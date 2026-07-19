@@ -37,21 +37,22 @@ def main():
     albedo_tint.set_editor_property("constant", unreal.LinearColor(0.5, 0.45, 0.4, 1.0))
 
     ao_multiply = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -200, 50)
-    mel.connect_material_expressions(albedo_tint, "", ao_multiply, "A")
-    mel.connect_material_expressions(vertex_color, "G", ao_multiply, "B")
-    mel.connect_material_property(ao_multiply, "", unreal.MaterialProperty.MP_BASE_COLOR)
+    # Every connection is checked: a silently-failed pin connect produced an
+    # invisible-terrain material once (2026-07-19) and cost a debug session.
+    if not mel.connect_material_expressions(albedo_tint, "", ao_multiply, "A"):
+        raise RuntimeError("connect albedo_tint -> multiply.A failed")
+    if not mel.connect_material_expressions(vertex_color, "G", ao_multiply, "B"):
+        raise RuntimeError("connect vertex_color.G -> multiply.B failed")
+    if not mel.connect_material_property(ao_multiply, "", unreal.MaterialProperty.MP_BASE_COLOR):
+        raise RuntimeError("connect multiply -> BaseColor failed")
 
     roughness = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -200, 250)
     roughness.set_editor_property("r", 0.9)
-    mel.connect_material_property(roughness, "", unreal.MaterialProperty.MP_ROUGHNESS)
+    if not mel.connect_material_property(roughness, "", unreal.MaterialProperty.MP_ROUGHNESS):
+        raise RuntimeError("connect roughness failed")
 
-    # Defensive: FVoxelChunkSceneProxy triangulates quads with correct
-    # *relative* winding between +/- faces but the absolute UE front-face
-    # winding convention could not be visually verified in this headless
-    # session (no PIE allowed) -- two-sided removes any risk of culled faces
-    # while normals (set explicitly per-vertex, not derived from winding)
-    # stay correct either way.
-    material.set_editor_property("two_sided", True)
+    # One-sided: absolute quad winding was verified empirically on 5.8
+    # (2026-07-19) — front faces render correctly without two-sided cost.
 
     mel.layout_material_expressions(material)
     mel.recompile_material(material)

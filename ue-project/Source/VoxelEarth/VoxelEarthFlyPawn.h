@@ -35,11 +35,8 @@ protected:
 
 private:
 	void MoveForward(float Value);
-	void MoveBackward(float Value);
 	void MoveRight(float Value);
-	void MoveLeft(float Value);
 	void MoveUp(float Value);
-	void MoveDown(float Value);
 	void Turn(float Value);
 	void LookUp(float Value);
 

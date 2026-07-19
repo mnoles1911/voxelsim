@@ -1,6 +1,6 @@
 {
 	"FileVersion": 3,
-	"EngineAssociation": "5.7",
+	"EngineAssociation": "5.8",
 	"Category": "",
 	"Description": "Voxel Earth - M1 scaffold consuming voxel-core.",
 	"Modules": [
@@ -13,6 +13,10 @@
 	"Plugins": [
 		{
 			"Name": "PythonScriptPlugin",
+			"Enabled": true
+		},
+		{
+			"Name": "ModelContextProtocol",
 			"Enabled": true
 		}
 	]

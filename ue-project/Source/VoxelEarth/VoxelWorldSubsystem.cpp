@@ -23,6 +23,8 @@
 #include "HAL/ThreadSafeCounter.h"
 #include "MaterialDomain.h"
 #include "Materials/Material.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 #include "Materials/MaterialInterface.h"
 #include "Stats/Stats.h"
 #include "Tasks/Task.h"
@@ -833,8 +835,15 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 	// Resolve the terrain material once (deliverable 4: load by path,
 	// fallback to the engine default material, never crash).
-	ChunkMaterial = Cast<UMaterialInterface>(
-		StaticLoadObject(UMaterialInterface::StaticClass(), nullptr, TEXT("/Game/Voxel/M_VoxelTerrain.M_VoxelTerrain")));
+	// -VoxelDefaultMaterial: diagnostic switch — skip the authored material
+	// and use the engine default, to isolate material bugs from geometry
+	// bugs (an invisible-terrain failure with the authored material and a
+	// visible one with the default indicts the asset, not the mesh).
+	if (!FParse::Param(FCommandLine::Get(), TEXT("VoxelDefaultMaterial")))
+	{
+		ChunkMaterial = Cast<UMaterialInterface>(
+			StaticLoadObject(UMaterialInterface::StaticClass(), nullptr, TEXT("/Game/Voxel/M_VoxelTerrain.M_VoxelTerrain")));
+	}
 	if (ChunkMaterial == nullptr)
 	{
 		ChunkMaterial = UMaterial::GetDefaultMaterial(MD_Surface);

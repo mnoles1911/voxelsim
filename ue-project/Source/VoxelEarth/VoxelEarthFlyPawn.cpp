@@ -4,6 +4,7 @@
 #include "Components/InputComponent.h"
 #include "Components/SceneComponent.h"
 #include "GameFramework/FloatingPawnMovement.h"
+#include "GameFramework/PlayerInput.h"
 #include "InputCoreTypes.h"
 
 AVoxelEarthFlyPawn::AVoxelEarthFlyPawn()
@@ -38,27 +39,30 @@ void AVoxelEarthFlyPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputC
 		return;
 	}
 
-	// Legacy raw-key bindings (docs/m1-plan.md Stage 2 decisions table:
-	// "legacy input bindings, no Enhanced Input assets"). BindAxisKey needs
-	// no named AxisMapping config -- each key drives its handler directly
-	// with the key's raw value (1.0 while a digital key like W is held).
-	PlayerInputComponent->BindAxisKey(EKeys::W, this, &AVoxelEarthFlyPawn::MoveForward);
-	PlayerInputComponent->BindAxisKey(EKeys::S, this, &AVoxelEarthFlyPawn::MoveBackward);
-	PlayerInputComponent->BindAxisKey(EKeys::D, this, &AVoxelEarthFlyPawn::MoveRight);
-	PlayerInputComponent->BindAxisKey(EKeys::A, this, &AVoxelEarthFlyPawn::MoveLeft);
-	PlayerInputComponent->BindAxisKey(EKeys::SpaceBar, this, &AVoxelEarthFlyPawn::MoveUp);
-	PlayerInputComponent->BindAxisKey(EKeys::LeftControl, this, &AVoxelEarthFlyPawn::MoveDown);
+	// Legacy input, no Enhanced Input assets (docs/m1-plan.md Stage 2
+	// decisions table). BindAxisKey only accepts true 1D axis keys (MouseX/
+	// MouseY) — digital keys (W, A, SpaceBar, ...) must go through named
+	// engine-defined axis mappings or they trip the AxisKey.IsAxis1D()
+	// ensure. Registration is process-global and idempotent-enough for a
+	// dev pawn (duplicate registrations of identical mappings are no-ops).
+	UPlayerInput::AddEngineDefinedAxisMapping(FInputAxisKeyMapping(TEXT("VoxelFly_Forward"), EKeys::W, 1.f));
+	UPlayerInput::AddEngineDefinedAxisMapping(FInputAxisKeyMapping(TEXT("VoxelFly_Forward"), EKeys::S, -1.f));
+	UPlayerInput::AddEngineDefinedAxisMapping(FInputAxisKeyMapping(TEXT("VoxelFly_Right"), EKeys::D, 1.f));
+	UPlayerInput::AddEngineDefinedAxisMapping(FInputAxisKeyMapping(TEXT("VoxelFly_Right"), EKeys::A, -1.f));
+	UPlayerInput::AddEngineDefinedAxisMapping(FInputAxisKeyMapping(TEXT("VoxelFly_Up"), EKeys::SpaceBar, 1.f));
+	UPlayerInput::AddEngineDefinedAxisMapping(FInputAxisKeyMapping(TEXT("VoxelFly_Up"), EKeys::LeftControl, -1.f));
+
+	PlayerInputComponent->BindAxis(TEXT("VoxelFly_Forward"), this, &AVoxelEarthFlyPawn::MoveForward);
+	PlayerInputComponent->BindAxis(TEXT("VoxelFly_Right"), this, &AVoxelEarthFlyPawn::MoveRight);
+	PlayerInputComponent->BindAxis(TEXT("VoxelFly_Up"), this, &AVoxelEarthFlyPawn::MoveUp);
 
 	PlayerInputComponent->BindAxisKey(EKeys::MouseX, this, &AVoxelEarthFlyPawn::Turn);
 	PlayerInputComponent->BindAxisKey(EKeys::MouseY, this, &AVoxelEarthFlyPawn::LookUp);
 }
 
 void AVoxelEarthFlyPawn::MoveForward(float Value) { AddMovementInput(GetActorForwardVector(), Value); }
-void AVoxelEarthFlyPawn::MoveBackward(float Value) { AddMovementInput(GetActorForwardVector(), -Value); }
 void AVoxelEarthFlyPawn::MoveRight(float Value) { AddMovementInput(GetActorRightVector(), Value); }
-void AVoxelEarthFlyPawn::MoveLeft(float Value) { AddMovementInput(GetActorRightVector(), -Value); }
 void AVoxelEarthFlyPawn::MoveUp(float Value) { AddMovementInput(FVector::UpVector, Value); }
-void AVoxelEarthFlyPawn::MoveDown(float Value) { AddMovementInput(FVector::UpVector, -Value); }
 
 void AVoxelEarthFlyPawn::Turn(float Value) { AddControllerYawInput(Value * MouseLookSpeed); }
 void AVoxelEarthFlyPawn::LookUp(float Value) { AddControllerPitchInput(-Value * MouseLookSpeed); }
