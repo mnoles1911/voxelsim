@@ -39,13 +39,23 @@ per frame (§2.5), LWC + origin rebasing from day one (§3.3).
    apply queue with per-frame budgets + hysteresis (§2.5); ring follows
    pawn; dig/place via DDA raycast → `World::applyEdit` → re-mesh dirty
    render chunks (edit-log authority path, §2.4); spectator pawn.
-3. **Walkable + LWC** — DDA box-sweep character collision (plan §3.3: no
-   Chaos for terrain), origin rebasing, material polish, perf pass vs the
-   60fps gate on this machine + min-spec proxy settings.
+3. **Walkable + LWC** — in order:
+   a. **Streaming perf** (first — compounds everything): the worker mesh
+      job samples `GeneratedWorld::materialAt`, which recomputes the full
+      amplifier column per VOXEL query; measured ~5 chunks/s wall-clock
+      (2026-07-19 run: 321 chunks / 63s while ~4300 queued). Fix = per-job
+      extended column grid ((chunkEdge+2)² columns computed once, mesher
+      apron sampler reads the grid), exactly like vxc_bench. Target ≥50
+      chunks/s single measurement on this machine.
+   b. DDA box-sweep character collision (plan §3.3: no Chaos for terrain),
+      walk mode on the pawn.
+   c. Origin rebasing (LWC) + material polish.
+   d. Perf pass vs the 60fps gate (min-spec proxy settings).
 
 ## Verification per stage
 
-Stage 1: `Build.bat VoxelEarthEditor` clean; PIE via mcp-unreal (after
+Stage 1: `Build.bat VoxelEarthEditor` clean; PIE via the native UE 5.8
+editor MCP (after
 server reconnect); viewport screenshot showing terrain surface with AO;
 `LogVoxelEarth` reports generated brick/chunk/quad counts matching a
 `vxc_bench`-style digest run at the same seed/radius.

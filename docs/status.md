@@ -30,6 +30,25 @@ call needs GPU meshing + render/memory numbers (M1).
 - [ ] GPU compute port of amplifier + mesher (GPU machine)
 - [ ] Cross-vendor (NV vs AMD) determinism CI
 
-## M1+ — not started
+## M1 — Walkable world in UE5 (IN PROGRESS, stages 1–2 verified on screen)
+
+Working plan + binding decisions: docs/m1-plan.md. UE 5.8.0 (retargeted
+2026-07-19), native editor MCP enabled.
+
+- [x] Stage 1 — voxels on screen: custom scene proxy (FLocalVertexFactory),
+  vertex-color AO material, verified by screenshot 2026-07-19
+- [x] Stage 2 — streaming + dig/place: lock-free worker split, budgets,
+  hysteresis, DDA raycast digs through the edit-log authority path
+- [ ] Stage 3 — walkable + LWC: streaming perf (worker column caching —
+  measured ~5 chunks/s, needs ~10×), DDA box-sweep character collision,
+  origin rebasing, 60fps gate run
+- Gate (walk & dig at 60fps min-spec): ⬜ open — blocked on stage 3
+
+## M0 GPU track (ADR-0001)
+
+- [x] Worldgen HLSL kernel (ColumnMain) mirrors CPU reference; compiles to
+  DXIL + SPIR-V from one source (pinned DXC 1.9, tools/compile-shaders.ps1)
+- [ ] Vulkan headless harness: dispatch + byte-compare vs CPU reference on
+  the AMD leg (this desktop), then a cloud NVIDIA leg → closes both M0 gates
 
 ## Water track — not started (W1 begins with M1)
