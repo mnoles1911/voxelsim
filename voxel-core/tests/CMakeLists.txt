@@ -5,6 +5,7 @@ add_executable(vxc_tests
   test_amplifier.cpp
   test_mesher.cpp
   test_editlog.cpp
+  test_editcompact.cpp
   test_world.cpp
   test_mips.cpp
   test_raycast.cpp
