@@ -1,0 +1,13 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.7",
+	"Category": "",
+	"Description": "Voxel Earth - M1 scaffold consuming voxel-core.",
+	"Modules": [
+		{
+			"Name": "VoxelEarth",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}
