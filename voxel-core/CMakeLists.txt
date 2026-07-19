@@ -11,6 +11,7 @@ endif()
 
 add_library(voxelcore STATIC
   src/amplifier.cpp
+  src/tilestore.cpp
 )
 target_include_directories(voxelcore PUBLIC include)
 if(MSVC)

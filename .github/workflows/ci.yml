@@ -33,20 +33,44 @@ jobs:
           name: digest-${{ matrix.compiler }}
           path: digest.txt
 
-  # Doctrine §2.3 proxy gate: gcc and clang builds must derive bit-identical
+  voxel-core-msvc:
+    name: voxel-core (msvc)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S voxel-core -B build
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Determinism digest
+        shell: pwsh
+        run: build/bench/Release/vxc_bench.exe --radius 16 --digest | Tee-Object -FilePath digest.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-msvc
+          path: digest.txt
+
+  # Doctrine §2.3 proxy gate: gcc, clang, and msvc builds must derive bit-identical
   # worlds. The real M0 gate (NVIDIA vs AMD GPU) needs self-hosted runners
   # once the GPU port exists.
   determinism-cross-compiler:
-    needs: voxel-core
+    needs: [voxel-core, voxel-core-msvc]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: digest-*
       - name: Compare digests
+        # tr strips the CRLF the Windows job writes; compare bytes after that.
         run: |
-          cat digest-g++/digest.txt digest-clang++/digest.txt
-          diff digest-g++/digest.txt digest-clang++/digest.txt
+          tr -d '\r' < digest-g++/digest.txt > a.txt
+          tr -d '\r' < digest-clang++/digest.txt > b.txt
+          tr -d '\r' < digest-msvc/digest.txt > c.txt
+          cat a.txt b.txt c.txt
+          diff a.txt b.txt
+          diff b.txt c.txt
 
   # Doctrine §2.3: no floating point in world-derivation code. Bench/timing
   # and UE-side rendering are outside the boundary.

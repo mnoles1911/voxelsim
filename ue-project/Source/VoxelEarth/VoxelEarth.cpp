@@ -7,7 +7,7 @@
 #include "voxelcore/amplifier.h"
 #include "voxelcore/tiles.h"
 
-DEFINE_LOG_CATEGORY_STATIC(LogVoxelEarth, Log, All);
+DEFINE_LOG_CATEGORY(LogVoxelEarth);
 
 void FVoxelEarthModule::StartupModule()
 {

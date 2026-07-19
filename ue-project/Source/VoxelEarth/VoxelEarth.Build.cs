@@ -15,7 +15,12 @@ public class VoxelEarth : ModuleRules
 		{
 			"Core",
 			"CoreUObject",
-			"Engine"
+			"Engine",
+			// FVoxelChunkSceneProxy (custom FPrimitiveSceneProxy, doctrine
+			// SS3.3 Band 1 -- NOT ProceduralMeshComponent): FLocalVertexFactory,
+			// FStaticMeshVertexBuffers, FDynamicMeshIndexBuffer32.
+			"RenderCore",
+			"RHI"
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[] { });

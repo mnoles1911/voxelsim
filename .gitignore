@@ -1,9 +1,13 @@
 # build outputs
 build/
+build-*/
 tile-cache/
 
 # tool-generated search indexes
 docs/index.bleve/
+
+# claude session worktrees
+.claude/worktrees/
 
 # python
 __pycache__/

@@ -6,8 +6,13 @@ add_executable(vxc_tests
   test_mesher.cpp
   test_editlog.cpp
   test_world.cpp
+  test_mips.cpp
+  test_tilestore.cpp
 )
 target_link_libraries(vxc_tests PRIVATE voxelcore)
+target_compile_definitions(vxc_tests PRIVATE
+  VXC_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+)
 if(NOT MSVC)
   target_compile_options(vxc_tests PRIVATE -Wall -Wextra -Werror)
 endif()
