@@ -25,6 +25,37 @@ curl -s "localhost:5000/tile?seed=1&x=0&y=0&scale=1" | xxd | head
 Environment: `TERRAIN_PROVIDER` (`synthetic`|`diffusion`),
 `TERRAIN_CACHE_DIR` (default `./tile-cache`).
 
+## Pre-generate tiles offline
+
+Pre-generate tiles for a launch radius to warm the cache before deployment
+(plan §3.4: "Pre-generate launch radius offline"):
+
+```sh
+python3 -m terrain_service.pregen --seed 42 --radius 8 --cache-dir ./tile-cache
+python3 -m terrain_service.pregen --seed 42 --radius 8 --center-x 100 --center-y -50 --scale 1
+python3 -m terrain_service.pregen --help
+```
+
+For each tile in the (2*radius+1)² square around the center point, the tool
+skips if already cached, else generates+encodes+caches. Prints progress every
+10 tiles.
+
+## Docker
+
+Build and run the service in a container:
+
+```sh
+docker build -t terrain-service terrain-service/
+docker run -p 8000:8000 -v tile-cache:/data/tile-cache terrain-service
+
+# Pre-generate tiles in container
+docker run -v tile-cache:/data/tile-cache terrain-service \
+  python -m terrain_service.pregen --seed 42 --radius 8
+
+# Fetch a tile via the running server
+curl -s "localhost:8000/tile?seed=42&x=0&y=0&scale=1" | xxd | head
+```
+
 ## Contracts that matter
 
 - Tile bytes for a given (provider_id, seed, x, y, scale) are **immutable

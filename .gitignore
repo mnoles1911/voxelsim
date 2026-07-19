@@ -29,3 +29,6 @@ ue-project/Saved/
 ue-project/.vs/
 ue-project/*.sln
 ue-project/.vsconfig
+
+# fetched toolchains
+tools/dxc/
