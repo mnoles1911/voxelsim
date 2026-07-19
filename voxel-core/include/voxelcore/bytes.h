@@ -34,7 +34,7 @@ public:
     bool u16(uint16_t& v) {
         uint8_t a, b;
         if (!u8(a) || !u8(b)) return false;
-        v = uint16_t(a) | uint16_t(b) << 8;
+        v = static_cast<uint16_t>(a | (b << 8));
         return true;
     }
     bool u32(uint32_t& v) {
