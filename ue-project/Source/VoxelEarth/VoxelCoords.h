@@ -35,6 +35,22 @@ namespace VoxelCoords
 		return (R != 0 && ((R < 0) != (B < 0))) ? Q - 1 : Q;
 	}
 
+	// Floored modulo matching vxc::floorMod -- local-within-chunk-or-brick
+	// coordinate of a voxel index (always in [0, B)).
+	constexpr int64 FloorMod(int64 A, int64 B)
+	{
+		return A - FloorDiv(A, B) * B;
+	}
+
+	// UE units (cm) -> millimetres, matching vxc::kVoxelSizeMm's unit (this is
+	// the ONLY place stage 2 (dig/place raycasts) converts to mm; voxelcore/
+	// raycast.h works in mm exclusively). 1 UU = 10 mm since VoxelSizeUU (10
+	// UU/voxel) = kVoxelSizeMm (100 mm/voxel).
+	FORCEINLINE int64 WorldToMm(double WorldUU)
+	{
+		return (int64)FMath::RoundToDouble(WorldUU * 10.0);
+	}
+
 	// Integer voxel lattice coordinate (unbounded range; matches vxc voxel
 	// coordinates 1:1).
 	struct FVoxelCoord
