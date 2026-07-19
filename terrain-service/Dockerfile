@@ -2,11 +2,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Copy terrain-service code
-COPY terrain-service/ .
-
-# Install dependencies including gunicorn
+# Copy terrain-service code (build context IS the terrain-service dir:
+# `docker build terrain-service` from the repo root, as CI does)
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt gunicorn
+COPY . .
 
 # Create cache volume mount point
 RUN mkdir -p /data/tile-cache
