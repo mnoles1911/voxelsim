@@ -8,7 +8,7 @@ gate definitions.
 | Gate | Status | Notes |
 |---|---|---|
 | Amplify+mesh 128m radius < 1s on RTX 3060 | ⬜ open | CPU reference done; GPU compute port not started (needs GPU machine). Baseline (2026-07-19, single-threaded CPU ref, container hardware): 128m radius = **10.6s** with 8³ bricks, **14.9s** with 16³ (amplify 4.3s / mesh 5.9s dominate at 8³). GPU port + parallel columns must close ~10–15×, which is the expected shape of the win. |
-| Bit-identical amplifier output NVIDIA vs AMD | ⬜ open | No GPU port yet. Interim proxy PASSING: gcc and clang builds produce bit-identical world+mesh digests (CI job `determinism-cross-compiler`), goldens pinned in tests. Real gate needs NV + AMD runners. |
+| Bit-identical amplifier output NVIDIA vs AMD | ⬜ open | No GPU port yet. Interim proxy PASSING across three toolchains / two OSes: gcc 13 + clang 18 (Linux CI) and MSVC 14.51/VS2026 (Windows, 2026-07-19) all produce bit-identical digests (r16 `9daf74437728f98f`, r128 `114b7875547a16e5`/`2c9a03d2ffabfd88`). Real gate needs the GPU port; strategy in ADR-0001 (AMD leg = Matt's desktop 7800 XT, NVIDIA leg = rented/CI). |
 
 ### Early 8³ vs 16³ data (CPU ref, will re-decide after GPU port)
 

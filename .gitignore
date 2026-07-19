@@ -2,6 +2,9 @@
 build/
 tile-cache/
 
+# tool-generated search indexes
+docs/index.bleve/
+
 # python
 __pycache__/
 *.pyc
@@ -13,8 +16,12 @@ __pycache__/
 .idea/
 .DS_Store
 
-# UE (M1+)
+# UE (M1+) — build outputs and generated IDE files (regenerate with
+# Build.bat -projectfiles)
 ue-project/Binaries/
 ue-project/DerivedDataCache/
 ue-project/Intermediate/
 ue-project/Saved/
+ue-project/.vs/
+ue-project/*.sln
+ue-project/.vsconfig
