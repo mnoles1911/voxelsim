@@ -24,7 +24,14 @@ foreach ($Src in $Kernels.Keys) {
         & $Dxc -T cs_6_0 -E $Entry -O3 $SrcPath -Fo $Dxil
         if ($LASTEXITCODE -ne 0) { throw "DXIL compile failed: $Src/$Entry" }
         Write-Host "[$Base/$Entry] SPIR-V"
-        & $Dxc -T cs_6_0 -E $Entry -O3 -spirv "-fspv-target-env=vulkan1.1" $SrcPath -Fo $Spv
+        # HLSL register classes (b/t/u/s) are separate namespaces but Vulkan
+        # descriptor bindings are one flat space per set; without shifts, b0/
+        # t0/u0 would all collide at (set=0, binding=0). Shift t- and u-type
+        # registers so every resource in worldgen.hlsl lands on a distinct
+        # binding: b0->0, t0->1, t1->2, u0->3 (see voxel-core/bench/gpu_harness.cpp,
+        # which hardcodes these same binding numbers).
+        & $Dxc -T cs_6_0 -E $Entry -O3 -spirv "-fspv-target-env=vulkan1.1" `
+            -fvk-b-shift 0 0 -fvk-t-shift 1 0 -fvk-u-shift 3 0 $SrcPath -Fo $Spv
         if ($LASTEXITCODE -ne 0) { throw "SPIR-V compile failed: $Src/$Entry" }
     }
 }
