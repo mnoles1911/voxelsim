@@ -6,6 +6,7 @@ add_executable(vxc_tests
   test_mesher.cpp
   test_editlog.cpp
   test_world.cpp
+  test_mips.cpp
 )
 target_link_libraries(vxc_tests PRIVATE voxelcore)
 if(NOT MSVC)
