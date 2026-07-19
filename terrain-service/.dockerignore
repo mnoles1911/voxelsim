@@ -1,0 +1,14 @@
+# Cache directories
+tile-cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Tests (optional)
+tests/
+
+# Other
+.git
+.gitignore
+.github
+README.md
