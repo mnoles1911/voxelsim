@@ -106,28 +106,29 @@ public:
 				Vertices.Add(Vert);
 			}
 
-			// Winding: the (u0,v0)->(u0,v1)->(u1,v1)->(u1,v0) loop is used
-			// as-is for Positive faces and reversed for negative faces, so
-			// the two face directions always wind oppositely (the essential
-			// correctness property -- see report for the two-sided-material
-			// note covering absolute engine winding convention).
+			// Winding: verified empirically (wireframe-visible / lit-invisible
+			// on the original orientation, 2026-07-19): UE front faces need
+			// the loop order REVERSED for Positive faces relative to the
+			// initial guess. Positive and negative faces still wind
+			// oppositely, and the mesh is now correct with a one-sided
+			// material (the temporary two-sided material flag can go away).
 			if (Q.Positive)
 			{
 				IndexBuffer.Indices.Add(BaseVertex + 0);
+				IndexBuffer.Indices.Add(BaseVertex + 2);
 				IndexBuffer.Indices.Add(BaseVertex + 1);
-				IndexBuffer.Indices.Add(BaseVertex + 2);
 				IndexBuffer.Indices.Add(BaseVertex + 0);
-				IndexBuffer.Indices.Add(BaseVertex + 2);
 				IndexBuffer.Indices.Add(BaseVertex + 3);
+				IndexBuffer.Indices.Add(BaseVertex + 2);
 			}
 			else
 			{
 				IndexBuffer.Indices.Add(BaseVertex + 0);
-				IndexBuffer.Indices.Add(BaseVertex + 2);
 				IndexBuffer.Indices.Add(BaseVertex + 1);
-				IndexBuffer.Indices.Add(BaseVertex + 0);
-				IndexBuffer.Indices.Add(BaseVertex + 3);
 				IndexBuffer.Indices.Add(BaseVertex + 2);
+				IndexBuffer.Indices.Add(BaseVertex + 0);
+				IndexBuffer.Indices.Add(BaseVertex + 2);
+				IndexBuffer.Indices.Add(BaseVertex + 3);
 			}
 		}
 
@@ -297,4 +298,13 @@ void UVoxelChunkComponent::SetMaterial(int32 ElementIndex, UMaterialInterface* N
 int32 UVoxelChunkComponent::GetNumMaterials() const
 {
 	return 1;
+}
+
+void UVoxelChunkComponent::GetUsedMaterials(TArray<UMaterialInterface*>& OutMaterials, bool bGetDebugMaterials) const
+{
+	Super::GetUsedMaterials(OutMaterials, bGetDebugMaterials);
+	if (ChunkMaterial)
+	{
+		OutMaterials.Add(ChunkMaterial);
+	}
 }

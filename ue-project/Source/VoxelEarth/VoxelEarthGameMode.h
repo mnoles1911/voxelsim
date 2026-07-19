@@ -17,4 +17,10 @@ public:
 	AVoxelEarthGameMode();
 
 	virtual void RestartPlayer(AController* NewPlayer) override;
+	virtual void BeginPlay() override;
+
+private:
+	FTimerHandle ScreenshotTimerHandle;
+	FTimerHandle SecondShotTimerHandle;
+	FTimerHandle QuitTimerHandle;
 };

@@ -39,6 +39,12 @@ public:
 	virtual UMaterialInterface* GetMaterial(int32 ElementIndex) const override;
 	virtual void SetMaterial(int32 ElementIndex, UMaterialInterface* NewMaterial) override;
 	virtual int32 GetNumMaterials() const override;
+	// Required: the render-thread material verifier rejects any FMeshBatch
+	// whose material is missing from this list (engine defaults are exempt,
+	// which masked the omission until an authored material was used —
+	// symptom: terrain renders with the default material, invisible with
+	// M_VoxelTerrain, "not present in GetUsedMaterials" in the log).
+	virtual void GetUsedMaterials(TArray<UMaterialInterface*>& OutMaterials, bool bGetDebugMaterials) const override;
 	//~ End UPrimitiveComponent Interface
 
 private:
