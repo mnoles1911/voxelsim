@@ -3,13 +3,38 @@
 #include "Camera/CameraComponent.h"
 #include "Components/InputComponent.h"
 #include "Components/SceneComponent.h"
+#include "Engine/World.h"
 #include "GameFramework/FloatingPawnMovement.h"
 #include "GameFramework/PlayerInput.h"
 #include "InputCoreTypes.h"
+#include "VoxelCoords.h"
+#include "VoxelWorldSubsystem.h"
+
+namespace
+{
+// Converts a world-space interval [Lo, Hi] (UU) into the inclusive integer
+// voxel-index range it overlaps. KINDA_SMALL_NUMBER keeps a box face that
+// lands exactly on a voxel boundary from spuriously pulling in the next
+// voxel over.
+void AxisVoxelRange(double Lo, double Hi, int64& OutMin, int64& OutMax)
+{
+	OutMin = (int64)FMath::FloorToDouble(Lo / VoxelCoords::VoxelSizeUU);
+	OutMax = (int64)FMath::FloorToDouble((Hi - KINDA_SMALL_NUMBER) / VoxelCoords::VoxelSizeUU);
+	if (OutMax < OutMin)
+	{
+		OutMax = OutMin;
+	}
+}
+} // namespace
 
 AVoxelEarthFlyPawn::AVoxelEarthFlyPawn()
 {
-	PrimaryActorTick.bCanEverTick = false;
+	// bCanEverTick stays true so walk mode (stage 3b) can flip actor tick on
+	// with SetActorTickEnabled; it starts disabled so fly mode (the default)
+	// is unchanged -- Tick only runs while bWalkMode is set (see
+	// ToggleWalkMode).
+	PrimaryActorTick.bCanEverTick = true;
+	PrimaryActorTick.bStartWithTickEnabled = false;
 
 	SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
 	SetRootComponent(SceneRoot);
@@ -25,7 +50,10 @@ AVoxelEarthFlyPawn::AVoxelEarthFlyPawn()
 	Movement->Deceleration = 8000.f;
 
 	// Actor rotation follows the controller (mouse look), and movement input
-	// is applied in actor-local axes -- the standard "fly cam" setup.
+	// is applied in actor-local axes -- the standard "fly cam" setup. Walk
+	// mode keeps this too (mouse look still pitches the camera); it only
+	// re-derives a yaw-only horizontal basis for movement (see
+	// TickWalkMode) instead of using GetActorForwardVector() directly.
 	bUseControllerRotationYaw = true;
 	bUseControllerRotationPitch = true;
 	bUseControllerRotationRoll = false;
@@ -58,11 +86,284 @@ void AVoxelEarthFlyPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputC
 
 	PlayerInputComponent->BindAxisKey(EKeys::MouseX, this, &AVoxelEarthFlyPawn::Turn);
 	PlayerInputComponent->BindAxisKey(EKeys::MouseY, this, &AVoxelEarthFlyPawn::LookUp);
+
+	// Stage 3b: G toggles walk mode; Space is repurposed from fly-up (the
+	// VoxelFly_Up axis above) to jump while walking -- MoveUp ignores that
+	// axis in walk mode, so the two bindings never fight over the key.
+	PlayerInputComponent->BindKey(EKeys::G, IE_Pressed, this, &AVoxelEarthFlyPawn::ToggleWalkMode);
+	PlayerInputComponent->BindKey(EKeys::SpaceBar, IE_Pressed, this, &AVoxelEarthFlyPawn::OnJumpPressed);
 }
 
-void AVoxelEarthFlyPawn::MoveForward(float Value) { AddMovementInput(GetActorForwardVector(), Value); }
-void AVoxelEarthFlyPawn::MoveRight(float Value) { AddMovementInput(GetActorRightVector(), Value); }
-void AVoxelEarthFlyPawn::MoveUp(float Value) { AddMovementInput(FVector::UpVector, Value); }
+void AVoxelEarthFlyPawn::MoveForward(float Value)
+{
+	CurrentForwardInput = Value;
+	if (!bWalkMode)
+	{
+		AddMovementInput(GetActorForwardVector(), Value);
+	}
+}
+
+void AVoxelEarthFlyPawn::MoveRight(float Value)
+{
+	CurrentRightInput = Value;
+	if (!bWalkMode)
+	{
+		AddMovementInput(GetActorRightVector(), Value);
+	}
+}
+
+void AVoxelEarthFlyPawn::MoveUp(float Value)
+{
+	// Walk mode: Space/LeftControl no longer fly up/down (Space is jump
+	// instead, via OnJumpPressed) -- this axis is simply ignored.
+	if (!bWalkMode)
+	{
+		AddMovementInput(FVector::UpVector, Value);
+	}
+}
 
 void AVoxelEarthFlyPawn::Turn(float Value) { AddControllerYawInput(Value * MouseLookSpeed); }
 void AVoxelEarthFlyPawn::LookUp(float Value) { AddControllerPitchInput(-Value * MouseLookSpeed); }
+
+void AVoxelEarthFlyPawn::ToggleWalkMode()
+{
+	bWalkMode = !bWalkMode;
+	VerticalVelocity = 0.f;
+	bJumpRequested = false;
+
+	if (Movement)
+	{
+		// Fly mode (default, unchanged behavior) uses UFloatingPawnMovement;
+		// walk mode drives position entirely from TickWalkMode below, so the
+		// movement component is parked (ticking it too would fight the
+		// kinematic mover for SceneRoot's transform).
+		Movement->StopMovementImmediately();
+		Movement->SetComponentTickEnabled(!bWalkMode);
+	}
+
+	// Only walk mode needs a per-frame kinematic step; fly mode is driven
+	// entirely by UFloatingPawnMovement's own tick (unchanged from before
+	// stage 3b).
+	SetActorTickEnabled(bWalkMode);
+}
+
+void AVoxelEarthFlyPawn::OnJumpPressed()
+{
+	if (bWalkMode)
+	{
+		bJumpRequested = true;
+	}
+	// Fly mode: SpaceBar already flies up via the VoxelFly_Up axis; no
+	// separate jump action there.
+}
+
+UVoxelWorldSubsystem* AVoxelEarthFlyPawn::GetVoxelWorldSubsystem() const
+{
+	UWorld* World = GetWorld();
+	return World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+}
+
+bool AVoxelEarthFlyPawn::IsGroundedAt(const FVector& Pos) const
+{
+	UVoxelWorldSubsystem* Subsystem = GetVoxelWorldSubsystem();
+	if (!Subsystem)
+	{
+		return false;
+	}
+
+	// Downward 1-voxel probe under the box: solid anywhere in the voxel
+	// layer immediately beneath the box's footprint counts as grounded.
+	const double BottomZ = Pos.Z - WalkBoxHalfExtentZ;
+	const int64 ProbeVZ = (int64)FMath::FloorToDouble(BottomZ / VoxelCoords::VoxelSizeUU) - 1;
+
+	int64 VXMin, VXMax, VYMin, VYMax;
+	AxisVoxelRange(Pos.X - WalkBoxHalfExtentXY, Pos.X + WalkBoxHalfExtentXY, VXMin, VXMax);
+	AxisVoxelRange(Pos.Y - WalkBoxHalfExtentXY, Pos.Y + WalkBoxHalfExtentXY, VYMin, VYMax);
+
+	for (int64 VX = VXMin; VX <= VXMax; ++VX)
+	{
+		for (int64 VY = VYMin; VY <= VYMax; ++VY)
+		{
+			if (Subsystem->IsSolidAtVoxel(VX, VY, ProbeVZ))
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool AVoxelEarthFlyPawn::SweepAxis(int32 Axis, double Delta, FVector& InOutPos) const
+{
+	if (FMath::IsNearlyZero(Delta))
+	{
+		return false;
+	}
+
+	UVoxelWorldSubsystem* Subsystem = GetVoxelWorldSubsystem();
+	if (!Subsystem)
+	{
+		// World not ready (shouldn't happen once walking, defensive only):
+		// move freely rather than getting stuck against nothing.
+		InOutPos[Axis] += Delta;
+		return false;
+	}
+
+	const double HalfExtent[3] = {WalkBoxHalfExtentXY, WalkBoxHalfExtentXY, WalkBoxHalfExtentZ};
+
+	const double OldCenter = InOutPos[Axis];
+	const double NewCenter = OldCenter + Delta;
+
+	// Voxel range the box overlaps across its full path along Axis this
+	// step (covers both the start and end box, not just the destination).
+	const double SweptLo = FMath::Min(OldCenter, NewCenter) - HalfExtent[Axis];
+	const double SweptHi = FMath::Max(OldCenter, NewCenter) + HalfExtent[Axis];
+	int64 VMin[3], VMax[3];
+	AxisVoxelRange(SweptLo, SweptHi, VMin[Axis], VMax[Axis]);
+
+	// The other two axes use the box's static extent at the (already
+	// axis-resolved) position -- this is what makes the sweep
+	// axis-separated: each axis is tested independently, in turn.
+	const int32 Other1 = (Axis + 1) % 3;
+	const int32 Other2 = (Axis + 2) % 3;
+	AxisVoxelRange(InOutPos[Other1] - HalfExtent[Other1], InOutPos[Other1] + HalfExtent[Other1], VMin[Other1], VMax[Other1]);
+	AxisVoxelRange(InOutPos[Other2] - HalfExtent[Other2], InOutPos[Other2] + HalfExtent[Other2], VMin[Other2], VMax[Other2]);
+
+	// Walk the moving axis from the near side (closest to OldCenter) toward
+	// the far side so the first hit found is the nearest blocking voxel.
+	const int32 Step = Delta > 0 ? 1 : -1;
+	const int64 AxisStart = Step > 0 ? VMin[Axis] : VMax[Axis];
+	const int64 AxisEnd = Step > 0 ? VMax[Axis] : VMin[Axis];
+
+	int64 V[3];
+	bool bBlocked = false;
+	int64 BlockingVoxel = 0;
+	for (int64 AV = AxisStart; Step > 0 ? AV <= AxisEnd : AV >= AxisEnd; AV += Step)
+	{
+		V[Axis] = AV;
+		bool bSliceSolid = false;
+		for (int64 O1 = VMin[Other1]; O1 <= VMax[Other1] && !bSliceSolid; ++O1)
+		{
+			V[Other1] = O1;
+			for (int64 O2 = VMin[Other2]; O2 <= VMax[Other2] && !bSliceSolid; ++O2)
+			{
+				V[Other2] = O2;
+				if (Subsystem->IsSolidAtVoxel(V[0], V[1], V[2]))
+				{
+					bSliceSolid = true;
+				}
+			}
+		}
+		if (bSliceSolid)
+		{
+			bBlocked = true;
+			BlockingVoxel = AV;
+			break;
+		}
+	}
+
+	if (!bBlocked)
+	{
+		InOutPos[Axis] = NewCenter;
+		return false;
+	}
+
+	// Clamp the box's leading face to the blocking voxel's near face, with
+	// CollisionEpsilonUU clearance so the box doesn't sit flush (and
+	// potentially re-trigger a hit next step due to floating point noise).
+	double ClampedCenter;
+	if (Step > 0)
+	{
+		const double FaceMin = double(BlockingVoxel) * VoxelCoords::VoxelSizeUU;
+		ClampedCenter = FMath::Min(NewCenter, FaceMin - HalfExtent[Axis] - CollisionEpsilonUU);
+	}
+	else
+	{
+		const double FaceMax = double(BlockingVoxel + 1) * VoxelCoords::VoxelSizeUU;
+		ClampedCenter = FMath::Max(NewCenter, FaceMax + HalfExtent[Axis] + CollisionEpsilonUU);
+	}
+	InOutPos[Axis] = ClampedCenter;
+	return true;
+}
+
+void AVoxelEarthFlyPawn::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+
+	if (bWalkMode)
+	{
+		TickWalkMode(DeltaTime);
+	}
+}
+
+void AVoxelEarthFlyPawn::TickWalkMode(float DeltaTime)
+{
+	UVoxelWorldSubsystem* Subsystem = GetVoxelWorldSubsystem();
+	if (!Subsystem)
+	{
+		return; // world not streamed in yet; hold position rather than fall through nothing
+	}
+
+	FVector Pos = GetActorLocation();
+	const bool bGrounded = IsGroundedAt(Pos);
+
+	if (bJumpRequested && bGrounded)
+	{
+		VerticalVelocity = JumpSpeedUU;
+	}
+	bJumpRequested = false;
+
+	// Client-presentation kinematics only (see class comment): plain float
+	// gravity integration, not part of the deterministic world derivation
+	// and not authoritative -- M3's server owns real player movement.
+	VerticalVelocity -= GravityUUPerSec2 * DeltaTime;
+
+	// Horizontal move from the existing WASD axis inputs, projected onto the
+	// yaw-only horizontal plane -- ignores the actor's pitch (mouse look
+	// still pitches the camera; it must not tilt walking into the ground).
+	const FRotator YawOnly(0.0, GetActorRotation().Yaw, 0.0);
+	const FRotationMatrix YawMatrix(YawOnly);
+	FVector WishDir = YawMatrix.GetUnitAxis(EAxis::X) * CurrentForwardInput + YawMatrix.GetUnitAxis(EAxis::Y) * CurrentRightInput;
+	if (WishDir.SizeSquared() > 1.0)
+	{
+		WishDir.Normalize();
+	}
+
+	const FVector HorizDelta = WishDir * WalkSpeedUU * DeltaTime;
+	const double VertDelta = VerticalVelocity * DeltaTime;
+
+	FVector NewPos = Pos;
+	const bool bBlockedX = SweepAxis(0, HorizDelta.X, NewPos);
+	const bool bBlockedY = SweepAxis(1, HorizDelta.Y, NewPos);
+
+	bool bDidStepSnap = false;
+	if ((bBlockedX || bBlockedY) && bGrounded)
+	{
+		// Step-up: retry the same horizontal move 30 UU (3 voxels) higher;
+		// if that clears, snap back down onto the ground with a downward
+		// sweep. Handles ledges/stairs up to 3 voxels without a full
+		// physics-style step solver.
+		FVector StepPos = Pos + FVector(0.0, 0.0, StepUpHeightUU);
+		const bool bStepBlockedX = SweepAxis(0, HorizDelta.X, StepPos);
+		const bool bStepBlockedY = SweepAxis(1, HorizDelta.Y, StepPos);
+		if (!bStepBlockedX && !bStepBlockedY)
+		{
+			SweepAxis(2, -(StepUpHeightUU + CollisionEpsilonUU * 2.0), StepPos);
+			NewPos = StepPos;
+			bDidStepSnap = true;
+			VerticalVelocity = 0.0;
+		}
+		// Else: the raised retry also hit something (a wall, not a step) --
+		// keep the normal (blocked/clamped) horizontal result in NewPos.
+	}
+
+	if (!bDidStepSnap)
+	{
+		if (SweepAxis(2, VertDelta, NewPos))
+		{
+			VerticalVelocity = 0.0;
+		}
+	}
+
+	SetActorLocation(NewPos);
+}

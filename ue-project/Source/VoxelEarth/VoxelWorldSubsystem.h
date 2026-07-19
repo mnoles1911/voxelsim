@@ -89,6 +89,15 @@ public:
 	// any chunk has streamed in.
 	double GetSurfaceHeightUU(double WorldX, double WorldY) const;
 
+	// True if the voxel at the given integer voxel-lattice coordinate is
+	// solid (overlay-aware World::materialAt != MAT_AIR -- edits are
+	// reflected immediately). Game thread only (same constraint as
+	// TryDig/TryPlace: Voxels' overlay is not thread-safe). Stage 3b (plan
+	// SS3.3, "no Chaos for terrain"): the walk-mode custom kinematic
+	// collision in AVoxelEarthFlyPawn queries this per-voxel instead of using
+	// a physics engine.
+	bool IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const;
+
 private:
 	TUniquePtr<FVoxelWorldImpl> Impl;
 

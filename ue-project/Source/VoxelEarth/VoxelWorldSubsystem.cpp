@@ -957,3 +957,15 @@ double UVoxelWorldSubsystem::GetSurfaceHeightUU(double WorldX, double WorldY) co
 	const vxc::ColumnSample Col = Impl->Voxels.amplifier().column(Vx, Vy);
 	return double(Col.surfaceMm) / 10.0; // mm -> UU (1 UU = 10 mm)
 }
+
+bool UVoxelWorldSubsystem::IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const
+{
+	if (!Impl)
+	{
+		return false;
+	}
+	// Overlay-aware (World::materialAt, not GeneratedWorld::materialAt): a
+	// dug voxel must read back as non-solid immediately, and a placed one as
+	// solid, for walk-mode collision to agree with what dig/place just did.
+	return Impl->Voxels.materialAt(Vx, Vy, Vz) != vxc::MAT_AIR;
+}
