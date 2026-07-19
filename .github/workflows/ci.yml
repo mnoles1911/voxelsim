@@ -93,3 +93,10 @@ jobs:
         run: python -m pip install -r terrain-service/requirements.txt
       - name: Test (incl. golden tiles)
         run: cd terrain-service && python -m pytest -q
+
+  docker-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build terrain-service Docker image
+        run: docker build terrain-service
