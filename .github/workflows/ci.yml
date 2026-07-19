@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  voxel-core:
+    name: voxel-core (${{ matrix.compiler }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: >
+          cmake -S voxel-core -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Determinism digest
+        run: ./build/bench/vxc_bench --radius 16 --digest | tee digest.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.compiler }}
+          path: digest.txt
+
+  # Doctrine §2.3 proxy gate: gcc and clang builds must derive bit-identical
+  # worlds. The real M0 gate (NVIDIA vs AMD GPU) needs self-hosted runners
+  # once the GPU port exists.
+  determinism-cross-compiler:
+    needs: voxel-core
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+      - name: Compare digests
+        run: |
+          cat digest-g++/digest.txt digest-clang++/digest.txt
+          diff digest-g++/digest.txt digest-clang++/digest.txt
+
+  # Doctrine §2.3: no floating point in world-derivation code. Bench/timing
+  # and UE-side rendering are outside the boundary.
+  float-ban:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Grep for float/double in voxel-core src+include
+        run: |
+          ! grep -rnE '\b(float|double)\b' voxel-core/include voxel-core/src
+
+  terrain-service:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: python -m pip install -r terrain-service/requirements.txt
+      - name: Test (incl. golden tiles)
+        run: cd terrain-service && python -m pytest -q

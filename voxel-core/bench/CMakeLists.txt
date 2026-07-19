@@ -1,0 +1,5 @@
+add_executable(vxc_bench bench_main.cpp)
+target_link_libraries(vxc_bench PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_bench PRIVATE -Wall -Wextra -Werror)
+endif()
