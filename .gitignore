@@ -32,3 +32,4 @@ ue-project/.vsconfig
 
 # fetched toolchains
 tools/dxc/
+tools/vulkan-headers/

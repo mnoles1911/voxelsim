@@ -8,7 +8,7 @@ gate definitions.
 | Gate | Status | Notes |
 |---|---|---|
 | Amplify+mesh 128m radius < 1s on RTX 3060 | ⬜ open | CPU reference done; GPU compute port not started (needs GPU machine). Baseline (2026-07-19, single-threaded CPU ref, container hardware): 128m radius = **10.6s** with 8³ bricks, **14.9s** with 16³ (amplify 4.3s / mesh 5.9s dominate at 8³). GPU port + parallel columns must close ~10–15×, which is the expected shape of the win. |
-| Bit-identical amplifier output NVIDIA vs AMD | ⬜ open | No GPU port yet. Interim proxy PASSING across three toolchains / two OSes: gcc 13 + clang 18 (Linux CI) and MSVC 14.51/VS2026 (Windows, 2026-07-19) all produce bit-identical digests (r16 `9daf74437728f98f`, r128 `114b7875547a16e5`/`2c9a03d2ffabfd88`). Real gate needs the GPU port; strategy in ADR-0001 (AMD leg = Matt's desktop 7800 XT, NVIDIA leg = rented/CI). |
+| Bit-identical amplifier output NVIDIA vs AMD | 🟨 half-open | **AMD leg PASSING** (2026-07-19): `vxc_gpu` (voxel-core/bench/gpu_harness.cpp, ADR-0001) dispatches the SPIR-V worldgen kernel (build/shaders/worldgen.ColumnMain.spv) on this desktop's AMD Radeon RX 7800 XT via a headless Vulkan 1.1 harness and byte-compares every field of every column against `vxc::Amplifier::column` — bit-exact over 32,768 columns across two dispatch regions (near-origin and a far/negative-coordinate region), digest `be28ce960bd5bcf6`. NVIDIA leg still open: needs a rented/CI Linux+NVIDIA runner producing the same `vxc_gpu` digest (ADR-0001 gate = identical digest on both legs). Interim cross-*compiler* proxy (gcc/clang/MSVC digests) still green as a secondary signal; see `determinism-cross-compiler` in CI. |
 
 ### Early 8³ vs 16³ data (CPU ref, will re-decide after GPU port)
 
@@ -27,8 +27,8 @@ call needs GPU meshing + render/memory numbers (M1).
 - [x] Greedy mesher (CPU ref); bricks/sec + 128m-radius wall-clock in bench
 - [x] Edit overlay + append-only log format (versioned, RLE brick diffs) + replay test
 - [ ] terrain-diffusion worker running (GPU machine)
-- [ ] GPU compute port of amplifier + mesher (GPU machine)
-- [ ] Cross-vendor (NV vs AMD) determinism CI
+- [x] GPU compute port of amplifier (worldgen.hlsl ColumnMain, Vulkan harness verified bit-exact on AMD leg); mesher GPU port still pending
+- [ ] Cross-vendor (NV vs AMD) determinism CI (AMD leg passing locally; NVIDIA leg needs a rented/CI runner)
 
 ## M1+ — not started
 
