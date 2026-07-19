@@ -1,5 +1,6 @@
 # build outputs
 build/
+build-*/
 tile-cache/
 
 # tool-generated search indexes
