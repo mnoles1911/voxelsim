@@ -63,10 +63,14 @@ jobs:
         with:
           pattern: digest-*
       - name: Compare digests
+        # tr strips the CRLF the Windows job writes; compare bytes after that.
         run: |
-          cat digest-g++/digest.txt digest-clang++/digest.txt digest-msvc/digest.txt
-          diff digest-g++/digest.txt digest-clang++/digest.txt || exit 1
-          diff digest-clang++/digest.txt digest-msvc/digest.txt || exit 1
+          tr -d '\r' < digest-g++/digest.txt > a.txt
+          tr -d '\r' < digest-clang++/digest.txt > b.txt
+          tr -d '\r' < digest-msvc/digest.txt > c.txt
+          cat a.txt b.txt c.txt
+          diff a.txt b.txt
+          diff b.txt c.txt
 
   # Doctrine §2.3: no floating point in world-derivation code. Bench/timing
   # and UE-side rendering are outside the boundary.

@@ -1,0 +1,300 @@
+#include "VoxelChunkComponent.h"
+
+#include "VoxelCoords.h"
+
+#include "DynamicMeshBuilder.h"
+#include "Engine/CollisionProfile.h"
+#include "Engine/Engine.h"
+#include "MaterialDomain.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialRenderProxy.h"
+#include "PrimitiveDrawingUtils.h"
+#include "PrimitiveSceneProxy.h"
+#include "PrimitiveUniformShaderParametersBuilder.h"
+#include "PrimitiveViewRelevance.h"
+#include "SceneInterface.h"
+#include "SceneView.h"
+#include "StaticMeshResources.h"
+
+// FVoxelChunkSceneProxy -----------------------------------------------------
+//
+// Doctrine (docs/voxel-earth-implementation-plan.md SS3.3 Band 1): hand-rolled
+// FPrimitiveSceneProxy, NOT ProceduralMeshComponent / UDynamicMesh. Structure
+// (buffers / InitResources / GetDynamicMeshElements) follows the engine's
+// CustomMeshComponent plugin 1:1 -- see
+// Engine/Plugins/Runtime/CustomMeshComponent/Source/CustomMeshComponent/Private/CustomMeshComponent.cpp
+// in the installed UE 5.7 -- with quads (4 verts / 6 indices) in place of
+// its raw triangle list, and per-vertex color/normal driven by voxel-core's
+// greedy-mesher output instead of a flat white color.
+class FVoxelChunkSceneProxy final : public FPrimitiveSceneProxy
+{
+public:
+	SIZE_T GetTypeHash() const override
+	{
+		static size_t UniquePointer;
+		return reinterpret_cast<size_t>(&UniquePointer);
+	}
+
+	explicit FVoxelChunkSceneProxy(UVoxelChunkComponent* Component)
+		: FPrimitiveSceneProxy(Component)
+		, VertexFactory(GetScene().GetFeatureLevel(), "FVoxelChunkSceneProxy")
+	{
+		static const FVector3f AxisDir[3] = {FVector3f(1, 0, 0), FVector3f(0, 1, 0), FVector3f(0, 0, 1)};
+
+		const int32 NumQuads = Component->ChunkQuads.Num();
+		TArray<FDynamicMeshVertex> Vertices;
+		Vertices.Reserve(NumQuads * 4);
+		IndexBuffer.Indices.Reserve(NumQuads * 6);
+
+		// World-planar UV origin (docs deliverable: "UV = world-planar
+		// (position on the two in-plane axes / 100.0f)"). Component-> is a
+		// game-thread accessor, safe here because CreateSceneProxy (which
+		// constructs this proxy) runs on the game thread; GetLocalToWorld()
+		// on the proxy itself is NOT valid yet at construction time (it is
+		// only populated later, when the primitive is added to the scene).
+		const FVector ComponentWorldOrigin = Component->GetComponentLocation();
+
+		for (const FVoxelChunkQuad& Q : Component->ChunkQuads)
+		{
+			const int32 Axis = Q.Axis;
+			const int32 U = (Axis + 1) % 3;
+			const int32 V = (Axis + 2) % 3;
+			const float FaceCoordVox = float(Q.Slice) + (Q.Positive ? 1.f : 0.f);
+			const float U0 = float(Q.U0), V0 = float(Q.V0);
+			const float U1 = U0 + float(Q.W), V1 = V0 + float(Q.H);
+
+			auto MakePos = [&](float Uc, float Vc) -> FVector3f
+			{
+				FVector3f P;
+				P[Axis] = FaceCoordVox;
+				P[U] = Uc;
+				P[V] = Vc;
+				return P * float(VoxelCoords::VoxelSizeUU);
+			};
+
+			// Quad loop (u0,v0) -> (u0,v1) -> (u1,v1) -> (u1,v0); corner
+			// indices below match the 2-bits-per-corner AO packing documented
+			// in voxelcore/mesher.h: (0,0),(1,0),(0,1),(1,1).
+			FVector3f Pos[4] = {MakePos(U0, V0), MakePos(U0, V1), MakePos(U1, V1), MakePos(U1, V0)};
+
+			const uint8 Ao00 = Q.Ao & 0x3;
+			const uint8 Ao10 = (Q.Ao >> 2) & 0x3;
+			const uint8 Ao01 = (Q.Ao >> 4) & 0x3;
+			const uint8 Ao11 = (Q.Ao >> 6) & 0x3;
+			const uint8 AoAtVert[4] = {Ao00, Ao01, Ao11, Ao10};
+
+			const FVector3f Normal = AxisDir[Axis] * (Q.Positive ? 1.f : -1.f);
+			const FVector3f TangentX = AxisDir[U];
+			const FVector3f TangentY = AxisDir[V];
+
+			const int32 BaseVertex = Vertices.Num();
+			for (int32 CornerIdx = 0; CornerIdx < 4; ++CornerIdx)
+			{
+				FDynamicMeshVertex Vert;
+				Vert.Position = Pos[CornerIdx];
+				Vert.SetTangents(TangentX, TangentY, Normal);
+
+				const float WorldU = (Pos[CornerIdx][U] + float(ComponentWorldOrigin[U])) / 100.f;
+				const float WorldV = (Pos[CornerIdx][V] + float(ComponentWorldOrigin[V])) / 100.f;
+				Vert.TextureCoordinate[0] = FVector2f(WorldU, WorldV);
+
+				// R = material id, G = AO (2-bit -> 0/85/170/255), B unused,
+				// A = 255 (deliverable 3 vertex-color spec).
+				const uint8 AoByte = uint8(AoAtVert[CornerIdx] * 85);
+				Vert.Color = FColor(Q.Mat, AoByte, 0, 255);
+
+				Vertices.Add(Vert);
+			}
+
+			// Winding: the (u0,v0)->(u0,v1)->(u1,v1)->(u1,v0) loop is used
+			// as-is for Positive faces and reversed for negative faces, so
+			// the two face directions always wind oppositely (the essential
+			// correctness property -- see report for the two-sided-material
+			// note covering absolute engine winding convention).
+			if (Q.Positive)
+			{
+				IndexBuffer.Indices.Add(BaseVertex + 0);
+				IndexBuffer.Indices.Add(BaseVertex + 1);
+				IndexBuffer.Indices.Add(BaseVertex + 2);
+				IndexBuffer.Indices.Add(BaseVertex + 0);
+				IndexBuffer.Indices.Add(BaseVertex + 2);
+				IndexBuffer.Indices.Add(BaseVertex + 3);
+			}
+			else
+			{
+				IndexBuffer.Indices.Add(BaseVertex + 0);
+				IndexBuffer.Indices.Add(BaseVertex + 2);
+				IndexBuffer.Indices.Add(BaseVertex + 1);
+				IndexBuffer.Indices.Add(BaseVertex + 0);
+				IndexBuffer.Indices.Add(BaseVertex + 3);
+				IndexBuffer.Indices.Add(BaseVertex + 2);
+			}
+		}
+
+		VertexBuffers.InitFromDynamicVertex(&VertexFactory, Vertices);
+
+		// Enqueue initialization of render resources (matches
+		// CustomMeshComponent.cpp exactly).
+		BeginInitResource(&VertexBuffers.PositionVertexBuffer);
+		BeginInitResource(&VertexBuffers.StaticMeshVertexBuffer);
+		BeginInitResource(&VertexBuffers.ColorVertexBuffer);
+		BeginInitResource(&IndexBuffer);
+		BeginInitResource(&VertexFactory);
+
+		Material = Component->ChunkMaterial;
+		if (Material == nullptr)
+		{
+			Material = UMaterial::GetDefaultMaterial(MD_Surface);
+		}
+		MaterialRelevance = Material->GetRelevance_Concurrent(GetScene().GetShaderPlatform());
+	}
+
+	virtual ~FVoxelChunkSceneProxy() override
+	{
+		VertexBuffers.PositionVertexBuffer.ReleaseResource();
+		VertexBuffers.StaticMeshVertexBuffer.ReleaseResource();
+		VertexBuffers.ColorVertexBuffer.ReleaseResource();
+		IndexBuffer.ReleaseResource();
+		VertexFactory.ReleaseResource();
+	}
+
+	virtual void GetDynamicMeshElements(const TArray<const FSceneView*>& Views, const FSceneViewFamily& ViewFamily,
+	                                     uint32 VisibilityMap, FMeshElementCollector& Collector) const override
+	{
+		QUICK_SCOPE_CYCLE_COUNTER(STAT_VoxelChunkSceneProxy_GetDynamicMeshElements);
+
+		const bool bWireframe = AllowDebugViewmodes() && ViewFamily.EngineShowFlags.Wireframe;
+
+		FMaterialRenderProxy* MaterialProxy = nullptr;
+		if (bWireframe)
+		{
+			auto WireframeMaterialInstance = new FColoredMaterialRenderProxy(
+				GEngine->WireframeMaterial ? GEngine->WireframeMaterial->GetRenderProxy() : nullptr,
+				FLinearColor(0, 0.5f, 1.f));
+			Collector.RegisterOneFrameMaterialProxy(WireframeMaterialInstance);
+			MaterialProxy = WireframeMaterialInstance;
+		}
+		else
+		{
+			MaterialProxy = Material->GetRenderProxy();
+		}
+
+		for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ViewIndex++)
+		{
+			if (VisibilityMap & (1 << ViewIndex))
+			{
+				const FSceneView* View = Views[ViewIndex];
+
+				FMeshBatch& Mesh = Collector.AllocateMesh();
+				FMeshBatchElement& BatchElement = Mesh.Elements[0];
+				BatchElement.IndexBuffer = &IndexBuffer;
+				Mesh.bWireframe = bWireframe;
+				Mesh.VertexFactory = &VertexFactory;
+				Mesh.MaterialRenderProxy = MaterialProxy;
+
+				FDynamicPrimitiveUniformBuffer& DynamicPrimitiveUniformBuffer =
+					Collector.AllocateOneFrameResource<FDynamicPrimitiveUniformBuffer>();
+				FPrimitiveUniformShaderParametersBuilder Builder;
+				BuildUniformShaderParameters(Builder);
+				DynamicPrimitiveUniformBuffer.Set(Collector.GetRHICommandList(), Builder);
+				BatchElement.PrimitiveUniformBufferResource = &DynamicPrimitiveUniformBuffer.UniformBuffer;
+
+				BatchElement.FirstIndex = 0;
+				BatchElement.NumPrimitives = IndexBuffer.Indices.Num() / 3;
+				BatchElement.MinVertexIndex = 0;
+				BatchElement.MaxVertexIndex = VertexBuffers.PositionVertexBuffer.GetNumVertices() - 1;
+				Mesh.ReverseCulling = IsLocalToWorldDeterminantNegative();
+				Mesh.Type = PT_TriangleList;
+				Mesh.DepthPriorityGroup = SDPG_World;
+				Mesh.bCanApplyViewModeOverrides = false;
+				Collector.AddMesh(ViewIndex, Mesh);
+			}
+		}
+	}
+
+	virtual FPrimitiveViewRelevance GetViewRelevance(const FSceneView* View) const override
+	{
+		FPrimitiveViewRelevance Result;
+		Result.bDrawRelevance = IsShown(View);
+		Result.bShadowRelevance = IsShadowCast(View);
+		Result.bDynamicRelevance = true;
+		Result.bRenderInMainPass = ShouldRenderInMainPass();
+		Result.bUsesLightingChannels = GetLightingChannelMask() != GetDefaultLightingChannelMask();
+		Result.bRenderCustomDepth = ShouldRenderCustomDepth();
+		Result.bTranslucentSelfShadow = bCastVolumetricTranslucentShadow;
+		MaterialRelevance.SetPrimitiveViewRelevance(Result);
+		Result.bVelocityRelevance = DrawsVelocity() && Result.bOpaque && Result.bRenderInMainPass;
+		return Result;
+	}
+
+	virtual bool CanBeOccluded() const override { return !MaterialRelevance.bDisableDepthTest; }
+
+	virtual uint32 GetMemoryFootprint() const override { return sizeof(*this) + GetAllocatedSize(); }
+
+	uint32 GetAllocatedSize() const { return FPrimitiveSceneProxy::GetAllocatedSize(); }
+
+private:
+	UMaterialInterface* Material = nullptr;
+	FStaticMeshVertexBuffers VertexBuffers;
+	FDynamicMeshIndexBuffer32 IndexBuffer;
+	FLocalVertexFactory VertexFactory;
+	FMaterialRelevance MaterialRelevance;
+};
+
+// UVoxelChunkComponent --------------------------------------------------
+
+UVoxelChunkComponent::UVoxelChunkComponent(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+	PrimaryComponentTick.bCanEverTick = false;
+
+	// Terrain collision is a custom DDA raycast/box-sweep against the brick
+	// grid (docs/voxel-earth-implementation-plan.md SS3.3), not Chaos -- this
+	// render-only primitive must not participate in Chaos collision.
+	SetCollisionProfileName(UCollisionProfile::NoCollision_ProfileName);
+	SetGenerateOverlapEvents(false);
+}
+
+void UVoxelChunkComponent::SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, int32 InChunkEdgeVoxels)
+{
+	ChunkQuads = MoveTemp(InQuads);
+	ChunkEdgeVoxels = InChunkEdgeVoxels;
+
+	MarkRenderStateDirty();
+	UpdateBounds();
+}
+
+FPrimitiveSceneProxy* UVoxelChunkComponent::CreateSceneProxy()
+{
+	if (ChunkQuads.Num() == 0)
+	{
+		return nullptr;
+	}
+	return new FVoxelChunkSceneProxy(this);
+}
+
+FBoxSphereBounds UVoxelChunkComponent::CalcBounds(const FTransform& LocalToWorld) const
+{
+	const float Extent = float(ChunkEdgeVoxels) * float(VoxelCoords::VoxelSizeUU);
+	const FBox LocalBox(FVector::ZeroVector, FVector(Extent, Extent, Extent));
+	return FBoxSphereBounds(LocalBox).TransformBy(LocalToWorld);
+}
+
+UMaterialInterface* UVoxelChunkComponent::GetMaterial(int32 ElementIndex) const
+{
+	return ElementIndex == 0 ? ChunkMaterial : nullptr;
+}
+
+void UVoxelChunkComponent::SetMaterial(int32 ElementIndex, UMaterialInterface* NewMaterial)
+{
+	if (ElementIndex == 0 && ChunkMaterial != NewMaterial)
+	{
+		ChunkMaterial = NewMaterial;
+		MarkRenderStateDirty();
+	}
+}
+
+int32 UVoxelChunkComponent::GetNumMaterials() const
+{
+	return 1;
+}
