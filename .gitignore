@@ -1,0 +1,20 @@
+# build outputs
+build/
+tile-cache/
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# editors/os
+.vscode/
+.idea/
+.DS_Store
+
+# UE (M1+)
+ue-project/Binaries/
+ue-project/DerivedDataCache/
+ue-project/Intermediate/
+ue-project/Saved/
