@@ -94,6 +94,21 @@ jobs:
       - name: Test (incl. golden tiles)
         run: cd terrain-service && python -m pytest -q
 
+  shader-compile:
+    name: Shader compilation (DXIL + SPIR-V)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch DXC
+        shell: pwsh
+        run: pwsh tools/fetch-dxc.ps1
+      - name: Compile shaders
+        shell: pwsh
+        run: pwsh tools/compile-shaders.ps1
+      - name: List produced artifacts
+        shell: pwsh
+        run: Get-ChildItem build/shaders
+
   docker-build:
     runs-on: ubuntu-24.04
     steps:
