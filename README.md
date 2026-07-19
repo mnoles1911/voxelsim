@@ -16,7 +16,7 @@ milestones). Current milestone status lives in [docs/status.md](docs/status.md).
 /terrain-service/   Python: terrain-diffusion worker, Flask tile API, disk cache
 /voxel-core/        C++20, UE-header-free, CMake: bricks, palettes, amplifier, mesher, editlog
 /voxel-core/bench/  headless benchmark + determinism harness
-/ue-project/        UE5 project consuming voxel-core as a module (M1+, not yet created)
+/ue-project/        UE 5.8 project (VoxelEarth) consuming voxel-core as a static lib
 /docs/              implementation plan, ADRs, milestone status
 ```
 
@@ -30,6 +30,21 @@ cmake --build build/voxel-core
 ctest --test-dir build/voxel-core --output-on-failure
 ./build/voxel-core/bench/vxc_bench --radius 32   # benchmark + determinism digest
 ```
+
+## Building ue-project (Windows, UE 5.8)
+
+Build voxel-core first (its static lib is linked by the UE module), then:
+
+```sh
+"<UE_5.8>/Engine/Build/BatchFiles/Build.bat" VoxelEarthEditor Win64 Development -project="<repo>/ue-project/VoxelEarth.uproject"
+```
+
+Visual verification without the editor: run the game with
+`-VoxelScreenshotAfter=<seconds>` (screenshots land in
+`ue-project/Saved/Screenshots`); `-VoxelDefaultMaterial` isolates material
+issues. The editor hosts the native Model Context Protocol server on
+`http://127.0.0.1:8000/mcp` (auto-start; `.mcp.json` at repo root connects
+Claude Code to it).
 
 ## Running terrain-service
 

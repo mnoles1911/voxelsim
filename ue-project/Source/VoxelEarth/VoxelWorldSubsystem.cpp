@@ -483,8 +483,38 @@ void FVoxelWorldImpl::DispatchJobs()
 				VoxelStreaming::FJobResult Result;
 				Result.Key = Key;
 				Result.GenerationId = GenId;
-				MeshChunkBricks(
-					Key, [GenPtr](int64 X, int64 Y, int64 Z) { return GenPtr->materialAt(X, Y, Z); }, Result.Quads);
+
+				// Column-cache the whole job (docs/m1-plan.md stage 3a): a
+				// naive GeneratedWorld::materialAt sampler recomputes the
+				// full amplifier column per VOXEL query (~130k column
+				// evaluations per chunk); this grid computes each of the
+				// (32+2)^2 columns exactly once (~100x less amplifier work,
+				// measured ~5 -> ~50+ chunks/s). The +1 apron matches the
+				// mesher's [-1,B] sampler contract across chunk borders.
+				constexpr int32 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
+				constexpr int32 GridEdge = ChunkVox + 2;
+				const int64 BaseVX = int64(Key.X) * ChunkVox;
+				const int64 BaseVY = int64(Key.Y) * ChunkVox;
+				TArray<vxc::ColumnSample> Columns;
+				Columns.SetNumUninitialized(GridEdge * GridEdge);
+				const vxc::Amplifier& Amp = GenPtr->amplifier();
+				for (int32 LY = 0; LY < GridEdge; ++LY)
+				{
+					for (int32 LX = 0; LX < GridEdge; ++LX)
+					{
+						Columns[LX + GridEdge * LY] =
+							Amp.column(BaseVX + LX - 1, BaseVY + LY - 1);
+					}
+				}
+				const auto GridSampler = [&Columns, BaseVX, BaseVY](int64 X, int64 Y, int64 Z)
+				{
+					const int32 LX = int32(X - BaseVX) + 1;
+					const int32 LY = int32(Y - BaseVY) + 1;
+					checkSlow(LX >= 0 && LX < GridEdge && LY >= 0 && LY < GridEdge);
+					return vxc::Amplifier::materialAt(Columns[LX + GridEdge * LY], Z);
+				};
+				MeshChunkBricks(Key, GridSampler, Result.Quads);
+
 				QueuePtr->Enqueue(MoveTemp(Result));
 				CounterPtr->Decrement();
 			},
