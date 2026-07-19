@@ -20,7 +20,10 @@ public class VoxelEarth : ModuleRules
 			// SS3.3 Band 1 -- NOT ProceduralMeshComponent): FLocalVertexFactory,
 			// FStaticMeshVertexBuffers, FDynamicMeshIndexBuffer32.
 			"RenderCore",
-			"RHI"
+			"RHI",
+			// Stage 2: legacy raw-key input bindings (EKeys::W, EKeys::LeftMouseButton, ...)
+			// on AVoxelEarthFlyPawn / AVoxelEarthPlayerController -- no Enhanced Input assets.
+			"InputCore"
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[] { });
