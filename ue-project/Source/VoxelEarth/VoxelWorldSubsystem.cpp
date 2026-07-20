@@ -969,3 +969,40 @@ bool UVoxelWorldSubsystem::IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const
 	// solid, for walk-mode collision to agree with what dig/place just did.
 	return Impl->Voxels.materialAt(Vx, Vy, Vz) != vxc::MAT_AIR;
 }
+
+bool UVoxelWorldSubsystem::RaycastVoxelWorld(const FVector& StartUU, const FVector& DirUU, double MaxDistUU,
+                                              FVector& OutHitVoxelCenterUU, FVector& OutPrevVoxelCenterUU) const
+{
+	if (!Impl || MaxDistUU <= 0.0)
+	{
+		return false;
+	}
+
+	const FVector Dir = DirUU.GetSafeNormal();
+	if (Dir.IsNearlyZero())
+	{
+		return false;
+	}
+
+	// Same mm conversion as the dig/place raycast (CastFromCamera above);
+	// kept independent (not shared) so this method stays self-contained for
+	// the parallel file-ownership split noted in docs/m1-plan.md.
+	const int64 OxMm = VoxelCoords::WorldToMm(StartUU.X);
+	const int64 OyMm = VoxelCoords::WorldToMm(StartUU.Y);
+	const int64 OzMm = VoxelCoords::WorldToMm(StartUU.Z);
+	const double RangeMm = MaxDistUU * 10.0; // UU -> mm (1 UU = 10 mm)
+	const int64 DxMm = (int64)FMath::RoundToDouble(Dir.X * RangeMm);
+	const int64 DyMm = (int64)FMath::RoundToDouble(Dir.Y * RangeMm);
+	const int64 DzMm = (int64)FMath::RoundToDouble(Dir.Z * RangeMm);
+
+	const auto MaterialFn = [this](int64 X, int64 Y, int64 Z) { return Impl->Voxels.materialAt(X, Y, Z); };
+	const vxc::RaycastHit Hit = vxc::raycastVoxels(MaterialFn, OxMm, OyMm, OzMm, DxMm, DyMm, DzMm);
+	if (!Hit.hit)
+	{
+		return false;
+	}
+
+	OutHitVoxelCenterUU = VoxelCoords::VoxelToWorldCenter(VoxelCoords::FVoxelCoord{Hit.vx, Hit.vy, Hit.vz});
+	OutPrevVoxelCenterUU = VoxelCoords::VoxelToWorldCenter(VoxelCoords::FVoxelCoord{Hit.px, Hit.py, Hit.pz});
+	return true;
+}

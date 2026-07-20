@@ -98,6 +98,20 @@ public:
 	// a physics engine.
 	bool IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const;
 
+	// Deterministic voxel DDA raycast (voxelcore/raycast.h) from StartUU along
+	// DirUU (need not be normalized -- normalized internally), out to
+	// MaxDistUU. Used by AVoxelEarthFlyPawn for the over-the-shoulder camera's
+	// collision-aware pull-in (Player experience decisions table, "Cameras"
+	// row): terrain has no Chaos collision, so USpringArmComponent's probe
+	// can't be used -- this gives the same DDA the dig/place raycast uses
+	// instead. On hit, OutHitVoxelCenterUU is the first solid voxel's center
+	// and OutPrevVoxelCenterUU is the center of the last empty voxel before
+	// it (project the segment head->OutPrevVoxelCenterUU to know how far the
+	// camera can safely sit along the ray). Returns false (outputs
+	// untouched) if nothing solid is hit within MaxDistUU. Game thread only
+	// (same constraint as IsSolidAtVoxel).
+	bool RaycastVoxelWorld(const FVector& StartUU, const FVector& DirUU, double MaxDistUU, FVector& OutHitVoxelCenterUU, FVector& OutPrevVoxelCenterUU) const;
+
 private:
 	TUniquePtr<FVoxelWorldImpl> Impl;
 
