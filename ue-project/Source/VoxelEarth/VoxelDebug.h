@@ -71,6 +71,14 @@ namespace VoxelDebug
 	// Ring level debug tint colors (m2-plan.md item 4): R0 green .. R4
 	// magenta, indexed by VoxelCoords::kNumLevels. Clamped to a valid index.
 	VOXELEARTH_API FLinearColor RingLevelTint(int32 Level);
+
+	// Band 3 debug tint (m2-plan.md "Debug" row; docs/debug-tooling-plan.md
+	// palette: "R4 magenta, heightmap band cyan") -- applied to every
+	// AVoxelClipmapActor level's DebugTint parameter while voxel.Debug.Rings
+	// is live under mode 2, same MID-lazy-create/clear doctrine every other
+	// debug-tint call site in this module follows (see
+	// UVoxelChunkComponent::SetDebugTint/ClearDebugTint).
+	VOXELEARTH_API FLinearColor HeightmapBandTint();
 }
 
 // --- Perf HUD data (P1 "Perf HUD") ------------------------------------------
