@@ -79,6 +79,68 @@ void AVoxelEarthGameMode::BeginPlay()
 		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelDebugRings: forcing voxel.Debug=2, voxel.Debug.Rings=1"));
 	}
 
+	// M2 wave 2 item 2 verification (docs/m2-plan.md "Distant-edit mip
+	// propagation"): -VoxelHeadlessDigTest[=<delaySeconds>] carves a sphere
+	// ~100m from spawn (see the CarveOffsetUU comment below for WHY it can't
+	// be at the anchor itself) once the player has had time to settle in
+	// (default 20s -- R1 chunks near the inner edge of its 64-128m annulus
+	// typically resident by then, per wave-1's measured fill rates in
+	// docs/status.md's M2 section) so the dig lands on terrain that's
+	// actually streamed in as an R1+ chunk, rather than racing streaming.
+	// Combine with -VoxelScreenshotAfter=<seconds> (existing switch, with a
+	// larger seconds value so the capture happens AFTER the carve) for a
+	// self-contained headless dig-then-screenshot run. The carve itself logs
+	// "Distant-edit mip propagation" (every dirtied ancestor chunk, every
+	// level) and "Distant-edit mip re-mesh" (every level>=1 chunk that
+	// actually re-meshed via the overlay-aware path) lines from
+	// VoxelWorldSubsystem.cpp -- that log evidence proves R1+ propagation
+	// independent of whether a screenshot is also requested.
+	float DigTestDelaySeconds = 20.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelHeadlessDigTest="), DigTestDelaySeconds) ||
+	    FParse::Param(FCommandLine::Get(), TEXT("VoxelHeadlessDigTest")))
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelHeadlessDigTest: carving near spawn in %.1fs"), DigTestDelaySeconds);
+		GetWorldTimerManager().SetTimer(
+			HeadlessDigTestTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this]()
+				{
+					UWorld* DigWorld = GetWorld();
+					APlayerController* PC = DigWorld ? DigWorld->GetFirstPlayerController() : nullptr;
+					APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+					UVoxelWorldSubsystem* Subsystem = DigWorld ? DigWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					if (!Pawn || !Subsystem)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelHeadlessDigTest: no pawn/subsystem yet, skipping carve."));
+						return;
+					}
+					// Rings are an ANNULUS around the anchor (m2-plan.md "Ring
+					// structure" row): R1's own inner edge excludes anything
+					// within 64m of the anchor (that band is R0's exclusive
+					// territory), so a carve AT the pawn's own location would
+					// never have a resident R1+ chunk to re-mesh -- there is
+					// nothing to prove propagation against. Offsetting 100m
+					// along X lands inside R1's [64,128) annulus instead,
+					// where a chunk has actually streamed in as pure-generated
+					// by dig time, giving MarkChunkDirtyForRemesh a real
+					// resident record to requeue.
+					constexpr double CarveOffsetUU = 10000.0; // 100m, inside R1's annulus
+					constexpr double RadiusUU = 1000.0;       // 10m
+					constexpr double JitterUU = 200.0;        // 2m
+					const FVector PawnLoc = Pawn->GetActorLocation();
+					const double TargetX = PawnLoc.X + CarveOffsetUU;
+					const double TargetY = PawnLoc.Y;
+					const double SurfaceUU = Subsystem->GetSurfaceHeightUU(TargetX, TargetY);
+					const FVector CarveCenter(TargetX, TargetY, SurfaceUU);
+					const int32 Removed = Subsystem->CarveSphere(CarveCenter, RadiusUU, JitterUU);
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelHeadlessDigTest: carved at (%.0f,%.0f,%.0f) r=%.0fUU, removed %d voxels -- watch for ")
+					       TEXT("'Distant-edit mip propagation'/'Distant-edit mip re-mesh' log lines (LogVoxelEdit)."),
+					       CarveCenter.X, CarveCenter.Y, CarveCenter.Z, RadiusUU, Removed);
+				}),
+			DigTestDelaySeconds, false);
+	}
+
 	// Unattended visual verification: -VoxelScreenshotAfter=<seconds> waits
 	// for streaming to populate, captures a screenshot, then quits ~3s later
 	// (screenshot write is async). Drives phase-verification captures from

@@ -24,6 +24,7 @@
 #include "GameFramework/Actor.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
+#include "HAL/CriticalSection.h"
 #include "HAL/PlatformMisc.h"
 #include "HAL/PlatformTime.h"
 #include "HAL/ThreadSafeCounter.h"
@@ -31,12 +32,14 @@
 #include "Materials/Material.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
+#include "Misc/ScopeRWLock.h"
 #include "Materials/MaterialInterface.h"
 #include "Stats/Stats.h"
 #include "Tasks/Task.h"
 #include "UObject/UObjectGlobals.h"
 
 #include <algorithm>
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 
@@ -133,7 +136,9 @@ void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const Material
 }
 
 // M2 mip sourcing (docs/m2-plan.md "Mip sourcing" row): a level-L (L>=1)
-// chunk job builds its bricks via vxc::MipChain<8> over a PURE-generated
+// chunk job builds its bricks via FCachedMipBuilder (below -- a
+// vxc::MipChain<8>-equivalent recursion over vxc::downsampleBricks, wired to
+// the cross-job FSharedMipCache as of M2 wave 2 item 1) over a PURE-generated
 // level-0 source -- the lock-free rule holds unchanged (workers never touch
 // World's overlay, only GeneratedWorld). A naive MipChain source that calls
 // GeneratedWorld::makeBrick(key) fresh on every request would recompute the
@@ -199,27 +204,276 @@ private:
 	TArray<uint64> RecencyOrder;
 };
 
-// Builds a per-job vxc::MipChain<8> whose level-0 source lazily materializes
-// bricks from GeneratedWorld via the column-grid cache above, and returns a
-// sampler closure (level-L absolute voxel coords -> MaterialId, valid on
-// [-1,B]^3 across brick AND chunk borders, matching meshBrick's contract)
-// bound to that chain at the requested Level. The returned std::function
-// keeps the MipChain and column cache alive via shared_ptr captures, so the
-// caller can pass the sampler straight into MeshChunkBricks without worrying
-// about lifetime -- everything is freed once the sampler itself goes out of
-// scope at the end of the worker job.
+// M2 wave 2 item 1 ("Cross-job mip caching", docs/m2-plan.md): a shared,
+// thread-safe, read-mostly cache of PURE-GENERATED level>=1 mip bricks
+// (vxc::downsampleBricks output), keyed by (level, BrickKey) via
+// vxc::MipKey/vxc::MipKeyHash (voxelcore/mips.h, read-only this wave -- its
+// public key/hash types are reused as-is rather than duplicated). Wave 1
+// rebuilt every level from scratch inside a fresh PER-JOB vxc::MipChain<8>
+// (measured worker p95 ~296ms on high-level jobs); the same (level,key) mip
+// brick is frequently rebuilt by MULTIPLE jobs (adjacent chunks at the same
+// level share intermediate ancestors, and a job building one level-4 chunk
+// recomputes every level-1..3 ancestor a sibling job needs too) -- this
+// cache amortizes that across jobs AND across levels within one job.
+//
+// Safe under the lock-free doctrine's "workers never touch the overlay"
+// rule: every entry here is a DETERMINISTIC function of (seed, level, key)
+// computed via GeneratedWorld only -- see FCachedMipBuilder below, whose two
+// call sites are MakeLevelSampler (worker path, SharedCache=this) and
+// MakeOverlayAwareLevelSampler (game-thread edited-mip path,
+// SharedCache=nullptr BY CONSTRUCTION so an edited region's mip bricks can
+// NEVER be written here). Edits explicitly invalidate (remove) affected
+// entries instead (FVoxelWorldImpl::PropagateEditToMips) rather than this
+// cache ever being allowed to hold an overlay-tainted value.
+//
+// Sharded (FRWLock-guarded std::unordered_map per shard) so concurrent
+// worker jobs don't serialize on one global lock. Find() returns a COPY
+// under the read lock rather than a pointer/reference: the target shard's
+// map can rehash on a concurrent writer, which would invalidate anything
+// crossing the lock boundary by reference. Brick<8> copies are cheap in the
+// overwhelmingly common homogeneous case (no heap allocation -- see
+// Brick<B>::isHomogeneous); non-homogeneous bricks pay a small heap copy,
+// acceptable given this replaces a full recursive re-downsample on a hit.
+// No eviction yet (per this wave's scope); BrickCount/BytesUsed are
+// maintained incrementally for the perf HUD's memory row.
+class FSharedMipCache
+{
+public:
+	using BrickT = vxc::Brick<VoxelCoords::BrickEdgeVoxels>;
+
+	bool Find(int32 Level, const vxc::BrickKey& Key, BrickT& OutBrick) const
+	{
+		const vxc::MipKey MK{Level, Key};
+		const FShard& Shard = ShardFor(MK);
+		FRWScopeLock Lock(Shard.Lock, SLT_ReadOnly);
+		const auto Found = Shard.Map.find(MK);
+		if (Found == Shard.Map.end())
+		{
+			return false;
+		}
+		OutBrick = Found->second;
+		return true;
+	}
+
+	void Insert(int32 Level, const vxc::BrickKey& Key, const BrickT& Value)
+	{
+		const vxc::MipKey MK{Level, Key};
+		FShard& Shard = ShardFor(MK);
+		FRWScopeLock Lock(Shard.Lock, SLT_Write);
+		auto [It, bInserted] = Shard.Map.emplace(MK, Value);
+		if (bInserted)
+		{
+			BrickCount.fetch_add(1, std::memory_order_relaxed);
+			BytesUsed.fetch_add(EstimateBytes(Value), std::memory_order_relaxed);
+		}
+		else
+		{
+			// Two jobs racing a miss on the same (level,key) both build and
+			// insert -- harmless (same deterministic inputs => byte-identical
+			// output), just an overwrite rather than a true race on content.
+			It->second = Value;
+		}
+	}
+
+	// M2 wave 2 item 2 ("Distant-edit mip propagation"): removes a
+	// (level,key) entry if present -- called when an edit lands under this
+	// mip chunk's footprint, since the pure-generated value cached here is
+	// now stale for rendering (the chunk must take the overlay-aware
+	// game-thread path from now on, exactly like a level-0 edited chunk;
+	// see FVoxelWorldImpl::PropagateEditToMips).
+	void Invalidate(int32 Level, const vxc::BrickKey& Key)
+	{
+		const vxc::MipKey MK{Level, Key};
+		FShard& Shard = ShardFor(MK);
+		FRWScopeLock Lock(Shard.Lock, SLT_Write);
+		const auto Found = Shard.Map.find(MK);
+		if (Found != Shard.Map.end())
+		{
+			BytesUsed.fetch_sub(EstimateBytes(Found->second), std::memory_order_relaxed);
+			Shard.Map.erase(Found);
+			BrickCount.fetch_sub(1, std::memory_order_relaxed);
+		}
+	}
+
+	int64 GetBrickCount() const { return BrickCount.load(std::memory_order_relaxed); }
+	int64 GetBytesUsed() const { return BytesUsed.load(std::memory_order_relaxed); }
+
+private:
+	static constexpr int32 kNumShards = 16;
+
+	struct FShard
+	{
+		mutable FRWLock Lock;
+		std::unordered_map<vxc::MipKey, BrickT, vxc::MipKeyHash> Map;
+	};
+
+	FShard& ShardFor(const vxc::MipKey& Key) { return Shards[vxc::MipKeyHash{}(Key) % uint64(kNumShards)]; }
+	const FShard& ShardFor(const vxc::MipKey& Key) const { return Shards[vxc::MipKeyHash{}(Key) % uint64(kNumShards)]; }
+
+	static int64 EstimateBytes(const BrickT& Value)
+	{
+		// Approximate (public-API-only, since Brick<B>'s storage is private):
+		// base struct size, plus one byte per dense cell + one byte per
+		// palette entry for the non-homogeneous case (mirrors Brick<B>'s
+		// actual cells_/palette_ layout closely enough for an HUD memory row).
+		constexpr int64 Base = sizeof(BrickT);
+		if (Value.isHomogeneous())
+		{
+			return Base;
+		}
+		return Base + BrickT::kCells + int64(Value.paletteSize());
+	}
+
+	FShard Shards[kNumShards];
+	std::atomic<int64> BrickCount{0};
+	std::atomic<int64> BytesUsed{0};
+};
+
+// M2 wave 2 item 1: recursive level>=1 mip builder shared by BOTH the
+// pure-generated worker path and the overlay-aware game-thread path (only
+// the Level0Source callback and whether a FSharedMipCache is wired in
+// differ). Reimplements vxc::MipChain<B>'s recursion (voxelcore/mips.h,
+// read-only this wave: its brick()/cache_ are usable but cache_ is private
+// with no seeding hook, so a per-job-only cache can't be shared across jobs
+// without this wrapper) using mips.h's PUBLIC downsampleBricks<B> directly,
+// so every level of the recursion -- not just the job's own target level --
+// consults/populates FSharedMipCache. A job-local map still backs every
+// pointer this returns (both cache hits and freshly-built bricks are copied
+// in here) so pointers stay valid for the sampler's whole lifetime, exactly
+// like vxc::MipChain<B>::cache_ did per-job in wave 1.
+class FCachedMipBuilder
+{
+public:
+	using BrickT = vxc::Brick<VoxelCoords::BrickEdgeVoxels>;
+	using Level0SourceFn = std::function<const BrickT*(const vxc::BrickKey&)>;
+
+	// SharedCache == nullptr disables cross-job caching entirely (both read
+	// and write) -- this is how the overlay-aware game-thread path
+	// (MakeOverlayAwareLevelSampler) structurally guarantees it can never
+	// pollute the pure shared cache with an edited value, rather than relying
+	// on a caller convention.
+	//
+	// GlobalEditEpoch/EpochSnapshot close a narrow cross-thread race: a
+	// worker job dispatched BEFORE an edit lands may still be mid-recursion
+	// when PropagateEditToMips (game thread) invalidates the very
+	// (level,key) entries this job is about to Insert -- without a check,
+	// the job's Insert would land AFTER the invalidate and silently
+	// resurrect a now-stale pure value. GlobalEditEpoch is
+	// FVoxelWorldImpl::EditEpoch (bumped once per edit batch, BEFORE
+	// invalidating, in PropagateEditToMips); EpochSnapshot is its value at
+	// job-dispatch time (DispatchJobs, same "snapshot at dispatch" idiom
+	// FChunkRecord::GenerationId already uses for stale-worker-RESULT
+	// discarding). If the epoch has moved by the time this job is ready to
+	// Insert, some edit landed mid-flight -- INSTEAD OF checking machinery
+	// to know whether it actually overlapped this specific brick, the whole
+	// Insert is conservatively skipped (a dropped cache-population
+	// opportunity, not a correctness issue: recomputed fresh next time).
+	// nullptr GlobalEditEpoch disables the check (used when SharedCache is
+	// also nullptr -- the overlay path never inserts here regardless).
+	FCachedMipBuilder(Level0SourceFn InLevel0Source, FSharedMipCache* InSharedCache, const std::atomic<uint64>* InGlobalEditEpoch,
+	                   uint64 InEpochSnapshot, int32 InThreshold = 4)
+		: Level0Source(std::move(InLevel0Source))
+		, SharedCache(InSharedCache)
+		, GlobalEditEpoch(InGlobalEditEpoch)
+		, EpochSnapshot(InEpochSnapshot)
+		, Threshold(InThreshold)
+	{
+	}
+
+	const BrickT* Brick(int32 Level, const vxc::BrickKey& Key)
+	{
+		if (Level <= 0)
+		{
+			return Level0Source(Key);
+		}
+
+		const vxc::MipKey MK{Level, Key};
+		const auto LocalFound = LocalCache.find(MK);
+		if (LocalFound != LocalCache.end())
+		{
+			return &LocalFound->second;
+		}
+
+		if (SharedCache)
+		{
+			BrickT Cached;
+			if (SharedCache->Find(Level, Key, Cached))
+			{
+				auto [It, Inserted] = LocalCache.emplace(MK, MoveTemp(Cached));
+				(void)Inserted;
+				return &It->second;
+			}
+		}
+
+		const BrickT* Children[8] = {};
+		bool bAnyChild = false;
+		for (int32 Cz = 0; Cz < 2; ++Cz)
+		{
+			for (int32 Cy = 0; Cy < 2; ++Cy)
+			{
+				for (int32 Cx = 0; Cx < 2; ++Cx)
+				{
+					const vxc::BrickKey ChildKey{Key.x * 2 + Cx, Key.y * 2 + Cy, Key.z * 2 + Cz};
+					const BrickT* Child = Brick(Level - 1, ChildKey);
+					if (Child)
+					{
+						bAnyChild = true;
+					}
+					Children[Cx + 2 * Cy + 4 * Cz] = Child;
+				}
+			}
+		}
+		if (!bAnyChild)
+		{
+			return nullptr; // whole 2x2x2 group is air; matches MipChain's convention (don't materialize).
+		}
+
+		BrickT Built = vxc::downsampleBricks<VoxelCoords::BrickEdgeVoxels>(Children, Threshold);
+		if (SharedCache && (!GlobalEditEpoch || GlobalEditEpoch->load() == EpochSnapshot))
+		{
+			SharedCache->Insert(Level, Key, Built);
+		}
+		auto [It, Inserted] = LocalCache.emplace(MK, MoveTemp(Built));
+		(void)Inserted;
+		return &It->second;
+	}
+
+private:
+	Level0SourceFn Level0Source;
+	FSharedMipCache* SharedCache;
+	const std::atomic<uint64>* GlobalEditEpoch;
+	uint64 EpochSnapshot;
+	int32 Threshold;
+	std::unordered_map<vxc::MipKey, BrickT, vxc::MipKeyHash> LocalCache;
+};
+
+// Builds a per-job level-L sampler (level-L absolute voxel coords ->
+// MaterialId, valid on [-1,B]^3 across brick AND chunk borders, matching
+// meshBrick's contract) whose level-0 source lazily materializes bricks from
+// GeneratedWorld via the column-grid cache above, and whose level>=1 bricks
+// go through FCachedMipBuilder wired to SharedCache (M2 wave 2 item 1: the
+// cross-job cache). The returned std::function keeps everything alive via a
+// shared_ptr capture, so the caller can pass the sampler straight into
+// MeshChunkBricks without worrying about lifetime -- freed once the sampler
+// itself goes out of scope at the end of the worker job. Worker path only
+// (pure GeneratedWorld source -- never touches World's overlay, per the
+// lock-free doctrine); see MakeOverlayAwareLevelSampler for the game-thread
+// edited-mip counterpart.
 std::function<vxc::MaterialId(int64, int64, int64)> MakeLevelSampler(const vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>& Gen,
-                                                                       int32 Level, vxc::Counters* PerfCounters)
+                                                                       int32 Level, vxc::Counters* PerfCounters,
+                                                                       FSharedMipCache* SharedCache,
+                                                                       const std::atomic<uint64>* GlobalEditEpoch, uint64 EpochSnapshot)
 {
 	using namespace vxc;
 	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
 
 	struct FJobMipState
 	{
-		FJobMipState(const GeneratedWorld<B>& InGen, Counters* InPerfCounters)
+		FJobMipState(const GeneratedWorld<B>& InGen, Counters* InPerfCounters, FSharedMipCache* InSharedCache,
+		             const std::atomic<uint64>* InGlobalEditEpoch, uint64 InEpochSnapshot)
 			: ColumnCache(InGen, InPerfCounters)
 			, Gen(InGen)
-			, Chain(
+			, Builder(
 				  [this](const BrickKey& Key) -> const Brick<B>*
 				  {
 					  auto Found = Level0Bricks.find(Key);
@@ -231,22 +485,83 @@ std::function<vxc::MaterialId(int64, int64, int64)> MakeLevelSampler(const vxc::
 					  auto [It, Inserted] = Level0Bricks.emplace(Key, Gen.makeBrick(Key, Grid));
 					  (void)Inserted;
 					  return &It->second;
-				  })
+				  },
+				  InSharedCache, InGlobalEditEpoch, InEpochSnapshot)
 		{
 		}
 
 		FJobColumnGridCache ColumnCache;
 		const GeneratedWorld<B>& Gen;
 		std::unordered_map<BrickKey, Brick<B>, BrickKeyHash> Level0Bricks;
-		MipChain<B> Chain;
+		FCachedMipBuilder Builder;
 	};
 
-	TSharedPtr<FJobMipState> State = MakeShared<FJobMipState>(Gen, PerfCounters);
+	TSharedPtr<FJobMipState> State = MakeShared<FJobMipState>(Gen, PerfCounters, SharedCache, GlobalEditEpoch, EpochSnapshot);
 
 	return [State, Level](int64 X, int64 Y, int64 Z) -> MaterialId
 	{
 		const BrickKey BKey{int32_t(floorDiv(X, B)), int32_t(floorDiv(Y, B)), int32_t(floorDiv(Z, B))};
-		const Brick<B>* B0 = State->Chain.brick(Level, BKey);
+		const Brick<B>* B0 = State->Builder.Brick(Level, BKey);
+		if (!B0)
+		{
+			return MAT_AIR;
+		}
+		const int Lx = int(floorMod(X, B));
+		const int Ly = int(floorMod(Y, B));
+		const int Lz = int(floorMod(Z, B));
+		return B0->get(Lx, Ly, Lz);
+	};
+}
+
+// M2 wave 2 item 2 ("Distant-edit mip propagation", docs/m2-plan.md): the
+// game-thread, overlay-aware counterpart to MakeLevelSampler -- sources
+// level-0 bricks from World::brickAt (edited version if present, else
+// generated; voxelcore/world.h) instead of a pure GeneratedWorld, so a mip
+// chunk built through this sampler reflects dig/place/carve edits underneath
+// it. Game thread only (World's overlay is not thread-safe, same constraint
+// as Voxels.materialAt elsewhere in this file). Deliberately constructs its
+// FCachedMipBuilder with SharedCache=nullptr: this is what makes it
+// structurally impossible for an edited mip brick to leak into the pure
+// cross-job FSharedMipCache (see that class's doc comment) -- caching here
+// is job-local (this single re-mesh call) only, same cost profile a per-job
+// vxc::MipChain<8> had in wave 1.
+std::function<vxc::MaterialId(int64, int64, int64)> MakeOverlayAwareLevelSampler(const vxc::World<VoxelCoords::BrickEdgeVoxels>& Voxels,
+                                                                                   int32 Level)
+{
+	using namespace vxc;
+	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
+
+	struct FOverlayMipState
+	{
+		FOverlayMipState(const World<B>& InVoxels)
+			: Voxels(InVoxels)
+			, Builder(
+				  [this](const BrickKey& Key) -> const Brick<B>*
+				  {
+					  auto Found = Level0Bricks.find(Key);
+					  if (Found != Level0Bricks.end())
+					  {
+						  return &Found->second;
+					  }
+					  auto [It, Inserted] = Level0Bricks.emplace(Key, Voxels.brickAt(Key));
+					  (void)Inserted;
+					  return &It->second;
+				  },
+				  /*SharedCache*/ nullptr, /*GlobalEditEpoch*/ nullptr, /*EpochSnapshot*/ 0)
+		{
+		}
+
+		const World<B>& Voxels;
+		std::unordered_map<BrickKey, Brick<B>, BrickKeyHash> Level0Bricks;
+		FCachedMipBuilder Builder;
+	};
+
+	TSharedPtr<FOverlayMipState> State = MakeShared<FOverlayMipState>(Voxels);
+
+	return [State, Level](int64 X, int64 Y, int64 Z) -> MaterialId
+	{
+		const BrickKey BKey{int32_t(floorDiv(X, B)), int32_t(floorDiv(Y, B)), int32_t(floorDiv(Z, B))};
+		const Brick<B>* B0 = State->Builder.Brick(Level, BKey);
 		if (!B0)
 		{
 			return MAT_AIR;
@@ -343,6 +658,12 @@ struct FVoxelWorldImpl
 		// timings"): sized once here so DrainResults never touches TArray
 		// growth on its hot path.
 		WorkerJobMsWindow.Init(0.f, WorkerJobMsWindowSize);
+		// M2 wave 2 item 1: same fixed-size-ring-buffer treatment, one window
+		// per ring level (report requirement: "worker p50/p95 per level").
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			LevelWorkerJobMsWindow[Level].Init(0.f, WorkerJobMsWindowSize);
+		}
 	}
 
 	vxc::SyntheticTileSampler Tiles;
@@ -360,11 +681,41 @@ struct FVoxelWorldImpl
 	// within level, lower level (finer) wins priority at equal distance").
 	// Sorted so Pop() (O(1), removes from the back) always yields the
 	// highest-priority pending chunk -- see SortPendingQueues.
-	TArray<VoxelCoords::FVoxelLevelChunkKey> PendingJobKeys;        // worker-dispatch pending (level 0 w/o edited brick, or any level>=1)
-	TArray<VoxelCoords::FVoxelLevelChunkKey> PendingGameThreadKeys; // overlay-aware game-thread mesh pending (level 0 only --
-	                                                                 // wave 1 limitation, see MarkChunkDirtyForRemesh doc comment)
+	TArray<VoxelCoords::FVoxelLevelChunkKey> PendingJobKeys;        // worker-dispatch pending (any level, minus edited-ancestor chunks)
+	TArray<VoxelCoords::FVoxelLevelChunkKey> PendingGameThreadKeys; // overlay-aware game-thread mesh pending -- ANY level as of
+	                                                                 // M2 wave 2 (see MarkChunkDirtyForRemesh/PropagateEditToMips)
 	TArray<VoxelCoords::FVoxelLevelChunkKey> PendingUnloadKeys;
 	TSet<VoxelCoords::FVoxelLevelChunkKey> PendingUnloadSet; // de-dupes PendingUnloadKeys across recomputes
+
+	// M2 wave 2 item 1 ("Cross-job mip caching"): shared cross-job cache of
+	// pure-generated level>=1 mip bricks, consulted/populated by every
+	// worker job's FCachedMipBuilder (see MakeLevelSampler). Owned here
+	// (outlives every job -- Deinitialize's WaitForInFlightTasks guarantees
+	// no job survives Impl, same lifetime assumption DispatchJobs already
+	// makes for GenPtr/QueuePtr/CounterPtr).
+	FSharedMipCache SharedMipCache;
+
+	// M2 wave 2 item 1: bumped once per edit batch, BEFORE SharedMipCache
+	// invalidation, in PropagateEditToMips -- lets an in-flight worker job
+	// (dispatched before the edit landed) detect that an edit raced its
+	// build and skip re-inserting a now-stale value (see FCachedMipBuilder's
+	// GlobalEditEpoch/EpochSnapshot doc comment). Same "snapshot at
+	// dispatch, compare later" idiom FChunkRecord::GenerationId already uses
+	// for stale-RESULT discarding, applied here to stale-CACHE-INSERT
+	// discarding instead.
+	std::atomic<uint64> EditEpoch{1};
+
+	// M2 wave 2 item 2 ("Distant-edit mip propagation"): per-level set of
+	// chunk keys known to have at least one edited level-0 voxel somewhere
+	// in their footprint (populated by PropagateEditToMips, consulted by
+	// RecomputeDesiredSet/DispatchJobs exactly like level 0's
+	// ChunkHasEditedBrick scan) -- index 0 is unused (level 0 keeps its
+	// existing live overlay scan, which is already exact; this table exists
+	// because scanning the overlay directly at level>=1 would mean visiting
+	// up to (ChunkEdgeBricks*2^Level)^3 level-0 brick keys per CANDIDATE
+	// chunk, prohibitive at L3/L4 -- this set is maintained incrementally
+	// instead, sized by edit count rather than footprint size).
+	TSet<VoxelCoords::FVoxelChunkKey> EditedAncestorChunks[VoxelCoords::kNumLevels];
 
 	TQueue<VoxelStreaming::FJobResult, EQueueMode::Mpsc> ResultsQueue;
 	FThreadSafeCounter JobsInFlightCounter;
@@ -414,6 +765,14 @@ struct FVoxelWorldImpl
 	int32 WorkerJobMsWindowNext = 0;
 	int32 WorkerJobMsWindowCount = 0;
 
+	// M2 wave 2 item 1: same rolling window, split per ring level (the perf
+	// report this wave asks for is "worker p50/p95 per level" -- the global
+	// window above averages every level together and would hide the wave-1
+	// regression this item fixes).
+	TArray<float> LevelWorkerJobMsWindow[VoxelCoords::kNumLevels];
+	int32 LevelWorkerJobMsWindowNext[VoxelCoords::kNumLevels] = {};
+	int32 LevelWorkerJobMsWindowCount[VoxelCoords::kNumLevels] = {};
+
 	// This-tick budget-saturation fractions (P1 "budget saturation (% of
 	// per-frame apply/unload/re-mesh budgets used)"), set by the three Drain*
 	// functions and blended together once per tick in UpdatePerfSnapshot.
@@ -462,13 +821,27 @@ private:
 	void ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
 	                      const VoxelCoords::FVoxelLevelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec, TArray<FVoxelChunkQuad>&& Quads,
 	                      bool bIsGameThreadMesh);
-	// Level 0 only (m2-plan.md "Distant edits" limitation -- see
-	// MarkChunkDirtyForRemesh doc comment): edits, the overlay, and re-mesh
-	// dirtying are all level-0 concepts in wave 1, so these keep taking a
-	// plain (level-implied-0) FVoxelChunkKey.
-	void MarkChunkDirtyForRemesh(const VoxelCoords::FVoxelChunkKey& Key);
+	// M2 wave 2: generalized from a level-0-only helper (wave 1) to any
+	// level -- both level-0 edited chunks AND their level>=1 mip ancestors
+	// (see PropagateEditToMips) route through here identically.
+	void MarkChunkDirtyForRemesh(const VoxelCoords::FVoxelLevelChunkKey& LevelKey);
+	// M2 wave 2 item 2 ("Distant-edit mip propagation"): for every level-0
+	// chunk key in DirtyLevel0Chunks (already apron-extended across
+	// render-chunk borders by CollectDirtyChunks), marks dirty the ancestor
+	// mip chunk at every level 1..kNumLevels-1 (cheap key math, see
+	// VoxelCoords::AncestorChunkKey), invalidates that footprint's entries
+	// in SharedMipCache (stale pure values), and records the ancestor in
+	// EditedAncestorChunks so it takes the overlay-aware path on any FUTURE
+	// load too (not just chunks that happen to be resident right now).
+	void PropagateEditToMips(const TSet<VoxelCoords::FVoxelChunkKey>& DirtyLevel0Chunks);
 	void CollectDirtyChunks(int64 Vx, int64 Vy, int64 Vz, TSet<VoxelCoords::FVoxelChunkKey>& Out) const;
 	bool ChunkHasEditedBrick(const VoxelCoords::FVoxelChunkKey& ChunkKey) const;
+	// M2 wave 2: "does this (level,chunk) currently need the overlay-aware
+	// game-thread mesh path" -- level 0 via ChunkHasEditedBrick's live scan,
+	// level>=1 via EditedAncestorChunks membership. Used by
+	// RecomputeDesiredSet (initial routing) and DispatchJobs (defensive
+	// re-check for an edit landing between recompute and dispatch).
+	bool NeedsOverlayAwarePath(const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const;
 	// Strict (no 1-brick border) variant used only for the "edited-chunk
 	// orange tint" test -- ChunkHasEditedBrick's border scan is correct for
 	// MESH ROUTING (a pristine chunk beside an edited one must also take the
@@ -643,6 +1016,20 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	                          TEXT("R3 loaded=%d pending=%d | R4 loaded=%d pending=%d"),
 	       LevelLoaded[0], LevelPending[0], LevelLoaded[1], LevelPending[1], LevelLoaded[2], LevelPending[2], LevelLoaded[3],
 	       LevelPending[3], LevelLoaded[4], LevelPending[4]);
+
+	// M2 wave 2 item 1 ("Cross-job mip caching"): per-level worker mesh-job
+	// ms (rolling-window p50/p95, LastPerfSnapshot -- refreshed at 1Hz
+	// whenever voxel.Debug >= 1, which -VoxelPerfRun forces on) plus the
+	// shared cross-job cache's memory footprint. This is the log-only
+	// evidence for the "report worker p50/p95 per level" measurement (a
+	// -VoxelPerfRun run has no HUD to screenshot).
+	const FVoxelPerfSnapshot& Snap = LastPerfSnapshot;
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel worker ms/level: R0 p50=%.2f p95=%.2f | R1 p50=%.2f p95=%.2f | R2 p50=%.2f p95=%.2f | ")
+	       TEXT("R3 p50=%.2f p95=%.2f | R4 p50=%.2f p95=%.2f | mipCache bricks=%lld bytes=%lld"),
+	       Snap.LevelWorkerMsP50[0], Snap.LevelWorkerMsP95[0], Snap.LevelWorkerMsP50[1], Snap.LevelWorkerMsP95[1],
+	       Snap.LevelWorkerMsP50[2], Snap.LevelWorkerMsP95[2], Snap.LevelWorkerMsP50[3], Snap.LevelWorkerMsP95[3],
+	       Snap.LevelWorkerMsP50[4], Snap.LevelWorkerMsP95[4], (long long)Snap.MipCacheBrickCount, (long long)Snap.MipCacheBytes);
 }
 
 // --- desired-set / hysteresis ------------------------------------------------
@@ -893,7 +1280,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					}
 
 					ChunkRecords.Add(LevelKey);
-					if (Level == 0 && ChunkHasEditedBrick(LevelKey.Key))
+					if (NeedsOverlayAwarePath(LevelKey))
 					{
 						PendingGameThreadKeys.Add(LevelKey);
 					}
@@ -927,11 +1314,11 @@ void FVoxelWorldImpl::DispatchJobs()
 			continue; // left the desired set between recompute and dispatch
 		}
 
-		// Defensive re-check (level 0 only -- see MakeLevelSampler doc
-		// comment on the wave-1 "higher levels never take the overlay path"
-		// limitation): an edit landing in this same tick, between recompute
-		// and dispatch, may have made this chunk edited-only.
-		if (LevelKey.Level == 0 && ChunkHasEditedBrick(LevelKey.Key))
+		// Defensive re-check (any level as of M2 wave 2 -- see
+		// NeedsOverlayAwarePath): an edit landing in this same tick, between
+		// recompute and dispatch, may have made this chunk (or one of its
+		// mip ancestors) edited-only.
+		if (NeedsOverlayAwarePath(LevelKey))
 		{
 			PendingGameThreadKeys.Add(LevelKey);
 			continue;
@@ -951,10 +1338,20 @@ void FVoxelWorldImpl::DispatchJobs()
 		TQueue<VoxelStreaming::FJobResult, EQueueMode::Mpsc>* QueuePtr = &ResultsQueue;
 		FThreadSafeCounter* CounterPtr = &JobsInFlightCounter;
 		vxc::Counters* PerfCountersPtr = &PerfCounters;
+		// M2 wave 2 item 1: shared cross-job mip cache -- see FSharedMipCache's
+		// doc comment for the lifetime/thread-safety argument (same "Impl
+		// outlives every job" guarantee as the three pointers above).
+		FSharedMipCache* SharedMipCachePtr = &SharedMipCache;
+		// M2 wave 2 item 1 race fix: snapshot the edit epoch at dispatch time
+		// (see FCachedMipBuilder's GlobalEditEpoch/EpochSnapshot doc comment,
+		// and EditEpoch's doc comment above) -- EditEpochPtr is read live at
+		// insert time, EditEpochSnapshot is this moment's value.
+		const std::atomic<uint64>* EditEpochPtr = &EditEpoch;
+		const uint64 EditEpochSnapshot = EditEpoch.load();
 
 		UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
 			TEXT("VoxelChunkMeshJob"),
-			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, PerfCountersPtr]()
+			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot]()
 			{
 				SCOPE_CYCLE_COUNTER(STAT_VoxelWorkerJob);
 				const double JobStartSeconds = FPlatformTime::Seconds();
@@ -1012,16 +1409,18 @@ void FVoxelWorldImpl::DispatchJobs()
 				else
 				{
 					// M2 mip sourcing (docs/m2-plan.md "Mip sourcing" row):
-					// level-L (L>=1) bricks come from a per-job vxc::MipChain<8>
-					// over a pure-GeneratedWorld level-0 source -- see
+					// level-L (L>=1) bricks come from a per-job FCachedMipBuilder
+					// over a pure-GeneratedWorld level-0 source, wired to the
+					// cross-job SharedMipCachePtr (M2 wave 2 item 1) -- see
 					// MakeLevelSampler's doc comment for the column-grid LRU
 					// that avoids the naive-recompute perf trap. Still lock-free
-					// (GenPtr only, never World/the overlay); wave-1 limitation:
-					// this NEVER checks for edited bricks, so higher levels
-					// render pure-generated even where level-0 edits exist
-					// underneath them (distant-edit mip propagation is a later
-					// M2 item, docs/m2-plan.md "Distant edits" row).
-					const auto LevelSampler = MakeLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr);
+					// (GenPtr only, never World/the overlay); by the time
+					// DispatchJobs pops this key it has already been routed here
+					// specifically BECAUSE it is not a known edited-ancestor
+					// chunk (NeedsOverlayAwarePath / EditedAncestorChunks, M2
+					// wave 2 item 2), so a pure-generated mesh is correct here.
+					const auto LevelSampler =
+						MakeLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot);
 					MeshChunkBricks(Key, LevelSampler, Result.Quads, PerfCountersPtr);
 				}
 
@@ -1089,10 +1488,14 @@ void FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	{
 		Rec.RemeshedAtSeconds = ElapsedSeconds;
 	}
-	// Overlay ownership is a level-0-only concept (m2-plan.md wave-1
-	// limitation): higher levels never own edited bricks in their own
-	// right (MakeLevelSampler never consults the overlay).
-	Rec.bHasOverlayBricks = (Key.Level == 0) && ChunkOwnsEditedBrick(Key.Key);
+	// Overlay ownership: level 0 uses the exact live-overlay scan
+	// (ChunkOwnsEditedBrick); level>=1 uses the EditedAncestorChunks
+	// membership PropagateEditToMips maintains (M2 wave 2 item 2) -- both
+	// answer "does this chunk currently render through the overlay-aware
+	// path," just via different exact-vs-tracked-set mechanisms (see
+	// ChunkHasEditedBrick vs NeedsOverlayAwarePath).
+	Rec.bHasOverlayBricks =
+		(Key.Level == 0) ? ChunkOwnsEditedBrick(Key.Key) : EditedAncestorChunks[Key.Level].Contains(Key.Key);
 }
 
 void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material)
@@ -1113,6 +1516,15 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		WorkerJobMsWindow[WorkerJobMsWindowNext] = Result.JobMs;
 		WorkerJobMsWindowNext = (WorkerJobMsWindowNext + 1) % WorkerJobMsWindowSize;
 		WorkerJobMsWindowCount = FMath::Min(WorkerJobMsWindowCount + 1, WorkerJobMsWindowSize);
+
+		// M2 wave 2 item 1: same recording, split into this result's level's
+		// own window (see LevelWorkerJobMsWindow doc comment).
+		{
+			const int32 Lvl = FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1);
+			LevelWorkerJobMsWindow[Lvl][LevelWorkerJobMsWindowNext[Lvl]] = Result.JobMs;
+			LevelWorkerJobMsWindowNext[Lvl] = (LevelWorkerJobMsWindowNext[Lvl] + 1) % WorkerJobMsWindowSize;
+			LevelWorkerJobMsWindowCount[Lvl] = FMath::Min(LevelWorkerJobMsWindowCount[Lvl] + 1, WorkerJobMsWindowSize);
+		}
 
 		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Result.Key);
 		// Stale-result discard: the chunk left the desired set entirely (no
@@ -1143,11 +1555,10 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 	int32 Count = 0;
 	while (Count < MaxRemeshes && PendingGameThreadKeys.Num() > 0)
 	{
-		// Level 0 only in wave 1 (docs/m2-plan.md "Distant edits" limitation
-		// -- see MarkChunkDirtyForRemesh): nothing ever pushes a level>=1 key
-		// onto this queue.
+		// M2 wave 2: ANY level can be on this queue now -- level 0 (unchanged
+		// from wave 1) and level>=1 mip ancestors of an edit (see
+		// PropagateEditToMips / MarkChunkDirtyForRemesh).
 		const VoxelCoords::FVoxelLevelChunkKey LevelKey = PendingGameThreadKeys.Pop(EAllowShrinking::No); // nearest
-		checkSlow(LevelKey.Level == 0);
 
 		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(LevelKey);
 		if (!Rec)
@@ -1158,8 +1569,25 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 
 		SCOPE_CYCLE_COUNTER(STAT_VoxelGameThreadMesh);
 		TArray<FVoxelChunkQuad> Quads;
-		MeshChunkBricks(
-			LevelKey.Key, [this](int64 X, int64 Y, int64 Z) { return Voxels.materialAt(X, Y, Z); }, Quads, &PerfCounters);
+		if (LevelKey.Level == 0)
+		{
+			MeshChunkBricks(
+				LevelKey.Key, [this](int64 X, int64 Y, int64 Z) { return Voxels.materialAt(X, Y, Z); }, Quads, &PerfCounters);
+		}
+		else
+		{
+			// M2 wave 2 item 2 ("Distant-edit mip propagation"): overlay-aware
+			// level>=1 sampler over World::brickAt, game-thread only (see
+			// MakeOverlayAwareLevelSampler's doc comment) -- this is what
+			// closes the wave-1 "R1+ never shows edits" limitation. Logged
+			// (not Verbose): this is a rare, edit-triggered event, and the
+			// log line is the headless-run evidence that a distant edit
+			// actually re-meshed a mip ring chunk.
+			const auto OverlaySampler = MakeOverlayAwareLevelSampler(Voxels, LevelKey.Level);
+			MeshChunkBricks(LevelKey.Key, OverlaySampler, Quads, &PerfCounters);
+			UE_LOG(LogVoxelEdit, Log, TEXT("Distant-edit mip re-mesh: level=%d chunk=(%d,%d,%d) quads=%d"), LevelKey.Level,
+			       LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z, Quads.Num());
+		}
 		ApplyMeshResult(Owner, Root, Material, LevelKey, *Rec, MoveTemp(Quads), /*bIsGameThreadMesh*/ true);
 	}
 	LastRemeshFrac = float(Count) / float(MaxRemeshes);
@@ -1250,28 +1678,107 @@ void FVoxelWorldImpl::CollectDirtyChunks(int64 Vx, int64 Vy, int64 Vz, TSet<Voxe
 	}
 }
 
-void FVoxelWorldImpl::MarkChunkDirtyForRemesh(const VoxelCoords::FVoxelChunkKey& Key)
+bool FVoxelWorldImpl::NeedsOverlayAwarePath(const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const
 {
-	// Level 0 only (docs/m2-plan.md "Distant edits" row, wave-1 limitation):
-	// edits, the overlay, and re-mesh dirtying only ever touch the level-0
-	// (true-voxel) ring in this wave. Higher levels render pure-generated
-	// even where a level-0 edit exists underneath them -- propagating an
-	// edit up the mip chain to invalidate/re-mesh overlapping level 1-4
-	// chunks is a later M2 item (see MakeLevelSampler's doc comment).
-	const VoxelCoords::FVoxelLevelChunkKey LevelKey{0, Key};
+	// Level 0: exact live-overlay scan (unchanged from wave 1). Level>=1
+	// (M2 wave 2 item 2): the tracked EditedAncestorChunks membership set
+	// PropagateEditToMips maintains -- see that function's doc comment for
+	// why this is a maintained set rather than a live scan at this level
+	// (scanning the overlay directly here would touch up to
+	// (ChunkEdgeBricks*2^Level)^3 level-0 brick keys PER CANDIDATE chunk).
+	if (LevelKey.Level == 0)
+	{
+		return ChunkHasEditedBrick(LevelKey.Key);
+	}
+	return EditedAncestorChunks[LevelKey.Level].Contains(LevelKey.Key);
+}
+
+void FVoxelWorldImpl::MarkChunkDirtyForRemesh(const VoxelCoords::FVoxelLevelChunkKey& LevelKey)
+{
+	// M2 wave 2: generalized from a level-0-only helper (wave 1) to any
+	// level -- see the doc comment on the declaration. Level-0 callers
+	// (ApplyGroupedEdits, below) and level>=1 callers (PropagateEditToMips)
+	// share this identical bump/requeue logic.
 	VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(LevelKey);
 	if (!Rec)
 	{
 		// Not currently streamed/tracked: nothing to re-mesh right now. On a
-		// later load, ChunkHasEditedBrick routes it correctly — its scan
-		// extends one brick beyond the chunk, so border-neighbors of edits
-		// also take the overlay-aware path (no stale-seam-on-reload case).
+		// later load, NeedsOverlayAwarePath routes it correctly -- level 0's
+		// ChunkHasEditedBrick scan extends one brick beyond the chunk, so
+		// border-neighbors of edits also take the overlay-aware path (no
+		// stale-seam-on-reload case); level>=1's EditedAncestorChunks
+		// membership was already recorded by PropagateEditToMips before this
+		// call even for untracked chunks (see that function).
 		return;
 	}
 	++Rec->GenerationId; // invalidates any in-flight/queued worker result for this chunk
 	Rec->bJobInFlight = false;
 	PendingJobKeys.RemoveSingle(LevelKey); // a dirtied chunk is never worker-dispatched
 	PendingGameThreadKeys.AddUnique(LevelKey);
+}
+
+void FVoxelWorldImpl::PropagateEditToMips(const TSet<VoxelCoords::FVoxelChunkKey>& DirtyLevel0Chunks)
+{
+	using namespace VoxelCoords;
+	constexpr int32 BricksPerChunk = ChunkEdgeBricks;
+
+	// M2 wave 2 item 1 race fix: bump BEFORE any SharedMipCache::Invalidate
+	// call below, so any worker job whose EpochSnapshot was taken before
+	// this point (game thread; all edit application + dispatch is game-
+	// thread-only, so this is a clean sequence point) will detect the
+	// mismatch and skip a stale re-Insert if it races to finish after this
+	// edit's invalidations (see FCachedMipBuilder's GlobalEditEpoch doc
+	// comment and EditEpoch's doc comment).
+	EditEpoch.fetch_add(1);
+
+	for (int32 Level = 1; Level < kNumLevels; ++Level)
+	{
+		// De-duped per level: several DirtyLevel0Chunks (e.g. a dig's 6
+		// chunk-border-neighbor apron cells) commonly share one ancestor at
+		// higher levels, since the ancestor's footprint is (1<<Level) times
+		// larger -- avoid invalidating/logging the same ancestor repeatedly.
+		TSet<FVoxelChunkKey> AncestorsThisLevel;
+		AncestorsThisLevel.Reserve(DirtyLevel0Chunks.Num());
+		for (const FVoxelChunkKey& Level0Chunk : DirtyLevel0Chunks)
+		{
+			AncestorsThisLevel.Add(AncestorChunkKey(Level0Chunk, Level));
+		}
+
+		for (const FVoxelChunkKey& Ancestor : AncestorsThisLevel)
+		{
+			const bool bAlreadyEdited = EditedAncestorChunks[Level].Contains(Ancestor);
+			EditedAncestorChunks[Level].Add(Ancestor);
+
+			// SharedMipCache stores PURE bricks only (see its doc comment);
+			// this chunk's footprint at this level is now stale for
+			// rendering, so drop every brick this chunk owns from the shared
+			// cache -- BricksPerChunk^3 lookups (64 at BricksPerChunk=4),
+			// cheap and bounded regardless of Level.
+			for (int32 Dz = 0; Dz < BricksPerChunk; ++Dz)
+			{
+				for (int32 Dy = 0; Dy < BricksPerChunk; ++Dy)
+				{
+					for (int32 Dx = 0; Dx < BricksPerChunk; ++Dx)
+					{
+						const vxc::BrickKey BKey{Ancestor.X * BricksPerChunk + Dx, Ancestor.Y * BricksPerChunk + Dy,
+						                          Ancestor.Z * BricksPerChunk + Dz};
+						SharedMipCache.Invalidate(Level, BKey);
+					}
+				}
+			}
+
+			// Dirty it for re-mesh if it happens to be resident right now
+			// (MarkChunkDirtyForRemesh no-ops if untracked); EditedAncestorChunks
+			// membership above is what guarantees correct routing on any
+			// FUTURE load too, tracked or not.
+			MarkChunkDirtyForRemesh(FVoxelLevelChunkKey{Level, Ancestor});
+
+			UE_LOG(LogVoxelEdit, Log,
+			       TEXT("Distant-edit mip propagation: level=%d chunk=(%d,%d,%d) tracked=%d %s"), Level, Ancestor.X, Ancestor.Y,
+			       Ancestor.Z, ChunkRecords.Contains(FVoxelLevelChunkKey{Level, Ancestor}) ? 1 : 0,
+			       bAlreadyEdited ? TEXT("(already edited-ancestor)") : TEXT("(newly marked edited-ancestor)"));
+		}
+	}
 }
 
 void FVoxelWorldImpl::ApplyGroupedEdits(std::unordered_map<vxc::BrickKey, std::vector<vxc::EditCell>, vxc::BrickKeyHash>& EditsByBrick,
@@ -1294,8 +1801,12 @@ void FVoxelWorldImpl::ApplyGroupedEdits(std::unordered_map<vxc::BrickKey, std::v
 
 	for (const VoxelCoords::FVoxelChunkKey& Key : DirtyChunks)
 	{
-		MarkChunkDirtyForRemesh(Key);
+		MarkChunkDirtyForRemesh(VoxelCoords::FVoxelLevelChunkKey{0, Key});
 	}
+	// M2 wave 2 item 2 ("Distant-edit mip propagation"): closes the wave-1
+	// "R1+ never shows edits" limitation -- dirty every ancestor mip chunk
+	// at every level whose footprint contains one of these level-0 edits.
+	PropagateEditToMips(DirtyChunks);
 	SortPendingQueues(LastAnchorLocation);
 }
 
@@ -1359,6 +1870,31 @@ void FVoxelWorldImpl::UpdatePerfSnapshot(float DeltaTime, float TickMs)
 	{
 		LastPerfSnapshot.WorkerMsP50 = LastPerfSnapshot.WorkerMsP95 = LastPerfSnapshot.WorkerMsMax = 0.f;
 	}
+
+	// M2 wave 2 item 1: identical percentile computation, per level (report
+	// requirement: "worker p50/p95 per level" -- this is the number the
+	// cross-job mip cache targets).
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+	{
+		if (LevelWorkerJobMsWindowCount[Level] > 0)
+		{
+			TArray<float> Sorted;
+			Sorted.Append(LevelWorkerJobMsWindow[Level].GetData(), LevelWorkerJobMsWindowCount[Level]);
+			Sorted.Sort();
+			const int32 P50Index = FMath::Clamp(int32(Sorted.Num() * 0.50f), 0, Sorted.Num() - 1);
+			const int32 P95Index = FMath::Clamp(int32(Sorted.Num() * 0.95f), 0, Sorted.Num() - 1);
+			LastPerfSnapshot.LevelWorkerMsP50[Level] = Sorted[P50Index];
+			LastPerfSnapshot.LevelWorkerMsP95[Level] = Sorted[P95Index];
+		}
+		else
+		{
+			LastPerfSnapshot.LevelWorkerMsP50[Level] = LastPerfSnapshot.LevelWorkerMsP95[Level] = 0.f;
+		}
+	}
+
+	// M2 wave 2 item 1: shared cross-job mip cache memory (FSharedMipCache).
+	LastPerfSnapshot.MipCacheBrickCount = SharedMipCache.GetBrickCount();
+	LastPerfSnapshot.MipCacheBytes = SharedMipCache.GetBytesUsed();
 
 	int32 ResidentComponents = 0;
 	// M2 item 1: "Per-level loaded/pending counters into the perf

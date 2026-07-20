@@ -48,6 +48,7 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan_core.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -1327,12 +1328,17 @@ struct GrowBuffer {
     VkBufferUsageFlags usage = 0;
     size_t reallocCount = 0;
 
-    void ensure(GpuContext& ctx, VkDeviceSize bytes) {
-        if (bytes <= capacityBytes && buf.buffer != VK_NULL_HANDLE) return;
+    // Returns true iff the underlying VkBuffer was (re)allocated -- callers
+    // use this to skip vkUpdateDescriptorSets when a slot's buffer set is
+    // unchanged from the previous tile that used this slot (persistent
+    // descriptor sets across the batched-flight run; see FlightSlot below).
+    bool ensure(GpuContext& ctx, VkDeviceSize bytes) {
+        if (bytes <= capacityBytes && buf.buffer != VK_NULL_HANDLE) return false;
         if (buf.buffer != VK_NULL_HANDLE) ctx.destroyBuffer(buf);
         capacityBytes = bytes;
         buf = ctx.createBuffer(capacityBytes, usage);
         ++reallocCount;
+        return true;
     }
 };
 
@@ -1357,6 +1363,177 @@ struct TileSpec {
     int32_t originVx = 0, originVy = 0; // dispatch tile origin, halo included
     int32_t ownedBx0 = 0, ownedBy0 = 0; // first interior (owned) brick, global brick coords
 };
+
+// ---------------------------------------------------------------------------
+// Batched-flight tiling (closes the 128m gate's remaining marshalling +
+// per-tile-fence overhead): tiles are processed in flights of kFlightSize,
+// each flight recording every tile's FULL chain (ColumnMain -> VoxelizeMain
+// -> MeshCount -> GPU scan -> MeshEmit) into ONE command buffer with ONE
+// fence, instead of the old 3-fences-per-tile (column, voxelize, mesh chain)
+// scheme. A flight needs kFlightSize independent buffer/descriptor sets
+// (FlightSlot) since all its tiles are simultaneously resident on the GPU
+// within that one submission.
+//
+// CPU/GPU overlap ("flight k+1 prep while flight k's fence is pending, via a
+// deferred wait") additionally needs the slot SET flight k+1 writes into to
+// be different from the one flight k's GPU commands may still be reading —
+// reusing the very same kFlightSize slots for both would race the CPU's
+// host-visible-memory writes against the GPU still consuming them. So slots
+// are double-buffered: kPipelineDepth (2) banks of kFlightSize slots each,
+// flights alternate banks, and a bank is only reused once its owning
+// flight's fence has been waited on (which always happens, in the main loop
+// below, before that bank is prepared again two flights later). Digest/
+// compare order is untouched: flights are built from grid.tiles in order and
+// harvested (in that same order) strictly before the flight two iterations
+// later reuses their bank, so the CPU-side digest byte stream is identical
+// to the old fully-serial per-tile loop.
+constexpr int32_t kFlightSize = 8;
+constexpr int32_t kPipelineDepth = 2;
+constexpr int32_t kTimestampsPerTile = 8; // brackets 7 stages: col,vox,count,scanB,scanS,scanA,emit
+
+struct FlightSlot {
+    GateBuffers gb;
+    VkDescriptorSet colSet = VK_NULL_HANDLE;
+    VkDescriptorSet voxSet = VK_NULL_HANDLE;
+    VkDescriptorSet meshCountSet = VK_NULL_HANDLE;
+    VkDescriptorSet meshEmitSet = VK_NULL_HANDLE;
+    VkDescriptorSet scanSet = VK_NULL_HANDLE;
+    bool colVoxDescriptorsWritten = false;  // persistent sets: only rewrite on first use / regrow
+    bool meshDescriptorsWritten = false;
+
+    // Per-tile scratch: filled by prepTileCpu() during flight prep, consumed
+    // by recordTileCommands() (same flight) and harvestTile() (after the
+    // flight's fence signals). Not touched while this slot's bank is
+    // "in flight" on the GPU from a PRIOR flight -- see kPipelineDepth above.
+    TileSpec tile;
+    bool active = false; // false for the unused tail slots of a partial last flight
+    bool verify = false;
+    std::vector<ColumnSample> cpuCols;
+    int32_t brickZMin = 0;
+    uint32_t bricksX = 0, bricksY = 0, bricksZ = 0;
+    uint32_t mbx = 0, mby = 0, mbz = 0, maskCount = 0;
+    uint32_t running = 0; // true quad total for this tile, known only after the fence
+};
+
+// Dedicated descriptor pool for the flight banks, sized for
+// kPipelineDepth*kFlightSize tiles' worth of sets. Allocated separately from
+// GpuContext's own pools (used by runRegion()'s default mode and left
+// untouched) so this optimization is fully additive/isolated to gate mode.
+struct FlightDescriptors {
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+};
+
+FlightDescriptors createFlightDescriptors(GpuContext& ctx, int32_t totalSlots,
+                                           std::vector<FlightSlot>& slots) {
+    FlightDescriptors fd;
+    // Per tile: colSet (1 uniform + 3 storage), voxSet (1 uniform + 2
+    // storage), meshCountSet/meshEmitSet/scanSet (1 uniform + 6 storage each,
+    // x3) -- mirrors createContext()'s pool-size derivation, just x totalSlots.
+    VkDescriptorPoolSize poolSizes[2]{};
+    poolSizes[0] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, uint32_t(totalSlots) * 5};
+    poolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, uint32_t(totalSlots) * 23};
+    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets = uint32_t(totalSlots) * 5;
+    dpci.poolSizeCount = 2;
+    dpci.pPoolSizes = poolSizes;
+    vkCheck(vkCreateDescriptorPool(ctx.device, &dpci, nullptr, &fd.pool),
+            "vkCreateDescriptorPool(flight)");
+
+    const auto allocDescriptorSets = [&](VkDescriptorSetLayout layout) -> std::vector<VkDescriptorSet> {
+        std::vector<VkDescriptorSetLayout> setLayouts;
+        setLayouts.assign(size_t(totalSlots), layout);
+        std::vector<VkDescriptorSet> result;
+        result.resize(size_t(totalSlots));
+        VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dsai.descriptorPool = fd.pool;
+        dsai.descriptorSetCount = uint32_t(totalSlots);
+        dsai.pSetLayouts = setLayouts.data();
+        vkCheck(vkAllocateDescriptorSets(ctx.device, &dsai, result.data()),
+                "vkAllocateDescriptorSets(flight)");
+        return result;
+    };
+    const std::vector<VkDescriptorSet> colSets = allocDescriptorSets(ctx.descSetLayout);
+    const std::vector<VkDescriptorSet> voxSets = allocDescriptorSets(ctx.voxDescSetLayout);
+    const std::vector<VkDescriptorSet> meshCountSets = allocDescriptorSets(ctx.meshDescSetLayout);
+    const std::vector<VkDescriptorSet> meshEmitSets = allocDescriptorSets(ctx.meshDescSetLayout);
+    const std::vector<VkDescriptorSet> scanSets = allocDescriptorSets(ctx.meshDescSetLayout);
+    for (int32_t i = 0; i < totalSlots; ++i) {
+        FlightSlot& s = slots[size_t(i)];
+        s.colSet = colSets[size_t(i)];
+        s.voxSet = voxSets[size_t(i)];
+        s.meshCountSet = meshCountSets[size_t(i)];
+        s.meshEmitSet = meshEmitSets[size_t(i)];
+        s.scanSet = scanSets[size_t(i)];
+    }
+    return fd;
+}
+
+void destroyFlightDescriptors(GpuContext& ctx, FlightDescriptors& fd) {
+    if (fd.pool) vkDestroyDescriptorPool(ctx.device, fd.pool, nullptr); // frees all sets too
+    fd = FlightDescriptors{};
+}
+
+// Persistent-descriptor variants of writeMeshDescriptors()/the inline column+
+// voxelize descriptor writes in runRegion(): write ONE slot's 2 (col+vox) or
+// 3 (mesh) descriptor sets, called only when that slot's buffers actually
+// changed (first use, or a GrowBuffer regrow) -- not every tile, per the
+// "marshalling reduction" goal.
+void writeColVoxDescriptorsSlot(GpuContext& ctx, FlightSlot& s) {
+    VkDescriptorBufferInfo paramsInfo{s.gb.paramsBuf.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo elevInfo{s.gb.elevBuf.buf.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo climInfo{s.gb.climBuf.buf.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo columnsInfo{s.gb.columnsBuf.buffer, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet writes[4]{};
+    writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.colSet, 0, 0, 1,
+                 VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &paramsInfo, nullptr};
+    writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.colSet, 1, 0, 1,
+                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &elevInfo, nullptr};
+    writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.colSet, 2, 0, 1,
+                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &climInfo, nullptr};
+    writes[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.colSet, 3, 0, 1,
+                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &columnsInfo, nullptr};
+    vkUpdateDescriptorSets(ctx.device, 4, writes, 0, nullptr);
+
+    VkDescriptorBufferInfo cellsInfo{s.gb.cellsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet voxWrites[3]{};
+    voxWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 0, 0, 1,
+                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &paramsInfo, nullptr};
+    voxWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 4, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &columnsInfo, nullptr};
+    voxWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 5, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cellsInfo, nullptr};
+    vkUpdateDescriptorSets(ctx.device, 3, voxWrites, 0, nullptr);
+}
+
+void writeMeshDescriptorsSlot(GpuContext& ctx, FlightSlot& s) {
+    VkDescriptorBufferInfo pInfo{s.gb.paramsBuf.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo cInfo{s.gb.cellsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo oReadInfo{s.gb.offsetsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo nInfo{s.gb.countsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo qInfo{s.gb.quadsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo oWriteInfo{s.gb.offsetsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo bInfo{s.gb.blockSumsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
+
+    const VkDescriptorSet sets[3] = {s.meshCountSet, s.meshEmitSet, s.scanSet};
+    for (VkDescriptorSet set : sets) {
+        VkWriteDescriptorSet w[7]{};
+        w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 0, 0, 1,
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &pInfo, nullptr};
+        w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 5, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cInfo, nullptr};
+        w[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 6, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &oReadInfo, nullptr};
+        w[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 7, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &nInfo, nullptr};
+        w[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 8, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qInfo, nullptr};
+        w[5] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 9, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &oWriteInfo, nullptr};
+        w[6] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 10, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bInfo, nullptr};
+        vkUpdateDescriptorSets(ctx.device, 7, w, 0, nullptr);
+    }
+}
 
 struct TileGrid {
     int32_t bMin = 0, bMax = 0;  // global brick-coord bounds of the requested radius (square)
@@ -1403,15 +1580,22 @@ struct GateStats {
     double cpuColumnPassMs = 0; // per-tile z-range CPU column pass (existing pattern)
     double cpuCompareMs = 0;    // CPU-vs-GPU comparison + digest bookkeeping
 
-    // The gate number: per-stage GPU wall-clock totals, summed across every
-    // tile, plus the marshalling in between (buffer ensure/grow, descriptor
-    // writes, WorldGenParams upload, raster-window fill). The scan is now a
-    // GPU pass (ScanBlocks/Sums/AddMain, chained with count+emit in ONE
-    // command buffer -- see runMeshChain()), timestamp-query timed per stage,
-    // replacing the old CPU-mapped-memory host prefix scan entirely.
-    double hostRasterFillMs = 0, columnMs = 0, voxelizeMs = 0, meshCountMs = 0,
-           scanBlocksMs = 0, scanSumsMs = 0, scanAddMs = 0, meshEmitMs = 0;
-    double gateMs = 0; // superset of the buckets above (the remainder is marshalling)
+    // Per-stage GPU busy-time totals, summed across every tile, from
+    // vkCmdWriteTimestamp queries bracketing EVERY stage now (column,
+    // voxelize, meshcount, 3x scan, emit) -- not just the mesh chain as
+    // before. These are true GPU execution times regardless of how much CPU
+    // marshalling of a later flight overlapped with them, so (unlike the old
+    // fully-serial per-tile loop) their sum can legitimately exceed the
+    // headline gate number below once flight pipelining hides marshalling
+    // time inside GPU execution time (see runGateMode's report).
+    double hostRasterFillMs = 0, marshallingMs = 0, columnMs = 0, voxelizeMs = 0,
+           meshCountMs = 0, scanBlocksMs = 0, scanSumsMs = 0, scanAddMs = 0, meshEmitMs = 0;
+    // The headline gate number: total loop wall-clock MINUS the two costs
+    // explicitly excluded per the gate spec (cpuColumnPassMs, cpuCompareMs).
+    // Computed once in runGateMode from the measured wall clock, not summed
+    // per-tile/per-flight -- see runGateMode for why (flight pipelining means
+    // per-tile windows overlap, so summing them would double-count).
+    double gateMs = 0;
 
     size_t totalTiles = 0, verifiedTiles = 0;
     size_t totalColumns = 0, verifiedColumns = 0;
@@ -1423,11 +1607,38 @@ struct GateStats {
     std::vector<Mismatch> mismatches;
 };
 
-// Runs the full pipeline for one dispatch tile, reusing gb's buffers.
-void runTile(GpuContext& ctx, GateBuffers& gb, const TileSpec& tile, uint64_t seed,
-             SyntheticTileSampler& tiles, Amplifier& amp, bool verify, GateStats& stats) {
+// --- Flight-batched tile pipeline (replaces the old one-tile-at-a-time
+// runTile(), which paid 3 fences/tile -- column, voxelize, mesh chain -- and
+// rewrote every descriptor set every tile). Split into three phases so
+// kFlightSize tiles can share ONE command buffer / ONE fence, and so flight
+// k+1's CPU-only prep can overlap flight k's still-pending fence (see
+// FlightSlot's doc comment above for the double-buffering/race-safety
+// reasoning):
+//   prepTileCpu()        - CPU column pass, raster fill, buffer ensure,
+//                          WorldGenParams upload, descriptor writes IFF this
+//                          slot's buffers actually (re)allocated. No GPU
+//                          submission.
+//   recordTileCommands() - records this tile's 7-dispatch chain (column,
+//                          voxelize, meshcount, 3x scan, emit) with barriers
+//                          and 8 bracketing timestamps into the flight's
+//                          shared command buffer.
+//   harvestTile()         - after the flight's fence has signalled: computes
+//                          the true quad total from the fenced counts/
+//                          offsets buffers, then runs the exact same digest/
+//                          CPU-compare logic runTile() used to run after
+//                          "GATE WINDOW ENDS" -- byte-for-byte unchanged, so
+//                          the digest is identical to the old serial loop as
+//                          long as tiles are harvested in tile order (they
+//                          are; see runGateMode()).
+
+void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t seed,
+                  SyntheticTileSampler& tiles, Amplifier& amp, bool verify, GateStats& stats) {
     constexpr int32_t W = kTileColumns, H = kTileColumns;
     const int64_t pixelSizeMm = tiles.pixelSizeMm();
+
+    s.tile = tile;
+    s.active = true;
+    s.verify = verify;
 
     const int64_t xMmMin = int64_t(tile.originVx) * kVoxelSizeMm;
     const int64_t xMmMax = int64_t(tile.originVx + W - 1) * kVoxelSizeMm;
@@ -1440,20 +1651,16 @@ void runTile(GpuContext& ctx, GateBuffers& gb, const TileSpec& tile, uint64_t se
     const uint32_t rasterW = static_cast<uint32_t>(pxMax - pxMin + 1);
     const uint32_t rasterH = static_cast<uint32_t>(pyMax - pyMin + 1);
 
-    // --- CPU column pass (setup): z-range + CPU reference columns, same
-    // pattern as runRegion() above. This is unavoidable GPU input (it
-    // derives BrickZMin/BricksZ), not optional bookkeeping, but it is real
-    // CPU-side cost a production path must hide/pipeline — timed separately
-    // and excluded from the gate number below, per the gate spec. ----------
+    // --- CPU column pass (setup, excluded from the gate number) -----------
     const auto tCpu0 = Clock::now();
-    std::vector<ColumnSample> cpuCols(size_t(W) * H);
+    s.cpuCols.resize(size_t(W) * H);
     int64_t vzMin = INT64_MAX, vzMax = INT64_MIN;
     for (int32_t y = 0; y < H; ++y) {
         for (int32_t x = 0; x < W; ++x) {
             const int64_t vx = int64_t(tile.originVx) + x;
             const int64_t vy = int64_t(tile.originVy) + y;
             const ColumnSample c = amp.column(vx, vy);
-            cpuCols[size_t(x) + size_t(y) * W] = c;
+            s.cpuCols[size_t(x) + size_t(y) * W] = c;
             const int64_t top = floorDiv(int64_t(c.surfaceMm) - kVoxelSizeMm / 2, kVoxelSizeMm);
             vzMin = top < vzMin ? top : vzMin;
             vzMax = top > vzMax ? top : vzMax;
@@ -1461,25 +1668,25 @@ void runTile(GpuContext& ctx, GateBuffers& gb, const TileSpec& tile, uint64_t se
     }
     stats.cpuColumnPassMs += msSince(tCpu0);
 
-    const int32_t brickZMin = static_cast<int32_t>(floorDiv(vzMin, kBrick));
+    s.brickZMin = static_cast<int32_t>(floorDiv(vzMin, kBrick));
     const int32_t brickZMax = static_cast<int32_t>(floorDiv(vzMax, kBrick));
-    const uint32_t bricksZ = static_cast<uint32_t>(brickZMax - brickZMin + 1);
-    const uint32_t bricksX = uint32_t(W) / kBrick, bricksY = uint32_t(H) / kBrick; // == 16
+    s.bricksZ = static_cast<uint32_t>(brickZMax - s.brickZMin + 1);
+    s.bricksX = uint32_t(W) / kBrick;
+    s.bricksY = uint32_t(H) / kBrick; // == 16
 
-    // ==== GATE WINDOW BEGINS ================================================
-    // Everything from here to "GATE WINDOW ENDS" is the timed end-to-end gate
-    // number: buffer ensure/marshalling + all four GPU dispatch stages + the
-    // host prefix scan, EXCLUDING the CPU column pass above and the
-    // CPU-reference comparison/digest below.
-    const auto tGate0 = Clock::now();
-
-    gb.elevBuf.ensure(ctx, VkDeviceSize(rasterW) * rasterH * sizeof(int32_t));
-    gb.climBuf.ensure(ctx, VkDeviceSize(rasterW) * rasterH * sizeof(uint32_t));
-    gb.cellsBuf.ensure(ctx, VkDeviceSize(bricksX) * bricksY * bricksZ * 512 * sizeof(uint32_t));
+    // --- Marshalling part 1: buffer ensure/grow (persistent slot buffers;
+    // only actually (re)allocates on this slot's first use or when a tile
+    // needs more room than any previous tile that used this slot). --------
+    const auto tMarshalA0 = Clock::now();
+    const bool cellsGrew = s.gb.cellsBuf.ensure(
+        ctx, VkDeviceSize(s.bricksX) * s.bricksY * s.bricksZ * 512 * sizeof(uint32_t));
+    const bool elevGrew = s.gb.elevBuf.ensure(ctx, VkDeviceSize(rasterW) * rasterH * sizeof(int32_t));
+    const bool climGrew = s.gb.climBuf.ensure(ctx, VkDeviceSize(rasterW) * rasterH * sizeof(uint32_t));
+    const double marshalA = msSince(tMarshalA0);
 
     const auto tRaster0 = Clock::now();
-    int32_t* elev = static_cast<int32_t*>(gb.elevBuf.buf.mapped);
-    uint32_t* clim = static_cast<uint32_t*>(gb.climBuf.buf.mapped);
+    int32_t* elev = static_cast<int32_t*>(s.gb.elevBuf.buf.mapped);
+    uint32_t* clim = static_cast<uint32_t*>(s.gb.climBuf.buf.mapped);
     for (uint32_t ly = 0; ly < rasterH; ++ly) {
         for (uint32_t lx = 0; lx < rasterW; ++lx) {
             const int64_t px = pxMin + lx, py = pyMin + ly;
@@ -1492,6 +1699,9 @@ void runTile(GpuContext& ctx, GateBuffers& gb, const TileSpec& tile, uint64_t se
     }
     stats.hostRasterFillMs += msSince(tRaster0);
 
+    // --- Marshalling part 2: WorldGenParams, mesh mask buffers, persistent
+    // descriptor writes (only when a bound buffer actually changed). ------
+    const auto tMarshalB0 = Clock::now();
     WorldGenParamsCB params{};
     params.DispatchColumnsX = uint32_t(W);
     params.DispatchColumnsY = uint32_t(H);
@@ -1504,185 +1714,200 @@ void runTile(GpuContext& ctx, GateBuffers& gb, const TileSpec& tile, uint64_t se
     params.SeedHi = static_cast<uint32_t>(seed >> 32);
     params.OriginVx = tile.originVx;
     params.OriginVy = tile.originVy;
-    params.BrickZMin = brickZMin;
-    params.BricksZ = bricksZ;
-    std::memcpy(gb.paramsBuf.mapped, &params, sizeof(params));
+    params.BrickZMin = s.brickZMin;
+    params.BricksZ = s.bricksZ;
 
-    // Descriptor writes: buffers are bound at VK_WHOLE_SIZE (their current
-    // capacity, which may exceed this tile's actual data) — harmless, since
-    // the shaders only ever index up to RasterSize/BricksZ from the cbuffer,
-    // never the raw buffer size.
-    VkDescriptorBufferInfo paramsInfo{gb.paramsBuf.buffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo elevInfo{gb.elevBuf.buf.buffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo climInfo{gb.climBuf.buf.buffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo columnsInfo{gb.columnsBuf.buffer, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet writes[4]{};
-    writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.descSet, 0, 0, 1,
-                 VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &paramsInfo, nullptr};
-    writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.descSet, 1, 0, 1,
-                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &elevInfo, nullptr};
-    writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.descSet, 2, 0, 1,
-                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &climInfo, nullptr};
-    writes[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.descSet, 3, 0, 1,
-                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &columnsInfo, nullptr};
-    vkUpdateDescriptorSets(ctx.device, 4, writes, 0, nullptr);
-
-    VkDescriptorBufferInfo cellsInfo{gb.cellsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet voxWrites[3]{};
-    voxWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 0, 0, 1,
-                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &paramsInfo, nullptr};
-    voxWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 4, 0, 1,
-                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &columnsInfo, nullptr};
-    voxWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 5, 0, 1,
-                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cellsInfo, nullptr};
-    vkUpdateDescriptorSets(ctx.device, 3, voxWrites, 0, nullptr);
-
-    const uint32_t groupsX = (uint32_t(W) + 7) / 8, groupsY = (uint32_t(H) + 7) / 8;
-
-    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cbai.commandPool = ctx.commandPool;
-    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-
-    // Submits one already-recorded command buffer and blocks until it
-    // completes, returning that wall-clock span. Per-stage submit+wait
-    // (rather than chaining every stage into one submission) is deliberate:
-    // it is what makes the per-stage GPU wall-clock totals below possible.
-    const auto submitAndWait = [&](VkCommandBuffer cmd) -> double {
-        VkFence fence = VK_NULL_HANDLE;
-        vkCheck(vkCreateFence(ctx.device, &fci, nullptr, &fence), "vkCreateFence(gate)");
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &cmd;
-        const auto t0 = Clock::now();
-        vkCheck(vkQueueSubmit(ctx.queue, 1, &si, fence), "vkQueueSubmit(gate)");
-        vkCheck(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX),
-                "vkWaitForFences(gate)");
-        const double ms = msSince(t0);
-        vkDestroyFence(ctx.device, fence, nullptr);
-        return ms;
-    };
-
-    // --- Pass 1: ColumnMain --------------------------------------------
-    VkCommandBuffer cmd1 = VK_NULL_HANDLE;
-    vkCheck(vkAllocateCommandBuffers(ctx.device, &cbai, &cmd1),
-            "vkAllocateCommandBuffers(gate-col)");
-    vkCheck(vkBeginCommandBuffer(cmd1, &cbbi), "vkBeginCommandBuffer(gate-col)");
-    vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipeline);
-    vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipelineLayout, 0, 1,
-                             &ctx.descSet, 0, nullptr);
-    vkCmdDispatch(cmd1, groupsX, groupsY, 1);
-    VkBufferMemoryBarrier barrier1{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-    barrier1.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier1.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
-    barrier1.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier1.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier1.buffer = gb.columnsBuf.buffer;
-    barrier1.offset = 0;
-    barrier1.size = VK_WHOLE_SIZE;
-    vkCmdPipelineBarrier(cmd1, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                          VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
-                          nullptr, 1, &barrier1, 0, nullptr);
-    vkCheck(vkEndCommandBuffer(cmd1), "vkEndCommandBuffer(gate-col)");
-    stats.columnMs += submitAndWait(cmd1);
-
-    // --- Pass 2: VoxelizeMain, chained off cmd1's columnsBuf write --------
-    VkCommandBuffer cmd2 = VK_NULL_HANDLE;
-    vkCheck(vkAllocateCommandBuffers(ctx.device, &cbai, &cmd2),
-            "vkAllocateCommandBuffers(gate-vox)");
-    vkCheck(vkBeginCommandBuffer(cmd2, &cbbi), "vkBeginCommandBuffer(gate-vox)");
-    VkBufferMemoryBarrier chainBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-    chainBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    chainBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    chainBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    chainBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    chainBarrier.buffer = gb.columnsBuf.buffer;
-    chainBarrier.offset = 0;
-    chainBarrier.size = VK_WHOLE_SIZE;
-    vkCmdPipelineBarrier(cmd2, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &chainBarrier, 0,
-                          nullptr);
-    vkCmdBindPipeline(cmd2, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.voxPipeline);
-    vkCmdBindDescriptorSets(cmd2, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.voxPipelineLayout, 0, 1,
-                             &ctx.voxDescSet, 0, nullptr);
-    vkCmdDispatch(cmd2, groupsX, groupsY, 1);
-    VkBufferMemoryBarrier barrier2{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-    barrier2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier2.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
-    barrier2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier2.buffer = gb.cellsBuf.buf.buffer;
-    barrier2.offset = 0;
-    barrier2.size = VK_WHOLE_SIZE;
-    vkCmdPipelineBarrier(cmd2, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                          VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
-                          nullptr, 1, &barrier2, 0, nullptr);
-    vkCheck(vkEndCommandBuffer(cmd2), "vkEndCommandBuffer(gate-vox)");
-    stats.voxelizeMs += submitAndWait(cmd2);
-
-    // --- Passes 3-7: MeshCountMain -> GPU scan (ScanBlocks/Sums/AddMain) ->
-    // MeshEmitMain, chained in ONE command buffer via runMeshChain() -- see
-    // its doc comment for the barrier/timestamp design. Replaces the old
-    // host prefix scan (CPU reading GPU-mapped counts between two separate
-    // submissions) that was the 128m gate's dominant cost.
-    uint32_t mbx = 0, mby = 0, mbz = 0, maskCount = 0, running = 0;
-    if (bricksX >= 3 && bricksY >= 3 && bricksZ >= 3) {
-        mbx = bricksX - 2;
-        mby = bricksY - 2;
-        mbz = bricksZ - 2;
-        maskCount = mbx * mby * mbz * 48u;
-
-        gb.countsBuf.ensure(ctx, VkDeviceSize(maskCount) * sizeof(uint32_t));
-        gb.offsetsBuf.ensure(ctx, VkDeviceSize(maskCount) * sizeof(uint32_t));
-        gb.blockSumsBuf.ensure(ctx, VkDeviceSize((maskCount + 255) / 256) * sizeof(uint32_t));
-        // Upper bound (32 quads/mask max, docs/gpu-mesher-design.md) since
-        // MeshEmitMain is chained into the SAME command buffer as
-        // MeshCountMain -- no readback point exists to size it exactly
-        // first. Grow-only GrowBuffer reuse keeps this cheap tile-to-tile.
-        gb.quadsBuf.ensure(ctx, VkDeviceSize(maskCount) * 32 * sizeof(uint64_t));
-
-        // ScanBlocks/Sums/AddMain read ScanCount from the SAME WorldGenParams
-        // buffer ColumnMain/VoxelizeMain already consumed this tile; safe to
-        // update the host-mapped copy now, same reasoning as runRegion().
-        params.ScanCount = maskCount;
-        std::memcpy(gb.paramsBuf.mapped, &params, sizeof(params));
-
-        writeMeshDescriptors(ctx, gb.paramsBuf.buffer,
-                              {gb.cellsBuf.buf.buffer, gb.countsBuf.buf.buffer,
-                               gb.offsetsBuf.buf.buffer, gb.blockSumsBuf.buf.buffer,
-                               gb.quadsBuf.buf.buffer});
-        const MeshStageTimingsMs stageMs = runMeshChain(
-            ctx, maskCount,
-            {gb.cellsBuf.buf.buffer, gb.countsBuf.buf.buffer, gb.offsetsBuf.buf.buffer,
-             gb.blockSumsBuf.buf.buffer, gb.quadsBuf.buf.buffer});
-        stats.meshCountMs += stageMs.count;
-        stats.scanBlocksMs += stageMs.scanBlocks;
-        stats.scanSumsMs += stageMs.scanSums;
-        stats.scanAddMs += stageMs.scanAdd;
-        stats.meshEmitMs += stageMs.emit;
-
-        const uint32_t* counts = static_cast<const uint32_t*>(gb.countsBuf.buf.mapped);
-        const uint32_t* offsets = static_cast<const uint32_t*>(gb.offsetsBuf.buf.mapped);
-        running = counts[maskCount - 1] + offsets[maskCount - 1];
+    if (!s.colVoxDescriptorsWritten || elevGrew || climGrew || cellsGrew) {
+        writeColVoxDescriptorsSlot(ctx, s);
+        s.colVoxDescriptorsWritten = true;
+        s.meshDescriptorsWritten = false; // cellsBuf is shared with the mesh set too
     }
 
-    stats.gateMs += msSince(tGate0);
-    // ==== GATE WINDOW ENDS ==================================================
+    s.mbx = s.mby = s.mbz = s.maskCount = 0;
+    if (s.bricksX >= 3 && s.bricksY >= 3 && s.bricksZ >= 3) {
+        s.mbx = s.bricksX - 2;
+        s.mby = s.bricksY - 2;
+        s.mbz = s.bricksZ - 2;
+        s.maskCount = s.mbx * s.mby * s.mbz * 48u;
 
-    // --- Digest (ALWAYS, over every tile's full GPU output, regardless of
-    // whether this tile is verified) + CPU comparison (only for `verify`
-    // tiles). Both are bookkeeping/verification, not the production path, so
-    // both are excluded from the gate number above. The digest byte stream
-    // is identical either way (same decode, same sequential order) so its
-    // value never depends on which tiles happened to be sampled. ----------
+        const bool countsGrew =
+            s.gb.countsBuf.ensure(ctx, VkDeviceSize(s.maskCount) * sizeof(uint32_t));
+        const bool offsetsGrew =
+            s.gb.offsetsBuf.ensure(ctx, VkDeviceSize(s.maskCount) * sizeof(uint32_t));
+        const bool blockSumsGrew = s.gb.blockSumsBuf.ensure(
+            ctx, VkDeviceSize((s.maskCount + 255) / 256) * sizeof(uint32_t));
+        // Upper bound (32 quads/mask max, docs/gpu-mesher-design.md) since
+        // MeshEmitMain is chained into the SAME command buffer as
+        // MeshCountMain -- no readback point to size it exactly first.
+        const bool quadsGrew =
+            s.gb.quadsBuf.ensure(ctx, VkDeviceSize(s.maskCount) * 32 * sizeof(uint64_t));
+
+        params.ScanCount = s.maskCount;
+
+        if (!s.meshDescriptorsWritten || cellsGrew || countsGrew || offsetsGrew || blockSumsGrew ||
+            quadsGrew) {
+            writeMeshDescriptorsSlot(ctx, s);
+            s.meshDescriptorsWritten = true;
+        }
+    }
+
+    std::memcpy(s.gb.paramsBuf.mapped, &params, sizeof(params));
+    stats.marshallingMs += marshalA + msSince(tMarshalB0);
+}
+
+// Records this tile's full chain into the flight's shared command buffer,
+// using slot s's persistent descriptor sets (already written by
+// prepTileCpu()). tsBase is this tile's offset into the flight's timestamp
+// query pool (kTimestampsPerTile slots, reset once per flight before any
+// tile is recorded -- see runGateMode()). No inter-tile barriers are needed:
+// every tile in a flight uses entirely disjoint buffers, so there is no data
+// hazard between them regardless of execution order on the compute queue.
+void recordTileCommands(GpuContext& ctx, VkCommandBuffer cmd, FlightSlot& s, VkQueryPool tsPool,
+                         uint32_t tsBase) {
+    const uint32_t groupsX = (uint32_t(kTileColumns) + 7) / 8, groupsY = groupsX;
+
+    const auto bufBarrier = [](VkBuffer buf, VkAccessFlags src,
+                                VkAccessFlags dst) -> VkBufferMemoryBarrier {
+        VkBufferMemoryBarrier b{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        b.srcAccessMask = src;
+        b.dstAccessMask = dst;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.buffer = buf;
+        b.offset = 0;
+        b.size = VK_WHOLE_SIZE;
+        return b;
+    };
+    const auto stageBarrier = [&](VkBufferMemoryBarrier b, VkPipelineStageFlags dstStage) {
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, dstStage, 0, 0, nullptr, 1,
+                              &b, 0, nullptr);
+    };
+
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, tsPool, tsBase + 0);
+
+    // --- ColumnMain ---------------------------------------------------
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipelineLayout, 0, 1,
+                             &s.colSet, 0, nullptr);
+    vkCmdDispatch(cmd, groupsX, groupsY, 1);
+    stageBarrier(bufBarrier(s.gb.columnsBuf.buffer, VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT),
+                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool, tsBase + 1);
+
+    // --- VoxelizeMain, chained off this SAME command buffer's ColumnMain --
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.voxPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.voxPipelineLayout, 0, 1,
+                             &s.voxSet, 0, nullptr);
+    vkCmdDispatch(cmd, groupsX, groupsY, 1);
+    stageBarrier(bufBarrier(s.gb.cellsBuf.buf.buffer, VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT),
+                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool, tsBase + 2);
+
+    if (s.mbz > 0) {
+        const uint32_t meshGroups = (s.maskCount + 63) / 64;
+        const uint32_t scanGroups = (s.maskCount + 255) / 256;
+
+        // --- MeshCountMain: cells -> OutQuadCounts -------------------
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshCountPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshPipelineLayout, 0, 1,
+                                 &s.meshCountSet, 0, nullptr);
+        vkCmdDispatch(cmd, meshGroups, 1, 1);
+        stageBarrier(
+            bufBarrier(s.gb.countsBuf.buf.buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT),
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool, tsBase + 3);
+
+        // --- ScanBlocksMain: counts -> per-block offsets + block sums -
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.scanBlocksPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshPipelineLayout, 0, 1,
+                                 &s.scanSet, 0, nullptr);
+        vkCmdDispatch(cmd, scanGroups, 1, 1);
+        {
+            VkBufferMemoryBarrier bs[2] = {
+                bufBarrier(s.gb.offsetsBuf.buf.buffer, VK_ACCESS_SHADER_WRITE_BIT,
+                           VK_ACCESS_SHADER_READ_BIT),
+                bufBarrier(s.gb.blockSumsBuf.buf.buffer, VK_ACCESS_SHADER_WRITE_BIT,
+                           VK_ACCESS_SHADER_READ_BIT)};
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 2, bs, 0,
+                                  nullptr);
+        }
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool, tsBase + 4);
+
+        // --- ScanSumsMain: block sums exclusive-scanned in place, 1 wg -
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.scanSumsPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshPipelineLayout, 0, 1,
+                                 &s.scanSet, 0, nullptr);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        stageBarrier(bufBarrier(s.gb.blockSumsBuf.buf.buffer, VK_ACCESS_SHADER_WRITE_BIT,
+                                VK_ACCESS_SHADER_READ_BIT),
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool, tsBase + 5);
+
+        // --- ScanAddMain: offsets += scanned block base ---------------
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.scanAddPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshPipelineLayout, 0, 1,
+                                 &s.scanSet, 0, nullptr);
+        vkCmdDispatch(cmd, scanGroups, 1, 1);
+        stageBarrier(
+            bufBarrier(s.gb.offsetsBuf.buf.buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT),
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool, tsBase + 6);
+
+        // --- MeshEmitMain: writes quads at the GPU-scanned offsets -----
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshEmitPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshPipelineLayout, 0, 1,
+                                 &s.meshEmitSet, 0, nullptr);
+        vkCmdDispatch(cmd, meshGroups, 1, 1);
+        {
+            VkBufferMemoryBarrier bs[3] = {
+                bufBarrier(s.gb.quadsBuf.buf.buffer, VK_ACCESS_SHADER_WRITE_BIT,
+                           VK_ACCESS_HOST_READ_BIT),
+                bufBarrier(s.gb.countsBuf.buf.buffer, VK_ACCESS_SHADER_WRITE_BIT,
+                           VK_ACCESS_HOST_READ_BIT),
+                bufBarrier(s.gb.offsetsBuf.buf.buffer, VK_ACCESS_SHADER_WRITE_BIT,
+                           VK_ACCESS_HOST_READ_BIT)};
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                  VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 3, bs, 0, nullptr);
+        }
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool, tsBase + 7);
+    } else {
+        // No interior bricks this tile (bricksZ too thin) -- still write the
+        // remaining timestamps so every tile's slice of the query pool has
+        // all kTimestampsPerTile slots populated (deltas read ~0 for the
+        // skipped stages); keeps harvestTile()'s per-stage readback uniform.
+        for (uint32_t k = 3; k <= 7; ++k)
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool, tsBase + k);
+    }
+}
+
+// After the owning flight's fence has signalled: computes the true quad
+// total from the now-fenced counts/offsets buffers, then digests + (if
+// s.verify) CPU-compares this tile's GPU output. Byte-for-byte the same
+// logic the old runTile() ran after "GATE WINDOW ENDS".
+void harvestTile(FlightSlot& s, GateStats& stats) {
+    constexpr int32_t W = kTileColumns, H = kTileColumns;
+    const uint32_t bricksX = s.bricksX, bricksY = s.bricksY, bricksZ = s.bricksZ;
+    const int32_t brickZMin = s.brickZMin;
+    const uint32_t mbx = s.mbx, mby = s.mby, mbz = s.mbz;
+    const TileSpec& tile = s.tile;
+    const bool verify = s.verify;
+    const std::vector<ColumnSample>& cpuCols = s.cpuCols;
+
+    uint32_t running = 0;
+    if (mbz > 0) {
+        const uint32_t* counts = static_cast<const uint32_t*>(s.gb.countsBuf.buf.mapped);
+        const uint32_t* offsets = static_cast<const uint32_t*>(s.gb.offsetsBuf.buf.mapped);
+        running = counts[s.maskCount - 1] + offsets[s.maskCount - 1];
+    }
+
     const auto tCmp0 = Clock::now();
-    const GpuColumnSample* gpuCols = static_cast<const GpuColumnSample*>(gb.columnsBuf.mapped);
-    const uint32_t* gpuCells = static_cast<const uint32_t*>(gb.cellsBuf.buf.mapped);
+    const GpuColumnSample* gpuCols = static_cast<const GpuColumnSample*>(s.gb.columnsBuf.mapped);
+    const uint32_t* gpuCells = static_cast<const uint32_t*>(s.gb.cellsBuf.buf.mapped);
     const uint64_t* gpuQuads =
-        running > 0 ? static_cast<const uint64_t*>(gb.quadsBuf.buf.mapped) : nullptr;
+        running > 0 ? static_cast<const uint64_t*>(s.gb.quadsBuf.buf.mapped) : nullptr;
 
     for (int32_t y = 0; y < H; ++y) {
         for (int32_t x = 0; x < W; ++x) {
@@ -1836,85 +2061,242 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
     const int32_t coveredBricks = grid.numTiles * kInteriorBricks;
     const double coveredMetres = coveredBricks * kBrick * kVoxelSizeMm / 1000.0;
     const double requestedMetres = double(radiusM) * 2.0;
+    const int32_t totalSlots = kFlightSize * kPipelineDepth;
     std::printf(
         "\n=== GATE MODE: radius %lldm (seed %llu) ===\n"
         "tile grid: %dx%d tiles (%zu total), 128x128-column dispatch, 14x14-brick "
         "(112-column) interior, 1-brick shared halo\n"
+        "flight batching: %d tiles/flight (1 command buffer, 1 fence), %d-deep pipelined "
+        "(flight k+1's CPU prep overlaps flight k's pending fence via a deferred wait), "
+        "%d total per-tile buffer/descriptor slots\n"
         "brick coord range [%d, %d] (%d bricks/side); covered square %.1fm/side "
         "(requested %.1fm — the last tile row/col overshoots slightly so interiors stay "
         "brick-aligned and gapless)\n",
         (long long)radiusM, (unsigned long long)seed, grid.numTiles, grid.numTiles,
-        grid.tiles.size(), grid.bMin, grid.bMax, grid.bMax - grid.bMin + 1, coveredMetres,
-        requestedMetres);
+        grid.tiles.size(), kFlightSize, kPipelineDepth, totalSlots, grid.bMin, grid.bMax,
+        grid.bMax - grid.bMin + 1, coveredMetres, requestedMetres);
 
     const bool fullVerify = radiusM <= kFullVerifyRadiusM;
     std::printf("verification: %s\n",
                 fullVerify ? "FULL (every tile)"
                            : "SAMPLED (every 8th tile, deterministic linear tile index)");
 
-    GateBuffers gb;
-    gb.paramsBuf = ctx.createBuffer(sizeof(WorldGenParamsCB), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-    gb.columnsBuf = ctx.createBuffer(
-        VkDeviceSize(kTileColumns) * kTileColumns * sizeof(GpuColumnSample),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    gb.elevBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    gb.climBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    gb.cellsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    gb.countsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    gb.offsetsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    gb.blockSumsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    gb.quadsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    std::vector<FlightSlot> slots;
+    slots.resize(size_t(totalSlots));
+    for (FlightSlot& s : slots) {
+        s.gb.paramsBuf =
+            ctx.createBuffer(sizeof(WorldGenParamsCB), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+        s.gb.columnsBuf = ctx.createBuffer(
+            VkDeviceSize(kTileColumns) * kTileColumns * sizeof(GpuColumnSample),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        s.gb.elevBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        s.gb.climBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        s.gb.cellsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        s.gb.countsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        s.gb.offsetsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        s.gb.blockSumsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        s.gb.quadsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    }
+    FlightDescriptors fd = createFlightDescriptors(ctx, totalSlots, slots);
+
+    // One timestamp-query pool PER PIPELINE-DEPTH BANK (not one shared pool):
+    // a shared pool's reset+write commands from flight k+1 could start
+    // executing (same queue, strict submission order, zero gap) before the
+    // host finishes vkGetQueryPoolResults for flight k if both flights used
+    // the same pool -- see FlightSlot's doc comment on why banks exist at
+    // all. Query count only needs to cover kFlightSize tiles (a bank's
+    // worth), not totalSlots.
+    VkQueryPool tsPools[kPipelineDepth] = {};
+    for (int32_t b = 0; b < kPipelineDepth; ++b) {
+        VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = uint32_t(kFlightSize) * uint32_t(kTimestampsPerTile);
+        vkCheck(vkCreateQueryPool(ctx.device, &qpci, nullptr, &tsPools[b]),
+                "vkCreateQueryPool(flight-timestamps)");
+    }
 
     SyntheticTileSampler tiles(seed);
     Amplifier amp(seed, tiles);
 
     GateStats stats;
+    const size_t numTiles = grid.tiles.size();
+    const int32_t numFlights =
+        int32_t((numTiles + size_t(kFlightSize) - 1) / size_t(kFlightSize));
+    const double toMs = ctx.timestampPeriodNs / 1.0e6;
+
+    struct PendingFlight {
+        bool valid = false;
+        VkFence fence = VK_NULL_HANDLE;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        int32_t bank = 0;
+        int32_t count = 0;
+    };
+
+    // Prepares (CPU column pass + raster fill + buffer/descriptor
+    // marshalling for every tile in the flight -- NO GPU submission touched
+    // yet) then records + submits (WITHOUT waiting) flight f's single
+    // command buffer. Uses bank f % kPipelineDepth; see FlightSlot's doc
+    // comment for why that bank is guaranteed free (its previous occupant,
+    // flight f-kPipelineDepth, was waited+harvested before this flight two
+    // iterations ago in the main loop below).
+    const auto prepareAndSubmit = [&](int32_t f) -> PendingFlight {
+        const int32_t bank = f % kPipelineDepth;
+        const int32_t base = bank * kFlightSize;
+        const size_t start = size_t(f) * size_t(kFlightSize);
+        const int32_t count = int32_t(std::min<size_t>(size_t(kFlightSize), numTiles - start));
+
+        VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbai.commandPool = ctx.commandPool;
+        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        vkCheck(vkAllocateCommandBuffers(ctx.device, &cbai, &cmd),
+                "vkAllocateCommandBuffers(flight)");
+        VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkCheck(vkBeginCommandBuffer(cmd, &cbbi), "vkBeginCommandBuffer(flight)");
+        vkCmdResetQueryPool(cmd, tsPools[bank], 0, uint32_t(kFlightSize) * uint32_t(kTimestampsPerTile));
+
+        for (int32_t i = 0; i < count; ++i) {
+            FlightSlot& s = slots[size_t(base + i)];
+            const TileSpec& t = grid.tiles[start + size_t(i)];
+            const int32_t linearIndex = t.ty * grid.numTiles + t.tx;
+            const bool verify = fullVerify || (linearIndex % kVerifySampleStride == 0);
+            prepTileCpu(ctx, s, t, seed, tiles, amp, verify, stats);
+            recordTileCommands(ctx, cmd, s, tsPools[bank], uint32_t(i) * uint32_t(kTimestampsPerTile));
+        }
+        for (int32_t i = count; i < kFlightSize; ++i) slots[size_t(base + i)].active = false;
+
+        vkCheck(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(flight)");
+
+        PendingFlight pf;
+        pf.valid = true;
+        pf.cmd = cmd;
+        pf.bank = bank;
+        pf.count = count;
+        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        vkCheck(vkCreateFence(ctx.device, &fci, nullptr, &pf.fence), "vkCreateFence(flight)");
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &pf.cmd;
+        vkCheck(vkQueueSubmit(ctx.queue, 1, &si, pf.fence), "vkQueueSubmit(flight)");
+        return pf;
+    };
+
+    // Waits pf's fence (deferred: by the time this is called the GPU has
+    // usually already finished, since the NEXT flight's CPU prep ran first
+    // in the main loop below -- that's the double-buffering win), reads back
+    // every tile's 7 GPU stage timings from pf's bank's query pool in one
+    // call, then harvests (digest + CPU compare) every tile IN ORDER.
+    const auto waitAndHarvest = [&](PendingFlight& pf) {
+        vkCheck(vkWaitForFences(ctx.device, 1, &pf.fence, VK_TRUE, UINT64_MAX),
+                "vkWaitForFences(flight)");
+        vkDestroyFence(ctx.device, pf.fence, nullptr);
+        pf.fence = VK_NULL_HANDLE;
+
+        // Only request results for pf.count*kTimestampsPerTile queries -- NOT
+        // the bank's full kFlightSize*kTimestampsPerTile capacity. On a
+        // partial (last) flight, recordTileCommands() only wrote timestamps
+        // for the first pf.count tiles; the remaining queries in the bank
+        // were reset but never written, and VK_QUERY_RESULT_WAIT_BIT on an
+        // unwritten query blocks forever (found via a hang on radius=16 and
+        // radius=128, both of which have a partial last flight -- 9 tiles
+        // and 529 tiles are not multiples of kFlightSize).
+        std::vector<uint64_t> ts(size_t(pf.count) * size_t(kTimestampsPerTile), 0);
+        vkCheck(vkGetQueryPoolResults(ctx.device, tsPools[pf.bank], 0, uint32_t(ts.size()),
+                                       ts.size() * sizeof(uint64_t), ts.data(), sizeof(uint64_t),
+                                       VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+                "vkGetQueryPoolResults(flight)");
+
+        const int32_t base = pf.bank * kFlightSize;
+        for (int32_t i = 0; i < pf.count; ++i) {
+            const uint64_t* t = &ts[size_t(i) * size_t(kTimestampsPerTile)];
+            stats.columnMs += double(t[1] - t[0]) * toMs;
+            stats.voxelizeMs += double(t[2] - t[1]) * toMs;
+            stats.meshCountMs += double(t[3] - t[2]) * toMs;
+            stats.scanBlocksMs += double(t[4] - t[3]) * toMs;
+            stats.scanSumsMs += double(t[5] - t[4]) * toMs;
+            stats.scanAddMs += double(t[6] - t[5]) * toMs;
+            stats.meshEmitMs += double(t[7] - t[6]) * toMs;
+            harvestTile(slots[size_t(base + i)], stats);
+        }
+    };
+
     const auto tRunStart = Clock::now();
-    for (const TileSpec& t : grid.tiles) {
-        const int32_t linearIndex = t.ty * grid.numTiles + t.tx;
-        const bool verify = fullVerify || (linearIndex % kVerifySampleStride == 0);
-        runTile(ctx, gb, t, seed, tiles, amp, verify, stats);
-        if ((linearIndex + 1) % 32 == 0 || linearIndex + 1 == int32_t(grid.tiles.size())) {
-            std::printf("  tile %d/%d done (grid %d,%d)\n", linearIndex + 1,
-                        int(grid.tiles.size()), t.tx, t.ty);
+    PendingFlight prev;
+    for (int32_t f = 0; f < numFlights; ++f) {
+        PendingFlight cur = prepareAndSubmit(f); // may overlap flight f-1's still-pending fence
+        if (prev.valid) waitAndHarvest(prev);    // deferred wait on flight f-1
+        prev = cur;
+        const size_t doneTiles = std::min<size_t>(size_t(f + 1) * size_t(kFlightSize), numTiles);
+        if ((f + 1) % 8 == 0 || f + 1 == numFlights) {
+            std::printf("  flight %d/%d done (%zu/%zu tiles)\n", f + 1, numFlights, doneTiles,
+                        numTiles);
         }
     }
+    if (prev.valid) waitAndHarvest(prev);
     const double wallMs = msSince(tRunStart);
+    // Headline gate number: measured wall clock minus the two costs the gate
+    // spec explicitly excludes. Computed once here (not summed per-tile/
+    // per-flight) because flight pipelining makes per-tile windows overlap
+    // in real time -- summing them would double-count the overlap.
+    stats.gateMs = wallMs - stats.cpuColumnPassMs - stats.cpuCompareMs;
 
-    ctx.destroyBuffer(gb.paramsBuf);
-    ctx.destroyBuffer(gb.columnsBuf);
-    if (gb.elevBuf.buf.buffer) ctx.destroyBuffer(gb.elevBuf.buf);
-    if (gb.climBuf.buf.buffer) ctx.destroyBuffer(gb.climBuf.buf);
-    if (gb.cellsBuf.buf.buffer) ctx.destroyBuffer(gb.cellsBuf.buf);
-    if (gb.countsBuf.buf.buffer) ctx.destroyBuffer(gb.countsBuf.buf);
-    if (gb.offsetsBuf.buf.buffer) ctx.destroyBuffer(gb.offsetsBuf.buf);
-    if (gb.blockSumsBuf.buf.buffer) ctx.destroyBuffer(gb.blockSumsBuf.buf);
-    if (gb.quadsBuf.buf.buffer) ctx.destroyBuffer(gb.quadsBuf.buf);
+    for (int32_t b = 0; b < kPipelineDepth; ++b) vkDestroyQueryPool(ctx.device, tsPools[b], nullptr);
+    destroyFlightDescriptors(ctx, fd);
+    size_t totalReallocs = 0;
+    for (FlightSlot& s : slots) {
+        totalReallocs += s.gb.totalReallocs();
+        ctx.destroyBuffer(s.gb.paramsBuf);
+        ctx.destroyBuffer(s.gb.columnsBuf);
+        if (s.gb.elevBuf.buf.buffer) ctx.destroyBuffer(s.gb.elevBuf.buf);
+        if (s.gb.climBuf.buf.buffer) ctx.destroyBuffer(s.gb.climBuf.buf);
+        if (s.gb.cellsBuf.buf.buffer) ctx.destroyBuffer(s.gb.cellsBuf.buf);
+        if (s.gb.countsBuf.buf.buffer) ctx.destroyBuffer(s.gb.countsBuf.buf);
+        if (s.gb.offsetsBuf.buf.buffer) ctx.destroyBuffer(s.gb.offsetsBuf.buf);
+        if (s.gb.blockSumsBuf.buf.buffer) ctx.destroyBuffer(s.gb.blockSumsBuf.buf);
+        if (s.gb.quadsBuf.buf.buffer) ctx.destroyBuffer(s.gb.quadsBuf.buf);
+    }
 
     const double gateSec = stats.gateMs / 1000.0;
     const double verifiedFraction =
         stats.totalTiles ? double(stats.verifiedTiles) / double(stats.totalTiles) : 0.0;
     const double scanMs = stats.scanBlocksMs + stats.scanSumsMs + stats.scanAddMs;
-    const double namedStagesMs =
+    const double gpuStagesMs =
         stats.columnMs + stats.voxelizeMs + stats.meshCountMs + scanMs + stats.meshEmitMs;
+    // "As if serial" sum of every measured bucket -- with flight pipelining
+    // this legitimately exceeds gateMs once CPU marshalling of one flight
+    // hides inside the GPU busy time of another; the excess is time the
+    // double-buffering actually hid, not a bug. Reported explicitly instead
+    // of pretending the buckets are additive to gateMs (as the old fully
+    // serial per-tile loop's remainder-based "marshalling overhead" line
+    // implicitly did).
+    const double serialEquivalentMs = stats.hostRasterFillMs + stats.marshallingMs + gpuStagesMs;
+    const double pipeliningSavedMs =
+        serialEquivalentMs > stats.gateMs ? serialEquivalentMs - stats.gateMs : 0.0;
 
     std::printf(
-        "\n--- GATE stage totals (radius %lldm, %zu tiles) ---\n"
+        "\n--- GATE stage totals (radius %lldm, %zu tiles, GPU busy-time from "
+        "vkCmdWriteTimestamp queries) ---\n"
         "  columns dispatch:       %10.3f ms\n"
         "  voxelize dispatch:      %10.3f ms\n"
         "  mesh count dispatch:    %10.3f ms\n"
         "  GPU scan (blocks+sums+add): %10.3f ms  (blocks %.3f + sums %.3f + add %.3f)\n"
         "  mesh emit dispatch:     %10.3f ms\n"
-        "  (marshalling overhead:  %10.3f ms -- buffer ensure/grow, descriptor writes, "
-        "WorldGenParams upload, raster fill)\n"
-        "  GATE TOTAL (gpu path):  %10.3f ms  = %.3f s\n"
+        "  host raster fill:       %10.3f ms\n"
+        "  marshalling (buffer ensure/grow, persistent-descriptor writes on regrow only, "
+        "WorldGenParams upload): %10.3f ms\n"
+        "  (sum of the above as if fully serial: %10.3f ms; hidden by flight double-"
+        "buffering: %10.3f ms)\n"
+        "  GATE TOTAL (measured wall clock, gpu path):  %10.3f ms  = %.3f s\n"
         "  CPU column pass (setup, excluded from gate):         %10.3f ms\n"
         "  CPU compare + digest (verification, excluded from gate): %10.3f ms\n"
         "  wall clock (everything, incl. both excluded costs):  %10.3f ms\n",
         (long long)radiusM, stats.totalTiles, stats.columnMs, stats.voxelizeMs,
         stats.meshCountMs, scanMs, stats.scanBlocksMs, stats.scanSumsMs, stats.scanAddMs,
-        stats.meshEmitMs, stats.gateMs - namedStagesMs, stats.gateMs, gateSec,
-        stats.cpuColumnPassMs, stats.cpuCompareMs, wallMs);
+        stats.meshEmitMs, stats.hostRasterFillMs, stats.marshallingMs, serialEquivalentMs,
+        pipeliningSavedMs, stats.gateMs, gateSec, stats.cpuColumnPassMs, stats.cpuCompareMs,
+        wallMs);
 
     std::printf("\nGATE radius=%lldm: %.3f s (target: <1.000 s, plan sec4 M0) -> %s\n",
                 (long long)radiusM, gateSec, gateSec < 1.0 ? "PASS" : "OVER TARGET");
@@ -1927,10 +2309,11 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
         stats.totalQuads, stats.totalInteriorBricks);
 
     std::printf(
-        "buffer reallocations across the run (elev/clim/cells/counts/offsets/quads combined): "
-        "%zu (small and front-loaded -- buffers grow to a working-set size within the first "
-        "few tiles, then every later tile reuses them as-is)\n",
-        gb.totalReallocs());
+        "buffer reallocations across the run, all %d flight slots combined (elev/clim/cells/"
+        "counts/offsets/quads): %zu (small and front-loaded -- each slot's buffers grow to a "
+        "working-set size within its first few tiles, then every later tile reusing that slot "
+        "reuses the buffer as-is)\n",
+        totalSlots, totalReallocs);
 
     std::printf(
         "GATE output digest (columns + cells + quads, ALL gpu output, seed %llu): %016llx\n",
