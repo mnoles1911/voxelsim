@@ -40,10 +40,13 @@ Working plan + binding decisions: docs/m1-plan.md. UE 5.8.0 (retargeted
   vertex-color AO material, verified by screenshot 2026-07-19
 - [x] Stage 2 — streaming + dig/place: lock-free worker split, budgets,
   hysteresis, DDA raycast digs through the edit-log authority path
-- [ ] Stage 3 — walkable + LWC: streaming perf (worker column caching —
-  measured ~5 chunks/s, needs ~10×), DDA box-sweep character collision,
-  origin rebasing, 60fps gate run
-- Gate (walk & dig at 60fps min-spec): ⬜ open — blocked on stage 3
+- [x] Stage 3 — walkable + LWC: streaming perf fixed (≥25×), custom AABB
+  walk collision, LWC verified at 8,000km, player experience implemented
+  (sized digs, explosives, dual cameras, proxy body — PRs #7/#11)
+- Gate (walk & dig at 60fps min-spec): 🟨 near-closed — player feel testing
+  passed (Matt, in-session sign-off 2026-07-20); -VoxelPerfRun harness
+  measured p50 2.8ms / p95 4.2ms pre-M2 (PR #12). Formal close needs a
+  min-spec proxy (settings-throttled) perf run.
 
 ## M2 — LOD cascade (first implementation wave landed, 2026-07-20)
 
