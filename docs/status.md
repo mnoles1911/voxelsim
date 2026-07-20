@@ -280,6 +280,136 @@ are all pre-existing engine-header deprecation notices, none in
 VoxelWorldSubsystem/VoxelClipmapActor/VoxelEarthGameMode/VoxelDebug/
 VoxelEarthHUD).
 
+## M3 — Multiplayer (wave 1 skeleton landed, 2026-07-20)
+
+Working plan + binding decisions: docs/m3-plan.md. Wave 1 scope: server
+target builds, subsystem role split, `AVoxelEditRelay` + intent RPCs + entry
+broadcast + join-time log sync, seed/digest handshake, and the gate.
+
+- [x] `Source/VoxelEarthServer.Target.cs` (`TargetType.Server`) added.
+  **Cannot be compiled in this environment**: `D:\UE_5.8` is an Epic Games
+  Launcher **Installed Build** (`Engine/Build/InstalledBuild.txt` present),
+  and Installed Builds do not support compiling dedicated-server targets —
+  Epic requires a source-built engine for that (`UnrealBuildTool` fails
+  immediately with "Server targets are not currently supported from this
+  engine distribution", before ever reaching the compiler). The target file
+  itself is syntactically valid and was accepted by UBT up to that
+  engine-distribution check. **Worked around for the gate**: ran the
+  dedicated-server role via `UnrealEditor-Cmd.exe <uproject> -server -log`
+  instead — the standard uncooked/headless technique for exercising
+  `NM_DedicatedServer` on an Installed Build without a separate cooked
+  server binary (uses the already-built Editor target's runtime, just in
+  server mode; no rendering, no viewport). This is the same technique the
+  gate script in docs/m3-plan.md's wave 1 item names as an acceptable
+  alternative. Editor target (`VoxelEarthEditor`) builds clean throughout.
+- [x] Role split in `UVoxelWorldSubsystem`: `TryDig`/`TryPlace`/`CarveSphere`
+  keep their exact pre-M3 signatures; internally, `NM_Standalone` takes the
+  literal pre-M3 code path (single extra `GetNetMode()` branch, zero
+  behavior change); `NM_DedicatedServer`/`NM_ListenServer` apply directly
+  (today's behavior) then broadcast newly-appended log entries via
+  `AVoxelEditRelay::MulticastAppliedEntries`; `NM_Client` applies the same
+  cells locally as a tracked prediction and forwards the intent to the
+  server through the local player's `AVoxelEarthPlayerController`.
+- [x] `AVoxelEditRelay` (new, `ue-project/Source/VoxelEarth/VoxelEditRelay.{h,cpp}`):
+  a single, unowned, `bAlwaysRelevant` world-scoped actor, spawned by
+  `AVoxelEarthGameMode::BeginPlay` on authority only when
+  `GetNetMode() != NM_Standalone` (single-player spawns nothing — zero
+  relay code paths touched, byte-identical to pre-M3). Carries the
+  replicated seed/worldgen-version/probe-digest handshake fields (set in
+  `BeginPlay` on authority, compared against the client's own locally-
+  computed values in the client's `BeginPlay`, hard-disconnect via
+  `PC->ConsoleCommand(TEXT("disconnect"))` on mismatch) and the reliable
+  `NetMulticast MulticastAppliedEntries(TArray<uint8>)` broadcast.
+  **Deviation from the literal RPC-surface suggestion**: client-initiated
+  RPCs (submit edit intent, request join-sync) do NOT live on this actor —
+  UE Server RPCs are only callable by the connection that owns the target
+  actor (`AActor::GetNetConnection()` walks the `Owner` chain; an unowned
+  actor has none, so the engine silently rejects a client's attempt to call
+  a Server RPC on it). Since this relay is deliberately a single shared
+  instance (not one per player), it structurally cannot receive them. Those
+  RPCs (`ServerSubmitDigIntent`/`ServerSubmitPlaceIntent`/
+  `ServerSubmitCarveIntent`/`ServerRequestJoinSync`/
+  `ClientReceiveJoinSyncChunk`) live on `AVoxelEarthPlayerController`
+  instead, which IS reliably owned by its own client connection — same
+  behavioral contract, the only architecturally-correct place to put them.
+- [x] Wire format: a new flat "batch of `vxc::EditEntry`" encoding built
+  from `vxc::ByteWriter`/`ByteReader` (voxel-core's own primitives), NOT
+  `vxc::EditLog::serialize`'s self-describing whole-log format — broadcasts
+  need arbitrary tail slices of the log, not always from seq 0.
+  **voxel-core was NOT modified**: entries replay through the existing
+  public `World::applyEdit`, one call per brick, via a new
+  `FVoxelWorldImpl::ApplyReplicatedEntries` that reuses the exact same
+  `ApplyGroupedEdits` tail every local edit already uses.
+- [x] Join sync: client's `PlayerController::BeginPlay` (own locally-
+  controlled instance, `NM_Client`) calls `ServerRequestJoinSync`; server
+  serializes the full log from seq 0 and replies via
+  `ClientReceiveJoinSyncChunk`, chunked ≤48KB per reliable RPC; client
+  buffers until `bFinal`, replays, then flushes any live
+  `MulticastAppliedEntries` batches that arrived mid-sync (buffered, not
+  dropped, not applied out of order).
+- [x] Prediction reconcile v1: `FVoxelWorldImpl::PendingPredictedCellsByBrick`
+  tracks the exact cells each local prediction wrote; a matching confirmed
+  entry silently erases it, a differing one logs a warning and is dropped
+  (v1-acceptable brick granularity per the plan) — the confirmed entry's
+  cells are ALWAYS applied to the overlay regardless of match, so the
+  overlay converges to server truth either way. **Observed live in the
+  gate run** (see below): client1 logged four "Prediction reconcile:
+  brick ... differs from local prediction" warnings after client2's dig
+  landed on overlapping bricks, then converged to the same digest as
+  everyone else — the mismatch path works as designed, not just the happy
+  path.
+- [x] Determinism-guard handshake: digest of seed + `vxc::kWorldGenVersion`
+  + 16 fixed `Amplifier::column` probes (`UVoxelWorldSubsystem::
+  ComputeHandshakeDigest`), replicated via `AVoxelEditRelay` fields,
+  compared client-side at join.
+- [x] **Gate — "two clients dig the same hole" — PASSED (2026-07-20).**
+  Dedicated server + 2 headless clients as separate processes
+  (`UnrealEditor-Cmd.exe`, see above for why `-server` instead of a
+  compiled server binary), seed 20260719: server up →
+  `-VoxelAutoDigAfter=<s>` on both clients fires one `TryDig` each at a
+  fixed, seed-derived world column (not pawn-relative, so independent
+  processes provably target the identical spot) → `-VoxelDumpDigestAfter=<s>`
+  on all three logs `VoxelDigestDump: role=... editedDigest=...`
+  (`voxel.DumpEditedDigest` console command also added for interactive use)
+  → all three matched:
+  ```
+  VoxelDigestDump: role=Client seed=20260719 editedDigest=0x2451E40F5C935D2C   (client1)
+  VoxelDigestDump: role=Client seed=20260719 editedDigest=0x2451E40F5C935D2C   (client2)
+  VoxelDigestDump: role=Server seed=20260719 editedDigest=0x2451E40F5C935D2C   (server)
+  ```
+  Both clients' handshake logged `handshake OK (seed=20260719 wgen=1
+  digest=0x0265CC7E14BF223B)` before join-sync. No crashes, no ensures, no
+  fatal errors in any of the three logs.
+  **Bugs found and fixed while getting the gate green**: (1) the
+  `-VoxelAutoDigAfter` fixed probe originally started the raycast 10m above
+  the surface against an 8m dig range (`DigPlaceRangeMeters`) — the ray
+  could never reach anything; fixed to 5m clearance. (2) A dedicated server
+  was still running the FULL render-chunk streaming/meshing pipeline every
+  tick (worker jobs, greedy meshing) despite having no viewport ever to
+  render into — wasted CPU stretched `FTimerManager`-scheduled verification
+  switches well past their nominal delay under concurrent process load.
+  Fixed: `UVoxelWorldSubsystem::OnWorldBeginPlay` now skips spawning
+  `ChunkOwner`/`ChunkRoot` entirely on `NM_DedicatedServer` (Tick() already
+  no-ops without them); the authoritative `Impl->Voxels` is unaffected —
+  TryDig/TryPlace/CarveSphere all still work identically. This is also a
+  legitimate standing optimization for real dedicated-server deployments,
+  not just a gate-timing fix.
+- [ ] PIE 2-player verification (editor multiplayer PIE) — not run this
+  wave; the dedicated-server + 2-headless-clients gate above supersedes it
+  for wave 1's pass/fail purposes, but PIE is worth a follow-up smoke test
+  before wave 2.
+- [ ] Prediction/reconcile polish, join-time compacted-snapshot sync,
+  validation hardening (rate caps), water/NPC readiness hooks — wave 2/3
+  per docs/m3-plan.md.
+
+Build: worktree `voxelcore.lib` rebuilt clean from scratch this wave
+(`vxc_tests` 2/2 + `vxc_editlog_selftest` pass; voxel-core itself untouched
+by M3 wave 1 — see the wire-format note above). `VoxelEarthEditor` Win64
+Development builds clean (zero warnings from any file touched this wave;
+same ~pre-existing engine-header deprecation baseline as prior waves).
+`VoxelEarthServer` cannot build on this Installed-Build engine (see above);
+its Target.cs is otherwise complete and UBT-valid.
+
 ## M0 GPU track (ADR-0001)
 
 - [x] Worldgen HLSL kernel (ColumnMain, VoxelizeMain, MeshCountMain,

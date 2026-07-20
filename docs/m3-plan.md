@@ -33,3 +33,47 @@ authority path (the edit log) for every world change.
 Interest management (all edits to all clients — KB/s class per plan §3.4),
 encryption/auth, server browser, persistence across restarts (M3 wave 2+
 via edit-log save/load + `vxc_editlog` compaction).
+
+## Wave 1 — as-built (landed 2026-07-20)
+
+Gate PASSED — see docs/status.md's M3 section for the full writeup and the
+three matching digest lines. Summary of what shipped vs. this doc's
+original framing:
+
+- **Server target**: `Source/VoxelEarthServer.Target.cs` exists and is
+  UBT-valid, but cannot be COMPILED on this dev machine — `D:\UE_5.8` is an
+  Epic Games Launcher Installed Build, and Installed Builds refuse to build
+  `TargetType.Server` (requires a source-built engine; UBT's own message:
+  "Server targets are not currently supported from this engine
+  distribution"). The gate instead ran the dedicated-server role via
+  `UnrealEditor-Cmd.exe <uproject> -server -log` (uncooked headless server
+  mode on the already-built Editor target) — functionally exercises the
+  exact same `NM_DedicatedServer` code path this doc's role-split decisions
+  are about, just without a separately-cooked binary. Building the actual
+  `VoxelEarthServer` target is deferred until a source-built engine is
+  available (wave 2+ or infra work, not a code blocker).
+- **Relay RPC surface**: `AVoxelEditRelay` carries server->everyone traffic
+  only (replicated handshake fields + `MulticastAppliedEntries`). Client->
+  server traffic (`ServerSubmitDigIntent`/`ServerSubmitPlaceIntent`/
+  `ServerSubmitCarveIntent`/`ServerRequestJoinSync`/
+  `ClientReceiveJoinSyncChunk`) lives on `AVoxelEarthPlayerController`
+  instead of the relay actor this doc's decisions table implied — a single
+  shared, unowned relay actor structurally cannot receive client-called
+  Server RPCs (UE requires the calling connection to own the target actor).
+  The relay stays the generic "seq-stamped opaque entry stream" broadcaster
+  the wave-3 note asks for; only the request/response half moved.
+- **voxel-core untouched**: no `applyReplicated(const EditEntry&)` or any
+  other voxel-core change was needed. Replicated entries replay through the
+  existing public `World::applyEdit` (one call per brick, exactly the local
+  path), fed by a UE-side wire format built from `vxc::ByteWriter`/
+  `ByteReader` — see `FVoxelWorldImpl::ApplyReplicatedEntries` /
+  `SerializeEntries`/`ParseEntries` in `VoxelWorldSubsystem.cpp`.
+- **A dedicated-server perf fix fell out of the gate work**: the render-
+  chunk streaming/meshing pipeline was running full-tilt on a headless
+  `-server` process with zero viewport ever to consume it, stalling
+  `FTimerManager` timers under concurrent multi-process load. Fixed by
+  skipping `ChunkOwner`/`ChunkRoot` spawn entirely on `NM_DedicatedServer`
+  in `UVoxelWorldSubsystem::OnWorldBeginPlay` — a real standing
+  optimization, not just a test-timing workaround.
+- PIE 2-player verification was not run this wave (the dedicated-server +
+  2-headless-clients gate superseded it); worth a follow-up smoke test.

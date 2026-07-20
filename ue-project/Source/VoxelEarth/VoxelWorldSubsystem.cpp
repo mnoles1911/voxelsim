@@ -5,10 +5,18 @@
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
 #include "VoxelMeshTypes.h"
+// M3 wave 1 (docs/m3-plan.md): role split needs the relay actor (broadcast
+// target) and the player controller (owns the client->server intent RPCs --
+// see VoxelEditRelay.h's class comment for why those can't live on the
+// shared relay actor itself). Both are ordinary same-module UE classes, not
+// the voxel-core boundary, so including them from this .cpp is fine.
+#include "VoxelEarthPlayerController.h"
+#include "VoxelEditRelay.h"
 
 // voxel-core is UE-header-free C++20; safe to include directly from a UE
 // module .cpp (doctrine: never from a header UHT parses -- see
 // VoxelWorldSubsystem.h / VoxelChunkComponent.h, both voxel-core-free).
+#include "voxelcore/bytes.h"
 #include "voxelcore/counters.h"
 #include "voxelcore/hash.h"
 #include "voxelcore/mesher.h"
@@ -21,10 +29,12 @@
 #include "Containers/Queue.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/World.h"
+#include "EngineUtils.h" // TActorIterator (M3: locating the world's single AVoxelEditRelay)
 #include "GameFramework/Actor.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/CriticalSection.h"
+#include "HAL/IConsoleManager.h" // M3: voxel.DumpEditedDigest
 #include "HAL/PlatformMisc.h"
 #include "HAL/PlatformTime.h"
 #include "HAL/ThreadSafeCounter.h"
@@ -728,6 +738,83 @@ struct FJobResult
 };
 } // namespace VoxelStreaming
 
+// M3 wave 1 (docs/m3-plan.md "Transport"): the wire format AVoxelEditRelay's
+// MulticastAppliedEntries and AVoxelEarthPlayerController's join-sync RPCs
+// carry. Built from vxc::ByteWriter/ByteReader (the SAME primitives
+// vxc::EditLog::serialize/parse use) but framed as a flat entry list rather
+// than EditLog::serialize's self-describing whole-log format (magic/version/
+// seed header, contiguous-from-0 seq requirement) -- broadcasts need to send
+// arbitrary TAIL slices of the log (new entries since the last broadcast),
+// not always the whole thing from seq 0. Sparse-only cell encoding (no RLE):
+// batches here are always small (one player's dig/place/carve, or the
+// occasional full join-sync replay), so EditLog's RLE-for-full-brick-
+// rewrites optimization isn't worth the complexity. Deliberately does NOT
+// touch voxel-core (doctrine: avoid modifying voxel-core unless truly
+// unavoidable) -- entries replay through the existing public
+// World::applyEdit, one call per brick, exactly like a local dig (see
+// FVoxelWorldImpl::ApplyReplicatedEntries below).
+namespace
+{
+using FEditsByBrick = std::unordered_map<vxc::BrickKey, std::vector<vxc::EditCell>, vxc::BrickKeyHash>;
+
+void SerializeEntries(const std::vector<vxc::EditEntry>& Entries, TArray<uint8>& OutBytes)
+{
+	std::vector<uint8_t> Bytes;
+	vxc::ByteWriter W(Bytes);
+	W.u64(Entries.size());
+	for (const vxc::EditEntry& E : Entries)
+	{
+		W.i32(E.key.x);
+		W.i32(E.key.y);
+		W.i32(E.key.z);
+		W.u16(static_cast<uint16_t>(E.cells.size()));
+		for (const vxc::EditCell& C : E.cells)
+		{
+			W.u16(C.cell);
+			W.u8(C.mat);
+		}
+	}
+	OutBytes.SetNumUninitialized((int32)Bytes.size());
+	if (!Bytes.empty())
+	{
+		FMemory::Memcpy(OutBytes.GetData(), Bytes.data(), Bytes.size());
+	}
+}
+
+bool ParseEntries(const TArray<uint8>& InBytes, std::vector<vxc::EditEntry>& OutEntries)
+{
+	OutEntries.clear();
+	vxc::ByteReader R(InBytes.GetData(), static_cast<size_t>(InBytes.Num()));
+	uint64_t Count = 0;
+	if (!R.u64(Count))
+	{
+		return InBytes.Num() == 0; // an empty batch is valid (nothing to apply)
+	}
+	OutEntries.reserve((size_t)Count);
+	for (uint64_t i = 0; i < Count; ++i)
+	{
+		vxc::EditEntry E;
+		int32_t X = 0, Y = 0, Z = 0;
+		uint16_t NumCells = 0;
+		if (!R.i32(X) || !R.i32(Y) || !R.i32(Z) || !R.u16(NumCells))
+		{
+			return false;
+		}
+		E.key = vxc::BrickKey{X, Y, Z};
+		E.cells.resize(NumCells);
+		for (uint16_t c = 0; c < NumCells; ++c)
+		{
+			if (!R.u16(E.cells[c].cell) || !R.u8(E.cells[c].mat))
+			{
+				return false;
+			}
+		}
+		OutEntries.push_back(std::move(E));
+	}
+	return true;
+}
+} // namespace
+
 // FVoxelWorldImpl -- the voxel-core side of the subsystem, defined only here
 // so VoxelWorldSubsystem.h (UHT-parsed) never sees a voxel-core header. Also
 // owns ALL Stage 2 streaming state (chunk records, pending-work queues, the
@@ -885,17 +972,64 @@ struct FVoxelWorldImpl
 	void TickStreaming(const FVector& Anchor, AActor& Owner, USceneComponent& Root, UMaterialInterface* Material, float DeltaTime);
 	void WaitForInFlightTasks();
 
-	// Dig/place (edit-log authority path). Game thread only.
-	bool TryDig(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels);
+	// Dig/place (edit-log authority path). Game thread only. OutPredicted,
+	// when non-null, receives a COPY of the per-brick cell groups actually
+	// applied (M3 wave 1 client-prediction tracking, docs/m3-plan.md
+	// "Prediction") -- populated before ApplyGroupedEdits moves the cells
+	// out of the local EditsByBrick map, so it reflects exactly what this
+	// call wrote to the overlay.
+	bool TryDig(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels, FEditsByBrick* OutPredicted = nullptr);
 	bool TryPlace(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels, uint8 MaterialId,
-	              const FVector& PlayerActorLocation);
+	              const FVector& PlayerActorLocation, FEditsByBrick* OutPredicted = nullptr);
 
-	// Explosives v1 (edit-log authority path). Game thread only.
-	int32 CarveSphere(const FVector& CenterUU, double RadiusUU, double JitterUU);
+	// Explosives v1 (edit-log authority path). Game thread only. OutPredicted: see TryDig.
+	int32 CarveSphere(const FVector& CenterUU, double RadiusUU, double JitterUU, FEditsByBrick* OutPredicted = nullptr);
+
+	// M3 wave 1 (docs/m3-plan.md): applies a batch of server-authoritative
+	// entries (parsed off the wire by UVoxelWorldSubsystem::ApplyReplicatedEntries)
+	// through the SAME ApplyGroupedEdits tail TryDig/TryPlace/CarveSphere use
+	// -- one World::applyEdit per touched brick, dirty-chunk marking, mip
+	// propagation, all identical to a local edit. Also reconciles any
+	// pending local predictions touching the same bricks (see
+	// ReconcilePrediction below) before applying. Game thread only (same
+	// constraint as every other edit-log entry point).
+	void ApplyReplicatedEntries(const std::vector<vxc::EditEntry>& Entries);
+
+	// M3 wave 1 client-prediction bookkeeping: brick -> the cells this
+	// client's OWN not-yet-confirmed local prediction wrote there (see
+	// TryDig's OutPredicted doc comment). Reconciled/erased by
+	// ReconcilePrediction as confirming (or superseding) server entries
+	// arrive. Deliberately public, all-fields-public struct convention
+	// (matches ChunkRecords etc. above) -- read/written by the free
+	// role-split helper functions in this file (TryDigReplica et al).
+	FEditsByBrick PendingPredictedCellsByBrick;
+
+	// M3 wave 1 authority-side broadcast bookkeeping: log size already sent
+	// via AVoxelEditRelay::MulticastAppliedEntries (see BroadcastNewEntries
+	// in this file). Authority only in practice (NM_Client never appends
+	// via this path, only via ApplyReplicatedEntries); harmless if unused.
+	uint64 LastBroadcastSeq = 0;
 
 	FVoxelPerfSnapshot GetPerfSnapshot() const { return LastPerfSnapshot; }
 
 private:
+	// M3 wave 1 (docs/m3-plan.md "Prediction reconcile v1"): drops
+	// PendingPredictedCellsByBrick[Key] if it exact-matches ConfirmedCells
+	// (silent confirmation -- deterministic derivation means byte-identical
+	// results, so this is the common case for a client's own edits). A
+	// present-but-different entry is a v1-acceptable brick-granularity
+	// mismatch: logs a warning and drops the stale prediction: the caller
+	// (ApplyReplicatedEntries) already applies ConfirmedCells' exact values
+	// to the overlay and marks the chunk dirty for re-mesh regardless of
+	// match, so the overlay always converges to server truth for the cells
+	// the confirmed entry actually names -- only cells the client predicted
+	// but the server DIDN'T confirm could remain locally wrong past this
+	// point (accepted v1 limitation, see docs/m3-plan.md wave 2 note on
+	// prediction/reconcile polish). A no-op if Key has no pending prediction
+	// (either not ours, or already confirmed).
+	void ReconcilePrediction(const vxc::BrickKey& Key, const std::vector<vxc::EditCell>& ConfirmedCells);
+
+
 	void RecomputeDesiredSet(const FVector& Anchor);
 	void ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax) const;
 	void SortPendingQueues(const FVector& Anchor);
@@ -2123,7 +2257,7 @@ void FVoxelWorldImpl::DrawDebugBoundsLayer(UWorld& World, const FVector& Anchor)
 	}
 }
 
-bool FVoxelWorldImpl::TryDig(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels)
+bool FVoxelWorldImpl::TryDig(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels, FEditsByBrick* OutPredicted)
 {
 	const FVector Dir = CameraDir.GetSafeNormal();
 	if (Dir.IsNearlyZero())
@@ -2175,12 +2309,16 @@ bool FVoxelWorldImpl::TryDig(const FVector& CameraLoc, const FVector& CameraDir,
 	{
 		return false;
 	}
+	if (OutPredicted)
+	{
+		*OutPredicted = EditsByBrick; // copy before ApplyGroupedEdits moves the cells out (M3 wave 1 prediction tracking)
+	}
 	ApplyGroupedEdits(EditsByBrick, DirtyChunks);
 	return true;
 }
 
 bool FVoxelWorldImpl::TryPlace(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels, uint8 MaterialId,
-                                const FVector& PlayerActorLocation)
+                                const FVector& PlayerActorLocation, FEditsByBrick* OutPredicted)
 {
 	const FVector Dir = CameraDir.GetSafeNormal();
 	if (Dir.IsNearlyZero())
@@ -2255,11 +2393,15 @@ bool FVoxelWorldImpl::TryPlace(const FVector& CameraLoc, const FVector& CameraDi
 	{
 		return false;
 	}
+	if (OutPredicted)
+	{
+		*OutPredicted = EditsByBrick; // see TryDig's identical comment above
+	}
 	ApplyGroupedEdits(EditsByBrick, DirtyChunks);
 	return true;
 }
 
-int32 FVoxelWorldImpl::CarveSphere(const FVector& CenterUU, double RadiusUU, double JitterUU)
+int32 FVoxelWorldImpl::CarveSphere(const FVector& CenterUU, double RadiusUU, double JitterUU, FEditsByBrick* OutPredicted)
 {
 	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
 	const double VoxelSize = VoxelCoords::VoxelSizeUU;
@@ -2318,9 +2460,181 @@ int32 FVoxelWorldImpl::CarveSphere(const FVector& CenterUU, double RadiusUU, dou
 		}
 	}
 
+	if (OutPredicted)
+	{
+		*OutPredicted = EditsByBrick;
+	}
 	ApplyGroupedEdits(EditsByBrick, DirtyChunks);
 	return RemovedCount;
 }
+
+void FVoxelWorldImpl::ReconcilePrediction(const vxc::BrickKey& Key, const std::vector<vxc::EditCell>& ConfirmedCells)
+{
+	auto It = PendingPredictedCellsByBrick.find(Key);
+	if (It == PendingPredictedCellsByBrick.end())
+	{
+		return; // not one of our own predictions (another player's edit, or already confirmed)
+	}
+	if (It->second == ConfirmedCells)
+	{
+		// Exact match: deterministic derivation means byte-identical results
+		// -- silent confirmation, no correction needed.
+		PendingPredictedCellsByBrick.erase(It);
+		return;
+	}
+	UE_LOG(LogVoxelEdit, Warning,
+	       TEXT("Prediction reconcile: brick (%d,%d,%d) server entry differs from local prediction -- applying ")
+	       TEXT("server truth for the confirmed cells (brick-granularity v1, docs/m3-plan.md 'Prediction reconcile v1')."),
+	       Key.x, Key.y, Key.z);
+	PendingPredictedCellsByBrick.erase(It);
+}
+
+void FVoxelWorldImpl::ApplyReplicatedEntries(const std::vector<vxc::EditEntry>& Entries)
+{
+	if (Entries.empty())
+	{
+		return;
+	}
+
+	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
+	FEditsByBrick EditsByBrick;
+	TSet<VoxelCoords::FVoxelChunkKey> DirtyChunks;
+
+	for (const vxc::EditEntry& E : Entries)
+	{
+		ReconcilePrediction(E.key, E.cells);
+
+		std::vector<vxc::EditCell>& Cells = EditsByBrick[E.key];
+		Cells.insert(Cells.end(), E.cells.begin(), E.cells.end());
+
+		for (const vxc::EditCell& C : E.cells)
+		{
+			const int LocalX = C.cell % B, LocalY = (C.cell / B) % B, LocalZ = C.cell / (B * B);
+			const int64 Vx = int64(E.key.x) * B + LocalX;
+			const int64 Vy = int64(E.key.y) * B + LocalY;
+			const int64 Vz = int64(E.key.z) * B + LocalZ;
+			CollectDirtyChunks(Vx, Vy, Vz, DirtyChunks);
+		}
+	}
+	// Reuses the exact same tail every local edit uses (docs/m3-plan.md
+	// doctrine: "one authority path for world changes") -- World::applyEdit
+	// per brick, dirty-chunk marking, mip propagation, pending-queue sort.
+	ApplyGroupedEdits(EditsByBrick, DirtyChunks);
+}
+
+// M3 wave 1 role-split helpers (docs/m3-plan.md "Authority flow"/"Prediction").
+// Free functions (not FVoxelWorldImpl/UVoxelWorldSubsystem members) since they
+// need UWorld&/actor access FVoxelWorldImpl deliberately never has, and the
+// UHT-parsed UVoxelWorldSubsystem header stays untouched (the role split is
+// entirely an implementation detail behind TryDig/TryPlace/CarveSphere's
+// unchanged public signatures).
+namespace
+{
+// NM_Client path: apply the SAME cells locally right now (today's overlay-
+// apply path, so digging/placing/carving still feels instant), remember them
+// as a pending prediction, then forward the identical intent to the server
+// through the local player's PlayerController -- the ONE actor guaranteed to
+// be owned by this client's connection (see VoxelEditRelay.h's class comment
+// for why the shared, unowned AVoxelEditRelay can't receive client-called
+// Server RPCs itself).
+bool TryDigReplica(FVoxelWorldImpl& Impl, UWorld& World, const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels)
+{
+	FEditsByBrick Predicted;
+	const bool bApplied = Impl.TryDig(CameraLoc, CameraDir, SizeVoxels, &Predicted);
+	if (!bApplied)
+	{
+		return false;
+	}
+	for (auto& Entry : Predicted)
+	{
+		Impl.PendingPredictedCellsByBrick[Entry.first] = Entry.second;
+	}
+	if (AVoxelEarthPlayerController* PC = Cast<AVoxelEarthPlayerController>(World.GetFirstPlayerController()))
+	{
+		PC->ServerSubmitDigIntent(CameraLoc, CameraDir, SizeVoxels);
+	}
+	return true;
+}
+
+bool TryPlaceReplica(FVoxelWorldImpl& Impl, UWorld& World, const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels,
+                      uint8 MaterialId, const FVector& PlayerActorLocation)
+{
+	FEditsByBrick Predicted;
+	const bool bApplied = Impl.TryPlace(CameraLoc, CameraDir, SizeVoxels, MaterialId, PlayerActorLocation, &Predicted);
+	if (!bApplied)
+	{
+		return false;
+	}
+	for (auto& Entry : Predicted)
+	{
+		Impl.PendingPredictedCellsByBrick[Entry.first] = Entry.second;
+	}
+	if (AVoxelEarthPlayerController* PC = Cast<AVoxelEarthPlayerController>(World.GetFirstPlayerController()))
+	{
+		PC->ServerSubmitPlaceIntent(CameraLoc, CameraDir, SizeVoxels, MaterialId, PlayerActorLocation);
+	}
+	return true;
+}
+
+int32 CarveSphereReplica(FVoxelWorldImpl& Impl, UWorld& World, const FVector& CenterUU, double RadiusUU, double JitterUU)
+{
+	FEditsByBrick Predicted;
+	const int32 Removed = Impl.CarveSphere(CenterUU, RadiusUU, JitterUU, &Predicted);
+	if (Removed <= 0)
+	{
+		return Removed;
+	}
+	for (auto& Entry : Predicted)
+	{
+		Impl.PendingPredictedCellsByBrick[Entry.first] = Entry.second;
+	}
+	if (AVoxelEarthPlayerController* PC = Cast<AVoxelEarthPlayerController>(World.GetFirstPlayerController()))
+	{
+		PC->ServerSubmitCarveIntent(CenterUU, (float)RadiusUU, (float)JitterUU);
+	}
+	return Removed;
+}
+
+// The relay is a single, world-scoped, always-relevant actor (see
+// VoxelEditRelay.h) -- a plain iterator lookup is fine at dig/place/carve
+// rate (not a per-frame hot path).
+AVoxelEditRelay* FindEditRelay(UWorld& World)
+{
+	for (TActorIterator<AVoxelEditRelay> It(&World); It; ++It)
+	{
+		return *It;
+	}
+	return nullptr;
+}
+
+// Authority path tail: after a local (or client-forwarded) authoritative
+// edit lands, broadcast whatever is new in the log since the last broadcast
+// (usually exactly what the edit just appended) to every client.
+void BroadcastNewEntries(FVoxelWorldImpl& Impl, UWorld& World)
+{
+	const uint64 CurrentSize = Impl.Voxels.log().size();
+	if (CurrentSize <= Impl.LastBroadcastSeq)
+	{
+		return;
+	}
+	const auto& AllEntries = Impl.Voxels.log().entries();
+	std::vector<vxc::EditEntry> Slice(AllEntries.begin() + static_cast<std::ptrdiff_t>(Impl.LastBroadcastSeq), AllEntries.end());
+	Impl.LastBroadcastSeq = CurrentSize;
+
+	TArray<uint8> Bytes;
+	SerializeEntries(Slice, Bytes);
+
+	if (AVoxelEditRelay* Relay = FindEditRelay(World))
+	{
+		Relay->MulticastAppliedEntries(Bytes);
+	}
+	else
+	{
+		UE_LOG(LogVoxelEdit, Warning, TEXT("BroadcastNewEntries: no AVoxelEditRelay in the world -- %d entries not broadcast."),
+		       (int32)Slice.size());
+	}
+}
+} // namespace
 
 // UVoxelWorldSubsystem ----------------------------------------------------
 
@@ -2385,6 +2699,26 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 	if (!InWorld.IsGameWorld() || !Impl)
 	{
+		return;
+	}
+
+	// M3 wave 1 (docs/m3-plan.md): a dedicated server has no viewport and
+	// never renders -- render-chunk streaming (mesh generation, worker
+	// jobs, UVoxelChunkComponent spawning) is pure client/listen-server
+	// concern that would otherwise burn CPU every tick for nothing on a
+	// true NM_DedicatedServer (this WAS observed: the M3 gate's first run
+	// showed multi-second tick stalls server-side from exactly this work,
+	// stretching FTimerManager-scheduled verification switches well past
+	// their nominal delay). ChunkOwner/ChunkRoot are deliberately left
+	// null; Tick() already no-ops without them, so nothing else needs to
+	// change -- Impl->Voxels (the authoritative World + edit log) is fully
+	// usable via TryDig/TryPlace/CarveSphere regardless.
+	if (InWorld.GetNetMode() == NM_DedicatedServer)
+	{
+		UE_LOG(LogVoxelStream, Log,
+		       TEXT("Voxel streaming DISABLED (seed %llu): NM_DedicatedServer has no viewport -- only the authoritative ")
+		       TEXT("World + edit log run here."),
+		       (unsigned long long)Seed);
 		return;
 	}
 
@@ -2463,15 +2797,58 @@ TStatId UVoxelWorldSubsystem::GetStatId() const
 	RETURN_QUICK_DECLARE_CYCLE_STAT(UVoxelWorldSubsystem, STATGROUP_Tickables);
 }
 
+// M3 wave 1 role split (docs/m3-plan.md "Authority flow"): NM_Standalone
+// takes EXACTLY the pre-M3 code path (Impl->TryDig, nothing else) --
+// byte-identical single-player behavior. NM_DedicatedServer/NM_ListenServer
+// (this world IS the authority) also apply directly, then broadcast
+// whatever the edit newly appended to every client. NM_Client predicts
+// locally and forwards the intent to the server instead of applying
+// authoritatively (see TryDigReplica above).
 bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection, int32 SizeVoxels)
 {
-	return Impl ? Impl->TryDig(CameraWorldLocation, CameraWorldDirection, SizeVoxels) : false;
+	if (!Impl)
+	{
+		return false;
+	}
+	UWorld* World = GetWorld();
+	const ENetMode NetMode = World ? World->GetNetMode() : NM_Standalone;
+
+	if (NetMode == NM_Client)
+	{
+		return World ? TryDigReplica(*Impl, *World, CameraWorldLocation, CameraWorldDirection, SizeVoxels) : false;
+	}
+
+	const bool bApplied = Impl->TryDig(CameraWorldLocation, CameraWorldDirection, SizeVoxels);
+	if (bApplied && World && (NetMode == NM_DedicatedServer || NetMode == NM_ListenServer))
+	{
+		BroadcastNewEntries(*Impl, *World);
+	}
+	return bApplied;
 }
 
 bool UVoxelWorldSubsystem::TryPlace(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection, int32 SizeVoxels,
                                      uint8 MaterialId, const FVector& PlayerActorLocation)
 {
-	return Impl ? Impl->TryPlace(CameraWorldLocation, CameraWorldDirection, SizeVoxels, MaterialId, PlayerActorLocation) : false;
+	if (!Impl)
+	{
+		return false;
+	}
+	UWorld* World = GetWorld();
+	const ENetMode NetMode = World ? World->GetNetMode() : NM_Standalone;
+
+	if (NetMode == NM_Client)
+	{
+		return World ? TryPlaceReplica(*Impl, *World, CameraWorldLocation, CameraWorldDirection, SizeVoxels, MaterialId,
+		                                PlayerActorLocation)
+		             : false;
+	}
+
+	const bool bApplied = Impl->TryPlace(CameraWorldLocation, CameraWorldDirection, SizeVoxels, MaterialId, PlayerActorLocation);
+	if (bApplied && World && (NetMode == NM_DedicatedServer || NetMode == NM_ListenServer))
+	{
+		BroadcastNewEntries(*Impl, *World);
+	}
+	return bApplied;
 }
 
 double UVoxelWorldSubsystem::GetSurfaceHeightUU(double WorldX, double WorldY) const
@@ -2537,10 +2914,171 @@ bool UVoxelWorldSubsystem::RaycastVoxelWorld(const FVector& StartUU, const FVect
 
 int32 UVoxelWorldSubsystem::CarveSphere(const FVector& CenterUU, double RadiusUU, double JitterUU)
 {
-	return Impl ? Impl->CarveSphere(CenterUU, RadiusUU, JitterUU) : 0;
+	if (!Impl)
+	{
+		return 0;
+	}
+	UWorld* World = GetWorld();
+	const ENetMode NetMode = World ? World->GetNetMode() : NM_Standalone;
+
+	if (NetMode == NM_Client)
+	{
+		return World ? CarveSphereReplica(*Impl, *World, CenterUU, RadiusUU, JitterUU) : 0;
+	}
+
+	const int32 Removed = Impl->CarveSphere(CenterUU, RadiusUU, JitterUU);
+	if (Removed > 0 && World && (NetMode == NM_DedicatedServer || NetMode == NM_ListenServer))
+	{
+		BroadcastNewEntries(*Impl, *World);
+	}
+	return Removed;
 }
 
 FVoxelPerfSnapshot UVoxelWorldSubsystem::GetPerfSnapshot() const
 {
 	return Impl ? Impl->GetPerfSnapshot() : FVoxelPerfSnapshot{};
 }
+
+// --- M3 wave 1: multiplayer plumbing (docs/m3-plan.md) ----------------------
+
+void UVoxelWorldSubsystem::SerializeLogEntriesFrom(uint64 FromSeq, TArray<uint8>& OutBytes) const
+{
+	OutBytes.Reset();
+	if (!Impl)
+	{
+		return;
+	}
+	const std::vector<vxc::EditEntry>& AllEntries = Impl->Voxels.log().entries();
+	std::vector<vxc::EditEntry> Slice;
+	if (FromSeq < AllEntries.size())
+	{
+		Slice.assign(AllEntries.begin() + static_cast<std::ptrdiff_t>(FromSeq), AllEntries.end());
+	}
+	SerializeEntries(Slice, OutBytes);
+}
+
+uint64 UVoxelWorldSubsystem::GetLogSize() const
+{
+	return Impl ? Impl->Voxels.log().size() : 0;
+}
+
+bool UVoxelWorldSubsystem::ApplyReplicatedEntries(const TArray<uint8>& Bytes)
+{
+	if (!Impl)
+	{
+		return false;
+	}
+	std::vector<vxc::EditEntry> Entries;
+	if (!ParseEntries(Bytes, Entries))
+	{
+		UE_LOG(LogVoxelEdit, Error, TEXT("ApplyReplicatedEntries: failed to parse %d bytes -- dropping batch."), Bytes.Num());
+		return false;
+	}
+	Impl->ApplyReplicatedEntries(Entries);
+	return true;
+}
+
+void UVoxelWorldSubsystem::BeginJoinSync()
+{
+	bJoinSyncInProgress = true;
+	JoinSyncAccumulator.Reset();
+	BufferedLiveEntryBatches.Reset();
+	UE_LOG(LogVoxelEdit, Log, TEXT("BeginJoinSync: waiting for the server's full edit-log replay."));
+}
+
+bool UVoxelWorldSubsystem::ReceiveJoinSyncChunk(const TArray<uint8>& Bytes, bool bFinal)
+{
+	JoinSyncAccumulator.Append(Bytes);
+	if (!bFinal)
+	{
+		return true;
+	}
+
+	const bool bOk = ApplyReplicatedEntries(JoinSyncAccumulator);
+	UE_LOG(LogVoxelEdit, Log,
+	       TEXT("ReceiveJoinSyncChunk: join-sync log replay %s (%d bytes total; %d live batch(es) buffered mid-sync to flush now)."),
+	       bOk ? TEXT("OK") : TEXT("FAILED"), JoinSyncAccumulator.Num(), BufferedLiveEntryBatches.Num());
+	JoinSyncAccumulator.Reset();
+	bJoinSyncInProgress = false;
+
+	// Flush anything that arrived mid-sync, in arrival order (m3-plan.md
+	// "Join sync": "client replays before accepting live entries (buffer
+	// live ones meanwhile)").
+	TArray<TArray<uint8>> Buffered = MoveTemp(BufferedLiveEntryBatches);
+	BufferedLiveEntryBatches.Reset();
+	for (const TArray<uint8>& Batch : Buffered)
+	{
+		ApplyReplicatedEntries(Batch);
+	}
+	return bOk;
+}
+
+bool UVoxelWorldSubsystem::ReceiveLiveEntries(const TArray<uint8>& Bytes)
+{
+	if (bJoinSyncInProgress)
+	{
+		BufferedLiveEntryBatches.Add(Bytes);
+		return true;
+	}
+	return ApplyReplicatedEntries(Bytes);
+}
+
+uint32 UVoxelWorldSubsystem::GetWorldGenVersion() const
+{
+	return vxc::kWorldGenVersion;
+}
+
+uint64 UVoxelWorldSubsystem::ComputeHandshakeDigest() const
+{
+	if (!Impl)
+	{
+		return 0;
+	}
+	// 16 fixed Amplifier columns (m3-plan.md "Determinism guard"): spread
+	// across a few km (arbitrary-but-fixed, not axis-aligned/round-number
+	// spacing) so the probe is sensitive to amplifier/tile drift generally,
+	// not just one column that happens to be lucky.
+	vxc::Digest D;
+	D.u64(Seed);
+	D.u32(vxc::kWorldGenVersion);
+	for (int32 i = 0; i < 16; ++i)
+	{
+		const int64 Vx = int64(i) * 4001;
+		const int64 Vy = int64(i) * 2003;
+		const vxc::ColumnSample Col = Impl->Voxels.amplifier().column(Vx, Vy);
+		D.u32(static_cast<uint32_t>(Col.surfaceMm));
+		D.u32(static_cast<uint32_t>(Col.topsoilMm));
+		D.u32(static_cast<uint32_t>(Col.subsoilMm));
+		D.u32(static_cast<uint32_t>(Col.bedrockDepthMm));
+		D.u8(Col.surfaceMat);
+	}
+	return D.h;
+}
+
+uint64 UVoxelWorldSubsystem::GetEditedDigest() const
+{
+	return Impl ? Impl->Voxels.editedDigest() : 0;
+}
+
+namespace
+{
+// M3 gate ("two clients dig the same hole", docs/m3-plan.md): a console
+// command alternative to the -VoxelDumpDigestAfter=<s> command-line switch
+// (AVoxelEarthGameMode / AVoxelEarthPlayerController) for interactive
+// verification (PIE/editor console) -- same underlying value either way.
+FAutoConsoleCommandWithWorld CVarVoxelDumpEditedDigest(
+    TEXT("voxel.DumpEditedDigest"),
+    TEXT("Logs this process's seed + World::editedDigest() (M3 gate: compare this value across server/client log files)."),
+    FConsoleCommandWithWorldDelegate::CreateLambda(
+        [](UWorld* World)
+        {
+	        UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	        if (!Subsystem)
+	        {
+		        UE_LOG(LogVoxelEarth, Warning, TEXT("voxel.DumpEditedDigest: no UVoxelWorldSubsystem in this world."));
+		        return;
+	        }
+	        UE_LOG(LogVoxelEarth, Log, TEXT("VoxelDigestDump: role=Console seed=%llu editedDigest=0x%016llX"),
+	               (unsigned long long)Subsystem->GetSeed(), (unsigned long long)Subsystem->GetEditedDigest());
+        }));
+} // namespace

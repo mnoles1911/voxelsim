@@ -180,7 +180,67 @@ public:
 	// safe to call from the game thread at any time after Initialize.
 	FVoxelPerfSnapshot GetPerfSnapshot() const;
 
+	// --- M3 wave 1: multiplayer role split (docs/m3-plan.md) -----------------
+	//
+	// TryDig/TryPlace/CarveSphere above are role-aware internally (see the
+	// .cpp): NM_Standalone applies directly with zero extra work (byte-
+	// identical to pre-M3 behavior); NM_DedicatedServer/NM_ListenServer apply
+	// directly (today's authority behavior) and then broadcast the newly
+	// appended entries via AVoxelEditRelay::MulticastAppliedEntries;
+	// NM_Client applies the SAME cells locally as a prediction (tracked
+	// internally, reconciled against confirmed entries) and forwards the
+	// intent to the server through AVoxelEarthPlayerController's Server RPCs
+	// (a shared, unowned relay actor cannot receive client-called Server
+	// RPCs -- see VoxelEditRelay.h). Everything below is the plumbing those
+	// two actor classes ride on; plain TArray<uint8>/uint64 signatures keep
+	// this UHT-parsed header voxel-core-free by doctrine.
+
+	// Wire-format helpers (vxc::ByteWriter/ByteReader-based, NOT
+	// vxc::EditLog::serialize's self-describing full-log format -- see the
+	// .cpp's SerializeEntries/ParseEntries doc comment): entries with seq in
+	// [FromSeq, GetLogSize()) serialized into OutBytes.
+	void SerializeLogEntriesFrom(uint64 FromSeq, TArray<uint8>& OutBytes) const;
+	uint64 GetLogSize() const;
+
+	// Parses OutBytes (SerializeLogEntriesFrom's format) and applies every
+	// entry through the same World::applyEdit path TryDig/TryPlace/
+	// CarveSphere use (one call per brick), reconciling any matching pending
+	// client predictions and marking every touched chunk dirty for re-mesh.
+	// Returns false on a corrupt/short buffer (nothing applied).
+	bool ApplyReplicatedEntries(const TArray<uint8>& Bytes);
+
+	// Join-sync client-side state machine (m3-plan.md "Join sync"): call
+	// BeginJoinSync before issuing the join-sync request RPC, feed every
+	// received chunk through ReceiveJoinSyncChunk (bFinal=true triggers the
+	// replay), and route every live MulticastAppliedEntries batch through
+	// ReceiveLiveEntries -- it automatically buffers live batches that
+	// arrive while a sync is still in flight and flushes them, in order,
+	// right after the historical replay completes.
+	void BeginJoinSync();
+	bool ReceiveJoinSyncChunk(const TArray<uint8>& Bytes, bool bFinal);
+	bool ReceiveLiveEntries(const TArray<uint8>& Bytes);
+
+	// Determinism-guard handshake probe (m3-plan.md "Determinism guard"):
+	// digest of seed + vxc::kWorldGenVersion + 16 fixed Amplifier columns.
+	// Computed identically wherever this subsystem's Impl exists; AVoxelEditRelay
+	// compares the server's value (replicated) against each client's own
+	// locally-computed value at join and hard-disconnects on mismatch.
+	uint64 ComputeHandshakeDigest() const;
+	uint32 GetWorldGenVersion() const;
+
+	// Deterministic digest over the edit overlay (vxc::World::editedDigest)
+	// -- the M3 gate's cross-process comparison value. Also surfaced via the
+	// voxel.DumpEditedDigest console command and the -VoxelDumpDigestAfter=<s>
+	// command-line switch (AVoxelEarthGameMode / AVoxelEarthPlayerController).
+	uint64 GetEditedDigest() const;
+
 private:
+	// Join-sync buffering state (client only; see BeginJoinSync above).
+	TArray<uint8> JoinSyncAccumulator;
+	bool bJoinSyncInProgress = false;
+	TArray<TArray<uint8>> BufferedLiveEntryBatches;
+
+
 	// M2 task "Config-driven seed": resolved in Initialize() from -VoxelSeed=
 	// (default DefaultSeed); see GetSeed() above.
 	uint64 Seed = DefaultSeed;
