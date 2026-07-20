@@ -184,4 +184,25 @@ namespace VoxelCoords
 		return FVector(double(Origin.X) * VoxelSizeUU * Scale, double(Origin.Y) * VoxelSizeUU * Scale,
 		               double(Origin.Z) * VoxelSizeUU * Scale);
 	}
+
+	// M2 wave 2 ("Distant-edit mip propagation" row, docs/m2-plan.md): the
+	// level-L ancestor chunk key whose footprint CONTAINS a given level-0
+	// chunk key -- the "cheap key math" the plan's decisions table calls for.
+	// A level-L chunk spans ChunkEdgeVoxels (32) level-L cells, and a
+	// level-L cell is (1<<L) level-0 voxels wide ("8 cubes become 1 in
+	// place"), so a level-L chunk's world footprint is exactly (1<<L)
+	// level-0 chunks wide per axis -- floorDiv by that factor is the whole
+	// rule. Verified against ChunkOriginWorldForLevel: a level-0 chunk at
+	// Chunk0 has world origin Chunk0*ChunkEdgeUU; a level-L chunk at ChunkL
+	// has world origin ChunkL*ChunkEdgeUU*(1<<L); Chunk0's origin falls
+	// inside ChunkL's span iff ChunkL == floorDiv(Chunk0, 1<<L) on every
+	// axis (X, Y, and Z alike -- the scaling is uniform across all three).
+	FORCEINLINE FVoxelChunkKey AncestorChunkKey(const FVoxelChunkKey& Level0Chunk, int32 Level)
+	{
+		const int64 Scale = int64(1) << Level;
+		return FVoxelChunkKey{
+			(int32)FloorDiv(Level0Chunk.X, Scale),
+			(int32)FloorDiv(Level0Chunk.Y, Scale),
+			(int32)FloorDiv(Level0Chunk.Z, Scale)};
+	}
 }

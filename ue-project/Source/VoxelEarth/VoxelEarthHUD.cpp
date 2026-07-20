@@ -110,6 +110,16 @@ void AVoxelEarthHUD::DrawPerfHUD()
 			RingsLine += FString::Printf(TEXT("  R%d %d/%d"), Level, Snap.LevelLoadedCount[Level], Snap.LevelPendingCount[Level]);
 		}
 
+		// M2 wave 2 item 1 ("Cross-job mip caching"): per-level worker ms
+		// row -- this is the number the shared mip cache targets (wave 1
+		// measured worker p95 ~296ms on high-level jobs).
+		FString LevelWorkerMsLine = TEXT("Worker ms/level:");
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			LevelWorkerMsLine +=
+				FString::Printf(TEXT("  R%d %.1f/%.1f"), Level, Snap.LevelWorkerMsP50[Level], Snap.LevelWorkerMsP95[Level]);
+		}
+
 		CachedPerfHUDText = FString::Printf(
 			TEXT("voxel.Debug %d -- F3 to cycle\n")
 			TEXT("Streaming: loaded %lld (%.1f/s)  unloaded %lld (%.1f/s)\n")
@@ -117,7 +127,9 @@ void AVoxelEarthHUD::DrawPerfHUD()
 			TEXT("  budget sat %.0f%%  stale discards %lld\n")
 			TEXT("%s\n")
 			TEXT("Worker ms: p50 %.2f  p95 %.2f  max %.2f\n")
+			TEXT("%s (p50/p95)\n")
 			TEXT("Memory: components %d  quads %lld  overlay bricks %lld  edit log %lld\n")
+			TEXT("  mip cache: bricks %lld  ~%.1f MB\n")
 			TEXT("Frame: subsystem tick %.2fms  frame %.2fms\n")
 			TEXT("Counters: bricks %llu  cells %llu  quads %llu  edits %llu  columns %llu"),
 			VoxelDebug::GetDebugMode(),
@@ -126,7 +138,9 @@ void AVoxelEarthHUD::DrawPerfHUD()
 			Snap.BudgetSaturationPct, (long long)Snap.StaleResultsDiscarded,
 			*RingsLine,
 			Snap.WorkerMsP50, Snap.WorkerMsP95, Snap.WorkerMsMax,
+			*LevelWorkerMsLine,
 			Snap.ResidentComponents, (long long)Snap.ResidentQuads, (long long)Snap.OverlayBrickCount, (long long)Snap.EditLogEntries,
+			(long long)Snap.MipCacheBrickCount, double(Snap.MipCacheBytes) / (1024.0 * 1024.0),
 			Snap.SubsystemTickMs, World->GetDeltaSeconds() * 1000.0,
 			Snap.BricksGenerated, Snap.CellsWritten, Snap.QuadsEmitted, Snap.EditsApplied, Snap.ColumnEvals);
 	}
