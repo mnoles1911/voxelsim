@@ -325,3 +325,12 @@ M1 min-spec proxy definition: `sg.ViewDistanceQuality 0`, `sg.ShadowQuality 0`,
 (`voxel.*` budget cvars pending) — intent: approximate RTX-3060-class
 headroom on this 7800 XT by measuring at these settings and requiring
 p95 < 16.6ms with zero steady-state hitches (excluding the first 10s ramp).
+
+**M1 gate run result (2026-07-20, 60s at proxy settings, post-M2 world):**
+p50 3.78ms (steady-state comfortably 60fps+), but p95 20.4ms / 38 hitches /
+max 400ms — FAILS the p95<16.6ms bar. Attribution: the M2 multi-ring +
+clipmap streaming ramp (14,748 chunks loaded across the run, 59% budget
+saturation) — M1-scope content alone measured p50 2.8/p95 4.2 pre-M2
+(PR #12). Verdict: M1 gate stays 🟨; the blockers are the backlogged M2
+items (streaming-ramp hitch isolation, PSO precache, R3/R4 first-build
+cost, budget cvars for true throttling) — re-run after those land.
