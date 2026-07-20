@@ -128,6 +128,7 @@ cbuffer WorldGenParams : register(b0)
     int BrickZMin;          // (VoxelizeMain) lowest brick z-index of the stack:
                              // covers voxel z in [BrickZMin*8, (BrickZMin+BricksZ)*8)
     uint BricksZ;           // (VoxelizeMain) number of bricks in the vertical stack
+    uint ScanCount;         // (Scan*Main) number of mask entries to scan
 };
 
 // Raster window (elevation mm per pixel; climate packed t|s<<8|p<<16|v<<24).
@@ -511,4 +512,80 @@ void MeshEmitMain(uint3 tid : SV_DispatchThreadID)
     if (!decodeMask(tid.x, origin, axis, dir, slice))
         return;
     greedyMask(origin, axis, dir, slice, 1u, InQuadOffsets[tid.x]);
+}
+
+// --- GPU exclusive scan over per-mask quad counts ---------------------------
+// Replaces the host scan between count and emit (the 128m gate's dominant
+// cost — see docs/status.md). Determinism: fixed-order shared-memory
+// Hillis-Steele over integers, identical result to the host scan by
+// definition of exclusive scan. Three dispatches chained in ONE command
+// buffer with barriers:
+//   ScanBlocksMain: per-256-block exclusive scan of OutQuadCounts into
+//                   OutQuadOffsets + per-block totals into OutBlockSums.
+//   ScanSumsMain:   ONE workgroup exclusive-scans OutBlockSums in place
+//                   (max 256 blocks => maskCount <= 65,536 per dispatch —
+//                   the harness asserts this per tile).
+//   ScanAddMain:    adds the scanned block base to every element.
+// The emit pass then reads InQuadOffsets — the SAME buffer bound read-only.
+// ScanCount (cbuffer append) = number of masks in this dispatch.
+
+RWStructuredBuffer<uint> OutQuadOffsets : register(u6);
+RWStructuredBuffer<uint> OutBlockSums : register(u7);
+
+groupshared uint gsScan[256];
+
+[numthreads(256, 1, 1)]
+void ScanBlocksMain(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID,
+                    uint3 gid : SV_GroupID)
+{
+    const uint n = ScanCount;
+    const uint v = (tid.x < n) ? OutQuadCounts[tid.x] : 0u;
+    gsScan[gtid.x] = v;
+    GroupMemoryBarrierWithGroupSync();
+    // Hillis-Steele inclusive scan (fixed iteration order — deterministic).
+    [unroll]
+    for (uint offset = 1u; offset < 256u; offset <<= 1u)
+    {
+        uint add = 0u;
+        if (gtid.x >= offset)
+            add = gsScan[gtid.x - offset];
+        GroupMemoryBarrierWithGroupSync();
+        gsScan[gtid.x] += add;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    // Exclusive = inclusive shifted right by one.
+    const uint exclusive = (gtid.x == 0u) ? 0u : gsScan[gtid.x - 1u];
+    if (tid.x < n)
+        OutQuadOffsets[tid.x] = exclusive;
+    if (gtid.x == 255u)
+        OutBlockSums[gid.x] = gsScan[255u]; // block total (inclusive of padding zeros)
+}
+
+[numthreads(256, 1, 1)]
+void ScanSumsMain(uint3 gtid : SV_GroupThreadID)
+{
+    const uint numBlocks = (ScanCount + 255u) / 256u;
+    const uint v = (gtid.x < numBlocks) ? OutBlockSums[gtid.x] : 0u;
+    gsScan[gtid.x] = v;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint offset = 1u; offset < 256u; offset <<= 1u)
+    {
+        uint add = 0u;
+        if (gtid.x >= offset)
+            add = gsScan[gtid.x - offset];
+        GroupMemoryBarrierWithGroupSync();
+        gsScan[gtid.x] += add;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    const uint exclusive = (gtid.x == 0u) ? 0u : gsScan[gtid.x - 1u];
+    if (gtid.x < numBlocks)
+        OutBlockSums[gtid.x] = exclusive;
+}
+
+[numthreads(256, 1, 1)]
+void ScanAddMain(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID)
+{
+    if (tid.x < ScanCount)
+        OutQuadOffsets[tid.x] += OutBlockSums[gid.x];
 }

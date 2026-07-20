@@ -41,6 +41,9 @@ if(VXC_BUILD_GPU_HARNESS)
     VXC_SPV_PATH_VOXELIZE="${VXC_REPO_ROOT}/build/shaders/worldgen.VoxelizeMain.spv"
     VXC_SPV_PATH_MESHCOUNT="${VXC_REPO_ROOT}/build/shaders/worldgen.MeshCountMain.spv"
     VXC_SPV_PATH_MESHEMIT="${VXC_REPO_ROOT}/build/shaders/worldgen.MeshEmitMain.spv"
+    VXC_SPV_PATH_SCANBLOCKS="${VXC_REPO_ROOT}/build/shaders/worldgen.ScanBlocksMain.spv"
+    VXC_SPV_PATH_SCANSUMS="${VXC_REPO_ROOT}/build/shaders/worldgen.ScanSumsMain.spv"
+    VXC_SPV_PATH_SCANADD="${VXC_REPO_ROOT}/build/shaders/worldgen.ScanAddMain.spv"
   )
   if(NOT MSVC)
     target_compile_options(vxc_gpu PRIVATE -Wall -Wextra -Werror)

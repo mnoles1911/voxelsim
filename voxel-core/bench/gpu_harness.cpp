@@ -115,7 +115,12 @@ namespace {
     X(vkCreateFence)                      \
     X(vkDestroyFence)                     \
     X(vkWaitForFences)                    \
-    X(vkQueueSubmit)
+    X(vkQueueSubmit)                      \
+    X(vkCreateQueryPool)                  \
+    X(vkDestroyQueryPool)                 \
+    X(vkCmdResetQueryPool)                \
+    X(vkCmdWriteTimestamp)                \
+    X(vkGetQueryPoolResults)
 
 #define VXC_DECLARE_PFN(name) static PFN_##name name = nullptr;
 VXC_VK_GLOBAL_FUNCS(VXC_DECLARE_PFN)
@@ -205,11 +210,12 @@ struct GpuColumnSample {
 };
 static_assert(sizeof(GpuColumnSample) == 20, "GpuColumnSample must match the HLSL layout");
 
-// GPU-side mirror of worldgen.hlsl's cbuffer WorldGenParams (52 bytes,
+// GPU-side mirror of worldgen.hlsl's cbuffer WorldGenParams (56 bytes,
 // tightly packed — verified against the compiled SPIR-V's member offsets;
 // nothing here straddles a 16-byte boundary so DXC's HLSL-style cbuffer
 // packing matches plain sequential layout). BrickZMin/BricksZ are read only
-// by VoxelizeMain; the rest is shared or ColumnMain-only (see worldgen.hlsl).
+// by VoxelizeMain; ScanCount only by Scan*Main; the rest is shared or
+// ColumnMain-only (see worldgen.hlsl).
 struct WorldGenParamsCB {
     uint32_t DispatchColumnsX, DispatchColumnsY;
     int32_t RasterOriginPxX, RasterOriginPxY;
@@ -221,8 +227,9 @@ struct WorldGenParamsCB {
     int32_t OriginVy;
     int32_t BrickZMin;
     uint32_t BricksZ;
+    uint32_t ScanCount;
 };
-static_assert(sizeof(WorldGenParamsCB) == 52, "WorldGenParamsCB must match the HLSL cbuffer layout");
+static_assert(sizeof(WorldGenParamsCB) == 56, "WorldGenParamsCB must match the HLSL cbuffer layout");
 
 // Cell index within one 8^3 brick — mirrors vxc::Brick<8>::cellIndex AND
 // worldgen.hlsl's cellIndexInBrick exactly.
@@ -273,19 +280,37 @@ struct GpuContext {
     VkDescriptorPool voxDescPool = VK_NULL_HANDLE;
     VkDescriptorSet voxDescSet = VK_NULL_HANDLE;
 
-    // Mesh kernels (MeshCountMain / MeshEmitMain) share ONE superset
-    // descriptor layout (binding 0 uniform; 5 cells, 6 offsets, 7 counts,
-    // 8 quads storage) — a layout binding a kernel's SPIR-V doesn't declare
-    // is legal, and it lets both kernels reuse identical set wiring.
+    // Mesh + GPU-scan kernels (MeshCountMain / MeshEmitMain / ScanBlocksMain /
+    // ScanSumsMain / ScanAddMain) share ONE superset descriptor layout
+    // (binding 0 uniform; 5 cells, 6 offsets-read, 7 counts, 8 quads, 9
+    // offsets-write, 10 block sums storage) — a layout binding a kernel's
+    // SPIR-V doesn't declare is legal, and it lets every kernel in the chain
+    // reuse identical set wiring. Bindings 9/10 are the scan extension: 9 is
+    // the SAME VkBuffer as binding 6 (offsets), bound both read-only (t5, for
+    // MeshEmitMain) and read-write (u6, for the scan kernels) at once.
     VkDescriptorSetLayout meshDescSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout meshPipelineLayout = VK_NULL_HANDLE;
     VkShaderModule meshCountModule = VK_NULL_HANDLE;
     VkShaderModule meshEmitModule = VK_NULL_HANDLE;
+    VkShaderModule scanBlocksModule = VK_NULL_HANDLE;
+    VkShaderModule scanSumsModule = VK_NULL_HANDLE;
+    VkShaderModule scanAddModule = VK_NULL_HANDLE;
     VkPipeline meshCountPipeline = VK_NULL_HANDLE;
     VkPipeline meshEmitPipeline = VK_NULL_HANDLE;
+    VkPipeline scanBlocksPipeline = VK_NULL_HANDLE;
+    VkPipeline scanSumsPipeline = VK_NULL_HANDLE;
+    VkPipeline scanAddPipeline = VK_NULL_HANDLE;
     VkDescriptorPool meshDescPool = VK_NULL_HANDLE;
     VkDescriptorSet meshCountSet = VK_NULL_HANDLE;
     VkDescriptorSet meshEmitSet = VK_NULL_HANDLE;
+    VkDescriptorSet scanSet = VK_NULL_HANDLE; // bound for ScanBlocks/ScanSums/ScanAddMain
+
+    // GPU timestamp queries: 6 slots bracket the 5 chained mesh/scan
+    // dispatches (count, scanBlocks, scanSums, scanAdd, emit) inside the
+    // SINGLE command buffer runMeshChain() records, so per-stage GPU time is
+    // still measurable even though the chain only has one fence.
+    VkQueryPool timestampPool = VK_NULL_HANDLE;
+    double timestampPeriodNs = 1.0;
 
     std::string deviceName;
 
@@ -320,8 +345,10 @@ struct GpuContext {
 };
 
 GpuContext createContext(const std::string& spvPath, const std::string& voxelizeSpvPath,
-                          const std::string& meshCountSpvPath,
-                          const std::string& meshEmitSpvPath) {
+                          const std::string& meshCountSpvPath, const std::string& meshEmitSpvPath,
+                          const std::string& scanBlocksSpvPath,
+                          const std::string& scanSumsSpvPath,
+                          const std::string& scanAddSpvPath) {
     GpuContext ctx;
 
     VkApplicationInfo appInfo{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -389,6 +416,13 @@ GpuContext createContext(const std::string& spvPath, const std::string& voxelize
         }
     }
     if (!found) fail("chosen GPU (" + ctx.deviceName + ") has no compute-capable queue family");
+    if (qfProps[ctx.queueFamily].timestampValidBits == 0) {
+        fail("chosen GPU (" + ctx.deviceName +
+             ")'s compute queue family reports 0 timestampValidBits — required for the "
+             "per-stage GPU timing runMeshChain() uses to bracket the chained mesh/scan "
+             "dispatches");
+    }
+    ctx.timestampPeriodNs = double(chosenProps.limits.timestampPeriod);
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -412,6 +446,14 @@ GpuContext createContext(const std::string& spvPath, const std::string& voxelize
     cpci.queueFamilyIndex = ctx.queueFamily;
     vkCheck(vkCreateCommandPool(ctx.device, &cpci, nullptr, &ctx.commandPool),
             "vkCreateCommandPool");
+
+    // 6 timestamp slots bracket runMeshChain()'s 5 chained dispatches (see
+    // GpuContext comment above).
+    VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qpci.queryCount = 6;
+    vkCheck(vkCreateQueryPool(ctx.device, &qpci, nullptr, &ctx.timestampPool),
+            "vkCreateQueryPool(timestamp)");
 
     // Descriptor set layout: binding 0 uniform (WorldGenParams), bindings
     // 1-2 read-only storage (ElevationMm, ClimatePacked), binding 3
@@ -527,17 +569,20 @@ GpuContext createContext(const std::string& spvPath, const std::string& voxelize
     vkCheck(vkAllocateDescriptorSets(ctx.device, &voxDsai, &ctx.voxDescSet),
             "vkAllocateDescriptorSets(voxelize)");
 
-    // --- Mesh pipelines: MeshCountMain + MeshEmitMain, shared superset
-    // layout (see GpuContext comment), two descriptor sets with identical
-    // buffer wiring so count/emit only differ by pipeline bind.
-    VkDescriptorSetLayoutBinding meshBindings[5]{};
+    // --- Mesh + scan pipelines: MeshCountMain + MeshEmitMain + ScanBlocks/
+    // Sums/AddMain, shared superset layout (see GpuContext comment), three
+    // descriptor sets with identical buffer wiring so each kernel only
+    // differs by pipeline bind. Bindings 9/10 are the scan extension.
+    VkDescriptorSetLayoutBinding meshBindings[7]{};
     meshBindings[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     meshBindings[1] = {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     meshBindings[2] = {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     meshBindings[3] = {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     meshBindings[4] = {8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    meshBindings[5] = {9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    meshBindings[6] = {10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo meshDslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    meshDslci.bindingCount = 5;
+    meshDslci.bindingCount = 7;
     meshDslci.pBindings = meshBindings;
     vkCheck(vkCreateDescriptorSetLayout(ctx.device, &meshDslci, nullptr, &ctx.meshDescSetLayout),
             "vkCreateDescriptorSetLayout(mesh)");
@@ -571,34 +616,48 @@ GpuContext createContext(const std::string& spvPath, const std::string& voxelize
     makeMeshPipeline(meshCountSpvPath, "MeshCountMain", ctx.meshCountModule,
                      ctx.meshCountPipeline);
     makeMeshPipeline(meshEmitSpvPath, "MeshEmitMain", ctx.meshEmitModule, ctx.meshEmitPipeline);
+    makeMeshPipeline(scanBlocksSpvPath, "ScanBlocksMain", ctx.scanBlocksModule,
+                     ctx.scanBlocksPipeline);
+    makeMeshPipeline(scanSumsSpvPath, "ScanSumsMain", ctx.scanSumsModule, ctx.scanSumsPipeline);
+    makeMeshPipeline(scanAddSpvPath, "ScanAddMain", ctx.scanAddModule, ctx.scanAddPipeline);
 
+    // 3 sets (count/emit/scan) x 7 bindings/set (1 uniform + 6 storage).
     VkDescriptorPoolSize meshPoolSizes[2]{};
-    meshPoolSizes[0] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2};
-    meshPoolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8};
+    meshPoolSizes[0] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3};
+    meshPoolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 18};
     VkDescriptorPoolCreateInfo meshDpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    meshDpci.maxSets = 2;
+    meshDpci.maxSets = 3;
     meshDpci.poolSizeCount = 2;
     meshDpci.pPoolSizes = meshPoolSizes;
     vkCheck(vkCreateDescriptorPool(ctx.device, &meshDpci, nullptr, &ctx.meshDescPool),
             "vkCreateDescriptorPool(mesh)");
 
-    VkDescriptorSetLayout meshLayouts[2] = {ctx.meshDescSetLayout, ctx.meshDescSetLayout};
-    VkDescriptorSet meshSets[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDescriptorSetLayout meshLayouts[3] = {ctx.meshDescSetLayout, ctx.meshDescSetLayout,
+                                             ctx.meshDescSetLayout};
+    VkDescriptorSet meshSets[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkDescriptorSetAllocateInfo meshDsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     meshDsai.descriptorPool = ctx.meshDescPool;
-    meshDsai.descriptorSetCount = 2;
+    meshDsai.descriptorSetCount = 3;
     meshDsai.pSetLayouts = meshLayouts;
     vkCheck(vkAllocateDescriptorSets(ctx.device, &meshDsai, meshSets),
             "vkAllocateDescriptorSets(mesh)");
     ctx.meshCountSet = meshSets[0];
     ctx.meshEmitSet = meshSets[1];
+    ctx.scanSet = meshSets[2];
 
     return ctx;
 }
 
 void destroyContext(GpuContext& ctx) {
     if (ctx.device) {
+        if (ctx.timestampPool) vkDestroyQueryPool(ctx.device, ctx.timestampPool, nullptr);
         if (ctx.meshDescPool) vkDestroyDescriptorPool(ctx.device, ctx.meshDescPool, nullptr);
+        if (ctx.scanBlocksPipeline) vkDestroyPipeline(ctx.device, ctx.scanBlocksPipeline, nullptr);
+        if (ctx.scanSumsPipeline) vkDestroyPipeline(ctx.device, ctx.scanSumsPipeline, nullptr);
+        if (ctx.scanAddPipeline) vkDestroyPipeline(ctx.device, ctx.scanAddPipeline, nullptr);
+        if (ctx.scanBlocksModule) vkDestroyShaderModule(ctx.device, ctx.scanBlocksModule, nullptr);
+        if (ctx.scanSumsModule) vkDestroyShaderModule(ctx.device, ctx.scanSumsModule, nullptr);
+        if (ctx.scanAddModule) vkDestroyShaderModule(ctx.device, ctx.scanAddModule, nullptr);
         if (ctx.meshCountPipeline) vkDestroyPipeline(ctx.device, ctx.meshCountPipeline, nullptr);
         if (ctx.meshEmitPipeline) vkDestroyPipeline(ctx.device, ctx.meshEmitPipeline, nullptr);
         if (ctx.meshCountModule) vkDestroyShaderModule(ctx.device, ctx.meshCountModule, nullptr);
@@ -647,14 +706,242 @@ struct RegionResult {
 
     // Mesh passes (docs/gpu-mesher-design.md): quads for INTERIOR bricks only
     // (1-brick halo excluded on every axis), packed 2x uint32 per quad in
-    // deterministic count->scan->emit order. quadOffsets has maskCount+1
-    // entries (exclusive scan + total).
-    std::vector<uint64_t> quads;       // packed (word0 | word1<<32)
-    std::vector<uint32_t> quadOffsets; // per-mask exclusive offsets + total tail
+    // deterministic count->GPU-scan->emit order (see runMeshChain()).
+    std::vector<uint64_t> quads; // packed (word0 | word1<<32), totalQuads entries
+    uint32_t totalQuads = 0;
     uint32_t interiorBricksX = 0, interiorBricksY = 0, interiorBricksZ = 0;
     double meshCountDispatchMs = 0;
+    double meshScanBlocksDispatchMs = 0;
+    double meshScanSumsDispatchMs = 0;
+    double meshScanAddDispatchMs = 0;
     double meshEmitDispatchMs = 0;
 };
+
+// --- shared mesh+scan chain (used by both runRegion() and gate::runTile()) -
+
+// Buffer handles the chained mesh/scan dispatches read or write. cells is
+// read-only (VoxelizeMain's output); counts/offsets/blockSums/quads are
+// read-write across the chain -- see the binding table in the GpuContext
+// comment above.
+struct MeshBuffers {
+    VkBuffer cells;
+    VkBuffer counts;
+    VkBuffer offsets;
+    VkBuffer blockSums;
+    VkBuffer quads;
+};
+
+struct MeshStageTimingsMs {
+    double count = 0, scanBlocks = 0, scanSums = 0, scanAdd = 0, emit = 0;
+};
+
+// Writes the full 7-binding superset (see GpuContext comment) into all THREE
+// mesh/scan descriptor sets (meshCountSet, meshEmitSet, scanSet) -- their
+// content is IDENTICAL; they stay separate VkDescriptorSet objects only so
+// vkCmdBindDescriptorSets can pick the one for the currently-bound pipeline,
+// mirroring the pre-existing meshCountSet/meshEmitSet split. Binding 6
+// (offsets, read-only view for MeshEmitMain's InQuadOffsets) and binding 9
+// (offsets, read-write view for the scan kernels' OutQuadOffsets) both point
+// at mb.offsets -- the SAME VkBuffer bound twice in one set, once per role.
+void writeMeshDescriptors(GpuContext& ctx, VkBuffer paramsBuffer, const MeshBuffers& mb) {
+    VkDescriptorBufferInfo pInfo{paramsBuffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo cInfo{mb.cells, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo oReadInfo{mb.offsets, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo nInfo{mb.counts, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo qInfo{mb.quads, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo oWriteInfo{mb.offsets, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo bInfo{mb.blockSums, 0, VK_WHOLE_SIZE};
+
+    const VkDescriptorSet sets[3] = {ctx.meshCountSet, ctx.meshEmitSet, ctx.scanSet};
+    for (VkDescriptorSet set : sets) {
+        VkWriteDescriptorSet w[7]{};
+        w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 0, 0, 1,
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &pInfo, nullptr};
+        w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 5, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cInfo, nullptr};
+        w[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 6, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &oReadInfo, nullptr};
+        w[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 7, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &nInfo, nullptr};
+        w[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 8, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qInfo, nullptr};
+        w[5] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 9, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &oWriteInfo, nullptr};
+        w[6] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 10, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bInfo, nullptr};
+        vkUpdateDescriptorSets(ctx.device, 7, w, 0, nullptr);
+    }
+}
+
+// Records, submits and waits on ONE command buffer chaining all 5 mesh/scan
+// dispatches (MeshCountMain -> ScanBlocksMain -> ScanSumsMain -> ScanAddMain
+// -> MeshEmitMain) with COMPUTE->COMPUTE buffer barriers between every stage
+// (write->read on exactly the buffer(s) the next stage reads) and a single
+// trailing COMPUTE->HOST barrier, so there is exactly ONE fence for the whole
+// chain (replaces the old host prefix scan between separately-submitted
+// count and emit passes -- see docs/status.md's M0 gate row). Quad order is
+// unchanged: MeshEmitMain still writes at exactly the offsets an exclusive
+// scan of MeshCountMain's counts would produce, just computed on GPU instead
+// of the CPU walking mapped memory between two submissions.
+//
+// ScanSumsMain exclusive-scans OutBlockSums in a SINGLE workgroup (256
+// threads => up to 256 blocks of 256 masks = 65,536 masks); the 128x128-
+// column tile layout (gate mode) and the 128x128 default regions both keep
+// maskCount well under that, but callers must never dispatch more.
+//
+// Per-stage GPU timing without extra submits: 6 timestamp queries bracket
+// the 5 dispatches inside the single command buffer (see GpuContext's
+// timestampPool comment); vkGetQueryPoolResults after the fence turns the 6
+// raw ticks into 5 stage deltas.
+MeshStageTimingsMs runMeshChain(GpuContext& ctx, uint32_t maskCount, const MeshBuffers& mb) {
+    if (maskCount > 65536) {
+        fail("mesh maskCount " + std::to_string(maskCount) +
+             " exceeds ScanSumsMain's single-workgroup limit of 65536 (256 blocks x 256 "
+             "threads/block) -- dispatch footprint too large for the GPU scan");
+    }
+    const uint32_t meshGroups = (maskCount + 63) / 64;   // Mesh{Count,Emit}Main: numthreads(64,1,1)
+    const uint32_t scanGroups = (maskCount + 255) / 256; // Scan{Blocks,Add}Main: numthreads(256,1,1)
+
+    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbai.commandPool = ctx.commandPool;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkCheck(vkAllocateCommandBuffers(ctx.device, &cbai, &cmd),
+            "vkAllocateCommandBuffers(mesh-chain)");
+    VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkCheck(vkBeginCommandBuffer(cmd, &cbbi), "vkBeginCommandBuffer(mesh-chain)");
+
+    vkCmdResetQueryPool(cmd, ctx.timestampPool, 0, 6);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.timestampPool, 0);
+
+    const auto bufBarrier = [](VkBuffer buf, VkAccessFlags src,
+                                VkAccessFlags dst) -> VkBufferMemoryBarrier {
+        VkBufferMemoryBarrier b{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        b.srcAccessMask = src;
+        b.dstAccessMask = dst;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.buffer = buf;
+        b.offset = 0;
+        b.size = VK_WHOLE_SIZE;
+        return b;
+    };
+
+    // Visibility for this chain's first read of the voxelized cells (written
+    // by VoxelizeMain in an earlier, already-fenced submission).
+    {
+        VkBufferMemoryBarrier b =
+            bufBarrier(mb.cells, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &b, 0,
+                              nullptr);
+    }
+
+    // --- MeshCountMain: cells -> OutQuadCounts ------------------------------
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshCountPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshPipelineLayout, 0, 1,
+                             &ctx.meshCountSet, 0, nullptr);
+    vkCmdDispatch(cmd, meshGroups, 1, 1);
+    {
+        VkBufferMemoryBarrier b =
+            bufBarrier(mb.counts, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &b, 0,
+                              nullptr);
+    }
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.timestampPool, 1);
+
+    // --- ScanBlocksMain: OutQuadCounts -> OutQuadOffsets (per-block) + OutBlockSums
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.scanBlocksPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshPipelineLayout, 0, 1,
+                             &ctx.scanSet, 0, nullptr);
+    vkCmdDispatch(cmd, scanGroups, 1, 1);
+    {
+        VkBufferMemoryBarrier bs[2] = {
+            bufBarrier(mb.offsets, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT),
+            bufBarrier(mb.blockSums, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT)};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 2, bs, 0,
+                              nullptr);
+    }
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.timestampPool, 2);
+
+    // --- ScanSumsMain: OutBlockSums exclusive-scanned in place, 1 workgroup -
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.scanSumsPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshPipelineLayout, 0, 1,
+                             &ctx.scanSet, 0, nullptr);
+    vkCmdDispatch(cmd, 1, 1, 1);
+    {
+        VkBufferMemoryBarrier b =
+            bufBarrier(mb.blockSums, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &b, 0,
+                              nullptr);
+    }
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.timestampPool, 3);
+
+    // --- ScanAddMain: OutQuadOffsets += scanned block base ------------------
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.scanAddPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshPipelineLayout, 0, 1,
+                             &ctx.scanSet, 0, nullptr);
+    vkCmdDispatch(cmd, scanGroups, 1, 1);
+    {
+        VkBufferMemoryBarrier b =
+            bufBarrier(mb.offsets, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &b, 0,
+                              nullptr);
+    }
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.timestampPool, 4);
+
+    // --- MeshEmitMain: writes quads at the GPU-scanned offsets --------------
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshEmitPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshPipelineLayout, 0, 1,
+                             &ctx.meshEmitSet, 0, nullptr);
+    vkCmdDispatch(cmd, meshGroups, 1, 1);
+    {
+        // Host needs: quads (the emitted stream) and counts+offsets (to
+        // derive the true total = counts[maskCount-1] + offsets[maskCount-1],
+        // since the quads buffer is upper-bound sized, not exactly sized --
+        // see the runRegion()/runTile() callers).
+        VkBufferMemoryBarrier bs[3] = {
+            bufBarrier(mb.quads, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT),
+            bufBarrier(mb.counts, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT),
+            bufBarrier(mb.offsets, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT)};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                              0, 0, nullptr, 3, bs, 0, nullptr);
+    }
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.timestampPool, 5);
+
+    vkCheck(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(mesh-chain)");
+
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence = VK_NULL_HANDLE;
+    vkCheck(vkCreateFence(ctx.device, &fci, nullptr, &fence), "vkCreateFence(mesh-chain)");
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkCheck(vkQueueSubmit(ctx.queue, 1, &si, fence), "vkQueueSubmit(mesh-chain)");
+    vkCheck(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX),
+            "vkWaitForFences(mesh-chain)");
+    vkDestroyFence(ctx.device, fence, nullptr);
+
+    uint64_t ts[6] = {};
+    vkCheck(vkGetQueryPoolResults(ctx.device, ctx.timestampPool, 0, 6, sizeof(ts), ts,
+                                   sizeof(uint64_t),
+                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+            "vkGetQueryPoolResults(mesh-chain)");
+    const double toMs = ctx.timestampPeriodNs / 1.0e6;
+    MeshStageTimingsMs t;
+    t.count = double(ts[1] - ts[0]) * toMs;
+    t.scanBlocks = double(ts[2] - ts[1]) * toMs;
+    t.scanSums = double(ts[3] - ts[2]) * toMs;
+    t.scanAdd = double(ts[4] - ts[3]) * toMs;
+    t.emit = double(ts[5] - ts[4]) * toMs;
+    return t;
+}
 
 RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed) {
     if (region.width % 8 != 0 || region.height % 8 != 0) {
@@ -916,8 +1203,10 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
     result.brickZMin = brickZMin;
     result.bricksZ = bricksZ;
 
-    // --- Passes 3+4: MeshCountMain -> host exclusive scan -> MeshEmitMain --
-    // (docs/gpu-mesher-design.md: deterministic ordering with no atomics).
+    // --- Passes 3-7: MeshCountMain -> GPU scan (ScanBlocks/Sums/AddMain) ->
+    // MeshEmitMain, chained in ONE command buffer via runMeshChain() --------
+    // (docs/gpu-mesher-design.md: deterministic ordering with no atomics;
+    // see runMeshChain()'s doc comment for the barrier/timing design).
     if (bricksX >= 3 && bricksY >= 3 && bricksZ >= 3) {
         const uint32_t mbx = bricksX - 2, mby = bricksY - 2, mbz = bricksZ - 2;
         const uint32_t maskCount = mbx * mby * mbz * 48u;
@@ -929,108 +1218,53 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
                                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         Buffer offsetsBuf = ctx.createBuffer(VkDeviceSize(maskCount) * sizeof(uint32_t),
                                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        // Placeholder quads buffer for the count pass (the superset layout
-        // requires a valid buffer at binding 8 even though count never
-        // touches it); replaced by the real one for emit.
-        Buffer quadsStub = ctx.createBuffer(sizeof(uint64_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-
-        const auto writeMeshSet = [&](VkDescriptorSet set, VkBuffer quadsBuffer) {
-            VkDescriptorBufferInfo pInfo{paramsBuf.buffer, 0, VK_WHOLE_SIZE};
-            VkDescriptorBufferInfo cInfo{cellsBuf.buffer, 0, VK_WHOLE_SIZE};
-            VkDescriptorBufferInfo oInfo{offsetsBuf.buffer, 0, VK_WHOLE_SIZE};
-            VkDescriptorBufferInfo nInfo{countsBuf.buffer, 0, VK_WHOLE_SIZE};
-            VkDescriptorBufferInfo qInfo{quadsBuffer, 0, VK_WHOLE_SIZE};
-            VkWriteDescriptorSet w[5]{};
-            w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 0, 0, 1,
-                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &pInfo, nullptr};
-            w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 5, 0, 1,
-                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cInfo, nullptr};
-            w[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 6, 0, 1,
-                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &oInfo, nullptr};
-            w[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 7, 0, 1,
-                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &nInfo, nullptr};
-            w[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 8, 0, 1,
-                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qInfo, nullptr};
-            vkUpdateDescriptorSets(ctx.device, 5, w, 0, nullptr);
-        };
-
-        const uint32_t meshGroups = (maskCount + 63) / 64;
-        const auto runMeshPass = [&](VkPipeline pipeline, VkDescriptorSet set, Buffer& hostReadBuf,
-                                      const char* what) -> double {
-            VkCommandBuffer cmd = VK_NULL_HANDLE;
-            vkCheck(vkAllocateCommandBuffers(ctx.device, &cbai, &cmd), what);
-            vkCheck(vkBeginCommandBuffer(cmd, &cbbi), what);
-            // Visibility for this submission's reads of the voxelize output.
-            VkBufferMemoryBarrier readBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-            readBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            readBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            readBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            readBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            readBarrier.buffer = cellsBuf.buffer;
-            readBarrier.offset = 0;
-            readBarrier.size = VK_WHOLE_SIZE;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1,
-                                  &readBarrier, 0, nullptr);
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshPipelineLayout,
-                                     0, 1, &set, 0, nullptr);
-            vkCmdDispatch(cmd, meshGroups, 1, 1);
-            VkBufferMemoryBarrier hostBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-            hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-            hostBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            hostBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            hostBarrier.buffer = hostReadBuf.buffer;
-            hostBarrier.offset = 0;
-            hostBarrier.size = VK_WHOLE_SIZE;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                  VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hostBarrier, 0,
-                                  nullptr);
-            vkCheck(vkEndCommandBuffer(cmd), what);
-            VkFence fence = VK_NULL_HANDLE;
-            vkCheck(vkCreateFence(ctx.device, &fci, nullptr, &fence), what);
-            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-            si.commandBufferCount = 1;
-            si.pCommandBuffers = &cmd;
-            const auto t0 = Clock::now();
-            vkCheck(vkQueueSubmit(ctx.queue, 1, &si, fence), what);
-            vkCheck(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX), what);
-            const double ms = msSince(t0);
-            vkDestroyFence(ctx.device, fence, nullptr);
-            return ms;
-        };
-
-        writeMeshSet(ctx.meshCountSet, quadsStub.buffer);
-        result.meshCountDispatchMs = runMeshPass(ctx.meshCountPipeline, ctx.meshCountSet,
-                                                  countsBuf, "mesh-count");
-
-        // Host exclusive scan (deterministic by definition).
-        const uint32_t* counts = static_cast<const uint32_t*>(countsBuf.mapped);
-        result.quadOffsets.resize(size_t(maskCount) + 1);
-        uint32_t running = 0;
-        for (uint32_t i = 0; i < maskCount; ++i) {
-            result.quadOffsets[i] = running;
-            running += counts[i];
-        }
-        result.quadOffsets[maskCount] = running;
-        std::memcpy(offsetsBuf.mapped, result.quadOffsets.data(),
-                    size_t(maskCount) * sizeof(uint32_t));
-
-        if (running > 0) {
-            Buffer quadsBuf = ctx.createBuffer(VkDeviceSize(running) * sizeof(uint64_t),
+        Buffer blockSumsBuf = ctx.createBuffer(VkDeviceSize((maskCount + 255) / 256) * sizeof(uint32_t),
                                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            writeMeshSet(ctx.meshEmitSet, quadsBuf.buffer);
-            result.meshEmitDispatchMs =
-                runMeshPass(ctx.meshEmitPipeline, ctx.meshEmitSet, quadsBuf, "mesh-emit");
+        // Quads buffer MUST be sized before the chain is recorded (MeshEmitMain
+        // is in the same command buffer as MeshCountMain, so there is no
+        // readback point between "how many quads" and "write them"). Upper
+        // bound: each mask emits at most 32 quads (docs/gpu-mesher-design.md).
+        // Grown-only reuse doesn't apply here (runRegion() creates fresh
+        // buffers per call) but the bound itself is small: 128x128 columns
+        // top out around 9-10k masks, i.e. a few MB.
+        Buffer quadsBuf = ctx.createBuffer(VkDeviceSize(maskCount) * 32 * sizeof(uint64_t),
+                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+        // ScanBlocks/Sums/AddMain read ScanCount from the SAME WorldGenParams
+        // buffer ColumnMain/VoxelizeMain already consumed; safe to update the
+        // host-mapped copy now (host writes before vkQueueSubmit are made
+        // available per the Vulkan memory model, same as the initial upload).
+        params.ScanCount = maskCount;
+        std::memcpy(paramsBuf.mapped, &params, sizeof(params));
+
+        writeMeshDescriptors(ctx, paramsBuf.buffer,
+                              {cellsBuf.buffer, countsBuf.buffer, offsetsBuf.buffer,
+                               blockSumsBuf.buffer, quadsBuf.buffer});
+        const MeshStageTimingsMs stageMs = runMeshChain(
+            ctx, maskCount,
+            {cellsBuf.buffer, countsBuf.buffer, offsetsBuf.buffer, blockSumsBuf.buffer,
+             quadsBuf.buffer});
+        result.meshCountDispatchMs = stageMs.count;
+        result.meshScanBlocksDispatchMs = stageMs.scanBlocks;
+        result.meshScanSumsDispatchMs = stageMs.scanSums;
+        result.meshScanAddDispatchMs = stageMs.scanAdd;
+        result.meshEmitDispatchMs = stageMs.emit;
+
+        // True total = counts[maskCount-1] + offsets[maskCount-1] (exclusive
+        // scan tail); the quads buffer itself is upper-bound sized.
+        const uint32_t* counts = static_cast<const uint32_t*>(countsBuf.mapped);
+        const uint32_t* offsets = static_cast<const uint32_t*>(offsetsBuf.mapped);
+        const uint32_t running = counts[maskCount - 1] + offsets[maskCount - 1];
+        result.totalQuads = running;
+        if (running > 0) {
             result.quads.resize(running);
             std::memcpy(result.quads.data(), quadsBuf.mapped, size_t(running) * sizeof(uint64_t));
-            ctx.destroyBuffer(quadsBuf);
         }
 
         ctx.destroyBuffer(countsBuf);
         ctx.destroyBuffer(offsetsBuf);
-        ctx.destroyBuffer(quadsStub);
+        ctx.destroyBuffer(blockSumsBuf);
+        ctx.destroyBuffer(quadsBuf);
     } else {
         std::printf("[%s] region too thin for interior mesh bricks (bricksZ=%u) — mesh pass "
                     "skipped\n",
@@ -1080,13 +1314,13 @@ constexpr int64_t kFullVerifyRadiusM = 64;   // <= this radius: full CPU compari
 // single dispatch. Vulkan buffer+memory (de)allocation is heavy enough that
 // repeating it ~500 times (once per tile at --radius 128) would swamp the
 // gate number with allocator overhead unrelated to the pipeline being
-// measured. Only cellsBuf/countsBuf/offsetsBuf/quadsBuf actually vary in
-// size tile-to-tile (they scale with each tile's local vertical extent,
-// bricksZ, which depends on nearby terrain height) — elevBuf/climBuf also
-// use this so a rare +/-1 raster-window rounding difference between tiles
-// doesn't need special-casing either. paramsBuf/columnsBuf/quadsStub are
-// genuinely fixed-size (128x128 columns, every tile) and are allocated once,
-// plainly, outside this helper.
+// measured. Only cellsBuf/countsBuf/offsetsBuf/blockSumsBuf/quadsBuf
+// actually vary in size tile-to-tile (they scale with each tile's local
+// vertical extent, bricksZ, which depends on nearby terrain height) —
+// elevBuf/climBuf also use this so a rare +/-1 raster-window rounding
+// difference between tiles doesn't need special-casing either.
+// paramsBuf/columnsBuf are genuinely fixed-size (128x128 columns, every
+// tile) and are allocated once, plainly, outside this helper.
 struct GrowBuffer {
     Buffer buf;
     VkDeviceSize capacityBytes = 0;
@@ -1103,19 +1337,18 @@ struct GrowBuffer {
 };
 
 struct GateBuffers {
-    Buffer paramsBuf;                 // fixed: sizeof(WorldGenParamsCB)
-    GrowBuffer elevBuf, climBuf;      // raster window (rarely grows past the first tile)
-    Buffer columnsBuf;                // fixed: kTileColumns^2 * sizeof(GpuColumnSample)
-    GrowBuffer cellsBuf;              // grows to the tallest bricksZ seen
-    GrowBuffer countsBuf, offsetsBuf; // mesh mask buffers, sized off bricksZ too
-    Buffer quadsStub;                 // fixed: 8-byte placeholder bound during MeshCountMain
-    GrowBuffer quadsBuf;              // emitted quads, sized off each tile's actual count
-    std::vector<uint32_t> quadOffsetsScratch; // host-side scan scratch, reused (not
-                                               // reallocated) across tiles like the GPU buffers
+    Buffer paramsBuf;                   // fixed: sizeof(WorldGenParamsCB)
+    GrowBuffer elevBuf, climBuf;        // raster window (rarely grows past the first tile)
+    Buffer columnsBuf;                  // fixed: kTileColumns^2 * sizeof(GpuColumnSample)
+    GrowBuffer cellsBuf;                // grows to the tallest bricksZ seen
+    GrowBuffer countsBuf, offsetsBuf;   // mesh mask buffers, sized off bricksZ too
+    GrowBuffer blockSumsBuf;            // GPU-scan per-256-block totals, (maskCount+255)/256 uints
+    GrowBuffer quadsBuf;                // emitted quads, upper-bound sized off each tile's maskCount
 
     size_t totalReallocs() const {
         return elevBuf.reallocCount + climBuf.reallocCount + cellsBuf.reallocCount +
-               countsBuf.reallocCount + offsetsBuf.reallocCount + quadsBuf.reallocCount;
+               countsBuf.reallocCount + offsetsBuf.reallocCount + blockSumsBuf.reallocCount +
+               quadsBuf.reallocCount;
     }
 };
 
@@ -1172,10 +1405,13 @@ struct GateStats {
 
     // The gate number: per-stage GPU wall-clock totals, summed across every
     // tile, plus the marshalling in between (buffer ensure/grow, descriptor
-    // writes, WorldGenParams upload, raster-window fill, host prefix scan).
-    double hostRasterFillMs = 0, columnMs = 0, voxelizeMs = 0, meshCountMs = 0, meshEmitMs = 0,
-           hostScanMs = 0;
-    double gateMs = 0; // superset of the six buckets above (the remainder is marshalling)
+    // writes, WorldGenParams upload, raster-window fill). The scan is now a
+    // GPU pass (ScanBlocks/Sums/AddMain, chained with count+emit in ONE
+    // command buffer -- see runMeshChain()), timestamp-query timed per stage,
+    // replacing the old CPU-mapped-memory host prefix scan entirely.
+    double hostRasterFillMs = 0, columnMs = 0, voxelizeMs = 0, meshCountMs = 0,
+           scanBlocksMs = 0, scanSumsMs = 0, scanAddMs = 0, meshEmitMs = 0;
+    double gateMs = 0; // superset of the buckets above (the remainder is marshalling)
 
     size_t totalTiles = 0, verifiedTiles = 0;
     size_t totalColumns = 0, verifiedColumns = 0;
@@ -1387,7 +1623,11 @@ void runTile(GpuContext& ctx, GateBuffers& gb, const TileSpec& tile, uint64_t se
     vkCheck(vkEndCommandBuffer(cmd2), "vkEndCommandBuffer(gate-vox)");
     stats.voxelizeMs += submitAndWait(cmd2);
 
-    // --- Passes 3+4: MeshCountMain -> host exclusive scan -> MeshEmitMain -
+    // --- Passes 3-7: MeshCountMain -> GPU scan (ScanBlocks/Sums/AddMain) ->
+    // MeshEmitMain, chained in ONE command buffer via runMeshChain() -- see
+    // its doc comment for the barrier/timestamp design. Replaces the old
+    // host prefix scan (CPU reading GPU-mapped counts between two separate
+    // submissions) that was the 128m gate's dominant cost.
     uint32_t mbx = 0, mby = 0, mbz = 0, maskCount = 0, running = 0;
     if (bricksX >= 3 && bricksY >= 3 && bricksZ >= 3) {
         mbx = bricksX - 2;
@@ -1397,91 +1637,36 @@ void runTile(GpuContext& ctx, GateBuffers& gb, const TileSpec& tile, uint64_t se
 
         gb.countsBuf.ensure(ctx, VkDeviceSize(maskCount) * sizeof(uint32_t));
         gb.offsetsBuf.ensure(ctx, VkDeviceSize(maskCount) * sizeof(uint32_t));
+        gb.blockSumsBuf.ensure(ctx, VkDeviceSize((maskCount + 255) / 256) * sizeof(uint32_t));
+        // Upper bound (32 quads/mask max, docs/gpu-mesher-design.md) since
+        // MeshEmitMain is chained into the SAME command buffer as
+        // MeshCountMain -- no readback point exists to size it exactly
+        // first. Grow-only GrowBuffer reuse keeps this cheap tile-to-tile.
+        gb.quadsBuf.ensure(ctx, VkDeviceSize(maskCount) * 32 * sizeof(uint64_t));
 
-        const auto writeMeshSet = [&](VkDescriptorSet set, VkBuffer quadsBuffer) {
-            VkDescriptorBufferInfo pInfo{gb.paramsBuf.buffer, 0, VK_WHOLE_SIZE};
-            VkDescriptorBufferInfo cInfo{gb.cellsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
-            VkDescriptorBufferInfo oInfo{gb.offsetsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
-            VkDescriptorBufferInfo nInfo{gb.countsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
-            VkDescriptorBufferInfo qInfo{quadsBuffer, 0, VK_WHOLE_SIZE};
-            VkWriteDescriptorSet w[5]{};
-            w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 0, 0, 1,
-                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &pInfo, nullptr};
-            w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 5, 0, 1,
-                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cInfo, nullptr};
-            w[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 6, 0, 1,
-                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &oInfo, nullptr};
-            w[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 7, 0, 1,
-                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &nInfo, nullptr};
-            w[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 8, 0, 1,
-                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qInfo, nullptr};
-            vkUpdateDescriptorSets(ctx.device, 5, w, 0, nullptr);
-        };
+        // ScanBlocks/Sums/AddMain read ScanCount from the SAME WorldGenParams
+        // buffer ColumnMain/VoxelizeMain already consumed this tile; safe to
+        // update the host-mapped copy now, same reasoning as runRegion().
+        params.ScanCount = maskCount;
+        std::memcpy(gb.paramsBuf.mapped, &params, sizeof(params));
 
-        const uint32_t meshGroups = (maskCount + 63) / 64;
-        const auto runMeshPass = [&](VkPipeline pipeline, VkDescriptorSet set,
-                                      VkBuffer hostReadBuffer, const char* what) -> double {
-            VkCommandBuffer cmd = VK_NULL_HANDLE;
-            vkCheck(vkAllocateCommandBuffers(ctx.device, &cbai, &cmd), what);
-            vkCheck(vkBeginCommandBuffer(cmd, &cbbi), what);
-            VkBufferMemoryBarrier readBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-            readBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            readBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            readBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            readBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            readBarrier.buffer = gb.cellsBuf.buf.buffer;
-            readBarrier.offset = 0;
-            readBarrier.size = VK_WHOLE_SIZE;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1,
-                                  &readBarrier, 0, nullptr);
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshPipelineLayout, 0,
-                                     1, &set, 0, nullptr);
-            vkCmdDispatch(cmd, meshGroups, 1, 1);
-            VkBufferMemoryBarrier hostBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-            hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-            hostBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            hostBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            hostBarrier.buffer = hostReadBuffer;
-            hostBarrier.offset = 0;
-            hostBarrier.size = VK_WHOLE_SIZE;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                  VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hostBarrier, 0,
-                                  nullptr);
-            vkCheck(vkEndCommandBuffer(cmd), what);
-            return submitAndWait(cmd);
-        };
+        writeMeshDescriptors(ctx, gb.paramsBuf.buffer,
+                              {gb.cellsBuf.buf.buffer, gb.countsBuf.buf.buffer,
+                               gb.offsetsBuf.buf.buffer, gb.blockSumsBuf.buf.buffer,
+                               gb.quadsBuf.buf.buffer});
+        const MeshStageTimingsMs stageMs = runMeshChain(
+            ctx, maskCount,
+            {gb.cellsBuf.buf.buffer, gb.countsBuf.buf.buffer, gb.offsetsBuf.buf.buffer,
+             gb.blockSumsBuf.buf.buffer, gb.quadsBuf.buf.buffer});
+        stats.meshCountMs += stageMs.count;
+        stats.scanBlocksMs += stageMs.scanBlocks;
+        stats.scanSumsMs += stageMs.scanSums;
+        stats.scanAddMs += stageMs.scanAdd;
+        stats.meshEmitMs += stageMs.emit;
 
-        writeMeshSet(ctx.meshCountSet, gb.quadsStub.buffer);
-        stats.meshCountMs += runMeshPass(ctx.meshCountPipeline, ctx.meshCountSet,
-                                          gb.countsBuf.buf.buffer, "gate-mesh-count");
-
-        const auto tScan0 = Clock::now();
         const uint32_t* counts = static_cast<const uint32_t*>(gb.countsBuf.buf.mapped);
-        // Reused across tiles (like the GPU-side GrowBuffers above): resize()
-        // only reallocates when growing past the current capacity, so after
-        // the first few tiles this scratch vector settles at a working-set
-        // size and every later tile's scan is allocation-free.
-        if (gb.quadOffsetsScratch.size() < size_t(maskCount) + 1)
-            gb.quadOffsetsScratch.resize(size_t(maskCount) + 1);
-        uint32_t* quadOffsets = gb.quadOffsetsScratch.data();
-        running = 0;
-        for (uint32_t i = 0; i < maskCount; ++i) {
-            quadOffsets[i] = running;
-            running += counts[i];
-        }
-        quadOffsets[maskCount] = running;
-        std::memcpy(gb.offsetsBuf.buf.mapped, quadOffsets, size_t(maskCount) * sizeof(uint32_t));
-        stats.hostScanMs += msSince(tScan0);
-
-        if (running > 0) {
-            gb.quadsBuf.ensure(ctx, VkDeviceSize(running) * sizeof(uint64_t));
-            writeMeshSet(ctx.meshEmitSet, gb.quadsBuf.buf.buffer);
-            stats.meshEmitMs += runMeshPass(ctx.meshEmitPipeline, ctx.meshEmitSet,
-                                             gb.quadsBuf.buf.buffer, "gate-mesh-emit");
-        }
+        const uint32_t* offsets = static_cast<const uint32_t*>(gb.offsetsBuf.buf.mapped);
+        running = counts[maskCount - 1] + offsets[maskCount - 1];
     }
 
     stats.gateMs += msSince(tGate0);
@@ -1672,12 +1857,12 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
     gb.columnsBuf = ctx.createBuffer(
         VkDeviceSize(kTileColumns) * kTileColumns * sizeof(GpuColumnSample),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    gb.quadsStub = ctx.createBuffer(sizeof(uint64_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     gb.elevBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     gb.climBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     gb.cellsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     gb.countsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     gb.offsetsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    gb.blockSumsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     gb.quadsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 
     SyntheticTileSampler tiles(seed);
@@ -1698,27 +1883,28 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
 
     ctx.destroyBuffer(gb.paramsBuf);
     ctx.destroyBuffer(gb.columnsBuf);
-    ctx.destroyBuffer(gb.quadsStub);
     if (gb.elevBuf.buf.buffer) ctx.destroyBuffer(gb.elevBuf.buf);
     if (gb.climBuf.buf.buffer) ctx.destroyBuffer(gb.climBuf.buf);
     if (gb.cellsBuf.buf.buffer) ctx.destroyBuffer(gb.cellsBuf.buf);
     if (gb.countsBuf.buf.buffer) ctx.destroyBuffer(gb.countsBuf.buf);
     if (gb.offsetsBuf.buf.buffer) ctx.destroyBuffer(gb.offsetsBuf.buf);
+    if (gb.blockSumsBuf.buf.buffer) ctx.destroyBuffer(gb.blockSumsBuf.buf);
     if (gb.quadsBuf.buf.buffer) ctx.destroyBuffer(gb.quadsBuf.buf);
 
     const double gateSec = stats.gateMs / 1000.0;
     const double verifiedFraction =
         stats.totalTiles ? double(stats.verifiedTiles) / double(stats.totalTiles) : 0.0;
-    const double namedStagesMs = stats.columnMs + stats.voxelizeMs + stats.meshCountMs +
-                                  stats.meshEmitMs + stats.hostScanMs;
+    const double scanMs = stats.scanBlocksMs + stats.scanSumsMs + stats.scanAddMs;
+    const double namedStagesMs =
+        stats.columnMs + stats.voxelizeMs + stats.meshCountMs + scanMs + stats.meshEmitMs;
 
     std::printf(
         "\n--- GATE stage totals (radius %lldm, %zu tiles) ---\n"
         "  columns dispatch:       %10.3f ms\n"
         "  voxelize dispatch:      %10.3f ms\n"
         "  mesh count dispatch:    %10.3f ms\n"
+        "  GPU scan (blocks+sums+add): %10.3f ms  (blocks %.3f + sums %.3f + add %.3f)\n"
         "  mesh emit dispatch:     %10.3f ms\n"
-        "  host prefix scan:       %10.3f ms\n"
         "  (marshalling overhead:  %10.3f ms -- buffer ensure/grow, descriptor writes, "
         "WorldGenParams upload, raster fill)\n"
         "  GATE TOTAL (gpu path):  %10.3f ms  = %.3f s\n"
@@ -1726,8 +1912,9 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
         "  CPU compare + digest (verification, excluded from gate): %10.3f ms\n"
         "  wall clock (everything, incl. both excluded costs):  %10.3f ms\n",
         (long long)radiusM, stats.totalTiles, stats.columnMs, stats.voxelizeMs,
-        stats.meshCountMs, stats.meshEmitMs, stats.hostScanMs, stats.gateMs - namedStagesMs,
-        stats.gateMs, gateSec, stats.cpuColumnPassMs, stats.cpuCompareMs, wallMs);
+        stats.meshCountMs, scanMs, stats.scanBlocksMs, stats.scanSumsMs, stats.scanAddMs,
+        stats.meshEmitMs, stats.gateMs - namedStagesMs, stats.gateMs, gateSec,
+        stats.cpuColumnPassMs, stats.cpuCompareMs, wallMs);
 
     std::printf("\nGATE radius=%lldm: %.3f s (target: <1.000 s, plan sec4 M0) -> %s\n",
                 (long long)radiusM, gateSec, gateSec < 1.0 ? "PASS" : "OVER TARGET");
@@ -1776,6 +1963,9 @@ int main(int argc, char** argv) {
     std::string voxelizeSpvPath = VXC_SPV_PATH_VOXELIZE;
     std::string meshCountSpvPath = VXC_SPV_PATH_MESHCOUNT;
     std::string meshEmitSpvPath = VXC_SPV_PATH_MESHEMIT;
+    std::string scanBlocksSpvPath = VXC_SPV_PATH_SCANBLOCKS;
+    std::string scanSumsSpvPath = VXC_SPV_PATH_SCANSUMS;
+    std::string scanAddSpvPath = VXC_SPV_PATH_SCANADD;
     int64_t gateRadiusM = -1; // -1 = not specified -> default regions mode (unchanged)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1783,16 +1973,20 @@ int main(int argc, char** argv) {
         else if (a == "--spv-voxelize" && i + 1 < argc) voxelizeSpvPath = argv[++i];
         else if (a == "--spv-meshcount" && i + 1 < argc) meshCountSpvPath = argv[++i];
         else if (a == "--spv-meshemit" && i + 1 < argc) meshEmitSpvPath = argv[++i];
+        else if (a == "--spv-scanblocks" && i + 1 < argc) scanBlocksSpvPath = argv[++i];
+        else if (a == "--spv-scansums" && i + 1 < argc) scanSumsSpvPath = argv[++i];
+        else if (a == "--spv-scanadd" && i + 1 < argc) scanAddSpvPath = argv[++i];
         else if (a == "--radius" && i + 1 < argc) gateRadiusM = std::atoll(argv[++i]);
     }
 
     std::printf(
         "voxel-core GPU harness (ADR-0001 M0 gate) — ColumnMain + VoxelizeMain + "
-        "MeshCount/EmitMain, seed %llu\n",
+        "MeshCount/EmitMain + GPU Scan(Blocks/Sums/Add)Main, seed %llu\n",
         (unsigned long long)seed);
 
     loadVulkanLoader();
-    GpuContext ctx = createContext(spvPath, voxelizeSpvPath, meshCountSpvPath, meshEmitSpvPath);
+    GpuContext ctx = createContext(spvPath, voxelizeSpvPath, meshCountSpvPath, meshEmitSpvPath,
+                                    scanBlocksSpvPath, scanSumsSpvPath, scanAddSpvPath);
     std::printf("device: %s\n\n", ctx.deviceName.c_str());
 
     if (gateRadiusM >= 0) {
@@ -1817,6 +2011,7 @@ int main(int argc, char** argv) {
     double totalColumnDispatchMs = 0;
     double totalVoxelizeDispatchMs = 0;
     double totalMeshCountMs = 0;
+    double totalMeshScanMs = 0;
     double totalMeshEmitMs = 0;
 
     for (const RegionSpec& region : regions) {
@@ -1887,12 +2082,17 @@ int main(int argc, char** argv) {
         // --- Mesh comparison: CPU meshBrick<8> per interior brick vs the
         // GPU quad stream (docs/gpu-mesher-design.md ordering contract) ----
         if (gpu.interiorBricksZ > 0) {
-            std::printf("[%s] MeshCount dispatch: %.3f ms, MeshEmit dispatch: %.3f ms, "
+            const double scanMs = gpu.meshScanBlocksDispatchMs + gpu.meshScanSumsDispatchMs +
+                                   gpu.meshScanAddDispatchMs;
+            std::printf("[%s] MeshCount dispatch: %.3f ms, GPU scan (blocks %.3f + sums %.3f + "
+                        "add %.3f = %.3f) ms, MeshEmit dispatch: %.3f ms, "
                         "%u quads over %ux%ux%u interior bricks\n",
-                        region.name, gpu.meshCountDispatchMs, gpu.meshEmitDispatchMs,
-                        gpu.quadOffsets.empty() ? 0u : gpu.quadOffsets.back(),
-                        gpu.interiorBricksX, gpu.interiorBricksY, gpu.interiorBricksZ);
+                        region.name, gpu.meshCountDispatchMs, gpu.meshScanBlocksDispatchMs,
+                        gpu.meshScanSumsDispatchMs, gpu.meshScanAddDispatchMs, scanMs,
+                        gpu.meshEmitDispatchMs, gpu.totalQuads, gpu.interiorBricksX,
+                        gpu.interiorBricksY, gpu.interiorBricksZ);
             totalMeshCountMs += gpu.meshCountDispatchMs;
+            totalMeshScanMs += scanMs;
             totalMeshEmitMs += gpu.meshEmitDispatchMs;
 
             std::vector<Quad> cpuQuads;
@@ -1968,16 +2168,18 @@ int main(int argc, char** argv) {
     const double voxelizeSec = totalVoxelizeDispatchMs / 1000.0;
     const double cellsPerSec = voxelizeSec > 0.0 ? double(totalCells) / voxelizeSec : 0.0;
 
-    const double meshSec = (totalMeshCountMs + totalMeshEmitMs) / 1000.0;
+    const double meshSec = (totalMeshCountMs + totalMeshScanMs + totalMeshEmitMs) / 1000.0;
     const double quadsPerSec = meshSec > 0.0 ? double(totalQuads) / meshSec : 0.0;
     std::printf(
         "\ncompared %zu columns, %zu cells, %zu meshed bricks (%zu quads) across %zu regions\n"
         "  ColumnMain total dispatch wall-clock:   %.3f ms\n"
         "  VoxelizeMain total dispatch wall-clock: %.3f ms  (%.3f Mcells/sec)\n"
-        "  Mesh count+emit total wall-clock:       %.3f ms  (%.3f Mquads/sec)\n",
+        "  Mesh count+GPUscan+emit total wall-clock: %.3f ms  (count %.3f + scan %.3f + emit "
+        "%.3f)  (%.3f Mquads/sec)\n",
         totalColumns, totalCells, totalMeshedBricks, totalQuads,
         sizeof(regions) / sizeof(regions[0]), totalColumnDispatchMs, totalVoxelizeDispatchMs,
-        cellsPerSec / 1e6, totalMeshCountMs + totalMeshEmitMs, quadsPerSec / 1e6);
+        cellsPerSec / 1e6, totalMeshCountMs + totalMeshScanMs + totalMeshEmitMs, totalMeshCountMs,
+        totalMeshScanMs, totalMeshEmitMs, quadsPerSec / 1e6);
     std::printf("GPU output digest (columns + cells + quads, combined): %016llx\n",
                 (unsigned long long)gpuDigest.h);
 

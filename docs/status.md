@@ -7,8 +7,8 @@ gate definitions.
 
 | Gate | Status | Notes |
 |---|---|---|
-| Amplify+mesh 128m radius < 1s on RTX 3060 | 🟨 half-open | **AMD leg measured (2026-07-19)**: `vxc_gpu --radius <m>` (voxel-core/bench/gpu_harness.cpp) now runs the FULL GPU pipeline (ColumnMain→VoxelizeMain→MeshCount/EmitMain) over every surface-shell brick in a horizontal radius, tiled into 128×128-column dispatches with a 1-brick shared halo (14×14-brick/112-column interior per tile — partitions the target square with no gaps, no double-meshing). On this desktop's AMD Radeon RX 7800 XT: **radius 64m = 0.678s** (PASS, under target) and **radius 128m = 2.388s** (OVER target) — end-to-end gate time excludes per-tile CPU column setup and CPU-reference comparison, both timed and reported separately. At 128m the host prefix-scan step (CPU reads GPU-mapped mesh-mask counts, writes back scan offsets, between the count and emit dispatches) is the single largest bucket (1.20s of 2.39s) — larger than all four GPU dispatch stages combined (1.07s) — pointing at CPU↔GPU-mapped-memory round-trip cost in the count→scan→emit chain, not raw compute throughput, as the next optimization target (gpu-mesher-design.md's mesher lists moving the scan to GPU as exactly this contingency). NVIDIA leg still needs to run the same `vxc_gpu --radius 64/128` and compare digests. CPU reference baseline (single-threaded, container hardware) unchanged below. |
-| Bit-identical amplifier output NVIDIA vs AMD | 🟨 half-open | **AMD leg PASSING** (2026-07-19): `vxc_gpu` (voxel-core/bench/gpu_harness.cpp, ADR-0001) dispatches the SPIR-V worldgen kernel (build/shaders/worldgen.ColumnMain.spv) on this desktop's AMD Radeon RX 7800 XT via a headless Vulkan 1.1 harness and byte-compares every field of every column against `vxc::Amplifier::column` — bit-exact over 32,768 columns across two dispatch regions (near-origin and a far/negative-coordinate region), digest `be28ce960bd5bcf6`. **`--radius` gate mode PASSING too** (2026-07-19, seed 20260719): full columns+cells+quads comparison at radius 64m (144/144 tiles, 100% verified: 2,359,296 columns / 87,687,168 cells / 1,129,674 quads, digest `e1db29a9b6874012`) and a deterministic every-8th-tile sample at radius 128m (67/529 tiles, 12.7% verified: 1,097,728 columns / 39,583,744 cells / 497,132 quads, digest `583e91d62cefb8a9`) — zero mismatches in both, and the digest covers ALL GPU output (not just the verified sample) so it's comparable across differently-sampled runs. NVIDIA leg still open: needs a rented/CI Linux+NVIDIA runner producing the same `vxc_gpu` digests (ADR-0001 gate = identical digest on both legs, for both the column-only regions AND the `--radius` gate digests). Interim cross-*compiler* proxy (gcc/clang/MSVC digests) still green as a secondary signal; see `determinism-cross-compiler` in CI. |
+| Amplify+mesh 128m radius < 1s on RTX 3060 | 🟨 half-open | **AMD leg measured (2026-07-19)**: `vxc_gpu --radius <m>` (voxel-core/bench/gpu_harness.cpp) now runs the FULL GPU pipeline (ColumnMain→VoxelizeMain→MeshCount/EmitMain) over every surface-shell brick in a horizontal radius, tiled into 128×128-column dispatches with a 1-brick shared halo (14×14-brick/112-column interior per tile — partitions the target square with no gaps, no double-meshing). On this desktop's AMD Radeon RX 7800 XT: **radius 64m = 0.678s** (PASS, under target) and **radius 128m = 2.388s** (OVER target) — end-to-end gate time excludes per-tile CPU column setup and CPU-reference comparison, both timed and reported separately. At 128m the host prefix-scan step (CPU reads GPU-mapped mesh-mask counts, writes back scan offsets, between the count and emit dispatches) is the single largest bucket (1.20s of 2.39s) — larger than all four GPU dispatch stages combined (1.07s) — pointing at CPU↔GPU-mapped-memory round-trip cost in the count→scan→emit chain, not raw compute throughput, as the next optimization target (gpu-mesher-design.md's mesher lists moving the scan to GPU as exactly this contingency). **Host scan replaced with a GPU scan (2026-07-20)**: worldgen.hlsl gained `ScanBlocksMain`/`ScanSumsMain`/`ScanAddMain` (fixed-order shared-memory Hillis-Steele, per-256-block scan + single-workgroup block-sum scan + add-back — deterministic by construction, so quad order is byte-for-byte unchanged), and `gpu_harness.cpp`'s `runMeshChain()` now chains MeshCountMain→ScanBlocksMain→ScanSumsMain→ScanAddMain→MeshEmitMain in ONE command buffer (COMPUTE→COMPUTE buffer barriers write→read between every stage, one trailing COMPUTE→HOST barrier, ONE fence per tile/region) instead of the old two-submission count/emit split with a CPU-side scan in between. The emitted quads buffer is upper-bound sized (32 quads/mask max × maskCount, grow-only reused) *before* the chain is recorded, since MeshEmitMain now has no readback point to learn the exact total first; the true total (`counts[maskCount-1] + offsets[maskCount-1]`) is read back after the single fence. Per-stage GPU timing survives the merge to one fence via 6 `vkCmdWriteTimestamp` queries bracketing the 5 dispatches. maskCount is asserted ≤65,536 per dispatch (ScanSumsMain's single-workgroup limit) — never triggered by the 128×128 tile layout in practice. Result: **radius 64m = 0.529s** (PASS, was 0.678s) and **radius 128m = 1.134s** (still OVER target, was 2.388s — a 52.5% reduction). The host scan bucket (was 1.20s at 128m) is now a 6.98ms GPU-scan bucket (blocks 3.66ms + sums 2.22ms + add 1.10ms) — the scan is no longer a bottleneck at any radius tested. The four original GPU dispatch stages (columns+voxelize+meshcount+meshemit) are ~925ms at 128m, about the same as before (1.07s); marshalling overhead rose modestly (118ms→201ms — three descriptor sets now rewritten per tile instead of ≤2, plus the upper-bound quads allocation) — mesh count/emit dispatch cost (283ms+286ms=569ms) and columns/voxelize (224ms+132ms=356ms) are now the dominant buckets and the next optimization target, not the scan. Digests at both radii are byte-identical to the pre-scan run (see the determinism row below), confirming the GPU scan changes nothing about output, only how it's computed. NVIDIA leg still needs to run the same `vxc_gpu --radius 64/128` and compare digests. CPU reference baseline (single-threaded, container hardware) unchanged below. |
+| Bit-identical amplifier output NVIDIA vs AMD | 🟨 half-open | **AMD leg PASSING** (2026-07-19): `vxc_gpu` (voxel-core/bench/gpu_harness.cpp, ADR-0001) dispatches the SPIR-V worldgen kernel (build/shaders/worldgen.ColumnMain.spv) on this desktop's AMD Radeon RX 7800 XT via a headless Vulkan 1.1 harness and byte-compares every field of every column against `vxc::Amplifier::column` — bit-exact over 32,768 columns across two dispatch regions (near-origin and a far/negative-coordinate region), digest `be28ce960bd5bcf6`. **`--radius` gate mode PASSING too** (2026-07-19, seed 20260719): full columns+cells+quads comparison at radius 64m (144/144 tiles, 100% verified: 2,359,296 columns / 87,687,168 cells / 1,129,674 quads, digest `e1db29a9b6874012`) and a deterministic every-8th-tile sample at radius 128m (67/529 tiles, 12.7% verified: 1,097,728 columns / 39,583,744 cells / 497,132 quads, digest `583e91d62cefb8a9`) — zero mismatches in both, and the digest covers ALL GPU output (not just the verified sample) so it's comparable across differently-sampled runs. **Re-verified after the GPU-scan wiring (2026-07-20)**: same seed, same two digests exactly (`e1db29a9b6874012` at radius 64m, `583e91d62cefb8a9` at radius 128m) and the default column-only regions mode also stays bit-exact — confirms the GPU scan is a pure re-implementation of the exclusive-scan step with no observable output change. NVIDIA leg still open: needs a rented/CI Linux+NVIDIA runner producing the same `vxc_gpu` digests (ADR-0001 gate = identical digest on both legs, for both the column-only regions AND the `--radius` gate digests). Interim cross-*compiler* proxy (gcc/clang/MSVC digests) still green as a secondary signal; see `determinism-cross-compiler` in CI. |
 
 ### Early 8³ vs 16³ data (CPU ref, will re-decide after GPU port)
 
@@ -45,11 +45,54 @@ Working plan + binding decisions: docs/m1-plan.md. UE 5.8.0 (retargeted
   origin rebasing, 60fps gate run
 - Gate (walk & dig at 60fps min-spec): ⬜ open — blocked on stage 3
 
+## M2 — LOD cascade (first implementation wave landed, 2026-07-20)
+
+Working plan + binding decisions: docs/m2-plan.md.
+
+- [x] Level-aware streaming: `VoxelCoords::FVoxelLevelChunkKey` generalizes
+  every record/queue in `VoxelWorldSubsystem.cpp`; per-level annulus desired
+  sets from the `RingPresets` table (R0 0-64m .. R4 512-1024m), outer-edge
+  hysteresis (1.25x), nearest-first-globally priority with level as an
+  equal-distance tie-break only, per-level entry-scan gating so outer rings
+  don't rescan on every 3.2m step.
+- [x] MipChain worker integration: level-L (L>=1) jobs build bricks via
+  `vxc::MipChain<8>` over a pure-`GeneratedWorld` level-0 source with a
+  per-job column-grid LRU (`MakeLevelSampler`); level 0 keeps its existing
+  hand-tuned fast path unchanged.
+- [x] Component/proxy: `UVoxelChunkComponent::SetLevel` scales position and
+  bounds by `VoxelSizeUU << level`; `voxel.Debug.Rings` cvar tints by level
+  (R0 green .. R4 magenta), `-VoxelDebugRings` forces it on headlessly.
+- [x] Verification (2026-07-20, seed 20260719, static spawn, no player
+  movement): headless `-game -VoxelScreenshotAfter=<n>` runs, clean shutdown,
+  zero ensures. From a cold spawn, ring population is strictly nearest-first
+  (rings are non-overlapping distance bands, so this is inherent, not a
+  bug): R0 (1596 chunks) and R1 (1172) settle in ~20s; R2 (~2000+ visible /
+  ~4010 candidates) takes ~90s; R3 candidates (~4038) dispatch markedly
+  slower — measured ~8 chunks/s vs R2's ~45-50/s, confirming the plan's "some
+  cost growth expected" note for higher MipChain levels — R3 was still
+  draining (598/2565 loaded) and R4 (4076 candidates) had not started after
+  475s. **Open follow-up**: cold-start fill time for R3/R4 is long relative
+  to a session (this is a one-time worst case, not the steady-state cost of
+  keeping rings loaded during normal flight, but it means the "R1+ nonzero"
+  verification needs several minutes from a cold spawn, not tens of
+  seconds) — worth profiling the per-job MipChain cost at L3/L4 specifically
+  (recursive 2x2x2 downsample fan-out) before the next M2 wave.
+- **Known limitation** (see docs/m2-plan.md "Known limitation" section):
+  distant edits do not propagate to mip levels yet — only level 0 takes the
+  overlay-aware path; R1-R4 always render pure-generated.
+- Gate (50km+ vista, 60fps, fast flight with no hitches): ⬜ open — this wave
+  is streaming/rendering plumbing only; the flight/hitch gate run and
+  dithered cross-fade are later M2 items.
+
 ## M0 GPU track (ADR-0001)
 
 - [x] Worldgen HLSL kernel (ColumnMain, VoxelizeMain, MeshCountMain,
   MeshEmitMain) mirrors CPU reference; compiles to DXIL + SPIR-V from one
   source (pinned DXC 1.9, tools/compile-shaders.ps1)
+- [x] GPU exclusive scan (ScanBlocksMain, ScanSumsMain, ScanAddMain) replaces
+  the CPU-mapped-memory host scan between mesh count and emit; chained with
+  count/emit in one command buffer/one fence (`runMeshChain()`,
+  gpu_harness.cpp) — see the M0 gate row above for before/after numbers
 - [x] Vulkan headless harness: dispatch + byte-compare vs CPU reference on
   the AMD leg (this desktop) — both the column-only regions mode and the
   `--radius` full-pipeline gate mode. Still needs a cloud NVIDIA leg

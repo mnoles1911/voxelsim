@@ -12,6 +12,7 @@
 #include "voxelcore/counters.h"
 #include "voxelcore/hash.h"
 #include "voxelcore/mesher.h"
+#include "voxelcore/mips.h"
 #include "voxelcore/raycast.h"
 #include "voxelcore/tiles.h"
 #include "voxelcore/world.h"
@@ -131,6 +132,132 @@ void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const Material
 	}
 }
 
+// M2 mip sourcing (docs/m2-plan.md "Mip sourcing" row): a level-L (L>=1)
+// chunk job builds its bricks via vxc::MipChain<8> over a PURE-generated
+// level-0 source -- the lock-free rule holds unchanged (workers never touch
+// World's overlay, only GeneratedWorld). A naive MipChain source that calls
+// GeneratedWorld::makeBrick(key) fresh on every request would recompute the
+// (8x8) amplifier column grid for every level-0 brick queried; within one
+// job, a tall stack of level-0 bricks at the same (bx,by) XY footprint
+// shares one column grid, so this small per-job LRU (capped, not one grid
+// covering the whole job footprint -- that would front-load amplifier work
+// for chunk regions the recursion may not even need) caches ColumnGrids by
+// (bx,by) and is the thing that actually avoids the redundant recompute.
+class FJobColumnGridCache
+{
+public:
+	using GeneratedWorldT = vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>;
+
+	FJobColumnGridCache(const GeneratedWorldT& InGen, vxc::Counters* InPerfCounters) : Gen(InGen), PerfCounters(InPerfCounters) {}
+
+	const GeneratedWorldT::ColumnGrid& Get(int32 Bx, int32 By)
+	{
+		const uint64 PackedKey = (uint64(uint32(Bx)) << 32) | uint64(uint32(By));
+		if (GeneratedWorldT::ColumnGrid* Found = Grids.Find(PackedKey))
+		{
+			Touch(PackedKey);
+			return *Found;
+		}
+		if (Grids.Num() >= kMaxEntries)
+		{
+			Evict();
+		}
+		// docs/debug-tooling-plan.md P1 "vxc::Counters": one increment per
+		// actual cache miss (LRU hits, the whole point of this cache, don't
+		// recount) -- B*B amplifier column evaluations per miss, same unit as
+		// the level-0 job's columnEvals counter.
+		if (PerfCounters)
+		{
+			PerfCounters->incColumnEvals(uint64_t(VoxelCoords::BrickEdgeVoxels) * VoxelCoords::BrickEdgeVoxels);
+		}
+		GeneratedWorldT::ColumnGrid& NewGrid = Grids.Add(PackedKey, Gen.columns(Bx, By));
+		RecencyOrder.Add(PackedKey);
+		return NewGrid;
+	}
+
+private:
+	void Touch(uint64 Key)
+	{
+		RecencyOrder.RemoveSingle(Key);
+		RecencyOrder.Add(Key);
+	}
+	void Evict()
+	{
+		if (RecencyOrder.Num() == 0)
+		{
+			return;
+		}
+		const uint64 Oldest = RecencyOrder[0];
+		RecencyOrder.RemoveAt(0);
+		Grids.Remove(Oldest);
+	}
+
+	static constexpr int32 kMaxEntries = 64;
+	const GeneratedWorldT& Gen;
+	vxc::Counters* PerfCounters;
+	TMap<uint64, GeneratedWorldT::ColumnGrid> Grids;
+	TArray<uint64> RecencyOrder;
+};
+
+// Builds a per-job vxc::MipChain<8> whose level-0 source lazily materializes
+// bricks from GeneratedWorld via the column-grid cache above, and returns a
+// sampler closure (level-L absolute voxel coords -> MaterialId, valid on
+// [-1,B]^3 across brick AND chunk borders, matching meshBrick's contract)
+// bound to that chain at the requested Level. The returned std::function
+// keeps the MipChain and column cache alive via shared_ptr captures, so the
+// caller can pass the sampler straight into MeshChunkBricks without worrying
+// about lifetime -- everything is freed once the sampler itself goes out of
+// scope at the end of the worker job.
+std::function<vxc::MaterialId(int64, int64, int64)> MakeLevelSampler(const vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>& Gen,
+                                                                       int32 Level, vxc::Counters* PerfCounters)
+{
+	using namespace vxc;
+	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
+
+	struct FJobMipState
+	{
+		FJobMipState(const GeneratedWorld<B>& InGen, Counters* InPerfCounters)
+			: ColumnCache(InGen, InPerfCounters)
+			, Gen(InGen)
+			, Chain(
+				  [this](const BrickKey& Key) -> const Brick<B>*
+				  {
+					  auto Found = Level0Bricks.find(Key);
+					  if (Found != Level0Bricks.end())
+					  {
+						  return &Found->second;
+					  }
+					  const auto& Grid = ColumnCache.Get(Key.x, Key.y);
+					  auto [It, Inserted] = Level0Bricks.emplace(Key, Gen.makeBrick(Key, Grid));
+					  (void)Inserted;
+					  return &It->second;
+				  })
+		{
+		}
+
+		FJobColumnGridCache ColumnCache;
+		const GeneratedWorld<B>& Gen;
+		std::unordered_map<BrickKey, Brick<B>, BrickKeyHash> Level0Bricks;
+		MipChain<B> Chain;
+	};
+
+	TSharedPtr<FJobMipState> State = MakeShared<FJobMipState>(Gen, PerfCounters);
+
+	return [State, Level](int64 X, int64 Y, int64 Z) -> MaterialId
+	{
+		const BrickKey BKey{int32_t(floorDiv(X, B)), int32_t(floorDiv(Y, B)), int32_t(floorDiv(Z, B))};
+		const Brick<B>* B0 = State->Chain.brick(Level, BKey);
+		if (!B0)
+		{
+			return MAT_AIR;
+		}
+		const int Lx = int(floorMod(X, B));
+		const int Ly = int(floorMod(Y, B));
+		const int Lz = int(floorMod(Z, B));
+		return B0->get(Lx, Ly, Lz);
+	};
+}
+
 // Sized dig/place cube anchoring (m1-plan.md "Player experience decisions",
 // "Dig sizes" / "Place" rows): the SizeVoxels^3 cube is centred on Anchor on
 // the two axes tangent to the hit face (FaceAxis), and biased along the face
@@ -194,7 +321,7 @@ struct FChunkRecord
 
 struct FJobResult
 {
-	VoxelCoords::FVoxelChunkKey Key;
+	VoxelCoords::FVoxelLevelChunkKey Key;
 	uint64 GenerationId = 0;
 	TArray<FVoxelChunkQuad> Quads;
 	float JobMs = 0.f; // wall time inside the worker task body (docs/debug-tooling-plan.md P1 "Worker timings")
@@ -221,25 +348,41 @@ struct FVoxelWorldImpl
 	vxc::SyntheticTileSampler Tiles;
 	vxc::World<VoxelCoords::BrickEdgeVoxels> Voxels;
 
-	// --- Stage 2 streaming state (docs/m1-plan.md Stage 2 decisions table) ---
+	// --- Stage 2 streaming state (docs/m1-plan.md Stage 2 decisions table);
+	// M2 (docs/m2-plan.md "Ring streaming" row) generalizes every key here
+	// from FVoxelChunkKey to FVoxelLevelChunkKey (level, chunk) -- level 0
+	// keys behave identically to the pre-M2 single-ring scheme. ---
 
-	TMap<VoxelCoords::FVoxelChunkKey, VoxelStreaming::FChunkRecord> ChunkRecords;
+	TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStreaming::FChunkRecord> ChunkRecords;
 
-	// Nearest-first priority queues. Sorted FARTHEST-first so Pop() (O(1),
-	// removes from the back) always yields the nearest pending chunk.
-	TArray<VoxelCoords::FVoxelChunkKey> PendingJobKeys;        // worker-dispatch pending (no edited brick)
-	TArray<VoxelCoords::FVoxelChunkKey> PendingGameThreadKeys; // overlay-aware game-thread mesh pending (first load of an
-	                                                            // edited chunk, or a post-edit dirty re-mesh)
-	TArray<VoxelCoords::FVoxelChunkKey> PendingUnloadKeys;
-	TSet<VoxelCoords::FVoxelChunkKey> PendingUnloadSet; // de-dupes PendingUnloadKeys across recomputes
+	// Nearest-first-within-level, lower-level-wins-ties priority queues
+	// (docs/m2-plan.md item 1: "Budgets shared across levels, nearest-first
+	// within level, lower level (finer) wins priority at equal distance").
+	// Sorted so Pop() (O(1), removes from the back) always yields the
+	// highest-priority pending chunk -- see SortPendingQueues.
+	TArray<VoxelCoords::FVoxelLevelChunkKey> PendingJobKeys;        // worker-dispatch pending (level 0 w/o edited brick, or any level>=1)
+	TArray<VoxelCoords::FVoxelLevelChunkKey> PendingGameThreadKeys; // overlay-aware game-thread mesh pending (level 0 only --
+	                                                                 // wave 1 limitation, see MarkChunkDirtyForRemesh doc comment)
+	TArray<VoxelCoords::FVoxelLevelChunkKey> PendingUnloadKeys;
+	TSet<VoxelCoords::FVoxelLevelChunkKey> PendingUnloadSet; // de-dupes PendingUnloadKeys across recomputes
 
 	TQueue<VoxelStreaming::FJobResult, EQueueMode::Mpsc> ResultsQueue;
 	FThreadSafeCounter JobsInFlightCounter;
 	TArray<UE::Tasks::TTask<void>> InFlightTasks; // only for a clean Deinitialize() wait; see WaitForInFlightTasks
 
 	bool bHasRecomputed = false;
-	VoxelCoords::FVoxelChunkKey LastAnchorChunk{};
+	VoxelCoords::FVoxelChunkKey LastAnchorChunk{}; // level 0 anchor chunk; gates the whole RecomputeDesiredSet call
 	FVector LastAnchorLocation = FVector::ZeroVector;
+
+	// Per-level entry-scan gating (docs/m2-plan.md "Perf budget" row: "Ring
+	// levels ... are ~constant cost by construction"): re-running the O(candidates)
+	// entry scan for every level on every level-0 chunk crossing (every 3.2m
+	// of movement) would waste work for outer levels whose own chunk edge is
+	// much larger -- level L only re-scans once the anchor has crossed into a
+	// new LEVEL-L chunk. The hysteresis/unload pass (cheap: iterates existing
+	// ChunkRecords, no candidate generation) still runs every call.
+	bool bHasRecomputedLevel[VoxelCoords::kNumLevels] = {};
+	VoxelCoords::FVoxelChunkKey LastAnchorChunkPerLevel[VoxelCoords::kNumLevels] = {};
 
 	// Cumulative counters, logged periodically (LogVoxelPerf, every ~5s) --
 	// never per-chunk (docs/m1-plan.md: "log cumulative ... periodically").
@@ -288,10 +431,12 @@ struct FVoxelWorldImpl
 	int64 UnloadedAtLastPerfRefresh = 0;
 	FVoxelPerfSnapshot LastPerfSnapshot;
 
-	// Tracks the previous tick's VoxelDebug::IsChunkStatesEnabled() so the
-	// off-transition can drop every component's MID exactly once (constraint:
-	// zero MID cost once the layer is off again).
+	// Tracks the previous tick's VoxelDebug::IsChunkStatesEnabled() /
+	// IsRingsEnabled() so the off-transition can drop every component's MID
+	// exactly once (constraint: zero MID cost once both layers are off
+	// again).
 	bool bChunkStatesWasEnabled = false;
+	bool bRingsWasEnabled = false;
 
 	void TickStreaming(const FVector& Anchor, AActor& Owner, USceneComponent& Root, UMaterialInterface* Material, float DeltaTime);
 	void WaitForInFlightTasks();
@@ -308,15 +453,19 @@ struct FVoxelWorldImpl
 
 private:
 	void RecomputeDesiredSet(const FVector& Anchor);
-	void ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32& OutChunkZMin, int32& OutChunkZMax) const;
+	void ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax) const;
 	void SortPendingQueues(const FVector& Anchor);
 	void DispatchJobs();
 	void DrainResults(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material);
 	void DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material);
 	void DrainUnloads();
 	void ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
-	                      const VoxelCoords::FVoxelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec, TArray<FVoxelChunkQuad>&& Quads,
+	                      const VoxelCoords::FVoxelLevelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec, TArray<FVoxelChunkQuad>&& Quads,
 	                      bool bIsGameThreadMesh);
+	// Level 0 only (m2-plan.md "Distant edits" limitation -- see
+	// MarkChunkDirtyForRemesh doc comment): edits, the overlay, and re-mesh
+	// dirtying are all level-0 concepts in wave 1, so these keep taking a
+	// plain (level-implied-0) FVoxelChunkKey.
 	void MarkChunkDirtyForRemesh(const VoxelCoords::FVoxelChunkKey& Key);
 	void CollectDirtyChunks(int64 Vx, int64 Vy, int64 Vz, TSet<VoxelCoords::FVoxelChunkKey>& Out) const;
 	bool ChunkHasEditedBrick(const VoxelCoords::FVoxelChunkKey& ChunkKey) const;
@@ -339,6 +488,9 @@ private:
 	// --- Debug-tooling helpers (docs/debug-tooling-plan.md P1) ----------------
 	void UpdatePerfSnapshot(float DeltaTime, float TickMs);
 	void UpdateChunkStateTints();
+	// M2 item 4 (docs/m2-plan.md): tints every loaded chunk by its ring
+	// level instead of chunk state; see VoxelDebug::IsRingsEnabled.
+	void UpdateRingTints();
 	void DrawDebugBoundsLayer(UWorld& World, const FVector& Anchor) const;
 };
 
@@ -397,18 +549,28 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		UpdatePerfSnapshot(DeltaTime, TickMs);
 	}
 
-	// Visualizations (mode 2 only; both helpers early-out on their own cvar
-	// check so this call is a single cheap branch when debug is off).
-	if (VoxelDebug::IsChunkStatesEnabled())
+	// Visualizations (mode 2 only; every helper early-outs on its own cvar
+	// check so this call is a single cheap branch when debug is off). M2
+	// item 4: voxel.Debug.Rings tints by mip level instead of chunk state --
+	// the two layers share one MID per component (UVoxelChunkComponent::
+	// SetDebugTint has no concept of "which layer"), so Rings takes priority
+	// when both happen to be enabled at once rather than fighting over the
+	// tint every tick.
+	const bool bRingsNow = VoxelDebug::IsRingsEnabled();
+	const bool bChunkStatesNow = VoxelDebug::IsChunkStatesEnabled();
+	if (bRingsNow)
+	{
+		UpdateRingTints();
+	}
+	else if (bChunkStatesNow)
 	{
 		UpdateChunkStateTints();
-		bChunkStatesWasEnabled = true;
 	}
-	else if (bChunkStatesWasEnabled)
+	if (!bRingsNow && !bChunkStatesNow && (bRingsWasEnabled || bChunkStatesWasEnabled))
 	{
-		// Off-transition: drop every MID once (constraint: zero MID cost with
-		// the layer off) rather than paying for one until the chunk happens to
-		// re-mesh naturally.
+		// Off-transition (both layers now off): drop every MID once
+		// (constraint: zero MID cost with the layer off) rather than paying
+		// for one until the chunk happens to re-mesh naturally.
 		for (auto& Pair : ChunkRecords)
 		{
 			if (UVoxelChunkComponent* Comp = Pair.Value.Component.Get())
@@ -416,8 +578,9 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 				Comp->ClearDebugTint();
 			}
 		}
-		bChunkStatesWasEnabled = false;
 	}
+	bRingsWasEnabled = bRingsNow;
+	bChunkStatesWasEnabled = bChunkStatesNow;
 
 	if (UWorld* World = Owner.GetWorld())
 	{
@@ -454,11 +617,37 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       TEXT("pendingGameThread=%d pendingUnload=%d"),
 	       (long long)TotalChunksLoaded, (long long)TotalChunksUnloaded, (long long)TotalQuadsLoaded, ChunkRecords.Num(),
 	       JobsInFlightCounter.GetValue(), PendingJobKeys.Num(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num());
+
+	// M2 item 1: "Per-level loaded/pending counters into the perf snapshot/
+	// HUD" -- also into this periodic log line, so a headless run's log file
+	// alone (no HUD to screenshot) is enough to verify every ring level is
+	// actually loading chunks.
+	int32 LevelLoaded[VoxelCoords::kNumLevels] = {};
+	int32 LevelPending[VoxelCoords::kNumLevels] = {};
+	for (const auto& Pair : ChunkRecords)
+	{
+		if (Pair.Value.Component.IsValid())
+		{
+			++LevelLoaded[FMath::Clamp(Pair.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
+		}
+	}
+	for (const VoxelCoords::FVoxelLevelChunkKey& K : PendingJobKeys)
+	{
+		++LevelPending[FMath::Clamp(K.Level, 0, VoxelCoords::kNumLevels - 1)];
+	}
+	for (const VoxelCoords::FVoxelLevelChunkKey& K : PendingGameThreadKeys)
+	{
+		++LevelPending[FMath::Clamp(K.Level, 0, VoxelCoords::kNumLevels - 1)];
+	}
+	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel rings: R0 loaded=%d pending=%d | R1 loaded=%d pending=%d | R2 loaded=%d pending=%d | ")
+	                          TEXT("R3 loaded=%d pending=%d | R4 loaded=%d pending=%d"),
+	       LevelLoaded[0], LevelPending[0], LevelLoaded[1], LevelPending[1], LevelLoaded[2], LevelPending[2], LevelLoaded[3],
+	       LevelPending[3], LevelLoaded[4], LevelPending[4]);
 }
 
 // --- desired-set / hysteresis ------------------------------------------------
 
-void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32& OutChunkZMin, int32& OutChunkZMax) const
+void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax) const
 {
 	using namespace VoxelCoords;
 
@@ -469,10 +658,16 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 	// margin around the resulting elevation range as slope safety. Generous
 	// on purpose; the Z-extent algorithm isn't pinned by the decisions table
 	// (only the XY radius test is), and this keeps recompute cost bounded.
-	const int64 Vx0 = int64(ChunkX) * ChunkEdgeVoxels;
-	const int64 Vx1 = Vx0 + ChunkEdgeVoxels - 1;
-	const int64 Vy0 = int64(ChunkY) * ChunkEdgeVoxels;
-	const int64 Vy1 = Vy0 + ChunkEdgeVoxels - 1;
+	//
+	// M2: the amplifier always operates in LEVEL-0 (10cm) voxel units, so a
+	// level-L footprint's corners are converted up to level-0 voxel units
+	// before querying it, and the resulting level-0 top-voxel range is
+	// converted back down to level-L chunk units afterward.
+	const int64 LevelScale = int64(1) << Level;
+	const int64 Vx0 = (int64(ChunkX) * ChunkEdgeVoxels) * LevelScale;
+	const int64 Vx1 = Vx0 + ChunkEdgeVoxels * LevelScale - 1;
+	const int64 Vy0 = (int64(ChunkY) * ChunkEdgeVoxels) * LevelScale;
+	const int64 Vy1 = Vy0 + ChunkEdgeVoxels * LevelScale - 1;
 
 	int64 TopVoxelMin = INT64_MAX, TopVoxelMax = INT64_MIN;
 	const int64 CornersX[2] = {Vx0, Vx1};
@@ -491,11 +686,14 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 	// Corner-only sampling under-estimates interior extremes; the amplifier's
 	// slope-scaled detail can add metres between corners. Missing chunks
 	// BELOW the range are invisible (buried), so -1 suffices; missing chunks
-	// ABOVE the range are holes in peaks, so take +2 (=6.4m) headroom. The
-	// exact fix (workers compute their own z-range per footprint) is a stage
-	// 3 refactor.
-	OutChunkZMin = (int32)FloorDiv(TopVoxelMin, ChunkEdgeVoxels) - 1;
-	OutChunkZMax = (int32)FloorDiv(TopVoxelMax, ChunkEdgeVoxels) + 2;
+	// ABOVE the range are holes in peaks, so take +2 headroom (in level-L
+	// chunks -- generous by construction, since a level-L chunk is (1<<L)
+	// times taller than a level-0 one). The exact fix (workers compute their
+	// own z-range per footprint) is a stage 3 refactor.
+	const int64 TopVoxelMinAtLevel = FloorDiv(TopVoxelMin, LevelScale);
+	const int64 TopVoxelMaxAtLevel = FloorDiv(TopVoxelMax, LevelScale);
+	OutChunkZMin = (int32)FloorDiv(TopVoxelMinAtLevel, ChunkEdgeVoxels) - 1;
+	OutChunkZMax = (int32)FloorDiv(TopVoxelMaxAtLevel, ChunkEdgeVoxels) + 2;
 }
 
 bool FVoxelWorldImpl::ChunkHasEditedBrick(const VoxelCoords::FVoxelChunkKey& ChunkKey) const
@@ -563,17 +761,42 @@ bool FVoxelWorldImpl::ChunkOwnsEditedBrick(const VoxelCoords::FVoxelChunkKey& Ch
 
 void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
 {
-	const auto DistSq = [&Anchor](const VoxelCoords::FVoxelChunkKey& Key)
+	const auto DistSq = [&Anchor](const VoxelCoords::FVoxelLevelChunkKey& LevelKey)
 	{
-		const double CenterX = (double(Key.X) + 0.5) * VoxelCoords::ChunkEdgeUU;
-		const double CenterY = (double(Key.Y) + 0.5) * VoxelCoords::ChunkEdgeUU;
-		const double CenterZ = (double(Key.Z) + 0.5) * VoxelCoords::ChunkEdgeUU;
+		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(LevelKey.Level);
+		const double CenterX = (double(LevelKey.Key.X) + 0.5) * ChunkEdge;
+		const double CenterY = (double(LevelKey.Key.Y) + 0.5) * ChunkEdge;
+		const double CenterZ = (double(LevelKey.Key.Z) + 0.5) * ChunkEdge;
 		return FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) + FMath::Square(CenterZ - Anchor.Z);
 	};
-	// Descending: nearest ends up at the back, so Pop() (O(1)) always yields
-	// the nearest-first priority order (decisions table: "Nearest-first
-	// priority by distance^2").
-	const auto Farthest = [&](const VoxelCoords::FVoxelChunkKey& A, const VoxelCoords::FVoxelChunkKey& B) { return DistSq(A) > DistSq(B); };
+	// docs/m2-plan.md item 1: "Budgets shared across levels, nearest-first
+	// within level, lower level (finer) wins priority at equal distance."
+	// Distance is the PRIMARY key -- "nearest-first" is the dominant clause,
+	// and "lower level wins ... at equal distance" is explicitly a tie-break
+	// ("at equal distance"), not an override. Level-as-primary-key was tried
+	// first and measured wrong: it dispatches every level-0 job before a
+	// single level-1 job, every level-1 before level-2, etc., so outer rings
+	// never get a turn until the (much larger, in absolute chunk count)
+	// inner rings fully drain -- R3/R4 stayed at 0 loaded chunks through a
+	// 90s verification run despite thousands queued. Distance-primary lets
+	// every ring populate outward from the camera roughly together, which is
+	// both the visually-correct LOD behavior and the literal reading of the
+	// decisions-table wording. Sort() wants a "less than" predicate
+	// producing ascending order, and Pop() removes from the back, so the
+	// LOWEST-priority element must sort first (front) and the
+	// HIGHEST-priority element (nearest, level 0 on an exact tie) must sort
+	// last (back) -- this predicate returns true when A has lower priority
+	// than B.
+	const auto Farthest = [&](const VoxelCoords::FVoxelLevelChunkKey& A, const VoxelCoords::FVoxelLevelChunkKey& B)
+	{
+		const double DistA = DistSq(A);
+		const double DistB = DistSq(B);
+		if (DistA != DistB)
+		{
+			return DistA > DistB; // farther = lower priority = sorts toward the front
+		}
+		return A.Level > B.Level; // exact-distance tie: higher level number = lower priority
+	};
 	PendingJobKeys.Sort(Farthest);
 	PendingGameThreadKeys.Sort(Farthest);
 }
@@ -582,71 +805,102 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 {
 	using namespace VoxelCoords;
 
-	const double LoadRadiusUU = UVoxelWorldSubsystem::LoadRadiusMeters * 100.0;   // m -> UU (1m = 100UU)
-	const double UnloadRadiusUU = UVoxelWorldSubsystem::UnloadRadiusMeters * 100.0;
-	const double LoadRadiusSq = LoadRadiusUU * LoadRadiusUU;
-	const double UnloadRadiusSq = UnloadRadiusUU * UnloadRadiusUU;
-
-	// 1. Hysteresis exit: currently-tracked chunks that drifted beyond the
-	// unload ring (80m) get queued for unload. Chunks that merely left the
-	// load ring (64m) but are still inside 80m stay tracked untouched.
+	// 1. Hysteresis exit: currently-tracked chunks (any level) that drifted
+	// beyond their level's unload ring, OR drifted inside their level's inner
+	// edge (the next finer level has taken over -- no hysteresis on this
+	// side in wave 1, see the doc comment on RingPresets in
+	// VoxelWorldSubsystem.h: "hard boundary" per m2-plan.md's v0 decision),
+	// get queued for unload. Chunks that merely left the load ring but are
+	// still inside the unload ring stay tracked untouched -- this is the
+	// same hysteresis gap the original single-ring code had, now evaluated
+	// per level.
 	for (const auto& Pair : ChunkRecords)
 	{
-		const FVoxelChunkKey& Key = Pair.Key;
-		if (PendingUnloadSet.Contains(Key))
+		const FVoxelLevelChunkKey& LevelKey = Pair.Key;
+		if (PendingUnloadSet.Contains(LevelKey))
 		{
 			continue;
 		}
-		const double CenterX = (double(Key.X) + 0.5) * ChunkEdgeUU;
-		const double CenterY = (double(Key.Y) + 0.5) * ChunkEdgeUU;
+		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[LevelKey.Level];
+		const double ChunkEdge = ChunkEdgeUUForLevel(LevelKey.Level);
+		const double CenterX = (double(LevelKey.Key.X) + 0.5) * ChunkEdge;
+		const double CenterY = (double(LevelKey.Key.Y) + 0.5) * ChunkEdge;
 		const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
-		if (DistSq > UnloadRadiusSq)
+		const double UnloadOuterUU = Preset.OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier;
+		const double InnerUU = Preset.InnerMeters * 100.0;
+		const bool bBeyondOuter = DistSq > FMath::Square(UnloadOuterUU);
+		const bool bInsideInner = LevelKey.Level > 0 && DistSq < FMath::Square(InnerUU);
+		if (bBeyondOuter || bInsideInner)
 		{
-			PendingUnloadKeys.Add(Key);
-			PendingUnloadSet.Add(Key);
-			PendingJobKeys.RemoveSingle(Key);
-			PendingGameThreadKeys.RemoveSingle(Key);
+			PendingUnloadKeys.Add(LevelKey);
+			PendingUnloadSet.Add(LevelKey);
+			PendingJobKeys.RemoveSingle(LevelKey);
+			PendingGameThreadKeys.RemoveSingle(LevelKey);
 		}
 	}
 
-	// 2. Hysteresis entry: XY footprints within the load ring (64m) that
-	// aren't already tracked become newly tracked chunks, routed to the
-	// worker queue or the game-thread queue depending on whether they
-	// already contain an edited brick.
-	const int32 ChunkSpan = FMath::CeilToInt32(LoadRadiusUU / ChunkEdgeUU) + 1;
-	const FVoxelChunkKey AnchorChunk = ChunkKeyForVoxel(WorldToVoxel(Anchor));
-
-	for (int32 Cy = AnchorChunk.Y - ChunkSpan; Cy <= AnchorChunk.Y + ChunkSpan; ++Cy)
+	// 2. Hysteresis entry, per level: XY footprints within level L's annulus
+	// [Inner(L), Outer(L)) that aren't already tracked become newly tracked
+	// chunks. Level 0 routes to the worker queue or the game-thread queue
+	// depending on whether it already contains an edited brick (unchanged
+	// M1 behavior); levels >=1 always take the worker/MipChain path (m2-plan.md
+	// "Distant edits" wave-1 limitation: higher levels render pure-generated
+	// even where level-0 edits exist underneath them -- see MakeLevelSampler).
+	//
+	// Gated per level (bHasRecomputedLevel/LastAnchorChunkPerLevel): a level-L
+	// chunk is (1<<L) times larger, so re-running this O(candidates) scan on
+	// every level-0 chunk crossing (every 3.2m) would be wasted work for
+	// outer levels once their own chunk hasn't actually changed.
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
-		for (int32 Cx = AnchorChunk.X - ChunkSpan; Cx <= AnchorChunk.X + ChunkSpan; ++Cx)
+		const FVoxelCoord AnchorVoxel = WorldToVoxelForLevel(Anchor, Level);
+		const FVoxelChunkKey AnchorChunk = ChunkKeyForVoxel(AnchorVoxel);
+		if (bHasRecomputedLevel[Level] && AnchorChunk.X == LastAnchorChunkPerLevel[Level].X &&
+		    AnchorChunk.Y == LastAnchorChunkPerLevel[Level].Y)
 		{
-			const double CenterX = (double(Cx) + 0.5) * ChunkEdgeUU;
-			const double CenterY = (double(Cy) + 0.5) * ChunkEdgeUU;
-			const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
-			if (DistSq > LoadRadiusSq)
-			{
-				continue;
-			}
+			continue; // nothing new can have entered this level's annulus
+		}
+		LastAnchorChunkPerLevel[Level] = AnchorChunk;
+		bHasRecomputedLevel[Level] = true;
 
-			int32 ChunkZMin, ChunkZMax;
-			ComputeFootprintChunkZRange(Cx, Cy, ChunkZMin, ChunkZMax);
+		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[Level];
+		const double InnerUU = Preset.InnerMeters * 100.0;
+		const double OuterUU = Preset.OuterMeters * 100.0;
+		const double ChunkEdge = ChunkEdgeUUForLevel(Level);
+		const int32 ChunkSpan = FMath::CeilToInt32(OuterUU / ChunkEdge) + 1;
 
-			for (int32 Cz = ChunkZMin; Cz <= ChunkZMax; ++Cz)
+		for (int32 Cy = AnchorChunk.Y - ChunkSpan; Cy <= AnchorChunk.Y + ChunkSpan; ++Cy)
+		{
+			for (int32 Cx = AnchorChunk.X - ChunkSpan; Cx <= AnchorChunk.X + ChunkSpan; ++Cx)
 			{
-				const FVoxelChunkKey Key{Cx, Cy, Cz};
-				if (ChunkRecords.Contains(Key))
+				const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
+				const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
+				const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
+				if (DistSq >= FMath::Square(OuterUU) || (Level > 0 && DistSq < FMath::Square(InnerUU)))
 				{
-					continue;
+					continue; // outside this level's annulus
 				}
 
-				ChunkRecords.Add(Key);
-				if (ChunkHasEditedBrick(Key))
+				int32 ChunkZMin, ChunkZMax;
+				ComputeFootprintChunkZRange(Cx, Cy, Level, ChunkZMin, ChunkZMax);
+
+				for (int32 Cz = ChunkZMin; Cz <= ChunkZMax; ++Cz)
 				{
-					PendingGameThreadKeys.Add(Key);
-				}
-				else
-				{
-					PendingJobKeys.Add(Key);
+					const FVoxelLevelChunkKey LevelKey{Level, FVoxelChunkKey{Cx, Cy, Cz}};
+					if (ChunkRecords.Contains(LevelKey))
+					{
+						continue;
+					}
+
+					ChunkRecords.Add(LevelKey);
+					if (Level == 0 && ChunkHasEditedBrick(LevelKey.Key))
+					{
+						PendingGameThreadKeys.Add(LevelKey);
+					}
+					else
+					{
+						PendingJobKeys.Add(LevelKey);
+					}
 				}
 			}
 		}
@@ -665,19 +919,21 @@ void FVoxelWorldImpl::DispatchJobs()
 
 	while (JobsInFlightCounter.GetValue() < MaxJobsInFlight && PendingJobKeys.Num() > 0)
 	{
-		const VoxelCoords::FVoxelChunkKey Key = PendingJobKeys.Pop(EAllowShrinking::No); // nearest (see SortPendingQueues)
+		const VoxelCoords::FVoxelLevelChunkKey LevelKey = PendingJobKeys.Pop(EAllowShrinking::No); // highest priority (see SortPendingQueues)
 
-		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Key);
+		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(LevelKey);
 		if (!Rec)
 		{
 			continue; // left the desired set between recompute and dispatch
 		}
 
-		// Defensive re-check: an edit landing in this same tick, between
-		// recompute and dispatch, may have made this chunk edited-only.
-		if (ChunkHasEditedBrick(Key))
+		// Defensive re-check (level 0 only -- see MakeLevelSampler doc
+		// comment on the wave-1 "higher levels never take the overlay path"
+		// limitation): an edit landing in this same tick, between recompute
+		// and dispatch, may have made this chunk edited-only.
+		if (LevelKey.Level == 0 && ChunkHasEditedBrick(LevelKey.Key))
 		{
-			PendingGameThreadKeys.Add(Key);
+			PendingGameThreadKeys.Add(LevelKey);
 			continue;
 		}
 
@@ -698,51 +954,76 @@ void FVoxelWorldImpl::DispatchJobs()
 
 		UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
 			TEXT("VoxelChunkMeshJob"),
-			[GenPtr, Key, GenId, QueuePtr, CounterPtr, PerfCountersPtr]()
+			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, PerfCountersPtr]()
 			{
 				SCOPE_CYCLE_COUNTER(STAT_VoxelWorkerJob);
 				const double JobStartSeconds = FPlatformTime::Seconds();
 
 				VoxelStreaming::FJobResult Result;
-				Result.Key = Key;
+				Result.Key = LevelKey;
 				Result.GenerationId = GenId;
 
-				// Column-cache the whole job (docs/m1-plan.md stage 3a): a
-				// naive GeneratedWorld::materialAt sampler recomputes the
-				// full amplifier column per VOXEL query (~130k column
-				// evaluations per chunk); this grid computes each of the
-				// (32+2)^2 columns exactly once (~100x less amplifier work,
-				// measured ~5 -> ~50+ chunks/s). The +1 apron matches the
-				// mesher's [-1,B] sampler contract across chunk borders.
-				constexpr int32 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
-				constexpr int32 GridEdge = ChunkVox + 2;
-				const int64 BaseVX = int64(Key.X) * ChunkVox;
-				const int64 BaseVY = int64(Key.Y) * ChunkVox;
-				TArray<vxc::ColumnSample> Columns;
-				Columns.SetNumUninitialized(GridEdge * GridEdge);
-				const vxc::Amplifier& Amp = GenPtr->amplifier();
-				for (int32 LY = 0; LY < GridEdge; ++LY)
+				const VoxelCoords::FVoxelChunkKey& Key = LevelKey.Key;
+				if (LevelKey.Level == 0)
 				{
-					for (int32 LX = 0; LX < GridEdge; ++LX)
+					// Column-cache the whole job (docs/m1-plan.md stage 3a): a
+					// naive GeneratedWorld::materialAt sampler recomputes the
+					// full amplifier column per VOXEL query (~130k column
+					// evaluations per chunk); this grid computes each of the
+					// (32+2)^2 columns exactly once (~100x less amplifier work,
+					// measured ~5 -> ~50+ chunks/s). The +1 apron matches the
+					// mesher's [-1,B] sampler contract across chunk borders.
+					// Level 0 keeps this exact, already-tuned fast path
+					// unchanged rather than routing it through MipChain too
+					// (a level-0 MipChain::brick(0,key) is just source_(key)
+					// directly, so it would be equivalent but strictly slower
+					// -- an extra Brick<8> materialization + get() indirection
+					// per voxel instead of Amplifier::materialAt directly).
+					constexpr int32 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
+					constexpr int32 GridEdge = ChunkVox + 2;
+					const int64 BaseVX = int64(Key.X) * ChunkVox;
+					const int64 BaseVY = int64(Key.Y) * ChunkVox;
+					TArray<vxc::ColumnSample> Columns;
+					Columns.SetNumUninitialized(GridEdge * GridEdge);
+					const vxc::Amplifier& Amp = GenPtr->amplifier();
+					for (int32 LY = 0; LY < GridEdge; ++LY)
 					{
-						Columns[LX + GridEdge * LY] =
-							Amp.column(BaseVX + LX - 1, BaseVY + LY - 1);
+						for (int32 LX = 0; LX < GridEdge; ++LX)
+						{
+							Columns[LX + GridEdge * LY] =
+								Amp.column(BaseVX + LX - 1, BaseVY + LY - 1);
+						}
 					}
+					const auto GridSampler = [&Columns, BaseVX, BaseVY](int64 X, int64 Y, int64 Z)
+					{
+						const int32 LX = int32(X - BaseVX) + 1;
+						const int32 LY = int32(Y - BaseVY) + 1;
+						checkSlow(LX >= 0 && LX < GridEdge && LY >= 0 && LY < GridEdge);
+						return vxc::Amplifier::materialAt(Columns[LX + GridEdge * LY], Z);
+					};
+					// docs/debug-tooling-plan.md P1 "vxc::Counters": columnEvals
+					// counts the explicit Amp.column() calls this cache-build loop
+					// makes -- the ~100x-cheaper number the doc comment above
+					// references, NOT a count of voxel-core-internal column work
+					// (that stays uninstrumented this pass, per P1 scope).
+					PerfCountersPtr->incColumnEvals(uint64_t(GridEdge) * GridEdge);
+					MeshChunkBricks(Key, GridSampler, Result.Quads, PerfCountersPtr);
 				}
-				const auto GridSampler = [&Columns, BaseVX, BaseVY](int64 X, int64 Y, int64 Z)
+				else
 				{
-					const int32 LX = int32(X - BaseVX) + 1;
-					const int32 LY = int32(Y - BaseVY) + 1;
-					checkSlow(LX >= 0 && LX < GridEdge && LY >= 0 && LY < GridEdge);
-					return vxc::Amplifier::materialAt(Columns[LX + GridEdge * LY], Z);
-				};
-				// docs/debug-tooling-plan.md P1 "vxc::Counters": columnEvals
-				// counts the explicit Amp.column() calls this cache-build loop
-				// makes -- the ~100x-cheaper number the doc comment above
-				// references, NOT a count of voxel-core-internal column work
-				// (that stays uninstrumented this pass, per P1 scope).
-				PerfCountersPtr->incColumnEvals(uint64_t(GridEdge) * GridEdge);
-				MeshChunkBricks(Key, GridSampler, Result.Quads, PerfCountersPtr);
+					// M2 mip sourcing (docs/m2-plan.md "Mip sourcing" row):
+					// level-L (L>=1) bricks come from a per-job vxc::MipChain<8>
+					// over a pure-GeneratedWorld level-0 source -- see
+					// MakeLevelSampler's doc comment for the column-grid LRU
+					// that avoids the naive-recompute perf trap. Still lock-free
+					// (GenPtr only, never World/the overlay); wave-1 limitation:
+					// this NEVER checks for edited bricks, so higher levels
+					// render pure-generated even where level-0 edits exist
+					// underneath them (distant-edit mip propagation is a later
+					// M2 item, docs/m2-plan.md "Distant edits" row).
+					const auto LevelSampler = MakeLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr);
+					MeshChunkBricks(Key, LevelSampler, Result.Quads, PerfCountersPtr);
+				}
 
 				Result.JobMs = float((FPlatformTime::Seconds() - JobStartSeconds) * 1000.0);
 				QueuePtr->Enqueue(MoveTemp(Result));
@@ -754,7 +1035,7 @@ void FVoxelWorldImpl::DispatchJobs()
 }
 
 void FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
-                                       const VoxelCoords::FVoxelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec,
+                                       const VoxelCoords::FVoxelLevelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec,
                                        TArray<FVoxelChunkQuad>&& Quads, bool bIsGameThreadMesh)
 {
 	// docs/debug-tooling-plan.md P1 "Memory" row: ResidentQuads tracks
@@ -783,7 +1064,8 @@ void FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	{
 		Comp = NewObject<UVoxelChunkComponent>(&Owner);
 		Comp->SetupAttachment(&Root);
-		Comp->SetRelativeLocation(VoxelCoords::ChunkOriginWorld(Key));
+		Comp->SetLevel(Key.Level); // M2: fixed for the component's lifetime, see SetLevel doc comment
+		Comp->SetRelativeLocation(VoxelCoords::ChunkOriginWorldForLevel(Key.Key, Key.Level));
 		Comp->SetMaterial(0, Material);
 		Comp->RegisterComponent();
 		Rec.Component = Comp;
@@ -807,7 +1089,10 @@ void FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	{
 		Rec.RemeshedAtSeconds = ElapsedSeconds;
 	}
-	Rec.bHasOverlayBricks = ChunkOwnsEditedBrick(Key);
+	// Overlay ownership is a level-0-only concept (m2-plan.md wave-1
+	// limitation): higher levels never own edited bricks in their own
+	// right (MakeLevelSampler never consults the overlay).
+	Rec.bHasOverlayBricks = (Key.Level == 0) && ChunkOwnsEditedBrick(Key.Key);
 }
 
 void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material)
@@ -858,9 +1143,13 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 	int32 Count = 0;
 	while (Count < MaxRemeshes && PendingGameThreadKeys.Num() > 0)
 	{
-		const VoxelCoords::FVoxelChunkKey Key = PendingGameThreadKeys.Pop(EAllowShrinking::No); // nearest
+		// Level 0 only in wave 1 (docs/m2-plan.md "Distant edits" limitation
+		// -- see MarkChunkDirtyForRemesh): nothing ever pushes a level>=1 key
+		// onto this queue.
+		const VoxelCoords::FVoxelLevelChunkKey LevelKey = PendingGameThreadKeys.Pop(EAllowShrinking::No); // nearest
+		checkSlow(LevelKey.Level == 0);
 
-		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Key);
+		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(LevelKey);
 		if (!Rec)
 		{
 			continue; // left the desired set; doesn't consume the budget
@@ -870,8 +1159,8 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 		SCOPE_CYCLE_COUNTER(STAT_VoxelGameThreadMesh);
 		TArray<FVoxelChunkQuad> Quads;
 		MeshChunkBricks(
-			Key, [this](int64 X, int64 Y, int64 Z) { return Voxels.materialAt(X, Y, Z); }, Quads, &PerfCounters);
-		ApplyMeshResult(Owner, Root, Material, Key, *Rec, MoveTemp(Quads), /*bIsGameThreadMesh*/ true);
+			LevelKey.Key, [this](int64 X, int64 Y, int64 Z) { return Voxels.materialAt(X, Y, Z); }, Quads, &PerfCounters);
+		ApplyMeshResult(Owner, Root, Material, LevelKey, *Rec, MoveTemp(Quads), /*bIsGameThreadMesh*/ true);
 	}
 	LastRemeshFrac = float(Count) / float(MaxRemeshes);
 }
@@ -883,7 +1172,7 @@ void FVoxelWorldImpl::DrainUnloads()
 	int32 Count = 0;
 	while (Count < MaxUnloads && PendingUnloadKeys.Num() > 0)
 	{
-		const VoxelCoords::FVoxelChunkKey Key = PendingUnloadKeys.Pop(EAllowShrinking::No);
+		const VoxelCoords::FVoxelLevelChunkKey Key = PendingUnloadKeys.Pop(EAllowShrinking::No);
 		PendingUnloadSet.Remove(Key);
 		++Count;
 
@@ -963,7 +1252,14 @@ void FVoxelWorldImpl::CollectDirtyChunks(int64 Vx, int64 Vy, int64 Vz, TSet<Voxe
 
 void FVoxelWorldImpl::MarkChunkDirtyForRemesh(const VoxelCoords::FVoxelChunkKey& Key)
 {
-	VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Key);
+	// Level 0 only (docs/m2-plan.md "Distant edits" row, wave-1 limitation):
+	// edits, the overlay, and re-mesh dirtying only ever touch the level-0
+	// (true-voxel) ring in this wave. Higher levels render pure-generated
+	// even where a level-0 edit exists underneath them -- propagating an
+	// edit up the mip chain to invalidate/re-mesh overlapping level 1-4
+	// chunks is a later M2 item (see MakeLevelSampler's doc comment).
+	const VoxelCoords::FVoxelLevelChunkKey LevelKey{0, Key};
+	VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(LevelKey);
 	if (!Rec)
 	{
 		// Not currently streamed/tracked: nothing to re-mesh right now. On a
@@ -974,8 +1270,8 @@ void FVoxelWorldImpl::MarkChunkDirtyForRemesh(const VoxelCoords::FVoxelChunkKey&
 	}
 	++Rec->GenerationId; // invalidates any in-flight/queued worker result for this chunk
 	Rec->bJobInFlight = false;
-	PendingJobKeys.RemoveSingle(Key); // a dirtied chunk is never worker-dispatched
-	PendingGameThreadKeys.AddUnique(Key);
+	PendingJobKeys.RemoveSingle(LevelKey); // a dirtied chunk is never worker-dispatched
+	PendingGameThreadKeys.AddUnique(LevelKey);
 }
 
 void FVoxelWorldImpl::ApplyGroupedEdits(std::unordered_map<vxc::BrickKey, std::vector<vxc::EditCell>, vxc::BrickKeyHash>& EditsByBrick,
@@ -1065,12 +1361,36 @@ void FVoxelWorldImpl::UpdatePerfSnapshot(float DeltaTime, float TickMs)
 	}
 
 	int32 ResidentComponents = 0;
+	// M2 item 1: "Per-level loaded/pending counters into the perf
+	// snapshot/HUD." Loaded = has a live component right now; pending =
+	// queued across all three pending arrays (job dispatch, game-thread
+	// mesh, unload) for that level.
+	int32 LevelLoaded[VoxelCoords::kNumLevels] = {};
+	int32 LevelPending[VoxelCoords::kNumLevels] = {};
 	for (const auto& Pair : ChunkRecords)
 	{
 		if (Pair.Value.Component.IsValid())
 		{
 			++ResidentComponents;
+			++LevelLoaded[FMath::Clamp(Pair.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
 		}
+	}
+	for (const VoxelCoords::FVoxelLevelChunkKey& K : PendingJobKeys)
+	{
+		++LevelPending[FMath::Clamp(K.Level, 0, VoxelCoords::kNumLevels - 1)];
+	}
+	for (const VoxelCoords::FVoxelLevelChunkKey& K : PendingGameThreadKeys)
+	{
+		++LevelPending[FMath::Clamp(K.Level, 0, VoxelCoords::kNumLevels - 1)];
+	}
+	for (const VoxelCoords::FVoxelLevelChunkKey& K : PendingUnloadKeys)
+	{
+		++LevelPending[FMath::Clamp(K.Level, 0, VoxelCoords::kNumLevels - 1)];
+	}
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+	{
+		LastPerfSnapshot.LevelLoadedCount[Level] = LevelLoaded[Level];
+		LastPerfSnapshot.LevelPendingCount[Level] = LevelPending[Level];
 	}
 	LastPerfSnapshot.ResidentComponents = ResidentComponents;
 	LastPerfSnapshot.ResidentQuads = ResidentQuads;
@@ -1127,6 +1447,21 @@ void FVoxelWorldImpl::UpdateChunkStateTints()
 	}
 }
 
+void FVoxelWorldImpl::UpdateRingTints()
+{
+	// docs/m2-plan.md first implementation wave item 4: "when voxel.Debug
+	// >= 2 and voxel.Debug.Rings is set, tint components by level." Simple
+	// and unconditional -- unlike UpdateChunkStateTints there is no flash/
+	// decay here, just a flat per-level color.
+	for (auto& Pair : ChunkRecords)
+	{
+		if (UVoxelChunkComponent* Comp = Pair.Value.Component.Get())
+		{
+			Comp->SetDebugTint(VoxelDebug::RingLevelTint(Pair.Key.Level));
+		}
+	}
+}
+
 void FVoxelWorldImpl::DrawDebugBoundsLayer(UWorld& World, const FVector& Anchor) const
 {
 	if (!VoxelDebug::IsBoundsEnabled())
@@ -1139,24 +1474,26 @@ void FVoxelWorldImpl::DrawDebugBoundsLayer(UWorld& World, const FVector& Anchor)
 	// radii; the full sort below only runs while this layer is switched on.
 	struct FEntry
 	{
-		VoxelCoords::FVoxelChunkKey Key;
+		VoxelCoords::FVoxelLevelChunkKey Key;
 		double DistSq;
 	};
 	TArray<FEntry> Entries;
 	Entries.Reserve(ChunkRecords.Num());
 	for (const auto& Pair : ChunkRecords)
 	{
-		const FVector Center = VoxelCoords::ChunkOriginWorld(Pair.Key) + FVector(VoxelCoords::ChunkEdgeUU * 0.5);
+		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Pair.Key.Level);
+		const FVector Center = VoxelCoords::ChunkOriginWorldForLevel(Pair.Key.Key, Pair.Key.Level) + FVector(ChunkEdge * 0.5);
 		Entries.Add(FEntry{Pair.Key, FVector::DistSquared(Center, Anchor)});
 	}
 	Entries.Sort([](const FEntry& A, const FEntry& B) { return A.DistSq < B.DistSq; });
 
 	constexpr int32 MaxBoxes = 200;
 	const int32 Count = FMath::Min(MaxBoxes, Entries.Num());
-	const float Extent = float(VoxelCoords::ChunkEdgeUU) * 0.5f;
 	for (int32 Index = 0; Index < Count; ++Index)
 	{
-		const FVector Center = VoxelCoords::ChunkOriginWorld(Entries[Index].Key) + FVector(Extent);
+		const VoxelCoords::FVoxelLevelChunkKey& LevelKey = Entries[Index].Key;
+		const float Extent = float(VoxelCoords::ChunkEdgeUUForLevel(LevelKey.Level)) * 0.5f;
+		const FVector Center = VoxelCoords::ChunkOriginWorldForLevel(LevelKey.Key, LevelKey.Level) + FVector(Extent);
 		DrawDebugBox(&World, Center, FVector(Extent), FColor::Cyan, /*bPersistentLines*/ false, /*LifeTime*/ -1.f,
 		             /*DepthPriority*/ 0, /*Thickness*/ 1.5f);
 	}

@@ -12,6 +12,7 @@
 #include "Misc/Parse.h"
 #include "TimerManager.h"
 #include "UnrealClient.h"
+#include "VoxelDebug.h"
 #include "VoxelEarth.h"
 #include "VoxelEarthFlyPawn.h"
 #include "VoxelEarthHUD.h"
@@ -65,6 +66,17 @@ void AVoxelEarthGameMode::BeginPlay()
 		// SS4): same "no authored map, spawn from code" reasoning as the
 		// light rig above -- the ocean actor is editor-independent.
 		World->SpawnActor<AVoxelOceanActor>();
+	}
+
+	// M2 ring debug verification (docs/m2-plan.md first implementation wave
+	// item 4/5): -VoxelDebugRings forces voxel.Debug=2 + voxel.Debug.Rings=1
+	// from the command line -- simplest way to get a headless -game run
+	// showing ring tints without needing -ExecCmds plumbing for two cvars.
+	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelDebugRings")))
+	{
+		VoxelDebug::SetDebugMode(2);
+		VoxelDebug::SetRingsEnabled(true);
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelDebugRings: forcing voxel.Debug=2, voxel.Debug.Rings=1"));
 	}
 
 	// Unattended visual verification: -VoxelScreenshotAfter=<seconds> waits
