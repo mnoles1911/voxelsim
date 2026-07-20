@@ -35,6 +35,16 @@ public:
 	// (VoxelCoords::ChunkEdgeVoxels in stage 1), used for local bounds.
 	void SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, int32 InChunkEdgeVoxels);
 
+	// M2 mip rings (docs/m2-plan.md decisions table): "one component type
+	// serves all levels ... position scale = VoxelSizeUU << level". Set once
+	// by UVoxelWorldSubsystem right after NewObject, before RegisterComponent
+	// -- never changes for the lifetime of this component (a chunk's level
+	// never changes; it is destroyed and a new one spawned instead). Quad
+	// coordinates in ChunkQuads stay in level-relative voxel units (0..31);
+	// only world placement (this scale) differs by level.
+	void SetLevel(int32 InLevel) { ChunkLevel = InLevel; }
+	int32 GetLevel() const { return ChunkLevel; }
+
 	//~ Begin UPrimitiveComponent Interface
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
@@ -72,6 +82,7 @@ public:
 private:
 	TArray<FVoxelChunkQuad> ChunkQuads;
 	int32 ChunkEdgeVoxels = 32;
+	int32 ChunkLevel = 0;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInterface> ChunkMaterial;

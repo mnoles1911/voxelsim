@@ -42,6 +42,13 @@ public:
 	{
 		static const FVector3f AxisDir[3] = {FVector3f(1, 0, 0), FVector3f(0, 1, 0), FVector3f(0, 0, 1)};
 
+		// M2 mip rings (docs/m2-plan.md decisions table): "position scale =
+		// VoxelSizeUU << level" -- ChunkQuads stay in level-relative voxel
+		// units (0..31, baked by MeshChunkBricks); this is the one place that
+		// converts them to world-space UU, so it is the one place the level
+		// scale needs to apply.
+		const float LevelVoxelSizeUU = float(VoxelCoords::VoxelSizeUU) * float(1 << Component->ChunkLevel);
+
 		const int32 NumQuads = Component->ChunkQuads.Num();
 		TArray<FDynamicMeshVertex> Vertices;
 		Vertices.Reserve(NumQuads * 4);
@@ -93,7 +100,7 @@ public:
 				P[Axis] = FaceCoordVox;
 				P[U] = Uc;
 				P[V] = Vc;
-				return P * float(VoxelCoords::VoxelSizeUU);
+				return P * LevelVoxelSizeUU;
 			};
 
 			// Quad loop (u0,v0) -> (u0,v1) -> (u1,v1) -> (u1,v0); corner
@@ -300,7 +307,10 @@ FPrimitiveSceneProxy* UVoxelChunkComponent::CreateSceneProxy()
 
 FBoxSphereBounds UVoxelChunkComponent::CalcBounds(const FTransform& LocalToWorld) const
 {
-	const float Extent = float(ChunkEdgeVoxels) * float(VoxelCoords::VoxelSizeUU);
+	// M2 mip rings: bounds must scale with this chunk's level too (see
+	// SetLevel doc comment) or a coarse-level chunk's true (larger) world
+	// footprint gets culled/frustum-tested against its level-0-sized bounds.
+	const float Extent = float(ChunkEdgeVoxels) * float(VoxelCoords::VoxelSizeUU) * float(1 << ChunkLevel);
 	const FBox LocalBox(FVector::ZeroVector, FVector(Extent, Extent, Extent));
 	return FBoxSphereBounds(LocalBox).TransformBy(LocalToWorld);
 }

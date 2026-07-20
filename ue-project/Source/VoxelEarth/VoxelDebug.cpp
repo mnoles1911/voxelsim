@@ -33,6 +33,12 @@ TAutoConsoleVariable<bool> CVarVoxelDebugBounds(
 	true,
 	TEXT("Chunk AABB bounds wireframe for the nearest ~200 tracked chunks. Live under voxel.Debug 2."),
 	ECVF_Default);
+
+TAutoConsoleVariable<bool> CVarVoxelDebugRings(
+	TEXT("voxel.Debug.Rings"),
+	false,
+	TEXT("Tint loaded chunks by mip ring level (R0 green .. R4 magenta) instead of chunk-state tints. Live under voxel.Debug 2."),
+	ECVF_Default);
 } // namespace
 
 int32 VoxelDebug::GetDebugMode()
@@ -58,4 +64,28 @@ bool VoxelDebug::IsChunkStatesEnabled()
 bool VoxelDebug::IsBoundsEnabled()
 {
 	return GetDebugMode() >= 2 && CVarVoxelDebugBounds.GetValueOnAnyThread();
+}
+
+bool VoxelDebug::IsRingsEnabled()
+{
+	return GetDebugMode() >= 2 && CVarVoxelDebugRings.GetValueOnAnyThread();
+}
+
+void VoxelDebug::SetRingsEnabled(bool bEnabled)
+{
+	CVarVoxelDebugRings->Set(bEnabled, ECVF_SetByCode);
+}
+
+FLinearColor VoxelDebug::RingLevelTint(int32 Level)
+{
+	// m2-plan.md first implementation wave item 4: "R0 green, R1 yellow, R2
+	// orange, R3 red, R4 magenta."
+	static const FLinearColor kTints[VoxelCoords::kNumLevels] = {
+		FLinearColor(0.1f, 0.9f, 0.15f, 1.0f),  // R0 green
+		FLinearColor(0.95f, 0.9f, 0.1f, 1.0f),  // R1 yellow
+		FLinearColor(1.0f, 0.55f, 0.05f, 1.0f), // R2 orange
+		FLinearColor(0.9f, 0.1f, 0.1f, 1.0f),   // R3 red
+		FLinearColor(0.85f, 0.1f, 0.85f, 1.0f), // R4 magenta
+	};
+	return kTints[FMath::Clamp(Level, 0, VoxelCoords::kNumLevels - 1)];
 }

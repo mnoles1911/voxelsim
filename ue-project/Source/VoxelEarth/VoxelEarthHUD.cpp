@@ -3,6 +3,7 @@
 #include "Engine/Canvas.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
+#include "VoxelCoords.h"
 #include "VoxelDebug.h"
 #include "VoxelEarthPlayerController.h"
 #include "VoxelWorldSubsystem.h"
@@ -100,11 +101,21 @@ void AVoxelEarthHUD::DrawPerfHUD()
 		PerfHUDLastRefreshWorldSeconds = NowSeconds;
 		const FVoxelPerfSnapshot Snap = Subsystem->GetPerfSnapshot();
 
+		// M2 item 1: "Per-level loaded/pending counters into the perf
+		// snapshot/HUD (extend the P1 HUD rows minimally)" -- one extra line,
+		// "R<level> loaded/pending" pairs.
+		FString RingsLine = TEXT("Rings:");
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			RingsLine += FString::Printf(TEXT("  R%d %d/%d"), Level, Snap.LevelLoadedCount[Level], Snap.LevelPendingCount[Level]);
+		}
+
 		CachedPerfHUDText = FString::Printf(
 			TEXT("voxel.Debug %d -- F3 to cycle\n")
 			TEXT("Streaming: loaded %lld (%.1f/s)  unloaded %lld (%.1f/s)\n")
 			TEXT("  jobs %d/%d  queues job=%d gt=%d unload=%d\n")
 			TEXT("  budget sat %.0f%%  stale discards %lld\n")
+			TEXT("%s\n")
 			TEXT("Worker ms: p50 %.2f  p95 %.2f  max %.2f\n")
 			TEXT("Memory: components %d  quads %lld  overlay bricks %lld  edit log %lld\n")
 			TEXT("Frame: subsystem tick %.2fms  frame %.2fms\n")
@@ -113,6 +124,7 @@ void AVoxelEarthHUD::DrawPerfHUD()
 			(long long)Snap.TotalChunksLoaded, Snap.ChunksLoadedPerSec, (long long)Snap.TotalChunksUnloaded, Snap.ChunksUnloadedPerSec,
 			Snap.JobsInFlight, Snap.JobsInFlightCap, Snap.PendingJobQueueDepth, Snap.PendingGameThreadQueueDepth, Snap.PendingUnloadQueueDepth,
 			Snap.BudgetSaturationPct, (long long)Snap.StaleResultsDiscarded,
+			*RingsLine,
 			Snap.WorkerMsP50, Snap.WorkerMsP95, Snap.WorkerMsMax,
 			Snap.ResidentComponents, (long long)Snap.ResidentQuads, (long long)Snap.OverlayBrickCount, (long long)Snap.EditLogEntries,
 			Snap.SubsystemTickMs, World->GetDeltaSeconds() * 1000.0,
@@ -122,7 +134,7 @@ void AVoxelEarthHUD::DrawPerfHUD()
 	TArray<FString> Lines;
 	CachedPerfHUDText.ParseIntoArrayLines(Lines, /*bCullEmpty*/ false);
 
-	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.55f), PerfPanelMarginPx, PerfPanelMarginPx, 560.f,
+	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.55f), PerfPanelMarginPx, PerfPanelMarginPx, 620.f,
 	         PerfPanelLineHeightPx * float(Lines.Num()) + 8.f);
 
 	float LineY = PerfPanelMarginPx + 4.f;
