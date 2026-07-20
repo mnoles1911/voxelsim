@@ -153,7 +153,7 @@ void computeDesiredForBrick(const BrickKey& key, const WaterMap& water, const Wa
                     gFlow = std::min(gFlow, remaining);
                 }
                 remaining -= gFlow;
-                scratch.desired[ci * kSlots + SLOT_GRAVITY] = static_cast<int16_t>(gFlow);
+                scratch.desired[static_cast<size_t>(ci * kSlots + SLOT_GRAVITY)] = static_cast<int16_t>(gFlow);
 
                 const bool supported = belowSolid || belowFill >= 255;
 
@@ -179,7 +179,7 @@ void computeDesiredForBrick(const BrickKey& key, const WaterMap& water, const Wa
                         }
                     }
                     remaining -= flow;
-                    scratch.desired[ci * kSlots + (SLOT_PX + dir)] = static_cast<int16_t>(flow);
+                    scratch.desired[static_cast<size_t>(ci * kSlots + (SLOT_PX + dir))] = static_cast<int16_t>(flow);
                 }
             }
 }
@@ -237,14 +237,14 @@ void gatherInflowForBrick(const BrickKey& key, const WaterMap& water, ScratchLoo
                     FlowScratch* srcScratch = sameBrick ? selfScratch : inboundScratch[i];
                     if (!srcScratch) continue; // that potential source wasn't active this tick: 0
                     const int sci = WaterBrick8::cellIndex(slx, sly, slz);
-                    const int desired = srcScratch->desired[sci * kSlots + s.slot];
+                    const int desired = srcScratch->desired[static_cast<size_t>(sci * kSlots + s.slot)];
                     if (desired <= 0) continue;
                     const int accepted = std::min(desired, budget);
                     budget -= accepted;
                     inflow += accepted;
-                    srcScratch->accepted[sci * kSlots + s.slot] = static_cast<int16_t>(accepted);
+                    srcScratch->accepted[static_cast<size_t>(sci * kSlots + s.slot)] = static_cast<int16_t>(accepted);
                 }
-                outInflow[ci] = inflow;
+                outInflow[static_cast<size_t>(ci)] = inflow;
             }
 }
 
@@ -371,7 +371,7 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
             for (int z = 0; z < kEdge; ++z)
                 for (int y = 0; y < kEdge; ++y)
                     for (int x = 0; x < kEdge; ++x)
-                        vals[WaterBrick8::cellIndex(x, y, z)] = b->get(x, y, z);
+                        vals[static_cast<size_t>(WaterBrick8::cellIndex(x, y, z))] = b->get(x, y, z);
         initialFill.emplace(t, vals);
     }
 
@@ -442,8 +442,8 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
                         const int ci = WaterBrick8::cellIndex(x, y, z);
                         int outflow = 0;
                         if (scratch)
-                            for (int s = 0; s < kSlots; ++s) outflow += scratch->accepted[ci * kSlots + s];
-                        const int32_t delta = inflow[ci] - outflow;
+                            for (int s = 0; s < kSlots; ++s) outflow += scratch->accepted[static_cast<size_t>(ci * kSlots + s)];
+                        const int32_t delta = inflow[static_cast<size_t>(ci)] - outflow;
                         if (delta == 0) continue;
                         const int64_t vx = int64_t(t.x) * kEdge + x;
                         const int64_t vy = int64_t(t.y) * kEdge + y;
@@ -466,7 +466,7 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
         for (int ci = 0; ci < kCells && !differs; ++ci) {
             const int x = ci % kEdge, y = (ci / kEdge) % kEdge, z = ci / (kEdge * kEdge);
             const uint8_t now = b ? b->get(x, y, z) : 0;
-            if (now != before[ci]) differs = true;
+            if (now != before[static_cast<size_t>(ci)]) differs = true;
         }
         if (differs) changed.insert(t);
     }
