@@ -89,3 +89,10 @@ FLinearColor VoxelDebug::RingLevelTint(int32 Level)
 	};
 	return kTints[FMath::Clamp(Level, 0, VoxelCoords::kNumLevels - 1)];
 }
+
+FLinearColor VoxelDebug::HeightmapBandTint()
+{
+	// m2-plan.md "Debug" row / debug-tooling-plan.md palette: "heightmap
+	// band cyan".
+	return FLinearColor(0.1f, 0.85f, 0.95f, 1.0f);
+}
