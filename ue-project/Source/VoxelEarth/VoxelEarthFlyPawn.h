@@ -82,6 +82,11 @@ private:
 	float CurrentForwardInput = 0.f;
 	float CurrentRightInput = 0.f;
 
+	// Cached Space/LeftControl axis value (unused in walk mode outside of
+	// swimming -- see class comment on MoveUp and TickWalkMode's swim
+	// branch, W1 swimming placeholder).
+	float CurrentUpInput = 0.f;
+
 	float VerticalVelocity = 0.f;
 	bool bJumpRequested = false;
 
@@ -90,6 +95,12 @@ private:
 	static constexpr double WalkBoxHalfExtentZ = 90.0;
 
 	static constexpr double WalkSpeedUU = 600.0;         // UU/s, horizontal
+	// Water track W1 swimming placeholder (docs/voxel-earth-implementation-
+	// plan.md SS3.7 -- real buoyancy/currents are W4): when the walk-mode
+	// box is below sea level (z=0, see TickWalkMode), gravity is disabled
+	// and movement becomes fly-style (horizontal + vertical from WASD +
+	// Space/LeftControl) at this reduced speed instead.
+	static constexpr double SwimSpeedUU = 300.0;         // UU/s, swimming (all axes)
 	static constexpr double GravityUUPerSec2 = 980.0;    // UU/s^2
 	static constexpr double JumpSpeedUU = 450.0;         // UU/s, upward
 	static constexpr double StepUpHeightUU = 30.0;       // 3 voxels
