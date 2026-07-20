@@ -130,6 +130,36 @@ namespace VoxelDebug
 	// hard clamp: UVoxelWaterSubsystem logs a throttled warning when exceeded
 	// (task spec: "do not explode") rather than truncating the tick.
 	VOXELEARTH_API int32 GetWaterMaxActiveBricks();
+
+	// --- voxel.Stream.* (M1/M2 "Perf-run hitches" isolation work, docs/status.md) ---
+	//
+	// Per-frame streaming budgets, previously compile-time constexpr in
+	// VoxelWorldSubsystem.cpp's DrainResults/DrainGameThreadMesh/DrainUnloads.
+	// Now live cvars so the streaming ramp's chunk-component apply/proxy-create
+	// rate can be tuned (a SMOOTHING scheme -- fewer applies/frame spreads
+	// proxy-creation cost more evenly) without a recompile. Defaults match the
+	// pre-cvar constants (docs/m1-plan.md Stage 2 decisions table), so leaving
+	// these untouched is a byte-identical no-op.
+
+	// voxel.Stream.MaxAppliesPerFrame: max worker-mesh-result chunk-component
+	// applies (DrainResults) drained per frame. Default 3 (tightened from the
+	// original 8 -- see VoxelDebug.cpp's cvar comment for the measurement).
+	VOXELEARTH_API int32 GetStreamMaxAppliesPerFrame();
+
+	// voxel.Stream.MaxRemeshesPerFrame: max game-thread overlay-aware edit
+	// re-meshes (DrainGameThreadMesh -- first load of an edited chunk, or a
+	// post-edit dirty re-mesh) applied per frame. Default 2 (was 4).
+	VOXELEARTH_API int32 GetStreamMaxRemeshesPerFrame();
+
+	// voxel.Stream.MaxUnloadsPerFrame: max chunk-component DestroyComponent
+	// calls (DrainUnloads) per frame. Default 2 (was 4).
+	VOXELEARTH_API int32 GetStreamMaxUnloadsPerFrame();
+
+	// Shared hitch-frame threshold (ms), matching UVoxelPerfRunSubsystem's own
+	// HitchThresholdMs (">30fps frame budget") -- used by
+	// FVoxelWorldImpl::TickStreaming's per-frame attribution log so "which
+	// frames count as a hitch" never disagrees between the two.
+	inline constexpr float kHitchThresholdMs = 33.3f;
 }
 
 // --- Perf HUD data (P1 "Perf HUD") ------------------------------------------

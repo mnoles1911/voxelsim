@@ -32,6 +32,19 @@ def main() -> int:
     parser.add_argument(
         "--min-avg-chunks-per-sec", type=float, default=None, help="Fail if avgChunksPerSec is below this."
     )
+    parser.add_argument(
+        "--max-post-warmup-p95-ms",
+        type=float,
+        default=None,
+        help="Fail if postWarmupP95FrameMs (frames from warmupExcludeSeconds onward) exceeds this.",
+    )
+    parser.add_argument(
+        "--max-post-warmup-hitches",
+        type=int,
+        default=None,
+        help="Fail if postWarmupHitchCount (docs/status.md 'Perf-run hitches' isolation task -- steady-state "
+        "hitches, excluding the first warmupExcludeSeconds) exceeds this.",
+    )
     args = parser.parse_args()
 
     try:
@@ -46,6 +59,8 @@ def main() -> int:
         ("--max-hitches", args.max_hitches, "hitchCount", lambda v, t: v <= t),
         ("--max-max-ms", args.max_max_ms, "maxFrameMs", lambda v, t: v <= t),
         ("--min-avg-chunks-per-sec", args.min_avg_chunks_per_sec, "avgChunksPerSec", lambda v, t: v >= t),
+        ("--max-post-warmup-p95-ms", args.max_post_warmup_p95_ms, "postWarmupP95FrameMs", lambda v, t: v <= t),
+        ("--max-post-warmup-hitches", args.max_post_warmup_hitches, "postWarmupHitchCount", lambda v, t: v <= t),
     ]
 
     failures = []

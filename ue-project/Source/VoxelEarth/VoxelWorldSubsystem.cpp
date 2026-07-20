@@ -46,6 +46,7 @@
 #include "HAL/PlatformMisc.h"
 #include "HAL/PlatformTime.h"
 #include "HAL/ThreadSafeCounter.h"
+#include "LocalVertexFactory.h" // hitch isolation: FLocalVertexFactory::StaticType for the BeginPlay PSO precache warmup
 #include "MaterialDomain.h"
 #include "Materials/Material.h"
 #include "Misc/CommandLine.h"
@@ -54,6 +55,7 @@
 #include "Misc/Paths.h" // M3 wave 2: FPaths::ProjectSavedDir
 #include "Misc/ScopeRWLock.h"
 #include "Materials/MaterialInterface.h"
+#include "PSOPrecache.h" // hitch isolation: FPSOPrecacheParams for the BeginPlay terrain-material PSO precache warmup
 #include "Stats/Stats.h"
 #include "Tasks/Task.h"
 #include "UObject/UObjectGlobals.h"
@@ -990,6 +992,22 @@ struct FVoxelWorldImpl
 	float BudgetSaturationAccum = 0.f;
 	int32 BudgetSaturationSamples = 0;
 
+	// --- Hitch attribution (docs/status.md "Perf-run hitches" isolation task)
+	// -----------------------------------------------------------------------
+	// Reset to 0 at the top of every TickStreaming call, filled by
+	// DispatchJobs/DrainResults/DrainGameThreadMesh/DrainUnloads as they run,
+	// and logged (LogVoxelPerf) at the bottom of TickStreaming only when this
+	// frame's DeltaTime exceeded VoxelDebug::kHitchThresholdMs -- "measure
+	// before fixing" diagnostic breakdown of what a hitch frame actually did.
+	int32 ThisFrameAppliesFromWorker = 0; // DrainResults: worker-mesh-result applies (ApplyMeshResult calls, any outcome)
+	int32 ThisFrameProxiesCreated = 0;    // ApplyMeshResult calls (either path) that were a genuine first load (NewObject+RegisterComponent)
+	int32 ThisFrameEditRemeshes = 0;      // DrainGameThreadMesh: overlay-aware re-mesh/first-load applies
+	int32 ThisFrameUnloads = 0;           // DrainUnloads: DestroyComponent calls
+	float ThisFrameDispatchMs = 0.f;
+	float ThisFrameApplyMs = 0.f;
+	float ThisFrameRemeshMs = 0.f;
+	float ThisFrameUnloadMs = 0.f;
+
 	// 1Hz refresh window (P1 "1Hz refresh of text, per-frame collection"):
 	// per-frame accumulation happens continuously above; the published
 	// snapshot itself only updates once this timer rolls over.
@@ -1073,7 +1091,13 @@ private:
 	void DrainResults(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material);
 	void DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material);
 	void DrainUnloads();
-	void ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
+	// Returns true iff this call created a brand-new UVoxelChunkComponent
+	// (NewObject+RegisterComponent) -- i.e. a genuine "proxy created" event as
+	// opposed to SetChunkQuads on an already-resident component (still a proxy
+	// RE-create via MarkRenderStateDirty, but without the RegisterComponent/
+	// scene-attach overhead). Hitch-attribution callers (DrainResults,
+	// DrainGameThreadMesh) sum this into ThisFrameProxiesCreated.
+	bool ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
 	                      const VoxelCoords::FVoxelLevelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec, TArray<FVoxelChunkQuad>&& Quads,
 	                      bool bIsGameThreadMesh);
 	// M2 wave 2: generalized from a level-0-only helper (wave 1) to any
@@ -1134,6 +1158,15 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	LastAnchorLocation = Anchor;
 	ElapsedSeconds += DeltaTime;
 
+	// Hitch attribution (docs/status.md "Perf-run hitches" isolation task):
+	// reset this frame's counters up front; Dispatch/Drain* below fill them in
+	// as they run, and the bottom of this function logs the breakdown iff this
+	// frame overran the hitch threshold.
+	ThisFrameAppliesFromWorker = 0;
+	ThisFrameProxiesCreated = 0;
+	ThisFrameEditRemeshes = 0;
+	ThisFrameUnloads = 0;
+
 	// Recompute the desired set only when the anchor crosses into a new
 	// render-chunk XY column (every ChunkEdgeUU = 3.2m of movement), not
 	// every tick -- the ring-membership test itself (docs/m1-plan.md: "render
@@ -1148,14 +1181,34 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		bHasRecomputed = true;
 	}
 
-	// Budgets (docs/m1-plan.md Stage 2 decisions table): jobs in flight
-	// <=2xLogicalCores, chunk component applies <=8/frame, unloads <=4/frame,
-	// edit re-meshes <=4/frame (also covers first load of an edited chunk --
-	// see PendingGameThreadKeys comment above).
-	DispatchJobs();
-	DrainResults(Owner, Root, Material);
-	DrainGameThreadMesh(Owner, Root, Material);
-	DrainUnloads();
+	// Budgets: jobs in flight <=2xLogicalCores (docs/m1-plan.md Stage 2
+	// decisions table); chunk component applies/unloads/edit-re-meshes are
+	// now voxel.Stream.Max{Applies,Unloads,Remeshes}PerFrame cvars (default
+	// 3/2/2, tightened from the original 8/4/4 -- see VoxelDebug.cpp's cvar
+	// comments for the docs/status.md "Perf-run hitches" measurement this
+	// tightening is based on). Edit re-meshes also cover first load of an
+	// edited chunk -- see PendingGameThreadKeys comment above.
+	{
+		const double T0 = FPlatformTime::Seconds();
+		DispatchJobs();
+		const double T1 = FPlatformTime::Seconds();
+		DrainResults(Owner, Root, Material);
+		const double T2 = FPlatformTime::Seconds();
+		DrainGameThreadMesh(Owner, Root, Material);
+		const double T3 = FPlatformTime::Seconds();
+		DrainUnloads();
+		const double T4 = FPlatformTime::Seconds();
+
+		// Hitch attribution timing (docs/status.md "Perf-run hitches"
+		// isolation task): four cheap FPlatformTime::Seconds() calls (already
+		// established practice in this function -- see TickStartSeconds
+		// above), always collected so the per-frame log below has real
+		// numbers the instant a hitch happens, not just from the next frame.
+		ThisFrameDispatchMs = float((T1 - T0) * 1000.0);
+		ThisFrameApplyMs = float((T2 - T1) * 1000.0);
+		ThisFrameRemeshMs = float((T3 - T2) * 1000.0);
+		ThisFrameUnloadMs = float((T4 - T3) * 1000.0);
+	}
 
 	InFlightTasks.RemoveAllSwap([](const UE::Tasks::TTask<void>& T) { return T.IsCompleted(); }, EAllowShrinking::No);
 
@@ -1166,6 +1219,13 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 
 	MaybeLogCounters(DeltaTime);
 
+	// Wall-clock ms this streaming tick has spent so far (one more
+	// FPlatformTime::Seconds() call -- negligible; matches the doctrine that
+	// only the O(n) work below, not this measurement itself, needs the
+	// debug-mode gate). Both UpdatePerfSnapshot (below) and the hitch
+	// attribution log want it.
+	const float TickMsSoFar = float((FPlatformTime::Seconds() - TickStartSeconds) * 1000.0);
+
 	// Constraint: "keep all debug work zero-cost when voxel.Debug=0 (branch
 	// out early)" -- FVoxelPerfSnapshot collection (array iteration, once/sec
 	// sort) is real work beyond the always-on STATS macros above, so it's
@@ -1173,8 +1233,29 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// than running unconditionally.
 	if (VoxelDebug::GetDebugMode() >= 1)
 	{
-		const float TickMs = float((FPlatformTime::Seconds() - TickStartSeconds) * 1000.0);
-		UpdatePerfSnapshot(DeltaTime, TickMs);
+		UpdatePerfSnapshot(DeltaTime, TickMsSoFar);
+	}
+
+	// docs/debug-tooling-plan.md P1 / docs/status.md "Perf-run hitches"
+	// isolation task: "when a frame exceeds the hitch threshold, log that
+	// frame's breakdown" -- the diagnostic deliverable ("measure before
+	// fixing"). Uses DeltaTime (the same per-frame sample
+	// UVoxelPerfRunSubsystem sums into its own hitch count, via the same
+	// VoxelDebug::kHitchThresholdMs) so the two never disagree about which
+	// frames count as a hitch. Deliberately NOT gated behind voxel.Debug --
+	// a real hitch in normal play is exactly when this diagnostic is most
+	// wanted, and the cost when there is no hitch is one float compare.
+	const float FrameMs = DeltaTime * 1000.f;
+	if (FrameMs > VoxelDebug::kHitchThresholdMs)
+	{
+		const float ElsewhereMs = FMath::Max(0.f, FrameMs - TickMsSoFar);
+		UE_LOG(LogVoxelPerf, Warning,
+		       TEXT("Hitch frame: frameMs=%.2f (threshold %.1f) | subsystemTickMs=%.2f elsewhereMs=%.2f | ")
+		       TEXT("dispatchMs=%.2f applyMs=%.2f remeshMs=%.2f unloadMs=%.2f | ")
+		       TEXT("componentsApplied=%d proxiesCreated=%d editRemeshes=%d unloads=%d"),
+		       FrameMs, VoxelDebug::kHitchThresholdMs, TickMsSoFar, ElsewhereMs, ThisFrameDispatchMs, ThisFrameApplyMs,
+		       ThisFrameRemeshMs, ThisFrameUnloadMs, ThisFrameAppliesFromWorker, ThisFrameProxiesCreated, ThisFrameEditRemeshes,
+		       ThisFrameUnloads);
 	}
 
 	// Visualizations (mode 2 only; every helper early-outs on its own cvar
@@ -1689,7 +1770,7 @@ void FVoxelWorldImpl::DispatchJobs()
 	}
 }
 
-void FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
+bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
                                        const VoxelCoords::FVoxelLevelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec,
                                        TArray<FVoxelChunkQuad>&& Quads, bool bIsGameThreadMesh)
 {
@@ -1710,7 +1791,7 @@ void FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			Existing->DestroyComponent();
 		}
 		Rec.Component = nullptr;
-		return;
+		return false;
 	}
 
 	UVoxelChunkComponent* Comp = Rec.Component.Get();
@@ -1752,14 +1833,18 @@ void FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	// ChunkHasEditedBrick vs NeedsOverlayAwarePath).
 	Rec.bHasOverlayBricks =
 		(Key.Level == 0) ? ChunkOwnsEditedBrick(Key.Key) : EditedAncestorChunks[Key.Level].Contains(Key.Key);
+	return bWasFirstLoad;
 }
 
 void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material)
 {
 	// docs/m1-plan.md Stage 2 decisions table: "<=8 chunk component
-	// applies/frame."
-	constexpr int32 MaxApplies = 8;
+	// applies/frame" -- now a cvar (voxel.Stream.MaxAppliesPerFrame, default
+	// 8) so the ramp's apply rate can be smoothed/tightened without a
+	// recompile (docs/status.md "Perf-run hitches" isolation task).
+	const int32 MaxApplies = VoxelDebug::GetStreamMaxAppliesPerFrame();
 	int32 Applied = 0;
+	int32 ProxiesCreated = 0;
 	VoxelStreaming::FJobResult Result;
 	while (Applied < MaxApplies && ResultsQueue.Dequeue(Result))
 	{
@@ -1794,21 +1879,29 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		}
 
 		Rec->bJobInFlight = false;
-		ApplyMeshResult(Owner, Root, Material, Result.Key, *Rec, MoveTemp(Result.Quads), /*bIsGameThreadMesh*/ false);
+		if (ApplyMeshResult(Owner, Root, Material, Result.Key, *Rec, MoveTemp(Result.Quads), /*bIsGameThreadMesh*/ false))
+		{
+			++ProxiesCreated;
+		}
 	}
 	LastAppliedFrac = float(Applied) / float(MaxApplies);
+	ThisFrameAppliesFromWorker = Applied;
+	ThisFrameProxiesCreated += ProxiesCreated;
 }
 
 void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material)
 {
-	// docs/m1-plan.md Stage 2 decisions table: "<=4 edit re-meshes/frame."
-	// This budget covers both first-time load of a chunk that already
-	// contains an edited brick (ChunkHasEditedBrick routed it here in
-	// RecomputeDesiredSet/DispatchJobs) and a post-edit dirty re-mesh
-	// (MarkChunkDirtyForRemesh) -- both use the identical overlay-aware
-	// game-thread mesh path, so they share one budget rather than two.
-	constexpr int32 MaxRemeshes = 4;
+	// docs/m1-plan.md Stage 2 decisions table: "<=4 edit re-meshes/frame" --
+	// now a cvar (voxel.Stream.MaxRemeshesPerFrame, default 4; docs/status.md
+	// "Perf-run hitches" isolation task). This budget covers both first-time
+	// load of a chunk that already contains an edited brick
+	// (ChunkHasEditedBrick routed it here in RecomputeDesiredSet/DispatchJobs)
+	// and a post-edit dirty re-mesh (MarkChunkDirtyForRemesh) -- both use the
+	// identical overlay-aware game-thread mesh path, so they share one budget
+	// rather than two.
+	const int32 MaxRemeshes = VoxelDebug::GetStreamMaxRemeshesPerFrame();
 	int32 Count = 0;
+	int32 ProxiesCreated = 0;
 	while (Count < MaxRemeshes && PendingGameThreadKeys.Num() > 0)
 	{
 		// M2 wave 2: ANY level can be on this queue now -- level 0 (unchanged
@@ -1844,15 +1937,22 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 			UE_LOG(LogVoxelEdit, Log, TEXT("Distant-edit mip re-mesh: level=%d chunk=(%d,%d,%d) quads=%d"), LevelKey.Level,
 			       LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z, Quads.Num());
 		}
-		ApplyMeshResult(Owner, Root, Material, LevelKey, *Rec, MoveTemp(Quads), /*bIsGameThreadMesh*/ true);
+		if (ApplyMeshResult(Owner, Root, Material, LevelKey, *Rec, MoveTemp(Quads), /*bIsGameThreadMesh*/ true))
+		{
+			++ProxiesCreated;
+		}
 	}
 	LastRemeshFrac = float(Count) / float(MaxRemeshes);
+	ThisFrameEditRemeshes = Count;
+	ThisFrameProxiesCreated += ProxiesCreated;
 }
 
 void FVoxelWorldImpl::DrainUnloads()
 {
-	// docs/m1-plan.md Stage 2 decisions table: "<=4 unloads/frame."
-	constexpr int32 MaxUnloads = 4;
+	// docs/m1-plan.md Stage 2 decisions table: "<=4 unloads/frame" -- now a
+	// cvar (voxel.Stream.MaxUnloadsPerFrame, default 4; docs/status.md
+	// "Perf-run hitches" isolation task).
+	const int32 MaxUnloads = VoxelDebug::GetStreamMaxUnloadsPerFrame();
 	int32 Count = 0;
 	while (Count < MaxUnloads && PendingUnloadKeys.Num() > 0)
 	{
@@ -1875,6 +1975,7 @@ void FVoxelWorldImpl::DrainUnloads()
 		}
 	}
 	LastUnloadFrac = float(Count) / float(MaxUnloads);
+	ThisFrameUnloads = Count;
 }
 
 // --- dig / place (edit-log authority path) -----------------------------
@@ -2927,6 +3028,36 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 		ChunkMaterial = UMaterial::GetDefaultMaterial(MD_Surface);
 		UE_LOG(LogVoxelEarth, Warning,
 		       TEXT("M_VoxelTerrain not found at /Game/Voxel/M_VoxelTerrain -- using engine default material."));
+	}
+
+	// Hitch isolation (docs/status.md "Perf-run hitches" / M1 gate blocker,
+	// fix (b) "PSO precache"): this hand-rolled FLocalVertexFactory +
+	// M_VoxelTerrain combination has never been drawn yet at this point in a
+	// fresh session -- absent a precache request, the engine compiles its
+	// pipeline-state-object the first time a real chunk actually reaches
+	// GetDynamicMeshElements, synchronously stalling whichever frame that
+	// lands on. UPrimitiveComponent's automatic PrecachePSOs-on-register path
+	// only fires for components that override it (UStaticMeshComponent etc);
+	// UVoxelChunkComponent never has, so this material+vertex-factory pair
+	// was never precached at all before this fix. Kicking it off here, once,
+	// at BeginPlay -- before ChunkOwner/ChunkRoot even exist, let alone any
+	// real chunk -- gives the async compile the whole loading-time window to
+	// finish before the streaming ramp's first frame. Non-blocking:
+	// PrecachePSOs only enqueues async shader-compile graph events, it never
+	// waits on them.
+	// -VoxelNoPSOPrecache: diagnostic switch (same convention as
+	// -VoxelDefaultMaterial above) -- skip the warmup request to isolate its
+	// effect on the hitch-attribution A/B measurement (docs/status.md
+	// "Perf-run hitches"). Never set in normal play.
+	if (ChunkMaterial && !FParse::Param(FCommandLine::Get(), TEXT("VoxelNoPSOPrecache")))
+	{
+		FPSOPrecacheParams TerrainPrecacheParams;
+		// UVoxelChunkComponent never calls SetMobility away from its
+		// UPrimitiveComponent Super default (Movable) -- match that here so
+		// the precached PSO variant is the one actually requested at draw
+		// time, not a Static-mobility variant that would go unused.
+		TerrainPrecacheParams.SetMobility(EComponentMobility::Movable);
+		ChunkMaterial->PrecachePSOs(&FLocalVertexFactory::StaticType, TerrainPrecacheParams);
 	}
 
 	// Single actor hosting every render-chunk component (unchanged from
