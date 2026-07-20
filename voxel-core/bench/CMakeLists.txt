@@ -39,6 +39,8 @@ if(VXC_BUILD_GPU_HARNESS)
   target_compile_definitions(vxc_gpu PRIVATE
     VXC_SPV_PATH="${VXC_REPO_ROOT}/build/shaders/worldgen.ColumnMain.spv"
     VXC_SPV_PATH_VOXELIZE="${VXC_REPO_ROOT}/build/shaders/worldgen.VoxelizeMain.spv"
+    VXC_SPV_PATH_MESHCOUNT="${VXC_REPO_ROOT}/build/shaders/worldgen.MeshCountMain.spv"
+    VXC_SPV_PATH_MESHEMIT="${VXC_REPO_ROOT}/build/shaders/worldgen.MeshEmitMain.spv"
   )
   if(NOT MSVC)
     target_compile_options(vxc_gpu PRIVATE -Wall -Wextra -Werror)

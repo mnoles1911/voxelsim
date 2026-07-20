@@ -314,3 +314,201 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
         }
     }
 }
+
+// --- Greedy mesher kernels (docs/gpu-mesher-design.md) ---------------------
+// Bit-exact port of vxc::meshBrick<8> (voxelcore/mesher.h). Determinism
+// strategy: count -> host exclusive scan -> emit at scanned offsets. NO
+// atomics anywhere in the output path, so quad order is identical to the CPU
+// stream by construction:
+//   per interior brick: axis {0,1,2} x dir {neg,pos} x slice {0..7} masks,
+//   quads within a mask in the CPU row-major greedy emission order.
+//
+// One thread per face-mask. Mask decode (mirrors the CPU loop nesting in
+// meshBrick: axis outer, then dir, then slice):
+//   maskIndex = meshBrickIndex * 48 + axis * 16 + dir * 8 + slice
+// Interior bricks only (the 1-brick halo supplies apron reads):
+//   interior dims: mbx = BricksX-2, mby = BricksY-2, mbz = BricksZ-2
+//   meshBrickIndex = ix + mbx * (iy + mby * iz)   (x fastest, z slowest)
+//   actual brick   = (ix+1, iy+1, iz+1) in region brick coords
+//
+// Bindings (register -> -fvk-shift Vulkan binding; all distinct, see the
+// table above InColumns): u4 OutQuadCounts -> 7, t5 InQuadOffsets -> 6,
+// u5 OutQuads -> 8.
+//
+// Packed quad (2x uint32, unpacked and byte-compared against vxc::Quad in
+// the harness):
+//   word0 = axis | positive<<4 | slice<<8 | u0<<16 | v0<<24
+//   word1 = w | h<<8 | ao<<16 | mat<<24
+
+RWStructuredBuffer<uint> OutQuadCounts : register(u4);
+StructuredBuffer<uint> InQuadOffsets : register(t5);
+RWStructuredBuffer<uint2> OutQuads : register(u5);
+
+// Region-voxel material read. rv is region-local voxel coords (region brick
+// (0,0,0) cell (0,0,0) is rv = (0,0,0)); callers only pass coords inside the
+// voxelized region (interior brick +/-1 cell stays inside because of the
+// halo brick).
+uint regionCellMat(int3 rv)
+{
+    const uint bx = (uint)(rv.x >> 3), by = (uint)(rv.y >> 3), bz = (uint)(rv.z >> 3);
+    const uint lx = (uint)(rv.x & 7), ly = (uint)(rv.y & 7), lz = (uint)(rv.z & 7);
+    const uint bricksX = DispatchColumns.x / 8u;
+    const uint footprintIndex = bx + bricksX * by;
+    const uint brickIndex = footprintIndex * BricksZ + bz;
+    return OutCells[brickIndex * 512u + cellIndexInBrick(lx, ly, lz)] & 0xffu;
+}
+
+// vxc::detail::aoCorner bit-for-bit.
+uint aoCorner(bool s1, bool s2, bool c)
+{
+    return (s1 && s2) ? 0u : (3u - ((s1 ? 1u : 0u) + (s2 ? 1u : 0u) + (c ? 1u : 0u)));
+}
+
+// Builds the 8x8 face mask for (brickOrigin, axis, dir, slice) and runs the
+// CPU greedy algorithm. When emit != 0, writes packed quads at
+// OutQuads[baseOffset + n]; always returns the quad count. Mirrors
+// vxc::meshBrick<8> exactly: mask key = mat | ao<<8 | 1<<16.
+uint greedyMask(int3 brickOriginRv, uint axis, uint dir, uint slice, uint emit, uint baseOffset)
+{
+    const uint u = (axis + 1u) % 3u;
+    const uint v = (axis + 2u) % 3u;
+    const int nOff = (dir != 0u) ? 1 : -1;
+
+    uint mask[64];
+    for (uint j = 0; j < 8u; ++j)
+    {
+        for (uint i = 0; i < 8u; ++i)
+        {
+            int3 c = int3(0, 0, 0);
+            c[axis] = (int)slice;
+            c[u] = (int)i;
+            c[v] = (int)j;
+            const uint m = regionCellMat(brickOriginRv + c);
+            uint key = 0u;
+            if (m != MAT_AIR)
+            {
+                int3 n = c;
+                n[axis] += nOff;
+                if (regionCellMat(brickOriginRv + n) == MAT_AIR)
+                {
+                    // 4-corner AO from the 8 cells ringing the face on the
+                    // neighbor plane (mesher.h order: (0,0),(1,0),(0,1),(1,1)).
+                    bool uNeg, uPos, vNeg, vPos, dNN, dPN, dNP, dPP;
+                    {
+                        int3 p;
+                        p = n; p[u] -= 1;            uNeg = regionCellMat(brickOriginRv + p) != MAT_AIR;
+                        p = n; p[u] += 1;            uPos = regionCellMat(brickOriginRv + p) != MAT_AIR;
+                        p = n; p[v] -= 1;            vNeg = regionCellMat(brickOriginRv + p) != MAT_AIR;
+                        p = n; p[v] += 1;            vPos = regionCellMat(brickOriginRv + p) != MAT_AIR;
+                        p = n; p[u] -= 1; p[v] -= 1; dNN = regionCellMat(brickOriginRv + p) != MAT_AIR;
+                        p = n; p[u] += 1; p[v] -= 1; dPN = regionCellMat(brickOriginRv + p) != MAT_AIR;
+                        p = n; p[u] -= 1; p[v] += 1; dNP = regionCellMat(brickOriginRv + p) != MAT_AIR;
+                        p = n; p[u] += 1; p[v] += 1; dPP = regionCellMat(brickOriginRv + p) != MAT_AIR;
+                    }
+                    uint ao = 0u;
+                    ao |= aoCorner(uNeg, vNeg, dNN);
+                    ao |= aoCorner(uPos, vNeg, dPN) << 2;
+                    ao |= aoCorner(uNeg, vPos, dNP) << 4;
+                    ao |= aoCorner(uPos, vPos, dPP) << 6;
+                    key = m | (ao << 8) | (1u << 16);
+                }
+            }
+            mask[i + 8u * j] = key;
+        }
+    }
+
+    // Greedy rectangle merge - identical control flow to mesher.h.
+    uint quadCount = 0u;
+    for (uint j2 = 0; j2 < 8u; ++j2)
+    {
+        for (uint i2 = 0; i2 < 8u;)
+        {
+            const uint key = mask[i2 + 8u * j2];
+            if (key == 0u)
+            {
+                ++i2;
+                continue;
+            }
+            uint w = 1u;
+            while (i2 + w < 8u && mask[i2 + w + 8u * j2] == key) ++w;
+            uint h = 1u;
+            for (; j2 + h < 8u; ++h)
+            {
+                bool rowOk = true;
+                for (uint k = 0; k < w; ++k)
+                {
+                    if (mask[i2 + k + 8u * (j2 + h)] != key)
+                    {
+                        rowOk = false;
+                        break;
+                    }
+                }
+                if (!rowOk) break;
+            }
+            for (uint dj = 0; dj < h; ++dj)
+                for (uint di = 0; di < w; ++di)
+                    mask[i2 + di + 8u * (j2 + dj)] = 0u;
+
+            if (emit != 0u)
+            {
+                const uint ao8 = (key >> 8) & 0xffu;
+                const uint mat = key & 0xffu;
+                uint2 q;
+                q.x = axis | (dir << 4) | (slice << 8) | (i2 << 16) | (j2 << 24);
+                q.y = w | (h << 8) | (ao8 << 16) | (mat << 24);
+                OutQuads[baseOffset + quadCount] = q;
+            }
+            ++quadCount;
+            i2 += w;
+        }
+    }
+    return quadCount;
+}
+
+// Decodes a flat mask index into (brick origin, axis, dir, slice); returns
+// false when the index is out of range.
+bool decodeMask(uint maskIndex, out int3 brickOriginRv, out uint axis, out uint dir, out uint slice)
+{
+    const uint bricksX = DispatchColumns.x / 8u;
+    const uint bricksY = DispatchColumns.y / 8u;
+    const uint mbx = bricksX - 2u, mby = bricksY - 2u, mbz = BricksZ - 2u;
+    const uint maskCount = mbx * mby * mbz * 48u;
+    if (maskIndex >= maskCount)
+    {
+        brickOriginRv = int3(0, 0, 0);
+        axis = 0u;
+        dir = 0u;
+        slice = 0u;
+        return false;
+    }
+    const uint meshBrickIndex = maskIndex / 48u;
+    const uint sub = maskIndex % 48u;
+    axis = sub / 16u;
+    dir = (sub % 16u) / 8u;
+    slice = sub % 8u;
+    const uint ix = meshBrickIndex % mbx;
+    const uint iy = (meshBrickIndex / mbx) % mby;
+    const uint iz = meshBrickIndex / (mbx * mby);
+    brickOriginRv = int3((int)((ix + 1u) * 8u), (int)((iy + 1u) * 8u), (int)((iz + 1u) * 8u));
+    return true;
+}
+
+[numthreads(64, 1, 1)]
+void MeshCountMain(uint3 tid : SV_DispatchThreadID)
+{
+    int3 origin;
+    uint axis, dir, slice;
+    if (!decodeMask(tid.x, origin, axis, dir, slice))
+        return;
+    OutQuadCounts[tid.x] = greedyMask(origin, axis, dir, slice, 0u, 0u);
+}
+
+[numthreads(64, 1, 1)]
+void MeshEmitMain(uint3 tid : SV_DispatchThreadID)
+{
+    int3 origin;
+    uint axis, dir, slice;
+    if (!decodeMask(tid.x, origin, axis, dir, slice))
+        return;
+    greedyMask(origin, axis, dir, slice, 1u, InQuadOffsets[tid.x]);
+}
