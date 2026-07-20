@@ -12,7 +12,7 @@ $OutDir = Join-Path $Root "build\shaders"
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 
 # kernel source -> entry points
-$Kernels = @{ "voxel-core\shaders\worldgen.hlsl" = @("ColumnMain") }
+$Kernels = @{ "voxel-core\shaders\worldgen.hlsl" = @("ColumnMain", "VoxelizeMain") }
 
 foreach ($Src in $Kernels.Keys) {
     $SrcPath = Join-Path $Root $Src
@@ -28,8 +28,9 @@ foreach ($Src in $Kernels.Keys) {
         # descriptor bindings are one flat space per set; without shifts, b0/
         # t0/u0 would all collide at (set=0, binding=0). Shift t- and u-type
         # registers so every resource in worldgen.hlsl lands on a distinct
-        # binding: b0->0, t0->1, t1->2, u0->3 (see voxel-core/bench/gpu_harness.cpp,
-        # which hardcodes these same binding numbers).
+        # binding: b0->0, t0->1, t1->2, u0->3, t3->4, u2->5 (see
+        # voxel-core/bench/gpu_harness.cpp, which hardcodes these same binding
+        # numbers for both the ColumnMain and VoxelizeMain descriptor sets).
         & $Dxc -T cs_6_0 -E $Entry -O3 -spirv "-fspv-target-env=vulkan1.1" `
             -fvk-b-shift 0 0 -fvk-t-shift 1 0 -fvk-u-shift 3 0 $SrcPath -Fo $Spv
         if ($LASTEXITCODE -ne 0) { throw "SPIR-V compile failed: $Src/$Entry" }
