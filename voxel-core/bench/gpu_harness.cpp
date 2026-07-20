@@ -1054,6 +1054,720 @@ struct Mismatch {
     int64_t cpuVal, gpuVal;
 };
 
+// ============================================================================
+// --radius gate mode (M0 gate): the FULL GPU pipeline (ColumnMain ->
+// VoxelizeMain -> MeshCount/EmitMain) over every surface-shell brick within a
+// horizontal radius of the origin. Tiles the target square into fixed
+// 128x128-column dispatches (runRegion() above uses one such dispatch per
+// call); a shared 1-brick halo on every tile means each tile's 14x14-brick
+// interior (the same "interior brick" concept the mesh pass above already
+// uses) is owned by exactly one tile, so interiors partition the target area
+// with no gaps and no double-meshing.
+// ============================================================================
+namespace gate {
+
+constexpr int32_t kBrick = 8;
+constexpr int32_t kTileBricks = 16;                                // 128 columns / 8
+constexpr int32_t kHaloBricks = 1;                                 // shared 1-brick halo
+constexpr int32_t kInteriorBricks = kTileBricks - 2 * kHaloBricks; // 14 owned bricks/tile
+constexpr int32_t kTileColumns = kTileBricks * kBrick;             // 128
+constexpr int32_t kVerifySampleStride = 8;   // "every 8th tile" sampled verification
+constexpr int64_t kFullVerifyRadiusM = 64;   // <= this radius: full CPU comparison
+
+// A buffer allocated once (lazily, on first need) that only ever grows:
+// later tiles reuse the same VkBuffer/VkDeviceMemory as long as it still
+// fits, instead of the per-region create/destroy runRegion() uses for its
+// single dispatch. Vulkan buffer+memory (de)allocation is heavy enough that
+// repeating it ~500 times (once per tile at --radius 128) would swamp the
+// gate number with allocator overhead unrelated to the pipeline being
+// measured. Only cellsBuf/countsBuf/offsetsBuf/quadsBuf actually vary in
+// size tile-to-tile (they scale with each tile's local vertical extent,
+// bricksZ, which depends on nearby terrain height) — elevBuf/climBuf also
+// use this so a rare +/-1 raster-window rounding difference between tiles
+// doesn't need special-casing either. paramsBuf/columnsBuf/quadsStub are
+// genuinely fixed-size (128x128 columns, every tile) and are allocated once,
+// plainly, outside this helper.
+struct GrowBuffer {
+    Buffer buf;
+    VkDeviceSize capacityBytes = 0;
+    VkBufferUsageFlags usage = 0;
+    size_t reallocCount = 0;
+
+    void ensure(GpuContext& ctx, VkDeviceSize bytes) {
+        if (bytes <= capacityBytes && buf.buffer != VK_NULL_HANDLE) return;
+        if (buf.buffer != VK_NULL_HANDLE) ctx.destroyBuffer(buf);
+        capacityBytes = bytes;
+        buf = ctx.createBuffer(capacityBytes, usage);
+        ++reallocCount;
+    }
+};
+
+struct GateBuffers {
+    Buffer paramsBuf;                 // fixed: sizeof(WorldGenParamsCB)
+    GrowBuffer elevBuf, climBuf;      // raster window (rarely grows past the first tile)
+    Buffer columnsBuf;                // fixed: kTileColumns^2 * sizeof(GpuColumnSample)
+    GrowBuffer cellsBuf;              // grows to the tallest bricksZ seen
+    GrowBuffer countsBuf, offsetsBuf; // mesh mask buffers, sized off bricksZ too
+    Buffer quadsStub;                 // fixed: 8-byte placeholder bound during MeshCountMain
+    GrowBuffer quadsBuf;              // emitted quads, sized off each tile's actual count
+    std::vector<uint32_t> quadOffsetsScratch; // host-side scan scratch, reused (not
+                                               // reallocated) across tiles like the GPU buffers
+
+    size_t totalReallocs() const {
+        return elevBuf.reallocCount + climBuf.reallocCount + cellsBuf.reallocCount +
+               countsBuf.reallocCount + offsetsBuf.reallocCount + quadsBuf.reallocCount;
+    }
+};
+
+struct TileSpec {
+    int32_t tx = 0, ty = 0;
+    int32_t originVx = 0, originVy = 0; // dispatch tile origin, halo included
+    int32_t ownedBx0 = 0, ownedBy0 = 0; // first interior (owned) brick, global brick coords
+};
+
+struct TileGrid {
+    int32_t bMin = 0, bMax = 0;  // global brick-coord bounds of the requested radius (square)
+    int32_t numTiles = 0;        // per axis; grid is numTiles x numTiles
+    std::vector<TileSpec> tiles; // row-major, ty outer, tx inner
+};
+
+// bMin/bMax mirror bench_main.cpp's brick-range derivation exactly (same
+// floorDiv(-radiusVox,B)/floorDiv(radiusVox-1,B) formula) so the CPU-radius
+// baseline and this GPU gate describe the same nominal footprint. Tiling
+// that range into fixed-size 128-column/16-brick dispatches with a 14-brick
+// interior means the LAST tile in each row/column can overshoot bMax by up
+// to kInteriorBricks-1 bricks when totalBricks isn't an exact multiple of
+// 14 (true for both 64m and 128m here) — deliberate: interiors must tile
+// contiguously with no gap, and slightly overshooting the far edge is
+// harmless (it's still real, deterministically-generated terrain, just
+// outside the nominal radius) whereas a gap or a double-meshed brick would
+// not be.
+TileGrid buildTileGrid(int64_t radiusM) {
+    TileGrid g;
+    const int64_t radiusVox = radiusM * 1000 / kVoxelSizeMm;
+    g.bMin = static_cast<int32_t>(floorDiv(-radiusVox, kBrick));
+    g.bMax = static_cast<int32_t>(floorDiv(radiusVox - 1, kBrick));
+    const int32_t totalBricks = g.bMax - g.bMin + 1;
+    g.numTiles = (totalBricks + kInteriorBricks - 1) / kInteriorBricks;
+    g.tiles.reserve(size_t(g.numTiles) * size_t(g.numTiles));
+    for (int32_t ty = 0; ty < g.numTiles; ++ty) {
+        for (int32_t tx = 0; tx < g.numTiles; ++tx) {
+            TileSpec t;
+            t.tx = tx;
+            t.ty = ty;
+            t.ownedBx0 = g.bMin + tx * kInteriorBricks;
+            t.ownedBy0 = g.bMin + ty * kInteriorBricks;
+            t.originVx = (t.ownedBx0 - kHaloBricks) * kBrick;
+            t.originVy = (t.ownedBy0 - kHaloBricks) * kBrick;
+            g.tiles.push_back(t);
+        }
+    }
+    return g;
+}
+
+struct GateStats {
+    // Setup + verification costs, timed but EXCLUDED from the gate number.
+    double cpuColumnPassMs = 0; // per-tile z-range CPU column pass (existing pattern)
+    double cpuCompareMs = 0;    // CPU-vs-GPU comparison + digest bookkeeping
+
+    // The gate number: per-stage GPU wall-clock totals, summed across every
+    // tile, plus the marshalling in between (buffer ensure/grow, descriptor
+    // writes, WorldGenParams upload, raster-window fill, host prefix scan).
+    double hostRasterFillMs = 0, columnMs = 0, voxelizeMs = 0, meshCountMs = 0, meshEmitMs = 0,
+           hostScanMs = 0;
+    double gateMs = 0; // superset of the six buckets above (the remainder is marshalling)
+
+    size_t totalTiles = 0, verifiedTiles = 0;
+    size_t totalColumns = 0, verifiedColumns = 0;
+    size_t totalCells = 0, verifiedCells = 0;
+    size_t totalQuads = 0, verifiedQuads = 0;
+    size_t totalInteriorBricks = 0;
+
+    Digest digest;
+    std::vector<Mismatch> mismatches;
+};
+
+// Runs the full pipeline for one dispatch tile, reusing gb's buffers.
+void runTile(GpuContext& ctx, GateBuffers& gb, const TileSpec& tile, uint64_t seed,
+             SyntheticTileSampler& tiles, Amplifier& amp, bool verify, GateStats& stats) {
+    constexpr int32_t W = kTileColumns, H = kTileColumns;
+    const int64_t pixelSizeMm = tiles.pixelSizeMm();
+
+    const int64_t xMmMin = int64_t(tile.originVx) * kVoxelSizeMm;
+    const int64_t xMmMax = int64_t(tile.originVx + W - 1) * kVoxelSizeMm;
+    const int64_t yMmMin = int64_t(tile.originVy) * kVoxelSizeMm;
+    const int64_t yMmMax = int64_t(tile.originVy + H - 1) * kVoxelSizeMm;
+    const int64_t pxMin = floorDiv(xMmMin, pixelSizeMm);
+    const int64_t pxMax = floorDiv(xMmMax, pixelSizeMm) + 1;
+    const int64_t pyMin = floorDiv(yMmMin, pixelSizeMm);
+    const int64_t pyMax = floorDiv(yMmMax, pixelSizeMm) + 1;
+    const uint32_t rasterW = static_cast<uint32_t>(pxMax - pxMin + 1);
+    const uint32_t rasterH = static_cast<uint32_t>(pyMax - pyMin + 1);
+
+    // --- CPU column pass (setup): z-range + CPU reference columns, same
+    // pattern as runRegion() above. This is unavoidable GPU input (it
+    // derives BrickZMin/BricksZ), not optional bookkeeping, but it is real
+    // CPU-side cost a production path must hide/pipeline — timed separately
+    // and excluded from the gate number below, per the gate spec. ----------
+    const auto tCpu0 = Clock::now();
+    std::vector<ColumnSample> cpuCols(size_t(W) * H);
+    int64_t vzMin = INT64_MAX, vzMax = INT64_MIN;
+    for (int32_t y = 0; y < H; ++y) {
+        for (int32_t x = 0; x < W; ++x) {
+            const int64_t vx = int64_t(tile.originVx) + x;
+            const int64_t vy = int64_t(tile.originVy) + y;
+            const ColumnSample c = amp.column(vx, vy);
+            cpuCols[size_t(x) + size_t(y) * W] = c;
+            const int64_t top = floorDiv(int64_t(c.surfaceMm) - kVoxelSizeMm / 2, kVoxelSizeMm);
+            vzMin = top < vzMin ? top : vzMin;
+            vzMax = top > vzMax ? top : vzMax;
+        }
+    }
+    stats.cpuColumnPassMs += msSince(tCpu0);
+
+    const int32_t brickZMin = static_cast<int32_t>(floorDiv(vzMin, kBrick));
+    const int32_t brickZMax = static_cast<int32_t>(floorDiv(vzMax, kBrick));
+    const uint32_t bricksZ = static_cast<uint32_t>(brickZMax - brickZMin + 1);
+    const uint32_t bricksX = uint32_t(W) / kBrick, bricksY = uint32_t(H) / kBrick; // == 16
+
+    // ==== GATE WINDOW BEGINS ================================================
+    // Everything from here to "GATE WINDOW ENDS" is the timed end-to-end gate
+    // number: buffer ensure/marshalling + all four GPU dispatch stages + the
+    // host prefix scan, EXCLUDING the CPU column pass above and the
+    // CPU-reference comparison/digest below.
+    const auto tGate0 = Clock::now();
+
+    gb.elevBuf.ensure(ctx, VkDeviceSize(rasterW) * rasterH * sizeof(int32_t));
+    gb.climBuf.ensure(ctx, VkDeviceSize(rasterW) * rasterH * sizeof(uint32_t));
+    gb.cellsBuf.ensure(ctx, VkDeviceSize(bricksX) * bricksY * bricksZ * 512 * sizeof(uint32_t));
+
+    const auto tRaster0 = Clock::now();
+    int32_t* elev = static_cast<int32_t*>(gb.elevBuf.buf.mapped);
+    uint32_t* clim = static_cast<uint32_t*>(gb.climBuf.buf.mapped);
+    for (uint32_t ly = 0; ly < rasterH; ++ly) {
+        for (uint32_t lx = 0; lx < rasterW; ++lx) {
+            const int64_t px = pxMin + lx, py = pyMin + ly;
+            const size_t idx = size_t(lx) + size_t(ly) * rasterW;
+            elev[idx] = tiles.elevationMm(px, py);
+            const ClimateSample cl = tiles.climate(px, py);
+            clim[idx] = uint32_t(cl.temperature) | (uint32_t(cl.seasonality) << 8) |
+                        (uint32_t(cl.precipitation) << 16) | (uint32_t(cl.precipVariability) << 24);
+        }
+    }
+    stats.hostRasterFillMs += msSince(tRaster0);
+
+    WorldGenParamsCB params{};
+    params.DispatchColumnsX = uint32_t(W);
+    params.DispatchColumnsY = uint32_t(H);
+    params.RasterOriginPxX = static_cast<int32_t>(pxMin);
+    params.RasterOriginPxY = static_cast<int32_t>(pyMin);
+    params.RasterSizeX = rasterW;
+    params.RasterSizeY = rasterH;
+    params.PixelSizeMm = static_cast<int32_t>(pixelSizeMm);
+    params.SeedLo = static_cast<uint32_t>(seed & 0xffffffffu);
+    params.SeedHi = static_cast<uint32_t>(seed >> 32);
+    params.OriginVx = tile.originVx;
+    params.OriginVy = tile.originVy;
+    params.BrickZMin = brickZMin;
+    params.BricksZ = bricksZ;
+    std::memcpy(gb.paramsBuf.mapped, &params, sizeof(params));
+
+    // Descriptor writes: buffers are bound at VK_WHOLE_SIZE (their current
+    // capacity, which may exceed this tile's actual data) — harmless, since
+    // the shaders only ever index up to RasterSize/BricksZ from the cbuffer,
+    // never the raw buffer size.
+    VkDescriptorBufferInfo paramsInfo{gb.paramsBuf.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo elevInfo{gb.elevBuf.buf.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo climInfo{gb.climBuf.buf.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo columnsInfo{gb.columnsBuf.buffer, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet writes[4]{};
+    writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.descSet, 0, 0, 1,
+                 VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &paramsInfo, nullptr};
+    writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.descSet, 1, 0, 1,
+                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &elevInfo, nullptr};
+    writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.descSet, 2, 0, 1,
+                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &climInfo, nullptr};
+    writes[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.descSet, 3, 0, 1,
+                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &columnsInfo, nullptr};
+    vkUpdateDescriptorSets(ctx.device, 4, writes, 0, nullptr);
+
+    VkDescriptorBufferInfo cellsInfo{gb.cellsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet voxWrites[3]{};
+    voxWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 0, 0, 1,
+                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &paramsInfo, nullptr};
+    voxWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 4, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &columnsInfo, nullptr};
+    voxWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 5, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cellsInfo, nullptr};
+    vkUpdateDescriptorSets(ctx.device, 3, voxWrites, 0, nullptr);
+
+    const uint32_t groupsX = (uint32_t(W) + 7) / 8, groupsY = (uint32_t(H) + 7) / 8;
+
+    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbai.commandPool = ctx.commandPool;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+
+    // Submits one already-recorded command buffer and blocks until it
+    // completes, returning that wall-clock span. Per-stage submit+wait
+    // (rather than chaining every stage into one submission) is deliberate:
+    // it is what makes the per-stage GPU wall-clock totals below possible.
+    const auto submitAndWait = [&](VkCommandBuffer cmd) -> double {
+        VkFence fence = VK_NULL_HANDLE;
+        vkCheck(vkCreateFence(ctx.device, &fci, nullptr, &fence), "vkCreateFence(gate)");
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        const auto t0 = Clock::now();
+        vkCheck(vkQueueSubmit(ctx.queue, 1, &si, fence), "vkQueueSubmit(gate)");
+        vkCheck(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX),
+                "vkWaitForFences(gate)");
+        const double ms = msSince(t0);
+        vkDestroyFence(ctx.device, fence, nullptr);
+        return ms;
+    };
+
+    // --- Pass 1: ColumnMain --------------------------------------------
+    VkCommandBuffer cmd1 = VK_NULL_HANDLE;
+    vkCheck(vkAllocateCommandBuffers(ctx.device, &cbai, &cmd1),
+            "vkAllocateCommandBuffers(gate-col)");
+    vkCheck(vkBeginCommandBuffer(cmd1, &cbbi), "vkBeginCommandBuffer(gate-col)");
+    vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipeline);
+    vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipelineLayout, 0, 1,
+                             &ctx.descSet, 0, nullptr);
+    vkCmdDispatch(cmd1, groupsX, groupsY, 1);
+    VkBufferMemoryBarrier barrier1{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    barrier1.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier1.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    barrier1.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier1.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier1.buffer = gb.columnsBuf.buffer;
+    barrier1.offset = 0;
+    barrier1.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd1, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
+                          nullptr, 1, &barrier1, 0, nullptr);
+    vkCheck(vkEndCommandBuffer(cmd1), "vkEndCommandBuffer(gate-col)");
+    stats.columnMs += submitAndWait(cmd1);
+
+    // --- Pass 2: VoxelizeMain, chained off cmd1's columnsBuf write --------
+    VkCommandBuffer cmd2 = VK_NULL_HANDLE;
+    vkCheck(vkAllocateCommandBuffers(ctx.device, &cbai, &cmd2),
+            "vkAllocateCommandBuffers(gate-vox)");
+    vkCheck(vkBeginCommandBuffer(cmd2, &cbbi), "vkBeginCommandBuffer(gate-vox)");
+    VkBufferMemoryBarrier chainBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    chainBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    chainBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    chainBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    chainBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    chainBarrier.buffer = gb.columnsBuf.buffer;
+    chainBarrier.offset = 0;
+    chainBarrier.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd2, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &chainBarrier, 0,
+                          nullptr);
+    vkCmdBindPipeline(cmd2, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.voxPipeline);
+    vkCmdBindDescriptorSets(cmd2, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.voxPipelineLayout, 0, 1,
+                             &ctx.voxDescSet, 0, nullptr);
+    vkCmdDispatch(cmd2, groupsX, groupsY, 1);
+    VkBufferMemoryBarrier barrier2{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    barrier2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier2.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    barrier2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier2.buffer = gb.cellsBuf.buf.buffer;
+    barrier2.offset = 0;
+    barrier2.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd2, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
+                          nullptr, 1, &barrier2, 0, nullptr);
+    vkCheck(vkEndCommandBuffer(cmd2), "vkEndCommandBuffer(gate-vox)");
+    stats.voxelizeMs += submitAndWait(cmd2);
+
+    // --- Passes 3+4: MeshCountMain -> host exclusive scan -> MeshEmitMain -
+    uint32_t mbx = 0, mby = 0, mbz = 0, maskCount = 0, running = 0;
+    if (bricksX >= 3 && bricksY >= 3 && bricksZ >= 3) {
+        mbx = bricksX - 2;
+        mby = bricksY - 2;
+        mbz = bricksZ - 2;
+        maskCount = mbx * mby * mbz * 48u;
+
+        gb.countsBuf.ensure(ctx, VkDeviceSize(maskCount) * sizeof(uint32_t));
+        gb.offsetsBuf.ensure(ctx, VkDeviceSize(maskCount) * sizeof(uint32_t));
+
+        const auto writeMeshSet = [&](VkDescriptorSet set, VkBuffer quadsBuffer) {
+            VkDescriptorBufferInfo pInfo{gb.paramsBuf.buffer, 0, VK_WHOLE_SIZE};
+            VkDescriptorBufferInfo cInfo{gb.cellsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
+            VkDescriptorBufferInfo oInfo{gb.offsetsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
+            VkDescriptorBufferInfo nInfo{gb.countsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
+            VkDescriptorBufferInfo qInfo{quadsBuffer, 0, VK_WHOLE_SIZE};
+            VkWriteDescriptorSet w[5]{};
+            w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 0, 0, 1,
+                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &pInfo, nullptr};
+            w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 5, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cInfo, nullptr};
+            w[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 6, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &oInfo, nullptr};
+            w[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 7, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &nInfo, nullptr};
+            w[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 8, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &qInfo, nullptr};
+            vkUpdateDescriptorSets(ctx.device, 5, w, 0, nullptr);
+        };
+
+        const uint32_t meshGroups = (maskCount + 63) / 64;
+        const auto runMeshPass = [&](VkPipeline pipeline, VkDescriptorSet set,
+                                      VkBuffer hostReadBuffer, const char* what) -> double {
+            VkCommandBuffer cmd = VK_NULL_HANDLE;
+            vkCheck(vkAllocateCommandBuffers(ctx.device, &cbai, &cmd), what);
+            vkCheck(vkBeginCommandBuffer(cmd, &cbbi), what);
+            VkBufferMemoryBarrier readBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            readBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            readBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            readBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            readBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            readBarrier.buffer = gb.cellsBuf.buf.buffer;
+            readBarrier.offset = 0;
+            readBarrier.size = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1,
+                                  &readBarrier, 0, nullptr);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.meshPipelineLayout, 0,
+                                     1, &set, 0, nullptr);
+            vkCmdDispatch(cmd, meshGroups, 1, 1);
+            VkBufferMemoryBarrier hostBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            hostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            hostBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            hostBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            hostBarrier.buffer = hostReadBuffer;
+            hostBarrier.offset = 0;
+            hostBarrier.size = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                  VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hostBarrier, 0,
+                                  nullptr);
+            vkCheck(vkEndCommandBuffer(cmd), what);
+            return submitAndWait(cmd);
+        };
+
+        writeMeshSet(ctx.meshCountSet, gb.quadsStub.buffer);
+        stats.meshCountMs += runMeshPass(ctx.meshCountPipeline, ctx.meshCountSet,
+                                          gb.countsBuf.buf.buffer, "gate-mesh-count");
+
+        const auto tScan0 = Clock::now();
+        const uint32_t* counts = static_cast<const uint32_t*>(gb.countsBuf.buf.mapped);
+        // Reused across tiles (like the GPU-side GrowBuffers above): resize()
+        // only reallocates when growing past the current capacity, so after
+        // the first few tiles this scratch vector settles at a working-set
+        // size and every later tile's scan is allocation-free.
+        if (gb.quadOffsetsScratch.size() < size_t(maskCount) + 1)
+            gb.quadOffsetsScratch.resize(size_t(maskCount) + 1);
+        uint32_t* quadOffsets = gb.quadOffsetsScratch.data();
+        running = 0;
+        for (uint32_t i = 0; i < maskCount; ++i) {
+            quadOffsets[i] = running;
+            running += counts[i];
+        }
+        quadOffsets[maskCount] = running;
+        std::memcpy(gb.offsetsBuf.buf.mapped, quadOffsets, size_t(maskCount) * sizeof(uint32_t));
+        stats.hostScanMs += msSince(tScan0);
+
+        if (running > 0) {
+            gb.quadsBuf.ensure(ctx, VkDeviceSize(running) * sizeof(uint64_t));
+            writeMeshSet(ctx.meshEmitSet, gb.quadsBuf.buf.buffer);
+            stats.meshEmitMs += runMeshPass(ctx.meshEmitPipeline, ctx.meshEmitSet,
+                                             gb.quadsBuf.buf.buffer, "gate-mesh-emit");
+        }
+    }
+
+    stats.gateMs += msSince(tGate0);
+    // ==== GATE WINDOW ENDS ==================================================
+
+    // --- Digest (ALWAYS, over every tile's full GPU output, regardless of
+    // whether this tile is verified) + CPU comparison (only for `verify`
+    // tiles). Both are bookkeeping/verification, not the production path, so
+    // both are excluded from the gate number above. The digest byte stream
+    // is identical either way (same decode, same sequential order) so its
+    // value never depends on which tiles happened to be sampled. ----------
+    const auto tCmp0 = Clock::now();
+    const GpuColumnSample* gpuCols = static_cast<const GpuColumnSample*>(gb.columnsBuf.mapped);
+    const uint32_t* gpuCells = static_cast<const uint32_t*>(gb.cellsBuf.buf.mapped);
+    const uint64_t* gpuQuads =
+        running > 0 ? static_cast<const uint64_t*>(gb.quadsBuf.buf.mapped) : nullptr;
+
+    for (int32_t y = 0; y < H; ++y) {
+        for (int32_t x = 0; x < W; ++x) {
+            const size_t colIdx = size_t(x) + size_t(y) * W;
+            const GpuColumnSample& g = gpuCols[colIdx];
+            stats.digest.u32(static_cast<uint32_t>(g.surfaceMm));
+            stats.digest.u32(static_cast<uint32_t>(g.topsoilMm));
+            stats.digest.u32(static_cast<uint32_t>(g.subsoilMm));
+            stats.digest.u32(static_cast<uint32_t>(g.bedrockDepthMm));
+            stats.digest.u8(static_cast<uint8_t>(g.surfaceMat));
+
+            const int64_t vx = int64_t(tile.originVx) + x, vy = int64_t(tile.originVy) + y;
+            if (verify) {
+                const ColumnSample& c = cpuCols[colIdx];
+                auto record = [&](const char* field, int64_t cpuVal, int64_t gpuVal) {
+                    if (cpuVal != gpuVal && stats.mismatches.size() < 20)
+                        stats.mismatches.push_back({vx, vy, field, cpuVal, gpuVal});
+                };
+                record("surfaceMm", c.surfaceMm, g.surfaceMm);
+                record("topsoilMm", c.topsoilMm, g.topsoilMm);
+                record("subsoilMm", c.subsoilMm, g.subsoilMm);
+                record("bedrockDepthMm", c.bedrockDepthMm, g.bedrockDepthMm);
+                record("surfaceMat", c.surfaceMat, g.surfaceMat);
+            }
+
+            const uint32_t bx = uint32_t(x) / 8u, by = uint32_t(y) / 8u, lx = uint32_t(x) % 8u,
+                           ly = uint32_t(y) % 8u;
+            const uint32_t footprintIndex = bx + bricksX * by;
+            for (uint32_t bz = 0; bz < bricksZ; ++bz) {
+                const size_t brickIndex = size_t(footprintIndex) * bricksZ + bz;
+                const int64_t brickZ = int64_t(brickZMin) + int64_t(bz);
+                for (uint32_t zLocal = 0; zLocal < 8u; ++zLocal) {
+                    const size_t cellIdx = brickIndex * 512 + cellIndexInBrick(lx, ly, zLocal);
+                    const uint8_t gpuMat = static_cast<uint8_t>(gpuCells[cellIdx] & 0xffu);
+                    stats.digest.u8(gpuMat);
+                    if (verify) {
+                        const int64_t vz = brickZ * 8 + zLocal;
+                        const uint8_t cpuMat =
+                            static_cast<uint8_t>(Amplifier::materialAt(cpuCols[colIdx], vz));
+                        if (cpuMat != gpuMat && stats.mismatches.size() < 20) {
+                            stats.mismatches.push_back(
+                                {vx, vy, "cell@vz=" + std::to_string(vz), cpuMat, gpuMat});
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    stats.totalInteriorBricks += size_t(mbx) * mby * mbz;
+    if (mbz > 0) {
+        if (verify) {
+            // Re-run the CPU mesher per interior brick and cross-check
+            // against the GPU quad stream, exactly like the default regions
+            // path above — but only for tiles selected for verification
+            // (running meshBrick<8> on every brick of every tile would make
+            // --radius 128's "sample every 8th tile" pointless).
+            std::vector<Quad> cpuQuads;
+            size_t gpuCursor = 0;
+            for (uint32_t iz = 0; iz < mbz; ++iz) {
+                for (uint32_t iy = 0; iy < mby; ++iy) {
+                    for (uint32_t ix = 0; ix < mbx; ++ix) {
+                        const int64_t ox = (int64_t(ix) + 1) * 8;
+                        const int64_t oy = (int64_t(iy) + 1) * 8;
+                        const int64_t oz = (int64_t(iz) + 1) * 8;
+                        const auto sampler = [&](int sx, int sy, int sz) -> MaterialId {
+                            const int64_t rvx = ox + sx, rvy = oy + sy;
+                            const int64_t vz = int64_t(brickZMin) * 8 + oz + sz;
+                            const ColumnSample& c = cpuCols[size_t(rvx) + size_t(rvy) * W];
+                            return Amplifier::materialAt(c, vz);
+                        };
+                        cpuQuads.clear();
+                        meshBrick<8>(sampler, cpuQuads);
+                        for (const Quad& q : cpuQuads) {
+                            const uint64_t gq =
+                                gpuCursor < running ? gpuQuads[gpuCursor] : ~0ull;
+                            const uint32_t w0 = uint32_t(gq & 0xffffffffu);
+                            const uint32_t w1 = uint32_t(gq >> 32);
+                            const uint8_t gAxis = w0 & 0xfu, gDir = (w0 >> 4) & 0xfu,
+                                          gSlice = (w0 >> 8) & 0xffu, gU0 = (w0 >> 16) & 0xffu,
+                                          gV0 = (w0 >> 24) & 0xffu;
+                            const uint8_t gW = w1 & 0xffu, gH = (w1 >> 8) & 0xffu,
+                                          gAo = (w1 >> 16) & 0xffu, gMat = (w1 >> 24) & 0xffu;
+                            stats.digest.u8(gAxis);
+                            stats.digest.u8(gDir);
+                            stats.digest.u8(gSlice);
+                            stats.digest.u8(gU0);
+                            stats.digest.u8(gV0);
+                            stats.digest.u8(gW);
+                            stats.digest.u8(gH);
+                            stats.digest.u8(gAo);
+                            stats.digest.u8(gMat);
+                            const bool same = gAxis == q.axis && gDir == q.positive &&
+                                              gSlice == q.slice && gU0 == q.u0 && gV0 == q.v0 &&
+                                              gW == q.w && gH == q.h && gAo == q.ao &&
+                                              gMat == q.mat;
+                            if (!same && stats.mismatches.size() < 20) {
+                                stats.mismatches.push_back(
+                                    {int64_t(ix), int64_t(iy),
+                                     "quad@tile(" + std::to_string(tile.tx) + "," +
+                                         std::to_string(tile.ty) + ")brick(" +
+                                         std::to_string(ix) + "," + std::to_string(iy) + "," +
+                                         std::to_string(iz) + ")#" + std::to_string(gpuCursor),
+                                     int64_t(q.mat), int64_t(gMat)});
+                            }
+                            ++gpuCursor;
+                        }
+                    }
+                }
+            }
+            if (gpuCursor != running && stats.mismatches.size() < 20) {
+                stats.mismatches.push_back({int64_t(tile.tx), int64_t(tile.ty),
+                                             "quadCount total (cpu vs gpu)", int64_t(gpuCursor),
+                                             int64_t(running)});
+            }
+        } else {
+            // Not verified: digest the raw GPU quad stream directly (same
+            // byte decode/order as the verify branch above) without paying
+            // for the CPU mesher.
+            for (size_t i = 0; i < running; ++i) {
+                const uint64_t gq = gpuQuads[i];
+                const uint32_t w0 = uint32_t(gq & 0xffffffffu), w1 = uint32_t(gq >> 32);
+                stats.digest.u8(static_cast<uint8_t>(w0 & 0xfu));
+                stats.digest.u8(static_cast<uint8_t>((w0 >> 4) & 0xfu));
+                stats.digest.u8(static_cast<uint8_t>((w0 >> 8) & 0xffu));
+                stats.digest.u8(static_cast<uint8_t>((w0 >> 16) & 0xffu));
+                stats.digest.u8(static_cast<uint8_t>((w0 >> 24) & 0xffu));
+                stats.digest.u8(static_cast<uint8_t>(w1 & 0xffu));
+                stats.digest.u8(static_cast<uint8_t>((w1 >> 8) & 0xffu));
+                stats.digest.u8(static_cast<uint8_t>((w1 >> 16) & 0xffu));
+                stats.digest.u8(static_cast<uint8_t>((w1 >> 24) & 0xffu));
+            }
+        }
+    }
+    stats.cpuCompareMs += msSince(tCmp0);
+
+    ++stats.totalTiles;
+    stats.totalColumns += size_t(W) * H;
+    stats.totalCells += size_t(bricksX) * bricksY * bricksZ * 512;
+    stats.totalQuads += running;
+    if (verify) {
+        ++stats.verifiedTiles;
+        stats.verifiedColumns += size_t(W) * H;
+        stats.verifiedCells += size_t(bricksX) * bricksY * bricksZ * 512;
+        stats.verifiedQuads += running;
+    }
+}
+
+int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
+    const TileGrid grid = buildTileGrid(radiusM);
+    const int32_t coveredBricks = grid.numTiles * kInteriorBricks;
+    const double coveredMetres = coveredBricks * kBrick * kVoxelSizeMm / 1000.0;
+    const double requestedMetres = double(radiusM) * 2.0;
+    std::printf(
+        "\n=== GATE MODE: radius %lldm (seed %llu) ===\n"
+        "tile grid: %dx%d tiles (%zu total), 128x128-column dispatch, 14x14-brick "
+        "(112-column) interior, 1-brick shared halo\n"
+        "brick coord range [%d, %d] (%d bricks/side); covered square %.1fm/side "
+        "(requested %.1fm — the last tile row/col overshoots slightly so interiors stay "
+        "brick-aligned and gapless)\n",
+        (long long)radiusM, (unsigned long long)seed, grid.numTiles, grid.numTiles,
+        grid.tiles.size(), grid.bMin, grid.bMax, grid.bMax - grid.bMin + 1, coveredMetres,
+        requestedMetres);
+
+    const bool fullVerify = radiusM <= kFullVerifyRadiusM;
+    std::printf("verification: %s\n",
+                fullVerify ? "FULL (every tile)"
+                           : "SAMPLED (every 8th tile, deterministic linear tile index)");
+
+    GateBuffers gb;
+    gb.paramsBuf = ctx.createBuffer(sizeof(WorldGenParamsCB), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    gb.columnsBuf = ctx.createBuffer(
+        VkDeviceSize(kTileColumns) * kTileColumns * sizeof(GpuColumnSample),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    gb.quadsStub = ctx.createBuffer(sizeof(uint64_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    gb.elevBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    gb.climBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    gb.cellsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    gb.countsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    gb.offsetsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    gb.quadsBuf.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
+    SyntheticTileSampler tiles(seed);
+    Amplifier amp(seed, tiles);
+
+    GateStats stats;
+    const auto tRunStart = Clock::now();
+    for (const TileSpec& t : grid.tiles) {
+        const int32_t linearIndex = t.ty * grid.numTiles + t.tx;
+        const bool verify = fullVerify || (linearIndex % kVerifySampleStride == 0);
+        runTile(ctx, gb, t, seed, tiles, amp, verify, stats);
+        if ((linearIndex + 1) % 32 == 0 || linearIndex + 1 == int32_t(grid.tiles.size())) {
+            std::printf("  tile %d/%d done (grid %d,%d)\n", linearIndex + 1,
+                        int(grid.tiles.size()), t.tx, t.ty);
+        }
+    }
+    const double wallMs = msSince(tRunStart);
+
+    ctx.destroyBuffer(gb.paramsBuf);
+    ctx.destroyBuffer(gb.columnsBuf);
+    ctx.destroyBuffer(gb.quadsStub);
+    if (gb.elevBuf.buf.buffer) ctx.destroyBuffer(gb.elevBuf.buf);
+    if (gb.climBuf.buf.buffer) ctx.destroyBuffer(gb.climBuf.buf);
+    if (gb.cellsBuf.buf.buffer) ctx.destroyBuffer(gb.cellsBuf.buf);
+    if (gb.countsBuf.buf.buffer) ctx.destroyBuffer(gb.countsBuf.buf);
+    if (gb.offsetsBuf.buf.buffer) ctx.destroyBuffer(gb.offsetsBuf.buf);
+    if (gb.quadsBuf.buf.buffer) ctx.destroyBuffer(gb.quadsBuf.buf);
+
+    const double gateSec = stats.gateMs / 1000.0;
+    const double verifiedFraction =
+        stats.totalTiles ? double(stats.verifiedTiles) / double(stats.totalTiles) : 0.0;
+    const double namedStagesMs = stats.columnMs + stats.voxelizeMs + stats.meshCountMs +
+                                  stats.meshEmitMs + stats.hostScanMs;
+
+    std::printf(
+        "\n--- GATE stage totals (radius %lldm, %zu tiles) ---\n"
+        "  columns dispatch:       %10.3f ms\n"
+        "  voxelize dispatch:      %10.3f ms\n"
+        "  mesh count dispatch:    %10.3f ms\n"
+        "  mesh emit dispatch:     %10.3f ms\n"
+        "  host prefix scan:       %10.3f ms\n"
+        "  (marshalling overhead:  %10.3f ms -- buffer ensure/grow, descriptor writes, "
+        "WorldGenParams upload, raster fill)\n"
+        "  GATE TOTAL (gpu path):  %10.3f ms  = %.3f s\n"
+        "  CPU column pass (setup, excluded from gate):         %10.3f ms\n"
+        "  CPU compare + digest (verification, excluded from gate): %10.3f ms\n"
+        "  wall clock (everything, incl. both excluded costs):  %10.3f ms\n",
+        (long long)radiusM, stats.totalTiles, stats.columnMs, stats.voxelizeMs,
+        stats.meshCountMs, stats.meshEmitMs, stats.hostScanMs, stats.gateMs - namedStagesMs,
+        stats.gateMs, gateSec, stats.cpuColumnPassMs, stats.cpuCompareMs, wallMs);
+
+    std::printf("\nGATE radius=%lldm: %.3f s (target: <1.000 s, plan sec4 M0) -> %s\n",
+                (long long)radiusM, gateSec, gateSec < 1.0 ? "PASS" : "OVER TARGET");
+
+    std::printf(
+        "\nverified %zu/%zu tiles (%.1f%%): %zu/%zu columns, %zu/%zu cells, %zu/%zu quads "
+        "compared; %zu interior bricks meshed total (all tiles, verified or not)\n",
+        stats.verifiedTiles, stats.totalTiles, verifiedFraction * 100.0, stats.verifiedColumns,
+        stats.totalColumns, stats.verifiedCells, stats.totalCells, stats.verifiedQuads,
+        stats.totalQuads, stats.totalInteriorBricks);
+
+    std::printf(
+        "buffer reallocations across the run (elev/clim/cells/counts/offsets/quads combined): "
+        "%zu (small and front-loaded -- buffers grow to a working-set size within the first "
+        "few tiles, then every later tile reuses them as-is)\n",
+        gb.totalReallocs());
+
+    std::printf(
+        "GATE output digest (columns + cells + quads, ALL gpu output, seed %llu): %016llx\n",
+        (unsigned long long)seed, (unsigned long long)stats.digest.h);
+
+    if (!stats.mismatches.empty()) {
+        std::printf("\nFAIL: %zu mismatch(es) found in the verified sample (showing up to 20):\n",
+                    stats.mismatches.size());
+        for (const Mismatch& m : stats.mismatches) {
+            std::printf("  (vx=%lld, vy=%lld) %s: cpu=%lld gpu=%lld\n", (long long)m.vx,
+                        (long long)m.vy, m.field.c_str(), (long long)m.cpuVal,
+                        (long long)m.gpuVal);
+        }
+        return 1;
+    }
+
+    std::printf("\nPASS: GPU output bit-exact with the CPU reference over the verified sample "
+                "(radius %lldm)\n",
+                (long long)radiusM);
+    return 0;
+}
+
+} // namespace gate
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1062,12 +1776,14 @@ int main(int argc, char** argv) {
     std::string voxelizeSpvPath = VXC_SPV_PATH_VOXELIZE;
     std::string meshCountSpvPath = VXC_SPV_PATH_MESHCOUNT;
     std::string meshEmitSpvPath = VXC_SPV_PATH_MESHEMIT;
+    int64_t gateRadiusM = -1; // -1 = not specified -> default regions mode (unchanged)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--spv" && i + 1 < argc) spvPath = argv[++i];
         else if (a == "--spv-voxelize" && i + 1 < argc) voxelizeSpvPath = argv[++i];
         else if (a == "--spv-meshcount" && i + 1 < argc) meshCountSpvPath = argv[++i];
         else if (a == "--spv-meshemit" && i + 1 < argc) meshEmitSpvPath = argv[++i];
+        else if (a == "--radius" && i + 1 < argc) gateRadiusM = std::atoll(argv[++i]);
     }
 
     std::printf(
@@ -1078,6 +1794,13 @@ int main(int argc, char** argv) {
     loadVulkanLoader();
     GpuContext ctx = createContext(spvPath, voxelizeSpvPath, meshCountSpvPath, meshEmitSpvPath);
     std::printf("device: %s\n\n", ctx.deviceName.c_str());
+
+    if (gateRadiusM >= 0) {
+        const int rc = gate::runGateMode(ctx, gateRadiusM, seed);
+        destroyContext(ctx);
+        FreeLibrary(g_vulkanDll);
+        return rc;
+    }
 
     const RegionSpec regions[] = {
         {"origin", -64, -64, 128, 128},

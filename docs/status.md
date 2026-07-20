@@ -7,8 +7,8 @@ gate definitions.
 
 | Gate | Status | Notes |
 |---|---|---|
-| Amplify+mesh 128m radius < 1s on RTX 3060 | ⬜ open | CPU reference done; GPU compute port not started (needs GPU machine). Baseline (2026-07-19, single-threaded CPU ref, container hardware): 128m radius = **10.6s** with 8³ bricks, **14.9s** with 16³ (amplify 4.3s / mesh 5.9s dominate at 8³). GPU port + parallel columns must close ~10–15×, which is the expected shape of the win. |
-| Bit-identical amplifier output NVIDIA vs AMD | 🟨 half-open | **AMD leg PASSING** (2026-07-19): `vxc_gpu` (voxel-core/bench/gpu_harness.cpp, ADR-0001) dispatches the SPIR-V worldgen kernel (build/shaders/worldgen.ColumnMain.spv) on this desktop's AMD Radeon RX 7800 XT via a headless Vulkan 1.1 harness and byte-compares every field of every column against `vxc::Amplifier::column` — bit-exact over 32,768 columns across two dispatch regions (near-origin and a far/negative-coordinate region), digest `be28ce960bd5bcf6`. NVIDIA leg still open: needs a rented/CI Linux+NVIDIA runner producing the same `vxc_gpu` digest (ADR-0001 gate = identical digest on both legs). Interim cross-*compiler* proxy (gcc/clang/MSVC digests) still green as a secondary signal; see `determinism-cross-compiler` in CI. |
+| Amplify+mesh 128m radius < 1s on RTX 3060 | 🟨 half-open | **AMD leg measured (2026-07-19)**: `vxc_gpu --radius <m>` (voxel-core/bench/gpu_harness.cpp) now runs the FULL GPU pipeline (ColumnMain→VoxelizeMain→MeshCount/EmitMain) over every surface-shell brick in a horizontal radius, tiled into 128×128-column dispatches with a 1-brick shared halo (14×14-brick/112-column interior per tile — partitions the target square with no gaps, no double-meshing). On this desktop's AMD Radeon RX 7800 XT: **radius 64m = 0.678s** (PASS, under target) and **radius 128m = 2.388s** (OVER target) — end-to-end gate time excludes per-tile CPU column setup and CPU-reference comparison, both timed and reported separately. At 128m the host prefix-scan step (CPU reads GPU-mapped mesh-mask counts, writes back scan offsets, between the count and emit dispatches) is the single largest bucket (1.20s of 2.39s) — larger than all four GPU dispatch stages combined (1.07s) — pointing at CPU↔GPU-mapped-memory round-trip cost in the count→scan→emit chain, not raw compute throughput, as the next optimization target (gpu-mesher-design.md's mesher lists moving the scan to GPU as exactly this contingency). NVIDIA leg still needs to run the same `vxc_gpu --radius 64/128` and compare digests. CPU reference baseline (single-threaded, container hardware) unchanged below. |
+| Bit-identical amplifier output NVIDIA vs AMD | 🟨 half-open | **AMD leg PASSING** (2026-07-19): `vxc_gpu` (voxel-core/bench/gpu_harness.cpp, ADR-0001) dispatches the SPIR-V worldgen kernel (build/shaders/worldgen.ColumnMain.spv) on this desktop's AMD Radeon RX 7800 XT via a headless Vulkan 1.1 harness and byte-compares every field of every column against `vxc::Amplifier::column` — bit-exact over 32,768 columns across two dispatch regions (near-origin and a far/negative-coordinate region), digest `be28ce960bd5bcf6`. **`--radius` gate mode PASSING too** (2026-07-19, seed 20260719): full columns+cells+quads comparison at radius 64m (144/144 tiles, 100% verified: 2,359,296 columns / 87,687,168 cells / 1,129,674 quads, digest `e1db29a9b6874012`) and a deterministic every-8th-tile sample at radius 128m (67/529 tiles, 12.7% verified: 1,097,728 columns / 39,583,744 cells / 497,132 quads, digest `583e91d62cefb8a9`) — zero mismatches in both, and the digest covers ALL GPU output (not just the verified sample) so it's comparable across differently-sampled runs. NVIDIA leg still open: needs a rented/CI Linux+NVIDIA runner producing the same `vxc_gpu` digests (ADR-0001 gate = identical digest on both legs, for both the column-only regions AND the `--radius` gate digests). Interim cross-*compiler* proxy (gcc/clang/MSVC digests) still green as a secondary signal; see `determinism-cross-compiler` in CI. |
 
 ### Early 8³ vs 16³ data (CPU ref, will re-decide after GPU port)
 
@@ -27,8 +27,9 @@ call needs GPU meshing + render/memory numbers (M1).
 - [x] Greedy mesher (CPU ref); bricks/sec + 128m-radius wall-clock in bench
 - [x] Edit overlay + append-only log format (versioned, RLE brick diffs) + replay test
 - [ ] terrain-diffusion worker running (GPU machine)
-- [x] GPU compute port of amplifier (worldgen.hlsl ColumnMain, Vulkan harness verified bit-exact on AMD leg); mesher GPU port still pending
-- [ ] Cross-vendor (NV vs AMD) determinism CI (AMD leg passing locally; NVIDIA leg needs a rented/CI runner)
+- [x] GPU compute port of amplifier (worldgen.hlsl ColumnMain, Vulkan harness verified bit-exact on AMD leg); mesher GPU port (MeshCount/EmitMain) also landed and verified bit-exact
+- [x] `vxc_gpu --radius <m>` M0 gate driver: tiled full pipeline (columns→voxelize→mesh) over every surface-shell brick in a radius; AMD leg measured, see gate row above
+- [ ] Cross-vendor (NV vs AMD) determinism CI (AMD leg passing locally, both column-only and `--radius` gate digests recorded; NVIDIA leg needs a rented/CI runner)
 
 ## M1 — Walkable world in UE5 (IN PROGRESS, stages 1–2 verified on screen)
 
@@ -46,10 +47,13 @@ Working plan + binding decisions: docs/m1-plan.md. UE 5.8.0 (retargeted
 
 ## M0 GPU track (ADR-0001)
 
-- [x] Worldgen HLSL kernel (ColumnMain) mirrors CPU reference; compiles to
-  DXIL + SPIR-V from one source (pinned DXC 1.9, tools/compile-shaders.ps1)
-- [ ] Vulkan headless harness: dispatch + byte-compare vs CPU reference on
-  the AMD leg (this desktop), then a cloud NVIDIA leg → closes both M0 gates
+- [x] Worldgen HLSL kernel (ColumnMain, VoxelizeMain, MeshCountMain,
+  MeshEmitMain) mirrors CPU reference; compiles to DXIL + SPIR-V from one
+  source (pinned DXC 1.9, tools/compile-shaders.ps1)
+- [x] Vulkan headless harness: dispatch + byte-compare vs CPU reference on
+  the AMD leg (this desktop) — both the column-only regions mode and the
+  `--radius` full-pipeline gate mode. Still needs a cloud NVIDIA leg
+  producing matching digests → closes both M0 gates
 
 ## Water track — W1 first slice landed (2026-07-19)
 

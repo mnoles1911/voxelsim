@@ -56,6 +56,9 @@ private:
 	void OnChargeStart();
 	void OnChargeRelease();
 
+	// docs/debug-tooling-plan.md P1 "CVars + F3": cycles voxel.Debug 0->1->2->0.
+	void OnCycleDebugMode();
+
 	int32 DigSizeVoxels = 1;
 
 	// vxc::MAT_ROCK == 2 (voxelcore/core.h); kept as a numeric literal here

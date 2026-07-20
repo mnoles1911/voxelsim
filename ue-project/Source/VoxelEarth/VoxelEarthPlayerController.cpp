@@ -4,6 +4,7 @@
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
 #include "InputCoreTypes.h"
+#include "VoxelDebug.h"
 #include "VoxelExplosive.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -33,6 +34,10 @@ void AVoxelEarthPlayerController::SetupInputComponent()
 	// Explosive charge/throw (m1-plan.md "Explosives v1" row).
 	InputComponent->BindKey(EKeys::F, IE_Pressed, this, &AVoxelEarthPlayerController::OnChargeStart);
 	InputComponent->BindKey(EKeys::F, IE_Released, this, &AVoxelEarthPlayerController::OnChargeRelease);
+
+	// docs/debug-tooling-plan.md P1 "CVars + F3": F3 cycles voxel.Debug
+	// 0(off)->1(perf HUD)->2(HUD+visualizations)->0 in PIE/game.
+	InputComponent->BindKey(EKeys::F3, IE_Pressed, this, &AVoxelEarthPlayerController::OnCycleDebugMode);
 }
 
 void AVoxelEarthPlayerController::OnDig()
@@ -157,6 +162,11 @@ void AVoxelEarthPlayerController::OnChargeRelease()
 	{
 		Explosive->Launch(ThrowDirection * ThrowSpeedUU);
 	}
+}
+
+void AVoxelEarthPlayerController::OnCycleDebugMode()
+{
+	VoxelDebug::CycleDebugMode();
 }
 
 float AVoxelEarthPlayerController::GetExplosiveChargeAlpha() const
