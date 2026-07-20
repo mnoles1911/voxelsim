@@ -264,6 +264,38 @@ void AVoxelEarthGameMode::BeginPlay()
 			ServerDumpDigestAfterSeconds, false);
 	}
 
+	// M3 wave 2 persistence verification (docs/m3-plan.md "Save/load"):
+	// -VoxelSaveWorldAfter=<s> calls the same UVoxelWorldSubsystem::SaveWorld()
+	// the voxel.SaveWorld console command uses, logs entries/digest, then
+	// self-quits a few seconds later -- same convenience pattern as
+	// -VoxelDumpDigestAfter above. Combine with -VoxelHeadlessDigTest (a
+	// smaller delay) so the save captures the dig's edits, e.g.
+	// -VoxelHeadlessDigTest=20 -VoxelSaveWorldAfter=25.
+	float SaveWorldAfterSeconds = 0.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelSaveWorldAfter="), SaveWorldAfterSeconds) && SaveWorldAfterSeconds > 0.f)
+	{
+		GetWorldTimerManager().SetTimer(
+			SaveWorldTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this]()
+				{
+					UWorld* SaveWorldPtr = GetWorld();
+					UVoxelWorldSubsystem* Subsystem = SaveWorldPtr ? SaveWorldPtr->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					if (!Subsystem)
+					{
+						return;
+					}
+					const bool bOk = Subsystem->SaveWorld();
+					UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSaveWorldAfter: SaveWorld() -> %s (editedDigest=0x%016llX)"),
+					       bOk ? TEXT("OK") : TEXT("FAILED"), (unsigned long long)Subsystem->GetEditedDigest());
+
+					GetWorldTimerManager().SetTimer(
+						SaveWorldQuitTimerHandle,
+						FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(/*bForce*/ false); }), 5.f, false);
+				}),
+			SaveWorldAfterSeconds, false);
+	}
+
 	// Unattended visual verification: -VoxelScreenshotAfter=<seconds> waits
 	// for streaming to populate, captures a screenshot, then quits ~3s later
 	// (screenshot write is async). Drives phase-verification captures from

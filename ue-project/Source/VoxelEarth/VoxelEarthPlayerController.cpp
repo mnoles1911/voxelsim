@@ -145,14 +145,48 @@ void AVoxelEarthPlayerController::BeginPlay()
 	}
 }
 
+bool AVoxelEarthPlayerController::TryConsumeIntentToken(const TCHAR* IntentName)
+{
+	// M3 wave 2 "Validation hardening" (docs/m3-plan.md): continuous-refill
+	// token bucket, capacity == voxel.Server.MaxIntentsPerSec. Starts full
+	// (not empty) on first use so a client's very first post-join intent
+	// isn't throttled by bucket-warm-up.
+	const UWorld* World = GetWorld();
+	const double NowSeconds = World ? World->GetTimeSeconds() : 0.0;
+	const double MaxPerSec = FMath::Max(1, VoxelDebug::GetServerMaxIntentsPerSec());
+
+	if (LastIntentTokenRefillSeconds < 0.0)
+	{
+		IntentTokens = MaxPerSec;
+		LastIntentTokenRefillSeconds = NowSeconds;
+	}
+	const double ElapsedSeconds = FMath::Max(0.0, NowSeconds - LastIntentTokenRefillSeconds);
+	LastIntentTokenRefillSeconds = NowSeconds;
+	IntentTokens = FMath::Min(MaxPerSec, IntentTokens + ElapsedSeconds * MaxPerSec);
+
+	if (IntentTokens < 1.0)
+	{
+		UE_LOG(LogVoxelEdit, Warning,
+		       TEXT("%s rejected: rate cap exceeded (voxel.Server.MaxIntentsPerSec=%.0f) for %s"), IntentName, MaxPerSec,
+		       *GetName());
+		return false;
+	}
+	IntentTokens -= 1.0;
+	return true;
+}
+
 bool AVoxelEarthPlayerController::ServerSubmitDigIntent_Validate(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels)
 {
-	return SizeVoxels >= 1 && SizeVoxels <= 8; // Subsystem clamps again to Min/MaxCubeSizeVoxels -- this just bounds the wire value
+	return SizeVoxels >= 1 && SizeVoxels <= 8; // loose wire-value sanity bound; the real cap is enforced (and logged) below
 }
 
 void AVoxelEarthPlayerController::ServerSubmitDigIntent_Implementation(const FVector& CameraLoc, const FVector& CameraDir,
                                                                         int32 SizeVoxels)
 {
+	if (!TryConsumeIntentToken(TEXT("ServerSubmitDigIntent")))
+	{
+		return;
+	}
 	UWorld* World = GetWorld();
 	UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
 	APawn* MyPawn = GetPawn();
@@ -171,9 +205,19 @@ void AVoxelEarthPlayerController::ServerSubmitDigIntent_Implementation(const FVe
 		UE_LOG(LogVoxelEdit, Warning, TEXT("ServerSubmitDigIntent rejected: camera origin too far from owning pawn."));
 		return;
 	}
+	// M3 wave 2 "Validation hardening": size-cap enforcement (dig/place <=
+	// MaxCubeSizeVoxels) -- rejected (logged), not silently clamped: a
+	// client claiming an oversized cube gets nothing applied rather than a
+	// smaller-than-requested edit it didn't ask for.
+	if (SizeVoxels > UVoxelWorldSubsystem::MaxCubeSizeVoxels)
+	{
+		UE_LOG(LogVoxelEdit, Warning, TEXT("ServerSubmitDigIntent rejected: SizeVoxels=%d exceeds MaxCubeSizeVoxels=%d"), SizeVoxels,
+		       UVoxelWorldSubsystem::MaxCubeSizeVoxels);
+		return;
+	}
 	// Same edit path a local server-side dig uses -- re-validates range
-	// (raycast cap) and size caps identically (UVoxelWorldSubsystem::TryDig,
-	// authority branch: applies directly + broadcasts).
+	// (raycast cap) identically (UVoxelWorldSubsystem::TryDig, authority
+	// branch: applies directly + broadcasts).
 	Subsystem->TryDig(CameraLoc, CameraDir, SizeVoxels);
 }
 
@@ -187,6 +231,10 @@ void AVoxelEarthPlayerController::ServerSubmitPlaceIntent_Implementation(const F
                                                                           int32 SizeVoxels, uint8 MaterialId,
                                                                           const FVector& PlayerActorLocation)
 {
+	if (!TryConsumeIntentToken(TEXT("ServerSubmitPlaceIntent")))
+	{
+		return;
+	}
 	UWorld* World = GetWorld();
 	UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
 	APawn* MyPawn = GetPawn();
@@ -201,6 +249,12 @@ void AVoxelEarthPlayerController::ServerSubmitPlaceIntent_Implementation(const F
 		UE_LOG(LogVoxelEdit, Warning, TEXT("ServerSubmitPlaceIntent rejected: claimed camera/player location too far from owning pawn."));
 		return;
 	}
+	if (SizeVoxels > UVoxelWorldSubsystem::MaxCubeSizeVoxels)
+	{
+		UE_LOG(LogVoxelEdit, Warning, TEXT("ServerSubmitPlaceIntent rejected: SizeVoxels=%d exceeds MaxCubeSizeVoxels=%d"), SizeVoxels,
+		       UVoxelWorldSubsystem::MaxCubeSizeVoxels);
+		return;
+	}
 	Subsystem->TryPlace(CameraLoc, CameraDir, SizeVoxels, MaterialId, PlayerActorLocation);
 }
 
@@ -208,14 +262,19 @@ bool AVoxelEarthPlayerController::ServerSubmitCarveIntent_Validate(const FVector
 {
 	// Generous caps derived from AVoxelExplosive's tuning (VoxelExplosive.h:
 	// BlastRadiusUU=300, BlastJitterUU=30) -- explosives are the only
-	// current CarveSphere caller, thrown up to ~60m; a v1 sanity bound, not
-	// a precise validation (CarveSphere itself has no size-cap concept the
-	// way TryDig/TryPlace do).
+	// current CarveSphere caller, thrown up to ~60m; a v1 sanity bound
+	// (rejects garbage/negative/NaN-ish wire values), not the real game-rule
+	// cap -- that (voxel.Server.MaxCarveRadiusUU, default 400) is enforced
+	// (and logged) below.
 	return RadiusUU > 0.f && RadiusUU <= 1000.f && FMath::Abs(JitterUU) <= 300.f;
 }
 
 void AVoxelEarthPlayerController::ServerSubmitCarveIntent_Implementation(const FVector& CenterUU, float RadiusUU, float JitterUU)
 {
+	if (!TryConsumeIntentToken(TEXT("ServerSubmitCarveIntent")))
+	{
+		return;
+	}
 	UWorld* World = GetWorld();
 	UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
 	APawn* MyPawn = GetPawn();
@@ -227,6 +286,14 @@ void AVoxelEarthPlayerController::ServerSubmitCarveIntent_Implementation(const F
 	if (FVector::Dist(CenterUU, MyPawn->GetActorLocation()) > MaxThrowDistanceUU)
 	{
 		UE_LOG(LogVoxelEdit, Warning, TEXT("ServerSubmitCarveIntent rejected: carve center too far from owning pawn."));
+		return;
+	}
+	// M3 wave 2 "Validation hardening": carve radius <= voxel.Server.MaxCarveRadiusUU (default 400 UU).
+	const float MaxRadiusUU = VoxelDebug::GetServerMaxCarveRadiusUU();
+	if (RadiusUU > MaxRadiusUU)
+	{
+		UE_LOG(LogVoxelEdit, Warning, TEXT("ServerSubmitCarveIntent rejected: RadiusUU=%.1f exceeds voxel.Server.MaxCarveRadiusUU=%.1f"),
+		       RadiusUU, MaxRadiusUU);
 		return;
 	}
 	Subsystem->CarveSphere(CenterUU, (double)RadiusUU, (double)JitterUU);
@@ -242,8 +309,13 @@ void AVoxelEarthPlayerController::ServerRequestJoinSync_Implementation()
 		return;
 	}
 
+	// M3 wave 2 "Join-sync compaction" (docs/m3-plan.md): send the COMPACTED
+	// log instead of the raw full log -- fewer/smaller chunks for the exact
+	// same replayed overlay state (see UVoxelWorldSubsystem::
+	// SerializeCompactedLogEntries's doc comment). The server's own live log
+	// (Impl->Voxels.log()) is never mutated by this.
 	TArray<uint8> FullBytes;
-	Subsystem->SerializeLogEntriesFrom(0, FullBytes);
+	Subsystem->SerializeCompactedLogEntries(FullBytes);
 
 	if (FullBytes.Num() == 0)
 	{

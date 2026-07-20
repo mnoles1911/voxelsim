@@ -202,6 +202,19 @@ public:
 	void SerializeLogEntriesFrom(uint64 FromSeq, TArray<uint8>& OutBytes) const;
 	uint64 GetLogSize() const;
 
+	// M3 wave 2 "Join-sync compaction" (docs/m3-plan.md): same flat wire
+	// format as SerializeLogEntriesFrom, but built from
+	// vxc::compactLog(Impl->Voxels.log()) instead of the raw log -- one
+	// last-write-wins entry per touched brick, so a join-syncing client
+	// receives fewer/smaller chunks for the exact same replayed overlay
+	// state (compactLog is proven digest-equal to its source by
+	// voxelcore/editcompact.h's own tests). The server's live in-memory log
+	// is never mutated -- compaction only ever produces this outgoing copy
+	// (append-only doctrine). Used by AVoxelEarthPlayerController::
+	// ServerRequestJoinSync in place of the old SerializeLogEntriesFrom(0, ...)
+	// call.
+	void SerializeCompactedLogEntries(TArray<uint8>& OutBytes) const;
+
 	// Parses OutBytes (SerializeLogEntriesFrom's format) and applies every
 	// entry through the same World::applyEdit path TryDig/TryPlace/
 	// CarveSphere use (one call per brick), reconciling any matching pending
@@ -234,6 +247,23 @@ public:
 	// command-line switch (AVoxelEarthGameMode / AVoxelEarthPlayerController).
 	uint64 GetEditedDigest() const;
 
+	// --- M3 wave 2: persistence (docs/m3-plan.md "Save/load") -----------------
+	//
+	// Saves the edit log to Saved/VoxelWorlds/<seed>.vxlog (EditLog::serialize
+	// format -- the same format voxel-core/bench/editlog_tool.cpp's `stats`/
+	// `verify` commands already read), compacting first
+	// (voxelcore/editcompact.h's compactLog) when the raw log has more than
+	// 2x its compacted entry count -- only the on-disk copy is ever
+	// compacted; Impl->Voxels.log() itself (the live append-only log) is
+	// never mutated. Atomic tmp+rename write (never leaves a truncated file
+	// if the process dies mid-write). Authority only (server/listen/
+	// standalone): returns false (logged warning, no-op) if called on
+	// NM_Client, since a client has no authoritative log of its own to save
+	// -- it relies on join-sync from the server instead. Also invoked by the
+	// voxel.SaveWorld console command and automatically from Deinitialize
+	// (autosave-on-shutdown). Returns true on success.
+	bool SaveWorld() const;
+
 private:
 	// Join-sync buffering state (client only; see BeginJoinSync above).
 	TArray<uint8> JoinSyncAccumulator;
@@ -244,6 +274,17 @@ private:
 	// M2 task "Config-driven seed": resolved in Initialize() from -VoxelSeed=
 	// (default DefaultSeed); see GetSeed() above.
 	uint64 Seed = DefaultSeed;
+
+	// M3 wave 2 persistence (docs/m3-plan.md "Save/load"): set true once
+	// OnWorldBeginPlay actually runs its game-world/Impl-present body (i.e.
+	// this instance's UWorld is a genuine gameplay world, not the transient
+	// "Entry"/loading UWorld that -game/-server launches also construct a
+	// subsystem instance for -- that phantom instance's Impl is a freshly-
+	// constructed EMPTY world that never sees OnWorldBeginPlay before being
+	// torn down, and Deinitialize's autosave must NOT write that empty state
+	// over a real save file. Checked (not just Impl-non-null) before
+	// Deinitialize calls SaveWorld().
+	bool bWorldBegunPlay = false;
 
 	TUniquePtr<FVoxelWorldImpl> Impl;
 

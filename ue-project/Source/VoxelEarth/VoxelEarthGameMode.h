@@ -41,4 +41,15 @@ private:
 	// needing to be killed externally.
 	FTimerHandle ServerDumpDigestTimerHandle;
 	FTimerHandle ServerDigestQuitTimerHandle;
+
+	// M3 wave 2 persistence verification (docs/m3-plan.md "Save/load"):
+	// -VoxelSaveWorldAfter=<s> calls the same UVoxelWorldSubsystem::SaveWorld()
+	// the voxel.SaveWorld console command uses, logs the result (entries +
+	// editedDigest), then self-quits a few seconds later -- same headless-run
+	// convenience as ServerDumpDigestTimerHandle above. Works on any
+	// authority role (standalone/listen/dedicated server all run
+	// GameMode::BeginPlay server-side); SaveWorld() itself already no-ops
+	// (with a warning) if this somehow runs on NM_Client.
+	FTimerHandle SaveWorldTimerHandle;
+	FTimerHandle SaveWorldQuitTimerHandle;
 };
