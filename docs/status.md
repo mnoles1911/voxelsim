@@ -303,6 +303,65 @@ transition, no screenshot), swim-mode placeholder in `AVoxelEarthFlyPawn`
 (gravity off, fly-style 300 UU/s below sea level). No pressure CA, reservoirs,
 buoyancy, or currents yet -- those are W2-W4.
 
+## Water track — W2 groundwork: pressure CA core landed (2026-07-20, worktree agent)
+
+Engine-free CPU reference for plan §3.7 Layer B ("THE AUTHORITY"), voxel-core
+only (no UE/engine touch this pass -- UE integration, reservoirs, replication
+are W2-proper, after M3). `voxelcore/waterca.h` + `src/waterca.cpp`:
+`WaterBrick8` (dense 8^3 fill-fraction array 0-255, homogeneous-empty
+collapse = absence from the map rather than Brick<8>'s in-place
+representation, since fill has no other homogeneous value worth keeping) +
+`WaterMap` (BrickKey-hashed, mirrors `ChunkMap<B>`'s shape) + `WaterCA`
+(owns the water map, an injected `MaterialId(vx,vy,vz)` solid-query callback
+so the header stays terrain-free, and an active-brick set). Tick rules v0:
+GRAVITY (each cell moves what fits into the non-solid, non-full cell below)
+then LATERAL (a cell resting on solid-or-full support equalizes with its 4
+horizontal neighbors in fixed +x/-x/+y/-y order, flow=(self-neighbor)/4
+with a minimum of 1 whenever self>neighbor+1, capped both ends) then a
+documented HYDROSTATIC no-op stub (U-bend column pressure is W2-proper).
+Both real phases run as a single fixed-order sequential sweep (sorted
+BrickKeyLess bricks, ascending cellIndex within each) over exactly the
+active-set snapshot taken at `step()` entry -- v0 is deliberately in-place/
+sequential, not a read-flows/apply scheme (that's left as a documented
+requirement for a future parallel/GPU port, exactly like the amplifier's
+CPU-reference-first discipline). A brick's key lands in the next tick's
+active set iff it was the source or destination of an actual change this
+tick (this is how neighbor reactivation and settling-out both fall out of
+one rule); `totalVolume()` is an O(1) running ledger, `recomputeVolume()`
+independently re-sums every stored brick for cross-checking it.
+
+**Discovered while writing the pooling test**: the lateral rule's stable
+fixed point is a local "sandpile" property (no two horizontally-adjacent
+open cells differ by more than 1 once fully settled) rather than a single
+global plateau -- a walled 5x5 basin forced to full coverage settled to
+[19,21] (span 2, not 1), and an unwalled flat-floor drop settled into a
+smooth cone (values 1-7) with every adjacent pair within 1 but a large
+global span. Both are correct, provable fixed points of the specified
+`(self-neighbor)/4, min 1 if self>neighbor+1` formula under the fixed
++x/-x/+y/-y sweep order (a Gauss-Seidel-style sweep is not perfectly
+symmetric by construction) -- not a bug. The pooling test was written
+against the adjacency-local invariant instead of a global-span check.
+
+Tests (`voxel-core/tests/test_waterca.cpp`, 6 new, `tests/CMakeLists.txt`
+updated): column drop in a walled shaft (isolates gravity from lateral,
+settles exactly on the floor, conservation checked every tick); pooling on
+an open unwalled floor (settles to the sandpile fixed point above,
+conservation checked every tick); a 3x3 walled container filling bottom-up
+(bottom layer exactly full at 255/cell before any second-layer fill, zero
+leakage through walls checked over a wide sampled volume); activity
+(a settled sim's `step()` touches zero bricks; a drop in a distant isolated
+shaft activates and steps exactly its own brick, not the unrelated settled
+one); determinism (two independently-built identical scenarios produce
+digest-identical state, golden `0x7995BE759FB9D67E` pinned); a 200-random-
+add (splitmix64-seeded) + 500-step conservation fuzz over real bumpy terrain
+(`SyntheticTileSampler` + `Amplifier::materialAt` as the solid-query
+callback) that exact-matches `totalVolume()` against the sum of `addWater`'s
+actual-placed return values, with the ledger-vs-recompute invariant checked
+after every single step. Full suite green: 71/71 (`vxc_tests.exe`, MSVC
+14.51/VS 2026, `/W4 /WX`, Ninja/Release), zero warnings from any file this
+pass, no float/double anywhere in `waterca.h`/`waterca.cpp` (float-ban CI
+grep clean).
+
 ## Backlog (parked / deferred, updated 2026-07-20)
 
 | Item | State | Unblock |
