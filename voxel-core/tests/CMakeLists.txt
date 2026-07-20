@@ -10,8 +10,10 @@ add_executable(vxc_tests
   test_mips.cpp
   test_raycast.cpp
   test_tilestore.cpp
+  test_counters.cpp
 )
-target_link_libraries(vxc_tests PRIVATE voxelcore)
+find_package(Threads REQUIRED)
+target_link_libraries(vxc_tests PRIVATE voxelcore Threads::Threads)
 target_compile_definitions(vxc_tests PRIVATE
   VXC_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
 )

@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
+#include "VoxelDebug.h" // FVoxelPerfSnapshot -- plain POD, voxel-core-free (see VoxelDebug.h doctrine note)
 #include "VoxelWorldSubsystem.generated.h"
 
 // voxel-core owns the deterministic world + edit overlay (doctrine SS2.1 /
@@ -140,6 +141,12 @@ public:
 	// thread only. Returns the number of voxels actually removed (were
 	// non-air before the carve).
 	int32 CarveSphere(const FVector& CenterUU, double RadiusUU, double JitterUU);
+
+	// docs/debug-tooling-plan.md P1 "Perf HUD": a snapshot refreshed at 1Hz
+	// (per-frame collection, see FVoxelWorldImpl::UpdatePerfSnapshot), read by
+	// AVoxelEarthHUD every frame when voxel.Debug >= 1. Cheap struct copy;
+	// safe to call from the game thread at any time after Initialize.
+	FVoxelPerfSnapshot GetPerfSnapshot() const;
 
 private:
 	TUniquePtr<FVoxelWorldImpl> Impl;
