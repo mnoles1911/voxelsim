@@ -13,7 +13,7 @@ C++ tile client (tilestore.h) for clipmap source data.
 | Ring streaming | Generalize FChunkRecord/queues to (level, chunkKey): one desired-set pass computes, per level, the annulus [innerR(level), outerR(level)] with the same hysteresis/budget machinery. Level-L render chunks cover 32 level-L cells (so world size doubles per level); one component type serves all levels (quads are level-agnostic; position scale = VoxelSizeUU << level). |
 | Mip sourcing | Workers build level-L bricks via voxelcore MipChain over the SAME pure-generated source path used today (no overlay in workers; edited chunks take the game-thread overlay-aware path, all levels). MipChain caching stays in the worker-side impl keyed identically — measure before adding cross-job sharing. |
 | Meshing mips | Same greedy mesher (it is level-agnostic over Brick<8>); apron sampling at level L reads level-L neighbors — provide a level-aware sampler from MipChain, never mix levels inside one mesh. |
-| Ring transitions | v0: hard boundary (inner ring simply occludes outer; both rendered in the overlap band of 1 chunk). Dithered blue-noise cross-fade is a POLISH item (plan flags it as the historical slip risk) — schedule after Band 3 exists, behind a cvar. |
+| Ring transitions | **v1 landed** (see "Ring transitions v1" below): v0's hard boundary is upgraded to a dithered cross-fade, pure material change (`UVoxelChunkComponent`/`M_VoxelTerrain`), no subsystem/streaming edit, no cvar (the fade is always-on; its own "no fade" inert defaults are how it stays inert on any material instance that never gets per-level params set). Level 0 has no inner fade (nothing coarser to fade in from); the outermost ring (R4) keeps no outer fade (matches the plan's "hard boundary v0" staying at the clipmap seam until that gets its own polish pass). |
 | Band 3 (heightmap clipmap) | **First slice landed** (see "Band 3 first slice" below): `AVoxelClipmapActor`, 4 concentric `UProceduralMeshComponent` levels (65×65 verts each), TILE elevation direct (30m/px bilinear, same seed as the ring cascade), covering the ring cascade's edge (~1km) out to ~16.4km radius (~32.8km diameter). CDLOD polish (dithered cross-fades, τ-driven LOD, partial-amplifier detail) remains a later track. |
 | Distant edits | Edits already bump generation ids per (level-0) chunk; propagate: an edit marks dirty its ancestor mip chunks up the chain (cheap key math) → re-mesh through the overlay-aware path at each level. Mip of edited bricks = MipChain over World::brickAt (overlay-aware) — needs a small overlay-aware source hook, game-thread only. |
 | τ (screen-space error) | v0: pure distance rings (above). τ-driven selection + user presets arrive with Band 3 when there is something to trade off. |
@@ -176,3 +176,116 @@ instead; promote to `docs/adr/` if a reviewer wants it split out.
 **Verification switch.** `-VoxelCameraHigh=<meters>` (`AVoxelEarthGameMode::RestartPlayer`)
 spawns the pawn that many meters above the surface instead of the default
 +5m, for vista screenshots where a ground-level spawn can't see 30km out.
+
+## Ring transitions v1 (dithered cross-fade, implemented)
+
+Upgrades the "Ring transitions" row's v0 hard boundary
+(`docs/voxel-earth-implementation-plan.md` §3.3: "dithered cross-fade band
+(outer 15-20% of each ring; blue-noise threshold; both LODs rendered in
+band; TSR resolves)"). Pure material + component change — `VoxelWorldSubsystem.*`
+untouched (owned by a parallel M2 agent this pass; the file-ownership split
+required reading `RingPresets` read-only for the fade-table math below, never
+writing it).
+
+**Material graph** (`Tools/create_voxel_material.py`, regenerated
+`M_VoxelTerrain.uasset` headlessly via `UnrealEditor-Cmd.exe -run=pythonscript`).
+Blend mode switches Opaque → Masked; four new `ScalarParameter`s
+(`RingInnerFadeStart/End`, `RingOuterFadeStart/End`, UU) drive:
+
+```
+CameraDistance = Distance(AbsoluteWorldPosition, CameraPositionWS)   -- LWC-safe: both
+                                                                         operands are engine LWC
+                                                                         expressions, so the
+                                                                         subtraction happens in
+                                                                         emulated double precision
+                                                                         before the (small,
+                                                                         camera-relative) result
+                                                                         downcasts to float
+InnerRamp   = saturate((CameraDistance - InnerStart) / (InnerEnd - InnerStart))   -- 0 -> 1 fade IN
+OuterRamp   = saturate((OuterEnd - CameraDistance) / (OuterEnd - OuterStart))     -- 1 -> 0 fade OUT
+FadeFactor  = InnerRamp * OuterRamp
+OpacityMask = DitherTemporalAA(FadeFactor)   -- Engine's
+    /Engine/Functions/Engine_MaterialFunctions02/Utility/DitherTemporalAA,
+    the same blue-noise-esque screen-door dither TAA/TSR resolves over
+    several frames that foliage/grass LOD crossfades use
+```
+
+Inert sentinel Start/End pairs (`-2/-1` for "inner fade already fully up",
+`1e7/2e7` UU for "outer fade hasn't started") are both the material's own
+base defaults AND what the component sets for level 0's inner side / R4's
+outer side — same formula path, no shader branch, "material params ...
+default = no fade, fully opaque" holds by construction. Verified headlessly
+(load the regenerated asset + `MaterialEditingLibrary` introspection, not
+just "the script didn't throw"): `BlendMode=BLEND_MASKED`, the four defaults
+above, 23 expressions, `OpacityMask` wired to the `DitherTemporalAA` call
+node — not left floating. Existing vertex-color/AO/DebugTint → BaseColor path
+and the Roughness constant are untouched; Masked with `OpacityMask==1`
+(the inert default) draws every pixel exactly like Opaque did, so the asset
+change alone is inert on any material instance that never gets per-level
+params set.
+
+**Component** (`VoxelChunkComponent.h/.cpp`). `SetLevel`/`SetMaterial` both
+funnel into a new `ApplyRingFadeParams()` that lazily creates (and thereafter
+reuses) a single `ChunkMID` — merged with the P1 chunk-state `DebugTint` MID
+per the task's "one MID per component maximum" constraint, since fades are
+always-on and therefore need a MID unconditionally (SetDebugTint/ClearDebugTint
+now just set/reset a parameter on that same instance instead of creating and
+tearing down a second one; "zero-cost when off" now means "no extra work",
+not "no MID" — there's only ever one). `ApplyRingFadeParams` no-ops until both
+`SetLevel` and `SetMaterial` have run at least once (order isn't fixed —
+`SetLevel` currently runs first per the `NewObject`/`RegisterComponent` call
+site in `VoxelWorldSubsystem.cpp`, but the code doesn't assume that).
+
+**Fade table** (`ComputeRingFadeParams`, derived from `RingPresets`, read-only
+reference — single source of truth for the ring radii, no hardcoded second
+copy). Band = 15% of that level's own annulus width (`Outer - Inner`):
+
+| Level | Annulus (m) | Band (m) | Inner fade (m) | Outer fade (m) |
+|---|---|---|---|---|
+| R0 | [0, 64) | 9.6 | *none (level 0)* | [54.4, 64] |
+| R1 | [64, 128) | 9.6 | [64, 73.6] | [118.4, 128] |
+| R2 | [128, 256) | 19.2 | [128, 147.2] | [236.8, 256] |
+| R3 | [256, 512) | 38.4 | [256, 294.4] | [473.6, 512] |
+| R4 | [512, 1024) | 76.8 | [512, 588.8] | *none (outermost)* |
+
+**Overlap finding (task item 3).** Confirmed both levels ARE loaded/rendered
+together around every boundary, comfortably covering each side's own fade
+band: `FVoxelWorldImpl::RecomputeDesiredSet`'s outer-edge-only hysteresis
+(`UnloadRingMultiplier = 1.25`) keeps a level-L chunk loaded until
+`Outer(L)*1.25`, while level-(L+1) starts loading immediately at
+`Inner(L+1) == Outer(L)` (no inner-edge hysteresis) — so both are resident
+across `[Outer(L), Outer(L)*1.25)`: 16m at the R0/R1 boundary, 32m at R1/R2,
+64m at R2/R3, 128m at R3/R4, each wider than either side's own fade band
+(9.6-76.8m) before per-chunk quantization is even counted (a level-(L+1)
+chunk's footprint is `(1<<(L+1))`× a level-0 chunk's 3.2m edge, so its center
+can already be well past `Inner(L+1)` — i.e. its near edge well inside the
+annulus — the first tick it's created). This matches the wave-1 code comment
+("both rendered in the overlap band of 1 chunk") — no limitation to report
+on loaded-chunk overlap itself.
+
+The actual limitation is about the FADE BANDS' placement, not the loaded-chunk
+overlap: because level L fades out over the tail of its OWN annulus and level
+L+1 fades in over the head of ITS OWN annulus, the two bands sit on opposite
+sides of the shared boundary point (e.g. R0's outer band ends at exactly 64m,
+R1's inner band starts at exactly 64m) rather than spanning the same distance
+range. There is therefore no moment where both levels are simultaneously at a
+partial opacity blending together like a true additive crossfade — instead
+the inner ring dithers down to fully transparent right at the boundary and
+the outer ring dithers up from fully transparent starting there, i.e.
+fade-to-nothing-then-fade-in rather than a blended dissolve. This is an
+inherent consequence of "each level fades over its own 15% band" (the plan's
+literal wording) done as a pure material change with no subsystem/annulus
+edits, and matches the task's own anticipated fallback ("it will read as a
+fade-to-nothing which is still better than a hard pop") — a real improvement
+over v0's instant pop either way, just not a full symmetric blend. A future
+pass that wants a true blend would need the subsystem to widen the desired-set
+overlap band explicitly to a shared distance range and hand both levels the
+SAME start/end pair at a boundary — out of scope for this pure-material pass
+(and the file-ownership split for this task).
+
+**Verification.** `-VoxelCameraHigh=300 -VoxelScreenshotAfter=50 -VoxelDebugRings`
+and the same without `-VoxelDebugRings` (screenshot paths in the M2 polish
+report). `-VoxelPerfRun=30`: p50=4.10ms / p95=18.33ms (max=400.00ms,
+15 hitches, 9549 chunks loaded, 62.8% budget saturation) — within noise of
+the pre-fade baseline (~4.3/18.5 p50/p95), no measurable Masked-material cost
+at this ring/chunk count.
