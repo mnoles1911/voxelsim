@@ -20,6 +20,7 @@ class VOXELEARTH_API AVoxelEarthPlayerController : public APlayerController
 
 protected:
 	virtual void SetupInputComponent() override;
+	virtual void BeginPlay() override;
 
 public:
 	// --- HUD queries (AVoxelEarthHUD) --------------------------------------
@@ -34,6 +35,38 @@ public:
 
 	// 0 at charge start, 1 at/after MaxChargeSeconds; 0 when not charging.
 	float GetExplosiveChargeAlpha() const;
+
+	// --- M3 wave 1 (docs/m3-plan.md): client -> server edit intents --------
+	//
+	// These live on the PlayerController rather than the shared AVoxelEditRelay
+	// actor because UE Server RPCs are only callable by the connection that
+	// OWNS the target actor -- a PlayerController is always owned by its own
+	// client connection, so this is the correct, minimal-plumbing place for
+	// them (see VoxelEditRelay.h's class comment). Called by
+	// UVoxelWorldSubsystem's NM_Client role-split path (TryDig/TryPlace/
+	// CarveSphere) on the LOCAL player's own controller immediately after
+	// applying the same edit as a local prediction; the server re-validates
+	// and re-applies via the exact same UVoxelWorldSubsystem::TryDig/
+	// TryPlace/CarveSphere path a local server edit uses.
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerSubmitDigIntent(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels);
+
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerSubmitPlaceIntent(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels, uint8 MaterialId,
+	                              const FVector& PlayerActorLocation);
+
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerSubmitCarveIntent(const FVector& CenterUU, float RadiusUU, float JitterUU);
+
+	// Join sync (m3-plan.md "Join sync"): fired once from BeginPlay on an
+	// NM_Client's own locally-controlled instance. Server replies with the
+	// full edit log, chunked <= 48KB per Client RPC (see the .cpp), each
+	// call routed through UVoxelWorldSubsystem::ReceiveJoinSyncChunk.
+	UFUNCTION(Server, Reliable)
+	void ServerRequestJoinSync();
+
+	UFUNCTION(Client, Reliable)
+	void ClientReceiveJoinSyncChunk(const TArray<uint8>& Bytes, bool bFinal);
 
 private:
 	void OnDig();
@@ -75,4 +108,21 @@ private:
 	static constexpr float MinThrowSpeedUU = 600.0f;
 	static constexpr float MaxThrowSpeedUU = 1600.0f;
 	static constexpr float ThrowUpwardArcDegrees = 30.0f;
+
+	// M3 wave 1 gate verification (docs/m3-plan.md "two clients dig the same
+	// hole"): -VoxelAutoDigAfter=<s> fires one TryDig at a fixed, seed-
+	// derived world column (NOT pawn-relative -- every process computes the
+	// identical spot from the shared seed, so multiple client processes
+	// "dig the same hole" without any out-of-band coordination); intended
+	// for -game clients in the dedicated-server verification run, harmless
+	// if passed on a listen-server/standalone local player too.
+	// -VoxelDumpDigestAfter=<s> logs this process's own perspective
+	// (seed + World::editedDigest()) -- the dedicated server's equivalent
+	// dump lives in AVoxelEarthGameMode::BeginPlay (GameMode only exists
+	// server-side). Both read BeginPlay()'s command line once.
+	FTimerHandle AutoDigTimerHandle;
+	FTimerHandle DumpDigestTimerHandle;
+	// Self-quit a few seconds after DumpDigestTimerHandle fires (gate-run
+	// convenience: nothing else naturally ends a headless -game client).
+	FTimerHandle DigestQuitTimerHandle;
 };

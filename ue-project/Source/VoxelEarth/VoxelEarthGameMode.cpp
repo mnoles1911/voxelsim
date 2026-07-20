@@ -18,6 +18,7 @@
 #include "VoxelClipmapActor.h"
 #include "VoxelEarthHUD.h"
 #include "VoxelEarthPlayerController.h"
+#include "VoxelEditRelay.h"
 #include "VoxelOceanActor.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -132,6 +133,19 @@ void AVoxelEarthGameMode::BeginPlay()
 		// spawn from code" reasoning -- the heightmap clipmap extends
 		// terrain from the ring cascade's edge (~1km) out to ~30km.
 		World->SpawnActor<AVoxelClipmapActor>();
+
+		// M3 wave 1 (docs/m3-plan.md): the edit-log replication transport
+		// (AVoxelEditRelay), spawned by the GameMode on authority -- but only
+		// when this world is actually networked. NM_Standalone spawns
+		// nothing at all, so single-player has zero relay-related code paths
+		// touched (docs/m3-plan.md gate requirement: "standalone behavior
+		// byte-identical"). GameMode::BeginPlay only ever runs server-side
+		// (dedicated server, or the server half of a listen server), so this
+		// unconditionally means "spawned once, by the authority."
+		if (World->GetNetMode() != NM_Standalone)
+		{
+			World->SpawnActor<AVoxelEditRelay>();
+		}
 	}
 
 	// M2 ring debug verification (docs/m2-plan.md first implementation wave
@@ -217,6 +231,37 @@ void AVoxelEarthGameMode::BeginPlay()
 					       CarveCenter.X, CarveCenter.Y, CarveCenter.Z, RadiusUU, Removed);
 				}),
 			DigTestDelaySeconds, false);
+	}
+
+	// M3 wave 1 gate verification (docs/m3-plan.md "two clients dig the same
+	// hole"): -VoxelDumpDigestAfter=<s> logs this SERVER process's seed +
+	// World::editedDigest() -- the client-side equivalent lives on
+	// AVoxelEarthPlayerController (GameMode never exists client-side).
+	float ServerDumpDigestAfterSeconds = 0.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelDumpDigestAfter="), ServerDumpDigestAfterSeconds) && ServerDumpDigestAfterSeconds > 0.f)
+	{
+		GetWorldTimerManager().SetTimer(
+			ServerDumpDigestTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this]()
+				{
+					UWorld* DumpWorld = GetWorld();
+					UVoxelWorldSubsystem* Subsystem = DumpWorld ? DumpWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					if (!Subsystem)
+					{
+						return;
+					}
+					UE_LOG(LogVoxelEarth, Log, TEXT("VoxelDigestDump: role=Server seed=%llu editedDigest=0x%016llX"),
+					       (unsigned long long)Subsystem->GetSeed(), (unsigned long long)Subsystem->GetEditedDigest());
+
+					// Self-quit a few seconds later (gate-run convenience:
+					// nothing else naturally ends a headless -server process).
+					GetWorldTimerManager().SetTimer(
+						ServerDigestQuitTimerHandle,
+						FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(/*bForce*/ false); }),
+						5.f, false);
+				}),
+			ServerDumpDigestAfterSeconds, false);
 	}
 
 	// Unattended visual verification: -VoxelScreenshotAfter=<seconds> waits

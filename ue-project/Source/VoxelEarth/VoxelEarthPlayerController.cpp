@@ -3,8 +3,13 @@
 #include "Components/InputComponent.h"
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
+#include "HAL/PlatformMisc.h"
 #include "InputCoreTypes.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
+#include "TimerManager.h"
 #include "VoxelDebug.h"
+#include "VoxelEarth.h"
 #include "VoxelExplosive.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -38,6 +43,240 @@ void AVoxelEarthPlayerController::SetupInputComponent()
 	// docs/debug-tooling-plan.md P1 "CVars + F3": F3 cycles voxel.Debug
 	// 0(off)->1(perf HUD)->2(HUD+visualizations)->0 in PIE/game.
 	InputComponent->BindKey(EKeys::F3, IE_Pressed, this, &AVoxelEarthPlayerController::OnCycleDebugMode);
+}
+
+void AVoxelEarthPlayerController::BeginPlay()
+{
+	Super::BeginPlay();
+
+	UWorld* World = GetWorld();
+	if (!World || !IsLocalController())
+	{
+		// Only this process's OWN locally-controlled instance should drive
+		// join-sync / verification switches -- a dedicated server also owns
+		// one AVoxelEarthPlayerController PER CONNECTED CLIENT (remote-owned
+		// proxies), and BeginPlay runs for those too; IsLocalController() is
+		// false for all of them there, so this whole block correctly never
+		// fires on the dedicated server's own process.
+		return;
+	}
+
+	UVoxelWorldSubsystem* Subsystem = World->GetSubsystem<UVoxelWorldSubsystem>();
+	if (!Subsystem)
+	{
+		return;
+	}
+
+	// M3 wave 1 (docs/m3-plan.md "Join sync"): a replica client requests the
+	// full authoritative edit log on join, before accepting any live
+	// MulticastAppliedEntries batches (buffered meanwhile -- see
+	// UVoxelWorldSubsystem::BeginJoinSync/ReceiveJoinSyncChunk/ReceiveLiveEntries).
+	if (World->GetNetMode() == NM_Client)
+	{
+		Subsystem->BeginJoinSync();
+		ServerRequestJoinSync();
+	}
+
+	// M3 gate verification switches (docs/m3-plan.md "two clients dig the
+	// same hole") -- see the header's doc comment on AutoDigTimerHandle/
+	// DumpDigestTimerHandle for why both live here rather than GameMode.
+	float AutoDigAfterSeconds = 0.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelAutoDigAfter="), AutoDigAfterSeconds) && AutoDigAfterSeconds > 0.f)
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelAutoDigAfter: will TryDig at the fixed (0,0) column in %.1fs"), AutoDigAfterSeconds);
+		World->GetTimerManager().SetTimer(
+		    AutoDigTimerHandle,
+		    FTimerDelegate::CreateWeakLambda(this,
+		                                      [this]()
+		                                      {
+			                                      UWorld* W = GetWorld();
+			                                      UVoxelWorldSubsystem* Sub = W ? W->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+			                                      if (!Sub)
+			                                      {
+				                                      return;
+			                                      }
+			                                      // Fixed, seed-derived world column (NOT pawn-relative): every
+			                                      // process launched with the same -VoxelSeed computes the exact
+			                                      // same spot, so independently-run client processes genuinely
+			                                      // "dig the same hole" with zero coordination beyond the shared
+			                                      // seed and this fixed switch.
+			                                      // +500UU (5m) clearance: comfortably inside
+			                                      // UVoxelWorldSubsystem::DigPlaceRangeMeters (8m) so the
+			                                      // straight-down ray actually reaches the surface.
+			                                      const double SurfaceUU = Sub->GetSurfaceHeightUU(0.0, 0.0);
+			                                      const FVector FixedCameraLoc(0.0, 0.0, SurfaceUU + 500.0);
+			                                      const FVector FixedCameraDir(0.0, 0.0, -1.0);
+			                                      const bool bDug = Sub->TryDig(FixedCameraLoc, FixedCameraDir, 2);
+			                                      UE_LOG(LogVoxelEarth, Log,
+			                                             TEXT("VoxelAutoDigAfter: TryDig at fixed column (0,0), size=2 -> %s"),
+			                                             bDug ? TEXT("applied") : TEXT("no-op (nothing hit in range)"));
+		                                      }),
+		    AutoDigAfterSeconds, false);
+	}
+
+	float DumpDigestAfterSeconds = 0.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelDumpDigestAfter="), DumpDigestAfterSeconds) && DumpDigestAfterSeconds > 0.f)
+	{
+		World->GetTimerManager().SetTimer(
+		    DumpDigestTimerHandle,
+		    FTimerDelegate::CreateWeakLambda(this,
+		                                      [this]()
+		                                      {
+			                                      UWorld* W = GetWorld();
+			                                      UVoxelWorldSubsystem* Sub = W ? W->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+			                                      if (!Sub)
+			                                      {
+				                                      return;
+			                                      }
+			                                      UE_LOG(LogVoxelEarth, Log,
+			                                             TEXT("VoxelDigestDump: role=Client seed=%llu editedDigest=0x%016llX"),
+			                                             (unsigned long long)Sub->GetSeed(), (unsigned long long)Sub->GetEditedDigest());
+
+			                                      UWorld* QuitWorld = GetWorld();
+			                                      if (QuitWorld)
+			                                      {
+				                                      QuitWorld->GetTimerManager().SetTimer(
+				                                          DigestQuitTimerHandle,
+				                                          FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(/*bForce*/ false); }),
+				                                          5.f, false);
+			                                      }
+		                                      }),
+		    DumpDigestAfterSeconds, false);
+	}
+}
+
+bool AVoxelEarthPlayerController::ServerSubmitDigIntent_Validate(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels)
+{
+	return SizeVoxels >= 1 && SizeVoxels <= 8; // Subsystem clamps again to Min/MaxCubeSizeVoxels -- this just bounds the wire value
+}
+
+void AVoxelEarthPlayerController::ServerSubmitDigIntent_Implementation(const FVector& CameraLoc, const FVector& CameraDir,
+                                                                        int32 SizeVoxels)
+{
+	UWorld* World = GetWorld();
+	UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	APawn* MyPawn = GetPawn();
+	if (!Subsystem || !MyPawn)
+	{
+		return;
+	}
+	// Range validation (m3-plan.md "Authority flow": "server validates
+	// (range from pawn ...)"): CastFromCamera already caps the ray itself to
+	// DigPlaceRangeMeters, but a client could lie about CameraLoc -- reject
+	// if the claimed camera origin is implausibly far from THIS connection's
+	// own pawn (generous slack for the over-the-shoulder camera offset).
+	constexpr double MaxCameraPawnOffsetUU = 500.0; // 5m
+	if (FVector::Dist(CameraLoc, MyPawn->GetActorLocation()) > MaxCameraPawnOffsetUU)
+	{
+		UE_LOG(LogVoxelEdit, Warning, TEXT("ServerSubmitDigIntent rejected: camera origin too far from owning pawn."));
+		return;
+	}
+	// Same edit path a local server-side dig uses -- re-validates range
+	// (raycast cap) and size caps identically (UVoxelWorldSubsystem::TryDig,
+	// authority branch: applies directly + broadcasts).
+	Subsystem->TryDig(CameraLoc, CameraDir, SizeVoxels);
+}
+
+bool AVoxelEarthPlayerController::ServerSubmitPlaceIntent_Validate(const FVector& CameraLoc, const FVector& CameraDir,
+                                                                     int32 SizeVoxels, uint8 MaterialId, const FVector& PlayerActorLocation)
+{
+	return SizeVoxels >= 1 && SizeVoxels <= 8;
+}
+
+void AVoxelEarthPlayerController::ServerSubmitPlaceIntent_Implementation(const FVector& CameraLoc, const FVector& CameraDir,
+                                                                          int32 SizeVoxels, uint8 MaterialId,
+                                                                          const FVector& PlayerActorLocation)
+{
+	UWorld* World = GetWorld();
+	UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	APawn* MyPawn = GetPawn();
+	if (!Subsystem || !MyPawn)
+	{
+		return;
+	}
+	constexpr double MaxCameraPawnOffsetUU = 500.0;
+	if (FVector::Dist(CameraLoc, MyPawn->GetActorLocation()) > MaxCameraPawnOffsetUU ||
+	    FVector::Dist(PlayerActorLocation, MyPawn->GetActorLocation()) > MaxCameraPawnOffsetUU)
+	{
+		UE_LOG(LogVoxelEdit, Warning, TEXT("ServerSubmitPlaceIntent rejected: claimed camera/player location too far from owning pawn."));
+		return;
+	}
+	Subsystem->TryPlace(CameraLoc, CameraDir, SizeVoxels, MaterialId, PlayerActorLocation);
+}
+
+bool AVoxelEarthPlayerController::ServerSubmitCarveIntent_Validate(const FVector& CenterUU, float RadiusUU, float JitterUU)
+{
+	// Generous caps derived from AVoxelExplosive's tuning (VoxelExplosive.h:
+	// BlastRadiusUU=300, BlastJitterUU=30) -- explosives are the only
+	// current CarveSphere caller, thrown up to ~60m; a v1 sanity bound, not
+	// a precise validation (CarveSphere itself has no size-cap concept the
+	// way TryDig/TryPlace do).
+	return RadiusUU > 0.f && RadiusUU <= 1000.f && FMath::Abs(JitterUU) <= 300.f;
+}
+
+void AVoxelEarthPlayerController::ServerSubmitCarveIntent_Implementation(const FVector& CenterUU, float RadiusUU, float JitterUU)
+{
+	UWorld* World = GetWorld();
+	UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	APawn* MyPawn = GetPawn();
+	if (!Subsystem || !MyPawn)
+	{
+		return;
+	}
+	constexpr double MaxThrowDistanceUU = 6000.0; // 60m -- generous over MaxThrowSpeedUU*FuseSeconds ballistic range
+	if (FVector::Dist(CenterUU, MyPawn->GetActorLocation()) > MaxThrowDistanceUU)
+	{
+		UE_LOG(LogVoxelEdit, Warning, TEXT("ServerSubmitCarveIntent rejected: carve center too far from owning pawn."));
+		return;
+	}
+	Subsystem->CarveSphere(CenterUU, (double)RadiusUU, (double)JitterUU);
+}
+
+void AVoxelEarthPlayerController::ServerRequestJoinSync_Implementation()
+{
+	UWorld* World = GetWorld();
+	UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	if (!Subsystem)
+	{
+		ClientReceiveJoinSyncChunk(TArray<uint8>(), true);
+		return;
+	}
+
+	TArray<uint8> FullBytes;
+	Subsystem->SerializeLogEntriesFrom(0, FullBytes);
+
+	if (FullBytes.Num() == 0)
+	{
+		ClientReceiveJoinSyncChunk(FullBytes, true);
+		UE_LOG(LogVoxelEdit, Log, TEXT("ServerRequestJoinSync: empty log, sent 0 bytes to %s"), *GetName());
+		return;
+	}
+
+	// Chunked <= 48KB per RPC (m3-plan.md "Join sync"); reliable RPCs on one
+	// actor channel are delivered in the order they were sent, so firing
+	// these back-to-back is safe -- the client just concatenates until bFinal.
+	constexpr int32 ChunkSizeBytes = 48 * 1024;
+	int32 Offset = 0;
+	while (Offset < FullBytes.Num())
+	{
+		const int32 ThisChunkSize = FMath::Min(ChunkSizeBytes, FullBytes.Num() - Offset);
+		TArray<uint8> Chunk(FullBytes.GetData() + Offset, ThisChunkSize);
+		Offset += ThisChunkSize;
+		const bool bFinal = Offset >= FullBytes.Num();
+		ClientReceiveJoinSyncChunk(Chunk, bFinal);
+	}
+	UE_LOG(LogVoxelEdit, Log, TEXT("ServerRequestJoinSync: sent %d bytes to %s"), FullBytes.Num(), *GetName());
+}
+
+void AVoxelEarthPlayerController::ClientReceiveJoinSyncChunk_Implementation(const TArray<uint8>& Bytes, bool bFinal)
+{
+	UWorld* World = GetWorld();
+	UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	if (!Subsystem)
+	{
+		return;
+	}
+	Subsystem->ReceiveJoinSyncChunk(Bytes, bFinal);
 }
 
 void AVoxelEarthPlayerController::OnDig()
