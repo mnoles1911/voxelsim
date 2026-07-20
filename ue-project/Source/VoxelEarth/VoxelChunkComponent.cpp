@@ -54,6 +54,29 @@ public:
 		// only populated later, when the primitive is added to the scene).
 		const FVector ComponentWorldOrigin = Component->GetComponentLocation();
 
+		// Stage 3c LWC precision (docs/m1-plan.md stage 3c; plan SS3.3): near
+		// Earth-scale coordinates (|X| ~ 2e8 UU at 2,000km from the world
+		// origin) a float has ~16 UU (~16cm) of representable step, so naively
+		// narrowing ComponentWorldOrigin to float before combining with the
+		// local vertex offset (as this used to do) loses enough precision to
+		// shimmer the world-planar UVs under camera motion. Fix: do the
+		// combine in double, then reduce to a small tiling period in double
+		// BEFORE narrowing to float -- the value that ever reaches a float is
+		// always small (sub-mm precision everywhere), regardless of how far
+		// the chunk is from the origin. ChunkEdgeUU (320 UU = 3.2m) divides
+		// UVTilePeriodM evenly, so vertices shared across a chunk border still
+		// wrap identically (same double input -> same output) and no new
+		// seams appear. The material's world-planar look is unchanged: UV
+		// scale is identical, the pattern now simply repeats every
+		// UVTilePeriodM instead of never (it already effectively repeated
+		// every ~168m where the old float precision wrapped around anyway).
+		constexpr double UVTilePeriodM = 32.0;
+		const auto WrapWorldToUV = [](double ComponentOriginUU, double LocalOffsetUU) -> float
+		{
+			const double WorldM = (ComponentOriginUU + LocalOffsetUU) / 100.0;
+			return float(FMath::Fmod(WorldM, UVTilePeriodM));
+		};
+
 		for (const FVoxelChunkQuad& Q : Component->ChunkQuads)
 		{
 			const int32 Axis = Q.Axis;
@@ -94,8 +117,8 @@ public:
 				Vert.Position = Pos[CornerIdx];
 				Vert.SetTangents(TangentX, TangentY, Normal);
 
-				const float WorldU = (Pos[CornerIdx][U] + float(ComponentWorldOrigin[U])) / 100.f;
-				const float WorldV = (Pos[CornerIdx][V] + float(ComponentWorldOrigin[V])) / 100.f;
+				const float WorldU = WrapWorldToUV(ComponentWorldOrigin[U], double(Pos[CornerIdx][U]));
+				const float WorldV = WrapWorldToUV(ComponentWorldOrigin[V], double(Pos[CornerIdx][V]));
 				Vert.TextureCoordinate[0] = FVector2f(WorldU, WorldV);
 
 				// R = material id, G = AO (2-bit -> 0/85/170/255), B unused,
