@@ -234,8 +234,28 @@ private:
 // overwhelmingly common homogeneous case (no heap allocation -- see
 // Brick<B>::isHomogeneous); non-homogeneous bricks pay a small heap copy,
 // acceptable given this replaces a full recursive re-downsample on a hit.
-// No eviction yet (per this wave's scope); BrickCount/BytesUsed are
-// maintained incrementally for the perf HUD's memory row.
+//
+// M2 task "Mip cache eviction": bounded by voxel.MipCacheBudgetMB (bytes via
+// VoxelDebug::GetMipCacheBudgetBytes(), default 512MB) via a per-shard
+// GENERATION-STAMPED APPROXIMATE LRU -- each entry carries a relaxed atomic
+// "last touched" stamp (FEntry::LastTouch), bumped on every Find hit and
+// fresh Insert from one cache-wide monotonic counter (Generation). Eviction
+// (EvictIfOverBudgetLocked, called at the end of Insert while that shard's
+// write lock is already held -- no extra locking) samples a small, FIXED
+// number of entries from the shard's map (kEvictSampleSize) and evicts
+// whichever sampled entry has the lowest stamp, looping until back under
+// budget or the shard runs dry. This is deliberately approximate rather than
+// a true global LRU (an intrusive doubly-linked list, sharded or not, would
+// be exact but is more machinery than this cache's access pattern needs --
+// see the task's own framing, "keep it simple"): the O(kEvictSampleSize)
+// sample cost per eviction step is independent of shard size, so a single
+// over-budget Insert never pays an O(shard size) scan even at the scale
+// docs/status.md's wave-2 measurement recorded (4.9M bricks / ~716MB with no
+// eviction at all, pre this task). Racing the LastTouch stamp under a shared
+// READ lock (multiple Find calls on the same entry) is safe in the C++
+// memory-model sense (std::atomic tolerates unsynchronized concurrent
+// writers by design) -- worst case is a lost/overwritten touch, which only
+// ever biases WHICH near-tied entry gets evicted next, never correctness.
 class FSharedMipCache
 {
 public:
@@ -251,7 +271,8 @@ public:
 		{
 			return false;
 		}
-		OutBrick = Found->second;
+		OutBrick = Found->second.Brick;
+		Found->second.LastTouch.store(NextGeneration(), std::memory_order_relaxed);
 		return true;
 	}
 
@@ -259,8 +280,9 @@ public:
 	{
 		const vxc::MipKey MK{Level, Key};
 		FShard& Shard = ShardFor(MK);
+		const uint64 Gen = NextGeneration();
 		FRWScopeLock Lock(Shard.Lock, SLT_Write);
-		auto [It, bInserted] = Shard.Map.emplace(MK, Value);
+		auto [It, bInserted] = Shard.Map.try_emplace(MK, Value, Gen);
 		if (bInserted)
 		{
 			BrickCount.fetch_add(1, std::memory_order_relaxed);
@@ -271,8 +293,12 @@ public:
 			// Two jobs racing a miss on the same (level,key) both build and
 			// insert -- harmless (same deterministic inputs => byte-identical
 			// output), just an overwrite rather than a true race on content.
-			It->second = Value;
+			const int64 OldBytes = EstimateBytes(It->second.Brick);
+			It->second.Brick = Value;
+			It->second.LastTouch.store(Gen, std::memory_order_relaxed);
+			BytesUsed.fetch_add(EstimateBytes(Value) - OldBytes, std::memory_order_relaxed);
 		}
+		EvictIfOverBudgetLocked(Shard);
 	}
 
 	// M2 wave 2 item 2 ("Distant-edit mip propagation"): removes a
@@ -289,7 +315,7 @@ public:
 		const auto Found = Shard.Map.find(MK);
 		if (Found != Shard.Map.end())
 		{
-			BytesUsed.fetch_sub(EstimateBytes(Found->second), std::memory_order_relaxed);
+			BytesUsed.fetch_sub(EstimateBytes(Found->second.Brick), std::memory_order_relaxed);
 			Shard.Map.erase(Found);
 			BrickCount.fetch_sub(1, std::memory_order_relaxed);
 		}
@@ -297,18 +323,75 @@ public:
 
 	int64 GetBrickCount() const { return BrickCount.load(std::memory_order_relaxed); }
 	int64 GetBytesUsed() const { return BytesUsed.load(std::memory_order_relaxed); }
+	int64 GetEvictionsCount() const { return Evictions.load(std::memory_order_relaxed); }
 
 private:
 	static constexpr int32 kNumShards = 16;
+	// Bounded sample size for approximate-LRU eviction (class comment) --
+	// small enough that even a large batch of evictions (e.g. a runtime
+	// voxel.MipCacheBudgetMB drop) stays cheap per step.
+	static constexpr int32 kEvictSampleSize = 8;
+
+	struct FEntry
+	{
+		BrickT Brick;
+		// mutable: Find() is a const method but still needs to bump the
+		// touch stamp on a hit (see class comment) -- same "logically const,
+		// bookkeeping mutates" doctrine as FRWLock members being mutable.
+		mutable std::atomic<uint64> LastTouch;
+
+		FEntry(const BrickT& InBrick, uint64 InTouch) : Brick(InBrick), LastTouch(InTouch) {}
+	};
 
 	struct FShard
 	{
 		mutable FRWLock Lock;
-		std::unordered_map<vxc::MipKey, BrickT, vxc::MipKeyHash> Map;
+		std::unordered_map<vxc::MipKey, FEntry, vxc::MipKeyHash> Map;
 	};
 
 	FShard& ShardFor(const vxc::MipKey& Key) { return Shards[vxc::MipKeyHash{}(Key) % uint64(kNumShards)]; }
 	const FShard& ShardFor(const vxc::MipKey& Key) const { return Shards[vxc::MipKeyHash{}(Key) % uint64(kNumShards)]; }
+
+	// const: called from the const Find() method too (touch-on-hit) -- Generation
+	// is `mutable` for the same "logically const, bookkeeping mutates" reason
+	// FEntry::LastTouch is.
+	uint64 NextGeneration() const { return Generation.fetch_add(1, std::memory_order_relaxed); }
+
+	// Called from Insert with Shard's write lock already held. Loops
+	// evicting one sampled-oldest entry at a time until BytesUsed is back
+	// under voxel.MipCacheBudgetMB or this shard is empty -- see class
+	// comment for why sampling (not a full scan) is used.
+	void EvictIfOverBudgetLocked(FShard& Shard)
+	{
+		const int64 Budget = VoxelDebug::GetMipCacheBudgetBytes();
+		if (Budget <= 0)
+		{
+			return; // <=0 means "unbounded" (defensive; eviction disabled)
+		}
+		while (BytesUsed.load(std::memory_order_relaxed) > Budget && !Shard.Map.empty())
+		{
+			auto OldestIt = Shard.Map.end();
+			uint64 OldestTouch = 0;
+			int32 Sampled = 0;
+			for (auto It = Shard.Map.begin(); It != Shard.Map.end() && Sampled < kEvictSampleSize; ++It, ++Sampled)
+			{
+				const uint64 Touch = It->second.LastTouch.load(std::memory_order_relaxed);
+				if (OldestIt == Shard.Map.end() || Touch < OldestTouch)
+				{
+					OldestIt = It;
+					OldestTouch = Touch;
+				}
+			}
+			if (OldestIt == Shard.Map.end())
+			{
+				break; // defensive; unreachable given the while condition's !empty() check
+			}
+			BytesUsed.fetch_sub(EstimateBytes(OldestIt->second.Brick), std::memory_order_relaxed);
+			Shard.Map.erase(OldestIt);
+			BrickCount.fetch_sub(1, std::memory_order_relaxed);
+			Evictions.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
 
 	static int64 EstimateBytes(const BrickT& Value)
 	{
@@ -327,6 +410,8 @@ private:
 	FShard Shards[kNumShards];
 	std::atomic<int64> BrickCount{0};
 	std::atomic<int64> BytesUsed{0};
+	std::atomic<int64> Evictions{0};
+	mutable std::atomic<uint64> Generation{1};
 };
 
 // M2 wave 2 item 1: recursive level>=1 mip builder shared by BOTH the
@@ -1026,10 +1111,11 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	const FVoxelPerfSnapshot& Snap = LastPerfSnapshot;
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel worker ms/level: R0 p50=%.2f p95=%.2f | R1 p50=%.2f p95=%.2f | R2 p50=%.2f p95=%.2f | ")
-	       TEXT("R3 p50=%.2f p95=%.2f | R4 p50=%.2f p95=%.2f | mipCache bricks=%lld bytes=%lld"),
+	       TEXT("R3 p50=%.2f p95=%.2f | R4 p50=%.2f p95=%.2f | mipCache bricks=%lld bytes=%lld evictions=%lld"),
 	       Snap.LevelWorkerMsP50[0], Snap.LevelWorkerMsP95[0], Snap.LevelWorkerMsP50[1], Snap.LevelWorkerMsP95[1],
 	       Snap.LevelWorkerMsP50[2], Snap.LevelWorkerMsP95[2], Snap.LevelWorkerMsP50[3], Snap.LevelWorkerMsP95[3],
-	       Snap.LevelWorkerMsP50[4], Snap.LevelWorkerMsP95[4], (long long)Snap.MipCacheBrickCount, (long long)Snap.MipCacheBytes);
+	       Snap.LevelWorkerMsP50[4], Snap.LevelWorkerMsP95[4], (long long)Snap.MipCacheBrickCount, (long long)Snap.MipCacheBytes,
+	       (long long)Snap.MipCacheEvictions);
 }
 
 // --- desired-set / hysteresis ------------------------------------------------
@@ -1893,8 +1979,10 @@ void FVoxelWorldImpl::UpdatePerfSnapshot(float DeltaTime, float TickMs)
 	}
 
 	// M2 wave 2 item 1: shared cross-job mip cache memory (FSharedMipCache).
+	// MipCacheEvictions: M2 task "Mip cache eviction" LRU-budget counter.
 	LastPerfSnapshot.MipCacheBrickCount = SharedMipCache.GetBrickCount();
 	LastPerfSnapshot.MipCacheBytes = SharedMipCache.GetBytesUsed();
+	LastPerfSnapshot.MipCacheEvictions = SharedMipCache.GetEvictionsCount();
 
 	int32 ResidentComponents = 0;
 	// M2 item 1: "Per-level loaded/pending counters into the perf
@@ -2247,9 +2335,23 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
 
-	// docs/m1-plan.md decisions table: "seed from config (default 20260719)"
-	// -- still fixed; config-driven seed selection is a later milestone.
-	Impl = MakeUnique<FVoxelWorldImpl>(DefaultSeed);
+	// M2 task "Config-driven seed": -VoxelSeed=<u64> command-line override,
+	// falling back to DefaultSeed (docs/m1-plan.md decisions table "seed from
+	// config (default 20260719)"). Command-line only, no ini fallback --
+	// an ini-driven override would be overkill for a dev/verification-only
+	// knob (see the task's own framing). Resolved once, here, before Impl is
+	// constructed, so every voxel-core access this run (Impl's World/Tiles)
+	// and every other actor that samples seed-matched terrain (e.g.
+	// AVoxelClipmapActor's heightmap, via GetSeed()) agree on one value.
+	uint64 ParsedSeed = DefaultSeed;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelSeed="), ParsedSeed))
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSeed override: using seed %llu (default %llu)"),
+		       (unsigned long long)ParsedSeed, (unsigned long long)DefaultSeed);
+	}
+	Seed = ParsedSeed;
+
+	Impl = MakeUnique<FVoxelWorldImpl>(Seed);
 }
 
 void UVoxelWorldSubsystem::Deinitialize()
@@ -2328,7 +2430,7 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 	UE_LOG(LogVoxelStream, Log,
 	       TEXT("Voxel streaming initialized (seed %llu): load=%.0fm unload=%.0fm digRange=%.0fm"),
-	       (unsigned long long)DefaultSeed, LoadRadiusMeters, UnloadRadiusMeters, DigPlaceRangeMeters);
+	       (unsigned long long)Seed, LoadRadiusMeters, UnloadRadiusMeters, DigPlaceRangeMeters);
 }
 
 void UVoxelWorldSubsystem::Tick(float DeltaTime)

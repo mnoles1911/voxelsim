@@ -14,6 +14,36 @@ voxel.Debug.ChunkStates) can recolor a chunk via a per-component MID without
 touching the shared material when debug tinting is off (white is the
 multiplicative identity).
 
+M2 "Transitions" upgrade (docs/voxel-earth-implementation-plan.md SS3.3:
+"dithered cross-fade band (outer 15-20% of each ring; blue-noise threshold;
+both LODs rendered in band; TSR resolves)"; docs/m2-plan.md's "hard boundary
+v0" decision row is what this upgrades). Pure material change -- no subsystem/
+streaming edits: adds four ScalarParameters (RingInnerFadeStart/End,
+RingOuterFadeStart/End, all in UU/cm to match View.WorldCameraOrigin/Absolute
+World Position) driving an opacity-masked dither fade:
+
+  CameraDistance = Distance(AbsoluteWorldPosition, CameraPositionWS)
+  InnerRamp = saturate((CameraDistance - InnerStart) / (InnerEnd - InnerStart))
+  OuterRamp = saturate((OuterEnd - CameraDistance) / (OuterEnd - OuterStart))
+  FadeFactor = InnerRamp * OuterRamp
+  OpacityMask = DitherTemporalAA(FadeFactor)   -- Engine's
+      /Engine/Functions/Engine_MaterialFunctions02/Utility/DitherTemporalAA,
+      the standard blue-noise-esque screen-door dither function resolved by
+      TAA/TSR over several frames (same function foliage/grass LOD crossfades
+      use), matching the plan's "blue-noise threshold ... TSR resolves" line.
+
+Defaults (INERT_LOW = -2/-1, INERT_HIGH = 1e7/2e7 UU) are chosen so both ramps
+saturate to 1 for any real camera distance when a MID never overrides them --
+"material params ... default = no fade, fully opaque" per the task spec, so
+this asset change alone is inert until UVoxelChunkComponent::ApplyRingFadeParams
+(VoxelChunkComponent.cpp) sets real per-level values on a MID. Blend mode
+switches Opaque -> Masked (OpacityMaskClipValue stays the engine default,
+0.3333, which is what DitherTemporalAA's output is calibrated against); the
+existing vertex-color/AO/DebugTint BaseColor path and Roughness constant are
+untouched -- Masked mode only adds the OpacityMask input, so with the inert
+defaults every existing chunk renders bit-for-bit as before (Masked with
+OpacityMask==1 draws every pixel, same as Opaque).
+
 Run via:
   UnrealEditor-Cmd.exe <uproject> -run=pythonscript -script=<this file> -unattended -nop4 -nosplash
 """
@@ -23,6 +53,14 @@ import unreal
 PACKAGE_PATH = "/Game/Voxel"
 MATERIAL_NAME = "M_VoxelTerrain"
 FULL_PATH = PACKAGE_PATH + "/" + MATERIAL_NAME
+
+DITHER_FUNCTION_PATH = "/Engine/Functions/Engine_MaterialFunctions02/Utility/DitherTemporalAA"
+
+# Inert sentinel pairs -- MUST match VoxelChunkComponent.cpp's
+# kInertLowStart/End and kInertHighStart/End exactly (both files document the
+# other as the source of truth for this constraint).
+INERT_LOW_START, INERT_LOW_END = -2.0, -1.0
+INERT_HIGH_START, INERT_HIGH_END = 1.0e7, 2.0e7
 
 
 def main():
@@ -74,6 +112,101 @@ def main():
 
     # One-sided: absolute quad winding was verified empirically on 5.8
     # (2026-07-19) — front faces render correctly without two-sided cost.
+
+    # --- M2 ring cross-fade (Masked opacity, dithered) ---------------------
+    material.set_editor_property("blend_mode", unreal.BlendMode.BLEND_MASKED)
+
+    def make_fade_param(name, default_value, y):
+        p = mel.create_material_expression(material, unreal.MaterialExpressionScalarParameter, -900, y)
+        p.set_editor_property("parameter_name", name)
+        p.set_editor_property("default_value", default_value)
+        return p
+
+    inner_start = make_fade_param("RingInnerFadeStart", INERT_LOW_START, -300)
+    inner_end = make_fade_param("RingInnerFadeEnd", INERT_LOW_END, -220)
+    outer_start = make_fade_param("RingOuterFadeStart", INERT_HIGH_START, -140)
+    outer_end = make_fade_param("RingOuterFadeEnd", INERT_HIGH_END, -60)
+
+    # CameraDistance = Distance(AbsoluteWorldPosition, CameraPositionWS).
+    # Both operands are LWC-typed engine expressions, so the compiler emits
+    # the subtraction in emulated double precision before downcasting the
+    # (small, camera-relative) result to float -- the standard LWC-safe
+    # "distance from camera" idiom at planet scale (docs/voxel-earth-
+    # implementation-plan.md SS3.3's LWC + origin-rebasing requirement).
+    world_pos = mel.create_material_expression(material, unreal.MaterialExpressionWorldPosition, -700, -400)
+    camera_pos = mel.create_material_expression(material, unreal.MaterialExpressionCameraPositionWS, -700, -320)
+    distance = mel.create_material_expression(material, unreal.MaterialExpressionDistance, -550, -400)
+    if not mel.connect_material_expressions(world_pos, "", distance, "A"):
+        raise RuntimeError("connect world_pos -> distance.A failed")
+    if not mel.connect_material_expressions(camera_pos, "", distance, "B"):
+        raise RuntimeError("connect camera_pos -> distance.B failed")
+
+    def make_ramp(numerator_a, numerator_b, denom_a, denom_b, y):
+        """saturate((numerator_a - numerator_b) / (denom_a - denom_b))"""
+        num_sub = mel.create_material_expression(material, unreal.MaterialExpressionSubtract, -400, y)
+        if not mel.connect_material_expressions(numerator_a, "", num_sub, "A"):
+            raise RuntimeError("connect ramp numerator A failed")
+        if not mel.connect_material_expressions(numerator_b, "", num_sub, "B"):
+            raise RuntimeError("connect ramp numerator B failed")
+
+        den_sub = mel.create_material_expression(material, unreal.MaterialExpressionSubtract, -400, y + 60)
+        if not mel.connect_material_expressions(denom_a, "", den_sub, "A"):
+            raise RuntimeError("connect ramp denominator A failed")
+        if not mel.connect_material_expressions(denom_b, "", den_sub, "B"):
+            raise RuntimeError("connect ramp denominator B failed")
+
+        div = mel.create_material_expression(material, unreal.MaterialExpressionDivide, -280, y)
+        if not mel.connect_material_expressions(num_sub, "", div, "A"):
+            raise RuntimeError("connect ramp num_sub -> div.A failed")
+        if not mel.connect_material_expressions(den_sub, "", div, "B"):
+            raise RuntimeError("connect ramp den_sub -> div.B failed")
+
+        sat = mel.create_material_expression(material, unreal.MaterialExpressionSaturate, -160, y)
+        # "" targets the first (and only) input pin regardless of display
+        # name -- same MaterialEditingLibrary convention create_ocean_material.py
+        # relies on for its single-input ComponentMask/Sine nodes.
+        if not mel.connect_material_expressions(div, "", sat, ""):
+            raise RuntimeError("connect ramp div -> saturate.Input failed")
+        return sat
+
+    # InnerRamp: 0 at InnerStart -> 1 at InnerEnd (fades IN as distance grows).
+    inner_ramp = make_ramp(distance, inner_start, inner_end, inner_start, -260)
+    # OuterRamp: 1 at OuterStart -> 0 at OuterEnd (fades OUT as distance grows).
+    outer_ramp = make_ramp(outer_end, distance, outer_end, outer_start, -100)
+
+    fade_factor = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -20, -180)
+    if not mel.connect_material_expressions(inner_ramp, "", fade_factor, "A"):
+        raise RuntimeError("connect inner_ramp -> fade_factor.A failed")
+    if not mel.connect_material_expressions(outer_ramp, "", fade_factor, "B"):
+        raise RuntimeError("connect outer_ramp -> fade_factor.B failed")
+
+    # unreal.EditorAssetLibrary.load_asset requires the Asset Registry to
+    # already know about the target package; a `-run=pythonscript` commandlet
+    # doesn't wait for Engine content's background scan to finish, so that
+    # call fails here ("could not be found in the Asset Registry") even
+    # though the .uasset is on disk. unreal.load_object bypasses the registry
+    # and calls StaticLoadObject directly, which works regardless of scan
+    # state -- needs the full object path (package.object), not just the
+    # package path.
+    dither_function = unreal.load_object(None, DITHER_FUNCTION_PATH + "." + "DitherTemporalAA")
+    if dither_function is None:
+        raise RuntimeError("failed to load DitherTemporalAA function at " + DITHER_FUNCTION_PATH)
+    dither_call = mel.create_material_expression(
+        material, unreal.MaterialExpressionMaterialFunctionCall, 140, -180
+    )
+    if not dither_call.set_material_function(dither_function):
+        raise RuntimeError("set_material_function(DitherTemporalAA) failed")
+
+    dither_inputs = mel.get_material_expression_input_names(dither_call)
+    if len(dither_inputs) == 0:
+        raise RuntimeError("DitherTemporalAA exposed zero input pins after set_material_function")
+    if not mel.connect_material_expressions(fade_factor, "", dither_call, dither_inputs[0]):
+        raise RuntimeError("connect fade_factor -> dither_call.%s failed" % dither_inputs[0])
+
+    dither_outputs = mel.get_material_expression_output_names(dither_call)
+    dither_output_name = dither_outputs[0] if len(dither_outputs) > 0 else ""
+    if not mel.connect_material_property(dither_call, dither_output_name, unreal.MaterialProperty.MP_OPACITY_MASK):
+        raise RuntimeError("connect dither_call -> OpacityMask failed")
 
     mel.layout_material_expressions(material)
     mel.recompile_material(material)

@@ -21,14 +21,20 @@ namespace
 {
 // m2-plan.md "Height source" row: TILE elevation directly (30m/px bilinear),
 // through a vxc::SyntheticTileSampler using the SAME seed the voxel world
-// uses (UVoxelWorldSubsystem::DefaultSeed) so clipmap terrain lines up with
-// the ring cascade at their shared seam. SyntheticTileSampler is stateless
-// (holds only seed_/pixelSizeMm_), so a function-local static instance is
-// safe to reuse across every call -- game-thread only (AVoxelClipmapActor's
+// uses at RUNTIME (UVoxelWorldSubsystem::GetSeed() -- M2 task "Config-driven
+// seed": -VoxelSeed=<u64> can override the DefaultSeed constant, so this must
+// track the subsystem's actual resolved seed, not the constant, or clipmap
+// terrain would stop lining up with the ring cascade at their shared seam
+// whenever -VoxelSeed is passed) so clipmap terrain lines up with the ring
+// cascade at their shared seam. SyntheticTileSampler is stateless (holds
+// only seed_/pixelSizeMm_, no heap allocation), so constructing one fresh
+// per call is negligible -- simpler and correct-by-construction than a
+// static instance that would need explicit invalidation if the seed ever
+// changed after first use. Game-thread only (AVoxelClipmapActor's
 // Tick/RebuildLevel never run off-thread), so no synchronization is needed.
-double SampleHeightUU(double WorldXUU, double WorldYUU)
+double SampleHeightUU(double WorldXUU, double WorldYUU, uint64 Seed)
 {
-	static vxc::SyntheticTileSampler Tiles(UVoxelWorldSubsystem::DefaultSeed);
+	vxc::SyntheticTileSampler Tiles(Seed); // elevationMm() is non-const (ITileSampler), so Tiles can't be const here
 
 	// mm -> UU is /10 (VoxelCoords::WorldToMm's inverse: 1 UU = 10 mm).
 	const double PixelSizeUU = double(Tiles.pixelSizeMm()) / 10.0;
@@ -39,9 +45,7 @@ double SampleHeightUU(double WorldXUU, double WorldYUU)
 	const double Fx = Px - double(Px0);
 	const double Fy = Py - double(Py0);
 
-	// No capture needed: Tiles has static storage duration (accessible
-	// directly, same as any other file/function-scope static).
-	auto ElevUU = [](int64 X, int64 Y) { return double(Tiles.elevationMm(X, Y)) / 10.0; };
+	auto ElevUU = [&Tiles](int64 X, int64 Y) { return double(Tiles.elevationMm(X, Y)) / 10.0; };
 	const double H00 = ElevUU(Px0, Py0);
 	const double H10 = ElevUU(Px0 + 1, Py0);
 	const double H01 = ElevUU(Px0, Py0 + 1);
@@ -99,6 +103,30 @@ void AVoxelClipmapActor::BeginPlay()
 	{
 		UE_LOG(LogVoxelEarth, Warning,
 		       TEXT("M_VoxelClipmap not found at /Game/Voxel/M_VoxelClipmap -- clipmap levels using the engine default material."));
+	}
+
+	// M2 task "Config-driven seed": read the subsystem's RUNTIME seed
+	// (-VoxelSeed=<u64> override, else DefaultSeed) rather than the
+	// DefaultSeed constant, so the clipmap's heightmap sampling stays
+	// seed-matched with the ring cascade even when -VoxelSeed overrides the
+	// default (see SampleHeightUU's comment). The subsystem's Initialize()
+	// (world-init time) always runs before this actor's BeginPlay
+	// (spawned from AVoxelEarthGameMode::BeginPlay), so the seed is already
+	// resolved by the time this reads it. Falls back to DefaultSeed with a
+	// warning if the subsystem is somehow unavailable.
+	if (const UWorld* World = GetWorld())
+	{
+		if (const UVoxelWorldSubsystem* Subsystem = World->GetSubsystem<UVoxelWorldSubsystem>())
+		{
+			TerrainSeed = Subsystem->GetSeed();
+		}
+		else
+		{
+			UE_LOG(LogVoxelEarth, Warning,
+			       TEXT("AVoxelClipmapActor::BeginPlay: UVoxelWorldSubsystem unavailable -- falling back to DefaultSeed (%llu); ")
+			       TEXT("clipmap terrain may not line up with the ring cascade if -VoxelSeed was passed."),
+			       (unsigned long long)UVoxelWorldSubsystem::DefaultSeed);
+		}
 	}
 
 	BuildSharedTopology();
@@ -210,7 +238,7 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 		{
 			const double LocalY = double(j - HalfIndex) * Spacing;
 			const double WorldY = SnappedOriginUU.Y + LocalY;
-			const double HeightUU = SampleHeightUU(WorldX, WorldY);
+			const double HeightUU = SampleHeightUU(WorldX, WorldY, TerrainSeed);
 			const int32 Idx = i * NumVertsPerSide + j;
 			HeightsUU[Idx] = HeightUU;
 			Positions[Idx] = FVector(LocalX, LocalY, HeightUU);

@@ -39,6 +39,13 @@ TAutoConsoleVariable<bool> CVarVoxelDebugRings(
 	false,
 	TEXT("Tint loaded chunks by mip ring level (R0 green .. R4 magenta) instead of chunk-state tints. Live under voxel.Debug 2."),
 	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarVoxelMipCacheBudgetMB(
+	TEXT("voxel.MipCacheBudgetMB"),
+	512,
+	TEXT("Approximate byte budget (MB) for the shared cross-job mip cache (FSharedMipCache, VoxelWorldSubsystem.cpp). ")
+	TEXT("Sharded approximate-LRU evicts on insert once over budget. <= 0 disables eviction (unbounded)."),
+	ECVF_Default);
 } // namespace
 
 int32 VoxelDebug::GetDebugMode()
@@ -95,4 +102,14 @@ FLinearColor VoxelDebug::HeightmapBandTint()
 	// m2-plan.md "Debug" row / debug-tooling-plan.md palette: "heightmap
 	// band cyan".
 	return FLinearColor(0.1f, 0.85f, 0.95f, 1.0f);
+}
+
+int64 VoxelDebug::GetMipCacheBudgetBytes()
+{
+	return int64(CVarVoxelMipCacheBudgetMB.GetValueOnAnyThread()) * 1024 * 1024;
+}
+
+void VoxelDebug::SetMipCacheBudgetMB(int32 NewBudgetMB)
+{
+	CVarVoxelMipCacheBudgetMB->Set(NewBudgetMB, ECVF_SetByCode);
 }

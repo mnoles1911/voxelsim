@@ -21,6 +21,44 @@
 #include "VoxelOceanActor.h"
 #include "VoxelWorldSubsystem.h"
 
+namespace
+{
+// -VoxelSpawnAt=X,Y (meters, world): shared by RestartPlayer's pawn spawn
+// column AND BeginPlay's SkyAtmosphere placement (M2 task "SkyAtmosphere
+// origin fix" -- see BeginPlay) so both land on the EXACT same column and
+// can never drift apart. Returns false (Out* left at 0,0 UU) if the switch
+// is absent; true with parsed meters->UU values if present and well-formed.
+// Malformed input logs a warning and returns false (falls back to (0,0)).
+//
+// bShouldStopOnSeparator=false on the FParse::Value call below: its default
+// terminator set includes ',' (meant for stopping at the end of one
+// positional value in a list), which would truncate "X,Y" at the comma and
+// silently drop Y -- this switch's value is the whole "X,Y" pair, so read up
+// to the next whitespace instead.
+bool ParseSpawnColumnUU(double& OutWorldX, double& OutWorldY)
+{
+	OutWorldX = 0.0;
+	OutWorldY = 0.0;
+	FString SpawnAtArg;
+	if (!FParse::Value(FCommandLine::Get(), TEXT("VoxelSpawnAt="), SpawnAtArg, /*bShouldStopOnSeparator=*/false))
+	{
+		return false;
+	}
+	FString XStr, YStr;
+	if (!SpawnAtArg.Split(TEXT(","), &XStr, &YStr))
+	{
+		UE_LOG(LogVoxelEarth, Warning,
+		       TEXT("-VoxelSpawnAt=%s malformed (expected X,Y in meters); falling back to (0,0)."), *SpawnAtArg);
+		return false;
+	}
+	const double SpawnMetersX = FCString::Atod(*XStr);
+	const double SpawnMetersY = FCString::Atod(*YStr);
+	OutWorldX = SpawnMetersX * 100.0; // meters -> UU (1 UU = 1 cm)
+	OutWorldY = SpawnMetersY * 100.0;
+	return true;
+}
+} // namespace
+
 AVoxelEarthGameMode::AVoxelEarthGameMode()
 {
 	DefaultPawnClass = AVoxelEarthFlyPawn::StaticClass();
@@ -59,8 +97,30 @@ void AVoxelEarthGameMode::BeginPlay()
 		{
 			USkyAtmosphereComponent* AtmosphereComp =
 				NewObject<USkyAtmosphereComponent>(Atmosphere);
+
+			// M2 task "SkyAtmosphere origin fix": the component's default
+			// TransformMode (PlanetTopAtAbsoluteWorldOrigin) hardcodes the
+			// planet's ground level at world (0,0,0). At a far LWC spawn
+			// (e.g. -VoxelSpawnAt=2000000,1500000 -- 20,000km out) the
+			// player is nowhere near that assumed ground level, so the
+			// atmosphere's horizon sphere (computed relative to the
+			// hardcoded origin) renders badly misplaced -- visible as a
+			// horizon-sphere artifact cutting across the sky (see the lwc
+			// verification runs this fix is checked against).
+			// PlanetTopAtComponentTransform instead makes the planet's
+			// ground level follow THIS component's own world transform, so
+			// placing the actor at the pawn's spawn column (below) keeps
+			// the horizon correct at any spawn offset, not just near-origin
+			// ones.
+			AtmosphereComp->TransformMode = ESkyAtmosphereTransformMode::PlanetTopAtComponentTransform;
+
 			AtmosphereComp->RegisterComponent();
 			Atmosphere->SetRootComponent(AtmosphereComp);
+
+			double SpawnColumnXUU = 0.0;
+			double SpawnColumnYUU = 0.0;
+			ParseSpawnColumnUU(SpawnColumnXUU, SpawnColumnYUU); // no-op (stays 0,0) if -VoxelSpawnAt is absent
+			Atmosphere->SetActorLocation(FVector(SpawnColumnXUU, SpawnColumnYUU, 0.0));
 		}
 
 		// Water track W1 (docs/voxel-earth-implementation-plan.md SS3.7 /
@@ -83,6 +143,18 @@ void AVoxelEarthGameMode::BeginPlay()
 		VoxelDebug::SetDebugMode(2);
 		VoxelDebug::SetRingsEnabled(true);
 		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelDebugRings: forcing voxel.Debug=2, voxel.Debug.Rings=1"));
+	}
+
+	// M2 task "Mip cache eviction" verification aid: -VoxelMipCacheBudgetMB=<N>
+	// forces voxel.MipCacheBudgetMB from the command line -- same
+	// FindConsoleVariable-set-by-code pattern SetDebugMode/SetRingsEnabled use
+	// above, simplest way to force a small budget for a headless
+	// -VoxelPerfRun run without depending on -ExecCmds cvar-parsing timing.
+	int32 MipCacheBudgetMBOverride = 0;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelMipCacheBudgetMB="), MipCacheBudgetMBOverride))
+	{
+		VoxelDebug::SetMipCacheBudgetMB(MipCacheBudgetMBOverride);
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelMipCacheBudgetMB override: forcing voxel.MipCacheBudgetMB=%d"), MipCacheBudgetMBOverride);
 	}
 
 	// M2 wave 2 item 2 verification (docs/m2-plan.md "Distant-edit mip
@@ -241,32 +313,16 @@ void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 	// overrides the spawn column with the same surface-height-query-plus-5m
 	// logic used for the default (0,0) column above, just evaluated at an
 	// arbitrary far-from-origin column. Default behavior (spawn at 0,0) is
-	// unchanged when the switch is absent.
+	// unchanged when the switch is absent. Parsing itself lives in the
+	// file-scope ParseSpawnColumnUU (shared with BeginPlay's SkyAtmosphere
+	// placement, M2 task "SkyAtmosphere origin fix") so the pawn and the
+	// atmosphere actor can never land on different columns.
 	double SpawnWorldX = 0.0;
 	double SpawnWorldY = 0.0;
-	FString SpawnAtArg;
-	// bShouldStopOnSeparator=false: FParse::Value's default terminator set
-	// includes ',' (it's meant for stopping at the end of one positional
-	// value in a list), which would truncate "X,Y" at the comma and silently
-	// drop Y. This switch's value is the whole "X,Y" pair, so read up to the
-	// next whitespace instead.
-	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelSpawnAt="), SpawnAtArg, /*bShouldStopOnSeparator=*/false))
+	if (ParseSpawnColumnUU(SpawnWorldX, SpawnWorldY))
 	{
-		FString XStr, YStr;
-		if (SpawnAtArg.Split(TEXT(","), &XStr, &YStr))
-		{
-			const double SpawnMetersX = FCString::Atod(*XStr);
-			const double SpawnMetersY = FCString::Atod(*YStr);
-			SpawnWorldX = SpawnMetersX * 100.0; // meters -> UU (1 UU = 1 cm)
-			SpawnWorldY = SpawnMetersY * 100.0;
-			UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSpawnAt override: spawning at column (%.1f, %.1f) m"),
-			       SpawnMetersX, SpawnMetersY);
-		}
-		else
-		{
-			UE_LOG(LogVoxelEarth, Warning,
-			       TEXT("-VoxelSpawnAt=%s malformed (expected X,Y in meters); falling back to (0,0)."), *SpawnAtArg);
-		}
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSpawnAt override: spawning at column (%.1f, %.1f) m"),
+		       SpawnWorldX / 100.0, SpawnWorldY / 100.0);
 	}
 
 	// -VoxelCameraHigh=<meters>: M2 Band 3 verification switch (docs/m2-plan.md

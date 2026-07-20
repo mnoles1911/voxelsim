@@ -42,7 +42,18 @@ public:
 	// never changes; it is destroyed and a new one spawned instead). Quad
 	// coordinates in ChunkQuads stay in level-relative voxel units (0..31);
 	// only world placement (this scale) differs by level.
-	void SetLevel(int32 InLevel) { ChunkLevel = InLevel; }
+	//
+	// M2 "Transitions" polish (docs/voxel-earth-implementation-plan.md SS3.3;
+	// docs/m2-plan.md's "hard boundary v0" row, now upgraded): also drives the
+	// always-on dithered ring cross-fade (ApplyRingFadeParams, VoxelChunkComponent.cpp)
+	// -- a per-level static table derived from UVoxelWorldSubsystem::RingPresets
+	// (read-only reference; this component never modifies the subsystem).
+	// SetLevel runs BEFORE SetMaterial (see the NewObject<UVoxelChunkComponent>
+	// call site in VoxelWorldSubsystem.cpp), so this alone can't create the MID
+	// yet if no base material is assigned -- ApplyRingFadeParams no-ops until
+	// both are known, whichever of SetLevel/SetMaterial lands second finishes
+	// the job.
+	void SetLevel(int32 InLevel);
 	int32 GetLevel() const { return ChunkLevel; }
 
 	//~ Begin UPrimitiveComponent Interface
@@ -62,21 +73,26 @@ public:
 	// --- Chunk-state debug tints (docs/debug-tooling-plan.md P1, mode 2 +
 	// voxel.Debug.ChunkStates) ------------------------------------------------
 
-	// Lazily creates a MID over ChunkMaterial (this component derives from
-	// UPrimitiveComponent, not UMeshComponent, so the usual
-	// CreateDynamicMaterialInstance helper isn't available -- this is its
-	// hand-rolled equivalent: UMaterialInstanceDynamic::Create + SetMaterial)
-	// and sets its DebugTint vector parameter (M_VoxelTerrain, multiplied into
-	// BaseColor; see Tools/create_voxel_material.py). Only ever called by
-	// FVoxelWorldImpl::UpdateChunkStateTints, which itself only runs while
-	// voxel.Debug.ChunkStates is live under mode 2 -- so the MID is never
-	// created at all with the layer off (constraint: "no MIDs created" when
-	// voxel.Debug=0 / the layer is off).
+	// Sets the DebugTint vector parameter (M_VoxelTerrain, multiplied into
+	// BaseColor; see Tools/create_voxel_material.py) on ChunkMID. M2 update:
+	// ChunkMID is no longer lazily created here -- it now always exists once a
+	// base material is assigned, because ApplyRingFadeParams (SetLevel/
+	// SetMaterial) needs one unconditionally for the always-on ring cross-fade
+	// params, and the task constraint is "one MID per component maximum" --
+	// so this just sets a parameter on that already-existing instance (a no-op
+	// if no material has been assigned yet at all, which shouldn't happen in
+	// practice since SetMaterial always runs before any debug call site).
+	// Only ever called by FVoxelWorldImpl::UpdateChunkStateTints /
+	// UpdateRingTints, which only run while voxel.Debug's mode>=2 layers are
+	// live -- so this is the only per-component work that layer ever costs
+	// (the MID itself is already paid for by the fade feature, not by debug).
 	void SetDebugTint(const FLinearColor& Tint);
 
-	// Drops the MID (if any) and reverts to the shared ChunkMaterial, so
-	// toggling debug off costs nothing further (constraint: "no MIDs created"
-	// when voxel.Debug's chunk-state layer is off).
+	// Resets DebugTint to the multiplicative identity (opaque white) rather
+	// than dropping ChunkMID -- the MID must persist regardless (it carries
+	// the always-on ring-fade params), so "zero-cost when off" now means "no
+	// extra per-frame/per-toggle work", not "no MID": there was never a
+	// second MID to drop once fades became always-on.
 	void ClearDebugTint();
 
 private:
@@ -84,13 +100,34 @@ private:
 	int32 ChunkEdgeVoxels = 32;
 	int32 ChunkLevel = 0;
 
+	// The material actually used for rendering (CreateSceneProxy reads this
+	// directly) -- either the plain base material passed to SetMaterial(),
+	// or ChunkMID once ApplyRingFadeParams has wrapped it (which happens as
+	// soon as both a base material and a level are known; see SetLevel).
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInterface> ChunkMaterial;
 
-	// Only created on first SetDebugTint call; nullptr (and unused) whenever
-	// chunk-state debug tinting has never been engaged this session.
+	// Single MID per component (docs/m2-plan.md "Transitions" row: "one MID
+	// per component maximum -- set both param groups on the same instance").
+	// Created by ApplyRingFadeParams (VoxelChunkComponent.cpp) the first time
+	// a base material is available; carries the four always-on
+	// RingInnerFadeStart/End + RingOuterFadeStart/End scalar params, and
+	// reused by SetDebugTint/ClearDebugTint above for the P1 DebugTint vector
+	// param when that separate debug layer is engaged. Never destroyed for
+	// the lifetime of the component once created (fades never turn off), only
+	// recreated if SetMaterial() is called again with a different base.
 	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInstanceDynamic> DebugTintMID;
+	TObjectPtr<UMaterialInstanceDynamic> ChunkMID;
+
+	// Applies this chunk's per-level ring cross-fade params (docs/m2-plan.md
+	// "Transitions" row upgrade; docs/voxel-earth-implementation-plan.md
+	// SS3.3) to ChunkMID, lazily creating it over the current base material
+	// (ChunkMID's existing Parent, or ChunkMaterial if no MID exists yet) the
+	// first time both ChunkLevel and a base material are known. No-ops if no
+	// base material has been assigned yet (SetLevel runs before SetMaterial
+	// in the current construction order -- see SetLevel's doc comment).
+	// Always-on: unlike SetDebugTint/ClearDebugTint, there is no cvar gate.
+	void ApplyRingFadeParams();
 
 	friend class FVoxelChunkSceneProxy;
 };

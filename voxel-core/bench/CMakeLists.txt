@@ -4,6 +4,15 @@ if(NOT MSVC)
   target_compile_options(vxc_bench PRIVATE -Wall -Wextra -Werror)
 endif()
 
+# --- vxc_editlog: offline edit-log stats/compact/verify tool (M3 groundwork,
+# docs/status.md) -----------------------------------------------------------
+add_executable(vxc_editlog editlog_tool.cpp)
+target_link_libraries(vxc_editlog PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_editlog PRIVATE -Wall -Wextra -Werror)
+endif()
+add_test(NAME vxc_editlog_selftest COMMAND vxc_editlog selftest)
+
 # --- vxc_gpu: Vulkan worldgen determinism harness (ADR-0001) ---------------
 # Headless: dispatches build/shaders/worldgen.ColumnMain.spv and byte-compares
 # against the CPU reference. Windows-only for now; needs tools/vulkan-headers

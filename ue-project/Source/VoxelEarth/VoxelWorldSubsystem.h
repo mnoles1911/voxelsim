@@ -54,10 +54,21 @@ public:
 	virtual TStatId GetStatId() const override;
 	//~ End FTickableGameObject / UTickableWorldSubsystem Interface
 
-	// Dev-fixed seed (docs/m1-plan.md decisions table: "seed from config
-	// (default 20260719)" -- still fixed; config-driven seed selection is a
-	// later milestone).
+	// Fallback seed (docs/m1-plan.md decisions table: "seed from config
+	// (default 20260719)"). M2 task "Config-driven seed": the RUNTIME seed
+	// actually in effect is resolved once in Initialize() from -VoxelSeed=<u64>
+	// on the command line (falling back to this constant) and stored in Seed
+	// below -- GetSeed() is the value every voxel-core access, and every other
+	// actor that needs seed-matched sampling (e.g. AVoxelClipmapActor's
+	// heightmap), should read. DefaultSeed itself stays a compile-time
+	// constant only for the fallback value and any log/comment referring to
+	// "the default".
 	static constexpr uint64 DefaultSeed = 20260719;
+
+	// The seed actually in effect this run (-VoxelSeed=<u64> override, else
+	// DefaultSeed) -- resolved once in Initialize(), before Impl is
+	// constructed, so it is valid for the subsystem's entire lifetime.
+	uint64 GetSeed() const { return Seed; }
 
 	// M2 first implementation wave (docs/m2-plan.md decisions table, "Ring
 	// structure" / "Ring streaming" rows): default ring preset, one annulus
@@ -170,6 +181,10 @@ public:
 	FVoxelPerfSnapshot GetPerfSnapshot() const;
 
 private:
+	// M2 task "Config-driven seed": resolved in Initialize() from -VoxelSeed=
+	// (default DefaultSeed); see GetSeed() above.
+	uint64 Seed = DefaultSeed;
+
 	TUniquePtr<FVoxelWorldImpl> Impl;
 
 	// Single actor hosting every render-chunk component (unchanged from
