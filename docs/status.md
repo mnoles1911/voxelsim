@@ -222,3 +222,26 @@ underwater fog/post-process tint toggled by camera depth (log-verified
 transition, no screenshot), swim-mode placeholder in `AVoxelEarthFlyPawn`
 (gravity off, fly-style 300 UU/s below sea level). No pressure CA, reservoirs,
 buoyancy, or currents yet -- those are W2-W4.
+
+## Backlog (parked / deferred, updated 2026-07-20)
+
+| Item | State | Unblock |
+|---|---|---|
+| NVIDIA cloud digest run (closes BOTH M0 gates) | blocked on rental spend (Matt) | ~$1, minutes of runtime; same session can bring up terrain-diffusion |
+| terrain-diffusion worker bring-up | deferred by ADR-0001 to vistas — Band 3 exists now, so eligible | cloud NVIDIA rental |
+| Mip cache eviction (unbounded, ~716MB observed) | agent wave in flight | — |
+| Config-driven world seed (constant 20260719) | agent wave in flight | — |
+| SkyAtmosphere spawned at world origin (visible ≥1000s of km) | agent wave in flight | — |
+| M1 formal min-spec proxy perf run | proxy settings defined below; run pending | — |
+| R3/R4 first-build cost (~335ms/job) | needs GPU-side gen or disk brick cache | design pass |
+| Dithered blue-noise ring cross-fades + ring↔clipmap seam | deliberate last (plan's slip-risk item) | M2 polish wave |
+| Perf-run hitches (~15-19/run, max 400ms, during initial streaming ramp) | needs isolate + PSO precache investigation | M2 gate work |
+| Clipmap follow-ups: two-sided material (winding unverified), A/B perf isolate, CDLOD replacement per ADR-0002 tripwire | noted in ADR/plan | M2 polish |
+| Edit-log compaction unused by any caller | offline tooling | M3 persistence |
+| Debug tooling P2/P3 (τ overlay, water ledgers) | phased with M2-polish/W2 | — |
+
+M1 min-spec proxy definition: `sg.ViewDistanceQuality 0`, `sg.ShadowQuality 0`,
+`r.ScreenPercentage 100` at 1080p, streaming budgets halved
+(`voxel.*` budget cvars pending) — intent: approximate RTX-3060-class
+headroom on this 7800 XT by measuring at these settings and requiring
+p95 < 16.6ms with zero steady-state hitches (excluding the first 10s ramp).

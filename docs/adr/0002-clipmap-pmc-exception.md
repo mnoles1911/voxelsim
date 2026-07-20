@@ -1,10 +1,10 @@
 # ADR-0002: Band 3 clipmap may use ProceduralMeshComponent (scoped exception)
 
-- **Status:** proposed (awaiting human sign-off)
+- **Status:** accepted
 - **Date:** 2026-07-20
 - **Doctrine sections affected:** plan §3.3 Band 1 ("GPU greedy meshing →
   pooled custom FPrimitiveSceneProxy buffers (NOT ProceduralMeshComponent)")
-- **Human sign-off:** pending (Matt)
+- **Human sign-off:** Matt Noles, 2026-07-20 ("ADR-0002 approved")
 
 ## Context
 
