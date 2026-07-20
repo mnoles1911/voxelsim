@@ -3,8 +3,10 @@
 
 #include "voxelcore/waterca.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <vector>
 
 #include "voxelcore/generator.h"
 #include "vxctest.h"
@@ -167,7 +169,104 @@ VXC_TEST(waterca_deterministic_repeat_and_golden_digest) {
     a.digest(da);
     b.digest(db);
     CHECK_EQ(da.h, db.h);
-    CHECK_EQ(da.h, 0x7995BE759FB9D67Eull); // GOLDEN(waterca_container_scenario)
+    // GOLDEN(waterca_container_scenario), v1 two-phase contract (kWaterCAVersion==2).
+    // Re-pinned from the v0 sequential-sweep value (0x7995BE759FB9D67E) --
+    // deliberate per the two-phase rewrite (header "Tick rules v1" comment);
+    // same scenario, different determinism contract, so a different digest
+    // is expected, not a regression.
+    CHECK_EQ(da.h, 0x5C8D36C83246CAFCull);
+}
+
+// Conservation-under-contention proof (two-phase v1 contract): a walled
+// "cross" -- origin plus its 4 lateral neighbors open at z=1, everything
+// else at z=1 solid (so each arm's ONLY non-solid neighbor is the origin;
+// no unrelated spreading to confuse the arithmetic) -- with origin near-full
+// (253/255, budget 2) and all 4 arms completely full (255). Every arm wants
+// to send flow toward origin (diff=2 each, i.e. flow=1 each per the
+// lateral rule): a naive unconditional apply would try to stuff 4 units
+// into a 2-unit budget (257 > 255, an illegal uint8_t overflow). The
+// two-phase design's fixed processing order (colorOf's 8-way round order --
+// see waterca.h "Tick rules v1") resolves this deterministically: origin
+// and the 4 arms fall into 3 different colors (verified: origin alone,
+// east+west together, north+south together), so by the time origin's
+// capacity is actually consumed (in the earlier-processed east/west round),
+// the later-processed north/south round finds zero budget left and
+// correctly contributes nothing -- not a coin flip or an overflow, the
+// SAME two arms (east/west, the lower-numbered color) win every time this
+// exact scenario runs. Total volume is exactly conserved either way.
+VXC_TEST(waterca_lateral_contention_capped_conserved_fixed_order) {
+    auto solid = [](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
+        if (vz <= 0) return MAT_ROCK; // floor
+        if (vz != 1) return MAT_AIR;  // nothing above the cross layer matters
+        const bool isArm = (vx == 0 && vy == 0) || (vx == 1 && vy == 0) || (vx == -1 && vy == 0) ||
+                           (vx == 0 && vy == 1) || (vx == 0 && vy == -1);
+        return isArm ? MAT_AIR : MAT_ROCK; // everything off the cross is a wall
+    };
+    WaterCA ca(solid);
+    ca.addWater(0, 0, 1, 253);  // origin: budget 2 once at 253/255
+    ca.addWater(1, 0, 1, 255);  // east: full
+    ca.addWater(-1, 0, 1, 255); // west: full
+    ca.addWater(0, 1, 1, 255);  // north: full
+    ca.addWater(0, -1, 1, 255); // south: full
+    CHECK_EQ(ca.totalVolume(), uint64_t(253 + 255 * 4));
+
+    ca.step();
+
+    // Origin filled to EXACTLY capacity (255), never 257 -- the cap held.
+    CHECK_EQ(int(ca.fillAt(0, 0, 1)), 255);
+    // East/west (the lower color, processed while origin still had budget)
+    // each gave up exactly 1 unit -- their desired flow was fully admitted.
+    CHECK_EQ(int(ca.fillAt(1, 0, 1)), 254);
+    CHECK_EQ(int(ca.fillAt(-1, 0, 1)), 254);
+    // North/south (the higher color, processed after origin's budget was
+    // already exhausted by east/west) contributed NOTHING and are
+    // therefore unchanged -- their desired-but-rejected flow was never
+    // subtracted from them (conservation would break if it had been).
+    CHECK_EQ(int(ca.fillAt(0, 1, 1)), 255);
+    CHECK_EQ(int(ca.fillAt(0, -1, 1)), 255);
+
+    // Exact conservation despite the contention: nothing created, nothing
+    // silently dropped on the floor when a target ran out of room.
+    CHECK_EQ(ca.totalVolume(), uint64_t(253 + 255 * 4));
+    CHECK_EQ(ca.recomputeVolume(), ca.totalVolume());
+}
+
+// Order-independence proof: this is the property that makes a future
+// GPU/parallel port valid (waterca.h "Tick rules v1" -- stepWithOrder is a
+// pure function of the ACTIVE SET's CONTENTS, never the order it's listed
+// in). Two identically-built WaterCA instances run the SAME scenario for
+// many ticks; one always feeds step() (which passes activeSetSnapshot(), a
+// BrickKeyLess-sorted vector) while the other explicitly REVERSES its own
+// active-set snapshot every single tick before calling stepWithOrder with
+// it -- a deliberately different (and itself varying, since a reversed
+// active set is never the same permutation as the previous tick's) order
+// every time. Byte-identical results throughout (not just at the end)
+// proves both determinism (repeatable) AND order-independence in one test.
+VXC_TEST(waterca_twophase_order_independent_and_deterministic) {
+    auto scenario_sorted = [](WaterCA& ca) {
+        ca.addWater(1, 1, 30, 2795);
+        ca.addWater(0, 0, 25, 150);
+    };
+
+    WaterCA sorted(basin(0, 2, 0, 2));
+    WaterCA shuffled(basin(0, 2, 0, 2));
+    scenario_sorted(sorted);
+    scenario_sorted(shuffled);
+
+    for (int i = 0; i < 60; ++i) {
+        sorted.step(); // sorted-order snapshot internally
+
+        std::vector<BrickKey> order = shuffled.activeSetSnapshot();
+        std::reverse(order.begin(), order.end()); // a different permutation than step() would use
+        shuffled.stepWithOrder(order);
+
+        CHECK_EQ(sorted.totalVolume(), shuffled.totalVolume());
+        CHECK_EQ(sorted.activeBrickCount(), shuffled.activeBrickCount());
+        Digest ds, dh;
+        sorted.digest(ds);
+        shuffled.digest(dh);
+        CHECK_EQ(ds.h, dh.h); // byte-identical state every single tick, not just at the end
+    }
 }
 
 VXC_TEST(waterca_conservation_fuzz_over_bumpy_terrain) {
