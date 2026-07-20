@@ -4,6 +4,7 @@
 #include "GameFramework/PlayerController.h"
 #include "Net/UnrealNetwork.h"
 #include "VoxelEarth.h"
+#include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
 
 AVoxelEditRelay::AVoxelEditRelay()
@@ -91,4 +92,21 @@ void AVoxelEditRelay::MulticastAppliedEntries_Implementation(const TArray<uint8>
 		return;
 	}
 	Subsystem->ReceiveLiveEntries(EntryBytes);
+}
+
+void AVoxelEditRelay::MulticastWaterDiffs_Implementation(const TArray<uint8>& DiffBytes)
+{
+	if (HasAuthority())
+	{
+		// Same reasoning as MulticastAppliedEntries_Implementation above: the
+		// server's own vxc::WaterCA is already authoritative for this tick.
+		return;
+	}
+	UWorld* World = GetWorld();
+	UVoxelWaterSubsystem* WaterSubsystem = World ? World->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+	if (!WaterSubsystem)
+	{
+		return;
+	}
+	WaterSubsystem->ApplyReplicatedWaterDiffs(DiffBytes);
 }

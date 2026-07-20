@@ -558,6 +558,190 @@ after every single step. Full suite green: 71/71 (`vxc_tests.exe`, MSVC
 pass, no float/double anywhere in `waterca.h`/`waterca.cpp` (float-ban CI
 grep clean).
 
+## Water track — W2 first engine slice: pressure CA live in the world (2026-07-20, worktree agent, wave 2)
+
+Wires the wave-1 `voxelcore::WaterCA` reference (above) into the running
+game: a new `UVoxelWaterSubsystem` (PImpl, exactly like `UVoxelWorldSubsystem`)
+ticks the CA on a fixed 10Hz accumulator, seeds it from two v0 activation
+sources, and renders active water voxels through a hand-rolled custom scene
+proxy mirroring the terrain doctrine. `voxel-core` itself gained only
+read-only accessors this pass (`WaterCA::activeBricks()`, `findBrick()`,
+`bricks()`, `setReplicatedFill()`) -- no tick-rule changes, no
+`kWaterCAVersion` bump needed; `vxc_tests` reconfirmed 70/70 green
+(golden waterca digest unchanged) after adding them.
+
+**Architecture.** `UVoxelWaterSubsystem` takes a direct
+`Collection.InitializeDependency<UVoxelWorldSubsystem>()` dependency (both
+`UWorldSubsystem`-derived, so ordering is engine-guaranteed, no BeginPlay
+race); the CA's `SolidFn` bridges to `UVoxelWorldSubsystem::IsSolidAtVoxel`
+(already public, overlay-aware) instead of duplicating terrain access.
+Authority-only simulation: `NM_Client` never steps its own CA, only mirrors
+state via `AVoxelEditRelay::MulticastWaterDiffs` (see Replication below).
+Own `ChunkOwner`/`ChunkRoot` actor (separate from terrain's), skipped
+entirely on `NM_DedicatedServer` (no viewport) while the CA still ticks
+authoritatively there, mirroring `UVoxelWorldSubsystem`'s identical
+dedicated-server branch.
+
+**Activation sources v0.**
+(a) `voxel.SpawnWater <amount>` console command: raycasts from the local
+player's crosshair (`UVoxelWorldSubsystem::RaycastVoxelWorld`, same aim as
+dig/place) and calls `WaterCA::addWater` at the first empty voxel before the
+hit surface, falling back to 5m in front of the camera on a miss.
+(b) **Dig breach**: `UVoxelWorldSubsystem::TryDig`/`CarveSphere` (authority
+branches only) now capture every voxel actually turned to `MAT_AIR` this
+call and forward it to `UVoxelWaterSubsystem::NotifyTerrainVoxelsCleared`.
+For each cleared voxel at or below sea level (Z<0), the water subsystem
+checks its 6 neighbors: if any neighbor is OUTSIDE this same edit batch
+(i.e., genuinely pre-existing, not a sibling cell this same dig just
+carved), non-solid, Z<0, and not already CA-tracked (`fillAt==0`), the
+cleared voxel is a breach boundary -- registered as a **Reservoir v0** cell
+(seeded to full fill=255 immediately, topped back up to 255 every fixed
+step thereafter for as long as it's registered). Documented v0
+simplification: a reservoir cell is never un-registered (no support yet for
+"plugging" a breach back up) -- once seeded, the connection to the infinite
+ocean is permanent for that cell.
+
+**Rendering v0.** `UWaterChunkComponent`/`FWaterChunkSceneProxy`
+(`VoxelWaterChunkComponent.h/.cpp`) are a lean SIBLING of
+`UVoxelChunkComponent`/`FVoxelChunkSceneProxy`, not a subclass -- terrain's
+ring mip-level scale/cross-fade machinery is a rendering-LOD concern that
+doesn't apply here (v0 active water only ever renders at true-voxel scale,
+one component per resident `WaterBrick8`, i.e. one per 80cm cube, never
+mip-leveled). Reuses `FVoxelChunkQuad`/`vxc::Quad` unchanged (identical
+field layout regardless of whether the sampler is terrain material or water
+fill-fraction). Sampler: `fill>=128` counts as solid for meshing (task
+spec's stub rule; partial-fill/partial-height mesh is W5 polish) --
+**this threshold matters more than expected in practice**: a modest pour
+(e.g. 3,000 fill units) spreading across an open, gently-sloped surface
+settles with every cell's fill under 128 (measured `maxFill=11`) -- CA-correct
+(volume conserved, settles to 0 active bricks) but **invisible**, since
+there's no boundary to mesh a face at. A concentrated pour (30,000+ units,
+still mostly a tall column when observed) stays above threshold and renders
+correctly. `Tools/create_water_voxel_material.py` authors `M_WaterVoxel`
+(translucent blue, vertex-color AO multiply, same convention as
+`M_VoxelTerrain`) -- confirmed rendering correctly by screenshot (see
+Verification below).
+
+**Perf budgeting -- three iterations, one open finding.** Task spec item 3
+only requires a log-throttled warning if `WaterCA::steppedBrickCount()`
+exceeds `voxel.Water.MaxActiveBricks` (default 4096) -- the CA's tick is
+atomic over its whole active-set snapshot (no safe mid-step cutoff without
+breaking conservation/determinism), so this is monitoring, not a clamp
+(implemented as specified). The RENDER side needed real budgeting
+(doctrine SS2.5), found by direct measurement across three passes:
+1. Every `meshBrick<8>` apron sample routed through `WaterCA::fillAt()`'s
+   full hash+`unordered_map` lookup, even for in-bounds cells whose brick
+   was already in hand: ~90 active bricks cost 10-40ms/tick. Fixed by
+   indexing the already-fetched `WaterBrick8` directly for in-bounds
+   samples, falling back to `fillAt()` only for the true cross-brick apron.
+2. A raw per-tick cap on NEW component creation (`NewObject`+
+   `RegisterComponent`, tried at 32 then 4) still left 6-17ms spikes:
+   RE-meshing already-resident components every tick was uncapped and
+   comparably expensive to creation.
+3. Unified into one `kMaxBrickMeshesPerTick` (=8) budget covering the
+   `meshBrick<8>` call itself, whichever side of create/update triggered
+   it; destroy-on-empty stays unbudgeted (cheap, and capping it would leak
+   stale geometry). `RemeshDirtyBricks` now also short-circuits entirely
+   (no meshing work at all) when `ChunkOwner`/`ChunkRoot` are null
+   (`NM_DedicatedServer`), rather than doing budgeted-but-pointless work.
+
+At small/typical scale (tens of active bricks, the spawn-water pool test)
+this brings the water tick to ~0.001-0.002ms/frame, comfortably inside the
+task's <2ms budget. **Open finding, not fixed this pass**: at the breach
+test's scale (~1,500-1,900 active/stored bricks, well UNDER the 4096 cap),
+measured water tick cost was **500-650ms/frame** -- the render budgeting
+above is no longer the bottleneck; `WaterCA::step()` itself (gravity +
+lateral passes, unbudgeted by task design) is, extrapolating to roughly
+O(activeCells) hashmap probes for every neighbor check
+(`waterKeyForVoxel` + `unordered_map` lookup per gravity/lateral neighbor
+read) -- on the order of 10M+ hash lookups/tick at this scale. This is an
+inherent cost of the CURRENT reference CA's cell-access pattern (not a bug
+introduced by the UE integration this pass), and the header itself already
+flags that "a future parallel/GPU port" is needed work. **Recommendation
+for W2-remaining**: either a much lower real-time-safe default for
+`voxel.Water.MaxActiveBricks` than 4096 (measured cost trend suggests low
+hundreds, not thousands, for a comfortable per-frame budget with the
+current CPU reference), or a CA-side optimization (cache the 6
+face-adjacent brick pointers per active brick instead of re-hashing
+`BrickKey`s per cell) before large flood/breach events are practical in
+real gameplay. Left the cvar default at the task-specified 4096 rather than
+silently changing it, since the spec named that value explicitly -- flagging
+the perf gap for follow-up instead.
+
+**Replication plumbing (v1, task's "documented cap and basic diff encoding"
+option).** Generalizes `AVoxelEditRelay` (its own doctrine comment
+explicitly anticipated this: "the relay generalizes to non-edit
+authoritative streams later ... water CA") with a second
+`MulticastWaterDiffs` broadcast rather than a new actor. Server (authority,
+non-standalone) accumulates dirty bricks since the last broadcast and pushes
+a batch every ~200ms (5Hz), brick-granularity RAW fill-snapshot wire format
+(u32 count, then per brick: i32 x,y,z + 512 raw fill bytes) capped at 32KB/
+broadcast (always encodes at least one brick past the cap to guarantee
+forward progress; the remainder waits for the next round). Explicitly NOT
+per-cell delta compression -- task spec allowed "basic diff encoding, full
+compression is W2-polish". Client applies a batch via
+`WaterCA::setReplicatedFill` (a new accessor, NOT `addWater` -- a replicated
+snapshot sets cells to their authoritative value directly rather than
+stacking) and re-meshes the affected chunks through the same budgeted path.
+Untested end-to-end over an actual two-process connection this pass (no
+dedicated-server run in this verification matrix); the wire format/parse
+round-trip and the client-apply code path are implemented and compile-clean
+but should get an M3-style two-process gate run before being trusted.
+
+**Verification (all headless, `-game`, this desktop's AMD 7800 XT).**
+(a) **Spawn-water pool + conservation/settling**: `-VoxelSpawnWaterTest`
+pours near (0,0); a 3,000-unit pour's log trail shows `volume=3000`
+unchanged across every sample from pour to settle, `activeBricks` reaching
+exactly 0 (`WaterCA::steppedBrickCount()==0`, i.e. the CA's own settled-state
+definition) and staying there. A 30,000-unit pour (needed to clear the
+fill>=128 visibility threshold above) is confirmed rendering by screenshot
+-- a small blue voxel cluster on the snow surface -- though it had not fully
+settled (still ~90 active bricks) within this run's 45s observation window
+(open-surface lateral spread on a v0 CA with no hydrostatic pressure takes a
+long time to reach a fixed point at this volume; the SMALL pour already
+proves the settle-to-0 contract independently). (b) **Dig breach**:
+`-VoxelBreachTest` scans a grid around spawn on `BeginPlay` for a
+below-sea-level column (widened to +/-20km/200m steps after the first,
++/-800m/20m scan found nothing -- this world's synthetic terrain has no
+near-spawn coastline), found one 20km out (65m below sea level), carved a
+6m-radius sphere there. Log: "Dig breach: seeded 10,932 Reservoir v0
+boundary cell(s)... out of 457,227 cleared voxel(s) examined" -- confirms
+the neighbor/ocean-adjacency rule fires at real scale, not just synthetic
+unit-test geometry. Screenshot: a large, dramatically flooded crater
+(a clear blue ring of meshed water voxels around a lighter submerged
+interior, camera itself underwater since the whole area sits below sea
+level) -- the infinite-reservoir inrush behavior is visually unambiguous.
+Volume climbed continuously across the whole observation window (documented
+v0 behavior: reservoir cells never stop topping up once registered).
+(c) **Perf run with water active**: `-VoxelPerfRun=30` combined with
+`-VoxelSpawnWaterTest=5` (small pour, tens of active bricks): overall frame
+p50=4.0ms/p95=18.9ms (dominated by terrain streaming during the scripted
+flight, not water); water-tick-specific samples (own `WaterPerf` log line)
+p50=0.001-0.14ms, occasional spikes into the 10-15ms range during the
+active-remesh budget window -- see the "open finding" above for the
+separate, much larger breach-scale measurement. (d) **Determinism**: ran
+the 30,000-unit spawn-water pour twice as independent processes, compared
+the `WaterCA::digest()` logged immediately after `addWater` (before any
+`step()` runs, so it's a pure function of seed + fixed pour location/amount,
+immune to wall-clock/frame-timing jitter) -- **bit-identical**:
+`0xD8F2DFE4C9B2AFBF` both runs.
+
+**Environment note (not a code change to flag as risky, but worth knowing):**
+this worktree's `.uproject` requires the `ModelContextProtocol`/`AllToolsets`
+engine plugins (`EngineAssociation: "5.8"`), which this machine's installed
+engine (`D:\UE5\UE_5.7`, actually 5.7.4) doesn't have -- marked both
+`"Optional": true` in `VoxelEarth.uproject` so `Build.bat`/`-game` runs
+proceed without them (harmless when the plugins ARE present; only matters
+on a machine that lacks them). Separately, this same engine-version gap
+means `Content/Voxel/M_VoxelTerrain.uasset`, `M_Ocean.uasset`, and
+`M_VoxelClipmap.uasset` (saved by whatever 5.8 engine authored them) are
+flagged "unloadable"/"newer engine version" by THIS 5.7 engine's asset
+registry during a `-run=pythonscript` commandlet pass (confirmed via log);
+a `-game` session did not show the same "not found" fallback warning for
+these, so ordinary gameplay loading appears more tolerant than the
+commandlet path, but this is worth Matt's attention if a future session
+needs to re-author any of those three materials on this machine.
+
 ## Backlog (parked / deferred, updated 2026-07-20)
 
 | Item | State | Unblock |
