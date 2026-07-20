@@ -1,8 +1,8 @@
-// M0-gate Vulkan harness (ADR-0001): dispatches the SPIR-V worldgen kernel
-// (voxel-core/shaders/worldgen.hlsl, ColumnMain) on this machine's GPU and
-// byte-compares every field of every output column against the CPU
-// reference (vxc::Amplifier::column). This desktop is the ADR's AMD leg
-// (RX 7800 XT) of the NVIDIA-vs-AMD M0 determinism gate.
+// M0-gate Vulkan harness (ADR-0001): dispatches the SPIR-V worldgen kernels
+// (voxel-core/shaders/worldgen.hlsl, ColumnMain + VoxelizeMain) on this
+// machine's GPU and byte-compares every field/cell against the CPU reference
+// (vxc::Amplifier::column / vxc::Amplifier::materialAt). This desktop is the
+// ADR's AMD leg (RX 7800 XT) of the NVIDIA-vs-AMD M0 determinism gate.
 //
 // Bench code: wall-clock timing uses floats/doubles, but every value fed to
 // or read from the shader is integer, matching docs/determinism.md and the
@@ -14,15 +14,25 @@
 // there is no import-lib link dependency — only tools/vulkan-headers'
 // headers (types/structs/PFN_ typedefs) are needed at compile time.
 //
+// Two kernels, two pipelines, one shared cbuffer, chained through one
+// buffer: ColumnMain writes OutColumns; that SAME VkBuffer is then bound as
+// VoxelizeMain's InColumns (a pipeline barrier makes the write visible to
+// the second dispatch's reads) — columns are never recomputed on GPU.
+//
 // Resource bindings mirror worldgen.hlsl exactly, but DXC's default SPIR-V
 // codegen maps each HLSL register class (b/t/u) independently onto the same
 // flat Vulkan (set, binding) space, so b0/t0/u0 collide at (0,0) unless
 // shifted. tools/compile-shaders.ps1 compiles with -fvk-t-shift 1 0
 // -fvk-u-shift 3 0, producing the layout hardcoded here:
-//   binding 0: WorldGenParams   (VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, b0)
-//   binding 1: ElevationMm      (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t0)
-//   binding 2: ClimatePacked    (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t1)
-//   binding 3: OutColumns       (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, u0, RW)
+//   ColumnMain pipeline descriptor set:
+//     binding 0: WorldGenParams   (VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, b0)
+//     binding 1: ElevationMm      (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t0)
+//     binding 2: ClimatePacked    (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t1)
+//     binding 3: OutColumns       (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, u0, RW)
+//   VoxelizeMain pipeline descriptor set:
+//     binding 0: WorldGenParams   (VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, b0; same buffer as above)
+//     binding 4: InColumns        (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t3; same buffer as OutColumns)
+//     binding 5: OutCells         (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, u2, RW)
 
 #ifndef _WIN32
 #error "gpu_harness.cpp is Windows-only for now (ADR-0001 M0 scope)"
@@ -194,10 +204,11 @@ struct GpuColumnSample {
 };
 static_assert(sizeof(GpuColumnSample) == 20, "GpuColumnSample must match the HLSL layout");
 
-// GPU-side mirror of worldgen.hlsl's cbuffer WorldGenParams (48 bytes,
+// GPU-side mirror of worldgen.hlsl's cbuffer WorldGenParams (52 bytes,
 // tightly packed — verified against the compiled SPIR-V's member offsets;
 // nothing here straddles a 16-byte boundary so DXC's HLSL-style cbuffer
-// packing matches plain sequential layout).
+// packing matches plain sequential layout). BrickZMin/BricksZ are read only
+// by VoxelizeMain; the rest is shared or ColumnMain-only (see worldgen.hlsl).
 struct WorldGenParamsCB {
     uint32_t DispatchColumnsX, DispatchColumnsY;
     int32_t RasterOriginPxX, RasterOriginPxY;
@@ -207,9 +218,26 @@ struct WorldGenParamsCB {
     uint32_t SeedHi;
     int32_t OriginVx;
     int32_t OriginVy;
-    int32_t Pad0;
+    int32_t BrickZMin;
+    uint32_t BricksZ;
 };
-static_assert(sizeof(WorldGenParamsCB) == 48, "WorldGenParamsCB must match the HLSL cbuffer layout");
+static_assert(sizeof(WorldGenParamsCB) == 52, "WorldGenParamsCB must match the HLSL cbuffer layout");
+
+// Cell index within one 8^3 brick — mirrors vxc::Brick<8>::cellIndex AND
+// worldgen.hlsl's cellIndexInBrick exactly.
+constexpr uint32_t cellIndexInBrick(uint32_t x, uint32_t y, uint32_t z) {
+    return x + 8u * (y + 8u * z);
+}
+
+// OutCells (RWStructuredBuffer<uint>, one uint per cell, material id 0-255 in
+// the low byte) layout — mirrors worldgen.hlsl's VoxelizeMain doc comment
+// exactly:
+//   bricksX = width / 8, bricksY = height / 8 (dispatch footprint, brick-aligned)
+//   bx = x / 8, by = y / 8, lx = x % 8, ly = y % 8
+//   footprintIndex = bx + bricksX * by
+//   brickIndex(footprintIndex, bzLocal) = footprintIndex * bricksZ + bzLocal
+//     (bzLocal in [0, bricksZ); actual brick z = brickZMin + bzLocal)
+//   cell offset = brickIndex * 512 + cellIndexInBrick(lx, ly, zLocal)
 
 struct Buffer {
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -234,6 +262,16 @@ struct GpuContext {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkDescriptorPool descPool = VK_NULL_HANDLE;
     VkDescriptorSet descSet = VK_NULL_HANDLE;
+
+    // VoxelizeMain — separate pipeline/layout/module/set (different SPIR-V
+    // module, different bindings), same instance/device/queue/commandPool.
+    VkDescriptorSetLayout voxDescSetLayout = VK_NULL_HANDLE;
+    VkPipelineLayout voxPipelineLayout = VK_NULL_HANDLE;
+    VkShaderModule voxShaderModule = VK_NULL_HANDLE;
+    VkPipeline voxPipeline = VK_NULL_HANDLE;
+    VkDescriptorPool voxDescPool = VK_NULL_HANDLE;
+    VkDescriptorSet voxDescSet = VK_NULL_HANDLE;
+
     std::string deviceName;
 
     Buffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
@@ -266,7 +304,7 @@ struct GpuContext {
     }
 };
 
-GpuContext createContext(const std::string& spvPath) {
+GpuContext createContext(const std::string& spvPath, const std::string& voxelizeSpvPath) {
     GpuContext ctx;
 
     VkApplicationInfo appInfo{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -415,12 +453,76 @@ GpuContext createContext(const std::string& spvPath) {
     vkCheck(vkAllocateDescriptorSets(ctx.device, &dsai, &ctx.descSet),
             "vkAllocateDescriptorSets");
 
+    // --- VoxelizeMain pipeline: separate SPIR-V module, separate descriptor
+    // set layout (binding 0 uniform WorldGenParams shared with ColumnMain's
+    // buffer, binding 4 InColumns read-only storage, binding 5 OutCells RW
+    // storage — see the file header for the DXC -fvk-*-shift derivation).
+    VkDescriptorSetLayoutBinding voxBindings[3]{};
+    voxBindings[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    voxBindings[1] = {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    voxBindings[2] = {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo voxDslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    voxDslci.bindingCount = 3;
+    voxDslci.pBindings = voxBindings;
+    vkCheck(vkCreateDescriptorSetLayout(ctx.device, &voxDslci, nullptr, &ctx.voxDescSetLayout),
+            "vkCreateDescriptorSetLayout(voxelize)");
+
+    VkPipelineLayoutCreateInfo voxPlci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    voxPlci.setLayoutCount = 1;
+    voxPlci.pSetLayouts = &ctx.voxDescSetLayout;
+    vkCheck(vkCreatePipelineLayout(ctx.device, &voxPlci, nullptr, &ctx.voxPipelineLayout),
+            "vkCreatePipelineLayout(voxelize)");
+
+    const std::vector<uint8_t> voxSpv = readFile(voxelizeSpvPath);
+    if (voxSpv.size() % 4 != 0)
+        fail("SPIR-V binary size not a multiple of 4: " + voxelizeSpvPath);
+    VkShaderModuleCreateInfo voxSmci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    voxSmci.codeSize = voxSpv.size();
+    voxSmci.pCode = reinterpret_cast<const uint32_t*>(voxSpv.data());
+    vkCheck(vkCreateShaderModule(ctx.device, &voxSmci, nullptr, &ctx.voxShaderModule),
+            "vkCreateShaderModule(voxelize)");
+
+    VkPipelineShaderStageCreateInfo voxStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    voxStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    voxStage.module = ctx.voxShaderModule;
+    voxStage.pName = "VoxelizeMain";
+    VkComputePipelineCreateInfo voxCpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    voxCpci.stage = voxStage;
+    voxCpci.layout = ctx.voxPipelineLayout;
+    vkCheck(vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &voxCpci, nullptr,
+                                      &ctx.voxPipeline),
+            "vkCreateComputePipelines(voxelize)");
+
+    VkDescriptorPoolSize voxPoolSizes[2]{};
+    voxPoolSizes[0] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1};
+    voxPoolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+    VkDescriptorPoolCreateInfo voxDpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    voxDpci.maxSets = 1;
+    voxDpci.poolSizeCount = 2;
+    voxDpci.pPoolSizes = voxPoolSizes;
+    vkCheck(vkCreateDescriptorPool(ctx.device, &voxDpci, nullptr, &ctx.voxDescPool),
+            "vkCreateDescriptorPool(voxelize)");
+
+    VkDescriptorSetAllocateInfo voxDsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    voxDsai.descriptorPool = ctx.voxDescPool;
+    voxDsai.descriptorSetCount = 1;
+    voxDsai.pSetLayouts = &ctx.voxDescSetLayout;
+    vkCheck(vkAllocateDescriptorSets(ctx.device, &voxDsai, &ctx.voxDescSet),
+            "vkAllocateDescriptorSets(voxelize)");
+
     return ctx;
 }
 
 void destroyContext(GpuContext& ctx) {
     if (ctx.device) {
-        // vkDestroyDescriptorPool implicitly frees ctx.descSet.
+        // vkDestroyDescriptorPool implicitly frees ctx.descSet / ctx.voxDescSet.
+        if (ctx.voxDescPool) vkDestroyDescriptorPool(ctx.device, ctx.voxDescPool, nullptr);
+        if (ctx.voxPipeline) vkDestroyPipeline(ctx.device, ctx.voxPipeline, nullptr);
+        if (ctx.voxPipelineLayout)
+            vkDestroyPipelineLayout(ctx.device, ctx.voxPipelineLayout, nullptr);
+        if (ctx.voxShaderModule) vkDestroyShaderModule(ctx.device, ctx.voxShaderModule, nullptr);
+        if (ctx.voxDescSetLayout)
+            vkDestroyDescriptorSetLayout(ctx.device, ctx.voxDescSetLayout, nullptr);
         if (ctx.descPool) vkDestroyDescriptorPool(ctx.device, ctx.descPool, nullptr);
         if (ctx.pipeline) vkDestroyPipeline(ctx.device, ctx.pipeline, nullptr);
         if (ctx.pipelineLayout) vkDestroyPipelineLayout(ctx.device, ctx.pipelineLayout, nullptr);
@@ -444,10 +546,21 @@ struct RegionSpec {
 
 struct RegionResult {
     std::vector<GpuColumnSample> samples; // width*height, row-major (x fast)
-    double dispatchMs = 0; // wall-clock: submit -> fence signalled
+    std::vector<ColumnSample> cpuCols;    // width*height CPU reference columns, same order/index
+    std::vector<uint32_t> cells;          // OutCells readback; layout doc near cellIndexInBrick()
+    int32_t brickZMin = 0;
+    uint32_t bricksZ = 0;
+    double columnDispatchMs = 0;   // wall-clock: ColumnMain submit -> fence signalled
+    double voxelizeDispatchMs = 0; // wall-clock: VoxelizeMain submit -> fence signalled
 };
 
 RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed) {
+    if (region.width % 8 != 0 || region.height % 8 != 0) {
+        fail(std::string("region '") + region.name +
+             "' dispatch footprint must be brick-aligned (width/height multiples of 8) "
+             "per worldgen.hlsl's VoxelizeMain contract");
+    }
+
     SyntheticTileSampler tiles(seed);
     const int64_t pixelSizeMm = tiles.pixelSizeMm();
 
@@ -469,14 +582,54 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
                 region.name, region.originVx, region.originVy, region.width, region.height,
                 (long long)pxMin, (long long)pyMin, rasterW, rasterH);
 
+    // CPU columns for the WHOLE region, computed once up front. This serves
+    // two purposes and both need it before the GPU dispatch: (a) it derives
+    // VoxelizeMain's z-range the same way GeneratedWorld<8>::surfaceBrickRange
+    // does (top-voxel min/max -> brick z range), except over the whole region
+    // rather than a single 8x8 footprint, since BrickZMin/BricksZ are one
+    // pair of scalars shared by every footprint in the dispatch; (b) it is
+    // returned to the caller and reused as ground truth for BOTH the
+    // ColumnMain field comparison and the VoxelizeMain cell comparison, so
+    // vxc::Amplifier::column is never computed twice for the same column.
+    SyntheticTileSampler cpuTiles(seed);
+    Amplifier cpuAmp(seed, cpuTiles);
+    std::vector<ColumnSample> cpuCols(size_t(region.width) * region.height);
+    int64_t vzMin = INT64_MAX, vzMax = INT64_MIN;
+    for (uint32_t y = 0; y < region.height; ++y) {
+        for (uint32_t x = 0; x < region.width; ++x) {
+            const int64_t vx = int64_t(region.originVx) + x;
+            const int64_t vy = int64_t(region.originVy) + y;
+            const ColumnSample c = cpuAmp.column(vx, vy);
+            cpuCols[size_t(x) + size_t(y) * region.width] = c;
+            // Topmost solid voxel: centre (vz*100+50) <= surfaceMm (mirrors
+            // GeneratedWorld<8>::surfaceBrickRange).
+            const int64_t top = floorDiv(int64_t(c.surfaceMm) - kVoxelSizeMm / 2, kVoxelSizeMm);
+            vzMin = top < vzMin ? top : vzMin;
+            vzMax = top > vzMax ? top : vzMax;
+        }
+    }
+    const int32_t brickZMin = static_cast<int32_t>(floorDiv(vzMin, 8));
+    const int32_t brickZMax = static_cast<int32_t>(floorDiv(vzMax, 8));
+    const uint32_t bricksZ = static_cast<uint32_t>(brickZMax - brickZMin + 1);
+    const uint32_t bricksX = region.width / 8;
+    const uint32_t bricksY = region.height / 8;
+    std::printf("[%s] voxelize z-range: brick z [%d, %d] (%u bricks tall)\n", region.name,
+                brickZMin, brickZMax, bricksZ);
+
     Buffer paramsBuf = ctx.createBuffer(sizeof(WorldGenParamsCB),
                                          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     Buffer elevBuf = ctx.createBuffer(VkDeviceSize(rasterW) * rasterH * sizeof(int32_t),
                                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     Buffer climBuf = ctx.createBuffer(VkDeviceSize(rasterW) * rasterH * sizeof(uint32_t),
                                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    Buffer outBuf = ctx.createBuffer(
+    // Columns buffer is shared: ColumnMain writes it (OutColumns, u0), then
+    // the SAME VkBuffer is bound as VoxelizeMain's InColumns (t3) — chained
+    // dispatch, columns never recomputed on GPU.
+    Buffer columnsBuf = ctx.createBuffer(
         VkDeviceSize(region.width) * region.height * sizeof(GpuColumnSample),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer cellsBuf = ctx.createBuffer(
+        VkDeviceSize(bricksX) * bricksY * bricksZ * 512 * sizeof(uint32_t),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     // Fill the raster window exactly as Amplifier::column would read it
@@ -508,13 +661,16 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
     params.SeedHi = static_cast<uint32_t>(seed >> 32);
     params.OriginVx = region.originVx;
     params.OriginVy = region.originVy;
-    params.Pad0 = 0;
+    params.BrickZMin = brickZMin;
+    params.BricksZ = bricksZ;
     std::memcpy(paramsBuf.mapped, &params, sizeof(params));
 
+    // ColumnMain descriptor set: unchanged bindings/order, columnsBuf in the
+    // OutColumns (u0) role.
     VkDescriptorBufferInfo paramsInfo{paramsBuf.buffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo elevInfo{elevBuf.buffer, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo climInfo{climBuf.buffer, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo outInfo{outBuf.buffer, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo columnsInfo{columnsBuf.buffer, 0, VK_WHOLE_SIZE};
     VkWriteDescriptorSet writes[4]{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.descSet, 0, 0, 1,
                  VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &paramsInfo, nullptr};
@@ -523,68 +679,146 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
     writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.descSet, 2, 0, 1,
                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &climInfo, nullptr};
     writes[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.descSet, 3, 0, 1,
-                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &outInfo, nullptr};
+                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &columnsInfo, nullptr};
     vkUpdateDescriptorSets(ctx.device, 4, writes, 0, nullptr);
 
+    // VoxelizeMain descriptor set: binding 0 shares the SAME paramsBuf,
+    // binding 4 (InColumns) is the SAME columnsBuf ColumnMain just wrote,
+    // binding 5 (OutCells) is the new cellsBuf.
+    VkDescriptorBufferInfo cellsInfo{cellsBuf.buffer, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet voxWrites[3]{};
+    voxWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 0, 0, 1,
+                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &paramsInfo, nullptr};
+    voxWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 4, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &columnsInfo, nullptr};
+    voxWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 5, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cellsInfo, nullptr};
+    vkUpdateDescriptorSets(ctx.device, 3, voxWrites, 0, nullptr);
+
+    const uint32_t groupsX = (region.width + 7) / 8;
+    const uint32_t groupsY = (region.height + 7) / 8;
+
+    // --- Pass 1: ColumnMain -------------------------------------------------
     VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cbai.commandPool = ctx.commandPool;
     cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cbai.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    vkCheck(vkAllocateCommandBuffers(ctx.device, &cbai, &cmd), "vkAllocateCommandBuffers");
+    VkCommandBuffer cmd1 = VK_NULL_HANDLE;
+    vkCheck(vkAllocateCommandBuffers(ctx.device, &cbai, &cmd1), "vkAllocateCommandBuffers(column)");
 
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkCheck(vkBeginCommandBuffer(cmd, &cbbi), "vkBeginCommandBuffer");
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipelineLayout, 0, 1,
+    vkCheck(vkBeginCommandBuffer(cmd1, &cbbi), "vkBeginCommandBuffer(column)");
+    vkCmdBindPipeline(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipeline);
+    vkCmdBindDescriptorSets(cmd1, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipelineLayout, 0, 1,
                              &ctx.descSet, 0, nullptr);
-    const uint32_t groupsX = (region.width + 7) / 8;
-    const uint32_t groupsY = (region.height + 7) / 8;
-    vkCmdDispatch(cmd, groupsX, groupsY, 1);
+    vkCmdDispatch(cmd1, groupsX, groupsY, 1);
 
-    // Visibility barrier: SHADER_WRITE -> HOST_READ on the output buffer
-    // before the host maps it post-fence (HOST_COHERENT memory skips the
-    // flush/invalidate calls, not the Vulkan memory-domain visibility op).
-    VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.buffer = outBuf.buffer;
-    barrier.offset = 0;
-    barrier.size = VK_WHOLE_SIZE;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
-                          0, nullptr, 1, &barrier, 0, nullptr);
-    vkCheck(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+    // Visibility barrier: SHADER_WRITE -> HOST_READ | SHADER_READ. HOST_READ
+    // so the host can map columnsBuf post-fence (HOST_COHERENT memory skips
+    // flush/invalidate calls, not the Vulkan memory-domain visibility op);
+    // SHADER_READ so this write is also available to VoxelizeMain's read of
+    // the same buffer as InColumns in the next submission (see the repeated
+    // barrier at the top of cmd2, which performs that read's visibility op).
+    VkBufferMemoryBarrier barrier1{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    barrier1.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier1.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    barrier1.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier1.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier1.buffer = columnsBuf.buffer;
+    barrier1.offset = 0;
+    barrier1.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd1, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
+                          nullptr, 1, &barrier1, 0, nullptr);
+    vkCheck(vkEndCommandBuffer(cmd1), "vkEndCommandBuffer(column)");
 
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    VkFence fence = VK_NULL_HANDLE;
-    vkCheck(vkCreateFence(ctx.device, &fci, nullptr, &fence), "vkCreateFence");
+    VkFence fence1 = VK_NULL_HANDLE;
+    vkCheck(vkCreateFence(ctx.device, &fci, nullptr, &fence1), "vkCreateFence(column)");
 
-    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cmd;
+    VkSubmitInfo submit1{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit1.commandBufferCount = 1;
+    submit1.pCommandBuffers = &cmd1;
 
-    const auto tDispatch = Clock::now();
-    vkCheck(vkQueueSubmit(ctx.queue, 1, &submit, fence), "vkQueueSubmit");
-    vkCheck(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-    const double dispatchMs = msSince(tDispatch);
+    const auto tColumn = Clock::now();
+    vkCheck(vkQueueSubmit(ctx.queue, 1, &submit1, fence1), "vkQueueSubmit(column)");
+    vkCheck(vkWaitForFences(ctx.device, 1, &fence1, VK_TRUE, UINT64_MAX), "vkWaitForFences(column)");
+    const double columnDispatchMs = msSince(tColumn);
+    vkDestroyFence(ctx.device, fence1, nullptr);
 
-    vkDestroyFence(ctx.device, fence, nullptr);
-    // Command buffer is reclaimed when ctx.commandPool is destroyed; no
+    // --- Pass 2: VoxelizeMain, chained off cmd1's columnsBuf write ---------
+    VkCommandBuffer cmd2 = VK_NULL_HANDLE;
+    vkCheck(vkAllocateCommandBuffers(ctx.device, &cbai, &cmd2), "vkAllocateCommandBuffers(voxelize)");
+    vkCheck(vkBeginCommandBuffer(cmd2, &cbbi), "vkBeginCommandBuffer(voxelize)");
+
+    // Availability was already established by barrier1 above (its dst scope
+    // included SHADER_READ); this repeats the dependency as the visibility
+    // operation for THIS submission's reads, per the Vulkan memory model —
+    // correct regardless of the (already GPU-idle) execution ordering from
+    // the fence wait.
+    VkBufferMemoryBarrier chainBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    chainBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    chainBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    chainBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    chainBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    chainBarrier.buffer = columnsBuf.buffer;
+    chainBarrier.offset = 0;
+    chainBarrier.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd2, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &chainBarrier, 0,
+                          nullptr);
+
+    vkCmdBindPipeline(cmd2, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.voxPipeline);
+    vkCmdBindDescriptorSets(cmd2, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.voxPipelineLayout, 0, 1,
+                             &ctx.voxDescSet, 0, nullptr);
+    vkCmdDispatch(cmd2, groupsX, groupsY, 1);
+
+    VkBufferMemoryBarrier barrier2{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    barrier2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier2.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    barrier2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier2.buffer = cellsBuf.buffer;
+    barrier2.offset = 0;
+    barrier2.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd2, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                          0, nullptr, 1, &barrier2, 0, nullptr);
+    vkCheck(vkEndCommandBuffer(cmd2), "vkEndCommandBuffer(voxelize)");
+
+    VkFence fence2 = VK_NULL_HANDLE;
+    vkCheck(vkCreateFence(ctx.device, &fci, nullptr, &fence2), "vkCreateFence(voxelize)");
+
+    VkSubmitInfo submit2{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit2.commandBufferCount = 1;
+    submit2.pCommandBuffers = &cmd2;
+
+    const auto tVoxelize = Clock::now();
+    vkCheck(vkQueueSubmit(ctx.queue, 1, &submit2, fence2), "vkQueueSubmit(voxelize)");
+    vkCheck(vkWaitForFences(ctx.device, 1, &fence2, VK_TRUE, UINT64_MAX),
+            "vkWaitForFences(voxelize)");
+    const double voxelizeDispatchMs = msSince(tVoxelize);
+    vkDestroyFence(ctx.device, fence2, nullptr);
+    // Command buffers are reclaimed when ctx.commandPool is destroyed; no
     // explicit vkFreeCommandBuffers needed for this one-shot-per-region use.
 
     RegionResult result;
-    result.dispatchMs = dispatchMs;
+    result.columnDispatchMs = columnDispatchMs;
+    result.voxelizeDispatchMs = voxelizeDispatchMs;
     result.samples.resize(size_t(region.width) * region.height);
-    std::memcpy(result.samples.data(), outBuf.mapped,
+    std::memcpy(result.samples.data(), columnsBuf.mapped,
                 result.samples.size() * sizeof(GpuColumnSample));
+    result.cpuCols = std::move(cpuCols);
+    result.cells.resize(size_t(bricksX) * bricksY * bricksZ * 512);
+    std::memcpy(result.cells.data(), cellsBuf.mapped, result.cells.size() * sizeof(uint32_t));
+    result.brickZMin = brickZMin;
+    result.bricksZ = bricksZ;
 
     ctx.destroyBuffer(paramsBuf);
     ctx.destroyBuffer(elevBuf);
     ctx.destroyBuffer(climBuf);
-    ctx.destroyBuffer(outBuf);
+    ctx.destroyBuffer(columnsBuf);
+    ctx.destroyBuffer(cellsBuf);
 
     return result;
 }
@@ -602,17 +836,21 @@ struct Mismatch {
 int main(int argc, char** argv) {
     const uint64_t seed = 20260719; // vxc::SyntheticTileSampler seed, per task spec.
     std::string spvPath = VXC_SPV_PATH;
+    std::string voxelizeSpvPath = VXC_SPV_PATH_VOXELIZE;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--spv" && i + 1 < argc) spvPath = argv[++i];
+        else if (a == "--spv-voxelize" && i + 1 < argc) voxelizeSpvPath = argv[++i];
     }
 
-    std::printf("voxel-core GPU harness (ADR-0001 M0 gate) — worldgen.ColumnMain, seed %llu\n",
-                (unsigned long long)seed);
-    std::printf("shader: %s\n", spvPath.c_str());
+    std::printf(
+        "voxel-core GPU harness (ADR-0001 M0 gate) — worldgen.ColumnMain + VoxelizeMain, "
+        "seed %llu\n",
+        (unsigned long long)seed);
+    std::printf("shaders: %s , %s\n", spvPath.c_str(), voxelizeSpvPath.c_str());
 
     loadVulkanLoader();
-    GpuContext ctx = createContext(spvPath);
+    GpuContext ctx = createContext(spvPath, voxelizeSpvPath);
     std::printf("device: %s\n\n", ctx.deviceName.c_str());
 
     const RegionSpec regions[] = {
@@ -624,22 +862,30 @@ int main(int argc, char** argv) {
     std::vector<Mismatch> mismatches;
     constexpr size_t kMaxMismatchesPrinted = 20;
     size_t totalColumns = 0;
-    double totalDispatchMs = 0;
+    size_t totalCells = 0;
+    double totalColumnDispatchMs = 0;
+    double totalVoxelizeDispatchMs = 0;
 
     for (const RegionSpec& region : regions) {
         const RegionResult gpu = runRegion(ctx, region, seed);
-        totalDispatchMs += gpu.dispatchMs;
-        std::printf("[%s] dispatch wall-clock: %.3f ms\n", region.name, gpu.dispatchMs);
+        totalColumnDispatchMs += gpu.columnDispatchMs;
+        totalVoxelizeDispatchMs += gpu.voxelizeDispatchMs;
+        std::printf("[%s] ColumnMain dispatch wall-clock: %.3f ms\n", region.name,
+                    gpu.columnDispatchMs);
+        std::printf("[%s] VoxelizeMain dispatch wall-clock: %.3f ms\n", region.name,
+                    gpu.voxelizeDispatchMs);
 
-        SyntheticTileSampler cpuTiles(seed);
-        Amplifier cpuAmp(seed, cpuTiles);
+        const uint32_t bricksX = region.width / 8;
 
+        // --- ColumnMain field comparison (unchanged from the column-only
+        // harness, just reusing gpu.cpuCols instead of recomputing it) -----
         for (uint32_t y = 0; y < region.height; ++y) {
             for (uint32_t x = 0; x < region.width; ++x) {
                 const int64_t vx = int64_t(region.originVx) + x;
                 const int64_t vy = int64_t(region.originVy) + y;
-                const GpuColumnSample& g = gpu.samples[size_t(x) + size_t(y) * region.width];
-                const ColumnSample c = cpuAmp.column(vx, vy);
+                const size_t colIdx = size_t(x) + size_t(y) * region.width;
+                const GpuColumnSample& g = gpu.samples[colIdx];
+                const ColumnSample& c = gpu.cpuCols[colIdx];
                 ++totalColumns;
 
                 gpuDigest.u32(static_cast<uint32_t>(g.surfaceMm));
@@ -657,6 +903,31 @@ int main(int argc, char** argv) {
                 record("subsoilMm", c.subsoilMm, g.subsoilMm);
                 record("bedrockDepthMm", c.bedrockDepthMm, g.bedrockDepthMm);
                 record("surfaceMat", c.surfaceMat, g.surfaceMat);
+
+                // --- VoxelizeMain cell comparison for this column's brick
+                // stack (mirrors GeneratedWorld<8>::makeBrick's per-cell
+                // Amplifier::materialAt call; the same column c is reused,
+                // never recomputed). Layout matches worldgen.hlsl's
+                // VoxelizeMain doc comment / cellIndexInBrick() above.
+                const uint32_t bx = x / 8u, by = y / 8u, lx = x % 8u, ly = y % 8u;
+                const uint32_t footprintIndex = bx + bricksX * by;
+                for (uint32_t bz = 0; bz < gpu.bricksZ; ++bz) {
+                    const size_t brickIndex = size_t(footprintIndex) * gpu.bricksZ + bz;
+                    const int64_t brickZ = int64_t(gpu.brickZMin) + int64_t(bz);
+                    for (uint32_t zLocal = 0; zLocal < 8u; ++zLocal) {
+                        const int64_t vz = brickZ * 8 + zLocal;
+                        const size_t cellIdx = brickIndex * 512 + cellIndexInBrick(lx, ly, zLocal);
+                        const uint8_t cpuMat =
+                            static_cast<uint8_t>(Amplifier::materialAt(c, vz));
+                        const uint8_t gpuMat = static_cast<uint8_t>(gpu.cells[cellIdx] & 0xffu);
+                        ++totalCells;
+                        gpuDigest.u8(gpuMat);
+                        if (cpuMat != gpuMat && mismatches.size() < kMaxMismatchesPrinted) {
+                            mismatches.push_back({vx, vy, "cell@vz=" + std::to_string(vz),
+                                                   cpuMat, gpuMat});
+                        }
+                    }
+                }
             }
         }
     }
@@ -665,9 +936,17 @@ int main(int argc, char** argv) {
     destroyContext(ctx);
     FreeLibrary(g_vulkanDll);
 
-    std::printf("\ncompared %zu columns across %zu regions, total dispatch wall-clock %.3f ms\n",
-                totalColumns, sizeof(regions) / sizeof(regions[0]), totalDispatchMs);
-    std::printf("GPU output digest: %016llx\n", (unsigned long long)gpuDigest.h);
+    const double voxelizeSec = totalVoxelizeDispatchMs / 1000.0;
+    const double cellsPerSec = voxelizeSec > 0.0 ? double(totalCells) / voxelizeSec : 0.0;
+
+    std::printf(
+        "\ncompared %zu columns and %zu cells across %zu regions\n"
+        "  ColumnMain total dispatch wall-clock:   %.3f ms\n"
+        "  VoxelizeMain total dispatch wall-clock: %.3f ms  (%.3f Mcells/sec)\n",
+        totalColumns, totalCells, sizeof(regions) / sizeof(regions[0]), totalColumnDispatchMs,
+        totalVoxelizeDispatchMs, cellsPerSec / 1e6);
+    std::printf("GPU output digest (columns + cells, combined): %016llx\n",
+                (unsigned long long)gpuDigest.h);
 
     if (!mismatches.empty()) {
         std::printf("\nFAIL: %zu mismatch(es) (showing up to %zu):\n", mismatches.size(),
@@ -681,7 +960,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("\nPASS: GPU output is bit-exact with the CPU reference (%s) over %zu columns\n",
-                deviceName.c_str(), totalColumns);
+    std::printf(
+        "\nPASS: GPU output is bit-exact with the CPU reference (%s) over %zu columns, %zu "
+        "cells\n",
+        deviceName.c_str(), totalColumns, totalCells);
     return 0;
 }
