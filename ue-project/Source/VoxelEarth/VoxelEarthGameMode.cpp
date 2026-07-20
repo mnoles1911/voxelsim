@@ -15,6 +15,7 @@
 #include "VoxelEarth.h"
 #include "VoxelEarthFlyPawn.h"
 #include "VoxelEarthPlayerController.h"
+#include "VoxelOceanActor.h"
 #include "VoxelWorldSubsystem.h"
 
 AVoxelEarthGameMode::AVoxelEarthGameMode()
@@ -57,6 +58,11 @@ void AVoxelEarthGameMode::BeginPlay()
 			AtmosphereComp->RegisterComponent();
 			Atmosphere->SetRootComponent(AtmosphereComp);
 		}
+
+		// Water track W1 (docs/voxel-earth-implementation-plan.md SS3.7 /
+		// SS4): same "no authored map, spawn from code" reasoning as the
+		// light rig above -- the ocean actor is editor-independent.
+		World->SpawnActor<AVoxelOceanActor>();
 	}
 
 	// Unattended visual verification: -VoxelScreenshotAfter=<seconds> waits
@@ -128,6 +134,21 @@ void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 	if (!NewPlayer || !Subsystem)
 	{
 		Super::RestartPlayer(NewPlayer);
+		return;
+	}
+
+	// Water track W1 verification aid (same pattern as VoxelWorldSubsystem's
+	// -VoxelDefaultMaterial switch): an unattended -game run can't drive the
+	// pawn into the ocean by hand, so this switch spawns underwater instead
+	// of above the terrain -- purely to observe AVoxelOceanActor's
+	// above/below transition log line without an interactive session. No
+	// effect unless passed explicitly; normal spawn behavior is unchanged.
+	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelForceUnderwaterSpawn")))
+	{
+		constexpr double UnderwaterSpawnDepthUU = -500.0; // -5m, well below sea level (z=0)
+		const FVector SpawnLocation(0.0, 0.0, UnderwaterSpawnDepthUU);
+		const FTransform SpawnTransform(FRotator::ZeroRotator, SpawnLocation);
+		RestartPlayerAtTransform(NewPlayer, SpawnTransform);
 		return;
 	}
 
