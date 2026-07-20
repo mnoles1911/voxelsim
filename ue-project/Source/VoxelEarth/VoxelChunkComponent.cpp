@@ -1,6 +1,15 @@
 #include "VoxelChunkComponent.h"
 
 #include "VoxelCoords.h"
+// Read-only reference to UVoxelWorldSubsystem::RingPresets (M2 "Transitions"
+// row: the ring cross-fade table is "derived from the ring radii" -- single
+// source of truth rather than a second hardcoded copy of 64/128/256/512/1024m).
+// FILE OWNERSHIP: this component only reads RingPresets (never writes);
+// VoxelWorldSubsystem.* itself is not touched by this change. Safe to include
+// from a .cpp regardless of the UHT-parsed-header voxel-core-free doctrine
+// (VoxelWorldSubsystem.h is itself voxel-core-free -- PImpl, see its own
+// top-of-file comment).
+#include "VoxelWorldSubsystem.h"
 
 #include "DynamicMeshBuilder.h"
 #include "Engine/CollisionProfile.h"
@@ -273,6 +282,79 @@ private:
 	FMaterialRelevance MaterialRelevance;
 };
 
+// Ring cross-fade table (M2 "Transitions" upgrade) -----------------------
+//
+// docs/voxel-earth-implementation-plan.md SS3.3: "dithered cross-fade band
+// (outer 15-20% of each ring; blue-noise threshold; both LODs rendered in
+// band; TSR resolves)". docs/m2-plan.md's "hard boundary v0" decision row is
+// what this upgrades -- v0 rendered a hard pop at each ring boundary; this
+// adds a per-level material-only fade, no subsystem/streaming change.
+namespace
+{
+	// Inert sentinel Start/End pairs (Tools/create_voxel_material.py mirrors
+	// these exactly as the material's own base defaults): a ramp whose
+	// Start/End are one of these pairs saturates to 1 (fully opaque) for
+	// every realistic in-game camera distance, which is how "no fade on this
+	// side" is expressed with the SAME shader formula path used everywhere
+	// else (no branch, no special-case node). kInertLow* is used for "ramp is
+	// already fully up before any real distance" (disables an inner fade-in);
+	// kInertHigh* is "ramp doesn't start falling until far past any real
+	// distance" (disables an outer fade-out). Both deltas (1 UU, 1e7 UU) are
+	// comfortably representable in float32 at their respective magnitudes, so
+	// neither denominator below can round to exactly zero.
+	constexpr float kInertLowStart = -2.f, kInertLowEnd = -1.f;
+	constexpr float kInertHighStart = 1.e7f, kInertHighEnd = 2.e7f;
+
+	// Plan SS3.3: "outer 15-20% of each ring" -- picked the low end of that
+	// range (15%) per the task spec; both the inner fade-in and outer
+	// fade-out bands use it, each sized against that LEVEL's own annulus
+	// width (RingPresets[Level].OuterMeters - InnerMeters), not a shared
+	// constant meter width -- so R4's much wider annulus gets a
+	// proportionally wider (not narrower) band, matching "each ring" in the
+	// plan wording literally.
+	constexpr float kFadeBandFraction = 0.15f;
+
+	struct FRingFadeParams
+	{
+		float InnerStartUU = kInertLowStart, InnerEndUU = kInertLowEnd;
+		float OuterStartUU = kInertHighStart, OuterEndUU = kInertHighEnd;
+	};
+
+	// docs/m2-plan.md task instructions: "level L fades OUT over its outer
+	// 15% band and fades IN over the inner 15% band of its annulus (level 0
+	// has no inner fade; the outermost ring keeps no outer fade so the
+	// clipmap seam remains hard for now)". Reads UVoxelWorldSubsystem::
+	// RingPresets directly (metres) and converts to UU (*100) to match the
+	// material's camera-distance space (View.WorldCameraOrigin / Absolute
+	// World Position are both UU) -- single source of truth for the ring
+	// radii, no second hardcoded copy.
+	FRingFadeParams ComputeRingFadeParams(int32 Level)
+	{
+		FRingFadeParams Params;
+		if (!ensure(Level >= 0 && Level < VoxelCoords::kNumLevels))
+		{
+			return Params; // fully inert on both sides -- never reached in practice
+		}
+
+		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[Level];
+		const float InnerUU = float(Preset.InnerMeters * 100.0);
+		const float OuterUU = float(Preset.OuterMeters * 100.0);
+		const float Band = (OuterUU - InnerUU) * kFadeBandFraction;
+
+		if (Level > 0) // level 0: no inner fade (kInertLow* default stands)
+		{
+			Params.InnerStartUU = InnerUU;
+			Params.InnerEndUU = InnerUU + Band;
+		}
+		if (Level < VoxelCoords::kNumLevels - 1) // outermost ring: no outer fade (kInertHigh* default stands)
+		{
+			Params.OuterStartUU = OuterUU - Band;
+			Params.OuterEndUU = OuterUU;
+		}
+		return Params;
+	}
+}
+
 // UVoxelChunkComponent --------------------------------------------------
 
 UVoxelChunkComponent::UVoxelChunkComponent(const FObjectInitializer& ObjectInitializer)
@@ -294,6 +376,12 @@ void UVoxelChunkComponent::SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, int3
 
 	MarkRenderStateDirty();
 	UpdateBounds();
+}
+
+void UVoxelChunkComponent::SetLevel(int32 InLevel)
+{
+	ChunkLevel = InLevel;
+	ApplyRingFadeParams();
 }
 
 FPrimitiveSceneProxy* UVoxelChunkComponent::CreateSceneProxy()
@@ -322,11 +410,33 @@ UMaterialInterface* UVoxelChunkComponent::GetMaterial(int32 ElementIndex) const
 
 void UVoxelChunkComponent::SetMaterial(int32 ElementIndex, UMaterialInterface* NewMaterial)
 {
-	if (ElementIndex == 0 && ChunkMaterial != NewMaterial)
+	if (ElementIndex != 0)
 	{
-		ChunkMaterial = NewMaterial;
-		MarkRenderStateDirty();
+		return;
 	}
+
+	// M2: compare against the current BASE (ChunkMID's Parent once one
+	// exists, since ChunkMaterial itself becomes the MID -- see ChunkMaterial's
+	// doc comment) rather than ChunkMaterial directly, so re-asserting the
+	// same base material (e.g. a redundant SetMaterial(0, Material) call) is
+	// still a correct no-op instead of spuriously dropping/recreating ChunkMID.
+	UMaterialInterface* CurrentBase = ChunkMaterial;
+	if (ChunkMID)
+	{
+		CurrentBase = ChunkMID->Parent;
+	}
+	if (CurrentBase == NewMaterial)
+	{
+		return;
+	}
+
+	// Base material changed (or this is first assignment): any existing MID
+	// was wrapping the OLD base, so it's stale -- drop it, ApplyRingFadeParams
+	// below creates a fresh one over NewMaterial.
+	ChunkMID = nullptr;
+	ChunkMaterial = NewMaterial;
+	MarkRenderStateDirty();
+	ApplyRingFadeParams();
 }
 
 int32 UVoxelChunkComponent::GetNumMaterials() const
@@ -345,36 +455,75 @@ void UVoxelChunkComponent::GetUsedMaterials(TArray<UMaterialInterface*>& OutMate
 
 void UVoxelChunkComponent::SetDebugTint(const FLinearColor& Tint)
 {
-	if (!DebugTintMID)
+	// M2: ChunkMID is created unconditionally by ApplyRingFadeParams as soon
+	// as a base material is known (fades are always-on) -- this no longer
+	// creates a MID itself, it only sets a parameter on the one that already
+	// exists. If SetMaterial has genuinely never run yet, there's nothing to
+	// tint (shouldn't happen in practice: the subsystem always calls
+	// SetMaterial right after NewObject, before this could ever be reached).
+	if (!ChunkMID)
 	{
-		// UPrimitiveComponent (this component's base, not UMeshComponent) has
-		// no CreateDynamicMaterialInstance helper -- hand-rolled equivalent:
-		// create the MID over whatever material is currently assigned, then
-		// route it through SetMaterial (the same virtual UPrimitiveComponent
-		// calls internally) so ChunkMaterial and the scene proxy both pick it
-		// up via the normal MarkRenderStateDirty path.
-		UMaterialInterface* Base = ChunkMaterial;
-		if (!Base)
-		{
-			return; // no material assigned yet; nothing to tint
-		}
-		DebugTintMID = UMaterialInstanceDynamic::Create(Base, this);
-		if (!DebugTintMID)
-		{
-			return;
-		}
-		SetMaterial(0, DebugTintMID);
+		return;
 	}
-	DebugTintMID->SetVectorParameterValue(TEXT("DebugTint"), Tint);
+	ChunkMID->SetVectorParameterValue(TEXT("DebugTint"), Tint);
 }
 
 void UVoxelChunkComponent::ClearDebugTint()
 {
-	if (!DebugTintMID)
+	// M2: reset to the multiplicative identity (opaque white) instead of
+	// dropping ChunkMID -- the MID must persist regardless of this layer's
+	// on/off state, since it also carries the always-on ring-fade params
+	// (see ChunkMID's doc comment). There is no second MID to drop anymore;
+	// "zero extra cost when this layer is off" now means "one SetVectorParameterValue
+	// call, no MID churn / no MarkRenderStateDirty", which is strictly
+	// cheaper than the old create/destroy-MID path, not more expensive.
+	if (!ChunkMID)
 	{
 		return;
 	}
-	UMaterialInterface* Base = DebugTintMID->Parent;
-	DebugTintMID = nullptr;
-	SetMaterial(0, Base);
+	ChunkMID->SetVectorParameterValue(TEXT("DebugTint"), FLinearColor::White);
+}
+
+void UVoxelChunkComponent::ApplyRingFadeParams()
+{
+	// Whichever of SetLevel/SetMaterial runs second is the one that actually
+	// has both pieces of information -- both call this, so the no-op on the
+	// first call (missing base material or, in principle, missing level) is
+	// expected, not an error.
+	UMaterialInterface* Base = ChunkMaterial;
+	if (ChunkMID)
+	{
+		Base = ChunkMID->Parent;
+	}
+	if (!Base)
+	{
+		return; // no base material assigned yet (SetLevel runs before SetMaterial)
+	}
+
+	if (!ChunkMID)
+	{
+		// UPrimitiveComponent (this component's base, not UMeshComponent) has
+		// no CreateDynamicMaterialInstance helper -- hand-rolled equivalent,
+		// same pattern the old SetDebugTint used: UMaterialInstanceDynamic::Create
+		// over the current base, then this component's ChunkMaterial field
+		// (which CreateSceneProxy/GetMaterial/GetUsedMaterials all read) takes
+		// over as the MID from here on.
+		ChunkMID = UMaterialInstanceDynamic::Create(Base, this);
+		if (!ChunkMID)
+		{
+			return;
+		}
+	}
+
+	const FRingFadeParams Params = ComputeRingFadeParams(ChunkLevel);
+	ChunkMID->SetScalarParameterValue(TEXT("RingInnerFadeStart"), Params.InnerStartUU);
+	ChunkMID->SetScalarParameterValue(TEXT("RingInnerFadeEnd"), Params.InnerEndUU);
+	ChunkMID->SetScalarParameterValue(TEXT("RingOuterFadeStart"), Params.OuterStartUU);
+	ChunkMID->SetScalarParameterValue(TEXT("RingOuterFadeEnd"), Params.OuterEndUU);
+
+	if (ChunkMaterial != ChunkMID)
+	{
+		ChunkMaterial = ChunkMID;
+		MarkRenderStateDirty();
+	}
 }
