@@ -4,6 +4,13 @@ if(NOT MSVC)
   target_compile_options(vxc_bench PRIVATE -Wall -Wextra -Werror)
 endif()
 
+# --- vxc_waterca_bench: W2 perf-gap step() timing (docs/status.md) --------
+add_executable(vxc_waterca_bench waterca_bench.cpp)
+target_link_libraries(vxc_waterca_bench PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_waterca_bench PRIVATE -Wall -Wextra -Werror)
+endif()
+
 # --- vxc_editlog: offline edit-log stats/compact/verify tool (M3 groundwork,
 # docs/status.md) -----------------------------------------------------------
 add_executable(vxc_editlog editlog_tool.cpp)
