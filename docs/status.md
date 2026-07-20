@@ -562,17 +562,23 @@ grep clean).
 
 | Item | State | Unblock |
 |---|---|---|
-| NVIDIA cloud digest run (closes BOTH M0 gates) | blocked on rental spend (Matt) | ~$1, minutes of runtime; same session can bring up terrain-diffusion |
+| **Confirm real terrain-diffusion tile outputs** (exact climate-channel count/semantics/ranges vs our 4-channel assumption: temp, seasonality, precip, precip-variability) — then reconcile the tile codec + amplifier climate lookup + M4 biome table to reality, addressing gaps/tweaks | **NEW — gates M4 biome tuning** | cloud NVIDIA rental (same session as diffusion bring-up); until then synthetic tiles stand in |
+| NVIDIA cloud digest run (closes BOTH M0 gates) | blocked on rental spend (Matt) | ~$1, minutes of runtime; same session can bring up terrain-diffusion + confirm tile outputs above |
 | terrain-diffusion worker bring-up | deferred by ADR-0001 to vistas — Band 3 exists now, so eligible | cloud NVIDIA rental |
-| Mip cache eviction (unbounded, ~716MB observed) | agent wave in flight | — |
-| Config-driven world seed (constant 20260719) | agent wave in flight | — |
-| SkyAtmosphere spawned at world origin (visible ≥1000s of km) | agent wave in flight | — |
-| M1 formal min-spec proxy perf run | proxy settings defined below; run pending | — |
+| M1 formal min-spec proxy perf run | RAN 2026-07-20: p50 3.8ms pass-quality, p95 20.4ms fails bar under M2 streaming ramp; gate 🟨 pending M2 hitch work | M2 polish (below) |
 | R3/R4 first-build cost (~335ms/job) | needs GPU-side gen or disk brick cache | design pass |
-| Dithered blue-noise ring cross-fades + ring↔clipmap seam | deliberate last (plan's slip-risk item) | M2 polish wave |
-| Perf-run hitches (~15-19/run, max 400ms, during initial streaming ramp) | needs isolate + PSO precache investigation | M2 gate work |
+| Dithered ring cross-fades — SYMMETRIC blend | v1 landed (adjacent fade-through); symmetric-blend needs wider desired-set annulus overlap | M2 polish wave |
+| ring↔clipmap seam (z-fighting, accepted v1) | noted | M2 polish |
+| Perf-run hitches (~15-38/run, max 400ms, initial streaming ramp) | needs isolate + PSO precache investigation | M2 gate work — also the M1 gate blocker |
 | Clipmap follow-ups: two-sided material (winding unverified), A/B perf isolate, CDLOD replacement per ADR-0002 tripwire | noted in ADR/plan | M2 polish |
+| Mip cache: budget default tuning (512MB) + real-scenario A/B | eviction landed (PR #16); default may need tuning | M2 polish |
 | Debug tooling P2/P3 (τ overlay, water ledgers) | phased with M2-polish/W2 | — |
+| M4 rounds 2-3 design (trees/structures, flora/placement) | round 1 decided; awaiting Matt design session | Matt |
+
+**Closed this session** (moved off backlog): mip-cache eviction ✅ (PR #16),
+config-driven `-VoxelSeed` ✅ (#16), SkyAtmosphere LWC fix ✅ (#16), M0 128m
+performance gate ✅ PASS 0.191s (#14), edit-log compaction CLI ✅ (#16),
+ring cross-fade v1 ✅ (#16), M3 persistence ✅ (#20).
 
 M1 min-spec proxy definition: `sg.ViewDistanceQuality 0`, `sg.ShadowQuality 0`,
 `r.ScreenPercentage 100` at 1080p, streaming budgets halved
