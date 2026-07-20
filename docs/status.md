@@ -201,6 +201,85 @@ all four verification logs (`perfrun_after.log`, `perfrun_before.log`,
   later M2 items, and R3/R4 cold-start fill time (wave-1's other open
   follow-up) is unchanged by this wave.
 
+### Wave 3 — mip cache eviction, config-driven seed, SkyAtmosphere origin fix (2026-07-20, worktree agent)
+
+**Item 1: mip cache eviction.** `FSharedMipCache` (wave 2 item 1) had no
+eviction — bytes only grew (4.9M bricks / ~716MB observed in wave 2). Bounded
+now by `voxel.MipCacheBudgetMB` (default 512, `VoxelDebug.cpp`) via a
+per-shard GENERATION-STAMPED APPROXIMATE LRU: each cached brick carries a
+relaxed atomic `LastTouch` stamp bumped on every `Find` hit and fresh
+`Insert` from one cache-wide monotonic counter. `Insert` calls
+`EvictIfOverBudgetLocked` (shard's write lock already held, no extra
+locking) which samples a FIXED 8 entries from that shard's map, evicts
+whichever sampled entry has the lowest stamp, and loops until back under
+budget or the shard is dry — O(sample size) per eviction step regardless of
+shard size, so a single over-budget `Insert` never pays an O(shard size)
+scan even at wave 2's measured scale. `MipCacheEvictions` lands in
+`FVoxelPerfSnapshot`, the perf HUD's mip-cache row, and the periodic
+`LogVoxelPerf` "Voxel worker ms/level" line. Verified via
+`-VoxelPerfRun=60 -VoxelMipCacheBudgetMB=64` (seed 20260719, same circular
+flight as wave 2's measurement): mip cache bytes climb from 0 to
+~64MB (67,108,338 → 67,108,864 target) then EVICTIONS TRACK BUDGET
+PRESSURE and bytes plateau right at the budget (67,108,338 /
+67,108,842 / 67,108,671 across successive 5s samples, essentially pinned
+at the 64MB target) instead of continuing to grow — evictions climb from 0
+to 582,493 over the run's back half. Zero ensures, clean shutdown.
+
+**Item 2: config-driven seed.** `-VoxelSeed=<u64>` (command-line only,
+`FParse::Value`, default stays `DefaultSeed`=20260719 — an ini fallback
+would be overkill for a dev/verification-only knob) resolved once in
+`UVoxelWorldSubsystem::Initialize`, before `Impl` is constructed, and
+exposed via a new `GetSeed()` accessor. Audit found ONE hardcode:
+`AVoxelClipmapActor`'s heightmap sampler
+(`VoxelClipmapActor.cpp::SampleHeightUU`) built its
+`vxc::SyntheticTileSampler` from the `DefaultSeed` CONSTANT, not the
+subsystem's runtime seed — under `-VoxelSeed`, the Band 3 clipmap would have
+silently kept sampling the OLD seed's terrain while the ring cascade moved
+to the new one, breaking their shared seam. Fixed: `AVoxelClipmapActor`
+reads `UVoxelWorldSubsystem::GetSeed()` once in `BeginPlay` (after the
+subsystem's `Initialize` has already resolved it) into a new `TerrainSeed`
+member, threaded into `SampleHeightUU`; the ocean actor and game mode were
+already seed-independent (ocean is a flat z=0 plane; game mode only queries
+`Subsystem->GetSurfaceHeightUU`, which already read the subsystem's
+internal `Voxels`). Verified: `-VoxelSeed=42 -VoxelScreenshotAfter=40` logs
+`VoxelSeed override: using seed 42 (default 20260719)` and
+`Voxel streaming initialized (seed 42)`; screenshot vs. a same-command
+default-seed baseline shows clearly different terrain (different spawn
+surface height put the camera in a different framing entirely — dense
+terrain edges filling the frame at the default seed vs. a mostly-open-ocean
+view at seed 42). Zero ensures both runs.
+
+**Item 3: SkyAtmosphere origin fix.** The atmosphere actor spawned at world
+origin with the component's default `TransformMode`
+(`PlanetTopAtAbsoluteWorldOrigin`), which hardcodes the planet's ground
+level at world (0,0,0) — at a far LWC spawn the horizon sphere is computed
+relative to that fixed point instead of the actual ground under the player.
+Fixed (Epic's documented approach for off-origin/LWC worlds): set
+`AtmosphereComp->TransformMode = ESkyAtmosphereTransformMode::
+PlanetTopAtComponentTransform` (planet ground level follows the
+component's OWN transform instead) and place the actor at the pawn's spawn
+column (Z=0), via a `ParseSpawnColumnUU` helper factored out of
+`RestartPlayer`'s existing `-VoxelSpawnAt` parsing so the pawn and the
+atmosphere actor can never land on different columns. Verified via
+`-VoxelSpawnAt=2000000,1500000 -VoxelScreenshotAfter=40`: log confirms
+`VoxelSpawnAt override: spawning at column (2000000.0, 1500000.0) m`, zero
+ensures, clean shutdown. An A/B screenshot comparison (fix enabled vs.
+temporarily disabled, same exact spawn/camera) showed no visually obvious
+difference — the screenshot capture's fixed -40° pitch keeps the camera
+looking mostly at terrain, with only a small sliver of sky in frame, so
+this framing is not a strong visual test for a horizon-sphere artifact
+either way; the fix itself matches Epic's documented guidance for
+LWC/off-origin `SkyAtmosphereComponent` placement and is confirmed to
+compile, run, and log the correct spawn column with zero ensures.
+
+Build: worktree `voxelcore.lib` rebuilt clean (`vxc_tests` 24/24 pass,
+untouched by this wave) before `Build.bat VoxelEarthEditor Win64
+Development -WaitMutex -NoHotReloadFromIDE`, which also built clean (zero
+warnings from any file touched this wave; the ~30 baseline warnings present
+are all pre-existing engine-header deprecation notices, none in
+VoxelWorldSubsystem/VoxelClipmapActor/VoxelEarthGameMode/VoxelDebug/
+VoxelEarthHUD).
+
 ## M0 GPU track (ADR-0001)
 
 - [x] Worldgen HLSL kernel (ColumnMain, VoxelizeMain, MeshCountMain,
