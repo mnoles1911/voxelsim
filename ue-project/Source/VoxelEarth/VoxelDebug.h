@@ -112,12 +112,26 @@ struct FVoxelPerfSnapshot
 	int64 ResidentQuads = 0;
 	int64 OverlayBrickCount = 0;
 	int64 EditLogEntries = 0;
+	// M2 wave 2 item 1 ("Cross-job mip caching"): the shared cross-job cache
+	// of pure-generated level>=1 mip bricks (FSharedMipCache,
+	// VoxelWorldSubsystem.cpp) -- brick count and an approximate byte total
+	// (no eviction yet, so this only grows).
+	int64 MipCacheBrickCount = 0;
+	int64 MipCacheBytes = 0;
 
 	// --- Ring levels (docs/m2-plan.md first implementation wave item 1) -----
 	// Loaded (has a live component) and pending (queued across job/game-thread/
 	// unload) chunk counts per mip level, indexed by VoxelCoords level.
 	int32 LevelLoadedCount[VoxelCoords::kNumLevels] = {};
 	int32 LevelPendingCount[VoxelCoords::kNumLevels] = {};
+
+	// M2 wave 2 item 1: per-level worker mesh-job ms (same rolling-window
+	// p50/p95 as WorkerMsP50/P95 above, split by ring level) -- the number
+	// this wave's fix targets directly (wave 1 measured worker p95 ~296ms on
+	// high-level jobs because every job rebuilt its whole level-0->L mip
+	// chain from scratch; see FSharedMipCache).
+	float LevelWorkerMsP50[VoxelCoords::kNumLevels] = {};
+	float LevelWorkerMsP95[VoxelCoords::kNumLevels] = {};
 
 	// --- Frame ---------------------------------------------------------------
 	float SubsystemTickMs = 0.f;

@@ -84,6 +84,119 @@ Working plan + binding decisions: docs/m2-plan.md.
   is streaming/rendering plumbing only; the flight/hitch gate run and
   dithered cross-fade are later M2 items.
 
+### Wave 2 — cross-job mip caching + distant-edit propagation (2026-07-20)
+
+**Item 1: cross-job mip cache.** `FSharedMipCache` (VoxelWorldSubsystem.cpp,
+file-scope) is a sharded (16 shards, `FRWLock` per shard) cache of
+pure-generated level>=1 `vxc::Brick<8>` mip bricks keyed by `vxc::MipKey`
+(level, BrickKey — `voxelcore/mips.h`'s own key/hash types, read-only this
+wave, reused as-is), owned by `FVoxelWorldImpl` and shared by every worker
+job. `FCachedMipBuilder` reimplements `vxc::MipChain<8>`'s recursion using
+`mips.h`'s public `downsampleBricks<8>` directly (`MipChain::cache_` is
+private with no seeding hook, so a per-job-only cache can't be shared across
+jobs without this wrapper) — every level of the recursion, not just a job's
+own target level, consults/populates the shared cache, so an outer level's
+build can skip rebuilding inner levels another job (or the SAME chunk's own
+previous residency) already computed. Populated on miss inside worker jobs;
+no eviction yet (tracked, not bounded) — `MipCacheBrickCount`/`MipCacheBytes`
+(brick count + an approximate byte total: base struct size, +1 byte/cell
++1 byte/palette-entry for non-homogeneous bricks) land in
+`FVoxelPerfSnapshot` and a new perf-HUD "mip cache" row. A cross-thread race
+(a worker job dispatched before an edit lands could still `Insert` a
+now-stale value after `PropagateEditToMips` invalidated it) is closed by
+`EditEpoch` (`std::atomic<uint64>`, bumped once per edit batch before
+invalidation) — same "snapshot at dispatch, compare later" idiom
+`FChunkRecord::GenerationId` already uses for stale-*result* discarding,
+applied here to stale-cache-*insert* discarding (a losing race just skips
+the `Insert`, safe: the value is recomputed fresh next time).
+
+*Measured, `-VoxelPerfRun=120` each way (seed 20260719, same circular
+100m-radius flight path, cache toggled via `SharedMipCache*` -> `nullptr` at
+the one worker call site for the "before" build only, reverted before
+commit), final-snapshot per-level worker ms from the `LogVoxelPerf` "Voxel
+worker ms/level" line:*
+
+| Level | Before (no shared cache) p50 / p95 | After (shared cache) p50 / p95 |
+|---|---|---|
+| R0 | 2.56 / 4.26 ms | 2.53 / 4.40 ms |
+| R1 | 21.20 / 50.69 ms | 8.05 / 13.85 ms |
+| R2 | 81.55 / 218.19 ms | 7.93 / 13.39 ms |
+| R3 | 335.33 / 867.89 ms | 334.80 / 887.43 ms |
+| R4 | not reached in 120s (matches wave-1's cold-start finding) | not reached in 120s |
+
+R0 is unaffected (level 0 never touches the mip cache, unchanged fast path).
+R1/R2 improve sharply (R2 p95 218ms -> 13ms, ~16x) — NOT from cross-job
+sharing between *different* same-level chunks (those partition disjoint
+brick keyspace at every level, by construction) but from the SAME chunk's
+mip data surviving repeated unload/reload cycles: the perf run's circular
+flight continuously churns chunks across ring boundaries (`chunksLoaded`
+tracked ~20k over 120s against ~67k total tracked records — heavy
+unload/reload churn), and once a level-L brick has ever been computed it
+now stays cached forever (no eviction), so a chunk crossing back into a
+ring it previously occupied is nearly free instead of a full rebuild. This
+directly targets the M2 gate's "no hitches at ring crossings" concern. R3
+does not show a matching improvement WITHIN this 120s window: R3 chunks
+here are being visited for the first time in the run (the flight path never
+gets far enough from the circle's fixed center for those specific 256-512m
+footprints to have any prior cached ancestry, and R3 itself hasn't yet
+looped back around to a repeat load in 120s) — a longer run, or a player
+genuinely flying away and back, would be expected to show the same
+R1/R2-style improvement at R3/R4 once that residency exists. Shared-cache
+memory at the end of the "after" run: 4,900,415 bricks / ~716MB (no
+eviction; a future wave should add an LRU/size cap once this is a live
+concern, not before it's measured).
+
+**Item 2: distant-edit mip propagation.** `VoxelCoords::AncestorChunkKey`
+(cheap key math: level-L ancestor of a level-0 chunk key = `floorDiv(key,
+1<<L)` on every axis, since a level-L chunk's world footprint is exactly
+`1<<L` level-0 chunks wide per axis) generalizes `MarkChunkDirtyForRemesh`
+from level-0-only to any `FVoxelLevelChunkKey`. `PropagateEditToMips`
+(called from `ApplyGroupedEdits` after every dig/place/carve) computes, for
+each already-apron-extended dirty level-0 chunk, its ancestor at every level
+1..4; each ancestor's `FSharedMipCache` entries are invalidated (stale pure
+values), it's recorded in a per-level `EditedAncestorChunks` membership set
+(so a chunk not yet streamed still routes correctly through
+`NeedsOverlayAwarePath` whenever it later enters the desired set — mirrors
+level 0's live `ChunkHasEditedBrick` overlay scan, but as a maintained set
+instead of a per-candidate scan, since a level-L scan would touch up to
+`(4*2^L)^3` level-0 brick keys per candidate at L4), and is dirtied for
+re-mesh if currently resident. Re-mesh itself goes through
+`MakeOverlayAwareLevelSampler` (game-thread only, `vxc::World::brickAt` as
+the level-0 source, `FCachedMipBuilder` with `SharedCache=nullptr` so an
+edited mip value can never leak into the pure shared cache by construction,
+not convention) via the same `PendingGameThreadKeys` queue and 4/frame
+budget level-0 edits already used (now genuinely level-agnostic).
+
+*Verification (`-VoxelDebugRings -VoxelHeadlessDigTest=25
+-VoxelScreenshotAfter=40`, seed 20260719):* the first attempt carved
+directly at the spawn/anchor location and produced zero re-mesh events —
+by design, R1+ rings are an annulus that EXCLUDES the anchor's own <64m
+radius (R0's exclusive territory), so there was never a resident R1+ chunk
+there to prove propagation against. Fixed by carving 100m from spawn
+(inside R1's 64-128m band, where an R1 chunk had already streamed in
+pure-generated by dig time): the corrected run produced the level-1
+ancestor set (`Distant-edit mip propagation: level=1 chunk=(15,-1,167)
+tracked=0 ...` etc., 8 level-1 + additional level 2-4 ancestor log lines)
+immediately on carve, followed within the same second by 36 `Distant-edit
+mip re-mesh: level=1 chunk=(...) quads=N` lines (e.g. `level=1
+chunk=(14,0,169) quads=7623`) as those now-tracked ancestor chunks
+re-meshed through the overlay-aware path — screenshots
+`VoxelVerify00002.png`/`00003.png` (Saved/Screenshots/WindowsEditor/) show
+the crater with rings-debug tinting on. Level 2-4 ancestors were marked
+dirty (logged) but had no resident chunk yet at dig time in this run (R2/R3/R4
+hadn't reached that specific 100m-offset footprint within 25s) so produced
+no re-mesh event THIS run — the membership-set mechanism (not a live scan)
+is exactly what guarantees they'll still route correctly through the
+overlay-aware path whenever they do stream in later. Zero ensures across
+all four verification logs (`perfrun_after.log`, `perfrun_before.log`,
+`perfrun_after120.log`, `digtest2.log`).
+
+- Gate (50km+ vista, 60fps, fast flight with no hitches): ⬜ open — wave 2
+  closes both wave-1 items on this list (cross-job mip cache, distant-edit
+  propagation); the flight/hitch gate run and dithered cross-fade are still
+  later M2 items, and R3/R4 cold-start fill time (wave-1's other open
+  follow-up) is unchanged by this wave.
+
 ## M0 GPU track (ADR-0001)
 
 - [x] Worldgen HLSL kernel (ColumnMain, VoxelizeMain, MeshCountMain,

@@ -23,4 +23,11 @@ private:
 	FTimerHandle ScreenshotTimerHandle;
 	FTimerHandle SecondShotTimerHandle;
 	FTimerHandle QuitTimerHandle;
+
+	// M2 wave 2 item 2 verification (docs/m2-plan.md "Distant-edit mip
+	// propagation"): -VoxelHeadlessDigTest fires a large CarveSphere at the
+	// spawn column once R0/R1 have had time to settle, so a headless -game
+	// run can prove (via log lines + a screenshot) that ring chunks over the
+	// dig site actually re-mesh through the overlay-aware path.
+	FTimerHandle HeadlessDigTestTimerHandle;
 };
