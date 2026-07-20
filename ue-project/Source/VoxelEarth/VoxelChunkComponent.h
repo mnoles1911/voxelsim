@@ -5,6 +5,8 @@
 #include "VoxelMeshTypes.h"
 #include "VoxelChunkComponent.generated.h"
 
+class UMaterialInstanceDynamic;
+
 // Render chunk primitive (docs/m1-plan.md decisions table: one
 // UVoxelChunkComponent + one FVoxelChunkSceneProxy per render chunk,
 // re-mesh unit on edit). Doctrine
@@ -47,12 +49,37 @@ public:
 	virtual void GetUsedMaterials(TArray<UMaterialInterface*>& OutMaterials, bool bGetDebugMaterials) const override;
 	//~ End UPrimitiveComponent Interface
 
+	// --- Chunk-state debug tints (docs/debug-tooling-plan.md P1, mode 2 +
+	// voxel.Debug.ChunkStates) ------------------------------------------------
+
+	// Lazily creates a MID over ChunkMaterial (this component derives from
+	// UPrimitiveComponent, not UMeshComponent, so the usual
+	// CreateDynamicMaterialInstance helper isn't available -- this is its
+	// hand-rolled equivalent: UMaterialInstanceDynamic::Create + SetMaterial)
+	// and sets its DebugTint vector parameter (M_VoxelTerrain, multiplied into
+	// BaseColor; see Tools/create_voxel_material.py). Only ever called by
+	// FVoxelWorldImpl::UpdateChunkStateTints, which itself only runs while
+	// voxel.Debug.ChunkStates is live under mode 2 -- so the MID is never
+	// created at all with the layer off (constraint: "no MIDs created" when
+	// voxel.Debug=0 / the layer is off).
+	void SetDebugTint(const FLinearColor& Tint);
+
+	// Drops the MID (if any) and reverts to the shared ChunkMaterial, so
+	// toggling debug off costs nothing further (constraint: "no MIDs created"
+	// when voxel.Debug's chunk-state layer is off).
+	void ClearDebugTint();
+
 private:
 	TArray<FVoxelChunkQuad> ChunkQuads;
 	int32 ChunkEdgeVoxels = 32;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInterface> ChunkMaterial;
+
+	// Only created on first SetDebugTint call; nullptr (and unused) whenever
+	// chunk-state debug tinting has never been engaged this session.
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> DebugTintMID;
 
 	friend class FVoxelChunkSceneProxy;
 };

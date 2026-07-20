@@ -2,7 +2,10 @@
 
 #include "Engine/Canvas.h"
 #include "Engine/Engine.h"
+#include "Engine/World.h"
+#include "VoxelDebug.h"
 #include "VoxelEarthPlayerController.h"
+#include "VoxelWorldSubsystem.h"
 
 namespace
 {
@@ -29,6 +32,13 @@ void AVoxelEarthHUD::DrawHUD()
 	if (!Canvas)
 	{
 		return;
+	}
+
+	// docs/debug-tooling-plan.md P1 "Perf HUD": mode >= 1 (mode 2 additionally
+	// activates the 3D visualization layers, handled in VoxelWorldSubsystem).
+	if (VoxelDebug::GetDebugMode() >= 1)
+	{
+		DrawPerfHUD();
 	}
 
 	// Crosshair: a small filled dot at the screen center (dig/place always
@@ -63,5 +73,62 @@ void AVoxelEarthHUD::DrawHUD()
 		const float Alpha = VoxelPC->GetExplosiveChargeAlpha();
 		DrawRect(FLinearColor(1.f, 0.45f, 0.05f, 0.95f), MarginPx, BarY, ChargeBarWidthPx * Alpha, ChargeBarHeightPx);
 		DrawText(TEXT("F charge"), FLinearColor::White, MarginPx, BarY - LineHeightPx, nullptr, 1.f, false);
+	}
+}
+
+void AVoxelEarthHUD::DrawPerfHUD()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+	UVoxelWorldSubsystem* Subsystem = World->GetSubsystem<UVoxelWorldSubsystem>();
+	if (!Subsystem)
+	{
+		return;
+	}
+
+	// docs/debug-tooling-plan.md P1 "Perf HUD": "1Hz refresh of text,
+	// per-frame collection" -- the subsystem already collects per-frame and
+	// only republishes FVoxelPerfSnapshot at 1Hz, so this only needs to
+	// rebuild the formatted string on the same cadence; DrawText itself still
+	// runs every frame from the cached string.
+	const float NowSeconds = World->GetTimeSeconds();
+	if (CachedPerfHUDText.IsEmpty() || (NowSeconds - PerfHUDLastRefreshWorldSeconds) >= PerfRefreshIntervalSeconds)
+	{
+		PerfHUDLastRefreshWorldSeconds = NowSeconds;
+		const FVoxelPerfSnapshot Snap = Subsystem->GetPerfSnapshot();
+
+		CachedPerfHUDText = FString::Printf(
+			TEXT("voxel.Debug %d -- F3 to cycle\n")
+			TEXT("Streaming: loaded %lld (%.1f/s)  unloaded %lld (%.1f/s)\n")
+			TEXT("  jobs %d/%d  queues job=%d gt=%d unload=%d\n")
+			TEXT("  budget sat %.0f%%  stale discards %lld\n")
+			TEXT("Worker ms: p50 %.2f  p95 %.2f  max %.2f\n")
+			TEXT("Memory: components %d  quads %lld  overlay bricks %lld  edit log %lld\n")
+			TEXT("Frame: subsystem tick %.2fms  frame %.2fms\n")
+			TEXT("Counters: bricks %llu  cells %llu  quads %llu  edits %llu  columns %llu"),
+			VoxelDebug::GetDebugMode(),
+			(long long)Snap.TotalChunksLoaded, Snap.ChunksLoadedPerSec, (long long)Snap.TotalChunksUnloaded, Snap.ChunksUnloadedPerSec,
+			Snap.JobsInFlight, Snap.JobsInFlightCap, Snap.PendingJobQueueDepth, Snap.PendingGameThreadQueueDepth, Snap.PendingUnloadQueueDepth,
+			Snap.BudgetSaturationPct, (long long)Snap.StaleResultsDiscarded,
+			Snap.WorkerMsP50, Snap.WorkerMsP95, Snap.WorkerMsMax,
+			Snap.ResidentComponents, (long long)Snap.ResidentQuads, (long long)Snap.OverlayBrickCount, (long long)Snap.EditLogEntries,
+			Snap.SubsystemTickMs, World->GetDeltaSeconds() * 1000.0,
+			Snap.BricksGenerated, Snap.CellsWritten, Snap.QuadsEmitted, Snap.EditsApplied, Snap.ColumnEvals);
+	}
+
+	TArray<FString> Lines;
+	CachedPerfHUDText.ParseIntoArrayLines(Lines, /*bCullEmpty*/ false);
+
+	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.55f), PerfPanelMarginPx, PerfPanelMarginPx, 560.f,
+	         PerfPanelLineHeightPx * float(Lines.Num()) + 8.f);
+
+	float LineY = PerfPanelMarginPx + 4.f;
+	for (const FString& Line : Lines)
+	{
+		DrawText(Line, FLinearColor(0.2f, 1.f, 0.3f, 1.f), PerfPanelMarginPx + 6.f, LineY, nullptr, 1.f, false);
+		LineY += PerfPanelLineHeightPx;
 	}
 }

@@ -2,12 +2,14 @@
 
 #include "VoxelChunkComponent.h"
 #include "VoxelCoords.h"
+#include "VoxelDebug.h"
 #include "VoxelEarth.h"
 #include "VoxelMeshTypes.h"
 
 // voxel-core is UE-header-free C++20; safe to include directly from a UE
 // module .cpp (doctrine: never from a header UHT parses -- see
 // VoxelWorldSubsystem.h / VoxelChunkComponent.h, both voxel-core-free).
+#include "voxelcore/counters.h"
 #include "voxelcore/hash.h"
 #include "voxelcore/mesher.h"
 #include "voxelcore/raycast.h"
@@ -16,11 +18,13 @@
 
 #include "Components/SceneComponent.h"
 #include "Containers/Queue.h"
+#include "DrawDebugHelpers.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/PlatformMisc.h"
+#include "HAL/PlatformTime.h"
 #include "HAL/ThreadSafeCounter.h"
 #include "MaterialDomain.h"
 #include "Materials/Material.h"
@@ -31,6 +35,7 @@
 #include "Tasks/Task.h"
 #include "UObject/UObjectGlobals.h"
 
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 
@@ -50,7 +55,8 @@ namespace
 // (overlay-aware). Only the sampler differs -- the mesh-and-bake logic never
 // drifts between the two.
 template <typename MaterialFn>
-void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const MaterialFn& MaterialAt, TArray<FVoxelChunkQuad>& OutQuads)
+void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const MaterialFn& MaterialAt, TArray<FVoxelChunkQuad>& OutQuads,
+                      vxc::Counters* PerfCounters = nullptr)
 {
 	using namespace vxc;
 	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
@@ -76,9 +82,27 @@ void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const Material
 
 				BrickQuads.clear();
 				meshBrick<B>(Sampler, BrickQuads);
+
+				// docs/debug-tooling-plan.md P1 "vxc::Counters": counted here
+				// (around the UE layer's call into meshBrick), not inside
+				// voxel-core itself -- bricksGenerated/cellsWritten count
+				// every brick attempted (whether or not it emits quads: an
+				// interior-solid brick still gets sampled/meshed), quads
+				// counted separately below only when non-empty.
+				if (PerfCounters)
+				{
+					PerfCounters->incBricksGenerated();
+					PerfCounters->incCellsWritten(uint64_t(B) * B * B);
+				}
+
 				if (BrickQuads.empty())
 				{
 					continue;
+				}
+
+				if (PerfCounters)
+				{
+					PerfCounters->incQuadsEmitted(uint64_t(BrickQuads.size()));
 				}
 
 				// Bake this brick's position within the chunk into the
@@ -156,6 +180,16 @@ struct FChunkRecord
 	uint64 GenerationId = 1;
 
 	bool bJobInFlight = false;
+
+	// --- Chunk-state debug tint bookkeeping (docs/debug-tooling-plan.md P1,
+	// mode 2 + voxel.Debug.ChunkStates) -- all in FVoxelWorldImpl::ElapsedSeconds
+	// terms (a free-running clock since Initialize, not GetWorld()'s time).
+	// Far-in-the-past defaults so a chunk that has never flashed reads as
+	// fully decayed on the very first tint update.
+	float LoadedAtSeconds = -1000.f;   // set when Component transitions null -> non-null (first apply)
+	float RemeshedAtSeconds = -1000.f; // set on a genuine re-mesh (Component already existed, overlay-aware path)
+	bool bHasOverlayBricks = false;    // this exact chunk (no border) currently owns >=1 edited brick
+	int32 LastQuadCount = 0;           // for FVoxelWorldImpl::ResidentQuads bookkeeping on replace/unload
 };
 
 struct FJobResult
@@ -163,6 +197,7 @@ struct FJobResult
 	VoxelCoords::FVoxelChunkKey Key;
 	uint64 GenerationId = 0;
 	TArray<FVoxelChunkQuad> Quads;
+	float JobMs = 0.f; // wall time inside the worker task body (docs/debug-tooling-plan.md P1 "Worker timings")
 };
 } // namespace VoxelStreaming
 
@@ -177,6 +212,10 @@ struct FVoxelWorldImpl
 		: Tiles(Seed)
 		, Voxels(Seed, Tiles)
 	{
+		// Fixed-size ring buffer (docs/debug-tooling-plan.md P1 "Worker
+		// timings"): sized once here so DrainResults never touches TArray
+		// growth on its hot path.
+		WorkerJobMsWindow.Init(0.f, WorkerJobMsWindowSize);
 	}
 
 	vxc::SyntheticTileSampler Tiles;
@@ -202,12 +241,57 @@ struct FVoxelWorldImpl
 	VoxelCoords::FVoxelChunkKey LastAnchorChunk{};
 	FVector LastAnchorLocation = FVector::ZeroVector;
 
-	// Cumulative counters, logged periodically (LogVoxelEarth, every ~5s) --
+	// Cumulative counters, logged periodically (LogVoxelPerf, every ~5s) --
 	// never per-chunk (docs/m1-plan.md: "log cumulative ... periodically").
 	int64 TotalChunksLoaded = 0;
 	int64 TotalChunksUnloaded = 0;
 	int64 TotalQuadsLoaded = 0;
 	float LogTimerAccumSeconds = 0.f;
+
+	// --- Debug-tooling instrumentation (docs/debug-tooling-plan.md P1) -------
+
+	// Engine-free perf counters (voxel-core/include/voxelcore/counters.h),
+	// incremented around this file's own calls into voxel-core (worker mesh
+	// jobs, the edit-log apply path) -- voxel-core's internals stay untouched.
+	vxc::Counters PerfCounters;
+
+	// Free-running clock since Initialize (NOT GetWorld()'s time -- this impl
+	// has no UWorld& handy outside Tick/TickStreaming's parameters), used only
+	// for chunk-state tint flash decay timing.
+	float ElapsedSeconds = 0.f;
+
+	int64 ResidentQuads = 0;         // sum of FChunkRecord::LastQuadCount across every tracked record with a live component
+	int64 StaleResultsDiscarded = 0; // cumulative worker results dropped (chunk left the desired set, or superseded by an edit)
+
+	// Rolling window of per-chunk worker mesh-job milliseconds (P1 "Worker
+	// timings"), filled on the game thread in DrainResults as results are
+	// drained -- no cross-thread access, so a plain ring buffer suffices.
+	static constexpr int32 WorkerJobMsWindowSize = 256;
+	TArray<float> WorkerJobMsWindow;
+	int32 WorkerJobMsWindowNext = 0;
+	int32 WorkerJobMsWindowCount = 0;
+
+	// This-tick budget-saturation fractions (P1 "budget saturation (% of
+	// per-frame apply/unload/re-mesh budgets used)"), set by the three Drain*
+	// functions and blended together once per tick in UpdatePerfSnapshot.
+	float LastAppliedFrac = 0.f;
+	float LastRemeshFrac = 0.f;
+	float LastUnloadFrac = 0.f;
+	float BudgetSaturationAccum = 0.f;
+	int32 BudgetSaturationSamples = 0;
+
+	// 1Hz refresh window (P1 "1Hz refresh of text, per-frame collection"):
+	// per-frame accumulation happens continuously above; the published
+	// snapshot itself only updates once this timer rolls over.
+	float PerfRefreshAccumSeconds = 0.f;
+	int64 LoadedAtLastPerfRefresh = 0;
+	int64 UnloadedAtLastPerfRefresh = 0;
+	FVoxelPerfSnapshot LastPerfSnapshot;
+
+	// Tracks the previous tick's VoxelDebug::IsChunkStatesEnabled() so the
+	// off-transition can drop every component's MID exactly once (constraint:
+	// zero MID cost once the layer is off again).
+	bool bChunkStatesWasEnabled = false;
 
 	void TickStreaming(const FVector& Anchor, AActor& Owner, USceneComponent& Root, UMaterialInterface* Material, float DeltaTime);
 	void WaitForInFlightTasks();
@@ -220,6 +304,8 @@ struct FVoxelWorldImpl
 	// Explosives v1 (edit-log authority path). Game thread only.
 	int32 CarveSphere(const FVector& CenterUU, double RadiusUU, double JitterUU);
 
+	FVoxelPerfSnapshot GetPerfSnapshot() const { return LastPerfSnapshot; }
+
 private:
 	void RecomputeDesiredSet(const FVector& Anchor);
 	void ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32& OutChunkZMin, int32& OutChunkZMax) const;
@@ -229,10 +315,17 @@ private:
 	void DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material);
 	void DrainUnloads();
 	void ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
-	                      const VoxelCoords::FVoxelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec, TArray<FVoxelChunkQuad>&& Quads);
+	                      const VoxelCoords::FVoxelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec, TArray<FVoxelChunkQuad>&& Quads,
+	                      bool bIsGameThreadMesh);
 	void MarkChunkDirtyForRemesh(const VoxelCoords::FVoxelChunkKey& Key);
 	void CollectDirtyChunks(int64 Vx, int64 Vy, int64 Vz, TSet<VoxelCoords::FVoxelChunkKey>& Out) const;
 	bool ChunkHasEditedBrick(const VoxelCoords::FVoxelChunkKey& ChunkKey) const;
+	// Strict (no 1-brick border) variant used only for the "edited-chunk
+	// orange tint" test -- ChunkHasEditedBrick's border scan is correct for
+	// MESH ROUTING (a pristine chunk beside an edited one must also take the
+	// overlay-aware path) but would tint chunks that merely neighbor an edit,
+	// not own one.
+	bool ChunkOwnsEditedBrick(const VoxelCoords::FVoxelChunkKey& ChunkKey) const;
 	vxc::RaycastHit CastFromCamera(const FVector& CameraLoc, const FVector& Dir) const;
 	void MaybeLogCounters(float DeltaTime);
 
@@ -242,15 +335,24 @@ private:
 	// empty.
 	void ApplyGroupedEdits(std::unordered_map<vxc::BrickKey, std::vector<vxc::EditCell>, vxc::BrickKeyHash>& EditsByBrick,
 	                        const TSet<VoxelCoords::FVoxelChunkKey>& DirtyChunks);
+
+	// --- Debug-tooling helpers (docs/debug-tooling-plan.md P1) ----------------
+	void UpdatePerfSnapshot(float DeltaTime, float TickMs);
+	void UpdateChunkStateTints();
+	void DrawDebugBoundsLayer(UWorld& World, const FVector& Anchor) const;
 };
 
 // --- streaming tick orchestration -------------------------------------------
 
 void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, USceneComponent& Root, UMaterialInterface* Material, float DeltaTime)
 {
+	SCOPE_CYCLE_COUNTER(STAT_VoxelSubsystemTick);
+	const double TickStartSeconds = FPlatformTime::Seconds();
+
 	using namespace VoxelCoords;
 
 	LastAnchorLocation = Anchor;
+	ElapsedSeconds += DeltaTime;
 
 	// Recompute the desired set only when the anchor crosses into a new
 	// render-chunk XY column (every ChunkEdgeUU = 3.2m of movement), not
@@ -277,7 +379,50 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 
 	InFlightTasks.RemoveAllSwap([](const UE::Tasks::TTask<void>& T) { return T.IsCompleted(); }, EAllowShrinking::No);
 
+	// docs/debug-tooling-plan.md P1 "Stats group": always-on DWORD counters
+	// (STATS macros already compile to nothing in Shipping; no extra gate).
+	SET_DWORD_STAT(STAT_VoxelChunksLoaded, ChunkRecords.Num());
+	SET_DWORD_STAT(STAT_VoxelChunksInFlight, JobsInFlightCounter.GetValue());
+
 	MaybeLogCounters(DeltaTime);
+
+	// Constraint: "keep all debug work zero-cost when voxel.Debug=0 (branch
+	// out early)" -- FVoxelPerfSnapshot collection (array iteration, once/sec
+	// sort) is real work beyond the always-on STATS macros above, so it's
+	// gated on mode >= 1 (the perf HUD's own activation threshold) rather
+	// than running unconditionally.
+	if (VoxelDebug::GetDebugMode() >= 1)
+	{
+		const float TickMs = float((FPlatformTime::Seconds() - TickStartSeconds) * 1000.0);
+		UpdatePerfSnapshot(DeltaTime, TickMs);
+	}
+
+	// Visualizations (mode 2 only; both helpers early-out on their own cvar
+	// check so this call is a single cheap branch when debug is off).
+	if (VoxelDebug::IsChunkStatesEnabled())
+	{
+		UpdateChunkStateTints();
+		bChunkStatesWasEnabled = true;
+	}
+	else if (bChunkStatesWasEnabled)
+	{
+		// Off-transition: drop every MID once (constraint: zero MID cost with
+		// the layer off) rather than paying for one until the chunk happens to
+		// re-mesh naturally.
+		for (auto& Pair : ChunkRecords)
+		{
+			if (UVoxelChunkComponent* Comp = Pair.Value.Component.Get())
+			{
+				Comp->ClearDebugTint();
+			}
+		}
+		bChunkStatesWasEnabled = false;
+	}
+
+	if (UWorld* World = Owner.GetWorld())
+	{
+		DrawDebugBoundsLayer(*World, Anchor);
+	}
 }
 
 void FVoxelWorldImpl::WaitForInFlightTasks()
@@ -302,7 +447,9 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	}
 	LogTimerAccumSeconds = 0.f;
 
-	UE_LOG(LogVoxelEarth, Log,
+	// docs/debug-tooling-plan.md P1 "Log split": periodic counter line moved
+	// off LogVoxelEarth (module/general) onto LogVoxelPerf.
+	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel streaming: loaded=%lld unloaded=%lld quads=%lld tracked=%d jobsInFlight=%d pendingJobs=%d ")
 	       TEXT("pendingGameThread=%d pendingUnload=%d"),
 	       (long long)TotalChunksLoaded, (long long)TotalChunksUnloaded, (long long)TotalQuadsLoaded, ChunkRecords.Num(),
@@ -371,6 +518,36 @@ bool FVoxelWorldImpl::ChunkHasEditedBrick(const VoxelCoords::FVoxelChunkKey& Chu
 		for (int32 Dy = -1; Dy <= BricksPerChunk; ++Dy)
 		{
 			for (int32 Dx = -1; Dx <= BricksPerChunk; ++Dx)
+			{
+				const vxc::BrickKey Key{ChunkKey.X * BricksPerChunk + Dx, ChunkKey.Y * BricksPerChunk + Dy,
+				                         ChunkKey.Z * BricksPerChunk + Dz};
+				if (Overlay.find(Key) != nullptr)
+				{
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+bool FVoxelWorldImpl::ChunkOwnsEditedBrick(const VoxelCoords::FVoxelChunkKey& ChunkKey) const
+{
+	// docs/debug-tooling-plan.md P1 chunk-state tint: "edited-chunk orange
+	// (persistent while it has overlay bricks)" -- unlike ChunkHasEditedBrick
+	// (mesh-routing correctness, needs the 1-brick border), this is purely a
+	// tint decision, so it only asks whether THIS chunk owns an edited brick.
+	constexpr int32 BricksPerChunk = VoxelCoords::ChunkEdgeBricks;
+	const vxc::ChunkMap<VoxelCoords::BrickEdgeVoxels>& Overlay = Voxels.editedBricks();
+	if (Overlay.size() == 0)
+	{
+		return false;
+	}
+	for (int32 Dz = 0; Dz < BricksPerChunk; ++Dz)
+	{
+		for (int32 Dy = 0; Dy < BricksPerChunk; ++Dy)
+		{
+			for (int32 Dx = 0; Dx < BricksPerChunk; ++Dx)
 			{
 				const vxc::BrickKey Key{ChunkKey.X * BricksPerChunk + Dx, ChunkKey.Y * BricksPerChunk + Dy,
 				                         ChunkKey.Z * BricksPerChunk + Dz};
@@ -517,11 +694,15 @@ void FVoxelWorldImpl::DispatchJobs()
 		const vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>* GenPtr = &Voxels.generated();
 		TQueue<VoxelStreaming::FJobResult, EQueueMode::Mpsc>* QueuePtr = &ResultsQueue;
 		FThreadSafeCounter* CounterPtr = &JobsInFlightCounter;
+		vxc::Counters* PerfCountersPtr = &PerfCounters;
 
 		UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
 			TEXT("VoxelChunkMeshJob"),
-			[GenPtr, Key, GenId, QueuePtr, CounterPtr]()
+			[GenPtr, Key, GenId, QueuePtr, CounterPtr, PerfCountersPtr]()
 			{
+				SCOPE_CYCLE_COUNTER(STAT_VoxelWorkerJob);
+				const double JobStartSeconds = FPlatformTime::Seconds();
+
 				VoxelStreaming::FJobResult Result;
 				Result.Key = Key;
 				Result.GenerationId = GenId;
@@ -555,8 +736,15 @@ void FVoxelWorldImpl::DispatchJobs()
 					checkSlow(LX >= 0 && LX < GridEdge && LY >= 0 && LY < GridEdge);
 					return vxc::Amplifier::materialAt(Columns[LX + GridEdge * LY], Z);
 				};
-				MeshChunkBricks(Key, GridSampler, Result.Quads);
+				// docs/debug-tooling-plan.md P1 "vxc::Counters": columnEvals
+				// counts the explicit Amp.column() calls this cache-build loop
+				// makes -- the ~100x-cheaper number the doc comment above
+				// references, NOT a count of voxel-core-internal column work
+				// (that stays uninstrumented this pass, per P1 scope).
+				PerfCountersPtr->incColumnEvals(uint64_t(GridEdge) * GridEdge);
+				MeshChunkBricks(Key, GridSampler, Result.Quads, PerfCountersPtr);
 
+				Result.JobMs = float((FPlatformTime::Seconds() - JobStartSeconds) * 1000.0);
 				QueuePtr->Enqueue(MoveTemp(Result));
 				CounterPtr->Decrement();
 			},
@@ -567,8 +755,15 @@ void FVoxelWorldImpl::DispatchJobs()
 
 void FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
                                        const VoxelCoords::FVoxelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec,
-                                       TArray<FVoxelChunkQuad>&& Quads)
+                                       TArray<FVoxelChunkQuad>&& Quads, bool bIsGameThreadMesh)
 {
+	// docs/debug-tooling-plan.md P1 "Memory" row: ResidentQuads tracks
+	// currently-loaded quads (not the cumulative TotalQuadsLoaded below), so
+	// it must be decremented by whatever this record held before, regardless
+	// of which branch below runs.
+	ResidentQuads -= Rec.LastQuadCount;
+	Rec.LastQuadCount = 0;
+
 	if (Quads.Num() == 0)
 	{
 		// No visible geometry (fully buried chunk, or an edit carved away
@@ -583,6 +778,7 @@ void FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	}
 
 	UVoxelChunkComponent* Comp = Rec.Component.Get();
+	const bool bWasFirstLoad = (Comp == nullptr);
 	if (!Comp)
 	{
 		Comp = NewObject<UVoxelChunkComponent>(&Owner);
@@ -594,7 +790,24 @@ void FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		++TotalChunksLoaded;
 	}
 	TotalQuadsLoaded += Quads.Num();
+	Rec.LastQuadCount = Quads.Num();
+	ResidentQuads += Rec.LastQuadCount;
 	Comp->SetChunkQuads(MoveTemp(Quads), VoxelCoords::ChunkEdgeVoxels);
+
+	// docs/debug-tooling-plan.md P1 chunk-state tints: "just-loaded" fires on
+	// any first component creation (worker or game-thread path alike);
+	// "re-mesh" only fires when this was a genuine re-mesh of an
+	// already-resident chunk via the overlay-aware path (never the worker
+	// path -- workers only ever run a chunk's FIRST mesh).
+	if (bWasFirstLoad)
+	{
+		Rec.LoadedAtSeconds = ElapsedSeconds;
+	}
+	else if (bIsGameThreadMesh)
+	{
+		Rec.RemeshedAtSeconds = ElapsedSeconds;
+	}
+	Rec.bHasOverlayBricks = ChunkOwnsEditedBrick(Key);
 }
 
 void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material)
@@ -608,6 +821,14 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 	{
 		++Applied;
 
+		// docs/debug-tooling-plan.md P1 "Worker timings": recorded for every
+		// drained result, even ones about to be discarded as stale below --
+		// the worker did real, representative work regardless of whether the
+		// result is still wanted.
+		WorkerJobMsWindow[WorkerJobMsWindowNext] = Result.JobMs;
+		WorkerJobMsWindowNext = (WorkerJobMsWindowNext + 1) % WorkerJobMsWindowSize;
+		WorkerJobMsWindowCount = FMath::Min(WorkerJobMsWindowCount + 1, WorkerJobMsWindowSize);
+
 		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Result.Key);
 		// Stale-result discard: the chunk left the desired set entirely (no
 		// record any more), or an edit re-mesh superseded this job while it
@@ -615,12 +836,14 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		// dispatched with -- MarkChunkDirtyForRemesh bumped it).
 		if (!Rec || Rec->GenerationId != Result.GenerationId)
 		{
+			++StaleResultsDiscarded;
 			continue;
 		}
 
 		Rec->bJobInFlight = false;
-		ApplyMeshResult(Owner, Root, Material, Result.Key, *Rec, MoveTemp(Result.Quads));
+		ApplyMeshResult(Owner, Root, Material, Result.Key, *Rec, MoveTemp(Result.Quads), /*bIsGameThreadMesh*/ false);
 	}
+	LastAppliedFrac = float(Applied) / float(MaxApplies);
 }
 
 void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material)
@@ -644,11 +867,13 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 		}
 		++Count;
 
+		SCOPE_CYCLE_COUNTER(STAT_VoxelGameThreadMesh);
 		TArray<FVoxelChunkQuad> Quads;
 		MeshChunkBricks(
-			Key, [this](int64 X, int64 Y, int64 Z) { return Voxels.materialAt(X, Y, Z); }, Quads);
-		ApplyMeshResult(Owner, Root, Material, Key, *Rec, MoveTemp(Quads));
+			Key, [this](int64 X, int64 Y, int64 Z) { return Voxels.materialAt(X, Y, Z); }, Quads, &PerfCounters);
+		ApplyMeshResult(Owner, Root, Material, Key, *Rec, MoveTemp(Quads), /*bIsGameThreadMesh*/ true);
 	}
+	LastRemeshFrac = float(Count) / float(MaxRemeshes);
 }
 
 void FVoxelWorldImpl::DrainUnloads()
@@ -672,9 +897,11 @@ void FVoxelWorldImpl::DrainUnloads()
 			{
 				Comp->DestroyComponent();
 			}
+			ResidentQuads -= Rec.LastQuadCount;
 			++TotalChunksUnloaded;
 		}
 	}
+	LastUnloadFrac = float(Count) / float(MaxUnloads);
 }
 
 // --- dig / place (edit-log authority path) -----------------------------
@@ -759,9 +986,14 @@ void FVoxelWorldImpl::ApplyGroupedEdits(std::unordered_map<vxc::BrickKey, std::v
 		return;
 	}
 
+	SCOPE_CYCLE_COUNTER(STAT_VoxelEditApply);
 	for (auto& Entry : EditsByBrick)
 	{
 		Voxels.applyEdit(Entry.first, std::move(Entry.second));
+		// docs/debug-tooling-plan.md P1 "vxc::Counters": one increment per
+		// World::applyEdit call, matching the doc comment's existing "one
+		// World::applyEdit per touched brick" invariant exactly.
+		PerfCounters.incEditsApplied();
 	}
 
 	for (const VoxelCoords::FVoxelChunkKey& Key : DirtyChunks)
@@ -769,6 +1001,165 @@ void FVoxelWorldImpl::ApplyGroupedEdits(std::unordered_map<vxc::BrickKey, std::v
 		MarkChunkDirtyForRemesh(Key);
 	}
 	SortPendingQueues(LastAnchorLocation);
+}
+
+// --- debug-tooling helpers (docs/debug-tooling-plan.md P1) -----------------
+
+void FVoxelWorldImpl::UpdatePerfSnapshot(float DeltaTime, float TickMs)
+{
+	// Per-frame collection into accumulators ("1Hz refresh of text, per-frame
+	// collection"); the published snapshot (LastPerfSnapshot, read via
+	// GetPerfSnapshot) only updates once the 1Hz window below rolls over.
+	const float ThisTickSaturation = (LastAppliedFrac + LastRemeshFrac + LastUnloadFrac) / 3.f;
+	BudgetSaturationAccum += ThisTickSaturation;
+	++BudgetSaturationSamples;
+
+	PerfRefreshAccumSeconds += DeltaTime;
+	LastPerfSnapshot.SubsystemTickMs = TickMs; // always fresh; cheap, no reason to gate behind 1Hz
+
+	if (PerfRefreshAccumSeconds < 1.0f)
+	{
+		return;
+	}
+	const float Window = PerfRefreshAccumSeconds;
+	PerfRefreshAccumSeconds = 0.f;
+
+	const int32 MaxJobsInFlight = 2 * FPlatformMisc::NumberOfCoresIncludingHyperthreads();
+
+	LastPerfSnapshot.TotalChunksLoaded = TotalChunksLoaded;
+	LastPerfSnapshot.TotalChunksUnloaded = TotalChunksUnloaded;
+	LastPerfSnapshot.ChunksLoadedPerSec = float(TotalChunksLoaded - LoadedAtLastPerfRefresh) / Window;
+	LastPerfSnapshot.ChunksUnloadedPerSec = float(TotalChunksUnloaded - UnloadedAtLastPerfRefresh) / Window;
+	LoadedAtLastPerfRefresh = TotalChunksLoaded;
+	UnloadedAtLastPerfRefresh = TotalChunksUnloaded;
+
+	LastPerfSnapshot.JobsInFlight = JobsInFlightCounter.GetValue();
+	LastPerfSnapshot.JobsInFlightCap = MaxJobsInFlight;
+	LastPerfSnapshot.PendingJobQueueDepth = PendingJobKeys.Num();
+	LastPerfSnapshot.PendingGameThreadQueueDepth = PendingGameThreadKeys.Num();
+	LastPerfSnapshot.PendingUnloadQueueDepth = PendingUnloadKeys.Num();
+	LastPerfSnapshot.StaleResultsDiscarded = StaleResultsDiscarded;
+
+	LastPerfSnapshot.BudgetSaturationPct =
+		BudgetSaturationSamples > 0 ? (BudgetSaturationAccum / float(BudgetSaturationSamples)) * 100.f : 0.f;
+	BudgetSaturationAccum = 0.f;
+	BudgetSaturationSamples = 0;
+
+	// Worker mesh-job ms percentiles over the rolling window (sort a small
+	// <=256-float copy once/sec -- negligible even though this runs whenever
+	// voxel.Debug >= 1, not just under mode 2).
+	if (WorkerJobMsWindowCount > 0)
+	{
+		TArray<float> Sorted;
+		Sorted.Append(WorkerJobMsWindow.GetData(), WorkerJobMsWindowCount);
+		Sorted.Sort();
+		const int32 P50Index = FMath::Clamp(int32(Sorted.Num() * 0.50f), 0, Sorted.Num() - 1);
+		const int32 P95Index = FMath::Clamp(int32(Sorted.Num() * 0.95f), 0, Sorted.Num() - 1);
+		LastPerfSnapshot.WorkerMsP50 = Sorted[P50Index];
+		LastPerfSnapshot.WorkerMsP95 = Sorted[P95Index];
+		LastPerfSnapshot.WorkerMsMax = Sorted.Last();
+	}
+	else
+	{
+		LastPerfSnapshot.WorkerMsP50 = LastPerfSnapshot.WorkerMsP95 = LastPerfSnapshot.WorkerMsMax = 0.f;
+	}
+
+	int32 ResidentComponents = 0;
+	for (const auto& Pair : ChunkRecords)
+	{
+		if (Pair.Value.Component.IsValid())
+		{
+			++ResidentComponents;
+		}
+	}
+	LastPerfSnapshot.ResidentComponents = ResidentComponents;
+	LastPerfSnapshot.ResidentQuads = ResidentQuads;
+	LastPerfSnapshot.OverlayBrickCount = int64(Voxels.editedBricks().size());
+	LastPerfSnapshot.EditLogEntries = int64(Voxels.log().size());
+
+	LastPerfSnapshot.BricksGenerated = PerfCounters.getBricksGenerated();
+	LastPerfSnapshot.CellsWritten = PerfCounters.getCellsWritten();
+	LastPerfSnapshot.QuadsEmitted = PerfCounters.getQuadsEmitted();
+	LastPerfSnapshot.EditsApplied = PerfCounters.getEditsApplied();
+	LastPerfSnapshot.ColumnEvals = PerfCounters.getColumnEvals();
+}
+
+void FVoxelWorldImpl::UpdateChunkStateTints()
+{
+	// docs/debug-tooling-plan.md P1 chunk-state tints: just-loaded flash blue
+	// (1s decay), edited-chunk orange (persistent while it owns overlay
+	// bricks), game-thread re-mesh flash purple (1s decay). Whichever flash
+	// is more recent (higher decay alpha) wins over the persistent base tint;
+	// the two flashes are mutually exclusive in practice (LoadedAtSeconds only
+	// fires on first creation, RemeshedAtSeconds only on an already-resident
+	// chunk) but a fresh chunk that's edited again within the same second
+	// could see both windows open at once, so pick explicitly rather than
+	// relying on ordering.
+	static const FLinearColor BlueFlash(0.1f, 0.4f, 1.0f, 1.0f);
+	static const FLinearColor PurpleFlash(0.6f, 0.05f, 0.9f, 1.0f);
+	static const FLinearColor OrangePersistent(1.0f, 0.45f, 0.05f, 1.0f);
+	static const FLinearColor White(1.0f, 1.0f, 1.0f, 1.0f);
+	constexpr float FlashDecaySeconds = 1.0f;
+
+	for (auto& Pair : ChunkRecords)
+	{
+		UVoxelChunkComponent* Comp = Pair.Value.Component.Get();
+		if (!Comp)
+		{
+			continue;
+		}
+		const VoxelStreaming::FChunkRecord& Rec = Pair.Value;
+		const FLinearColor BaseTint = Rec.bHasOverlayBricks ? OrangePersistent : White;
+
+		const float SinceLoaded = ElapsedSeconds - Rec.LoadedAtSeconds;
+		const float SinceRemeshed = ElapsedSeconds - Rec.RemeshedAtSeconds;
+		const float LoadedAlpha = (SinceLoaded >= 0.f && SinceLoaded < FlashDecaySeconds) ? (1.f - SinceLoaded / FlashDecaySeconds) : 0.f;
+		const float RemeshedAlpha = (SinceRemeshed >= 0.f && SinceRemeshed < FlashDecaySeconds) ? (1.f - SinceRemeshed / FlashDecaySeconds) : 0.f;
+
+		FLinearColor Tint = BaseTint;
+		if (LoadedAlpha > 0.f || RemeshedAlpha > 0.f)
+		{
+			const bool bLoadedWins = LoadedAlpha >= RemeshedAlpha;
+			Tint = FMath::Lerp(BaseTint, bLoadedWins ? BlueFlash : PurpleFlash, bLoadedWins ? LoadedAlpha : RemeshedAlpha);
+		}
+
+		Comp->SetDebugTint(Tint);
+	}
+}
+
+void FVoxelWorldImpl::DrawDebugBoundsLayer(UWorld& World, const FVector& Anchor) const
+{
+	if (!VoxelDebug::IsBoundsEnabled())
+	{
+		return;
+	}
+
+	// Cap ~200 nearest tracked chunks (docs/debug-tooling-plan.md P1 "Bounds
+	// layer"). ChunkRecords can hold several thousand entries at M1 streaming
+	// radii; the full sort below only runs while this layer is switched on.
+	struct FEntry
+	{
+		VoxelCoords::FVoxelChunkKey Key;
+		double DistSq;
+	};
+	TArray<FEntry> Entries;
+	Entries.Reserve(ChunkRecords.Num());
+	for (const auto& Pair : ChunkRecords)
+	{
+		const FVector Center = VoxelCoords::ChunkOriginWorld(Pair.Key) + FVector(VoxelCoords::ChunkEdgeUU * 0.5);
+		Entries.Add(FEntry{Pair.Key, FVector::DistSquared(Center, Anchor)});
+	}
+	Entries.Sort([](const FEntry& A, const FEntry& B) { return A.DistSq < B.DistSq; });
+
+	constexpr int32 MaxBoxes = 200;
+	const int32 Count = FMath::Min(MaxBoxes, Entries.Num());
+	const float Extent = float(VoxelCoords::ChunkEdgeUU) * 0.5f;
+	for (int32 Index = 0; Index < Count; ++Index)
+	{
+		const FVector Center = VoxelCoords::ChunkOriginWorld(Entries[Index].Key) + FVector(Extent);
+		DrawDebugBox(&World, Center, FVector(Extent), FColor::Cyan, /*bPersistentLines*/ false, /*LifeTime*/ -1.f,
+		             /*DepthPriority*/ 0, /*Thickness*/ 1.5f);
+	}
 }
 
 bool FVoxelWorldImpl::TryDig(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels)
@@ -869,7 +1260,9 @@ bool FVoxelWorldImpl::TryPlace(const FVector& CameraLoc, const FVector& CameraDi
 	                              CubeMaxUU.Y > PlayerMinUU.Y && CubeMinUU.Z < PlayerMaxUU.Z && CubeMaxUU.Z > PlayerMinUU.Z;
 	if (bOverlapsPlayer)
 	{
-		UE_LOG(LogVoxelEarth, Log, TEXT("TryPlace rejected: %dx%dx%d cube at (%lld,%lld,%lld) would intersect the player."),
+		// docs/debug-tooling-plan.md P1 "Log split": edit-log rejections move
+		// to LogVoxelEdit.
+		UE_LOG(LogVoxelEdit, Log, TEXT("TryPlace rejected: %dx%dx%d cube at (%lld,%lld,%lld) would intersect the player."),
 		       N, N, N, (long long)MinX, (long long)MinY, (long long)MinZ);
 		return false;
 	}
@@ -1047,7 +1440,9 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	ChunkOwner = InWorld.SpawnActor<AActor>(AActor::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
 	if (ChunkOwner == nullptr)
 	{
-		UE_LOG(LogVoxelEarth, Error, TEXT("Failed to spawn the voxel chunk owner actor; streaming will not start."));
+		// docs/debug-tooling-plan.md P1 "Log split": streaming-lifecycle lines
+		// move to LogVoxelStream (module/general lines stay on LogVoxelEarth).
+		UE_LOG(LogVoxelStream, Error, TEXT("Failed to spawn the voxel chunk owner actor; streaming will not start."));
 		return;
 	}
 
@@ -1058,7 +1453,7 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	ChunkOwner->SetActorLabel(TEXT("VoxelChunkOwner"));
 #endif
 
-	UE_LOG(LogVoxelEarth, Log,
+	UE_LOG(LogVoxelStream, Log,
 	       TEXT("Voxel streaming initialized (seed %llu): load=%.0fm unload=%.0fm digRange=%.0fm"),
 	       (unsigned long long)DefaultSeed, LoadRadiusMeters, UnloadRadiusMeters, DigPlaceRangeMeters);
 }
@@ -1168,4 +1563,9 @@ bool UVoxelWorldSubsystem::RaycastVoxelWorld(const FVector& StartUU, const FVect
 int32 UVoxelWorldSubsystem::CarveSphere(const FVector& CenterUU, double RadiusUU, double JitterUU)
 {
 	return Impl ? Impl->CarveSphere(CenterUU, RadiusUU, JitterUU) : 0;
+}
+
+FVoxelPerfSnapshot UVoxelWorldSubsystem::GetPerfSnapshot() const
+{
+	return Impl ? Impl->GetPerfSnapshot() : FVoxelPerfSnapshot{};
 }

@@ -29,4 +29,19 @@ private:
 	// Charge bar (drawn above the text block while charging).
 	static constexpr float ChargeBarWidthPx = 160.0f;
 	static constexpr float ChargeBarHeightPx = 12.0f;
+
+	// --- Perf HUD (docs/debug-tooling-plan.md P1, voxel.Debug mode >= 1) -----
+
+	// Top-left multi-line panel, refreshed at 1Hz (matches the subsystem's
+	// own 1Hz FVoxelPerfSnapshot refresh -- rebuilding the formatted string
+	// more often than the data actually changes would be wasted work); drawn
+	// every frame from the cached string.
+	void DrawPerfHUD();
+
+	static constexpr float PerfPanelMarginPx = 12.0f;
+	static constexpr float PerfPanelLineHeightPx = 16.0f;
+	static constexpr float PerfRefreshIntervalSeconds = 1.0f;
+
+	FString CachedPerfHUDText;
+	float PerfHUDLastRefreshWorldSeconds = -1000.f;
 };

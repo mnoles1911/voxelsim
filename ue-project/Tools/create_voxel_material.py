@@ -7,6 +7,13 @@ AO-shaded terrain: BaseColor = a flat albedo tint * VertexColor.G, Roughness
 constant 0.9. Two-sided is enabled defensively -- see the M1 stage 1 report for
 why (quad winding could not be verified visually in this headless run).
 
+docs/debug-tooling-plan.md P1 "Chunk-state tints": also adds a DebugTint
+VectorParameter (default opaque white) multiplied into BaseColor after the AO
+multiply, so UVoxelChunkComponent::SetDebugTint (voxel.Debug mode 2 +
+voxel.Debug.ChunkStates) can recolor a chunk via a per-component MID without
+touching the shared material when debug tinting is off (white is the
+multiplicative identity).
+
 Run via:
   UnrealEditor-Cmd.exe <uproject> -run=pythonscript -script=<this file> -unattended -nop4 -nosplash
 """
@@ -43,8 +50,22 @@ def main():
         raise RuntimeError("connect albedo_tint -> multiply.A failed")
     if not mel.connect_material_expressions(vertex_color, "G", ao_multiply, "B"):
         raise RuntimeError("connect vertex_color.G -> multiply.B failed")
-    if not mel.connect_material_property(ao_multiply, "", unreal.MaterialProperty.MP_BASE_COLOR):
-        raise RuntimeError("connect multiply -> BaseColor failed")
+
+    # docs/debug-tooling-plan.md P1: DebugTint VectorParameter, default opaque
+    # white (the multiplicative identity -- SetMaterial/SetVectorParameterValue
+    # only ever touches a per-component MID, so the shared material's default
+    # keeps every non-debug chunk visually unchanged).
+    debug_tint = mel.create_material_expression(material, unreal.MaterialExpressionVectorParameter, -200, 150)
+    debug_tint.set_editor_property("parameter_name", "DebugTint")
+    debug_tint.set_editor_property("default_value", unreal.LinearColor(1.0, 1.0, 1.0, 1.0))
+
+    tint_multiply = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, 0, 50)
+    if not mel.connect_material_expressions(ao_multiply, "", tint_multiply, "A"):
+        raise RuntimeError("connect ao_multiply -> tint_multiply.A failed")
+    if not mel.connect_material_expressions(debug_tint, "", tint_multiply, "B"):
+        raise RuntimeError("connect debug_tint -> tint_multiply.B failed")
+    if not mel.connect_material_property(tint_multiply, "", unreal.MaterialProperty.MP_BASE_COLOR):
+        raise RuntimeError("connect tint_multiply -> BaseColor failed")
 
     roughness = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -200, 250)
     roughness.set_editor_property("r", 0.9)

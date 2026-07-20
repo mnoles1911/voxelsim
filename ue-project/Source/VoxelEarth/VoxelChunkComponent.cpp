@@ -7,6 +7,7 @@
 #include "Engine/Engine.h"
 #include "MaterialDomain.h"
 #include "Materials/Material.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialRenderProxy.h"
 #include "PrimitiveDrawingUtils.h"
 #include "PrimitiveSceneProxy.h"
@@ -330,4 +331,40 @@ void UVoxelChunkComponent::GetUsedMaterials(TArray<UMaterialInterface*>& OutMate
 	{
 		OutMaterials.Add(ChunkMaterial);
 	}
+}
+
+void UVoxelChunkComponent::SetDebugTint(const FLinearColor& Tint)
+{
+	if (!DebugTintMID)
+	{
+		// UPrimitiveComponent (this component's base, not UMeshComponent) has
+		// no CreateDynamicMaterialInstance helper -- hand-rolled equivalent:
+		// create the MID over whatever material is currently assigned, then
+		// route it through SetMaterial (the same virtual UPrimitiveComponent
+		// calls internally) so ChunkMaterial and the scene proxy both pick it
+		// up via the normal MarkRenderStateDirty path.
+		UMaterialInterface* Base = ChunkMaterial;
+		if (!Base)
+		{
+			return; // no material assigned yet; nothing to tint
+		}
+		DebugTintMID = UMaterialInstanceDynamic::Create(Base, this);
+		if (!DebugTintMID)
+		{
+			return;
+		}
+		SetMaterial(0, DebugTintMID);
+	}
+	DebugTintMID->SetVectorParameterValue(TEXT("DebugTint"), Tint);
+}
+
+void UVoxelChunkComponent::ClearDebugTint()
+{
+	if (!DebugTintMID)
+	{
+		return;
+	}
+	UMaterialInterface* Base = DebugTintMID->Parent;
+	DebugTintMID = nullptr;
+	SetMaterial(0, Base);
 }
