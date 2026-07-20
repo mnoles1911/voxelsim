@@ -6,6 +6,7 @@
 DEFINE_LOG_CATEGORY(LogVoxelStream);
 DEFINE_LOG_CATEGORY(LogVoxelEdit);
 DEFINE_LOG_CATEGORY(LogVoxelPerf);
+DEFINE_LOG_CATEGORY(LogVoxelWater);
 
 DEFINE_STAT(STAT_VoxelSubsystemTick);
 DEFINE_STAT(STAT_VoxelWorkerJob);
@@ -59,6 +60,14 @@ TAutoConsoleVariable<float> CVarVoxelServerMaxCarveRadiusUU(
 	400.0f,
 	TEXT("M3 wave 2 validation hardening: server-side cap (UU) on ServerSubmitCarveIntent's RadiusUU. Requests above ")
 	TEXT("this are rejected (logged)."),
+	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarVoxelWaterMaxActiveBricks(
+	TEXT("voxel.Water.MaxActiveBricks"),
+	4096,
+	TEXT("W2: advisory per-tick budget on vxc::WaterCA's active-set size. The CA tick is atomic (no mid-step cutoff ")
+	TEXT("without breaking conservation/determinism), so exceeding this only logs a throttled warning -- see ")
+	TEXT("UVoxelWaterSubsystem::TickWater."),
 	ECVF_Default);
 } // namespace
 
@@ -136,4 +145,9 @@ int32 VoxelDebug::GetServerMaxIntentsPerSec()
 float VoxelDebug::GetServerMaxCarveRadiusUU()
 {
 	return CVarVoxelServerMaxCarveRadiusUU.GetValueOnGameThread();
+}
+
+int32 VoxelDebug::GetWaterMaxActiveBricks()
+{
+	return CVarVoxelWaterMaxActiveBricks.GetValueOnAnyThread();
 }

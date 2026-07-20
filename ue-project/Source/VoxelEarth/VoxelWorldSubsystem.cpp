@@ -12,6 +12,12 @@
 // the voxel-core boundary, so including them from this .cpp is fine.
 #include "VoxelEarthPlayerController.h"
 #include "VoxelEditRelay.h"
+// W2 dig-breach hook (docs/voxel-earth-implementation-plan.md SS3.7 item 2):
+// TryDig/CarveSphere notify the water subsystem of newly-cleared voxels so
+// it can seed Reservoir v0 boundary cells. Same-module UE include, not a
+// voxel-core boundary concern -- VoxelWaterSubsystem.h is itself
+// voxel-core-free (PImpl), exactly like this header.
+#include "VoxelWaterSubsystem.h"
 
 // voxel-core is UE-header-free C++20; safe to include directly from a UE
 // module .cpp (doctrine: never from a header UHT parses -- see
@@ -816,6 +822,32 @@ bool ParseEntries(const TArray<uint8>& InBytes, std::vector<vxc::EditEntry>& Out
 		OutEntries.push_back(std::move(E));
 	}
 	return true;
+}
+
+// W2 dig-breach hook: converts a TryDig/CarveSphere batch's brick+cell edits
+// into plain voxel coordinates, filtered to MAT_AIR writes only (dig-style
+// clears -- TryPlace's arbitrary materials never breach). UVoxelWaterSubsystem
+// itself decides which of these actually border pre-existing open water
+// (see NotifyTerrainVoxelsCleared's doc comment); this helper only unpacks
+// the coordinates.
+void ExtractClearedVoxelCoords(const FEditsByBrick& Edits, TArray<VoxelCoords::FVoxelCoord>& OutCoords)
+{
+	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
+	for (const auto& Entry : Edits)
+	{
+		const vxc::BrickKey& Key = Entry.first;
+		for (const vxc::EditCell& Cell : Entry.second)
+		{
+			if (Cell.mat != vxc::MAT_AIR)
+			{
+				continue;
+			}
+			const int LocalX = Cell.cell % B;
+			const int LocalY = (Cell.cell / B) % B;
+			const int LocalZ = Cell.cell / (B * B);
+			OutCoords.Add(VoxelCoords::FVoxelCoord{int64(Key.x) * B + LocalX, int64(Key.y) * B + LocalY, int64(Key.z) * B + LocalZ});
+		}
+	}
 }
 } // namespace
 
@@ -2975,10 +3007,23 @@ bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVec
 		return World ? TryDigReplica(*Impl, *World, CameraWorldLocation, CameraWorldDirection, SizeVoxels) : false;
 	}
 
-	const bool bApplied = Impl->TryDig(CameraWorldLocation, CameraWorldDirection, SizeVoxels);
+	FEditsByBrick DugCells;
+	const bool bApplied = Impl->TryDig(CameraWorldLocation, CameraWorldDirection, SizeVoxels, &DugCells);
 	if (bApplied && World && (NetMode == NM_DedicatedServer || NetMode == NM_ListenServer))
 	{
 		BroadcastNewEntries(*Impl, *World);
+	}
+	// W2 dig-breach hook (task item 2): authority-only, same NetMode gate as
+	// the broadcast above but ALSO fires on NM_Standalone (single-player has
+	// no relay to broadcast to, but water breach seeding still applies).
+	if (bApplied && World && NetMode != NM_Client)
+	{
+		if (UVoxelWaterSubsystem* WaterSubsystem = World->GetSubsystem<UVoxelWaterSubsystem>())
+		{
+			TArray<VoxelCoords::FVoxelCoord> ClearedVoxels;
+			ExtractClearedVoxelCoords(DugCells, ClearedVoxels);
+			WaterSubsystem->NotifyTerrainVoxelsCleared(ClearedVoxels);
+		}
 	}
 	return bApplied;
 }
@@ -3083,10 +3128,23 @@ int32 UVoxelWorldSubsystem::CarveSphere(const FVector& CenterUU, double RadiusUU
 		return World ? CarveSphereReplica(*Impl, *World, CenterUU, RadiusUU, JitterUU) : 0;
 	}
 
-	const int32 Removed = Impl->CarveSphere(CenterUU, RadiusUU, JitterUU);
+	FEditsByBrick CarvedCells;
+	const int32 Removed = Impl->CarveSphere(CenterUU, RadiusUU, JitterUU, &CarvedCells);
 	if (Removed > 0 && World && (NetMode == NM_DedicatedServer || NetMode == NM_ListenServer))
 	{
 		BroadcastNewEntries(*Impl, *World);
+	}
+	// W2 dig-breach hook (task item 2): CarveSphere is the explosive/crater
+	// carve path -- same breach rule as TryDig above (a crater opened below
+	// sea level adjacent to open ocean floods).
+	if (Removed > 0 && World && NetMode != NM_Client)
+	{
+		if (UVoxelWaterSubsystem* WaterSubsystem = World->GetSubsystem<UVoxelWaterSubsystem>())
+		{
+			TArray<VoxelCoords::FVoxelCoord> ClearedVoxels;
+			ExtractClearedVoxelCoords(CarvedCells, ClearedVoxels);
+			WaterSubsystem->NotifyTerrainVoxelsCleared(ClearedVoxels);
+		}
 	}
 	return Removed;
 }

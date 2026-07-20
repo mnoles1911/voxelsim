@@ -238,6 +238,41 @@ public:
     // mirroring Brick<B>::digest / World::editedDigest.
     void digest(Digest& d) const;
 
+    // --- Read-only query accessors (W2 engine-integration groundwork) -----
+    // Pure queries over existing state; none of these change tick behavior
+    // or the determinism contract above, so they need no kWaterCAVersion
+    // bump. Added for callers that need to know WHICH bricks/cells changed
+    // (dirty-chunk re-mesh, replication diff encoding), not just counts
+    // (steppedBrickCount/activeBrickCount already cover that).
+
+    // The active set as of the end of the most recent step() call — per the
+    // "Activity / settling" contract above, this IS exactly the set of
+    // bricks that changed on that call (or the full initial active set if no
+    // step() has run yet, e.g. right after addWater()).
+    const std::set<BrickKey, BrickKeyLess>& activeBricks() const { return active_; }
+
+    // Direct brick lookup (nullptr if absent/empty-collapsed) — for callers
+    // that need a brick's full 512-cell content (meshing, replication
+    // snapshotting) rather than one cell at a time via fillAt().
+    const WaterBrick8* findBrick(const BrickKey& k) const { return water_.find(k); }
+
+    // Every currently-stored (non-empty) brick, for callers that need to
+    // enumerate the whole live water body (e.g. a full-state replication
+    // snapshot, or rebuilding every render chunk after a reconnect).
+    const WaterMap& bricks() const { return water_; }
+
+    // Overwrites a single cell's fill with an authoritative value received
+    // over the wire (client-side replication mirror only — NOT part of the
+    // step()/addWater() simulation API). Keeps totalVolume()'s ledger
+    // consistent via the same accounting setFillAccounted uses internally,
+    // but — unlike addWater() — can move the ledger in either direction and
+    // never stacks into neighboring cells: a replicated snapshot sets cells
+    // to their authoritative values directly. Never called on the authority
+    // instance's own simulated CA, only on a client's locally-held mirror.
+    void setReplicatedFill(int64_t vx, int64_t vy, int64_t vz, uint8_t newFill) {
+        setFillAccounted(vx, vy, vz, newFill, nullptr);
+    }
+
 private:
     bool isSolid(int64_t vx, int64_t vy, int64_t vz) const { return solid_(vx, vy, vz) != MAT_AIR; }
     uint8_t getFill(int64_t vx, int64_t vy, int64_t vz) const;

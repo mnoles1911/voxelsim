@@ -52,4 +52,19 @@ private:
 	// (with a warning) if this somehow runs on NM_Client.
 	FTimerHandle SaveWorldTimerHandle;
 	FTimerHandle SaveWorldQuitTimerHandle;
+
+	// W2 verification (task item 5a): -VoxelSpawnWaterTest[=<delaySeconds>]
+	// pours a water pool near spawn, then logs a settle-check (active
+	// bricks/volume/digest) ~15s later -- combine with
+	// -VoxelScreenshotAfter=<seconds> (a larger value) for the visual.
+	FTimerHandle SpawnWaterTestTimerHandle;
+	FTimerHandle SpawnWaterTestSettleTimerHandle;
+
+	// W2 verification (task item 5b): -VoxelBreachTest[=<delaySeconds>]
+	// scans for a below-sea-level column near spawn on BeginPlay (logged),
+	// then carves a crater there once the delay elapses, seeding a Reservoir
+	// v0 breach -- settle-check logged ~15s after the carve, same shape as
+	// the spawn-water test above.
+	FTimerHandle BreachTestTimerHandle;
+	FTimerHandle BreachTestSettleTimerHandle;
 };

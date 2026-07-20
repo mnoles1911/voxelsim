@@ -71,4 +71,22 @@ public:
 	// entries directly; only remote (client) instances need to replay them.
 	UFUNCTION(NetMulticast, Reliable)
 	void MulticastAppliedEntries(const TArray<uint8>& EntryBytes);
+
+	// W2 (docs/voxel-earth-implementation-plan.md SS3.7 Layer B replication):
+	// exactly the reuse this class's header comment called for -- "the relay
+	// generalizes to non-edit authoritative streams later ... water CA" --
+	// so this is a second seq-stamped opaque entry stream on the SAME relay
+	// actor rather than a new one. Server -> every client: reliable broadcast
+	// of dirty water-brick fill-diffs, called by UVoxelWaterSubsystem at a
+	// fixed ~5Hz cadence (never per-CA-tick -- the CA ticks at 10Hz, the wire
+	// cadence is independently throttled and byte-capped, see
+	// UVoxelWaterSubsystem::BroadcastWaterDiffs). Wire format: flat
+	// brick-key + raw-512-byte-fill pairs (UVoxelWaterSubsystem::
+	// SerializeWaterDiffs/ParseWaterDiffs) -- brick-granularity snapshots,
+	// NOT a per-cell delta; full compression is W2-polish per the task spec.
+	// No-ops on the calling (authority) instance itself, same reasoning as
+	// MulticastAppliedEntries above (the server's own CA is already
+	// authoritative; only remote instances need to mirror it).
+	UFUNCTION(NetMulticast, Reliable)
+	void MulticastWaterDiffs(const TArray<uint8>& DiffBytes);
 };

@@ -6,6 +6,7 @@
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
 #include "VoxelEarthPlayerController.h"
+#include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
 
 namespace
@@ -143,6 +144,21 @@ void AVoxelEarthHUD::DrawPerfHUD()
 			(long long)Snap.MipCacheBrickCount, double(Snap.MipCacheBytes) / (1024.0 * 1024.0), (long long)Snap.MipCacheEvictions,
 			Snap.SubsystemTickMs, World->GetDeltaSeconds() * 1000.0,
 			Snap.BricksGenerated, Snap.CellsWritten, Snap.QuadsEmitted, Snap.EditsApplied, Snap.ColumnEvals);
+
+		// W2 (docs/debug-tooling-plan.md P3 "Water" row): active bricks,
+		// total volume, steps/s, replicated bytes/s -- task item 3's HUD
+		// requirement. Appended only if UVoxelWaterSubsystem exists this run
+		// (it always should once W2 has landed, but this stays defensive the
+		// same way every other subsystem lookup in this file is).
+		if (UVoxelWaterSubsystem* WaterSubsystem = World->GetSubsystem<UVoxelWaterSubsystem>())
+		{
+			const FVoxelWaterPerfSnapshot WaterSnap = WaterSubsystem->GetPerfSnapshot();
+			CachedPerfHUDText += FString::Printf(
+				TEXT("\nWater: active bricks %lld  stored %lld  volume %llu  steps/s %.1f (last step %lld bricks)\n")
+				TEXT("  reservoir cells %d  replicated %.2f KB/s  tick %.2fms"),
+				WaterSnap.ActiveBricks, WaterSnap.StoredBricks, (unsigned long long)WaterSnap.TotalVolume, WaterSnap.StepsPerSec,
+				WaterSnap.LastSteppedBrickCount, WaterSnap.ReservoirCells, WaterSnap.ReplicatedBytesPerSec / 1024.0, WaterSnap.TickMs);
+		}
 	}
 
 	TArray<FString> Lines;
