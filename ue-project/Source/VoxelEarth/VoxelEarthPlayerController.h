@@ -69,6 +69,20 @@ public:
 	void ClientReceiveJoinSyncChunk(const TArray<uint8>& Bytes, bool bFinal);
 
 private:
+	// M3 wave 2 "Validation hardening" (docs/m3-plan.md): per-connection
+	// token-bucket rate cap shared by every ServerSubmit*Intent handler
+	// (voxel.Server.MaxIntentsPerSec, default 10/s). Continuous refill
+	// (fractional tokens, not a fixed "reset every 1s" window) so a client
+	// can't game a window boundary for a double-rate burst. Returns false
+	// (logs a rejection reason -- IntentName is the calling RPC's name for
+	// the log line) and consumes nothing when the bucket is empty; the
+	// caller must then return without applying the edit. Server-side
+	// (authority) only -- meaningless on a client's own locally-controlled
+	// instance, which only ever SENDS these RPCs.
+	bool TryConsumeIntentToken(const TCHAR* IntentName);
+	double IntentTokens = 0.0;
+	double LastIntentTokenRefillSeconds = -1.0;
+
 	void OnDig();
 	void OnPlace();
 

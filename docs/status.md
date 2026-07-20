@@ -398,9 +398,10 @@ broadcast + join-time log sync, seed/digest handshake, and the gate.
   wave; the dedicated-server + 2-headless-clients gate above supersedes it
   for wave 1's pass/fail purposes, but PIE is worth a follow-up smoke test
   before wave 2.
-- [ ] Prediction/reconcile polish, join-time compacted-snapshot sync,
-  validation hardening (rate caps), water/NPC readiness hooks — wave 2/3
-  per docs/m3-plan.md.
+- [x] Join-time compacted-snapshot sync, validation hardening (rate caps) —
+  landed wave 2, see below.
+- [ ] Prediction/reconcile polish, water/NPC readiness hooks — wave 3 per
+  docs/m3-plan.md.
 
 Build: worktree `voxelcore.lib` rebuilt clean from scratch this wave
 (`vxc_tests` 2/2 + `vxc_editlog_selftest` pass; voxel-core itself untouched
@@ -409,6 +410,71 @@ Development builds clean (zero warnings from any file touched this wave;
 same ~pre-existing engine-header deprecation baseline as prior waves).
 `VoxelEarthServer` cannot build on this Installed-Build engine (see above);
 its Target.cs is otherwise complete and UBT-valid.
+
+### Wave 2 — persistence + validation hardening (landed 2026-07-20, worktree agent)
+
+Full writeup: docs/m3-plan.md "Wave 2" section. Summary:
+
+- [x] **Save/load**: `voxel.SaveWorld` console command + autosave-on-shutdown
+  serialize the authoritative edit log (`vxc::EditLog::serialize`,
+  `vxc_editlog`-compatible) to `Saved/VoxelWorlds/<seed>.vxlog` atomically
+  (tmp+rename), authority-only (no-op on `NM_Client`). Compacts the
+  on-disk copy via `vxc::compactLog` when the raw log has more than 2x its
+  compacted entry count (the live log is never mutated). Startup replays
+  the saved file (if present) before streaming begins; `-VoxelNoLoad`
+  bypasses it. **Bug found and fixed during verification**: the transient
+  `/Engine/Maps/Entry` loading world also gets a `UVoxelWorldSubsystem`
+  instance with an empty `Impl`, and an unconditional `Deinitialize`
+  autosave was clobbering the real save file with 0 entries before the
+  actual game world loaded — fixed with a `bWorldBegunPlay` gate.
+- [x] **Join-sync compaction**: server join sync now sends
+  `vxc::compactLog`'s output through the existing wire format instead of
+  the raw log — verified live: `SerializeCompactedLogEntries (join-sync):
+  8 raw entries -> 4 compacted entries (112 bytes)`.
+- [x] **Validation hardening**: per-player token-bucket rate cap
+  (`voxel.Server.MaxIntentsPerSec`, default 10, continuous refill),
+  dig/place size-cap enforcement (`SizeVoxels > MaxCubeSizeVoxels`
+  rejected), carve-radius enforcement (`voxel.Server.MaxCarveRadiusUU`,
+  default 400 UU, rejected) — all three logged-reject-not-disconnect in
+  `_Implementation`, existing camera/pawn range check verified unchanged.
+- [x] **Verification — standalone single-process** (seed 20260719): dig
+  (`-VoxelHeadlessDigTest=3`) then save (`-VoxelSaveWorldAfter=6`) then
+  quit — `SaveWorld: wrote 7863 entries ... editedDigest=0x9EA22D63D98BE8CD`.
+  Relaunch (same seed, no dig) — `LoadWorld: restored 7863 entries ...
+  editedDigest=0x9EA22D63D98BE8CD` — **exact match**. Zero ensures either run.
+- [x] **Verification — networked rerun** (wave 1's gate scenario: dedicated
+  server + 2 headless clients, seed 20260719): all three dump the same
+  digest as wave 1's original gate run —
+  ```
+  VoxelDigestDump: role=Client seed=20260719 editedDigest=0x2451E40F5C935D2C   (client1)
+  VoxelDigestDump: role=Client seed=20260719 editedDigest=0x2451E40F5C935D2C   (client2)
+  VoxelDigestDump: role=Server seed=20260719 editedDigest=0x2451E40F5C935D2C   (server)
+  ```
+  Server saves (8 entries) and quits; **server relaunched** (fresh process,
+  same seed) restores `editedDigest=0x2451E40F5C935D2C` from disk; a
+  **fresh third client** joins via the now-compacted sync and both dump
+  the same digest:
+  ```
+  VoxelDigestDump: role=Server seed=20260719 editedDigest=0x2451E40F5C935D2C   (relaunched server)
+  VoxelDigestDump: role=Client seed=20260719 editedDigest=0x2451E40F5C935D2C   (fresh client)
+  ```
+  Zero ensures/fatal across all five process logs; every launched process
+  self-quit and was confirmed exited, no force-kills needed, no stragglers
+  on a post-run process sweep.
+
+Build: worktree `voxelcore.lib` rebuilt clean from scratch this wave too
+(`vxc_tests` 70/70 pass, `vxc_editlog selftest` PASS; voxel-core itself
+untouched by wave 2 — no source files under voxel-core/ were modified,
+only the UE module consumes `voxelcore/editcompact.h`, which already
+existed). `VoxelEarthEditor` Win64 Development builds clean via
+`Build.bat VoxelEarthEditor Win64 Development -WaitMutex
+-NoHotReloadFromIDE` (zero warnings from any file touched this wave:
+`VoxelDebug.{h,cpp}`, `VoxelEarthGameMode.{h,cpp}`,
+`VoxelEarthPlayerController.{h,cpp}`, `VoxelWorldSubsystem.{h,cpp}`; same
+pre-existing engine-header deprecation baseline as prior waves). Standalone
+behavior without the new switches/commands is unchanged (`LoadWorld: no
+saved world ... starting fresh` is the observed startup line whenever no
+save file exists, byte-identical to pre-wave-2 behavior otherwise).
 
 ## M0 GPU track (ADR-0001)
 
@@ -506,7 +572,6 @@ grep clean).
 | Dithered blue-noise ring cross-fades + ring↔clipmap seam | deliberate last (plan's slip-risk item) | M2 polish wave |
 | Perf-run hitches (~15-19/run, max 400ms, during initial streaming ramp) | needs isolate + PSO precache investigation | M2 gate work |
 | Clipmap follow-ups: two-sided material (winding unverified), A/B perf isolate, CDLOD replacement per ADR-0002 tripwire | noted in ADR/plan | M2 polish |
-| Edit-log compaction unused by any caller | offline tooling | M3 persistence |
 | Debug tooling P2/P3 (τ overlay, water ledgers) | phased with M2-polish/W2 | — |
 
 M1 min-spec proxy definition: `sg.ViewDistanceQuality 0`, `sg.ShadowQuality 0`,

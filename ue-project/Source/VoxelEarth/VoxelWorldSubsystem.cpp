@@ -18,6 +18,7 @@
 // VoxelWorldSubsystem.h / VoxelChunkComponent.h, both voxel-core-free).
 #include "voxelcore/bytes.h"
 #include "voxelcore/counters.h"
+#include "voxelcore/editcompact.h" // M3 wave 2: compactLog for save-to-disk + join-sync compaction
 #include "voxelcore/hash.h"
 #include "voxelcore/mesher.h"
 #include "voxelcore/mips.h"
@@ -34,14 +35,17 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/CriticalSection.h"
-#include "HAL/IConsoleManager.h" // M3: voxel.DumpEditedDigest
+#include "HAL/FileManager.h" // M3 wave 2: atomic save-file rename (IFileManager::Move)
+#include "HAL/IConsoleManager.h" // M3: voxel.DumpEditedDigest / voxel.SaveWorld
 #include "HAL/PlatformMisc.h"
 #include "HAL/PlatformTime.h"
 #include "HAL/ThreadSafeCounter.h"
 #include "MaterialDomain.h"
 #include "Materials/Material.h"
 #include "Misc/CommandLine.h"
+#include "Misc/FileHelper.h" // M3 wave 2: Saved/VoxelWorlds/<seed>.vxlog read/write
 #include "Misc/Parse.h"
+#include "Misc/Paths.h" // M3 wave 2: FPaths::ProjectSavedDir
 #include "Misc/ScopeRWLock.h"
 #include "Materials/MaterialInterface.h"
 #include "Stats/Stats.h"
@@ -2634,6 +2638,126 @@ void BroadcastNewEntries(FVoxelWorldImpl& Impl, UWorld& World)
 		       (int32)Slice.size());
 	}
 }
+
+// M3 wave 2 persistence (docs/m3-plan.md "Save/load") -----------------------
+//
+// Saved/VoxelWorlds/<seed>.vxlog, using vxc::EditLog::serialize's
+// self-describing whole-log format (magic/version/seed/brickEdge header) --
+// the SAME format voxel-core/bench/editlog_tool.cpp's `stats`/`compact`/
+// `verify` commands already read/write, so an on-disk save from this game
+// process is directly usable by that offline tool too.
+FString GetWorldSaveFilePath(uint64 Seed)
+{
+	return FPaths::ProjectSavedDir() / TEXT("VoxelWorlds") / FString::Printf(TEXT("%llu.vxlog"), (unsigned long long)Seed);
+}
+
+// Atomic tmp+rename write (mirrors voxel-core/bench/editlog_tool.cpp's own
+// writeFileAtomic, UE-side: FFileHelper for the write, IFileManager::Move for
+// the rename-over-destination) -- a process dying mid-write leaves only the
+// .tmp file behind, never a truncated/corrupt Path.
+bool WriteBytesAtomic(const FString& Path, const TArray<uint8>& Bytes)
+{
+	const FString TmpPath = Path + TEXT(".tmp");
+	if (!FFileHelper::SaveArrayToFile(Bytes, *TmpPath))
+	{
+		UE_LOG(LogVoxelEdit, Error, TEXT("SaveWorld: failed to write temp file %s"), *TmpPath);
+		return false;
+	}
+	if (!IFileManager::Get().Move(*Path, *TmpPath, /*Replace*/ true))
+	{
+		UE_LOG(LogVoxelEdit, Error, TEXT("SaveWorld: failed to rename %s -> %s"), *TmpPath, *Path);
+		IFileManager::Get().Delete(*TmpPath);
+		return false;
+	}
+	return true;
+}
+
+// UVoxelWorldSubsystem::SaveWorld's real body (kept as a free function so it
+// only needs FVoxelWorldImpl&, matching this file's existing role-split
+// convention -- see TryDigReplica et al above). Compacts the outgoing copy
+// (never the live log_) when the raw log has more than 2x its compacted
+// entry count (docs/m3-plan.md wave 2 item 1: "COMPACT on save when the log
+// has >2x the entries of its compacted form").
+bool SaveEditLogToDisk(const FVoxelWorldImpl& Impl, uint64 Seed)
+{
+	const vxc::EditLog& Log = Impl.Voxels.log();
+	const vxc::EditLog Compacted = vxc::compactLog(Log);
+	const bool bUseCompacted = Log.size() > 2 * Compacted.size();
+	const vxc::EditLog& ToSave = bUseCompacted ? Compacted : Log;
+
+	std::vector<uint8_t> Bytes;
+	ToSave.serialize(Bytes);
+	TArray<uint8> OutBytes;
+	OutBytes.SetNumUninitialized((int32)Bytes.size());
+	if (!Bytes.empty())
+	{
+		FMemory::Memcpy(OutBytes.GetData(), Bytes.data(), Bytes.size());
+	}
+
+	const FString Dir = FPaths::ProjectSavedDir() / TEXT("VoxelWorlds");
+	IFileManager::Get().MakeDirectory(*Dir, /*Tree*/ true);
+	const FString Path = GetWorldSaveFilePath(Seed);
+
+	if (!WriteBytesAtomic(Path, OutBytes))
+	{
+		return false;
+	}
+
+	if (bUseCompacted)
+	{
+		UE_LOG(LogVoxelEdit, Log,
+		       TEXT("SaveWorld: compacted %llu -> %llu entries before saving (raw log had more than 2x the compacted size)."),
+		       (unsigned long long)Log.size(), (unsigned long long)Compacted.size());
+	}
+	UE_LOG(LogVoxelEdit, Log,
+	       TEXT("SaveWorld: wrote %llu entries (%d bytes%s) to %s -- editedDigest=0x%016llX"),
+	       (unsigned long long)ToSave.size(), OutBytes.Num(), bUseCompacted ? TEXT(", compacted") : TEXT(""), *Path,
+	       (unsigned long long)Impl.Voxels.editedDigest());
+	return true;
+}
+
+// Loads Saved/VoxelWorlds/<seed>.vxlog (if present) via vxc::World::replay,
+// called once from OnWorldBeginPlay before any streaming/chunk work reads
+// from Impl.Voxels -- see the call site for the authority-only gating.
+// -VoxelNoLoad bypasses this entirely (fresh-start verification aid).
+void LoadEditLogFromDisk(FVoxelWorldImpl& Impl, uint64 Seed)
+{
+	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelNoLoad")))
+	{
+		UE_LOG(LogVoxelEdit, Log, TEXT("LoadWorld: -VoxelNoLoad passed -- skipping saved-world load, starting fresh."));
+		return;
+	}
+
+	const FString Path = GetWorldSaveFilePath(Seed);
+	if (!FPaths::FileExists(Path))
+	{
+		UE_LOG(LogVoxelEdit, Log, TEXT("LoadWorld: no saved world at %s -- starting fresh."), *Path);
+		return;
+	}
+
+	TArray<uint8> Bytes;
+	if (!FFileHelper::LoadFileToArray(Bytes, *Path))
+	{
+		UE_LOG(LogVoxelEdit, Error, TEXT("LoadWorld: failed to read %s -- starting fresh."), *Path);
+		return;
+	}
+
+	const std::optional<vxc::EditLog> ParsedLog = vxc::EditLog::parse(Bytes.GetData(), (size_t)Bytes.Num());
+	if (!ParsedLog)
+	{
+		UE_LOG(LogVoxelEdit, Error, TEXT("LoadWorld: %s is corrupt or unrecognized -- starting fresh."), *Path);
+		return;
+	}
+
+	if (!Impl.Voxels.replay(*ParsedLog))
+	{
+		UE_LOG(LogVoxelEdit, Error, TEXT("LoadWorld: seed/brickEdge mismatch replaying %s -- starting fresh."), *Path);
+		return;
+	}
+
+	UE_LOG(LogVoxelEdit, Log, TEXT("LoadWorld: restored %llu entries from %s -- editedDigest=0x%016llX"),
+	       (unsigned long long)ParsedLog->size(), *Path, (unsigned long long)Impl.Voxels.editedDigest());
+}
 } // namespace
 
 // UVoxelWorldSubsystem ----------------------------------------------------
@@ -2675,6 +2799,20 @@ void UVoxelWorldSubsystem::Deinitialize()
 		// Worker jobs hold raw pointers into Impl-owned data (DispatchJobs);
 		// block until every in-flight job has finished before freeing it.
 		Impl->WaitForInFlightTasks();
+
+		// M3 wave 2 persistence (docs/m3-plan.md "Save/load"): autosave-on-
+		// shutdown, but ONLY for a world that actually began play (see the
+		// header's doc comment on bWorldBegunPlay) -- the transient "Entry"
+		// loading world -game/-server also constructs a subsystem instance
+		// for has an empty Impl and must never overwrite a real save file
+		// with that emptiness. SaveWorld() itself already no-ops (with a
+		// logged warning) on NM_Client, so this is safe to call
+		// unconditionally beyond that -- only the authority (server/listen/
+		// standalone) actually writes a file.
+		if (bWorldBegunPlay)
+		{
+			SaveWorld();
+		}
 	}
 
 	ChunkRoot = nullptr;
@@ -2700,6 +2838,25 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	if (!InWorld.IsGameWorld() || !Impl)
 	{
 		return;
+	}
+
+	// M3 wave 2 persistence: from here on, this is a genuine gameplay world
+	// (see the header's doc comment on bWorldBegunPlay for why this can't
+	// just be "Impl is non-null") -- gates Deinitialize's autosave.
+	bWorldBegunPlay = true;
+
+	// M3 wave 2 persistence (docs/m3-plan.md "Save/load"): authority
+	// (server/listen/standalone) loads Saved/VoxelWorlds/<seed>.vxlog, if
+	// present, before ANY streaming/chunk work below reads from Impl->Voxels
+	// -- this is the earliest point OnWorldBeginPlay runs (right after the
+	// game-world/Impl guard above), and it runs before the dedicated-server
+	// early-return further down so it applies uniformly across every
+	// authority role. NM_Client never loads its own file -- a joining client
+	// gets its state from the server's join-sync reply instead (see
+	// AVoxelEarthPlayerController::ServerRequestJoinSync).
+	if (InWorld.GetNetMode() != NM_Client)
+	{
+		LoadEditLogFromDisk(*Impl, Seed);
 	}
 
 	// M3 wave 1 (docs/m3-plan.md): a dedicated server has no viewport and
@@ -2962,6 +3119,21 @@ uint64 UVoxelWorldSubsystem::GetLogSize() const
 	return Impl ? Impl->Voxels.log().size() : 0;
 }
 
+void UVoxelWorldSubsystem::SerializeCompactedLogEntries(TArray<uint8>& OutBytes) const
+{
+	OutBytes.Reset();
+	if (!Impl)
+	{
+		return;
+	}
+	const vxc::EditLog& RawLog = Impl->Voxels.log();
+	const vxc::EditLog Compacted = vxc::compactLog(RawLog);
+	SerializeEntries(Compacted.entries(), OutBytes);
+	UE_LOG(LogVoxelEdit, Log,
+	       TEXT("SerializeCompactedLogEntries (join-sync): %llu raw entries -> %llu compacted entries (%d bytes)."),
+	       (unsigned long long)RawLog.size(), (unsigned long long)Compacted.size(), OutBytes.Num());
+}
+
 bool UVoxelWorldSubsystem::ApplyReplicatedEntries(const TArray<uint8>& Bytes)
 {
 	if (!Impl)
@@ -3060,6 +3232,23 @@ uint64 UVoxelWorldSubsystem::GetEditedDigest() const
 	return Impl ? Impl->Voxels.editedDigest() : 0;
 }
 
+bool UVoxelWorldSubsystem::SaveWorld() const
+{
+	if (!Impl)
+	{
+		return false;
+	}
+	const UWorld* World = GetWorld();
+	const ENetMode NetMode = World ? World->GetNetMode() : NM_Standalone;
+	if (NetMode == NM_Client)
+	{
+		UE_LOG(LogVoxelEdit, Warning,
+		       TEXT("SaveWorld: refused on NM_Client -- only the authority (server/listen/standalone) has a log to save."));
+		return false;
+	}
+	return SaveEditLogToDisk(*Impl, Seed);
+}
+
 namespace
 {
 // M3 gate ("two clients dig the same hole", docs/m3-plan.md): a console
@@ -3080,5 +3269,25 @@ FAutoConsoleCommandWithWorld CVarVoxelDumpEditedDigest(
 	        }
 	        UE_LOG(LogVoxelEarth, Log, TEXT("VoxelDigestDump: role=Console seed=%llu editedDigest=0x%016llX"),
 	               (unsigned long long)Subsystem->GetSeed(), (unsigned long long)Subsystem->GetEditedDigest());
+        }));
+
+// M3 wave 2 persistence (docs/m3-plan.md "Save/load"): interactive
+// alternative to the -VoxelSaveWorldAfter=<s> command-line switch
+// (AVoxelEarthGameMode) -- same UVoxelWorldSubsystem::SaveWorld() call
+// either way.
+FAutoConsoleCommandWithWorld CVarVoxelSaveWorld(
+    TEXT("voxel.SaveWorld"),
+    TEXT("Saves the authoritative edit log to Saved/VoxelWorlds/<seed>.vxlog (M3 wave 2 persistence; no-op with a ")
+    TEXT("warning on NM_Client)."),
+    FConsoleCommandWithWorldDelegate::CreateLambda(
+        [](UWorld* World)
+        {
+	        UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	        if (!Subsystem)
+	        {
+		        UE_LOG(LogVoxelEarth, Warning, TEXT("voxel.SaveWorld: no UVoxelWorldSubsystem in this world."));
+		        return;
+	        }
+	        Subsystem->SaveWorld();
         }));
 } // namespace

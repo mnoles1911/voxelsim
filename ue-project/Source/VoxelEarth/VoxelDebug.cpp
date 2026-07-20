@@ -46,6 +46,20 @@ TAutoConsoleVariable<int32> CVarVoxelMipCacheBudgetMB(
 	TEXT("Approximate byte budget (MB) for the shared cross-job mip cache (FSharedMipCache, VoxelWorldSubsystem.cpp). ")
 	TEXT("Sharded approximate-LRU evicts on insert once over budget. <= 0 disables eviction (unbounded)."),
 	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarVoxelServerMaxIntentsPerSec(
+	TEXT("voxel.Server.MaxIntentsPerSec"),
+	10,
+	TEXT("M3 wave 2 validation hardening: per-connection token-bucket cap on dig/place/carve intent RPCs accepted per ")
+	TEXT("second. Excess intents are rejected (logged), not disconnected."),
+	ECVF_Default);
+
+TAutoConsoleVariable<float> CVarVoxelServerMaxCarveRadiusUU(
+	TEXT("voxel.Server.MaxCarveRadiusUU"),
+	400.0f,
+	TEXT("M3 wave 2 validation hardening: server-side cap (UU) on ServerSubmitCarveIntent's RadiusUU. Requests above ")
+	TEXT("this are rejected (logged)."),
+	ECVF_Default);
 } // namespace
 
 int32 VoxelDebug::GetDebugMode()
@@ -112,4 +126,14 @@ int64 VoxelDebug::GetMipCacheBudgetBytes()
 void VoxelDebug::SetMipCacheBudgetMB(int32 NewBudgetMB)
 {
 	CVarVoxelMipCacheBudgetMB->Set(NewBudgetMB, ECVF_SetByCode);
+}
+
+int32 VoxelDebug::GetServerMaxIntentsPerSec()
+{
+	return CVarVoxelServerMaxIntentsPerSec.GetValueOnGameThread();
+}
+
+float VoxelDebug::GetServerMaxCarveRadiusUU()
+{
+	return CVarVoxelServerMaxCarveRadiusUU.GetValueOnGameThread();
 }
