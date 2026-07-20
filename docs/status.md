@@ -45,6 +45,45 @@ Working plan + binding decisions: docs/m1-plan.md. UE 5.8.0 (retargeted
   origin rebasing, 60fps gate run
 - Gate (walk & dig at 60fps min-spec): ⬜ open — blocked on stage 3
 
+## M2 — LOD cascade (first implementation wave landed, 2026-07-20)
+
+Working plan + binding decisions: docs/m2-plan.md.
+
+- [x] Level-aware streaming: `VoxelCoords::FVoxelLevelChunkKey` generalizes
+  every record/queue in `VoxelWorldSubsystem.cpp`; per-level annulus desired
+  sets from the `RingPresets` table (R0 0-64m .. R4 512-1024m), outer-edge
+  hysteresis (1.25x), nearest-first-globally priority with level as an
+  equal-distance tie-break only, per-level entry-scan gating so outer rings
+  don't rescan on every 3.2m step.
+- [x] MipChain worker integration: level-L (L>=1) jobs build bricks via
+  `vxc::MipChain<8>` over a pure-`GeneratedWorld` level-0 source with a
+  per-job column-grid LRU (`MakeLevelSampler`); level 0 keeps its existing
+  hand-tuned fast path unchanged.
+- [x] Component/proxy: `UVoxelChunkComponent::SetLevel` scales position and
+  bounds by `VoxelSizeUU << level`; `voxel.Debug.Rings` cvar tints by level
+  (R0 green .. R4 magenta), `-VoxelDebugRings` forces it on headlessly.
+- [x] Verification (2026-07-20, seed 20260719, static spawn, no player
+  movement): headless `-game -VoxelScreenshotAfter=<n>` runs, clean shutdown,
+  zero ensures. From a cold spawn, ring population is strictly nearest-first
+  (rings are non-overlapping distance bands, so this is inherent, not a
+  bug): R0 (1596 chunks) and R1 (1172) settle in ~20s; R2 (~2000+ visible /
+  ~4010 candidates) takes ~90s; R3 candidates (~4038) dispatch markedly
+  slower — measured ~8 chunks/s vs R2's ~45-50/s, confirming the plan's "some
+  cost growth expected" note for higher MipChain levels — R3 was still
+  draining (598/2565 loaded) and R4 (4076 candidates) had not started after
+  475s. **Open follow-up**: cold-start fill time for R3/R4 is long relative
+  to a session (this is a one-time worst case, not the steady-state cost of
+  keeping rings loaded during normal flight, but it means the "R1+ nonzero"
+  verification needs several minutes from a cold spawn, not tens of
+  seconds) — worth profiling the per-job MipChain cost at L3/L4 specifically
+  (recursive 2x2x2 downsample fan-out) before the next M2 wave.
+- **Known limitation** (see docs/m2-plan.md "Known limitation" section):
+  distant edits do not propagate to mip levels yet — only level 0 takes the
+  overlay-aware path; R1-R4 always render pure-generated.
+- Gate (50km+ vista, 60fps, fast flight with no hitches): ⬜ open — this wave
+  is streaming/rendering plumbing only; the flight/hitch gate run and
+  dithered cross-fade are later M2 items.
+
 ## M0 GPU track (ADR-0001)
 
 - [x] Worldgen HLSL kernel (ColumnMain, VoxelizeMain, MeshCountMain,

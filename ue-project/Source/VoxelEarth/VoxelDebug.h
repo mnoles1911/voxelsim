@@ -12,6 +12,7 @@
 
 #include "CoreMinimal.h"
 #include "Stats/Stats.h"
+#include "VoxelCoords.h" // VoxelCoords::kNumLevels (ring tint table + perf snapshot sizing) -- UE-only, voxel-core-free, safe here
 
 // --- Log categories (P1 "Log split") ----------------------------------------
 //
@@ -53,6 +54,23 @@ namespace VoxelDebug
 	// in, so call sites never need to check GetDebugMode() themselves.
 	VOXELEARTH_API bool IsChunkStatesEnabled();
 	VOXELEARTH_API bool IsBoundsEnabled();
+
+	// voxel.Debug.Rings (docs/m2-plan.md first implementation wave item 4):
+	// tints every loaded chunk component by its mip level (RingLevelTint)
+	// instead of the chunk-state flash/overlay tints. Same mode>=2 gating as
+	// the other layers; takes priority over ChunkStates if both are enabled
+	// (see FVoxelWorldImpl::TickStreaming).
+	VOXELEARTH_API bool IsRingsEnabled();
+
+	// Programmatic setter (ECVF_SetByCode, mirrors SetDebugMode) -- used by
+	// the -VoxelDebugRings command-line switch (AVoxelEarthGameMode::BeginPlay)
+	// to force voxel.Debug=2 + voxel.Debug.Rings=1 for headless verification
+	// runs without needing -ExecCmds plumbing.
+	VOXELEARTH_API void SetRingsEnabled(bool bEnabled);
+
+	// Ring level debug tint colors (m2-plan.md item 4): R0 green .. R4
+	// magenta, indexed by VoxelCoords::kNumLevels. Clamped to a valid index.
+	VOXELEARTH_API FLinearColor RingLevelTint(int32 Level);
 }
 
 // --- Perf HUD data (P1 "Perf HUD") ------------------------------------------
@@ -94,6 +112,12 @@ struct FVoxelPerfSnapshot
 	int64 ResidentQuads = 0;
 	int64 OverlayBrickCount = 0;
 	int64 EditLogEntries = 0;
+
+	// --- Ring levels (docs/m2-plan.md first implementation wave item 1) -----
+	// Loaded (has a live component) and pending (queued across job/game-thread/
+	// unload) chunk counts per mip level, indexed by VoxelCoords level.
+	int32 LevelLoadedCount[VoxelCoords::kNumLevels] = {};
+	int32 LevelPendingCount[VoxelCoords::kNumLevels] = {};
 
 	// --- Frame ---------------------------------------------------------------
 	float SubsystemTickMs = 0.f;

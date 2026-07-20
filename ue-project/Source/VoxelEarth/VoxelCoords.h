@@ -27,6 +27,13 @@ namespace VoxelCoords
 	inline constexpr int32 ChunkEdgeVoxels = BrickEdgeVoxels * ChunkEdgeBricks; // 32
 	inline constexpr double ChunkEdgeUU = ChunkEdgeVoxels * VoxelSizeUU;        // 320 UU = 3.2m
 
+	// M2 mip rings (docs/m2-plan.md decisions table): R0 = true voxels
+	// (level 0, unchanged), R1-R4 = mip levels 1-4. A level-L voxel is
+	// (1<<L) times the edge length of a level-0 voxel; a level-L render
+	// chunk still spans ChunkEdgeVoxels (32) level-L cells, so its world
+	// footprint doubles per level ("8 cubes become 1 in place").
+	inline constexpr int32 kNumLevels = 5;
+
 	// Floored division matching vxc::floorDiv (C++ integer division truncates
 	// toward zero; voxel/brick/chunk lattice indexing needs floor instead).
 	constexpr int64 FloorDiv(int64 A, int64 B)
@@ -59,7 +66,10 @@ namespace VoxelCoords
 	};
 
 	// Render-chunk coordinates: one chunk = ChunkEdgeVoxels^3 voxels
-	// (matches vxc::BrickKey scaled up by ChunkEdgeBricks).
+	// (matches vxc::BrickKey scaled up by ChunkEdgeBricks). Level-relative:
+	// (X,Y,Z) index chunks within whichever level's own independent lattice
+	// they're paired with (see FVoxelLevelChunkKey below) -- a bare
+	// FVoxelChunkKey on its own is only unambiguous at level 0.
 	struct FVoxelChunkKey
 	{
 		int32 X = 0, Y = 0, Z = 0;
@@ -72,6 +82,37 @@ namespace VoxelCoords
 		return HashCombine(::GetTypeHash(Key.X), ::GetTypeHash(Key.Y), ::GetTypeHash(Key.Z));
 	}
 
+	// Level-aware render-chunk key (docs/m2-plan.md "Ring streaming" row):
+	// pairs a mip level (0 = true voxels, 1-4 = mip rings) with a chunk key
+	// in THAT level's own lattice. Level 0 keys are numerically identical to
+	// the pre-M2 single-level scheme (back-compat: existing dig/edit code
+	// keeps working against plain FVoxelChunkKey + implied level 0).
+	struct FVoxelLevelChunkKey
+	{
+		int32 Level = 0;
+		FVoxelChunkKey Key;
+
+		friend bool operator==(const FVoxelLevelChunkKey&, const FVoxelLevelChunkKey&) = default;
+	};
+
+	FORCEINLINE uint32 GetTypeHash(const FVoxelLevelChunkKey& LevelKey)
+	{
+		return HashCombine(::GetTypeHash(LevelKey.Level), GetTypeHash(LevelKey.Key));
+	}
+
+	// Edge length (UU) of one voxel at the given mip level -- doubles per
+	// level (docs/m2-plan.md: "8 cubes become 1 in place").
+	FORCEINLINE double VoxelSizeUUForLevel(int32 Level)
+	{
+		return VoxelSizeUU * double(int64(1) << Level);
+	}
+
+	// Edge length (UU) of one render chunk at the given mip level.
+	FORCEINLINE double ChunkEdgeUUForLevel(int32 Level)
+	{
+		return ChunkEdgeUU * double(int64(1) << Level);
+	}
+
 	// World position (UU, LWC) -> voxel lattice coordinate (floored).
 	FORCEINLINE FVoxelCoord WorldToVoxel(const FVector& WorldPos)
 	{
@@ -79,6 +120,17 @@ namespace VoxelCoords
 			(int64)FMath::FloorToDouble(WorldPos.X / VoxelSizeUU),
 			(int64)FMath::FloorToDouble(WorldPos.Y / VoxelSizeUU),
 			(int64)FMath::FloorToDouble(WorldPos.Z / VoxelSizeUU)};
+	}
+
+	// World position (UU, LWC) -> voxel lattice coordinate at the given mip
+	// level (floored; level-L voxels are (1<<L) times level-0's edge).
+	FORCEINLINE FVoxelCoord WorldToVoxelForLevel(const FVector& WorldPos, int32 Level)
+	{
+		const double SizeUU = VoxelSizeUUForLevel(Level);
+		return FVoxelCoord{
+			(int64)FMath::FloorToDouble(WorldPos.X / SizeUU),
+			(int64)FMath::FloorToDouble(WorldPos.Y / SizeUU),
+			(int64)FMath::FloorToDouble(WorldPos.Z / SizeUU)};
 	}
 
 	// Voxel lattice coordinate -> world position (UU) of its negative corner.
@@ -92,7 +144,10 @@ namespace VoxelCoords
 		return VoxelToWorldCorner(Voxel) + FVector(VoxelSizeUU * 0.5);
 	}
 
-	// Render-chunk key containing a given voxel.
+	// Render-chunk key containing a given voxel (level-agnostic: works for
+	// any level's independent lattice, since chunk indexing is always
+	// floorDiv(voxelIndex, ChunkEdgeVoxels) regardless of what a "voxel"
+	// means at that level).
 	FORCEINLINE FVoxelChunkKey ChunkKeyForVoxel(const FVoxelCoord& Voxel)
 	{
 		return FVoxelChunkKey{
@@ -101,7 +156,8 @@ namespace VoxelCoords
 			(int32)FloorDiv(Voxel.Z, ChunkEdgeVoxels)};
 	}
 
-	// Render-chunk key -> voxel coordinate of its negative corner.
+	// Render-chunk key -> voxel coordinate of its negative corner (in that
+	// same level's own voxel units).
 	FORCEINLINE FVoxelCoord ChunkOriginVoxel(const FVoxelChunkKey& Chunk)
 	{
 		return FVoxelCoord{
@@ -112,9 +168,20 @@ namespace VoxelCoords
 
 	// Render-chunk key -> world position (UU) of its negative corner; this is
 	// where a UVoxelChunkComponent for that chunk should sit (relative
-	// location, actor root at the world/voxel origin).
+	// location, actor root at the world/voxel origin). Level 0 only; see
+	// ChunkOriginWorldForLevel for higher mip levels.
 	FORCEINLINE FVector ChunkOriginWorld(const FVoxelChunkKey& Chunk)
 	{
 		return VoxelToWorldCorner(ChunkOriginVoxel(Chunk));
+	}
+
+	// Level-aware variant: scales the corner position by (1<<Level) since a
+	// level-L "voxel" spans that many level-0 voxels' worth of world space.
+	FORCEINLINE FVector ChunkOriginWorldForLevel(const FVoxelChunkKey& Chunk, int32 Level)
+	{
+		const double Scale = double(int64(1) << Level);
+		const FVoxelCoord Origin = ChunkOriginVoxel(Chunk);
+		return FVector(double(Origin.X) * VoxelSizeUU * Scale, double(Origin.Y) * VoxelSizeUU * Scale,
+		               double(Origin.Z) * VoxelSizeUU * Scale);
 	}
 }

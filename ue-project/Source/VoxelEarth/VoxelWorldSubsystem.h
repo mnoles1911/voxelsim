@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
+#include "VoxelCoords.h" // VoxelCoords::kNumLevels (ring preset table sizing) -- UE-only, voxel-core-free
 #include "VoxelDebug.h" // FVoxelPerfSnapshot -- plain POD, voxel-core-free (see VoxelDebug.h doctrine note)
 #include "VoxelWorldSubsystem.generated.h"
 
@@ -58,12 +59,32 @@ public:
 	// later milestone).
 	static constexpr uint64 DefaultSeed = 20260719;
 
-	// Stage 2 decisions table: streaming hysteresis ring radii (meters).
-	// Render chunks enter the desired set inside LoadRadiusMeters, leave it
-	// only once they cross UnloadRadiusMeters (the gap prevents load/unload
-	// flicker for an anchor sitting near a single threshold).
-	static constexpr double LoadRadiusMeters = 64.0;
-	static constexpr double UnloadRadiusMeters = 80.0;
+	// M2 first implementation wave (docs/m2-plan.md decisions table, "Ring
+	// structure" / "Ring streaming" rows): default ring preset, one annulus
+	// [InnerMeters, OuterMeters) per mip level -- R0 = true voxels (level 0,
+	// same radii as the original single-ring M1 behavior), R1-R4 = mip
+	// levels 1-4. A chunk leaves its level's desired set once it crosses
+	// OuterMeters*UnloadRingMultiplier (hysteresis on the outer edge only --
+	// see FVoxelWorldImpl::RecomputeDesiredSet doc comment for why the inner
+	// edge has none in this wave).
+	struct FRingPreset
+	{
+		double InnerMeters = 0.0;
+		double OuterMeters = 0.0;
+	};
+	static constexpr FRingPreset RingPresets[VoxelCoords::kNumLevels] = {
+		{0.0, 64.0},
+		{64.0, 128.0},
+		{128.0, 256.0},
+		{256.0, 512.0},
+		{512.0, 1024.0},
+	};
+	static constexpr double UnloadRingMultiplier = 1.25;
+
+	// Back-compat aliases (R0's radii; a handful of log lines still reference
+	// these by name -- unchanged numeric values from the pre-M2 single ring).
+	static constexpr double LoadRadiusMeters = RingPresets[0].OuterMeters;
+	static constexpr double UnloadRadiusMeters = RingPresets[0].OuterMeters * UnloadRingMultiplier;
 
 	// Stage 2 decisions table: dig/place raycast range.
 	static constexpr double DigPlaceRangeMeters = 8.0;
