@@ -20,6 +20,7 @@
 #include "VoxelEarthPlayerController.h"
 #include "VoxelEditRelay.h"
 #include "VoxelOceanActor.h"
+#include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
 
 namespace
@@ -309,13 +310,82 @@ void AVoxelEarthGameMode::BeginPlay()
 			FTimerDelegate::CreateWeakLambda(this,
 				[this]()
 				{
-					// Aim down toward the terrain well before capturing, on
-					// both the controller AND the pawn (belt and braces —
-					// the first capture attempt showed control rotation
-					// alone not reflected in the captured view).
-					APlayerController* PC = GetWorld()->GetFirstPlayerController();
-					if (PC)
+					UWorld* ShotWorld = GetWorld();
+					APlayerController* PC = ShotWorld ? ShotWorld->GetFirstPlayerController() : nullptr;
+
+					// W2 verification framing (task items 5a/5b): a v0 water
+					// pool/crater is only a few meters across -- easy to miss
+					// entirely at the default oblique terrain-survey angle
+					// from spawn height. When a water test switch drove this
+					// run, instead hover the pawn directly above the known
+					// pour/breach column and look close to straight down.
+					float Throwaway = 0.f;
+					const bool bSpawnWaterTestActive = FParse::Param(FCommandLine::Get(), TEXT("VoxelSpawnWaterTest")) ||
+					                                    FParse::Value(FCommandLine::Get(), TEXT("VoxelSpawnWaterTest="), Throwaway);
+					const bool bBreachTestActive = FParse::Param(FCommandLine::Get(), TEXT("VoxelBreachTest")) ||
+					                                FParse::Value(FCommandLine::Get(), TEXT("VoxelBreachTest="), Throwaway);
+
+					bool bOverheadFraming = false;
+					FVector OverheadColumnWorld = FVector::ZeroVector;
+					UVoxelWorldSubsystem* ShotTerrain = ShotWorld ? ShotWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					UVoxelWaterSubsystem* ShotWater = ShotWorld ? ShotWorld->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+
+					// Prefer the water body's ACTUAL centroid (wherever the
+					// CA's lateral spread/gravity actually settled it) over
+					// the pour/breach column it started from -- a pool can
+					// drift meters away from where it was poured before
+					// coming to rest, especially on sloped terrain.
+					if (ShotWater && (bSpawnWaterTestActive || bBreachTestActive) && ShotWater->GetStoredWaterCentroidUU(OverheadColumnWorld))
 					{
+						bOverheadFraming = true;
+					}
+					else if (ShotTerrain && bSpawnWaterTestActive)
+					{
+						OverheadColumnWorld = FVector(0.0, 0.0, ShotTerrain->GetSurfaceHeightUU(0.0, 0.0));
+						bOverheadFraming = true;
+					}
+					else if (ShotTerrain && bBreachTestActive)
+					{
+						// Same synchronous grid scan BeginPlay used to pick the
+						// breach column (duplicated here rather than threading
+						// BreachColumnWorldX/Y through -- this lambda is a
+						// separate closure defined earlier in BeginPlay than
+						// that block's local variables).
+						constexpr double ScanStepUU = 20000.0; // 200m grid step
+						constexpr int32 ScanRadiusSteps = 100; // +/- 20km around spawn
+						for (int32 Iy = -ScanRadiusSteps; Iy <= ScanRadiusSteps && !bOverheadFraming; ++Iy)
+						{
+							for (int32 Ix = -ScanRadiusSteps; Ix <= ScanRadiusSteps; ++Ix)
+							{
+								const double Wx = double(Ix) * ScanStepUU;
+								const double Wy = double(Iy) * ScanStepUU;
+								const double SurfUU = ShotTerrain->GetSurfaceHeightUU(Wx, Wy);
+								if (SurfUU < 0.0)
+								{
+									OverheadColumnWorld = FVector(Wx, Wy, SurfUU);
+									bOverheadFraming = true;
+									break;
+								}
+							}
+						}
+					}
+
+					if (bOverheadFraming && PC)
+					{
+						constexpr double HoverHeightAboveUU = 1500.0; // 15m: fills frame, clears splash geometry
+						if (APawn* P = PC->GetPawn())
+						{
+							P->SetActorLocation(OverheadColumnWorld + FVector(0.0, 0.0, HoverHeightAboveUU));
+							P->SetActorRotation(FRotator(-85.f, 0.f, 0.f));
+						}
+						PC->SetControlRotation(FRotator(-85.f, 0.f, 0.f));
+					}
+					else if (PC)
+					{
+						// Aim down toward the terrain well before capturing, on
+						// both the controller AND the pawn (belt and braces -
+						// the first capture attempt showed control rotation
+						// alone not reflected in the captured view).
 						PC->SetControlRotation(FRotator(-40.f, 45.f, 0.f));
 						if (APawn* P = PC->GetPawn())
 						{
@@ -350,6 +420,172 @@ void AVoxelEarthGameMode::BeginPlay()
 						6.f, false);
 				}),
 			DelaySeconds, false);
+	}
+
+	// W2 verification (task item 5a): -VoxelSpawnWaterTest[=<delaySeconds>]
+	// (default 20s) pours a water pool above the spawn column, logs the
+	// ledger volume + digest at pour time, then again ~15s later as a
+	// settle-check (active bricks should trend toward 0 as the pool flattens
+	// and rests). Combine with -VoxelScreenshotAfter=<seconds> (a larger
+	// value than this delay) for a visual capture of the pool.
+	float SpawnWaterTestDelaySeconds = 20.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelSpawnWaterTest="), SpawnWaterTestDelaySeconds) ||
+	    FParse::Param(FCommandLine::Get(), TEXT("VoxelSpawnWaterTest")))
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSpawnWaterTest: pouring a water pool near spawn in %.1fs"), SpawnWaterTestDelaySeconds);
+		GetWorldTimerManager().SetTimer(
+			SpawnWaterTestTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this]()
+				{
+					UWorld* PourWorld = GetWorld();
+					UVoxelWorldSubsystem* Terrain = PourWorld ? PourWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					UVoxelWaterSubsystem* Water = PourWorld ? PourWorld->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+					if (!Terrain || !Water)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelSpawnWaterTest: subsystems not ready, skipping."));
+						return;
+					}
+
+					// 30,000 fill units ~= 118 full voxels' worth (255 each).
+					// Verification testing found the v0 mesher's fill>=128
+					// visibility threshold (task item 4) matters here: a
+					// SMALL pour (e.g. 3,000 units) spreads thin enough over
+					// an open, gently-sloped surface that every settled
+					// cell's fill stays under 128 (observed maxFill=11 for a
+					// 3,000-unit pour) -- CA-correct (volume conserved,
+					// settles to 0 active bricks) but invisible, since there
+					// is no boundary to mesh a face at. 30,000 keeps enough
+					// of the pour concentrated near the pour column to stay
+					// above the meshing threshold while it settles. Poured
+					// 5m above the (0,0) spawn column's surface so it falls
+					// and pools under gravity + lateral equalization.
+					constexpr uint32 PourAmount = 30000;
+					const double SurfaceUU = Terrain->GetSurfaceHeightUU(0.0, 0.0);
+					const FVector PourLoc(0.0, 0.0, SurfaceUU + 500.0);
+					const uint32 Placed = Water->SpawnWaterAt(PourLoc, PourAmount);
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelSpawnWaterTest: poured %u/%u fill units at (0,0,%.0f); ledger volume=%llu digest=0x%016llX"),
+					       Placed, PourAmount, PourLoc.Z, (unsigned long long)Water->GetPerfSnapshot().TotalVolume,
+					       (unsigned long long)Water->GetWaterDigest());
+
+					GetWorldTimerManager().SetTimer(
+						SpawnWaterTestSettleTimerHandle,
+						FTimerDelegate::CreateWeakLambda(this,
+							[this]()
+							{
+								UWorld* SettleWorld = GetWorld();
+								UVoxelWaterSubsystem* SettleWater = SettleWorld ? SettleWorld->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+								if (!SettleWater)
+								{
+									return;
+								}
+								const FVoxelWaterPerfSnapshot Snap = SettleWater->GetPerfSnapshot();
+								UE_LOG(LogVoxelEarth, Log,
+								       TEXT("VoxelSpawnWaterTest settle-check: activeBricks=%lld storedBricks=%lld volume=%llu ")
+								       TEXT("maxFill=%d digest=0x%016llX"),
+								       Snap.ActiveBricks, Snap.StoredBricks, (unsigned long long)Snap.TotalVolume,
+								       SettleWater->GetMaxStoredFill(), (unsigned long long)SettleWater->GetWaterDigest());
+							}),
+						45.f, false);
+				}),
+			SpawnWaterTestDelaySeconds, false);
+	}
+
+	// W2 verification (task item 5b): -VoxelBreachTest[=<delaySeconds>]
+	// (default 20s) scans a grid around spawn RIGHT NOW (BeginPlay, so the
+	// chosen spot is logged before the delayed carve, not racing streaming)
+	// for a column whose surface elevation is already below sea level (an
+	// offshore seabed column -- the implicit ocean's non-solid z<0 cells
+	// already sit directly above it) via UVoxelWorldSubsystem::
+	// GetSurfaceHeightUU (a pure, cheap query safe to call this early). Once
+	// found, carving a sphere centered AT that surface exposes solid voxels
+	// whose neighbors are already open water, satisfying
+	// UVoxelWaterSubsystem::NotifyTerrainVoxelsCleared's breach condition --
+	// the crater floods from the Reservoir v0 boundary cells this carve
+	// creates.
+	float BreachTestDelaySeconds = 20.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelBreachTest="), BreachTestDelaySeconds) ||
+	    FParse::Param(FCommandLine::Get(), TEXT("VoxelBreachTest")))
+	{
+		UVoxelWorldSubsystem* Terrain = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+		bool bFoundBreachColumn = false;
+		double BreachColumnWorldX = 0.0, BreachColumnWorldY = 0.0;
+		if (Terrain)
+		{
+			constexpr double ScanStepUU = 20000.0; // 200m grid step
+			constexpr int32 ScanRadiusSteps = 100; // +/- 20km around spawn
+			for (int32 Iy = -ScanRadiusSteps; Iy <= ScanRadiusSteps && !bFoundBreachColumn; ++Iy)
+			{
+				for (int32 Ix = -ScanRadiusSteps; Ix <= ScanRadiusSteps; ++Ix)
+				{
+					const double Wx = double(Ix) * ScanStepUU;
+					const double Wy = double(Iy) * ScanStepUU;
+					if (Terrain->GetSurfaceHeightUU(Wx, Wy) < 0.0)
+					{
+						BreachColumnWorldX = Wx;
+						BreachColumnWorldY = Wy;
+						bFoundBreachColumn = true;
+						break;
+					}
+				}
+			}
+		}
+
+		if (!bFoundBreachColumn)
+		{
+			UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelBreachTest: no below-sea-level column found within the scan radius -- test skipped."));
+		}
+		else
+		{
+			UE_LOG(LogVoxelEarth, Log, TEXT("VoxelBreachTest: chosen column (%.1f, %.1f) m, surface %.2f m below sea level; carving in %.1fs"),
+			       BreachColumnWorldX / 100.0, BreachColumnWorldY / 100.0, -Terrain->GetSurfaceHeightUU(BreachColumnWorldX, BreachColumnWorldY) / 100.0,
+			       BreachTestDelaySeconds);
+			GetWorldTimerManager().SetTimer(
+				BreachTestTimerHandle,
+				FTimerDelegate::CreateWeakLambda(this,
+					[this, BreachColumnWorldX, BreachColumnWorldY]()
+					{
+						UWorld* CarveWorld = GetWorld();
+						UVoxelWorldSubsystem* CarveTerrain = CarveWorld ? CarveWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+						UVoxelWaterSubsystem* CarveWater = CarveWorld ? CarveWorld->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+						if (!CarveTerrain || !CarveWater)
+						{
+							UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelBreachTest: subsystems not ready, skipping."));
+							return;
+						}
+						const double SurfUU = CarveTerrain->GetSurfaceHeightUU(BreachColumnWorldX, BreachColumnWorldY);
+						const FVector Center(BreachColumnWorldX, BreachColumnWorldY, SurfUU);
+						constexpr double RadiusUU = 600.0; // 6m
+						constexpr double JitterUU = 100.0; // 1m
+						const int32 Removed = CarveTerrain->CarveSphere(Center, RadiusUU, JitterUU);
+						UE_LOG(LogVoxelEarth, Log,
+						       TEXT("VoxelBreachTest: carved %d voxels at (%.0f,%.0f,%.0f) -- watch for 'Dig breach' log lines ")
+						       TEXT("(LogVoxelWater)"),
+						       Removed, Center.X, Center.Y, Center.Z);
+
+						GetWorldTimerManager().SetTimer(
+							BreachTestSettleTimerHandle,
+							FTimerDelegate::CreateWeakLambda(this,
+								[this]()
+								{
+									UWorld* SettleWorld = GetWorld();
+									UVoxelWaterSubsystem* SettleWater = SettleWorld ? SettleWorld->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+									if (!SettleWater)
+									{
+										return;
+									}
+									const FVoxelWaterPerfSnapshot Snap = SettleWater->GetPerfSnapshot();
+									UE_LOG(LogVoxelEarth, Log,
+									       TEXT("VoxelBreachTest settle-check: activeBricks=%lld storedBricks=%lld volume=%llu ")
+									       TEXT("maxFill=%d digest=0x%016llX"),
+									       Snap.ActiveBricks, Snap.StoredBricks, (unsigned long long)Snap.TotalVolume,
+									       SettleWater->GetMaxStoredFill(), (unsigned long long)SettleWater->GetWaterDigest());
+								}),
+							25.f, false);
+					}),
+				BreachTestDelaySeconds, false);
+		}
 	}
 }
 

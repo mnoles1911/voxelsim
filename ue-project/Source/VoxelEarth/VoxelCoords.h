@@ -63,7 +63,20 @@ namespace VoxelCoords
 	struct FVoxelCoord
 	{
 		int64 X = 0, Y = 0, Z = 0;
+
+		friend bool operator==(const FVoxelCoord&, const FVoxelCoord&) = default;
 	};
+
+	// W2 water groundwork: hashable so a TSet<FVoxelCoord>/TMap<FVoxelCoord, ...>
+	// can key both actual voxel coordinates (dig-breach candidate cells) and,
+	// where documented at the call site, water-brick-grid coordinates (the
+	// same plain int64x3 shape, just a different lattice scale) -- reusing
+	// this one type avoids a second near-identical struct for the water
+	// subsystem, which stays voxel-core-free like everything else here.
+	FORCEINLINE uint32 GetTypeHash(const FVoxelCoord& Coord)
+	{
+		return HashCombine(HashCombine(::GetTypeHash(Coord.X), ::GetTypeHash(Coord.Y)), ::GetTypeHash(Coord.Z));
+	}
 
 	// Render-chunk coordinates: one chunk = ChunkEdgeVoxels^3 voxels
 	// (matches vxc::BrickKey scaled up by ChunkEdgeBricks). Level-relative:

@@ -24,6 +24,10 @@
 VOXELEARTH_API DECLARE_LOG_CATEGORY_EXTERN(LogVoxelStream, Log, All);
 VOXELEARTH_API DECLARE_LOG_CATEGORY_EXTERN(LogVoxelEdit, Log, All);
 VOXELEARTH_API DECLARE_LOG_CATEGORY_EXTERN(LogVoxelPerf, Log, All);
+// W2 (docs/debug-tooling-plan.md P3 "log split" extension): the pressure CA
+// tick, breach/reservoir seeding, and replication plumbing get their own
+// category so water verbosity can be toggled independently of terrain's.
+VOXELEARTH_API DECLARE_LOG_CATEGORY_EXTERN(LogVoxelWater, Log, All);
 
 // --- stat VoxelEarth group (P1 "Stats group") -------------------------------
 
@@ -114,6 +118,18 @@ namespace VoxelDebug
 	// rather than a separately-tunable cvar that could drift from what the
 	// client itself enforces).
 	VOXELEARTH_API float GetServerMaxCarveRadiusUU();
+
+	// --- voxel.Water.* (W2, docs/voxel-earth-implementation-plan.md SS3.7) ---
+
+	// voxel.Water.MaxActiveBricks: advisory budget (default 4096) on the
+	// number of active vxc::WaterCA bricks a single fixed-step tick may
+	// process (WaterCA::steppedBrickCount() after step()). The CA's tick
+	// contract (voxelcore/waterca.h) processes its whole active-set snapshot
+	// atomically -- there is no mid-step cutoff that wouldn't break volume
+	// conservation/determinism -- so this is a monitoring threshold, not a
+	// hard clamp: UVoxelWaterSubsystem logs a throttled warning when exceeded
+	// (task spec: "do not explode") rather than truncating the tick.
+	VOXELEARTH_API int32 GetWaterMaxActiveBricks();
 }
 
 // --- Perf HUD data (P1 "Perf HUD") ------------------------------------------
@@ -188,4 +204,39 @@ struct FVoxelPerfSnapshot
 	uint64 QuadsEmitted = 0;
 	uint64 EditsApplied = 0;
 	uint64 ColumnEvals = 0;
+};
+
+// W2 (docs/debug-tooling-plan.md P3 "Water (future)" row, now landed):
+// published once per second by UVoxelWaterSubsystem (mirrors
+// FVoxelPerfSnapshot's cadence/shape convention) and read by AVoxelEarthHUD's
+// mode>=1 rows. Plain POD, no vxc:: types (same doctrine as FVoxelPerfSnapshot
+// above) -- UVoxelWaterSubsystem.h is voxel-core-free by PImpl, exactly like
+// UVoxelWorldSubsystem.h.
+struct FVoxelWaterPerfSnapshot
+{
+	// vxc::WaterCA::activeBrickCount() / storedBrickCount() as of the last
+	// fixed-step tick this second.
+	int64 ActiveBricks = 0;
+	int64 StoredBricks = 0;
+	// vxc::WaterCA::totalVolume() (fill units; 255 = one full voxel).
+	uint64 TotalVolume = 0;
+	// Fixed-step CA ticks actually executed in the last 1s window (target
+	// 10Hz; less if a frame hitch ate into the accumulator's iteration cap).
+	float StepsPerSec = 0.f;
+	// Most recent step()'s steppedBrickCount() -- the number the
+	// voxel.Water.MaxActiveBricks budget check above compares against.
+	int64 LastSteppedBrickCount = 0;
+	// Replication plumbing (v1, authority only): bytes/sec actually pushed
+	// through AVoxelEditRelay::MulticastWaterDiffs over the last window.
+	float ReplicatedBytesPerSec = 0.f;
+	// Reservoir v0 (docs/voxel-earth-implementation-plan.md SS3.7): number of
+	// registered breach-boundary cells continuously topped up to 255/tick.
+	int32 ReservoirCells = 0;
+
+	// Wall-clock ms UVoxelWaterSubsystem::Tick() spent this frame (fixed-step
+	// CA stepping + re-mesh + replication broadcast, whichever ran) -- the
+	// number the task spec's perf budget ("<2ms/frame at v0 scale") is
+	// measured against. Always fresh (not gated behind the 1Hz refresh),
+	// same convention as FVoxelPerfSnapshot::SubsystemTickMs.
+	float TickMs = 0.f;
 };
