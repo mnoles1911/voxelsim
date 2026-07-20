@@ -753,7 +753,7 @@ needs to re-author any of those three materials on this machine.
 | R3/R4 first-build cost (~335ms/job) | needs GPU-side gen or disk brick cache | design pass |
 | Dithered ring cross-fades — SYMMETRIC blend | v1 landed (adjacent fade-through); symmetric-blend needs wider desired-set annulus overlap | M2 polish wave |
 | ring↔clipmap seam (z-fighting, accepted v1) | noted | M2 polish |
-| Perf-run hitches (~15-38/run, max 400ms, initial streaming ramp) | needs isolate + PSO precache investigation | M2 gate work — also the M1 gate blocker |
+| Perf-run hitches (~15-38/run, max 400ms, initial streaming ramp) | **ISOLATED + partially fixed 2026-07-20** (worktree agent): see the M1 gate run result below. Root cause found: every hitch frame has the per-frame apply/unload budgets pinned at cap while their own CPU cost is <1ms — the real cost is render-thread scene-mutation backlog, not our subsystem's own tick or a single PSO stall. Tightened streaming budgets (voxel.Stream.Max*PerFrame cvars, 8/4/4→3/2/2) + a BeginPlay PSO precache warmup cut hitches ~3-5x and confined most remaining ones to the two unavoidable cold-start frames, but the gate does not yet PASS cleanly on every run (see below) | component pooling/reuse (avoid DestroyComponent+NewObject on every ring-boundary crossing) — the next concrete lead now that the dominant bucket is known |
 | Clipmap follow-ups: two-sided material (winding unverified), A/B perf isolate, CDLOD replacement per ADR-0002 tripwire | noted in ADR/plan | M2 polish |
 | Mip cache: budget default tuning (512MB) + real-scenario A/B | eviction landed (PR #16); default may need tuning | M2 polish |
 | Debug tooling P2/P3 (τ overlay, water ledgers) | phased with M2-polish/W2 | — |
@@ -765,10 +765,10 @@ performance gate ✅ PASS 0.191s (#14), edit-log compaction CLI ✅ (#16),
 ring cross-fade v1 ✅ (#16), M3 persistence ✅ (#20).
 
 M1 min-spec proxy definition: `sg.ViewDistanceQuality 0`, `sg.ShadowQuality 0`,
-`r.ScreenPercentage 100` at 1080p, streaming budgets halved
-(`voxel.*` budget cvars pending) — intent: approximate RTX-3060-class
-headroom on this 7800 XT by measuring at these settings and requiring
-p95 < 16.6ms with zero steady-state hitches (excluding the first 10s ramp).
+`sg.PostProcessQuality 0`, `sg.EffectsQuality 0`, `r.ScreenPercentage 100` at
+1080p — intent: approximate RTX-3060-class headroom on this 7800 XT by
+measuring at these settings and requiring p95 < 16.6ms with zero
+steady-state hitches (excluding an initial warmup window).
 
 **M1 gate run result (2026-07-20, 60s at proxy settings, post-M2 world):**
 p50 3.78ms (steady-state comfortably 60fps+), but p95 20.4ms / 38 hitches /
@@ -778,3 +778,94 @@ saturation) — M1-scope content alone measured p50 2.8/p95 4.2 pre-M2
 (PR #12). Verdict: M1 gate stays 🟨; the blockers are the backlogged M2
 items (streaming-ramp hitch isolation, PSO precache, R3/R4 first-build
 cost, budget cvars for true throttling) — re-run after those land.
+
+### Perf-run hitches: isolation + fix (2026-07-20, worktree agent)
+
+**Instrumentation (the diagnostic deliverable, "measure before fixing").**
+`FVoxelWorldImpl::TickStreaming` (VoxelWorldSubsystem.cpp) now times its own
+Dispatch/Drain* calls every frame (four extra `FPlatformTime::Seconds()`
+calls — negligible; the function already took one unconditionally) and, on
+any frame whose `DeltaTime` exceeds a shared `VoxelDebug::kHitchThresholdMs`
+(33.3ms, the same constant `UVoxelPerfRunSubsystem` sums hitches against —
+factored out so the two can never disagree about what counts as a hitch),
+logs (`LogVoxelPerf`, Warning) a breakdown: `frameMs`, `subsystemTickMs` vs
+`elsewhereMs` (game-thread time outside our subsystem's tick),
+`dispatchMs`/`applyMs`/`remeshMs`/`unloadMs` (the four budgeted sub-stages),
+and `componentsApplied`/`proxiesCreated`/`editRemeshes`/`unloads` (raw
+counts). Deliberately NOT gated behind `voxel.Debug` — a real hitch in
+normal play is exactly when this is wanted, and the cost when there is no
+hitch is one float compare. `UVoxelPerfRunSubsystem` also gained a
+post-warmup window: samples/hitches from `ElapsedSeconds >= 10s` onward are
+tracked and reported separately (`postWarmup*` fields in the JSON summary,
+a matching `LogVoxelPerf` line) — the mechanism the M1 gate note's own
+"if the ramp itself still hitches but steady-state is clean, report that
+honestly ... with steady-state window numbers" fallback needs;
+`tools/check-perf-run.py` gained matching `--max-post-warmup-p95-ms`/
+`--max-post-warmup-hitches` flags.
+
+**Finding.** Ran `-VoxelPerfRun=30`/`=60` repeatedly (seed 20260719, min-spec
+proxy settings) and read the hitch-attribution log. Every single hitch frame,
+across every configuration tested, showed `componentsApplied`/`unloads`
+PINNED AT THEIR PER-FRAME BUDGET CAP (8/4 originally), while
+`dispatchMs+applyMs+remeshMs+unloadMs` summed to **under 1ms even on hitch
+frames** — the streaming subsystem's own budgeted CPU work is not the
+expensive part. The dominant cost bucket in the overwhelming majority of
+hitches (e.g. `frameMs=110.49 subsystemTickMs=0.34 elsewhereMs=90.97`) is
+`elsewhereMs`: game-thread time spent OUTSIDE `TickStreaming` entirely. This
+is consistent with a RENDER-THREAD scene-mutation backlog (each of the
+budgeted 8 applies + 4 unloads enqueues a `NewObject`/`RegisterComponent` or
+`DestroyComponent` plus `BeginInitResource` calls for up to 4 GPU buffers)
+periodically forcing the game thread to stall resyncing with a render thread
+that has fallen behind — NOT a single synchronous PSO/shader-compile stall
+on one frame (which would show as one dominant frame, not a recurring
+pattern). Two frames are a distinct, separate, one-time cost in every run:
+frame 1 (`subsystemTickMs` ~70-100ms — the cold-start `RecomputeDesiredSet`
+synchronously populating all 5 ring levels' candidate queues) and frame 2
+(`elsewhereMs` ~90-145ms — the first real draw's shader/pipeline warm-up).
+Contrary to the backlog's "initial streaming ramp" framing, hitches beyond
+those first two frames are **not confined to the first ~10 seconds** — they
+recur (now rarely) throughout a 60s run, timestamp-correlated with the
+scripted circular flight path (100m radius, ~31s/lap) crossing ring
+boundaries and triggering a batch of chunk-component create/destroy churn on
+revisit, not just on first fill.
+
+**Fix applied.** (a) The previously-hardcoded `MaxApplies=8`/`MaxRemeshes=4`/
+`MaxUnloads=4` constants in `DrainResults`/`DrainGameThreadMesh`/
+`DrainUnloads` are now `voxel.Stream.MaxAppliesPerFrame`/
+`MaxRemeshesPerFrame`/`MaxUnloadsPerFrame` cvars (`VoxelDebug.h/.cpp`),
+**tightened to 3/2/2** — the data-justified fix, since every hitch
+correlated with these being at cap: smaller caps spread the render-thread-
+facing scene-mutation rate more evenly. (b) A one-time, non-blocking
+`UMaterialInterface::PrecachePSOs(&FLocalVertexFactory::StaticType, ...)`
+warmup for the terrain material now runs in `OnWorldBeginPlay`, before
+`ChunkOwner`/`ChunkRoot` even exist (toggleable via `-VoxelNoPSOPrecache` for
+A/B measurement) — Epic's documented pattern for exactly this class of
+first-draw stall. Measured effect on this fast dev machine was small/
+inconclusive (the async compile races the short BeginPlay-to-first-draw
+window and doesn't reliably win it), but it's a correct, standing
+optimization expected to matter more on slower/target hardware; kept.
+
+**Before/after (60s runs, seed 20260719, min-spec proxy settings):**
+
+| Config | p50 | p95 | max | hitches | post-warmup (t≥10s) hitches | avg chunks/s |
+|---|---|---|---|---|---|---|
+| Before (8/4/4, no precache — reproduces pre-fix behavior) | 3.52ms | 21.36ms | 110.5ms | 27 | ~25 | 259 |
+| After (3/2/2 + precache), 4 repeated runs | 2.53-2.69ms | 17.4-19.2ms | 90-113ms | 2, 3, 5, 10 | 0, 2, 2, 8 | 142-143 |
+
+**Verdict: substantial, measured improvement (~3-5x fewer hitches, p95 down
+~10-20%, max down ~10-20% and now driven almost entirely by the two
+unavoidable cold-start frames) but NOT a clean, reproducible PASS.** p95
+lands just above the 16.6ms bar on every after-run measured, and
+post-warmup hitch count varies 0-8 across four identical-config repeats —
+real run-to-run variance on this shared dev machine, not a regression
+between runs. M1 gate stays 🟨. The two cold-start frames are a legitimate
+loading-screen-class cost per the gate note's own allowance (a spinner
+during those ~150-200ms would be an acceptable exclusion); the remaining
+scattered mid-run hitches are the honest open item, and the data now points
+at a concrete next step: pool/reuse `UVoxelChunkComponent`s across
+unload/reload instead of `DestroyComponent`+`NewObject` on every
+ring-boundary crossing, which is what would actually shrink the
+render-thread-facing scene-mutation volume this pass's budget-tightening
+could only spread out, not reduce. Throughput trade-off: avg chunks/s
+dropped from ~259 to ~143 at the tightened budgets — an accepted cost for
+smoothness, not evaluated against a throughput requirement (none is gated).

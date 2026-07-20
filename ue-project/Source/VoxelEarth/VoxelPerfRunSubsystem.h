@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
+#include "VoxelDebug.h" // VoxelDebug::kHitchThresholdMs -- shared hitch-frame threshold
 #include "VoxelPerfRunSubsystem.generated.h"
 
 // docs/debug-tooling-plan.md P1 "Regression harness (the gates, automated)":
@@ -59,10 +60,25 @@ private:
 	static constexpr double HeightAboveSurfaceUU = 3000.0; // surface + 30m
 	static constexpr double YawSweepDegPerSec = 60.0;
 
-	static constexpr float HitchThresholdMs = 33.3f; // >30fps frame budget
+	// Shared with FVoxelWorldImpl::TickStreaming's per-frame hitch-attribution
+	// log (VoxelDebug.h) so both never disagree about which frames count as a
+	// hitch (docs/status.md "Perf-run hitches" isolation task).
+	static constexpr float HitchThresholdMs = VoxelDebug::kHitchThresholdMs;
+
+	// docs/status.md "Perf-run hitches" isolation task / M1 gate note: "if the
+	// ramp itself still hitches but steady-state is clean, report that
+	// honestly ... with the steady-state window numbers proving it." Frames
+	// with ElapsedSeconds >= this are also folded into a SEPARATE
+	// post-warmup sample set (below), reported as its own p95/hitch-count in
+	// the JSON summary/log -- this is what lets a "cold-start-only" hitch
+	// pattern be told apart from a genuine, ongoing steady-state one without
+	// re-running anything.
+	static constexpr float WarmupExcludeSeconds = 10.0f;
 
 	TArray<float> FrameMsSamples;
 	int32 HitchCount = 0;
+	TArray<float> PostWarmupFrameMsSamples;
+	int32 PostWarmupHitchCount = 0;
 	float BudgetSaturationAccum = 0.f;
 	int32 BudgetSaturationSamples = 0;
 };
