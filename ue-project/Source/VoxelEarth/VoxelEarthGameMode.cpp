@@ -15,6 +15,7 @@
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
 #include "VoxelEarthFlyPawn.h"
+#include "VoxelClipmapActor.h"
 #include "VoxelEarthHUD.h"
 #include "VoxelEarthPlayerController.h"
 #include "VoxelOceanActor.h"
@@ -66,6 +67,11 @@ void AVoxelEarthGameMode::BeginPlay()
 		// SS4): same "no authored map, spawn from code" reasoning as the
 		// light rig above -- the ocean actor is editor-independent.
 		World->SpawnActor<AVoxelOceanActor>();
+
+		// M2 Band 3 first slice (docs/m2-plan.md): same "no authored map,
+		// spawn from code" reasoning -- the heightmap clipmap extends
+		// terrain from the ring cascade's edge (~1km) out to ~30km.
+		World->SpawnActor<AVoxelClipmapActor>();
 	}
 
 	// M2 ring debug verification (docs/m2-plan.md first implementation wave
@@ -228,7 +234,8 @@ void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 		return;
 	}
 
-	constexpr double SpawnHeightAboveSurfaceUU = 500.0; // +5m (1 UU = 1 cm)
+	constexpr double DefaultSpawnHeightAboveSurfaceUU = 500.0; // +5m (1 UU = 1 cm)
+	double SpawnHeightAboveSurfaceUU = DefaultSpawnHeightAboveSurfaceUU;
 
 	// -VoxelSpawnAt=X,Y (meters, world): stage 3c LWC verification switch --
 	// overrides the spawn column with the same surface-height-query-plus-5m
@@ -260,6 +267,19 @@ void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 			UE_LOG(LogVoxelEarth, Warning,
 			       TEXT("-VoxelSpawnAt=%s malformed (expected X,Y in meters); falling back to (0,0)."), *SpawnAtArg);
 		}
+	}
+
+	// -VoxelCameraHigh=<meters>: M2 Band 3 verification switch (docs/m2-plan.md
+	// "Verification" row) -- a summit-level ground spawn can't see the 30km
+	// clipmap well, so this spawns the pawn N meters above the surface
+	// instead of the default +5m, giving a vista screenshot that actually
+	// shows rings near / clipmap far / ocean beyond coastlines. No effect
+	// unless passed explicitly.
+	float CameraHighMeters = 0.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelCameraHigh="), CameraHighMeters) && CameraHighMeters > 0.f)
+	{
+		SpawnHeightAboveSurfaceUU = double(CameraHighMeters) * 100.0; // meters -> UU
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCameraHigh override: spawning %.0fm above the surface"), CameraHighMeters);
 	}
 
 	const double SurfaceUU = Subsystem->GetSurfaceHeightUU(SpawnWorldX, SpawnWorldY);

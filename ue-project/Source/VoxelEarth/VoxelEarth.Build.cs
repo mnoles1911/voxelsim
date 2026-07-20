@@ -30,7 +30,14 @@ public class VoxelEarth : ModuleRules
 			"EngineCameras"
 		});
 
-		PrivateDependencyModuleNames.AddRange(new string[] { });
+		PrivateDependencyModuleNames.AddRange(new string[]
+		{
+			// M2 Band 3 first slice (docs/m2-plan.md, AVoxelClipmapActor):
+			// PRAGMATIC EXCEPTION to the "no PMC" doctrine (that rule targets
+			// the voxel rendering path, not a conventional heightmap clipmap
+			// -- see VoxelClipmapActor.h's class comment).
+			"ProceduralMeshComponent"
+		});
 
 		// voxel-core: engine-agnostic, UE-header-free C++20 static library.
 		string VoxelCoreRoot = Path.Combine(ModuleDirectory, "..", "..", "..", "voxel-core");
