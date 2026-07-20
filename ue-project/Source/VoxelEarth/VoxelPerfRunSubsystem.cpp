@@ -106,6 +106,19 @@ void UVoxelPerfRunSubsystem::Tick(float DeltaTime)
 		++HitchCount;
 	}
 
+	// Post-warmup window (see WarmupExcludeSeconds's doc comment): gated on
+	// ElapsedSeconds as of the START of this frame (before it's advanced at
+	// the bottom of this function) -- a one-frame fuzziness on a 10s cutoff
+	// is immaterial.
+	if (ElapsedSeconds >= WarmupExcludeSeconds)
+	{
+		PostWarmupFrameMsSamples.Add(FrameMs);
+		if (FrameMs > HitchThresholdMs)
+		{
+			++PostWarmupHitchCount;
+		}
+	}
+
 	if (UVoxelWorldSubsystem* Subsystem = World->GetSubsystem<UVoxelWorldSubsystem>())
 	{
 		BudgetSaturationAccum += Subsystem->GetPerfSnapshot().BudgetSaturationPct;
@@ -163,6 +176,16 @@ void UVoxelPerfRunSubsystem::FinishRun()
 	const float P95 = N > 0 ? Sorted[FMath::Clamp(int32(N * 0.95f), 0, N - 1)] : 0.f;
 	const float Max = N > 0 ? Sorted.Last() : 0.f;
 
+	// Post-warmup window (see WarmupExcludeSeconds's doc comment) -- same
+	// percentile math, over only the samples from ElapsedSeconds >=
+	// WarmupExcludeSeconds onward.
+	TArray<float> PostWarmupSorted = PostWarmupFrameMsSamples;
+	PostWarmupSorted.Sort();
+	const int32 PostWarmupN = PostWarmupSorted.Num();
+	const float PostWarmupP50 = PostWarmupN > 0 ? PostWarmupSorted[FMath::Clamp(int32(PostWarmupN * 0.50f), 0, PostWarmupN - 1)] : 0.f;
+	const float PostWarmupP95 = PostWarmupN > 0 ? PostWarmupSorted[FMath::Clamp(int32(PostWarmupN * 0.95f), 0, PostWarmupN - 1)] : 0.f;
+	const float PostWarmupMax = PostWarmupN > 0 ? PostWarmupSorted.Last() : 0.f;
+
 	int64 ChunksLoaded = 0;
 	if (UWorld* World = GetWorld())
 	{
@@ -193,10 +216,16 @@ void UVoxelPerfRunSubsystem::FinishRun()
 		TEXT("  \"hitchThresholdMs\": %.1f,\n")
 		TEXT("  \"chunksLoaded\": %lld,\n")
 		TEXT("  \"avgChunksPerSec\": %.2f,\n")
-		TEXT("  \"avgBudgetSaturationPct\": %.2f\n")
+		TEXT("  \"avgBudgetSaturationPct\": %.2f,\n")
+		TEXT("  \"warmupExcludeSeconds\": %.1f,\n")
+		TEXT("  \"postWarmupFrameCount\": %d,\n")
+		TEXT("  \"postWarmupP50FrameMs\": %.3f,\n")
+		TEXT("  \"postWarmupP95FrameMs\": %.3f,\n")
+		TEXT("  \"postWarmupMaxFrameMs\": %.3f,\n")
+		TEXT("  \"postWarmupHitchCount\": %d\n")
 		TEXT("}\n"),
 		DurationSeconds, N, P50, P95, Max, HitchCount, HitchThresholdMs, (long long)ChunksLoaded, AvgChunksPerSec,
-		AvgBudgetSaturationPct);
+		AvgBudgetSaturationPct, WarmupExcludeSeconds, PostWarmupN, PostWarmupP50, PostWarmupP95, PostWarmupMax, PostWarmupHitchCount);
 
 	FFileHelper::SaveStringToFile(Json, *OutPath);
 
@@ -204,6 +233,10 @@ void UVoxelPerfRunSubsystem::FinishRun()
 	       TEXT("VoxelPerfRun complete: frames=%d p50=%.2fms p95=%.2fms max=%.2fms hitches=%d chunksLoaded=%lld ")
 	       TEXT("avgChunks/s=%.2f budgetSat=%.1f%% -- wrote %s"),
 	       N, P50, P95, Max, HitchCount, (long long)ChunksLoaded, AvgChunksPerSec, AvgBudgetSaturationPct, *OutPath);
+
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("VoxelPerfRun post-warmup (t>=%.0fs): frames=%d p50=%.2fms p95=%.2fms max=%.2fms hitches=%d"), WarmupExcludeSeconds,
+	       PostWarmupN, PostWarmupP50, PostWarmupP95, PostWarmupMax, PostWarmupHitchCount);
 
 	FPlatformMisc::RequestExit(/*bForce*/ false);
 }

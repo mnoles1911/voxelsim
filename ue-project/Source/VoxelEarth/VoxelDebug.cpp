@@ -69,6 +69,32 @@ TAutoConsoleVariable<int32> CVarVoxelWaterMaxActiveBricks(
 	TEXT("without breaking conservation/determinism), so exceeding this only logs a throttled warning -- see ")
 	TEXT("UVoxelWaterSubsystem::TickWater."),
 	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarVoxelStreamMaxAppliesPerFrame(
+	TEXT("voxel.Stream.MaxAppliesPerFrame"),
+	3,
+	TEXT("Hitch isolation (docs/status.md 'Perf-run hitches'): max worker-mesh-result chunk-component applies ")
+	TEXT("(FVoxelWorldImpl::DrainResults) per frame. Lower to smooth proxy-creation/scene-mutation cost more evenly ")
+	TEXT("across frames. Was a compile-time constant of 8 (docs/m1-plan.md Stage 2); measured 2026-07-20 ")
+	TEXT("(-VoxelPerfRun hitch-attribution log) that EVERY hitch frame had this budget pinned at its cap, with the ")
+	TEXT("actual cost surfacing later as game-thread time OUTSIDE the subsystem tick (render-thread scene-mutation ")
+	TEXT("backlog) rather than in DrainResults itself -- tightened to 3 to spread that load thinner (steady-state ")
+	TEXT("hitches ~27->0-1 per 60s run at this value; see the M1 gate row in docs/status.md for the full trade)."),
+	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarVoxelStreamMaxRemeshesPerFrame(
+	TEXT("voxel.Stream.MaxRemeshesPerFrame"),
+	2,
+	TEXT("Hitch isolation: max game-thread overlay-aware edit re-meshes (FVoxelWorldImpl::DrainGameThreadMesh) per ")
+	TEXT("frame. Was a compile-time constant of 4; tightened to 2 alongside MaxAppliesPerFrame (see its comment)."),
+	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarVoxelStreamMaxUnloadsPerFrame(
+	TEXT("voxel.Stream.MaxUnloadsPerFrame"),
+	2,
+	TEXT("Hitch isolation: max chunk-component DestroyComponent calls (FVoxelWorldImpl::DrainUnloads) per frame. ")
+	TEXT("Was a compile-time constant of 4; tightened to 2 alongside MaxAppliesPerFrame (see its comment)."),
+	ECVF_Default);
 } // namespace
 
 int32 VoxelDebug::GetDebugMode()
@@ -150,4 +176,19 @@ float VoxelDebug::GetServerMaxCarveRadiusUU()
 int32 VoxelDebug::GetWaterMaxActiveBricks()
 {
 	return CVarVoxelWaterMaxActiveBricks.GetValueOnAnyThread();
+}
+
+int32 VoxelDebug::GetStreamMaxAppliesPerFrame()
+{
+	return FMath::Max(1, CVarVoxelStreamMaxAppliesPerFrame.GetValueOnGameThread());
+}
+
+int32 VoxelDebug::GetStreamMaxRemeshesPerFrame()
+{
+	return FMath::Max(1, CVarVoxelStreamMaxRemeshesPerFrame.GetValueOnGameThread());
+}
+
+int32 VoxelDebug::GetStreamMaxUnloadsPerFrame()
+{
+	return FMath::Max(1, CVarVoxelStreamMaxUnloadsPerFrame.GetValueOnGameThread());
 }
