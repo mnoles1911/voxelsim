@@ -23,7 +23,11 @@ public class VoxelEarth : ModuleRules
 			"RHI",
 			// Stage 2: legacy raw-key input bindings (EKeys::W, EKeys::LeftMouseButton, ...)
 			// on AVoxelEarthFlyPawn / AVoxelEarthPlayerController -- no Enhanced Input assets.
-			"InputCore"
+			"InputCore",
+			// m1-plan.md "Explosives v1" row: UVoxelBlastCameraShake configures
+			// a UPerlinNoiseCameraShakePattern (VoxelExplosive.h/.cpp) for the
+			// brief detonation camera kick. Enabled-by-default engine plugin.
+			"EngineCameras"
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[] { });
