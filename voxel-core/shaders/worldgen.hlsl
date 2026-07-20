@@ -11,9 +11,14 @@
 // Any change here that alters output is world-breaking: bump
 // vxc::kWorldGenVersion and regenerate goldens, never patch silently.
 //
-// Kernel: ColumnMain — one thread per column, computes the full
-// ColumnSample stratigraphy (mirrors vxc::Amplifier::column). Voxelization
-// and greedy meshing kernels build on this in later ports.
+// Kernels:
+//   ColumnMain   — one thread per column, computes the full ColumnSample
+//                  stratigraphy (mirrors vxc::Amplifier::column).
+//   VoxelizeMain — one thread per column, chained after ColumnMain: reads
+//                  that column's GpuColumnSample (NOT recomputed) and fills
+//                  a vertical stack of brick-major cell buckets (mirrors
+//                  vxc::Amplifier::materialAt / GeneratedWorld<8>::makeBrick).
+// Greedy meshing kernels build on this in later ports.
 
 // --- constants mirrored from voxel-core (compile checks in harness) --------
 
@@ -106,17 +111,23 @@ struct GpuColumnSample
     uint surfaceMat;
 };
 
+// One cbuffer shared by both kernels (documented per-field below) rather
+// than a second one: it stays a single binding, and the fields ColumnMain
+// doesn't use (BrickZMin/BricksZ) or VoxelizeMain doesn't use (RasterOriginPx/
+// RasterSize/PixelSizeMm) simply go unread by that kernel's entry point.
 cbuffer WorldGenParams : register(b0)
 {
-    uint2 DispatchColumns;  // columns along x, y for this dispatch
-    int2 RasterOriginPx;    // tile-pixel coordinate of raster window texel (0,0)
-    uint2 RasterSize;       // raster window extent in pixels
-    int PixelSizeMm;        // 30000 (scale 1) or 11250 (scale 8)
-    uint SeedLo;            // uint64 seed split across two 32-bit values
+    uint2 DispatchColumns;  // columns along x, y for this dispatch (both kernels)
+    int2 RasterOriginPx;    // tile-pixel coordinate of raster window texel (0,0) (ColumnMain)
+    uint2 RasterSize;       // raster window extent in pixels (ColumnMain)
+    int PixelSizeMm;        // 30000 (scale 1) or 11250 (scale 8) (ColumnMain)
+    uint SeedLo;            // uint64 seed split across two 32-bit values (ColumnMain)
     uint SeedHi;
     int OriginVx;           // world voxel coord of dispatch column (0,0);
     int OriginVy;           // int32 spans +/-214,000 km at 10cm — Earth fits
-    int Pad0;
+    int BrickZMin;          // (VoxelizeMain) lowest brick z-index of the stack:
+                             // covers voxel z in [BrickZMin*8, (BrickZMin+BricksZ)*8)
+    uint BricksZ;           // (VoxelizeMain) number of bricks in the vertical stack
 };
 
 // Raster window (elevation mm per pixel; climate packed t|s<<8|p<<16|v<<24).
@@ -128,6 +139,28 @@ StructuredBuffer<int> ElevationMm : register(t0);
 StructuredBuffer<uint> ClimatePacked : register(t1);
 
 RWStructuredBuffer<GpuColumnSample> OutColumns : register(u0);
+
+// VoxelizeMain-only bindings. InColumns is the SAME buffer OutColumns was
+// written to by the chained ColumnMain dispatch — columns are read back, not
+// recomputed. Registers t3/u2 are deliberately non-contiguous with t0/t1/u0
+// so that after tools/compile-shaders.ps1's DXC -fvk-*-shift mapping
+// (b->+0, t->+1, u->+3) EVERY resource declared in this file lands on a
+// distinct Vulkan (set=0, binding) slot, regardless of whether a given
+// kernel's compiled entry point ends up referencing it:
+//   b0 WorldGenParams -> binding 0   (both kernels)
+//   t0 ElevationMm    -> binding 1   (ColumnMain)
+//   t1 ClimatePacked  -> binding 2   (ColumnMain)
+//   u0 OutColumns     -> binding 3   (ColumnMain)
+//   t3 InColumns      -> binding 4   (VoxelizeMain)
+//   u2 OutCells       -> binding 5   (VoxelizeMain)
+// voxel-core/bench/gpu_harness.cpp hardcodes this same layout for the
+// VoxelizeMain pipeline's descriptor set.
+StructuredBuffer<GpuColumnSample> InColumns : register(t3);
+
+// One uint per cell, material id 0-255 in the low byte (packing optimization
+// left for later). Layout — see the VoxelizeMain doc comment below for the
+// precise brick/cell indexing this buffer is written with.
+RWStructuredBuffer<uint> OutCells : register(u2);
 
 int rasterElevationMm(int64_t px, int64_t py)
 {
@@ -214,4 +247,70 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
         outCol.surfaceMat = MAT_TOPSOIL;
 
     OutColumns[tid.x + tid.y * DispatchColumns.x] = outCol;
+}
+
+// --- VoxelizeMain: bit-exact mirror of vxc::Amplifier::materialAt ---------
+// (fed by ColumnMain's output; columns are never recomputed here).
+//
+// OutCells layout contract (mirrored exactly in gpu_harness.cpp):
+//   - The dispatch footprint DispatchColumns (same meaning as ColumnMain:
+//     one thread per voxel column) MUST be brick-aligned: DispatchColumns.x
+//     and .y are exact multiples of 8. BricksX = DispatchColumns.x / 8,
+//     BricksY = DispatchColumns.y / 8.
+//   - Thread (tid.x, tid.y) belongs to brick footprint
+//     (bx, by) = (tid.x / 8, tid.y / 8) at local column (lx, ly) = (tid.x % 8, tid.y % 8).
+//   - The vertical stack for footprint (bx, by) holds BricksZ bricks; stack
+//     index bz in [0, BricksZ) maps to actual brick z = BrickZMin + bz,
+//     covering voxel z in [(BrickZMin+bz)*8, (BrickZMin+bz)*8 + 8) — i.e. the
+//     whole stack spans voxel z in [BrickZMin*8, (BrickZMin+BricksZ)*8).
+//   - Bricks are ordered z-major WITHIN a column's stack, and footprints are
+//     ordered bx-major-x-then-y (row-major, x fastest):
+//       footprintIndex = bx + BricksX * by
+//       brickIndex     = footprintIndex * BricksZ + bz
+//   - Cell index within a brick mirrors vxc::Brick<8>::cellIndex exactly:
+//       cellIndexInBrick(x, y, z) = x + 8 * (y + 8 * z)
+//   - Final index into OutCells: brickIndex * 512 + cellIndexInBrick(lx, ly, zLocal)
+//
+// InColumns is indexed exactly like ColumnMain's OutColumns:
+//   idx = tid.x + tid.y * DispatchColumns.x
+
+uint cellIndexInBrick(uint x, uint y, uint z) { return x + 8u * (y + 8u * z); }
+
+// vxc::Amplifier::materialAt bit-for-bit.
+uint materialAt(GpuColumnSample col, int64_t vz)
+{
+    const int64_t centreMm = vz * (int64_t)kVoxelSizeMm + (int64_t)kVoxelSizeMm / 2;
+    const int64_t depthMm = (int64_t)col.surfaceMm - centreMm;
+    if (depthMm < 0) return MAT_AIR;
+    if (depthMm < (int64_t)col.topsoilMm) return col.surfaceMat;
+    if (depthMm < (int64_t)col.topsoilMm + (int64_t)col.subsoilMm)
+        return col.surfaceMat == MAT_SAND ? MAT_GRAVEL : MAT_SUBSOIL;
+    if (depthMm < (int64_t)col.bedrockDepthMm) return MAT_ROCK;
+    return MAT_BEDROCK;
+}
+
+[numthreads(8, 8, 1)]
+void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= DispatchColumns.x || tid.y >= DispatchColumns.y)
+        return;
+
+    const uint bx = tid.x / 8u, by = tid.y / 8u;
+    const uint lx = tid.x % 8u, ly = tid.y % 8u;
+    const uint bricksX = DispatchColumns.x / 8u;
+    const uint footprintIndex = bx + bricksX * by;
+
+    const GpuColumnSample col = InColumns[tid.x + tid.y * DispatchColumns.x];
+
+    for (uint bz = 0; bz < BricksZ; ++bz)
+    {
+        const uint brickIndex = footprintIndex * BricksZ + bz;
+        const int64_t brickZ = (int64_t)BrickZMin + (int64_t)bz;
+        [unroll]
+        for (uint z = 0; z < 8u; ++z)
+        {
+            const int64_t vz = brickZ * (int64_t)8 + (int64_t)z;
+            OutCells[brickIndex * 512u + cellIndexInBrick(lx, ly, z)] = materialAt(col, vz);
+        }
+    }
 }

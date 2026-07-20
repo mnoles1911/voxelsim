@@ -52,6 +52,20 @@ per frame (§2.5), LWC + origin rebasing from day one (§3.3).
    c. Origin rebasing (LWC) + material polish.
    d. Perf pass vs the 60fps gate (min-spec proxy settings).
 
+## Player experience decisions (Matt, 2026-07-19 — binding for M1 polish)
+
+| Topic | Decision |
+|---|---|
+| Slope feel | Auto-step absorbs ≤3 voxels (30cm) silently; camera Z is smoothed (spring toward target) so steps read as ramps. Taller rises need a jump. |
+| Speeds | Walk 4.5 m/s, sprint 7 m/s (Shift). Fly speed unchanged (30 m/s). |
+| Jump | ~1.0m apex (10 voxels); gravity tuned accordingly. Air control ~30%. |
+| Dig sizes | 1³ / 2³ / 4³ grid-aligned cubes, centered on the hit voxel and biased into the surface. Scroll wheel cycles size (1/2/3 keys as shortcuts); on-screen size indicator. Replaces the r=3 sphere dig. |
+| Dig timing | Instant for M1 (creative feel). Hardness/timed mining deferred (revisit with survival systems; NPC dig costs in plan §3.6 are unaffected). |
+| Place | Creative palette: cycle material (rock/soil/sand) with a key; placement uses the same size selector, grid-snapped against the hit face. |
+| Explosives v1 | Thrown with arc (hold to aim further), simple bounce physics, 3s fuse; carves a ~3m-radius sphere via the edit-log path with hash-ragged falloff edges. Re-mesh stays budgeted. |
+| Cameras | First person + over-the-shoulder third person: boom 2.5m back, 0.4m right, collision-aware pull-in. `C` toggles. Dig/place always traces camera-through-crosshair. |
+| Character proxy | Blocky voxel-style body (~1.8m, box torso/head/limbs) with basic walk/idle bob — placeholder until M5 per-bone voxel bodies. Visible in TP, hidden in FP. |
+
 ## Verification per stage
 
 Stage 1: `Build.bat VoxelEarthEditor` clean; PIE via the native UE 5.8

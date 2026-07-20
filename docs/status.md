@@ -51,4 +51,11 @@ Working plan + binding decisions: docs/m1-plan.md. UE 5.8.0 (retargeted
 - [ ] Vulkan headless harness: dispatch + byte-compare vs CPU reference on
   the AMD leg (this desktop), then a cloud NVIDIA leg → closes both M0 gates
 
-## Water track — not started (W1 begins with M1)
+## Water track — W1 first slice landed (2026-07-19)
+
+Implicit ocean (z<0, zero voxel data): `AVoxelOceanActor` (camera-following
+40km `/Engine/BasicShapes/Plane`, `M_Ocean` via `Tools/create_ocean_material.py`),
+underwater fog/post-process tint toggled by camera depth (log-verified
+transition, no screenshot), swim-mode placeholder in `AVoxelEarthFlyPawn`
+(gravity off, fly-style 300 UU/s below sea level). No pressure CA, reservoirs,
+buoyancy, or currents yet -- those are W2-W4.

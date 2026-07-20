@@ -38,6 +38,7 @@ if(VXC_BUILD_GPU_HARNESS)
   # no vulkan-1.lib import library needed or linked.
   target_compile_definitions(vxc_gpu PRIVATE
     VXC_SPV_PATH="${VXC_REPO_ROOT}/build/shaders/worldgen.ColumnMain.spv"
+    VXC_SPV_PATH_VOXELIZE="${VXC_REPO_ROOT}/build/shaders/worldgen.VoxelizeMain.spv"
   )
   if(NOT MSVC)
     target_compile_options(vxc_gpu PRIVATE -Wall -Wextra -Werror)

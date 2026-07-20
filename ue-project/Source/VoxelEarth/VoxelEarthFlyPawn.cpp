@@ -114,8 +114,11 @@ void AVoxelEarthFlyPawn::MoveRight(float Value)
 
 void AVoxelEarthFlyPawn::MoveUp(float Value)
 {
-	// Walk mode: Space/LeftControl no longer fly up/down (Space is jump
-	// instead, via OnJumpPressed) -- this axis is simply ignored.
+	// Cached unconditionally: walk mode's swim branch (TickWalkMode) reads
+	// this for vertical fly-style movement while submerged. Walk mode
+	// otherwise ignores it -- Space/LeftControl don't fly up/down on land
+	// (Space is jump instead, via OnJumpPressed).
+	CurrentUpInput = Value;
 	if (!bWalkMode)
 	{
 		AddMovementInput(FVector::UpVector, Value);
@@ -305,18 +308,37 @@ void AVoxelEarthFlyPawn::TickWalkMode(float DeltaTime)
 	}
 
 	FVector Pos = GetActorLocation();
-	const bool bGrounded = IsGroundedAt(Pos);
 
-	if (bJumpRequested && bGrounded)
+	// Water track W1 swimming placeholder (docs/voxel-earth-implementation-
+	// plan.md SS3.7): the walk-mode box counts as "in the water" once it is
+	// entirely below sea level (z=0, matching AVoxelOceanActor's implicit
+	// ocean -- VoxelCoords.h: voxel z=0 == UE world z=0). This is a binary
+	// swim/walk switch only -- no buoyancy, drag, or currents (those are
+	// W4).
+	const bool bSwimming = (Pos.Z + WalkBoxHalfExtentZ) < 0.0;
+	const bool bGrounded = !bSwimming && IsGroundedAt(Pos);
+
+	if (bSwimming)
 	{
-		VerticalVelocity = JumpSpeedUU;
+		// Fly-style while submerged: no gravity, no jump, no step-up --
+		// just reduced-speed 3-axis movement, still swept against voxel
+		// collision (below the DDA-swept ground, e.g. a lakebed).
+		VerticalVelocity = 0.0;
+		bJumpRequested = false;
 	}
-	bJumpRequested = false;
+	else
+	{
+		if (bJumpRequested && bGrounded)
+		{
+			VerticalVelocity = JumpSpeedUU;
+		}
+		bJumpRequested = false;
 
-	// Client-presentation kinematics only (see class comment): plain float
-	// gravity integration, not part of the deterministic world derivation
-	// and not authoritative -- M3's server owns real player movement.
-	VerticalVelocity -= GravityUUPerSec2 * DeltaTime;
+		// Client-presentation kinematics only (see class comment): plain float
+		// gravity integration, not part of the deterministic world derivation
+		// and not authoritative -- M3's server owns real player movement.
+		VerticalVelocity -= GravityUUPerSec2 * DeltaTime;
+	}
 
 	// Horizontal move from the existing WASD axis inputs, projected onto the
 	// yaw-only horizontal plane -- ignores the actor's pitch (mouse look
@@ -329,15 +351,19 @@ void AVoxelEarthFlyPawn::TickWalkMode(float DeltaTime)
 		WishDir.Normalize();
 	}
 
-	const FVector HorizDelta = WishDir * WalkSpeedUU * DeltaTime;
-	const double VertDelta = VerticalVelocity * DeltaTime;
+	const double HorizSpeed = bSwimming ? SwimSpeedUU : WalkSpeedUU;
+	const FVector HorizDelta = WishDir * HorizSpeed * DeltaTime;
+	// Swimming: vertical motion comes directly from the Space/LeftControl
+	// axis (fly-style), not integrated velocity -- there's no "falling"
+	// underwater in this placeholder.
+	const double VertDelta = bSwimming ? (CurrentUpInput * SwimSpeedUU * DeltaTime) : (VerticalVelocity * DeltaTime);
 
 	FVector NewPos = Pos;
 	const bool bBlockedX = SweepAxis(0, HorizDelta.X, NewPos);
 	const bool bBlockedY = SweepAxis(1, HorizDelta.Y, NewPos);
 
 	bool bDidStepSnap = false;
-	if ((bBlockedX || bBlockedY) && bGrounded)
+	if (!bSwimming && (bBlockedX || bBlockedY) && bGrounded)
 	{
 		// Step-up: retry the same horizontal move 30 UU (3 voxels) higher;
 		// if that clears, snap back down onto the ground with a downward

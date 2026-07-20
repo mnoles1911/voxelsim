@@ -15,6 +15,7 @@
 #include "VoxelEarth.h"
 #include "VoxelEarthFlyPawn.h"
 #include "VoxelEarthPlayerController.h"
+#include "VoxelOceanActor.h"
 #include "VoxelWorldSubsystem.h"
 
 AVoxelEarthGameMode::AVoxelEarthGameMode()
@@ -57,6 +58,11 @@ void AVoxelEarthGameMode::BeginPlay()
 			AtmosphereComp->RegisterComponent();
 			Atmosphere->SetRootComponent(AtmosphereComp);
 		}
+
+		// Water track W1 (docs/voxel-earth-implementation-plan.md SS3.7 /
+		// SS4): same "no authored map, spawn from code" reasoning as the
+		// light rig above -- the ocean actor is editor-independent.
+		World->SpawnActor<AVoxelOceanActor>();
 	}
 
 	// Unattended visual verification: -VoxelScreenshotAfter=<seconds> waits
@@ -131,9 +137,57 @@ void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 		return;
 	}
 
+	// Water track W1 verification aid (same pattern as VoxelWorldSubsystem's
+	// -VoxelDefaultMaterial switch): an unattended -game run can't drive the
+	// pawn into the ocean by hand, so this switch spawns underwater instead
+	// of above the terrain -- purely to observe AVoxelOceanActor's
+	// above/below transition log line without an interactive session. No
+	// effect unless passed explicitly; normal spawn behavior is unchanged.
+	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelForceUnderwaterSpawn")))
+	{
+		constexpr double UnderwaterSpawnDepthUU = -500.0; // -5m, well below sea level (z=0)
+		const FVector SpawnLocation(0.0, 0.0, UnderwaterSpawnDepthUU);
+		const FTransform SpawnTransform(FRotator::ZeroRotator, SpawnLocation);
+		RestartPlayerAtTransform(NewPlayer, SpawnTransform);
+		return;
+	}
+
 	constexpr double SpawnHeightAboveSurfaceUU = 500.0; // +5m (1 UU = 1 cm)
-	const double SurfaceUU = Subsystem->GetSurfaceHeightUU(0.0, 0.0);
-	const FVector SpawnLocation(0.0, 0.0, SurfaceUU + SpawnHeightAboveSurfaceUU);
+
+	// -VoxelSpawnAt=X,Y (meters, world): stage 3c LWC verification switch --
+	// overrides the spawn column with the same surface-height-query-plus-5m
+	// logic used for the default (0,0) column above, just evaluated at an
+	// arbitrary far-from-origin column. Default behavior (spawn at 0,0) is
+	// unchanged when the switch is absent.
+	double SpawnWorldX = 0.0;
+	double SpawnWorldY = 0.0;
+	FString SpawnAtArg;
+	// bShouldStopOnSeparator=false: FParse::Value's default terminator set
+	// includes ',' (it's meant for stopping at the end of one positional
+	// value in a list), which would truncate "X,Y" at the comma and silently
+	// drop Y. This switch's value is the whole "X,Y" pair, so read up to the
+	// next whitespace instead.
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelSpawnAt="), SpawnAtArg, /*bShouldStopOnSeparator=*/false))
+	{
+		FString XStr, YStr;
+		if (SpawnAtArg.Split(TEXT(","), &XStr, &YStr))
+		{
+			const double SpawnMetersX = FCString::Atod(*XStr);
+			const double SpawnMetersY = FCString::Atod(*YStr);
+			SpawnWorldX = SpawnMetersX * 100.0; // meters -> UU (1 UU = 1 cm)
+			SpawnWorldY = SpawnMetersY * 100.0;
+			UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSpawnAt override: spawning at column (%.1f, %.1f) m"),
+			       SpawnMetersX, SpawnMetersY);
+		}
+		else
+		{
+			UE_LOG(LogVoxelEarth, Warning,
+			       TEXT("-VoxelSpawnAt=%s malformed (expected X,Y in meters); falling back to (0,0)."), *SpawnAtArg);
+		}
+	}
+
+	const double SurfaceUU = Subsystem->GetSurfaceHeightUU(SpawnWorldX, SpawnWorldY);
+	const FVector SpawnLocation(SpawnWorldX, SpawnWorldY, SurfaceUU + SpawnHeightAboveSurfaceUU);
 	const FTransform SpawnTransform(FRotator::ZeroRotator, SpawnLocation);
 
 	RestartPlayerAtTransform(NewPlayer, SpawnTransform);
