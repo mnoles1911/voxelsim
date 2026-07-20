@@ -93,6 +93,27 @@ namespace VoxelDebug
 	// (AVoxelEarthGameMode::BeginPlay) to force a small budget for headless
 	// eviction-verification runs without needing -ExecCmds plumbing.
 	VOXELEARTH_API void SetMipCacheBudgetMB(int32 NewBudgetMB);
+
+	// --- voxel.Server.* (M3 wave 2 "Validation hardening", docs/m3-plan.md) ---
+	//
+	// Server-side edit-intent caps read by AVoxelEarthPlayerController's
+	// ServerSubmit*Intent handlers (authority only -- these are meaningless on
+	// a client, which never receives its own intent RPCs). Excess/oversized
+	// intents are REJECTED (logged, no-op) rather than silently clamped or
+	// disconnected -- see the handlers' doc comments.
+
+	// voxel.Server.MaxIntentsPerSec: per-connection token-bucket cap (default
+	// 10) on ServerSubmitDigIntent/ServerSubmitPlaceIntent/
+	// ServerSubmitCarveIntent RPCs accepted per second.
+	VOXELEARTH_API int32 GetServerMaxIntentsPerSec();
+
+	// voxel.Server.MaxCarveRadiusUU: cap (UU, default 400) on
+	// ServerSubmitCarveIntent's RadiusUU -- dig/place's equivalent cap is the
+	// existing compile-time UVoxelWorldSubsystem::MaxCubeSizeVoxels constant
+	// (shared with client-side prediction clamping, so it stays a constant
+	// rather than a separately-tunable cvar that could drift from what the
+	// client itself enforces).
+	VOXELEARTH_API float GetServerMaxCarveRadiusUU();
 }
 
 // --- Perf HUD data (P1 "Perf HUD") ------------------------------------------
