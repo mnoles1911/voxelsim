@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "VoxelWorldSubsystem.h" // UVoxelWorldSubsystem::DefaultSeed/GetSeed() -- voxel-core-free, safe here (see doctrine note below)
 #include "VoxelClipmapActor.generated.h"
 
 class UProceduralMeshComponent;
@@ -46,12 +47,14 @@ class UMaterialInterface;
 // Height source (m2-plan.md "Height source" row): TILE elevation directly
 // (30m/px bilinear), NOT the full Amplifier (that is sub-voxel-ring detail,
 // invisible at these scales and not worth the cost here) -- sampled through
-// a file-local vxc::SyntheticTileSampler in the .cpp using the same
-// UVoxelWorldSubsystem::DefaultSeed the voxel world uses, so clipmap terrain
-// lines up with the ring cascade's terrain at the shared seam. This header
-// stays voxel-core-free by doctrine (see VoxelWorldSubsystem.h's PImpl
-// comment) -- the sampling helper is a plain free function in the .cpp, no
-// voxel-core type ever appears in a UHT-parsed signature here.
+// a file-local vxc::SyntheticTileSampler in the .cpp seeded from
+// UVoxelWorldSubsystem::GetSeed() (the RUNTIME seed, -VoxelSeed=<u64> or
+// DefaultSeed -- see TerrainSeed below), so clipmap terrain lines up with
+// the ring cascade's terrain at the shared seam even when -VoxelSeed
+// overrides the default. This header stays voxel-core-free by doctrine (see
+// VoxelWorldSubsystem.h's PImpl comment) -- the sampling helper is a plain
+// free function in the .cpp, no voxel-core type ever appears in a
+// UHT-parsed signature here.
 //
 // Recenter/rebuild (m2-plan.md "Recenter" row): each level's grid snaps to
 // its OWN vertex-spacing grid as the camera moves; a level only rebuilds its
@@ -157,4 +160,14 @@ private:
 	int32 RoundRobinCursor = 0;
 
 	bool bLastRingsEnabled = false;
+
+	// M2 task "Config-driven seed": the voxel world's RUNTIME seed
+	// (UVoxelWorldSubsystem::GetSeed(), read once in BeginPlay), used to
+	// seed SampleHeightUU's vxc::SyntheticTileSampler so clipmap terrain
+	// stays lined up with the ring cascade even under a -VoxelSeed override.
+	// Defaults to UVoxelWorldSubsystem::DefaultSeed until BeginPlay resolves
+	// it (matches the subsystem's own pre-Initialize default; VoxelWorldSubsystem.h
+	// is UHT-parsed but voxel-core-free by its own doctrine, so it's safe to
+	// include from this UHT-parsed header too).
+	uint64 TerrainSeed = UVoxelWorldSubsystem::DefaultSeed;
 };

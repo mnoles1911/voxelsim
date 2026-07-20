@@ -79,6 +79,20 @@ namespace VoxelDebug
 	// debug-tint call site in this module follows (see
 	// UVoxelChunkComponent::SetDebugTint/ClearDebugTint).
 	VOXELEARTH_API FLinearColor HeightmapBandTint();
+
+	// voxel.MipCacheBudgetMB (M2 task "Mip cache eviction"): approximate byte
+	// budget, in MB, for the shared cross-job mip cache (FSharedMipCache,
+	// VoxelWorldSubsystem.cpp) -- default 512. Read via GetValueOnAnyThread:
+	// SharedMipCache::Insert runs on worker job threads, same cross-thread
+	// cvar-read pattern every other voxel.Debug* accessor in this namespace
+	// uses. <= 0 disables eviction (unbounded, pre-eviction-wave behavior).
+	VOXELEARTH_API int64 GetMipCacheBudgetBytes();
+
+	// Programmatic setter (ECVF_SetByCode, mirrors SetRingsEnabled) -- used by
+	// the -VoxelMipCacheBudgetMB=<N> command-line switch
+	// (AVoxelEarthGameMode::BeginPlay) to force a small budget for headless
+	// eviction-verification runs without needing -ExecCmds plumbing.
+	VOXELEARTH_API void SetMipCacheBudgetMB(int32 NewBudgetMB);
 }
 
 // --- Perf HUD data (P1 "Perf HUD") ------------------------------------------
@@ -126,6 +140,9 @@ struct FVoxelPerfSnapshot
 	// (no eviction yet, so this only grows).
 	int64 MipCacheBrickCount = 0;
 	int64 MipCacheBytes = 0;
+	// M2 task "Mip cache eviction": running count of approximate-LRU evictions
+	// (FSharedMipCache::Insert, over voxel.MipCacheBudgetMB) since startup.
+	int64 MipCacheEvictions = 0;
 
 	// --- Ring levels (docs/m2-plan.md first implementation wave item 1) -----
 	// Loaded (has a live component) and pending (queued across job/game-thread/
