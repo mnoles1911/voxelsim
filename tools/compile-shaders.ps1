@@ -12,7 +12,7 @@ $OutDir = Join-Path $Root "build\shaders"
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 
 # kernel source -> entry points
-$Kernels = @{ "voxel-core\shaders\worldgen.hlsl" = @("ColumnMain", "VoxelizeMain", "MeshCountMain", "MeshEmitMain") }
+$Kernels = @{ "voxel-core\shaders\worldgen.hlsl" = @("ColumnMain", "VoxelizeMain", "MeshCountMain", "MeshEmitMain", "ScanBlocksMain", "ScanSumsMain", "ScanAddMain") }
 
 foreach ($Src in $Kernels.Keys) {
     $SrcPath = Join-Path $Root $Src
