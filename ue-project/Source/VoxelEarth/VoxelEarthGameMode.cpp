@@ -14,6 +14,7 @@
 #include "UnrealClient.h"
 #include "VoxelEarth.h"
 #include "VoxelEarthFlyPawn.h"
+#include "VoxelEarthHUD.h"
 #include "VoxelEarthPlayerController.h"
 #include "VoxelOceanActor.h"
 #include "VoxelWorldSubsystem.h"
@@ -22,6 +23,7 @@ AVoxelEarthGameMode::AVoxelEarthGameMode()
 {
 	DefaultPawnClass = AVoxelEarthFlyPawn::StaticClass();
 	PlayerControllerClass = AVoxelEarthPlayerController::StaticClass();
+	HUDClass = AVoxelEarthHUD::StaticClass();
 }
 
 void AVoxelEarthGameMode::BeginPlay()
