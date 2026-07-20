@@ -558,6 +558,163 @@ after every single step. Full suite green: 71/71 (`vxc_tests.exe`, MSVC
 pass, no float/double anywhere in `waterca.h`/`waterca.cpp` (float-ban CI
 grep clean).
 
+## Water track — W2 perf: two-phase read/apply CA rewrite, ~1900-brick gap closed (2026-07-20, worktree agent)
+
+**Problem**: the v0 sequential in-place sweep above measured 500-650ms/tick
+at ~1900 active bricks (this section's own earlier perf-gap note) --
+correct but a hashmap lookup (BrickKey compute + `unordered_map::find`) per
+cell per neighbor read/write, unparallelizable by construction (each cell's
+result depended on cells already mutated earlier in the same pass).
+
+**Fix**: `WaterCA::step()` is now `stepWithOrder(activeSetSnapshot())`, a
+genuine two-phase (read-flows, then apply) engine -- **`kWaterCAVersion`
+bumped 1->2, a deliberate world-breaking contract change exactly like a
+worldgen version bump** (waterca.h's "Tick rules v1" comment is now the
+authority; v0's sequential contract is retired, not kept as a fallback).
+Same physical fixed-point family per scenario (flat-within-1 pools,
+bottom-up container fill, floor-resting columns), different exact per-tick
+values and digest -- expected and re-pinned (golden
+`0x5C8D36C83246CAFC`, was `0x7995BE759FB9D67E`).
+
+- **Phase READ**: for every active cell, compute up to 5 outgoing flows
+  (gravity down, then lateral +x/-x/+y/-y) from data already committed to
+  `water_` this tick, never from anything written later in the SAME phase
+  -- source-side capped in that fixed priority order so one cell's total
+  outflow never exceeds its own fill, all before any target is consulted.
+- **Phase APPLY (GATHER then FINALIZE)**: every cell that could possibly
+  receive flow (active cells plus their up-to-5 target-direction neighbors,
+  the "touched" set) gathers its inbound candidates in the same fixed
+  order against its own remaining capacity -- whichever arrive first in
+  that order are admitted in full up to the budget, the rest truncated to
+  exactly what's left (proof: `waterca_lateral_contention_capped_
+  conserved_fixed_order`, a walled cross where 4 full neighbors all want
+  to overfill a near-full origin -- origin caps at exactly 255, the two
+  lower-colored neighbors give up exactly 1 unit each, the two
+  higher-colored ones are correctly untouched, total conserved exactly).
+  FINALIZE then nets accepted inflow against accepted outflow per cell
+  once every target has been gathered, through the existing
+  `setFillAccounted` (ledger + homogeneous-empty collapse unchanged).
+- **Flat brick working set**: `computeDesiredForBrick`/`gatherInflowForBrick`
+  cache each active/touched brick's own pointer plus (only when a cell
+  sits on a brick boundary) its neighbor bricks' pointers ONCE per brick,
+  resolving cross-brick reads via arithmetic (`neighborOf`, wrap the local
+  coordinate, only bump the brick key on overflow) instead of a
+  voxel->BrickKey->hashmap round trip per cell -- this is the actual
+  hashmap-cost fix: O(bricks) map lookups per tick instead of O(cells).
+- **Eight-way (2x2x2) coloring, not two**: a cell's outgoing flows are
+  computed and applied in 8 sequential per-tick rounds keyed by
+  `(x&1)|(y&1)<<1|(z&1)<<2` (any single-axis step flips at least one bit,
+  so a cell's 5 possible targets are always a different color). This
+  needed real debugging, not just the obvious read/apply split: a plain
+  2-color (x^y^z parity) split fixes the simple case (naive single-pass
+  Jacobi sits exactly at the marginal stability boundary for this
+  diffusion rule and produces a persistent checkerboard that never
+  settles -- found empirically, a symmetric pour never stopped stepping),
+  but 2 colors are NOT enough in general: a closed 4-cell loop in the
+  lateral plane alternates between only those 2 colors going around it, so
+  red-black can still let such a loop trade flow in a perfect,
+  non-progressing cycle every tick forever (found empirically on a
+  pooling-test scenario: `activeBrickCount()` never reached 0, and where it
+  froze, several adjacent cells differed by more than 1 -- a real
+  correctness bug, not merely slow convergence, confirmed by showing that
+  repeating the same 2-round pair up to 4x per tick did not help, and that
+  alternating which color goes first tick-to-tick made it WORSE). The
+  8-way coloring assigns every cell of that same small loop a different
+  round, so no two cells of a cycle ever move off the same stale snapshot
+  simultaneously -- verified: `waterca_pooling_spreads_flat_within_tolerance`
+  now settles cleanly with zero flatness violations (was persistently
+  non-settling with 2 colors) and the whole suite's `activeBrickCount()`
+  reaches exactly 0 on every settling scenario.
+- **Next-active-set fix**: a brick that is genuinely blocked for an entire
+  tick (e.g. its gravity target still full) produces zero net change
+  itself and therefore isn't a source or destination of anything --
+  `changed`-based activation alone would then never reactivate it even
+  after the blocking neighbor drains, so it would stall forever the first
+  time it lost a single-tick race (found and fixed empirically: a
+  2-cell-adjacent gravity drop across a brick boundary froze indefinitely
+  under the naive rule). Fixed: the next active set is `changed` UNION
+  every one of `changed`'s 6 face-neighbors (all 6, not just the 5
+  "outgoing target" directions `touched` uses -- the brick ABOVE a changed
+  brick, a potential gravity SOURCE into it, is the one direction that
+  list omits).
+- **`changed` is a true tick-start-vs-tick-end diff, not per-write**:
+  because 8 sequential color rounds each commit real writes to `water_`
+  within one tick (round *c*+1 needs to see round *c*'s results), a cell
+  can be nudged and nudged back within the same tick -- individually real
+  writes that net to zero. Feeding those straight into "changed" would
+  mark a brick active forever despite no actual tick-over-tick change
+  (found and fixed empirically alongside the checkerboard work). Every
+  touched cell's fill is snapshotted before any round runs; `changed` is
+  computed by comparing that snapshot against the post-all-rounds state.
+- **`stepWithOrder(std::vector<BrickKey>)`** (new public API) runs one tick
+  against an explicit active-brick list instead of the real `active_` set,
+  accepting any permutation -- `step()` is exactly
+  `stepWithOrder(activeSetSnapshot())`. Proves the property that makes a
+  future GPU port valid: `waterca_twophase_order_independent_and_
+  deterministic` runs two identical scenarios in lockstep for 60 ticks, one
+  via plain `step()` and the other feeding `stepWithOrder` its OWN
+  active-set snapshot **reversed every single tick** (never the same
+  permutation twice in a row) -- byte-identical digest and volume after
+  every tick, not just at the end.
+
+**Benchmark** (`voxel-core/bench/waterca_bench.cpp`, new, kept out of the
+correctness suite): a 441-column pour (4000 units each, ~1.76M units total)
+over real bumpy terrain (`SyntheticTileSampler`/`Amplifier`, seed 20260719),
+step() wall-clock timed every tick with the active-brick count recorded
+alongside it. `vxc_waterca_bench` reports the average in the active-brick
+window closest to the v0 baseline's ~1900-2000 scale.
+
+**Result (2026-07-20, this desktop, MSVC 14.51/VS 2026 Release)**:
+`vxc_waterca_bench --ticks 600`, seed 20260719, 1,764,000 units placed over
+441 columns, max active bricks reached 3228 during the run. Average step()
+in the [1605, 2005] active-brick window (182 samples, closest available
+band to the v0 baseline's documented ~1900-2000 scale): **194.4 ms**,
+against the v0 baseline's documented 500-650 ms/tick (midpoint 575 ms) --
+**~3x speedup, not the 100x+ target.**
+
+**Honest accounting of why**: the per-brick hashmap-lookup elimination
+(caching each active/touched brick's 5 real-water-map and 5 scratch-map
+neighbor pointers ONCE per brick instead of once per boundary CELL) and the
+per-tick-not-per-round scratch/inflow allocation fix (fixed-size
+`std::array` scratch reused across all 8 rounds instead of a fresh
+`std::vector`-backed hashmap built 8 times per tick) together took this
+benchmark from an initial working version's ~360 ms/tick down to ~194
+ms/tick in this same window -- real, verified wins, just not enough of one.
+The remaining cost is almost certainly the 8x multiplier itself: every one
+of the 8 colored rounds still does a full READ + GATHER + FINALIZE pass
+over the ENTIRE active/touched set (order ~2000-3200 bricks x 512 cells),
+even though on any given round only ~1/8 of a brick's cells match that
+round's color and can possibly do anything -- i.e. this implementation pays
+for 8 full brick scans per tick to do the productive work of roughly 1.
+Not fixed this pass (time-boxed): the two most promising follow-ups are (1)
+per-round, per-brick "does this brick have ANY cell of this round's color
+with fill>0" early-out (skip the full 512-cell scan entirely when not),
+which trivially still needs a fast per-color occupancy check to be worth
+it, and (2) revisiting whether 8 colors is really required everywhere or
+only in the specific dense/converging regions where the 4-cycle resonance
+(see the coloring writeup above) actually arises -- a scenario at ~2000
+active bricks spread thinly (not a single dense 1764-unit pour like this
+benchmark) may show a much better ratio. Both are correctness-preserving,
+pure-perf follow-ups against the SAME v1 (kWaterCAVersion==2) contract
+already locked in by this pass's tests, not a reason to hold this pass.
+
+**Build**: `voxelcore.lib` clean rebuild from scratch, `/W4 /WX` (MSVC
+14.51/VS 2026, Ninja/Release), zero warnings from any file this pass;
+`vxc_tests` 72/72 green (8 waterca tests total: the 6 pre-existing ones all
+still pass unmodified in intent -- only the golden digest constant changed
+per the documented contract bump -- plus 2 new: the contention-conservation
+proof and the order-independence/determinism proof); no float/double
+anywhere in `waterca.h`/`waterca.cpp` (float-ban clean, unchanged).
+
+**UE follow-up (next wave)**: the UE water subsystem does not exist yet
+this wave (W1 is implicit-ocean-only, per the section above; W2 UE
+integration is still unstarted) so there is no live UE-side golden to
+re-verify from THIS change -- flagging for whichever wave first wires
+`WaterCA` into the UE water subsystem: any saved/golden digest captured
+against a `WaterCA` scenario is a v1 (kWaterCAVersion==2) value from this
+point forward, and needs regenerating if anyone captured one against the
+retired v0 sequential engine in the interim.
+
 ## Backlog (parked / deferred, updated 2026-07-20)
 
 | Item | State | Unblock |
