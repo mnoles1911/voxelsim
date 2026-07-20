@@ -8,6 +8,7 @@
 #include "GameFramework/PlayerInput.h"
 #include "InputCoreTypes.h"
 #include "VoxelCoords.h"
+#include "VoxelProxyBody.h"
 #include "VoxelWorldSubsystem.h"
 
 namespace
@@ -29,18 +30,37 @@ void AxisVoxelRange(double Lo, double Hi, int64& OutMin, int64& OutMax)
 
 AVoxelEarthFlyPawn::AVoxelEarthFlyPawn()
 {
-	// bCanEverTick stays true so walk mode (stage 3b) can flip actor tick on
-	// with SetActorTickEnabled; it starts disabled so fly mode (the default)
-	// is unchanged -- Tick only runs while bWalkMode is set (see
-	// ToggleWalkMode).
+	// Tick now always runs (not just in walk mode): TickWalkMode is still
+	// gated on bWalkMode, but camera smoothing/the third-person boom
+	// (UpdateCameraSmoothing) and proxy body animation need to update every
+	// frame in fly mode too (task 5: fly mode keeps TP camera + visible
+	// proxy).
 	PrimaryActorTick.bCanEverTick = true;
-	PrimaryActorTick.bStartWithTickEnabled = false;
+	PrimaryActorTick.bStartWithTickEnabled = true;
 
 	SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("SceneRoot"));
 	SetRootComponent(SceneRoot);
 
 	Camera = CreateDefaultSubobject<UCameraComponent>(TEXT("Camera"));
 	Camera->SetupAttachment(SceneRoot);
+	Camera->SetRelativeLocation(FVector(0.0, 0.0, HeadOffsetUU));
+	Camera->bAutoActivate = true;
+
+	// Over-the-shoulder third-person camera (Player experience decisions
+	// table, "Cameras" row); its transform is recomputed every frame in
+	// UpdateThirdPersonCamera rather than via a spring arm -- see class
+	// comment on the field. Starts inactive; BeginPlay makes the initial
+	// FP/TP state explicit.
+	ThirdPersonCamera = CreateDefaultSubobject<UCameraComponent>(TEXT("ThirdPersonCamera"));
+	ThirdPersonCamera->SetupAttachment(SceneRoot);
+	ThirdPersonCamera->bAutoActivate = false;
+
+	// Blocky voxel proxy body (Player experience decisions table,
+	// "Character proxy" row); its own origin is the walk-mode collision
+	// box's center (matches WalkBoxHalfExtentZ/XY -- see VoxelProxyBody.h),
+	// same as this pawn's root, so no extra offset is needed here.
+	ProxyBody = CreateDefaultSubobject<UVoxelProxyBodyComponent>(TEXT("ProxyBody"));
+	ProxyBody->SetupAttachment(SceneRoot);
 
 	Movement = CreateDefaultSubobject<UFloatingPawnMovement>(TEXT("Movement"));
 	// Flying speed tuned for exploring a streaming radius measured in tens
@@ -57,6 +77,26 @@ AVoxelEarthFlyPawn::AVoxelEarthFlyPawn()
 	bUseControllerRotationYaw = true;
 	bUseControllerRotationPitch = true;
 	bUseControllerRotationRoll = false;
+}
+
+void AVoxelEarthFlyPawn::BeginPlay()
+{
+	Super::BeginPlay();
+
+	// Explicit initial camera-mode / proxy-visibility state (first person,
+	// proxy hidden) -- doesn't rely on component default-activation order.
+	if (Camera)
+	{
+		Camera->SetActive(true);
+	}
+	if (ThirdPersonCamera)
+	{
+		ThirdPersonCamera->SetActive(false);
+	}
+	if (ProxyBody)
+	{
+		ProxyBody->SetVisibility(false, true);
+	}
 }
 
 void AVoxelEarthFlyPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
@@ -92,6 +132,12 @@ void AVoxelEarthFlyPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputC
 	// axis in walk mode, so the two bindings never fight over the key.
 	PlayerInputComponent->BindKey(EKeys::G, IE_Pressed, this, &AVoxelEarthFlyPawn::ToggleWalkMode);
 	PlayerInputComponent->BindKey(EKeys::SpaceBar, IE_Pressed, this, &AVoxelEarthFlyPawn::OnJumpPressed);
+
+	// Player experience decisions table: sprint (LeftShift held) and camera
+	// mode toggle ('C').
+	PlayerInputComponent->BindKey(EKeys::LeftShift, IE_Pressed, this, &AVoxelEarthFlyPawn::OnSprintPressed);
+	PlayerInputComponent->BindKey(EKeys::LeftShift, IE_Released, this, &AVoxelEarthFlyPawn::OnSprintReleased);
+	PlayerInputComponent->BindKey(EKeys::C, IE_Pressed, this, &AVoxelEarthFlyPawn::ToggleCameraMode);
 }
 
 void AVoxelEarthFlyPawn::MoveForward(float Value)
@@ -133,6 +179,7 @@ void AVoxelEarthFlyPawn::ToggleWalkMode()
 	bWalkMode = !bWalkMode;
 	VerticalVelocity = 0.f;
 	bJumpRequested = false;
+	HorizontalVelocity = FVector::ZeroVector;
 
 	if (Movement)
 	{
@@ -144,10 +191,10 @@ void AVoxelEarthFlyPawn::ToggleWalkMode()
 		Movement->SetComponentTickEnabled(!bWalkMode);
 	}
 
-	// Only walk mode needs a per-frame kinematic step; fly mode is driven
-	// entirely by UFloatingPawnMovement's own tick (unchanged from before
-	// stage 3b).
-	SetActorTickEnabled(bWalkMode);
+	// Actor tick itself now stays on unconditionally in both modes (see
+	// constructor comment) so camera smoothing / the third-person boom /
+	// proxy animation keep updating in fly mode too; only TickWalkMode's
+	// kinematic step is gated on bWalkMode (see Tick).
 }
 
 void AVoxelEarthFlyPawn::OnJumpPressed()
@@ -158,6 +205,27 @@ void AVoxelEarthFlyPawn::OnJumpPressed()
 	}
 	// Fly mode: SpaceBar already flies up via the VoxelFly_Up axis; no
 	// separate jump action there.
+}
+
+void AVoxelEarthFlyPawn::OnSprintPressed() { bSprintHeld = true; }
+void AVoxelEarthFlyPawn::OnSprintReleased() { bSprintHeld = false; }
+
+void AVoxelEarthFlyPawn::ToggleCameraMode()
+{
+	bThirdPerson = !bThirdPerson;
+	if (Camera)
+	{
+		Camera->SetActive(!bThirdPerson);
+	}
+	if (ThirdPersonCamera)
+	{
+		ThirdPersonCamera->SetActive(bThirdPerson);
+	}
+	if (ProxyBody)
+	{
+		// Character proxy row: "Visible in TP, hidden in FP."
+		ProxyBody->SetVisibility(bThirdPerson, true);
+	}
 }
 
 UVoxelWorldSubsystem* AVoxelEarthFlyPawn::GetVoxelWorldSubsystem() const
@@ -297,6 +365,89 @@ void AVoxelEarthFlyPawn::Tick(float DeltaTime)
 	{
 		TickWalkMode(DeltaTime);
 	}
+
+	// Runs in both modes (see constructor comment on PrimaryActorTick):
+	// step-smoothing decay + the third-person boom, and the proxy body's
+	// code-driven animation (task 5: fly mode keeps the TP camera/proxy).
+	UpdateCameraSmoothing(DeltaTime);
+
+	if (ProxyBody)
+	{
+		const double HorizSpeedUU = bWalkMode ? HorizontalVelocity.Size() : GetVelocity().Size();
+		ProxyBody->UpdateAnimation(DeltaTime, HorizSpeedUU);
+	}
+}
+
+FVector AVoxelEarthFlyPawn::GetHeadWorldLocation() const
+{
+	return GetActorLocation() + FVector(0.0, 0.0, HeadOffsetUU + CameraZOffsetUU);
+}
+
+void AVoxelEarthFlyPawn::UpdateCameraSmoothing(float DeltaTime)
+{
+	// Step-smoothing (decisions table, "Slope feel"): TickWalkMode's
+	// step-up snap pushes the abrupt part of the actor's Z jump into
+	// CameraZOffsetUU instead of letting the camera teleport with it; here
+	// that offset exponentially decays back to 0 (rate CameraSmoothRatePerSec,
+	// ~10/s) so steps read as a smooth ramp. Runs every frame (not just
+	// while walking) so a step-up finishes smoothing out even across a
+	// G-toggle to fly mode.
+	const double Alpha = 1.0 - FMath::Exp(-CameraSmoothRatePerSec * (double)DeltaTime);
+	CameraZOffsetUU = FMath::Lerp(CameraZOffsetUU, 0.0, Alpha);
+	if (FMath::Abs(CameraZOffsetUU) < 0.01)
+	{
+		CameraZOffsetUU = 0.0;
+	}
+
+	if (Camera)
+	{
+		Camera->SetRelativeLocation(FVector(0.0, 0.0, HeadOffsetUU + CameraZOffsetUU));
+	}
+
+	UpdateThirdPersonCamera();
+}
+
+void AVoxelEarthFlyPawn::UpdateThirdPersonCamera()
+{
+	if (!ThirdPersonCamera)
+	{
+		return;
+	}
+
+	const FVector HeadPos = GetHeadWorldLocation();
+	const FVector Forward = GetActorForwardVector();
+	const FVector Right = GetActorRightVector();
+	const FVector DesiredPos = HeadPos - Forward * ThirdPersonBoomBackUU + Right * ThirdPersonBoomRightUU;
+
+	FVector FinalPos = DesiredPos;
+	const FVector ToDesired = DesiredPos - HeadPos;
+	const double DesiredDist = ToDesired.Size();
+	if (DesiredDist > KINDA_SMALL_NUMBER)
+	{
+		const FVector Dir = ToDesired / DesiredDist;
+		if (UVoxelWorldSubsystem* Subsystem = GetVoxelWorldSubsystem())
+		{
+			FVector HitCenter, PrevCenter;
+			// Collision-aware pull-in (decisions table, "Cameras" row): no
+			// USpringArmComponent probes -- terrain has no Chaos collision --
+			// so the boom is pulled in with the same voxel DDA raycast
+			// dig/place uses, cast from the head toward the desired camera
+			// position.
+			if (Subsystem->RaycastVoxelWorld(HeadPos, Dir, DesiredDist, HitCenter, PrevCenter))
+			{
+				// Project the last-empty-voxel center back onto the ray so
+				// the pulled-in camera always stays exactly on the
+				// head->desired line (PrevCenter itself is a voxel center,
+				// not necessarily on that line).
+				const double PrevDistAlongDir = (PrevCenter - HeadPos) | Dir;
+				const double PulledDist = FMath::Max(0.0, PrevDistAlongDir - ThirdPersonPullInEpsilonUU);
+				FinalPos = HeadPos + Dir * PulledDist;
+			}
+		}
+	}
+
+	ThirdPersonCamera->SetWorldLocation(FinalPos);
+	ThirdPersonCamera->SetWorldRotation(GetActorRotation());
 }
 
 void AVoxelEarthFlyPawn::TickWalkMode(float DeltaTime)
@@ -330,7 +481,7 @@ void AVoxelEarthFlyPawn::TickWalkMode(float DeltaTime)
 	{
 		if (bJumpRequested && bGrounded)
 		{
-			VerticalVelocity = JumpSpeedUU;
+			VerticalVelocity = (float)JumpSpeedUU;
 		}
 		bJumpRequested = false;
 
@@ -351,8 +502,41 @@ void AVoxelEarthFlyPawn::TickWalkMode(float DeltaTime)
 		WishDir.Normalize();
 	}
 
-	const double HorizSpeed = bSwimming ? SwimSpeedUU : WalkSpeedUU;
-	const FVector HorizDelta = WishDir * HorizSpeed * DeltaTime;
+	FVector HorizDelta;
+	if (bSwimming)
+	{
+		// Fly-style while submerged (W1 swimming placeholder, unchanged):
+		// instant velocity from input, no accel/friction model. Kept synced
+		// into HorizontalVelocity so ground movement resumes smoothly from
+		// this value on exit instead of snapping.
+		HorizontalVelocity = WishDir * SwimSpeedUU;
+		HorizDelta = HorizontalVelocity * DeltaTime;
+	}
+	else
+	{
+		// Player experience decisions table ("Movement feel"): accel-based
+		// ground movement (~4000 UU/s^2) with friction-style damping when
+		// there's no input (WishDir == 0 pulls HorizontalVelocity toward
+		// zero the same way), and air control at 30% of ground accel while
+		// airborne -- this is what makes direction changes feel weighted
+		// instead of the old instant-velocity snap.
+		const double MaxSpeed = bSprintHeld ? SprintSpeedUU : WalkSpeedUU;
+		const double Accel = bGrounded ? GroundAccelUUPerSec2 : (GroundAccelUUPerSec2 * AirControlFactor);
+
+		const FVector TargetVelocity = WishDir * MaxSpeed;
+		const FVector VelDelta = TargetVelocity - HorizontalVelocity;
+		const double MaxStep = Accel * DeltaTime;
+		if (VelDelta.SizeSquared() <= FMath::Square(MaxStep))
+		{
+			HorizontalVelocity = TargetVelocity;
+		}
+		else
+		{
+			HorizontalVelocity += VelDelta.GetSafeNormal() * MaxStep;
+		}
+		HorizDelta = HorizontalVelocity * DeltaTime;
+	}
+
 	// Swimming: vertical motion comes directly from the Space/LeftControl
 	// axis (fly-style), not integrated velocity -- there's no "falling"
 	// underwater in this placeholder.
@@ -389,6 +573,16 @@ void AVoxelEarthFlyPawn::TickWalkMode(float DeltaTime)
 		{
 			VerticalVelocity = 0.0;
 		}
+	}
+	else
+	{
+		// Step smoothing (decisions table, "Slope feel"): the actor's Z just
+		// jumped abruptly (up to StepUpHeightUU = 30 UU, well within the
+		// "<=35 UU" abrupt-change band); absorb that jump into the camera
+		// offset instead of letting the camera teleport with it --
+		// UpdateCameraSmoothing decays this back to 0 every frame.
+		const double AbruptZJump = NewPos.Z - Pos.Z;
+		CameraZOffsetUU -= AbruptZJump;
 	}
 
 	SetActorLocation(NewPos);

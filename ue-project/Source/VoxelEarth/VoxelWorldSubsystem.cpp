@@ -8,6 +8,7 @@
 // voxel-core is UE-header-free C++20; safe to include directly from a UE
 // module .cpp (doctrine: never from a header UHT parses -- see
 // VoxelWorldSubsystem.h / VoxelChunkComponent.h, both voxel-core-free).
+#include "voxelcore/hash.h"
 #include "voxelcore/mesher.h"
 #include "voxelcore/raycast.h"
 #include "voxelcore/tiles.h"
@@ -105,6 +106,36 @@ void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const Material
 		}
 	}
 }
+
+// Sized dig/place cube anchoring (m1-plan.md "Player experience decisions",
+// "Dig sizes" / "Place" rows): the SizeVoxels^3 cube is centred on Anchor on
+// the two axes tangent to the hit face (FaceAxis), and biased along the face
+// axis by GrowAxisSign so the whole cube sits on one side of Anchor instead
+// of straddling it -- dig grows INTO the terrain (GrowAxisSign ==
+// hit.faceSign), place grows AWAY from it (GrowAxisSign == -hit.faceSign).
+// FaceAxis == -1 (ray started inside solid; dig-only, TryPlace already
+// rejects this case) falls back to centring on all three axes since there is
+// no face to bias against.
+void ComputeCubeMinCorner(int64 AnchorX, int64 AnchorY, int64 AnchorZ, int32 FaceAxis, int32 GrowAxisSign, int32 SizeVoxels,
+                           int64& OutMinX, int64& OutMinY, int64& OutMinZ)
+{
+	const int64 Anchor[3] = {AnchorX, AnchorY, AnchorZ};
+	int64 Min[3];
+	for (int32 Axis = 0; Axis < 3; ++Axis)
+	{
+		if (Axis == FaceAxis && GrowAxisSign != 0)
+		{
+			Min[Axis] = (GrowAxisSign > 0) ? Anchor[Axis] : Anchor[Axis] - (int64)(SizeVoxels - 1);
+		}
+		else
+		{
+			Min[Axis] = Anchor[Axis] - (int64)(SizeVoxels / 2);
+		}
+	}
+	OutMinX = Min[0];
+	OutMinY = Min[1];
+	OutMinZ = Min[2];
+}
 } // namespace
 
 // Streaming bookkeeping types. File-scope (not exposed to the UHT-parsed
@@ -182,8 +213,12 @@ struct FVoxelWorldImpl
 	void WaitForInFlightTasks();
 
 	// Dig/place (edit-log authority path). Game thread only.
-	bool TryDig(const FVector& CameraLoc, const FVector& CameraDir);
-	bool TryPlace(const FVector& CameraLoc, const FVector& CameraDir);
+	bool TryDig(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels);
+	bool TryPlace(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels, uint8 MaterialId,
+	              const FVector& PlayerActorLocation);
+
+	// Explosives v1 (edit-log authority path). Game thread only.
+	int32 CarveSphere(const FVector& CenterUU, double RadiusUU, double JitterUU);
 
 private:
 	void RecomputeDesiredSet(const FVector& Anchor);
@@ -200,6 +235,13 @@ private:
 	bool ChunkHasEditedBrick(const VoxelCoords::FVoxelChunkKey& ChunkKey) const;
 	vxc::RaycastHit CastFromCamera(const FVector& CameraLoc, const FVector& Dir) const;
 	void MaybeLogCounters(float DeltaTime);
+
+	// Shared tail of TryDig/TryPlace/CarveSphere (edit-log authority path):
+	// applies every brick's grouped edits, marks every dirty chunk for
+	// re-mesh, and re-sorts the pending queues. No-op if EditsByBrick is
+	// empty.
+	void ApplyGroupedEdits(std::unordered_map<vxc::BrickKey, std::vector<vxc::EditCell>, vxc::BrickKeyHash>& EditsByBrick,
+	                        const TSet<VoxelCoords::FVoxelChunkKey>& DirtyChunks);
 };
 
 // --- streaming tick orchestration -------------------------------------------
@@ -709,7 +751,27 @@ void FVoxelWorldImpl::MarkChunkDirtyForRemesh(const VoxelCoords::FVoxelChunkKey&
 	PendingGameThreadKeys.AddUnique(Key);
 }
 
-bool FVoxelWorldImpl::TryDig(const FVector& CameraLoc, const FVector& CameraDir)
+void FVoxelWorldImpl::ApplyGroupedEdits(std::unordered_map<vxc::BrickKey, std::vector<vxc::EditCell>, vxc::BrickKeyHash>& EditsByBrick,
+                                         const TSet<VoxelCoords::FVoxelChunkKey>& DirtyChunks)
+{
+	if (EditsByBrick.empty())
+	{
+		return;
+	}
+
+	for (auto& Entry : EditsByBrick)
+	{
+		Voxels.applyEdit(Entry.first, std::move(Entry.second));
+	}
+
+	for (const VoxelCoords::FVoxelChunkKey& Key : DirtyChunks)
+	{
+		MarkChunkDirtyForRemesh(Key);
+	}
+	SortPendingQueues(LastAnchorLocation);
+}
+
+bool FVoxelWorldImpl::TryDig(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels)
 {
 	const FVector Dir = CameraDir.GetSafeNormal();
 	if (Dir.IsNearlyZero())
@@ -723,28 +785,28 @@ bool FVoxelWorldImpl::TryDig(const FVector& CameraLoc, const FVector& CameraDir)
 		return false;
 	}
 
-	constexpr int64 R = UVoxelWorldSubsystem::DigSphereRadiusVoxels;
-	constexpr double RadiusSq = double(R) * double(R);
+	const int32 N = FMath::Clamp(SizeVoxels, UVoxelWorldSubsystem::MinCubeSizeVoxels, UVoxelWorldSubsystem::MaxCubeSizeVoxels);
 	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
 
+	// Cube biased into the terrain (m1-plan.md "Dig sizes" row): grow along
+	// the hit-face axis in the SAME direction the ray was travelling when it
+	// entered the solid voxel (Hit.faceSign) -- that direction points deeper
+	// into the surface, away from the camera.
+	int64 MinX, MinY, MinZ;
+	ComputeCubeMinCorner(Hit.vx, Hit.vy, Hit.vz, Hit.faceAxis, Hit.faceSign, N, MinX, MinY, MinZ);
+
 	// One World::applyEdit per touched brick (docs/m1-plan.md Stage 2
-	// decisions table): collect every voxel in the sphere, grouped by brick.
+	// decisions table): collect every voxel in the cube, grouped by brick.
 	std::unordered_map<vxc::BrickKey, std::vector<vxc::EditCell>, vxc::BrickKeyHash> EditsByBrick;
 	TSet<VoxelCoords::FVoxelChunkKey> DirtyChunks;
 
-	for (int64 Dz = -R; Dz <= R; ++Dz)
+	for (int64 Dz = 0; Dz < N; ++Dz)
 	{
-		for (int64 Dy = -R; Dy <= R; ++Dy)
+		for (int64 Dy = 0; Dy < N; ++Dy)
 		{
-			for (int64 Dx = -R; Dx <= R; ++Dx)
+			for (int64 Dx = 0; Dx < N; ++Dx)
 			{
-				const double DistSq = double(Dx * Dx + Dy * Dy + Dz * Dz);
-				if (DistSq > RadiusSq)
-				{
-					continue;
-				}
-
-				const int64 Vx = Hit.vx + Dx, Vy = Hit.vy + Dy, Vz = Hit.vz + Dz;
+				const int64 Vx = MinX + Dx, Vy = MinY + Dy, Vz = MinZ + Dz;
 				const vxc::BrickKey BKey = vxc::ChunkMap<B>::keyForVoxel(Vx, Vy, Vz);
 				const int LocalX = (int)vxc::floorMod(Vx, B);
 				const int LocalY = (int)vxc::floorMod(Vy, B);
@@ -761,22 +823,12 @@ bool FVoxelWorldImpl::TryDig(const FVector& CameraLoc, const FVector& CameraDir)
 	{
 		return false;
 	}
-
-	for (auto& Entry : EditsByBrick)
-	{
-		Voxels.applyEdit(Entry.first, std::move(Entry.second));
-	}
-
-	for (const VoxelCoords::FVoxelChunkKey& Key : DirtyChunks)
-	{
-		MarkChunkDirtyForRemesh(Key);
-	}
-	SortPendingQueues(LastAnchorLocation);
-
+	ApplyGroupedEdits(EditsByBrick, DirtyChunks);
 	return true;
 }
 
-bool FVoxelWorldImpl::TryPlace(const FVector& CameraLoc, const FVector& CameraDir)
+bool FVoxelWorldImpl::TryPlace(const FVector& CameraLoc, const FVector& CameraDir, int32 SizeVoxels, uint8 MaterialId,
+                                const FVector& PlayerActorLocation)
 {
 	const FVector Dir = CameraDir.GetSafeNormal();
 	if (Dir.IsNearlyZero())
@@ -790,25 +842,130 @@ bool FVoxelWorldImpl::TryPlace(const FVector& CameraLoc, const FVector& CameraDi
 		return false; // no hit, or the ray started inside solid (no valid face)
 	}
 
+	const int32 N = FMath::Clamp(SizeVoxels, UVoxelWorldSubsystem::MinCubeSizeVoxels, UVoxelWorldSubsystem::MaxCubeSizeVoxels);
 	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
-	const int64 Vx = Hit.px, Vy = Hit.py, Vz = Hit.pz;
-	const vxc::BrickKey BKey = vxc::ChunkMap<B>::keyForVoxel(Vx, Vy, Vz);
-	const int LocalX = (int)vxc::floorMod(Vx, B);
-	const int LocalY = (int)vxc::floorMod(Vy, B);
-	const int LocalZ = (int)vxc::floorMod(Vz, B);
-	const uint16_t Cell = (uint16_t)vxc::Brick<B>::cellIndex(LocalX, LocalY, LocalZ);
 
-	Voxels.applyEdit(BKey, {vxc::EditCell{Cell, vxc::MAT_ROCK}});
+	// Cube grid-snapped against the hit face, biased AWAY from the surface
+	// (m1-plan.md "Place" row): grow along the face axis opposite the ray's
+	// entry direction (-Hit.faceSign), starting from Hit.px/py/pz (already
+	// the empty voxel adjacent to the face) -- mirrors TryDig's bias.
+	int64 MinX, MinY, MinZ;
+	ComputeCubeMinCorner(Hit.px, Hit.py, Hit.pz, Hit.faceAxis, -Hit.faceSign, N, MinX, MinY, MinZ);
 
-	TSet<VoxelCoords::FVoxelChunkKey> DirtyChunks;
-	CollectDirtyChunks(Vx, Vy, Vz, DirtyChunks);
-	for (const VoxelCoords::FVoxelChunkKey& Key : DirtyChunks)
+	// Reject if the placement cube would overlap the player's collision box
+	// (m1-plan.md "Place" row: "Placement must not intersect the player's
+	// collision box"). Box half-extents mirror AVoxelEarthFlyPawn's walk-mode
+	// collision box (60x60x180 UU) -- duplicated here (rather than reaching
+	// into the pawn) since the subsystem must not depend on a specific pawn
+	// class.
+	constexpr double PlayerHalfExtentXYUU = 30.0;
+	constexpr double PlayerHalfExtentZUU = 90.0;
+	const FVector CubeMinUU = VoxelCoords::VoxelToWorldCorner(VoxelCoords::FVoxelCoord{MinX, MinY, MinZ});
+	const FVector CubeMaxUU =
+		VoxelCoords::VoxelToWorldCorner(VoxelCoords::FVoxelCoord{MinX + N, MinY + N, MinZ + N});
+	const FVector PlayerMinUU = PlayerActorLocation - FVector(PlayerHalfExtentXYUU, PlayerHalfExtentXYUU, PlayerHalfExtentZUU);
+	const FVector PlayerMaxUU = PlayerActorLocation + FVector(PlayerHalfExtentXYUU, PlayerHalfExtentXYUU, PlayerHalfExtentZUU);
+	const bool bOverlapsPlayer = CubeMinUU.X < PlayerMaxUU.X && CubeMaxUU.X > PlayerMinUU.X && CubeMinUU.Y < PlayerMaxUU.Y &&
+	                              CubeMaxUU.Y > PlayerMinUU.Y && CubeMinUU.Z < PlayerMaxUU.Z && CubeMaxUU.Z > PlayerMinUU.Z;
+	if (bOverlapsPlayer)
 	{
-		MarkChunkDirtyForRemesh(Key);
+		UE_LOG(LogVoxelEarth, Log, TEXT("TryPlace rejected: %dx%dx%d cube at (%lld,%lld,%lld) would intersect the player."),
+		       N, N, N, (long long)MinX, (long long)MinY, (long long)MinZ);
+		return false;
 	}
-	SortPendingQueues(LastAnchorLocation);
 
+	// One World::applyEdit per touched brick, same grouping as TryDig.
+	std::unordered_map<vxc::BrickKey, std::vector<vxc::EditCell>, vxc::BrickKeyHash> EditsByBrick;
+	TSet<VoxelCoords::FVoxelChunkKey> DirtyChunks;
+
+	for (int64 Dz = 0; Dz < N; ++Dz)
+	{
+		for (int64 Dy = 0; Dy < N; ++Dy)
+		{
+			for (int64 Dx = 0; Dx < N; ++Dx)
+			{
+				const int64 Vx = MinX + Dx, Vy = MinY + Dy, Vz = MinZ + Dz;
+				const vxc::BrickKey BKey = vxc::ChunkMap<B>::keyForVoxel(Vx, Vy, Vz);
+				const int LocalX = (int)vxc::floorMod(Vx, B);
+				const int LocalY = (int)vxc::floorMod(Vy, B);
+				const int LocalZ = (int)vxc::floorMod(Vz, B);
+				const uint16_t Cell = (uint16_t)vxc::Brick<B>::cellIndex(LocalX, LocalY, LocalZ);
+				EditsByBrick[BKey].push_back(vxc::EditCell{Cell, (vxc::MaterialId)MaterialId});
+
+				CollectDirtyChunks(Vx, Vy, Vz, DirtyChunks);
+			}
+		}
+	}
+
+	if (EditsByBrick.empty())
+	{
+		return false;
+	}
+	ApplyGroupedEdits(EditsByBrick, DirtyChunks);
 	return true;
+}
+
+int32 FVoxelWorldImpl::CarveSphere(const FVector& CenterUU, double RadiusUU, double JitterUU)
+{
+	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
+	const double VoxelSize = VoxelCoords::VoxelSizeUU;
+	const uint64 Seed = Voxels.amplifier().seed();
+	const double MaxExtentUU = RadiusUU + FMath::Abs(JitterUU);
+
+	// Bounding box of voxels that could possibly be inside RadiusUU +
+	// JitterUU of CenterUU, in voxel-lattice coordinates.
+	const int64 VXMin = (int64)FMath::FloorToDouble((CenterUU.X - MaxExtentUU) / VoxelSize);
+	const int64 VXMax = (int64)FMath::CeilToDouble((CenterUU.X + MaxExtentUU) / VoxelSize);
+	const int64 VYMin = (int64)FMath::FloorToDouble((CenterUU.Y - MaxExtentUU) / VoxelSize);
+	const int64 VYMax = (int64)FMath::CeilToDouble((CenterUU.Y + MaxExtentUU) / VoxelSize);
+	const int64 VZMin = (int64)FMath::FloorToDouble((CenterUU.Z - MaxExtentUU) / VoxelSize);
+	const int64 VZMax = (int64)FMath::CeilToDouble((CenterUU.Z + MaxExtentUU) / VoxelSize);
+
+	// One World::applyEdit per touched brick, same grouping as TryDig/TryPlace.
+	std::unordered_map<vxc::BrickKey, std::vector<vxc::EditCell>, vxc::BrickKeyHash> EditsByBrick;
+	TSet<VoxelCoords::FVoxelChunkKey> DirtyChunks;
+	int32 RemovedCount = 0;
+
+	for (int64 Vz = VZMin; Vz <= VZMax; ++Vz)
+	{
+		for (int64 Vy = VYMin; Vy <= VYMax; ++Vy)
+		{
+			for (int64 Vx = VXMin; Vx <= VXMax; ++Vx)
+			{
+				const FVector VoxelCenterUU = VoxelCoords::VoxelToWorldCenter(VoxelCoords::FVoxelCoord{Vx, Vy, Vz});
+				const double DistUU = (VoxelCenterUU - CenterUU).Size();
+
+				// Deterministic per-voxel jitter (m1-plan.md "Explosives v1"
+				// row): vxc::hash3(seed, vx,vy,vz, channel 40), top 16 bits
+				// signed and scaled into [-JitterUU, +JitterUU] -- gives a
+				// ragged, reproducible blast edge instead of a perfect sphere.
+				const uint64 H = vxc::hash3(Seed, Vx, Vy, Vz, /*channel*/ 40);
+				const double JitterHereUU = (double(vxc::hashToSigned16(H)) / 32768.0) * JitterUU;
+				if (DistUU >= RadiusUU + JitterHereUU)
+				{
+					continue;
+				}
+
+				if (Voxels.materialAt(Vx, Vy, Vz) == vxc::MAT_AIR)
+				{
+					continue; // nothing to remove; also keeps the edit-log entry minimal
+				}
+
+				const vxc::BrickKey BKey = vxc::ChunkMap<B>::keyForVoxel(Vx, Vy, Vz);
+				const int LocalX = (int)vxc::floorMod(Vx, B);
+				const int LocalY = (int)vxc::floorMod(Vy, B);
+				const int LocalZ = (int)vxc::floorMod(Vz, B);
+				const uint16_t Cell = (uint16_t)vxc::Brick<B>::cellIndex(LocalX, LocalY, LocalZ);
+				EditsByBrick[BKey].push_back(vxc::EditCell{Cell, vxc::MAT_AIR});
+
+				CollectDirtyChunks(Vx, Vy, Vz, DirtyChunks);
+				++RemovedCount;
+			}
+		}
+	}
+
+	ApplyGroupedEdits(EditsByBrick, DirtyChunks);
+	return RemovedCount;
 }
 
 // UVoxelWorldSubsystem ----------------------------------------------------
@@ -936,14 +1093,15 @@ TStatId UVoxelWorldSubsystem::GetStatId() const
 	RETURN_QUICK_DECLARE_CYCLE_STAT(UVoxelWorldSubsystem, STATGROUP_Tickables);
 }
 
-bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection)
+bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection, int32 SizeVoxels)
 {
-	return Impl ? Impl->TryDig(CameraWorldLocation, CameraWorldDirection) : false;
+	return Impl ? Impl->TryDig(CameraWorldLocation, CameraWorldDirection, SizeVoxels) : false;
 }
 
-bool UVoxelWorldSubsystem::TryPlace(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection)
+bool UVoxelWorldSubsystem::TryPlace(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection, int32 SizeVoxels,
+                                     uint8 MaterialId, const FVector& PlayerActorLocation)
 {
-	return Impl ? Impl->TryPlace(CameraWorldLocation, CameraWorldDirection) : false;
+	return Impl ? Impl->TryPlace(CameraWorldLocation, CameraWorldDirection, SizeVoxels, MaterialId, PlayerActorLocation) : false;
 }
 
 double UVoxelWorldSubsystem::GetSurfaceHeightUU(double WorldX, double WorldY) const
@@ -968,4 +1126,46 @@ bool UVoxelWorldSubsystem::IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const
 	// dug voxel must read back as non-solid immediately, and a placed one as
 	// solid, for walk-mode collision to agree with what dig/place just did.
 	return Impl->Voxels.materialAt(Vx, Vy, Vz) != vxc::MAT_AIR;
+}
+
+bool UVoxelWorldSubsystem::RaycastVoxelWorld(const FVector& StartUU, const FVector& DirUU, double MaxDistUU,
+                                              FVector& OutHitVoxelCenterUU, FVector& OutPrevVoxelCenterUU) const
+{
+	if (!Impl || MaxDistUU <= 0.0)
+	{
+		return false;
+	}
+
+	const FVector Dir = DirUU.GetSafeNormal();
+	if (Dir.IsNearlyZero())
+	{
+		return false;
+	}
+
+	// Same mm conversion as the dig/place raycast (CastFromCamera above);
+	// kept independent (not shared) so this method stays self-contained for
+	// the parallel file-ownership split noted in docs/m1-plan.md.
+	const int64 OxMm = VoxelCoords::WorldToMm(StartUU.X);
+	const int64 OyMm = VoxelCoords::WorldToMm(StartUU.Y);
+	const int64 OzMm = VoxelCoords::WorldToMm(StartUU.Z);
+	const double RangeMm = MaxDistUU * 10.0; // UU -> mm (1 UU = 10 mm)
+	const int64 DxMm = (int64)FMath::RoundToDouble(Dir.X * RangeMm);
+	const int64 DyMm = (int64)FMath::RoundToDouble(Dir.Y * RangeMm);
+	const int64 DzMm = (int64)FMath::RoundToDouble(Dir.Z * RangeMm);
+
+	const auto MaterialFn = [this](int64 X, int64 Y, int64 Z) { return Impl->Voxels.materialAt(X, Y, Z); };
+	const vxc::RaycastHit Hit = vxc::raycastVoxels(MaterialFn, OxMm, OyMm, OzMm, DxMm, DyMm, DzMm);
+	if (!Hit.hit)
+	{
+		return false;
+	}
+
+	OutHitVoxelCenterUU = VoxelCoords::VoxelToWorldCenter(VoxelCoords::FVoxelCoord{Hit.vx, Hit.vy, Hit.vz});
+	OutPrevVoxelCenterUU = VoxelCoords::VoxelToWorldCenter(VoxelCoords::FVoxelCoord{Hit.px, Hit.py, Hit.pz});
+	return true;
+}
+
+int32 UVoxelWorldSubsystem::CarveSphere(const FVector& CenterUU, double RadiusUU, double JitterUU)
+{
+	return Impl ? Impl->CarveSphere(CenterUU, RadiusUU, JitterUU) : 0;
 }

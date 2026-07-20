@@ -64,24 +64,39 @@ public:
 	static constexpr double LoadRadiusMeters = 64.0;
 	static constexpr double UnloadRadiusMeters = 80.0;
 
-	// Stage 2 decisions table: dig/place raycast range and dig sphere radius.
+	// Stage 2 decisions table: dig/place raycast range.
 	static constexpr double DigPlaceRangeMeters = 8.0;
-	static constexpr int32 DigSphereRadiusVoxels = 3;
 
-	// Digs a sphere (radius DigSphereRadiusVoxels, MAT_AIR) centred on the
-	// first solid voxel hit by a ray from CameraWorldLocation along
+	// m1-plan.md "Player experience decisions" (Matt sign-off): dig/place
+	// cube edge lengths, in voxels, selectable via AVoxelEarthPlayerController
+	// (scroll wheel / number keys).
+	static constexpr int32 MinCubeSizeVoxels = 1;
+	static constexpr int32 MaxCubeSizeVoxels = 4;
+
+	// Digs a grid-aligned SizeVoxels^3 cube (MAT_AIR) anchored on the first
+	// solid voxel hit by a ray from CameraWorldLocation along
 	// CameraWorldDirection (need not be normalized), out to
-	// DigPlaceRangeMeters. Submits one World::applyEdit per touched brick
-	// (the edit-log authority path) and re-meshes every dirty render chunk
-	// (including chunk-border neighbors) budgeted on subsequent ticks. Game
-	// thread only. Returns true if anything was edited.
-	bool TryDig(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection);
+	// DigPlaceRangeMeters. The cube is centred on the hit voxel on the two
+	// axes tangent to the hit face and biased ~SizeVoxels/2 along the
+	// negative hit-face normal (into the terrain) on the face axis, so it
+	// bites into solid material rather than mostly digging air (m1-plan.md
+	// "Dig sizes" row -- replaces the old r=3 sphere dig). Submits one
+	// World::applyEdit per touched brick (the edit-log authority path) and
+	// re-meshes every dirty render chunk (including chunk-border neighbors)
+	// budgeted on subsequent ticks. Game thread only. Returns true if
+	// anything was edited.
+	bool TryDig(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection, int32 SizeVoxels);
 
-	// Places a single MAT_ROCK voxel on the face of the first solid voxel hit
-	// by the same ray (no-op if nothing is hit within range, or the ray
-	// starts inside solid geometry -- no valid face to place against). Game
-	// thread only. Returns true if a voxel was placed.
-	bool TryPlace(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection);
+	// Places a grid-aligned SizeVoxels^3 cube of MaterialId, grid-snapped
+	// against the face of the first solid voxel hit by the same ray (biased
+	// away from the surface, mirroring TryDig's bias) -- no-op if nothing is
+	// hit within range, or the ray starts inside solid geometry (no valid
+	// face to place against). Rejected (logged, no edit) if the placement
+	// cube would overlap the player's collision box at PlayerActorLocation
+	// (m1-plan.md "Place" row). Game thread only. Returns true if the cube
+	// was placed.
+	bool TryPlace(const FVector& CameraWorldLocation, const FVector& CameraWorldDirection, int32 SizeVoxels,
+	              uint8 MaterialId, const FVector& PlayerActorLocation);
 
 	// Amplifier column surface elevation, in UE units (cm), at the given
 	// world XY. A pure query (no streaming state touched) -- safe to call as
@@ -97,6 +112,34 @@ public:
 	// collision in AVoxelEarthFlyPawn queries this per-voxel instead of using
 	// a physics engine.
 	bool IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const;
+
+	// Deterministic voxel DDA raycast (voxelcore/raycast.h) from StartUU along
+	// DirUU (need not be normalized -- normalized internally), out to
+	// MaxDistUU. Used by AVoxelEarthFlyPawn for the over-the-shoulder camera's
+	// collision-aware pull-in (Player experience decisions table, "Cameras"
+	// row): terrain has no Chaos collision, so USpringArmComponent's probe
+	// can't be used -- this gives the same DDA the dig/place raycast uses
+	// instead. On hit, OutHitVoxelCenterUU is the first solid voxel's center
+	// and OutPrevVoxelCenterUU is the center of the last empty voxel before
+	// it (project the segment head->OutPrevVoxelCenterUU to know how far the
+	// camera can safely sit along the ray). Returns false (outputs
+	// untouched) if nothing solid is hit within MaxDistUU. Game thread only
+	// (same constraint as IsSolidAtVoxel).
+	bool RaycastVoxelWorld(const FVector& StartUU, const FVector& DirUU, double MaxDistUU, FVector& OutHitVoxelCenterUU, FVector& OutPrevVoxelCenterUU) const;
+
+	// --- Explosives v1 (m1-plan.md "Explosives v1" row) ---------------------
+
+	// Carves (MAT_AIR) every voxel whose center lies within RadiusUU +
+	// per-voxel jitter of CenterUU (both UU), where the jitter is a
+	// deterministic per-voxel hash (vxc::hash3, world seed, channel 40)
+	// scaled into [-JitterUU, +JitterUU] -- a ragged, reproducible blast edge
+	// rather than a perfect sphere. Same edit-log authority path as
+	// TryDig/TryPlace (one World::applyEdit per touched brick; dirties every
+	// overlapping render chunk incl. neighbors, budgeted re-mesh on
+	// subsequent ticks). Called by AVoxelExplosive on fuse detonation. Game
+	// thread only. Returns the number of voxels actually removed (were
+	// non-air before the carve).
+	int32 CarveSphere(const FVector& CenterUU, double RadiusUU, double JitterUU);
 
 private:
 	TUniquePtr<FVoxelWorldImpl> Impl;
