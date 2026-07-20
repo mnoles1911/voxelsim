@@ -30,4 +30,15 @@ private:
 	// run can prove (via log lines + a screenshot) that ring chunks over the
 	// dig site actually re-mesh through the overlay-aware path.
 	FTimerHandle HeadlessDigTestTimerHandle;
+
+	// M3 wave 1 gate verification (docs/m3-plan.md "two clients dig the same
+	// hole"): -VoxelDumpDigestAfter=<s> logs THIS process's (the server's)
+	// seed + World::editedDigest() -- see AVoxelEarthPlayerController's
+	// identical switch for the client-side dump (GameMode only exists
+	// server-side, so the server's own dump has to live here instead).
+	// Self-quits a few seconds after dumping (see the .cpp) so a headless
+	// dedicated-server process run for the gate exits on its own instead of
+	// needing to be killed externally.
+	FTimerHandle ServerDumpDigestTimerHandle;
+	FTimerHandle ServerDigestQuitTimerHandle;
 };
