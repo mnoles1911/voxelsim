@@ -3336,3 +3336,162 @@ new solid geometry), but a genuine visual/data quirk worth a real fix later.
 (3) `docs/adr/0003-hydrostatic-persistent-body.md` item 3 (the persistent
 per-water-body structure) remains deliberately deferred, unaffected by this
 wave.
+
+### Water reactivation on terrain edits (wakeRegion)
+
+**The bug.** A fully settled body of water (`activeBricks==0`) ignored terrain
+edits completely. `vxc::WaterCA::step()` is a no-op over an empty active set
+(waterca.h "Activity / settling": a brick that produces no net change in a tick
+drops out of the active set, and the next active set is exactly the set of
+bricks that changed), and NOTHING ever put a brick back for an above-sea-level
+edit -- only the Reservoir v0 breach path did, and only for Z<0 ocean-adjacent
+cells. `NotifyTerrainRegionEdited`'s `invalidateSolidRegion` call corrects what
+the CA BELIEVES about terrain but never makes it LOOK. Net effect in shipped
+gameplay: dig underneath a settled pond and nothing happened -- proven by the
+previous wave (unchanging water digest through an entire dig/place/carve/
+collapse sequence, which is why that scenario needed `SpawnWaterAt` "nudges" to
+prove anything at all).
+
+**The fix: `WaterCA::wakeRegion(minVoxel..maxVoxel)`** (waterca.h/.cpp).
+Re-inserts into the active set every brick that CURRENTLY STORES WATER and
+intersects the edited voxel box grown by `kWakeHaloBricks == 1` brick on each
+axis. It writes no fill at all -- waking is purely a SCHEDULING act, never a
+source or a sink, so `totalVolume()` cannot move because of it. Returns the
+number of bricks newly woken.
+
+*Why a 1-brick halo, and why only that.* Waking only the bricks the edit
+overlaps is useless for the flagship case: when you dig the floor out from
+under a pond, every removed voxel is dry terrain and there is no water in the
+edited bricks at all. One brick of halo covers every face-, edge- and
+corner-adjacent brick, i.e. every brick whose cells can be within one CA step's
+reach (gravity/lateral are 1-voxel moves) of a changed voxel. It does not need
+to be wider: once any woken brick actually moves water, `stepWithOrder`'s
+existing "changed UNION changed's 6 face-neighbours" rule carries activity
+outward on its own, as far as the water genuinely travels. So the halo only
+SEEDS the reaction; it never has to predict its extent -- which is also what
+stops a big edit beside a big lake from re-activating the whole lake up front.
+Empty bricks in the halo are skipped (nothing to move, and they would cost a
+512-cell scan per tick); water flowing INTO an empty brick is already covered,
+because the SOURCE brick is active and `stepWithOrder`'s `touched` set already
+includes every active cell's target-direction neighbours.
+
+*Determinism.* The woken set is a pure function of (region, WaterMap contents).
+`active_` is a `std::set` ordered by `BrickKeyLess`, so insertion order is
+unobservable, and the per-brick test ("does this key store water?") depends on
+no iteration or hash order. `wakeRegion` picks between walking the region's
+bricks and walking the stored bricks purely on size; both enumerate exactly
+{stored} INTERSECT {region}. Pinned by
+`waterca_wake_region_order_and_strategy_independent` (same body built in two
+insertion orders -> identical woken set and identical post-tick digest under
+forward vs reversed active-set order, plus a same-region/different-strategy
+cross-check).
+
+**Wiring.** `UVoxelWaterSubsystem::NotifyTerrainRegionEdited` now calls
+`wakeRegion` right after `invalidateSolidRegion`. That hook is already called
+by EVERY authoritative edit path (TryDig / TryPlace / CarveSphere /
+PromoteDetachedIslands+collapse / structure fixtures), so every edit path gets
+reactivation for free, with the same authority-only (`NetMode != NM_Client`)
+gating as the invalidation. A `LogVoxelWater` Verbose line reports the woken
+count per edit.
+
+**Proof -- the settled pond actually drains now.** New GameMode switch
+`-VoxelWaterWakeTest[=<delaySeconds>]` runs the IDENTICAL basin/pour/dig/place/
+carve/structure/collapse sequence as `-VoxelWaterMemoTest`, but with every
+`SpawnWaterAt` nudge suppressed, so nothing but the terrain edits themselves
+can move water. Headless (`-nullrhi`, seed 20260719, clean `Saved/VoxelWorlds`):
+
+| Checkpoint | water digest | volume |
+|---|---|---|
+| pour | `0x68598CA231A5B2D8` | 20000 |
+| pre-edit settle (pond settled, activeBricks 0) | `0xFFCC45E6CD111EC2` | 20000 |
+| dig beneath basin (`applied=1`), `wakeRegion` woke **10** bricks | `0xFFCC45E6CD111EC2` (unchanged at the instant of the edit -- waking writes nothing) | 20000 |
+| post-dig settled | **`0xA16FBD50DC4EDB3F`** | 20000 |
+| place at basin floor (`applied=1`), woke 5 bricks | `0xA16FBD50DC4EDB3F` | 20000 |
+| post-place settled | `0xA16FBD50DC4EDB3F` | 20000 |
+| side carve / structure fixture / M5 collapse blast | `0xA16FBD50DC4EDB3F` | 20000 |
+| FINAL | `0xA16FBD50DC4EDB3F`, storedBricks 8, activeBricks 0 | 20000 |
+
+The pond, settled and dormant, MOVED when the floor was dug out from under it
+(`0xFFCC45E6...` -> `0xA16FBD50...`) with volume EXACTLY conserved at 20000 at
+every checkpoint -- on the old code that digest was constant through the whole
+sequence. The later edits wake bricks (the TryPlace path logged 5) but move
+nothing, because by then the water has drained down the shaft and out of their
+reach; the carve/structure/collapse are metres from any remaining water and
+wake 0 bricks, which is the correct answer and not a missed hook (an edit
+nowhere near water must cost one bounded probe and wake nothing).
+
+Screenshots (windowed run, same switch, camera framed on the water body's own
+centroid), in `ue-project/Saved/Screenshots/WindowsEditor/`:
+`VoxelWakeTest_PondSettled_BeforeDig.png` (t=42s, the pool's flat surface
+filling the basin) and `VoxelWakeTest_Drained_AfterDig.png` (t=55s, same
+camera -- the pool is gone and the bare sand basin floor it was covering is
+exposed, the water having drained down the dug shaft).
+
+**Deterministic voxel-core proofs** (tests/test_waterca.cpp, 5 new tests):
+`waterca_wake_region_drains_settled_pond_into_new_hole` (settles a 2000-unit
+pond in a 4x4 basin, opens a shaft through the floor, asserts 20 ticks of
+NOTHING happening first -- the regression witness for the old behaviour -- then
+wakes and drains it to the exact expected bottom-up shaft profile, conservation
+checked after every single tick);
+`waterca_wake_region_settled_pool_flows_through_a_carved_breach` (the same
+story sideways: a multi-brick wall carve, re-levelling to 41/42 across all 48
+newly connected floor cells);
+`waterca_wake_region_writes_nothing_and_ignores_dry_regions` (digest and ledger
+byte-identical across a wake; a far-away edit and an inverted box both wake 0;
+re-waking is idempotent); `waterca_wake_region_order_and_strategy_independent`
+(above); `waterca_wake_region_halo_reaches_one_brick_not_two`.
+
+**`kWaterCAVersion` 3 -> 4, and NO golden moved.** The bump is deliberate and
+is a SIGNAL, not a re-pin: no tick rule changed, and `wakeRegion` is a new API
+that nothing in voxel-core's own scenarios calls, so every pinned digest is
+byte-identical to v3 -- `waterca_deterministic_repeat_and_golden_digest`
+(`0x3D2224BE4A253404`), `waterca_hydrostatic_large_pool_multibrick_golden`
+(`0x56BC18914355A205`) and `waterca_solid_cache_golden_digests_unchanged` all
+still pass against their existing values, and nothing was re-pinned anywhere.
+The version moves because a LIVE world now evolves differently across an
+identical terrain-edit sequence than it did before (that is the whole fix), so
+a v3 recording/replay or persisted water state no longer reproduces -- exactly
+what docs/determinism.md keeps the constant for.
+
+The engine-level memo A/B table above also did NOT move: re-running
+`-VoxelWaterMemoTest` with `voxel.Water.SolidCacheEnabled` forced 0 and 1
+reproduces every previously documented checkpoint byte-for-byte, FINAL included
+(`waterDigest 0x5D0D9B43677FD302`, `editedDigest 0xFB1235E05C62C838`,
+storedBricks 11, volume 21200), memo off == memo on. That scenario's nudges
+already woke the CA, so adding `wakeRegion` in front of them changes nothing
+there -- a useful independent confirmation that waking is a pure no-op wherever
+nothing can actually move.
+
+**Perf.** `vxc_waterca_bench` gained `--lake --wake-edit`: a settled 63x63 lake
+with a player-sized (3x3x3-voxel) terrain edit landing on its rim EVERY tick,
+forever -- the worst realistic case, and unlike the pre-existing `--lake`
+disturbance it injects no volume, so all of its cost is the reactivation
+itself. `wakeRegion` costs **0.0019 ms/call** (avg over 200 calls, ~5.9 bricks
+woken per edit), and the resulting `step()` averages **3.28 ms/tick** (memo ON,
+`--lake-solid-spin 50`) versus **4.09 ms/tick** for the existing addWater
+disturbance -- i.e. per-tick terrain editing beside a large settled lake is
+CHEAPER than the per-tick water drip the bench already treated as its steady
+state, and a settled lake with no edits still costs exactly zero (empty active
+set). The solidity memo's win is intact and untouched: the 441-column pour
+bench (which never calls `wakeRegion`) is **344.1 -> 131.5 ms/tick** in the
+~1830-active-brick window with the memo off vs on (2.6x), 4x versus the v0
+sequential engine.
+
+**Build/tests.** voxel-core (clang, llvm-mingw, Release, `-Wall -Wextra
+-Wconversion -Werror`, plus `waterca.cpp` re-checked under an explicit
+`-Wsign-conversion -Werror`): clean, **137/137 PASS, 0 FAIL**; float-ban script
+clean. `voxelcore.lib` rebuilt with MSVC 14.51/VS 2026 (Ninja, Release) for the
+UE link. `VoxelEarthEditor Win64 Development` -> `Result: Succeeded`, no
+warnings from the touched files.
+
+**Follow-ups.** (1) A halo of 1 brick is the right seed for 1-voxel-per-step
+flow; if a future Layer C adds multi-voxel-per-tick momentum, the halo must
+grow with it (it is a named constant, `WaterCA::kWakeHaloBricks`, for exactly
+that reason). (2) The stale-fill-inside-a-newly-solid-cell quirk (previous
+wave's follow-up 2) is untouched: waking schedules the brick, but no rule
+evicts water from a cell that just became solid, so that fill stays put
+(byte-identical across clients, just hidden). Now that a wake hook exists, an
+eviction rule on the place path is a natural next step. (3) The
+`-VoxelWaterMemoTest` nudges are now redundant for reactivation and are kept
+only so that scenario keeps reproducing its signed-off A/B table; they could be
+retired once someone re-pins that table.

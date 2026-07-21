@@ -509,6 +509,62 @@ void WaterCA::invalidateSolidRegion(int64_t minVx, int64_t minVy, int64_t minVz,
                                            static_cast<int32_t>(bz)});
 }
 
+// --- Terrain-edit reactivation (see waterca.h for the rule and its rationale;
+// this is scheduling only — it writes no fill, so the conservation ledger
+// cannot move) ---------------------------------------------------------------
+
+size_t WaterCA::wakeRegion(int64_t minVx, int64_t minVy, int64_t minVz, int64_t maxVx, int64_t maxVy,
+                           int64_t maxVz) {
+    if (minVx > maxVx || minVy > maxVy || minVz > maxVz) return 0;
+    if (water_.size() == 0) return 0; // nothing stores water: nothing can be woken
+
+    // Edited voxel box -> brick box, grown by the halo (see waterca.h). Kept in
+    // int64 throughout and clamped to the BrickKey int32 domain at the end, so
+    // the +/-1 halo can never wrap at the coordinate extremes.
+    const int64_t bx0 = floorDiv(minVx, kEdge) - kWakeHaloBricks;
+    const int64_t bx1 = floorDiv(maxVx, kEdge) + kWakeHaloBricks;
+    const int64_t by0 = floorDiv(minVy, kEdge) - kWakeHaloBricks;
+    const int64_t by1 = floorDiv(maxVy, kEdge) + kWakeHaloBricks;
+    const int64_t bz0 = floorDiv(minVz, kEdge) - kWakeHaloBricks;
+    const int64_t bz1 = floorDiv(maxVz, kEdge) + kWakeHaloBricks;
+
+    const uint64_t spanned =
+        static_cast<uint64_t>(bx1 - bx0 + 1) * static_cast<uint64_t>(by1 - by0 + 1) *
+        static_cast<uint64_t>(bz1 - bz0 + 1);
+
+    size_t woken = 0;
+    auto wake = [&](const BrickKey& k) {
+        if (active_.insert(k).second) ++woken;
+    };
+
+    if (spanned <= static_cast<uint64_t>(water_.size())) {
+        // Small edit (the overwhelmingly common case): walk the region's bricks
+        // and probe the WaterMap for each. O(spanned) hash lookups.
+        for (int64_t bz = bz0; bz <= bz1; ++bz)
+            for (int64_t by = by0; by <= by1; ++by)
+                for (int64_t bx = bx0; bx <= bx1; ++bx) {
+                    if (bx < INT32_MIN || bx > INT32_MAX || by < INT32_MIN || by > INT32_MAX ||
+                        bz < INT32_MIN || bz > INT32_MAX)
+                        continue;
+                    const BrickKey k{static_cast<int32_t>(bx), static_cast<int32_t>(by),
+                                     static_cast<int32_t>(bz)};
+                    if (water_.find(k) != nullptr) wake(k);
+                }
+    } else {
+        // Region larger than the whole stored water body: cheaper to walk the
+        // stored bricks and test containment. Same resulting set by
+        // construction (both enumerate exactly {stored bricks} INTERSECT
+        // {region bricks}); the traversal here is over an unordered_map, but
+        // the RESULT is a std::set, so hash order is not observable.
+        for (const auto& [k, brick] : water_) {
+            (void)brick;
+            if (k.x < bx0 || k.x > bx1 || k.y < by0 || k.y > by1 || k.z < bz0 || k.z > bz1) continue;
+            wake(k);
+        }
+    }
+    return woken;
+}
+
 void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
                               std::set<BrickKey, BrickKeyLess>& changed) {
     // --- Per-brick flood cache (W2 perf fix, docs/status.md) ----------------

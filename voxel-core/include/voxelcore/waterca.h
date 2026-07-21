@@ -346,7 +346,15 @@ namespace vxc {
 // themselves are UNCHANGED, only the new Phase C pass appended after them
 // is new behavior. Every stored WaterCA-derived save/golden must be
 // re-pinned against v3; there is no v2 compatibility path.
-inline constexpr uint32_t kWaterCAVersion = 3;
+// v4 (==4): wakeRegion() exists and the engine calls it on every terrain
+// edit (see "Terrain-edit reactivation" below). NO TICK RULE CHANGED — every
+// pinned voxel-core golden below is byte-identical to v3, because no
+// voxel-core scenario calls wakeRegion — but a live world's water now
+// genuinely reacts to digs/places/carves/collapses instead of sitting frozen,
+// so the same terrain-edit sequence replayed against a v3 recording no longer
+// reproduces v3's (buggy, unchanging) water state. Per docs/determinism.md
+// that divergence is what the version constant exists to signal.
+inline constexpr uint32_t kWaterCAVersion = 4;
 
 // Dense 8^3 fill-fraction brick. 0 = empty, 255 = full. Always brick edge
 // 8 (not templated like Brick<B> — water ticks at a fixed cell size).
@@ -519,6 +527,73 @@ public:
     void setReplicatedFill(int64_t vx, int64_t vy, int64_t vz, uint8_t newFill) {
         setFillAccounted(vx, vy, vz, newFill, nullptr);
     }
+
+    // --- Terrain-edit reactivation (wakeRegion) ---------------------------
+    //
+    // THE BUG THIS FIXES. Per "Activity / settling" above, a brick that
+    // produces no net change in a tick drops out of the active set, and
+    // step() over an empty active set is a no-op. That is correct and cheap
+    // for a world whose terrain never changes — but the CA has no idea when
+    // terrain DOES change. Before this API existed, the only way a settled
+    // brick could ever tick again was addWater() (which injects volume) or
+    // the caller happening to have some other water land next to it. So a
+    // settled pond sat frozen forever no matter what was dug out from
+    // underneath it: verified empirically (docs/status.md, W2) as an
+    // unchanging water digest across an entire dig/place/carve/collapse
+    // sequence. invalidateSolidRegion() only fixes the SOLIDITY MEMO's view
+    // of the edit; it does not (and must not) schedule anything.
+    //
+    // WHAT THIS DOES. Re-inserts into the active set every brick that
+    // CURRENTLY STORES WATER and intersects the edited voxel box grown by
+    // kWakeHaloBricks brick in each direction on each axis. It writes no
+    // fill whatsoever, so totalVolume() is unchanged by construction —
+    // waking is purely a SCHEDULING act, never a source or sink. Returns the
+    // number of bricks newly woken (diagnostics/tests only).
+    //
+    // THE NEIGHBORHOOD RULE, AND WHY. Waking only the bricks the edit
+    // literally overlaps is not enough: the whole point is that water NEXT
+    // TO a newly opened hole must now flow into it, and that water usually
+    // lives in a different brick from the voxels the dig removed (dig the
+    // floor out from under a pond and the removed voxels are all solid
+    // terrain — there is no water in the edited bricks at all). One brick of
+    // halo in each of x/y/z covers every face-, edge- and corner-adjacent
+    // brick, which is the complete set of bricks whose cells can be within
+    // one CA step's reach (gravity/lateral are 1-voxel moves) of any voxel
+    // the edit changed. It does NOT need to be larger than that: once ANY
+    // woken brick actually moves water, stepWithOrder's existing "changed
+    // UNION changed's 6 face-neighbors" rule carries the activity outward on
+    // its own, tick by tick, as far as the water actually travels. So the
+    // halo only has to seed the reaction, not predict its extent — which is
+    // also what keeps a big edit beside a big lake from re-activating the
+    // whole lake up front (only the lake's edit-adjacent rim wakes; the rest
+    // wakes only if and as water genuinely reaches it).
+    //
+    // ONLY WATER-BEARING BRICKS. An empty brick in the halo is skipped: it
+    // has no fill to move, so activating it would contribute nothing to any
+    // round while still costing a full 512-cell scan every tick until it
+    // settled back out. Water flowing INTO a currently-empty brick is
+    // already handled — the SOURCE brick is active, and stepWithOrder's
+    // `touched` set already includes every active cell's target-direction
+    // neighbors regardless of whether they hold water.
+    //
+    // DETERMINISM. The result is a pure function of (region, current
+    // WaterMap contents): the active set is a std::set ordered by
+    // BrickKeyLess, so insertion order is not observable, and the wake test
+    // ("does this brick key currently store water?") is per-brick and
+    // independent of any iteration or hash order. Enumerating the region's
+    // bricks vs. enumerating the stored bricks (the size-based strategy
+    // switch below) therefore yields the identical resulting active set —
+    // proved in-suite by waterca_wake_region_order_and_strategy_independent.
+    //
+    // WHY THIS BUMPS kWaterCAVersion. No tick RULE changed, and no
+    // voxel-core golden scenario calls this — but a live world's water now
+    // evolves differently across an identical terrain-edit sequence than it
+    // did before (that is the fix), so any recorded/replayed edit stream or
+    // persisted water state from before this is no longer reproducible.
+    // Per docs/determinism.md that is a version bump.
+    static constexpr int kWakeHaloBricks = 1;
+    size_t wakeRegion(int64_t minVx, int64_t minVy, int64_t minVz, int64_t maxVx, int64_t maxVy,
+                      int64_t maxVz);
 
     // --- Cross-tick terrain-solidity cache (OPT-IN; OFF by default) --------
     //
