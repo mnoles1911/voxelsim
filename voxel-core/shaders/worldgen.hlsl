@@ -6,8 +6,11 @@
 // DETERMINISM CONTRACT (docs/determinism.md): every expression here must be
 // a bit-exact mirror of the CPU reference. Integer-only; int64/uint64
 // arithmetic requires Int64 shader ops (D3D12 Int64ShaderOps / Vulkan
-// shaderInt64 — see ADR-0001). C++ and HLSL agree on: two's-complement
-// casts, truncation-toward-zero for / and %, arithmetic >> on signed.
+// shaderInt64 — see ADR-0001). C++ and HLSL agree on two's-complement casts
+// and arithmetic >> on signed values. They DO NOT reliably agree on signed
+// `/` and `%` when the operands have mixed signs — that is undefined in HLSL
+// and diverged between AMD and NVIDIA at the M0 gate; see the floorDiv /
+// truncDiv comment below and use those helpers instead.
 // Any change here that alters output is world-breaking: bump
 // vxc::kWorldGenVersion and regenerate goldens, never patch silently.
 //
@@ -80,11 +83,56 @@ static const int kOctaveAmplitudeMm[kOctaveCount] = {1800, 700, 260, 100};
 
 // --- primitives mirrored from core.h / hash.h ------------------------------
 
+// VENDOR-DIVERGENCE FIX (M0 gate, 2026-07: AMD RX 7800 XT PASS / NVIDIA RTX
+// 4090 FAIL on identical SPIR-V). Signed integer division and remainder with
+// operands of MIXED SIGN are not portable in this stack:
+//   * HLSL defines `%` only when both operands share a sign (D3D HLSL
+//     operator reference); GLSL says the same for `%` and for `/`.
+//   * DXC lowers them to OpSDiv/OpSRem, and the 64-bit integer emulation the
+//     driver substitutes is where the vendors part ways. On AMD, OpSRem
+//     returned a remainder with the sign of the DIVIDEND (matching x86/C++),
+//     so the flooring correction `(r < 0) != (b < 0)` fired for negative
+//     coordinates. On NVIDIA it did not fire, and floorDiv silently degraded
+//     to TRUNCATING division for every column with a negative world
+//     coordinate — wrong raster pixel, wrong noise lattice cell, metre-scale
+//     surfaceMm/topsoilMm/subsoilMm divergence.
+//
+// Everything below therefore routes signed division through MAGNITUDE-ONLY
+// unsigned division (OpUDiv), which has exactly one legal result on every
+// implementation, and reconstructs the sign explicitly. No OpSRem, no
+// sign-dependent rounding, anywhere in the worldgen math. Unsigned negation
+// wraps by definition, so these are also correct at INT64_MIN.
+// DO NOT reintroduce bare `/` or `%` on a possibly-negative signed value:
+// use floorDiv (floor, world coord -> cell index) or truncDiv (toward zero,
+// mirrors C++ `/`) so the CPU reference and the GPU agree by construction.
+
+uint64_t absToU64(int64_t v)
+{
+    const uint64_t u = (uint64_t)v;
+    return (v < 0) ? ((uint64_t)0 - u) : u;
+}
+
+// Truncating division — bit-exact mirror of C++ `/` on int64_t.
+int64_t truncDiv(int64_t a, int64_t b)
+{
+    const uint64_t uq = absToU64(a) / absToU64(b);
+    return ((a < 0) != (b < 0)) ? (int64_t)((uint64_t)0 - uq) : (int64_t)uq;
+}
+
+// Floored division — bit-exact mirror of vxc::floorDiv (core.h).
 int64_t floorDiv(int64_t a, int64_t b)
 {
-    const int64_t q = a / b;
-    const int64_t r = a % b;
-    return (r != 0 && ((r < 0) != (b < 0))) ? q - 1 : q;
+    const uint64_t ua = absToU64(a);
+    const uint64_t ub = absToU64(b);
+    const uint64_t uq = ua / ub;
+    if ((a < 0) != (b < 0))
+    {
+        // Negative quotient: round away from zero unless the division was
+        // exact. `uq * ub == ua` is the exactness test (no OpUMod needed).
+        const uint64_t bump = (uq * ub == ua) ? (uint64_t)0 : (uint64_t)1;
+        return (int64_t)((uint64_t)0 - uq - bump);
+    }
+    return (int64_t)uq;
 }
 
 int64_t clamp64(int64_t v, int64_t lo, int64_t hi)
@@ -125,13 +173,17 @@ int64_t valueNoise2(uint64_t seed, int64_t xMm, int64_t yMm, int64_t latticeMm, 
     const int64_t v11 = hashToSigned16(hash2(seed, x0 + 1, y0 + 1, channel));
     const int64_t gx = latticeMm - fx;
     const int64_t gy = latticeMm - fy;
-    return ((v00 * gx + v10 * fx) * gy + (v01 * gx + v11 * fx) * fy) /
-           (latticeMm * latticeMm);
+    // Numerator is routinely negative (v* in [-32768, 32767]) — truncDiv, not
+    // `/`, per the floorDiv comment above.
+    return truncDiv((v00 * gx + v10 * fx) * gy + (v01 * gx + v11 * fx) * fy,
+                    latticeMm * latticeMm);
 }
 
 int64_t slopeScaleQ10(int64_t slopeMmPerPx)
 {
-    return clamp64(512 + slopeMmPerPx / 24, 256, 4096);
+    // slopeMmPerPx is a sum of absolute values (>= 0), so both roundings agree
+    // today; truncDiv keeps that from becoming load-bearing.
+    return clamp64(512 + truncDiv(slopeMmPerPx, 24), 256, 4096);
 }
 
 // --- biome classification (voxelcore/biome.h) -------------------------------
@@ -285,8 +337,9 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
     const int64_t e11 = (int64_t)rasterElevationMm(px + 1, py + 1);
     const int64_t gx = pxMm - fx;
     const int64_t gy = pxMm - fy;
-    const int64_t baseMm =
-        ((e00 * gx + e10 * fx) * gy + (e01 * gx + e11 * fx) * fy) / (pxMm * pxMm);
+    // Elevations go negative (oceans) — truncDiv, not `/`.
+    const int64_t baseMm = truncDiv(
+        (e00 * gx + e10 * fx) * gy + (e01 * gx + e11 * fx) * fy, pxMm * pxMm);
 
     const int64_t slopeMmPerPx =
         (e10 > e00 ? e10 - e00 : e00 - e10) + (e01 > e00 ? e01 - e00 : e00 - e01);
@@ -296,11 +349,12 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
     [unroll]
     for (int i = 0; i < kOctaveCount; ++i)
     {
-        detailMm += valueNoise2(seed, xMm, yMm, (int64_t)kOctaveLatticeMm[i],
-                                CH_DETAIL_OCTAVE_BASE + (uint)i) *
-                    (int64_t)kOctaveAmplitudeMm[i] / 32768;
+        detailMm += truncDiv(valueNoise2(seed, xMm, yMm, (int64_t)kOctaveLatticeMm[i],
+                                         CH_DETAIL_OCTAVE_BASE + (uint)i) *
+                                 (int64_t)kOctaveAmplitudeMm[i],
+                             32768);
     }
-    detailMm = detailMm * sScale / 1024;
+    detailMm = truncDiv(detailMm * sScale, 1024);
 
     const uint cl = rasterClimate(px, py);
     const uint clTemperature = cl & 0xff;
@@ -311,10 +365,10 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
     outCol.surfaceMm = (int)clamp64(baseMm + detailMm, -8000000, 9000000);
 
     int64_t topsoil =
-        clamp64(300 + (int64_t)clPrecipitation * 8 - slopeMmPerPx / 4, 0, 2500);
+        clamp64(300 + (int64_t)clPrecipitation * 8 - truncDiv(slopeMmPerPx, 4), 0, 2500);
     const int64_t tj =
         (int64_t)hashToSigned16(hash2(seed, vx >> 4, vy >> 4, CH_TOPSOIL_JITTER));
-    topsoil += topsoil * tj / (4 * 32768);
+    topsoil += truncDiv(topsoil * tj, 4 * 32768); // tj is signed — truncDiv.
     outCol.topsoilMm = (int)topsoil;
 
     outCol.subsoilMm = (int)clamp64(topsoil * 2 + 500, 0, 6000);
