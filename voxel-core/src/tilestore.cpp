@@ -88,7 +88,7 @@ int32_t TileGridSampler::elevationMm(int64_t px, int64_t py) {
     uint32_t lx, ly;
     const TileData* t = findTile(px, py, lx, ly);
     if (!t) {
-        ++missingTileQueries;
+        missingTileQueries.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
     const int64_t metres = t->elevationAt(lx, ly);
@@ -99,7 +99,7 @@ ClimateSample TileGridSampler::climate(int64_t px, int64_t py) {
     uint32_t lx, ly;
     const TileData* t = findTile(px, py, lx, ly);
     if (!t) {
-        ++missingTileQueries;
+        missingTileQueries.fetch_add(1, std::memory_order_relaxed);
         return ClimateSample{};
     }
     ClimateSample c;
