@@ -13,6 +13,7 @@ add_library(voxelcore STATIC
   src/amplifier.cpp
   src/tilestore.cpp
   src/waterca.cpp
+  src/rivernet.cpp
 )
 target_include_directories(voxelcore PUBLIC include)
 if(MSVC)
