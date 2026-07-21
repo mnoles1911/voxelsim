@@ -476,6 +476,49 @@ behavior without the new switches/commands is unchanged (`LoadWorld: no
 saved world ... starting fresh` is the observed startup line whenever no
 save file exists, byte-identical to pre-wave-2 behavior otherwise).
 
+## M5 — Destruction (groundwork landed, 2026-07-20)
+
+- [x] **Connectivity flood-fill CPU reference** (`voxelcore/connectivity.h`,
+  plan §3.5: "Connectivity flood-fill over affected region on structural
+  edits -> disconnected islands promoted to rigid voxel debris bodies") —
+  the primitive that makes chopped trees / cut structures fall, landed as an
+  engine-free header-only C++20 module (no UE, no terrain dependency —
+  caller supplies `solidFn`/`anchorFn`, same shape as `waterca.h`).
+  `findComponents(solidFn, minCorner, maxCorner)` 6-connected-flood-fills an
+  inclusive voxel box into components, deterministically ordered by minimum
+  voxel coord (falls out of scanning the box in the same z-major order as
+  `VoxelCoordLess`, for free — no separate sort-by-min pass needed) with
+  voxels within each component sorted the same way.
+  `findDisconnectedIslands(solidFn, region, anchorFn)` is the concrete M5
+  use case: splits a structural edit's affected-region components into
+  anchored (contains >=1 `anchorFn`-true "grounded" voxel — stays standing)
+  vs. floating islands (zero anchored voxels — the set that should be
+  promoted to debris); `bottomFaceAnchor()` covers the common "touches the
+  region's bottom face" policy.
+  **Debris-body promotion + Chaos integration is M5-proper, in UE, later**
+  — this lands only the CPU graph-algorithm reference the plan's doctrine
+  §2 requires (CPU ref before GPU/engine port) plus its test coverage.
+- [x] **Tests** (`voxel-core/tests/test_connectivity.cpp`, 7 cases, all
+  passing): single blob -> 1 component; two separated blobs -> 2 components
+  in deterministic min-coord order; a vertical-trunk-plus-canopy "tree" cut
+  mid-trunk -> stump (anchored under a bottom-face anchor) splits from
+  canopy+upper-trunk (flagged as the floating island, 128 voxels); edge- and
+  corner-diagonal-only touches do NOT connect (6-connectivity, not 26);
+  determinism (identical digest run-over-run) with a pinned golden digest
+  `0xeccfa24f24b88702`; a component fully spanning the box -> 1 component,
+  zero islands under a bottom anchor; perf sanity over a 64^3 mostly-solid
+  region with scattered holes -> 1 component in ~30-55ms (well under the
+  reference-impl "not accidentally O(n^2)" bar, no hard target).
+- [x] **Build/warnings**: `voxel-core` full suite green on MSVC
+  (vcvars64 + VS-bundled CMake/Ninja, `/W4 /WX`) — 79/79 tests pass (72
+  pre-existing + 7 new). Separately verified clang-clean under
+  `-Wall -Wextra -Wconversion -Wsign-conversion -Werror` (llvm-mingw clang
+  22.1.5) — one real `int32_t -> size_t` implicit-narrowing sign-conversion
+  bug caught in `findDisconnectedIslands`'s component-index loop (MSVC's
+  `/W4` did not flag it) and fixed by making the loop index `size_t` with an
+  explicit `static_cast<int32_t>` when recording indices into the
+  `int32_t` result vectors.
+
 ## M0 GPU track (ADR-0001)
 
 - [x] Worldgen HLSL kernel (ColumnMain, VoxelizeMain, MeshCountMain,

@@ -12,6 +12,7 @@ add_executable(vxc_tests
   test_tilestore.cpp
   test_counters.cpp
   test_waterca.cpp
+  test_connectivity.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(vxc_tests PRIVATE voxelcore Threads::Threads)
