@@ -39,6 +39,18 @@ private:
 	// Self-quits a few seconds after dumping (see the .cpp) so a headless
 	// dedicated-server process run for the gate exits on its own instead of
 	// needing to be killed externally.
+	// M4 voxel light field + cone-traced GI verification (-VoxelGITest,
+	// -VoxelGIBreach, -VoxelGIOn). Self-contained: this switch does its own
+	// carve, its own camera framing and its own capture/quit, so it adds
+	// nothing to the shared -VoxelScreenshotAfter framing chain.
+	FVector GITestChamberCentreUU = FVector::ZeroVector;
+	double GITestSurfaceUU = 0.0;
+	FTimerHandle GITestTimerHandle;
+	FTimerHandle GITestBreachTimerHandle;
+	FTimerHandle GITestPoseTimerHandle;
+	FTimerHandle GITestShotTimerHandle;
+	FTimerHandle GITestQuitTimerHandle;
+
 	FTimerHandle ServerDumpDigestTimerHandle;
 	FTimerHandle ServerDigestQuitTimerHandle;
 

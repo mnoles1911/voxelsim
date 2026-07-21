@@ -62,6 +62,10 @@ public:
 	void SetLevel(int32 InLevel);
 	int32 GetLevel() const { return ChunkLevel; }
 
+	// M4 voxel GI: UVoxelGISubsystem surface-voxelizes these quads into the
+	// light field. Read-only; the GI subsystem never mutates chunk geometry.
+	const TArray<FVoxelChunkQuad>& GetChunkQuads() const { return ChunkQuads; }
+
 	//~ Begin UPrimitiveComponent Interface
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;

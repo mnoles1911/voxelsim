@@ -1,6 +1,7 @@
 #include "VoxelChunkComponent.h"
 
 #include "VoxelCoords.h"
+#include "VoxelEarth.h" // LogVoxelEarth, for the voxel.GI.Debug 2 per-chunk shading dump
 // Read-only reference to UVoxelWorldSubsystem::RingPresets (M2 "Transitions"
 // row: the ring cross-fade table is "derived from the ring radii" -- single
 // source of truth rather than a second hardcoded copy of 64/128/256/512/1024m).
@@ -10,6 +11,12 @@
 // (VoxelWorldSubsystem.h is itself voxel-core-free -- PImpl, see its own
 // top-of-file comment).
 #include "VoxelWorldSubsystem.h"
+// M4 voxel light field + cone-traced GI. Both are read-only from here: the
+// proxy samples the field to shade, and SetChunkQuads notifies the subsystem
+// that this chunk's geometry changed. Default off (voxel.GI.Enabled 0), in
+// which case every code path below collapses to exactly what it was.
+#include "VoxelGI.h"
+#include "VoxelLightField.h"
 
 #include "DynamicMeshBuilder.h"
 #include "Engine/CollisionProfile.h"
@@ -94,14 +101,59 @@ public:
 			return float(FMath::Fmod(WorldM, UVTilePeriodM));
 		};
 
+		// --- M4 voxel GI hookup ------------------------------------------
+		//
+		// GI is folded into the SAME VertexColor.G byte the mesher's geometric
+		// AO already writes, because M_VoxelTerrain computes
+		// BaseColor = albedoTint * VertexColor.G * DebugTint. That means no
+		// material asset change is needed, and -- critically for the M1 gate --
+		// when voxel.GI.Enabled is 0 every line below is skipped and the emitted
+		// FColor is byte-identical to what it was before this feature existed.
+		//
+		// The two terms compose rather than compete: the mesher's per-corner AO
+		// is CONTACT-scale occlusion (the inside of a 10cm crease), which a
+		// cone trace whose first step is already 40cm wide cannot resolve; the
+		// cone trace supplies the LARGE-scale term (a tunnel, a roof, a
+		// canyon) that per-voxel AO cannot see. Final G is their product.
+		const bool bGIEnabled = VoxelGI::IsEnabled() && Component->ChunkLevel == 0;
+		const UVoxelGISubsystem* GISubsystem = nullptr;
+		if (bGIEnabled)
+		{
+			if (const UWorld* World = Component->GetWorld())
+			{
+				GISubsystem = World->GetSubsystem<UVoxelGISubsystem>();
+			}
+		}
+		const FVoxelLightField* GIField = GISubsystem ? &GISubsystem->GetField() : nullptr;
+		TUniquePtr<FVoxelLightField::FReadScope> GIRead;
+		if (GIField)
+		{
+			// One read lock for the whole proxy build instead of one per
+			// vertex -- a chunk can be several thousand vertices.
+			GIRead = MakeUnique<FVoxelLightField::FReadScope>(*GIField);
+		}
+		const FVector GICentreUU = GISubsystem ? GISubsystem->GetFieldCentreUU() : FVector::ZeroVector;
+		const float GIStrength = VoxelGI::GetStrength();
+		const float GIAmbientFloor = VoxelGI::GetAmbientFloor();
+		const float GIFadeStartUU = VoxelGI::GetFadeStartUU();
+		const float GIFadeEndUU = FMath::Max(VoxelGI::GetFadeEndUU(), GIFadeStartUU + 1.f);
+
+		// GI is evaluated per VERTEX, and a greedy quad can span 32 voxels
+		// (3.2 m) with only 4 corner samples -- a light pool under a hole in a
+		// roof would smear across the whole face. Splitting quads when GI is on
+		// buys resolution at the cost of vertices; it is a cvar so the tradeoff
+		// is measurable, and it is entirely inert when GI is off.
+		const int32 GIMaxSpan = bGIEnabled ? VoxelGI::GetMaxQuadSpanVoxels() : 0;
+
+		int32 DebugGIHits = 0;
+		float DebugGISum = 0.f;
+
 		for (const FVoxelChunkQuad& Q : Component->ChunkQuads)
 		{
 			const int32 Axis = Q.Axis;
 			const int32 U = (Axis + 1) % 3;
 			const int32 V = (Axis + 2) % 3;
 			const float FaceCoordVox = float(Q.Slice) + (Q.Positive ? 1.f : 0.f);
-			const float U0 = float(Q.U0), V0 = float(Q.V0);
-			const float U1 = U0 + float(Q.W), V1 = V0 + float(Q.H);
 
 			auto MakePos = [&](float Uc, float Vc) -> FVector3f
 			{
@@ -112,64 +164,138 @@ public:
 				return P * LevelVoxelSizeUU;
 			};
 
-			// Quad loop (u0,v0) -> (u0,v1) -> (u1,v1) -> (u1,v0); corner
-			// indices below match the 2-bits-per-corner AO packing documented
+			// Corner indices match the 2-bits-per-corner AO packing documented
 			// in voxelcore/mesher.h: (0,0),(1,0),(0,1),(1,1).
-			FVector3f Pos[4] = {MakePos(U0, V0), MakePos(U0, V1), MakePos(U1, V1), MakePos(U1, V0)};
+			const float Ao00 = float(Q.Ao & 0x3);
+			const float Ao10 = float((Q.Ao >> 2) & 0x3);
+			const float Ao01 = float((Q.Ao >> 4) & 0x3);
+			const float Ao11 = float((Q.Ao >> 6) & 0x3);
 
-			const uint8 Ao00 = Q.Ao & 0x3;
-			const uint8 Ao10 = (Q.Ao >> 2) & 0x3;
-			const uint8 Ao01 = (Q.Ao >> 4) & 0x3;
-			const uint8 Ao11 = (Q.Ao >> 6) & 0x3;
-			const uint8 AoAtVert[4] = {Ao00, Ao01, Ao11, Ao10};
+			// Bilinear over the quad's own AO corners, so a subdivided quad
+			// reproduces exactly the same AO gradient an unsubdivided one had.
+			auto AoAt = [&](float Fu, float Fv) -> float
+			{
+				return FMath::Lerp(FMath::Lerp(Ao00, Ao10, Fu), FMath::Lerp(Ao01, Ao11, Fu), Fv);
+			};
 
 			const FVector3f Normal = AxisDir[Axis] * (Q.Positive ? 1.f : -1.f);
 			const FVector3f TangentX = AxisDir[U];
 			const FVector3f TangentY = AxisDir[V];
 
-			const int32 BaseVertex = Vertices.Num();
-			for (int32 CornerIdx = 0; CornerIdx < 4; ++CornerIdx)
+			const int32 SpanU = int32(Q.W);
+			const int32 SpanV = int32(Q.H);
+			const int32 StepU = (GIMaxSpan > 0) ? FMath::Min(SpanU, GIMaxSpan) : SpanU;
+			const int32 StepV = (GIMaxSpan > 0) ? FMath::Min(SpanV, GIMaxSpan) : SpanV;
+
+			for (int32 SubU = 0; SubU < SpanU; SubU += StepU)
 			{
-				FDynamicMeshVertex Vert;
-				Vert.Position = Pos[CornerIdx];
-				Vert.SetTangents(TangentX, TangentY, Normal);
+				const int32 SubU1 = FMath::Min(SubU + StepU, SpanU);
+				for (int32 SubV = 0; SubV < SpanV; SubV += StepV)
+				{
+					const int32 SubV1 = FMath::Min(SubV + StepV, SpanV);
 
-				const float WorldU = WrapWorldToUV(ComponentWorldOrigin[U], double(Pos[CornerIdx][U]));
-				const float WorldV = WrapWorldToUV(ComponentWorldOrigin[V], double(Pos[CornerIdx][V]));
-				Vert.TextureCoordinate[0] = FVector2f(WorldU, WorldV);
+					const float U0 = float(Q.U0 + SubU), U1 = float(Q.U0 + SubU1);
+					const float V0 = float(Q.V0 + SubV), V1 = float(Q.V0 + SubV1);
+					// Parametric position of this sub-rect's corners within the
+					// parent quad, for the AO bilinear above.
+					const float Fu0 = float(SubU) / float(SpanU), Fu1 = float(SubU1) / float(SpanU);
+					const float Fv0 = float(SubV) / float(SpanV), Fv1 = float(SubV1) / float(SpanV);
 
-				// R = material id, G = AO (2-bit -> 0/85/170/255), B unused,
-				// A = 255 (deliverable 3 vertex-color spec).
-				const uint8 AoByte = uint8(AoAtVert[CornerIdx] * 85);
-				Vert.Color = FColor(Q.Mat, AoByte, 0, 255);
+					// Corner order (u0,v0) -> (u0,v1) -> (u1,v1) -> (u1,v0),
+					// unchanged from the pre-GI code (the winding below
+					// depends on it).
+					const FVector3f Pos[4] = {MakePos(U0, V0), MakePos(U0, V1), MakePos(U1, V1), MakePos(U1, V0)};
+					const float CornerFu[4] = {Fu0, Fu0, Fu1, Fu1};
+					const float CornerFv[4] = {Fv0, Fv1, Fv1, Fv0};
 
-				Vertices.Add(Vert);
+					const int32 BaseVertex = Vertices.Num();
+					for (int32 CornerIdx = 0; CornerIdx < 4; ++CornerIdx)
+					{
+						FDynamicMeshVertex Vert;
+						Vert.Position = Pos[CornerIdx];
+						Vert.SetTangents(TangentX, TangentY, Normal);
+
+						const float WorldU = WrapWorldToUV(ComponentWorldOrigin[U], double(Pos[CornerIdx][U]));
+						const float WorldV = WrapWorldToUV(ComponentWorldOrigin[V], double(Pos[CornerIdx][V]));
+						Vert.TextureCoordinate[0] = FVector2f(WorldU, WorldV);
+
+						// R = material id, G = AO * GI, B unused, A = 255.
+						const float AoNorm = FMath::Clamp(AoAt(CornerFu[CornerIdx], CornerFv[CornerIdx]) * (85.f / 255.f), 0.f, 1.f);
+						float ShadeG = AoNorm;
+
+						if (GIRead.IsValid())
+						{
+							const FVector WorldPos = ComponentWorldOrigin + FVector(Pos[CornerIdx]);
+							float Irradiance = 0.f;
+							// A false return means "the field has nothing solved
+							// here yet" (brick streamed in this frame, or we are
+							// outside the GI ring). Falling back to plain AO
+							// rather than to zero is what stops a chunk from
+							// flashing black for the frames before its first
+							// solve lands.
+							if (GIRead->Sample(WorldPos, Normal, Irradiance))
+							{
+								++DebugGIHits;
+								DebugGISum += Irradiance;
+								const float DistUU = float(FVector::Dist(WorldPos, GICentreUU));
+								const float Fade = 1.f - FMath::Clamp((DistUU - GIFadeStartUU) / (GIFadeEndUU - GIFadeStartUU), 0.f, 1.f);
+								const float Ambient = FMath::Lerp(GIAmbientFloor, 1.f, FMath::Clamp(Irradiance, 0.f, 1.f));
+								// Weight 1 -> pure geometric AO, weight 0 -> AO * GI.
+								const float Weight = FMath::Clamp(GIStrength * Fade, 0.f, 1.f);
+								ShadeG = AoNorm * FMath::Lerp(1.f, Ambient, Weight);
+							}
+						}
+
+						const uint8 ShadeByte = bGIEnabled
+							? uint8(FMath::Clamp(FMath::RoundToInt(ShadeG * 255.f), 0, 255))
+							// GI off: reproduce the original 2-bit quantisation
+							// EXACTLY (0/85/170/255), not a rounded float of it.
+							: uint8(int32(AoAt(CornerFu[CornerIdx], CornerFv[CornerIdx]) + 0.5f) * 85);
+						Vert.Color = FColor(Q.Mat, ShadeByte, 0, 255);
+
+						Vertices.Add(Vert);
+					}
+
+					// Winding: verified empirically (wireframe-visible /
+					// lit-invisible on the original orientation, 2026-07-19):
+					// UE front faces need the loop order REVERSED for Positive
+					// faces relative to the initial guess. Positive and negative
+					// faces still wind oppositely, and the mesh is correct with a
+					// one-sided material.
+					if (Q.Positive)
+					{
+						IndexBuffer.Indices.Add(BaseVertex + 0);
+						IndexBuffer.Indices.Add(BaseVertex + 2);
+						IndexBuffer.Indices.Add(BaseVertex + 1);
+						IndexBuffer.Indices.Add(BaseVertex + 0);
+						IndexBuffer.Indices.Add(BaseVertex + 3);
+						IndexBuffer.Indices.Add(BaseVertex + 2);
+					}
+					else
+					{
+						IndexBuffer.Indices.Add(BaseVertex + 0);
+						IndexBuffer.Indices.Add(BaseVertex + 1);
+						IndexBuffer.Indices.Add(BaseVertex + 2);
+						IndexBuffer.Indices.Add(BaseVertex + 0);
+						IndexBuffer.Indices.Add(BaseVertex + 2);
+						IndexBuffer.Indices.Add(BaseVertex + 3);
+					}
+				}
 			}
+		}
 
-			// Winding: verified empirically (wireframe-visible / lit-invisible
-			// on the original orientation, 2026-07-19): UE front faces need
-			// the loop order REVERSED for Positive faces relative to the
-			// initial guess. Positive and negative faces still wind
-			// oppositely, and the mesh is now correct with a one-sided
-			// material (the temporary two-sided material flag can go away).
-			if (Q.Positive)
-			{
-				IndexBuffer.Indices.Add(BaseVertex + 0);
-				IndexBuffer.Indices.Add(BaseVertex + 2);
-				IndexBuffer.Indices.Add(BaseVertex + 1);
-				IndexBuffer.Indices.Add(BaseVertex + 0);
-				IndexBuffer.Indices.Add(BaseVertex + 3);
-				IndexBuffer.Indices.Add(BaseVertex + 2);
-			}
-			else
-			{
-				IndexBuffer.Indices.Add(BaseVertex + 0);
-				IndexBuffer.Indices.Add(BaseVertex + 1);
-				IndexBuffer.Indices.Add(BaseVertex + 2);
-				IndexBuffer.Indices.Add(BaseVertex + 0);
-				IndexBuffer.Indices.Add(BaseVertex + 2);
-				IndexBuffer.Indices.Add(BaseVertex + 3);
-			}
+		// voxel.GI.Debug 2: per-chunk shading dump. Distinguishes "GI is off",
+		// "GI is on but the field had nothing solved here" (hits << verts) and
+		// "GI is on and this is what it decided" (meanGI) -- the three
+		// explanations for an unexpected-looking chunk, told apart from one log
+		// line instead of from a screenshot.
+		if (VoxelGI::GetDebugLevel() >= 2 && Vertices.Num() > 0)
+		{
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("GIProxy: level=%d origin=(%.0f,%.0f,%.0f) verts=%d giEnabled=%d field=%d hits=%d meanGI=%.3f"),
+			       Component->ChunkLevel, ComponentWorldOrigin.X, ComponentWorldOrigin.Y, ComponentWorldOrigin.Z,
+			       Vertices.Num(), bGIEnabled ? 1 : 0, GIField ? 1 : 0, DebugGIHits,
+			       DebugGIHits > 0 ? DebugGISum / float(DebugGIHits) : -1.f);
 		}
 
 		VertexBuffers.InitFromDynamicVertex(&VertexFactory, Vertices);
@@ -376,6 +502,21 @@ void UVoxelChunkComponent::SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, int3
 
 	MarkRenderStateDirty();
 	UpdateBounds();
+
+	// M4 voxel GI. This single call is the ENTIRE edit-responsiveness
+	// mechanism: UVoxelWorldSubsystem already routes both stream-in and
+	// every edit-driven remesh through SetChunkQuads, so the GI subsystem
+	// learns about a dug tunnel or a blown roof by the same path it learns
+	// about a newly streamed chunk -- no deterministic path (worldgen, edit
+	// log, digest) is touched or even read to achieve it. With
+	// voxel.GI.Enabled 0 this is one cvar read and an immediate return.
+	if (const UWorld* World = VoxelGI::IsEnabled() ? GetWorld() : nullptr)
+	{
+		if (UVoxelGISubsystem* GI = World->GetSubsystem<UVoxelGISubsystem>())
+		{
+			GI->NotifyChunkMeshUpdated(this);
+		}
+	}
 }
 
 void UVoxelChunkComponent::SetLevel(int32 InLevel)
