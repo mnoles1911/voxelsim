@@ -455,3 +455,49 @@ VXC_TEST(waterca_hydrostatic_order_independent_and_deterministic) {
         CHECK_EQ(ds.h, dh.h); // byte-identical state every single tick, not just at the end
     }
 }
+
+// Phase C flood over a LARGE, multi-brick connected pool -- the regression
+// guard for the W2 hydrostatic perf rewrite (docs/status.md, 2026-07-20:
+// per-brick flood cache + deferred writes + no-op-write skip + raw solid_ for
+// the once-per-voxel air queries). That rewrite is a pure ACCESS-COST change
+// -- component partition, totalVol, bottom-up leveling and the overflow cap
+// are all supposed to be byte-for-byte identical to the old from-scratch
+// flood -- but the other hydrostatic tests above only exercise tiny
+// (single-column / 2x2) components that never cross a brick boundary in the
+// flood or stress the air-shell exploration. This one pours into a wide
+// 16x16 basin (footprint spans a 2x2 block of 8^3 bricks; the water column
+// plus the air headroom above it span several bricks in z too), so the flood
+// genuinely crosses brick faces in every direction, resolves the same brick
+// many times (exercising the cache), and explores a real air shell above the
+// surface -- then pins the settled digest so any future change that perturbs
+// the flood's cell set, ordering-into-leveling, or write set is caught.
+// (Verified byte-identical against the pre-rewrite implementation at this and
+// larger scales, incl. the 441-column overflow bench, before pinning.)
+VXC_TEST(waterca_hydrostatic_large_pool_multibrick_golden) {
+    WaterCA ca(basin(0, 15, 0, 15)); // 16x16 footprint = 2x2 bricks in x,y
+    // 4 full layers (4*256*255 = 261120) plus a partial 5th, chosen with a
+    // remainder so the top layer's fixed (x,y) tie-break distribution is
+    // exercised, not just clean full layers.
+    const uint32_t placed = ca.addWater(7, 7, 30, 300000);
+    CHECK_EQ(placed, uint32_t(300000));
+
+    const bool settled = runToSettleCheckingConservation(ca, 5000);
+    CHECK(settled);
+    CHECK_EQ(ca.totalVolume(), uint64_t(300000));
+
+    // Bottom-up fill: layers z=1..4 completely full (each 256*255=65280),
+    // consuming 261120; the remaining 38880 sits in z=5, nothing at z>=6.
+    for (int64_t x = 0; x <= 15; ++x)
+        for (int64_t y = 0; y <= 15; ++y) {
+            CHECK_EQ(int(ca.fillAt(x, y, 1)), 255);
+            CHECK_EQ(int(ca.fillAt(x, y, 4)), 255);
+            CHECK_EQ(int(ca.fillAt(x, y, 6)), 0);
+        }
+    CHECK_EQ(ca.recomputeVolume(), ca.totalVolume());
+
+    // GOLDEN(waterca_large_pool_multibrick), v3 hydrostatic contract
+    // (kWaterCAVersion==3). Locks the multi-brick flood + leveling output.
+    Digest d;
+    ca.digest(d);
+    CHECK_EQ(d.h, 0x56BC18914355A205ull);
+}

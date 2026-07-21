@@ -533,16 +533,21 @@ private:
 
     void activate(const BrickKey& k) { active_.insert(k); }
 
-    // Phase C — see header comment "Phase C — HYDROSTATIC". Templated (like
-    // the free-function round helpers in waterca.cpp) so it can be handed
-    // stepWithOrder's per-tick memoizing `cachedSolid` lambda directly
-    // instead of the raw solid_ callback; only ever instantiated from
-    // stepWithOrder, in the same translation unit, so the out-of-line
-    // template definition lives entirely in waterca.cpp (must appear
-    // textually before stepWithOrder there for implicit instantiation to
-    // see it).
-    template <typename SolidLookup>
-    void hydrostaticPass(SolidLookup&& solid, const std::set<BrickKey, BrickKeyLess>& touched,
+    // Phase C — see header comment "Phase C — HYDROSTATIC". Unlike Phase
+    // READ/APPLY (which is handed stepWithOrder's per-tick memoizing
+    // `cachedSolid` lambda, because its 5-neighbor gathers legitimately ask
+    // the SAME voxel's solidity several times per round so memoization pays
+    // off), the hydrostatic flood queries each air voxel at most ONCE per
+    // tick — the shared `visited` mask is checked before any solidity query,
+    // so a voxel is never re-examined — so routing those queries through the
+    // memo cache only adds a per-call VoxelKey hash plus an insert into a
+    // map that balloons to the full air-shell size (with the rehashing that
+    // implies), for ZERO dedup benefit. It therefore calls the raw `solid_`
+    // callback directly (measured: ~1.8x faster on the large-pour bench than
+    // going through the cache, byte-identical since memoization never changes
+    // a deterministic query's answer). No longer templated: with no
+    // cachedSolid lambda to inline it is a plain out-of-line member.
+    void hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
                          std::set<BrickKey, BrickKeyLess>& changed);
 
     SolidFn solid_;

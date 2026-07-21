@@ -1270,6 +1270,125 @@ time. No float/double anywhere in `waterca.h`/`waterca.cpp` (float-ban
 clean, unchanged) -- verified by grep, the one `double` string match is
 inside a code comment ("double-visit"), not a type.
 
+## Water track — W2 perf: hydrostatic flood access-cost rewrite, ~3x, BYTE-IDENTICAL (2026-07-20, worktree agent)
+
+Attacks the ~8-10x Phase C regression above. Constraint was hard: the tick
+OUTPUT must stay byte-for-byte identical (golden `0x3D2224BE4A253404`
+unchanged, order-independence preserved) -- this is world-derivation code,
+so a different digest is a FAIL, not a re-pin. Delivered: **identical output,
+~3x faster**, via a pure ACCESS-COST rewrite of `WaterCA::hydrostaticPass`'s
+flood (`voxel-core/src/waterca.cpp`). The component partition, per-component
+`totalVol`, bottom-up level allocation, the 65536-cell overflow cap, and
+every tie-break are unchanged by construction; only HOW the flood reads the
+map and applies writes changed.
+
+**What profiling actually found** (the earlier note's "traversal/visiting"
+diagnosis was right but incomplete). Instrumented cell counts on the
+441-column bench: **97-98% of flood cell-pops are AIR** (~900K air vs
+~14-31K water per tick) -- the deliberately-unbounded flood explores the
+entire touched air shell above/around the pool every tick, and on this
+scenario the big merged body exceeds the 65536 cap, so it is TRAVERSED in
+full and then skipped. Stubbing the air `solid()` query dropped the pass
+from ~720ms to ~89ms, proving the dominant cost is the terrain `solid_`
+query on that air shell, not the flood machinery -- exactly the ~1us/call
+Amplifier column query the code comments already flag as the engine's
+pour-scale bottleneck.
+
+**Four byte-identical changes** (each verified against the pre-rewrite
+implementation, not just re-derived):
+1. **Per-brick flood cache.** Each DISTINCT brick is resolved once (one
+   `water_.find` + one `touched.find`) into a node holding the brick's water
+   pointer, its touched-ness, and an inline 512-bit visited mask; every
+   subsequent cell read/visit is a plain array index + bit op. Replaces the
+   old per-CELL `getFill` hashmap find + `unordered_set<VoxelKey>` visited
+   probe (3 splitmix64 rounds) + `inTouched` set-find. Stack entries carry
+   the resolved `BrickCell*` (no lookup on pop) and same-brick neighbor steps
+   reuse it (no hash) -- node-based `unordered_map` keeps those pointers valid
+   across later inserts.
+2. **Deferred writes.** All leveling writes are collected and applied in one
+   pass AFTER discovery, so the read-only brick cache never observes a
+   mid-pass `water_` mutation (setFillAccounted can create/erase bricks).
+   Safe because distinct components never share a cell and each target is an
+   absolute value from the captured `totalVol`.
+3. **No-op-write skip.** Each discovered cell carries its flood-time fill
+   (still current at apply time, since writes are deferred), so a target
+   equal to the current fill emits no write at all -- a settled interior is
+   all no-ops. Removes the second O(pool) cost (a `waterKeyForVoxel` +
+   `water_` find per interior cell) that setFillAccounted paid every tick.
+4. **Raw `solid_` for the flood (biggest win: ~720ms -> ~410ms).** Phase C's
+   flood queries each air voxel at most once (the shared visited mask is
+   checked before any solidity query), so routing those through the per-tick
+   memoizing `cachedSolid` only added a `VoxelKey` hash + an insert into a
+   map that balloons to the full air-shell size (with rehashing) for ZERO
+   dedup benefit. `hydrostaticPass` now takes the raw `solid_` callback
+   directly (no longer templated). Byte-identical: memoization never changes
+   a deterministic query's answer. (Phase READ/APPLY still uses `cachedSolid`
+   -- its 5-neighbor gathers DO re-ask the same voxel, so there the memo pays
+   off.) Also skips the query entirely for WATER neighbors (never solid by
+   engine invariant).
+
+**Benchmark** (`vxc_waterca_bench`, seed 20260719, same 441-column/1.76M-unit
+scenario): windowed avg **~1322-1330 ms/tick -> ~411-441 ms/tick**; full-run
+avg **~1052-1117 ms/tick -> ~350-365 ms/tick** -- **~3.0-3.2x**. Still ~2.7x
+over the v2 (pre-Phase-C) ~140-155ms baseline; the residual is almost
+entirely the ~900K/tick terrain `solid_` calls (see obstacle below).
+
+**Byte-identical verification**: golden `0x3D2224BE4A253404` unchanged;
+`waterca_twophase_order_independent_and_deterministic` and
+`waterca_hydrostatic_order_independent_and_deterministic` still pass (the
+reversed-active-set replay); all 110 `vxc_tests` green. Beyond the unit
+tests (which only exercise tiny, single-brick components), the rewrite was
+digest-compared tick-by-tick against the pre-rewrite implementation on the
+full 441-column overflow scenario across 3 seeds (20260719/12345/99) at
+checkpoints through tick 60 -- every digest matched. A NEW permanent
+regression test, `waterca_hydrostatic_large_pool_multibrick_golden`
+(golden `0x56BC18914355A205`, itself confirmed identical between old and new
+impls), pins a wide 16x16 multi-brick pool so future flood changes that
+perturb the cell set / leveling / write set are caught in-suite. Clang
+`-Wall -Wextra -Wconversion -Wsign-conversion -Werror` clean; float-ban
+clean. `kWaterCAVersion` NOT bumped (output unchanged, correctly).
+
+**Obstacle for the recommended persistent/incremental per-body structure
+(honest report, not shipped -- doctrine forbids a latent divergence).** The
+theoretically-correct O(1)-settled fix is blocked on byte-identical grounds
+by two coupled facts this profiling exposed:
+- **The overflow cap counts AIR, not just water.** A hydrostatic component's
+  size (and thus whether it is leveled or skipped-as-too-big) depends on the
+  gated air cells reachable THIS tick, which depend on `touched`. So the
+  cell set -- and even the level-vs-skip decision -- is genuinely per-tick,
+  not a persistent property of the water body. A persistent water-body
+  structure cannot reproduce the exact skip decisions without re-deriving the
+  touched-dependent air each tick.
+- **Air BRIDGES water.** Two water regions with an air gap between them (a
+  full cell -> gated air -> down into the other region's water) are ONE flood
+  component and equalize through the gap -- this is the communicating-vessels
+  behavior, and it is touched-dependent. So component identity is not water
+  connectivity; persistent union-find over water alone under-merges vs the
+  real flood.
+  Consequence: seeding only from CHANGED cells, or skipping "clean" bodies,
+  or truncating the post-overflow air walk, each diverges on a constructible
+  (and plausibly bench-present) case -- a settled body made to rise by a
+  third party newly touching adjacent below-surface air, or an air-bridged
+  sub-body under the cap that would then be leveled instead of skipped.
+  A cross-tick `solid_` cache (which WOULD cut the dominant cost, since
+  terrain is static within the bench/tests) is likewise unsafe: it changes
+  output under live-edited terrain (digging), which the existing per-tick
+  cache deliberately avoids, and there is no terrain-change invalidation hook
+  to add without touching non-owned caller code. Both are real follow-ups but
+  need a design pass (and a terrain-edit signal into WaterCA) that is out of
+  scope for a byte-identical perf fix -- flagged rather than risked.
+
+**Follow-ups**: (a) a persistent per-body structure that carries the
+touched-dependent air frontier explicitly (not just water) and re-validates
+only the frontier each tick -- the real path to O(1)-settled, but a genuine
+redesign with a merge/split/air-bridge correctness proof; (b) a `solid_`
+cache invalidated by a terrain-edit generation counter plumbed from the
+dig/explosive path -- would collapse the residual ~640ms directly and helps
+Phase READ/APPLY too; (c) revisit whether the overflow cap SHOULD count air
+(counting only water would make the cap a property of the water body and
+unblock (a)) -- but that is a deliberate world-breaking change (digest +
+`kWaterCAVersion` bump), a separate decision, not a silent perf tweak.
+
 ## Backlog (parked / deferred, updated 2026-07-20)
 
 | Item | State | Unblock |
