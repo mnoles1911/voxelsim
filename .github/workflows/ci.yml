@@ -103,6 +103,36 @@ jobs:
               sys.exit(1)
           print("float-ban clean")
 
+  # ADR-0001 determinism surface: the M0 gate passed on AMD and failed on
+  # NVIDIA running the IDENTICAL committed SPIR-V, because worldgen.hlsl's
+  # floorDiv derived its flooring correction from `a % b` and HLSL leaves `%`
+  # undefined unless both operands share a sign (commit 6ab4b2a). This job
+  # makes that whole class mechanical: it fails on signed `/`/`%` that is not
+  # routed through the approved floorDiv/truncDiv helpers, on non-constant or
+  # over-wide shifts, on unsigned subtraction that can underflow into an
+  # index, on unclamped buffer writes, and on wave/subgroup-width assumptions
+  # (AMD wave64 vs NVIDIA warp32). Like float-ban, it blanks comments and
+  # string literals before matching so prose can never trip it. Safe
+  # constructs are silenced one at a time by an inline annotation that must
+  # carry a written reason; unused annotations are themselves failures.
+  #
+  # --spv-dir additionally scans the COMMITTED bytecode for the OpSDiv/
+  # OpSRem/OpSMod opcodes. The HLSL rules are heuristic; the opcode scan is
+  # exact, and it is what catches the shipped bug directly no matter how the
+  # source is written.
+  shader-ub-lint:
+    name: Shader vendor-divergence lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Lint HLSL kernels + audit committed SPIR-V
+        run: >
+          python tools/lint-shader-ub.py voxel-core/shaders
+          --spv-dir voxel-core/shaders/prebuilt
+
   terrain-service:
     runs-on: ubuntu-24.04
     steps:

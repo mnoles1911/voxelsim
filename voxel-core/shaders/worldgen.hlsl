@@ -109,6 +109,7 @@ static const int kOctaveAmplitudeMm[kOctaveCount] = {1800, 700, 260, 100};
 uint64_t absToU64(int64_t v)
 {
     const uint64_t u = (uint64_t)v;
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - deliberate two's-complement negation of a magnitude; unsigned wraparound is well-defined and is exactly what makes this correct at INT64_MIN
     return (v < 0) ? ((uint64_t)0 - u) : u;
 }
 
@@ -116,6 +117,7 @@ uint64_t absToU64(int64_t v)
 int64_t truncDiv(int64_t a, int64_t b)
 {
     const uint64_t uq = absToU64(a) / absToU64(b);
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - deliberate negation of an unsigned magnitude to rebuild the signed quotient; unsigned wraparound is well-defined
     return ((a < 0) != (b < 0)) ? (int64_t)((uint64_t)0 - uq) : (int64_t)uq;
 }
 
@@ -130,6 +132,7 @@ int64_t floorDiv(int64_t a, int64_t b)
         // Negative quotient: round away from zero unless the division was
         // exact. `uq * ub == ua` is the exactness test (no OpUMod needed).
         const uint64_t bump = (uq * ub == ua) ? (uint64_t)0 : (uint64_t)1;
+        // lint-shader-ub: allow UNSIGNED_UNDERFLOW - deliberate negation of an unsigned magnitude, then a 0-or-1 rounding bump; unsigned wraparound is well-defined and is the intended two's-complement result
         return (int64_t)((uint64_t)0 - uq - bump);
     }
     return (int64_t)uq;
@@ -158,6 +161,7 @@ uint64_t hash2(uint64_t seed, int64_t x, int64_t y, uint channel)
 // Top 16 bits -> [-32768, 32767].
 int hashToSigned16(uint64_t h)
 {
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - recentring a full 16-bit unsigned range onto [-32768, 32767]; the subtraction happens in signed 32-bit after the (int) cast, so it cannot wrap, and a negative result is the whole point
     return (int)(uint)(h >> 48) - 32768;
 }
 
@@ -297,16 +301,33 @@ StructuredBuffer<GpuColumnSample> InColumns : register(t3);
 // precise brick/cell indexing this buffer is written with.
 RWStructuredBuffer<uint> OutCells : register(u2);
 
+// HARDENING (2026-07 cross-vendor UB pass, issue 5). `RasterSize` is host-
+// controlled and unvalidated in-shader. When RasterSize.x == 0 the clamp
+// upper bound `(int64_t)RasterSize.x - 1` is -1 while the lower bound is 0,
+// so clamp64 returns -1 for any px past the origin (`v > hi` wins), and the
+// `(uint)` cast turns that into ~4 billion — a wild out-of-bounds load whose
+// result is vendor-defined (AMD's range-checked descriptors return 0,
+// NVIDIA's may return adjacent memory). An empty raster window carries no
+// data to interpolate, so return the zero element deterministically instead.
+// This is a GUARD, not a behavior change: for RasterSize.{x,y} >= 1 — every
+// window the harness/RDG pass ever binds — the guard is never taken and the
+// clamp is unchanged.
 int rasterElevationMm(int64_t px, int64_t py)
 {
+    if (RasterSize.x == 0u || RasterSize.y == 0u) return 0;
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - the zero-extent early-out directly above proves RasterSize.x >= 1, so this clamp bound is >= 0 and the range stays well-ordered
     const int64_t lx = clamp64(px - RasterOriginPx.x, 0, (int64_t)RasterSize.x - 1);
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - same zero-extent early-out proves RasterSize.y >= 1
     const int64_t ly = clamp64(py - RasterOriginPx.y, 0, (int64_t)RasterSize.y - 1);
     return ElevationMm[(uint)(lx + ly * RasterSize.x)];
 }
 
 uint rasterClimate(int64_t px, int64_t py)
 {
+    if (RasterSize.x == 0u || RasterSize.y == 0u) return 0u;
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - the zero-extent early-out directly above proves RasterSize.x >= 1, so this clamp bound is >= 0 and the range stays well-ordered
     const int64_t lx = clamp64(px - RasterOriginPx.x, 0, (int64_t)RasterSize.x - 1);
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - same zero-extent early-out proves RasterSize.y >= 1
     const int64_t ly = clamp64(py - RasterOriginPx.y, 0, (int64_t)RasterSize.y - 1);
     return ClimatePacked[(uint)(lx + ly * RasterSize.x)];
 }
@@ -317,6 +338,18 @@ uint rasterClimate(int64_t px, int64_t py)
 void ColumnMain(uint3 tid : SV_DispatchThreadID)
 {
     if (tid.x >= DispatchColumns.x || tid.y >= DispatchColumns.y)
+        return;
+
+    // HARDENING (2026-07 cross-vendor UB pass, issue 4). PixelSizeMm is a
+    // host-supplied divisor that reaches floorDiv/truncDiv below (and
+    // `pxMm * pxMm`). Zero would be an OpUDiv-by-zero: undefined in SPIR-V,
+    // so the result is whatever the vendor's integer unit happens to produce
+    // (and on some stacks it can fault). There is no meaningful column to
+    // derive from a zero-size pixel, so refuse the dispatch deterministically.
+    // Mirrored by a host-side assert in voxel-core/bench/gpu_harness.cpp.
+    // GUARD ONLY: valid PixelSizeMm is 30000 (scale 1) or 11250 (scale 8) —
+    // never 0 — so this branch is never taken on any real dispatch.
+    if (PixelSizeMm == 0)
         return;
 
     const uint64_t seed = ((uint64_t)SeedHi << 32) | (uint64_t)SeedLo;
@@ -447,6 +480,7 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
         for (uint z = 0; z < 8u; ++z)
         {
             const int64_t vz = brickZ * (int64_t)8 + (int64_t)z;
+            // lint-shader-ub: allow UNGUARDED_WRITE - index is bounded by construction: the entry guard caps tid below DispatchColumns, so footprintIndex < bricksX*bricksY and brickIndex < bricksX*bricksY*BricksZ, while lx/ly/z are all < 8; the host sizes OutCells to exactly bricksX*bricksY*BricksZ*512 (contract mirrored in gpu_harness.cpp, asserted there)
             OutCells[brickIndex * 512u + cellIndexInBrick(lx, ly, z)] = materialAt(col, vz);
         }
     }
@@ -498,6 +532,7 @@ uint regionCellMat(int3 rv)
 // vxc::detail::aoCorner bit-for-bit.
 uint aoCorner(bool s1, bool s2, bool c)
 {
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - the subtrahend is a sum of three 0-or-1 terms, so it is at most 3 and the result stays in [0, 3]; cannot go below zero
     return (s1 && s2) ? 0u : (3u - ((s1 ? 1u : 0u) + (s2 ? 1u : 0u) + (c ? 1u : 0u)));
 }
 
@@ -566,8 +601,23 @@ uint greedyMask(int3 brickOriginRv, uint axis, uint dir, uint slice, uint emit, 
                 ++i2;
                 continue;
             }
+            // HARDENING (2026-07 cross-vendor UB pass, issue 2). This was
+            //   while (i2 + w < 8u && mask[i2 + w + 8u * j2] == key) ++w;
+            // which reads mask[64] — one past `uint mask[64]` — on the
+            // terminating iteration of the last row (i2 + w == 8, j2 == 7).
+            // It is only safe if `&&` short-circuits, and HLSL has
+            // historically declined to guarantee short-circuit evaluation for
+            // scalar operands (the spec permits evaluating both sides; DXC
+            // does short-circuit today, but that is a compiler property, not
+            // a contract). Hoisting the bound into its own `if` makes the
+            // in-range test structural. Identical iteration count and
+            // identical `w` for every input — pure control-flow rewrite.
             uint w = 1u;
-            while (i2 + w < 8u && mask[i2 + w + 8u * j2] == key) ++w;
+            while (i2 + w < 8u)
+            {
+                if (mask[i2 + w + 8u * j2] != key) break;
+                ++w;
+            }
             uint h = 1u;
             for (; j2 + h < 8u; ++h)
             {
@@ -593,7 +643,25 @@ uint greedyMask(int3 brickOriginRv, uint axis, uint dir, uint slice, uint emit, 
                 uint2 q;
                 q.x = axis | (dir << 4) | (slice << 8) | (i2 << 16) | (j2 << 24);
                 q.y = w | (h << 8) | (ao8 << 16) | (mat << 24);
-                OutQuads[baseOffset + quadCount] = q;
+                // HARDENING (2026-07 cross-vendor UB pass, issue 3).
+                // `baseOffset` comes from InQuadOffsets, i.e. from whatever
+                // the scan chain wrote; the write was previously unclamped,
+                // so a short/stale ScanCount (offsets never scanned) or a
+                // corrupt offset would scribble arbitrarily far outside
+                // OutQuads. Bound it against the buffer's OWN length rather
+                // than a new cbuffer field: GetDimensions lowers to
+                // OpArrayLength over the bound descriptor range, so it is the
+                // real allocation, needs no host/shader contract to stay in
+                // sync, and cannot itself go stale. `quadIndex < baseOffset`
+                // catches uint wraparound. GUARD ONLY: the harness sizes
+                // OutQuads to the 32-quads-per-mask upper bound
+                // (docs/gpu-mesher-design.md), so on every valid dispatch
+                // quadIndex < quadCap holds and every quad is still written.
+                uint quadCap, quadStride;
+                OutQuads.GetDimensions(quadCap, quadStride);
+                const uint quadIndex = baseOffset + quadCount;
+                if (quadIndex >= baseOffset && quadIndex < quadCap)
+                    OutQuads[quadIndex] = q;
             }
             ++quadCount;
             i2 += w;
@@ -608,6 +676,29 @@ bool decodeMask(uint maskIndex, out int3 brickOriginRv, out uint axis, out uint 
 {
     const uint bricksX = DispatchColumns.x / 8u;
     const uint bricksY = DispatchColumns.y / 8u;
+    // HARDENING (2026-07 cross-vendor UB pass, issue 1). The interior-brick
+    // dims below subtract the 1-brick halo from each axis. On UNSIGNED
+    // values, a region with fewer than 3 bricks on any axis wraps: e.g.
+    // bricksX == 1 gives mbx == 0xFFFFFFFF, and the product
+    // mbx*mby*mbz*48 then wraps to some large-but-arbitrary maskCount that
+    // the `maskIndex >= maskCount` range check happily passes. decodeMask
+    // would return true with a nonsense brick origin, and regionCellMat
+    // would read OutCells far out of bounds — vendor-defined behavior
+    // exactly like the bug this pass exists to prevent (AMD's range-checked
+    // descriptors return 0; NVIDIA's may return adjacent memory). A region
+    // that thin has NO interior bricks, so the correct answer is "no mask".
+    // GUARD ONLY: gpu_harness.cpp already refuses to run the mesh chain
+    // unless bricksX/Y/Z are all >= 3, so this branch is never taken on any
+    // dispatch that actually reaches the GPU today.
+    if (bricksX < 3u || bricksY < 3u || BricksZ < 3u)
+    {
+        brickOriginRv = int3(0, 0, 0);
+        axis = 0u;
+        dir = 0u;
+        slice = 0u;
+        return false;
+    }
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - the >= 3 early-out directly above proves every axis has at least 3 bricks, so each halo subtraction leaves >= 1; this is the exact underflow that guard was added to prevent
     const uint mbx = bricksX - 2u, mby = bricksY - 2u, mbz = BricksZ - 2u;
     const uint maskCount = mbx * mby * mbz * 48u;
     if (maskIndex >= maskCount)
@@ -647,6 +738,16 @@ void MeshEmitMain(uint3 tid : SV_DispatchThreadID)
     uint axis, dir, slice;
     if (!decodeMask(tid.x, origin, axis, dir, slice))
         return;
+    // HARDENING (2026-07 cross-vendor UB pass, issue 3). InQuadOffsets[i] is
+    // only meaningful for i < ScanCount — those are the entries the
+    // ScanBlocks/Sums/Add chain actually wrote. Emitting from an offset
+    // beyond ScanCount would read never-written device memory, whose
+    // contents differ by driver and allocation history, and then use it as a
+    // write base. GUARD ONLY: the harness always sets ScanCount == maskCount
+    // (both call sites), and decodeMask has already rejected
+    // tid.x >= maskCount above, so this is unreachable on a valid dispatch.
+    if (tid.x >= ScanCount)
+        return;
     greedyMask(origin, axis, dir, slice, 1u, InQuadOffsets[tid.x]);
 }
 
@@ -684,16 +785,19 @@ void ScanBlocksMain(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThread
     {
         uint add = 0u;
         if (gtid.x >= offset)
+            // lint-shader-ub: allow UNSIGNED_UNDERFLOW - the enclosing `gtid.x >= offset` test is precisely the no-underflow precondition for this subtraction
             add = gsScan[gtid.x - offset];
         GroupMemoryBarrierWithGroupSync();
         gsScan[gtid.x] += add;
         GroupMemoryBarrierWithGroupSync();
     }
     // Exclusive = inclusive shifted right by one.
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - the ternary takes the subtracting branch only when gtid.x != 0, i.e. gtid.x >= 1, so this cannot go below zero
     const uint exclusive = (gtid.x == 0u) ? 0u : gsScan[gtid.x - 1u];
     if (tid.x < n)
         OutQuadOffsets[tid.x] = exclusive;
     if (gtid.x == 255u)
+        // lint-shader-ub: allow UNGUARDED_WRITE - one store per workgroup, so gid.x < the dispatched group count, and the host sizes OutBlockSums to exactly ceil(ScanCount/256) = that group count (gpu_harness.cpp blockSumsBuf)
         OutBlockSums[gid.x] = gsScan[255u]; // block total (inclusive of padding zeros)
 }
 
@@ -709,11 +813,13 @@ void ScanSumsMain(uint3 gtid : SV_GroupThreadID)
     {
         uint add = 0u;
         if (gtid.x >= offset)
+            // lint-shader-ub: allow UNSIGNED_UNDERFLOW - the enclosing `gtid.x >= offset` test is precisely the no-underflow precondition for this subtraction
             add = gsScan[gtid.x - offset];
         GroupMemoryBarrierWithGroupSync();
         gsScan[gtid.x] += add;
         GroupMemoryBarrierWithGroupSync();
     }
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - the ternary takes the subtracting branch only when gtid.x != 0, i.e. gtid.x >= 1, so this cannot go below zero
     const uint exclusive = (gtid.x == 0u) ? 0u : gsScan[gtid.x - 1u];
     if (gtid.x < numBlocks)
         OutBlockSums[gtid.x] = exclusive;
