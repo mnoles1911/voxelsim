@@ -4471,3 +4471,120 @@ re-architecting it.
 5. Suballocate the GPU harness's host-visible buffers to reach the 112-realloc
    floor; low value now that the cost is correctly attributed at ~68 ms hidden
    behind GPU execution.
+
+### Mesher profiling + optimisation (2026-07-21, worktree agent)
+
+Follow-up #2 from the worldgen performance pass above ("mesh is now the largest
+bench stage and has had no profiling pass at all"). Closed: mesh is **3.2x
+faster at both brick sizes**, with byte-identical output and no shader change.
+
+**Methodology.** `vxc_bench --radius 32`, seed 20260719, clang Release
+(`-O3 -DNDEBUG`), **min-of-5** — this box shows ~15% run-to-run variance, so
+single runs are not evidence. Attribution used a separate probe that meshed the
+same world three ways (live sampler / apron fill only / fill + array-backed
+sampler) so the sampler's cost could be separated from the mesher's own work.
+An early version of that probe was built at plain `-O2` and reported mesh at
+433 ms against the bench's 242 ms; the gap was the build flags, not a finding.
+Rebuilt to match the bench, the probe reproduced the bench to within 4%.
+
+**Measured breakdown BEFORE any change.** The headline result is that the
+suspected culprit was not the culprit. The greedy merge inner loop — the thing
+the brief flagged first — was never the problem, and neither were quad-vector
+growth or palette indirection. Roughly **half of "mesh" was the sampler being
+re-evaluated**, and the other half was addressing overhead in the scan, not
+merging:
+
+| | brick 8^3 | brick 16^3 |
+|---|---|---|
+| mesh, live sampler (= bench) | 233.6 ms | 394.8 ms |
+| mesh, apron pre-materialised | 137.5 ms | 207.9 ms |
+| sampler calls per brick | 5277 (512 voxels) | 39522 (4096 voxels) |
+
+~10 sampler calls per voxel: the face scan reads every voxel six times (once
+per face direction) and reads nine more cells per *visible* face for AO.
+
+Also measured, and worth recording as a negative result: **homogeneous-brick
+early-outs are worth nothing on this benchmark.** The bench walks the surface
+shell, and 0 of 10,952 bricks have a homogeneous interior. They were still
+added, because they matter underground, but anyone expecting them to move the
+bench number should not.
+
+**What changed** (`mesher.h` only; two targets, both chosen from the table):
+
+1. *Materialise the brick + 1-voxel apron once* into a flat array before any
+   face scan. This is `(B+2)^3` sampler calls — 1000 vs the old floor of
+   `6*B^3` = 3072 at 8^3, and 5832 vs 24576 at 16^3 — so it is fewer calls than
+   before for *every* brick size and cannot regress a caller. Critically the
+   old code already queried the entire `[-1,B]^3` cube (the AO reads reach even
+   the corners, e.g. `(-1,-1,-1)`), so the set of queried coordinates is
+   **exactly unchanged**; no sampler can observe the difference.
+2. *Hoisted per-axis strides* replacing the per-cell `int c[3]` with
+   runtime-varying subscripts. Because `axis`/`u`/`v` are loop variables and not
+   compile-time constants, the old form forced the coordinate triple to memory
+   on every cell; with strides each neighbour is a constant offset from the cell
+   index. This turned out to be worth about as much as (1).
+3. Two early-outs for homogeneous bricks (all-air interior; uniform
+   apron+interior), which previously needed a full `6*B^3` scan to conclude
+   "no quads". See the negative result above re: their benchmark impact.
+
+The greedy merge loop is **untouched**.
+
+**Before/after, min-of-5.**
+
+| stage | brick 8 before | brick 8 after | brick 16 before | brick 16 after |
+|---|---|---|---|---|
+| amplify | 195.4 ms | 197.9 ms | 158.0 ms | 160.7 ms |
+| voxelize | 24.4 ms | 22.8 ms | 38.6 ms | 40.2 ms |
+| **mesh** | **242.4 ms** | **76.3 ms** (3.18x) | **411.2 ms** | **129.6 ms** (3.17x) |
+| **total** | **462.3 ms** | **296.9 ms** (1.56x) | **607.7 ms** | **330.6 ms** (1.84x) |
+
+Mesh drops from 53% / 68% of total to **26% / 39%**. **Amplify is once again
+the largest worldgen stage** at both brick sizes.
+
+**Determinism.** Output is byte-identical, verified beyond the pinned pair: a
+bench built from the pre-change mesher and the new one were compared over
+3 seeds x 4 radii x 2 brick sizes — **24/24 digests match**, including
+`6dbb95d59737e045` (8^3) and `280684104c06aacf` (16^3).
+`GOLDEN(amplifier_columns)` `0x81785278E4DFCF67` and `GOLDEN(cave_layer)`
+`0x1CD7912E8DBBB5EA` unchanged. `vxc_tests` **174 PASS / 0 FAIL**; float-ban
+clean; `mesher.h` compiles clean under
+`-Wall -Wextra -Wconversion -Wsign-conversion -Werror`.
+
+**Shader semantics did NOT change.** `worldgen.hlsl` is untouched — the quad
+stream is identical, so `MeshCountMain`/`MeshEmitMain` need no mirror change,
+no SPIR-V rebuild, and the AMD digests `e21e2767591496eb` / `1e664cf6680a137c`
+/ `7602afe508d2ee73` cannot move. The GPU harness was therefore not re-run
+(it is not buildable under mingw, and the CPU-side proof is stronger than a
+single harness pass would be). `lint-shader-ub.py` not run for the same reason.
+
+New `test_mesher.cpp` pins four byte-exact quad-stream digests (8^3 and 16^3,
+sparse and dense) so this contract is now guarded locally without a GPU — plus
+an over-trigger guard where one air apron cell in a solid brick must still
+produce exactly one face.
+
+**Deliberately not done.**
+- The greedy merge loop, mask layout, and quad-vector growth were left alone:
+  measurement said they were not where the time went.
+- Splitting the `dir` loop so both face directions share one primary-material
+  read (halving `6*B^3` reads to `3*B^3`) was scoped and rejected for now —
+  it needs two mask buffers and careful preservation of emission order, for an
+  estimated 10-15% of a stage that is no longer the bottleneck.
+- gcc was not verified locally: no real gcc on this box (the `g++` on PATH is
+  a clang alias). The new code avoids the known gcc-stricter traps — no
+  enum/non-enum ternary, all conversions explicit — and the one expression kept
+  verbatim from the original is the `aoCorner` shift chain, which gcc already
+  accepts today. CI is the check.
+
+**Follow-ups, by expected value.**
+1. **Amplify is the top cost again** (197.9 / 160.7 ms, now 67% / 49% of total).
+   Its largest remaining term is still `caveColumnFor` — same conclusion as the
+   previous pass, and it still needs the `caves.h` owner.
+2. Re-measure the UE streaming path. Chunk meshing there feeds `meshBrick` from
+   a `Brick`, not from the amplifier, so it was paying proportionally *more* of
+   the addressing overhead and less of the sampler overhead — the real-world win
+   may differ from the bench's 3.2x in either direction, and should be measured
+   rather than assumed.
+3. The `dir`-loop sharing above, if mesh ever returns to the top of the profile.
+4. Consider whether the GPU mesher carries the same ~10x redundant-sample
+   pattern. It is a different execution model (one thread per mask entry) so the
+   fix does not transfer directly, but the redundancy analysis might.
