@@ -79,4 +79,10 @@ private:
 	bool bTreeTestActive = false;
 	double TreeTestColumnXUU = 0.0;
 	double TreeTestColumnYUU = 0.0;
+
+	// M6 NPC swarm verification (docs/status.md M6 section): -VoxelSwarmTest[=<N>]
+	// spawns the pursuit swarm a couple of seconds after BeginPlay -- see the
+	// .cpp for why this doesn't need to wait for render streaming the way
+	// -VoxelHeadlessDigTest/-VoxelTreeTest do.
+	FTimerHandle SwarmTestTimerHandle;
 };
