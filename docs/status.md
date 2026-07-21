@@ -1006,6 +1006,200 @@ test switches.
   tick via `pathStillValid`, cheap at window-scale but not brick-indexed);
   agent state replication (above).
 
+### Digging-while-pathing (M6, authoritative NPC edits)
+
+- [x] **The payoff slice**: Tier 0 NPC agents now MINE and BRIDGE terrain
+  live, through the exact same cost function that already chose Walk/
+  StepUp/Climb/Fall/Jump (`voxel-core/include/voxelcore/pathfind.h`,
+  consumed as-is — not modified). Enabling this was purely a
+  `PathCostConfig` change on the UE side
+  (`ue-project/Source/VoxelEarth/VoxelAgentSubsystem.cpp`); no new
+  algorithm.
+
+- [x] **Cost values chosen (`FVoxelAgentImpl::DigConfig`, Initialize)**:
+  `walkCost`/`stepUpCost`/`fallCostPerVoxel`/`jumpGapCost` unchanged from
+  `pathfind.h`'s own defaults (10/14/5/15). `mineCostByMaterial[MAT_ROCK] =
+  35` (~3.5x `walkCost`) — a short detour (a few walked cells) stays
+  cheaper than mining, but tunneling through a THIN wall beats a detour
+  that a small (~3.3m) search window can't even see the end of.
+  `bridgeCost = 26` (~2.6x `walkCost`) — pricier than a soft-material mine
+  would be, cheaper than mining hard rock (bridging a gap is usually less
+  work than excavating through solid material). The full
+  `kMineCostByMaterial` table (file-scope, `VoxelAgentSubsystem.cpp`) is
+  filled in for every `vxc::Material` with a documented relative-hardness
+  ordering (soft soils ~12-20, hard rock 35), but — **known v0 limitation,
+  documented follow-up** — only `MAT_ROCK`'s entry is reachable today:
+  `UVoxelWorldSubsystem::IsSolidAtVoxel` (the only material-adjacent query
+  this slice is allowed to call — `VoxelWorldSubsystem.{h,cpp}` were
+  READ-ONLY, owned by another track tonight) returns a bare `bool`, so
+  `PlanPath`'s `SolidFn` reports every solid voxel as one sentinel material
+  (`kSolidSentinelMaterial = MAT_ROCK`) regardless of what it actually is.
+  "Softer materials mine cheaper" is real, tested intent, not yet
+  observable behavior — unlocking it needs a material-returning query
+  added to `UVoxelWorldSubsystem`, left as a follow-up for whoever owns
+  that file next. `MAT_BEDROCK` stays hard-blocked exactly as `pathfind.h`
+  enforces (unconditional, config can't override it) — not fought.
+
+- [x] **Execution through the ONE authority path**: Mine → `Terrain.TryDig
+  (EyeWorld, DestCenterWorld - EyeWorld, MinCubeSizeVoxels)`, aimed from
+  the CENTER of the agent's own current voxel straight at the destination
+  voxel's center — always a short (≤√2 voxels), unobstructed ray since
+  `classifyMove` only ever produces Mine for one of the 18 fixed
+  neighbor offsets; `SizeVoxels=1` digs exactly that one voxel (no bias
+  growth). Bridge → `Terrain.TryPlace(AffectedCenterWorld, NeighborDir,
+  MinCubeSizeVoxels, BridgeScaffoldMaterialId, PlayerWorldPos)` — trickier,
+  because `TryPlace` can only snap a new cube against an EXISTING solid
+  face (it has no "place a fully floating voxel" mode), and a Bridge's
+  `affectedCell` is air by definition. `TryExecuteWaypointEdit`
+  (`VoxelAgentSubsystem.cpp`) scans `affectedCell`'s six face-neighbors via
+  `IsSolidAtVoxel` for a real one (e.g. the floor under the agent for a
+  flat bridge), then fires a one-voxel ray from inside `affectedCell`
+  straight at it so the DDA hit lands exactly on `affectedCell`. **Known
+  v0 limitation, documented follow-up**: a Bridge destination with no
+  solid face-neighbor on ANY side (a fully floating scaffold mid-chasm)
+  can't be placed through today's public dig/place API at all — the agent
+  waits (rate-limited retry, same as a cooldown miss) rather than silently
+  dropping the edit; fixing this needs a direct point-target stamp entry
+  point on `UVoxelWorldSubsystem` (mirroring the already-`Impl`-only
+  `StampVoxels` this slice isn't allowed to reach). `PlayerWorldPos`, not
+  `Agent.Position`, is passed as `TryPlace`'s overlap-reject argument so an
+  NPC edit still honors "never trap the real player." Both calls route
+  through `UVoxelWorldSubsystem::TryDig`/`TryPlace` — the exact same
+  authority/replication/chop-hook/water-breach-hook path player digs use;
+  no second edit path was added anywhere.
+
+- [x] **Rate limiting (three independent limits, all must hold)**: (1)
+  per-agent cooldown — `NPCDigCooldownSeconds = 1.5`s
+  (`FVoxelAgent::LastDigTimeSeconds`), "mining costs hardness x TIME, not
+  an instant swap." (2) Global per-tick cap — `MaxNPCEditsPerTick = 4`
+  across the WHOLE swarm, threaded through `Tick`/`TickTier0` exactly like
+  the existing replan budget; logged (`"VoxelSwarm NPC edits this tick:
+  N/4 (cap)"`) whenever spent. (3) Tier restriction — digging is Tier
+  0-EXCLUSIVE, narrower than the doctrine's "Tier 0 and optionally Tier
+  1": Tier 1/2 plan/steer through a separate `FVoxelAgentImpl::NavConfig`
+  (byte-identical to the pre-M6 single-config setup — Mine impossible,
+  Bridge ~1,000,000) so their paths never NEED an edit, sidestepping the
+  failure mode where a Tier 1 agent inherits a stale Mine/Bridge waypoint
+  it will never execute and `AdvanceAlongWaypoints` (no collision
+  awareness of its own) walks it through solid/unsupported terrain. A
+  demoted Tier 0→1 agent still gets one belt-and-braces guard:
+  `FVoxelAgentImpl::PathIsDigCapable` (tagged per-path by `PlanPath`) makes
+  `TickTier1` force an immediate replan (and hold position that exact
+  tick) the moment it detects it just inherited a dig-capable path, rather
+  than advancing first.
+
+- [x] **Safety valve**: `voxel.NPCDig.Enabled` console var (default ON),
+  mirroring `voxel.Destruction.Enabled`'s identical M5 role. Realized as a
+  COST-FUNCTION swap, not a bolted-on execution block: `PlanPath` routes
+  Tier 0 to `NavConfig` instead of `DigConfig` the instant this is off, so
+  disabling it proves the "walking, mining, tunneling, bridging fall out
+  of ONE cost function" claim applies to the switch too (agents plan
+  genuine detours, not a tunnel that then silently fails to execute).
+  `TryExecuteWaypointEdit` also checks it directly (defensive, for the
+  narrow window between a runtime toggle and an agent's next replan).
+
+- [x] **Invalidation**: no new plumbing needed — Tier 0's existing
+  every-tick `pathStillValid` recheck (pre-M6) already IS the cross-agent
+  (and cross-player) invalidation mechanism "for free": any edit (this
+  agent's own successful Mine/Bridge, another agent's, or a player dig)
+  changes what `IsSolidAtVoxel` reports at the touched cell, so the very
+  next tick's re-classification of that step disagrees with what was
+  recorded and forces a replan. `pathStillValid` is now called with the
+  SAME config a path was planned under (`DigConfig` for Tier 0, `NavConfig`
+  for Tier 1 — mismatching them would false-positive-invalidate every
+  tick). Comment in `TickTier0` marks where a future per-dirty-brick
+  invalidation (`regiongraph.h`'s `markRegionDirty`, merged but NOT a
+  dependency of this slice) would hook in to replace "every agent re-scans
+  its own path every tick" with "only agents touching a just-dirtied brick
+  get invalidated" — a cost optimization, not a correctness change.
+
+- [x] **Headless verification** (`-VoxelDigSwarmTest=<N>`, new switch,
+  `AVoxelEarthGameMode`): builds a deliberate 4m-wide x 2.8m-tall x
+  4-voxel-thick `MAT_ROCK` wall 6m ahead of the player (70 `TryPlace`
+  calls, bottom-up, each raycasting straight down onto whatever is
+  currently topmost — natural terrain for layer 0, the previously-placed
+  cube for every layer after) — sized bigger on every axis than a single
+  Tier 0 search window (`WindowHalfExtentVoxels`/`WindowHalfHeightVoxels`,
+  ~3.3m x 2.5m) so a lone windowed search can't step over the top or find
+  either end. Spawns N agents on the wall's FAR side
+  (`UVoxelAgentSubsystem::SpawnSwarmAtOffset`, a new deterministic-offset
+  variant of `SpawnSwarm` added because the random 360-degree ring can't
+  guarantee that). `VoxelEarthEditor` built clean (`Build.bat ...
+  -WaitMutex -NoHotReloadFromIDE`, `Result: Succeeded`, zero warnings from
+  any of `VoxelAgent.{h,cpp}`/`VoxelAgentSubsystem.{h,cpp}`/
+  `VoxelEarthGameMode.{h,cpp}` — forced a full recompile of all three .cpp
+  files specifically to confirm this, not just relied on an incremental
+  no-op link). Worktree `voxelcore.lib` freshly configured+built
+  (CMake+Ninja, MSVC 14.51/VS 2026, Release); `vxc_tests.exe` full suite
+  passes (pathfind's own golden-digest/tunnel-vs-around/bedrock-never-mined
+  tests included, unmodified — `pathfind.h` was consumed as-is).
+  **Gotcha discovered and worked around**: `UVoxelWorldSubsystem`
+  autoloads `Saved/VoxelWorlds/<seed>.vxlog` on startup and autosaves on
+  shutdown (M3 wave 2 persistence) — a repeated headless run without
+  clearing that file builds on the PREVIOUS run's already-dug wall, which
+  silently degrades/skews the demo; every run below started from a deleted
+  `.vxlog` (documented in a code comment at the switch's delay constant so
+  a future by-hand re-run doesn't get bitten by it).
+
+  Run 1 (`-game -VoxelDigSwarmTest=10 -VoxelScreenshotAfter=55 -windowed
+  -resx=1280 -resy=720 -log -unattended -nosplash`, seed default
+  20260719, clean `.vxlog`): wall built (70/70 cubes). 10/10 agents
+  spawned ~9m beyond it; all promoted to Tier 0 immediately (within
+  `Tier0EnterUU`). **98 authoritative edits applied** over the run (44
+  Mine + 54 Bridge — agents tunnel through the rock, then bridge a gap on
+  the far side), each logged with its exact voxel coordinates, e.g.
+  `"VoxelAgent 1: Mine at (61,-1,10972) -- authoritative edit applied
+  (edit budget 3/4 remaining this tick)"`. Per-tick cap distribution: 43
+  ticks at 1/4, 17 at 2/4, 3 at 3/4, 3 at 4/4 — **the cap held, never
+  exceeded 4/4**. Mean distance-to-player: 11.2m (spawn) → 3.1m (last log
+  before quit) — **monotonically decreasing**, agents get through. Clean
+  shutdown (`LogExit: Exiting.`), zero ensures, zero fatal errors (the
+  only warnings are the pre-existing `M_VoxelTerrain`/`M_VoxelClipmap`
+  missing-material fallback, unrelated to this slice — same documented
+  issue as the M6 navigation-only run above). Two screenshots captured
+  (`Saved/Screenshots/WindowsEditor/VoxelVerify00000.png`,
+  `VoxelVerify00001.png`, 1280×720) — visibly show the wall with a carved
+  opening through its face (the tunnel), framed low and close per this
+  switch's own screenshot-framing branch. (Terrain in these shots renders
+  with the same pre-existing spiky/checkerboard default-material artifact
+  as every other verification run in this worktree — unrelated to, and
+  not caused by, this slice.)
+
+  Run 2 (same command + `-ExecCmds="voxel.NPCDig.Enabled 0"`, clean
+  `.vxlog`): wall built identically (70/70 cubes, confirmed same log
+  line). **0 authoritative edits applied** the entire run (`grep -c
+  "authoritative edit applied"` → 0) — proves the safety valve, realized
+  as `PlanPath`'s cost-function swap, actually suppresses every Mine/
+  Bridge. Agents still converge (11.2m → 4.3m) via a genuine WALK-ONLY
+  detour around the wall's lateral extent (confirmed not just "pressed
+  against the wall's outer face": 4.3m is closer than the wall's near face
+  ever gets to the player without going around it) — a real, if less
+  dramatic than "stuck", proof that the SAME cost function drives both
+  outcomes purely from `DigConfig` vs `NavConfig`, not a hardcoded
+  behavior swap. Screenshot of the same wall column shows it fully intact
+  (no carved opening), the visual counterpart to the 0-edit log count.
+  **Honest caveat**: the wall's 4m width only modestly exceeds the ~3.3m
+  search window, so a multi-replan walk-around remains reachable inside
+  this run's ~60s budget rather than leaving agents visibly stuck — a
+  wider wall (or a longer run) would make the "fails to reach" half of
+  "detour or fail to reach" more dramatic, but the decisive proof the task
+  asked for (zero edits when disabled vs. 98 rate-limited edits with exact
+  coordinates when enabled) is unambiguous either way.
+
+- [ ] **Follow-ups (documented, not fixed this slice)**: (1) per-material
+  mine costs are inert until `UVoxelWorldSubsystem` gains a real
+  material-returning query (today every solid voxel reads as one sentinel
+  material). (2) Bridge can't place a fully floating scaffold with no
+  solid neighbor on any side — needs a direct point-target stamp API on
+  `UVoxelWorldSubsystem` (mirroring its already-`Impl`-only `StampVoxels`).
+  (3) Tier 1 digging (the doctrine's "and optionally Tier 1") was
+  deliberately left out of scope — extending it needs either
+  `AdvanceAlongWaypoints` to gain collision/edit awareness or a redesign
+  of how a demoted agent's in-flight edit obligations transfer between
+  tiers. (4) all prior M6 follow-ups (region-graph swap for Tier 1,
+  2-voxel body, per-dirty-brick invalidation, agent state replication)
+  still stand, unchanged by this slice.
+
 ## M0 GPU track (ADR-0001)
 
 - [x] Worldgen HLSL kernel (ColumnMain, VoxelizeMain, MeshCountMain,

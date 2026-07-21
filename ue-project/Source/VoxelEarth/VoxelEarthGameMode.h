@@ -85,4 +85,21 @@ private:
 	// .cpp for why this doesn't need to wait for render streaming the way
 	// -VoxelHeadlessDigTest/-VoxelTreeTest do.
 	FTimerHandle SwarmTestTimerHandle;
+
+	// M6 digging-while-pathing verification (docs/status.md M6 section
+	// "Digging-while-pathing"): -VoxelDigSwarmTest[=<N>] builds a
+	// deliberate rock wall a few meters ahead of the player, then spawns N
+	// agents on the FAR side of it (UVoxelAgentSubsystem::SpawnSwarmAtOffset)
+	// so the only short route back to the player crosses the wall -- see the
+	// .cpp for the wall/spawn geometry and why it's sized against the Tier 0
+	// search window.
+	FTimerHandle DigSwarmTestTimerHandle;
+	// Set once the wall is actually built (inside DigSwarmTestTimerHandle's
+	// callback, so these reflect the REAL build column, not just the parsed
+	// spawn arg) -- read by the -VoxelScreenshotAfter framing block (mirrors
+	// bTreeTestActive/TreeTestColumnXUU/YUU's identical shape) so a combined
+	// run captures the wall/tunnel instead of the generic oblique default.
+	bool bDigSwarmTestActive = false;
+	double DigSwarmTestColumnXUU = 0.0;
+	double DigSwarmTestColumnYUU = 0.0;
 };
