@@ -301,6 +301,31 @@ void AVoxelEarthGameMode::BeginPlay()
 		}
 	}
 
+	// -VoxelGIDebug=<n> / -VoxelGIVis=<n>. Both of these are read when a scene
+	// proxy is BUILT, and a proxy is only rebuilt when something marks it
+	// dirty -- so setting them through -ExecCmds leaves every already-resident
+	// chunk on the old value and silently produces a half-instrumented frame.
+	// Command line, read at init, same reasoning as -VoxelGIOn and
+	// -VoxelNoUnderground.
+	int32 GIDebugLevel = 0;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelGIDebug="), GIDebugLevel))
+	{
+		if (IConsoleVariable* V = IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.GI.Debug")))
+		{
+			V->Set(GIDebugLevel, ECVF_SetByCode);
+			UE_LOG(LogVoxelEarth, Log, TEXT("VoxelGIDebug: voxel.GI.Debug=%d"), GIDebugLevel);
+		}
+	}
+	int32 GIVisMode = 0;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelGIVis="), GIVisMode))
+	{
+		if (IConsoleVariable* V = IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.GI.DebugVis")))
+		{
+			V->Set(GIVisMode, ECVF_SetByCode);
+			UE_LOG(LogVoxelEarth, Log, TEXT("VoxelGIVis: voxel.GI.DebugVis=%d"), GIVisMode);
+		}
+	}
+
 	float GITestDelaySeconds = 20.f;
 	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelGITest="), GITestDelaySeconds) ||
 	    FParse::Param(FCommandLine::Get(), TEXT("VoxelGITest")))
