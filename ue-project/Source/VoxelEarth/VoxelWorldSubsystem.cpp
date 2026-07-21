@@ -886,6 +886,27 @@ struct FVoxelWorldImpl
 
 	TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStreaming::FChunkRecord> ChunkRecords;
 
+	// M1 hitch-gap wave (component pooling, docs/status.md M1 gate row): a
+	// component that leaves the desired set (DrainUnloads) or goes empty on
+	// re-mesh (ApplyMeshResult's zero-quads branch) is hidden + parked here
+	// instead of DestroyComponent()'d; AcquireChunkComponent (ApplyMeshResult's
+	// first-load branch) pops from here before ever falling back to
+	// NewObject+RegisterComponent. The hitch-attribution instrumentation
+	// (docs/status.md "Perf-run hitches") pinned render-thread scene-mutation
+	// backlog -- not this subsystem's own tick cost -- as the dominant cost at
+	// ring-boundary crossings; reusing a UPrimitiveComponent (and, just as
+	// importantly, its already-created UMaterialInstanceDynamic -- see
+	// ApplyRingFadeParams) avoids the AddPrimitive/RemovePrimitive churn a
+	// fresh Unregister+destroy / NewObject+Register pair costs. Capped at
+	// voxel.Stream.ComponentPoolMax (default 512); unloads past the cap still
+	// destroy the old way, so this never grows unboundedly. TWeakObjectPtr for
+	// the same reason FChunkRecord::Component is weak -- the actual GC root is
+	// ChunkOwner's OwnedComponents list; pooled components stay
+	// registered/attached (never Unregister/DestroyComponent'd) the whole time
+	// they're parked, so the weak pointer should never actually go stale in
+	// practice (AcquireChunkComponent guards against it anyway).
+	TArray<TWeakObjectPtr<UVoxelChunkComponent>> ComponentPool;
+
 	// Nearest-first-within-level, lower-level-wins-ties priority queues
 	// (docs/m2-plan.md item 1: "Budgets shared across levels, nearest-first
 	// within level, lower level (finer) wins priority at equal distance").
@@ -1000,13 +1021,19 @@ struct FVoxelWorldImpl
 	// frame's DeltaTime exceeded VoxelDebug::kHitchThresholdMs -- "measure
 	// before fixing" diagnostic breakdown of what a hitch frame actually did.
 	int32 ThisFrameAppliesFromWorker = 0; // DrainResults: worker-mesh-result applies (ApplyMeshResult calls, any outcome)
-	int32 ThisFrameProxiesCreated = 0;    // ApplyMeshResult calls (either path) that were a genuine first load (NewObject+RegisterComponent)
+	int32 ThisFrameProxiesCreated = 0;    // ApplyMeshResult calls (either path) that were a genuine first load (pooled reuse OR NewObject+RegisterComponent)
 	int32 ThisFrameEditRemeshes = 0;      // DrainGameThreadMesh: overlay-aware re-mesh/first-load applies
-	int32 ThisFrameUnloads = 0;           // DrainUnloads: DestroyComponent calls
+	int32 ThisFrameUnloads = 0;           // DrainUnloads: pool-park-or-destroy events
 	float ThisFrameDispatchMs = 0.f;
 	float ThisFrameApplyMs = 0.f;
 	float ThisFrameRemeshMs = 0.f;
 	float ThisFrameUnloadMs = 0.f;
+
+	// M1 hitch-gap wave (component pooling): AcquireChunkComponent pool hits
+	// (a first-load that reused a parked component instead of NewObject'ing a
+	// fresh one) this frame / cumulative since startup.
+	int32 ThisFramePoolReuses = 0;
+	int64 TotalPoolReuses = 0;
 
 	// 1Hz refresh window (P1 "1Hz refresh of text, per-frame collection"):
 	// per-frame accumulation happens continuously above; the published
@@ -1014,6 +1041,7 @@ struct FVoxelWorldImpl
 	float PerfRefreshAccumSeconds = 0.f;
 	int64 LoadedAtLastPerfRefresh = 0;
 	int64 UnloadedAtLastPerfRefresh = 0;
+	int64 PoolReusesAtLastPerfRefresh = 0;
 	FVoxelPerfSnapshot LastPerfSnapshot;
 
 	// Tracks the previous tick's VoxelDebug::IsChunkStatesEnabled() /
@@ -1100,6 +1128,24 @@ private:
 	bool ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
 	                      const VoxelCoords::FVoxelLevelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec, TArray<FVoxelChunkQuad>&& Quads,
 	                      bool bIsGameThreadMesh);
+	// M1 hitch-gap wave (component pooling): returns a pooled component
+	// (popped + counted as a reuse) if ComponentPool is non-empty, else falls
+	// back to the pre-pooling NewObject+SetupAttachment+RegisterComponent
+	// path. Never returns null. Caller (ApplyMeshResult) is responsible for
+	// re-applying every per-load property (level, position, material,
+	// visibility) regardless of which path this took -- a pooled component's
+	// stale level/position/quads are exactly the things about to be
+	// overwritten, and a fresh component needs them set for the first time.
+	UVoxelChunkComponent& AcquireChunkComponent(AActor& Owner, USceneComponent& Root);
+	// M1 hitch-gap wave: hides InComp, drops its render proxy (empty quads),
+	// resets its debug tint to identity, and parks it in ComponentPool --
+	// unless the pool is already at voxel.Stream.ComponentPoolMax, in which
+	// case this falls back to the pre-pooling DestroyComponent() (no
+	// unbounded pool growth). Deliberately leaves ChunkLevel/ChunkMaterial/
+	// ChunkMID untouched (see the .cpp definition) -- reusing that MID
+	// without recreating it is a real part of the pooling win, not just the
+	// register/unregister avoidance.
+	void ReturnChunkComponentToPool(UVoxelChunkComponent& InComp);
 	// M2 wave 2: generalized from a level-0-only helper (wave 1) to any
 	// level -- both level-0 edited chunks AND their level>=1 mip ancestors
 	// (see PropagateEditToMips) route through here identically.
@@ -1166,6 +1212,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	ThisFrameProxiesCreated = 0;
 	ThisFrameEditRemeshes = 0;
 	ThisFrameUnloads = 0;
+	ThisFramePoolReuses = 0;
 
 	// Recompute the desired set only when the anchor crosses into a new
 	// render-chunk XY column (every ChunkEdgeUU = 3.2m of movement), not
@@ -1252,10 +1299,10 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		UE_LOG(LogVoxelPerf, Warning,
 		       TEXT("Hitch frame: frameMs=%.2f (threshold %.1f) | subsystemTickMs=%.2f elsewhereMs=%.2f | ")
 		       TEXT("dispatchMs=%.2f applyMs=%.2f remeshMs=%.2f unloadMs=%.2f | ")
-		       TEXT("componentsApplied=%d proxiesCreated=%d editRemeshes=%d unloads=%d"),
+		       TEXT("componentsApplied=%d proxiesCreated=%d editRemeshes=%d unloads=%d poolReuses=%d poolSize=%d"),
 		       FrameMs, VoxelDebug::kHitchThresholdMs, TickMsSoFar, ElsewhereMs, ThisFrameDispatchMs, ThisFrameApplyMs,
 		       ThisFrameRemeshMs, ThisFrameUnloadMs, ThisFrameAppliesFromWorker, ThisFrameProxiesCreated, ThisFrameEditRemeshes,
-		       ThisFrameUnloads);
+		       ThisFrameUnloads, ThisFramePoolReuses, ComponentPool.Num());
 	}
 
 	// Visualizations (mode 2 only; every helper early-outs on its own cvar
@@ -1770,6 +1817,72 @@ void FVoxelWorldImpl::DispatchJobs()
 	}
 }
 
+UVoxelChunkComponent& FVoxelWorldImpl::AcquireChunkComponent(AActor& Owner, USceneComponent& Root)
+{
+	while (ComponentPool.Num() > 0)
+	{
+		const TWeakObjectPtr<UVoxelChunkComponent> Pooled = ComponentPool.Pop(EAllowShrinking::No);
+		if (UVoxelChunkComponent* Comp = Pooled.Get())
+		{
+			++ThisFramePoolReuses;
+			++TotalPoolReuses;
+			return *Comp;
+		}
+		// Stale weak pointer: shouldn't happen in practice (pooled components
+		// stay registered/attached the whole time they're parked -- see
+		// ComponentPool's doc comment) but skip it and keep looking rather
+		// than ever hand back a dangling reference.
+	}
+
+	UVoxelChunkComponent* Comp = NewObject<UVoxelChunkComponent>(&Owner);
+	Comp->SetupAttachment(&Root);
+	Comp->RegisterComponent();
+	return *Comp;
+}
+
+void FVoxelWorldImpl::ReturnChunkComponentToPool(UVoxelChunkComponent& InComp)
+{
+	const int32 PoolMax = VoxelDebug::GetComponentPoolMax();
+	if (ComponentPool.Num() >= PoolMax)
+	{
+		// Already at cap: fall back to the pre-pooling path rather than grow
+		// this array unboundedly.
+		InComp.DestroyComponent();
+		return;
+	}
+
+	// Reset every piece of per-residency state EXCEPT ChunkLevel/ChunkMaterial/
+	// ChunkMID -- those are overwritten on the next acquire (SetLevel/
+	// SetMaterial, called unconditionally in ApplyMeshResult's first-load
+	// branch below) before anything reads them again, and leaving ChunkMID
+	// alive is itself a real part of the pooling win: ApplyRingFadeParams
+	// reuses the SAME UMaterialInstanceDynamic and just updates its scalar
+	// params instead of calling UMaterialInstanceDynamic::Create again (a
+	// non-trivial render-thread cost of its own).
+	//  - SetVisibility(false): hides it. Coalesces with the MarkRenderStateDirty
+	//    below into a single end-of-frame proxy recreate (UE batches same-frame
+	//    dirty-render-state requests, it does not recreate per call), so doing
+	//    both here costs the same as doing either one alone.
+	//  - SetChunkQuads({}, ...): drops the stale geometry (CreateSceneProxy
+	//    returns null once ChunkQuads is empty) so a parked component holds no
+	//    GPU-side vertex/index buffers and has no live scene proxy at all --
+	//    the cheapest possible "parked" state, and correctness-required (a
+	//    hidden-but-still-meshed component would otherwise flash its OLD
+	//    chunk's geometry for one frame if something ever force-showed it).
+	//  - ClearDebugTint(): a chunk-state/ring tint from this component's
+	//    PREVIOUS residency must never bleed into whichever new chunk reuses
+	//    it -- this is the "indistinguishable from a fresh component"
+	//    correctness bar for the debug-tint layers specifically.
+	// No SetComponentTickEnabled(false) call: UVoxelChunkComponent's
+	// constructor already sets PrimaryComponentTick.bCanEverTick = false
+	// unconditionally (this primitive never ticks, pooled or not), so there
+	// is nothing for it to disable.
+	InComp.SetVisibility(false);
+	InComp.SetChunkQuads({}, VoxelCoords::ChunkEdgeVoxels);
+	InComp.ClearDebugTint();
+	ComponentPool.Add(&InComp);
+}
+
 bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
                                        const VoxelCoords::FVoxelLevelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec,
                                        TArray<FVoxelChunkQuad>&& Quads, bool bIsGameThreadMesh)
@@ -1784,11 +1897,15 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	if (Quads.Num() == 0)
 	{
 		// No visible geometry (fully buried chunk, or an edit carved away
-		// the last exposed faces): drop any stale component instead of
-		// spawning/keeping an empty one.
+		// the last exposed faces): park (not destroy) any stale component --
+		// M1 hitch-gap wave, same pooling path DrainUnloads uses -- rather
+		// than spawning/keeping an empty one. The record stays in
+		// ChunkRecords (this chunk key is still in the desired set; it might
+		// gain quads again on a future edit), it just has no live component
+		// until then.
 		if (UVoxelChunkComponent* Existing = Rec.Component.Get())
 		{
-			Existing->DestroyComponent();
+			ReturnChunkComponentToPool(*Existing);
 		}
 		Rec.Component = nullptr;
 		return false;
@@ -1798,12 +1915,21 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	const bool bWasFirstLoad = (Comp == nullptr);
 	if (!Comp)
 	{
-		Comp = NewObject<UVoxelChunkComponent>(&Owner);
-		Comp->SetupAttachment(&Root);
-		Comp->SetLevel(Key.Level); // M2: fixed for the component's lifetime, see SetLevel doc comment
+		// M1 hitch-gap wave: prefer a pooled component (hidden, no proxy,
+		// still registered/attached) over NewObject+RegisterComponent -- see
+		// AcquireChunkComponent. Every per-load property below is
+		// unconditionally re-applied regardless of which path AcquireChunkComponent
+		// took, so a reused component ends up byte-for-byte indistinguishable
+		// from a fresh one at this (level, key): SetLevel resets the level
+		// (and, via ApplyRingFadeParams, the ring cross-fade params) even
+		// though a pooled component may have held a DIFFERENT level in its
+		// previous residency; SetRelativeLocation/SetMaterial/SetVisibility
+		// likewise never assume anything about prior state.
+		Comp = &AcquireChunkComponent(Owner, Root);
+		Comp->SetLevel(Key.Level);
 		Comp->SetRelativeLocation(VoxelCoords::ChunkOriginWorldForLevel(Key.Key, Key.Level));
 		Comp->SetMaterial(0, Material);
-		Comp->RegisterComponent();
+		Comp->SetVisibility(true); // undo ReturnChunkComponentToPool's hide; no-op for a genuinely fresh component (visible by default)
 		Rec.Component = Comp;
 		++TotalChunksLoaded;
 	}
@@ -1966,9 +2092,13 @@ void FVoxelWorldImpl::DrainUnloads()
 			// Any worker job still in flight for this key keeps running to
 			// completion (it can't be cancelled); when its result arrives,
 			// DrainResults finds no record for the key and discards it.
+			// M1 hitch-gap wave: park (not destroy) -- see
+			// ReturnChunkComponentToPool / docs/status.md M1 gate row. This is
+			// the exact ring-boundary-crossing case the hitch-attribution
+			// instrumentation pinned as the dominant cost.
 			if (UVoxelChunkComponent* Comp = Rec.Component.Get())
 			{
-				Comp->DestroyComponent();
+				ReturnChunkComponentToPool(*Comp);
 			}
 			ResidentQuads -= Rec.LastQuadCount;
 			++TotalChunksUnloaded;
@@ -2196,6 +2326,15 @@ void FVoxelWorldImpl::UpdatePerfSnapshot(float DeltaTime, float TickMs)
 	LastPerfSnapshot.ChunksUnloadedPerSec = float(TotalChunksUnloaded - UnloadedAtLastPerfRefresh) / Window;
 	LoadedAtLastPerfRefresh = TotalChunksLoaded;
 	UnloadedAtLastPerfRefresh = TotalChunksUnloaded;
+
+	// M1 hitch-gap wave (component pooling): parked-pool size (current) +
+	// reuse rate (events/sec over this window) + cumulative reuses since
+	// startup -- same ChunksLoadedPerSec-style windowed-rate convention as
+	// the streaming counters just above.
+	LastPerfSnapshot.PooledComponents = ComponentPool.Num();
+	LastPerfSnapshot.PoolReusesPerSec = float(TotalPoolReuses - PoolReusesAtLastPerfRefresh) / Window;
+	LastPerfSnapshot.TotalPoolReuses = TotalPoolReuses;
+	PoolReusesAtLastPerfRefresh = TotalPoolReuses;
 
 	LastPerfSnapshot.JobsInFlight = JobsInFlightCounter.GetValue();
 	LastPerfSnapshot.JobsInFlightCap = MaxJobsInFlight;
