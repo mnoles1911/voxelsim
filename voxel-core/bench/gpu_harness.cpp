@@ -1415,12 +1415,34 @@ struct GrowBuffer {
     // use this to skip vkUpdateDescriptorSets when a slot's buffer set is
     // unchanged from the previous tile that used this slot (persistent
     // descriptor sets across the batched-flight run; see FlightSlot below).
-    bool ensure(GpuContext& ctx, VkDeviceSize bytes) {
+    // Growth policy. Allocating EXACTLY `bytes` meant a slot that saw tiles of
+    // steadily increasing bricksZ/maskCount re-allocated on almost every one:
+    // measured at --radius 64, 202 reallocations across the 16 slots, each
+    // costing ~1.7 ms of vkAllocateMemory + vkMapMemory (+ unmap/free of the
+    // old buffer) on tens of MB of host-visible memory. Only 112 of those
+    // (7 buffers x 16 slots) are unavoidable first touches.
+    //
+    // So over-allocate: at least 1.5x the previous capacity, rounded up to a
+    // 1 MB granularity. That bounds the wasted memory at 50% while making
+    // repeated small growths free. Buffer CAPACITY is invisible to the
+    // shaders -- every dispatch is bounded by WorldGenParams (DispatchColumns,
+    // BricksZ, ScanCount), never by buffer size -- so this cannot move a
+    // digest. It only ever allocates MORE than before.
+    static VkDeviceSize grownCapacity(VkDeviceSize bytes, VkDeviceSize prevCapacity) {
+        const VkDeviceSize slack = prevCapacity + prevCapacity / 2;
+        VkDeviceSize want = bytes > slack ? bytes : slack;
+        constexpr VkDeviceSize kGranularity = 1u << 20; // 1 MB
+        return (want + kGranularity - 1) / kGranularity * kGranularity;
+    }
+
+    bool ensure(GpuContext& ctx, VkDeviceSize bytes, double* allocMsOut = nullptr) {
         if (bytes <= capacityBytes && buf.buffer != VK_NULL_HANDLE) return false;
+        const auto t0 = Clock::now();
         if (buf.buffer != VK_NULL_HANDLE) ctx.destroyBuffer(buf);
-        capacityBytes = bytes;
+        capacityBytes = grownCapacity(bytes, capacityBytes);
         buf = ctx.createBuffer(capacityBytes, usage);
         ++reallocCount;
+        if (allocMsOut) *allocMsOut += msSince(t0);
         return true;
     }
 };
@@ -1671,8 +1693,9 @@ struct GateStats {
     // fully-serial per-tile loop) their sum can legitimately exceed the
     // headline gate number below once flight pipelining hides marshalling
     // time inside GPU execution time (see runGateMode's report).
-    double hostRasterFillMs = 0, marshallingMs = 0, columnMs = 0, voxelizeMs = 0,
-           meshCountMs = 0, scanBlocksMs = 0, scanSumsMs = 0, scanAddMs = 0, meshEmitMs = 0;
+    double hostRasterFillMs = 0, marshallingMs = 0, bufferAllocMs = 0, columnMs = 0,
+           voxelizeMs = 0, meshCountMs = 0, scanBlocksMs = 0, scanSumsMs = 0, scanAddMs = 0,
+           meshEmitMs = 0;
     // The headline gate number: total loop wall-clock MINUS the two costs
     // explicitly excluded per the gate spec (cpuColumnPassMs, cpuCompareMs).
     // Computed once in runGateMode from the measured wall clock, not summed
@@ -1805,15 +1828,20 @@ void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t 
     s.bricksX = uint32_t(W) / kBrick;
     s.bricksY = uint32_t(H) / kBrick; // == 16
 
-    // --- Marshalling part 1: buffer ensure/grow (persistent slot buffers;
-    // only actually (re)allocates on this slot's first use or when a tile
-    // needs more room than any previous tile that used this slot). --------
-    const auto tMarshalA0 = Clock::now();
+    // --- Buffer ensure/grow (persistent slot buffers; only actually
+    // (re)allocates on this slot's first use or when a tile needs more room
+    // than any previous tile that used this slot). Timed into its OWN bucket:
+    // this is vkAllocateMemory/vkMapMemory cost, not marshalling, and lumping
+    // the two together made the old single "marshalling" line read as though
+    // per-tile CPU marshalling cost 342 ms when almost all of it was 202
+    // allocations. -------------------------------------------------------
+    double allocMs = 0.0;
     const bool cellsGrew = s.gb.cellsBuf.ensure(
-        ctx, VkDeviceSize(s.bricksX) * s.bricksY * s.bricksZ * 512 * sizeof(uint32_t));
-    const bool elevGrew = s.gb.elevBuf.ensure(ctx, VkDeviceSize(rasterW) * rasterH * sizeof(int32_t));
-    const bool climGrew = s.gb.climBuf.ensure(ctx, VkDeviceSize(rasterW) * rasterH * sizeof(uint32_t));
-    const double marshalA = msSince(tMarshalA0);
+        ctx, VkDeviceSize(s.bricksX) * s.bricksY * s.bricksZ * 512 * sizeof(uint32_t), &allocMs);
+    const bool elevGrew =
+        s.gb.elevBuf.ensure(ctx, VkDeviceSize(rasterW) * rasterH * sizeof(int32_t), &allocMs);
+    const bool climGrew =
+        s.gb.climBuf.ensure(ctx, VkDeviceSize(rasterW) * rasterH * sizeof(uint32_t), &allocMs);
 
     const auto tRaster0 = Clock::now();
     int32_t* elev = static_cast<int32_t*>(s.gb.elevBuf.buf.mapped);
@@ -1830,9 +1858,11 @@ void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t 
     }
     stats.hostRasterFillMs += msSince(tRaster0);
 
-    // --- Marshalling part 2: WorldGenParams, mesh mask buffers, persistent
-    // descriptor writes (only when a bound buffer actually changed). ------
-    const auto tMarshalB0 = Clock::now();
+    // --- Marshalling proper: WorldGenParams fill/upload and persistent
+    // descriptor writes (only when a bound buffer actually changed). The mesh
+    // mask buffers' ensure() calls below add into allocMs, not this. -------
+    const double allocMsBeforeMarshal = allocMs; // part-A allocs are outside the bracket below
+    const auto tMarshal0 = Clock::now();
     WorldGenParamsCB params{};
     params.DispatchColumnsX = uint32_t(W);
     params.DispatchColumnsY = uint32_t(H);
@@ -1872,16 +1902,16 @@ void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t 
                  ") bricksZ=" + std::to_string(s.bricksZ) + ")");
 
         const bool countsGrew =
-            s.gb.countsBuf.ensure(ctx, VkDeviceSize(s.maskCount) * sizeof(uint32_t));
+            s.gb.countsBuf.ensure(ctx, VkDeviceSize(s.maskCount) * sizeof(uint32_t), &allocMs);
         const bool offsetsGrew =
-            s.gb.offsetsBuf.ensure(ctx, VkDeviceSize(s.maskCount) * sizeof(uint32_t));
+            s.gb.offsetsBuf.ensure(ctx, VkDeviceSize(s.maskCount) * sizeof(uint32_t), &allocMs);
         const bool blockSumsGrew = s.gb.blockSumsBuf.ensure(
-            ctx, VkDeviceSize((s.maskCount + 255) / 256) * sizeof(uint32_t));
+            ctx, VkDeviceSize((s.maskCount + 255) / 256) * sizeof(uint32_t), &allocMs);
         // Upper bound (32 quads/mask max, docs/gpu-mesher-design.md) since
         // MeshEmitMain is chained into the SAME command buffer as
         // MeshCountMain -- no readback point to size it exactly first.
-        const bool quadsGrew =
-            s.gb.quadsBuf.ensure(ctx, VkDeviceSize(s.maskCount) * 32 * sizeof(uint64_t));
+        const bool quadsGrew = s.gb.quadsBuf.ensure(
+            ctx, VkDeviceSize(s.maskCount) * 32 * sizeof(uint64_t), &allocMs);
 
         params.ScanCount = s.maskCount;
         validateScanCount(params.ScanCount, s.maskCount, "prepTileCpu mesh chain");
@@ -1894,7 +1924,11 @@ void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t 
     }
 
     std::memcpy(s.gb.paramsBuf.mapped, &params, sizeof(params));
-    stats.marshallingMs += marshalA + msSince(tMarshalB0);
+    // msSince(tMarshal0) spans the mesh ensure() calls too, so subtract the
+    // allocation time they contributed; the remainder is params + descriptors.
+    const double marshalOnlyMs = msSince(tMarshal0) - (allocMs - allocMsBeforeMarshal);
+    stats.marshallingMs += marshalOnlyMs > 0.0 ? marshalOnlyMs : 0.0;
+    stats.bufferAllocMs += allocMs;
 }
 
 // Records this tile's full chain into the flight's shared command buffer,
@@ -2447,7 +2481,8 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
     // of pretending the buckets are additive to gateMs (as the old fully
     // serial per-tile loop's remainder-based "marshalling overhead" line
     // implicitly did).
-    const double serialEquivalentMs = stats.hostRasterFillMs + stats.marshallingMs + gpuStagesMs;
+    const double serialEquivalentMs =
+        stats.hostRasterFillMs + stats.marshallingMs + stats.bufferAllocMs + gpuStagesMs;
     const double pipeliningSavedMs =
         serialEquivalentMs > stats.gateMs ? serialEquivalentMs - stats.gateMs : 0.0;
 
@@ -2460,8 +2495,9 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
         "  GPU scan (blocks+sums+add): %10.3f ms  (blocks %.3f + sums %.3f + add %.3f)\n"
         "  mesh emit dispatch:     %10.3f ms\n"
         "  host raster fill:       %10.3f ms\n"
-        "  marshalling (buffer ensure/grow, persistent-descriptor writes on regrow only, "
-        "WorldGenParams upload): %10.3f ms\n"
+        "  marshalling (WorldGenParams fill+upload, persistent-descriptor writes on "
+        "regrow only): %10.3f ms\n"
+        "  buffer (re)allocation (vkAllocateMemory + vkMapMemory on grow): %10.3f ms\n"
         "  (sum of the above as if fully serial: %10.3f ms; hidden by flight double-"
         "buffering: %10.3f ms)\n"
         "  GATE TOTAL (measured wall clock, gpu path):  %10.3f ms  = %.3f s\n"
@@ -2470,7 +2506,8 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
         "  wall clock (everything, incl. both excluded costs):  %10.3f ms\n",
         (long long)radiusM, stats.totalTiles, stats.columnMs, stats.voxelizeMs,
         stats.meshCountMs, scanMs, stats.scanBlocksMs, stats.scanSumsMs, stats.scanAddMs,
-        stats.meshEmitMs, stats.hostRasterFillMs, stats.marshallingMs, serialEquivalentMs,
+        stats.meshEmitMs, stats.hostRasterFillMs, stats.marshallingMs, stats.bufferAllocMs,
+        serialEquivalentMs,
         pipeliningSavedMs, stats.gateMs, gateSec, stats.cpuColumnPassMs, stats.cpuCompareMs,
         wallMs);
 
