@@ -3791,3 +3791,150 @@ core, costing ~36% more `MaterialFn` calls than the purely lazy version
 (10.5M vs 7.7M) — a deliberate trade of total CPU for frame granularity,
 revisitable if a cheaper bulk terrain read (e.g. per-brick generation rather
 than per-voxel) becomes available.
+### Voxel light field + cone-traced GI (M4)
+
+First working slice of the M4 line item "voxel light field + cone-traced GI".
+**Default OFF** (`voxel.GI.Enabled 0`) until it earns its way on. CLIENT-SIDE
+RENDERING ONLY: outside the determinism boundary, floats throughout, no
+worldgen / edit-log / replication / digest path is read or written by any of
+it. Two clients may converge to slightly different irradiance; they cannot
+disagree about world state.
+
+New files: `VoxelLightField.{h,cpp}` (the field + cone tracer),
+`VoxelGI.{h,cpp}` (`UVoxelGISubsystem`: budgets, queues, cvars). Touched:
+`VoxelChunkComponent.{h,cpp}` (proxy shades from the field), and one anchored
+test-switch block in `VoxelEarthGameMode.{h,cpp}`.
+
+**Approach -- surface-voxelized VCT, CPU-side, folded into VertexColor.G.**
+Classic voxel cone tracing (Crassin et al. 2011), with three choices worth
+justifying:
+
+1. *Surface voxelization, not solid.* VCT rasterizes scene surfaces into a
+   grid; cones stop at the first surface, so solid interiors never matter.
+   That is fortunate here, because the only voxel data reachable without
+   reaching into `UVoxelWorldSubsystem`'s PImpl is the greedy-mesher quad list
+   already flowing through `UVoxelChunkComponent::SetChunkQuads` -- which is
+   exactly a surface description, and is already delivered on stream-in AND on
+   every edit-driven remesh.
+2. *Field aligned 1:1 with level-0 chunks.* One brick per chunk: 8^3 cells of
+   40 UU = 320 UU = `VoxelCoords::ChunkEdgeUU`. Brick lifetime, dirtying and
+   eviction therefore follow chunk streaming exactly, and re-voxelizing is
+   always a clean clear-then-fill of one chunk.
+3. *Output is a scalar in `VertexColor.G`.* `M_VoxelTerrain` already computes
+   `BaseColor = albedoTint * VertexColor.G * DebugTint`, so no material asset
+   change, no custom global shader and no render-pass integration were needed
+   -- the whole feature is CPU-side and reviewable. With GI off the emitted
+   `FColor` is byte-identical to before (the 2-bit AO quantisation 0/85/170/255
+   is reproduced exactly, not round-tripped through a float).
+
+Per air-cell adjacent to a surface the field stores **6 directional visibility
+bytes** (an ambient cube; 6 x 90-degree cones is the standard VCT diffuse
+budget). A shading point recombines them with `max(0, N.D)` weights, so a floor
+and the ceiling above it get different answers from the same data. Mip pyramid:
+4 in-brick levels (40/80/160/320 UU) + 3 sparse global levels (640/1280/2560
+UU), MAX-aggregated rather than averaged -- VCT's classic failure is light
+LEAKING through thin walls once they blur at coarse mips, and for a game about
+digging, erring toward "too dark" is the right side to be wrong on. The mesher's
+existing per-corner AO is kept and multiplied in: it supplies contact-scale
+occlusion that a cone whose first step is already 40cm wide cannot resolve,
+while the cone supplies the large-scale term per-voxel AO cannot see.
+
+A subtle but load-bearing detail found by measurement: the cone march step MUST
+equal the sampled mip's cell size, not the cone radius. They diverge between mip
+boundaries, and because this is a surface voxelization the ground is a
+single-cell-thick shell -- a step larger than the cell being sampled marches
+straight through it and reports full sky visibility for a surface facing a floor
+3 metres away.
+
+**One bounce is progressive.** A cone terminating on a surface picks up that
+surface's *previously solved* irradiance times a constant albedo. Nothing
+converges within a single solve; re-solves (edits, streaming, and a slow
+round-robin refresh) carry it forward. This is what makes bounded per-frame
+cost possible: there is no pass that must finish before the frame can be shown.
+
+**Edit responsiveness.** `SetChunkQuads` is the entire mechanism. The streaming
+system already remeshes every chunk an edit dirties and pushes it through that
+call, so a dug tunnel arrives here indistinguishably from a newly streamed
+chunk. The affected brick is re-voxelized and its `voxel.GI.EditDirtyRadiusBricks`
+neighbourhood (default 2 -> 5x5x5) queued for re-solve. A large explosion makes
+the queue longer, never the frame longer.
+
+**Budget / LOD.** Everything is capped per frame:
+`MaxVoxelizePerFrame` 16, `MaxBrickSolvesPerFrame` 8 (blocking `ParallelFor`
+over workers), `RefreshBricksPerFrame` 2, `MaxChunkRefreshesPerFrame` 4,
+`MaxBricks` 4096 (~3.6 KB each). Measured steady state at 1999 resident bricks:
+**8.2 MB, 0.5-0.6 ms of game-thread tick**, solving ~230-300 cells across 2
+bricks per tick. LOD story follows the existing ring cascade: only level-0
+chunks feed or sample the field, so GI simply does not exist beyond R0, and the
+proxy fades the GI term back to plain AO over `FadeStartUU`..`FadeEndUU`
+(4800..6400 UU) so the R0/R1 boundary is not also a lighting boundary. Eviction
+is distance-based (level-0 chunks only unload because the camera left).
+
+**M1 60fps gate -- NOT regressed.** Same scenario as the gate close above:
+`-VoxelPerfRun=60`, seed 20260719, min-spec proxy (`sg.ViewDistanceQuality 0`,
+`sg.ShadowQuality 0`, `sg.PostProcessQuality 0`, `sg.EffectsQuality 0`,
+`r.ScreenPercentage 100`), 1080p windowed, clean `Saved/VoxelWorlds`.
+
+| Config | p50 | p95 | postWarmup p95 | postWarmup max | postWarmup hitches |
+|---|---|---|---|---|---|
+| **GI off** (run 1) | 3.09 ms | **4.82 ms** | 4.86 ms | 12.8 ms | 0 |
+| **GI off** (run 2) | 3.00 ms | **4.85 ms** | 4.88 ms | 13.0 ms | 0 |
+| **GI on** | 4.09 ms | **7.80 ms** | 7.31 ms | 14.0 ms | 0 |
+
+GI off reproduces the gate-close band (4.79-4.93 ms) exactly -- unchanged, still
+a ~3.4x margin on the 16.6 ms bar. GI on costs about **+1.0 ms p50 / +3.0 ms
+p95** and still passes the bar with ~2.1x margin and zero post-warmup hitches,
+but that is a real and honestly large fraction of a 60fps budget for a first
+slice; most of it is the extra vertices from `voxel.GI.MaxQuadSpanVoxels` plus
+the extra proxy rebuilds, not the cone tracing itself (which measures 0.5 ms).
+Caveat: one early GI-off run measured 6.27 ms before later runs settled at
+4.82/4.85; a same-tree pre-change baseline was not captured, so "unchanged"
+rests on matching the previously published band rather than on a paired A/B.
+
+**Screenshots** (`docs/images/m4-gi/`, seed 20260719, identical camera per pair):
+- `01-outdoor-gi-off.png` / `02-outdoor-gi-on.png` -- open terrain from spawn.
+  GI on visibly deepens occlusion in terrain crevices (clearest in the upper-left
+  band). Weak demo: the default framing is mostly ocean.
+- `03-roofed-gi-off.png` / `04-roofed-gi-on.png` -- inside the wall+roof fixture,
+  looking down the covered span. **The money shot:** the enclosed wall face goes
+  from fully lit cream (off) to dark grey (on).
+- `05-breach-gi-off.png` / `06-breach-gi-on.png` -- same, after punching a ~4m
+  hole through the roof slab. The hole's cut faces are correctly dark and the
+  roof re-shades around the opening.
+
+**Honest assessment.** The mechanism demonstrably works, and the numbers say so
+more clearly than the pictures do: with `voxel.GI.Debug 2`, open terrain solves
+to meanGI 0.65-0.70, buried and enclosed chunks to 0.001-0.02, roof chunks to
+0.21-0.43, with ~95% of vertices finding solved data. But:
+- **Monochrome.** No coloured bleed. Needs a material change (or a second
+  vertex attribute) to carry RGB.
+- **It modulates albedo, not the ambient term.** Physically a shortcut. It reads
+  correctly only because `M_VoxelTerrain` is a flat untextured albedo.
+- **Vertex-rate resolution.** Mitigated by subdividing quads when GI is on
+  (`voxel.GI.MaxQuadSpanVoxels`, default 8), which costs vertices.
+- **UNRESOLVED:** in `04-roofed-gi-on.png` the roof slab's underside still
+  renders fully lit even though the field reports 0.00 irradiance there
+  (verified by direct probe) and the roof chunks' vertex data is dark. I could
+  not explain the discrepancy in the time available and am flagging it rather
+  than claiming the shot is better than it is.
+- **No underground proof.** The obvious test -- dig a chamber and stand in it --
+  cannot work in this build: the streaming footprint only meshes a band of
+  chunks around the terrain SURFACE, so a camera 9m+ down renders open sky under
+  a thin crust regardless of what voxel-core says is solid. That is a
+  streaming/LOD limitation, not a GI one, but it is why the enclosure shots use
+  an above-ground fixture.
+
+**Follow-ups.** (1) Resolve the roof-underside discrepancy. (2) Move the cone
+trace to the GPU against a real 3D texture clipmap; the CPU field is fine as the
+source of truth but per-vertex CPU sampling is what costs the GI-on ms.
+(3) Coloured bounce (needs a material change). (4) Specular/reflection cones.
+(5) A sun-visibility cone so bounce is driven by direct light rather than a
+uniform sky. (6) Underground streaming, without which caves cannot be lit or
+even seen.
+
+New cvars, all `voxel.GI.*`: `Enabled` (0), `Strength`, `AmbientFloor`,
+`MaxQuadSpanVoxels`, `RadiusUU`, `FadeStartUU`, `FadeEndUU`,
+`MaxVoxelizePerFrame`, `MaxBrickSolvesPerFrame`, `RefreshBricksPerFrame`,
+`MaxChunkRefreshesPerFrame`, `EditDirtyRadiusBricks`, `MaxBricks`,
+`ConeDistanceUU`, `BounceAlbedo`, `Debug`. New switches: `-VoxelGIOn`,
+`-VoxelGITest=<s>`, `-VoxelGIBreach`.
