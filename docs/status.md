@@ -585,6 +585,108 @@ flora/ecotone blending remain pending design (rounds 2-3).
   explicit `static_cast<int32_t>` when recording indices into the
   `int32_t` result vectors.
 
+### First slice — chop → island → fall, wired in UE (2026-07-20, worktree agent)
+
+The connectivity primitive above is now driven end-to-end in the UE runtime:
+a chop severs a piece, the island detector finds it, it is removed from the
+authoritative grid, and a cosmetic Chaos body falls and settles. New UE files:
+`Source/VoxelEarth/VoxelDebris.{h,cpp}` (the falling-debris actor) + additions
+to `VoxelWorldSubsystem.{h,cpp}` and `VoxelEarthGameMode.{h,cpp}`. voxel-core
+was NOT modified (`connectivity.h` is header-only, consumed as-is).
+
+**The pipeline.**
+1. **Stand-in tree TEST FIXTURE** (`UVoxelWorldSubsystem::SpawnTreeFixtureAt`,
+   behind the GameMode's `-VoxelTreeTest[=<s>]`, authority only): a
+   hand-authored blocky voxel tree — a 2×2 MAT_ROCK trunk column (24 voxels
+   tall) + a radius-6 spherical canopy blob, ~1000 voxels total — stamped near
+   spawn (+6m ahead) through the edit-log path (`StampVoxels`). Explicitly a
+   FIXTURE to exercise M5 physics (docs/m4-plan.md Round 2), NOT M4
+   vegetation. Renders because the edit routes its above-surface chunks through
+   the overlay-aware mesh path (they sit inside R0 + the desired-set's +2-chunk
+   Z headroom).
+2. **Chop → island detection** (`FVoxelWorldImpl::DetectAndRemoveIslands`,
+   called by the file-scope `PromoteDetachedIslands` hook from
+   `UVoxelWorldSubsystem::TryDig`/`CarveSphere` after any solid-removing edit,
+   before the M3 broadcast so removals replicate with the trigger): builds a
+   bounded region around the just-cleared voxels (cleared AABB + margins:
+   ±10 XY, −3/+48 Z; hard-capped 48×48×128) and runs
+   `vxc::findDisconnectedIslands` over it with a **boundary-except-top anchor**
+   (a solid voxel is "grounded" if it touches any region face except the top).
+   That anchor is strictly safer than the header's `bottomFaceAnchor`: anything
+   reaching a side/bottom boundary is assumed to continue into the standing
+   world outside the box, so only a piece fully INTERIOR to the region (a
+   severed chunk with margin around it) is flagged — grounded terrain is never
+   falsely deleted.
+3. **Island → falling debris** (`AVoxelDebris`): each detached island is (a)
+   REMOVED from the authoritative grid via the edit-log path (a second
+   `ApplyGroupedEdits`), then (b) handed to one cosmetic `AVoxelDebris` actor —
+   a Chaos rigid body (an invisible 1m cube carrying gravity; all collision
+   responses Ignore because terrain has no Chaos collision, plan §3.3) plus an
+   InstancedStaticMesh of one engine cube per island voxel (the "engine cubes"
+   render option). It free-falls under gravity and is settled by a per-tick DDA
+   raycast against the voxel world (`RaycastVoxelWorld`): when the island's
+   lowest face reaches the surface it snaps to rest and stops simulating.
+
+**Deterministic / cosmetic split (doctrine-preserving).** The AUTHORITATIVE,
+deterministic, replicated effect of a chop is the **edit-log removal of the
+island voxels** — the island DECISION is `connectivity.h` (deterministic) and
+the removal is edit entries (replicated + persisted like any dig). The
+`AVoxelDebris` **Chaos body is pure client-side presentation**: it touches no
+edit log, is never replicated, and may tumble/settle differently per client —
+so it can never desync world state. On a dedicated server the removal still
+happens but no debris actor is spawned (no viewport). *Follow-up:* clients
+today receive the removal as replicated entries but do not yet re-run island
+detection to spawn their OWN cosmetic debris — v0 spawns debris only where the
+edit originates (standalone/listen/authority).
+
+**Safety — no false debris on normal terrain edits.** A first attempt ran
+detection on every solid-removing edit unconditionally; a 10m explosive-style
+`CarveSphere` (2.1M voxels, ragged jitter) then produced 1712 spurious
+micro-islands from its clamped region — which would have wrongly deleted
+terrain and broken the "standalone edit behavior unchanged" gate. Fixed with
+two guards in `DetectAndRemoveIslands`: (1) **if the region hits the size cap
+(clamped), detection is SKIPPED entirely** — a bounded region can only anchor
+soundly when it fully contains the candidate piece, so large edits do not
+detach islands this slice (large-span structural collapse is a follow-up);
+(2) a **MinIslandVoxels=16 threshold** ignores the handful of single voxels a
+ragged carve genuinely isolates (left in the grid), plus a MaxIslandsPerEdit=16
+valve. The whole pass is gated by `voxel.Destruction.Enabled` (default true;
+with no world geometry that detaches, normal digs find zero islands, so
+edit-log RESULTS are unchanged whether on or off).
+
+**Verification (headless `-game`, seed 20260719, zero ensures, clean
+shutdown).**
+- `-VoxelTreeTest=8 -VoxelChopTest=18 -VoxelScreenshotAfter=30`: tree fixture
+  placed (1000 voxels) → trunk carved (32 voxels) →
+  `Destruction: region=[(50,-10,10978)..(71,11,11036)] components=2 anchored=1
+  islands=1` → `island 0 promoted -> 936 voxels removed` →
+  `VoxelDebris spawned: voxels=936 ... halfH=75UU -- falling` →
+  `VoxelDebris settled: voxels=936 rest=(605,5,109885) after ~1.0s` (fell 80UU
+  = the 8-voxel cut gap, landing on the stump). Screenshots
+  `Saved/Screenshots/WindowsEditor/VoxelVerify00004.png` / `VoxelVerify00005.png`
+  (chop-test camera framing aims at the tree column). The 1000-voxel tree =
+  32-voxel anchored stump + 32 carved + 936 canopy island — accounted for.
+- False-positive regression: `-VoxelHeadlessDigTest=10` (a 10m crater on
+  terrain, no tree) now logs `edit region exceeded cap (48x48x128) -- island
+  detection skipped` and promotes ZERO islands / ZERO debris — terrain
+  behavior unchanged, gate preserved.
+
+**Build.** `VoxelEarthEditor Win64 Development` clean via `Build.bat ...
+-WaitMutex -NoHotReloadFromIDE` (zero warnings from any file touched this
+slice: `VoxelDebris.{h,cpp}`, `VoxelWorldSubsystem.{h,cpp}`,
+`VoxelEarthGameMode.{h,cpp}`; same pre-existing engine-header deprecation
+baseline as prior waves). Standalone behavior without the test switches is
+unchanged.
+
+**Follow-ups** (documented, not done this slice): (1) full voxel-vs-Chaos
+collision so debris rests on terrain by contact rather than a per-tick raycast;
+(2) re-integrating a settled island back into the static voxel grid as
+resting voxels (v0 leaves it as a parked Chaos body); (3) client-side cosmetic
+debris from replicated removals; (4) large-edit / structural-collapse island
+detection (currently skipped when the region clamps); (5) reusing the voxel
+chunk scene proxy to mesh the island instead of per-voxel instanced cubes;
+(6) per-bone voxel character bodies (severed-limb debris), plan §3.5.
+
 ## M0 GPU track (ADR-0001)
 
 - [x] Worldgen HLSL kernel (ColumnMain, VoxelizeMain, MeshCountMain,

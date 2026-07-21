@@ -174,6 +174,16 @@ public:
 	// non-air before the carve).
 	int32 CarveSphere(const FVector& CenterUU, double RadiusUU, double JitterUU);
 
+	// --- M5 destruction (first slice, docs/m4-plan.md Round 2 reframe) --------
+
+	// Places a hand-authored blocky voxel "tree" TEST FIXTURE (a solid trunk
+	// column + a canopy blob, MAT_ROCK) rooted on the surface at world column
+	// (WorldX, WorldY), via the edit-log authority path. This is NOT M4
+	// vegetation -- it exists solely to exercise the M5 chop -> island-detect ->
+	// fall pipeline (a stand-in that a chop severs). Authority only; behind the
+	// GameMode's -VoxelTreeTest switch. Returns the number of voxels stamped.
+	int32 SpawnTreeFixtureAt(double WorldX, double WorldY);
+
 	// docs/debug-tooling-plan.md P1 "Perf HUD": a snapshot refreshed at 1Hz
 	// (per-frame collection, see FVoxelWorldImpl::UpdatePerfSnapshot), read by
 	// AVoxelEarthHUD every frame when voxel.Debug >= 1. Cheap struct copy;

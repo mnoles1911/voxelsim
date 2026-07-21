@@ -67,4 +67,16 @@ private:
 	// the spawn-water test above.
 	FTimerHandle BreachTestTimerHandle;
 	FTimerHandle BreachTestSettleTimerHandle;
+
+	// M5 destruction (first slice, docs/m4-plan.md Round 2): -VoxelTreeTest
+	// places a stand-in tree FIXTURE near spawn; -VoxelChopTest (implies
+	// -VoxelTreeTest) then carves through its trunk after the tree has settled,
+	// severing the canopy so it detaches and falls as cosmetic debris. The
+	// screenshot framing (below, in the -VoxelScreenshotAfter block) aims at
+	// the tree column when either switch is active.
+	FTimerHandle TreeTestTimerHandle;
+	FTimerHandle ChopTestTimerHandle;
+	bool bTreeTestActive = false;
+	double TreeTestColumnXUU = 0.0;
+	double TreeTestColumnYUU = 0.0;
 };
