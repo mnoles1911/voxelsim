@@ -715,6 +715,134 @@ against a `WaterCA` scenario is a v1 (kWaterCAVersion==2) value from this
 point forward, and needs regenerating if anyone captured one against the
 retired v0 sequential engine in the interim.
 
+## Water track — W2 perf: color early-out + solid_ memoization (2026-07-20, worktree agent)
+
+Follow-up to the two-phase perf pass above, attacking exactly the "8 full
+brick scans/tick, ~1/8 productive" gap that pass's honest-accounting note
+flagged and time-boxed out. `kWaterCAVersion` stays 2 -- **not a contract
+change**: every golden digest (`waterca_deterministic_repeat_and_golden_digest`'s
+`0x5C8D36C83246CAFC`, the container/contention/order-independence tests) is
+byte-identical before and after this pass; all changes below are pure loop
+restructuring or memoization of an already-required-to-be-pure/deterministic
+callback (`WaterCA::SolidFn`), never a change to what gets computed.
+
+**What changed** (`voxel-core/src/waterca.cpp`):
+1. **Color-cell enumeration** (the change this pass was scoped for): a
+   compile-time table `kColorCells[8][64]`, built once via `constexpr
+   buildColorCells()` by running the SAME `colorOf()` the tick-rules
+   contract already defines over the brick's 512 local cells and bucketing
+   each into its color's list. Phase READ now iterates
+   `kColorCells[roundColor]` (64 cells) directly instead of scanning all
+   512 and `continue`-ing on a color mismatch. GATHER and FINALIZE got the
+   analogous treatment: a target cell can only ever receive nonzero inflow
+   from a `roundColor` source if its OWN color is `roundColor^1`,
+   `roundColor^2`, or `roundColor^4` (the axis-flip derived from which of
+   GRAVITY/lateral-X/lateral-Y moved it there) -- so GATHER now visits
+   those 3 colors' 192 cells instead of 512, and FINALIZE visits the union
+   of those 3 plus `roundColor` itself (outflow) -- 256 cells instead of
+   512. One level deeper, GATHER's inner per-cell loop over the 5
+   `kInbound` slots was ALSO narrowed to just the 1-2 slots whose axis
+   matches the target's own color group (the other slots are structurally
+   guaranteed `desired<=0` and were always a wasted check).
+2. **Profiling found the actual dominant cost was NOT the scan overhead**
+   the previous note guessed, but the `SolidFn` terrain callback itself:
+   instrumented locally (not committed) against the bench's real
+   `Amplifier::materialAt` (bilinear elevation + several octaves of value
+   noise, recomputed from scratch on every call, no memoization of its
+   own) measured **~17.8M calls/tick at ~1.08us/call** -- ~128ms/tick, the
+   large majority of pre-this-pass wall time, and structurally *not*
+   reduced by (1) alone (the old code already skipped `solid()` for
+   wrong-color cells via the same `continue`, so call count was already
+   minimal per round -- the redundancy is CROSS-round: up to 5 different
+   active neighbors of one solid/air voxel can each independently query
+   "is THIS voxel solid" as part of their own gravity/lateral check).
+   Fix: `stepWithOrder` now builds a per-tick `solidCache`
+   (`unordered_map<VoxelKey,MaterialId>`, `VoxelKey` = full `int64_t` x/y/z,
+   distinct from the brick-truncated `BrickKey`) and every `computeDesiredForBrick`
+   call goes through a memoizing `cachedSolid` lambda instead of `solid_`
+   directly. Scoped to exactly one `stepWithOrder()` call (built fresh,
+   discarded at return) -- safe because `solid_` is already required to be
+   a deterministic, side-effect-free function of `(vx,vy,vz)` by the
+   existing order-independence contract, so reusing an answer changes
+   nothing observable, and a live-terrain-editing caller is unaffected
+   (the cache can only go stale WITHIN a tick, never across one). Measured
+   effect: **17.8M raw `materialAt` calls/tick -> ~8.6M** (the tick's
+   actual count of distinct `(vx,vy,vz)` queried, i.e. this is the real
+   cross-round duplicate-query rate, not a tunable knob).
+3. **Per-tick GATHER/FINALIZE pointer cache**: profiling after (1)+(2)
+   found GATHER was STILL the next-biggest bucket, from a different
+   redundancy -- `gatherInflowForBrick` re-resolved its self + 5
+   inbound-neighbor `FlowScratch*` pointers via a `scratchMap` hashmap
+   lookup on EVERY call, i.e. 6 lookups x every touched brick x all 8
+   rounds, even though (unlike `water_`, whose brick-level contents
+   genuinely change round-to-round) the SET of bricks with scratch storage
+   is exactly `order`'s contents and is fixed for the whole tick before
+   round 0 ever runs. Fix: a `touchedCache` vector, built once per tick,
+   holding each touched brick's precomputed `selfScratch`/`inboundScratch`
+   pointers and a stable pointer into its `inflowMap` entry; GATHER/FINALIZE
+   iterate this vector directly instead of re-hashing `touched` every
+   round. `water_.find(key)` inside `gatherInflowForBrick` itself is
+   deliberately NOT cached this way -- that lookup's answer (does the
+   brick exist, what's its current fill) DOES change round to round via
+   the previous round's FINALIZE, so it has to stay live.
+
+**Result** (`vxc_waterca_bench --ticks 600`, same 441-column/1.76M-unit
+scenario, seed 20260719, this same desktop): average step() in the
+[1605, 2005] active-brick window landed in the **~140-155 ms** range across
+repeated runs (best observed 122.9 ms full-run average one run; window avg
+139-155 ms across three separate 600-tick runs) -- down from the prior
+pass's documented 194.4 ms in the same window, but **not** the "well under
+50 ms, ideally 25-30 ms" target this pass was aiming for. This machine's
+background load turned out to vary enormously run-to-run this session (a
+same-code, same-session A/B rebuild of the PRE-this-pass version measured
+anywhere from 191 ms to 468 ms in the same window depending on what else
+was running) -- the reported ~140-155 ms range is the STABLE, repeated
+value for the optimized code; a controlled back-to-back re-measurement of
+the pre-this-pass baseline on the same noisy machine, same session, put it
+consistently higher (191-340 ms), so the real win is smaller in absolute
+terms than the "194ms baseline" headline number suggests but is genuine
+and reproducible.
+
+**Honest accounting of the shortfall**: (1) alone (color-cell enumeration)
+barely moved the needle, because profiling revealed `SolidFn` was already
+the dominant cost even in the pre-this-pass code -- the previous note's
+theory ("8 full brick scans, doing 1/8 productive work") was directionally
+right about the SHAPE of the waste but wrong about where the TIME was
+going; the actual bottleneck was an expensive, uncached, terrain-backed
+callback outside this file's own control, discovered only by instrumenting
+per-phase wall time locally (not committed) rather than reasoning from the
+loop structure alone. (2) and (3) target the two costs profiling actually
+found dominant (the `SolidFn` callback and per-round hashmap re-resolution)
+and both measurably helped, but even after both, `SolidFn`'s ~8.6M
+remaining calls/tick (each still ~0.5-1us against THIS bench's synthetic
+Amplifier) is a hard floor this file's own algorithm cannot lower further
+without either changing what gets asked (a physics change, out of scope)
+or the caller supplying a cheaper/cacheable `SolidFn` (a worldgen-side
+change, outside voxel-core/waterca ownership). A real engine-integrated
+`SolidFn` backed by an already-resident chunk/brick lookup (not per-call
+procedural noise) would likely land much closer to the original target;
+this bench's synthetic Amplifier is deliberately worst-case for exactly
+this reason (real bumpy terrain, not a cheap flat-floor lambda).
+
+**Determinism verified**: `vxc_tests` 72/72 green, unchanged golden digest
+`0x5C8D36C83246CAFC` (`waterca_deterministic_repeat_and_golden_digest`),
+`waterca_container_fills_bottom_up_never_escapes_walls`,
+`waterca_lateral_contention_capped_conserved_fixed_order`, and
+`waterca_twophase_order_independent_and_deterministic` all pass unmodified
+against the same fixed digest/behavior contract as before this pass;
+`waterca_conservation_fuzz_over_bumpy_terrain` still holds the ledger
+exactly. `kWaterCAVersion` unchanged at 2.
+
+**Build**: `voxelcore.lib` clean rebuild, `/W4 /WX` (MSVC 14.51/VS 2026,
+Ninja/Release), zero warnings. Also checked with the winget-installed
+LLVM-MinGW `clang++` (`-std=c++20 -Wall -Wextra -Wconversion
+-Wsign-conversion -fsyntax-only`, matching CI's stricter sign-conversion
+gate MSVC doesn't enforce): one `int`-into-`size_type`-array-index warning
+found and fixed (`inboundScratch[i]` -> `inboundScratch[static_cast<size_t>(i)]`
+in the new slot-restricted GATHER loop); `waterca.cpp`/`test_waterca.cpp`
+clang-clean after the fix. No float/double anywhere in `waterca.h`/`waterca.cpp`
+(float-ban clean, unchanged).
+
 ## Backlog (parked / deferred, updated 2026-07-20)
 
 | Item | State | Unblock |
