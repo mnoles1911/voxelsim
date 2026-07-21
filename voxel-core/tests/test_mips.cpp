@@ -174,5 +174,5 @@ VXC_TEST(mips_chain_determinism_golden) {
         d.u64(static_cast<uint32_t>(k.z));
         b->digest(d);
     }
-    CHECK_EQ(d.h, 0xE4CF1B376622A38Full); // GOLDEN(mips_chain) — M4 biome surfaceMat, kWorldGenVersion 2
+    CHECK_EQ(d.h, 0xE827A786195B8A73ull); // GOLDEN(mips_chain) — kWorldGenVersion 3: synthetic-tile spectral-gap octaves (was 0xE4CF1B376622A38F at v2)
 }

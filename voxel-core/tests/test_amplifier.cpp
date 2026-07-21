@@ -77,7 +77,7 @@ VXC_TEST(amplifier_golden_digest) {
             d.u32(static_cast<uint32_t>(col.bedrockDepthMm));
             d.u8(col.surfaceMat);
         }
-    CHECK_EQ(d.h, 0x73B43CAE621CA286ull); // GOLDEN(amplifier_columns) — M4 biome surfaceMat, kWorldGenVersion 2
+    CHECK_EQ(d.h, 0x81785278E4DFCF67ull); // GOLDEN(amplifier_columns) — kWorldGenVersion 3: synthetic-tile spectral-gap octaves (was 0x73B43CAE621CA286 at v2)
 }
 
 VXC_TEST(generated_brick_matches_pointwise_queries) {

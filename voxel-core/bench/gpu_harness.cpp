@@ -865,9 +865,11 @@ void writeMeshDescriptors(GpuContext& ctx, VkBuffer paramsBuffer, const MeshBuff
 // of the CPU walking mapped memory between two submissions.
 //
 // ScanSumsMain exclusive-scans OutBlockSums in a SINGLE workgroup (256
-// threads => up to 256 blocks of 256 masks = 65,536 masks); the 128x128-
-// column tile layout (gate mode) and the 128x128 default regions both keep
-// maskCount well under that, but callers must never dispatch more.
+// threads => up to 256 blocks of 256 masks = 65,536 masks); the gate mode's
+// z-slab splitting (see ZWindow in the gate section) and the 64x64 default
+// regions both keep maskCount under that, but callers must never dispatch
+// more — offsets for masks past the capacity would silently miss their
+// scanned block base and corrupt MeshEmitMain's write positions.
 //
 // Per-stage GPU timing without extra submits: 6 timestamp queries bracket
 // the 5 dispatches inside the single command buffer (see GpuContext's
@@ -1712,8 +1714,30 @@ struct GateStats {
 //                          long as tiles are harvested in tile order (they
 //                          are; see runGateMode()).
 
+// A tile's dispatch z-window. Normally the tile's full surface-straddling
+// brick range, but tiles whose terrain relief makes that range too tall for
+// the GPU scan's single-workgroup capacity (ScanSumsMain: 256 blocks x 256
+// masks = 65,536 masks; 14x14-brick interiors give 9,408 masks per interior
+// z-layer, so > 6 interior layers overflows) are split into z-SLABS of at
+// most kMaxSlabInteriorLayers interior layers each. Slab interiors partition
+// the tile's interior layers exactly (no gap, no overlap) and adjacent slabs
+// share a 1-brick halo, mirroring how tile interiors partition the plane —
+// so every brick is still meshed exactly once and apron reads stay inside
+// the slab's own voxelized range. Before worldgen v3's spectral-gap terrain
+// no gate tile ever exceeded 6 interior layers, so the overflow was
+// unreachable; v3's rougher relief made it routine (125/144 tiles at
+// --radius 64), and without this split the unscanned block bases silently
+// corrupted MeshEmitMain's write offsets (the default-regions path has
+// always FATALed loudly on the same condition — see runMeshChain()).
+struct ZWindow {
+    int32_t brickZMin = 0;
+    uint32_t bricksZ = 0;
+};
+constexpr uint32_t kMaxSlabInteriorLayers = 6; // 14*14*6*48 = 56,448 <= 65,536
+
 void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t seed,
-                  SyntheticTileSampler& tiles, Amplifier& amp, bool verify, GateStats& stats) {
+                  SyntheticTileSampler& tiles, Amplifier& amp, bool verify, GateStats& stats,
+                  const ZWindow* forcedWindow, std::vector<ZWindow>& overflowSlabs) {
     constexpr int32_t W = kTileColumns, H = kTileColumns;
     const int64_t pixelSizeMm = tiles.pixelSizeMm();
 
@@ -1749,9 +1773,35 @@ void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t 
     }
     stats.cpuColumnPassMs += msSince(tCpu0);
 
-    s.brickZMin = static_cast<int32_t>(floorDiv(vzMin, kBrick));
-    const int32_t brickZMax = static_cast<int32_t>(floorDiv(vzMax, kBrick));
-    s.bricksZ = static_cast<uint32_t>(brickZMax - s.brickZMin + 1);
+    if (forcedWindow) {
+        // A z-slab of a tall tile: the window was derived (below) when the
+        // full tile was first prepped; use it verbatim.
+        s.brickZMin = forcedWindow->brickZMin;
+        s.bricksZ = forcedWindow->bricksZ;
+    } else {
+        s.brickZMin = static_cast<int32_t>(floorDiv(vzMin, kBrick));
+        const int32_t brickZMax = static_cast<int32_t>(floorDiv(vzMax, kBrick));
+        s.bricksZ = static_cast<uint32_t>(brickZMax - s.brickZMin + 1);
+        // Too tall for one GPU-scan dispatch? Keep the FIRST slab for this
+        // slot and hand the rest back for the caller to enqueue (processed
+        // next, ascending z, so the digest/compare order stays fully
+        // deterministic).
+        const uint32_t mbzNat = s.bricksZ >= 3 ? s.bricksZ - 2 : 0;
+        if (mbzNat > kMaxSlabInteriorLayers) {
+            const uint32_t numSlabs =
+                (mbzNat + kMaxSlabInteriorLayers - 1) / kMaxSlabInteriorLayers;
+            const int32_t z0 = s.brickZMin;
+            for (uint32_t k = 1; k < numSlabs; ++k) {
+                const uint32_t ic =
+                    std::min(kMaxSlabInteriorLayers, mbzNat - k * kMaxSlabInteriorLayers);
+                ZWindow w;
+                w.brickZMin = z0 + int32_t(k * kMaxSlabInteriorLayers);
+                w.bricksZ = ic + 2;
+                overflowSlabs.push_back(w);
+            }
+            s.bricksZ = kMaxSlabInteriorLayers + 2; // slab 0: interiors [1, 1+6)
+        }
+    }
     s.bricksX = uint32_t(W) / kBrick;
     s.bricksY = uint32_t(H) / kBrick; // == 16
 
@@ -1811,6 +1861,15 @@ void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t 
         s.mby = s.bricksY - 2;
         s.mbz = s.bricksZ - 2;
         s.maskCount = s.mbx * s.mby * s.mbz * 48u;
+        // The z-slab split above guarantees this; a failure here means the
+        // slab math regressed. Same 65,536 contract runMeshChain() enforces
+        // for the default-regions path — never dispatch past the GPU scan's
+        // single-workgroup capacity, it silently corrupts emit offsets.
+        if (s.maskCount > 65536)
+            fail("prepTileCpu: maskCount " + std::to_string(s.maskCount) +
+                 " exceeds ScanSumsMain's 65,536-mask capacity after slab split "
+                 "(tile(" + std::to_string(tile.tx) + "," + std::to_string(tile.ty) +
+                 ") bricksZ=" + std::to_string(s.bricksZ) + ")");
 
         const bool countsGrew =
             s.gb.countsBuf.ensure(ctx, VkDeviceSize(s.maskCount) * sizeof(uint32_t));
@@ -2203,9 +2262,18 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
 
     GateStats stats;
     const size_t numTiles = grid.tiles.size();
-    const int32_t numFlights =
-        int32_t((numTiles + size_t(kFlightSize) - 1) / size_t(kFlightSize));
     const double toMs = ctx.timestampPeriodNs / 1.0e6;
+
+    // Work stream: tiles in grid order, with a tall tile's extra z-slabs
+    // interleaved immediately after its first slab (see ZWindow). The queue
+    // only ever holds the current tile's remaining slabs, so consuming it
+    // before advancing tileCursor preserves exact deterministic order.
+    size_t tileCursor = 0;
+    std::vector<ZWindow> pendingSlabs; // FIFO via eraseFront index below
+    size_t pendingNext = 0;
+    TileSpec pendingTile{};
+    bool pendingVerify = false;
+    size_t tallTilesSplit = 0, extraSlabs = 0;
 
     struct PendingFlight {
         bool valid = false;
@@ -2222,11 +2290,13 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
     // comment for why that bank is guaranteed free (its previous occupant,
     // flight f-kPipelineDepth, was waited+harvested before this flight two
     // iterations ago in the main loop below).
+    const auto workRemaining = [&]() -> bool {
+        return pendingNext < pendingSlabs.size() || tileCursor < numTiles;
+    };
+
     const auto prepareAndSubmit = [&](int32_t f) -> PendingFlight {
         const int32_t bank = f % kPipelineDepth;
         const int32_t base = bank * kFlightSize;
-        const size_t start = size_t(f) * size_t(kFlightSize);
-        const int32_t count = int32_t(std::min<size_t>(size_t(kFlightSize), numTiles - start));
 
         VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         cbai.commandPool = ctx.commandPool;
@@ -2240,12 +2310,29 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
         vkCheck(vkBeginCommandBuffer(cmd, &cbbi), "vkBeginCommandBuffer(flight)");
         vkCmdResetQueryPool(cmd, tsPools[bank], 0, uint32_t(kFlightSize) * uint32_t(kTimestampsPerTile));
 
-        for (int32_t i = 0; i < count; ++i) {
+        int32_t count = 0;
+        for (int32_t i = 0; i < kFlightSize && workRemaining(); ++i, ++count) {
             FlightSlot& s = slots[size_t(base + i)];
-            const TileSpec& t = grid.tiles[start + size_t(i)];
-            const int32_t linearIndex = t.ty * grid.numTiles + t.tx;
-            const bool verify = fullVerify || (linearIndex % kVerifySampleStride == 0);
-            prepTileCpu(ctx, s, t, seed, tiles, amp, verify, stats);
+            if (pendingNext < pendingSlabs.size()) {
+                // Remaining z-slab of the tall tile prepped just before.
+                const ZWindow w = pendingSlabs[pendingNext++];
+                std::vector<ZWindow> none;
+                prepTileCpu(ctx, s, pendingTile, seed, tiles, amp, pendingVerify, stats, &w,
+                            none);
+            } else {
+                const TileSpec& t = grid.tiles[tileCursor++];
+                const int32_t linearIndex = t.ty * grid.numTiles + t.tx;
+                const bool verify = fullVerify || (linearIndex % kVerifySampleStride == 0);
+                pendingSlabs.clear();
+                pendingNext = 0;
+                prepTileCpu(ctx, s, t, seed, tiles, amp, verify, stats, nullptr, pendingSlabs);
+                if (!pendingSlabs.empty()) {
+                    ++tallTilesSplit;
+                    extraSlabs += pendingSlabs.size();
+                    pendingTile = t;
+                    pendingVerify = verify;
+                }
+            }
             recordTileCommands(ctx, cmd, s, tsPools[bank], uint32_t(i) * uint32_t(kTimestampsPerTile));
         }
         for (int32_t i = count; i < kFlightSize; ++i) slots[size_t(base + i)].active = false;
@@ -2307,17 +2394,23 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
 
     const auto tRunStart = Clock::now();
     PendingFlight prev;
-    for (int32_t f = 0; f < numFlights; ++f) {
+    int32_t f = 0;
+    while (workRemaining()) {
         PendingFlight cur = prepareAndSubmit(f); // may overlap flight f-1's still-pending fence
         if (prev.valid) waitAndHarvest(prev);    // deferred wait on flight f-1
         prev = cur;
-        const size_t doneTiles = std::min<size_t>(size_t(f + 1) * size_t(kFlightSize), numTiles);
-        if ((f + 1) % 8 == 0 || f + 1 == numFlights) {
-            std::printf("  flight %d/%d done (%zu/%zu tiles)\n", f + 1, numFlights, doneTiles,
-                        numTiles);
+        ++f;
+        if (f % 8 == 0 || !workRemaining()) {
+            std::printf("  flight %d done (%zu/%zu tiles consumed)\n", f, tileCursor, numTiles);
         }
     }
     if (prev.valid) waitAndHarvest(prev);
+    if (tallTilesSplit) {
+        std::printf(
+            "  %zu tall tile(s) split into z-slabs (+%zu extra dispatch chains) to respect "
+            "ScanSumsMain's 65,536-mask capacity (kMaxSlabInteriorLayers=%u)\n",
+            tallTilesSplit, extraSlabs, kMaxSlabInteriorLayers);
+    }
     const double wallMs = msSince(tRunStart);
     // Headline gate number: measured wall clock minus the two costs the gate
     // spec explicitly excludes. Computed once here (not summed per-tile/
@@ -2462,9 +2555,16 @@ int main(int argc, char** argv) {
         return rc;
     }
 
+    // 64x64-column fixtures (8x8 bricks, 6x6 interior => 1,728 masks per
+    // interior z-layer). 128x128 regions overflowed runMeshChain()'s 65,536-
+    // mask cap once worldgen v3's spectral-gap octaves made relief tall
+    // enough (origin hit 10 brick layers = 75,264 masks); at 64x64 the cap
+    // needs > 37 interior layers (~30 m of relief inside a 6.4 m footprint)
+    // — unreachable for surface terrain. Gate mode still exercises the full
+    // 128x128 dispatch shape (with z-slab splitting, see ZWindow).
     const RegionSpec regions[] = {
-        {"origin", -64, -64, 128, 128},
-        {"far-negative", -100000, 250000, 128, 128},
+        {"origin", -64, -64, 64, 64},
+        {"far-negative", -100000, 250000, 64, 64},
     };
 
     Digest gpuDigest;
