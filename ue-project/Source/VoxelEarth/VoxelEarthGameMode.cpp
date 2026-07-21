@@ -621,12 +621,29 @@ void AVoxelEarthGameMode::BeginPlay()
 					// timer well before the capture. Posing and capturing inside
 					// one lambda captures the PRE-move view (documented in the
 					// GITest block; reproduced here).
+					//
+					// SETTLE TIME IS LOAD-BEARING, and 24 s was not enough. The
+					// camera teleports ~300 m and 13 m down, so the whole deep
+					// footprint is meshed from scratch; the GI dirty queue sits
+					// around 1700 bricks and the re-shade queue several hundred,
+					// draining at MaxBrickSolvesPerFrame / MaxChunkRefreshesPerFrame.
+					// Capture before that drains and chunks are still on their
+					// plain-AO fallback, so the cave photographs BRIGHT -- and
+					// whether it does is a race, i.e. the same build and seed
+					// gave a dark cave one run and a bright one the next. Two
+					// runs were spent bisecting a "regression" that was this
+					// race. Default settle is now 50 s; -VoxelGICaveSettle=<s>
+					// overrides.
+					float CaveSettleSeconds = 50.f;
+					FParse::Value(FCommandLine::Get(), TEXT("VoxelGICaveSettle="), CaveSettleSeconds);
 					GetWorldTimerManager().SetTimer(
 						GICavePoseTimerHandle, FTimerDelegate::CreateWeakLambda(this, PoseInCave), 0.5f, false);
 					GetWorldTimerManager().SetTimer(
-						GICaveRepose1TimerHandle, FTimerDelegate::CreateWeakLambda(this, PoseInCave), 21.f, false);
+						GICaveRepose1TimerHandle, FTimerDelegate::CreateWeakLambda(this, PoseInCave),
+						FMath::Max(1.f, CaveSettleSeconds - 4.f), false);
 					GetWorldTimerManager().SetTimer(
-						GICaveRepose2TimerHandle, FTimerDelegate::CreateWeakLambda(this, PoseInCave), 23.f, false);
+						GICaveRepose2TimerHandle, FTimerDelegate::CreateWeakLambda(this, PoseInCave),
+						FMath::Max(1.f, CaveSettleSeconds - 2.f), false);
 					GetWorldTimerManager().SetTimer(
 						GICaveShotTimerHandle,
 						FTimerDelegate::CreateWeakLambda(this,
@@ -674,10 +691,11 @@ void AVoxelEarthGameMode::BeginPlay()
 								}
 								FScreenshotRequest::RequestScreenshot(TEXT("VoxelGICave"), false, true);
 							}),
-						24.f, false);
+						CaveSettleSeconds, false);
 					GetWorldTimerManager().SetTimer(
 						GICaveQuitTimerHandle,
-						FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(false); }), 28.f, false);
+						FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(false); }),
+						CaveSettleSeconds + 4.f, false);
 				}),
 			GICaveDelaySeconds, false);
 	}

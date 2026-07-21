@@ -4219,3 +4219,136 @@ handshake digest `0x52004DCC85DDD80C`.
    `VoxelCoords::FloorDiv` and an anonymous-namespace copy in
    `VoxelLightField.cpp`; fixed by qualifying at the call site, but the
    duplicate helper should probably just go.
+
+### GI: defect fix + GPU sampling
+
+**1. The unresolved roof-underside defect: found, and it was never a GI bug.**
+
+The previous slice flagged that in `04-roofed-gi-on.png` the roof slab underside
+renders fully lit while the light field correctly probes 0.00 there. It was
+right that the field was correct, and right to flag it rather than dress it up.
+The cause is that **the underside was never on screen**.
+
+Both winding branches in `FVoxelChunkSceneProxy` were inverted. With the
+one-sided `M_VoxelTerrain` (confirmed at runtime, `twoSided=0`) every voxel face
+was wound so UE treated its BACK as front-facing, so you always saw the far side
+of a solid, shaded with that far face's normal. Under the slab you were shown
+its **sunlit +Z top face** in place of its shaded -Z underside.
+
+Measured, not reasoned (new `voxel.GI.Debug 3` and `voxel.GI.DebugVis`):
+
+| probe | result |
+|---|---|
+| `Debug 3` per-face-direction, roof chunk `(-4800,0,115520)` | `+Z n=64 hit=64 irr=1.000`, `-Z n=64 hit=64 irr=0.000` |
+| `DebugVis 3` (abs(N.Z) ramp) | the ceiling shades as a **+Z** face |
+| `DebugVis 4` (omit +Z faces) | the ceiling becomes **sky** -- the underside drew nothing |
+| runtime material query | `twoSided=0`, so a back-facing quad is culled |
+
+So 100% of the underside vertices found solved data and shaded black, and the
+pixels on screen belonged to a different triangle. The field, the sampling and
+the vertex colours were correct throughout.
+
+This predates GI and mis-rendered **all** terrain: the "scattered floating
+blocks, holes, distant clipmap showing through" look in every earlier screenshot
+is the world drawn inside-out. GI only made it falsifiable, being the first
+thing that computes a normal-dependent value. `07/08-roofed-gi-off/on-fixed.png`
+vs `09-roofed-legacy-winding-before.png` is the before/after; `DebugVis 6`
+restores the legacy winding so the pair comes from one build.
+
+**This changes GI-OFF output too.** It is a rendering-correctness fix, not a GI
+change; the "GI off stays byte-identical" rule exists to stop GI leaking into
+the non-GI path, not to preserve a bug. Flagged rather than buried.
+`VoxelWaterChunkComponent.cpp` has the same inverted winding copied from here
+and was NOT touched (not an owned file) -- follow-up.
+
+**2. GPU sampling: NOT DONE. What the cost actually is.**
+
+The first slice attributed GI-on's +3 ms to "extra vertices from
+`MaxQuadSpanVoxels` plus the extra proxy rebuilds". The first half is wrong.
+Isolated by measurement (post-warmup p95, `-VoxelPerfRun=60`, seed 20260719,
+min-spec proxy, 1080p, clean `Saved/VoxelWorlds`):
+
+| config | post-warmup p95 |
+|---|---|
+| GI off | **4.79 ms** |
+| GI on | **8.99 ms** |
+| GI on, `MaxQuadSpanVoxels 0` (no subdivision) | 9.03 ms (**-0.04 ms: subdivision is free**) |
+| GI on, `MaxChunkRefreshesPerFrame 0` (no GI proxy rebuilds) | 7.31 ms (**-1.7 ms**) |
+
+So the +4.2 ms splits roughly: **1.7 ms** re-shading proxies, **~1-2 ms**
+game-thread cone-trace tick, the remainder per-vertex sampling inside ordinary
+streaming proxy builds. Quad subdivision costs nothing, so the vertex-rate
+argument for a volume texture is weaker than assumed -- the case for it is
+resolution and removing the refresh rebuilds, not vertex count.
+
+Two attempts were made and **both reverted**:
+
+- *In-place colour vertex buffer update* (the task's second option -- stop
+  rebuilding proxies to carry colour). Measured 8.99 -> 7.92 ms. Reverted: the
+  colour buffer `FStaticMeshVertexBuffers::InitFromDynamicVertex` creates is not
+  set up for CPU rewrite, so a `LockBuffer` memcpy against it does not reliably
+  reach the drawn geometry. Doing this properly needs a colour buffer allocated
+  for dynamic update with the vertex factory's colour SRV rebound to it.
+- *Refresh only bricks whose irradiance signature changed*, and a wall-clock
+  `SolveBudgetMs` time slice. Both measured fine and neither survived review:
+  the time slice starves convergence outright, and the signature gate answers
+  "did this brick change" when the question is "has every chunk sampling it been
+  shaded at least once". `voxel.GI.SolveBudgetMs` remains, defaulting to 0 (off).
+
+Nothing half-working was shipped. **GI-on p95 is unchanged at ~9 ms**; the
+target of getting materially closer to 4.8 ms was not met.
+
+**3. GI in caves -- the case it exists for.**
+
+`-VoxelGICaveTest[=<s>]` finds a **pristine worldgen sinkhole** near spawn
+(continuous air from just under the surface into the cave band, bottoming out
+with head room) and frames the cave under it. Nothing is carved. Found one at
+`(2400,-8400)`, 300 m out, cave floor **13.4 m below daylight**; capture-time
+six-axis probe `+X 1.9m -X 2.9m +Y 10.0m -Y 6.9m +Z 2.3m -Z 3.3m`.
+
+| image | mean luma | pixels < 60 |
+|---|---|---|
+| `14-cave-gi-off-passage.png` | 154.1 | 2.8% |
+| `15-cave-gi-on-passage.png` | 129.0 | 12.0% |
+| `16-cave-gi-on-passage-early.png` (24 s settle) | 104.7 | 48.6% |
+
+GI off, 13 m underground, the cave is uniform pale blue-white -- the skylight
+lights it as if it were open ground, with no reading of depth. GI on it darkens
+substantially and the passage falls away.
+
+**The honest part.** Compare the last two rows: the SAME camera, seed and build
+photographed 24 s after arrival is far darker than at 50 s. The progressive
+one-bounce gather is not energy-conserving -- each re-solve feeds the previous
+solve's irradiance back through `BounceAlbedo`, so enclosed space creeps
+*brighter* over successive refreshes toward `MaxBounceContribution`. An early
+capture flatters the feature. `15-` is the settled, reproducible state (two
+independent runs, mean luma 129.0 and 129.1) and is what should be believed.
+Two runs were spent bisecting a "regression" that was this drift.
+
+A second contributor to enclosed spaces reading wrong: the six cones are
+axis-aligned and recombined with `max(0, N.D)`, so for the axis-aligned normals
+this mesh always has, **exactly one cone survives** -- a downward face's entire
+answer is one 90-degree cone straight down. Light arriving from open sides at
+grazing angles is weighted to zero. That is why the open-sided shelter fixture
+goes near-black while a deep cave creeps bright.
+
+**Switches added:** `-VoxelGICaveTest[=<s>]`, `-VoxelGICaveStandoff=<uu>`,
+`-VoxelGICavePitch=<deg>`, `-VoxelGICaveSettle=<s>`, `-VoxelGIDebug=<n>`,
+`-VoxelGIVis=<n>`. New cvars: `voxel.GI.DebugVis`, `voxel.GI.SolveBudgetMs`.
+
+**Recommendation: do NOT default GI on yet.** The winding fix should ship
+regardless. GI itself still costs ~4 ms of a 16.6 ms budget, over-brightens
+enclosed space over time, and collapses to a single cone on axis-aligned
+normals. Fix the cone basis and the bounce energy first; they are correctness,
+and they are cheaper than the GPU move.
+
+**Follow-ups, in the order I would do them.**
+1. Cone basis: spread the six cones over the hemisphere around N, or weight the
+   four tangential cones instead of zeroing them. Fixes both enclosure artifacts.
+2. Bounce energy: make the progressive gather converge to a fixed point instead
+   of creeping (track a per-cell direct term separately from the bounce).
+3. Dynamic colour vertex buffer, then the in-place re-shade -- 1.7 ms, and it is
+   a prerequisite for any GPU path that still wants per-vertex fallback.
+4. Volume-texture sampling for resolution; note it does NOT address the
+   ~1-2 ms CPU solve tick, which would still need budgeting or moving.
+5. `VoxelWaterChunkComponent.cpp` winding.
