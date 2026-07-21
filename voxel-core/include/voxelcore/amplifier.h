@@ -53,9 +53,20 @@ public:
     // it". Production paths want materialAt().
     static MaterialId stratigraphyAt(const ColumnSample& col, int64_t vz);
 
+    // Per-voxel query. This is the path taken by World::materialAt ->
+    // UVoxelWorldSubsystem::IsSolidAtVoxel -> the region-graph MaterialFn and
+    // by collapse.h's CarveSphere, which walk voxels rather than columns and
+    // so re-derive the SAME column once per voxel of its height. It goes
+    // through the memo below; batch callers that already hold a ColumnGrid
+    // (GeneratedWorld::columns, gpu_harness, bench) use the two-argument
+    // materialAt and never pay for it.
     MaterialId materialAt(int64_t vx, int64_t vy, int64_t vz) const {
-        return materialAt(column(vx, vy), vz);
+        return materialAt(columnCached(vx, vy), vz);
     }
+
+    // column(), served from a per-thread memo. Identical value to column();
+    // the reference is valid until this thread's next columnCached call.
+    const ColumnSample& columnCached(int64_t vx, int64_t vy) const;
 
 private:
     // Identity for the per-thread tile-raster memo in amplifier.cpp. Drawn from

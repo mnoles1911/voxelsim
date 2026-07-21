@@ -173,6 +173,30 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     return col;
 }
 
+// Per-thread memo of whole columns, for the voxel-walking callers described in
+// amplifier.h. Same direct-mapped, lock-free, never-reused-id scheme as the
+// tile memo above, and equally output-neutral: a hit returns the value a miss
+// would have computed. 256 slots x 96 bytes = 24 KB/thread; a z-innermost walk
+// (the common shape) needs only one live slot, and 256 additionally covers a
+// row-major sweep across a brick footprint.
+const ColumnSample& Amplifier::columnCached(int64_t vx, int64_t vy) const {
+    constexpr uint32_t kColumnSlots = 256;
+    struct ColumnSlot {
+        uint64_t amp = 0; // 0 == empty (ids start at 1)
+        int64_t vx = 0, vy = 0;
+        ColumnSample value;
+    };
+    static thread_local ColumnSlot slots[kColumnSlots];
+
+    ColumnSlot& s = slots[slotIndex(id_, vx, vy, kColumnSlots)];
+    if (s.amp == id_ && s.vx == vx && s.vy == vy) return s.value;
+    s.value = column(vx, vy);
+    s.amp = id_;
+    s.vx = vx;
+    s.vy = vy;
+    return s.value;
+}
+
 MaterialId Amplifier::stratigraphyAt(const ColumnSample& col, int64_t vz) {
     const int64_t centreMm = vz * kVoxelSizeMm + kVoxelSizeMm / 2;
     const int64_t depthMm = static_cast<int64_t>(col.surfaceMm) - centreMm;
