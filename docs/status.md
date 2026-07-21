@@ -1169,3 +1169,100 @@ verified via `-VoxelScreenshotAfter=40` (seed 20260719): terrain, ocean, and
 shadowing all render correctly, zero ensures, clean shutdown --
 `VoxelVerify00000.png`/`00001.png` under
 `ue-project/Saved/Screenshots/WindowsEditor/`.
+
+## Water track — W3 groundwork: river segment-graph core landed (2026-07-20, worktree agent)
+
+Engine-free CPU reference for plan §3.7 Layer R ("river network sim: segment
+graph ticks ~1Hz server-side, Muskingum-class storage routing") and the
+Generation note ("rivers = flow-accumulation routing, discharge from
+upstream precip sets width/depth"), voxel-core only (no UE/engine touch this
+pass; waterca.h/.cpp untouched, per-voxel river carving, CA coupling, and
+replication are W3-proper/later). `voxelcore/rivernet.h` + `src/rivernet.cpp`:
+`RiverNode` (vx,vy voxel-coord position + elevationMm) + `RiverSegment`
+(fromNode/toNode, lengthMm, discharge, storage, conveyance 0-255,
+Muskingum-K travelMillis) + `RiverNetwork`, which owns both vectors (ids are
+just vector index, assigned in a fixed position-ordered traversal — fully
+deterministic given tiles+bounds+threshold).
+
+`buildFromFlowAccumulation(tiles, seed, bounds, accumThreshold)`: coarse
+tile-pixel-scale (NOT per-voxel) D8 flow accumulation over an inclusive
+pixel rectangle — each pixel's steepest-descent neighbor is the lowest-
+elevation in-bounds compass neighbor (fixed N/NE/E/SE/S/SW/W/NW tie-break
+order; v0 simplification: no distance normalization, though segment length
+itself does account for the diagonal-vs-cardinal distance via an integer
+sqrt(2)~=181/128 approximation, no floats), pixels visited in strictly-
+descending elevation order (ties broken by position) so every uphill
+contributor to a cell is accumulated before the cell itself is — the
+standard topological-order flow-accumulation trick. A pixel becomes a
+`RiverNode` once its accumulation (precipitation-channel-weighted) crosses
+`accumThreshold`; a `RiverSegment` connects two qualifying pixels along a
+D8 edge. Every node has at most one outgoing segment (its single D8
+target), so the graph is a forest of chains draining toward the region's
+low edge / basin sinks — exactly the "coarse graph, not per-voxel" the plan
+calls for.
+
+`step(dtMillis)`: two-phase (read outflow from tick-start storage, then
+apply) Muskingum-class routing — v0 implements the X=0 linear-reservoir
+special case (outflow proportional to storage, no negative-prone
+subtraction), integer-exact: `outflow = clamp(storage*dtMillis/travelMillis
+* conveyance/255, 0, storage)`, where `travelMillis` (Muskingum K) is fixed
+at build time from segment length (longer reaches lag more). The two-phase
+split means confluences (multiple segments feeding one downstream segment)
+never race regardless of segment iteration order, mirroring waterca.h's own
+two-phase contract for the same reason. `setConveyance(segId, 0)` = full
+dam: that segment's own outflow is permanently forced to 0, so its storage
+only ever grows from upstream inflow (monotonic non-decreasing — the
+numeric proxy for "upstream stage rises," a later system would read this to
+decide when to spawn a UE reservoir entity); the segment immediately
+downstream receives zero new inflow and its own storage/discharge decays
+toward zero at its own routing rate — "downstream discharge decays" falls
+out with no special-casing. `injectInflow(segId, amount)` is the rivernet
+analogue of `WaterCA::addWater` — the explicit stimulus API conservation
+tests inject through. `totalStorage()`/`totalInjected()`/
+`totalOutflowToOutlets()` are O(1) running ledgers with the exact invariant
+`totalStorage() + totalOutflowToOutlets() == totalInjected()` holding after
+any call sequence; `recomputeTotalStorage()` independently re-sums for
+cross-checking.
+
+**Hydrology graph-diff** (the persistent replicated log hook, plan §3.7):
+`RiverDiffRecord` + `applyGraphDiff()`. `kSetConveyance` ("a dam
+placed/removed/adjusted") is REAL — dispatches to the same `setConveyance()`
+a live caller uses, so replaying a diff log against a freshly-built network
+reproduces byte-identical state to whatever produced it live (proven by the
+replay test below). `kDivertChannel` ("a sustained CA flux promotes a new
+channel to a segment") is a documented no-op stub — promoting a channel
+needs live CA data this graph-only layer doesn't have; that coupling is
+W3-proper, after this header and waterca.h are wired together. Full network
+*replication* (sending these diffs over the wire) is separately M3-water
+integration, later still.
+
+Tests (`voxel-core/tests/test_rivernet.cpp`, 5 new, `tests/CMakeLists.txt`
+updated): flow accumulation on a hand-verifiable synthetic east-descending
+slope (`LinearSlopeTileSampler`, deliberately simpler than
+`SyntheticTileSampler` so structure can be asserted exactly) produces a
+single downhill chain reaching the low edge (last node has no outgoing
+segment, first node is never any segment's downstream target) with
+discharge strictly increasing along the main stem; routing conservation
+(inject at a headwater, step 300 ticks, exact integer ledger checked every
+tick: `totalStorage()==recomputeTotalStorage()` and
+`totalStorage()+totalOutflowToOutlets()==totalInjected()`); dam behavior
+(continuous headwater baseflow, dam a mid-chain segment, 200 ticks: dammed
+segment's storage strictly monotonic non-decreasing, its own discharge
+pinned at exactly 0, the immediately-downstream segment's discharge
+decays below 50 from a much larger starting value, conservation exact
+throughout); determinism (two networks built from the real
+`vxc::SyntheticTileSampler` over a 16x16-pixel branching region, identical
+stimulus injected at every headwater segment, stepped 50 ticks, byte-
+identical digest, golden `0xE4944F92B37F60FB` pinned); graph-diff replay
+(one network dammed via direct `setConveyance()`, a fresh twin dammed only
+via `applyGraphDiff(kSetConveyance)` replayed at the same point in an
+otherwise-identical stimulus sequence — digests and dammed-segment storage
+match exactly; a follow-up `kDivertChannel` diff is confirmed to leave the
+digest unchanged, proving the stub is really a no-op). Full suite green:
+84/84 (`vxc_tests.exe`, MSVC 14.51/VS 2026, `/W4 /WX`, Ninja/Release), zero
+warnings from any file this pass. Separately verified clang-clean under
+`-Wall -Wextra -Wconversion -Wsign-conversion -Werror` (llvm-mingw clang++,
+`rivernet.cpp` and `test_rivernet.cpp` compiled standalone) — zero
+diagnostics, no sign-conversion bugs found this pass. No float/double
+anywhere in `rivernet.h`/`rivernet.cpp` (the one `\bfloat\b`/`\bdouble\b`
+grep hit in the header is the prose word "double-count," not a type).
