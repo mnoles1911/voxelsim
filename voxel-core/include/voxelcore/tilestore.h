@@ -7,6 +7,7 @@
 // ITerrainSource implementations.
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -97,7 +98,18 @@ public:
 
     // Count of queries answered with the missing-tile default. Public by
     // design so tests/streaming code can assert directly on it.
-    uint64_t missingTileQueries = 0;
+    //
+    // Atomic because this sampler is about to be shared across UE meshing
+    // worker threads: tiles_ is populated only during init (all loadTile*
+    // calls happen before workers start) and is never mutated afterward, so
+    // elevationMm()/climate() are otherwise pure reads of immutable data —
+    // this counter increment is the ONLY mutation on the hot query path, and
+    // therefore the only race to guard. Relaxed ordering is fine: callers
+    // only care about the final tally, not happens-before relative to other
+    // memory. NOTE: this makes TileGridSampler non-copyable/non-movable
+    // (verified nothing in the repo copies or moves one — grep confirms it's
+    // only ever constructed in place and used by reference/pointer).
+    std::atomic<uint64_t> missingTileQueries{0};
 
 private:
     static uint64_t tileKey(int32_t tx, int32_t ty) {
