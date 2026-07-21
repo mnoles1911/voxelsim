@@ -78,9 +78,30 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Grep for float/double in voxel-core src+include
+      - name: Grep for float/double in voxel-core src+include (comments/strings stripped)
+        shell: python
         run: |
-          ! grep -rnE '\b(float|double)\b' voxel-core/include voxel-core/src
+          import re, sys, pathlib
+          # Doctrine bans float/double as TYPES in world-derivation code, not
+          # the words "double" / "float" appearing in comments or strings
+          # (e.g. "double-visit"). Strip // and /* */ comments and string
+          # literals before searching so prose never trips the guard.
+          bad = []
+          for base in ("voxel-core/include", "voxel-core/src"):
+              for f in pathlib.Path(base).rglob("*"):
+                  if f.suffix not in (".h", ".hpp", ".cpp", ".cc"):
+                      continue
+                  src = f.read_text(encoding="utf-8", errors="replace")
+                  src = re.sub(r"/\*.*?\*/", " ", src, flags=re.S)   # block comments
+                  src = re.sub(r"//[^\n]*", " ", src)                # line comments
+                  for i, line in enumerate(src.splitlines(), 1):
+                      if re.search(r"\b(float|double)\b", line):
+                          bad.append(f"{f}:{i}: {line.strip()}")
+          if bad:
+              print("float/double type found in voxel-core world-derivation code:")
+              print("\n".join(bad))
+              sys.exit(1)
+          print("float-ban clean")
 
   terrain-service:
     runs-on: ubuntu-24.04
