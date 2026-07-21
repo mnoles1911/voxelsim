@@ -448,6 +448,33 @@ public:
     // the requested amount. Marks every touched brick active.
     uint32_t addWater(int64_t vx, int64_t vy, int64_t vz, uint32_t amount);
 
+    // --- Single-cell accounted add/remove (W4 CA<->SWE coupling hook) ------
+    //
+    // WHY THESE EXIST AND WHY THEY ARE NOT addWater()/setReplicatedFill().
+    // The SWE coupling (voxelcore/swe.h §5) needs to hand an exact integer
+    // number of fill units to ONE named CA cell and take an exact integer
+    // number back out of ONE named CA cell, and needs the owning brick woken
+    // so the CA actually carries the water away afterwards. Neither existing
+    // entry point does that: addWater() STACKS UPWARD as each cell fills,
+    // which for a lake draining through a punctured bed would push water back
+    // up into the very sheet it just left; and setReplicatedFill() is
+    // documented client-mirror-only, overwrites rather than adds, and
+    // deliberately does not wake anything, so water injected through it would
+    // sit frozen.
+    //
+    // These are pure state edits at the same layer as addWater(): they use the
+    // same setFillAccounted() ledger path and the same activate() wake, they
+    // saturate rather than overflow (add is capped by 255-current and by
+    // solidity; remove is capped by what is present), and they return the
+    // amount ACTUALLY moved so a caller can keep an exact two-sided ledger.
+    //
+    // NO TICK RULE CHANGES and kWaterCAVersion is NOT bumped: nothing in
+    // voxel-core calls these except the (default-OFF) coupler, no golden
+    // scenario reaches them, and a world in which they are never called is
+    // bit-for-bit identical to one in which they do not exist.
+    uint32_t addWaterAt(int64_t vx, int64_t vy, int64_t vz, uint32_t amount);
+    uint32_t removeWaterAt(int64_t vx, int64_t vy, int64_t vz, uint32_t amount);
+
     uint8_t fillAt(int64_t vx, int64_t vy, int64_t vz) const { return getFill(vx, vy, vz); }
 
     // Running conservation ledger (see header comment). O(1).
