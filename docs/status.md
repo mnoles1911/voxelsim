@@ -4588,3 +4588,104 @@ produce exactly one face.
 4. Consider whether the GPU mesher carries the same ~10x redundant-sample
    pattern. It is a different execution model (one thread per mask entry) so the
    fix does not transfer directly, but the redundancy analysis might.
+
+### Caverns + crevices (C1-C3)
+
+`docs/cavern-design.md`'s C1-C3 (caverns.h, crevices, tests), landed standalone
+per the build plan — **folded in Matt's post-design decisions** (bedrock
+moving to ~200 m depth, caverns should be larger/rarer, generation must
+respect real terrain) rather than shipping against the superseded spec.
+
+**Caverns (`voxelcore/caverns.h`, new).** Hash-gated sites at every 8th
+lattice node (204.8 m apart — 2x the design's original 102.4 m, i.e. a quarter
+as many candidate corners per unit area: the "rarer" half of "large but
+rare"), 1-in-4 gated via a bit folded into the same hash `caveNode()` already
+computes (§3.7's called-out optimization). Each open site is a **coaxial
+chain** of up to 4 rooms rather than a star-shaped cluster around one point:
+child 0 is a modest "entrance chamber" (rz 4-10 m) centered exactly on the
+anchor — the same node position and depth the tunnel network's own axis uses
+there, so the cavern volume provably contains a point of the connected
+backbone, same argument as sinkhole shafts — and children 1-3 chain directly
+below the previous room (**same xy each time**), independently sized (rxy
+12-28 m, rz 12-40 m per room), descending up to ~80 m below the anchor in the
+observed sample. Coaxial (zero horizontal offset between chain members) turns
+"do consecutive rooms overlap" into an *exact* 1D interval test
+(`|dz| < rz[c-1]+rz[c]`, no ellipsoid-overlap approximation needed), provable
+by `static_assert` against worst-case hashed radii — and as a free side
+effect, distance-to-anchor is now computed **once per column** and reused by
+all 4 rooms instead of once per room. Flat floor per room (own-center-
+relative now, not anchor-relative — stopped making sense once rooms are no
+longer clustered around one point) and a per-column wall-roughness sample
+(shared by every room in the column) are unchanged in spirit from the design.
+Underground water (§5, approved as designed) rides unchanged:
+`CavernColumn.floodZMm` + `CH_CAVERN_FLOOD`, per-site, ~60% wet, level,
+clamped below the anchor.
+
+**No bedrock assumption anywhere.** The original design's depth-safety window
+was computed against an assumed ~38 m bedrock ceiling; since bedrock is
+moving to ~200 m in a later, amplifier.cpp-owned change this file doesn't
+touch, that assumption is gone. Only child 0 (the one room tied to the
+shallow, 9-34 m tunnel-node depth) has a compile-time safety window at all,
+and it is roof-side only (`kCavernNodeDepthSafeMinMm`..`kCaveNodeDepthMinMm+
+kCaveNodeDepthSpanMm`, i.e. bounded above by caveNode()'s own range, not a
+bedrock guess). The bedrock side is entirely the ordinary **runtime**
+`cavernCarveAt(..., bedrockDepthMm, ...)` clamp, exactly like caves.h's
+`caveCarveAt` — verified in `test_caverns.cpp` against bedrock depths from
+45,000 mm (today) through 260,000 mm (past the planned move) with zero
+special-casing.
+
+**Crevices (`voxelcore/caves.h`)**: 1-in-8 gated thin (0.3-0.8 m) vertical
+slab riding an *existing* tunnel edge, lens-tapered (`4u(1-u)`, u = the
+closest-approach parameter `caveColumnFor` already computes) so it pinches to
+nothing at each node instead of ending in a wall. Emits an ordinary `CaveSeg`
+— zero new per-voxel mechanism, connectivity inherited for free because the
+slab always contains its own tube's axis. `kMaxCaveSegs` 8 → 12. **Caught and
+fixed a real bug during development**: the first cut computed the taper as an
+exact rational `num*(den-num)/den²`, and `den` (a jittered lattice edge's
+squared length) can reach ~3e9 mm², so `den²` overflows int64 — caught by
+`crevice_geometry_pinches_out_at_nodes_and_contains_the_tube_axis` (all 20
+sampled edges failed the containment check pre-fix). Replaced with Q16
+fixed-point math; no correctness issue reaches production since this was
+caught before merge, but recorded here as the kind of thing this doctrine's
+"measure, don't assume" tests exist to catch.
+
+**Tests (`test_caverns.cpp`, new, 11 cases; `test_caves.cpp`, +3 crevice
+cases).** Determinism + golden digests (both re-derived from the redesign,
+`cavern_layer` new, `cave_layer` re-pinned for crevices — both moves
+explicitly authorized by the build plan's file ownership for C1-C3).
+Connectivity is measured, not assumed: every sampled valid site's anchor
+voxel is carved by *both* `cavernCarveAt` and `caveCarveAt`, and a
+flood-fill at a real site shows the cavern's component extends beyond its own
+max reach into the wider tunnel network (99.4% of the fill in one component
+in the sampled case). **Roof cover measured on genuinely varied real terrain**
+(SyntheticTileSampler + Amplifier, 387 m of relief across the scan, not flat
+ground): minimum observed roof cover over any carved cavern voxel = exactly
+6,000 mm, i.e. the clamp is measurably load-bearing (some column got
+truncated right at the boundary), and 88 of the sampled in-reach columns were
+refused outright by slope truncation — the "clamps become load-bearing on
+slopes" claim, verified rather than asserted. Segment-cap headroom (max 4 of
+6 rooms/column observed), flood-level properties (level, disc-consistent,
+bounded, ~63% wet against a ~60% target over 150 sampled sites), and a cost
+micro-benchmark: **~28 ns/column** (mixed columns, well under the design's
+own ~87 ns estimate — the wider 204.8 m spacing means the full-reduction tier
+fires on a quarter as many columns before the gate probability is even
+applied), **~0 ns/voxel** for the cavern-free fast path, **~1.2 ns/voxel**
+worst case observed (4 segments) — all comfortably inside the <4 ns/voxel
+worst-case budget. Suite: 173 → 184 PASS / 0 FAIL. Clang clean under
+`-Wall -Wextra -Wconversion -Wsign-conversion -Werror`; float-ban clean
+(verified against the exact CI script, not just `-Wall`). No real GCC was
+available in this dev environment to cross-check the "gcc stricter than
+clang" gotcha directly; the specific known pattern (enum/non-enum ternary)
+was checked by hand and does not appear in the new code.
+
+**Left for C4+ (amplifier fold-in, version bump, GPU mirror — none of it
+touched here):** wire `CavernColumn` into `ColumnSample`/`materialAt` exactly
+as `CaveColumn` is wired in today; bump `kWorldGenVersion`; re-pin the
+amplifier/GPU-harness goldens the design doc's §9 predicts will move; extend
+`surfaceMmAt` into a shared CPU/GPU function (this file's `surfaceAt`
+callback contract is written for exactly that hand-off); when bedrock's
+actual new depth constant lands in `amplifier.cpp`, nothing in caverns.h
+needs to change (it was never assumed) — worth re-running
+`cavern_never_breaches_bedrock` and the roof-cover test once it does, since
+the *observed* numbers (how much of the ~80 m chain actually survives a given
+column's real bedrock) will shift even though no code does.
