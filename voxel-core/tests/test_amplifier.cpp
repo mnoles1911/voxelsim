@@ -45,13 +45,20 @@ VXC_TEST(amplifier_stratigraphy_ordering) {
                   col.surfaceMat == MAT_ROCK);
 
             // Walking down the column: air above surface, then the layer
-            // sequence, never air below the surface (implicit-solid doctrine).
+            // sequence, never air below the surface. This is the STRATIGRAPHY
+            // (Amplifier::stratigraphyAt) — since the M4 cave pass,
+            // materialAt() also carves tunnels out of it, so "no air below the
+            // surface" is no longer true of the full material function and
+            // holds only of the layer model this test is about. The cave
+            // pass's own invariants live in test_caves.cpp.
             const int64_t topVz = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
-            CHECK_EQ(Amplifier::materialAt(col, topVz + 1), MAT_AIR);
+            CHECK_EQ(Amplifier::stratigraphyAt(col, topVz + 1), MAT_AIR);
+            CHECK(Amplifier::stratigraphyAt(col, topVz) != MAT_AIR);
+            // The surface shell itself is never carved (roof clamp).
             CHECK(Amplifier::materialAt(col, topVz) != MAT_AIR);
             bool leftTopLayer = false;
             for (int64_t vz = topVz; vz > topVz - 1200; vz -= 7) {
-                const MaterialId m = Amplifier::materialAt(col, vz);
+                const MaterialId m = Amplifier::stratigraphyAt(col, vz);
                 CHECK(m != MAT_AIR);
                 if (m != col.surfaceMat) leftTopLayer = true;
                 // materialAt is depth-ordered: once below the top layer, the
