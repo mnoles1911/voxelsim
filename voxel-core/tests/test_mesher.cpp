@@ -164,6 +164,99 @@ VXC_TEST(mesher_ao_darkens_inside_corner) {
     CHECK(sawOpen);
 }
 
+// --- Byte-exact output goldens -------------------------------------------
+// Pinned against the pre-optimisation reference implementation. The mesher is
+// mirrored bit-exactly by the GPU (MeshCountMain/MeshEmitMain in
+// worldgen.hlsl), so ANY movement in these digests is a semantic change that
+// must be mirrored in the shader — an optimisation must never move them.
+
+template <int E>
+struct GoldenFixture {
+    MaterialId cells[(E + 2) * (E + 2) * (E + 2)] = {};
+    MaterialId& at(int x, int y, int z) {
+        return cells[(x + 1) + (E + 2) * ((y + 1) + (E + 2) * (z + 1))];
+    }
+    MaterialId operator()(int x, int y, int z) const {
+        return cells[(x + 1) + (E + 2) * ((y + 1) + (E + 2) * (z + 1))];
+    }
+};
+
+template <int E>
+uint64_t goldenDigest(int fillPct, uint64_t salt, size_t* quadCount) {
+    GoldenFixture<E> f;
+    for (int z = -1; z <= E; ++z)
+        for (int y = -1; y <= E; ++y)
+            for (int x = -1; x <= E; ++x) {
+                const uint64_t h = hash3(salt, x, y, z, 77);
+                f.at(x, y, z) =
+                    (h % 100 < static_cast<uint64_t>(fillPct))
+                        ? static_cast<MaterialId>(1 + h / 100 % (kMaterialCount - 1))
+                        : static_cast<MaterialId>(MAT_AIR);
+            }
+    std::vector<Quad> q;
+    meshBrick<E>(f, q);
+    Digest d;
+    digestQuads(q, d);
+    *quadCount = q.size();
+    return d.h;
+}
+
+VXC_TEST(mesher_golden_digests_are_stable) {
+    size_t n = 0;
+    CHECK_EQ(goldenDigest<8>(45, 321, &n), 0xE0B458FF035B9C43ull);
+    CHECK_EQ(n, size_t(762));
+    CHECK_EQ(goldenDigest<8>(85, 555, &n), 0x735526D535C5EF56ull);
+    CHECK_EQ(n, size_t(368));
+    CHECK_EQ(goldenDigest<16>(45, 321, &n), 0x4742A1C375AB5E77ull);
+    CHECK_EQ(n, size_t(6241));
+    CHECK_EQ(goldenDigest<16>(90, 999, &n), 0x3B0BA93CE806F1C1ull);
+    CHECK_EQ(n, size_t(2218));
+}
+
+// --- Homogeneous-brick early-outs ----------------------------------------
+// These must stay byte-identical to the general path, which for each of them
+// means "emit nothing".
+
+VXC_TEST(mesher_air_interior_with_solid_apron_emits_nothing) {
+    // Interior entirely air but every apron cell solid: no interior cell has a
+    // material, so no face is ever visible regardless of the apron.
+    Fixture f;
+    for (int z = -1; z <= B; ++z)
+        for (int y = -1; y <= B; ++y)
+            for (int x = -1; x <= B; ++x)
+                if (x < 0 || x >= B || y < 0 || y >= B || z < 0 || z >= B)
+                    f.at(x, y, z) = MAT_ROCK;
+    CHECK_EQ(mesh(f).size(), size_t(0));
+}
+
+VXC_TEST(mesher_solid_brick_with_one_air_apron_cell_still_emits) {
+    // Guards the all-same early-out against over-triggering: a single air cell
+    // in the apron must still produce exactly one visible face.
+    Fixture f;
+    for (int z = -1; z <= B; ++z)
+        for (int y = -1; y <= B; ++y)
+            for (int x = -1; x <= B; ++x) f.at(x, y, z) = MAT_ROCK;
+    f.at(-1, 3, 4) = MAT_AIR;
+    const auto quads = mesh(f);
+    CHECK_EQ(quads.size(), size_t(1));
+    CHECK_EQ(int(quads[0].axis), 0);
+    CHECK_EQ(int(quads[0].positive), 0);
+    CHECK_EQ(int(quads[0].slice), 0);
+    CHECK_EQ(int(quads[0].w), 1);
+    CHECK_EQ(int(quads[0].h), 1);
+}
+
+VXC_TEST(mesher_single_air_voxel_in_solid_brick_emits_six_faces) {
+    Fixture f;
+    for (int z = -1; z <= B; ++z)
+        for (int y = -1; y <= B; ++y)
+            for (int x = -1; x <= B; ++x) f.at(x, y, z) = MAT_ROCK;
+    f.at(4, 4, 4) = MAT_AIR;
+    const auto quads = mesh(f);
+    CHECK_EQ(quads.size(), size_t(6));
+    CHECK_EQ(totalArea(quads), 6);
+}
+
 VXC_TEST(mesher_deterministic_output_order) {
     Fixture f;
     for (int z = -1; z <= B; ++z)

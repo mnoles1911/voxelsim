@@ -37,9 +37,68 @@ constexpr uint8_t aoCorner(bool s1, bool s2, bool c) {
 } // namespace detail
 
 // Sampler: MaterialId sampler(int x, int y, int z), valid on [-1, B]^3.
+//
+// Performance note (this is an implementation detail only — the emitted quad
+// stream is byte-identical to the original straight-through version, and the
+// HLSL port needs no corresponding change):
+//
+//  * The brick plus its 1-voxel apron is materialized ONCE into a flat array
+//    before any face scan. The scan reads every voxel six times (once per
+//    face direction) and reads nine more cells for each visible face's AO, so
+//    a live sampler used to be re-evaluated ~10x per voxel. The apron is
+//    exactly the sampler's documented domain, so no query outside the old
+//    footprint is introduced and a pure sampler cannot observe the change.
+//  * Addressing uses hoisted per-axis strides instead of a per-cell int c[3]
+//    with runtime-varying subscripts. The old form forced the coordinate
+//    triple to memory on every cell because axis/u/v are not compile-time
+//    constants; strides make each neighbor a constant offset from the cell.
 template <int B, typename Sampler>
 void meshBrick(const Sampler& sampler, std::vector<Quad>& out) {
-    const auto solid = [&](int x, int y, int z) { return sampler(x, y, z) != MAT_AIR; };
+    constexpr int S = B + 2;               // apron-inclusive edge
+    constexpr int kCells = S * S * S;
+    constexpr int kStride[3] = {1, S, S * S};
+    constexpr int kOrigin = 1 + S * (1 + S * 1); // index of voxel (0,0,0)
+
+    MaterialId mat[kCells];
+    {
+        int idx = 0;
+        for (int z = -1; z <= B; ++z)
+            for (int y = -1; y <= B; ++y)
+                for (int x = -1; x <= B; ++x) mat[idx++] = sampler(x, y, z);
+    }
+
+    // Early-out 1: no solid voxel in the brick interior means no face can have
+    // a source material, whatever the apron holds.
+    {
+        bool anySolid = false;
+        for (int z = 0; z < B && !anySolid; ++z)
+            for (int y = 0; y < B && !anySolid; ++y) {
+                const int rowBase = kOrigin + y * kStride[1] + z * kStride[2];
+                for (int x = 0; x < B; ++x)
+                    if (mat[rowBase + x] != MAT_AIR) {
+                        anySolid = true;
+                        break;
+                    }
+            }
+        if (!anySolid) return;
+    }
+
+    // Early-out 2: a uniform apron+interior means every neighbor of every
+    // interior voxel is solid, so nothing is visible. (The all-air case was
+    // already caught above; this catches solid interior bricks, which mesh to
+    // zero quads and should cost near nothing.)
+    {
+        const MaterialId m0 = mat[0];
+        bool uniform = true;
+        for (int i = 1; i < kCells; ++i)
+            if (mat[i] != m0) {
+                uniform = false;
+                break;
+            }
+        if (uniform) return;
+    }
+
+    const auto solidAt = [&](int index) { return mat[index] != MAT_AIR; };
 
     // key: 0 = no face, else material | ao<<8 | 1<<16 (visible marker so
     // MAT_* values never collide with "no face").
@@ -47,37 +106,30 @@ void meshBrick(const Sampler& sampler, std::vector<Quad>& out) {
 
     for (int axis = 0; axis < 3; ++axis) {
         const int u = (axis + 1) % 3, v = (axis + 2) % 3;
+        const int sa = kStride[axis], su = kStride[u], sv = kStride[v];
         for (int dir = 0; dir < 2; ++dir) {
-            const int nOff = dir ? 1 : -1;
+            const int nOff = dir ? sa : -sa;
             for (int slice = 0; slice < B; ++slice) {
+                const int sliceBase = kOrigin + slice * sa;
                 // Build the face mask for this slice.
                 for (int j = 0; j < B; ++j) {
+                    const int rowBase = sliceBase + j * sv;
                     for (int i = 0; i < B; ++i) {
-                        int c[3];
-                        c[axis] = slice;
-                        c[u] = i;
-                        c[v] = j;
-                        const MaterialId m = sampler(c[0], c[1], c[2]);
+                        const int c = rowBase + i * su;
+                        const MaterialId m = mat[c];
                         uint32_t key = 0;
                         if (m != MAT_AIR) {
-                            int n[3] = {c[0], c[1], c[2]};
-                            n[axis] += nOff;
-                            if (!solid(n[0], n[1], n[2])) {
+                            const int n = c + nOff;
+                            if (!solidAt(n)) {
                                 // AO from the 8 cells ringing the face on the
                                 // neighbor plane.
-                                const auto planeSolid = [&](int du, int dv) {
-                                    int p[3] = {n[0], n[1], n[2]};
-                                    p[u] += du;
-                                    p[v] += dv;
-                                    return solid(p[0], p[1], p[2]);
-                                };
-                                const bool uNeg = planeSolid(-1, 0), uPos = planeSolid(1, 0);
-                                const bool vNeg = planeSolid(0, -1), vPos = planeSolid(0, 1);
+                                const bool uNeg = solidAt(n - su), uPos = solidAt(n + su);
+                                const bool vNeg = solidAt(n - sv), vPos = solidAt(n + sv);
                                 uint8_t ao = 0;
-                                ao |= detail::aoCorner(uNeg, vNeg, planeSolid(-1, -1));
-                                ao |= detail::aoCorner(uPos, vNeg, planeSolid(1, -1)) << 2;
-                                ao |= detail::aoCorner(uNeg, vPos, planeSolid(-1, 1)) << 4;
-                                ao |= detail::aoCorner(uPos, vPos, planeSolid(1, 1)) << 6;
+                                ao |= detail::aoCorner(uNeg, vNeg, solidAt(n - su - sv));
+                                ao |= detail::aoCorner(uPos, vNeg, solidAt(n + su - sv)) << 2;
+                                ao |= detail::aoCorner(uNeg, vPos, solidAt(n - su + sv)) << 4;
+                                ao |= detail::aoCorner(uPos, vPos, solidAt(n + su + sv)) << 6;
                                 key = uint32_t(m) | uint32_t(ao) << 8 | 1u << 16;
                             }
                         }
