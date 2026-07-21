@@ -27,6 +27,35 @@
 
 #include <vector>
 
+// ADR-0003 item 2/4 (docs/adr/0003-hydrostatic-persistent-body.md): toggles
+// vxc::WaterCA's cross-tick terrain-solidity memo. Checked every fixed step
+// (see StepFixed below), same "read the cvar every call, no restart needed"
+// pattern as VoxelWorldSubsystem.cpp's CVarVoxelDestructionEnabled/
+// CVarVoxelCollapseEnabled -- so it can be flipped off in the field without a
+// relaunch (task item 4) if the invalidation contract is ever suspected of a
+// gap. Byte-identical for as long as UVoxelWorldSubsystem's edit paths honour
+// the invalidation contract (NotifyTerrainRegionEdited, wired into
+// TryDig/TryPlace/CarveSphere/island-and-collapse-removal -- see
+// VoxelWorldSubsystem.cpp).
+//
+// DEFAULT ON as of ADR-0003 item 2 resolution: an in-engine cross-process A/B
+// (-VoxelWaterMemoTest, VoxelEarthGameMode.cpp) ran the full dig/place/carve/
+// M5-collapse edit vocabulary beneath and around a settled basin pool, once
+// with this cvar forced 0 and once forced 1 (same seed, same edit sequence),
+// and diffed EVERY logged checkpoint digest, not just the final one: pour,
+// pre-edit settle, post-dig/-place/-carve/-collapse (each immediately after
+// its edit AND again once re-settled). All of them matched byte-for-byte
+// between the two runs, including intermediate values, confirming the
+// invalidation wiring is complete for every edit path this cvar's contract
+// depends on. See docs/status.md's "Water edit-notification completeness +
+// memo enablement" entry for the full digest table and the perf numbers.
+static TAutoConsoleVariable<bool> CVarVoxelWaterSolidCache(
+	TEXT("voxel.Water.SolidCacheEnabled"), true,
+	TEXT("ADR-0003: enable WaterCA's cross-tick terrain-solidity memo (~2.8-3.0x hydrostatic pass speedup). ")
+	TEXT("Byte-identical for as long as every terrain edit invalidates it -- see docs/adr/0003-hydrostatic-persistent-body.md. ")
+	TEXT("Set to 0 to force the uncached path (e.g. if an edit path is ever suspected of a missed invalidation)."),
+	ECVF_Default);
+
 namespace
 {
 // BrickKey <-> VoxelCoords::FVoxelCoord: this subsystem carries brick-grid
@@ -466,6 +495,13 @@ void RemeshDirtyBricks(FVoxelWaterImpl& Impl, AActor* ChunkOwner, USceneComponen
 // dirty-for-replication sets (task items 2 & 3).
 void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 {
+	// ADR-0003 item 4: re-check the cvar every fixed step (cheap -- a bool
+	// compare, plus a memo clear only on the OFF-transition, see
+	// WaterCA::setSolidCacheEnabled) so voxel.Water.SolidCacheEnabled can be
+	// flipped live without restarting. Must happen before step() below --
+	// hydrostaticPass reads solidCacheEnabled_ at the top of its own call.
+	Impl.CA.setSolidCacheEnabled(CVarVoxelWaterSolidCache.GetValueOnGameThread());
+
 	// Reservoir v0 (SS3.7: "the implicit ocean acts as an infinite
 	// reservoir: boundary cells refill to 255 each tick while exposed"). v0
 	// simplification: tops up unconditionally once registered (no support
@@ -743,6 +779,28 @@ void UVoxelWaterSubsystem::NotifyTerrainVoxelsCleared(const TArray<VoxelCoords::
 		       TEXT("voxel(s) examined."),
 		       NewlyBreachedCount, ClearedVoxels.Num());
 	}
+}
+
+void UVoxelWaterSubsystem::NotifyTerrainRegionEdited(const VoxelCoords::FVoxelCoord& MinVoxelIncl,
+                                                       const VoxelCoords::FVoxelCoord& MaxVoxelIncl)
+{
+	if (!Impl)
+	{
+		return;
+	}
+	UWorld* World = GetWorld();
+	const ENetMode NetMode = World ? World->GetNetMode() : NM_Standalone;
+	if (NetMode == NM_Client)
+	{
+		return; // a client's local mirror never runs step()/hydrostaticPass -- nothing to invalidate
+	}
+	Impl->CA.invalidateSolidRegion(MinVoxelIncl.X, MinVoxelIncl.Y, MinVoxelIncl.Z, MaxVoxelIncl.X, MaxVoxelIncl.Y,
+	                               MaxVoxelIncl.Z);
+}
+
+bool UVoxelWaterSubsystem::IsSolidCacheEnabled() const
+{
+	return Impl && Impl->CA.solidCacheEnabled();
 }
 
 FVoxelWaterPerfSnapshot UVoxelWaterSubsystem::GetPerfSnapshot() const

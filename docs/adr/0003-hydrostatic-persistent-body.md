@@ -213,3 +213,36 @@ memo needs — option B does not avoid the caller contract, it inherits it.
   changes without any edit event, like a streaming LOD swap that alters
   materialAt), that caller must simply leave the memo off; it loses perf, never
   correctness.
+
+## Item 2 resolution (docs/status.md "Water edit-notification completeness +
+## memo enablement" has the full writeup; this is a pointer, not a restatement)
+
+The three notification gaps this item called out (`TryPlace` sending nothing,
+`ExtractClearedVoxelCoords`'s `MAT_AIR`-only filter hiding non-air edits, and
+M5 collapse/island removal never notifying water at all) are fixed in
+`VoxelWorldSubsystem.cpp`/`.h` and `VoxelWaterSubsystem.cpp`/`.h`: every edit
+path now calls a new material-agnostic `NotifyTerrainRegionEdited` hook
+(batched per edit, routed to `invalidateSolidRegion`), in addition to the
+existing solid->air-only `NotifyTerrainVoxelsCleared` reservoir/breach path.
+
+The memo was then proven safe via an in-engine cross-process A/B
+(`-VoxelWaterMemoTest`, `VoxelEarthGameMode.cpp`): the full dig/place/carve/
+M5-collapse edit vocabulary run beneath and around a settled basin pool, once
+with `voxel.Water.SolidCacheEnabled` forced 0 and once forced 1 (same seed,
+same edits) -- every logged checkpoint digest matched byte-for-byte, not just
+the final one. `voxel.Water.SolidCacheEnabled` now defaults to **true** on
+that strength (a console var, per this ADR's own item-4-equivalent ask, so it
+can still be forced off in the field with no relaunch if a future edit path
+is ever suspected of a missed invalidation).
+
+This does NOT change the PENDING/proposed status or human-sign-off line
+above -- that decision is Matt's to make; this note only records what was
+built and proven so it need not be re-derived. One real, separate gap
+surfaced during the proof and is NOT fixed here (see docs/status.md for the
+full reasoning): a fully-settled water body does not reactivate itself when
+nearby terrain changes at all (memo on or off) -- no public voxel-core API
+exists to wake a brick without also injecting real volume via `addWater`, so
+"dig beneath a long-settled pond above sea level and see it react" is not
+currently true in shipped gameplay. Flagged as a follow-up needing either a
+new voxel-core API or a deliberate, metered production nudge policy -- not
+something this item's scope (caller-side invalidation wiring) covers.

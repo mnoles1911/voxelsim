@@ -83,6 +83,29 @@ public:
 	// see the .cpp for the full rule.
 	void NotifyTerrainVoxelsCleared(const TArray<VoxelCoords::FVoxelCoord>& ClearedVoxels);
 
+	// ADR-0003 item 2 (docs/adr/0003-hydrostatic-persistent-body.md): the
+	// general "terrain solidity changed here" hook the cross-tick solid_ memo
+	// (voxelcore/waterca.h setSolidCacheEnabled) needs, distinct from
+	// NotifyTerrainVoxelsCleared above -- that one is solid->air ONLY
+	// (reservoir/breach seeding never cares about the other direction), while
+	// the memo is a cache of solidity ITSELF and must be told about BOTH
+	// solid->air AND air->solid (a placed block matters exactly as much as a
+	// dug one). Called by UVoxelWorldSubsystem after EVERY authoritative edit
+	// (dig/place/carve/island-or-collapse-removal) with that edit's own
+	// inclusive voxel-coordinate bounding box -- ONE call per edit, not one
+	// per voxel (batched, per ADR-0003's "keep it efficient" note), routed
+	// straight to vxc::WaterCA::invalidateSolidRegion. Over-invalidating the
+	// box is always safe (a dropped-but-still-valid memo entry costs one
+	// re-query, never a wrong answer), so callers may pass a conservative box
+	// rather than the exact edited-cell set. No-op on NM_Client and whenever
+	// the memo is disabled (nothing to invalidate either way).
+	void NotifyTerrainRegionEdited(const VoxelCoords::FVoxelCoord& MinVoxelIncl, const VoxelCoords::FVoxelCoord& MaxVoxelIncl);
+
+	// Diagnostic: whether the cross-tick solid_ memo (voxel.Water.SolidCacheEnabled)
+	// is currently enabled -- read by verification/perf-report log lines so a
+	// dumped digest or timing line is unambiguous about which path produced it.
+	bool IsSolidCacheEnabled() const;
+
 	// docs/debug-tooling-plan.md P3 "Water" HUD row (task item 3): a snapshot
 	// refreshed at 1Hz (same cadence/shape convention as
 	// UVoxelWorldSubsystem::GetPerfSnapshot), read by AVoxelEarthHUD every
