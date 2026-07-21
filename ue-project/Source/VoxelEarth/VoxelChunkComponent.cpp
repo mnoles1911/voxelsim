@@ -148,6 +148,17 @@ public:
 		int32 DebugGIHits = 0;
 		float DebugGISum = 0.f;
 
+		// voxel.GI.Debug 3 / voxel.GI.DebugVis. Per-face-DIRECTION accounting:
+		// bucket index = Axis * 2 + (Positive ? 0 : 1), i.e. +X,-X,+Y,-Y,+Z,-Z.
+		// The roof-underside defect was invisible in the whole-chunk aggregate
+		// (a roof chunk's bright top faces and dark underside average to a
+		// plausible middle) and obvious the moment the buckets were separated.
+		const int32 GIDebugVis = bGIEnabled ? VoxelGI::GetDebugVis() : 0;
+		int32 DirCount[6] = {};
+		int32 DirHits[6] = {};
+		float DirIrrSum[6] = {};
+		float DirShadeSum[6] = {};
+
 		for (const FVoxelChunkQuad& Q : Component->ChunkQuads)
 		{
 			const int32 Axis = Q.Axis;
@@ -181,6 +192,14 @@ public:
 			const FVector3f Normal = AxisDir[Axis] * (Q.Positive ? 1.f : -1.f);
 			const FVector3f TangentX = AxisDir[U];
 			const FVector3f TangentY = AxisDir[V];
+
+			// DebugVis 4/5: omit one face class entirely. This is the test that
+			// settles "which face am I actually looking at" beyond argument --
+			// if the surface disappears, it was that class.
+			if ((GIDebugVis == 4 && Axis == 2 && Q.Positive) || (GIDebugVis == 5 && Axis == 2 && !Q.Positive))
+			{
+				continue;
+			}
 
 			const int32 SpanU = int32(Q.W);
 			const int32 SpanV = int32(Q.H);
@@ -223,6 +242,10 @@ public:
 						const float AoNorm = FMath::Clamp(AoAt(CornerFu[CornerIdx], CornerFv[CornerIdx]) * (85.f / 255.f), 0.f, 1.f);
 						float ShadeG = AoNorm;
 
+						const int32 DirBucket = Axis * 2 + (Q.Positive ? 0 : 1);
+						bool bGIHit = false;
+						float HitIrradiance = 0.f;
+
 						if (GIRead.IsValid())
 						{
 							const FVector WorldPos = ComponentWorldOrigin + FVector(Pos[CornerIdx]);
@@ -235,6 +258,8 @@ public:
 							// solve lands.
 							if (GIRead->Sample(WorldPos, Normal, Irradiance))
 							{
+								bGIHit = true;
+								HitIrradiance = Irradiance;
 								++DebugGIHits;
 								DebugGISum += Irradiance;
 								const float DistUU = float(FVector::Dist(WorldPos, GICentreUU));
@@ -244,6 +269,25 @@ public:
 								const float Weight = FMath::Clamp(GIStrength * Fade, 0.f, 1.f);
 								ShadeG = AoNorm * FMath::Lerp(1.f, Ambient, Weight);
 							}
+						}
+
+						// Diagnostic override, entirely outside the shipping path
+						// (GIDebugVis is 0 unless -VoxelGIVis is on the command
+						// line, and is forced to 0 whenever GI is off).
+						switch (GIDebugVis)
+						{
+						case 1: ShadeG = bGIHit ? HitIrradiance : 1.f; break;
+						case 2: ShadeG = bGIHit ? 0.f : 1.f; break;
+						case 3: ShadeG = FMath::Abs(Normal.Z) > 0.5f ? (Normal.Z < 0.f ? 0.15f : 1.f) : 0.5f; break;
+						default: break;
+						}
+
+						if (DirBucket >= 0 && DirBucket < 6)
+						{
+							++DirCount[DirBucket];
+							DirHits[DirBucket] += bGIHit ? 1 : 0;
+							DirIrrSum[DirBucket] += HitIrradiance;
+							DirShadeSum[DirBucket] += ShadeG;
 						}
 
 						const uint8 ShadeByte = bGIEnabled
@@ -256,13 +300,39 @@ public:
 						Vertices.Add(Vert);
 					}
 
-					// Winding: verified empirically (wireframe-visible /
-					// lit-invisible on the original orientation, 2026-07-19):
-					// UE front faces need the loop order REVERSED for Positive
-					// faces relative to the initial guess. Positive and negative
-					// faces still wind oppositely, and the mesh is correct with a
-					// one-sided material.
-					if (Q.Positive)
+					// WINDING -- corrected 2026-07-21, and this is the fix for the
+					// "roof slab underside renders fully lit" defect.
+					//
+					// Both branches used to be inverted: with the one-sided
+					// M_VoxelTerrain (confirmed at runtime, twoSided=0) every
+					// voxel face was wound so that UE treated its BACK side as
+					// front-facing. You therefore never saw the face pointing at
+					// you -- you saw the far side of the solid, with the shading
+					// normal of that far face.
+					//
+					// On open terrain that mis-renders as "the voxel look":
+					// scattered blocks, holes, distant clipmap showing through.
+					// Nobody caught it because there was no reference for what it
+					// should look like. On the wall+roof fixture it is
+					// unmissable: standing under the slab you were shown the
+					// slab's SUNLIT TOP face (+Z) instead of its shaded underside
+					// (-Z), which is exactly "the underside renders fully lit
+					// while the light field correctly reports 0.00 there". The
+					// field, the sampling and the vertex colours were all right
+					// the whole time -- the wrong triangle was on screen.
+					//
+					// Proven, not guessed (voxel.GI.DebugVis, this file):
+					//   vis 3 (|N.Z| ramp)   -- the ceiling shades as a +Z face.
+					//   vis 4 (drop +Z)      -- the ceiling turns to SKY, so the
+					//                           -Z underside was drawing nothing.
+					//   vis 6 (this winding) -- the ceiling turns black AND the
+					//                           terrain becomes a coherent solid.
+					//
+					// vis 6 is retained as the LEGACY inverted winding so the
+					// before/after pair can be captured from one build.
+					const bool bLegacyInvertedWinding = (GIDebugVis == 6);
+					const bool bReverseWinding = bLegacyInvertedWinding ? bool(Q.Positive) : !Q.Positive;
+					if (bReverseWinding)
 					{
 						IndexBuffer.Indices.Add(BaseVertex + 0);
 						IndexBuffer.Indices.Add(BaseVertex + 2);
@@ -298,6 +368,45 @@ public:
 			       DebugGIHits > 0 ? DebugGISum / float(DebugGIHits) : -1.f);
 		}
 
+		if (VoxelGI::GetDebugLevel() >= 3 && bGIEnabled && Vertices.Num() > 0)
+		{
+			static const TCHAR* kDirNames[6] = {TEXT("+X"), TEXT("-X"), TEXT("+Y"), TEXT("-Y"), TEXT("+Z"), TEXT("-Z")};
+			FString Line;
+			for (int32 D = 0; D < 6; ++D)
+			{
+				if (DirCount[D] == 0)
+				{
+					continue;
+				}
+				Line += FString::Printf(TEXT("%s n=%d hit=%d irr=%.3f shade=%.3f | "),
+				                        kDirNames[D], DirCount[D], DirHits[D],
+				                        DirHits[D] > 0 ? DirIrrSum[D] / float(DirHits[D]) : -1.f,
+				                        DirShadeSum[D] / float(DirCount[D]));
+			}
+			UE_LOG(LogVoxelEarth, Log, TEXT("GIDir: origin=(%.0f,%.0f,%.0f) %s"),
+			       ComponentWorldOrigin.X, ComponentWorldOrigin.Y, ComponentWorldOrigin.Z, *Line);
+		}
+
+		// Only reachable from the DebugVis 4/5 face-drop modes (CreateSceneProxy
+		// already refuses to build a proxy for a chunk with no quads, so the
+		// shipping path can never land here). The RHI fatals on a zero-sized
+		// buffer, so emit one degenerate triangle instead.
+		if (Vertices.Num() == 0 || IndexBuffer.Indices.Num() == 0)
+		{
+			Vertices.Reset();
+			FDynamicMeshVertex Dummy;
+			Dummy.Position = FVector3f::ZeroVector;
+			Dummy.SetTangents(FVector3f(1, 0, 0), FVector3f(0, 1, 0), FVector3f(0, 0, 1));
+			Dummy.Color = FColor(0, 0, 0, 0);
+			Vertices.Add(Dummy);
+			Vertices.Add(Dummy);
+			Vertices.Add(Dummy);
+			IndexBuffer.Indices.Reset();
+			IndexBuffer.Indices.Add(0);
+			IndexBuffer.Indices.Add(1);
+			IndexBuffer.Indices.Add(2);
+		}
+
 		VertexBuffers.InitFromDynamicVertex(&VertexFactory, Vertices);
 
 		// Enqueue initialization of render resources (matches
@@ -314,6 +423,19 @@ public:
 			Material = UMaterial::GetDefaultMaterial(MD_Surface);
 		}
 		MaterialRelevance = Material->GetRelevance_Concurrent(GetScene().GetShaderPlatform());
+
+		if (VoxelGI::GetDebugLevel() >= 3)
+		{
+			static bool bLoggedSidedness = false;
+			if (!bLoggedSidedness)
+			{
+				bLoggedSidedness = true;
+				const UMaterial* BaseMat = Material->GetMaterial();
+				UE_LOG(LogVoxelEarth, Log, TEXT("GIMat: material=%s twoSided=%d twoSidedRelevance=%d"),
+				       *Material->GetName(), BaseMat && BaseMat->IsTwoSided() ? 1 : 0,
+				       MaterialRelevance.bTwoSided ? 1 : 0);
+			}
+		}
 	}
 
 	virtual ~FVoxelChunkSceneProxy() override

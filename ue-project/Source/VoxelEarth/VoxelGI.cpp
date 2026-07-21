@@ -110,7 +110,24 @@ namespace
 
 	TAutoConsoleVariable<int32> CVarGIDebug(
 		TEXT("voxel.GI.Debug"), 0,
-		TEXT("1 = log light field stats (bricks, queue depths, solve ms) once a second."),
+		TEXT("1 = log light field stats (bricks, queue depths, solve ms) once a second. ")
+		TEXT("2 = + a downward-normal probe column and a per-chunk shading summary. ")
+		TEXT("3 = + a PER-FACE-DIRECTION breakdown of every chunk proxy (which was what ")
+		TEXT("finally isolated the roof-underside defect: the +X/-X/+Y/-Y/+Z/-Z buckets ")
+		TEXT("report their own hit rate and mean shade, so 'this normal never finds data' ")
+		TEXT("is one log line rather than a guess from a screenshot)."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<int32> CVarGIDebugVis(
+		TEXT("voxel.GI.DebugVis"), 0,
+		TEXT("Diagnostic override of the vertex shade byte (read at proxy build, so use ")
+		TEXT("-VoxelGIVis=<n> rather than -ExecCmds). 0 = off. 1 = raw sampled irradiance, ")
+		TEXT("with a MISS forced to white -- distinguishes 'the field says lit' from 'the ")
+		TEXT("field had no data and we fell back to plain AO'. 2 = pure hit/miss map ")
+		TEXT("(hit = black, miss = white). 3 = |N.Z| ramp, to confirm which faces are ")
+		TEXT("actually on screen. 4 = omit +Z faces. 5 = omit -Z faces. 6 = restore the ")
+		TEXT("LEGACY inverted triangle winding (the roof-underside defect), for before/after ")
+		TEXT("capture from a single build."),
 		ECVF_Default);
 
 	constexpr int32 kMaxPendingVoxelize = 1024;
@@ -126,6 +143,7 @@ namespace VoxelGI
 	float GetFadeStartUU() { return CVarGIFadeStartUU.GetValueOnAnyThread(); }
 	float GetFadeEndUU() { return CVarGIFadeEndUU.GetValueOnAnyThread(); }
 	int32 GetDebugLevel() { return CVarGIDebug.GetValueOnAnyThread(); }
+	int32 GetDebugVis() { return CVarGIDebugVis.GetValueOnAnyThread(); }
 }
 
 // --- subsystem lifetime ----------------------------------------------------
