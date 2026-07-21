@@ -210,6 +210,16 @@ public:
 	// -VoxelStructureTest switch. Returns the number of voxels stamped.
 	int32 SpawnStructureFixtureAt(double WorldX, double WorldY);
 
+	// Underground streaming diagnostic: reports what the streaming system
+	// currently holds for the LEVEL-0 render chunk containing WorldPos --
+	// whether it is in the desired set at all (bOutTracked), whether it owns a
+	// live component, and how many quads it meshed to. Zero quads with
+	// bOutTracked true is the expected, correct reading for a fully-solid
+	// interior chunk (it has no visible faces, so it holds no component and no
+	// GPU memory); bOutTracked FALSE is the "there is no world here" case this
+	// task exists to fix. Game thread only; returns false if Impl is null.
+	bool DebugChunkStatusAt(const FVector& WorldPos, bool& bOutTracked, bool& bOutHasComponent, int32& OutQuads) const;
+
 	// docs/debug-tooling-plan.md P1 "Perf HUD": a snapshot refreshed at 1Hz
 	// (per-frame collection, see FVoxelWorldImpl::UpdatePerfSnapshot), read by
 	// AVoxelEarthHUD every frame when voxel.Debug >= 1. Cheap struct copy;
