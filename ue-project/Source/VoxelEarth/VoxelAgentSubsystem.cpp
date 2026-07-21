@@ -115,8 +115,16 @@ static TAutoConsoleVariable<bool> CVarVoxelNPCDigEnabled(
 // scenario once with this at its default (1) and once with
 // "-ExecCmds=\"voxel.Agent.Tier1RegionGraph.Enabled 0\"", then diff the
 // "VoxelSwarm Tier1 planner:" log lines.
+// DEFAULT OFF (integration decision, 2026-07-21): the region-graph BUILD is
+// currently synchronous and measured at ~160s (256-expansion cap) to >500s
+// (4096 cap, killed) for the 1,875-region box -- dominated by
+// O(regions x portals^2) fine-findPath calls. Enabling this by default would
+// stall the game thread for minutes on the first Tier-1 plan. The planner
+// itself is correct and cheaper per query; it is the one-time build that is
+// unshippable until it is backgrounded/time-sliced (filed as the top M6
+// follow-up in docs/status.md). Flip to 1 to measure/compare.
 static TAutoConsoleVariable<bool> CVarVoxelTier1UseRegionGraph(
-	TEXT("voxel.Agent.Tier1RegionGraph.Enabled"), true,
+	TEXT("voxel.Agent.Tier1RegionGraph.Enabled"), false,
 	TEXT("M6: Tier 1 agents plan via the hierarchical region-graph planner (regiongraph.h) when the graph covers ")
 	TEXT("the query, falling back to the pre-M6 fine windowed search otherwise. Set to 0 to force ALL Tier 1 ")
 	TEXT("planning through the fine windowed search (before/after cost comparison)."),
