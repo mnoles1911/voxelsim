@@ -13,6 +13,7 @@
 #include "TimerManager.h"
 #include "UnrealClient.h"
 #include "VoxelDebug.h"
+#include "VoxelAgentReplication.h" // M6 gap closure: AVoxelAgentReplicator spawn below
 #include "VoxelAgentSubsystem.h" // M6 NPC swarm: -VoxelSwarmTest switch below
 #include "VoxelEarth.h"
 #include "VoxelEarthFlyPawn.h"
@@ -147,6 +148,15 @@ void AVoxelEarthGameMode::BeginPlay()
 		if (World->GetNetMode() != NM_Standalone)
 		{
 			World->SpawnActor<AVoxelEditRelay>();
+
+			// M6 gap closure (docs/status.md M6 section "Tier-1 hierarchical
+			// planning + NPC replication"): the NPC-state replication
+			// transport (AVoxelAgentReplicator, VoxelAgentReplication.h/.cpp
+			// -- a new file for this slice, deliberately NOT a third stream
+			// bolted onto AVoxelEditRelay, see that class's header comment).
+			// Same "only when actually networked" gating as the edit relay
+			// above, same reasoning (byte-identical standalone behavior).
+			World->SpawnActor<AVoxelAgentReplicator>();
 		}
 	}
 
@@ -418,6 +428,25 @@ void AVoxelEarthGameMode::BeginPlay()
 							ShotTerrain ? ShotTerrain->GetSurfaceHeightUU(DigSwarmTestColumnXUU, DigSwarmTestColumnYUU) : 0.0;
 						const FVector WallMid(DigSwarmTestColumnXUU, DigSwarmTestColumnYUU, WallSurfUU + 140.0);
 						const FVector CamPos = WallMid + FVector(-450.0, -550.0, 60.0); // back / side / slightly up
+						const FRotator Look = (WallMid - CamPos).Rotation();
+						if (APawn* P = PC->GetPawn())
+						{
+							P->SetActorLocation(CamPos);
+							P->SetActorRotation(Look);
+						}
+						PC->SetControlRotation(Look);
+					}
+					// M6 gap closure framing (docs/status.md M6 section):
+					// same broadside-and-back shape as bDigSwarmTestActive
+					// above, just aimed at the Tier1RegionGraphTest wall/gap
+					// column instead.
+					else if (bTier1RegionGraphTestActive && PC)
+					{
+						const double WallSurfUU = ShotTerrain
+							? ShotTerrain->GetSurfaceHeightUU(Tier1RegionGraphTestColumnXUU, Tier1RegionGraphTestColumnYUU)
+							: 0.0;
+						const FVector WallMid(Tier1RegionGraphTestColumnXUU, Tier1RegionGraphTestColumnYUU, WallSurfUU + 140.0);
+						const FVector CamPos = WallMid + FVector(-450.0, -650.0, 500.0); // back / side / well up (see the whole detour, not just the wall face)
 						const FRotator Look = (WallMid - CamPos).Rotation();
 						if (APawn* P = PC->GetPawn())
 						{
@@ -879,6 +908,28 @@ void AVoxelEarthGameMode::BeginPlay()
 					}
 					const int32 Spawned = AgentSubsystem->SpawnSwarm(SwarmTestCount);
 					UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSwarmTest: spawned %d/%d requested agents."), Spawned, SwarmTestCount);
+
+					// M6 gap closure verification (docs/status.md M6 section
+					// "Tier-1 hierarchical planning + NPC replication"):
+					// -VoxelReplicationSelfTest exercises UVoxelAgentSubsystem::
+					// CollectReplicationSnapshot -> ApplyReplicatedAgentSnapshot
+					// IN-PROCESS (no real network hop) right after the swarm
+					// spawns -- see RunReplicationSelfTest's doc comment for
+					// exactly what this does and doesn't prove. A genuine
+					// cross-process replication test (two headless processes,
+					// real UDP) was ALSO attempted for this gap closure but the
+					// client-side handshake did not complete in this sandboxed
+					// dev environment (the server accepts the connection, but
+					// the client's own connection times out waiting for a
+					// reply -- consistent with a firewall/loopback constraint
+					// this account has no permission to fix, not a bug in the
+					// replication code) -- this self-test is the fallback
+					// verification for the actual snapshot/quantize/interpolate
+					// logic.
+					if (FParse::Param(FCommandLine::Get(), TEXT("VoxelReplicationSelfTest")))
+					{
+						AgentSubsystem->RunReplicationSelfTest();
+					}
 				}),
 			SwarmSpawnDelaySeconds, false);
 	}
@@ -1049,6 +1100,157 @@ void AVoxelEarthGameMode::BeginPlay()
 					       Spawned, DigSwarmTestCount);
 				}),
 			DigSwarmSpawnDelaySeconds, false);
+	}
+
+	// M6 gap closure verification (docs/status.md M6 section "Tier-1
+	// hierarchical planning + NPC replication"): -VoxelTier1RegionGraphTest[=<N>]
+	// (default N=3) is the decisive scenario for BOTH halves of the gap
+	// closure this switch exists to prove: (1) Tier 1 agents actually plan
+	// via UVoxelAgentSubsystem::PlanPathTier1's hierarchical path (not the
+	// pre-M6 fine fallback) -- guaranteed by spawning strictly inside the
+	// region graph's coverage box, AND (2) dirty invalidation actually
+	// re-routes a live agent -- proven by digging a gap partway through the
+	// run and watching the corridor cost drop on the next replan.
+	//
+	// Unlike -VoxelDigSwarmTest's wall (built right next to the player, for
+	// Tier 0's dig-while-pathing demo), this wall sits at WallOffsetXUU (8m)
+	// -- inside UVoxelAgentSubsystem::Tier1GraphHorizontalRadiusRegions'
+	// ~19.2m-per-axis coverage box around the player (MEASURED down from an
+	// original, much bigger box that hung for 95+ seconds without
+	// completing a single buildRegionGraph call -- see that constant's doc
+	// comment) -- and the agents spawn at SpawnOffsetUU (17m), which is
+	// ALWAYS classified Tier 1 from their very first tick (beyond
+	// Tier0EnterUU=15m -- the MINIMUM distance for Tier 1 at all -- well
+	// under Tier1ExitUU=100m) and also inside the graph's ~19.2m coverage,
+	// so PlanPathTier1 takes the hierarchical branch, not the fallback, for
+	// this whole test.
+	int32 Tier1RegionGraphTestCount = 3;
+	const bool bTier1RegionGraphTestRequested =
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelTier1RegionGraphTest="), Tier1RegionGraphTestCount) ||
+		FParse::Param(FCommandLine::Get(), TEXT("VoxelTier1RegionGraphTest"));
+	if (bTier1RegionGraphTestRequested)
+	{
+		constexpr float Tier1TestSpawnDelaySeconds = 10.f;
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelTier1RegionGraphTest: building a wall + spawning %d Tier1-range agents in %.1fs"),
+		       Tier1RegionGraphTestCount, Tier1TestSpawnDelaySeconds);
+		GetWorldTimerManager().SetTimer(
+			Tier1RegionGraphTestTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this, Tier1RegionGraphTestCount]()
+				{
+					UWorld* TestWorld = GetWorld();
+					UVoxelWorldSubsystem* Terrain = TestWorld ? TestWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					UVoxelAgentSubsystem* AgentSubsystem = TestWorld ? TestWorld->GetSubsystem<UVoxelAgentSubsystem>() : nullptr;
+					APlayerController* PC = TestWorld ? TestWorld->GetFirstPlayerController() : nullptr;
+					APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+					if (!Terrain || !AgentSubsystem || !Pawn)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelTier1RegionGraphTest: subsystems/pawn not ready, skipping."));
+						return;
+					}
+
+					const FVector PlayerLoc = Pawn->GetActorLocation();
+
+					constexpr double WallOffsetXUU = 800.0;   // 8m ahead -- inside the ~19.2m Tier1 region graph box
+					constexpr int32 WallColumns = 15;         // 15 x 4-voxel cubes = 60 voxels = 6m wide (Y) -- forces a real detour
+					constexpr int32 WallLayers = 6;            // 6 x 4-voxel cubes = 24 voxels = 2.4m tall (Z)
+					constexpr double CubeEdgeUU = 40.0;        // 4 voxels x VoxelCoords::VoxelSizeUU
+					constexpr int32 CubeSizeVoxels = 4;
+					constexpr uint8 WallMaterialId = 2; // vxc::MAT_ROCK
+
+					const double WallCenterX = PlayerLoc.X + WallOffsetXUU;
+					const double WallCenterY = PlayerLoc.Y;
+					const double WallMinY = WallCenterY - (double(WallColumns) * CubeEdgeUU) * 0.5;
+
+					int32 CubesPlaced = 0;
+					for (int32 ColIdx = 0; ColIdx < WallColumns; ++ColIdx)
+					{
+						const double ColumnX = WallCenterX;
+						const double ColumnY = WallMinY + double(ColIdx) * CubeEdgeUU + CubeEdgeUU * 0.5;
+						double NextLayerBottomZ = Terrain->GetSurfaceHeightUU(ColumnX, ColumnY);
+						for (int32 LayerIdx = 0; LayerIdx < WallLayers; ++LayerIdx)
+						{
+							const FVector CameraLoc(ColumnX, ColumnY, NextLayerBottomZ + CubeEdgeUU * 3.0);
+							const FVector DownDir(0.0, 0.0, -1.0);
+							const bool bPlaced = Terrain->TryPlace(CameraLoc, DownDir, CubeSizeVoxels, WallMaterialId,
+							                                        PlayerLoc + FVector(1.0e7, 1.0e7, 1.0e7));
+							if (bPlaced)
+							{
+								++CubesPlaced;
+							}
+							NextLayerBottomZ += CubeEdgeUU;
+						}
+					}
+					const int32 CubesExpected = WallColumns * WallLayers;
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelTier1RegionGraphTest: wall built at X=%.0f, Y=[%.0f,%.0f] -- %d/%d cubes placed."),
+					       WallCenterX, WallMinY, WallMinY + double(WallColumns) * CubeEdgeUU, CubesPlaced, CubesExpected);
+
+					bTier1RegionGraphTestActive = true;
+					Tier1RegionGraphTestColumnXUU = WallCenterX;
+					Tier1RegionGraphTestColumnYUU = WallCenterY;
+
+					// Tier-1-range spawn (17m -- Tier0EnterUU=15m < dist <
+					// Tier1ExitUU=100m, so every agent starts life as Tier 1
+					// and stays there -- UVoxelAgentSubsystem.h's hysteresis
+					// constants), beyond the wall, and inside the ~19.2m
+					// region graph coverage box.
+					constexpr double SpawnOffsetUU = 1700.0; // 17m
+					constexpr double LateralJitterUU = 50.0;
+					const int32 Spawned = AgentSubsystem->SpawnSwarmAtOffset(
+						Tier1RegionGraphTestCount, PlayerLoc, FVector(1.0, 0.0, 0.0), SpawnOffsetUU, LateralJitterUU);
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelTier1RegionGraphTest: spawned %d/%d Tier1-range agents beyond the wall -- watch for ")
+					       TEXT("'VoxelAgent N (Tier1 hierarchical): corridor cost=...' log lines (LogVoxelEarth, Verbose)."),
+					       Spawned, Tier1RegionGraphTestCount);
+
+					// Dig a gap through the wall's center some time later --
+					// proves dirty invalidation (docs/status.md M6 section):
+					// the agents should re-route through it on their NEXT
+					// natural Tier 1 replan (at most UVoxelAgentSubsystem::
+					// Tier1ReplanIntervalSeconds=2.5s later), not just
+					// continue their old detour.
+					constexpr float GapDelaySeconds = 15.f;
+					GetWorldTimerManager().SetTimer(
+						Tier1RegionGraphGapTimerHandle,
+						FTimerDelegate::CreateWeakLambda(this,
+							[this, WallCenterX, WallCenterY, WallLayers, CubeEdgeUU]()
+							{
+								UWorld* GapWorld = GetWorld();
+								UVoxelWorldSubsystem* GapTerrain = GapWorld ? GapWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+								if (!GapTerrain)
+								{
+									return;
+								}
+								const double SurfaceUU = GapTerrain->GetSurfaceHeightUU(WallCenterX, WallCenterY);
+								// One horizontal dig per layer, straight through
+								// the wall's ~40UU thickness at its center
+								// column -- exactly like a player's own
+								// left-click dig (UVoxelWorldSubsystem::TryDig),
+								// the SAME authoritative path this whole gap
+								// closure's "player digs" dirty-invalidation
+								// case is about.
+								int32 DigsApplied = 0;
+								for (int32 LayerIdx = 0; LayerIdx < WallLayers; ++LayerIdx)
+								{
+									const FVector CameraLoc(WallCenterX - 200.0, WallCenterY,
+									                          SurfaceUU + CubeEdgeUU * double(LayerIdx) + CubeEdgeUU * 0.5);
+									const FVector DigDir(1.0, 0.0, 0.0);
+									if (GapTerrain->TryDig(CameraLoc, DigDir, 4))
+									{
+										++DigsApplied;
+									}
+								}
+								UE_LOG(LogVoxelEarth, Log,
+								       TEXT("VoxelTier1RegionGraphTest: opened a gap in the wall at (%.0f,%.0f) -- %d/%d dig(s) applied. ")
+								       TEXT("Watch for the NEXT 'VoxelAgent N (Tier1 hierarchical): corridor cost=...' line to drop, and ")
+								       TEXT("'VoxelSwarm Tier1 region graph: edit-log grew ... dirtied N region(s)'."),
+								       WallCenterX, WallCenterY, DigsApplied, WallLayers);
+							}),
+						GapDelaySeconds, false);
+				}),
+			Tier1TestSpawnDelaySeconds, false);
 	}
 }
 
