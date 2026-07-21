@@ -115,16 +115,28 @@ static TAutoConsoleVariable<bool> CVarVoxelNPCDigEnabled(
 // scenario once with this at its default (1) and once with
 // "-ExecCmds=\"voxel.Agent.Tier1RegionGraph.Enabled 0\"", then diff the
 // "VoxelSwarm Tier1 planner:" log lines.
-// DEFAULT OFF (integration decision, 2026-07-21): the region-graph BUILD is
-// currently synchronous and measured at ~160s (256-expansion cap) to >500s
-// (4096 cap, killed) for the 1,875-region box -- dominated by
-// O(regions x portals^2) fine-findPath calls. Enabling this by default would
-// stall the game thread for minutes on the first Tier-1 plan. The planner
-// itself is correct and cheaper per query; it is the one-time build that is
-// unshippable until it is backgrounded/time-sliced (filed as the top M6
-// follow-up in docs/status.md). Flip to 1 to measure/compare.
+// DEFAULT ON (2026-07-21). It was briefly defaulted OFF because the
+// region-graph BUILD was synchronous and measured at ~160s (256-expansion
+// cap) to >500s (4096 cap, killed) for the 1,875-region box, which would
+// have stalled the game thread for minutes on the first Tier-1 plan. Both
+// halves of that are now fixed and MEASURED (see
+// UVoxelAgentSubsystem.h's "Tier-1 region graph build budget" and
+// regiongraph.h's "Build cost"):
+//   - the build itself got ~4x cheaper in CPU and 67x cheaper in MaterialFn
+//     traffic (the term that actually dominated in-engine), with the
+//     resulting graph bit-identical -- golden digest 0xeb05deb529b8f143 and
+//     the incremental-equals-from-scratch test both still pass;
+//   - and it is no longer synchronous: AdvanceTier1RegionGraphBuild spends
+//     at most Tier1GraphBuildBudgetMsPerTick (2.0ms) per frame on a
+//     resumable vxc::RegionGraphBuilder and swaps the finished graph in only
+//     when complete, so NO frame pays the build.
+// Until the first build lands, Tier 1 planning degrades to exactly the
+// pre-M6 fine windowed search -- never a stall, never a half-built graph.
+// Set to 0 to force EVERY Tier 1 planning call through the fine windowed
+// search regardless of graph coverage (the "before" side of the before/after
+// comparison described above).
 static TAutoConsoleVariable<bool> CVarVoxelTier1UseRegionGraph(
-	TEXT("voxel.Agent.Tier1RegionGraph.Enabled"), false,
+	TEXT("voxel.Agent.Tier1RegionGraph.Enabled"), true,
 	TEXT("M6: Tier 1 agents plan via the hierarchical region-graph planner (regiongraph.h) when the graph covers ")
 	TEXT("the query, falling back to the pre-M6 fine windowed search otherwise. Set to 0 to force ALL Tier 1 ")
 	TEXT("planning through the fine windowed search (before/after cost comparison)."),
@@ -170,6 +182,21 @@ struct FVoxelAgentImpl
 	// below) for the build/query/fallback logic.
 	vxc::RegionGraph Tier1RegionGraph;
 	bool bTier1GraphValid = false;
+	// In-flight TIME-SLICED build (regiongraph.h header comment "Build
+	// cost"): non-null exactly while a (re)build is in progress. The live
+	// Tier1RegionGraph above is NEVER touched until this builder reports
+	// done() -- so a build in progress costs Tier 1 nothing but freshness
+	// (it keeps querying the previous graph, or falls back to the fine
+	// windowed search before the very first build lands), and never a
+	// multi-second game-thread stall. Driven by
+	// AdvanceTier1RegionGraphBuild once per Tick.
+	TUniquePtr<vxc::RegionGraphBuilder> Tier1GraphBuilder;
+	FVector Tier1GraphBuildCenterWorld = FVector::ZeroVector;
+	double Tier1GraphBuildStartSeconds = 0.0;
+	double Tier1GraphBuildBusySeconds = 0.0;   // CPU actually spent, summed over slices
+	double Tier1GraphBuildWorstSliceMs = 0.0;  // worst single tick's slice -- the frame-budget number
+	int32 Tier1GraphBuildSlices = 0;
+	int32 Tier1GraphBuildLoggedQuarter = 0; // progress-log throttle, see AdvanceTier1RegionGraphBuild
 	// World-space (ground-projected) center the graph was last (re)built
 	// around -- EnsureTier1RegionGraph rebuilds once the player's ground
 	// column drifts UVoxelAgentSubsystem::Tier1GraphRebuildTriggerUU away
@@ -675,7 +702,7 @@ bool UVoxelAgentSubsystem::PlanPath(int32 AgentIndex, UVoxelWorldSubsystem& Terr
 	return Agent.Waypoints.Num() > 0;
 }
 
-void UVoxelAgentSubsystem::EnsureTier1RegionGraph(UVoxelWorldSubsystem& Terrain, const FVector& PlayerWorldPos)
+void UVoxelAgentSubsystem::AdvanceTier1RegionGraphBuild(UVoxelWorldSubsystem& Terrain, const FVector& PlayerWorldPos)
 {
 	if (!Impl)
 	{
@@ -689,50 +716,153 @@ void UVoxelAgentSubsystem::EnsureTier1RegionGraph(UVoxelWorldSubsystem& Terrain,
 	const double GroundZ = Terrain.GetSurfaceHeightUU(PlayerWorldPos.X, PlayerWorldPos.Y);
 	const FVector GraphCenterWorld(PlayerWorldPos.X, PlayerWorldPos.Y, GroundZ);
 
-	if (Impl->bTier1GraphValid &&
-	    FVector::DistSquared(GraphCenterWorld, Impl->Tier1GraphCenterWorld) <= FMath::Square(Tier1GraphRebuildTriggerUU))
-	{
-		return; // cached graph still covers this area -- no rebuild due
-	}
-
-	const VoxelCoords::FVoxelCoord CenterVoxel = VoxelCoords::WorldToVoxel(GraphCenterWorld);
-	const vxc::PathCoord CenterPath{CenterVoxel.X, CenterVoxel.Y, CenterVoxel.Z};
-	const vxc::RegionCoord CenterRegion = vxc::regionOfVoxel(CenterPath);
-
-	const vxc::RegionCoord MinRegion{CenterRegion.x - Tier1GraphHorizontalRadiusRegions,
-	                                   CenterRegion.y - Tier1GraphHorizontalRadiusRegions,
-	                                   CenterRegion.z - Tier1GraphVerticalRadiusRegions};
-	const vxc::RegionCoord MaxRegion{CenterRegion.x + Tier1GraphHorizontalRadiusRegions,
-	                                   CenterRegion.y + Tier1GraphHorizontalRadiusRegions,
-	                                   CenterRegion.z + Tier1GraphVerticalRadiusRegions};
-
 	UVoxelWorldSubsystem* TerrainPtr = &Terrain;
 	const auto SolidFn = [TerrainPtr](int64 X, int64 Y, int64 Z) -> vxc::MaterialId
 	{
 		return TerrainPtr->IsSolidAtVoxel(X, Y, Z) ? kSolidSentinelMaterial : vxc::MAT_AIR;
 	};
 
-	// NavConfig, not DigConfig: Tier 1 never plans with Mine/Bridge enabled
-	// (see the class comment "Rate limiting -- tier restriction") -- the
-	// abstract graph's portals/edges must reflect the SAME walkability
-	// notion Tier 1's own findHierarchicalPath call below will query with.
-	const double StartSeconds = FPlatformTime::Seconds();
-	Impl->Tier1RegionGraph = vxc::buildRegionGraph(SolidFn, MinRegion, MaxRegion, Impl->NavConfig, Tier1GraphIntraMaxExpansions);
-	const double ElapsedMs = (FPlatformTime::Seconds() - StartSeconds) * 1000.0;
+	// --- (1) Decide whether a NEW build needs to start ---------------------
+	// Re-centering hysteresis is measured against whichever center is most
+	// recent: the in-flight build's center if one is running (so a player
+	// walking steadily doesn't restart the same build every few meters and
+	// never finish one), otherwise the live graph's.
+	const bool bBuilding = Impl->Tier1GraphBuilder.IsValid();
+	const FVector ReferenceCenter = bBuilding ? Impl->Tier1GraphBuildCenterWorld : Impl->Tier1GraphCenterWorld;
+	const bool bHaveReference = bBuilding || Impl->bTier1GraphValid;
+	const bool bNeedsNewBuild =
+		!bHaveReference ||
+		FVector::DistSquared(GraphCenterWorld, ReferenceCenter) > FMath::Square(Tier1GraphRebuildTriggerUU);
 
+	if (bNeedsNewBuild)
+	{
+		const VoxelCoords::FVoxelCoord CenterVoxel = VoxelCoords::WorldToVoxel(GraphCenterWorld);
+		const vxc::PathCoord CenterPath{CenterVoxel.X, CenterVoxel.Y, CenterVoxel.Z};
+		const vxc::RegionCoord CenterRegion = vxc::regionOfVoxel(CenterPath);
+
+		const vxc::RegionCoord MinRegion{CenterRegion.x - Tier1GraphHorizontalRadiusRegions,
+		                                   CenterRegion.y - Tier1GraphHorizontalRadiusRegions,
+		                                   CenterRegion.z - Tier1GraphVerticalRadiusRegions};
+		const vxc::RegionCoord MaxRegion{CenterRegion.x + Tier1GraphHorizontalRadiusRegions,
+		                                   CenterRegion.y + Tier1GraphHorizontalRadiusRegions,
+		                                   CenterRegion.z + Tier1GraphVerticalRadiusRegions};
+
+		// NavConfig, not DigConfig: Tier 1 never plans with Mine/Bridge
+		// enabled (class comment "Rate limiting -- tier restriction") -- the
+		// abstract graph's portals/edges must reflect the SAME walkability
+		// notion Tier 1's own findHierarchicalPath call queries with. The
+		// config is captured by the builder's caller (us) on every advance,
+		// so it must stay the same one for the whole build.
+		Impl->Tier1GraphBuilder = MakeUnique<vxc::RegionGraphBuilder>(MinRegion, MaxRegion, Tier1GraphIntraMaxExpansions);
+		Impl->Tier1GraphBuildCenterWorld = GraphCenterWorld;
+		Impl->Tier1GraphBuildStartSeconds = FPlatformTime::Seconds();
+		Impl->Tier1GraphBuildBusySeconds = 0.0;
+		Impl->Tier1GraphBuildSlices = 0;
+		Impl->Tier1GraphBuildWorstSliceMs = 0.0;
+		Impl->Tier1GraphBuildLoggedQuarter = 0;
+		// Snapshot the edit-log baseline at build START, not at completion:
+		// a time-sliced build spans many ticks, and an edit that lands
+		// PART-WAY through it is only reflected in the regions this builder
+		// had not reached yet. Baselining at the start makes
+		// PollWorldEditsForTier1DirtyRegions re-dirty for those edits once
+		// the graph goes live, rather than silently trusting a graph that
+		// saw two different world states.
+		Impl->LastSeenEditLogSize = Terrain.GetLogSize();
+
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelSwarm Tier1 region graph build STARTED (time-sliced, %.1fms/tick budget): ")
+		       TEXT("regions=[%lld..%lld]x[%lld..%lld]x[%lld..%lld] (%lld region-steps of work)"),
+		       Tier1GraphBuildBudgetMsPerTick, MinRegion.x, MaxRegion.x, MinRegion.y, MaxRegion.y,
+		       MinRegion.z, MaxRegion.z, Impl->Tier1GraphBuilder->totalRegionSteps());
+	}
+
+	if (!Impl->Tier1GraphBuilder.IsValid())
+	{
+		return; // graph is live and still well-centered -- nothing to do
+	}
+
+	// --- (2) Spend at most this tick's budget on it ------------------------
+	// The budget is checked BETWEEN slices, so a frame can overshoot it by at
+	// most one slice's worth of work (Tier1GraphBuildRegionsPerSlice regions
+	// -- deliberately 1, so the overshoot is one region's portal detection or
+	// one region's intra-edge searches, bounded by
+	// Tier1GraphIntraMaxExpansions x that region's portal count and by the
+	// ~20^3 voxels regiongraph.h's RegionMaterialCache reads per region).
+	// See the class comment "Tier-1 region graph build budget".
+	const double SliceStart = FPlatformTime::Seconds();
+	const double BudgetSeconds = Tier1GraphBuildBudgetMsPerTick / 1000.0;
+	bool bDone = false;
+	do
+	{
+		bDone = Impl->Tier1GraphBuilder->advance(SolidFn, Impl->NavConfig, Tier1GraphBuildRegionsPerSlice);
+	} while (!bDone && (FPlatformTime::Seconds() - SliceStart) < BudgetSeconds);
+
+	const double SliceMs = (FPlatformTime::Seconds() - SliceStart) * 1000.0;
+	Impl->Tier1GraphBuildBusySeconds += SliceMs / 1000.0;
+	Impl->Tier1GraphBuildWorstSliceMs = FMath::Max(Impl->Tier1GraphBuildWorstSliceMs, SliceMs);
+	++Impl->Tier1GraphBuildSlices;
+
+	// Permanent guardrail, not debug scaffolding: the whole justification for
+	// defaulting voxel.Agent.Tier1RegionGraph.Enabled ON is that the build
+	// costs a bounded slice of a frame. A slice that exceeds a whole 60Hz
+	// frame means that claim has regressed (a pathological region, a much
+	// more expensive MaterialFn, or a raised Tier1GraphBuildRegionsPerSlice)
+	// and should be seen, not silently absorbed.
+	static constexpr double kFrameBudgetMs = 1000.0 / 60.0;
+	if (SliceMs > kFrameBudgetMs)
+	{
+		UE_LOG(LogVoxelEarth, Warning,
+		       TEXT("VoxelSwarm Tier1 region graph build slice took %.2fms -- over the %.2fms 60Hz frame budget ")
+		       TEXT("(budget is %.1fms/tick, checked between %lld-region slices)"),
+		       SliceMs, kFrameBudgetMs, Tier1GraphBuildBudgetMsPerTick, Tier1GraphBuildRegionsPerSlice);
+	}
+
+	if (!bDone)
+	{
+		// Quarter-by-quarter progress. Not decoration: a time-sliced build's
+		// wall-clock-to-ready depends on the HOST's tick rate, not just on the
+		// build's own CPU cost (measured: ~21s wall with 3 agents, but still
+		// unfinished after 4 minutes under a 200-agent load, because a busy
+		// frame delivers the same 4ms slice far less often). Without this the
+		// only two observable states are "started" and "finished", which makes
+		// a slow-but-healthy build indistinguishable from a wedged one.
+		const int64 Total = Impl->Tier1GraphBuilder->totalRegionSteps();
+		const int64 Done = Impl->Tier1GraphBuilder->completedRegionSteps();
+		const int32 Quarter = Total > 0 ? (int32)((Done * 4) / Total) : 0;
+		if (Quarter > Impl->Tier1GraphBuildLoggedQuarter)
+		{
+			Impl->Tier1GraphBuildLoggedQuarter = Quarter;
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("VoxelSwarm Tier1 region graph build %d%% (%lld/%lld steps, %.1fms CPU across %d ticks, ")
+			       TEXT("worst tick %.2fms, %.1fs wall so far)"),
+			       Quarter * 25, Done, Total, Impl->Tier1GraphBuildBusySeconds * 1000.0,
+			       Impl->Tier1GraphBuildSlices, Impl->Tier1GraphBuildWorstSliceMs,
+			       FPlatformTime::Seconds() - Impl->Tier1GraphBuildStartSeconds);
+		}
+		return; // still building -- the PREVIOUS graph (if any) stays live
+	}
+
+	// --- (3) Swap the finished graph in ------------------------------------
+	// Only now does the new graph become queryable. Until this point Tier 1
+	// kept serving from the previous graph, or (on the very first build) fell
+	// back to the pre-M6 fine windowed search -- never a stall, never a
+	// half-built graph.
+	Impl->Tier1RegionGraph = MoveTemp(Impl->Tier1GraphBuilder->graph());
+	Impl->Tier1GraphCenterWorld = Impl->Tier1GraphBuildCenterWorld;
 	Impl->bTier1GraphValid = true;
-	Impl->Tier1GraphCenterWorld = GraphCenterWorld;
-	// A fresh build already reflects the CURRENT world state -- reset the
-	// dirty-poll baseline so PollWorldEditsForTier1DirtyRegions doesn't
-	// immediately re-dirty everything from edits this graph already saw.
-	Impl->LastSeenEditLogSize = Terrain.GetLogSize();
+	Impl->Tier1GraphBuilder.Reset();
 
+	const double WallSeconds = FPlatformTime::Seconds() - Impl->Tier1GraphBuildStartSeconds;
 	UE_LOG(LogVoxelEarth, Log,
 	       TEXT("VoxelSwarm Tier1 region graph (re)built: regions=[%lld..%lld]x[%lld..%lld]x[%lld..%lld] ")
-	       TEXT("(%d portals, %d edges, %lld fine-findPath expansions spent building) in %.2fms"),
-	       MinRegion.x, MaxRegion.x, MinRegion.y, MaxRegion.y, MinRegion.z, MaxRegion.z,
+	       TEXT("(%d portals, %d edges, %lld fine expansions spent building) -- %.1fms of CPU across %d ticks ")
+	       TEXT("(worst single tick %.2fms), %.1fs wall"),
+	       Impl->Tier1RegionGraph.minRegion.x, Impl->Tier1RegionGraph.maxRegion.x,
+	       Impl->Tier1RegionGraph.minRegion.y, Impl->Tier1RegionGraph.maxRegion.y,
+	       Impl->Tier1RegionGraph.minRegion.z, Impl->Tier1RegionGraph.maxRegion.z,
 	       (int32)Impl->Tier1RegionGraph.portals.size(), (int32)Impl->Tier1RegionGraph.edges.size(),
-	       Impl->Tier1RegionGraph.totalFinePathExpansions, ElapsedMs);
+	       Impl->Tier1RegionGraph.totalFinePathExpansions, Impl->Tier1GraphBuildBusySeconds * 1000.0,
+	       Impl->Tier1GraphBuildSlices, Impl->Tier1GraphBuildWorstSliceMs, WallSeconds);
 }
 
 bool UVoxelAgentSubsystem::PlanPathTier1(int32 AgentIndex, UVoxelWorldSubsystem& Terrain, const FVector& PlayerWorldPos,
@@ -757,7 +887,11 @@ bool UVoxelAgentSubsystem::PlanPathTier1(int32 AgentIndex, UVoxelWorldSubsystem&
 		return bOk;
 	}
 
-	EnsureTier1RegionGraph(Terrain, PlayerWorldPos);
+	// Non-blocking: kicks a time-sliced build off (or nudges the in-flight
+	// one) and returns immediately. If no graph is live YET, bCovered below
+	// is false and this call falls back to the fine windowed search -- the
+	// same graceful degradation an out-of-box agent already gets.
+	AdvanceTier1RegionGraphBuild(Terrain, PlayerWorldPos);
 
 	FVoxelAgent& Agent = Agents[AgentIndex];
 	const VoxelCoords::FVoxelCoord StartVoxel = VoxelCoords::WorldToVoxel(Agent.Position);
@@ -1528,6 +1662,14 @@ void UVoxelAgentSubsystem::Tick(float DeltaTime)
 	// before any agent this Tick reads the graph. See the method's own doc
 	// comment (UVoxelAgentSubsystem.h) for why this is a best-effort,
 	// position-based heuristic rather than a precise coordinate-level hook.
+	// M6 Tier-1 enablement (regiongraph.h header comment "Build cost"): spend
+	// at most Tier1GraphBuildBudgetMsPerTick of THIS frame on the region-graph
+	// build, every tick, whether or not any agent happens to plan this frame.
+	// Driving it from Tick rather than only from PlanPathTier1 is what keeps
+	// the build making steady progress instead of arriving in bursts on the
+	// frames that also happen to be replanning.
+	AdvanceTier1RegionGraphBuild(*Terrain, PlayerWorldPos);
+
 	PollWorldEditsForTier1DirtyRegions(*Terrain);
 
 	int32 ReplanBudget = MaxTier0ReplansPerTick;

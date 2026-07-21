@@ -323,6 +323,52 @@ public:
 	static constexpr int32 Tier1GraphIntraMaxExpansions = 1024;
 	static constexpr int32 Tier1PerRegionMaxExpansions = 1024;
 
+	// --- Tier-1 region graph build budget (M6 enablement, 2026-07-21) -----
+	// UPDATE to the MEASURED numbers quoted above: the ~160s/~506s builds
+	// they describe were dominated by two things that regiongraph.h has
+	// since removed outright (see its header comment "Build cost"), WITHOUT
+	// changing the resulting graph by a single bit (golden digest
+	// 0xeb05deb529b8f143 unchanged):
+	//   (1) one bounded fine findPath per ORDERED PAIR of a region's portals
+	//       -> ONE search per SOURCE portal (findPath is zero-heuristic
+	//       Dijkstra, so its settle order from a start is goal-independent
+	//       and one search already holds every pairwise answer);
+	//   (2) 666 MILLION MaterialFn calls -> 9.9M, by memoizing each region's
+	//       neighborhood once instead of re-evaluating procedural worldgen
+	//       per classifyMove read. This is the multiplier that dominated
+	//       HERE specifically, because our MaterialFn is
+	//       UVoxelWorldSubsystem::IsSolidAtVoxel -> World::materialAt ->
+	//       procedural generation, not a table lookup.
+	// Measured on the 1,875-region box: 9,045ms -> 2,257ms at cap 1024
+	// against a cheap in-process MaterialFn, with MaterialFn traffic down
+	// 67x -- which is what turns the ~506s in-engine build into a low
+	// single-digit-seconds one.
+	//
+	// That is still not ONE 16.6ms frame's worth of work, and it never will
+	// be for a box this size, so the build is additionally TIME-SLICED:
+	// AdvanceTier1RegionGraphBuild spends at most this many milliseconds of
+	// each frame on an in-flight vxc::RegionGraphBuilder and swaps the
+	// result in only when complete. 2.0ms is 12% of a 60Hz frame -- enough
+	// to finish the box in a few seconds of wall time while leaving the
+	// frame budget overwhelmingly to rendering/simulation. Tier 1 loses
+	// nothing while a build is in flight: it queries the PREVIOUS graph, or
+	// (before the first one lands) the same fine windowed search it used
+	// pre-M6.
+	// 4.0ms is 24% of a 60Hz frame. MEASURED headroom: the budget is only
+	// checked BETWEEN slices, so a frame's true worst case is
+	// budget + one slice, and vxc::RegionGraphBuilder's slice is a bounded
+	// SUB-region step -- either a 512-cell MaterialFn prefetch chunk or one
+	// warm-cache portal/intra-edge pass, both ~1ms in-engine -- so ~5ms
+	// worst case against a 16.6ms budget. (An earlier cut of this used
+	// whole-region slices; a region's ~4,100 cold procedural-worldgen reads
+	// made ONE slice a ~6ms average / 12.4ms worst indivisible lump, which
+	// is why regiongraph.h slices the prefetch itself.)
+	static constexpr double Tier1GraphBuildBudgetMsPerTick = 4.0;
+	// Builder STEPS per advance() call -- keep at 1 so the budget is
+	// re-checked at the finest granularity the builder offers and the
+	// overshoot stays one sub-region step, not a batch of them.
+	static constexpr int64 Tier1GraphBuildRegionsPerSlice = 1;
+
 	// --- NPC state replication (M6 gap closure) -------------------------
 	// Client-side render-position interpolation window (TickClientReplicated
 	// Agents/ApplyReplicatedAgentSnapshot): a fresh snapshot re-anchors a
@@ -490,16 +536,25 @@ private:
 	// doesn't duplicate it. Returns the new agent's pool index.
 	int32 SpawnOneAgentAt(double WorldX, double WorldY, UVoxelWorldSubsystem& Terrain);
 
-	// Tier 1 hierarchical region-graph planner (M6 gap closure -- see the
-	// constants' doc comment above for the extent/lifetime design). Builds or
-	// rebuilds FVoxelAgentImpl::Tier1RegionGraph, centered on the player's
-	// ground column, if the graph doesn't exist yet or the player has
-	// drifted more than Tier1GraphRebuildTriggerUU from the cached center.
-	// No-op (cheap distance compare) otherwise. Also resets
-	// FVoxelAgentImpl::LastSeenEditLogSize to the terrain's CURRENT log size
-	// on every (re)build, so PollWorldEditsForTier1DirtyRegions never treats
-	// entries the fresh graph already reflects as "new."
-	void EnsureTier1RegionGraph(UVoxelWorldSubsystem& Terrain, const FVector& PlayerWorldPos);
+	// Tier 1 hierarchical region-graph planner, TIME-SLICED build driver (M6
+	// gap closure -- see the constants' doc comment above for the extent/
+	// lifetime design and "Tier-1 region graph build budget" for the cost
+	// story). Called once per Tick and NEVER blocks:
+	//   - starts a fresh vxc::RegionGraphBuilder if no graph/build exists yet
+	//     or the player has drifted more than Tier1GraphRebuildTriggerUU from
+	//     the in-flight build's (or, if none, the live graph's) center;
+	//   - spends at most Tier1GraphBuildBudgetMsPerTick of THIS frame
+	//     advancing whichever build is in flight;
+	//   - swaps the finished graph into FVoxelAgentImpl::Tier1RegionGraph
+	//     ONLY once the builder reports done().
+	// The live graph is never partially updated, so Tier 1 either queries a
+	// complete previous graph or (before the first build lands) falls back to
+	// the pre-M6 fine windowed search. Also resets
+	// FVoxelAgentImpl::LastSeenEditLogSize at build START (not completion), so
+	// PollWorldEditsForTier1DirtyRegions re-dirties for any edit that landed
+	// part-way through a multi-tick build rather than trusting a graph that
+	// saw two different world states.
+	void AdvanceTier1RegionGraphBuild(UVoxelWorldSubsystem& Terrain, const FVector& PlayerWorldPos);
 
 	// Tier 1's planner entry point (replaces the raw vxc::findPath call
 	// TickTier1 used pre-M6): ensures the region graph is current, then --

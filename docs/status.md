@@ -3495,3 +3495,126 @@ eviction rule on the place path is a natural next step. (3) The
 `-VoxelWaterMemoTest` nudges are now redundant for reactivation and are kept
 only so that scenario keeps reproducing its signed-off A/B table; they could be
 retired once someone re-pins that table.
+
+### Region-graph build cost (M6 Tier-1 enablement)
+
+`voxel.Agent.Tier1RegionGraph.Enabled` now **defaults to `true`**. It was
+shipped defaulting to `false` because the region-graph *build* was
+synchronous and measured at ~160 s (256-expansion cap) to >500 s (4096 cap,
+killed) for the 1,875-region box — a multi-minute game-thread stall on the
+first Tier-1 plan. The planner itself was never the problem; the build was.
+
+**1. Where the time actually went (measured before changing anything).**
+Instrumented harness over the same box shape the UE side builds (25x25x3 =
+1,875 regions, cap 1024), against a cheap in-process `MaterialFn`:
+
+| Phase | Time | Share |
+|---|---|---|
+| Portal detection | 106 ms | 1.2% |
+| **Intra-region edges** | **8,966 ms** | **98.0%** |
+| Inter-region edges | 73 ms | 0.8% |
+
+Inside that 98%: **23,416 `findPath` calls** (one per *ordered pair* of a
+region's portals) burning **16.1M expansions** — a mean of 688
+expansions/call, i.e. most calls running to the cap because the pair simply
+is not connected inside the region. Portals per region were mean **4.84**,
+max **5**, so portal *count* was never the driver; the `P^2` call count and
+the resulting **666,190,347 `MaterialFn` calls** (41 per expansion — 18
+offsets x 2-3 voxel reads each) were. Cost scaled **linearly** in region
+count (4.4 / 5.2 / 4.9 ms per region at 147 / 507 / 1,875 regions).
+
+The in-engine build was ~56x slower than the harness for the identical work,
+which pins the real cost precisely: our `MaterialFn` is
+`IsSolidAtVoxel -> World::materialAt -> procedural worldgen`, ~1.5 us/call.
+666M of those *is* the ~500 s.
+
+**2. What changed (all in `regiongraph.h`; the graph is unchanged).**
+- **`O(portals^2)` searches -> `O(portals)`.** `findPath` is Dijkstra with a
+  **zero heuristic**, so its priority-queue key `(g, PathCoordLess)` never
+  mentions the goal: the settle *order* from a given start is
+  **goal-independent**. One search per *source* portal therefore already
+  contains every pairwise answer for that source. `findPath` returns
+  `complete` iff the goal is among the first `maxExpansions` settled cells,
+  with cost = that cell's settled `bestG` (all move costs are non-negative —
+  a negative `mineCostByMaterial` is the *impassable* sentinel, classified
+  invalid, never a negative edge). So the edge set and every edge cost are
+  **identical**, not merely equivalent.
+- **`MaterialFn` memoization.** Every voxel an intra-region search can
+  consult lies within the region box grown by 2, so `RegionMaterialCache`
+  memoizes them to at most `20^3` per region and is shared by the region's
+  portal detection *and* its intra-edge searches. Pure memoization — same
+  reads, same answers, far fewer of them.
+- **Resumable build.** `RegionGraphBuilder` walks the same phases in the same
+  region order under a caller-supplied per-call step budget, and
+  `buildRegionGraph()` is now literally the single-unlimited-slice case, so a
+  time-sliced build is byte-identical to a one-shot build *by construction*.
+  Steps are **sub-region**: a region's ~4,100 cold worldgen reads are
+  prefetched in 512-cell chunks before a warm-cache compute step, because
+  otherwise one region is a ~6 ms indivisible lump of a 16.6 ms frame.
+
+**3. Before/after (same harness, same boxes, same caps).**
+
+| Box | Cap | Before | After | `MaterialFn` calls |
+|---|---|---|---|---|
+| 147 regions | 1024 | 645 ms | 167 ms | 43.5M -> 0.81M |
+| 507 regions | 1024 | 2,187 ms | 547 ms | 168M -> 2.0M |
+| **1,875 regions** | **1024** | **9,046 ms** | **2,414 ms** | **666M -> 10.5M (63x)** |
+| 1,875 regions | 256 | 2,680 ms | 730 ms | 191M -> 9.9M |
+
+**4. Proof the graph did not change.** Golden digest
+`0xeb05deb529b8f143` still passes; the
+incremental-recompute-equals-from-scratch test still passes; and the built
+graph's digest is **bit-identical before and after** at 147
+(`0x77ff4fa19764c1ff`), 507 (`0x920f0703e08d9f33`) and 1,875 regions
+(`0x6d9a6a32c3a92ce0` at cap 1024, `0xd6b5e2c90b695760` at cap 256). A new
+test, `regiongraph_time_sliced_build_matches_one_shot_build`, pins the
+budgeted build against the one-shot build at the tightest possible budget
+(one step per `advance()`). 138 PASS / 0 FAIL; header and tests clean under
+`-Wall -Wextra -Wconversion -Wsign-conversion -Werror`; integer-only.
+`RegionGraph::totalFinePathExpansions` is now a *smaller* number for the same
+graph (P searches instead of P*(P-1)) — it is a monitoring counter,
+explicitly excluded from `digest()`.
+
+**5. Frame-budget evidence (headless, `-nullrhi`,
+`-VoxelTier1RegionGraphTest=3`).** `AdvanceTier1RegionGraphBuild` runs from
+`Tick` with a 4.0 ms/tick budget and swaps the finished graph in only when
+complete:
+
+> `Tier1 region graph (re)built: (8875 portals, 24959 edges, 8862707 fine
+> expansions spent building) -- 14431.0ms of CPU across 2264 ticks (worst
+> single tick 10.71ms), 28.4s wall`
+
+**Worst single tick 8.94-10.71 ms across runs, against a 16.6 ms budget, with
+zero occurrences of the permanent over-budget warning** — versus a ~506 s
+single-frame stall before. Until the first build lands, Tier 1 degrades to
+exactly the pre-M6 fine windowed search, so enabling this by default is
+strictly non-regressive.
+
+**Known limitation, measured, not hidden.** Wall-clock *to readiness* depends
+on the host's tick rate, not just the build's CPU: ~21-28 s with 3 agents,
+but **still unfinished after 4 minutes under a 200-agent `-VoxelSwarmTest`
+load** (same 4 ms slice, delivered far less often per second). Frame budget
+was never violated in that run either, and Tier 1 kept planning correctly via
+the fine fallback — but the hierarchical planner does not get a chance to
+engage in a short, heavily-loaded run. Also note the 3-agent scenario now
+converges (agents reach the player at ~7.7 m) *before* the graph is ready, so
+that specific test reports `hierarchical calls=0`; it is no longer the right
+scenario for exercising the hierarchical path.
+
+**Follow-ups.** (1) *Background-thread build* is the real fix for
+wall-clock-to-readiness — voxel-core is engine-free and `RegionGraphBuilder`
+is already a resumable, self-contained object, so the only blocker is that
+`World::materialAt` reads the edit overlay that game-thread digs mutate;
+making terrain reads thread-safe (or building against an immutable snapshot)
+belongs to `VoxelWorldSubsystem`, owned elsewhere this run. (2) The worst
+tick is now the warm-cache *compute* step of a portal-dense region (up to
+`cap x portals` expansions); slicing that per source portal would drop the
+worst tick further, toward the ~1 ms prefetch-chunk floor. (3)
+`rebuildIntraEdgesForRegion` still linearly scans all portals and all edges
+per region to collect/tombstone — `O(regions x graph size)`, ~50 ms at this
+box size and invisible today, but it is the next term to bite if the box
+grows. (4) Sub-region slicing made the prefetch eager over each region's full
+core, costing ~36% more `MaterialFn` calls than the purely lazy version
+(10.5M vs 7.7M) — a deliberate trade of total CPU for frame granularity,
+revisitable if a cheaper bulk terrain read (e.g. per-brick generation rather
+than per-voxel) becomes available.

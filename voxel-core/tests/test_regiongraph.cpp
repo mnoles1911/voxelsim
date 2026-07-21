@@ -234,7 +234,16 @@ VXC_TEST(regiongraph_time_sliced_build_matches_one_shot_build) {
 
     RegionGraphBuilder builder(minR, maxR);
     int64_t slices = 0;
-    while (!builder.advance(solid, config, /*regionBudget=*/1)) ++slices;
+    // NOTE the deliberately hostile calling convention: a FRESH, TEMPORARY
+    // MaterialFn per advance() call, destroyed the instant the call returns.
+    // That is exactly how the UE caller drives this (it builds its solidFn
+    // lambda inside the per-tick function), and the builder keeps a
+    // RegionMaterialCache alive ACROSS calls for the region it is part-way
+    // through -- so a cache that captured the first call's MaterialFn by
+    // pointer and never rebound would read freed memory on the next call.
+    // It did, and this is the regression pin for it (see
+    // RegionMaterialCache's LIFETIME CONTRACT).
+    while (!builder.advance(MaterialFn(solid), config, /*regionBudget=*/1)) ++slices;
     ++slices;
 
     // Every advance() must have made progress and the walk must have taken
