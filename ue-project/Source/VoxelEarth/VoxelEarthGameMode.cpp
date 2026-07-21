@@ -13,6 +13,7 @@
 #include "TimerManager.h"
 #include "UnrealClient.h"
 #include "VoxelDebug.h"
+#include "VoxelAgentSubsystem.h" // M6 NPC swarm: -VoxelSwarmTest switch below
 #include "VoxelEarth.h"
 #include "VoxelEarthFlyPawn.h"
 #include "VoxelClipmapActor.h"
@@ -688,6 +689,48 @@ void AVoxelEarthGameMode::BeginPlay()
 					       CutCentre.X, CutCentre.Y, CutCentre.Z, Removed);
 				}),
 			ChopTestDelaySeconds, false);
+	}
+
+	// M6 NPC swarm verification (docs/status.md M6 section, plan SS3.6):
+	// -VoxelSwarmTest[=<N>] (default N=200) spawns N pursuit agents ringed
+	// around the player ~2s after BeginPlay -- authority only (GameMode::
+	// BeginPlay only ever runs server-side, same reasoning
+	// -VoxelHeadlessDigTest/-VoxelTreeTest's blocks above already rely on).
+	// Unlike those two, this delay is short and fixed (not tunable, not
+	// waiting on render streaming): UVoxelAgentSubsystem::SpawnSwarm's
+	// ground-placement query (UVoxelWorldSubsystem::GetSurfaceHeightUU) is a
+	// pure amplifier read, safe immediately once the terrain subsystem's
+	// Impl exists (see that method's own doc comment) -- the only thing
+	// this delay actually waits on is RestartPlayer's pawn existing. Combine
+	// with -VoxelScreenshotAfter=<seconds> (a value LARGER than this delay)
+	// for a self-contained headless capture of the swarm converging on the
+	// player; tier counts and the mean-distance-to-player convergence
+	// metric are logged periodically by UVoxelAgentSubsystem::Tick itself
+	// ("VoxelSwarm:" lines, LogVoxelEarth), independent of whether a
+	// screenshot is also requested.
+	int32 SwarmTestCount = UVoxelAgentSubsystem::DefaultSwarmCount;
+	const bool bSwarmTestActive = FParse::Value(FCommandLine::Get(), TEXT("VoxelSwarmTest="), SwarmTestCount) ||
+	                               FParse::Param(FCommandLine::Get(), TEXT("VoxelSwarmTest"));
+	if (bSwarmTestActive)
+	{
+		constexpr float SwarmSpawnDelaySeconds = 2.f;
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSwarmTest: spawning %d agents in %.1fs"), SwarmTestCount, SwarmSpawnDelaySeconds);
+		GetWorldTimerManager().SetTimer(
+			SwarmTestTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this, SwarmTestCount]()
+				{
+					UWorld* SwarmWorld = GetWorld();
+					UVoxelAgentSubsystem* AgentSubsystem = SwarmWorld ? SwarmWorld->GetSubsystem<UVoxelAgentSubsystem>() : nullptr;
+					if (!AgentSubsystem)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelSwarmTest: no UVoxelAgentSubsystem, skipping spawn."));
+						return;
+					}
+					const int32 Spawned = AgentSubsystem->SpawnSwarm(SwarmTestCount);
+					UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSwarmTest: spawned %d/%d requested agents."), Spawned, SwarmTestCount);
+				}),
+			SwarmSpawnDelaySeconds, false);
 	}
 }
 
