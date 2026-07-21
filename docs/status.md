@@ -4219,3 +4219,118 @@ handshake digest `0x52004DCC85DDD80C`.
    `VoxelCoords::FloorDiv` and an anonymous-namespace copy in
    `VoxelLightField.cpp`; fixed by qualifying at the call site, but the
    duplicate helper should probably just go.
+
+### Worldgen + streaming performance pass
+
+Measure-first pass over worldgen and voxel streaming. Two of the three leads
+handed to this pass turned out to be worth less than advertised; the biggest
+real win was in a place none of them named.
+
+**Profile before any change** (clang -O2, seed 20260719, `vxc_bench --radius
+32`, min-of-5 — this box has ~15% run-to-run variance, so single runs are not
+usable):
+
+| stage | brick 8^3 | brick 16^3 |
+|---|---|---|
+| amplify | 528.4 ms | 428.3 ms |
+| voxelize | 26.0 ms | 54.0 ms |
+| mesh | 238.3 ms | 417.9 ms |
+| **total** | **792.6 ms** | **900.3 ms** |
+
+Amplify was 67% of the brick-8 total. Ablating `Amplifier::column` (0.946
+us/column) showed where it went:
+
+| component | us/column | share |
+|---|---|---|
+| tile raster reads (4x `elevationMm` + `climate`) | 0.574 | 61% |
+| `caveColumnFor` | 0.227 | 24% |
+| detail octaves + stratigraphy jitter | 0.083 | 9% |
+| biome classify | ~0.000 | 0% |
+
+**1. Tile-raster memo.** The raster reads are a pure function of the tile
+*pixel*, and a 30 m pixel covers 300x300 = 90,000 voxel columns — the entire
+640x640-column bench region spans just **25 distinct tile pixels**.
+`SyntheticTileSampler` evaluates seven value-noise octaves (28 hashes) per
+`elevationMm`, and it is what the UE runtime uses by default (only
+`-VoxelTileDir` selects `TileGridSampler`), so this was real shipped cost, not
+a bench-only artefact. Added a direct-mapped `thread_local` memo keyed by
+(amplifier id, px, py) — lock-free, so the shared `Amplifier` the UE job pool
+calls into gains no contention.
+
+Result: amplify **528.4 -> 192.0 ms** (2.75x) at brick 8, **428.3 -> 157.8 ms**
+(2.71x) at brick 16; totals 792.6 -> 458.8 ms and 900.3 -> 604.7 ms.
+
+**2. Column memo on the per-voxel path.** `Amplifier::materialAt(vx, vy, vz)` —
+behind `World::materialAt` -> `IsSolidAtVoxel` -> the region-graph `MaterialFn`,
+and behind `collapse.h`'s `CarveSphere` — rebuilt a whole `ColumnSample` for
+every voxel of a column's height. A 256-slot `thread_local` memo fixes it:
+884,736 calls over a 96^3 box, z-innermost (the shape those callers actually
+use) **279.9 -> 8.0 ms, 35x**. Batch callers holding a `ColumnGrid` use the
+two-argument overload and are untouched, so nothing double-caches.
+
+**3. The GPU "342 ms marshalling" lead was a measurement artefact, twice
+over.** It was never 342 of 367: the harness sums buckets into a
+"serial equivalent" line and prints the excess as hidden by flight
+double-buffering, because `prepareAndSubmit(f)` runs before
+`waitAndHarvest(f-1)`. The five stage timers are true GPU busy time from
+`vkCmdWriteTimestamp`, and the bracket contains no submit, fence wait or queue
+idle — so no GPU work was hiding in it. And it was almost entirely *not*
+marshalling: the bracket conflated buffer ensure/grow with the WorldGenParams
+upload and descriptor writes. Split apart at `--radius 64`, **marshalling
+proper is 0.129 ms**; the rest is `vkAllocateMemory`/`vkMapMemory` on tens of MB
+of host-visible memory. Pre-sizing "the marshalling" would have optimised a
+0.1 ms line. Gave `GrowBuffer` a growth policy (>=1.5x previous capacity,
+rounded to 1 MB) instead of allocating exactly the requested size: reallocations
+**168 -> 126** on this box (floor is 112 = 7 buffers x 16 slots), buffer-alloc
+time 68.1 ms. Capacity is invisible to the shaders — dispatches are bounded by
+WorldGenParams, never by buffer size — so no digest can move.
+
+Note the numbers quoted to this pass (342 ms, 202 reallocs, columns dispatch
+79 ms, mesh count 73 ms) do not reproduce on this box: the unmodified baseline
+measures 114 ms conflated / 168 reallocs. They came from a different build or
+machine state and should not be treated as a standing baseline.
+
+**M1 gate** (`-VoxelPerfRun=60`, seed 20260719, `-nullrhi`, two runs each side,
+same binary rebuilt only from voxel-core):
+
+| | R0 worker p95 (median of samples) | worst sample | hitches | chunks loaded | avgChunks/s |
+|---|---|---|---|---|---|
+| before run 1 | 30.51 ms | 128.59 ms | 18 | 9,183 | 153.1 |
+| before run 2 | 6.50 ms | 48.83 ms | 20 | 13,960 | 232.7 |
+| after run 1 | 4.79 ms | 6.31 ms | 1 | 22,395 | 373.3 |
+| after run 2 | 5.10 ms | 5.74 ms | 1 | 22,144 | 369.1 |
+
+The "after" side is tightly reproducible; the "before" side is erratic, which is
+itself the finding — the pass removed a variance source, not just a mean. ~1.9x
+more chunks streamed in the same 60 s. Worth flagging: the documented gate
+figure of p95 ~4.93-4.97 ms did **not** reproduce on the unmodified baseline
+here (30.5 / 6.5 ms); the post-change build is what matches it.
+
+**Determinism.** Unchanged everywhere: `vxc_bench` digests
+`6dbb95d59737e045` (8^3) and `280684104c06aacf` (16^3);
+`GOLDEN(amplifier_columns)` `0x81785278E4DFCF67`; AMD RX 7800 XT digests
+`e21e2767591496eb` (default), `1e664cf6680a137c` (`--radius 64`, 100% of 305
+tiles verified bit-exact) and `7602afe508d2ee73` (`--radius 128`).
+`vxc_tests` 154 PASS / 0 FAIL; `lint-shader-ub.py` clean; float-ban clean
+(shader untouched, so no SPIR-V rebuild).
+
+**Deliberately not done.** `caveColumnFor` is now 68% of what remains of
+`column()`, but `caves.h` is owned by another agent. The streaming exit scan
+(`RecomputeDesiredSet`, O(tracked), ~2.2-2.8 ms) and the `PendingJobKeys`
+backlog were left alone: with worker throughput up ~1.9x the backlog is no
+longer the binding constraint, and re-measuring it should come before
+re-architecting it.
+
+**Follow-ups, by expected value.**
+1. Cache or cheapen `caveColumnFor` (34 hashes/column, now the single largest
+   term in `column()`). Needs the caves.h owner.
+2. Mesh is now the largest bench stage (243 ms at brick 8, 409 ms at brick 16 —
+   53% and 68% of the totals). It has had no profiling pass at all.
+3. Re-measure the exit scan and pending-job backlog against the new throughput
+   before acting on either; both baselines are now stale.
+4. `TileGridSampler` gains less from the tile memo than `SyntheticTileSampler`
+   (it is already a raster lookup). Worth confirming the win holds with
+   `-VoxelTileDir` before assuming it generalises to shipped tile data.
+5. Suballocate the GPU harness's host-visible buffers to reach the 112-realloc
+   floor; low value now that the cost is correctly attributed at ~68 ms hidden
+   behind GPU execution.
