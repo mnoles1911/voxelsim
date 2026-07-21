@@ -3495,3 +3495,61 @@ eviction rule on the place path is a natural next step. (3) The
 `-VoxelWaterMemoTest` nudges are now redundant for reactivation and are kept
 only so that scenario keeps reproducing its signed-off A/B table; they could be
 retired once someone re-pins that table.
+
+## Track B — real terrain tiles into the runtime (2026-07-21)
+
+**B2 landed: `.vxtl` tiles are now a selectable, shippable tile source.**
+`-VoxelTileDir=<dir>` (plus optional `-VoxelTileScale=<1|8>`, default 1)
+makes `UVoxelWorldSubsystem` construct a `vxc::TileGridSampler` and load
+every `.vxtl` in the directory at Initialize (the terrain-service cache leaf
+layout, `<cache>/<provider_id>/<seed hex>/s<scale>/`); absent switch =>
+`SyntheticTileSampler`, byte-identical to before (goldens untouched, no
+`kWorldGenVersion` bump — Track A's 2→3 bump is unrelated and unaffected).
+The clipmap now samples heights through the subsystem's ACTIVE sampler
+(`SampleTerrainHeightUU`) instead of constructing its own synthetic sampler,
+so clipmap and voxel terrain read the same tiles and keep their seam.
+Proven on screen from the pregen'd synthetic-provider cache (seed 20260719,
+3×3 tiles, committed under `ue-project/Content/TerrainTiles/`):
+`docs/media/trackb-proof-vxtl-tiles.png` (tile-sourced world) vs
+`docs/media/trackb-control-synthetic.png` (same `-VoxelSpawnAt=7680,15360`
+coords, no switch — visibly different world), plus
+`docs/media/trackb-vxtl-snowline-biome.png` (tile climate driving cold-biome
+materials). Log proof: `Voxel tile grid: dir=... loaded=9 rejected=0
+seed=20260719 scale=1`.
+
+**Missing-tile policy (decided + documented):** tiles are canonical data and
+the client NEVER fabricates them. Queries outside the loaded set return
+`TileGridSampler`'s deterministic flat sea-level default (elevation 0,
+default climate) and bump an atomic `missingTileQueries` counter, surfaced
+as a throttled `LogVoxelPerf` Warning; zero tiles loaded at boot (bad path,
+empty dir, seed/scale mismatch) is an Error + fallback to the synthetic
+sampler so a typo can't silently boot an empty flat world.
+`missingTileQueries` was made `std::atomic<uint64_t>` because UE meshing
+workers query the sampler concurrently (tile map itself is immutable after
+load); covered by an exact-count 4-thread test plus TileGridSampler→Amplifier
+end-to-end determinism tests in `test_tilestore.cpp` (140/140 vxc_tests).
+
+**B1 prepared: `DiffusionProvider._call_model` is implemented** (no more
+TODO) against the real terrain-diffusion source: `WorldPipeline
+.from_pretrained(<local snapshot>)` (coarse/base/decoder submodels),
+`pipeline.get(i1,j1,i2,j2, with_climate=True)`, channel order confirmed to
+match `EXPECTED_CHANNELS`. Checkpoint sha256 (directory-manifest hash) is
+verified BEFORE load and refuses `"UNPINNED"`; per-tile RNG seed derivation
+is deterministic; backend is injectable, so the whole path is unit-tested
+GPU-free with fake models (42/42 terrain-service tests). Remaining
+GPU-session work is verification only: `terrain-service/docs/
+diffusion-bringup.md` + the exact copy-paste pod blocks in
+`docs/pod-bringup-commands.md` (checkpoint pin, one-tile
+`validate_model_output`, seam/axis check, pregen radius 2, package cache).
+
+**Follow-ups.** (1) `VoxelEarth.Build.cs` hardcodes
+`build/voxel-core-msvc/voxelcore.lib` but multi-config VS generators emit
+`Release/voxelcore.lib` — every fresh worktree needs a manual copy;
+deliberately not fixed in this slice. (2) `pregen --provider diffusion`
+still constructs the UNPINNED default config — wire pinned-config selection
+into `app._make_provider` once a production checkpoint is chosen (the pod
+doc's Block 5 sidesteps this with an explicit-config script). (3) Edit-logs
+recorded against a tile-sourced world replay correctly only against the
+same tile set; stamping `provider_id` into the save/editlog header is open.
+(4) When real diffusion tiles become the DEFAULT source, that is the
+`kWorldGenVersion` bump + golden re-pin moment — not this slice.
