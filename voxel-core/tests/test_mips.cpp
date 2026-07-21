@@ -174,5 +174,5 @@ VXC_TEST(mips_chain_determinism_golden) {
         d.u64(static_cast<uint32_t>(k.z));
         b->digest(d);
     }
-    CHECK_EQ(d.h, 0xACC109F9B1A5AD25ull); // GOLDEN(mips_chain)
+    CHECK_EQ(d.h, 0xE4CF1B376622A38Full); // GOLDEN(mips_chain) — M4 biome surfaceMat, kWorldGenVersion 2
 }
