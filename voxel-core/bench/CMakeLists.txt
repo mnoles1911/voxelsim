@@ -104,6 +104,14 @@ if(VXC_BUILD_GPU_HARNESS)
     VXC_SPV_PATH_SCANADD="${VXC_SPV_DIR}/worldgen.ScanAddMain.spv"
   )
   if(NOT MSVC)
-    target_compile_options(vxc_gpu PRIVATE -Wall -Wextra -Werror)
+    # gpu_harness.cpp uses the idiomatic Vulkan aggregate-init pattern
+    # (e.g. VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_...}) that deliberately
+    # value-initializes (zeroes) the trailing members. GCC/clang -Wextra flags
+    # that as -Wmissing-field-initializers; under -Werror it's fatal. The
+    # zero-fill is intentional and correct, so exclude just that one warning
+    # (real issues still error). Without this, the opt-in Linux/GCC build path
+    # — exactly what tools/run-nvidia-digest.sh drives — fails to compile.
+    target_compile_options(vxc_gpu PRIVATE
+      -Wall -Wextra -Werror -Wno-missing-field-initializers)
   endif()
 endif()
