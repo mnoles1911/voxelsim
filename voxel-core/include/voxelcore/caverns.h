@@ -1,7 +1,9 @@
 #pragma once
-// Cavern pass v1 (M4 cave pass v2, docs/cavern-design.md) — hash-gated
-// ellipsoid-cluster caverns anchored on the existing tunnel lattice's
-// backbone-crossing nodes, plus their per-site flood level.
+// Cavern pass v1 (M4 cave pass v2, docs/cavern-design.md, folding in Matt's
+// post-design decisions) — hash-gated, LARGE-and-RARE cavern sites anchored
+// on the existing tunnel lattice's backbone-crossing nodes, each a coaxial
+// CHAIN of ellipsoid "storeys" descending from the anchor, plus a per-site
+// flood level.
 //
 // Header-only, integer-only (CI float-ban). This is C1 of the design's build
 // plan (docs/cavern-design.md §7): new file, no other file touched, standalone
@@ -11,6 +13,56 @@
 // bit-for-bit in `voxel-core/shaders/worldgen.hlsl` (C6) — same discipline as
 // caves.h: integer math only, `floorDiv`/power-of-two masks instead of signed
 // `%`, no unbounded allocation.
+//
+// ---------------------------------------------------------------------------
+// POST-DESIGN CHANGES (Matt, folded in here rather than v1's spec)
+// ---------------------------------------------------------------------------
+// 1. Bedrock is moving from ~40-60 m to ~200 m depth (a later, amplifier.cpp
+//    change this file does NOT own or assume the exact value of). This file
+//    therefore makes NO compile-time assumption about how deep bedrock is:
+//    the only place bedrock matters is the ordinary per-voxel runtime clamp
+//    in `cavernCarveAt`, which takes `bedrockDepthMm` as a parameter exactly
+//    like caves.h's `caveCarveAt` already does — already correctly
+//    parameterised, already safe whether bedrock is 40 m or 200 m. There is
+//    no "kCavernBedrockCeilingMm" constant anywhere below.
+// 2. Caverns are LARGER and RARER than the original spec (12-28 m wide,
+//    5-12 m tall, 1-in-4 gate at 102.4 m spacing): sites now sit 204.8 m
+//    apart (every 8th lattice node, still a guaranteed backbone crossing —
+//    8 is a multiple of caves.h's own backbone period of 4) and each open
+//    site is a coaxial CHAIN of up to 4 rooms (24-56 m wide) descending from
+//    the anchor, using the depth room the bedrock move frees up (see #3).
+// 3. "Design for the vertical range": a single shallow ellipsoid centred on
+//    the tunnel-depth anchor cannot get much taller without either poking
+//    above the roof clamp (anchor depth tops out at 34 m, so a large upward
+//    reach breaches daylight) or needing an assumed bedrock ceiling (#1). So
+//    the EXTRA vertical range goes downward, as a CHAIN: child 0 is the
+//    small "entrance chamber" at the anchor (tied to the tunnel depth, roof-
+//    safe by the same static_assert style as before); children 1-3 each sit
+//    directly below the PREVIOUS child (same xy — see "why coaxial" below),
+//    independently sized, so the whole site can span up to ~40-100+ m of
+//    depth. Whatever doesn't fit above the real bedrock at a given column is
+//    truncated by the ordinary runtime clamp, same as it always was.
+// 4. Underground water (design doc §5, approved as designed, implemented in
+//    C7/C8) is unaffected: `CavernColumn.floodZMm` and `CH_CAVERN_FLOOD`
+//    stay exactly as before, and every child still carries an own-center
+//    flat floor, so C7 has a well-defined basin to flood.
+//
+// WHY COAXIAL (children 1-3 share the anchor's xy, not an independent offset)
+// ---------------------------------------------------------------------------
+// Two ellipsoids of revolution (rx == ry == rxy, semi-axis rz) centred a
+// displacement (dxy, dz) apart do NOT have a simple exact overlap test in
+// general — but if dxy == 0 (same xy, i.e. coaxial), the two ellipsoids'
+// horizontal cross-sections at any given z are full circles on the SAME axis,
+// so overlap reduces EXACTLY to the 1D interval test |dz| < rz0 + rz1. That
+// is what makes the connectivity argument for a 4-room chain a clean,
+// static_assert-able fact instead of an approximation: build the chain with
+// zero horizontal offset between consecutive rooms, and the same worst-case
+// static_assert style caves.h already uses (compare hashed MINIMUMS) proves
+// every consecutive pair overlaps, hence (transitively) the whole chain's
+// union is one connected blob for every possible hash draw. It also means
+// distance-to-anchor (dxySq) is now computed ONCE PER COLUMN and reused for
+// all 4 children instead of once per child — a real cost reduction, keeping
+// faith with "the perf pass just landed 2.75x, do not give it back."
 //
 // ---------------------------------------------------------------------------
 // WHY THIS RIDES THE EXISTING PER-COLUMN REDUCTION (design doc §0)
@@ -31,15 +83,13 @@
 // ---------------------------------------------------------------------------
 // PLACEMENT: HASH-GATED SITES AT BACKBONE-CROSSING NODES (design doc §3.1)
 // ---------------------------------------------------------------------------
-// Cavern sites live at the SAME class of lattice node caves.h's sinkhole
-// shafts use: `(i & 3) == 0 && (j & 3) == 0` on the cave lattice, i.e. every
-// 4th node in both axes, 102.4 m apart (`kCavernCoarseMm`). Every such node is
-// a BACKBONE crossing — caves.h's backbone rule makes every 4th row's +x
-// edges and every 4th column's +y edges unconditional, so a backbone-crossing
-// node always has (interior-of-world) four incident tunnels — and the anchor
-// point IS that exact node (same `caveNode()` call, same `CH_CAVE_NODE`
-// channel, so bit-identical to the tunnel network's own node), at absolute
-// height
+// Cavern sites live at every 8th lattice node in both axes (`(i & 7) == 0 &&
+// (j & 7) == 0`, i.e. `kCavernCoarseLatticeRatio` cave-lattice cells, 204.8 m
+// apart, `kCavernCoarseMm`) — a strict subset of the backbone-crossing nodes
+// caves.h's sinkhole shafts use (every 4th), so every candidate is still
+// guaranteed four incident backbone tunnels. The anchor point IS that exact
+// node (same `caveNode()` call, same `CH_CAVE_NODE` channel, so bit-identical
+// to the tunnel network's own node), at absolute height
 //
 //     anchorZ = surfaceMmAt(nx, ny) − node.depthMm
 //
@@ -54,40 +104,38 @@
 // `surfaceMmAt` is evaluated at the SITE'S OWN (nx, ny) — not the querying
 // column's position — because a lake or room floor that drapes with the
 // terrain overhead is visibly wrong; caverns anchor at absolute z so floors
-// and future water tables are level. This is the one place the cavern pass
-// needs a surface height at an xy other than the column being queried, hence
-// the `surfaceAt` callback threaded through `cavernSiteFor`/`cavernColumnFor`
+// and water tables are level. This is the one place the cavern pass needs a
+// surface height at an xy other than the column being queried, hence the
+// `surfaceAt` callback threaded through `cavernSiteFor`/`cavernColumnFor`
 // below: the caller (Amplifier::column in C4) already owns the tile raster
-// and can supply its own bilinear+octave surface function (or, for a
-// standalone caller, anything satisfying the same contract — see the
-// function comments). Callers must not widen a GPU column-cache struct to
-// carry this; C6 recomputes it inside VoxelizeMain instead (design doc §3.5).
+// and can supply its own bilinear+octave surface function. Callers must not
+// widen a GPU column-cache struct to carry this; C6 recomputes it inside
+// VoxelizeMain instead (design doc §3.5).
 //
 // ---------------------------------------------------------------------------
 // WHY THE COMMON-CASE COLUMN IS CHEAP (design doc §3.4, §3.7)
 // ---------------------------------------------------------------------------
-// A site's maximum reach from its anchor (worst-case child offset + widest
-// roughened radius, `kCavernMaxReachMm`) is safely under half the 102.4 m
-// coarse spacing, so:
+// A site's maximum reach from its anchor (widest possible roughened room
+// radius, `kCavernMaxReachMm` — there is no offset term any more, see "why
+// coaxial" above) is safely under half the 204.8 m coarse spacing, so:
 //   * the 2x2 block of coarse-lattice corners around the column's own coarse
 //     cell is EXHAUSTIVE (nothing further away can possibly reach it) —
 //     `static_assert` below;
 //   * at most ONE of those 4 corners can ever be an open, in-reach site for
-//     any given column (two adjacent corners' reach discs cannot both cover
-//     the same point) — `static_assert` below, which is what lets
+//     any given column — `static_assert` below, which is what lets
 //     `cavernColumnFor` just accumulate into one `CavernColumn` with no
 //     "which site wins" tie-break to define.
 // Per corner, the FIRST thing tested is a single gate bit folded into the
 // hash `caveNode()` already computes for node-jitter (`CH_CAVE_NODE`) — see
-// `cavernSiteGateOpen` — so the common "gate closed" case (~68% of corners,
-// theory (3/4)^1 per corner) costs nothing beyond a hash call the tunnel
-// system's own node lookup would otherwise also need. Only once a corner
-// passes gate + a cheap depth-safety window + a cheap xy-distance reject does
-// `cavernSiteFor` run — the ONE place that reads the terrain raster
-// (`surfaceAt`), decodes the K=4 child ellipsoids and the flood level. That
-// full reduction is measured at ~4% of columns (docs/cavern-design.md §3.7).
-// Columns with no site in reach get `CavernColumn{count=0, floodZMm=dry}` and
-// the per-voxel test is one `count == 0` check.
+// `cavernSiteGateOpen` — so the common "gate closed" case costs nothing
+// beyond a hash call the tunnel system's own node lookup would otherwise
+// also need. Only once a corner passes gate + a cheap depth-safety window +
+// a cheap xy-distance reject does `cavernSiteFor` run — the ONE place that
+// reads the terrain raster (`surfaceAt`), decodes the up-to-4-room chain and
+// the flood level. The wider spacing (204.8 m vs the original 102.4 m) means
+// this full-reduction tier fires on a QUARTER as many columns as before,
+// purely from geometry, before the gate probability is even applied —
+// exactly the "rarity helps the budget" property Matt asked to keep.
 //
 // ---------------------------------------------------------------------------
 // SAFETY GUARDS ON SLOPES (design doc §3.6) — read this before retuning
@@ -102,16 +150,19 @@
 // caves.h already applies, reused verbatim (`kCaveRoofMinMm`,
 // `kCaveBedrockMarginMm`, `kCaveMinVoxelZ`, `kCaveMinSurfaceMm`). A cavern
 // near a slope gets truncated with full cover rather than ever creating a
-// surprise skylight or a bedrock breach; the measured flood-fill in
-// test_caverns.cpp is the arbiter of how much that costs connectivity, the
-// same way it already is for tunnel pinching at cliffs.
+// surprise skylight, a floating floor, or a sea breach; test_caverns.cpp
+// measures this on genuinely varied (not flat) terrain and reports the
+// minimum roof cover actually observed, the same way it is already the
+// arbiter for tunnel pinching at cliffs.
 //
-// Separately, the SITE is only accepted if its own node depth falls inside a
-// SAFE WINDOW (`kCavernNodeDepthSafeMinMm`..`kCavernNodeDepthSafeMaxMm`) that
-// guarantees the full ellipsoid geometry (including the widest possible
-// child offset+radius) cannot reach the roof or bedrock clamps even before
-// the per-voxel guards are consulted — "sizing at the anchor column is
-// structural" per the design doc, `static_assert`-pinned below.
+// Separately, ONLY child 0 (the entrance chamber, sitting exactly at the
+// anchor) needs a compile-time safety window on the node's own depth — it is
+// the one room whose center is tied to the shallow (9-34 m) tunnel band, so
+// it is the only one that can threaten the ROOF (children 1-3 only ever sit
+// deeper). `kCavernNodeDepthSafeMinMm` guarantees child 0's own widest
+// possible radius cannot reach the roof clamp before any per-voxel guard is
+// even consulted — "sizing at the anchor column is structural" per the
+// design doc, `static_assert`-pinned below.
 
 #include "voxelcore/caves.h"
 
@@ -119,17 +170,18 @@ namespace vxc {
 
 // --- worldgen contract constants (tune only on a kWorldGenVersion bump) -----
 
-// Cavern sites sit on the same lattice class as sinkhole shafts (every 4th
-// cave-lattice node in both axes), 102.4 m apart.
-inline constexpr int64_t kCavernCoarseMm = kCaveLatticeMm * 4;
+// Cavern sites sit on a strict subset of the sinkhole-shaft lattice class
+// (every Nth cave-lattice node in both axes, N = kCavernCoarseLatticeRatio),
+// 204.8 m apart -- 2x caves.h's own 102.4 m shaft spacing, i.e. a QUARTER as
+// many candidate corners per unit area, the "rarer" half of "large but rare."
+inline constexpr int64_t kCavernCoarseLatticeRatio = 8;
+inline constexpr int64_t kCavernCoarseMm = kCaveLatticeMm * kCavernCoarseLatticeRatio;
 
 // 1-in-4 site gate, decoded from bits the node-jitter hash otherwise leaves
 // unused (caveNode() consumes bits 0..59 of hash2(seed,i,j,CH_CAVE_NODE) for
 // x/y jitter + depth; bits 60/61 are free). This is the "fold gate bits into
 // the node-jitter hash" optimization the design doc calls out (§3.7):
-// testing it costs nothing beyond the hash caveNode() already computes, and
-// removes what would otherwise be a second hash call in the ~63%-of-columns
-// "gate open, later rejected on xy distance" tier.
+// testing it costs nothing beyond the hash caveNode() already computes.
 inline constexpr uint64_t kCavernSiteGateMask = 3; // bits 60..61 == 0 -> open
 
 // Beach/ocean guard on the SITE's own surface (not the querying column's) —
@@ -137,81 +189,82 @@ inline constexpr uint64_t kCavernSiteGateMask = 3; // bits 60..61 == 0 -> open
 // half-drowned cliffside room reads far worse than a half-drowned tunnel.
 inline constexpr int32_t kCavernMinSurfaceMm = 20000;
 
-// --- child ellipsoid geometry (design doc §3.2) -----------------------------
+// --- chain geometry (design doc §3.2, widened for "large but rare") --------
 
+// Four rooms per open site: child 0 is the entrance chamber at the anchor
+// (tied to the shallow tunnel depth); children 1..3 chain downward from the
+// previous room, same xy each time (see "why coaxial" above).
 inline constexpr int32_t kCavernChildCount = 4;
 
-// Children 1..3 offset from the anchor by up to this many mm on each axis
-// independently (child 0 sits exactly on the anchor). ±8 m per the design.
-inline constexpr int64_t kCavernChildOffsetXYMaxMm = 8000;
-inline constexpr int64_t kCavernChildOffsetZMaxMm = 3000; // ±3 m
-
-// Horizontal (rx == ry — an oblate spheroid, i.e. round in plan, flattened in
-// z, matching "rooms not spheres") and vertical semi-axes, each independently
-// hashed per child.
-inline constexpr int64_t kCavernRxyMinMm = 6000;  // 6 m
-inline constexpr int64_t kCavernRxySpanMm = 8000; // -> [6, 14) m
+// Horizontal semi-axis, shared by every room in the chain (rx == ry — an
+// oblate spheroid, round in plan). 24-56 m diameter -- 2x the original
+// spec's 12-28 m wide, satisfying "bigger."
+inline constexpr int64_t kCavernRxyMinMm = 12000;  // 12 m
+inline constexpr int64_t kCavernRxySpanMm = 16000; // -> [12, 28) m
 inline constexpr int64_t kCavernRxyMaxMm = kCavernRxyMinMm + kCavernRxySpanMm;
-inline constexpr int64_t kCavernRzMinMm = 2500;   // 2.5 m
-inline constexpr int64_t kCavernRzSpanMm = 3500;  // -> [2.5, 6) m
-inline constexpr int64_t kCavernRzMaxMm = kCavernRzMinMm + kCavernRzSpanMm;
 
-// Flat floor: each child's floor sits this far below the SITE's anchorZ (not
-// the child's own center — every child shares the anchor as its floor
-// reference, design doc §3.2), independently hashed per child.
-inline constexpr int64_t kCavernFloorDropMinMm = 1000; // 1 m
-inline constexpr int64_t kCavernFloorDropSpanMm = 3000; // -> [1, 4) m
+// Child 0's vertical semi-axis: kept modest so it stays roof-safe across
+// most of the tunnel node depth range (see the safety-window constants
+// below) -- it is the "doorway," not the main room.
+inline constexpr int64_t kCavernRz0MinMm = 4000;  // 4 m
+inline constexpr int64_t kCavernRz0SpanMm = 6000; // -> [4, 10) m
+inline constexpr int64_t kCavernRz0MaxMm = kCavernRz0MinMm + kCavernRz0SpanMm;
+
+// Children 1..3's vertical semi-axis: the actual "use the new depth" room,
+// independently hashed per room, up to 40 m tall (80 m full height) each.
+inline constexpr int64_t kCavernRzDeepMinMm = 12000;  // 12 m
+inline constexpr int64_t kCavernRzDeepSpanMm = 28000; // -> [12, 40) m
+inline constexpr int64_t kCavernRzDeepMaxMm = kCavernRzDeepMinMm + kCavernRzDeepSpanMm;
+
+// Flat floor, own-center-relative for every room (a chain of 40-80 m tall
+// rooms sharing one floor reference stopped making sense once the rooms are
+// no longer clustered around one point).
+inline constexpr int64_t kCavernFloorDropMinMm = 3000;  // 3 m
+inline constexpr int64_t kCavernFloorDropSpanMm = 12000; // -> [3, 15) m
+
+// Downward chain step: child[c]'s center sits this far below child[c-1]'s
+// (child 0 has none -- it IS the anchor). Bounded (see static_asserts below)
+// so consecutive rooms always overlap regardless of which radii got hashed.
+inline constexpr int64_t kCavernStepDownMinMm = 2000;  // 2 m
+inline constexpr int64_t kCavernStepDownSpanMm = 12000; // -> [2, 14) m
 
 // --- wall roughness (design doc §3.2) ---------------------------------------
 
 // Per-column 2D value noise multiplies the reduced xy reach (rxy²) before the
 // margin division, so walls/ceilings undulate at zero per-voxel cost — one
-// sample shared by every child in the column, exactly like a tunnel radius is
-// constant along an edge but the tube still looks organic because the whole
-// lattice is jittered.
-inline constexpr int64_t kCavernRoughLatticeMm = 3200; // 3.2 m
+// sample shared by every room in the column. Lattice widened vs the original
+// spec (3.2 m) to stay visually proportional to the much bigger rooms.
+inline constexpr int64_t kCavernRoughLatticeMm = 6400; // 6.4 m
 inline constexpr int64_t kCavernRoughAmpQ10 = 307;     // +/-0.3 of 1024
 inline constexpr int64_t kCavernRoughMinQ10 = 1024 - kCavernRoughAmpQ10; // 717 (~0.70)
 inline constexpr int64_t kCavernRoughMaxQ10 = 1024 + kCavernRoughAmpQ10; // 1331 (~1.30)
 
-// --- site depth safety window (design doc §3.6) -----------------------------
-
-// Worst-case vertical reach of any child ellipsoid from the anchor, in either
-// direction: offset (up to +/-3 m) plus the widest possible radius (6 m).
-inline constexpr int64_t kCavernMaxVerticalReachMm =
-    kCavernChildOffsetZMaxMm + kCavernRzMaxMm; // 9000
-// Roof/bedrock margins the SITE itself must clear before any per-voxel clamp
-// is even consulted (2 m of extra headroom past the ordinary clamps, design
-// doc §3.6).
+// --- child-0 depth safety window (design doc §3.6) --------------------------
+// Only child 0 needs this: it is the only room tied to the shallow (9-34 m)
+// tunnel-node depth, so it is the only one that can threaten the roof.
+// Deliberately NOT bounded above by any assumed bedrock depth (see the
+// header comment's post-design-change note #1) -- the natural ceiling is
+// simply caveNode()'s own depth range; going deeper than that never happens
+// because node.depthMm cannot produce it.
 inline constexpr int64_t kCavernRoofSafetyMarginMm = 2000;
-inline constexpr int64_t kCavernBedrockSafetyMarginMm = 2000;
-inline constexpr int64_t kCavernBedrockCeilingMm = 38000; // shallowest bedrock the amplifier can produce, minus nothing yet
-// Only node depths in this window can host a full-size cavern without the
-// geometry alone (before any per-voxel clamp) violating roof or bedrock.
 inline constexpr int64_t kCavernNodeDepthSafeMinMm =
-    kCaveRoofMinMm + kCavernRoofSafetyMarginMm + kCavernMaxVerticalReachMm; // 17000
+    kCaveRoofMinMm + kCavernRoofSafetyMarginMm + kCavernRz0MaxMm; // 6000+2000+10000 = 18000
 inline constexpr int64_t kCavernNodeDepthSafeMaxMm =
-    kCavernBedrockCeilingMm - kCavernBedrockSafetyMarginMm - kCavernMaxVerticalReachMm; // 27000
+    kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm; // 34000, caveNode()'s own ceiling
 
 // --- candidate reach (design doc §3.4) --------------------------------------
 
-// Safe (non-tight) bound on the worst-case 2D offset magnitude of a child
-// from the anchor. The true worst case is 8000*sqrt(2) =~ 11314 mm (both
-// axes hashed independently to +/-8000); 12000 mm is a round, easily-verified
-// upper bound (12000^2 >= 2*8000^2) chosen to avoid a sqrt in constexpr
-// integer code — being conservative here only widens the candidate net, it
-// never risks missing a real site.
-inline constexpr int64_t kCavernMaxOffsetMagnitudeMm = 12000;
-// Safe bound on the widest a roughened child radius can reach: rxyMax scaled
-// by the roughness ceiling (linear, not the tighter sqrt(roughness) the
-// marginSq formula implies — again conservative on purpose).
-inline constexpr int64_t kCavernMaxReachMm =
-    kCavernMaxOffsetMagnitudeMm + (kCavernRxyMaxMm * kCavernRoughMaxQ10) / 1024;
+// Safe bound on the widest a roughened room radius can reach from the anchor
+// (there is no per-child xy offset any more -- every room shares the
+// anchor's xy, see "why coaxial" above -- so this is purely the widest
+// radius scaled by the roughness ceiling; linear, not the tighter
+// sqrt(roughness) the marginSq formula implies -- conservative on purpose).
+inline constexpr int64_t kCavernMaxReachMm = (kCavernRxyMaxMm * kCavernRoughMaxQ10) / 1024;
 inline constexpr int64_t kCavernMaxReachSqMm = kCavernMaxReachMm * kCavernMaxReachMm;
 
-// --- flood level (design doc §5.1) ------------------------------------------
+// --- flood level (design doc §5.1, approved as designed) --------------------
 
-inline constexpr int64_t kCavernFloodMinMm = 800;  // 0.8 m above the highest child floor
+inline constexpr int64_t kCavernFloodMinMm = 800;  // 0.8 m above the highest room floor
 inline constexpr int64_t kCavernFloodSpanMm = 2400; // -> [0.8, 3.2) m
 // 40% of open sites are dry, rounded down from 0.4 * 2^32 in pure integer
 // math (no floating literal, per the float-ban): a uniform top-32-bit hash
@@ -226,24 +279,24 @@ inline constexpr int32_t kMaxCavernSegs = 6;
 
 // --- structural invariants, checked at compile time -------------------------
 
-// Every child overlaps child 0 (which sits on the anchor with radius >= the
-// minimum), so the K-ellipsoid union is one connected blob. Compared as
-// squares so no sqrt is needed: worst-case offset magnitude^2 vs (rxyMin +
-// rxyMin)^2.
-static_assert(2 * kCavernChildOffsetXYMaxMm * kCavernChildOffsetXYMaxMm <
-                  4 * kCavernRxyMinMm * kCavernRxyMinMm,
-              "every non-root child must overlap child 0, or the K-ellipsoid "
-              "cluster is not guaranteed connected");
+// Chain overlap, step 0->1: child 1 must overlap child 0 for EVERY possible
+// hash draw. Coaxial (dxy=0), so overlap is the exact 1D test
+// stepDown < rz0 + rz1; checked against the worst case (both radii and the
+// step at their least/most overlap-hostile values).
+static_assert(kCavernStepDownMinMm + kCavernStepDownSpanMm < kCavernRz0MinMm + kCavernRzDeepMinMm,
+              "child 1 must overlap child 0 (coaxial 1D interval test) for every "
+              "possible hashed radius/step, or the chain is not guaranteed connected");
+// Chain overlap, steps 1->2 and 2->3: both ends use the "deep room" range.
+static_assert(kCavernStepDownMinMm + kCavernStepDownSpanMm < 2 * kCavernRzDeepMinMm,
+              "consecutive deep rooms must overlap for every possible hashed radius/"
+              "step, or the chain is not guaranteed connected");
 
 // The depth safety window must be non-empty and must sit inside the range
-// caveNode() can actually produce (kCaveNodeDepthMinMm ..
-// +kCaveNodeDepthSpanMm) -- otherwise no site could ever pass it, or the
-// "safe" window could silently extend outside what caveNode() ever returns.
+// caveNode() can actually produce (kCaveNodeDepthMinMm..+kCaveNodeDepthSpanMm)
+// -- otherwise no site could ever pass it.
 static_assert(kCavernNodeDepthSafeMinMm < kCavernNodeDepthSafeMaxMm,
               "cavern depth safety window must be non-empty");
 static_assert(kCavernNodeDepthSafeMinMm >= kCaveNodeDepthMinMm,
-              "cavern depth safety window must sit inside caveNode()'s range");
-static_assert(kCavernNodeDepthSafeMaxMm <= kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm,
               "cavern depth safety window must sit inside caveNode()'s range");
 
 // The 2x2 corner block is only exhaustive while nothing further away can
@@ -262,15 +315,15 @@ static_assert(2 * kCavernMaxReachMm < kCavernCoarseMm - kCaveLatticeMm,
 // --- hash channels -----------------------------------------------------------
 // Extends caves.h's registry (18..21, 24 reserved for CH_CREVICE in
 // caves.h). APPEND ONLY, never renumber.
-inline constexpr uint32_t CH_CAVERN_SITE = 22;  // per-child geometry (offset/radii/floor)
+inline constexpr uint32_t CH_CAVERN_SITE = 22;  // per-room geometry (radii/floor/step)
 inline constexpr uint32_t CH_CAVERN_ROUGH = 23; // per-column wall roughness
 inline constexpr uint32_t CH_CAVERN_FLOOD = 25; // per-site flood level
 
 // --- small helpers -----------------------------------------------------------
 
 // Unsigned 10-bit field -> [0, spanMm), multiply-then-shift (never a
-// division), matching caveNode()'s 20-bit fields but narrower since a site
-// needs six independent fields out of one 64-bit hash.
+// division), matching caveNode()'s 20-bit fields but narrower since a room
+// needs at most four independent fields out of one 64-bit hash.
 constexpr int64_t cavernHashField10(uint64_t h, int32_t shift, int64_t spanMm) {
     return static_cast<int64_t>((((h >> shift) & 0x3FFu) * static_cast<uint64_t>(spanMm)) >> 10);
 }
@@ -279,24 +332,27 @@ constexpr int64_t cavernHashField10(uint64_t h, int32_t shift, int64_t spanMm) {
 
 // True if the backbone-crossing node (fi, fj) is a cavern site candidate
 // (folded into the node-jitter hash — see the constant comment above). Caller
-// must already know (fi & 3) == 0 && (fj & 3) == 0; every caller here
+// must already know (fi & 7) == 0 && (fj & 7) == 0; every caller here
 // constructs fi/fj that way by construction, so no runtime mask check.
 constexpr bool cavernSiteGateOpen(uint64_t seed, int64_t fi, int64_t fj) {
     return ((hash2(seed, fi, fj, CH_CAVE_NODE) >> 60) & kCavernSiteGateMask) == 0;
 }
 
-// True if a node at this depth can host a full-size cavern without the
-// geometry alone (before any per-voxel clamp) violating roof or bedrock.
+// True if a node at this depth can host child 0 (the entrance chamber, tied
+// to this exact depth) without its geometry alone -- before any per-voxel
+// clamp -- violating the roof. See the safety-window constant comments for
+// why there is no bedrock-side bound here.
 constexpr bool cavernDepthIsSafe(int64_t nodeDepthMm) {
     return nodeDepthMm >= kCavernNodeDepthSafeMinMm && nodeDepthMm <= kCavernNodeDepthSafeMaxMm;
 }
 
-// --- per-site geometry (the ~4% "full reduction" tier) ----------------------
+// --- per-site geometry (the rare "full reduction" tier) ---------------------
 
 struct CavernChild {
-    int64_t xMm = 0, yMm = 0, zMm = 0; // absolute center
-    int64_t rxyMm = 0, rzMm = 0;       // semi-axes (rx == ry: oblate spheroid)
-    int64_t zFloorMm = 0;             // absolute flat-floor clamp
+    int64_t zMm = 0;     // absolute center (xy is always the site's anchor xy)
+    int64_t rxyMm = 0;   // horizontal semi-axis (rx == ry: oblate spheroid)
+    int64_t rzMm = 0;    // vertical semi-axis
+    int64_t zFloorMm = 0; // absolute flat-floor clamp, own-center-relative
 };
 
 struct CavernSite {
@@ -317,6 +373,11 @@ struct CavernSite {
 // "at most one site in reach" static_assert above) and only after the cheap
 // gate/depth/xy-reach checks in `cavernColumnFor` already passed — this is
 // the one place in the whole cavern pass that reads the terrain raster.
+//
+// Every room after child 0 chains directly below the PREVIOUS room (same
+// xy — "why coaxial" in the header comment), so the whole site's footprint
+// is exactly the anchor's xy for every room; only the per-room z, radii and
+// floor vary.
 template <typename SurfaceFn>
 constexpr CavernSite cavernSiteFor(uint64_t seed, int64_t fi, int64_t fj, const CaveNode& node,
                                     const SurfaceFn& surfaceAt) {
@@ -329,37 +390,36 @@ constexpr CavernSite cavernSiteFor(uint64_t seed, int64_t fi, int64_t fj, const 
     site.anchorZMm = static_cast<int64_t>(siteSurfaceMm) - node.depthMm;
 
     int64_t maxFloorZMm = INT64_MIN;
+    int64_t prevZMm = site.anchorZMm;
     for (int32_t c = 0; c < kCavernChildCount; ++c) {
         const uint64_t h = hash3(seed, fi, fj, c, CH_CAVERN_SITE);
         const bool isRoot = (c == 0);
-        const int64_t offXMm =
-            isRoot ? 0
-                   : cavernHashField10(h, 0, 2 * kCavernChildOffsetXYMaxMm) - kCavernChildOffsetXYMaxMm;
-        const int64_t offYMm =
-            isRoot ? 0
-                   : cavernHashField10(h, 10, 2 * kCavernChildOffsetXYMaxMm) - kCavernChildOffsetXYMaxMm;
-        const int64_t offZMm =
-            isRoot ? 0
-                   : cavernHashField10(h, 20, 2 * kCavernChildOffsetZMaxMm) - kCavernChildOffsetZMaxMm;
-        const int64_t rxyMm = kCavernRxyMinMm + cavernHashField10(h, 30, kCavernRxySpanMm);
-        const int64_t rzMm = kCavernRzMinMm + cavernHashField10(h, 40, kCavernRzSpanMm);
+
+        const int64_t rxyMm = kCavernRxyMinMm + cavernHashField10(h, 0, kCavernRxySpanMm);
+        const int64_t rzMm = isRoot ? kCavernRz0MinMm + cavernHashField10(h, 10, kCavernRz0SpanMm)
+                                     : kCavernRzDeepMinMm + cavernHashField10(h, 10, kCavernRzDeepSpanMm);
         const int64_t floorDropMm =
-            kCavernFloorDropMinMm + cavernHashField10(h, 50, kCavernFloorDropSpanMm);
+            kCavernFloorDropMinMm + cavernHashField10(h, 20, kCavernFloorDropSpanMm);
+        const int64_t stepDownMm =
+            isRoot ? 0 : kCavernStepDownMinMm + cavernHashField10(h, 30, kCavernStepDownSpanMm);
+
+        const int64_t zMm = isRoot ? site.anchorZMm : prevZMm - stepDownMm;
+        prevZMm = zMm;
 
         CavernChild& ch = site.children[c];
-        ch.xMm = site.anchorXMm + offXMm;
-        ch.yMm = site.anchorYMm + offYMm;
-        ch.zMm = site.anchorZMm + offZMm;
+        ch.zMm = zMm;
         ch.rxyMm = rxyMm;
         ch.rzMm = rzMm;
-        ch.zFloorMm = site.anchorZMm - floorDropMm;
+        ch.zFloorMm = zMm - floorDropMm;
         if (ch.zFloorMm > maxFloorZMm) maxFloorZMm = ch.zFloorMm;
     }
 
-    // Flood level: 40% dry, else a level a bit above the highest child floor,
-    // clamped below the anchor (air above the lake) and above zero (the
-    // implicit ocean owns z<0; the min-surface gate keeps sites inland of it
-    // anyway, this is just a defensive floor).
+    // Flood level: 40% dry, else a level a bit above the highest room floor
+    // (typically child 0's, the shallowest room -- so a wet site reads as a
+    // flooded shaft, submerged from the deepest room up to just under the
+    // entrance), clamped below the anchor (air above the lake) and above
+    // zero (the implicit ocean owns z<0; the min-surface gate keeps sites
+    // inland of it anyway, this is just a defensive floor).
     const uint64_t floodHash = hash2(seed, fi, fj, CH_CAVERN_FLOOD);
     if (static_cast<uint32_t>(floodHash >> 32) >= kCavernFloodDryThreshold32) {
         const int64_t floodMm =
@@ -375,7 +435,7 @@ constexpr CavernSite cavernSiteFor(uint64_t seed, int64_t fi, int64_t fj, const 
 
 struct CavernSeg {
     int32_t marginSq = 0;  // rz^2 * (roughened rxy^2 - xyDist^2) / roughened rxy^2, > 0
-    int32_t zCenterMm = 0; // ABSOLUTE z of the child center
+    int32_t zCenterMm = 0; // ABSOLUTE z of the room center
     int32_t zFloorMm = 0;  // ABSOLUTE floor clamp
 };
 
@@ -385,7 +445,7 @@ struct CavernColumn {
     int32_t floodZMm = INT32_MIN; // INT32_MIN = dry (or no site in reach)
 };
 
-// Every cavern child within reach of column (vx, vy), reduced to the two
+// Every cavern room within reach of column (vx, vy), reduced to the two
 // int32s the per-voxel test needs plus the flat-floor clamp. `surfaceMm` is
 // the QUERYING column's own terrain height (the ordinary ocean/beach guard,
 // caves.h's kCaveMinSurfaceMm — deliberately the more permissive threshold;
@@ -393,7 +453,7 @@ struct CavernColumn {
 // surface inside `cavernSiteFor`). `surfaceAt` is threaded through to
 // `cavernSiteFor` — see its comment for the contract.
 //
-// Iteration order (dj, di, then child index) is part of the worldgen
+// Iteration order (dj, di, then room index) is part of the worldgen
 // contract, mirrored bit-exactly in the eventual HLSL port.
 template <typename SurfaceFn>
 constexpr CavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, int32_t surfaceMm,
@@ -408,8 +468,8 @@ constexpr CavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, in
 
     for (int32_t dj = 0; dj < 2; ++dj) {
         for (int32_t di = 0; di < 2; ++di) {
-            const int64_t fi = (si + di) * 4;
-            const int64_t fj = (sj + dj) * 4;
+            const int64_t fi = (si + di) * kCavernCoarseLatticeRatio;
+            const int64_t fj = (sj + dj) * kCavernCoarseLatticeRatio;
 
             // Cheapest reject first: the gate bit folded into the node-
             // jitter hash (no separate hash call, see kCavernSiteGateMask).
@@ -418,9 +478,12 @@ constexpr CavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, in
             const CaveNode node = caveNode(seed, fi, fj);
             if (!cavernDepthIsSafe(node.depthMm)) continue;
 
+            // Every room in the chain shares this xy (see "why coaxial"), so
+            // this distance is computed ONCE per column, not once per room.
             const int64_t ex = xMm - node.xMm;
             const int64_t ey = yMm - node.yMm;
-            if (ex * ex + ey * ey > kCavernMaxReachSqMm) continue;
+            const int64_t dxySq = ex * ex + ey * ey;
+            if (dxySq > kCavernMaxReachSqMm) continue;
 
             // Full reduction: the one place surfaceAt() (a terrain raster
             // read) is called. At most one corner per column ever reaches
@@ -429,7 +492,7 @@ constexpr CavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, in
             if (!site.valid) continue;
 
             // Wall roughness: one 2D value-noise sample for this column,
-            // shared by every child of this site.
+            // shared by every room of this site.
             const int64_t roughQ10 = clampi64(
                 1024 + valueNoise2(seed, xMm, yMm, kCavernRoughLatticeMm, CH_CAVERN_ROUGH) *
                            kCavernRoughAmpQ10 / 32768,
@@ -437,12 +500,9 @@ constexpr CavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, in
 
             for (int32_t c = 0; c < kCavernChildCount; ++c) {
                 const CavernChild& ch = site.children[c];
-                const int64_t cex = xMm - ch.xMm;
-                const int64_t cey = yMm - ch.yMm;
-                const int64_t dxySq = cex * cex + cey * cey;
                 const int64_t rxySq = ch.rxyMm * ch.rxyMm;
                 const int64_t rxySqRough = rxySq * roughQ10 / 1024;
-                if (dxySq >= rxySqRough) continue; // this child doesn't reach here
+                if (dxySq >= rxySqRough) continue; // this room doesn't reach here
                 const int64_t marginSq = ch.rzMm * ch.rzMm * (rxySqRough - dxySq) / rxySqRough;
                 if (marginSq <= 0) continue;
                 if (out.count < kMaxCavernSegs) {
@@ -463,7 +523,9 @@ constexpr CavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, in
 // True if voxel (.., vz) of this column should become MAT_AIR. Same guard
 // order/shape as caves.h's caveCarveAt, and — per the header comment above —
 // these clamps are load-bearing here, not just backstops: `surfaceMm` /
-// `bedrockDepthMm` are the QUERYING column's own values.
+// `bedrockDepthMm` are the QUERYING column's own values, and `bedrockDepthMm`
+// is a runtime parameter with no compile-time assumption baked in anywhere
+// in this file (see the post-design-change note #1 at the top).
 constexpr bool cavernCarveAt(const CavernColumn& col, int32_t surfaceMm, int32_t bedrockDepthMm,
                               int64_t vz) {
     if (col.count == 0) return false;
@@ -485,7 +547,7 @@ constexpr bool cavernCarveAt(const CavernColumn& col, int32_t surfaceMm, int32_t
     return false;
 }
 
-// --- underground water (design doc §5.1) ------------------------------------
+// --- underground water (design doc §5.1, approved as designed) -------------
 
 // Half of the "implicit static water" predicate: true if voxel (.., vz) sits
 // below this column's flood level. The other half — that the voxel is cave
