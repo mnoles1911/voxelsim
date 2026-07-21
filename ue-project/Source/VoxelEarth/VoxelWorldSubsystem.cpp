@@ -930,6 +930,20 @@ struct FVoxelWorldImpl
 	TArray<VoxelCoords::FVoxelLevelChunkKey> PendingJobKeys;        // worker-dispatch pending (any level, minus edited-ancestor chunks)
 	TArray<VoxelCoords::FVoxelLevelChunkKey> PendingGameThreadKeys; // overlay-aware game-thread mesh pending -- ANY level as of
 	                                                                 // M2 wave 2 (see MarkChunkDirtyForRemesh/PropagateEditToMips)
+	// SortPendingQueues' decorate-sort-undecorate scratch (see its body): kept
+	// as members purely to reuse the allocation across the ~8 calls/second.
+	struct FSortEntry
+	{
+		double DistSq;
+		VoxelCoords::FVoxelLevelChunkKey Key;
+	};
+	TArray<FSortEntry> SortScratchJob;
+	TArray<FSortEntry> SortScratchGameThread;
+
+	// RecomputeDesiredSet's per-call eviction set (see its batched queue-filter
+	// pass); a member only to reuse the allocation.
+	TSet<VoxelCoords::FVoxelLevelChunkKey> EvictedThisCall;
+
 	TArray<VoxelCoords::FVoxelLevelChunkKey> PendingUnloadKeys;
 	TSet<VoxelCoords::FVoxelLevelChunkKey> PendingUnloadSet; // de-dupes PendingUnloadKeys across recomputes
 
@@ -980,6 +994,32 @@ struct FVoxelWorldImpl
 	// ChunkRecords, no candidate generation) still runs every call.
 	bool bHasRecomputedLevel[VoxelCoords::kNumLevels] = {};
 	VoxelCoords::FVoxelChunkKey LastAnchorChunkPerLevel[VoxelCoords::kNumLevels] = {};
+
+	// ComputeFootprintChunkZRange memo (docs/status.md "R3/R4 recompute
+	// amortization"). That function is a PURE function of (Level, ChunkX,
+	// ChunkY) and the amplifier -- and the amplifier is a pure function of the
+	// seed, fixed for the subsystem's lifetime; edits live in the overlay and
+	// never move terrain elevation. So caching it cannot change which chunks
+	// are desired, only how long it takes to decide. It is worth caching
+	// because consecutive entry scans re-visit almost the same annulus: a
+	// one-chunk anchor step changes only the annulus MARGIN (~40 of ~1250
+	// level-0 footprints), yet the uncached scan re-samples the amplifier at 4
+	// corners for every footprint, every time.
+	//
+	// Keyed with Z=0 (the value IS the Z range, so Z is not part of the input).
+	struct FFootprintZRange
+	{
+		int32 ChunkZMin = 0;
+		int32 ChunkZMax = 0;
+	};
+	mutable TMap<VoxelCoords::FVoxelLevelChunkKey, FFootprintZRange> FootprintZRangeCache;
+
+	// Bound on the memo above. The live working set is the union of all five
+	// annuli, ~5k footprints; this cap leaves an order of magnitude of slack
+	// for drift before PruneFootprintZRangeCache drops the entries that are
+	// far from the anchor (a distance-based prune rather than a full clear, so
+	// pruning never costs a re-sample burst).
+	static constexpr int32 FootprintZRangeCacheMaxEntries = 65536;
 
 	// Cumulative counters, logged periodically (LogVoxelPerf, every ~5s) --
 	// never per-chunk (docs/m1-plan.md: "log cumulative ... periodically").
@@ -1043,6 +1083,39 @@ struct FVoxelWorldImpl
 	float ThisFrameApplyMs = 0.f;
 	float ThisFrameRemeshMs = 0.f;
 	float ThisFrameUnloadMs = 0.f;
+
+	// M1 steady-state-hitch wave (docs/status.md "R3/R4 recompute
+	// amortization"): the four Drain*/Dispatch timers above cover everything
+	// TickStreaming does EXCEPT RecomputeDesiredSet, which is why the M1 gate's
+	// residual ~14-15ms `subsystemTickMs` hitches showed up as unattributed
+	// tick time. These break that call down into its three stages (exit
+	// hysteresis scan / per-level entry scan / pending-queue sort) so the cost
+	// can be attributed to a specific ring level before anything is changed.
+	// Same always-collected, log-only-on-hitch policy as the timers above.
+	float ThisFrameRecomputeMs = 0.f;
+	float ThisFrameExitScanMs = 0.f;
+	float ThisFrameSortMs = 0.f;
+	float ThisFrameLevelEntryMs[VoxelCoords::kNumLevels] = {};
+	int32 ThisFrameLevelFootprints[VoxelCoords::kNumLevels] = {}; // in-annulus XY footprints visited (= ComputeFootprintChunkZRange calls)
+
+	// Running maxima since the last periodic counter log (MaybeLogCounters
+	// resets them): a recompute burst that lands on a frame which does NOT
+	// cross the hitch threshold is invisible to the per-hitch log above, so
+	// these give the cost distribution independent of whether it hitched.
+	float MaxRecomputeMs = 0.f;
+	float MaxExitScanMs = 0.f;
+	float MaxSortMs = 0.f;
+	float MaxLevelEntryMs[VoxelCoords::kNumLevels] = {};
+	int32 LevelEntryScans[VoxelCoords::kNumLevels] = {}; // how many times each level's entry scan actually ran
+	int32 RecomputeCalls = 0;
+
+	// The 60fps bar is 16.6ms, but the hitch log/`UVoxelPerfRunSubsystem`'s
+	// hitch count both use the much looser 33.3ms threshold -- a recurring
+	// ~20-30ms burst is a hard 60fps violation that is completely invisible to
+	// both. Counted here (cumulative + since-last-log) so the gate's actual
+	// criterion can be reported, not just the 33.3ms proxy for it.
+	int64 TotalFramesOver60FpsBar = 0;
+	int32 FramesOver60FpsBarSinceLog = 0;
 
 	// M1 hitch-gap wave (component pooling): AcquireChunkComponent pool hits
 	// (a first-load that reused a parked component instead of NewObject'ing a
@@ -1129,6 +1202,10 @@ private:
 
 	void RecomputeDesiredSet(const FVector& Anchor);
 	void ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax) const;
+	// Memoized wrapper around ComputeFootprintChunkZRange -- see
+	// FootprintZRangeCache's doc comment for why memoizing is exact.
+	void FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax) const;
+	void PruneFootprintZRangeCache(const FVector& Anchor);
 	void SortPendingQueues(const FVector& Anchor);
 	void DispatchJobs();
 	void DrainResults(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material);
@@ -1253,6 +1330,14 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	ThisFrameEditRemeshes = 0;
 	ThisFrameUnloads = 0;
 	ThisFramePoolReuses = 0;
+	ThisFrameRecomputeMs = 0.f;
+	ThisFrameExitScanMs = 0.f;
+	ThisFrameSortMs = 0.f;
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+	{
+		ThisFrameLevelEntryMs[Level] = 0.f;
+		ThisFrameLevelFootprints[Level] = 0;
+	}
 
 	// Recompute the desired set only when the anchor crosses into a new
 	// render-chunk XY column (every ChunkEdgeUU = 3.2m of movement), not
@@ -1333,6 +1418,11 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// a real hitch in normal play is exactly when this diagnostic is most
 	// wanted, and the cost when there is no hitch is one float compare.
 	const float FrameMs = DeltaTime * 1000.f;
+	if (FrameMs > 16.6f) // the actual 60fps gate bar (see TotalFramesOver60FpsBar)
+	{
+		++TotalFramesOver60FpsBar;
+		++FramesOver60FpsBarSinceLog;
+	}
 	if (FrameMs > VoxelDebug::kHitchThresholdMs)
 	{
 		const float ElsewhereMs = FMath::Max(0.f, FrameMs - TickMsSoFar);
@@ -1357,6 +1447,18 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		       FrameMs, VoxelDebug::kHitchThresholdMs, TickMsSoFar, ElsewhereMs, RenderMs, RenderWaitMs, RHIMs, GameWaitMs,
 		       ThisFrameDispatchMs, ThisFrameApplyMs, ThisFrameRemeshMs, ThisFrameUnloadMs, ThisFrameAppliesFromWorker,
 		       ThisFrameProxiesCreated, ThisFrameEditRemeshes, ThisFrameUnloads, ThisFramePoolReuses, ComponentPool.Num());
+
+		// Recompute breakdown (M1 steady-state-hitch wave): the one stage of
+		// TickStreaming the line above does not cover. Split out rather than
+		// widened into that format string so the existing line stays greppable.
+		UE_LOG(LogVoxelPerf, Warning,
+		       TEXT("Hitch frame recompute: recomputeMs=%.2f exitScanMs=%.2f sortMs=%.2f | ")
+		       TEXT("entryMs R0=%.2f R1=%.2f R2=%.2f R3=%.2f R4=%.2f | ")
+		       TEXT("footprints R0=%d R1=%d R2=%d R3=%d R4=%d | tracked=%d"),
+		       ThisFrameRecomputeMs, ThisFrameExitScanMs, ThisFrameSortMs, ThisFrameLevelEntryMs[0], ThisFrameLevelEntryMs[1],
+		       ThisFrameLevelEntryMs[2], ThisFrameLevelEntryMs[3], ThisFrameLevelEntryMs[4], ThisFrameLevelFootprints[0],
+		       ThisFrameLevelFootprints[1], ThisFrameLevelFootprints[2], ThisFrameLevelFootprints[3], ThisFrameLevelFootprints[4],
+		       ChunkRecords.Num());
 	}
 
 	// Visualizations (mode 2 only; every helper early-outs on its own cvar
@@ -1468,6 +1570,29 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       Snap.LevelWorkerMsP50[2], Snap.LevelWorkerMsP95[2], Snap.LevelWorkerMsP50[3], Snap.LevelWorkerMsP95[3],
 	       Snap.LevelWorkerMsP50[4], Snap.LevelWorkerMsP95[4], (long long)Snap.MipCacheBrickCount, (long long)Snap.MipCacheBytes,
 	       (long long)Snap.MipCacheEvictions);
+
+	// M1 steady-state-hitch wave: worst RecomputeDesiredSet cost seen since the
+	// last periodic log, per level. Independent of the hitch log (a burst that
+	// lands on a frame under the 33.3ms threshold is invisible there), so this
+	// is what quantifies "what does R3/R4 recompute cost when it fires".
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel recompute (max since last log): totalMs=%.2f exitScanMs=%.2f sortMs=%.2f calls=%d | ")
+	       TEXT("entryMs R0=%.2f R1=%.2f R2=%.2f R3=%.2f R4=%.2f | scans R0=%d R1=%d R2=%d R3=%d R4=%d | ")
+	       TEXT("tracked=%d pendingJob=%d pendingGT=%d pendingUnload=%d | framesOver16.6ms=%d (total %lld)"),
+	       MaxRecomputeMs, MaxExitScanMs, MaxSortMs, RecomputeCalls, MaxLevelEntryMs[0], MaxLevelEntryMs[1], MaxLevelEntryMs[2],
+	       MaxLevelEntryMs[3], MaxLevelEntryMs[4], LevelEntryScans[0], LevelEntryScans[1], LevelEntryScans[2], LevelEntryScans[3],
+	       LevelEntryScans[4], ChunkRecords.Num(), PendingJobKeys.Num(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num(),
+	       FramesOver60FpsBarSinceLog, (long long)TotalFramesOver60FpsBar);
+	MaxRecomputeMs = 0.f;
+	MaxExitScanMs = 0.f;
+	MaxSortMs = 0.f;
+	RecomputeCalls = 0;
+	FramesOver60FpsBarSinceLog = 0;
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+	{
+		MaxLevelEntryMs[Level] = 0.f;
+		LevelEntryScans[Level] = 0;
+	}
 }
 
 // --- desired-set / hysteresis ------------------------------------------------
@@ -1519,6 +1644,47 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 	const int64 TopVoxelMaxAtLevel = FloorDiv(TopVoxelMax, LevelScale);
 	OutChunkZMin = (int32)FloorDiv(TopVoxelMinAtLevel, ChunkEdgeVoxels) - 1;
 	OutChunkZMax = (int32)FloorDiv(TopVoxelMaxAtLevel, ChunkEdgeVoxels) + 2;
+}
+
+void FVoxelWorldImpl::FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin,
+                                                 int32& OutChunkZMax) const
+{
+	const VoxelCoords::FVoxelLevelChunkKey CacheKey{Level, VoxelCoords::FVoxelChunkKey{ChunkX, ChunkY, 0}};
+	if (const FFootprintZRange* Hit = FootprintZRangeCache.Find(CacheKey))
+	{
+		OutChunkZMin = Hit->ChunkZMin;
+		OutChunkZMax = Hit->ChunkZMax;
+		return;
+	}
+	ComputeFootprintChunkZRange(ChunkX, ChunkY, Level, OutChunkZMin, OutChunkZMax);
+	FootprintZRangeCache.Add(CacheKey, FFootprintZRange{OutChunkZMin, OutChunkZMax});
+}
+
+void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
+{
+	if (FootprintZRangeCache.Num() <= FootprintZRangeCacheMaxEntries)
+	{
+		return;
+	}
+
+	// Drop everything outside twice its level's unload ring: those footprints
+	// cannot re-enter the annulus without a long journey back, and re-sampling
+	// them then costs the same as it did the first time. Cheap relative to what
+	// it protects (a pointer-chasing pass over the map, no amplifier sampling).
+	for (auto It = FootprintZRangeCache.CreateIterator(); It; ++It)
+	{
+		const VoxelCoords::FVoxelLevelChunkKey& Key = It.Key();
+		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[Key.Level];
+		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Key.Level);
+		const double CenterX = (double(Key.Key.X) + 0.5) * ChunkEdge;
+		const double CenterY = (double(Key.Key.Y) + 0.5) * ChunkEdge;
+		const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
+		const double KeepRadiusUU = Preset.OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier * 2.0;
+		if (DistSq > FMath::Square(KeepRadiusUU))
+		{
+			It.RemoveCurrent();
+		}
+	}
 }
 
 bool FVoxelWorldImpl::ChunkHasEditedBrick(const VoxelCoords::FVoxelChunkKey& ChunkKey) const
@@ -1612,23 +1778,51 @@ void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
 	// HIGHEST-priority element (nearest, level 0 on an exact tie) must sort
 	// last (back) -- this predicate returns true when A has lower priority
 	// than B.
-	const auto Farthest = [&](const VoxelCoords::FVoxelLevelChunkKey& A, const VoxelCoords::FVoxelLevelChunkKey& B)
+	// Decorate-sort-undecorate. The obvious form -- Sort() with a predicate that
+	// calls DistSq on both operands -- recomputes the distance on every
+	// COMPARISON, i.e. ~2*n*log2(n) times (measured: 3.2-3.5ms per call on a
+	// ~19k-deep pending queue, ~8 times a second, see docs/status.md "R3/R4
+	// recompute amortization"). Computing each key exactly once instead makes it
+	// n distance computes plus a sort over cached doubles. The ordering is
+	// bit-identical: same primary key (distance, descending), same tie-break
+	// (higher level first), and Sort() was already unstable, so elements equal
+	// under BOTH keys were never in a defined order to begin with.
+	const auto SortQueue = [&DistSq](TArray<VoxelCoords::FVoxelLevelChunkKey>& Queue, TArray<FSortEntry>& Scratch)
 	{
-		const double DistA = DistSq(A);
-		const double DistB = DistSq(B);
-		if (DistA != DistB)
+		Scratch.Reset(Queue.Num());
+		for (const VoxelCoords::FVoxelLevelChunkKey& Key : Queue)
 		{
-			return DistA > DistB; // farther = lower priority = sorts toward the front
+			Scratch.Add(FSortEntry{DistSq(Key), Key});
 		}
-		return A.Level > B.Level; // exact-distance tie: higher level number = lower priority
+		Scratch.Sort(
+		    [](const FSortEntry& A, const FSortEntry& B)
+		    {
+			    if (A.DistSq != B.DistSq)
+			    {
+				    return A.DistSq > B.DistSq; // farther = lower priority = sorts toward the front
+			    }
+			    return A.Key.Level > B.Key.Level; // exact-distance tie: higher level number = lower priority
+		    });
+		for (int32 Index = 0; Index < Scratch.Num(); ++Index)
+		{
+			Queue[Index] = Scratch[Index].Key;
+		}
 	};
-	PendingJobKeys.Sort(Farthest);
-	PendingGameThreadKeys.Sort(Farthest);
+	// Member scratch buffers (not locals): this runs ~8 times a second with
+	// ~19k elements, and reusing the allocation keeps it off the heap churn.
+	SortQueue(PendingJobKeys, SortScratchJob);
+	SortQueue(PendingGameThreadKeys, SortScratchGameThread);
 }
 
 void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 {
 	using namespace VoxelCoords;
+
+	// Stage timing (see the ThisFrameRecomputeMs member's comment): always
+	// collected, a handful of FPlatformTime::Seconds() calls on a path that
+	// only runs on an anchor chunk crossing, never per-frame.
+	const double RecomputeT0 = FPlatformTime::Seconds();
+	EvictedThisCall.Reset();
 
 	// 1. Hysteresis exit: currently-tracked chunks (any level) that drifted
 	// beyond their level's unload ring, OR drifted inside their level's inner
@@ -1659,9 +1853,31 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		{
 			PendingUnloadKeys.Add(LevelKey);
 			PendingUnloadSet.Add(LevelKey);
-			PendingJobKeys.RemoveSingle(LevelKey);
-			PendingGameThreadKeys.RemoveSingle(LevelKey);
+			EvictedThisCall.Add(LevelKey);
 		}
+	}
+
+	// Drop the just-evicted keys from the two pending queues in ONE filtering
+	// pass instead of a TArray::RemoveSingle per eviction. RemoveSingle is a
+	// linear scan, and these queues run ~19k deep during a perf flight (the
+	// worker throughput, not the desired-set size, is what bounds them), so the
+	// old form was O(evictions * queue depth) -- measured as the single largest
+	// component of this function's cost. Same result: at most one copy of a key
+	// can be in a queue (a key is only ever queued right after ChunkRecords.Add,
+	// which is guarded by ChunkRecords.Contains), so "remove all copies" and
+	// "remove one copy" are the same removal here. Queue ORDER is irrelevant --
+	// SortPendingQueues re-sorts both at the end of this function.
+	// Filtered against only the keys evicted by THIS call (not the whole
+	// PendingUnloadSet, which also holds not-yet-drained evictions from earlier
+	// calls -- those were already removed from the queues when they happened,
+	// and a chunk CAN legitimately be re-queued while still in that set, see
+	// DrainUnloads' "raced with a re-add/remesh" branch).
+	if (EvictedThisCall.Num() > 0)
+	{
+		PendingJobKeys.RemoveAllSwap([this](const FVoxelLevelChunkKey& K) { return EvictedThisCall.Contains(K); },
+		                             EAllowShrinking::No);
+		PendingGameThreadKeys.RemoveAllSwap([this](const FVoxelLevelChunkKey& K) { return EvictedThisCall.Contains(K); },
+		                                    EAllowShrinking::No);
 	}
 
 	// 2. Hysteresis entry, per level: XY footprints within level L's annulus
@@ -1676,8 +1892,12 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// chunk is (1<<L) times larger, so re-running this O(candidates) scan on
 	// every level-0 chunk crossing (every 3.2m) would be wasted work for
 	// outer levels once their own chunk hasn't actually changed.
+	const double RecomputeT1 = FPlatformTime::Seconds();
+	ThisFrameExitScanMs = float((RecomputeT1 - RecomputeT0) * 1000.0);
+
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
+		const double LevelT0 = FPlatformTime::Seconds();
 		const FVoxelCoord AnchorVoxel = WorldToVoxelForLevel(Anchor, Level);
 		const FVoxelChunkKey AnchorChunk = ChunkKeyForVoxel(AnchorVoxel);
 		if (bHasRecomputedLevel[Level] && AnchorChunk.X == LastAnchorChunkPerLevel[Level].X &&
@@ -1687,6 +1907,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		}
 		LastAnchorChunkPerLevel[Level] = AnchorChunk;
 		bHasRecomputedLevel[Level] = true;
+		++LevelEntryScans[Level];
 
 		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[Level];
 		const double InnerUU = Preset.InnerMeters * 100.0;
@@ -1706,8 +1927,9 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					continue; // outside this level's annulus
 				}
 
+				++ThisFrameLevelFootprints[Level];
 				int32 ChunkZMin, ChunkZMax;
-				ComputeFootprintChunkZRange(Cx, Cy, Level, ChunkZMin, ChunkZMax);
+				FootprintChunkZRangeCached(Cx, Cy, Level, ChunkZMin, ChunkZMax);
 
 				for (int32 Cz = ChunkZMin; Cz <= ChunkZMax; ++Cz)
 				{
@@ -1729,9 +1951,25 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				}
 			}
 		}
+
+		// Levels that early-`continue`d above (anchor still inside the same
+		// level-L chunk) leave their entry at 0 -- exactly the "did no work"
+		// reading we want.
+		ThisFrameLevelEntryMs[Level] = float((FPlatformTime::Seconds() - LevelT0) * 1000.0);
+		MaxLevelEntryMs[Level] = FMath::Max(MaxLevelEntryMs[Level], ThisFrameLevelEntryMs[Level]);
 	}
 
+	PruneFootprintZRangeCache(Anchor);
+
+	const double SortT0 = FPlatformTime::Seconds();
 	SortPendingQueues(Anchor);
+	const double SortT1 = FPlatformTime::Seconds();
+	ThisFrameSortMs = float((SortT1 - SortT0) * 1000.0);
+	ThisFrameRecomputeMs = float((SortT1 - RecomputeT0) * 1000.0);
+	MaxRecomputeMs = FMath::Max(MaxRecomputeMs, ThisFrameRecomputeMs);
+	MaxExitScanMs = FMath::Max(MaxExitScanMs, ThisFrameExitScanMs);
+	MaxSortMs = FMath::Max(MaxSortMs, ThisFrameSortMs);
+	++RecomputeCalls;
 }
 
 // --- budgeted drains ----------------------------------------------------
