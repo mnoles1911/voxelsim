@@ -6,6 +6,14 @@
 #include "GameFramework/Actor.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
+#include "HAL/PlatformMisc.h"
+#include "HAL/PlatformTime.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
+#include "Serialization/MemoryReader.h"
+#include "Serialization/MemoryWriter.h"
+#include "TimerManager.h"
+#include "UnrealClient.h"
 #include "VoxelCoords.h"
 #include "VoxelEarth.h" // LogVoxelEarth
 #include "VoxelWorldSubsystem.h"
@@ -15,9 +23,13 @@
 // VoxelAgentSubsystem.h's identical PImpl doc comment). pathfind.h is the
 // M6-groundwork windowed voxel A* this subsystem drives (docs/status.md's
 // M6 section) -- consumed as-is, never modified (voxel-core stays
-// engine-free and owned by that other slice).
+// engine-free and owned by that other slice). regiongraph.h is the M6 gap
+// closure this file now ALSO drives for Tier 1 (docs/status.md M6 section
+// "Tier-1 hierarchical planning + NPC replication") -- likewise consumed
+// as-is, never modified.
 #include "voxelcore/core.h"
 #include "voxelcore/pathfind.h"
+#include "voxelcore/regiongraph.h"
 
 namespace
 {
@@ -92,6 +104,32 @@ static TAutoConsoleVariable<bool> CVarVoxelNPCDigEnabled(
 	TEXT("M6: allow Tier 0 NPC agents to execute authoritative Mine/Bridge terrain edits while pathing."),
 	ECVF_Default);
 
+// Tier 1 hierarchical planner toggle (M6 gap closure, docs/status.md M6
+// section "Tier-1 hierarchical planning + NPC replication"): on by default
+// (Tier 1 uses vxc::findHierarchicalPath when the region graph covers the
+// query, PlanPath's fine windowed search otherwise -- see PlanPathTier1).
+// Set to 0 to force EVERY Tier 1 planning call through the pre-M6 fine
+// windowed search regardless of graph coverage -- this is the "before"
+// side of the before/after cost comparison this gap closure needs to
+// report: run the identical -VoxelSwarmTest/-VoxelTier1RegionGraphTest
+// scenario once with this at its default (1) and once with
+// "-ExecCmds=\"voxel.Agent.Tier1RegionGraph.Enabled 0\"", then diff the
+// "VoxelSwarm Tier1 planner:" log lines.
+// DEFAULT OFF (integration decision, 2026-07-21): the region-graph BUILD is
+// currently synchronous and measured at ~160s (256-expansion cap) to >500s
+// (4096 cap, killed) for the 1,875-region box -- dominated by
+// O(regions x portals^2) fine-findPath calls. Enabling this by default would
+// stall the game thread for minutes on the first Tier-1 plan. The planner
+// itself is correct and cheaper per query; it is the one-time build that is
+// unshippable until it is backgrounded/time-sliced (filed as the top M6
+// follow-up in docs/status.md). Flip to 1 to measure/compare.
+static TAutoConsoleVariable<bool> CVarVoxelTier1UseRegionGraph(
+	TEXT("voxel.Agent.Tier1RegionGraph.Enabled"), false,
+	TEXT("M6: Tier 1 agents plan via the hierarchical region-graph planner (regiongraph.h) when the graph covers ")
+	TEXT("the query, falling back to the pre-M6 fine windowed search otherwise. Set to 0 to force ALL Tier 1 ")
+	TEXT("planning through the fine windowed search (before/after cost comparison)."),
+	ECVF_Default);
+
 // PImpl (VoxelAgentSubsystem.h's class comment): the voxel-core state this
 // UHT-parsed header must never see directly.
 struct FVoxelAgentImpl
@@ -125,6 +163,34 @@ struct FVoxelAgentImpl
 	// always get NavConfig regardless of the cvar.
 	vxc::PathCostConfig DigConfig;
 	vxc::PathCostConfig NavConfig;
+
+	// --- Tier 1 hierarchical region-graph planner (M6 gap closure) ---------
+	// See UVoxelAgentSubsystem.h's Tier1Graph* constants doc comment for the
+	// extent/lifetime design and EnsureTier1RegionGraph/PlanPathTier1 (.cpp,
+	// below) for the build/query/fallback logic.
+	vxc::RegionGraph Tier1RegionGraph;
+	bool bTier1GraphValid = false;
+	// World-space (ground-projected) center the graph was last (re)built
+	// around -- EnsureTier1RegionGraph rebuilds once the player's ground
+	// column drifts UVoxelAgentSubsystem::Tier1GraphRebuildTriggerUU away
+	// from this cached value.
+	FVector Tier1GraphCenterWorld = FVector::ZeroVector;
+	// Dirty invalidation, player/M5-edit case (PollWorldEditsForTier1DirtyRegions's
+	// doc comment, UVoxelAgentSubsystem.h): UVoxelWorldSubsystem::GetLogSize()
+	// as of the last time this subsystem checked it (or the graph's last
+	// (re)build, whichever is more recent) -- a poll-based "did ANYTHING
+	// change" signal, since no delegate reports WHERE.
+	uint64 LastSeenEditLogSize = 0;
+
+	// Tier 1 planning-cost measurement (docs/status.md M6 section "measure
+	// it"): running totals split by which planner actually served the call --
+	// logged periodically (Tick, same cadence as the existing convergence
+	// log) as an average expansions/call for each side, the real "before
+	// (fine fallback) vs after (hierarchical)" comparison number.
+	int64 Tier1HierarchicalCalls = 0;
+	int64 Tier1HierarchicalExpansionsTotal = 0;
+	int64 Tier1FineFallbackCalls = 0;
+	int64 Tier1FineFallbackExpansionsTotal = 0;
 };
 
 UVoxelAgentSubsystem::UVoxelAgentSubsystem() = default;
@@ -205,6 +271,125 @@ void UVoxelAgentSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	if (!InWorld.IsGameWorld() || !Impl)
 	{
 		return;
+	}
+
+	// M6 gap closure verification switches (docs/status.md M6 section
+	// "Tier-1 hierarchical planning + NPC replication") -- parsed here (a
+	// UWorldSubsystem), NOT AVoxelEarthGameMode, specifically because they
+	// must run on EVERY net mode including a pure remote client, and
+	// GameMode only ever exists on the authority (see this method's
+	// dedicated-server branch below for the analogous "sim always, render
+	// never" split this module already uses).
+	//
+	// -VoxelDumpAgentsAfter=<seconds>: logs role=Server/Client (from THIS
+	// process's own GetNetMode()), agent count, and the first few agents'
+	// (sorted by AgentId/pool-index) raw world positions + tier -- the
+	// "two clients dig the same hole"-style position-agreement evidence
+	// (docs/m3-plan.md), just for NPC state instead of terrain edits. A
+	// SERVER process reads straight from the authoritative Agents pool; a
+	// CLIENT process reads from ClientAgents (the replicated-state mirror,
+	// see ApplyReplicatedAgentSnapshot) -- comparing the two processes' log
+	// lines (run with roughly the same -VoxelDumpAgentsAfter delay) is the
+	// verification. Self-quits 5s after dumping, same convenience pattern as
+	// every other headless-run verification switch in this module
+	// (UVoxelWorldSubsystem::SaveWorld/AVoxelEarthGameMode's -VoxelDumpDigestAfter).
+	float DumpAgentsAfterSeconds = 0.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelDumpAgentsAfter="), DumpAgentsAfterSeconds) && DumpAgentsAfterSeconds > 0.f)
+	{
+		InWorld.GetTimerManager().SetTimer(
+			DumpAgentsTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this]()
+				{
+					UWorld* DumpWorld = GetWorld();
+					if (!DumpWorld)
+					{
+						return;
+					}
+					const bool bIsClient = DumpWorld->GetNetMode() == NM_Client;
+					const TCHAR* RoleStr = bIsClient ? TEXT("Client") : TEXT("Server");
+
+					if (bIsClient)
+					{
+						TArray<int32> Ids;
+						ClientAgents.GetKeys(Ids);
+						Ids.Sort();
+						UE_LOG(LogVoxelEarth, Log, TEXT("VoxelAgentDump: role=%s count=%d"), RoleStr, Ids.Num());
+						for (int32 i = 0; i < FMath::Min(5, Ids.Num()); ++i)
+						{
+							const FVoxelAgentClientView& View = ClientAgents[Ids[i]];
+							UE_LOG(LogVoxelEarth, Log,
+							       TEXT("VoxelAgentDump: role=%s agentId=%d pos=(%.1f,%.1f,%.1f) tier=%d"),
+							       RoleStr, Ids[i], View.TargetPosition.X, View.TargetPosition.Y, View.TargetPosition.Z,
+							       View.Tier);
+						}
+					}
+					else
+					{
+						UE_LOG(LogVoxelEarth, Log, TEXT("VoxelAgentDump: role=%s count=%d"), RoleStr, Agents.Num());
+						for (int32 i = 0; i < FMath::Min(5, Agents.Num()); ++i)
+						{
+							const FVoxelAgent& Agent = Agents[i];
+							UE_LOG(LogVoxelEarth, Log,
+							       TEXT("VoxelAgentDump: role=%s agentId=%d pos=(%.1f,%.1f,%.1f) tier=%d"),
+							       RoleStr, i, Agent.Position.X, Agent.Position.Y, Agent.Position.Z, (int32)Agent.Tier);
+						}
+					}
+
+					UWorld* QuitWorld = GetWorld();
+					if (QuitWorld)
+					{
+						QuitWorld->GetTimerManager().SetTimer(
+							DumpAgentsQuitTimerHandle,
+							FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(/*bForce*/ false); }), 5.f, false);
+					}
+				}),
+			DumpAgentsAfterSeconds, false);
+	}
+
+	// -VoxelClientScreenshotAfter=<seconds>: a CLIENT-capable counterpart to
+	// AVoxelEarthGameMode's existing -VoxelScreenshotAfter (which can never
+	// fire on a pure remote client process -- AGameModeBase only ever exists
+	// on the authority). Deliberately a SEPARATE switch name, not a
+	// second handler for the same -VoxelScreenshotAfter flag, so a
+	// standalone/listen-server run's existing screenshot behavior (relied on
+	// by every other milestone's verification) is never touched by this
+	// slice. Aims the local camera down at the swarm, requests one capture,
+	// then quits -- same shape as GameMode's Capture lambda, minus the
+	// per-test-fixture framing branches this subsystem has no need of.
+	float ClientScreenshotAfterSeconds = 0.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelClientScreenshotAfter="), ClientScreenshotAfterSeconds) &&
+	    ClientScreenshotAfterSeconds > 0.f)
+	{
+		InWorld.GetTimerManager().SetTimer(
+			ClientScreenshotTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this]()
+				{
+					UWorld* ShotWorld = GetWorld();
+					if (!ShotWorld || ShotWorld->GetNetMode() == NM_DedicatedServer)
+					{
+						return; // no viewport to capture from
+					}
+					if (APlayerController* PC = ShotWorld->GetFirstPlayerController())
+					{
+						PC->SetControlRotation(FRotator(-35.f, 0.f, 0.f));
+						if (APawn* P = PC->GetPawn())
+						{
+							P->SetActorRotation(FRotator(-35.f, 0.f, 0.f));
+						}
+					}
+					FScreenshotRequest::RequestScreenshot(TEXT("VoxelClientSwarm"), false, true);
+
+					UWorld* QuitWorld = GetWorld();
+					if (QuitWorld)
+					{
+						QuitWorld->GetTimerManager().SetTimer(
+							ClientScreenshotQuitTimerHandle,
+							FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(/*bForce*/ false); }), 4.f, false);
+					}
+				}),
+			ClientScreenshotAfterSeconds, false);
 	}
 
 	// Dedicated server: no viewport, so no cosmetic ISM -- but the swarm
@@ -490,6 +675,317 @@ bool UVoxelAgentSubsystem::PlanPath(int32 AgentIndex, UVoxelWorldSubsystem& Terr
 	return Agent.Waypoints.Num() > 0;
 }
 
+void UVoxelAgentSubsystem::EnsureTier1RegionGraph(UVoxelWorldSubsystem& Terrain, const FVector& PlayerWorldPos)
+{
+	if (!Impl)
+	{
+		return;
+	}
+
+	// Ground-projected center (Tick's own GoalWorldPos philosophy, see its
+	// class comment): agents are ground-snapped, so the graph should be
+	// centered on the terrain surface near the player, not the player's
+	// possibly-airborne Z.
+	const double GroundZ = Terrain.GetSurfaceHeightUU(PlayerWorldPos.X, PlayerWorldPos.Y);
+	const FVector GraphCenterWorld(PlayerWorldPos.X, PlayerWorldPos.Y, GroundZ);
+
+	if (Impl->bTier1GraphValid &&
+	    FVector::DistSquared(GraphCenterWorld, Impl->Tier1GraphCenterWorld) <= FMath::Square(Tier1GraphRebuildTriggerUU))
+	{
+		return; // cached graph still covers this area -- no rebuild due
+	}
+
+	const VoxelCoords::FVoxelCoord CenterVoxel = VoxelCoords::WorldToVoxel(GraphCenterWorld);
+	const vxc::PathCoord CenterPath{CenterVoxel.X, CenterVoxel.Y, CenterVoxel.Z};
+	const vxc::RegionCoord CenterRegion = vxc::regionOfVoxel(CenterPath);
+
+	const vxc::RegionCoord MinRegion{CenterRegion.x - Tier1GraphHorizontalRadiusRegions,
+	                                   CenterRegion.y - Tier1GraphHorizontalRadiusRegions,
+	                                   CenterRegion.z - Tier1GraphVerticalRadiusRegions};
+	const vxc::RegionCoord MaxRegion{CenterRegion.x + Tier1GraphHorizontalRadiusRegions,
+	                                   CenterRegion.y + Tier1GraphHorizontalRadiusRegions,
+	                                   CenterRegion.z + Tier1GraphVerticalRadiusRegions};
+
+	UVoxelWorldSubsystem* TerrainPtr = &Terrain;
+	const auto SolidFn = [TerrainPtr](int64 X, int64 Y, int64 Z) -> vxc::MaterialId
+	{
+		return TerrainPtr->IsSolidAtVoxel(X, Y, Z) ? kSolidSentinelMaterial : vxc::MAT_AIR;
+	};
+
+	// NavConfig, not DigConfig: Tier 1 never plans with Mine/Bridge enabled
+	// (see the class comment "Rate limiting -- tier restriction") -- the
+	// abstract graph's portals/edges must reflect the SAME walkability
+	// notion Tier 1's own findHierarchicalPath call below will query with.
+	const double StartSeconds = FPlatformTime::Seconds();
+	Impl->Tier1RegionGraph = vxc::buildRegionGraph(SolidFn, MinRegion, MaxRegion, Impl->NavConfig, Tier1GraphIntraMaxExpansions);
+	const double ElapsedMs = (FPlatformTime::Seconds() - StartSeconds) * 1000.0;
+
+	Impl->bTier1GraphValid = true;
+	Impl->Tier1GraphCenterWorld = GraphCenterWorld;
+	// A fresh build already reflects the CURRENT world state -- reset the
+	// dirty-poll baseline so PollWorldEditsForTier1DirtyRegions doesn't
+	// immediately re-dirty everything from edits this graph already saw.
+	Impl->LastSeenEditLogSize = Terrain.GetLogSize();
+
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("VoxelSwarm Tier1 region graph (re)built: regions=[%lld..%lld]x[%lld..%lld]x[%lld..%lld] ")
+	       TEXT("(%d portals, %d edges, %lld fine-findPath expansions spent building) in %.2fms"),
+	       MinRegion.x, MaxRegion.x, MinRegion.y, MaxRegion.y, MinRegion.z, MaxRegion.z,
+	       (int32)Impl->Tier1RegionGraph.portals.size(), (int32)Impl->Tier1RegionGraph.edges.size(),
+	       Impl->Tier1RegionGraph.totalFinePathExpansions, ElapsedMs);
+}
+
+bool UVoxelAgentSubsystem::PlanPathTier1(int32 AgentIndex, UVoxelWorldSubsystem& Terrain, const FVector& PlayerWorldPos,
+                                          const FVector& GoalWorldPos)
+{
+	if (!Impl || !Agents.IsValidIndex(AgentIndex))
+	{
+		return false;
+	}
+
+	if (!CVarVoxelTier1UseRegionGraph.GetValueOnGameThread())
+	{
+		// Forced "before" mode (before/after cost comparison, docs/status.md
+		// M6 section) -- go straight to the pre-M6 fine windowed search,
+		// same as if the graph never covered this query.
+		const bool bOk = PlanPath(AgentIndex, Terrain, GoalWorldPos);
+		if (Impl->Paths.IsValidIndex(AgentIndex))
+		{
+			Impl->Tier1FineFallbackExpansionsTotal += Impl->Paths[AgentIndex].expansionsUsed;
+		}
+		++Impl->Tier1FineFallbackCalls;
+		return bOk;
+	}
+
+	EnsureTier1RegionGraph(Terrain, PlayerWorldPos);
+
+	FVoxelAgent& Agent = Agents[AgentIndex];
+	const VoxelCoords::FVoxelCoord StartVoxel = VoxelCoords::WorldToVoxel(Agent.Position);
+	const VoxelCoords::FVoxelCoord GoalVoxel = VoxelCoords::WorldToVoxel(GoalWorldPos);
+	const vxc::PathCoord Start{StartVoxel.X, StartVoxel.Y, StartVoxel.Z};
+	const vxc::PathCoord Goal{GoalVoxel.X, GoalVoxel.Y, GoalVoxel.Z};
+
+	const bool bCovered = Impl->bTier1GraphValid &&
+	                       vxc::regionInBounds(vxc::regionOfVoxel(Start), Impl->Tier1RegionGraph.minRegion,
+	                                            Impl->Tier1RegionGraph.maxRegion) &&
+	                       vxc::regionInBounds(vxc::regionOfVoxel(Goal), Impl->Tier1RegionGraph.minRegion,
+	                                            Impl->Tier1RegionGraph.maxRegion);
+
+	auto FallBackToFineSearch = [this, AgentIndex, &Terrain, &GoalWorldPos]() -> bool
+	{
+		// Graceful degradation (class comment "Graph lifetime/extent"): a
+		// Tier 1 agent this graph doesn't (yet) cover, or whose corridor
+		// query genuinely failed, is NEVER worse off than pre-M6 Tier 1 --
+		// it just falls through to the identical fine windowed search
+		// PlanPath already provides Tier 0.
+		const bool bOk = PlanPath(AgentIndex, Terrain, GoalWorldPos);
+		if (Impl->Paths.IsValidIndex(AgentIndex))
+		{
+			Impl->Tier1FineFallbackExpansionsTotal += Impl->Paths[AgentIndex].expansionsUsed;
+		}
+		++Impl->Tier1FineFallbackCalls;
+		return bOk;
+	};
+
+	if (!bCovered)
+	{
+		return FallBackToFineSearch();
+	}
+
+	UVoxelWorldSubsystem* TerrainPtr = &Terrain;
+	const auto SolidFn = [TerrainPtr](int64 X, int64 Y, int64 Z) -> vxc::MaterialId
+	{
+		return TerrainPtr->IsSolidAtVoxel(X, Y, Z) ? kSolidSentinelMaterial : vxc::MAT_AIR;
+	};
+
+	// refine=true (concrete step path), not the coarser corridor-waypoints
+	// option: AdvanceAlongWaypoints (VoxelAgent.cpp) walks a STRAIGHT LINE
+	// between consecutive Waypoints with no collision/edit awareness of its
+	// own -- it has no way to detour around an obstacle a coarse
+	// portal-to-portal straight line might clip through mid-region. Every
+	// refined intra-region hop is still bounded to ONE region's own
+	// SearchWindow (kRegionVolume=4096 cells max, vs. Tier 0/1's pre-M6
+	// window of ~27,225 cells -- WindowHalfExtentVoxels/HalfHeightVoxels
+	// above), and the ROUTE-FINDING itself (which regions/portals to cross)
+	// is a cheap Dijkstra over a few dozen portal nodes, not another
+	// bounded voxel search -- so even with refine=true, the total fine-A*
+	// work for a query spanning N regions is O(N) SMALL bounded searches
+	// rather than the pre-M6 approach's repeated ~27,225-cell windowed
+	// searches chained across many replans to slowly close a long distance.
+	// See docs/status.md's measured before/after numbers.
+	const vxc::HierarchicalPathResult Result = vxc::findHierarchicalPath(
+		Impl->Tier1RegionGraph, Start, Goal, SolidFn, Impl->NavConfig, /*refine=*/true, Tier1PerRegionMaxExpansions);
+
+	++Impl->Tier1HierarchicalCalls;
+	const int64 ExpansionsThisCall =
+		Result.entryExitExpansionsUsed + (Result.refined ? Result.concretePath.expansionsUsed : 0);
+	Impl->Tier1HierarchicalExpansionsTotal += ExpansionsThisCall;
+
+	if (!Result.corridor.found || !Result.refined)
+	{
+		// Diagnostic (docs/status.md M6 section -- kept permanently, not
+		// just for this slice's own debugging): counts alive portals in
+		// Start's/Goal's own regions directly from the graph, distinguishing
+		// "this region has zero portals at all" (would mean the box's
+		// vertical/horizontal extent doesn't actually reach usable terrain
+		// here) from "portals exist but the corridor/entry/exit search
+		// itself failed" (an expansion-cap/connectivity issue) -- both are
+		// real, distinct failure modes this system can hit, and Verbose
+		// alone wasn't enough to diagnose which one was happening when this
+		// was first built (see docs/status.md's measured numbers).
+		const vxc::RegionCoord StartRegion = vxc::regionOfVoxel(Start);
+		const vxc::RegionCoord GoalRegion = vxc::regionOfVoxel(Goal);
+		int32 StartPortalCount = 0, GoalPortalCount = 0;
+		for (const vxc::Portal& P : Impl->Tier1RegionGraph.portals)
+		{
+			if (!P.alive) continue;
+			if (P.region == StartRegion) ++StartPortalCount;
+			if (P.region == GoalRegion) ++GoalPortalCount;
+		}
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelAgent %d Tier1 DIAGNOSTIC: corridor.found=%d refined=%d startRegion=(%lld,%lld,%lld) portals=%d ")
+		       TEXT("goalRegion=(%lld,%lld,%lld) portals=%d start=(%lld,%lld,%lld) goal=(%lld,%lld,%lld)"),
+		       AgentIndex, Result.corridor.found ? 1 : 0, Result.refined ? 1 : 0,
+		       StartRegion.x, StartRegion.y, StartRegion.z, StartPortalCount,
+		       GoalRegion.x, GoalRegion.y, GoalRegion.z, GoalPortalCount,
+		       Start.x, Start.y, Start.z, Goal.x, Goal.y, Goal.z);
+
+		// Regions disconnected in the abstract graph, or a stale-graph
+		// refinement failure (header comment "Hierarchical query": refine
+		// does NOT re-validate the abstract corridor itself against a
+		// changed solidFn) -- fall back rather than leaving the agent stuck.
+		return FallBackToFineSearch();
+	}
+
+	Agent.Waypoints.Reset();
+	Agent.Waypoints.Reserve((int32)Result.concretePath.steps.size());
+	for (const vxc::PathStep& Step : Result.concretePath.steps)
+	{
+		const VoxelCoords::FVoxelCoord Cell{Step.cell.x, Step.cell.y, Step.cell.z};
+		Agent.Waypoints.Add(VoxelCoords::VoxelToWorldCenter(Cell));
+	}
+	Agent.WaypointIndex = 0;
+
+	const UWorld* World = GetWorld();
+	Agent.LastReplanTimeSeconds = World ? World->GetTimeSeconds() : Agent.LastReplanTimeSeconds;
+	Agent.LastPlanGoalWorld = GoalWorldPos;
+
+	if (Impl->Paths.IsValidIndex(AgentIndex))
+	{
+		Impl->Paths[AgentIndex] = Result.concretePath; // for pathStillValid revalidation, same as PlanPath
+	}
+	if (Impl->PathIsDigCapable.IsValidIndex(AgentIndex))
+	{
+		Impl->PathIsDigCapable[AgentIndex] = false; // Tier 1 is never dig-capable (NavConfig, see class comment)
+	}
+
+	UE_LOG(LogVoxelEarth, Verbose,
+	       TEXT("VoxelAgent %d (Tier1 hierarchical): corridor cost=%lld portals=%d steps=%d expansions=%lld"),
+	       AgentIndex, Result.corridor.totalCost, (int32)Result.corridor.portalIds.size(),
+	       (int32)Result.concretePath.steps.size(), ExpansionsThisCall);
+
+	return Agent.Waypoints.Num() > 0;
+}
+
+void UVoxelAgentSubsystem::MarkTerrainEditDirty(UVoxelWorldSubsystem& Terrain, int64 VoxelX, int64 VoxelY, int64 VoxelZ)
+{
+	if (!Impl || !Impl->bTier1GraphValid)
+	{
+		return;
+	}
+	const vxc::PathCoord VoxelPath{VoxelX, VoxelY, VoxelZ};
+	const vxc::RegionCoord Region = vxc::regionOfVoxel(VoxelPath);
+	if (!vxc::regionInBounds(Region, Impl->Tier1RegionGraph.minRegion, Impl->Tier1RegionGraph.maxRegion))
+	{
+		return; // outside the graph's current coverage -- nothing to keep in sync
+	}
+
+	UVoxelWorldSubsystem* TerrainPtr = &Terrain;
+	const auto SolidFn = [TerrainPtr](int64 X, int64 Y, int64 Z) -> vxc::MaterialId
+	{
+		return TerrainPtr->IsSolidAtVoxel(X, Y, Z) ? kSolidSentinelMaterial : vxc::MAT_AIR;
+	};
+	vxc::markRegionDirty(Impl->Tier1RegionGraph, Region, SolidFn, Impl->NavConfig, Tier1GraphIntraMaxExpansions);
+
+	UE_LOG(LogVoxelEarth, Verbose,
+	       TEXT("VoxelSwarm Tier1 region graph: dirtied region (%lld,%lld,%lld) after an NPC edit at voxel (%lld,%lld,%lld)."),
+	       Region.x, Region.y, Region.z, VoxelX, VoxelY, VoxelZ);
+}
+
+void UVoxelAgentSubsystem::PollWorldEditsForTier1DirtyRegions(UVoxelWorldSubsystem& Terrain)
+{
+	if (!Impl || !Impl->bTier1GraphValid)
+	{
+		return;
+	}
+	const uint64 CurrentLogSize = Terrain.GetLogSize();
+	if (CurrentLogSize == Impl->LastSeenEditLogSize)
+	{
+		return; // nothing new since the last check (or the graph's own last (re)build)
+	}
+	Impl->LastSeenEditLogSize = CurrentLogSize;
+
+	// KNOWN v0 LIMITATION (doctrine-mandated fallback -- see
+	// UVoxelAgentSubsystem.h's doc comment on this method): no delegate
+	// exists on UVoxelWorldSubsystem reporting WHICH cells a player dig/
+	// place or M5 structural-collapse edit touched, and that file is out of
+	// scope for this slice to modify (another agent owns it this run). This
+	// is the agent-side best-effort fallback the doctrine anticipates:
+	// whenever the edit log has grown, dirty the region around every
+	// currently-tracked Tier 0/1 agent's OWN position -- markRegionDirty's
+	// own up-to-6-neighbor sweep (regiongraph.h) already extends that to
+	// immediately adjacent regions too. This reliably catches the scenarios
+	// that actually matter to this system (an edit landing near an agent's
+	// CURRENT path), at the cost of an occasional false-positive dirty (a
+	// region re-scanned that in fact wasn't touched) whenever the real edit
+	// landed somewhere else entirely. Follow-up: a precise coordinate-level
+	// notification (e.g. a delegate on UVoxelWorldSubsystem broadcasting
+	// touched bricks) would make this exact instead of approximate.
+	UVoxelWorldSubsystem* TerrainPtr = &Terrain;
+	const auto SolidFn = [TerrainPtr](int64 X, int64 Y, int64 Z) -> vxc::MaterialId
+	{
+		return TerrainPtr->IsSolidAtVoxel(X, Y, Z) ? kSolidSentinelMaterial : vxc::MAT_AIR;
+	};
+
+	TArray<vxc::RegionCoord> DirtiedThisPoll;
+	for (const FVoxelAgent& Agent : Agents)
+	{
+		if (Agent.Tier == EVoxelAgentTier::Tier2_Statistical)
+		{
+			continue; // Tier 2 never paths at all -- nothing to keep in sync for it
+		}
+		const VoxelCoords::FVoxelCoord AgentVoxel = VoxelCoords::WorldToVoxel(Agent.Position);
+		const vxc::RegionCoord Region = vxc::regionOfVoxel(vxc::PathCoord{AgentVoxel.X, AgentVoxel.Y, AgentVoxel.Z});
+		if (!vxc::regionInBounds(Region, Impl->Tier1RegionGraph.minRegion, Impl->Tier1RegionGraph.maxRegion))
+		{
+			continue;
+		}
+		bool bAlready = false;
+		for (const vxc::RegionCoord& R : DirtiedThisPoll)
+		{
+			if (R.x == Region.x && R.y == Region.y && R.z == Region.z)
+			{
+				bAlready = true;
+				break;
+			}
+		}
+		if (bAlready)
+		{
+			continue;
+		}
+		DirtiedThisPoll.Add(Region);
+		vxc::markRegionDirty(Impl->Tier1RegionGraph, Region, SolidFn, Impl->NavConfig, Tier1GraphIntraMaxExpansions);
+	}
+
+	if (DirtiedThisPoll.Num() > 0)
+	{
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelSwarm Tier1 region graph: edit-log grew (size %llu) -- dirtied %d region(s) near active ")
+		       TEXT("agents (best-effort -- no precise edit-location delegate available, see doc comment)."),
+		       (unsigned long long)CurrentLogSize, DirtiedThisPoll.Num());
+	}
+}
+
 bool UVoxelAgentSubsystem::TryExecuteWaypointEdit(int32 AgentIndex, UVoxelWorldSubsystem& Terrain,
                                                     const FVector& PlayerWorldPos, int32& InOutEditBudget)
 {
@@ -653,6 +1149,17 @@ bool UVoxelAgentSubsystem::TryExecuteWaypointEdit(int32 AgentIndex, UVoxelWorldS
 	{
 		Agent.LastDigTimeSeconds = Now;
 		--InOutEditBudget;
+
+		// Dirty invalidation, NPC-edit case (docs/status.md M6 section
+		// "Tier-1 hierarchical planning + NPC replication"): this subsystem
+		// IS the one making this edit and knows the exact cell, so the
+		// Tier 1 region graph (if built and covering it) is kept precisely
+		// in sync the instant the edit lands -- no polling needed for this
+		// case (see PollWorldEditsForTier1DirtyRegions for the OTHER case,
+		// player digs/places and M5 collapse, which this subsystem doesn't
+		// directly cause).
+		MarkTerrainEditDirty(Terrain, EditedCell.X, EditedCell.Y, EditedCell.Z);
+
 		// %hs (not %s): vxc::actionName returns a narrow `const char*`
 		// (voxelcore/pathfind.h is engine-free, ANSI-only), while TEXT(...)
 		// format strings are TCHAR -- UE's format-string sanitizer requires
@@ -911,7 +1418,11 @@ void UVoxelAgentSubsystem::TickTier1(int32 AgentIndex, UVoxelWorldSubsystem& Ter
 
 	if (!Agent.bIdleAtStandoff && bNeedsReplan && InOutReplanBudget > 0)
 	{
-		PlanPath(AgentIndex, Terrain, GoalWorldPos);
+		// M6 gap closure (docs/status.md M6 section): PlanPathTier1 replaces
+		// the raw vxc::findPath call this used to make directly -- see its
+		// doc comment (UVoxelAgentSubsystem.h) for the hierarchical-vs-fine
+		// dispatch/fallback logic.
+		PlanPathTier1(AgentIndex, Terrain, PlayerWorldPos, GoalWorldPos);
 		--InOutReplanBudget;
 	}
 
@@ -960,16 +1471,29 @@ void UVoxelAgentSubsystem::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
-	if (Agents.Num() == 0 || !Impl)
+	UWorld* World = GetWorld();
+	if (!World)
 	{
 		return;
 	}
 
-	UWorld* World = GetWorld();
-	if (!World || World->GetNetMode() == NM_Client)
+	if (World->GetNetMode() == NM_Client)
 	{
-		// Server-authoritative (class comment "KNOWN v0 SCOPE LIMIT"): no
-		// client-side simulation or replication in this slice.
+		// M6 gap closure (docs/status.md M6 section "Tier-1 hierarchical
+		// planning + NPC replication"): a client's OWN Agents/Impl stay
+		// empty forever (server-authoritative simulation, class comment) --
+		// what a client renders instead comes from ClientAgents, the
+		// replicated-state mirror AVoxelAgentReplicator feeds via
+		// ApplyReplicatedAgentSnapshot. This is intentionally a SEPARATE,
+		// much lighter code path (no pathfinding, no world edits -- just
+		// interpolating already-decided positions) rather than sharing the
+		// authority branch below.
+		TickClientReplicatedAgents(DeltaTime);
+		return;
+	}
+
+	if (Agents.Num() == 0 || !Impl)
+	{
 		return;
 	}
 
@@ -997,6 +1521,14 @@ void UVoxelAgentSubsystem::Tick(float DeltaTime)
 	// is correctly seen as "far" even while hovering directly overhead.
 	const double GroundSurfaceUU = Terrain->GetSurfaceHeightUU(PlayerWorldPos.X, PlayerWorldPos.Y);
 	const FVector GoalWorldPos(PlayerWorldPos.X, PlayerWorldPos.Y, GroundSurfaceUU);
+
+	// M6 gap closure (docs/status.md M6 section): dirty invalidation for
+	// edits this subsystem did NOT itself make (player digs/places, M5
+	// structural-collapse removals) -- one poll/dirty-scan pass per Tick,
+	// before any agent this Tick reads the graph. See the method's own doc
+	// comment (UVoxelAgentSubsystem.h) for why this is a best-effort,
+	// position-based heuristic rather than a precise coordinate-level hook.
+	PollWorldEditsForTier1DirtyRegions(*Terrain);
 
 	int32 ReplanBudget = MaxTier0ReplansPerTick;
 	// Digging-while-pathing global per-tick cap (VoxelAgentSubsystem.h "Rate
@@ -1075,5 +1607,293 @@ void UVoxelAgentSubsystem::Tick(float DeltaTime)
 		UE_LOG(LogVoxelEarth, Log,
 		       TEXT("VoxelSwarm: agents=%d tier0=%d tier1=%d tier2=%d meanDistToPlayer=%.1fm"),
 		       Agents.Num(), Tier0Count, Tier1Count, Tier2Count, LastSnapshot.MeanDistanceToPlayerUU / 100.0);
+
+		// Tier 1 planning-cost measurement (docs/status.md M6 section
+		// "measure it" -- the before/after comparison this gap closure needs
+		// to report). Same cadence/gating as the convergence log line above
+		// so it doesn't spam a quiet swarm; only printed once either side has
+		// actually been called at least once.
+		if (Impl && (Impl->Tier1HierarchicalCalls > 0 || Impl->Tier1FineFallbackCalls > 0))
+		{
+			const double AvgHierarchicalExpansions = Impl->Tier1HierarchicalCalls > 0
+				? double(Impl->Tier1HierarchicalExpansionsTotal) / double(Impl->Tier1HierarchicalCalls)
+				: 0.0;
+			const double AvgFineFallbackExpansions = Impl->Tier1FineFallbackCalls > 0
+				? double(Impl->Tier1FineFallbackExpansionsTotal) / double(Impl->Tier1FineFallbackCalls)
+				: 0.0;
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("VoxelSwarm Tier1 planner: hierarchical calls=%lld totalExpansions=%lld avgExpansions=%.1f | ")
+			       TEXT("fineFallback calls=%lld totalExpansions=%lld avgExpansions=%.1f"),
+			       Impl->Tier1HierarchicalCalls, Impl->Tier1HierarchicalExpansionsTotal, AvgHierarchicalExpansions,
+			       Impl->Tier1FineFallbackCalls, Impl->Tier1FineFallbackExpansionsTotal, AvgFineFallbackExpansions);
+		}
+	}
+}
+
+// --- M6 gap closure: NPC state replication (docs/status.md M6 section "Tier-1
+// hierarchical planning + NPC replication") -----------------------------------
+
+void UVoxelAgentSubsystem::CollectReplicationSnapshot(const FVector& OriginWorld, double RelevancyRadiusUU,
+                                                        TArray<uint8>& OutBytes) const
+{
+	OutBytes.Reset();
+
+	// Wire format (own compact scheme, NOT vxc::ByteWriter -- this is
+	// ephemeral UE-side network data, not terrain/edit-log data, so it has
+	// no reason to route through voxel-core): int32 count, then per agent
+	// int32 AgentId + int16 relative-position-per-axis (UU, relative to
+	// OriginWorld) + uint8 Tier = 11 bytes/agent.
+	struct FSample
+	{
+		int32 AgentId = 0;
+		int16 Dx = 0, Dy = 0, Dz = 0;
+		uint8 Tier = 0;
+	};
+	TArray<FSample> Samples;
+	Samples.Reserve(Agents.Num());
+
+	const double RadiusSq = RelevancyRadiusUU * RelevancyRadiusUU;
+	for (int32 i = 0; i < Agents.Num(); ++i)
+	{
+		const FVoxelAgent& Agent = Agents[i];
+
+		// Relevancy/culling (AVoxelAgentReplicator's class comment
+		// "Relevancy/culling"): Tier 2 agents are NEVER replicated,
+		// regardless of distance -- the tier scheduler's own hysteresis
+		// (ComputeNextVoxelAgentTier) already guarantees a Tier 2 agent is
+		// farther than Tier1ExitUU from EVERY player, and it is the least
+		// cosmetically important tier to begin with (bounded steering, no
+		// path, no interesting behavior to show a remote client). Tier 0/1
+		// agents are included only within RelevancyRadiusUU of THIS
+		// broadcast's origin.
+		if (Agent.Tier == EVoxelAgentTier::Tier2_Statistical)
+		{
+			continue;
+		}
+		if (FVector::DistSquared(Agent.Position, OriginWorld) > RadiusSq)
+		{
+			continue;
+		}
+
+		const FVector Rel = Agent.Position - OriginWorld;
+		FSample Sample;
+		Sample.AgentId = i; // pool index -- stable for this slice (agents are never removed, see class comment)
+		Sample.Dx = (int16)FMath::Clamp(FMath::RoundToInt(Rel.X), -32767, 32767);
+		Sample.Dy = (int16)FMath::Clamp(FMath::RoundToInt(Rel.Y), -32767, 32767);
+		Sample.Dz = (int16)FMath::Clamp(FMath::RoundToInt(Rel.Z), -32767, 32767);
+		Sample.Tier = (uint8)Agent.Tier;
+		Samples.Add(Sample);
+	}
+
+	FMemoryWriter Writer(OutBytes, /*bIsPersistent=*/false);
+	int32 Count = Samples.Num();
+	Writer << Count;
+	for (FSample& Sample : Samples)
+	{
+		Writer << Sample.AgentId << Sample.Dx << Sample.Dy << Sample.Dz << Sample.Tier;
+	}
+}
+
+void UVoxelAgentSubsystem::ApplyReplicatedAgentSnapshot(const FVector& OriginWorld, const TArray<uint8>& Bytes)
+{
+	if (Bytes.Num() < (int32)sizeof(int32))
+	{
+		return;
+	}
+	FMemoryReader Reader(Bytes, /*bIsPersistent=*/false);
+	int32 Count = 0;
+	Reader << Count;
+	if (Count < 0)
+	{
+		return;
+	}
+
+	// Full-snapshot semantics (not an incremental add/remove event stream):
+	// every currently-known ClientAgents entry starts this call marked
+	// "not seen," and only ids actually present in THIS snapshot get
+	// re-marked seen below -- see FVoxelAgentClientView::bSeenLastSnapshot's
+	// doc comment for why (self-correcting even across a dropped/late
+	// packet, robust to reordering).
+	for (TPair<int32, FVoxelAgentClientView>& Pair : ClientAgents)
+	{
+		Pair.Value.bSeenLastSnapshot = false;
+	}
+
+	const UWorld* World = GetWorld();
+	const double Now = World ? World->GetTimeSeconds() : 0.0;
+	const double InstanceScaleXY = AgentBodyWidthUU / 100.0;
+	const double InstanceScaleZ = (AgentHalfHeightUU * 2.0) / 100.0;
+
+	for (int32 i = 0; i < Count; ++i)
+	{
+		if (Reader.IsError())
+		{
+			break;
+		}
+		int32 AgentId = 0;
+		int16 Dx = 0, Dy = 0, Dz = 0;
+		uint8 TierByte = 0;
+		Reader << AgentId << Dx << Dy << Dz << TierByte;
+		if (Reader.IsError())
+		{
+			break;
+		}
+
+		const FVector WorldPos = OriginWorld + FVector((double)Dx, (double)Dy, (double)Dz);
+		FVoxelAgentClientView& View = ClientAgents.FindOrAdd(AgentId);
+
+		if (View.InstanceIndex == INDEX_NONE && AgentISM == nullptr)
+		{
+			// Dedicated-server-style process with no viewport -- nothing to
+			// render into (mirrors FVoxelAgent::InstanceIndex's identical
+			// INDEX_NONE convention, OnWorldBeginPlay's doc comment). Still
+			// track the position (harmless, cheap) in case a viewport shows
+			// up later; just never touch AgentISM.
+			View.PrevPosition = WorldPos;
+			View.TargetPosition = WorldPos;
+			View.PrevTimeSeconds = Now;
+			View.TargetTimeSeconds = Now;
+		}
+		else if (View.InstanceIndex == INDEX_NONE)
+		{
+			// First time this AgentId has been seen -- give it a fresh ISM instance.
+			View.PrevPosition = WorldPos;
+			View.TargetPosition = WorldPos;
+			View.PrevTimeSeconds = Now;
+			View.TargetTimeSeconds = Now;
+			const FTransform InstanceTransform(FRotator::ZeroRotator, WorldPos + FVector(0.0, 0.0, AgentHalfHeightUU),
+			                                    FVector(InstanceScaleXY, InstanceScaleXY, InstanceScaleZ));
+			View.InstanceIndex = AgentISM->AddInstance(InstanceTransform, /*bWorldSpace=*/true);
+		}
+		else
+		{
+			// Re-anchor the interpolation window from wherever the render
+			// position CURRENTLY sits (not necessarily the old Target, if a
+			// snapshot arrived a little early/late) toward the fresh target.
+			const double OldAlpha = (View.TargetTimeSeconds > View.PrevTimeSeconds)
+				? FMath::Clamp((Now - View.PrevTimeSeconds) / (View.TargetTimeSeconds - View.PrevTimeSeconds), 0.0, 1.0)
+				: 1.0;
+			View.PrevPosition = FMath::Lerp(View.PrevPosition, View.TargetPosition, OldAlpha);
+			View.PrevTimeSeconds = Now;
+			View.TargetPosition = WorldPos;
+			View.TargetTimeSeconds = Now + ClientAgentInterpolationWindowSeconds;
+		}
+		View.Tier = TierByte;
+		View.bSeenLastSnapshot = true;
+	}
+
+	// Entries not touched this snapshot have aged out of the server's
+	// relevancy radius -- HIDE (zero-scale, not
+	// UInstancedStaticMeshComponent::RemoveInstance) their instance rather
+	// than tearing it down: RemoveInstance can shuffle other instances'
+	// indices (typically a swap-with-last), which would silently invalidate
+	// every OTHER tracked agent's cached InstanceIndex unless this class
+	// also maintained a reverse index->id map to fix them up. Since AgentIds
+	// never truly disappear in this slice (agents aren't despawned) and
+	// commonly re-enter relevancy later (the player walks back toward them),
+	// keeping a permanently-reserved, currently-invisible slot is simpler
+	// and avoids that whole class of bug.
+	bool bAnyHidden = false;
+	for (TPair<int32, FVoxelAgentClientView>& Pair : ClientAgents)
+	{
+		if (!Pair.Value.bSeenLastSnapshot && AgentISM && Pair.Value.InstanceIndex != INDEX_NONE)
+		{
+			const FTransform Hidden(FRotator::ZeroRotator, FVector::ZeroVector, FVector::ZeroVector);
+			AgentISM->UpdateInstanceTransform(Pair.Value.InstanceIndex, Hidden, /*bWorldSpace=*/true,
+			                                    /*bMarkRenderStateDirty=*/false, /*bTeleport=*/true);
+			bAnyHidden = true;
+		}
+	}
+	if (bAnyHidden && AgentISM)
+	{
+		AgentISM->MarkRenderStateDirty();
+	}
+}
+
+void UVoxelAgentSubsystem::RunReplicationSelfTest()
+{
+	if (Agents.Num() == 0)
+	{
+		UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelReplicationSelfTest: no agents to test -- run with -VoxelSwarmTest first."));
+		return;
+	}
+
+	// Origin = the first agent's own position, NOT world zero: production
+	// (AVoxelAgentReplicator::Tick) always anchors OriginWorld at a live
+	// player's location, which sits close (a few meters at most) to the
+	// ground-snapped agents it's broadcasting -- keeping every relative
+	// offset comfortably inside int16 range (+-32767UU = +-327m). World
+	// zero would NOT be representative here: this world's absolute terrain
+	// elevation is ~1000m+ at this seed, so an agent-Z-minus-zero offset
+	// overflows int16 and quantizes to garbage -- a self-test artifact of a
+	// badly chosen origin, not a wire-format bug (confirmed by re-running
+	// with a realistic origin, see docs/status.md's measured results).
+	const FVector OriginWorld = Agents[0].Position;
+	TArray<uint8> Bytes;
+	CollectReplicationSnapshot(OriginWorld, 1.0e9, Bytes);
+	ApplyReplicatedAgentSnapshot(OriginWorld, Bytes);
+
+	int32 Compared = 0;
+	double MaxDeltaUU = 0.0;
+	for (int32 i = 0; i < Agents.Num(); ++i)
+	{
+		if (Agents[i].Tier == EVoxelAgentTier::Tier2_Statistical)
+		{
+			continue; // never replicated by design -- nothing to compare
+		}
+		const FVoxelAgentClientView* View = ClientAgents.Find(i);
+		if (!View)
+		{
+			UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelReplicationSelfTest: agent %d missing from ClientAgents after apply!"), i);
+			continue;
+		}
+		const double DeltaUU = FVector::Dist(Agents[i].Position, View->TargetPosition);
+		MaxDeltaUU = FMath::Max(MaxDeltaUU, DeltaUU);
+		++Compared;
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelReplicationSelfTest: agent %d authoritative=(%.2f,%.2f,%.2f) replicated=(%.2f,%.2f,%.2f) ")
+		       TEXT("delta=%.3fUU tier(auth=%d,rep=%d)"),
+		       i, Agents[i].Position.X, Agents[i].Position.Y, Agents[i].Position.Z, View->TargetPosition.X,
+		       View->TargetPosition.Y, View->TargetPosition.Z, DeltaUU, (int32)Agents[i].Tier, (int32)View->Tier);
+	}
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("VoxelReplicationSelfTest: compared %d/%d agents, maxDelta=%.3fUU (int16 UU quantization rounding, ")
+	       TEXT("expect <=~0.87UU worst case)."),
+	       Compared, Agents.Num(), MaxDeltaUU);
+}
+
+void UVoxelAgentSubsystem::TickClientReplicatedAgents(float DeltaSeconds)
+{
+	(void)DeltaSeconds; // interpolation here is time-stamp-based (Now vs Prev/TargetTimeSeconds), not delta-accumulated
+	if (ClientAgents.Num() == 0 || !AgentISM)
+	{
+		return;
+	}
+	const UWorld* World = GetWorld();
+	const double Now = World ? World->GetTimeSeconds() : 0.0;
+	const double InstanceScaleXY = AgentBodyWidthUU / 100.0;
+	const double InstanceScaleZ = (AgentHalfHeightUU * 2.0) / 100.0;
+
+	bool bAnyUpdated = false;
+	for (TPair<int32, FVoxelAgentClientView>& Pair : ClientAgents)
+	{
+		FVoxelAgentClientView& View = Pair.Value;
+		if (View.InstanceIndex == INDEX_NONE || !View.bSeenLastSnapshot)
+		{
+			continue; // no viewport, or hidden (aged out of relevancy) -- ApplyReplicatedAgentSnapshot already handled it
+		}
+		const double Alpha = (View.TargetTimeSeconds > View.PrevTimeSeconds)
+			? FMath::Clamp((Now - View.PrevTimeSeconds) / (View.TargetTimeSeconds - View.PrevTimeSeconds), 0.0, 1.0)
+			: 1.0;
+		const FVector RenderPos = FMath::Lerp(View.PrevPosition, View.TargetPosition, Alpha);
+		const FTransform InstanceTransform(FRotator::ZeroRotator, RenderPos + FVector(0.0, 0.0, AgentHalfHeightUU),
+		                                    FVector(InstanceScaleXY, InstanceScaleXY, InstanceScaleZ));
+		AgentISM->UpdateInstanceTransform(View.InstanceIndex, InstanceTransform, /*bWorldSpace=*/true,
+		                                    /*bMarkRenderStateDirty=*/false, /*bTeleport=*/true);
+		bAnyUpdated = true;
+	}
+	if (bAnyUpdated)
+	{
+		AgentISM->MarkRenderStateDirty();
 	}
 }
