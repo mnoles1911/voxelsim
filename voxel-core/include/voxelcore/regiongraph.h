@@ -149,6 +149,46 @@
 // post-edit solidFn.
 //
 // -----------------------------------------------------------------------
+// Build cost (M6 Tier-1 enablement, 2026-07-21)
+// -----------------------------------------------------------------------
+// The v0 build was measured (25x25x3 = 1,875 regions, 1024-expansion cap)
+// at ~9.0 s against a cheap in-process MaterialFn and ~506 s against UE's
+// real procedural MaterialFn. 98% of that sat in ONE place: intra-region
+// edges. Two independent multipliers, both removed here WITHOUT changing a
+// single bit of the resulting graph (both are pure algebraic/memoization
+// rewrites; the golden digest is unchanged):
+//
+//   1. O(portals^2) searches -> O(portals) searches. v0 ran a separate
+//      bounded findPath for EVERY ORDERED PAIR of a region's portals
+//      (23,416 calls; mean cost 688 expansions, i.e. most of them running
+//      to the cap because the pair simply is not connected inside the
+//      region). But findPath is Dijkstra with a ZERO heuristic
+//      (pathfind.h "Search / windowing"), so its priority-queue key --
+//      (g, PathCoordLess) -- never mentions the goal: the settle ORDER
+//      from a given start is GOAL-INDEPENDENT. One search per SOURCE
+//      portal therefore already contains every pairwise answer for that
+//      source. See detail::runRegionSearch for the full equivalence
+//      argument and the exact cap semantics that make it identical rather
+//      than merely equivalent-in-the-limit.
+//   2. O(expansions x 41) MaterialFn traffic -> O(distinct voxels touched).
+//      Each expansion classifies 18 offsets and each classifyMove reads
+//      2-3 voxels, so v0 made 666 MILLION MaterialFn calls over that box.
+//      Every voxel an intra-region search can possibly consult lies within
+//      the region box grown by 2 (detail::RegionMaterialCache), so those
+//      calls are memoized down to at most 20^3 = 8,000 per region. This is
+//      the multiplier that dominates in UE, where MaterialFn is procedural
+//      worldgen rather than a lambda over a heightfield.
+//
+// Even so a full 1,875-region build is not a 16.6 ms frame's worth of work,
+// so the build is additionally RESUMABLE: RegionGraphBuilder walks the same
+// three phases in the same region order under a caller-supplied per-call
+// region budget, and buildRegionGraph() is now literally "construct a
+// builder and advance it with an unlimited budget" -- so a time-sliced
+// build is byte-identical to a one-shot build BY CONSTRUCTION, not by a
+// parallel code path that could drift. The UE side (VoxelAgentSubsystem)
+// drives it from Tick under a millisecond budget.
+//
+// -----------------------------------------------------------------------
 // Determinism
 // -----------------------------------------------------------------------
 // RegionGraph::digest() sorts a canonical COPY of the (alive) portal list
@@ -164,6 +204,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <queue>
 #include <utility>
 #include <vector>
@@ -477,6 +518,179 @@ inline std::vector<PortalLocal> findFacePortals(const MaterialFn& solidFn, const
     return result;
 }
 
+// ---------------------------------------------------------------------
+// Region-local memoizing material cache (see header comment "Build cost")
+// ---------------------------------------------------------------------
+// Pure memoization of the caller's MaterialFn over one region's
+// neighborhood: identical inputs -> identical outputs, so NOTHING about
+// the resulting graph depends on it. It exists only because the callers
+// below read the same few thousand voxels hundreds of times each, and in
+// the real engine a MaterialFn read is a procedural worldgen evaluation
+// (~750 ns), not a table lookup.
+//
+// Halo of 2 is provably sufficient for every read any per-region work does:
+//   - classifyMove from an origin inside the region reads the destination
+//     (up to 2 away horizontally for Jump, 1 vertically), the destination's
+//     support cell (dest.z-1, so origin.z-2 for a step-down), and the Jump
+//     midpoint and its support. Max reach: +-2 in x/y, +1/-2 in z.
+//   - findFacePortals reads a boundary cell, its across-the-face neighbor
+//     (+-1), and those two cells' classifyMove reads (as above).
+// A read outside the halo falls through to the source MaterialFn, so the
+// cache is a strict optimization even if that bound were ever wrong.
+inline constexpr int64_t kRegionCacheHalo = 2;
+inline constexpr int64_t kRegionCacheEdge = kRegionEdge + 2 * kRegionCacheHalo;
+
+class RegionMaterialCache {
+public:
+    RegionMaterialCache(const MaterialFn& src, RegionCoord region)
+        : src_(&src),
+          lo_{regionMinCorner(region).x - kRegionCacheHalo, regionMinCorner(region).y - kRegionCacheHalo,
+              regionMinCorner(region).z - kRegionCacheHalo},
+          known_(static_cast<size_t>(kRegionCacheEdge * kRegionCacheEdge * kRegionCacheEdge), 0),
+          mat_(static_cast<size_t>(kRegionCacheEdge * kRegionCacheEdge * kRegionCacheEdge), MAT_AIR) {}
+
+    MaterialId at(int64_t x, int64_t y, int64_t z) const {
+        const int64_t lx = x - lo_.x, ly = y - lo_.y, lz = z - lo_.z;
+        if (lx < 0 || lx >= kRegionCacheEdge || ly < 0 || ly >= kRegionCacheEdge || lz < 0 ||
+            lz >= kRegionCacheEdge)
+            return (*src_)(x, y, z); // outside the proven halo -- pass through
+        const size_t i = localIndex(lx, ly, lz, kRegionCacheEdge, kRegionCacheEdge);
+        if (!known_[i]) {
+            mat_[i] = (*src_)(x, y, z);
+            known_[i] = 1;
+        }
+        return mat_[i];
+    }
+
+    // A MaterialFn view of this cache, for handing to classifyMove/
+    // findFacePortals in place of the raw source.
+    MaterialFn fn() const {
+        return [this](int64_t x, int64_t y, int64_t z) { return at(x, y, z); };
+    }
+
+    // Pre-populates cells [begin, end) of the region's OWN kRegionVolume-cell
+    // core (NOT the halo, which stays lazy). Purely brings forward reads that
+    // at() would otherwise do on first touch — it cannot change any value, so
+    // it cannot change the graph.
+    //
+    // This exists so a time-sliced build can chop up the one genuinely
+    // expensive, otherwise-atomic piece of per-region work. Against a
+    // procedural-worldgen MaterialFn a region's first touch costs thousands
+    // of generator evaluations (measured in-engine at ~4,100 reads / ~6 ms
+    // per region), which would make ONE region an indivisible ~6 ms lump of a
+    // 16.6 ms frame no matter how small the caller's budget was. Filling the
+    // core in bounded chunks first makes the subsequent portal/intra-edge
+    // work a cheap, purely-compute step over a warm cache. The core is
+    // essentially exactly what a region's searches touch anyway (measured:
+    // ~4,113 distinct cells touched vs. kRegionVolume=4,096), so this
+    // prefetch is not speculative work — it is the same reads, earlier and in
+    // slices.
+    void fillCoreRange(int64_t begin, int64_t end) const {
+        const int64_t lo = begin < 0 ? 0 : begin;
+        const int64_t hi = end > kRegionVolume ? kRegionVolume : end;
+        for (int64_t i = lo; i < hi; ++i) {
+            const int64_t cx = i % kRegionEdge;
+            const int64_t cy = (i / kRegionEdge) % kRegionEdge;
+            const int64_t cz = i / (kRegionEdge * kRegionEdge);
+            (void)at(lo_.x + kRegionCacheHalo + cx, lo_.y + kRegionCacheHalo + cy,
+                     lo_.z + kRegionCacheHalo + cz);
+        }
+    }
+
+    // LIFETIME CONTRACT: this cache holds a POINTER to the caller's
+    // MaterialFn, never a copy, so it must never outlive it. A cache that
+    // survives across calls (RegionGraphBuilder keeps one alive across
+    // advance() calls for the region it is mid-way through) MUST rebind to
+    // the MaterialFn reference of the CURRENT call before touching it --
+    // callers routinely materialize a fresh std::function per call, and the
+    // previous one is long destroyed. Rebinding rather than copying also
+    // means the cache always reads through the caller's live functor, never
+    // a stale snapshot of it.
+    void rebindSource(const MaterialFn& src) const { src_ = &src; }
+
+private:
+    mutable const MaterialFn* src_;
+    PathCoord lo_;
+    mutable std::vector<uint8_t> known_;
+    mutable std::vector<MaterialId> mat_;
+};
+
+// ---------------------------------------------------------------------
+// Single-source region search -- the P^2 -> P collapse (header "Build cost")
+// ---------------------------------------------------------------------
+// Expansion-for-expansion IDENTICAL to pathfind.h's findPath confined to
+// `region`'s own SearchWindow: same 18 kNeighborOffsets in the same order,
+// same detail::classifyMove, same PathQueueCmp ((g, PathCoordLess) -- the
+// only tie-break), same in-box test, same stale-entry skip, same cap check
+// at the same point in the loop. It differs ONLY in dropping the goal test
+// and the parent/path reconstruction, and in running past the point where a
+// particular goal would have stopped it.
+//
+// WHY reading the settled distances off ONE such search per source is
+// EXACTLY what P-1 pairwise findPath calls from that source produce:
+//   (a) findPath's heuristic is ZERO, so its queue key does not mention the
+//       goal and its settle sequence from a fixed start is goal-INDEPENDENT.
+//       findPath(s,g1) and findPath(s,g2) settle the same cells in the same
+//       order; they only stop at different points.
+//   (b) findPath settles at most `maxExpansions` cells (the cap is tested at
+//       the top of the loop, and each settle increments the counter), and
+//       returns complete iff the goal is among them. So `complete` <->
+//       `settled[goal]` in this one search run with the same cap.
+//   (c) all move costs are non-negative -- a negative mineCostByMaterial
+//       entry is the "impassable" sentinel and makes classifyMove INVALID,
+//       never a negative edge -- so a settled cell's bestG is already its
+//       final optimal in-window cost, which is exactly findPath's
+//       totalCost for that goal.
+// Hence: same edge set, same edge costs, same digest. This is a rewrite of
+// HOW the same numbers are computed, not of WHAT is computed.
+struct RegionSearch {
+    std::vector<int64_t> bestG;   // region-local index -> optimal cost (INT64_MAX if unreached)
+    std::vector<uint8_t> settled; // region-local index -> settled within the cap
+};
+
+inline size_t regionLocalIndex(RegionCoord region, PathCoord c) {
+    const PathCoord lo = regionMinCorner(region);
+    return localIndex(c.x - lo.x, c.y - lo.y, c.z - lo.z, kRegionEdge, kRegionEdge);
+}
+
+inline int32_t runRegionSearch(const MaterialFn& solidFn, const PathCostConfig& config, RegionCoord region,
+                                PathCoord source, int32_t capExpansions, RegionSearch& out) {
+    const PathCoord lo = regionMinCorner(region);
+    const PathCoord hi = regionMaxCorner(region);
+    out.bestG.assign(static_cast<size_t>(kRegionVolume), INT64_MAX);
+    out.settled.assign(static_cast<size_t>(kRegionVolume), 0);
+    int32_t expansionsUsed = 0;
+    if (!inBox(source, lo, hi)) return expansionsUsed; // mirrors findPath's own guard
+
+    std::priority_queue<PathQueueEntry, std::vector<PathQueueEntry>, PathQueueCmp> open;
+    out.bestG[regionLocalIndex(region, source)] = 0;
+    open.push({0, source});
+
+    while (!open.empty()) {
+        if (expansionsUsed >= capExpansions) break;
+        const PathQueueEntry e = open.top();
+        open.pop();
+        const size_t idx = regionLocalIndex(region, e.coord);
+        if (out.settled[idx]) continue;
+        if (e.g > out.bestG[idx]) continue; // stale entry
+        out.settled[idx] = 1;
+        ++expansionsUsed;
+
+        for (const auto& off : kNeighborOffsets) {
+            const MoveClassification mv = classifyMove(solidFn, config, e.coord, off[0], off[1], off[2]);
+            if (!mv.valid) continue;
+            if (!inBox(mv.to, lo, hi)) continue;
+            const size_t nIdx = regionLocalIndex(region, mv.to);
+            const int64_t newG = e.g + mv.cost;
+            if (newG < out.bestG[nIdx]) {
+                out.bestG[nIdx] = newG;
+                open.push({newG, mv.to});
+            }
+        }
+    }
+    return expansionsUsed;
+}
+
 // Appends fresh Portal entries for one region+face's detected clusters
 // (used by both buildRegionGraph and markRegionDirty).
 inline void appendFacePortals(RegionGraph& graph, const MaterialFn& solidFn, const PathCostConfig& config,
@@ -494,11 +708,32 @@ inline void appendFacePortals(RegionGraph& graph, const MaterialFn& solidFn, con
 }
 
 // Tombstones every existing intra-region edge fully inside `region`, then
-// appends a fresh set over the region's current ALIVE portals (bounded fine
-// findPath, confined to `region`'s own SearchWindow — skipped if
-// unreachable). O(portals(region)^2) fine findPath calls.
-inline void rebuildIntraEdgesForRegion(RegionGraph& graph, RegionCoord region, const MaterialFn& solidFn,
-                                        const PathCostConfig& config, int32_t capExpansions) {
+// appends a fresh set over the region's current ALIVE portals, confined to
+// `region`'s own SearchWindow (no edge at all if unreachable within the
+// cap).
+//
+// ONE bounded search per SOURCE portal (runRegionSearch), not one per
+// ORDERED PAIR — see runRegionSearch's comment for why the resulting edge
+// set and costs are bit-identical to the O(portals^2) findPath version this
+// replaces, and the header comment "Build cost" for the measurements that
+// motivated it. Edges are appended in the same (source-ascending, then
+// destination-ascending) order as before.
+//
+// NOTE on RegionGraph::totalFinePathExpansions: it still counts every
+// expansion this build actually spends, but that is now a much SMALLER
+// number for the same graph (P searches instead of P*(P-1)). It is a
+// monitoring counter, explicitly excluded from digest() — no golden or
+// structural result depends on it.
+//
+// `cachedSolidFn` must be a MaterialFn already backed by a
+// RegionMaterialCache for THIS region when the caller has one to share
+// (RegionGraphBuilder does — it detects the region's portals and builds its
+// intra edges under one cache, so each region's voxels are read from the
+// caller's real MaterialFn exactly once for the whole build); the
+// convenience overload below makes its own.
+inline void rebuildIntraEdgesForRegionCached(RegionGraph& graph, RegionCoord region,
+                                              const MaterialFn& cachedSolidFn, const PathCostConfig& config,
+                                              int32_t capExpansions) {
     for (PortalEdge& e : graph.edges) {
         if (!e.intraRegion) continue;
         if (graph.portals[e.from].region == region && graph.portals[e.to].region == region) e.alive = false;
@@ -507,24 +742,35 @@ inline void rebuildIntraEdgesForRegion(RegionGraph& graph, RegionCoord region, c
     std::vector<uint32_t> ids;
     for (size_t i = 0; i < graph.portals.size(); ++i)
         if (graph.portals[i].alive && graph.portals[i].region == region) ids.push_back(static_cast<uint32_t>(i));
+    if (ids.size() < 2) return; // no ordered pairs -> no intra edges, and no searches to run
 
-    const SearchWindow win = regionWindow(region, capExpansions);
+    const MaterialFn& cachedFn = cachedSolidFn;
+
+    RegionSearch search;
     for (uint32_t i : ids) {
+        graph.totalFinePathExpansions +=
+            runRegionSearch(cachedFn, config, region, graph.portals[i].cell, capExpansions, search);
         for (uint32_t j : ids) {
             if (i == j) continue;
-            const PathResult pr =
-                findPath(solidFn, graph.portals[i].cell, graph.portals[j].cell, config, win);
-            graph.totalFinePathExpansions += pr.expansionsUsed;
-            if (!pr.complete) continue;
+            const size_t jIdx = regionLocalIndex(region, graph.portals[j].cell);
+            if (!search.settled[jIdx]) continue; // == findPath(i,j).complete == false
             PortalEdge e;
             e.from = i;
             e.to = j;
-            e.cost = static_cast<int32_t>(pr.totalCost);
+            e.cost = static_cast<int32_t>(search.bestG[jIdx]);
             e.intraRegion = true;
             e.alive = true;
             graph.edges.push_back(e);
         }
     }
+}
+
+// Convenience overload for callers with no cache to share (markRegionDirty):
+// makes a private one for this region.
+inline void rebuildIntraEdgesForRegion(RegionGraph& graph, RegionCoord region, const MaterialFn& solidFn,
+                                        const PathCostConfig& config, int32_t capExpansions) {
+    const RegionMaterialCache cache(solidFn, region);
+    rebuildIntraEdgesForRegionCached(graph, region, cache.fn(), config, capExpansions);
 }
 
 // Tombstones every existing inter-region edge on the boundary between
@@ -581,50 +827,173 @@ inline void rebuildInterEdgesForFacePair(RegionGraph& graph, RegionCoord regionA
 
 } // namespace detail
 
+// Resumable, budgeted RegionGraph build (header comment "Build cost"). Walks
+// exactly the three phases buildRegionGraph always walked — (0) portals,
+// (1) intra-region edges, (2) inter-region edges — over exactly the same
+// region iteration order (rx fastest, then ry, then rz), stopping whenever
+// the caller's per-call region budget runs out and picking up at the same
+// cursor next call. Because the ONLY thing a budget changes is where
+// advance() returns and re-enters, a graph built in N budgeted slices is
+// byte-identical to one built in a single unlimited slice — and
+// buildRegionGraph() below is literally the single-unlimited-slice case, so
+// there is no second implementation to drift.
+//
+// Intended UE use (VoxelAgentSubsystem::EnsureTier1RegionGraph): keep a
+// builder alive across ticks, call advance() with a small budget each tick,
+// and swap the finished graph in only once done() — the game thread never
+// pays more than one budget's worth of build in any one frame.
+class RegionGraphBuilder {
+public:
+    RegionGraphBuilder(RegionCoord minRegion, RegionCoord maxRegion, int32_t intraRegionMaxExpansions = 0)
+        : cap_(intraRegionMaxExpansions > 0 ? intraRegionMaxExpansions : static_cast<int32_t>(kRegionVolume)) {
+        graph_.minRegion = minRegion;
+        graph_.maxRegion = maxRegion;
+        if (maxRegion.x < minRegion.x || maxRegion.y < minRegion.y || maxRegion.z < minRegion.z) {
+            phase_ = kPhaseCount; // empty box -> nothing to do, immediately done
+            return;
+        }
+        nx_ = maxRegion.x - minRegion.x + 1;
+        ny_ = maxRegion.y - minRegion.y + 1;
+        nz_ = maxRegion.z - minRegion.z + 1;
+        regionCount_ = nx_ * ny_ * nz_;
+    }
+
+    bool done() const { return phase_ >= kPhaseCount; }
+
+    // Progress, in STEP units — the same unit advance()'s budget counts, so a
+    // caller can turn it into a percentage or an ETA directly. Logging/ETA
+    // only, never load-bearing for correctness.
+    int64_t totalRegionSteps() const { return regionCount_ * kStepsPerRegionTotal; }
+    int64_t completedRegionSteps() const {
+        if (done()) return totalRegionSteps();
+        const int64_t phaseBase = phase_ == 0 ? 0 : regionCount_ * kStepsPerRegionPhase0;
+        const int64_t perRegion = phase_ == 0 ? kStepsPerRegionPhase0 : 1;
+        return phaseBase + cursor_ * perRegion + sub_;
+    }
+
+    // Advances at most `regionBudget` STEPS (<=0 means unlimited); a step is
+    // one bounded chunk of work, never a whole region — see
+    // kStepsPerRegionPhase0. Returns done().
+    bool advance(const MaterialFn& solidFn, const PathCostConfig& config, int64_t regionBudget) {
+        const bool unlimited = regionBudget <= 0;
+        int64_t spent = 0;
+        while (!done() && (unlimited || spent < regionBudget)) {
+            stepOne(solidFn, config);
+            ++spent;
+        }
+        return done();
+    }
+
+    const RegionGraph& graph() const { return graph_; }
+    RegionGraph& graph() { return graph_; }
+
+private:
+    // TWO phases, not three: a region's portals and that same region's intra
+    // edges are done TOGETHER, under ONE RegionMaterialCache, so each
+    // region's voxels are read from the caller's MaterialFn exactly once for
+    // the whole build instead of once per phase. (Legal because a region's
+    // intra edges depend only on that region's OWN portals, which the same
+    // step just produced — unlike inter-region edges, which need the
+    // NEIGHBOUR's portals and therefore must stay a separate pass after all
+    // portals exist.) Portal ids are still assigned in the same region order,
+    // so portal identity is unchanged; intra edges now interleave with later
+    // regions' portals in `edges` STORAGE order, which digest() is
+    // deliberately independent of (header comment "Determinism": edges are
+    // hashed in sorted canonical-rank order, never storage order).
+    static constexpr int kPhaseCount = 2;
+
+    // Sub-region step granularity. Phase 0's per-region work is split into
+    // kCoreFillSteps bounded MaterialFn-prefetch chunks (see
+    // RegionMaterialCache::fillCoreRange for why that read traffic, not the
+    // search, is the expensive and otherwise-indivisible part) followed by
+    // ONE warm-cache compute step that detects the region's portals and
+    // builds its intra edges. Phase 1 (inter-region edges) is one cheap step
+    // per region — it runs a handful of classifyMove calls, no search.
+    static constexpr int64_t kCoreFillChunk = 512; // cells per prefetch step
+    static constexpr int64_t kCoreFillSteps = kRegionVolume / kCoreFillChunk;
+    static_assert(kCoreFillSteps * kCoreFillChunk == kRegionVolume,
+                  "kCoreFillChunk must divide kRegionVolume evenly");
+    static constexpr int64_t kStepsPerRegionPhase0 = kCoreFillSteps + 1;
+    static constexpr int64_t kStepsPerRegionTotal = kStepsPerRegionPhase0 + 1;
+    // Each boundary is visited exactly once, from the lower region via its
+    // positive-direction faces only (the neighbor's mirrored negative face
+    // is handled inside rebuildInterEdgesForFacePair itself).
+    static constexpr std::array<Face, 3> kPositiveFaces = {Face::PlusX, Face::PlusY, Face::PlusZ};
+
+    RegionCoord regionAt(int64_t index) const {
+        const int64_t rx = index % nx_;
+        const int64_t ry = (index / nx_) % ny_;
+        const int64_t rz = index / (nx_ * ny_);
+        return RegionCoord{graph_.minRegion.x + rx, graph_.minRegion.y + ry, graph_.minRegion.z + rz};
+    }
+
+    void nextRegion() {
+        sub_ = 0;
+        if (++cursor_ >= regionCount_) {
+            cursor_ = 0;
+            ++phase_;
+        }
+    }
+
+    // Performs exactly ONE bounded step of work.
+    void stepOne(const MaterialFn& solidFn, const PathCostConfig& config) {
+        const RegionCoord region = regionAt(cursor_);
+        if (phase_ != 0) {
+            for (Face f : kPositiveFaces) {
+                if (!regionInBounds(neighborRegion(region, f), graph_.minRegion, graph_.maxRegion)) continue;
+                detail::rebuildInterEdgesForFacePair(graph_, region, f, solidFn, config);
+            }
+            nextRegion();
+            return;
+        }
+
+        // ONE memo per region, shared by the prefetch chunks below, all 6
+        // faces' portal detection, and this region's intra-edge searches —
+        // see kPhaseCount's and fillCoreRange's comments.
+        if (!cache_) cache_ = std::make_unique<detail::RegionMaterialCache>(solidFn, region);
+        // The cache outlives the advance() call that created it (it is kept
+        // for the whole region, across ticks); `solidFn` typically does NOT.
+        // See RegionMaterialCache's LIFETIME CONTRACT.
+        cache_->rebindSource(solidFn);
+
+        if (sub_ < kCoreFillSteps) {
+            cache_->fillCoreRange(sub_ * kCoreFillChunk, (sub_ + 1) * kCoreFillChunk);
+            ++sub_;
+            return;
+        }
+
+        const MaterialFn cachedFn = cache_->fn();
+        for (Face f : kAllFaces) {
+            if (!regionInBounds(neighborRegion(region, f), graph_.minRegion, graph_.maxRegion)) continue;
+            detail::appendFacePortals(graph_, cachedFn, config, region, f);
+        }
+        detail::rebuildIntraEdgesForRegionCached(graph_, region, cachedFn, config, cap_);
+        cache_.reset();
+        nextRegion();
+    }
+
+    RegionGraph graph_;
+    std::unique_ptr<detail::RegionMaterialCache> cache_; // non-null mid-region in phase 0
+    int32_t cap_ = 0;
+    int phase_ = 0;
+    int64_t cursor_ = 0;
+    int64_t sub_ = 0;
+    int64_t nx_ = 0, ny_ = 0, nz_ = 0, regionCount_ = 0;
+};
+
 // Builds a RegionGraph over the inclusive region-space box [minRegion,
 // maxRegion]. `intraRegionMaxExpansions<=0` defaults to kRegionVolume (a
 // cap that can never spuriously truncate an in-region search — the region
 // box has exactly that many cells). See header comment "Model".
+//
+// This is RegionGraphBuilder run to completion in one unlimited slice — a
+// caller that cannot afford the whole build in one call should drive a
+// RegionGraphBuilder directly instead (header comment "Build cost").
 inline RegionGraph buildRegionGraph(const MaterialFn& solidFn, RegionCoord minRegion, RegionCoord maxRegion,
                                      const PathCostConfig& config, int32_t intraRegionMaxExpansions = 0) {
-    RegionGraph graph;
-    graph.minRegion = minRegion;
-    graph.maxRegion = maxRegion;
-    if (maxRegion.x < minRegion.x || maxRegion.y < minRegion.y || maxRegion.z < minRegion.z) return graph;
-
-    const int32_t cap =
-        intraRegionMaxExpansions > 0 ? intraRegionMaxExpansions : static_cast<int32_t>(kRegionVolume);
-
-    for (int64_t rz = minRegion.z; rz <= maxRegion.z; ++rz)
-        for (int64_t ry = minRegion.y; ry <= maxRegion.y; ++ry)
-            for (int64_t rx = minRegion.x; rx <= maxRegion.x; ++rx) {
-                const RegionCoord region{rx, ry, rz};
-                for (Face f : kAllFaces) {
-                    if (!regionInBounds(neighborRegion(region, f), minRegion, maxRegion)) continue;
-                    detail::appendFacePortals(graph, solidFn, config, region, f);
-                }
-            }
-
-    for (int64_t rz = minRegion.z; rz <= maxRegion.z; ++rz)
-        for (int64_t ry = minRegion.y; ry <= maxRegion.y; ++ry)
-            for (int64_t rx = minRegion.x; rx <= maxRegion.x; ++rx)
-                detail::rebuildIntraEdgesForRegion(graph, RegionCoord{rx, ry, rz}, solidFn, config, cap);
-
-    // Each boundary visited exactly once: from the lower region via its
-    // positive-direction faces only (the neighbor's mirrored negative face
-    // is handled inside rebuildInterEdgesForFacePair itself).
-    static constexpr std::array<Face, 3> kPositiveFaces = {Face::PlusX, Face::PlusY, Face::PlusZ};
-    for (int64_t rz = minRegion.z; rz <= maxRegion.z; ++rz)
-        for (int64_t ry = minRegion.y; ry <= maxRegion.y; ++ry)
-            for (int64_t rx = minRegion.x; rx <= maxRegion.x; ++rx) {
-                const RegionCoord region{rx, ry, rz};
-                for (Face f : kPositiveFaces) {
-                    if (!regionInBounds(neighborRegion(region, f), minRegion, maxRegion)) continue;
-                    detail::rebuildInterEdgesForFacePair(graph, region, f, solidFn, config);
-                }
-            }
-
-    return graph;
+    RegionGraphBuilder builder(minRegion, maxRegion, intraRegionMaxExpansions);
+    builder.advance(solidFn, config, 0);
+    return std::move(builder.graph());
 }
 
 // Incremental recompute for a single dirtied region (e.g. after a dig
