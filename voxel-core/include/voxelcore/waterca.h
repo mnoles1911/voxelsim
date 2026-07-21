@@ -142,12 +142,155 @@
 // identical next active set); step() is simply stepWithOrder() called with
 // the real active_ set's contents.
 //
-// Phase C — HYDROSTATIC (stub, documented hook only): full column pressure
-// (fills U-bends; breaching below water table = depth-scaled inrush jet) is
-// W2-proper, not v1. hydrostaticPass() exists as a no-op so the
-// read/apply -> hydrostatic pipeline shape is fixed now; implementing it
-// later must preserve both the volume-conservation invariant and the
-// active-set-order independence the same way Phase READ/APPLY do.
+// Phase C — HYDROSTATIC (kWaterCAVersion==3): connected-volume level
+// equalization, run once per tick after all 8 colored READ/APPLY rounds have
+// committed. This is what makes water fill a U-bend and communicating
+// vessels equalize, instead of only ever settling to each column's own LOCAL
+// gravity+lateral fixed point (which a U-bend's far arm can never reach —
+// gravity never flows up, and lateral only trades flow between same-z
+// neighbors, so nothing in Phase READ/APPLY ever pushes water up the far
+// arm no matter how much sits in the near one).
+//
+// ALGORITHM (per stepWithOrder() call, i.e. once per tick, not once per
+// round):
+//   1. CONNECTED-COMPONENT DISCOVERY: a bounded flood fill over voxel
+//      6-neighbors, SEEDED ONLY FROM WATER CELLS (fill > 0) found by
+//      scanning every brick in `touched` (the same active-plus-
+//      target-neighbors set Phase READ/APPLY already computed this tick —
+//      see stepWithOrder); a bare empty cell is never a seed (see the
+//      empty-cell rule below for why letting one be a seed is actively
+//      dangerous, not just useless). From there, which neighbors the fill
+//      may step onto differs by what the neighbor cell IS:
+//        - a cell that currently holds water (fill > 0, an O(1) WaterMap
+//          lookup): ALWAYS explorable, unconditionally, regardless of
+//          whether its owning brick is in `touched`, from ANY current cell.
+//          This is deliberate and load-bearing — without it, a settled (no
+//          longer active) stretch of a body of water would silently
+//          disappear from the volume accounting the instant it stopped
+//          changing, making "fill a U-bend" impossible whenever the source
+//          arm has already settled (the near-universal case: gravity/
+//          lateral drain a pour to its local fixed point in a handful of
+//          ticks, long before hydrostatic has had time to raise the far
+//          arm).
+//        - a cell that's currently empty (fill == 0): explorable ONLY if
+//          ALL THREE hold: (a) the step is not -z — never explore
+//          DOWNWARD into previously-untouched empty space (any water cell
+//          this pass ever looks at already finished settling this tick's
+//          gravity/lateral rounds; if it had empty space below it, it
+//          wouldn't be resting there — a -z step off it only ever reaches
+//          dry floor BESIDE the real body, not real headroom, and letting
+//          it through is what let an earlier version of this pass leak
+//          into fresh dry land beside an open, unwalled pool and never
+//          settle); (b) the CURRENT cell (the one this step is FROM) is
+//          either a FULL water cell (fill==255 — "this column is
+//          saturated, there may be pressure to rise") or an already-
+//          included empty cell (fill==0 — continuing a chain legitimately
+//          started at a full column); and (c) the neighbor's owning brick
+//          is in `touched` — the actual "bounded to the active region"
+//          cap, limiting how far into new headroom one tick's pass can
+//          reach. Condition (b) is the one that makes seeding from a bare
+//          empty cell dangerous: without it (and without gating on
+//          fullness at all), a mostly-empty brick sharing its 8-voxel
+//          height with a barely-filled water cell would pull that whole
+//          brick's dry headroom into the redistribution EVERY tick purely
+//          because it's the same brick, diluting the level and
+//          reactivating a permanently growing footprint with no genuine
+//          pressure behind it — measured empirically: an earlier version
+//          of this pass gated only on `touched`-membership (no fullness
+//          check, no -z exclusion) and waterca_pooling_spreads_flat_
+//          within_tolerance never settled.
+//      A component that needs more headroom than this tick's `touched`
+//      provides simply rises partway; the water moved into newly-nonzero
+//      cells reactivates their owning bricks (ordinary "changed" tracking
+//      below) which — via stepWithOrder's own existing 6-direction
+//      reactivation, see "Activity / settling" below — pulls the NEXT
+//      brick up in +z into next tick's active set, so the reachable
+//      ceiling climbs over the following ticks until the far arm reaches
+//      the true equalized level (water-side reach is unbounded per the
+//      first bullet, so only the "new, previously-dry" side of a rise is
+//      ever tick-limited — an already-full column of water is never
+//      artificially capped).
+//      A hard cell-count cap per component (kMaxHydrostaticComponentCells,
+//      waterca.cpp) is the backstop against the unbounded-through-water half
+//      of this rule making one enormous connected body (a whole persistent
+//      lake/ocean, later milestones) expensive every tick something merely
+//      touches its edge: a component that would exceed the cap is left
+//      completely unmodified this tick (never partially/incorrectly
+//      equalized off a truncated view) — safe, just deferred; see
+//      docs/status.md's W2 hydrostatic note for the "active-only"
+//      optimization (e.g. a persisted per-body union-find) this should get
+//      before a real large persistent body exists.
+//   2. LEVEL COMPUTATION: for each discovered component with at least one
+//      water cell and at least 2 cells total (trivial size-1 "components"
+//      are already their own fixed point — skip), sum its total current
+//      fill (`totalVol`, exactly conserved — this is a REDISTRIBUTION of
+//      existing volume among the component's own cells, never a source or
+//      sink) and sort its cells by z ascending (ties broken by (x,y)
+//      ascending — an arbitrary but FIXED, deterministic rule, exactly like
+//      the lateral rule's own east/west-before-north/south tie-break).
+//      Walking layers bottom-up, each layer's `n` cells get target fill 255
+//      apiece (consuming n*255 of `totalVol`) as long as enough volume
+//      remains to fill the WHOLE layer; the first layer that can't be fully
+//      filled gets `totalVol / n` apiece plus one extra unit each to the
+//      first `totalVol % n` cells in the fixed (x,y) tie-break order; every
+//      layer above that gets 0. totalVol never exceeds the component's
+//      total capacity (cells*255) since it's already the sum of THOSE SAME
+//      cells' own current fill, each already <= 255 — the allocation always
+//      has somewhere to put every unit, by construction, no separate
+//      capacity check needed.
+//   3. APPLY: each cell whose computed target differs from its current fill
+//      is written via the same setFillAccounted() path (and the SAME
+//      per-tick `changed` set) everything else in stepWithOrder uses —
+//      ledger update, homogeneous-empty collapse, and activity tracking all
+//      stay centralized there. A no-op write (target == current, the common
+//      case once near equilibrium) costs nothing extra: setFillAccounted
+//      already early-returns on equal old/new.
+//
+// CONSERVATION: structural, not checked-after-the-fact, for the same reason
+// Phase READ/APPLY's is — every write is an absolute target computed from a
+// partition of `totalVol` that sums back to exactly `totalVol` (integer
+// division + explicit remainder distribution, no rounding loss), and
+// distinct components never share a cell (each cell is visited at most once
+// across the whole flood fill, via the shared `visited` set), so summing
+// the deltas of every write across every component this tick nets to
+// exactly zero.
+//
+// ORDER INDEPENDENCE: hydrostaticPass() takes `touched` (the SAME
+// std::set<BrickKey> Phase READ/APPLY already built from `order`'s
+// CONTENTS, never its permutation) and reads current WaterMap state — which
+// is itself already order-independent by the time hydrostaticPass runs, by
+// Phase READ/APPLY's own property. hydrostaticPass never looks at `order`
+// itself, only `touched`'s contents and water_'s contents, both of which
+// are already permutation-invariant; component discovery is an intrinsic
+// property of the (touched-contents, water-contents) graph, and every
+// tie-break inside it (z then (x,y)) is a fixed rule over voxel
+// coordinates, never over iteration/discovery order. So hydrostaticPass is
+// exactly as order-independent as Phase READ/APPLY, by the same argument.
+//
+// CONVERGENCE: for a single, isolated U-bend/communicating-vessels scenario
+// (finite total volume, finite cross-sections), each tick's pass can only
+// ever move water toward the fully-connected-component equilibrium level
+// (never past it — the bottom-up allocation always produces the CORRECT
+// equilibrium for whatever portion of the component is currently visible),
+// and the visible portion is monotonically non-shrinking tick over tick
+// (once a brick is reachable via the water-side unbounded rule it stays
+// reachable, since water cells, once created, keep the owning brick
+// eligible; touched-region growth from the existing 6-direction
+// reactivation rule is also monotonic while anything is still changing).
+// So the visible-equilibrium level is monotonically non-decreasing on the
+// rising side and the process has a finite ceiling (the scenario's true
+// full-container equilibrium) it cannot overshoot — it must reach and then
+// hold that fixed point in finitely many ticks. Proved empirically in
+// tests/test_waterca.cpp (waterca_hydrostatic_u_bend_equalizes_and_settles,
+// waterca_hydrostatic_communicating_vessels_equalize) by running to
+// settling and checking both arms/tanks land within +/-1 of each other.
+//
+// NOT MODELED in v0 (later milestones, see plan §3.7 Layer B/C split): flow
+// MOMENTUM/velocity (a depth-scaled breach "inrush jet" needs Layer C's SWE
+// patches for that; this pass only ever computes a static equilibrium
+// level, instantly-ish over a few ticks, never a surge) and any
+// active-region-crossing optimization for very large persistent bodies (the
+// kMaxHydrostaticComponentCells cap above).
 //
 // -----------------------------------------------------------------------
 // Activity / settling
@@ -193,7 +336,16 @@ namespace vxc {
 // independent — see "Tick rules v1" header comment above (the CONTRACT is
 // versioned "v1" in prose since it's the first two-phase contract; the
 // bumped kWaterCAVersion constant is the actual invalidation signal).
-inline constexpr uint32_t kWaterCAVersion = 2;
+// v3 (==3): Phase C hydrostatic pass is now real (connected-volume level
+// equalization — see "Phase C — HYDROSTATIC" header comment below) instead
+// of the v2 no-op stub. Deliberate world-breaking change per
+// docs/determinism.md: step() now produces different per-tick values (and a
+// different digest) than v2 did on any scenario where hydrostatic actually
+// moves water (e.g. a U-bend) — the two-phase Phase READ/APPLY rounds
+// themselves are UNCHANGED, only the new Phase C pass appended after them
+// is new behavior. Every stored WaterCA-derived save/golden must be
+// re-pinned against v3; there is no v2 compatibility path.
+inline constexpr uint32_t kWaterCAVersion = 3;
 
 // Dense 8^3 fill-fraction brick. 0 = empty, 255 = full. Always brick edge
 // 8 (not templated like Brick<B> — water ticks at a fixed cell size).
@@ -297,9 +449,9 @@ public:
     uint64_t recomputeVolume() const;
 
     // One tick: two-phase read/apply over the active set snapshot taken at
-    // entry (see header comment "Tick rules v1"), then the (currently
-    // no-op) hydrostatic hook. Equivalent to
-    // stepWithOrder(activeSetSnapshot()).
+    // entry (see header comment "Tick rules v1"), then the hydrostatic
+    // connected-volume level-equalization pass (see header comment "Phase C
+    // — HYDROSTATIC"). Equivalent to stepWithOrder(activeSetSnapshot()).
     void step();
 
     // Current active set as a plain vector (BrickKeyLess order — but see
@@ -381,8 +533,17 @@ private:
 
     void activate(const BrickKey& k) { active_.insert(k); }
 
-    // v0 stub — see header comment "Phase C". Intentionally a no-op.
-    void hydrostaticPass(const std::vector<BrickKey>& order, std::set<BrickKey, BrickKeyLess>& changed);
+    // Phase C — see header comment "Phase C — HYDROSTATIC". Templated (like
+    // the free-function round helpers in waterca.cpp) so it can be handed
+    // stepWithOrder's per-tick memoizing `cachedSolid` lambda directly
+    // instead of the raw solid_ callback; only ever instantiated from
+    // stepWithOrder, in the same translation unit, so the out-of-line
+    // template definition lives entirely in waterca.cpp (must appear
+    // textually before stepWithOrder there for implicit instantiation to
+    // see it).
+    template <typename SolidLookup>
+    void hydrostaticPass(SolidLookup&& solid, const std::set<BrickKey, BrickKeyLess>& touched,
+                         std::set<BrickKey, BrickKeyLess>& changed);
 
     SolidFn solid_;
     WaterMap water_;

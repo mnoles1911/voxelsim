@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <unordered_set>
+#include <utility>
 
 namespace vxc {
 
@@ -26,6 +28,20 @@ struct VoxelKeyHash {
         return static_cast<size_t>(h);
     }
 };
+
+// Phase C (hydrostatic) full 6-neighbor offsets -- unlike `touched`'s
+// gravity-only -z target direction, the hydrostatic flood fill must look
+// UP too (see waterca.h "Phase C -- HYDROSTATIC" for why: finding a U-bend's
+// far-arm headroom).
+constexpr int kHydroDx[6] = {1, -1, 0, 0, 0, 0};
+constexpr int kHydroDy[6] = {0, 0, 1, -1, 0, 0};
+constexpr int kHydroDz[6] = {0, 0, 0, 0, 1, -1};
+
+// Backstop cap on one hydrostatic component's cell count -- see waterca.h
+// "Phase C -- HYDROSTATIC" for the full rationale (the water-side flood
+// fill is deliberately unbounded; this is what keeps one enormous connected
+// body from making a single tick's pass unbounded too).
+constexpr size_t kMaxHydrostaticComponentCells = 65536;
 
 // The ONE fixed enumeration used everywhere in this file: as a cell's own
 // outgoing-flow priority (source-side cap, header "Tick rules v1") AND,
@@ -450,11 +466,159 @@ uint64_t WaterCA::recomputeVolume() const {
     return sum;
 }
 
-void WaterCA::hydrostaticPass(const std::vector<BrickKey>&, std::set<BrickKey, BrickKeyLess>&) {
-    // Stub (header comment "Phase C"): full hydrostatic column pressure
-    // (U-bends, breach inrush) is W2-proper, not v1. Intentionally a no-op —
-    // exists so the pipeline shape (read/apply -> hydrostatic) is fixed for
-    // the next version to fill in without reshuffling step().
+template <typename SolidLookup>
+void WaterCA::hydrostaticPass(SolidLookup&& solid, const std::set<BrickKey, BrickKeyLess>& touched,
+                              std::set<BrickKey, BrickKeyLess>& changed) {
+    // Global "have we ever considered this voxel this tick" set, shared
+    // across every seed attempt below -- guarantees each cell is visited at
+    // most once across the WHOLE pass (not just within one component's own
+    // BFS), which is both the perf property (no component is ever
+    // rediscovered from a second seed) and part of why this is
+    // order-independent (the partition into components is a property of
+    // the graph, not of which seed happened to reach a cell first).
+    std::unordered_set<VoxelKey, VoxelKeyHash> visited;
+    visited.reserve(touched.size() * 32);
+
+    auto inTouched = [&touched](const BrickKey& k) { return touched.find(k) != touched.end(); };
+
+    // Deterministic seed scan: `touched` is already a sorted std::set, and
+    // each brick's 512 cells are walked in fixed (z,y,x) order -- matches
+    // the fixed-order doctrine every other phase in this file follows, even
+    // though (see header comment) the actual component PARTITION this
+    // produces doesn't depend on scan order at all, only which cells are
+    // reachable from which. Seeds are WATER cells ONLY (fill > 0) -- see
+    // "empty-cell gating" below for why seeding from a bare empty cell would
+    // let a pass wander through arbitrary connected dry space with no water
+    // anywhere near it.
+    for (const BrickKey& key : touched) {
+        for (int z = 0; z < kEdge; ++z)
+            for (int y = 0; y < kEdge; ++y)
+                for (int x = 0; x < kEdge; ++x) {
+                    const int64_t vx = int64_t(key.x) * kEdge + x;
+                    const int64_t vy = int64_t(key.y) * kEdge + y;
+                    const int64_t vz = int64_t(key.z) * kEdge + z;
+                    const VoxelKey seed{vx, vy, vz};
+                    if (visited.count(seed)) continue;
+                    if (getFill(vx, vy, vz) == 0) continue; // not a water cell: never a seed (see above)
+
+                    // Bounded-through-air / unbounded-through-water flood
+                    // fill (header comment "Phase C -- HYDROSTATIC" step 1).
+                    //
+                    // Empty-cell gating (the fix for an earlier version of
+                    // this pass that never settled on an open, unwalled
+                    // pool): an empty neighbor is explorable ONLY if (a) the
+                    // CURRENT cell is itself either a FULL water cell
+                    // (fill==255 -- "this column is saturated, there may be
+                    // pressure to rise") or an already-included empty cell
+                    // (fill==0 -- continuing a chain that was legitimately
+                    // started at a full column), AND (b) the step is not
+                    // -z (never explore NEWLY-discovered empty space
+                    // downward -- any water cell reaching this pass already
+                    // settled this tick's gravity/lateral rounds, so if it
+                    // had empty space below it it wouldn't be resting there
+                    // yet; going down would only ever reach dry floor
+                    // BESIDE the real body, not real headroom), AND (c) the
+                    // neighbor's owning brick is in `touched` (the actual
+                    // "bounded to the active region" cap). Without the
+                    // fill==255 gate on the FIRST air-ward step, any
+                    // partially-filled water cell whose owning brick simply
+                    // happens to span several empty voxels above it (a
+                    // brick is 8 voxels tall; that headroom is `touched`
+                    // purely by being the SAME brick as the water, whether
+                    // or not the water actually needs it) would pull that
+                    // dry headroom into the redistribution every tick,
+                    // diluting the level and reactivating a permanently
+                    // growing footprint -- never a genuine pressure
+                    // response, just brick-granularity leakage.
+                    std::vector<VoxelKey> stack{seed};
+                    visited.insert(seed);
+                    std::vector<VoxelKey> cells;
+                    bool overflowed = false;
+                    uint64_t totalVol = 0;
+
+                    while (!stack.empty()) {
+                        const VoxelKey c = stack.back();
+                        stack.pop_back();
+                        const uint8_t cFill = getFill(c.x, c.y, c.z);
+                        if (!overflowed) {
+                            cells.push_back(c);
+                            totalVol += cFill;
+                            if (cells.size() > kMaxHydrostaticComponentCells) overflowed = true;
+                        }
+                        const bool canEnterAir = cFill == 255 || cFill == 0;
+                        for (int i = 0; i < 6; ++i) {
+                            const int64_t nx = c.x + kHydroDx[i];
+                            const int64_t ny = c.y + kHydroDy[i];
+                            const int64_t nz = c.z + kHydroDz[i];
+                            const VoxelKey nk{nx, ny, nz};
+                            if (visited.count(nk)) continue;
+                            const uint8_t nFill = getFill(nx, ny, nz);
+                            if (nFill == 0) {
+                                if (kHydroDz[i] < 0) continue;               // never explore downward into empty space
+                                if (!canEnterAir) continue;                  // gate: full water or already-air only
+                                if (!inTouched(waterKeyForVoxel(nx, ny, nz))) continue; // bounded to active region
+                            }
+                            if (solid(nx, ny, nz) != MAT_AIR) {
+                                visited.insert(nk);
+                                continue;
+                            }
+                            visited.insert(nk);
+                            stack.push_back(nk);
+                        }
+                    }
+
+                    // Too big to safely handle this tick (deferred, not
+                    // truncated-and-wrong -- see header comment), or a
+                    // trivial single-cell "component" (just the seed,
+                    // nothing reachable) that's already its own fixed
+                    // point: nothing to write. (Always has water: the seed
+                    // itself does, unconditionally.)
+                    if (overflowed || cells.size() < 2) continue;
+
+                    // Level computation (header comment step 2): bottom-up
+                    // by z, fixed (x,y)-ascending tie-break within a layer.
+                    std::sort(cells.begin(), cells.end(), [](const VoxelKey& a, const VoxelKey& b) {
+                        if (a.z != b.z) return a.z < b.z;
+                        if (a.x != b.x) return a.x < b.x;
+                        return a.y < b.y;
+                    });
+
+                    std::vector<std::pair<VoxelKey, uint8_t>> writes;
+                    writes.reserve(cells.size());
+                    uint64_t remaining = totalVol;
+                    size_t idx = 0;
+                    while (idx < cells.size()) {
+                        size_t j = idx;
+                        const int64_t layerZ = cells[idx].z;
+                        while (j < cells.size() && cells[j].z == layerZ) ++j;
+                        const size_t n = j - idx;
+                        const uint64_t layerCap = static_cast<uint64_t>(n) * 255u;
+                        if (remaining >= layerCap) {
+                            for (size_t k = idx; k < j; ++k) writes.emplace_back(cells[k], uint8_t(255));
+                            remaining -= layerCap;
+                        } else if (remaining > 0) {
+                            const uint64_t base = remaining / n;
+                            const uint64_t rem = remaining % n; // first `rem` cells (fixed x,y order) get +1
+                            for (size_t k = idx; k < j; ++k) {
+                                const uint64_t v = base + ((k - idx) < rem ? 1u : 0u);
+                                writes.emplace_back(cells[k], static_cast<uint8_t>(v));
+                            }
+                            remaining = 0;
+                        } else {
+                            for (size_t k = idx; k < j; ++k) writes.emplace_back(cells[k], uint8_t(0));
+                        }
+                        idx = j;
+                    }
+
+                    // Apply (header comment step 3): absolute targets
+                    // through the normal accounted-write path -- ledger,
+                    // homogeneous-empty collapse, and `changed` tracking
+                    // all stay centralized in setFillAccounted, exactly
+                    // like every other write in this file. A target equal
+                    // to the cell's current fill is a no-op there.
+                    for (const auto& [vk, target] : writes) setFillAccounted(vk.x, vk.y, vk.z, target, &changed);
+                }
+    }
 }
 
 void WaterCA::step() { stepWithOrder(activeSetSnapshot()); }
@@ -699,7 +863,7 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
         if (differs) changed.insert(t);
     }
 
-    hydrostaticPass(order, changed);
+    hydrostaticPass(cachedSolid, touched, changed);
 
     // Next active set = changed bricks UNION every one of their 6
     // face-neighbors (all 6, not just the 5 "outgoing target" directions
