@@ -9,9 +9,15 @@ Tile generation + serving for Voxel Earth (plan §3.1 steps 1–2). Serves
   API, voxel-core consumption) works without a GPU.
 - **diffusion**: the canonical provider wrapping
   [terrain-diffusion](https://github.com/xandergos/terrain-diffusion).
-  Currently a stub with a bring-up checklist in
-  `terrain_service/providers/diffusion.py` — needs a CUDA machine (the
-  project targets one rented 4090-class worker in production, plan §3.4).
+  Config/adapter/validation are fully implemented and tested in
+  `terrain_service/providers/diffusion.py`; only the actual model call
+  (`DiffusionProvider._call_model`) needs a CUDA machine (the project
+  targets one rented 4090-class worker in production, plan §3.4). Run with
+  `dry_run=True` (or `TERRAIN_DIFFUSION_DRY_RUN=1` / `pregen --dry-run`) to
+  exercise the full config→adapter→validate→encode path with
+  synthetic-fallback rasters, no GPU needed. See
+  `terrain-service/docs/diffusion-bringup.md` for the cloud bring-up
+  runbook.
 
 ## Run
 
@@ -23,7 +29,9 @@ curl -s "localhost:5000/tile?seed=1&x=0&y=0&scale=1" | xxd | head
 ```
 
 Environment: `TERRAIN_PROVIDER` (`synthetic`|`diffusion`),
-`TERRAIN_CACHE_DIR` (default `./tile-cache`).
+`TERRAIN_CACHE_DIR` (default `./tile-cache`), `TERRAIN_DIFFUSION_DRY_RUN`
+(`1` => diffusion provider runs in dry-run/synthetic-fallback mode, no GPU
+needed).
 
 ## Pre-generate tiles offline
 
@@ -55,6 +63,10 @@ docker run -v tile-cache:/data/tile-cache terrain-service \
 # Fetch a tile via the running server
 curl -s "localhost:8000/tile?seed=42&x=0&y=0&scale=1" | xxd | head
 ```
+
+`Dockerfile.diffusion` is a separate CUDA-base image for the real
+terrain-diffusion GPU worker (unbuildable without GPU cloud network access
+here — build it on the rented GPU box). See `docs/diffusion-bringup.md`.
 
 ## Contracts that matter
 
