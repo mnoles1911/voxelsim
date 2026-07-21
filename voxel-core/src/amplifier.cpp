@@ -2,8 +2,84 @@
 
 #include "voxelcore/biome.h"
 
+#include <atomic>
+
 namespace vxc {
 namespace {
+
+// ---------------------------------------------------------------------------
+// Tile-raster memo (performance only — provably cannot change any output).
+//
+// Measured on this box (clang -O2, seed 20260719, 409'600 columns): a column
+// costs 0.946 us, of which the five ITileSampler reads (four elevationMm
+// corners + one climate) are 0.574 us — 61%. Those reads are a function of the
+// TILE PIXEL, and a 30 m pixel covers 300x300 = 90'000 voxel columns, so the
+// same handful of values was being recomputed tens of thousands of times: the
+// whole 640x640-column benchmark region spans just 25 distinct tile pixels.
+// SyntheticTileSampler in particular evaluates seven value-noise octaves (28
+// hashes) per elevationMm call, and it is the sampler the UE runtime uses by
+// default (only -VoxelTileDir switches to the raster-backed TileGridSampler).
+//
+// Memoising is safe because ITileSampler is a read-only view of canonical tile
+// DATA: elevationMm/climate are pure functions of (sampler, px, py). (They are
+// non-const only so an implementation may lazily page tiles in; that changes
+// no VALUE.) Determinism is therefore untouched — a hit and a miss return
+// bit-identical results, and no worldgen constant or iteration order moves.
+//
+// The tables are `thread_local`, so the memo needs no lock and adds no
+// cross-thread contention on the shared Amplifier the UE job pool calls into.
+// They are direct-mapped (no LRU bookkeeping on the hot path); a colliding
+// probe simply misses and recomputes, which is always correct.
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t kElevSlots = 256;   // ~6 KB/thread
+constexpr uint32_t kClimateSlots = 64; // ~2 KB/thread
+
+struct ElevSlot {
+    uint64_t amp = 0; // owning Amplifier id; 0 == empty (ids start at 1)
+    int64_t px = 0, py = 0;
+    int32_t value = 0;
+};
+
+struct ClimateSlot {
+    uint64_t amp = 0;
+    int64_t px = 0, py = 0;
+    ClimateSample value{};
+};
+
+// Cheap index mix. Only distribution matters — collisions cost a recompute,
+// never a wrong answer.
+constexpr uint32_t slotIndex(uint64_t amp, int64_t px, int64_t py, uint32_t slots) {
+    uint64_t h = static_cast<uint64_t>(px) * 0x9E3779B97F4A7C15ull;
+    h ^= static_cast<uint64_t>(py) * 0xC2B2AE3D27D4EB4Full;
+    h ^= amp * 0x165667B19E3779F9ull;
+    return static_cast<uint32_t>((h >> 32) & (slots - 1));
+}
+
+int32_t cachedElevationMm(uint64_t amp, ITileSampler& tiles, int64_t px, int64_t py) {
+    static thread_local ElevSlot slots[kElevSlots];
+    ElevSlot& s = slots[slotIndex(amp, px, py, kElevSlots)];
+    if (s.amp == amp && s.px == px && s.py == py) return s.value;
+    const int32_t v = tiles.elevationMm(px, py);
+    s.amp = amp;
+    s.px = px;
+    s.py = py;
+    s.value = v;
+    return v;
+}
+
+ClimateSample cachedClimate(uint64_t amp, ITileSampler& tiles, int64_t px, int64_t py) {
+    static thread_local ClimateSlot slots[kClimateSlots];
+    ClimateSlot& s = slots[slotIndex(amp, px, py, kClimateSlots)];
+    if (s.amp == amp && s.px == px && s.py == py) return s.value;
+    const ClimateSample v = tiles.climate(px, py);
+    s.amp = amp;
+    s.px = px;
+    s.py = py;
+    s.value = v;
+    return v;
+}
+
 
 // Detail octave table v1 (worldgen-versioned constant, docs/determinism.md).
 // latticeMm chosen so octaves nest across brick sizes; amplitudes in mm before
@@ -27,6 +103,11 @@ constexpr int64_t slopeScaleQ10(int64_t slopeMmPerPx) {
 
 } // namespace
 
+uint64_t Amplifier::nextId() {
+    static std::atomic<uint64_t> counter{0};
+    return counter.fetch_add(1, std::memory_order_relaxed) + 1; // 0 means "empty slot"
+}
+
 ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     const int64_t xMm = vx * kVoxelSizeMm;
     const int64_t yMm = vy * kVoxelSizeMm;
@@ -35,10 +116,10 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // Bilinear base elevation from the tile raster (exact integer math).
     const int64_t px = floorDiv(xMm, pxMm), py = floorDiv(yMm, pxMm);
     const int64_t fx = xMm - px * pxMm, fy = yMm - py * pxMm;
-    const int64_t e00 = tiles_->elevationMm(px, py);
-    const int64_t e10 = tiles_->elevationMm(px + 1, py);
-    const int64_t e01 = tiles_->elevationMm(px, py + 1);
-    const int64_t e11 = tiles_->elevationMm(px + 1, py + 1);
+    const int64_t e00 = cachedElevationMm(id_, *tiles_, px, py);
+    const int64_t e10 = cachedElevationMm(id_, *tiles_, px + 1, py);
+    const int64_t e01 = cachedElevationMm(id_, *tiles_, px, py + 1);
+    const int64_t e11 = cachedElevationMm(id_, *tiles_, px + 1, py + 1);
     const int64_t gx = pxMm - fx, gy = pxMm - fy;
     const int64_t baseMm =
         ((e00 * gx + e10 * fx) * gy + (e01 * gx + e11 * fx) * fy) / (pxMm * pxMm);
@@ -57,7 +138,7 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     }
     detailMm = detailMm * sScale / 1024;
 
-    const ClimateSample cl = tiles_->climate(px, py);
+    const ClimateSample cl = cachedClimate(id_, *tiles_, px, py);
 
     ColumnSample col;
     col.surfaceMm = clampi32(baseMm + detailMm, -8'000'000, 9'000'000);
@@ -90,6 +171,30 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // GpuColumnSample. Mirrored bit-exactly there.
     col.cave = caveColumnFor(seed_, vx, vy, col.surfaceMm);
     return col;
+}
+
+// Per-thread memo of whole columns, for the voxel-walking callers described in
+// amplifier.h. Same direct-mapped, lock-free, never-reused-id scheme as the
+// tile memo above, and equally output-neutral: a hit returns the value a miss
+// would have computed. 256 slots x 96 bytes = 24 KB/thread; a z-innermost walk
+// (the common shape) needs only one live slot, and 256 additionally covers a
+// row-major sweep across a brick footprint.
+const ColumnSample& Amplifier::columnCached(int64_t vx, int64_t vy) const {
+    constexpr uint32_t kColumnSlots = 256;
+    struct ColumnSlot {
+        uint64_t amp = 0; // 0 == empty (ids start at 1)
+        int64_t vx = 0, vy = 0;
+        ColumnSample value;
+    };
+    static thread_local ColumnSlot slots[kColumnSlots];
+
+    ColumnSlot& s = slots[slotIndex(id_, vx, vy, kColumnSlots)];
+    if (s.amp == id_ && s.vx == vx && s.vy == vy) return s.value;
+    s.value = column(vx, vy);
+    s.amp = id_;
+    s.vx = vx;
+    s.vy = vy;
+    return s.value;
 }
 
 MaterialId Amplifier::stratigraphyAt(const ColumnSample& col, int64_t vz) {
