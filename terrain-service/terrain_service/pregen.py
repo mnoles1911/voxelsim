@@ -58,6 +58,16 @@ def main() -> int:
         choices=["synthetic", "diffusion"],
         help="Tile provider (default synthetic)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Diffusion provider only: run in dry-run mode (synthetic-fallback "
+            "rasters through the real config/adapter/validate path, no GPU "
+            "needed). Lets you exercise/pregen the pipeline before a real "
+            "checkpoint is wired up. See docs/diffusion-bringup.md."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -68,7 +78,7 @@ def main() -> int:
 
     # Initialize provider and cache
     try:
-        provider = _make_provider(args.provider)
+        provider = _make_provider(args.provider, dry_run=args.dry_run)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

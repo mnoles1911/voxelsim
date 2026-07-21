@@ -6,6 +6,13 @@ Configuration via environment:
 
     TERRAIN_PROVIDER   synthetic (default) | diffusion
     TERRAIN_CACHE_DIR  cache root (default: ./tile-cache)
+    TERRAIN_DIFFUSION_DRY_RUN
+                       1 => diffusion provider runs in dry-run mode
+                       (synthetic-fallback rasters through the real
+                       config/adapter/validate path, no GPU needed).
+                       See providers/diffusion.py and
+                       docs/diffusion-bringup.md. Ignored for
+                       TERRAIN_PROVIDER=synthetic.
 """
 
 from __future__ import annotations
@@ -19,19 +26,22 @@ from .cache import TileCache
 from .providers.synthetic import SyntheticProvider
 
 
-def _make_provider(name: str):
+def _make_provider(name: str, dry_run: bool = False):
     if name == "synthetic":
         return SyntheticProvider()
     if name == "diffusion":
         from .providers.diffusion import DiffusionProvider
 
-        return DiffusionProvider()
+        return DiffusionProvider(dry_run=dry_run)
     raise ValueError(f"unknown TERRAIN_PROVIDER {name!r}")
 
 
 def create_app(provider=None, cache: TileCache | None = None) -> Flask:
     app = Flask(__name__)
-    provider = provider or _make_provider(os.environ.get("TERRAIN_PROVIDER", "synthetic"))
+    provider = provider or _make_provider(
+        os.environ.get("TERRAIN_PROVIDER", "synthetic"),
+        dry_run=os.environ.get("TERRAIN_DIFFUSION_DRY_RUN", "") == "1",
+    )
     cache = cache or TileCache(os.environ.get("TERRAIN_CACHE_DIR", "tile-cache"))
 
     @app.get("/healthz")
