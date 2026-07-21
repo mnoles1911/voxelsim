@@ -8,23 +8,35 @@ namespace vxc {
 
 // Bumped on any deliberate change to worldgen math (hash, octave tables,
 // stratigraphy constants). Invalidates edit logs and golden digests.
-inline constexpr uint32_t kWorldGenVersion = 1;
+inline constexpr uint32_t kWorldGenVersion = 2;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 
 using MaterialId = uint8_t;
 
-// Material set v0 (amplifier stratigraphy). Water is implicit (z<0 above
-// terrain) and never stored in terrain bricks.
+// Material set v1 (amplifier stratigraphy + M4 per-biome surface materials,
+// voxelcore/biome.h). Water is implicit (z<0 above terrain) and never stored
+// in terrain bricks. IDs are append-only — never renumber an existing entry,
+// it would invalidate every saved edit log.
 enum Material : MaterialId {
     MAT_AIR = 0,
-    MAT_BEDROCK = 1,
-    MAT_ROCK = 2, // sedimentary layers
-    MAT_GRAVEL = 3,
-    MAT_SAND = 4,
-    MAT_SUBSOIL = 5,
-    MAT_TOPSOIL = 6,
-    MAT_SNOW = 7,
+    MAT_BEDROCK = 1,       // deep unweathered rock, unbounded depth floor
+    MAT_ROCK = 2,          // sedimentary layers between subsoil and bedrock
+    MAT_GRAVEL = 3,        // coarse subsoil under sandy surfaces (beach/desert)
+    MAT_SAND = 4,          // beach + desert surface
+    MAT_SUBSOIL = 5,       // generic layer between topsoil and rock
+    MAT_TOPSOIL = 6,       // generic fertile soil; temperate-forest surface
+    MAT_SNOW = 7,          // legacy v0 high-altitude cap (superseded by
+                            // MAT_PERMAFROST/MAT_ROCK for biome surfaces, kept
+                            // stable for any existing saved edit logs)
+    MAT_GRASS = 8,         // grassland surface
+    MAT_JUNGLE_SOIL = 9,   // rainforest surface: dark, wet, organic-rich soil
+    MAT_SAVANNA_GRASS = 10,// savanna surface: dry, seasonal grass
+    MAT_PODZOL = 11,       // taiga surface: acidic boreal-forest soil
+    MAT_PERMAFROST = 12,   // tundra/alpine surface: frozen ground
+    MAT_MUD = 13,          // ocean floor / future wetland surface
+    MAT_CLAY = 14,         // fine sediment; headroom for future
+                            // floodplain/riverbank biomes (M4 rounds 2-3)
     kMaterialCount
 };
 

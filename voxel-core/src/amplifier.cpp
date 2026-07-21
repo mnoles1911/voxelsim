@@ -1,5 +1,7 @@
 #include "voxelcore/amplifier.h"
 
+#include "voxelcore/biome.h"
+
 namespace vxc {
 namespace {
 
@@ -73,16 +75,13 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     const uint64_t bj = hash2(seed_, vx >> 6, vy >> 6, CH_BEDROCK_JITTER);
     col.bedrockDepthMm = static_cast<int32_t>(40000 + ((bj >> 48) * 20000) / 65536);
 
-    // Surface material from climate + elevation. Thresholds are v0 placeholders
-    // (real biome tables arrive in M4).
-    if (cl.temperature < 70 || col.surfaceMm > 2'800'000) {
-        col.surfaceMat = MAT_SNOW;
-    } else if ((cl.precipitation < 45 && cl.temperature > 150) ||
-               (col.surfaceMm > -2000 && col.surfaceMm < 3000)) {
-        col.surfaceMat = MAT_SAND; // desert, or beach near sea level
-    } else {
-        col.surfaceMat = MAT_TOPSOIL;
-    }
+    // Surface material from biome classification (M4): morphology gates
+    // (slope, coastal band, temperature-adjusted treeline) run before the
+    // Whittaker climate lookup — see voxelcore/biome.h, mirrored bit-exactly
+    // in worldgen.hlsl's ColumnMain.
+    const BiomeId biome = classifyBiome(cl.temperature, cl.precipitation, cl.seasonality,
+                                         col.surfaceMm, slopeMmPerPx);
+    col.surfaceMat = biomeSurfaceMaterial(biome, col.surfaceMm);
     return col;
 }
 
