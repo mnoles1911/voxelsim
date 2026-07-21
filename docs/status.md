@@ -757,6 +757,96 @@ chunk scene proxy to mesh the island instead of per-voxel instanced cubes;
   float/double anywhere in `pathfind.h` (float-ban clean; header-only, no
   `.cpp`, no `voxel-core/CMakeLists.txt` library-source change needed).
 
+### Region-graph hierarchical layer (M6, worktree agent)
+
+- [x] **Single-level portal-graph acceleration layer**
+  (`voxelcore/regiongraph.h`) sitting on top of `pathfind.h`'s fine A*
+  (consumed, not duplicated — calls `detail::classifyMove` directly, so "the
+  same walkability notion as pathfind.h" can't drift) — the M6 primitive
+  that lets hundreds of NPCs plan paths cheaply instead of each running a
+  world-spanning fine search. Space is partitioned into fixed 16-voxel cubic
+  `RegionCoord` regions (power-of-two edge, documented compile-time
+  constant `kRegionEdge`). Each region face may have zero or more
+  `Portal`s — maximal 4-connected clusters of boundary cells where a
+  single-step crossing is a valid `classifyMove` (Walk/Mine for the four
+  side faces, Climb/Fall for top/bottom; StepUp/StepDown/Jump/Bridge are
+  documented as NOT portal-forming in v0). Portals are *mirrored*: a
+  doorway produces two Portal nodes (one per region) joined by a cheap
+  inter-region edge, rather than one shared node — this is what makes
+  incremental recompute tractable (see below). A proof in the header
+  comment shows mirrored portals always land on the *identical*
+  representative cell (offset by the face normal), so edge construction is
+  a direct lookup, not a geometric search. Intra-region edges connect every
+  pair of portals in the same region via a bounded fine `findPath` confined
+  to that region's own `SearchWindow` (skipped, not infinite-cost, if
+  unreachable within the region). `buildRegionGraph(solidFn, minRegion,
+  maxRegion, config)` builds the graph over a caller-bounded region-space
+  box (same "caller supplies the region it cares about" doctrine as
+  `connectivity.h`/`pathfind.h` — never an unbounded world scan).
+- [x] **Hierarchical query** `findHierarchicalPath(graph, start, goal,
+  solidFn, config, refine)`: same-region start/goal skips the abstract
+  graph entirely (one bounded fine search); otherwise, bounded fine
+  searches from `start` to every portal in its region and from every portal
+  in goal's region to `goal`, then a zero-heuristic multi-source Dijkstra
+  over the portal graph with `PortalKeyLess` (region, then face, then cell
+  — extending `PathCoordLess`'s z-major convention to portals) as the ONLY
+  tie-break, independent of portal storage/insertion order. Never falls
+  back to an unbounded direct search if the two regions are disconnected in
+  the abstract graph — reports not-found instead (proved by
+  `regiongraph_sealed_region_no_abstract_path_no_fallback`, where a
+  doorway-less bedrock wall seals two regions and both a direct fine search
+  and the hierarchical query agree the goal is unreachable).
+  `refine=true` additionally stitches a concrete step-by-step `PathResult`:
+  intra-region hops via a fresh bounded fine `findPath`, inter-region hops
+  as a single synthesized `classifyMove` step (no search needed — this is
+  where most of the cheapness comes from).
+- [x] **Incremental dirtying** `markRegionDirty(graph, region, solidFn,
+  config)`: recomputes ONLY that region's own portals/intra-edges, its
+  up-to-6 neighbors' *mirrored-face* portals/intra-edges, and every
+  inter-region edge incident to the dirtied region — never the whole graph.
+  Portals are tombstoned (`Portal::alive=false`) rather than physically
+  erased so ids/edges never need an O(n) fix-up pass; `RegionGraph::digest()`
+  sorts a canonical copy by `PortalKeyLess` and resolves edges through that
+  rank, which is what makes tombstone-and-append storage still produce a
+  digest byte-identical to a from-scratch rebuild. Proved by
+  `regiongraph_incremental_recompute_matches_from_scratch_rebuild`: edit a
+  wall+doorway into one region's own boundary brick, `markRegionDirty` that
+  region against the post-edit world, and compare digests against
+  `buildRegionGraph` called fresh on the same post-edit world — identical.
+- [x] **Cheapness demonstrated**
+  (`regiongraph_hierarchical_matches_direct_reachability_and_is_cheaper`,
+  5-region-long open world, world x 0..79): a direct world-spanning fine
+  `findPath` costs 2000 expansions; the hierarchical query's corridor-only
+  cost (entry-region + exit-region searches — the number that stays
+  roughly CONSTANT as more regions are crossed, since the portal Dijkstra
+  itself touches zero fine-A* cells) is 676 expansions, ~3x cheaper; even
+  fully refined to a concrete step path it's 1495, still cheaper than the
+  direct search. The one-time graph build itself cost 1599 expansions,
+  amortized across every future query against that graph (the point of the
+  architecture for hundreds of concurrent NPCs).
+- [x] **Tests** (`voxel-core/tests/test_regiongraph.cpp`, 5 cases, wired
+  into `tests/CMakeLists.txt` next to `test_pathfind.cpp`): (a) a
+  full-height/full-width bedrock wall with a single-cell doorway produces
+  exactly one portal on each mirrored side, at the expected representative
+  cell; (b) hierarchical-vs-direct reachability agreement + the cheapness
+  numbers above; (c) a sealed region yields no abstract path on either
+  side, no unbounded fallback; (d) `markRegionDirty` matches a from-scratch
+  rebuild byte-for-byte after a boundary-changing edit; (e) determinism —
+  two builds of the same world produce an identical digest, pinned golden
+  `0xeb05deb529b8f143`.
+- [x] **Build/warnings**: full `vxc_tests` suite (114/114, all pre-existing
+  + 5 new) green via LLVM-MinGW clang++ 22.1.5 (`vxc_tests` target
+  specifically, not `vxc_gpu`, per the no-CUDA/no-Vulkan dev box).
+  Standalone strict compile of `test_regiongraph.cpp` under `-Wall -Wextra
+  -Wconversion -Wsign-conversion -Werror`: clean. No float/double anywhere
+  in `regiongraph.h` or the test file (float-ban clean; header-only, no
+  `voxel-core/CMakeLists.txt` library-source change needed).
+- [ ] Follow-ups (documented as v0 simplifications, not built): multi-level
+  region nesting (Tier 1/2 of plan §3.6); StepUp/StepDown/Jump-forming
+  portals at region boundaries; portal-id compaction after sustained dirty
+  churn (tombstones accumulate — periodic full rebuild reclaims them); UE
+  integration and real per-brick dirty-set plumbing into `markRegionDirty`.
+
 ## M0 GPU track (ADR-0001)
 
 - [x] Worldgen HLSL kernel (ColumnMain, VoxelizeMain, MeshCountMain,
