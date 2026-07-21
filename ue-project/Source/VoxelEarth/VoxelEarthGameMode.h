@@ -68,6 +68,22 @@ private:
 	FTimerHandle BreachTestTimerHandle;
 	FTimerHandle BreachTestSettleTimerHandle;
 
+	// ADR-0003 item 3 verification (docs/adr/0003-hydrostatic-persistent-body.md
+	// "item 2 resolution"): -VoxelWaterMemoTest[=<delaySeconds>] carves a
+	// basin, settles a water pool in it, then runs dig/place/carve/collapse
+	// edits beneath and around it, logging the water digest after every step
+	// plus one final summary line -- the cross-process A/B this ADR's proof
+	// is built from (run once with -ExecCmds="voxel.Water.SolidCacheEnabled 0",
+	// once with 1, same seed, diff the FINAL line's waterDigest). See the .cpp
+	// for the exact scenario and docs/status.md's "Water edit-notification
+	// completeness + memo enablement" entry for the result. Every stage after
+	// the first uses a throwaway local FTimerHandle (fire-and-forget, never
+	// cancelled) -- only the entry point needs a member.
+	FTimerHandle WaterMemoTestTimerHandle;
+	bool bWaterMemoTestActive = false;
+	double WaterMemoTestBasinXUU = 0.0;
+	double WaterMemoTestBasinYUU = 0.0;
+
 	// M5 destruction (first slice, docs/m4-plan.md Round 2): -VoxelTreeTest
 	// places a stand-in tree FIXTURE near spawn; -VoxelChopTest (implies
 	// -VoxelTreeTest) then carves through its trunk after the tree has settled,

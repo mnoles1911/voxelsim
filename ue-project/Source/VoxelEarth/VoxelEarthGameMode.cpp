@@ -371,6 +371,25 @@ void AVoxelEarthGameMode::BeginPlay()
 						}
 					}
 
+					// ADR-0003 item 3 water-memo-test framing: stand back and
+					// slightly above the basin so both the settled/redistributed
+					// water AND the collapsed roof debris around it are in
+					// frame. Highest priority of all -- this switch's whole
+					// point is to SEE water react to the edit sequence.
+					if (bWaterMemoTestActive && PC)
+					{
+						const double BasinSurfUU =
+							ShotTerrain ? ShotTerrain->GetSurfaceHeightUU(WaterMemoTestBasinXUU, WaterMemoTestBasinYUU) : 0.0;
+						const FVector BasinMid(WaterMemoTestBasinXUU, WaterMemoTestBasinYUU, BasinSurfUU + 100.0);
+						const FVector CamPos = BasinMid + FVector(-1400.0, -1000.0, 900.0); // back / side / up
+						const FRotator Look = (BasinMid - CamPos).Rotation();
+						if (APawn* P = PC->GetPawn())
+						{
+							P->SetActorLocation(CamPos);
+							P->SetActorRotation(Look);
+						}
+						PC->SetControlRotation(Look);
+					}
 					// M5 chop-test framing (task item 5): stand back from the tree
 					// column and look at it, so the detached/fallen canopy is in
 					// frame. Highest priority when a tree/chop test drove the run.
@@ -379,7 +398,7 @@ void AVoxelEarthGameMode::BeginPlay()
 					// standing (wall-supported) part of the slab and the fallen
 					// span are both in frame. Highest priority of all -- the
 					// whole point of this run is to SEE the aftermath.
-					if (bStructureTestActive && PC)
+					else if (bStructureTestActive && PC)
 					{
 						const double StructSurfUU =
 							ShotTerrain ? ShotTerrain->GetSurfaceHeightUU(StructureTestColumnXUU, StructureTestColumnYUU) : 0.0;
@@ -642,6 +661,378 @@ void AVoxelEarthGameMode::BeginPlay()
 					}),
 				BreachTestDelaySeconds, false);
 		}
+	}
+
+	// ADR-0003 item 3 verification (docs/adr/0003-hydrostatic-persistent-body.md
+	// "item 2 resolution"): -VoxelWaterMemoTest[=<delaySeconds>] (default 15s)
+	// carves a basin, settles a pool in it, then fires the full edit vocabulary
+	// (dig, place, carve, then an M5 structural collapse whose roof spans
+	// directly over the basin) around/beneath the water, logging the water
+	// digest after every step. This is the SAME public UVoxelWorldSubsystem
+	// API real gameplay uses (TryDig/TryPlace/CarveSphere/SpawnStructureFixtureAt),
+	// so it exercises the actual notification/invalidation wiring end to end,
+	// not a bypass. The proof itself is a CROSS-PROCESS A/B (mirrors the M3
+	// determinism-guard convention): run this switch once with
+	// -ExecCmds="voxel.Water.SolidCacheEnabled 0" and once with 1 (same seed,
+	// same everything else), then diff the two runs' "VoxelWaterMemoTest
+	// FINAL" log line -- byte-identical waterDigest across both proves the
+	// memo's invalidation contract is fully honoured by this edit sequence.
+	// The structure fixture's far-pillar blast is positioned with the SAME
+	// relative offsets -VoxelCollapseTest already uses (proven to trigger the
+	// brick-resolution collapse path, docs/status.md M5 section), just at a
+	// column chosen so its roof overhangs the basin -- see BasinX/Y below.
+	//
+	// IMPORTANT test-harness-only technique, mirroring voxel-core's own
+	// waterca_solid_cache_invalidation_tracks_terrain_edit (test_waterca.cpp):
+	// a small SpawnWaterAt "nudge" follows each edit below. This is NOT a
+	// production behavior -- it exists ONLY so this scenario can prove
+	// anything at all. WaterCA::active_ (waterca.h) means a body that has
+	// fully settled (activeBricks==0) touches NOTHING on subsequent step()
+	// calls, by design -- a terrain edit does not, by itself, wake a
+	// dormant water body (confirmed empirically: a first pass at this
+	// scenario without any nudge produced an UNCHANGING digest through
+	// every single edit, dig/place/carve/structure/collapse alike, because
+	// nothing ever re-examined the affected bricks). That is a SEPARATE,
+	// pre-existing gap from the memo -- see docs/status.md's writeup -- not
+	// something this task's notification/invalidation wiring is scoped to
+	// fix (no public voxel-core API exists to reactivate a brick without
+	// also adding real volume). The nudge exists purely to put the water
+	// CA back into an active state so it actually re-examines solidity near
+	// each edit, which is what the memo-safety question requires testing.
+	float WaterMemoTestDelaySeconds = 15.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterMemoTest="), WaterMemoTestDelaySeconds) ||
+	    FParse::Param(FCommandLine::Get(), TEXT("VoxelWaterMemoTest")))
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelWaterMemoTest: starting basin/pour/dig/place/carve/collapse sequence in %.1fs"),
+		       WaterMemoTestDelaySeconds);
+		GetWorldTimerManager().SetTimer(
+			WaterMemoTestTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this]()
+				{
+					UWorld* TestWorld = GetWorld();
+					UVoxelWorldSubsystem* Terrain = TestWorld ? TestWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					UVoxelWaterSubsystem* Water = TestWorld ? TestWorld->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+					if (!Terrain || !Water)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelWaterMemoTest: subsystems not ready, skipping."));
+						return;
+					}
+
+					double SpawnColXUU = 0.0, SpawnColYUU = 0.0;
+					ParseSpawnColumnUU(SpawnColXUU, SpawnColYUU);
+					// 50m ahead: clear of every other test fixture's own offset
+					// (all <=1240 UU / 12.4m), and still inside R0's 64m load
+					// radius so streaming isn't the bottleneck.
+					const double StructAnchorX = SpawnColXUU + 5000.0;
+					const double StructAnchorY = SpawnColYUU;
+					// Under the middle of the roof span (roof covers local
+					// X:[0,1270], Y:[0,310] UU -- see SpawnStructureFixtureAt),
+					// and past the wall's ~480UU cantilever budget, so the
+					// collapse's removed voxels land directly above/around it.
+					const double BasinX = StructAnchorX + 800.0;
+					const double BasinY = StructAnchorY + 160.0;
+					bWaterMemoTestActive = true;
+					WaterMemoTestBasinXUU = BasinX;
+					WaterMemoTestBasinYUU = BasinY;
+
+					const double SurfUU = Terrain->GetSurfaceHeightUU(BasinX, BasinY);
+					// Deliberately shallow (max depth 100+350=450UU=4.5m below
+					// surface, dead-center) so every dig/place raycast below can
+					// reach its target within DigPlaceRangeMeters (8m/800UU) from
+					// a camera comfortably above the surface -- an earlier,
+					// deeper basin (center -250, radius 550) put the floor out
+					// of an 8m ray's reach entirely (TryDig/TryPlace both
+					// silently returned false, applied=0 -- verified in the log,
+					// not assumed).
+					constexpr double BasinCenterDownUU = 100.0;
+					constexpr double BasinRadiusUU = 350.0; // 3.5m
+					const int32 CarvedBasin =
+						Terrain->CarveSphere(FVector(BasinX, BasinY, SurfUU - BasinCenterDownUU), BasinRadiusUU, 0.0);
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelWaterMemoTest: carved basin (%d voxels) at (%.0f,%.0f,%.0f); memoEnabled=%d"),
+					       CarvedBasin, BasinX, BasinY, SurfUU, (int32)Water->IsSolidCacheEnabled());
+
+					GetWorldTimerManager().SetTimer(
+						WaterMemoTestTimerHandle,
+						FTimerDelegate::CreateWeakLambda(this,
+							[this, BasinX, BasinY, SurfUU]()
+							{
+								UWorld* PourWorld = GetWorld();
+								UVoxelWaterSubsystem* PourWater = PourWorld ? PourWorld->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+								if (!PourWater)
+								{
+									return;
+								}
+								constexpr uint32 PourAmount = 20000;
+								const uint32 Placed =
+									PourWater->SpawnWaterAt(FVector(BasinX, BasinY, SurfUU + 150.0), PourAmount);
+								UE_LOG(LogVoxelEarth, Log,
+								       TEXT("VoxelWaterMemoTest: poured %u/%u fill units into the basin; digest=0x%016llX"),
+								       Placed, PourAmount, (unsigned long long)PourWater->GetWaterDigest());
+
+								GetWorldTimerManager().SetTimer(
+									WaterMemoTestTimerHandle,
+									FTimerDelegate::CreateWeakLambda(this,
+										[this, BasinX, BasinY, SurfUU]()
+										{
+											UWorld* DigWorld = GetWorld();
+											UVoxelWorldSubsystem* DigTerrain =
+												DigWorld ? DigWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+											UVoxelWaterSubsystem* DigWater =
+												DigWorld ? DigWorld->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+											if (!DigTerrain || !DigWater)
+											{
+												return;
+											}
+											UE_LOG(LogVoxelEarth, Log,
+											       TEXT("VoxelWaterMemoTest settle-check (pre-edit): digest=0x%016llX volume=%llu"),
+											       (unsigned long long)DigWater->GetWaterDigest(),
+											       (unsigned long long)DigWater->GetPerfSnapshot().TotalVolume);
+
+											// DIG: straight down through the settled
+											// pool onto the basin floor -- the raycast
+											// ignores water (terrain-only), so this
+											// opens a hole beneath it exactly like
+											// task item 5's "flow into a hole you dig
+											// under it" verification. Camera 3m above
+											// the surface, dead-center over the basin
+											// (where the pour settled) -- within the
+											// 8m dig range of the ~4.5m-deep floor.
+											const bool bDug = DigTerrain->TryDig(
+												FVector(BasinX, BasinY, SurfUU + 300.0), FVector(0.0, 0.0, -1.0), 4);
+											UE_LOG(LogVoxelEarth, Log,
+											       TEXT("VoxelWaterMemoTest: dig beneath basin -> applied=%d"), (int32)bDug);
+
+											// Test-harness nudge (see the switch's own
+											// doc comment above): a settled body does
+											// not reactivate on its own from a terrain
+											// edit alone, so re-pour a small amount to
+											// put the CA back into an active state and
+											// let it actually re-examine the
+											// (memo-invalidated) solidity near the dig.
+											DigWater->SpawnWaterAt(FVector(BasinX, BasinY, SurfUU + 150.0), 300);
+											UE_LOG(LogVoxelEarth, Log,
+											       TEXT("VoxelWaterMemoTest: post-dig nudge digest=0x%016llX"),
+											       (unsigned long long)DigWater->GetWaterDigest());
+
+											GetWorldTimerManager().SetTimer(
+												WaterMemoTestTimerHandle,
+												FTimerDelegate::CreateWeakLambda(this,
+													[this, BasinX, BasinY, SurfUU]()
+													{
+														UWorld* PlaceWorld = GetWorld();
+														UVoxelWorldSubsystem* PlaceTerrain =
+															PlaceWorld ? PlaceWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+														UVoxelWaterSubsystem* PlaceWater =
+															PlaceWorld ? PlaceWorld->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+														if (!PlaceTerrain || !PlaceWater)
+														{
+															return;
+														}
+														UE_LOG(LogVoxelEarth, Log,
+														       TEXT("VoxelWaterMemoTest: post-dig settled digest=0x%016llX"),
+														       (unsigned long long)PlaceWater->GetWaterDigest());
+
+														// PLACE: a solid cube near the
+														// basin's floor, offset from the
+														// dig column, well clear of the
+														// player (task item 5's "displaced
+														// by a block you place"). Same
+														// camera-height reasoning as the dig
+														// above -- within 8m of the floor.
+														constexpr uint8 MatRock = 2; // vxc::MAT_ROCK
+														const bool bPlaced = PlaceTerrain->TryPlace(
+															FVector(BasinX + 100.0, BasinY, SurfUU + 300.0), FVector(0.0, 0.0, -1.0),
+															4, MatRock, FVector(1.0e7, 1.0e7, 1.0e7));
+														UE_LOG(LogVoxelEarth, Log,
+														       TEXT("VoxelWaterMemoTest: place at basin floor -> applied=%d"), (int32)bPlaced);
+
+														// Test-harness nudge (see doc comment
+														// above the switch parse block).
+														PlaceWater->SpawnWaterAt(FVector(BasinX, BasinY, SurfUU + 150.0), 300);
+														UE_LOG(LogVoxelEarth, Log,
+														       TEXT("VoxelWaterMemoTest: post-place nudge digest=0x%016llX"),
+														       (unsigned long long)PlaceWater->GetWaterDigest());
+
+														GetWorldTimerManager().SetTimer(
+															WaterMemoTestTimerHandle,
+															FTimerDelegate::CreateWeakLambda(this,
+																[this, BasinX, BasinY, SurfUU]()
+																{
+																	UWorld* CarveWorld = GetWorld();
+																	UVoxelWorldSubsystem* CarveTerrain =
+																		CarveWorld ? CarveWorld->GetSubsystem<UVoxelWorldSubsystem>()
+																		           : nullptr;
+																	UVoxelWaterSubsystem* CarveWater =
+																		CarveWorld ? CarveWorld->GetSubsystem<UVoxelWaterSubsystem>()
+																		           : nullptr;
+																	if (!CarveTerrain || !CarveWater)
+																	{
+																		return;
+																	}
+																	UE_LOG(LogVoxelEarth, Log,
+																	       TEXT("VoxelWaterMemoTest: post-place settled digest=0x%016llX"),
+																	       (unsigned long long)CarveWater->GetWaterDigest());
+
+																	// CARVE: breach a side channel next
+																	// to the basin.
+																	const int32 CarvedSide = CarveTerrain->CarveSphere(
+																		FVector(BasinX - 500.0, BasinY, SurfUU - 100.0), 300.0, 60.0);
+																	UE_LOG(LogVoxelEarth, Log,
+																	       TEXT("VoxelWaterMemoTest: side carve (%d voxels)"), CarvedSide);
+
+																	// Test-harness nudge (see doc comment
+																	// above the switch parse block).
+																	CarveWater->SpawnWaterAt(FVector(BasinX, BasinY, SurfUU + 150.0), 300);
+																	UE_LOG(LogVoxelEarth, Log,
+																	       TEXT("VoxelWaterMemoTest: post-carve nudge digest=0x%016llX"),
+																	       (unsigned long long)CarveWater->GetWaterDigest());
+
+																	GetWorldTimerManager().SetTimer(
+																		WaterMemoTestTimerHandle,
+																		FTimerDelegate::CreateWeakLambda(this,
+																			[this, BasinX, BasinY, SurfUU]()
+																			{
+																				UWorld* StructWorld = GetWorld();
+																				UVoxelWorldSubsystem* StructTerrain =
+																					StructWorld ? StructWorld->GetSubsystem<UVoxelWorldSubsystem>()
+																					            : nullptr;
+																				UVoxelWaterSubsystem* StructWater =
+																					StructWorld ? StructWorld->GetSubsystem<UVoxelWaterSubsystem>()
+																					            : nullptr;
+																				if (!StructTerrain || !StructWater)
+																				{
+																					return;
+																				}
+																				UE_LOG(LogVoxelEarth, Log,
+																				       TEXT("VoxelWaterMemoTest: post-carve settled digest=0x%016llX"),
+																				       (unsigned long long)StructWater->GetWaterDigest());
+																				double SpawnColXUU2 = 0.0, SpawnColYUU2 = 0.0;
+																				ParseSpawnColumnUU(SpawnColXUU2, SpawnColYUU2);
+																				const double StructAnchorX2 = SpawnColXUU2 + 5000.0;
+																				const double StructAnchorY2 = SpawnColYUU2;
+																				// STRUCTURE: a wall+roof+far-pillars
+																				// fixture whose roof spans directly
+																				// over the basin (non-air MAT_ROCK
+																				// edit right above/around water --
+																				// exercises the memo fix in
+																				// SpawnStructureFixtureAt itself).
+																				const int32 StampedCount =
+																					StructTerrain->SpawnStructureFixtureAt(StructAnchorX2, StructAnchorY2);
+																				UE_LOG(LogVoxelEarth, Log,
+																				       TEXT("VoxelWaterMemoTest: structure fixture (%d voxels) over basin -> digest=0x%016llX"),
+																				       StampedCount, (unsigned long long)StructWater->GetWaterDigest());
+
+																				GetWorldTimerManager().SetTimer(
+																					WaterMemoTestTimerHandle,
+																					FTimerDelegate::CreateWeakLambda(this,
+																						[this, StructAnchorX2, StructAnchorY2, BasinX, BasinY, SurfUU]()
+																						{
+																							UWorld* BlastWorld = GetWorld();
+																							UVoxelWorldSubsystem* BlastTerrain =
+																								BlastWorld ? BlastWorld->GetSubsystem<UVoxelWorldSubsystem>()
+																								           : nullptr;
+																							UVoxelWaterSubsystem* BlastWater =
+																								BlastWorld ? BlastWorld->GetSubsystem<UVoxelWaterSubsystem>()
+																								           : nullptr;
+																							if (!BlastTerrain || !BlastWater)
+																							{
+																								return;
+																							}
+																							// COLLAPSE: blow out the far
+																							// pillars (same relative offsets
+																							// -VoxelCollapseTest uses) --
+																							// the roof above the basin loses
+																							// support past the wall's
+																							// cantilever budget and comes
+																							// down via the M5 edit-log
+																							// collapse path.
+																							const double BlastSurfUU =
+																								BlastTerrain->GetSurfaceHeightUU(StructAnchorX2, StructAnchorY2);
+																							const int32 BlastRemoved = BlastTerrain->CarveSphere(
+																								FVector(StructAnchorX2 + 1240.0, StructAnchorY2 + 160.0,
+																								        BlastSurfUU + 80.0),
+																								260.0, 0.0);
+																							UE_LOG(LogVoxelEarth, Log,
+																							       TEXT("VoxelWaterMemoTest: collapse blast (%d voxels)"), BlastRemoved);
+
+																							// Test-harness nudge (see doc
+																							// comment above the switch parse
+																							// block).
+																							BlastWater->SpawnWaterAt(FVector(BasinX, BasinY, SurfUU + 150.0), 300);
+																							UE_LOG(LogVoxelEarth, Log,
+																							       TEXT("VoxelWaterMemoTest: post-collapse nudge digest=0x%016llX"),
+																							       (unsigned long long)BlastWater->GetWaterDigest());
+
+																							GetWorldTimerManager().SetTimer(
+																								WaterMemoTestTimerHandle,
+																								FTimerDelegate::CreateWeakLambda(this,
+																									[this]()
+																									{
+																										UWorld* FinalWorld = GetWorld();
+																										UVoxelWorldSubsystem* FinalTerrain =
+																											FinalWorld ? FinalWorld->GetSubsystem<UVoxelWorldSubsystem>()
+																											           : nullptr;
+																										UVoxelWaterSubsystem* FinalWater =
+																											FinalWorld ? FinalWorld->GetSubsystem<UVoxelWaterSubsystem>()
+																											           : nullptr;
+																										if (!FinalWater)
+																										{
+																											return;
+																										}
+																										const FVoxelWaterPerfSnapshot Snap =
+																											FinalWater->GetPerfSnapshot();
+																										// The A/B comparison line: diff
+																										// this across two runs (memo
+																										// cvar 0 vs 1, same seed) --
+																										// waterDigest must match exactly.
+																										UE_LOG(LogVoxelEarth, Log,
+																										       TEXT("VoxelWaterMemoTest FINAL: memoEnabled=%d waterDigest=0x%016llX ")
+																										       TEXT("editedDigest=0x%016llX activeBricks=%lld storedBricks=%lld volume=%llu"),
+																										       (int32)FinalWater->IsSolidCacheEnabled(),
+																										       (unsigned long long)FinalWater->GetWaterDigest(),
+																										       (unsigned long long)(FinalTerrain ? FinalTerrain->GetEditedDigest() : 0),
+																										       Snap.ActiveBricks, Snap.StoredBricks,
+																										       (unsigned long long)Snap.TotalVolume);
+
+																										// Self-quit for a bare headless
+																										// gate run (no screenshot
+																										// requested) -- mirrors
+																										// -VoxelDumpDigestAfter's
+																										// convenience. A combined
+																										// -VoxelScreenshotAfter run
+																										// owns its own quit timer
+																										// instead, scheduled well
+																										// after this one fires.
+																										float Throwaway = 0.f;
+																										const bool bScreenshotRequested =
+																											FParse::Value(FCommandLine::Get(), TEXT("VoxelScreenshotAfter="), Throwaway) &&
+																											Throwaway > 0.f;
+																										if (!bScreenshotRequested)
+																										{
+																											GetWorldTimerManager().SetTimer(
+																												WaterMemoTestTimerHandle,
+																												FTimerDelegate::CreateLambda(
+																													[]() { FPlatformMisc::RequestExit(/*bForce*/ false); }),
+																												5.f, false);
+																										}
+																									}),
+																								8.f, false);
+																						}),
+																					3.f, false);
+																			}),
+																		6.f, false);
+																}),
+															6.f, false);
+													}),
+												6.f, false);
+										}),
+									10.f, false);
+							}),
+						3.f, false);
+				}),
+			WaterMemoTestDelaySeconds, false);
 	}
 
 	// M5 destruction (first slice, docs/m4-plan.md Round 2 reframe):

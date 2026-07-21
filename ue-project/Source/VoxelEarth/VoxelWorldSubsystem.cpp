@@ -878,6 +878,79 @@ void ExtractClearedVoxelCoords(const FEditsByBrick& Edits, TArray<VoxelCoords::F
 		}
 	}
 }
+
+// ADR-0003 item 2 (docs/adr/0003-hydrostatic-persistent-body.md): the
+// water-memo invalidation companion to ExtractClearedVoxelCoords above --
+// but UNFILTERED by material, since the memo cares about BOTH solidity
+// directions (a placed solid matters exactly as much as a dug-out one; see
+// UVoxelWaterSubsystem::NotifyTerrainRegionEdited's doc comment). Returns the
+// INCLUSIVE voxel-coordinate bounding box spanning every cell in Edits,
+// regardless of what material each cell was written to -- one box per edit,
+// not one invalidation call per voxel (the "batch per edit" efficiency the
+// task calls for). Returns false (Out* untouched) if Edits is empty.
+bool ComputeEditVoxelBounds(const FEditsByBrick& Edits, VoxelCoords::FVoxelCoord& OutMin, VoxelCoords::FVoxelCoord& OutMax)
+{
+	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
+	bool bAny = false;
+	int64 MinX = 0, MinY = 0, MinZ = 0, MaxX = 0, MaxY = 0, MaxZ = 0;
+	for (const auto& Entry : Edits)
+	{
+		const vxc::BrickKey& Key = Entry.first;
+		for (const vxc::EditCell& Cell : Entry.second)
+		{
+			const int LocalX = Cell.cell % B;
+			const int LocalY = (Cell.cell / B) % B;
+			const int LocalZ = Cell.cell / (B * B);
+			const int64 Vx = int64(Key.x) * B + LocalX;
+			const int64 Vy = int64(Key.y) * B + LocalY;
+			const int64 Vz = int64(Key.z) * B + LocalZ;
+			if (!bAny)
+			{
+				MinX = MaxX = Vx;
+				MinY = MaxY = Vy;
+				MinZ = MaxZ = Vz;
+				bAny = true;
+			}
+			else
+			{
+				MinX = FMath::Min(MinX, Vx); MaxX = FMath::Max(MaxX, Vx);
+				MinY = FMath::Min(MinY, Vy); MaxY = FMath::Max(MaxY, Vy);
+				MinZ = FMath::Min(MinZ, Vz); MaxZ = FMath::Max(MaxZ, Vz);
+			}
+		}
+	}
+	if (bAny)
+	{
+		OutMin = VoxelCoords::FVoxelCoord{MinX, MinY, MinZ};
+		OutMax = VoxelCoords::FVoxelCoord{MaxX, MaxY, MaxZ};
+	}
+	return bAny;
+}
+
+// Same idea as ComputeEditVoxelBounds, for the StampVoxels-based test fixture
+// paths (SpawnTreeFixtureAt/SpawnStructureFixtureAt) whose callers already
+// hold a plain TArray<FVoxelCoord> rather than an FEditsByBrick -- these are
+// ALSO non-air (MAT_ROCK) edits the memo must be told about (ADR-0003 item 2:
+// "make water learn about every solidity change... and non-air edits").
+bool ComputeVoxelCoordBounds(const TArray<VoxelCoords::FVoxelCoord>& Coords, VoxelCoords::FVoxelCoord& OutMin,
+                              VoxelCoords::FVoxelCoord& OutMax)
+{
+	if (Coords.Num() == 0)
+	{
+		return false;
+	}
+	int64 MinX = Coords[0].X, MinY = Coords[0].Y, MinZ = Coords[0].Z;
+	int64 MaxX = MinX, MaxY = MinY, MaxZ = MinZ;
+	for (const VoxelCoords::FVoxelCoord& V : Coords)
+	{
+		MinX = FMath::Min(MinX, V.X); MaxX = FMath::Max(MaxX, V.X);
+		MinY = FMath::Min(MinY, V.Y); MaxY = FMath::Max(MaxY, V.Y);
+		MinZ = FMath::Min(MinZ, V.Z); MaxZ = FMath::Max(MaxZ, V.Z);
+	}
+	OutMin = VoxelCoords::FVoxelCoord{MinX, MinY, MinZ};
+	OutMax = VoxelCoords::FVoxelCoord{MaxX, MaxY, MaxZ};
+	return true;
+}
 } // namespace
 
 // FVoxelWorldImpl -- the voxel-core side of the subsystem, defined only here
@@ -3789,6 +3862,42 @@ void PromoteDetachedIslands(FVoxelWorldImpl& Impl, UWorld& World, const TArray<V
 		return;
 	}
 
+	// W2 fix (ADR-0003 item 2 / this task's collapse-notification gap):
+	// island promotion AND large-edit structural collapse (DetectAndRemoveCollapse
+	// funnels its own removed pieces into this SAME Islands array -- see its
+	// call site inside DetectAndRemoveIslands) both remove voxels from the
+	// authoritative grid via the edit-log path, exactly like a dig, but water
+	// previously never learned about it -- only the triggering dig/carve's own
+	// ClearedVoxels was ever notified. Flatten every piece's coordinates once
+	// and notify BOTH hooks: the solid->air reservoir/breach path (these
+	// voxels are always MAT_AIR writes, same as a dig) and the general
+	// solidity-memo invalidation path (one bounding-box call, not one per
+	// voxel -- a collapse can remove up to 150,000 voxels). Authority-only by
+	// construction: PromoteDetachedIslands is only ever called from TryDig/
+	// CarveSphere's own NetMode!=NM_Client branches.
+	if (UVoxelWaterSubsystem* WaterSubsystem = World.GetSubsystem<UVoxelWaterSubsystem>())
+	{
+		TArray<VoxelCoords::FVoxelCoord> RemovedVoxels;
+		int64 MinX = INT64_MAX, MinY = INT64_MAX, MinZ = INT64_MAX;
+		int64 MaxX = INT64_MIN, MaxY = INT64_MIN, MaxZ = INT64_MIN;
+		for (const TArray<VoxelCoords::FVoxelCoord>& Piece : Islands)
+		{
+			for (const VoxelCoords::FVoxelCoord& V : Piece)
+			{
+				RemovedVoxels.Add(V);
+				MinX = FMath::Min(MinX, V.X); MaxX = FMath::Max(MaxX, V.X);
+				MinY = FMath::Min(MinY, V.Y); MaxY = FMath::Max(MaxY, V.Y);
+				MinZ = FMath::Min(MinZ, V.Z); MaxZ = FMath::Max(MaxZ, V.Z);
+			}
+		}
+		if (RemovedVoxels.Num() > 0)
+		{
+			WaterSubsystem->NotifyTerrainVoxelsCleared(RemovedVoxels);
+			WaterSubsystem->NotifyTerrainRegionEdited(VoxelCoords::FVoxelCoord{MinX, MinY, MinZ},
+			                                          VoxelCoords::FVoxelCoord{MaxX, MaxY, MaxZ});
+		}
+	}
+
 	// Cosmetic debris bodies: only where there is something to look at. A
 	// dedicated server has already done the authoritative half above (the
 	// voxels ARE gone from the grid and those removals replicate); it just
@@ -4260,6 +4369,14 @@ bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVec
 		if (UVoxelWaterSubsystem* WaterSubsystem = World->GetSubsystem<UVoxelWaterSubsystem>())
 		{
 			WaterSubsystem->NotifyTerrainVoxelsCleared(ClearedVoxels);
+
+			// ADR-0003 item 2: memo invalidation, batched over this whole
+			// dig's own bounding box (one call, not one per voxel).
+			VoxelCoords::FVoxelCoord EditMin, EditMax;
+			if (ComputeEditVoxelBounds(DugCells, EditMin, EditMax))
+			{
+				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax);
+			}
 		}
 	}
 	return bApplied;
@@ -4282,10 +4399,41 @@ bool UVoxelWorldSubsystem::TryPlace(const FVector& CameraWorldLocation, const FV
 		             : false;
 	}
 
-	const bool bApplied = Impl->TryPlace(CameraWorldLocation, CameraWorldDirection, SizeVoxels, MaterialId, PlayerActorLocation);
-	if (bApplied && World && (NetMode == NM_DedicatedServer || NetMode == NM_ListenServer))
+	// W2 fix (task item 1): TryPlace previously sent NO water notification at
+	// all -- capture the placed cells (mirrors TryDig's DugCells) so both
+	// water hooks below can see exactly what changed.
+	FEditsByBrick PlacedCells;
+	const bool bApplied =
+		Impl->TryPlace(CameraWorldLocation, CameraWorldDirection, SizeVoxels, MaterialId, PlayerActorLocation, &PlacedCells);
+	if (bApplied && World)
 	{
-		BroadcastNewEntries(*Impl, *World);
+		if (NetMode == NM_DedicatedServer || NetMode == NM_ListenServer)
+		{
+			BroadcastNewEntries(*Impl, *World);
+		}
+
+		if (UVoxelWaterSubsystem* WaterSubsystem = World->GetSubsystem<UVoxelWaterSubsystem>())
+		{
+			// Reservoir/breach path: normally a no-op for TryPlace (the
+			// placed material is virtually never MAT_AIR), but handled
+			// generically via the same ExtractClearedVoxelCoords filter a dig
+			// uses rather than assumed-never-relevant, in case a future
+			// material picker ever offers MAT_AIR.
+			TArray<VoxelCoords::FVoxelCoord> ClearedVoxels;
+			ExtractClearedVoxelCoords(PlacedCells, ClearedVoxels);
+			if (ClearedVoxels.Num() > 0)
+			{
+				WaterSubsystem->NotifyTerrainVoxelsCleared(ClearedVoxels);
+			}
+
+			// ADR-0003 item 2: the fix that actually matters here -- air->solid
+			// invalidates the memo exactly like solid->air does.
+			VoxelCoords::FVoxelCoord EditMin, EditMax;
+			if (ComputeEditVoxelBounds(PlacedCells, EditMin, EditMax))
+			{
+				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax);
+			}
+		}
 	}
 	return bApplied;
 }
@@ -4387,6 +4535,14 @@ int32 UVoxelWorldSubsystem::CarveSphere(const FVector& CenterUU, double RadiusUU
 		if (UVoxelWaterSubsystem* WaterSubsystem = World->GetSubsystem<UVoxelWaterSubsystem>())
 		{
 			WaterSubsystem->NotifyTerrainVoxelsCleared(ClearedVoxels);
+
+			// ADR-0003 item 2: memo invalidation, batched over this carve's
+			// own bounding box.
+			VoxelCoords::FVoxelCoord EditMin, EditMax;
+			if (ComputeEditVoxelBounds(CarvedCells, EditMin, EditMax))
+			{
+				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax);
+			}
 		}
 	}
 	return Removed;
@@ -4453,6 +4609,20 @@ int32 UVoxelWorldSubsystem::SpawnTreeFixtureAt(double WorldX, double WorldY)
 	if (World && (World->GetNetMode() == NM_DedicatedServer || World->GetNetMode() == NM_ListenServer))
 	{
 		BroadcastNewEntries(*Impl, *World);
+	}
+
+	// ADR-0003 item 2: this is a non-air (MAT_ROCK) edit-log write like any
+	// other -- the memo must be told, exactly like TryPlace.
+	if (World)
+	{
+		if (UVoxelWaterSubsystem* WaterSubsystem = World->GetSubsystem<UVoxelWaterSubsystem>())
+		{
+			VoxelCoords::FVoxelCoord EditMin, EditMax;
+			if (ComputeVoxelCoordBounds(Coords, EditMin, EditMax))
+			{
+				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax);
+			}
+		}
 	}
 
 	UE_LOG(LogVoxelEarth, Log,
@@ -4524,6 +4694,20 @@ int32 UVoxelWorldSubsystem::SpawnStructureFixtureAt(double WorldX, double WorldY
 	if (World && (World->GetNetMode() == NM_DedicatedServer || World->GetNetMode() == NM_ListenServer))
 	{
 		BroadcastNewEntries(*Impl, *World);
+	}
+
+	// ADR-0003 item 2: same fix as SpawnTreeFixtureAt above -- a non-air
+	// (MAT_ROCK) edit-log write the memo must be told about.
+	if (World)
+	{
+		if (UVoxelWaterSubsystem* WaterSubsystem = World->GetSubsystem<UVoxelWaterSubsystem>())
+		{
+			VoxelCoords::FVoxelCoord EditMin, EditMax;
+			if (ComputeVoxelCoordBounds(Coords, EditMin, EditMax))
+			{
+				WaterSubsystem->NotifyTerrainRegionEdited(EditMin, EditMax);
+			}
+		}
 	}
 
 	UE_LOG(LogVoxelEarth, Log,

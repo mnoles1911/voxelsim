@@ -2975,3 +2975,175 @@ base differs from `main` only in `voxel-core/shaders/`, which is HLSL/SPIR-V
 for the GPU worldgen path and is not compiled into that library nor exercised
 by the CPU perf run). Note for future waves: the engine is at
 **`D:\UE5\UE_5.7\Engine`**, not `D:\UE5\Engine`.
+
+### Water edit-notification completeness + memo enablement
+
+Task: ADR-0003 item 2 (`docs/adr/0003-hydrostatic-persistent-body.md`) --
+close the notification gaps between `UVoxelWorldSubsystem`'s edit paths and
+`UVoxelWaterSubsystem`, then decide whether the cross-tick solid_ memo
+(`vxc::WaterCA::setSolidCacheEnabled`) can be turned on by default.
+
+**Gaps found and fixed** (`VoxelWorldSubsystem.cpp`/`.h`,
+`VoxelWaterSubsystem.cpp`/`.h`):
+
+1. **`TryPlace` sent no water notification at all.** Fixed: it now captures
+   its own `FEditsByBrick` (mirroring `TryDig`'s `DugCells`) and, on every
+   authority role, calls both `NotifyTerrainVoxelsCleared` (defensive --
+   handles the near-impossible case a placed material is itself `MAT_AIR`)
+   and the new `NotifyTerrainRegionEdited`.
+2. **`ExtractClearedVoxelCoords` filtered to `MAT_AIR`, hiding every non-air
+   edit from the memo.** Rather than stretch that helper's contract (it stays
+   exactly what it always was -- "which of these edited voxels are dig-style
+   solid-to-air clears," feeding Reservoir v0 breach-seeding, which genuinely
+   only cares about that one direction), a NEW, material-agnostic hook was
+   added: `UVoxelWaterSubsystem::NotifyTerrainRegionEdited(MinVoxelIncl,
+   MaxVoxelIncl)`, routed straight to `vxc::WaterCA::invalidateSolidRegion`.
+   It is called once per edit (batched over that edit's own bounding box, per
+   the "keep it efficient" requirement -- a 150,000-voxel collapse costs the
+   memo ONE call, not 150,000), by EVERY edit path: `TryDig`, `TryPlace`,
+   `CarveSphere`, `PromoteDetachedIslands` (islands + large-edit collapse,
+   see #3), `SpawnTreeFixtureAt`, `SpawnStructureFixtureAt` -- regardless of
+   whether the edit's result is air or solid. Over-invalidating a region that
+   did not actually change solidity is always safe (ADR-0003): it only costs
+   a re-query.
+3. **M5 structural collapse (and ordinary island promotion) never notified
+   water at all**, on either hook. `PromoteDetachedIslands` removes voxels via
+   the SAME edit-log path as a dig (`DetectAndRemoveIslands` /
+   `DetectAndRemoveCollapse` both write `MAT_AIR`), but the water calls at the
+   `TryDig`/`CarveSphere` call sites only ever saw the ORIGINAL dig/carve's
+   own cleared-voxel list, never the islands/pieces removed as a
+   CONSEQUENCE. Fixed: `PromoteDetachedIslands` now flattens every promoted
+   piece's coordinates (covers both plain island detection and the
+   brick-resolution collapse path, since the latter funnels its pieces into
+   the SAME `Islands` array) and calls both water hooks itself, on every
+   authority role, before the cosmetic-debris/dedicated-server branch.
+
+A new helper, `ComputeEditVoxelBounds` (from an `FEditsByBrick`) /
+`ComputeVoxelCoordBounds` (from a plain `TArray<FVoxelCoord>`, for the
+`StampVoxels`-based fixture paths), computes the exact inclusive bounding box
+of whatever an edit touched, unfiltered by material -- this is what
+`NotifyTerrainRegionEdited`'s batched call is built from.
+
+**Memo enablement -- PROVEN, enabled by default.** New GameMode switch
+`-VoxelWaterMemoTest[=<delaySeconds>]` (`VoxelEarthGameMode.{h,cpp}`) carves a
+basin, settles a pool in it, then runs the full edit vocabulary through the
+SAME public `UVoxelWorldSubsystem` API real gameplay uses: `TryDig` (beneath
+the pool), `TryPlace` (a rock cube at the basin floor), `CarveSphere` (a side
+breach), `SpawnStructureFixtureAt` (a non-air wall+roof fixture whose roof
+spans directly over the basin), then a large `CarveSphere` through the far
+pillars that trips the M5 brick-resolution collapse path, dropping the roof
+section above the basin. A new console var, `voxel.Water.SolidCacheEnabled`
+(default **true**), toggles the memo; `StepFixed` re-reads it every fixed
+step (same "cheap enough to poll every call" pattern as
+`voxel.Destruction.Enabled`/`voxel.Destruction.Collapse`), so it can be
+forced off in the field with no relaunch (task item 4).
+
+The proof is a cross-process A/B (same convention as the M3 determinism
+guard): the identical scenario (same seed, same edit sequence) run twice,
+once with `-ExecCmds="voxel.Water.SolidCacheEnabled 0"` and once with `1`,
+diffing every logged checkpoint digest -- not just the final one:
+
+| Checkpoint | memo OFF | memo ON |
+|---|---|---|
+| pour | `0x68598CA231A5B2D8` | `0x68598CA231A5B2D8` |
+| pre-edit settle | `0xFFCC45E6CD111EC2` (vol 20000) | `0xFFCC45E6CD111EC2` (vol 20000) |
+| post-dig nudge | `0x4EA5F1471F872744` | `0x4EA5F1471F872744` |
+| post-dig settled | `0x0E776E8E381361DB` | `0x0E776E8E381361DB` |
+| post-place nudge | `0x147D62C9128170A1` | `0x147D62C9128170A1` |
+| post-place settled | `0xDEC8BBA411E47A74` | `0xDEC8BBA411E47A74` |
+| post-carve nudge | `0xE5F3F5D80B01192E` | `0xE5F3F5D80B01192E` |
+| post-carve settled | `0xCC2AD7C552AD4BE3` | `0xCC2AD7C552AD4BE3` |
+| post-collapse nudge | `0x8B065FC41CE39239` | `0x8B065FC41CE39239` |
+| FINAL | waterDigest `0x5D0D9B43677FD302`, editedDigest `0xFB1235E05C62C838`, activeBricks 0, storedBricks 11, volume 21200 | identical, all fields |
+
+Every single checkpoint matches byte-for-byte, both runs, seed 20260719 --
+this is the ADR-0003 item 2 bar ("an automated test that ... shows the water
+state is byte-identical with the memo ON vs OFF") met in full, through the
+actual engine wiring (not a bypass). `voxel.Water.SolidCacheEnabled` default
+flipped to true on the strength of this. (An earlier attempt with only
+2-second inter-edit settle windows showed a handful of INTERMEDIATE
+checkpoints differing by a tick or two before reconverging identically by
+the post-carve stage onward -- traced to real-wall-clock tick-count jitter
+between separate process launches: the CA's 10Hz accumulator is driven by
+actual frame `DeltaTime`, and two independent runs' frame timing is not
+required to line up to the tick, NOT a memo defect. Widening the settle
+windows to 6-8s made every checkpoint agree, confirming the jitter theory.)
+
+**A separate, pre-existing gap found (NOT fixed, NOT blocking the above):**
+a fully-settled water body (`activeBricks==0`) does not reactivate itself
+when nearby terrain changes -- `vxc::WaterCA::step()` is a no-op over an
+empty active set, and NEITHER hook above (nor any existing call in
+`VoxelWaterSubsystem.cpp`) ever adds a brick back to `active_` for an
+above-sea-level edit; only the Reservoir v0 breach path does that, and only
+for `Z<0` cells that border already-open ocean. This is why the
+`-VoxelWaterMemoTest` scenario above includes a small `SpawnWaterAt` "nudge"
+after each edit, mirroring `test_waterca.cpp`'s own
+`waterca_solid_cache_invalidation_tracks_terrain_edit` (whose own comment
+already documents this: terrain edits do not by themselves wake bricks, that
+is the caller's existing activation duty). Verified empirically: a first
+pass at this scenario with NO nudge produced an unchanging digest through
+dig/place/carve/collapse alike. This does NOT threaten memo correctness
+(confirmed byte-identical either way, and the hydrostatic flood's
+water-cell-seeded exploration does not even consult a stored water cell's
+OWN solidity, only its neighbors', so a body that never gets re-examined
+behaves identically memo on or off, trivially, not meaningfully). It DOES
+mean "dig beneath a long-settled pond above sea level and see it react" is
+not currently true in shipped gameplay. No public voxel-core API exists to
+reactivate a brick without also injecting real (if tiny) volume via
+`addWater` -- per this task's own doctrine (call existing invalidation APIs;
+if a needed API genuinely does not exist, report it), this is reported as a
+follow-up rather than hacked around with a silent per-edit volume injection
+in production code. A real fix needs either a new narrow
+`WaterCA::wakeRegion(...)`-style API (voxel-core change, Matt's call) or a
+documented, metered production nudge policy.
+
+In-engine perf: the test basin is small (10-45 active bricks, sub-brick-scale
+scenario) -- `LogVoxelPerf`'s `WaterPerf` lines show `tickMs` in the
+0.001-0.04ms range regardless of the memo, i.e. this scenario is too small to
+show a measurable difference (expected -- ADR-0003 already found the memo's
+win lives in "97-98% of flood cell-pops are AIR" at LARGE active-pour scale).
+The authoritative perf numbers remain `vxc_waterca_bench`'s (unaffected by
+this wave, voxel-core untouched): 329-345 -> 111-121 ms/tick on the
+441-column pour (~2.8-3.0x), 40.8M -> 4.7M terrain queries; ~9-11 ->
+~6.5-6.8 ms/tick on a settled lake with an engine-realistic (~1us) query
+cost.
+
+**Determinism argument.** Every notification call above is reached only on
+an authority role (`NetMode != NM_Client`, matching every pre-existing water
+hook), driven by the SAME edit-log entries that already replicate
+deterministically to clients; a client's own `UVoxelWaterSubsystem` never
+steps its local CA (mirrors via replicated fills only), so it has nothing to
+invalidate and the hooks no-op there by construction. The memo itself is a
+pure memoization (byte-identical by definition once invalidation is
+honoured, per `voxelcore/waterca.h`'s own contract) -- this wave's job was
+proving the CALLER honours that contract for every edit path, which the A/B
+above does.
+
+**Build/tests.** `VoxelEarthEditor Win64 Development` via `Build.bat ...
+-WaitMutex -NoHotReloadFromIDE` -> `Result: Succeeded`, zero warnings from
+`VoxelWaterSubsystem.{h,cpp}`/`VoxelWorldSubsystem.{h,cpp}`/
+`VoxelEarthGameMode.{h,cpp}` (only pre-existing engine-header deprecation
+warnings elsewhere, unrelated). `voxelcore.lib` freshly built for this
+worktree (CMake+Ninja, MSVC 14.51/VS 2026, Release) since it did not exist
+yet here; voxel-core itself untouched by this wave. `vxc_tests.exe` (clang,
+llvm-mingw): 132/132 PASS, 0 FAIL. Headless verification: `-game
+-VoxelWaterMemoTest=10 -VoxelScreenshotAfter=62 -windowed -resx=1280
+-resy=720 -log -unattended -nosplash`, seed default (20260719): full
+carve/pour/dig/place/carve/structure/collapse sequence completes, log
+confirms `applied=1` for both the dig and the place (an early attempt with
+the camera 30m from target, outside `DigPlaceRangeMeters`'s 8m raycast
+range, silently returned `applied=0` for both; fixed by moving the test's
+camera placements within range). Screenshots
+`VoxelVerify00000.png`/`VoxelVerify00001.png`
+(`ue-project/Saved/Screenshots/WindowsEditor/`) show the carved crater, the
+placed rock cube at its rim, and water filling the basin/surroundings.
+
+**Follow-ups.** (1) The settled-water reactivation gap above. (2) Placing a
+solid block directly into a voxel that already holds stored water fill: no
+existing API evicts that water either (same "no production-safe API"
+reasoning as the reactivation gap) -- harmless for determinism (the stale
+fill stays byte-identical across clients, just visually hidden behind the
+new solid geometry), but a genuine visual/data quirk worth a real fix later.
+(3) `docs/adr/0003-hydrostatic-persistent-body.md` item 3 (the persistent
+per-water-body structure) remains deliberately deferred, unaffected by this
+wave.
