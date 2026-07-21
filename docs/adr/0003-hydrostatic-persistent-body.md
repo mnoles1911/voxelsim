@@ -8,7 +8,7 @@
   which imposes a new obligation on `UVoxelWorldSubsystem`'s edit paths;
   (2) the "should the overflow cap count air?" question, which would be a
   world-breaking `kWaterCAVersion` bump.
-- **Human sign-off:** PENDING — see "Decision" below.
+- **Human sign-off:** **ACCEPTED by Matt, 2026-07-21.** See "Decision" below.
 
 ## Context
 
@@ -144,7 +144,11 @@ memo needs — option B does not avoid the caller contract, it inherits it.
 
 ## Decision
 
-**PENDING — requires Matt's sign-off on items 2 and 3.**
+**ACCEPTED by Matt, 2026-07-21** ("I concur... approved ADR-0003"). Items 2 and 3
+are both accepted as recommended: the memo is enabled on the live UE water
+subsystem (done, PR #46, with the invalidation-completeness proof required
+here), and the persistent per-water-body structure stays DEFERRED on the
+measured evidence in this ADR.
 
 1. **Merged now, no sign-off needed (byte-identical, off by default).** WaterCA
    gains an opt-in cross-tick solidity memo — `setSolidCacheEnabled`,

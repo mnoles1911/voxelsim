@@ -8,7 +8,7 @@
   shipped code, CI `float-ban` is clean, and no waiver is requested. What this
   ADR asks Matt to approve is a **physics fidelity reduction** and a **future
   enablement**, not a numerics exception.
-- **Human sign-off:** PENDING — see "Decision" below.
+- **Human sign-off:** **ACCEPTED by Matt, 2026-07-21.** See "Decision" below.
 
 ## Context
 
@@ -382,7 +382,18 @@ and the eligibility predicate rejecting lidded and confined columns.
 
 ## Decision
 
-**PENDING — requires Matt's sign-off on items 2 and 3. Item 1 needs none.**
+**ACCEPTED by Matt, 2026-07-21** ("I accept your ADR-0004 recommendations").
+
+Both recommendations are adopted as written:
+- **Item 2 ADOPTED** — the reduced (virtual-pipe) SWE is *the* W4 model.
+  Accepted consequences: settled surface flat to +/-6.3 mm (vs Phase C
+  +/-0.4 mm); no hydraulic jumps, no supercritical flow, dam-break bore at
+  the wrong speed; damping/gain are CFL-bounded numerics constants, not
+  designer feel-dials. Bought with: no float, no doctrine waiver,
+  cross-vendor bit-identity, exact conservation, and 11-74x the CA.
+- **Item 3 DEFERRED as recommended** — the coupler stays disabled until M3
+  networked water wires its membership/dwell/depth state into replication.
+  Enabling earlier is a guaranteed desync.
 
 1. **Merged now, no sign-off needed (inert, byte-identical).** The SWE core,
    force field and coupler ship default-off and unreferenced. No golden moved,
