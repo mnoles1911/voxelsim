@@ -205,3 +205,51 @@ VXC_TEST(regiongraph_determinism_golden_digest) {
                 static_cast<unsigned long long>(d1.h));
     CHECK_EQ(d1.h, kGoldenDigest);
 }
+
+VXC_TEST(regiongraph_time_sliced_build_matches_one_shot_build) {
+    // The M6 Tier-1 enablement change (regiongraph.h header comment "Build
+    // cost") makes the build RESUMABLE so the UE side can spend a bounded
+    // slice of it per tick instead of stalling the game thread for the whole
+    // thing. The contract that makes that safe is: a graph assembled from N
+    // budgeted slices is BYTE-IDENTICAL to the same graph built in one
+    // unlimited slice. buildRegionGraph() is itself the unlimited-slice case,
+    // so this pins the two against each other over a multi-region box with
+    // the tightest possible budget (ONE region of work per advance() call --
+    // which forces a resume boundary at every single phase/region step,
+    // including mid-phase and exactly on phase transitions).
+    auto solid = [](int64_t x, int64_t y, int64_t z) -> MaterialId {
+        // Rolling floor with a couple of walls, so regions differ from each
+        // other and portal counts vary (a flat world would make the test
+        // pass trivially).
+        if (z == 0) return MAT_ROCK;
+        if (x == 16 && z <= 6 && !(y >= 4 && y <= 6)) return MAT_ROCK;
+        if (y == 16 && z <= 4 && !(x >= 20 && x <= 22)) return MAT_BEDROCK;
+        if (z == 1 && ((x + y) % 11) == 0) return MAT_ROCK;
+        return MAT_AIR;
+    };
+    PathCostConfig config;
+    const RegionCoord minR{0, 0, 0}, maxR{2, 2, 1}; // 18 regions
+
+    const RegionGraph oneShot = buildRegionGraph(solid, minR, maxR, config);
+
+    RegionGraphBuilder builder(minR, maxR);
+    int64_t slices = 0;
+    while (!builder.advance(solid, config, /*regionBudget=*/1)) ++slices;
+    ++slices;
+
+    // Every advance() must have made progress and the walk must have taken
+    // exactly one slice per (phase, region) step -- i.e. the budget is
+    // actually honored, not silently ignored.
+    CHECK_EQ(slices, builder.totalRegionSteps());
+    CHECK_EQ(builder.completedRegionSteps(), builder.totalRegionSteps());
+
+    Digest dOne, dSliced;
+    oneShot.digest(dOne);
+    builder.graph().digest(dSliced);
+    CHECK_EQ(dOne.h, dSliced.h);
+
+    // Sanity: the fixture is actually exercising something (a world with no
+    // portals would make the digest equality vacuous).
+    CHECK(oneShot.portals.size() > 0);
+    CHECK(oneShot.edges.size() > 0);
+}
