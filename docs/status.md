@@ -2327,3 +2327,147 @@ Win64 Development` built clean via `Build.bat ... -WaitMutex
 -NoHotReloadFromIDE` (zero warnings from the only file touched this wave,
 `VoxelWorldSubsystem.cpp`; same pre-existing engine-header deprecation baseline
 as prior waves).
+
+### R3/R4 recompute amortization (M1 steady-state hitches) (2026-07-21, worktree agent)
+
+Closes the one sub-criterion the M1 60fps gate did not meet: residual
+steady-state frame spikes. The prior wave's *p95* fix stands untouched; this
+wave only addresses the leftover spikes it attributed to "coarse-ring (R3/R4)
+recompute amplifier-sampling".
+
+**That attribution was wrong, and the instrumentation says so directly.**
+`TickStreaming`'s existing hitch-attribution timers covered
+`DispatchJobs`/`DrainResults`/`DrainGameThreadMesh`/`DrainUnloads` but NOT
+`RecomputeDesiredSet` -- the one stage the residual hitches were blamed on.
+This wave added that missing breakdown (per-call `recomputeMs` split into
+exit-scan / per-level entry-scan / queue-sort, plus in-annulus footprint
+counts), logged on hitch frames, AND a periodic "max since last log" line so a
+burst that lands on a frame *under* the 33.3ms hitch threshold is still
+visible. Two findings:
+
+- **None of the >33.3ms hitch frames involve a recompute at all.** Across the
+  baseline runs every single hitch frame logged `recomputeMs=0.00` with
+  `subsystemTickMs~=0.02-0.05`. Those hitches are cold-start frame-1
+  render/PSO warm-up (`renderWaitMs` in the thousands) or unattributed
+  `elsewhereMs`-only frames -- i.e. the environmental floor the prior wave
+  already described, not ring recompute.
+- **But recompute really was blowing the 60fps budget ~8 times a second** --
+  invisible to every existing metric, because both the hitch log and
+  `UVoxelPerfRunSubsystem`'s hitch count use a 33.3ms threshold and the bursts
+  landed at 25-32ms, just underneath it. Measured baseline worst-case
+  recompute: **25-32ms**, ~40 calls per 5s. The gate's actual bar is 16.6ms,
+  so a **frames-over-16.6ms counter** was added (also in the periodic log):
+  the baseline run spends **260 frames per 60s run over the 60fps bar**, ~25
+  per 5s.
+
+**Where the time actually went** (worst-case call, baseline,
+`-VoxelPerfRun=60`, seed 20260719, min-spec proxy):
+
+| Stage | Baseline worst | Cause |
+|---|---|---|
+| exit hysteresis scan | 10-13 ms | `PendingJobKeys.RemoveSingle` per eviction -- a linear scan of a **~19,000-deep** pending queue, run once per evicted chunk (O(evictions x depth)) |
+| entry scan R0 | 5-7 ms | 4 `Amplifier::column` samples per in-annulus footprint (~1250 footprints), re-sampled from scratch every call |
+| entry scan R1/R2/R3/R4 | 2.4-4.3 ms each | same, ~940 footprints per ring |
+| queue sort | 3.2-3.5 ms | `Sort()` predicate recomputed chunk-centre distance on every **comparison** (~2*n*log2(n) ~= 530k distance computes at n=19k) |
+
+Note the shape: R3/R4 are **not** special -- every level costs about the same,
+R0 costs the most, and the worst frames are the ones where several levels scan
+at once. Ring chunk boundaries are **nested**, so an anchor crossing a level-4
+boundary necessarily crosses the level-3/2/1/0 boundaries in the same frame;
+the existing per-level gating therefore never staggers the work, it aligns it.
+
+**Fix -- three scheduling changes, all semantics-preserving (nothing mutable is
+memoized, no change to *which* chunks are desired):**
+
+1. **Memoized `ComputeFootprintChunkZRange`** per `(Level, ChunkX, ChunkY)`.
+   It is a pure function of the amplifier, which is a pure function of the seed
+   and never changes (edits live in the overlay and never move terrain
+   elevation), so the memo is exact. Consecutive entry scans re-visit almost
+   the same annulus -- a one-chunk anchor step changes only its margin -- so
+   the hit rate is very high. Bounded at 65,536 entries by a distance-based
+   prune (`PruneFootprintZRangeCache`), which drops far entries rather than
+   clearing, so pruning can never itself cost a re-sample burst.
+2. **Batched queue filtering.** The per-eviction `RemoveSingle` calls are
+   replaced by one `RemoveAllSwap` pass over each pending queue, filtered
+   against a set of the keys evicted by *this* call (deliberately not the whole
+   `PendingUnloadSet`, which also holds not-yet-drained earlier evictions that
+   `DrainUnloads` may legitimately have re-queued). At most one copy of a key
+   can ever be in a queue, so "remove all" and "remove one" are identical here;
+   queue order is irrelevant because `SortPendingQueues` re-sorts immediately.
+3. **Decorate-sort-undecorate** in `SortPendingQueues`: each distance is
+   computed once into a scratch array instead of once per comparison. Ordering
+   is bit-identical (same primary key, same tie-break, and `Sort()` was already
+   unstable so fully-equal elements never had a defined order).
+
+**Before / after** (min-spec proxy `sg.*Quality 0` + `r.ScreenPercentage 100`,
+1080p windowed, `-VoxelPerfRun=60`, seed 20260719, clean `Saved/VoxelWorlds`):
+
+| Metric | Baseline | After (3 runs) |
+|---|---|---|
+| **frames over 16.6ms (60fps bar), whole run** | **260** | **2 / 14 / 19** |
+| worst recompute call | 25-32 ms | 6.2-10.7 ms steady (15-18 ms in the first 5s, cold memo) |
+| -- its exit scan | 10-13 ms | 2.4-2.7 ms |
+| -- its sort | 3.2-3.5 ms | 1.8-2.3 ms |
+| -- its R0 / R1-R4 entry scans | 5-7 / 2.4-4.3 ms | 1.6-2.4 / 0.5-1.7 ms |
+| p95 (full run) | 5.01 ms | 5.20 / 5.24 / 5.30 ms |
+| postWarmup p95 | 5.08 ms | 5.29 / 5.33 / 5.40 ms |
+| p50 | 3.08 ms | 3.04-3.11 ms |
+| postWarmup max frame | 33.31 ms | 12.79 / 71.38 / 46.95 ms |
+| postWarmup hitches (>33.3ms) | 1 | 0 / 2 / 1 |
+| chunks loaded (60s) | 13,867 | 14,383-14,995 |
+
+p95 is unchanged within run-to-run noise (the prior wave's ~4.8-5.0ms band
+holds; recompute bursts were always a sub-1% tail, never the p95 driver) and
+throughput improved slightly. The headline is the 60fps-bar count: **260 ->
+2-19 frames per run**, and every remaining one is unattributable to recompute.
+
+**Honest residual accounting.** The 0-2 post-warmup >33.3ms frames per run all
+log `recomputeMs=0.00` and `subsystemTickMs~=0.03-0.05`, i.e. none of them is
+ours: one is always frame 1 (`renderWaitMs` ~19-22s of accumulated wait = cold
+shader/PSO warm-up, a loading-screen-class cost), the rest are `renderMs`-only
+or fully unattributed dev-box stalls, matching the prior wave's environmental
+floor. The residual 14-19 over-16.6ms frames in two of the three runs likewise
+do not line up with the recompute maxima (which stay at 7-10ms in those
+windows). The genuinely-ours residual is the ~7-10ms steady worst-case
+recompute -- under the bar, but not free. **Measurement caution learned the
+hard way**: an intervening `-VoxelHeadlessDigTest` run leaves a
+`Saved/VoxelWorlds/<seed>.vxlog`, and a later perf run *loads* it, producing
+200ms overlay-re-mesh frames that have nothing to do with streaming. Two runs
+were discarded for this reason; clear `Saved/VoxelWorlds` between perf runs.
+
+**Determinism verified, not asserted.** A/B of `-VoxelHeadlessDigTest=15
+-VoxelDumpDigestAfter=25 -VoxelNoLoad` (seed 20260719) on a baseline build and
+on the changed build: both carve **2,131,643 voxels** and both report
+**`editedDigest=0xD9FB0347863F529E`** (server and client). Render correctness
+re-checked with `-VoxelScreenshotAfter=40`: contiguous voxel terrain, no
+near-field holes, HUD present, zero ensures.
+
+**Follow-ups.**
+
+- `PendingJobKeys` sits at a **steady ~19,000-20,000** all run: the desired set
+  is produced far faster than workers drain it, and the queue depth is what
+  makes both the sort and the eviction filter cost anything at all. Capping the
+  outer-ring queue depth (or not enqueueing R3/R4 candidates that provably
+  cannot be reached before they leave the annulus) would shrink the remaining
+  recompute cost and cut wasted work -- the real structural item behind
+  wave-1's "R3/R4 cold-start fill time" note.
+- The exit hysteresis scan is still O(tracked) = ~27,000 records per call,
+  ~2.5ms. If it ever matters, amortize it across frames with a round-robin
+  cursor; the 1.25x unload hysteresis makes a few-frame eviction delay safe.
+- Unrelated latent issue found while A/B-building: with
+  `VoxelWorldSubsystem.cpp` **unmodified** (so it rejoins the adaptive-unity
+  blob), `VoxelEarth` fails to compile with redefinition errors in
+  `voxel-core/include/voxelcore/connectivity.h` (`localIndex` "already has a
+  body", `kNeighborOffsets` hides a global). It is masked whenever that file is
+  dirty. Worth fixing before it bites a clean CI build.
+
+Build: `VoxelEarthEditor Win64 Development` via `Build.bat ... -WaitMutex
+-NoHotReloadFromIDE` -> `Result: Succeeded`, zero warnings from
+`VoxelWorldSubsystem.cpp` (the only source file touched -- this wave's working
+diff is exactly `VoxelWorldSubsystem.cpp` + this file). voxel-core was not
+modified by this wave; the worktree's `voxelcore.lib` was reused from the
+`main` build, whose voxel-core **C++** sources are identical (this branch's
+base differs from `main` only in `voxel-core/shaders/`, which is HLSL/SPIR-V
+for the GPU worldgen path and is not compiled into that library nor exercised
+by the CPU perf run). Note for future waves: the engine is at
+**`D:\UE5\UE_5.7\Engine`**, not `D:\UE5\Engine`.
