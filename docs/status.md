@@ -585,6 +585,76 @@ flora/ecotone blending remain pending design (rounds 2-3).
   explicit `static_cast<int32_t>` when recording indices into the
   `int32_t` result vectors.
 
+## M6 — NPCs (groundwork landed, 2026-07-20)
+
+- [x] **Dig-aware windowed voxel A* CPU reference** (`voxelcore/pathfind.h`,
+  plan §3.6: "local windowed voxel A* where traversing air is cheap, digging
+  costs (hardness x time), placing scaffold blocks has cost -> walking,
+  mining, tunneling, bridging fall out of ONE cost function") — engine-free,
+  header-only, integer-only C++20, same "caller supplies a query over the
+  region it cares about" shape as `connectivity.h`/`waterca.h`. Body model:
+  the agent is a single lattice voxel (no head clearance yet, documented v0
+  simplification). Neighbor model: 18 fixed candidate offsets per cell —
+  the classic 6-connected face neighbors (flat horizontal N/S/E/W + pure
+  vertical up/down), 8 step-up/step-down offsets (horizontal +1 combined
+  with one voxel of rise/drop), and 4 two-voxel-horizontal Jump offsets (a
+  cheap no-scaffold alternative to Bridge for a gap exactly one voxel
+  wide). `detail::classifyMove` is the ONE cost function: every candidate
+  neighbor is classified into Walk/StepUp/StepDown/Climb/Fall/Mine/Bridge/
+  Jump purely from (origin, offset, solidFn, PathCostConfig) — the same
+  call site produces a walk, a mine, or a bridge depending only on what the
+  world and config say, never a separately-coded movement rule.
+  `MAT_BEDROCK` is hard-blocked from Mine unconditionally, regardless of
+  `PathCostConfig.mineCostByMaterial` (plan: "bedrock = effectively
+  infinite/unmineable"). `findPath` runs a deliberately-zero-heuristic A*
+  (Dijkstra) bounded to a caller `SearchWindow` (inclusive box +
+  `maxExpansions` cap) — dense per-cell bookkeeping arrays sized to the
+  window's volume (same tradeoff `connectivity.h` documents), never a
+  world-spanning search. The open-set priority queue's only tie-break is
+  `PathCoordLess` (z-major, matching `VoxelCoordLess`/`BrickKeyLess`
+  elsewhere), making the same query always produce the byte-identical step
+  sequence and `PathResult::digest()`. `pathStillValid(path, solidFn,
+  config)` re-classifies every recorded step against a (possibly changed)
+  `solidFn` and returns false the instant one no longer matches — the v0
+  incremental-invalidation primitive a future per-dirty-brick cache
+  (M6-proper, UE-side) would call on cached paths touching an edited brick;
+  the region-graph hierarchical layer, Tier 0/1/2 agents, and the actual
+  UE integration are M6-proper, later.
+- [x] **The unified-cost-function proof** (`voxel-core/tests/test_pathfind.cpp`,
+  9 cases): the SAME `findPath` call against the SAME world flips its
+  chosen action sequence purely from `PathCostConfig` weights —
+  `pathfind_diggable_wall_tunnel_vs_around_same_code` tunnels straight
+  through a single-voxel-thick rock wall (exactly one Mine action) when
+  mining is cheap, and detours around it (zero Mine actions, longer path)
+  when mining is expensive; `pathfind_bedrock_never_mined_forces_detour`
+  shows the same wall as `MAT_BEDROCK` forces the detour even with mining
+  configured artificially cheap for it, proving the impassable rule is
+  hard-coded, not config-driven; `pathfind_gap_bridge_vs_around_same_code`
+  crosses a 3-voxel-wide missing-floor gap with Bridge actions when
+  bridging is cheap and detours around it when expensive. Also covered:
+  open-ground straight-line all-Walk with cost = distance x walkCost;
+  StepUp/StepDown on a single-voxel ledge (both directions); Jump over a
+  narrow gap when `jumpGapCost` is cheap (found and fixed during this pass:
+  Jump originally didn't require its midpoint to be genuinely unsupported,
+  so it silently undercut Walk/StepUp over ordinary flat ground any time
+  `jumpGapCost < 2x walkCost` — fixed by requiring the midpoint have no
+  support of its own, i.e. a real gap, not just ordinary terrain);
+  determinism (two runs produce an identical step sequence and digest,
+  pinned golden `0xa88bdd2f0eb8afd1`); windowing (a goal sealed off by a
+  full-window-spanning bedrock wall returns `capped=true` after exhausting
+  the window, well under `maxExpansions`; a tiny `maxExpansions=3` cap on an
+  otherwise-easy 50-voxel-away goal stops the search at exactly 3
+  expansions, proving the cap itself bounds work independent of window
+  exhaustion); `pathStillValid` flips from true to false when a single cell
+  along an already-computed path is mutated to solid.
+- [x] **Build/warnings**: `voxel-core` full suite green on MSVC (vcvars64 +
+  VS-bundled CMake/Ninja, `/W4 /WX`) — 106/106 tests pass (97 pre-existing +
+  9 new). Standalone LLVM-MinGW clang++ 22.1.5 compile of
+  `test_pathfind.cpp` and a header-only translation unit, both under
+  `-Wall -Wextra -Wconversion -Wsign-conversion -Werror`: clean. No
+  float/double anywhere in `pathfind.h` (float-ban clean; header-only, no
+  `.cpp`, no `voxel-core/CMakeLists.txt` library-source change needed).
+
 ## M0 GPU track (ADR-0001)
 
 - [x] Worldgen HLSL kernel (ColumnMain, VoxelizeMain, MeshCountMain,
