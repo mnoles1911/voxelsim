@@ -14,6 +14,7 @@ add_executable(vxc_tests
   test_counters.cpp
   test_waterca.cpp
   test_connectivity.cpp
+  test_collapse.cpp
   test_rivernet.cpp
   test_pathfind.cpp
   test_regiongraph.cpp

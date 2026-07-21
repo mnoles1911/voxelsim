@@ -646,8 +646,11 @@ micro-islands from its clamped region — which would have wrongly deleted
 terrain and broken the "standalone edit behavior unchanged" gate. Fixed with
 two guards in `DetectAndRemoveIslands`: (1) **if the region hits the size cap
 (clamped), detection is SKIPPED entirely** — a bounded region can only anchor
-soundly when it fully contains the candidate piece, so large edits do not
-detach islands this slice (large-span structural collapse is a follow-up);
+soundly when it fully contains the candidate piece, so large edits did not
+detach islands *in this slice*. **(Superseded: that clamped branch now hands
+off to the brick-resolution differential-support pass — see "Structural
+collapse (M5, large-edit)" below. This voxel-resolution path itself is
+unchanged and still handles every non-clamping edit.)**;
 (2) a **MinIslandVoxels=16 threshold** ignores the handful of single voxels a
 ragged carve genuinely isolates (left in the grid), plus a MaxIslandsPerEdit=16
 valve. The whole pass is gated by `voxel.Destruction.Enabled` (default true;
@@ -683,9 +686,217 @@ collision so debris rests on terrain by contact rather than a per-tick raycast;
 (2) re-integrating a settled island back into the static voxel grid as
 resting voxels (v0 leaves it as a parked Chaos body); (3) client-side cosmetic
 debris from replicated removals; (4) large-edit / structural-collapse island
-detection (currently skipped when the region clamps); (5) reusing the voxel
+detection (was: skipped when the region clamps) — **DONE, see "Structural
+collapse (M5, large-edit)" below**; (5) reusing the voxel
 chunk scene proxy to mesh the island instead of per-voxel instanced cubes;
 (6) per-bone voxel character bodies (severed-limb debris), plan §3.5.
+
+### Structural collapse (M5, large-edit)
+
+**The hole.** The M5 first slice detected detached islands with
+`vxc::findDisconnectedIslands` over a bounded voxel region, anchoring on "this
+solid voxel touches the region's side or bottom face". That anchor is only
+SOUND while the region fully CONTAINS the candidate piece, so
+`DetectAndRemoveIslands` **skipped detection entirely whenever the region
+clamped** at its 48x48x128 cap. A 10m explosive `CarveSphere` is 200 voxels
+across, i.e. always clamped — so exactly the edits that most obviously ought to
+bring a structure down detached **nothing**, and large destruction left
+impossible floating geometry standing. (A first attempt at running detection
+unconditionally on the clamped region produced **1712 spurious micro-islands**
+from a single 10m crater, which would have wrongly deleted standing terrain;
+hence the skip.)
+
+**The model: differential coarse support** (`voxel-core/include/voxelcore/collapse.h`,
+integer-only, engine-free, header-only — same caller-supplies-a-predicate shape
+as `connectivity.h`). Four ideas, each removing one false-positive mode. Full
+derivation is in the header comment; the short form:
+
+1. **Coarse cells.** The analysis grid is coarse cells, not voxels — one cell
+   is one 8-voxel (0.8m) brick, so occupancy comes straight off the edit
+   overlay's brick occupancy bitset or (for unedited terrain) the heightfield,
+   with no per-voxel terrain evaluation. Coarse adjacency is a strict
+   OVER-approximation of voxel adjacency, so coarsening can only make a piece
+   look MORE attached than it is: it can MISS a collapse but can never INVENT
+   one. The approximation error points the safe way.
+2. **Support, not connectivity.** Over the occupied cells,
+   `dist(c) = min over paths from the anchor set of (number of LATERAL steps)`,
+   where a step to a face-adjacent occupied cell costs **1 if horizontal, 0 if
+   vertical**. A cell is SUPPORTED iff `dist(c) <= maxLateralCells` (6 cells =
+   **4.8m**). In words: *load travels up and down a stack of blocks for free,
+   but spans only a bounded horizontal distance from whatever is carrying it.*
+   A column standing on the ground is supported to any height; a slab
+   cantilevered off it is supported 4.8m out and no further; a slab attached to
+   nothing is supported nowhere. There is deliberately **no budget reset on
+   vertical steps** — an earlier formulation reset the budget whenever a cell
+   rested on a supported cell, which let a 2-cell-thick slab zig-zag
+   up/lateral/down/lateral and span unbounded distance.
+3. **Differential.** Applied absolutely, that model would flag every natural
+   arch, cliff undercut and sea cave and disintegrate them the first time
+   anyone dug nearby. So support is computed **twice** over the same region and
+   a cell only SEEDS a collapse if it is `occupied-after AND supported-BEFORE
+   AND NOT supported-after` — only mass whose support *this edit* destroyed
+   falls, and pre-existing geology is grandfathered forever. Pre-edit occupancy
+   needs no snapshot: for a removal-only edit it is exactly (post-edit
+   occupancy + the bricks the just-cleared voxels sat in), which the caller
+   already holds.
+4. **Closure.** Seeds alone leave a wart: a roof that already overhung its
+   pillar past the budget has an unsupported fringe, which grandfathering
+   protects, so when the core falls the fringe is left hanging. So the seed set
+   is closed under 6-connectivity through `occupied-after AND NOT
+   supported-after` cells — a falling mass comes down whole. This cannot leak
+   into standing terrain (the flood only crosses unsupported cells, and all
+   ground-connected mass is supported by construction) and cannot
+   un-grandfather isolated geology (an arch touching nothing that falls has no
+   seed in its component).
+
+**Why this is sound at ANY region size — the property the bounded box lacked.**
+Anchors are the region's bottom and four side faces (never the top). Shrink or
+clamp the region and interior cells become boundary cells — which are anchored,
+hence supported, in **both** the before pass and the after pass, and a cell
+supported in both can never satisfy the collapse predicate. So **clamping can
+only ever REMOVE collapse decisions, never add one**: under-sizing the region
+costs recall, never precision, and the region can be capped as hard as the
+frame budget likes. The old box was unsound precisely because its correctness
+depended on containment; nothing here depends on containment.
+`test_collapse.cpp::collapse_shrinking_region_only_removes_decisions` asserts
+the subset property directly over 8 progressively smaller regions.
+
+**Wiring** (`FVoxelWorldImpl::DetectAndRemoveCollapse`). The clamped branch of
+`DetectAndRemoveIslands` no longer returns 0 — it hands off here. Ordinary digs
+and chops never reach this path at all, so **standalone edit behavior for
+ordinary digs is unchanged by construction**, not by testing alone. Region:
+cleared-voxel brick AABB + 20 bricks XY / -4/+16 Z, capped at 48x48x40 bricks
+(38.4 x 38.4 x 32 m). Occupancy for unedited bricks uses the fact that base
+terrain is a pure heightfield (`amplifier.h`: solid iff voxel centre <=
+`surfaceMm`), so one `Amplifier::column()` evaluation per voxel column answers
+the whole vertical brick stack above it and is reused again for the per-voxel
+extraction — 64 evaluations per brick column instead of an O(volume) scan.
+
+**Doctrine boundary — unchanged.** The AUTHORITATIVE act is still the
+**edit-log removal** of the collapsing voxels: a deterministic decision,
+applied through the same `ApplyGroupedEdits` path a dig uses, replicated and
+persisted like any other edit. `AVoxelDebris` Chaos bodies remain **pure client
+cosmetic** — never replicated, cannot desync. A dedicated server removes the
+voxels and spawns no debris.
+
+**Caps** (all documented at their definitions). Authoritative side:
+`MaxCollapsingCells=2048`, `MaxCollapseVoxels=150000`, both taken as a
+deterministic prefix in `VoxelCoordLess` order so a truncated collapse is still
+byte-identical everywhere; `MinPieceVoxels=16` leaves sub-chip fragments in the
+grid (same policy/number as `MinIslandVoxels`). Cosmetic side, applied only in
+`PromoteDetachedIslands` so world state is identical whatever they are set to:
+`MaxDebrisActors=24` Chaos bodies per edit and a shared
+`MaxDebrisInstancesPerEdit=40000` visible-cube budget, with pieces taken
+**largest first** (ties broken on the piece's minimum voxel) so the visually
+significant mass always gets a body. `AVoxelDebris` now also instances only the
+island's **surface shell** — a voxel with all six face-neighbours in the island
+cannot be seen from any angle — and strides uniformly (never a prefix, which
+would render only the bottom slice of a slab) if the shell still exceeds the
+budget. Measured: the chopped tree canopy went from 936 instances to **362**;
+the collapsed roof slab is 4958 voxels rendered as **4838** shell instances.
+
+**Console var.** `voxel.Destruction.Collapse` (default 1), mirroring
+`voxel.Destruction.Enabled` one level down: it gates ONLY this large-edit pass,
+so setting it to 0 restores the previous v0 behavior exactly without touching
+ordinary digs. `voxel.Destruction.Enabled=0` still disables both.
+
+**Verification** (headless `-game`, seed 20260719, `-VoxelNoLoad`, zero ensures,
+clean shutdown, exit 0). New switches `-VoxelStructureTest[=<s>]` (default 8s)
+and `-VoxelCollapseTest[=<s>]` (default 20s, implies the former), anchored
+beside `-VoxelTreeTest`/`-VoxelChopTest`.
+
+- **The money case.** `-VoxelStructureTest=8 -VoxelCollapseTest=22 -VoxelScreenshotAfter=34`.
+  The fixture (`SpawnStructureFixtureAt`, 20,480 voxels) is a ground-rooted
+  **wall** at one end, two **pillars** 12.0m away at the other, and a thin
+  **roof slab** spanning between them — shaped so that pure connectivity cannot
+  give the right answer. One `CarveSphere` r=260UU through the far pillars
+  removed 5,976 voxels; the roof was then **still 6-connected to the ground
+  through the wall**, so `findDisconnectedIslands` would report zero islands and
+  nothing would fall. The support model instead logged `collapsingCells=44 ...
+  supportedBefore=8318 supportedAfter=8268` and `1 piece(s) from 4958
+  unsupported voxels, 4958 voxels removed from the static grid (edit-log)`, then
+  `VoxelDebris spawned: voxels=4958 shell=4838` → `VoxelDebris settled ... after
+  3.63s`. Accounting checks out: the roof is 128x32x2 = 8,192 voxels, the 9 of
+  16 brick columns beyond the wall's 4.8m budget are 72x32x2 = 4,608 of them,
+  plus pillar footings = 4,958. Screenshot
+  `ue-project/Saved/Screenshots/WindowsEditor/M5-collapse-on.png`
+  (= `VoxelVerify00001.png`) shows the wall with only its supported roof stub
+  standing and the fallen span resting on the ground; the control
+  `M5-collapse-off.png` (= `VoxelVerify00005.png`, same run with
+  `voxel.Destruction.Collapse 0`) shows the **entire 12.8m slab hanging in
+  mid-air** — the exact impossible-geometry bug, side by side with its fix.
+- **No false positives — the 1712 regression.** `-VoxelHeadlessDigTest=12`
+  (the 10m crater on open terrain, 2,131,643 voxels removed) now takes the new
+  path instead of skipping, and logs `occupiedAfter=42306 supportedBefore=44309
+  supportedAfter=42306 collapsingCells=0` → `nothing lost support -- 0 pieces`,
+  **zero** islands and **zero** debris. The 1712 spurious islands did not
+  return. Stronger still, the run reports `editedDigest=0xD9FB0347863F529E` —
+  **byte-identical to the pre-change baseline** recorded in this document's M2
+  determinism note, on both server and client roles.
+- **Ordinary digs unchanged.** `-VoxelTreeTest=8 -VoxelChopTest=18` reproduces
+  the first slice's numbers exactly: `region=[(50,-10,10978)..(71,11,11036)]
+  components=2 anchored=1 islands=1` → `island 0 promoted -> 936 voxels
+  removed` → `settled ... rest=(605,5,109885)`, `editedDigest=0xCBF37C4314C206D7`
+  on both roles. The only difference anywhere is cosmetic: the debris body now
+  draws 362 shell instances instead of 936.
+- **Determinism.** A/B of two identical money-case runs: both produced cell
+  digest `0x678F218A72ED5F13`, piece digest `0xC43CE6EDFC8C78C0`, and
+  post-collapse `editedDigest=0x662B4D7933826189`. Order-independence is proved
+  in voxel-core rather than assumed: `computeSupport`'s bucket queue is checked
+  against an order-independent Bellman-Ford relax-to-fixpoint reference at five
+  budgets (`dist` is a shortest-path distance, hence unique regardless of
+  relaxation order), and `splitIntoComponents` is fed 16 random shuffles of the
+  same voxel set and must return identical component order, identical
+  within-component order, and an identical digest every time. Golden pin:
+  `0x64CE88EFEC89BF80` (`collapse_golden_digest_pinned`).
+- **Cost.** The collapse pass is a one-off ~100ms on the money case (prepass
+  91.7ms, support 3.7ms) and ~144ms on the 2.1M-voxel crater (prepass 79.3ms,
+  support 64.5ms). The prepass — 48x48 brick columns x 64 uncached
+  `Amplifier::column()` evaluations — dominates and is the obvious thing to fix
+  next (see follow-ups).
+
+**Unity-build hazard fixed (`connectivity.h`).** With `VoxelWorldSubsystem.cpp`
+unmodified it rejoins UE's adaptive-unity blob alongside
+`VoxelAgentSubsystem.cpp`/`VoxelAgent.cpp`, putting `connectivity.h` and
+`pathfind.h` in ONE translation unit — where two real collisions bit:
+
+1. Both headers opened `namespace vxc::detail` and defined an inline
+   `localIndex(int64_t,int64_t,int64_t,int64_t,int64_t)` with the identical
+   signature. Two definitions of one function in one TU is a hard redefinition
+   error regardless of `inline` or `#pragma once` (which guard re-inclusion of
+   the SAME file, not two files declaring the same entity). Reproduced exactly:
+   `pathfind.h(331,15): error: redefinition of 'localIndex'`.
+2. `connectivity.h` declared a function-local `kNeighborOffsets`, which HIDES
+   the namespace-scope `vxc::kNeighborOffsets` that `pathfind.h` declares —
+   MSVC C4459, which UE compiles as an **error** under `/W4 /WX`.
+
+Fixed properly rather than by suppression: each header now owns its own nested
+detail namespace (`connectivity_detail`, `collapse_detail`) and its own
+constant names (`kComponentFaceSteps`, `kClosureFaceSteps`, `kSplitFaceSteps`),
+with the reasoning recorded at both sites so neither gets flattened back.
+Proven two ways: `test_connectivity.cpp` now `#include`s `pathfind.h` as a
+standing compile-time regression guard, and `VoxelEarthEditor Win64
+Development` was built **with `-DisableAdaptiveUnity`** (which forces all three
+modified files back into the unity blob, and which reproduced BOTH errors
+before the fix) — `Result: Succeeded`, as does the ordinary adaptive build.
+
+**Build/tests.** `vxc_tests` **132 PASS / 0 FAIL** (12 new in
+`test_collapse.cpp`), and `collapse.h` + both test files compile clean under
+`-Wall -Wextra -Wconversion -Wsign-conversion -Werror` with clang.
+
+**Follow-ups** (documented, not done): (1) the ~80-95ms heightfield prepass —
+`Amplifier::column()` has no cache and `CarveSphere` has just evaluated most of
+the same columns, so threading a column cache through the edit would nearly
+erase it; (2) collapse is evaluated once, at edit time — knocking out the
+support of an already-fallen-and-settled mass does not re-trigger, and there is
+no multi-stage progressive collapse; (3) the cantilever budget is a single
+global constant, not material-dependent (rock should span further than soil);
+(4) collapsing cells are removed at brick granularity, so the shear plane is
+0.8m-quantised and can clip a little standing rock adjacent to a falling span;
+(5) clients still do not re-run collapse on replicated removals to spawn their
+own cosmetic debris (shared with the first slice's follow-up 3); (6) pieces
+past the debris cap vanish without a body rather than being merged into a
+batched one.
 
 ## M6 — NPCs (groundwork landed, 2026-07-20)
 

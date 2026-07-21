@@ -39,12 +39,12 @@ AVoxelDebris::AVoxelDebris()
 	VoxelISM->SetCanEverAffectNavigation(false);
 }
 
-void AVoxelDebris::InitFromIsland(const TArray<VoxelCoords::FVoxelCoord>& IslandVoxels)
+int32 AVoxelDebris::InitFromIsland(const TArray<VoxelCoords::FVoxelCoord>& IslandVoxels, int32 MaxInstances)
 {
 	VoxelCount = IslandVoxels.Num();
 	if (VoxelCount == 0)
 	{
-		return;
+		return 0;
 	}
 
 	// World-space AABB of the island's voxel CENTRES.
@@ -62,16 +62,54 @@ void AVoxelDebris::InitFromIsland(const TArray<VoxelCoords::FVoxelCoord>& Island
 
 	SetActorLocation(CentreWorld);
 
-	// One engine-cube instance per voxel, positioned relative to the body
-	// centre. Cube base mesh is 100 UU, so scale by VoxelSizeUU/100 to make a
-	// single voxel.
-	const double InstanceScale = VoxelCoords::VoxelSizeUU / 100.0;
-	VoxelISM->PreAllocateInstancesMemory(VoxelCount);
+	// --- Surface shell only (see the header comment) ------------------------
+	// A voxel whose six face-neighbours are ALL in the island cannot be seen
+	// from any angle, so it is dropped. Membership is tested against a set
+	// built once from the island's own coords; the island list is already
+	// deterministic (sorted by the detector), so the shell is too.
+	TSet<VoxelCoords::FVoxelCoord> Occupied;
+	Occupied.Reserve(VoxelCount);
 	for (const VoxelCoords::FVoxelCoord& V : IslandVoxels)
 	{
-		const FVector Rel = VoxelCoords::VoxelToWorldCenter(V) - CentreWorld;
+		Occupied.Add(V);
+	}
+	TArray<VoxelCoords::FVoxelCoord> Shell;
+	Shell.Reserve(FMath::Min(VoxelCount, MaxInstancesPerBody * 4));
+	for (const VoxelCoords::FVoxelCoord& V : IslandVoxels)
+	{
+		const bool bInterior =
+			Occupied.Contains(VoxelCoords::FVoxelCoord{V.X - 1, V.Y, V.Z}) &&
+			Occupied.Contains(VoxelCoords::FVoxelCoord{V.X + 1, V.Y, V.Z}) &&
+			Occupied.Contains(VoxelCoords::FVoxelCoord{V.X, V.Y - 1, V.Z}) &&
+			Occupied.Contains(VoxelCoords::FVoxelCoord{V.X, V.Y + 1, V.Z}) &&
+			Occupied.Contains(VoxelCoords::FVoxelCoord{V.X, V.Y, V.Z - 1}) &&
+			Occupied.Contains(VoxelCoords::FVoxelCoord{V.X, V.Y, V.Z + 1});
+		if (!bInterior)
+		{
+			Shell.Add(V);
+		}
+	}
+
+	// Budget: the smaller of this body's own ceiling and whatever the caller
+	// has left for this edit. If the shell still does not fit, take every Nth
+	// voxel (uniform stride, not a prefix -- a prefix would render only the
+	// bottom slice of a big slab and look like half the piece vanished).
+	const int32 Budget = FMath::Max(1, FMath::Min(MaxInstances, MaxInstancesPerBody));
+	const int32 Stride = (Shell.Num() > Budget) ? FMath::DivideAndRoundUp(Shell.Num(), Budget) : 1;
+
+	// One engine-cube instance per rendered voxel, positioned relative to the
+	// body centre. Cube base mesh is 100 UU, so scale by VoxelSizeUU/100 to
+	// make a single voxel.
+	const double InstanceScale = VoxelCoords::VoxelSizeUU / 100.0;
+	const int32 Estimate = FMath::DivideAndRoundUp(Shell.Num(), Stride);
+	VoxelISM->PreAllocateInstancesMemory(Estimate);
+	int32 Instances = 0;
+	for (int32 I = 0; I < Shell.Num(); I += Stride)
+	{
+		const FVector Rel = VoxelCoords::VoxelToWorldCenter(Shell[I]) - CentreWorld;
 		const FTransform Xf(FRotator::ZeroRotator, Rel, FVector(InstanceScale));
 		VoxelISM->AddInstance(Xf); // relative to the ISM (= actor origin)
+		++Instances;
 	}
 
 	// Start the Chaos rigid body falling. Gravity only; ignore every collision
@@ -89,8 +127,10 @@ void AVoxelDebris::InitFromIsland(const TArray<VoxelCoords::FVoxelCoord>& Island
 	PhysicsBody->SetPhysicsAngularVelocityInDegrees(Spin);
 
 	UE_LOG(LogVoxelEarth, Log,
-	       TEXT("VoxelDebris spawned: voxels=%d centre=(%.0f,%.0f,%.0f) halfH=%.0fUU -- falling (cosmetic Chaos body)"),
-	       VoxelCount, CentreWorld.X, CentreWorld.Y, CentreWorld.Z, AabbHalfHeightUU);
+	       TEXT("VoxelDebris spawned: voxels=%d shell=%d instances=%d (stride %d) centre=(%.0f,%.0f,%.0f) halfH=%.0fUU ")
+	       TEXT("-- falling (cosmetic Chaos body)"),
+	       VoxelCount, Shell.Num(), Instances, Stride, CentreWorld.X, CentreWorld.Y, CentreWorld.Z, AabbHalfHeightUU);
+	return Instances;
 }
 
 void AVoxelDebris::Tick(float DeltaSeconds)

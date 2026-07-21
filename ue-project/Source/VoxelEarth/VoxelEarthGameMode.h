@@ -80,6 +80,20 @@ private:
 	double TreeTestColumnXUU = 0.0;
 	double TreeTestColumnYUU = 0.0;
 
+	// M5 LARGE-EDIT structural collapse (docs/status.md "Structural collapse
+	// (M5, large-edit)"): -VoxelStructureTest places a wall+roof+far-pillars
+	// FIXTURE near spawn; -VoxelCollapseTest (implies -VoxelStructureTest) then
+	// fires one large CarveSphere through the far pillars, so the roof loses its
+	// support while STILL being connected to the ground via the wall -- the case
+	// island detection structurally cannot answer. Screenshot framing below aims
+	// broadside at the structure when either switch is active.
+	FTimerHandle StructureTestTimerHandle;
+	FTimerHandle CollapseTestTimerHandle;
+	FTimerHandle CollapseTestSettleTimerHandle;
+	bool bStructureTestActive = false;
+	double StructureTestColumnXUU = 0.0;
+	double StructureTestColumnYUU = 0.0;
+
 	// M6 NPC swarm verification (docs/status.md M6 section): -VoxelSwarmTest[=<N>]
 	// spawns the pursuit swarm a couple of seconds after BeginPlay -- see the
 	// .cpp for why this doesn't need to wait for render streaming the way
