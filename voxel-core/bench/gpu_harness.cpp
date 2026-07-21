@@ -8,11 +8,13 @@
 // or read from the shader is integer, matching docs/determinism.md and the
 // float-free contract of voxel-core/src and voxel-core/include.
 //
-// No Vulkan SDK dependency: vulkan-1.dll is loaded dynamically at runtime
-// (LoadLibraryA + vkGetInstanceProcAddr) and every Vulkan entry point used
-// below is resolved through that one function via the X-macro tables, so
-// there is no import-lib link dependency — only tools/vulkan-headers'
-// headers (types/structs/PFN_ typedefs) are needed at compile time.
+// No Vulkan SDK dependency: the Vulkan loader (vulkan-1.dll on Windows,
+// libvulkan.so.1 on Linux) is loaded dynamically at runtime
+// (LoadLibrary/dlopen + vkGetInstanceProcAddr) and every Vulkan entry point
+// used below is resolved through that one function via the X-macro tables,
+// so there is no import-lib link dependency — only tools/vulkan-headers'
+// headers on Windows, or the system Vulkan headers on Linux
+// (types/structs/PFN_ typedefs) are needed at compile time.
 //
 // Two kernels, two pipelines, one shared cbuffer, chained through one
 // buffer: ColumnMain writes OutColumns; that SAME VkBuffer is then bound as
@@ -33,18 +35,25 @@
 //     binding 0: WorldGenParams   (VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, b0; same buffer as above)
 //     binding 4: InColumns        (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t3; same buffer as OutColumns)
 //     binding 5: OutCells         (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, u2, RW)
+//
+// Platform split (M0 close-out, NVIDIA/Linux leg): everything below this
+// comment is identical on both platforms except the ~30-line dynamic-loader
+// shim directly below (LoadLibrary/GetProcAddress/FreeLibrary on Windows,
+// dlopen/dlsym/dlclose on Linux) — the byte-compare logic, output format,
+// and PASS/FAIL/digest reporting are untouched by platform.
 
-#ifndef _WIN32
-#error "gpu_harness.cpp is Windows-only for now (ADR-0001 M0 scope)"
-#endif
-
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <Windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 // Headless compute only — no WSI/surface, so plain vulkan_core.h (no
 // platform header) is enough. VK_NO_PROTOTYPES keeps this a header-only
-// dependency: no vulkan-1.lib, every entry point resolved dynamically below.
+// dependency: no vulkan-1.lib/libvulkan.so link dependency, every entry
+// point resolved dynamically below.
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan_core.h>
 
@@ -140,20 +149,50 @@ void vkCheck(VkResult r, const char* what) {
     if (r != VK_SUCCESS) fail(std::string(what) + " failed: VkResult " + std::to_string(r));
 }
 
-HMODULE g_vulkanDll = nullptr;
+#ifdef _WIN32
+using VulkanLoaderHandle = HMODULE;
+#else
+using VulkanLoaderHandle = void*;
+#endif
+VulkanLoaderHandle g_vulkanDll = nullptr;
 
 void loadVulkanLoader() {
+#ifdef _WIN32
     g_vulkanDll = LoadLibraryA("vulkan-1.dll");
     if (!g_vulkanDll) fail("vulkan-1.dll not found (no Vulkan runtime installed)");
     vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
         GetProcAddress(g_vulkanDll, "vkGetInstanceProcAddr"));
     if (!vkGetInstanceProcAddr) fail("vulkan-1.dll missing vkGetInstanceProcAddr export");
+#else
+    // libvulkan.so.1 is the versioned SONAME every Vulkan loader package
+    // (e.g. Ubuntu's libvulkan-dev / libvulkan1) installs; libvulkan.so
+    // (unversioned, dev-only symlink) is a fallback for setups that only
+    // installed the -dev package's symlink without the runtime package.
+    g_vulkanDll = dlopen("libvulkan.so.1", RTLD_NOW);
+    if (!g_vulkanDll) g_vulkanDll = dlopen("libvulkan.so", RTLD_NOW);
+    if (!g_vulkanDll)
+        fail(std::string("libvulkan.so.1/libvulkan.so not found (no Vulkan runtime installed): ") +
+             dlerror());
+    vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+        dlsym(g_vulkanDll, "vkGetInstanceProcAddr"));
+    if (!vkGetInstanceProcAddr)
+        fail(std::string("libvulkan.so missing vkGetInstanceProcAddr export: ") + dlerror());
+#endif
 
 #define VXC_LOAD_GLOBAL(name)                                                          \
     name = reinterpret_cast<PFN_##name>(vkGetInstanceProcAddr(nullptr, #name));        \
     if (!name) fail("missing global Vulkan entry point " #name);
     VXC_VK_GLOBAL_FUNCS(VXC_LOAD_GLOBAL)
 #undef VXC_LOAD_GLOBAL
+}
+
+void closeVulkanLoader() {
+#ifdef _WIN32
+    FreeLibrary(g_vulkanDll);
+#else
+    dlclose(g_vulkanDll);
+#endif
+    g_vulkanDll = nullptr;
 }
 
 void loadInstanceFuncs(VkInstance instance) {
@@ -2375,7 +2414,7 @@ int main(int argc, char** argv) {
     if (gateRadiusM >= 0) {
         const int rc = gate::runGateMode(ctx, gateRadiusM, seed);
         destroyContext(ctx);
-        FreeLibrary(g_vulkanDll);
+        closeVulkanLoader();
         return rc;
     }
 
@@ -2546,7 +2585,7 @@ int main(int argc, char** argv) {
 
     const std::string deviceName = ctx.deviceName;
     destroyContext(ctx);
-    FreeLibrary(g_vulkanDll);
+    closeVulkanLoader();
 
     const double voxelizeSec = totalVoxelizeDispatchMs / 1000.0;
     const double cellsPerSec = voxelizeSec > 0.0 ? double(totalCells) / voxelizeSec : 0.0;
