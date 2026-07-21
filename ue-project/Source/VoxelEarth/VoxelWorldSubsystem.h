@@ -184,6 +184,16 @@ public:
 	// GameMode's -VoxelTreeTest switch. Returns the number of voxels stamped.
 	int32 SpawnTreeFixtureAt(double WorldX, double WorldY);
 
+	// Places a hand-authored wall + roof-slab + far-pillars TEST FIXTURE rooted
+	// at world column (WorldX, WorldY), via the edit-log authority path. Exists
+	// solely to exercise M5 LARGE-EDIT structural collapse: blowing out only the
+	// far pillars leaves the roof still 6-connected to the ground through the
+	// wall, so connectivity alone would (correctly, and uselessly) report zero
+	// detached islands, while the support model brings down everything past the
+	// cantilever budget. Authority only; behind the GameMode's
+	// -VoxelStructureTest switch. Returns the number of voxels stamped.
+	int32 SpawnStructureFixtureAt(double WorldX, double WorldY);
+
 	// docs/debug-tooling-plan.md P1 "Perf HUD": a snapshot refreshed at 1Hz
 	// (per-frame collection, see FVoxelWorldImpl::UpdatePerfSnapshot), read by
 	// AVoxelEarthHUD every frame when voxel.Debug >= 1. Cheap struct copy;

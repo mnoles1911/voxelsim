@@ -374,7 +374,27 @@ void AVoxelEarthGameMode::BeginPlay()
 					// M5 chop-test framing (task item 5): stand back from the tree
 					// column and look at it, so the detached/fallen canopy is in
 					// frame. Highest priority when a tree/chop test drove the run.
-					if (bTreeTestActive && PC)
+					// M5 large-edit collapse framing: stand well back and to the
+					// side of the wall+roof fixture, level with the roof, so the
+					// standing (wall-supported) part of the slab and the fallen
+					// span are both in frame. Highest priority of all -- the
+					// whole point of this run is to SEE the aftermath.
+					if (bStructureTestActive && PC)
+					{
+						const double StructSurfUU =
+							ShotTerrain ? ShotTerrain->GetSurfaceHeightUU(StructureTestColumnXUU, StructureTestColumnYUU) : 0.0;
+						const FVector StructMid(StructureTestColumnXUU + 640.0, StructureTestColumnYUU + 160.0,
+						                        StructSurfUU + 250.0);
+						const FVector CamPos = StructMid + FVector(-200.0, -1600.0, 700.0); // broadside, back, up
+						const FRotator Look = (StructMid - CamPos).Rotation();
+						if (APawn* P = PC->GetPawn())
+						{
+							P->SetActorLocation(CamPos);
+							P->SetActorRotation(Look);
+						}
+						PC->SetControlRotation(Look);
+					}
+					else if (bTreeTestActive && PC)
 					{
 						const double TreeSurfUU = ShotTerrain ? ShotTerrain->GetSurfaceHeightUU(TreeTestColumnXUU, TreeTestColumnYUU) : 0.0;
 						const FVector TreeMid(TreeTestColumnXUU, TreeTestColumnYUU, TreeSurfUU + 150.0);
@@ -708,6 +728,117 @@ void AVoxelEarthGameMode::BeginPlay()
 					       CutCentre.X, CutCentre.Y, CutCentre.Z, Removed);
 				}),
 			ChopTestDelaySeconds, false);
+	}
+
+	// M5 LARGE-EDIT structural collapse (docs/status.md "Structural collapse
+	// (M5, large-edit)"): -VoxelStructureTest[=<delaySeconds>] (default 8s)
+	// places a wall + roof-slab + far-pillars FIXTURE ~10m ahead of the spawn
+	// column. -VoxelCollapseTest[=<delaySeconds>] (default 20s; implies
+	// -VoxelStructureTest) then fires ONE large CarveSphere through the far
+	// pillars. The carve is far too big for the voxel-resolution island region
+	// (its cleared AABB alone exceeds the 48-voxel cap), so it takes the
+	// brick-resolution differential-support path -- and because the roof stays
+	// 6-connected to the ground through the wall the whole time, anything that
+	// falls here is the SUPPORT model working, not connectivity. Combine with
+	// -VoxelScreenshotAfter=<n> (larger than the collapse delay) for a headless
+	// capture of the aftermath.
+	float CollapseTestDelaySeconds = 20.f;
+	const bool bCollapseTestActive = FParse::Value(FCommandLine::Get(), TEXT("VoxelCollapseTest="), CollapseTestDelaySeconds) ||
+	                                 FParse::Param(FCommandLine::Get(), TEXT("VoxelCollapseTest"));
+	float StructureTestDelaySeconds = 8.f;
+	const bool bStructureTestRequested =
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelStructureTest="), StructureTestDelaySeconds) ||
+		FParse::Param(FCommandLine::Get(), TEXT("VoxelStructureTest"));
+
+	if (bStructureTestRequested || bCollapseTestActive)
+	{
+		bStructureTestActive = true;
+
+		// ~10m ahead (+X) of the spawn column so the whole 12.8m span sits in
+		// front of the pawn and inside R0 (same reasoning as -VoxelTreeTest).
+		double SpawnColXUU = 0.0, SpawnColYUU = 0.0;
+		ParseSpawnColumnUU(SpawnColXUU, SpawnColYUU);
+		StructureTestColumnXUU = SpawnColXUU + 1000.0;
+		StructureTestColumnYUU = SpawnColYUU;
+
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelStructureTest: placing wall+roof fixture at (%.0f,%.0f) in %.1fs"),
+		       StructureTestColumnXUU, StructureTestColumnYUU, StructureTestDelaySeconds);
+		GetWorldTimerManager().SetTimer(
+			StructureTestTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this]()
+				{
+					UWorld* StructWorld = GetWorld();
+					UVoxelWorldSubsystem* Subsystem = StructWorld ? StructWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					if (!Subsystem)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelStructureTest: subsystem not ready, skipping fixture."));
+						return;
+					}
+					const int32 Count = Subsystem->SpawnStructureFixtureAt(StructureTestColumnXUU, StructureTestColumnYUU);
+					UE_LOG(LogVoxelEarth, Log, TEXT("VoxelStructureTest: fixture placed (%d voxels), digest=0x%016llX."),
+					       Count, (unsigned long long)Subsystem->GetEditedDigest());
+				}),
+			StructureTestDelaySeconds, false);
+	}
+
+	if (bCollapseTestActive)
+	{
+		if (CollapseTestDelaySeconds <= StructureTestDelaySeconds)
+		{
+			CollapseTestDelaySeconds = StructureTestDelaySeconds + 12.f;
+		}
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCollapseTest: blowing out the far pillars in %.1fs"), CollapseTestDelaySeconds);
+		GetWorldTimerManager().SetTimer(
+			CollapseTestTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this]()
+				{
+					UWorld* BlastWorld = GetWorld();
+					UVoxelWorldSubsystem* Subsystem = BlastWorld ? BlastWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					if (!Subsystem)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelCollapseTest: subsystem not ready, skipping blast."));
+						return;
+					}
+					// Centred on the far pillar pair (the fixture's +X end,
+					// mid-width, a little above the surface). Radius 2.6m
+					// comfortably swallows BOTH pillars (they sit +/-1.6m from
+					// the centre line); the cleared AABB is ~52 voxels across,
+					// well past the voxel-resolution region's 48-voxel cap, so
+					// this takes the large-edit path by construction. Jitter 0
+					// keeps the blast itself deterministic for the A/B digest
+					// comparison.
+					const double SurfUU = Subsystem->GetSurfaceHeightUU(StructureTestColumnXUU, StructureTestColumnYUU);
+					const FVector BlastCentre(StructureTestColumnXUU + 1240.0, StructureTestColumnYUU + 160.0, SurfUU + 80.0);
+					const int32 Removed = Subsystem->CarveSphere(BlastCentre, 260.0, 0.0);
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelCollapseTest: blast at (%.0f,%.0f,%.0f) r=260UU removed %d voxels -- watch for ")
+					       TEXT("'Collapse:' / 'VoxelDebris' log lines (LogVoxelEdit/LogVoxelEarth)."),
+					       BlastCentre.X, BlastCentre.Y, BlastCentre.Z, Removed);
+
+					GetWorldTimerManager().SetTimer(
+						CollapseTestSettleTimerHandle,
+						FTimerDelegate::CreateWeakLambda(this,
+							[this]()
+							{
+								UWorld* SettleWorld = GetWorld();
+								UVoxelWorldSubsystem* S = SettleWorld ? SettleWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+								if (S)
+								{
+									// The post-collapse edited-world digest IS
+									// the determinism check: the collapse
+									// removals are edit-log entries like any
+									// dig, so an A/B of two identical runs must
+									// print the same value here.
+									UE_LOG(LogVoxelEarth, Log,
+									       TEXT("VoxelCollapseTest: post-collapse seed=%llu editedDigest=0x%016llX"),
+									       (unsigned long long)S->GetSeed(), (unsigned long long)S->GetEditedDigest());
+								}
+							}),
+						8.f, false);
+				}),
+			CollapseTestDelaySeconds, false);
 	}
 
 	// M6 NPC swarm verification (docs/status.md M6 section, plan SS3.6):

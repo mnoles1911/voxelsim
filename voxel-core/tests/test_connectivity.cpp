@@ -3,6 +3,15 @@
 // affected region stay standing vs. become floating debris islands.
 
 #include "voxelcore/connectivity.h"
+// ODR / unity-build regression guard (see connectivity.h's note on
+// `connectivity_detail`): pathfind.h also opens a nested detail namespace with
+// an identically-signed localIndex. UE's adaptive unity build routinely lands
+// both headers in one translation unit (VoxelWorldSubsystem.cpp includes
+// connectivity.h, VoxelAgentSubsystem.cpp includes pathfind.h), which used to
+// fail the VoxelEarth module build with "redefinition of 'localIndex'". This
+// include makes that a compile-time test: if the two headers ever collide
+// again, THIS FILE stops compiling.
+#include "voxelcore/pathfind.h"
 #include "vxctest.h"
 
 #include <chrono>
