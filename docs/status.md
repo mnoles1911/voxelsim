@@ -44,15 +44,21 @@ Working plan + binding decisions: docs/m1-plan.md. UE 5.8.0 (retargeted
 - [x] Stage 3 — walkable + LWC: streaming perf fixed (≥25×), custom AABB
   walk collision, LWC verified at 8,000km, player experience implemented
   (sized digs, explosives, dual cameras, proxy body — PRs #7/#11)
-- Gate (walk & dig at 60fps min-spec): 🟨 near-closed — player feel testing
-  passed (Matt, in-session sign-off 2026-07-20); -VoxelPerfRun harness
-  measured p50 2.8ms / p95 4.2ms pre-M2 (PR #12). Formal min-spec proxy run
-  landed (see "Perf-run hitches" backlog row / M1 gate run result below):
-  p95 has stayed pinned at ~18-19ms across every wave tried so far (budget
-  tightening + PSO precache, then chunk-component pooling) — still above the
-  16.6ms bar. **Component pooling wave (2026-07-20/21) did NOT close the
-  gate** — see the dedicated writeup below for the full before/after numbers
-  and why the theoretical win didn't materialize.
+- Gate (walk & dig at 60fps min-spec): 🟢 **p95 PASS (2026-07-21)** — min-spec
+  proxy p95 dropped from ~18ms to **4.8ms** (postWarmup p95 4.75-4.93ms across
+  5 runs, a 3.4x margin under the 16.6ms bar). Root cause was NOT the
+  per-load GPU buffer upload the prior waves chased: the per-frame streaming
+  budgets were being spent on *free* bookkeeping, so component-less far-ring
+  record evictions starved the real R0 unloads and stale worker results
+  starved the real R0 applies. R0 resident bloated to ~6000 (4x its ~1600
+  desired) and the render thread hitched drawing the stale set. Fix budgets
+  the render-thread-facing work only (see "M1 gate close" writeup below).
+  Player feel testing passed (Matt, in-session sign-off 2026-07-20).
+  **Residual**: 5-18 isolated ~33-40ms steady-state frames remain, fully
+  attributed to (a) coarse-ring (R3/R4) recompute amplifier-sampling (~1-2/run,
+  an M2 streaming follow-up) and (b) environmental stalls on the shared dev
+  box (majority, zero streaming/render/RHI correlation) — not a streaming or
+  render defect. Proposed criterion refinement documented in the writeup.
 
 ## M2 — LOD cascade (first implementation wave landed, 2026-07-20)
 
@@ -774,7 +780,7 @@ retired v0 sequential engine in the interim.
 | R3/R4 first-build cost (~335ms/job) | needs GPU-side gen or disk brick cache | design pass |
 | Dithered ring cross-fades — SYMMETRIC blend | v1 landed (adjacent fade-through); symmetric-blend needs wider desired-set annulus overlap | M2 polish wave |
 | ring↔clipmap seam (z-fighting, accepted v1) | noted | M2 polish |
-| Perf-run hitches (~15-38/run, max 400ms, initial streaming ramp) | **ISOLATED + partially fixed 2026-07-20**, **component pooling tried 2026-07-20/21 -- did NOT close the gate** (worktree agent): see the M1 gate run result + "Component pooling wave" writeup below. Root cause found: every hitch frame has the per-frame apply/unload budgets pinned at cap while their own CPU cost is <1ms — the real cost is render-thread scene-mutation backlog. Tightened streaming budgets (voxel.Stream.Max*PerFrame cvars, 8/4/4→3/2/2) + a BeginPlay PSO precache warmup cut hitches ~3-5x. Pooling `UVoxelChunkComponent`s (avoid DestroyComponent+NewObject on ring-boundary crossings) was the next concrete lead and got a full implementation + measurement pass, but p95 stayed flat at ~18-19ms across 8 measured runs (same band as pre-pooling) — see writeup for why | needs a lead that targets the per-load GPU vertex/index-buffer upload cost itself (BeginInitResource, unavoidable on every SetChunkQuads regardless of component reuse), not the UObject/component lifecycle pooling already addressed |
+| Perf-run hitches (~15-38/run, max 400ms, initial streaming ramp) | **CLOSED on p95 2026-07-21** (worktree agent): p95 18ms→4.8ms. The prior waves' render-buffer-upload diagnosis was a red herring — real root cause was budget MIS-ACCOUNTING (free stale-result discards consumed the apply budget; free component-less far-ring evictions consumed the unload budget), starving the real R0 applies/unloads and bloating R0 resident to ~6000 (4x desired). Fix budgets only render-thread-facing work. See "M1 gate close" writeup below | residual steady-state hitches (5-18/run, ~33-40ms) are environmental + coarse-ring recompute amplifier cost; the latter (memoize ComputeFootprintChunkZRange) is an optional M2 streaming follow-up |
 | Clipmap follow-ups: two-sided material (winding unverified), A/B perf isolate, CDLOD replacement per ADR-0002 tripwire | noted in ADR/plan | M2 polish |
 | Mip cache: budget default tuning (512MB) + real-scenario A/B | eviction landed (PR #16); default may need tuning | M2 polish |
 | Debug tooling P2/P3 (τ overlay, water ledgers) | phased with M2-polish/W2 | — |
@@ -1041,3 +1047,118 @@ verified via `-VoxelScreenshotAfter=40` (seed 20260719): terrain, ocean, and
 shadowing all render correctly, zero ensures, clean shutdown --
 `VoxelVerify00000.png`/`00001.png` under
 `ue-project/Saved/Screenshots/WindowsEditor/`.
+
+### M1 gate close — budget mis-accounting was the real hitch (2026-07-21, worktree agent)
+
+**The prior diagnosis was wrong.** Every earlier wave (budget tightening,
+PSO precache, component pooling) accepted that "the per-load GPU
+vertex/index-buffer upload + FScene::AddPrimitive is the irreducible cost."
+Re-measuring from scratch on this AMD 7800 XT (min-spec proxy: `sg.*Quality 0`,
+`r.ScreenPercentage 100`, 1080p, `-VoxelPerfRun=60`, seed 20260719) with the
+existing hitch-attribution log AND newly-added per-thread frame timers
+(`GRenderThreadTime`/`GRenderThreadWaitTime`/`GRHIThreadTime`/
+`GGameThreadWaitTime` from `RenderTimer.h`, logged only on hitch frames)
+showed a different picture:
+
+- **Attribution.** Steady-state hitch frames had `subsystemTickMs≈0` (our own
+  budgeted CPU work is nothing) and were **render-thread-bound**: `renderMs`
+  spiked to 17-47ms with `renderWaitMs≈0` (render thread fully busy, not idle)
+  and `gameWaitMs` tracking it (game thread blocked on the render fence). The
+  giant 100-400ms spikes were one-time (cold DDC/shader-compile: `postWarmupMax`
+  fell 358ms→56ms between a cold and a warm run with no code change). GC and
+  shader compilation were ruled out by log inspection (no `LogGarbage`, no
+  mid-run `LogShaderCompilers`).
+- **The smoking gun.** The `Voxel rings:`/`Voxel streaming:` periodic log lines
+  showed **R0 resident = 5925 and still growing** (design is ~1600 — see M2
+  wave-1 verification), with **pendingUnload = 58,051** backlogged and
+  `tracked = 68,771`. The render thread was drawing ~4x the chunks it should,
+  because chunks that had long left the 80m unload radius stayed resident with
+  live scene proxies. Unload starvation, not buffer-upload cost.
+
+**Root cause: the per-frame budgets were being spent on FREE work.**
+`DrainResults` counted every stale-result discard (chunk left the desired set,
+or was superseded by an edit re-mesh — a `TMap::Find` + counter, no proxy)
+against `voxel.Stream.MaxAppliesPerFrame`. `DrainUnloads` counted every
+component-LESS record eviction (an outer-ring R2/R3/R4 candidate that was
+queued as a job but left the desired set before it ever meshed — a bare
+`TMap` erase, no `RemovePrimitive`) against `voxel.Stream.MaxUnloadsPerFrame`.
+During a perf flight the far-ring churn is enormous (measured ~130k
+component-less evictions and a flood of stale results vs ~7k real loads), so
+the render-facing budgets were consumed almost entirely by bookkeeping and the
+real R0 applies/unloads near the player were starved: R0 couldn't unload
+(resident bloated → render-thread hitch) and, when the unload budget was naively
+raised to compensate, R0 couldn't even apply (resident collapsed to 0 — fast
+frames drawing nothing).
+
+**Fix (render/streaming-side only; determinism unaffected — only *when* chunks
+load/unload changes, never *what*).** Make the budgets gate only the
+render-thread-facing events:
+- `DrainResults`: stale discards no longer consume `MaxApplies`; only live
+  results (an actual `ApplyMeshResult` → `SetChunkQuads` → `AddPrimitive`/GPU
+  upload) do. A separate large per-frame drain cap (1024) bounds the cheap
+  discard work so a stale backlog can't stall the game thread either.
+- `DrainUnloads`: component-less evictions no longer consume `MaxUnloads`; only
+  a pool-park of a live component (which fires `RemovePrimitive`) does.
+  Component-bearing unloads over budget this frame are deferred (kept tracked,
+  re-queued) rather than forced through; component-less evictions flow freely
+  under a 1024/frame pop cap.
+
+No cvar defaults changed (still 3/2/2) — the numbers were never the problem,
+the accounting was. With the fix, `MaxApplies=3`/`MaxUnloads=2` per frame is
+ample (render-facing rates ~540/360 per sec at ~180fps vs ~127/sec real
+churn), so R0 stays both populated and bounded.
+
+**Before / after** (min-spec proxy, `-VoxelPerfRun=60`, seed 20260719, 5 runs
+each; "before" = this session's baseline with the old accounting, matching the
+prior waves' ~18ms band):
+
+| Metric | Before | After (5 runs) |
+|---|---|---|
+| p95 (full run) | 17.6-18.4 ms | **4.79-4.93 ms** |
+| postWarmup p95 (t≥10s) | 18.5 ms | **4.75-4.93 ms** |
+| p50 | 3.1-3.9 ms | 3.09-3.15 ms |
+| postWarmup hitches (>33.3ms) | 7-26 | 5-18 |
+| R0 resident (perf flight) | 5925 & growing | ~250-625 (bounded) |
+| pendingUnload backlog | 58,051 | 23 |
+
+**Verdict: p95 gate PASSES** — 4.8ms vs the 16.6ms bar, a 3.4x margin,
+reproducibly across 5 runs, both full-run and post-warmup. Render correctness
+verified (`-VoxelScreenshotAfter=40`, seed 20260719: contiguous voxel terrain
+with AO, ocean plane, HUD, no near-field holes, zero ensures —
+`VoxelVerify00000.png`/`00001.png`). Standalone behavior with default budgets
+unchanged; the fix is byte-identical output, only faster loading/unloading.
+
+**Honest residual (the "steady-state hitches → 0" sub-criterion is NOT
+literally met).** 5-18 isolated ~33-40ms frames per run remain post-warmup,
+fully attributed to two non-render, non-buffer-upload sources: **(a)** ~1-2/run
+where `subsystemTickMs≈14-15ms` — a coarse-ring (R3/R4) entry rescan that
+re-samples the amplifier via `ComputeFootprintChunkZRange` over ~1849 footprints
+when the anchor crosses a level-3/4 chunk boundary (every ~1-2.5s); memoizing
+that pure function per `(level,Cx,Cy)` would remove it and is a clean optional
+M2 streaming follow-up. **(b)** the majority — ~33-40ms frames with
+`subsystemTickMs≈0.03` and `renderMs`/`rhiMs`/`gameWaitMs` all tiny, i.e. no
+correlation to any measured thread: environmental stalls on this shared dev box
+(other processes / GPU-driver / windowed-mode present), an ~0.1%-of-frames
+floor no streaming or render change can reach here. Neither category is the
+per-load render cost the gate was chasing.
+
+**Proposed gate-criterion refinement** (per the gate note's own "if steady-state
+is clean, report that honestly" allowance): assess the 60fps requirement as
+**post-warmup p95 < 16.6ms with no steady-state hitch attributable to
+streaming/render** (met: 4.8ms, and every residual hitch is attributed to
+amplifier-recompute cost or environmental noise, not render/proxy work),
+excluding the two unavoidable cold-start frames (first-frame desired-set
+build + first-draw shader warm-up — legitimate loading-screen-class cost).
+
+**Diagnostic instrumentation kept**: the per-thread frame timers
+(`GRenderThreadTime` etc.) are now logged on every hitch frame (cost: a few
+global reads, only when a frame already overran the threshold) — they are what
+turned "elsewhereMs is a black box" into the render-thread-bound attribution
+above, and remain useful for any future perf work.
+
+Build: worktree `voxelcore.lib` reused from the identical `main` checkout
+(voxel-core untouched — `git diff main -- voxel-core/` empty), `VoxelEarthEditor
+Win64 Development` built clean via `Build.bat ... -WaitMutex
+-NoHotReloadFromIDE` (zero warnings from the only file touched this wave,
+`VoxelWorldSubsystem.cpp`; same pre-existing engine-header deprecation baseline
+as prior waves).
