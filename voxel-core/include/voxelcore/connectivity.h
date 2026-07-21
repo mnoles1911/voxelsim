@@ -149,7 +149,20 @@ struct ConnectivityResult {
     }
 };
 
-namespace detail {
+// ODR / unity-build note (do NOT re-flatten this into `vxc::detail`):
+// pathfind.h ALSO opens `namespace vxc::detail` and defines an inline
+// `localIndex(int64_t,int64_t,int64_t,int64_t,int64_t)` with the identical
+// signature. Two definitions of the same function in one translation unit is a
+// hard redefinition error regardless of `inline` or `#pragma once` (those guard
+// re-inclusion of the SAME file, not two different files declaring the same
+// entity). That is exactly what UE's adaptive unity build produces: when
+// VoxelWorldSubsystem.cpp (includes connectivity.h) is unmodified it rejoins
+// the unity blob alongside VoxelAgentSubsystem.cpp/VoxelAgent.cpp (include
+// pathfind.h), both headers land in one TU, and VoxelEarth fails to compile
+// with a redefinition error pointing here. Giving each header its own nested
+// detail namespace removes the collision for good; test_connectivity.cpp
+// includes both headers in one TU as a standing regression guard.
+namespace connectivity_detail {
 
 // Local (box-relative) voxel index, x-fastest — matches Brick<B>::cellIndex's
 // convention (x + edge*(y + edge*z)).
@@ -159,7 +172,7 @@ inline size_t localIndex(int64_t lx, int64_t ly, int64_t lz, int64_t dx, int64_t
                (static_cast<size_t>(ly) + static_cast<size_t>(dy) * static_cast<size_t>(lz));
 }
 
-} // namespace detail
+} // namespace connectivity_detail
 
 // Flood-fills the solid voxels of the inclusive box [minCorner, maxCorner]
 // into 6-connected components. Returns an empty result (componentCount == 0,
@@ -182,7 +195,7 @@ inline ConnectivityResult findComponents(const SolidFn& solidFn, VoxelCoord minC
     for (int64_t lz = 0; lz < dz; ++lz)
         for (int64_t ly = 0; ly < dy; ++ly)
             for (int64_t lx = 0; lx < dx; ++lx) {
-                const size_t idx = detail::localIndex(lx, ly, lz, dx, dy);
+                const size_t idx = connectivity_detail::localIndex(lx, ly, lz, dx, dy);
                 solidMask[idx] = solidFn(minCorner.x + lx, minCorner.y + ly, minCorner.z + lz) ? 1 : 0;
             }
 
@@ -194,19 +207,28 @@ inline ConnectivityResult findComponents(const SolidFn& solidFn, VoxelCoord minC
     queue.reserve(volume);
 
     // Fixed 6-neighbor step order (face adjacency only — NOT the 26
-    // diagonal/edge/corner neighbors): -x, +x, -y, +y, -z, +z. The order
+    // diagonal/edge/corner neighbors): -x, +x, -y, +y, -z, +z. Named
+    // kComponentFaceSteps rather than the obvious kComponentFaceSteps on purpose:
+    // pathfind.h declares a NAMESPACE-SCOPE `vxc::kComponentFaceSteps`, and a
+    // function-local of that name in a translation unit that also includes
+    // pathfind.h trips MSVC's C4459 (local declaration hides global) — which UE
+    // compiles as an ERROR under /W4 /WX, and UE's unity build routinely puts
+    // both headers in one TU. Same family of hazard as the localIndex ODR
+    // collision documented above, and the same fix: do not reuse a name another
+    // voxel-core header has already claimed at namespace scope. The order
+    // itself
     // itself is not load-bearing for the resulting component SET (any
     // order visits the same reachable voxels), only kept fixed for
     // readability/consistency with the rest of the codebase's fixed-order
     // conventions (e.g. waterca.h's gravity/+x/-x/+y/-y priority order).
-    static constexpr std::array<std::array<int64_t, 3>, 6> kNeighborOffsets = {{
+    static constexpr std::array<std::array<int64_t, 3>, 6> kComponentFaceSteps = {{
         {-1, 0, 0}, {1, 0, 0}, {0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1},
     }};
 
     for (int64_t lz = 0; lz < dz; ++lz) {
         for (int64_t ly = 0; ly < dy; ++ly) {
             for (int64_t lx = 0; lx < dx; ++lx) {
-                const size_t startIdx = detail::localIndex(lx, ly, lz, dx, dy);
+                const size_t startIdx = connectivity_detail::localIndex(lx, ly, lz, dx, dy);
                 if (!solidMask[startIdx] || visited[startIdx]) continue;
 
                 Component comp;
@@ -218,12 +240,12 @@ inline ConnectivityResult findComponents(const SolidFn& solidFn, VoxelCoord minC
                     const LocalCoord c = queue[head++];
                     comp.voxels.push_back(
                         VoxelCoord{minCorner.x + c.lx, minCorner.y + c.ly, minCorner.z + c.lz});
-                    for (const auto& off : kNeighborOffsets) {
+                    for (const auto& off : kComponentFaceSteps) {
                         const int64_t nx = c.lx + off[0];
                         const int64_t ny = c.ly + off[1];
                         const int64_t nz = c.lz + off[2];
                         if (nx < 0 || nx >= dx || ny < 0 || ny >= dy || nz < 0 || nz >= dz) continue;
-                        const size_t nIdx = detail::localIndex(nx, ny, nz, dx, dy);
+                        const size_t nIdx = connectivity_detail::localIndex(nx, ny, nz, dx, dy);
                         if (!solidMask[nIdx] || visited[nIdx]) continue;
                         visited[nIdx] = 1;
                         queue.push_back({nx, ny, nz});

@@ -24,6 +24,7 @@
 // module .cpp (doctrine: never from a header UHT parses -- see
 // VoxelWorldSubsystem.h / VoxelChunkComponent.h, both voxel-core-free).
 #include "voxelcore/bytes.h"
+#include "voxelcore/collapse.h"     // M5 large-edit structural collapse: differential coarse support
 #include "voxelcore/connectivity.h" // M5 destruction: findDisconnectedIslands over the edited region
 #include "voxelcore/counters.h"
 #include "voxelcore/editcompact.h" // M3 wave 2: compactLog for save-to-disk + join-sync compaction
@@ -83,6 +84,17 @@ static_assert(vxc::kVoxelSizeMm == int32(VoxelCoords::VoxelSizeUU) * 10,
 static TAutoConsoleVariable<bool> CVarVoxelDestructionEnabled(
 	TEXT("voxel.Destruction.Enabled"), true,
 	TEXT("M5: run connectivity island-detection after solid-removing edits and promote detached islands to falling debris."),
+	ECVF_Default);
+
+// M5 large-edit structural collapse, mirroring voxel.Destruction.Enabled one
+// level down: this gates ONLY the brick-resolution differential-support pass
+// that runs when the voxel-resolution island region clamps (large/explosive
+// edits). Default on. Turning it off restores the previous v0 behavior exactly
+// -- large edits detach nothing -- without touching ordinary digs, which never
+// reach this path at all. voxel.Destruction.Enabled=0 disables both.
+static TAutoConsoleVariable<bool> CVarVoxelCollapseEnabled(
+	TEXT("voxel.Destruction.Collapse"), true,
+	TEXT("M5: run brick-resolution differential-support structural collapse for edits too large for voxel-resolution island detection."),
 	ECVF_Default);
 
 namespace
@@ -1298,6 +1310,27 @@ public:
 	// island count. No-op returning 0 if ClearedVoxels is empty.
 	int32 DetectAndRemoveIslands(const TArray<VoxelCoords::FVoxelCoord>& ClearedVoxels,
 	                             TArray<TArray<VoxelCoords::FVoxelCoord>>& OutIslands, bool& bOutRegionClamped);
+
+	// M5 LARGE-EDIT structural collapse (docs/status.md "Structural collapse
+	// (M5, large-edit)"; model + soundness argument in
+	// voxel-core/include/voxelcore/collapse.h). This is the path taken when
+	// DetectAndRemoveIslands' bounded voxel region CLAMPS -- i.e. exactly the
+	// explosive-scale edits whose boundary-anchor policy it cannot reason
+	// about, which previously did nothing at all and left impossible floating
+	// geometry standing.
+	//
+	// Runs vxc::findCollapsingCells over a BRICK-resolution region (one coarse
+	// cell == one 8-voxel/0.8m brick, so cell occupancy comes straight off the
+	// edit overlay's brick bitset or the heightfield, with no per-voxel terrain
+	// evaluation) twice: once against pre-edit occupancy (post-edit occupancy
+	// plus the bricks the just-cleared voxels sat in) and once against
+	// post-edit occupancy. Mass whose support THIS edit destroyed is removed
+	// from the authoritative grid through the same edit-log path
+	// DetectAndRemoveIslands uses, and the removed voxel sets come back in
+	// OutPieces for the caller to hand to cosmetic AVoxelDebris bodies.
+	// Returns the number of collapsed pieces. Authority side, game thread.
+	int32 DetectAndRemoveCollapse(const TArray<VoxelCoords::FVoxelCoord>& ClearedVoxels,
+	                              TArray<TArray<VoxelCoords::FVoxelCoord>>& OutPieces);
 private:
 
 	// --- Debug-tooling helpers (docs/debug-tooling-plan.md P1) ----------------
@@ -2735,9 +2768,10 @@ int32 FVoxelWorldImpl::DetectAndRemoveIslands(const TArray<VoxelCoords::FVoxelCo
 	if (bOutRegionClamped)
 	{
 		UE_LOG(LogVoxelEdit, Log,
-		       TEXT("Destruction: edit region exceeded cap (%lldx%lldx%lld) -- island detection skipped (large-edit collapse is a follow-up)"),
+		       TEXT("Destruction: edit region exceeded the voxel-resolution cap (%lldx%lldx%lld) -- handing off to large-edit ")
+		       TEXT("structural collapse (brick-resolution differential support)"),
 		       (long long)RegionMaxXY, (long long)RegionMaxXY, (long long)RegionMaxZ);
-		return 0;
+		return DetectAndRemoveCollapse(ClearedVoxels, OutIslands);
 	}
 
 	// Ragged carves (jittered CarveSphere) can genuinely isolate a handful of
@@ -2829,6 +2863,294 @@ int32 FVoxelWorldImpl::DetectAndRemoveIslands(const TArray<VoxelCoords::FVoxelCo
 		       MinIslandVoxels);
 	}
 	return IslandCount;
+}
+
+// M5 LARGE-EDIT structural collapse. See the declaration above for what this
+// is, and voxel-core/include/voxelcore/collapse.h for the model itself (coarse
+// cells, support-with-a-lateral-budget, differential before/after, closure)
+// plus the argument for why it stays sound at any region size where the
+// voxel-resolution bounded box did not.
+int32 FVoxelWorldImpl::DetectAndRemoveCollapse(const TArray<VoxelCoords::FVoxelCoord>& ClearedVoxels,
+                                               TArray<TArray<VoxelCoords::FVoxelCoord>>& OutPieces)
+{
+	if (!CVarVoxelCollapseEnabled.GetValueOnGameThread())
+	{
+		UE_LOG(LogVoxelEdit, Log, TEXT("Collapse: voxel.Destruction.Collapse=0 -- large-edit collapse skipped"));
+		return 0;
+	}
+	if (ClearedVoxels.Num() == 0)
+	{
+		return 0;
+	}
+	constexpr int32 B = VoxelCoords::BrickEdgeVoxels; // 8 voxels = 0.8m = ONE coarse cell
+	const double StartSeconds = FPlatformTime::Seconds();
+
+	// --- Tunables (all documented in docs/status.md) -------------------------
+	// Region margins, in BRICKS. Generous laterally and upward because the mass
+	// that loses its support can extend well past the blast itself (a roof
+	// whose pillars were blown out reaches far beyond the crater). Unlike the
+	// voxel-resolution path, over-shrinking here is not a correctness problem,
+	// only a recall problem -- see the clamp note below.
+	constexpr int64 MarginBricksXY = 20;   // 16m
+	constexpr int64 MarginBricksDown = 4;  // 3.2m
+	constexpr int64 MarginBricksUp = 16;   // 12.8m
+	// Hard region caps. 48x48x40 bricks = 38.4 x 38.4 x 32 m, 92160 cells --
+	// two byte arrays + two int32 arrays over that is ~0.9MB, and the
+	// heightfield prepass below is 48*48 brick columns * 64 amplifier column
+	// evaluations = ~147k, the dominant cost (logged as prepassMs).
+	constexpr int64 RegionMaxBricksXY = 48;
+	constexpr int64 RegionMaxBricksZ = 40;
+	// Cantilever budget: 6 cells = 4.8m of horizontal span from the nearest
+	// thing carrying load. See collapse.h; larger is more conservative.
+	constexpr int32 MaxLateralCells = 6;
+	// Work valves. Cells first (bounds the support scan's output), then voxels
+	// (bounds edit-log churn + re-mesh), both taken as a deterministic prefix
+	// in VoxelCoordLess order so a truncated collapse is still identical on
+	// every machine.
+	constexpr int32 MaxCollapsingCells = 2048;   // 2048 bricks = up to ~1M voxels before the voxel cap bites
+	constexpr int32 MaxCollapseVoxels = 150000;
+	// Chips smaller than this are left in the grid rather than promoted --
+	// same policy (and same number) as DetectAndRemoveIslands' MinIslandVoxels.
+	constexpr int32 MinPieceVoxels = 16;
+
+	// --- Analysis region, in brick coords -----------------------------------
+	int64 MinVx = INT64_MAX, MinVy = INT64_MAX, MinVz = INT64_MAX;
+	int64 MaxVx = INT64_MIN, MaxVy = INT64_MIN, MaxVz = INT64_MIN;
+	for (const VoxelCoords::FVoxelCoord& V : ClearedVoxels)
+	{
+		MinVx = FMath::Min(MinVx, V.X); MaxVx = FMath::Max(MaxVx, V.X);
+		MinVy = FMath::Min(MinVy, V.Y); MaxVy = FMath::Max(MaxVy, V.Y);
+		MinVz = FMath::Min(MinVz, V.Z); MaxVz = FMath::Max(MaxVz, V.Z);
+	}
+	vxc::VoxelCoord MinCell{vxc::floorDiv(MinVx, B) - MarginBricksXY, vxc::floorDiv(MinVy, B) - MarginBricksXY,
+	                        vxc::floorDiv(MinVz, B) - MarginBricksDown};
+	vxc::VoxelCoord MaxCell{vxc::floorDiv(MaxVx, B) + MarginBricksXY, vxc::floorDiv(MaxVy, B) + MarginBricksXY,
+	                        vxc::floorDiv(MaxVz, B) + MarginBricksUp};
+
+	// Clamping is SAFE here, which is the whole point of this path. Shrinking
+	// the region turns interior cells into boundary cells, and boundary cells
+	// are anchored in BOTH the before pass and the after pass -- so they are
+	// supported in both and can never satisfy the collapse predicate. Clamping
+	// can therefore only ever REMOVE collapse decisions, never invent one.
+	// (The voxel-resolution path could not say this: its anchor policy was only
+	// sound while the box CONTAINED the candidate piece, which is exactly why
+	// it had to bail out when it clamped.)
+	bool bRegionClamped = false;
+	auto ClampAxis = [&bRegionClamped](int64& Lo, int64& Hi, int64 Cap)
+	{
+		if (Hi - Lo + 1 > Cap)
+		{
+			const int64 Centre = (Lo + Hi) / 2;
+			Lo = Centre - Cap / 2;
+			Hi = Lo + Cap - 1;
+			bRegionClamped = true;
+		}
+	};
+	ClampAxis(MinCell.x, MaxCell.x, RegionMaxBricksXY);
+	ClampAxis(MinCell.y, MaxCell.y, RegionMaxBricksXY);
+	ClampAxis(MinCell.z, MaxCell.z, RegionMaxBricksZ);
+
+	const int64 CX = MaxCell.x - MinCell.x + 1;
+	const int64 CY = MaxCell.y - MinCell.y + 1;
+	const int64 CZ = MaxCell.z - MinCell.z + 1;
+
+	// --- Heightfield prepass ------------------------------------------------
+	// The base (unedited) world is a pure heightfield: voxel (x,y,z) is solid
+	// iff its centre z*kVoxelSizeMm + kVoxelSizeMm/2 is at or below that
+	// column's surfaceMm (amplifier.h). So one Amplifier::column() evaluation
+	// per voxel COLUMN answers occupancy for the whole vertical brick stack
+	// above it -- 64 evaluations per brick column, reused for all CZ bricks and
+	// again for the per-voxel extraction below, instead of the ~O(volume)
+	// uncached column() calls a World::materialAt-per-voxel scan would cost.
+	TArray<int32> ColumnSurfaceMm;
+	ColumnSurfaceMm.SetNumUninitialized((int32)(CX * CY * B * B));
+	TArray<int64> BrickColumnTopVz; // topmost solid voxel z over each brick column's 8x8 footprint
+	BrickColumnTopVz.SetNumUninitialized((int32)(CX * CY));
+	for (int64 Ly = 0; Ly < CY; ++Ly)
+	{
+		for (int64 Lx = 0; Lx < CX; ++Lx)
+		{
+			int64 TopMax = INT64_MIN;
+			for (int32 Cy = 0; Cy < B; ++Cy)
+			{
+				for (int32 Cx = 0; Cx < B; ++Cx)
+				{
+					const int64 Vx = (MinCell.x + Lx) * B + Cx;
+					const int64 Vy = (MinCell.y + Ly) * B + Cy;
+					const int32 SurfMm = Voxels.amplifier().column(Vx, Vy).surfaceMm;
+					ColumnSurfaceMm[(int32)(((Ly * CX) + Lx) * B * B + Cy * B + Cx)] = SurfMm;
+					TopMax = FMath::Max(TopMax, vxc::floorDiv((int64)SurfMm - vxc::kVoxelSizeMm / 2, vxc::kVoxelSizeMm));
+				}
+			}
+			BrickColumnTopVz[(int32)(Ly * CX + Lx)] = TopMax;
+		}
+	}
+	const double PrepassSeconds = FPlatformTime::Seconds();
+
+	// --- Occupancy predicates ----------------------------------------------
+	// AFTER: the edit overlay wins where it exists (its brick bitset is exact
+	// and already includes this edit's removals), otherwise the heightfield.
+	const auto OccupiedAfter = [&](int64_t cx, int64_t cy, int64_t cz) -> bool
+	{
+		const vxc::BrickKey Key{(int32)cx, (int32)cy, (int32)cz};
+		if (const vxc::Brick<B>* Br = Voxels.editedBricks().find(Key))
+		{
+			return !Br->empty();
+		}
+		const int64 Lx = cx - MinCell.x, Ly = cy - MinCell.y;
+		if (Lx < 0 || Lx >= CX || Ly < 0 || Ly >= CY)
+		{
+			return false; // outside the prepass; never queried by computeSupport
+		}
+		return (int64)cz * B <= BrickColumnTopVz[(int32)(Ly * CX + Lx)];
+	};
+	// BEFORE: for a removal-only edit, pre-edit occupancy is exactly post-edit
+	// occupancy PLUS every brick that contained one of the just-cleared voxels
+	// (those bricks certainly had at least one solid voxel a moment ago). No
+	// snapshot of the world is needed, only the cleared list the caller already
+	// has -- this is what makes the differential rule cheap.
+	TSet<FIntVector> ClearedBricks;
+	ClearedBricks.Reserve(FMath::Min(ClearedVoxels.Num(), 4096));
+	for (const VoxelCoords::FVoxelCoord& V : ClearedVoxels)
+	{
+		ClearedBricks.Add(FIntVector((int32)vxc::floorDiv(V.X, B), (int32)vxc::floorDiv(V.Y, B),
+		                             (int32)vxc::floorDiv(V.Z, B)));
+	}
+	const auto OccupiedBefore = [&](int64_t cx, int64_t cy, int64_t cz) -> bool
+	{
+		if (ClearedBricks.Contains(FIntVector((int32)cx, (int32)cy, (int32)cz)))
+		{
+			return true;
+		}
+		return OccupiedAfter(cx, cy, cz);
+	};
+
+	// --- The decision -------------------------------------------------------
+	vxc::CollapseParams Params;
+	Params.maxLateralCells = MaxLateralCells;
+	Params.maxCollapsingCells = MaxCollapsingCells;
+	const vxc::CollapseAnalysis Analysis =
+		vxc::findCollapsingCells(OccupiedBefore, OccupiedAfter, MinCell, MaxCell, Params);
+	const double AnalysisSeconds = FPlatformTime::Seconds();
+
+	vxc::Digest CellDigest;
+	Analysis.digest(CellDigest);
+	UE_LOG(LogVoxelEdit, Log,
+	       TEXT("Collapse: region=[(%lld,%lld,%lld)..(%lld,%lld,%lld)] bricks (%lldx%lldx%lld)%s budget=%d ")
+	       TEXT("occupiedAfter=%d supportedBefore=%d supportedAfter=%d collapsingCells=%d%s digest=0x%016llX"),
+	       (long long)MinCell.x, (long long)MinCell.y, (long long)MinCell.z, (long long)MaxCell.x,
+	       (long long)MaxCell.y, (long long)MaxCell.z, (long long)CX, (long long)CY, (long long)CZ,
+	       bRegionClamped ? TEXT(" (CLAMPED - recall only, still sound)") : TEXT(""), MaxLateralCells,
+	       Analysis.occupiedCellsAfter, Analysis.supportedCellsBefore, Analysis.supportedCellsAfter,
+	       (int32)Analysis.collapsingCells.size(), Analysis.bTruncated ? TEXT(" (CELL CAP)") : TEXT(""),
+	       (unsigned long long)CellDigest.h);
+
+	if (Analysis.collapsingCells.empty())
+	{
+		UE_LOG(LogVoxelEdit, Log,
+		       TEXT("Collapse: nothing lost support -- 0 pieces (prepass %.1fms, support %.1fms)"),
+		       (PrepassSeconds - StartSeconds) * 1000.0, (AnalysisSeconds - PrepassSeconds) * 1000.0);
+		return 0;
+	}
+
+	// --- Coarse cells -> the actual voxels to remove ------------------------
+	// Only cells collapse; the voxels that come down are every still-solid
+	// voxel inside them. Iterated in the cells' own VoxelCoordLess order so the
+	// MaxCollapseVoxels cut is a deterministic prefix.
+	std::vector<vxc::VoxelCoord> CollapsingVoxels;
+	bool bVoxelCapHit = false;
+	for (const vxc::VoxelCoord& Cell : Analysis.collapsingCells)
+	{
+		if ((int32)CollapsingVoxels.size() >= MaxCollapseVoxels)
+		{
+			bVoxelCapHit = true;
+			break;
+		}
+		const vxc::BrickKey Key{(int32)Cell.x, (int32)Cell.y, (int32)Cell.z};
+		const vxc::Brick<B>* Br = Voxels.editedBricks().find(Key);
+		const int64 Lx = Cell.x - MinCell.x, Ly = Cell.y - MinCell.y;
+		for (int32 Cz = 0; Cz < B; ++Cz)
+		{
+			for (int32 Cy = 0; Cy < B; ++Cy)
+			{
+				for (int32 Cx = 0; Cx < B; ++Cx)
+				{
+					const int64 Vz = Cell.z * B + Cz;
+					bool bSolid;
+					if (Br)
+					{
+						bSolid = Br->get(Cx, Cy, Cz) != vxc::MAT_AIR;
+					}
+					else
+					{
+						const int32 SurfMm = ColumnSurfaceMm[(int32)(((Ly * CX) + Lx) * B * B + Cy * B + Cx)];
+						bSolid = (Vz * vxc::kVoxelSizeMm + vxc::kVoxelSizeMm / 2) <= (int64)SurfMm;
+					}
+					if (bSolid)
+					{
+						CollapsingVoxels.push_back(vxc::VoxelCoord{Cell.x * B + Cx, Cell.y * B + Cy, Vz});
+					}
+				}
+			}
+		}
+	}
+
+	// Split into physically separate falling pieces (a collapse usually breaks
+	// into several). Hash-set BFS over the SET, not a dense mask over its
+	// bounding box -- the set is sparse and can be large.
+	const int32 CollapsingVoxelCount = (int32)CollapsingVoxels.size();
+	std::vector<vxc::Component> Pieces = vxc::splitIntoComponents(std::move(CollapsingVoxels));
+	vxc::Digest PieceDigest;
+	vxc::digestComponents(Pieces, PieceDigest);
+
+	// --- Authoritative removal (edit-log path) ------------------------------
+	// ONE grouped apply for the whole collapse rather than one per piece: a big
+	// collapse can touch hundreds of bricks and each ApplyGroupedEdits triggers
+	// re-mesh bookkeeping.
+	std::unordered_map<vxc::BrickKey, std::vector<vxc::EditCell>, vxc::BrickKeyHash> EditsByBrick;
+	TSet<VoxelCoords::FVoxelChunkKey> DirtyChunks;
+	int32 PieceCount = 0, SkippedSmall = 0, RemovedVoxels = 0;
+	for (const vxc::Component& Piece : Pieces)
+	{
+		if ((int32)Piece.voxels.size() < MinPieceVoxels)
+		{
+			++SkippedSmall;
+			continue; // chip -- leave it in the grid, same policy as MinIslandVoxels
+		}
+		TArray<VoxelCoords::FVoxelCoord> PieceCoords;
+		PieceCoords.Reserve((int32)Piece.voxels.size());
+		for (const vxc::VoxelCoord& V : Piece.voxels)
+		{
+			const vxc::BrickKey BKey = vxc::ChunkMap<B>::keyForVoxel(V.x, V.y, V.z);
+			const int LocalX = (int)vxc::floorMod(V.x, B);
+			const int LocalY = (int)vxc::floorMod(V.y, B);
+			const int LocalZ = (int)vxc::floorMod(V.z, B);
+			EditsByBrick[BKey].push_back(vxc::EditCell{(uint16_t)vxc::Brick<B>::cellIndex(LocalX, LocalY, LocalZ), vxc::MAT_AIR});
+			CollectDirtyChunks(V.x, V.y, V.z, DirtyChunks);
+			PieceCoords.Add(VoxelCoords::FVoxelCoord{V.x, V.y, V.z});
+		}
+		RemovedVoxels += PieceCoords.Num();
+		OutPieces.Add(MoveTemp(PieceCoords));
+		++PieceCount;
+	}
+	if (EditsByBrick.empty())
+	{
+		UE_LOG(LogVoxelEdit, Log, TEXT("Collapse: %d chip(s) below %d voxels only -- nothing removed"), SkippedSmall,
+		       MinPieceVoxels);
+		OutPieces.Reset();
+		return 0;
+	}
+	ApplyGroupedEdits(EditsByBrick, DirtyChunks);
+
+	const double EndSeconds = FPlatformTime::Seconds();
+	UE_LOG(LogVoxelEdit, Log,
+	       TEXT("Collapse: %d piece(s) from %d unsupported voxels, %d voxels removed from the static grid (edit-log)%s%s; ")
+	       TEXT("%d chip(s) left; pieceDigest=0x%016llX; prepass %.1fms support %.1fms total %.1fms"),
+	       PieceCount, CollapsingVoxelCount, RemovedVoxels, bVoxelCapHit ? TEXT(" (VOXEL CAP)") : TEXT(""),
+	       Analysis.bTruncated ? TEXT(" (CELL CAP)") : TEXT(""), SkippedSmall,
+	       (unsigned long long)PieceDigest.h, (PrepassSeconds - StartSeconds) * 1000.0,
+	       (AnalysisSeconds - PrepassSeconds) * 1000.0, (EndSeconds - StartSeconds) * 1000.0);
+	return PieceCount;
 }
 
 // --- debug-tooling helpers (docs/debug-tooling-plan.md P1) -----------------
@@ -3467,27 +3789,81 @@ void PromoteDetachedIslands(FVoxelWorldImpl& Impl, UWorld& World, const TArray<V
 		return;
 	}
 
-	// Cosmetic debris bodies: only where there is something to look at.
+	// Cosmetic debris bodies: only where there is something to look at. A
+	// dedicated server has already done the authoritative half above (the
+	// voxels ARE gone from the grid and those removals replicate); it just
+	// spawns no Chaos body, so there is nothing here that could desync.
 	if (World.GetNetMode() == NM_DedicatedServer)
 	{
 		return;
 	}
-	int32 Spawned = 0;
-	for (const TArray<VoxelCoords::FVoxelCoord>& Island : Islands)
+
+	// --- Debris caps (docs/status.md "Structural collapse (M5, large-edit)") -
+	// A chop detaches one canopy; a large collapse can shatter into dozens of
+	// pieces totalling six figures of voxels, and a thousand Chaos bodies (or a
+	// million ISM instances) would tank the frame for a purely decorative
+	// effect. Two caps, both applied HERE on the cosmetic side only -- the
+	// authoritative removal above is never capped by them, so world state is
+	// identical whatever these are set to (and identical on a dedicated server,
+	// which spawns none of this).
+	//   * MaxDebrisActors: at most this many Chaos bodies per edit.
+	//   * MaxDebrisInstancesPerEdit: a shared budget of visible cubes across
+	//     all of them, so many-small-pieces and one-huge-piece both stay bounded.
+	// Pieces are taken LARGEST FIRST so the visually significant mass always
+	// gets a body and it is the invisible confetti that gets dropped. Ties
+	// break on the piece's first (VoxelCoordLess-minimum) voxel, so the choice
+	// is deterministic even though it is only cosmetic.
+	// Pieces past the cap are simply not shown; they have already been removed
+	// from the grid, which is the part that matters.
+	constexpr int32 MaxDebrisActors = 24;
+	constexpr int32 MaxDebrisInstancesPerEdit = 40000;
+
+	TArray<int32> Order;
+	Order.Reserve(Islands.Num());
+	for (int32 I = 0; I < Islands.Num(); ++I)
 	{
-		if (Island.Num() == 0)
+		if (Islands[I].Num() > 0)
 		{
+			Order.Add(I);
+		}
+	}
+	Order.Sort([&Islands](int32 A, int32 Bi)
+	{
+		const TArray<VoxelCoords::FVoxelCoord>& Pa = Islands[A];
+		const TArray<VoxelCoords::FVoxelCoord>& Pb = Islands[Bi];
+		if (Pa.Num() != Pb.Num())
+		{
+			return Pa.Num() > Pb.Num(); // largest first
+		}
+		const VoxelCoords::FVoxelCoord& Va = Pa[0];
+		const VoxelCoords::FVoxelCoord& Vb = Pb[0];
+		if (Va.Z != Vb.Z) return Va.Z < Vb.Z; // VoxelCoordLess tie-break
+		if (Va.Y != Vb.Y) return Va.Y < Vb.Y;
+		return Va.X < Vb.X;
+	});
+
+	int32 Spawned = 0, InstanceBudget = MaxDebrisInstancesPerEdit, Skipped = 0, TotalInstances = 0;
+	for (int32 I : Order)
+	{
+		if (Spawned >= MaxDebrisActors || InstanceBudget <= 0)
+		{
+			++Skipped;
 			continue;
 		}
 		AVoxelDebris* Debris = World.SpawnActor<AVoxelDebris>();
-		if (Debris)
+		if (!Debris)
 		{
-			Debris->InitFromIsland(Island);
-			++Spawned;
+			continue;
 		}
+		const int32 Used = Debris->InitFromIsland(Islands[I], InstanceBudget);
+		InstanceBudget -= Used;
+		TotalInstances += Used;
+		++Spawned;
 	}
-	UE_LOG(LogVoxelEdit, Log, TEXT("Destruction: %d island(s) promoted, %d cosmetic debris actor(s) spawned"), IslandCount,
-	       Spawned);
+	UE_LOG(LogVoxelEdit, Log,
+	       TEXT("Destruction: %d piece(s) promoted, %d cosmetic debris actor(s) spawned (%d instances, %d piece(s) over the ")
+	       TEXT("cap shown as none)"),
+	       IslandCount, Spawned, TotalInstances, Skipped);
 }
 
 // M3 wave 2 persistence (docs/m3-plan.md "Save/load") -----------------------
@@ -4082,6 +4458,79 @@ int32 UVoxelWorldSubsystem::SpawnTreeFixtureAt(double WorldX, double WorldY)
 	UE_LOG(LogVoxelEarth, Log,
 	       TEXT("VoxelTreeTest: stamped stand-in tree FIXTURE -- %d voxels at column (%.0f,%.0f), baseVz=%lld (surface %.0fUU)"),
 	       Count, WorldX, WorldY, (long long)BaseVz, SurfaceUU);
+	return Count;
+}
+
+int32 UVoxelWorldSubsystem::SpawnStructureFixtureAt(double WorldX, double WorldY)
+{
+	if (!Impl)
+	{
+		return 0;
+	}
+
+	// M5 LARGE-EDIT COLLAPSE test fixture (docs/status.md "Structural collapse
+	// (M5, large-edit)"). Deliberately shaped so that pure connectivity is NOT
+	// enough to explain the right answer:
+	//
+	//     wall                                        far pillars
+	//     ####|=====================================|####|
+	//     ####|             roof slab               |####|
+	//     ####                                       ####
+	//     ####                                       ####
+	//   ~~~~~~~~~~~~~~~~ terrain ~~~~~~~~~~~~~~~~~~~~~~~~~~
+	//
+	// A short ground-rooted WALL at one end, two PILLARS 12.8m away at the
+	// other, and a thin ROOF SLAB spanning between them. Blow out only the far
+	// pillars and the roof is STILL 6-connected to the ground through the wall
+	// -- findDisconnectedIslands would report zero islands and nothing would
+	// fall -- but everything past the 4.8m cantilever budget from the wall has
+	// nothing carrying it and must come down. That is the whole point of a
+	// support model as opposed to a connectivity model.
+	//
+	// Sizes are in voxels (1 voxel = 10cm). All members run 16 voxels BELOW the
+	// surface so uneven terrain can never leave the fixture floating.
+	constexpr int64 StructLenX = 128;   // 12.8m span, wall face to pillar face
+	constexpr int64 StructWidY = 32;    // 3.2m
+	constexpr int64 WallThickX = 4;
+	constexpr int64 PillarSize = 8;     // 0.8m square == exactly one brick footprint
+	constexpr int64 EmbedDepth = 16;    // 1.6m of footing buried in the terrain
+	constexpr int64 ClearHeight = 32;   // 3.2m from the surface to the underside of the roof
+	constexpr int64 RoofThick = 2;      // 20cm slab
+
+	const double SurfaceUU = GetSurfaceHeightUU(WorldX, WorldY);
+	const int64 BaseVx = (int64)FMath::FloorToDouble(WorldX / VoxelCoords::VoxelSizeUU);
+	const int64 BaseVy = (int64)FMath::FloorToDouble(WorldY / VoxelCoords::VoxelSizeUU);
+	const int64 BaseVz = (int64)FMath::FloorToDouble(SurfaceUU / VoxelCoords::VoxelSizeUU) + 1;
+
+	TSet<VoxelCoords::FVoxelCoord> Voxels;
+	auto AddBox = [&Voxels, BaseVx, BaseVy, BaseVz](int64 X0, int64 X1, int64 Y0, int64 Y1, int64 Z0, int64 Z1)
+	{
+		for (int64 Z = Z0; Z <= Z1; ++Z)
+			for (int64 Y = Y0; Y <= Y1; ++Y)
+				for (int64 X = X0; X <= X1; ++X)
+					Voxels.Add(VoxelCoords::FVoxelCoord{BaseVx + X, BaseVy + Y, BaseVz + Z});
+	};
+
+	AddBox(0, WallThickX - 1, 0, StructWidY - 1, -EmbedDepth, ClearHeight - 1); // wall
+	AddBox(StructLenX - PillarSize, StructLenX - 1, 0, PillarSize - 1, -EmbedDepth, ClearHeight - 1); // -y pillar
+	AddBox(StructLenX - PillarSize, StructLenX - 1, StructWidY - PillarSize, StructWidY - 1, -EmbedDepth,
+	       ClearHeight - 1); // +y pillar
+	AddBox(0, StructLenX - 1, 0, StructWidY - 1, ClearHeight, ClearHeight + RoofThick - 1); // roof slab
+
+	const TArray<VoxelCoords::FVoxelCoord> Coords = Voxels.Array();
+	const int32 Count = Impl->StampVoxels(Coords, (uint8)vxc::MAT_ROCK);
+
+	UWorld* World = GetWorld();
+	if (World && (World->GetNetMode() == NM_DedicatedServer || World->GetNetMode() == NM_ListenServer))
+	{
+		BroadcastNewEntries(*Impl, *World);
+	}
+
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("VoxelStructureTest: stamped wall+roof+pillars FIXTURE -- %d voxels at column (%.0f,%.0f), baseVz=%lld ")
+	       TEXT("(surface %.0fUU); roof spans %.1fm, pillars at +%.1fm"),
+	       Count, WorldX, WorldY, (long long)BaseVz, SurfaceUU, double(StructLenX) / 10.0,
+	       double(StructLenX - PillarSize) / 10.0);
 	return Count;
 }
 

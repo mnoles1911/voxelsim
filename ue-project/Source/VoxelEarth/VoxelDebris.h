@@ -46,11 +46,26 @@ public:
 
 	virtual void Tick(float DeltaSeconds) override;
 
-	// Builds the physics body + per-voxel instanced cubes from a detached
-	// island's world voxel coordinates and starts it falling. Call once,
-	// immediately after SpawnActor. Coords are level-0 voxel-lattice coords
-	// (the same the island detector emits).
-	void InitFromIsland(const TArray<VoxelCoords::FVoxelCoord>& IslandVoxels);
+	// Builds the physics body + instanced cubes from a detached island's world
+	// voxel coordinates and starts it falling. Call once, immediately after
+	// SpawnActor. Coords are level-0 voxel-lattice coords (the same the island
+	// detector and the collapse pass both emit).
+	//
+	// Only the island's SURFACE SHELL is instanced -- a voxel with all six
+	// face-neighbours also in the island is invisible from every angle, so
+	// drawing it is pure cost. For a chopped tree canopy that changes almost
+	// nothing; for a collapsed roof or wall slab (M5 large-edit collapse) it is
+	// the difference between thousands of instances and tens of thousands.
+	//
+	// MaxInstances is the caller's remaining per-edit cosmetic budget (see
+	// PromoteDetachedIslands' debris caps). If the shell is larger than that,
+	// it is uniformly strided down to fit -- the piece still reads as a solid
+	// falling mass, just sparser. Returns the number of instances actually
+	// created so the caller can debit its budget.
+	int32 InitFromIsland(const TArray<VoxelCoords::FVoxelCoord>& IslandVoxels, int32 MaxInstances = MaxInstancesPerBody);
+
+	// Per-body instance ceiling, independent of the caller's per-edit budget.
+	static constexpr int32 MaxInstancesPerBody = 8192;
 
 private:
 	void SettleOnSurface(double SurfaceTopZUU);
