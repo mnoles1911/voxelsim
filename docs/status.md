@@ -771,6 +771,117 @@ chunk scene proxy to mesh the island instead of per-voxel instanced cubes;
   `--radius` full-pipeline gate mode. Still needs a cloud NVIDIA leg
   producing matching digests → closes both M0 gates
 
+### Linux/NVIDIA cross-vendor determinism runner (M0 close-out)
+
+Makes `vxc_gpu` runnable on a Linux+NVIDIA box so a one-shot script can
+close the M0 cross-vendor (NVIDIA-vs-AMD) determinism gate without needing
+DXC (Windows-only) on the Linux side at all — SPIR-V is portable, vendor-
+and OS-neutral bytecode, so the plan is: compile the `.spv` kernels ONCE on
+this Windows dev box (existing DXC flow), commit them, and the Linux
+harness loads the identical bytes. The determinism check becomes: the SAME
+committed SPIR-V dispatched on an NVIDIA GPU must byte-match the CPU
+reference — which AMD already does — closing NVIDIA≡AMD transitively (both
+legs independently agree with the CPU reference ⇒ they agree with each
+other).
+
+**Shaders compiled + committed**: `voxel-core/shaders/prebuilt/*.spv` (7
+kernels — ColumnMain, VoxelizeMain, MeshCountMain, MeshEmitMain,
+ScanBlocksMain, ScanSumsMain, ScanAddMain), compiled from the current
+`worldgen.hlsl` (commit `8b834107701fd4a2a005b8dbd4a17352f44f26c1`, "M4:
+biome classification core") with the pinned DXC `v1.9.2602.24`
+(`tools/fetch-dxc.ps1`). SHA-256 provenance for every file is in
+`voxel-core/shaders/prebuilt/README.md`. **Important**: these do NOT match
+the older `e1db29a9b6874012`/`583e91d62cefb8a9` digests recorded in the gate
+row above — those predate the M4 biome commit, which legitimately changed
+`worldgen.hlsl`'s output (new materials/biome constants). The gate row's
+digests are stale relative to `HEAD` and should get refreshed in a
+follow-up; that refresh is out of scope here. What this pass actually
+re-verified, freshly, on this AMD Radeon RX 7800 XT, using these exact
+committed `.spv` files: default regions mode PASS (digest
+`1dbcabb01cfaf2bc`), `--radius 64` PASS (digest `95a82ba20200f6f2`, 144/144
+tiles, gate 0.129s), `--radius 128` PASS (digest `b4c8ec5d0966894b`, 67/529
+tiles sampled, gate 0.259s) — all zero mismatches. These three digests are
+the values a Linux/NVIDIA run should be compared against (via
+`vulkaninfo`/`vxc_gpu`'s own device-name line, not an automated cross-box
+diff — no NVIDIA box exists in this pass to actually run the comparison).
+
+**Loader ported for cross-platform use**: `gpu_harness.cpp`'s dynamic
+Vulkan-loader shim is now `#ifdef _WIN32`-gated — Windows keeps
+`LoadLibraryA("vulkan-1.dll")` + `GetProcAddress`; the `#else` branch uses
+`dlopen("libvulkan.so.1", RTLD_NOW)` (falling back to `"libvulkan.so"`) +
+`dlsym` for `vkGetInstanceProcAddr`, via a small `VulkanLoaderHandle`
+typedef and a new `closeVulkanLoader()` helper replacing the two direct
+`FreeLibrary()` call sites. Everything below that ~30-line shim (dispatch,
+byte-compare, PASS/FAIL/digest reporting, `--radius` gate mode) is
+unchanged and platform-agnostic — it was already pure Vulkan calls resolved
+through the X-macro function-pointer tables, no other Windows API usage
+existed in the file.
+
+**CMake**: `voxel-core/bench/CMakeLists.txt`'s `vxc_gpu` target now builds
+on both platforms. `VXC_SPV_PATH*` compile definitions point at the
+committed `voxel-core/shaders/prebuilt/*.spv` (identical path both
+platforms) instead of the gitignored `build/shaders/` DXC output dir. On
+Windows, headers still come from `tools/vulkan-headers` (unchanged). On
+Linux, headers come from `find_package(Vulkan)` (the system
+`libvulkan-dev` package) and the target links `${CMAKE_DL_LIBS}` for
+`dlopen`/`dlsym`. The harness stays opt-in (`VXC_BUILD_GPU_HARNESS`,
+default OFF) everywhere except one case: MSVC on Windows with
+`tools/vulkan-headers` already fetched auto-defaults it ON (unchanged
+pre-existing behavior, narrowed from "any WIN32 compiler" to "MSVC
+specifically" — see below). Linux never auto-defaults ON (no
+`find_package(Vulkan)` probe at option-default time), so a plain default
+configure on any existing CI job (gcc/clang on Linux, msvc on Windows)
+gains no new hard dependency.
+
+**Regression found and fixed during verification, in scope**: fetching
+`tools/vulkan-headers` (a prerequisite for compiling the shaders above) has
+the side effect of flipping the pre-existing `WIN32 AND
+EXISTS(vulkan_core.h)` auto-default to ON for *any* Windows compiler, not
+just MSVC. Tried against this box's clang/llvm-mingw toolchain, that
+surfaced a latent, pre-existing bug: `gpu_harness.cpp`'s Vulkan struct
+aggregate-initializers (e.g. `VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_...};`)
+trip clang's `-Wmissing-field-initializers` under this target's `-Wall
+-Wextra -Werror` (MSVC has never warned on this pattern, and vxc_gpu has
+only ever been built with MSVC in this repo's history — confirmed via `git
+log`). Fixed by narrowing the auto-default from `WIN32` to `MSVC`
+specifically, so a Windows box with both `tools/vulkan-headers` fetched
+*and* a clang toolchain configured still gets a clean default
+configure/build (clang users can still opt in explicitly with
+`-DVXC_BUILD_GPU_HARNESS=ON`, which will hit the same pre-existing
+warnings — not fixed here, out of scope). Verified: default configure +
+full build is clean under both this desktop's clang/llvm-mingw toolchain
+(`vxc_tests` 109/109 green, harness correctly excluded) and MSVC/VS 2026
+(harness auto-included, builds clean, same PASS/digest as above).
+
+**Linux runner**: `tools/run-nvidia-digest.sh` — one-shot, idempotent
+script for a fresh Ubuntu+NVIDIA box. Installs deps (`build-essential
+cmake git libvulkan-dev vulkan-tools`), prints `vulkaninfo | grep -i
+deviceName` so the operator sees the NVIDIA GPU is the Vulkan device before
+trusting any result, configures (`cmake -S voxel-core -B build-gpu
+-DVXC_BUILD_GPU_HARNESS=ON -DCMAKE_BUILD_TYPE=Release`), builds `vxc_gpu`,
+runs both the default regions mode and `--radius 64`, and prints `===
+M0 NVIDIA DETERMINISM: PASS/FAIL (gpu=<name>) ===` as the final line.
+
+**Unverifiable until the Linux box exists**: everything Linux-side —
+whether `find_package(Vulkan)` actually locates `libvulkan-dev`'s headers
+correctly, whether the `dlopen`/`dlsym` loader path compiles and resolves
+symbols identically to the Windows `LoadLibrary` path, and (the actual
+point of this whole effort) whether an NVIDIA GPU's `vxc_gpu` run
+byte-matches the CPU reference the same way AMD's does. The `#else`/CMake
+Linux paths are correct by construction and documented, not run — no Linux
+machine was available in this pass.
+
+**No float-in-shader risk found**: `worldgen.hlsl` has zero occurrences of
+`float`/`half`/`double` (checked directly) — every value is integer/
+fixed-point end to end, matching the float-free contract in
+`docs/determinism.md`. This is the actual reason cross-vendor bit-exactness
+is even plausible: IEEE-754 float ops can legitimately differ in rounding
+between AMD and NVIDIA (fused-multiply-add contraction, transcendental
+approximations, denormal handling), which would make a NVIDIA-vs-AMD gate
+fundamentally unreliable if the shader touched floats anywhere in the
+value-computing path (wall-clock timing code in the harness itself uses
+floats/doubles, but that never feeds GPU dispatch inputs or outputs).
+
 ## Water track — W1 first slice landed (2026-07-19)
 
 Implicit ocean (z<0, zero voxel data): `AVoxelOceanActor` (camera-following
