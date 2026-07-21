@@ -53,6 +53,7 @@
 #include "Misc/FileHelper.h" // M3 wave 2: Saved/VoxelWorlds/<seed>.vxlog read/write
 #include "Misc/Parse.h"
 #include "Misc/Paths.h" // M3 wave 2: FPaths::ProjectSavedDir
+#include "RenderTimer.h" // M1 gate: per-thread frame timers (GRenderThreadTime/GRHIThreadTime/GGameThreadWaitTime) for hitch attribution
 #include "Misc/ScopeRWLock.h"
 #include "Materials/MaterialInterface.h"
 #include "PSOPrecache.h" // hitch isolation: FPSOPrecacheParams for the BeginPlay terrain-material PSO precache warmup
@@ -1296,13 +1297,27 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	if (FrameMs > VoxelDebug::kHitchThresholdMs)
 	{
 		const float ElsewhereMs = FMath::Max(0.f, FrameMs - TickMsSoFar);
+		// M1 gate attribution (docs/status.md M1 gate row): the engine's own
+		// per-thread frame timers, set once/frame in FViewport::Draw (so they
+		// describe the PREVIOUS frame -- a one-frame lag is immaterial for
+		// correlating which thread a hitch lived on). This is what
+		// disambiguates "elsewhereMs" between (a)/(b) render-thread scene
+		// mutation (renderMs high), (d) GPU/RHI submission (rhiMs high), and a
+		// pure game-thread stall on the render fence (gameWaitMs high, renderMs
+		// low). Cycles -> ms via the platform's seconds-per-cycle.
+		const double CyToMs = FPlatformTime::GetSecondsPerCycle() * 1000.0;
+		const float RenderMs = float(GRenderThreadTime * CyToMs);
+		const float RenderWaitMs = float(GRenderThreadWaitTime * CyToMs);
+		const float RHIMs = float(GRHIThreadTime * CyToMs);
+		const float GameWaitMs = float(GGameThreadWaitTime * CyToMs);
 		UE_LOG(LogVoxelPerf, Warning,
 		       TEXT("Hitch frame: frameMs=%.2f (threshold %.1f) | subsystemTickMs=%.2f elsewhereMs=%.2f | ")
+		       TEXT("renderMs=%.2f renderWaitMs=%.2f rhiMs=%.2f gameWaitMs=%.2f | ")
 		       TEXT("dispatchMs=%.2f applyMs=%.2f remeshMs=%.2f unloadMs=%.2f | ")
 		       TEXT("componentsApplied=%d proxiesCreated=%d editRemeshes=%d unloads=%d poolReuses=%d poolSize=%d"),
-		       FrameMs, VoxelDebug::kHitchThresholdMs, TickMsSoFar, ElsewhereMs, ThisFrameDispatchMs, ThisFrameApplyMs,
-		       ThisFrameRemeshMs, ThisFrameUnloadMs, ThisFrameAppliesFromWorker, ThisFrameProxiesCreated, ThisFrameEditRemeshes,
-		       ThisFrameUnloads, ThisFramePoolReuses, ComponentPool.Num());
+		       FrameMs, VoxelDebug::kHitchThresholdMs, TickMsSoFar, ElsewhereMs, RenderMs, RenderWaitMs, RHIMs, GameWaitMs,
+		       ThisFrameDispatchMs, ThisFrameApplyMs, ThisFrameRemeshMs, ThisFrameUnloadMs, ThisFrameAppliesFromWorker,
+		       ThisFrameProxiesCreated, ThisFrameEditRemeshes, ThisFrameUnloads, ThisFramePoolReuses, ComponentPool.Num());
 	}
 
 	// Visualizations (mode 2 only; every helper early-outs on its own cvar
@@ -1969,12 +1984,26 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 	// 8) so the ramp's apply rate can be smoothed/tightened without a
 	// recompile (docs/status.md "Perf-run hitches" isolation task).
 	const int32 MaxApplies = VoxelDebug::GetStreamMaxAppliesPerFrame();
-	int32 Applied = 0;
+	// M1 gate (docs/status.md M1 gate row): MaxApplies gates only the
+	// RENDER-THREAD-FACING applies (ApplyMeshResult -> SetChunkQuads ->
+	// MarkRenderStateDirty -> FScene::AddPrimitive + GPU buffer upload). A
+	// STALE result (chunk left the desired set, or was superseded by an edit
+	// re-mesh while its job was in flight) creates no proxy and costs only a
+	// TMap::Find + a counter bump -- it must NOT consume the render-facing
+	// budget, or under the heavy ring-crossing churn a perf-flight generates
+	// the budget is spent entirely discarding stale results and live chunks
+	// near the player never get applied at all (measured: R0 resident collapsed
+	// to 0 under aggressive unloading before this split). The cheap discard
+	// work is instead bounded by a much larger per-frame drain cap so a huge
+	// stale backlog can't stall the game thread either.
+	constexpr int32 kMaxResultDrainsPerFrame = 1024;
+	int32 Applied = 0; // render-thread-facing applies (live results) this frame -- gated by MaxApplies
+	int32 Drains = 0;  // total results dequeued incl. stale discards (game-thread-cheap) -- gated by kMaxResultDrainsPerFrame
 	int32 ProxiesCreated = 0;
 	VoxelStreaming::FJobResult Result;
-	while (Applied < MaxApplies && ResultsQueue.Dequeue(Result))
+	while (Applied < MaxApplies && Drains < kMaxResultDrainsPerFrame && ResultsQueue.Dequeue(Result))
 	{
-		++Applied;
+		++Drains;
 
 		// docs/debug-tooling-plan.md P1 "Worker timings": recorded for every
 		// drained result, even ones about to be discarded as stale below --
@@ -1997,7 +2026,8 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		// Stale-result discard: the chunk left the desired set entirely (no
 		// record any more), or an edit re-mesh superseded this job while it
 		// was in flight (GenerationId no longer matches the id the job was
-		// dispatched with -- MarkChunkDirtyForRemesh bumped it).
+		// dispatched with -- MarkChunkDirtyForRemesh bumped it). Free (no
+		// proxy) -- does NOT consume the render-facing MaxApplies budget.
 		if (!Rec || Rec->GenerationId != Result.GenerationId)
 		{
 			++StaleResultsDiscarded;
@@ -2005,12 +2035,13 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		}
 
 		Rec->bJobInFlight = false;
+		++Applied; // a live result: this IS a render-thread-facing apply
 		if (ApplyMeshResult(Owner, Root, Material, Result.Key, *Rec, MoveTemp(Result.Quads), /*bIsGameThreadMesh*/ false))
 		{
 			++ProxiesCreated;
 		}
 	}
-	LastAppliedFrac = float(Applied) / float(MaxApplies);
+	LastAppliedFrac = MaxApplies > 0 ? float(Applied) / float(MaxApplies) : 0.f;
 	ThisFrameAppliesFromWorker = Applied;
 	ThisFrameProxiesCreated += ProxiesCreated;
 }
@@ -2079,33 +2110,68 @@ void FVoxelWorldImpl::DrainUnloads()
 	// cvar (voxel.Stream.MaxUnloadsPerFrame, default 4; docs/status.md
 	// "Perf-run hitches" isolation task).
 	const int32 MaxUnloads = VoxelDebug::GetStreamMaxUnloadsPerFrame();
-	int32 Count = 0;
-	while (Count < MaxUnloads && PendingUnloadKeys.Num() > 0)
+	// M1 gate (docs/status.md M1 gate row): MaxUnloads gates only the
+	// RENDER-THREAD-FACING unloads -- a chunk that has a live component, whose
+	// pool-park (ReturnChunkComponentToPool -> SetVisibility(false) +
+	// SetChunkQuads({}) -> MarkRenderStateDirty) enqueues an
+	// FScene::RemovePrimitive. A component-LESS record (an outer-ring R2/R3/R4
+	// candidate that was queued as a job but left the desired set before it
+	// ever meshed -- by far the bulk of the unload traffic during a perf
+	// flight: measured 130k+ component-less evictions vs ~7k real loads) costs
+	// only a TMap erase and must NOT consume the render-facing budget, or the
+	// real R0/R1 unloads starve behind the far-ring flood and resident R0
+	// chunks that have long left view range pile up unbounded (measured R0
+	// resident bloating to ~6000, ~4x its ~1600 desired size, which is exactly
+	// what loaded the render thread into the hitch). Cheap evictions flow
+	// freely under a generous per-frame pop cap (so a huge backlog still can't
+	// stall the game thread); component-bearing unloads over budget this frame
+	// are deferred (kept tracked + re-queued) for the next frame rather than
+	// forced through.
+	constexpr int32 kMaxUnloadPopsPerFrame = 1024;
+	int32 ComponentUnloads = 0; // render-thread-facing pool-parks this frame -- gated by MaxUnloads
+	int32 Pops = 0;             // total queue pops incl. free component-less evictions -- gated by kMaxUnloadPopsPerFrame
+	TArray<VoxelCoords::FVoxelLevelChunkKey> Deferred; // component-bearing unloads beyond MaxUnloads this frame
+	while (Pops < kMaxUnloadPopsPerFrame && PendingUnloadKeys.Num() > 0)
 	{
 		const VoxelCoords::FVoxelLevelChunkKey Key = PendingUnloadKeys.Pop(EAllowShrinking::No);
-		PendingUnloadSet.Remove(Key);
-		++Count;
+		++Pops;
 
-		VoxelStreaming::FChunkRecord Rec;
-		if (ChunkRecords.RemoveAndCopyValue(Key, Rec))
+		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Key);
+		if (!Rec)
 		{
+			PendingUnloadSet.Remove(Key); // already gone (raced with a re-add/remesh); nothing to do
+			continue;
+		}
+
+		// A live component here means this pop costs a render-thread
+		// RemovePrimitive -- gate it. Over budget this frame: keep the record
+		// tracked and re-queue it for the next frame (do NOT drop the chunk).
+		if (Rec->Component.IsValid())
+		{
+			if (ComponentUnloads >= MaxUnloads)
+			{
+				Deferred.Add(Key); // stays in PendingUnloadSet, re-added below
+				continue;
+			}
 			// Any worker job still in flight for this key keeps running to
 			// completion (it can't be cancelled); when its result arrives,
 			// DrainResults finds no record for the key and discards it.
 			// M1 hitch-gap wave: park (not destroy) -- see
-			// ReturnChunkComponentToPool / docs/status.md M1 gate row. This is
-			// the exact ring-boundary-crossing case the hitch-attribution
-			// instrumentation pinned as the dominant cost.
-			if (UVoxelChunkComponent* Comp = Rec.Component.Get())
-			{
-				ReturnChunkComponentToPool(*Comp);
-			}
-			ResidentQuads -= Rec.LastQuadCount;
-			++TotalChunksUnloaded;
+			// ReturnChunkComponentToPool / docs/status.md M1 gate row.
+			ReturnChunkComponentToPool(*Rec->Component.Get());
+			++ComponentUnloads;
 		}
+
+		PendingUnloadSet.Remove(Key);
+		ResidentQuads -= Rec->LastQuadCount;
+		ChunkRecords.Remove(Key);
+		++TotalChunksUnloaded;
 	}
-	LastUnloadFrac = float(Count) / float(MaxUnloads);
-	ThisFrameUnloads = Count;
+	// Re-queue the deferred component-bearing unloads (still in PendingUnloadSet,
+	// still tracked) so they're retried next frame under the render budget.
+	PendingUnloadKeys.Append(Deferred);
+	LastUnloadFrac = MaxUnloads > 0 ? float(ComponentUnloads) / float(MaxUnloads) : 0.f;
+	ThisFrameUnloads = ComponentUnloads;
 }
 
 // --- dig / place (edit-log authority path) -----------------------------
