@@ -387,6 +387,25 @@ void AVoxelEarthGameMode::BeginPlay()
 						}
 						PC->SetControlRotation(Look);
 					}
+					// M6 digging-while-pathing framing (docs/status.md M6
+					// section): stand off to the side of the wall column and
+					// look along its face, low enough (~2m) to actually see
+					// the mined tunnel/hole rather than looking down on the
+					// wall's top from above.
+					else if (bDigSwarmTestActive && PC)
+					{
+						const double WallSurfUU =
+							ShotTerrain ? ShotTerrain->GetSurfaceHeightUU(DigSwarmTestColumnXUU, DigSwarmTestColumnYUU) : 0.0;
+						const FVector WallMid(DigSwarmTestColumnXUU, DigSwarmTestColumnYUU, WallSurfUU + 140.0);
+						const FVector CamPos = WallMid + FVector(-450.0, -550.0, 60.0); // back / side / slightly up
+						const FRotator Look = (WallMid - CamPos).Rotation();
+						if (APawn* P = PC->GetPawn())
+						{
+							P->SetActorLocation(CamPos);
+							P->SetActorRotation(Look);
+						}
+						PC->SetControlRotation(Look);
+					}
 					else if (bOverheadFraming && PC)
 					{
 						constexpr double HoverHeightAboveUU = 1500.0; // 15m: fills frame, clears splash geometry
@@ -731,6 +750,174 @@ void AVoxelEarthGameMode::BeginPlay()
 					UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSwarmTest: spawned %d/%d requested agents."), Spawned, SwarmTestCount);
 				}),
 			SwarmSpawnDelaySeconds, false);
+	}
+
+	// M6 digging-while-pathing verification (docs/status.md M6 section
+	// "Digging-while-pathing"): -VoxelDigSwarmTest[=<N>] (default N=10) is
+	// the decisive scenario the M6 payoff needs -- place the player behind a
+	// diggable wall so the ONLY short route to them is through it, spawn a
+	// small (legible) swarm on the far side, and let the SAME cost function
+	// (voxel-core/include/voxelcore/pathfind.h) that chooses Walk/StepUp/
+	// Climb/Fall/Jump everywhere else in this subsystem choose Mine instead,
+	// live, authoritatively, through UVoxelWorldSubsystem::TryDig/TryPlace.
+	//
+	// The wall itself is built here (test-fixture code, same "no authored
+	// content yet, build fixtures from code" precedent as
+	// UVoxelWorldSubsystem::SpawnTreeFixtureAt) via repeated
+	// UVoxelWorldSubsystem::TryPlace calls -- the SAME authoritative
+	// raycast-and-place API the agents themselves use for Bridge, so this
+	// fixture doubles as an independent exercise of that call path before
+	// any agent relies on it. TryPlace can only snap a new cube against an
+	// EXISTING solid face (it cannot place a fully floating voxel), so the
+	// wall is built bottom-up, one straight-down raycast per 4x4x4-voxel
+	// cube: layer 0 snaps against natural terrain, every layer after snaps
+	// against the cube placed directly below it.
+	//
+	// Sizing is deliberately larger than a single Tier 0 search window
+	// (UVoxelAgentSubsystem::WindowHalfExtentVoxels/WindowHalfHeightVoxels,
+	// ~3.3m horizontal x 2.5m vertical) on every side that would let an
+	// agent avoid digging: 4m wide x 2.8m tall x 40cm (4-voxel) thick. A
+	// SINGLE windowed search can therefore neither step over the top nor
+	// find either end of the wall -- the only route the cost function can
+	// find within one window is straight through the (thin, cheap-to-mine)
+	// 4-voxel thickness. Agents are spawned via
+	// UVoxelAgentSubsystem::SpawnSwarmAtOffset -- NOT the random-360-degree
+	// SpawnSwarm -- specifically so every one of them starts beyond the
+	// wall's far face, guaranteeing the wall actually sits between them and
+	// the player rather than leaving some agents with a clear line already.
+	//
+	// Combine with -VoxelScreenshotAfter=<seconds> (larger than this delay)
+	// for a visual capture of the tunnel/hole. For the "digging disabled"
+	// control run (proving the COST FUNCTION, not hardcoded behavior,
+	// drives this), add -ExecCmds="voxel.NPCDig.Enabled 0" -- see that
+	// cvar's doc comment (VoxelAgentSubsystem.cpp) for why disabling it
+	// changes PlanPath's cost config for every tier, not just execution.
+	int32 DigSwarmTestCount = 10;
+	// NOT named bDigSwarmTestActive -- that name is the MEMBER (VoxelEarthGameMode.h)
+	// the screenshot-framing block below reads; it's only set true once the
+	// wall is actually built (inside the timer callback), not just once the
+	// switch is parsed here.
+	const bool bDigSwarmTestRequested = FParse::Value(FCommandLine::Get(), TEXT("VoxelDigSwarmTest="), DigSwarmTestCount) ||
+	                                     FParse::Param(FCommandLine::Get(), TEXT("VoxelDigSwarmTest"));
+	if (bDigSwarmTestRequested)
+	{
+		// 10s, not -VoxelSwarmTest's 2s: a little extra margin before the
+		// pawn/subsystems are guaranteed ready, since (unlike SpawnSwarm,
+		// which only reads GetSurfaceHeightUU, a pure amplifier query) the
+		// wall build below raycasts through UVoxelWorldSubsystem::TryPlace
+		// at BeginPlay. NOTE for anyone re-running this switch by hand: the
+		// wall/agent edits from a PRIOR run persist (M3 wave 2 "Save/load" --
+		// UVoxelWorldSubsystem autoloads Saved/VoxelWorlds/<seed>.vxlog on
+		// startup and autosaves on shutdown), so a repeated run on top of a
+		// leftover save can land the wall raycast on an already-tunneled
+		// wall instead of fresh terrain -- delete that .vxlog (or pass a
+		// fresh -VoxelSeed=<N>) for a clean, reproducible repeat. Mirrors
+		// -VoxelHeadlessDigTest's identical
+		// reasoning for its own (20s) delay.
+		constexpr float DigSwarmSpawnDelaySeconds = 10.f;
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelDigSwarmTest: building a wall + spawning %d agents beyond it in %.1fs"),
+		       DigSwarmTestCount, DigSwarmSpawnDelaySeconds);
+		GetWorldTimerManager().SetTimer(
+			DigSwarmTestTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this, DigSwarmTestCount]()
+				{
+					UWorld* TestWorld = GetWorld();
+					UVoxelWorldSubsystem* Terrain = TestWorld ? TestWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					UVoxelAgentSubsystem* AgentSubsystem = TestWorld ? TestWorld->GetSubsystem<UVoxelAgentSubsystem>() : nullptr;
+					APlayerController* PC = TestWorld ? TestWorld->GetFirstPlayerController() : nullptr;
+					APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+					if (!Terrain || !AgentSubsystem || !Pawn)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelDigSwarmTest: subsystems/pawn not ready, skipping."));
+						return;
+					}
+
+					const FVector PlayerLoc = Pawn->GetActorLocation();
+
+					constexpr double WallOffsetXUU = 600.0;  // 6m ahead of the player (+X)
+					constexpr int32 WallColumns = 10;        // 10 x 4-voxel cubes = 40 voxels = 4m wide (Y)
+					constexpr int32 WallLayers = 7;           // 7 x 4-voxel cubes = 28 voxels = 2.8m tall (Z)
+					constexpr double CubeEdgeUU = 40.0;       // 4 voxels x VoxelCoords::VoxelSizeUU (10UU/voxel)
+					constexpr int32 CubeSizeVoxels = 4;       // UVoxelWorldSubsystem::MaxCubeSizeVoxels
+					constexpr uint8 WallMaterialId = 2;       // vxc::MAT_ROCK (voxelcore/core.h) -- hard, per
+					                                           // kMineCostByMaterial (VoxelAgentSubsystem.cpp)
+
+					const double WallCenterX = PlayerLoc.X + WallOffsetXUU;
+					const double WallCenterY = PlayerLoc.Y;
+					const double WallMinY = WallCenterY - (double(WallColumns) * CubeEdgeUU) * 0.5;
+
+					int32 CubesPlaced = 0;
+					for (int32 ColIdx = 0; ColIdx < WallColumns; ++ColIdx)
+					{
+						const double ColumnX = WallCenterX;
+						const double ColumnY = WallMinY + double(ColIdx) * CubeEdgeUU + CubeEdgeUU * 0.5;
+						// Tracks (approximately -- see below) where the next
+						// layer's cube should rest; the raycast always
+						// starts comfortably ABOVE this, so any small drift
+						// between this estimate and the actual lattice-
+						// snapped cube top self-corrects every layer (the
+						// ray finds whatever is REALLY topmost, not this
+						// estimate).
+						double NextLayerBottomZ = Terrain->GetSurfaceHeightUU(ColumnX, ColumnY);
+						for (int32 LayerIdx = 0; LayerIdx < WallLayers; ++LayerIdx)
+						{
+							const FVector CameraLoc(ColumnX, ColumnY, NextLayerBottomZ + CubeEdgeUU * 3.0);
+							const FVector DownDir(0.0, 0.0, -1.0);
+							// PlayerActorLocation pushed far away: the wall
+							// is built well clear of the player's actual
+							// position, so TryPlace's overlap-reject check
+							// can never legitimately fire here.
+							const bool bPlaced = Terrain->TryPlace(CameraLoc, DownDir, CubeSizeVoxels, WallMaterialId,
+							                                        PlayerLoc + FVector(1.0e7, 1.0e7, 1.0e7));
+							if (bPlaced)
+							{
+								++CubesPlaced;
+							}
+							NextLayerBottomZ += CubeEdgeUU;
+						}
+					}
+					const int32 CubesExpected = WallColumns * WallLayers;
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelDigSwarmTest: wall built at X=%.0f, Y=[%.0f,%.0f], Z from ground +%.0fUU -- %d/%d cubes placed."),
+					       WallCenterX, WallMinY, WallMinY + double(WallColumns) * CubeEdgeUU, double(WallLayers) * CubeEdgeUU,
+					       CubesPlaced, CubesExpected);
+					if (CubesPlaced < CubesExpected)
+					{
+						// Diagnosable, not silent: a shortfall here means some
+						// column's TryPlace raycast missed (most likely that
+						// column's terrain/materialAt data wasn't resolved
+						// yet this early in a headless run -- see
+						// DigSwarmSpawnDelaySeconds' doc comment above) --
+						// the wall may have gaps an agent could walk through
+						// without digging, which would understate the demo.
+						UE_LOG(LogVoxelEarth, Warning,
+						       TEXT("VoxelDigSwarmTest: wall is INCOMPLETE (%d/%d cubes) -- some columns' terrain may not have been ")
+						       TEXT("resolved yet; consider a larger DigSwarmSpawnDelaySeconds if this recurs."),
+						       CubesPlaced, CubesExpected);
+					}
+
+					// -VoxelScreenshotAfter framing (see that block's
+					// bDigSwarmTestActive branch): the REAL build column, set
+					// here (not earlier) so it always matches where the wall
+					// actually landed.
+					bDigSwarmTestActive = true;
+					DigSwarmTestColumnXUU = WallCenterX;
+					DigSwarmTestColumnYUU = WallCenterY;
+
+					// Spawn beyond the wall's far face (+X past the wall's
+					// 4-voxel thickness), so the ONLY short route back to
+					// the player crosses it.
+					constexpr double LateralJitterUU = 150.0;
+					const double SpawnOffsetUU = WallOffsetXUU + CubeEdgeUU + 250.0; // wall far face + 2.5m clearance
+					const int32 Spawned =
+						AgentSubsystem->SpawnSwarmAtOffset(DigSwarmTestCount, PlayerLoc, FVector(1.0, 0.0, 0.0), SpawnOffsetUU, LateralJitterUU);
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelDigSwarmTest: spawned %d/%d agents beyond the wall -- watch for 'VoxelAgent N: Mine/Bridge' and ")
+					       TEXT("'VoxelSwarm NPC edits this tick' log lines (LogVoxelEarth)."),
+					       Spawned, DigSwarmTestCount);
+				}),
+			DigSwarmSpawnDelaySeconds, false);
 	}
 }
 

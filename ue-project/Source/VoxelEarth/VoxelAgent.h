@@ -88,6 +88,17 @@ struct FVoxelAgent
 	// INDEX_NONE on a dedicated server (no ISM exists there at all -- no
 	// viewport to render into, see UVoxelAgentSubsystem::OnWorldBeginPlay).
 	int32 InstanceIndex = INDEX_NONE;
+
+	// M6 digging-while-pathing (docs/status.md M6 section): UWorld::
+	// GetTimeSeconds() at this agent's last successful authoritative terrain
+	// edit (Mine/Bridge -- see UVoxelAgentSubsystem::TryExecuteWaypointEdit).
+	// Gates UVoxelAgentSubsystem::NPCDigCooldownSeconds -- "mining a voxel
+	// takes time, not an instant swap" -- and is intentionally per-AGENT
+	// (not global): the global side of the rate limit is the separate
+	// per-tick edit budget threaded through TickTier0. -1 means "never dug
+	// yet", so the very first dig an agent attempts is never blocked by its
+	// own (nonexistent) cooldown.
+	double LastDigTimeSeconds = -1.0;
 };
 
 // Hysteresis hand-off between adjacent tiers: an agent keeps its CURRENT
