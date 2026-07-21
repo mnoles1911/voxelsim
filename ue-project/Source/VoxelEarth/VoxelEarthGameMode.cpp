@@ -484,6 +484,204 @@ void AVoxelEarthGameMode::BeginPlay()
 				}),
 			GITestDelaySeconds, false);
 	}
+	// -VoxelGICaveTest=<s> ---------------------------------------------------
+	//
+	// THE case a voxel light field exists for: a dark cave with daylight
+	// falling in through a sinkhole. Underground streaming (PR #55) is what
+	// made this testable -- the previous GI pass had to use an above-ground
+	// fixture because nothing below the surface was meshed.
+	//
+	// Finds a real WORLDGEN sinkhole (nothing is carved, so this is pristine
+	// terrain, not an edit), parks the camera in the cave a few metres off the
+	// shaft axis, and looks back up at the lit shaft mouth so the same frame
+	// contains daylight, the lit floor under the shaft, and cave wall the light
+	// does not reach. Pair with -VoxelGIOn for the A/B.
+	float GICaveDelaySeconds = 18.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelGICaveTest="), GICaveDelaySeconds) ||
+	    FParse::Param(FCommandLine::Get(), TEXT("VoxelGICaveTest")))
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelGICaveTest: searching for a sinkhole near spawn in %.1fs"),
+		       GICaveDelaySeconds);
+		GetWorldTimerManager().SetTimer(
+			GICaveTestTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this]()
+				{
+					UWorld* CWorld = GetWorld();
+					UVoxelWorldSubsystem* Terrain = CWorld ? CWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					if (!Terrain)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelGICaveTest: subsystem not ready."));
+						return;
+					}
+					double SpawnX = 0.0, SpawnY = 0.0;
+					ParseSpawnColumnUU(SpawnX, SpawnY);
+
+					FVector ShaftBaseUU;
+					double ShaftSurfaceUU = 0.0;
+					if (!FindSinkholeColumn(*Terrain, SpawnX, SpawnY, ShaftBaseUU, ShaftSurfaceUU))
+					{
+						UE_LOG(LogVoxelEarth, Warning,
+						       TEXT("VoxelGICaveTest: no sinkhole found within the search radius."));
+						return;
+					}
+
+					// Stand back from the shaft axis so the lit floor patch and
+					// the shaft above it are both in frame. Placement is done
+					// with direct solidity probes, NOT RaycastVoxelWorld: at
+					// this point the sinkhole is ~300 m away and none of its
+					// chunks are resident, so a raycast against the resident set
+					// reports "no hit" for solid rock and cheerfully parks the
+					// camera inside a wall (it did exactly that on the first
+					// attempt).
+					const FVector Cardinals[4] = {FVector(1, 0, 0), FVector(-1, 0, 0), FVector(0, 1, 0), FVector(0, -1, 0)};
+					auto IsAirAt = [Terrain](const FVector& P)
+					{
+						return !Terrain->IsSolidAtVoxel((int64)FMath::FloorToDouble(P.X / VoxelCoords::VoxelSizeUU),
+						                                (int64)FMath::FloorToDouble(P.Y / VoxelCoords::VoxelSizeUU),
+						                                (int64)FMath::FloorToDouble(P.Z / VoxelCoords::VoxelSizeUU));
+					};
+					// A spot is standable if there is air from knee to head
+					// height -- one air voxel is not a place to put a camera.
+					auto IsStandable = [&IsAirAt](const FVector& Base)
+					{
+						return IsAirAt(Base + FVector(0, 0, 50.0)) && IsAirAt(Base + FVector(0, 0, 150.0)) &&
+						       IsAirAt(Base + FVector(0, 0, 250.0));
+					};
+
+					FVector BestDir = Cardinals[0];
+					double BestClear = 0.0;
+					for (const FVector& D : Cardinals)
+					{
+						double Clear = 0.0;
+						for (double Dist = 50.0; Dist <= 900.0; Dist += 50.0)
+						{
+							if (!IsStandable(ShaftBaseUU + D * Dist))
+							{
+								break; // contiguous run only
+							}
+							Clear = Dist;
+						}
+						if (Clear > BestClear)
+						{
+							BestClear = Clear;
+							BestDir = D;
+						}
+					}
+					// Keep a voxel of margin off the wall, and cap the standoff
+					// so the shaft stays inside a 59-degree vertical FOV.
+					// 2 m of standoff, not the full clearance: at 6 m the camera
+					// ends up hard against the far wall with the shaft mouth off
+					// the top of frame (measured -- first two attempts).
+					float StandoffCapUU = 200.f;
+					FParse::Value(FCommandLine::Get(), TEXT("VoxelGICaveStandoff="), StandoffCapUU);
+					const double StandOffUU = FMath::Clamp(BestClear - 50.0, 0.0, double(StandoffCapUU));
+					GICaveCameraUU = ShaftBaseUU + FVector(0, 0, 150.0) + BestDir * StandOffUU;
+					const FVector ToShaft = (ShaftBaseUU - GICaveCameraUU).GetSafeNormal2D();
+					// Look UP the shaft. This is the legible framing: the lit
+					// mouth sits in the middle of the frame ringed by cave the
+					// daylight does not reach, so GI on/off differ over most of
+					// the image rather than in one corner.
+					float CavePitchDeg = 55.f;
+					FParse::Value(FCommandLine::Get(), TEXT("VoxelGICavePitch="), CavePitchDeg);
+					GICaveCameraRot = FRotator(
+						CavePitchDeg,
+						StandOffUU > 1.0 ? float(FMath::RadiansToDegrees(FMath::Atan2(ToShaft.Y, ToShaft.X))) : 0.f,
+						0.f);
+					bGICaveFound = true;
+
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelGICaveTest: sinkhole shaft at (%.0f,%.0f), surface %.0f, cave floor %.0f ")
+					       TEXT("(%.1fm below daylight); camera (%.0f,%.0f,%.0f) standoff %.0fUU pitch %.1f yaw %.1f"),
+					       ShaftBaseUU.X, ShaftBaseUU.Y, ShaftSurfaceUU, ShaftBaseUU.Z,
+					       (ShaftSurfaceUU - ShaftBaseUU.Z) / 100.0, GICaveCameraUU.X, GICaveCameraUU.Y,
+					       GICaveCameraUU.Z, StandOffUU, GICaveCameraRot.Pitch, GICaveCameraRot.Yaw);
+
+					auto PoseInCave = [this]()
+					{
+						UWorld* PWorld = GetWorld();
+						APlayerController* Ctrl = PWorld ? PWorld->GetFirstPlayerController() : nullptr;
+						if (!Ctrl || !bGICaveFound)
+						{
+							return;
+						}
+						if (APawn* P = Ctrl->GetPawn())
+						{
+							P->SetActorLocation(GICaveCameraUU, false, nullptr, ETeleportType::TeleportPhysics);
+							P->SetActorRotation(GICaveCameraRot);
+							Ctrl->SetViewTarget(P);
+						}
+						Ctrl->SetControlRotation(GICaveCameraRot);
+					};
+					// Pose first so streaming and the GI solve both key off the
+					// final view origin, then capture well after (the camera has
+					// teleported hundreds of metres and the deep footprint has to
+					// be recomputed and meshed from scratch).
+					// Two-phase, matching -VoxelGITest: assert the pose on its own
+					// timer well before the capture. Posing and capturing inside
+					// one lambda captures the PRE-move view (documented in the
+					// GITest block; reproduced here).
+					GetWorldTimerManager().SetTimer(
+						GICavePoseTimerHandle, FTimerDelegate::CreateWeakLambda(this, PoseInCave), 0.5f, false);
+					GetWorldTimerManager().SetTimer(
+						GICaveRepose1TimerHandle, FTimerDelegate::CreateWeakLambda(this, PoseInCave), 21.f, false);
+					GetWorldTimerManager().SetTimer(
+						GICaveRepose2TimerHandle, FTimerDelegate::CreateWeakLambda(this, PoseInCave), 23.f, false);
+					GetWorldTimerManager().SetTimer(
+						GICaveShotTimerHandle,
+						FTimerDelegate::CreateWeakLambda(this,
+							[this, PoseInCave]()
+							{
+								// Report the ACTUAL camera, not the intended one.
+								// Two runs differing only in standoff produced
+								// near-identical frames, which is the signature
+								// of the pose not sticking; this is the line that
+								// tells the two apart.
+								if (APlayerController* CC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr)
+								{
+									if (CC->PlayerCameraManager)
+									{
+										const FVector L = CC->PlayerCameraManager->GetCameraLocation();
+										const FRotator R = CC->PlayerCameraManager->GetCameraRotation();
+										UE_LOG(LogVoxelEarth, Log,
+										       TEXT("VoxelGICaveTest capture: ACTUAL cam=(%.0f,%.0f,%.0f) rot=(pitch %.1f yaw %.1f) ")
+										       TEXT("| intended=(%.0f,%.0f,%.0f) pitch %.1f"),
+										       L.X, L.Y, L.Z, R.Pitch, R.Yaw, GICaveCameraUU.X, GICaveCameraUU.Y,
+										       GICaveCameraUU.Z, GICaveCameraRot.Pitch);
+									}
+								}
+								// Probe at CAPTURE time, when the chunks around
+								// the camera are actually resident -- a probe at
+								// search time reports nothing but MISS and is
+								// what let two runs park the camera in a wall.
+								UWorld* SWorld = GetWorld();
+								if (UVoxelWorldSubsystem* T = SWorld ? SWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr)
+								{
+									const FVector Dirs[6] = {FVector(1, 0, 0),  FVector(-1, 0, 0), FVector(0, 1, 0),
+									                         FVector(0, -1, 0), FVector(0, 0, 1),  FVector(0, 0, -1)};
+									const TCHAR* Names[6] = {TEXT("+X"), TEXT("-X"), TEXT("+Y"), TEXT("-Y"), TEXT("+Z"), TEXT("-Z")};
+									FString Report;
+									for (int32 I = 0; I < 6; ++I)
+									{
+										FVector Hit, Prev;
+										Report += FString::Printf(
+											TEXT("%s=%s "), Names[I],
+											T->RaycastVoxelWorld(GICaveCameraUU, Dirs[I], 6000.0, Hit, Prev)
+												? *FString::Printf(TEXT("%.1fm"), (Hit - GICaveCameraUU).Size() / 100.0)
+												: TEXT("open"));
+									}
+									UE_LOG(LogVoxelEarth, Log, TEXT("VoxelGICaveTest capture probe: %s"), *Report);
+								}
+								FScreenshotRequest::RequestScreenshot(TEXT("VoxelGICave"), false, true);
+							}),
+						24.f, false);
+					GetWorldTimerManager().SetTimer(
+						GICaveQuitTimerHandle,
+						FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(false); }), 28.f, false);
+				}),
+			GICaveDelaySeconds, false);
+	}
+
 	// ==== end M4 voxel GI verification ======================================
 
 	// M3 wave 1 gate verification (docs/m3-plan.md "two clients dig the same
@@ -2207,6 +2405,99 @@ void AVoxelEarthGameMode::LogUndergroundChunkStatus(UVoxelWorldSubsystem& Subsys
 		                        bComp ? TEXT("C") : TEXT("-"), Quads);
 	}
 	UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCaveTest [%s] column (depth:tracked/component/quads): %s"), Phase, *Line);
+}
+
+// --- GI proof: finding a real worldgen sinkhole ------------------------------
+//
+// A sinkhole is a column whose air runs CONTINUOUSLY from just under the
+// surface down past the top of the cave band -- i.e. daylight reaches
+// underground there. docs/status.md puts them at roughly one per 205 m square,
+// so the search has to reach well past R0; the camera teleports there and the
+// streaming system catches up before the capture.
+//
+// Nothing is carved. This is pristine worldgen, which is the point: it is the
+// world's own geometry lighting itself, not a fixture built to flatter the
+// feature.
+bool AVoxelEarthGameMode::FindSinkholeColumn(UVoxelWorldSubsystem& Subsystem, double OriginXUU, double OriginYUU,
+                                             FVector& OutShaftBaseUU, double& OutSurfaceUU) const
+{
+	constexpr double SearchRadiusUU = 30000.0; // 300 m -- ~2 sinkhole spacings
+	constexpr double StepXYUU = 200.0;         // 2 m; a sinkhole throat is wider than this
+	constexpr double ThroatDepthUU = 800.0;    // 8 m of continuous air below the surface
+	constexpr double ProbeStepUU = 50.0;
+	constexpr double MaxFloorDepthUU = 4000.0; // stop looking for a floor at 40 m
+
+	for (double Ring = 0.0; Ring <= SearchRadiusUU; Ring += StepXYUU)
+	{
+		for (double OffY = -Ring; OffY <= Ring; OffY += StepXYUU)
+		{
+			for (double OffX = -Ring; OffX <= Ring; OffX += StepXYUU)
+			{
+				// Perimeter only: the interior was covered by a smaller ring,
+				// so the first hit is the CLOSEST sinkhole to spawn.
+				if (Ring > 0.0 && FMath::Abs(OffX) < Ring - 0.5 && FMath::Abs(OffY) < Ring - 0.5)
+				{
+					continue;
+				}
+				const double WorldX = OriginXUU + OffX;
+				const double WorldY = OriginYUU + OffY;
+				const double SurfaceUU = Subsystem.GetSurfaceHeightUU(WorldX, WorldY);
+				if (SurfaceUU <= 0.0)
+				{
+					continue; // below sea level
+				}
+				const int64 Vx = (int64)FMath::FloorToDouble(WorldX / VoxelCoords::VoxelSizeUU);
+				const int64 Vy = (int64)FMath::FloorToDouble(WorldY / VoxelCoords::VoxelSizeUU);
+
+				// Continuous air from 0.5 m under the surface to ThroatDepthUU.
+				bool bOpenThroat = true;
+				for (double D = ProbeStepUU; D <= ThroatDepthUU && bOpenThroat; D += ProbeStepUU)
+				{
+					const int64 Vz = (int64)FMath::FloorToDouble((SurfaceUU - D) / VoxelCoords::VoxelSizeUU);
+					bOpenThroat = !Subsystem.IsSolidAtVoxel(Vx, Vy, Vz);
+				}
+				if (!bOpenThroat)
+				{
+					continue;
+				}
+
+				// Follow the shaft down to the first solid -- the cave floor
+				// the daylight actually lands on.
+				double FloorZ = SurfaceUU - ThroatDepthUU;
+				for (double D = ThroatDepthUU; D <= MaxFloorDepthUU; D += ProbeStepUU)
+				{
+					const double Z = SurfaceUU - D;
+					const int64 Vz = (int64)FMath::FloorToDouble(Z / VoxelCoords::VoxelSizeUU);
+					if (Subsystem.IsSolidAtVoxel(Vx, Vy, Vz))
+					{
+						FloorZ = Z;
+						break;
+					}
+					FloorZ = Z;
+				}
+				// The shaft has to bottom out in something worth standing in:
+				// require ~2.5 m of head room above the floor, or keep looking.
+				// Without this the search happily returns a blind throat that
+				// pinches shut, and the camera ends up wedged in rock.
+				const FVector Base(WorldX, WorldY, FloorZ + VoxelCoords::VoxelSizeUU);
+				bool bRoomBelow = true;
+				for (double H = 50.0; H <= 250.0 && bRoomBelow; H += 100.0)
+				{
+					const int64 Vz = (int64)FMath::FloorToDouble((Base.Z + H) / VoxelCoords::VoxelSizeUU);
+					bRoomBelow = !Subsystem.IsSolidAtVoxel(Vx, Vy, Vz);
+				}
+				if (!bRoomBelow)
+				{
+					continue;
+				}
+
+				OutShaftBaseUU = Base;
+				OutSurfaceUU = SurfaceUU;
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 // --- underground streaming proof: finding a real cave ------------------------
