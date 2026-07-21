@@ -466,20 +466,97 @@ uint64_t WaterCA::recomputeVolume() const {
     return sum;
 }
 
-template <typename SolidLookup>
-void WaterCA::hydrostaticPass(SolidLookup&& solid, const std::set<BrickKey, BrickKeyLess>& touched,
+void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
                               std::set<BrickKey, BrickKeyLess>& changed) {
-    // Global "have we ever considered this voxel this tick" set, shared
-    // across every seed attempt below -- guarantees each cell is visited at
-    // most once across the WHOLE pass (not just within one component's own
-    // BFS), which is both the perf property (no component is ever
-    // rediscovered from a second seed) and part of why this is
-    // order-independent (the partition into components is a property of
-    // the graph, not of which seed happened to reach a cell first).
-    std::unordered_set<VoxelKey, VoxelKeyHash> visited;
-    visited.reserve(touched.size() * 32);
+    // --- Per-brick flood cache (W2 perf fix, docs/status.md) ----------------
+    // The component partition, per-component totalVol, and bottom-up level
+    // allocation below are BYTE-FOR-BYTE the same as the from-scratch flood
+    // this replaced (same graph, same tie-breaks, same arithmetic); this is
+    // a pure ACCESS-COST rewrite of HOW the flood reads the map, not WHAT it
+    // computes. The old flood paid, for EVERY cell it popped AND every one of
+    // its 6 neighbors, a full voxel->BrickKey compute + `water_` hashmap
+    // find (via getFill), an `unordered_set<VoxelKey>` visited probe (three
+    // splitmix64 rounds), and -- for empty neighbors -- an `inTouched`
+    // set-find; profiling (status.md perf note) put that per-cell hashing,
+    // not the writes, as the dominant cost of re-flooding a large settled
+    // pool every tick. Here each DISTINCT brick is resolved exactly once
+    // (one `water_.find`, one `touched.find`) into a cache node that carries
+    // the brick's water pointer, its touched-ness, and an inline 512-bit
+    // visited mask; every subsequent cell read/visit on that brick is then a
+    // plain array index + bit op, no hashing. std::unordered_map guarantees
+    // node references stay valid across later inserts (only iterators are
+    // invalidated), so a `BrickCell&` held while resolving a neighbour brick
+    // does not dangle.
+    struct BrickCell {
+        const WaterBrick8* water; // nullptr if the brick is absent (all-empty)
+        bool touched;
+        std::array<uint64_t, 8> visited; // 512 bits in cellIndex order
+    };
+    std::unordered_map<BrickKey, BrickCell, BrickKeyHash> cache;
+    cache.reserve(touched.size() * 4);
 
-    auto inTouched = [&touched](const BrickKey& k) { return touched.find(k) != touched.end(); };
+    auto brickOf = [&](const BrickKey& k) -> BrickCell& {
+        auto it = cache.find(k);
+        if (it != cache.end()) return it->second;
+        BrickCell bc;
+        bc.water = water_.find(k);
+        bc.touched = touched.find(k) != touched.end();
+        bc.visited.fill(0);
+        return cache.emplace(k, bc).first->second;
+    };
+    auto fillOf = [](const BrickCell& bc, int lx, int ly, int lz) -> uint8_t {
+        return bc.water ? bc.water->get(lx, ly, lz) : uint8_t(0);
+    };
+    auto isVisited = [](const BrickCell& bc, int ci) {
+        return (bc.visited[static_cast<size_t>(ci >> 6)] >> (ci & 63)) & 1ull;
+    };
+    auto markVisited = [](BrickCell& bc, int ci) {
+        bc.visited[static_cast<size_t>(ci >> 6)] |= (1ull << (ci & 63));
+    };
+
+    // A flood stack entry keeps brick-local coordinates (like
+    // computeDesiredForBrick's neighborOf walk) so neighbor resolution is
+    // pure arithmetic -- no per-cell floorDiv/floorMod voxel->brick round
+    // trip -- AND caches the already-resolved BrickCell pointer so popping a
+    // cell needs no cache lookup at all, and a neighbor that stays in the
+    // SAME brick (the common case for an 8^3 brick -- every interior cell,
+    // and 5 of 6 faces of a boundary cell) reuses that pointer instead of
+    // hashing the cache again. Node-based std::unordered_map keeps the
+    // pointer valid across later inserts (only iterators are invalidated),
+    // and discovery never erases, so these cached pointers never dangle.
+    struct StackEntry {
+        BrickCell* brick;
+        BrickKey bk;
+        int lx, ly, lz;
+    };
+    std::vector<StackEntry> stack;
+    // Each discovered cell carries the fill it had at flood time. That fill
+    // is still current at apply time (all writes are deferred, so nothing
+    // mutates these cells between discovery and apply), which lets the level
+    // step below SKIP emitting a write whenever the computed target already
+    // equals the current fill -- the overwhelmingly common case for a large
+    // settled pool, whose deep interior is all 255 every tick. setFillAccounted
+    // early-returns on an equal old/new value and never records a no-op into
+    // `changed`, so dropping those calls entirely is byte-identical, and it
+    // removes the whole second O(pool) cost (a waterKeyForVoxel + water_ find
+    // per interior cell, every tick) the perf note flagged alongside traversal.
+    struct FloodCell {
+        int64_t x, y, z;
+        uint8_t fill;
+    };
+    std::vector<FloodCell> cells;
+    cells.reserve(kMaxHydrostaticComponentCells + 1); // grow-once, reused per seed
+    // Writes are DEFERRED to a single apply pass after ALL components are
+    // discovered, rather than applied per-component inside the loop. This is
+    // what lets the read-only brick cache above hold `water_.find` pointers
+    // safely: setFillAccounted can getOrCreate/erase bricks (invalidating
+    // those pointers), so no write may run while discovery is still reading.
+    // Output is unchanged: distinct components never share a cell (the global
+    // visited marking is preserved), so a later component's flood never reads
+    // a cell an earlier component would have written; and each target is an
+    // absolute value computed from the captured totalVol, independent of
+    // when it is committed.
+    std::vector<std::pair<VoxelKey, uint8_t>> pendingWrites;
 
     // Deterministic seed scan: `touched` is already a sorted std::set, and
     // each brick's 512 cells are walked in fixed (z,y,x) order -- matches
@@ -491,15 +568,14 @@ void WaterCA::hydrostaticPass(SolidLookup&& solid, const std::set<BrickKey, Bric
     // let a pass wander through arbitrary connected dry space with no water
     // anywhere near it.
     for (const BrickKey& key : touched) {
+        BrickCell& seedBrick = brickOf(key);
+        if (!seedBrick.water) continue; // no water at all in this brick: no seeds
         for (int z = 0; z < kEdge; ++z)
             for (int y = 0; y < kEdge; ++y)
                 for (int x = 0; x < kEdge; ++x) {
-                    const int64_t vx = int64_t(key.x) * kEdge + x;
-                    const int64_t vy = int64_t(key.y) * kEdge + y;
-                    const int64_t vz = int64_t(key.z) * kEdge + z;
-                    const VoxelKey seed{vx, vy, vz};
-                    if (visited.count(seed)) continue;
-                    if (getFill(vx, vy, vz) == 0) continue; // not a water cell: never a seed (see above)
+                    const int ci = WaterBrick8::cellIndex(x, y, z);
+                    if (isVisited(seedBrick, ci)) continue;
+                    if (seedBrick.water->get(x, y, z) == 0) continue; // not water: never a seed
 
                     // Bounded-through-air / unbounded-through-water flood
                     // fill (header comment "Phase C -- HYDROSTATIC" step 1).
@@ -530,40 +606,65 @@ void WaterCA::hydrostaticPass(SolidLookup&& solid, const std::set<BrickKey, Bric
                     // diluting the level and reactivating a permanently
                     // growing footprint -- never a genuine pressure
                     // response, just brick-granularity leakage.
-                    std::vector<VoxelKey> stack{seed};
-                    visited.insert(seed);
-                    std::vector<VoxelKey> cells;
+                    markVisited(seedBrick, ci);
+                    stack.clear();
+                    stack.push_back(StackEntry{&seedBrick, key, x, y, z});
+                    cells.clear();
                     bool overflowed = false;
                     uint64_t totalVol = 0;
 
                     while (!stack.empty()) {
-                        const VoxelKey c = stack.back();
+                        const StackEntry c = stack.back();
                         stack.pop_back();
-                        const uint8_t cFill = getFill(c.x, c.y, c.z);
+                        BrickCell& cBrick = *c.brick;
+                        const uint8_t cFill = fillOf(cBrick, c.lx, c.ly, c.lz);
                         if (!overflowed) {
-                            cells.push_back(c);
+                            cells.push_back(FloodCell{int64_t(c.bk.x) * kEdge + c.lx,
+                                                      int64_t(c.bk.y) * kEdge + c.ly,
+                                                      int64_t(c.bk.z) * kEdge + c.lz, cFill});
                             totalVol += cFill;
                             if (cells.size() > kMaxHydrostaticComponentCells) overflowed = true;
                         }
                         const bool canEnterAir = cFill == 255 || cFill == 0;
                         for (int i = 0; i < 6; ++i) {
-                            const int64_t nx = c.x + kHydroDx[i];
-                            const int64_t ny = c.y + kHydroDy[i];
-                            const int64_t nz = c.z + kHydroDz[i];
-                            const VoxelKey nk{nx, ny, nz};
-                            if (visited.count(nk)) continue;
-                            const uint8_t nFill = getFill(nx, ny, nz);
+                            int nlx, nly, nlz;
+                            const BrickKey nbk = neighborOf(c.bk, c.lx, c.ly, c.lz, kHydroDx[i], kHydroDy[i],
+                                                            kHydroDz[i], nlx, nly, nlz);
+                            // Same-brick neighbor (interior step): reuse the
+                            // popped cell's own brick node, no cache hash.
+                            BrickCell& nBrick = (nbk == c.bk) ? cBrick : brickOf(nbk);
+                            const int nci = WaterBrick8::cellIndex(nlx, nly, nlz);
+                            if (isVisited(nBrick, nci)) continue;
+                            const uint8_t nFill = fillOf(nBrick, nlx, nly, nlz);
                             if (nFill == 0) {
-                                if (kHydroDz[i] < 0) continue;               // never explore downward into empty space
-                                if (!canEnterAir) continue;                  // gate: full water or already-air only
-                                if (!inTouched(waterKeyForVoxel(nx, ny, nz))) continue; // bounded to active region
+                                if (kHydroDz[i] < 0) continue;   // never explore downward into empty space
+                                if (!canEnterAir) continue;      // gate: full water or already-air only
+                                if (!nBrick.touched) continue;   // bounded to active region
+                                // Air cell passing the gates: confirm it is
+                                // genuinely open (not solid terrain) before
+                                // pulling it into the component. Only AIR
+                                // neighbors need this query -- a WATER
+                                // neighbor (nFill>0) is, by engine invariant,
+                                // never inside solid terrain (addWater guards
+                                // isSolid; Phase READ/APPLY only ever flows
+                                // into solid()==MAT_AIR cells; hydrostatic
+                                // only writes flood-included non-solid cells;
+                                // and conservation would break if any water
+                                // sat in a solid cell), so solid() on it is
+                                // ALWAYS MAT_AIR and calling it would only add
+                                // a redundant (~1us terrain) solid_ query.
+                                // Matching the old code's inclusion decision
+                                // exactly, just skipping the constant query.
+                                const int64_t nx = int64_t(nbk.x) * kEdge + nlx;
+                                const int64_t ny = int64_t(nbk.y) * kEdge + nly;
+                                const int64_t nz = int64_t(nbk.z) * kEdge + nlz;
+                                if (solid_(nx, ny, nz) != MAT_AIR) {
+                                    markVisited(nBrick, nci);
+                                    continue;
+                                }
                             }
-                            if (solid(nx, ny, nz) != MAT_AIR) {
-                                visited.insert(nk);
-                                continue;
-                            }
-                            visited.insert(nk);
-                            stack.push_back(nk);
+                            markVisited(nBrick, nci);
+                            stack.push_back(StackEntry{&nBrick, nbk, nlx, nly, nlz});
                         }
                     }
 
@@ -577,14 +678,18 @@ void WaterCA::hydrostaticPass(SolidLookup&& solid, const std::set<BrickKey, Bric
 
                     // Level computation (header comment step 2): bottom-up
                     // by z, fixed (x,y)-ascending tie-break within a layer.
-                    std::sort(cells.begin(), cells.end(), [](const VoxelKey& a, const VoxelKey& b) {
+                    // Only cells whose computed target DIFFERS from their
+                    // current fill are emitted (see FloodCell) -- a settled
+                    // interior is all no-ops and produces no writes at all.
+                    std::sort(cells.begin(), cells.end(), [](const FloodCell& a, const FloodCell& b) {
                         if (a.z != b.z) return a.z < b.z;
                         if (a.x != b.x) return a.x < b.x;
                         return a.y < b.y;
                     });
 
-                    std::vector<std::pair<VoxelKey, uint8_t>> writes;
-                    writes.reserve(cells.size());
+                    auto emit = [&pendingWrites](const FloodCell& fc, uint8_t target) {
+                        if (target != fc.fill) pendingWrites.emplace_back(VoxelKey{fc.x, fc.y, fc.z}, target);
+                    };
                     uint64_t remaining = totalVol;
                     size_t idx = 0;
                     while (idx < cells.size()) {
@@ -594,31 +699,31 @@ void WaterCA::hydrostaticPass(SolidLookup&& solid, const std::set<BrickKey, Bric
                         const size_t n = j - idx;
                         const uint64_t layerCap = static_cast<uint64_t>(n) * 255u;
                         if (remaining >= layerCap) {
-                            for (size_t k = idx; k < j; ++k) writes.emplace_back(cells[k], uint8_t(255));
+                            for (size_t k = idx; k < j; ++k) emit(cells[k], uint8_t(255));
                             remaining -= layerCap;
                         } else if (remaining > 0) {
                             const uint64_t base = remaining / n;
                             const uint64_t rem = remaining % n; // first `rem` cells (fixed x,y order) get +1
                             for (size_t k = idx; k < j; ++k) {
                                 const uint64_t v = base + ((k - idx) < rem ? 1u : 0u);
-                                writes.emplace_back(cells[k], static_cast<uint8_t>(v));
+                                emit(cells[k], static_cast<uint8_t>(v));
                             }
                             remaining = 0;
                         } else {
-                            for (size_t k = idx; k < j; ++k) writes.emplace_back(cells[k], uint8_t(0));
+                            for (size_t k = idx; k < j; ++k) emit(cells[k], uint8_t(0));
                         }
                         idx = j;
                     }
-
-                    // Apply (header comment step 3): absolute targets
-                    // through the normal accounted-write path -- ledger,
-                    // homogeneous-empty collapse, and `changed` tracking
-                    // all stay centralized in setFillAccounted, exactly
-                    // like every other write in this file. A target equal
-                    // to the cell's current fill is a no-op there.
-                    for (const auto& [vk, target] : writes) setFillAccounted(vk.x, vk.y, vk.z, target, &changed);
                 }
     }
+
+    // Apply (header comment step 3): absolute targets through the normal
+    // accounted-write path -- ledger, homogeneous-empty collapse, and
+    // `changed` tracking all stay centralized in setFillAccounted, exactly
+    // like every other write in this file. A target equal to the cell's
+    // current fill is a no-op there. Deferred to here (see pendingWrites)
+    // so the brick cache above never observes a mid-pass mutation of water_.
+    for (const auto& [vk, target] : pendingWrites) setFillAccounted(vk.x, vk.y, vk.z, target, &changed);
 }
 
 void WaterCA::step() { stepWithOrder(activeSetSnapshot()); }
@@ -863,7 +968,10 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
         if (differs) changed.insert(t);
     }
 
-    hydrostaticPass(cachedSolid, touched, changed);
+    // Phase C uses the raw solid_ callback directly (NOT cachedSolid): its
+    // flood queries each air voxel at most once, so the memo cache would be
+    // pure overhead -- see hydrostaticPass's declaration comment in waterca.h.
+    hydrostaticPass(touched, changed);
 
     // Next active set = changed bricks UNION every one of their 6
     // face-neighbors (all 6, not just the 5 "outgoing target" directions
