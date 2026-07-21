@@ -44,7 +44,47 @@ public class VoxelEarth : ModuleRules
 		string VoxelCoreInclude = Path.Combine(VoxelCoreRoot, "include");
 		PublicIncludePaths.Add(VoxelCoreInclude);
 
-		string VoxelCoreLib = Path.Combine(ModuleDirectory, "..", "..", "..", "build", "voxel-core-msvc", "voxelcore.lib");
+		// Single-config generators (Ninja, Makefiles) place voxelcore.lib
+		// directly in this directory; multi-config generators (Visual Studio)
+		// place it under a per-configuration subdirectory instead. Search
+		// both, preferring an optimized build over Debug, and preferring the
+		// subdirectory that matches the UE target configuration when there's
+		// a choice, so a stray Debug lib doesn't win over a Release build in
+		// an optimized UE build (and vice versa).
+		string VoxelCoreBuildDir = Path.Combine(ModuleDirectory, "..", "..", "..", "build", "voxel-core-msvc");
+		bool bDebugTarget = Target.Configuration == UnrealTargetConfiguration.Debug
+			|| Target.Configuration == UnrealTargetConfiguration.DebugGame;
+		string[] ConfigSearchOrder = bDebugTarget
+			? new string[] { "Debug", "RelWithDebInfo", "Release", "" }
+			: new string[] { "Release", "RelWithDebInfo", "Debug", "" };
+
+		string VoxelCoreLib = null;
+		foreach (string Config in ConfigSearchOrder)
+		{
+			string Candidate = string.IsNullOrEmpty(Config)
+				? Path.Combine(VoxelCoreBuildDir, "voxelcore.lib")
+				: Path.Combine(VoxelCoreBuildDir, Config, "voxelcore.lib");
+			if (File.Exists(Candidate))
+			{
+				VoxelCoreLib = Candidate;
+				break;
+			}
+		}
+
+		if (VoxelCoreLib == null)
+		{
+			throw new BuildException(
+				"VoxelEarth: could not find voxelcore.lib. Searched:\n" +
+				"  " + Path.Combine(VoxelCoreBuildDir, "voxelcore.lib") + "\n" +
+				"  " + Path.Combine(VoxelCoreBuildDir, "Release", "voxelcore.lib") + "\n" +
+				"  " + Path.Combine(VoxelCoreBuildDir, "RelWithDebInfo", "voxelcore.lib") + "\n" +
+				"  " + Path.Combine(VoxelCoreBuildDir, "Debug", "voxelcore.lib") + "\n" +
+				"Build voxel-core first, e.g.:\n" +
+				"  cmake -S voxel-core -B build/voxel-core-msvc\n" +
+				"  cmake --build build/voxel-core-msvc --config Release"
+			);
+		}
+
 		PublicAdditionalLibraries.Add(VoxelCoreLib);
 	}
 }

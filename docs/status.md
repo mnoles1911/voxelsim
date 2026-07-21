@@ -3495,3 +3495,51 @@ eviction rule on the place path is a natural next step. (3) The
 `-VoxelWaterMemoTest` nudges are now redundant for reactivation and are kept
 only so that scenario keeps reproducing its signed-off A/B table; they could be
 retired once someone re-pins that table.
+
+### VoxelEarth.Build.cs: per-config voxelcore.lib resolution
+
+`VoxelEarth.Build.cs` used to hardcode the voxel-core static lib as the flat
+path `build/voxel-core-msvc/voxelcore.lib`. That only ever matched
+single-config CMake generators (Ninja, Makefiles/NMake); a multi-config
+generator (Visual Studio) puts the artifact under a per-configuration
+subdirectory instead (`Release/`, `RelWithDebInfo/`, `Debug/`), so the UE
+build failed to find it. Multiple agents had been manually copying the .lib
+into the flat path in every fresh worktree to work around this. Fixed: the
+module now searches the flat path and all three per-config subdirectories,
+preferring an optimized config over `Debug/` (and preferring the config that
+matches the current UE target configuration -- `Debug`/`DebugGame` prefers
+`Debug/` first) rather than hardcoding one location. If nothing is found it
+throws a `BuildException` at configure time listing every path searched and
+the CMake commands to build voxel-core, instead of failing later with an
+opaque linker error.
+
+**Verified, not just reasoned about**, in this worktree with system CMake
+4.4.0 (`C:\Program Files\CMake\bin\cmake.exe`):
+- Multi-config (the case that was broken): configured voxel-core with
+  `-G "Visual Studio 18 2026"`, built the `Release` config -- the .lib landed
+  ONLY at `build/voxel-core-msvc/Release/voxelcore.lib` (no flat file ever
+  existed). `Build.bat VoxelEarthEditor Win64 Development` against
+  `D:\UE_5.8` -> `Result: Succeeded`, with zero manual copying.
+- Single-config sanity check: configured voxel-core with `-G "NMake
+  Makefiles"` (system CMake's Visual Studio generator, unlike Ninja, doesn't
+  need a preconfigured dev-shell env, but NMake does -- ran via
+  `vcvarsall.bat x64`), built `Release`, and confirmed the flat-path branch
+  independently by temporarily swapping a flat-only `voxelcore.lib` (no
+  subdirectories at all) into `build/voxel-core-msvc/` -- also
+  `Result: Succeeded`, no manual copy.
+- Missing-lib case: with `build/voxel-core-msvc/` absent entirely, the build
+  fails fast at configure time with `Unable to instantiate module
+  'VoxelEarth': VoxelEarth: could not find voxelcore.lib. Searched: ...` (all
+  four candidate paths listed) plus the two `cmake` commands to build it --
+  `Result: Failed (RulesError)`, not a linker error.
+
+One gotcha hit along the way, worth remembering: UBT caches its resolved
+target action graph in
+`Intermediate/Build/Win64/x64/<Target>/Development/Makefile.bin` and does NOT
+re-run a module's `Build.cs` on every invocation, only when it decides the
+makefile is stale. When swapping library layouts by hand to test each branch,
+that cache had to be deleted between runs to force UBT to re-evaluate
+`VoxelEarth.Build.cs`'s new resolution logic -- a normal `cmake --build`
+after a config change followed by an ordinary UE rebuild will not need this
+(the lib file's own timestamp change is what invalidates the link action;
+it's specifically re-*resolving a different path* that this cache can hide).
