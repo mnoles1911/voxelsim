@@ -847,6 +847,165 @@ chunk scene proxy to mesh the island instead of per-voxel instanced cubes;
   churn (tombstones accumulate — periodic full rebuild reclaims them); UE
   integration and real per-brick dirty-set plumbing into `markRegionDirty`.
 
+### Swarm + Tier 0/1/2 LOD + pursuit (UE, navigation-only v0)
+
+UE-side consumption of `pathfind.h` (worktree agent): hundreds of
+server-authoritative NPCs pursue the player across streaming voxel terrain,
+navigation-only (no dig/place this slice — that's the next M6 wave). New
+files: `VoxelAgent.{h,cpp}`, `VoxelAgentSubsystem.{h,cpp}`; `VoxelEarthGameMode`
+gained the `-VoxelSwarmTest[=<N>]` switch, same pattern as the other headless
+test switches.
+
+- [x] **Agent representation: pooled + instanced, not N actors.** `FVoxelAgent`
+  (`VoxelAgent.h`) is a plain UE struct (position, velocity, waypoints,
+  tier, standoff flag, ISM instance index) held in one
+  `TArray<FVoxelAgent>` inside `UVoxelAgentSubsystem` — no `AActor` per
+  agent, which would be far too heavy at hundreds of agents (per-actor
+  tick/replication/component overhead). Rendering mirrors `AVoxelDebris`'
+  "engine cubes" style: a single `UInstancedStaticMeshComponent`
+  (`AgentISM`), one instance per agent, updated in place each tick
+  (`UpdateInstanceTransform`) with ONE `MarkRenderStateDirty()` call per
+  tick for the whole batch, not per instance. `FVoxelAgent` is deliberately
+  voxel-core-free (no `vxc::` types) so it stays safe to include from
+  `UVoxelAgentSubsystem.h`, a UHT-parsed `UCLASS` header — the actual
+  `vxc::PathResult` per Tier 0/1 agent lives PIMPL-side, in
+  `VoxelAgentSubsystem.cpp`'s `FVoxelAgentImpl` (a parallel array, same
+  index as the pool), exactly mirroring `UVoxelWorldSubsystem`'s
+  `FVoxelWorldImpl` / `UVoxelWaterSubsystem`'s `FVoxelWaterImpl` PImpl
+  idiom so voxel-core never leaks into a reflected header. A dedicated
+  server (no viewport) still runs the full simulation; only `AgentISM`
+  itself is skipped (`OnWorldBeginPlay`), the same "sim always, render
+  never" split `UVoxelWorldSubsystem`'s chunk streaming and
+  `UVoxelWaterSubsystem`'s CA both use for `NM_DedicatedServer`.
+- [x] **LOD scheduler: tier thresholds, hysteresis, replan budget.** Every
+  agent is bucketed each tick by distance-to-player via
+  `ComputeNextVoxelAgentTier` (`VoxelAgent.cpp`), a pure hysteresis
+  function: entering Tier 0 needs distance < 15m, leaving it needs > 20m;
+  entering Tier 1 (from Tier 2) needs < 80m, leaving to Tier 2 needs >
+  100m — asymmetric enter/exit thresholds per boundary so an agent sitting
+  between the two never flips tiers from per-frame noise.
+  - **Tier 0 (near, ~dozens)**: full windowed `vxc::findPath` every tick it
+    needs one — replanned when the path is exhausted, `pathStillValid`
+    fails, or the player's (ground-projected) goal has drifted >3m from
+    where the current path was planned toward. Ground-snapped via
+    `UVoxelWorldSubsystem::RaycastVoxelWorld` every tick (mirrors
+    `AVoxelDebris`' settle raycast). **Cost**: one `findPath` call per
+    replan, windowed to 33×33×25 voxels (~3.3m×3.3m×2.4m, ~27k cells)
+    centered on the AGENT, not sized to reach the player — `findPath`
+    allocates its bookkeeping arrays to the full window volume up front
+    (see `pathfind.h`'s own "Search / windowing" doc comment), so a window
+    sized to reach a player 20m away would be ~40x bigger per axis and
+    cost orders of magnitude more, every replan, for every Tier 0/1 agent.
+    When the (typically far) goal lies outside this small window,
+    `findPath` returns `capped=true` with a best-effort path to the
+    settled cell closest (Manhattan) to the goal — the agent walks that
+    partial path, reaches its end, and gets replanned from its new
+    position: repeated small windowed searches chain into steady progress
+    toward a moving goal, which is the "local windowed voxel A*" the plan
+    doctrine (§3.6) actually describes, not one huge search per agent.
+  - **Tier 1 (mid)**: the SAME `findPath` call, coarser cadence — replans
+    (and the `pathStillValid` recheck that can trigger one) are additionally
+    gated on a 2.5s per-agent cooldown (unless the path is exhausted, which
+    still forces an immediate replan, budget permitting), and the
+    ground-snap raycast runs on a 0.5s cadence instead of every tick.
+    **Cost**: same per-search cost as Tier 0, but far fewer searches/sec
+    per agent. `// TODO(M6): swap Tier 1's findPath call for a hierarchical
+    regiongraph.h lookup once that layer lands` — a separate track is
+    building the region-graph hierarchical layer; it is NOT merged into
+    this worktree, so Tier 1 does not depend on it.
+  - **Tier 2 (far, the "hundreds" bulk)**: **no A\* at all** — bounded
+    steering straight toward the player (`SteerVoxelAgentTier2`,
+    `VoxelAgent.cpp`) plus a small per-agent sine wander so a crowd doesn't
+    march in lockstep, ground-snapped only every 1.5s. **Cost**: a
+    normalize + a `Sin` call per tick, zero voxel queries most ticks — this
+    is what makes hundreds of agents affordable.
+  - **Replan budget**: `MaxTier0ReplansPerTick = 6` — Tier 0 AND Tier 1
+    replans share one counter per subsystem `Tick`, decremented on every
+    ATTEMPT (a full `findPath` call), whether or not it finds a usable
+    path, since the cost is paid either way. An agent whose replan is due
+    but the budget is spent simply waits (moves along its old path, or
+    idles at its end) for a future tick's budget.
+  - Mine/Bridge are effectively disabled for every search (task doctrine:
+    "navigation-only v0 — agents only Walk/Step/Climb/Fall/Jump over
+    EXISTING terrain"): every material's `mineCostByMaterial` entry is set
+    to the pathfind.h "impassable" sentinel (negative) in
+    `UVoxelAgentSubsystem::Initialize`, and `bridgeCost` is priced at
+    1,000,000 (pathfind.h has no literal "forbid this action" flag, only
+    cost) — Jump stays enabled at its default cost since it places nothing
+    and is explicitly one of the allowed actions.
+- [x] **Pursuit + standoff.** Every agent's goal is the player's current
+  column, Z-projected onto the terrain surface
+  (`UVoxelWorldSubsystem::GetSurfaceHeightUU`) rather than the player's
+  literal (possibly airborne — `AVoxelEarthFlyPawn` flies freely) position:
+  `pathfind.h`'s v0 Climb/Fall model has no "open shaft vs. genuine wall"
+  distinction (a documented header simplification — Climb only checks the
+  destination is air), so pathing agents literally toward a hovering player
+  would have them Climb straight up through open sky one voxel at a time. A
+  nav-only ground swarm chases where the player is STANDING OVER, not the
+  camera; LOD tiering and standoff distance still use the player's REAL 3D
+  position, so a player who flies away is correctly seen as "far" even
+  while hovering overhead. An agent within 2.5m of the player
+  (`StandoffRadiusUU`) stops advancing (`bIdleAtStandoff`) so the swarm
+  doesn't pile into the player's own cell; it only resumes once the player
+  is back beyond 4m (`StandoffResumeUU`), same hysteresis shape as the tier
+  bands.
+- [x] **Headless verification**: `VoxelEarthEditor` built clean (`Build.bat
+  ... -WaitMutex -NoHotReloadFromIDE`, zero warnings from any of
+  `VoxelAgent.cpp`/`VoxelAgentSubsystem.cpp`/`VoxelEarthGameMode.cpp` — the
+  only warnings in the build log are the pre-existing engine-header
+  deprecation baseline from `SharedPCH`, unrelated to this pass). Worktree
+  `voxelcore.lib` freshly configured+built for this checkout (CMake+Ninja,
+  MSVC 14.51/VS 2026, Release — the worktree's `voxel-core` had diverged
+  from `main`'s prebuilt lib by an unrelated in-flight `waterca.cpp`
+  change, so `main`'s `.lib` could not just be reused this time).
+  `-game -VoxelSwarmTest=200 -VoxelScreenshotAfter=20 -windowed -resx=1280
+  -resy=720 -log -unattended -nosplash`, seed default (20260719): spawned
+  200/200 agents ringed 10m-150m around the player (spans all three tiers
+  on spawn by design). Tier bucketing and the convergence metric, logged
+  every 2s (`LogVoxelEarth`, `"VoxelSwarm:"` lines):
+
+  | t (approx) | tier0 | tier1 | tier2 | meanDistToPlayer |
+  |---|---|---|---|---|
+  | spawn+1s | 5 | 113 | 82 | 85.6m |
+  | +5s | 5 | 113 | 82 | 83.1m |
+  | +10s | 5 | 113 | 82 | 80.0m |
+  | +15s | 5 | 115 | 80 | 76.8m |
+  | +20s | 7 | 131 | 62 | 70.4m |
+  | +25s | 8 | 161 | 31 | 66.2m |
+  | +30s | 8 | 189 | 3 | 64.3m |
+  | +33s (last tick before quit) | 9 | 191 | 0 | 64.0m |
+
+  Mean distance-to-player **monotonically decreases** (85.6m → 64.0m) and
+  Tier 2's count drains to 0 as agents promote through Tier 1 toward Tier 0
+  (convergence, both in the aggregate metric and via the tier-promotion
+  path itself) — the requested verification. Two screenshots captured
+  (`Saved/Screenshots/WindowsEditor/VoxelVerify00000.png`,
+  `VoxelVerify00001.png`, 1280×720) visibly show the swarm's instanced
+  cube bodies standing on the terrain at various distances. Clean shutdown
+  (`LogExit: Exiting.`), zero ensures, zero fatal errors. (Pre-existing,
+  unrelated to this pass: `M_Ocean`/`M_VoxelClipmap`/`M_VoxelTerrain`
+  fail to load in this worktree with an asset-custom-version-too-new
+  error — falls back to the engine default material per each actor's own
+  existing fallback path, same as any other missing-material run; not
+  caused by or fixed by this slice, no content files are in this slice's
+  owned-files list.)
+- [ ] **Known v0 scope limit, documented not fixed**: agent state is NOT
+  replicated to remote clients this slice (no `FastArraySerializer`/RPC
+  wiring — `VoxelEditRelay.h` is outside this slice's owned-files list);
+  every verification run above is `NM_Standalone`. The simulation itself
+  is already authority-gated (`NM_Client` never ticks its own copy), so
+  wiring real replication is additive, not a rewrite — left as a follow-up
+  for whoever extends this into a networked run.
+- [ ] **Follow-up (next slice, known/expected)**: digging/editing terrain
+  while pathing (this slice is navigation-only — agents never call
+  `TryDig`/`TryPlace`/`CarveSphere`). Also: swap Tier 1's `findPath` for
+  `regiongraph.h` once that layer merges (seam left as a `// TODO(M6)` in
+  `VoxelAgentSubsystem.h`); a real 2-voxel-tall body (`pathfind.h`'s own
+  documented v0 simplification, inherited here); per-dirty-brick path
+  cache invalidation (currently Tier 0 revalidates its whole path every
+  tick via `pathStillValid`, cheap at window-scale but not brick-indexed);
+  agent state replication (above).
+
 ## M0 GPU track (ADR-0001)
 
 - [x] Worldgen HLSL kernel (ColumnMain, VoxelizeMain, MeshCountMain,
