@@ -466,6 +466,7 @@ void UVoxelChunkComponent::SetDebugTint(const FLinearColor& Tint)
 		return;
 	}
 	ChunkMID->SetVectorParameterValue(TEXT("DebugTint"), Tint);
+	bDebugTintDirty = true; // M1 hitch-gap wave: see ClearDebugTint's early-out
 }
 
 void UVoxelChunkComponent::ClearDebugTint()
@@ -477,11 +478,28 @@ void UVoxelChunkComponent::ClearDebugTint()
 	// "zero extra cost when this layer is off" now means "one SetVectorParameterValue
 	// call, no MID churn / no MarkRenderStateDirty", which is strictly
 	// cheaper than the old create/destroy-MID path, not more expensive.
-	if (!ChunkMID)
+	//
+	// M1 hitch-gap wave (component pooling): ReturnChunkComponentToPool now
+	// calls this unconditionally on EVERY pool-park, which -- unlike
+	// SetVisibility/SetChunkQuads's MarkRenderStateDirty -- does NOT coalesce
+	// with anything else; SetVectorParameterValue fires its own immediate
+	// render-thread command every time it's actually called. Measured impact:
+	// with this early-out ABSENT, a min-spec-proxy -VoxelPerfRun=60 gate run
+	// (voxel.Debug=0 the whole time, i.e. DebugTint was never touched by
+	// anything) still enqueued this render command on every one of the
+	// steady ~2 unloads/frame during ring-crossing churn -- pure waste, and a
+	// real regression vs the pre-pooling DestroyComponent path (which never
+	// touched a material parameter on unload at all). bDebugTintDirty tracks
+	// "does this MID's DebugTint param currently differ from the identity",
+	// so a component that was never tinted (the overwhelmingly common case
+	// whenever voxel.Debug's visualization layers are off) skips the call
+	// entirely -- zero render-thread cost, not just zero EXTRA MID churn.
+	if (!ChunkMID || !bDebugTintDirty)
 	{
 		return;
 	}
 	ChunkMID->SetVectorParameterValue(TEXT("DebugTint"), FLinearColor::White);
+	bDebugTintDirty = false;
 }
 
 void UVoxelChunkComponent::ApplyRingFadeParams()

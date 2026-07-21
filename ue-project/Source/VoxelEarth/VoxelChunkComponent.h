@@ -36,12 +36,18 @@ public:
 	void SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, int32 InChunkEdgeVoxels);
 
 	// M2 mip rings (docs/m2-plan.md decisions table): "one component type
-	// serves all levels ... position scale = VoxelSizeUU << level". Set once
-	// by UVoxelWorldSubsystem right after NewObject, before RegisterComponent
-	// -- never changes for the lifetime of this component (a chunk's level
-	// never changes; it is destroyed and a new one spawned instead). Quad
-	// coordinates in ChunkQuads stay in level-relative voxel units (0..31);
-	// only world placement (this scale) differs by level.
+	// serves all levels ... position scale = VoxelSizeUU << level". Set by
+	// UVoxelWorldSubsystem right after acquiring a component (fresh or pooled
+	// -- see FVoxelWorldImpl::AcquireChunkComponent) and always before the
+	// SetChunkQuads call that actually bakes this into a scene proxy. M1
+	// hitch-gap wave (component pooling): a single component's level CAN now
+	// change across its lifetime -- once when first assigned, and again every
+	// time a pooled/reused instance is handed to a DIFFERENT (level, key) --
+	// this is safe to call repeatedly for exactly that reason; only the
+	// value as of the NEXT SetChunkQuads call matters, nothing latches on
+	// first-ever assignment. Quad coordinates in ChunkQuads stay in
+	// level-relative voxel units (0..31); only world placement (this scale)
+	// differs by level.
 	//
 	// M2 "Transitions" polish (docs/voxel-earth-implementation-plan.md SS3.3;
 	// docs/m2-plan.md's "hard boundary v0" row, now upgraded): also drives the
@@ -118,6 +124,16 @@ private:
 	// recreated if SetMaterial() is called again with a different base.
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> ChunkMID;
+
+	// M1 hitch-gap wave: true iff ChunkMID's DebugTint param currently
+	// differs from the identity (opaque white) -- set by SetDebugTint,
+	// cleared by ClearDebugTint. Lets ClearDebugTint (now called
+	// unconditionally on every pool-park by ReturnChunkComponentToPool, see
+	// VoxelWorldSubsystem.cpp) skip its SetVectorParameterValue call --  a
+	// real, non-coalescing render-thread command, unlike MarkRenderStateDirty
+	// -- whenever there is genuinely nothing to clear (the common case
+	// whenever voxel.Debug's tint layers are off).
+	bool bDebugTintDirty = false;
 
 	// Applies this chunk's per-level ring cross-fade params (docs/m2-plan.md
 	// "Transitions" row upgrade; docs/voxel-earth-implementation-plan.md

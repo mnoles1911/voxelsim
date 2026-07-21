@@ -151,9 +151,22 @@ namespace VoxelDebug
 	// post-edit dirty re-mesh) applied per frame. Default 2 (was 4).
 	VOXELEARTH_API int32 GetStreamMaxRemeshesPerFrame();
 
-	// voxel.Stream.MaxUnloadsPerFrame: max chunk-component DestroyComponent
-	// calls (DrainUnloads) per frame. Default 2 (was 4).
+	// voxel.Stream.MaxUnloadsPerFrame: max chunk-component unload events
+	// (DrainUnloads -- pool-park, or DestroyComponent once the pool is at
+	// cap) per frame. Default 2 (was 4).
 	VOXELEARTH_API int32 GetStreamMaxUnloadsPerFrame();
+
+	// voxel.Stream.ComponentPoolMax (M1 hitch-gap wave, docs/status.md M1
+	// gate row): max UVoxelChunkComponent instances parked (hidden, no scene
+	// proxy, still registered/attached) in the reuse pool after leaving the
+	// desired set, instead of DestroyComponent()'d immediately. A pending
+	// first-load prefers a pooled component over NewObject+RegisterComponent
+	// -- see FVoxelWorldImpl::AcquireChunkComponent -- avoiding the
+	// render-thread AddPrimitive/RemovePrimitive churn the hitch-attribution
+	// instrumentation pinned as the dominant cost at ring-boundary crossings.
+	// Default 512; unloads past the cap fall back to DestroyComponent() (no
+	// unbounded growth).
+	VOXELEARTH_API int32 GetComponentPoolMax();
 
 	// Shared hitch-frame threshold (ms), matching UVoxelPerfRunSubsystem's own
 	// HitchThresholdMs (">30fps frame budget") -- used by
@@ -188,6 +201,15 @@ struct FVoxelPerfSnapshot
 	// last refresh window, as a percentage -- "budget saturation" row.
 	float BudgetSaturationPct = 0.f;
 	int64 StaleResultsDiscarded = 0;
+
+	// --- Component pool (M1 hitch-gap wave, docs/status.md M1 gate row) -----
+	// Chunk components parked (hidden, no scene proxy) instead of destroyed
+	// when they leave the desired set; a first-load prefers one of these over
+	// NewObject+RegisterComponent. See FVoxelWorldImpl::ComponentPool /
+	// AcquireChunkComponent / ReturnChunkComponentToPool.
+	int32 PooledComponents = 0;   // current pool size
+	float PoolReusesPerSec = 0.f; // reuse events (pool hits) over the last refresh window
+	int64 TotalPoolReuses = 0;    // cumulative reuse events since startup
 
 	// --- Worker timings -----------------------------------------------------
 	// Rolling 256-sample window of per-chunk worker mesh-job milliseconds
