@@ -10,6 +10,23 @@ namespace {
 constexpr int kEdge = WaterBrick8::kEdge;   // 8
 constexpr int kCells = WaterBrick8::kCells; // 512
 
+// Voxel-coordinate key for the per-tick solid_ memoization cache (see
+// stepWithOrder's `cachedSolid`/`solidCache`) -- distinct from BrickKey,
+// which is truncated to int32_t brick coordinates; a voxel key needs the
+// full int64_t range solid_'s own (vx,vy,vz) contract uses.
+struct VoxelKey {
+    int64_t x, y, z;
+    friend bool operator==(const VoxelKey&, const VoxelKey&) = default;
+};
+struct VoxelKeyHash {
+    size_t operator()(const VoxelKey& k) const {
+        uint64_t h = splitmix64(static_cast<uint64_t>(k.x));
+        h = splitmix64(h ^ static_cast<uint64_t>(k.y));
+        h = splitmix64(h ^ static_cast<uint64_t>(k.z));
+        return static_cast<size_t>(h);
+    }
+};
+
 // The ONE fixed enumeration used everywhere in this file: as a cell's own
 // outgoing-flow priority (source-side cap, header "Tick rules v1") AND,
 // reinterpreted as "which neighbor's flow lands on me", as a target cell's
@@ -97,15 +114,74 @@ BrickKey neighborOf(const BrickKey& key, int lx, int ly, int lz, int dx, int dy,
 // previous rounds' results, much closer to true Gauss-Seidel, while still
 // being (within each of the 8 rounds) 100% parallel and independent of
 // active-set/touched-set iteration order exactly like the 2-color version.
-int colorOf(int64_t vx, int64_t vy, int64_t vz) {
+constexpr int colorOf(int64_t vx, int64_t vy, int64_t vz) {
     return static_cast<int>((vx & 1) | ((vy & 1) << 1) | ((vz & 1) << 2));
 }
 
+// One cell of a color's 4x4x4 stride-2 sublattice within an 8^3 brick, as
+// brick-local coordinates (0..7 each).
+struct ColorCell {
+    uint8_t x, y, z;
+};
+
+// kColorCells[c]: the 64 brick-local cells whose colorOf() == c (every one
+// of the 8 colors partitions the 512-cell brick into exactly 64 cells since
+// kEdge==8 is even on every axis). A LOCAL (x,y,z) alone already determines
+// a cell's color regardless of which brick it's in: colorOf only looks at
+// the low bit of each axis, and a brick's global origin (key.x*kEdge etc.)
+// is always a multiple of kEdge==8, hence always even, so it never flips
+// that low bit -- brick-local parity IS global parity here. Built once, at
+// COMPILE time (stronger than the "static const, computed once" ask -- zero
+// runtime cost at all), by literally running colorOf() over the same
+// (z,y,x) full 512-cell sweep order the per-round READ/GATHER/FINALIZE
+// loops used to run before this optimization, and bucketing each cell into
+// its color's list -- so each list's internal order exactly matches the
+// order that color's cells used to appear in when the old code scanned all
+// 512 and skipped 7/8 of them, and the derivation can never drift out of
+// sync with colorOf's own bit layout (the single documented source of
+// truth for coloring -- see colorOf's comment reference in waterca.h "Tick
+// rules v1").
+//
+// This is the fix for the "8 full brick scans/tick, ~1/8 productive" perf
+// note (docs/status.md W2 perf note, waterca.h header): every per-round,
+// color-partitioned sweep below now enumerates exactly the cells that
+// round can possibly touch instead of visiting all 512 and discarding 7/8
+// (READ: kColorCells[roundColor], 64 cells; GATHER: the 3 colors that can
+// receive nonzero inflow from a `roundColor` source, kColorCells[roundColor
+// ^ 1/2/4], 192 cells; FINALIZE: the union of GATHER's 3 plus roundColor
+// itself for outflow, 256 cells) -- an output-preserving loop restructuring
+// only: every cell any of these loops used to actually touch (i.e. every
+// iteration that didn't immediately `continue` on a color mismatch) is
+// still visited, in the same relative order, doing the exact same
+// computation; cells that would have been skipped are now simply never
+// visited, since their arrays are already known-zero (resetForRound()'s
+// memset / the caller's inflow.fill(0) / a delta that's structurally
+// always 0 for that cell this round -- see gatherInflowForBrick's and the
+// FINALIZE loop's comments for the per-phase color-group derivation).
+constexpr std::array<std::array<ColorCell, 64>, 8> buildColorCells() {
+    std::array<std::array<ColorCell, 64>, 8> out{};
+    std::array<int, 8> idx{};
+    for (int z = 0; z < kEdge; ++z)
+        for (int y = 0; y < kEdge; ++y)
+            for (int x = 0; x < kEdge; ++x) {
+                const int c = colorOf(x, y, z);
+                const size_t sc = static_cast<size_t>(c);
+                out[sc][static_cast<size_t>(idx[sc])] =
+                    ColorCell{static_cast<uint8_t>(x), static_cast<uint8_t>(y), static_cast<uint8_t>(z)};
+                ++idx[sc];
+            }
+    return out;
+}
+constexpr std::array<std::array<ColorCell, 64>, 8> kColorCells = buildColorCells();
+
 // Phase READ for one active brick: fills `scratch.desired` from the CURRENT
 // map state (tick-start for round 0; round-0-updated for round 1 -- see
-// colorOf/stepWithOrder) for cells matching `colorFilter` only. Cells of the
-// other color, and cells with fill==0, leave their slots at the
-// zero-initialized default (no outflow this round).
+// colorOf/stepWithOrder) for cells of color `colorFilter` ONLY -- enumerated
+// directly via kColorCells[colorFilter] (64 cells), not by scanning all 512
+// and skipping 7/8 (see kColorCells's comment). Cells of the other 7
+// colors, and cells with fill==0, leave their slots at the zero-initialized
+// default (no outflow this round) exactly as before -- this is a loop
+// restructuring, not a behavior change.
 //
 // The 5 possible neighbor bricks (below, +x, -x, +y, -y) are looked up ONCE
 // here, before the per-cell loop, and reused for every one of this brick's
@@ -114,8 +190,20 @@ int colorOf(int64_t vx, int64_t vy, int64_t vz) {
 // which is the actual fix for the v0 per-cell-hashmap cost (measured:
 // looking these up per-cell instead, even after fixing the earlier
 // allocation-churn issue, was still the dominant remaining cost).
-void computeDesiredForBrick(const BrickKey& key, const WaterMap& water, const WaterCA::SolidFn& solid,
-                            int colorFilter, FlowScratch& scratch) {
+//
+// `solid` is templated (not WaterCA::SolidFn directly) so callers can pass
+// stepWithOrder's per-tick memoizing `cachedSolid` wrapper instead of the
+// raw callback -- see stepWithOrder's `solidCache` comment for why: a
+// REAL terrain-backed SolidFn (bilinear elevation + several octaves of
+// value noise per call, no memoization of its own) measured at ~1us/call
+// is the dominant cost of this whole engine at pour scale, dwarfing every
+// per-cell-enumeration saving above; `solid` here is called the same
+// number of times, with the same arguments, producing the same results,
+// as the raw `solid_` would -- the template only changes WHICH callable
+// answers each call, never what gets asked or what comes back.
+template <typename SolidLookup>
+void computeDesiredForBrick(const BrickKey& key, const WaterMap& water, SolidLookup&& solid, int colorFilter,
+                            FlowScratch& scratch) {
     const WaterBrick8* self = water.find(key);
     if (!self) return; // drained-to-empty active brick: nothing left to send
 
@@ -127,61 +215,59 @@ void computeDesiredForBrick(const BrickKey& key, const WaterMap& water, const Wa
     // Indexed by dir (0=+x,1=-x,2=+y,3=-y), matching kLateralDx/Dy order.
     const WaterBrick8* const lateralBrick[4] = {pxBrick, nxBrick, pyBrick, nyBrick};
 
-    for (int z = 0; z < kEdge; ++z)
-        for (int y = 0; y < kEdge; ++y)
-            for (int x = 0; x < kEdge; ++x) {
-                const uint8_t fill = self->get(x, y, z);
-                if (fill == 0) continue;
-                const int64_t vx = int64_t(key.x) * kEdge + x;
-                const int64_t vy = int64_t(key.y) * kEdge + y;
-                const int64_t vz = int64_t(key.z) * kEdge + z;
-                if (colorOf(vx, vy, vz) != colorFilter) continue; // other color's round
-                const int ci = WaterBrick8::cellIndex(x, y, z);
+    for (const ColorCell& cc : kColorCells[static_cast<size_t>(colorFilter)]) {
+        const int x = cc.x, y = cc.y, z = cc.z;
+        const uint8_t fill = self->get(x, y, z);
+        if (fill == 0) continue;
+        const int64_t vx = int64_t(key.x) * kEdge + x;
+        const int64_t vy = int64_t(key.y) * kEdge + y;
+        const int64_t vz = int64_t(key.z) * kEdge + z;
+        const int ci = WaterBrick8::cellIndex(x, y, z);
 
-                int remaining = fill; // source-side cap: own tick-start fill
+        int remaining = fill; // source-side cap: own tick-start fill
 
-                // Slot 0: GRAVITY (below = z-1).
-                const bool belowSolid = solid(vx, vy, vz - 1) != MAT_AIR;
-                uint8_t belowFill = 0;
-                if (!belowSolid) {
-                    const WaterBrick8* b = (z > 0) ? self : belowBrick;
-                    belowFill = b ? b->get(x, y, z > 0 ? z - 1 : kEdge - 1) : 0;
-                }
-                int gFlow = 0;
-                if (!belowSolid) {
-                    gFlow = std::min<int>(fill, 255 - belowFill);
-                    gFlow = std::min(gFlow, remaining);
-                }
-                remaining -= gFlow;
-                scratch.desired[static_cast<size_t>(ci * kSlots + SLOT_GRAVITY)] = static_cast<int16_t>(gFlow);
+        // Slot 0: GRAVITY (below = z-1).
+        const bool belowSolid = solid(vx, vy, vz - 1) != MAT_AIR;
+        uint8_t belowFill = 0;
+        if (!belowSolid) {
+            const WaterBrick8* b = (z > 0) ? self : belowBrick;
+            belowFill = b ? b->get(x, y, z > 0 ? z - 1 : kEdge - 1) : 0;
+        }
+        int gFlow = 0;
+        if (!belowSolid) {
+            gFlow = std::min<int>(fill, 255 - belowFill);
+            gFlow = std::min(gFlow, remaining);
+        }
+        remaining -= gFlow;
+        scratch.desired[static_cast<size_t>(ci * kSlots + SLOT_GRAVITY)] = static_cast<int16_t>(gFlow);
 
-                const bool supported = belowSolid || belowFill >= 255;
+        const bool supported = belowSolid || belowFill >= 255;
 
-                // Slots 1..4: LATERAL, fixed +x,-x,+y,-y order.
-                for (int dir = 0; dir < 4; ++dir) {
-                    int flow = 0;
-                    if (supported && remaining > 0) {
-                        const int64_t nvx = vx + kLateralDx[dir];
-                        const int64_t nvy = vy + kLateralDy[dir];
-                        if (solid(nvx, nvy, vz) == MAT_AIR) {
-                            int nlx, nly, nlz;
-                            const bool sameBrick =
-                                neighborOf(key, x, y, z, kLateralDx[dir], kLateralDy[dir], 0, nlx, nly, nlz) == key;
-                            const WaterBrick8* nBrick = sameBrick ? self : lateralBrick[dir];
-                            const uint8_t nf = nBrick ? nBrick->get(nlx, nly, nlz) : 0;
-                            if (fill > nf) {
-                                const int diff = int(fill) - int(nf);
-                                int f = diff / 2;
-                                f = std::min(f, int(fill));
-                                f = std::min(f, 255 - int(nf));
-                                if (f > 0) flow = std::min(f, remaining);
-                            }
-                        }
+        // Slots 1..4: LATERAL, fixed +x,-x,+y,-y order.
+        for (int dir = 0; dir < 4; ++dir) {
+            int flow = 0;
+            if (supported && remaining > 0) {
+                const int64_t nvx = vx + kLateralDx[dir];
+                const int64_t nvy = vy + kLateralDy[dir];
+                if (solid(nvx, nvy, vz) == MAT_AIR) {
+                    int nlx, nly, nlz;
+                    const bool sameBrick =
+                        neighborOf(key, x, y, z, kLateralDx[dir], kLateralDy[dir], 0, nlx, nly, nlz) == key;
+                    const WaterBrick8* nBrick = sameBrick ? self : lateralBrick[dir];
+                    const uint8_t nf = nBrick ? nBrick->get(nlx, nly, nlz) : 0;
+                    if (fill > nf) {
+                        const int diff = int(fill) - int(nf);
+                        int f = diff / 2;
+                        f = std::min(f, int(fill));
+                        f = std::min(f, 255 - int(nf));
+                        if (f > 0) flow = std::min(f, remaining);
                     }
-                    remaining -= flow;
-                    scratch.desired[static_cast<size_t>(ci * kSlots + (SLOT_PX + dir))] = static_cast<int16_t>(flow);
                 }
             }
+            remaining -= flow;
+            scratch.desired[static_cast<size_t>(ci * kSlots + (SLOT_PX + dir))] = static_cast<int16_t>(flow);
+        }
+    }
 }
 
 // One inbound source reference for the GATHER step: at a target cell, the
@@ -199,53 +285,104 @@ constexpr InboundSource kInbound[kSlots] = {
 };
 
 // Phase APPLY / GATHER for one touched brick: computes its per-cell inbound
-// total (into `outInflow`, size kCells, pre-zeroed by the caller) and writes
-// each admitted amount back into the sourcing active brick's
-// scratch.accepted (via `scratchOf`). Reads `water` only for this brick's
-// own tick-start fill (to size the per-cell budget) -- every inbound
-// candidate's magnitude comes from `scratch.desired`, already computed by
-// Phase READ, never from `water` again.
+// total (into `outInflow`, size kCells, ALREADY pre-zeroed by the caller --
+// load-bearing now, see below) and writes each admitted amount back into
+// the sourcing active brick's scratch.accepted (via `selfScratch`/
+// `inboundScratch`). Reads `water` only for this brick's own tick-start
+// fill (to size the per-cell budget) -- every inbound candidate's
+// magnitude comes from `scratch.desired`, already computed by Phase READ,
+// never from `water` again.
 //
-// Like computeDesiredForBrick, the (up to) 5 neighbor scratch pointers are
-// resolved ONCE here, before the per-cell loop, not per cell -- this is the
-// other half of the O(bricks)-not-O(cells) hashmap-lookup fix.
-template <typename ScratchLookup>
-void gatherInflowForBrick(const BrickKey& key, const WaterMap& water, ScratchLookup&& scratchOf,
+// `selfScratch`/`inboundScratch` (this brick's own scratch, and its up-to-5
+// inbound-direction neighbors' scratch, indexed exactly like kInbound) are
+// caller-precomputed, NOT resolved here via a scratchOf(key) hashmap call
+// per neighbor per round -- see stepWithOrder's `touchedCache` comment for
+// why: unlike `water` (whose brick-level contents genuinely change
+// round-to-round, so `water.find(key)` below still has to be a fresh
+// per-round lookup), the SET of bricks that have scratch storage at all is
+// exactly `order`'s contents, fixed for the entire tick before round 0
+// ever runs -- so which of these 6 pointers is non-null, and what object
+// each points at, is round-INVARIANT and only needs computing once per
+// tick, reused across all 8 rounds, exactly like scratchMap/inflowMap
+// themselves already are.
+//
+// `color` is round c's source color (the same value computeDesiredForBrick
+// was just called with). This function only ever reads from a source
+// cell's `desired` slot, and Phase READ only populates `desired` for cells
+// of color `color` (kColorCells[color]) -- every other cell's `desired` is
+// structurally all-zero this round. So a TARGET cell can only possibly
+// receive nonzero inflow if it is exactly one axis-step away from SOME
+// color-`color` cell, i.e. its own color is `color` with exactly one of
+// the bits 1(x)/2(y)/4(z) flipped -- `color^1` (from a PX/NX-slot source,
+// kInbound indices 1,2), `color^2` (PY/NY, indices 3,4), or `color^4`
+// (GRAVITY, index 0). Those 3 colors are always pairwise distinct from
+// each other and from `color` itself (XOR with distinct nonzero masks off
+// the same base never collides), so enumerating their 3*64=192 cells (via
+// kColorCells) instead of all 512 visits every cell that could possibly
+// get nonzero inflow, and only those -- cells outside this union are left
+// at the caller's pre-zeroed 0, which is exactly what this function would
+// have computed for them anyway (every one of their 5 candidate sources
+// would have hit `desired<=0` immediately). Output-preserving loop
+// restructuring only.
+//
+// One more restriction of the exact same kind, one level deeper: for a
+// GIVEN target color group, only the kInbound entries on THAT group's own
+// axis can ever be nonzero -- the z-flip group (color^4) only ever has
+// GRAVITY (kInbound[0]) to check; the x-flip group (color^1) only PX/NX
+// (kInbound[1],[2]); the y-flip group (color^2) only PY/NY
+// (kInbound[3],[4]). (Reason: a source cell's color is `color` --this
+// round's only nonzero-`desired` color-- so kInbound[i]'s implied source,
+// `color-group ^ (i's own axis bit)`, only equals `color` when i's axis
+// matches the group's flipped axis; any other i would imply a source
+// color that's never `color`, so its `desired` is structurally 0 and the
+// check would always fall through the `desired<=0` continue below.)
+// Checking only the applicable 1-2 slots instead of all 5 per cell is
+// therefore output-preserving for the identical reason kColorCells itself
+// is: every skipped check would have found nothing.
+constexpr int kZFlipSlots[] = {0};
+constexpr int kXFlipSlots[] = {1, 2};
+constexpr int kYFlipSlots[] = {3, 4};
+
+void gatherInflowForBrick(const BrickKey& key, const WaterMap& water, int color, FlowScratch* selfScratch,
+                          const std::array<FlowScratch*, kSlots>& inboundScratch,
                           std::array<int32_t, kCells>& outInflow) {
     const WaterBrick8* self = water.find(key);
-    FlowScratch* selfScratch = scratchOf(key);
-    // Indexed exactly like kInbound (0=gravity/above, 1=west, 2=east,
-    // 3=south, 4=north).
-    FlowScratch* const inboundScratch[kSlots] = {
-        scratchOf(BrickKey{key.x, key.y, key.z + 1}), scratchOf(BrickKey{key.x - 1, key.y, key.z}),
-        scratchOf(BrickKey{key.x + 1, key.y, key.z}), scratchOf(BrickKey{key.x, key.y - 1, key.z}),
-        scratchOf(BrickKey{key.x, key.y + 1, key.z}),
+
+    struct TargetGroup {
+        int color;
+        const int* slots;
+        int slotCount;
     };
+    const TargetGroup groups[3] = {
+        {color ^ 4, kZFlipSlots, 1},
+        {color ^ 1, kXFlipSlots, 2},
+        {color ^ 2, kYFlipSlots, 2},
+    };
+    for (const TargetGroup& g : groups)
+        for (const ColorCell& cc : kColorCells[static_cast<size_t>(g.color)]) {
+            const int x = cc.x, y = cc.y, z = cc.z;
+            const int ci = WaterBrick8::cellIndex(x, y, z);
+            const uint8_t fillStart = self ? self->get(x, y, z) : 0;
+            int budget = 255 - int(fillStart);
+            int32_t inflow = 0;
 
-    for (int z = 0; z < kEdge; ++z)
-        for (int y = 0; y < kEdge; ++y)
-            for (int x = 0; x < kEdge; ++x) {
-                const int ci = WaterBrick8::cellIndex(x, y, z);
-                const uint8_t fillStart = self ? self->get(x, y, z) : 0;
-                int budget = 255 - int(fillStart);
-                int32_t inflow = 0;
-
-                for (int i = 0; i < kSlots; ++i) {
-                    const InboundSource& s = kInbound[i];
-                    int slx, sly, slz;
-                    const bool sameBrick = neighborOf(key, x, y, z, s.dx, s.dy, s.dz, slx, sly, slz) == key;
-                    FlowScratch* srcScratch = sameBrick ? selfScratch : inboundScratch[i];
-                    if (!srcScratch) continue; // that potential source wasn't active this tick: 0
-                    const int sci = WaterBrick8::cellIndex(slx, sly, slz);
-                    const int desired = srcScratch->desired[static_cast<size_t>(sci * kSlots + s.slot)];
-                    if (desired <= 0) continue;
-                    const int accepted = std::min(desired, budget);
-                    budget -= accepted;
-                    inflow += accepted;
-                    srcScratch->accepted[static_cast<size_t>(sci * kSlots + s.slot)] = static_cast<int16_t>(accepted);
-                }
-                outInflow[static_cast<size_t>(ci)] = inflow;
+            for (int gi = 0; gi < g.slotCount; ++gi) {
+                const int i = g.slots[gi];
+                const InboundSource& s = kInbound[i];
+                int slx, sly, slz;
+                const bool sameBrick = neighborOf(key, x, y, z, s.dx, s.dy, s.dz, slx, sly, slz) == key;
+                FlowScratch* srcScratch = sameBrick ? selfScratch : inboundScratch[static_cast<size_t>(i)];
+                if (!srcScratch) continue; // that potential source wasn't active this tick: 0
+                const int sci = WaterBrick8::cellIndex(slx, sly, slz);
+                const int desired = srcScratch->desired[static_cast<size_t>(sci * kSlots + s.slot)];
+                if (desired <= 0) continue;
+                const int accepted = std::min(desired, budget);
+                budget -= accepted;
+                inflow += accepted;
+                srcScratch->accepted[static_cast<size_t>(sci * kSlots + s.slot)] = static_cast<int16_t>(accepted);
             }
+            outInflow[static_cast<size_t>(ci)] = inflow;
+        }
 }
 
 } // namespace
@@ -396,6 +533,85 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
     inflowMap.reserve(touched.size() * 2);
     for (const BrickKey& t : touched) inflowMap[t];
 
+    // Per-touched-brick GATHER/FINALIZE pointer cache, resolved ONCE per
+    // tick and reused by all 8 rounds below -- the other half of "stop
+    // re-resolving round-INVARIANT lookups every round" (see solidCache
+    // just below for the round-VARYING case this does NOT apply to).
+    // `selfScratch`/`inboundScratch` answer "does brick K have scratch
+    // storage" (K in `order`?) and "which FlowScratch object is it" --
+    // both fixed by `order`'s CONTENTS, decided before round 0 ever runs
+    // and never touched again (scratchMap's key set never changes, only
+    // its values reset per round via resetForRound()). `inflow` is a
+    // stable pointer into inflowMap's own storage for the same reason
+    // (inflowMap's key set is exactly `touched`, likewise fixed for the
+    // whole tick). Previously gatherInflowForBrick/the FINALIZE loop
+    // re-ran up to 6 scratchMap hashmap lookups (self + 5 neighbors) AND
+    // an inflowMap lookup for EVERY touched brick, EVERY round (8x
+    // redundant, since none of these answers can differ round to round) --
+    // profiling this pass found that redundant hashing/probing, not the
+    // per-cell math, was GATHER's dominant remaining cost after the
+    // color-enumeration fix above. `water.find(key)` inside
+    // gatherInflowForBrick is deliberately NOT cached here: unlike scratch
+    // storage, which bricks exist in `water_` and what they currently
+    // contain genuinely changes round-to-round (a previous round's
+    // FINALIZE can create or homogeneous-empty-collapse a brick), so that
+    // lookup must stay live every round.
+    struct TouchedBrickCache {
+        BrickKey key;
+        FlowScratch* selfScratch;
+        std::array<FlowScratch*, kSlots> inboundScratch; // indexed like kInbound
+        std::array<int32_t, kCells>* inflow;
+    };
+    std::vector<TouchedBrickCache> touchedCache;
+    touchedCache.reserve(touched.size());
+    for (const BrickKey& t : touched) {
+        TouchedBrickCache tc;
+        tc.key = t;
+        tc.selfScratch = scratchOf(t);
+        tc.inboundScratch = {
+            scratchOf(BrickKey{t.x, t.y, t.z + 1}), scratchOf(BrickKey{t.x - 1, t.y, t.z}),
+            scratchOf(BrickKey{t.x + 1, t.y, t.z}), scratchOf(BrickKey{t.x, t.y - 1, t.z}),
+            scratchOf(BrickKey{t.x, t.y + 1, t.z}),
+        };
+        tc.inflow = &inflowMap.at(t);
+        touchedCache.push_back(tc);
+    }
+
+    // Per-tick memoization of solid_: solid_ is a PURE function of
+    // (vx,vy,vz) that never changes within one stepWithOrder() call
+    // (terrain isn't touched by water flow, and every existing WaterCA
+    // contract -- determinism, order-independence -- already requires
+    // callers' SolidFn be a deterministic, side-effect-free query, so
+    // reusing an answer instead of re-asking changes nothing observable).
+    // Measured (profiling this pass): a REAL terrain-backed SolidFn (the
+    // Amplifier's bilinear-elevation + multi-octave-noise column query,
+    // recomputed from scratch every call with no memoization of its own)
+    // costs on the order of 1us/call and is the dominant cost of the
+    // whole engine at pour scale -- not the per-cell enumeration this
+    // pass otherwise optimizes. And solid_ queries DO legitimately repeat
+    // the same voxel within a tick: up to 5 different active neighbors of
+    // one solid/air cell can each independently ask "is THIS voxel solid"
+    // as part of their own gravity/lateral check (the cell above asking
+    // via gravity, and up to 4 lateral neighbors each asking via their
+    // own lateral check) -- a real, structural source of duplicate
+    // queries this cache collapses to one real call. Scoped to exactly
+    // ONE stepWithOrder() call (built fresh here, discarded at return,
+    // same lifetime as scratchMap/inflowMap above) -- never carried
+    // across ticks, so a caller whose SolidFn reflects live-edited
+    // terrain (digging mid-game) is unaffected: the cache can only ever
+    // go stale WITHIN a tick, and solid_ is already required not to
+    // change within one.
+    std::unordered_map<VoxelKey, MaterialId, VoxelKeyHash> solidCache;
+    solidCache.reserve(order.size() * 16);
+    auto cachedSolid = [this, &solidCache](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
+        const VoxelKey k{vx, vy, vz};
+        const auto it = solidCache.find(k);
+        if (it != solidCache.end()) return it->second;
+        const MaterialId m = solid_(vx, vy, vz);
+        solidCache.emplace(k, m);
+        return m;
+    };
+
     // Eight colored rounds per tick (see colorOf): round c moves color-c
     // cells' outflow using data AS UPDATED BY EVERY EARLIER ROUND this tick
     // (round 0 uses true tick-start data; rounds 1-7 read straight from
@@ -412,17 +628,16 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
         // Phase READ: reset then refill every active brick's scratch (O(1)
         // lookup by key regardless of iteration order -- no allocation).
         for (const BrickKey& k : order) scratchMap[k].resetForRound();
-        for (const BrickKey& k : order) computeDesiredForBrick(k, water_, solid_, color, scratchMap[k]);
+        for (const BrickKey& k : order) computeDesiredForBrick(k, water_, cachedSolid, color, scratchMap[k]);
 
         // Phase APPLY / GATHER: visit every touched brick exactly once.
         // Order over `touched` (a sorted std::set) never affects the
         // outcome -- each (source cell, slot) is written by exactly one
         // touched brick, a structural bijection (see header), so there is
         // no write race.
-        for (const BrickKey& t : touched) {
-            std::array<int32_t, kCells>& inflow = inflowMap[t];
-            inflow.fill(0);
-            gatherInflowForBrick(t, water_, scratchOf, inflow);
+        for (const TouchedBrickCache& tc : touchedCache) {
+            tc.inflow->fill(0);
+            gatherInflowForBrick(tc.key, water_, color, tc.selfScratch, tc.inboundScratch, *tc.inflow);
         }
 
         // Phase APPLY / FINALIZE: every active brick's `accepted` is now
@@ -433,25 +648,38 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
         // centralized in setFillAccounted). Committing here (inside the
         // color loop) is exactly what lets the next round see this one's
         // results.
-        for (const BrickKey& t : touched) {
-            const std::array<int32_t, kCells>& inflow = inflowMap.at(t);
-            const FlowScratch* scratch = scratchOf(t);
-            for (int z = 0; z < kEdge; ++z)
-                for (int y = 0; y < kEdge; ++y)
-                    for (int x = 0; x < kEdge; ++x) {
-                        const int ci = WaterBrick8::cellIndex(x, y, z);
-                        int outflow = 0;
-                        if (scratch)
-                            for (int s = 0; s < kSlots; ++s) outflow += scratch->accepted[static_cast<size_t>(ci * kSlots + s)];
-                        const int32_t delta = inflow[static_cast<size_t>(ci)] - outflow;
-                        if (delta == 0) continue;
-                        const int64_t vx = int64_t(t.x) * kEdge + x;
-                        const int64_t vy = int64_t(t.y) * kEdge + y;
-                        const int64_t vz = int64_t(t.z) * kEdge + z;
-                        const uint8_t fillStart = getFill(vx, vy, vz);
-                        const int newFill = int(fillStart) + delta;
-                        setFillAccounted(vx, vy, vz, static_cast<uint8_t>(newFill), nullptr);
-                    }
+        //
+        // Only 4 of the 8 colors can possibly have a nonzero delta this
+        // round: `color` itself (outflow only -- `scratch->accepted` is
+        // only ever written at a color-`color` source cell, per
+        // computeDesiredForBrick/gatherInflowForBrick above) and
+        // `color^1`/`color^2`/`color^4` (inflow only -- see
+        // gatherInflowForBrick's comment; those 3 are exactly the colors
+        // `outInflow` can be nonzero at). No cell is ever in both groups
+        // (color != color^{1,2,4} always), so there's no double-visit risk
+        // and every cell outside this 4-color union is skipped exactly
+        // where it would have hit `delta == 0` and `continue`d anyway.
+        const int finalizeColors[4] = {color, color ^ 1, color ^ 2, color ^ 4};
+        for (const TouchedBrickCache& tc : touchedCache) {
+            const std::array<int32_t, kCells>& inflow = *tc.inflow;
+            const FlowScratch* scratch = tc.selfScratch;
+            const BrickKey& t = tc.key;
+            for (int fc : finalizeColors)
+                for (const ColorCell& cc : kColorCells[static_cast<size_t>(fc)]) {
+                    const int x = cc.x, y = cc.y, z = cc.z;
+                    const int ci = WaterBrick8::cellIndex(x, y, z);
+                    int outflow = 0;
+                    if (scratch)
+                        for (int s = 0; s < kSlots; ++s) outflow += scratch->accepted[static_cast<size_t>(ci * kSlots + s)];
+                    const int32_t delta = inflow[static_cast<size_t>(ci)] - outflow;
+                    if (delta == 0) continue;
+                    const int64_t vx = int64_t(t.x) * kEdge + x;
+                    const int64_t vy = int64_t(t.y) * kEdge + y;
+                    const int64_t vz = int64_t(t.z) * kEdge + z;
+                    const uint8_t fillStart = getFill(vx, vy, vz);
+                    const int newFill = int(fillStart) + delta;
+                    setFillAccounted(vx, vy, vz, static_cast<uint8_t>(newFill), nullptr);
+                }
         }
     }
 
