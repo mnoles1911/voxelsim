@@ -161,4 +161,33 @@ private:
 	bool bTier1RegionGraphTestActive = false;
 	double Tier1RegionGraphTestColumnXUU = 0.0;
 	double Tier1RegionGraphTestColumnYUU = 0.0;
+
+	// Underground streaming proof (docs/status.md "Underground streaming
+	// (vertical footprint)"): -VoxelUndergroundTest[=<delaySeconds>] carves a
+	// vertical shaft from the spawn column down to UndergroundTestDepthUU, a
+	// short horizontal tunnel off its foot, and a chamber at the tunnel's end,
+	// then parks the pawn underground -- the shot that was impossible before,
+	// because the streaming footprint only meshed a band around the SURFACE.
+	// Combine with -VoxelScreenshotAfter=<a larger value> to capture it, and
+	// -VoxelUndergroundView=shaft to frame the shaft/tunnel instead of the
+	// chamber. Same one-shot-timer + column-cache shape as the tree/structure
+	// fixtures above.
+	FTimerHandle UndergroundTestTimerHandle;
+	bool bUndergroundTestActive = false;
+	double UndergroundTestColumnXUU = 0.0;
+	double UndergroundTestColumnYUU = 0.0;
+	double UndergroundTestSurfaceUU = 0.0;
+	// Depth of the chamber floor below the surface. 24m is chosen to sit BELOW
+	// the unconditional depth skirt (~19.2m of level-0 chunks), so this fixture
+	// exercises the anchor-relative deep box and not just the skirt.
+	double UndergroundTestDepthUU = 2400.0;
+	// Where the pawn is parked for the capture, and which way it looks. Two
+	// framings, selected by -VoxelUndergroundView: "chamber" (default) stands
+	// in the chamber looking back up the tunnel -- rock on every side; "shaft"
+	// stands at the shaft foot looking along the tunnel, so the shot shows a
+	// dug passage with walls and a floor. Both read UndergroundTestSurfaceUU,
+	// so they are only valid after the carve timer has run.
+	FVector UndergroundTestCameraLocation() const;
+	FRotator UndergroundTestCameraRotation() const;
+	bool IsUndergroundShaftView() const;
 };

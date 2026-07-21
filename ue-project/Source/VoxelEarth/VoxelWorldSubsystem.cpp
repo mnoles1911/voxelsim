@@ -912,6 +912,18 @@ struct FChunkRecord
 	float RemeshedAtSeconds = -1000.f; // set on a genuine re-mesh (Component already existed, overlay-aware path)
 	bool bHasOverlayBricks = false;    // this exact chunk (no border) currently owns >=1 edited brick
 	int32 LastQuadCount = 0;           // for FVoxelWorldImpl::ResidentQuads bookkeeping on replace/unload
+
+	// Underground streaming (docs/status.md "Underground streaming (vertical
+	// footprint)"): true iff this chunk entered the desired set ONLY because
+	// the anchor was underground and this chunk fell inside the anchor-relative
+	// deep box -- i.e. it sits strictly below its footprint's surface band +
+	// depth skirt. Those two are pure functions of the footprint, so the
+	// existing XY-only hysteresis-exit scan evicts them correctly; the deep box
+	// is a function of the anchor's Z as well, so chunks it (and only it) added
+	// need the extra vertical keep-test in RecomputeDesiredSet's exit pass.
+	// Chunks in the surface band or the skirt are NEVER flagged, so they keep
+	// exactly their pre-change lifetime.
+	bool bDeepAnchorRelative = false;
 };
 
 struct FJobResult
@@ -1257,6 +1269,17 @@ struct FVoxelWorldImpl
 	bool bHasRecomputed = false;
 	VoxelCoords::FVoxelChunkKey LastAnchorChunk{}; // level 0 anchor chunk; gates the whole RecomputeDesiredSet call
 	FVector LastAnchorLocation = FVector::ZeroVector;
+
+	// Underground streaming (see namespace VoxelUnderground): whether the
+	// anchor is currently below the terrain surface, with enter/exit
+	// hysteresis. Recomputed once per TickStreaming (one amplifier column
+	// sample), NOT per footprint. While true, the anchor's chunk Z is part of
+	// what gates a recompute -- otherwise digging straight down would never
+	// trigger one, since the existing gate is XY-only.
+	bool bAnchorUnderground = false;
+	// Returns the underground state for this anchor, applying hysteresis
+	// against the current bAnchorUnderground value.
+	bool EvaluateAnchorUnderground(const FVector& Anchor) const;
 
 	// Per-level entry-scan gating (docs/m2-plan.md "Perf budget" row: "Ring
 	// levels ... are ~constant cost by construction"): re-running the O(candidates)
@@ -1639,8 +1662,22 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// chunks (XY footprints) within 64m") is cheap per-candidate but touches
 	// ~1300+ candidate footprints at a 64m/3.2m ratio, so gating it behind
 	// anchor movement is what keeps this off the hot per-frame path.
+	//
+	// Underground streaming (see namespace VoxelUnderground) adds two more
+	// triggers to that XY-crossing test, both cheap and both necessary: the
+	// anchor crossing into a new chunk in Z WHILE UNDERGROUND (otherwise
+	// digging or falling straight down never recomputes at all -- the deep box
+	// would stay pinned where the player entered the ground), and the
+	// underground flag itself flipping (which is what makes surfacing evict the
+	// deep box, and entering the ground build it). Above ground the Z of the
+	// anchor still does not matter, so flying keeps exactly its M1 recompute
+	// cadence.
 	const FVoxelChunkKey AnchorChunk = ChunkKeyForVoxel(WorldToVoxel(Anchor));
-	if (!bHasRecomputed || AnchorChunk.X != LastAnchorChunk.X || AnchorChunk.Y != LastAnchorChunk.Y)
+	const bool bUndergroundNow = EvaluateAnchorUnderground(Anchor);
+	const bool bUndergroundChanged = bUndergroundNow != bAnchorUnderground;
+	bAnchorUnderground = bUndergroundNow;
+	if (!bHasRecomputed || AnchorChunk.X != LastAnchorChunk.X || AnchorChunk.Y != LastAnchorChunk.Y ||
+	    bUndergroundChanged || (bAnchorUnderground && AnchorChunk.Z != LastAnchorChunk.Z))
 	{
 		RecomputeDesiredSet(Anchor);
 		LastAnchorChunk = AnchorChunk;
@@ -1818,11 +1855,30 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 
 	// docs/debug-tooling-plan.md P1 "Log split": periodic counter line moved
 	// off LogVoxelEarth (module/general) onto LogVoxelPerf.
+	// Underground streaming: how many tracked chunks exist only because of the
+	// anchor-relative deep box, and how many of those actually produced visible
+	// geometry. A full solid interior chunk meshes to ZERO quads and therefore
+	// holds no component and no GPU memory (see ApplyMeshResult's Quads.Num()==0
+	// branch), so this pair is what tells us whether depth is costing RAM or
+	// merely bookkeeping + worker throughput. An O(tracked) scan at the periodic
+	// 5s log cadence only; never per-frame.
+	int32 DeepTracked = 0;
+	int32 DeepWithGeometry = 0;
+	for (const auto& Pair : ChunkRecords)
+	{
+		if (Pair.Value.bDeepAnchorRelative)
+		{
+			++DeepTracked;
+			DeepWithGeometry += (Pair.Value.LastQuadCount > 0) ? 1 : 0;
+		}
+	}
+
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel streaming: loaded=%lld unloaded=%lld quads=%lld tracked=%d jobsInFlight=%d pendingJobs=%d ")
-	       TEXT("pendingGameThread=%d pendingUnload=%d"),
+	       TEXT("pendingGameThread=%d pendingUnload=%d underground=%d deepTracked=%d deepWithGeometry=%d residentQuads=%lld"),
 	       (long long)TotalChunksLoaded, (long long)TotalChunksUnloaded, (long long)TotalQuadsLoaded, ChunkRecords.Num(),
-	       JobsInFlightCounter.GetValue(), PendingJobKeys.Num(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num());
+	       JobsInFlightCounter.GetValue(), PendingJobKeys.Num(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num(),
+	       bAnchorUnderground ? 1 : 0, DeepTracked, DeepWithGeometry, (long long)ResidentQuads);
 
 	// M2 item 1: "Per-level loaded/pending counters into the perf snapshot/
 	// HUD" -- also into this periodic log line, so a headless run's log file
@@ -1908,6 +1964,150 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	}
 }
 
+// --- underground streaming policy --------------------------------------------
+//
+// docs/status.md "Underground streaming (vertical footprint)". Before this,
+// ComputeFootprintChunkZRange below was the ONLY thing deciding vertical
+// extent, and it is keyed purely on the terrain SURFACE at (Level, X, Y): a
+// level-0 chunk is 3.2m tall and it returns surfaceChunkZ-1, so the world was
+// meshed only 3.2-6.4m deep everywhere. A camera 9m down rendered open sky.
+//
+// Two additions, both applied OUTSIDE the FootprintZRangeCache memo so that
+// memo keeps its correctness argument intact (it caches a pure function of
+// (Level, X, Y) and the amplifier; nothing anchor-dependent may go inside it):
+//
+//  1. DEPTH SKIRT -- unconditional, anchor-Z-independent. Extra chunks of
+//     meshed rock below the surface band, shrinking with horizontal distance,
+//     so a shaft dug from the surface has walls and a floor instead of opening
+//     into nothing. Because it is a pure function of the footprint, skirt
+//     chunks need no new eviction rule: they leave with their footprint.
+//
+//  2. ANCHOR-RELATIVE DEEP BOX -- only while the anchor is underground. A
+//     vertical band centred on the anchor's own chunk Z, again shrinking with
+//     horizontal distance, so being underground streams chunks around you in
+//     all directions rather than a surface-relative crust far overhead.
+//
+// Depth budget. Cost is measured in chunks-per-footprint, and every ring holds
+// roughly the same footprint count by construction (~940: each ring doubles
+// both its radius and its chunk edge), so "+N chunks of depth on ring R" costs
+// ~940*N chunks there regardless of R. The budget therefore shrinks with
+// horizontal distance, expressed as a fraction of the ring's OWN outer radius:
+//
+//   - Level 0's annulus is [0, 64m), so it is the only ring whose footprints
+//     can land in the <0.25 and <0.5 bands. Levels 1-4 have Inner == Outer/2
+//     (see RingPresets), so their fraction is always >= 0.5 and they get the
+//     far-band budget -- i.e. R2/R3/R4 keep their pre-change vertical extent
+//     EXACTLY. That is deliberate: an R3/R4 chunk is already 25.6m/51.2m tall,
+//     so its existing -1 chunk of margin is already tens of metres of depth,
+//     and deep columns out at 256-1024m are invisible rock.
+//   - The deep box additionally stops at level 1. Beyond ~128m horizontally
+//     there is no line of sight underground that a deeper column would serve.
+//
+// Nothing here touches worldgen, the edit log, or chunk CONTENTS -- only which
+// chunk keys enter the desired set.
+namespace VoxelUnderground
+{
+// Master switch, for A/B measurement against the M1 gate without a rebuild.
+// Turning it off mid-run stops NEW deep chunks entering the desired set; the
+// exit pass's vertical keep-test is deliberately NOT gated on it, so already-
+// resident deep chunks still drain out through the normal unload path.
+static int32 GEnabled = 1;
+static FAutoConsoleVariableRef CVarUndergroundEnabled(
+	TEXT("voxel.Stream.Underground"),
+	GEnabled,
+	TEXT("1 (default): extend the streaming footprint below the terrain surface (depth skirt + underground anchor box). 0: pre-M4 surface-band-only behaviour."),
+	ECVF_Default);
+
+// Ring-fraction band edges (fraction of the level's own OuterMeters).
+static constexpr double NearFrac = 0.25;
+static constexpr double MidFrac = 0.50;
+
+// (1) Depth skirt: EXTRA level-L chunks below ComputeFootprintChunkZRange's
+// ChunkZMin, per band. At level 0 (3.2m chunks) that is ~19.2m / ~9.6m /
+// unchanged-3.2m of guaranteed rock under the surface at <16m / <32m / >=32m
+// from the anchor. 16m near-band depth is chosen to comfortably clear the
+// 9m-down case that exposed this bug, and to exceed the deepest single dig
+// (MaxCubeSizeVoxels = 4 voxels = 0.4m) by two orders of magnitude, so a
+// player digging straight down always has streamed floor ahead of them.
+static constexpr int32 SkirtChunksNear = 5;
+static constexpr int32 SkirtChunksMid = 2;
+static constexpr int32 SkirtChunksFar = 0;
+
+// (2) Underground deep box: vertical RADIUS in level-L chunks around the
+// anchor's chunk Z, per band. Radius 0 still means one chunk layer (the
+// anchor's own). Level 0 near-band 8 => +-25.6m, which overlaps the 19.2m
+// skirt above it, so a shaft up to ~45m deep stays vertically CONTIGUOUS
+// (skirt bottom meets box top) with no unmeshed gap in its walls.
+static constexpr int32 BoxRadiusChunksL0[3] = {8, 4, 0}; // near / mid / far
+static constexpr int32 BoxRadiusChunksL1 = 0;            // whole ring (fraction is always >= 0.5 there)
+
+// Vertical keep-distance for the deep box, in level-L chunks, used by the
+// exit scan. Mirrors the XY hysteresis: keep out to KeepChunks * chunkEdge *
+// UnloadRingMultiplier. Generous relative to the near-band radius that created
+// them (8 -> 9) so that a player moving HORIZONTALLY between bands does not
+// thrash chunks in and out; surfacing still evicts the whole box, because the
+// anchor's Z leaves the keep window entirely.
+static constexpr int32 KeepChunks[VoxelCoords::kNumLevels] = {9, 2, 0, 0, 0};
+
+// The anchor counts as underground once it is this far below the amplifier
+// surface, and stops counting as underground only once it comes back above the
+// (smaller) exit depth -- plain hysteresis so standing at the lip of a pit
+// cannot flap the whole desired set. Enter depth is well clear of the ~1m a
+// pawn's actor origin floats above the ground it is standing on.
+static constexpr double EnterDepthUU = 200.0; // 2.0m
+static constexpr double ExitDepthUU = 100.0;  // 1.0m
+
+// Which band a footprint at squared XY distance DistSq falls in (0 near,
+// 1 mid, 2 far), against the level's own outer radius.
+static int32 BandForDistance(int32 Level, double DistSq)
+{
+	const double OuterUU = UVoxelWorldSubsystem::RingPresets[Level].OuterMeters * 100.0;
+	if (DistSq < FMath::Square(OuterUU * NearFrac))
+	{
+		return 0;
+	}
+	if (DistSq < FMath::Square(OuterUU * MidFrac))
+	{
+		return 1;
+	}
+	return 2;
+}
+
+static int32 SkirtDepthChunks(int32 Level, double DistSq)
+{
+	if (!GEnabled)
+	{
+		return 0;
+	}
+	switch (BandForDistance(Level, DistSq))
+	{
+	case 0: return SkirtChunksNear;
+	case 1: return SkirtChunksMid;
+	default: return SkirtChunksFar;
+	}
+}
+
+// Returns false if this level gets no deep box at all (levels 2-4).
+static bool BoxRadiusChunks(int32 Level, double DistSq, int32& OutRadius)
+{
+	if (!GEnabled)
+	{
+		return false;
+	}
+	if (Level == 0)
+	{
+		OutRadius = BoxRadiusChunksL0[BandForDistance(0, DistSq)];
+		return true;
+	}
+	if (Level == 1)
+	{
+		OutRadius = BoxRadiusChunksL1;
+		return true;
+	}
+	return false;
+}
+} // namespace VoxelUnderground
+
 // --- desired-set / hysteresis ------------------------------------------------
 
 void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax) const
@@ -1953,10 +2153,13 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 	// chunks -- generous by construction, since a level-L chunk is (1<<L)
 	// times taller than a level-0 one). The exact fix (workers compute their
 	// own z-range per footprint) is a stage 3 refactor.
-	const int64 TopVoxelMinAtLevel = FloorDiv(TopVoxelMin, LevelScale);
-	const int64 TopVoxelMaxAtLevel = FloorDiv(TopVoxelMax, LevelScale);
-	OutChunkZMin = (int32)FloorDiv(TopVoxelMinAtLevel, ChunkEdgeVoxels) - 1;
-	OutChunkZMax = (int32)FloorDiv(TopVoxelMaxAtLevel, ChunkEdgeVoxels) + 2;
+	// Qualified: VoxelLightField.cpp declares its own anonymous-namespace
+	// FloorDiv, and in a unity blob that contains both files the unqualified
+	// name is ambiguous against `using namespace VoxelCoords`.
+	const int64 TopVoxelMinAtLevel = VoxelCoords::FloorDiv(TopVoxelMin, LevelScale);
+	const int64 TopVoxelMaxAtLevel = VoxelCoords::FloorDiv(TopVoxelMax, LevelScale);
+	OutChunkZMin = (int32)VoxelCoords::FloorDiv(TopVoxelMinAtLevel, (int64)ChunkEdgeVoxels) - 1;
+	OutChunkZMax = (int32)VoxelCoords::FloorDiv(TopVoxelMaxAtLevel, (int64)ChunkEdgeVoxels) + 2;
 }
 
 void FVoxelWorldImpl::FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin,
@@ -2127,6 +2330,24 @@ void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
 	SortQueue(PendingGameThreadKeys, SortScratchGameThread);
 }
 
+bool FVoxelWorldImpl::EvaluateAnchorUnderground(const FVector& Anchor) const
+{
+	// One amplifier column per TickStreaming call -- the same query
+	// UVoxelWorldSubsystem::GetSurfaceHeightUU makes, inlined here because this
+	// runs on the streaming path and must not depend on the outer subsystem.
+	// Deliberately the GENERATED surface, not an overlay-aware one: standing in
+	// a dug-out chamber whose roof is edited-away should still read as
+	// underground by elevation, and the overlay is not a height field anyway.
+	const int64 Vx = (int64)FMath::FloorToDouble(Anchor.X / VoxelCoords::VoxelSizeUU);
+	const int64 Vy = (int64)FMath::FloorToDouble(Anchor.Y / VoxelCoords::VoxelSizeUU);
+	const double SurfaceUU = double(Voxels.amplifier().column(Vx, Vy).surfaceMm) / 10.0;
+	const double DepthUU = SurfaceUU - Anchor.Z;
+	// Hysteresis: deeper than EnterDepthUU to become underground, shallower
+	// than ExitDepthUU to stop being underground.
+	return bAnchorUnderground ? (DepthUU > VoxelUnderground::ExitDepthUU)
+	                          : (DepthUU > VoxelUnderground::EnterDepthUU);
+}
+
 void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 {
 	using namespace VoxelCoords;
@@ -2162,7 +2383,22 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		const double InnerUU = Preset.InnerMeters * 100.0;
 		const bool bBeyondOuter = DistSq > FMath::Square(UnloadOuterUU);
 		const bool bInsideInner = LevelKey.Level > 0 && DistSq < FMath::Square(InnerUU);
-		if (bBeyondOuter || bInsideInner)
+		// Underground streaming (see namespace VoxelUnderground): the two tests
+		// above are XY-only, which is correct for every chunk whose desired-ness
+		// is a pure function of its footprint (the surface band and the depth
+		// skirt both are). Chunks that entered ONLY via the anchor-relative deep
+		// box are not -- without this they would stay resident forever once the
+		// player surfaced, since their footprint is still well inside its ring.
+		// Same hysteresis shape as the outer XY edge (UnloadRingMultiplier).
+		bool bBeyondVertical = false;
+		if (Pair.Value.bDeepAnchorRelative)
+		{
+			const int32 KeepChunks = VoxelUnderground::KeepChunks[LevelKey.Level];
+			const double KeepUU = double(KeepChunks + 1) * ChunkEdge * UVoxelWorldSubsystem::UnloadRingMultiplier;
+			const double CenterZ = (double(LevelKey.Key.Z) + 0.5) * ChunkEdge;
+			bBeyondVertical = FMath::Abs(CenterZ - Anchor.Z) > KeepUU;
+		}
+		if (bBeyondOuter || bInsideInner || bBeyondVertical)
 		{
 			PendingUnloadKeys.Add(LevelKey);
 			PendingUnloadSet.Add(LevelKey);
@@ -2208,13 +2444,22 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	const double RecomputeT1 = FPlatformTime::Seconds();
 	ThisFrameExitScanMs = float((RecomputeT1 - RecomputeT0) * 1000.0);
 
+	int32 ScratchBoxRadius = 0; // BoxRadiusChunks out-param, used only for its bool return in the level gate
+
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
 		const double LevelT0 = FPlatformTime::Seconds();
 		const FVoxelCoord AnchorVoxel = WorldToVoxelForLevel(Anchor, Level);
 		const FVoxelChunkKey AnchorChunk = ChunkKeyForVoxel(AnchorVoxel);
+		// Underground streaming: while underground the anchor's LEVEL-L chunk Z
+		// is an input to this level's candidate set (the deep box), so it joins
+		// X and Y in the gate -- but only for levels that actually get a deep
+		// box, and only while underground. Above ground this is byte-for-byte
+		// the M1/M2 gate, so the perf-gate flight's scan cadence is unchanged.
+		const bool bZMatters = bAnchorUnderground && VoxelUnderground::BoxRadiusChunks(Level, 0.0, ScratchBoxRadius);
 		if (bHasRecomputedLevel[Level] && AnchorChunk.X == LastAnchorChunkPerLevel[Level].X &&
-		    AnchorChunk.Y == LastAnchorChunkPerLevel[Level].Y)
+		    AnchorChunk.Y == LastAnchorChunkPerLevel[Level].Y &&
+		    (!bZMatters || AnchorChunk.Z == LastAnchorChunkPerLevel[Level].Z))
 		{
 			continue; // nothing new can have entered this level's annulus
 		}
@@ -2244,15 +2489,23 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				int32 ChunkZMin, ChunkZMax;
 				FootprintChunkZRangeCached(Cx, Cy, Level, ChunkZMin, ChunkZMax);
 
-				for (int32 Cz = ChunkZMin; Cz <= ChunkZMax; ++Cz)
+				// Underground streaming (see namespace VoxelUnderground), step
+				// 1: widen the memoized SURFACE band downward by this band's
+				// depth skirt. Applied here rather than inside
+				// ComputeFootprintChunkZRange precisely so the memo's inputs
+				// stay (Level, X, Y) only -- the skirt depends on the anchor's
+				// horizontal distance, which the memo does not key on.
+				ChunkZMin -= VoxelUnderground::SkirtDepthChunks(Level, DistSq);
+
+				const auto AddCandidate = [this](const FVoxelLevelChunkKey& LevelKey, bool bDeepAnchorRelative)
 				{
-					const FVoxelLevelChunkKey LevelKey{Level, FVoxelChunkKey{Cx, Cy, Cz}};
 					if (ChunkRecords.Contains(LevelKey))
 					{
-						continue;
+						return;
 					}
 
-					ChunkRecords.Add(LevelKey);
+					VoxelStreaming::FChunkRecord& NewRecord = ChunkRecords.Add(LevelKey);
+					NewRecord.bDeepAnchorRelative = bDeepAnchorRelative;
 					if (NeedsOverlayAwarePath(LevelKey))
 					{
 						PendingGameThreadKeys.Add(LevelKey);
@@ -2260,6 +2513,30 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					else
 					{
 						PendingJobKeys.Add(LevelKey);
+					}
+				};
+
+				for (int32 Cz = ChunkZMin; Cz <= ChunkZMax; ++Cz)
+				{
+					AddCandidate(FVoxelLevelChunkKey{Level, FVoxelChunkKey{Cx, Cy, Cz}}, /*bDeepAnchorRelative*/ false);
+				}
+
+				// Step 2: the anchor-relative deep box, only while underground.
+				// Chunks the surface band + skirt already cover are skipped so
+				// they keep their unflagged (footprint-lifetime) status -- only
+				// chunks that exist SOLELY because of the anchor's Z get the
+				// flag, and therefore only those are subject to the exit pass's
+				// vertical keep-test.
+				int32 BoxRadius = 0;
+				if (bAnchorUnderground && VoxelUnderground::BoxRadiusChunks(Level, DistSq, BoxRadius))
+				{
+					for (int32 Cz = AnchorChunk.Z - BoxRadius; Cz <= AnchorChunk.Z + BoxRadius; ++Cz)
+					{
+						if (Cz >= ChunkZMin && Cz <= ChunkZMax)
+						{
+							continue;
+						}
+						AddCandidate(FVoxelLevelChunkKey{Level, FVoxelChunkKey{Cx, Cy, Cz}}, /*bDeepAnchorRelative*/ true);
 					}
 				}
 			}

@@ -713,6 +713,23 @@ void AVoxelEarthGameMode::BeginPlay()
 						}
 						PC->SetControlRotation(Look);
 					}
+					// Underground streaming proof: re-assert the pose the carve
+					// timer set, so the generic "aim down at the terrain from
+					// spawn" branch below cannot yank the camera back into the
+					// sky. Re-asserting (rather than trusting the earlier set)
+					// also survives anything that moved the pawn in between,
+					// e.g. the walk-mode kinematic settle onto the tunnel floor.
+					else if (bUndergroundTestActive && PC)
+					{
+						const FVector Pose = UndergroundTestCameraLocation();
+						const FRotator Look = UndergroundTestCameraRotation();
+						if (APawn* P = PC->GetPawn())
+						{
+							P->SetActorLocation(Pose);
+							P->SetActorRotation(Look);
+						}
+						PC->SetControlRotation(Look);
+					}
 					else if (bOverheadFraming && PC)
 					{
 						constexpr double HoverHeightAboveUU = 1500.0; // 15m: fills frame, clears splash geometry
@@ -1475,6 +1492,141 @@ void AVoxelEarthGameMode::BeginPlay()
 			StructureTestDelaySeconds, false);
 	}
 
+	// (Underground camera pose helpers are defined just below BeginPlay.)
+
+	// Underground streaming proof (docs/status.md "Underground streaming
+	// (vertical footprint)"): -VoxelUndergroundTest[=<delaySeconds>] (default
+	// 10s) carves a shaft down from the spawn column, a short horizontal tunnel
+	// off its foot and a chamber at the tunnel's end, then parks the pawn in
+	// the chamber (or, with -VoxelUndergroundView=shaft, at the shaft foot
+	// looking along the tunnel). Every carve goes through the ordinary
+	// CarveSphere edit-log authority path -- exactly what a player's explosive
+	// does -- so this fixture changes nothing about worldgen or determinism, it
+	// just makes an air pocket in a place the streaming system previously
+	// refused to mesh. Pair with -VoxelScreenshotAfter=<larger value>.
+	float UndergroundTestDelaySeconds = 10.f;
+	const bool bUndergroundTestRequested =
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelUndergroundTest="), UndergroundTestDelaySeconds) ||
+		FParse::Param(FCommandLine::Get(), TEXT("VoxelUndergroundTest"));
+	if (bUndergroundTestRequested)
+	{
+		bUndergroundTestActive = true;
+
+		float DepthMeters = 24.f;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelUndergroundDepth="), DepthMeters) && DepthMeters > 4.f)
+		{
+			UndergroundTestDepthUU = double(DepthMeters) * 100.0;
+		}
+
+		double SpawnColXUU = 0.0, SpawnColYUU = 0.0;
+		ParseSpawnColumnUU(SpawnColXUU, SpawnColYUU);
+		UndergroundTestColumnXUU = SpawnColXUU;
+		UndergroundTestColumnYUU = SpawnColYUU;
+
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelUndergroundTest: carving shaft+tunnel+chamber at (%.0f,%.0f), %.1fm down, in %.1fs"),
+		       UndergroundTestColumnXUU, UndergroundTestColumnYUU, UndergroundTestDepthUU / 100.0,
+		       UndergroundTestDelaySeconds);
+		GetWorldTimerManager().SetTimer(
+			UndergroundTestTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this]()
+				{
+					UWorld* DigWorld = GetWorld();
+					UVoxelWorldSubsystem* Subsystem = DigWorld ? DigWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					if (!Subsystem)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelUndergroundTest: subsystem not ready, skipping."));
+						return;
+					}
+					UndergroundTestSurfaceUU =
+						Subsystem->GetSurfaceHeightUU(UndergroundTestColumnXUU, UndergroundTestColumnYUU);
+
+					// Geometry, all in UU (1 UU = 1cm). The shaft is a stack of
+					// overlapping spheres (CarveSphere is the only carve
+					// primitive, and it is what an explosive uses); 100UU
+					// spacing against a 160UU radius keeps the column
+					// continuous with no scalloped gaps between spheres.
+					// Kept deliberately SMALL: these carves go through the same
+					// large-edit path as an explosive, and an oversized chamber
+					// both costs a long structural-collapse prepass per carve
+					// and takes the shot further from "a player dug this".
+					constexpr double ShaftRadiusUU = 110.0;
+					constexpr double ShaftStepUU = 80.0;
+					constexpr double TunnelRadiusUU = 130.0;
+					constexpr double TunnelLengthUU = 900.0;
+					constexpr double ChamberRadiusUU = 220.0;
+					constexpr double JitterUU = 12.0; // slight raggedness, same as an explosive's edge
+					const double FloorZUU = UndergroundTestSurfaceUU - UndergroundTestDepthUU;
+
+					int32 Removed = 0;
+					// Shaft: from a little ABOVE the surface (so the mouth is
+					// open to the sky and the shot proves a real hole, not a
+					// sealed bubble) down to the tunnel level.
+					for (double Z = UndergroundTestSurfaceUU + 200.0; Z >= FloorZUU; Z -= ShaftStepUU)
+					{
+						Removed += Subsystem->CarveSphere(
+							FVector(UndergroundTestColumnXUU, UndergroundTestColumnYUU, Z), ShaftRadiusUU, JitterUU);
+					}
+					// Horizontal tunnel off the shaft foot, running +X.
+					for (double D = 0.0; D <= TunnelLengthUU; D += ShaftStepUU)
+					{
+						Removed += Subsystem->CarveSphere(
+							FVector(UndergroundTestColumnXUU + D, UndergroundTestColumnYUU, FloorZUU), TunnelRadiusUU,
+							JitterUU);
+					}
+					// Chamber at the tunnel's end.
+					Removed += Subsystem->CarveSphere(
+						FVector(UndergroundTestColumnXUU + TunnelLengthUU, UndergroundTestColumnYUU, FloorZUU),
+						ChamberRadiusUU, JitterUU);
+
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelUndergroundTest: carved %d voxels; surface=%.0f floor=%.0f digest=0x%016llX."),
+					       Removed, UndergroundTestSurfaceUU, FloorZUU,
+					       (unsigned long long)Subsystem->GetEditedDigest());
+
+					// Park the pawn underground immediately, so the streaming
+					// system has the remaining seconds before the screenshot to
+					// build the deep set around it (the whole point of the
+					// fixture -- the anchor being underground is what triggers
+					// the deep box).
+					if (APlayerController* PC = DigWorld->GetFirstPlayerController())
+					{
+						const FVector Pose = UndergroundTestCameraLocation();
+						const FRotator Look = UndergroundTestCameraRotation();
+						if (APawn* P = PC->GetPawn())
+						{
+							P->SetActorLocation(Pose);
+							P->SetActorRotation(Look);
+						}
+						PC->SetControlRotation(Look);
+						UE_LOG(LogVoxelEarth, Log, TEXT("VoxelUndergroundTest: pawn parked at (%.0f,%.0f,%.0f)."),
+						       Pose.X, Pose.Y, Pose.Z);
+
+						// Enclosure probe: six axis rays from the parked pose.
+						// This is the ground truth for "is there a world down
+						// here" -- independent of anything the renderer does,
+						// it asks voxel-core directly how far the rock is in
+						// each direction. A miss on -Z is literally the bug
+						// this task is about (no floor under your feet).
+						const FVector Dirs[6] = {FVector(1, 0, 0),  FVector(-1, 0, 0), FVector(0, 1, 0),
+						                         FVector(0, -1, 0), FVector(0, 0, 1),  FVector(0, 0, -1)};
+						const TCHAR* Names[6] = {TEXT("+X"), TEXT("-X"), TEXT("+Y"), TEXT("-Y"), TEXT("+Z"), TEXT("-Z")};
+						FString Report;
+						for (int32 I = 0; I < 6; ++I)
+						{
+							FVector Hit, Prev;
+							const bool bHit = Subsystem->RaycastVoxelWorld(Pose, Dirs[I], 6000.0, Hit, Prev);
+							Report += FString::Printf(TEXT("%s=%s "), Names[I],
+							                          bHit ? *FString::Printf(TEXT("%.1fm"), (Hit - Pose).Size() / 100.0)
+							                               : TEXT("MISS"));
+						}
+						UE_LOG(LogVoxelEarth, Log, TEXT("VoxelUndergroundTest: enclosure probe (60m rays): %s"), *Report);
+					}
+				}),
+			UndergroundTestDelaySeconds, false);
+	}
+
 	if (bCollapseTestActive)
 	{
 		if (CollapseTestDelaySeconds <= StructureTestDelaySeconds)
@@ -1916,6 +2068,40 @@ void AVoxelEarthGameMode::BeginPlay()
 				}),
 			Tier1TestSpawnDelaySeconds, false);
 	}
+}
+
+// --- underground streaming proof: camera poses -------------------------------
+//
+// Geometry constants below MUST stay in step with the carve in BeginPlay's
+// -VoxelUndergroundTest block (shaft at the spawn column, tunnel running +X for
+// 900UU, chamber at its end). Both poses sit ~120UU above the tunnel floor,
+// i.e. roughly standing eye height inside a passage carved with a 190UU radius.
+
+bool AVoxelEarthGameMode::IsUndergroundShaftView() const
+{
+	FString View;
+	return FParse::Value(FCommandLine::Get(), TEXT("VoxelUndergroundView="), View) && View.Equals(TEXT("shaft"), ESearchCase::IgnoreCase);
+}
+
+FVector AVoxelEarthGameMode::UndergroundTestCameraLocation() const
+{
+	const double FloorZUU = UndergroundTestSurfaceUU - UndergroundTestDepthUU;
+	if (IsUndergroundShaftView())
+	{
+		// At the shaft foot, just inside the tunnel mouth: the frame is the dug
+		// passage itself -- walls left/right, floor below, roof above.
+		return FVector(UndergroundTestColumnXUU + 60.0, UndergroundTestColumnYUU, FloorZUU + 120.0);
+	}
+	// In the chamber, looking back toward the tunnel: rock on every side.
+	return FVector(UndergroundTestColumnXUU + 900.0, UndergroundTestColumnYUU, FloorZUU + 120.0);
+}
+
+FRotator AVoxelEarthGameMode::UndergroundTestCameraRotation() const
+{
+	// Shaft view looks along +X down the tunnel; chamber view looks back along
+	// -X toward the tunnel mouth. A few degrees of downward pitch in both so
+	// the floor is in frame (a floor is precisely what used to be missing).
+	return IsUndergroundShaftView() ? FRotator(-8.f, 0.f, 0.f) : FRotator(-8.f, 180.f, 0.f);
 }
 
 void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
