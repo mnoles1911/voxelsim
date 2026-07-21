@@ -190,4 +190,24 @@ private:
 	FVector UndergroundTestCameraLocation() const;
 	FRotator UndergroundTestCameraRotation() const;
 	bool IsUndergroundShaftView() const;
+
+	// -VoxelCaveTest[=<delaySeconds>]: searches the columns around spawn for a
+	// genuine M4 cave void (voxelcore/caves.h -- pristine worldgen, NOT an
+	// edit), parks the pawn inside the tallest one it finds and logs a
+	// six-axis enclosure probe. This is the real proof that the world exists
+	// below the surface: unlike the dug-chamber fixture, a cave is unedited,
+	// so nothing forces its chunks to be meshed -- they are there only if the
+	// streaming footprint reaches them. Pair with -VoxelScreenshotAfter.
+	FTimerHandle CaveTestTimerHandle;
+	bool bCaveTestActive = false;
+	bool bCaveTestFound = false;
+	FVector CaveTestCameraPos = FVector::ZeroVector;
+	FRotator CaveTestCameraRot = FRotator::ZeroRotator;
+	// Scans for the tallest air pocket in the cave depth band around
+	// (OriginXUU, OriginYUU); returns false if nothing qualifying was found.
+	bool FindCaveVoid(class UVoxelWorldSubsystem& Subsystem, double OriginXUU, double OriginYUU, FVector& OutCenter) const;
+	// Logs the tracked/component/quad state of the level-0 chunks in a vertical
+	// stack through Center -- the measurement that distinguishes "nothing is
+	// streamed down here" from "it is streamed but renders oddly".
+	void LogUndergroundChunkStatus(class UVoxelWorldSubsystem& Subsystem, const FVector& Center, const TCHAR* Phase) const;
 };

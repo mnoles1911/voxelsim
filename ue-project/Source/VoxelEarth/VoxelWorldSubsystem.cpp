@@ -2018,19 +2018,40 @@ static FAutoConsoleVariableRef CVarUndergroundEnabled(
 	TEXT("1 (default): extend the streaming footprint below the terrain surface (depth skirt + underground anchor box). 0: pre-M4 surface-band-only behaviour."),
 	ECVF_Default);
 
+// -VoxelNoUnderground: the same off-switch as the cvar, but readable BEFORE
+// the first RecomputeDesiredSet. This matters for A/B measurement: -ExecCmds
+// cvars are applied after the world has already begun streaming, and by then
+// the first recomputes have added deep chunks that nothing subsequently
+// evicts (skirt chunks are pure functions of their footprint and live as long
+// as it does), so an -ExecCmds A/B silently measures the SAME desired set
+// twice. Same "don't depend on -ExecCmds cvar-parsing timing" reasoning the
+// GameMode already applies to -VoxelGIOn / -VoxelMipCacheBudgetMB.
+static bool UndergroundDisabled()
+{
+	static const bool bDisabledOnCommandLine = FParse::Param(FCommandLine::Get(), TEXT("VoxelNoUnderground"));
+	return bDisabledOnCommandLine || GEnabled == 0;
+}
+
 // Ring-fraction band edges (fraction of the level's own OuterMeters).
 static constexpr double NearFrac = 0.25;
 static constexpr double MidFrac = 0.50;
 
 // (1) Depth skirt: EXTRA level-L chunks below ComputeFootprintChunkZRange's
-// ChunkZMin, per band. At level 0 (3.2m chunks) that is ~19.2m / ~9.6m /
+// ChunkZMin, per band. At level 0 (3.2m chunks) that is ~41.6m / ~16.0m /
 // unchanged-3.2m of guaranteed rock under the surface at <16m / <32m / >=32m
-// from the anchor. 16m near-band depth is chosen to comfortably clear the
-// 9m-down case that exposed this bug, and to exceed the deepest single dig
-// (MaxCubeSizeVoxels = 4 voxels = 0.4m) by two orders of magnitude, so a
-// player digging straight down always has streamed floor ahead of them.
-static constexpr int32 SkirtChunksNear = 5;
-static constexpr int32 SkirtChunksMid = 2;
+// from the anchor.
+//
+// The near-band figure is set by the M4 CAVE PASS rather than by digging.
+// voxelcore/caves.h places tunnel axes kCaveNodeDepthMinMm..+SpanMm =
+// 9m..34m below the surface, with radius up to kCaveRadiusMaxMm = 2.8m, so
+// the deepest cave voxel sits ~36.8m down (the header's own static_assert
+// bounds it under 40m). 12 level-0 chunks = 38.4m clears that whole band, so
+// a cave -- and a sinkhole shaft leading into one -- is meshed BEFORE the
+// player is underground, which is what makes an entrance visible from
+// outside it rather than popping in once you have already fallen through.
+// It also covers digging by a wide margin (MaxCubeSizeVoxels = 4 = 0.4m).
+static constexpr int32 SkirtChunksNear = 12;
+static constexpr int32 SkirtChunksMid = 5;
 static constexpr int32 SkirtChunksFar = 0;
 
 // (2) Underground deep box: vertical RADIUS in level-L chunks around the
@@ -2075,7 +2096,7 @@ static int32 BandForDistance(int32 Level, double DistSq)
 
 static int32 SkirtDepthChunks(int32 Level, double DistSq)
 {
-	if (!GEnabled)
+	if (UndergroundDisabled())
 	{
 		return 0;
 	}
@@ -2090,7 +2111,7 @@ static int32 SkirtDepthChunks(int32 Level, double DistSq)
 // Returns false if this level gets no deep box at all (levels 2-4).
 static bool BoxRadiusChunks(int32 Level, double DistSq, int32& OutRadius)
 {
-	if (!GEnabled)
+	if (UndergroundDisabled())
 	{
 		return false;
 	}
@@ -4942,6 +4963,21 @@ bool UVoxelWorldSubsystem::TryPlace(const FVector& CameraWorldLocation, const FV
 		}
 	}
 	return bApplied;
+}
+
+bool UVoxelWorldSubsystem::DebugChunkStatusAt(const FVector& WorldPos, bool& bOutTracked, bool& bOutHasComponent,
+                                              int32& OutQuads) const
+{
+	if (!Impl)
+	{
+		return false;
+	}
+	const VoxelCoords::FVoxelLevelChunkKey Key{0, VoxelCoords::ChunkKeyForVoxel(VoxelCoords::WorldToVoxel(WorldPos))};
+	const VoxelStreaming::FChunkRecord* Rec = Impl->ChunkRecords.Find(Key);
+	bOutTracked = (Rec != nullptr);
+	bOutHasComponent = Rec && Rec->Component.IsValid();
+	OutQuads = Rec ? Rec->LastQuadCount : 0;
+	return true;
 }
 
 double UVoxelWorldSubsystem::GetSurfaceHeightUU(double WorldX, double WorldY) const

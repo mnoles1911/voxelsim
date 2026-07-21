@@ -4049,3 +4049,173 @@ four-way junction. The numbers above are the primary deliverable.
 - The cave hash channels (18-21) are declared in `caves.h` rather than
   appended to `hash.h`'s `HashChannel` registry; folding them in would be
   tidier.
+
+### Underground streaming (vertical footprint)
+
+**The bug.** The world had no underground. The streaming footprint's vertical
+extent was decided in exactly one place --
+`FVoxelWorldImpl::ComputeFootprintChunkZRange`
+(`ue-project/Source/VoxelEarth/VoxelWorldSubsystem.cpp`) -- and it is keyed
+purely on the terrain SURFACE at `(Level, ChunkX, ChunkY)`: it samples the
+amplifier column at the footprint's four corners and returns
+
+```
+ChunkZMin = floorDiv(minCornerTopVoxel, 32) - 1
+ChunkZMax = floorDiv(maxCornerTopVoxel, 32) + 2
+```
+
+A level-0 chunk is 32 voxels = 3.2 m tall, so `-1` guarantees only **3.2-6.4 m
+of meshed rock below the surface**, everywhere, forever. The camera's Z was not
+an input anywhere in the system. Three consequences, all confirmed by
+measurement:
+
+1. A camera ~9 m down renders open sky under a thin crust (the GI section's
+   note above).
+2. `TickStreaming` recomputed the desired set only on an anchor crossing in
+   **X or Y**, so digging straight down triggered no recompute at all.
+3. The hysteresis-exit scan was **XY-distance only**, so anything added below
+   the surface needed its own eviction rule or it would never unload.
+
+**What changed.** Two additions, both applied OUTSIDE the `FootprintZRangeCache`
+memo so its correctness argument ("a pure function of `(Level, X, Y)` and the
+amplifier") is untouched -- nothing anchor-dependent may go inside it:
+
+1. **Depth skirt** -- unconditional and anchor-Z-independent: extra chunks below
+   the surface band, shrinking with horizontal distance. Because it is a pure
+   function of the footprint, skirt chunks need no new eviction rule; they leave
+   with their footprint exactly as before.
+2. **Anchor-relative deep box** -- only while the anchor is underground: a
+   vertical band centred on the anchor's own chunk Z, so being underground
+   streams chunks around you in all directions rather than a crust overhead.
+
+**Depth budget.** Cost is chunks-per-footprint, and every ring holds roughly the
+same footprint count by construction (~940 -- each ring doubles both its radius
+and its chunk edge), so "+N chunks of depth on ring R" costs ~940N chunks
+regardless of R. The budget is therefore expressed as a fraction of each ring's
+OWN outer radius:
+
+| band (fraction of ring outer) | skirt (extra level-0 chunks) | underground box radius |
+|---|---|---|
+| < 0.25 (R0: < 16 m) | 12 (38.4 m) | 8 (+-25.6 m) |
+| < 0.50 (R0: < 32 m) | 5 (16.0 m) | 4 (+-12.8 m) |
+| >= 0.50 | 0 (unchanged) | R0 0, R1 0, R2-R4 none |
+
+Levels 1-4 have `Inner == Outer/2` in `RingPresets`, so their footprints always
+land in the far band and **R2/R3/R4 keep their pre-change vertical extent
+exactly**. That is deliberate: an R3/R4 chunk is already 25.6 m/51.2 m tall, so
+its existing `-1` of margin is already tens of metres, and deep columns at
+256-1024 m out are invisible rock.
+
+The 38.4 m near-band figure is set by the **M4 cave pass**, not by digging:
+`voxelcore/caves.h` puts tunnel axes 9-34 m below the surface with radius up to
+2.8 m, so the deepest cave voxel is ~36.8 m down. 12 level-0 chunks clears the
+whole cave band, which is what makes a cave (and a sinkhole leading into one)
+visible *before* you are already inside it.
+
+**Eviction.** Deep-box chunks carry `FChunkRecord::bDeepAnchorRelative` and get a
+vertical keep-test in the previously XY-only exit scan, with the same
+`UnloadRingMultiplier` hysteresis as the outer XY edge. Surfacing evicts the
+whole box. Surface-band and skirt chunks are never flagged and keep exactly
+their prior lifetime. `TickStreaming`'s recompute gate gains two triggers:
+crossing a chunk in Z **while underground**, and the underground flag flipping
+(enter/exit hysteresis at 2.0 m/1.0 m below the amplifier surface). Above ground
+the gate is byte-for-byte the M1/M2 one, so the perf flight's scan cadence is
+unchanged.
+
+**Do mostly-solid underground chunks need a cheaper representation? No --
+measured, not assumed.** A fully-solid interior chunk has no visible faces, the
+greedy mesher emits zero quads, and `ApplyMeshResult`'s `Quads.Num() == 0` branch
+already parks the component and keeps only the record. So depth costs a worker
+job and a `TMap` entry, **not geometry and not GPU memory**. The instrumented
+perf-run line now reports `deepTracked` / `deepWithGeometry`: standing in a cave,
+**2597 deep chunks tracked, 8 with any geometry**. Confirmed at the whole-run
+level too -- see the resident-quad numbers below, which went *down*.
+
+**Proof: a real cave.** `-VoxelCaveTest[=<s>]` searches the columns near spawn for
+a genuine M4 cave void (pristine worldgen -- nothing edited, so nothing forces
+those chunks to be meshed), parks the pawn in it and logs a six-axis enclosure
+probe plus the tracked/component/quad state of the chunks in a vertical stack
+through the camera. Found a 4.5 m-tall void 14.2 m down at (600,-800); probe
+`+X=2.3m -X=1.5m +Y=4.4m -Y=3.9m +Z=2.5m -Z=1.9m` -- genuinely sealed in rock.
+
+```
+depth:tracked/component/quads      (T = in desired set, C = live component)
+
+before  -33.5m:--0 -30.2m:--0 -27.1m:--0 -23.9m:--0 -20.6m:--0 -17.4m:--0
+        -14.2m:--0 -11.1m:--0  -7.8m:--0  -4.7m:--0  -1.4m:T-0  +1.8m:TC1390
+
+after   -33.5m:T-0 -30.2m:T-0 -27.1m:T-0 -23.9m:T-0 -20.6m:T-0 -17.4m:T-0
+        -14.2m:TC1198 -11.1m:TC2114 -7.8m:TC38 -4.7m:T-0 -1.4m:T-0 +1.8m:TC1390
+```
+
+Before, nothing below -1.4 m is in the world at all. After, the column is
+tracked to 33.5 m down, solid rock meshes to 0 quads (no component, no GPU
+memory), and the cave at -14.2/-11.1 m carries 1198 and 2114 quads of real
+geometry. Screenshots in `docs/images/underground/`:
+
+- `01-before-open-sky-below.png` -- 14.2 m underground looking down: a thin dark
+  crust overhead and **open sky beneath it**, with fragments floating in the void.
+- `02-after-rock-below.png` -- same camera, same seed, fix on: rock terraces
+  below. Distant sky remains where the depth budget deliberately tapers.
+- `03-before-crust-underside.png` / `04-after-cave-interior.png` -- the same pair
+  looking level along the tunnel.
+
+**A/B methodology note (this cost three runs to find).** `-ExecCmds` cvars are
+applied *after* the world has begun streaming, and by then the first recomputes
+have already added deep chunks that nothing subsequently evicts (skirt chunks
+live as long as their footprint). An `-ExecCmds` A/B therefore measures the SAME
+desired set twice and produces pixel-identical screenshots. The off-switch is
+`-VoxelNoUnderground` (read once, before the first recompute), matching the
+"don't depend on -ExecCmds cvar-parsing timing" reasoning already used for
+`-VoxelGIOn`. `voxel.Stream.Underground 0` also exists for live toggling.
+
+**M1 gate: not regressed.** `-VoxelPerfRun=60`, seed 20260719, 1080p windowed,
+min-spec proxy, clean `Saved/VoxelWorlds` per run. Baseline is the SAME binary
+with `-VoxelNoUnderground`, so the instrumentation matches.
+
+| | before (feature off) | after (3 runs) |
+|---|---|---|
+| p95 | 5.74 ms | **4.93 / 4.95 / 4.97 ms** |
+| post-warmup p95 | 5.83 ms | 4.98 / 5.02 / 5.04 ms |
+| p50 | 2.54 ms | 2.48 / 2.51 / 2.50 ms |
+| frames over 16.6 ms | 6 | 10 / 5 / 5 |
+| hitches (>33.3 ms), post-warmup | 0 | 2 / 0 / 0 |
+| tracked chunk records | 29,497 | 34,825-34,835 (**+18%**) |
+| resident quads | 1,908,143 | 1,394,860-1,450,523 (**-25%**) |
+| chunks loaded / run | 18,985 | 16,518-16,706 |
+
+p95 *improved* by ~0.8 ms and resident quads *fell* by a quarter. That is not a
+free lunch, it is a reallocation: the pipeline is throughput-bound (jobs in
+flight pinned at 2x cores, ~21-26k pending all run), so adding desired chunks
+changes what the workers spend their time on rather than how much they do. The
+deep chunks near the camera sort high on the 3D-distance priority and mesh to
+nothing, displacing distant high-quad surface chunks that would otherwise have
+become resident. The real cost is the **+18% in tracked records** (a `TMap` entry
+each) and ~2,300 fewer surface chunks completed per run.
+
+**Determinism / contents untouched.** Streaming and scheduling only -- worldgen,
+the edit log and chunk contents are not touched; only which chunk keys enter the
+desired set. Verified on one build, feature ON vs OFF, same seed: identical carve
+(137,501 voxels) and identical `editedDigest=0x60CF63CDFEE1E619`, identical
+handshake digest `0x52004DCC85DDD80C`.
+
+**Follow-ups.**
+1. The skirt and the deep box are two disjoint Z ranges, not one contiguous
+   fill. Rock between them is unmeshed -- invisible in practice, but a shaft
+   deeper than ~45 m (skirt bottom no longer meeting box top) would show a gap
+   in its walls. Contiguous fill was rejected on cost: at 100 m deep it is ~31
+   extra chunks per footprint.
+2. The far band still gets no depth at all, so a wide downward view from
+   underground shows the old thin-crust-over-sky beyond ~33 m out
+   (`02-after-rock-below.png`). Fixing it properly wants occlusion-aware
+   selection, not a bigger budget.
+3. `ComputeFootprintChunkZRange` still samples only the footprint's 4 corners,
+   so its surface band can miss interior extremes on steep slopes. Pre-existing;
+   the exact fix (workers compute their own z-range) is still the stage-3
+   refactor its comment describes.
+4. Level 1's deep box is a single chunk layer and levels 2-4 get none, so a
+   large cavern seen from far away underground is still surface-LOD only.
+5. The unity build broke on `FloorDiv` being ambiguous between
+   `VoxelCoords::FloorDiv` and an anonymous-namespace copy in
+   `VoxelLightField.cpp`; fixed by qualifying at the call site, but the
+   duplicate helper should probably just go.
