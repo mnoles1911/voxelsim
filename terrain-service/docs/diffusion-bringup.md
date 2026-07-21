@@ -1,0 +1,181 @@
+# terrain-diffusion cloud bring-up runbook
+
+Turnkey checklist for the ONE session where Matt rents a GPU and we bring up
+the real `terrain-diffusion` provider. Everything that does not need a GPU
+is already implemented and tested (`terrain_service/providers/diffusion.py`,
+`tests/test_diffusion.py`) — this doc is the short remaining path, not a
+research project. Related: `docs/status.md` backlog ("Confirm real
+terrain-diffusion tile outputs" / "terrain-diffusion worker bring-up"),
+`docs/voxel-earth-implementation-plan.md` §3.1/§3.4, `docs/m4-plan.md`.
+
+## 0. Before you start (no GPU needed — do this locally first)
+
+Confirm the dry-run plumbing is green so you know any failure during
+bring-up is about the REAL model, not our code:
+
+```sh
+cd terrain-service
+python -m pytest -q                                          # all green
+python -m terrain_service.pregen --seed 1 --radius 1 \
+    --provider diffusion --dry-run --cache-dir /tmp/dryrun    # generated=9
+```
+
+## 1. Rent a serverless GPU (scale-to-zero)
+
+Plan §3.4's cost model: production targets **one 4090-class GPU, ~$0.35–0.7/hr
+rented, serverless/scale-to-zero** — generation cost scales with *newly
+explored area*, not player count, and decays toward zero once the cache
+fills (most requests become cache hits). Total production infra for co-op
+scale: **<$100–600/mo**. For the ONE bring-up session (not production
+hosting), a Runpod/Modal/Vast-class on-demand pod billed by the minute is
+the right shape — no need to wire up serverless autoscaling just to run
+`validate_model_output` once and pregen a launch radius:
+
+- **Runpod**: On-Demand Pod, RTX 4090 or similar, PyTorch template, pay by
+  the minute, stop (not just idle) the pod when done.
+- **Modal** (if going serverless from day one): `@app.function(gpu="A10G")`
+  class wrapper around the provider; scale-to-zero is the default.
+- Any CUDA 12.x + PyTorch 2.x host works — `terrain-diffusion` doesn't need
+  anything more exotic. Estimated session cost at ~$0.5/hr: well under $5
+  for the checklist below (a couple hours including install/debug).
+
+## 2. Install terrain-diffusion + deps
+
+```sh
+git clone https://github.com/xandergos/terrain-diffusion
+cd terrain-diffusion
+pip install -r requirements.txt      # brings CUDA torch; verify with:
+python -c "import torch; print(torch.cuda.is_available())"   # must print True
+```
+
+Also `pip install -r <this repo>/terrain-service/requirements.txt` on the
+GPU box so `terrain_service` itself is importable there (needed for step 4).
+
+## 3. Pin a checkpoint into `DiffusionConfig`
+
+Download/select the 30m terrain-diffusion checkpoint, then in a Python shell
+on the GPU box:
+
+```python
+from terrain_service.providers.diffusion import DiffusionConfig, SamplerConfig
+
+config = DiffusionConfig(
+    checkpoint_id="<checkpoint name/tag from the terrain-diffusion release>",
+    checkpoint_sha256="<sha256sum of the checkpoint file>",
+    sampler=SamplerConfig(steps=30, guidance_scale=3.0, scheduler="ddim"),  # tune to taste
+    scale=1,  # 30m/px; bring up scale=8 (11.25m/px) as a SEPARATE config/provider_id once scale=1 works
+)
+print(config.provider_id())  # record this — it's the cache namespace for everything below
+```
+
+Record `config.provider_id()` — every tile generated under this checkpoint +
+sampler + scale + channel_mapping combination is cached under this key
+(doctrine §2.3: diffusion output isn't bit-deterministic across GPUs, so
+tiles are canonical data generated once and distributed, never
+regenerated-and-compared client-side).
+
+## 4. Wire the real model call
+
+Open `terrain_service/providers/diffusion.py`, find
+`DiffusionProvider._call_model` — it has a numbered TODO. Fill in:
+
+1. Load the checkpoint (verify its sha256 against `config.checkpoint_sha256`
+   — a silent checkpoint swap under an unchanged `provider_id` would poison
+   the cache with mismatched tiles).
+2. Run terrain-diffusion inference with `self.config.sampler` settings,
+   positioned from `(seed, x, y, scale)` per terrain-diffusion's own
+   sampling API — tile `(x, y)` covers pixel range
+   `[x*512, (x+1)*512)` on each axis, same convention as `tile_codec.py`.
+3. Return a `dict[str, np.ndarray]` of **raw, unquantized** float32 rasters
+   keyed by `self.config.channel_mapping`'s values (do not clip/round here —
+   `validate_model_output` needs to see the model's honest output to report
+   real mismatches, and `adapt_raster_to_tile` does the quantization).
+
+Do NOT skip `validate_model_output`/`adapt_raster_to_tile` — that's the
+whole point of this scaffolding: the real model call plugs into the SAME
+path the dry-run already exercises.
+
+## 5. Confirm real tile outputs — the actual point of this backlog item
+
+Run inference for exactly ONE tile and validate it against our channel
+assumption (`EXPECTED_CHANNELS` in `providers/diffusion.py`: int16-metres
+elevation + 4 uint8 climate channels — temperature, seasonality,
+precipitation, precip variability):
+
+```python
+from terrain_service.providers.diffusion import DiffusionProvider, validate_model_output, ModelOutputMismatch
+
+provider = DiffusionProvider(config=config, dry_run=False)
+raster = provider._call_model(seed=1, x=0, y=0, scale=1)   # raw model output, pre-adapter
+
+try:
+    validate_model_output(raster, config.channel_mapping)
+    print("MATCHES our assumption — no adaptation needed")
+except ModelOutputMismatch as e:
+    for issue in e.issues:
+        print("-", issue)
+```
+
+Two outcomes:
+
+- **Matches**: proceed to step 6 as-is.
+- **Differs** (different channel count/names/dtype/ranges): this is a
+  `DiffusionConfig.channel_mapping` edit (if it's a naming/count mismatch —
+  e.g. the model calls it `precip_var` not `precip_variability`, or splits
+  temperature into day/night) or an `EXPECTED_CHANNELS` + `adapt_raster_to_tile`
+  edit (if it's a genuinely different channel *set*, e.g. no seasonality
+  channel at all). Either way it's a config/provider-layer change, not a
+  redesign — see `docs/m4-plan.md`'s "HARD DEPENDENCY before biome tuning"
+  section, which this step directly closes out. Update `docs/m4-plan.md` and
+  `docs/status.md`'s backlog row with what you found.
+
+Once `validate_model_output` passes, sanity-check the adapted tile visually
+(dump `tile.elevation`/`tile.climate` as a PNG or just eyeball min/max/mean)
+before trusting the full pregen run in step 6 — validation catches
+structural mismatches, not "the mountains are inverted."
+
+## 6. Golden-tile pin + pregen the launch radius
+
+```python
+import hashlib
+from terrain_service import tile_codec
+
+tile = provider.generate(seed=1, x=0, y=0, scale=1)
+print(hashlib.sha256(tile_codec.encode(tile)).hexdigest())   # pin this, generating machine only
+```
+
+Record that hash as a comment near `config` (informational only — unlike the
+synthetic provider's `GOLDEN_SHA256`, diffusion output is NOT required to
+reproduce cross-machine; cache-distribution is what makes that a non-issue,
+per the module docstring). Then pregen the launch radius:
+
+```sh
+python -m terrain_service.pregen --seed <world seed> --radius 8 \
+    --provider diffusion --cache-dir ./tile-cache
+# TERRAIN_PROVIDER env var equivalent for the Flask server; wire config
+# selection (checkpoint id, sampler, scale) into _make_provider in app.py
+# once a single pinned config is chosen for production — currently
+# DiffusionProvider() takes the dataclass defaults.
+```
+
+Copy/sync `./tile-cache` off the GPU box (it's just files, content-addressed
+by provider_id/seed/scale/x/y — see `cache.py`) to wherever the production
+Flask server's `TERRAIN_CACHE_DIR` lives, or point the server directly at a
+shared volume/bucket.
+
+## 7. Shut the GPU down
+
+Stop (not just pause) the rented instance. If it's a scale-to-zero
+serverless deployment left running for production, confirm it actually
+scales to zero on idle before walking away — the cost model above assumes
+it does.
+
+## Session budget
+
+Rough shape, assuming the config/adapter/validate scaffolding above already
+works (which is the entire point of doing it ahead of time): install +
+verify CUDA (~15 min), pin checkpoint + run step 5 validation (~15-30 min,
+more if `EXPECTED_CHANNELS` needs adjusting), golden-tile + pregen radius 8
+(~10-60 min depending on per-tile inference cost — measure on tile 1 before
+committing to the full radius), teardown (~5 min). Target: **a single
+afternoon, not a multi-day research project.**

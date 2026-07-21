@@ -1,0 +1,65 @@
+# GPU worker image for the real terrain-diffusion provider (bring-up: see
+# docs/diffusion-bringup.md). NOT the default terrain-service image (that's
+# ./Dockerfile, CPU-only, synthetic provider) — this one is only needed when
+# TERRAIN_PROVIDER=diffusion is actually generating tiles on a rented GPU.
+#
+# Unbuildable without network access to pull the CUDA/terrain-diffusion deps
+# in this environment, but the shape is what a bring-up session needs:
+# build this on the rented GPU box (docs/diffusion-bringup.md step 2), or as
+# a CI image once a CI runner has GPU access.
+#
+#   docker build -f terrain-service/Dockerfile.diffusion -t terrain-service-diffusion terrain-service/
+#   docker run --gpus all -e TERRAIN_PROVIDER=diffusion \
+#       -e TERRAIN_CACHE_DIR=/data/tile-cache -v tile-cache:/data/tile-cache \
+#       -p 8000:8000 terrain-service-diffusion
+
+# CUDA 12.x + cuDNN devel base — matches terrain-diffusion's torch
+# requirement (docs/diffusion-bringup.md step 2). Devel (not runtime) because
+# some torch extension builds need nvcc; swap to a `-runtime` tag once
+# bring-up confirms no source builds are needed, to shrink the image.
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+WORKDIR /app
+
+# Ubuntu 22.04's default python3 is 3.10; terrain-service targets 3.11+ in
+# CI (.github/workflows/ci.yml) but 3.10 is fine here — pin explicitly if
+# that ever matters.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip git \
+    && rm -rf /var/lib/apt/lists/*
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+# terrain-service's own deps (flask/numpy/pytest — no torch here).
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt gunicorn
+
+# --- terrain-diffusion install placeholder ---
+# Pin an exact commit/tag once bring-up selects one (docs/diffusion-bringup.md
+# step 2/3); `main` is a placeholder, not what a real deployment should use.
+# CUDA-enabled torch first (index-url below matches CUDA 12.4; adjust to
+# match whatever the rented box's driver actually supports), THEN
+# terrain-diffusion's own requirements (which would otherwise pull a
+# CPU-only torch wheel).
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu124
+RUN git clone --depth 1 https://github.com/xandergos/terrain-diffusion /opt/terrain-diffusion \
+    && pip install --no-cache-dir -r /opt/terrain-diffusion/requirements.txt \
+    && pip install --no-cache-dir -e /opt/terrain-diffusion
+# Checkpoint weights are NOT baked into the image (too large, and pinned per
+# docs/diffusion-bringup.md step 3 via DiffusionConfig.checkpoint_sha256) —
+# mount or download them at container start, e.g.:
+#   ENV TERRAIN_DIFFUSION_CHECKPOINT_URL=...
+#   RUN mkdir -p /data/checkpoints
+# and fetch in an entrypoint script once DiffusionProvider._call_model reads
+# from a real path instead of raising NotImplementedError.
+
+COPY . .
+
+RUN mkdir -p /data/tile-cache
+EXPOSE 8000
+
+ENV TERRAIN_CACHE_DIR=/data/tile-cache
+ENV TERRAIN_PROVIDER=diffusion
+
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "terrain_service.app:create_app()"]
+
+VOLUME ["/data/tile-cache"]
