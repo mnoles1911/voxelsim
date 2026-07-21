@@ -161,13 +161,39 @@ inline constexpr int32_t kCaveMinSurfaceMm = 12000;   // columns below this get 
 inline constexpr int64_t kCaveMinVoxelZ = 0;          // never carve at or below sea level
 
 // Max tube axes recorded per column. Four edges meet at a node, so a column
-// sitting exactly on a junction can legitimately see 4; 6 leaves headroom for
-// an unrelated tube brushing past. The cap is a fixed-size-storage bound, not
-// a design limit — test_caves.cpp CaveSegmentCapHeadroom measures the real
-// maximum over a large sample and fails if it ever reaches the cap, so the
-// (deterministic, fixed-iteration-order) truncation below is never reached in
-// practice on either CPU or GPU.
-inline constexpr int32_t kMaxCaveSegs = 8;
+// sitting exactly on a junction can legitimately see 4 tunnels; since M4 cave
+// pass v2 (docs/cavern-design.md §4) a crevice can ride the SAME edge as a
+// tunnel, so a junction column can now see up to 4 tunnels + 4 crevices = 8;
+// 12 leaves headroom for an unrelated tube brushing past. The cap is a
+// fixed-size-storage bound, not a design limit — test_caves.cpp
+// CaveSegmentCapHeadroom measures the real maximum over a large sample and
+// fails if it ever reaches the cap, so the (deterministic, fixed-iteration-
+// order) truncation below is never reached in practice on either CPU or GPU.
+inline constexpr int32_t kMaxCaveSegs = 12;
+
+// --- crevices (M4 cave pass v2, docs/cavern-design.md §4) -------------------
+// A crevice is NOT a new generator: it is a 1-in-8 gated decoration riding an
+// EXISTING lattice edge (the tube is already there), a thin lens-tapered
+// vertical slab centered on the tube's own axis. Because the slab always
+// contains the axis point, connectivity is inherited for free from the tube
+// it rides — no separate connectivity argument needed. It emits an ordinary
+// CaveSeg, in depth space exactly like the tube, so there is zero new
+// per-voxel mechanism: caveCarveAt does not change at all.
+inline constexpr uint64_t kCrevGateMask = 7; // 1-in-8: top 3 bits of the hash == 0
+inline constexpr int64_t kCrevHalfThickMinMm = 300;  // 0.3 m
+inline constexpr int64_t kCrevHalfThickSpanMm = 500; // -> [0.3, 0.8) m
+inline constexpr int64_t kCrevUpMinMm = 3000;   // 3 m above the tube axis
+inline constexpr int64_t kCrevUpSpanMm = 7000;  // -> [3, 10) m
+inline constexpr int64_t kCrevDownMinMm = 2000; // 2 m below the tube axis
+inline constexpr int64_t kCrevDownSpanMm = 4000; // -> [2, 6) m
+
+// Crevices must stay thinner than the thinnest tunnel: their xy accept
+// corridor (radius t) is then always a strict subset of the tube's own
+// (radius r), so a crevice can never exist somewhere its own tube doesn't —
+// the containment the header comment's connectivity argument relies on.
+static_assert(kCrevHalfThickMinMm + kCrevHalfThickSpanMm < kCaveRadiusMinMm,
+              "crevices must stay thinner than the thinnest tunnel radius, or a "
+              "crevice could exist outside its own tube's xy footprint");
 
 // --- structural invariants, checked at compile time -------------------------
 
@@ -195,6 +221,8 @@ inline constexpr uint32_t CH_CAVE_NODE = 18;   // node jitter (position + depth)
 inline constexpr uint32_t CH_CAVE_EDGE = 19;   // non-backbone edge gate
 inline constexpr uint32_t CH_CAVE_RADIUS = 20; // per-edge tube radius
 inline constexpr uint32_t CH_CAVE_SHAFT = 21;  // sinkhole gate + shaft radius
+// 22/23/25 belong to voxelcore/caverns.h (CH_CAVERN_SITE/_ROUGH/_FLOOD).
+inline constexpr uint32_t CH_CREVICE = 24;     // crevice gate + slab geometry
 
 // --- node / edge primitives -------------------------------------------------
 
@@ -234,6 +262,18 @@ constexpr int64_t caveEdgeRadiusMm(uint64_t seed, int64_t i, int64_t j, int32_t 
     const uint64_t h = hash2(seed, i, j * 2 + dir, CH_CAVE_RADIUS);
     return kCaveRadiusMinMm +
            static_cast<int64_t>((((h >> 44) & 0xFFFFFu) * static_cast<uint64_t>(kCaveRadiusSpanMm)) >> 20);
+}
+
+// One hash2 call per edge supplies the crevice's gate bit AND all of its
+// geometry (half-thickness, up/down reach) — a single channel, unlike the
+// tunnel's split gate/radius channels, since the design doc doesn't call for
+// folding anything here (there is no separate cheap tier to protect: a
+// crevice is only ever evaluated on an edge that already exists).
+constexpr uint64_t caveCreviceHash(uint64_t seed, int64_t i, int64_t j, int32_t dir) {
+    return hash2(seed, i, j * 2 + dir, CH_CREVICE);
+}
+constexpr bool caveCreviceGateOpen(uint64_t h) {
+    return ((h >> 61) & kCrevGateMask) == 0;
 }
 
 // --- per-column reduction ---------------------------------------------------
@@ -313,6 +353,58 @@ constexpr CaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int32_
                     out.segs[out.count].marginSq = static_cast<int32_t>(marginSq);
                     out.segs[out.count].depthMm = static_cast<int32_t>(cd);
                     ++out.count;
+                }
+
+                // Crevice: a 1-in-8 gated thin vertical slab riding this same
+                // edge (docs/cavern-design.md §4). Only reachable here because
+                // marginSq > 0 already put us within the (wider) tunnel radius
+                // r of this axis; kCrevHalfThickMaxMm < kCaveRadiusMinMm
+                // (static_assert above) means a column outside r is provably
+                // outside the crevice's own, narrower corridor too, so no
+                // separate reject was skipped.
+                const uint64_t crevH = caveCreviceHash(seed, i, j, dir);
+                if (caveCreviceGateOpen(crevH)) {
+                    const int64_t tMm =
+                        kCrevHalfThickMinMm +
+                        static_cast<int64_t>(((crevH & 0xFFFFFu) * static_cast<uint64_t>(kCrevHalfThickSpanMm)) >> 20);
+                    if (ex * ex + ey * ey <= tMm * tMm) {
+                        const int64_t hUpMm =
+                            kCrevUpMinMm + static_cast<int64_t>((((crevH >> 20) & 0xFFFFFu) *
+                                                                  static_cast<uint64_t>(kCrevUpSpanMm)) >> 20);
+                        const int64_t hDownMm =
+                            kCrevDownMinMm + static_cast<int64_t>((((crevH >> 40) & 0xFFFFFu) *
+                                                                    static_cast<uint64_t>(kCrevDownSpanMm)) >> 20);
+                        // Per-column clamp: never let the slab's top reach
+                        // shallower than the roof clamp, so a crevice pinches
+                        // out gracefully near the surface instead of getting
+                        // an abrupt flat lid from caveCarveAt's own guard.
+                        const int64_t hUpEffMm = clampi64(hUpMm, 0, cd - kCaveRoofMinMm);
+                        const int64_t halfSpanMm = (hUpEffMm + hDownMm) / 2;
+                        // Lens taper: 4u(1-u), u = num/den (the closest-
+                        // approach parameter already computed above) -- 0 at
+                        // either node, 1 at mid-edge, so the fissure pinches
+                        // to nothing well before it would otherwise end in a
+                        // flat wall at the node. Done in Q16 fixed point
+                        // rather than the exact rational (num*(den-num)/den^2)
+                        // on purpose: den = dx^2+dy^2 for a jittered lattice
+                        // edge can reach ~3e9 mm^2 (two node jitters can each
+                        // span most of a lattice cell), so den*den overflows
+                        // int64 -- this is exactly the kind of construct
+                        // tools/lint-shader-ub.py exists to keep out of the
+                        // shader, and the reason every division elsewhere in
+                        // this file goes through floorDiv on pre-scaled
+                        // quantities instead of squaring a large denominator.
+                        const int64_t uQ16 = floorDiv(num << 16, den);
+                        const int64_t taperQ16 = (4 * uQ16 * ((1 << 16) - uQ16)) >> 16;
+                        const int64_t halfSpanTaperedMm = floorDiv(halfSpanMm * taperQ16, 1 << 16);
+                        const int64_t crevMarginSq = halfSpanTaperedMm * halfSpanTaperedMm;
+                        if (crevMarginSq > 0 && out.count < kMaxCaveSegs) {
+                            out.segs[out.count].marginSq = static_cast<int32_t>(crevMarginSq);
+                            out.segs[out.count].depthMm =
+                                static_cast<int32_t>(cd + floorDiv(hDownMm - hUpEffMm, 2));
+                            ++out.count;
+                        }
+                    }
                 }
             }
         }

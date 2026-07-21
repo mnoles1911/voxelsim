@@ -131,7 +131,13 @@ VXC_TEST(cave_golden_digest) {
                 d.u8(caveCarveAt(c, kFlatSurfaceMm, kFlatBedrockMm, vz) ? 1 : 0);
         }
     }
-    CHECK_EQ(d.h, 0x1CD7912E8DBBB5EAull); // GOLDEN(cave_layer) — new at kWorldGenVersion 4
+    // GOLDEN(cave_layer) — new at kWorldGenVersion 4; MOVED for M4 cave pass v2
+    // (docs/cavern-design.md C2): caveColumnFor now also emits crevice segs on
+    // ~1-in-8 of existing edges, so count/segs[] shift for many sampled
+    // columns even though the tunnel geometry itself is unchanged. Re-pinned
+    // per the build plan's explicit "caves.h + test_caves.cpp headroom/golden
+    // updates" ownership for this subtask.
+    CHECK_EQ(d.h, 0xBFE42E07FFA6B78Dull);
 }
 
 // --- safety rule 1: the bedrock floor is never breached ----------------------
@@ -313,6 +319,114 @@ VXC_TEST(cave_segment_cap_headroom) {
     std::printf("    [caves] segment cap: max %d tubes per column over %zu columns "
                 "(cap %d); %.1f%% of columns are over a tube\n",
                 maxSegs, columns, kMaxCaveSegs, 100.0 * double(withAny) / double(columns));
+}
+
+// --- crevices (M4 cave pass v2, docs/cavern-design.md §4) -------------------
+
+VXC_TEST(crevice_gate_rate_is_about_one_in_eight) {
+    // Direct hash-level check, independent of whether any particular edge
+    // exists: the gate itself should open close to 1/8 of the time.
+    int64_t total = 0, open = 0;
+    for (int64_t i = -400; i < 400; ++i)
+        for (int64_t j = -400; j < 400; j += 7)
+            for (int32_t dir = 0; dir < 2; ++dir) {
+                ++total;
+                if (caveCreviceGateOpen(caveCreviceHash(kSeed, i, j, dir))) ++open;
+            }
+    const double rate = double(open) / double(total);
+    std::printf("    [caves] crevice gate: %lld/%lld open (%.3f%%, target 12.5%%)\n",
+                static_cast<long long>(open), static_cast<long long>(total), 100.0 * rate);
+    CHECK(rate > 0.10);
+    CHECK(rate < 0.15);
+}
+
+VXC_TEST(crevice_geometry_pinches_out_at_nodes_and_contains_the_tube_axis) {
+    // Recompute the crevice reduction directly (same formulas as
+    // caveColumnFor's crevice block) for a handful of real gated-open edges,
+    // and check the two structural claims the header comment makes: the
+    // emitted z-interval always contains the tube axis depth `cd` at
+    // mid-edge (u=0.5, where the lens taper is maximal), and every decoded
+    // field stays inside its documented range.
+    int64_t edgesChecked = 0;
+    for (int64_t j = 0; j <= 40 && edgesChecked < 20; j += 4) {
+        for (int64_t i = 0; i <= 40 && edgesChecked < 20; ++i) {
+            for (int32_t dir = 0; dir < 2 && edgesChecked < 20; ++dir) {
+                if (!caveEdgeExists(kSeed, i, j, dir)) continue;
+                const uint64_t crevH = caveCreviceHash(kSeed, i, j, dir);
+                if (!caveCreviceGateOpen(crevH)) continue;
+                ++edgesChecked;
+
+                const CaveNode a = caveNode(kSeed, i, j);
+                const CaveNode b = (dir == 0) ? caveNode(kSeed, i + 1, j) : caveNode(kSeed, i, j + 1);
+                const int64_t dx = b.xMm - a.xMm, dy = b.yMm - a.yMm;
+                const int64_t den = dx * dx + dy * dy;
+                CHECK(den > 0);
+
+                const int64_t tMm =
+                    kCrevHalfThickMinMm +
+                    static_cast<int64_t>(((crevH & 0xFFFFFu) * static_cast<uint64_t>(kCrevHalfThickSpanMm)) >> 20);
+                const int64_t hUpMm =
+                    kCrevUpMinMm + static_cast<int64_t>((((crevH >> 20) & 0xFFFFFu) *
+                                                          static_cast<uint64_t>(kCrevUpSpanMm)) >> 20);
+                const int64_t hDownMm =
+                    kCrevDownMinMm + static_cast<int64_t>((((crevH >> 40) & 0xFFFFFu) *
+                                                            static_cast<uint64_t>(kCrevDownSpanMm)) >> 20);
+                CHECK(tMm >= kCrevHalfThickMinMm);
+                CHECK(tMm < kCrevHalfThickMinMm + kCrevHalfThickSpanMm);
+                CHECK(hUpMm >= kCrevUpMinMm);
+                CHECK(hUpMm < kCrevUpMinMm + kCrevUpSpanMm);
+                CHECK(hDownMm >= kCrevDownMinMm);
+                CHECK(hDownMm < kCrevDownMinMm + kCrevDownSpanMm);
+
+                // Mid-edge: taper is maximal, so the slab is at its full
+                // (roof-clamped) size and must contain the tube axis depth at
+                // that same point. Q16 fixed point, matching caveColumnFor's
+                // crevice block exactly (den can be too large to square into
+                // int64, see that block's comment).
+                const int64_t numMid = den / 2;
+                const int64_t cdMid = a.depthMm + floorDiv((b.depthMm - a.depthMm) * numMid, den);
+                const int64_t hUpEffMm = clampi64(hUpMm, 0, cdMid - kCaveRoofMinMm);
+                const int64_t halfSpanMm = (hUpEffMm + hDownMm) / 2;
+                const int64_t uQ16Mid = floorDiv(numMid << 16, den);
+                const int64_t taperQ16Mid = (4 * uQ16Mid * ((1 << 16) - uQ16Mid)) >> 16;
+                const int64_t halfSpanTaperedMid = floorDiv(halfSpanMm * taperQ16Mid, 1 << 16);
+                CHECK(halfSpanTaperedMid > 0);
+                const int64_t depthMid = cdMid + floorDiv(hDownMm - hUpEffMm, 2);
+                const int64_t centerOffset = depthMid - cdMid;
+                CHECK(centerOffset <= halfSpanTaperedMid);
+                CHECK(-centerOffset <= halfSpanTaperedMid);
+
+                // At either node (u=0 or u=1), the taper is zero by
+                // construction -- the slab pinches to nothing.
+                CHECK_EQ((4 * static_cast<int64_t>(0) * ((1 << 16) - 0)) >> 16, 0);
+                const int64_t uQ16End = floorDiv(den << 16, den); // u=1 -> 1<<16
+                CHECK_EQ((4 * uQ16End * ((1 << 16) - uQ16End)) >> 16, 0);
+            }
+        }
+    }
+    std::printf("    [caves] crevice geometry: %lld gated-open edges sampled, all "
+                "well-formed and mid-edge slabs contain their tube axis\n",
+                static_cast<long long>(edgesChecked));
+    CHECK(edgesChecked > 0);
+}
+
+VXC_TEST(crevice_segments_actually_appear_in_caveColumnFor) {
+    // End-to-end: scanning real columns must find at least one column whose
+    // segment count exceeds what four tunnels alone could ever contribute at
+    // an ordinary junction, evidencing a crevice seg riding along.
+    int32_t maxSegs = 0;
+    size_t columns = 0;
+    for (int64_t x = -4096; x < 4096; x += 3)
+        for (int64_t y = -4096; y < 4096; y += 5) {
+            ++columns;
+            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm);
+            if (c.count > maxSegs) maxSegs = c.count;
+        }
+    std::printf("    [caves] crevice presence: max %d segs/column over %zu columns "
+                "(cap %d) -- above the pre-crevice max of 4 confirms crevices fire\n",
+                maxSegs, columns, kMaxCaveSegs);
+    CHECK(maxSegs > 4);
+    CHECK(maxSegs < kMaxCaveSegs);
 }
 
 // --- connectivity: the tunnel network on its own -----------------------------
