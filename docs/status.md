@@ -1749,6 +1749,95 @@ Phase READ/APPLY too; (c) revisit whether the overflow cap SHOULD count air
 unblock (a)) -- but that is a deliberate world-breaking change (digest +
 `kWaterCAVersion` bump), a separate decision, not a silent perf tweak.
 
+## Water track — W2 perf: cross-tick solidity memo (2.8x, BYTE-IDENTICAL, opt-in) + persistent-body design pass (2026-07-21, worktree agent)
+
+The design pass the section above asked for. Two deliverables: a **shipped,
+byte-identical 2.8x** on top of the previous 3x, and a **decision, not a
+behavior change**, on the persistent per-water-body structure —
+`docs/adr/0003-hydrostatic-persistent-body.md`, drafted **PENDING Matt's
+sign-off**. No tick output changed, no golden re-pinned, no
+`kWaterCAVersion` bump.
+
+**The two filed blockers were re-derived, and both are less fatal than filed.**
+(1) The overflow cap does count AIR — confirmed — but the count DECOMPOSES into
+(persistent water size) + (this tick's air), so it blocks only the naive
+"skip untouched bodies" shortcut, not a persistent structure. (2) Air does
+bridge water — confirmed — but gate (c) means an air cell is only explorable if
+its brick is in `touched`, so **every air bridge lies inside the touched region
+we already pay to walk**; persistent water union-find + per-tick bridge unions
+reproduces the exact partition. The blocker that actually bites is different and
+was not previously filed: **splits** (union-find has no deletion, so a draining
+cell forces a re-flood — worst case is today's cost plus guard overhead) and the
+**visited obligation** (even a provably-unchanged component must still have its
+cells marked visited, or a later seed inside it emits different writes; that is
+O(cells) unless per-brick visited masks are persisted, i.e. the structure must
+carry per-body per-brick mask state, not just a size and a volume). The ADR
+records the **replay-skip invariant** (a component's output is a pure function
+of fill + `touched`-membership + `solid_` over its *dependency footprint*, so an
+unchanged footprint permits a skip) so it never has to be re-derived; merges,
+splits and appearing/vanishing air bridges all fall out of the guard rather than
+needing special cases.
+
+**What shipped: an opt-in cross-tick memo of `solid_`** (`waterca.h`
+`setSolidCacheEnabled` / `invalidateSolidAt` / `invalidateSolidRegion` /
+`invalidateSolidCache` / `solidCacheBrickCount`), stored as per-brick 512-bit
+known/solid mask pairs and reached through the flood's existing per-brick cache
+node, so an air-shell solidity question becomes a shift-and-test with no
+hashing. Memoizing a pure function cannot change its answers, so this is
+byte-identical — for as long as the memo agrees with `solid_`, which is the
+caller's invalidation obligation. **Default OFF**, because the one WaterCA whose
+SolidFn sees editable terrain is the live UE subsystem's
+(`IsSolidAtVoxel` -> `World::materialAt`, overlay-aware: digging and explosives
+change solidity under settled water), and the plumbing to notify it lives in
+`VoxelWaterSubsystem.cpp` / `VoxelWorldSubsystem.cpp`, not in this agent's owned
+files. Enabling it there is ADR-0003 item 2, pending sign-off.
+
+**Measured** (`vxc_waterca_bench`, new `--solid-cache`, `--count-queries`,
+`--lake`, `--lake-span`, `--lake-solid-spin` flags):
+
+| Scenario | memo off | memo ON |
+|---|---|---|
+| 441-column pour, real Amplifier terrain (full-run avg) | 329-345 ms/tick | **111-121 ms/tick** |
+| terrain `solid_` calls, same run | 40.8M | 4.7M |
+| settled 63x63 lake, ~1us/query emulated | 9.2 ms/tick | 6.5 ms/tick |
+| settled 127x127 lake, ~1us/query emulated | 10.6 ms/tick | 6.8 ms/tick |
+
+That is **~2.8-3.0x** (paired back-to-back runs; the memo-off figure is the
+noisier of the two, ranging to ~435 ms under CPU contention from a concurrent
+build, while memo-on sits stably at 111-115 ms), and it puts Phase C *below* the pre-Phase-C v2 baseline
+(~140-155 ms/tick) — Phase C is no longer a regression against the pass it
+regressed. Memo memory on the pour bench: 6477 bricks, ~830KB of masks.
+
+**Why the persistent body structure is DEFERRED (recommendation, not a
+unilateral call).** The new `--lake` bench mode measures the case the
+441-column pour does not represent: a fully settled pool disturbed by one unit
+per tick. It turns out a settled body barely explores air at all — once it
+settles `touched` shrinks to the disturbed corner, and gate (c) confines air
+exploration to `touched` — so the settled-lake cost is only ~6.5 ms/tick after
+the memo, and it grows *sub-linearly* (2.8 -> 6.3 ms as lake area grows 38x,
+since big bodies trip the overflow cap and get skipped). So the persistent
+structure's measured prize is ~6.5 ms/tick per large settled body, against the
+memo's ~230 ms/tick already banked, for an order of magnitude more complexity
+and determinism risk. ADR-0003 recommends revisiting only once (a) M3+ has
+multiple large persistent bodies resident and (b) the memo is live in-engine.
+
+**Verification**: 120/120 `vxc_tests` green (115 existing + 5 new). Both
+goldens re-derived with the memo ON inside
+`waterca_solid_cache_golden_digests_unchanged` — `0x3D2224BE4A253404` and
+`0x56BC18914355A205`, unchanged. New tests also cover tick-by-tick equality
+against an unmemoized CA over the U-bend, order-independence with the memo on,
+mid-run full-invalidate / disable / re-enable, and — the case the memo is not
+vacuously safe for — a **live terrain edit** (a divider wall dug out under
+settled water) where the memoized CA must track an unmemoized one byte-for-byte
+via `invalidateSolidRegion`; that test is the executable spec of what a caller
+owes WaterCA. Additionally, the whole suite was run once with the memo default
+FORCED ON: 119/120 byte-identical, the single failure being that test's own
+deliberately-unmemoized control instance — which incidentally proves the test
+really does detect a missed invalidation. Clang `-Wall -Wextra -Wconversion
+-Wsign-conversion -Werror` clean on `waterca.cpp`, `test_waterca.cpp` and
+`waterca_bench.cpp` (also fixed a pre-existing sign-conversion in the bench's
+`samples.reserve`); float-ban clean.
+
 ## Backlog (parked / deferred, updated 2026-07-20)
 
 | Item | State | Unblock |
