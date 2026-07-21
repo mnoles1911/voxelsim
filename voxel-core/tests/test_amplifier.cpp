@@ -3,6 +3,7 @@
 // M0 NVIDIA-vs-AMD gate: gcc and clang CI builds must both match it.
 
 #include "voxelcore/amplifier.h"
+#include "voxelcore/biome.h"
 #include "voxelcore/generator.h"
 #include "vxctest.h"
 
@@ -35,8 +36,13 @@ VXC_TEST(amplifier_stratigraphy_ordering) {
             CHECK(col.topsoilMm >= 0);
             CHECK(col.subsoilMm >= 0);
             CHECK(col.bedrockDepthMm > col.topsoilMm + col.subsoilMm);
+            // Biome surface materials (M4, voxelcore/biome.h); MAT_SNOW is a
+            // retired v0 id no longer produced by classifyBiome.
             CHECK(col.surfaceMat == MAT_TOPSOIL || col.surfaceMat == MAT_SAND ||
-                  col.surfaceMat == MAT_SNOW);
+                  col.surfaceMat == MAT_GRASS || col.surfaceMat == MAT_JUNGLE_SOIL ||
+                  col.surfaceMat == MAT_SAVANNA_GRASS || col.surfaceMat == MAT_PODZOL ||
+                  col.surfaceMat == MAT_PERMAFROST || col.surfaceMat == MAT_MUD ||
+                  col.surfaceMat == MAT_ROCK);
 
             // Walking down the column: air above surface, then the layer
             // sequence, never air below the surface (implicit-solid doctrine).
@@ -71,7 +77,7 @@ VXC_TEST(amplifier_golden_digest) {
             d.u32(static_cast<uint32_t>(col.bedrockDepthMm));
             d.u8(col.surfaceMat);
         }
-    CHECK_EQ(d.h, 0xA7CFA118B16CE0DFull); // GOLDEN(amplifier_columns)
+    CHECK_EQ(d.h, 0x73B43CAE621CA286ull); // GOLDEN(amplifier_columns) — M4 biome surfaceMat, kWorldGenVersion 2
 }
 
 VXC_TEST(generated_brick_matches_pointwise_queries) {

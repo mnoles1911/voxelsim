@@ -17,7 +17,7 @@ struct ColumnSample {
     int32_t topsoilMm = 0;      // layer thickness below surface
     int32_t subsoilMm = 0;      // layer thickness below topsoil
     int32_t bedrockDepthMm = 0; // depth below surface where bedrock begins
-    MaterialId surfaceMat = MAT_TOPSOIL; // TOPSOIL | SAND | SNOW
+    MaterialId surfaceMat = MAT_TOPSOIL; // biome surface material, voxelcore/biome.h
 };
 
 class Amplifier {

@@ -3,6 +3,7 @@ add_executable(vxc_tests
   test_brick.cpp
   test_hash.cpp
   test_amplifier.cpp
+  test_biome.cpp
   test_mesher.cpp
   test_editlog.cpp
   test_editcompact.cpp

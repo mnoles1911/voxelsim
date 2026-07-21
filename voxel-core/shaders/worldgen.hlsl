@@ -29,7 +29,7 @@ static const uint CH_DETAIL_OCTAVE_BASE = 0;
 static const uint CH_TOPSOIL_JITTER = 16;
 static const uint CH_BEDROCK_JITTER = 17;
 
-// Material ids (core.h).
+// Material ids (core.h) — append only, never renumber.
 static const uint MAT_AIR = 0;
 static const uint MAT_BEDROCK = 1;
 static const uint MAT_ROCK = 2;
@@ -38,6 +38,40 @@ static const uint MAT_SAND = 4;
 static const uint MAT_SUBSOIL = 5;
 static const uint MAT_TOPSOIL = 6;
 static const uint MAT_SNOW = 7;
+static const uint MAT_GRASS = 8;
+static const uint MAT_JUNGLE_SOIL = 9;
+static const uint MAT_SAVANNA_GRASS = 10;
+static const uint MAT_PODZOL = 11;
+static const uint MAT_PERMAFROST = 12;
+static const uint MAT_MUD = 13;
+static const uint MAT_CLAY = 14;
+
+// BiomeId (voxelcore/biome.h) — append only, never renumber.
+static const uint BIOME_OCEAN = 0;
+static const uint BIOME_BEACH = 1;
+static const uint BIOME_GRASSLAND = 2;
+static const uint BIOME_TEMPERATE_FOREST = 3;
+static const uint BIOME_RAINFOREST = 4;
+static const uint BIOME_DESERT = 5;
+static const uint BIOME_SAVANNA = 6;
+static const uint BIOME_TAIGA = 7;
+static const uint BIOME_TUNDRA_ALPINE = 8;
+
+// Biome gate/Whittaker thresholds (voxelcore/biome.h) — bit-exact mirror,
+// worldgen contract.
+static const int64_t kBiomeCliffSlopeMmPerPx = 6000;
+static const int kBiomeBeachLowerMm = -3000;
+static const int kBiomeBeachUpperMm = 4000;
+static const int kBiomeTreelineBaseMm = 2600000;
+static const int kBiomeTreelineMmPerTempUnit = 20000;
+static const int kBiomeAlpineRockLineMm = 3200000;
+static const int kBiomeTempColdU8 = 70;
+static const int kBiomeTempWarmU8 = 140;
+static const int kBiomeTempHotU8 = 170;
+static const int kBiomePrecipAridU8 = 60;
+static const int kBiomePrecipSemiU8 = 100;
+static const int kBiomePrecipModU8 = 170;
+static const int kBiomeSeasonalHighU8 = 128;
 
 // Detail octave table v1 (amplifier.cpp kDetailOctaves).
 static const int kOctaveCount = 4;
@@ -98,6 +132,54 @@ int64_t valueNoise2(uint64_t seed, int64_t xMm, int64_t yMm, int64_t latticeMm, 
 int64_t slopeScaleQ10(int64_t slopeMmPerPx)
 {
     return clamp64(512 + slopeMmPerPx / 24, 256, 4096);
+}
+
+// --- biome classification (voxelcore/biome.h) -------------------------------
+// Bit-exact mirror of vxc::classifyBiome / vxc::biomeTreelineMm /
+// vxc::biomeSurfaceMaterial. See biome.h for the doc comments explaining the
+// gate order and every threshold; DO NOT let this drift from that file.
+
+int biomeTreelineMm(int tempU8)
+{
+    const int64_t adjusted = (int64_t)kBiomeTreelineBaseMm +
+                              ((int64_t)tempU8 - 128) * (int64_t)kBiomeTreelineMmPerTempUnit;
+    return (int)clamp64(adjusted, (int64_t)kBiomeBeachUpperMm, (int64_t)9000000);
+}
+
+uint classifyBiome(int tempU8, int precipU8, int seasonalityU8, int surfaceMm,
+                    int64_t slopeMmPerPx)
+{
+    if (slopeMmPerPx > kBiomeCliffSlopeMmPerPx) return BIOME_TUNDRA_ALPINE;
+    if (surfaceMm < kBiomeBeachLowerMm) return BIOME_OCEAN;
+    if (surfaceMm <= kBiomeBeachUpperMm) return BIOME_BEACH;
+    if (surfaceMm > biomeTreelineMm(tempU8)) return BIOME_TUNDRA_ALPINE;
+
+    if (tempU8 < kBiomeTempColdU8) return BIOME_TAIGA;
+
+    const bool seasonal = seasonalityU8 >= kBiomeSeasonalHighU8;
+    const bool warm = tempU8 >= kBiomeTempWarmU8;
+    const bool hot = tempU8 >= kBiomeTempHotU8;
+
+    if (precipU8 < kBiomePrecipAridU8) return hot ? BIOME_DESERT : BIOME_GRASSLAND;
+    if (precipU8 < kBiomePrecipSemiU8) return (warm && seasonal) ? BIOME_SAVANNA : BIOME_GRASSLAND;
+    if (precipU8 < kBiomePrecipModU8)
+        return (warm && seasonal) ? BIOME_SAVANNA : BIOME_TEMPERATE_FOREST;
+    return warm ? BIOME_RAINFOREST : BIOME_TEMPERATE_FOREST; // wet band
+}
+
+uint biomeSurfaceMaterial(uint biome, int surfaceMm)
+{
+    if (biome == BIOME_OCEAN) return MAT_MUD;
+    if (biome == BIOME_BEACH) return MAT_SAND;
+    if (biome == BIOME_GRASSLAND) return MAT_GRASS;
+    if (biome == BIOME_TEMPERATE_FOREST) return MAT_TOPSOIL;
+    if (biome == BIOME_RAINFOREST) return MAT_JUNGLE_SOIL;
+    if (biome == BIOME_DESERT) return MAT_SAND;
+    if (biome == BIOME_SAVANNA) return MAT_SAVANNA_GRASS;
+    if (biome == BIOME_TAIGA) return MAT_PODZOL;
+    // BIOME_TUNDRA_ALPINE (default) — see biome.h's biomeSurfaceMaterial doc
+    // comment for the elevation-based rock/permafrost split rationale.
+    return surfaceMm > kBiomeAlpineRockLineMm ? MAT_ROCK : MAT_PERMAFROST;
 }
 
 // --- kernel I/O ------------------------------------------------------------
@@ -222,6 +304,7 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
 
     const uint cl = rasterClimate(px, py);
     const uint clTemperature = cl & 0xff;
+    const uint clSeasonality = (cl >> 8) & 0xff;
     const uint clPrecipitation = (cl >> 16) & 0xff;
 
     GpuColumnSample outCol;
@@ -239,13 +322,12 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
     const uint64_t bj = hash2(seed, vx >> 6, vy >> 6, CH_BEDROCK_JITTER);
     outCol.bedrockDepthMm = (int)(40000 + ((bj >> 48) * 20000) / 65536);
 
-    if (clTemperature < 70 || outCol.surfaceMm > 2800000)
-        outCol.surfaceMat = MAT_SNOW;
-    else if ((clPrecipitation < 45 && clTemperature > 150) ||
-             (outCol.surfaceMm > -2000 && outCol.surfaceMm < 3000))
-        outCol.surfaceMat = MAT_SAND;
-    else
-        outCol.surfaceMat = MAT_TOPSOIL;
+    // Surface material from biome classification (M4) — morphology gates
+    // then Whittaker climate lookup, bit-exact mirror of
+    // vxc::Amplifier::column's classifyBiome/biomeSurfaceMaterial call.
+    const uint biome = classifyBiome((int)clTemperature, (int)clPrecipitation,
+                                     (int)clSeasonality, outCol.surfaceMm, slopeMmPerPx);
+    outCol.surfaceMat = biomeSurfaceMaterial(biome, outCol.surfaceMm);
 
     OutColumns[tid.x + tid.y * DispatchColumns.x] = outCol;
 }

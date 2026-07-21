@@ -481,6 +481,61 @@ behavior without the new switches/commands is unchanged (`LoadWorld: no
 saved world ... starting fresh` is the observed startup line whenever no
 save file exists, byte-identical to pre-wave-2 behavior otherwise).
 
+## M4 — Biome classification core (round 1 landed, 2026-07-20, worktree agent)
+
+Working plan + as-built writeup: docs/m4-plan.md "Round 1 implementation".
+Round-1 scope only (classification + per-biome surface materials); trees/
+flora/ecotone blending remain pending design (rounds 2-3).
+
+- [x] **Materials**: `voxel-core/include/voxelcore/core.h` grows from 8 to
+  15 ids (append-only 8-14): `MAT_GRASS`, `MAT_JUNGLE_SOIL`,
+  `MAT_SAVANNA_GRASS`, `MAT_PODZOL`, `MAT_PERMAFROST`, `MAT_MUD`,
+  `MAT_CLAY` (defined, unused headroom for a future wetland biome).
+  `MAT_SNOW` retired from active use, kept stable for old saved edit logs.
+- [x] **`voxelcore/biome.h`** (new, header-only, integer-only):
+  `classifyBiome` (morphology gates — slope, coastal band, temperature-
+  adjusted treeline — before a Whittaker temperature x precipitation table,
+  seasonality splitting savanna/grassland and forest types) +
+  `biomeSurfaceMaterial`. Full gate order and threshold rationale in
+  m4-plan.md.
+- [x] **Wiring**: `Amplifier::column` (amplifier.cpp) and
+  `worldgen.hlsl`'s `ColumnMain` both call classifyBiome/
+  biomeSurfaceMaterial in place of the old v0 ad-hoc surfaceMat logic;
+  `ColumnSample`/`GpuColumnSample` layout unchanged (BiomeId used
+  internally only).
+- [x] **`kWorldGenVersion` 1->2** (world-breaking); goldens regenerated:
+  `amplifier_golden_digest` `0xA7CFA118B16CE0DF -> 0x73B43CAE621CA286`,
+  `mips_chain_determinism_golden` `0xACC109F9B1A5AD25 -> 0xE4CF1B376622A38F`,
+  new `biome_map_golden_digest` `0xEDBF3C9217ECBBF6` (test_biome.cpp, a
+  direct classifier sweep). `test_hash.cpp` unaffected (hash/value-noise
+  primitives untouched).
+- [x] **CPU/GPU determinism gate — PASS bit-exact** (`vxc_gpu`, AMD Radeon
+  RX 7800 XT, seed 20260719): column-only regions digest
+  `1dbcabb01cfaf2bc` (was `be28ce960bd5bcf6`); `--radius 64m` gate 144/144
+  tiles (100%) verified, digest `95a82ba20200f6f2` (was
+  `e1db29a9b6874012`), 0.104s; `--radius 128m` gate 67/529 tiles (12.7%)
+  sampled, digest `b4c8ec5d0966894b` (was `583e91d62cefb8a9`), 0.177s —
+  both still comfortably under the <1s M0 gate target, unchanged from the
+  pre-M4 baseline (biome classification is cheap integer comparisons added
+  to an existing dispatch, no new kernels).
+- [x] **Tests**: new `voxel-core/tests/test_biome.cpp` (13 cases — biome
+  distribution sanity per climate band, the morphology-gate slope
+  override with an exact-boundary check, seasonality splits, coastal-band
+  edges, treeline monotonicity, the full surface-material mapping,
+  determinism, golden digest); `test_amplifier.cpp`'s stratigraphy test
+  updated to the new biome material set.
+- [x] **Build/gates**: `vxc_tests` 92/92 pass on MSVC 14.51/VS 2026
+  (Ninja/Release, `/W4 /WX`) — cross-checked with a standalone LLVM-MinGW
+  clang++ build of the same sources (same goldens, 0 failures), confirming
+  the classifier is pure cross-compiler-portable integer math. `vxc_gpu`
+  bit-exact PASS (above). clang `-Wall -Wextra -Wconversion
+  -Wsign-conversion` clean on every file touched this wave (pre-existing
+  unrelated warnings elsewhere in brick.h/world.h, not touched, left
+  as-is — same precedent as M5's wave). `worldgen.hlsl` compiles clean to
+  DXIL + SPIR-V for all 7 kernels. float-ban clean.
+- [ ] Round 2 (trees/structures) and round 3 (flora/placement, ecotone
+  blending) — pending design with Matt, m4-plan.md.
+
 ## M5 — Destruction (groundwork landed, 2026-07-20)
 
 - [x] **Connectivity flood-fill CPU reference** (`voxelcore/connectivity.h`,
