@@ -137,6 +137,22 @@ public:
 	// any chunk has streamed in.
 	double GetSurfaceHeightUU(double WorldX, double WorldY) const;
 
+	// Track B2 ("real .vxtl terrain tiles as a selectable tile source"):
+	// bilinear-samples RAW TILE elevation (not the full Amplifier -- see
+	// GetSurfaceHeightUU above for that) at the given world XY, through
+	// whichever ITileSampler this run is actually using (the synthetic
+	// sampler by default, or a loaded vxc::TileGridSampler under
+	// -VoxelTileDir=<path> -- see VoxelWorldSubsystem.cpp's FVoxelWorldImpl
+	// for the selection policy). This is the SAME sampler the ring cascade's
+	// Amplifier reads underneath it, which is the point: AVoxelClipmapActor's
+	// heightmap calls this instead of constructing its own sampler, so
+	// clipmap terrain and voxel terrain agree at their shared seam whether or
+	// not real tiles are loaded. Plain double signature (no vxc types) so this
+	// UHT-parsed header stays voxel-core-free by doctrine. Returns 0.0 if Impl
+	// is null (the transient "Entry"/loading world's subsystem instance --
+	// see bWorldBegunPlay's doc comment -- never gets a real Impl to sample).
+	double SampleTerrainHeightUU(double WorldXUU, double WorldYUU) const;
+
 	// True if the voxel at the given integer voxel-lattice coordinate is
 	// solid (overlay-aware World::materialAt != MAT_AIR -- edits are
 	// reflected immediately). Game thread only (same constraint as

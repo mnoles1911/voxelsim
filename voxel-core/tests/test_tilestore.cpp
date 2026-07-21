@@ -15,7 +15,10 @@
 
 #include "voxelcore/tilestore.h"
 
+#include <atomic>
 #include <filesystem>
+#include <thread>
+#include <vector>
 
 #include "voxelcore/amplifier.h"
 #include "vxctest.h"
@@ -26,6 +29,26 @@ namespace {
 
 std::filesystem::path fixturePath() {
     return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "tile_s1_seed1_0_0.vxtl";
+}
+
+// Builds an in-memory TileData with a constant elevation and constant
+// climate planes, for tests that want to drive the amplifier from known
+// hand-built tile data rather than the on-disk fixture.
+TileData makeConstantTile(uint64_t seed, int32_t x, int32_t y, uint8_t scale,
+                           int16_t elevationMetres, uint8_t temperature = 128,
+                           uint8_t seasonality = 0, uint8_t precipitation = 128,
+                           uint8_t precipVariability = 0) {
+    TileData t;
+    t.seed = seed;
+    t.x = x;
+    t.y = y;
+    t.scale = scale;
+    t.elevation.assign(TileData::kPixelCount, elevationMetres);
+    t.climate[0].assign(TileData::kPixelCount, temperature);
+    t.climate[1].assign(TileData::kPixelCount, seasonality);
+    t.climate[2].assign(TileData::kPixelCount, precipitation);
+    t.climate[3].assign(TileData::kPixelCount, precipVariability);
+    return t;
 }
 
 } // namespace
@@ -127,7 +150,7 @@ VXC_TEST(tilegridsampler_loads_and_rejects_seed_scale_mismatch) {
 VXC_TEST(tilegridsampler_pixel_routing_and_missing_tile_counter) {
     TileGridSampler s(1, 1);
     CHECK(s.loadTileFile(fixturePath()));
-    CHECK_EQ(s.missingTileQueries, uint64_t(0));
+    CHECK_EQ(s.missingTileQueries.load(), uint64_t(0));
 
     // In-range pixels: routed to tile (0,0), values match the fixture.
     CHECK_EQ(s.elevationMm(0, 0), int32_t(1210) * 1000);
@@ -140,33 +163,33 @@ VXC_TEST(tilegridsampler_pixel_routing_and_missing_tile_counter) {
     CHECK_EQ(int(c00.seasonality), 83);
     CHECK_EQ(int(c00.precipitation), 123);
     CHECK_EQ(int(c00.precipVariability), 134);
-    CHECK_EQ(s.missingTileQueries, uint64_t(0)); // still zero: all in-range
+    CHECK_EQ(s.missingTileQueries.load(), uint64_t(0)); // still zero: all in-range
 
     // Out-of-range positive pixel: tile (1,0), not loaded -> deterministic
     // default + counter increments.
     CHECK_EQ(s.elevationMm(512, 0), int32_t(0));
-    CHECK_EQ(s.missingTileQueries, uint64_t(1));
+    CHECK_EQ(s.missingTileQueries.load(), uint64_t(1));
     ClimateSample cMiss = s.climate(512, 0);
     CHECK_EQ(int(cMiss.temperature), 128);
     CHECK_EQ(int(cMiss.seasonality), 0);
     CHECK_EQ(int(cMiss.precipitation), 128);
     CHECK_EQ(int(cMiss.precipVariability), 0);
-    CHECK_EQ(s.missingTileQueries, uint64_t(2));
+    CHECK_EQ(s.missingTileQueries.load(), uint64_t(2));
 
     // Negative pixel coords: floorDiv(-1,512) == -1, a different (missing)
     // tile from tile (0,0) — must NOT alias to the loaded tile via truncation
     // toward zero.
     CHECK_EQ(s.elevationMm(-1, -1), int32_t(0));
-    CHECK_EQ(s.missingTileQueries, uint64_t(3));
+    CHECK_EQ(s.missingTileQueries.load(), uint64_t(3));
     CHECK_EQ(s.elevationMm(-512, 0), int32_t(0)); // tile (-1, 0)
-    CHECK_EQ(s.missingTileQueries, uint64_t(4));
+    CHECK_EQ(s.missingTileQueries.load(), uint64_t(4));
 
     // Exactly on the border: px=511 is the last local pixel of tile (0,0)
     // (in range, no counter bump); px=512 (checked above) is local pixel 0
     // of the neighboring, unloaded tile (1,0).
-    const uint64_t before = s.missingTileQueries;
+    const uint64_t before = s.missingTileQueries.load();
     CHECK_EQ(s.elevationMm(511, 0), int32_t(528) * 1000); // real tile data
-    CHECK_EQ(s.missingTileQueries, before);
+    CHECK_EQ(s.missingTileQueries.load(), before);
 }
 
 VXC_TEST(amplifier_over_tilegridsampler_is_deterministic) {
@@ -200,6 +223,187 @@ VXC_TEST(amplifier_over_tilegridsampler_is_deterministic) {
         }
     }
     CHECK_EQ(digestA.h, digestB.h);
-    CHECK_EQ(samplerA.missingTileQueries, uint64_t(0));
-    CHECK_EQ(samplerB.missingTileQueries, uint64_t(0));
+    CHECK_EQ(samplerA.missingTileQueries.load(), uint64_t(0));
+    CHECK_EQ(samplerB.missingTileQueries.load(), uint64_t(0));
+}
+
+VXC_TEST(amplifier_over_manual_tiles_end_to_end) {
+    // Same determinism proof as amplifier_over_tilegridsampler_is_deterministic,
+    // but driving TileGridSampler from hand-built TileData (no fixture/codec
+    // in the loop) — this is the shape UE runtime code will construct tiles
+    // in once decoded from the terrain service, so it's worth pinning
+    // independently of the fixture-based path.
+    constexpr uint64_t seed = 20260721;
+
+    TileData tile100 = makeConstantTile(seed, 0, 0, 1, 100);
+    TileData tile500 = makeConstantTile(seed, 0, 0, 1, 500);
+
+    TileGridSampler samplerA100(seed, 1), samplerB100(seed, 1), sampler500(seed, 1);
+    CHECK(samplerA100.loadTile(tile100));
+    CHECK(samplerB100.loadTile(tile100));
+    CHECK(sampler500.loadTile(tile500));
+
+    Amplifier ampA100(seed, samplerA100), ampB100(seed, samplerB100), amp500(seed, sampler500);
+
+    // (i) Determinism: two independently loaded samplers over byte-identical
+    // tile data must produce byte-identical ColumnSample output across a grid.
+    Digest digestA, digestB;
+    for (int64_t vy = 0; vy <= 150000; vy += 15000) {
+        for (int64_t vx = 0; vx <= 150000; vx += 15000) {
+            const ColumnSample ca = ampA100.column(vx, vy);
+            const ColumnSample cb = ampB100.column(vx, vy);
+            digestA.u32(static_cast<uint32_t>(ca.surfaceMm));
+            digestA.u32(static_cast<uint32_t>(ca.topsoilMm));
+            digestA.u32(static_cast<uint32_t>(ca.subsoilMm));
+            digestA.u32(static_cast<uint32_t>(ca.bedrockDepthMm));
+            digestA.u8(ca.surfaceMat);
+            digestB.u32(static_cast<uint32_t>(cb.surfaceMm));
+            digestB.u32(static_cast<uint32_t>(cb.topsoilMm));
+            digestB.u32(static_cast<uint32_t>(cb.subsoilMm));
+            digestB.u32(static_cast<uint32_t>(cb.bedrockDepthMm));
+            digestB.u8(cb.surfaceMat);
+        }
+    }
+    CHECK_EQ(digestA.h, digestB.h);
+    CHECK_EQ(samplerA100.missingTileQueries.load(), uint64_t(0));
+    CHECK_EQ(samplerB100.missingTileQueries.load(), uint64_t(0));
+
+    // (ii) Tile data actually drives the amplifier: the 500m tile must yield
+    // a strictly greater surfaceMm than the 100m tile at the same coords.
+    // The 400m (400,000mm) gap between the two constant bases dwarfs the
+    // bounded detail-octave contribution (see (iii) below), so this holds
+    // everywhere in the probed range, not just at one lucky point.
+    for (int64_t vy = 0; vy <= 150000; vy += 30000) {
+        for (int64_t vx = 0; vx <= 150000; vx += 30000) {
+            const int32_t s100 = ampA100.column(vx, vy).surfaceMm;
+            const int32_t s500 = amp500.column(vx, vy).surfaceMm;
+            CHECK(s500 > s100);
+        }
+    }
+
+    // (iii) Sane band around 100,000 mm for the 100m tile. Justification
+    // (mirrors amplifier.cpp's Amplifier::column): baseMm is an exact
+    // bilinear blend of a perfectly constant elevation field, so baseMm ==
+    // 100000 mm everywhere. detailMm is a sum of 4 octaves (amplitudes 1800 +
+    // 700 + 260 + 100 = 2860 mm, each individually bounded to
+    // [-amplitude, +amplitude] by valueNoise2's [-32768,32767]-scaled range)
+    // scaled by sScale/1024. Because the tile is perfectly flat,
+    // slopeMmPerPx == 0, so sScale == slopeScaleQ10(0) == 512 (0.5x). Worst
+    // case |detailMm| <= 0.5 * 2860 = 1430 mm. A +/-2000mm band gives
+    // comfortable margin over that bound without being so wide it would
+    // silently pass if the tile data stopped driving the base elevation.
+    for (int64_t vy = 0; vy <= 150000; vy += 30000) {
+        for (int64_t vx = 0; vx <= 150000; vx += 30000) {
+            const int32_t surfaceMm = ampA100.column(vx, vy).surfaceMm;
+            CHECK(surfaceMm >= 100000 - 2000);
+            CHECK(surfaceMm <= 100000 + 2000);
+        }
+    }
+}
+
+VXC_TEST(missing_tile_fallback_is_deterministic_through_amplifier) {
+    // Querying far outside any loaded tile must fall back to the documented
+    // deterministic default (elevation 0, default ClimateSample), bump the
+    // counter, and — since the amplifier is a pure function of what the
+    // sampler returns — still produce byte-identical Amplifier output across
+    // two independently constructed (empty) samplers.
+    constexpr uint64_t seed = 555;
+    TileGridSampler samplerA(seed, 1), samplerB(seed, 1); // no tiles loaded at all
+
+    for (TileGridSampler* s : {&samplerA, &samplerB}) {
+        CHECK_EQ(s->elevationMm(1'000'000, 1'000'000), int32_t(0));
+        const ClimateSample c = s->climate(1'000'000, 1'000'000);
+        CHECK_EQ(int(c.temperature), 128);
+        CHECK_EQ(int(c.seasonality), 0);
+        CHECK_EQ(int(c.precipitation), 128);
+        CHECK_EQ(int(c.precipVariability), 0);
+    }
+    CHECK_EQ(samplerA.missingTileQueries.load(), uint64_t(2));
+    CHECK_EQ(samplerB.missingTileQueries.load(), uint64_t(2));
+
+    Amplifier ampA(seed, samplerA), ampB(seed, samplerB);
+    Digest digestA, digestB;
+    for (int64_t vy = 500000; vy <= 590000; vy += 15000) {
+        for (int64_t vx = 500000; vx <= 590000; vx += 15000) {
+            const ColumnSample ca = ampA.column(vx, vy);
+            const ColumnSample cb = ampB.column(vx, vy);
+            digestA.u32(static_cast<uint32_t>(ca.surfaceMm));
+            digestA.u32(static_cast<uint32_t>(ca.topsoilMm));
+            digestA.u32(static_cast<uint32_t>(ca.subsoilMm));
+            digestA.u32(static_cast<uint32_t>(ca.bedrockDepthMm));
+            digestA.u8(ca.surfaceMat);
+            digestB.u32(static_cast<uint32_t>(cb.surfaceMm));
+            digestB.u32(static_cast<uint32_t>(cb.topsoilMm));
+            digestB.u32(static_cast<uint32_t>(cb.subsoilMm));
+            digestB.u32(static_cast<uint32_t>(cb.bedrockDepthMm));
+            digestB.u8(cb.surfaceMat);
+        }
+    }
+    CHECK_EQ(digestA.h, digestB.h);
+    // Every query in this loop misses (nothing is loaded), and both samplers
+    // ran the exact same query sequence, so their tallies must match exactly
+    // — not merely both be nonzero.
+    CHECK_EQ(samplerA.missingTileQueries.load(), samplerB.missingTileQueries.load());
+    CHECK(samplerA.missingTileQueries.load() > uint64_t(2));
+}
+
+VXC_TEST(concurrent_queries_are_thread_safe_and_counter_is_exact) {
+    // Meshing-worker-thread smoke test: several threads hammer
+    // elevationMm()/climate() concurrently, spanning both the one loaded
+    // tile and an adjacent never-loaded tile. tiles_ is populated before any
+    // thread starts (doctrine: all loadTile* calls happen at init), so the
+    // only concurrent mutation is the atomic counter increment. The query
+    // pattern is arranged so the exact miss count is computable up front,
+    // independent of thread interleaving.
+    constexpr uint64_t seed = 777;
+    TileGridSampler s(seed, 1);
+    CHECK(s.loadTile(makeConstantTile(seed, 0, 0, 1, 250, /*temperature=*/200,
+                                       /*seasonality=*/10, /*precipitation=*/90,
+                                       /*precipVariability=*/5)));
+
+    constexpr int kThreads = 4;
+    constexpr int64_t kItersPerThread = 4096; // multiple of 1024 -> exact miss accounting below
+    std::atomic<uint64_t> mismatches{0};
+
+    auto worker = [&](int64_t py) {
+        for (int64_t i = 0; i < kItersPerThread; ++i) {
+            // px cycles 0..1023: [0,511] is loaded tile (0,0); [512,1023] is
+            // never-loaded tile (1,0). py in [0, kThreads) keeps ty == 0
+            // throughout, so tile (0,0) is the only one ever loaded here.
+            const int64_t px = i % 1024;
+            const int32_t elev = s.elevationMm(px, py);
+            const ClimateSample c = s.climate(px, py);
+            if (px < 512) {
+                if (elev != int32_t(250) * 1000) mismatches.fetch_add(1, std::memory_order_relaxed);
+                if (c.temperature != 200 || c.seasonality != 10 || c.precipitation != 90 ||
+                    c.precipVariability != 5)
+                    mismatches.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                if (elev != 0) mismatches.fetch_add(1, std::memory_order_relaxed);
+                if (c.temperature != 128 || c.seasonality != 0 || c.precipitation != 128 ||
+                    c.precipVariability != 0)
+                    mismatches.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) threads.emplace_back(worker, int64_t(t));
+    for (std::thread& th : threads) th.join();
+
+    // Correctness must not be reported via CHECK/CHECK_EQ from inside worker
+    // threads: vxctest's failure counter is a plain int, not atomic, so
+    // concurrent CHECK failures there would themselves be a data race. All
+    // per-query verdicts are folded into the atomic `mismatches` counter
+    // instead, and asserted here after every thread has joined.
+    CHECK_EQ(mismatches.load(), uint64_t(0));
+
+    // Exact expected miss count: each thread's px cycles 0..1023 exactly
+    // kItersPerThread/1024 times; 512 of the 1024 px values per cycle land in
+    // the unloaded tile and miss on BOTH elevationMm and climate (2 misses
+    // each), independent of scheduling/interleaving.
+    const uint64_t cyclesPerThread = uint64_t(kItersPerThread) / 1024;
+    const uint64_t missesPerThread = cyclesPerThread * 512 * 2;
+    const uint64_t expectedTotal = missesPerThread * uint64_t(kThreads);
+    CHECK_EQ(s.missingTileQueries.load(), expectedTotal);
 }

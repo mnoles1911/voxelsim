@@ -6,10 +6,13 @@ is exactly why tiles are generated once, cached forever, and distributed as
 data.
 
 Bring-up status: everything that does NOT need a GPU is implemented and
-tested here — config, adapter, validation, dry-run plumbing. The one thing
-that needs a CUDA machine is clearly marked with a TODO in
-``DiffusionProvider._call_model``. See ``terrain-service/docs/diffusion-bringup.md``
-for the runbook.
+tested here — config, adapter, validation, dry-run plumbing, AND the real
+model call itself (``TerrainDiffusionBackend``), which is fully wired up but
+untestable without a CUDA machine (module import and construction never
+touch torch; only ``TerrainDiffusionBackend.generate_rasters`` does, lazily).
+See ``terrain-service/docs/diffusion-bringup.md`` for the remaining
+GPU-session runbook (pin a checkpoint, run validation, sanity-check the
+ASSUMPTIONs called out on ``TerrainDiffusionBackend``).
 
 Design, top to bottom:
 
@@ -48,10 +51,12 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 
-from ..tile_codec import CLIMATE_CHANNELS, PIXEL_SIZE_MM, Tile
+from ..tile_codec import CLIMATE_CHANNELS, PIXEL_SIZE_MM, TILE_SIZE, Tile
 
 # ---------------------------------------------------------------------------
 # Expected model output — our current assumption (plan §3.1, m4-plan.md).
@@ -316,6 +321,314 @@ class DiffusionConfig:
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint verification (pure, torch-free -- unit-testable with temp files).
+# ---------------------------------------------------------------------------
+
+
+def _sha256_of_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _sha256_of_checkpoint_path(path: "str | Path") -> str:
+    """sha256 of a checkpoint path, file OR directory.
+
+    A real terrain-diffusion checkpoint is NOT one file: ``WorldPipeline``
+    is a diffusers ``ConfigMixin``/``ModelMixin`` pipeline whose
+    ``from_pretrained`` loads a top-level ``config.json`` plus three
+    submodels (``coarse_model/``, ``base_model/``, ``decoder_model/``),
+    each its own ``config.json`` + ``*.safetensors`` (confirmed by reading
+    ``terrain_diffusion/inference/world_pipeline.py``'s ``from_pretrained``
+    and ``terrain_diffusion/models/edm_unet.py``'s ``EDMUnet2D(ModelMixin,
+    ConfigMixin)``). So a directory is hashed as a canonical manifest --
+    sha256 of every file's ``relative/path:sha256`` line, sorted by path --
+    which lets one sha256 pin an entire multi-file snapshot. A single file
+    path (e.g. bring-up/tests using one checkpoint blob) is hashed directly.
+    """
+    p = Path(path)
+    if p.is_file():
+        return _sha256_of_file(p)
+    if p.is_dir():
+        lines = [
+            f"{f.relative_to(p).as_posix()}:{_sha256_of_file(f)}"
+            for f in sorted(p.rglob("*"))
+            if f.is_file()
+        ]
+        return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+    raise FileNotFoundError(f"checkpoint path does not exist: {p}")
+
+
+def verify_checkpoint_sha256(path: "str | Path", expected: str) -> None:
+    """Verify a checkpoint file/directory's sha256 against ``expected``.
+
+    MUST be called before any load/inference call (doctrine: a silent
+    checkpoint swap under an unchanged ``provider_id`` would poison the
+    content-addressed tile cache with tiles from two different models).
+
+    Raises ``ValueError`` if ``expected`` is the ``"UNPINNED"`` placeholder
+    (refuses to run against an unpinned checkpoint) or if the computed hash
+    does not match -- the message names both the expected and actual hash.
+    Returns ``None`` (does not raise) when the hash matches.
+    """
+    if expected == "UNPINNED":
+        raise ValueError(
+            "checkpoint_sha256 is 'UNPINNED' -- refusing to run inference "
+            "against an unpinned checkpoint (doctrine: a silent checkpoint "
+            "swap under an unchanged provider_id would poison the cache). "
+            "Pin DiffusionConfig.checkpoint_sha256 at GPU bring-up -- see "
+            "terrain-service/docs/diffusion-bringup.md step 3."
+        )
+    actual = _sha256_of_checkpoint_path(path)
+    if actual != expected:
+        raise ValueError(
+            f"checkpoint sha256 mismatch for {str(path)!r}: expected "
+            f"{expected!r}, got {actual!r} -- refusing to load. If this "
+            "checkpoint is intentionally different, mint a new "
+            "DiffusionConfig with the new sha256 (this rolls provider_id, "
+            "so old and new tiles never collide in the cache)."
+        )
+
+
+def derive_tile_seed(seed: int, x: int, y: int, scale: int) -> int:
+    """Deterministic per-tile RNG seed, hashed from (seed, x, y, scale).
+
+    Pure Python (sha256 of a canonical string, no numpy/torch) so it is
+    trivially unit-testable and carries no import-time weight. Used as
+    defense-in-depth: ``TerrainDiffusionBackend`` seeds torch's global RNG
+    from this value immediately before each inference call, layered on top
+    of ``WorldPipeline``'s own internal per-tile seeding (see that class's
+    docstring for why both exist).
+
+    Per doctrine (module docstring, §2.3): diffusion output is NOT
+    bit-deterministic across GPUs/torch versions, so this does NOT promise
+    cross-machine reproducibility -- only that reruns on the SAME machine
+    (same GPU, same torch/driver versions) reproduce the same tile. That is
+    exactly why tiles are generated once and distributed as cached data
+    rather than regenerated-and-compared.
+    """
+    canonical = f"terrain-diffusion-tile-seed:{int(seed)}:{int(x)}:{int(y)}:{int(scale)}"
+    digest = hashlib.sha256(canonical.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+# ---------------------------------------------------------------------------
+# Model backend protocol + the real terrain-diffusion backend.
+#
+# Neither this protocol nor TerrainDiffusionBackend's __init__ import torch
+# or terrain-diffusion -- only TerrainDiffusionBackend's methods do, lazily,
+# so `import terrain_service.providers.diffusion` works on machines with no
+# GPU/torch installed (see tests/test_diffusion.py's import test).
+# ---------------------------------------------------------------------------
+
+
+class ModelBackend(Protocol):
+    """What DiffusionProvider needs from a model backend (real or fake)."""
+
+    def generate_rasters(
+        self, seed: int, x: int, y: int, scale: int
+    ) -> dict[str, np.ndarray]:
+        """Return RAW UNQUANTIZED float32 rasters at (TILE_SIZE, TILE_SIZE),
+        keyed by the values of ``DiffusionConfig.channel_mapping`` -- the
+        same contract ``validate_model_output``/``adapt_raster_to_tile``
+        expect from any real model call."""
+        ...
+
+
+class TerrainDiffusionBackend:
+    """Real terrain-diffusion inference backend. Needs a CUDA machine; see
+    ``terrain-service/docs/diffusion-bringup.md`` for the bring-up runbook.
+
+    Grounded in the actual xandergos/terrain-diffusion source (fetched and
+    read at bring-up-research time -- README.md, API_README.md,
+    ``terrain_diffusion/inference/world_pipeline.py``,
+    ``terrain_diffusion/inference/api.py``,
+    ``terrain_diffusion/common/model_utils.py``). Facts this class relies
+    on, all confirmed by reading that source (not guessed):
+
+      * Checkpoints are diffusers-style (``ModelMixin``/``ConfigMixin``)
+        submodels published on HuggingFace. ``WorldPipeline.from_pretrained
+        (pretrained_model_name_or_path, token=None, **kwargs)`` loads a
+        pipeline-level ``config.json``, then three submodels via
+        ``EDMUnet2D.from_pretrained(path, subfolder="coarse_model" /
+        "base_model" / "decoder_model")``. There is NO single checkpoint
+        *file* -- it's a directory tree (local) or an HF repo (remote) of
+        three submodel subfolders, each with its own ``config.json`` +
+        ``*.safetensors``. See ``_sha256_of_checkpoint_path`` for how this
+        class still pins one sha256 over that whole tree.
+      * ``WorldPipeline.get(i1, j1, i2, j2, with_climate=True)`` returns
+        ``{'elev': (H, W) float torch.Tensor, meters; 'climate': (5, H, W)
+        float torch.Tensor}``. ``i1, j1, i2, j2`` are pixel-space
+        bounding-box coordinates -- matches ``tile_codec.py``'s
+        ``[x*TILE_SIZE, (x+1)*TILE_SIZE)`` convention directly, no unit
+        conversion needed.
+      * Climate channel order (confirmed from ``WorldPipeline.
+        _compute_climate``'s ``torch.stack([temp_realistic, coarse_up[3],
+        coarse_up[4], coarse_up[5], beta_up[0]])`` and ``inference/api.py``'s
+        ``_binary_response`` docstring "channels: temp, t_season, precip,
+        p_cv"): index 0 = temperature, 1 = seasonality, 2 = precipitation,
+        3 = precip_variability (index 4 = an internal beta coefficient, not
+        exposed/needed). This is EXACTLY ``_CLIMATE_ORDER`` below, so
+        ``DEFAULT_CHANNEL_MAPPING`` needs no reshuffling for the real model.
+      * One ``WorldPipeline`` instance holds ONE world ``seed`` (constructor
+        arg / ``change_seed()``); different ``(x, y)`` queries into the
+        SAME seeded pipeline are what give seamless infinite terrain (via
+        the ``infinite-tensor`` tile store + internal per-tile hashing) --
+        ``(x, y)`` are NOT independent per-tile seeds in the real API.
+
+    ASSUMPTIONs below (things the source didn't settle and a GPU bring-up
+    session must confirm) are marked inline with ``# ASSUMPTION:``.
+    """
+
+    def __init__(self, config: DiffusionConfig) -> None:
+        self.config = config
+        self._pipeline = None  # lazily constructed by _load_pipeline()
+        self._bound_seed: int | None = None
+
+    def _load_pipeline(self):
+        try:
+            import torch
+        except ImportError as exc:
+            raise RuntimeError(
+                "terrain-diffusion backend needs torch installed and a CUDA "
+                "machine for real inference -- see "
+                "terrain-service/docs/diffusion-bringup.md. Pass "
+                "dry_run=True, or inject model_backend=<fake>, to exercise "
+                "the surrounding plumbing without a GPU."
+            ) from exc
+        try:
+            from terrain_diffusion.inference.world_pipeline import WorldPipeline
+        except ImportError as exc:
+            raise RuntimeError(
+                "the terrain-diffusion package is not installed -- see "
+                "terrain-service/docs/diffusion-bringup.md step 2."
+            ) from exc
+
+        # ASSUMPTION: checkpoint_id is a LOCAL filesystem path to a
+        # pre-downloaded pipeline snapshot (e.g. via `huggingface_hub.
+        # snapshot_download(repo_id, local_dir=...)` or `WorldPipeline(...).
+        # save_pretrained(...)` at bring-up time) -- NOT a bare HuggingFace
+        # repo id string. Doctrine requires sha256 verification BEFORE any
+        # load/inference call; a bare repo id can't be hashed before
+        # terrain-diffusion downloads it itself, which would only verify
+        # after the fact. If pre-downloading a local snapshot proves
+        # inconvenient at bring-up, pinning HF's own commit sha (instead of
+        # a content sha256) is the other option to evaluate.
+        verify_checkpoint_sha256(self.config.checkpoint_id, self.config.checkpoint_sha256)
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        pipeline = WorldPipeline.from_pretrained(self.config.checkpoint_id)
+        pipeline.to(device)
+        # 'direct' (in-memory LRU) is WorldPipeline.bind's own default
+        # caching_strategy; no hdf5_file needed for a single serverless
+        # worker process. See world_pipeline.py's `bind()`.
+        pipeline.bind()
+        self._pipeline = pipeline
+        return pipeline
+
+    def _pipeline_for_seed(self, seed: int):
+        pipeline = self._pipeline if self._pipeline is not None else self._load_pipeline()
+        if self._bound_seed != seed:
+            # change_seed() rebuilds the pipeline's internal tile
+            # hierarchy -- expensive, but expected to be rare: one server
+            # process serves one world seed for the whole session in
+            # practice (per docs/diffusion-bringup.md's cost model).
+            pipeline.change_seed(seed)
+            self._bound_seed = seed
+        return pipeline
+
+    def _get_terrain_at_scale(self, pipeline, i1: int, j1: int, i2: int, j2: int, scale: int):
+        """Transcribed from ``terrain_diffusion.inference.api._get_terrain``
+        (fetched verbatim during bring-up research): scale=1 is a direct
+        native-resolution fetch; scale>1 upsamples via bilinear
+        interpolation with 1-native-pixel padding for edge handling.
+
+        ASSUMPTION: ``DiffusionConfig.scale`` (our tile_codec.py pixel-size
+        key -- 1 => 30m/px, 8 => 11.25m/px) is passed straight through as
+        terrain-diffusion's own ``scale`` upsample factor, which is relative
+        to the PINNED CHECKPOINT's ``native_resolution`` config field (a
+        ``WorldPipeline.__init__`` parameter, default 90.0 in the base
+        class -- the 30m/90m checkpoints presumably override it). Whether
+        our scale=1 truly means "no upsampling needed" for the checkpoint
+        actually pinned in bring-up (i.e. native_resolution == 30.0) must be
+        confirmed at that point -- see docs/diffusion-bringup.md steps 3/5.
+        """
+        import torch
+
+        if scale == 1:
+            out = pipeline.get(i1, j1, i2, j2, with_climate=True)
+            return out["elev"], out["climate"]
+
+        i1n, j1n = i1 // scale, j1 // scale
+        i2n, j2n = -(-i2 // scale), -(-j2 // scale)  # ceil div
+        i1p, j1p, i2p, j2p = i1n - 1, j1n - 1, i2n + 1, j2n + 1  # 1px native pad
+
+        out_native = pipeline.get(i1p, j1p, i2p, j2p, with_climate=True)
+        elev_native, climate_native = out_native["elev"], out_native["climate"]
+
+        out_h, out_w = i2 - i1, j2 - j1
+        elev_up = torch.nn.functional.interpolate(
+            elev_native.unsqueeze(0).unsqueeze(0),
+            scale_factor=scale, mode="bilinear", align_corners=False,
+        ).squeeze()
+        climate_up = torch.nn.functional.interpolate(
+            climate_native.unsqueeze(0),
+            scale_factor=scale, mode="bilinear", align_corners=False,
+        ).squeeze(0)
+
+        pad_up = scale  # 1 native pixel of padding == `scale` upsampled pixels
+        offset_i = i1 - i1n * scale
+        offset_j = j1 - j1n * scale
+        ci1, cj1 = pad_up + offset_i, pad_up + offset_j
+        elev = elev_up[ci1:ci1 + out_h, cj1:cj1 + out_w]
+        climate = climate_up[:, ci1:ci1 + out_h, cj1:cj1 + out_w]
+        return elev, climate
+
+    def generate_rasters(self, seed: int, x: int, y: int, scale: int) -> dict[str, np.ndarray]:
+        # _pipeline_for_seed -> _load_pipeline does the guarded `import
+        # torch` (clear RuntimeError if missing) BEFORE anything below
+        # assumes torch is importable.
+        pipeline = self._pipeline_for_seed(seed)
+        import torch
+
+        # Defense-in-depth determinism, layered on top of WorldPipeline's
+        # own internal per-tile seeding (see class docstring): pin torch's
+        # global RNG from a documented hash of (seed, x, y, scale)
+        # immediately before inference, in case the sampler's forward pass
+        # consumes any randomness NOT already covered by the tile store's
+        # own deterministic per-tile hashing. Per doctrine this targets
+        # same-machine reruns only -- see derive_tile_seed's docstring.
+        tile_seed = derive_tile_seed(seed, x, y, scale)
+        torch.manual_seed(tile_seed & 0xFFFFFFFFFFFFFFFF)
+
+        # ASSUMPTION: tile (x, y) covers pixels [x*TILE_SIZE,(x+1)*TILE_SIZE)
+        # per tile_codec.py, with x=column (j) and y=row (i). world_pipeline.
+        # py names its own internal tile-hash args (ty, tx) row-then-col,
+        # which is what this mapping mirrors, but WorldPipeline.get()'s
+        # (i1, j1, i2, j2) axis order was not independently confirmed from
+        # source alone -- verify at GPU bring-up (e.g. generate two
+        # east-west-adjacent tiles and confirm the seam lines up on the x
+        # axis, not the y axis).
+        i1, j1 = y * TILE_SIZE, x * TILE_SIZE
+        i2, j2 = i1 + TILE_SIZE, j1 + TILE_SIZE
+
+        elev, climate = self._get_terrain_at_scale(pipeline, i1, j1, i2, j2, scale)
+
+        elev_np = elev.detach().to("cpu").to(torch.float32).numpy()
+        climate_np = climate.detach().to("cpu").to(torch.float32).numpy()
+
+        mapping = self.config.channel_mapping
+        raster: dict[str, np.ndarray] = {
+            mapping["elevation"]: np.ascontiguousarray(elev_np),
+        }
+        for i, name in enumerate(_CLIMATE_ORDER):
+            raster[mapping[name]] = np.ascontiguousarray(climate_np[i])
+        return raster
+
+
+# ---------------------------------------------------------------------------
 # Provider.
 # ---------------------------------------------------------------------------
 
@@ -334,10 +647,20 @@ class DiffusionProvider:
     """
 
     def __init__(
-        self, config: DiffusionConfig | None = None, dry_run: bool = False
+        self,
+        config: DiffusionConfig | None = None,
+        dry_run: bool = False,
+        model_backend: ModelBackend | None = None,
     ) -> None:
         self.config = config or DiffusionConfig()
         self.dry_run = dry_run
+        #: Optional injected model backend (see ModelBackend protocol) --
+        #: how this is unit-tested without a GPU (a fake backend stands in
+        #: for TerrainDiffusionBackend). None (the default) keeps prior
+        #: behavior/signature compatibility and means "lazily construct the
+        #: real TerrainDiffusionBackend on first non-dry-run call".
+        self.model_backend = model_backend
+        self._real_backend: TerrainDiffusionBackend | None = None
         # provider_id is an attribute (not a property) per the TileProvider
         # protocol; dry-run runs are tagged so they can never collide with
         # real generated tiles in a shared cache.
@@ -356,38 +679,29 @@ class DiffusionProvider:
         return adapt_raster_to_tile(raster, self.config, seed, x, y, scale)
 
     def _call_model(self, seed: int, x: int, y: int, scale: int) -> dict[str, np.ndarray]:
-        """The one place that needs a real CUDA machine.
+        """Get raw (unquantized) model rasters for one tile.
 
-        TODO(GPU bring-up, see docs/diffusion-bringup.md):
-          1. Load ``self.config.checkpoint_id`` (verify against
-             ``self.config.checkpoint_sha256``) via terrain-diffusion.
-          2. Run inference with ``self.config.sampler`` settings, seeded/
-             positioned from (seed, x, y, scale) per terrain-diffusion's
-             sampling API (tile (x, y) at TILE_SIZE covers pixels
-             [x*TILE_SIZE, (x+1)*TILE_SIZE) etc. — same convention as
-             tile_codec.py).
-          3. Return a dict of channel name -> float32 numpy array, keyed
-             per ``self.config.channel_mapping`` values, at
-             (TILE_SIZE, TILE_SIZE) resolution. Do NOT quantize here —
-             ``validate_model_output``/``adapt_raster_to_tile`` handle that;
-             this function's job is exactly "get the model's raw raster
-             out", so ``validate_model_output`` can compare it honestly
-             against EXPECTED_CHANNELS.
-
-        Until that lands, dry_run=False callers get a clear error instead of
-        silently returning fake data; dry_run=True callers get the
-        synthetic-provider stand-in below (proves the plumbing, not the
-        model).
+        Precedence (dry_run wins): dry_run=True ALWAYS uses the synthetic
+        stand-in below, even if a model_backend was injected -- dry_run
+        exists specifically to exercise the surrounding plumbing (config ->
+        adapter -> validate -> encode) without any model, real or fake,
+        being invoked, so it must behave identically regardless of what a
+        caller happens to have injected. Otherwise, an injected
+        model_backend (see ModelBackend protocol) is used if present -- this
+        is how bring-up scaffolding is unit-tested without a GPU (a fake
+        backend stands in for TerrainDiffusionBackend). With neither, the
+        real ``TerrainDiffusionBackend`` is lazily constructed exactly once
+        (needs a CUDA machine; see terrain-service/docs/diffusion-bringup.md)
+        and reused for subsequent calls.
         """
         if self.dry_run:
             return self._synthetic_stand_in(seed, x, y, scale)
-        raise NotImplementedError(
-            "terrain-diffusion model call not wired up yet — needs a CUDA "
-            "machine. See terrain-service/docs/diffusion-bringup.md for the "
-            "bring-up runbook, or pass dry_run=True to exercise the "
-            "surrounding plumbing (config -> adapter -> validate -> encode) "
-            "with synthetic stand-in rasters."
-        )
+        backend = self.model_backend
+        if backend is None:
+            if self._real_backend is None:
+                self._real_backend = TerrainDiffusionBackend(self.config)
+            backend = self._real_backend
+        return backend.generate_rasters(seed, x, y, scale)
 
     def _synthetic_stand_in(
         self, seed: int, x: int, y: int, scale: int
