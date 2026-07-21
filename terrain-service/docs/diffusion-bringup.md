@@ -74,26 +74,62 @@ sampler + scale + channel_mapping combination is cached under this key
 tiles are canonical data generated once and distributed, never
 regenerated-and-compared client-side).
 
-## 4. Wire the real model call
+## 4. Wire the real model call — DONE, this step is now verification only
 
-Open `terrain_service/providers/diffusion.py`, find
-`DiffusionProvider._call_model` — it has a numbered TODO. Fill in:
+`DiffusionProvider._call_model` is implemented (no more TODO): it lazily
+constructs `TerrainDiffusionBackend` once and reuses it, which loads
+`WorldPipeline` (checkpoint sha256 verified first via
+`verify_checkpoint_sha256`), reseeds it per request seed, and queries
+`WorldPipeline.get(i1, j1, i2, j2, with_climate=True)` positioned per
+`(x, y)` at `[x*512, (x+1)*512)` — same convention as `tile_codec.py`. It
+returns raw, unquantized float32 rasters through the SAME
+`validate_model_output` -> `adapt_raster_to_tile` path the dry-run already
+exercises. This was implemented against the real terrain-diffusion source
+(README.md, API_README.md, `world_pipeline.py`, `inference/api.py`,
+`common/model_utils.py`), not guessed — see `TerrainDiffusionBackend`'s
+class docstring for exactly what was confirmed from source.
 
-1. Load the checkpoint (verify its sha256 against `config.checkpoint_sha256`
-   — a silent checkpoint swap under an unchanged `provider_id` would poison
-   the cache with mismatched tiles).
-2. Run terrain-diffusion inference with `self.config.sampler` settings,
-   positioned from `(seed, x, y, scale)` per terrain-diffusion's own
-   sampling API — tile `(x, y)` covers pixel range
-   `[x*512, (x+1)*512)` on each axis, same convention as `tile_codec.py`.
-3. Return a `dict[str, np.ndarray]` of **raw, unquantized** float32 rasters
-   keyed by `self.config.channel_mapping`'s values (do not clip/round here —
-   `validate_model_output` needs to see the model's honest output to report
-   real mismatches, and `adapt_raster_to_tile` does the quantization).
+What this GPU session still needs to do, in order:
 
-Do NOT skip `validate_model_output`/`adapt_raster_to_tile` — that's the
-whole point of this scaffolding: the real model call plugs into the SAME
-path the dry-run already exercises.
+1. **Pin `checkpoint_id`/`checkpoint_sha256` for real** (step 3 above is a
+   placeholder until this runs). `TerrainDiffusionBackend` assumes
+   `checkpoint_id` is a **local filesystem path** to a pre-downloaded
+   `WorldPipeline` snapshot (top-level `config.json` + `coarse_model/`,
+   `base_model/`, `decoder_model/` subfolders, each `config.json` +
+   `*.safetensors` — confirmed from `world_pipeline.py`'s `from_pretrained`
+   and `save_pretrained`), NOT a bare HuggingFace repo id — doctrine
+   requires the sha256 check to run *before* any load, and a bare repo id
+   can't be hashed before terrain-diffusion downloads it itself. Download a
+   snapshot locally (e.g. `huggingface_hub.snapshot_download("xandergos/
+   terrain-diffusion-30m", local_dir=...)`), compute its sha256 (`_sha256_
+   of_checkpoint_path` in `diffusion.py` hashes a directory as a manifest of
+   every file's path+sha256 — you can call it directly, or just run
+   `verify_checkpoint_sha256` once with a throwaway expected value to see
+   the "actual" hash it reports), and pin both fields into `DiffusionConfig`.
+   If a local snapshot proves inconvenient, pinning HF's commit sha instead
+   of a content sha256 is the fallback to evaluate — flagged as an
+   ASSUMPTION on `TerrainDiffusionBackend._load_pipeline`.
+2. Run step 5 below (`validate_model_output` against one real tile).
+3. Confirm/adjust the ASSUMPTIONs marked inline on `TerrainDiffusionBackend`
+   (grep the class for `# ASSUMPTION:`) — in priority order:
+   - **Axis mapping**: `(x, y)` -> `WorldPipeline.get(i1, j1, ...)` assumes
+     `i1=y*512` (row), `j1=x*512` (col). Generate two east-west-adjacent
+     tiles and confirm the seam lines up on the x axis, not the y axis; flip
+     the mapping in `generate_rasters` if it's backwards.
+   - **Scale semantics**: `DiffusionConfig.scale` (1 => 30m/px, 8 =>
+     11.25m/px in our `tile_codec.py`) is passed straight through as
+     terrain-diffusion's own upsample `scale` factor (relative to the
+     pinned checkpoint's `native_resolution` config field). Confirm the
+     pinned checkpoint's `native_resolution` actually makes `scale=1` mean
+     "no upsampling" (i.e. native 30m/px) before trusting scale=1 output;
+     bring up scale=8 as a separate `DiffusionConfig`/`provider_id` per the
+     note in step 3 above, once scale=1 is confirmed good.
+   - **Per-tile reseed cost**: `TerrainDiffusionBackend` calls `WorldPipeline
+     .change_seed()` whenever the requested `seed` differs from the
+     pipeline's currently-bound seed (expensive — rebuilds the tile
+     hierarchy). Fine for one world seed per server process (the expected
+     production shape), but confirm pregen/serving patterns don't
+     interleave multiple seeds against one process.
 
 ## 5. Confirm real tile outputs — the actual point of this backlog item
 

@@ -33,6 +33,11 @@
 #include "voxelcore/mips.h"
 #include "voxelcore/raycast.h"
 #include "voxelcore/tiles.h"
+// Track B2: vxc::TileGridSampler (parses real .vxtl terrain-service tiles)
+// -- only referenced from this .cpp's file-local MakeTileSampler factory and
+// FVoxelWorldImpl's Tiles/GridTiles members, never from the UHT-parsed
+// header (same PImpl doctrine as every other voxel-core include here).
+#include "voxelcore/tilestore.h"
 #include "voxelcore/world.h"
 
 #include "Components/SceneComponent.h"
@@ -66,6 +71,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <filesystem> // Track B2: directory_iterator over -VoxelTileDir
+#include <memory>     // Track B2: std::unique_ptr<vxc::ITileSampler>
 #include <unordered_map>
 #include <vector>
 
@@ -707,6 +714,145 @@ std::function<vxc::MaterialId(int64, int64, int64)> MakeOverlayAwareLevelSampler
 	};
 }
 
+// Track B2 ("real .vxtl terrain tiles as a selectable tile source"): builds
+// the ITileSampler FVoxelWorldImpl::Tiles owns for this run.
+//
+// TileDir empty/absent (the default -- no -VoxelTileDir on the command line)
+// => a bare vxc::SyntheticTileSampler(Seed), zero filesystem access,
+// UNCONDITIONALLY: this is what keeps default behavior byte-identical to
+// pre-Track-B2 (the cross-vendor determinism goldens depend on exactly this
+// path running with no new switches present).
+//
+// Non-empty TileDir => construct a vxc::TileGridSampler(Seed, TileScale) and
+// load every *.vxtl file directly inside TileDir (non-recursive: the
+// terrain-service cache leaf directory this switch names, e.g.
+// tile-cache/<provider_id>/<seed hex>/s1, is already flat). Parsed manually
+// here (vxc::readFileBytes + vxc::TileData::parse) rather than via
+// TileGridSampler::loadTileFile so the tile's own (x, y) is available for the
+// bounding-box log below -- loadTile(TileData) still enforces the exact same
+// seed/scale rejection loadTileFile would (doctrine-required: a tile
+// generated for a different seed/scale must never silently leak into this
+// run's terrain).
+//
+// Missing-tile policy (doctrine, see voxelcore/tilestore.h's own comment):
+// once a grid IS in use, any individual query landing outside every loaded
+// tile's footprint returns TileGridSampler's built-in deterministic flat-sea-
+// level default (elevation 0, default climate) rather than fabricating data
+// -- intended and fine (see FVoxelWorldImpl::MaybeLogCounters' missing-tile
+// telemetry). But if the directory as a WHOLE produces zero loaded tiles (bad
+// path, empty directory, or -VoxelTileDir paired with the wrong -VoxelSeed so
+// every file's seed check fails), that is very likely operator error rather
+// than an intentionally sparse tile set -- silently booting an entirely-empty
+// flat world on a bad path would be confusing and hard to diagnose, so this
+// case is rejected loudly (UE_LOG Error) and falls back to the synthetic
+// sampler instead, exactly like the invalid-TileScale case below.
+std::unique_ptr<vxc::ITileSampler> MakeTileSampler(uint64 Seed, const FString& TileDir, int32 TileScale, bool& bOutUsingTileGrid)
+{
+	bOutUsingTileGrid = false;
+
+	if (TileDir.IsEmpty())
+	{
+		return std::make_unique<vxc::SyntheticTileSampler>(Seed);
+	}
+
+	if (vxc::tilePixelSizeMm((uint8)TileScale) == 0)
+	{
+		UE_LOG(LogVoxelEarth, Error,
+		       TEXT("-VoxelTileScale=%d is not a supported tile scale (only 1 [30m/px] or 8 [11.25m/px] are valid) -- ")
+		       TEXT("falling back to the synthetic sampler."),
+		       TileScale);
+		return std::make_unique<vxc::SyntheticTileSampler>(Seed);
+	}
+
+	// TCHAR is wchar_t on Windows (this module's only supported platform per
+	// its build docs), which is std::filesystem::path's native windows encoding
+	// -- constructing directly from *TileDir needs no UTF8 round-trip.
+	const std::filesystem::path DirPath(*TileDir);
+	std::error_code DirEc;
+	if (!std::filesystem::is_directory(DirPath, DirEc) || DirEc)
+	{
+		UE_LOG(LogVoxelEarth, Error,
+		       TEXT("-VoxelTileDir=%s does not exist or is not a directory -- falling back to the synthetic sampler."), *TileDir);
+		return std::make_unique<vxc::SyntheticTileSampler>(Seed);
+	}
+
+	auto Grid = std::make_unique<vxc::TileGridSampler>(Seed, (uint8)TileScale);
+
+	int32 Loaded = 0;
+	int32 Rejected = 0;
+	bool bAnyBox = false;
+	int32 MinTx = 0, MaxTx = 0, MinTy = 0, MaxTy = 0;
+
+	std::error_code IterEc;
+	for (auto It = std::filesystem::directory_iterator(DirPath, IterEc);
+	     !IterEc && It != std::filesystem::directory_iterator(); It.increment(IterEc))
+	{
+		const std::filesystem::directory_entry& Entry = *It;
+		std::error_code FileEc;
+		if (!Entry.is_regular_file(FileEc) || FileEc)
+		{
+			continue;
+		}
+		if (Entry.path().extension() != ".vxtl")
+		{
+			continue;
+		}
+
+		std::optional<std::vector<uint8_t>> Bytes = vxc::readFileBytes(Entry.path());
+		if (!Bytes)
+		{
+			++Rejected;
+			continue;
+		}
+		std::optional<vxc::TileData> Parsed = vxc::TileData::parse(Bytes->data(), Bytes->size());
+		if (!Parsed)
+		{
+			++Rejected; // malformed / truncated / wrong-version .vxtl
+			continue;
+		}
+		const int32 Tx = Parsed->x;
+		const int32 Ty = Parsed->y;
+		if (!Grid->loadTile(std::move(*Parsed)))
+		{
+			++Rejected; // parsed fine but this file's seed/scale != (Seed, TileScale)
+			continue;
+		}
+
+		++Loaded;
+		if (!bAnyBox)
+		{
+			MinTx = MaxTx = Tx;
+			MinTy = MaxTy = Ty;
+			bAnyBox = true;
+		}
+		else
+		{
+			MinTx = FMath::Min(MinTx, Tx);
+			MaxTx = FMath::Max(MaxTx, Tx);
+			MinTy = FMath::Min(MinTy, Ty);
+			MaxTy = FMath::Max(MaxTy, Ty);
+		}
+	}
+
+	UE_LOG(LogVoxelEarth, Log, TEXT("Voxel tile grid: dir=%s loaded=%d rejected=%d seed=%llu scale=%d"), *TileDir, Loaded, Rejected,
+	       (unsigned long long)Seed, TileScale);
+
+	if (Loaded == 0)
+	{
+		UE_LOG(LogVoxelEarth, Error,
+		       TEXT("-VoxelTileDir=%s produced zero loaded tiles (bad path, empty directory, or every tile's seed/scale ")
+		       TEXT("mismatched -VoxelSeed=%llu / -VoxelTileScale=%d) -- falling back to the synthetic sampler rather than ")
+		       TEXT("silently booting an empty flat world."),
+		       *TileDir, (unsigned long long)Seed, TileScale);
+		return std::make_unique<vxc::SyntheticTileSampler>(Seed);
+	}
+
+	UE_LOG(LogVoxelEarth, Log, TEXT("Voxel tile grid: loaded tile coords bounding box x=[%d,%d] y=[%d,%d]"), MinTx, MaxTx, MinTy, MaxTy);
+
+	bOutUsingTileGrid = true;
+	return Grid;
+}
+
 // Sized dig/place cube anchoring (m1-plan.md "Player experience decisions",
 // "Dig sizes" / "Place" rows): the SizeVoxels^3 cube is centred on Anchor on
 // the two axes tangent to the hit face (FaceAxis), and biased along the face
@@ -960,10 +1106,27 @@ bool ComputeVoxelCoordBounds(const TArray<VoxelCoords::FVoxelCoord>& Coords, Vox
 // UE-reflection-visible, so it belongs behind the same PImpl boundary.
 struct FVoxelWorldImpl
 {
-	explicit FVoxelWorldImpl(uint64 Seed)
-		: Tiles(Seed)
-		, Voxels(Seed, Tiles)
+	// Track B2: TileDir/TileScale select the tile source (see MakeTileSampler
+	// above for the full policy) -- TileDir empty is the pre-Track-B2 default
+	// (SyntheticTileSampler, byte-identical to before).
+	explicit FVoxelWorldImpl(uint64 Seed, const FString& TileDir, int32 TileScale)
+		: Tiles(MakeTileSampler(Seed, TileDir, TileScale, bUsingTileGrid))
+		, Voxels(Seed, *Tiles)
 	{
+		// bUsingTileGrid (declared, and thus constructed via its NSDMI, BEFORE
+		// Tiles below -- member init order follows DECLARATION order, not this
+		// list's order) is already valid by the time MakeTileSampler's
+		// out-param write above runs, so GridTiles can safely depend on it here.
+		if (bUsingTileGrid)
+		{
+			// Non-owning: Tiles (unique_ptr<ITileSampler>) is the sole owner.
+			// static_cast, not dynamic_cast: voxel-core is RTTI-agnostic by
+			// design (Counters/mesher etc. never assume it's enabled), and
+			// bUsingTileGrid being true is exactly MakeTileSampler's own
+			// guarantee that Tiles.get() really does point at a TileGridSampler.
+			GridTiles = static_cast<vxc::TileGridSampler*>(Tiles.get());
+		}
+
 		// Fixed-size ring buffer (docs/debug-tooling-plan.md P1 "Worker
 		// timings"): sized once here so DrainResults never touches TArray
 		// growth on its hot path.
@@ -976,8 +1139,33 @@ struct FVoxelWorldImpl
 		}
 	}
 
-	vxc::SyntheticTileSampler Tiles;
+	// Track B2: bUsingTileGrid MUST be declared (and default-constructed via
+	// its NSDMI) before Tiles below -- see the ctor's mem-initializer-order
+	// comment. Tiles itself must be declared before Voxels: Voxels holds a
+	// live ITileSampler& into whatever Tiles owns, so Tiles has to already be
+	// a fully-formed object by the time Voxels' own constructor runs.
+	bool bUsingTileGrid = false;
+	std::unique_ptr<vxc::ITileSampler> Tiles;
+	// Non-owning view of Tiles when bUsingTileGrid (set in the ctor body,
+	// after Tiles exists) -- telemetry only (MaybeLogCounters' missing-tile
+	// warning below); nullptr whenever the synthetic sampler is in use.
+	//
+	// THREAD-SAFETY: meshing worker jobs (DispatchJobs) query the active
+	// sampler concurrently via Voxels' amplifier/generated-world path. That is
+	// safe here because TileGridSampler's tile_ map is READ-ONLY after this
+	// ctor returns -- every loadTile call above happens before Initialize()
+	// hands Impl back to the subsystem, i.e. strictly before any job is ever
+	// dispatched. missingTileQueries is the one field worker jobs and this
+	// (game-thread) telemetry both touch concurrently; a parallel voxel-core
+	// change is making it atomic, so it's read here through an implicit
+	// conversion into a plain uint64 local (see MaybeLogCounters) rather than
+	// captured by reference/pointer -- that compiles whether the member is
+	// today's plain uint64_t or the incoming std::atomic<uint64_t>.
+	vxc::TileGridSampler* GridTiles = nullptr;
 	vxc::World<VoxelCoords::BrickEdgeVoxels> Voxels;
+
+	// MaybeLogCounters' missing-tile delta tracking (bUsingTileGrid only).
+	uint64 LastMissingTileQueries = 0;
 
 	// --- Stage 2 streaming state (docs/m1-plan.md Stage 2 decisions table);
 	// M2 (docs/m2-plan.md "Ring streaming" row) generalizes every key here
@@ -1698,6 +1886,25 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	{
 		MaxLevelEntryMs[Level] = 0.f;
 		LevelEntryScans[Level] = 0;
+	}
+
+	// Track B2 missing-tile telemetry: only meaningful once a real tile grid
+	// is in use (bUsingTileGrid) -- the synthetic sampler has no concept of a
+	// "missing" tile, so this is silent (no log spam) for today's default
+	// path. See GridTiles' doc comment above for why this reads through an
+	// implicit conversion into a plain uint64 local rather than holding a
+	// reference to the counter.
+	if (bUsingTileGrid && GridTiles)
+	{
+		const uint64 MissingNow = GridTiles->missingTileQueries;
+		if (MissingNow > LastMissingTileQueries)
+		{
+			UE_LOG(LogVoxelPerf, Warning,
+			       TEXT("Voxel tile grid: +%llu missing-tile queries since last log (total %llu) -- player/clipmap sampling ")
+			       TEXT("beyond loaded tile radius -- terrain is deterministic flat sea-level fallback there."),
+			       (unsigned long long)(MissingNow - LastMissingTileQueries), (unsigned long long)MissingNow);
+		}
+		LastMissingTileQueries = MissingNow;
 	}
 }
 
@@ -4125,7 +4332,29 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	}
 	Seed = ParsedSeed;
 
-	Impl = MakeUnique<FVoxelWorldImpl>(Seed);
+	// Track B2 ("real .vxtl terrain tiles as a selectable tile source"):
+	// -VoxelTileDir=<path> selects a terrain-service tile-cache directory as
+	// the world's tile source instead of the synthetic sampler; empty/absent
+	// (the default -- no new switch on the command line) keeps today's exact
+	// behavior, unconditionally (see MakeTileSampler). Same one-shot dev/
+	// config-switch convention as -VoxelSeed above: command-line only, no ini
+	// fallback, resolved once here before Impl is constructed.
+	FString TileDir;
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelTileDir="), TileDir);
+	if (!TileDir.IsEmpty() && FPaths::IsRelative(TileDir))
+	{
+		TileDir = FPaths::Combine(FPaths::ProjectContentDir(), TileDir);
+	}
+
+	// -VoxelTileScale=<int>: which tile scale to load (1 => 30m/px, the
+	// default; 8 => 11.25m/px). Only meaningful alongside -VoxelTileDir --
+	// MakeTileSampler validates it (vxc::tilePixelSizeMm returns 0 for
+	// anything else) and falls back to the synthetic sampler with an Error
+	// log if it's invalid, rather than silently misinterpreting tile pixels.
+	int32 TileScale = 1;
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelTileScale="), TileScale);
+
+	Impl = MakeUnique<FVoxelWorldImpl>(Seed, TileDir, TileScale);
 }
 
 void UVoxelWorldSubsystem::Deinitialize()
@@ -4448,6 +4677,44 @@ double UVoxelWorldSubsystem::GetSurfaceHeightUU(double WorldX, double WorldY) co
 	const int64 Vy = (int64)FMath::FloorToDouble(WorldY / VoxelCoords::VoxelSizeUU);
 	const vxc::ColumnSample Col = Impl->Voxels.amplifier().column(Vx, Vy);
 	return double(Col.surfaceMm) / 10.0; // mm -> UU (1 UU = 10 mm)
+}
+
+double UVoxelWorldSubsystem::SampleTerrainHeightUU(double WorldXUU, double WorldYUU) const
+{
+	if (!Impl)
+	{
+		// Transient "Entry"/loading world (see bWorldBegunPlay's doc comment
+		// in the header) -- Impl exists but has never streamed anything, and
+		// nothing here needs a real height for it; 0.0 matches
+		// GetSurfaceHeightUU's own Impl==nullptr fallback above.
+		return 0.0;
+	}
+
+	// Track B2: sample whichever ITileSampler this run is actually using
+	// (synthetic by default, or a loaded vxc::TileGridSampler under
+	// -VoxelTileDir=<path> -- see FVoxelWorldImpl::Tiles/MakeTileSampler) --
+	// moved here (from AVoxelClipmapActor's file-local SampleHeightUU) so
+	// clipmap terrain and voxel-ring terrain read the SAME tiles and keep
+	// lining up at their shared seam whether or not real tiles are loaded.
+	vxc::ITileSampler& Sampler = *Impl->Tiles;
+
+	// mm -> UU is /10 (VoxelCoords::WorldToMm's inverse: 1 UU = 10 mm).
+	const double PixelSizeUU = double(Sampler.pixelSizeMm()) / 10.0;
+	const double Px = WorldXUU / PixelSizeUU;
+	const double Py = WorldYUU / PixelSizeUU;
+	const int64 Px0 = (int64)FMath::FloorToDouble(Px);
+	const int64 Py0 = (int64)FMath::FloorToDouble(Py);
+	const double Fx = Px - double(Px0);
+	const double Fy = Py - double(Py0);
+
+	auto ElevUU = [&Sampler](int64 X, int64 Y) { return double(Sampler.elevationMm(X, Y)) / 10.0; };
+	const double H00 = ElevUU(Px0, Py0);
+	const double H10 = ElevUU(Px0 + 1, Py0);
+	const double H01 = ElevUU(Px0, Py0 + 1);
+	const double H11 = ElevUU(Px0 + 1, Py0 + 1);
+	const double Hx0 = FMath::Lerp(H00, H10, Fx);
+	const double Hx1 = FMath::Lerp(H01, H11, Fx);
+	return FMath::Lerp(Hx0, Hx1, Fy);
 }
 
 bool UVoxelWorldSubsystem::IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const
