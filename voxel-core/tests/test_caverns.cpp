@@ -393,8 +393,25 @@ VXC_TEST(cavern_roof_clamp_is_load_bearing_on_sloped_real_terrain) {
         return amp.column(vx, vy).surfaceMm;
     };
 
+    // "Is a voxel inside a room's ELLIPSOID (plus its flat floor), ignoring
+    // every clamp?" — the same per-seg test cavernCarveAt runs, minus the
+    // guards. The difference between this and cavernCarveAt is exactly the
+    // set of voxels a clamp truncated, which is what "load-bearing" means.
+    auto geometricallyInsideARoom = [](const CavernColumn& c, int64_t vz) {
+        const int64_t zAbs = vz * kVoxelSizeMm + kVoxelSizeMm / 2;
+        for (int32_t s = 0; s < c.count; ++s) {
+            const CavernSeg& sg = c.segs[s];
+            if (zAbs < int64_t(sg.zFloorMm)) continue;
+            const int64_t dz = zAbs - int64_t(sg.zCenterMm);
+            if (dz * dz < int64_t(sg.marginSq)) return true;
+        }
+        return false;
+    };
+
     int64_t columnsSampled = 0, columnsWithCavern = 0, carvedVoxels = 0;
     int64_t columnsFullyRefused = 0; // in reach, but every candidate voxel was clamped away
+    int64_t clampedVoxels = 0;       // inside a room's geometry, but a clamp refused it
+    int64_t columnsPartlyClamped = 0;
     int64_t thinnestRoofMm = 1LL << 60;
     int32_t minSurfaceMmSeen = INT32_MAX, maxSurfaceMmSeen = INT32_MIN;
 
@@ -413,16 +430,24 @@ VXC_TEST(cavern_roof_clamp_is_load_bearing_on_sloped_real_terrain) {
             const CavernColumn cc = cavernColumnFor(kSeed, x, y, col.surfaceMm, realSurfaceAt);
             if (cc.count == 0) continue;
 
-            bool any = false;
+            bool any = false, anyClamped = false;
             const int64_t topVz = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
             for (int64_t vz = topVz; vz > topVz - 3000; --vz) {
-                if (!cavernCarveAt(cc, col.surfaceMm, col.bedrockDepthMm, vz)) continue;
+                const bool carved = cavernCarveAt(cc, col.surfaceMm, col.bedrockDepthMm, vz);
+                if (!carved) {
+                    if (geometricallyInsideARoom(cc, vz)) {
+                        ++clampedVoxels;
+                        anyClamped = true;
+                    }
+                    continue;
+                }
                 any = true;
                 ++carvedVoxels;
                 const int64_t roofMm =
                     int64_t(col.surfaceMm) - (vz * kVoxelSizeMm + kVoxelSizeMm / 2);
                 if (roofMm < thinnestRoofMm) thinnestRoofMm = roofMm;
             }
+            if (anyClamped) ++columnsPartlyClamped;
             if (any)
                 ++columnsWithCavern;
             else
@@ -439,6 +464,13 @@ VXC_TEST(cavern_roof_clamp_is_load_bearing_on_sloped_real_terrain) {
                 "clamps (slope truncation)\n",
                 static_cast<long long>(columnsSampled), static_cast<long long>(columnsWithCavern),
                 static_cast<long long>(carvedVoxels), static_cast<long long>(columnsFullyRefused));
+    std::printf("    [caverns] sloped real terrain: %lld voxels sat inside a room's "
+                "ellipsoid but were refused by a clamp, across %lld columns (%.1f%% of "
+                "columns over a cavern)\n",
+                static_cast<long long>(clampedVoxels), static_cast<long long>(columnsPartlyClamped),
+                columnsWithCavern > 0
+                    ? 100.0 * double(columnsPartlyClamped) / double(columnsWithCavern)
+                    : 0.0);
 
     CHECK(maxSurfaceMmSeen > minSurfaceMmSeen); // genuinely varied, not flat
     CHECK(carvedVoxels > 0);                    // caverns do exist in this scan
@@ -450,10 +482,22 @@ VXC_TEST(cavern_roof_clamp_is_load_bearing_on_sloped_real_terrain) {
                     static_cast<long long>(kCaveRoofMinMm));
         CHECK(thinnestRoofMm >= kCaveRoofMinMm); // the clamp held, by construction
     }
-    // The whole point of this test: on sloped ground, the clamp actually
-    // BINDS somewhere (at least one in-reach column gets fully truncated) --
-    // this is the "load-bearing, not just backstop" claim, measured.
-    CHECK(columnsFullyRefused > 0);
+    // The whole point of this test: on sloped ground, the clamps actually BIND
+    // somewhere -- the "load-bearing, not just backstop" claim, measured.
+    //
+    // This assertion USED to be `columnsFullyRefused > 0` (an in-reach column
+    // where every candidate voxel was clamped away). That proxy stopped firing
+    // at kWorldGenVersion 5, and for a good reason rather than a regression:
+    // with bedrock moved from 40-60 m to 180-220 m, the BEDROCK clamp no
+    // longer truncates any cavern at all (the deepest a chain reaches is
+    // ~128 m), so the only clamp still binding is the roof -- and the roof
+    // clamp shaves the TOP off a room rather than erasing a whole column's
+    // worth of it. Counting fully-erased columns therefore measures a clamp
+    // that is now correctly inert; counting CLAMPED VOXELS measures the one
+    // that is still load-bearing, which is what the claim was always about.
+    CHECK_EQ(columnsFullyRefused, 0); // pinned: no clamp erases a whole column any more
+    CHECK(clampedVoxels > 0);         // but the roof clamp does still truncate real rooms
+    CHECK(columnsPartlyClamped > 0);
 }
 
 // --- storage bound ------------------------------------------------------------

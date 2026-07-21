@@ -84,7 +84,13 @@ VXC_TEST(amplifier_golden_digest) {
             d.u32(static_cast<uint32_t>(col.bedrockDepthMm));
             d.u8(col.surfaceMat);
         }
-    CHECK_EQ(d.h, 0x81785278E4DFCF67ull); // GOLDEN(amplifier_columns) — kWorldGenVersion 3: synthetic-tile spectral-gap octaves (was 0x73B43CAE621CA286 at v2)
+    // GOLDEN(amplifier_columns) — kWorldGenVersion 5: bedrock top moved from a
+    // 40-60 m band to a 180-220 m one (200 m mean, Matt's decision). This
+    // digest covers surfaceMm/topsoilMm/subsoilMm/bedrockDepthMm/surfaceMat, of
+    // which ONLY bedrockDepthMm moved — the cave and cavern passes are not part
+    // of it, so the v5 cavern fold-in does not touch this value.
+    // (was 0x81785278E4DFCF67 at v3/v4, 0x73B43CAE621CA286 at v2)
+    CHECK_EQ(d.h, 0xA29A7A767DC1543Bull);
 }
 
 VXC_TEST(generated_brick_matches_pointwise_queries) {

@@ -204,8 +204,22 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
 
     col.subsoilMm = clampi32(topsoil * 2 + 500, 0, 6000);
 
+    // Bedrock top: a jittered band CENTRED ON 200 m (Matt's decision; was
+    // 40-60 m at kWorldGenVersion 4). Same deterministic shape as before — one
+    // 16-bit field of a 6.4 m-lattice hash, linearly mapped onto [base, base +
+    // span) — only the two constants move.
+    //
+    // Why 180-220 m rather than "the old 40 m + 50%-of-base shape scaled up"
+    // (which would give 200-300 m, mean 250 m): 200 m is the number asked for,
+    // so it is the band's MEAN, not its floor. The +/-20 m (10%) span is large
+    // enough that the bedrock boundary does not read as a flat sheet draped
+    // under the terrain — the only reason the jitter exists — while staying
+    // comfortably clear of everything above it: the deepest a cavern chain
+    // reaches is ~128 m (test_caverns.cpp measures 128'050 mm of depth at a
+    // 200 m bedrock), so even the shallowest 180 m draw leaves ~52 m of
+    // untouched rock above the floor against caves.h's 2 m margin.
     const uint64_t bj = hash2(seed_, vx >> 6, vy >> 6, CH_BEDROCK_JITTER);
-    col.bedrockDepthMm = static_cast<int32_t>(40000 + ((bj >> 48) * 20000) / 65536);
+    col.bedrockDepthMm = static_cast<int32_t>(180000 + ((bj >> 48) * 40000) / 65536);
 
     // Surface material from biome classification (M4): morphology gates
     // (slope, coastal band, temperature-adjusted treeline) run before the

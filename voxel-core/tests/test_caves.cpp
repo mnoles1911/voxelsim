@@ -29,7 +29,12 @@ constexpr uint64_t kSeed = 20260719;
 // A flat synthetic column, used by the tests that want to look at the tunnel
 // NETWORK on its own with no terrain draping and no clipping in the way.
 constexpr int32_t kFlatSurfaceMm = 100000;   // 100 m — well clear of sea level
-constexpr int32_t kFlatBedrockMm = 45000;    // 45 m — the amplifier's own range
+constexpr int32_t kFlatBedrockMm = 45000;    // 45 m — deliberately kept at the
+                                             // PRE-v5 amplifier band (bedrock
+                                             // moved to 180-220 m at v5), so
+                                             // this file keeps exercising the
+                                             // bedrock clamp against a floor
+                                             // shallow enough for it to bind
 
 // Carve predicate for the flat world.
 bool flatCarve(int64_t vx, int64_t vy, int64_t vz) {

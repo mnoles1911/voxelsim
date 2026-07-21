@@ -56,7 +56,8 @@
 //      sinkhole shaft (see kCaveShaftNodeMask) — a sparse, explicitly chosen
 //      set of entrance holes, not a leaky roof.
 //   2. The network stays out of the bedrock floor: deepest possible carve is
-//      36.8 m, while bedrockDepthMm is >= 40 m everywhere (amplifier.cpp), and
+//      36.8 m, while bedrockDepthMm is >= 180 m everywhere since
+//      kWorldGenVersion 5 (>= 40 m before it — amplifier.cpp), and
 //      caveCarveAt additionally refuses anything within kCaveBedrockMarginMm
 //      of the column's own bedrock top AND Amplifier::materialAt refuses to
 //      turn MAT_BEDROCK into air at all. Three independent guards.
@@ -206,8 +207,11 @@ static_assert(kCaveRadiusMaxMm * 2 < kCaveLatticeMm,
 static_assert(kCaveNodeDepthMinMm - kCaveRadiusMaxMm > kCaveRoofMinMm,
               "tube geometry must keep itself above the roof clamp — the clamp is a "
               "backstop, not the mechanism");
-// Floor: deepest possible carved voxel vs the shallowest bedrock top the
-// amplifier can produce (40 m, amplifier.cpp bedrockDepthMm).
+// Floor: deepest possible carved voxel vs a bedrock top of 40 m. That is the
+// PRE-v5 amplifier minimum, kept deliberately after the v5 move to a
+// 180-220 m band (amplifier.cpp bedrockDepthMm): asserting against the old,
+// much shallower floor is a strictly stronger statement, and it keeps tunnel
+// geometry provably independent of wherever the bedrock band happens to sit.
 static_assert(kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm + kCaveRadiusMaxMm +
                       kCaveBedrockMarginMm < 40000,
               "tube geometry must keep itself out of bedrock — the bedrock margin is a "
