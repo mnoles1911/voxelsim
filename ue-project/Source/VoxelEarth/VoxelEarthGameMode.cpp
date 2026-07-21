@@ -38,6 +38,23 @@ namespace
 // positional value in a list), which would truncate "X,Y" at the comma and
 // silently drop Y -- this switch's value is the whole "X,Y" pair, so read up
 // to the next whitespace instead.
+// -VoxelWaterWakeTest: runs the SAME basin/pour/dig/place/carve/collapse
+// sequence as -VoxelWaterMemoTest, but with every test-harness "nudge"
+// (SpawnWaterAt after each edit) SUPPRESSED. Those nudges only ever existed
+// because a settled water body used to be unwakeable from a terrain edit --
+// the gap UVoxelWaterSubsystem::NotifyTerrainRegionEdited -> WaterCA::wakeRegion
+// now closes. With them off, any change in the logged digest/volume is caused
+// SOLELY by the terrain edit waking the water, and total volume must be
+// identical at every checkpoint (waking moves water, it never adds any).
+// Read from the command line rather than threaded through the switch's deeply
+// nested timer lambdas, to keep this diff minimal and local.
+bool IsWaterWakeTestMode()
+{
+	float Ignored = 0.f;
+	return FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterWakeTest="), Ignored) ||
+	       FParse::Param(FCommandLine::Get(), TEXT("VoxelWaterWakeTest"));
+}
+
 bool ParseSpawnColumnUU(double& OutWorldX, double& OutWorldY)
 {
 	OutWorldX = 0.0;
@@ -381,8 +398,31 @@ void AVoxelEarthGameMode::BeginPlay()
 						const double BasinSurfUU =
 							ShotTerrain ? ShotTerrain->GetSurfaceHeightUU(WaterMemoTestBasinXUU, WaterMemoTestBasinYUU) : 0.0;
 						const FVector BasinMid(WaterMemoTestBasinXUU, WaterMemoTestBasinYUU, BasinSurfUU + 100.0);
-						const FVector CamPos = BasinMid + FVector(-1400.0, -1000.0, 900.0); // back / side / up
-						const FRotator Look = (BasinMid - CamPos).Rotation();
+						FVector Subject = BasinMid;
+						FVector CamOffset(-1400.0, -1000.0, 900.0); // back / side / up
+						if (IsWaterWakeTestMode())
+						{
+							// -VoxelWaterWakeTest frames much tighter, and on the
+							// WATER ITSELF (its actual centroid, wherever the CA
+							// left it) rather than on the basin: its subject is the
+							// pool that is present before the dig and gone after
+							// it, which at the memo run's 14m/10m/9m standoff is a
+							// few dozen pixels and reads as terrain. The wide
+							// framing stays for -VoxelWaterMemoTest, whose subject
+							// is the collapsed roof debris AROUND the basin.
+							FVector WaterCentroid = FVector::ZeroVector;
+							if (ShotWater && ShotWater->GetStoredWaterCentroidUU(WaterCentroid))
+							{
+								Subject = WaterCentroid;
+							}
+							// Stand 8m/6m back at a fixed 5m ABOVE THE SURFACE, not
+							// above the subject: the pool's centroid sits several
+							// metres down inside the basin, so a camera offset
+							// vertically from IT ends up buried in terrain.
+							CamOffset = FVector(-800.0, -600.0, (BasinSurfUU + 500.0) - Subject.Z);
+						}
+						const FVector CamPos = Subject + CamOffset;
+						const FRotator Look = (Subject - CamPos).Rotation();
 						if (APawn* P = PC->GetPawn())
 						{
 							P->SetActorLocation(CamPos);
@@ -682,26 +722,33 @@ void AVoxelEarthGameMode::BeginPlay()
 	// brick-resolution collapse path, docs/status.md M5 section), just at a
 	// column chosen so its roof overhangs the basin -- see BasinX/Y below.
 	//
-	// IMPORTANT test-harness-only technique, mirroring voxel-core's own
-	// waterca_solid_cache_invalidation_tracks_terrain_edit (test_waterca.cpp):
-	// a small SpawnWaterAt "nudge" follows each edit below. This is NOT a
-	// production behavior -- it exists ONLY so this scenario can prove
-	// anything at all. WaterCA::active_ (waterca.h) means a body that has
-	// fully settled (activeBricks==0) touches NOTHING on subsequent step()
-	// calls, by design -- a terrain edit does not, by itself, wake a
-	// dormant water body (confirmed empirically: a first pass at this
-	// scenario without any nudge produced an UNCHANGING digest through
-	// every single edit, dig/place/carve/structure/collapse alike, because
-	// nothing ever re-examined the affected bricks). That is a SEPARATE,
-	// pre-existing gap from the memo -- see docs/status.md's writeup -- not
-	// something this task's notification/invalidation wiring is scoped to
-	// fix (no public voxel-core API exists to reactivate a brick without
-	// also adding real volume). The nudge exists purely to put the water
-	// CA back into an active state so it actually re-examines solidity near
-	// each edit, which is what the memo-safety question requires testing.
+	// HISTORICAL NOTE + the wake-test variant. Each edit below is followed by
+	// a small SpawnWaterAt "nudge". Those nudges are test-harness-only and
+	// exist for a reason that is now FIXED: a fully settled body
+	// (activeBricks==0) touches nothing on subsequent step() calls
+	// (waterca.h "Activity / settling"), and at the time this switch was
+	// written a terrain edit could not wake it -- the first pass at this
+	// scenario produced an UNCHANGING digest through every dig/place/carve/
+	// structure/collapse. The nudge injected volume purely to force the CA
+	// back into an active state so the memo-safety question could be tested
+	// at all.
+	//
+	// UVoxelWaterSubsystem::NotifyTerrainRegionEdited now calls
+	// vxc::WaterCA::wakeRegion (voxelcore/waterca.h "Terrain-edit
+	// reactivation") on every edit, so the nudges are no longer necessary for
+	// water to react. They are KEPT here so the memo A/B keeps producing the
+	// exact same digests it was signed off with; pass -VoxelWaterWakeTest
+	// INSTEAD of -VoxelWaterMemoTest to run the identical sequence with every
+	// nudge suppressed (IsWaterWakeTestMode above). In that mode nothing but
+	// the terrain edits themselves can move the water, and total volume must
+	// be identical at every logged checkpoint -- which is exactly the
+	// "settled pond actually drains when you dig under it, and conserves"
+	// proof (docs/status.md, "Water reactivation on terrain edits").
 	float WaterMemoTestDelaySeconds = 15.f;
 	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterMemoTest="), WaterMemoTestDelaySeconds) ||
-	    FParse::Param(FCommandLine::Get(), TEXT("VoxelWaterMemoTest")))
+	    FParse::Param(FCommandLine::Get(), TEXT("VoxelWaterMemoTest")) ||
+	    FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterWakeTest="), WaterMemoTestDelaySeconds) ||
+	    FParse::Param(FCommandLine::Get(), TEXT("VoxelWaterWakeTest")))
 	{
 		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelWaterMemoTest: starting basin/pour/dig/place/carve/collapse sequence in %.1fs"),
 		       WaterMemoTestDelaySeconds);
@@ -811,10 +858,16 @@ void AVoxelEarthGameMode::BeginPlay()
 											// put the CA back into an active state and
 											// let it actually re-examine the
 											// (memo-invalidated) solidity near the dig.
-											DigWater->SpawnWaterAt(FVector(BasinX, BasinY, SurfUU + 150.0), 300);
+											if (!IsWaterWakeTestMode())
+											{
+												DigWater->SpawnWaterAt(FVector(BasinX, BasinY, SurfUU + 150.0), 300);
+											}
 											UE_LOG(LogVoxelEarth, Log,
-											       TEXT("VoxelWaterMemoTest: post-dig nudge digest=0x%016llX"),
-											       (unsigned long long)DigWater->GetWaterDigest());
+											       TEXT("VoxelWaterMemoTest: post-dig %s digest=0x%016llX volume=%llu activeBricks=%lld"),
+											       IsWaterWakeTestMode() ? TEXT("(wakeRegion only, no nudge)") : TEXT("nudge"),
+											       (unsigned long long)DigWater->GetWaterDigest(),
+											       (unsigned long long)DigWater->GetPerfSnapshot().TotalVolume,
+											       DigWater->GetPerfSnapshot().ActiveBricks);
 
 											GetWorldTimerManager().SetTimer(
 												WaterMemoTestTimerHandle,
@@ -831,8 +884,9 @@ void AVoxelEarthGameMode::BeginPlay()
 															return;
 														}
 														UE_LOG(LogVoxelEarth, Log,
-														       TEXT("VoxelWaterMemoTest: post-dig settled digest=0x%016llX"),
-														       (unsigned long long)PlaceWater->GetWaterDigest());
+														       TEXT("VoxelWaterMemoTest: post-dig settled digest=0x%016llX volume=%llu"),
+														       (unsigned long long)PlaceWater->GetWaterDigest(),
+						       (unsigned long long)PlaceWater->GetPerfSnapshot().TotalVolume);
 
 														// PLACE: a solid cube near the
 														// basin's floor, offset from the
@@ -850,10 +904,16 @@ void AVoxelEarthGameMode::BeginPlay()
 
 														// Test-harness nudge (see doc comment
 														// above the switch parse block).
-														PlaceWater->SpawnWaterAt(FVector(BasinX, BasinY, SurfUU + 150.0), 300);
+														if (!IsWaterWakeTestMode())
+														{
+															PlaceWater->SpawnWaterAt(FVector(BasinX, BasinY, SurfUU + 150.0), 300);
+														}
 														UE_LOG(LogVoxelEarth, Log,
-														       TEXT("VoxelWaterMemoTest: post-place nudge digest=0x%016llX"),
-														       (unsigned long long)PlaceWater->GetWaterDigest());
+														       TEXT("VoxelWaterMemoTest: post-place %s digest=0x%016llX volume=%llu activeBricks=%lld"),
+														       IsWaterWakeTestMode() ? TEXT("(wakeRegion only, no nudge)") : TEXT("nudge"),
+														       (unsigned long long)PlaceWater->GetWaterDigest(),
+														       (unsigned long long)PlaceWater->GetPerfSnapshot().TotalVolume,
+														       PlaceWater->GetPerfSnapshot().ActiveBricks);
 
 														GetWorldTimerManager().SetTimer(
 															WaterMemoTestTimerHandle,
@@ -872,8 +932,9 @@ void AVoxelEarthGameMode::BeginPlay()
 																		return;
 																	}
 																	UE_LOG(LogVoxelEarth, Log,
-																	       TEXT("VoxelWaterMemoTest: post-place settled digest=0x%016llX"),
-																	       (unsigned long long)CarveWater->GetWaterDigest());
+																	       TEXT("VoxelWaterMemoTest: post-place settled digest=0x%016llX volume=%llu"),
+																	       (unsigned long long)CarveWater->GetWaterDigest(),
+						       (unsigned long long)CarveWater->GetPerfSnapshot().TotalVolume);
 
 																	// CARVE: breach a side channel next
 																	// to the basin.
@@ -884,10 +945,16 @@ void AVoxelEarthGameMode::BeginPlay()
 
 																	// Test-harness nudge (see doc comment
 																	// above the switch parse block).
-																	CarveWater->SpawnWaterAt(FVector(BasinX, BasinY, SurfUU + 150.0), 300);
+																	if (!IsWaterWakeTestMode())
+																	{
+																		CarveWater->SpawnWaterAt(FVector(BasinX, BasinY, SurfUU + 150.0), 300);
+																	}
 																	UE_LOG(LogVoxelEarth, Log,
-																	       TEXT("VoxelWaterMemoTest: post-carve nudge digest=0x%016llX"),
-																	       (unsigned long long)CarveWater->GetWaterDigest());
+																	       TEXT("VoxelWaterMemoTest: post-carve %s digest=0x%016llX volume=%llu activeBricks=%lld"),
+																	       IsWaterWakeTestMode() ? TEXT("(wakeRegion only, no nudge)") : TEXT("nudge"),
+																	       (unsigned long long)CarveWater->GetWaterDigest(),
+																	       (unsigned long long)CarveWater->GetPerfSnapshot().TotalVolume,
+																	       CarveWater->GetPerfSnapshot().ActiveBricks);
 
 																	GetWorldTimerManager().SetTimer(
 																		WaterMemoTestTimerHandle,
@@ -906,8 +973,9 @@ void AVoxelEarthGameMode::BeginPlay()
 																					return;
 																				}
 																				UE_LOG(LogVoxelEarth, Log,
-																				       TEXT("VoxelWaterMemoTest: post-carve settled digest=0x%016llX"),
-																				       (unsigned long long)StructWater->GetWaterDigest());
+																				       TEXT("VoxelWaterMemoTest: post-carve settled digest=0x%016llX volume=%llu"),
+																				       (unsigned long long)StructWater->GetWaterDigest(),
+						       (unsigned long long)StructWater->GetPerfSnapshot().TotalVolume);
 																				double SpawnColXUU2 = 0.0, SpawnColYUU2 = 0.0;
 																				ParseSpawnColumnUU(SpawnColXUU2, SpawnColYUU2);
 																				const double StructAnchorX2 = SpawnColXUU2 + 5000.0;
@@ -960,10 +1028,16 @@ void AVoxelEarthGameMode::BeginPlay()
 																							// Test-harness nudge (see doc
 																							// comment above the switch parse
 																							// block).
-																							BlastWater->SpawnWaterAt(FVector(BasinX, BasinY, SurfUU + 150.0), 300);
+																							if (!IsWaterWakeTestMode())
+																							{
+																								BlastWater->SpawnWaterAt(FVector(BasinX, BasinY, SurfUU + 150.0), 300);
+																							}
 																							UE_LOG(LogVoxelEarth, Log,
-																							       TEXT("VoxelWaterMemoTest: post-collapse nudge digest=0x%016llX"),
-																							       (unsigned long long)BlastWater->GetWaterDigest());
+																							       TEXT("VoxelWaterMemoTest: post-collapse %s digest=0x%016llX volume=%llu activeBricks=%lld"),
+																							       IsWaterWakeTestMode() ? TEXT("(wakeRegion only, no nudge)") : TEXT("nudge"),
+																							       (unsigned long long)BlastWater->GetWaterDigest(),
+																							       (unsigned long long)BlastWater->GetPerfSnapshot().TotalVolume,
+																							       BlastWater->GetPerfSnapshot().ActiveBricks);
 
 																							GetWorldTimerManager().SetTimer(
 																								WaterMemoTestTimerHandle,

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <vector>
 
 #include "voxelcore/generator.h"
@@ -84,6 +85,36 @@ WaterCA::SolidFn communicatingVessels(int64_t tankAx0, int64_t connX0, int64_t c
         const bool inTankB = vx >= tankBx0 && vx <= tankBx0 + 1;
         if (vz == 1 && vx >= connX0 && vx <= connX1) return MAT_AIR; // connector layer only
         if (inTankA || inTankB) return MAT_AIR;                     // both tanks, full height
+        return MAT_ROCK;
+    };
+}
+
+// A 4x4 open basin (x,y in [0,3]) with its floor at z<=0 and walls outside,
+// plus a 1x1 drain shaft at (0,0) punched straight through that floor down to
+// bedrock at z<=-10 -- but ONLY once *holeOpen becomes true. That flip is
+// exactly a player digging underneath a settled pond: the terrain query's
+// answers change at runtime, with no water added or removed. Used by the
+// wakeRegion tests below.
+WaterCA::SolidFn basinWithDrain(std::shared_ptr<bool> holeOpen) {
+    return [holeOpen](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
+        if (vz <= -10) return MAT_ROCK; // bedrock under the shaft
+        if (*holeOpen && vx == 0 && vy == 0 && vz <= 0) return MAT_AIR; // the dug shaft
+        if (vz <= 0) return MAT_ROCK;                                   // basin floor
+        if (vx < 0 || vx > 3 || vy < 0 || vy > 3) return MAT_ROCK;      // basin walls
+        return MAT_AIR;
+    };
+}
+
+// A 4x4 walled chamber (x,y in [0,3]) whose EAST wall is carved away once
+// *breached becomes true, opening a channel + second chamber out to x=11. The
+// carve/breach counterpart of basinWithDrain: it proves water reacts to a
+// SIDEWAYS opening, several bricks wide, not just to a hole underneath.
+WaterCA::SolidFn basinWithBreach(std::shared_ptr<bool> breached) {
+    return [breached](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
+        if (vz <= 0) return MAT_ROCK;                              // floor everywhere
+        if (vy < 0 || vy > 3) return MAT_ROCK;                     // north/south walls
+        if (vx >= 0 && vx <= 3) return MAT_AIR;                    // the original chamber
+        if (*breached && vx >= 4 && vx <= 11) return MAT_AIR;      // carved channel + chamber
         return MAT_ROCK;
     };
 }
@@ -679,4 +710,220 @@ VXC_TEST(waterca_solid_cache_disable_and_full_invalidate_are_safe) {
         CHECK_EQ(dp.h, dm.h);
     }
     CHECK_EQ(plain.totalVolume(), memo.totalVolume());
+}
+
+// --- Terrain-edit reactivation (wakeRegion, waterca.h "Terrain-edit
+// reactivation") -------------------------------------------------------------
+
+// THE BUG, reproduced: a settled pond is frozen against a terrain edit until
+// something wakes it. The first half of this test is the regression witness
+// (the old, broken behavior); the second half is the fix.
+VXC_TEST(waterca_wake_region_drains_settled_pond_into_new_hole) {
+    auto holeOpen = std::make_shared<bool>(false);
+    WaterCA ca(basinWithDrain(holeOpen));
+    ca.addWater(1, 1, 6, 2000);
+    CHECK(runToSettleCheckingConservation(ca, 300));
+    CHECK_EQ(ca.totalVolume(), uint64_t(2000));
+    CHECK_EQ(int(ca.fillAt(1, 1, 1)), 125); // 2000 spread flat over the 16-cell floor
+    CHECK_EQ(ca.activeBrickCount(), size_t(0));
+
+    Digest settled;
+    ca.digest(settled);
+
+    // Dig the shaft out from under the pond. WITHOUT a wake call this is a
+    // complete no-op forever -- the exact gameplay bug (docs/status.md W2).
+    *holeOpen = true;
+    for (int i = 0; i < 20; ++i) {
+        ca.step();
+        CHECK_EQ(ca.steppedBrickCount(), size_t(0));
+    }
+    Digest frozen;
+    ca.digest(frozen);
+    CHECK_EQ(frozen.h, settled.h);
+    CHECK_EQ(int(ca.fillAt(1, 1, 1)), 125); // still sitting there, untouched
+
+    // Now wake the edited region. The dug voxels were ALL terrain and hold no
+    // water at all -- the water that must react lives in a different brick,
+    // which is precisely what the halo rule is for.
+    const size_t woken = ca.wakeRegion(0, 0, -9, 0, 0, 0);
+    CHECK(woken >= size_t(1));
+    CHECK_EQ(ca.totalVolume(), uint64_t(2000)); // waking creates/destroys nothing
+    Digest afterWake;
+    ca.digest(afterWake);
+    CHECK_EQ(afterWake.h, settled.h); // ...and writes no fill either
+
+    CHECK(runToSettleCheckingConservation(ca, 500));
+    CHECK_EQ(ca.totalVolume(), uint64_t(2000)); // exact conservation through the drain
+
+    Digest drained;
+    ca.digest(drained);
+    CHECK(drained.h != settled.h); // the whole point: the state actually moved
+
+    // 2000 units in the 9-cell shaft (z=-9..-1): fills bottom-up, 7 full cells
+    // (1785) + 215 in the 8th, leaving the basin floor above it dry.
+    CHECK_EQ(int(ca.fillAt(0, 0, -9)), 255);
+    CHECK_EQ(int(ca.fillAt(0, 0, -3)), 255);
+    CHECK_EQ(int(ca.fillAt(0, 0, -2)), 215);
+    CHECK_EQ(int(ca.fillAt(0, 0, -1)), 0);
+    CHECK_EQ(int(ca.fillAt(1, 1, 1)), 0); // pond fully drained
+    CHECK_EQ(ca.recomputeVolume(), uint64_t(2000));
+}
+
+// Waking is scheduling only: no fill written, ledger untouched, and an edit
+// nowhere near any water wakes nothing at all (so a dig in the desert can
+// never resurrect a distant lake's per-tick cost).
+VXC_TEST(waterca_wake_region_writes_nothing_and_ignores_dry_regions) {
+    WaterCA ca(basin(0, 3, 0, 3));
+    ca.addWater(1, 1, 6, 2000);
+    CHECK(runToSettleCheckingConservation(ca, 300));
+    CHECK_EQ(ca.activeBrickCount(), size_t(0));
+
+    Digest before;
+    ca.digest(before);
+    const uint64_t vol = ca.totalVolume();
+
+    // Far away (many bricks off in every direction): nothing to wake.
+    CHECK_EQ(ca.wakeRegion(4000, 4000, 4000, 4001, 4001, 4001), size_t(0));
+    CHECK_EQ(ca.activeBrickCount(), size_t(0));
+
+    // Degenerate/inverted boxes are rejected rather than misinterpreted.
+    CHECK_EQ(ca.wakeRegion(5, 5, 5, 4, 6, 6), size_t(0));
+
+    // On the pond itself: wakes, but changes no stored state whatsoever.
+    CHECK(ca.wakeRegion(1, 1, 1, 1, 1, 1) >= size_t(1));
+    Digest after;
+    ca.digest(after);
+    CHECK_EQ(after.h, before.h);
+    CHECK_EQ(ca.totalVolume(), vol);
+    CHECK_EQ(ca.recomputeVolume(), vol);
+
+    // Re-waking an already-active brick is idempotent (0 newly woken).
+    const size_t n = ca.activeBrickCount();
+    CHECK_EQ(ca.wakeRegion(1, 1, 1, 1, 1, 1), size_t(0));
+    CHECK_EQ(ca.activeBrickCount(), n);
+}
+
+// Order/strategy independence (waterca.h "DETERMINISM"): the woken set is a
+// pure function of (region, WaterMap contents) -- independent of the order the
+// water was inserted in (i.e. of unordered_map bucket order) AND of which of
+// wakeRegion's two enumeration strategies it picks for a given region.
+VXC_TEST(waterca_wake_region_order_and_strategy_independent) {
+    // Same body, built in opposite insertion orders -> identical contents,
+    // different internal hash-table layout.
+    auto build = [](WaterCA& ca, bool reversed) {
+        for (int i = 0; i < 4; ++i) {
+            const int64_t x = reversed ? (3 - i) : i;
+            for (int64_t y = 0; y < 4; ++y) ca.addWater(x, y, 6, 400);
+        }
+    };
+    WaterCA a(basin(0, 3, 0, 3)), b(basin(0, 3, 0, 3));
+    build(a, false);
+    build(b, true);
+    CHECK(runToSettleCheckingConservation(a, 300));
+    CHECK(runToSettleCheckingConservation(b, 300));
+    Digest ds0, ds1;
+    a.digest(ds0);
+    b.digest(ds1);
+    CHECK_EQ(ds0.h, ds1.h);
+
+    // A region far larger than the stored body forces wakeRegion's
+    // walk-the-stored-bricks branch (over an unordered_map) on both.
+    const size_t wa = a.wakeRegion(-500, -500, -500, 500, 500, 500);
+    const size_t wb = b.wakeRegion(-500, -500, -500, 500, 500, 500);
+    CHECK_EQ(wa, wb);
+    CHECK_EQ(a.activeBricks().size(), b.activeBricks().size());
+    for (const BrickKey& k : a.activeBricks()) CHECK(b.activeBricks().count(k) == size_t(1));
+
+    // ...and the resulting tick is itself order-independent, exactly the way
+    // the existing two-phase property tests check it.
+    std::vector<BrickKey> fwd = a.activeSetSnapshot();
+    std::vector<BrickKey> rev = fwd;
+    std::reverse(rev.begin(), rev.end());
+    a.stepWithOrder(fwd);
+    b.stepWithOrder(rev);
+    Digest da, db;
+    a.digest(da);
+    b.digest(db);
+    CHECK_EQ(da.h, db.h);
+    CHECK_EQ(a.totalVolume(), b.totalVolume());
+
+    // STRATEGY CROSS-CHECK: the SAME region against the SAME nearby body must
+    // wake the same bricks whether wakeRegion walks the region (chosen when
+    // the region spans fewer bricks than the map stores) or walks the map.
+    // `large` carries extra, unrelated water far away purely to push the
+    // stored brick count past the region's span and flip the branch.
+    WaterCA small(basin(0, 3, 0, 3));
+    small.addWater(1, 1, 3, 600);
+    CHECK(runToSettleCheckingConservation(small, 200));
+    WaterCA large(basin(0, 3, 0, 3));
+    large.addWater(1, 1, 3, 600);
+    CHECK(runToSettleCheckingConservation(large, 200));
+    for (int64_t i = 0; i < 64; ++i) large.addWater(2, 2, 1 + 8 * (i + 20), 100); // far column, own bricks
+    CHECK(large.storedBrickCount() > small.storedBrickCount());
+
+    const auto beforeLarge = large.activeBricks();
+    const size_t nSmall = small.wakeRegion(0, 0, 0, 3, 3, 3);
+    large.wakeRegion(0, 0, 0, 3, 3, 3);
+    size_t nLarge = 0;
+    for (const BrickKey& k : large.activeBricks())
+        if (beforeLarge.find(k) == beforeLarge.end()) ++nLarge;
+    CHECK_EQ(nSmall, nLarge);
+    for (const BrickKey& k : small.activeBricks()) CHECK(large.activeBricks().count(k) == size_t(1));
+}
+
+// The carve/breach counterpart of the drain test: a settled pool behind a wall
+// that is carved away sideways must flow out and re-level across the newly
+// opened volume -- and must sit there frozen if nothing wakes it.
+VXC_TEST(waterca_wake_region_settled_pool_flows_through_a_carved_breach) {
+    auto breached = std::make_shared<bool>(false);
+    WaterCA ca(basinWithBreach(breached));
+    ca.addWater(1, 1, 6, 2000);
+    CHECK(runToSettleCheckingConservation(ca, 300));
+    CHECK_EQ(int(ca.fillAt(1, 1, 1)), 125);
+    CHECK_EQ(int(ca.fillAt(9, 1, 1)), 0);
+    CHECK_EQ(ca.activeBrickCount(), size_t(0));
+    Digest settled;
+    ca.digest(settled);
+
+    *breached = true; // carve the east wall + a channel out to x=11
+    for (int i = 0; i < 10; ++i) {
+        ca.step();
+        CHECK_EQ(ca.steppedBrickCount(), size_t(0)); // frozen until woken
+    }
+    Digest frozen;
+    ca.digest(frozen);
+    CHECK_EQ(frozen.h, settled.h);
+
+    // The carve spans several bricks; wake over its whole inclusive box.
+    CHECK(ca.wakeRegion(4, 0, 1, 11, 3, 8) >= size_t(1));
+    CHECK(runToSettleCheckingConservation(ca, 800));
+    CHECK_EQ(ca.totalVolume(), uint64_t(2000)); // exact conservation through the breach
+    CHECK_EQ(ca.recomputeVolume(), uint64_t(2000));
+
+    // Re-levelled across all 48 newly connected floor cells (3 chambers' worth
+    // of 4x4 footprint): 2000/48 = 41 remainder 32, so every floor cell holds
+    // 41 or 42 and the original chamber's 125 is long gone.
+    for (int64_t x = 0; x <= 11; ++x)
+        for (int64_t y = 0; y <= 3; ++y) {
+            const int f = int(ca.fillAt(x, y, 1));
+            CHECK(f == 41 || f == 42);
+        }
+    CHECK_EQ(int(ca.fillAt(1, 1, 2)), 0); // nothing left stacked above the new level
+}
+
+// The halo is what makes this work at all: the edited voxels themselves are
+// dry terrain, so a zero-halo rule (wake only bricks the edit overlaps) would
+// wake nothing whenever the dig sits one brick below the water. Pins that the
+// halo reaches exactly one brick and no further.
+VXC_TEST(waterca_wake_region_halo_reaches_one_brick_not_two) {
+    WaterCA ca(basin(0, 3, 0, 3));
+    ca.addWater(1, 1, 6, 2000); // settles into brick (0,0,0) (voxels z=1..)
+    CHECK(runToSettleCheckingConservation(ca, 300));
+    CHECK_EQ(ca.activeBrickCount(), size_t(0));
+    CHECK(ca.findBrick(BrickKey{0, 0, 0}) != nullptr);
+
+    // An edit in brick (0,0,-2) is two bricks below the water: out of reach.
+    CHECK_EQ(ca.wakeRegion(1, 1, -12, 1, 1, -12), size_t(0));
+    // An edit in brick (0,0,-1) is directly below it: within the halo.
+    CHECK_EQ(ca.wakeRegion(1, 1, -1, 1, 1, -1), size_t(1));
 }
