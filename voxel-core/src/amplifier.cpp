@@ -80,6 +80,57 @@ ClimateSample cachedClimate(uint64_t amp, ITileSampler& tiles, int64_t px, int64
     return v;
 }
 
+// ---------------------------------------------------------------------------
+// Cave-lattice memo (performance only — provably cannot change any output).
+//
+// With the tile-raster memo above in place, `caveColumnFor` became the largest
+// single term in column(): ~0.227 us/col, ~68% of the remaining cost. Almost
+// all of it is the 34-70 hashes of the 4x4 node block, the 18 candidate edges
+// and the sinkhole candidate — and caves.h now exposes those separately
+// (`CaveLattice` / `caveLatticeFor`) because they depend ONLY on the lattice
+// CELL (ci, cj), never on where in the cell the column sits. One cell is
+// 25.6 m square = 65'536 voxel columns, so a sweep recomputes the identical
+// block tens of thousands of times.
+//
+// Same direct-mapped, thread_local, never-reused-id scheme as the tile memo:
+// a hit and a miss return bit-identical values (caveLatticeFor is pure), so
+// determinism is untouched and no worldgen constant or iteration order moves.
+// The key is (seed, ci, cj) — the seed, not the Amplifier id, because the
+// lattice is a function of the seed alone and two Amplifiers on one seed
+// legitimately share it.
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t kCaveLatticeSlots = 16; // ~11 KB/thread at ~700 B/slot
+
+struct CaveLatticeSlot {
+    bool valid = false;
+    uint64_t seed = 0;
+    int64_t ci = 0, cj = 0;
+    CaveLattice value;
+};
+
+const CaveLattice& cachedCaveLattice(uint64_t seed, int64_t ci, int64_t cj) {
+    static thread_local CaveLatticeSlot slots[kCaveLatticeSlots];
+    CaveLatticeSlot& s = slots[slotIndex(seed, ci, cj, kCaveLatticeSlots)];
+    if (s.valid && s.seed == seed && s.ci == ci && s.cj == cj) return s.value;
+    s.value = caveLatticeFor(seed, ci, cj);
+    s.valid = true;
+    s.seed = seed;
+    s.ci = ci;
+    s.cj = cj;
+    return s.value;
+}
+
+// caveColumnFor(seed, vx, vy, surfaceMm), memoised. Bit-identical by
+// construction: it is caves.h's own composition with the cell-only half served
+// from the table.
+CaveColumn cachedCaveColumn(uint64_t seed, int64_t vx, int64_t vy, int32_t surfaceMm) {
+    if (surfaceMm < kCaveMinSurfaceMm) return CaveColumn{};
+    const int64_t ci = floorDiv(vx * kVoxelSizeMm, kCaveLatticeMm);
+    const int64_t cj = floorDiv(vy * kVoxelSizeMm, kCaveLatticeMm);
+    return caveColumnFromLattice(cachedCaveLattice(seed, ci, cj), vx, vy);
+}
+
 
 // Detail octave table v1 (worldgen-versioned constant, docs/determinism.md).
 // latticeMm chosen so octaves nest across brick sizes; amplitudes in mm before
@@ -169,7 +220,9 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // (seed, vx, vy, surfaceMm) — no raster reads — which is what lets
     // worldgen.hlsl recompute it inside VoxelizeMain rather than widening
     // GpuColumnSample. Mirrored bit-exactly there.
-    col.cave = caveColumnFor(seed_, vx, vy, col.surfaceMm);
+    // Served from the per-thread cave-lattice memo above; bit-identical to
+    // caveColumnFor(seed_, vx, vy, col.surfaceMm).
+    col.cave = cachedCaveColumn(seed_, vx, vy, col.surfaceMm);
     return col;
 }
 
