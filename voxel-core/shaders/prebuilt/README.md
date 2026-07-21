@@ -25,6 +25,41 @@ The **CPU reference did not change**, so `vxc::kWorldGenVersion` stays at 2
 and no goldens move. Confirmed empirically: all three AMD-leg digests below
 are bit-identical before and after the fix.
 
+## 2026-07 respin 2: cross-vendor UB hardening (ColumnMain, MeshCount, MeshEmit)
+
+A follow-up audit of `worldgen.hlsl` found five more constructs in the same
+undefined-behavior family as the signed-`%` bug above — latent rather than
+live, each currently masked by a host-side contract that nothing in the
+shader enforced. All five are now guarded IN THE SHADER:
+
+1. `decodeMask`'s interior-brick dims (`bricksX - 2u`) wrapped to
+   `0xFFFFFFFF` for a region with fewer than 3 bricks on an axis, which the
+   `maskIndex >= maskCount` range check then passed — early-out added.
+2. The greedy run-length scan read `mask[64]`, one past `uint mask[64]`, on
+   the last row's terminating iteration; safe only if `&&` short-circuits,
+   which HLSL does not guarantee — hoisted into an explicit `if`/`break`.
+3. `OutQuads[baseOffset + quadCount]` was an unclamped write driven by
+   scanned offsets — now bounded by `OutQuads.GetDimensions` (the buffer's
+   own length, so no new host/shader contract), and `MeshEmitMain` refuses
+   to emit above `ScanCount`.
+4. `PixelSizeMm` is a host-controlled divisor; zero would be an
+   OpUDiv-by-zero — guarded in `ColumnMain` and asserted host-side in
+   `voxel-core/bench/gpu_harness.cpp`.
+5. `clamp64(..., 0, RasterSize.x - 1)` inverted its range to `[0, -1]` when
+   the raster window was empty, returning -1 that the `(uint)` cast turned
+   into a ~4-billion index — zero-extent early-out added.
+
+These are GUARDS, not behavior changes: on every valid input each guarded
+branch is unreachable, and all three AMD digests below reproduce bit-identically
+(re-verified on this box after the change). `ColumnMain`, `MeshCountMain` and
+`MeshEmitMain` respun; the other four kernels are byte-identical to respin 1.
+The CPU reference is untouched — `vxc::kWorldGenVersion` stays at 2, no
+goldens move.
+
+`tools/lint-shader-ub.py` (CI job `shader-ub-lint`) now enforces this whole
+class going forward, including an exact OpSDiv/OpSRem/OpSMod opcode audit of
+the `.spv` files in this directory.
+
 ## Provenance
 
 - Source: `voxel-core/shaders/worldgen.hlsl` at commit `8b834107701fd4a2a005b8dbd4a17352f44f26c1`
@@ -34,20 +69,29 @@ are bit-identical before and after the fix.
 - Compile command: `tools/compile-shaders.ps1`'s SPIR-V invocation —
   `dxc -T cs_6_0 -E <Entry> -O3 -spirv -fspv-target-env=vulkan1.1
   -fvk-b-shift 0 0 -fvk-t-shift 1 0 -fvk-u-shift 3 0 worldgen.hlsl -Fo <out>.spv`
-- Compiled and committed from: worktree HEAD `354ea238a66caa1b5aa966632cd81c3f5070ee06`
-  (branch base: `main`) — ColumnMain respun for the signed-`%` fix above; the
-  other six kernels are unchanged since worktree HEAD
-  `a172baf54c8ebf45e99d281a539fdd63fcd5e7e6` (branch base: `main`, PR #34
-  "m6-pathfind" merge)
+- Compiled and committed from: worktree HEAD `4b54e9f1118de70cec46b837e7e237547ef2fce8`
+  (branch base: `main`, PR #40 "worldgen-vendor-ub-fix" merge) — ColumnMain,
+  MeshCountMain and MeshEmitMain respun for the UB-hardening pass above.
+  ScanAddMain/ScanBlocksMain/ScanSumsMain/VoxelizeMain are unchanged since
+  worktree HEAD `a172baf54c8ebf45e99d281a539fdd63fcd5e7e6` (branch base:
+  `main`, PR #34 "m6-pathfind" merge); the intervening respin
+  (`354ea238a66caa1b5aa966632cd81c3f5070ee06`) touched ColumnMain only, for
+  the signed-`%` fix.
+- Verified: recompiling from the pinned DXC reproduces these bytes exactly,
+  and `python tools/lint-shader-ub.py --spv-dir voxel-core/shaders/prebuilt`
+  confirms ZERO `OpSDiv`/`OpSRem`/`OpSMod` across all seven modules. Every
+  division that remains lowers to `OpUDiv`/`OpUMod` (24 `OpUDiv` in
+  ColumnMain alone), which has exactly one legal result on any
+  implementation.
 - Built on: this Windows dev box (MSVC/VS 2026 toolchain elsewhere in the
   repo; DXC itself needs no MSVC — it's a standalone compiler)
 
 ## SHA-256
 
 ```
-36a8d69d5f628b9b811deac2376e9e3f1c386372be01d193be46519b10a9cbf5  worldgen.ColumnMain.spv
-d77c4d737507a61d9f9fa61bb2e6c0677d16d93c9ed74e20f2f3bfbc1725e6aa  worldgen.MeshCountMain.spv
-c856bb46d94b8358797fe5c1275df54e48a3922ddb080db71cdfe8b559ea808e  worldgen.MeshEmitMain.spv
+5f16bc95373ed6f585b068cf4ba93666eda2d8081e463e053a8b371e34768ce6  worldgen.ColumnMain.spv
+b3fdca92cefc9ee1967bb0d0b4bbef377d0183224e60223c32cfb41c2ee6981b  worldgen.MeshCountMain.spv
+f5d1168c83935f7c35094f30f27012057aa8ea80d83130afeaa945a46e03bacd  worldgen.MeshEmitMain.spv
 72cb57ed63c531b0745f109e1b7c9a2054ed1e201b0ef59dbb062171ed207130  worldgen.ScanAddMain.spv
 0168a302618b437e31b0b4e8bf69aa4ea203383dfd6d1e38b13acd0618d277e1  worldgen.ScanBlocksMain.spv
 e2060888d9938627c0e5c899d4402c804aeee61aae04b86ffcf9c3c5ec4cdf8e  worldgen.ScanSumsMain.spv
@@ -87,6 +131,12 @@ three digests reproduced exactly — `1dbcabb01cfaf2bc`, `95a82ba20200f6f2`,
 `b4c8ec5d0966894b`. That the AMD digests are byte-identical across the fix is
 the proof that the fix is a no-op on the vendor that was already correct, and
 therefore cannot move any golden.
+
+Re-verified UNCHANGED AGAIN after "respin 2: cross-vendor UB hardening" above
+(same box, same three modes, `vxc_gpu` rebuilt against the respun `.spv`):
+`1dbcabb01cfaf2bc`, `95a82ba20200f6f2`, `b4c8ec5d0966894b`. Since every added
+guard is unreachable on valid input, identical digests are the expected
+result and the evidence that the guards changed no behavior.
 
 These three digests — not the older status.md ones — are the values the
 NVIDIA leg (`tools/run-nvidia-digest.sh`) must reproduce to close the M0
