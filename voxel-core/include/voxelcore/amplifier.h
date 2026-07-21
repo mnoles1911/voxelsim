@@ -32,7 +32,8 @@ struct ColumnSample {
 
 class Amplifier {
 public:
-    Amplifier(uint64_t seed, ITileSampler& tiles) : seed_(seed), tiles_(&tiles) {}
+    Amplifier(uint64_t seed, ITileSampler& tiles)
+        : seed_(seed), tiles_(&tiles), id_(nextId()) {}
 
     uint64_t seed() const { return seed_; }
 
@@ -52,13 +53,33 @@ public:
     // it". Production paths want materialAt().
     static MaterialId stratigraphyAt(const ColumnSample& col, int64_t vz);
 
+    // Per-voxel query. This is the path taken by World::materialAt ->
+    // UVoxelWorldSubsystem::IsSolidAtVoxel -> the region-graph MaterialFn and
+    // by collapse.h's CarveSphere, which walk voxels rather than columns and
+    // so re-derive the SAME column once per voxel of its height. It goes
+    // through the memo below; batch callers that already hold a ColumnGrid
+    // (GeneratedWorld::columns, gpu_harness, bench) use the two-argument
+    // materialAt and never pay for it.
     MaterialId materialAt(int64_t vx, int64_t vy, int64_t vz) const {
-        return materialAt(column(vx, vy), vz);
+        return materialAt(columnCached(vx, vy), vz);
     }
 
+    // column(), served from a per-thread memo. Identical value to column();
+    // the reference is valid until this thread's next columnCached call.
+    const ColumnSample& columnCached(int64_t vx, int64_t vy) const;
+
 private:
+    // Identity for the per-thread tile-raster memo in amplifier.cpp. Drawn from
+    // a never-reused counter rather than using `this` or `tiles_`, because a
+    // destroyed Amplifier's address can be recycled by the allocator and a
+    // stale memo entry would then be served to a DIFFERENT world. Copies share
+    // the id, which is correct: Amplifier is immutable after construction, so
+    // a copy samples the same (seed, tiles) and must produce the same columns.
+    static uint64_t nextId();
+
     uint64_t seed_;
     ITileSampler* tiles_;
+    uint64_t id_;
 };
 
 } // namespace vxc
