@@ -132,4 +132,21 @@ private:
 	bool bDigSwarmTestActive = false;
 	double DigSwarmTestColumnXUU = 0.0;
 	double DigSwarmTestColumnYUU = 0.0;
+
+	// M6 gap closure verification (docs/status.md M6 section "Tier-1
+	// hierarchical planning + NPC replication"): -VoxelTier1RegionGraphTest[=<N>]
+	// builds a short wall INSIDE UVoxelAgentSubsystem::Tier1GraphHorizontalRadius
+	// Regions' coverage (unlike -VoxelDigSwarmTest's wall, which sits right
+	// next to the player and is meant for Tier 0's dig-while-pathing), spawns
+	// N Tier-1-range agents on the far side of it, then (after they've had
+	// time to detour around it) DIGS A GAP in the wall's center -- proving
+	// dirty invalidation: the next natural Tier 1 replan should route through
+	// the new opening instead of continuing the old detour. See the .cpp for
+	// the exact geometry/timing and watch for "VoxelAgent N (Tier1
+	// hierarchical): corridor cost=..." log lines before/after the gap.
+	FTimerHandle Tier1RegionGraphTestTimerHandle;
+	FTimerHandle Tier1RegionGraphGapTimerHandle;
+	bool bTier1RegionGraphTestActive = false;
+	double Tier1RegionGraphTestColumnXUU = 0.0;
+	double Tier1RegionGraphTestColumnYUU = 0.0;
 };

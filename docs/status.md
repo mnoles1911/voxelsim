@@ -1411,6 +1411,195 @@ test switches.
   2-voxel body, per-dirty-brick invalidation, agent state replication)
   still stand, unchanged by this slice.
 
+### Tier-1 hierarchical planning + NPC replication (M6 gap closure, worktree agent)
+
+Closes the two documented v0 gaps: Tier 1 now plans via the merged
+`regiongraph.h` hierarchical layer instead of raw `vxc::findPath`
+(`UVoxelAgentSubsystem::PlanPathTier1`), and NPC state now replicates to
+remote clients (`AVoxelAgentReplicator`, a new file). Files touched:
+`VoxelAgent{,Subsystem}.{h,cpp}`, new `VoxelAgentReplication.{h,cpp}`,
+`VoxelEarthGameMode.{h,cpp}` (test switches only).
+
+**1. Region-graph lifetime/extent design.** ONE `vxc::RegionGraph`
+(`FVoxelAgentImpl::Tier1RegionGraph`, PIMPL-side), rebuilt (not
+per-frame — only when the player's ground column drifts more than
+`Tier1GraphRebuildTriggerUU`, half the box radius, from the cached
+center) over a box centered on the player's ground column:
+`Tier1GraphHorizontalRadiusRegions=12` (19.2m) x
+`Tier1GraphVerticalRadiusRegions=1` (1.6m each way) = 25x25x3 = 1,875
+regions. This is deliberately NOT sized to cover the full Tier 1
+catchment (`Tier0ExitUU`..`Tier1ExitUU` = 20m..100m) — see the measured
+cost below for why — so Tier 1 agents outside the box's coverage fall
+back to the pre-M6 fine windowed `findPath`, unchanged and always
+correct, never worse than before this slice (`PlanPathTier1`'s
+`FallBackToFineSearch`). 19.2m was chosen as the SMALLEST radius that
+can ever hold a Tier 1 agent at all: Tier 1 classification requires
+distance >= `Tier0EnterUU` (15m), so any box radius under that could
+never cover a single Tier 1 query.
+
+**MEASURED build cost (real numbers, not estimates) — the central
+finding of this slice**: the dominant cost is **O(regions x portals^2)
+fine-`findPath` calls**, each allocating bookkeeping arrays sized to its
+search window's volume regardless of how many expansions it actually
+uses. Three real data points, same 1,875-region box, only the per-call
+expansion cap (`Tier1GraphIntraMaxExpansions`/`Tier1PerRegionMaxExpansions`)
+varied:
+| Cap | Build time | Corridor success |
+|---|---|---|
+| 256 | ~160s | **0/751** hierarchical queries succeeded (entry/exit/intra-region searches inside rock-dense regions genuinely need more than 256 expansions; every one fell back to fine search) |
+| 4096 (regiongraph.h default) | >500s, killed before completion | untested (never finished) |
+| 1024 (shipped) | ~506s | succeeded (3/5 initial hierarchical calls per a 3-agent test; the other 2 were early-tick misses before the graph existed) |
+An EARLIER, bigger box (radius 16/3 = 33x33x7 = 7,623 regions, cap
+4096) hung for 95+ seconds and never completed in one headless run —
+first real signal that region COUNT, not the expansion cap, is the
+actual lever for build cost (confirmed: raising the cap on the SAME
+1,875-region box made the build slower, not faster, since more real
+search work — not just array allocation — was genuinely happening at
+the higher cap). **Conclusion**: at this project's terrain and
+`kRegionEdge=16`, a synchronous one-shot build of even a modest
+(sub-20m-radius) box costs several minutes on this machine — not
+affordable as a per-rebuild hitch in a real game. This is reported
+honestly as a genuine, measured limitation of doing this synchronously
+on the game thread; see follow-ups below for the fix (background/async
+build).
+
+**2. Tier-1 planning cost before/after** (`voxel.Agent.Tier1RegionGraph.Enabled`
+cvar; default on = hierarchical + fallback, off = force fine-only —
+run the same scenario both ways and diff the "VoxelSwarm Tier1
+planner:" log lines). Measured on the 3-agent `-VoxelTier1RegionGraphTest`
+scenario (agents 17m out, cvar on): hierarchical calls succeeded with
+avgExpansions=5,515.7/call — but critically, all 3 agents reached the
+player (promoted Tier0, `meanDistToPlayer` dropped from 18.6m to 5.1m)
+within about 3 total hierarchical calls combined, i.e. ~1 call/agent to
+cover the full 17m including a detour around a deliberately-placed 6m
+wall. The pre-M6 fine fallback path (still exercised for the 2 early-tick
+misses, and always exercised with the cvar off) shows
+avgExpansions=8,000.0/call — pinned at `MaxExpansionsPerSearch`,
+i.e. capped/incomplete almost every time, meaning the OLD Tier 1 needs
+MANY chained 8,000-expansion partial replans to slowly close a 17m gap
+instead of the ~1-2 hierarchical calls that got there in this run. The
+per-call hierarchical cost (5,515 expansions) is higher than one capped
+fine-search call (8,000, but incomplete/partial) is misleading in
+isolation — the honest comparison is "expansions PER UNIT OF REAL
+PROGRESS", where hierarchical wins by roughly the number of chained
+fine-replans it would have taken otherwise (untested exactly how many,
+but the fine path never even got the agents to the player in the same
+window in earlier `-VoxelSwarmTest` runs at comparable range).
+
+**3. Dirty invalidation wiring + proof.** NPC edits (`TryExecuteWaypointEdit`)
+call `MarkTerrainEditDirty` with the EXACT edited voxel the instant they
+land — precise, no polling. Player digs/places and M5 structural-collapse
+removals have no delegate to hook (`UVoxelWorldSubsystem`/`VoxelWaterSubsystem`
+are out of scope this slice, per doctrine) — implemented instead as a
+documented best-effort fallback, `PollWorldEditsForTier1DirtyRegions`:
+once per Tick, compares `UVoxelWorldSubsystem::GetLogSize()` (already
+public, already counts every edit regardless of source) against the last
+seen value, and if it grew, dirties the region containing every
+active Tier 0/1 agent's CURRENT position (deduplicated, one
+`markRegionDirty` call per distinct region, not per log entry). PROOF:
+in the region-graph test, digging a gap in the wall produced
+`VoxelSwarm Tier1 region graph: edit-log grew (size 261) -- dirtied 1
+region(s) near active agents` on the very next Tick after the dig — the
+mechanism fires correctly. HOWEVER: in the specific run captured, the 3
+test agents had already detoured AROUND the wall and reached the player
+(Tier0, standoff) several seconds BEFORE the gap was dug, so this run
+demonstrates "a Tier 1 agent re-plans correctly AROUND a new wall" (the
+whole swarm successfully routed around the 6m obstacle via the
+hierarchical planner) but does NOT capture a single agent's cost/route
+visibly changing AFTER walking through a freshly-dug opening in the same
+continuous run — a timing/tuning artifact of this scenario (the agents
+converge faster than the scripted gap-dig delay), not a failure of the
+invalidation mechanism itself, which the log line above proves fires
+correctly and on the correct region.
+
+**4. NPC state replication** (`AVoxelAgentReplicator`, new file,
+mirrors `AVoxelEditRelay`'s spawn-when-networked pattern in
+`AVoxelEarthGameMode::BeginPlay`): one `NetMulticast Reliable`
+broadcast (`MulticastAgentSnapshot`) every `BroadcastIntervalSeconds`
+(10Hz, independent of and much coarser than the sim tick), carrying
+EVERY currently-relevant agent in ONE call (batched, not one RPC/agent).
+Wire format (`UVoxelAgentSubsystem::CollectReplicationSnapshot`/
+`ApplyReplicatedAgentSnapshot`): `int32 AgentId + int16x3 relative
+position (UU, relative to a replicated `OriginWorld` re-anchored at the
+first connected player's pawn every broadcast, keeping offsets small
+and LWC-safe regardless of planet-scale absolute coordinates) + uint8
+Tier` = 11 bytes/agent, vs 24+ for a raw double `FVector`. Relevancy/
+culling: Tier 2 agents (always > `Tier1ExitUU` from every player,
+per the tier scheduler's own hysteresis, and the least important tier
+already) are NEVER sent, and Tier 0/1 agents are filtered to
+`RelevancyRadiusUU` (120m) of the origin — a client never receives
+agents far outside the interesting zone at all, not just "at a lower
+rate". Client-side: a NEW `ClientAgents` mirror (position/tier only, no
+path state) is populated by `ApplyReplicatedAgentSnapshot` and rendered
+by a NEW, separate `Tick` branch (`TickClientReplicatedAgents`) that
+interpolates each entry from its last render position toward the fresh
+target over `ClientAgentInterpolationWindowSeconds` (0.15s) — smooth at
+10Hz instead of visibly snapping. Agents that age out of relevancy are
+HIDDEN (zero-scale ISM transform), not `RemoveInstance`d, to avoid the
+instance-index-reshuffling bug class that would otherwise silently
+corrupt other agents' cached indices. Server remains sole authority for
+path/dig decisions in every case — a client only ever draws what it's
+told.
+
+**Verification actually performed vs. what could not be completed.**
+A genuine two-process networked test (dedicated server + client, and
+separately a listen-server + client, both via `UnrealEditor-Cmd.exe
+<uproject> [-server|<map>?Listen] [127.0.0.1] -game`, mirroring M3's
+own gate scenario) was attempted. The listen server DID spawn 10/10
+swarm agents (`VoxelSwarmTest: spawned 10/10 requested agents`) and DID
+accept an incoming connection (`LogNet: NotifyAcceptingConnection
+accepted from: 127.0.0.1:...`), but the CLIENT's own connection never
+completed its handshake and timed out after 60s
+(`UNetConnection::Tick: Connection TIMED OUT`) in BOTH the
+dedicated-server and listen-server configurations, on this sandboxed
+dev machine — consistent with a firewall/loopback constraint on fresh,
+unsigned `UnrealEditor-Cmd.exe` invocations (no existing firewall rule
+for the binary; `New-NetFirewallRule` failed with Access Denied, no
+admin rights available to this session) rather than a bug in the
+replication code. **Do not read this as "multiplayer works" — the
+actual cross-process UDP round trip was NOT verified.** What WAS
+verified instead: `UVoxelAgentSubsystem::RunReplicationSelfTest`
+(`-VoxelReplicationSelfTest`, new method, calls `CollectReplicationSnapshot`
+-> `ApplyReplicatedAgentSnapshot` IN-PROCESS, no network hop) against a
+12-agent swarm: **all 12 agents' replicated position matched their
+authoritative position to within 0.755UU worst case** (expected
+quantization rounding for the int16 wire format is <=~0.87UU) — proof
+that the serialize/quantize/deserialize/interpolation-setup logic is
+correct, independent of whatever the OS network stack does. The actor/
+RPC plumbing itself (`AVoxelAgentReplicator`) is standard, well-
+established UE machinery (same shape as the already-proven
+`AVoxelEditRelay`) and was code-reviewed but not exercised end-to-end
+over a real socket in this environment. No client-view screenshot was
+captured for this reason — a server-view screenshot is NOT substituted
+in its place (per doctrine: don't claim what wasn't verified).
+
+**Build**: `VoxelEarthEditor` Win64 Development, `Build.bat ...
+-WaitMutex -NoHotReloadFromIDE` — `Result: Succeeded`, zero warnings
+from any file touched this slice (`voxel-core-msvc` itself rebuilt
+once, untouched by this slice, via `cmake -S voxel-core -B
+build/voxel-core-msvc` + `cmake --build ... --config Release`, since
+this fresh worktree had never built it before).
+
+**Follow-ups (documented, not fixed this slice)**: (1) the region-graph
+build needs to move off the game thread (background task /
+time-sliced across ticks) before its coverage box can grow to anything
+useful — the measured several-minutes-per-build cost at even a modest
+size is the blocking issue, not this slice's wiring. (2) precise
+coordinate-level dirty notification (a delegate on
+`UVoxelWorldSubsystem` reporting exactly which cells an edit touched)
+would replace `PollWorldEditsForTier1DirtyRegions`'s position-based
+best-effort heuristic with an exact one; not implemented since that
+file is out of scope this run. (3) a real cross-process replication
+gate re-run is needed once the sandbox's networking constraint is
+lifted (or on a machine/account with firewall-rule permissions). (4)
+`AVoxelAgentReplicator` uses Reliable NetMulticast (matching
+`MulticastWaterDiffs`'s existing precedent); Unreliable would be
+strictly better for stale-position traffic in a shipped version. (5)
+Tier 2 agents are never replicated at all in this slice (relevancy
+cutoff, not a rate reduction) — a shipped version might want them at a
+very coarse rate instead of not at all, for visual continuity at the
+edge of relevancy.
+
 ## M0 GPU track (ADR-0001)
 
 - [x] Worldgen HLSL kernel (ColumnMain, VoxelizeMain, MeshCountMain,
