@@ -1391,15 +1391,22 @@ struct FVoxelWorldImpl
 	// many candidates gate (a) declined.
 	int32 LevelsScannedThisCall = 0;
 	int32 CandidatesRejectedThisCall = 0;
-	// Per-call admission budget. The distance cutoff alone does not bound how
-	// much a single call admits: DispatchJobs pops from the NEAR end, so the
-	// queue steadily fills with the farthest candidates, the cutoff drifts out
-	// with it, and every call was admitting ~3k newly-near chunks and dropping
-	// ~3k newly-far ones (each an insert + an erase, and a slot in that call's
-	// sort). Bounding admissions per call bounds all three at once. Sized well
-	// above the measured per-call dispatch rate (~160), so it never starves the
-	// workers -- what it removes is churn, not throughput.
-	int32 AdmissionsThisCall = 0;
+	// Admission budget, per LEVEL per RecomputeDesiredSet call. The distance
+	// cutoff alone does not bound how much a single call admits: DispatchJobs
+	// pops from the NEAR end, so the queue steadily fills with the farthest
+	// candidates, the cutoff drifts out with it, and every call was admitting
+	// ~3k newly-near chunks and dropping ~3k newly-far ones (each an insert +
+	// an erase, and a slot in that call's sort). Bounding admissions bounds all
+	// three at once. Sized well above the measured per-call dispatch rate
+	// (~160), so it never starves the workers -- what it removes is churn, not
+	// throughput.
+	//
+	// Per level, not per call, because levels are scanned in ascending order
+	// and level 0 rescans on EVERY call while level 1 rescans on every second
+	// one: one shared budget let R0 spend it before R1 was even looked at, and
+	// R1 residency measured ~8% lower for it (620-664 loaded vs 699-705). A
+	// budget each keeps the ring mix where it was.
+	int32 AdmissionsThisLevel = 0;
 
 	// Bound on the memo above. The live working set is the union of all five
 	// annuli, ~5k footprints; this cap leaves an order of magnitude of slack
@@ -2567,7 +2574,6 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	EvictedThisCall.Reset();
 	LevelsScannedThisCall = 0;
 	CandidatesRejectedThisCall = 0;
-	AdmissionsThisCall = 0;
 
 	// Bounded admission: the cutoff was computed at the end of the PREVIOUS
 	// call, when the queue was at cap; workers have been draining it since.
@@ -2696,6 +2702,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		bHasRecomputedLevel[Level] = true;
 		++LevelEntryScans[Level];
 		++LevelsScannedThisCall;
+		AdmissionsThisLevel = 0; // per-level admission budget (see its doc comment)
 
 		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[Level];
 		const double InnerUU = Preset.InnerMeters * 100.0;
@@ -2745,9 +2752,9 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					// is not what the cap exists to bound.
 					const bool bOverlayAware = NeedsOverlayAwarePath(LevelKey);
 					const int32 Cap = VoxelStreamAdmission::GetPendingJobCap();
-					if (!bOverlayAware && Cap > 0 && AdmissionsThisCall >= Cap / 4)
+					if (!bOverlayAware && Cap > 0 && AdmissionsThisLevel >= Cap / 4)
 					{
-						// Per-call admission budget (see AdmissionsThisCall).
+						// Per-level admission budget (see AdmissionsThisLevel).
 						++CandidatesRejectedSinceLog;
 						++CandidatesRejectedThisCall;
 						bAdmissionDeferredWork = true;
@@ -2769,7 +2776,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 
 					VoxelStreaming::FChunkRecord& NewRecord = ChunkRecords.Add(LevelKey);
 					++RecordsAddedSinceLog;
-					AdmissionsThisCall += bOverlayAware ? 0 : 1;
+					AdmissionsThisLevel += bOverlayAware ? 0 : 1;
 					NewRecord.bDeepAnchorRelative = bDeepAnchorRelative;
 					if (bOverlayAware)
 					{
