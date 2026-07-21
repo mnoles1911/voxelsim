@@ -110,7 +110,12 @@ MaterialId Amplifier::materialAt(const ColumnSample& col, int64_t vz) {
     // independent bedrock guards (caves.h documents the other two) — even a
     // mis-tuned constant table cannot punch a hole in the world's floor.
     if (m == MAT_AIR || m == MAT_BEDROCK) return m;
-    return caveCarveAt(col.cave, col.surfaceMm, col.bedrockDepthMm, vz) ? MAT_AIR : m;
+    // MAT_AIR is an enumerator and `m` is a MaterialId variable, so a bare
+    // `cond ? MAT_AIR : m` mixes an enumerated and a non-enumerated operand —
+    // gcc's -Wextra rejects that (clang does not), so name the type explicitly.
+    return caveCarveAt(col.cave, col.surfaceMm, col.bedrockDepthMm, vz)
+               ? static_cast<MaterialId>(MAT_AIR)
+               : m;
 }
 
 } // namespace vxc
