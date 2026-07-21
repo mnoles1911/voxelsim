@@ -271,6 +271,46 @@ struct WorldGenParamsCB {
 };
 static_assert(sizeof(WorldGenParamsCB) == 56, "WorldGenParamsCB must match the HLSL cbuffer layout");
 
+// Host half of the 2026-07 cross-vendor UB hardening pass. worldgen.hlsl now
+// guards these in-shader (it returns without writing rather than executing an
+// OpUDiv-by-zero or an underflowed clamp bound), but a shader that silently
+// declines to produce output is a miserable thing to debug — and the guards
+// are a backstop, not a licence for the host to send garbage. Validating here
+// means a bad cbuffer fails loudly, at the call site that built it, naming
+// the field. Every value checked is a host-side invariant that already holds
+// on every code path today; this only stops a future edit from breaking it
+// quietly.
+void validateWorldGenParams(const WorldGenParamsCB& p, const char* where) {
+    // PixelSizeMm reaches floorDiv/truncDiv as a divisor in ColumnMain
+    // (SPIR-V leaves OpUDiv-by-zero undefined, i.e. vendor-specific).
+    if (p.PixelSizeMm == 0)
+        fail(std::string(where) + ": PixelSizeMm is 0 — it is a divisor in ColumnMain");
+    // RasterSize 0 underflows ColumnMain's clamp upper bound (RasterSize.x-1)
+    // to -1, which the (uint) cast turns into a ~4-billion element index.
+    if (p.RasterSizeX == 0 || p.RasterSizeY == 0)
+        fail(std::string(where) + ": RasterSize has a zero extent (" +
+             std::to_string(p.RasterSizeX) + "x" + std::to_string(p.RasterSizeY) + ")");
+    // VoxelizeMain's brick indexing assumes a brick-aligned footprint.
+    if (p.DispatchColumnsX % 8 != 0 || p.DispatchColumnsY % 8 != 0)
+        fail(std::string(where) + ": DispatchColumns must be brick-aligned (multiples of 8), got " +
+             std::to_string(p.DispatchColumnsX) + "x" + std::to_string(p.DispatchColumnsY));
+}
+
+// Checked immediately before the mesh chain is recorded. MeshEmitMain reads
+// InQuadOffsets[tid.x] for every mask decodeMask accepts (tid.x < maskCount),
+// and only entries below ScanCount were actually written by the scan chain —
+// so ScanCount < maskCount would emit from never-written device memory.
+// ScanCount > maskCount is harmless for the offsets of real masks but means
+// the scan is reading past the counts buffer, which is equally not intended.
+// The shader now refuses to emit above ScanCount; this asserts the exact
+// equality the design actually relies on.
+void validateScanCount(uint32_t scanCount, uint32_t maskCount, const char* where) {
+    if (scanCount != maskCount)
+        fail(std::string(where) + ": ScanCount (" + std::to_string(scanCount) +
+             ") must equal maskCount (" + std::to_string(maskCount) +
+             ") — MeshEmitMain reads one offset per mask");
+}
+
 // Cell index within one 8^3 brick — mirrors vxc::Brick<8>::cellIndex AND
 // worldgen.hlsl's cellIndexInBrick exactly.
 constexpr uint32_t cellIndexInBrick(uint32_t x, uint32_t y, uint32_t z) {
@@ -1092,6 +1132,7 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
     params.OriginVy = region.originVy;
     params.BrickZMin = brickZMin;
     params.BricksZ = bricksZ;
+    validateWorldGenParams(params, "runRegion");
     std::memcpy(paramsBuf.mapped, &params, sizeof(params));
 
     // ColumnMain descriptor set: unchanged bindings/order, columnsBuf in the
@@ -1275,6 +1316,7 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
         // host-mapped copy now (host writes before vkQueueSubmit are made
         // available per the Vulkan memory model, same as the initial upload).
         params.ScanCount = maskCount;
+        validateScanCount(params.ScanCount, maskCount, "runRegion mesh chain");
         std::memcpy(paramsBuf.mapped, &params, sizeof(params));
 
         writeMeshDescriptors(ctx, paramsBuf.buffer,
@@ -1755,6 +1797,7 @@ void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t 
     params.OriginVy = tile.originVy;
     params.BrickZMin = s.brickZMin;
     params.BricksZ = s.bricksZ;
+    validateWorldGenParams(params, "prepTileCpu");
 
     if (!s.colVoxDescriptorsWritten || elevGrew || climGrew || cellsGrew) {
         writeColVoxDescriptorsSlot(ctx, s);
@@ -1782,6 +1825,7 @@ void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t 
             s.gb.quadsBuf.ensure(ctx, VkDeviceSize(s.maskCount) * 32 * sizeof(uint64_t));
 
         params.ScanCount = s.maskCount;
+        validateScanCount(params.ScanCount, s.maskCount, "prepTileCpu mesh chain");
 
         if (!s.meshDescriptorsWritten || cellsGrew || countsGrew || offsetsGrew || blockSumsGrew ||
             quadsGrew) {

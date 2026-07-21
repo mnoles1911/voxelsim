@@ -1325,6 +1325,105 @@ fundamentally unreliable if the shader touched floats anywhere in the
 value-computing path (wall-clock timing code in the harness itself uses
 floats/doubles, but that never feeds GPU dispatch inputs or outputs).
 
+### Cross-vendor UB hardening + CI guard (2026-07-21, worktree agent)
+
+Follow-up to the signed-`%` fix (PR #40, commit `6ab4b2a`) that closed the
+NVIDIA leg of the M0 gate. That bug — `worldgen.hlsl`'s `floorDiv` deriving
+its flooring correction from `a % b`, which HLSL leaves undefined unless both
+operands share a sign, so `floorDiv` silently truncated on NVIDIA for every
+negative world coordinate — was one instance of a class. This pass fixed the
+five remaining members of that class and, more importantly, made the class
+mechanically impossible to reintroduce.
+
+**Five latent issues, all confirmed real by reading the generated code, all
+fixed in `voxel-core/shaders/worldgen.hlsl`.** Each was live UB reachable
+from a cbuffer value, masked only by a host-side contract that nothing in the
+shader enforced:
+
+1. `decodeMask` computed interior-brick dims as `bricksX - 2u`. On unsigned
+   values a region with <3 bricks on an axis wraps to `0xFFFFFFFF`, the
+   product wraps to an arbitrary `maskCount`, and the `maskIndex >=
+   maskCount` range check then PASSES — so `regionCellMat` reads `OutCells`
+   far out of bounds. Fixed with a `bricksX/Y/Z < 3u` early-out.
+2. The greedy run-length scan read `mask[64]`, one past `uint mask[64]`, on
+   the terminating iteration of the last row (`i2 + w == 8`, `j2 == 7`).
+   Safe only if `&&` short-circuits, which HLSL does not guarantee (DXC does
+   today — a compiler property, not a contract). Hoisted into an explicit
+   `if`/`break`; identical iteration count on every input.
+3. `OutQuads[baseOffset + quadCount]` was an unclamped write driven by
+   scanned offsets. Bounded against the buffer's OWN length via
+   `OutQuads.GetDimensions` (lowers to `OpArrayLength`) rather than a new
+   cbuffer field, so there is no second contract to keep in sync; plus
+   `MeshEmitMain` now returns rather than emitting above `ScanCount`, where
+   the offsets were never written by the scan chain.
+4. `PixelSizeMm` is a host-controlled divisor reaching `floorDiv`/`truncDiv`;
+   zero is an `OpUDiv`-by-zero, undefined in SPIR-V. Guarded in `ColumnMain`
+   AND asserted host-side (`validateWorldGenParams` in
+   `voxel-core/bench/gpu_harness.cpp`, called at both cbuffer-fill sites),
+   because a shader that silently declines to write output is miserable to
+   debug. `validateScanCount` likewise pins `ScanCount == maskCount`.
+5. `clamp64(..., 0, RasterSize.x - 1)` inverts to `[0, -1]` when the raster
+   window is empty, so `clamp64` returns -1 and the `(uint)` cast makes it a
+   ~4-billion element index. Zero-extent early-out added to both
+   `rasterElevationMm` and `rasterClimate`.
+
+**These are guards, not behavior changes — proven, not asserted.** Every
+added branch is unreachable on valid input, and the three AMD-leg digests
+reproduce bit-identically on the RX 7800 XT: `1dbcabb01cfaf2bc` (default),
+`95a82ba20200f6f2` (`--radius 64`), `b4c8ec5d0966894b` (`--radius 128`) —
+all PASS, 0 mismatches, measured before and after the change on the same box.
+CPU reference untouched: `kWorldGenVersion` stays **2**, no goldens re-pinned,
+`vxc_tests` 115 PASS / 0 FAIL under clang. Three kernels respun
+(`ColumnMain`, `MeshCountMain`, `MeshEmitMain`); `prebuilt/README.md` has the
+refreshed provenance and hashes.
+
+**The durable half: `tools/lint-shader-ub.py`, CI job `shader-ub-lint`.**
+Scans `voxel-core/shaders/*.hlsl` and fails on signed `/`/`%` where an
+operand can be negative and is not routed through the approved
+`floorDiv`/`truncDiv` helpers; shift distances that are not literals provably
+below the operand width; unsigned subtraction that can underflow into an
+index or invert a clamp range; `RW*Buffer` writes with no visible bound on
+the index; and wave/subgroup-width assumptions (AMD wave64 vs NVIDIA warp32).
+It blanks comments and string literals before matching, in the style of the
+existing `float-ban` job, so prose can never trip it.
+
+Design is **fail-closed**. Constructs that are genuinely safe are silenced one
+at a time by an inline `// lint-shader-ub: allow <RULE> - <reason>`
+annotation; a bare `allow` with no written reason is itself an error, and an
+annotation that stops matching anything is an error too, so a justification
+cannot rot into cover for new code. There is deliberately no exemption for
+`floorDiv`/`truncDiv` themselves — they are written against magnitude-only
+unsigned division precisely so they pass on their own merits. worldgen.hlsl
+currently carries 16 annotations covering 19 findings, each recording a real
+invariant (e.g. "the `>= 3` early-out above proves every axis has at least 3
+bricks", "the enclosing `gtid.x >= offset` test is precisely the no-underflow
+precondition"). That is the honest cost of a fail-closed default, and it
+doubles as documentation of the bounds this kernel actually relies on.
+
+With `--spv-dir` the lint also scans the COMMITTED bytecode for the
+`OpSDiv`/`OpSRem`/`OpSMod` opcodes. The HLSL rules are heuristic; the opcode
+scan is exact, and it catches the shipped bug directly however the source is
+written. It carries a positive control (zero division opcodes across the
+whole module set means the parse saw nothing, and fails rather than reporting
+clean). Current state: **zero** `OpSDiv`/`OpSRem`/`OpSMod` across all seven
+modules; every remaining division is `OpUDiv`/`OpUMod`.
+
+**The guard was verified by watching it fail**, not by assuming. Reintroducing
+the original `%`-based `floorDiv` into a scratch copy makes the lint exit 1
+with exactly two findings (`a / b` and `a % b`, both `SIGNED_DIVISION`) and no
+noise; compiling that same copy and auditing its SPIR-V reports 10 `OpSDiv`
+and 10 `OpSRem` in `ColumnMain`. Restored, the lint exits 0 on HEAD.
+
+Two false-positive sources were found and fixed in the lint itself rather than
+allowlisted, which is the difference between a guard and a nuisance: HLSL
+swizzles were contributing their component letter as an identifier (so
+`tid.x / 8u` picked up the `int64_t x` PARAMETER of `hash2` elsewhere in the
+file and looked signed), and non-negative literals were being treated as
+"possibly negative" (flagging every `x / 8u`). Also worth recording: the
+SPIR-V opcode table is easy to get wrong — 137 is `OpUMod`, not `OpSRem`
+(`OpSRem` is 138), and the first draft of the audit reported all the
+legitimate unsigned remainders as violations.
+
 ## Water track — W1 first slice landed (2026-07-19)
 
 Implicit ocean (z<0, zero voxel data): `AVoxelOceanActor` (camera-following
