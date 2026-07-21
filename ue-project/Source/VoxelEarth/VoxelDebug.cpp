@@ -92,8 +92,20 @@ TAutoConsoleVariable<int32> CVarVoxelStreamMaxRemeshesPerFrame(
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxUnloadsPerFrame(
 	TEXT("voxel.Stream.MaxUnloadsPerFrame"),
 	2,
-	TEXT("Hitch isolation: max chunk-component DestroyComponent calls (FVoxelWorldImpl::DrainUnloads) per frame. ")
-	TEXT("Was a compile-time constant of 4; tightened to 2 alongside MaxAppliesPerFrame (see its comment)."),
+	TEXT("Hitch isolation: max chunk-component unload events (FVoxelWorldImpl::DrainUnloads -- pool-park, or ")
+	TEXT("DestroyComponent once the pool is at voxel.Stream.ComponentPoolMax) per frame. Was a compile-time constant ")
+	TEXT("of 4; tightened to 2 alongside MaxAppliesPerFrame (see its comment)."),
+	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarVoxelStreamComponentPoolMax(
+	TEXT("voxel.Stream.ComponentPoolMax"),
+	512,
+	TEXT("M1 hitch-gap wave (docs/status.md M1 gate row): max UVoxelChunkComponent instances parked (hidden, quads ")
+	TEXT("cleared, no scene proxy, still registered/attached) in the reuse pool after leaving the desired set, ")
+	TEXT("instead of DestroyComponent()'d immediately. A pending first-load prefers a pooled component -- see ")
+	TEXT("FVoxelWorldImpl::AcquireChunkComponent -- over NewObject+RegisterComponent, avoiding the render-thread ")
+	TEXT("AddPrimitive/RemovePrimitive churn the hitch-attribution instrumentation pinned as the dominant cost at ")
+	TEXT("ring-boundary crossings. Unloads past the cap fall back to DestroyComponent() (no unbounded growth)."),
 	ECVF_Default);
 } // namespace
 
@@ -191,4 +203,9 @@ int32 VoxelDebug::GetStreamMaxRemeshesPerFrame()
 int32 VoxelDebug::GetStreamMaxUnloadsPerFrame()
 {
 	return FMath::Max(1, CVarVoxelStreamMaxUnloadsPerFrame.GetValueOnGameThread());
+}
+
+int32 VoxelDebug::GetComponentPoolMax()
+{
+	return FMath::Max(0, CVarVoxelStreamComponentPoolMax.GetValueOnGameThread());
 }

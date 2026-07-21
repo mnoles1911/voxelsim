@@ -46,8 +46,13 @@ Working plan + binding decisions: docs/m1-plan.md. UE 5.8.0 (retargeted
   (sized digs, explosives, dual cameras, proxy body — PRs #7/#11)
 - Gate (walk & dig at 60fps min-spec): 🟨 near-closed — player feel testing
   passed (Matt, in-session sign-off 2026-07-20); -VoxelPerfRun harness
-  measured p50 2.8ms / p95 4.2ms pre-M2 (PR #12). Formal close needs a
-  min-spec proxy (settings-throttled) perf run.
+  measured p50 2.8ms / p95 4.2ms pre-M2 (PR #12). Formal min-spec proxy run
+  landed (see "Perf-run hitches" backlog row / M1 gate run result below):
+  p95 has stayed pinned at ~18-19ms across every wave tried so far (budget
+  tightening + PSO precache, then chunk-component pooling) — still above the
+  16.6ms bar. **Component pooling wave (2026-07-20/21) did NOT close the
+  gate** — see the dedicated writeup below for the full before/after numbers
+  and why the theoretical win didn't materialize.
 
 ## M2 — LOD cascade (first implementation wave landed, 2026-07-20)
 
@@ -769,7 +774,7 @@ retired v0 sequential engine in the interim.
 | R3/R4 first-build cost (~335ms/job) | needs GPU-side gen or disk brick cache | design pass |
 | Dithered ring cross-fades — SYMMETRIC blend | v1 landed (adjacent fade-through); symmetric-blend needs wider desired-set annulus overlap | M2 polish wave |
 | ring↔clipmap seam (z-fighting, accepted v1) | noted | M2 polish |
-| Perf-run hitches (~15-38/run, max 400ms, initial streaming ramp) | **ISOLATED + partially fixed 2026-07-20** (worktree agent): see the M1 gate run result below. Root cause found: every hitch frame has the per-frame apply/unload budgets pinned at cap while their own CPU cost is <1ms — the real cost is render-thread scene-mutation backlog, not our subsystem's own tick or a single PSO stall. Tightened streaming budgets (voxel.Stream.Max*PerFrame cvars, 8/4/4→3/2/2) + a BeginPlay PSO precache warmup cut hitches ~3-5x and confined most remaining ones to the two unavoidable cold-start frames, but the gate does not yet PASS cleanly on every run (see below) | component pooling/reuse (avoid DestroyComponent+NewObject on every ring-boundary crossing) — the next concrete lead now that the dominant bucket is known |
+| Perf-run hitches (~15-38/run, max 400ms, initial streaming ramp) | **ISOLATED + partially fixed 2026-07-20**, **component pooling tried 2026-07-20/21 -- did NOT close the gate** (worktree agent): see the M1 gate run result + "Component pooling wave" writeup below. Root cause found: every hitch frame has the per-frame apply/unload budgets pinned at cap while their own CPU cost is <1ms — the real cost is render-thread scene-mutation backlog. Tightened streaming budgets (voxel.Stream.Max*PerFrame cvars, 8/4/4→3/2/2) + a BeginPlay PSO precache warmup cut hitches ~3-5x. Pooling `UVoxelChunkComponent`s (avoid DestroyComponent+NewObject on ring-boundary crossings) was the next concrete lead and got a full implementation + measurement pass, but p95 stayed flat at ~18-19ms across 8 measured runs (same band as pre-pooling) — see writeup for why | needs a lead that targets the per-load GPU vertex/index-buffer upload cost itself (BeginInitResource, unavoidable on every SetChunkQuads regardless of component reuse), not the UObject/component lifecycle pooling already addressed |
 | Clipmap follow-ups: two-sided material (winding unverified), A/B perf isolate, CDLOD replacement per ADR-0002 tripwire | noted in ADR/plan | M2 polish |
 | Mip cache: budget default tuning (512MB) + real-scenario A/B | eviction landed (PR #16); default may need tuning | M2 polish |
 | Debug tooling P2/P3 (τ overlay, water ledgers) | phased with M2-polish/W2 | — |
@@ -885,3 +890,154 @@ render-thread-facing scene-mutation volume this pass's budget-tightening
 could only spread out, not reduce. Throughput trade-off: avg chunks/s
 dropped from ~259 to ~143 at the tightened budgets — an accepted cost for
 smoothness, not evaluated against a throughput requirement (none is gated).
+
+### Component pooling wave (2026-07-20/21, worktree agent) — implemented, measured, did NOT close the gate
+
+**Design.** `FVoxelWorldImpl::ComponentPool` (`VoxelWorldSubsystem.cpp`) is a
+`TArray<TWeakObjectPtr<UVoxelChunkComponent>>` (weak for the same reason
+`FChunkRecord::Component` already is -- the real GC root is
+`ChunkOwner`'s `OwnedComponents` list; pooled components stay
+registered/attached the whole time they're parked, never
+Unregister/DestroyComponent'd). `DrainUnloads` and `ApplyMeshResult`'s
+zero-quads branch (a resident chunk re-meshing to no visible geometry --
+previously also a `DestroyComponent`, now routed through the same pool path
+for consistency) call `ReturnChunkComponentToPool` instead of
+`DestroyComponent()`: `SetVisibility(false)` + `SetChunkQuads({}, ...)` +
+`ClearDebugTint()`, then push onto the pool -- capped at
+`voxel.Stream.ComponentPoolMax` (default 512; over-cap unloads still
+`DestroyComponent()`, so the pool never grows unboundedly). `ApplyMeshResult`'s
+first-load branch calls the new `AcquireChunkComponent` (pop-if-non-empty,
+else the pre-pooling `NewObject`+`SetupAttachment`+`RegisterComponent`) and
+then unconditionally re-applies every per-load property (`SetLevel`,
+`SetRelativeLocation`, `SetMaterial`, `SetVisibility(true)`) regardless of
+which path was taken -- a reused component is fully overwritten before
+anything reads it again.
+
+**Correctness.** `SetVisibility(false)` + `SetChunkQuads({}, ...)` coalesce
+into one end-of-frame `MarkRenderStateDirty` recreate (UE batches same-frame
+dirty-render-state requests into one actual recreate, not one per call), so
+a parked component ends up with NO live scene proxy at all (cheapest
+possible idle state, and correctness-required -- a hidden-but-still-meshed
+component would otherwise flash its OLD chunk's geometry for one frame if
+ever force-shown). `ChunkLevel`/`ChunkMaterial`/`ChunkMID` deliberately
+survive a park/reuse cycle: `SetLevel` on reuse re-applies the level scale
+and (via the existing `ApplyRingFadeParams`) the ring cross-fade params onto
+the *same* MID rather than recreating it -- reusing the MID (skipping
+`UMaterialInstanceDynamic::Create`) is real, not just the
+register/unregister avoidance. `UVoxelChunkComponent::SetLevel`'s doc
+comment (previously "never changes for the lifetime of this component") is
+updated to reflect that a pooled component's level now legitimately changes
+across residencies. `GenerationId`/`bHasOverlayBricks`/flash-timer fields
+live on `FChunkRecord`, not the component, and a fresh `FChunkRecord` is
+always constructed for a (level, key) re-entering the desired set
+(`ChunkRecords.Add(LevelKey)`), so none of that state can leak from a
+component's previous residency. `UpdateChunkStateTints`/`UpdateRingTints`
+only ever iterate live `ChunkRecords` (never the pool) and recompute tint
+fresh from `Pair.Key.Level` every call, so pooling is transparent to both
+debug-tint layers by construction, not by convention.
+
+**Instrumentation.** `FVoxelPerfSnapshot` gained `PooledComponents` (current
+pool size), `PoolReusesPerSec`, and `TotalPoolReuses`; the perf HUD gained a
+`component pool: pooled N reuses X/s (total M)` row; the existing per-frame
+hitch-attribution log line gained `poolReuses=N poolSize=N`.
+
+**A correctness-adjacent perf bug found and fixed during measurement.**
+`ReturnChunkComponentToPool` originally called `ClearDebugTint()`
+*unconditionally* on every pool-park. Unlike `SetVisibility`/`SetChunkQuads`,
+`ClearDebugTint`'s `SetVectorParameterValue` does **not** coalesce with
+anything -- it fires its own immediate render-thread command every time it's
+actually called, even when the tint was already the identity (the
+overwhelmingly common case with `voxel.Debug` off, which every gate run
+below uses). With ~2 unloads/frame during the perf run's steady ring-crossing
+churn, this meant a genuinely new, avoidable render-thread command on nearly
+every frame -- a real regression the pre-pooling `DestroyComponent` path
+never paid (a destroyed component's material params are simply gone, never
+touched on unload). Fixed with a `bDebugTintDirty` flag
+(`UVoxelChunkComponent`, set by `SetDebugTint`, cleared by `ClearDebugTint`):
+`ClearDebugTint` now early-outs when nothing is actually dirty. This also
+incidentally speeds up the existing debug-layer off-transition sweep in
+`TickStreaming` (was already calling `ClearDebugTint` on every tracked
+chunk on that edge). Measured effect: cut per-run hitch counts roughly in
+half on this run of measurements (below) -- real, but not enough to close
+the gate.
+
+**Measurement.** `-VoxelPerfRun=60`, seed 20260719, min-spec proxy settings
+(`sg.ViewDistanceQuality 0`, `sg.ShadowQuality 0`, `sg.PostProcessQuality 0`,
+`sg.EffectsQuality 0`, `r.ScreenPercentage 100`, 1080p), 8 total runs (4
+before the `ClearDebugTint` fix, 4 after):
+
+| Run | p50 | p95 | max | hitches | post-warmup (t≥10s) hitches |
+|---|---|---|---|---|---|
+| 1 (pre-fix) | 3.84ms | 18.44ms | 275.0ms | 25 | 22 |
+| 2 (pre-fix) | 3.97ms | 18.58ms | 114.5ms | 28 | 26 |
+| 3 (pre-fix) | 3.92ms | 18.46ms | 98.5ms | 16 | 14 |
+| 4 (pre-fix) | 3.94ms | 18.50ms | 212.1ms | 17 | 14 |
+| 5 (post-fix) | 3.91ms | 18.02ms | 121.0ms | 7 | 4 |
+| 6 (post-fix) | 3.92ms | 18.23ms | 117.7ms | 17 | 15 |
+| 7 (post-fix) | 3.86ms | 18.14ms | 102.0ms | 5 | 2 |
+| 8 (post-fix) | 3.91ms | 18.75ms | 109.1ms | 20 | 18 |
+
+Pre-pooling baseline for comparison (from the "Perf-run hitches" section
+above, same settings/seed, 3/2/2+precache, 4 runs): p50 2.53-2.69ms, p95
+17.4-19.2ms, hitches 2/3/5/10, post-warmup hitches 0/2/2/8.
+
+**Verdict: M1 gate FAILS. Component pooling, as implemented, did not
+measurably close the gap.** p95 across all 8 pooling runs is 18.02-18.75ms
+(mean ~18.4ms) -- *every single run* lands above the 16.6ms bar, and the
+band is statistically indistinguishable from the pre-pooling baseline's
+17.4-19.2ms. Post-warmup (steady-state) hitches range 2-26 across the 8
+runs -- not trending to 0, and on average higher than the pre-pooling
+baseline's 0-8 (though the baseline itself already flagged large run-to-run
+variance on this shared dev machine, and my post-fix best cases, 2 and 4,
+land inside that baseline's own range). Neither the raw gate criterion
+(p95<16.6ms) nor the softer "ring crossings spike but steady-state is
+clean" fallback applies here -- steady-state is not clean in any of the 8
+runs. p50 is also slightly *worse* than the pre-pooling baseline (3.86-3.97ms
+vs 2.53-2.69ms), consistent with pooling's `SetVisibility`/`SetChunkQuads`/
+`ClearDebugTint` calls adding some fixed per-event cost across the many
+ordinary (non-hitch) frames that see ring-crossing churn during the
+scripted flight's continuous 100m-radius circle.
+
+**Why the theoretical win didn't materialize.** The original hitch-
+attribution diagnosis (see "Perf-run hitches" above) named TWO cost sources
+inside every budgeted apply/unload: "a `NewObject`/`RegisterComponent` or
+`DestroyComponent` **plus** `BeginInitResource` calls for up to 4 GPU
+buffers." Pooling eliminates the first (UObject allocation/GC, actor
+component-list churn, `RegisterComponent`/`UnregisterComponent`'s broader
+lifecycle) but **not** the second: every `SetChunkQuads` call --pooled
+component or not-- still calls `InitFromDynamicVertex` and
+`BeginInitResource` for a brand-new vertex/index/color buffer set, because
+the actual geometry content is different every time (a reused component's
+OLD buffers are useless for a NEW chunk's quads). The render-thread
+`FScene::AddPrimitive`/`RemovePrimitive` pair triggered by
+`MarkRenderStateDirty` also fires exactly once per park and once per reuse,
+same count as one `DestroyComponent`+one fresh `RegisterComponent`+
+`SetChunkQuads` before pooling -- pooling changed nothing about *how many*
+scene-mutation events happen, only trimmed the smaller UObject-lifecycle
+overhead layered on top. The data now says that smaller layer was not the
+dominant bucket after all. **Recommended next lead** (not attempted this
+wave): target the GPU buffer upload cost directly -- e.g. investigate
+whether `BeginInitResource`/`AddPrimitive` can be moved off the game
+thread's critical path (already async at the RHI level, but the *enqueue*
+still costs something per call), reduce the *frequency* of these events by
+enlarging the render-chunk footprint (fewer, larger meshes crossing ring
+boundaries less often, at the cost of coarser edit-remesh granularity), or
+get a proper render-thread-side profile (Unreal Insights) of what
+`FScene::AddPrimitive` actually costs at this call rate before optimizing
+further blind. Component pooling itself is kept in the codebase regardless
+of not closing the gate -- it is not harmful (same p95, render-correctness
+screenshot unaffected, standalone behavior unchanged, zero ensures across
+every run) and it does reduce real GC/UObject-churn pressure that the
+measurement above doesn't directly capture.
+
+Build: worktree `voxelcore.lib` rebuilt clean (`vxc_tests` green, untouched
+by this wave) before `Build.bat VoxelEarthEditor Win64 Development
+-WaitMutex -NoHotReloadFromIDE`, which also built clean both before and
+after the `ClearDebugTint` fix (zero warnings from any file touched this
+wave: `VoxelChunkComponent.{h,cpp}`, `VoxelDebug.{h,cpp}`,
+`VoxelEarthHUD.cpp`, `VoxelWorldSubsystem.cpp`; same pre-existing
+engine-header deprecation baseline as prior waves). Render-correctness
+verified via `-VoxelScreenshotAfter=40` (seed 20260719): terrain, ocean, and
+shadowing all render correctly, zero ensures, clean shutdown --
+`VoxelVerify00000.png`/`00001.png` under
+`ue-project/Saved/Screenshots/WindowsEditor/`.

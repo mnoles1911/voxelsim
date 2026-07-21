@@ -131,6 +131,7 @@ void AVoxelEarthHUD::DrawPerfHUD()
 			TEXT("%s (p50/p95)\n")
 			TEXT("Memory: components %d  quads %lld  overlay bricks %lld  edit log %lld\n")
 			TEXT("  mip cache: bricks %lld  ~%.1f MB  evictions %lld\n")
+			TEXT("  component pool: pooled %d  reuses %.1f/s (total %lld)\n")
 			TEXT("Frame: subsystem tick %.2fms  frame %.2fms\n")
 			TEXT("Counters: bricks %llu  cells %llu  quads %llu  edits %llu  columns %llu"),
 			VoxelDebug::GetDebugMode(),
@@ -142,6 +143,7 @@ void AVoxelEarthHUD::DrawPerfHUD()
 			*LevelWorkerMsLine,
 			Snap.ResidentComponents, (long long)Snap.ResidentQuads, (long long)Snap.OverlayBrickCount, (long long)Snap.EditLogEntries,
 			(long long)Snap.MipCacheBrickCount, double(Snap.MipCacheBytes) / (1024.0 * 1024.0), (long long)Snap.MipCacheEvictions,
+			Snap.PooledComponents, Snap.PoolReusesPerSec, (long long)Snap.TotalPoolReuses,
 			Snap.SubsystemTickMs, World->GetDeltaSeconds() * 1000.0,
 			Snap.BricksGenerated, Snap.CellsWritten, Snap.QuadsEmitted, Snap.EditsApplied, Snap.ColumnEvals);
 
