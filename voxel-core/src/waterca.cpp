@@ -460,6 +460,27 @@ uint32_t WaterCA::addWater(int64_t vx, int64_t vy, int64_t vz, uint32_t amount) 
     return placed;
 }
 
+uint32_t WaterCA::addWaterAt(int64_t vx, int64_t vy, int64_t vz, uint32_t amount) {
+    if (amount == 0 || isSolid(vx, vy, vz)) return 0;
+    const uint8_t cur = getFill(vx, vy, vz);
+    const uint32_t capacity = 255u - cur;
+    const uint32_t add = amount < capacity ? amount : capacity;
+    if (add == 0) return 0;
+    setFillAccounted(vx, vy, vz, static_cast<uint8_t>(cur + add), nullptr);
+    activate(waterKeyForVoxel(vx, vy, vz));
+    return add;
+}
+
+uint32_t WaterCA::removeWaterAt(int64_t vx, int64_t vy, int64_t vz, uint32_t amount) {
+    if (amount == 0) return 0;
+    const uint8_t cur = getFill(vx, vy, vz);
+    const uint32_t take = amount < cur ? amount : cur;
+    if (take == 0) return 0;
+    setFillAccounted(vx, vy, vz, static_cast<uint8_t>(cur - take), nullptr);
+    activate(waterKeyForVoxel(vx, vy, vz));
+    return take;
+}
+
 uint64_t WaterCA::recomputeVolume() const {
     uint64_t sum = 0;
     for (const auto& [key, brick] : water_) sum += brick.volume();

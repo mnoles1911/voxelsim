@@ -19,6 +19,7 @@ add_executable(vxc_tests
   test_pathfind.cpp
   test_regiongraph.cpp
   test_caves.cpp
+  test_swe.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(vxc_tests PRIVATE voxelcore Threads::Threads)

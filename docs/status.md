@@ -4219,3 +4219,141 @@ handshake digest `0x52004DCC85DDD80C`.
    `VoxelCoords::FloorDiv` and an anonymous-namespace copy in
    `VoxelLightField.cpp`; fixed by qualifying at the call site, but the
    duplicate helper should probably just go.
+
+### W4 — SWE + force field (design)
+
+*(2026-07-21, worktree agent. Full decision content:
+`docs/adr/0004-swe-fixed-point-coupling.md`. Full design prose:
+`voxel-core/include/voxelcore/swe.h`. This entry is a pointer plus the
+numbers, not a restatement.)*
+
+Plan §4 lists **"W4 CA↔SWE coupling"** among the water track's historical slip
+risks, so this was run as a design pass first. Two questions had to be answered
+before code was worth writing: can shallow water be done at all under the
+integer-only rule (doctrine §2.3 / CI `float-ban`), and where exactly does the
+per-voxel CA stop and the depth-averaged sheet begin.
+
+**The numerics verdict: YES, and no doctrine deviation is needed.** The brief
+anticipated that a faithful SWE might force an ADR'd float exception. It turns
+out the dichotomy is false. A *Riemann-solver* SWE (HLL/HLLC/Roe) genuinely is
+impractical in fixed point — not because of the `sqrt(g h)` wave speeds, which
+integer sqrt handles, but because the **well-balanced (C-property)** cancellation
+between pressure flux and bed-slope source term is unreachable under per-term
+truncation. But that is a fact about one discretisation family, not about
+shallow water in integers. The **virtual-pipe reduced SWE** (Mei-class; exact
+depth-averaged mass equation, momentum equation linearised by dropping the
+advection term, momentum carried as a per-face stateful flux) is not merely
+adequate in integers — on three counts it beats what the float version could
+offer:
+
+- **Lake at rest is exactly exact**, permanently, over an arbitrarily uneven
+  bed — because there *is* no source term to cancel against (the bed enters
+  only via `head = bed*255 + depth`). The float literature's hardest property
+  is free here.
+- **Mass conservation is bit-exact and structural**, because rounding is
+  confined to the momentum accumulator, which is not a conserved quantity —
+  truncation there is a bounded *dissipative* bias, i.e. a stability asset.
+- **It cannot diverge.** Depth is clamped by the outflow/headroom caps, so the
+  CFL condition is a quality constraint, not a safety one. No NaN exists to
+  reach.
+
+Two fixed-point traps, both now covered by tests that assert the buggy
+behaviour explicitly so they cannot silently return: a plain `>>` rounds
+negatives toward -infinity, which leaves a settled lake carrying a **permanent
+one-unit-per-tick current in one direction only** (fixed by `shiftSym`); and
+whole-unit flux storage gives a **half-voxel truncation deadband** (fixed by a
+Q8 accumulator, which drops it to 16 fill units).
+
+**Quantified cost.** Settle deadband **±16 fill units = ±6.3 mm = 6.3% of a
+voxel** (derived, not tuned: `d_min = 2^gainShift * (256-dampingQ8)/256`;
+`sweSettleTolerance()` computes it so tests assert the derivation), against
+Phase C's ±0.4 mm. Stability margin **240/256 (6.25%)** under
+`dampingQ8 + ((8<<8)>>gainShift) < 256`, clamped by the constructor rather than
+trusted. Not modelled: hydraulic jumps, supercritical flow, correct dam-break
+bore speed — direct consequences of dropping the advection term.
+
+**Measured, settled lake disturbed by one unit/tick (Release, -O2):**
+
+| Footprint | SWE sheet | WaterCA (4 deep, memo ON) |
+|---|---|---|
+| 64x64 | **0.083 ms/tick** | 6.13 ms/tick (74x) |
+| 128x128 | **0.364 ms/tick** | 4.14 ms/tick (11x) |
+| 256x256 | **1.48 ms/tick** | — |
+
+SWE scales linearly. The CA looks *cheaper* at 128x128 than at 64x64 because it
+is **declining to simulate** — the bigger body trips
+`kMaxHydrostaticComponentCells` and Phase C skips it (same inversion ADR-0003
+measured), so the comparison understates the win. ~2.4 MB for a 256x256 sheet.
+
+**The coupling.** Ownership is a strict partition decided per column, enforced
+per voxel: an SWE column owns `bed+1` upward; everything at or below `bed` (the
+cave under the lake, the drain shaft) stays CA-owned unconditionally. **The
+boundary is always a surface — a solid bed or a domain perimeter — never a
+shared cell**, which is what lets the exchange be a ledgered integer transfer
+instead of a flux-matching condition between two discretisations. Three
+exchange channels (drain / absorb / membership change), each a single integer
+move debited and credited in the same statement, so
+`ca.totalVolume() + grid.totalVolume() == injected` holds after any sequence of
+coupled ticks. Non-oscillation is structural, not tuned: dwell-window hysteresis
+on membership (a test flips eligibility *every tick* for 200 ticks and observes
+**zero** ownership changes), one transfer direction per column per tick, and
+rate limits rather than equalization.
+
+Two non-obvious errors were found by tests rather than by reasoning, and both
+are worth remembering:
+
+1. **Membership must live in the numerics, not just the coupler's bookkeeping.**
+   Initially a CA-owned column was still an ordinary SWE cell, so the sheet kept
+   flowing into ground the coupler had just handed to the CA — a genuine
+   double-owned cell. Fixed with `SweGrid::setColumnActive`: a CA-owned column
+   is a hard wall, exactly like the grid's outer boundary.
+2. **Do not re-seat the bed downward to follow a puncture.** That moves the
+   ownership boundary down over voxels the CA is at that moment carrying water
+   through. A punctured column is instead a *metered source* into the CA, and
+   the hand-over then completes with no extra machinery at all — a non-solid
+   bed fails the eligibility predicate, so the column demotes after its dwell
+   window. The desired game feel (metered inrush, visibly falling sheet, then
+   clean transfer) falls out of the hysteresis rather than being special-cased.
+
+One guarantee is deliberately stated weaker than it first looks: the SWE side of
+the partition is *absolute*, but the CA side is *rate-limited*. No voxel is ever
+written by both solvers — but a CA source pushing water into a sheet faster than
+`absorbPerTick` leaves a bounded, correctly-ledgered standing residue in transit.
+**A renderer must draw the union of sheet depth and CA fill, not the sheet
+alone.**
+
+**Status: inert.** `voxelcore/swe.h`, `src/swe.cpp`, `tests/test_swe.cpp` are
+new and nothing constructs them; `SweCoupleConfig::enabled` defaults false and
+makes `step()` a total no-op (asserted, not assumed). The only edit outside the
+new files is two additive single-cell `WaterCA` hooks (`addWaterAt`/
+`removeWaterAt`) the coupling genuinely requires — `addWater()` stacks upward,
+which for a draining punctured bed would push water back into the sheet it just
+left, and `setReplicatedFill()` neither adds nor wakes. **No tick rule changed;
+`kWaterCAVersion` stays 4.** Suite **154 -> 170 PASS / 0 FAIL**; both pinned
+water goldens (`0x3D2224BE4A253404`, `0x56BC18914355A205`) and the
+solid-cache/wake tests unmoved. New SWE golden `0x61523E585CF7B782` under an
+independent `kSweVersion`, so SWE changes can never invalidate a water golden.
+Clang clean under `-Wall -Wextra -Wconversion -Wsign-conversion -Werror`;
+`float-ban` clean.
+
+**What ADR-0004 asks Matt to decide.** (2) Adopt the reduced model as *the* W4
+model, accepting ±6.3 mm flatness, no shock physics, and damping/gain being
+CFL-bounded numerics constants rather than feel-dials — in exchange for no
+float, no waiver, cross-vendor bit-identity, and 11-74x the CA's cost.
+Recommendation: **adopt**. (3) Enabling the coupler on a live world.
+Recommendation: **defer to M3 networked-water integration** — the coupler is a
+second simulation whose membership/dwell/depth state is not yet wired into the
+replication path at all, so enabling it early is a guaranteed desync, and there
+is no renderer to consume the force field yet either.
+
+**Follow-ups.**
+1. Lateral orifice/breach flux between an SWE column and a *confined* CA
+   neighbour (hole in a dam wall, as opposed to the lake floor). Designed in
+   `swe.h` §5 but not implemented; the puncture path covers the floor case.
+2. Sparse/tiled residency. The reference grid is a dense rectangle on purpose,
+   to keep the conservation and order-independence arguments legible.
+3. W3 hookup: `rivernet.h`'s `kDivertChannel` is still a stub, and its
+   discharge could drive SWE inflow at network outlets.
+4. GPU port. The tick is Jacobi and order-independent with **no colouring
+   needed** (unlike the CA's 8 colours), so it should be a markedly easier port
+   than `WaterCA` was.
