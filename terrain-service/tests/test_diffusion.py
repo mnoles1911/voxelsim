@@ -1,7 +1,10 @@
-"""Diffusion provider bring-up scaffolding tests (no GPU): validate_model_output,
-the dry-run config->adapter->validate->encode pipeline, and provider_id
-stability. Everything here MUST pass without a CUDA machine — the real model
-call stays behind DiffusionProvider._call_model's TODO."""
+"""Diffusion provider tests (no GPU): validate_model_output, the dry-run
+config->adapter->validate->encode pipeline, provider_id stability, checkpoint
+sha256 verification, per-tile seed derivation, and DiffusionProvider's
+model_backend injection point. Everything here MUST pass without a CUDA
+machine — TerrainDiffusionBackend's real inference call (the only piece that
+needs one) is exercised only indirectly, via a fake backend standing in for
+it, per DiffusionProvider(model_backend=...)."""
 
 from __future__ import annotations
 
@@ -18,8 +21,11 @@ from terrain_service.providers.diffusion import (
     DiffusionProvider,
     ModelOutputMismatch,
     SamplerConfig,
+    TerrainDiffusionBackend,
     adapt_raster_to_tile,
+    derive_tile_seed,
     validate_model_output,
+    verify_checkpoint_sha256,
 )
 
 TILE_SIZE = tile_codec.TILE_SIZE
@@ -201,9 +207,15 @@ def test_dry_run_provider_deterministic():
     np.testing.assert_array_equal(a.climate, b.climate)
 
 
-def test_non_dry_run_generate_raises_clear_not_implemented():
+def test_non_dry_run_without_backend_raises_clear_error_without_torch():
+    """_call_model's real (non-dry-run, no injected backend) path now
+    lazily constructs TerrainDiffusionBackend instead of raising
+    NotImplementedError -- but on this dev machine (no torch/CUDA), that
+    construction still fails, just with a clear, actionable RuntimeError
+    (pointing at dry_run=True / model_backend injection, and the bring-up
+    doc) instead of a raw ModuleNotFoundError traceback."""
     provider = DiffusionProvider(dry_run=False)
-    with pytest.raises(NotImplementedError, match="CUDA machine"):
+    with pytest.raises(RuntimeError, match="dry_run=True"):
         provider.generate(1, 0, 0, 1)
 
 
@@ -238,3 +250,203 @@ def test_tile_api_diffusion_dry_run(tmp_path):
     assert r2.data == r.data  # cache-served, byte-identical
 
     assert client.get("/healthz").get_json()["provider"] == provider.provider_id
+
+
+# ---------------------------------------------------------------------------
+# DiffusionProvider(model_backend=...) injection -- how the real inference
+# path is unit-tested without a GPU: a fake backend stands in for
+# TerrainDiffusionBackend and must be driven through the exact same
+# generate() -> _call_model -> validate -> adapt path a real backend would.
+# ---------------------------------------------------------------------------
+
+
+class _FakeBackend:
+    """Crafted deterministic rasters, keyed by DEFAULT_CHANNEL_MAPPING, so
+    tests can assert exact elevation/climate conversion through generate()."""
+
+    def __init__(self):
+        self.calls: list[tuple[int, int, int, int]] = []
+
+    def generate_rasters(self, seed: int, x: int, y: int, scale: int) -> dict[str, np.ndarray]:
+        self.calls.append((seed, x, y, scale))
+        raster = {
+            "elevation": np.full((TILE_SIZE, TILE_SIZE), 1234.6, dtype=np.float32),
+            "temperature": np.full((TILE_SIZE, TILE_SIZE), 1.0, dtype=np.float32),
+            "seasonality": np.full((TILE_SIZE, TILE_SIZE), 0.0, dtype=np.float32),
+            "precipitation": np.full((TILE_SIZE, TILE_SIZE), 0.5, dtype=np.float32),
+            "precip_variability": np.full((TILE_SIZE, TILE_SIZE), 0.25, dtype=np.float32),
+        }
+        return raster
+
+
+class _BadShapeBackend:
+    def generate_rasters(self, seed, x, y, scale):
+        raster = _good_raster()
+        raster["elevation"] = raster["elevation"][:, :256]  # non-square
+        return raster
+
+
+class _BadDtypeBackend:
+    def generate_rasters(self, seed, x, y, scale):
+        raster = _good_raster()
+        raster["elevation"] = raster["elevation"].astype(np.float64)
+        return raster
+
+
+class _ExtraChannelBackend:
+    def generate_rasters(self, seed, x, y, scale):
+        raster = _good_raster()
+        raster["humidity"] = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.float32)
+        return raster
+
+
+def test_injected_backend_produces_correct_tile():
+    fake = _FakeBackend()
+    provider = DiffusionProvider(model_backend=fake)
+    tile = provider.generate(seed=5, x=2, y=-3, scale=1)
+
+    assert tile.seed == 5 and tile.x == 2 and tile.y == -3 and tile.scale == 1
+    assert tile.elevation.dtype == np.int16
+    assert int(tile.elevation[0, 0]) == 1235  # 1234.6 rounds to 1235
+
+    assert tile.climate.dtype == np.uint8
+    assert tile.climate[0, 0, 0] == 255  # temperature 1.0 -> 255
+    assert tile.climate[1, 0, 0] == 0  # seasonality 0.0 -> 0
+    assert tile.climate[2, 0, 0] == 128  # precipitation 0.5 -> 128 (rounds)
+    assert tile.climate[3, 0, 0] == 64  # precip_variability 0.25 -> 64 (rounds)
+
+
+def test_injected_backend_receives_exact_call_args():
+    fake = _FakeBackend()
+    provider = DiffusionProvider(model_backend=fake)
+    provider.generate(seed=42, x=7, y=-9, scale=1)
+    assert fake.calls == [(42, 7, -9, 1)]
+
+
+def test_injected_backend_wrong_shape_raises_mismatch():
+    provider = DiffusionProvider(model_backend=_BadShapeBackend())
+    with pytest.raises(ModelOutputMismatch):
+        provider.generate(seed=1, x=0, y=0, scale=1)
+
+
+def test_injected_backend_wrong_dtype_raises_mismatch():
+    provider = DiffusionProvider(model_backend=_BadDtypeBackend())
+    with pytest.raises(ModelOutputMismatch, match="dtype"):
+        provider.generate(seed=1, x=0, y=0, scale=1)
+
+
+def test_injected_backend_extra_channel_raises_mismatch():
+    provider = DiffusionProvider(model_backend=_ExtraChannelBackend())
+    with pytest.raises(ModelOutputMismatch, match="extra channel"):
+        provider.generate(seed=1, x=0, y=0, scale=1)
+
+
+def test_dry_run_wins_over_injected_backend():
+    """Documented precedence (see DiffusionProvider._call_model's
+    docstring): dry_run=True ALWAYS uses the synthetic stand-in, even with
+    a model_backend injected -- dry_run exists purely to exercise the
+    surrounding plumbing without any model (real or fake) being invoked."""
+    fake = _FakeBackend()
+    provider = DiffusionProvider(model_backend=fake, dry_run=True)
+    provider.generate(seed=1, x=0, y=0, scale=1)
+    assert fake.calls == []  # the fake was never called
+
+
+# ---------------------------------------------------------------------------
+# verify_checkpoint_sha256 -- pure, unit-testable with temp files.
+# ---------------------------------------------------------------------------
+
+
+def test_verify_checkpoint_sha256_passes_on_matching_file(tmp_path):
+    f = tmp_path / "checkpoint.bin"
+    f.write_bytes(b"pretend checkpoint weights")
+    import hashlib
+
+    expected = hashlib.sha256(b"pretend checkpoint weights").hexdigest()
+    verify_checkpoint_sha256(f, expected)  # must not raise
+
+
+def test_verify_checkpoint_sha256_raises_on_mismatch(tmp_path):
+    f = tmp_path / "checkpoint.bin"
+    f.write_bytes(b"pretend checkpoint weights")
+    with pytest.raises(ValueError, match="mismatch"):
+        verify_checkpoint_sha256(f, "deadbeef" * 8)
+
+
+def test_verify_checkpoint_sha256_refuses_unpinned(tmp_path):
+    f = tmp_path / "checkpoint.bin"
+    f.write_bytes(b"pretend checkpoint weights")
+    with pytest.raises(ValueError, match="UNPINNED"):
+        verify_checkpoint_sha256(f, "UNPINNED")
+
+
+# ---------------------------------------------------------------------------
+# Import without torch: the implicit invariant this module must preserve.
+# ---------------------------------------------------------------------------
+
+
+def test_module_imports_without_torch(monkeypatch):
+    """Importing terrain_service.providers.diffusion (and constructing
+    DiffusionProvider / TerrainDiffusionBackend) must never require torch --
+    only TerrainDiffusionBackend.generate_rasters, lazily, does. Simulate
+    torch being entirely absent and re-import fresh to prove it."""
+    import builtins
+    import importlib
+    import sys
+
+    real_import = builtins.__import__
+
+    def _blocking_import(name, *args, **kwargs):
+        if name == "torch" or name.startswith("torch."):
+            raise ImportError(f"simulated: {name!r} is not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    monkeypatch.setattr(builtins, "__import__", _blocking_import)
+
+    module_name = "terrain_service.providers.diffusion"
+    saved = sys.modules.pop(module_name, None)
+    try:
+        reloaded = importlib.import_module(module_name)
+        # Construction (real, non-dry-run, no injected backend) also must
+        # not touch torch -- only generate()/_call_model does.
+        provider = reloaded.DiffusionProvider(dry_run=False)
+        assert provider.provider_id
+    finally:
+        monkeypatch.undo()
+        sys.modules.pop(module_name, None)
+        if saved is not None:
+            sys.modules[module_name] = saved
+        importlib.import_module(module_name)
+
+
+# ---------------------------------------------------------------------------
+# derive_tile_seed -- deterministic, distinct per neighboring tile.
+# ---------------------------------------------------------------------------
+
+
+def test_derive_tile_seed_deterministic():
+    a = derive_tile_seed(seed=1, x=0, y=0, scale=1)
+    b = derive_tile_seed(seed=1, x=0, y=0, scale=1)
+    assert a == b
+    assert isinstance(a, int)
+
+
+def test_derive_tile_seed_distinct_for_neighboring_tiles():
+    base = derive_tile_seed(seed=1, x=0, y=0, scale=1)
+    neighbors = [
+        derive_tile_seed(seed=1, x=1, y=0, scale=1),
+        derive_tile_seed(seed=1, x=0, y=1, scale=1),
+        derive_tile_seed(seed=1, x=-1, y=0, scale=1),
+        derive_tile_seed(seed=1, x=0, y=0, scale=8),
+        derive_tile_seed(seed=2, x=0, y=0, scale=1),
+    ]
+    all_values = [base] + neighbors
+    assert len(set(all_values)) == len(all_values), "every distinct (seed,x,y,scale) must hash distinctly"
+
+
+def test_terrain_diffusion_backend_constructs_without_torch():
+    """TerrainDiffusionBackend.__init__ must not import torch -- only
+    generate_rasters (via _load_pipeline) does, lazily."""
+    backend = TerrainDiffusionBackend(DiffusionConfig())
+    assert backend.config is not None
