@@ -891,6 +891,152 @@ in the new slot-restricted GATHER loop); `waterca.cpp`/`test_waterca.cpp`
 clang-clean after the fix. No float/double anywhere in `waterca.h`/`waterca.cpp`
 (float-ban clean, unchanged).
 
+## Water track — W2: Phase C hydrostatic pressure pass landed, U-bends now equalize (2026-07-20, worktree agent)
+
+Implements the documented Phase C no-op stub (plan §3.7 Layer B: "gravity
+then lateral equalization then hydrostatic column pressure (fills
+U-bends...)") for real. Before this pass, `WaterCA::step()` only ever
+settled each region to its LOCAL gravity+lateral fixed point -- correct for
+a single basin/shaft, but structurally incapable of raising the far arm of
+a U-bend or a second communicating-vessels tank, since gravity never flows
+up and lateral only trades flow between same-z neighbors. `kWaterCAVersion`
+bumped **2 -> 3** (deliberate world-breaking change per docs/determinism.md
+-- Phase READ/APPLY itself is byte-for-byte unchanged; only the new Phase C
+step appended after it changes tick output).
+
+**Algorithm** (`WaterCA::hydrostaticPass`, `voxel-core/src/waterca.cpp`,
+full rationale in `voxel-core/include/voxelcore/waterca.h` "Phase C --
+HYDROSTATIC"): runs once per `stepWithOrder()` call (not once per colored
+round), after all 8 Phase READ/APPLY rounds have committed.
+1. **Connected-component discovery**: a flood fill over voxel 6-neighbors,
+   seeded only from water cells (fill>0) in `touched` (the same
+   active-plus-target-neighbors brick set Phase READ/APPLY already builds).
+   Water-to-water steps are unconditional and UNBOUNDED (any owning brick,
+   active or long-settled) -- necessary so a component's true total volume
+   is always seen, even when the source arm settled (dropped out of the
+   active set) ticks ago. Water-to-EMPTY steps are gated on three
+   conditions: not a -z (downward) step; the FROM cell is either a full
+   (255) water cell or an already-included empty cell (a chain that started
+   at a full column); and the target's owning brick is in `touched`. This
+   gating is the fix for a real bug found while building this: an earlier,
+   simpler version explored any empty cell whose owning brick was merely
+   `touched` (no fullness/direction gate) -- since a brick is 8 voxels
+   tall, that pulled a partially-filled water cell's own dry headroom (same
+   brick, no relation to any actual pressure) into the redistribution every
+   tick, diluting the level and reactivating a permanently growing
+   footprint. Concretely, `waterca_pooling_spreads_flat_within_tolerance`
+   (an open, unwalled pour) never settled under that version -- confirming
+   the gate is load-bearing, not cosmetic.
+2. **Level computation**: per component, sort cells by z ascending (fixed
+   (x,y)-ascending tie-break within a layer) and allocate the component's
+   conserved total fill bottom-up -- each layer filled to 255/cell as long
+   as volume remains for the whole layer, the first layer that can't be
+   fully filled gets `total/n` plus the remainder to the first `total%n`
+   cells in tie-break order, everything above that gets 0.
+3. **Apply**: absolute per-cell targets through the same
+   `setFillAccounted()`/`changed`-set path every other write in this file
+   uses -- ledger, homogeneous-empty collapse, and activity tracking stay
+   centralized.
+
+A hard per-component cap (`kMaxHydrostaticComponentCells = 65536`) is a
+safety backstop against the unbounded-through-water rule: a component that
+would exceed it is left completely unmodified that tick (deferred, never
+partially/incorrectly equalized off a truncated view).
+
+**Conservation**: structural, same argument as Phase READ/APPLY -- every
+write is an absolute target computed from a partition of the component's
+own conserved total that sums back to exactly that total (integer division
++ explicit remainder, no rounding loss); distinct components never share a
+cell (one global `visited` set for the whole pass). Verified by
+`runToSettleCheckingConservation`'s per-tick ledger-vs-recompute check in
+every existing and new waterca test, including the two new hydrostatic
+scenarios and the 200-drop/500-tick bumpy-terrain fuzz test.
+
+**Order independence**: `hydrostaticPass` takes `touched` (the same sorted
+`std::set<BrickKey>` Phase READ/APPLY already derived from `order`'s
+CONTENTS, never its permutation) and reads `water_` state that is already
+order-independent by the time Phase C runs; it never looks at `order`
+itself. Component discovery is an intrinsic property of the
+(touched-contents, water-contents) graph, and the only tie-break (z, then
+x, then y) is over voxel coordinates, never iteration order. Proved by a
+NEW test, `waterca_hydrostatic_order_independent_and_deterministic`
+(`tests/test_waterca.cpp`) -- the existing reversed-active-set-snapshot
+technique from `waterca_twophase_order_independent_and_deterministic`, but
+run over the U-bend scenario for 200 ticks specifically so Phase C is doing
+real cross-arm redistribution every tick along the way, not just settling a
+single flat basin.
+
+**New tests** (`voxel-core/tests/test_waterca.cpp`, all passing, plus 2 new
+fixtures `uBend`/`communicatingVessels`):
+- `waterca_hydrostatic_u_bend_equalizes_and_settles`: pours 2805 units
+  (chosen to land EXACTLY, no remainder) into only the left arm of a
+  solid-walled 1-cell-wide U-bend; both arms settle at precisely the same
+  height (z=1..4 full in each), volume exactly conserved, nothing poured
+  into the right arm directly -- it only got there via Phase C.
+- `waterca_hydrostatic_communicating_vessels_equalize`: same idea with
+  wider (2x2 footprint) tanks joined by a low channel, to exercise the
+  level computation's per-layer cross-section accounting rather than
+  single-column arms; 10200 units poured into tank A land both tanks at
+  z=1..3 full, exactly equal.
+- `waterca_hydrostatic_order_independent_and_deterministic`: see above.
+- Existing `waterca_lateral_contention_capped_conserved_fixed_order`
+  updated (not gamed): this scenario's 5 cells turn out to be one
+  fully-connected flat (z=1) water body once Phase READ/APPLY settles the
+  contention, so Phase C now ALSO re-equalizes it in the same tick --
+  final per-cell values changed (west/south/origin=255, north/east=254,
+  still exactly conserving 253+255*4=1273) even though the contention
+  mechanism itself (fixed 8-way round order resolving the 4-units-into-a-
+  2-unit-budget race) is untouched; comment rewritten to explain why the
+  test no longer observes that mechanism's output as the tick's LAST word.
+
+**Golden digest re-pinned**: `waterca_deterministic_repeat_and_golden_digest`
+was `0x5C8D36C83246CAFC` (v2, Phase C no-op) -> now `0x3D2224BE4A253404`
+(v3, Phase C live) -- honestly recomputed from an actual passing run, not
+hand-picked. All 87 waterca-and-surrounding tests in `vxc_tests` pass
+(87/87 total in the full suite this pass touched).
+
+**Benchmark** (`vxc_waterca_bench`, same 441-column/1.76M-unit synthetic-
+terrain scenario, seed 20260719): reduced tick counts used (`--ticks 40`
+and `--ticks 50` separately, not the usual 600) because Phase C's cost at
+this scenario's scale made a full 600-tick run impractically slow for this
+pass's iteration loop -- the active-brick count already reaches its
+steady-state window (~2100 peak) within the first ~40-50 ticks, so the
+windowed average is still representative. Measured **~1170-1480 ms/tick**
+full-run and windowed averages (two separate runs), versus the
+pre-this-pass v2 baseline's documented ~140-155 ms/tick in the same
+[~1600,2000]-active-brick window -- roughly an **8-10x regression**,
+entirely attributable to Phase C's deliberately-unbounded water-side flood
+fill: this bench's 441 simultaneous drop columns over bumpy terrain merge
+into a small number of LARGE connected pools, and every tick that touches
+any part of a pool's boundary re-floods and re-levels the WHOLE pool
+(bounded by the 65536-cell cap, but that cap only stops an oversized
+component from being WRITTEN, not from being TRAVERSED -- the BFS still
+visits, and marks visited, every reachable water cell up to the cap before
+giving up, so a large settled pool costs real time every tick something
+near it is still active). This is exactly the cost the plan doc's own
+Layer B description implies ("replicate compressed fill-diffs for active
+regions (capped, e.g. few-thousand active bricks ~= ~50m event)") and the
+task brief anticipated ("hydrostatic adds cost -- quantify; ... note if it
+needs an active-only optimization") -- **it does**. The correct fix is a
+persistent, incremental structure (e.g. a per-body union-find or cached
+equilibrium state kept ACROSS ticks, invalidated only where a component's
+own boundary actually changed) instead of this v0's from-scratch flood
+fill every tick; out of scope for this pass (a genuine redesign, not a
+tuning knob -- lowering `kMaxHydrostaticComponentCells` alone does not
+help, since the traversal cost comes from marking cells visited, which
+happens regardless of the cap). Flagged here rather than silently
+shipped. Small/medium scenarios (the U-bend/vessels tests above, and any
+single pour that doesn't merge into a terrain-scale pool) pay only a small
+Phase C cost proportional to the pour's own size, not the whole map.
+
+**Build**: `voxelcore.lib` clean rebuild, `/W4 /WX` (MSVC 14.51/VS 2026,
+Ninja/Release), zero warnings. LLVM-MinGW `clang++`
+(`-std=c++20 -Wall -Wextra -Wconversion -Wsign-conversion -Werror`) clean
+on both `waterca.cpp` and `test_waterca.cpp` with no changes needed this
+time. No float/double anywhere in `waterca.h`/`waterca.cpp` (float-ban
+clean, unchanged) -- verified by grep, the one `double` string match is
+inside a code comment ("double-visit"), not a type.
+
 ## Backlog (parked / deferred, updated 2026-07-20)
 
 | Item | State | Unblock |

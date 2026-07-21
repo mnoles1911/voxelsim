@@ -49,6 +49,45 @@ bool runToSettleCheckingConservation(WaterCA& ca, int budget) {
     return false;
 }
 
+// A classic U-bend / drain trap (Phase C target scenario, waterca.h "Phase
+// C -- HYDROSTATIC"): two single-cell-wide vertical arms at (armX0,0) and
+// (armX1,0), joined by a single-cell-wide horizontal connector along y==0,
+// z==1, for x in [armX0, armX1] -- both arm bases are themselves part of
+// that same connector row, so the whole z==1 layer (both bases + the
+// channel between) is one contiguous open strip. Everything else is solid.
+// Floor at z<=0. Gravity/lateral alone can fill the connector and stack
+// water up EITHER arm independently, but can never push water up the FAR
+// arm just because the NEAR arm has more in it -- that's exactly the gap
+// Phase C closes.
+WaterCA::SolidFn uBend(int64_t armX0, int64_t armX1) {
+    return [armX0, armX1](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
+        if (vz <= 0) return MAT_ROCK;
+        if (vy != 0) return MAT_ROCK;
+        if (vz == 1) return (vx >= armX0 && vx <= armX1) ? MAT_AIR : MAT_ROCK; // connector + both bases
+        if (vx == armX0 || vx == armX1) return MAT_AIR;                       // the two vertical arms
+        return MAT_ROCK;
+    };
+}
+
+// Two communicating vessels: wider (2x2 footprint) tanks at
+// x in [tankAx0,tankAx0+1] and x in [tankBx0,tankBx0+1] (both y in [0,1]),
+// joined by a lower single-layer (z==1) channel spanning connX0..connX1 at
+// the same y range. Wider than uBend's 1-cell arms specifically to exercise
+// the level computation's per-layer CROSS-SECTION handling (a real
+// container, not just a single column per side) -- see waterca.h "Phase C"
+// step 2.
+WaterCA::SolidFn communicatingVessels(int64_t tankAx0, int64_t connX0, int64_t connX1, int64_t tankBx0) {
+    return [tankAx0, connX0, connX1, tankBx0](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
+        if (vz <= 0) return MAT_ROCK;
+        if (vy != 0 && vy != 1) return MAT_ROCK;
+        const bool inTankA = vx >= tankAx0 && vx <= tankAx0 + 1;
+        const bool inTankB = vx >= tankBx0 && vx <= tankBx0 + 1;
+        if (vz == 1 && vx >= connX0 && vx <= connX1) return MAT_AIR; // connector layer only
+        if (inTankA || inTankB) return MAT_AIR;                     // both tanks, full height
+        return MAT_ROCK;
+    };
+}
+
 } // namespace
 
 VXC_TEST(waterca_column_drop_settles_on_floor_conserved) {
@@ -169,31 +208,51 @@ VXC_TEST(waterca_deterministic_repeat_and_golden_digest) {
     a.digest(da);
     b.digest(db);
     CHECK_EQ(da.h, db.h);
-    // GOLDEN(waterca_container_scenario), v1 two-phase contract (kWaterCAVersion==2).
-    // Re-pinned from the v0 sequential-sweep value (0x7995BE759FB9D67E) --
-    // deliberate per the two-phase rewrite (header "Tick rules v1" comment);
-    // same scenario, different determinism contract, so a different digest
-    // is expected, not a regression.
-    CHECK_EQ(da.h, 0x5C8D36C83246CAFCull);
+    // GOLDEN(waterca_container_scenario), v3 hydrostatic contract
+    // (kWaterCAVersion==3). Re-pinned from the v2 two-phase-only value
+    // (0x5C8D36C83246CAFC) -- deliberate per Phase C landing (waterca.h
+    // "Phase C -- HYDROSTATIC" comment, kWaterCAVersion doc comment): same
+    // scenario, Phase READ/APPLY itself is byte-for-byte unchanged, but
+    // Phase C now runs and equalizes the basin's own level every tick
+    // instead of being a no-op, so a different digest is expected, not a
+    // regression. (This scenario is a single walled basin, no U-bend/
+    // multi-arm shape, so Phase C's only effect here is to make the
+    // already-close-to-level basin surface exactly level a little faster
+    // than Phase READ/APPLY's own lateral diffusion alone would.)
+    CHECK_EQ(da.h, 0x3D2224BE4A253404ull);
 }
 
-// Conservation-under-contention proof (two-phase v1 contract): a walled
-// "cross" -- origin plus its 4 lateral neighbors open at z=1, everything
-// else at z=1 solid (so each arm's ONLY non-solid neighbor is the origin;
-// no unrelated spreading to confuse the arithmetic) -- with origin near-full
-// (253/255, budget 2) and all 4 arms completely full (255). Every arm wants
-// to send flow toward origin (diff=2 each, i.e. flow=1 each per the
-// lateral rule): a naive unconditional apply would try to stuff 4 units
-// into a 2-unit budget (257 > 255, an illegal uint8_t overflow). The
-// two-phase design's fixed processing order (colorOf's 8-way round order --
-// see waterca.h "Tick rules v1") resolves this deterministically: origin
-// and the 4 arms fall into 3 different colors (verified: origin alone,
-// east+west together, north+south together), so by the time origin's
-// capacity is actually consumed (in the earlier-processed east/west round),
-// the later-processed north/south round finds zero budget left and
-// correctly contributes nothing -- not a coin flip or an overflow, the
-// SAME two arms (east/west, the lower-numbered color) win every time this
-// exact scenario runs. Total volume is exactly conserved either way.
+// Conservation-under-contention proof (two-phase v1 contract, Phase
+// READ/APPLY): a walled "cross" -- origin plus its 4 lateral neighbors open
+// at z=1, everything else at z=1 solid (so each arm's ONLY non-solid
+// neighbor is the origin; no unrelated spreading to confuse the arithmetic)
+// -- with origin near-full (253/255, budget 2) and all 4 arms completely
+// full (255). Every arm wants to send flow toward origin (diff=2 each, i.e.
+// flow=1 each per the lateral rule): a naive unconditional apply would try
+// to stuff 4 units into a 2-unit budget (257 > 255, an illegal uint8_t
+// overflow). The two-phase design's fixed processing order (colorOf's
+// 8-way round order -- see waterca.h "Tick rules v1") resolves this
+// deterministically: origin and the 4 arms fall into 3 different colors
+// (origin alone, east+west together, north+south together), so by the time
+// origin's capacity is actually consumed (in the earlier-processed
+// east/west round), the later-processed north/south round finds zero
+// budget left and correctly contributes nothing to Phase READ/APPLY.
+//
+// BUT this scenario's cross is now, after that redistribution, a single
+// fully water-connected flat (all z=1) body -- exactly the shape Phase C
+// (hydrostatic, kWaterCAVersion==3) exists to perfect: it runs immediately
+// after Phase READ/APPLY within the SAME step() call and re-equalizes the
+// whole connected cross to its true integer level (total 1273 over 5
+// cells: base 254 + 3 remainder units, see waterca.h "Phase C" step 2), so
+// the FINAL observable state below reflects both phases, not Phase
+// READ/APPLY alone -- there is no public hook to observe the intermediate
+// post-READ/APPLY-pre-hydrostatic state, and this test doesn't need one:
+// the contention-resolution mechanism above is still exactly what runs
+// and still deterministic, it's just no longer the LAST thing to touch
+// these 5 cells this tick. What still matters, and is still checked here:
+// the cap never overflows mid-tick, and total volume is exactly conserved
+// end to end despite two different redistribution mechanisms both touching
+// the same 5 cells in the same tick.
 VXC_TEST(waterca_lateral_contention_capped_conserved_fixed_order) {
     auto solid = [](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
         if (vz <= 0) return MAT_ROCK; // floor
@@ -212,21 +271,21 @@ VXC_TEST(waterca_lateral_contention_capped_conserved_fixed_order) {
 
     ca.step();
 
-    // Origin filled to EXACTLY capacity (255), never 257 -- the cap held.
-    CHECK_EQ(int(ca.fillAt(0, 0, 1)), 255);
-    // East/west (the lower color, processed while origin still had budget)
-    // each gave up exactly 1 unit -- their desired flow was fully admitted.
-    CHECK_EQ(int(ca.fillAt(1, 0, 1)), 254);
-    CHECK_EQ(int(ca.fillAt(-1, 0, 1)), 254);
-    // North/south (the higher color, processed after origin's budget was
-    // already exhausted by east/west) contributed NOTHING and are
-    // therefore unchanged -- their desired-but-rejected flow was never
-    // subtracted from them (conservation would break if it had been).
-    CHECK_EQ(int(ca.fillAt(0, 1, 1)), 255);
-    CHECK_EQ(int(ca.fillAt(0, -1, 1)), 255);
+    // Post-hydrostatic exact level: total 1273 over the 5 connected cells
+    // = base 254 each + 3 remainder units, awarded by the fixed (x,y)
+    // ascending tie-break (waterca.h "Phase C" step 2) to the first 3 cells
+    // in that order: (-1,0), (0,-1), (0,0) -- west, south, origin get 255;
+    // (0,1), (1,0) -- north, east get 254. Never 257 anywhere -- the
+    // Phase READ/APPLY cap held before hydrostatic ever ran.
+    CHECK_EQ(int(ca.fillAt(0, 0, 1)), 255);  // origin
+    CHECK_EQ(int(ca.fillAt(-1, 0, 1)), 255); // west
+    CHECK_EQ(int(ca.fillAt(0, -1, 1)), 255); // south
+    CHECK_EQ(int(ca.fillAt(1, 0, 1)), 254);  // east
+    CHECK_EQ(int(ca.fillAt(0, 1, 1)), 254);  // north
 
-    // Exact conservation despite the contention: nothing created, nothing
-    // silently dropped on the floor when a target ran out of room.
+    // Exact conservation despite the contention AND the subsequent
+    // hydrostatic re-equalization: nothing created, nothing silently
+    // dropped on the floor when a target ran out of room.
     CHECK_EQ(ca.totalVolume(), uint64_t(253 + 255 * 4));
     CHECK_EQ(ca.recomputeVolume(), ca.totalVolume());
 }
@@ -296,4 +355,103 @@ VXC_TEST(waterca_conservation_fuzz_over_bumpy_terrain) {
         CHECK_EQ(ca.totalVolume(), ca.recomputeVolume());
     }
     CHECK_EQ(ca.totalVolume(), expectedTotal);
+}
+
+// Phase C (hydrostatic, kWaterCAVersion==3) headline scenario: pour water
+// into ONLY the left arm of a solid-walled U-bend (uBend fixture) and check
+// it rises in the RIGHT arm too, settling with both arms at the same
+// height -- the thing gravity+lateral alone structurally cannot do (see
+// waterca.h "Phase C -- HYDROSTATIC" intro: gravity never flows up, lateral
+// only trades flow between same-z neighbors). Volume is chosen to divide
+// EXACTLY across the connector-layer's 5 cells (both arm bases + the 3
+// cells between, x in [0,4] at z==1: 5*255=1275) plus 3 more full layers
+// split evenly across the 2 arms (2*255*3=1530), total 2805 -- an exact
+// integer equilibrium with no remainder, so both arms must land at
+// PRECISELY the same fill, not just within the usual +/-1 tolerance.
+VXC_TEST(waterca_hydrostatic_u_bend_equalizes_and_settles) {
+    WaterCA ca(uBend(0, 4));
+    const uint32_t placed = ca.addWater(0, 0, 40, 2805); // poured only into the LEFT arm (x=0), high up
+    CHECK_EQ(placed, uint32_t(2805));
+
+    const bool settled = runToSettleCheckingConservation(ca, 2000);
+    CHECK(settled);
+    CHECK_EQ(ca.totalVolume(), uint64_t(2805));
+
+    // Both arms rose to EXACTLY the same height: z=1..4 full (255) in each,
+    // nothing above z=4, nothing was poured into the right arm directly --
+    // it only got there via Phase C equalizing through the connector.
+    for (int64_t z = 1; z <= 4; ++z) {
+        CHECK_EQ(int(ca.fillAt(0, 0, z)), 255); // left arm (pour side)
+        CHECK_EQ(int(ca.fillAt(4, 0, z)), 255); // right arm (equalized side)
+    }
+    CHECK_EQ(int(ca.fillAt(0, 0, 5)), 0);
+    CHECK_EQ(int(ca.fillAt(4, 0, 5)), 0);
+    // Connector itself (the 3 cells strictly between the two arm bases)
+    // full too -- it's part of the same z==1 layer.
+    CHECK_EQ(int(ca.fillAt(2, 0, 1)), 255);
+
+    // Exact conservation through both the two-phase rounds and Phase C.
+    CHECK_EQ(ca.recomputeVolume(), ca.totalVolume());
+}
+
+// Communicating vessels: two wider (2x2 footprint) tanks joined by a lower
+// channel (communicatingVessels fixture) -- exercises Phase C's per-layer
+// CROSS-SECTION accounting (waterca.h "Phase C" step 2) rather than uBend's
+// single-column arms. Connector spans x in [2,9] -- contiguous from tank
+// A's right edge (x=1) through to tank B's left edge (x=10), no gap. Volume
+// chosen to land exactly: connector layer (tankA 4 cells + connector 16
+// cells + tankB 4 cells = 24*255=6120) plus 2 more full layers split across
+// just the two tanks (8*255*2=4080), total 10200 -- both tanks must settle
+// at EXACTLY the same per-cell fill.
+VXC_TEST(waterca_hydrostatic_communicating_vessels_equalize) {
+    WaterCA ca(communicatingVessels(0, 2, 9, 10));
+    const uint32_t placed = ca.addWater(0, 0, 40, 10200); // poured only into tank A
+    CHECK_EQ(placed, uint32_t(10200));
+
+    const bool settled = runToSettleCheckingConservation(ca, 2000);
+    CHECK(settled);
+    CHECK_EQ(ca.totalVolume(), uint64_t(10200));
+
+    for (int64_t z = 1; z <= 3; ++z) {
+        for (int64_t y = 0; y <= 1; ++y) {
+            CHECK_EQ(int(ca.fillAt(0, y, z)), 255);  // tank A
+            CHECK_EQ(int(ca.fillAt(1, y, z)), 255);  // tank A
+            CHECK_EQ(int(ca.fillAt(10, y, z)), 255); // tank B (equalized, nothing poured here)
+            CHECK_EQ(int(ca.fillAt(11, y, z)), 255); // tank B
+        }
+    }
+    CHECK_EQ(int(ca.fillAt(0, 0, 4)), 0);
+    CHECK_EQ(int(ca.fillAt(10, 0, 4)), 0);
+    CHECK_EQ(ca.recomputeVolume(), ca.totalVolume());
+}
+
+// Order-independence proof extended to Phase C (waterca.h "Phase C --
+// HYDROSTATIC", "ORDER INDEPENDENCE" paragraph): the SAME reversed-order
+// technique as waterca_twophase_order_independent_and_deterministic, but
+// over the U-bend scenario specifically so a run of this test actually
+// exercises Phase C doing real cross-arm redistribution (not just a
+// single-layer basin settling toward flat) every tick along the way, not
+// only Phase READ/APPLY.
+VXC_TEST(waterca_hydrostatic_order_independent_and_deterministic) {
+    auto pour = [](WaterCA& ca) { ca.addWater(0, 0, 40, 2805); };
+
+    WaterCA sorted(uBend(0, 4));
+    WaterCA shuffled(uBend(0, 4));
+    pour(sorted);
+    pour(shuffled);
+
+    for (int i = 0; i < 200; ++i) {
+        sorted.step(); // sorted-order snapshot internally
+
+        std::vector<BrickKey> order = shuffled.activeSetSnapshot();
+        std::reverse(order.begin(), order.end()); // a different permutation than step() would use
+        shuffled.stepWithOrder(order);
+
+        CHECK_EQ(sorted.totalVolume(), shuffled.totalVolume());
+        CHECK_EQ(sorted.activeBrickCount(), shuffled.activeBrickCount());
+        Digest ds, dh;
+        sorted.digest(ds);
+        shuffled.digest(dh);
+        CHECK_EQ(ds.h, dh.h); // byte-identical state every single tick, not just at the end
+    }
 }
