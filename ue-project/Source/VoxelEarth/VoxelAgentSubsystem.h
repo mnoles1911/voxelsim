@@ -15,13 +15,25 @@ class UVoxelWorldSubsystem;
 // FVoxelWaterImpl (see either header's identical doc comment). Defined only
 // in VoxelAgentSubsystem.cpp: owns, per agent (parallel array, same index
 // as Agents below), the full vxc::PathResult Tier 0/1 revalidate against
-// (pathStillValid) and replan from, plus the one shared vxc::PathCostConfig
-// every findPath call in this subsystem uses.
+// (pathStillValid) and replan from, plus TWO shared vxc::PathCostConfigs
+// (digging-while-pathing, docs/status.md M6 section) -- DigConfig (Mine/
+// Bridge enabled, Tier 0 only) and NavConfig (Mine/Bridge effectively
+// disabled, exactly the old v0 single-config setup, Tier 1 -- see
+// PlanPath's tier dispatch).
 struct FVoxelAgentImpl;
 
 // M6 NPC swarm (docs/voxel-earth-implementation-plan.md SS3.6 "NPCs & AI
-// (simulation LOD)"; navigation-only v0 -- agents pursue the player across
-// streaming voxel terrain but never dig/edit it, that is the next slice).
+// (simulation LOD)"). Digging-while-pathing (docs/status.md M6 section
+// "Digging-while-pathing"): Tier 0 agents plan with Mine/Bridge ENABLED
+// (FVoxelAgentImpl::DigConfig, VoxelAgentSubsystem.cpp) and execute those
+// steps through the SAME authoritative edit-log path player digs use
+// (UVoxelWorldSubsystem::TryDig/TryPlace -- see TryExecuteWaypointEdit's doc
+// comment for exactly how a point-target Mine/Bridge step is expressed as
+// one of those raycast-based calls). Tier 1/2 remain navigation-only
+// (FVoxelAgentImpl::NavConfig, Mine/Bridge priced exactly as the old v0
+// single-config setup did) -- see "Rate limiting -- tier restriction" below
+// for why digging is Tier-0-exclusive in this slice, not "Tier 0 and 1" as
+// the plan doctrine's phrasing allows.
 //
 // Owns a POOLED, instance-rendered agent swarm (see VoxelAgent.h's class
 // comment for why: hundreds of AActors would be far too heavy) and runs the
@@ -104,6 +116,21 @@ public:
 	// above): a no-op (logged, returns 0) on NM_Client or if no player pawn
 	// exists yet. Returns the number of agents actually spawned.
 	int32 SpawnSwarm(int32 Count);
+
+	// -VoxelDigSwarmTest=<N> (AVoxelEarthGameMode, docs/status.md M6
+	// "Digging-while-pathing" section): a DETERMINISTIC variant of SpawnSwarm
+	// for that verification scenario -- SpawnSwarm's random 360-degree ring
+	// can't guarantee every agent starts on one particular side of a
+	// deliberately-built obstacle, which the decisive "only route is through
+	// the wall" demo needs. Places Count agents at CenterWorldPos +
+	// Offset.GetSafeNormal() * OffsetRadiusUU, each additionally jittered
+	// +-LateralJitterUU along the axis perpendicular to Offset (XY plane
+	// only) so the cluster doesn't spawn as a single stacked point. Ground-
+	// placed the same way as SpawnSwarm (GetSurfaceHeightUU); same authority-
+	// only refusal on NM_Client / no terrain subsystem. Returns the number of
+	// agents actually spawned.
+	int32 SpawnSwarmAtOffset(int32 Count, const FVector& CenterWorldPos, const FVector& Offset, double OffsetRadiusUU,
+	                          double LateralJitterUU);
 
 	int32 GetAgentCount() const { return Agents.Num(); }
 
@@ -208,6 +235,52 @@ public:
 	static constexpr double SpawnRingOuterUU = 15000.0;
 	static constexpr int32 DefaultSwarmCount = 200;
 
+	// --- Digging-while-pathing rate limits (docs/status.md M6 section) ---
+	//
+	// A swarm of hundreds of agents each mining every tick would vaporize
+	// the world and swamp the edit log/replication -- three independent
+	// limits, all of which must hold simultaneously:
+	//
+	// 1. Per-agent cooldown: an agent that just successfully dug/placed one
+	//    voxel cannot attempt another for this many seconds (FVoxelAgent::
+	//    LastDigTimeSeconds) -- "mining costs hardness x TIME", not an
+	//    instant swap, matching pathfind.h's own cost-function doctrine
+	//    comment. At MoveSpeedUUPerSec (3.8 m/s) this reads as a believable
+	//    "the agent visibly pauses, chewing through the rock" beat per
+	//    voxel rather than a teleport-through-solid-matter glitch.
+	static constexpr double NPCDigCooldownSeconds = 1.5;
+	// 2. Global per-tick cap: at most this many NPC edits (Mine+Bridge
+	//    combined, across the WHOLE swarm) land per UVoxelAgentSubsystem::
+	//    Tick, regardless of how many Tier 0 agents are simultaneously off
+	//    cooldown and want to dig -- the actual bound on worst-case per-tick
+	//    edit-log growth from this subsystem. Sized well above what a
+	//    LEGIBLE demo swarm (5-20 agents, 1.5s cooldown each) can ever hit in
+	//    practice, but far below what hundreds of agents converging on a
+	//    single wall at once could otherwise do without it.
+	static constexpr int32 MaxNPCEditsPerTick = 4;
+	// 3. Tier restriction (class comment "Rate limiting -- tier
+	//    restriction"): ONLY Tier 0 agents ever execute an edit -- Tier 1/2
+	//    plan (Tier 1) or steer (Tier 2) through FVoxelAgentImpl::NavConfig,
+	//    which prices Mine/Bridge exactly as effectively-disabled as the
+	//    pre-M6 single-config setup did, so their paths/steering never
+	//    require an edit in the first place. This is deliberately narrower
+	//    than "Tier 0 and optionally Tier 1": a Tier 1 agent's path is
+	//    reused across a much coarser replan cadence (Tier1ReplanIntervalSeconds)
+	//    and would otherwise carry a Mine/Bridge step (planned once, stale
+	//    for up to that whole interval) into ticks where AdvanceAlongWaypoints
+	//    -- which has NO collision/edit awareness of its own -- would walk
+	//    the agent straight through still-solid terrain waiting for an edit
+	//    that Tier 1 never attempts. Keeping digging Tier-0-only sidesteps
+	//    that failure mode entirely rather than having to solve it.
+
+	// Placeholder solid material a Bridge action's placed scaffold voxel
+	// uses (UVoxelWorldSubsystem::TryPlace's MaterialId parameter) -- no
+	// distinct "scaffold" material exists in vxc::Material yet (voxelcore/
+	// core.h), so this reuses MAT_ROCK, the same placeholder-material
+	// precedent UVoxelWorldSubsystem::SpawnTreeFixtureAt already set for a
+	// hand-authored fixture that isn't real world content either.
+	static constexpr uint8 BridgeScaffoldMaterialId = 2; // vxc::MAT_ROCK (voxelcore/core.h) -- see above
+
 private:
 	// Per-tier per-agent update. All three share the same signature shape
 	// (agent pool index, the terrain subsystem, live player state, dt, and
@@ -217,8 +290,12 @@ private:
 	// (All three fetch GetWorld()->GetTimeSeconds() internally where needed
 	// -- e.g. Tier 1's replan-interval gate, Tier 2's wander phase -- rather
 	// than threading a timestamp through every call.)
+	// TickTier0 additionally threads InOutEditBudget (MaxNPCEditsPerTick's
+	// live counter, shared across every Tier 0 agent this Tick -- see "Rate
+	// limiting" above) alongside the existing replan budget; TickTier1/2
+	// never dig (tier restriction above) so they don't need it.
 	void TickTier0(int32 AgentIndex, UVoxelWorldSubsystem& Terrain, const FVector& PlayerWorldPos,
-	               const FVector& GoalWorldPos, double DeltaSeconds, int32& InOutReplanBudget);
+	               const FVector& GoalWorldPos, double DeltaSeconds, int32& InOutReplanBudget, int32& InOutEditBudget);
 	void TickTier1(int32 AgentIndex, UVoxelWorldSubsystem& Terrain, const FVector& PlayerWorldPos,
 	               const FVector& GoalWorldPos, double DeltaSeconds, int32& InOutReplanBudget);
 	void TickTier2(int32 AgentIndex, UVoxelWorldSubsystem& Terrain, const FVector& PlayerWorldPos,
@@ -230,8 +307,42 @@ private:
 	// false (no state changed) if the agent's start voxel isn't inside the
 	// search window (should not happen in practice -- window is centered on
 	// the agent) or the search finds literally zero steps (agent already at
-	// the reached cell).
+	// the reached cell). Digging-while-pathing (docs/status.md M6 section):
+	// which of FVoxelAgentImpl::DigConfig/NavConfig this call uses is
+	// selected purely from Agents[AgentIndex].Tier (already set by Tick's
+	// dispatch before either TickTier0/1 runs) -- Tier 0 gets DigConfig
+	// (Mine/Bridge enabled), everything else gets NavConfig. Also records,
+	// per agent, whether the freshly-planned path IS dig-capable
+	// (FVoxelAgentImpl::PathIsDigCapable) -- TickTier1 forces an immediate
+	// replan the moment it inherits a dig-capable path from a just-demoted
+	// Tier 0 agent, rather than trying (and failing) to walk a Mine/Bridge
+	// step it will never execute -- see TickTier1's doc comment.
 	bool PlanPath(int32 AgentIndex, UVoxelWorldSubsystem& Terrain, const FVector& GoalWorldPos);
+
+	// Digging-while-pathing execution (docs/status.md M6 section): if the
+	// step Agents[AgentIndex] is currently walking toward
+	// (Impl->Paths[AgentIndex].steps[Agent.WaypointIndex]) is a Mine or
+	// Bridge action, attempts the corresponding authoritative edit through
+	// UVoxelWorldSubsystem::TryDig/TryPlace -- see the .cpp for exactly how
+	// a point-target voxel edit is expressed as one of those raycast-based
+	// calls. Rate-limited (NPCDigCooldownSeconds, InOutEditBudget -- see
+	// "Rate limiting" above) and gated by the voxel.NPCDig.Enabled safety
+	// valve cvar. Returns true if the agent is clear to advance toward this
+	// waypoint THIS tick (the step isn't Mine/Bridge at all, the edit was
+	// already applied by a previous tick/another agent, or an edit was just
+	// successfully applied this call); false if an edit is still pending
+	// (cooldown/budget/cvar-off/no-valid-placement-face) and the agent must
+	// hold its current position rather than advance into still-solid (Mine)
+	// or still-unsupported (Bridge) terrain.
+	bool TryExecuteWaypointEdit(int32 AgentIndex, UVoxelWorldSubsystem& Terrain, const FVector& PlayerWorldPos,
+	                             int32& InOutEditBudget);
+
+	// Shared per-agent construction (ground-placement query + FVoxelAgent
+	// pool append + Impl->Paths/PathIsDigCapable append-in-lockstep + ISM
+	// instance creation) -- factored out of SpawnSwarm so SpawnSwarmAtOffset
+	// (a different WorldX/WorldY generation policy, same everything-after)
+	// doesn't duplicate it. Returns the new agent's pool index.
+	int32 SpawnOneAgentAt(double WorldX, double WorldY, UVoxelWorldSubsystem& Terrain);
 
 	// Tier-aware ground-snap: no-ops (cheaply, just a timestamp compare)
 	// unless this agent's tier-specific cadence has elapsed since its last
