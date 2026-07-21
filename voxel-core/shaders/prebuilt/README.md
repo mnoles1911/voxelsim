@@ -11,6 +11,20 @@ reference the same way they already do on AMD, closing the NVIDIA≡AMD leg of
 the M0 determinism gate transitively (both legs agree with the CPU reference
 ⇒ both legs agree with each other).
 
+## 2026-07 respin: signed `%` vendor-divergence fix (ColumnMain only)
+
+`worldgen.ColumnMain.spv` was recompiled after `worldgen.hlsl`'s `floorDiv`
+was rewritten to stop depending on signed `/` and `%` with mixed-sign
+operands (HLSL leaves `%` undefined unless both operands share a sign). That
+dependency is what failed the NVIDIA leg of this gate: on an RTX 4090 the
+flooring correction never fired, so `floorDiv` silently truncated for every
+NEGATIVE world coordinate. The other six `.spv` files are byte-identical to
+the previous respin — the change only touches ColumnMain's call graph.
+
+The **CPU reference did not change**, so `vxc::kWorldGenVersion` stays at 2
+and no goldens move. Confirmed empirically: all three AMD-leg digests below
+are bit-identical before and after the fix.
+
 ## Provenance
 
 - Source: `voxel-core/shaders/worldgen.hlsl` at commit `8b834107701fd4a2a005b8dbd4a17352f44f26c1`
@@ -20,15 +34,18 @@ the M0 determinism gate transitively (both legs agree with the CPU reference
 - Compile command: `tools/compile-shaders.ps1`'s SPIR-V invocation —
   `dxc -T cs_6_0 -E <Entry> -O3 -spirv -fspv-target-env=vulkan1.1
   -fvk-b-shift 0 0 -fvk-t-shift 1 0 -fvk-u-shift 3 0 worldgen.hlsl -Fo <out>.spv`
-- Compiled and committed from: worktree HEAD `a172baf54c8ebf45e99d281a539fdd63fcd5e7e6`
-  (branch base: `main`, PR #34 "m6-pathfind" merge)
+- Compiled and committed from: worktree HEAD `354ea238a66caa1b5aa966632cd81c3f5070ee06`
+  (branch base: `main`) — ColumnMain respun for the signed-`%` fix above; the
+  other six kernels are unchanged since worktree HEAD
+  `a172baf54c8ebf45e99d281a539fdd63fcd5e7e6` (branch base: `main`, PR #34
+  "m6-pathfind" merge)
 - Built on: this Windows dev box (MSVC/VS 2026 toolchain elsewhere in the
   repo; DXC itself needs no MSVC — it's a standalone compiler)
 
 ## SHA-256
 
 ```
-1d5e9afca7bf4f4d590e97b70be6566f5feacc05e50158e5a10973baab0883d3  worldgen.ColumnMain.spv
+36a8d69d5f628b9b811deac2376e9e3f1c386372be01d193be46519b10a9cbf5  worldgen.ColumnMain.spv
 d77c4d737507a61d9f9fa61bb2e6c0677d16d93c9ed74e20f2f3bfbc1725e6aa  worldgen.MeshCountMain.spv
 c856bb46d94b8358797fe5c1275df54e48a3922ddb080db71cdfe8b559ea808e  worldgen.MeshEmitMain.spv
 72cb57ed63c531b0745f109e1b7c9a2054ed1e201b0ef59dbb062171ed207130  worldgen.ScanAddMain.spv
@@ -63,6 +80,13 @@ the pinned DXC + current `worldgen.hlsl`, using these exact committed
 | `--radius 128` | **PASS**, 0 mismatches, 67/529 tiles (12.7%, every-8th sampled) verified, gate 0.259s (< 1s target) | `b4c8ec5d0966894b` |
 
 Device: AMD Radeon RX 7800 XT.
+
+Re-verified UNCHANGED after the 2026-07 signed-`%` fix above (same box, same
+three modes, freshly rebuilt `vxc_gpu` against these committed `.spv`): all
+three digests reproduced exactly — `1dbcabb01cfaf2bc`, `95a82ba20200f6f2`,
+`b4c8ec5d0966894b`. That the AMD digests are byte-identical across the fix is
+the proof that the fix is a no-op on the vendor that was already correct, and
+therefore cannot move any golden.
 
 These three digests — not the older status.md ones — are the values the
 NVIDIA leg (`tools/run-nvidia-digest.sh`) must reproduce to close the M0
