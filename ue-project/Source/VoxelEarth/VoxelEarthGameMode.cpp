@@ -262,6 +262,205 @@ void AVoxelEarthGameMode::BeginPlay()
 			DigTestDelaySeconds, false);
 	}
 
+	// ==== M4 voxel light field + cone-traced GI verification ================
+	// (ONE self-contained block, deliberately: it does its own fixture, its own
+	// camera framing and its own capture/quit rather than adding a branch to
+	// the shared -VoxelScreenshotAfter framing chain below, so it cannot
+	// collide with other agents' edits to that chain.)
+	//
+	// -VoxelGIOn            force voxel.GI.Enabled 1 from the command line
+	//                       (same SetByCode pattern as -VoxelDebugRings above;
+	//                       more reliable than -ExecCmds timing). Usable on
+	//                       its own, including with -VoxelPerfRun.
+	// -VoxelGITest=<s>      after <s> seconds, stamp the wall+roof fixture on
+	//                       the flattest column near spawn and put the camera
+	//                       UNDER the roof slab looking down the covered span.
+	//                       This is the "enclosed space should go dark" proof.
+	// -VoxelGIBreach        additionally punch a hole through the middle of the
+	//                       roof slab a few seconds before the capture -- the
+	//                       "blow open a roof and light pours in" proof.
+	//
+	// WHY AN ABOVE-GROUND ENCLOSURE AND NOT A DUG TUNNEL. The obvious version
+	// of this test -- carve a chamber underground and stand in it -- does not
+	// work in this build, and three runs were spent finding out why: the
+	// streaming footprint only meshes a band of chunks around the terrain
+	// SURFACE (see ComputeFootprintChunkZRange in VoxelWorldSubsystem.cpp), so
+	// a camera 9m or more below the surface is outside the resident set and
+	// renders open sky beneath a thin crust of terrain no matter how much rock
+	// voxel-core says is there. That is a streaming/LOD limitation, not a GI
+	// one, but it makes an underground shot meaningless. The wall+roof fixture
+	// (SpawnStructureFixtureAt, already used by -VoxelStructureTest) gives a
+	// real 12.8m x 3.2m covered span with 3.2m of headroom, entirely inside the
+	// R0 ring and unambiguously rendered.
+	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelGIOn")))
+	{
+		if (IConsoleVariable* GIVar = IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.GI.Enabled")))
+		{
+			GIVar->Set(1, ECVF_SetByCode);
+			UE_LOG(LogVoxelEarth, Log, TEXT("VoxelGIOn: forcing voxel.GI.Enabled=1"));
+		}
+	}
+
+	float GITestDelaySeconds = 20.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelGITest="), GITestDelaySeconds) ||
+	    FParse::Param(FCommandLine::Get(), TEXT("VoxelGITest")))
+	{
+		const bool bGIBreach = FParse::Param(FCommandLine::Get(), TEXT("VoxelGIBreach"));
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelGITest: roofed fixture near spawn in %.1fs (breach=%d)"),
+		       GITestDelaySeconds, bGIBreach ? 1 : 0);
+
+		GetWorldTimerManager().SetTimer(
+			GITestTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this, bGIBreach]()
+				{
+					UWorld* GIWorld = GetWorld();
+					APlayerController* PC = GIWorld ? GIWorld->GetFirstPlayerController() : nullptr;
+					APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+					UVoxelWorldSubsystem* Terrain = GIWorld ? GIWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					if (!Pawn || !Terrain)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelGITest: no pawn/subsystem yet, skipping."));
+						return;
+					}
+
+					// Flattest column within 60m of spawn: the fixture's covered
+					// span is only 3.2m high, so a sloping floor under it would
+					// close the corridor off and ruin the framing. Deterministic
+					// scan -> seed-stable framing across the off/on pair.
+					const FVector PawnLoc = Pawn->GetActorLocation();
+					double BestX = PawnLoc.X, BestY = PawnLoc.Y;
+					double BestSurf = Terrain->GetSurfaceHeightUU(PawnLoc.X, PawnLoc.Y);
+					double BestRelief = TNumericLimits<double>::Max();
+					constexpr double ScanStepUU = 1000.0; // 10m
+					constexpr int32 ScanSteps = 6;        // +/- 60m, comfortably inside R0
+					for (int32 Iy = -ScanSteps; Iy <= ScanSteps; ++Iy)
+					{
+						for (int32 Ix = -ScanSteps; Ix <= ScanSteps; ++Ix)
+						{
+							const double Cx = PawnLoc.X + double(Ix) * ScanStepUU;
+							const double Cy = PawnLoc.Y + double(Iy) * ScanStepUU;
+							const double Cs = Terrain->GetSurfaceHeightUU(Cx, Cy);
+							if (Cs <= 0.0)
+							{
+								continue; // below sea level
+							}
+							double Relief = 0.0;
+							for (int32 Ni = 0; Ni <= 13; ++Ni)
+							{
+								// Sample along the +X span the fixture will occupy.
+								const double Ns = Terrain->GetSurfaceHeightUU(Cx + double(Ni) * 100.0, Cy + 160.0);
+								Relief = FMath::Max(Relief, FMath::Abs(Ns - Cs));
+							}
+							if (Relief < BestRelief)
+							{
+								BestRelief = Relief;
+								BestX = Cx; BestY = Cy; BestSurf = Cs;
+							}
+						}
+					}
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelGITest: flattest column = (%.0f,%.0f) surface %.0f, relief %.0fUU along the span"),
+					       BestX, BestY, BestSurf, BestRelief);
+
+					const int32 Count = Terrain->SpawnStructureFixtureAt(BestX, BestY);
+					UE_LOG(LogVoxelEarth, Log, TEXT("VoxelGITest: wall+roof fixture stamped (%d voxels)"), Count);
+
+					// Fixture-local geometry, in the same voxel units
+					// SpawnStructureFixtureAt uses: span 128 vx (+X), width 32 vx
+					// (+Y), roof underside 32 vx (3.2m) above the surface.
+					GITestChamberCentreUU = FVector(BestX, BestY, BestSurf);
+					GITestSurfaceUU = BestSurf;
+
+					if (bGIBreach)
+					{
+						GetWorldTimerManager().SetTimer(
+							GITestBreachTimerHandle,
+							FTimerDelegate::CreateWeakLambda(this,
+								[this]()
+								{
+									UWorld* BWorld = GetWorld();
+									UVoxelWorldSubsystem* BTerrain = BWorld ? BWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+									if (!BTerrain)
+									{
+										return;
+									}
+									// Punch a ~4m skylight through the middle of the
+									// 20cm roof slab.
+									const FVector Hole(GITestChamberCentreUU.X + 640.0,
+									                   GITestChamberCentreUU.Y + 160.0,
+									                   GITestSurfaceUU + 340.0);
+									const int32 BreachRemoved = BTerrain->CarveSphere(Hole, 200.0, 0.0);
+									UE_LOG(LogVoxelEarth, Log,
+									       TEXT("VoxelGITest: BREACH -- roof holed at (%.0f,%.0f,%.0f), removed %d voxels"),
+									       Hole.X, Hole.Y, Hole.Z, BreachRemoved);
+								}),
+							11.f, false);
+					}
+
+					// Two-phase framing, matching the -VoxelScreenshotAfter pattern
+					// that is already known to work: assert the pose on one timer,
+					// capture on a LATER one. Doing both in a single lambda
+					// captured the pre-move view.
+					auto PoseUnderRoof = [this]()
+					{
+						UWorld* CWorld = GetWorld();
+						APlayerController* Ctrl = CWorld ? CWorld->GetFirstPlayerController() : nullptr;
+						if (!Ctrl)
+						{
+							return;
+						}
+						// Stand just inside the pillar end, 1.5m up, looking back
+						// along the covered span toward the wall, tilted slightly
+						// up so the roof underside fills the top of frame. The
+						// shaded floor, the shaded slab underside and the sunlit
+						// ground past the wall are all in one shot.
+						const FVector CamPos(GITestChamberCentreUU.X + 1180.0,
+						                     GITestChamberCentreUU.Y + 160.0,
+						                     GITestSurfaceUU + 150.0);
+						const FRotator Look(6.f, 180.f, 0.f);
+						if (APawn* P = Ctrl->GetPawn())
+						{
+							P->SetActorLocation(CamPos, /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics);
+							P->SetActorRotation(Look);
+							Ctrl->SetViewTarget(P);
+						}
+						Ctrl->SetControlRotation(Look);
+					};
+					auto CaptureUnderRoof = [this, PoseUnderRoof]()
+					{
+						PoseUnderRoof(); // re-assert, in case the pawn drifted
+						if (APlayerController* Ctrl = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr)
+						{
+							if (Ctrl->PlayerCameraManager)
+							{
+								const FVector L = Ctrl->PlayerCameraManager->GetCameraLocation();
+								const FRotator R = Ctrl->PlayerCameraManager->GetCameraRotation();
+								UE_LOG(LogVoxelEarth, Log,
+								       TEXT("VoxelGITest capture: ACTUAL cam=(%.0f,%.0f,%.0f) rot=(pitch %.1f yaw %.1f)"),
+								       L.X, L.Y, L.Z, R.Pitch, R.Yaw);
+							}
+						}
+						FScreenshotRequest::RequestScreenshot(TEXT("VoxelGI"), false, true);
+					};
+
+					// Pose early (streaming + the GI solve both key off the view
+					// origin, so the camera wants to be in position well before
+					// the shot), then capture.
+					const float ShotDelay = bGIBreach ? 20.f : 14.f;
+					GetWorldTimerManager().SetTimer(
+						GITestPoseTimerHandle, FTimerDelegate::CreateWeakLambda(this, PoseUnderRoof), 2.f, false);
+					GetWorldTimerManager().SetTimer(
+						GITestShotTimerHandle, FTimerDelegate::CreateWeakLambda(this, CaptureUnderRoof), ShotDelay, false);
+					GetWorldTimerManager().SetTimer(
+						GITestQuitTimerHandle,
+						FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(/*bForce*/ false); }),
+						ShotDelay + 4.f, false);
+				}),
+			GITestDelaySeconds, false);
+	}
+	// ==== end M4 voxel GI verification ======================================
+
 	// M3 wave 1 gate verification (docs/m3-plan.md "two clients dig the same
 	// hole"): -VoxelDumpDigestAfter=<s> logs this SERVER process's seed +
 	// World::editedDigest() -- the client-side equivalent lives on
