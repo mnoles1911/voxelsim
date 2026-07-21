@@ -8,6 +8,7 @@
 // material). Later versions add erosion stamps, riverbed carving, caves,
 // vegetation placement.
 
+#include "voxelcore/caves.h"
 #include "voxelcore/tiles.h"
 
 namespace vxc {
@@ -18,6 +19,15 @@ struct ColumnSample {
     int32_t subsoilMm = 0;      // layer thickness below topsoil
     int32_t bedrockDepthMm = 0; // depth below surface where bedrock begins
     MaterialId surfaceMat = MAT_TOPSOIL; // biome surface material, voxelcore/biome.h
+
+    // M4 cave pass (voxelcore/caves.h): the tube axes passing near this column,
+    // already reduced to the per-voxel test's two numbers. Carried in the
+    // ColumnSample — rather than recomputed per voxel or bolted onto
+    // materialAt's signature — so that every existing consumer of the column
+    // cache (GeneratedWorld::makeBrick, the UE column grid cache, gpu_harness,
+    // bench) picks caves up with no API change and pays the 34 cave hashes
+    // once per column instead of once per voxel.
+    CaveColumn cave;
 };
 
 class Amplifier {
@@ -30,9 +40,17 @@ public:
     ColumnSample column(int64_t vx, int64_t vy) const;
 
     // Material of voxel (vx, vy, vz) given its precomputed column. A voxel is
-    // solid iff its centre (vz*100+50 mm) is at or below the surface. Defined
-    // to unbounded depth (implicit-solid underground, doctrine §3.1 step 4).
+    // solid iff its centre (vz*100+50 mm) is at or below the surface, MINUS
+    // whatever the M4 cave pass carves out of it (voxelcore/caves.h). Defined
+    // to unbounded depth (implicit-solid underground, doctrine §3.1 step 4) —
+    // note that underground is no longer UNIFORMLY solid: caves are the one
+    // source of air below the surface shell.
     static MaterialId materialAt(const ColumnSample& col, int64_t vz);
+
+    // Stratigraphy only, cave pass NOT applied — the pre-M4 definition, kept
+    // for tests and tooling that need "what would be here if no cave crossed
+    // it". Production paths want materialAt().
+    static MaterialId stratigraphyAt(const ColumnSample& col, int64_t vz);
 
     MaterialId materialAt(int64_t vx, int64_t vy, int64_t vz) const {
         return materialAt(column(vx, vy), vz);

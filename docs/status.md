@@ -3938,3 +3938,114 @@ New cvars, all `voxel.GI.*`: `Enabled` (0), `Strength`, `AmbientFloor`,
 `MaxChunkRefreshesPerFrame`, `EditDirtyRadiusBricks`, `MaxBricks`,
 `ConeDistanceUU`, `BounceAlbedo`, `Debug`. New switches: `-VoxelGIOn`,
 `-VoxelGITest=<s>`, `-VoxelGIBreach`.
+
+### Cave pass (M4)
+
+**Status: landed.** `voxelcore/caves.h` (new, header-only, integer-only) +
+the carve fold-in at `Amplifier::materialAt`, mirrored bit-exactly in
+`worldgen.hlsl`'s `VoxelizeMain`. `kWorldGenVersion` **3 -> 4**.
+
+**Formulation — a jittered lattice graph, not 3D noise.** Blobby noise caves
+give disconnected bubbles whose connectivity is an emergent property you can
+only measure after the fact and that breaks on any threshold retune. Here the
+network is the union of round tubes laid along the edges of a 25.6 m lattice
+whose nodes are hash-jittered anywhere inside their own cell. Edges are kept
+when they are BACKBONE edges — every 4th lattice row's +x edges, every 4th
+column's +y edges — or when a 1-in-4 hash gate opens them. The backbone alone
+is a connected grid graph for every seed (each backbone row is connected along
+x, each backbone column along y, and every row crosses every column), so
+connectivity is structural. The gated extras only add loops, branches and dead
+ends; they can never disconnect anything.
+
+**Depth space.** Node depth is measured down from the column's own surface, so
+the network drapes under the topography. That is what makes the roof guarantee
+free (shallowest possible tunnel voxel is 6.2 m below its own surface, pinned
+by `static_assert` against the 6 m clamp) and keeps the whole network 3.2 m
+clear of the shallowest bedrock the amplifier can produce.
+
+**Sinkhole entrances.** Depth-space tunnels never break the surface on their
+own, which on the gentle synthetic terrain left the network fully sealed
+(measured: 0 natural mouths in a 204.8 m square). So a backbone-CROSSING node
+— one that provably has all four backbone tunnels incident on it — opens a
+vertical shaft to the surface on a 1-in-4 gate: roughly one entrance per 205 m
+square, each ~1.0-1.7 m in radius. Measured surface perforation: 73 of 466,489
+sampled columns (0.016%).
+
+**Connectivity evidence** (`test_caves.cpp`, flood fill via `connectivity.h`
+on a 0.4 m decimated sample grid):
+
+| Scene | Components | Largest share |
+|---|---|---|
+| flat terrain, 153.6 m square x full depth band (384x384x108 samples, 213,996 cave samples) | 6 | 86.3% |
+| real `SyntheticTileSampler` terrain, 102.4 m square (256x256x232 samples, 65,810 cave samples) | 3 | 88.8% |
+| 51.2 m box around a sinkhole | entrance component holds 33,756 of 33,756 samples (100%) and descends 35 m from daylight | |
+
+A handful of large components, not thousands of bubbles. The remainder is
+analysis-box clipping — tubes that enter the box and leave again without
+meeting the backbone inside it.
+
+**Volume budget:** 1.18% of the 6-40 m subsurface band is cave air; 13.7% of
+columns have any cave beneath them. Max 5 tube axes recorded per column over
+800,476 columns (storage cap 8, and the test fails if the cap is ever
+reached).
+
+**Safety rules and their tests.** Three independent bedrock guards — the
+geometry (`static_assert`), a 2 m runtime margin above the column's own
+bedrock top, and `materialAt` refusing to turn `MAT_BEDROCK` into air at all;
+measured closest approach 6.25 m. Implicit ocean (W1): no carve at or below
+z=0 and no caves at all in columns below 12 m surface elevation, so a void
+below sea level is never created and the ocean cannot flood the network —
+driven directly over every surface height from -40 m up (9,408 synthetic
+columns, 3.49 M sub-sea-level probes, all refused). Roof: 10.9 m thinnest
+cover measured over non-sinkhole ground against a 6 m clamp.
+
+**Gameplay coupling** falls out because cave air is plain `MAT_AIR`:
+`pathfind.h` already prices air cheaply (M6), `collapse.h`/dig edits act on it
+(M5), and the water CA drains into it. Verified through the brick path, not
+just pointwise queries.
+
+**GPU: AMD RX 7800 XT PASS, bit-exact.**
+
+| Mode | Digest | Was (v3) |
+|---|---|---|
+| default (2 regions) | `e21e2767591496eb` | `e21e2767591496eb` — **unchanged, correctly** |
+| `--radius 64` | `1e664cf6680a137c` | `346b60c292a26b5a` |
+| `--radius 128` | `7602afe508d2ee73` | `75b737e961f65bf5` |
+
+Default mode voxelizes only the surface-shell brick range (48 voxels tall),
+which is entirely above the 6 m cave roof, so it contains no cave voxels and
+its digest must not move. `--radius 64` is the run that actually exercises the
+cave path, and it verified **270,663,680 of 270,663,680 cells (100%)** against
+the CPU reference with zero mismatches. `tools/lint-shader-ub.py` clean
+(HLSL + committed SPIR-V, zero `OpSDiv`/`OpSRem`/`OpSMod`); float-ban clean.
+
+**Goldens.** Moved: none of the existing ones, and that was predicted rather
+than discovered. `amplifier_golden_digest` digests columns only. `mips_chain`
+digests a 2x2x2 level-2 block anchored on the surface straddle, i.e. roughly
++/-30 voxels around the surface — above the cave band. `biome_map`, all
+`test_hash`, `connectivity`, `pathfind`, `regiongraph`, `collapse`, `waterca`
+and `tilestore` goldens are built from hand-written lambdas or fixtures and do
+not touch the amplifier. New: `GOLDEN(cave_layer)` = `0x1CD7912E8DBBB5EA`.
+`vxc_tests` 154/154.
+
+**Visual verification — what could and could not be shown.** No in-editor
+cave-interior screenshot: the world does not stream anything underground yet
+(a concurrent workstream), so a camera below the surface sees open sky under a
+thin crust. What was produced instead, headless from the CPU reference: a
+vertical cross-section (tube cross-sections in rock, intact roof, bedrock
+floor untouched) and a 120 m plan view of the topmost-cave-depth field showing
+branching, junction-connected passages with a sinkhole entrance sitting on a
+four-way junction. The numbers above are the primary deliverable.
+
+**Follow-ups.**
+- Re-shoot a real in-editor screenshot once underground streaming lands; a
+  sinkhole is visible from the surface and is the cheapest thing to aim a
+  camera at.
+- Cave-specific surface materials (damp rock, flowstone) and the M4 GI pass's
+  behavior inside enclosed cave volumes are untouched here.
+- `Amplifier::stratigraphyAt` vs `materialAt` is now a real distinction;
+  `VoxelWorldSubsystem.cpp`'s direct `Amplifier::materialAt` call correctly
+  picks up caves, but any future caller must pick deliberately.
+- The cave hash channels (18-21) are declared in `caves.h` rather than
+  appended to `hash.h`'s `HashChannel` registry; folding them in would be
+  tidier.
