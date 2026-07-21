@@ -82,10 +82,17 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     const BiomeId biome = classifyBiome(cl.temperature, cl.precipitation, cl.seasonality,
                                          col.surfaceMm, slopeMmPerPx);
     col.surfaceMat = biomeSurfaceMaterial(biome, col.surfaceMm);
+
+    // M4 cave pass (voxelcore/caves.h): reduce the jittered lattice tunnel
+    // network to the tube axes that pass near this column. Depends only on
+    // (seed, vx, vy, surfaceMm) — no raster reads — which is what lets
+    // worldgen.hlsl recompute it inside VoxelizeMain rather than widening
+    // GpuColumnSample. Mirrored bit-exactly there.
+    col.cave = caveColumnFor(seed_, vx, vy, col.surfaceMm);
     return col;
 }
 
-MaterialId Amplifier::materialAt(const ColumnSample& col, int64_t vz) {
+MaterialId Amplifier::stratigraphyAt(const ColumnSample& col, int64_t vz) {
     const int64_t centreMm = vz * kVoxelSizeMm + kVoxelSizeMm / 2;
     const int64_t depthMm = static_cast<int64_t>(col.surfaceMm) - centreMm;
     if (depthMm < 0) return MAT_AIR;
@@ -94,6 +101,21 @@ MaterialId Amplifier::materialAt(const ColumnSample& col, int64_t vz) {
         return col.surfaceMat == MAT_SAND ? MAT_GRAVEL : MAT_SUBSOIL;
     if (depthMm < col.bedrockDepthMm) return MAT_ROCK;
     return MAT_BEDROCK;
+}
+
+MaterialId Amplifier::materialAt(const ColumnSample& col, int64_t vz) {
+    const MaterialId m = stratigraphyAt(col, vz);
+    // Already void, or the unbounded bedrock floor: the cave pass never
+    // touches either. Refusing MAT_BEDROCK here is the third and last of the
+    // independent bedrock guards (caves.h documents the other two) — even a
+    // mis-tuned constant table cannot punch a hole in the world's floor.
+    if (m == MAT_AIR || m == MAT_BEDROCK) return m;
+    // MAT_AIR is an enumerator and `m` is a MaterialId variable, so a bare
+    // `cond ? MAT_AIR : m` mixes an enumerated and a non-enumerated operand —
+    // gcc's -Wextra rejects that (clang does not), so name the type explicitly.
+    return caveCarveAt(col.cave, col.surfaceMm, col.bedrockDepthMm, vz)
+               ? static_cast<MaterialId>(MAT_AIR)
+               : m;
 }
 
 } // namespace vxc

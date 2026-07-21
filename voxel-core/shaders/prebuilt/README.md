@@ -89,13 +89,13 @@ the `.spv` files in this directory.
 ## SHA-256
 
 ```
-5f16bc95373ed6f585b068cf4ba93666eda2d8081e463e053a8b371e34768ce6  worldgen.ColumnMain.spv
+f4292777605064826e812ee12bcf7fb063adfe0e4fd07cbb5ccd03dffa2d6747  worldgen.ColumnMain.spv
 b3fdca92cefc9ee1967bb0d0b4bbef377d0183224e60223c32cfb41c2ee6981b  worldgen.MeshCountMain.spv
 f5d1168c83935f7c35094f30f27012057aa8ea80d83130afeaa945a46e03bacd  worldgen.MeshEmitMain.spv
 72cb57ed63c531b0745f109e1b7c9a2054ed1e201b0ef59dbb062171ed207130  worldgen.ScanAddMain.spv
 0168a302618b437e31b0b4e8bf69aa4ea203383dfd6d1e38b13acd0618d277e1  worldgen.ScanBlocksMain.spv
 e2060888d9938627c0e5c899d4402c804aeee61aae04b86ffcf9c3c5ec4cdf8e  worldgen.ScanSumsMain.spv
-729fc4f21e7fcc323545f9977512827f2acc53b15a83c82bc78b8ccfade6b0c1  worldgen.VoxelizeMain.spv
+fb7af97b3cb7f131d797bb0bedaf3850819477d664388a0adef70ec99b2b7127  worldgen.VoxelizeMain.spv
 ```
 
 Verify with `sha256sum -c` (or `Get-FileHash -Algorithm SHA256` on Windows)
@@ -192,3 +192,48 @@ tools/compile-shaders.ps1        # writes build/shaders/*.spv (DXIL + SPIR-V)
 
 Bump the DXC pin (`tools/fetch-dxc.ps1`) and regenerate deliberately —
 shader binaries are part of the determinism surface (ADR-0001).
+
+
+## 2026-07 respin 3: M4 cave pass (kWorldGenVersion 3 -> 4)
+
+`worldgen.hlsl` gained a real code change this time — the M4 cave pass, a
+bit-exact HLSL mirror of `voxelcore/caves.h` (`caveEdgeExists`,
+`caveEdgeRadiusMm`, `caveColumnFor`, `caveCarveAt`), plus the split of the
+old `materialAt` into `stratigraphyAt` (layer model) and `materialAt`
+(layers minus caves). All seven modules were recompiled from the pinned DXC
+`v1.9.2602.24` / `dxc_2026_05_27.zip`; **ColumnMain and VoxelizeMain moved,
+the five mesher/scan modules did not** (`MeshCountMain`, `MeshEmitMain`,
+`ScanBlocksMain`, `ScanSumsMain`, `ScanAddMain` are byte-identical to
+respin 2 — their source is untouched and DXC is deterministic, which is
+itself a useful control on the rebuild). ColumnMain moved only because the
+cave functions are declared ahead of it in the same translation unit and
+DXC's module-level output shifts; its *behavior* is unchanged, which the
+harness confirms (see the default-mode digest below).
+
+`python tools/lint-shader-ub.py voxel-core/shaders --spv-dir
+voxel-core/shaders/prebuilt` is clean on the respun bytecode: still ZERO
+`OpSDiv`/`OpSRem`/`OpSMod`. Every coordinate -> lattice mapping the cave
+pass adds (`floorDiv(xMm, kCaveLatticeMm)`, the closest-approach
+`floorDiv(sdx * num, den)`) goes through the approved helpers, and the
+backbone/sinkhole selectors use a power-of-two AND mask precisely so that no
+signed `%` is needed for the "every 4th lattice row" test.
+
+| Mode | Result | GPU output digest (columns+cells+quads) |
+|---|---|---|
+| default (2 regions) | **PASS**, 0 mismatches, 8192 columns / 360448 cells / 4997 quads | `e21e2767591496eb` (UNCHANGED) |
+| `--radius 64` | **PASS**, 0 mismatches, 305/305 entries (100%) verified — 4,997,120 columns / 270,663,680 cells / 2,523,983 quads compared — gate 0.104s | `1e664cf6680a137c` (was `346b60c292a26b5a`) |
+| `--radius 128` | **PASS**, 0 mismatches, 136/1089 entries (12.5%) verified, gate 0.180s | `7602afe508d2ee73` (was `75b737e961f65bf5`) |
+
+Device: AMD Radeon RX 7800 XT.
+
+**Why default mode's digest did NOT move, and why that is correct.** The two
+default regions voxelize only the surface-shell brick range the amplifier
+reports (`origin` is 6 bricks = 48 voxels tall, `far-negative` 5 bricks).
+The cave pass never carves shallower than 6 m (60 voxels) below a column's
+own surface, and the only construct that reaches the surface at all — the
+sinkhole shaft — occurs about once per 205 m square, so a 6.4 m region
+almost never contains one. Default mode therefore contains no cave voxels,
+and an unchanged digest there is the expected result. It does mean default
+mode does **not** exercise the cave path: the `--radius 64` run is the one
+that verifies it, and it does so over all 270 million cells with zero
+mismatches.

@@ -446,8 +446,9 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
 
 uint cellIndexInBrick(uint x, uint y, uint z) { return x + 8u * (y + 8u * z); }
 
-// vxc::Amplifier::materialAt bit-for-bit.
-uint materialAt(GpuColumnSample col, int64_t vz)
+// vxc::Amplifier::stratigraphyAt bit-for-bit (the layer model, cave pass NOT
+// applied — materialAt below is the full function).
+uint stratigraphyAt(GpuColumnSample col, int64_t vz)
 {
     const int64_t centreMm = vz * (int64_t)kVoxelSizeMm + (int64_t)kVoxelSizeMm / 2;
     const int64_t depthMm = (int64_t)col.surfaceMm - centreMm;
@@ -457,6 +458,210 @@ uint materialAt(GpuColumnSample col, int64_t vz)
         return col.surfaceMat == MAT_SAND ? MAT_GRAVEL : MAT_SUBSOIL;
     if (depthMm < (int64_t)col.bedrockDepthMm) return MAT_ROCK;
     return MAT_BEDROCK;
+}
+
+// --- M4 cave pass ----------------------------------------------------------
+// Bit-exact mirror of voxelcore/caves.h. Read that header for WHY the network
+// is a jittered lattice graph rather than 3D noise, why tube depth is measured
+// from the column's own surface, and what the three safety clamps are for; the
+// code below is deliberately a line-for-line transliteration of it so the two
+// can be diffed by eye. DO NOT let them drift.
+//
+// Recomputed here per VoxelizeMain thread rather than carried through
+// GpuColumnSample: it needs only (seed, vx, vy, surfaceMm) — no raster reads —
+// so recomputing costs the same 34 hashes ColumnMain would have paid, keeps
+// the column buffer layout (and the harness's column comparison) unchanged,
+// and avoids widening a cross-kernel struct contract.
+
+static const int64_t kCaveLatticeMm = 25600;
+static const int64_t kCaveNodeDepthMinMm = 9000;
+static const int64_t kCaveNodeDepthSpanMm = 25000;
+static const int64_t kCaveRadiusMinMm = 1200;
+static const int64_t kCaveRadiusSpanMm = 1600;
+static const int64_t kCaveBackboneMask = 3;
+static const uint64_t kCaveEdgeGateMask = 3;
+static const int64_t kCaveShaftNodeMask = 3;
+static const uint64_t kCaveShaftGateMask = 3;
+static const int64_t kCaveShaftRadiusMinMm = 1000;
+static const int64_t kCaveShaftRadiusSpanMm = 700;
+static const int64_t kCaveRoofMinMm = 6000;
+static const int64_t kCaveBedrockMarginMm = 2000;
+static const int kCaveMinSurfaceMm = 12000;
+static const int64_t kCaveMinVoxelZ = 0;
+static const int kMaxCaveSegs = 8;
+
+// HashChannel ids from voxelcore/caves.h — append only, never renumber.
+static const uint CH_CAVE_NODE = 18;
+static const uint CH_CAVE_EDGE = 19;
+static const uint CH_CAVE_RADIUS = 20;
+static const uint CH_CAVE_SHAFT = 21;
+
+struct GpuCaveColumn
+{
+    int segCount;
+    int segMarginSq[kMaxCaveSegs];
+    int segDepthMm[kMaxCaveSegs];
+    int shaftMarginSq;
+    int shaftDepthMaxMm;
+};
+
+// vxc::caveEdgeExists bit-for-bit.
+bool caveEdgeExists(uint64_t seed, int64_t ei, int64_t ej, int edir)
+{
+    if (edir == 0 && (ej & kCaveBackboneMask) == 0) return true;
+    if (edir == 1 && (ei & kCaveBackboneMask) == 0) return true;
+    return ((hash2(seed, ei, ej * 2 + (int64_t)edir, CH_CAVE_EDGE) >> 48) & kCaveEdgeGateMask) == 0;
+}
+
+// vxc::caveEdgeRadiusMm bit-for-bit.
+int64_t caveEdgeRadiusMm(uint64_t seed, int64_t ei, int64_t ej, int edir)
+{
+    const uint64_t hr = hash2(seed, ei, ej * 2 + (int64_t)edir, CH_CAVE_RADIUS);
+    return kCaveRadiusMinMm +
+           (int64_t)((((hr >> 44) & 0xFFFFFULL) * (uint64_t)kCaveRadiusSpanMm) >> 20);
+}
+
+// vxc::caveColumnFor bit-for-bit, including the (dj, di, dir) iteration order
+// that decides which tubes survive the kMaxCaveSegs cap.
+GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm)
+{
+    GpuCaveColumn cc;
+    cc.segCount = 0;
+    cc.shaftMarginSq = 0;
+    cc.shaftDepthMaxMm = 0;
+    [unroll]
+    for (int q = 0; q < kMaxCaveSegs; ++q)
+    {
+        cc.segMarginSq[q] = 0;
+        cc.segDepthMm[q] = 0;
+    }
+    if (surfaceMm < kCaveMinSurfaceMm) return cc;
+
+    const int64_t xMm = vx * (int64_t)kVoxelSizeMm;
+    const int64_t yMm = vy * (int64_t)kVoxelSizeMm;
+    const int64_t ci = floorDiv(xMm, kCaveLatticeMm);
+    const int64_t cj = floorDiv(yMm, kCaveLatticeMm);
+
+    int64_t nodeX[16];
+    int64_t nodeY[16];
+    int64_t nodeD[16];
+    for (int nj = 0; nj < 4; ++nj)
+    {
+        for (int ni = 0; ni < 4; ++ni)
+        {
+            const int64_t gi = ci - 1 + (int64_t)ni;
+            const int64_t gj = cj - 1 + (int64_t)nj;
+            const uint64_t hn = hash2(seed, gi, gj, CH_CAVE_NODE);
+            const int nidx = ni + 4 * nj;
+            nodeX[nidx] = gi * kCaveLatticeMm +
+                          (int64_t)(((hn & 0xFFFFFULL) * (uint64_t)kCaveLatticeMm) >> 20);
+            nodeY[nidx] = gj * kCaveLatticeMm +
+                          (int64_t)((((hn >> 20) & 0xFFFFFULL) * (uint64_t)kCaveLatticeMm) >> 20);
+            nodeD[nidx] = kCaveNodeDepthMinMm +
+                          (int64_t)((((hn >> 40) & 0xFFFFFULL) * (uint64_t)kCaveNodeDepthSpanMm) >> 20);
+        }
+    }
+
+    for (int dj = 0; dj < 3; ++dj)
+    {
+        for (int di = 0; di < 3; ++di)
+        {
+            const int64_t ei = ci - 1 + (int64_t)di;
+            const int64_t ej = cj - 1 + (int64_t)dj;
+            for (int dir = 0; dir < 2; ++dir)
+            {
+                if (!caveEdgeExists(seed, ei, ej, dir)) continue;
+                const int aIdx = di + 4 * dj;
+                const int bIdx = (dir == 0) ? (di + 1 + 4 * dj) : (di + 4 * (dj + 1));
+                const int64_t axMm = nodeX[aIdx];
+                const int64_t ayMm = nodeY[aIdx];
+                const int64_t adMm = nodeD[aIdx];
+                const int64_t bxMm = nodeX[bIdx];
+                const int64_t byMm = nodeY[bIdx];
+                const int64_t bdMm = nodeD[bIdx];
+
+                const int64_t sdx = bxMm - axMm;
+                const int64_t sdy = byMm - ayMm;
+                const int64_t den = sdx * sdx + sdy * sdy;
+                if (den == 0) continue;
+
+                const int64_t wx = xMm - axMm;
+                const int64_t wy = yMm - ayMm;
+                const int64_t num = clamp64(wx * sdx + wy * sdy, 0, den);
+
+                const int64_t cxMm = axMm + floorDiv(sdx * num, den);
+                const int64_t cyMm = ayMm + floorDiv(sdy * num, den);
+                const int64_t cdMm = adMm + floorDiv((bdMm - adMm) * num, den);
+
+                const int64_t ex = xMm - cxMm;
+                const int64_t ey = yMm - cyMm;
+                const int64_t rr = caveEdgeRadiusMm(seed, ei, ej, dir);
+                const int64_t marginSq = rr * rr - (ex * ex + ey * ey);
+                if (marginSq <= 0) continue;
+
+                if (cc.segCount < kMaxCaveSegs)
+                {
+                    cc.segMarginSq[cc.segCount] = (int)marginSq;
+                    cc.segDepthMm[cc.segCount] = (int)cdMm;
+                    cc.segCount += 1;
+                }
+            }
+        }
+    }
+
+    // Sinkhole shaft — at most one backbone-crossing node is in reach.
+    for (int sj = 0; sj < 3; ++sj)
+    {
+        for (int si = 0; si < 3; ++si)
+        {
+            if (cc.shaftMarginSq != 0) continue;
+            const int64_t hi = ci - 1 + (int64_t)si;
+            const int64_t hj = cj - 1 + (int64_t)sj;
+            if ((hi & kCaveShaftNodeMask) != 0 || (hj & kCaveShaftNodeMask) != 0) continue;
+            const uint64_t hs = hash2(seed, hi, hj, CH_CAVE_SHAFT);
+            if (((hs >> 48) & kCaveShaftGateMask) != 0) continue;
+            const int sIdx = si + 4 * sj;
+            const int64_t sr = kCaveShaftRadiusMinMm +
+                               (int64_t)(((hs & 0xFFFFFULL) * (uint64_t)kCaveShaftRadiusSpanMm) >> 20);
+            const int64_t sex = xMm - nodeX[sIdx];
+            const int64_t sey = yMm - nodeY[sIdx];
+            const int64_t sMarginSq = sr * sr - (sex * sex + sey * sey);
+            if (sMarginSq <= 0) continue;
+            cc.shaftMarginSq = (int)sMarginSq;
+            cc.shaftDepthMaxMm = (int)nodeD[sIdx];
+        }
+    }
+    return cc;
+}
+
+// vxc::caveCarveAt bit-for-bit.
+bool caveCarveAt(GpuCaveColumn cc, int surfaceMm, int bedrockDepthMm, int64_t vz)
+{
+    if (cc.segCount == 0 && cc.shaftMarginSq == 0) return false;
+    if (vz < kCaveMinVoxelZ) return false;
+    if (surfaceMm < kCaveMinSurfaceMm) return false;
+
+    const int64_t centreMm = vz * (int64_t)kVoxelSizeMm + (int64_t)kVoxelSizeMm / 2;
+    const int64_t depthMm = (int64_t)surfaceMm - centreMm;
+    if (depthMm < 0) return false;
+    if (cc.shaftMarginSq > 0 && depthMm <= (int64_t)cc.shaftDepthMaxMm) return true;
+    if (depthMm < kCaveRoofMinMm) return false;
+    if (depthMm + kCaveBedrockMarginMm >= (int64_t)bedrockDepthMm) return false;
+
+    for (int s = 0; s < cc.segCount; ++s)
+    {
+        const int64_t dz = depthMm - (int64_t)cc.segDepthMm[s];
+        if (dz * dz < (int64_t)cc.segMarginSq[s]) return true;
+    }
+    return false;
+}
+
+// vxc::Amplifier::materialAt bit-for-bit (stratigraphy minus the cave pass).
+uint materialAt(GpuColumnSample col, GpuCaveColumn cc, int64_t vz)
+{
+    const uint m = stratigraphyAt(col, vz);
+    if (m == MAT_AIR || m == MAT_BEDROCK) return m;
+    return caveCarveAt(cc, col.surfaceMm, col.bedrockDepthMm, vz) ? MAT_AIR : m;
 }
 
 [numthreads(8, 8, 1)]
@@ -472,6 +677,12 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
 
     const GpuColumnSample col = InColumns[tid.x + tid.y * DispatchColumns.x];
 
+    // Cave pass: one reduction per column, reused down the whole brick stack —
+    // the same split vxc::ColumnSample::cave makes on the CPU.
+    const uint64_t caveSeed = ((uint64_t)SeedHi << 32) | (uint64_t)SeedLo;
+    const GpuCaveColumn cave = caveColumnFor(caveSeed, (int64_t)OriginVx + (int64_t)tid.x,
+                                             (int64_t)OriginVy + (int64_t)tid.y, col.surfaceMm);
+
     for (uint bz = 0; bz < BricksZ; ++bz)
     {
         const uint brickIndex = footprintIndex * BricksZ + bz;
@@ -481,7 +692,7 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
         {
             const int64_t vz = brickZ * (int64_t)8 + (int64_t)z;
             // lint-shader-ub: allow UNGUARDED_WRITE - index is bounded by construction: the entry guard caps tid below DispatchColumns, so footprintIndex < bricksX*bricksY and brickIndex < bricksX*bricksY*BricksZ, while lx/ly/z are all < 8; the host sizes OutCells to exactly bricksX*bricksY*BricksZ*512 (contract mirrored in gpu_harness.cpp, asserted there)
-            OutCells[brickIndex * 512u + cellIndexInBrick(lx, ly, z)] = materialAt(col, vz);
+            OutCells[brickIndex * 512u + cellIndexInBrick(lx, ly, z)] = materialAt(col, cave, vz);
         }
     }
 }

@@ -10,7 +10,9 @@ namespace vxc {
 // stratigraphy constants). Invalidates edit logs and golden digests.
 // v3: SyntheticTileSampler spectral-gap fill — 4 new elevation octaves at
 // 480/240/120/60 m wavelength (70/38/20/11 m amplitude), terrain-realism audit.
-inline constexpr uint32_t kWorldGenVersion = 3;
+// v4: M4 cave pass (voxelcore/caves.h) — jittered-lattice tunnel network
+// carved into the voxelize path. Underground is no longer uniformly solid.
+inline constexpr uint32_t kWorldGenVersion = 4;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 
