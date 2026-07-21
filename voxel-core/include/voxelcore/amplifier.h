@@ -32,7 +32,8 @@ struct ColumnSample {
 
 class Amplifier {
 public:
-    Amplifier(uint64_t seed, ITileSampler& tiles) : seed_(seed), tiles_(&tiles) {}
+    Amplifier(uint64_t seed, ITileSampler& tiles)
+        : seed_(seed), tiles_(&tiles), id_(nextId()) {}
 
     uint64_t seed() const { return seed_; }
 
@@ -57,8 +58,17 @@ public:
     }
 
 private:
+    // Identity for the per-thread tile-raster memo in amplifier.cpp. Drawn from
+    // a never-reused counter rather than using `this` or `tiles_`, because a
+    // destroyed Amplifier's address can be recycled by the allocator and a
+    // stale memo entry would then be served to a DIFFERENT world. Copies share
+    // the id, which is correct: Amplifier is immutable after construction, so
+    // a copy samples the same (seed, tiles) and must produce the same columns.
+    static uint64_t nextId();
+
     uint64_t seed_;
     ITileSampler* tiles_;
+    uint64_t id_;
 };
 
 } // namespace vxc
