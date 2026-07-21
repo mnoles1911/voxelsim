@@ -19,21 +19,29 @@
 
 namespace
 {
-// m2-plan.md "Height source" row: TILE elevation directly (30m/px bilinear),
-// through a vxc::SyntheticTileSampler using the SAME seed the voxel world
-// uses at RUNTIME (UVoxelWorldSubsystem::GetSeed() -- M2 task "Config-driven
-// seed": -VoxelSeed=<u64> can override the DefaultSeed constant, so this must
-// track the subsystem's actual resolved seed, not the constant, or clipmap
-// terrain would stop lining up with the ring cascade at their shared seam
-// whenever -VoxelSeed is passed) so clipmap terrain lines up with the ring
-// cascade at their shared seam. SyntheticTileSampler is stateless (holds
-// only seed_/pixelSizeMm_, no heap allocation), so constructing one fresh
-// per call is negligible -- simpler and correct-by-construction than a
-// static instance that would need explicit invalidation if the seed ever
-// changed after first use. Game-thread only (AVoxelClipmapActor's
-// Tick/RebuildLevel never run off-thread), so no synchronization is needed.
-double SampleHeightUU(double WorldXUU, double WorldYUU, uint64 Seed)
+// m2-plan.md "Height source" row: TILE elevation directly (30m/px bilinear).
+//
+// Track B2 ("real .vxtl terrain tiles as a selectable tile source"): the
+// primary path now routes through UVoxelWorldSubsystem::SampleTerrainHeightUU,
+// which samples whichever ITileSampler the voxel world is ACTUALLY using this
+// run (the synthetic sampler by default, or a loaded vxc::TileGridSampler
+// under -VoxelTileDir=<path>) -- this is what keeps clipmap terrain and the
+// ring cascade reading the SAME tiles and lining up at their shared seam,
+// with or without real tiles loaded. Subsystem==nullptr (genuinely
+// unavailable -- should not happen in practice; BeginPlay already warns if
+// so) falls back to a fresh vxc::SyntheticTileSampler seeded from Seed,
+// preserving the exact pre-Track-B2 behavior for that edge case.
+// SyntheticTileSampler is stateless (holds only seed_/pixelSizeMm_, no heap
+// allocation), so constructing one fresh per call is negligible. Game-thread
+// only (AVoxelClipmapActor's Tick/RebuildLevel never run off-thread), so no
+// synchronization is needed either way.
+double SampleHeightUU(double WorldXUU, double WorldYUU, const UVoxelWorldSubsystem* Subsystem, uint64 Seed)
 {
+	if (Subsystem)
+	{
+		return Subsystem->SampleTerrainHeightUU(WorldXUU, WorldYUU);
+	}
+
 	vxc::SyntheticTileSampler Tiles(Seed); // elevationMm() is non-const (ITileSampler), so Tiles can't be const here
 
 	// mm -> UU is /10 (VoxelCoords::WorldToMm's inverse: 1 UU = 10 mm).
@@ -221,6 +229,14 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 	const double Spacing = SpacingUUForLevel(LevelIndex);
 	const double SkirtDropUU = 2.0 * Spacing; // m2-plan.md "Cracks/overlap" row
 
+	// Track B2: fetched once per rebuild (not per vertex -- RebuildLevel runs
+	// at most once/level/tick, see the class comment's "Recenter" section) so
+	// every one of this rebuild's ~4225 height taps reads the SAME tile
+	// source the ring cascade is using right now. See SampleHeightUU's doc
+	// comment for the nullptr fallback.
+	const UWorld* World = GetWorld();
+	const UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+
 	// Pass 1: sample heights (bilinear tile taps -- "trivially cheap" per
 	// m2-plan.md's Recenter row) and lay out local-space XY (offsets from
 	// SnappedOriginUU; the component's own relative location supplies the
@@ -238,7 +254,7 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 		{
 			const double LocalY = double(j - HalfIndex) * Spacing;
 			const double WorldY = SnappedOriginUU.Y + LocalY;
-			const double HeightUU = SampleHeightUU(WorldX, WorldY, TerrainSeed);
+			const double HeightUU = SampleHeightUU(WorldX, WorldY, Subsystem, TerrainSeed);
 			const int32 Idx = i * NumVertsPerSide + j;
 			HeightsUU[Idx] = HeightUU;
 			Positions[Idx] = FVector(LocalX, LocalY, HeightUU);
