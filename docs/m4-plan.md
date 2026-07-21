@@ -51,6 +51,30 @@ Two mechanisms, layered:
    lookup only picks among biomes whose morphology gates pass. Deterministic,
    per-column, zero replication — same rules the amplifier already lives by.
 
+## Round 2 decisions (Matt, 2026-07-21) — vegetation DEFERRED, reframed
+
+Matt's call: do NOT build procedural trees/vegetation this phase — good-looking
+cubic-voxel trees need real inputs (reference, iteration in a populated world)
+and getting them wrong looks worse than none. Decisions captured for when we do:
+
+| Topic | Decision |
+|---|---|
+| This phase's tree scope | A SINGLE stand-in tree (source/adapt an existing cubic-voxel tree model online) used ONLY as a test fixture — NOT M4 generation. Its purpose is to exercise the CHOP → DISCONNECT → FALL pipeline. This is really M5 (destruction physics) validation, not M4 vegetation. |
+| Tree generation (future) | Hybrid: hand-authored voxel archetypes per species + procedural per-instance variation (height/lean/branch/canopy jitter). |
+| Small flora (future) | Hybrid: bushes = true voxels (choppable, edit-log world); grass/flowers = cheap cosmetic instanced (non-interactive). |
+| Placement (future) | Grove/cluster logic — clustered noise for groves + clearings, density from biome+moisture; deterministic per-column hash. |
+
+### Reframe → M5 physics work (Matt flagged as significant)
+The stand-in tree becomes the concrete test case for the destruction physics
+that M5 needs anyway: chopping/mining voxels → connectivity flood-fill (DONE,
+voxelcore/connectivity.h) identifies the disconnected island → the island must
+FALL and settle/degrade as debris. Matt explicitly marks the FALLING-VOXEL
+handling (mined/chopped pieces that must fall, via Chaos rigid voxel debris
+bodies per plan §3.5) as substantial physics-engine work. Sequence: (1)
+stand-in tree fixture, (2) chop→connectivity→island detection wired in UE,
+(3) island → Chaos debris body that falls + settles, (4) THEN return to M4
+procedural vegetation once the destruction loop feels right.
+
 ## Pending design (next session with Matt)
 
 Round 2 — trees & structures: generation approach (procedural vs template
