@@ -125,4 +125,5 @@ namespace VoxelGI
 	VOXELEARTH_API float GetFadeStartUU();
 	VOXELEARTH_API float GetFadeEndUU();
 	VOXELEARTH_API int32 GetDebugLevel();
+	VOXELEARTH_API int32 GetDebugVis();
 }

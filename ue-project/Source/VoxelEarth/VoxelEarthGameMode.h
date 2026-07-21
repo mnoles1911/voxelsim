@@ -51,6 +51,19 @@ private:
 	FTimerHandle GITestShotTimerHandle;
 	FTimerHandle GITestQuitTimerHandle;
 
+	// -VoxelGICaveTest: find a real worldgen SINKHOLE near spawn, drop the
+	// camera into the cave under it and frame the daylight coming down the
+	// shaft. Same self-contained pose/capture/quit shape as -VoxelGITest.
+	FVector GICaveCameraUU = FVector::ZeroVector;
+	FRotator GICaveCameraRot = FRotator::ZeroRotator;
+	bool bGICaveFound = false;
+	FTimerHandle GICaveTestTimerHandle;
+	FTimerHandle GICavePoseTimerHandle;
+	FTimerHandle GICaveRepose1TimerHandle;
+	FTimerHandle GICaveRepose2TimerHandle;
+	FTimerHandle GICaveShotTimerHandle;
+	FTimerHandle GICaveQuitTimerHandle;
+
 	FTimerHandle ServerDumpDigestTimerHandle;
 	FTimerHandle ServerDigestQuitTimerHandle;
 
@@ -206,6 +219,12 @@ private:
 	// Scans for the tallest air pocket in the cave depth band around
 	// (OriginXUU, OriginYUU); returns false if nothing qualifying was found.
 	bool FindCaveVoid(class UVoxelWorldSubsystem& Subsystem, double OriginXUU, double OriginYUU, FVector& OutCenter) const;
+
+	// -VoxelGICaveTest: locate a pristine worldgen sinkhole (a column with
+	// continuous air from the surface into the cave band) and report the cave
+	// floor the daylight lands on.
+	bool FindSinkholeColumn(class UVoxelWorldSubsystem& Subsystem, double OriginXUU, double OriginYUU,
+	                        FVector& OutShaftBaseUU, double& OutSurfaceUU) const;
 	// Logs the tracked/component/quad state of the level-0 chunks in a vertical
 	// stack through Center -- the measurement that distinguishes "nothing is
 	// streamed down here" from "it is streamed but renders oddly".
