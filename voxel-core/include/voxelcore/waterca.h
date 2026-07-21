@@ -316,6 +316,7 @@
 // and exists for callers (tests, asserts) to cross-check the ledger
 // against actual stored state.
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <set>
@@ -519,7 +520,77 @@ public:
         setFillAccounted(vx, vy, vz, newFill, nullptr);
     }
 
+    // --- Cross-tick terrain-solidity cache (OPT-IN; OFF by default) --------
+    //
+    // WHAT IT IS. A pure MEMO of the caller-supplied `solid_` query, keyed by
+    // voxel, persisting ACROSS ticks (unlike stepWithOrder's `cachedSolid`,
+    // which is rebuilt every tick and therefore can never go stale). Memoizing
+    // a pure function cannot change its answers, so with the cache enabled the
+    // tick output is byte-for-byte identical to the uncached path FOR AS LONG
+    // AS the memo agrees with `solid_` — which is exactly the caller's
+    // obligation below. It is NOT a behavior change and does NOT bump
+    // kWaterCAVersion: cache OFF (the default) is bit-for-bit today's code
+    // path, and cache ON over unchanging terrain is bit-for-bit the same
+    // again (proved in-suite: waterca_static_terrain_cache_golden_digests
+    // re-derives BOTH pinned goldens with the cache enabled).
+    //
+    // WHY IT EXISTS. Profiling (docs/status.md, W2) puts 97-98% of the
+    // hydrostatic flood's cell pops on AIR (~900K/tick on the 441-column
+    // bench) and the dominant per-tick cost on the ~1us terrain `solid_`
+    // query over that air shell — NOT on the flood machinery, which a prior
+    // pass already made ~3x cheaper. That air shell is re-queried from
+    // scratch every tick even though terrain almost never changes. This cache
+    // collapses that repeat cost to a bit test.
+    //
+    // THE CALLER'S OBLIGATION (the whole safety contract, read this).
+    // Enabling the cache asserts: "`solid_` is a pure function of position,
+    // and I will tell WaterCA about EVERY change to it before the next
+    // step()." A caller whose terrain can be edited at runtime (digging,
+    // explosives, voxel placement, replicated world edits) MUST call
+    // invalidateSolidAt / invalidateSolidRegion for every voxel whose
+    // material changed — INCLUDING air->solid, not just solid->air — or call
+    // invalidateSolidCache() to drop everything. A missed invalidation is a
+    // SILENT DETERMINISM DIVERGENCE (water flowing through terrain that was
+    // dug away, or sitting inside terrain that was placed), which is exactly
+    // why this defaults to OFF: a caller opts in only once it can honour the
+    // contract. Static-terrain callers (the bench, every voxel-core test)
+    // satisfy it vacuously. See docs/adr/0003-hydrostatic-persistent-body.md
+    // for the live-engine plumbing this still needs before the UE water
+    // subsystem may enable it.
+    void setSolidCacheEnabled(bool on);
+    bool solidCacheEnabled() const { return solidCacheEnabled_; }
+
+    // Drops the memo for one voxel / an inclusive voxel box / everything.
+    // Cheap and always safe to over-invalidate (it is only a memo; dropping a
+    // still-valid entry costs one re-query, never a wrong answer).
+    void invalidateSolidAt(int64_t vx, int64_t vy, int64_t vz);
+    void invalidateSolidRegion(int64_t minVx, int64_t minVy, int64_t minVz, int64_t maxVx, int64_t maxVy,
+                               int64_t maxVz);
+    void invalidateSolidCache() { solidCache_.clear(); }
+
+    // Number of 8^3 bricks currently holding memoized solidity (diagnostics /
+    // tests; each costs 128 bytes of masks plus the map node).
+    size_t solidCacheBrickCount() const { return solidCache_.size(); }
+
 private:
+    // Per-brick memo of `solid_`: 512 "have I asked?" bits + 512 "was it
+    // solid?" bits, in WaterBrick8::cellIndex order. Dense masks rather than a
+    // hashed per-voxel map because the hydrostatic flood already resolves each
+    // brick exactly once per tick (see hydrostaticPass's BrickCell), so a
+    // pointer to this node turns every subsequent solidity question on that
+    // brick into a shift-and-test with no hashing at all.
+    struct SolidMaskBrick {
+        std::array<uint64_t, 8> known{};
+        std::array<uint64_t, 8> solid{};
+    };
+
+    // Hard bound on memo memory (128B of masks + node overhead per brick, so
+    // ~16MB of masks at this cap). Overflowing simply CLEARS the whole memo —
+    // safe by construction, since a memo miss only ever costs a re-query, and
+    // the clear happens at a point where no cached node pointer is live (top
+    // of hydrostaticPass, before any brick is resolved).
+    static constexpr size_t kMaxSolidCacheBricks = 1u << 17;
+
     bool isSolid(int64_t vx, int64_t vy, int64_t vz) const { return solid_(vx, vy, vz) != MAT_AIR; }
     uint8_t getFill(int64_t vx, int64_t vy, int64_t vz) const;
 
@@ -551,6 +622,8 @@ private:
                          std::set<BrickKey, BrickKeyLess>& changed);
 
     SolidFn solid_;
+    bool solidCacheEnabled_ = false;
+    std::unordered_map<BrickKey, SolidMaskBrick, BrickKeyHash> solidCache_;
     WaterMap water_;
     std::set<BrickKey, BrickKeyLess> active_;
     uint64_t totalVolume_ = 0;
