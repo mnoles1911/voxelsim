@@ -501,3 +501,182 @@ VXC_TEST(waterca_hydrostatic_large_pool_multibrick_golden) {
     ca.digest(d);
     CHECK_EQ(d.h, 0x56BC18914355A205ull);
 }
+
+// ---------------------------------------------------------------------------
+// Cross-tick terrain-solidity memo (waterca.h setSolidCacheEnabled)
+// ---------------------------------------------------------------------------
+// The memo is an OPT-IN cache of the caller's `solid_` query that survives
+// across ticks. Memoizing a pure function cannot change its answers, so with
+// the memo on the tick output must be byte-for-byte what the uncached path
+// produces -- these tests are the in-suite proof of exactly that, at the two
+// pinned goldens, tick-by-tick over a Phase-C-heavy scenario, under the
+// order-independence property, and (the one case where the memo is NOT
+// vacuously safe) across a live terrain edit with the invalidation hook.
+
+// A basin split by a removable divider wall at x==divX. `wallUp` is read
+// through a pointer so a test can DIG THE WALL AWAY between ticks -- the
+// runtime-editable-terrain case that the memo's invalidation contract exists
+// for (the live UE water subsystem's SolidFn is overlay-aware in exactly this
+// way; see docs/adr/0003-hydrostatic-persistent-body.md).
+namespace {
+WaterCA::SolidFn dividedBasin(const bool* wallUp, int64_t divX) {
+    return [wallUp, divX](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
+        if (vz <= 0) return MAT_ROCK;
+        if (vx < 0 || vx > 11 || vy < 0 || vy > 3) return MAT_ROCK;
+        if (*wallUp && vx == divX) return MAT_ROCK;
+        return MAT_AIR;
+    };
+}
+} // namespace
+
+// Both pinned goldens, re-derived with the memo ENABLED. If the memo ever
+// perturbed the flood's cell set, leveling, or write set, these constants --
+// the same ones waterca_deterministic_repeat_and_golden_digest and
+// waterca_hydrostatic_large_pool_multibrick_golden pin on the uncached path --
+// would move. They must not.
+VXC_TEST(waterca_solid_cache_golden_digests_unchanged) {
+    WaterCA a(basin(0, 2, 0, 2));
+    a.setSolidCacheEnabled(true);
+    CHECK(a.solidCacheEnabled());
+    a.addWater(1, 1, 30, 2795);
+    a.addWater(0, 0, 25, 150);
+    for (int i = 0; i < 40; ++i) a.step();
+    Digest da;
+    a.digest(da);
+    CHECK_EQ(da.h, 0x3D2224BE4A253404ull); // GOLDEN(waterca_container_scenario), memo on
+    CHECK(a.solidCacheBrickCount() > 0);   // the memo really was populated
+
+    WaterCA b(basin(0, 15, 0, 15));
+    b.setSolidCacheEnabled(true);
+    CHECK_EQ(b.addWater(7, 7, 30, 300000), uint32_t(300000));
+    CHECK(runToSettleCheckingConservation(b, 5000));
+    CHECK_EQ(b.totalVolume(), uint64_t(300000));
+    Digest db;
+    b.digest(db);
+    CHECK_EQ(db.h, 0x56BC18914355A205ull); // GOLDEN(waterca_large_pool_multibrick), memo on
+}
+
+// Tick-by-tick equality (not just at settling) between a memoized and an
+// unmemoized CA, over the U-bend -- so every single tick genuinely runs Phase
+// C cross-arm redistribution while the memo is being built up and hit.
+VXC_TEST(waterca_solid_cache_tick_by_tick_identical_to_uncached) {
+    WaterCA plain(uBend(0, 4));
+    WaterCA memo(uBend(0, 4));
+    memo.setSolidCacheEnabled(true);
+    plain.addWater(0, 0, 40, 2805);
+    memo.addWater(0, 0, 40, 2805);
+
+    for (int i = 0; i < 200; ++i) {
+        plain.step();
+        memo.step();
+        CHECK_EQ(plain.totalVolume(), memo.totalVolume());
+        CHECK_EQ(plain.activeBrickCount(), memo.activeBrickCount());
+        Digest dp, dm;
+        plain.digest(dp);
+        memo.digest(dm);
+        CHECK_EQ(dp.h, dm.h); // byte-identical EVERY tick, not just at the end
+    }
+}
+
+// The memo must not disturb order-independence either: same reversed-active-set
+// replay as waterca_hydrostatic_order_independent_and_deterministic, memo on.
+VXC_TEST(waterca_solid_cache_order_independent_and_deterministic) {
+    WaterCA sorted(uBend(0, 4));
+    WaterCA shuffled(uBend(0, 4));
+    sorted.setSolidCacheEnabled(true);
+    shuffled.setSolidCacheEnabled(true);
+    sorted.addWater(0, 0, 40, 2805);
+    shuffled.addWater(0, 0, 40, 2805);
+
+    for (int i = 0; i < 200; ++i) {
+        sorted.step();
+        std::vector<BrickKey> order = shuffled.activeSetSnapshot();
+        std::reverse(order.begin(), order.end());
+        shuffled.stepWithOrder(order);
+        Digest ds, dh;
+        sorted.digest(ds);
+        shuffled.digest(dh);
+        CHECK_EQ(ds.h, dh.h);
+    }
+}
+
+// The case the memo is NOT vacuously safe for: terrain edited under settled
+// water. A memoized CA that honours the invalidation contract must track an
+// unmemoized CA byte-for-byte across the edit; this is the executable spec for
+// what a caller owes WaterCA before it may enable the memo.
+VXC_TEST(waterca_solid_cache_invalidation_tracks_terrain_edit) {
+    bool wallUpPlain = true, wallUpMemo = true;
+    WaterCA plain(dividedBasin(&wallUpPlain, 5));
+    WaterCA memo(dividedBasin(&wallUpMemo, 5));
+    memo.setSolidCacheEnabled(true);
+
+    // Pour into the LEFT half only; let it settle against the divider.
+    plain.addWater(2, 2, 30, 20000);
+    memo.addWater(2, 2, 30, 20000);
+    for (int i = 0; i < 60; ++i) {
+        plain.step();
+        memo.step();
+    }
+    Digest d0p, d0m;
+    plain.digest(d0p);
+    memo.digest(d0m);
+    CHECK_EQ(d0p.h, d0m.h);
+    CHECK_EQ(int(plain.fillAt(8, 2, 1)), 0); // right half still dry: wall held
+    CHECK(memo.solidCacheBrickCount() > 0);  // and the divider IS memoized as solid
+
+    // Dig the divider out. The memoized CA is told; the water must now spread
+    // right in BOTH instances, identically, every tick.
+    wallUpPlain = false;
+    wallUpMemo = false;
+    memo.invalidateSolidRegion(5, 0, -8, 5, 3, 64);
+    // Terrain edits do not by themselves wake bricks (that is the caller's
+    // existing activation duty, unchanged by this memo) -- nudge both the same
+    // way so the comparison isolates the memo, not activation.
+    plain.addWater(2, 2, 30, 255);
+    memo.addWater(2, 2, 30, 255);
+
+    for (int i = 0; i < 400; ++i) {
+        plain.step();
+        memo.step();
+        CHECK_EQ(plain.totalVolume(), memo.totalVolume());
+        Digest dp, dm;
+        plain.digest(dp);
+        memo.digest(dm);
+        CHECK_EQ(dp.h, dm.h); // identical across and after the edit
+    }
+    CHECK(plain.fillAt(8, 2, 1) > 0); // water really did cross the removed wall
+    CHECK_EQ(plain.recomputeVolume(), plain.totalVolume());
+    CHECK_EQ(memo.recomputeVolume(), memo.totalVolume());
+}
+
+// Disabling the memo drops it entirely (never keep a cache we have stopped
+// maintaining), and a full invalidateSolidCache() is always safe: both leave
+// the CA on the plain path with identical results.
+VXC_TEST(waterca_solid_cache_disable_and_full_invalidate_are_safe) {
+    WaterCA plain(basin(0, 7, 0, 7));
+    WaterCA memo(basin(0, 7, 0, 7));
+    memo.setSolidCacheEnabled(true);
+    plain.addWater(3, 3, 30, 60000);
+    memo.addWater(3, 3, 30, 60000);
+
+    for (int i = 0; i < 120; ++i) {
+        plain.step();
+        memo.step();
+        if (i == 30) {
+            CHECK(memo.solidCacheBrickCount() > 0);
+            memo.invalidateSolidCache(); // full drop mid-run: only costs re-queries
+            CHECK_EQ(memo.solidCacheBrickCount(), size_t(0));
+        }
+        if (i == 60) {
+            memo.setSolidCacheEnabled(false); // turning it off clears it too
+            CHECK(!memo.solidCacheEnabled());
+            CHECK_EQ(memo.solidCacheBrickCount(), size_t(0));
+        }
+        if (i == 90) memo.setSolidCacheEnabled(true); // and back on, from cold
+        Digest dp, dm;
+        plain.digest(dp);
+        memo.digest(dm);
+        CHECK_EQ(dp.h, dm.h);
+    }
+    CHECK_EQ(plain.totalVolume(), memo.totalVolume());
+}

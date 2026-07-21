@@ -466,6 +466,49 @@ uint64_t WaterCA::recomputeVolume() const {
     return sum;
 }
 
+// --- Cross-tick terrain-solidity memo (see waterca.h for the safety
+// contract; this is plumbing only, no tick-rule content) ---------------------
+
+void WaterCA::setSolidCacheEnabled(bool on) {
+    solidCacheEnabled_ = on;
+    if (!on) solidCache_.clear(); // never keep a memo we have stopped maintaining
+}
+
+void WaterCA::invalidateSolidAt(int64_t vx, int64_t vy, int64_t vz) {
+    auto it = solidCache_.find(waterKeyForVoxel(vx, vy, vz));
+    if (it == solidCache_.end()) return;
+    const int ci = WaterBrick8::cellIndex(int(floorMod(vx, kEdge)), int(floorMod(vy, kEdge)),
+                                          int(floorMod(vz, kEdge)));
+    const uint64_t bit = 1ull << (ci & 63);
+    it->second.known[static_cast<size_t>(ci >> 6)] &= ~bit;
+    it->second.solid[static_cast<size_t>(ci >> 6)] &= ~bit;
+}
+
+void WaterCA::invalidateSolidRegion(int64_t minVx, int64_t minVy, int64_t minVz, int64_t maxVx,
+                                    int64_t maxVy, int64_t maxVz) {
+    if (solidCache_.empty()) return;
+    if (minVx > maxVx || minVy > maxVy || minVz > maxVz) return;
+    // Erase whole cached bricks rather than picking bits: a brick is the memo's
+    // unit, over-invalidation is always safe (a dropped-but-still-valid entry
+    // costs one re-query, never a wrong answer), and this keeps the cost
+    // proportional to bricks touched instead of voxels touched. A region so
+    // large that walking its bricks would cost more than a full re-memo just
+    // drops everything.
+    const int64_t bx0 = floorDiv(minVx, kEdge), bx1 = floorDiv(maxVx, kEdge);
+    const int64_t by0 = floorDiv(minVy, kEdge), by1 = floorDiv(maxVy, kEdge);
+    const int64_t bz0 = floorDiv(minVz, kEdge), bz1 = floorDiv(maxVz, kEdge);
+    const uint64_t spanned = uint64_t(bx1 - bx0 + 1) * uint64_t(by1 - by0 + 1) * uint64_t(bz1 - bz0 + 1);
+    if (spanned >= solidCache_.size()) {
+        solidCache_.clear();
+        return;
+    }
+    for (int64_t bz = bz0; bz <= bz1; ++bz)
+        for (int64_t by = by0; by <= by1; ++by)
+            for (int64_t bx = bx0; bx <= bx1; ++bx)
+                solidCache_.erase(BrickKey{static_cast<int32_t>(bx), static_cast<int32_t>(by),
+                                           static_cast<int32_t>(bz)});
+}
+
 void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
                               std::set<BrickKey, BrickKeyLess>& changed) {
     // --- Per-brick flood cache (W2 perf fix, docs/status.md) ----------------
@@ -487,11 +530,24 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
     // node references stay valid across later inserts (only iterators are
     // invalidated), so a `BrickCell&` held while resolving a neighbour brick
     // does not dangle.
+    //
+    // When the OPT-IN cross-tick solidity memo is enabled (waterca.h,
+    // setSolidCacheEnabled), each resolved brick ALSO carries a pointer to its
+    // persistent 512-bit known/solid mask pair, so the air-shell `solid_`
+    // query below — profiled as the dominant cost of this whole pass — becomes
+    // a shift-and-test on the second and every later tick. Memoizing a pure
+    // query never changes its answer, so this is byte-identical; the caller's
+    // invalidation obligation is what keeps the memo pure (see waterca.h).
     struct BrickCell {
         const WaterBrick8* water; // nullptr if the brick is absent (all-empty)
+        SolidMaskBrick* solidMask; // nullptr when the memo is disabled
         bool touched;
         std::array<uint64_t, 8> visited; // 512 bits in cellIndex order
     };
+    // Bound the memo BEFORE any node pointer below is taken: clearing it here
+    // is safe precisely because nothing holds a SolidMaskBrick* yet.
+    if (solidCacheEnabled_ && solidCache_.size() > kMaxSolidCacheBricks) solidCache_.clear();
+
     std::unordered_map<BrickKey, BrickCell, BrickKeyHash> cache;
     cache.reserve(touched.size() * 4);
 
@@ -500,6 +556,9 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
         if (it != cache.end()) return it->second;
         BrickCell bc;
         bc.water = water_.find(k);
+        // Node-based unordered_map: this reference stays valid across every
+        // later insert into solidCache_, exactly like `cache`'s own nodes.
+        bc.solidMask = solidCacheEnabled_ ? &solidCache_[k] : nullptr;
         bc.touched = touched.find(k) != touched.end();
         bc.visited.fill(0);
         return cache.emplace(k, bc).first->second;
@@ -655,10 +714,30 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
                                 // a redundant (~1us terrain) solid_ query.
                                 // Matching the old code's inclusion decision
                                 // exactly, just skipping the constant query.
-                                const int64_t nx = int64_t(nbk.x) * kEdge + nlx;
-                                const int64_t ny = int64_t(nbk.y) * kEdge + nly;
-                                const int64_t nz = int64_t(nbk.z) * kEdge + nlz;
-                                if (solid_(nx, ny, nz) != MAT_AIR) {
+                                bool cellIsSolid;
+                                if (nBrick.solidMask) {
+                                    // Cross-tick memo hit: shift-and-test, no
+                                    // terrain query at all. Same answer as
+                                    // solid_ by the purity contract.
+                                    const size_t w = static_cast<size_t>(nci >> 6);
+                                    const uint64_t bit = 1ull << (nci & 63);
+                                    if (nBrick.solidMask->known[w] & bit) {
+                                        cellIsSolid = (nBrick.solidMask->solid[w] & bit) != 0;
+                                    } else {
+                                        const int64_t nx = int64_t(nbk.x) * kEdge + nlx;
+                                        const int64_t ny = int64_t(nbk.y) * kEdge + nly;
+                                        const int64_t nz = int64_t(nbk.z) * kEdge + nlz;
+                                        cellIsSolid = solid_(nx, ny, nz) != MAT_AIR;
+                                        nBrick.solidMask->known[w] |= bit;
+                                        if (cellIsSolid) nBrick.solidMask->solid[w] |= bit;
+                                    }
+                                } else {
+                                    const int64_t nx = int64_t(nbk.x) * kEdge + nlx;
+                                    const int64_t ny = int64_t(nbk.y) * kEdge + nly;
+                                    const int64_t nz = int64_t(nbk.z) * kEdge + nlz;
+                                    cellIsSolid = solid_(nx, ny, nz) != MAT_AIR;
+                                }
+                                if (cellIsSolid) {
                                     markVisited(nBrick, nci);
                                     continue;
                                 }
