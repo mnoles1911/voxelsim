@@ -796,6 +796,24 @@ void UVoxelWaterSubsystem::NotifyTerrainRegionEdited(const VoxelCoords::FVoxelCo
 	}
 	Impl->CA.invalidateSolidRegion(MinVoxelIncl.X, MinVoxelIncl.Y, MinVoxelIncl.Z, MaxVoxelIncl.X, MaxVoxelIncl.Y,
 	                               MaxVoxelIncl.Z);
+
+	// ...and then actually WAKE the water this edit can affect. The memo
+	// invalidation above only fixes what the CA believes about terrain; without
+	// this call a settled body never ticks again and simply ignores the edit
+	// (see the header comment on this function, and voxelcore/waterca.h
+	// "Terrain-edit reactivation"). Scheduling only: no fill is written, so the
+	// conservation ledger is untouched. Water-bearing bricks only, within one
+	// brick of the edit -- an edit nowhere near water costs one bounded probe
+	// and wakes nothing.
+	const size_t Woken = Impl->CA.wakeRegion(MinVoxelIncl.X, MinVoxelIncl.Y, MinVoxelIncl.Z, MaxVoxelIncl.X,
+	                                         MaxVoxelIncl.Y, MaxVoxelIncl.Z);
+	if (Woken > 0)
+	{
+		UE_LOG(LogVoxelWater, Verbose,
+		       TEXT("NotifyTerrainRegionEdited: woke %d water brick(s) for edit [%d,%d,%d]..[%d,%d,%d]"),
+		       static_cast<int32>(Woken), MinVoxelIncl.X, MinVoxelIncl.Y, MinVoxelIncl.Z, MaxVoxelIncl.X,
+		       MaxVoxelIncl.Y, MaxVoxelIncl.Z);
+	}
 }
 
 bool UVoxelWaterSubsystem::IsSolidCacheEnabled() const

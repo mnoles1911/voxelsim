@@ -99,6 +99,18 @@ public:
 	// re-query, never a wrong answer), so callers may pass a conservative box
 	// rather than the exact edited-cell set. No-op on NM_Client and whenever
 	// the memo is disabled (nothing to invalidate either way).
+	//
+	// THIS ALSO WAKES THE WATER. Invalidating the memo only corrects what the
+	// CA BELIEVES about terrain; it does not make the CA look. Per
+	// voxelcore/waterca.h "Activity / settling", a settled body of water has
+	// left the active set entirely and step() over it is a no-op, so before
+	// vxc::WaterCA::wakeRegion existed a settled pond sat frozen through any
+	// dig/place/carve/collapse underneath or beside it (verified empirically:
+	// docs/status.md, "Water reactivation on terrain edits"). This hook is
+	// already called from EVERY authoritative edit path, so routing
+	// wakeRegion through it here is what makes water react to terrain edits
+	// at all. Waking writes no fill -- it is scheduling only, so
+	// GetWaterVolume() cannot move because of it.
 	void NotifyTerrainRegionEdited(const VoxelCoords::FVoxelCoord& MinVoxelIncl, const VoxelCoords::FVoxelCoord& MaxVoxelIncl);
 
 	// Diagnostic: whether the cross-tick solid_ memo (voxel.Water.SolidCacheEnabled)

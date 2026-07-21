@@ -6,7 +6,8 @@
 // appear ONLY in reporting (ms figures), never in world/CA math, matching
 // the rest of the bench harness (bench_main.cpp).
 //
-//   vxc_waterca_bench [--seed N] [--ticks N] [--solid-cache] [--count-queries] [--lake]
+//   vxc_waterca_bench [--seed N] [--ticks N] [--solid-cache] [--count-queries]
+//                     [--lake [--wake-edit]]
 //
 // Scenario: a large pour (many drop columns, big total volume) over real
 // bumpy terrain (SyntheticTileSampler + Amplifier, same solid-query source
@@ -76,7 +77,7 @@ WaterCA::SolidFn flatWalledBasin(int64_t halfSpan, uint32_t spin) {
     };
 }
 
-int runLake(int ticks, bool solidCache, int64_t kHalfSpan, uint32_t spin) {
+int runLake(int ticks, bool solidCache, int64_t kHalfSpan, uint32_t spin, bool wakeEdit) {
     WaterCA ca(flatWalledBasin(kHalfSpan, spin));
     ca.setSolidCacheEnabled(solidCache);
 
@@ -102,17 +103,38 @@ int runLake(int ticks, bool solidCache, int64_t kHalfSpan, uint32_t spin) {
 
     // Now the steady state we actually care about: one trivial disturbance per
     // tick against an otherwise unchanging body.
+    // --wake-edit: the WORST REALISTIC CASE for wakeRegion (waterca.h
+    // "Terrain-edit reactivation") -- a player-sized terrain edit landing on
+    // the rim of a large, fully settled lake EVERY SINGLE TICK, forever. This
+    // is the "does waking cost back the solidity memo's win?" measurement.
+    // Unlike the addWater disturbance it injects no volume: it only schedules,
+    // so any cost it shows is purely the reactivation the fix introduces.
     double sum = 0;
+    double wakeSum = 0;
+    size_t wokenTotal = 0;
     int n = 0;
     for (int t = 0; t < ticks; ++t) {
-        ca.addWater(-kHalfSpan, -kHalfSpan, 30, 1); // one unit, one corner
+        if (wakeEdit) {
+            // A 3x3x3-voxel dig on the lake floor's corner, moved along the rim
+            // so it is never the same brick two ticks running.
+            const int64_t x = -kHalfSpan + (t % (2 * kHalfSpan));
+            const auto w0 = Clock::now();
+            wokenTotal += ca.wakeRegion(x, -kHalfSpan, 0, x + 2, -kHalfSpan + 2, 2);
+            wakeSum += msSince(w0);
+        } else {
+            ca.addWater(-kHalfSpan, -kHalfSpan, 30, 1); // one unit, one corner
+        }
         const auto t0 = Clock::now();
         ca.step();
         sum += msSince(t0);
         ++n;
     }
-    std::printf("  disturbed-settled-lake avg step(): %.3f ms/tick over %d ticks\n", n ? sum / double(n) : 0.0,
-                n);
+    std::printf("  %s avg step(): %.3f ms/tick over %d ticks\n",
+                wakeEdit ? "wake-edit-per-tick settled lake" : "disturbed-settled-lake",
+                n ? sum / double(n) : 0.0, n);
+    if (wakeEdit)
+        std::printf("  wakeRegion() itself: %.6f ms/call avg, %zu bricks woken over %d calls\n",
+                    n ? wakeSum / double(n) : 0.0, wokenTotal, n);
     return 0;
 }
 
@@ -132,6 +154,7 @@ int main(int argc, char** argv) {
     bool lake = false;
     int64_t lakeSpan = 31; // --lake footprint is (2*span+1)^2
     uint32_t lakeSpin = 0;  // --lake-solid-spin: emulated per-query terrain cost
+    bool wakeEdit = false;  // --wake-edit: disturb the settled lake with terrain-edit wakes, not water
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--seed" && i + 1 < argc) seed = std::strtoull(argv[++i], nullptr, 10);
@@ -139,6 +162,7 @@ int main(int argc, char** argv) {
         else if (a == "--solid-cache") solidCache = true;
         else if (a == "--count-queries") countQueries = true;
         else if (a == "--lake") lake = true;
+        else if (a == "--wake-edit") wakeEdit = true;
         else if (a == "--lake-span" && i + 1 < argc) lakeSpan = std::atoi(argv[++i]);
         else if (a == "--lake-solid-spin" && i + 1 < argc)
             lakeSpin = static_cast<uint32_t>(std::atoi(argv[++i]));
@@ -150,7 +174,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (lake) return runLake(ticks, solidCache, lakeSpan, lakeSpin);
+    if (lake) return runLake(ticks, solidCache, lakeSpan, lakeSpin, wakeEdit);
 
     SyntheticTileSampler tiles(seed);
     Amplifier amp(seed, tiles);
