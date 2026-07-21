@@ -113,17 +113,22 @@ commit added new materials/biome constants to `worldgen.hlsl` itself (see
 legitimately changes the GPU output — the old digests are stale relative to
 current `HEAD`, not a bug in these shaders.
 
-**What was actually verified** (this pass, on this box, fresh rebuild from
-the pinned DXC + current `worldgen.hlsl`, using these exact committed
-`.spv` files via `vxc_gpu --spv .../prebuilt/...`):
+**What was actually verified** (2026-07 worldgen v3 pass, on this box, fresh
+rebuild from the pinned DXC + current `worldgen.hlsl`, using these exact
+committed `.spv` files via `vxc_gpu --spv .../prebuilt/...`):
 
 | Mode | Result | GPU output digest (columns+cells+quads) |
 |---|---|---|
-| default (2 regions, column+cell+quad compare) | **PASS**, 0 mismatches, 32768 columns / 786432 cells / 10739 quads | `1dbcabb01cfaf2bc` |
-| `--radius 64` | **PASS**, 0 mismatches, 144/144 tiles (100%) verified, gate 0.129s (< 1s target) | `95a82ba20200f6f2` |
-| `--radius 128` | **PASS**, 0 mismatches, 67/529 tiles (12.7%, every-8th sampled) verified, gate 0.259s (< 1s target) | `b4c8ec5d0966894b` |
+| default (2 regions, column+cell+quad compare) | **PASS**, 0 mismatches, 8192 columns / 360448 cells / 4997 quads | `e21e2767591496eb` |
+| `--radius 64` | **PASS**, 0 mismatches, 305/305 dispatch entries (144 tiles + 161 z-slabs, 100%) verified, gate 0.093-0.096s (< 1s target) | `346b60c292a26b5a` |
+| `--radius 128` | **PASS**, 0 mismatches, 136/1089 entries (12.5%, every-8th sampled) verified, gate 0.182-0.215s (< 1s target) | `75b737e961f65bf5` |
 
 Device: AMD Radeon RX 7800 XT.
+
+At kWorldGenVersion 2 the same three modes measured: default (128x128
+regions) `1dbcabb01cfaf2bc`, `--radius 64` `95a82ba20200f6f2` (144 tiles),
+`--radius 128` `b4c8ec5d0966894b` (529 tiles) — superseded by the v3 table
+above; see the next section for why every digest legitimately moved.
 
 Re-verified UNCHANGED after the 2026-07 signed-`%` fix above (same box, same
 three modes, freshly rebuilt `vxc_gpu` against these committed `.spv`): all
@@ -138,12 +143,44 @@ Re-verified UNCHANGED AGAIN after "respin 2: cross-vendor UB hardening" above
 guard is unreachable on valid input, identical digests are the expected
 result and the evidence that the guards changed no behavior.
 
+## 2026-07 re-verify 3: worldgen v3 spectral-gap terrain (kWorldGenVersion 2 -> 3)
+
+The **SPIR-V did not change** in this pass — all seven `.spv` files and the
+SHA-256 table above are byte-identical to respin 2. What changed is the CPU
+reference itself: `SyntheticTileSampler` gained four elevation octaves at
+480/240/120/60 m wavelength (the terrain-realism audit's spectral-gap fix,
+`vxc::kWorldGenVersion` 2 -> 3). The tile raster is host-generated and
+uploaded as a buffer, so the shaders consume the new terrain with zero
+shader edits; every digest legitimately moved because the WORLD moved, and
+the gate re-passed bit-exact on the same committed bytecode.
+
+Two `gpu_harness.cpp` changes rode along, both forced by the rougher v3
+relief and affecting dispatch shapes (never per-quad output):
+
+1. **Gate mode splits tall tiles into z-slabs** (`ZWindow`,
+   `kMaxSlabInteriorLayers = 6`). v3 terrain routinely produces gate tiles
+   taller than 6 interior brick layers (125/144 tiles at `--radius 64`),
+   i.e. maskCounts past ScanSumsMain's single-workgroup 65,536-mask
+   capacity. The gate path previously had NO guard for that (unlike
+   `runMeshChain()`'s FATAL): masks past the capacity silently missed their
+   scanned block base, MeshEmitMain wrote their quads at bogus offsets on
+   top of the early stream, and the corruption was nondeterministic across
+   runs. This was a live, silent correctness bug in the harness, latent at
+   v2 only because v2's flat terrain never exceeded 6 interior layers.
+   Slabs partition a tall tile's interior layers exactly (1-brick shared
+   halo, ascending z, inline in the work order), so every brick is still
+   meshed exactly once and the digest/compare order stays deterministic.
+   prepTileCpu now FATALs if a dispatch could still exceed the capacity.
+2. **Default regions shrank from 128x128 to 64x64 columns** — the origin
+   fixture at v3 needs 10 brick layers (75,264 masks), which tripped
+   `runMeshChain()`'s FATAL. At 64x64 (6x6-brick interior, 1,728 masks per
+   layer) the capacity needs >37 interior layers to overflow: unreachable
+   for surface terrain. The gate mode still exercises the full 128x128
+   dispatch shape.
+
 These three digests — not the older status.md ones — are the values the
 NVIDIA leg (`tools/run-nvidia-digest.sh`) must reproduce to close the M0
-cross-vendor gate. `docs/status.md` should get its determinism row refreshed
-against these current values as a separate follow-up (out of scope for this
-pass, which only appends a new subsection — see this repo's `docs/status.md`
-"Linux/NVIDIA cross-vendor determinism runner" entry).
+cross-vendor gate (run it from a checkout at or after worldgen v3).
 
 ## Regenerating
 

@@ -178,7 +178,7 @@ VXC_TEST(rivernet_determinism_golden_digest) {
     netA.digest(dA);
     netB.digest(dB);
     CHECK_EQ(dA.h, dB.h);
-    CHECK_EQ(dA.h, 0xE4944F92B37F60FBull); // GOLDEN(rivernet_synthetic_slope)
+    CHECK_EQ(dA.h, 0xA4D30E5715339878ull); // GOLDEN(rivernet_synthetic_slope) — kWorldGenVersion 3: synthetic-tile spectral-gap octaves (was 0xE4944F92B37F60FB at v2)
 }
 
 VXC_TEST(rivernet_graph_diff_dam_replay_matches_live) {

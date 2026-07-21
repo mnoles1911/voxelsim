@@ -37,12 +37,25 @@ public:
     int32_t pixelSizeMm() const override { return pixelSizeMm_; }
 
     int32_t elevationMm(int64_t px, int64_t py) override {
-        // Octaves in pixel units (lattice sizes 512/128/32 px), amplitudes in
-        // metres; slight negative bias creates oceans/coastlines.
+        // Octaves in pixel units, amplitudes in metres; slight negative bias
+        // creates oceans/coastlines. Lattices 512/128/32 px are the original
+        // continental octaves (wavelengths 15.36 km / 3.84 km / 0.96 km at
+        // 30 m pixels). Lattices 16/8/4/2 px (480/240/120/60 m) fill the
+        // former 960 m -> 25.6 m spectral gap with a ~lambda^0.9 amplitude
+        // ramp so sub-km landforms exist (terrain-realism audit, worldgen v3);
+        // 2 px = 60 m is Nyquist for the 30 m raster. Channels +5..+7 are
+        // left free for future climate channels (+3/+4 in use below).
         const int64_t n0 = valueNoise2(seed_, px, py, 512, CH_SYNTH_TILE_BASE + 0);
         const int64_t n1 = valueNoise2(seed_, px, py, 128, CH_SYNTH_TILE_BASE + 1);
         const int64_t n2 = valueNoise2(seed_, px, py, 32, CH_SYNTH_TILE_BASE + 2);
-        const int64_t m = (n0 * 1400 + n1 * 450 + n2 * 130) / 32768 - 120;
+        const int64_t n3 = valueNoise2(seed_, px, py, 16, CH_SYNTH_TILE_BASE + 8);
+        const int64_t n4 = valueNoise2(seed_, px, py, 8, CH_SYNTH_TILE_BASE + 9);
+        const int64_t n5 = valueNoise2(seed_, px, py, 4, CH_SYNTH_TILE_BASE + 10);
+        const int64_t n6 = valueNoise2(seed_, px, py, 2, CH_SYNTH_TILE_BASE + 11);
+        const int64_t m = (n0 * 1400 + n1 * 450 + n2 * 130 + n3 * 70 + n4 * 38 +
+                           n5 * 20 + n6 * 11) /
+                              32768 -
+                          120;
         return static_cast<int32_t>(m * 1000);
     }
 

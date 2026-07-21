@@ -8,7 +8,9 @@ namespace vxc {
 
 // Bumped on any deliberate change to worldgen math (hash, octave tables,
 // stratigraphy constants). Invalidates edit logs and golden digests.
-inline constexpr uint32_t kWorldGenVersion = 2;
+// v3: SyntheticTileSampler spectral-gap fill — 4 new elevation octaves at
+// 480/240/120/60 m wavelength (70/38/20/11 m amplitude), terrain-realism audit.
+inline constexpr uint32_t kWorldGenVersion = 3;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 
