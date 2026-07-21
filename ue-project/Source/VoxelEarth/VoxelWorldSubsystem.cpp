@@ -11,6 +11,7 @@
 // shared relay actor itself). Both are ordinary same-module UE classes, not
 // the voxel-core boundary, so including them from this .cpp is fine.
 #include "VoxelEarthPlayerController.h"
+#include "VoxelDebris.h" // M5 destruction: cosmetic falling-debris actor spawned for each detached island
 #include "VoxelEditRelay.h"
 // W2 dig-breach hook (docs/voxel-earth-implementation-plan.md SS3.7 item 2):
 // TryDig/CarveSphere notify the water subsystem of newly-cleared voxels so
@@ -23,6 +24,7 @@
 // module .cpp (doctrine: never from a header UHT parses -- see
 // VoxelWorldSubsystem.h / VoxelChunkComponent.h, both voxel-core-free).
 #include "voxelcore/bytes.h"
+#include "voxelcore/connectivity.h" // M5 destruction: findDisconnectedIslands over the edited region
 #include "voxelcore/counters.h"
 #include "voxelcore/editcompact.h" // M3 wave 2: compactLog for save-to-disk + join-sync compaction
 #include "voxelcore/hash.h"
@@ -69,6 +71,18 @@
 // voxel-core-free; check the two never drift apart.
 static_assert(vxc::kVoxelSizeMm == int32(VoxelCoords::VoxelSizeUU) * 10,
               "VoxelCoords::VoxelSizeUU (UE units) must track vxc::kVoxelSizeMm (mm)");
+
+// M5 destruction (first slice, docs/voxel-earth-implementation-plan.md SS3.5):
+// gates the connectivity-flood-fill "did this edit detach a floating island?"
+// pass that runs after every solid-removing dig/carve on the authority. On by
+// default -- with no trees/structures in the world yet it is a near-no-op
+// (normal terrain digs never detach an island; see PromoteDetachedIslands), so
+// standalone terrain/edit RESULTS are byte-identical whether it is on or off;
+// this switch exists to disable the extra per-edit scan cost if ever needed.
+static TAutoConsoleVariable<bool> CVarVoxelDestructionEnabled(
+	TEXT("voxel.Destruction.Enabled"), true,
+	TEXT("M5: run connectivity island-detection after solid-removing edits and promote detached islands to falling debris."),
+	ECVF_Default);
 
 namespace
 {
@@ -1182,6 +1196,31 @@ private:
 	// empty.
 	void ApplyGroupedEdits(std::unordered_map<vxc::BrickKey, std::vector<vxc::EditCell>, vxc::BrickKeyHash>& EditsByBrick,
 	                        const TSet<VoxelCoords::FVoxelChunkKey>& DirtyChunks);
+
+	// --- M5 destruction (first slice, docs/voxel-earth-implementation-plan.md SS3.5) ---
+	// public: called by the subsystem's SpawnTreeFixtureAt and the file-scope
+	// PromoteDetachedIslands chop hook (same access shape as Voxels/log() reached
+	// by BroadcastNewEntries).
+public:
+	// Writes Coords (world voxel-lattice) as solid Material through the exact
+	// same edit-log authority path a dig/place uses (one World::applyEdit per
+	// brick + dirty-chunk re-mesh). Used to stamp the stand-in tree TEST
+	// FIXTURE (docs/m4-plan.md Round 2 -- NOT M4 vegetation). Returns the count
+	// actually written. Authority side; caller replicates via BroadcastNewEntries.
+	int32 StampVoxels(const TArray<VoxelCoords::FVoxelCoord>& Coords, uint8 Material);
+
+	// After a solid-removing edit whose cleared voxels are ClearedVoxels, runs
+	// vxc::findDisconnectedIslands over a bounded region around them (see the
+	// .cpp for the region/anchor policy) and, for every detached island,
+	// REMOVES its voxels from the authoritative grid via the edit-log path
+	// (deterministic + replicated -- the authoritative half of the split). The
+	// removed islands' world coords are returned in OutIslands so the caller
+	// (subsystem, which has UWorld) can spawn the COSMETIC AVoxelDebris bodies.
+	// bOutRegionClamped is set true if the region hit the size cap. Returns the
+	// island count. No-op returning 0 if ClearedVoxels is empty.
+	int32 DetectAndRemoveIslands(const TArray<VoxelCoords::FVoxelCoord>& ClearedVoxels,
+	                             TArray<TArray<VoxelCoords::FVoxelCoord>>& OutIslands, bool& bOutRegionClamped);
+private:
 
 	// --- Debug-tooling helpers (docs/debug-tooling-plan.md P1) ----------------
 	void UpdatePerfSnapshot(float DeltaTime, float TickMs);
@@ -2297,6 +2336,197 @@ void FVoxelWorldImpl::ApplyGroupedEdits(std::unordered_map<vxc::BrickKey, std::v
 	SortPendingQueues(LastAnchorLocation);
 }
 
+// --- M5 destruction (first slice, docs/voxel-earth-implementation-plan.md SS3.5) ---
+
+int32 FVoxelWorldImpl::StampVoxels(const TArray<VoxelCoords::FVoxelCoord>& Coords, uint8 Material)
+{
+	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
+	std::unordered_map<vxc::BrickKey, std::vector<vxc::EditCell>, vxc::BrickKeyHash> EditsByBrick;
+	TSet<VoxelCoords::FVoxelChunkKey> DirtyChunks;
+	for (const VoxelCoords::FVoxelCoord& V : Coords)
+	{
+		const vxc::BrickKey BKey = vxc::ChunkMap<B>::keyForVoxel(V.X, V.Y, V.Z);
+		const int LocalX = (int)vxc::floorMod(V.X, B);
+		const int LocalY = (int)vxc::floorMod(V.Y, B);
+		const int LocalZ = (int)vxc::floorMod(V.Z, B);
+		const uint16_t Cell = (uint16_t)vxc::Brick<B>::cellIndex(LocalX, LocalY, LocalZ);
+		EditsByBrick[BKey].push_back(vxc::EditCell{Cell, (vxc::MaterialId)Material});
+		CollectDirtyChunks(V.X, V.Y, V.Z, DirtyChunks);
+	}
+	if (EditsByBrick.empty())
+	{
+		return 0;
+	}
+	const int32 Count = Coords.Num();
+	ApplyGroupedEdits(EditsByBrick, DirtyChunks);
+	return Count;
+}
+
+int32 FVoxelWorldImpl::DetectAndRemoveIslands(const TArray<VoxelCoords::FVoxelCoord>& ClearedVoxels,
+                                              TArray<TArray<VoxelCoords::FVoxelCoord>>& OutIslands, bool& bOutRegionClamped)
+{
+	bOutRegionClamped = false;
+	if (ClearedVoxels.Num() == 0)
+	{
+		return 0;
+	}
+
+	// --- Analysis region ----------------------------------------------------
+	// AABB of the just-cleared voxels, expanded into the volume where a
+	// detached piece could live. A chop severs a piece ABOVE the cut, so we
+	// grow generously upward (MarginZUp) to capture the whole piece and
+	// modestly outward (MarginXY) so the piece sits INTERIOR to the region --
+	// which is what keeps the anchor policy below safe. MarginZDown reaches
+	// one layer below the cut, where the still-grounded stump/terrain sits.
+	constexpr int64 MarginXY = 10;
+	constexpr int64 MarginZDown = 3;
+	constexpr int64 MarginZUp = 48;
+	// Hard caps so a giant edit can never scan the world (connectivity.h is a
+	// dense O(volume) scan). Clamping only ever SHRINKS the region, which under
+	// the boundary anchor below can only anchor MORE voxels -- it can miss a
+	// far-flung island but never falsely promote grounded terrain.
+	constexpr int64 RegionMaxXY = 48;
+	constexpr int64 RegionMaxZ = 128;
+
+	int64 MinX = INT64_MAX, MinY = INT64_MAX, MinZ = INT64_MAX;
+	int64 MaxX = INT64_MIN, MaxY = INT64_MIN, MaxZ = INT64_MIN;
+	for (const VoxelCoords::FVoxelCoord& V : ClearedVoxels)
+	{
+		MinX = FMath::Min(MinX, V.X);
+		MinY = FMath::Min(MinY, V.Y);
+		MinZ = FMath::Min(MinZ, V.Z);
+		MaxX = FMath::Max(MaxX, V.X);
+		MaxY = FMath::Max(MaxY, V.Y);
+		MaxZ = FMath::Max(MaxZ, V.Z);
+	}
+
+	vxc::VoxelCoord RegionMin{MinX - MarginXY, MinY - MarginXY, MinZ - MarginZDown};
+	vxc::VoxelCoord RegionMax{MaxX + MarginXY, MaxY + MarginXY, MaxZ + MarginZUp};
+
+	// Clamp each axis to its cap, keeping the cleared-AABB centre in view.
+	auto ClampAxis = [&bOutRegionClamped](int64& Lo, int64& Hi, int64 Cap)
+	{
+		if (Hi - Lo + 1 > Cap)
+		{
+			const int64 Centre = (Lo + Hi) / 2;
+			Lo = Centre - Cap / 2;
+			Hi = Lo + Cap - 1;
+			bOutRegionClamped = true;
+		}
+	};
+	ClampAxis(RegionMin.x, RegionMax.x, RegionMaxXY);
+	ClampAxis(RegionMin.y, RegionMax.y, RegionMaxXY);
+	ClampAxis(RegionMin.z, RegionMax.z, RegionMaxZ);
+
+	// If the edit is larger than the cap, the bounded region can no longer
+	// CONTAIN the affected piece with margin -- the boundary-except-top anchor
+	// below is only SOUND when the region fully surrounds the candidate island
+	// (otherwise a big ragged carve produces hundreds of interior fragments and
+	// terrain whose support merely exits the clamped box gets mis-flagged). So
+	// a clamped region SKIPS detection entirely rather than run it unsoundly.
+	// Consequence (documented v0 limitation, docs/status.md): large edits
+	// (explosive craters) do NOT detach islands this slice -- structural
+	// collapse of big spans is later M5 work. A controlled chop (the tree test,
+	// a normal small dig) stays well under the cap and is fully handled.
+	if (bOutRegionClamped)
+	{
+		UE_LOG(LogVoxelEdit, Log,
+		       TEXT("Destruction: edit region exceeded cap (%lldx%lldx%lld) -- island detection skipped (large-edit collapse is a follow-up)"),
+		       (long long)RegionMaxXY, (long long)RegionMaxXY, (long long)RegionMaxZ);
+		return 0;
+	}
+
+	// Ragged carves (jittered CarveSphere) can genuinely isolate a handful of
+	// single voxels at the blast edge; promoting each to its own debris body is
+	// noise, not gameplay. Only islands of at least this many voxels become
+	// debris (smaller floating chips are left in the grid for this slice).
+	constexpr int32 MinIslandVoxels = 16;
+	// Safety valve so one pathological edit can never spawn an unbounded number
+	// of debris actors.
+	constexpr int32 MaxIslandsPerEdit = 16;
+
+	// --- Connectivity flood-fill -------------------------------------------
+	// solidFn: overlay-aware materialAt (edits already applied by the caller's
+	// dig/carve, so the just-removed voxels read as air here).
+	const auto SolidFn = [this](int64_t x, int64_t y, int64_t z) { return Voxels.materialAt(x, y, z) != vxc::MAT_AIR; };
+	// anchorFn: a solid voxel is "grounded" if it touches ANY region boundary
+	// face EXCEPT the top -- reaching a side/bottom face means it plausibly
+	// continues into the standing world outside this bounded box (connectivity.h
+	// warns that out-of-box voxels are never consulted). Only a piece fully
+	// interior to the region -- exactly a severed chunk with margin around it --
+	// counts as a floating island. This is strictly safer than the header's
+	// bottomFaceAnchor: it never deletes terrain whose support exits sideways.
+	const vxc::VoxelCoord RMin = RegionMin, RMax = RegionMax;
+	const auto AnchorFn = [RMin, RMax](int64_t x, int64_t y, int64_t z)
+	{
+		return x == RMin.x || x == RMax.x || y == RMin.y || y == RMax.y || z == RMin.z; // NOT z == RMax.z (top)
+	};
+
+	const vxc::IslandAnalysis Analysis = vxc::findDisconnectedIslands(SolidFn, RegionMin, RegionMax, AnchorFn);
+
+	UE_LOG(LogVoxelEdit, Log,
+	       TEXT("Destruction: region=[(%lld,%lld,%lld)..(%lld,%lld,%lld)]%s components=%d anchored=%d islands=%d"),
+	       (long long)RegionMin.x, (long long)RegionMin.y, (long long)RegionMin.z, (long long)RegionMax.x,
+	       (long long)RegionMax.y, (long long)RegionMax.z, bOutRegionClamped ? TEXT(" (CLAMPED)") : TEXT(""),
+	       Analysis.connectivity.componentCount, (int)Analysis.anchoredComponentIndices.size(),
+	       (int)Analysis.islandComponentIndices.size());
+
+	if (Analysis.islandComponentIndices.empty())
+	{
+		return 0;
+	}
+
+	// --- Remove each island from the authoritative grid (edit-log path) -----
+	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
+	int32 IslandCount = 0;
+	int32 SkippedSmall = 0;
+	for (int32 CompIdx : Analysis.islandComponentIndices)
+	{
+		const vxc::Component& Comp = Analysis.connectivity.components[CompIdx];
+		if ((int32)Comp.voxels.size() < MinIslandVoxels)
+		{
+			++SkippedSmall;
+			continue; // too small to be worth a debris body -- leave it in the grid
+		}
+		if (IslandCount >= MaxIslandsPerEdit)
+		{
+			UE_LOG(LogVoxelEdit, Log, TEXT("Destruction: island cap (%d) reached -- remaining islands left in place this edit"),
+			       MaxIslandsPerEdit);
+			break;
+		}
+		std::unordered_map<vxc::BrickKey, std::vector<vxc::EditCell>, vxc::BrickKeyHash> EditsByBrick;
+		TSet<VoxelCoords::FVoxelChunkKey> DirtyChunks;
+		TArray<VoxelCoords::FVoxelCoord> IslandCoords;
+		IslandCoords.Reserve((int32)Comp.voxels.size());
+		for (const vxc::VoxelCoord& V : Comp.voxels)
+		{
+			const vxc::BrickKey BKey = vxc::ChunkMap<B>::keyForVoxel(V.x, V.y, V.z);
+			const int LocalX = (int)vxc::floorMod(V.x, B);
+			const int LocalY = (int)vxc::floorMod(V.y, B);
+			const int LocalZ = (int)vxc::floorMod(V.z, B);
+			const uint16_t Cell = (uint16_t)vxc::Brick<B>::cellIndex(LocalX, LocalY, LocalZ);
+			EditsByBrick[BKey].push_back(vxc::EditCell{Cell, vxc::MAT_AIR});
+			CollectDirtyChunks(V.x, V.y, V.z, DirtyChunks);
+			IslandCoords.Add(VoxelCoords::FVoxelCoord{V.x, V.y, V.z});
+		}
+		if (EditsByBrick.empty())
+		{
+			continue;
+		}
+		ApplyGroupedEdits(EditsByBrick, DirtyChunks);
+		UE_LOG(LogVoxelEdit, Log, TEXT("Destruction: island %d promoted -> %d voxels removed from static grid (edit-log)"),
+		       IslandCount, IslandCoords.Num());
+		OutIslands.Add(MoveTemp(IslandCoords));
+		++IslandCount;
+	}
+	if (SkippedSmall > 0)
+	{
+		UE_LOG(LogVoxelEdit, Log, TEXT("Destruction: %d sub-%d-voxel chip(s) left in grid (below MinIslandVoxels)"), SkippedSmall,
+		       MinIslandVoxels);
+	}
+	return IslandCount;
+}
+
 // --- debug-tooling helpers (docs/debug-tooling-plan.md P1) -----------------
 
 void FVoxelWorldImpl::UpdatePerfSnapshot(float DeltaTime, float TickMs)
@@ -2911,6 +3141,51 @@ void BroadcastNewEntries(FVoxelWorldImpl& Impl, UWorld& World)
 	}
 }
 
+// M5 destruction (first slice): the chop hook. Runs after an authoritative
+// solid-removing edit. Detects disconnected islands in the affected region and
+// removes each from the authoritative grid (deterministic + edit-log, done
+// inside DetectAndRemoveIslands -- the AUTHORITATIVE half), then spawns one
+// cosmetic AVoxelDebris body per island (the COSMETIC half; skipped on a
+// dedicated server, which has no viewport). MUST be called BEFORE
+// BroadcastNewEntries so the island-removal entries replicate together with the
+// triggering dig. See docs/status.md "M5 -- Destruction" for the split.
+void PromoteDetachedIslands(FVoxelWorldImpl& Impl, UWorld& World, const TArray<VoxelCoords::FVoxelCoord>& ClearedVoxels)
+{
+	if (!CVarVoxelDestructionEnabled.GetValueOnGameThread())
+	{
+		return;
+	}
+	TArray<TArray<VoxelCoords::FVoxelCoord>> Islands;
+	bool bRegionClamped = false;
+	const int32 IslandCount = Impl.DetectAndRemoveIslands(ClearedVoxels, Islands, bRegionClamped);
+	if (IslandCount <= 0)
+	{
+		return;
+	}
+
+	// Cosmetic debris bodies: only where there is something to look at.
+	if (World.GetNetMode() == NM_DedicatedServer)
+	{
+		return;
+	}
+	int32 Spawned = 0;
+	for (const TArray<VoxelCoords::FVoxelCoord>& Island : Islands)
+	{
+		if (Island.Num() == 0)
+		{
+			continue;
+		}
+		AVoxelDebris* Debris = World.SpawnActor<AVoxelDebris>();
+		if (Debris)
+		{
+			Debris->InitFromIsland(Island);
+			++Spawned;
+		}
+	}
+	UE_LOG(LogVoxelEdit, Log, TEXT("Destruction: %d island(s) promoted, %d cosmetic debris actor(s) spawned"), IslandCount,
+	       Spawned);
+}
+
 // M3 wave 2 persistence (docs/m3-plan.md "Save/load") -----------------------
 //
 // Saved/VoxelWorlds/<seed>.vxlog, using vxc::EditLog::serialize's
@@ -3279,19 +3554,31 @@ bool UVoxelWorldSubsystem::TryDig(const FVector& CameraWorldLocation, const FVec
 
 	FEditsByBrick DugCells;
 	const bool bApplied = Impl->TryDig(CameraWorldLocation, CameraWorldDirection, SizeVoxels, &DugCells);
-	if (bApplied && World && (NetMode == NM_DedicatedServer || NetMode == NM_ListenServer))
-	{
-		BroadcastNewEntries(*Impl, *World);
-	}
-	// W2 dig-breach hook (task item 2): authority-only, same NetMode gate as
-	// the broadcast above but ALSO fires on NM_Standalone (single-player has
-	// no relay to broadcast to, but water breach seeding still applies).
 	if (bApplied && World && NetMode != NM_Client)
 	{
+		// Voxels this dig cleared (dig-style MAT_AIR writes), shared by the M5
+		// chop hook and the W2 water-breach hook below.
+		TArray<VoxelCoords::FVoxelCoord> ClearedVoxels;
+		ExtractClearedVoxelCoords(DugCells, ClearedVoxels);
+
+		// M5 chop hook (docs/voxel-earth-implementation-plan.md SS3.5): detach +
+		// remove any floating island this dig severed. Runs BEFORE the broadcast
+		// so the island-removal edit entries replicate together with the dig
+		// (they are appended to the same log). Also spawns cosmetic debris.
+		PromoteDetachedIslands(*Impl, *World, ClearedVoxels);
+
+		// Same NetMode gate as before, but now AFTER the chop hook so the
+		// broadcast covers both the dig and any island removals it triggered.
+		if (NetMode == NM_DedicatedServer || NetMode == NM_ListenServer)
+		{
+			BroadcastNewEntries(*Impl, *World);
+		}
+
+		// W2 dig-breach hook (task item 2): fires on any authority role incl.
+		// NM_Standalone (single-player has no relay to broadcast to, but water
+		// breach seeding still applies).
 		if (UVoxelWaterSubsystem* WaterSubsystem = World->GetSubsystem<UVoxelWaterSubsystem>())
 		{
-			TArray<VoxelCoords::FVoxelCoord> ClearedVoxels;
-			ExtractClearedVoxelCoords(DugCells, ClearedVoxels);
 			WaterSubsystem->NotifyTerrainVoxelsCleared(ClearedVoxels);
 		}
 	}
@@ -3400,19 +3687,25 @@ int32 UVoxelWorldSubsystem::CarveSphere(const FVector& CenterUU, double RadiusUU
 
 	FEditsByBrick CarvedCells;
 	const int32 Removed = Impl->CarveSphere(CenterUU, RadiusUU, JitterUU, &CarvedCells);
-	if (Removed > 0 && World && (NetMode == NM_DedicatedServer || NetMode == NM_ListenServer))
-	{
-		BroadcastNewEntries(*Impl, *World);
-	}
-	// W2 dig-breach hook (task item 2): CarveSphere is the explosive/crater
-	// carve path -- same breach rule as TryDig above (a crater opened below
-	// sea level adjacent to open ocean floods).
 	if (Removed > 0 && World && NetMode != NM_Client)
 	{
+		TArray<VoxelCoords::FVoxelCoord> ClearedVoxels;
+		ExtractClearedVoxelCoords(CarvedCells, ClearedVoxels);
+
+		// M5 chop hook: CarveSphere is the explosive/crater carve path AND the
+		// -VoxelChopTest trunk cut -- a carve that severs a piece detaches it
+		// here (runs before the broadcast, same as TryDig).
+		PromoteDetachedIslands(*Impl, *World, ClearedVoxels);
+
+		if (NetMode == NM_DedicatedServer || NetMode == NM_ListenServer)
+		{
+			BroadcastNewEntries(*Impl, *World);
+		}
+
+		// W2 dig-breach hook (task item 2): a crater opened below sea level
+		// adjacent to open ocean floods.
 		if (UVoxelWaterSubsystem* WaterSubsystem = World->GetSubsystem<UVoxelWaterSubsystem>())
 		{
-			TArray<VoxelCoords::FVoxelCoord> ClearedVoxels;
-			ExtractClearedVoxelCoords(CarvedCells, ClearedVoxels);
 			WaterSubsystem->NotifyTerrainVoxelsCleared(ClearedVoxels);
 		}
 	}
@@ -3422,6 +3715,70 @@ int32 UVoxelWorldSubsystem::CarveSphere(const FVector& CenterUU, double RadiusUU
 FVoxelPerfSnapshot UVoxelWorldSubsystem::GetPerfSnapshot() const
 {
 	return Impl ? Impl->GetPerfSnapshot() : FVoxelPerfSnapshot{};
+}
+
+int32 UVoxelWorldSubsystem::SpawnTreeFixtureAt(double WorldX, double WorldY)
+{
+	if (!Impl)
+	{
+		return 0;
+	}
+
+	// TEST FIXTURE geometry (docs/m4-plan.md Round 2 -- NOT M4 vegetation): a
+	// 2x2 trunk column rooted on the surface + a spherical canopy blob above
+	// it, both solid MAT_ROCK, all written through the edit-log authority path.
+	// Deliberately blocky/simple -- its only job is to be a connected solid the
+	// chop test can sever so the canopy detaches as an island.
+	const double SurfaceUU = GetSurfaceHeightUU(WorldX, WorldY);
+	const int64 BaseVx = (int64)FMath::FloorToDouble(WorldX / VoxelCoords::VoxelSizeUU);
+	const int64 BaseVy = (int64)FMath::FloorToDouble(WorldY / VoxelCoords::VoxelSizeUU);
+	const int64 BaseVz = (int64)FMath::FloorToDouble(SurfaceUU / VoxelCoords::VoxelSizeUU) + 1; // first voxel above the surface
+
+	constexpr int64 TrunkHeight = 24; // 2.4m
+	constexpr int64 CanopyRadius = 6; // ~1.2m blob
+
+	TSet<VoxelCoords::FVoxelCoord> TreeVoxels; // set dedupes the trunk/canopy overlap
+	for (int64 Dz = 0; Dz < TrunkHeight; ++Dz)
+	{
+		for (int64 Dy = 0; Dy < 2; ++Dy)
+		{
+			for (int64 Dx = 0; Dx < 2; ++Dx)
+			{
+				TreeVoxels.Add(VoxelCoords::FVoxelCoord{BaseVx + Dx, BaseVy + Dy, BaseVz + Dz});
+			}
+		}
+	}
+	const int64 Ccx = BaseVx, Ccy = BaseVy, Ccz = BaseVz + TrunkHeight; // canopy centre overlaps the trunk top (stays connected)
+	const int64 R2 = CanopyRadius * CanopyRadius;
+	for (int64 Dz = -CanopyRadius; Dz <= CanopyRadius; ++Dz)
+	{
+		for (int64 Dy = -CanopyRadius; Dy <= CanopyRadius; ++Dy)
+		{
+			for (int64 Dx = -CanopyRadius; Dx <= CanopyRadius; ++Dx)
+			{
+				if (Dx * Dx + Dy * Dy + Dz * Dz <= R2)
+				{
+					TreeVoxels.Add(VoxelCoords::FVoxelCoord{Ccx + Dx, Ccy + Dy, Ccz + Dz});
+				}
+			}
+		}
+	}
+
+	const TArray<VoxelCoords::FVoxelCoord> Coords = TreeVoxels.Array();
+	const int32 Count = Impl->StampVoxels(Coords, (uint8)vxc::MAT_ROCK);
+
+	// Replicate the fixture to clients on a networked authority (single-player
+	// has no relay -- BroadcastNewEntries no-ops without one anyway).
+	UWorld* World = GetWorld();
+	if (World && (World->GetNetMode() == NM_DedicatedServer || World->GetNetMode() == NM_ListenServer))
+	{
+		BroadcastNewEntries(*Impl, *World);
+	}
+
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("VoxelTreeTest: stamped stand-in tree FIXTURE -- %d voxels at column (%.0f,%.0f), baseVz=%lld (surface %.0fUU)"),
+	       Count, WorldX, WorldY, (long long)BaseVz, SurfaceUU);
+	return Count;
 }
 
 // --- M3 wave 1: multiplayer plumbing (docs/m3-plan.md) ----------------------

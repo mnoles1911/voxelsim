@@ -370,7 +370,23 @@ void AVoxelEarthGameMode::BeginPlay()
 						}
 					}
 
-					if (bOverheadFraming && PC)
+					// M5 chop-test framing (task item 5): stand back from the tree
+					// column and look at it, so the detached/fallen canopy is in
+					// frame. Highest priority when a tree/chop test drove the run.
+					if (bTreeTestActive && PC)
+					{
+						const double TreeSurfUU = ShotTerrain ? ShotTerrain->GetSurfaceHeightUU(TreeTestColumnXUU, TreeTestColumnYUU) : 0.0;
+						const FVector TreeMid(TreeTestColumnXUU, TreeTestColumnYUU, TreeSurfUU + 150.0);
+						const FVector CamPos = TreeMid + FVector(-500.0, -350.0, 300.0); // back / side / up
+						const FRotator Look = (TreeMid - CamPos).Rotation();
+						if (APawn* P = PC->GetPawn())
+						{
+							P->SetActorLocation(CamPos);
+							P->SetActorRotation(Look);
+						}
+						PC->SetControlRotation(Look);
+					}
+					else if (bOverheadFraming && PC)
 					{
 						constexpr double HoverHeightAboveUU = 1500.0; // 15m: fills frame, clears splash geometry
 						if (APawn* P = PC->GetPawn())
@@ -586,6 +602,92 @@ void AVoxelEarthGameMode::BeginPlay()
 					}),
 				BreachTestDelaySeconds, false);
 		}
+	}
+
+	// M5 destruction (first slice, docs/m4-plan.md Round 2 reframe):
+	// -VoxelTreeTest[=<delaySeconds>] (default 8s) places a stand-in tree
+	// FIXTURE ~6m ahead of the spawn column once R0 has streamed in.
+	// -VoxelChopTest[=<delaySeconds>] (default 18s; implies -VoxelTreeTest)
+	// then carves through the trunk, severing the canopy so the M5 chop ->
+	// island-detect -> fall pipeline promotes it to falling debris. Combine
+	// with -VoxelScreenshotAfter=<n> (a value LARGER than the chop delay) for a
+	// self-contained headless capture of the detached canopy on the ground; the
+	// screenshot block above aims at the tree column when either switch is set.
+	float ChopTestDelaySeconds = 18.f;
+	const bool bChopTestActive = FParse::Value(FCommandLine::Get(), TEXT("VoxelChopTest="), ChopTestDelaySeconds) ||
+	                             FParse::Param(FCommandLine::Get(), TEXT("VoxelChopTest"));
+	float TreeTestDelaySeconds = 8.f;
+	const bool bTreeTestRequested = FParse::Value(FCommandLine::Get(), TEXT("VoxelTreeTest="), TreeTestDelaySeconds) ||
+	                                FParse::Param(FCommandLine::Get(), TEXT("VoxelTreeTest"));
+
+	if (bTreeTestRequested || bChopTestActive)
+	{
+		bTreeTestActive = true;
+
+		// Place the tree ~6m ahead (+X) of the spawn column (the fly pawn spawns
+		// facing +X), so it lands in front of the pawn and inside R0.
+		double SpawnColXUU = 0.0, SpawnColYUU = 0.0;
+		ParseSpawnColumnUU(SpawnColXUU, SpawnColYUU);
+		TreeTestColumnXUU = SpawnColXUU + 600.0;
+		TreeTestColumnYUU = SpawnColYUU;
+
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelTreeTest: placing stand-in tree fixture at (%.0f,%.0f) in %.1fs"),
+		       TreeTestColumnXUU, TreeTestColumnYUU, TreeTestDelaySeconds);
+		GetWorldTimerManager().SetTimer(
+			TreeTestTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this]()
+				{
+					UWorld* TreeWorld = GetWorld();
+					UVoxelWorldSubsystem* Subsystem = TreeWorld ? TreeWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					if (!Subsystem)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelTreeTest: subsystem not ready, skipping tree placement."));
+						return;
+					}
+					const int32 Count = Subsystem->SpawnTreeFixtureAt(TreeTestColumnXUU, TreeTestColumnYUU);
+					UE_LOG(LogVoxelEarth, Log, TEXT("VoxelTreeTest: tree fixture placed (%d voxels)."), Count);
+				}),
+			TreeTestDelaySeconds, false);
+	}
+
+	if (bChopTestActive)
+	{
+		// Make sure the chop lands AFTER the tree has been placed (and its
+		// chunks meshed) -- clamp the chop delay to comfortably follow the tree.
+		if (ChopTestDelaySeconds <= TreeTestDelaySeconds)
+		{
+			ChopTestDelaySeconds = TreeTestDelaySeconds + 10.f;
+		}
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelChopTest: chopping the trunk in %.1fs"), ChopTestDelaySeconds);
+		GetWorldTimerManager().SetTimer(
+			ChopTestTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this]()
+				{
+					UWorld* ChopWorld = GetWorld();
+					UVoxelWorldSubsystem* Subsystem = ChopWorld ? ChopWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					if (!Subsystem)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelChopTest: subsystem not ready, skipping chop."));
+						return;
+					}
+					// Carve straight through the trunk at ~mid-height (12 voxels
+					// above the surface). Radius 40UU (4 voxels) fully clears the
+					// 2x2 trunk cross-section over an ~8-voxel band -> a clean
+					// sever. Jitter 0 for a deterministic cut. CarveSphere routes
+					// through the M5 chop hook (PromoteDetachedIslands), which
+					// detects the now-floating canopy, removes it from the grid,
+					// and spawns the falling debris.
+					const double SurfUU = Subsystem->GetSurfaceHeightUU(TreeTestColumnXUU, TreeTestColumnYUU);
+					const FVector CutCentre(TreeTestColumnXUU + 10.0, TreeTestColumnYUU + 10.0, SurfUU + 120.0);
+					const int32 Removed = Subsystem->CarveSphere(CutCentre, 40.0, 0.0);
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelChopTest: carved trunk at (%.0f,%.0f,%.0f), removed %d voxels -- watch for 'Destruction:' / ")
+					       TEXT("'VoxelDebris' log lines (LogVoxelEdit/LogVoxelEarth)."),
+					       CutCentre.X, CutCentre.Y, CutCentre.Z, Removed);
+				}),
+			ChopTestDelaySeconds, false);
 	}
 }
 
