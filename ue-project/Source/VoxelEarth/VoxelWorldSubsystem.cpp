@@ -3316,8 +3316,11 @@ void FVoxelWorldImpl::DispatchJobs()
 		// footprints and the mip path samples columns at stride 2^L rather
 		// than building a dense grid, so no exact band is available for it --
 		// see the follow-up in docs/status.md.
+		// The band is only useful if something will consult it.
+		const bool bComputeBand =
+			VoxelStreamAdmission::BuriedSkipEnabled() || VoxelStreamAdmission::VerifyBuriedSkipEnabled();
 		bool bPredictedEmpty = false;
-		if (LevelKey.Level == 0)
+		if (bComputeBand && LevelKey.Level == 0)
 		{
 			if (const VoxelStreaming::FFootprintBand* Band = FootprintBandCache.Find(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y)))
 			{
@@ -3387,7 +3390,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
 			TEXT("VoxelChunkMeshJob"),
 			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
-			 bPredictedEmpty]()
+			 bPredictedEmpty, bComputeBand]()
 			{
 				SCOPE_CYCLE_COUNTER(STAT_VoxelWorkerJob);
 				const double JobStartSeconds = FPlatformTime::Seconds();
@@ -3486,6 +3489,12 @@ void FVoxelWorldImpl::DispatchJobs()
 					// is pure insurance: the per-column bounds are already outer
 					// bounds, this makes an off-by-one in the derivation harmless
 					// rather than a hole in the world.
+					// Gated so that -VoxelBuriedSkip=0 is a TRUE pre-wave
+					// baseline: without this the "off" side of an A/B still pays
+					// the reduction (1156 columns x up to 18 segment tests), which
+					// would quietly flatter the "on" side by handicapping its
+					// control. Costs nothing in production, where it is always on.
+					if (bComputeBand)
 					{
 						int64 MaxTop = INT64_MIN;
 						int64 MinAir = INT64_MAX;
