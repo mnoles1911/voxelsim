@@ -415,7 +415,10 @@ constexpr int64_t detailMaxMm(bool landform) {
 }
 constexpr int64_t kLandformMaxMm = detailMaxMm(true);
 constexpr int64_t kMicroMaxMm = detailMaxMm(false);
-constexpr int64_t kDetailMaxMm = kLandformMaxMm + kMicroMaxMm;
+// NB there is deliberately no combined kDetailMaxMm: the two bands are scaled
+// by DIFFERENT factors (slopeScaleQ10 vs microScaleQ10), so a single summed
+// ceiling has no caller and clang's -Wunused-const-variable rejects it under
+// -Werror. Sum the two named constants at the point of use instead.
 
 // (4) Tripwire. (3) keeps the bound SOUND across an octave-table edit on its
 // own; this makes such an edit impossible to do ACCIDENTALLY without reading
@@ -715,8 +718,8 @@ int32_t Amplifier::surfaceMm(int64_t vx, int64_t vy) const { return evalSurface(
 //     is pinned at compile time to [-32768, 32767] via hashToSigned16 — see
 //     the numbered block near kDetailOctaves. Each octave's term is therefore
 //     at most trunc(32767 * amp_i / 32768) (amplitudes are asserted positive),
-//     and kDetailMaxMm is exactly that sum, computed from the same table
-//     evalSurface loops over.
+//     and kLandformMaxMm / kMicroMaxMm are exactly those sums per band,
+//     computed from the same table evalSurface loops over.
 //
 //     sScale is slopeScaleQ10 of the slope at the pixel cell the column falls
 //     in; every such cell is in the corner grid we just read, so the footprint's
