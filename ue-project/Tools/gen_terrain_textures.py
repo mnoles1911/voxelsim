@@ -124,13 +124,20 @@ def write_biome_lut(path, size=64):
     u = np.linspace(0.0, 1.0, size)[None, :].repeat(size, axis=0)  # precipitation
     v = np.linspace(0.0, 1.0, size)[:, None].repeat(size, axis=1)  # temperature
 
-    # Corner anchors of the diagram (linear-ish sRGB values).
-    cold_dry = (0.46, 0.44, 0.40)   # bare tundra / frost-shattered fellfield
-    cold_wet = (0.40, 0.42, 0.42)   # wet tundra, mossy grey-green
-    mild_dry = (0.52, 0.47, 0.26)   # golden steppe grass
-    mild_wet = (0.22, 0.34, 0.16)   # temperate broadleaf forest
-    warm_dry = (0.56, 0.50, 0.28)   # dry grassland
-    warm_wet = (0.17, 0.36, 0.13)   # lush temperate rainforest
+    # Corner anchors of the diagram, LINEAR albedo.
+    #
+    # These are deliberately DARKER and more saturated than they "look right" in
+    # isolation. The terrain is lit by a full-strength sun plus sky, and the
+    # first tuning pass -- anchors around 0.5 luminance -- came back as a washed
+    # pale olive on screen: a 0.5 linear albedo under this lighting tonemaps to
+    # nearly white. Real vegetation albedo is 0.10-0.25, so these now sit in
+    # that range and the greens survive the exposure.
+    cold_dry = (0.34, 0.32, 0.29)   # bare tundra / frost-shattered fellfield
+    cold_wet = (0.24, 0.27, 0.25)   # wet tundra, mossy grey-green
+    mild_dry = (0.36, 0.31, 0.15)   # golden steppe grass
+    mild_wet = (0.11, 0.21, 0.08)   # temperate broadleaf forest
+    warm_dry = (0.40, 0.34, 0.17)   # dry grassland
+    warm_wet = (0.08, 0.22, 0.07)   # lush temperate rainforest
 
     cold = _mix(cold_dry, cold_wet, u)
     mild = _mix(mild_dry, mild_wet, u)
@@ -149,7 +156,7 @@ def write_biome_lut(path, size=64):
     # A taiga wedge: cold AND wet reads as dark conifer rather than grey tundra.
     # Without this the whole cold half is a flat grey and the uplands look dead.
     taiga = np.clip((0.52 - v) / 0.22, 0.0, 1.0) * np.clip((v - 0.16) / 0.16, 0.0, 1.0) * np.clip((u - 0.35) / 0.4, 0.0, 1.0)
-    rgb = _mix(rgb, (0.15, 0.23, 0.16), taiga)
+    rgb = _mix(rgb, (0.07, 0.13, 0.08), taiga)
 
     # sRGB-encoded on the way out: the LUT is imported with srgb=True, so UE
     # decodes on sample. See linear_to_srgb's docstring.

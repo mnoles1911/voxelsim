@@ -189,6 +189,41 @@ namespace
 
 		const int32 GIDebugVis = bGIEnabled ? VoxelGI::GetDebugVis() : 0;
 
+		// --- surface proximity gate -------------------------------------
+		//
+		// The biome tint keys off face direction (+Z = sky-facing), because the
+		// material ids voxel-core emits here cannot distinguish surface from
+		// subsurface -- see VoxelClimateProbe.h. Face direction ALONE is not
+		// enough though, and the underground shot proved it: a cave FLOOR is
+		// also a +Z face, so the first version painted cave floors grassland
+		// green. That is a straight regression underground, which this change
+		// is explicitly not allowed to cause.
+		//
+		// Fix: a +Z face only takes the biome colour if it is actually near the
+		// terrain surface. GetSurfaceHeightUU is the full amplifier column (the
+		// real surface, not the 30 m tile base), sampled ONCE PER CHUNK at the
+		// chunk centre rather than per quad: a chunk is 3.2 m across and the
+		// surface barely moves over that, so per-chunk is ample and keeps this
+		// off the per-quad path on the meshing workers.
+		//
+		// Chunks with no subsystem (transient/loading worlds) fall back to
+		// "always surface", matching how this behaved before the gate existed.
+		double ChunkSurfaceZUU = -TNumericLimits<double>::Max();
+		if (const UWorld* SurfWorld = Component.GetWorld())
+		{
+			if (const UVoxelWorldSubsystem* SurfSub = SurfWorld->GetSubsystem<UVoxelWorldSubsystem>())
+			{
+				const double HalfChunkUU = 0.5 * double(VoxelCoords::ChunkEdgeVoxels) * double(LevelVoxelSizeUU);
+				ChunkSurfaceZUU = SurfSub->GetSurfaceHeightUU(ComponentWorldOrigin.X + HalfChunkUU,
+				                                              ComponentWorldOrigin.Y + HalfChunkUU);
+			}
+		}
+		// 2 m of slack: the per-chunk sample is taken at the chunk centre, so a
+		// quad at the chunk edge on a steep slope can legitimately sit somewhat
+		// below it. Generous enough not to punch holes in the surface, far
+		// tighter than the tens of metres a cave sits below it.
+		constexpr double kSurfaceBandUU = 200.0;
+
 		// -VoxelMatHistogram: one-shot histogram of the material ids voxel-core
 		// actually emits. Added because this change spent a long time reasoning
 		// about what biome.h SHOULD produce for these tiles instead of measuring
@@ -377,7 +412,14 @@ namespace
 						// measurement and what it costs. Q.Mat is still the
 						// input, it is just resolved to a binary here on the CPU
 						// instead of in the shader.
-						const FColor VertColor(VoxelClimate::BiomeTintForFace(Q.Mat, Axis, Q.Positive != 0), ShadeByte,
+						// Below the surface band, nothing is biome-tinted --
+						// cave floors are +Z faces too (see the gate above).
+						const bool bNearSurface =
+							(ComponentWorldOrigin.Z + double(Pos[CornerIdx].Z)) > (ChunkSurfaceZUU - kSurfaceBandUU);
+						const uint8 TintByte = bNearSurface
+							? VoxelClimate::BiomeTintForFace(Q.Mat, Axis, Q.Positive != 0)
+							: 0;
+						const FColor VertColor(TintByte, ShadeByte,
 						                       QuadClimate.Temperature, QuadClimate.Precipitation);
 
 						if (OutColors)

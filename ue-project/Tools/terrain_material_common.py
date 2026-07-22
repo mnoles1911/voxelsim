@@ -235,7 +235,7 @@ def build_terrain_base_color(
     # now one rock tone rather than bedrock/rock/gravel/subsoil each having
     # their own -- but it is not a regression against main, where every
     # underground surface is the same flat beige as everything else.
-    subsurface = b.vector("SubsurfaceColor", 0.30, 0.275, 0.245)
+    subsurface = b.vector("SubsurfaceColor", 0.20, 0.175, 0.145)
 
     # --- biome lookup -------------------------------------------------------
     #
