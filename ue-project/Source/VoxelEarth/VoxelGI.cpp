@@ -86,8 +86,19 @@ namespace
 
 	TAutoConsoleVariable<int32> CVarGIMaxChunkRefreshesPerFrame(
 		TEXT("voxel.GI.MaxChunkRefreshesPerFrame"), 4,
-		TEXT("Scene proxies rebuilt per frame to pick up new GI vertex colours. Same order of ")
-		TEXT("magnitude as the streaming system's own applies-per-frame budget."),
+		TEXT("Chunks re-shaded per frame to pick up new GI vertex colours. Same order of ")
+		TEXT("magnitude as the streaming system's own applies-per-frame budget. (Before the ")
+		TEXT("in-place colour update this was a SCENE PROXY REBUILD per chunk -- see ")
+		TEXT("voxel.GI.LegacyProxyRebuild.)"),
+		ECVF_Default);
+
+	TAutoConsoleVariable<int32> CVarGILegacyProxyRebuild(
+		TEXT("voxel.GI.LegacyProxyRebuild"), 0,
+		TEXT("1 = restore the pre-2026-07-22 re-shade path: push new GI vertex colours by calling ")
+		TEXT("MarkRenderStateDirty(), i.e. destroy and rebuild the whole scene proxy, instead of ")
+		TEXT("memcpying the colours into the existing colour vertex buffer. Kept solely so the ")
+		TEXT("before/after cost can be measured from ONE binary in an interleaved A/B ")
+		TEXT("(-VoxelGILegacyRefresh); it is strictly slower for identical output."),
 		ECVF_Default);
 
 	TAutoConsoleVariable<int32> CVarGIEditDirtyRadiusBricks(
@@ -468,6 +479,11 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 	//    declines (no proxy yet), so behaviour is unchanged where it cannot
 	//    apply.
 	const int32 RefreshChunkBudget = FMath::Max(0, CVarGIMaxChunkRefreshesPerFrame.GetValueOnGameThread());
+	// Read from the COMMAND LINE as well as the cvar: an -ExecCmds cvar lands
+	// after streaming has already begun, so an -ExecCmds A/B silently measures
+	// the same state twice (this cost three runs to discover on -VoxelGIOn).
+	static const bool bLegacyRefreshCmdLine = FParse::Param(FCommandLine::Get(), TEXT("VoxelGILegacyRefresh"));
+	const bool bLegacyProxyRebuild = bLegacyRefreshCmdLine || CVarGILegacyProxyRebuild.GetValueOnGameThread() != 0;
 	int32 Refreshed = 0;
 	while (Refreshed < RefreshChunkBudget && RefreshQueue.Num() > 0)
 	{
@@ -478,7 +494,7 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		{
 			if (UVoxelChunkComponent* Comp = Found->Get())
 			{
-				if (!Comp->UpdateGIVertexColors())
+				if (bLegacyProxyRebuild || !Comp->UpdateGIVertexColors())
 				{
 					Comp->MarkRenderStateDirty();
 				}
