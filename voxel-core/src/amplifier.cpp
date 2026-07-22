@@ -286,9 +286,14 @@ constexpr Octave kDetailOctaves[] = {
     // The 200 mm lattice is the new floor of the cascade: two voxels, which is
     // the finest scale at which value noise is still a shape rather than
     // per-voxel static.
-    {1600, 400},
+    // Energy is weighted toward the METRE scale rather than the finest
+    // lattice on purpose. An earlier cut put more into the 200 mm octave and
+    // it read in-engine as per-2-voxel static — the eye takes dense
+    // uncorrelated jitter as noise, not as ground. Larger, smoother lumps
+    // with quieter fine detail on top read as terrain.
+    {1600, 500},
     {400, 190},
-    {200, 100},
+    {200, 60},
 };
 constexpr uint32_t kDetailOctaveCount = sizeof(kDetailOctaves) / sizeof(kDetailOctaves[0]);
 
@@ -320,10 +325,20 @@ constexpr int64_t slopeScaleQ10(int64_t slopeMmPerPx) {
 // hillside. The narrower range (0.75..2.0 against the landform band's
 // 0.25..4.0) also keeps the surface upper bound from widening much: this band
 // is small in amplitude, and the bound pays for its maximum.
+// It is DELIBERATELY almost slope-flat. The first cut of this used
+// `768 + slope/64` clamped to 2.0, by analogy with slopeScaleQ10 — and that
+// was wrong for a reason worth recording. On a 45-degree slope the tile slope
+// term reaches ~60000 mm/px, which took the fine band to x1.66, i.e. roughly
+// +/-11 VOXELS of 0.2-1.6 m noise. In-engine that turned the mountainside
+// from machined corduroy into uniform rubble: a different artifact, not a
+// fix. Amplifying the fine band on steep ground was never the point of this
+// band — the FLOOR on flat ground is. Decimetre roughness is a property of
+// the material, not of the gradient, so the curve is now nearly constant and
+// the ceiling is 1.25 rather than 2.0.
 constexpr int64_t kMicroScaleMinQ10 = 768;  // 0.75
-constexpr int64_t kMicroScaleMaxQ10 = 2048; // 2.0
+constexpr int64_t kMicroScaleMaxQ10 = 1280; // 1.25
 constexpr int64_t microScaleQ10(int64_t slopeMmPerPx) {
-    return clampi64(768 + slopeMmPerPx / 64, kMicroScaleMinQ10, kMicroScaleMaxQ10);
+    return clampi64(768 + slopeMmPerPx / 256, kMicroScaleMinQ10, kMicroScaleMaxQ10);
 }
 
 // Final clamp on a surface elevation, in mm above sea level.
@@ -406,7 +421,7 @@ constexpr int64_t kDetailMaxMm = kLandformMaxMm + kMicroMaxMm;
 // own; this makes such an edit impossible to do ACCIDENTALLY without reading
 // the derivation. Any change here also moves worldgen output — bump
 // kWorldGenVersion and regenerate goldens.
-static_assert(kDetailOctaveCount == 5 && kLandformMaxMm == 3698 && kMicroMaxMm == 687,
+static_assert(kDetailOctaveCount == 5 && kLandformMaxMm == 3698 && kMicroMaxMm == 747,
               "kDetailOctaves changed. Amplifier::surfaceUpperBoundMm derives its "
               "detail allowance from the table, so the bound is still sound -- but "
               "re-read its derivation before updating these numbers, and remember an "
@@ -478,7 +493,7 @@ static_assert(microScaleQ10(0) >= 768,
 // small number of metres (i.e. that the bound has not quietly become useless).
 constexpr int64_t kDetailMaxAtMaxSlopeMm =
     kLandformMaxMm * kSlopeScaleMaxQ10 / 1024 + kMicroMaxMm * kMicroScaleMaxQ10 / 1024;
-static_assert(kDetailMaxAtMaxSlopeMm == 16166, "detail allowance moved");
+static_assert(kDetailMaxAtMaxSlopeMm == 15725, "detail allowance moved");
 
 // ---------------------------------------------------------------------------
 // Couplings for the MIRROR bounds: Amplifier::surfaceLowerBoundMm and
@@ -511,7 +526,7 @@ constexpr int64_t kMicroAbsMaxMm = detailAbsMaxMm(false);
 static_assert(kLandformAbsMaxMm >= kLandformMaxMm && kMicroAbsMaxMm >= kMicroMaxMm,
               "the symmetric detail envelope must cover the positive-side maximum too, or "
               "surfaceLowerBoundMm is looser than surfaceUpperBoundMm in the wrong direction");
-static_assert(kLandformAbsMaxMm == 3700 && kMicroAbsMaxMm == 690,
+static_assert(kLandformAbsMaxMm == 3700 && kMicroAbsMaxMm == 750,
               "detail amplitude sum moved; see (4)");
 
 // (8) The cave family's carve depth, in the QUERYING COLUMN'S OWN depth space.

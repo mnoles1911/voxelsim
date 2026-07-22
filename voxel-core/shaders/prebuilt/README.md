@@ -91,13 +91,13 @@ the `.spv` files in this directory.
 Current as of respin 5 (worldgen v6, see the bottom of this file):
 
 ```
-80268af563ff362bce23d5c06386fcc4176380331d3fdcc0720403d360006532  worldgen.ColumnMain.spv
+2ab01165f70bfc2dc5e5d1e66a4ee0c5fe58ac34778c1c3245d1fbc9b31c77f9  worldgen.ColumnMain.spv
 b3fdca92cefc9ee1967bb0d0b4bbef377d0183224e60223c32cfb41c2ee6981b  worldgen.MeshCountMain.spv
 e6213729a69289bb1fced82714d67f041cbc34bb2b649a01797bd9ed9185f8b6  worldgen.MeshEmitMain.spv
 72cb57ed63c531b0745f109e1b7c9a2054ed1e201b0ef59dbb062171ed207130  worldgen.ScanAddMain.spv
 0168a302618b437e31b0b4e8bf69aa4ea203383dfd6d1e38b13acd0618d277e1  worldgen.ScanBlocksMain.spv
 e2060888d9938627c0e5c899d4402c804aeee61aae04b86ffcf9c3c5ec4cdf8e  worldgen.ScanSumsMain.spv
-f317b5d5de795be97b91a4b1f44546476f84affe9eb7438dd08de28c2a1ceb27  worldgen.VoxelizeMain.spv
+cdcf478bcf5bac50e19f516543cb8fade86f79d514c5586873bf40cafeab7df0  worldgen.VoxelizeMain.spv
 ```
 
 > **Stale-entry correction (found during respin 5).** The previous table
@@ -324,9 +324,9 @@ ColumnMain 37,468 -> 56,084 bytes, VoxelizeMain 71,808 -> 90,464 bytes.
 
 | Mode | Result | GPU output digest (columns+cells+quads) |
 |---|---|---|
-| default (2 regions) | **PASS**, 0 mismatches, 8192 columns / 360448 cells / 7492 quads | `46d86246e2ad37b4` (was `71288ec0ac6dba0b`) |
-| `--radius 64` | **PASS**, 0 mismatches, 326/326 tiles (100%) verified — 5,341,184 columns / 293,339,136 cells / 3,586,220 quads compared | `4698d521f7e69eed` (was `f102b490a42918c0`) |
-| `--radius 128` | **PASS**, 0 mismatches, 144/1144 tiles (12.6%) verified — 2,359,296 columns / 127,926,272 cells / 1,619,189 quads compared | `19c7ffcd9b16d49a` (was `1f88f5e0d405321d`) |
+| default (2 regions) | **PASS**, 0 mismatches, 8192 columns / 393216 cells / 6666 quads | `f3c48a4df3e20e9a` (was `71288ec0ac6dba0b`) |
+| `--radius 64` | **PASS**, 0 mismatches, 319/319 tiles (100%) verified — 5,226,496 columns / 289,406,976 cells / 3,058,001 quads compared | `591c7602bb9b0e62` (was `f102b490a42918c0`) |
+| `--radius 128` | **PASS**, 0 mismatches, 143/1138 tiles (12.6%) verified — 2,342,912 columns / 126,877,696 cells / 1,389,322 quads compared | `424bca33dbbb37bd` (was `1f88f5e0d405321d`) |
 
 Device: AMD Radeon RX 7800 XT.
 
@@ -334,8 +334,8 @@ All three digests moved, and all three had to: this change moves `surfaceMm`
 at essentially every column, so it moves columns, the cells voxelized from
 them, and the quads meshed from those. A digest that had NOT moved would be
 evidence the shader failed to pick the change up. The quad and tile counts
-also grew relative to respin 4 (`--radius 64`: 305 -> 326 tiles,
-2,523,983 -> 3,586,220 quads), which is the expected consequence of terrain
+also grew relative to respin 4 (`--radius 64`: 305 -> 319 tiles,
+2,523,983 -> 3,058,001 quads), which is the expected consequence of terrain
 that is genuinely rougher at the voxel scale — more surface area, more
 meshed faces. That is the cost side of this change and it is real.
 

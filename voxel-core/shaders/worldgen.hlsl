@@ -82,7 +82,7 @@ static const int kBiomeSeasonalHighU8 = 128;
 static const int kOctaveCount = 5;
 static const int kLandformOctaveCount = 2;
 static const int kOctaveLatticeMm[kOctaveCount] = {25600, 6400, 1600, 400, 200};
-static const int kOctaveAmplitudeMm[kOctaveCount] = {2600, 1100, 400, 190, 100};
+static const int kOctaveAmplitudeMm[kOctaveCount] = {2600, 1100, 500, 190, 60};
 
 // --- primitives mirrored from core.h / hash.h ------------------------------
 
@@ -246,10 +246,13 @@ int64_t slopeScaleQ10(int64_t slopeMmPerPx)
 // vxc::microScaleQ10 (amplifier.cpp) bit-for-bit. The microrelief band's
 // scale: same shape as slopeScaleQ10, deliberately a different curve, and it
 // NEVER drops below 0.75 — flat ground is still bumpy, and at 10 cm voxels
-// flat ground is exactly where the terrace artifact is worst.
+// flat ground is exactly where the terrace artifact is worst. It is also
+// almost slope-FLAT by design (divisor 256, ceiling 1.25): amplifying the
+// fine band on steep ground turned a mountainside into rubble in-engine.
+// See amplifier.cpp for that measurement.
 int64_t microScaleQ10(int64_t slopeMmPerPx)
 {
-    return clamp64(768 + truncDiv(slopeMmPerPx, 64), 768, 2048);
+    return clamp64(768 + truncDiv(slopeMmPerPx, 256), 768, 1280);
 }
 
 // --- biome classification (voxelcore/biome.h) -------------------------------
