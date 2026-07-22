@@ -14,9 +14,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "voxelcore/mesher.h"
+#include "voxelcore/mips.h"
 #include "voxelcore/world.h"
 
 using namespace vxc;
@@ -29,6 +31,8 @@ struct Options {
     int brick = 0; // 0 = both
     bool digestOnly = false;
     bool goldens = false;
+    bool mips = false; // --mips: per-level chunk build, fine mip path vs coarse path
+    int reps = 5;      // --reps: min-of-N for the --mips mode
 };
 
 using Clock = std::chrono::steady_clock;
@@ -170,6 +174,194 @@ void printGoldens(const Options& opt) {
     (void)opt;
 }
 
+// ---------------------------------------------------------------------------
+// --mips: per-level LOD chunk generation cost, fine mip path (materialize +
+// downsample every level-0 descendant, replicating the UE worker job:
+// column-grid cache, level-0 source that always materializes, recursive
+// downsampleBricks, [-1,B]^3 apron meshing of the 4x4x4 chunk bricks) vs the
+// coarse path (GeneratedWorld::makeCoarseBrick at the level's own
+// resolution). Cold caches per rep, min-of-N (--reps, default 5) per this
+// box's measured ~15% run-to-run variance. Digests printed for both paths so
+// runs are comparable; the coarse digest is additionally covered by
+// test_coarsegen.cpp's pinned golden.
+// ---------------------------------------------------------------------------
+
+constexpr int kMipsBrickEdge = 8;   // matches the UE runtime (VoxelCoords::BrickEdgeVoxels)
+constexpr int kMipsChunkBricks = 4; // 4x4x4 bricks per render chunk
+constexpr int kMipsMaxLevel = 4;    // kNumLevels - 1
+
+struct MipsPhases {
+    double columnsMs = 0, fillMs = 0, downMs = 0, meshMs = 0, totalMs = 0;
+    size_t l0Bricks = 0, mipBricks = 0;
+    uint64_t digest = 0;
+    size_t quads = 0;
+};
+
+// Fine path job state: FCachedMipBuilder-equivalent, cold, no shared cache.
+struct MipsFineJob {
+    static constexpr int B = kMipsBrickEdge;
+    const GeneratedWorld<B>& gen;
+    MipsPhases& ph;
+    std::unordered_map<uint64_t, GeneratedWorld<B>::ColumnGrid> grids;
+    std::unordered_map<BrickKey, Brick<B>, BrickKeyHash> l0;
+    std::unordered_map<MipKey, Brick<B>, MipKeyHash> mips;
+
+    MipsFineJob(const GeneratedWorld<B>& g, MipsPhases& p) : gen(g), ph(p) {}
+
+    const Brick<B>* brick(int32_t level, const BrickKey& key) {
+        if (level <= 0) {
+            auto it = l0.find(key);
+            if (it != l0.end()) return &it->second;
+            const uint64_t gk =
+                (uint64_t(uint32_t(key.x)) << 32) | uint64_t(uint32_t(key.y));
+            auto git = grids.find(gk);
+            if (git == grids.end()) {
+                const auto t0 = Clock::now();
+                git = grids.emplace(gk, gen.columns(key.x, key.y)).first;
+                ph.columnsMs += msSince(t0);
+            }
+            const auto t1 = Clock::now();
+            auto [it2, ins] = l0.emplace(key, gen.makeBrick(key, git->second));
+            ph.fillMs += msSince(t1);
+            ++ph.l0Bricks;
+            return &it2->second;
+        }
+        const MipKey mk{level, key};
+        auto it = mips.find(mk);
+        if (it != mips.end()) return &it->second;
+        const Brick<B>* children[8] = {};
+        for (int cz = 0; cz < 2; ++cz)
+            for (int cy = 0; cy < 2; ++cy)
+                for (int cx = 0; cx < 2; ++cx)
+                    children[cx + 2 * cy + 4 * cz] = brick(
+                        level - 1, BrickKey{key.x * 2 + cx, key.y * 2 + cy, key.z * 2 + cz});
+        const auto t0 = Clock::now();
+        Brick<B> built = downsampleBricks<B>(children, 4);
+        ph.downMs += msSince(t0);
+        ++ph.mipBricks;
+        return &mips.emplace(mk, std::move(built)).first->second;
+    }
+};
+
+// Coarse path job state: same shape, but bricks come straight from
+// makeCoarseBrick at the target level — no level-0 bricks, no downsampling.
+struct MipsCoarseJob {
+    static constexpr int B = kMipsBrickEdge;
+    const GeneratedWorld<B>& gen;
+    MipsPhases& ph;
+    std::unordered_map<uint64_t, GeneratedWorld<B>::ColumnGrid> grids;
+    std::unordered_map<BrickKey, Brick<B>, BrickKeyHash> bricks;
+
+    MipsCoarseJob(const GeneratedWorld<B>& g, MipsPhases& p) : gen(g), ph(p) {}
+
+    const Brick<B>* brick(int32_t level, const BrickKey& key) {
+        auto it = bricks.find(key);
+        if (it != bricks.end()) return &it->second;
+        const uint64_t gk = (uint64_t(uint32_t(key.x)) << 32) | uint64_t(uint32_t(key.y));
+        auto git = grids.find(gk);
+        if (git == grids.end()) {
+            const auto t0 = Clock::now();
+            git = grids.emplace(gk, gen.coarseColumns(level, key.x, key.y)).first;
+            ph.columnsMs += msSince(t0);
+        }
+        const auto t1 = Clock::now();
+        auto [it2, ins] = bricks.emplace(key, gen.makeCoarseBrick(level, key, git->second));
+        ph.fillMs += msSince(t1);
+        ++ph.mipBricks;
+        return &it2->second;
+    }
+};
+
+// One cold level-L chunk build + mesh through `Job`; phases accumulated into
+// the returned MipsPhases. Chunk (0, 0, ckz) where ckz holds the surface at
+// the origin, matching where the real streaming jobs do their heavy work.
+template <typename Job>
+MipsPhases runMipsChunk(const GeneratedWorld<kMipsBrickEdge>& gen, int32_t level, int32_t ckz) {
+    constexpr int B = kMipsBrickEdge;
+    MipsPhases ph;
+    Job job(gen, ph);
+    Digest digest;
+    std::vector<Quad> quads;
+    const auto tAll = Clock::now();
+    for (int dz = 0; dz < kMipsChunkBricks; ++dz)
+        for (int dy = 0; dy < kMipsChunkBricks; ++dy)
+            for (int dx = 0; dx < kMipsChunkBricks; ++dx) {
+                const int64_t obx = dx, oby = dy;
+                const int64_t obz = int64_t(ckz) * kMipsChunkBricks + dz;
+                // Materialize the mesh's whole 27-brick neighborhood first so
+                // generation cost lands in the generation phases, then time
+                // the mesh separately over warm bricks.
+                for (int nz = -1; nz <= 1; ++nz)
+                    for (int ny = -1; ny <= 1; ++ny)
+                        for (int nx = -1; nx <= 1; ++nx)
+                            (void)job.brick(level,
+                                            BrickKey{int32_t(obx + nx), int32_t(oby + ny),
+                                                     int32_t(obz + nz)});
+                const int64_t ovx = obx * B, ovy = oby * B, ovz = obz * B;
+                const auto sampler = [&](int x, int y, int z) -> MaterialId {
+                    const int64_t X = ovx + x, Y = ovy + y, Z = ovz + z;
+                    const Brick<B>* b = job.brick(
+                        level, BrickKey{int32_t(floorDiv(X, B)), int32_t(floorDiv(Y, B)),
+                                        int32_t(floorDiv(Z, B))});
+                    if (!b) return MAT_AIR;
+                    return b->get(int(floorMod(X, B)), int(floorMod(Y, B)),
+                                  int(floorMod(Z, B)));
+                };
+                const auto tM = Clock::now();
+                quads.clear();
+                meshBrick<B>(sampler, quads);
+                ph.meshMs += msSince(tM);
+                ph.quads += quads.size();
+                digest.u32(static_cast<uint32_t>(obx));
+                digest.u32(static_cast<uint32_t>(oby));
+                digest.u32(static_cast<uint32_t>(obz));
+                job.brick(level, BrickKey{int32_t(obx), int32_t(oby), int32_t(obz)})
+                    ->digest(digest);
+                digestQuads(quads, digest);
+            }
+    ph.totalMs = msSince(tAll);
+    ph.digest = digest.h;
+    return ph;
+}
+
+void runMipsBench(const Options& opt) {
+    constexpr int B = kMipsBrickEdge;
+    SyntheticTileSampler tiles(opt.seed);
+    Amplifier amp(opt.seed, tiles);
+    GeneratedWorld<B> gen(amp);
+    const ColumnSample c0 = amp.column(0, 0);
+    std::printf("mips bench: seed %llu (worldgen v%u), surface at origin %d mm, min of %d\n\n",
+                (unsigned long long)opt.seed, kWorldGenVersion, c0.surfaceMm, opt.reps);
+    std::printf("level |     fine total (columns |   l0fill | downsample | mesh) |"
+                " coarse total (columns |  fill | mesh) | speedup\n");
+
+    for (int32_t level = 0; level <= kMipsMaxLevel; ++level) {
+        const int64_t chunkVox0 = int64_t(kMipsChunkBricks) * B << level;
+        const int32_t ckz = static_cast<int32_t>(
+            floorDiv(floorDiv(c0.surfaceMm, kVoxelSizeMm), chunkVox0));
+
+        MipsPhases fine, coarse;
+        fine.totalMs = 1e30;
+        coarse.totalMs = 1e30;
+        for (int r = 0; r < opt.reps; ++r) {
+            const MipsPhases f = runMipsChunk<MipsFineJob>(gen, level, ckz);
+            if (f.totalMs < fine.totalMs) fine = f;
+            const MipsPhases c = runMipsChunk<MipsCoarseJob>(gen, level, ckz);
+            if (c.totalMs < coarse.totalMs) coarse = c;
+        }
+        std::printf("  %d   | %11.1f ms (%7.1f | %8.1f | %10.1f | %4.1f) |"
+                    " %9.1f ms (%7.2f | %5.2f | %4.1f) | %6.1fx\n",
+                    level, fine.totalMs, fine.columnsMs, fine.fillMs, fine.downMs, fine.meshMs,
+                    coarse.totalMs, coarse.columnsMs, coarse.fillMs, coarse.meshMs,
+                    coarse.totalMs > 0 ? fine.totalMs / coarse.totalMs : 0.0);
+        std::printf("      | fine: l0 bricks %zu, mip bricks %zu, quads %zu, digest %016llx\n",
+                    fine.l0Bricks, fine.mipBricks, fine.quads,
+                    (unsigned long long)fine.digest);
+        std::printf("      | coarse: bricks %zu, quads %zu, digest %016llx\n",
+                    coarse.mipBricks, coarse.quads, (unsigned long long)coarse.digest);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -181,15 +373,21 @@ int main(int argc, char** argv) {
         else if (a == "--brick" && i + 1 < argc) opt.brick = std::atoi(argv[++i]);
         else if (a == "--digest") opt.digestOnly = true;
         else if (a == "--goldens") opt.goldens = true;
+        else if (a == "--mips") opt.mips = true;
+        else if (a == "--reps" && i + 1 < argc) opt.reps = std::atoi(argv[++i]);
         else {
             std::fprintf(stderr,
                          "usage: vxc_bench [--radius m] [--seed n] [--brick 8|16] "
-                         "[--digest] [--goldens]\n");
+                         "[--digest] [--goldens] [--mips] [--reps n]\n");
             return 2;
         }
     }
     if (opt.goldens) {
         printGoldens(opt);
+        return 0;
+    }
+    if (opt.mips) {
+        runMipsBench(opt);
         return 0;
     }
     if (opt.digestOnly) {

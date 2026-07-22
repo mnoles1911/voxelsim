@@ -5336,3 +5336,114 @@ values PR #64 recorded.
 5. Floors and cap shares are constants tuned on a 12-core box; they should scale
    with `NumberOfCoresIncludingHyperthreads`.
 
+## M2 perf — coarse LOD generation path: R4 chunk 3,144 ms -> 2.0 ms (2026-07-21, worktree agent)
+
+**Problem, measured first.** Outer-ring LOD chunks (levels 1-4) had no coarse
+generation path: a level-L brick was built by materializing and downsampling
+all 8^L level-0 descendants. On a faithful cold replica of the UE worker job
+(column-grid cache, always-materializing level-0 source, recursive
+`downsampleBricks`, `[-1,B]^3` apron meshing; clang -O2, seed 20260719,
+min-of-3), a level-4 chunk cost **3,273 ms**: level-0 voxel fill 2,177 ms
+(67%), downsample chain 616 ms (19%), map/alloc overhead 313 ms (10%),
+amplifier columns 165 ms (5%), mesh 2.3 ms. That matches the streaming wave's
+worker p50 of 2,850-5,241 ms for R4. The verdict from the breakdown: 95% of
+the cost is materializing 884,736 level-0 bricks, so no column-sampling
+optimization could have moved the needle — the chunk had to stop touching
+level-0 data entirely.
+
+**The coarse path** (`GeneratedWorld::coarseColumns` / `makeCoarseBrick` /
+`coarseSurfaceBrickRange`, voxel-core/include/voxelcore/generator.h): a
+level-L cell takes the material of the representative level-0 voxel at the
+CENTRE of its 2^L-cube footprint — cell index c samples level-0 index
+`c*2^L + 2^(L-1)` per axis, through the unchanged `Amplifier::column` +
+`materialAt`. Properties, in doctrine order:
+
+- **Determinism**: a pure composition of the existing integer worldgen
+  functions of (seed, coords) — no new constants, no iteration-order
+  dependence. New golden `0x85B3E79EF8D01AFC` pinned (levels 1-4, 3x3
+  footprints, test_coarsegen.cpp). All fine-path goldens byte-identical
+  (vxc_tests 197/197; bench `--digest` still `6dbb95d59737e045` /
+  `280684104c06aacf`).
+- **Level-0 identity**: at L=0 the offset is 0 and the rule degenerates to
+  `makeBrick` bit-exactly (pinned by test AND by the bench's identical
+  L0 digests) — one rule serves every level.
+- **Exactness**: exact wherever the cell's footprint is uniform (deep rock,
+  open air — the overwhelming majority of cells). NOT exact on the surface
+  shell or at cave/cavern walls, and provably cannot be at this cost: the
+  true mip's recursive majority vote is a function of all 4^L column heights
+  in the footprint, so reproducing it needs all those columns (see options
+  below). Centre (not corner) sampling was chosen because it has zero
+  systematic lateral shift at every level — corner sampling would translate
+  features by 2^(L-1) voxels, a different shift per level (inter-level
+  popping). Residual bias: +50 mm in z (half a fine voxel, constant across
+  levels, below the coarse quantization).
+- **Fidelity vs the true mip**, measured on surface-shell bricks and pinned
+  as permille CEILINGS in test_coarsegen.cpp so it cannot silently degrade:
+  occupancy mismatch 38/19/11/10 permille and material mismatch (both solid)
+  75/61/21/35 permille at L1/2/3/4. Mismatch FALLS with level (coarser cells
+  average over more terrain, and the true mip's own vote gets fuzzier).
+- **Feature survival**: caves/caverns/bedrock participate for free (the
+  representative column carries the full `ColumnSample`). A real cavern
+  room (560 fine void cells) survives coarsening in EXACT proportion:
+  280/140/70/35 void cells at L1-4. Sub-cell tunnels (3 m tube vs 1.6 m
+  L4 cells) dither hit-or-miss — same behavior the true mip's majority vote
+  produces for them, at 512+ m viewing distance.
+- **Seams**: coarse bricks are a global function of the coarse cell index —
+  adjacent bricks/footprints can never contradict (seam test pinned). At a
+  fine/coarse ring boundary the divergence from the true mip is bounded by
+  the local surface variation inside one coarse cell, i.e. the same order as
+  the mip's own quantization; the existing dithered cross-fade covers it.
+
+**Result** (`vxc_bench --mips`, fine/coarse interleaved per rep, min-of-5):
+
+| level | fine (UE job replica) | coarse | speedup |
+|---|---|---|---|
+| 0 | 2.8 ms | 2.8 ms | 1.0x (identical digest) |
+| 1 | 13.6 ms | 3.1 ms | 4.5x |
+| 2 | 72.5 ms | 2.5 ms | 29x |
+| 3 | 565.2 ms | 2.4 ms | 236x |
+| 4 | 3,143.7 ms | 2.0 ms | 1,564x |
+
+Coarse cost is level-independent by construction (216 bricks, 36 column
+grids per chunk at any level) — an R4 chunk now costs what an R0 chunk
+costs, which is what makes a 1 km ring convergable at all.
+
+**Options presented, not silently picked.** (a) Representative centre sample
+(landed): ~2-3 ms/chunk, mismatch as above. (b) Exact-occupancy column
+reduction: for cave-free stratigraphy the recursive threshold-4 vote is
+computable per column in closed form (each level of a monotone column stack
+is again a heightfield), but it needs all 4^L columns per footprint — from
+the measured column cost that is ~100-250 ms per R4 chunk (30-100x slower
+than (a), still 15-30x faster than today), caves break the monotonicity
+argument, and materials would need per-material vote bookkeeping. Not
+implemented. (c) 2x2 corner supersampling with a mini-vote: ~4x the column
+cost of (a), closer surface statistics, still inexact. Not implemented —
+(a)'s mismatch numbers did not justify it.
+
+**UE wiring follow-up (owned by the streaming-file agent).**
+`MakeLevelSampler` (VoxelWorldSubsystem.cpp): for a level-L job, replace
+`FCachedMipBuilder::Brick(Level, Key)` with a job-local (or shared,
+keyed (level,key)) cache filled by `Gen.makeCoarseBrick(Level, Key,
+coarseGrid)` using `coarseColumns` per (level, bx, by) footprint — no
+recursion, no level-0 bricks, no `FSharedMipCache` dependency for pure
+chunks. The overlay-aware path (`MakeOverlayAwareLevelSampler`) MUST stay on
+the true-mip recursion: edits live at level 0 and must keep reflecting into
+mip chunks exactly as today (the coarse path never sees edits). Chunks whose
+footprint contains edits already route through the overlay path / edited-
+ancestor sets, so the split exists. `PropagateEditToMips`/`FSharedMipCache`
+invalidation semantics are untouched. Visual check on switch-over: expect a
+one-time popping delta on R1+ (coarse vs downsampled disagree on ~1-4% of
+shell cells); the cross-fade should absorb it, but eyeball it.
+
+**GPU follow-up**: if/when outer rings move to the GPU voxelize path, the
+coarse rule is the same `worldgen.hlsl` functions called at strided
+coordinates — no new math to mirror. NOT touched this wave (C6 owns that
+file).
+
+**Files.** voxel-core/include/voxelcore/generator.h (coarse API; fine path
+untouched), voxel-core/tests/test_coarsegen.cpp (7 tests: identity,
+pointwise/seam, surface-range formula, NEW golden, seed sensitivity,
+fidelity ceilings, cavern survival), voxel-core/tests/CMakeLists.txt,
+voxel-core/bench/bench_main.cpp (`--mips` mode; default modes untouched).
+No changes to mips.h, caves.h, caverns.h, amplifier.*, worldgen.hlsl, or
+anything under ue-project/.

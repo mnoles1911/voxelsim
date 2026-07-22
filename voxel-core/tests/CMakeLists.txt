@@ -20,6 +20,7 @@ add_executable(vxc_tests
   test_regiongraph.cpp
   test_caves.cpp
   test_caverns.cpp
+  test_coarsegen.cpp
   test_swe.cpp
 )
 find_package(Threads REQUIRED)
