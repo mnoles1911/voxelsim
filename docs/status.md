@@ -4471,3 +4471,178 @@ re-architecting it.
 5. Suballocate the GPU harness's host-visible buffers to reach the 112-realloc
    floor; low value now that the cost is correctly attributed at ~68 ms hidden
    behind GPU execution.
+
+### Streaming pipeline re-measure + rework (2026-07-21, worktree agent)
+
+Re-measures the two streaming items the PR #58 perf pass deliberately left
+alone ("with throughput up ~1.9x their baselines are stale, and re-measuring
+must precede re-architecting"), then fixes what the measurement actually found.
+
+**Verdict up front: both flagged items were still real, and the pending-queue
+one had grown, not shrunk.** The throughput win dissolved neither. But the
+*reason* they were expensive is not the one in the backlog note, and the fix
+that follows from the measurement is not the one that note proposed.
+
+**Method.** `-VoxelPerfRun=60`, seed 20260719, `-nullrhi`, `Saved/VoxelWorlds`
+cleared before every run. The A/B rides a **command-line switch read at first
+use** (`-VoxelPendingJobCap=<n>`, `0` = the old unbounded behaviour) -- not a
+cvar, because `-ExecCmds` cvars land after streaming has begun and an
+`-ExecCmds` A/B silently measures the same state twice (the lesson
+`-VoxelNoUnderground` already exists for). **One binary, both sides**, runs
+interleaved A/B/A/B, two per side, plus a separate real-RHI min-spec-proxy
+round for the M1 gate. `voxelcore.lib` was rebuilt in this worktree from this
+commit's sources rather than reused, so the measured throughput really is the
+post-PR-#58 one.
+
+Two pieces of instrumentation had to be added before anything was measurable:
+the existing per-frame breakdown only logs on frames over the 33.3 ms hitch
+threshold, and a `-nullrhi` throughput run has none. Added to the 5 s periodic
+log: a **tick-budget line** (tick / recompute / dispatch / apply / remesh /
+unload ms summed over the window) and a **job-flow line** (dispatched /
+drained / stale / zero-quad / records added / records evicted).
+
+**Current measured profile (unbounded side, the honest "before").**
+
+| | value |
+|---|---|
+| `PendingJobKeys` depth, steady | **26.5k** (the stale note said 19-20k) |
+| `ChunkRecords` (tracked) | **34.5k** |
+| evictions per 60 s run | **207,839**, against 21.5-22.2k component loads |
+| jobs dispatched | ~1,370/s, `jobsInFlight` pinned at 24 = 2x12 logical cores |
+| stale results | **0.0-0.1%** (not a source of waste) |
+| results meshing to zero quads | **~72%** (buried chunks: real work, no component) |
+| subsystem tick | **4.5-4.9% of wall** (`-nullrhi`), 5.9-6.2% with RHI |
+| ...of which `RecomputeDesiredSet` | **75-78%** |
+| worst recompute call | 5.7-7.2 ms, ~8/s |
+| ...exit hysteresis scan | 2.39-2.59 ms (the flagged O(tracked) item) |
+| R2 / R3 / R4 chunks loaded in 60 s | **0 / 0 / 0**, with 16.2k of them queued |
+
+Two things reframe the problem. First, **production outruns drain by ~40x**
+and always did: ~68k candidate chunks/second are enumerated by the entry scans
+against ~1,370 dispatches/second. Second -- and this is what the old note
+missed -- **the queue depth is not a symptom, it is the cost**. ~90% of
+everything admitted to the desired set left it before a worker ever looked at
+it, and each of those admissions bought a `ChunkRecords` insert, a slot in the
+O(n log n) queue sort (8x/second), a slot in the O(evictions) queue filter and
+a slot in the O(tracked) exit scan. The exit scan is not expensive because it
+is O(tracked); it is expensive because 80% of `tracked` is work that will
+never happen.
+
+**The fix: bound admission by what can be drained** (`-VoxelPendingJobCap`,
+default 2048). Three gates, all keyed on the same 3D chunk-centre distance
+`SortPendingQueues` already prioritises by, so **dispatch order is unchanged**
+-- only the volume of never-to-be-done bookkeeping shrinks:
+
+1. **Distance cutoff.** While the queue is at cap, a candidate farther than
+   the farthest queued chunk never becomes a record. Candidates *nearer* are
+   always admitted, so nothing near the player waits behind far work.
+2. **Truncation.** After the sort, entries past the cap are dropped, record and
+   all -- only ever entries with no component and no job in flight (a queued
+   chunk has by definition never meshed), so a drop costs nothing and loses
+   nothing: the entry scan re-enumerates any untracked in-annulus footprint the
+   next time that level scans, which is exactly when its ranking can change.
+3. **Per-level admission budget** (`Cap/4`). The cutoff alone does not bound a
+   single call: `DispatchJobs` pops from the *near* end, so the queue refills
+   with the farthest candidates, the cutoff drifts out with them, and each call
+   was admitting ~3k newly-near chunks and dropping ~3k newly-far ones. Per
+   *level*, not per call, because levels are scanned in ascending order and R0
+   rescans every call while R1 rescans every second one -- one shared budget
+   let R0 spend it first and measured 8% lower R1 residency.
+
+Plus a **drain-triggered refill**: `RecomputeDesiredSet` is movement-gated, so
+a bounded queue would otherwise leave a *stationary* player idle with chunks
+still unloaded in range (the unbounded queue papered over this by holding
+minutes of backlog). When a deferring queue drains below a quarter of its cap,
+a recompute is forced and the per-level scan gate cleared for it.
+
+**Before / after, same binary, interleaved, all four runs shown**
+(`-VoxelPerfRun=60`, seed 20260719, `-nullrhi`):
+
+| metric | A1 (cap=0) | A2 (cap=0) | B1 (cap=2048) | B2 (cap=2048) |
+|---|---|---|---|---|
+| chunks/s | 358.9 | 363.5 | **367.6** | **369.6** |
+| subsystem tick, % of wall | 4.60 | 4.53 | **2.47** | **2.26** |
+| recompute ms per 5 s | 177.3 | 169.7 | **69.5** | **58.3** |
+| worst recompute call (ms) | 6.2-7.2 | 5.7-6.5 | **2.6-4.0** | **2.3-3.2** |
+| ...exit scan (ms) | 2.49-2.59 | 2.39-2.49 | **0.47-0.58** | **0.50-0.53** |
+| tracked records | 34,536 | 34,536 | **9,952** | **10,101** |
+| `PendingJobKeys` | 26,681 | 26,471 | **2,029** | **2,023** |
+| evictions per run | 207,839 | 207,839 | **76,799** | **77,281** |
+| R0 / R1 resident | 1726/681 | 1760/690 | 1745/684 | 1758/696 |
+
+Throughput is **unchanged to slightly up** -- which is the finding, not a
+disappointment: the pipeline is worker-CPU-bound, so capping the queue cannot
+buy chunks/s, only the game-thread cost of describing work that never happens.
+Ring residency is at parity, so nothing visible changed.
+
+**M1 gate, real RHI** (min-spec proxy `sg.*Quality 0` + `r.ScreenPercentage
+100`, 1080p windowed, one warm-up run discarded, two per side):
+
+| | A1 | A2 | B1 | B2 |
+|---|---|---|---|---|
+| p95 (full run) | 4.74 | 4.78 | **4.70** | **4.60** |
+| post-warmup p95 | 4.79 | 4.84 | 4.79 | **4.67** |
+| post-warmup hitches (>33.3 ms) | 0 | 2 | 1 | 0 |
+| frames over the 16.6 ms bar | 9 | 8 | **6** | **6** |
+| chunks/s | 291.5 | 284.9 | **295.2** | **299.0** |
+| subsystem tick, % of wall | 5.94 | 6.18 | **2.89** | **3.10** |
+
+**Gate holds** (4.6-4.8 ms against the 16.6 ms bar) and the capped side is
+equal or better on every column. This establishes its own before/after on one
+build rather than trusting the documented ~4.93-4.97 ms figure, which PR #58
+reported did not reproduce on an unmodified baseline; here both sides land at
+4.6-4.8 ms, so that band does reproduce on this build.
+
+**Contents unchanged, verified not asserted.** A/B of
+`-VoxelHeadlessDigTest=15 -VoxelDumpDigestAfter=25 -VoxelNoLoad` (seed
+20260719) with the cap off and on: both carve **2,178,385** voxels, both report
+**`editedDigest=0xFB62844A74CB9121`** (server and client), and both write an
+identical **8,039-entry / 4,135,443-byte** `.vxlog`. voxel-core was not touched
+(`git diff` against the base is exactly `VoxelWorldSubsystem.cpp` + this file),
+so no bench digest or golden can move.
+
+**Build.** `VoxelEarthEditor Win64 Development` via `D:\UE_5.8\...\Build.bat
+... -WaitMutex -NoHotReloadFromIDE` -> `Result: Succeeded`, zero warnings from
+`VoxelWorldSubsystem.cpp`. Worktree `voxelcore.lib` built fresh with MSVC/Ninja
+from this commit (note for future waves: `vcvars64.bat` prints a harmless
+`vswhere.exe is not recognized` line and still works, but passing it
+`-no_logo` breaks it, and cmake will otherwise pick up the mingw clang on
+PATH ahead of `cl.exe`).
+
+**Deliberately not done.**
+
+- **Did not make the exit scan incremental/bucketed.** It was 2.4-2.6 ms
+  because `tracked` was 80% never-to-be-meshed queue entries; with those gone
+  it is 0.5 ms. A round-robin cursor would have been real work that measured as
+  noise afterwards -- the classic mis-fix this task exists to avoid.
+- **Did not touch per-record bookkeeping size.** Same reason: `tracked` fell
+  71%, a bigger win than shrinking `FChunkRecord` could have been, and it is
+  now cheap enough not to matter.
+- **Did not fix R2/R3/R4 never loading** (below). It is a prioritisation
+  question with a visible-output consequence, which puts it outside a
+  streaming-cost wave required not to change what renders.
+- **Did not raise `MaxJobsInFlight`** past 2x cores; the worker pool is already
+  the binding resource and this box has 12 logical cores.
+
+**Follow-ups, ranked.**
+
+1. **R2/R3/R4 load zero chunks in a 60 s flight** -- before this wave they sat
+   at 16.2k queued-and-never-dispatched; after it they are simply never
+   admitted. Same outcome, less waste, but the underlying prioritisation bug is
+   untouched: distance is 3D while ring membership is XY, so R0's *deep column*
+   chunks outrank R1+ *surface* chunks, and R0 alone out-produces the worker
+   pool forever. A per-ring share of the dispatch budget would fix it. This
+   changes what renders (more distant voxel terrain, currently masked by the
+   clipmap), so it wants its own wave and its own gate run.
+2. **~72% of all worker output meshes to zero quads** (fully-buried chunks:
+   correct, but ~1,000 jobs/s of amplifier+mesher work for no geometry). A
+   cheap "is this chunk entirely below the surface band and unedited" pre-test
+   before dispatch could reclaim most of the worker pool -- by far the largest
+   remaining throughput lever.
+3. Residual admit/drop churn is ~14-20k records per 5 s (down from 124k at the
+   first cut of this wave). Bounded and cheap; only worth revisiting if the
+   entry scans get cheaper first.
+4. `-VoxelPendingJobCap` swept at 512 / 1024 / 2048 / 8192: 512-2048 are
+   equivalent, 8192 is measurably worse (3.34% of wall vs 2.57%), unbounded
+   worst. 2048 was kept for starvation margin. No re-tune needed unless the
+   drain rate changes a lot.
