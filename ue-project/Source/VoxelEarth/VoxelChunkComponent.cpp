@@ -17,6 +17,12 @@
 // which case every code path below collapses to exactly what it was.
 #include "VoxelGI.h"
 #include "VoxelLightField.h"
+// Biome appearance: climate -> VertexColor.B/A, decoded by M_VoxelTerrain
+// through T_VoxelBiomeLUT. Shared with AVoxelClipmapActor so the near field
+// and the 50 km vista cannot drift apart at their seam.
+#include "VoxelClimateProbe.h"
+
+#include <atomic>
 
 #include "DynamicMeshBuilder.h"
 #include "Engine/CollisionProfile.h"
@@ -183,8 +189,35 @@ namespace
 
 		const int32 GIDebugVis = bGIEnabled ? VoxelGI::GetDebugVis() : 0;
 
+		// -VoxelMatHistogram: one-shot histogram of the material ids voxel-core
+		// actually emits. Added because this change spent a long time reasoning
+		// about what biome.h SHOULD produce for these tiles instead of measuring
+		// what it DOES; the shader-side symptoms were consistent with several
+		// different id distributions and only a direct count separates them.
+		// Off unless the switch is present, and it stops after one dump.
+		static const bool bMatHistogram = FParse::Param(FCommandLine::Get(), TEXT("VoxelMatHistogram"));
+		static std::atomic<int64> MatCounts[16] = {};
+		static std::atomic<int64> MatTotal{0};
+		static std::atomic<bool> bMatDumped{false};
+
 		for (const FVoxelChunkQuad& Q : ChunkQuads)
 		{
+			if (bMatHistogram && !bMatDumped.load(std::memory_order_relaxed))
+			{
+				MatCounts[Q.Mat & 0xF].fetch_add(1, std::memory_order_relaxed);
+				if (MatTotal.fetch_add(1, std::memory_order_relaxed) == 2000000)
+				{
+					bMatDumped.store(true, std::memory_order_relaxed);
+					FString Line;
+					for (int32 M = 0; M < 16; ++M)
+					{
+						const int64 C = MatCounts[M].load(std::memory_order_relaxed);
+						if (C > 0) { Line += FString::Printf(TEXT("%d=%lld "), M, (long long)C); }
+					}
+					UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelMatHistogram (2M quads): %s"), *Line);
+				}
+			}
+
 			const int32 Axis = Q.Axis;
 			const int32 U = (Axis + 1) % 3;
 			const int32 V = (Axis + 2) % 3;
@@ -224,6 +257,24 @@ namespace
 			{
 				continue;
 			}
+
+			// --- biome climate, once per quad ------------------------------
+			//
+			// VertexColor.B = temperature, .A = precipitation, both remapped to
+			// this world's measured p1..p99 window (VoxelClimateProbe.h explains
+			// why the raw tile bytes are unusable). M_VoxelTerrain feeds them to
+			// T_VoxelBiomeLUT as (U=precip, V=temp).
+			//
+			// PER QUAD, not per vertex: climate is a 30 m raster and a greedy
+			// quad spans at most 32 voxels (3.2 m), so per-quad is already ~10x
+			// oversampling the source data, at a quarter of the sample cost on
+			// the meshing workers. The probe bilinearly filters across raster
+			// pixels, so what varies within those 3.2 m is a smooth ramp anyway.
+			const FVoxelClimateBytes QuadClimate = VoxelClimate::SampleClimateAtWorldUU(
+				ComponentWorldOrigin[0] + double(MakePos(float(Q.U0) + float(Q.W) * 0.5f,
+				                                         float(Q.V0) + float(Q.H) * 0.5f)[0]),
+				ComponentWorldOrigin[1] + double(MakePos(float(Q.U0) + float(Q.W) * 0.5f,
+				                                         float(Q.V0) + float(Q.H) * 0.5f)[1]));
 
 			const int32 SpanU = int32(Q.W);
 			const int32 SpanV = int32(Q.H);
@@ -311,7 +362,23 @@ namespace
 							// GI off: reproduce the original 2-bit quantisation
 							// EXACTLY (0/85/170/255), not a rounded float of it.
 							: uint8(int32(AoAt(CornerFu[CornerIdx], CornerFv[CornerIdx]) + 0.5f) * 85);
-						const FColor VertColor(Q.Mat, ShadeByte, 0, 255);
+						// R = biome-tint flag (0 or 255), G = AO * GI,
+						// B = temperature, A = precipitation.
+						//
+						// B and A were both dead bytes until now (B constant 0,
+						// A constant 255) -- nothing reads vertex alpha on this
+						// material: the M2 ring cross-fade drives OpacityMask
+						// from DitherTemporalAA, not from vertex A, so
+						// repurposing it costs nothing.
+						//
+						// R carried the raw Q.Mat until an exposure-proof shader
+						// probe showed id thresholds could not be read back
+						// reliably; VoxelClimateProbe.h documents the
+						// measurement and what it costs. Q.Mat is still the
+						// input, it is just resolved to a binary here on the CPU
+						// instead of in the shader.
+						const FColor VertColor(VoxelClimate::BiomeTintForFace(Q.Mat, Axis, Q.Positive != 0), ShadeByte,
+						                       QuadClimate.Temperature, QuadClimate.Precipitation);
 
 						if (OutColors)
 						{

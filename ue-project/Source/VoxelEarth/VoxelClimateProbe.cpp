@@ -1,0 +1,197 @@
+#include "VoxelClimateProbe.h"
+
+#include "VoxelEarth.h" // LogVoxelEarth
+
+#include "HAL/CriticalSection.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
+
+#include "voxelcore/tiles.h"
+#include "voxelcore/tilestore.h"
+
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <vector>
+
+namespace
+{
+	// Init-once state. Guarded rather than relying on EnsureInitialized() always
+	// being reached from the game thread first: UVoxelChunkComponent builds its
+	// vertex data on background UE::Tasks, and a chunk job can land before the
+	// clipmap actor has ticked. After bInitialized the sampler is never mutated,
+	// so the hot path takes no lock at all.
+	FCriticalSection GInitLock;
+	bool GInitialized = false;
+	std::unique_ptr<vxc::ITileSampler> GSampler;
+	int32 GLoadedTiles = 0;
+	bool GUsingTileGrid = false;
+
+	// Deliberately a copy of VoxelWorldSubsystem.cpp's MakeTileSampler scan,
+	// not a call into it: that file is off-limits to this change, and its
+	// version is a file-local static anyway. The two must agree about which
+	// tiles exist -- if they ever disagree, climate would be sampled from a
+	// different tile set than the geometry, so this mirrors it exactly
+	// (non-recursive *.vxtl scan, reject on seed/scale mismatch, fall back to
+	// synthetic on zero loaded).
+	void LoadTiles()
+	{
+		FString TileDir;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelTileDir="), TileDir);
+
+		int32 TileScale = 1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelTileScale="), TileScale);
+
+		uint64 Seed = 0;
+		{
+			FString SeedStr;
+			if (FParse::Value(FCommandLine::Get(), TEXT("VoxelSeed="), SeedStr))
+			{
+				Seed = FCString::Strtoui64(*SeedStr, nullptr, 10);
+			}
+		}
+
+		if (TileDir.IsEmpty() || vxc::tilePixelSizeMm((uint8)TileScale) == 0)
+		{
+			GSampler = std::make_unique<vxc::SyntheticTileSampler>(Seed);
+			return;
+		}
+
+		const std::filesystem::path DirPath(*TileDir);
+		std::error_code DirEc;
+		if (!std::filesystem::is_directory(DirPath, DirEc) || DirEc)
+		{
+			GSampler = std::make_unique<vxc::SyntheticTileSampler>(Seed);
+			return;
+		}
+
+		auto Grid = std::make_unique<vxc::TileGridSampler>(Seed, (uint8)TileScale);
+		int32 Loaded = 0;
+
+		std::error_code IterEc;
+		for (auto It = std::filesystem::directory_iterator(DirPath, IterEc);
+		     !IterEc && It != std::filesystem::directory_iterator(); It.increment(IterEc))
+		{
+			const std::filesystem::directory_entry& Entry = *It;
+			std::error_code FileEc;
+			if (!Entry.is_regular_file(FileEc) || FileEc) { continue; }
+			if (Entry.path().extension() != ".vxtl") { continue; }
+
+			std::optional<std::vector<uint8_t>> Bytes = vxc::readFileBytes(Entry.path());
+			if (!Bytes) { continue; }
+			std::optional<vxc::TileData> Parsed = vxc::TileData::parse(Bytes->data(), Bytes->size());
+			if (!Parsed) { continue; }
+			if (!Grid->loadTile(std::move(*Parsed))) { continue; }
+			++Loaded;
+		}
+
+		if (Loaded == 0)
+		{
+			UE_LOG(LogVoxelEarth, Error,
+			       TEXT("VoxelClimateProbe: zero tiles loaded from %s -- terrain will render with NEUTRAL climate ")
+			       TEXT("(mid-LUT) everywhere. Check -VoxelSeed/-VoxelTileScale match the tiles."), *TileDir);
+			GSampler = std::make_unique<vxc::SyntheticTileSampler>(Seed);
+			return;
+		}
+
+		GLoadedTiles = Loaded;
+		GUsingTileGrid = true;
+		GSampler = std::move(Grid);
+	}
+}
+
+namespace VoxelClimate
+{
+
+void EnsureInitialized()
+{
+	FScopeLock Lock(&GInitLock);
+	if (GInitialized) { return; }
+	LoadTiles();
+	GInitialized = true;
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("VoxelClimateProbe: %s, tiles=%d, remap temp u8 [%d,%d] precip u8 [%d,%d]"),
+	       GUsingTileGrid ? TEXT("tile grid") : TEXT("SYNTHETIC (no -VoxelTileDir)"),
+	       GLoadedTiles, kTempU8Lo, kTempU8Hi, kPrecipU8Lo, kPrecipU8Hi);
+}
+
+uint8 BiomeTintForFace(uint8 /*MaterialId*/, int32 FaceAxis, bool bFacePositive)
+{
+	// See the header for why this is geometric: voxel-core emits only MAT_ROCK
+	// and MAT_SUBSOIL on this data (measured, -VoxelMatHistogram), so no
+	// id-keyed rule can separate a hillside from a cave wall.
+	if (FaceAxis == 2)
+	{
+		return bFacePositive ? 255 : 0; // sky-facing : ceiling
+	}
+	// Side face. 140/255 = 0.55: the riser of a 10 cm step reads as part turf,
+	// part exposed soil. A hard 0 stripes every hillside at voxel pitch, which
+	// looks far worse than either extreme.
+	return 140;
+}
+
+int32 GetLoadedTileCount()
+{
+	FScopeLock Lock(&GInitLock);
+	return GLoadedTiles;
+}
+
+FVoxelClimateBytes SampleClimateAtWorldUU(double WorldXUU, double WorldYUU)
+{
+	if (!GInitialized)
+	{
+		// A worker beat the game thread to it. EnsureInitialized is idempotent
+		// and this is the only path that can contend, so paying the lock here
+		// (once, at world start) is cheaper than checking an atomic per vertex.
+		EnsureInitialized();
+	}
+
+	FVoxelClimateBytes Out;
+	vxc::ITileSampler* Sampler = GSampler.get();
+	if (Sampler == nullptr)
+	{
+		return Out; // neutral 128/128
+	}
+
+	// Same world -> tile-pixel convention as
+	// UVoxelWorldSubsystem::SampleTerrainHeightUU (1 UU = 10 mm). Sharing the
+	// convention is what makes climate line up with the elevation the geometry
+	// was built from.
+	const double PixelSizeUU = double(Sampler->pixelSizeMm()) / 10.0;
+	const double Px = WorldXUU / PixelSizeUU;
+	const double Py = WorldYUU / PixelSizeUU;
+	const int64 Px0 = (int64)FMath::FloorToDouble(Px);
+	const int64 Py0 = (int64)FMath::FloorToDouble(Py);
+	const double Fx = Px - double(Px0);
+	const double Fy = Py - double(Py0);
+
+	// Bilinear across the 30 m raster. Without this the biome colour would step
+	// in visible 30 m squares, which at 10 cm voxels is a 300-voxel-wide block.
+	const vxc::ClimateSample C00 = Sampler->climate(Px0, Py0);
+	const vxc::ClimateSample C10 = Sampler->climate(Px0 + 1, Py0);
+	const vxc::ClimateSample C01 = Sampler->climate(Px0, Py0 + 1);
+	const vxc::ClimateSample C11 = Sampler->climate(Px0 + 1, Py0 + 1);
+
+	auto Bilerp = [Fx, Fy](double V00, double V10, double V01, double V11)
+	{
+		return FMath::Lerp(FMath::Lerp(V00, V10, Fx), FMath::Lerp(V01, V11, Fx), Fy);
+	};
+
+	const double TempRaw = Bilerp(C00.temperature, C10.temperature, C01.temperature, C11.temperature);
+	const double PrecipRaw = Bilerp(C00.precipitation, C10.precipitation, C01.precipitation, C11.precipitation);
+
+	// Remap the measured p1..p99 window onto the full byte. Values outside it
+	// clamp rather than wrap -- the window is p1..p99 precisely so the 2% of
+	// outliers saturate at the ends of the LUT instead of compressing the 98%.
+	auto Remap = [](double Raw, int32 Lo, int32 Hi) -> uint8
+	{
+		const double T = (Raw - double(Lo)) / double(FMath::Max(Hi - Lo, 1));
+		return (uint8)FMath::Clamp(FMath::RoundToInt(T * 255.0), 0, 255);
+	};
+
+	Out.Temperature = Remap(TempRaw, kTempU8Lo, kTempU8Hi);
+	Out.Precipitation = Remap(PrecipRaw, kPrecipU8Lo, kPrecipU8Hi);
+	return Out;
+}
+
+} // namespace VoxelClimate

@@ -43,6 +43,8 @@ import os
 import numpy as np
 from PIL import Image
 
+from terrain_palette import PALETTE, PALETTE_WIDTH, biome_tinted_runs
+
 # MUST MATCH VoxelClimateProbe.h's kTempU8Lo/Hi and kPrecipU8Lo/Hi exactly.
 TEMP_U8_LO, TEMP_U8_HI = 100, 189
 PRECIP_U8_LO, PRECIP_U8_HI = 14, 32
@@ -56,48 +58,46 @@ SEED = 20260722
 
 # --- material palette -------------------------------------------------------
 #
-# Indexed by vxc::MaterialId (voxel-core/include/voxelcore/core.h). RGB is the
-# material's own albedo in sRGB; A is how much the surface-biome colour takes
-# over (255 = fully biome-driven, 0 = pure material albedo).
-#
-# The A column is what makes a cave look like rock while the hillside above it
-# looks like grassland, from ONE material graph: subsurface strata (bedrock,
-# rock, gravel, subsoil, mud, clay) are never biome-tinted, surface materials
-# always are. It also makes this robust to voxel-core's classifier: today every
-# land surface voxel is MAT_SAND, so the biome path effectively owns all outdoor
-# appearance; if the classifier is later fixed to emit varied surface ids, this
-# table is already correct for them.
-PALETTE = [
-    # (name,             R,    G,    B,    biome_tint)
-    ("AIR",            0.00, 0.00, 0.00,   0),
-    ("BEDROCK",        0.19, 0.18, 0.175,  0),
-    ("ROCK",           0.38, 0.355, 0.325, 0),
-    ("GRAVEL",         0.45, 0.42, 0.385,  0),
-    ("SAND",           0.74, 0.66, 0.48, 255),
-    ("SUBSOIL",        0.34, 0.26, 0.185,  0),
-    ("TOPSOIL",        0.24, 0.175, 0.115, 255),
-    ("SNOW",           0.90, 0.925, 0.96,  0),
-    ("GRASS",          0.26, 0.38, 0.16, 255),
-    ("JUNGLE_SOIL",    0.20, 0.30, 0.12, 255),
-    ("SAVANNA_GRASS",  0.52, 0.46, 0.24, 255),
-    ("PODZOL",         0.22, 0.20, 0.16, 255),
-    ("PERMAFROST",     0.52, 0.51, 0.49, 255),
-    ("MUD",            0.22, 0.19, 0.155, 0),
-    ("CLAY",           0.44, 0.34, 0.26,  0),
-    ("_RESERVED",      0.50, 0.45, 0.40,  0),
-]
+# The table itself now lives in terrain_palette.py, imported above: the material
+# graph needs the same data (to decide which ids take the biome colour) and runs
+# under UE's Python, which has no numpy/Pillow. One table, two consumers.
+
+
+def linear_to_srgb(c):
+    """Encode a LINEAR colour for storage in an sRGB texture.
+
+    T_VoxelPalette and T_VoxelBiomeLUT are imported with srgb=True, so UE decodes
+    sRGB->linear when sampling. The colours in terrain_palette.py and in the
+    biome diagram below are authored as LINEAR albedo, so they must be
+    sRGB-ENCODED on the way out or every colour comes back darker and more
+    saturated than authored.
+
+    That was a real, measured bug, not a theoretical one: the first render of
+    this material came back with linear channel ratios (1, 0.71, 0.43) where the
+    authored sand is (1, 0.89, 0.65) -- exactly the signature of a missing
+    linear->sRGB encode, and the thing that identified which colour was actually
+    reaching the screen.
+    """
+    c = np.clip(np.asarray(c, dtype=np.float64), 0.0, 1.0)
+    return np.where(c <= 0.0031308, c * 12.92, 1.055 * np.power(c, 1.0 / 2.4) - 0.055)
 
 
 def write_palette(path):
-    img = np.zeros((1, 16, 4), dtype=np.uint8)
-    for i, (_name, r, g, b, a) in enumerate(PALETTE):
-        img[0, i] = (
-            int(round(r * 255)),
-            int(round(g * 255)),
-            int(round(b * 255)),
-            int(a),
-        )
-    Image.fromarray(img, "RGBA").save(path)
+    """16x1 RGB, LINEAR albedo sRGB-encoded for storage.
+
+    The biome-tint weight is NOT in this texture. It briefly lived in the alpha
+    channel and then in a second row; both read back as ~0 in the shader no
+    matter how the texture was configured (verified 16x2, TF_NEAREST, TA_CLAMP,
+    uncompressed, no mips -- and an unlit probe still showed 0.004 where the
+    texel was 255). Rather than keep guessing at UE sampler semantics, the
+    weight is now computed arithmetically from the material id in the material
+    graph, generated from terrain_palette.biome_tinted_runs(). That is exact,
+    costs one fewer sampler, and has no texture-format failure mode at all.
+    """
+    img = np.zeros((1, PALETTE_WIDTH, 3), dtype=np.uint8)
+    for i, (_name, r, g, b, _tint) in enumerate(PALETTE):
+        img[0, i] = np.rint(linear_to_srgb([r, g, b]) * 255.0).astype(np.uint8)
+    Image.fromarray(img, "RGB").save(path)
     return img
 
 
@@ -151,10 +151,10 @@ def write_biome_lut(path, size=64):
     taiga = np.clip((0.52 - v) / 0.22, 0.0, 1.0) * np.clip((v - 0.16) / 0.16, 0.0, 1.0) * np.clip((u - 0.35) / 0.4, 0.0, 1.0)
     rgb = _mix(rgb, (0.15, 0.23, 0.16), taiga)
 
-    out = np.zeros((size, size, 4), dtype=np.uint8)
-    out[..., :3] = np.clip(np.rint(rgb * 255.0), 0, 255).astype(np.uint8)
-    out[..., 3] = 255
-    Image.fromarray(out, "RGBA").save(path)
+    # sRGB-encoded on the way out: the LUT is imported with srgb=True, so UE
+    # decodes on sample. See linear_to_srgb's docstring.
+    out = np.clip(np.rint(linear_to_srgb(rgb) * 255.0), 0, 255).astype(np.uint8)
+    Image.fromarray(out, "RGB").save(path)
     return out
 
 
@@ -221,8 +221,8 @@ def main():
     os.makedirs(out, exist_ok=True)
 
     p = write_palette(os.path.join(out, "T_VoxelPalette.png"))
-    print("T_VoxelPalette.png   16x1   materials=%d biome-tinted=%d"
-          % (len(PALETTE), int((p[0, :, 3] > 0).sum())))
+    print("T_VoxelPalette.png   16x1   materials=%d biome-tinted-runs=%s"
+          % (len(PALETTE), biome_tinted_runs()))
 
     b = write_biome_lut(os.path.join(out, "T_VoxelBiomeLUT.png"))
     print("T_VoxelBiomeLUT.png  %dx%d  temp u8 %d..%d, precip u8 %d..%d"

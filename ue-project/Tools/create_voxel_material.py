@@ -48,7 +48,15 @@ Run via:
   UnrealEditor-Cmd.exe <uproject> -run=pythonscript -script=<this file> -unattended -nop4 -nosplash
 """
 
+import os
+import sys
+
 import unreal
+
+# The shared biome graph lives next to this file. A -run=pythonscript commandlet
+# does not put the script's own directory on sys.path, so add it explicitly.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from terrain_material_common import GraphBuilder, build_terrain_base_color  # noqa: E402
 
 PACKAGE_PATH = "/Game/Voxel"
 MATERIAL_NAME = "M_VoxelTerrain"
@@ -78,14 +86,44 @@ def main():
 
     vertex_color = mel.create_material_expression(material, unreal.MaterialExpressionVertexColor, -500, -50)
 
-    albedo_tint = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -500, 150)
-    albedo_tint.set_editor_property("constant", unreal.LinearColor(0.5, 0.45, 0.4, 1.0))
+    # --- BIOME + TEXTURE BASE COLOUR ---------------------------------------
+    #
+    # Replaces the stage-1 flat Constant3Vector(0.5, 0.45, 0.4). That constant
+    # was, quite literally, the "everything is one flat beige" defect: this
+    # material had VertexColor.R (the material id) plumbed all the way to the
+    # GPU and then discarded it, so no upstream terrain or biome work could
+    # ever have changed the colour of anything.
+    #
+    # The graph itself is shared with M_VoxelClipmap (terrain_material_common)
+    # so the near field and the 50 km vista cannot diverge at their seam.
+    b = GraphBuilder(material)
+
+    # T_VoxelDetail UV: TextureCoordinate 0 is world-planar metres wrapped to a
+    # 32 m period (VoxelChunkComponent's WrapWorldToUV -- the wrap is what keeps
+    # LWC precision sane at 2000 km from the origin). Dividing by 8 repeats the
+    # detail every 8 m; 8 divides 32 exactly, so vertices on either side of the
+    # wrap still agree and no seam appears.
+    tex_coord = mel.create_material_expression(material, unreal.MaterialExpressionTextureCoordinate, -900, 400)
+    tex_coord.set_editor_property("coordinate_index", 0)
+    detail_uv = b.div(tex_coord, b.scalar("DetailTileMeters", 8.0))
+
+    base_color, snow_w, base_color_out = build_terrain_base_color(
+        b, vertex_color, detail_uv, "",
+        # Voxel face normals are AXIS-ALIGNED, so every 10 cm step riser on a
+        # gentle grassy hill is a "vertical" face. At full strength the slope
+        # term would stripe the entire world grass/rock; at 0.35 it reads as
+        # natural darkening of the riser. The clipmap, whose normals are real
+        # terrain normals, passes 1.0.
+        rock_slope_strength=0.35,
+        detail_fine_strength=0.30,
+        detail_coarse_strength=0.22,
+    )
 
     ao_multiply = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -200, 50)
     # Every connection is checked: a silently-failed pin connect produced an
     # invisible-terrain material once (2026-07-19) and cost a debug session.
-    if not mel.connect_material_expressions(albedo_tint, "", ao_multiply, "A"):
-        raise RuntimeError("connect albedo_tint -> multiply.A failed")
+    if not mel.connect_material_expressions(base_color, base_color_out, ao_multiply, "A"):
+        raise RuntimeError("connect base_color -> multiply.A failed")
     if not mel.connect_material_expressions(vertex_color, "G", ao_multiply, "B"):
         raise RuntimeError("connect vertex_color.G -> multiply.B failed")
 
@@ -105,8 +143,10 @@ def main():
     if not mel.connect_material_property(tint_multiply, "", unreal.MaterialProperty.MP_BASE_COLOR):
         raise RuntimeError("connect tint_multiply -> BaseColor failed")
 
-    roughness = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -200, 250)
-    roughness.set_editor_property("r", 0.9)
+    # Roughness: snow is markedly smoother than soil or rock, and this is the
+    # cheapest way to make a snow cap read as snow rather than as white paint.
+    # Everything else keeps the original 0.9.
+    roughness = b.lerp(b.scalar("RoughnessBase", 0.90), "", b.scalar("RoughnessSnow", 0.55), "", snow_w)
     if not mel.connect_material_property(roughness, "", unreal.MaterialProperty.MP_ROUGHNESS):
         raise RuntimeError("connect roughness failed")
 

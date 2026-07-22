@@ -12,6 +12,9 @@
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
 #include "VoxelWorldSubsystem.h"
+// Biome appearance: the SAME climate->vertex-colour encoding
+// UVoxelChunkComponent uses, so the vista and the near field cannot diverge.
+#include "VoxelClimateProbe.h"
 
 // voxelcore/tiles.h ONLY here, in the .cpp -- VoxelClipmapActor.h is
 // UHT-parsed and must stay voxel-core-free (doctrine, see
@@ -71,8 +74,15 @@ double SampleHeightUU(double WorldXUU, double WorldYUU, const UVoxelWorldSubsyst
 // voxel-core/shaders/worldgen.hlsl MAT_SNOW threshold) rather than a hard
 // cutoff, so the clipmap's coarse (64-512m/vertex) grid doesn't show a
 // jagged single-vertex-row edge at the line.
-constexpr double kSnowlineBandLowMeters = 2700.0;
-constexpr double kSnowlineBandHighMeters = 2900.0;
+// MOVED TO THE MATERIAL. The snow band is now a SnowlineLowMeters/
+// SnowlineHighMeters ScalarParameter pair on M_VoxelClipmap and
+// M_VoxelTerrain, evaluated per pixel from world Z (and biased by temperature)
+// rather than per clipmap vertex. Two reasons: the voxel near field needs the
+// same snowline and had no way to get it from a clipmap-only constant, and a
+// per-pixel band no longer shows the jagged single-vertex-row edge this
+// 200 m ramp existed to hide -- create_clipmap_material.py owns the values now.
+// (2700/2900 straddled the amplifier's 2800 m MAT_SNOW threshold; the material
+// parameters keep those same numbers.)
 
 // ---- UNDERGROUND VEIL constants (see VoxelClipmapActor.h for the diagnosis)
 //
@@ -151,6 +161,15 @@ void AVoxelClipmapActor::BeginPlay()
 		UE_LOG(LogVoxelEarth, Warning,
 		       TEXT("M_VoxelClipmap not found at /Game/Voxel/M_VoxelClipmap -- clipmap levels using the engine default material."));
 	}
+
+	// Load the climate tiles here, on the game thread, before the first clipmap
+	// rebuild and before any meshing worker can need them. The probe is
+	// self-initializing and thread-safe, so this is not required for
+	// correctness -- it is here so the 25-tile disk read happens once at a
+	// predictable point instead of inside whichever background chunk job
+	// happens to touch climate first, and so the "tiles=N" log line lands early
+	// enough to diagnose a bad -VoxelTileDir before the screenshot.
+	VoxelClimate::EnsureInitialized();
 
 	// M2 task "Config-driven seed": read the subsystem's RUNTIME seed
 	// (-VoxelSeed=<u64> override, else DefaultSeed) rather than the
@@ -640,15 +659,43 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 			const FVector Normal = FVector(-DhDx, -DhDy, 1.0).GetSafeNormal();
 			Normals[Idx] = Normal;
 
-			const double Slope = FMath::Clamp(1.0 - double(Normal.Z), 0.0, 1.0);
+			// Vertex colour semantics are now IDENTICAL to
+			// UVoxelChunkComponent's: R = material id, G = shade, B =
+			// temperature, A = precipitation. They used to be R = slope,
+			// G = snow -- a completely DIFFERENT convention from the voxel
+			// chunks, which is a large part of why the 50 km vista rendered
+			// pale green while the near field rendered beige. Sharing one
+			// encoding (and therefore T_VoxelPalette + T_VoxelBiomeLUT) makes
+			// the two agree at the seam by construction, instead of relying on
+			// two independently hand-tuned colour schemes happening to match.
+			//
+			// Slope and snow are NOT lost -- they moved into the material,
+			// where both graphs derive slope from the interpolated normal and
+			// snow from temperature plus world Z. This pass already computes
+			// real normals (Normals[Idx] above) and hands them to the PMC, so
+			// the material recovers exactly the quantity this code used to
+			// precompute, without spending a vertex byte on it.
 			const double HeightMeters = HeightsUU[Idx] / 100.0;
-			const double Snow = FMath::Clamp(
-				(HeightMeters - kSnowlineBandLowMeters) / (kSnowlineBandHighMeters - kSnowlineBandLowMeters), 0.0, 1.0);
 
-			VertexColors[Idx] = FColor(
-				(uint8)FMath::Clamp(FMath::RoundToInt32(Slope * 255.0), 0, 255),
-				(uint8)FMath::Clamp(FMath::RoundToInt32(Snow * 255.0), 0, 255),
-				0, 255);
+			// Below sea level is ocean floor: MAT_MUD is not biome-tinted in
+			// T_VoxelPalette, so the sea bed reads as dark sediment rather than
+			// taking a grassland colour that would then show through shallow
+			// water. 4 = MAT_SAND is the id voxel-core actually emits for every
+			// land surface voxel on these tiles, so the vista and the near
+			// field index the exact same palette entry.
+			const uint8 MatId = (HeightMeters < 0.0) ? 13 /*MAT_MUD*/ : 4 /*MAT_SAND*/;
+
+			// Recomputed rather than carried over from pass 1 (which is where
+			// WorldX/WorldY live): this is 2 multiply-adds against 65x65
+			// vertices per level, four levels, only on a rebuild.
+			const FVoxelClimateBytes Climate = VoxelClimate::SampleClimateAtWorldUU(
+				SnappedOriginUU.X + double(i - HalfIndex) * Spacing,
+				SnappedOriginUU.Y + double(j - HalfIndex) * Spacing);
+
+			// G = 255: a heightfield clipmap has no per-vertex AO to carry, and
+			// 255 is the identity for the material's AO multiply.
+			VertexColors[Idx] = FColor(VoxelClimate::BiomeTintForFace(MatId, 2, HeightMeters >= 0.0), 255,
+			                          Climate.Temperature, Climate.Precipitation);
 		}
 	}
 
