@@ -239,13 +239,30 @@ private:
 	// so nothing forces its chunks to be meshed -- they are there only if the
 	// streaming footprint reaches them. Pair with -VoxelScreenshotAfter.
 	FTimerHandle CaveTestTimerHandle;
+	// Like -VoxelGICaveTest, the fixture now owns its own settle/pose/capture/
+	// quit schedule instead of depending on -VoxelScreenshotAfter: the pawn
+	// teleports tens of metres underground and the deep streaming footprint has
+	// to be recomputed and meshed from scratch, which does not happen in the
+	// same frame the teleport does.
+	FTimerHandle CavePoseTimerHandle;
+	FTimerHandle CaveRepose1TimerHandle;
+	FTimerHandle CaveRepose2TimerHandle;
+	FTimerHandle CaveShotTimerHandle;
+	FTimerHandle CaveQuitTimerHandle;
 	bool bCaveTestActive = false;
 	bool bCaveTestFound = false;
+	bool bCaveTestSelfCapture = false;
 	FVector CaveTestCameraPos = FVector::ZeroVector;
 	FRotator CaveTestCameraRot = FRotator::ZeroRotator;
 	// Scans for the tallest air pocket in the cave depth band around
-	// (OriginXUU, OriginYUU); returns false if nothing qualifying was found.
-	bool FindCaveVoid(class UVoxelWorldSubsystem& Subsystem, double OriginXUU, double OriginYUU, FVector& OutCenter) const;
+	// (OriginXUU, OriginYUU) that a camera actually fits inside; returns false
+	// if nothing qualifying was found. OutFloorZUU is the top of the solid floor
+	// under the void, which is what the camera height is measured from.
+	bool FindCaveVoid(class UVoxelWorldSubsystem& Subsystem, double OriginXUU, double OriginYUU, FVector& OutCenter,
+	                  double& OutFloorZUU) const;
+	// Poses the pawn at the cave camera. Idempotent, and re-asserted on several
+	// timers, because a single SetActorLocation is not enough (see the .cpp).
+	void PoseInCaveTest() const;
 
 	// -VoxelGICaveTest: locate a pristine worldgen sinkhole (a column with
 	// continuous air from the surface into the cave band) and report the cave

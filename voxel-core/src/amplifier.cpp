@@ -233,12 +233,135 @@ constexpr Octave kDetailOctaves[] = {
     {1600, 260},
     {400, 100},
 };
+constexpr uint32_t kDetailOctaveCount = sizeof(kDetailOctaves) / sizeof(kDetailOctaves[0]);
+
+// The divisor evalSurface applies to each octave's raw noise before scaling it
+// by the octave amplitude. Named because Amplifier::surfaceUpperBoundMm's
+// detail allowance is derived through the same constant.
+constexpr int64_t kDetailNoiseScale = 32768;
 
 // Slope scale in q10 fixed point (1024 == 1.0): flat ground damps detail,
 // steep ground amplifies it (scree/cliff roughness), clamped to [0.25, 4.0].
+constexpr int64_t kSlopeScaleMinQ10 = 256;
+constexpr int64_t kSlopeScaleMaxQ10 = 4096;
 constexpr int64_t slopeScaleQ10(int64_t slopeMmPerPx) {
-    return clampi64(512 + slopeMmPerPx / 24, 256, 4096);
+    return clampi64(512 + slopeMmPerPx / 24, kSlopeScaleMinQ10, kSlopeScaleMaxQ10);
 }
+
+// Final clamp on a surface elevation, in mm above sea level.
+constexpr int32_t kSurfaceClampMinMm = -8'000'000;
+constexpr int32_t kSurfaceClampMaxMm = 9'000'000;
+
+// The bilinear tile base and the tile-level slope, as SHARED functions rather
+// than as an expression in evalSurface plus a copy of it in the bound. Both are
+// used by evalSurface (where they define worldgen output) and by
+// Amplifier::surfaceUpperBoundMm (where the bound's exactness argument is
+// stated against them), so factoring them out is what makes the bound's
+// dependency on the base term structural instead of a mirrored formula.
+//
+// fx/fy are the column's offset inside the pixel cell, in mm; the division
+// truncates toward zero, exactly as before this was named.
+constexpr int64_t bilinearBaseMm(int64_t e00, int64_t e10, int64_t e01, int64_t e11,
+                                 int64_t fx, int64_t fy, int64_t pxMm) {
+    const int64_t gx = pxMm - fx, gy = pxMm - fy;
+    return ((e00 * gx + e10 * fx) * gy + (e01 * gx + e11 * fx) * fy) / (pxMm * pxMm);
+}
+
+constexpr int64_t tileSlopeMmPerPx(int64_t e00, int64_t e10, int64_t e01) {
+    return (e10 > e00 ? e10 - e00 : e00 - e10) + (e01 > e00 ? e01 - e00 : e00 - e01);
+}
+
+// ---------------------------------------------------------------------------
+// Compile-time couplings for Amplifier::surfaceUpperBoundMm.
+//
+// The bound is only sound while a handful of properties of the code above hold.
+// Each one below is either DERIVED from the table (so a tweak carries into the
+// bound automatically) or STATIC_ASSERTED (so a tweak that the derivation
+// cannot follow breaks the build instead of shipping invisible holes in the
+// terrain). This block is the whole reason the bound lives in this file rather
+// than in the consumer that needs it.
+// ---------------------------------------------------------------------------
+
+// (1) valueNoise2's output range. Its result is a convex combination of four
+// hashToSigned16 values divided exactly by latticeMm^2, so it cannot leave that
+// primitive's range; pin both ends of the primitive. Widening it (say to 17
+// bits) would raise every octave's reach and silently invalidate (2).
+static_assert(hashToSigned16(0ull) == -32768,
+              "hashToSigned16's range moved; Amplifier::surfaceUpperBoundMm's detail "
+              "allowance is derived from it.");
+static_assert(hashToSigned16(~0ull) == 32767,
+              "hashToSigned16's range moved; Amplifier::surfaceUpperBoundMm's detail "
+              "allowance is derived from it.");
+constexpr int64_t kNoiseMax = 32767;
+
+// (2) Every amplitude is positive. The next step takes each octave's maximum at
+// noise == +kNoiseMax, which assumes the amplitude does not flip the sign.
+constexpr bool detailAmplitudesArePositive() {
+    for (uint32_t i = 0; i < kDetailOctaveCount; ++i)
+        if (kDetailOctaves[i].amplitudeMm <= 0) return false;
+    return true;
+}
+static_assert(detailAmplitudesArePositive(),
+              "A non-positive detail amplitude puts that octave's maximum at noise == "
+              "-32768, not +32767; revisit Amplifier::surfaceUpperBoundMm.");
+
+// (3) The largest `detailMm` evalSurface's octave loop can produce, evaluated in
+// the SAME integer form and over the SAME table that loop uses. DERIVED, not
+// mirrored: adding, removing or re-tuning an octave moves the bound with it.
+constexpr int64_t detailMaxMm() {
+    int64_t sum = 0;
+    for (uint32_t i = 0; i < kDetailOctaveCount; ++i)
+        sum += kNoiseMax * kDetailOctaves[i].amplitudeMm / kDetailNoiseScale;
+    return sum;
+}
+constexpr int64_t kDetailMaxMm = detailMaxMm();
+
+// (4) Tripwire. (3) keeps the bound SOUND across an octave-table edit on its
+// own; this makes such an edit impossible to do ACCIDENTALLY without reading
+// the derivation. Any change here also moves worldgen output — bump
+// kWorldGenVersion and regenerate goldens.
+static_assert(kDetailOctaveCount == 4 && kDetailMaxMm == 2856,
+              "kDetailOctaves changed. Amplifier::surfaceUpperBoundMm derives its "
+              "detail allowance from the table, so the bound is still sound -- but "
+              "re-read its derivation before updating these numbers, and remember an "
+              "octave change is a worldgen change (bump kWorldGenVersion).");
+
+// (5) slopeScaleQ10 is fed the footprint's MAXIMUM slope, and the bound needs
+// the result to be (a) never above kSlopeScaleMaxQ10 and (b) NONDECREASING in
+// its argument — otherwise the max-slope pixel is not the worst pixel. (b) is
+// true because `512 + s/24` is nondecreasing for s >= 0 (truncating division by
+// a positive divisor is monotone) and clampi64 is monotone. Check it by
+// exhaustive-enough sweep at compile time so that a reshaped formula — anything
+// with a fold, an abs(), or a negative coefficient — fails the build.
+// (MSVC's constexpr step budget is 2^20, so the sweep is two resolutions
+// rather than one: every single value across the whole range where the result
+// actually varies -- it saturates at slope 86'016 -- then a coarse sweep out to
+// 3 m of relief per pixel, well past anything an int32 elevation can produce.)
+constexpr bool slopeScaleIsNondecreasing() {
+    int64_t prev = slopeScaleQ10(0);
+    for (int64_t s = 0; s <= 90000; ++s) {
+        const int64_t v = slopeScaleQ10(s);
+        if (v < prev || v > kSlopeScaleMaxQ10) return false;
+        prev = v;
+    }
+    for (int64_t s = 90000; s <= 3'000'000; s += 251) {
+        const int64_t v = slopeScaleQ10(s);
+        if (v < prev || v > kSlopeScaleMaxQ10) return false;
+        prev = v;
+    }
+    return true;
+}
+static_assert(slopeScaleIsNondecreasing(),
+              "slopeScaleQ10 must be nondecreasing and clamped above; "
+              "Amplifier::surfaceUpperBoundMm feeds it the footprint's maximum slope.");
+static_assert(slopeScaleQ10(1LL << 40) == kSlopeScaleMaxQ10,
+              "slopeScaleQ10 must saturate; a slope past the sweep in "
+              "slopeScaleIsNondecreasing must still clamp.");
+
+// (6) The detail allowance at full slope scale, and a check that it stays a
+// small number of metres (i.e. that the bound has not quietly become useless).
+constexpr int64_t kDetailMaxAtMaxSlopeMm = kDetailMaxMm * kSlopeScaleMaxQ10 / 1024;
+static_assert(kDetailMaxAtMaxSlopeMm == 11424, "detail allowance moved");
 
 } // namespace
 
@@ -265,21 +388,18 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     const int64_t e10 = cachedElevationMm(id_, *tiles_, px + 1, py);
     const int64_t e01 = cachedElevationMm(id_, *tiles_, px, py + 1);
     const int64_t e11 = cachedElevationMm(id_, *tiles_, px + 1, py + 1);
-    const int64_t gx = pxMm - fx, gy = pxMm - fy;
-    const int64_t baseMm =
-        ((e00 * gx + e10 * fx) * gy + (e01 * gx + e11 * fx) * fy) / (pxMm * pxMm);
+    const int64_t baseMm = bilinearBaseMm(e00, e10, e01, e11, fx, fy, pxMm);
 
     // Tile-level slope (mm of elevation change per pixel) conditions both
     // detail amplitude and soil depth.
-    const int64_t slopeMmPerPx =
-        (e10 > e00 ? e10 - e00 : e00 - e10) + (e01 > e00 ? e01 - e00 : e00 - e01);
+    const int64_t slopeMmPerPx = tileSlopeMmPerPx(e00, e10, e01);
 
     const int64_t sScale = slopeScaleQ10(slopeMmPerPx);
     int64_t detailMm = 0;
-    for (uint32_t i = 0; i < sizeof(kDetailOctaves) / sizeof(kDetailOctaves[0]); ++i) {
+    for (uint32_t i = 0; i < kDetailOctaveCount; ++i) {
         const Octave& o = kDetailOctaves[i];
         detailMm += valueNoise2(seed_, xMm, yMm, o.latticeMm, CH_DETAIL_OCTAVE_BASE + i) *
-                    o.amplitudeMm / 32768;
+                    o.amplitudeMm / kDetailNoiseScale;
     }
     detailMm = detailMm * sScale / 1024;
 
@@ -287,8 +407,141 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     s.px = px;
     s.py = py;
     s.slopeMmPerPx = slopeMmPerPx;
-    s.surfaceMm = clampi32(baseMm + detailMm, -8'000'000, 9'000'000);
+    s.surfaceMm = clampi32(baseMm + detailMm, kSurfaceClampMinMm, kSurfaceClampMaxMm);
     return s;
+}
+
+int32_t Amplifier::surfaceMm(int64_t vx, int64_t vy) const { return evalSurface(vx, vy).surfaceMm; }
+
+// ---------------------------------------------------------------------------
+// The sky-band trim's proof obligation. DERIVATION — read this before touching
+// evalSurface above.
+//
+// evalSurface computes, for a column at (xMm, yMm) = (vx, vy) * kVoxelSizeMm:
+//
+//     surfaceMm = clampi32(base(x,y) + detail(x,y), MIN, MAX)
+//
+// so an upper bound on surfaceMm over a footprint is the clamp applied to
+// (an upper bound on base) + (an upper bound on detail) over that footprint.
+// Both sub-bounds and the composition rest on one property used repeatedly:
+//
+//     C++ integer division by a POSITIVE divisor is truncation toward zero,
+//     and truncation toward zero is a NONDECREASING function of the real
+//     quotient.  (x <= y  =>  trunc(x) <= trunc(y): both signs, and mixed
+//     signs via trunc(x) <= 0 <= trunc(y).)
+//
+// That is what lets every step below bound the exact rational quantity and then
+// truncate, rather than having to carry rounding slack around. It is also why
+// applying clampi32/clampi64 to a bound yields a bound: clamping is monotone.
+//
+// (a) BASE — bounded EXACTLY, not conservatively.
+//     base is the bilinear interpolation of the four elevations of the tile
+//     pixel cell the column falls in. Restricted to one cell it is a bilinear
+//     patch, which is LINEAR along each axis with the other held fixed, so its
+//     maximum over any axis-aligned sub-rectangle is attained at a CORNER of
+//     that sub-rectangle. We therefore clip the footprint to each pixel cell it
+//     touches and evaluate that cell's own bilinear form at the four clipped
+//     corners, via the very function evalSurface uses. Taking the largest of
+//     those is the exact maximum of base over the footprint's bounding
+//     rectangle — a superset of the discrete columns in it, hence still a
+//     bound, with no sampling-density argument anywhere.
+//
+//     This matters: taking the largest pixel CORNER elevation instead would
+//     also be valid but badly loose whenever the footprint is small relative to
+//     a 30 m pixel (the level-0..3 chunks), because the nearest corner can be
+//     tens of metres of relief away from any ground the footprint contains.
+//
+// (b) DETAIL — bounded by the amplitude sum times the footprint's OWN slope
+//     scale. detail = (sum over octaves of trunc(noise_i * amp_i / 32768))
+//     scaled by trunc(* sScale / 1024). noise_i is a valueNoise2, whose range
+//     is pinned at compile time to [-32768, 32767] via hashToSigned16 — see
+//     the numbered block near kDetailOctaves. Each octave's term is therefore
+//     at most trunc(32767 * amp_i / 32768) (amplitudes are asserted positive),
+//     and kDetailMaxMm is exactly that sum, computed from the same table
+//     evalSurface loops over.
+//
+//     sScale is slopeScaleQ10 of the slope at the pixel cell the column falls
+//     in; every such cell is in the corner grid we just read, so the footprint's
+//     maximum slope is available EXACTLY, and slopeScaleQ10 is asserted
+//     nondecreasing, so the max-slope cell gives the max scale. Using the
+//     footprint's own slope rather than the global worst case takes the
+//     allowance from 11.42 m to typically 1-3 m, which is the difference
+//     between the trim binding at level 4 and not.
+//
+//     Note the bound does NOT evaluate a single hash: it is cheaper than one
+//     column, which is what makes it usable per chunk on the streaming path.
+//
+// (c) The two sub-bounds are summed and clamped. Sound because each is an upper
+//     bound on its term at EVERY column of the footprint simultaneously (they
+//     need not be attained at the same column) and clamping is monotone.
+//
+// It declines (kSurfaceBoundDeclined) rather than guess whenever it has no
+// information: no tile raster, a degenerate pixel size, an empty footprint, or
+// a footprint so large it would need an unbounded number of corner reads.
+// ---------------------------------------------------------------------------
+int64_t Amplifier::surfaceUpperBoundMm(int64_t vx0, int64_t vy0, int64_t vx1,
+                                       int64_t vy1) const {
+    if (vx1 < vx0 || vy1 < vy0) return kSurfaceBoundDeclined; // empty footprint
+    const int64_t pxMm = tiles_ ? int64_t(tiles_->pixelSizeMm()) : 0;
+    if (pxMm <= 0) return kSurfaceBoundDeclined;
+
+    // Footprint bounding rectangle in mm. Inclusive of both end columns: an
+    // amplifier column at index vx sits exactly at vx * kVoxelSizeMm.
+    const int64_t x0Mm = vx0 * kVoxelSizeMm, x1Mm = vx1 * kVoxelSizeMm;
+    const int64_t y0Mm = vy0 * kVoxelSizeMm, y1Mm = vy1 * kVoxelSizeMm;
+
+    // Every tile-pixel CORNER of every pixel cell the rectangle touches. The
+    // cells the COLUMNS fall in are exactly px in [px0, px1-1], which is what
+    // makes the slope maximum below exact rather than merely conservative.
+    const int64_t px0 = floorDiv(x0Mm, pxMm), px1 = floorDiv(x1Mm, pxMm) + 1;
+    const int64_t py0 = floorDiv(y0Mm, pxMm), py1 = floorDiv(y1Mm, pxMm) + 1;
+    const int64_t nx = px1 - px0 + 1, ny = py1 - py0 + 1;
+    if (nx > kSurfaceBoundMaxCornersPerAxis || ny > kSurfaceBoundMaxCornersPerAxis)
+        return kSurfaceBoundDeclined;
+
+    // Read the corner elevations once (through the same per-thread tile memo
+    // column() uses); everything below is derived from this grid.
+    int64_t elev[kSurfaceBoundMaxCornersPerAxis * kSurfaceBoundMaxCornersPerAxis];
+    for (int64_t iy = 0; iy < ny; ++iy)
+        for (int64_t ix = 0; ix < nx; ++ix)
+            elev[ix + nx * iy] = cachedElevationMm(id_, *tiles_, px0 + ix, py0 + iy);
+
+    int64_t maxBaseMm = kSurfaceBoundDeclined; // sentinel: nothing seen yet
+    bool haveBase = false;
+    int64_t maxSlopeMmPerPx = 0;
+    for (int64_t iy = 0; iy + 1 < ny; ++iy) {
+        for (int64_t ix = 0; ix + 1 < nx; ++ix) {
+            const int64_t e00 = elev[ix + nx * iy];
+            const int64_t e10 = elev[(ix + 1) + nx * iy];
+            const int64_t e01 = elev[ix + nx * (iy + 1)];
+            const int64_t e11 = elev[(ix + 1) + nx * (iy + 1)];
+
+            // (b) evalSurface's slope term for this pixel, same function.
+            const int64_t slope = tileSlopeMmPerPx(e00, e10, e01);
+            if (slope > maxSlopeMmPerPx) maxSlopeMmPerPx = slope;
+
+            // (a) Footprint clipped to this cell, in cell-local mm [0, pxMm].
+            const int64_t cellX0Mm = (px0 + ix) * pxMm, cellY0Mm = (py0 + iy) * pxMm;
+            const int64_t lx0 = x0Mm - cellX0Mm < 0 ? 0 : x0Mm - cellX0Mm;
+            const int64_t lx1 = x1Mm - cellX0Mm > pxMm ? pxMm : x1Mm - cellX0Mm;
+            const int64_t ly0 = y0Mm - cellY0Mm < 0 ? 0 : y0Mm - cellY0Mm;
+            const int64_t ly1 = y1Mm - cellY0Mm > pxMm ? pxMm : y1Mm - cellY0Mm;
+            if (lx0 > lx1 || ly0 > ly1) continue; // footprint misses this cell
+
+            const int64_t fxs[2] = {lx0, lx1};
+            const int64_t fys[2] = {ly0, ly1};
+            for (int64_t fx : fxs)
+                for (int64_t fy : fys) {
+                    const int64_t b = bilinearBaseMm(e00, e10, e01, e11, fx, fy, pxMm);
+                    if (!haveBase || b > maxBaseMm) maxBaseMm = b;
+                    haveBase = true;
+                }
+        }
+    }
+    if (!haveBase) return kSurfaceBoundDeclined; // degenerate grid; bound nothing
+
+    const int64_t maxDetailMm = kDetailMaxMm * slopeScaleQ10(maxSlopeMmPerPx) / 1024;
+    return clampi64(maxBaseMm + maxDetailMm, kSurfaceClampMinMm, kSurfaceClampMaxMm);
 }
 
 ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {

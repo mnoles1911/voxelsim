@@ -1253,12 +1253,15 @@ void AVoxelEarthGameMode::BeginPlay()
 					// e.g. the walk-mode kinematic settle onto the tunnel floor.
 					else if (bCaveTestActive && bCaveTestFound && PC)
 					{
-						if (APawn* P = PC->GetPawn())
+						PoseInCaveTest();
+						// The measurement the fixture exists for, on this path
+						// too: the at-park dump is taken before any streaming
+						// tick and is always empty, so without this the run
+						// produces no usable streaming evidence at all.
+						if (UVoxelWorldSubsystem* CaveSub = GetWorld()->GetSubsystem<UVoxelWorldSubsystem>())
 						{
-							P->SetActorLocation(CaveTestCameraPos);
-							P->SetActorRotation(CaveTestCameraRot);
+							LogUndergroundChunkStatus(*CaveSub, CaveTestCameraPos, TEXT("at-capture"));
 						}
-						PC->SetControlRotation(CaveTestCameraRot);
 					}
 					else if (bUndergroundTestActive && PC)
 					{
@@ -2087,7 +2090,17 @@ void AVoxelEarthGameMode::BeginPlay()
 	    FParse::Param(FCommandLine::Get(), TEXT("VoxelCaveTest")))
 	{
 		bCaveTestActive = true;
-		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCaveTest: searching for a cave near spawn in %.1fs"), CaveTestDelaySeconds);
+		// Own the capture unless the caller explicitly drives it with
+		// -VoxelScreenshotAfter, in which case the shared framing chain below
+		// re-asserts the pose and takes the shot as before. Defaulting to
+		// self-capture is the fix for the fixture's real failure mode: run
+		// bare, it used to teleport into a cave and then never photograph it.
+		float UnusedShotAfter = 0.f;
+		bCaveTestSelfCapture =
+			!FParse::Value(FCommandLine::Get(), TEXT("VoxelScreenshotAfter="), UnusedShotAfter);
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelCaveTest: searching for a cave near spawn in %.1fs (%s)"), CaveTestDelaySeconds,
+		       bCaveTestSelfCapture ? TEXT("self-capture") : TEXT("capture driven by -VoxelScreenshotAfter"));
 		GetWorldTimerManager().SetTimer(
 			CaveTestTimerHandle,
 			FTimerDelegate::CreateWeakLambda(this,
@@ -2104,56 +2117,200 @@ void AVoxelEarthGameMode::BeginPlay()
 					ParseSpawnColumnUU(SpawnColXUU, SpawnColYUU);
 
 					FVector Center;
-					if (!FindCaveVoid(*Subsystem, SpawnColXUU, SpawnColYUU, Center))
+					double FloorZUU = 0.0;
+					if (!FindCaveVoid(*Subsystem, SpawnColXUU, SpawnColYUU, Center, FloorZUU))
 					{
 						UE_LOG(LogVoxelEarth, Warning,
 						       TEXT("VoxelCaveTest: no cave void found within the search radius -- try -VoxelSpawnAt."));
 						return;
 					}
-					bCaveTestFound = true;
-					CaveTestCameraPos = Center;
-					// Pitched down 35 degrees, deliberately. The bug this proves
-					// is "there is nothing under your feet": looking DOWN is
-					// what distinguishes a cave with a rock floor from a thin
-					// crust with open sky beneath it. A level view mostly
-					// frames the far end of the tunnel system, where both
-					// answers look similar.
-					CaveTestCameraRot = FRotator(-35.f, 0.f, 0.f);
 
-					if (APlayerController* PC = CaveWorld->GetFirstPlayerController())
+					// --- framing ------------------------------------------
+					//
+					// The old pose was the raw search result with a hardcoded
+					// FRotator(-35, 0, 0): the exact vertical midpoint of the
+					// air run, aimed 35 degrees down at +X regardless of what
+					// was actually there. In a 2.5 m pocket that is a lens
+					// about a metre from the floor pointed at the floor, and
+					// the yaw is whatever the world happened to put in the +X
+					// direction -- usually a wall. Same class of bug as
+					// -VoxelGICaveTest's sunlit mountainside and
+					// -VoxelUndergroundTest's roof-jammed tunnel pose.
+					//
+					// Instead: measure the open directions with direct solidity
+					// probes (NOT raycasts -- at search time these chunks are
+					// not resident and a raycast reports MISS through solid
+					// rock, which is what put the GI camera in a wall), then
+					// stand back against the wall opposite the longest open run
+					// and look ALONG it. That frames the length of the tunnel,
+					// which is the thing worth photographing, and it puts the
+					// nearest surface behind the camera rather than in the lens.
+					auto IsAirAt = [Subsystem](const FVector& P)
 					{
-						if (APawn* P = PC->GetPawn())
+						return !Subsystem->IsSolidAtVoxel((int64)FMath::FloorToDouble(P.X / VoxelCoords::VoxelSizeUU),
+						                                  (int64)FMath::FloorToDouble(P.Y / VoxelCoords::VoxelSizeUU),
+						                                  (int64)FMath::FloorToDouble(P.Z / VoxelCoords::VoxelSizeUU));
+					};
+					const FVector Cardinals[4] = {FVector(1, 0, 0), FVector(-1, 0, 0), FVector(0, 1, 0),
+					                              FVector(0, -1, 0)};
+					double ClearUU[4] = {0.0, 0.0, 0.0, 0.0};
+					for (int32 I = 0; I < 4; ++I)
+					{
+						for (double Dist = 50.0; Dist <= 1500.0; Dist += 50.0)
 						{
-							P->SetActorLocation(CaveTestCameraPos);
-							P->SetActorRotation(CaveTestCameraRot);
+							if (!IsAirAt(Center + Cardinals[I] * Dist))
+							{
+								break; // contiguous run only
+							}
+							ClearUU[I] = Dist;
 						}
-						PC->SetControlRotation(CaveTestCameraRot);
 					}
+					int32 ViewIdx = 0;
+					for (int32 I = 1; I < 4; ++I)
+					{
+						if (ClearUU[I] > ClearUU[ViewIdx])
+						{
+							ViewIdx = I;
+						}
+					}
+					// Back up along the opposite cardinal, keeping half a metre
+					// off that wall, and never more than 2 m (past that the
+					// near wall crowds the frame -- the standoff lesson from
+					// -VoxelGICaveTest).
+					const int32 BackIdx = ViewIdx ^ 1; // pairs are (0,1) and (2,3)
+					const double BackOffUU = FMath::Clamp(ClearUU[BackIdx] - 50.0, 0.0, 200.0);
+					CaveTestCameraPos = Center + Cardinals[BackIdx] * BackOffUU;
+					// Pitched gently down, deliberately. The bug this fixture
+					// proves is "there is nothing under your feet": some floor
+					// must be in frame, or a cave and a hole in the world look
+					// identical. But 35 degrees down from a metre up is all
+					// floor -- 12 degrees keeps the tunnel ahead AND the floor
+					// under it in the same frame.
+					float CavePitchDeg = -12.f;
+					FParse::Value(FCommandLine::Get(), TEXT("VoxelCavePitch="), CavePitchDeg);
+					CaveTestCameraRot =
+						FRotator(CavePitchDeg,
+					             float(FMath::RadiansToDegrees(FMath::Atan2(Cardinals[ViewIdx].Y, Cardinals[ViewIdx].X))),
+					             0.f);
+					bCaveTestFound = true;
+					PoseInCaveTest();
 
 					const double SurfaceUU = Subsystem->GetSurfaceHeightUU(Center.X, Center.Y);
-					FString Report;
-					const FVector Dirs[6] = {FVector(1, 0, 0),  FVector(-1, 0, 0), FVector(0, 1, 0),
-					                         FVector(0, -1, 0), FVector(0, 0, 1),  FVector(0, 0, -1)};
-					const TCHAR* Names[6] = {TEXT("+X"), TEXT("-X"), TEXT("+Y"), TEXT("-Y"), TEXT("+Z"), TEXT("-Z")};
-					for (int32 I = 0; I < 6; ++I)
-					{
-						FVector Hit, Prev;
-						const bool bHit = Subsystem->RaycastVoxelWorld(Center, Dirs[I], 6000.0, Hit, Prev);
-						Report += FString::Printf(TEXT("%s=%s "), Names[I],
-						                          bHit ? *FString::Printf(TEXT("%.1fm"), (Hit - Center).Size() / 100.0)
-						                               : TEXT("MISS"));
-					}
 					UE_LOG(LogVoxelEarth, Log,
-					       TEXT("VoxelCaveTest: parked in cave at (%.0f,%.0f,%.0f), %.1fm below surface; probe: %s"),
-					       Center.X, Center.Y, Center.Z, (SurfaceUU - Center.Z) / 100.0, *Report);
+					       TEXT("VoxelCaveTest: parked at (%.0f,%.0f,%.0f), %.1fm below surface, %.2fm above the ")
+					       TEXT("cave floor; clearance +X=%.1fm -X=%.1fm +Y=%.1fm -Y=%.1fm; looking yaw %.0f pitch %.0f ")
+					       TEXT("(standoff %.0fUU)"),
+					       CaveTestCameraPos.X, CaveTestCameraPos.Y, CaveTestCameraPos.Z,
+					       (SurfaceUU - CaveTestCameraPos.Z) / 100.0, (Center.Z - FloorZUU) / 100.0,
+					       ClearUU[0] / 100.0, ClearUU[1] / 100.0, ClearUU[2] / 100.0, ClearUU[3] / 100.0,
+					       CaveTestCameraRot.Yaw, CaveTestCameraRot.Pitch, BackOffUU);
 
 					// Streaming diagnostic: is there actually a meshed chunk
-					// here, and at the surface directly overhead? This is the
-					// measurement that separates "the world is not streamed
-					// down here" from "it is streamed and something else is
-					// wrong". Logged again from the screenshot timer, by which
-					// point streaming has had time to catch up.
-					LogUndergroundChunkStatus(*Subsystem, Center, TEXT("at-park"));
+					// here, and at the surface directly overhead? This
+					// at-park reading is taken in the SAME FRAME as the
+					// teleport, before UVoxelWorldSubsystem::Tick has seen the
+					// new anchor and recomputed the desired set, so it reads
+					// all-"--0" by construction and means nothing on its own.
+					// It is kept only as the baseline for the at-capture
+					// reading below, which is the one that measures streaming.
+					LogUndergroundChunkStatus(*Subsystem, CaveTestCameraPos, TEXT("at-park"));
+
+					// --- settle, then capture -----------------------------
+					//
+					// The fixture used to have no schedule of its own and
+					// relied entirely on -VoxelScreenshotAfter. That is why it
+					// photographed nothing: the pawn teleports tens of metres
+					// underground, which makes the anchor underground for the
+					// first time and requires the whole deep streaming box to
+					// be recomputed and meshed from scratch, and the only
+					// evidence anyone had was the at-park dump above -- taken
+					// before a single streaming tick. (Worse, with
+					// -VoxelScreenshotAfter <= the search delay, the cave
+					// branch there never fired at all and the run silently
+					// produced an ordinary surface screenshot.)
+					//
+					// Own the schedule, exactly as -VoxelGICaveTest does, and
+					// re-assert the pose on the way in so nothing can drift the
+					// camera between the teleport and the shutter.
+					if (bCaveTestSelfCapture)
+					{
+						float CaveSettleSeconds = 40.f;
+						FParse::Value(FCommandLine::Get(), TEXT("VoxelCaveSettle="), CaveSettleSeconds);
+						auto Repose = [this]() { PoseInCaveTest(); };
+						GetWorldTimerManager().SetTimer(
+							CavePoseTimerHandle, FTimerDelegate::CreateWeakLambda(this, Repose), 0.5f, false);
+						GetWorldTimerManager().SetTimer(CaveRepose1TimerHandle,
+						                                FTimerDelegate::CreateWeakLambda(this, Repose),
+						                                FMath::Max(1.f, CaveSettleSeconds - 4.f), false);
+						GetWorldTimerManager().SetTimer(CaveRepose2TimerHandle,
+						                                FTimerDelegate::CreateWeakLambda(this, Repose),
+						                                FMath::Max(1.f, CaveSettleSeconds - 2.f), false);
+						GetWorldTimerManager().SetTimer(
+							CaveShotTimerHandle,
+							FTimerDelegate::CreateWeakLambda(this,
+								[this]()
+								{
+									PoseInCaveTest();
+									UWorld* SWorld = GetWorld();
+									UVoxelWorldSubsystem* T =
+										SWorld ? SWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+									if (APlayerController* CC = SWorld ? SWorld->GetFirstPlayerController() : nullptr)
+									{
+										if (CC->PlayerCameraManager)
+										{
+											// The ACTUAL camera, not the
+											// intended one: the only way to
+											// tell "the pose did not stick"
+											// from "the pose was wrong".
+											const FVector L = CC->PlayerCameraManager->GetCameraLocation();
+											const FRotator R = CC->PlayerCameraManager->GetCameraRotation();
+											UE_LOG(LogVoxelEarth, Log,
+											       TEXT("VoxelCaveTest capture: ACTUAL cam=(%.0f,%.0f,%.0f) ")
+											       TEXT("rot=(pitch %.1f yaw %.1f) | intended=(%.0f,%.0f,%.0f) ")
+											       TEXT("pitch %.1f yaw %.1f"),
+											       L.X, L.Y, L.Z, R.Pitch, R.Yaw, CaveTestCameraPos.X,
+											       CaveTestCameraPos.Y, CaveTestCameraPos.Z, CaveTestCameraRot.Pitch,
+											       CaveTestCameraRot.Yaw);
+										}
+									}
+									if (T)
+									{
+										// Re-probe at CAPTURE time, when the
+										// chunks around the camera are actually
+										// resident. A probe at search time
+										// reports nothing but MISS.
+										const FVector Dirs[6] = {FVector(1, 0, 0),  FVector(-1, 0, 0),
+										                         FVector(0, 1, 0),  FVector(0, -1, 0),
+										                         FVector(0, 0, 1),  FVector(0, 0, -1)};
+										const TCHAR* Names[6] = {TEXT("+X"), TEXT("-X"), TEXT("+Y"),
+										                         TEXT("-Y"), TEXT("+Z"), TEXT("-Z")};
+										FString Report;
+										for (int32 I = 0; I < 6; ++I)
+										{
+											FVector Hit, Prev;
+											Report += FString::Printf(
+												TEXT("%s=%s "), Names[I],
+												T->RaycastVoxelWorld(CaveTestCameraPos, Dirs[I], 6000.0, Hit, Prev)
+													? *FString::Printf(TEXT("%.1fm"),
+													                   (Hit - CaveTestCameraPos).Size() / 100.0)
+													: TEXT("open"));
+										}
+										UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCaveTest capture probe: %s"), *Report);
+										// THE measurement this fixture exists
+										// for, and the one that was missing:
+										// the promised second column dump,
+										// taken when streaming has had the
+										// whole settle to catch up.
+										LogUndergroundChunkStatus(*T, CaveTestCameraPos, TEXT("at-capture"));
+									}
+									FScreenshotRequest::RequestScreenshot(TEXT("VoxelCave"), false, true);
+								}),
+							CaveSettleSeconds, false);
+						GetWorldTimerManager().SetTimer(
+							CaveQuitTimerHandle,
+							FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(false); }),
+							CaveSettleSeconds + 4.f, false);
+					}
 				}),
 			CaveTestDelaySeconds, false);
 	}
@@ -2853,7 +3010,7 @@ bool AVoxelEarthGameMode::FindSinkholeColumn(UVoxelWorldSubsystem& Subsystem, do
 // --- underground streaming proof: finding a real cave ------------------------
 
 bool AVoxelEarthGameMode::FindCaveVoid(UVoxelWorldSubsystem& Subsystem, double OriginXUU, double OriginYUU,
-                                       FVector& OutCenter) const
+                                       FVector& OutCenter, double& OutFloorZUU) const
 {
 	// voxelcore/caves.h: tunnel axes run 9m..34m below the surface, radius up
 	// to 2.8m, so every cave voxel is inside roughly [6m, 37m] of depth. Probe
@@ -2866,14 +3023,46 @@ bool AVoxelEarthGameMode::FindCaveVoid(UVoxelWorldSubsystem& Subsystem, double O
 	constexpr double MinDepthUU = 600.0;
 	constexpr double MaxDepthUU = 3700.0;
 	constexpr double StepZUU = 50.0;
-	constexpr double MinVoidHeightUU = 200.0; // 2m: tall enough to stand a camera in
+	constexpr double MinVoidHeightUU = 250.0; // 2.5m: room for a camera plus floor clearance
 
 	double BestHeightUU = 0.0;
+	double BestDistUU = 0.0;
 	bool bFound = false;
 
+	auto IsAirAt = [&Subsystem](double X, double Y, double Z)
+	{
+		return !Subsystem.IsSolidAtVoxel((int64)FMath::FloorToDouble(X / VoxelCoords::VoxelSizeUU),
+		                                 (int64)FMath::FloorToDouble(Y / VoxelCoords::VoxelSizeUU),
+		                                 (int64)FMath::FloorToDouble(Z / VoxelCoords::VoxelSizeUU));
+	};
+	// A void is only usable if the camera has somewhere to LOOK: a single-voxel
+	// crack passes the "2 m of air overhead" test and then photographs as a wall
+	// 30 cm from the lens. Require air one metre out on at least two opposite
+	// cardinals at eye height, i.e. a pocket at least ~2 m across. This is the
+	// same class of check -VoxelGICaveTest grew after it parked a camera in a
+	// wall, and -VoxelUndergroundTest after it parked one in a tunnel roof.
+	auto HasLateralRoom = [&IsAirAt](double X, double Y, double EyeZ)
+	{
+		const bool bXOpen = IsAirAt(X + 100.0, Y, EyeZ) && IsAirAt(X - 100.0, Y, EyeZ);
+		const bool bYOpen = IsAirAt(X, Y + 100.0, EyeZ) && IsAirAt(X, Y - 100.0, EyeZ);
+		return bXOpen || bYOpen;
+	};
+
 	// Walk outward in rings so the cave we pick is the CLOSEST decent one to
-	// spawn (keeps it inside R0, where the fine voxels are).
-	for (double Ring = 0.0; Ring <= SearchRadiusUU && !bFound; Ring += StepXYUU * 4.0)
+	// spawn. Distance is not cosmetic: UVoxelWorldSubsystem's underground skirt
+	// is 12 chunks (38.4 m of depth) only inside the R0 NEAR band, drops to 5
+	// chunks (16 m) in the mid band and to ZERO past 32 m out. A cave 60 m from
+	// spawn is below the streamed depth at park time no matter how long you
+	// wait for the initial footprint, so a search that returns a far cave when
+	// a near one exists is itself a way to photograph nothing.
+	//
+	// The stride here USED TO BE `Ring += StepXYUU * 4.0` while the offsets
+	// stepped by StepXYUU, so only the square outlines at 0, 4, 8, ... m were
+	// ever probed and three metres in every four were skipped -- which both
+	// missed near caves outright and, when it did hit, returned a cave up to
+	// four metres further out than the nearest one. Rings now advance by the
+	// same step the offsets do, so the scan is complete.
+	for (double Ring = 0.0; Ring <= SearchRadiusUU && !bFound; Ring += StepXYUU)
 	{
 		for (double OffY = -Ring; OffY <= Ring; OffY += StepXYUU)
 		{
@@ -2890,10 +3079,37 @@ bool AVoxelEarthGameMode::FindCaveVoid(UVoxelWorldSubsystem& Subsystem, double O
 				const double SurfaceUU = Subsystem.GetSurfaceHeightUU(WorldX, WorldY);
 				const int64 Vx = (int64)FMath::FloorToDouble(WorldX / VoxelCoords::VoxelSizeUU);
 				const int64 Vy = (int64)FMath::FloorToDouble(WorldY / VoxelCoords::VoxelSizeUU);
+				const double DistUU = FMath::Sqrt(OffX * OffX + OffY * OffY);
 
-				// March down the column, tracking the tallest contiguous air run.
+				// March down the column, tracking contiguous air runs. A run is
+				// a candidate once it ends (or the band does), so its FLOOR is
+				// known -- the camera is placed relative to the floor, never at
+				// the midpoint of the run, because the midpoint of a tall
+				// chimney is nowhere in particular.
 				double RunTopUU = 0.0;
 				double RunHeightUU = 0.0;
+				auto ConsiderRun = [&](double FloorZUU)
+				{
+					if (RunHeightUU < MinVoidHeightUU)
+					{
+						return;
+					}
+					const double EyeZUU = FloorZUU + FMath::Min(150.0, RunHeightUU * 0.5);
+					if (!HasLateralRoom(WorldX, WorldY, EyeZUU))
+					{
+						return; // a crack, not a chamber
+					}
+					// Prefer the tallest void on this ring; ties go to the
+					// closest column.
+					if (RunHeightUU > BestHeightUU || (RunHeightUU == BestHeightUU && DistUU < BestDistUU))
+					{
+						BestHeightUU = RunHeightUU;
+						BestDistUU = DistUU;
+						OutCenter = FVector(WorldX, WorldY, EyeZUU);
+						OutFloorZUU = FloorZUU;
+						bFound = true;
+					}
+				};
 				for (double Depth = MinDepthUU; Depth <= MaxDepthUU; Depth += StepZUU)
 				{
 					const double Z = SurfaceUU - Depth;
@@ -2908,31 +3124,51 @@ bool AVoxelEarthGameMode::FindCaveVoid(UVoxelWorldSubsystem& Subsystem, double O
 					}
 					else
 					{
-						if (RunHeightUU >= MinVoidHeightUU && RunHeightUU > BestHeightUU)
-						{
-							BestHeightUU = RunHeightUU;
-							OutCenter = FVector(WorldX, WorldY, RunTopUU - RunHeightUU * 0.5);
-							bFound = true;
-						}
+						ConsiderRun(Z + StepZUU); // first air step above this solid
 						RunHeightUU = 0.0;
 					}
 				}
-				if (RunHeightUU >= MinVoidHeightUU && RunHeightUU > BestHeightUU)
-				{
-					BestHeightUU = RunHeightUU;
-					OutCenter = FVector(WorldX, WorldY, RunTopUU - RunHeightUU * 0.5);
-					bFound = true;
-				}
+				// A run still open at the bottom of the band: its floor is
+				// below MaxDepth, so measure from the deepest air we saw.
+				ConsiderRun(RunTopUU - RunHeightUU + StepZUU);
 			}
 		}
 	}
 
 	if (bFound)
 	{
-		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCaveTest: found a %.1fm-tall cave void at (%.0f,%.0f,%.0f)."),
-		       BestHeightUU / 100.0, OutCenter.X, OutCenter.Y, OutCenter.Z);
+		const double SurfaceUU = Subsystem.GetSurfaceHeightUU(OutCenter.X, OutCenter.Y);
+		// The distance and band are logged because they are the first thing to
+		// check when the column dump comes back empty: see the skirt bands in
+		// UVoxelWorldSubsystem's VoxelUnderground namespace.
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelCaveTest: found a %.1fm-tall cave void at (%.0f,%.0f,%.0f), floor %.0f, ")
+		       TEXT("%.1fm below surface, %.1fm from spawn (%s band)."),
+		       BestHeightUU / 100.0, OutCenter.X, OutCenter.Y, OutCenter.Z, OutFloorZUU,
+		       (SurfaceUU - OutCenter.Z) / 100.0, BestDistUU / 100.0,
+		       BestDistUU < 1600.0 ? TEXT("near") : (BestDistUU < 3200.0 ? TEXT("mid") : TEXT("FAR -- no skirt")));
 	}
 	return bFound;
+}
+
+void AVoxelEarthGameMode::PoseInCaveTest() const
+{
+	UWorld* PWorld = GetWorld();
+	APlayerController* Ctrl = PWorld ? PWorld->GetFirstPlayerController() : nullptr;
+	if (!Ctrl || !bCaveTestFound)
+	{
+		return;
+	}
+	if (APawn* P = Ctrl->GetPawn())
+	{
+		// TeleportPhysics + SetViewTarget, matching -VoxelGICaveTest: a plain
+		// SetActorLocation leaves the movement component's velocity and the
+		// view target untouched, which is how a pose silently fails to stick.
+		P->SetActorLocation(CaveTestCameraPos, false, nullptr, ETeleportType::TeleportPhysics);
+		P->SetActorRotation(CaveTestCameraRot);
+		Ctrl->SetViewTarget(P);
+	}
+	Ctrl->SetControlRotation(CaveTestCameraRot);
 }
 
 // --- underground streaming proof: camera poses -------------------------------
