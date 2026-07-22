@@ -6363,3 +6363,148 @@ PR #70's band skip AND the sky band together against neither):
    geometry, but once R3/R4 are populated the same capacity would be better
    spent holding frame time down. `voxel.Stream.MaxAppliesPerFrame` and the ring
    floors are the knobs, and neither was re-swept against the new capacity.
+
+## PR #80 follow-up #2: all-solid skip at admission, and the moving-underground measurement that motivated it
+
+Two deliverables: the measurement PR #80 flagged as missing, and the fix it
+asked for. The measurement came first and it changed what the fix had to be.
+
+### The missing fixture, and what it found
+
+Nothing in the tree moved an underground anchor â€” the cavern shot settles and
+stands still â€” so `-VoxelPerfFlight=underground` was built first
+(`VoxelPerfRunSubsystem`). Same circle, same 20 m/s as the M1 surface flight so
+an A/B isolates depth; Z tracks the terrain at a constant 60 m offset rather
+than being pinned at the spawn column, because over a 100 m circle the surface
+moves more than the depth and a fixed Z surfaces partway round and quietly
+reports the surface flight's numbers under an underground label. The run
+reports `undergroundFrameFraction` and warns if it is not 1.0.
+
+**Moving underground is materially more expensive**, two 60 s runs per arm on a
+quiet box:
+
+| post-warmup | surface x2 | underground x2 |
+|---|---|---|
+| p95 frame | 6.86 / 6.84 ms | 5.84 / 5.87 ms |
+| max frame | 14.4 / 20.0 ms | **34.5** / 16.7 ms |
+| hitches | 0 / 0 | **1** / 0 |
+| tracked | 17.6k / 17.5k | **52.3k / 53.5k** |
+| recompute totalMs (max) | 4.82 / 4.87 ms | **12.88 / 13.99 ms** |
+| exit scan (max) | 1.83 / 1.96 ms | **3.61 / 5.03 ms** |
+| R0 entry scan (max) | 2.54 / 2.51 ms | **8.00 / 8.35 ms** |
+| subsystem tick | 6.6 / 6.3 % of wall | **19.1 / 21.0 %** |
+
+Two things PR #80's note did not anticipate. The p95 is *lower* underground â€”
+almost nothing meshes, so the renderer idles and masks the streaming cost; the
+danger is that the cost is real, already produces a 34.5 ms hitch, and the
+headroom hiding it disappears as underground gains geometry. And the exit scan
+is **not** the dominant term: R0's *entry* scan is about twice it. Both scale
+with the deep set, so the admission skip attacks the bigger one.
+
+### The all-solid test
+
+`vxc::Amplifier::solidBelowBoundMm` â€” the mirror of PR #75's
+`surfaceUpperBoundMm`, and strictly harder. `materialAt` has exactly three
+sources of air and the enumeration is closed (no `MAT_WATER`; every non-air
+material is solid): above the surface, `caveCarveAt`, `cavernCarveAt`.
+
+- Caves, crevices, shafts: **42.8 m** below the querying column's own surface,
+  all compile-time constants.
+- Caverns: anchored at absolute z off the surface at the *site's* anchor, a
+  different column. Bounded at **91 m** below that surface â€” the binding term is
+  the flat-floor clamp (`zFloorMm = zMm - floorDropMm`), which `cavernCarveAt`
+  tests before it ever evaluates the ellipsoid, so a 40 m vertical semi-axis
+  does not reach 40 m below the room centre. This independently reproduces the
+  tree's measured ~128 m max cavern depth: that figure is relative to the
+  *querying* column, which can sit ~37 m below the site over the 36.4 m reach.
+
+**Two tiers**, because a flat 91 m envelope is sound but nearly useless â€” at a
+60 m anchor depth it clears only a small cap at the bottom of the sight sphere.
+Caverns are rare (756 columns of ~100k sampled) and whether one is in reach is
+decidable from four hashes per 204.8 m coarse cell, no surface read and no site
+decode. No cavern in reach -> 42.8 m against the tight footprint; else 91 m
+against the footprint dilated by the cavern reach.
+
+Every constant is derived from the real tables or `static_assert`ed, in the same
+coupling block `surfaceUpperBoundMm` uses, plus an **independent** bedrock
+backstop (both carve passes refuse `depthMm + kCaveBedrockMarginMm >=
+bedrockDepthMm`, so nothing carves past 178 m by a separate mechanism). Two of
+those asserts caught real errors while writing this.
+
+The edit veto is the correctness crux and lives **outside** the memo, since
+`ComputeFootprintChunkZRange` must stay pure in (Level, X, Y) for the M1 hitch
+fix. `EditedFootprintMinZ` mirrors `EditedFootprintMaxZ` exactly, maintained by
+the same walk in the same one place. It vetoes the whole column below the lowest
+edit rather than tracking individual chunks: a false veto costs one record, a
+missed one is a chunk the world does not know exists where somebody is digging.
+
+### Results, interleaved A/B on one binary (`voxel.Stream.AdmissionSolidSkip`)
+
+Moving-underground flight, three interleaved pairs, all runs shown:
+
+| run | tracked | deep | deepGeo | loaded | recompute | exitScan | R0 entry | tick % wall | pwP95 | pwMax | hitch |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| off 1 | 52,910 | 43,723 | 0 | 8,282 | 13.30 | 4.69 | 7.96 | 16.59 | 5.659 | 17.07 | 0 |
+| on 1 | 31,313 | 20,023 | 58 | 15,350 | 9.13 | 2.46 | 6.12 | 11.44 | 5.884 | 17.57 | 0 |
+| off 2 | 48,783 | 40,330 | 0 | 8,412 | 11.60 | 4.24 | 7.26 | 15.74 | 5.794 | 34.82 | 2 |
+| on 2 | 31,185 | 19,991 | 64 | 15,032 | 12.13 | 2.56 | 6.55 | 11.63 | 6.081 | 31.83 | 0 |
+| off 3 | 51,080 | 42,284 | 1 | 8,509 | 10.18 | 4.28 | 7.71 | 16.95 | 6.002 | 21.37 | 0 |
+| on 3 | 30,829 | 19,821 | 64 | 15,358 | 9.16 | 2.45 | 5.53 | 10.43 | 5.942 | 21.73 | 0 |
+
+Deep records **-53%**, exit scan **-45%**, R0 entry **-20%**, subsystem tick
+**-33%**. The reclaimed budget is not banked: chunks loaded goes **+81%**, and
+`deepWithGeometry` goes **0-1 -> 58-64**. That last is the real headline â€” the
+old deep set was 43k records of solid rock crowding out the handful of chunks
+underground that actually have geometry.
+
+**Not the ~25x the follow-up estimated.** That figure came from the stationary
+cavern scene at 60.7 m depth; a 64 m sight sphere around a 60 m anchor spans
+0-124 m of depth, and most of it sits within 42.8 m of the surface where the
+cave envelope cannot prove solidity. 2.2x is the honest ceiling for a bound this
+cheap â€” going further needs per-column cave data (`ColumnDeepestAirVoxel`), i.e.
+a `column()` per candidate, which is far too expensive at admission.
+
+M1 gate, two interleaved pairs: p95 6.686-6.842 both sides, **0 hitches and 0
+frames over 16.6 ms on all four runs**. `skipped=0 floorCache=0` on the surface
+flight confirms the path is inert above ground, as designed.
+
+### Soundness evidence
+
+- voxel-core: 228/228 tests. The central one takes the claimed floor over 700
+  randomised footprints and hammers every sampled column with the real
+  `column()` and real `materialAt`: **150,033,021 voxels below the floor across
+  7,230 cave and 756 cavern columns, zero air.** Worst headroom 11.0 m (38.1 m
+  before the two-tier split, which is what keeps tier 1 honest).
+- In-engine `-VoxelVerifySolidSkip`, 60 s moving underground: **76,409 chunks
+  admitted and dispatched anyway, VIOLATIONS=0**, no UNSOUND lines. voxel-core
+  proves the bound; this proves the UE-side chunk-Z arithmetic over it.
+- Cavern screenshot with skip on vs off: visually identical, no sky, no new
+  holes; residency fan MESHED at all four elevations on both sides.
+- `-VoxelUndergroundTest` (carves a shaft/tunnel/chamber and parks the pawn in
+  it): pawn enclosed, digest server==client, and `skipped=0` in that footprint â€”
+  the edit veto disabling the skip exactly where it must.
+- Dig digest unmoved: **2,178,385 voxels / 0xFB62844A74CB9121 / 8,039 entries**,
+  identical with the skip on and off. `kWorldGenVersion` stays 5;
+  `amplifier_columns` unchanged at 0xA29A7A767DC1543B, so the bedrock
+  literal-to-constant refactor is bit-identical worldgen.
+
+Two new goldens: `amplifier_solid_below_bound` = 0xE9D395DF74D61495. Neither is
+worldgen output.
+
+### Follow-ups
+
+1. **The remaining 20k deep records are within 42.8 m of the surface.** Closing
+   that needs the per-column cave envelope, which needs `column()` per
+   candidate. The cheap version would be a *footprint-level* cave-lattice bound
+   analogous to the cavern reach test â€” the cave lattice is 25.6 m, so a level-0
+   footprint touches at most 2x2 cells, and the segment depths are decodable
+   from the lattice without a surface read. Same shape as tier 1, one level down.
+2. **`deepWithGeometry` was 0 on this flight before the change.** Worth knowing
+   that the 60 m circle on this seed passes through essentially no natural
+   caves; the geometry the skip unblocked (58-64 chunks) is at the edges of the
+   sphere. A flight routed deliberately through a cave system would be a better
+   residency fixture than a fixed-depth circle.
+3. **`voxel.Stream.UndergroundSightM`'s help text still says "40 (default)"**
+   while the default is 64 and `SightRadiusUU()` silently clamps to 64 â€” so
+   raising it from `-ExecCmds` does nothing, invisibly. Not touched here.
+
