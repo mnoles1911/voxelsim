@@ -13,13 +13,38 @@ Configuration via environment:
                        See providers/diffusion.py and
                        docs/diffusion-bringup.md. Ignored for
                        TERRAIN_PROVIDER=synthetic.
-    TERRAIN_DIFFUSION_CHECKPOINT_ID / TERRAIN_DIFFUSION_CHECKPOINT_SHA256
-                       Pin the diffusion provider's DiffusionConfig (doctrine
-                       §2.3: checkpoint sha256 must be pinned before ANY real
-                       inference, or verify_checkpoint_sha256 refuses).
-                       Leaving these unset keeps DiffusionConfig's UNPINNED
-                       default, which is fine for TERRAIN_DIFFUSION_DRY_RUN=1
-                       but is refused for a real (non-dry-run) call.
+    TERRAIN_DIFFUSION_CHECKPOINT_ID
+                       WHERE to load the checkpoint from (local snapshot
+                       path). NOT part of provider_id -- identity is
+                       content-addressed, see DiffusionConfig.
+    TERRAIN_DIFFUSION_CHECKPOINT_LABEL
+                       Human-readable checkpoint name (e.g.
+                       terrain-diffusion-30m). Hashed into provider_id;
+                       must not be a path.
+    TERRAIN_DIFFUSION_CHECKPOINT_SHA256
+                       Pin the checkpoint's content hash (doctrine §2.3: it
+                       must be pinned before ANY real inference, or
+                       verify_checkpoint_sha256 refuses).
+    TERRAIN_DIFFUSION_CONDITIONING_DIGEST
+                       Pin the conditioning rasters' content hash (WorldClim
+                       bio + data/global/etopo_10m.tif -- they condition
+                       generation, so different copies mean different
+                       terrain). From compute_conditioning_digest().
+    TERRAIN_DIFFUSION_VERSION
+                       terrain-diffusion package version/commit, when known.
+    TERRAIN_CONDITIONING_ROOT
+                       Where the conditioning rasters live (default
+                       data/global relative to CWD, matching upstream).
+    TERRAIN_DIFFUSION_PROVIDER_ID_OVERRIDE
+                       COMPATIBILITY ONLY: serve an existing cache namespace
+                       verbatim (e.g. tiles generated under the v1 id).
+                       Defeats every identity guarantee above -- see
+                       DiffusionConfig.provider_id_override.
+
+                       Leaving the pinning vars unset keeps DiffusionConfig's
+                       UNPINNED/UNVERIFIED defaults, which is fine for
+                       TERRAIN_DIFFUSION_DRY_RUN=1 but is refused for a real
+                       (non-dry-run) call.
 """
 
 from __future__ import annotations
@@ -53,22 +78,33 @@ def _make_provider(name: str, dry_run: bool = False, config: "DiffusionConfig | 
     raise ValueError(f"unknown TERRAIN_PROVIDER {name!r}")
 
 
+#: env var -> DiffusionConfig field. Every identity-bearing field the server
+#: can pin without a code change; see this module's docstring for what each
+#: means and diffusion.py for why the load path is NOT among them.
+_DIFFUSION_ENV_FIELDS = {
+    "TERRAIN_DIFFUSION_CHECKPOINT_ID": "checkpoint_id",
+    "TERRAIN_DIFFUSION_CHECKPOINT_LABEL": "checkpoint_label",
+    "TERRAIN_DIFFUSION_CHECKPOINT_SHA256": "checkpoint_sha256",
+    "TERRAIN_DIFFUSION_CONDITIONING_DIGEST": "conditioning_digest",
+    "TERRAIN_DIFFUSION_VERSION": "terrain_diffusion_version",
+    "TERRAIN_DIFFUSION_PROVIDER_ID_OVERRIDE": "provider_id_override",
+}
+
+
 def _diffusion_config_from_env() -> "DiffusionConfig | None":
-    """Build a pinned DiffusionConfig from TERRAIN_DIFFUSION_CHECKPOINT_ID /
-    _SHA256 if either is set in the environment, else None (caller falls
-    back to DiffusionProvider's own UNPINNED default -- unchanged prior
-    behavior, and still fine for TERRAIN_DIFFUSION_DRY_RUN=1)."""
-    checkpoint_id = os.environ.get("TERRAIN_DIFFUSION_CHECKPOINT_ID")
-    checkpoint_sha256 = os.environ.get("TERRAIN_DIFFUSION_CHECKPOINT_SHA256")
-    if checkpoint_id is None and checkpoint_sha256 is None:
+    """Build a pinned DiffusionConfig from the environment, or None if none of
+    the pinning vars are set (caller falls back to DiffusionProvider's own
+    UNPINNED/UNVERIFIED default -- unchanged prior behavior, and still fine
+    for TERRAIN_DIFFUSION_DRY_RUN=1)."""
+    kwargs = {
+        fieldname: os.environ[var]
+        for var, fieldname in _DIFFUSION_ENV_FIELDS.items()
+        if var in os.environ
+    }
+    if not kwargs:
         return None
     from .providers.diffusion import DiffusionConfig
 
-    kwargs = {}
-    if checkpoint_id is not None:
-        kwargs["checkpoint_id"] = checkpoint_id
-    if checkpoint_sha256 is not None:
-        kwargs["checkpoint_sha256"] = checkpoint_sha256
     return DiffusionConfig(**kwargs)
 
 

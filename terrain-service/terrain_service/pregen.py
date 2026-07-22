@@ -87,10 +87,82 @@ def main() -> int:
         "--checkpoint-sha256",
         type=str,
         default=None,
-        help="Diffusion provider only: sha256 of --checkpoint-id's weights/snapshot.",
+        help=(
+            "Diffusion provider only: sha256 of --checkpoint-id's "
+            "weights/snapshot. THIS, not the path, is what identifies the "
+            "checkpoint in provider_id."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-label",
+        type=str,
+        default=None,
+        help=(
+            "Diffusion provider only: human-readable checkpoint name (e.g. "
+            "terrain-diffusion-30m) for legible cache dirs and edit-log "
+            "stamps. Hashed into provider_id; must NOT be a path -- "
+            "--checkpoint-id is the load location and is deliberately "
+            "excluded from the identity."
+        ),
+    )
+    parser.add_argument(
+        "--conditioning-digest",
+        type=str,
+        default=None,
+        help=(
+            "Diffusion provider only: digest of the conditioning rasters "
+            "(WorldClim bio + data/global/etopo_10m.tif) from "
+            "compute_conditioning_digest(). They condition generation, so "
+            "different copies mean different terrain under what would "
+            "otherwise be one identity. Pass --print-conditioning-digest to "
+            "compute it for this box."
+        ),
+    )
+    parser.add_argument(
+        "--terrain-diffusion-version",
+        type=str,
+        default=None,
+        help="Diffusion provider only: terrain-diffusion package version/commit.",
+    )
+    parser.add_argument(
+        "--provider-id-override",
+        type=str,
+        default=None,
+        help=(
+            "COMPATIBILITY ONLY: write into an existing cache namespace "
+            "verbatim (e.g. resume tiles generated under the pre-v2 "
+            "provider_id). Defeats every identity guarantee -- see "
+            "DiffusionConfig.provider_id_override."
+        ),
+    )
+    parser.add_argument(
+        "--print-conditioning-digest",
+        action="store_true",
+        help=(
+            "Compute and print this box's conditioning digest, then exit "
+            "(nothing is generated). Run this at bring-up to get the value "
+            "for --conditioning-digest / "
+            "TERRAIN_DIFFUSION_CONDITIONING_DIGEST."
+        ),
     )
 
     args = parser.parse_args()
+
+    if args.print_conditioning_digest:
+        from .providers.diffusion import (
+            ConditioningDataMissing,
+            compute_conditioning_digest,
+            resolve_conditioning_root,
+        )
+
+        try:
+            digest = compute_conditioning_digest()
+        except ConditioningDataMissing as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        print(f"conditioning_root:   {resolve_conditioning_root()}")
+        print(f"conditioning_digest: {digest}")
+        return 0
 
     # Validate seed
     if not 0 <= args.seed < 2**64:
@@ -108,11 +180,21 @@ def main() -> int:
         from .providers.diffusion import DiffusionConfig
 
         config_kwargs: dict[str, object] = {"scale": args.scale}
-        if args.checkpoint_id is not None:
-            config_kwargs["checkpoint_id"] = args.checkpoint_id
-        if args.checkpoint_sha256 is not None:
-            config_kwargs["checkpoint_sha256"] = args.checkpoint_sha256
-        config = DiffusionConfig(**config_kwargs)
+        for flag, fieldname in (
+            (args.checkpoint_id, "checkpoint_id"),
+            (args.checkpoint_label, "checkpoint_label"),
+            (args.checkpoint_sha256, "checkpoint_sha256"),
+            (args.conditioning_digest, "conditioning_digest"),
+            (args.terrain_diffusion_version, "terrain_diffusion_version"),
+            (args.provider_id_override, "provider_id_override"),
+        ):
+            if flag is not None:
+                config_kwargs[fieldname] = flag
+        try:
+            config = DiffusionConfig(**config_kwargs)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
 
     # Initialize provider and cache
     try:
@@ -123,6 +205,12 @@ def main() -> int:
 
     cache = TileCache(args.cache_dir)
     Path(args.cache_dir).mkdir(parents=True, exist_ok=True)
+
+    # Echo the identity this run writes under: it is the cache namespace AND
+    # the value stamped into edit logs, so a run that silently landed in the
+    # wrong namespace (or under an UNPINNED/UNVERIFIEDDATA-marked id) should
+    # be obvious from the first line of the log, not discovered later.
+    print(f"provider_id: {provider.provider_id}", file=sys.stderr)
 
     # Generate tile coordinates in (2*radius+1)^2 square
     tiles_to_generate = []

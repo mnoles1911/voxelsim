@@ -83,46 +83,128 @@ unattended scripts). ETOPO must be *built*, not downloaded: the code reads
 `etopo_10m.tif`, a 10 arc-**minute** downsample, while the README points at
 NOAA's 30 arc-**second** product — see `tools/fetch_etopo.py`.
 
-## 3. Pin a checkpoint into `DiffusionConfig` — ANSWERED
+## 3. Pin a checkpoint AND the conditioning data into `DiffusionConfig`
 
-The checkpoint bundle is **`xandergos/terrain-diffusion-30m`**.
+**Which checkpoint — ANSWERED.** The bundle is **`xandergos/terrain-diffusion-30m`**.
 
 `terrain_diffusion.common.model_utils.MODEL_PATHS` is actively misleading
-here: it lists **three separate repos**, which reads as "download all
-three". It is not. `WorldPipeline.from_pretrained` takes **one** path — a
-local directory or an HF id — and pulls `coarse_model`, `base_model` and
+here: it lists **three separate repos**, which reads as "download all three".
+It is not. `WorldPipeline.from_pretrained` takes **one** path — a local
+directory or an HF id — and pulls `coarse_model`, `base_model` and
 `decoder_model` out of it via `subfolder=`. The three `MODEL_PATHS` entries
 are the separate *training* repos the bundle was assembled from. A
-`terrain-diffusion-90m` bundle also exists; it is a different resolution,
-not a newer version, and needs its own `DiffusionConfig`/`provider_id`.
+`terrain-diffusion-90m` bundle also exists; it is a different resolution, not
+a newer version, and needs its own `DiffusionConfig`/`provider_id`.
 
 `tools/fetch_checkpoint.py` downloads it and verifies the subfolder shape;
 `tools/checkpoint_sha256.py` prints the digest to pin.
 
+> **Never type that hash by hand.** On 2026-07-22 the placeholder went in with
+> its angle brackets attached (`"<ed06...>"`). A wrong hash does not fail
+> loudly — it silently changes `provider_id`, which is *both* the tile-cache
+> namespace and the edit-log provider stamp. The scripts read it from
+> `/workspace/bringup.env`; the tools reject bracketed values.
+
+`provider_id` does two load-bearing jobs: it is the tile-cache namespace, and
+it is the value stamped into the edit log that `EditLog::checkProvider()`
+compares to decide whether replaying a saved world against a tile set is safe
+(`kMismatch` = refuse the replay outright). So it has to be **content-
+addressed**: same generation inputs => same id, different inputs => different
+id, and *nothing else*.
+
+Two things must be pinned, because the model generates from two kinds of
+input:
+
+1. **The checkpoint** — `checkpoint_sha256`. Note `checkpoint_id` is the
+   **load path only** and is *deliberately excluded* from `provider_id`;
+   `checkpoint_label` is the human-readable name that goes into the id.
+2. **The conditioning data** — `conditioning_digest`. `WorldPipeline` does
+   not generate from weights alone: at bring-up it downloads the WorldClim
+   2.1 10-arc-minute bio rasters and reads `data/global/etopo_10m.tif`, and
+   `synthetic_map._compute_map_stats` derives statistics from them that
+   condition generation. Two boxes with different copies produce different
+   terrain. `tools/fetch_etopo.py` *builds* `etopo_10m.tif` from whichever
+   NOAA product was reachable (its candidate list includes both a `_bed` and
+   a `_surface` variant), so this divergence is likely, not theoretical.
+
+Get the conditioning digest for this box (run from `terrain-service/`, the
+directory containing `data/global` — the path is relative and resolved from
+CWD, same as upstream; `TERRAIN_CONDITIONING_ROOT` overrides it):
+
+```sh
+python -m terrain_service.pregen --seed 0 --radius 0 --print-conditioning-digest
+```
+
+If the rasters are absent this **refuses** and exits 1 rather than printing an
+invented digest — a provider that cannot see its conditioning data has no
+business claiming an identity.
+
+Then, in a Python shell on the GPU box:
+
 ```python
-from terrain_service.providers.diffusion import DiffusionConfig
+from terrain_service.providers.diffusion import (
+    DiffusionConfig, SamplerConfig, _sha256_of_checkpoint_path, compute_conditioning_digest,
+)
 
 config = DiffusionConfig(
-    checkpoint_id="/workspace/ckpt/terrain-diffusion-30m",  # local path, see §4.1
-    checkpoint_sha256="<64 hex chars, from tools/checkpoint_sha256.py>",
+    checkpoint_id="/workspace/ckpt/terrain-diffusion-30m",   # WHERE to load from (not in the id)
+    checkpoint_label="terrain-diffusion-30m",                # human-readable name (in the id; must NOT be a path)
+    checkpoint_sha256=_sha256_of_checkpoint_path("/workspace/ckpt/terrain-diffusion-30m"),
+    conditioning_digest=compute_conditioning_digest(),
+    terrain_diffusion_version="<git rev / package version>",
+    sampler=SamplerConfig(steps=30, guidance_scale=3.0, scheduler="ddim"),  # tune to taste
     scale=1,  # 30m/px. NB scale is a SUPERSAMPLE knob: 8 => 11.25m/px, which
-              # covers LESS ground, not more. Bring it up as a separate
+              # covers LESS ground, not more. Bring it up as a SEPARATE
               # config/provider_id once scale=1 is trusted.
 )
 print(config.provider_id())  # the cache namespace for everything below
 ```
 
-> **Never type that hash by hand.** On 2026-07-19 the placeholder went in
-> with its angle brackets attached (`"<ed06...>"`). A wrong hash does not
-> fail loudly — it silently changes `provider_id`, which is *both* the
-> tile-cache namespace and the edit-log provider stamp. The scripts read it
-> from `/workspace/bringup.env`; the tools reject bracketed values.
+Record `config.provider_id()`. Sanity-check it before generating anything:
 
-Record `config.provider_id()` — every tile generated under this checkpoint +
-sampler + scale + channel_mapping combination is cached under this key
-(doctrine §2.3: diffusion output isn't bit-deterministic across GPUs, so
-tiles are canonical data generated once and distributed, never
-regenerated-and-compared client-side).
+- It must **not** contain `UNPINNED` or `UNVERIFIEDDATA`. Those markers are
+  deliberate — an identity that hasn't pinned its checkpoint or its
+  conditioning data is printed as such so nobody caches against it by
+  accident, and real inference is refused outright by
+  `verify_checkpoint_sha256` / `verify_conditioning_digest`.
+- It must **not** contain any filesystem path. If it does, you put the mount
+  point in `checkpoint_label` (the config now rejects that outright).
+
+Every tile generated under this checkpoint + conditioning data + sampler +
+scale + channel_mapping + tile wire format is cached under this key (doctrine
+§2.3: diffusion output isn't bit-deterministic across GPUs, so tiles are
+canonical data generated once and distributed, never regenerated-and-compared
+client-side).
+
+The same env vars exist for the server and pregen CLI —
+`TERRAIN_DIFFUSION_CHECKPOINT_ID` / `_LABEL` / `_SHA256`,
+`TERRAIN_DIFFUSION_CONDITIONING_DIGEST`, `TERRAIN_DIFFUSION_VERSION`,
+`TERRAIN_CONDITIONING_ROOT` (see `app.py`'s docstring), and
+`--checkpoint-label` / `--conditioning-digest` / etc. on
+`python -m terrain_service.pregen`, which echoes `provider_id:` as its first
+line so a run in the wrong namespace is obvious immediately.
+
+### Migration: tiles generated under the pre-2026-07-22 (v1) id
+
+The v1 formula was `terrain-diffusion-{checkpoint_id}-{digest}` with the local
+load path inside it and no conditioning-data coverage — both bugs. Anything
+generated before this change carries that old id. The new scheme is
+**identity schema v2**; ids from the two schemes never collide.
+
+- **Cached tile files keep working as-is.** The cache layout is
+  `tile-cache/<provider_id>/<seed>/s<scale>/…` and UE's `-VoxelTileDir` points
+  at the **leaf** directory, so the old id survives purely as a directory
+  name nobody reads. Nothing to do.
+- **To serve or resume that old namespace by name**, set
+  `provider_id_override` (env `TERRAIN_DIFFUSION_PROVIDER_ID_OVERRIDE`, flag
+  `--provider-id-override`) to the old id verbatim. This is a compatibility
+  escape hatch: it bypasses every guarantee above, so use it to *read* an
+  existing tile set, not as a way to keep generating under a stale identity.
+- **Worlds saved with the old id stamped in their edit log** will report
+  `kMismatch` against a v2 id. That is a true positive for the checkpoint
+  path bug (same tiles, id changed for a reason that was noise) — replay
+  those worlds with the override set, or re-stamp them once. There is no way
+  to have both: the whole point of the fix is that the id changed.
 
 ## 4. Wire the real model call — DONE, this step is now verification only
 
