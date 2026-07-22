@@ -158,6 +158,17 @@ uint64_t hash2(uint64_t seed, int64_t x, int64_t y, uint channel)
                              splitmix64((uint64_t)channel))));
 }
 
+// vxc::hash3 (hash.h) bit-for-bit — one more splitmix64 round than hash2.
+// Used by the cavern pass's per-room geometry channel (CH_CAVERN_SITE), which
+// needs the room index as a third coordinate.
+uint64_t hash3(uint64_t seed, int64_t x, int64_t y, int64_t z, uint channel)
+{
+    return splitmix64(seed ^ splitmix64((uint64_t)x ^
+                             splitmix64((uint64_t)y ^
+                             splitmix64((uint64_t)z ^
+                             splitmix64((uint64_t)channel)))));
+}
+
 // Top 16 bits -> [-32768, 32767].
 int hashToSigned16(uint64_t h)
 {
@@ -287,7 +298,9 @@ RWStructuredBuffer<GpuColumnSample> OutColumns : register(u0);
 // distinct Vulkan (set=0, binding) slot, regardless of whether a given
 // kernel's compiled entry point ends up referencing it:
 //   b0 WorldGenParams -> binding 0   (both kernels)
-//   t0 ElevationMm    -> binding 1   (ColumnMain)
+//   t0 ElevationMm    -> binding 1   (ColumnMain AND, since the C6 cavern
+//                                     mirror, VoxelizeMain — cavernSiteFor
+//                                     needs the surface at the SITE's xy)
 //   t1 ClimatePacked  -> binding 2   (ColumnMain)
 //   u0 OutColumns     -> binding 3   (ColumnMain)
 //   t3 InColumns      -> binding 4   (VoxelizeMain)
@@ -332,29 +345,31 @@ uint rasterClimate(int64_t px, int64_t py)
     return ClimatePacked[(uint)(lx + ly * RasterSize.x)];
 }
 
-// --- ColumnMain: bit-exact mirror of vxc::Amplifier::column ----------------
-
-[numthreads(8, 8, 1)]
-void ColumnMain(uint3 tid : SV_DispatchThreadID)
+// --- evalSurface: bit-exact mirror of vxc::Amplifier::evalSurface ----------
+// The surface half of column() — bilinear tile base plus the slope-scaled
+// detail octaves, and the two by-products (tile pixel, tile slope) the rest of
+// ColumnMain needs.
+//
+// C4 factored this out on the CPU for ONE reason, and it is the reason it
+// exists here too: the cavern pass anchors rooms at ABSOLUTE z, so
+// `cavernSiteFor` needs the terrain height at the SITE's own xy rather than at
+// the querying column's, and that height must be produced by the very same
+// function the querying column's own surfaceMm came from. VoxelizeMain
+// therefore calls this directly (see cavernSiteFor below) instead of
+// GpuColumnSample being widened to carry a site surface — which it could not
+// do anyway, since the site is not a column in the dispatch.
+//
+// CALLER CONTRACT: this reads ElevationMm, so any kernel that calls it must
+// have the raster bound and must have already refused PixelSizeMm == 0.
+struct SurfaceEval
 {
-    if (tid.x >= DispatchColumns.x || tid.y >= DispatchColumns.y)
-        return;
+    int64_t px, py;          // tile pixel of the bilinear base tap
+    int64_t slopeMmPerPx;    // tile-level slope, conditions detail + soil depth
+    int surfaceMm;
+};
 
-    // HARDENING (2026-07 cross-vendor UB pass, issue 4). PixelSizeMm is a
-    // host-supplied divisor that reaches floorDiv/truncDiv below (and
-    // `pxMm * pxMm`). Zero would be an OpUDiv-by-zero: undefined in SPIR-V,
-    // so the result is whatever the vendor's integer unit happens to produce
-    // (and on some stacks it can fault). There is no meaningful column to
-    // derive from a zero-size pixel, so refuse the dispatch deterministically.
-    // Mirrored by a host-side assert in voxel-core/bench/gpu_harness.cpp.
-    // GUARD ONLY: valid PixelSizeMm is 30000 (scale 1) or 11250 (scale 8) —
-    // never 0 — so this branch is never taken on any real dispatch.
-    if (PixelSizeMm == 0)
-        return;
-
-    const uint64_t seed = ((uint64_t)SeedHi << 32) | (uint64_t)SeedLo;
-    const int64_t vx = (int64_t)OriginVx + (int64_t)tid.x;
-    const int64_t vy = (int64_t)OriginVy + (int64_t)tid.y;
+SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
+{
     const int64_t xMm = vx * kVoxelSizeMm;
     const int64_t yMm = vy * kVoxelSizeMm;
     const int64_t pxMm = (int64_t)PixelSizeMm;
@@ -389,13 +404,50 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
     }
     detailMm = truncDiv(detailMm * sScale, 1024);
 
+    SurfaceEval s;
+    s.px = px;
+    s.py = py;
+    s.slopeMmPerPx = slopeMmPerPx;
+    s.surfaceMm = (int)clamp64(baseMm + detailMm, -8000000, 9000000);
+    return s;
+}
+
+// --- ColumnMain: bit-exact mirror of vxc::Amplifier::column ----------------
+
+[numthreads(8, 8, 1)]
+void ColumnMain(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= DispatchColumns.x || tid.y >= DispatchColumns.y)
+        return;
+
+    // HARDENING (2026-07 cross-vendor UB pass, issue 4). PixelSizeMm is a
+    // host-supplied divisor that reaches floorDiv/truncDiv below (and
+    // `pxMm * pxMm`). Zero would be an OpUDiv-by-zero: undefined in SPIR-V,
+    // so the result is whatever the vendor's integer unit happens to produce
+    // (and on some stacks it can fault). There is no meaningful column to
+    // derive from a zero-size pixel, so refuse the dispatch deterministically.
+    // Mirrored by a host-side assert in voxel-core/bench/gpu_harness.cpp.
+    // GUARD ONLY: valid PixelSizeMm is 30000 (scale 1) or 11250 (scale 8) —
+    // never 0 — so this branch is never taken on any real dispatch.
+    if (PixelSizeMm == 0)
+        return;
+
+    const uint64_t seed = ((uint64_t)SeedHi << 32) | (uint64_t)SeedLo;
+    const int64_t vx = (int64_t)OriginVx + (int64_t)tid.x;
+    const int64_t vy = (int64_t)OriginVy + (int64_t)tid.y;
+
+    const SurfaceEval se = evalSurface(seed, vx, vy);
+    const int64_t px = se.px;
+    const int64_t py = se.py;
+    const int64_t slopeMmPerPx = se.slopeMmPerPx;
+
     const uint cl = rasterClimate(px, py);
     const uint clTemperature = cl & 0xff;
     const uint clSeasonality = (cl >> 8) & 0xff;
     const uint clPrecipitation = (cl >> 16) & 0xff;
 
     GpuColumnSample outCol;
-    outCol.surfaceMm = (int)clamp64(baseMm + detailMm, -8000000, 9000000);
+    outCol.surfaceMm = se.surfaceMm;
 
     int64_t topsoil =
         clamp64(300 + (int64_t)clPrecipitation * 8 - truncDiv(slopeMmPerPx, 4), 0, 2500);
@@ -406,8 +458,13 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
 
     outCol.subsoilMm = (int)clamp64(topsoil * 2 + 500, 0, 6000);
 
+    // Bedrock top: a jittered band CENTRED ON 200 m. kWorldGenVersion 5 moved
+    // this from 40-60 m to 180-220 m (amplifier.cpp — read its comment for
+    // why 200 m is the band's MEAN, not its floor). Same deterministic shape
+    // as before, one 16-bit hash field linearly mapped onto [base, base+span);
+    // only the two constants moved.
     const uint64_t bj = hash2(seed, vx >> 6, vy >> 6, CH_BEDROCK_JITTER);
-    outCol.bedrockDepthMm = (int)(40000 + ((bj >> 48) * 20000) / 65536);
+    outCol.bedrockDepthMm = (int)(180000 + ((bj >> 48) * 40000) / 65536);
 
     // Surface material from biome classification (M4) — morphology gates
     // then Whittaker climate lookup, bit-exact mirror of
@@ -488,13 +545,32 @@ static const int64_t kCaveRoofMinMm = 6000;
 static const int64_t kCaveBedrockMarginMm = 2000;
 static const int kCaveMinSurfaceMm = 12000;
 static const int64_t kCaveMinVoxelZ = 0;
-static const int kMaxCaveSegs = 8;
+// Raised 8 -> 12 by M4 cave pass v2 (C2): a crevice can now ride the SAME
+// lattice edge as a tunnel, so a junction column can see 4 tunnels + 4
+// crevices; 12 leaves headroom. Mirrors caves.h's kMaxCaveSegs exactly — the
+// cap is part of the worldgen contract because it decides, together with the
+// (dj, di, dir) iteration order, which segments survive if it were ever hit.
+static const int kMaxCaveSegs = 12;
+
+// Crevices (M4 cave pass v2, docs/cavern-design.md §4): a 1-in-8 gated thin
+// lens-tapered vertical slab riding an EXISTING tube's axis. Not a new
+// generator and not a new per-voxel mechanism — it emits an ordinary CaveSeg
+// in depth space, so caveCarveAt is untouched.
+static const uint64_t kCrevGateMask = 7;
+static const int64_t kCrevHalfThickMinMm = 300;
+static const int64_t kCrevHalfThickSpanMm = 500;
+static const int64_t kCrevUpMinMm = 3000;
+static const int64_t kCrevUpSpanMm = 7000;
+static const int64_t kCrevDownMinMm = 2000;
+static const int64_t kCrevDownSpanMm = 4000;
 
 // HashChannel ids from voxelcore/caves.h — append only, never renumber.
 static const uint CH_CAVE_NODE = 18;
 static const uint CH_CAVE_EDGE = 19;
 static const uint CH_CAVE_RADIUS = 20;
 static const uint CH_CAVE_SHAFT = 21;
+// 22/23/25 belong to the cavern pass below (CH_CAVERN_SITE/_ROUGH/_FLOOD).
+static const uint CH_CREVICE = 24;
 
 struct GpuCaveColumn
 {
@@ -605,6 +681,58 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
                     cc.segDepthMm[cc.segCount] = (int)cdMm;
                     cc.segCount += 1;
                 }
+
+                // Crevice: a 1-in-8 gated thin vertical slab riding this same
+                // edge. Only reachable here because marginSq > 0 already put
+                // us within the (wider) tunnel radius of this axis, and
+                // kCrevHalfThickMaxMm < kCaveRadiusMinMm, so a column outside
+                // the tube is provably outside the crevice's narrower
+                // corridor too — no separate reject was skipped.
+                //
+                // caves.h computes this hash for every existing edge (its
+                // lattice block) and reads it only here; recomputing it lazily
+                // is the same pure function of (seed, i, j, dir), so the value
+                // is identical.
+                const uint64_t crevH = hash2(seed, ei, ej * 2 + (int64_t)dir, CH_CREVICE);
+                if (((crevH >> 61) & kCrevGateMask) == 0)
+                {
+                    const int64_t tMm =
+                        kCrevHalfThickMinMm +
+                        (int64_t)(((crevH & 0xFFFFFULL) * (uint64_t)kCrevHalfThickSpanMm) >> 20);
+                    if (ex * ex + ey * ey <= tMm * tMm)
+                    {
+                        const int64_t hUpMm =
+                            kCrevUpMinMm +
+                            (int64_t)((((crevH >> 20) & 0xFFFFFULL) * (uint64_t)kCrevUpSpanMm) >> 20);
+                        const int64_t hDownMm =
+                            kCrevDownMinMm +
+                            (int64_t)((((crevH >> 40) & 0xFFFFFULL) * (uint64_t)kCrevDownSpanMm) >> 20);
+                        // Per-column clamp: never let the slab's top reach
+                        // shallower than the roof clamp, so a crevice pinches
+                        // out gracefully instead of getting a flat lid from
+                        // caveCarveAt's own guard.
+                        const int64_t hUpEffMm = clamp64(hUpMm, 0, cdMm - kCaveRoofMinMm);
+                        const int64_t halfSpanMm = truncDiv(hUpEffMm + hDownMm, 2);
+                        // Lens taper 4u(1-u), u = num/den, in Q16 FIXED POINT
+                        // rather than the exact rational num*(den-num)/den^2:
+                        // den = dx^2+dy^2 reaches ~5e9 mm^2 for a jittered
+                        // edge, so den*den overflows int64. caves.h found that
+                        // overflow and took the same Q16 route — this mirrors
+                        // it exactly, including both floorDivs.
+                        const int64_t uQ16 = floorDiv(num << 16, den);
+                        const int64_t taperQ16 = (4 * uQ16 * ((int64_t)65536 - uQ16)) >> 16;
+                        const int64_t halfSpanTaperedMm =
+                            floorDiv(halfSpanMm * taperQ16, (int64_t)65536);
+                        const int64_t crevMarginSq = halfSpanTaperedMm * halfSpanTaperedMm;
+                        if (crevMarginSq > 0 && cc.segCount < kMaxCaveSegs)
+                        {
+                            cc.segMarginSq[cc.segCount] = (int)crevMarginSq;
+                            cc.segDepthMm[cc.segCount] =
+                                (int)(cdMm + floorDiv(hDownMm - hUpEffMm, 2));
+                            cc.segCount += 1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -656,18 +784,314 @@ bool caveCarveAt(GpuCaveColumn cc, int surfaceMm, int bedrockDepthMm, int64_t vz
     return false;
 }
 
-// vxc::Amplifier::materialAt bit-for-bit (stratigraphy minus the cave pass).
-uint materialAt(GpuColumnSample col, GpuCaveColumn cc, int64_t vz)
+// --- M4 cave pass v2 cavern pass -------------------------------------------
+// Bit-exact mirror of voxelcore/caverns.h. Read that header for WHY sites are
+// hash-gated backbone-crossing nodes 204.8 m apart, why each open site is a
+// COAXIAL chain of four ellipsoid rooms descending from the anchor, and why
+// the per-voxel roof/bedrock/sea clamps are LOAD-BEARING here rather than
+// backstops (caverns anchor at absolute z, so a level room under sloping
+// terrain has no draped-depth guarantee to fall back on). The code below is a
+// line-for-line transliteration so the two can be diffed by eye.
+//
+// The CPU splits this into cavernCandidatesFor (per coarse cell) +
+// cavernSiteFor (per site) + cavernColumnFromSites (per column) purely so
+// amplifier.cpp can memoise the first two — each is a pure function of the
+// coarse cell / site respectively. The fused form below is what caverns.h
+// calls "the pure, self-contained f(...) the HLSL mirror is written against",
+// and is bit-identical by construction: same arithmetic, same (dj, di, room)
+// iteration order.
+
+static const int64_t kCavernCoarseLatticeRatio = 8;
+static const int64_t kCavernCoarseMm = kCaveLatticeMm * kCavernCoarseLatticeRatio; // 204800
+static const uint64_t kCavernSiteGateMask = 3; // bits 60..61 of CH_CAVE_NODE == 0 -> open
+static const int kCavernMinSurfaceMm = 20000;  // stricter than kCaveMinSurfaceMm, SITE only
+static const int kCavernChildCount = 4;
+static const int64_t kCavernRxyMinMm = 12000;
+static const int64_t kCavernRxySpanMm = 16000;
+static const int64_t kCavernRxyMaxMm = kCavernRxyMinMm + kCavernRxySpanMm;
+static const int64_t kCavernRz0MinMm = 4000;
+static const int64_t kCavernRz0SpanMm = 6000;
+static const int64_t kCavernRzDeepMinMm = 12000;
+static const int64_t kCavernRzDeepSpanMm = 28000;
+static const int64_t kCavernFloorDropMinMm = 3000;
+static const int64_t kCavernFloorDropSpanMm = 12000;
+static const int64_t kCavernStepDownMinMm = 2000;
+static const int64_t kCavernStepDownSpanMm = 12000;
+static const int64_t kCavernRoughLatticeMm = 6400;
+static const int64_t kCavernRoughAmpQ10 = 307;
+static const int64_t kCavernRoughMinQ10 = 717;  // 1024 - kCavernRoughAmpQ10
+static const int64_t kCavernRoughMaxQ10 = 1331; // 1024 + kCavernRoughAmpQ10
+// kCaveRoofMinMm + kCavernRoofSafetyMarginMm + kCavernRz0MaxMm, and
+// caveNode()'s own depth ceiling (kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm).
+static const int64_t kCavernNodeDepthSafeMinMm = 18000;
+static const int64_t kCavernNodeDepthSafeMaxMm = 34000;
+// (kCavernRxyMaxMm * kCavernRoughMaxQ10) / 1024 = (28000 * 1331) / 1024, i.e.
+// the widest a roughened room radius can reach from the anchor. Written as a
+// literal rather than the expression so no `/` appears at file scope.
+static const int64_t kCavernMaxReachMm = 36394;
+static const int64_t kCavernMaxReachSqMm = kCavernMaxReachMm * kCavernMaxReachMm;
+static const int64_t kCavernFloodMinMm = 800;
+static const int64_t kCavernFloodSpanMm = 2400;
+static const uint kCavernFloodDryThreshold32 = 1717986918u; // (4 << 32) / 10
+static const int kMaxCavernSegs = 6;
+// vxc::CavernSite/CavernColumn's INT32_MIN "dry" sentinel. Spelled as a hex
+// bit pattern because HLSL parses -2147483648 as a negation of a literal that
+// does not fit in int.
+static const int kCavernDryZMm = (int)0x80000000u;
+
+static const uint CH_CAVERN_SITE = 22;  // per-room geometry (radii/floor/step)
+static const uint CH_CAVERN_ROUGH = 23; // per-column wall roughness
+static const uint CH_CAVERN_FLOOD = 25; // per-site flood level
+
+// vxc::cavernHashField10 — unsigned 10-bit field -> [0, spanMm), multiply-
+// then-shift, never a division. The CPU takes a `shift` parameter; here the
+// caller pre-shifts instead, so every shift distance in this file stays an
+// integer LITERAL (a variable shift distance is undefined past the operand
+// width and is one of tools/lint-shader-ub.py's rules). Same value.
+int64_t cavernField10(uint64_t hShifted, int64_t spanMm)
+{
+    return (int64_t)(((hShifted & 0x3FFULL) * (uint64_t)spanMm) >> 10);
+}
+
+struct GpuCaveNode
+{
+    int64_t xMm, yMm, depthMm;
+};
+
+// vxc::CavernSite. xy is always the anchor's (every room is coaxial), so only
+// the per-room z, radii and floor are carried.
+struct GpuCavernSite
+{
+    bool valid;
+    int64_t anchorZMm;
+    int64_t childZMm[kCavernChildCount];
+    int64_t childRxyMm[kCavernChildCount];
+    int64_t childRzMm[kCavernChildCount];
+    int64_t childFloorZMm[kCavernChildCount];
+    int floodZMm;
+};
+
+// vxc::CavernColumn.
+struct GpuCavernColumn
+{
+    int count;
+    int marginSq[kMaxCavernSegs];
+    int zCenterMm[kMaxCavernSegs];
+    int zFloorMm[kMaxCavernSegs];
+    int floodZMm;
+};
+
+// vxc::cavernSiteFor bit-for-bit.
+//
+// THE surfaceAt CONTRACT (caverns.h, and the whole reason evalSurface exists
+// as a separate function on both sides): the surface is sampled at the SITE's
+// OWN (node.xMm, node.yMm), NOT at the querying column's xy. A lake or room
+// floor that drapes with the terrain overhead is visibly wrong; caverns anchor
+// at absolute z so floors and water tables stay level. amplifier.cpp supplies
+// `evalSurface(floorDiv(xMm, kVoxelSizeMm), floorDiv(yMm, kVoxelSizeMm))
+// .surfaceMm` — including the mm -> voxel floorDiv, mirrored exactly below.
+GpuCavernSite cavernSiteFor(uint64_t seed, int64_t fi, int64_t fj, GpuCaveNode node)
+{
+    GpuCavernSite site;
+    site.valid = false;
+    site.anchorZMm = 0;
+    site.floodZMm = kCavernDryZMm;
+    [unroll]
+    for (int q = 0; q < kCavernChildCount; ++q)
+    {
+        site.childZMm[q] = 0;
+        site.childRxyMm[q] = 0;
+        site.childRzMm[q] = 0;
+        site.childFloorZMm[q] = 0;
+    }
+
+    const int siteSurfaceMm = evalSurface(seed, floorDiv(node.xMm, (int64_t)kVoxelSizeMm),
+                                          floorDiv(node.yMm, (int64_t)kVoxelSizeMm))
+                                  .surfaceMm;
+    if (siteSurfaceMm < kCavernMinSurfaceMm) return site; // beach/ocean guard on the SITE
+
+    site.anchorZMm = (int64_t)siteSurfaceMm - node.depthMm;
+
+    int64_t maxFloorZMm = (int64_t)0x8000000000000000ULL; // INT64_MIN
+    int64_t prevZMm = site.anchorZMm;
+    for (int c = 0; c < kCavernChildCount; ++c)
+    {
+        const uint64_t h = hash3(seed, fi, fj, (int64_t)c, CH_CAVERN_SITE);
+        const bool isRoot = (c == 0);
+
+        const int64_t rxyMm = kCavernRxyMinMm + cavernField10(h, kCavernRxySpanMm);
+        const int64_t rzMm = isRoot ? kCavernRz0MinMm + cavernField10(h >> 10, kCavernRz0SpanMm)
+                                    : kCavernRzDeepMinMm + cavernField10(h >> 10, kCavernRzDeepSpanMm);
+        const int64_t floorDropMm =
+            kCavernFloorDropMinMm + cavernField10(h >> 20, kCavernFloorDropSpanMm);
+        const int64_t stepDownMm =
+            isRoot ? 0 : kCavernStepDownMinMm + cavernField10(h >> 30, kCavernStepDownSpanMm);
+
+        const int64_t zMm = isRoot ? site.anchorZMm : prevZMm - stepDownMm;
+        prevZMm = zMm;
+
+        site.childZMm[c] = zMm;
+        site.childRxyMm[c] = rxyMm;
+        site.childRzMm[c] = rzMm;
+        site.childFloorZMm[c] = zMm - floorDropMm;
+        if (site.childFloorZMm[c] > maxFloorZMm) maxFloorZMm = site.childFloorZMm[c];
+    }
+
+    // Flood level: 40% of open sites dry, else a level just above the highest
+    // room floor, clamped below the anchor and above zero.
+    const uint64_t floodHash = hash2(seed, fi, fj, CH_CAVERN_FLOOD);
+    if ((uint)(floodHash >> 32) >= kCavernFloodDryThreshold32)
+    {
+        const int64_t floodMm =
+            maxFloorZMm + kCavernFloodMinMm + cavernField10(floodHash, kCavernFloodSpanMm);
+        site.floodZMm = (int)clamp64(floodMm, 1, site.anchorZMm - 1);
+    }
+
+    site.valid = true;
+    return site;
+}
+
+// vxc::cavernColumnFor bit-for-bit — the fused candidates + per-column
+// reduction, including the (dj, di) corner order and the per-room order that
+// together decide which segments survive the kMaxCavernSegs cap.
+GpuCavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm)
+{
+    GpuCavernColumn cv;
+    cv.count = 0;
+    cv.floodZMm = kCavernDryZMm;
+    [unroll]
+    for (int q = 0; q < kMaxCavernSegs; ++q)
+    {
+        cv.marginSq[q] = 0;
+        cv.zCenterMm[q] = 0;
+        cv.zFloorMm[q] = 0;
+    }
+    // The QUERYING column's ordinary ocean/beach guard — deliberately the more
+    // permissive kCaveMinSurfaceMm; kCavernMinSurfaceMm is stricter and
+    // applies only to the SITE's own surface, inside cavernSiteFor.
+    if (surfaceMm < kCaveMinSurfaceMm) return cv;
+
+    const int64_t xMm = vx * (int64_t)kVoxelSizeMm;
+    const int64_t yMm = vy * (int64_t)kVoxelSizeMm;
+    const int64_t si = floorDiv(xMm, kCavernCoarseMm);
+    const int64_t sj = floorDiv(yMm, kCavernCoarseMm);
+
+    for (int dj = 0; dj < 2; ++dj)
+    {
+        for (int di = 0; di < 2; ++di)
+        {
+            const int64_t fi = (si + (int64_t)di) * kCavernCoarseLatticeRatio;
+            const int64_t fj = (sj + (int64_t)dj) * kCavernCoarseLatticeRatio;
+
+            // vxc::cavernCandidatesFor: cheapest reject first — the site gate
+            // folded into bits 60/61 of the node-jitter hash caveNode() would
+            // compute anyway, then the node those same bits also encode
+            // (vxc::caveNodeFromHash), then child 0's depth safety window.
+            const uint64_t hn = hash2(seed, fi, fj, CH_CAVE_NODE);
+            if (((hn >> 60) & kCavernSiteGateMask) != 0) continue;
+            GpuCaveNode node;
+            node.xMm = fi * kCaveLatticeMm +
+                       (int64_t)(((hn & 0xFFFFFULL) * (uint64_t)kCaveLatticeMm) >> 20);
+            node.yMm = fj * kCaveLatticeMm +
+                       (int64_t)((((hn >> 20) & 0xFFFFFULL) * (uint64_t)kCaveLatticeMm) >> 20);
+            node.depthMm =
+                kCaveNodeDepthMinMm +
+                (int64_t)((((hn >> 40) & 0xFFFFFULL) * (uint64_t)kCaveNodeDepthSpanMm) >> 20);
+            if (node.depthMm < kCavernNodeDepthSafeMinMm ||
+                node.depthMm > kCavernNodeDepthSafeMaxMm)
+                continue;
+
+            // Every room shares the anchor's xy (coaxial chain), so this
+            // distance is computed ONCE per column, not once per room.
+            const int64_t ex = xMm - node.xMm;
+            const int64_t ey = yMm - node.yMm;
+            const int64_t dxySq = ex * ex + ey * ey;
+            if (dxySq > kCavernMaxReachSqMm) continue;
+
+            // Full reduction: the one place the terrain raster is read. At
+            // most one corner per column ever reaches here (caverns.h
+            // static_assert), so no column does this twice.
+            const GpuCavernSite site = cavernSiteFor(seed, fi, fj, node);
+            if (!site.valid) continue;
+
+            // Wall roughness: one 2D value-noise sample for this column,
+            // shared by every room of this site.
+            const int64_t roughQ10 =
+                clamp64(1024 + truncDiv(valueNoise2(seed, xMm, yMm, kCavernRoughLatticeMm,
+                                                    CH_CAVERN_ROUGH) *
+                                            kCavernRoughAmpQ10,
+                                        32768),
+                        kCavernRoughMinQ10, kCavernRoughMaxQ10);
+
+            for (int c = 0; c < kCavernChildCount; ++c)
+            {
+                const int64_t rxyMm = site.childRxyMm[c];
+                const int64_t rzMm = site.childRzMm[c];
+                const int64_t rxySq = rxyMm * rxyMm;
+                const int64_t rxySqRough = truncDiv(rxySq * roughQ10, 1024);
+                if (dxySq >= rxySqRough) continue; // this room doesn't reach here
+                const int64_t marginSq = truncDiv(rzMm * rzMm * (rxySqRough - dxySq), rxySqRough);
+                if (marginSq <= 0) continue;
+                if (cv.count < kMaxCavernSegs)
+                {
+                    cv.marginSq[cv.count] = (int)marginSq;
+                    cv.zCenterMm[cv.count] = (int)site.childZMm[c];
+                    cv.zFloorMm[cv.count] = (int)site.childFloorZMm[c];
+                    cv.count += 1;
+                }
+            }
+            cv.floodZMm = site.floodZMm;
+        }
+    }
+    return cv;
+}
+
+// vxc::cavernCarveAt bit-for-bit. Same guard order/shape as caveCarveAt, minus
+// the sinkhole exception (caverns have no construct allowed through the roof).
+bool cavernCarveAt(GpuCavernColumn cv, int surfaceMm, int bedrockDepthMm, int64_t vz)
+{
+    if (cv.count == 0) return false;
+    if (vz < kCaveMinVoxelZ) return false;
+    if (surfaceMm < kCaveMinSurfaceMm) return false;
+
+    const int64_t zAbs = vz * (int64_t)kVoxelSizeMm + (int64_t)kVoxelSizeMm / 2;
+    const int64_t depthMm = (int64_t)surfaceMm - zAbs;
+    if (depthMm < 0) return false; // above ground
+    if (depthMm < kCaveRoofMinMm) return false;
+    if (depthMm + kCaveBedrockMarginMm >= (int64_t)bedrockDepthMm) return false;
+
+    for (int s = 0; s < cv.count; ++s)
+    {
+        if (zAbs < (int64_t)cv.zFloorMm[s]) continue; // flat floor clamp
+        const int64_t dz = zAbs - (int64_t)cv.zCenterMm[s];
+        if (dz * dz < (int64_t)cv.marginSq[s]) return true;
+    }
+    return false;
+}
+
+// vxc::Amplifier::materialAt bit-for-bit (stratigraphy, then caves, then
+// caverns — caverns ordered last purely because a cavern column is far rarer,
+// so the common case never reaches that call: cavernCarveAt's first test is
+// `count == 0`).
+uint materialAt(GpuColumnSample col, GpuCaveColumn cc, GpuCavernColumn cv, int64_t vz)
 {
     const uint m = stratigraphyAt(col, vz);
     if (m == MAT_AIR || m == MAT_BEDROCK) return m;
-    return caveCarveAt(cc, col.surfaceMm, col.bedrockDepthMm, vz) ? MAT_AIR : m;
+    if (caveCarveAt(cc, col.surfaceMm, col.bedrockDepthMm, vz)) return MAT_AIR;
+    if (cavernCarveAt(cv, col.surfaceMm, col.bedrockDepthMm, vz)) return MAT_AIR;
+    return m;
 }
 
 [numthreads(8, 8, 1)]
 void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
 {
     if (tid.x >= DispatchColumns.x || tid.y >= DispatchColumns.y)
+        return;
+
+    // Same guard as ColumnMain, and now load-bearing for the same reason: the
+    // cavern pass calls evalSurface (for the SITE's surface height), which
+    // divides by PixelSizeMm. GUARD ONLY — valid values are 30000 or 11250.
+    if (PixelSizeMm == 0)
         return;
 
     const uint bx = tid.x / 8u, by = tid.y / 8u;
@@ -680,8 +1104,18 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
     // Cave pass: one reduction per column, reused down the whole brick stack —
     // the same split vxc::ColumnSample::cave makes on the CPU.
     const uint64_t caveSeed = ((uint64_t)SeedHi << 32) | (uint64_t)SeedLo;
-    const GpuCaveColumn cave = caveColumnFor(caveSeed, (int64_t)OriginVx + (int64_t)tid.x,
-                                             (int64_t)OriginVy + (int64_t)tid.y, col.surfaceMm);
+    const int64_t colVx = (int64_t)OriginVx + (int64_t)tid.x;
+    const int64_t colVy = (int64_t)OriginVy + (int64_t)tid.y;
+    const GpuCaveColumn cave = caveColumnFor(caveSeed, colVx, colVy, col.surfaceMm);
+
+    // Cavern pass, wired in exactly as the cave pass above: one reduction per
+    // column, reused down the whole brick stack. Unlike caves it DOES read the
+    // raster — cavernSiteFor evaluates the terrain height at the site's own xy
+    // (see its comment) — so VoxelizeMain now binds ElevationMm (t3 -> Vulkan
+    // binding 1). caverns.h's design doc §3.5 chose this over widening
+    // GpuColumnSample: the site is generally not a column in the dispatch, so
+    // there is no column entry to carry its surface on.
+    const GpuCavernColumn cavern = cavernColumnFor(caveSeed, colVx, colVy, col.surfaceMm);
 
     for (uint bz = 0; bz < BricksZ; ++bz)
     {
@@ -692,7 +1126,8 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
         {
             const int64_t vz = brickZ * (int64_t)8 + (int64_t)z;
             // lint-shader-ub: allow UNGUARDED_WRITE - index is bounded by construction: the entry guard caps tid below DispatchColumns, so footprintIndex < bricksX*bricksY and brickIndex < bricksX*bricksY*BricksZ, while lx/ly/z are all < 8; the host sizes OutCells to exactly bricksX*bricksY*BricksZ*512 (contract mirrored in gpu_harness.cpp, asserted there)
-            OutCells[brickIndex * 512u + cellIndexInBrick(lx, ly, z)] = materialAt(col, cave, vz);
+            OutCells[brickIndex * 512u + cellIndexInBrick(lx, ly, z)] =
+                materialAt(col, cave, cavern, vz);
         }
     }
 }
