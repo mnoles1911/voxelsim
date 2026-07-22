@@ -1409,6 +1409,47 @@ bool GetPerLevelRefillEnabled()
 	return GPerLevelRefill != 0;
 }
 
+// All-solid ADMISSION skip (PR #80 follow-up #2, its author's own top-ranked
+// item). The buried-chunk skip already declines to DISPATCH an all-solid chunk,
+// so those cost almost no worker time -- but they are all still tracked
+// records, and the record count is what both the exit scan and R0's entry scan
+// are O(). Measured on the moving-underground flight added in this same wave:
+// 52-53 k tracked of which 43-44 k deep, streaming subsystem at 19-21% of wall
+// against the surface flight's 6.3-6.6%, and 96% of the deep set never produces
+// geometry.
+//
+// 1 (default): a deep candidate whose apron-inclusive top is provably below
+// vxc::Amplifier::solidBelowBoundMm never becomes a record at all.
+// 0: the shipped form -- admit it, then decline to dispatch it later.
+//
+// Safe to drive from -ExecCmds for the same reason voxel.Stream.UndergroundSightM
+// is: the deep set does not exist until the anchor first goes underground,
+// which on any scripted flight is long after cvars have been applied.
+static int32 GSolidSkip = 1;
+static FAutoConsoleVariableRef CVarSolidSkip(
+	TEXT("voxel.Stream.AdmissionSolidSkip"),
+	GSolidSkip,
+	TEXT("1 (default): skip ADMITTING anchor-relative deep chunks that are provably all solid rock, rather than "
+	     "admitting them and declining to dispatch them later. 0: the pre-change form. The proof is "
+	     "vxc::Amplifier::solidBelowBoundMm; it is vetoed by any edit in the footprint at or below the chunk."),
+	ECVF_Default);
+
+bool SolidSkipEnabled()
+{
+	return GSolidSkip != 0;
+}
+
+// -VoxelVerifySolidSkip: admit the chunks the skip would have dropped, and
+// record them so DrainResults can check they really did mesh to zero quads.
+// voxel-core's tests prove the BOUND against the real amplifier; this proves
+// the UE-side chunk-Z arithmetic that turns the bound into a per-chunk verdict,
+// which is the half an off-by-one would actually live in.
+inline bool VerifySolidSkipEnabled()
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelVerifySolidSkip"));
+	return bEnabled;
+}
+
 bool GetRingQuotaEnabled()
 {
 	static const bool bEnabled = []
@@ -1777,6 +1818,27 @@ struct FVoxelWorldImpl
 	// reduction. Sized by edited footprints, not by world extent.
 	TMap<FIntPoint, int32> EditedFootprintMaxZ[VoxelCoords::kNumLevels];
 
+	// LOWEST edited chunk Z per (level, footprint XY) -- the mirror of the map
+	// above, and the correctness crux of the all-solid admission skip (see
+	// VoxelStreamAdmission::SolidSkipEnabled and RecomputeDesiredSet).
+	//
+	// The analytic floor from Amplifier::solidBelowBoundMm is a statement about
+	// WORLDGEN, and worldgen is not the only thing that puts air underground: a
+	// player digs. A chunk 50 m down that the bound correctly calls all-solid
+	// stops being all-solid the moment someone tunnels into it, and if that
+	// chunk was never ADMITTED there is no record, no component, and nothing to
+	// re-mesh -- strictly worse than the sky-band trim's failure mode, which at
+	// least still had a tracked record. So the skip is vetoed for any footprint
+	// with an edit at or below the candidate's Z.
+	//
+	// Lives OUTSIDE the FootprintZRangeCache memo for exactly the reason the
+	// sky-band escape hatch and the depth skirt do: the memo is keyed on
+	// (Level, X, Y) and must stay a pure function of them, which the M1 hitch
+	// fix depends on. Edits are not a function of (Level, X, Y) over time.
+	//
+	// Maintained in the same one place and by the same walk as EditedFootprintMaxZ.
+	TMap<FIntPoint, int32> EditedFootprintMinZ[VoxelCoords::kNumLevels];
+
 	// -VoxelVerifySkyBand only: chunk keys IsChunkProvablyAllAir called air,
 	// dispatched anyway so DrainResults can check the verdict against the mesh
 	// the worker really produced. Empty (and never touched) in normal runs.
@@ -1848,6 +1910,19 @@ struct FVoxelWorldImpl
 		int32 ChunkZMaxUntrimmed = 0;
 	};
 	mutable TMap<VoxelCoords::FVoxelLevelChunkKey, FFootprintZRange> FootprintZRangeCache;
+
+	// All-solid admission skip: the analytic floor (absolute mm, sea-level
+	// datum) below which every voxel of this level-L footprint is provably
+	// solid, from vxc::Amplifier::solidBelowBoundMm. INT64_MIN means it
+	// declined, which callers must read as "no information", never as solid.
+	//
+	// A SEPARATE memo from FootprintZRangeCache rather than a fourth field on
+	// FFootprintZRange, because it is consulted only for anchor-relative deep
+	// candidates -- a small minority of the calls the z-range memo serves, and
+	// none at all on a surface flight. Same key, same purity argument (a pure
+	// function of (Level, X, Y) and the immutable tile raster: no anchor, no
+	// edits), same prune.
+	mutable TMap<VoxelCoords::FVoxelLevelChunkKey, int64> FootprintSolidFloorCache;
 
 	// Buried-chunk pre-dispatch skip: level-0 footprint bands, keyed by the
 	// level-0 footprint (X,Y). Like FootprintZRangeCache this memoizes a PURE
@@ -2130,6 +2205,21 @@ struct FVoxelWorldImpl
 	int64 BuriedVerifyCheckedTotal = 0;
 	int64 BuriedVerifyViolations = 0;
 
+	// All-solid ADMISSION skip census (voxel.Stream.AdmissionSolidSkip): deep
+	// candidates that never became records at all, which is the whole point --
+	// the dispatch-time buried skip already stopped these from costing worker
+	// time, but they still cost a record in every O(ChunkRecords) pass.
+	int64 SolidSkippedAtAdmissionSinceLog = 0;
+	int64 SolidSkippedAtAdmissionTotal = 0;
+	int64 LevelSolidSkippedAtAdmission[VoxelCoords::kNumLevels] = {};
+	// -VoxelVerifySolidSkip only: chunk keys IsChunkProvablyAllSolid claimed,
+	// admitted and dispatched anyway so DrainResults can hold the claim against
+	// the mesh the worker really produced. Empty and never touched otherwise.
+	TSet<VoxelCoords::FVoxelLevelChunkKey> SolidSkipVerifyKeys;
+	int64 SolidVerifyCheckedSinceLog = 0;
+	int64 SolidVerifyCheckedTotal = 0;
+	int64 SolidVerifyViolations = 0;
+
 	// The 60fps bar is 16.6ms, but the hitch log/`UVoxelPerfRunSubsystem`'s
 	// hitch count both use the much looser 33.3ms threshold -- a recurring
 	// ~20-30ms burst is a hard 60fps violation that is completely invisible to
@@ -2243,6 +2333,17 @@ private:
 	// callers must veto on NeedsOverlayAwarePath first (a placed block is solid
 	// material in what worldgen calls sky).
 	bool IsChunkProvablyAllAir(const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const;
+	// Memoized vxc::Amplifier::solidBelowBoundMm for this level-L footprint:
+	// absolute mm below which every voxel of the footprint is provably solid,
+	// or INT64_MIN if the bound declined. Pure in (Level, ChunkX, ChunkY).
+	int64 FootprintSolidFloorMmCached(int32 Level, int32 ChunkX, int32 ChunkY) const;
+	// True iff every voxel of this chunk, apron included, is provably solid
+	// rock and therefore meshes to zero quads (voxelcore/mesher.h emits a face
+	// only where a solid voxel has an AIR neighbour). Conservative: false means
+	// "not proven", never "has geometry". Does NOT consider edits -- callers
+	// must veto on the footprint's lowest edited Z first, since a player can
+	// dig into rock this says is solid.
+	bool IsChunkProvablyAllSolid(const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const;
 	// Memoized wrapper around ComputeFootprintChunkZRange -- see
 	// FootprintZRangeCache's doc comment for why memoizing is exact.
 	void FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax,
@@ -2911,6 +3012,28 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       (long long)BuriedSkipsByLevelSinceLog[0], FootprintBandCache.Num(), (long long)BuriedVerifyCheckedSinceLog,
 	       (long long)BuriedVerifyCheckedTotal, (long long)BuriedVerifyViolations);
 	BuriedSkipsSinceLog = BuriedSkipAirSinceLog = BuriedSkipSolidSinceLog = BuriedVerifyCheckedSinceLog = 0;
+
+	// All-solid ADMISSION skip census. Deliberately its own line rather than
+	// folded into the buried-skip one above: they measure different things and
+	// confusing them would hide the point. That line counts chunks that were
+	// TRACKED and then not dispatched; this one counts chunks that never became
+	// records -- the difference the follow-up was about.
+	SolidSkippedAtAdmissionTotal += SolidSkippedAtAdmissionSinceLog;
+	SolidVerifyCheckedTotal += SolidVerifyCheckedSinceLog;
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel solid skip at admission (5s window): enabled=%d verify=%d skipped=%lld (total %lld) | ")
+	       TEXT("R0=%lld R1=%lld | floorCache=%d | verifyChecked=%lld (total %lld) VIOLATIONS=%lld"),
+	       VoxelStreamAdmission::SolidSkipEnabled() ? 1 : 0, VoxelStreamAdmission::VerifySolidSkipEnabled() ? 1 : 0,
+	       (long long)SolidSkippedAtAdmissionSinceLog, (long long)SolidSkippedAtAdmissionTotal,
+	       (long long)LevelSolidSkippedAtAdmission[0], (long long)LevelSolidSkippedAtAdmission[1],
+	       FootprintSolidFloorCache.Num(), (long long)SolidVerifyCheckedSinceLog,
+	       (long long)SolidVerifyCheckedTotal, (long long)SolidVerifyViolations);
+	SolidSkippedAtAdmissionSinceLog = 0;
+	SolidVerifyCheckedSinceLog = 0;
+	for (int64& N : LevelSolidSkippedAtAdmission)
+	{
+		N = 0;
+	}
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
 		BuriedSkipsByLevelSinceLog[Level] = 0;
@@ -3411,6 +3534,57 @@ bool FVoxelWorldImpl::IsChunkProvablyAllAir(const VoxelCoords::FVoxelLevelChunkK
 	return BottomVoxel > TopSolidUpperBound;
 }
 
+int64 FVoxelWorldImpl::FootprintSolidFloorMmCached(int32 Level, int32 ChunkX, int32 ChunkY) const
+{
+	using namespace VoxelCoords;
+
+	// Z forced to 0: this is a per-FOOTPRINT value, exactly like the z-range
+	// memo it sits beside, so every chunk in the column shares one entry.
+	const FVoxelLevelChunkKey CacheKey{Level, FVoxelChunkKey{ChunkX, ChunkY, 0}};
+	if (const int64* Cached = FootprintSolidFloorCache.Find(CacheKey))
+	{
+		return *Cached;
+	}
+
+	// Footprint in level-0 voxel indices, apron included. The apron matters:
+	// the mesher reads one voxel past the interior on every side, and a face is
+	// emitted where a solid voxel has an air neighbour -- so a chunk is only
+	// quad-free if its APRON is solid too, not just its interior.
+	const int64 LevelScale = int64(1) << Level;
+	const int64 Span = int64(ChunkEdgeVoxels) * LevelScale;
+	const int64 VX0 = int64(ChunkX) * Span - LevelScale;
+	const int64 VY0 = int64(ChunkY) * Span - LevelScale;
+	const int64 VX1 = VX0 + Span + 2 * LevelScale - 1;
+	const int64 VY1 = VY0 + Span + 2 * LevelScale - 1;
+
+	const int64 FloorMm = Voxels.amplifier().solidBelowBoundMm(VX0, VY0, VX1, VY1);
+	FootprintSolidFloorCache.Add(CacheKey, FloorMm);
+	return FloorMm;
+}
+
+bool FVoxelWorldImpl::IsChunkProvablyAllSolid(const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const
+{
+	using namespace VoxelCoords;
+
+	const int64 FloorMm = FootprintSolidFloorMmCached(LevelKey.Level, LevelKey.Key.X, LevelKey.Key.Y);
+	if (FloorMm == INT64_MIN)
+	{
+		return false; // declined to bound: never claim solid on no information
+	}
+
+	// Topmost level-0 voxel INDEX this chunk covers, apron included. A level-L
+	// chunk spans ChunkEdgeVoxels cells of (1 << Level) level-0 voxels each,
+	// and the mesher reads one level-L cell past the interior top.
+	const int64 LevelScale = int64(1) << LevelKey.Level;
+	const int64 TopVoxel = (int64(LevelKey.Key.Z) + 1) * int64(ChunkEdgeVoxels) * LevelScale + LevelScale - 1;
+
+	// That voxel's CENTRE, which is what materialAt tests against. Strict `<`:
+	// the bound's contract is that everything strictly below it is solid.
+	const int64 TopCentreMm = TopVoxel * int64(vxc::kVoxelSizeMm) + int64(vxc::kVoxelSizeMm) / 2;
+
+	return TopCentreMm < FloorMm;
+}
+
 void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax,
                                                    int32& OutChunkZMaxUntrimmed) const
 {
@@ -3558,6 +3732,22 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 			{
 				It.RemoveCurrent();
 			}
+		}
+	}
+
+	// All-solid admission skip: same key and same growth as the z-range memo,
+	// so it prunes on the same trigger and by the same rule.
+	for (auto It = FootprintSolidFloorCache.CreateIterator(); It; ++It)
+	{
+		const int32 Level = It.Key().Level;
+		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
+		const double KeepRadiusUU =
+			UVoxelWorldSubsystem::RingPresets[Level].OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier * 2.0;
+		const double CenterX = (double(It.Key().Key.X) + 0.5) * ChunkEdge;
+		const double CenterY = (double(It.Key().Key.Y) + 0.5) * ChunkEdge;
+		if (FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) > FMath::Square(KeepRadiusUU))
+		{
+			It.RemoveCurrent();
 		}
 	}
 
@@ -4019,13 +4209,52 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				int32 BoxRadius = 0;
 				if (bAnchorUnderground && VoxelUnderground::BoxRadiusChunks(Level, DistSq, BoxRadius))
 				{
+					// All-solid admission skip (see VoxelStreamAdmission::
+					// SolidSkipEnabled). The EDIT VETO is resolved here, once
+					// per footprint, and deliberately OUTSIDE the memo: the
+					// analytic floor is a statement about worldgen, and a
+					// player digging is not worldgen. If this footprint has any
+					// edit at or below a candidate's Z, that candidate is
+					// admitted normally.
+					//
+					// MIN_int32 (not MAX_int32) when there is no edit: it makes
+					// the "is the candidate at or above the lowest edit"
+					// comparison below false for every Cz, i.e. no veto, which
+					// is the common case and the one that must be branch-cheap.
+					const bool bSolidSkip = VoxelStreamAdmission::SolidSkipEnabled();
+					const int32* EditedMinZ =
+						bSolidSkip ? EditedFootprintMinZ[Level].Find(FIntPoint(Cx, Cy)) : nullptr;
+
 					for (int32 Cz = AnchorChunk.Z - BoxRadius; Cz <= AnchorChunk.Z + BoxRadius; ++Cz)
 					{
 						if (Cz >= ChunkZMin && Cz <= ChunkZMax)
 						{
 							continue;
 						}
-						AddCandidate(FVoxelLevelChunkKey{Level, FVoxelChunkKey{Cx, Cy, Cz}}, /*bDeepAnchorRelative*/ true);
+						const FVoxelLevelChunkKey DeepKey{Level, FVoxelChunkKey{Cx, Cy, Cz}};
+
+						// Veto if this footprint holds an edit at or below this
+						// chunk. Conservative on purpose: it vetoes the whole
+						// column below the lowest edit rather than tracking
+						// which chunks were edited, because the cost of a false
+						// veto is one tracked record and the cost of a missed
+						// one is a chunk the world does not know exists sitting
+						// where somebody is digging.
+						const bool bEditVeto = EditedMinZ != nullptr && Cz >= *EditedMinZ;
+						if (bSolidSkip && !bEditVeto && IsChunkProvablyAllSolid(DeepKey))
+						{
+							++SolidSkippedAtAdmissionSinceLog;
+							++LevelSolidSkippedAtAdmission[FMath::Clamp(Level, 0, VoxelCoords::kNumLevels - 1)];
+							if (!VoxelStreamAdmission::VerifySolidSkipEnabled())
+							{
+								continue;
+							}
+							// Verify mode: admit and dispatch it anyway, and
+							// remember that we claimed it solid so DrainResults
+							// can hold the claim against the real mesh.
+							SolidSkipVerifyKeys.Add(DeepKey);
+						}
+						AddCandidate(DeepKey, /*bDeepAnchorRelative*/ true);
 					}
 				}
 			}
@@ -4862,6 +5091,25 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			}
 		}
 
+		// -VoxelVerifySolidSkip soundness check, the mirror of the one above.
+		// This chunk was claimed provably ALL SOLID at admission -- i.e. the
+		// shipped path would never have tracked it at all -- and admitted
+		// anyway. If it produced quads, the all-solid bound or the chunk-Z
+		// arithmetic over it is wrong, and the skip would have left a hole in
+		// the world that no record even points at.
+		if (SolidSkipVerifyKeys.Remove(Result.Key) > 0)
+		{
+			++SolidVerifyCheckedSinceLog;
+			if (Result.Quads.Num() > 0)
+			{
+				++SolidVerifyViolations;
+				UE_LOG(LogVoxelPerf, Error,
+				       TEXT("Voxel solid skip UNSOUND: chunk L%d (%d,%d,%d) was predicted all-solid at admission ")
+				       TEXT("but meshed %d quads"),
+				       Result.Key.Level, Result.Key.Key.X, Result.Key.Key.Y, Result.Key.Key.Z, Result.Quads.Num());
+			}
+		}
+
 		// Buried-chunk skip census. Counted here -- BEFORE the stale-result
 		// discard below -- deliberately: the question is what fraction of
 		// WORKER OUTPUT meshes to zero quads, and a job whose result is later
@@ -5198,6 +5446,9 @@ void FVoxelWorldImpl::PropagateEditToMips(const TSet<VoxelCoords::FVoxelChunkKey
 	{
 		int32& MaxZ = EditedFootprintMaxZ[0].FindOrAdd(FIntPoint(Level0Chunk.X, Level0Chunk.Y), MIN_int32);
 		MaxZ = FMath::Max(MaxZ, Level0Chunk.Z);
+		// ...and the mirror, for the all-solid admission skip's edit veto.
+		int32& MinZ = EditedFootprintMinZ[0].FindOrAdd(FIntPoint(Level0Chunk.X, Level0Chunk.Y), MAX_int32);
+		MinZ = FMath::Min(MinZ, Level0Chunk.Z);
 	}
 
 	for (int32 Level = 1; Level < kNumLevels; ++Level)
@@ -5220,6 +5471,8 @@ void FVoxelWorldImpl::PropagateEditToMips(const TSet<VoxelCoords::FVoxelChunkKey
 			{
 				int32& MaxZ = EditedFootprintMaxZ[Level].FindOrAdd(FIntPoint(Ancestor.X, Ancestor.Y), MIN_int32);
 				MaxZ = FMath::Max(MaxZ, Ancestor.Z);
+				int32& MinZ = EditedFootprintMinZ[Level].FindOrAdd(FIntPoint(Ancestor.X, Ancestor.Y), MAX_int32);
+				MinZ = FMath::Min(MinZ, Ancestor.Z);
 			}
 
 			// SharedMipCache stores PURE bricks only (see its doc comment);
