@@ -254,6 +254,11 @@ private:
 	static constexpr double JumpSpeedUU = 442.7;         // UU/s, upward
 	static constexpr double StepUpHeightUU = 30.0;       // 3 voxels
 	static constexpr double CollisionEpsilonUU = 0.1;    // face clamp clearance
+	// Slack allowed below the analytic surface before the unstreamed-terrain
+	// backstop (see the end of TickWalkMode) engages. Generous enough that
+	// voxel quantisation, a step-down, or standing in a shallow dip never trip
+	// it; far smaller than the multi-metre free fall it exists to stop.
+	static constexpr double SurfaceBackstopToleranceUU = 300.0; // 3 m
 
 	// --- Cameras + step smoothing (Player experience decisions table) -----
 

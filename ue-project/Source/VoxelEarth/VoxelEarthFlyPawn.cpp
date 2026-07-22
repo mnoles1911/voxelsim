@@ -335,48 +335,44 @@ bool AVoxelEarthFlyPawn::IsTerrainReadyAt(const FVector& Pos) const
 	// toggles into walk mode a fraction of a second early falls forever, and
 	// (worse) it does so silently and looks like a collision bug.
 	//
-	// THE RULE. Gravity runs only where the world under the pawn is positively
-	// known. The test is per-chunk residency via DebugChunkStatusAt: a chunk
-	// that is TRACKED (in the streaming desired set) but does not yet own a
-	// COMPONENT is precisely "queued, not here yet" -- exactly the state both
-	// the boot case and a fast traverse into unstreamed space produce -- and
-	// it vetoes gravity. Anything else counts as ready:
+	// THE RULE. Gravity runs unless the pawn's OWN chunk is TRACKED (in the
+	// streaming desired set) but does not yet own a COMPONENT -- precisely
+	// "queued, not here yet", the boot case and the reason the pawn must not
+	// fall the moment it spawns. Anything else counts as ready:
 	//
 	//   * tracked WITH a component -- the ground is really there (or the chunk
-	//     is really empty air, which is a legitimate reason to fall);
-	//   * not tracked at all -- outside the streaming footprint, which
-	//     includes the all-air chunks the sky-band optimisation deliberately
-	//     never admits. Vetoing on those would leave the pawn hovering
-	//     wherever it stepped off a ledge into open sky, which is worse than
-	//     falling.
+	//     is genuinely empty air, a legitimate reason to fall);
+	//   * not tracked at all -- outside the streaming footprint, e.g. an
+	//     all-air chunk the sky-band optimisation never admits. Vetoing there
+	//     would leave the pawn hovering wherever it stepped into open sky.
 	//
-	// Probed at the pawn's centre AND one chunk lower, because the pawn
-	// usually stands in an AIR chunk whose ground lives in the chunk below --
-	// checking only its own chunk would let it fall through terrain that is
-	// still a frame away.
+	// ONLY the pawn's own chunk is probed. An earlier version also probed the
+	// chunk one below, to stop a fall into terrain a frame away -- but that
+	// held a pawn hovering a metre above real ground whenever the solid rock
+	// directly beneath it was un-meshed (underground rock is never meshed, so
+	// its chunk is legitimately "tracked, no component"). The genuine
+	// fall-through case -- dropping into space that was never generated -- is
+	// caught instead by the analytic-surface backstop at the end of
+	// TickWalkMode, which needs no streaming at all. So this probe stays local
+	// and the caller additionally short-circuits it when actually grounded.
 	//
 	// NOT snapshot-based. FVoxelPerfSnapshot looked like the obvious global
 	// "has anything loaded yet" signal, but the subsystem only refreshes it
 	// while voxel.Debug >= 1 (a deliberate zero-cost-at-mode-0 gate), so a
 	// snapshot test would read all-zero in a normal session and hold the pawn
-	// in the air forever. DebugChunkStatusAt is a live query and has no such
-	// gate.
+	// in the air forever. DebugChunkStatusAt is a live query with no such gate.
 	UVoxelWorldSubsystem* Subsystem = GetVoxelWorldSubsystem();
 	if (!Subsystem)
 	{
 		return false;
 	}
 
-	const FVector Probes[2] = {Pos, Pos - FVector(0.0, 0.0, VoxelCoords::ChunkEdgeUU)};
-	for (const FVector& Probe : Probes)
+	bool bTracked = false;
+	bool bHasComponent = false;
+	int32 Quads = 0;
+	if (Subsystem->DebugChunkStatusAt(Pos, bTracked, bHasComponent, Quads) && bTracked && !bHasComponent)
 	{
-		bool bTracked = false;
-		bool bHasComponent = false;
-		int32 Quads = 0;
-		if (Subsystem->DebugChunkStatusAt(Probe, bTracked, bHasComponent, Quads) && bTracked && !bHasComponent)
-		{
-			return false;
-		}
+		return false;
 	}
 	return true;
 }
@@ -616,13 +612,22 @@ void AVoxelEarthFlyPawn::TickWalkMode(float DeltaTime)
 
 	FVector Pos = GetActorLocation();
 
+	// Being GROUNDED on a real solid voxel is proof the terrain here has
+	// arrived -- it trumps the streaming-readiness probe unconditionally. This
+	// ordering matters: IsTerrainReadyAt also inspects the chunk one below the
+	// pawn, and when you are standing on the floor of a resident chunk that
+	// lower chunk is solid underground rock, which is legitimately never meshed
+	// (so "tracked, no component"). Without this short-circuit that would read
+	// as "not ready" and hold a pawn that is plainly standing on the ground.
+	const bool bGroundedNow = IsGroundedAt(Pos);
+
 	// Terrain not streamed under the pawn (see IsTerrainReadyAt): suspend
 	// gravity and hold Z. Horizontal movement is deliberately still allowed --
 	// freezing completely would strand you with no way to walk back to loaded
 	// ground -- but with no voxels to sweep against it is unobstructed, which
 	// is the honest behaviour: there is nothing there yet. The HUD shows
 	// "WAITING FOR TERRAIN" so this reads as a state, not a bug.
-	bWaitingForTerrain = !IsTerrainReadyAt(Pos);
+	bWaitingForTerrain = !bGroundedNow && !IsTerrainReadyAt(Pos);
 	if (bWaitingForTerrain)
 	{
 		VerticalVelocity = 0.f;
@@ -650,7 +655,7 @@ void AVoxelEarthFlyPawn::TickWalkMode(float DeltaTime)
 	// swim/walk switch only -- no buoyancy, drag, or currents (those are
 	// W4).
 	const bool bSwimming = (Pos.Z + WalkBoxHalfExtentZ) < 0.0;
-	const bool bGrounded = !bSwimming && IsGroundedAt(Pos);
+	const bool bGrounded = !bSwimming && bGroundedNow;
 	bSwimmingLastTick = bSwimming;
 	bGroundedLastTick = bGrounded;
 
@@ -768,6 +773,47 @@ void AVoxelEarthFlyPawn::TickWalkMode(float DeltaTime)
 		// UpdateCameraSmoothing decays this back to 0 every frame.
 		const double AbruptZJump = NewPos.Z - Pos.Z;
 		CameraZOffsetUU -= AbruptZJump;
+	}
+
+	// --- Backstop: never fall through the surface into unstreamed space -----
+	//
+	// IsTerrainReadyAt (above) catches "the chunk I am in is queued", but it
+	// cannot catch this: the streaming set does not ADMIT underground chunks
+	// until the anchor itself goes underground (FVoxelWorldImpl's deep-set
+	// policy). So a pawn that starts falling from a few metres up can outrun
+	// the surface chunk, cross into space that was never generated at all --
+	// where IsSolidAtVoxel honestly answers "air" for every voxel -- and keep
+	// accelerating downwards forever. Measured directly: entering walk mode 1 s
+	// after launch put the pawn 14.9 m BELOW the surface and still airborne.
+	//
+	// The fix uses the one height that needs no streaming at all:
+	// GetSurfaceHeightUU is the analytic amplifier surface, available
+	// everywhere, immediately. If the box has sunk below it and the chunk it
+	// is in has no component, the pawn is falling through terrain that does
+	// not exist yet -- so park it on the analytic surface and report
+	// "waiting for terrain" until the real voxels arrive.
+	//
+	// This deliberately does NOT fire when the chunk IS resident, which is
+	// what makes caves, dug holes and cave mouths work normally: those are all
+	// below the analytic surface, but their chunks are loaded, so the real
+	// voxel sweep stays in charge and this never intervenes.
+	if (!bSwimming)
+	{
+		const double SurfaceUU = Subsystem->GetSurfaceHeightUU(NewPos.X, NewPos.Y);
+		if ((NewPos.Z - WalkBoxHalfExtentZ) < (SurfaceUU - SurfaceBackstopToleranceUU))
+		{
+			bool bTracked = false;
+			bool bHasComponent = false;
+			int32 Quads = 0;
+			const bool bResident = Subsystem->DebugChunkStatusAt(NewPos, bTracked, bHasComponent, Quads) && bHasComponent;
+			if (!bResident)
+			{
+				NewPos.Z = SurfaceUU + WalkBoxHalfExtentZ;
+				VerticalVelocity = 0.f;
+				bWaitingForTerrain = true;
+				bGroundedLastTick = false;
+			}
+		}
 	}
 
 	SetActorLocation(NewPos);
