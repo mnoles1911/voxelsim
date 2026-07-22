@@ -351,6 +351,42 @@ struct Buffer {
     VkDeviceSize size = 0;
 };
 
+// Sub-timers for the buffer-(re)allocation bracket. The single aggregate
+// "buffer (re)allocation" number this harness used to print was labelled
+// "vkAllocateMemory + vkMapMemory on grow", but GrowBuffer::ensure() starts
+// its clock BEFORE destroying the outgoing buffer -- so the bracket also
+// contained vkUnmapMemory + vkDestroyBuffer + vkFreeMemory of the OLD
+// allocation, plus vkCreateBuffer and vkBindBufferMemory of the new one.
+// That mislabel is exactly the kind of thing that has already produced one
+// confidently-wrong attribution in this file's history (the "342 ms
+// marshalling" number that turned out to be 0.129 ms of marshalling plus a
+// buffer-grow conflated into the same bracket), so the components are now
+// measured separately and printed individually. Pure instrumentation: no
+// allocation sizes, buffer contents, or dispatch bounds change, so this
+// cannot move a digest.
+struct AllocProfile {
+    double destroyOldMs = 0.0;   // vkUnmapMemory + vkDestroyBuffer + vkFreeMemory (old buffer)
+    double createBufferMs = 0.0; // vkCreateBuffer + vkGetBufferMemoryRequirements
+    double allocateMemoryMs = 0.0;
+    double bindMs = 0.0;
+    double mapMs = 0.0;
+    uint64_t bytesAllocated = 0;
+    size_t allocCount = 0;
+    // Which host-visible memory type the allocations actually land in. On AMD
+    // with resizable BAR the first HOST_VISIBLE|HOST_COHERENT type can also be
+    // DEVICE_LOCAL (i.e. BAR-mapped VRAM), whose vkAllocateMemory cost is
+    // sensitive to VRAM pressure from other processes -- worth printing, since
+    // it makes an environment-dependent allocation stall diagnosable instead of
+    // re-litigable.
+    uint32_t memTypeIndex = UINT32_MAX;
+    VkMemoryPropertyFlags memTypeFlags = 0;
+    VkDeviceSize memHeapSize = 0;
+
+    double totalMs() const {
+        return destroyOldMs + createBufferMs + allocateMemoryMs + bindMs + mapMs;
+    }
+};
+
 // --- the Vulkan device we run everything on ---------------------------------
 
 struct GpuContext {
@@ -411,9 +447,15 @@ struct GpuContext {
 
     std::string deviceName;
 
+    // Component breakdown of every createBuffer/destroyBuffer this context
+    // performs. Snapshot it before teardown to get the in-gate figure (the
+    // final cleanup's destroyBuffer calls also accumulate into destroyOldMs).
+    AllocProfile allocProfile;
+
     Buffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
         Buffer b;
         b.size = size;
+        const auto tCreate = Clock::now();
         VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bci.size = size;
         bci.usage = usage;
@@ -427,17 +469,36 @@ struct GpuContext {
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         mai.allocationSize = req.size;
         mai.memoryTypeIndex = findMemoryType(memProps, req.memoryTypeBits, hostVisible);
+        allocProfile.createBufferMs += msSince(tCreate);
+
+        const auto tAlloc = Clock::now();
         vkCheck(vkAllocateMemory(device, &mai, nullptr, &b.memory), "vkAllocateMemory");
+        allocProfile.allocateMemoryMs += msSince(tAlloc);
+
+        const auto tBind = Clock::now();
         vkCheck(vkBindBufferMemory(device, b.buffer, b.memory, 0), "vkBindBufferMemory");
+        allocProfile.bindMs += msSince(tBind);
+
+        const auto tMap = Clock::now();
         vkCheck(vkMapMemory(device, b.memory, 0, size, 0, &b.mapped), "vkMapMemory");
+        allocProfile.mapMs += msSince(tMap);
+
+        allocProfile.bytesAllocated += uint64_t(req.size);
+        ++allocProfile.allocCount;
+        allocProfile.memTypeIndex = mai.memoryTypeIndex;
+        allocProfile.memTypeFlags = memProps.memoryTypes[mai.memoryTypeIndex].propertyFlags;
+        allocProfile.memHeapSize =
+            memProps.memoryHeaps[memProps.memoryTypes[mai.memoryTypeIndex].heapIndex].size;
         return b;
     }
 
     void destroyBuffer(Buffer& b) {
+        const auto t0 = Clock::now();
         if (b.mapped) vkUnmapMemory(device, b.memory);
         if (b.buffer) vkDestroyBuffer(device, b.buffer, nullptr);
         if (b.memory) vkFreeMemory(device, b.memory, nullptr);
         b = Buffer{};
+        allocProfile.destroyOldMs += msSince(t0);
     }
 };
 
@@ -2491,6 +2552,11 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
     // in real time -- summing them would double-count the overlap.
     stats.gateMs = wallMs - stats.cpuColumnPassMs - stats.cpuCompareMs;
 
+    // Snapshot BEFORE teardown: the cleanup loop below calls destroyBuffer on
+    // every slot's buffers, which would otherwise fold post-gate frees into
+    // the in-gate destroyOldMs figure.
+    const AllocProfile allocProf = ctx.allocProfile;
+
     for (int32_t b = 0; b < kPipelineDepth; ++b) vkDestroyQueryPool(ctx.device, tsPools[b], nullptr);
     destroyFlightDescriptors(ctx, fd);
     size_t totalReallocs = 0;
@@ -2536,7 +2602,13 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
         "  host raster fill:       %10.3f ms\n"
         "  marshalling (WorldGenParams fill+upload, persistent-descriptor writes on "
         "regrow only): %10.3f ms\n"
-        "  buffer (re)allocation (vkAllocateMemory + vkMapMemory on grow): %10.3f ms\n"
+        "  buffer (re)allocation on grow (whole bracket): %10.3f ms\n"
+        "      of which: free old (unmap+destroy+free) %8.3f | vkCreateBuffer+GetMemReq %8.3f | "
+        "vkAllocateMemory %8.3f | vkBindBufferMemory %8.3f | vkMapMemory %8.3f ms\n"
+        "      (%zu allocations, %.1f MiB total, host-visible memory type %u flags 0x%03x, "
+        "heap %.0f MiB; the component figures cover EVERY createBuffer -- the regrows above plus "
+        "the 2 fixed per-slot buffers (params, columns) built at slot setup -- so they sum to "
+        "slightly more than the ensure()-only bracket total)\n"
         "  (sum of the above as if fully serial: %10.3f ms; hidden by flight double-"
         "buffering: %10.3f ms)\n"
         "  GATE TOTAL (measured wall clock, gpu path):  %10.3f ms  = %.3f s\n"
@@ -2546,6 +2618,10 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
         (long long)radiusM, stats.totalTiles, stats.columnMs, stats.voxelizeMs,
         stats.meshCountMs, scanMs, stats.scanBlocksMs, stats.scanSumsMs, stats.scanAddMs,
         stats.meshEmitMs, stats.hostRasterFillMs, stats.marshallingMs, stats.bufferAllocMs,
+        allocProf.destroyOldMs, allocProf.createBufferMs, allocProf.allocateMemoryMs,
+        allocProf.bindMs, allocProf.mapMs, allocProf.allocCount,
+        double(allocProf.bytesAllocated) / (1024.0 * 1024.0), allocProf.memTypeIndex,
+        (unsigned)allocProf.memTypeFlags, double(allocProf.memHeapSize) / (1024.0 * 1024.0),
         serialEquivalentMs,
         pipeliningSavedMs, stats.gateMs, gateSec, stats.cpuColumnPassMs, stats.cpuCompareMs,
         wallMs);
