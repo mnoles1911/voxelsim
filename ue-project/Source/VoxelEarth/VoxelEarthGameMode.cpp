@@ -2957,8 +2957,32 @@ FVector AVoxelEarthGameMode::UndergroundTestCameraLocation() const
 		// passage itself -- walls left/right, floor below, roof above.
 		return FVector(UndergroundTestColumnXUU + 60.0, UndergroundTestColumnYUU, FloorZUU + 120.0);
 	}
+	if (IsUndergroundTunnelView())
+	{
+		// -VoxelUndergroundView=tunnel: the FRAMING fix. The two poses above
+		// both sit 120UU above the tunnel AXIS, but the tunnel is carved with
+		// a 130UU radius -- so a "standing eye height" offset puts the camera
+		// within 10UU of the tunnel ROOF, aimed at the rock above the tunnel
+		// mouth rather than down the passage. That is why the chamber shot
+		// reads as a wall 2.3m from the lens (the measured -X enclosure
+		// distance) instead of a 9m corridor.
+		//
+		// Sit just above the axis instead (40UU, comfortably inside the
+		// radius) at the chamber end, so the shot looks straight down the
+		// full 900UU tunnel to the shaft foot -- and up the shaft to real
+		// daylight, which is also the check that the underground veil is not
+		// blocking legitimate sky.
+		return FVector(UndergroundTestColumnXUU + 900.0, UndergroundTestColumnYUU, FloorZUU + 40.0);
+	}
 	// In the chamber, looking back toward the tunnel: rock on every side.
 	return FVector(UndergroundTestColumnXUU + 900.0, UndergroundTestColumnYUU, FloorZUU + 120.0);
+}
+
+bool AVoxelEarthGameMode::IsUndergroundTunnelView() const
+{
+	FString View;
+	return FParse::Value(FCommandLine::Get(), TEXT("VoxelUndergroundView="), View) &&
+	       View.Equals(TEXT("tunnel"), ESearchCase::IgnoreCase);
 }
 
 FRotator AVoxelEarthGameMode::UndergroundTestCameraRotation() const
@@ -2966,6 +2990,14 @@ FRotator AVoxelEarthGameMode::UndergroundTestCameraRotation() const
 	// Shaft view looks along +X down the tunnel; chamber view looks back along
 	// -X toward the tunnel mouth. A few degrees of downward pitch in both so
 	// the floor is in frame (a floor is precisely what used to be missing).
+	if (IsUndergroundTunnelView())
+	{
+		// Dead level along the tunnel axis (-X, back toward the shaft). Any
+		// downward pitch here just fills the frame with the near floor, which
+		// is what "a few degrees so the floor is in frame" costs once the
+		// camera is actually ON the axis rather than against the roof.
+		return FRotator(0.f, 180.f, 0.f);
+	}
 	return IsUndergroundShaftView() ? FRotator(-8.f, 0.f, 0.f) : FRotator(-8.f, 180.f, 0.f);
 }
 

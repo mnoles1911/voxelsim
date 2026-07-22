@@ -74,12 +74,22 @@ constexpr double kSnowlineBandHighMeters = 2900.0;
 
 // ---- UNDERGROUND VEIL constants (see VoxelClipmapActor.h for the diagnosis)
 //
-// Half-extent of the inward-facing occluder box. Must sit OUTSIDE every piece
-// of voxel geometry so it can never occlude a real cave surface: the ring
-// cascade tops out at RingPresets R4 outer = 1024 m, so 2 km is a 2x margin.
-// It is deliberately INSIDE the clipmap's ~16.4 km reach -- occluding the
-// clipmap is the point.
-constexpr double kVeilHalfExtentUU = 200000.0; // 2 km
+// Half-extent of the inward-facing occluder box.
+//
+// The first version used 2 km (outside the ring cascade's 1 km R4 outer, for
+// maximum clearance). That FAILED, and instructively: SkyAtmosphere's aerial
+// perspective is integrated over the distance to the surface, and 2 km of it
+// repainted the near-black box back to pale sky blue -- the shot came back
+// looking like an overcast sky rather than rock. Distance is the enemy here,
+// not the friend.
+//
+// 300 m is the right number: aerial perspective over 300 m is negligible, and
+// nothing underground is ever resident beyond it. Underground residency is a
+// +-25.6 m deep box plus a 38.4 m skirt (VoxelWorldSubsystem's
+// BoxRadiusChunksL0/SkirtChunksNear), and the largest worldgen feature down
+// here is a cavern at 24-56 m across -- all an order of magnitude inside 300
+// m, so the veil can never occlude a real cave surface.
+constexpr double kVeilHalfExtentUU = 30000.0; // 300 m
 
 // Near-black rock. Multiplied into M_VoxelClipmap's BaseColor via its existing
 // DebugTint VectorParameter, so the veil needs NO new material asset (and no
