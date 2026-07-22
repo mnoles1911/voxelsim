@@ -866,6 +866,37 @@ void AVoxelClipmapActor::Tick(float DeltaTime)
 		}
 	}
 
+	// CONCENTRIC recenter (the ring-seam fix). ALL levels share ONE
+	// camera-snapped origin, so every level's outer boundary lands on exactly
+	// the same world-space square as the next-coarser level's inner hole
+	// boundary -- both are +-32*SpacingL == +-16*Spacing(L+1) measured from the
+	// SAME centre, so they coincide by construction.
+	//
+	// Previously each level snapped to its OWN spacing grid
+	// (GridSnap(cam, SpacingUUForLevel(Level))), giving each ring a DIFFERENT
+	// origin. A finer ring's outer edge and the coarser ring's hole edge, both
+	// nominally at the same radius, were then offset by up to a fine cell in
+	// world space -- opening an annular GAP (up to a whole coarse cell wide at
+	// the outer boundaries, i.e. hundreds of metres) that showed the dark
+	// underground veil / background straight through the seam: the "dark
+	// rectangular slabs of apparently-missing terrain" artifact. (Square,
+	// symmetric holes can only line up on all four sides when adjacent levels
+	// share an origin -- no per-level snap can fix it; concentricity is the
+	// only geometry that does, and is what a real clipmap uses regardless.)
+	// With the rings concentric the boundaries coincide, the gap closes, and
+	// the existing skirts (RebuildLevel pass 3) only have the residual
+	// T-junction crack left to hide -- exactly what a 2x-spacing skirt is for.
+	//
+	// Snapped to the FINEST level's spacing (not the coarsest): keeps level 0's
+	// inner hole within one fine cell of the camera so it still lines up with
+	// the voxel cascade's outer edge at the near (2 km) seam. The cost is that
+	// all four levels go dirty together each time the shared origin moves, but
+	// round-robin still rebuilds at most one per tick -- identical per-frame
+	// cost to before (the coarser levels simply refresh over the next few
+	// ticks; distant, cosmetic, never in the M1 budget's critical path).
+	const double Spacing0 = SpacingUUForLevel(0);
+	const FVector2D CommonOrigin(FMath::GridSnap(CameraLocUU.X, Spacing0), FMath::GridSnap(CameraLocUU.Y, Spacing0));
+
 	if (!bBootstrapped)
 	{
 		// One-time: build every level immediately (see class comment
@@ -873,10 +904,8 @@ void AVoxelClipmapActor::Tick(float DeltaTime)
 		// spawn -- a one-off cost, not a recurring per-frame one.
 		for (int32 Level = 0; Level < NumLevels; ++Level)
 		{
-			const double Spacing = SpacingUUForLevel(Level);
-			const FVector2D SnappedOrigin(FMath::GridSnap(CameraLocUU.X, Spacing), FMath::GridSnap(CameraLocUU.Y, Spacing));
-			RebuildLevel(Level, SnappedOrigin);
-			LastSnappedOriginUU[Level] = SnappedOrigin;
+			RebuildLevel(Level, CommonOrigin);
+			LastSnappedOriginUU[Level] = CommonOrigin;
 			bLevelBuilt[Level] = true;
 		}
 		bBootstrapped = true;
@@ -889,12 +918,10 @@ void AVoxelClipmapActor::Tick(float DeltaTime)
 	for (int32 Step = 0; Step < NumLevels; ++Step)
 	{
 		const int32 Level = (RoundRobinCursor + Step) % NumLevels;
-		const double Spacing = SpacingUUForLevel(Level);
-		const FVector2D SnappedOrigin(FMath::GridSnap(CameraLocUU.X, Spacing), FMath::GridSnap(CameraLocUU.Y, Spacing));
-		if (!bLevelBuilt[Level] || SnappedOrigin != LastSnappedOriginUU[Level])
+		if (!bLevelBuilt[Level] || CommonOrigin != LastSnappedOriginUU[Level])
 		{
-			RebuildLevel(Level, SnappedOrigin);
-			LastSnappedOriginUU[Level] = SnappedOrigin;
+			RebuildLevel(Level, CommonOrigin);
+			LastSnappedOriginUU[Level] = CommonOrigin;
 			bLevelBuilt[Level] = true;
 			RoundRobinCursor = (Level + 1) % NumLevels;
 			break;

@@ -56,21 +56,28 @@ class UMaterialInterface;
 // free function in the .cpp, no voxel-core type ever appears in a
 // UHT-parsed signature here.
 //
-// Recenter/rebuild (m2-plan.md "Recenter" row): each level's grid snaps to
-// its OWN vertex-spacing grid as the camera moves; a level only rebuilds its
-// heights when its snapped origin actually changes, and at most one level
-// rebuilds per tick (round-robin across levels) once the initial four-level
-// bootstrap (first tick a camera is available) has happened -- a 65x65
-// bilinear height fill is cheap enough that the one-time bootstrap building
-// all 4 at once is a non-issue, and it avoids a 4-frame terrain pop-in at
-// spawn.
+// Recenter/rebuild (m2-plan.md "Recenter" row): all levels share ONE
+// camera-snapped origin (snapped to the FINEST level's vertex spacing) so the
+// rings are truly CONCENTRIC -- each level's outer boundary then lands on
+// exactly the same world-space square as the next-coarser level's inner hole
+// boundary (both +-32*SpacingL == +-16*Spacing(L+1) from the shared centre),
+// which is what closes the inter-ring seam (see Tick() for the full
+// diagnosis: independent per-level snapping used to give each ring a different
+// origin and open a gap between them). A level rebuilds only when the shared
+// origin actually changes; at most one level rebuilds per tick (round-robin
+// across levels) once the initial four-level bootstrap (first tick a camera is
+// available) has happened -- a 65x65 bilinear height fill is cheap enough that
+// the one-time bootstrap building all 4 at once is a non-issue, and it avoids
+// a 4-frame terrain pop-in at spawn.
 //
-// Cracks/overlap (m2-plan.md "Cracks/overlap" row): v1 uses skirts (the
-// outer grid edge and the inner hole boundary both drop 2x that level's
-// vertex spacing) plus per-level annulus culling (quads entirely inside the
-// hole are simply not emitted) to hide most seams; z-fighting/visible seams
-// against the ring cascade and between adjacent clipmap levels are accepted
-// v1 artifacts (plan's CDLOD polish item fixes this properly later).
+// Cracks/overlap (m2-plan.md "Cracks/overlap" row): with the rings concentric
+// (above) the only inter-level discontinuity left is the T-junction crack (a
+// finer ring's edge has 2x the coarser ring's vertex density along the shared
+// boundary), which the skirts hide: the outer grid edge and the inner hole
+// boundary both drop 2x that level's vertex spacing, and quads entirely inside
+// a level's hole are not emitted (annulus culling). Residual z-fighting against
+// the ring cascade at the near seam is an accepted v1 artifact; the full
+// per-vertex CDLOD morph (ADR-0002 tripwire) remains the M2-polish item.
 UCLASS()
 class VOXELEARTH_API AVoxelClipmapActor : public AActor
 {
