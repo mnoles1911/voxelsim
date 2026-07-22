@@ -56,7 +56,11 @@ while [ $# -gt 0 ]; do
     --radius)       RADIUS="$2"; shift 2 ;;
     --scan-radius)  SCAN_RADIUS="$2"; shift 2 ;;
     --stride)       STRIDE="$2"; shift 2 ;;
+    # Both spellings: a negative origin (`--origin -6,3`) is ambiguous with a
+    # flag in argparse downstream, so `--origin=-6,3` is what we recommend and
+    # what our own error messages print -- this must therefore accept it too.
     --origin)       ORIGIN="$2"; shift 2 ;;
+    --origin=*)     ORIGIN="${1#--origin=}"; shift ;;
     --rescan)       RESCAN=1; shift ;;
     -h|--help)      sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *)              die "unknown argument: $1" ;;
@@ -126,10 +130,14 @@ say "2/3 pregen $tiles tiles at origin $ORIGIN (~$((tiles * 23 / 60)) min at 22.
 # pregen_at.py writes the manifest (provider_id, checkpoint sha256, per-tile
 # hashes) and the tarball itself, so nothing has to be recovered from
 # scrollback if this terminal dies.
+# NOTE the `--origin=` form. A western/southern origin is NEGATIVE (the first
+# real auto-pick was -6,3), and `--origin -6,3` makes argparse read the value
+# as another flag -- "expected one argument". The `=` form is the only spelling
+# that survives a negative coordinate, which is most of the map.
 python3 tools/pregen_at.py "$CKPT_DIR" "$CKPT_SHA" \
-  --origin "$ORIGIN" --seed "$SEED" --radius "$RADIUS" \
+  --origin="$ORIGIN" --seed "$SEED" --radius "$RADIUS" \
   --cache "$CACHE_DIR" --out "$OUT_TAR" \
-  || die "pregen failed. Re-run this script with --origin $ORIGIN --
+  || die "pregen failed. Re-run this script with --origin=$ORIGIN --
     tiles already in the cache are skipped, so only the missing ones cost."
 
 say "3/3 done"
