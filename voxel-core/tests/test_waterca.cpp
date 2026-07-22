@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "voxelcore/generator.h"
@@ -1205,4 +1207,414 @@ VXC_TEST(waterca_mobilize_placing_into_an_implicit_lake_raises_no_shortfall) {
     CHECK_EQ(mob.debitedVolume(), mob.creditedVolume());
     CHECK_EQ(int(ca.fillAt(4, 4, 5)), 0); // the CA never put water in the rock
     CHECK(int(ca.fillAt(4, 4, 6)) > 0);   // but the rest of the brick converted
+}
+
+// ===========================================================================
+// WaterState — savegame persistence (waterca.h "WaterState",
+// docs/adr/0005-water-persistence.md)
+// ===========================================================================
+
+namespace {
+
+// Drives the synthetic cavern through a full dig-and-drain, leaving a world
+// with a genuinely interesting water state to persist: a partially drained
+// lake, mobilized bricks on both sides of the dig, and CA fill in bricks the
+// implicit field used to own. `ticks` < 0 means "run to settled".
+//
+// The front budget is deliberately unbounded here. pending_ is NOT persisted
+// (it is re-derived from the active set — see waterca.h's "OUT, and
+// deliberately" list), so draining the queue every call is what lets the
+// mid-flow resume test below compare against an uninterrupted run without the
+// comparison turning into a test of queue timing rather than of persistence.
+constexpr size_t kUnboundedFront = size_t(-1);
+
+void drainCavern(WaterCA& ca, WaterMobilizer& mob, std::shared_ptr<bool> plugOpen, int ticks) {
+    *plugOpen = true;
+    ca.invalidateSolidRegion(8, 2, 4, 8, 5, 5);
+    mob.mobilizeEditRegion(ca, 8, 2, 4, 8, 5, 5);
+    ca.wakeRegion(8, 2, 4, 8, 5, 5);
+
+    for (int i = 0; ticks < 0 ? i < 3000 : i < ticks; ++i) {
+        mob.advanceFront(ca, kUnboundedFront);
+        ca.step();
+        if (ticks < 0 && ca.steppedBrickCount() == 0 && mob.pendingFrontBricks() == 0) return;
+    }
+}
+
+uint64_t caDigest(const WaterCA& ca) {
+    Digest d;
+    ca.digest(d);
+    return d.h;
+}
+
+uint64_t mobDigest(const WaterMobilizer& mob) {
+    Digest d;
+    mob.digest(d);
+    return d.h;
+}
+
+} // namespace
+
+// THE TEST ADR-0005 WAS WRITTEN TO DEMAND. Save -> load -> digest must be
+// byte-identical on BOTH digests, and the total volume must be conserved
+// across the cycle. A cycle that silently loses water is precisely the failure
+// the ADR exists to catch, so it fails loudly here rather than being asserted
+// in a comment.
+VXC_TEST(waterca_state_round_trip_digest_identical_and_volume_conserved) {
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(cavernFlood(), cavernTerrain(plugOpen));
+    WaterCA ca(mob.makeSolidFn());
+    drainCavern(ca, mob, plugOpen, -1);
+
+    // Precondition for the assertions below: this really is a drained lake
+    // with state worth persisting, not an empty world trivially round-tripping.
+    CHECK(ca.storedBrickCount() > 0);
+    CHECK(mob.mobilizedBricks().size() > 0);
+    CHECK_EQ(ca.totalVolume(), kLakeVolume);
+
+    std::vector<uint8_t> blob;
+    WaterState::serialize(ca, mob, blob);
+
+    // Load into a FRESH pair, exactly as a savegame load would.
+    auto plugOpen2 = std::make_shared<bool>(true); // the dig is terrain, from the edit log
+    WaterMobilizer mob2(cavernFlood(), cavernTerrain(plugOpen2));
+    WaterCA ca2(mob2.makeSolidFn());
+    CHECK(WaterState::load(blob.data(), blob.size(), ca2, mob2));
+
+    // Byte-identical digests: the CA fill AND the mobilized set.
+    CHECK_EQ(caDigest(ca2), caDigest(ca));
+    CHECK_EQ(mobDigest(mob2), mobDigest(mob));
+
+    // Volume conserved, on both the O(1) ledger and the independent re-sum.
+    CHECK_EQ(ca2.totalVolume(), ca.totalVolume());
+    CHECK_EQ(ca2.recomputeVolume(), ca.recomputeVolume());
+    CHECK_EQ(ca2.totalVolume(), ca2.recomputeVolume());
+
+    // And the WHOLE world's water — both accountants — is conserved, which is
+    // the assertion that actually notices a destroyed lake: a mobilized-keys-
+    // only loader passes every CA-side check above by making both terms zero.
+    CHECK_EQ(implicitVolume(mob2) + ca2.totalVolume(), kLakeVolume);
+
+    // Structural equality too, not just digest equality.
+    CHECK_EQ(ca2.storedBrickCount(), ca.storedBrickCount());
+    CHECK_EQ(mob2.mobilizedBricks().size(), mob.mobilizedBricks().size());
+    CHECK(mob2.mobilizedBricks() == mob.mobilizedBricks());
+    CHECK(ca2.activeBricks() == ca.activeBricks());
+
+    // The blob itself is deterministic: re-serializing the loaded world
+    // reproduces it byte for byte (all three key lists are sorted, and the
+    // per-brick mode choice is a pure function of the brick's contents).
+    std::vector<uint8_t> blob2;
+    WaterState::serialize(ca2, mob2, blob2);
+    CHECK(blob2 == blob);
+}
+
+// THE TRAP, MADE EXECUTABLE. This is the serializer the backlog asked for —
+// mobilized keys only, no CA fill — and it is here to demonstrate, not to be
+// used: it destroys the lake. Mobilization is a one-way surrender of the only
+// record of where the water was, so a brick restored WITHOUT its fill reports
+// zero units from the implicit field AND zero from the CA. If someone ever
+// "simplifies" WaterState back to a key list, this test is what fails.
+VXC_TEST(waterca_state_mobilized_keys_alone_would_destroy_the_lake) {
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(cavernFlood(), cavernTerrain(plugOpen));
+    WaterCA ca(mob.makeSolidFn());
+    drainCavern(ca, mob, plugOpen, -1);
+    CHECK_EQ(implicitVolume(mob) + ca.totalVolume(), kLakeVolume);
+
+    // The naive load: replay the mobilized keys into a fresh world, as
+    // markMobilized's doc comment invites — WITHOUT satisfying its stated
+    // precondition that the units are already present in the loaded CA fill.
+    auto plugOpen2 = std::make_shared<bool>(true);
+    WaterMobilizer naive(cavernFlood(), cavernTerrain(plugOpen2));
+    WaterCA naiveCa(naive.makeSolidFn());
+    for (const BrickKey& k : mob.mobilizedBricks()) naive.markMobilized(k);
+
+    // Every unit of the lake is gone. Not drained — GONE: the implicit field
+    // has handed ownership over and the CA holds nothing.
+    CHECK_EQ(naiveCa.totalVolume(), uint64_t(0));
+    CHECK_EQ(implicitVolume(naive), uint64_t(0));
+    // The mobilized-set digest ROUND TRIPS PERFECTLY while this happens, which
+    // is exactly why the naive version would have shipped behind a green test.
+    CHECK_EQ(mobDigest(naive), mobDigest(mob));
+    // And the flooded cave now reads as open air to the CA.
+    CHECK_EQ(int(naive.makeSolidFn()(4, 4, 6)), int(MAT_AIR));
+
+    // The real loader, on the same world, keeps the water.
+    std::vector<uint8_t> blob;
+    WaterState::serialize(ca, mob, blob);
+    auto plugOpen3 = std::make_shared<bool>(true);
+    WaterMobilizer good(cavernFlood(), cavernTerrain(plugOpen3));
+    WaterCA goodCa(good.makeSolidFn());
+    CHECK(WaterState::load(blob.data(), blob.size(), goodCa, good));
+    CHECK_EQ(implicitVolume(good) + goodCa.totalVolume(), kLakeVolume);
+}
+
+// Persistence must survive a save taken MID-FLOW, not just a settled one —
+// and the resumed world must reach the same end state as one that was never
+// interrupted. This is what the persisted ACTIVE SET buys: without it the
+// reloaded water is a frozen snapshot waiting for an unrelated disturbance.
+VXC_TEST(waterca_state_mid_flow_save_resumes_identically) {
+    auto plugOpenA = std::make_shared<bool>(false);
+    WaterMobilizer mobA(cavernFlood(), cavernTerrain(plugOpenA));
+    WaterCA caA(mobA.makeSolidFn());
+    drainCavern(caA, mobA, plugOpenA, 3); // stop mid-drain: water still moving
+    CHECK(caA.activeBrickCount() > 0);
+    CHECK_EQ(mobA.pendingFrontBricks(), size_t(0)); // unbounded front: nothing queued
+    CHECK_EQ(implicitVolume(mobA) + caA.totalVolume(), kLakeVolume);
+
+    std::vector<uint8_t> blob;
+    WaterState::serialize(caA, mobA, blob);
+
+    auto plugOpenB = std::make_shared<bool>(true);
+    WaterMobilizer mobB(cavernFlood(), cavernTerrain(plugOpenB));
+    WaterCA caB(mobB.makeSolidFn());
+    CHECK(WaterState::load(blob.data(), blob.size(), caB, mobB));
+    CHECK_EQ(caDigest(caB), caDigest(caA));
+    CHECK_EQ(implicitVolume(mobB) + caB.totalVolume(), kLakeVolume);
+
+    // Run BOTH to settled and compare. The reloaded world must not merely be
+    // conserved, it must evolve the same way.
+    for (int i = 0; i < 3000; ++i) {
+        mobA.advanceFront(caA, kUnboundedFront);
+        caA.step();
+        if (caA.steppedBrickCount() == 0 && mobA.pendingFrontBricks() == 0) break;
+    }
+    for (int i = 0; i < 3000; ++i) {
+        mobB.advanceFront(caB, kUnboundedFront);
+        caB.step();
+        if (caB.steppedBrickCount() == 0 && mobB.pendingFrontBricks() == 0) break;
+    }
+    CHECK_EQ(caDigest(caB), caDigest(caA));
+    CHECK_EQ(mobDigest(mobB), mobDigest(mobA));
+    CHECK_EQ(caB.totalVolume(), caA.totalVolume());
+    CHECK_EQ(implicitVolume(mobB) + caB.totalVolume(), kLakeVolume);
+    CHECK_EQ(mobB.shortfallVolume(), uint64_t(0));
+}
+
+// A truncated or tampered blob must fail CLEANLY and never half-load: the
+// caller is left with an untouched (empty) world it can fall back to implicit
+// water with, not a world holding a prefix of someone else's lake.
+VXC_TEST(waterca_state_rejects_truncated_and_tampered_blobs) {
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(cavernFlood(), cavernTerrain(plugOpen));
+    WaterCA ca(mob.makeSolidFn());
+    drainCavern(ca, mob, plugOpen, -1);
+
+    std::vector<uint8_t> blob;
+    WaterState::serialize(ca, mob, blob);
+    CHECK(WaterState::parse(blob.data(), blob.size()).has_value());
+
+    // EVERY proper prefix is rejected, and rejecting leaves the target world
+    // completely untouched — the "never half-load" property, checked on the
+    // world rather than only on the return value.
+    for (size_t n = 0; n < blob.size(); ++n) {
+        auto plug2 = std::make_shared<bool>(true);
+        WaterMobilizer m2(cavernFlood(), cavernTerrain(plug2));
+        WaterCA c2(m2.makeSolidFn());
+        CHECK(!WaterState::load(blob.data(), n, c2, m2));
+        CHECK_EQ(c2.totalVolume(), uint64_t(0));
+        CHECK_EQ(c2.storedBrickCount(), size_t(0));
+        CHECK_EQ(m2.mobilizedBricks().size(), size_t(0));
+    }
+
+    // Trailing garbage: a blob that decodes fully but has bytes left over is a
+    // corrupt append, not a valid save.
+    std::vector<uint8_t> extra = blob;
+    extra.push_back(0);
+    CHECK(!WaterState::parse(extra.data(), extra.size()).has_value());
+
+    auto tamper = [&blob](size_t offset, uint8_t xorMask) {
+        std::vector<uint8_t> b = blob;
+        b[offset] = static_cast<uint8_t>(b[offset] ^ xorMask);
+        return !WaterState::parse(b.data(), b.size()).has_value();
+    };
+    CHECK(tamper(0, 0xff));  // magic
+    CHECK(tamper(4, 0xff));  // container format version
+    CHECK(tamper(8, 0xff));  // kWaterCAVersion: fill from other tick rules
+    CHECK(tamper(12, 0xff)); // totalVolume: the integrity cross-check fires
+
+    // Empty and garbage inputs are refused rather than crashing.
+    CHECK(!WaterState::parse(nullptr, 0).has_value());
+    const uint8_t junk[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    CHECK(!WaterState::parse(junk, sizeof junk).has_value());
+}
+
+// Loading into a world that already holds water is refused: it would leave
+// stale cells the blob never mentions, which is a silent merge, not a load.
+VXC_TEST(waterca_state_refuses_a_non_empty_target) {
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(cavernFlood(), cavernTerrain(plugOpen));
+    WaterCA ca(mob.makeSolidFn());
+    drainCavern(ca, mob, plugOpen, -1);
+    std::vector<uint8_t> blob;
+    WaterState::serialize(ca, mob, blob);
+
+    auto plug2 = std::make_shared<bool>(true);
+    WaterMobilizer m2(cavernFlood(), cavernTerrain(plug2));
+    WaterCA c2(m2.makeSolidFn());
+    c2.addWater(12, 3, 5, 255); // pre-existing water in the sump
+    const uint64_t before = c2.totalVolume();
+    CHECK(before > 0);
+    CHECK(!WaterState::load(blob.data(), blob.size(), c2, m2));
+    CHECK_EQ(c2.totalVolume(), before); // refused without touching anything
+    CHECK_EQ(m2.mobilizedBricks().size(), size_t(0));
+}
+
+// An untouched world persists to a tiny header and reloads to nothing — the
+// implicit field's "an untouched lake costs zero storage" property survives
+// into the save format.
+VXC_TEST(waterca_state_empty_world_round_trips) {
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(cavernFlood(), cavernTerrain(plugOpen));
+    WaterCA ca(mob.makeSolidFn());
+    std::vector<uint8_t> blob;
+    WaterState::serialize(ca, mob, blob);
+    CHECK_EQ(blob.size(), size_t(44)); // 3 versions + volume + three zero counts
+
+    auto plug2 = std::make_shared<bool>(false);
+    WaterMobilizer m2(cavernFlood(), cavernTerrain(plug2));
+    WaterCA c2(m2.makeSolidFn());
+    CHECK(WaterState::load(blob.data(), blob.size(), c2, m2));
+    CHECK_EQ(c2.storedBrickCount(), size_t(0));
+    CHECK_EQ(implicitVolume(m2), kLakeVolume); // still a full, free, implicit lake
+}
+
+// THE MEASUREMENT (waterca.h "PAYLOAD MODES"): does per-brick mode selection
+// actually earn its place, or would dense-only be fine? Measured on three real
+// scenarios rather than assumed, because the two non-dense modes win on
+// DIFFERENT water and a single scenario would have answered only half of it:
+//   * settled water (a drained lake, a pooled basin) is long stretches of 255
+//     and 0, so kRle wins by a mile — one full brick is 3 bytes.
+//   * THIN VERTICAL water — a drain shaft, a waterfall, a single wet column —
+//     is the case that earns kSparse its place, and it is not the case I
+//     first guessed. Water in motion turned out to still be SHEETS (see the
+//     mid-drain numbers this test prints: kRle wins there too, and by more
+//     than on the settled lake), so "moving water is scattered droplets" was
+//     simply wrong. What actually defeats kRle is the CELL ORDER: cellIndex
+//     is x-fastest, so a column of water one cell wide in x and y lands as
+//     ISOLATED bytes 64 apart, and every wet cell costs kRle two runs (the
+//     cell, plus the zeros after it) while kSparse pays a flat 3 bytes. A
+//     player cutting a drain shaft to empty a cavern — the exact story
+//     ADR-0005 opens with — produces precisely this shape.
+// The per-scenario check also cross-checks the emitted blob against the size
+// the mode rule predicts, so this measures the real encoder rather than a copy
+// of it.
+namespace {
+
+struct ModeStats {
+    size_t bricks = 0, dense = 0, sparse = 0, rle = 0;
+    size_t chosenBytes = 0, denseBytes = 0, blobBytes = 0, denseBlobBytes = 0;
+};
+
+ModeStats measureBlob(const std::vector<uint8_t>& blob, const char* label) {
+    ModeStats st;
+    const std::optional<WaterState> parsed = WaterState::parse(blob.data(), blob.size());
+    CHECK(parsed.has_value());
+    if (!parsed) return st;
+
+    for (const auto& entry : parsed->bricks) {
+        const WaterState::BrickFill& f = entry.second;
+        size_t nonZero = 0, runs = 0;
+        for (size_t i = 0; i < f.size(); ++i) {
+            if (f[i] != 0) ++nonZero;
+            if (i == 0 || f[i] != f[i - 1]) ++runs;
+        }
+        const size_t dense = f.size(), sparse = 2 + 3 * nonZero, rle = 2 + 3 * runs;
+        st.denseBytes += dense;
+        if (dense <= sparse && dense <= rle) {
+            st.chosenBytes += dense;
+            ++st.dense;
+        } else if (sparse <= rle) {
+            st.chosenBytes += sparse;
+            ++st.sparse;
+        } else {
+            st.chosenBytes += rle;
+            ++st.rle;
+        }
+    }
+    st.bricks = parsed->bricks.size();
+
+    // Fixed overhead: 28-byte header, 13 bytes per brick (key + mode byte),
+    // and a counted key list for the active and mobilized sets.
+    const size_t overhead = 28 + 13 * st.bricks + 8 + 12 * parsed->active.size() + 8 +
+                            12 * parsed->mobilized.size();
+    CHECK_EQ(blob.size(), overhead + st.chosenBytes);
+    st.blobBytes = blob.size();
+    st.denseBlobBytes = overhead + st.denseBytes;
+
+    std::printf("  [measure] %-22s %3zu bricks (%zu dense/%zu sparse/%zu rle), payload %6zu B vs"
+                " %6zu B dense-only, blob %6zu B vs %6zu B (%zu%% of dense)\n",
+                label, st.bricks, st.dense, st.sparse, st.rle, st.chosenBytes, st.denseBytes,
+                st.blobBytes, st.denseBlobBytes,
+                st.denseBlobBytes ? 100 * st.blobBytes / st.denseBlobBytes : 100);
+    return st;
+}
+
+} // namespace
+
+VXC_TEST(waterca_state_sparse_and_rle_encoding_beat_dense) {
+    // (1) SETTLED, MOBILIZED: the drained cavern lake — contiguous water, the
+    // case kRle exists for.
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(cavernFlood(), cavernTerrain(plugOpen));
+    WaterCA ca(mob.makeSolidFn());
+    drainCavern(ca, mob, plugOpen, -1);
+    std::vector<uint8_t> settledBlob;
+    WaterState::serialize(ca, mob, settledBlob);
+    const ModeStats settled = measureBlob(settledBlob, "drained cavern");
+
+    // (2) IN MOTION: the same cavern three ticks into the drain, which is what
+    // an autosave during play actually catches.
+    auto plugOpenM = std::make_shared<bool>(false);
+    WaterMobilizer mobM(cavernFlood(), cavernTerrain(plugOpenM));
+    WaterCA caM(mobM.makeSolidFn());
+    drainCavern(caM, mobM, plugOpenM, 3);
+    std::vector<uint8_t> movingBlob;
+    WaterState::serialize(caM, mobM, movingBlob);
+    const ModeStats moving = measureBlob(movingBlob, "cavern mid-drain");
+
+    // (3) A LARGE SETTLED POOL: the repo's own multi-brick pool fixture (the
+    // 0x56BC18914355A205 golden scenario), i.e. deep water with genuinely full
+    // interior bricks.
+    WaterCA pool(basin(0, 15, 0, 15));
+    CHECK_EQ(pool.addWater(7, 7, 30, 300000), uint32_t(300000));
+    CHECK(runToSettleCheckingConservation(pool, 5000));
+    WaterMobilizer noMob(cavernFlood(), cavernTerrain(plugOpen));
+    std::vector<uint8_t> poolBlob;
+    WaterState::serialize(pool, noMob, poolBlob);
+    const ModeStats pooled = measureBlob(poolBlob, "16x16 settled pool");
+
+    // (4) A THIN VERTICAL COLUMN: a one-cell-wide drain shaft. Contiguous in
+    // SPACE but isolated in cellIndex ORDER, which is what kRle cannot exploit
+    // and kSparse can.
+    WaterCA shaft(shaftAt(0, 0));
+    CHECK_EQ(shaft.addWater(0, 0, 20, 500), uint32_t(500));
+    CHECK(runToSettleCheckingConservation(shaft, 200));
+    WaterMobilizer noMob2(cavernFlood(), cavernTerrain(plugOpen));
+    std::vector<uint8_t> shaftBlob;
+    WaterState::serialize(shaft, noMob2, shaftBlob);
+    const ModeStats shafted = measureBlob(shaftBlob, "vertical drain shaft");
+
+    // THE VERDICT, as assertions rather than prose:
+    // kRle earns its place on settled water, and by a wide margin.
+    CHECK(settled.rle > 0);
+    CHECK(pooled.rle > 0);
+    CHECK(settled.chosenBytes * 4 < settled.denseBytes);
+    CHECK(pooled.chosenBytes * 4 < pooled.denseBytes);
+    // Water in motion is still sheets, so kRle wins there too — recorded as an
+    // assertion so the surprising half of the measurement cannot rot silently.
+    CHECK(moving.rle > 0);
+    CHECK_EQ(moving.sparse, size_t(0));
+    // kSparse earns its place on the drain shaft. THIS is the assertion that
+    // would fail if the third mode were dead weight and should be deleted —
+    // and it is the only one of the four scenarios that fails without it.
+    CHECK(shafted.sparse > 0);
+    CHECK(shafted.chosenBytes * 4 < shafted.denseBytes);
+    // And no scenario is ever WORSE than dense-only, because the encoder picks
+    // the minimum of the three per brick.
+    CHECK(settled.chosenBytes <= settled.denseBytes);
+    CHECK(moving.chosenBytes <= moving.denseBytes);
+    CHECK(pooled.chosenBytes <= pooled.denseBytes);
+    CHECK(shafted.chosenBytes <= shafted.denseBytes);
 }

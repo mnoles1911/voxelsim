@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace vxc {
 
@@ -1322,6 +1324,270 @@ void WaterMobilizer::digest(Digest& d) const {
         d.i64(k.y);
         d.i64(k.z);
     }
+}
+
+// ===========================================================================
+// WaterState — the savegame blob (see the long contract comment in waterca.h;
+// the "why this is not just a list of mobilized keys" argument lives there and
+// is the whole point of this class)
+// ===========================================================================
+
+namespace {
+
+void writeKey(ByteWriter& w, const BrickKey& k) {
+    w.i32(k.x);
+    w.i32(k.y);
+    w.i32(k.z);
+}
+
+bool readKey(ByteReader& r, BrickKey& k) { return r.i32(k.x) && r.i32(k.y) && r.i32(k.z); }
+
+// A u64-counted key list, required to be STRICTLY ASCENDING in BrickKeyLess
+// order. Both persisted key sets are std::set<BrickKey, BrickKeyLess> on the
+// write side, so this costs nothing to satisfy and buys two things: a
+// re-serialized load is byte-identical, and a shuffled/duplicated blob is
+// rejected instead of quietly producing a different-but-plausible world.
+// Nothing is reserved off `n` before its bytes are read, so a garbage count
+// fails on the first short read rather than allocating against it.
+bool readKeyList(ByteReader& r, std::vector<BrickKey>& out) {
+    uint64_t n = 0;
+    if (!r.u64(n)) return false;
+    BrickKey prev{};
+    for (uint64_t i = 0; i < n; ++i) {
+        BrickKey k{};
+        if (!readKey(r, k)) return false;
+        if (i > 0 && !BrickKeyLess{}(prev, k)) return false;
+        prev = k;
+        out.push_back(k);
+    }
+    return true;
+}
+
+WaterState::BrickFill readBrickFill(const WaterBrick8& b) {
+    WaterState::BrickFill f{};
+    for (int z = 0; z < kEdge; ++z)
+        for (int y = 0; y < kEdge; ++y)
+            for (int x = 0; x < kEdge; ++x)
+                f[static_cast<size_t>(WaterBrick8::cellIndex(x, y, z))] = b.get(x, y, z);
+    return f;
+}
+
+struct FillRun {
+    uint8_t fill;
+    uint16_t len;
+};
+
+std::vector<FillRun> runsOf(const WaterState::BrickFill& f) {
+    std::vector<FillRun> runs;
+    for (uint8_t v : f) {
+        if (!runs.empty() && runs.back().fill == v && runs.back().len < 0xffffu)
+            ++runs.back().len;
+        else
+            runs.push_back(FillRun{v, 1});
+    }
+    return runs;
+}
+
+// Encodes one brick in all three modes and writes the SMALLEST; ties break to
+// the lower mode id so the choice is a pure function of the brick's contents.
+// See waterca.h for what each mode is good at and
+// waterca_state_sparse_encoding_beats_dense for the measurement that earned
+// them their place.
+void writeBrickPayload(ByteWriter& w, const WaterState::BrickFill& f) {
+    size_t nonZero = 0;
+    for (uint8_t v : f)
+        if (v != 0) ++nonZero;
+    const std::vector<FillRun> runs = runsOf(f);
+
+    const size_t denseBytes = f.size();
+    const size_t sparseBytes = 2 + 3 * nonZero;
+    const size_t rleBytes = 2 + 3 * runs.size();
+
+    if (denseBytes <= sparseBytes && denseBytes <= rleBytes) {
+        w.u8(WaterState::kDense);
+        for (uint8_t v : f) w.u8(v);
+        return;
+    }
+    if (sparseBytes <= rleBytes) {
+        w.u8(WaterState::kSparse);
+        w.u16(static_cast<uint16_t>(nonZero));
+        for (size_t ci = 0; ci < f.size(); ++ci) {
+            if (f[ci] == 0) continue;
+            w.u16(static_cast<uint16_t>(ci));
+            w.u8(f[ci]);
+        }
+        return;
+    }
+    w.u8(WaterState::kRle);
+    w.u16(static_cast<uint16_t>(runs.size()));
+    for (const FillRun& run : runs) {
+        w.u8(run.fill);
+        w.u16(run.len);
+    }
+}
+
+bool readBrickPayload(ByteReader& r, WaterState::BrickFill& f) {
+    f.fill(0);
+    uint8_t mode = 0;
+    if (!r.u8(mode)) return false;
+
+    if (mode == WaterState::kDense) {
+        for (size_t i = 0; i < f.size(); ++i)
+            if (!r.u8(f[i])) return false;
+        return true;
+    }
+    if (mode == WaterState::kSparse) {
+        uint16_t n = 0;
+        if (!r.u16(n)) return false;
+        uint32_t prev = 0;
+        for (uint16_t i = 0; i < n; ++i) {
+            uint16_t cell = 0;
+            uint8_t v = 0;
+            if (!r.u16(cell) || !r.u8(v)) return false;
+            if (cell >= f.size()) return false;
+            if (v == 0) return false;                    // never canonical: 0 is the default
+            if (i > 0 && cell <= prev) return false;     // sorted, unique
+            prev = cell;
+            f[static_cast<size_t>(cell)] = v;
+        }
+        return true;
+    }
+    if (mode == WaterState::kRle) {
+        uint16_t n = 0;
+        if (!r.u16(n)) return false;
+        size_t cell = 0;
+        for (uint16_t i = 0; i < n; ++i) {
+            uint8_t v = 0;
+            uint16_t len = 0;
+            if (!r.u8(v) || !r.u16(len)) return false;
+            if (len == 0) return false;                  // never canonical: empty run
+            if (static_cast<size_t>(len) > f.size() - cell) return false;
+            for (uint16_t j = 0; j < len; ++j) f[cell++] = v;
+        }
+        return cell == f.size();                         // must cover exactly 512 cells
+    }
+    return false;
+}
+
+} // namespace
+
+void WaterState::serialize(const WaterCA& ca, const WaterMobilizer& mob,
+                           std::vector<uint8_t>& out) {
+    ByteWriter w(out);
+    w.u32(kMagic);
+    w.u32(kFormatVersion);
+    w.u32(kWaterCAVersion);
+    w.u64(ca.totalVolume());
+
+    // The two key sets below are already BrickKeyLess-ordered (std::set), so
+    // they need no sorting at all. The fill map is the one exception: WaterMap
+    // is an unordered_map, so its keys get one explicit sort here -- exactly
+    // what WaterCA::digest does, for exactly the same reason.
+    std::vector<BrickKey> keys;
+    keys.reserve(ca.bricks().size());
+    for (const auto& entry : ca.bricks()) keys.push_back(entry.first);
+    std::sort(keys.begin(), keys.end(), BrickKeyLess{});
+
+    w.u64(keys.size());
+    for (const BrickKey& k : keys) {
+        writeKey(w, k);
+        writeBrickPayload(w, readBrickFill(*ca.bricks().find(k)));
+    }
+
+    w.u64(ca.activeBricks().size());
+    for (const BrickKey& k : ca.activeBricks()) writeKey(w, k);
+
+    w.u64(mob.mobilizedBricks().size());
+    for (const BrickKey& k : mob.mobilizedBricks()) writeKey(w, k);
+}
+
+std::optional<WaterState> WaterState::parse(const uint8_t* data, size_t size) {
+    ByteReader r(data, size);
+    uint32_t magic = 0, fmt = 0, caVersion = 0;
+    if (!r.u32(magic) || magic != kMagic) return std::nullopt;
+    if (!r.u32(fmt) || fmt != kFormatVersion) return std::nullopt;
+    // EXACT match, not a range: fill produced under different tick rules is a
+    // different simulation state, and per docs/determinism.md that is what the
+    // constant exists to signal. Refusing here leaves the caller with a world
+    // whose water reverts to implicit -- degraded, but coherent.
+    if (!r.u32(caVersion) || caVersion != kWaterCAVersion) return std::nullopt;
+
+    WaterState s;
+    if (!r.u64(s.totalVolume)) return std::nullopt;
+
+    uint64_t brickCount = 0;
+    if (!r.u64(brickCount)) return std::nullopt;
+    uint64_t sum = 0;
+    BrickKey prev{};
+    for (uint64_t i = 0; i < brickCount; ++i) {
+        BrickKey k{};
+        if (!readKey(r, k)) return std::nullopt;
+        if (i > 0 && !BrickKeyLess{}(prev, k)) return std::nullopt; // strictly ascending
+        prev = k;
+        BrickFill f{};
+        if (!readBrickPayload(r, f)) return std::nullopt;
+        uint64_t brickSum = 0;
+        for (uint8_t v : f) brickSum += static_cast<uint64_t>(v);
+        // An all-zero brick is never stored (homogeneous-empty collapse ==
+        // absence), so its presence means the blob did not come from
+        // serialize() and nothing about it should be trusted.
+        if (brickSum == 0) return std::nullopt;
+        sum += brickSum;
+        s.bricks.push_back({k, f});
+    }
+    // Integrity: the ledger we just re-derived from the decoded fills must
+    // equal the one the save recorded. This is the loud half of "a save/load
+    // cycle must not silently lose water" -- the quiet half is the round-trip
+    // test, and this one also fires in production.
+    if (sum != s.totalVolume) return std::nullopt;
+
+    if (!readKeyList(r, s.active)) return std::nullopt;
+    if (!readKeyList(r, s.mobilized)) return std::nullopt;
+    if (!r.atEnd()) return std::nullopt; // trailing bytes: truncated append or garbage
+    return s;
+}
+
+bool WaterState::applyTo(WaterCA& ca, WaterMobilizer& mob) const {
+    // A non-empty target would leave behind stale cells this blob never
+    // mentions -- a silent merge, not a load. Refuse before writing anything.
+    if (ca.storedBrickCount() != 0 || ca.totalVolume() != 0 || ca.activeBrickCount() != 0)
+        return false;
+    if (!mob.mobilizedBricks().empty()) return false;
+
+    // FILLS FIRST (waterca.h explains why the order is written down even
+    // though the end state is order-independent). setReplicatedFill writes
+    // state directly and never consults solidity, so it is untroubled by
+    // makeSolidFn() still reporting these cells as implicit-water WALL at this
+    // point -- which is precisely what lets the fill land before the wall is
+    // lifted, instead of after.
+    for (const auto& entry : bricks) {
+        const BrickKey& k = entry.first;
+        const BrickFill& f = entry.second;
+        const int64_t ox = static_cast<int64_t>(k.x) * kEdge;
+        const int64_t oy = static_cast<int64_t>(k.y) * kEdge;
+        const int64_t oz = static_cast<int64_t>(k.z) * kEdge;
+        for (int z = 0; z < kEdge; ++z)
+            for (int y = 0; y < kEdge; ++y)
+                for (int x = 0; x < kEdge; ++x) {
+                    const uint8_t v = f[static_cast<size_t>(WaterBrick8::cellIndex(x, y, z))];
+                    if (v != 0) ca.setReplicatedFill(ox + x, oy + y, oz + z, v);
+                }
+    }
+
+    // Scheduling next: restores mid-flow water as mid-flow. Writes nothing.
+    for (const BrickKey& k : active) ca.markActive(k);
+
+    // The wall comes down LAST. markMobilized credits nothing -- the units are
+    // already in the fill loaded above, which is the precondition its doc
+    // comment states and the one this class exists to actually satisfy.
+    for (const BrickKey& k : mobilized) mob.markMobilized(k);
+    return true;
+}
+
+bool WaterState::load(const uint8_t* data, size_t size, WaterCA& ca, WaterMobilizer& mob) {
+    const std::optional<WaterState> s = parse(data, size);
+    if (!s) return false;
+    return s->applyTo(ca, mob);
 }
 
 } // namespace vxc
