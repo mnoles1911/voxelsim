@@ -220,20 +220,89 @@ CavernColumn cachedCavernColumn(uint64_t seed, int64_t vx, int64_t vy, int32_t s
 }
 
 
-// Detail octave table v1 (worldgen-versioned constant, docs/determinism.md).
+// Detail octave table v2 (worldgen-versioned constant, docs/determinism.md).
 // latticeMm chosen so octaves nest across brick sizes; amplitudes in mm before
-// slope scaling.
+// scaling. Ordered COARSE to FINE — the split into the two bands below is by
+// index, so the ordering is load-bearing.
+//
+// ---------------------------------------------------------------------------
+// WHY v2 EXISTS, AND WHY v1's PARAMETERS WERE NEVER RIGHT FOR REAL TILES.
+//
+// v1 was tuned entirely against SyntheticTileSampler, whose own octave ladder
+// already runs down to a 2-pixel (60 m) lattice. Real terrain-diffusion tiles
+// are a 30 m/px raster with nothing below Nyquist, so the amplifier was never
+// once asked to actually CONTINUE a spectrum — and it does not.
+//
+// Measured with vxc_terrainprobe against the real tiles, using the DETRENDED
+// roughness S2(d) = mean |h(x+d) - 2h(x) + h(x-d)| (the plain structure
+// function is swamped by the mean slope on sloped ground and reports a
+// meaningless H = 1.0):
+//
+//   * the coarse raster is self-affine with H ~ 0.7-0.9 from 960 m down to
+//     30 m, which is what natural terrain looks like;
+//   * the v1 amplified surface has H ~ 1.4-1.8 between 0.1 m and 0.4 m —
+//     SMOOTHER THAN LINEAR. That is the signature of running out of octaves:
+//     below the 400 mm finest lattice the surface is an analytically smooth
+//     bilinear ramp, with roughness at 0.1 m lag of 0.05 voxels.
+//
+// A locally-planar surface voxelised at 10 cm produces coherent contour
+// terraces, and that is the whole artifact. On 1.7% ground v1 gave terrace
+// runs averaging 8.8 voxels with 27% of a transect inside dead-flat runs of
+// 2 m or more; on a 98% slope it gave a perfect 1:1 staircase. Same defect,
+// two ranges — the smooth vista and the corduroy ground are one bug.
+//
+// For calibration: terrain-diffusion's own Minecraft integration
+// (github.com/xandergos/terrain-diffusion-mc, ported from
+// terrain_diffusion/inference/minecraft_api.py) solves the identical
+// coarse->fine problem with the identical architecture we already had —
+// bilinear upsample plus slope-gated fBm, nothing learned — but applies up to
+// ~100 m + ~70 m of it at native scale. v1's ceiling was 2.856 m. We were
+// running at roughly 2.5% of the reference implementation's amplitude.
+//
+// (The checkpoint's decoder_model/ is NOT an option here: it is an EDMUnet2D
+// consistency decoder, 4-channel latents at 240 m/px -> the 1-channel
+// Laplacian residual at 30 m/px, a fixed 8x latent-to-pixel stage. 30 m is the
+// end of that cascade and no finer model exists. Everything below 30 m is
+// procedural and always will be.)
+// ---------------------------------------------------------------------------
 struct Octave {
     int32_t latticeMm;
     int32_t amplitudeMm;
 };
 constexpr Octave kDetailOctaves[] = {
-    {25600, 1800},
-    {6400, 700},
-    {1600, 260},
-    {400, 100},
+    // --- LANDFORM band: scaled by slopeScaleQ10, so it vanishes on flats.
+    // These are hillside-shaping octaves; on a plain there should be no
+    // hillside, and damping them there is correct.
+    {25600, 2600},
+    {6400, 1100},
+    // --- MICRORELIEF band: scaled by microScaleQ10, which has a FLOOR.
+    // This band is why v2 is not just "v1 with bigger numbers". Real ground
+    // has centimetre-to-metre roughness — clods, tussocks, stones, rills —
+    // that does not disappear because the ground is level, and at 10 cm voxels
+    // flat ground is precisely where the terrace runs are LONGEST and the
+    // artifact is worst. Upstream's slope gate drives detail to exactly zero
+    // on flats; that is harmless at 1 m blocks and actively wrong at 10 cm, so
+    // this is the one place we deliberately diverge from the reference.
+    // The 200 mm lattice is the new floor of the cascade: two voxels, which is
+    // the finest scale at which value noise is still a shape rather than
+    // per-voxel static.
+    // Energy is weighted toward the METRE scale rather than the finest
+    // lattice on purpose. An earlier cut put more into the 200 mm octave and
+    // it read in-engine as per-2-voxel static — the eye takes dense
+    // uncorrelated jitter as noise, not as ground. Larger, smoother lumps
+    // with quieter fine detail on top read as terrain.
+    {1600, 500},
+    {400, 190},
+    {200, 60},
 };
 constexpr uint32_t kDetailOctaveCount = sizeof(kDetailOctaves) / sizeof(kDetailOctaves[0]);
+
+// The band split, by index into the table above (which is ordered coarse to
+// fine). Octaves [0, kLandformOctaveCount) take the slope scale; the rest take
+// the microrelief scale.
+constexpr uint32_t kLandformOctaveCount = 2;
+static_assert(kLandformOctaveCount < kDetailOctaveCount,
+              "both bands must be non-empty; evalSurface and the bound both split here");
 
 // The divisor evalSurface applies to each octave's raw noise before scaling it
 // by the octave amplitude. Named because Amplifier::surfaceUpperBoundMm's
@@ -246,6 +315,30 @@ constexpr int64_t kSlopeScaleMinQ10 = 256;
 constexpr int64_t kSlopeScaleMaxQ10 = 4096;
 constexpr int64_t slopeScaleQ10(int64_t slopeMmPerPx) {
     return clampi64(512 + slopeMmPerPx / 24, kSlopeScaleMinQ10, kSlopeScaleMaxQ10);
+}
+
+// Microrelief scale in q10, for the fine band. Same SHAPE as slopeScaleQ10 —
+// nondecreasing in slope, saturating — and deliberately a different CURVE: it
+// never drops below 0.75, because ground roughness at the decimetre scale is a
+// property of the material, not of the gradient. Flat ground is still bumpy;
+// it is only the hillside-shaping octaves that should vanish when there is no
+// hillside. The narrower range (0.75..2.0 against the landform band's
+// 0.25..4.0) also keeps the surface upper bound from widening much: this band
+// is small in amplitude, and the bound pays for its maximum.
+// It is DELIBERATELY almost slope-flat. The first cut of this used
+// `768 + slope/64` clamped to 2.0, by analogy with slopeScaleQ10 — and that
+// was wrong for a reason worth recording. On a 45-degree slope the tile slope
+// term reaches ~60000 mm/px, which took the fine band to x1.66, i.e. roughly
+// +/-11 VOXELS of 0.2-1.6 m noise. In-engine that turned the mountainside
+// from machined corduroy into uniform rubble: a different artifact, not a
+// fix. Amplifying the fine band on steep ground was never the point of this
+// band — the FLOOR on flat ground is. Decimetre roughness is a property of
+// the material, not of the gradient, so the curve is now nearly constant and
+// the ceiling is 1.25 rather than 2.0.
+constexpr int64_t kMicroScaleMinQ10 = 768;  // 0.75
+constexpr int64_t kMicroScaleMaxQ10 = 1280; // 1.25
+constexpr int64_t microScaleQ10(int64_t slopeMmPerPx) {
+    return clampi64(768 + slopeMmPerPx / 256, kMicroScaleMinQ10, kMicroScaleMaxQ10);
 }
 
 // Final clamp on a surface elevation, in mm above sea level.
@@ -308,19 +401,27 @@ static_assert(detailAmplitudesArePositive(),
 // (3) The largest `detailMm` evalSurface's octave loop can produce, evaluated in
 // the SAME integer form and over the SAME table that loop uses. DERIVED, not
 // mirrored: adding, removing or re-tuning an octave moves the bound with it.
-constexpr int64_t detailMaxMm() {
+// PER BAND, because evalSurface now scales the two bands by different factors
+// and the bound must do the same or it is not a bound. `landform` selects
+// which half of the table to sum; both are DERIVED from the same table and the
+// same kLandformOctaveCount split that evalSurface's loop uses.
+constexpr int64_t detailMaxMm(bool landform) {
     int64_t sum = 0;
-    for (uint32_t i = 0; i < kDetailOctaveCount; ++i)
+    for (uint32_t i = 0; i < kDetailOctaveCount; ++i) {
+        if ((i < kLandformOctaveCount) != landform) continue;
         sum += kNoiseMax * kDetailOctaves[i].amplitudeMm / kDetailNoiseScale;
+    }
     return sum;
 }
-constexpr int64_t kDetailMaxMm = detailMaxMm();
+constexpr int64_t kLandformMaxMm = detailMaxMm(true);
+constexpr int64_t kMicroMaxMm = detailMaxMm(false);
+constexpr int64_t kDetailMaxMm = kLandformMaxMm + kMicroMaxMm;
 
 // (4) Tripwire. (3) keeps the bound SOUND across an octave-table edit on its
 // own; this makes such an edit impossible to do ACCIDENTALLY without reading
 // the derivation. Any change here also moves worldgen output — bump
 // kWorldGenVersion and regenerate goldens.
-static_assert(kDetailOctaveCount == 4 && kDetailMaxMm == 2856,
+static_assert(kDetailOctaveCount == 5 && kLandformMaxMm == 3698 && kMicroMaxMm == 747,
               "kDetailOctaves changed. Amplifier::surfaceUpperBoundMm derives its "
               "detail allowance from the table, so the bound is still sound -- but "
               "re-read its derivation before updating these numbers, and remember an "
@@ -358,10 +459,41 @@ static_assert(slopeScaleQ10(1LL << 40) == kSlopeScaleMaxQ10,
               "slopeScaleQ10 must saturate; a slope past the sweep in "
               "slopeScaleIsNondecreasing must still clamp.");
 
-// (6) The detail allowance at full slope scale, and a check that it stays a
+// (5b) The SAME two properties for microScaleQ10, which the bound feeds the
+// footprint's maximum slope in exactly the same way and for exactly the same
+// reason. Verified by the same exhaustive sweep rather than by asserting that
+// it "looks like" slopeScaleQ10 — it is a different curve with a different
+// divisor and a different floor, so it needs its own proof.
+constexpr bool microScaleIsNondecreasing() {
+    int64_t prev = microScaleQ10(0);
+    for (int64_t s = 0; s <= 90000; ++s) {
+        const int64_t v = microScaleQ10(s);
+        if (v < prev || v > kMicroScaleMaxQ10) return false;
+        prev = v;
+    }
+    for (int64_t s = 90000; s <= 3'000'000; s += 251) {
+        const int64_t v = microScaleQ10(s);
+        if (v < prev || v > kMicroScaleMaxQ10) return false;
+        prev = v;
+    }
+    return true;
+}
+static_assert(microScaleIsNondecreasing(),
+              "microScaleQ10 must be nondecreasing and clamped above; "
+              "Amplifier::surfaceUpperBoundMm feeds it the footprint's maximum slope.");
+static_assert(microScaleQ10(1LL << 40) == kMicroScaleMaxQ10, "microScaleQ10 must saturate");
+// The floor is the entire point of this band existing; assert it directly so
+// that "re-tune microScaleQ10" cannot quietly reintroduce the artifact by
+// letting the fine band vanish on flat ground.
+static_assert(microScaleQ10(0) >= 768,
+              "the microrelief band must not vanish on flat ground -- that is the terrace "
+              "artifact this band exists to break up. See kDetailOctaves.");
+
+// (6) The detail allowance at full scale, per band, and a check that it stays a
 // small number of metres (i.e. that the bound has not quietly become useless).
-constexpr int64_t kDetailMaxAtMaxSlopeMm = kDetailMaxMm * kSlopeScaleMaxQ10 / 1024;
-static_assert(kDetailMaxAtMaxSlopeMm == 11424, "detail allowance moved");
+constexpr int64_t kDetailMaxAtMaxSlopeMm =
+    kLandformMaxMm * kSlopeScaleMaxQ10 / 1024 + kMicroMaxMm * kMicroScaleMaxQ10 / 1024;
+static_assert(kDetailMaxAtMaxSlopeMm == 15725, "detail allowance moved");
 
 // ---------------------------------------------------------------------------
 // Couplings for the MIRROR bounds: Amplifier::surfaceLowerBoundMm and
@@ -381,16 +513,21 @@ static_assert(kDetailMaxAtMaxSlopeMm == 11424, "detail allowance moved");
 // in the one place an off-by-one is a hole in the world, take the trivially
 // sound envelope: |noise| <= kDetailNoiseScale, so each octave's contribution
 // is at most its own amplitude. DERIVED from the same table as (3).
-constexpr int64_t detailAbsMaxMm() {
+constexpr int64_t detailAbsMaxMm(bool landform) {
     int64_t sum = 0;
-    for (uint32_t i = 0; i < kDetailOctaveCount; ++i) sum += kDetailOctaves[i].amplitudeMm;
+    for (uint32_t i = 0; i < kDetailOctaveCount; ++i) {
+        if ((i < kLandformOctaveCount) != landform) continue;
+        sum += kDetailOctaves[i].amplitudeMm;
+    }
     return sum;
 }
-constexpr int64_t kDetailAbsMaxMm = detailAbsMaxMm();
-static_assert(kDetailAbsMaxMm >= kDetailMaxMm,
+constexpr int64_t kLandformAbsMaxMm = detailAbsMaxMm(true);
+constexpr int64_t kMicroAbsMaxMm = detailAbsMaxMm(false);
+static_assert(kLandformAbsMaxMm >= kLandformMaxMm && kMicroAbsMaxMm >= kMicroMaxMm,
               "the symmetric detail envelope must cover the positive-side maximum too, or "
               "surfaceLowerBoundMm is looser than surfaceUpperBoundMm in the wrong direction");
-static_assert(kDetailAbsMaxMm == 2860, "detail amplitude sum moved; see (4)");
+static_assert(kLandformAbsMaxMm == 3700 && kMicroAbsMaxMm == 750,
+              "detail amplitude sum moved; see (4)");
 
 // (8) The cave family's carve depth, in the QUERYING COLUMN'S OWN depth space.
 // caveCarveAt tests `depthMm < segs[s].depthMm + sqrt(marginSq)`, so the
@@ -503,14 +640,26 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     // detail amplitude and soil depth.
     const int64_t slopeMmPerPx = tileSlopeMmPerPx(e00, e10, e01);
 
+    // Two bands, accumulated separately because they take different scales
+    // (see kDetailOctaves). Each band is summed at full precision and scaled
+    // ONCE, rather than scaling per octave, so the truncation happens in one
+    // place per band and the bound has exactly two terms to account for.
     const int64_t sScale = slopeScaleQ10(slopeMmPerPx);
-    int64_t detailMm = 0;
+    const int64_t mScale = microScaleQ10(slopeMmPerPx);
+    int64_t landformMm = 0, microMm = 0;
     for (uint32_t i = 0; i < kDetailOctaveCount; ++i) {
         const Octave& o = kDetailOctaves[i];
-        detailMm += valueNoise2(seed_, xMm, yMm, o.latticeMm, CH_DETAIL_OCTAVE_BASE + i) *
-                    o.amplitudeMm / kDetailNoiseScale;
+        // Faded, not raw: raw valueNoise2 puts a visible dead-straight crease
+        // on every lattice line of every octave. See hash.h.
+        const int64_t term =
+            valueNoise2Fade(seed_, xMm, yMm, o.latticeMm, CH_DETAIL_OCTAVE_BASE + i) *
+            o.amplitudeMm / kDetailNoiseScale;
+        if (i < kLandformOctaveCount)
+            landformMm += term;
+        else
+            microMm += term;
     }
-    detailMm = detailMm * sScale / 1024;
+    const int64_t detailMm = landformMm * sScale / 1024 + microMm * mScale / 1024;
 
     SurfaceEval s;
     s.px = px;
@@ -662,11 +811,22 @@ bool Amplifier::surfaceBoundsMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t v
     // maximum slope; sound for the lower bound for the same reason, since
     // scaling only ever grows the detail term's MAGNITUDE, in both directions.
     const int64_t slopeQ10 = slopeScaleQ10(maxSlopeMmPerPx);
-    const int64_t maxDetailMm = kDetailMaxMm * slopeQ10 / 1024;
+    const int64_t microQ10 = microScaleQ10(maxSlopeMmPerPx);
+    // Two bands, two scales -- summed here exactly as evalSurface sums them.
+    // Sound because each band's maximum bounds that band at every column
+    // simultaneously (they need not be attained at the same column), and both
+    // scale curves are asserted nondecreasing so the footprint's maximum slope
+    // gives each band's maximum scale.
+    const int64_t maxDetailMm =
+        kLandformMaxMm * slopeQ10 / 1024 + kMicroMaxMm * microQ10 / 1024;
     // The negative side uses the symmetric envelope (coupling (7)), and takes
-    // one further millimetre for the truncation in the q10 divide, which rounds
-    // toward zero and so would otherwise shave the magnitude.
-    const int64_t minDetailMm = kDetailAbsMaxMm * slopeQ10 / 1024 + 1;
+    // one further millimetre PER BAND for the truncation in each q10 divide,
+    // which rounds toward zero and so would otherwise shave the magnitude.
+    // Two bands, two truncations, two millimetres — this is the one place
+    // where splitting the sum costs the bound anything, and one millimetre of
+    // conservatism is the right price for not having to argue about it.
+    const int64_t minDetailMm =
+        kLandformAbsMaxMm * slopeQ10 / 1024 + kMicroAbsMaxMm * microQ10 / 1024 + 2;
 
     outUpperMm = clampi64(maxBaseMm + maxDetailMm, kSurfaceClampMinMm, kSurfaceClampMaxMm);
     outLowerMm = clampi64(minBaseMm - minDetailMm, kSurfaceClampMinMm, kSurfaceClampMaxMm);

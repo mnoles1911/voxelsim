@@ -76,10 +76,13 @@ static const int kBiomePrecipSemiU8 = 100;
 static const int kBiomePrecipModU8 = 170;
 static const int kBiomeSeasonalHighU8 = 128;
 
-// Detail octave table v1 (amplifier.cpp kDetailOctaves).
-static const int kOctaveCount = 4;
-static const int kOctaveLatticeMm[kOctaveCount] = {25600, 6400, 1600, 400};
-static const int kOctaveAmplitudeMm[kOctaveCount] = {1800, 700, 260, 100};
+// Detail octave table v2 (amplifier.cpp kDetailOctaves). Ordered coarse to
+// fine; the first kLandformOctaveCount entries take slopeScaleQ10 and the rest
+// take microScaleQ10. See amplifier.cpp for why the table looks like this.
+static const int kOctaveCount = 5;
+static const int kLandformOctaveCount = 2;
+static const int kOctaveLatticeMm[kOctaveCount] = {25600, 6400, 1600, 400, 200};
+static const int kOctaveAmplitudeMm[kOctaveCount] = {2600, 1100, 500, 190, 60};
 
 // --- primitives mirrored from core.h / hash.h ------------------------------
 
@@ -194,11 +197,62 @@ int64_t valueNoise2(uint64_t seed, int64_t xMm, int64_t yMm, int64_t latticeMm, 
                     latticeMm * latticeMm);
 }
 
+// vxc::fadeFractionMm (hash.h) bit-for-bit. Perlin's quintic
+// 6t^5 - 15t^4 + 10t^3 applied to a lattice fraction, carried as a 10-bit
+// fraction so t^5 stays inside int64. See hash.h for why the detail octaves
+// need it and why it costs the surface bound nothing.
+//
+// Every operand here is NON-NEGATIVE: fx is in [0, latticeMm) by floorDiv's
+// contract, and the quintic is nonneg on [0, 1]. So the divisions are
+// same-sign and truncDiv agrees with `/` on both CPU and GPU — but they go
+// through truncDiv anyway, because "this operand happens to be positive
+// today" is exactly the reasoning the M0 NVIDIA-vs-AMD divergence punished.
+int64_t fadeFractionMm(int64_t fx, int64_t latticeMm)
+{
+    const int64_t tq = truncDiv(fx * 1024, latticeMm);
+    const int64_t t3 = tq * tq * tq;
+    const int64_t w = truncDiv(6 * t3 * tq * tq - 15 * t3 * tq * 1024 + 10 * t3 * 1024 * 1024,
+                               (int64_t)1024 * 1024 * 1024 * 1024);
+    return truncDiv(w * latticeMm, 1024);
+}
+
+// vxc::valueNoise2Fade (hash.h) bit-for-bit. Same lattice, same hashes, same
+// output range as valueNoise2 — only the interpolation weights differ.
+int64_t valueNoise2Fade(uint64_t seed, int64_t xMm, int64_t yMm, int64_t latticeMm, uint channel)
+{
+    const int64_t x0 = floorDiv(xMm, latticeMm);
+    const int64_t y0 = floorDiv(yMm, latticeMm);
+    const int64_t fx = fadeFractionMm(xMm - x0 * latticeMm, latticeMm);
+    const int64_t fy = fadeFractionMm(yMm - y0 * latticeMm, latticeMm);
+    const int64_t v00 = hashToSigned16(hash2(seed, x0, y0, channel));
+    const int64_t v10 = hashToSigned16(hash2(seed, x0 + 1, y0, channel));
+    const int64_t v01 = hashToSigned16(hash2(seed, x0, y0 + 1, channel));
+    const int64_t v11 = hashToSigned16(hash2(seed, x0 + 1, y0 + 1, channel));
+    const int64_t gx = latticeMm - fx;
+    const int64_t gy = latticeMm - fy;
+    // Numerator is routinely negative (v* in [-32768, 32767]) — truncDiv, not
+    // `/`, per the floorDiv comment above.
+    return truncDiv((v00 * gx + v10 * fx) * gy + (v01 * gx + v11 * fx) * fy,
+                    latticeMm * latticeMm);
+}
+
 int64_t slopeScaleQ10(int64_t slopeMmPerPx)
 {
     // slopeMmPerPx is a sum of absolute values (>= 0), so both roundings agree
     // today; truncDiv keeps that from becoming load-bearing.
     return clamp64(512 + truncDiv(slopeMmPerPx, 24), 256, 4096);
+}
+
+// vxc::microScaleQ10 (amplifier.cpp) bit-for-bit. The microrelief band's
+// scale: same shape as slopeScaleQ10, deliberately a different curve, and it
+// NEVER drops below 0.75 — flat ground is still bumpy, and at 10 cm voxels
+// flat ground is exactly where the terrace artifact is worst. It is also
+// almost slope-FLAT by design (divisor 256, ceiling 1.25): amplifying the
+// fine band on steep ground turned a mountainside into rubble in-engine.
+// See amplifier.cpp for that measurement.
+int64_t microScaleQ10(int64_t slopeMmPerPx)
+{
+    return clamp64(768 + truncDiv(slopeMmPerPx, 256), 768, 1280);
 }
 
 // --- biome classification (voxelcore/biome.h) -------------------------------
@@ -392,17 +446,28 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     const int64_t slopeMmPerPx =
         (e10 > e00 ? e10 - e00 : e00 - e10) + (e01 > e00 ? e01 - e00 : e00 - e01);
 
+    // Two bands, accumulated separately because they take different scales,
+    // and each scaled ONCE — mirroring Amplifier::evalSurface exactly,
+    // including WHERE the truncations happen. Moving a truncation is a
+    // divergence even when the arithmetic is otherwise identical.
     const int64_t sScale = slopeScaleQ10(slopeMmPerPx);
-    int64_t detailMm = 0;
+    const int64_t mScale = microScaleQ10(slopeMmPerPx);
+    int64_t landformMm = 0;
+    int64_t microMm = 0;
     [unroll]
     for (int i = 0; i < kOctaveCount; ++i)
     {
-        detailMm += truncDiv(valueNoise2(seed, xMm, yMm, (int64_t)kOctaveLatticeMm[i],
-                                         CH_DETAIL_OCTAVE_BASE + (uint)i) *
-                                 (int64_t)kOctaveAmplitudeMm[i],
-                             32768);
+        const int64_t term = truncDiv(valueNoise2Fade(seed, xMm, yMm,
+                                                      (int64_t)kOctaveLatticeMm[i],
+                                                      CH_DETAIL_OCTAVE_BASE + (uint)i) *
+                                          (int64_t)kOctaveAmplitudeMm[i],
+                                      32768);
+        if (i < kLandformOctaveCount)
+            landformMm += term;
+        else
+            microMm += term;
     }
-    detailMm = truncDiv(detailMm * sScale, 1024);
+    const int64_t detailMm = truncDiv(landformMm * sScale, 1024) + truncDiv(microMm * mScale, 1024);
 
     SurfaceEval s;
     s.px = px;

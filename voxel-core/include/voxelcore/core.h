@@ -17,7 +17,16 @@ namespace vxc {
 // from a 40-60 m band to a 180-220 m one (200 m mean, Matt's decision), which
 // is what gives the multi-storey cavern chains their vertical room. One bump
 // covers both; see docs/status.md "C4".
-inline constexpr uint32_t kWorldGenVersion = 5;
+// v6: coarse-to-fine detail rework, the first time the amplifier was measured
+// against REAL 30 m terrain-diffusion tiles rather than SyntheticTileSampler.
+// Three changes, all in the surface term: (a) detail octave table v2 — five
+// octaves down to a 200 mm lattice, split into a slope-scaled LANDFORM band
+// and a microrelief band whose scale has a floor so it does not vanish on flat
+// ground; (b) the detail octaves now use the quintic-faded value noise
+// (hash.h valueNoise2Fade) instead of the raw bilinear one, which removes the
+// dead-straight lattice creases; (c) the surface bounds widened to match.
+// See amplifier.cpp kDetailOctaves for the measurements that forced this.
+inline constexpr uint32_t kWorldGenVersion = 6;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 
