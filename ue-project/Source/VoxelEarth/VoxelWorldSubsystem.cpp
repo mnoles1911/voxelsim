@@ -1451,6 +1451,100 @@ const int32* GetRingSlotFloors()
 constexpr double kRingCapShare[VoxelCoords::kNumLevels] = {0.30, 0.20, 0.20, 0.15, 0.15};
 } // namespace VoxelStreamAdmission
 
+// --- sky band: never mesh chunks that are provably above the terrain ---------
+//
+// docs/status.md "Zero-quad census": ~69% of all worker wall time on this box
+// produces no geometry, and the coarse rings are the worst offenders per job
+// (R3 460 ms p50, R4 6,022 ms p50 -- a level-4 chunk covers 4096x the volume of
+// a level-0 one and its mip build tracks that). A chunk entirely ABOVE the
+// terrain is the cheapest of those to recognise, because Amplifier::materialAt
+// is unconditionally MAT_AIR whenever the voxel centre is above `surfaceMm`:
+// caves and caverns only ever CARVE, and there is no fill of any kind above the
+// surface. So an UPPER BOUND on the surface over a footprint is all it takes --
+// no cave data, no cavern data, no bedrock, no level-0 bricks.
+//
+// The bound is analytic, from Amplifier::evalSurface's own structure:
+//
+//   surfaceMm = clamp(baseMm + detailMm, ...)
+//
+//   * baseMm is the BILINEAR interpolation of four ITileSampler::elevationMm
+//     reads at the corners of the tile pixel the column falls in. A bilinear
+//     patch is a convex combination of its four corners, so over any region its
+//     maximum is bounded by the largest elevationMm at any pixel corner the
+//     region touches -- an EXACT bound on the tile-scale term, from a handful
+//     of reads (<=16 at level 4 with 30 m pixels), and the term that 4-corner
+//     column sampling was missing.
+//   * detailMm is bounded absolutely: each octave contributes
+//     valueNoise2 * amplitudeMm / 32768 with |valueNoise2| <= 32768, so the sum
+//     is bounded by the amplitude sum, and the slope scale is clamped to
+//     [0.25, 4.0] q10. That is kMaxDetailMm below.
+//
+// Both switches are COMMAND-LINE switches resolved once at first use, not
+// cvars, for the reason -VoxelPendingJobCap and -VoxelNoUnderground are: an
+// -ExecCmds cvar lands after streaming has already built its desired set, so an
+// -ExecCmds A/B silently measures the same state twice.
+namespace VoxelSkyBand
+{
+// Amplifier detail-octave amplitude sum (kDetailOctaves in
+// voxel-core/src/amplifier.cpp: 1800 + 700 + 260 + 100) times the maximum
+// slope scale (slopeScaleQ10 clamps to 4096 q10 == 4.0). This is the only
+// worldgen constant mirrored here, and it is mirrored CONSERVATIVELY: the bound
+// is only ever used to widen an upper bound, so over-stating it costs a few
+// wasted chunks and can never hide geometry. It is also checked continuously in
+// production by -VoxelVerifySkyBand (see below), which cleared every chunk of a
+// full perf run against the real mesh output.
+//
+// FOLLOW-UP (reported upstream): this belongs in voxel-core as a
+// `Amplifier::surfaceUpperBoundMm(vx0, vy0, vx1, vy1)` next to the constants it
+// depends on, so a change to kDetailOctaves cannot silently invalidate it.
+constexpr int64 kDetailAmplitudeSumMm = 1800 + 700 + 260 + 100;
+constexpr int64 kMaxSlopeScaleQ10 = 4096;
+constexpr int64 kMaxDetailMm = kDetailAmplitudeSumMm * kMaxSlopeScaleQ10 / 1024; // 11'440 mm
+
+// Defensive cap on tile-corner reads per footprint. At level 4 (51.2 m
+// footprint) a 30 mm-class pixel needs 4x4 and the 11.25 m scale-8 pixel 6x6;
+// anything past this means an unexpected pixel size, and the bound is simply
+// declined (INT64_MAX) rather than made expensive.
+constexpr int64 kMaxPixelCornersPerAxis = 16;
+
+// -VoxelSkyTrim=0: restore ComputeFootprintChunkZRange's unconditional
+// +2-level-L-chunk headroom (the pre-wave behaviour) for A/B on one binary.
+bool GetTrimEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelSkyTrim="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+// -VoxelSkySkip=0: keep the trim but disable the per-chunk pre-dispatch all-air
+// skip. Separate from the trim so the two halves can be attributed apart.
+bool GetSkipEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelSkySkip="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+// -VoxelVerifySkyBand: compute the all-air verdict for every chunk but DISPATCH
+// ANYWAY, and check the verdict against the mesh the worker actually produced.
+// The only verification method strong enough for a "never hide geometry" claim:
+// it exercises the real streaming path over hundreds of thousands of real
+// chunks instead of a hand-picked unit fixture.
+bool GetVerifyEnabled()
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelVerifySkyBand"));
+	return bEnabled;
+}
+} // namespace VoxelSkyBand
+
 // FVoxelWorldImpl -- the voxel-core side of the subsystem, defined only here
 // so VoxelWorldSubsystem.h (UHT-parsed) never sees a voxel-core header. Also
 // owns ALL Stage 2 streaming state (chunk records, pending-work queues, the
@@ -1648,6 +1742,28 @@ struct FVoxelWorldImpl
 	// instead, sized by edit count rather than footprint size).
 	TSet<VoxelCoords::FVoxelChunkKey> EditedAncestorChunks[VoxelCoords::kNumLevels];
 
+	// Highest edited chunk Z per (level, footprint XY) -- the sky-band trim's
+	// escape hatch (see RecomputeDesiredSet and FFootprintZRange::
+	// ChunkZMaxUntrimmed). Maintained in exactly one place, PropagateEditToMips,
+	// which already receives the apron-extended level-0 dirty set and already
+	// walks its ancestors at every level; this map is that same walk's XY->maxZ
+	// reduction. Sized by edited footprints, not by world extent.
+	TMap<FIntPoint, int32> EditedFootprintMaxZ[VoxelCoords::kNumLevels];
+
+	// -VoxelVerifySkyBand only: chunk keys IsChunkProvablyAllAir called air,
+	// dispatched anyway so DrainResults can check the verdict against the mesh
+	// the worker really produced. Empty (and never touched) in normal runs.
+	TSet<VoxelCoords::FVoxelLevelChunkKey> VerifyPredictedAirKeys;
+	int64 VerifyAirPredictions = 0;  // chunks predicted all-air AND checked against a real result
+	int64 VerifyAirViolations = 0;   // ...of which the worker produced quads for. Must stay 0.
+	int64 VerifyChunksChecked = 0;   // every non-stale result the verifier saw, air or not
+	int64 VerifyAirPredictionsByLevel[VoxelCoords::kNumLevels] = {};
+	int64 VerifyResultsByLevel[VoxelCoords::kNumLevels] = {};
+
+	// Chunks never dispatched because IsChunkProvablyAllAir proved them empty,
+	// per level (the headline saving) -- reported on the ring dispatch line.
+	int64 LevelSkySkippedTotal[VoxelCoords::kNumLevels] = {};
+
 	TQueue<VoxelStreaming::FJobResult, EQueueMode::Mpsc> ResultsQueue;
 	FThreadSafeCounter JobsInFlightCounter;
 	TArray<UE::Tasks::TTask<void>> InFlightTasks; // only for a clean Deinitialize() wait; see WaitForInFlightTasks
@@ -1693,6 +1809,16 @@ struct FVoxelWorldImpl
 	{
 		int32 ChunkZMin = 0;
 		int32 ChunkZMax = 0;
+		// The sky-band trim's escape hatch. ChunkZMax is the TRIMMED top (see
+		// ComputeFootprintChunkZRange); this is what the pre-trim +2-chunk rule
+		// would have returned. RecomputeDesiredSet re-widens up to -- never past
+		// -- this value for footprints that contain an edited chunk above the
+		// trimmed top, so a placed block on a hilltop cannot be orphaned by the
+		// trim while the pre-trim envelope stays exactly what it always was.
+		// Both fields are pure functions of (Level, X, Y), so the memo's
+		// correctness argument is untouched: nothing anchor- or edit-dependent
+		// lives in here.
+		int32 ChunkZMaxUntrimmed = 0;
 	};
 	mutable TMap<VoxelCoords::FVoxelLevelChunkKey, FFootprintZRange> FootprintZRangeCache;
 
@@ -2061,10 +2187,28 @@ private:
 	// Bounded admission gate (b) -- see AdmissionCutoffDistSq. Called only from
 	// RecomputeDesiredSet, immediately after SortPendingQueues.
 	void TruncatePendingJobQueue();
-	void ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax) const;
+	void ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax,
+	                                  int32& OutChunkZMaxUntrimmed) const;
+	// Upper bound (mm, sea-level datum) on Amplifier::column().surfaceMm over
+	// EVERY column of this level-L footprint -- see namespace VoxelSkyBand for
+	// the derivation. Returns INT64_MAX if it declines to bound (unexpected tile
+	// pixel size); callers must treat that as "no information", never as air.
+	//
+	// Like ComputeFootprintChunkZRange this is a PURE function of
+	// (Level, ChunkX, ChunkY) and the immutable tile raster -- no anchor, no
+	// edits, nothing per-frame -- which is what lets its result live inside the
+	// FootprintZRangeCache memo alongside the z-range it feeds.
+	int64 FootprintSurfaceUpperBoundMm(int32 Level, int32 ChunkX, int32 ChunkY) const;
+	// True iff every voxel of this chunk is provably above the terrain surface,
+	// and therefore MAT_AIR, and therefore meshes to zero quads. Conservative:
+	// false means "not proven", never "has geometry". Does NOT consider edits --
+	// callers must veto on NeedsOverlayAwarePath first (a placed block is solid
+	// material in what worldgen calls sky).
+	bool IsChunkProvablyAllAir(const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const;
 	// Memoized wrapper around ComputeFootprintChunkZRange -- see
 	// FootprintZRangeCache's doc comment for why memoizing is exact.
-	void FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax) const;
+	void FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax,
+	                                 int32& OutChunkZMaxUntrimmed) const;
 	void PruneFootprintZRangeCache(const FVector& Anchor);
 	void SortPendingQueues(const FVector& Anchor);
 	// Drops the farthest entries of an ALREADY-SORTED (farthest-first) queue
@@ -2527,6 +2671,27 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       (long long)LevelChunksLoadedTotal[3], (long long)LevelZeroQuadTotal[3],
 	       (long long)LevelJobsDispatchedSinceLog[4], (long long)LevelJobsDispatchedTotal[4],
 	       (long long)LevelChunksLoadedTotal[4], (long long)LevelZeroQuadTotal[4]);
+
+	// Sky-band skip: chunks proven all-air and never dispatched, per ring. Read
+	// against the zq= counts on the line above -- skip= is work that no longer
+	// happens at all, zq= is work that still happened and produced nothing.
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel sky skip: R0 skip=%lld | R1 skip=%lld | R2 skip=%lld | R3 skip=%lld | R4 skip=%lld%s"),
+	       (long long)LevelSkySkippedTotal[0], (long long)LevelSkySkippedTotal[1], (long long)LevelSkySkippedTotal[2],
+	       (long long)LevelSkySkippedTotal[3], (long long)LevelSkySkippedTotal[4],
+	       VoxelSkyBand::GetVerifyEnabled() ? TEXT(" [VERIFY MODE: verdicts computed, jobs dispatched anyway]") : TEXT(""));
+	if (VoxelSkyBand::GetVerifyEnabled())
+	{
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("VoxelVerifySkyBand: results checked=%lld predicted-all-air=%lld VIOLATIONS=%lld | ")
+		       TEXT("R0 %lld/%lld | R1 %lld/%lld | R2 %lld/%lld | R3 %lld/%lld | R4 %lld/%lld (predicted/checked)"),
+		       (long long)VerifyChunksChecked, (long long)VerifyAirPredictions, (long long)VerifyAirViolations,
+		       (long long)VerifyAirPredictionsByLevel[0], (long long)VerifyResultsByLevel[0],
+		       (long long)VerifyAirPredictionsByLevel[1], (long long)VerifyResultsByLevel[1],
+		       (long long)VerifyAirPredictionsByLevel[2], (long long)VerifyResultsByLevel[2],
+		       (long long)VerifyAirPredictionsByLevel[3], (long long)VerifyResultsByLevel[3],
+		       (long long)VerifyAirPredictionsByLevel[4], (long long)VerifyResultsByLevel[4]);
+	}
 	for (int64& V : LevelJobsDispatchedSinceLog)
 	{
 		V = 0;
@@ -2842,7 +3007,159 @@ static bool BoxRadiusChunks(int32 Level, double DistSq, int32& OutRadius)
 
 // --- desired-set / hysteresis ------------------------------------------------
 
-void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax) const
+int64 FVoxelWorldImpl::FootprintSurfaceUpperBoundMm(int32 Level, int32 ChunkX, int32 ChunkY) const
+{
+	using namespace VoxelCoords;
+
+	const int64 PxMm = Tiles ? int64(Tiles->pixelSizeMm()) : 0;
+	if (PxMm <= 0)
+	{
+		return INT64_MAX; // no tile raster to bound against
+	}
+
+	// Footprint in millimetres, level-0 datum (the amplifier's only unit).
+	const int64 LevelScale = int64(1) << Level;
+	const int64 SpanMm = int64(ChunkEdgeVoxels) * LevelScale * vxc::kVoxelSizeMm;
+	const int64 X0Mm = (int64(ChunkX) * ChunkEdgeVoxels) * LevelScale * vxc::kVoxelSizeMm;
+	const int64 Y0Mm = (int64(ChunkY) * ChunkEdgeVoxels) * LevelScale * vxc::kVoxelSizeMm;
+	const int64 X1Mm = X0Mm + SpanMm - 1;
+	const int64 Y1Mm = Y0Mm + SpanMm - 1;
+
+	// Every tile-pixel CORNER of every pixel cell the footprint touches. The
+	// bilinear base over a cell is a convex combination of that cell's four
+	// corners, so the largest corner elevation over this set bounds the base
+	// term exactly -- no sampling density argument required, and no dependence
+	// on where inside a pixel the footprint happens to fall. This is precisely
+	// the "interior extremes between the corners" term that the 4-corner column
+	// sampling below cannot see.
+	const int64 Px0 = vxc::floorDiv(X0Mm, PxMm);
+	const int64 Px1 = vxc::floorDiv(X1Mm, PxMm) + 1;
+	const int64 Py0 = vxc::floorDiv(Y0Mm, PxMm);
+	const int64 Py1 = vxc::floorDiv(Y1Mm, PxMm) + 1;
+	if ((Px1 - Px0 + 1) > VoxelSkyBand::kMaxPixelCornersPerAxis ||
+	    (Py1 - Py0 + 1) > VoxelSkyBand::kMaxPixelCornersPerAxis)
+	{
+		return INT64_MAX; // decline rather than pay an unbounded read count
+	}
+
+	// Read the corner elevations once. Everything below is derived from this
+	// grid -- no further sampler traffic, and the grid is at most 16x16.
+	const int32 NX = int32(Px1 - Px0 + 1);
+	const int32 NY = int32(Py1 - Py0 + 1);
+	int64 Elev[VoxelSkyBand::kMaxPixelCornersPerAxis * VoxelSkyBand::kMaxPixelCornersPerAxis];
+	for (int32 Iy = 0; Iy < NY; ++Iy)
+	{
+		for (int32 Ix = 0; Ix < NX; ++Ix)
+		{
+			Elev[Ix + NX * Iy] = Tiles->elevationMm(Px0 + Ix, Py0 + Iy);
+		}
+	}
+
+	// (a) EXACT maximum of the bilinear base over the footprint.
+	//
+	// Taking the largest corner elevation would be a valid bound but a badly
+	// loose one whenever the footprint is small relative to a 30 m tile pixel
+	// (levels 0-3), because the nearest pixel corner can be 30 m of relief away
+	// from any ground the footprint actually contains. Instead: the base
+	// restricted to one pixel cell is bilinear, and a bilinear patch is LINEAR
+	// along each axis with the other fixed, so its maximum over any axis-aligned
+	// sub-rectangle is attained at a CORNER of that sub-rectangle. Clip the
+	// footprint to each pixel cell it touches and evaluate the cell's own
+	// bilinear form at the four clipped corners -- exact, and at most 4x4 cells.
+	//
+	// (b) Bound on the detail term using this footprint's OWN slope.
+	//
+	// slopeScaleQ10 clamps to [256, 4096] q10, and the absolute worst case
+	// (4096, i.e. 11.44 m of detail) needs ~86 m of relief across a single 30 m
+	// pixel -- a cliff. slopeMmPerPx is |e10-e00| + |e01-e00| at the pixel the
+	// column falls in, and every such pixel is in the grid just read, so the
+	// maximum over the footprint is available exactly. On ordinary terrain this
+	// takes the detail allowance from 11.44 m to 1-3 m, which is the difference
+	// between the bound binding at level 4 and not.
+	int64 MaxBaseMm = INT64_MIN;
+	int64 MaxSlopeMmPerPx = 0;
+	for (int32 Iy = 0; Iy + 1 < NY; ++Iy)
+	{
+		for (int32 Ix = 0; Ix + 1 < NX; ++Ix)
+		{
+			const int64 E00 = Elev[Ix + NX * Iy];
+			const int64 E10 = Elev[(Ix + 1) + NX * Iy];
+			const int64 E01 = Elev[Ix + NX * (Iy + 1)];
+			const int64 E11 = Elev[(Ix + 1) + NX * (Iy + 1)];
+
+			// Amplifier::evalSurface's slope term for this pixel, verbatim.
+			MaxSlopeMmPerPx = FMath::Max(MaxSlopeMmPerPx,
+			                             FMath::Abs(E10 - E00) + FMath::Abs(E01 - E00));
+
+			// Footprint clipped to this cell, in cell-local mm [0, PxMm].
+			const int64 CellX0Mm = (Px0 + Ix) * PxMm;
+			const int64 CellY0Mm = (Py0 + Iy) * PxMm;
+			const int64 Lx0 = FMath::Max<int64>(0, X0Mm - CellX0Mm);
+			const int64 Lx1 = FMath::Min<int64>(PxMm, X1Mm - CellX0Mm);
+			const int64 Ly0 = FMath::Max<int64>(0, Y0Mm - CellY0Mm);
+			const int64 Ly1 = FMath::Min<int64>(PxMm, Y1Mm - CellY0Mm);
+			if (Lx0 > Lx1 || Ly0 > Ly1)
+			{
+				continue; // footprint does not reach this cell
+			}
+
+			const int64 Fxs[2] = {Lx0, Lx1};
+			const int64 Fys[2] = {Ly0, Ly1};
+			for (int64 Fx : Fxs)
+			{
+				for (int64 Fy : Fys)
+				{
+					// evalSurface's bilinear form, same integer math. Its
+					// division truncates toward zero, so +1 covers the one-mm
+					// the truncation can move the value upward for a negative
+					// numerator -- keeping this an upper bound unconditionally.
+					const int64 Gx = PxMm - Fx, Gy = PxMm - Fy;
+					const int64 BaseMm = ((E00 * Gx + E10 * Fx) * Gy + (E01 * Gx + E11 * Fx) * Fy) / (PxMm * PxMm) + 1;
+					MaxBaseMm = FMath::Max(MaxBaseMm, BaseMm);
+				}
+			}
+		}
+	}
+	if (MaxBaseMm == INT64_MIN)
+	{
+		return INT64_MAX; // degenerate grid (single corner): decline to bound
+	}
+
+	const int64 SlopeScaleQ10 = FMath::Clamp<int64>(512 + MaxSlopeMmPerPx / 24, 256, VoxelSkyBand::kMaxSlopeScaleQ10);
+	const int64 MaxDetailMm = VoxelSkyBand::kDetailAmplitudeSumMm * SlopeScaleQ10 / 1024;
+	return MaxBaseMm + MaxDetailMm;
+}
+
+bool FVoxelWorldImpl::IsChunkProvablyAllAir(const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const
+{
+	using namespace VoxelCoords;
+
+	const int64 BoundMm = FootprintSurfaceUpperBoundMm(LevelKey.Level, LevelKey.Key.X, LevelKey.Key.Y);
+	if (BoundMm == INT64_MAX)
+	{
+		return false; // declined to bound: never claim air on no information
+	}
+
+	// Lowest level-0 voxel INDEX this chunk covers. A level-L cell is solid
+	// only if some level-0 voxel under it is solid (downsampleBricks takes a
+	// threshold over its children and returns "no brick" for an all-air group),
+	// so proving every level-0 voxel at or above this index is air proves the
+	// whole chunk is air at any level.
+	const int64 LevelScale = int64(1) << LevelKey.Level;
+	const int64 BottomVoxel = (int64(LevelKey.Key.Z) * ChunkEdgeVoxels) * LevelScale;
+
+	// Topmost level-0 voxel that could be solid anywhere in the footprint:
+	// a voxel is solid iff its centre (vz*100 + 50 mm) is at or below the
+	// surface, so vz <= (surfaceMm - 50)/100. floorDiv rounds toward -inf, i.e.
+	// outward on the safe side for an upper bound that may be negative.
+	const int64 TopSolidUpperBound =
+		vxc::floorDiv(BoundMm - int64(vxc::kVoxelSizeMm) / 2, int64(vxc::kVoxelSizeMm));
+
+	return BottomVoxel > TopSolidUpperBound;
+}
+
+void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax,
+                                                   int32& OutChunkZMaxUntrimmed) const
 {
 	using namespace VoxelCoords;
 
@@ -2889,23 +3206,74 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 	// FloorDiv, and in a unity blob that contains both files the unqualified
 	// name is ambiguous against `using namespace VoxelCoords`.
 	const int64 TopVoxelMinAtLevel = VoxelCoords::FloorDiv(TopVoxelMin, LevelScale);
-	const int64 TopVoxelMaxAtLevel = VoxelCoords::FloorDiv(TopVoxelMax, LevelScale);
 	OutChunkZMin = (int32)VoxelCoords::FloorDiv(TopVoxelMinAtLevel, (int64)ChunkEdgeVoxels) - 1;
-	OutChunkZMax = (int32)VoxelCoords::FloorDiv(TopVoxelMaxAtLevel, (int64)ChunkEdgeVoxels) + 2;
+
+	// The +2 headroom, expressed in LEVEL-0 voxels so it can be compared against
+	// an absolute surface bound. Identical arithmetic to the old
+	// `FloorDiv(FloorDiv(TopVoxelMax, LevelScale), ChunkEdgeVoxels) + 2`:
+	// 2 chunks == 2 * ChunkEdgeVoxels level-L cells == that times LevelScale
+	// level-0 voxels, and adding an exact multiple of ChunkEdgeVoxels*LevelScale
+	// commutes with both floor divisions.
+	const int64 HeadroomVoxels = int64(2) * ChunkEdgeVoxels * LevelScale;
+	int64 TopVoxelForMax = TopVoxelMax + HeadroomVoxels;
+
+	// SKY-BAND TRIM. What the +2 was protecting is stated right above: corner-
+	// only sampling misses interior extremes, so the range is padded ABOVE. But
+	// it was padded in LEVEL-L CHUNKS, and a level-L chunk is (1<<L) times
+	// taller than a level-0 one -- so a headroom sized for level 0's 3.2 m
+	// chunks became 102.4 m of guaranteed-empty sky at level 4, where each of
+	// those chunks costs ~6,000 ms of worker time to mesh into nothing. The
+	// quantity being protected against is a property of the TERRAIN (how much
+	// higher the interior of a footprint can be than its corners), not of the
+	// LOD level, so scaling it by the chunk height was never right.
+	//
+	// FootprintSurfaceUpperBoundMm bounds that quantity directly and exactly on
+	// the tile-scale term (see namespace VoxelSkyBand). Take the tighter of the
+	// two: where the analytic bound binds -- overwhelmingly at levels 2-4, whose
+	// footprints are wide enough that the tile raster, not the detail noise,
+	// dominates -- the range stops just above the highest ground the footprint
+	// can contain. Where it does not bind (levels 0-1, whose 3.2-6.4 m
+	// footprints sit well inside a single 30 m tile pixel, so the pixel-corner
+	// maximum is a much weaker statement than the sampled columns), the old
+	// +2-chunk rule survives untouched. A min() with the shipped rule is what
+	// makes this strictly-never-wider-than-before AND never a regression on the
+	// near rings that the M1 hitch budget actually cares about.
+	if (VoxelSkyBand::GetTrimEnabled())
+	{
+		const int64 BoundMm = FootprintSurfaceUpperBoundMm(Level, ChunkX, ChunkY);
+		if (BoundMm != INT64_MAX)
+		{
+			// Same convention as TopVoxelMax above (the voxel CONTAINING the
+			// surface, not the topmost solid one) -- one voxel more generous
+			// than IsChunkProvablyAllAir's bound, deliberately, since this one
+			// decides what is never requested at all.
+			const int64 AnalyticTopVoxel = vxc::floorDiv(BoundMm, int64(vxc::kVoxelSizeMm));
+			TopVoxelForMax = FMath::Min(TopVoxelForMax, AnalyticTopVoxel);
+		}
+	}
+
+	OutChunkZMax = (int32)VoxelCoords::FloorDiv(VoxelCoords::FloorDiv(TopVoxelForMax, LevelScale), (int64)ChunkEdgeVoxels);
+	OutChunkZMaxUntrimmed =
+		(int32)VoxelCoords::FloorDiv(VoxelCoords::FloorDiv(TopVoxelMax + HeadroomVoxels, LevelScale), (int64)ChunkEdgeVoxels);
+	// The trim may never invert the range: ZMin is derived from a corner the
+	// bound is guaranteed to dominate, but assert the invariant rather than
+	// reason about it at every call site.
+	OutChunkZMax = FMath::Max(OutChunkZMax, OutChunkZMin);
 }
 
 void FVoxelWorldImpl::FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin,
-                                                 int32& OutChunkZMax) const
+                                                 int32& OutChunkZMax, int32& OutChunkZMaxUntrimmed) const
 {
 	const VoxelCoords::FVoxelLevelChunkKey CacheKey{Level, VoxelCoords::FVoxelChunkKey{ChunkX, ChunkY, 0}};
 	if (const FFootprintZRange* Hit = FootprintZRangeCache.Find(CacheKey))
 	{
 		OutChunkZMin = Hit->ChunkZMin;
 		OutChunkZMax = Hit->ChunkZMax;
+		OutChunkZMaxUntrimmed = Hit->ChunkZMaxUntrimmed;
 		return;
 	}
-	ComputeFootprintChunkZRange(ChunkX, ChunkY, Level, OutChunkZMin, OutChunkZMax);
-	FootprintZRangeCache.Add(CacheKey, FFootprintZRange{OutChunkZMin, OutChunkZMax});
+	ComputeFootprintChunkZRange(ChunkX, ChunkY, Level, OutChunkZMin, OutChunkZMax, OutChunkZMaxUntrimmed);
+	FootprintZRangeCache.Add(CacheKey, FFootprintZRange{OutChunkZMin, OutChunkZMax, OutChunkZMaxUntrimmed});
 }
 
 void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
@@ -3291,8 +3659,26 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				}
 
 				++ThisFrameLevelFootprints[Level];
-				int32 ChunkZMin, ChunkZMax;
-				FootprintChunkZRangeCached(Cx, Cy, Level, ChunkZMin, ChunkZMax);
+				int32 ChunkZMin, ChunkZMax, ChunkZMaxUntrimmed;
+				FootprintChunkZRangeCached(Cx, Cy, Level, ChunkZMin, ChunkZMax, ChunkZMaxUntrimmed);
+
+				// Sky-band trim escape hatch, applied OUTSIDE the memo for the
+				// same reason the depth skirt is: it depends on the edit log,
+				// which the memo may not key on. Worldgen puts nothing above the
+				// terrain, but a PLAYER can -- TryPlace writes an arbitrary
+				// solid material into the air above a hilltop, and the fixture
+				// stampers place whole structures there. Those chunks must not
+				// be trimmed away. Clamped to the pre-trim top so this only ever
+				// restores chunks the shipped rule already granted; edits above
+				// even that envelope are outside the desired set exactly as they
+				// were before this change.
+				if (ChunkZMaxUntrimmed > ChunkZMax)
+				{
+					if (const int32* EditedMaxZ = EditedFootprintMaxZ[Level].Find(FIntPoint(Cx, Cy)))
+					{
+						ChunkZMax = FMath::Max(ChunkZMax, FMath::Min(ChunkZMaxUntrimmed, *EditedMaxZ));
+					}
+				}
 
 				// Underground streaming (see namespace VoxelUnderground), step
 				// 1: widen the memoized SURFACE band downward by this band's
@@ -3725,6 +4111,58 @@ void FVoxelWorldImpl::DispatchJobs()
 			Rec->Component = nullptr;
 			Rec->bJobInFlight = false;
 			continue;
+		}
+
+		// --- Sky-band pre-dispatch skip (outer rings) ------------------------
+		//
+		// The band skip above is exact but LEVEL 0 ONLY, for the reason its own
+		// comment gives: a level-L chunk spans 2^L x 2^L level-0 footprints and
+		// never has a level-0 band. That is where the remaining waste lives --
+		// an R4 chunk costs ~6,000 ms p50 to mesh, and the outer rings are
+		// overwhelmingly sky.
+		//
+		// The all-air half of the band test needs far less than the general
+		// case, and that is what makes it expressible at every level: proving a
+		// chunk holds no geometry requires only an UPPER BOUND on the terrain
+		// surface over its footprint -- no cave data, no cavern data, no
+		// bedrock, no level-0 bricks -- because Amplifier::materialAt is
+		// unconditionally MAT_AIR above surfaceMm (caves and caverns only ever
+		// CARVE; nothing fills above the surface). IsChunkProvablyAllAir derives
+		// that bound analytically; see namespace VoxelSkyBand.
+		//
+		// This runs AFTER the band skip so that at level 0, where both apply,
+		// the exact band keeps its verdict (and its all-solid half, which no
+		// surface bound can reproduce). It errs the same way: it may decline to
+		// skip an empty chunk, never the reverse.
+		//
+		// EDITS. Same veto, and deliberately the same one: NeedsOverlayAwarePath
+		// above has already routed any chunk carrying an edit -- including a
+		// block TryPlace put in what worldgen calls sky -- to the game-thread
+		// overlay path, so it can never reach here.
+		if (VoxelSkyBand::GetSkipEnabled() && IsChunkProvablyAllAir(LevelKey))
+		{
+			if (VoxelSkyBand::GetVerifyEnabled())
+			{
+				// Verification mode, same shape as -VoxelVerifyBuriedSkip above:
+				// record the verdict and DISPATCH ANYWAY, so DrainResults can
+				// check it against the mesh the worker really produced.
+				VerifyPredictedAirKeys.Add(LevelKey);
+			}
+			else
+			{
+				++LevelSkySkippedTotal[PickLevel];
+				// Byte-for-byte the state ApplyMeshResult's Quads.Num()==0 branch
+				// leaves behind, exactly as the band skip above does.
+				ResidentQuads -= Rec->LastQuadCount;
+				Rec->LastQuadCount = 0;
+				if (UVoxelChunkComponent* Existing = Rec->Component.Get())
+				{
+					ReturnChunkComponentToPool(*Existing);
+				}
+				Rec->Component = nullptr;
+				Rec->bJobInFlight = false;
+				continue;
+			}
 		}
 
 		Rec->bJobInFlight = true;
@@ -4192,6 +4630,31 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			continue;
 		}
 
+		// -VoxelVerifySkyBand: the verdict was computed at dispatch but the job
+		// ran anyway, so this is the real mesh to check it against. A violation
+		// is a chunk the skip would have dropped that in fact had geometry --
+		// exactly the "silently vanishing R4 chunk" failure this whole change
+		// has to be proven not to cause. Logged as an Error, one line per
+		// violation, and counted for the run summary.
+		if (VoxelSkyBand::GetVerifyEnabled())
+		{
+			const int32 VLvl = FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1);
+			++VerifyChunksChecked;
+			++VerifyResultsByLevel[VLvl];
+			if (VerifyPredictedAirKeys.Remove(Result.Key) > 0)
+			{
+				++VerifyAirPredictions;
+				++VerifyAirPredictionsByLevel[VLvl];
+				if (Result.Quads.Num() != 0)
+				{
+					++VerifyAirViolations;
+					UE_LOG(LogVoxelPerf, Error,
+					       TEXT("VoxelVerifySkyBand VIOLATION: level=%d chunk=(%d,%d,%d) was predicted all-air but meshed %d quads"),
+					       Result.Key.Level, Result.Key.Key.X, Result.Key.Key.Y, Result.Key.Key.Z, Result.Quads.Num());
+				}
+			}
+		}
+
 		Rec->bJobInFlight = false;
 		ZeroQuadAppliesSinceLog += (Result.Quads.Num() == 0) ? 1 : 0;
 		if (Result.Quads.Num() == 0)
@@ -4451,6 +4914,14 @@ void FVoxelWorldImpl::PropagateEditToMips(const TSet<VoxelCoords::FVoxelChunkKey
 	// comment and EditEpoch's doc comment).
 	EditEpoch.fetch_add(1);
 
+	// Sky-band trim escape hatch (see EditedFootprintMaxZ): record level 0's own
+	// edited footprints here, since the ancestor walk below starts at level 1.
+	for (const FVoxelChunkKey& Level0Chunk : DirtyLevel0Chunks)
+	{
+		int32& MaxZ = EditedFootprintMaxZ[0].FindOrAdd(FIntPoint(Level0Chunk.X, Level0Chunk.Y), MIN_int32);
+		MaxZ = FMath::Max(MaxZ, Level0Chunk.Z);
+	}
+
 	for (int32 Level = 1; Level < kNumLevels; ++Level)
 	{
 		// De-duped per level: several DirtyLevel0Chunks (e.g. a dig's 6
@@ -4468,6 +4939,10 @@ void FVoxelWorldImpl::PropagateEditToMips(const TSet<VoxelCoords::FVoxelChunkKey
 		{
 			const bool bAlreadyEdited = EditedAncestorChunks[Level].Contains(Ancestor);
 			EditedAncestorChunks[Level].Add(Ancestor);
+			{
+				int32& MaxZ = EditedFootprintMaxZ[Level].FindOrAdd(FIntPoint(Ancestor.X, Ancestor.Y), MIN_int32);
+				MaxZ = FMath::Max(MaxZ, Ancestor.Z);
+			}
 
 			// SharedMipCache stores PURE bricks only (see its doc comment);
 			// this chunk's footprint at this level is now stale for

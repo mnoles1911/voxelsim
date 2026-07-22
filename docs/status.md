@@ -6162,3 +6162,204 @@ call:
 4. **Consider trading solve latency for frame cost** now that the basis is
    2.33x: `voxel.GI.MaxBrickSolvesPerFrame` (8) and `RefreshBricksPerFrame` (2)
    were tuned against the cheaper basis and were not re-swept here.
+
+## Sky-band trim + outer-ring all-air skip -- R4 goes from 100% waste to 100% useful (2026-07-22, worktree agent)
+
+**The waste, measured first on this tree.** `-VoxelPerfRun=60 -VoxelMeasureEmpty
+-VoxelBuriedSkip=0 -VoxelSkyTrim=0 -VoxelSkySkip=0`, seed 20260719, `-nullrhi`.
+The per-ring census confirms the picture PR #70 left behind, with the coarse
+rings now the whole story:
+
+| ring | zero-quad share of results | zero-quad share of that ring's worker time | composition |
+|---|---|---|---|
+| R0 | 74.9-76.7% | 73.9-74.2% | ~33% air, ~66% solid |
+| R1 | 63.0-68.4% | 70.5-75.2% | ~85% air |
+| R2 | 77.6-90.8% | 69.6-96.5% | **~99% air** |
+| R3 | 100% | 100% | **100% air** |
+| R4 | 100% | 100% | **100% air** |
+
+PR #70's band skip covers R0 and is exact there, including the all-solid half
+that dominates R0. It is level-0 only for a structural reason its own comment
+states: a level-L chunk spans 2^L x 2^L level-0 footprints and never has a
+level-0 band. That is exactly where the remaining waste is -- one R4 job is
+~4,900-6,300 ms p50, so R3+R4 were ~38% of all worker time while loading 20 and
+**0** chunks respectively.
+
+**What makes the outer rings expressible: the all-air case needs far less than a
+band.** `Amplifier::materialAt` is unconditionally `MAT_AIR` whenever a voxel
+centre is above `surfaceMm` -- caves and caverns only ever CARVE, and nothing
+fills above the surface -- so proving a chunk empty needs only an UPPER BOUND on
+the terrain surface over its footprint. No cave data, no cavern data, no
+bedrock, no level-0 bricks.
+
+`coarseSurfaceBrickRange` was **not** reusable for this, despite being the
+obvious candidate. It is exact for a brick generated through `makeCoarseBrick`,
+but the UE worker does not use the coarse path at all (`MakeLevelSampler` still
+builds level-0 bricks and downsamples), so a coarse range is a STRIDED SUBSAMPLE
+of the data the mesher actually sees, not a bound on it -- terrain between two
+stride-2^L samples can be higher than both.
+
+**The bound, derived from `Amplifier::evalSurface`'s own structure.**
+`surfaceMm = clamp(baseMm + detailMm, ...)`, and both terms are boundable from
+tile-raster reads alone:
+
+* `baseMm` is bilinear per 30 m tile pixel. A bilinear patch is LINEAR along
+  each axis with the other fixed, so its maximum over the footprint clipped to
+  one pixel cell is attained at a corner of that clipped rectangle -- **exact**,
+  at most 4x4 cells, and it is precisely the "interior extremes between the
+  sampled corners" term the `+2` headroom existed to cover.
+* `detailMm` is the four octaves times `slopeScaleQ10`, which clamps to
+  [0.25, 4.0]. The absolute worst case (4.0 -> 11.44 m) needs ~86 m of relief
+  across one 30 m pixel. The real slope term is computable exactly from the same
+  elevation grid, which takes the allowance to 1-3 m on ordinary terrain -- the
+  difference between the bound binding at level 4 and never firing at all. The
+  first, looser version of this bound made only **555** predictions in a 60 s
+  run; the tightened one makes **21,000**.
+
+**What the `+2` was protecting, and what it became.** The comment is explicit:
+corner-only sampling under-estimates interior extremes, so pad ABOVE. But it
+padded in LEVEL-L CHUNKS, and a level-L chunk is `1<<L` times taller than a
+level-0 one -- so a headroom sized for level 0's 3.2 m chunks became **102.4 m**
+of guaranteed-empty sky at level 4. The quantity being protected against is a
+property of the TERRAIN, not of the LOD level; scaling it by chunk height was
+never right. It is now `min(analytic bound, the old +2 rule)`, so the range is
+**never wider than before at any level** and is never a regression on the near
+rings the M1 budget cares about, while at levels 2-4 -- whose footprints are
+wide enough that the tile raster dominates -- it stops just above the highest
+ground the footprint can contain.
+
+`ComputeFootprintChunkZRange` stays a **pure function of (Level, X, Y)** and the
+immutable tile raster, so the M1 hitch memo's correctness argument is untouched.
+The one edit-dependent part lives OUTSIDE the memo exactly as the depth skirt
+does: `TryPlace` writes solid material into what worldgen calls sky, so the memo
+also carries the pre-trim top and `RecomputeDesiredSet` re-widens up to -- never
+past -- it for footprints with an edited chunk above the trimmed top.
+
+**Throughput and per-ring effect.** 5 interleaved A/B pairs on ONE binary,
+`-VoxelSkyTrim=0 -VoxelSkySkip=0` vs default. Pair 1 discarded as warm-up (its
+`on` run was contended by another agent's build: R0 p50 9.39 ms vs 1.08 ms
+everywhere else, mipCache evictions 0). All runs shown:
+
+| | off | on |
+|---|---|---|
+| avgChunks/s | 781.25*, 764.65, 779.00, 778.65, 778.57 | 752.12*, 861.20, 861.45, 859.82, 861.32 |
+| chunksLoaded | 46875*, 45879, 46740, 46719, 46714 | 45127*, 51672, 51687, 51589, 51679 |
+
+(* = discarded warm-up pair.) Throughput **+11.1%** (775.2 -> 860.9 chunks/s),
+chunks loaded **+11.1%**. Per ring, means of pairs 2-5 -- `total` is jobs
+dispatched, `load` is components created, `zq` is jobs that meshed to nothing:
+
+| ring | total off -> on | **load off -> on** | zq off -> on |
+|---|---|---|---|
+| R0 | 56,279 -> 52,739 | 31,029 -> 31,068 | 25,236 -> 21,661 |
+| R1 | 39,867 -> 32,152 | 14,647 -> **17,379** | 25,157 -> 14,751 |
+| R2 | 2,486 -> 4,369 | 806 -> **3,119** | 1,603 -> 1,141 |
+| R3 | 158 -> 140 | 20 -> **74** | 109 -> **26** |
+| R4 | 12.5 -> 8.3 | **0 -> 3** | 7.75 -> **0** |
+
+The headline is the bottom row. R4 went from **0 chunks loaded and 8 meshed to
+nothing** -- a ring spending ~22% of all worker time to render literally
+nothing -- to **3 loaded and 0 wasted**. R3 went from 20 loaded / 109 wasted to
+74 loaded / 26 wasted. R2 dispatched MORE jobs and loaded 3.9x more chunks: the
+wasted jobs were occupying the ring's reserved worker slots, so removing them
+converts directly into vista geometry rather than into idle threads.
+
+**Verification: 485,478 chunks, 0 violations.** `-VoxelVerifySkyBand` computes
+the verdict for every chunk and **dispatches anyway**, then checks it against the
+mesh the worker really produced; run with `-VoxelSkyTrim=0` so the verifier also
+sees every chunk the trim would have removed (the skip's threshold is strictly
+the more aggressive of the two, so verifying the skip verifies the trim). Five
+60 s runs: 87,372 + 99,510 + 99,253 + 99,466 + 99,877 results checked, 101,740
+predicted all-air, **0 violations**. Prediction rate tracks the waste almost
+exactly -- R0 11.4%, R1 32.5%, R2 53.9%, R3 78.4%, **R4 100% in every run**.
+
+**Contents unchanged, verified not asserted.** A/B of
+`-VoxelHeadlessDigTest=15 -VoxelDumpDigestAfter=25 -VoxelNoLoad` (seed
+20260719) with the switches off and on: both carve **2,178,385** voxels, both
+report **`editedDigest=0xFB62844A74CB9121`** on server AND client, and both
+write an identical **8,039-entry / 4,135,445-byte** `.vxlog`. Note the byte
+count: the M1-era figure quoted in the brief is 4,135,443, and the 2-byte
+difference is present on BOTH sides, i.e. it is a property of merged `main`
+(PR #71 landed in between), not of this change.
+
+**Build.** voxel-core via cmake/Ninja/MSVC, then `VoxelEarthEditor Win64
+Development` via `D:\UE_5.8\Engine\Build\BatchFiles\Build.bat ... -WaitMutex
+-NoHotReloadFromIDE` -> `Result: Succeeded`.
+
+**Gotchas worth not rediscovering.**
+1. A fresh worktree has no `build/voxel-core-msvc`, and `Build.bat` fails with
+   `RulesError: could not find voxelcore.lib` -- but the *shell pipeline* still
+   exits 0, so a scripted build looks like it succeeded and the editor then dies
+   with "The game module 'VoxelEarth' could not be found". Grep the build output
+   for `Result: Succeeded`, never trust the exit code.
+2. `-nullrhi` perf runs report p95 = 0.50 ms at ~1,900 fps. That is not
+   comparable to the 6-7 ms figures quoted for the M1 gate, which come from the
+   real-RHI min-spec proxy. Use `-nullrhi` for throughput and census work only.
+
+**Follow-ups, in priority order.**
+1. **`Amplifier::surfaceUpperBoundMm(vx0, vy0, vx1, vy1)` in voxel-core.** The
+   bound mirrors two worldgen constants (`kDetailOctaves`' amplitude sum and
+   `slopeScaleQ10`'s clamp) UE-side, where a change to either could silently
+   invalidate it. It belongs next to the constants it depends on, with a golden
+   that pins it. `-VoxelVerifySkyBand` is the interim guard and it is a strong
+   one, but it is a runtime check, not a compile-time one.
+2. **The all-SOLID half at levels >= 1.** R0's waste is ~66% buried rock and
+   PR #70's band already handles it; R1's is ~15%. A lower surface bound is just
+   as cheap as the upper one, but a buried chunk can still hold cave and cavern
+   air, so the test needs the cave/cavern depth envelope as well -- strictly
+   harder than the all-air case, which is why this wave did not attempt it.
+3. **R1 is now the largest single consumer** (~38% of worker time, ~46% of it
+   still zero-quad). It is 85% air, so the same bound applies; it fires on only
+   32.5% of R1 chunks because at a 6.4 m footprint the tile-pixel term is weak.
+   Sampling a few real columns and taking the min against the analytic bound
+   would likely close most of that gap.
+
+### M1 gate on the same binary: passes, but p95 rises with the extra throughput
+
+`-nullrhi` is useless for this (it runs at ~1,900 fps and reports p95 = 0.50 ms
+on both sides), so the M1 numbers below are the real-RHI **min-spec proxy**:
+1080p windowed, `-ExecCmds="sg.ViewDistanceQuality 0,sg.ShadowQuality 0,
+sg.PostProcessQuality 0,sg.EffectsQuality 0,r.ScreenPercentage 100"`,
+`-VoxelPerfRun=60`, seed 20260719, interleaved, first pair discarded as warm-up.
+All runs shown, post-warmup (t>=10 s):
+
+| run | off p95 | off max | off framesOver16.6 | on p95 | on max | on framesOver16.6 |
+|---|---|---|---|---|---|---|
+| 0 (warm-up, discarded) | 5.61 ms | 16.08 ms | 0 | 6.59 ms | 14.47 ms | 0 |
+| 1 | 5.73 ms | 21.23 ms | 0 | 6.72 ms | 15.86 ms | 0 |
+| 2 | 5.66 ms | 13.17 ms | 0 | 6.90 ms | 15.75 ms | 0 |
+
+**The gate holds: 0 frames over 16.6 ms on both sides, every run, and 0
+post-warmup hitches (>33.3 ms) on both sides.** But p95 rises ~1.1 ms
+(5.66-5.73 -> 6.72-6.90), and that should be reported as what it is rather than
+buried: it is not the bound costing frame time, it is the pipeline **converting
+the reclaimed worker time into more work per frame**. The same runs load
+21,717-21,855 chunks off versus 23,734-23,963 on (+10%), at 52.8% versus 55.8%
+budget saturation -- the apply path is simply busier because more results are
+arriving. Worth noting the *max* frame time moved the other way (off peaked at
+21.23 ms in run 1; on peaked at 15.86 ms across both runs).
+
+For context, the brief records both sides of the previous wave sitting at
+6.1-7.1 ms p95 on this box; the `on` side here (6.72-6.90) is inside that band
+and the `off` side is below it. If the p95 is ever wanted back, the knob is the
+per-frame apply budget, not this change -- see follow-up 4.
+
+**Exact after-census** (`-VoxelPerfRun=60 -VoxelMeasureEmpty`, all skips on,
+versus the all-skips-off census at the top of this section; note this compares
+PR #70's band skip AND the sky band together against neither):
+
+| ring | zero-quad share of results, off -> on | zero-quad share of worker time, off -> on |
+|---|---|---|
+| R0 | 74.9-76.7% -> **26.5-30.0%** | 73.9-74.2% -> **28.3-32.2%** |
+| R1 | 63.0-68.4% -> **45.1-45.3%** | 70.5-75.2% -> **52.1-52.3%** |
+| R2 | 77.6-90.8% -> **25.8-27.6%** | 69.6-96.5% -> **25.3-35.2%** |
+| R3 | 100% -> **11.1-25.0%** | 100% -> **12.4-12.8%** |
+| R4 | 100% -> **0-50%** | 100% -> **0-100%** (1-2 jobs/window; see the A/B table for the reliable R4 figure) |
+
+4. **The p95/throughput trade is now the open question, not the waste.** This
+   change hands the streaming pipeline ~11% more worker capacity and the
+   pipeline spends all of it, taking budget saturation 52.8% -> 55.8% and p95
+   5.7 -> 6.8 ms. That is the right default while the outer rings are starved of
+   geometry, but once R3/R4 are populated the same capacity would be better
+   spent holding frame time down. `voxel.Stream.MaxAppliesPerFrame` and the ring
+   floors are the knobs, and neither was re-swept against the new capacity.
