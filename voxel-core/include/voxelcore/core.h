@@ -12,7 +12,12 @@ namespace vxc {
 // 480/240/120/60 m wavelength (70/38/20/11 m amplitude), terrain-realism audit.
 // v4: M4 cave pass (voxelcore/caves.h) — jittered-lattice tunnel network
 // carved into the voxelize path. Underground is no longer uniformly solid.
-inline constexpr uint32_t kWorldGenVersion = 4;
+// v5: M4 cave pass v2 — (a) the cavern system (voxelcore/caverns.h) folded
+// into ColumnSample/materialAt alongside caves, and (b) the bedrock top moved
+// from a 40-60 m band to a 180-220 m one (200 m mean, Matt's decision), which
+// is what gives the multi-storey cavern chains their vertical room. One bump
+// covers both; see docs/status.md "C4".
+inline constexpr uint32_t kWorldGenVersion = 5;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 

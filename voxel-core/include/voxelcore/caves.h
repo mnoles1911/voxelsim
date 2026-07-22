@@ -56,7 +56,8 @@
 //      sinkhole shaft (see kCaveShaftNodeMask) — a sparse, explicitly chosen
 //      set of entrance holes, not a leaky roof.
 //   2. The network stays out of the bedrock floor: deepest possible carve is
-//      36.8 m, while bedrockDepthMm is >= 40 m everywhere (amplifier.cpp), and
+//      36.8 m, while bedrockDepthMm is >= 180 m everywhere since
+//      kWorldGenVersion 5 (>= 40 m before it — amplifier.cpp), and
 //      caveCarveAt additionally refuses anything within kCaveBedrockMarginMm
 //      of the column's own bedrock top AND Amplifier::materialAt refuses to
 //      turn MAT_BEDROCK into air at all. Three independent guards.
@@ -206,8 +207,11 @@ static_assert(kCaveRadiusMaxMm * 2 < kCaveLatticeMm,
 static_assert(kCaveNodeDepthMinMm - kCaveRadiusMaxMm > kCaveRoofMinMm,
               "tube geometry must keep itself above the roof clamp — the clamp is a "
               "backstop, not the mechanism");
-// Floor: deepest possible carved voxel vs the shallowest bedrock top the
-// amplifier can produce (40 m, amplifier.cpp bedrockDepthMm).
+// Floor: deepest possible carved voxel vs a bedrock top of 40 m. That is the
+// PRE-v5 amplifier minimum, kept deliberately after the v5 move to a
+// 180-220 m band (amplifier.cpp bedrockDepthMm): asserting against the old,
+// much shallower floor is a strictly stronger statement, and it keeps tunnel
+// geometry provably independent of wherever the bedrock band happens to sit.
 static_assert(kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm + kCaveRadiusMaxMm +
                       kCaveBedrockMarginMm < 40000,
               "tube geometry must keep itself out of bedrock — the bedrock margin is a "
@@ -236,8 +240,14 @@ struct CaveNode {
 // three: 20 bits each for x jitter, y jitter and depth, scaled by
 // multiply-then-shift (never a division — the shift is by a literal, so it is
 // portable in HLSL too).
-constexpr CaveNode caveNode(uint64_t seed, int64_t i, int64_t j) {
-    const uint64_t h = hash2(seed, i, j, CH_CAVE_NODE);
+//
+// Split into a "from an already-computed hash" form purely so callers that
+// ALSO need other bits of the same `hash2(seed, i, j, CH_CAVE_NODE)` value can
+// pay for it once instead of twice — voxelcore/caverns.h's site gate lives in
+// bits 60/61 of exactly this hash, and used to recompute it. No value changes:
+// caveNode() is still bit-for-bit what it was, and the shader mirror only ever
+// needs the fused form below.
+constexpr CaveNode caveNodeFromHash(uint64_t h, int64_t i, int64_t j) {
     CaveNode n;
     n.xMm = i * kCaveLatticeMm +
             static_cast<int64_t>(((h & 0xFFFFFu) * static_cast<uint64_t>(kCaveLatticeMm)) >> 20);
@@ -247,6 +257,10 @@ constexpr CaveNode caveNode(uint64_t seed, int64_t i, int64_t j) {
         kCaveNodeDepthMinMm +
         static_cast<int64_t>((((h >> 40) & 0xFFFFFu) * static_cast<uint64_t>(kCaveNodeDepthSpanMm)) >> 20);
     return n;
+}
+
+constexpr CaveNode caveNode(uint64_t seed, int64_t i, int64_t j) {
+    return caveNodeFromHash(hash2(seed, i, j, CH_CAVE_NODE), i, j);
 }
 
 // dir 0 = the +x edge out of (i, j), dir 1 = the +y edge. Backbone edges are
@@ -295,35 +309,108 @@ struct CaveColumn {
     int32_t shaftDepthMaxMm = 0; // shaft runs from the surface down to this depth
 };
 
-// Every tube axis within reach of column (vx, vy). `surfaceMm` is the column's
-// own terrain height: columns at or below kCaveMinSurfaceMm are excluded
-// outright, which is the ocean/beach guard (see caveCarveAt).
+// ---------------------------------------------------------------------------
+// LATTICE BLOCK (performance only — provably cannot change any output)
+// ---------------------------------------------------------------------------
+// Everything caveColumnFor hashes is a function of the column's LATTICE CELL
+// (ci, cj), never of where inside that cell the column sits: the 4x4 node
+// block, the 18 candidate edges' existence/radius/crevice draws, and the
+// single sinkhole candidate. A lattice cell is 25.6 m square = 256x256 =
+// 65'536 voxel columns, so on any realistic sweep those ~34-70 hashes were
+// being recomputed tens of thousands of times over.
 //
-// Iteration order (dj, then di, then dir) is part of the worldgen contract: it
-// is what decides which segments survive if the kMaxCaveSegs cap were ever
-// hit, and the shader mirrors it exactly.
-constexpr CaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int32_t surfaceMm) {
-    CaveColumn out;
-    if (surfaceMm < kCaveMinSurfaceMm) return out;
+// Splitting them out into a plain value (`caveLatticeFor`) leaves the pure
+// `caveColumnFor` composition below bit-identical — it is the same arithmetic
+// in the same order — while letting a caller that walks many columns memoise
+// the block. amplifier.cpp does exactly that with a thread_local direct-mapped
+// table, the same output-neutral scheme it already uses for tile reads. The
+// shader mirror can keep fusing the two halves; nothing about the contract,
+// the iteration order or any constant moves.
+//
+// Note the block computes the crevice hash for every EXISTING edge, whereas
+// the fused form only reached it for edges the column actually falls inside.
+// That is strictly more work per lattice cell and strictly less per column
+// (amortised over 65'536 of them), and the VALUE is unchanged because
+// caveCreviceHash is a pure function of (seed, i, j, dir).
+// radiusMm == 0 is the "no edge here" sentinel; a real tube can never hash to
+// it, so no parallel existence flag (and no extra byte per edge) is needed.
+static_assert(kCaveRadiusMinMm > 0,
+              "CaveLatticeEdge uses radiusMm == 0 as its 'edge does not exist' sentinel");
 
-    const int64_t xMm = vx * kVoxelSizeMm;
-    const int64_t yMm = vy * kVoxelSizeMm;
-    const int64_t ci = floorDiv(xMm, kCaveLatticeMm);
-    const int64_t cj = floorDiv(yMm, kCaveLatticeMm);
+struct CaveLatticeEdge {
+    int32_t radiusMm = 0;  // 0 == this edge does not exist
+    uint64_t crevHash = 0; // caveCreviceHash for it (meaningless if radiusMm == 0)
+};
+
+struct CaveLattice {
+    CaveNode nodes[16] = {};       // di + 4*dj over the 4x4 block
+    CaveLatticeEdge edges[18] = {}; // (di + 3*dj) * 2 + dir over the 3x3 sources
+    int32_t shaftNodeSlot = -1;    // di + 4*dj of the sinkhole candidate, -1 = none
+    int32_t shaftRadiusMm = 0;
+};
+
+// All of caveColumnFor's hashing, for lattice cell (ci, cj). Iteration order
+// matches the fused form exactly.
+constexpr CaveLattice caveLatticeFor(uint64_t seed, int64_t ci, int64_t cj) {
+    CaveLattice L;
 
     // 4x4 node block: the 3x3 candidate SOURCE nodes plus the +x/+y endpoints
     // they need.
-    CaveNode nodes[16] = {};
     for (int32_t dj = 0; dj < 4; ++dj)
         for (int32_t di = 0; di < 4; ++di)
-            nodes[di + 4 * dj] = caveNode(seed, ci - 1 + di, cj - 1 + dj);
+            L.nodes[di + 4 * dj] = caveNode(seed, ci - 1 + di, cj - 1 + dj);
 
-    for (int32_t dj = 0; dj < 3; ++dj) {
+    for (int32_t dj = 0; dj < 3; ++dj)
         for (int32_t di = 0; di < 3; ++di) {
             const int64_t i = ci - 1 + di;
             const int64_t j = cj - 1 + dj;
             for (int32_t dir = 0; dir < 2; ++dir) {
                 if (!caveEdgeExists(seed, i, j, dir)) continue;
+                CaveLatticeEdge& e = L.edges[(di + 3 * dj) * 2 + dir];
+                e.radiusMm = static_cast<int32_t>(caveEdgeRadiusMm(seed, i, j, dir));
+                e.crevHash = caveCreviceHash(seed, i, j, dir);
+            }
+        }
+
+    // Sinkhole shaft candidate. At most one node in the 3x3 block can be a
+    // backbone crossing (three consecutive indices contain at most one
+    // multiple of 4 on each axis), so the first hit in the fixed (dj, di)
+    // order is also the only hit — recording it here is exactly what the
+    // fused loop's early-out found.
+    for (int32_t dj = 0; dj < 3 && L.shaftNodeSlot < 0; ++dj)
+        for (int32_t di = 0; di < 3 && L.shaftNodeSlot < 0; ++di) {
+            const int64_t i = ci - 1 + di;
+            const int64_t j = cj - 1 + dj;
+            if ((i & kCaveShaftNodeMask) != 0 || (j & kCaveShaftNodeMask) != 0) continue;
+            const uint64_t h = hash2(seed, i, j, CH_CAVE_SHAFT);
+            if (((h >> 48) & kCaveShaftGateMask) != 0) continue;
+            L.shaftNodeSlot = di + 4 * dj;
+            L.shaftRadiusMm = static_cast<int32_t>(
+                kCaveShaftRadiusMinMm +
+                static_cast<int64_t>(((h & 0xFFFFFu) * static_cast<uint64_t>(kCaveShaftRadiusSpanMm)) >> 20));
+        }
+    return L;
+}
+
+// Every tube axis within reach of column (vx, vy), given its lattice cell's
+// already-hashed block. `surfaceMm` is the column's own terrain height:
+// columns at or below kCaveMinSurfaceMm are excluded outright by the caller,
+// which is the ocean/beach guard (see caveCarveAt).
+//
+// Iteration order (dj, then di, then dir) is part of the worldgen contract: it
+// is what decides which segments survive if the kMaxCaveSegs cap were ever
+// hit, and the shader mirrors it exactly.
+constexpr CaveColumn caveColumnFromLattice(const CaveLattice& L, int64_t vx, int64_t vy) {
+    CaveColumn out;
+    const int64_t xMm = vx * kVoxelSizeMm;
+    const int64_t yMm = vy * kVoxelSizeMm;
+    const CaveNode* nodes = L.nodes;
+
+    for (int32_t dj = 0; dj < 3; ++dj) {
+        for (int32_t di = 0; di < 3; ++di) {
+            for (int32_t dir = 0; dir < 2; ++dir) {
+                const CaveLatticeEdge& edge = L.edges[(di + 3 * dj) * 2 + dir];
+                if (edge.radiusMm == 0) continue; // edge does not exist
                 const CaveNode a = nodes[di + 4 * dj];
                 const CaveNode b = (dir == 0) ? nodes[di + 1 + 4 * dj] : nodes[di + 4 * (dj + 1)];
 
@@ -345,7 +432,7 @@ constexpr CaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int32_
 
                 const int64_t ex = xMm - cx;
                 const int64_t ey = yMm - cy;
-                const int64_t r = caveEdgeRadiusMm(seed, i, j, dir);
+                const int64_t r = edge.radiusMm;
                 const int64_t marginSq = r * r - (ex * ex + ey * ey);
                 if (marginSq <= 0) continue;
 
@@ -362,7 +449,7 @@ constexpr CaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int32_
                 // (static_assert above) means a column outside r is provably
                 // outside the crevice's own, narrower corridor too, so no
                 // separate reject was skipped.
-                const uint64_t crevH = caveCreviceHash(seed, i, j, dir);
+                const uint64_t crevH = edge.crevHash;
                 if (caveCreviceGateOpen(crevH)) {
                     const int64_t tMm =
                         kCrevHalfThickMinMm +
@@ -410,30 +497,31 @@ constexpr CaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int32_
         }
     }
 
-    // Sinkhole shaft. Same 3x3 source-node block; at most one node in it can
-    // be a backbone crossing (three consecutive indices contain at most one
-    // multiple of 4 on each axis), so the first hit in the fixed (dj, di)
-    // order is also the only hit.
-    for (int32_t dj = 0; dj < 3 && out.shaftMarginSq == 0; ++dj) {
-        for (int32_t di = 0; di < 3 && out.shaftMarginSq == 0; ++di) {
-            const int64_t i = ci - 1 + di;
-            const int64_t j = cj - 1 + dj;
-            if ((i & kCaveShaftNodeMask) != 0 || (j & kCaveShaftNodeMask) != 0) continue;
-            const uint64_t h = hash2(seed, i, j, CH_CAVE_SHAFT);
-            if (((h >> 48) & kCaveShaftGateMask) != 0) continue;
-            const CaveNode n = nodes[di + 4 * dj];
-            const int64_t r =
-                kCaveShaftRadiusMinMm +
-                static_cast<int64_t>(((h & 0xFFFFFu) * static_cast<uint64_t>(kCaveShaftRadiusSpanMm)) >> 20);
-            const int64_t ex = xMm - n.xMm;
-            const int64_t ey = yMm - n.yMm;
-            const int64_t marginSq = r * r - (ex * ex + ey * ey);
-            if (marginSq <= 0) continue;
+    // Sinkhole shaft: the single candidate the lattice block already found.
+    if (L.shaftNodeSlot >= 0) {
+        const CaveNode& n = nodes[L.shaftNodeSlot];
+        const int64_t r = L.shaftRadiusMm;
+        const int64_t ex = xMm - n.xMm;
+        const int64_t ey = yMm - n.yMm;
+        const int64_t marginSq = r * r - (ex * ex + ey * ey);
+        if (marginSq > 0) {
             out.shaftMarginSq = static_cast<int32_t>(marginSq);
             out.shaftDepthMaxMm = static_cast<int32_t>(n.depthMm);
         }
     }
     return out;
+}
+
+// Fused form: the pure, self-contained `f(seed, vx, vy, surfaceMm)` the
+// worldgen contract and the HLSL mirror are written against. Callers walking
+// many columns should go through amplifier.cpp's memoised path instead, which
+// produces bit-identical values.
+constexpr CaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int32_t surfaceMm) {
+    CaveColumn out;
+    if (surfaceMm < kCaveMinSurfaceMm) return out;
+    const int64_t ci = floorDiv(vx * kVoxelSizeMm, kCaveLatticeMm);
+    const int64_t cj = floorDiv(vy * kVoxelSizeMm, kCaveLatticeMm);
+    return caveColumnFromLattice(caveLatticeFor(seed, ci, cj), vx, vy);
 }
 
 // --- per-voxel carve test ---------------------------------------------------

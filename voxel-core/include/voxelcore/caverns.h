@@ -445,6 +445,54 @@ struct CavernColumn {
     int32_t floodZMm = INT32_MIN; // INT32_MIN = dry (or no site in reach)
 };
 
+// ---------------------------------------------------------------------------
+// CANDIDATE CORNERS (performance only — provably cannot change any output)
+// ---------------------------------------------------------------------------
+// The gate + depth-safety pass over the 2x2 corner block is a function of the
+// column's COARSE CELL (si, sj) alone, never of where inside the 204.8 m cell
+// the column sits — that cell is 2048x2048 = 4.2 MILLION voxel columns. So the
+// four hashes are split out here exactly the way caves.h splits out its
+// lattice block, and amplifier.cpp memoises them per (seed, si, sj). The fused
+// `cavernColumnFor` below is unchanged in value and stays the contract/HLSL-
+// mirror form.
+//
+// This also fuses what used to be two hashes per corner into one:
+// `cavernSiteGateOpen` computes hash2(seed, fi, fj, CH_CAVE_NODE) for the gate
+// bits and `caveNode` then recomputed the very same hash for the jitter. One
+// call now feeds both, via caves.h's `caveNodeFromHash`. Same bits, same node.
+struct CavernCandidate {
+    bool open = false; // gate open AND node depth inside the child-0 safety window
+    int64_t fi = 0, fj = 0;
+    CaveNode node;
+};
+
+struct CavernCandidates {
+    // Index dj * 2 + di — the (dj, di) iteration order that is part of the
+    // worldgen contract.
+    CavernCandidate corners[4] = {};
+};
+
+constexpr CavernCandidates cavernCandidatesFor(uint64_t seed, int64_t si, int64_t sj) {
+    CavernCandidates out;
+    for (int32_t dj = 0; dj < 2; ++dj)
+        for (int32_t di = 0; di < 2; ++di) {
+            const int64_t fi = (si + di) * kCavernCoarseLatticeRatio;
+            const int64_t fj = (sj + dj) * kCavernCoarseLatticeRatio;
+            CavernCandidate& c = out.corners[dj * 2 + di];
+            c.fi = fi;
+            c.fj = fj;
+
+            // Cheapest reject first: the gate bit folded into the node-jitter
+            // hash (see kCavernSiteGateMask), then the node it also encodes.
+            const uint64_t h = hash2(seed, fi, fj, CH_CAVE_NODE);
+            if (((h >> 60) & kCavernSiteGateMask) != 0) continue;
+            c.node = caveNodeFromHash(h, fi, fj);
+            if (!cavernDepthIsSafe(c.node.depthMm)) continue;
+            c.open = true;
+        }
+    return out;
+}
+
 // Every cavern room within reach of column (vx, vy), reduced to the two
 // int32s the per-voxel test needs plus the flat-floor clamp. `surfaceMm` is
 // the QUERYING column's own terrain height (the ordinary ocean/beach guard,
@@ -455,28 +503,33 @@ struct CavernColumn {
 //
 // Iteration order (dj, di, then room index) is part of the worldgen
 // contract, mirrored bit-exactly in the eventual HLSL port.
-template <typename SurfaceFn>
-constexpr CavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, int32_t surfaceMm,
-                                        const SurfaceFn& surfaceAt) {
+//
+// `siteFor(fi, fj, node) -> CavernSite` is how the site geometry is obtained.
+// It is a parameter rather than a direct `cavernSiteFor` call because a site
+// is a per-SITE value, not a per-column one, and the original comment here —
+// "at most one corner per column ever reaches this, so this never repeats
+// work" — was only true WITHIN a column. Across columns it repeats for every
+// one of the ~400'000 columns inside the site's ~36 m reach disc, and each
+// repeat re-runs `surfaceAt`, which in production is the amplifier's full
+// bilinear-tile-base + detail-octave surface function. Measured on
+// vxc_bench --radius 32, that alone roughly DOUBLED the whole amplify stage.
+// Hoisting it behind a callable lets amplifier.cpp memoise per (seed, fi, fj)
+// while the pure form below stays exactly what the contract and the HLSL
+// mirror are written against.
+template <typename SiteFn>
+constexpr CavernColumn cavernColumnFromSites(uint64_t seed, const CavernCandidates& cands,
+                                              int64_t vx, int64_t vy, const SiteFn& siteFor) {
     CavernColumn out;
-    if (surfaceMm < kCaveMinSurfaceMm) return out;
-
     const int64_t xMm = vx * kVoxelSizeMm;
     const int64_t yMm = vy * kVoxelSizeMm;
-    const int64_t si = floorDiv(xMm, kCavernCoarseMm);
-    const int64_t sj = floorDiv(yMm, kCavernCoarseMm);
 
     for (int32_t dj = 0; dj < 2; ++dj) {
         for (int32_t di = 0; di < 2; ++di) {
-            const int64_t fi = (si + di) * kCavernCoarseLatticeRatio;
-            const int64_t fj = (sj + dj) * kCavernCoarseLatticeRatio;
-
-            // Cheapest reject first: the gate bit folded into the node-
-            // jitter hash (no separate hash call, see kCavernSiteGateMask).
-            if (!cavernSiteGateOpen(seed, fi, fj)) continue;
-
-            const CaveNode node = caveNode(seed, fi, fj);
-            if (!cavernDepthIsSafe(node.depthMm)) continue;
+            const CavernCandidate& cand = cands.corners[dj * 2 + di];
+            if (!cand.open) continue;
+            const int64_t fi = cand.fi;
+            const int64_t fj = cand.fj;
+            const CaveNode& node = cand.node;
 
             // Every room in the chain shares this xy (see "why coaxial"), so
             // this distance is computed ONCE per column, not once per room.
@@ -485,10 +538,10 @@ constexpr CavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, in
             const int64_t dxySq = ex * ex + ey * ey;
             if (dxySq > kCavernMaxReachSqMm) continue;
 
-            // Full reduction: the one place surfaceAt() (a terrain raster
-            // read) is called. At most one corner per column ever reaches
-            // here (static_assert above), so this never repeats work.
-            const CavernSite site = cavernSiteFor(seed, fi, fj, node, surfaceAt);
+            // Full reduction: the one place the terrain raster is read. At
+            // most one corner per column ever reaches here (static_assert
+            // above), so no column does this twice.
+            const CavernSite& site = siteFor(fi, fj, node);
             if (!site.valid) continue;
 
             // Wall roughness: one 2D value-noise sample for this column,
@@ -516,6 +569,31 @@ constexpr CavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, in
         }
     }
     return out;
+}
+
+// As above, with sites computed straight from `surfaceAt` (no memo).
+template <typename SurfaceFn>
+constexpr CavernColumn cavernColumnFromCandidates(uint64_t seed, const CavernCandidates& cands,
+                                                   int64_t vx, int64_t vy,
+                                                   const SurfaceFn& surfaceAt) {
+    return cavernColumnFromSites(
+        seed, cands, vx, vy, [&](int64_t fi, int64_t fj, const CaveNode& node) {
+            return cavernSiteFor(seed, fi, fj, node, surfaceAt);
+        });
+}
+
+// Fused form: the pure, self-contained `f(seed, vx, vy, surfaceMm, surfaceAt)`
+// the worldgen contract and the HLSL mirror are written against. Callers
+// walking many columns should go through amplifier.cpp's memoised path
+// instead, which produces bit-identical values.
+template <typename SurfaceFn>
+constexpr CavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, int32_t surfaceMm,
+                                        const SurfaceFn& surfaceAt) {
+    CavernColumn out;
+    if (surfaceMm < kCaveMinSurfaceMm) return out;
+    const int64_t si = floorDiv(vx * kVoxelSizeMm, kCavernCoarseMm);
+    const int64_t sj = floorDiv(vy * kVoxelSizeMm, kCavernCoarseMm);
+    return cavernColumnFromCandidates(seed, cavernCandidatesFor(seed, si, sj), vx, vy, surfaceAt);
 }
 
 // --- per-voxel carve test ---------------------------------------------------

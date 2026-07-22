@@ -8,6 +8,7 @@
 // material). Later versions add erosion stamps, riverbed carving, caves,
 // vegetation placement.
 
+#include "voxelcore/caverns.h"
 #include "voxelcore/caves.h"
 #include "voxelcore/tiles.h"
 
@@ -28,6 +29,17 @@ struct ColumnSample {
     // bench) picks caves up with no API change and pays the 34 cave hashes
     // once per column instead of once per voxel.
     CaveColumn cave;
+
+    // M4 cave pass v2 (voxelcore/caverns.h): the cavern rooms whose ellipsoids
+    // reach this column, reduced the same way `cave` is and carried here for
+    // the same reason — every consumer of the column cache picks caverns up
+    // with no API change. Unlike `cave`, the cavern reduction needs a terrain
+    // surface at the SITE's own xy (caverns anchor at absolute z so their
+    // floors and water tables are level, not draped); Amplifier::column
+    // supplies that as a callback over its own surface function, and the GPU
+    // mirror recomputes it inside VoxelizeMain rather than widening
+    // GpuColumnSample (docs/cavern-design.md §3.5).
+    CavernColumn cavern;
 };
 
 class Amplifier {
@@ -69,6 +81,19 @@ public:
     const ColumnSample& columnCached(int64_t vx, int64_t vy) const;
 
 private:
+    // The surface half of column() — the bilinear tile base plus the
+    // slope-scaled detail octaves — plus the tile pixel and tile slope the
+    // rest of column() derives from the same reads. Exposed as its own step
+    // only so the cavern pass's `surfaceAt` callback (caverns.h, which needs a
+    // surface at the SITE's xy rather than the querying column's) can be
+    // literally this function instead of a second copy of it.
+    struct SurfaceEval {
+        int32_t surfaceMm = 0;
+        int64_t slopeMmPerPx = 0;
+        int64_t px = 0, py = 0; // tile pixel the column falls in
+    };
+    SurfaceEval evalSurface(int64_t vx, int64_t vy) const;
+
     // Identity for the per-thread tile-raster memo in amplifier.cpp. Drawn from
     // a never-reused counter rather than using `this` or `tiles_`, because a
     // destroyed Amplifier's address can be recycled by the allocator and a

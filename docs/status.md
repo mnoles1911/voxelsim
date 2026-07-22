@@ -4821,3 +4821,170 @@ needs to change (it was never assumed) — worth re-running
 `cavern_never_breaches_bedrock` and the roof-cover test once it does, since
 the *observed* numbers (how much of the ~80 m chain actually survives a given
 column's real bedrock) will shift even though no code does.
+
+### C4: caverns fold-in, 200 m bedrock, caveColumnFor caching
+
+Three things that all live in the worldgen column path, done in one pass and
+one `kWorldGenVersion` bump (**4 -> 5**). The GPU mirror (C6) is explicitly NOT
+part of this and the AMD digests are now stale — see the end of this section.
+
+**1. Caverns wired into the amplifier (C4).** `ColumnSample` gains a
+`CavernColumn cavern` next to its `CaveColumn cave`, `Amplifier::column`
+fills it, and `Amplifier::materialAt` consults it — the same shape the cave
+pass already had, with caves tested first because a cavern column is far
+rarer and `cavernCarveAt`'s first test is `count == 0`. The `MAT_AIR` /
+`MAT_BEDROCK` early-out stays exactly where it was, so the bedrock floor keeps
+all three independent guards.
+
+The one place that needed interpretation was the `surfaceAt` callback.
+Caverns anchor at *absolute* z (level floors and water tables rather than
+draped ones), so the reduction needs terrain height at the SITE's own xy, not
+the querying column's. Rather than pass a second copy of the surface formula,
+`Amplifier::column`'s surface half was factored out as
+`Amplifier::evalSurface` and the callback is literally that function — the
+contract holds by construction instead of by a comment asking two copies to
+stay in step. Nothing was added to any GPU column-cache struct; C6 recomputes
+it inside `VoxelizeMain`, as the design doc's section 3.5 requires.
+
+**2. Bedrock 40-60 m -> 180-220 m** (Matt's decision: 200 m). Same
+deterministic shape (one 16-bit field of a 6.4 m-lattice `CH_BEDROCK_JITTER`
+hash), only the two constants move. 200 m is the band's MEAN rather than its
+floor — scaling the old "base + 50% of base" shape would have given 200-300 m
+(mean 250 m), which is not what was asked for. The +/-20 m (10%) span is enough
+that the boundary does not read as a flat sheet draped under the terrain (the
+only reason the jitter exists) while leaving ~52 m of untouched rock above
+even the shallowest draw. As predicted by the cavern author, **caverns.h
+needed no change** — it never had a compile-time bedrock assumption.
+
+Re-ran the two flagged tests. `cavern_never_breaches_bedrock` is driven by
+its own bedrock parameters and is unchanged: closest approach 2050 / 2050 /
+128'050 / 188'050 mm at 45 / 60 / 200 / 260 m, against a 2000 mm margin. The
+sloped-real-terrain roof test moved a lot, over the same 640'000-column scan
+(387 m of relief):
+
+| | 40-60 m | 180-220 m |
+|---|---|---|
+| carved cavern voxels | 1'356'809 | 1'870'004 (+37.8%) |
+| columns over a cavern | 5'551 | 5'639 |
+| voxels clamped away | 534'227 | 21'032 (-96.1%) |
+| columns partly clamped | 4'189 (75.5%) | 517 (9.2%) |
+| columns fully refused | 88 | 0 |
+| min roof cover over a carved voxel | 6000 mm | 6000 mm |
+| caves' closest approach to bedrock | 6'250 mm | 146'279 mm |
+
+So ~38% more of each chain now survives, the **bedrock clamp is now inert**
+for caverns and tunnels alike, and the **roof clamp is the only one still
+binding** — still exactly, at 6.00 m. That retired the old
+`columnsFullyRefused > 0` assertion, which was measuring a clamp that is now
+correctly inert; it is replaced by a direct count of voxels inside a room's
+ellipsoid that a clamp refused, which is what "load-bearing" always meant.
+
+**Second-order effects checked.** Caves/tunnels sit 6-40 m down and are
+depth-relative, so they are unaffected in geometry — but their *bedrock
+margin* clamp, which used to bind occasionally against a 40 m floor, is now
+inert (closest approach 6'250 -> 146'279 mm). `caves.h`'s bedrock
+`static_assert` is deliberately left checking against the old 40 m figure: it
+is a strictly stronger statement and keeps tunnel geometry provably
+independent of wherever the bedrock band sits. Stratigraphy ordering is
+unchanged (`bedrockDepthMm > topsoil + subsoil` still holds by three orders of
+magnitude), `MAT_ROCK`'s extent grows from ~40 m to ~200 m, and the
+underground streaming depth budget of 38.4 m was *already* entirely inside
+MAT_ROCK before the move, so nothing there changes at all. Mip/LOD and
+water/aquifer behaviour are untouched: every existing golden that walks voxels
+(`mips_chain`, both bench digests) only ever visits SURFACE-SHELL bricks, so
+none of them can see either bedrock or caverns.
+
+That last point is a gap worth naming: **no pre-existing golden would have
+noticed if the cavern fold-in had been silently dropped.** Two new tests close
+it — `amplifier_folds_caverns_into_materialAt` (1115 columns over a cavern,
+387'917 voxels carved by the cavern pass, 379'924 of them cavern-ONLY, roof
+cover 6.0-77.8 m, 656'754 bedrock voxels all refused) and
+`GOLDEN(amplifier_deep_materials)`, which digests `materialAt` 260 m down over
+an 800 m grid and therefore actually covers caves, caverns and the bedrock
+boundary as the amplifier composes them.
+
+**3. `caveColumnFor` cached.** All of its hashing (the 4x4 node block, 18
+candidate edges, sinkhole candidate) depends only on the LATTICE CELL — 25.6 m
+square, 65'536 voxel columns — so `caves.h` now exposes that half as
+`CaveLattice`/`caveLatticeFor` and `amplifier.cpp` memoises it thread-locally
+by (seed, ci, cj). The pure fused `caveColumnFor` is unchanged in value and
+remains the contract/HLSL-mirror form. `caverns.h` got the same treatment for
+its 2x2 candidate corners (204.8 m cell), plus a fused gate+node hash where it
+was computing `hash2(..., CH_CAVE_NODE)` twice per corner.
+
+One cost-model correction worth recording: caverns.h's comment that the site
+reduction "never repeats work" was true only *within* a column. Across
+columns a site was re-decoded for every one of the ~400'000 columns inside its
+~36 m reach disc, each re-running `surfaceAt` — in production the amplifier's
+full bilinear+4-octave surface function. `cavernSiteFor` is now reached
+through a callable so `amplifier.cpp` can memoise per (seed, fi, fj);
+measured over a region that actually contains a site (59.4% of columns over a
+cavern), that alone takes `column()` from **473 -> 301 ns/col**, bit-identical
+output.
+
+**vxc_bench --radius 32, min-of-5, interleaved against a binary built from
+`main` @ ec872bd** (this box's run-to-run variance is large enough that
+sequential before/after runs were misleading by up to 55% — the two binaries
+were alternated on every rep):
+
+| | main 8^3 | this 8^3 | main 16^3 | this 16^3 |
+|---|---|---|---|---|
+| amplify | 202.1 ms | **115.5 ms** | 163.7 ms | **93.9 ms** |
+| voxelize | 21.8 ms | 24.6 ms | 43.4 ms | 40.5 ms |
+| mesh | 76.6 ms | 76.0 ms | 125.1 ms | 113.4 ms |
+| **total** | **300.5 ms** | **216.1 ms** | **332.4 ms** | **247.7 ms** |
+
+Amplify is **1.75x** faster and worldgen overall **1.39x / 1.34x** faster —
+while also gaining the entire cavern system. Target met: the combined
+cave+cavern cost did not undo the earlier 792.6 -> 283 ms passes, it extended
+them.
+
+**Caverns cost more in the real column path than standalone.** Isolated
+(same interleaving, caverns computed vs not, 8^3): amplify 98.4 -> 119.1 ms
+over 409'600 columns = **+50 ns/col**, versus the **~28 ns/col** the
+standalone micro-benchmark reported. The standalone figure used a constant
+`surfaceAt` and a `CavernColumn` that was never stored; the real path pays an
+80-byte struct write per column on top. It is the same order of magnitude and
+it is comfortably paid for by the caching above, but the standalone number
+should not be quoted as the production one.
+
+**Goldens — predicted first, then checked. Nothing moved unpredicted.**
+
+| golden | predicted | actual |
+|---|---|---|
+| `amplifier_columns` | MOVE (digests `bedrockDepthMm`) | `0x81785278E4DFCF67` -> `0xA29A7A767DC1543B` |
+| `cave_layer` | unmoved (test-local flat surface + bedrock; lattice split is pure) | `0xBFE42E07FFA6B78D` unmoved |
+| `cavern_layer` | unmoved (test-local constants; candidate split is pure) | `0x5B1F8E5E73ED6EF2` unmoved |
+| `mips_chain` | unmoved (surface-shell bricks only — never 40 m deep, never near a cavern) | `0xE827A786195B8A73` unmoved |
+| `rivernet_synthetic_slope` | unmoved (tile-only, no amplifier columns) | `0xA4D30E5715339878` unmoved |
+| `biome_map` | unmoved | `0xEDBF3C9217ECBBF6` unmoved |
+| bench digests | unmoved (surface-shell only, same reason as mips) | `6dbb95d59737e045` / `280684104c06aacf` unmoved |
+| `amplifier_deep_materials` | NEW | `0xF88B88DB9D9341AA` |
+
+The cave/cavern refactors were committed *first*, separately, and verified to
+leave every single golden and both bench digests byte-identical — that is the
+evidence that the caching is output-neutral, rather than an argument that it
+ought to be.
+
+**The AMD GPU digests are now STALE.** `worldgen.hlsl`'s `ColumnMain` /
+`VoxelizeMain` know nothing about caverns and still carry the 40-60 m bedrock
+band, so the CPU/GPU harness **will FAIL until C6 lands** — expected, not a
+regression. C6 must mirror `cavernCandidatesFor` / `cavernSiteFor` /
+`cavernColumnFromSites` / `cavernCarveAt` bit-for-bit, apply the same
+180'000 + jitter bedrock constants, and re-pin the AMD RX 7800 XT digests.
+No HLSL was touched here.
+
+**Verification:** 190 PASS / 0 FAIL (was 188 — two new amplifier tests).
+Clang clean under `-Wall -Wextra -Wconversion -Wsign-conversion -Werror` for
+every file touched; float-ban clean against the exact CI script. No gcc
+available on this box, so the known "gcc is stricter" pattern (enum/non-enum
+ternary) was avoided by hand — `materialAt`'s new cavern branch uses an
+explicit `static_cast<MaterialId>(MAT_AIR)` and an `if` rather than a ternary.
+
+**Follow-ups.** (a) C6, as above — the blocking one. (b) `ColumnSample` grew
+128 -> 208 bytes; `kMaxCavernSegs` is 6 where at most `kCavernChildCount` (4)
+rooms can ever be recorded, so 24 bytes are provably dead — left alone because
+it is a caverns.h contract constant and measurement showed the struct size is
+NOT the bottleneck. (c) The UE `VoxelWorldSubsystem` column cache holds
+`ColumnSample`s and will use ~62% more memory; not this agent's file.
+(d) `columnCached`'s comment still says "96 bytes"; stale but harmless.
