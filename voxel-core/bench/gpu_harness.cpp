@@ -76,6 +76,23 @@ using namespace vxc;
 
 namespace {
 
+// --- Raster-window margin for the cavern pass (C6) -------------------------
+// VoxelizeMain's cavernSiteFor evaluates the terrain surface at the SITE's own
+// xy — caverns.h's `surfaceAt` contract, because caverns anchor at absolute z
+// and a draped floor would be visibly wrong. A site can sit up to
+// kCavernMaxReachMm away in x and y from the querying column
+// (cavernColumnFromSites rejects anything further BEFORE it ever calls
+// surfaceAt, so this bound is exact), the shader then floors that mm
+// coordinate to a voxel (losing up to one more voxel) and takes bilinear taps
+// at px and px+1.
+//
+// The uploaded raster window must therefore extend this far past the column
+// range. Undersizing it does NOT fault: worldgen.hlsl's rasterElevationMm
+// clamps to the window edge as a defensive backstop, so the GPU would read a
+// different elevation than the CPU and the byte-compare would fail with no
+// other symptom. That is exactly the failure mode this constant prevents.
+constexpr int64_t kRasterCavernMarginMm = kCavernMaxReachMm + kVoxelSizeMm;
+
 // --- Vulkan dynamic loading: no import lib, no static linkage -------------
 
 #define VXC_VK_GLOBAL_FUNCS(X) X(vkCreateInstance)
@@ -594,14 +611,23 @@ GpuContext createContext(const std::string& spvPath, const std::string& voxelize
 
     // --- VoxelizeMain pipeline: separate SPIR-V module, separate descriptor
     // set layout (binding 0 uniform WorldGenParams shared with ColumnMain's
-    // buffer, binding 4 InColumns read-only storage, binding 5 OutCells RW
-    // storage — see the file header for the DXC -fvk-*-shift derivation).
-    VkDescriptorSetLayoutBinding voxBindings[3]{};
+    // buffer, binding 1 ElevationMm read-only storage, binding 4 InColumns
+    // read-only storage, binding 5 OutCells RW storage — see the file header
+    // for the DXC -fvk-*-shift derivation).
+    //
+    // Binding 1 is new as of the C6 cavern mirror. VoxelizeMain used to need
+    // no raster at all (the cave pass is a pure function of seed/vx/vy/
+    // surfaceMm), but caverns.h's `surfaceAt` contract makes the cavern pass
+    // evaluate terrain height at the SITE's own xy — which is generally not a
+    // column in the dispatch, so it cannot be carried on GpuColumnSample and
+    // must be recomputed from the elevation raster in-shader.
+    VkDescriptorSetLayoutBinding voxBindings[4]{};
     voxBindings[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    voxBindings[1] = {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    voxBindings[2] = {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    voxBindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    voxBindings[2] = {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    voxBindings[3] = {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo voxDslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    voxDslci.bindingCount = 3;
+    voxDslci.bindingCount = 4;
     voxDslci.pBindings = voxBindings;
     vkCheck(vkCreateDescriptorSetLayout(ctx.device, &voxDslci, nullptr, &ctx.voxDescSetLayout),
             "vkCreateDescriptorSetLayout(voxelize)");
@@ -634,7 +660,7 @@ GpuContext createContext(const std::string& spvPath, const std::string& voxelize
 
     VkDescriptorPoolSize voxPoolSizes[2]{};
     voxPoolSizes[0] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1};
-    voxPoolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+    voxPoolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
     VkDescriptorPoolCreateInfo voxDpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     voxDpci.maxSets = 1;
     voxDpci.poolSizeCount = 2;
@@ -1037,11 +1063,14 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
 
     // Raster window covering every bilinear tap the dispatch touches
     // (worldgen.hlsl's documented contract): pixel range from the column mm
-    // range, +1 on the high end for the second bilinear tap.
-    const int64_t xMmMin = int64_t(region.originVx) * kVoxelSizeMm;
-    const int64_t xMmMax = int64_t(region.originVx + int32_t(region.width) - 1) * kVoxelSizeMm;
-    const int64_t yMmMin = int64_t(region.originVy) * kVoxelSizeMm;
-    const int64_t yMmMax = int64_t(region.originVy + int32_t(region.height) - 1) * kVoxelSizeMm;
+    // range, +1 on the high end for the second bilinear tap, and
+    // kRasterCavernMarginMm on both ends for VoxelizeMain's site-surface taps.
+    const int64_t xMmMin = int64_t(region.originVx) * kVoxelSizeMm - kRasterCavernMarginMm;
+    const int64_t xMmMax =
+        int64_t(region.originVx + int32_t(region.width) - 1) * kVoxelSizeMm + kRasterCavernMarginMm;
+    const int64_t yMmMin = int64_t(region.originVy) * kVoxelSizeMm - kRasterCavernMarginMm;
+    const int64_t yMmMax =
+        int64_t(region.originVy + int32_t(region.height) - 1) * kVoxelSizeMm + kRasterCavernMarginMm;
     const int64_t pxMin = floorDiv(xMmMin, pixelSizeMm);
     const int64_t pxMax = floorDiv(xMmMax, pixelSizeMm) + 1;
     const int64_t pyMin = floorDiv(yMmMin, pixelSizeMm);
@@ -1155,17 +1184,20 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
     vkUpdateDescriptorSets(ctx.device, 4, writes, 0, nullptr);
 
     // VoxelizeMain descriptor set: binding 0 shares the SAME paramsBuf,
-    // binding 4 (InColumns) is the SAME columnsBuf ColumnMain just wrote,
-    // binding 5 (OutCells) is the new cellsBuf.
+    // binding 1 (ElevationMm) the SAME elevBuf ColumnMain reads (the cavern
+    // pass's site-surface evaluation), binding 4 (InColumns) the SAME
+    // columnsBuf ColumnMain just wrote, binding 5 (OutCells) the new cellsBuf.
     VkDescriptorBufferInfo cellsInfo{cellsBuf.buffer, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet voxWrites[3]{};
+    VkWriteDescriptorSet voxWrites[4]{};
     voxWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 0, 0, 1,
                     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &paramsInfo, nullptr};
-    voxWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 4, 0, 1,
+    voxWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 1, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &elevInfo, nullptr};
+    voxWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 4, 0, 1,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &columnsInfo, nullptr};
-    voxWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 5, 0, 1,
+    voxWrites[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 5, 0, 1,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cellsInfo, nullptr};
-    vkUpdateDescriptorSets(ctx.device, 3, voxWrites, 0, nullptr);
+    vkUpdateDescriptorSets(ctx.device, 4, voxWrites, 0, nullptr);
 
     const uint32_t groupsX = (region.width + 7) / 8;
     const uint32_t groupsY = (region.height + 7) / 8;
@@ -1531,12 +1563,13 @@ struct FlightDescriptors {
 FlightDescriptors createFlightDescriptors(GpuContext& ctx, int32_t totalSlots,
                                            std::vector<FlightSlot>& slots) {
     FlightDescriptors fd;
-    // Per tile: colSet (1 uniform + 3 storage), voxSet (1 uniform + 2
-    // storage), meshCountSet/meshEmitSet/scanSet (1 uniform + 6 storage each,
-    // x3) -- mirrors createContext()'s pool-size derivation, just x totalSlots.
+    // Per tile: colSet (1 uniform + 3 storage), voxSet (1 uniform + 3 storage
+    // -- elevation joined it with the C6 cavern mirror),
+    // meshCountSet/meshEmitSet/scanSet (1 uniform + 6 storage each, x3) --
+    // mirrors createContext()'s pool-size derivation, just x totalSlots.
     VkDescriptorPoolSize poolSizes[2]{};
     poolSizes[0] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, uint32_t(totalSlots) * 5};
-    poolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, uint32_t(totalSlots) * 23};
+    poolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, uint32_t(totalSlots) * 24};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = uint32_t(totalSlots) * 5;
     dpci.poolSizeCount = 2;
@@ -1600,14 +1633,18 @@ void writeColVoxDescriptorsSlot(GpuContext& ctx, FlightSlot& s) {
     vkUpdateDescriptorSets(ctx.device, 4, writes, 0, nullptr);
 
     VkDescriptorBufferInfo cellsInfo{s.gb.cellsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet voxWrites[3]{};
+    // Binding 1 (ElevationMm) is bound to the voxelize set too since the C6
+    // cavern mirror — see the voxBindings comment in initVulkan().
+    VkWriteDescriptorSet voxWrites[4]{};
     voxWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 0, 0, 1,
                     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &paramsInfo, nullptr};
-    voxWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 4, 0, 1,
+    voxWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 1, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &elevInfo, nullptr};
+    voxWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 4, 0, 1,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &columnsInfo, nullptr};
-    voxWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 5, 0, 1,
+    voxWrites[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 5, 0, 1,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cellsInfo, nullptr};
-    vkUpdateDescriptorSets(ctx.device, 3, voxWrites, 0, nullptr);
+    vkUpdateDescriptorSets(ctx.device, 4, voxWrites, 0, nullptr);
 }
 
 void writeMeshDescriptorsSlot(GpuContext& ctx, FlightSlot& s) {
@@ -1768,10 +1805,12 @@ void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t 
     s.active = true;
     s.verify = verify;
 
-    const int64_t xMmMin = int64_t(tile.originVx) * kVoxelSizeMm;
-    const int64_t xMmMax = int64_t(tile.originVx + W - 1) * kVoxelSizeMm;
-    const int64_t yMmMin = int64_t(tile.originVy) * kVoxelSizeMm;
-    const int64_t yMmMax = int64_t(tile.originVy + H - 1) * kVoxelSizeMm;
+    // Both ends carry kRasterCavernMarginMm for VoxelizeMain's site-surface
+    // taps — see that constant's comment.
+    const int64_t xMmMin = int64_t(tile.originVx) * kVoxelSizeMm - kRasterCavernMarginMm;
+    const int64_t xMmMax = int64_t(tile.originVx + W - 1) * kVoxelSizeMm + kRasterCavernMarginMm;
+    const int64_t yMmMin = int64_t(tile.originVy) * kVoxelSizeMm - kRasterCavernMarginMm;
+    const int64_t yMmMax = int64_t(tile.originVy + H - 1) * kVoxelSizeMm + kRasterCavernMarginMm;
     const int64_t pxMin = floorDiv(xMmMin, pixelSizeMm);
     const int64_t pxMax = floorDiv(xMmMax, pixelSizeMm) + 1;
     const int64_t pyMin = floorDiv(yMmMin, pixelSizeMm);

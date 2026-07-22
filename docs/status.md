@@ -5467,3 +5467,76 @@ fidelity ceilings, cavern survival), voxel-core/tests/CMakeLists.txt,
 voxel-core/bench/bench_main.cpp (`--mips` mode; default modes untouched).
 No changes to mips.h, caves.h, caverns.h, amplifier.*, worldgen.hlsl, or
 anything under ue-project/.
+
+---
+
+## C6b — worldgen.hlsl mirror finished, AMD cross-vendor determinism re-verified
+
+**State found.** C6's mirror was substantively complete and correct: the C2
+crevices, the C4 folded cavern pass and the 180-220 m bedrock band were all
+present in `voxel-core/shaders/worldgen.hlsl` (497 lines, 118 cavern
+references), with the bedrock formula `180000 + ((bj >> 48) * 40000) / 65536`
+matching `amplifier.cpp:329` character for character. It had never been run
+against a GPU.
+
+**The one real defect: a stale `kMaxCavernSegs`.** The mirror was written
+against `kMaxCavernSegs = 6`; `main` subsequently shrank the CPU constant to
+4 (tight == `kCavernChildCount`). This is not a benign over-allocation — the
+cap gates which segments survive into `ColumnSample`, so a GPU admitting a
+5th segment the CPU had dropped would produce a different column digest.
+Fixed to 4, SPIR-V respun (`VoxelizeMain` 72,448 -> 71,808 bytes). That was
+the only change needed; no host-side binding change, `gpu_harness.cpp`
+untouched beyond C6's own merge.
+
+**AMD Radeon RX 7800 XT — all three modes bit-exact (PASS).**
+
+| Mode | Result | New digest | Replaces |
+|---|---|---|---|
+| default (2 regions) | PASS, 0 mismatches, 8192 columns / 360,448 cells / 4,997 quads | `71288ec0ac6dba0b` | `e21e2767591496eb` |
+| `--radius 64` | PASS, 0 mismatches, 305/305 tiles (100%) — 4,997,120 columns / 270,663,680 cells / 2,523,983 quads | `f102b490a42918c0` | `1e664cf6680a137c` |
+| `--radius 128` | PASS, 0 mismatches, 136/1089 tiles (12.5%) — 2,228,224 columns / 119,799,808 cells / 1,126,522 quads | `1f88f5e0d405321d` | `7602afe508d2ee73` |
+
+**All three digests moved, including default — which is the correct
+expectation here, and the earlier brief's reasoning was wrong.** The
+respin-3 (caves) argument that default mode's digest should hold, because
+default voxelizes only a ~48-voxel surface shell above any carved geometry,
+is an argument about *voxels*. `bedrockDepthMm` is a per-**column** field and
+the harness digest covers columns as well as cells and quads, so the bedrock
+band move shifts the default digest no matter which voxels get meshed. A
+default digest that had stayed put would have been evidence the shader never
+picked the change up — suspicious, not reassuring. (Credit to C6, which
+caught this in its final message before it was killed.)
+
+**No CPU behaviour changed.** `git diff main` over `voxel-core/src`,
+`voxel-core/include` and `voxel-core/tests` is empty — this wave touched only
+the shader, the prebuilt SPIR-V and docs. `kWorldGenVersion` is still 5 (not
+bumped). All six pinned goldens verify unchanged: `amplifier_columns`
+`0xA29A7A767DC1543B`, `cave_layer` `0xBFE42E07FFA6B78D`, `cavern_layer`
+`0x5B1F8E5E73ED6EF2`, `amplifier_deep_materials` `0xF88B88DB9D9341AA`,
+`mips_chain` `0xE827A786195B8A73`, `coarsegen` `0x85B3E79EF8D01AFC`.
+
+**Gates.** `tools/lint-shader-ub.py` clean on its own merits (1 HLSL file, 5
+rules, fail-closed); every `allow` annotation in the file carries a written
+justification, none are bare. Zero `float`/`double`/`half` in
+`worldgen.hlsl`. `vxc_tests` 205 PASS / 0 FAIL (clang/llvm-mingw).
+
+**Build note for the next agent on this box.** `vxc_gpu` needs MSVC + Vulkan
+and will not build under mingw, as documented — but VS 2026 here is
+`C:\Program Files\Microsoft Visual Studio\18\Community` (product version 18)
+and ships **no** bundled CMake or Ninja, so the documented "vcvars64 +
+VS-bundled CMake/Ninja" recipe no longer works as written. What does work:
+`tools/fetch-vulkan-headers.ps1` and `tools/fetch-dxc.ps1` (neither is
+checked in), then vcvars64 plus the standalone CMake with `-G "NMake
+Makefiles"`.
+
+**Follow-up, not a determinism issue.** The `--radius 64` gate now measures
+1.377 s against its <1.000 s target ("OVER TARGET"), dominated by 1,326 ms of
+`vkAllocateMemory`/`vkMapMemory` buffer (re)allocation; `--radius 128` passes
+its gate comfortably at 0.202 s. The r64 regression is an allocator warm-up
+cost, not worldgen math, and is orthogonal to the byte-compare — worth a
+separate look at buffer pre-sizing for the small-radius case.
+
+**Files.** voxel-core/shaders/worldgen.hlsl (`kMaxCavernSegs` 6 -> 4),
+voxel-core/shaders/prebuilt/*.spv (respun), voxel-core/shaders/prebuilt/
+README.md (respin 4 section), docs/status.md (this entry). No CPU source, no
+test, nothing under ue-project/.
