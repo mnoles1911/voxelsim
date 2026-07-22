@@ -934,7 +934,18 @@ public:
     // The savegame-load and client-replication path: the units are already
     // present in the loaded/replicated CA fill, so crediting them again would
     // duplicate exactly the water this class exists to protect.
-    void markMobilized(const BrickKey& k) { mobilized_.insert(k); }
+    // Queues into takeRecentlyMobilized() as well, so a client re-meshes the
+    // handover on exactly the same path the authority does.
+    void markMobilized(const BrickKey& k) {
+        if (mobilized_.insert(k).second) recentlyMobilized_.push_back(k);
+    }
+
+    // Bricks mobilized since the last call, in mobilization order, and clears
+    // the queue. The engine drains this to re-mesh: a mobilized brick must
+    // stop being drawn as implicit water and start being drawn as CA water in
+    // the same frame, or the handover flickers. Also the natural feed for the
+    // replication channel that tells clients which bricks have converted.
+    std::vector<BrickKey> takeRecentlyMobilized();
 
     // Deterministic digest of the mobilized set, in sorted key order.
     void digest(Digest& d) const;
@@ -959,6 +970,7 @@ private:
     WaterCA::SolidFn terrain_;
     std::set<BrickKey, BrickKeyLess> mobilized_;
     std::set<BrickKey, BrickKeyLess> pending_;
+    std::vector<BrickKey> recentlyMobilized_;
     mutable std::unordered_set<BrickKey, BrickKeyHash> noImplicit_;
     uint64_t debited_ = 0;
     uint64_t credited_ = 0;

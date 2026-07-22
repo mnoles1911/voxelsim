@@ -1244,6 +1244,7 @@ uint32_t WaterMobilizer::mobilizeBrick(WaterCA& ca, const BrickKey& k) {
     // would have addWaterAt refuse every cell as solid and credit nothing,
     // which shortfallVolume() would (loudly) catch.
     mobilized_.insert(k);
+    recentlyMobilized_.push_back(k);
     noImplicit_.erase(k);
 
     int64_t ox = 0, oy = 0, oz = 0;
@@ -1307,6 +1308,12 @@ size_t WaterMobilizer::advanceFront(WaterCA& ca, size_t maxBricks) {
         ++done;
     }
     return done;
+}
+
+std::vector<BrickKey> WaterMobilizer::takeRecentlyMobilized() {
+    std::vector<BrickKey> out;
+    out.swap(recentlyMobilized_);
+    return out;
 }
 
 void WaterMobilizer::digest(Digest& d) const {
