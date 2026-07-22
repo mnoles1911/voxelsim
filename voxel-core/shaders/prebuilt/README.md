@@ -237,3 +237,40 @@ and an unchanged digest there is the expected result. It does mean default
 mode does **not** exercise the cave path: the `--radius 64` run is the one
 that verifies it, and it does so over all 270 million cells with zero
 mismatches.
+
+## Respin 4 — caverns (C4), crevices (C2) and the 180-220 m bedrock band
+
+`worldgen.hlsl` now mirrors the C2 crevices, the C4 folded cavern pass and
+the `kWorldGenVersion` 5 bedrock move (40-60 m -> a jittered band centred on
+200 m). `VoxelizeMain` grew 20,816 -> 71,808 bytes; `ColumnMain` moved for
+the usual module-layout reason. The other five modules are byte-identical to
+respin 3 again, the same free control as before.
+
+**`kMaxCavernSegs` must track the CPU.** The CPU shrank it 6 -> 4 (tight ==
+`kCavernChildCount`, the provable max) after the mirror was first written, so
+the shader was briefly one constant out of step. A wider GPU cap is not a
+harmless over-allocation: the cap decides *which* segments survive into
+`ColumnSample`, so a GPU that admitted a 5th segment the CPU dropped would
+diverge. Matching it to 4 is what the final SPIR-V here is built from.
+
+| Mode | Result | GPU output digest (columns+cells+quads) |
+|---|---|---|
+| default (2 regions) | **PASS**, 0 mismatches, 8192 columns / 360448 cells / 4997 quads | `71288ec0ac6dba0b` (was `e21e2767591496eb`) |
+| `--radius 64` | **PASS**, 0 mismatches, 305/305 entries (100%) verified — 4,997,120 columns / 270,663,680 cells / 2,523,983 quads compared | `f102b490a42918c0` (was `1e664cf6680a137c`) |
+| `--radius 128` | **PASS**, 0 mismatches, 136/1089 entries (12.5%) verified, gate 0.202s | `1f88f5e0d405321d` (was `7602afe508d2ee73`) |
+
+Device: AMD Radeon RX 7800 XT.
+
+**Why default mode's digest DID move this time** — and why the respin-3
+reasoning above does not carry over. Respin 3 argued (correctly, for caves)
+that default mode voxelizes only a ~48-voxel surface shell well above any
+carved geometry, so its digest should not move. That argument is specific to
+*voxel* changes. `bedrockDepthMm` is a per-**column** field and the digest
+covers columns as well as cells and quads, so moving the bedrock band shifts
+the default digest regardless of which voxels get meshed. For a change of
+this shape, a default digest that did *not* move would be evidence the
+shader had not picked the change up at all.
+
+`python tools/lint-shader-ub.py` is clean on its own merits (5 rules,
+fail-closed); every `allow` annotation in the file carries a justification.
+`worldgen.hlsl` still contains zero `float`/`double`/`half`.
