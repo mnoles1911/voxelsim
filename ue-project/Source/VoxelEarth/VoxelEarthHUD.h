@@ -18,7 +18,74 @@ class VOXELEARTH_API AVoxelEarthHUD : public AHUD
 public:
 	virtual void DrawHUD() override;
 
+	// --- In-game debug overlay (usability task) -----------------------------
+	//
+	// A key-driven, navigable panel that flips the SAME voxel.Debug* / voxel.GI
+	// cvars the console does -- deliberately not a parallel debug system (see
+	// VoxelDebug.h). Default OFF and only ever shown by an explicit F1 press,
+	// so it cannot appear in a headless verification screenshot.
+	//
+	// AVoxelEarthPlayerController owns the key bindings and forwards to these;
+	// the state and the item table live here because everything they read is
+	// already what DrawHUD reads.
+	void ToggleDebugOverlay();
+	bool IsDebugOverlayVisible() const { return bOverlayVisible; }
+
+	// Up/Down: move the selection (Delta -1 / +1, wraps).
+	void MoveOverlaySelection(int32 Delta);
+	// Left/Right/Enter: change the selected row's value. Delta is -1 or +1;
+	// boolean rows ignore the sign and just flip.
+	void AdjustOverlaySelection(int32 Delta);
+
 private:
+	// --- Debug overlay ------------------------------------------------------
+
+	// Rows the selection can land on. Kept as an enum (not an index into a
+	// runtime array) so the switch in AdjustOverlaySelection is exhaustive and
+	// adding a row is a compile error until it is both drawn and handled.
+	enum class EOverlayRow : uint8
+	{
+		MovementMode = 0,
+		FlySpeed,
+		DebugMode,
+		ChunkStates,
+		Bounds,
+		Rings,
+		GlobalIllumination,
+		Wireframe,
+		Count
+	};
+
+	void DrawDebugOverlay();
+
+	// One "  Label .......... value" row, highlighted (and prefixed with '>')
+	// when it is the selected one. Advances InOutY by OverlayLineHeightPx.
+	void DrawOverlayRow(EOverlayRow Row, const FString& Label, const FString& Value, float PanelX, float& InOutY);
+
+	// Non-selectable status line inside the overlay panel.
+	void DrawOverlayInfo(const FString& Text, const FLinearColor& Color, float PanelX, float& InOutY);
+
+	class AVoxelEarthFlyPawn* GetVoxelPawn() const;
+
+	// Always-on, one line, bottom-right: "FLY 30 m/s" / "WALK". Suppressed
+	// under VoxelDebug::IsUnattendedFixtureRun() so no headless verification
+	// screenshot gains a pixel it did not have before this task.
+	void DrawModeLine();
+
+	bool bOverlayVisible = false;
+	EOverlayRow OverlaySelection = EOverlayRow::MovementMode;
+
+	// ShowFlag.Wireframe is write-only from here (there is no console read-back
+	// for a show flag), so the overlay tracks what it last set. Starts false,
+	// which is the engine default for a game viewport.
+	bool bWireframeRequested = false;
+
+	static constexpr float OverlayPanelWidthPx = 560.0f;
+	static constexpr float OverlayMarginPx = 12.0f;
+	static constexpr float OverlayLineHeightPx = 16.0f;
+	// Column x-offset (from the panel's left edge) where a row's value starts.
+	static constexpr float OverlayValueColumnPx = 300.0f;
+
 	// Small filled square at the screen center.
 	static constexpr float CrosshairHalfSizePx = 2.0f;
 

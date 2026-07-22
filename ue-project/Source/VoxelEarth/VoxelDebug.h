@@ -72,6 +72,87 @@ namespace VoxelDebug
 	// runs without needing -ExecCmds plumbing.
 	VOXELEARTH_API void SetRingsEnabled(bool bEnabled);
 
+	// --- In-game debug overlay support (AVoxelEarthHUD) ---------------------
+	//
+	// The overlay flips the SAME cvars the console does (nothing parallel):
+	// these are the ECVF_SetByCode setters matching IsChunkStatesEnabled /
+	// IsBoundsEnabled above, which SetRingsEnabled already had. Note the
+	// getters fold in the mode>=2 gate but these setters do NOT touch
+	// voxel.Debug -- the overlay shows and edits the mode as its own row.
+	VOXELEARTH_API void SetChunkStatesEnabled(bool bEnabled);
+	VOXELEARTH_API void SetBoundsEnabled(bool bEnabled);
+
+	// Raw cvar values, ignoring the mode>=2 gate the Is*Enabled getters apply.
+	// The overlay must show what the cvar is SET to (and let you flip it)
+	// independently of whether mode 2 is currently making it visible --
+	// otherwise every layer reads "off" at mode 1 and toggling looks broken.
+	VOXELEARTH_API bool GetChunkStatesCVar();
+	VOXELEARTH_API bool GetBoundsCVar();
+	VOXELEARTH_API bool GetRingsCVar();
+
+	// --- Tile-source status (overlay "real tiles vs synthetic sampler" row) --
+	//
+	// WHY A LOG SNIFFER. Which sampler the world actually booted on is decided
+	// in MakeTileSampler (VoxelWorldSubsystem.cpp) and survives only as the
+	// PRIVATE FVoxelWorldImpl::bUsingTileGrid -- UVoxelWorldSubsystem exposes
+	// no accessor, and this task must not edit that file. The one durable,
+	// already-shipped signal is the log line MakeTileSampler emits:
+	//
+	//   "Voxel tile grid: dir=%s loaded=%d rejected=%d seed=%llu scale=%d"
+	//
+	// so a tiny FOutputDevice registered at core init (VoxelDebug.cpp) parses
+	// exactly that line (plus the bounding-box line) and caches the numbers.
+	// This is deliberately a READ of an existing log line, not a second source
+	// of truth: if the format ever changes, bKnown simply goes false and the
+	// overlay says "unknown" rather than lying. Several hours were lost on this
+	// project to not knowing which sampler was live, which is why it is worth
+	// the ugliness.
+	struct FTileSourceStatus
+	{
+		// False until MakeTileSampler has logged (i.e. before the world
+		// subsystem initialises), or if the line was never seen at all.
+		bool bKnown = false;
+		// True only when the tile grid actually loaded >= 1 tile. A zero-loaded
+		// -VoxelTileDir falls back to the synthetic sampler in MakeTileSampler,
+		// and this mirrors that exact rule.
+		bool bUsingRealTiles = false;
+		int32 TilesLoaded = 0;
+		int32 TilesRejected = 0;
+		FString TileDir;
+		// From the "loaded tile coords bounding box x=[a,b] y=[c,d]" line;
+		// bBoxKnown is false when that line was not seen (e.g. zero tiles).
+		bool bBoxKnown = false;
+		int32 MinTileX = 0, MaxTileX = 0, MinTileY = 0, MaxTileY = 0;
+	};
+	VOXELEARTH_API FTileSourceStatus GetTileSourceStatus();
+
+	// Tile index / tile-pixel coords for a world position, so the overlay can
+	// answer "which diffusion tile am I standing in" -- the tiles on disk are
+	// named "<x>_<y>.vxtl" and this is the same floorDiv mapping
+	// vxc::TileGridSampler::findTile uses (tile = floorDiv(pixel, 512)), with
+	// the pixel size from -VoxelTileScale (30 m/px at scale 1, 11.25 m/px at
+	// scale 8 -- vxc::tilePixelSizeMm). Mirrored here as plain arithmetic
+	// rather than including voxel-core: this header is UHT-adjacent and
+	// voxel-core-free by doctrine (see the file header), and these are two
+	// stable format constants, not worldgen behaviour.
+	VOXELEARTH_API void WorldToTileCoords(double WorldXUU, double WorldYUU, int32& OutTileX, int32& OutTileY, int64& OutPixelX,
+	                                       int64& OutPixelY);
+
+	// -VoxelUndergroundVeil=0 (AVoxelClipmapActor::BeginPlay) disables the
+	// underground veil for the whole run. That actor keeps its live
+	// active/inactive state private, so the overlay reports this run-level
+	// switch -- read the same way, from the command line, at call time.
+	VOXELEARTH_API bool IsUndergroundVeilEnabledForRun();
+
+	// True for the headless verification fixtures, every one of which launches
+	// with -unattended (see ue-project/Tools/capture_terrain_shots.ps1 and the
+	// -VoxelScreenshotAfter/-VoxelVistaShot/-VoxelPerfRun recipes in
+	// docs/status.md). AVoxelEarthHUD suppresses its ALWAYS-ON additions (the
+	// walk/fly mode line) under this so nothing new can land in a verification
+	// screenshot; the overlay itself is default-off and key-driven, so it can
+	// never appear in one regardless.
+	VOXELEARTH_API bool IsUnattendedFixtureRun();
+
 	// Ring level debug tint colors (m2-plan.md item 4): R0 green .. R4
 	// magenta, indexed by VoxelCoords::kNumLevels. Clamped to a valid index.
 	VOXELEARTH_API FLinearColor RingLevelTint(int32 Level);
