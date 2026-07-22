@@ -77,6 +77,7 @@ public:
 
 private:
 	void ClearAllState();
+	void RunConvergenceHarness();
 	void MarkBrickNeighbourhoodDirty(const FIntVector& BrickCoord, int32 RadiusBricks);
 	void PushDirty(const FIntVector& Key);
 	FVector ResolveViewOriginUU() const;
@@ -112,6 +113,15 @@ private:
 	double LastEvictSeconds = 0.0;
 	double LastStatSeconds = 0.0;
 	int32 FramesSinceCoarseRebuild = 0;
+
+	// -VoxelGIConverge=<N> harness state (see RunConvergenceHarness).
+	int32 ConvergePasses = 0;
+	float ConvergeSettleSeconds = 40.f;
+	bool bConvergeLegacy = false;
+	bool bConvergeSeed = false;
+	int32 ConvergeSeedValue = 0;
+	bool bConvergeDone = false;
+	double FirstTickSeconds = 0.0;
 };
 
 // Free helpers so FVoxelChunkSceneProxy can consult GI policy without pulling
