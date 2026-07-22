@@ -517,7 +517,16 @@ double AVoxelClipmapActor::SpacingUUForLevel(int32 LevelIndex)
 	// R0-R4, extended outward): level L's hole then lands exactly on level
 	// L-1's outer edge, by construction (both scale with the same 1<<L
 	// factor), for every level.
-	static const double RingEdgeUU = UVoxelWorldSubsystem::RingPresets[VoxelCoords::kNumLevels - 1].OuterMeters * 100.0;
+	//
+	// Keyed off the OUTERMOST ACTIVE ring, not off kNumLevels-1: -VoxelMaxRingLevel
+	// can retire the outer rings at runtime, and if the hole stayed pinned to the
+	// compiled-in last preset it would sit outside where the voxels actually stop
+	// and open an annulus of missing world between the two systems. Reading the
+	// active edge keeps the two coverages adjacent at any cascade radius, which is
+	// also what makes a radius A/B a fair comparison rather than one side
+	// photographing a hole.
+	static const double RingEdgeUU =
+		UVoxelWorldSubsystem::RingPresets[UVoxelWorldSubsystem::GetMaxRingLevel()].OuterMeters * 100.0;
 	static const double Spacing0UU = RingEdgeUU / double(HoleHalfIndex);
 	return Spacing0UU * double(int64(1) << LevelIndex);
 }

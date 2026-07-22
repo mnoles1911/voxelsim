@@ -152,7 +152,24 @@ void AVoxelEarthGameMode::BeginPlay()
 		// M2 Band 3 first slice (docs/m2-plan.md): same "no authored map,
 		// spawn from code" reasoning -- the heightmap clipmap extends
 		// terrain from the ring cascade's edge (~1km) out to ~30km.
-		World->SpawnActor<AVoxelClipmapActor>();
+		//
+		// -VoxelNoClipmap suppresses it. This is the CONTROL for "is that
+		// distant terrain actually voxels?": the clipmap is a smooth triangle
+		// heightfield covering the same ground the outer voxel rings do, and in
+		// a screenshot the two are easy to confuse. With the clipmap absent,
+		// anything still drawn past the ring cascade's edge is voxel geometry by
+		// construction, and anything that becomes empty sky was clipmap. A
+		// command-line switch rather than a cvar, matching -VoxelPendingJobCap
+		// and friends: -ExecCmds cvars land after streaming has begun, and this
+		// one has to be decided before the actor is ever spawned.
+		if (!FParse::Param(FCommandLine::Get(), TEXT("VoxelNoClipmap")))
+		{
+			World->SpawnActor<AVoxelClipmapActor>();
+		}
+		else
+		{
+			UE_LOG(LogVoxelEarth, Warning, TEXT("Voxel clipmap: SUPPRESSED by -VoxelNoClipmap (far terrain is voxels only)"));
+		}
 
 		// M3 wave 1 (docs/m3-plan.md): the edit-log replication transport
 		// (AVoxelEditRelay), spawned by the GameMode on authority -- but only
@@ -1054,6 +1071,22 @@ void AVoxelEarthGameMode::BeginPlay()
 			}();
 			return Pitch;
 		}
+		// -VoxelVistaYaw=<degrees>. Yaw was previously pinned to the same 45 deg
+		// the default framing uses, which makes the vista shot unusable as
+		// evidence whenever the interesting terrain is not on that bearing --
+		// the spawn used for LOD verification looks out over open ocean at 45,
+		// so a cascade shot there photographs water no matter how far the
+		// voxels actually reach. Overridable so the camera can be aimed at land.
+		static float YawDegrees()
+		{
+			static const float Yaw = []
+			{
+				float Value = 45.f;
+				FParse::Value(FCommandLine::Get(), TEXT("VoxelVistaYaw="), Value);
+				return Value;
+			}();
+			return Yaw;
+		}
 	};
 
 	// Unattended visual verification: -VoxelScreenshotAfter=<seconds> waits
@@ -1315,7 +1348,7 @@ void AVoxelEarthGameMode::BeginPlay()
 						// first attempt produced a frame of nothing but fog, seen
 						// from inside the ground through back-face culling).
 						const float HeightUU = VoxelVistaShot::HeightMeters() * 100.f;
-						const FRotator Look(VoxelVistaShot::PitchDegrees(), 45.f, 0.f);
+						const FRotator Look(VoxelVistaShot::PitchDegrees(), VoxelVistaShot::YawDegrees(), 0.f);
 						if (APawn* P = PC->GetPawn())
 						{
 							FVector Loc = P->GetActorLocation();

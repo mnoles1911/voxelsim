@@ -219,7 +219,18 @@ class FJobColumnGridCache
 public:
 	using GeneratedWorldT = vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>;
 
-	FJobColumnGridCache(const GeneratedWorldT& InGen, vxc::Counters* InPerfCounters) : Gen(InGen), PerfCounters(InPerfCounters) {}
+	// CoarseLevel == 0 is the historical behaviour (level-0 column grids for the
+	// mip recursion's level-0 source). CoarseLevel > 0 makes this a cache of
+	// COARSE column grids at that level (vxc::GeneratedWorld::coarseColumns),
+	// which is what MakeCoarseLevelSampler needs -- same B*B amplifier column
+	// evaluations per miss at ANY level, which is the whole point of the coarse
+	// path. voxel-core guarantees coarseColumns(0,...) == columns(...)
+	// bit-identically, but the branch is kept explicit so the level-0 mip source
+	// provably takes the exact same call it always did.
+	FJobColumnGridCache(const GeneratedWorldT& InGen, vxc::Counters* InPerfCounters, int32 InCoarseLevel = 0)
+		: Gen(InGen), PerfCounters(InPerfCounters), CoarseLevel(InCoarseLevel)
+	{
+	}
 
 	const GeneratedWorldT::ColumnGrid& Get(int32 Bx, int32 By)
 	{
@@ -241,7 +252,8 @@ public:
 		{
 			PerfCounters->incColumnEvals(uint64_t(VoxelCoords::BrickEdgeVoxels) * VoxelCoords::BrickEdgeVoxels);
 		}
-		GeneratedWorldT::ColumnGrid& NewGrid = Grids.Add(PackedKey, Gen.columns(Bx, By));
+		GeneratedWorldT::ColumnGrid& NewGrid =
+			Grids.Add(PackedKey, CoarseLevel == 0 ? Gen.columns(Bx, By) : Gen.coarseColumns(CoarseLevel, Bx, By));
 		RecencyOrder.Add(PackedKey);
 		return NewGrid;
 	}
@@ -266,6 +278,7 @@ private:
 	static constexpr int32 kMaxEntries = 64;
 	const GeneratedWorldT& Gen;
 	vxc::Counters* PerfCounters;
+	int32 CoarseLevel = 0;
 	TMap<uint64, GeneratedWorldT::ColumnGrid> Grids;
 	TArray<uint64> RecencyOrder;
 };
@@ -661,6 +674,83 @@ std::function<vxc::MaterialId(int64, int64, int64)> MakeLevelSampler(const vxc::
 		const int Ly = int(floorMod(Y, B));
 		const int Lz = int(floorMod(Z, B));
 		return B0->get(Lx, Ly, Lz);
+	};
+}
+
+// Direct COARSE level-L sampler -- the reason distant rings can exist at all.
+//
+// MakeLevelSampler above is correct but its cost is structural: a level-L brick
+// is folded from 8^L level-0 bricks, so it scales 8x per level. Measured on this
+// box (60s flight, real diffusion tiles, seed 20260719, before this function
+// existed): R0 p50 1.32ms, R1 2.44ms, R2 23.88ms, R3 1543ms, R4 15901ms. At R4 a
+// single chunk holds a worker slot for SIXTEEN SECONDS, so R3/R4 reported
+// loaded=0 at every 5s sample of the whole flight -- the nominal 1024m cascade
+// actually terminated near 250m (the admission cutoff collapsed to ~200m under
+// the resulting queue backlog) and everything beyond was clipmap. That is the
+// "low poly vista".
+//
+// vxc::GeneratedWorld::makeCoarseBrick/coarseColumns (voxelcore/generator.h)
+// generate a level-L brick DIRECTLY: coarseColumns does B*B amplifier column
+// evaluations and makeCoarseBrick does B^3 materialAt calls, at ANY level. So a
+// level-L chunk costs what a level-0 chunk costs, independent of L. That is what
+// makes rings past R2 viable.
+//
+// Semantics differ deliberately and this is not a bug: coarse is nearest-
+// neighbour sampling of the generator at the coarse cell centre, mip is a
+// majority vote over children (generator.h documents them as separate paths with
+// separate goldens; coarse != downsample in general). For distant LOD the coarse
+// rule is arguably the better one -- it tracks the true surface instead of
+// eroding thin features through repeated majority votes.
+//
+// No FSharedMipCache here, on purpose. That cache's key is (level, BrickKey) and
+// its documented contract is "vxc::downsampleBricks output"; a coarse brick is a
+// DIFFERENT function of the same key, so sharing the cache would mix two rules
+// under one key. Coarse bricks are cheap enough not to need cross-job caching --
+// the job-local map below is sufficient. Worker path only (pure GeneratedWorld,
+// never World's overlay), same lock-free rule as MakeLevelSampler.
+std::function<vxc::MaterialId(int64, int64, int64)> MakeCoarseLevelSampler(const vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>& Gen,
+                                                                             int32 Level, vxc::Counters* PerfCounters)
+{
+	using namespace vxc;
+	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
+
+	struct FJobCoarseState
+	{
+		FJobCoarseState(const GeneratedWorld<B>& InGen, Counters* InPerfCounters, int32 InLevel)
+			: ColumnCache(InGen, InPerfCounters, InLevel), Gen(InGen), Level(InLevel)
+		{
+		}
+
+		const Brick<B>* Brick(const BrickKey& Key)
+		{
+			auto Found = Bricks.find(Key);
+			if (Found != Bricks.end())
+			{
+				return &Found->second;
+			}
+			const auto& Grid = ColumnCache.Get(Key.x, Key.y);
+			auto [It, Inserted] = Bricks.emplace(Key, Gen.makeCoarseBrick(Level, Key, Grid));
+			(void)Inserted;
+			return &It->second;
+		}
+
+		FJobColumnGridCache ColumnCache;
+		const GeneratedWorld<B>& Gen;
+		int32 Level;
+		std::unordered_map<BrickKey, vxc::Brick<B>, BrickKeyHash> Bricks;
+	};
+
+	TSharedPtr<FJobCoarseState> State = MakeShared<FJobCoarseState>(Gen, PerfCounters, Level);
+
+	return [State](int64 X, int64 Y, int64 Z) -> MaterialId
+	{
+		const BrickKey BKey{int32_t(floorDiv(X, B)), int32_t(floorDiv(Y, B)), int32_t(floorDiv(Z, B))};
+		const vxc::Brick<B>* Br = State->Brick(BKey);
+		if (!Br)
+		{
+			return MAT_AIR;
+		}
+		return Br->get(int(floorMod(X, B)), int(floorMod(Y, B)), int(floorMod(Z, B)));
 	};
 }
 
@@ -1322,6 +1412,32 @@ int32 GetPendingJobCap()
 	return Cap;
 }
 
+// Lowest chunk level that generates via the DIRECT COARSE path
+// (MakeCoarseLevelSampler / vxc::GeneratedWorld::makeCoarseBrick) instead of the
+// 8^L mip recursion (MakeLevelSampler). Levels below this keep the mip path;
+// level 0 always has its own dedicated path and is unaffected either way.
+//
+// Default 1 = every mip level goes coarse, because the mip recursion's cost is
+// what capped the effective voxel radius at ~250m (see MakeCoarseLevelSampler's
+// comment for the measured per-level numbers). `-VoxelCoarseMinLevel=99`
+// disables the coarse path entirely and restores the pre-change mip behaviour,
+// which is how the A/B for this change is measured.
+//
+// Command-line, not a cvar, for the reason documented on -VoxelPendingJobCap
+// above: -ExecCmds lands after streaming has already begun.
+constexpr int32 kDefaultCoarseMinLevel = 1;
+
+int32 GetCoarseMinLevel()
+{
+	static const int32 MinLevel = []
+	{
+		int32 Value = kDefaultCoarseMinLevel;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelCoarseMinLevel="), Value);
+		return FMath::Max(1, Value); // level 0 has its own path; never route it here
+	}();
+	return MinLevel;
+}
+
 // docs/status.md "Buried-chunk pre-dispatch skip", step 1 (measure before
 // changing anything). Turns on the per-level zero-quad census in the worker
 // job: every job additionally classifies its chunk as all-air / all-solid /
@@ -1486,7 +1602,14 @@ bool GetRingQuotaEnabled()
 // itself -- whole-run throughput collapsed from 49,179 chunks to 558 (819 -> 9.3
 // chunks/s) and R0 residency from ~3,000 to ~10. The floors below cost at most 4
 // of 24 slots and are the largest that did not measurably move the near field.
-constexpr int32 kRingSlotFloorDefault[VoxelCoords::kNumLevels] = {0, 1, 1, 1, 1};
+// R5 gets the same floor of 1 as every other coarse ring. The measured
+// catastrophe above came from LONG jobs monopolising the ~12 real background
+// threads; since the coarse path made per-chunk cost flat in level (~4 ms at R5
+// exactly as at R1), an R5 slot is now no more expensive to reserve than an R1
+// one, so the "at most 4 of 24 slots" reasoning extends unchanged to 5 of 24.
+constexpr int32 kRingSlotFloorDefault[VoxelCoords::kNumLevels] = {0, 1, 1, 1, 1, 1};
+static_assert(UE_ARRAY_COUNT(kRingSlotFloorDefault) == VoxelCoords::kNumLevels,
+              "kRingSlotFloorDefault must have one entry per level (a short list zero-fills silently, starving the tail rings)");
 
 // Overridable for tuning/measurement: `-VoxelRingFloors=0,1,1,1,1`.
 const int32* GetRingSlotFloors()
@@ -1516,7 +1639,29 @@ const int32* GetRingSlotFloors()
 // produces and drains the most), but every ring is guaranteed a share it cannot
 // be crowded out of, which is the whole point: with one shared cap R0+R1 filled
 // it inside 246 m and R3/R4 never got a record.
-constexpr double kRingCapShare[VoxelCoords::kNumLevels] = {0.30, 0.20, 0.20, 0.15, 0.15};
+// R5 (1024-2048 m) takes a share out of the existing ones rather than being
+// bolted on. The ring geometry makes this cheap to reason about: every annulus
+// is sized so its COLUMN count is roughly equal (the chunk edge doubles per
+// level at the same time the annulus area quadruples), so rings want broadly
+// similar shares, and R0 keeps the largest only because of its churn.
+//
+// A short list here does not merely mistune -- it breaks. A 0.0 share rounds to
+// a LevelCap of 1 via the Max(1,...) below, so the ring holds one queued chunk,
+// permanently re-arms bAdmissionDeferredWork, and spins the recompute every tick
+// while never streaming.
+constexpr double kRingCapShare[VoxelCoords::kNumLevels] = {0.25, 0.18, 0.17, 0.15, 0.13, 0.12};
+static_assert(UE_ARRAY_COUNT(kRingCapShare) == VoxelCoords::kNumLevels, "kRingCapShare must have one entry per level");
+
+constexpr double SumRingCapShare()
+{
+	double Sum = 0.0;
+	for (double Share : kRingCapShare)
+	{
+		Sum += Share;
+	}
+	return Sum;
+}
+static_assert(SumRingCapShare() > 0.999 && SumRingCapShare() < 1.001, "kRingCapShare must sum to 1.0");
 } // namespace VoxelStreamAdmission
 
 // --- sky band: never mesh chunks that are provably above the terrain ---------
@@ -1573,6 +1718,12 @@ constexpr int64 kMaxDetailMm = kDetailAmplitudeSumMm * kMaxSlopeScaleQ10 / 1024;
 // footprint) a 30 mm-class pixel needs 4x4 and the 11.25 m scale-8 pixel 6x6;
 // anything past this means an unexpected pixel size, and the bound is simply
 // declined (INT64_MAX) rather than made expensive.
+//
+// Level 5 (102.4 m + 6.4 m apron = 108.8 m) needs ~6x6 at 30 m and ~12x12 at
+// 11.25 m, so the 2 km cascade stays inside this cap and the bound is still
+// computed at every level in use. See the matching note on
+// vxc::kSurfaceBoundMaxCornersPerAxis for why a looser bound at a bigger
+// footprint is the safe direction, and why level 6 would start declining.
 constexpr int64 kMaxPixelCornersPerAxis = 16;
 
 // -VoxelSkyTrim=0: restore ComputeFootprintChunkZRange's unconditional
@@ -1618,6 +1769,56 @@ bool GetVerifyEnabled()
 // owns ALL Stage 2 streaming state (chunk records, pending-work queues, the
 // worker-result MPSC queue, in-flight task handles): none of it is
 // UE-reflection-visible, so it belongs behind the same PImpl boundary.
+// Per-level diagnostic fields are built by LOOP rather than written out as
+// R0=... R1=... literals. The hand-listed form was load-bearing in the worst
+// way: it compiled fine when kNumLevels grew but silently omitted every level
+// past R4 from every diagnostic -- precisely when a newly added outer ring is
+// the thing you most need to see. Joins one formatted field per level with " | ".
+// Highest ring level that participates in streaming, i.e. where the voxel
+// cascade ends. kNumLevels-1 (the default) is the full cascade; a lower value
+// retires the outer rings at runtime.
+//
+// This exists so the cascade radius is an A/B-able knob on ONE binary rather
+// than a recompile: -VoxelMaxRingLevel=4 gives the 1024 m cascade and =5 the
+// 2048 m one, interleaved, which is the only honest way to attribute a frame-time
+// delta to the extra ring rather than to run-to-run drift. It is also the
+// mechanism for shipping the largest radius that actually holds the budget.
+//
+// Retiring a level here suppresses only its ENTRY scan (nothing new is admitted
+// at that level). The exit scan is left completely alone on purpose: any chunk
+// already tracked at a retired level must still be able to leave by the normal
+// hysteresis path, and teaching the exit scan about this switch would mean
+// stranding resident chunks the moment it changed.
+//
+// Command-line rather than cvar, per the -VoxelPendingJobCap precedent: it has
+// to be known before the first RecomputeDesiredSet and before the clipmap sizes
+// its inner hole against it.
+int32 UVoxelWorldSubsystem::GetMaxRingLevel()
+{
+	static const int32 MaxLevel = []
+	{
+		int32 Value = VoxelCoords::kNumLevels - 1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelMaxRingLevel="), Value);
+		return FMath::Clamp(Value, 0, VoxelCoords::kNumLevels - 1);
+	}();
+	return MaxLevel;
+}
+
+template <typename FormatOneLevelFn>
+static FString JoinPerLevel(FormatOneLevelFn&& FormatOneLevel)
+{
+	FString Out;
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+	{
+		if (Level > 0)
+		{
+			Out += TEXT(" | ");
+		}
+		Out += FormatOneLevel(Level);
+	}
+	return Out;
+}
+
 struct FVoxelWorldImpl
 {
 	// Track B2: TileDir/TileScale select the tile source (see MakeTileSampler
@@ -1639,6 +1840,16 @@ struct FVoxelWorldImpl
 			// bUsingTileGrid being true is exactly MakeTileSampler's own
 			// guarantee that Tiles.get() really does point at a TileGridSampler.
 			GridTiles = static_cast<vxc::TileGridSampler*>(Tiles.get());
+		}
+
+		// "Admit everything at this level" sentinel. Set by loop rather than by a
+		// braced initializer on the member, because a braced list that falls
+		// short of kNumLevels zero-fills its tail -- and 0.0 here is not a
+		// permissive cutoff but an absolute one that rejects every candidate at
+		// those levels, forever, silently. See the member's doc comment.
+		for (double& Cutoff : LevelAdmissionCutoffDistSq)
+		{
+			Cutoff = DBL_MAX;
 		}
 
 		// Fixed-size ring buffer (docs/debug-tooling-plan.md P1 "Worker
@@ -1976,7 +2187,16 @@ struct FVoxelWorldImpl
 	// and R4 never admitted a single chunk. With the quota off, every entry here
 	// holds the same global value and the behaviour is exactly the old one.
 	// DBL_MAX = that level's queue is not full, admit everything in its annulus.
-	double LevelAdmissionCutoffDistSq[VoxelCoords::kNumLevels] = {DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX};
+	//
+	// Filled by loop, NOT by a literal list, and that is deliberate. The sentinel
+	// here means "admit everything", so a hand-written list that falls short of
+	// kNumLevels zero-fills the tail to 0.0 -- which is not a lax cutoff but the
+	// strictest possible one, rejecting every candidate at those levels forever.
+	// It is the single most dangerous of the per-level tables and the one least
+	// likely to be noticed, because the symptom is a ring that silently never
+	// streams rather than any error.
+	// (set to the DBL_MAX sentinel by loop in FVoxelWorldImpl's constructor)
+	double LevelAdmissionCutoffDistSq[VoxelCoords::kNumLevels] = {};
 
 	// Worker jobs currently in flight per ring level. JobsInFlightCounter is the
 	// total (and must stay atomic -- workers decrement it); this breakdown is
@@ -2751,11 +2971,10 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		// widened into that format string so the existing line stays greppable.
 		UE_LOG(LogVoxelPerf, Warning,
 		       TEXT("Hitch frame recompute: recomputeMs=%.2f exitScanMs=%.2f sortMs=%.2f | ")
-		       TEXT("entryMs R0=%.2f R1=%.2f R2=%.2f R3=%.2f R4=%.2f | ")
-		       TEXT("footprints R0=%d R1=%d R2=%d R3=%d R4=%d | tracked=%d"),
-		       ThisFrameRecomputeMs, ThisFrameExitScanMs, ThisFrameSortMs, ThisFrameLevelEntryMs[0], ThisFrameLevelEntryMs[1],
-		       ThisFrameLevelEntryMs[2], ThisFrameLevelEntryMs[3], ThisFrameLevelEntryMs[4], ThisFrameLevelFootprints[0],
-		       ThisFrameLevelFootprints[1], ThisFrameLevelFootprints[2], ThisFrameLevelFootprints[3], ThisFrameLevelFootprints[4],
+		       TEXT("entryMs %s | footprints %s | tracked=%d"),
+		       ThisFrameRecomputeMs, ThisFrameExitScanMs, ThisFrameSortMs,
+		       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%.2f"), L, ThisFrameLevelEntryMs[L]); }),
+		       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%d"), L, ThisFrameLevelFootprints[L]); }),
 		       ChunkRecords.Num());
 	}
 
@@ -2868,50 +3087,37 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	{
 		++LevelPending[FMath::Clamp(K.Level, 0, VoxelCoords::kNumLevels - 1)];
 	}
-	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel rings: R0 loaded=%d pending=%d | R1 loaded=%d pending=%d | R2 loaded=%d pending=%d | ")
-	                          TEXT("R3 loaded=%d pending=%d | R4 loaded=%d pending=%d"),
-	       LevelLoaded[0], LevelPending[0], LevelLoaded[1], LevelPending[1], LevelLoaded[2], LevelPending[2], LevelLoaded[3],
-	       LevelPending[3], LevelLoaded[4], LevelPending[4]);
+	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel rings: %s"), *JoinPerLevel([&](int32 L)
+	       { return FString::Printf(TEXT("R%d loaded=%d pending=%d"), L, LevelLoaded[L], LevelPending[L]); }));
 
 	// R2-R4 ring starvation wave: the dispatch side of the same picture. Read
 	// with the line above, "loaded=0 pending=4000 dispatched=0" (starved: no
 	// worker ever ran) is now distinguishable from "loaded=0 dispatched=4000
 	// zeroQuad=4000" (served, but every chunk was buried rock). disp= is this
 	// 5s window, total= and load= are cumulative over the whole run.
-	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel ring dispatch: R0 disp=%lld total=%lld load=%lld zq=%lld | R1 disp=%lld total=%lld load=%lld zq=%lld | ")
-	       TEXT("R2 disp=%lld total=%lld load=%lld zq=%lld | R3 disp=%lld total=%lld load=%lld zq=%lld | ")
-	       TEXT("R4 disp=%lld total=%lld load=%lld zq=%lld"),
-	       (long long)LevelJobsDispatchedSinceLog[0], (long long)LevelJobsDispatchedTotal[0],
-	       (long long)LevelChunksLoadedTotal[0], (long long)LevelZeroQuadTotal[0],
-	       (long long)LevelJobsDispatchedSinceLog[1], (long long)LevelJobsDispatchedTotal[1],
-	       (long long)LevelChunksLoadedTotal[1], (long long)LevelZeroQuadTotal[1],
-	       (long long)LevelJobsDispatchedSinceLog[2], (long long)LevelJobsDispatchedTotal[2],
-	       (long long)LevelChunksLoadedTotal[2], (long long)LevelZeroQuadTotal[2],
-	       (long long)LevelJobsDispatchedSinceLog[3], (long long)LevelJobsDispatchedTotal[3],
-	       (long long)LevelChunksLoadedTotal[3], (long long)LevelZeroQuadTotal[3],
-	       (long long)LevelJobsDispatchedSinceLog[4], (long long)LevelJobsDispatchedTotal[4],
-	       (long long)LevelChunksLoadedTotal[4], (long long)LevelZeroQuadTotal[4]);
+	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel ring dispatch: %s"), *JoinPerLevel([&](int32 L)
+	       {
+		       return FString::Printf(TEXT("R%d disp=%lld total=%lld load=%lld zq=%lld"), L,
+		                              (long long)LevelJobsDispatchedSinceLog[L], (long long)LevelJobsDispatchedTotal[L],
+		                              (long long)LevelChunksLoadedTotal[L], (long long)LevelZeroQuadTotal[L]);
+	       }));
 
 	// Sky-band skip: chunks proven all-air and never dispatched, per ring. Read
 	// against the zq= counts on the line above -- skip= is work that no longer
 	// happens at all, zq= is work that still happened and produced nothing.
-	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel sky skip: R0 skip=%lld | R1 skip=%lld | R2 skip=%lld | R3 skip=%lld | R4 skip=%lld%s"),
-	       (long long)LevelSkySkippedTotal[0], (long long)LevelSkySkippedTotal[1], (long long)LevelSkySkippedTotal[2],
-	       (long long)LevelSkySkippedTotal[3], (long long)LevelSkySkippedTotal[4],
+	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel sky skip: %s%s"),
+	       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d skip=%lld"), L, (long long)LevelSkySkippedTotal[L]); }),
 	       VoxelSkyBand::GetVerifyEnabled() ? TEXT(" [VERIFY MODE: verdicts computed, jobs dispatched anyway]") : TEXT(""));
 	if (VoxelSkyBand::GetVerifyEnabled())
 	{
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("VoxelVerifySkyBand: results checked=%lld predicted-all-air=%lld VIOLATIONS=%lld | ")
-		       TEXT("R0 %lld/%lld | R1 %lld/%lld | R2 %lld/%lld | R3 %lld/%lld | R4 %lld/%lld (predicted/checked)"),
+		       TEXT("VoxelVerifySkyBand: results checked=%lld predicted-all-air=%lld VIOLATIONS=%lld | %s (predicted/checked)"),
 		       (long long)VerifyChunksChecked, (long long)VerifyAirPredictions, (long long)VerifyAirViolations,
-		       (long long)VerifyAirPredictionsByLevel[0], (long long)VerifyResultsByLevel[0],
-		       (long long)VerifyAirPredictionsByLevel[1], (long long)VerifyResultsByLevel[1],
-		       (long long)VerifyAirPredictionsByLevel[2], (long long)VerifyResultsByLevel[2],
-		       (long long)VerifyAirPredictionsByLevel[3], (long long)VerifyResultsByLevel[3],
-		       (long long)VerifyAirPredictionsByLevel[4], (long long)VerifyResultsByLevel[4]);
+		       *JoinPerLevel([&](int32 L)
+		       {
+			       return FString::Printf(TEXT("R%d %lld/%lld"), L, (long long)VerifyAirPredictionsByLevel[L],
+			                              (long long)VerifyResultsByLevel[L]);
+		       }));
 	}
 	for (int64& V : LevelJobsDispatchedSinceLog)
 	{
@@ -2925,13 +3131,10 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// evidence for the "report worker p50/p95 per level" measurement (a
 	// -VoxelPerfRun run has no HUD to screenshot).
 	const FVoxelPerfSnapshot& Snap = LastPerfSnapshot;
-	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel worker ms/level: R0 p50=%.2f p95=%.2f | R1 p50=%.2f p95=%.2f | R2 p50=%.2f p95=%.2f | ")
-	       TEXT("R3 p50=%.2f p95=%.2f | R4 p50=%.2f p95=%.2f | mipCache bricks=%lld bytes=%lld evictions=%lld"),
-	       Snap.LevelWorkerMsP50[0], Snap.LevelWorkerMsP95[0], Snap.LevelWorkerMsP50[1], Snap.LevelWorkerMsP95[1],
-	       Snap.LevelWorkerMsP50[2], Snap.LevelWorkerMsP95[2], Snap.LevelWorkerMsP50[3], Snap.LevelWorkerMsP95[3],
-	       Snap.LevelWorkerMsP50[4], Snap.LevelWorkerMsP95[4], (long long)Snap.MipCacheBrickCount, (long long)Snap.MipCacheBytes,
-	       (long long)Snap.MipCacheEvictions);
+	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel worker ms/level: %s | mipCache bricks=%lld bytes=%lld evictions=%lld"),
+	       *JoinPerLevel([&](int32 L)
+	       { return FString::Printf(TEXT("R%d p50=%.2f p95=%.2f"), L, Snap.LevelWorkerMsP50[L], Snap.LevelWorkerMsP95[L]); }),
+	       (long long)Snap.MipCacheBrickCount, (long long)Snap.MipCacheBytes, (long long)Snap.MipCacheEvictions);
 
 	// M1 steady-state-hitch wave: worst RecomputeDesiredSet cost seen since the
 	// last periodic log, per level. Independent of the hitch log (a burst that
@@ -2939,11 +3142,12 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// is what quantifies "what does R3/R4 recompute cost when it fires".
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel recompute (max since last log): totalMs=%.2f exitScanMs=%.2f sortMs=%.2f calls=%d | ")
-	       TEXT("entryMs R0=%.2f R1=%.2f R2=%.2f R3=%.2f R4=%.2f | scans R0=%d R1=%d R2=%d R3=%d R4=%d | ")
+	       TEXT("entryMs %s | scans %s | ")
 	       TEXT("tracked=%d pendingJob=%d pendingGT=%d pendingUnload=%d | framesOver16.6ms=%d (total %lld)"),
-	       MaxRecomputeMs, MaxExitScanMs, MaxSortMs, RecomputeCalls, MaxLevelEntryMs[0], MaxLevelEntryMs[1], MaxLevelEntryMs[2],
-	       MaxLevelEntryMs[3], MaxLevelEntryMs[4], LevelEntryScans[0], LevelEntryScans[1], LevelEntryScans[2], LevelEntryScans[3],
-	       LevelEntryScans[4], ChunkRecords.Num(), PendingJobNum(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num(),
+	       MaxRecomputeMs, MaxExitScanMs, MaxSortMs, RecomputeCalls,
+	       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%.2f"), L, MaxLevelEntryMs[L]); }),
+	       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%d"), L, LevelEntryScans[L]); }),
+	       ChunkRecords.Num(), PendingJobNum(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num(),
 	       FramesOver60FpsBarSinceLog, (long long)TotalFramesOver60FpsBar);
 	// Streaming pipeline re-measure (docs/status.md "Streaming pipeline
 	// re-measure + rework"): the two questions the existing logs could not
@@ -3291,7 +3495,10 @@ static constexpr int32 BoxRadiusChunksL1 = 0; // whole ring (fraction is always 
 // them (8 -> 9) so that a player moving HORIZONTALLY between bands does not
 // thrash chunks in and out; surfacing still evicts the whole box, because the
 // anchor's Z leaves the keep window entirely.
-static constexpr int32 KeepChunks[VoxelCoords::kNumLevels] = {9, 2, 0, 0, 0};
+// Levels 2+ get no deep box at all (BoxRadiusChunks returns false for them), so
+// their entry here is unused and 0 is the correct value for R5 as well.
+static constexpr int32 KeepChunks[VoxelCoords::kNumLevels] = {9, 2, 0, 0, 0, 0};
+static_assert(UE_ARRAY_COUNT(KeepChunks) == VoxelCoords::kNumLevels, "KeepChunks must have one entry per level");
 
 // Vertical keep-distance in UU for a deep chunk of this level, used by the
 // exit scan. Level 0 derives it from the sight sphere rather than from the
@@ -4064,8 +4271,16 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 
 	int32 ScratchBoxRadius = 0; // BoxRadiusChunks out-param, used only for its bool return in the level gate
 
+	const int32 MaxRingLevel = UVoxelWorldSubsystem::GetMaxRingLevel();
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
+		if (Level > MaxRingLevel)
+		{
+			// Cascade ends below this level this run (-VoxelMaxRingLevel). Entry
+			// only -- see GetMaxRingLevel: the exit scan above still runs for
+			// every level so nothing already resident can be stranded.
+			continue;
+		}
 		const double LevelT0 = FPlatformTime::Seconds();
 		const FVoxelCoord AnchorVoxel = WorldToVoxelForLevel(Anchor, Level);
 		const FVoxelChunkKey AnchorChunk = ChunkKeyForVoxel(AnchorVoxel);
@@ -4853,8 +5068,19 @@ void FVoxelWorldImpl::DispatchJobs()
 					// specifically BECAUSE it is not a known edited-ancestor
 					// chunk (NeedsOverlayAwarePath / EditedAncestorChunks, M2
 					// wave 2 item 2), so a pure-generated mesh is correct here.
+					//
+					// ...unless this level is at or above the coarse threshold,
+					// in which case the brick comes straight out of
+					// GeneratedWorld::makeCoarseBrick at O(1) per level instead
+					// of folding 8^L level-0 bricks. Both samplers are pure
+					// GeneratedWorld and satisfy the same
+					// [-1,B]^3-across-borders contract MeshChunkBricks wants, so
+					// this is a straight substitution of the brick RULE, nothing
+					// else in the job changes.
 					const auto LevelSampler =
-						MakeLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot);
+						(LevelKey.Level >= VoxelStreamAdmission::GetCoarseMinLevel())
+							? MakeCoarseLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr)
+							: MakeLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot);
 					MeshChunkBricks(Key, LevelSampler, Result.Quads, PerfCountersPtr);
 					if (bMeasureEmpty && Result.Quads.Num() == 0)
 					{

@@ -331,7 +331,10 @@ FLinearColor VoxelDebug::RingLevelTint(int32 Level)
 		FLinearColor(1.0f, 0.55f, 0.05f, 1.0f), // R2 orange
 		FLinearColor(0.9f, 0.1f, 0.1f, 1.0f),   // R3 red
 		FLinearColor(0.85f, 0.1f, 0.85f, 1.0f), // R4 magenta
+		FLinearColor(0.25f, 0.5f, 1.0f, 1.0f),  // R5 blue (2 km cascade edge)
 	};
+	static_assert(UE_ARRAY_COUNT(kTints) == VoxelCoords::kNumLevels,
+	              "kTints must have one entry per level (a short list yields invisible transparent-black debug rings)");
 	return kTints[FMath::Clamp(Level, 0, VoxelCoords::kNumLevels - 1)];
 }
 
