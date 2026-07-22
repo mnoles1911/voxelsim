@@ -1519,6 +1519,19 @@ struct FVoxelWorldImpl
 	double AccumTickMs = 0.0;
 	int32 AccumTicks = 0;
 	int64 JobsDispatchedSinceLog = 0;   // DispatchJobs: worker jobs actually launched
+	// R2-R4 ring starvation wave: the per-ring question the logs could not
+	// answer. "Voxel rings" reports per-level RESIDENCY and QUEUE DEPTH, which
+	// cannot distinguish "this ring is queued and dispatching but every result
+	// is buried rock meshing to zero quads" from "this ring never gets a worker
+	// at all" -- both read as loaded=0 with thousands pending. These are the
+	// dispatch side: jobs launched per level, and of those, results that came
+	// back with zero quads. Cumulative counters (never reset) alongside the
+	// since-log ones, so a run's total per-ring dispatch is readable from the
+	// final log line alone.
+	int64 LevelJobsDispatchedSinceLog[VoxelCoords::kNumLevels] = {};
+	int64 LevelJobsDispatchedTotal[VoxelCoords::kNumLevels] = {};
+	int64 LevelZeroQuadTotal[VoxelCoords::kNumLevels] = {};
+	int64 LevelChunksLoadedTotal[VoxelCoords::kNumLevels] = {}; // component creations per level, cumulative
 	int64 ResultsDrainedSinceLog = 0;   // DrainResults: results dequeued (live + stale)
 	int64 StaleDiscardsSinceLog = 0;    // ...of which discarded (record gone / superseded)
 	int64 ZeroQuadAppliesSinceLog = 0;  // ...of which meshed to zero quads (buried: real work, no component)
@@ -2064,6 +2077,30 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	                          TEXT("R3 loaded=%d pending=%d | R4 loaded=%d pending=%d"),
 	       LevelLoaded[0], LevelPending[0], LevelLoaded[1], LevelPending[1], LevelLoaded[2], LevelPending[2], LevelLoaded[3],
 	       LevelPending[3], LevelLoaded[4], LevelPending[4]);
+
+	// R2-R4 ring starvation wave: the dispatch side of the same picture. Read
+	// with the line above, "loaded=0 pending=4000 dispatched=0" (starved: no
+	// worker ever ran) is now distinguishable from "loaded=0 dispatched=4000
+	// zeroQuad=4000" (served, but every chunk was buried rock). disp= is this
+	// 5s window, total= and load= are cumulative over the whole run.
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel ring dispatch: R0 disp=%lld total=%lld load=%lld zq=%lld | R1 disp=%lld total=%lld load=%lld zq=%lld | ")
+	       TEXT("R2 disp=%lld total=%lld load=%lld zq=%lld | R3 disp=%lld total=%lld load=%lld zq=%lld | ")
+	       TEXT("R4 disp=%lld total=%lld load=%lld zq=%lld"),
+	       (long long)LevelJobsDispatchedSinceLog[0], (long long)LevelJobsDispatchedTotal[0],
+	       (long long)LevelChunksLoadedTotal[0], (long long)LevelZeroQuadTotal[0],
+	       (long long)LevelJobsDispatchedSinceLog[1], (long long)LevelJobsDispatchedTotal[1],
+	       (long long)LevelChunksLoadedTotal[1], (long long)LevelZeroQuadTotal[1],
+	       (long long)LevelJobsDispatchedSinceLog[2], (long long)LevelJobsDispatchedTotal[2],
+	       (long long)LevelChunksLoadedTotal[2], (long long)LevelZeroQuadTotal[2],
+	       (long long)LevelJobsDispatchedSinceLog[3], (long long)LevelJobsDispatchedTotal[3],
+	       (long long)LevelChunksLoadedTotal[3], (long long)LevelZeroQuadTotal[3],
+	       (long long)LevelJobsDispatchedSinceLog[4], (long long)LevelJobsDispatchedTotal[4],
+	       (long long)LevelChunksLoadedTotal[4], (long long)LevelZeroQuadTotal[4]);
+	for (int64& V : LevelJobsDispatchedSinceLog)
+	{
+		V = 0;
+	}
 
 	// M2 wave 2 item 1 ("Cross-job mip caching"): per-level worker mesh-job
 	// ms (rolling-window p50/p95, LastPerfSnapshot -- refreshed at 1Hz
@@ -2946,6 +2983,11 @@ void FVoxelWorldImpl::DispatchJobs()
 		Rec->bJobInFlight = true;
 		JobsInFlightCounter.Increment();
 		++JobsDispatchedSinceLog;
+		{
+			const int32 L = FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1);
+			++LevelJobsDispatchedSinceLog[L];
+			++LevelJobsDispatchedTotal[L];
+		}
 
 		const uint64 GenId = Rec->GenerationId;
 		// Worker threading (decisions table): the job touches ONLY
@@ -3168,6 +3210,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		Comp->SetVisibility(true); // undo ReturnChunkComponentToPool's hide; no-op for a genuinely fresh component (visible by default)
 		Rec.Component = Comp;
 		++TotalChunksLoaded;
+		++LevelChunksLoadedTotal[FMath::Clamp(Key.Level, 0, VoxelCoords::kNumLevels - 1)];
 	}
 	TotalQuadsLoaded += Quads.Num();
 	Rec.LastQuadCount = Quads.Num();
@@ -3259,6 +3302,10 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 
 		Rec->bJobInFlight = false;
 		ZeroQuadAppliesSinceLog += (Result.Quads.Num() == 0) ? 1 : 0;
+		if (Result.Quads.Num() == 0)
+		{
+			++LevelZeroQuadTotal[FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
+		}
 		++Applied; // a live result: this IS a render-thread-facing apply
 		if (ApplyMeshResult(Owner, Root, Material, Result.Key, *Rec, MoveTemp(Result.Quads), /*bIsGameThreadMesh*/ false))
 		{
