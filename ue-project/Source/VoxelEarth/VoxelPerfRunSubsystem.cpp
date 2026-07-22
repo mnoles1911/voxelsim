@@ -36,7 +36,47 @@ void UVoxelPerfRunSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 			VoxelDebug::SetDebugMode(1);
 		}
 
-		UE_LOG(LogVoxelPerf, Log, TEXT("VoxelPerfRun: scripted %.1fs flight requested."), DurationSeconds);
+		// -VoxelPerfFlight=<surface|underground>. A command-line switch, not a
+		// cvar, for the same reason the sky-band and buried-skip switches are:
+		// the path shape decides where the anchor is on the FIRST tick, and an
+		// -ExecCmds cvar lands after streaming has already begun building a
+		// desired set around the surface spawn.
+		FString FlightName;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfFlight="), FlightName))
+		{
+			if (FlightName.Equals(TEXT("underground"), ESearchCase::IgnoreCase))
+			{
+				Flight = EVoxelPerfFlight::Underground;
+			}
+			else if (!FlightName.Equals(TEXT("surface"), ESearchCase::IgnoreCase))
+			{
+				// Refuse rather than silently flying the default path: a typo'd
+				// flight name that quietly ran the surface circle would produce
+				// a perfectly plausible JSON summary labelled as the run you
+				// thought you asked for.
+				UE_LOG(LogVoxelPerf, Error,
+				       TEXT("VoxelPerfRun: unknown -VoxelPerfFlight=%s (expected 'surface' or 'underground'). Aborting run."),
+				       *FlightName);
+				bRequested = false;
+				return;
+			}
+		}
+
+		float DepthM = float(DefaultDepthM);
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfDepth="), DepthM) && DepthM > 0.f)
+		{
+			DepthUU = double(DepthM) * 100.0;
+		}
+
+		float SpeedMPerSec = 0.f;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfSpeed="), SpeedMPerSec) && SpeedMPerSec > 0.f)
+		{
+			LinearSpeedUUPerSecOverride = double(SpeedMPerSec) * 100.0;
+		}
+
+		UE_LOG(LogVoxelPerf, Log, TEXT("VoxelPerfRun: scripted %.1fs flight requested (flight=%s, depth=%.0fm, speed=%.0fm/s)."),
+		       DurationSeconds, Flight == EVoxelPerfFlight::Underground ? TEXT("underground") : TEXT("surface"),
+		       DepthUU / 100.0, LinearSpeedUUPerSecOverride / 100.0);
 	}
 }
 
@@ -144,7 +184,7 @@ void UVoxelPerfRunSubsystem::StepFlightPath(float DeltaTime)
 
 	// docs/debug-tooling-plan.md P1: "circle radius 100m around spawn at
 	// 20 m/s at surface+30m, constant yaw sweep."
-	const double AngularSpeedRadPerSec = LinearSpeedUUPerSec / CircleRadiusUU;
+	const double AngularSpeedRadPerSec = LinearSpeedUUPerSecOverride / CircleRadiusUU;
 	const double Angle = double(ElapsedSeconds) * AngularSpeedRadPerSec;
 
 	FVector NewLocation = CircleCenterUU;
@@ -153,7 +193,52 @@ void UVoxelPerfRunSubsystem::StepFlightPath(float DeltaTime)
 	NewLocation.Z = FixedHeightUU;
 
 	const float Yaw = FMath::Fmod(ElapsedSeconds * float(YawSweepDegPerSec), 360.f);
-	const FRotator NewRotation(-10.f, Yaw, 0.f);
+	FRotator NewRotation(-10.f, Yaw, 0.f);
+
+	if (Flight == EVoxelPerfFlight::Underground)
+	{
+		// Same circle, same speed -- only Z differs, so an A/B against the
+		// surface run isolates depth. Z tracks the terrain rather than being
+		// pinned once at the spawn column: over a 100 m circle the surface can
+		// easily move more than 60 m, and a fixed Z would surface partway
+		// round and hand back the surface flight's numbers under an
+		// underground label. Following the surface at a constant offset is
+		// also the honest shape of the player action being modelled -- walking
+		// a tunnel that was dug at a roughly constant depth.
+		//
+		// The extra Z motion this introduces is not a distortion to apologise
+		// for: it is the underground recompute trigger (anchor chunk Z changes
+		// while underground) doing exactly what it exists to do, and leaving it
+		// out would measure a strictly easier case than a real tunnel walk.
+		double SurfaceZ = FixedHeightUU - HeightAboveSurfaceUU;
+		if (UWorld* W = GetWorld())
+		{
+			if (UVoxelWorldSubsystem* Subsystem = W->GetSubsystem<UVoxelWorldSubsystem>())
+			{
+				SurfaceZ = Subsystem->GetSurfaceHeightUU(NewLocation.X, NewLocation.Y);
+			}
+		}
+		NewLocation.Z = SurfaceZ - DepthUU;
+
+		// Look along the direction of travel, level. A walking player faces
+		// down the tunnel; the surface flight's decoupled yaw sweep exists to
+		// stress frustum churn against a distant horizon, which underground is
+		// a wall two metres away.
+		const double TangentDeg = FMath::RadiansToDegrees(Angle) + 90.0;
+		NewRotation = FRotator(0.f, float(FMath::Fmod(TangentDeg, 360.0)), 0.f);
+
+		LastPlacedZUU = NewLocation.Z;
+		LastSurfaceZUU = SurfaceZ;
+		++TotalPathFrames;
+		if (NewLocation.Z < SurfaceZ)
+		{
+			++UndergroundFrames;
+		}
+	}
+	else
+	{
+		++TotalPathFrames;
+	}
 
 	// Teleport (not a swept move): this is a scripted perf-measurement path,
 	// not gameplay movement, and terrain has no Chaos collision to sweep
@@ -197,6 +282,25 @@ void UVoxelPerfRunSubsystem::FinishRun()
 	const float AvgChunksPerSec = DurationSeconds > 0.f ? float(ChunksLoaded) / DurationSeconds : 0.f;
 	const float AvgBudgetSaturationPct = BudgetSaturationSamples > 0 ? BudgetSaturationAccum / float(BudgetSaturationSamples) : 0.f;
 
+	// Fixture-validity evidence, reported rather than assumed. An underground
+	// run whose fraction is not 1.0 did not measure what its label claims, and
+	// the number is in the artifact so that is not something a reader has to
+	// take on trust from the flight code.
+	const float UndergroundFraction = TotalPathFrames > 0 ? float(UndergroundFrames) / float(TotalPathFrames) : 0.f;
+	if (Flight == EVoxelPerfFlight::Underground)
+	{
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("VoxelPerfRun fixture check: undergroundFrames=%d/%d (%.1f%%) lastZ=%.0f lastSurfaceZ=%.0f depth=%.0fm"),
+		       UndergroundFrames, TotalPathFrames, 100.f * UndergroundFraction, LastPlacedZUU, LastSurfaceZUU, DepthUU / 100.0);
+		if (UndergroundFraction < 0.999f)
+		{
+			UE_LOG(LogVoxelPerf, Warning,
+			       TEXT("VoxelPerfRun: underground flight spent %.1f%% of frames ABOVE the surface -- these numbers are not an ")
+			       TEXT("underground measurement."),
+			       100.f * (1.f - UndergroundFraction));
+		}
+	}
+
 	const FString Timestamp = FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"));
 	const FString OutDir = FPaths::ProjectSavedDir() / TEXT("PerfRuns");
 	IFileManager::Get().MakeDirectory(*OutDir, /*Tree*/ true);
@@ -222,10 +326,16 @@ void UVoxelPerfRunSubsystem::FinishRun()
 		TEXT("  \"postWarmupP50FrameMs\": %.3f,\n")
 		TEXT("  \"postWarmupP95FrameMs\": %.3f,\n")
 		TEXT("  \"postWarmupMaxFrameMs\": %.3f,\n")
-		TEXT("  \"postWarmupHitchCount\": %d\n")
+		TEXT("  \"postWarmupHitchCount\": %d,\n")
+		TEXT("  \"flight\": \"%s\",\n")
+		TEXT("  \"flightDepthM\": %.1f,\n")
+		TEXT("  \"flightSpeedMPerSec\": %.1f,\n")
+		TEXT("  \"undergroundFrameFraction\": %.4f\n")
 		TEXT("}\n"),
 		DurationSeconds, N, P50, P95, Max, HitchCount, HitchThresholdMs, (long long)ChunksLoaded, AvgChunksPerSec,
-		AvgBudgetSaturationPct, WarmupExcludeSeconds, PostWarmupN, PostWarmupP50, PostWarmupP95, PostWarmupMax, PostWarmupHitchCount);
+		AvgBudgetSaturationPct, WarmupExcludeSeconds, PostWarmupN, PostWarmupP50, PostWarmupP95, PostWarmupMax, PostWarmupHitchCount,
+		Flight == EVoxelPerfFlight::Underground ? TEXT("underground") : TEXT("surface"), DepthUU / 100.0,
+		LinearSpeedUUPerSecOverride / 100.0, UndergroundFraction);
 
 	FFileHelper::SaveStringToFile(Json, *OutPath);
 
