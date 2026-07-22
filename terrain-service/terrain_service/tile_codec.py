@@ -13,7 +13,8 @@ Wire format (little-endian throughout):
     version  u16 (1)
     seed     u64
     x, y     i32 tile coords (tile (0,0) covers pixels [0,512) on each axis)
-    scale    u8  (1 => 30m/px, 8 => 11.25m/px, terrain-diffusion convention)
+    scale    u8  (1 => 30m/px, 8 => 3.75m/px, terrain-diffusion convention:
+                 scale is a SUPERSAMPLE factor, so scale 8 = 30m / 8)
     size     u16 (512)
     elevation int16[size*size], row-major (y outer)
     climate   uint8[4][size*size]
@@ -33,7 +34,13 @@ CLIMATE_CHANNELS = 4
 _HEADER = struct.Struct("<4sHQiiBH")
 
 #: mm per pixel by scale — must match voxel-core's ITileSampler::pixelSizeMm.
-PIXEL_SIZE_MM = {1: 30000, 8: 11250}
+#: MIRROR: keep byte-identical with voxel-core/include/voxelcore/tiles.h and
+#: tilestore.h (tilePixelSizeMm). scale is a supersample factor on the pinned
+#: 30 m checkpoint, so scale 8 = 30 m / 8 = 3.75 m/px = 3750 mm. (The old 11250
+#: was 90 m / 8, from the superseded 90 m model — wrong by 3x for the 30 m
+#: checkpoint. Nothing was ever generated at scale 8, so no cached tile is
+#: affected; this rolls provider_id via _tile_format_fingerprint, as intended.)
+PIXEL_SIZE_MM = {1: 30000, 8: 3750}
 
 
 @dataclass

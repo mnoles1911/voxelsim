@@ -500,7 +500,7 @@ class DiffusionConfig:
     terrain_diffusion_version: str = "UNRECORDED"
     sampler: SamplerConfig = field(default_factory=SamplerConfig)
     #: Tile pixel scale this config is calibrated for (tile_codec.PIXEL_SIZE_MM
-    #: key: 1 => 30m/px, 8 => 11.25m/px supersampled). Must match the `scale`
+    #: key: 1 => 30m/px, 8 => 3.75m/px supersampled). Must match the `scale`
     #: argument the provider is actually called with.
     scale: int = 1
     #: Semantic channel name -> raster dict key the model emits. Identity
@@ -972,7 +972,7 @@ class TerrainDiffusionBackend:
         interpolation with 1-native-pixel padding for edge handling.
 
         ASSUMPTION: ``DiffusionConfig.scale`` (our tile_codec.py pixel-size
-        key -- 1 => 30m/px, 8 => 11.25m/px) is passed straight through as
+        key -- 1 => 30m/px, 8 => 3.75m/px) is passed straight through as
         terrain-diffusion's own ``scale`` upsample factor, which is relative
         to the PINNED CHECKPOINT's ``native_resolution`` config field (a
         ``WorldPipeline.__init__`` parameter, default 90.0 in the base

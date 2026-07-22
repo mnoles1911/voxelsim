@@ -77,4 +77,4 @@ here — build it on the rented GPU box). See `docs/diffusion-bringup.md`.
 - Wire format is defined in `terrain_service/tile_codec.py` and mirrored by
   `voxel-core/include/voxelcore/tiles.h` (`PIXEL_SIZE_MM` ↔ `pixelSizeMm`).
 - Scale semantics follow terrain-diffusion: scale 1 = 30 m/px, scale 8
-  (supersampled) = 11.25 m/px.
+  (supersampled) = 3.75 m/px (30 m / 8).
