@@ -6313,3 +6313,53 @@ Development` via `D:\UE_5.8\Engine\Build\BatchFiles\Build.bat ... -WaitMutex
    32.5% of R1 chunks because at a 6.4 m footprint the tile-pixel term is weak.
    Sampling a few real columns and taking the min against the analytic bound
    would likely close most of that gap.
+
+### M1 gate on the same binary: passes, but p95 rises with the extra throughput
+
+`-nullrhi` is useless for this (it runs at ~1,900 fps and reports p95 = 0.50 ms
+on both sides), so the M1 numbers below are the real-RHI **min-spec proxy**:
+1080p windowed, `-ExecCmds="sg.ViewDistanceQuality 0,sg.ShadowQuality 0,
+sg.PostProcessQuality 0,sg.EffectsQuality 0,r.ScreenPercentage 100"`,
+`-VoxelPerfRun=60`, seed 20260719, interleaved, first pair discarded as warm-up.
+All runs shown, post-warmup (t>=10 s):
+
+| run | off p95 | off max | off framesOver16.6 | on p95 | on max | on framesOver16.6 |
+|---|---|---|---|---|---|---|
+| 0 (warm-up, discarded) | 5.61 ms | 16.08 ms | 0 | 6.59 ms | 14.47 ms | 0 |
+| 1 | 5.73 ms | 21.23 ms | 0 | 6.72 ms | 15.86 ms | 0 |
+| 2 | 5.66 ms | 13.17 ms | 0 | 6.90 ms | 15.75 ms | 0 |
+
+**The gate holds: 0 frames over 16.6 ms on both sides, every run, and 0
+post-warmup hitches (>33.3 ms) on both sides.** But p95 rises ~1.1 ms
+(5.66-5.73 -> 6.72-6.90), and that should be reported as what it is rather than
+buried: it is not the bound costing frame time, it is the pipeline **converting
+the reclaimed worker time into more work per frame**. The same runs load
+21,717-21,855 chunks off versus 23,734-23,963 on (+10%), at 52.8% versus 55.8%
+budget saturation -- the apply path is simply busier because more results are
+arriving. Worth noting the *max* frame time moved the other way (off peaked at
+21.23 ms in run 1; on peaked at 15.86 ms across both runs).
+
+For context, the brief records both sides of the previous wave sitting at
+6.1-7.1 ms p95 on this box; the `on` side here (6.72-6.90) is inside that band
+and the `off` side is below it. If the p95 is ever wanted back, the knob is the
+per-frame apply budget, not this change -- see follow-up 4.
+
+**Exact after-census** (`-VoxelPerfRun=60 -VoxelMeasureEmpty`, all skips on,
+versus the all-skips-off census at the top of this section; note this compares
+PR #70's band skip AND the sky band together against neither):
+
+| ring | zero-quad share of results, off -> on | zero-quad share of worker time, off -> on |
+|---|---|---|
+| R0 | 74.9-76.7% -> **26.5-30.0%** | 73.9-74.2% -> **28.3-32.2%** |
+| R1 | 63.0-68.4% -> **45.1-45.3%** | 70.5-75.2% -> **52.1-52.3%** |
+| R2 | 77.6-90.8% -> **25.8-27.6%** | 69.6-96.5% -> **25.3-35.2%** |
+| R3 | 100% -> **11.1-25.0%** | 100% -> **12.4-12.8%** |
+| R4 | 100% -> **0-50%** | 100% -> **0-100%** (1-2 jobs/window; see the A/B table for the reliable R4 figure) |
+
+4. **The p95/throughput trade is now the open question, not the waste.** This
+   change hands the streaming pipeline ~11% more worker capacity and the
+   pipeline spends all of it, taking budget saturation 52.8% -> 55.8% and p95
+   5.7 -> 6.8 ms. That is the right default while the outer rings are starved of
+   geometry, but once R3/R4 are populated the same capacity would be better
+   spent holding frame time down. `voxel.Stream.MaxAppliesPerFrame` and the ring
+   floors are the knobs, and neither was re-swept against the new capacity.
