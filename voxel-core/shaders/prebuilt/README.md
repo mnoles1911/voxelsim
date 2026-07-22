@@ -88,15 +88,29 @@ the `.spv` files in this directory.
 
 ## SHA-256
 
+Current as of respin 5 (worldgen v6, see the bottom of this file):
+
 ```
-f4292777605064826e812ee12bcf7fb063adfe0e4fd07cbb5ccd03dffa2d6747  worldgen.ColumnMain.spv
+80268af563ff362bce23d5c06386fcc4176380331d3fdcc0720403d360006532  worldgen.ColumnMain.spv
 b3fdca92cefc9ee1967bb0d0b4bbef377d0183224e60223c32cfb41c2ee6981b  worldgen.MeshCountMain.spv
-f5d1168c83935f7c35094f30f27012057aa8ea80d83130afeaa945a46e03bacd  worldgen.MeshEmitMain.spv
+e6213729a69289bb1fced82714d67f041cbc34bb2b649a01797bd9ed9185f8b6  worldgen.MeshEmitMain.spv
 72cb57ed63c531b0745f109e1b7c9a2054ed1e201b0ef59dbb062171ed207130  worldgen.ScanAddMain.spv
 0168a302618b437e31b0b4e8bf69aa4ea203383dfd6d1e38b13acd0618d277e1  worldgen.ScanBlocksMain.spv
 e2060888d9938627c0e5c899d4402c804aeee61aae04b86ffcf9c3c5ec4cdf8e  worldgen.ScanSumsMain.spv
-fb7af97b3cb7f131d797bb0bedaf3850819477d664388a0adef70ec99b2b7127  worldgen.VoxelizeMain.spv
+f317b5d5de795be97b91a4b1f44546476f84affe9eb7438dd08de28c2a1ceb27  worldgen.VoxelizeMain.spv
 ```
+
+> **Stale-entry correction (found during respin 5).** The previous table
+> listed `f5d1168c83935f7c35094f30f27012057aa8ea80d83130afeaa945a46e03bacd`
+> for `worldgen.MeshEmitMain.spv`, but the file committed in this directory
+> hashed to `e6213729a69289bb…` — and respin 5 did not touch MeshEmitMain
+> (`git diff` shows only ColumnMain and VoxelizeMain changed). So that entry
+> had been stale since an earlier respin: MeshEmitMain's bytes moved without
+> the table being updated. Anyone following this file's own "verify with
+> `sha256sum -c` before trusting a copy" instruction would have hit a
+> spurious mismatch. The value above is the one the committed file actually
+> has, verified against `git show HEAD:...` before the respin overwrote
+> anything.
 
 Verify with `sha256sum -c` (or `Get-FileHash -Algorithm SHA256` on Windows)
 against this list before trusting a copy of these files.
@@ -274,3 +288,62 @@ shader had not picked the change up at all.
 `python tools/lint-shader-ub.py` is clean on its own merits (5 rules,
 fail-closed); every `allow` annotation in the file carries a justification.
 `worldgen.hlsl` still contains zero `float`/`double`/`half`.
+
+## Respin 5 — coarse-to-fine detail rework (kWorldGenVersion 5 -> 6)
+
+`worldgen.hlsl` gained the GPU mirror of the amplifier's coarse-to-fine
+detail rework — the first change to the surface term made against REAL 30 m
+terrain-diffusion tiles rather than `SyntheticTileSampler`. Three pieces:
+
+1. `fadeFractionMm` / `valueNoise2Fade` — bit-for-bit mirrors of the new
+   `hash.h` functions. Perlin's quintic `6t^5 - 15t^4 + 10t^3` on the lattice
+   fraction, carried as a 10-bit fixed-point `t` so the `t^5` term stays
+   inside int64. Raw `valueNoise2` is still present and still used by the
+   cavern roughness channel, unchanged.
+2. `microScaleQ10` — mirror of the new microrelief band scale.
+3. The octave table went to five entries with new amplitudes, and
+   `evalSurface`'s loop split into two bands scaled independently.
+
+**Every division in the new code goes through `truncDiv` even though every
+operand is provably non-negative** (`fx` is in `[0, latticeMm)` by
+`floorDiv`'s contract, and the quintic is non-negative on `[0, 1]`).
+"This operand happens to be positive today" is precisely the reasoning that
+produced the M0 NVIDIA-vs-AMD divergence, so it is not reasoning this file
+gets to use.
+
+`python tools/lint-shader-ub.py voxel-core/shaders --spv-dir
+voxel-core/shaders/prebuilt` is clean on the respun bytecode: still ZERO
+`OpSDiv`/`OpSRem`/`OpSMod` across all seven modules. That is the check that
+matters here, because `fadeFractionMm` adds four new divisions to the
+hottest function in the shader.
+
+**ColumnMain and VoxelizeMain moved; the other five modules are
+byte-identical to respin 4** — the same free control on the rebuild as
+previous respins (their source is untouched and DXC is deterministic).
+ColumnMain 37,468 -> 56,084 bytes, VoxelizeMain 71,808 -> 90,464 bytes.
+
+| Mode | Result | GPU output digest (columns+cells+quads) |
+|---|---|---|
+| default (2 regions) | **PASS**, 0 mismatches, 8192 columns / 360448 cells / 7492 quads | `46d86246e2ad37b4` (was `71288ec0ac6dba0b`) |
+| `--radius 64` | **PASS**, 0 mismatches, 326/326 tiles (100%) verified — 5,341,184 columns / 293,339,136 cells / 3,586,220 quads compared | `4698d521f7e69eed` (was `f102b490a42918c0`) |
+| `--radius 128` | **PASS**, 0 mismatches, 144/1144 tiles (12.6%) verified — 2,359,296 columns / 127,926,272 cells / 1,619,189 quads compared | `19c7ffcd9b16d49a` (was `1f88f5e0d405321d`) |
+
+Device: AMD Radeon RX 7800 XT.
+
+All three digests moved, and all three had to: this change moves `surfaceMm`
+at essentially every column, so it moves columns, the cells voxelized from
+them, and the quads meshed from those. A digest that had NOT moved would be
+evidence the shader failed to pick the change up. The quad and tile counts
+also grew relative to respin 4 (`--radius 64`: 305 -> 326 tiles,
+2,523,983 -> 3,586,220 quads), which is the expected consequence of terrain
+that is genuinely rougher at the voxel scale — more surface area, more
+meshed faces. That is the cost side of this change and it is real.
+
+`worldgen.hlsl` still contains zero `float`/`double`/`half`.
+
+- Source: `voxel-core/shaders/worldgen.hlsl` at worktree commit
+  `2d785e202dc60e3b055645a3e903494abe12c9cf` ("worldgen v6: mirror the detail
+  rework to HLSL, bump version, re-pin goldens")
+- Compiler: the same pinned Microsoft DXC `v1.9.2602.24`
+  (`dxcompiler.dll: 1.9(5191-d355aa83)(1.9.2602.24) - 1.9.2602.24
+  (d355aa836)`), via `tools/compile-shaders.ps1` with no flag changes.
