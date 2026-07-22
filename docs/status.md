@@ -6011,3 +6011,154 @@ synthetic-sampler runs; see follow-ups.
   look by that subsystem's owner.
 - M6 pathfinding still treats flooded caverns as air — already parked as a
   water-track follow-up in the design doc, unchanged by this work.
+---
+
+## M4 wave: water winding, GI cone basis, GI bounce energy (2026-07-21)
+
+Three client-side rendering correctness fixes. Nothing here touches voxel-core,
+worldgen, the edit log or any replicated state, so no golden moved.
+
+### 1. Water chunk winding -- the copy-pasted inversion
+
+`FWaterChunkSceneProxy` carried the same inverted winding that had just been
+fixed in `FVoxelChunkSceneProxy` (PR #62): both branches flipped, so every
+water quad presented its back face as front-facing and `M_Ocean` shaded against
+a normal pointing *into* the water. Fixed by matching the terrain convention
+(`!Q.Positive` reversed). The two proxies build corners, tangents and indices
+identically, so the fix is textually exact.
+
+**Verified geometrically, not photographically.** Water screenshots turned out
+to be a bad instrument -- the implicit ocean plane, the translucent material and
+the sky are all similar blue, and the top and bottom of a water slab are
+coincident planes, so an inverted surface looks broadly the same.
+`-VoxelWindingCheck` instead computes `dot(cross(P1-P0, P2-P0), shadingNormal)`
+over every emitted triangle of both proxies:
+
+| proxy | mean dot |
+|---|---|
+| terrain (reference; its winding was verified on screen in PR #62) | **-1.000** |
+| water, after this fix | **-1.000** |
+| terrain forced to the legacy inverted winding (`-VoxelGIOn -VoxelGIVis=6`) | **+1.000** |
+
+The third row is the control: the check *is* sensitive to exactly this defect,
+and water now agrees with the reference on every triangle of every proxy. This
+is a stronger result than any screenshot and it is cheap to re-run.
+
+### 2. The cone basis was degenerate
+
+Six axis-aligned cones recombined with `max(0, N.D)`. Every normal a greedy
+voxel mesh produces is axis-aligned, so exactly one cone survived and **side
+light was weighted to literally zero** -- a floor lit entirely by a shaft three
+metres to the side solved to "dark" because the only cone consulted pointed at
+the ceiling.
+
+Replaced with a proper cosine-weighted hemisphere. **14 cones are traced** (the
+6 axes + the 8 cube diagonals) and projected into the 6 ambient-cube storage
+slots, **5 cones per slot** (its own axis at weight 1, four diagonals at
+1/sqrt(3), the four equatorial cones correctly at 0). Cones are shared between
+slots -- a diagonal contributes to three -- so it is 14 marches per cell, not 30.
+Weights are normalized per slot, which matters twice: an unoccluded cell still
+solves to exactly 1.0 (open terrain unchanged with GI on), and the basis cannot
+manufacture energy.
+
+**Cost: 2.33x the cone marches.** Measured in the steady state, same scene, 2
+bricks per solve: **0.50-0.53 ms (old basis) -> 0.88-1.11 ms (new)**.
+
+### 3. The bounce was not energy conserving -- and the diagnosis changed
+
+The gather read the same `AvgIrr` array it was writing. Within a brick that made
+it Gauss-Seidel in X/Y/Z scan order; across bricks the `ParallelFor` made it
+Gauss-Seidel in *nondeterministic thread order*. A pass therefore applied
+somewhere between one and several bounces depending on scheduling. The header
+called that race "benign for a progressive gather"; it was not.
+
+Now a **Jacobi iteration**: the gather reads `PrevAvgIrr`, a snapshot published
+at the end of each pass, and writes `AvgIrr`. One pass is exactly one bounce,
+independent of thread count and scan order. With that, boundedness is a theorem:
+`Irr <= Vis*Sky + albedo*(1-Vis) <= 1`, a contraction with modulus `BounceAlbedo`.
+The `MaxBounceContribution` clamp was deleted -- it masked the symptom and did
+nothing about the cause.
+
+**The convergence proof (`-VoxelGIConverge=N`).** Measuring a settled field
+proves nothing: it sits still whether or not the iteration is sound. So
+`-VoxelGIConvergeSeed=<0..255>` kicks every solved cell to all-white or
+all-black first, and the passes are then run back-to-back on a frozen scene.
+1711-1788 resident bricks, ~220k solved cells, albedo 0.40:
+
+```
+HOT start (255): 73.139 -> 33.577 -> 24.671 -> 22.629 -> 22.103 -> 22.037 -> 22.025 -> 22.023 (flat)
+                 successive maxDelta ratio: 0.280 0.362 0.400 0.400 0.500  <- albedo is 0.40
+COLD start (0):  18.076 -> 21.511 -> 22.250 -> 22.381 -> 22.401 -> 22.403 -> 22.404 (flat)
+```
+
+Hot and cold converge to the same fixed point from opposite directions, and the
+measured contraction modulus sits on the predicted 0.40. Twelve passes on a
+frozen scene move the mean by less than 0.001/255.
+
+**Honest correction to the premise.** The reported 104.7 vs 129.0 luma drift is
+**not reproduced as a bounce-energy divergence**. Run with the legacy in-place
+gather restored (`-VoxelGIConvergeLegacy`), the old code *also* converges, to
+22.470 against the fixed 22.404 -- a real but tiny 0.3% energy gain, not 23%.
+The large luma difference between those two captures is far more likely the
+settle race already documented in the `-VoxelGICaveTest` block (capture before
+the GI queue drains and chunks are still on their bright plain-AO fallback).
+What the Jacobi fix actually buys is **reproducibility**: the result no longer
+depends on thread scheduling, so captures are comparable and the next agent does
+not bisect a phantom regression. Two identical rendered runs now read mean luma
+141.89 and 141.90.
+
+### M1 gate
+
+`-VoxelPerfRun=60`, seed 20260719, two runs each. **This box was noisy during
+this wave** (parallel builds), and the noise swamps the effect being measured:
+
+| config | p95 run 1 | p95 run 2 |
+|---|---|---|
+| rendered, GI off | 5.36 ms | 8.49 ms |
+| rendered, GI on | 12.00 ms | 10.76 ms |
+| nullrhi, GI off | 0.50 ms | -- |
+| nullrhi, GI on | 1.34 ms | -- |
+
+GI-off spans 5.4-8.5 ms against a recorded baseline of 4.76-4.82, so these
+numbers cannot support a +/-0.5 ms claim either way. What they do support: the
+GI-off path is untouched *by construction* (with `voxel.GI.Enabled=0` the
+subsystem does not tick, no field is built, and the new winding check is behind
+an absent command-line switch), and GI-on is consistently ~+3 to +5 ms over
+GI-off in the same session. **The GI-off gate needs a re-run on a quiet box
+before it is quoted anywhere.**
+
+### Recommendation: GI stays DEFAULT OFF
+
+The two correctness blockers are genuinely fixed and the second one is now
+pinned by a test rather than by a screenshot. But default-on is still the wrong
+call:
+
+1. **Cost went up, not down.** The correct cone basis is 2.33x the marches.
+   GI-on measured 10.8-12.0 ms p95 here against a ~4.8 ms gate. Even discounting
+   the noise, that is not a 60 fps budget.
+2. **The dominant cost is not the tracing.** Known split: proxy rebuilds 1.7 ms,
+   tracing ~0.5 ms (now ~1.1 ms). Making the cones correct made the *cheap* part
+   more expensive; the expensive part is re-running chunk scene proxies to move
+   vertex colours, and that is what a GPU/vertex-buffer-update path removes.
+3. **Quality is still unproven in a legible frame.** See below.
+
+**Follow-ups, ranked.**
+
+1. **Get a legible enclosed-space capture.** Neither harness produced one at
+   seed 20260719: `-VoxelGICaveTest`'s sinkhole search parked the camera on a
+   mountainside at 1126 m altitude in open sky, and `-VoxelUndergroundTest`
+   parks it hard against a carved wall (enclosure probe: 0.9-3.8 m on every
+   axis) so blocky near-geometry fills the frame. The cone-basis A/B is
+   therefore only a luma delta (legacy 154.61 / dark 6.5% vs fixed 155.20 /
+   dark 5.9%), not a visual verdict. A framing pass -- stand off, aim along the
+   chamber, not at a wall 90 cm away -- is a prerequisite for any quality claim,
+   and is cheap.
+2. **Move the vertex-colour update off the proxy rebuild path.** This is the
+   1.7 ms and it is most of the gap to default-on. Note a previous in-place
+   colour buffer attempt (8.99 -> 7.92 ms) and a refresh-gate/time-slice pair
+   were implemented, measured and reverted as not-working; the measurements are
+   good, the approach needs rethinking rather than repeating.
+3. **Re-run the M1 gate on a quiet box** to get a trustworthy GI-off number.
+4. **Consider trading solve latency for frame cost** now that the basis is
+   2.33x: `voxel.GI.MaxBrickSolvesPerFrame` (8) and `RefreshBricksPerFrame` (2)
+   were tuned against the cheaper basis and were not re-swept here.
