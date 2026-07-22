@@ -131,6 +131,94 @@ CaveColumn cachedCaveColumn(uint64_t seed, int64_t vx, int64_t vy, int32_t surfa
     return caveColumnFromLattice(cachedCaveLattice(seed, ci, cj), vx, vy);
 }
 
+// ---------------------------------------------------------------------------
+// Cavern candidate-corner memo (performance only — same argument as above).
+//
+// caverns.h's gate + depth-safety pass over the 2x2 coarse corners is a
+// function of the coarse cell (si, sj) alone, and a coarse cell is 204.8 m
+// square = 4.2 million voxel columns. Memoising it turns the cavern pass's
+// unavoidable per-column cost into four predicted-taken compares.
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t kCavernCornerSlots = 8; // ~2 KB/thread
+
+struct CavernCornerSlot {
+    bool valid = false;
+    uint64_t seed = 0;
+    int64_t si = 0, sj = 0;
+    CavernCandidates value;
+};
+
+const CavernCandidates& cachedCavernCandidates(uint64_t seed, int64_t si, int64_t sj) {
+    static thread_local CavernCornerSlot slots[kCavernCornerSlots];
+    CavernCornerSlot& s = slots[slotIndex(seed, si, sj, kCavernCornerSlots)];
+    if (s.valid && s.seed == seed && s.si == si && s.sj == sj) return s.value;
+    s.value = cavernCandidatesFor(seed, si, sj);
+    s.valid = true;
+    s.seed = seed;
+    s.si = si;
+    s.sj = sj;
+    return s.value;
+}
+
+// ---------------------------------------------------------------------------
+// Cavern SITE memo — the one that actually matters, and the one caverns.h's
+// own cost model missed.
+//
+// A CavernSite is a function of (seed, fi, fj) and the terrain surface at the
+// site's own anchor xy: a per-SITE value. But it was being decoded once per
+// COLUMN, for every column inside the site's ~36 m reach disc — on the order
+// of 400'000 columns — and each decode calls `surfaceAt`, which in production
+// is the amplifier's full bilinear-tile-base + four-detail-octave surface
+// function, i.e. the single most expensive thing in column(). Measured on
+// vxc_bench --radius 32 (a 64 m square region, so a large fraction of it sits
+// inside one reach disc), that alone took the amplify stage from 97.6 ms to
+// 180.2 ms. The standalone "~28 ns/col" figure for the cavern pass was
+// measured against a constant surfaceAt and does not survive contact with the
+// real column path.
+//
+// Memoising per (seed, fi, fj) restores it: the decode runs once per site
+// instead of once per column, and `surfaceAt` with it.
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t kCavernSiteSlots = 8; // ~1.5 KB/thread
+
+struct CavernSiteSlot {
+    bool valid = false;
+    uint64_t seed = 0;
+    int64_t fi = 0, fj = 0;
+    CavernSite value;
+};
+
+template <typename SurfaceFn>
+const CavernSite& cachedCavernSite(uint64_t seed, int64_t fi, int64_t fj, const CaveNode& node,
+                                   const SurfaceFn& surfaceAt) {
+    static thread_local CavernSiteSlot slots[kCavernSiteSlots];
+    CavernSiteSlot& s = slots[slotIndex(seed, fi, fj, kCavernSiteSlots)];
+    if (s.valid && s.seed == seed && s.fi == fi && s.fj == fj) return s.value;
+    s.value = cavernSiteFor(seed, fi, fj, node, surfaceAt);
+    s.valid = true;
+    s.seed = seed;
+    s.fi = fi;
+    s.fj = fj;
+    return s.value;
+}
+
+// cavernColumnFor(...), memoised. Bit-identical by construction: caverns.h's
+// own composition with the two cell/site-only halves served from tables.
+template <typename SurfaceFn>
+CavernColumn cachedCavernColumn(uint64_t seed, int64_t vx, int64_t vy, int32_t surfaceMm,
+                                const SurfaceFn& surfaceAt) {
+    if (surfaceMm < kCaveMinSurfaceMm) return CavernColumn{};
+    const int64_t si = floorDiv(vx * kVoxelSizeMm, kCavernCoarseMm);
+    const int64_t sj = floorDiv(vy * kVoxelSizeMm, kCavernCoarseMm);
+    return cavernColumnFromSites(
+        seed, cachedCavernCandidates(seed, si, sj), vx, vy,
+        [&](int64_t fi, int64_t fj, const CaveNode& node) -> const CavernSite& {
+            return cachedCavernSite(seed, fi, fj, node, surfaceAt);
+        });
+}
+
 
 // Detail octave table v1 (worldgen-versioned constant, docs/determinism.md).
 // latticeMm chosen so octaves nest across brick sizes; amplitudes in mm before
@@ -159,7 +247,13 @@ uint64_t Amplifier::nextId() {
     return counter.fetch_add(1, std::memory_order_relaxed) + 1; // 0 means "empty slot"
 }
 
-ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
+// The surface half of column(): the bilinear tile base plus the slope-scaled
+// detail octaves, and the two by-products (tile pixel, tile slope) the rest of
+// column() needs. Factored out ONLY so the cavern pass's `surfaceAt` callback
+// can be the very same function the querying column's own surfaceMm came from
+// — caverns.h's contract for it — bit-identically, by construction rather than
+// by a comment asking two copies to stay in step.
+Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     const int64_t xMm = vx * kVoxelSizeMm;
     const int64_t yMm = vy * kVoxelSizeMm;
     const int64_t pxMm = tiles_->pixelSizeMm();
@@ -189,10 +283,23 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     }
     detailMm = detailMm * sScale / 1024;
 
+    SurfaceEval s;
+    s.px = px;
+    s.py = py;
+    s.slopeMmPerPx = slopeMmPerPx;
+    s.surfaceMm = clampi32(baseMm + detailMm, -8'000'000, 9'000'000);
+    return s;
+}
+
+ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
+    const SurfaceEval s = evalSurface(vx, vy);
+    const int64_t px = s.px, py = s.py;
+    const int64_t slopeMmPerPx = s.slopeMmPerPx;
+
     const ClimateSample cl = cachedClimate(id_, *tiles_, px, py);
 
     ColumnSample col;
-    col.surfaceMm = clampi32(baseMm + detailMm, -8'000'000, 9'000'000);
+    col.surfaceMm = s.surfaceMm;
 
     // Topsoil deepens with precipitation, thins with slope; +/-25% hash jitter
     // breaks up contour-following layer boundaries.
@@ -237,6 +344,27 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // Served from the per-thread cave-lattice memo above; bit-identical to
     // caveColumnFor(seed_, vx, vy, col.surfaceMm).
     col.cave = cachedCaveColumn(seed_, vx, vy, col.surfaceMm);
+
+    // M4 cave pass v2 cavern pass (voxelcore/caverns.h), wired in exactly as
+    // the cave pass above is: one reduction per column, carried in the
+    // ColumnSample, consumed per voxel by materialAt.
+    //
+    // The one shape difference is the `surfaceAt` callback. Caverns anchor at
+    // ABSOLUTE z (level floors and water tables, not draped ones), so the
+    // reduction needs the terrain height at the SITE's own xy rather than at
+    // the querying column's — see caverns.h's cavernSiteFor. Supplying
+    // evalSurface() here makes that the identical function this column's own
+    // surfaceMm came from, which is the contract that callback is written
+    // against. It is invoked at most once per column and only for the <1% of
+    // columns that pass the gate/depth/xy-reach rejects, and it hits the tile
+    // memo above, so it costs nothing in the common case. C6 will recompute it
+    // inside VoxelizeMain rather than widening GpuColumnSample.
+    const auto surfaceAt = [this](int64_t xMm, int64_t yMm) -> int32_t {
+        return evalSurface(floorDiv(xMm, int64_t(kVoxelSizeMm)),
+                           floorDiv(yMm, int64_t(kVoxelSizeMm)))
+            .surfaceMm;
+    };
+    col.cavern = cachedCavernColumn(seed_, vx, vy, col.surfaceMm, surfaceAt);
     return col;
 }
 
@@ -285,9 +413,17 @@ MaterialId Amplifier::materialAt(const ColumnSample& col, int64_t vz) {
     // MAT_AIR is an enumerator and `m` is a MaterialId variable, so a bare
     // `cond ? MAT_AIR : m` mixes an enumerated and a non-enumerated operand —
     // gcc's -Wextra rejects that (clang does not), so name the type explicitly.
-    return caveCarveAt(col.cave, col.surfaceMm, col.bedrockDepthMm, vz)
-               ? static_cast<MaterialId>(MAT_AIR)
-               : m;
+    if (caveCarveAt(col.cave, col.surfaceMm, col.bedrockDepthMm, vz))
+        return static_cast<MaterialId>(MAT_AIR);
+    // Caverns (voxelcore/caverns.h) carve the same way tunnels do and under
+    // the same three independent bedrock guards — the MAT_BEDROCK refusal
+    // above, cavernCarveAt's own margin clamp, and the geometry itself.
+    // Ordered after caves purely because a cavern column is far rarer, so the
+    // common case never reaches this call: cavernCarveAt's first test is
+    // `count == 0`.
+    if (cavernCarveAt(col.cavern, col.surfaceMm, col.bedrockDepthMm, vz))
+        return static_cast<MaterialId>(MAT_AIR);
+    return m;
 }
 
 } // namespace vxc
