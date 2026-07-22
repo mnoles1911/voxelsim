@@ -5,6 +5,30 @@ coarsening). Bands per plan §3.3. Prereqs in place: voxel mip chain
 (voxelcore/mips.h, worldgen-versioned), streaming machinery (stage 2/3a),
 C++ tile client (tilestore.h) for clipmap source data.
 
+**Which system actually delivers the gate, measured 2026-07-21** (full
+writeup: docs/status.md, "R2-R4 ring starvation fix" entry). The gate's
+"(only ring coarsening)" phrasing reads as if the voxel ring cascade (R0-R4)
+delivers the 50km+ vista. It does not, and was never going to at its current
+radii: `RingPresets` tops out at R4's outer edge, **1024m** — the ring
+cascade's real range is close-range detail out to ~1km, not 50km. The
+long-distance vista is delivered by **Band 3**, the heightmap clipmap
+(`AVoxelClipmapActor`, see "Band 3 first slice" below), which covers from
+the ring cascade's edge (~1km) out to ~16.4km radius (~32.8km diameter) via
+direct TILE-elevation sampling — a genuinely different rendering system, not
+a coarser ring level. Vista screenshots at 250m above spawn (`-VoxelVistaShot`)
+confirm a real horizon-to-horizon vista renders today, but it renders on the
+clipmap, not on ring coarsening. Restated plainly: the gate's CLOSE-RANGE
+half (fast flight, no hitches out to ~1km) is a ring-cascade concern; the
+LONG-RANGE half (the 50km+ vista itself) is a clipmap concern. This is a
+documentation correction only — the gate criteria above are unchanged, and
+the gate itself remains open (see docs/status.md's M2 section for current
+status): either the ring cascade needs to widen enough to be a truthful
+"only ring coarsening" vista mechanism (blocked on the coarse-LOD
+generation-cost finding — R4 chunks cost seconds each, see docs/status.md's
+"M2 perf — coarse LOD generation path" entry), or the gate's own wording
+should be corrected to credit the clipmap for the vista range it actually
+covers.
+
 ## Decisions (binding once implementation starts; ADR for deviations)
 
 | Topic | Decision |
