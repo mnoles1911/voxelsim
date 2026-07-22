@@ -139,6 +139,69 @@ void terraceStats(const std::vector<int64_t>& hMm, const char* label) {
                 static_cast<double>(inLong * 100 / static_cast<long double>(hMm.size())));
 }
 
+// 2-D TERRACE PLATEAUS — the metric that actually matches the screenshot.
+//
+// A 1-D transect can tell you a step happens every N columns, but not whether
+// the steps LINE UP across rows, and lining up is the whole artifact: a
+// terrace edge that runs dead straight for tens of metres reads as machined,
+// while the same number of steps scattered reads as ground. So take the 2-D
+// field of voxel heights floor(h/100mm) and measure the connected components
+// of CONSTANT height (4-connectivity). Long straight terraces are large
+// components; natural ground is a confetti of tiny ones.
+void terracePlateaus(Amplifier& amp, int64_t vx0, int64_t vy0, int64_t n, const char* label) {
+    std::vector<int64_t> hv(static_cast<size_t>(n * n));
+    for (int64_t j = 0; j < n; ++j)
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t mm = amp.surfaceMm(vx0 + i, vy0 + j);
+            hv[static_cast<size_t>(j * n + i)] = (mm >= 0 ? mm / 100 : (mm - 99) / 100);
+        }
+
+    std::vector<char> seen(static_cast<size_t>(n * n), 0);
+    std::vector<int64_t> areas;
+    std::vector<int64_t> stack;
+    for (int64_t s = 0; s < n * n; ++s) {
+        if (seen[static_cast<size_t>(s)]) continue;
+        const int64_t lvl = hv[static_cast<size_t>(s)];
+        int64_t area = 0;
+        stack.clear();
+        stack.push_back(s);
+        seen[static_cast<size_t>(s)] = 1;
+        while (!stack.empty()) {
+            const int64_t c = stack.back();
+            stack.pop_back();
+            ++area;
+            const int64_t cx = c % n, cy = c / n;
+            const int64_t nb[4][2] = {{cx - 1, cy}, {cx + 1, cy}, {cx, cy - 1}, {cx, cy + 1}};
+            for (auto& q : nb) {
+                if (q[0] < 0 || q[0] >= n || q[1] < 0 || q[1] >= n) continue;
+                const int64_t k = q[1] * n + q[0];
+                if (seen[static_cast<size_t>(k)] || hv[static_cast<size_t>(k)] != lvl) continue;
+                seen[static_cast<size_t>(k)] = 1;
+                stack.push_back(k);
+            }
+        }
+        areas.push_back(area);
+    }
+    std::sort(areas.begin(), areas.end());
+    long double sum = 0;
+    for (int64_t a : areas) sum += a;
+    // Area-weighted mean: the size of the plateau a RANDOMLY CHOSEN VOXEL sits
+    // in, which is what the eye samples — not the mean over components, which
+    // is dominated by the confetti and flatters the result.
+    long double w = 0;
+    for (int64_t a : areas) w += static_cast<long double>(a) * a;
+    std::printf("\n%s — 2-D constant-height plateaus over a %lldx%lld voxel patch (%.1f m sq)\n",
+                label, (long long)n, (long long)n, static_cast<double>(n) * 0.1);
+    std::printf("  components=%zu  largest=%lld voxels  area-weighted mean=%.1f voxels\n",
+                areas.size(), (long long)areas.back(),
+                static_cast<double>(w / sum));
+    long double big = 0;
+    for (int64_t a : areas)
+        if (a >= 400) big += a; // 400 voxels = 4 m^2 of dead-flat, dead-level ground
+    std::printf("  fraction of area in plateaus >= 400 voxels (4 m sq flat): %.1f%%\n",
+                static_cast<double>(big * 100 / sum));
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -210,5 +273,6 @@ int main(int argc, char** argv) {
                       static_cast<double>(pxMm) / 1000.0);
 
     terraceStats(hAmp, "AMPLIFIED SURFACE");
+    terracePlateaus(amp, vx0, vy0, 512, "AMPLIFIED SURFACE");
     return 0;
 }
