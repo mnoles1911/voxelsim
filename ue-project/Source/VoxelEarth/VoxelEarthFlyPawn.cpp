@@ -335,37 +335,48 @@ bool AVoxelEarthFlyPawn::IsTerrainReadyAt(const FVector& Pos) const
 	// toggles into walk mode a fraction of a second early falls forever, and
 	// (worse) it does so silently and looks like a collision bug.
 	//
-	// THE RULE. Gravity runs only when the world under the pawn is positively
-	// known. Two independent tests, either of which vetoes:
+	// THE RULE. Gravity runs only where the world under the pawn is positively
+	// known. The test is per-chunk residency via DebugChunkStatusAt: a chunk
+	// that is TRACKED (in the streaming desired set) but does not yet own a
+	// COMPONENT is precisely "queued, not here yet" -- exactly the state both
+	// the boot case and a fast traverse into unstreamed space produce -- and
+	// it vetoes gravity. Anything else counts as ready:
 	//
-	//   1. GLOBAL: no level-0 chunk has loaded at all yet. This is the boot
-	//      case and the reason the pawn must not fall the moment it spawns.
-	//   2. LOCAL: the level-0 chunk containing the pawn IS in the desired set
-	//      (tracked) but does not yet own a component. That is precisely
-	//      "queued, not here yet" -- the state a fast traverse into unstreamed
-	//      space produces.
+	//   * tracked WITH a component -- the ground is really there (or the chunk
+	//     is really empty air, which is a legitimate reason to fall);
+	//   * not tracked at all -- outside the streaming footprint, which
+	//     includes the all-air chunks the sky-band optimisation deliberately
+	//     never admits. Vetoing on those would leave the pawn hovering
+	//     wherever it stepped off a ledge into open sky, which is worse than
+	//     falling.
 	//
-	// Anything else -- untracked chunk (out of the streaming footprint
-	// entirely, e.g. flying far out) or tracked-with-component -- counts as
-	// ready, so the veto is narrow and self-clearing. When it fires, the
-	// pawn HOLDS (see TickWalkMode); it never falls.
+	// Probed at the pawn's centre AND one chunk lower, because the pawn
+	// usually stands in an AIR chunk whose ground lives in the chunk below --
+	// checking only its own chunk would let it fall through terrain that is
+	// still a frame away.
+	//
+	// NOT snapshot-based. FVoxelPerfSnapshot looked like the obvious global
+	// "has anything loaded yet" signal, but the subsystem only refreshes it
+	// while voxel.Debug >= 1 (a deliberate zero-cost-at-mode-0 gate), so a
+	// snapshot test would read all-zero in a normal session and hold the pawn
+	// in the air forever. DebugChunkStatusAt is a live query and has no such
+	// gate.
 	UVoxelWorldSubsystem* Subsystem = GetVoxelWorldSubsystem();
 	if (!Subsystem)
 	{
 		return false;
 	}
 
-	if (Subsystem->GetPerfSnapshot().LevelLoadedCount[0] <= 0)
+	const FVector Probes[2] = {Pos, Pos - FVector(0.0, 0.0, VoxelCoords::ChunkEdgeUU)};
+	for (const FVector& Probe : Probes)
 	{
-		return false;
-	}
-
-	bool bTracked = false;
-	bool bHasComponent = false;
-	int32 Quads = 0;
-	if (Subsystem->DebugChunkStatusAt(Pos, bTracked, bHasComponent, Quads) && bTracked && !bHasComponent)
-	{
-		return false;
+		bool bTracked = false;
+		bool bHasComponent = false;
+		int32 Quads = 0;
+		if (Subsystem->DebugChunkStatusAt(Probe, bTracked, bHasComponent, Quads) && bTracked && !bHasComponent)
+		{
+			return false;
+		}
 	}
 	return true;
 }

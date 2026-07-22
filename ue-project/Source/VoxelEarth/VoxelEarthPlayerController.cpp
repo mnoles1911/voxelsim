@@ -9,7 +9,9 @@
 #include "Misc/Parse.h"
 #include "TimerManager.h"
 #include "VoxelDebug.h"
+#include "UnrealClient.h"
 #include "VoxelEarth.h"
+#include "VoxelEarthFlyPawn.h"
 #include "VoxelEarthHUD.h"
 #include "VoxelExplosive.h"
 #include "VoxelWorldSubsystem.h"
@@ -136,6 +138,89 @@ void AVoxelEarthPlayerController::BeginPlay()
 	{
 		Subsystem->BeginJoinSync();
 		ServerRequestJoinSync();
+	}
+
+	// --- Usability task verification fixtures (see the header) -------------
+	//
+	// Read here, at init, alongside every other switch this controller owns --
+	// not via -ExecCmds, which lands after subsystems have already run.
+
+	float WalkModeAfterSeconds = 0.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelWalkModeAfter="), WalkModeAfterSeconds) && WalkModeAfterSeconds > 0.f)
+	{
+		World->GetTimerManager().SetTimer(WalkModeTimerHandle,
+		                                   FTimerDelegate::CreateWeakLambda(this,
+		                                                                     [this]()
+		                                                                     {
+			                                                                     if (AVoxelEarthFlyPawn* FlyPawn =
+			                                                                             Cast<AVoxelEarthFlyPawn>(GetPawn()))
+			                                                                     {
+				                                                                     FlyPawn->SetWalkMode(true);
+				                                                                     UE_LOG(LogVoxelEarth, Log,
+				                                                                            TEXT("VoxelWalkModeAfter: walk mode on"));
+			                                                                     }
+		                                                                     }),
+		                                   WalkModeAfterSeconds, false);
+	}
+
+	float OverlayShotAfterSeconds = 0.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelOverlayShot="), OverlayShotAfterSeconds) && OverlayShotAfterSeconds > 0.f)
+	{
+		World->GetTimerManager().SetTimer(
+		    OverlayShotTimerHandle,
+		    FTimerDelegate::CreateWeakLambda(
+		        this,
+		        [this]()
+		        {
+			        AVoxelEarthHUD* Hud = GetVoxelHUD();
+			        if (!Hud)
+			        {
+				        UE_LOG(LogVoxelEarth, Error, TEXT("VoxelOverlayShot: no AVoxelEarthHUD -- nothing to capture."));
+				        return;
+			        }
+
+			        // Applied here rather than in BeginPlay because the pawn
+			        // may not be possessed yet when this controller begins play.
+			        int32 FlySpeedStep = -1;
+			        if (FParse::Value(FCommandLine::Get(), TEXT("VoxelFlySpeedStep="), FlySpeedStep) && FlySpeedStep >= 0)
+			        {
+				        if (AVoxelEarthFlyPawn* FlyPawn = Cast<AVoxelEarthFlyPawn>(GetPawn()))
+				        {
+					        // AdjustFlySpeed clamps at both ends, so walking to
+					        // 0 and back up lands exactly on the requested step.
+					        FlyPawn->AdjustFlySpeed(-AVoxelEarthFlyPawn::GetFlySpeedStepCount());
+					        FlyPawn->AdjustFlySpeed(FlySpeedStep);
+				        }
+			        }
+
+			        // -VoxelHudShotOnly: capture the always-on HUD (walk/fly
+			        // mode line) WITHOUT the overlay panel over it.
+			        const bool bHudOnly = FParse::Param(FCommandLine::Get(), TEXT("VoxelHudShotOnly"));
+			        if (!bHudOnly && !Hud->IsDebugOverlayVisible())
+			        {
+				        Hud->ToggleDebugOverlay();
+			        }
+			        int32 Row = 0;
+			        if (!bHudOnly && FParse::Value(FCommandLine::Get(), TEXT("VoxelOverlayRow="), Row) && Row > 0)
+			        {
+				        Hud->MoveOverlaySelection(Row);
+			        }
+
+			        // bShowUI=TRUE, unlike the -VoxelScreenshotAfter chain: the
+			        // whole point of this fixture is the canvas HUD.
+			        FScreenshotRequest::RequestScreenshot(TEXT("VoxelOverlay"), /*bShowUI*/ true, /*bAddFilenameSuffix*/ true);
+			        UE_LOG(LogVoxelEarth, Log, TEXT("VoxelOverlayShot: overlay shown, screenshot requested (row %d)"), Row);
+
+			        UWorld* W = GetWorld();
+			        if (W)
+			        {
+				        W->GetTimerManager().SetTimer(OverlayQuitTimerHandle,
+				                                       FTimerDelegate::CreateWeakLambda(
+				                                           this, []() { FPlatformMisc::RequestExit(false); }),
+				                                       4.0f, false);
+			        }
+		        }),
+		    OverlayShotAfterSeconds, false);
 	}
 
 	// M3 gate verification switches (docs/m3-plan.md "two clients dig the

@@ -153,6 +153,26 @@ private:
 	// (seed + World::editedDigest()) -- the dedicated server's equivalent
 	// dump lives in AVoxelEarthGameMode::BeginPlay (GameMode only exists
 	// server-side). Both read BeginPlay()'s command line once.
+	// Usability task verification fixtures. The overlay and the walk/fly mode
+	// line are HUD canvas drawing driven by key presses, and the existing
+	// -VoxelScreenshotAfter chain captures with bShowUI=FALSE -- so neither
+	// could ever appear in a verification shot. These three switches make both
+	// capturable headlessly, which is the only way this stays verifiable:
+	//
+	//   -VoxelWalkModeAfter=<s>  enter walk mode at <s> (default is fly)
+	//   -VoxelFlySpeedStep=<n>   set the fly speed table index (0-based)
+	//   -VoxelOverlayShot=<s>    at <s>: open the overlay, screenshot WITH UI
+	//                            ("VoxelOverlay*.png"), then quit 4 s later.
+	//   -VoxelOverlayRow=<n>     which overlay row is selected in that shot.
+	//
+	// -VoxelOverlayShot=<s> without -VoxelOverlayRow captures the overlay with
+	// its default (top) selection; pass -VoxelOverlayShot with the overlay
+	// suppressed by simply not passing it at all -- there is no "close" form,
+	// because the overlay is default-OFF and nothing else can open it.
+	FTimerHandle WalkModeTimerHandle;
+	FTimerHandle OverlayShotTimerHandle;
+	FTimerHandle OverlayQuitTimerHandle;
+
 	FTimerHandle AutoDigTimerHandle;
 	FTimerHandle DumpDigestTimerHandle;
 	// Self-quit a few seconds after DumpDigestTimerHandle fires (gate-run

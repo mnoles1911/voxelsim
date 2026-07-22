@@ -403,16 +403,30 @@ void AVoxelEarthHUD::DrawDebugOverlay()
 
 	if (Subsystem)
 	{
-		const FVoxelPerfSnapshot Snap = Subsystem->GetPerfSnapshot();
-		FString RingsLine = TEXT("Rings  ");
-		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		// The subsystem only REFRESHES FVoxelPerfSnapshot while voxel.Debug >= 1
+		// (a deliberate "zero cost at mode 0" gate in TickStreaming), so at
+		// mode 0 these rows would be permanently stale zeros. Say so instead of
+		// showing a confident, wrong "R0 0/0" -- and point at the fix, which is
+		// the very next row of this same overlay.
+		if (VoxelDebug::GetDebugMode() >= 1)
 		{
-			RingsLine += FString::Printf(TEXT(" R%d %d/%d"), Level, Snap.LevelLoadedCount[Level], Snap.LevelPendingCount[Level]);
+			const FVoxelPerfSnapshot Snap = Subsystem->GetPerfSnapshot();
+			FString RingsLine = TEXT("Rings  ");
+			for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+			{
+				RingsLine += FString::Printf(TEXT(" R%d %d/%d"), Level, Snap.LevelLoadedCount[Level], Snap.LevelPendingCount[Level]);
+			}
+			DrawOverlayInfo(RingsLine + TEXT("   (loaded/pending)"), kOverlayInfo, PanelX, Y);
+			DrawOverlayInfo(FString::Printf(TEXT("Jobs    %d/%d in flight   queues %d/%d/%d"), Snap.JobsInFlight,
+			                                 Snap.JobsInFlightCap, Snap.PendingJobQueueDepth, Snap.PendingGameThreadQueueDepth,
+			                                 Snap.PendingUnloadQueueDepth),
+			                kOverlayInfo, PanelX, Y);
 		}
-		DrawOverlayInfo(RingsLine + TEXT("   (loaded/pending)"), kOverlayInfo, PanelX, Y);
-		DrawOverlayInfo(FString::Printf(TEXT("Jobs    %d/%d in flight   queues %d/%d/%d"), Snap.JobsInFlight, Snap.JobsInFlightCap,
-		                                 Snap.PendingJobQueueDepth, Snap.PendingGameThreadQueueDepth, Snap.PendingUnloadQueueDepth),
-		                kOverlayInfo, PanelX, Y);
+		else
+		{
+			DrawOverlayInfo(TEXT("Rings   (set voxel.Debug 1 below -- snapshot is"), kOverlayWarn, PanelX, Y);
+			DrawOverlayInfo(TEXT("Jobs     only collected at mode >= 1)"), kOverlayWarn, PanelX, Y);
+		}
 
 		// Per-position residency -- the same query walk mode's terrain-ready
 		// gate uses, so "why am I hovering" is answerable from the overlay.
