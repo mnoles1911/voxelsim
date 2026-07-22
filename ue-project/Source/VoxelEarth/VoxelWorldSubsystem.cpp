@@ -3114,7 +3114,37 @@ static constexpr int32 SkirtChunksFar = 0;
 // is safe to drive from -ExecCmds, unlike the master switch above: the deep
 // set does not exist until the anchor first goes underground, which on any
 // scripted flight is long after cvars have been applied.
-static float GSightRadiusM = 40.0f;
+// DEFAULT 64 m, which is exactly ring 0's own outer radius -- underground, the
+// level-0 ring is fully resident in three dimensions rather than as a slab.
+// Chosen by measurement, not taste. In the documented test cavern (a room
+// 46.6 m wide and 49.4 m tall, 60.7 m down, camera 2 m off one wall), the
+// capture probe reports where the sightline terminates and whether that rock
+// is meshed:
+//
+//   R = 40 m: +0deg wall at 44.9 m MESHED; +10/+20/+30deg walls at 46-51 m
+//             tracked but NOT MESHED -- i.e. everything the camera is actually
+//             pointed at is a hole, and the screenshot is open sky above a
+//             thin band of floor. At 44.6 m lateral an R = 40 sphere has zero
+//             vertical radius, so the resident set out there is the single
+//             3.2 m layer at the anchor's own Z. A horizontal ray runs down
+//             the middle of that band and sees rock the whole way, which is
+//             why a less careful probe called this a pass.
+//   R = 64 m: all four elevations MESHED. No sky in frame.
+//
+// Cost, same scene, stationary: deep records 9,350 -> 31,648 and tracked
+// 21,112 -> 44,331, for 548 -> 1,238 deep chunks that actually carry geometry
+// (3.9% -- the rest is solid rock the buried-chunk skip never dispatches).
+// Steady-state cost of that is close to nothing: recompute 0.0 ms (the refill
+// trigger stops firing once the ring converges) and subsystem tick 0.27-0.37%
+// of wall, against 0.29-0.33% at R = 40.
+//
+// WHAT IS NOT MEASURED, and it is the reason this is a cvar: MOVING
+// underground. The exit scan is O(ChunkRecords) and runs on every recompute,
+// so 44 k records is ~2.7x the surface flight's 16 k, where that scan cost
+// 2.4-2.7 ms. Nothing here exercises a moving underground anchor. See the
+// follow-up on skipping all-solid chunks at ADMISSION rather than at dispatch,
+// which would cut these records by ~25x and is the real fix if this bites.
+static float GSightRadiusM = 64.0f;
 static FAutoConsoleVariableRef CVarUndergroundSightRadius(
 	TEXT("voxel.Stream.UndergroundSightM"),
 	GSightRadiusM,
@@ -7241,39 +7271,59 @@ void UVoxelWorldSubsystem::TickCavernShot(float DeltaSeconds)
 
 		// RESIDENCY probe: whether that rock is actually MESHED, which is the
 		// claim the sight sphere makes and the only one the screenshot can
-		// confirm. Walks the forward sightline in 2 m steps asking
-		// DebugChunkStatusAt whether the chunk containing each point is
-		// tracked and owns a component. "meshed" runs out at the distance
-		// beyond which the image is darkness rather than rock, so this number
-		// should reach the sightline FindCavernPose measured.
+		// confirm. Asks DebugChunkStatusAt whether the chunk containing each
+		// sample is tracked and owns a component.
+		//
+		// A FAN, along the actual view direction and above it -- not a single
+		// horizontal ray. The horizontal-only version of this probe reported
+		// "23/23 meshed" for a frame whose entire middle was open sky, and the
+		// reason is the exact shape of what the sphere does: at 44.6 m lateral
+		// an R = 40 m sphere has ZERO vertical radius, so the resident set
+		// there is one 3.2 m band at the anchor's own Z. A ray at eye height
+		// runs straight down the middle of that band and sees rock the whole
+		// way, while everything the camera is actually looking at -- pitched
+		// 18 degrees up -- is above it and unmeshed. Sampling the view cone is
+		// what makes the probe answer the question the screenshot asks.
 		{
+			// For each elevation: raycast the VOXEL world to find where the rock
+			// the player is looking at actually is, then ask whether the chunk
+			// holding that rock is tracked and meshed. Both halves are needed
+			// and neither alone is honest.
+			//
+			// Walking a ray and counting "meshed" samples does NOT work, and
+			// the failure is instructive: a chunk of open cavern air is all-air,
+			// meshes to zero quads and correctly owns NO component, so a sample
+			// inside the room reads as "not meshed" while being exactly right.
+			// A first attempt at this probe scored +20deg as 0/23 for that
+			// reason alone. What matters is only the chunk the sightline
+			// TERMINATES in -- that is the surface that either draws or is a
+			// hole showing sky.
+			const double Elevations[4] = {0.0, 10.0, 20.0, 30.0}; // degrees above horizontal
 			FString Res;
-			double LastMeshedUU = 0.0, FirstGapUU = -1.0;
-			int32 Tracked = 0, Meshed = 0, Samples = 0;
-			for (double D = 200.0; D <= CavernShotSightlineUU + 200.0; D += 200.0)
+			for (const double ElevDeg : Elevations)
 			{
-				const FVector P = CavernShotCameraUU + FVector(D, 0, 0);
+				const double Rad = FMath::DegreesToRadians(ElevDeg);
+				const FVector Dir(FMath::Cos(Rad), 0.0, FMath::Sin(Rad));
+				FVector Hit, PrevVoxel;
+				if (!RaycastVoxelWorld(CavernShotCameraUU, Dir, 8000.0, Hit, PrevVoxel))
+				{
+					Res += FString::Printf(TEXT("[+%.0fdeg NO ROCK within 80m] "), ElevDeg);
+					continue;
+				}
+				const double DistM = (Hit - CavernShotCameraUU).Size() / 100.0;
+				// One voxel PAST the surface, so the sample lands in the solid
+				// chunk that owns the visible face rather than in the air chunk
+				// in front of it.
 				bool bTracked = false, bHasComponent = false;
 				int32 Quads = 0;
-				++Samples;
-				if (DebugChunkStatusAt(P, bTracked, bHasComponent, Quads))
-				{
-					Tracked += bTracked ? 1 : 0;
-					Meshed += bHasComponent ? 1 : 0;
-					if (bHasComponent)
-					{
-						LastMeshedUU = D;
-					}
-					else if (FirstGapUU < 0.0)
-					{
-						FirstGapUU = D;
-					}
-				}
+				const bool bKnown = DebugChunkStatusAt(Hit + Dir * VoxelCoords::VoxelSizeUU, bTracked, bHasComponent, Quads);
+				Res += FString::Printf(TEXT("[+%.0fdeg wall at %.1fm: %s] "), ElevDeg, DistM,
+				                       !bKnown          ? TEXT("NOT TRACKED -> renders as a hole")
+				                       : !bHasComponent ? TEXT("tracked but NOT MESHED -> renders as a hole")
+				                                        : TEXT("MESHED -> draws"));
 			}
-			Res = FString::Printf(TEXT("samples=%d tracked=%d meshed=%d | meshed out to %.1fm | first gap at %.1fm | measured sightline %.1fm"),
-			                      Samples, Tracked, Meshed, LastMeshedUU / 100.0,
-			                      FirstGapUU < 0.0 ? -1.0 : FirstGapUU / 100.0, CavernShotSightlineUU / 100.0);
-			UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCavernShot: forward RESIDENCY probe: %s"), *Res);
+			UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCavernShot: RESIDENCY fan (sightline %.1fm, sight sphere R=%.0fm): %s"),
+			       CavernShotSightlineUU / 100.0, double(VoxelUnderground::GSightRadiusM), *Res);
 		}
 
 		const FVoxelPerfSnapshot Snap = GetPerfSnapshot();
