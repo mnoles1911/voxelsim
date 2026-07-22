@@ -32,7 +32,22 @@ namespace VoxelCoords
 	// (1<<L) times the edge length of a level-0 voxel; a level-L render
 	// chunk still spans ChunkEdgeVoxels (32) level-L cells, so its world
 	// footprint doubles per level ("8 cubes become 1 in place").
-	inline constexpr int32 kNumLevels = 5;
+	// Raised 5 -> 6 to push the voxel cascade from 1024 m out to 2048 m (R5 =
+	// mip level 5, 102.4 m chunks over the 1024-2048 m annulus). This became
+	// affordable only once the worker stopped building level-L chunks by folding
+	// 8^L level-0 bricks and started generating them directly
+	// (MakeCoarseLevelSampler in VoxelWorldSubsystem.cpp): per-chunk worker cost
+	// is now flat in level (~4 ms at every level) instead of 8x per level, so an
+	// extra ring costs chunks, not exponentially more time per chunk.
+	//
+	// If you change this, note that SIX hand-written per-level tables must grow
+	// with it. C++ silently zero-fills a too-short initializer list, and the
+	// resulting failures are all silent runtime ones (an all-zero ring annulus
+	// admits nothing; an all-zero admission cutoff REJECTS everything; a zero
+	// RingPresets outer radius collapses the clipmap to zero extent). Every one
+	// of those tables now carries a static_assert on its own length so the
+	// mistake is a compile error instead. Search kNumLevels.
+	inline constexpr int32 kNumLevels = 6;
 
 	// Floored division matching vxc::floorDiv (C++ integer division truncates
 	// toward zero; voxel/brick/chunk lattice indexing needs floor instead).

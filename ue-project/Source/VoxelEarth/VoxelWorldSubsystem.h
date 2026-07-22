@@ -89,8 +89,22 @@ public:
 		{128.0, 256.0},
 		{256.0, 512.0},
 		{512.0, 1024.0},
+		{1024.0, 2048.0}, // R5: the 2 km cascade edge
 	};
+	// A short initializer list here is silently zero-filled by C++, and the
+	// consequences are runtime-silent rather than loud: a {0,0} annulus admits no
+	// chunks at that level, and AVoxelClipmapActor derives its ENTIRE vertex
+	// spacing from RingPresets[kNumLevels-1].OuterMeters, so a zero there
+	// collapses the whole 30 km heightmap to a degenerate zero-extent mesh.
+	static_assert(UE_ARRAY_COUNT(RingPresets) == VoxelCoords::kNumLevels, "RingPresets must have one entry per level");
 	static constexpr double UnloadRingMultiplier = 1.25;
+
+	// Outermost ring level actually streaming this run (-VoxelMaxRingLevel=<N>,
+	// default kNumLevels-1). RingPresets[GetMaxRingLevel()].OuterMeters is
+	// therefore where the voxel world really ends, which is what
+	// AVoxelClipmapActor has to butt its inner hole against -- see
+	// SpacingUUForLevel. Resolved once from the command line at first use.
+	static int32 GetMaxRingLevel();
 
 	// Back-compat aliases (R0's radii; a handful of log lines still reference
 	// these by name -- unchanged numeric values from the pre-M2 single ring).
