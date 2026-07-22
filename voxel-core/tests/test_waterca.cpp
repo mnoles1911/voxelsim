@@ -927,3 +927,282 @@ VXC_TEST(waterca_wake_region_halo_reaches_one_brick_not_two) {
     // An edit in brick (0,0,-1) is directly below it: within the halo.
     CHECK_EQ(ca.wakeRegion(1, 1, -1, 1, 1, -1), size_t(1));
 }
+
+// ===========================================================================
+// C8 — mobilize-on-approach (waterca.h WaterMobilizer, docs/cavern-design.md
+// §5.2). A synthetic stand-in for a flooded cavern: voxel-core's water layer
+// never includes caverns.h, so the implicit field arrives as a plain lambda
+// and these tests exercise the handover, not worldgen.
+// ===========================================================================
+
+namespace {
+
+// The synthetic cavern. Rock everywhere except:
+//
+//   ROOM  : 0<=x<8,  0<=y<8, 4<=z<12   the cavern, implicitly flooded to z<10
+//   PLUG  : x==8,    2<=y<6, 4<=z<6    rock until the "dig" opens it
+//   SUMP  : 9<=x<16, 2<=y<6, -4<=z<6   a dry lower chamber to drain into
+//
+// The room holds 8*8*6 = 384 implicit water cells at 255 = 97,920 fill units,
+// and the sump has room for most but not all of it, so the settled result has
+// water on both sides of the dig — a partial drain, like the real thing.
+constexpr int64_t kRoomX = 8, kRoomY = 8, kRoomZ0 = 4, kRoomZ1 = 12;
+constexpr int64_t kFloodZ = 10; // implicit water fills 4 <= z < 10
+constexpr uint64_t kLakeVolume = 8 * 8 * 6 * 255;
+
+bool inRoom(int64_t vx, int64_t vy, int64_t vz) {
+    return vx >= 0 && vx < kRoomX && vy >= 0 && vy < kRoomY && vz >= kRoomZ0 && vz < kRoomZ1;
+}
+bool inPlug(int64_t vx, int64_t vy, int64_t vz) {
+    return vx == 8 && vy >= 2 && vy < 6 && vz >= 4 && vz < 6;
+}
+bool inSump(int64_t vx, int64_t vy, int64_t vz) {
+    return vx >= 9 && vx < 16 && vy >= 2 && vy < 6 && vz >= -4 && vz < 6;
+}
+
+// `plugOpen` is the dig: flipping it turns the PLUG cells to air at runtime,
+// exactly the way basinWithDrain() models a dig above.
+WaterCA::SolidFn cavernTerrain(std::shared_ptr<bool> plugOpen) {
+    return [plugOpen](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
+        if (inRoom(vx, vy, vz) || inSump(vx, vy, vz)) return MAT_AIR;
+        if (inPlug(vx, vy, vz)) return *plugOpen ? MAT_AIR : MAT_ROCK;
+        return MAT_ROCK;
+    };
+}
+
+// The implicit static flood field: cave air below the flood level. Mirrors
+// caverns.h's documented pairing `cavernFloodedAt(col.cavern, vz) &&
+// materialAt(col, vz) == MAT_AIR`.
+WaterMobilizer::ImplicitFn cavernFlood() {
+    return [](int64_t vx, int64_t vy, int64_t vz) -> uint8_t {
+        return (inRoom(vx, vy, vz) && vz < kFloodZ) ? uint8_t(255) : uint8_t(0);
+    };
+}
+
+// Sums the implicit field's CURRENT contribution (i.e. respecting the
+// mobilization handover) over a box comfortably containing the whole fixture.
+uint64_t implicitVolume(const WaterMobilizer& mob) {
+    uint64_t sum = 0;
+    for (int64_t z = -8; z < 16; ++z)
+        for (int64_t y = -2; y < 10; ++y)
+            for (int64_t x = -2; x < 18; ++x) sum += mob.implicitFillAt(x, y, z);
+    return sum;
+}
+
+} // namespace
+
+// An untouched lake is FREE: no bricks, no ledger, no activity — the entire
+// point of generating cavern water implicitly instead of filling the CA.
+VXC_TEST(waterca_mobilize_untouched_lake_costs_nothing) {
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(cavernFlood(), cavernTerrain(plugOpen));
+    WaterCA ca(mob.makeSolidFn());
+
+    CHECK_EQ(implicitVolume(mob), kLakeVolume);
+    CHECK_EQ(ca.totalVolume(), uint64_t(0));
+    CHECK_EQ(ca.storedBrickCount(), size_t(0));
+    CHECK_EQ(mob.mobilizedBricks().size(), size_t(0));
+
+    for (int i = 0; i < 10; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+    }
+    CHECK_EQ(ca.storedBrickCount(), size_t(0));  // nothing ever ticked
+    CHECK_EQ(implicitVolume(mob), kLakeVolume);  // and the lake is untouched
+    CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+}
+
+// The wall invariant (waterca.h "SO WE MAKE IT STRUCTURALLY IMPOSSIBLE"):
+// still-implicit water reads as SOLID, so CA water physically cannot occupy a
+// cell the implicit field still owns. This is what makes double occupancy —
+// and therefore the create/destroy choice at mobilization time — impossible.
+VXC_TEST(waterca_mobilize_implicit_water_is_a_wall_until_mobilized) {
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(cavernFlood(), cavernTerrain(plugOpen));
+    WaterCA::SolidFn terrain = mob.terrainSolidFn();
+    WaterCA ca(mob.makeSolidFn());
+
+    // Bare terrain says this cell is open cave air; the composed function says
+    // solid, because the implicit lake still owns it.
+    CHECK_EQ(int(terrain(4, 4, 6)), int(MAT_AIR));
+    CHECK_EQ(int(mob.makeSolidFn()(4, 4, 6)), int(MAT_ROCK));
+    // Above the flood level it is ordinary air again.
+    CHECK_EQ(int(mob.makeSolidFn()(4, 4, 11)), int(MAT_AIR));
+
+    // Pour CA water into the air gap above the lake: it lands ON the implicit
+    // surface and never sinks into it.
+    const uint32_t placed = ca.addWater(4, 4, 11, 255);
+    CHECK_EQ(placed, uint32_t(255));
+    CHECK(runToSettleCheckingConservation(ca, 400));
+    CHECK_EQ(ca.totalVolume(), uint64_t(255));
+    for (int64_t z = kRoomZ0; z < kFloodZ; ++z) CHECK_EQ(int(ca.fillAt(4, 4, z)), 0);
+    CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+}
+
+// THE CONSERVATION PROOF. Dig into the lake and drain it, asserting after
+// EVERY tick that implicit + CA is exactly the volume we started with — no
+// unit created, none lost, across the whole mobilization sequence.
+VXC_TEST(waterca_mobilize_dig_into_lake_conserves_exactly) {
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(cavernFlood(), cavernTerrain(plugOpen));
+    WaterCA ca(mob.makeSolidFn());
+
+    CHECK_EQ(implicitVolume(mob) + ca.totalVolume(), kLakeVolume);
+
+    // The dig: open the plug, then run the two hooks an engine edit runs —
+    // invalidate the solidity memo, mobilize the edit region, wake it.
+    *plugOpen = true;
+    ca.invalidateSolidRegion(8, 2, 4, 8, 5, 5);
+    const size_t seeded = mob.mobilizeEditRegion(ca, 8, 2, 4, 8, 5, 5);
+    CHECK(seeded > 0); // the dig reached real lake water
+    ca.wakeRegion(8, 2, 4, 8, 5, 5);
+
+    // Drain, advancing the front before every tick, auditing every tick.
+    bool settled = false;
+    for (int i = 0; i < 3000; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        CHECK_EQ(ca.totalVolume(), ca.recomputeVolume());
+        CHECK_EQ(implicitVolume(mob) + ca.totalVolume(), kLakeVolume);
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        if (ca.steppedBrickCount() == 0 && mob.pendingFrontBricks() == 0) {
+            settled = true;
+            break;
+        }
+    }
+    CHECK(settled);
+
+    // It really drained: the whole lake mobilized, and water reached the sump.
+    CHECK_EQ(implicitVolume(mob), uint64_t(0));
+    CHECK_EQ(ca.totalVolume(), kLakeVolume);
+    CHECK_EQ(mob.debitedVolume(), kLakeVolume);
+    CHECK_EQ(mob.creditedVolume(), kLakeVolume);
+    CHECK(int(ca.fillAt(12, 3, -4)) > 0); // sump floor, on the far side of the dig
+}
+
+// The per-tick budget is a rate limit, never a correctness knob: a deferred
+// brick is still a wall, so a one-brick-per-tick front and an unbounded one
+// converge on the same conserved end state and the same mobilized set. (The
+// intermediate drain path legitimately differs — that IS the budget working.)
+VXC_TEST(waterca_mobilize_front_budget_does_not_change_the_outcome) {
+    auto run = [](size_t budget, uint64_t& outVolume, std::vector<BrickKey>& outMobilized) {
+        auto plugOpen = std::make_shared<bool>(false);
+        WaterMobilizer mob(cavernFlood(), cavernTerrain(plugOpen));
+        WaterCA ca(mob.makeSolidFn());
+        *plugOpen = true;
+        ca.invalidateSolidRegion(8, 2, 4, 8, 5, 5);
+        mob.mobilizeEditRegion(ca, 8, 2, 4, 8, 5, 5);
+        ca.wakeRegion(8, 2, 4, 8, 5, 5);
+        for (int i = 0; i < 3000; ++i) {
+            mob.advanceFront(ca, budget);
+            ca.step();
+            CHECK_EQ(implicitVolume(mob) + ca.totalVolume(), kLakeVolume);
+            if (ca.steppedBrickCount() == 0 && mob.pendingFrontBricks() == 0) break;
+        }
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        outVolume = ca.totalVolume();
+        outMobilized.assign(mob.mobilizedBricks().begin(), mob.mobilizedBricks().end());
+    };
+
+    uint64_t volSlow = 0, volFast = 0;
+    std::vector<BrickKey> mobSlow, mobFast;
+    run(1, volSlow, mobSlow);
+    run(4096, volFast, mobFast);
+
+    CHECK_EQ(volSlow, kLakeVolume);
+    CHECK_EQ(volFast, kLakeVolume);
+    CHECK(mobSlow == mobFast);
+}
+
+// Mobilization is one-way and idempotent — the `mobilizedBricks` set is what
+// stops a re-entered brick from being credited twice (the duplication this
+// whole class exists to prevent).
+VXC_TEST(waterca_mobilize_brick_is_idempotent) {
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(cavernFlood(), cavernTerrain(plugOpen));
+    WaterCA ca(mob.makeSolidFn());
+
+    const BrickKey k = waterKeyForVoxel(4, 4, 6); // squarely inside the lake
+    const uint32_t first = mob.mobilizeBrick(ca, k);
+    CHECK(first > 0);
+    CHECK(mob.isMobilized(k));
+    const uint64_t after = ca.totalVolume();
+
+    for (int i = 0; i < 5; ++i) CHECK_EQ(mob.mobilizeBrick(ca, k), uint32_t(0));
+    CHECK_EQ(ca.totalVolume(), after);
+    CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+    CHECK_EQ(mob.debitedVolume(), mob.creditedVolume());
+
+    // A brick with no implicit water is not recorded at all — ordinary surface
+    // water must not grow the persisted set.
+    const BrickKey dry = waterKeyForVoxel(12, 3, -4); // in the dry sump
+    CHECK_EQ(mob.mobilizeBrick(ca, dry), uint32_t(0));
+    CHECK(!mob.isMobilized(dry));
+}
+
+// The replication / savegame-load inbound path credits NOTHING: the units are
+// already present in the replicated or loaded CA fill, so crediting them again
+// would duplicate exactly the water this class protects. It only moves the
+// ownership line so the client stops drawing the brick as implicit water.
+VXC_TEST(waterca_mobilize_mark_mobilized_credits_nothing) {
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(cavernFlood(), cavernTerrain(plugOpen));
+    WaterCA ca(mob.makeSolidFn());
+
+    const BrickKey k = waterKeyForVoxel(4, 4, 6);
+    mob.markMobilized(k);
+    CHECK(mob.isMobilized(k));
+    CHECK_EQ(ca.totalVolume(), uint64_t(0));      // nothing credited
+    CHECK_EQ(mob.debitedVolume(), uint64_t(0));   // and nothing debited
+    CHECK_EQ(mob.shortfallVolume(), uint64_t(0)); // so the ledger still balances
+
+    // The brick's cells now read as CA-owned (implicit contributes 0) and are
+    // no longer a wall, which is what lets the replicated fill live there.
+    CHECK_EQ(int(mob.implicitFillAt(4, 4, 6)), 0);
+    CHECK(implicitVolume(mob) < kLakeVolume);
+
+    // A subsequent mobilizeBrick is a no-op, so a load followed by normal play
+    // cannot re-credit the loaded lake.
+    CHECK_EQ(mob.mobilizeBrick(ca, k), uint32_t(0));
+    CHECK_EQ(ca.totalVolume(), uint64_t(0));
+}
+
+// Filling a hole destroys water, and it must do so QUIETLY — no shortfall
+// alarm. A block placed into a still-implicit lake leaves that cell holding
+// nothing (implicitFillAt gates on current terrain), so the later mobilization
+// credits exactly what it debits. This is the same discontinuity a placement
+// into CA water already causes in totalVolume(); the point is that the two
+// kinds of water now behave identically. See the WaterMobilizer constructor's
+// "WHY TERRAIN IS PART OF THE IMPLICIT FIELD" comment.
+VXC_TEST(waterca_mobilize_placing_into_an_implicit_lake_raises_no_shortfall) {
+    auto plugOpen = std::make_shared<bool>(false);
+    // A placement overlay on top of the cavern terrain, the way an engine edit
+    // sits on top of the worldgen raster.
+    auto placed = std::make_shared<bool>(false);
+    WaterCA::SolidFn base = cavernTerrain(plugOpen);
+    WaterCA::SolidFn withPlacement = [base, placed](int64_t vx, int64_t vy,
+                                                    int64_t vz) -> MaterialId {
+        if (*placed && vx == 4 && vy == 4 && vz == 5) return MAT_ROCK;
+        return base(vx, vy, vz);
+    };
+    WaterMobilizer mob(cavernFlood(), withPlacement);
+    WaterCA ca(mob.makeSolidFn());
+
+    CHECK_EQ(implicitVolume(mob), kLakeVolume);
+    CHECK_EQ(int(mob.implicitFillAt(4, 4, 5)), 255);
+
+    // Place a block into the unmobilized lake. That cell's implicit water is
+    // destroyed by the placement — exactly one cell's worth, no more.
+    *placed = true;
+    ca.invalidateSolidRegion(4, 4, 5, 4, 4, 5);
+    CHECK_EQ(int(mob.implicitFillAt(4, 4, 5)), 0);
+    CHECK_EQ(implicitVolume(mob), kLakeVolume - 255);
+
+    // Now mobilize the affected brick the way the edit hook would. The ledger
+    // balances: nothing was debited for the filled cell, so nothing is missing.
+    mob.mobilizeEditRegion(ca, 4, 4, 5, 4, 4, 5);
+    CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+    CHECK_EQ(mob.debitedVolume(), mob.creditedVolume());
+    CHECK_EQ(int(ca.fillAt(4, 4, 5)), 0); // the CA never put water in the rock
+    CHECK(int(ca.fillAt(4, 4, 6)) > 0);   // but the rest of the brick converted
+}
