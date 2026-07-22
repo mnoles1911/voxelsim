@@ -128,6 +128,58 @@ private:
 	// (Out untouched) if neither is available yet.
 	bool GetCameraLocationUU(FVector& OutCameraLocationUU) const;
 
+	// ---- Underground veil (see the "UNDERGROUND VEIL" block in the .cpp for
+	// the full diagnosis this implements) ----------------------------------
+	//
+	// The world is a SHELL, not a solid: the voxel mesher emits a quad only
+	// where solid meets air (voxel-core mesher.h), and the 1-voxel apron is
+	// re-derived from the deterministic generator rather than read from
+	// neighbor residency -- so underground rock is surrounded by rock and
+	// meshes to ZERO geometry, everywhere except the thin band around a
+	// carved/natural void. M_VoxelTerrain is one-sided, so the surface skin
+	// that DOES exist is backface-culled when viewed from below. Net effect
+	// from inside a cave: past the underground streaming radius there is
+	// simply nothing, and the two-sided distant actors (this clipmap, the
+	// ocean plane) plus the SkyAtmosphere paint a sunlit vista over what
+	// should be solid rock.
+	//
+	// No material or winding change can fix that -- there is no geometry down
+	// there to shade. Instead, when the camera actually has rock overhead we
+	// hide the clipmap and draw a single inward-facing dark box far outside
+	// the voxel cascade, which occludes sky/ocean/clipmap in one draw call
+	// while leaving every real cave surface in front of it untouched.
+
+	// Probes straight up from the camera for solid voxels (this is the
+	// physically honest test -- "is there rock over my head", not "is my Z
+	// below some heightfield sample", which mis-fires by tens of meters on an
+	// amplified peak and would switch the veil on ABOVE ground). Costs one
+	// amplifier column plus a handful of analytic-in-Z material lookups.
+	bool IsCameraUnderRock(const FVector& CameraLocUU) const;
+
+	// Applies the current veil state to the level meshes + shell. Only ever
+	// touches components on a state TRANSITION.
+	void SetVeilActive(bool bActive);
+
+	// Builds the 8-vertex / 12-triangle inward-facing box once, lazily.
+	void EnsureVeilShell();
+
+	UPROPERTY(Transient)
+	TObjectPtr<UProceduralMeshComponent> VeilShell;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> VeilShellMID;
+
+	// -VoxelUndergroundVeil=0 disables the whole feature (read once at
+	// BeginPlay, NOT a cvar: -ExecCmds applies after systems initialise and
+	// can silently measure the same state twice).
+	bool bVeilEnabled = true;
+
+	bool bVeilActive = false;
+	// False until SetVeilActive has run once, so the very first evaluation
+	// always applies (and logs) even though it agrees with bVeilActive's
+	// initialiser.
+	bool bVeilStateKnown = false;
+
 	// voxel.Debug.Rings (m2-plan.md "Debug" row): cyan tint on every
 	// clipmap level, applied/cleared only on a mode transition (never
 	// creates a MID while the layer is off, matching the doctrine every
