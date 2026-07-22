@@ -932,6 +932,24 @@ struct FJobResult
 	uint64 GenerationId = 0;
 	TArray<FVoxelChunkQuad> Quads;
 	float JobMs = 0.f; // wall time inside the worker task body (docs/debug-tooling-plan.md P1 "Worker timings")
+
+	// --- Buried-chunk pre-dispatch skip, MEASUREMENT ONLY (-VoxelMeasureEmpty).
+	// docs/status.md "Buried-chunk pre-dispatch skip" step 1: before building
+	// any skip we must know what fraction of worker output meshes to zero
+	// quads, split by ring level, and WHAT those chunks are -- all-air, all-
+	// solid, or something subtler. Two prior leads on this project turned out
+	// to be misdiagnoses, so nothing here is assumed.
+	//
+	// GridMs is the level-0 column-grid build (the (32+2)^2 Amplifier::column
+	// calls) measured separately from the mesh, because which of the two
+	// dominates decides what a skip can possibly save: if the mesher's own
+	// early-outs already make a buried chunk nearly free, the only thing left
+	// to reclaim is the column grid.
+	float GridMs = 0.f;
+	// 0 = produced quads, 1 = all air, 2 = all solid (no AIR in chunk+apron),
+	// 3 = zero quads but neither (mixed with no visible face). Only filled in
+	// when the measurement switch is on; otherwise stays 0.
+	uint8 EmptyClass = 0;
 };
 } // namespace VoxelStreaming
 
@@ -1138,6 +1156,25 @@ int32 GetPendingJobCap()
 		return FMath::Max(0, Value); // 0 = unbounded (pre-wave behaviour)
 	}();
 	return Cap;
+}
+
+// docs/status.md "Buried-chunk pre-dispatch skip", step 1 (measure before
+// changing anything). Turns on the per-level zero-quad census in the worker
+// job: every job additionally classifies its chunk as all-air / all-solid /
+// mixed-no-face, and times the level-0 column-grid build separately from the
+// mesh. The census costs a 34^3 sampler sweep per job, so it is a MEASUREMENT
+// switch and never on in a throughput or gate run -- the numbers it reports
+// describe the pipeline, but the run it reports them from is slower than the
+// pipeline it describes.
+//
+// Read at first use from the command line rather than as a cvar, because
+// -ExecCmds cvars apply only AFTER streaming has initialised and would
+// silently census nothing for the first seconds of a run (the established
+// -VoxelPendingJobCap= / -VoxelRingQuota= pattern, for the same reason).
+bool MeasureEmptyEnabled()
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelMeasureEmpty"));
+	return bEnabled;
 }
 } // namespace VoxelStreamAdmission
 
@@ -1526,6 +1563,34 @@ struct FVoxelWorldImpl
 	int64 RecordsEvictedSinceLog = 0;   // DrainUnloads: records erased (component-less + parked)
 	int64 CandidatesRejectedSinceLog = 0; // bounded admission: in-annulus candidates NOT admitted (never became records)
 	int64 RecordsDroppedSinceLog = 0;     // bounded admission: queued-but-never-meshed records displaced by nearer work
+
+	// --- Buried-chunk pre-dispatch skip, step 1 census (docs/status.md).
+	// Per RING LEVEL, over the same 5s window as everything above: results
+	// drained, of which zero-quad, split by composition. The existing
+	// ZeroQuadAppliesSinceLog is a single world-wide number and cannot answer
+	// "is this an R0 deep-column problem or an R3/R4 problem", which is the
+	// question that decides where a skip should be aimed. The class split is
+	// only populated under -VoxelMeasureEmpty (see MeasureEmptyEnabled).
+	int64 LevelResultsSinceLog[VoxelCoords::kNumLevels] = {};
+	int64 LevelZeroQuadSinceLog[VoxelCoords::kNumLevels] = {};
+	int64 LevelAllAirSinceLog[VoxelCoords::kNumLevels] = {};
+	int64 LevelAllSolidSinceLog[VoxelCoords::kNumLevels] = {};
+	int64 LevelMixedEmptySinceLog[VoxelCoords::kNumLevels] = {};
+	// Level-0 column-grid build time vs total job time, summed over the window:
+	// the "what could a skip possibly reclaim" ratio.
+	double AccumLevel0GridMs = 0.0;
+	double AccumLevel0JobMs = 0.0;
+	// THE decisive number for this wave, and the one the job-count census
+	// cannot give: worker WALL TIME split by outcome. 77% of jobs meshing to
+	// zero quads only justifies a skip if those jobs are also a large share of
+	// worker time -- the mesher early-outs on a uniform chunk, so a zero-quad
+	// job is already cheaper than a surface one, and the honest ceiling on
+	// this wave is LevelZeroQuadMs / (LevelZeroQuadMs + LevelQuadMs), not 77%.
+	// Always accumulated (two float adds, no census sweep) so it can be read
+	// from a run with -VoxelMeasureEmpty OFF -- the census's own 34^3 sweep
+	// lands inside JobMs and would inflate the zero-quad side badly.
+	double LevelZeroQuadMsSinceLog[VoxelCoords::kNumLevels] = {};
+	double LevelQuadMsSinceLog[VoxelCoords::kNumLevels] = {};
 
 	// The 60fps bar is 16.6ms, but the hitch log/`UVoxelPerfRunSubsystem`'s
 	// hitch count both use the much looser 33.3ms threshold -- a recurring
@@ -2122,6 +2187,42 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       VoxelStreamAdmission::GetPendingJobCap(),
 	       AdmissionCutoffDistSq < DBL_MAX ? FMath::Sqrt(AdmissionCutoffDistSq) / 100.0 : -1.0,
 	       (long long)CandidatesRejectedSinceLog, (long long)RecordsDroppedSinceLog);
+	// Buried-chunk pre-dispatch skip, step 1 census. One line per ring level:
+	// results/zeroQuad is the fraction of that ring's worker output that
+	// produced no geometry at all, and air/solid/mixed says what those chunks
+	// were (only non-zero under -VoxelMeasureEmpty). gridMs/jobMs on R0 is the
+	// share of a level-0 job spent building the (32+2)^2 column grid, i.e. the
+	// ceiling on what any pre-dispatch skip can reclaim there.
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+	{
+		if (LevelResultsSinceLog[Level] == 0)
+		{
+			continue;
+		}
+		FString GridSuffix;
+		if (Level == 0 && AccumLevel0JobMs > 0.0)
+		{
+			GridSuffix = FString::Printf(TEXT(" | gridMs=%.1f jobMs=%.1f (grid %.1f%% of job)"), AccumLevel0GridMs,
+			                             AccumLevel0JobMs, 100.0 * AccumLevel0GridMs / AccumLevel0JobMs);
+		}
+		const double TotalMs = LevelZeroQuadMsSinceLog[Level] + LevelQuadMsSinceLog[Level];
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel empty census R%d (5s window): results=%lld zeroQuad=%lld (%.1f%%) air=%lld solid=%lld mixed=%lld | ")
+		       TEXT("workerMs zeroQuad=%.1f quad=%.1f (zeroQuad %.1f%% of worker time)%s"),
+		       Level, (long long)LevelResultsSinceLog[Level], (long long)LevelZeroQuadSinceLog[Level],
+		       100.0 * double(LevelZeroQuadSinceLog[Level]) / double(LevelResultsSinceLog[Level]),
+		       (long long)LevelAllAirSinceLog[Level], (long long)LevelAllSolidSinceLog[Level],
+		       (long long)LevelMixedEmptySinceLog[Level], LevelZeroQuadMsSinceLog[Level], LevelQuadMsSinceLog[Level],
+		       TotalMs > 0.0 ? 100.0 * LevelZeroQuadMsSinceLog[Level] / TotalMs : 0.0, *GridSuffix);
+	}
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+	{
+		LevelResultsSinceLog[Level] = LevelZeroQuadSinceLog[Level] = LevelAllAirSinceLog[Level] = 0;
+		LevelAllSolidSinceLog[Level] = LevelMixedEmptySinceLog[Level] = 0;
+		LevelZeroQuadMsSinceLog[Level] = LevelQuadMsSinceLog[Level] = 0.0;
+	}
+	AccumLevel0GridMs = AccumLevel0JobMs = 0.0;
+
 	AccumDispatchMs = AccumApplyMs = AccumRemeshMs = AccumUnloadMs = AccumRecomputeMs = AccumTickMs = 0.0;
 	AccumTicks = 0;
 	JobsDispatchedSinceLog = ResultsDrainedSinceLog = StaleDiscardsSinceLog = ZeroQuadAppliesSinceLog = 0;
@@ -2981,6 +3082,46 @@ void FVoxelWorldImpl::DispatchJobs()
 				Result.GenerationId = GenId;
 
 				const VoxelCoords::FVoxelChunkKey& Key = LevelKey.Key;
+				const bool bMeasureEmpty = VoxelStreamAdmission::MeasureEmptyEnabled();
+				// Classify a zero-quad chunk over the SAME domain the mesher
+				// reads: the chunk interior plus its 1-voxel apron. The mesher
+				// emits a face only where a solid voxel has an AIR neighbour
+				// (voxelcore/mesher.h -- material boundaries emit nothing), so
+				// "no SOLID in the interior" and "no AIR anywhere in
+				// chunk+apron" are each individually sufficient for zero quads.
+				// Anything else that still meshed to zero is class 3 and is the
+				// interesting residue.
+				const auto ClassifyEmpty = [](const auto& Sampler, const VoxelCoords::FVoxelChunkKey& K) -> uint8
+				{
+					constexpr int32 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
+					const int64 BX = int64(K.X) * ChunkVox;
+					const int64 BY = int64(K.Y) * ChunkVox;
+					const int64 BZ = int64(K.Z) * ChunkVox;
+					bool bAnyAir = false, bAnySolidInterior = false;
+					for (int32 Z = -1; Z <= ChunkVox; ++Z)
+					{
+						for (int32 Y = -1; Y <= ChunkVox; ++Y)
+						{
+							for (int32 X = -1; X <= ChunkVox; ++X)
+							{
+								const bool bAir = Sampler(BX + X, BY + Y, BZ + Z) == vxc::MAT_AIR;
+								bAnyAir |= bAir;
+								const bool bInterior =
+									X >= 0 && X < ChunkVox && Y >= 0 && Y < ChunkVox && Z >= 0 && Z < ChunkVox;
+								bAnySolidInterior |= (bInterior && !bAir);
+							}
+						}
+					}
+					if (!bAnySolidInterior)
+					{
+						return 1; // all air in the interior (apron irrelevant -- mesher early-out 1)
+					}
+					if (!bAnyAir)
+					{
+						return 2; // all solid across chunk+apron
+					}
+					return 3; // zero quads but neither
+				};
 				if (LevelKey.Level == 0)
 				{
 					// Column-cache the whole job (docs/m1-plan.md stage 3a): a
@@ -3003,6 +3144,13 @@ void FVoxelWorldImpl::DispatchJobs()
 					TArray<vxc::ColumnSample> Columns;
 					Columns.SetNumUninitialized(GridEdge * GridEdge);
 					const vxc::Amplifier& Amp = GenPtr->amplifier();
+					// Buried-chunk skip step 1: time the column-grid build apart
+					// from the mesh. These (32+2)^2 Amplifier::column calls are
+					// the only part of a level-0 job that a pre-dispatch skip
+					// could reclaim -- the mesher's own early-outs already make
+					// the mesh of a uniform chunk cheap -- so this split is what
+					// decides whether the skip is worth building at all.
+					const double GridStartSeconds = FPlatformTime::Seconds();
 					for (int32 LY = 0; LY < GridEdge; ++LY)
 					{
 						for (int32 LX = 0; LX < GridEdge; ++LX)
@@ -3011,6 +3159,7 @@ void FVoxelWorldImpl::DispatchJobs()
 								Amp.column(BaseVX + LX - 1, BaseVY + LY - 1);
 						}
 					}
+					Result.GridMs = float((FPlatformTime::Seconds() - GridStartSeconds) * 1000.0);
 					const auto GridSampler = [&Columns, BaseVX, BaseVY](int64 X, int64 Y, int64 Z)
 					{
 						const int32 LX = int32(X - BaseVX) + 1;
@@ -3025,6 +3174,10 @@ void FVoxelWorldImpl::DispatchJobs()
 					// (that stays uninstrumented this pass, per P1 scope).
 					PerfCountersPtr->incColumnEvals(uint64_t(GridEdge) * GridEdge);
 					MeshChunkBricks(Key, GridSampler, Result.Quads, PerfCountersPtr);
+					if (bMeasureEmpty && Result.Quads.Num() == 0)
+					{
+						Result.EmptyClass = ClassifyEmpty(GridSampler, Key);
+					}
 				}
 				else
 				{
@@ -3042,6 +3195,10 @@ void FVoxelWorldImpl::DispatchJobs()
 					const auto LevelSampler =
 						MakeLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot);
 					MeshChunkBricks(Key, LevelSampler, Result.Quads, PerfCountersPtr);
+					if (bMeasureEmpty && Result.Quads.Num() == 0)
+					{
+						Result.EmptyClass = ClassifyEmpty(LevelSampler, Key);
+					}
 				}
 
 				Result.JobMs = float((FPlatformTime::Seconds() - JobStartSeconds) * 1000.0);
@@ -3242,6 +3399,33 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			LevelWorkerJobMsWindow[Lvl][LevelWorkerJobMsWindowNext[Lvl]] = Result.JobMs;
 			LevelWorkerJobMsWindowNext[Lvl] = (LevelWorkerJobMsWindowNext[Lvl] + 1) % WorkerJobMsWindowSize;
 			LevelWorkerJobMsWindowCount[Lvl] = FMath::Min(LevelWorkerJobMsWindowCount[Lvl] + 1, WorkerJobMsWindowSize);
+		}
+
+		// Buried-chunk skip census. Counted here -- BEFORE the stale-result
+		// discard below -- deliberately: the question is what fraction of
+		// WORKER OUTPUT meshes to zero quads, and a job whose result is later
+		// discarded as stale still did the full generate+mesh. Counting only
+		// live results would understate exactly the waste this is measuring.
+		{
+			const int32 Lvl = FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1);
+			++LevelResultsSinceLog[Lvl];
+			(Result.Quads.Num() == 0 ? LevelZeroQuadMsSinceLog[Lvl] : LevelQuadMsSinceLog[Lvl]) += Result.JobMs;
+			if (Result.Quads.Num() == 0)
+			{
+				++LevelZeroQuadSinceLog[Lvl];
+				switch (Result.EmptyClass)
+				{
+				case 1: ++LevelAllAirSinceLog[Lvl]; break;
+				case 2: ++LevelAllSolidSinceLog[Lvl]; break;
+				case 3: ++LevelMixedEmptySinceLog[Lvl]; break;
+				default: break; // census switch off
+				}
+			}
+			if (Lvl == 0)
+			{
+				AccumLevel0GridMs += Result.GridMs;
+				AccumLevel0JobMs += Result.JobMs;
+			}
 		}
 
 		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Result.Key);
