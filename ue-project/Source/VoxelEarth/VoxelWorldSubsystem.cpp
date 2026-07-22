@@ -1392,6 +1392,23 @@ bool BuriedSkipEnabled()
 // single-global-ordering behaviour (one shared cap, one global cutoff, strictly
 // nearest-first dispatch across all levels) for A/B measurement, on the same
 // binary, for the same reason -VoxelPendingJobCap is a switch and not a cvar.
+// Admission refill: per level (1, default) or against the summed queue depth
+// across every level (0, the pre-change form). A cvar rather than a
+// command-line switch on purpose -- unlike -VoxelNoUnderground, this one is
+// read fresh on every tick and changes no latched state, so flipping it from
+// -ExecCmds mid-run genuinely measures both behaviours on one binary.
+static int32 GPerLevelRefill = 1;
+static FAutoConsoleVariableRef CVarPerLevelRefill(
+	TEXT("voxel.Stream.PerLevelRefill"),
+	GPerLevelRefill,
+	TEXT("1 (default): a ring's admission refill triggers on ITS OWN queue draining below its share of the cap. 0: the pre-change form, one threshold over the summed queue depth -- which let R4's multi-second jobs hold R0's refill hostage."),
+	ECVF_Default);
+
+bool GetPerLevelRefillEnabled()
+{
+	return GPerLevelRefill != 0;
+}
+
 bool GetRingQuotaEnabled()
 {
 	static const bool bEnabled = []
@@ -2439,25 +2456,51 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// against its own share of the cap -- the same kRingCapShare the truncate
 	// pass already divides the cap by, so the two halves agree on what "this
 	// ring's queue is empty" means.
+	// voxel.Stream.PerLevelRefill=0 restores the summed-queue form exactly, so
+	// the A/B for this change runs on ONE binary -- the same reason
+	// -VoxelRingQuota exists. It is safe from -ExecCmds because it is read
+	// fresh on every tick rather than latched at startup.
 	const int32 AdmissionCap = VoxelStreamAdmission::GetPendingJobCap();
 	bool bLevelWantsRefill[VoxelCoords::kNumLevels] = {};
 	bool bAdmissionRefill = false;
 	if (bHasRecomputed && AdmissionCap > 0)
 	{
-		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		bool bAnyDeferred = false;
+		for (const bool bDeferred : bAdmissionDeferredWork)
 		{
-			if (!bAdmissionDeferredWork[Level])
+			bAnyDeferred |= bDeferred;
+		}
+		if (!VoxelStreamAdmission::GetPerLevelRefillEnabled())
+		{
+			// Pre-change behaviour: one summed threshold, and every level
+			// re-enumerates when it fires.
+			if (bAnyDeferred && PendingJobNum() * 4 < AdmissionCap)
 			{
-				continue; // this ring has nothing waiting; an empty queue is just convergence
-			}
-			const int32 LevelCap =
-				VoxelStreamAdmission::GetRingQuotaEnabled()
-					? FMath::Max(1, FMath::RoundToInt(double(AdmissionCap) * VoxelStreamAdmission::kRingCapShare[Level]))
-					: AdmissionCap;
-			if (PendingJobKeysByLevel[Level].Num() * 4 < LevelCap)
-			{
-				bLevelWantsRefill[Level] = true;
 				bAdmissionRefill = true;
+				for (bool& bWants : bLevelWantsRefill)
+				{
+					bWants = true;
+				}
+			}
+		}
+		else if (bAnyDeferred)
+		{
+			for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+			{
+				if (!bAdmissionDeferredWork[Level])
+				{
+					continue; // this ring has nothing waiting; an empty queue is just convergence
+				}
+				const int32 LevelCap =
+					VoxelStreamAdmission::GetRingQuotaEnabled()
+						? FMath::Max(1,
+						             FMath::RoundToInt(double(AdmissionCap) * VoxelStreamAdmission::kRingCapShare[Level]))
+						: AdmissionCap;
+				if (PendingJobKeysByLevel[Level].Num() * 4 < LevelCap)
+				{
+					bLevelWantsRefill[Level] = true;
+					bAdmissionRefill = true;
+				}
 			}
 		}
 	}
@@ -7054,12 +7097,19 @@ bool UVoxelWorldSubsystem::FindCavernPose(FVector& OutCameraUU, FRotator& OutLoo
 
 	OutCameraUU = FVector(StandXUU, BestYUU, EyeZUU);
 	const_cast<UVoxelWorldSubsystem*>(this)->CavernShotSightlineUU = SightUU;
-	// Aim at a point two thirds of the way up the far wall: that puts the far
-	// wall, the ceiling above it and the floor between here and there all in
-	// frame, which is what makes the image read as a room rather than as a
-	// grey field. Pitch comes out of the geometry rather than being guessed.
-	const double TargetZUU = FloorZUU + (CeilZUU - FloorZUU) * 0.66;
-	OutLookRot = FRotator(FMath::RadiansToDegrees(FMath::Atan2(TargetZUU - EyeZUU, FMath::Max(SightUU, 1.0))), 0.0, 0.0);
+	// Aim LOW on the far wall -- a third of its height -- and then clamp the
+	// pitch. Both halves are corrections from real runs. Aiming two thirds up
+	// gave 34.8 degrees in a room that is 49 m tall and 47 m wide, and the
+	// resulting frame was almost entirely ceiling: in a room whose height is
+	// comparable to its width, "look at the far wall" and "look up" are nearly
+	// the same instruction. Aiming low keeps the floor sweeping away to the
+	// far wall in frame, which is what makes the distance legible -- an
+	// unbroken floor running to a wall 45 m away IS the picture of the sight
+	// sphere working. The clamp is the backstop for a room shape the ratio
+	// does not anticipate.
+	const double TargetZUU = FloorZUU + (CeilZUU - FloorZUU) * 0.33;
+	const double RawPitch = FMath::RadiansToDegrees(FMath::Atan2(TargetZUU - EyeZUU, FMath::Max(SightUU, 1.0)));
+	OutLookRot = FRotator(FMath::Clamp(RawPitch, -15.0, 18.0), 0.0, 0.0);
 
 	const double SurfaceUU = GetSurfaceHeightUU(BestXUU, BestYUU);
 	OutReport = FString::Printf(
