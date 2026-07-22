@@ -169,7 +169,11 @@ private:
 	// its default (top) selection; pass -VoxelOverlayShot with the overlay
 	// suppressed by simply not passing it at all -- there is no "close" form,
 	// because the overlay is default-OFF and nothing else can open it.
+	//   -VoxelOverlayOn          open the overlay and leave it open (no shot,
+	//                            no quit) -- the overlay-on arm of the M1 perf
+	//                            A/B, which -VoxelOverlayShot cannot serve.
 	FTimerHandle WalkModeTimerHandle;
+	FTimerHandle OverlayOnTimerHandle;
 	FTimerHandle OverlayShotTimerHandle;
 	FTimerHandle OverlayQuitTimerHandle;
 

@@ -163,6 +163,27 @@ void AVoxelEarthPlayerController::BeginPlay()
 		                                   WalkModeAfterSeconds, false);
 	}
 
+	// -VoxelOverlayOn: open the overlay a moment after begin-play and LEAVE it
+	// open, with no screenshot and no quit. This is the overlay-on arm of the
+	// M1 perf A/B (-VoxelPerfRun), which -VoxelOverlayShot cannot serve
+	// because it self-quits 4 s after firing.
+	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelOverlayOn")))
+	{
+		World->GetTimerManager().SetTimer(OverlayOnTimerHandle,
+		                                   FTimerDelegate::CreateWeakLambda(this,
+		                                                                     [this]()
+		                                                                     {
+			                                                                     AVoxelEarthHUD* Hud = GetVoxelHUD();
+			                                                                     if (Hud && !Hud->IsDebugOverlayVisible())
+			                                                                     {
+				                                                                     Hud->ToggleDebugOverlay();
+				                                                                     UE_LOG(LogVoxelEarth, Log,
+				                                                                            TEXT("VoxelOverlayOn: overlay open"));
+			                                                                     }
+		                                                                     }),
+		                                   2.0f, false);
+	}
+
 	float OverlayShotAfterSeconds = 0.f;
 	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelOverlayShot="), OverlayShotAfterSeconds) && OverlayShotAfterSeconds > 0.f)
 	{

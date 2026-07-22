@@ -46,6 +46,44 @@ issues. The editor hosts the native Model Context Protocol server on
 `http://127.0.0.1:8000/mcp` (auto-start; `.mcp.json` at repo root connects
 Claude Code to it).
 
+## Controls
+
+The test pawn has a **fly** mode (default) and a **walk** mode; `G` toggles.
+Fly clips through everything -- terrain, water, debris. Walk has gravity and
+voxel collision, and holds position instead of falling when the ground under
+it has not streamed in yet (the HUD says so).
+
+| Key | Action |
+| --- | --- |
+| `W` `A` `S` `D` | Move |
+| `Space` / `LeftCtrl` | Fly up / down (`Space` is jump in walk mode) |
+| Mouse | Look |
+| `LeftShift` (hold) | Boost -- 4x fly speed, sprint on foot |
+| `LeftAlt` (hold) | Precision -- 0.15x fly speed, for 10 cm inspection |
+| `]` / `[` | Fly speed step, 9 steps from 0.5 m/s to 2 km/s |
+| `G` | Toggle walk / fly |
+| `C` | Toggle first / third person |
+| `F1` | Toggle the in-game debug overlay |
+| `Up` `Down` | Overlay: move selection |
+| `Left` `Right` / `Enter` | Overlay: change the selected setting |
+| `F3` | Cycle `voxel.Debug` 0 -> 1 (perf HUD) -> 2 (+ 3D layers) |
+| `LMB` / `RMB` | Dig / place |
+| `1` `2` `3`, mouse wheel | Dig-and-place cube size |
+| `T` | Cycle placement material |
+| `F` (hold, release) | Charge and throw an explosive |
+
+The overlay is OFF by default and lists these keybinds on itself. It shows
+position/altitude, which diffusion tile you are in, per-ring loaded/pending
+counts, the residency of the chunk you are standing in, and -- worth checking
+first whenever the world looks wrong -- whether the run booted on **real
+tiles** or fell back to the **synthetic sampler**. It toggles the same
+`voxel.Debug.*` / `voxel.GI.Enabled` cvars the console does, plus wireframe.
+
+Headless equivalents, for capturing any of the above without a keyboard:
+`-VoxelWalkModeAfter=<s>`, `-VoxelFlySpeedStep=<n>`, `-VoxelOverlayShot=<s>`
+(captures *with* UI, then quits), `-VoxelOverlayRow=<n>`, `-VoxelHudShotOnly`,
+`-VoxelOverlayOn`.
+
 ## Running terrain-service
 
 ```sh
