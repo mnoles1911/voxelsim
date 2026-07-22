@@ -274,5 +274,24 @@ int main(int argc, char** argv) {
 
     terraceStats(hAmp, "AMPLIFIED SURFACE");
     terracePlateaus(amp, vx0, vy0, 512, "AMPLIFIED SURFACE");
+
+    // Optional raw dump of the voxel-quantised height field, for hillshading
+    // offline. A hillshade of floor(h/100mm) shows the terrace artifact
+    // exactly as the eye sees it in-engine, in about a second — which makes
+    // parameter iteration a tight loop instead of a UE rebuild each time.
+    if (const char* out = std::getenv("VXC_PROBE_DUMP")) {
+        const int64_t nn = 512;
+        std::vector<int32_t> f(static_cast<size_t>(nn * nn));
+        for (int64_t j = 0; j < nn; ++j)
+            for (int64_t i = 0; i < nn; ++i)
+                f[static_cast<size_t>(j * nn + i)] = amp.surfaceMm(vx0 + i, vy0 + j);
+        FILE* fp = std::fopen(out, "wb");
+        if (fp) {
+            std::fwrite(f.data(), sizeof(int32_t), f.size(), fp);
+            std::fclose(fp);
+            std::printf("\ndumped %lldx%lld int32 surfaceMm to %s\n", (long long)nn,
+                        (long long)nn, out);
+        }
+    }
     return 0;
 }

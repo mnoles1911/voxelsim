@@ -634,8 +634,11 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     int64_t landformMm = 0, microMm = 0;
     for (uint32_t i = 0; i < kDetailOctaveCount; ++i) {
         const Octave& o = kDetailOctaves[i];
-        const int64_t term = valueNoise2(seed_, xMm, yMm, o.latticeMm, CH_DETAIL_OCTAVE_BASE + i) *
-                             o.amplitudeMm / kDetailNoiseScale;
+        // Faded, not raw: raw valueNoise2 puts a visible dead-straight crease
+        // on every lattice line of every octave. See hash.h.
+        const int64_t term =
+            valueNoise2Fade(seed_, xMm, yMm, o.latticeMm, CH_DETAIL_OCTAVE_BASE + i) *
+            o.amplitudeMm / kDetailNoiseScale;
         if (i < kLandformOctaveCount)
             landformMm += term;
         else
