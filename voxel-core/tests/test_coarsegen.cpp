@@ -182,7 +182,13 @@ VXC_TEST(coarsegen_golden_digest) {
     // over the 3x3 footprints around the origin.
     const uint64_t d = coarseRegionDigest(kSeed);
     std::printf("    [coarsegen] golden digest 0x%016" PRIX64 "\n", d);
-    CHECK_EQ(d, 0x85B3E79EF8D01AFCull);
+    // kWorldGenVersion 6: moves because the fine surface it samples moved
+    // (coarse-to-fine detail rework). The coarse RULE is unchanged — its own
+    // tests (coarsegen_level0_identity, coarsegen_matches_pointwise_queries,
+    // coarsegen_surface_range_formula, coarsegen_fidelity_vs_true_mip) all
+    // still pass, and the fidelity mismatch ceilings were not relaxed.
+    // (was 0x85B3E79EF8D01AFC at v5)
+    CHECK_EQ(d, 0x9C7796E3BAE796F6ull);
 }
 
 VXC_TEST(coarsegen_seed_sensitivity) {
