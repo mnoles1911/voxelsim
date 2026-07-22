@@ -4,15 +4,26 @@ Pattern: Tools/create_voxel_material.py (every connection checked -- a
 silently-failed pin connect produced an invisible-terrain material once
 (2026-07-19) and cost a debug session; same discipline applies here).
 
-Slope+height tint, driven entirely by per-vertex data computed on the CPU in
-AVoxelClipmapActor::RebuildLevel (VoxelClipmapActor.cpp) rather than in the
-material graph -- VertexColor.R carries a 0..1 slope factor (0 = flat, 1 =
-near-vertical), VertexColor.G carries a 0..1 snow factor (ramped over a band
-around the amplifier's 2800m snowline, voxel-core/src/amplifier.cpp /
-worldgen.hlsl MAT_SNOW threshold). Two lerps: flat-green -> steep-grey by R,
-then that result -> white by G. Ocean is handled entirely by the existing
-AVoxelOceanActor plane (the clipmap mesh is allowed to dip below z=0; water
-covers it, per m2-plan.md's binding decision).
+BIOME UPGRADE (2026-07-22). This used to be a two-lerp graph over a private
+vertex-colour convention: VertexColor.R = slope, .G = snow, both precomputed in
+AVoxelClipmapActor::RebuildLevel. That convention was completely different from
+the voxel chunks' (R = material id, G = AO), which is a large part of why the
+50 km vista rendered pale green while the near field rendered flat beige -- two
+independently authored colour schemes with nothing forcing them to agree.
+
+Both meshes now write ONE encoding (R = material id, G = shade, B = temperature,
+A = precipitation; see VoxelClimateProbe.h) and this material decodes it with
+the SAME shared graph M_VoxelTerrain uses (terrain_material_common.py). Slope
+and snow did not go away -- slope is now derived per pixel from the interpolated
+vertex normal (which RebuildLevel already computes and hands to the PMC) and
+snow from temperature plus world Z, so the clipmap gets a smoother band than the
+old 64-512 m/vertex grid could express, and the voxel near field gets the same
+snowline for the first time.
+
+Ocean is still handled entirely by the existing AVoxelOceanActor plane (the
+clipmap mesh is allowed to dip below z=0; water covers it, per m2-plan.md's
+binding decision) -- but sub-sea-level vertices now emit MAT_MUD so the sea bed
+under shallow water reads as sediment rather than as drowned grassland.
 
 Also adds the same DebugTint VectorParameter (default opaque white) pattern
 as M_VoxelTerrain, multiplied into BaseColor after the slope/snow lerps, so
@@ -32,7 +43,15 @@ Run via:
   UnrealEditor-Cmd.exe <uproject> -run=pythonscript -script=<this file> -unattended -nop4 -nosplash
 """
 
+import os
+import sys
+
 import unreal
+
+# Shared biome graph, same directory. A -run=pythonscript commandlet does not
+# put the script's own directory on sys.path, so add it explicitly.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from terrain_material_common import GraphBuilder, build_terrain_base_color  # noqa: E402
 
 PACKAGE_PATH = "/Game/Voxel"
 MATERIAL_NAME = "M_VoxelClipmap"
@@ -54,34 +73,38 @@ def main():
 
     vertex_color = mel.create_material_expression(material, unreal.MaterialExpressionVertexColor, -700, -50)
 
-    green_low_flat = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -700, 120)
-    green_low_flat.set_editor_property("constant", unreal.LinearColor(0.15, 0.42, 0.13, 1.0))
+    b = GraphBuilder(material)
 
-    grey_steep = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -700, 260)
-    grey_steep.set_editor_property("constant", unreal.LinearColor(0.45, 0.44, 0.42, 1.0))
+    # T_VoxelDetail UV. The voxel material uses TexCoord0 (world-planar metres
+    # wrapped to 32 m); the clipmap CANNOT -- its SharedUV0 is a plain [0,1]^2
+    # grid over a level that spans up to 50 km, and AbsoluteWorldPosition out
+    # there is exactly the LWC precision case the voxel path wraps to avoid.
+    # Scaling the [0,1]^2 grid instead gives ~28 repeats across each level,
+    # which at clipmap distances is large-scale mottling to break up the flat
+    # green -- the only thing detail can usefully do at 64-512 m per vertex.
+    tex_coord = mel.create_material_expression(material, unreal.MaterialExpressionTextureCoordinate, -900, 400)
+    tex_coord.set_editor_property("coordinate_index", 0)
+    detail_uv = b.mul(tex_coord, b.scalar("DetailTileRepeats", 28.0))
 
-    white_snow = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -700, 400)
-    white_snow.set_editor_property("constant", unreal.LinearColor(0.95, 0.96, 0.98, 1.0))
+    base_color, snow_w, base_color_out = build_terrain_base_color(
+        b, vertex_color, detail_uv, "",
+        # Full strength, unlike the voxel material's 0.35: a clipmap vertex
+        # normal is a REAL terrain normal (central-difference heightmap
+        # gradient, RebuildLevel pass 2), so a steep face here genuinely is
+        # exposed rock rather than a 10 cm voxel step riser.
+        rock_slope_strength=1.0,
+        # Weaker than the voxel material's: at 64-512 m per vertex the fine
+        # band is far below a pixel and would only add noise for TSR to chew on.
+        detail_fine_strength=0.06,
+        detail_coarse_strength=0.16,
+    )
 
-    # lerp1 = Lerp(green_low_flat, grey_steep, VertexColor.R) -- flat/low ->
-    # steep tint by slope.
-    lerp_slope = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -380, 180)
-    if not mel.connect_material_expressions(green_low_flat, "", lerp_slope, "A"):
-        raise RuntimeError("connect green_low_flat -> lerp_slope.A failed")
-    if not mel.connect_material_expressions(grey_steep, "", lerp_slope, "B"):
-        raise RuntimeError("connect grey_steep -> lerp_slope.B failed")
-    if not mel.connect_material_expressions(vertex_color, "R", lerp_slope, "Alpha"):
-        raise RuntimeError("connect vertex_color.R -> lerp_slope.Alpha failed")
-
-    # lerp2 = Lerp(lerp1, white_snow, VertexColor.G) -- slope-tinted result ->
-    # white above the snowline band.
-    lerp_snow = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -100, 300)
-    if not mel.connect_material_expressions(lerp_slope, "", lerp_snow, "A"):
-        raise RuntimeError("connect lerp_slope -> lerp_snow.A failed")
-    if not mel.connect_material_expressions(white_snow, "", lerp_snow, "B"):
-        raise RuntimeError("connect white_snow -> lerp_snow.B failed")
-    if not mel.connect_material_expressions(vertex_color, "G", lerp_snow, "Alpha"):
-        raise RuntimeError("connect vertex_color.G -> lerp_snow.Alpha failed")
+    # G is 255 on every clipmap vertex (a heightfield has no per-vertex AO), so
+    # this multiply is the identity today. It is kept so the graph stays
+    # structurally identical to M_VoxelTerrain's -- if the clipmap ever grows an
+    # AO or shadow term, it has somewhere to go, and the two materials do not
+    # silently diverge in the meantime.
+    lerp_snow = b.mul(base_color, vertex_color, base_color_out, "G")
 
     # docs/debug-tooling-plan.md P1 palette: "heightmap band cyan"
     # (VoxelDebug::HeightmapBandTint) -- default opaque white, the
@@ -98,8 +121,9 @@ def main():
     if not mel.connect_material_property(tint_multiply, "", unreal.MaterialProperty.MP_BASE_COLOR):
         raise RuntimeError("connect tint_multiply -> BaseColor failed")
 
-    roughness = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -380, 500)
-    roughness.set_editor_property("r", 0.9)
+    # Same snow-smooths-roughness term as M_VoxelTerrain, same defaults, so the
+    # snow cap on a distant peak and the snow underfoot shade alike.
+    roughness = b.lerp(b.scalar("RoughnessBase", 0.90), "", b.scalar("RoughnessSnow", 0.55), "", snow_w)
     if not mel.connect_material_property(roughness, "", unreal.MaterialProperty.MP_ROUGHNESS):
         raise RuntimeError("connect roughness failed")
 
