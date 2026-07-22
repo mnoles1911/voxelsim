@@ -219,7 +219,18 @@ class FJobColumnGridCache
 public:
 	using GeneratedWorldT = vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>;
 
-	FJobColumnGridCache(const GeneratedWorldT& InGen, vxc::Counters* InPerfCounters) : Gen(InGen), PerfCounters(InPerfCounters) {}
+	// CoarseLevel == 0 is the historical behaviour (level-0 column grids for the
+	// mip recursion's level-0 source). CoarseLevel > 0 makes this a cache of
+	// COARSE column grids at that level (vxc::GeneratedWorld::coarseColumns),
+	// which is what MakeCoarseLevelSampler needs -- same B*B amplifier column
+	// evaluations per miss at ANY level, which is the whole point of the coarse
+	// path. voxel-core guarantees coarseColumns(0,...) == columns(...)
+	// bit-identically, but the branch is kept explicit so the level-0 mip source
+	// provably takes the exact same call it always did.
+	FJobColumnGridCache(const GeneratedWorldT& InGen, vxc::Counters* InPerfCounters, int32 InCoarseLevel = 0)
+		: Gen(InGen), PerfCounters(InPerfCounters), CoarseLevel(InCoarseLevel)
+	{
+	}
 
 	const GeneratedWorldT::ColumnGrid& Get(int32 Bx, int32 By)
 	{
@@ -241,7 +252,8 @@ public:
 		{
 			PerfCounters->incColumnEvals(uint64_t(VoxelCoords::BrickEdgeVoxels) * VoxelCoords::BrickEdgeVoxels);
 		}
-		GeneratedWorldT::ColumnGrid& NewGrid = Grids.Add(PackedKey, Gen.columns(Bx, By));
+		GeneratedWorldT::ColumnGrid& NewGrid =
+			Grids.Add(PackedKey, CoarseLevel == 0 ? Gen.columns(Bx, By) : Gen.coarseColumns(CoarseLevel, Bx, By));
 		RecencyOrder.Add(PackedKey);
 		return NewGrid;
 	}
@@ -266,6 +278,7 @@ private:
 	static constexpr int32 kMaxEntries = 64;
 	const GeneratedWorldT& Gen;
 	vxc::Counters* PerfCounters;
+	int32 CoarseLevel = 0;
 	TMap<uint64, GeneratedWorldT::ColumnGrid> Grids;
 	TArray<uint64> RecencyOrder;
 };
@@ -661,6 +674,83 @@ std::function<vxc::MaterialId(int64, int64, int64)> MakeLevelSampler(const vxc::
 		const int Ly = int(floorMod(Y, B));
 		const int Lz = int(floorMod(Z, B));
 		return B0->get(Lx, Ly, Lz);
+	};
+}
+
+// Direct COARSE level-L sampler -- the reason distant rings can exist at all.
+//
+// MakeLevelSampler above is correct but its cost is structural: a level-L brick
+// is folded from 8^L level-0 bricks, so it scales 8x per level. Measured on this
+// box (60s flight, real diffusion tiles, seed 20260719, before this function
+// existed): R0 p50 1.32ms, R1 2.44ms, R2 23.88ms, R3 1543ms, R4 15901ms. At R4 a
+// single chunk holds a worker slot for SIXTEEN SECONDS, so R3/R4 reported
+// loaded=0 at every 5s sample of the whole flight -- the nominal 1024m cascade
+// actually terminated near 250m (the admission cutoff collapsed to ~200m under
+// the resulting queue backlog) and everything beyond was clipmap. That is the
+// "low poly vista".
+//
+// vxc::GeneratedWorld::makeCoarseBrick/coarseColumns (voxelcore/generator.h)
+// generate a level-L brick DIRECTLY: coarseColumns does B*B amplifier column
+// evaluations and makeCoarseBrick does B^3 materialAt calls, at ANY level. So a
+// level-L chunk costs what a level-0 chunk costs, independent of L. That is what
+// makes rings past R2 viable.
+//
+// Semantics differ deliberately and this is not a bug: coarse is nearest-
+// neighbour sampling of the generator at the coarse cell centre, mip is a
+// majority vote over children (generator.h documents them as separate paths with
+// separate goldens; coarse != downsample in general). For distant LOD the coarse
+// rule is arguably the better one -- it tracks the true surface instead of
+// eroding thin features through repeated majority votes.
+//
+// No FSharedMipCache here, on purpose. That cache's key is (level, BrickKey) and
+// its documented contract is "vxc::downsampleBricks output"; a coarse brick is a
+// DIFFERENT function of the same key, so sharing the cache would mix two rules
+// under one key. Coarse bricks are cheap enough not to need cross-job caching --
+// the job-local map below is sufficient. Worker path only (pure GeneratedWorld,
+// never World's overlay), same lock-free rule as MakeLevelSampler.
+std::function<vxc::MaterialId(int64, int64, int64)> MakeCoarseLevelSampler(const vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>& Gen,
+                                                                             int32 Level, vxc::Counters* PerfCounters)
+{
+	using namespace vxc;
+	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
+
+	struct FJobCoarseState
+	{
+		FJobCoarseState(const GeneratedWorld<B>& InGen, Counters* InPerfCounters, int32 InLevel)
+			: ColumnCache(InGen, InPerfCounters, InLevel), Gen(InGen), Level(InLevel)
+		{
+		}
+
+		const Brick<B>* Brick(const BrickKey& Key)
+		{
+			auto Found = Bricks.find(Key);
+			if (Found != Bricks.end())
+			{
+				return &Found->second;
+			}
+			const auto& Grid = ColumnCache.Get(Key.x, Key.y);
+			auto [It, Inserted] = Bricks.emplace(Key, Gen.makeCoarseBrick(Level, Key, Grid));
+			(void)Inserted;
+			return &It->second;
+		}
+
+		FJobColumnGridCache ColumnCache;
+		const GeneratedWorld<B>& Gen;
+		int32 Level;
+		std::unordered_map<BrickKey, vxc::Brick<B>, BrickKeyHash> Bricks;
+	};
+
+	TSharedPtr<FJobCoarseState> State = MakeShared<FJobCoarseState>(Gen, PerfCounters, Level);
+
+	return [State](int64 X, int64 Y, int64 Z) -> MaterialId
+	{
+		const BrickKey BKey{int32_t(floorDiv(X, B)), int32_t(floorDiv(Y, B)), int32_t(floorDiv(Z, B))};
+		const vxc::Brick<B>* Br = State->Brick(BKey);
+		if (!Br)
+		{
+			return MAT_AIR;
+		}
+		return Br->get(int(floorMod(X, B)), int(floorMod(Y, B)), int(floorMod(Z, B)));
 	};
 }
 
@@ -1320,6 +1410,32 @@ int32 GetPendingJobCap()
 		return FMath::Max(0, Value); // 0 = unbounded (pre-wave behaviour)
 	}();
 	return Cap;
+}
+
+// Lowest chunk level that generates via the DIRECT COARSE path
+// (MakeCoarseLevelSampler / vxc::GeneratedWorld::makeCoarseBrick) instead of the
+// 8^L mip recursion (MakeLevelSampler). Levels below this keep the mip path;
+// level 0 always has its own dedicated path and is unaffected either way.
+//
+// Default 1 = every mip level goes coarse, because the mip recursion's cost is
+// what capped the effective voxel radius at ~250m (see MakeCoarseLevelSampler's
+// comment for the measured per-level numbers). `-VoxelCoarseMinLevel=99`
+// disables the coarse path entirely and restores the pre-change mip behaviour,
+// which is how the A/B for this change is measured.
+//
+// Command-line, not a cvar, for the reason documented on -VoxelPendingJobCap
+// above: -ExecCmds lands after streaming has already begun.
+constexpr int32 kDefaultCoarseMinLevel = 1;
+
+int32 GetCoarseMinLevel()
+{
+	static const int32 MinLevel = []
+	{
+		int32 Value = kDefaultCoarseMinLevel;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelCoarseMinLevel="), Value);
+		return FMath::Max(1, Value); // level 0 has its own path; never route it here
+	}();
+	return MinLevel;
 }
 
 // docs/status.md "Buried-chunk pre-dispatch skip", step 1 (measure before
@@ -4853,8 +4969,19 @@ void FVoxelWorldImpl::DispatchJobs()
 					// specifically BECAUSE it is not a known edited-ancestor
 					// chunk (NeedsOverlayAwarePath / EditedAncestorChunks, M2
 					// wave 2 item 2), so a pure-generated mesh is correct here.
+					//
+					// ...unless this level is at or above the coarse threshold,
+					// in which case the brick comes straight out of
+					// GeneratedWorld::makeCoarseBrick at O(1) per level instead
+					// of folding 8^L level-0 bricks. Both samplers are pure
+					// GeneratedWorld and satisfy the same
+					// [-1,B]^3-across-borders contract MeshChunkBricks wants, so
+					// this is a straight substitution of the brick RULE, nothing
+					// else in the job changes.
 					const auto LevelSampler =
-						MakeLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot);
+						(LevelKey.Level >= VoxelStreamAdmission::GetCoarseMinLevel())
+							? MakeCoarseLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr)
+							: MakeLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot);
 					MeshChunkBricks(Key, LevelSampler, Result.Quads, PerfCountersPtr);
 					if (bMeasureEmpty && Result.Quads.Num() == 0)
 					{
