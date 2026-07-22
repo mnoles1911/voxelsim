@@ -363,6 +363,115 @@ static_assert(slopeScaleQ10(1LL << 40) == kSlopeScaleMaxQ10,
 constexpr int64_t kDetailMaxAtMaxSlopeMm = kDetailMaxMm * kSlopeScaleMaxQ10 / 1024;
 static_assert(kDetailMaxAtMaxSlopeMm == 11424, "detail allowance moved");
 
+// ---------------------------------------------------------------------------
+// Couplings for the MIRROR bounds: Amplifier::surfaceLowerBoundMm and
+// Amplifier::solidBelowBoundMm. Same doctrine as (1)-(6) above -- derive from
+// the real tables where possible, static_assert where the derivation cannot
+// follow -- but the stakes are higher on this side. A too-high surface UPPER
+// bound merely tracks a chunk that turned out to be empty; a too-high all-SOLID
+// floor claims a chunk is solid when it is not, and the streaming layer then
+// never tracks it at all. That is an unreachable cave, or a player digging into
+// a chunk the world does not know exists.
+// ---------------------------------------------------------------------------
+
+// (7) The detail term's magnitude on the NEGATIVE side. (3) derives the maximum
+// at noise == +kNoiseMax; the minimum is at noise == -32768, whose magnitude is
+// one LSB larger, so the upper bound's allowance is NOT a valid magnitude bound
+// for the lower side. Rather than mirror the asymmetry and invite an off-by-one
+// in the one place an off-by-one is a hole in the world, take the trivially
+// sound envelope: |noise| <= kDetailNoiseScale, so each octave's contribution
+// is at most its own amplitude. DERIVED from the same table as (3).
+constexpr int64_t detailAbsMaxMm() {
+    int64_t sum = 0;
+    for (uint32_t i = 0; i < kDetailOctaveCount; ++i) sum += kDetailOctaves[i].amplitudeMm;
+    return sum;
+}
+constexpr int64_t kDetailAbsMaxMm = detailAbsMaxMm();
+static_assert(kDetailAbsMaxMm >= kDetailMaxMm,
+              "the symmetric detail envelope must cover the positive-side maximum too, or "
+              "surfaceLowerBoundMm is looser than surfaceUpperBoundMm in the wrong direction");
+static_assert(kDetailAbsMaxMm == 2860, "detail amplitude sum moved; see (4)");
+
+// (8) The cave family's carve depth, in the QUERYING COLUMN'S OWN depth space.
+// caveCarveAt tests `depthMm < segs[s].depthMm + sqrt(marginSq)`, so the
+// deepest reachable voxel is the deepest tube axis plus the widest radius; a
+// crevice is emitted as an ordinary segment whose depth extends the axis by at
+// most its downward reach. Sinkhole shafts bypass the roof clamp but are capped
+// by the same caveNode depth ceiling, so they are covered by the axis term.
+constexpr int64_t kMaxCaveCarveBelowSurfaceMm = kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm +
+                                                kCaveRadiusMaxMm + kCrevDownMinMm + kCrevDownSpanMm;
+static_assert(kMaxCaveCarveBelowSurfaceMm == 42800,
+              "cave/crevice depth envelope moved; Amplifier::solidBelowBoundMm derives its "
+              "carve allowance from these constants.");
+
+// (9) The cavern chain's carve depth, in the SITE'S OWN depth space. The chain
+// is: anchor at caveNode's depth below the site surface, then (childCount - 1)
+// downward steps, then the flat-floor clamp below the last room's centre.
+//
+// The FLOOR CLAMP is what bounds the bottom, not the room radius: cavernCarveAt
+// refuses any voxel with `zAbs < sg.zFloorMm` before it ever evaluates the
+// ellipsoid, and zFloorMm is `zMm - floorDropMm`. A 40 m vertical semi-axis
+// therefore does NOT reach 40 m below the room centre -- it is cut off at
+// floorDropMm. Getting this wrong in the safe direction would cost 25 m of
+// bound for nothing; getting it wrong in the unsafe direction is a hole, which
+// is why the adversarial test sweeps real cavern columns against it rather than
+// trusting this comment.
+constexpr int64_t kMaxCavernCarveBelowSiteSurfaceMm =
+    kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm +
+    (kCavernChildCount - 1) * (kCavernStepDownMinMm + kCavernStepDownSpanMm) +
+    kCavernFloorDropMinMm + kCavernFloorDropSpanMm;
+static_assert(kMaxCavernCarveBelowSiteSurfaceMm == 91000,
+              "cavern chain depth envelope moved; Amplifier::solidBelowBoundMm derives its "
+              "carve allowance from these constants.");
+
+// Every hashed field above is drawn from a half-open range, so Min + Span is a
+// STRICT upper bound rather than an attainable value. Pinned at both the
+// all-ones and all-zeros draw so a change to the field decode -- say to an
+// inclusive range -- breaks the build rather than eating the one millimetre of
+// slack these bounds rely on.
+static_assert(cavernHashField10(~0ull, 0, kCavernStepDownSpanMm) < kCavernStepDownSpanMm,
+              "cavern step-down field must stay half-open");
+static_assert(cavernHashField10(~0ull, 0, kCavernFloorDropSpanMm) < kCavernFloorDropSpanMm,
+              "cavern floor-drop field must stay half-open");
+static_assert(cavernHashField10(0ull, 0, kCavernFloorDropSpanMm) == 0,
+              "cavern floor-drop field must start at zero");
+static_assert(caveNodeFromHash(~0ull, 0, 0).depthMm < kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm,
+              "caveNode depth field must stay half-open: both the tube envelope (8) and the "
+              "cavern anchor envelope (9) are capped by it.");
+
+// (10) The envelope solidBelowBoundMm actually subtracts: the deeper of the
+// two, since both are measured below a surface that the dilated lower bound
+// bounds from below.
+constexpr int64_t kDeepestCarveBelowSurfaceMm =
+    kMaxCaveCarveBelowSurfaceMm > kMaxCavernCarveBelowSiteSurfaceMm
+        ? kMaxCaveCarveBelowSurfaceMm
+        : kMaxCavernCarveBelowSiteSurfaceMm;
+static_assert(kDeepestCarveBelowSurfaceMm == 91000, "carve envelope moved");
+
+// (11) Independent backstop, and a genuine one rather than a restatement. Both
+// carve passes refuse `depthMm + kCaveBedrockMarginMm >= bedrockDepthMm`, and
+// bedrockDepthMm is drawn from [kBedrockDepthMinMm, +40 m]. So NOTHING can
+// carve deeper than kBedrockDepthMinMm - kCaveBedrockMarginMm below its own
+// column's surface, by a mechanism entirely separate from the chain geometry in
+// (8) and (9). If the geometry-derived envelope ever exceeded this, one of the
+// two derivations would be wrong -- and this catches it at compile time.
+constexpr int64_t kBedrockDepthMinMm = 180000;
+constexpr int64_t kBedrockDepthJitterMm = 40000;
+static_assert(kDeepestCarveBelowSurfaceMm < kBedrockDepthMinMm - kCaveBedrockMarginMm,
+              "the geometric carve envelope must stay inside the bedrock clamp; if it does "
+              "not, either (8)/(9) or the bedrock depth range is wrong.");
+
+// (12) The dilation radius. A cavern site only reaches columns within
+// kCavernMaxReachMm of its anchor (cavernColumnFromSites culls on exactly
+// kCavernMaxReachSqMm), so bounding the surface over the footprint dilated by
+// this radius bounds every site that can carve into the footprint. In voxels,
+// rounded UP.
+constexpr int64_t kCavernReachVoxels =
+    (kCavernMaxReachMm + kVoxelSizeMm - 1) / kVoxelSizeMm;
+static_assert(kCavernReachVoxels * kVoxelSizeMm >= kCavernMaxReachMm,
+              "cavern reach must round UP in voxels, or the dilated footprint can miss the "
+              "site whose surface the bound is derived from.");
+
 } // namespace
 
 uint64_t Amplifier::nextId() {
@@ -479,11 +588,18 @@ int32_t Amplifier::surfaceMm(int64_t vx, int64_t vy) const { return evalSurface(
 // information: no tile raster, a degenerate pixel size, an empty footprint, or
 // a footprint so large it would need an unbounded number of corner reads.
 // ---------------------------------------------------------------------------
-int64_t Amplifier::surfaceUpperBoundMm(int64_t vx0, int64_t vy0, int64_t vx1,
-                                       int64_t vy1) const {
-    if (vx1 < vx0 || vy1 < vy0) return kSurfaceBoundDeclined; // empty footprint
+// Shared body of surfaceUpperBoundMm and surfaceLowerBoundMm. ONE traversal
+// producing BOTH bounds, so the two can never disagree about which cells the
+// footprint touches, which corners it reads, or what the maximum slope is --
+// the failure mode a second copy of this loop would eventually have.
+//
+// Returns false when it declines; the two public wrappers turn that into their
+// own (deliberately different) sentinels.
+bool Amplifier::surfaceBoundsMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t vy1,
+                                int64_t& outLowerMm, int64_t& outUpperMm) const {
+    if (vx1 < vx0 || vy1 < vy0) return false; // empty footprint
     const int64_t pxMm = tiles_ ? int64_t(tiles_->pixelSizeMm()) : 0;
-    if (pxMm <= 0) return kSurfaceBoundDeclined;
+    if (pxMm <= 0) return false;
 
     // Footprint bounding rectangle in mm. Inclusive of both end columns: an
     // amplifier column at index vx sits exactly at vx * kVoxelSizeMm.
@@ -496,8 +612,7 @@ int64_t Amplifier::surfaceUpperBoundMm(int64_t vx0, int64_t vy0, int64_t vx1,
     const int64_t px0 = floorDiv(x0Mm, pxMm), px1 = floorDiv(x1Mm, pxMm) + 1;
     const int64_t py0 = floorDiv(y0Mm, pxMm), py1 = floorDiv(y1Mm, pxMm) + 1;
     const int64_t nx = px1 - px0 + 1, ny = py1 - py0 + 1;
-    if (nx > kSurfaceBoundMaxCornersPerAxis || ny > kSurfaceBoundMaxCornersPerAxis)
-        return kSurfaceBoundDeclined;
+    if (nx > kSurfaceBoundMaxCornersPerAxis || ny > kSurfaceBoundMaxCornersPerAxis) return false;
 
     // Read the corner elevations once (through the same per-thread tile memo
     // column() uses); everything below is derived from this grid.
@@ -506,7 +621,8 @@ int64_t Amplifier::surfaceUpperBoundMm(int64_t vx0, int64_t vy0, int64_t vx1,
         for (int64_t ix = 0; ix < nx; ++ix)
             elev[ix + nx * iy] = cachedElevationMm(id_, *tiles_, px0 + ix, py0 + iy);
 
-    int64_t maxBaseMm = kSurfaceBoundDeclined; // sentinel: nothing seen yet
+    int64_t maxBaseMm = 0;
+    int64_t minBaseMm = 0;
     bool haveBase = false;
     int64_t maxSlopeMmPerPx = 0;
     for (int64_t iy = 0; iy + 1 < ny; ++iy) {
@@ -534,14 +650,129 @@ int64_t Amplifier::surfaceUpperBoundMm(int64_t vx0, int64_t vy0, int64_t vx1,
                 for (int64_t fy : fys) {
                     const int64_t b = bilinearBaseMm(e00, e10, e01, e11, fx, fy, pxMm);
                     if (!haveBase || b > maxBaseMm) maxBaseMm = b;
+                    if (!haveBase || b < minBaseMm) minBaseMm = b;
                     haveBase = true;
                 }
         }
     }
-    if (!haveBase) return kSurfaceBoundDeclined; // degenerate grid; bound nothing
+    if (!haveBase) return false; // degenerate grid; bound nothing
 
-    const int64_t maxDetailMm = kDetailMaxMm * slopeScaleQ10(maxSlopeMmPerPx) / 1024;
-    return clampi64(maxBaseMm + maxDetailMm, kSurfaceClampMinMm, kSurfaceClampMaxMm);
+    // The SAME slope scale feeds both sides. Sound for the upper bound because
+    // slopeScaleQ10 is nondecreasing (coupling (5)) and this is the footprint's
+    // maximum slope; sound for the lower bound for the same reason, since
+    // scaling only ever grows the detail term's MAGNITUDE, in both directions.
+    const int64_t slopeQ10 = slopeScaleQ10(maxSlopeMmPerPx);
+    const int64_t maxDetailMm = kDetailMaxMm * slopeQ10 / 1024;
+    // The negative side uses the symmetric envelope (coupling (7)), and takes
+    // one further millimetre for the truncation in the q10 divide, which rounds
+    // toward zero and so would otherwise shave the magnitude.
+    const int64_t minDetailMm = kDetailAbsMaxMm * slopeQ10 / 1024 + 1;
+
+    outUpperMm = clampi64(maxBaseMm + maxDetailMm, kSurfaceClampMinMm, kSurfaceClampMaxMm);
+    outLowerMm = clampi64(minBaseMm - minDetailMm, kSurfaceClampMinMm, kSurfaceClampMaxMm);
+    return true;
+}
+
+int64_t Amplifier::surfaceUpperBoundMm(int64_t vx0, int64_t vy0, int64_t vx1,
+                                       int64_t vy1) const {
+    int64_t lo = 0, hi = 0;
+    if (!surfaceBoundsMm(vx0, vy0, vx1, vy1, lo, hi)) return kSurfaceBoundDeclined;
+    return hi;
+}
+
+int64_t Amplifier::surfaceLowerBoundMm(int64_t vx0, int64_t vy0, int64_t vx1,
+                                       int64_t vy1) const {
+    int64_t lo = 0, hi = 0;
+    if (!surfaceBoundsMm(vx0, vy0, vx1, vy1, lo, hi)) return kSurfaceLowerBoundDeclined;
+    return lo;
+}
+
+// See the contract and the full derivation on the declaration in amplifier.h.
+// The whole proof is two lines here because every hard part is a compile-time
+// constant in the coupling block above, which is exactly where it belongs.
+// True if ANY cavern site that ANY column in the rect could possibly see has
+// its anchor within carving reach of the rect. Conservative: it returns true
+// whenever it is not certain of the answer, and true is the safe direction (it
+// forces the caller onto the deeper, more pessimistic carve envelope).
+//
+// Exactness argument. cavernColumnFromSites reduces column (vx, vy) against
+// exactly the four candidates of that column's OWN coarse cell, and culls each
+// on `dxySq > kCavernMaxReachSqMm` measured from the column to the anchor. So
+// enumerating the candidates of every coarse cell the rect's columns fall in is
+// a superset of every site any column in the rect can see, and testing each
+// anchor against the rect's nearest point is a lower bound on that per-column
+// distance. If the nearest point is out of reach, no column in the rect is.
+//
+// Cost: four hashes per coarse cell, memoised per (seed, si, sj) in the same
+// table the cave pass uses. No surface read, no site decode -- the gate bit and
+// the node jitter come out of one hash, and the depth safety window is a
+// comparison. A cell is 204.8 m, so a level-0 chunk footprint touches one.
+bool Amplifier::cavernMayReachFootprint(int64_t vx0, int64_t vy0, int64_t vx1, int64_t vy1) const {
+    const int64_t x0Mm = vx0 * kVoxelSizeMm, x1Mm = vx1 * kVoxelSizeMm;
+    const int64_t y0Mm = vy0 * kVoxelSizeMm, y1Mm = vy1 * kVoxelSizeMm;
+    const int64_t si0 = floorDiv(x0Mm, kCavernCoarseMm), si1 = floorDiv(x1Mm, kCavernCoarseMm);
+    const int64_t sj0 = floorDiv(y0Mm, kCavernCoarseMm), sj1 = floorDiv(y1Mm, kCavernCoarseMm);
+
+    // A rect spanning more coarse cells than this is not worth enumerating;
+    // say "yes" and let the caller take the pessimistic envelope. A level-4
+    // chunk (51.2 m) against a 204.8 m cell can straddle at most 2 per axis.
+    constexpr int64_t kMaxCoarseCellsPerAxis = 4;
+    if (si1 - si0 + 1 > kMaxCoarseCellsPerAxis || sj1 - sj0 + 1 > kMaxCoarseCellsPerAxis)
+        return true;
+
+    for (int64_t sj = sj0; sj <= sj1; ++sj) {
+        for (int64_t si = si0; si <= si1; ++si) {
+            const CavernCandidates& cands = cachedCavernCandidates(seed_, si, sj);
+            for (int32_t k = 0; k < 4; ++k) {
+                const CavernCandidate& c = cands.corners[k];
+                if (!c.open) continue;
+                // Nearest point of the rect to this anchor, per axis.
+                const int64_t ex = c.node.xMm < x0Mm   ? x0Mm - c.node.xMm
+                                   : c.node.xMm > x1Mm ? c.node.xMm - x1Mm
+                                                       : 0;
+                const int64_t ey = c.node.yMm < y0Mm   ? y0Mm - c.node.yMm
+                                   : c.node.yMm > y1Mm ? c.node.yMm - y1Mm
+                                                       : 0;
+                if (ex * ex + ey * ey <= kCavernMaxReachSqMm) return true;
+            }
+        }
+    }
+    return false;
+}
+
+int64_t Amplifier::solidBelowBoundMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t vy1) const {
+    if (vx1 < vx0 || vy1 < vy0) return kSurfaceLowerBoundDeclined;
+
+    // TIER 1, the common case by a wide margin. No cavern site is in reach, so
+    // the only carvers left are tunnels, crevices and shafts -- all bounded in
+    // the querying column's OWN depth space. That means no dilation is needed
+    // either, and the tight lower bound over the footprint itself is valid.
+    //
+    // This tier is the whole reason the bound is useful at playable depths. The
+    // cavern envelope is 91 m against the cave family's 42.8 m, and caverns are
+    // rare: on the test corpus, 756 cavern columns against ~100k sampled. A
+    // single flat 91 m envelope would only ever skip chunks more than 91 m
+    // down, which at a 60 m anchor depth is a small cap at the bottom of the
+    // sight sphere; 42.8 m clears most of it.
+    if (!cavernMayReachFootprint(vx0, vy0, vx1, vy1)) {
+        const int64_t tightMm = surfaceLowerBoundMm(vx0, vy0, vx1, vy1);
+        if (tightMm == kSurfaceLowerBoundDeclined) return kSurfaceLowerBoundDeclined;
+        return tightMm - kMaxCaveCarveBelowSurfaceMm;
+    }
+
+    // TIER 2. A cavern site is in reach, so dilate by that reach BEFORE
+    // bounding: the chain is anchored at absolute z derived from the surface at
+    // its OWN anchor, which is a different column from any in the footprint.
+    //
+    // No min() against tier 1's value is needed: the dilated lower bound is
+    // never above the tight one and the cavern envelope is never shallower than
+    // the cave one, so this branch is unconditionally the more conservative of
+    // the two.
+    const int64_t lowerMm = surfaceLowerBoundMm(vx0 - kCavernReachVoxels, vy0 - kCavernReachVoxels,
+                                                vx1 + kCavernReachVoxels, vy1 + kCavernReachVoxels);
+    if (lowerMm == kSurfaceLowerBoundDeclined) return kSurfaceLowerBoundDeclined;
+
+    return lowerMm - kDeepestCarveBelowSurfaceMm;
 }
 
 ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
@@ -579,7 +810,12 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // 200 m bedrock), so even the shallowest 180 m draw leaves ~52 m of
     // untouched rock above the floor against caves.h's 2 m margin.
     const uint64_t bj = hash2(seed_, vx >> 6, vy >> 6, CH_BEDROCK_JITTER);
-    col.bedrockDepthMm = static_cast<int32_t>(180000 + ((bj >> 48) * 40000) / 65536);
+    // Named constants rather than literals so coupling (11) in the block above
+    // -- the independent bedrock backstop on the all-solid carve envelope --
+    // is checked against the range this line ACTUALLY produces. Same values, so
+    // worldgen output is bit-identical.
+    col.bedrockDepthMm =
+        static_cast<int32_t>(kBedrockDepthMinMm + ((bj >> 48) * kBedrockDepthJitterMm) / 65536);
 
     // Surface material from biome classification (M4): morphology gates
     // (slope, coastal band, temperature-adjusted treeline) run before the
