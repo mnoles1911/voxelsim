@@ -12,6 +12,60 @@ namespace VoxelLF
 		FVector3f(0, 1, 0), FVector3f(0, -1, 0),
 		FVector3f(0, 0, 1), FVector3f(0, 0, -1),
 	};
+
+	namespace
+	{
+		constexpr float kInvSqrt3 = 0.57735026f;
+	}
+
+	// 6 axes + 8 cube diagonals. The diagonals are what carry side light: for a
+	// +Z slot they sit 54.7 degrees off the normal, so a floor lit only from
+	// the side now gathers real energy instead of the exact zero the
+	// axis-only basis gave it.
+	const FVector3f TraceDirTable[NumTraceDirs] = {
+		FVector3f(1, 0, 0), FVector3f(-1, 0, 0),
+		FVector3f(0, 1, 0), FVector3f(0, -1, 0),
+		FVector3f(0, 0, 1), FVector3f(0, 0, -1),
+		FVector3f(kInvSqrt3, kInvSqrt3, kInvSqrt3),
+		FVector3f(kInvSqrt3, kInvSqrt3, -kInvSqrt3),
+		FVector3f(kInvSqrt3, -kInvSqrt3, kInvSqrt3),
+		FVector3f(kInvSqrt3, -kInvSqrt3, -kInvSqrt3),
+		FVector3f(-kInvSqrt3, kInvSqrt3, kInvSqrt3),
+		FVector3f(-kInvSqrt3, kInvSqrt3, -kInvSqrt3),
+		FVector3f(-kInvSqrt3, -kInvSqrt3, kInvSqrt3),
+		FVector3f(-kInvSqrt3, -kInvSqrt3, -kInvSqrt3),
+	};
+
+	// Cosine weights, normalized per slot. Every slot gets its own axis at
+	// cos 0 = 1 plus the four diagonals of its hemisphere at cos 54.7 =
+	// 1/sqrt(3); the two perpendicular axes and the four opposite diagonals get
+	// exactly 0, which is the correct cosine response at and below the horizon.
+	// Row sum 1 + 4/sqrt(3) = 3.3094, so each row here is that normalized --
+	// which is what makes an unoccluded cell solve to exactly 1.0.
+	namespace
+	{
+		constexpr float kRowNorm = 1.f / (1.f + 4.f * kInvSqrt3); // 0.302169
+		constexpr float kAxisW = kRowNorm;                        // 0.302169
+		constexpr float kDiagW = kInvSqrt3 * kRowNorm;            // 0.174457
+		constexpr float kZ = 0.f;
+	}
+
+	// Column order matches TraceDirTable: +X -X +Y -Y +Z -Z then the 8
+	// diagonals in (+++ ++- +-+ +-- -++ -+- --+ ---) order.
+	const float SlotWeight[NumDirs][NumTraceDirs] = {
+		// slot +X : diagonals with +x -> indices 6,7,8,9
+		{kAxisW, kZ, kZ, kZ, kZ, kZ, kDiagW, kDiagW, kDiagW, kDiagW, kZ, kZ, kZ, kZ},
+		// slot -X : diagonals with -x -> indices 10,11,12,13
+		{kZ, kAxisW, kZ, kZ, kZ, kZ, kZ, kZ, kZ, kZ, kDiagW, kDiagW, kDiagW, kDiagW},
+		// slot +Y : diagonals with +y -> 6,7,10,11
+		{kZ, kZ, kAxisW, kZ, kZ, kZ, kDiagW, kDiagW, kZ, kZ, kDiagW, kDiagW, kZ, kZ},
+		// slot -Y : diagonals with -y -> 8,9,12,13
+		{kZ, kZ, kZ, kAxisW, kZ, kZ, kZ, kZ, kDiagW, kDiagW, kZ, kZ, kDiagW, kDiagW},
+		// slot +Z : diagonals with +z -> 6,8,10,12
+		{kZ, kZ, kZ, kZ, kAxisW, kZ, kDiagW, kZ, kDiagW, kZ, kDiagW, kZ, kDiagW, kZ},
+		// slot -Z : diagonals with -z -> 7,9,11,13
+		{kZ, kZ, kZ, kZ, kZ, kAxisW, kZ, kDiagW, kZ, kDiagW, kZ, kDiagW, kZ, kDiagW},
+	};
 }
 
 namespace
@@ -119,6 +173,10 @@ uint32 FVoxelLightField::VoxelizeChunk(const FIntVector& BrickCoord, const FVect
 	Brick.SolvedCells.Init(false, VoxelLF::BrickCells);
 	FMemory::Memzero(Brick.Vis, sizeof(Brick.Vis));
 	FMemory::Memzero(Brick.AvgIrr, sizeof(Brick.AvgIrr));
+	// Both halves of the Jacobi pair, or the re-voxelized brick would keep
+	// bouncing light off geometry that no longer exists (visible as a dug
+	// tunnel staying lit for a few passes after the rock came out).
+	FMemory::Memzero(Brick.PrevAvgIrr, sizeof(Brick.PrevAvgIrr));
 	Brick.bSolved = false;
 
 	// The subsystem derives BrickCoord from the component location, so this
@@ -292,6 +350,11 @@ float FVoxelLightField::SampleOpacity(const FVector& WorldUU, int32 Level) const
 	return float(Coarse[CoarseIdx].FindRef(Key)) * (1.f / 255.f);
 }
 
+// Reads the PUBLISHED (previous-pass) irradiance, never the in-flight one --
+// this is the read side of the Jacobi iteration. See the ENERGY CONSERVATION
+// note in the header: sampling the live AvgIrr here is what made the bounce
+// count depend on scan order and thread scheduling, and made enclosed spaces
+// brighten pass over pass.
 float FVoxelLightField::SampleAvgIrr(const FVector& WorldUU) const
 {
 	const FIntVector Key = WorldToBrick(WorldUU);
@@ -303,7 +366,8 @@ float FVoxelLightField::SampleAvgIrr(const FVector& WorldUU) const
 	const int32 IX = FMath::Clamp(int32((WorldUU.X - double(Key.X) * VoxelLF::BrickEdgeUU) / VoxelLF::CellSizeUU), 0, 7);
 	const int32 IY = FMath::Clamp(int32((WorldUU.Y - double(Key.Y) * VoxelLF::BrickEdgeUU) / VoxelLF::CellSizeUU), 0, 7);
 	const int32 IZ = FMath::Clamp(int32((WorldUU.Z - double(Key.Z) * VoxelLF::BrickEdgeUU) / VoxelLF::CellSizeUU), 0, 7);
-	return float(Brick->AvgIrr[VoxelLF::CellIndex(IX, IY, IZ)]) * (1.f / 255.f);
+	const uint8* Src = bLegacyInPlaceGather ? Brick->AvgIrr : Brick->PrevAvgIrr;
+	return float(Src[VoxelLF::CellIndex(IX, IY, IZ)]) * (1.f / 255.f);
 }
 
 bool FVoxelLightField::SampleIrradiance(const FVector& WorldUU, const FVector3f& Normal, float& OutIrradiance) const
@@ -430,8 +494,13 @@ bool FVoxelLightField::SampleIrradianceAtProbe(const FVector& P, const float (&D
 
 // --- solve -----------------------------------------------------------------
 
-int32 FVoxelLightField::SolveBricks(const TArray<FIntVector>& Keys, const FVoxelGISolveParams& Params)
+int32 FVoxelLightField::SolveBricks(const TArray<FIntVector>& Keys, const FVoxelGISolveParams& Params,
+                                    FVoxelGIPassStats* OutStats)
 {
+	if (OutStats)
+	{
+		*OutStats = FVoxelGIPassStats();
+	}
 	if (Keys.Num() == 0)
 	{
 		return 0;
@@ -470,10 +539,42 @@ int32 FVoxelLightField::SolveBricks(const TArray<FIntVector>& Keys, const FVoxel
 		SolvedCounts[I] = SolveBrickInternal(TargetKeys[I], *Targets[I], Params);
 	});
 
+	// PUBLISH. Every brick in this pass swaps its freshly-written AvgIrr into
+	// PrevAvgIrr only now, after all workers have finished -- which is what
+	// makes the pass a Jacobi step (exactly one bounce, order-independent)
+	// rather than the nondeterministic Gauss-Seidel it used to be.
+	//
+	// Deliberately AFTER the ParallelFor and not inside it: publishing per
+	// brick as each worker finished would reintroduce exactly the race this
+	// exists to remove. 512 bytes per brick, so at the default 10 bricks/frame
+	// this is a 5 KB memcpy.
 	int32 Total = 0;
-	for (int32 C : SolvedCounts)
+	double IrrSum = 0.0;
+	int32 IrrCount = 0;
+	double MaxDelta = 0.0;
+	for (int32 I = 0; I < Targets.Num(); ++I)
 	{
-		Total += C;
+		Total += SolvedCounts[I];
+		FVoxelLFBrick& Brick = *Targets[I];
+		for (int32 C = 0; C < VoxelLF::BrickCells; ++C)
+		{
+			if (!Brick.SolvedCells[C])
+			{
+				continue;
+			}
+			const int32 New = int32(Brick.AvgIrr[C]);
+			MaxDelta = FMath::Max(MaxDelta, FMath::Abs(double(New - int32(Brick.PrevAvgIrr[C]))));
+			IrrSum += double(New);
+			++IrrCount;
+		}
+		FMemory::Memcpy(Brick.PrevAvgIrr, Brick.AvgIrr, sizeof(Brick.AvgIrr));
+	}
+
+	if (OutStats)
+	{
+		OutStats->CellsSolved = Total;
+		OutStats->MeanIrr = IrrCount > 0 ? (IrrSum / double(IrrCount)) / 255.0 : 0.0;
+		OutStats->MaxAbsDelta = MaxDelta / 255.0;
 	}
 	return Total;
 }
@@ -527,10 +628,14 @@ int32 FVoxelLightField::SolveBrickInternal(const FIntVector& Key, FVoxelLFBrick&
 			continue;
 		}
 
-		float Sum = 0.f;
-		for (int32 D = 0; D < VoxelLF::NumDirs; ++D)
+		// Trace the 14-cone basis once, then project it into the 6 ambient-cube
+		// slots. Tracing per-slot instead would be 30 marches for the same
+		// answer; the cones are shared because a diagonal cone contributes to
+		// three slots at once.
+		float ConeIrr[VoxelLF::NumTraceDirs];
+		for (int32 D = 0; D < VoxelLF::NumTraceDirs; ++D)
 		{
-			const FVector Dir(VoxelLF::DirTable[D]);
+			const FVector Dir(VoxelLF::TraceDirTable[D]);
 
 			float Occ = 0.f;
 			float Bounce = 0.f;
@@ -580,10 +685,30 @@ int32 FVoxelLightField::SolveBrickInternal(const FIntVector& Key, FVoxelLFBrick&
 				T += FMath::Max(LevelCellUU, MinStepUU);
 			}
 
+			// ENERGY: Vis and the Contrib_i that fed Bounce partition the cone
+			// exactly (Vis + sum Contrib_i = 1), and Bounce scales every
+			// Contrib_i by albedo < 1 -- so Irr <= Vis*Sky + albedo*(1-Vis) <= 1
+			// for Sky <= 1 with no clamping needed. The Clamp is byte-encode
+			// hygiene against a SkyIntensity someone pushed above 1, not the
+			// thing keeping the iteration bounded.
 			const float Vis = FMath::Max(0.f, 1.f - Occ);
-			const float Irr = FMath::Clamp(Vis * Params.SkyIntensity + FMath::Min(Bounce, Params.MaxBounceContribution), 0.f, 1.f);
-			Brick.Vis[Idx * VoxelLF::NumDirs + D] = uint8(FMath::RoundToInt(Irr * 255.f));
-			Sum += Irr;
+			ConeIrr[D] = FMath::Clamp(Vis * FMath::Min(Params.SkyIntensity, 1.f) + Bounce, 0.f, 1.f);
+		}
+
+		// Project into the ambient cube. Each row of SlotWeight sums to 1, so
+		// every slot is a convex combination of ConeIrr and stays in [0,1] --
+		// the recombination cannot add energy either.
+		float Sum = 0.f;
+		for (int32 S = 0; S < VoxelLF::NumDirs; ++S)
+		{
+			float SlotIrr = 0.f;
+			for (int32 D = 0; D < VoxelLF::NumTraceDirs; ++D)
+			{
+				SlotIrr += VoxelLF::SlotWeight[S][D] * ConeIrr[D];
+			}
+			SlotIrr = FMath::Clamp(SlotIrr, 0.f, 1.f);
+			Brick.Vis[Idx * VoxelLF::NumDirs + S] = uint8(FMath::RoundToInt(SlotIrr * 255.f));
+			Sum += SlotIrr;
 		}
 
 		Brick.AvgIrr[Idx] = uint8(FMath::RoundToInt(FMath::Clamp(Sum / VoxelLF::NumDirs, 0.f, 1.f) * 255.f));

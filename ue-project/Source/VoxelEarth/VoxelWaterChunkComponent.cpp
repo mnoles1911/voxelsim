@@ -116,10 +116,23 @@ public:
 				Vertices.Add(Vert);
 			}
 
-			// Winding verified against FVoxelChunkSceneProxy's identical
-			// (empirically-verified) convention: Positive faces reversed
-			// relative to the naive loop order.
-			if (Q.Positive)
+			// WINDING -- corrected 2026-07-21 to match FVoxelChunkSceneProxy.
+			//
+			// This was a copy of the terrain proxy's winding from BEFORE that
+			// proxy's inversion bug was found: BOTH branches were flipped, so
+			// every water quad was wound with its BACK side front-facing. The
+			// terrain fix (see VoxelChunkComponent.cpp, "WINDING -- corrected")
+			// established that the correct convention is NEGATIVE faces
+			// reversed relative to the naive loop order, not positive ones.
+			//
+			// Symptom on water specifically: an ocean/pond surface seen from
+			// above was showing the underside quad (-Z, lit by the sky through
+			// the water normal) and vice versa. It is less obvious than the
+			// terrain case because the top and bottom of a water slab are
+			// geometrically coincident planes, but the shading normal handed to
+			// M_Ocean was inverted, so specular/fresnel responded to a normal
+			// pointing into the water rather than out of it.
+			if (!Q.Positive)
 			{
 				IndexBuffer.Indices.Add(BaseVertex + 0);
 				IndexBuffer.Indices.Add(BaseVertex + 2);
