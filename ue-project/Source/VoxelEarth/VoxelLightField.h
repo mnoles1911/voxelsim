@@ -208,6 +208,11 @@ struct FVoxelGISolveParams
 	// Values above 1.0 break the convergence bound (see the header note) and
 	// are clamped by the solve.
 	float SkyIntensity = 1.0f;
+	// Diagnostic: restore the pre-2026-07-21 degenerate basis (6 axis cones,
+	// each slot fed by its own axis alone) so the before/after of the cone
+	// basis fix can be captured from one build. Same trick the winding fix
+	// used with voxel.GI.DebugVis 6.
+	bool bLegacyConeBasis = false;
 };
 
 // Per-pass convergence telemetry. MaxAbsDelta is the quantity the contraction
@@ -302,6 +307,17 @@ public:
 	// PrevAvgIrr, so one build can measure both the old drift and the new
 	// convergence. Never set outside the convergence harness.
 	void SetLegacyInPlaceGather(bool bEnable) { bLegacyInPlaceGather = bEnable; }
+
+	// TEST ONLY (-VoxelGIConvergeSeed=<0..255>). Overwrites every solved cell's
+	// irradiance, both halves of the Jacobi pair, with a constant.
+	//
+	// This is what makes the convergence claim falsifiable. Measuring a field
+	// that has already settled proves nothing -- it sits still whether or not
+	// the iteration is sound. Kicking it to all-black or all-white and
+	// watching where it lands does: a contraction returns to the SAME fixed
+	// point from both directions, while a gathering loop with gain >= 1 runs
+	// away from the hot start instead of falling back to it.
+	void SeedIrradiance(uint8 Value);
 
 private:
 	bool SampleIrradianceUnlocked(const FVector& WorldUU, const FVector3f& Normal, float& OutIrradiance) const;

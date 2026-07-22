@@ -118,6 +118,8 @@ private:
 	int32 ConvergePasses = 0;
 	float ConvergeSettleSeconds = 40.f;
 	bool bConvergeLegacy = false;
+	bool bConvergeSeed = false;
+	int32 ConvergeSeedValue = 0;
 	bool bConvergeDone = false;
 	double FirstTickSeconds = 0.0;
 };

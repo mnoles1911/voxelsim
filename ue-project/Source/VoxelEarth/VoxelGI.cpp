@@ -111,6 +111,15 @@ namespace
 		TEXT("Diffuse albedo used for the progressive one-bounce gather."),
 		ECVF_Default);
 
+	TAutoConsoleVariable<int32> CVarGILegacyConeBasis(
+		TEXT("voxel.GI.LegacyConeBasis"), 0,
+		TEXT("1 = restore the pre-2026-07-21 DEGENERATE cone basis: 6 axis-aligned cones, each ")
+		TEXT("ambient-cube slot fed by its own axis alone. Because every normal this mesh produces ")
+		TEXT("is axis-aligned, max(0,N.D) then selects exactly one cone and side light is weighted ")
+		TEXT("to zero. Kept solely so the before/after of the fix can be captured from one build ")
+		TEXT("(-VoxelGILegacyBasis); it is a bug, not a quality/perf tradeoff."),
+		ECVF_Default);
+
 	TAutoConsoleVariable<int32> CVarGIDebug(
 		TEXT("voxel.GI.Debug"), 0,
 		TEXT("1 = log light field stats (bricks, queue depths, solve ms) once a second. ")
@@ -168,11 +177,25 @@ void UVoxelGISubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	//   -VoxelGIConvergeLegacy      gather the bounce from the live AvgIrr, i.e.
 	//                               the pre-fix behaviour, so one build can
 	//                               produce both the drift and the fix.
+	// -VoxelGILegacyBasis: command line rather than -ExecCmds for the same
+	// reason as -VoxelGIVis -- it has to be in force before the first solve,
+	// and a cvar set after init leaves already-solved bricks on the new basis
+	// and silently produces a mixed capture.
+	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelGILegacyBasis")))
+	{
+		if (IConsoleVariable* V = IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.GI.LegacyConeBasis")))
+		{
+			V->Set(1, ECVF_SetByCode);
+			UE_LOG(LogVoxelGI, Log, TEXT("VoxelGILegacyBasis: voxel.GI.LegacyConeBasis=1 (degenerate pre-fix basis)"));
+		}
+	}
+
 	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelGIConverge="), ConvergePasses) && ConvergePasses > 0)
 	{
 		ConvergePasses = FMath::Clamp(ConvergePasses, 1, 64);
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGIConvergeSettle="), ConvergeSettleSeconds);
 		bConvergeLegacy = FParse::Param(FCommandLine::Get(), TEXT("VoxelGIConvergeLegacy"));
+		bConvergeSeed = FParse::Value(FCommandLine::Get(), TEXT("VoxelGIConvergeSeed="), ConvergeSeedValue);
 		if (IConsoleVariable* V = IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.GI.Enabled")))
 		{
 			V->Set(1, ECVF_SetByCode); // the harness is meaningless with GI off
@@ -373,6 +396,7 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 	FVoxelGISolveParams Params;
 	Params.MaxConeDistanceUU = CVarGIConeDistanceUU.GetValueOnGameThread();
 	Params.BounceAlbedo = CVarGIBounceAlbedo.GetValueOnGameThread();
+	Params.bLegacyConeBasis = CVarGILegacyConeBasis.GetValueOnGameThread() != 0;
 
 	TArray<FIntVector> ToSolve;
 	const int32 SolveBudget = FMath::Max(0, CVarGIMaxBrickSolvesPerFrame.GetValueOnGameThread());
@@ -553,12 +577,22 @@ void UVoxelGISubsystem::RunConvergenceHarness()
 	FVoxelGISolveParams Params;
 	Params.MaxConeDistanceUU = CVarGIConeDistanceUU.GetValueOnGameThread();
 	Params.BounceAlbedo = CVarGIBounceAlbedo.GetValueOnGameThread();
+	Params.bLegacyConeBasis = CVarGILegacyConeBasis.GetValueOnGameThread() != 0;
 
 	Field->SetLegacyInPlaceGather(bConvergeLegacy);
 
+	if (bConvergeSeed)
+	{
+		const uint8 SeedByte = uint8(FMath::Clamp(ConvergeSeedValue, 0, 255));
+		Field->SeedIrradiance(SeedByte);
+		UE_LOG(LogVoxelGI, Log, TEXT("GICONVERGE: seeded every solved cell to %d/255 (%s start)."),
+		       int32(SeedByte), SeedByte >= 128 ? TEXT("HOT") : TEXT("COLD"));
+	}
+
 	UE_LOG(LogVoxelGI, Log,
-	       TEXT("GICONVERGE: begin -- %d resident bricks, %d passes, albedo %.2f, mode=%s"),
+	       TEXT("GICONVERGE: begin -- %d resident bricks, %d passes, albedo %.2f, seed=%s, mode=%s"),
 	       AllKeys.Num(), ConvergePasses, Params.BounceAlbedo,
+	       bConvergeSeed ? *FString::Printf(TEXT("%d"), ConvergeSeedValue) : TEXT("none"),
 	       bConvergeLegacy ? TEXT("LEGACY in-place gather (pre-fix)") : TEXT("Jacobi published gather (fixed)"));
 
 	double PrevMean = 0.0;

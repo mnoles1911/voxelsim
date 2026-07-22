@@ -492,6 +492,29 @@ bool FVoxelLightField::SampleIrradianceAtProbe(const FVector& P, const float (&D
 	return true;
 }
 
+void FVoxelLightField::SeedIrradiance(uint8 Value)
+{
+	FRWScopeLock ScopeLock(Lock, SLT_Write);
+	for (TPair<FIntVector, TUniquePtr<FVoxelLFBrick>>& Pair : Bricks)
+	{
+		if (!Pair.Value)
+		{
+			continue;
+		}
+		FVoxelLFBrick& Brick = *Pair.Value;
+		for (int32 C = 0; C < VoxelLF::BrickCells; ++C)
+		{
+			// Solved cells only: an unsolved cell is not part of the iteration
+			// and seeding it would inject light into rock.
+			if (Brick.SolvedCells[C])
+			{
+				Brick.AvgIrr[C] = Value;
+				Brick.PrevAvgIrr[C] = Value;
+			}
+		}
+	}
+}
+
 // --- solve -----------------------------------------------------------------
 
 int32 FVoxelLightField::SolveBricks(const TArray<FIntVector>& Keys, const FVoxelGISolveParams& Params,
@@ -632,8 +655,12 @@ int32 FVoxelLightField::SolveBrickInternal(const FIntVector& Key, FVoxelLFBrick&
 		// slots. Tracing per-slot instead would be 30 marches for the same
 		// answer; the cones are shared because a diagonal cone contributes to
 		// three slots at once.
+		// TraceDirTable's first 6 entries ARE DirTable, in the same order, so
+		// the legacy basis is just this loop stopped at 6 with an identity
+		// projection below.
+		const int32 NumTrace = Params.bLegacyConeBasis ? VoxelLF::NumDirs : VoxelLF::NumTraceDirs;
 		float ConeIrr[VoxelLF::NumTraceDirs];
-		for (int32 D = 0; D < VoxelLF::NumTraceDirs; ++D)
+		for (int32 D = 0; D < NumTrace; ++D)
 		{
 			const FVector Dir(VoxelLF::TraceDirTable[D]);
 
@@ -702,9 +729,16 @@ int32 FVoxelLightField::SolveBrickInternal(const FIntVector& Key, FVoxelLFBrick&
 		for (int32 S = 0; S < VoxelLF::NumDirs; ++S)
 		{
 			float SlotIrr = 0.f;
-			for (int32 D = 0; D < VoxelLF::NumTraceDirs; ++D)
+			if (Params.bLegacyConeBasis)
 			{
-				SlotIrr += VoxelLF::SlotWeight[S][D] * ConeIrr[D];
+				SlotIrr = ConeIrr[S]; // the degenerate one-cone-per-slot basis
+			}
+			else
+			{
+				for (int32 D = 0; D < VoxelLF::NumTraceDirs; ++D)
+				{
+					SlotIrr += VoxelLF::SlotWeight[S][D] * ConeIrr[D];
+				}
 			}
 			SlotIrr = FMath::Clamp(SlotIrr, 0.f, 1.f);
 			Brick.Vis[Idx * VoxelLF::NumDirs + S] = uint8(FMath::RoundToInt(SlotIrr * 255.f));
