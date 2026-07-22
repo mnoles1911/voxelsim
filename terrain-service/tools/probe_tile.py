@@ -17,8 +17,13 @@ either "MATCHES our assumption" or the specific EXPECTED_CHANNELS mismatches.
 Exits 0 on match, 1 on mismatch, 2 on bad arguments.
 """
 
+import os
 import sys
 import time
+
+
+def _allow_cpu() -> bool:
+    return os.environ.get("VOXELSIM_ALLOW_CPU") == "1"
 
 
 def main() -> int:
@@ -39,6 +44,28 @@ def main() -> int:
         print(f"ERROR: sha256 should be 64 hex chars, got {len(checkpoint_sha256)}.")
         return 2
 
+    # TerrainDiffusionBackend picks its device with
+    #   device = "cuda" if torch.cuda.is_available() else "cpu"
+    # which means a torch/driver mismatch does NOT raise -- it quietly runs
+    # on CPU at minutes-to-hours per tile while a rented 4090 sits idle and
+    # billing. That is exactly what a cu130 wheel on a 12.8 driver produced
+    # on 2026-07-19. Refuse to proceed rather than discover it from the bill.
+    if not _allow_cpu():
+        import torch
+        if not torch.cuda.is_available():
+            print("ERROR: torch.cuda.is_available() is False -- inference "
+                  "would run on CPU.")
+            print(f"  torch: {torch.__version__}")
+            print("  Fix: reinstall torch+torchvision from the wheel index "
+                  "matching this host's driver:")
+            print("    python tools/cuda_index.py    # prints the index URLs "
+                  "to try, best first")
+            print("  torchvision MUST come from the same --index-url or it "
+                  "drags a PyPI torch back in.")
+            print("  Set VOXELSIM_ALLOW_CPU=1 only if you genuinely mean to "
+                  "wait hours for one tile.")
+            return 3
+
     from terrain_service.providers.diffusion import (
         DiffusionConfig,
         DiffusionProvider,
@@ -53,7 +80,9 @@ def main() -> int:
     provider = DiffusionProvider(config=config)
 
     t0 = time.time()
-    raster = provider._call_model(seed=20260719, x=0, y=0, scale=1)
+    seed = int(os.environ.get("PROBE_SEED", "20260719"))
+    print("probe seed:", seed)
+    raster = provider._call_model(seed=seed, x=0, y=0, scale=1)
     elapsed = time.time() - t0
     # The pregen budget is derived from this number, so print it prominently.
     print(f"per-tile: {elapsed:.1f}s  -> 25 tiles ~{elapsed * 25 / 60:.1f} min,"
