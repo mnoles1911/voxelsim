@@ -206,3 +206,113 @@ def test_pregen_diffusion_dry_run_without_pin_uses_unpinned_default(tmp_path):
     default_id = DiffusionConfig(scale=1).provider_id() + "-dryrun"
     cache = TileCache(cache_dir)
     assert cache.get(default_id, 5, 0, 0, 1) is not None
+
+
+def test_pregen_diffusion_pins_conditioning_and_label_in_cache_key(tmp_path):
+    """The new identity fields must reach DiffusionProvider, and the run must
+    announce the namespace it writes into.
+
+    checkpoint_label and conditioning_digest are what make the identity
+    content-addressed (see providers/diffusion.py): the label replaces the
+    load path that used to be embedded in provider_id, and the conditioning
+    digest covers the WorldClim/ETOPO rasters that condition generation.
+    """
+    from terrain_service.providers.diffusion import DiffusionConfig
+
+    cache_dir = tmp_path / "cache"
+    result = subprocess.run(
+        [
+            "python",
+            "-m",
+            "terrain_service.pregen",
+            "--seed", "5",
+            "--radius", "0",
+            "--cache-dir", str(cache_dir),
+            "--provider", "diffusion",
+            "--dry-run",
+            "--checkpoint-id", "/some/mount/point",
+            "--checkpoint-label", "terrain-diffusion-30m",
+            "--checkpoint-sha256", "c" * 64,
+            "--conditioning-digest", "d" * 64,
+            "--terrain-diffusion-version", "abc1234",
+        ],
+        cwd=Path(__file__).parent.parent,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"pregen failed: {result.stderr}"
+    assert "generated=1" in result.stderr
+
+    pinned_id = (
+        DiffusionConfig(
+            checkpoint_id="/some/mount/point",
+            checkpoint_label="terrain-diffusion-30m",
+            checkpoint_sha256="c" * 64,
+            conditioning_digest="d" * 64,
+            terrain_diffusion_version="abc1234",
+            scale=1,
+        ).provider_id()
+        + "-dryrun"
+    )
+    cache = TileCache(cache_dir)
+    assert cache.get(pinned_id, 5, 0, 0, 1) is not None
+    # The run announces its namespace, and the mount point never appears in it.
+    assert f"provider_id: {pinned_id}" in result.stderr
+    assert "/some/mount/point" not in pinned_id
+
+
+def test_pregen_rejects_a_path_as_checkpoint_label(tmp_path):
+    """Putting the mount point in the identity field (the old habit that
+    caused bug 1) must fail with a clear message, not silently work."""
+    result = subprocess.run(
+        [
+            "python",
+            "-m",
+            "terrain_service.pregen",
+            "--seed", "5",
+            "--radius", "0",
+            "--cache-dir", str(tmp_path / "cache"),
+            "--provider", "diffusion",
+            "--dry-run",
+            "--checkpoint-label", "/workspace/ckpt/terrain-diffusion-30m",
+        ],
+        cwd=Path(__file__).parent.parent,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "checkpoint_label" in result.stderr
+
+
+def test_pregen_print_conditioning_digest(tmp_path, monkeypatch):
+    """The bring-up helper that produces the value for --conditioning-digest.
+    With no conditioning data present it must refuse (exit 1) rather than
+    print an invented digest."""
+    import os
+
+    from terrain_service.providers.diffusion import (
+        DEFAULT_CONDITIONING_FILES,
+        compute_conditioning_digest,
+    )
+
+    root = tmp_path / "global"
+    root.mkdir()
+    env = dict(os.environ, TERRAIN_CONDITIONING_ROOT=str(root))
+    cmd = [
+        "python", "-m", "terrain_service.pregen",
+        "--seed", "5", "--radius", "0", "--print-conditioning-digest",
+    ]
+
+    missing = subprocess.run(
+        cmd, cwd=Path(__file__).parent.parent, capture_output=True, text=True, env=env
+    )
+    assert missing.returncode == 1
+    assert "etopo_10m.tif" in missing.stderr
+
+    for name in DEFAULT_CONDITIONING_FILES:
+        (root / name).write_bytes(name.encode())
+    ok = subprocess.run(
+        cmd, cwd=Path(__file__).parent.parent, capture_output=True, text=True, env=env
+    )
+    assert ok.returncode == 0, ok.stderr
+    assert compute_conditioning_digest(root=root) in ok.stdout

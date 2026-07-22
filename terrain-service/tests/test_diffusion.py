@@ -753,3 +753,59 @@ def test_terrain_diffusion_backend_constructs_without_torch():
     generate_rasters (via _load_pipeline) does, lazily."""
     backend = TerrainDiffusionBackend(DiffusionConfig())
     assert backend.config is not None
+
+
+def test_create_app_pins_full_identity_from_env(tmp_path, monkeypatch):
+    """The server can pin every identity-bearing field from the environment
+    (label, checkpoint hash, conditioning digest, package version) -- and the
+    checkpoint LOAD PATH it is given never shows up in the served id."""
+    monkeypatch.setenv("TERRAIN_PROVIDER", "diffusion")
+    monkeypatch.setenv("TERRAIN_DIFFUSION_DRY_RUN", "1")
+    monkeypatch.setenv("TERRAIN_DIFFUSION_CHECKPOINT_ID", "/workspace/ckpt/td30m")
+    monkeypatch.setenv("TERRAIN_DIFFUSION_CHECKPOINT_LABEL", "terrain-diffusion-30m")
+    monkeypatch.setenv("TERRAIN_DIFFUSION_CHECKPOINT_SHA256", "b" * 64)
+    monkeypatch.setenv("TERRAIN_DIFFUSION_CONDITIONING_DIGEST", "e" * 64)
+    monkeypatch.setenv("TERRAIN_DIFFUSION_VERSION", "abc1234")
+    monkeypatch.delenv("TERRAIN_DIFFUSION_PROVIDER_ID_OVERRIDE", raising=False)
+
+    app = create_app(cache=TileCache(tmp_path))
+    served = app.test_client().get("/healthz").get_json()["provider"]
+
+    expected = (
+        DiffusionConfig(
+            checkpoint_id="/workspace/ckpt/td30m",
+            checkpoint_label="terrain-diffusion-30m",
+            checkpoint_sha256="b" * 64,
+            conditioning_digest="e" * 64,
+            terrain_diffusion_version="abc1234",
+        ).provider_id()
+        + "-dryrun"
+    )
+    assert served == expected
+    assert "workspace" not in served
+    assert "UNPINNED" not in served and "UNVERIFIED" not in served
+
+
+def test_create_app_provider_id_override_serves_legacy_namespace(tmp_path, monkeypatch):
+    """The migration path for tiles already on disk under the pre-v2 id: the
+    server serves that namespace verbatim.
+
+    Non-dry-run, because that is the real scenario (serving tonight's cached
+    tiles) and because the ``-dryrun`` suffix is applied on top of the
+    override on purpose — dry-run output must never land in a namespace that
+    holds real generated tiles, override or not.
+    """
+    legacy = "terrain-diffusion-/workspace/ckpt/terrain-diffusion-30m-c6f775d3f1b21289"
+    monkeypatch.setenv("TERRAIN_PROVIDER", "diffusion")
+    monkeypatch.delenv("TERRAIN_DIFFUSION_DRY_RUN", raising=False)
+    monkeypatch.setenv("TERRAIN_DIFFUSION_PROVIDER_ID_OVERRIDE", legacy)
+
+    app = create_app(cache=TileCache(tmp_path))
+    assert app.test_client().get("/healthz").get_json()["provider"] == legacy
+
+    monkeypatch.setenv("TERRAIN_DIFFUSION_DRY_RUN", "1")
+    dry_app = create_app(cache=TileCache(tmp_path))
+    assert (
+        dry_app.test_client().get("/healthz").get_json()["provider"]
+        == legacy + "-dryrun"
+    )
