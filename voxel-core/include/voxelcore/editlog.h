@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -33,15 +34,51 @@ struct EditEntry {
 
 class EditLog {
 public:
-    static constexpr uint32_t kFormatVersion = 1;
+    // Format history:
+    //   1 - magic, fmt, wgen, seed, brickEdge, count, entries.
+    //   2 - adds providerId (u16 length + bytes) right after brickEdge, so
+    //       a replay knows which tile-content-addressed provider (checkpoint
+    //       sha256 + sampler + scale, see terrain-service's
+    //       DiffusionConfig.provider_id()) the log's diffs were recorded
+    //       against. parse() still reads version-1 files (providerId reads
+    //       as "" -- see checkProvider()'s kUnstamped result) so existing
+    //       logs on disk keep loading; only NEW logs are written as v2.
+    static constexpr uint32_t kFormatVersion = 2;
+    static constexpr uint32_t kMinReadableFormatVersion = 1;
     static constexpr uint32_t kMagic = 0x4C455856; // "VXEL" little-endian
 
-    EditLog(uint64_t seed, uint8_t brickEdge) : seed_(seed), brickEdge_(brickEdge) {}
+    // Result of comparing a log's stamped providerId against the provider
+    // that is about to replay it. kUnstamped is NOT a failure: version-1
+    // logs (and any v2 log deliberately written with providerId="") predate
+    // or opt out of the stamp, so callers should warn loudly and proceed --
+    // only kMismatch should refuse a replay outright (see doc comment on
+    // checkProvider()).
+    enum class ProviderCheck { kMatch, kUnstamped, kMismatch };
+
+    EditLog(uint64_t seed, uint8_t brickEdge, std::string providerId = {})
+        : seed_(seed), brickEdge_(brickEdge), providerId_(std::move(providerId)) {}
 
     uint64_t seed() const { return seed_; }
     uint8_t brickEdge() const { return brickEdge_; }
+    // Content-addressed identity of the tile provider this log's diffs were
+    // recorded against ("" means unstamped: a pre-v2 log, or a caller that
+    // never had a provider identity, e.g. tests). See ProviderCheck.
+    const std::string& providerId() const { return providerId_; }
     const std::vector<EditEntry>& entries() const { return entries_; }
     size_t size() const { return entries_.size(); }
+
+    // Compare this log's stamped providerId against `currentProviderId` (the
+    // identity of the world/tile-set about to replay it). Doctrine: an
+    // edit-log is a diff against a specific base world, so replaying it
+    // against a DIFFERENT tile set silently lands edits on terrain that no
+    // longer matches. kMismatch means the caller MUST refuse the replay;
+    // kUnstamped means the log predates provider stamping and the caller
+    // should warn but MAY proceed (refusing outright would hard-fail every
+    // log recorded before this feature existed).
+    ProviderCheck checkProvider(const std::string& currentProviderId) const {
+        if (providerId_.empty()) return ProviderCheck::kUnstamped;
+        return providerId_ == currentProviderId ? ProviderCheck::kMatch : ProviderCheck::kMismatch;
+    }
 
     // Appends with the next sequence number. Cells are normalized to
     // sorted-unique, last write wins.
@@ -71,6 +108,7 @@ public:
         w.u32(kWorldGenVersion);
         w.u64(seed_);
         w.u8(brickEdge_);
+        writeString(w, providerId_);
         w.u64(entries_.size());
         const uint32_t cellsPerBrick =
             uint32_t(brickEdge_) * brickEdge_ * brickEdge_;
@@ -89,11 +127,15 @@ public:
         uint64_t seed, count;
         uint8_t edge;
         if (!r.u32(magic) || magic != kMagic) return std::nullopt;
-        if (!r.u32(fmt) || fmt != kFormatVersion) return std::nullopt;
+        if (!r.u32(fmt) || fmt < kMinReadableFormatVersion || fmt > kFormatVersion)
+            return std::nullopt;
         if (!r.u32(wgen) || wgen != kWorldGenVersion) return std::nullopt;
-        if (!r.u64(seed) || !r.u8(edge) || !r.u64(count)) return std::nullopt;
+        if (!r.u64(seed) || !r.u8(edge)) return std::nullopt;
         if (edge != 8 && edge != 16) return std::nullopt;
-        EditLog log(seed, edge);
+        std::string providerId; // stays "" for fmt==1 (pre-provider-stamp logs)
+        if (fmt >= 2 && !readString(r, providerId)) return std::nullopt;
+        if (!r.u64(count)) return std::nullopt;
+        EditLog log(seed, edge, std::move(providerId));
         const uint32_t cellsPerBrick = uint32_t(edge) * edge * edge;
         for (uint64_t i = 0; i < count; ++i) {
             EditEntry e;
@@ -109,6 +151,29 @@ public:
 
 private:
     enum PayloadMode : uint8_t { kSparse = 0, kRle = 1 };
+
+    // ByteWriter/ByteReader (voxelcore/bytes.h) are shared with the tile
+    // wire format and only speak fixed-width integers; providerId is the
+    // only string field in this format, so it gets its own tiny
+    // length-prefixed (uint16) codec here rather than growing the shared
+    // helper for one caller.
+    static void writeString(ByteWriter& w, const std::string& s) {
+        w.u16(static_cast<uint16_t>(s.size()));
+        for (unsigned char c : s) w.u8(c);
+    }
+
+    static bool readString(ByteReader& r, std::string& s) {
+        uint16_t n;
+        if (!r.u16(n)) return false;
+        s.clear();
+        s.reserve(n);
+        for (uint16_t i = 0; i < n; ++i) {
+            uint8_t c;
+            if (!r.u8(c)) return false;
+            s.push_back(static_cast<char>(c));
+        }
+        return true;
+    }
 
     static void writePayload(ByteWriter& w, const EditEntry& e, uint32_t cellsPerBrick) {
         // RLE only encodes full-brick rewrites; pick it when smaller.
@@ -171,6 +236,7 @@ private:
 
     uint64_t seed_;
     uint8_t brickEdge_;
+    std::string providerId_;
     std::vector<EditEntry> entries_;
 };
 
