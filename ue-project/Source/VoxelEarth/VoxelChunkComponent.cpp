@@ -29,54 +29,87 @@
 #include "PrimitiveSceneProxy.h"
 #include "PrimitiveUniformShaderParametersBuilder.h"
 #include "PrimitiveViewRelevance.h"
+#include "RHICommandList.h"    // FRHICommandListBase::LockBuffer, for the GI colour fast path
+#include "RenderingThread.h"   // ENQUEUE_RENDER_COMMAND, ditto
 #include "SceneInterface.h"
 #include "SceneView.h"
 #include "StaticMeshResources.h"
 
-// FVoxelChunkSceneProxy -----------------------------------------------------
+// Shared chunk vertex builder ----------------------------------------------
 //
-// Doctrine (docs/voxel-earth-implementation-plan.md SS3.3 Band 1): hand-rolled
-// FPrimitiveSceneProxy, NOT ProceduralMeshComponent / UDynamicMesh. Structure
-// (buffers / InitResources / GetDynamicMeshElements) follows the engine's
-// CustomMeshComponent plugin 1:1 -- see
-// Engine/Plugins/Runtime/CustomMeshComponent/Source/CustomMeshComponent/Private/CustomMeshComponent.cpp
-// in the installed UE 5.7 -- with quads (4 verts / 6 indices) in place of
-// its raw triangle list, and per-vertex color/normal driven by voxel-core's
-// greedy-mesher output instead of a flat white color.
-class FVoxelChunkSceneProxy final : public FPrimitiveSceneProxy
+// ONE loop produces the chunk's vertices, indices and vertex colours. The
+// scene proxy constructor calls it for everything; the M4 GI colour refresh
+// (UVoxelChunkComponent::UpdateGIVertexColors) calls it for colours ALONE and
+// memcpys the result straight into the live colour vertex buffer.
+//
+// WHY THIS FACTORING IS THE SAFETY ARGUMENT. Updating a vertex buffer in place
+// is only correct if colour #N still belongs to vertex #N. Rather than assert
+// that two similar-looking loops agree, there is exactly one loop: the emission
+// order, the greedy-quad subdivision, the DebugVis face-drop `continue`s and
+// the degenerate-triangle fallback are all shared code, so the correspondence
+// holds by construction rather than by review. -VoxelGIColorCheck then verifies
+// it at runtime anyway (see UpdateGIVertexColors).
+//
+// Colours-only mode skips the work that cannot affect a colour -- tangents, the
+// double-precision world-planar UV wrap, index emission and the vertex array
+// itself -- but takes every branch that affects HOW MANY vertices are emitted.
+namespace
 {
-public:
-	SIZE_T GetTypeHash() const override
+	struct FVoxelChunkBuildStats
 	{
-		static size_t UniquePointer;
-		return reinterpret_cast<size_t>(&UniquePointer);
-	}
+		bool bGIEnabled = false;
+		bool bHasField = false;
+		int32 GIHits = 0;
+		float GISum = 0.f;
+		// Per-face-DIRECTION accounting for voxel.GI.Debug 3 / voxel.GI.DebugVis:
+		// bucket index = Axis * 2 + (Positive ? 0 : 1), i.e. +X,-X,+Y,-Y,+Z,-Z.
+		// The roof-underside defect was invisible in the whole-chunk aggregate (a
+		// roof chunk's bright top faces and dark underside average to a plausible
+		// middle) and obvious the moment the buckets were separated.
+		int32 DirCount[6] = {};
+		int32 DirHits[6] = {};
+		float DirIrrSum[6] = {};
+		float DirShadeSum[6] = {};
+	};
 
-	explicit FVoxelChunkSceneProxy(UVoxelChunkComponent* Component)
-		: FPrimitiveSceneProxy(Component)
-		, VertexFactory(GetScene().GetFeatureLevel(), "FVoxelChunkSceneProxy")
+	// Any of the three outputs may be null. OutVertices/OutIndices null means
+	// "colours only". All supplied arrays are Reset() first.
+	void BuildChunkVertexData(
+		const UVoxelChunkComponent& Component,
+		TArray<FDynamicMeshVertex>* OutVertices,
+		TArray<uint32>* OutIndices,
+		TArray<FColor>* OutColors,
+		FVoxelChunkBuildStats& OutStats)
 	{
 		static const FVector3f AxisDir[3] = {FVector3f(1, 0, 0), FVector3f(0, 1, 0), FVector3f(0, 0, 1)};
+
+		const bool bWantGeometry = (OutVertices != nullptr);
+		if (OutVertices) { OutVertices->Reset(); }
+		if (OutIndices) { OutIndices->Reset(); }
+		if (OutColors) { OutColors->Reset(); }
+
+		const TArray<FVoxelChunkQuad>& ChunkQuads = Component.GetChunkQuads();
+		const int32 ChunkLevel = Component.GetLevel();
 
 		// M2 mip rings (docs/m2-plan.md decisions table): "position scale =
 		// VoxelSizeUU << level" -- ChunkQuads stay in level-relative voxel
 		// units (0..31, baked by MeshChunkBricks); this is the one place that
 		// converts them to world-space UU, so it is the one place the level
 		// scale needs to apply.
-		const float LevelVoxelSizeUU = float(VoxelCoords::VoxelSizeUU) * float(1 << Component->ChunkLevel);
+		const float LevelVoxelSizeUU = float(VoxelCoords::VoxelSizeUU) * float(1 << ChunkLevel);
 
-		const int32 NumQuads = Component->ChunkQuads.Num();
-		TArray<FDynamicMeshVertex> Vertices;
-		Vertices.Reserve(NumQuads * 4);
-		IndexBuffer.Indices.Reserve(NumQuads * 6);
+		const int32 NumQuads = ChunkQuads.Num();
+		if (OutVertices) { OutVertices->Reserve(NumQuads * 4); }
+		if (OutIndices) { OutIndices->Reserve(NumQuads * 6); }
+		if (OutColors) { OutColors->Reserve(NumQuads * 4); }
 
 		// World-planar UV origin (docs deliverable: "UV = world-planar
-		// (position on the two in-plane axes / 100.0f)"). Component-> is a
-		// game-thread accessor, safe here because CreateSceneProxy (which
-		// constructs this proxy) runs on the game thread; GetLocalToWorld()
-		// on the proxy itself is NOT valid yet at construction time (it is
-		// only populated later, when the primitive is added to the scene).
-		const FVector ComponentWorldOrigin = Component->GetComponentLocation();
+		// (position on the two in-plane axes / 100.0f)"). Component. accessors
+		// are game-thread accessors, safe here because both call sites
+		// (CreateSceneProxy and UpdateGIVertexColors) run on the game thread;
+		// GetLocalToWorld() on the proxy itself is NOT valid at construction
+		// time (it is only populated later, when the primitive is added).
+		const FVector ComponentWorldOrigin = Component.GetComponentLocation();
 
 		// Stage 3c LWC precision (docs/m1-plan.md stage 3c; plan SS3.3): near
 		// Earth-scale coordinates (|X| ~ 2e8 UU at 2,000km from the world
@@ -115,11 +148,11 @@ public:
 		// cone trace whose first step is already 40cm wide cannot resolve; the
 		// cone trace supplies the LARGE-scale term (a tunnel, a roof, a
 		// canyon) that per-voxel AO cannot see. Final G is their product.
-		const bool bGIEnabled = VoxelGI::IsEnabled() && Component->ChunkLevel == 0;
+		const bool bGIEnabled = VoxelGI::IsEnabled() && ChunkLevel == 0;
 		const UVoxelGISubsystem* GISubsystem = nullptr;
 		if (bGIEnabled)
 		{
-			if (const UWorld* World = Component->GetWorld())
+			if (const UWorld* World = Component.GetWorld())
 			{
 				GISubsystem = World->GetSubsystem<UVoxelGISubsystem>();
 			}
@@ -128,8 +161,8 @@ public:
 		TUniquePtr<FVoxelLightField::FReadScope> GIRead;
 		if (GIField)
 		{
-			// One read lock for the whole proxy build instead of one per
-			// vertex -- a chunk can be several thousand vertices.
+			// One read lock for the whole build instead of one per vertex --
+			// a chunk can be several thousand vertices.
 			GIRead = MakeUnique<FVoxelLightField::FReadScope>(*GIField);
 		}
 		const FVector GICentreUU = GISubsystem ? GISubsystem->GetFieldCentreUU() : FVector::ZeroVector;
@@ -138,6 +171,9 @@ public:
 		const float GIFadeStartUU = VoxelGI::GetFadeStartUU();
 		const float GIFadeEndUU = FMath::Max(VoxelGI::GetFadeEndUU(), GIFadeStartUU + 1.f);
 
+		OutStats.bGIEnabled = bGIEnabled;
+		OutStats.bHasField = (GIField != nullptr);
+
 		// GI is evaluated per VERTEX, and a greedy quad can span 32 voxels
 		// (3.2 m) with only 4 corner samples -- a light pool under a hole in a
 		// roof would smear across the whole face. Splitting quads when GI is on
@@ -145,21 +181,9 @@ public:
 		// is measurable, and it is entirely inert when GI is off.
 		const int32 GIMaxSpan = bGIEnabled ? VoxelGI::GetMaxQuadSpanVoxels() : 0;
 
-		int32 DebugGIHits = 0;
-		float DebugGISum = 0.f;
-
-		// voxel.GI.Debug 3 / voxel.GI.DebugVis. Per-face-DIRECTION accounting:
-		// bucket index = Axis * 2 + (Positive ? 0 : 1), i.e. +X,-X,+Y,-Y,+Z,-Z.
-		// The roof-underside defect was invisible in the whole-chunk aggregate
-		// (a roof chunk's bright top faces and dark underside average to a
-		// plausible middle) and obvious the moment the buckets were separated.
 		const int32 GIDebugVis = bGIEnabled ? VoxelGI::GetDebugVis() : 0;
-		int32 DirCount[6] = {};
-		int32 DirHits[6] = {};
-		float DirIrrSum[6] = {};
-		float DirShadeSum[6] = {};
 
-		for (const FVoxelChunkQuad& Q : Component->ChunkQuads)
+		for (const FVoxelChunkQuad& Q : ChunkQuads)
 		{
 			const int32 Axis = Q.Axis;
 			const int32 U = (Axis + 1) % 3;
@@ -227,17 +251,9 @@ public:
 					const float CornerFu[4] = {Fu0, Fu0, Fu1, Fu1};
 					const float CornerFv[4] = {Fv0, Fv1, Fv1, Fv0};
 
-					const int32 BaseVertex = Vertices.Num();
+					const int32 BaseVertex = OutVertices ? OutVertices->Num() : 0;
 					for (int32 CornerIdx = 0; CornerIdx < 4; ++CornerIdx)
 					{
-						FDynamicMeshVertex Vert;
-						Vert.Position = Pos[CornerIdx];
-						Vert.SetTangents(TangentX, TangentY, Normal);
-
-						const float WorldU = WrapWorldToUV(ComponentWorldOrigin[U], double(Pos[CornerIdx][U]));
-						const float WorldV = WrapWorldToUV(ComponentWorldOrigin[V], double(Pos[CornerIdx][V]));
-						Vert.TextureCoordinate[0] = FVector2f(WorldU, WorldV);
-
 						// R = material id, G = AO * GI, B unused, A = 255.
 						const float AoNorm = FMath::Clamp(AoAt(CornerFu[CornerIdx], CornerFv[CornerIdx]) * (85.f / 255.f), 0.f, 1.f);
 						float ShadeG = AoNorm;
@@ -260,8 +276,8 @@ public:
 							{
 								bGIHit = true;
 								HitIrradiance = Irradiance;
-								++DebugGIHits;
-								DebugGISum += Irradiance;
+								++OutStats.GIHits;
+								OutStats.GISum += Irradiance;
 								const float DistUU = float(FVector::Dist(WorldPos, GICentreUU));
 								const float Fade = 1.f - FMath::Clamp((DistUU - GIFadeStartUU) / (GIFadeEndUU - GIFadeStartUU), 0.f, 1.f);
 								const float Ambient = FMath::Lerp(GIAmbientFloor, 1.f, FMath::Clamp(Irradiance, 0.f, 1.f));
@@ -284,10 +300,10 @@ public:
 
 						if (DirBucket >= 0 && DirBucket < 6)
 						{
-							++DirCount[DirBucket];
-							DirHits[DirBucket] += bGIHit ? 1 : 0;
-							DirIrrSum[DirBucket] += HitIrradiance;
-							DirShadeSum[DirBucket] += ShadeG;
+							++OutStats.DirCount[DirBucket];
+							OutStats.DirHits[DirBucket] += bGIHit ? 1 : 0;
+							OutStats.DirIrrSum[DirBucket] += HitIrradiance;
+							OutStats.DirShadeSum[DirBucket] += ShadeG;
 						}
 
 						const uint8 ShadeByte = bGIEnabled
@@ -295,9 +311,24 @@ public:
 							// GI off: reproduce the original 2-bit quantisation
 							// EXACTLY (0/85/170/255), not a rounded float of it.
 							: uint8(int32(AoAt(CornerFu[CornerIdx], CornerFv[CornerIdx]) + 0.5f) * 85);
-						Vert.Color = FColor(Q.Mat, ShadeByte, 0, 255);
+						const FColor VertColor(Q.Mat, ShadeByte, 0, 255);
 
-						Vertices.Add(Vert);
+						if (OutColors)
+						{
+							OutColors->Add(VertColor);
+						}
+						if (bWantGeometry)
+						{
+							FDynamicMeshVertex Vert;
+							Vert.Position = Pos[CornerIdx];
+							Vert.SetTangents(TangentX, TangentY, Normal);
+
+							const float WorldU = WrapWorldToUV(ComponentWorldOrigin[U], double(Pos[CornerIdx][U]));
+							const float WorldV = WrapWorldToUV(ComponentWorldOrigin[V], double(Pos[CornerIdx][V]));
+							Vert.TextureCoordinate[0] = FVector2f(WorldU, WorldV);
+							Vert.Color = VertColor;
+							OutVertices->Add(Vert);
+						}
 					}
 
 					// WINDING -- corrected 2026-07-21, and this is the fix for the
@@ -330,29 +361,102 @@ public:
 					//
 					// vis 6 is retained as the LEGACY inverted winding so the
 					// before/after pair can be captured from one build.
-					const bool bLegacyInvertedWinding = (GIDebugVis == 6);
-					const bool bReverseWinding = bLegacyInvertedWinding ? bool(Q.Positive) : !Q.Positive;
-					if (bReverseWinding)
+					if (OutIndices)
 					{
-						IndexBuffer.Indices.Add(BaseVertex + 0);
-						IndexBuffer.Indices.Add(BaseVertex + 2);
-						IndexBuffer.Indices.Add(BaseVertex + 1);
-						IndexBuffer.Indices.Add(BaseVertex + 0);
-						IndexBuffer.Indices.Add(BaseVertex + 3);
-						IndexBuffer.Indices.Add(BaseVertex + 2);
-					}
-					else
-					{
-						IndexBuffer.Indices.Add(BaseVertex + 0);
-						IndexBuffer.Indices.Add(BaseVertex + 1);
-						IndexBuffer.Indices.Add(BaseVertex + 2);
-						IndexBuffer.Indices.Add(BaseVertex + 0);
-						IndexBuffer.Indices.Add(BaseVertex + 2);
-						IndexBuffer.Indices.Add(BaseVertex + 3);
+						const bool bLegacyInvertedWinding = (GIDebugVis == 6);
+						const bool bReverseWinding = bLegacyInvertedWinding ? bool(Q.Positive) : !Q.Positive;
+						if (bReverseWinding)
+						{
+							OutIndices->Add(BaseVertex + 0);
+							OutIndices->Add(BaseVertex + 2);
+							OutIndices->Add(BaseVertex + 1);
+							OutIndices->Add(BaseVertex + 0);
+							OutIndices->Add(BaseVertex + 3);
+							OutIndices->Add(BaseVertex + 2);
+						}
+						else
+						{
+							OutIndices->Add(BaseVertex + 0);
+							OutIndices->Add(BaseVertex + 1);
+							OutIndices->Add(BaseVertex + 2);
+							OutIndices->Add(BaseVertex + 0);
+							OutIndices->Add(BaseVertex + 2);
+							OutIndices->Add(BaseVertex + 3);
+						}
 					}
 				}
 			}
 		}
+
+		// Only reachable from the DebugVis 4/5 face-drop modes (CreateSceneProxy
+		// already refuses to build a proxy for a chunk with no quads, so the
+		// shipping path can never land here). The RHI fatals on a zero-sized
+		// buffer, so emit one degenerate triangle instead. Colours-only mode
+		// must reproduce this too or its count would not match the buffer.
+		const int32 EmittedVerts = OutColors ? OutColors->Num() : (OutVertices ? OutVertices->Num() : 0);
+		if (EmittedVerts == 0)
+		{
+			if (OutVertices)
+			{
+				OutVertices->Reset();
+				FDynamicMeshVertex Dummy;
+				Dummy.Position = FVector3f::ZeroVector;
+				Dummy.SetTangents(FVector3f(1, 0, 0), FVector3f(0, 1, 0), FVector3f(0, 0, 1));
+				Dummy.Color = FColor(0, 0, 0, 0);
+				OutVertices->Add(Dummy);
+				OutVertices->Add(Dummy);
+				OutVertices->Add(Dummy);
+			}
+			if (OutColors)
+			{
+				OutColors->Reset();
+				OutColors->Add(FColor(0, 0, 0, 0));
+				OutColors->Add(FColor(0, 0, 0, 0));
+				OutColors->Add(FColor(0, 0, 0, 0));
+			}
+			if (OutIndices)
+			{
+				OutIndices->Reset();
+				OutIndices->Add(0);
+				OutIndices->Add(1);
+				OutIndices->Add(2);
+			}
+		}
+	}
+}
+
+// FVoxelChunkSceneProxy -----------------------------------------------------
+//
+// Doctrine (docs/voxel-earth-implementation-plan.md SS3.3 Band 1): hand-rolled
+// FPrimitiveSceneProxy, NOT ProceduralMeshComponent / UDynamicMesh. Structure
+// (buffers / InitResources / GetDynamicMeshElements) follows the engine's
+// CustomMeshComponent plugin 1:1 -- see
+// Engine/Plugins/Runtime/CustomMeshComponent/Source/CustomMeshComponent/Private/CustomMeshComponent.cpp
+// in the installed UE 5.7 -- with quads (4 verts / 6 indices) in place of
+// its raw triangle list, and per-vertex color/normal driven by voxel-core's
+// greedy-mesher output instead of a flat white color.
+class FVoxelChunkSceneProxy final : public FPrimitiveSceneProxy
+{
+public:
+	SIZE_T GetTypeHash() const override
+	{
+		static size_t UniquePointer;
+		return reinterpret_cast<size_t>(&UniquePointer);
+	}
+
+	explicit FVoxelChunkSceneProxy(UVoxelChunkComponent* Component)
+		: FPrimitiveSceneProxy(Component)
+		, VertexFactory(GetScene().GetFeatureLevel(), "FVoxelChunkSceneProxy")
+	{
+		// ONE shared builder produces geometry and colours (see
+		// BuildChunkVertexData above). The GI colour refresh path calls the
+		// same function for colours alone, which is what makes an in-place
+		// colour-buffer update safe.
+		FVoxelChunkBuildStats Stats;
+		TArray<FDynamicMeshVertex> Vertices;
+		BuildChunkVertexData(*Component, &Vertices, &IndexBuffer.Indices, nullptr, Stats);
+
+		const FVector ComponentWorldOrigin = Component->GetComponentLocation();
 
 		// voxel.GI.Debug 2: per-chunk shading dump. Distinguishes "GI is off",
 		// "GI is on but the field had nothing solved here" (hits << verts) and
@@ -364,47 +468,27 @@ public:
 			UE_LOG(LogVoxelEarth, Log,
 			       TEXT("GIProxy: level=%d origin=(%.0f,%.0f,%.0f) verts=%d giEnabled=%d field=%d hits=%d meanGI=%.3f"),
 			       Component->ChunkLevel, ComponentWorldOrigin.X, ComponentWorldOrigin.Y, ComponentWorldOrigin.Z,
-			       Vertices.Num(), bGIEnabled ? 1 : 0, GIField ? 1 : 0, DebugGIHits,
-			       DebugGIHits > 0 ? DebugGISum / float(DebugGIHits) : -1.f);
+			       Vertices.Num(), Stats.bGIEnabled ? 1 : 0, Stats.bHasField ? 1 : 0, Stats.GIHits,
+			       Stats.GIHits > 0 ? Stats.GISum / float(Stats.GIHits) : -1.f);
 		}
 
-		if (VoxelGI::GetDebugLevel() >= 3 && bGIEnabled && Vertices.Num() > 0)
+		if (VoxelGI::GetDebugLevel() >= 3 && Stats.bGIEnabled && Vertices.Num() > 0)
 		{
 			static const TCHAR* kDirNames[6] = {TEXT("+X"), TEXT("-X"), TEXT("+Y"), TEXT("-Y"), TEXT("+Z"), TEXT("-Z")};
 			FString Line;
 			for (int32 D = 0; D < 6; ++D)
 			{
-				if (DirCount[D] == 0)
+				if (Stats.DirCount[D] == 0)
 				{
 					continue;
 				}
 				Line += FString::Printf(TEXT("%s n=%d hit=%d irr=%.3f shade=%.3f | "),
-				                        kDirNames[D], DirCount[D], DirHits[D],
-				                        DirHits[D] > 0 ? DirIrrSum[D] / float(DirHits[D]) : -1.f,
-				                        DirShadeSum[D] / float(DirCount[D]));
+				                        kDirNames[D], Stats.DirCount[D], Stats.DirHits[D],
+				                        Stats.DirHits[D] > 0 ? Stats.DirIrrSum[D] / float(Stats.DirHits[D]) : -1.f,
+				                        Stats.DirShadeSum[D] / float(Stats.DirCount[D]));
 			}
 			UE_LOG(LogVoxelEarth, Log, TEXT("GIDir: origin=(%.0f,%.0f,%.0f) %s"),
 			       ComponentWorldOrigin.X, ComponentWorldOrigin.Y, ComponentWorldOrigin.Z, *Line);
-		}
-
-		// Only reachable from the DebugVis 4/5 face-drop modes (CreateSceneProxy
-		// already refuses to build a proxy for a chunk with no quads, so the
-		// shipping path can never land here). The RHI fatals on a zero-sized
-		// buffer, so emit one degenerate triangle instead.
-		if (Vertices.Num() == 0 || IndexBuffer.Indices.Num() == 0)
-		{
-			Vertices.Reset();
-			FDynamicMeshVertex Dummy;
-			Dummy.Position = FVector3f::ZeroVector;
-			Dummy.SetTangents(FVector3f(1, 0, 0), FVector3f(0, 1, 0), FVector3f(0, 0, 1));
-			Dummy.Color = FColor(0, 0, 0, 0);
-			Vertices.Add(Dummy);
-			Vertices.Add(Dummy);
-			Vertices.Add(Dummy);
-			IndexBuffer.Indices.Reset();
-			IndexBuffer.Indices.Add(0);
-			IndexBuffer.Indices.Add(1);
-			IndexBuffer.Indices.Add(2);
 		}
 
 		// -VoxelWindingCheck: see the matching block in
@@ -462,6 +546,59 @@ public:
 				       MaterialRelevance.bTwoSided ? 1 : 0);
 			}
 		}
+	}
+
+	// M4 GI: replace the colour vertex buffer's contents in place ------------
+	//
+	// THE POINT OF THIS WHOLE CHANGE. GI re-shading used to go through
+	// MarkRenderStateDirty(), which destroys this proxy and builds a new one:
+	// five fresh RHI buffers, a full re-walk of the quad list to regenerate
+	// positions/tangents/UVs/indices that did not change, a scene
+	// remove+add of the primitive, and the render-thread deletion of the old
+	// proxy. All of that to alter one byte per vertex. Here the geometry is
+	// untouched and only the colour stream is overwritten.
+	//
+	// Safe without any proxy/scene churn because this primitive is
+	// DYNAMIC-relevance (GetViewRelevance sets bDynamicRelevance, and drawing
+	// goes through GetDynamicMeshElements): there are no cached mesh draw
+	// commands referencing the old buffer contents, and vertex colour is not
+	// part of GPUScene, so nothing outside this buffer needs invalidating.
+	//
+	// Returns false if it declined (count/stride mismatch), which the caller
+	// turns into a proxy rebuild.
+	bool UpdateVertexColors_RenderThread(FRHICommandListBase& RHICmdList, const TArray<FColor>& NewColors)
+	{
+		check(IsInRenderingThread());
+
+		FColorVertexBuffer& ColorBuffer = VertexBuffers.ColorVertexBuffer;
+		const uint32 NumVerts = ColorBuffer.GetNumVertices();
+
+		// The guard that makes the whole scheme safe against races. Between the
+		// game thread computing these colours and this command running, the
+		// chunk may have been remeshed (different vertex count) or a cvar that
+		// changes subdivision (voxel.GI.MaxQuadSpanVoxels, voxel.GI.Enabled)
+		// may have moved. Any of those makes the correspondence invalid, and in
+		// every such case a proxy rebuild is already on its way, so dropping
+		// this update is both safe and correct.
+		if (NumVerts == 0 || uint32(NewColors.Num()) != NumVerts || ColorBuffer.GetStride() != sizeof(FColor))
+		{
+			return false;
+		}
+
+		FRHIBuffer* Buffer = ColorBuffer.VertexBufferRHI;
+		if (Buffer == nullptr)
+		{
+			return false; // BeginInitResource has not landed yet
+		}
+
+		const uint32 NumBytes = NumVerts * uint32(sizeof(FColor));
+		if (void* Dest = RHICmdList.LockBuffer(Buffer, 0, NumBytes, RLM_WriteOnly))
+		{
+			FMemory::Memcpy(Dest, NewColors.GetData(), NumBytes);
+			RHICmdList.UnlockBuffer(Buffer);
+			return true;
+		}
+		return false;
 	}
 
 	virtual ~FVoxelChunkSceneProxy() override
@@ -671,6 +808,108 @@ void UVoxelChunkComponent::SetLevel(int32 InLevel)
 {
 	ChunkLevel = InLevel;
 	ApplyRingFadeParams();
+}
+
+bool UVoxelChunkComponent::UpdateGIVertexColors()
+{
+	// No proxy => nothing to update in place (chunk not yet rendered, or it
+	// had no quads). Render state already dirty => a fresh proxy is being
+	// built this frame and will pick the new field up on its own, so this
+	// update would be redundant work on a proxy that is about to die; report
+	// success so the caller does not schedule a second rebuild.
+	if (!IsRenderStateCreated())
+	{
+		return false;
+	}
+	if (IsRenderStateDirty())
+	{
+		return true;
+	}
+	FVoxelChunkSceneProxy* Proxy = static_cast<FVoxelChunkSceneProxy*>(SceneProxy);
+	if (Proxy == nullptr)
+	{
+		return false;
+	}
+
+	FVoxelChunkBuildStats Stats;
+	TArray<FColor> Colors;
+	BuildChunkVertexData(*this, nullptr, nullptr, &Colors, Stats);
+	if (Colors.Num() == 0)
+	{
+		return false;
+	}
+
+	// -VoxelGIColorCheck: colour-equivalence self-verification, in the spirit
+	// of -VoxelWindingCheck.
+	//
+	// The claim this fast path rests on is "the colours-only walk produces
+	// exactly the byte sequence the full proxy build would have written". That
+	// is a property of the shared builder, but a property worth MEASURING
+	// rather than asserting -- a faster path that subtly changes shading is a
+	// regression, and a one-vertex ordering slip would be invisible on screen
+	// while corrupting a whole chunk's lighting.
+	//
+	// So: run the FULL build (geometry + colours, the exact code the proxy
+	// constructor runs) against the same field state, and compare its
+	// per-vertex colours with the colours-only array element by element. Logs
+	// a count, a mismatch tally and an FNV-1a digest of each stream, so a run
+	// can be checked by grepping for a single line rather than by eye.
+	{
+		static const bool bColorCheck = FParse::Param(FCommandLine::Get(), TEXT("VoxelGIColorCheck"));
+		if (bColorCheck)
+		{
+			FVoxelChunkBuildStats FullStats;
+			TArray<FDynamicMeshVertex> FullVerts;
+			TArray<uint32> FullIndices;
+			BuildChunkVertexData(*this, &FullVerts, &FullIndices, nullptr, FullStats);
+
+			auto Digest = [](const auto& Container, auto&& Get) -> uint64
+			{
+				uint64 Hash = 0xcbf29ce484222325ull;
+				for (int32 I = 0; I < Container.Num(); ++I)
+				{
+					const FColor C = Get(Container[I]);
+					const uint8 Bytes[4] = {C.R, C.G, C.B, C.A};
+					for (uint8 B : Bytes)
+					{
+						Hash ^= uint64(B);
+						Hash *= 0x100000001b3ull;
+					}
+				}
+				return Hash;
+			};
+
+			const uint64 FastDigest = Digest(Colors, [](const FColor& C) { return C; });
+			const uint64 FullDigest = Digest(FullVerts, [](const FDynamicMeshVertex& V) { return V.Color; });
+
+			int32 Mismatches = 0;
+			const int32 Common = FMath::Min(Colors.Num(), FullVerts.Num());
+			for (int32 I = 0; I < Common; ++I)
+			{
+				if (Colors[I] != FullVerts[I].Color)
+				{
+					++Mismatches;
+				}
+			}
+
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("VoxelGIColorCheck: fastVerts=%d fullVerts=%d mismatches=%d fastDigest=0x%016llX fullDigest=0x%016llX %s"),
+			       Colors.Num(), FullVerts.Num(), Mismatches, FastDigest, FullDigest,
+			       (Colors.Num() == FullVerts.Num() && Mismatches == 0 && FastDigest == FullDigest) ? TEXT("MATCH") : TEXT("*** DIFFER ***"));
+		}
+	}
+
+	// Raw proxy pointer across the thread boundary is the established engine
+	// pattern for this (see ProceduralMeshComponent's UpdateSection_*): proxy
+	// destruction is itself an enqueued render command, so a command enqueued
+	// now is guaranteed to run before any deletion enqueued later.
+	ENQUEUE_RENDER_COMMAND(FVoxelChunkGIColorUpdate)(
+		[Proxy, MovedColors = MoveTemp(Colors)](FRHICommandListImmediate& RHICmdList)
+		{
+			Proxy->UpdateVertexColors_RenderThread(RHICmdList, MovedColors);
+		});
+
+	return true;
 }
 
 FPrimitiveSceneProxy* UVoxelChunkComponent::CreateSceneProxy()

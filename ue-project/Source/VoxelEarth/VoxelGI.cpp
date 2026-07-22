@@ -448,11 +448,25 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		}
 	}
 
-	// 4) Re-shade chunks whose irradiance changed. MarkRenderStateDirty
-	//    rebuilds the scene proxy, which re-samples the field per vertex --
-	//    the same path a normal remesh takes, so this reuses machinery that is
-	//    already on the streaming system's proven budget rather than inventing
-	//    a second vertex-buffer update route.
+	// 4) Re-shade chunks whose irradiance changed.
+	//
+	//    THIS USED TO BE MarkRenderStateDirty(), i.e. a full scene-proxy
+	//    rebuild per chunk, and it was the dominant cost of having GI on --
+	//    measured at ~1.7 ms/frame, more than the cone marching itself. The
+	//    rebuild regenerated positions, tangents, world-planar UVs and indices
+	//    that had not changed, allocated five fresh RHI buffers, and pushed a
+	//    primitive remove+add through the scene, all to alter ONE BYTE per
+	//    vertex (VertexColor.G).
+	//
+	//    UpdateGIVertexColors instead recomputes only the colour stream and
+	//    memcpys it into the existing proxy's colour vertex buffer (see
+	//    VoxelChunkComponent.cpp). Geometry is identical across a GI re-shade
+	//    by construction: this queue only ever holds chunks whose IRRADIANCE
+	//    changed -- a chunk whose geometry changed arrives through
+	//    SetChunkQuads, which already rebuilds the proxy for its own reasons.
+	//    MarkRenderStateDirty remains the fallback for the cases the fast path
+	//    declines (no proxy yet), so behaviour is unchanged where it cannot
+	//    apply.
 	const int32 RefreshChunkBudget = FMath::Max(0, CVarGIMaxChunkRefreshesPerFrame.GetValueOnGameThread());
 	int32 Refreshed = 0;
 	while (Refreshed < RefreshChunkBudget && RefreshQueue.Num() > 0)
@@ -464,7 +478,10 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		{
 			if (UVoxelChunkComponent* Comp = Found->Get())
 			{
-				Comp->MarkRenderStateDirty();
+				if (!Comp->UpdateGIVertexColors())
+				{
+					Comp->MarkRenderStateDirty();
+				}
 				++Refreshed;
 			}
 			else

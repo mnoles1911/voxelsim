@@ -66,6 +66,25 @@ public:
 	// light field. Read-only; the GI subsystem never mutates chunk geometry.
 	const TArray<FVoxelChunkQuad>& GetChunkQuads() const { return ChunkQuads; }
 
+	// M4 voxel GI re-shade, FAST PATH. Recomputes only this chunk's vertex
+	// COLOURS from the current light field and memcpys them into the live
+	// scene proxy's colour vertex buffer.
+	//
+	// This exists because the original re-shade path was
+	// MarkRenderStateDirty() -- i.e. destroy the scene proxy and build a new
+	// one -- which regenerates positions, tangents, UVs, indices and five RHI
+	// buffers, and pushes a scene remove+add, all to change one byte per
+	// vertex. The geometry is identical across a GI update by definition (GI
+	// only re-shades chunks it did not remesh), so none of that work is
+	// warranted.
+	//
+	// Returns false if the update could not be applied -- no scene proxy yet,
+	// or nothing worth pushing -- in which case the caller should fall back to
+	// MarkRenderStateDirty(). Note the render-thread side can ALSO decline
+	// (vertex count moved under it); that case is already covered by the
+	// rebuild that caused the count to move.
+	bool UpdateGIVertexColors();
+
 	//~ Begin UPrimitiveComponent Interface
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
