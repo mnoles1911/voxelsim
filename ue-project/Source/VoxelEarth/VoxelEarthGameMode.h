@@ -227,6 +227,9 @@ private:
 	FVector UndergroundTestCameraLocation() const;
 	FRotator UndergroundTestCameraRotation() const;
 	bool IsUndergroundShaftView() const;
+	// -VoxelUndergroundView=tunnel: on-axis corridor framing (see the .cpp for
+	// why the other two poses land against the tunnel roof).
+	bool IsUndergroundTunnelView() const;
 
 	// -VoxelCaveTest[=<delaySeconds>]: searches the columns around spawn for a
 	// genuine M4 cave void (voxelcore/caves.h -- pristine worldgen, NOT an

@@ -71,6 +71,41 @@ double SampleHeightUU(double WorldXUU, double WorldYUU, const UVoxelWorldSubsyst
 // jagged single-vertex-row edge at the line.
 constexpr double kSnowlineBandLowMeters = 2700.0;
 constexpr double kSnowlineBandHighMeters = 2900.0;
+
+// ---- UNDERGROUND VEIL constants (see VoxelClipmapActor.h for the diagnosis)
+//
+// Half-extent of the inward-facing occluder box.
+//
+// The first version used 2 km (outside the ring cascade's 1 km R4 outer, for
+// maximum clearance). That FAILED, and instructively: SkyAtmosphere's aerial
+// perspective is integrated over the distance to the surface, and 2 km of it
+// repainted the near-black box back to pale sky blue -- the shot came back
+// looking like an overcast sky rather than rock. Distance is the enemy here,
+// not the friend.
+//
+// 300 m is the right number: aerial perspective over 300 m is negligible, and
+// nothing underground is ever resident beyond it. Underground residency is a
+// +-25.6 m deep box plus a 38.4 m skirt (VoxelWorldSubsystem's
+// BoxRadiusChunksL0/SkirtChunksNear), and the largest worldgen feature down
+// here is a cavern at 24-56 m across -- all an order of magnitude inside 300
+// m, so the veil can never occlude a real cave surface.
+constexpr double kVeilHalfExtentUU = 30000.0; // 300 m
+
+// Near-black rock. Multiplied into M_VoxelClipmap's BaseColor via its existing
+// DebugTint VectorParameter, so the veil needs NO new material asset (and no
+// Content/ change at all). Roughness 0.9 / metallic 0 means the lit result is
+// essentially this value, whichever way a given box face happens to point --
+// which is why the wrong-facing-normal problem that sinks a naive "make the
+// terrain two-sided" fix does not apply here.
+const FLinearColor kVeilTint(0.020f, 0.020f, 0.026f, 1.0f);
+
+// Upward rock probe. Steps 2 m at a time to 80 m; two solid samples (~2 m of
+// rock overhead) latches the veil ON, zero solid samples latches it OFF. The
+// gap between those two conditions IS the hysteresis -- no separate
+// enter/exit depth constants needed.
+constexpr double kVeilProbeStepUU = 200.0;
+constexpr double kVeilProbeMaxUU = 8000.0;
+constexpr int32 kVeilProbeSolidsToLatch = 2;
 } // namespace
 
 AVoxelClipmapActor::AVoxelClipmapActor()
@@ -137,7 +172,156 @@ void AVoxelClipmapActor::BeginPlay()
 		}
 	}
 
+	// -VoxelUndergroundVeil=0 turns the veil off on the SAME binary, so the
+	// before/after A/B (and the M1 perf A/B) never has to compare two builds.
+	int32 VeilFlag = 1;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelUndergroundVeil="), VeilFlag))
+	{
+		bVeilEnabled = (VeilFlag != 0);
+	}
+	UE_LOG(LogVoxelEarth, Log, TEXT("VoxelUndergroundVeil: %s"), bVeilEnabled ? TEXT("enabled") : TEXT("DISABLED"));
+
 	BuildSharedTopology();
+}
+
+void AVoxelClipmapActor::EnsureVeilShell()
+{
+	if (VeilShell)
+	{
+		return;
+	}
+
+	VeilShell = NewObject<UProceduralMeshComponent>(this, TEXT("UndergroundVeilShell"));
+	VeilShell->SetupAttachment(ClipmapRoot);
+	VeilShell->RegisterComponent();
+	VeilShell->SetMobility(EComponentMobility::Movable);
+	VeilShell->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	VeilShell->bUseAsyncCooking = false;
+	// The box is recentred on the camera every tick, so a bounds-based cull
+	// would be computing a cull for a primitive that always contains the
+	// view point. Skip it rather than let a stale bound flicker the veil off.
+	VeilShell->bUseAttachParentBound = false;
+	VeilShell->SetCastShadow(false); // pure occluder; casting from it would black out the cave
+
+	const double H = kVeilHalfExtentUU;
+	// 8 corners, z-minor ordering: index bit0 = +X, bit1 = +Y, bit2 = +Z.
+	TArray<FVector> V;
+	V.Reserve(8);
+	for (int32 B = 0; B < 8; ++B)
+	{
+		V.Add(FVector((B & 1) ? H : -H, (B & 2) ? H : -H, (B & 4) ? H : -H));
+	}
+
+	// INWARD-facing winding: each face is wound so its geometric normal points
+	// at the box centre (i.e. at the camera). This is the one place in this
+	// file where winding is load-bearing and NOT defensively covered by
+	// M_VoxelClipmap's two-sidedness -- two-sided renders it either way, but
+	// the normals below are what the shading reads, so they are authored
+	// inward to match.
+	TArray<int32> T;
+	TArray<FVector> N;
+	N.SetNum(8);
+	auto AddFace = [&T](int32 A, int32 B, int32 C, int32 D)
+	{
+		T.Add(A); T.Add(B); T.Add(C);
+		T.Add(A); T.Add(C); T.Add(D);
+	};
+	AddFace(0, 2, 3, 1); // -Z, seen from above inside
+	AddFace(4, 5, 7, 6); // +Z
+	AddFace(0, 1, 5, 4); // -Y
+	AddFace(2, 6, 7, 3); // +Y
+	AddFace(0, 4, 6, 2); // -X
+	AddFace(1, 3, 7, 5); // +X
+	for (int32 B = 0; B < 8; ++B)
+	{
+		N[B] = (-V[B]).GetSafeNormal(); // corner normal points at the centre
+	}
+
+	TArray<FVector2D> UV;
+	UV.Init(FVector2D::ZeroVector, 8);
+	TArray<FColor> C;
+	// VertexColor.R = slope, .G = snow. Zero on both keeps M_VoxelClipmap on
+	// its flat-terrain base colour, which the near-black tint then crushes.
+	C.Init(FColor(0, 0, 0, 255), 8);
+
+	VeilShell->CreateMeshSection(0, V, T, N, UV, C, TArray<FProcMeshTangent>(), /*bCreateCollision*/ false);
+
+	if (ClipmapMaterial)
+	{
+		VeilShellMID = VeilShell->CreateDynamicMaterialInstance(0, ClipmapMaterial);
+		if (VeilShellMID)
+		{
+			VeilShellMID->SetVectorParameterValue(TEXT("DebugTint"), kVeilTint);
+		}
+	}
+	VeilShell->SetVisibility(false);
+}
+
+bool AVoxelClipmapActor::IsCameraUnderRock(const FVector& CameraLocUU) const
+{
+	const UWorld* World = GetWorld();
+	const UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	if (!Subsystem)
+	{
+		return false; // fail OPEN: never veil the vista on a missing subsystem
+	}
+
+	const int64 Vx = (int64)FMath::FloorToDouble(CameraLocUU.X / VoxelCoords::VoxelSizeUU);
+	const int64 Vy = (int64)FMath::FloorToDouble(CameraLocUU.Y / VoxelCoords::VoxelSizeUU);
+
+	int32 Solids = 0;
+	for (double Up = kVeilProbeStepUU; Up <= kVeilProbeMaxUU; Up += kVeilProbeStepUU)
+	{
+		const int64 Vz = (int64)FMath::FloorToDouble((CameraLocUU.Z + Up) / VoxelCoords::VoxelSizeUU);
+		if (Subsystem->IsSolidAtVoxel(Vx, Vy, Vz))
+		{
+			if (++Solids >= kVeilProbeSolidsToLatch)
+			{
+				return true; // early-out: this is the common case underground
+			}
+		}
+	}
+	// Latch OFF only on ZERO solids overhead; 1 solid sample holds the
+	// previous state (see kVeilProbeSolidsToLatch's comment -- the caller
+	// implements that hold).
+	return Solids > 0 ? bVeilActive : false;
+}
+
+void AVoxelClipmapActor::SetVeilActive(bool bActive)
+{
+	// No transition -- same "never touch components without a transition"
+	// doctrine as UpdateDebugTint. bVeilStateKnown (not "VeilShell != null")
+	// is the right guard: the shell is created lazily on the first ON, so
+	// keying off it made every above-ground tick re-run the else-branch and
+	// log once per frame.
+	if (bVeilStateKnown && bActive == bVeilActive)
+	{
+		return;
+	}
+	bVeilStateKnown = true;
+	bVeilActive = bActive;
+
+	if (bActive)
+	{
+		EnsureVeilShell();
+	}
+	if (VeilShell)
+	{
+		VeilShell->SetVisibility(bActive);
+	}
+	for (UProceduralMeshComponent* PMC : LevelMeshes)
+	{
+		if (PMC)
+		{
+			// Hidden, not destroyed: the levels keep recentring/rebuilding
+			// underneath so surfacing again is instant, with no pop-in.
+			PMC->SetVisibility(!bActive);
+		}
+	}
+
+	UE_LOG(LogVoxelEarth, Log, TEXT("VoxelUndergroundVeil: %s (clipmap %s)"),
+	       bActive ? TEXT("ON -- camera has rock overhead") : TEXT("off -- open sky overhead"),
+	       bActive ? TEXT("hidden") : TEXT("visible"));
 }
 
 double AVoxelClipmapActor::SpacingUUForLevel(int32 LevelIndex)
@@ -329,6 +513,36 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 		}
 	}
 
+	// -VoxelWindingCheck (same measurement UVoxelChunkComponent's and
+	// UVoxelWaterChunkComponent's scene proxies log, extended to the clipmap
+	// because its winding was picked BY HAND and never verified -- see
+	// BuildSharedTopology's comment and Tools/create_clipmap_material.py's
+	// "flip to one-sided once a screenshot confirms correct winding"
+	// follow-up). Terrain and water both read -1.000 when correct.
+	// Topology is shared across all 4 levels, so any one level's number is
+	// the answer for all of them; logged per level anyway since the NORMALS
+	// differ per level and both operands matter.
+	{
+		static const bool bWindingCheck = FParse::Param(FCommandLine::Get(), TEXT("VoxelWindingCheck"));
+		if (bWindingCheck && SharedTriangles.Num() >= 3)
+		{
+			double DotSum = 0.0;
+			int32 TriCount = 0;
+			for (int32 I = 0; I + 2 < SharedTriangles.Num(); I += 3)
+			{
+				const FVector& P0 = Positions[SharedTriangles[I + 0]];
+				const FVector& P1 = Positions[SharedTriangles[I + 1]];
+				const FVector& P2 = Positions[SharedTriangles[I + 2]];
+				const FVector Geo = FVector::CrossProduct(P1 - P0, P2 - P0).GetSafeNormal();
+				DotSum += FVector::DotProduct(Geo, Normals[SharedTriangles[I]]);
+				++TriCount;
+			}
+			UE_LOG(LogTemp, Log,
+			       TEXT("VoxelWindingCheck CLIPMAP: level=%d tris=%d meanDot(geometricNormal, shadingNormal)=%+.3f"),
+			       LevelIndex, TriCount, TriCount > 0 ? DotSum / double(TriCount) : 0.0);
+		}
+	}
+
 	const bool bFirstBuild = !bLevelBuilt[LevelIndex];
 	if (bFirstBuild)
 	{
@@ -414,6 +628,19 @@ void AVoxelClipmapActor::Tick(float DeltaTime)
 	if (!GetCameraLocationUU(CameraLocUU))
 	{
 		return; // nothing to recenter around yet
+	}
+
+	// Underground veil: evaluated before the recenter/rebuild work so a
+	// surfacing camera un-hides the levels on the same tick they recentre.
+	if (bVeilEnabled)
+	{
+		SetVeilActive(IsCameraUnderRock(CameraLocUU));
+		if (bVeilActive && VeilShell)
+		{
+			// Follow the camera. Component-relative because ClipmapRoot is at
+			// the actor origin, same convention RebuildLevel uses.
+			VeilShell->SetRelativeLocation(CameraLocUU - GetActorLocation());
+		}
 	}
 
 	if (!bBootstrapped)
