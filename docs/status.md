@@ -5447,3 +5447,184 @@ fidelity ceilings, cavern survival), voxel-core/tests/CMakeLists.txt,
 voxel-core/bench/bench_main.cpp (`--mips` mode; default modes untouched).
 No changes to mips.h, caves.h, caverns.h, amplifier.*, worldgen.hlsl, or
 anything under ue-project/.
+
+### Buried-chunk pre-dispatch skip
+
+Two prior streaming investigations both flagged the same lever and both
+declined it: **most worker output meshes to zero quads**. This wave measured
+it, built a pre-dispatch test for it at level 0, and -- importantly -- found
+that after merging `main`'s ring-quota fix the *largest* remaining instance of
+the problem has moved somewhere this test does not reach. That correction is
+the most valuable thing here and is written up in full below.
+
+**Step 1: measure, before changing anything.** A per-ring census
+(`-VoxelMeasureEmpty`) classifies every zero-quad chunk over the mesher's own
+domain (chunk + 1-voxel apron). That domain is the right one because
+`voxelcore/mesher.h` emits a face **only** where a solid voxel has an AIR
+neighbour -- material boundaries emit nothing -- so "no solid in the interior"
+and "no air in chunk+apron" are each independently sufficient for zero quads.
+Worker **wall time** is split by outcome too, always on: job COUNT alone cannot
+justify the wave, since the mesher early-outs on a uniform chunk and a
+zero-quad job is already cheaper than a surface one.
+
+Measured on the merged build, `-VoxelPerfRun=60`, seed 20260719, `-nullrhi`,
+5 s windows:
+
+| ring | zero-quad jobs | share of that ring's worker time | composition |
+|---|---|---|---|
+| R0 | 71-74% | 67-74% | ~45% all-air, ~55% all-solid |
+| R1 | 65-79% | 74-86% | ~88% all-air |
+| R2 | 82-95% | **93-99%** | 100% all-air |
+| R3 | ~100% | ~100% | all-air |
+| R4 | **100%** | **100%** | all-air |
+
+Summing one representative window: R0 9,765 ms, R1 3,670, R2 3,674, R3 1,264,
+R4 8,570 -- **~83% of all worker wall time produces no geometry at all.** The
+72-77% figure the wave inherited is confirmed for job count and is, if
+anything, an under-statement of the time share.
+
+Two corrections to the inherited framing:
+
+1. It is **not** mostly "fully-buried solid interior". Only R0 has a solid
+   majority; R1 outward is overwhelmingly **all-air** chunks sitting above the
+   terrain, admitted by `ComputeFootprintChunkZRange`'s deliberately generous
+   `+2` chunk headroom (at level 4 that headroom is ~102 m of sky).
+2. The mesher's early-outs do **not** already make these cheap. A zero-quad R0
+   job costs 0.93 ms against 1.15 ms for one that produces geometry -- only
+   ~20% less, because the dominant cost is upstream of the mesher: the
+   `(32+2)^2` `Amplifier::column` grid alone is **34-42%** of a level-0 job.
+
+**Step 2: the test.** A *footprint band* is two level-0 voxel z values
+summarising what a whole (X,Y) footprint can contain, reduced from the **same
+34x34 column grid a level-0 job already builds**. Every level-0 chunk in an
+(X,Y) reads columns `[32X-1, 32X+32]` -- exactly that grid, apron included --
+so one job's band answers the question for every chunk stacked above and below
+it. The band costs a max/min over columns already paid for and is then reused
+by the ~10-20 other chunks in the footprint. It is **never** computed on the
+game thread, where 1156 `Amplifier::column` calls per footprint would be an
+M1-gate disaster; it rides home on worker results and is cached per footprint
+(a pure function of (X,Y) and the amplifier, so it never needs invalidating).
+
+  * `MaxSurfaceTopVoxel` -- above it every column is air, so a chunk starting
+    above it hits `meshBrick`'s early-out 1 in all 64 bricks.
+  * `SolidBelowVoxel` -- below it every column is solid, so no face has an AIR
+    neighbour.
+
+**Which way it errs: toward "might have geometry".** Every per-column bound is
+an OUTER bound of the corresponding voxel-core predicate, taken over a
+SUPERSET of the columns a chunk reads, then widened one further voxel each
+way. `caveCarveAt` and `cavernCarveAt` are mirrored from their public segment
+fields with the radius rounded **up** (`CeilSqrtI64`); crevices need no special
+case because `caveColumnFromLattice` emits them as ordinary extra `CaveSeg`s,
+and the sinkhole shaft is bounded directly by `shaftDepthMaxMm` **outside** the
+bedrock clamp, matching `caveCarveAt`'s guard order. Sea-level and
+minimum-surface clamps tighten the CARVE terms only, never the
+air-above-surface term -- terrain whose surface is below sea level has air
+above it and must not be claimed solid. So the test can fail to skip a chunk
+that is in fact featureless (pure lost opportunity) but **cannot** claim
+"definitely empty" for a chunk with geometry. A false "might have geometry" is
+free; a false "definitely empty" is a hole in the world, invisible until
+someone flies past it.
+
+**Edits** are vetoed by the pre-existing `NeedsOverlayAwarePath` gate the skip
+sits behind, which at level 0 **is** `ChunkHasEditedBrick` -- the chunk plus one
+brick of border on every axis. Any chunk an edit could have made non-uniform,
+including a pristine neighbour of an edited brick, is routed to the
+game-thread path before the skip is considered. The band is pure worldgen and
+is never consulted for such a chunk.
+
+**Step 3: proof no geometry is lost.** `-VoxelVerifyBuriedSkip` computes the
+verdict exactly as in production but dispatches the job anyway and checks
+every "provably empty" verdict against the real mesh. Across a 120 s flight on
+the merged build: **96,430 predicted-empty chunks meshed, 0 violations**; plus
+303,148 on the pre-merge build (163,744 from a dedicated verify run and
+139,404 carried incidentally by the two skip-off runs) -- **~400,000 chunks,
+zero disagreements.** This is the direct form of the proof: not "the rendered
+sets matched" but "every single chunk the test would have deleted was
+independently confirmed to contain nothing".
+
+**Throughput, interleaved A/B, same binary** (`-VoxelPerfRun=60`, seed
+20260719, `-nullrhi`, all four runs shown):
+
+| metric | A1 (skip off) | A2 (skip off) | B1 (skip on) | B2 (skip on) |
+|---|---|---|---|---|
+| chunks/s | 559.5 | 436.7 | **727.4** | **607.2** |
+| R0 loaded | 2367 | 2025 | **3056** | **2897** |
+| R1 loaded | 990 | 801 | **2098** | **1339** |
+
+Both skip-on runs beat both skip-off runs with no overlap, which is what makes
+this readable through this box's ~15% run-to-run variance. Min-of-N:
+**436.7 -> 607.2 chunks/s, +39%**. Level-0 jobs dispatched per 5 s window fall
+from ~11,200 to ~3,700 (**-67%**), and the residual zero-quad share at R0 drops
+from 76-78% to 27-30% -- the band catches ~92% of the opportunity that exists
+at level 0.
+
+**M1 gate, real RHI** (min-spec proxy `sg.*Quality 0` + `r.ScreenPercentage
+100`, 1080p windowed, one warm-up discarded). The first measured pair was still
+warming (DDC/PSO) and failed on BOTH sides at 18.60 / 21.72 ms; it is shown for
+completeness and excluded from the conclusion. All six runs:
+
+| | A1 (warming) | B1 (warming) | A2 | B2 | A3 | B3 |
+|---|---|---|---|---|---|---|
+| p95 (ms) | 18.60 | 21.72 | 6.55 | **7.12** | 6.12 | **6.81** |
+| post-warmup p95 | 18.68 | 20.82 | 5.92 | **6.81** | 5.75 | **6.54** |
+| frames over 16.6 ms | 17 | 21 | 0 | **0** | 0 | **0** |
+| hitches (>33.3 ms) | 120 | 129 | 40 | 51 | 35 | 36 |
+| chunks/s | 158.6 | 187.6 | 244.6 | **297.7** | 251.8 | **305.1** |
+
+**Gate holds** -- 6.81-7.12 ms against the 16.6 ms bar, with **0 frames over the
+bar** on either side. Reported honestly: the skip costs **~+0.6-0.7 ms p95**.
+That is not the skip being slow, it is the pipeline doing more useful work per
+frame -- the same runs load **+22% more chunks/s**, and applying those extra
+meshes is game-thread work that did not previously exist. Both sides sit well
+under the bar with >2x margin.
+
+Note the documented ~4.76-4.82 ms baseline does **not** reproduce here: both
+sides land at 6.1-7.1 ms. That shift arrives with `main`'s ring-quota fix (R2-R4
+now actually dispatch and render) and is present on both sides of this A/B, so
+it is not attributable to this wave.
+
+**Contents unchanged, verified not asserted.** A/B of
+`-VoxelHeadlessDigTest=15 -VoxelSaveWorldAfter=22 -VoxelDumpDigestAfter=25
+-VoxelNoLoad` (seed 20260719) with the skip off and on: both carve
+**2,178,385** voxels, both report **`editedDigest=0xFB62844A74CB9121`**, and
+both write an **8,039-entry / 4,135,443-byte** `.vxlog` that is byte-identical
+(SHA-256 `4881EDEC...F8945F` on both sides). Exactly the established reference.
+voxel-core was not modified.
+
+**The correction that matters most.** This test is **level 0 only**, and after
+merging `main` that is no longer where the biggest waste is. A level-L chunk
+spans `2^L x 2^L` level-0 footprints and the mip path samples columns at stride
+rather than building a dense grid, so no exact band is available for it; and
+combining level-0 bands upward does not help, because an R4 footprint 1024 m
+out never has level-0 bands to combine. Meanwhile the census shows R2/R3/R4 are
+**100% all-air** and a single R4 chunk costs **6,261-26,377 ms** of worker time
+to produce nothing. R4 alone was ~32% of all worker time in the sampled window
+-- larger than the entire R0 saving this wave delivers.
+
+**Follow-ups, ranked.**
+
+1. **Extend the band to the outer rings -- now the single largest lever.**
+   R2/R3/R4 are 100% all-air and cost seconds per chunk. The all-air half of
+   the test needs only a conservative UPPER bound on surface height over a
+   footprint, which requires no cave/cavern data at all (caves only ever
+   REMOVE solid). `main` just landed `generator.h`'s `coarseColumns` /
+   `makeCoarseBrick`, which is very likely exactly the primitive needed: wire
+   coarse LOD into UE first, then derive outer-ring bands from a coarse column
+   grid the same way this wave derives level-0 bands from a dense one.
+2. **Tighten `ComputeFootprintChunkZRange`'s `+2` chunk headroom.** It is the
+   direct *source* of the all-air chunks -- at level 4 it admits ~102 m of sky
+   per footprint. Skipping them after admission (item 1) is good; not admitting
+   them is better and cheaper. Needs a conservative max-surface bound, same
+   primitive as item 1.
+3. **A voxel-core "column bound over a region" query.** This wave had to mirror
+   `caveCarveAt`/`cavernCarveAt`'s segment semantics UE-side because no such
+   API exists and voxel-core was owned by other agents. It is verified over
+   ~400k chunks, but it is a duplicated invariant: a retune of the cave
+   constants would silently need this mirror updated too. The ideal API is
+   `Amplifier::columnAirBounds(col) -> {topSolidVoxel, deepestAirVoxel}` living
+   next to the predicates it must agree with.
+4. **The ~8% of level-0 opportunity the band misses** is chunks dispatched
+   before their footprint's first job returned a band. A cheap "band probe"
+   job per new footprint would close it, but it is a small residual next to
+   items 1-2 and should wait for them.
