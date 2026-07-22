@@ -73,20 +73,40 @@ class ChannelSpec:
     max: float
 
 
-#: Our pipeline's current assumption about the model's raw (pre-adapter)
-#: output: elevation in metres as float32, plus 4 climate channels
-#: normalized to [0, 1] float32 (the adapter quantizes these into the
-#: int16/uint8 wire format). This is the manifest the "confirm real
-#: outputs" backlog item (docs/status.md) verifies against a real
-#: checkpoint. Ranges are generous (Earth's extremes) so validation only
-#: fires on genuinely wrong output, not legitimate high mountains/trenches.
+#: What the model actually emits (CONFIRMED against a real checkpoint on an
+#: RTX 4090, 2026-07-22 — the "confirm real terrain-diffusion tile outputs"
+#: backlog item). Elevation is float32 metres. The four climate channels are
+#: **raw WorldClim bioclim values in physical units**, NOT normalized to
+#: [0, 1] as originally assumed:
+#:
+#:   temperature        bio_1   annual mean temperature, degrees C
+#:   seasonality        bio_4   temperature seasonality, sd(monthly) x 100
+#:   precipitation      bio_12  annual precipitation, mm
+#:   precip_variability bio_15  precipitation seasonality, CV %
+#:
+#: That identification is not a guess: the pipeline downloads the WorldClim
+#: 2.1 10-arc-minute bio rasters at bring-up and conditions on them, and the
+#: observed tile-(0,0) values (21.1-22.8, 451-548, 629-772, 42-58) sit exactly
+#: where bio_1/4/12/15 sit for a warm wet ocean cell.
+#:
+#: These bounds do double duty: they are the validation range AND the
+#: quantization range the adapter maps into uint8 (see adapt_raster_to_tile).
+#: So they are part of the tile wire format — changing one changes tile bytes,
+#: and must roll the provider_id. They are set generously (Earth's extremes,
+#: e.g. bio_12 max ~11,900 mm at Mawsynram) so validation fires only on
+#: genuinely wrong output, and so quantization clips only at true extremes.
 EXPECTED_CHANNELS: tuple[ChannelSpec, ...] = (
     ChannelSpec("elevation", "float32", -12000.0, 9000.0),
-    ChannelSpec("temperature", "float32", 0.0, 1.0),
-    ChannelSpec("seasonality", "float32", 0.0, 1.0),
-    ChannelSpec("precipitation", "float32", 0.0, 1.0),
-    ChannelSpec("precip_variability", "float32", 0.0, 1.0),
+    ChannelSpec("temperature", "float32", -40.0, 40.0),
+    ChannelSpec("seasonality", "float32", 0.0, 3000.0),
+    ChannelSpec("precipitation", "float32", 0.0, 12000.0),
+    ChannelSpec("precip_variability", "float32", 0.0, 200.0),
 )
+
+#: Climate channels by name, for the adapter's per-channel normalization.
+_CLIMATE_SPECS: dict[str, ChannelSpec] = {
+    c.name: c for c in EXPECTED_CHANNELS if c.name != "elevation"
+}
 
 #: Identity mapping: semantic channel name -> raster dict key the model
 #: uses. Override via ``DiffusionConfig(channel_mapping=...)`` if the real
@@ -219,9 +239,10 @@ def adapt_raster_to_tile(
     """Convert a (validated) model raster dict into our Tile format.
 
     Elevation: float32 metres -> int16 metres (rounded, clipped to int16).
-    Climate: float32 in [0, 1] -> uint8 in [0, 255] (rounded, clipped),
-    packed in the tile_codec channel order (temperature, seasonality,
-    precipitation, precip_variability).
+    Climate: float32 in each channel's PHYSICAL WorldClim range (see
+    EXPECTED_CHANNELS) -> normalized to [0, 1] by that range -> uint8 in
+    [0, 255] (rounded, clipped), packed in the tile_codec channel order
+    (temperature, seasonality, precipitation, precip_variability).
 
     Callers should run ``validate_model_output(raster_dict, config.channel_mapping)``
     first — this function does not re-validate; it trusts the caller and
@@ -235,7 +256,16 @@ def adapt_raster_to_tile(
     climate = np.zeros((CLIMATE_CHANNELS, *elevation.shape), dtype=np.uint8)
     for i, name in enumerate(_CLIMATE_ORDER):
         raw = raster_dict[mapping[name]]
-        climate[i] = np.clip(np.rint(raw * 255.0), 0, 255).astype(np.uint8)
+        # The model emits RAW WorldClim physical units, not [0, 1] -- see
+        # EXPECTED_CHANNELS. Normalize per channel by its own physical range
+        # before quantizing. The previous `raw * 255.0` silently saturated
+        # every climate plane to 255 (bio_1 ~21 C, bio_12 ~630 mm all clip),
+        # producing four identical constant planes that would have looked
+        # like "climate exists" while carrying no information at all.
+        spec = _CLIMATE_SPECS[name]
+        span = spec.max - spec.min
+        unit = (raw.astype(np.float64) - spec.min) / span
+        climate[i] = np.clip(np.rint(unit * 255.0), 0, 255).astype(np.uint8)
 
     return Tile(seed=seed, x=x, y=y, scale=scale, elevation=elevation, climate=climate)
 
