@@ -1,12 +1,13 @@
 # ADR-0005: Persisting water — the CA fill is irreducible state, and the mobilized set cannot be saved without it
 
-- **Status:** proposed
+- **Status:** **ACCEPTED** (Matt, 2026-07-22) — implemented as `WaterState`
+  (`voxel-core/include/voxelcore/waterca.h`).
 - **Date:** 2026-07-21
 - **Doctrine sections affected:** **§2.1** (never replicate voxels; seed +
   edit-log diffs only). This ADR argues that §2.1 is a *replication* rule and
   that persistence is a different axis, but the distinction is load-bearing
   enough that it should be Matt's call rather than mine.
-- **Human sign-off:** **PENDING.**
+- **Human sign-off:** **GRANTED (Matt, 2026-07-22).**
 
 ## Context
 
@@ -134,10 +135,42 @@ lose), and persisting the collapse scheduler.
 
 ## Status of the work
 
-Nothing is implemented. This ADR was written *instead of* the backlog item,
-because implementing the item as written would have shipped a silent
-lake-destroying bug behind a green test suite — the mobilized-set round trip
-would have passed perfectly while the water it referred to vanished.
+This ADR was written *instead of* the backlog item, because implementing the
+item as written would have shipped a silent lake-destroying bug behind a green
+test suite — the mobilized-set round trip would have passed perfectly while the
+water it referred to vanished.
 
-Follow-up if adopted: the serializer, the round-trip conservation test, and a
-UE-side hook to write the blob alongside the edit log.
+**Implemented** (voxel-core, `WaterState` in `waterca.h` / `waterca.cpp`,
+tests in `test_waterca.cpp`):
+
+- The serializer, carrying CA fill + the active set + mobilized keys as a
+  standalone blob with its own magic and its own `kWaterCAVersion` stamp, kept
+  deliberately separate from the edit log so water is discardable without
+  discarding terrain edits. Container format is versioned independently of the
+  CA version so the byte layout can evolve without a world-breaking bump.
+- Load applies **fills first**, then the active set, then `markMobilized`.
+  Parse decodes and validates the whole blob before applying anything, so a
+  truncated or tampered save fails cleanly and never half-loads; `totalVolume`
+  is stored redundantly and cross-checked against the fills actually decoded,
+  so a lossy cycle is loud in production and not only under test.
+- The round-trip test asserts both digests are byte-identical and that
+  implicit + CA volume is conserved, plus a mid-flow save that must resume to
+  the same end state as an uninterrupted run (which is what persisting the
+  active set buys). `waterca_state_mobilized_keys_alone_would_destroy_the_lake`
+  keeps the trap itself executable: it demonstrates the naive serializer
+  zeroing the lake *while its mobilized-set digest round-trips perfectly*.
+- Payload encoding reuses the edit log's `kSparse`/`kRle` split rather than
+  inventing a third scheme, and the choice was **measured** on four real
+  scenarios, not assumed. `kRle` carries almost everything (11-21% of
+  dense-only); `kSparse` earns its place on thin vertical water (a drain
+  shaft — 8 B vs 17 B) and *not* on water in motion, which turned out to still
+  be sheets; `kDense` wins none of the four and is kept only as the
+  never-worse-than-raw floor.
+
+**Ships inert.** Nothing in voxel-core writes a file by itself — the blob is
+produced into and parsed out of a caller-owned buffer, exactly like `EditLog`.
+
+**Still open:** the UE-side hook that writes the blob alongside the edit log on
+save and feeds it back on load, including the decision of what to do when the
+water blob is missing, stale (`kWaterCAVersion` moved), or refused (fall back
+to a fully implicit world — coherent, but every drained cavern refills).
