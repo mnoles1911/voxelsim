@@ -1169,4 +1169,159 @@ void WaterCA::digest(Digest& d) const {
     }
 }
 
+// ===========================================================================
+// WaterMobilizer (see the long contract comment in waterca.h)
+// ===========================================================================
+
+namespace {
+
+// Voxel coordinates of a water brick's (0,0,0) corner cell.
+inline void brickOrigin(const BrickKey& k, int64_t& ox, int64_t& oy, int64_t& oz) {
+    ox = static_cast<int64_t>(k.x) * kEdge;
+    oy = static_cast<int64_t>(k.y) * kEdge;
+    oz = static_cast<int64_t>(k.z) * kEdge;
+}
+
+} // namespace
+
+uint8_t WaterMobilizer::sourceFillAt(int64_t vx, int64_t vy, int64_t vz) const {
+    // Implicit water exists only in open cave air -- see the constructor's
+    // "WHY TERRAIN IS PART OF THE IMPLICIT FIELD" comment for why this belongs
+    // here rather than being left to the ImplicitFn or to the CA.
+    if (terrain_(vx, vy, vz) != MAT_AIR) return 0;
+    return implicit_(vx, vy, vz);
+}
+
+uint8_t WaterMobilizer::implicitFillAt(int64_t vx, int64_t vy, int64_t vz) const {
+    // The ownership handover, in one line: once the brick has mobilized the
+    // CA owns these cells and the implicit field contributes nothing.
+    if (mobilized_.count(waterKeyForVoxel(vx, vy, vz)) != 0) return 0;
+    return sourceFillAt(vx, vy, vz);
+}
+
+WaterCA::SolidFn WaterMobilizer::makeSolidFn() const {
+    // Terrain first: it is the cheaper query and the common answer. Only for
+    // genuinely open air do we ask whether the implicit field still owns this
+    // cell, in which case it reads as solid -- an unmobilized lake is a WALL,
+    // which is what makes the ownership partition structural (waterca.h).
+    // (Inlined rather than calling implicitFillAt, to avoid asking terrain_
+    // twice on the CA's hottest query.)
+    return [this](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
+        const MaterialId m = terrain_(vx, vy, vz);
+        if (m != MAT_AIR) return m;
+        if (mobilized_.count(waterKeyForVoxel(vx, vy, vz)) != 0) return MAT_AIR;
+        return implicit_(vx, vy, vz) != 0 ? MAT_ROCK : MAT_AIR;
+    };
+}
+
+uint64_t WaterMobilizer::scanBrick(const BrickKey& k) const {
+    int64_t ox = 0, oy = 0, oz = 0;
+    brickOrigin(k, ox, oy, oz);
+    uint64_t sum = 0;
+    for (int z = 0; z < kEdge; ++z)
+        for (int y = 0; y < kEdge; ++y)
+            for (int x = 0; x < kEdge; ++x) sum += sourceFillAt(ox + x, oy + y, oz + z);
+    return sum;
+}
+
+uint32_t WaterMobilizer::mobilizeBrick(WaterCA& ca, const BrickKey& k) {
+    if (mobilized_.count(k) != 0) return 0;
+    if (noImplicit_.count(k) != 0) return 0;
+
+    if (scanBrick(k) == 0) {
+        // Dry brick: nothing to hand over, and recording it would bloat the
+        // persisted set for every brick ordinary surface water ever splashes
+        // through. Negative memo only.
+        if (noImplicit_.size() >= kMaxNoImplicitBricks) noImplicit_.clear();
+        noImplicit_.insert(k);
+        return 0;
+    }
+
+    // ORDER MATTERS. Mark first, so implicitFillAt() -- and therefore the wall
+    // in makeSolidFn() -- reports 0 for these cells before we try to write
+    // them. Then drop the CA's solidity memo for the brick, which was caching
+    // "solid" for exactly those cells. Only then credit. Getting this backwards
+    // would have addWaterAt refuse every cell as solid and credit nothing,
+    // which shortfallVolume() would (loudly) catch.
+    mobilized_.insert(k);
+    recentlyMobilized_.push_back(k);
+    noImplicit_.erase(k);
+
+    int64_t ox = 0, oy = 0, oz = 0;
+    brickOrigin(k, ox, oy, oz);
+    ca.invalidateSolidRegion(ox, oy, oz, ox + kEdge - 1, oy + kEdge - 1, oz + kEdge - 1);
+
+    uint32_t credited = 0;
+    for (int z = 0; z < kEdge; ++z)
+        for (int y = 0; y < kEdge; ++y)
+            for (int x = 0; x < kEdge; ++x) {
+                const uint8_t want = sourceFillAt(ox + x, oy + y, oz + z);
+                if (want == 0) continue;
+                debited_ += want;
+                // The cell was owned by the implicit field, so it was a wall to
+                // the CA and is necessarily empty: this credits the full amount.
+                credited += ca.addWaterAt(ox + x, oy + y, oz + z, want);
+            }
+    credited_ += credited;
+    return credited;
+}
+
+size_t WaterMobilizer::mobilizeEditRegion(WaterCA& ca, int64_t minVx, int64_t minVy, int64_t minVz,
+                                          int64_t maxVx, int64_t maxVy, int64_t maxVz) {
+    if (minVx > maxVx || minVy > maxVy || minVz > maxVz) return 0;
+
+    const BrickKey lo = waterKeyForVoxel(minVx, minVy, minVz);
+    const BrickKey hi = waterKeyForVoxel(maxVx, maxVy, maxVz);
+    size_t n = 0;
+    for (int32_t bz = lo.z - kEditHaloBricks; bz <= hi.z + kEditHaloBricks; ++bz)
+        for (int32_t by = lo.y - kEditHaloBricks; by <= hi.y + kEditHaloBricks; ++by)
+            for (int32_t bx = lo.x - kEditHaloBricks; bx <= hi.x + kEditHaloBricks; ++bx) {
+                const BrickKey k{bx, by, bz};
+                if (mobilizeBrick(ca, k) != 0) ++n;
+            }
+    return n;
+}
+
+size_t WaterMobilizer::advanceFront(WaterCA& ca, size_t maxBricks) {
+    // Seed: every active brick's face neighbours. A brick only becomes active
+    // once it holds (or just lost) water, so this is exactly the CA/implicit
+    // contact surface, and it grows by one shell per tick.
+    static constexpr int kDx[6] = {1, -1, 0, 0, 0, 0};
+    static constexpr int kDy[6] = {0, 0, 1, -1, 0, 0};
+    static constexpr int kDz[6] = {0, 0, 0, 0, 1, -1};
+
+    for (const BrickKey& a : ca.activeBricks()) {
+        for (int i = 0; i < 6; ++i) {
+            const BrickKey n{a.x + kDx[i], a.y + kDy[i], a.z + kDz[i]};
+            if (mobilized_.count(n) != 0 || noImplicit_.count(n) != 0) continue;
+            pending_.insert(n);
+        }
+    }
+
+    // Drain the queue in BrickKeyLess order, budget-bounded. Deferring is safe:
+    // a queued brick is still a wall, so nothing can leak into it meanwhile.
+    size_t done = 0;
+    while (done < maxBricks && !pending_.empty()) {
+        const BrickKey k = *pending_.begin();
+        pending_.erase(pending_.begin());
+        mobilizeBrick(ca, k);
+        ++done;
+    }
+    return done;
+}
+
+std::vector<BrickKey> WaterMobilizer::takeRecentlyMobilized() {
+    std::vector<BrickKey> out;
+    out.swap(recentlyMobilized_);
+    return out;
+}
+
+void WaterMobilizer::digest(Digest& d) const {
+    for (const BrickKey& k : mobilized_) {
+        d.i64(k.x);
+        d.i64(k.y);
+        d.i64(k.z);
+    }
+}
+
 } // namespace vxc
