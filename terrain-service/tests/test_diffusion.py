@@ -34,7 +34,14 @@ from terrain_service.providers.diffusion import (
     verify_conditioning_digest,
 )
 
+from terrain_service.providers.synthetic import SyntheticProvider
+
 TILE_SIZE = tile_codec.TILE_SIZE
+
+#: Dry-run provider_id suffix. It carries SyntheticProvider's own version
+#: because in dry-run mode the STAND-IN, not the checkpoint, decides the
+#: bytes -- bumping "synthetic-v1" must roll the dry-run cache namespace.
+DRYRUN = "-dryrun-" + SyntheticProvider.provider_id
 
 
 def _good_raster(mapping: dict[str, str] | None = None) -> dict[str, np.ndarray]:
@@ -428,12 +435,12 @@ def test_dry_run_provider_produces_valid_encodable_tile():
 
 def test_dry_run_provider_id_is_tagged_and_distinct_from_real():
     dry = DiffusionProvider(dry_run=True)
-    assert dry.provider_id.endswith("-dryrun")
+    assert dry.provider_id.endswith(DRYRUN)
 
     # Real (non-dry-run) construction never touches a GPU — only generate()
     # does — so this must succeed without raising.
     real = DiffusionProvider(dry_run=False)
-    assert not real.provider_id.endswith("-dryrun")
+    assert not real.provider_id.endswith(DRYRUN)
     assert real.provider_id != dry.provider_id
 
 
@@ -519,7 +526,7 @@ def test_create_app_pins_diffusion_config_from_env(tmp_path, monkeypatch):
 
     expected = (
         DiffusionConfig(checkpoint_id="ckpt-env", checkpoint_sha256="b" * 64).provider_id()
-        + "-dryrun"
+        + DRYRUN
     )
     assert client.get("/healthz").get_json()["provider"] == expected
 
@@ -533,7 +540,7 @@ def test_create_app_without_checkpoint_env_uses_unpinned_default(tmp_path, monke
     app = create_app(cache=TileCache(tmp_path))
     client = app.test_client()
 
-    expected = DiffusionConfig().provider_id() + "-dryrun"
+    expected = DiffusionConfig().provider_id() + DRYRUN
     assert client.get("/healthz").get_json()["provider"] == expected
 
 
@@ -720,6 +727,14 @@ def test_module_imports_without_torch(monkeypatch):
         sys.modules.pop(module_name, None)
         if saved is not None:
             sys.modules[module_name] = saved
+            # Also restore the PACKAGE ATTRIBUTE. importlib.import_module
+            # above rebound terrain_service.providers.diffusion to the freshly
+            # loaded module object, and `from terrain_service.providers import
+            # diffusion` resolves via that attribute, not sys.modules. Leaving
+            # it pointing at the throwaway module made every later test that
+            # monkeypatches a module-level constant silently patch a module
+            # nobody else was using -- a test that could only ever pass.
+            setattr(sys.modules["terrain_service.providers"], "diffusion", saved)
         importlib.import_module(module_name)
 
 
@@ -779,7 +794,7 @@ def test_create_app_pins_full_identity_from_env(tmp_path, monkeypatch):
             conditioning_digest="e" * 64,
             terrain_diffusion_version="abc1234",
         ).provider_id()
-        + "-dryrun"
+        + DRYRUN
     )
     assert served == expected
     assert "workspace" not in served
@@ -807,5 +822,57 @@ def test_create_app_provider_id_override_serves_legacy_namespace(tmp_path, monke
     dry_app = create_app(cache=TileCache(tmp_path))
     assert (
         dry_app.test_client().get("/healthz").get_json()["provider"]
-        == legacy + "-dryrun"
+        == legacy + DRYRUN
     )
+
+
+# ---------------------------------------------------------------------------
+# Further inputs that decide tile bytes but live outside DiffusionConfig.
+# ---------------------------------------------------------------------------
+
+
+def test_provider_id_covers_tile_codec_container_format(monkeypatch):
+    """A codec bump changes every cached byte string. Cache files are keyed
+    only by provider_id, so without this the namespace would end up holding
+    two incompatible formats and decode() would raise "unsupported tile
+    version" on the older half."""
+    before = DiffusionConfig().provider_id()
+    monkeypatch.setattr(tile_codec, "VERSION", tile_codec.VERSION + 1)
+    assert DiffusionConfig().provider_id() != before
+
+
+def test_provider_id_covers_generation_algorithm_version(monkeypatch):
+    """The manual counter for generation logic that cannot be hashed
+    automatically: the axis mapping, the upsampling math, derive_tile_seed's
+    scheme. See GENERATION_ALGORITHM_VERSION's docstring for the bump list."""
+    from terrain_service.providers import diffusion as diff_mod
+
+    before = DiffusionConfig().provider_id()
+    monkeypatch.setattr(diff_mod, "GENERATION_ALGORITHM_VERSION", 99)
+    assert DiffusionConfig().provider_id() != before
+
+
+def test_dry_run_id_carries_the_stand_ins_version():
+    """In dry-run mode SyntheticProvider, not the checkpoint, decides the
+    bytes -- so bumping "synthetic-v1" must roll the dry-run namespace."""
+    dry = DiffusionProvider(dry_run=True).provider_id
+    assert dry.endswith(SyntheticProvider.provider_id)
+    assert "-dryrun-" in dry
+
+
+def test_channel_mapping_cannot_be_mutated_after_construction():
+    """frozen=True blocks rebinding but not mutation, and the mapping is read
+    live on every generate() while provider_id was snapshotted at
+    construction -- one mutation would repack the climate planes under an
+    already-published identity."""
+    config = DiffusionConfig()
+    with pytest.raises(TypeError):
+        config.channel_mapping["temperature"] = "t2m"
+
+    # Constructing FROM a dict must copy, so later mutating the caller's dict
+    # cannot reach in either.
+    caller_dict = dict(DEFAULT_CHANNEL_MAPPING)
+    config2 = DiffusionConfig(channel_mapping=caller_dict)
+    before = config2.provider_id()
+    caller_dict["temperature"] = "t2m"
+    assert config2.provider_id() == before

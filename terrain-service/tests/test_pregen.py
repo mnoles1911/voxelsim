@@ -10,6 +10,9 @@ from terrain_service import tile_codec
 from terrain_service.cache import TileCache
 from terrain_service.providers.synthetic import SyntheticProvider
 
+#: See test_diffusion.py's DRYRUN.
+DRYRUN = "-dryrun-" + SyntheticProvider.provider_id
+
 
 def test_pregen_radius1_generates_9_tiles(tmp_path):
     """Radius 1 should generate 9 tiles in a 3x3 square."""
@@ -171,7 +174,7 @@ def test_pregen_diffusion_dry_run_uses_pinned_checkpoint_in_cache_key(tmp_path):
     pinned_id = (
         DiffusionConfig(checkpoint_id="ckpt-cli", checkpoint_sha256="c" * 64, scale=1)
         .provider_id()
-        + "-dryrun"
+        + DRYRUN
     )
     cache = TileCache(cache_dir)
     assert cache.get(pinned_id, 5, 0, 0, 1) is not None
@@ -203,7 +206,7 @@ def test_pregen_diffusion_dry_run_without_pin_uses_unpinned_default(tmp_path):
     )
     assert result.returncode == 0, f"pregen failed: {result.stderr}"
 
-    default_id = DiffusionConfig(scale=1).provider_id() + "-dryrun"
+    default_id = DiffusionConfig(scale=1).provider_id() + DRYRUN
     cache = TileCache(cache_dir)
     assert cache.get(default_id, 5, 0, 0, 1) is not None
 
@@ -252,7 +255,7 @@ def test_pregen_diffusion_pins_conditioning_and_label_in_cache_key(tmp_path):
             terrain_diffusion_version="abc1234",
             scale=1,
         ).provider_id()
-        + "-dryrun"
+        + DRYRUN
     )
     cache = TileCache(cache_dir)
     assert cache.get(pinned_id, 5, 0, 0, 1) is not None

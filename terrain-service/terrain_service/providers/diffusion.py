@@ -53,6 +53,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Protocol
 
 import numpy as np
@@ -331,22 +332,59 @@ DEFAULT_CONDITIONING_FILES: tuple[str, ...] = (
 )
 
 
+#: MANUAL VERSION COUNTER for generation logic that is pure CODE and cannot
+#: be hashed automatically. **Bump it in the same commit as any change to:**
+#:
+#:   * ``derive_tile_seed``'s canonical string, field order, digest slice or
+#:     endianness — and the ``torch.manual_seed`` call that consumes it;
+#:   * ``TerrainDiffusionBackend.generate_rasters``' tile-to-pixel axis
+#:     mapping (``i1 = y*TILE_SIZE, j1 = x*TILE_SIZE`` — still marked
+#:     ``# ASSUMPTION:`` and the single most likely edit in this file: if
+#:     bring-up finds it transposed, the whole world transposes);
+#:   * ``_get_terrain_at_scale``'s upsampling math (``mode="bilinear"``,
+#:     ``align_corners=False``, the 1-native-pixel pad, the ceil-div, the
+#:     crop offsets) — ``scale`` is in the id but the INTERPOLATOR is not;
+#:   * ``adapt_raster_to_tile``'s conversion beyond the ranges already
+#:     covered below, or ``_synthetic_stand_in``'s stand-in arithmetic.
+#:
+#: A counter is not as good as hashing the source, but hashing source text
+#: would roll the id on comment edits and reformattings — a false kMismatch,
+#: the same failure mode as bug #1. An explicit, documented counter puts the
+#: decision where the judgement is.
+GENERATION_ALGORITHM_VERSION = 1
+
+
 def _tile_format_fingerprint() -> str:
     """sha256 of everything OUTSIDE DiffusionConfig that still decides tile
-    bytes: the wire geometry (``TILE_SIZE``, ``CLIMATE_CHANNELS``,
-    ``PIXEL_SIZE_MM``) and the adapter's quantization contract
-    (``EXPECTED_CHANNELS`` min/max — which ``adapt_raster_to_tile`` uses as
-    the uint8 mapping range — plus ``_CLIMATE_ORDER``, the plane packing
-    order).
+    bytes.
 
-    These are module constants, not config fields, so before this they could
-    be edited without rolling ``provider_id`` — silently changing tile bytes
-    under an unchanged identity. Folding them in closes that (third) gap.
+    Three groups, none of them config fields — so before this they could all
+    be edited without rolling ``provider_id``, silently changing tile bytes
+    (or the cached byte FORMAT) under an unchanged identity:
+
+      * wire geometry: ``TILE_SIZE``, ``CLIMATE_CHANNELS``, ``PIXEL_SIZE_MM``;
+      * the encoded-tile container: ``tile_codec``'s ``MAGIC``, ``VERSION``
+        and header struct. A codec bump is especially nasty without this —
+        cache files are keyed only by provider_id, so the namespace would end
+        up holding two mutually incompatible formats and ``decode`` would
+        raise "unsupported tile version" on the old ones;
+      * the adapter's quantization contract: ``EXPECTED_CHANNELS`` min/max
+        (which ``adapt_raster_to_tile`` uses as the uint8 mapping range) and
+        ``_CLIMATE_ORDER`` (the plane packing order);
+
+    plus ``GENERATION_ALGORITHM_VERSION`` for the logic that can only be
+    tracked by hand (see that constant).
     """
+    from .. import tile_codec
+
     payload = {
+        "algorithm_version": GENERATION_ALGORITHM_VERSION,
         "tile_size": TILE_SIZE,
         "climate_channels": CLIMATE_CHANNELS,
         "pixel_size_mm": {str(k): v for k, v in sorted(PIXEL_SIZE_MM.items())},
+        "codec_magic": tile_codec.MAGIC.decode("ascii"),
+        "codec_version": tile_codec.VERSION,
+        "codec_header": tile_codec._HEADER.format,
         "climate_order": list(_CLIMATE_ORDER),
         "expected_channels": [
             [c.name, c.dtype, c.min, c.max] for c in EXPECTED_CHANNELS
@@ -455,6 +493,15 @@ class DiffusionConfig:
                 "checkpoint_id (which is deliberately excluded from the identity) and "
                 "give the label something like 'terrain-diffusion-30m'."
             )
+        # `frozen=True` stops attribute rebinding but NOT
+        # `config.channel_mapping["temperature"] = "t2m"`, and the mapping is
+        # read live on every generate() while provider_id was snapshotted at
+        # construction -- one mutation would repack the climate planes under
+        # an already-published identity. Freeze the contents too.
+        object.__setattr__(
+            self, "channel_mapping", MappingProxyType(dict(self.channel_mapping))
+        )
+        object.__setattr__(self, "conditioning_files", tuple(self.conditioning_files))
         if not self.conditioning_files:
             raise ValueError(
                 "conditioning_files must not be empty: an identity that covers no "
@@ -502,7 +549,7 @@ class DiffusionConfig:
                 "scheduler": self.sampler.scheduler,
             },
             "scale": self.scale,
-            "channel_mapping": self.channel_mapping,
+            "channel_mapping": dict(self.channel_mapping),
             "tile_format": _tile_format_fingerprint(),
         }
         digest = hashlib.sha256(
@@ -840,7 +887,17 @@ class TerrainDiffusionBackend:
         # _compute_map_stats), so this gate is exactly as load-bearing as the
         # checkpoint one above: without it, a box with a different ETOPO
         # build generates different terrain under the same provider_id.
-        verify_conditioning_digest(self.config)
+        #
+        # DEFAULT_CONDITIONING_ROOT is passed EXPLICITLY (an argument beats
+        # TERRAIN_CONDITIONING_ROOT) on purpose: upstream's
+        # synthetic_map._compute_map_stats opens the relative path
+        # data/global/... from the process CWD and knows nothing about our
+        # env var. Honouring the override here would let the gate verify a
+        # directory the model never opens -- passing against canonical data
+        # while generating from a different local copy, which is exactly the
+        # divergence this check exists to catch. The env var stays useful
+        # for computing a digest off-box; it must not move the gate.
+        verify_conditioning_digest(self.config, root=DEFAULT_CONDITIONING_ROOT)
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         pipeline = WorldPipeline.from_pretrained(self.config.checkpoint_id)
@@ -989,7 +1046,18 @@ class DiffusionProvider:
         # protocol; dry-run runs are tagged so they can never collide with
         # real generated tiles in a shared cache.
         base_id = self.config.provider_id()
-        self.provider_id = f"{base_id}-dryrun" if dry_run else base_id
+        if dry_run:
+            # Tag dry-run output so it can never collide with real generated
+            # tiles -- and tag it with the STAND-IN's own version, because in
+            # dry-run mode SyntheticProvider, not the checkpoint, is what
+            # decides the bytes. Without this, bumping "synthetic-v1" (the
+            # exact thing that string exists for) would leave every dry-run
+            # tile cached under an unchanged id.
+            from .synthetic import SyntheticProvider
+
+            self.provider_id = f"{base_id}-dryrun-{SyntheticProvider.provider_id}"
+        else:
+            self.provider_id = base_id
 
     def generate(self, seed: int, x: int, y: int, scale: int) -> Tile:
         if scale != self.config.scale:
