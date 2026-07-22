@@ -146,6 +146,43 @@ public:
 	// screenshot shows nothing visible.
 	uint8 GetMaxStoredFill() const;
 
+	// --- C7/C8 underground water (docs/cavern-design.md SS5) -----------------
+
+	// Searches outward from OriginUU for a cavern column that is BOTH carved
+	// (a room actually reaches it) and flooded, and returns a point on its
+	// water surface in world UU. Steps the search grid at 30 m, which is
+	// under a cavern site's ~36 m reach radius, so no site inside the radius
+	// can be stepped over. Cost is one worldgen column query per grid point;
+	// this is verification/debug scaffolding (-VoxelFloodTest), not a
+	// gameplay path. Returns false if nothing flooded is in range.
+	bool FindFloodedCavernNear(const FVector& OriginUU, double SearchRadiusUU, FVector& OutWaterSurfaceUU) const;
+
+	// The column's implicit flood level in world UU, or false if the column is
+	// dry. Pure worldgen (vxc::cavernFloodedAt / CavernColumn::floodZMm) --
+	// zero storage, no simulation state consulted.
+	bool GetCavernFloodZUU(double WorldXUU, double WorldYUU, double& OutFloodZUU) const;
+
+	// Carves an outflow tunnel from a flooded cavern horizontally outward until
+	// it leaves the site's flood reach, then slopes it down -- i.e. gives the
+	// lake somewhere to actually go. Needed because the flood field is defined
+	// on CURRENT air below floodZ, so digging DOWNWARD inside a flooded column
+	// only creates more implicit water (correct aquifer semantics, and exactly
+	// what makes a cavern lake feel like groundwater); draining requires
+	// breaking OUT of the flooded columns. Returns voxels removed.
+	// Verification scaffolding for -VoxelFloodTest; authority only.
+	int32 CarveCavernOutflow(const FVector& LakeSurfaceUU);
+
+	// The implicit field's CURRENT contribution at a world point (0-255), i.e.
+	// respecting the mobilization handover: 0 once the owning brick has
+	// converted to CA water. Verification/debug read.
+	uint8 GetImplicitFillAtWorld(const FVector& WorldUU) const;
+
+	// C8 ledger, for verification logging. Shortfall MUST be 0 forever: it
+	// counts units the implicit field gave up that the CA did not accept,
+	// which is the one way mobilization could destroy water. See waterca.h.
+	void GetMobilizationStats(int32& OutMobilizedBricks, uint64& OutDebited, uint64& OutCredited,
+	                          uint64& OutShortfall) const;
+
 	// --- Replication plumbing v1 (task item 1) -------------------------------
 	//
 	// Server -> client transport is AVoxelEditRelay::MulticastWaterDiffs

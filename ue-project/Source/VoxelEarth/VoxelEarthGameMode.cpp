@@ -700,6 +700,261 @@ void AVoxelEarthGameMode::BeginPlay()
 			GICaveDelaySeconds, false);
 	}
 
+	// ==== C7/C8 underground water verification ==============================
+	//
+	// -VoxelFloodTest[=<delaySeconds>] is the deliverable for the cavern-water
+	// pass: ONE run producing TWO shots from the SAME camera -- a static
+	// implicit cavern lake, then that lake drained. Same-camera matters; two
+	// differently framed shots prove nothing about the water level.
+	//
+	// The drain has to be an outflow tunnel OUT of the site's flood reach, not
+	// a hole in the lake floor. The flood field is defined on CURRENT air below
+	// floodZ, so digging downward inside a flooded column only creates more
+	// implicit water -- correct groundwater semantics, and exactly what makes a
+	// cavern lake feel like an aquifer rather than a bathtub -- so the water can
+	// only actually leave by breaking out past the reach disc. See
+	// UVoxelWaterSubsystem::CarveCavernOutflow.
+	float FloodTestDelaySeconds = 20.f;
+	const bool bFloodTestRequested =
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelFloodTest="), FloodTestDelaySeconds) ||
+		FParse::Param(FCommandLine::Get(), TEXT("VoxelFloodTest"));
+	if (bFloodTestRequested)
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelFloodTest: searching for a flooded cavern in %.1fs"), FloodTestDelaySeconds);
+
+		// Poses the camera on the lake shore. Split out and fired on its own
+		// timers well before each capture: posing and capturing in one lambda
+		// captures the PRE-move view (documented in the GITest/GICaveTest
+		// blocks above, reproduced here).
+		auto PoseOnShore = [this]()
+		{
+			UWorld* PWorld = GetWorld();
+			APlayerController* Ctrl = PWorld ? PWorld->GetFirstPlayerController() : nullptr;
+			if (!Ctrl || !bFloodTestFound)
+			{
+				return;
+			}
+			if (APawn* P = Ctrl->GetPawn())
+			{
+				P->SetActorLocation(FloodTestCameraUU, false, nullptr, ETeleportType::TeleportPhysics);
+				P->SetActorRotation(FloodTestCameraRot);
+				Ctrl->SetViewTarget(P);
+			}
+			Ctrl->SetControlRotation(FloodTestCameraRot);
+		};
+
+		// Reports where the camera ACTUALLY ended up and what surrounds it.
+		auto LogCameraProbe = [this](const TCHAR* Stage)
+		{
+			UWorld* PWorld = GetWorld();
+			APlayerController* Ctrl = PWorld ? PWorld->GetFirstPlayerController() : nullptr;
+			UVoxelWorldSubsystem* T = PWorld ? PWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+			if (!Ctrl || !Ctrl->PlayerCameraManager || !T)
+			{
+				return;
+			}
+			const FVector L = Ctrl->PlayerCameraManager->GetCameraLocation();
+			const FRotator R = Ctrl->PlayerCameraManager->GetCameraRotation();
+			const FVector Dirs[6] = {FVector(1, 0, 0),  FVector(-1, 0, 0), FVector(0, 1, 0),
+			                         FVector(0, -1, 0), FVector(0, 0, 1),  FVector(0, 0, -1)};
+			const TCHAR* Names[6] = {TEXT("+X"), TEXT("-X"), TEXT("+Y"), TEXT("-Y"), TEXT("+Z"), TEXT("-Z")};
+			FString Report;
+			for (int32 I = 0; I < 6; ++I)
+			{
+				FVector Hit, Prev;
+				Report += FString::Printf(TEXT("%s=%s "), Names[I],
+				                          T->RaycastVoxelWorld(L, Dirs[I], 8000.0, Hit, Prev)
+				                              ? *FString::Printf(TEXT("%.1fm"), (Hit - L).Size() / 100.0)
+				                              : TEXT("open"));
+			}
+			// Is there actually water under our feet? A vertical column of the
+			// implicit field straight down from the camera answers directly,
+			// rather than leaving it to be guessed from the screenshot.
+			FString WaterCol;
+			if (UVoxelWaterSubsystem* W = PWorld->GetSubsystem<UVoxelWaterSubsystem>())
+			{
+				for (int32 D = -4; D <= 8; ++D)
+				{
+					WaterCol += FString::Printf(TEXT("%d "), int32(W->GetImplicitFillAtWorld(L - FVector(0, 0, D * 100.0))));
+				}
+			}
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("VoxelFloodTest [%s] camera: ACTUAL (%.0f,%.0f,%.0f) rot(pitch %.1f yaw %.1f) | intended (%.0f,%.0f,%.0f) | walls: %s | implicitFill from cam-4m down to cam+8m: %s"),
+			       Stage, L.X, L.Y, L.Z, R.Pitch, R.Yaw, FloodTestCameraUU.X, FloodTestCameraUU.Y, FloodTestCameraUU.Z,
+			       *Report, *WaterCol);
+		};
+
+		auto LogLedger = [this](const TCHAR* Stage)
+		{
+			UWorld* LWorld = GetWorld();
+			UVoxelWaterSubsystem* Water = LWorld ? LWorld->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+			if (!Water)
+			{
+				return;
+			}
+			int32 MobBricks = 0;
+			uint64 Deb = 0, Cred = 0, Short = 0;
+			Water->GetMobilizationStats(MobBricks, Deb, Cred, Short);
+			const FVoxelWaterPerfSnapshot Snap = Water->GetPerfSnapshot();
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("VoxelFloodTest [%s]: mobilizedBricks=%d debited=%llu credited=%llu SHORTFALL=%llu | CA stored=%lld active=%lld volume=%llu"),
+			       Stage, MobBricks, (unsigned long long)Deb, (unsigned long long)Cred, (unsigned long long)Short,
+			       Snap.StoredBricks, Snap.ActiveBricks, (unsigned long long)Snap.TotalVolume);
+			if (Short != 0)
+			{
+				// The one failure this whole feature is built to make
+				// impossible: units the implicit field gave up that the CA did
+				// not accept, i.e. water destroyed by the handover.
+				UE_LOG(LogVoxelEarth, Error,
+				       TEXT("VoxelFloodTest: MOBILIZATION SHORTFALL %llu -- water was destroyed by the implicit->CA handover."),
+				       (unsigned long long)Short);
+			}
+		};
+
+		GetWorldTimerManager().SetTimer(
+			FloodTestFindTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this, PoseOnShore, LogLedger]()
+				{
+					UWorld* FWorld = GetWorld();
+					UVoxelWaterSubsystem* Water = FWorld ? FWorld->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+					if (!Water)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelFloodTest: water subsystem not ready, skipping."));
+						return;
+					}
+
+					double SpawnColXUU = 0.0, SpawnColYUU = 0.0;
+					ParseSpawnColumnUU(SpawnColXUU, SpawnColYUU);
+					// 2 km: cavern sites sit 204.8 m apart and only ~60% of them
+					// are wet, so a generous radius keeps the test seed-agnostic.
+					if (!Water->FindFloodedCavernNear(FVector(SpawnColXUU, SpawnColYUU, 0.0), 200000.0,
+					                                  FloodTestLakeSurfaceUU))
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelFloodTest: no flooded cavern found; nothing to capture."));
+						return;
+					}
+					bFloodTestFound = true;
+
+					// Stand just above the waterline at the column the search
+					// picked, which is the most open point of the chamber. Do
+					// NOT back the camera off horizontally: a room tapers fast,
+					// and a camera that ends up inside rock renders the whole
+					// world see-through (every surface around it is a backface).
+					// The tunnel is carved toward +X, so looking +X keeps its
+					// mouth in frame as the lake drops.
+					// Pitch STEEPLY down and stand a few metres up, so the lake
+					// surface fills the frame instead of the horizon. Underground
+					// the far field is a heightfield whose underside is backface-
+					// culled, so anything aimed near the horizon renders as a
+					// see-through world; aiming at the water avoids that entirely.
+					// ABOVE the lake looking down, not wading in it. Standing at
+					// the waterline puts the camera inside a 25 m translucent
+					// slab and the frame turns into featureless blue; from up
+					// near the roof the surface reads as a surface, with an edge,
+					// and a dropping level is unmistakable between the two shots.
+					// HEIGHT IS LOAD-BEARING, and not for the framing. Underground
+					// chunk residency is tight and keyed to the camera: the
+					// outflow carve has to break rock ~30 m away, and it removed
+					// 341744 voxels with the camera 1.2 m over the water and
+					// NOTHING (0/102 spheres, five retries) with it 9 m up. So
+					// sit just above the waterline -- where the rock we need to
+					// cut is actually streamed in -- and get the framing from
+					// pitch instead.
+					FloodTestCameraUU = FloodTestLakeSurfaceUU + FVector(0.0, 0.0, 150.0);
+					FloodTestCameraRot = FRotator(-25.0, 0.0, 0.0); // look +X, down onto the lake
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelFloodTest: lake surface (%.0f,%.0f,%.0f) UU; camera (%.0f,%.0f,%.0f)"),
+					       FloodTestLakeSurfaceUU.X, FloodTestLakeSurfaceUU.Y, FloodTestLakeSurfaceUU.Z,
+					       FloodTestCameraUU.X, FloodTestCameraUU.Y, FloodTestCameraUU.Z);
+					LogLedger(TEXT("found"));
+					PoseOnShore();
+				}),
+			FloodTestDelaySeconds, false);
+
+		// Re-assert the pose as streaming catches up: the camera teleports a
+		// long way underground and the deep footprint meshes from scratch.
+		GetWorldTimerManager().SetTimer(FloodTestPose1TimerHandle, FTimerDelegate::CreateWeakLambda(this, PoseOnShore),
+		                                FloodTestDelaySeconds + 8.f, false);
+
+		// SHOT 1 -- the untouched implicit lake. Nothing has mobilized yet, so
+		// this is worldgen water costing zero storage and zero ticks.
+		GetWorldTimerManager().SetTimer(
+			FloodTestShot1TimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this, LogLedger, LogCameraProbe]()
+				{
+					if (!bFloodTestFound)
+					{
+						return;
+					}
+					LogLedger(TEXT("lake/static"));
+					// Probe at CAPTURE time, when the chunks around the camera
+					// are actually resident. A camera stuck in rock produces a
+					// see-through world rather than an obviously black frame,
+					// so this is the line that tells a good shot from a bad one.
+					LogCameraProbe(TEXT("lake/static"));
+					FScreenshotRequest::RequestScreenshot(TEXT("VoxelFloodLake"), false, true);
+				}),
+			FloodTestDelaySeconds + 24.f, false);
+
+		// THE DIG, with RETRIES. CarveSphere only removes voxels from chunks that
+		// are currently resident, and the outflow has to break out past the
+		// site's ~36 m flood reach -- right at the edge of what is streamed in
+		// underground. Observed removing 341744 voxels on one run and 0 on the
+		// next from byte-identical inputs, so a single attempt is not enough.
+		// Re-arms itself (a plain function-object member, since a lambda cannot
+		// reschedule itself) until something actually gives way.
+		FloodTestCarveRetryDelegate = FTimerDelegate::CreateWeakLambda(this,
+			[this, LogLedger]()
+			{
+				UWorld* CWorld = GetWorld();
+				UVoxelWaterSubsystem* Water = CWorld ? CWorld->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+				if (!Water || !bFloodTestFound)
+				{
+					return;
+				}
+				if (Water->CarveCavernOutflow(FloodTestLakeSurfaceUU) == 0 && FloodTestCarveAttempts < 5)
+				{
+					++FloodTestCarveAttempts;
+					UE_LOG(LogVoxelEarth, Warning,
+					       TEXT("VoxelFloodTest: outflow carve removed nothing (attempt %d/5) -- chunks likely not resident; retrying in 3s."),
+					       FloodTestCarveAttempts);
+					GetWorldTimerManager().SetTimer(FloodTestCarveTimerHandle, FloodTestCarveRetryDelegate, 3.f, false);
+					return;
+				}
+				LogLedger(TEXT("post-dig"));
+			});
+		GetWorldTimerManager().SetTimer(FloodTestCarveTimerHandle, FloodTestCarveRetryDelegate,
+		                                FloodTestDelaySeconds + 28.f, false);
+
+		GetWorldTimerManager().SetTimer(FloodTestPose2TimerHandle, FTimerDelegate::CreateWeakLambda(this, PoseOnShore),
+		                                FloodTestDelaySeconds + 34.f, false);
+
+		// SHOT 2 -- same camera, after the advancing front has converted the
+		// lake brick by brick and the CA has drained it out through the tunnel.
+		GetWorldTimerManager().SetTimer(
+			FloodTestShot2TimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this, LogLedger, LogCameraProbe]()
+				{
+					if (!bFloodTestFound)
+					{
+						return;
+					}
+					LogLedger(TEXT("drained"));
+					LogCameraProbe(TEXT("drained"));
+					FScreenshotRequest::RequestScreenshot(TEXT("VoxelFloodDrain"), false, true);
+				}),
+			FloodTestDelaySeconds + 52.f, false);
+
+		GetWorldTimerManager().SetTimer(FloodTestQuitTimerHandle,
+		                                FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(false); }),
+		                                FloodTestDelaySeconds + 58.f, false);
+	}
+
+	// ==== end C7/C8 underground water verification ==========================
+
 	// ==== end M4 voxel GI verification ======================================
 
 	// M3 wave 1 gate verification (docs/m3-plan.md "two clients dig the same
