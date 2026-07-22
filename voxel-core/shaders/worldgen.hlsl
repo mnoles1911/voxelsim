@@ -833,7 +833,11 @@ static const int64_t kCavernMaxReachSqMm = kCavernMaxReachMm * kCavernMaxReachMm
 static const int64_t kCavernFloodMinMm = 800;
 static const int64_t kCavernFloodSpanMm = 2400;
 static const uint kCavernFloodDryThreshold32 = 1717986918u; // (4 << 32) / 10
-static const int kMaxCavernSegs = 6;
+// Mirrors vxc::kMaxCavernSegs (caverns.h). Shrunk 6 -> 4 alongside the CPU:
+// it is tight == kCavernChildCount, the provable max. Must match exactly --
+// the cap decides which segments survive in ColumnSample, so a wider GPU cap
+// would admit a 5th segment the CPU dropped and diverge the digest.
+static const int kMaxCavernSegs = 4;
 // vxc::CavernSite/CavernColumn's INT32_MIN "dry" sentinel. Spelled as a hex
 // bit pattern because HLSL parses -2147483648 as a negation of a literal that
 // does not fit in int.
