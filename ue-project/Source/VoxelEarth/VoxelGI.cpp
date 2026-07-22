@@ -86,8 +86,19 @@ namespace
 
 	TAutoConsoleVariable<int32> CVarGIMaxChunkRefreshesPerFrame(
 		TEXT("voxel.GI.MaxChunkRefreshesPerFrame"), 4,
-		TEXT("Scene proxies rebuilt per frame to pick up new GI vertex colours. Same order of ")
-		TEXT("magnitude as the streaming system's own applies-per-frame budget."),
+		TEXT("Chunks re-shaded per frame to pick up new GI vertex colours. Same order of ")
+		TEXT("magnitude as the streaming system's own applies-per-frame budget. (Before the ")
+		TEXT("in-place colour update this was a SCENE PROXY REBUILD per chunk -- see ")
+		TEXT("voxel.GI.LegacyProxyRebuild.)"),
+		ECVF_Default);
+
+	TAutoConsoleVariable<int32> CVarGILegacyProxyRebuild(
+		TEXT("voxel.GI.LegacyProxyRebuild"), 0,
+		TEXT("1 = restore the pre-2026-07-22 re-shade path: push new GI vertex colours by calling ")
+		TEXT("MarkRenderStateDirty(), i.e. destroy and rebuild the whole scene proxy, instead of ")
+		TEXT("memcpying the colours into the existing colour vertex buffer. Kept solely so the ")
+		TEXT("before/after cost can be measured from ONE binary in an interleaved A/B ")
+		TEXT("(-VoxelGILegacyRefresh); it is strictly slower for identical output."),
 		ECVF_Default);
 
 	TAutoConsoleVariable<int32> CVarGIEditDirtyRadiusBricks(
@@ -151,7 +162,25 @@ namespace VoxelGI
 	bool IsEnabled() { return CVarGIEnabled.GetValueOnAnyThread() != 0; }
 	float GetStrength() { return FMath::Clamp(CVarGIStrength.GetValueOnAnyThread(), 0.f, 1.f); }
 	float GetAmbientFloor() { return FMath::Clamp(CVarGIAmbientFloor.GetValueOnAnyThread(), 0.f, 1.f); }
-	int32 GetMaxQuadSpanVoxels() { return FMath::Clamp(CVarGIMaxQuadSpanVoxels.GetValueOnAnyThread(), 0, 32); }
+	// -VoxelGIQuadSpan=<n> overrides voxel.GI.MaxQuadSpanVoxels from the COMMAND
+	// LINE, latched on first use. This knob is read at proxy-build time, so an
+	// -ExecCmds cvar only affects chunks meshed AFTER it lands -- chunks already
+	// resident keep the old subdivision until something re-meshes them, which
+	// silently mixes both settings into one measurement. Same class of trap as
+	// the -ExecCmds voxel.GI.Enabled A/B that cost three runs.
+	int32 GetMaxQuadSpanVoxels()
+	{
+		static const int32 CmdLineOverride = []
+		{
+			int32 Value = -1;
+			return FParse::Value(FCommandLine::Get(), TEXT("VoxelGIQuadSpan="), Value) ? FMath::Clamp(Value, 0, 32) : -1;
+		}();
+		if (CmdLineOverride >= 0)
+		{
+			return CmdLineOverride;
+		}
+		return FMath::Clamp(CVarGIMaxQuadSpanVoxels.GetValueOnAnyThread(), 0, 32);
+	}
 	float GetFadeStartUU() { return CVarGIFadeStartUU.GetValueOnAnyThread(); }
 	float GetFadeEndUU() { return CVarGIFadeEndUU.GetValueOnAnyThread(); }
 	int32 GetDebugLevel() { return CVarGIDebug.GetValueOnAnyThread(); }
@@ -448,13 +477,56 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		}
 	}
 
-	// 4) Re-shade chunks whose irradiance changed. MarkRenderStateDirty
-	//    rebuilds the scene proxy, which re-samples the field per vertex --
-	//    the same path a normal remesh takes, so this reuses machinery that is
-	//    already on the streaming system's proven budget rather than inventing
-	//    a second vertex-buffer update route.
+	// 4) Re-shade chunks whose irradiance changed.
+	//
+	//    THIS USED TO BE MarkRenderStateDirty(), i.e. a full scene-proxy
+	//    rebuild per chunk: it regenerated positions, tangents, world-planar
+	//    UVs and indices that had not changed, allocated five fresh RHI
+	//    buffers, and pushed a primitive remove+add through the scene, all to
+	//    alter ONE BYTE per vertex (VertexColor.G).
+	//
+	//    MEASURED WORTH, and it is less than the standing "~1.7 ms, the
+	//    dominant cost" note claimed. Interleaved 4-round A/B from one binary
+	//    (voxel.GI.LegacyProxyRebuild, 2026-07-22, contended box): the rebuild
+	//    costs about 0.15 ms p50 and 0.72 ms p95 over the in-place update, and
+	//    -- the more interesting part -- 15 post-warmup hitches against 3, plus
+	//    a visible downward drift in chunks/s as a run progresses that the
+	//    in-place path does not show. So the proxy churn was mostly a TAIL and
+	//    throughput problem, not a median one. GI's median cost lives
+	//    elsewhere: see the attribution note on
+	//    voxel.GI.MaxQuadSpanVoxels.
+	//
+	//    UpdateGIVertexColors instead recomputes only the colour stream and
+	//    memcpys it into the existing proxy's colour vertex buffer (see
+	//    VoxelChunkComponent.cpp). Geometry is identical across a GI re-shade
+	//    by construction: this queue only ever holds chunks whose IRRADIANCE
+	//    changed -- a chunk whose geometry changed arrives through
+	//    SetChunkQuads, which already rebuilds the proxy for its own reasons.
+	//    MarkRenderStateDirty remains the fallback for the cases the fast path
+	//    declines (no proxy yet), so behaviour is unchanged where it cannot
+	//    apply.
 	const int32 RefreshChunkBudget = FMath::Max(0, CVarGIMaxChunkRefreshesPerFrame.GetValueOnGameThread());
+	// Read from the COMMAND LINE as well as the cvar: an -ExecCmds cvar lands
+	// after streaming has already begun, so an -ExecCmds A/B silently measures
+	// the same state twice (this cost three runs to discover on -VoxelGIOn).
+	static const bool bLegacyRefreshCmdLine = FParse::Param(FCommandLine::Get(), TEXT("VoxelGILegacyRefresh"));
+	const bool bLegacyProxyRebuild = bLegacyRefreshCmdLine || CVarGILegacyProxyRebuild.GetValueOnGameThread() != 0;
+
+	// PER-COMPONENT dedupe, on top of the queue's existing per-BRICK dedupe.
+	//
+	// The queue is keyed by brick, but re-shading is per CHUNK and always
+	// recomputes the chunk's WHOLE colour array. A chunk covers many bricks, so
+	// a single edit -- which dirties a 5x5x5 brick neighbourhood by default
+	// (voxel.GI.EditDirtyRadiusBricks) -- used to pop several bricks that all
+	// resolve to the same component and pay for that chunk's full re-shade once
+	// EACH. The second and subsequent recomputes of a frame read the same field
+	// state and produce the same bytes, so they were pure waste.
+	//
+	// Skipped duplicates deliberately do NOT consume the frame's budget: the
+	// budget exists to bound work done, and a dedupe hit does none.
+	TSet<UVoxelChunkComponent*> RefreshedThisFrame;
 	int32 Refreshed = 0;
+	int32 DedupeSkips = 0;
 	while (Refreshed < RefreshChunkBudget && RefreshQueue.Num() > 0)
 	{
 		const FIntVector Key = RefreshQueue[0];
@@ -464,7 +536,17 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		{
 			if (UVoxelChunkComponent* Comp = Found->Get())
 			{
-				Comp->MarkRenderStateDirty();
+				bool bAlreadyRefreshed = false;
+				RefreshedThisFrame.Add(Comp, &bAlreadyRefreshed);
+				if (bAlreadyRefreshed)
+				{
+					++DedupeSkips;
+					continue;
+				}
+				if (bLegacyProxyRebuild || !Comp->UpdateGIVertexColors())
+				{
+					Comp->MarkRenderStateDirty();
+				}
 				++Refreshed;
 			}
 			else
@@ -533,10 +615,12 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 	{
 		LastStatSeconds = Now;
 		UE_LOG(LogVoxelGI, Log,
-		       TEXT("GI: bricks=%d (%.1f MB) pendingVox=%d dirty=%d refresh=%d | solved %d bricks/%d cells in %.2fms, tick %.2fms"),
+		       TEXT("GI: bricks=%d (%.1f MB) pendingVox=%d dirty=%d refresh=%d | solved %d bricks/%d cells in %.2fms, ")
+		       TEXT("reshaded %d chunks (%d dupes skipped), tick %.2fms"),
 		       Field->NumBricks(), double(Field->EstimatedBytes()) / (1024.0 * 1024.0),
 		       PendingVoxelize.Num(), DirtyQueue.Num(), RefreshQueue.Num(),
-		       ToSolve.Num(), CellsSolved, SolveMs, (FPlatformTime::Seconds() - TickStart) * 1000.0);
+		       ToSolve.Num(), CellsSolved, SolveMs, Refreshed, DedupeSkips,
+		       (FPlatformTime::Seconds() - TickStart) * 1000.0);
 	}
 }
 
