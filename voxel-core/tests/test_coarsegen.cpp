@@ -1,0 +1,333 @@
+// Coarse generation path tests (GeneratedWorld::coarseColumns /
+// makeCoarseBrick / coarseSurfaceBrickRange — generator.h): the outer-ring
+// LOD path that generates a level-L brick at its own resolution instead of
+// materializing and downsampling its 8^L level-0 descendants.
+//
+// Covered here:
+//   - level-0 identity: the coarse path at level 0 is bit-identical to the
+//     fine path (columns, bricks, surface range) — one rule, provably
+//     degenerating to the existing generator;
+//   - pointwise consistency: every coarse cell equals a direct amplifier
+//     query at its representative level-0 voxel, including across brick
+//     seams (no per-brick state, so adjacent bricks can never contradict);
+//   - surface-range formula against Amplifier::stratigraphyAt;
+//   - a NEW pinned golden for levels 1..4 (this path has its own goldens;
+//     it never feeds the fine mip chain, whose mips_chain golden is pinned
+//     unchanged in test_mips.cpp);
+//   - seed sensitivity;
+//   - fidelity vs the TRUE mip (recursive downsampleBricks over full-res
+//     generation): measured occupancy/material mismatch pinned as ceilings,
+//     so the approximation can never silently degrade;
+//   - cavern survival: a real cavern room's void survives coarsening at the
+//     levels whose cells are smaller than the room.
+
+#include <cinttypes>
+#include <unordered_map>
+
+#include "voxelcore/generator.h"
+#include "voxelcore/mips.h"
+#include "vxctest.h"
+
+using namespace vxc;
+
+namespace {
+constexpr uint64_t kSeed = 20260719;
+constexpr int B = 8;
+
+// True-mip reference: recursive downsample over full-resolution generation,
+// with a level-0 source that (like the UE worker job) always materializes —
+// nullptr never propagates, so all-air groups are still voted on.
+struct TrueMip {
+    const GeneratedWorld<B>& gen;
+    std::unordered_map<BrickKey, Brick<B>, BrickKeyHash> l0;
+    std::unordered_map<MipKey, Brick<B>, MipKeyHash> mips;
+
+    explicit TrueMip(const GeneratedWorld<B>& g) : gen(g) {}
+
+    const Brick<B>& brick(int32_t level, const BrickKey& key) {
+        if (level <= 0) {
+            auto it = l0.find(key);
+            if (it != l0.end()) return it->second;
+            return l0.emplace(key, gen.makeBrick(key)).first->second;
+        }
+        const MipKey mk{level, key};
+        auto it = mips.find(mk);
+        if (it != mips.end()) return it->second;
+        const Brick<B>* children[8] = {};
+        for (int cz = 0; cz < 2; ++cz)
+            for (int cy = 0; cy < 2; ++cy)
+                for (int cx = 0; cx < 2; ++cx)
+                    children[cx + 2 * cy + 4 * cz] = &brick(
+                        level - 1, BrickKey{key.x * 2 + cx, key.y * 2 + cy, key.z * 2 + cz});
+        return mips.emplace(mk, downsampleBricks<B>(children, 4)).first->second;
+    }
+};
+
+uint64_t coarseRegionDigest(uint64_t seed) {
+    SyntheticTileSampler tiles(seed);
+    Amplifier amp(seed, tiles);
+    GeneratedWorld<B> gen(amp);
+    Digest d;
+    for (int32_t level = 1; level <= 4; ++level)
+        for (int32_t by = -1; by <= 1; ++by)
+            for (int32_t bx = -1; bx <= 1; ++bx) {
+                const auto grid = gen.coarseColumns(level, bx, by);
+                int32_t bzMin = 0, bzMax = 0;
+                gen.coarseSurfaceBrickRange(level, grid, bzMin, bzMax);
+                d.u32(static_cast<uint32_t>(level));
+                d.u32(static_cast<uint32_t>(bzMin));
+                d.u32(static_cast<uint32_t>(bzMax));
+                for (int32_t bz = bzMin; bz <= bzMax; ++bz)
+                    gen.makeCoarseBrick(level, BrickKey{bx, by, bz}, grid).digest(d);
+            }
+    return d.h;
+}
+
+} // namespace
+
+VXC_TEST(coarsegen_level0_identity) {
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    GeneratedWorld<B> gen(amp);
+
+    for (int32_t by = -1; by <= 1; ++by)
+        for (int32_t bx = -1; bx <= 1; ++bx) {
+            const auto fine = gen.columns(bx, by);
+            const auto coarse = gen.coarseColumns(0, bx, by);
+            for (int i = 0; i < B * B; ++i) {
+                CHECK_EQ(fine.cols[i].surfaceMm, coarse.cols[i].surfaceMm);
+                CHECK_EQ(fine.cols[i].topsoilMm, coarse.cols[i].topsoilMm);
+                CHECK_EQ(fine.cols[i].subsoilMm, coarse.cols[i].subsoilMm);
+                CHECK_EQ(fine.cols[i].bedrockDepthMm, coarse.cols[i].bedrockDepthMm);
+                CHECK_EQ(fine.cols[i].surfaceMat, coarse.cols[i].surfaceMat);
+            }
+
+            int32_t fMin = 0, fMax = 0, cMin = 0, cMax = 0;
+            gen.surfaceBrickRange(fine, fMin, fMax);
+            gen.coarseSurfaceBrickRange(0, coarse, cMin, cMax);
+            CHECK_EQ(fMin, cMin);
+            CHECK_EQ(fMax, cMax);
+
+            for (int32_t bz = fMin - 1; bz <= fMax + 1; ++bz) {
+                const BrickKey key{bx, by, bz};
+                CHECK(gen.makeBrick(key, fine) == gen.makeCoarseBrick(0, key, coarse));
+            }
+        }
+}
+
+VXC_TEST(coarsegen_matches_pointwise_queries) {
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    GeneratedWorld<B> gen(amp);
+
+    // Two xy-adjacent footprints at each level: cells are a pure function of
+    // the GLOBAL coarse cell index, so the shared seam column x=0 of (1,0)
+    // must continue x=7 of (0,0) with no per-brick offset error.
+    for (int32_t level = 1; level <= 4; ++level)
+        for (int32_t bx = 0; bx <= 1; ++bx) {
+            const auto grid = gen.coarseColumns(level, bx, 0);
+            int32_t bzMin = 0, bzMax = 0;
+            gen.coarseSurfaceBrickRange(level, grid, bzMin, bzMax);
+            const BrickKey key{bx, 0, bzMin};
+            const Brick<B> brick = gen.makeCoarseBrick(level, key, grid);
+            for (int z = 0; z < B; ++z)
+                for (int y = 0; y < B; ++y)
+                    for (int x = 0; x < B; ++x) {
+                        const int64_t vx =
+                            GeneratedWorld<B>::coarseRep(int64_t(bx) * B + x, level);
+                        const int64_t vy = GeneratedWorld<B>::coarseRep(int64_t(y), level);
+                        const int64_t vz =
+                            GeneratedWorld<B>::coarseRep(int64_t(bzMin) * B + z, level);
+                        CHECK_EQ(brick.get(x, y, z), amp.materialAt(vx, vy, vz));
+                    }
+        }
+}
+
+VXC_TEST(coarsegen_surface_range_formula) {
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    GeneratedWorld<B> gen(amp);
+
+    // For every column: the topmost solid coarse cell under the
+    // representative-sample rule sits inside [bzMin, bzMax], the cell above
+    // it is air. Checked against stratigraphyAt (surface rule without the
+    // cave carve, which coarseSurfaceBrickRange — like surfaceBrickRange —
+    // deliberately ignores).
+    for (int32_t level = 1; level <= 4; ++level) {
+        const int64_t s = int64_t(1) << level;
+        const auto grid = gen.coarseColumns(level, 0, 0);
+        int32_t bzMin = 0, bzMax = 0;
+        gen.coarseSurfaceBrickRange(level, grid, bzMin, bzMax);
+        CHECK(bzMin <= bzMax);
+        for (int i = 0; i < B * B; ++i) {
+            const ColumnSample& col = grid.cols[i];
+            const int64_t top0 = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
+            const int64_t top = floorDiv(top0 - s / 2, s);
+            CHECK(Amplifier::stratigraphyAt(col, GeneratedWorld<B>::coarseRep(top, level)) !=
+                  MAT_AIR);
+            CHECK_EQ(Amplifier::stratigraphyAt(
+                         col, GeneratedWorld<B>::coarseRep(top + 1, level)),
+                     MAT_AIR);
+            CHECK(top >= int64_t(bzMin) * B);
+            CHECK(top < (int64_t(bzMax) + 1) * B);
+        }
+    }
+}
+
+VXC_TEST(coarsegen_golden_digest) {
+    // NEW golden for the coarse path (kWorldGenVersion 5). The fine-path
+    // goldens (amplifier_columns, mips_chain, ...) are pinned elsewhere and
+    // must not move; this one pins the coarse rule itself: representative
+    // centre sample at c*2^L + 2^(L-1), materialAt semantics, levels 1..4
+    // over the 3x3 footprints around the origin.
+    const uint64_t d = coarseRegionDigest(kSeed);
+    std::printf("    [coarsegen] golden digest 0x%016" PRIX64 "\n", d);
+    CHECK_EQ(d, 0x85B3E79EF8D01AFCull);
+}
+
+VXC_TEST(coarsegen_seed_sensitivity) {
+    CHECK(coarseRegionDigest(kSeed) != coarseRegionDigest(kSeed + 1));
+}
+
+VXC_TEST(coarsegen_fidelity_vs_true_mip) {
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    GeneratedWorld<B> gen(amp);
+    TrueMip mip(gen);
+
+    // Surface-shell bricks at footprint (0,0) per level (the deep interior
+    // and the open air are exact by uniformity; the shell is where the
+    // approximation lives). Mismatch is pinned as a permille CEILING so the
+    // coarse rule can never silently drift further from the true mip;
+    // measured actuals are printed for the record.
+    //
+    // Measured (seed 20260719): occupancy mismatch 38/19/11/10 permille,
+    // material-given-both-solid mismatch 75/61/21/35 permille at levels
+    // 1/2/3/4. Ceilings sit ~1.5x above the measured values.
+    const int64_t occCeilPermille[5] = {0, 60, 40, 30, 30};
+    const int64_t matCeilPermille[5] = {0, 110, 90, 50, 60};
+
+    for (int32_t level = 1; level <= 4; ++level) {
+        const auto grid = gen.coarseColumns(level, 0, 0);
+        int32_t bzMin = 0, bzMax = 0;
+        gen.coarseSurfaceBrickRange(level, grid, bzMin, bzMax);
+
+        int64_t cells = 0, occMismatch = 0, bothSolid = 0, matMismatch = 0;
+        for (int32_t bz = bzMin; bz <= bzMax; ++bz) {
+            const BrickKey key{0, 0, bz};
+            const Brick<B> coarse = gen.makeCoarseBrick(level, key, grid);
+            const Brick<B>& truth = mip.brick(level, key);
+            for (int z = 0; z < B; ++z)
+                for (int y = 0; y < B; ++y)
+                    for (int x = 0; x < B; ++x) {
+                        const MaterialId a = coarse.get(x, y, z);
+                        const MaterialId b = truth.get(x, y, z);
+                        ++cells;
+                        if ((a == MAT_AIR) != (b == MAT_AIR)) {
+                            ++occMismatch;
+                        } else if (a != MAT_AIR) {
+                            ++bothSolid;
+                            if (a != b) ++matMismatch;
+                        }
+                    }
+        }
+        const int64_t occPm = cells > 0 ? occMismatch * 1000 / cells : 0;
+        const int64_t matPm = bothSolid > 0 ? matMismatch * 1000 / bothSolid : 0;
+        std::printf("    [coarsegen] L%d vs true mip: cells %" PRId64 ", occupancy mismatch %" PRId64
+                    "/1000, material mismatch (both solid) %" PRId64 "/1000\n",
+                    level, cells, occPm, matPm);
+        CHECK(cells > 0);
+        CHECK(occPm <= occCeilPermille[level]);
+        CHECK(matPm <= matCeilPermille[level]);
+    }
+}
+
+VXC_TEST(coarsegen_cavern_survival) {
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    GeneratedWorld<B> gen(amp);
+
+    // Fine cavern void height at a column: air cells strictly below the
+    // surface shell (stratigraphy solid, materialAt air), scanned down to
+    // bedrock depth.
+    const auto fineVoidAt = [&](int64_t vx, int64_t vy, int64_t& lo, int64_t& hi) -> int64_t {
+        const ColumnSample col = amp.column(vx, vy);
+        const int64_t topVz = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
+        int64_t n = 0;
+        lo = 0;
+        hi = 0;
+        for (int64_t vz = topVz - 2200; vz < topVz; ++vz) {
+            if (Amplifier::stratigraphyAt(col, vz) != MAT_AIR &&
+                Amplifier::materialAt(col, vz) == MAT_AIR) {
+                if (n == 0) lo = vz;
+                hi = vz;
+                ++n;
+            }
+        }
+        return n;
+    };
+
+    // Phase 1: wide deterministic scan (stride 128 voxels = 12.8 m, over
+    // +/-1.6 km) for any cavern-reached column. Room reach discs are tens
+    // of metres wide, so the stride cannot step over one.
+    int64_t hitVx = 0, hitVy = 0;
+    bool found = false;
+    for (int64_t vy = -16000; vy <= 16000 && !found; vy += 128)
+        for (int64_t vx = -16000; vx <= 16000 && !found; vx += 128) {
+            if (amp.column(vx, vy).cavern.count > 0) {
+                hitVx = vx;
+                hitVy = vy;
+                found = true;
+            }
+        }
+    CHECK(found);
+    if (!found) return;
+
+    // Phase 2: refine to the max-void column nearby — an anchor near the
+    // room's centre, so every level's representative column for the cell
+    // containing it (lateral offset < s voxels) still falls inside the room.
+    int64_t foundVx = hitVx, foundVy = hitVy, fineVoid = 0, voidLo = 0, voidHi = 0;
+    for (int64_t vy = hitVy - 512; vy <= hitVy + 512; vy += 32)
+        for (int64_t vx = hitVx - 512; vx <= hitVx + 512; vx += 32) {
+            int64_t lo = 0, hi = 0;
+            const int64_t n = fineVoidAt(vx, vy, lo, hi);
+            if (n > fineVoid) {
+                fineVoid = n;
+                voidLo = lo;
+                voidHi = hi;
+                foundVx = vx;
+                foundVy = vy;
+            }
+        }
+    std::printf("    [coarsegen] cavern anchor voxel (%" PRId64 ", %" PRId64 "): %" PRId64
+                " fine void cells in [%" PRId64 ", %" PRId64 "]\n",
+                foundVx, foundVy, fineVoid, voidLo, voidHi);
+    CHECK(fineVoid > 0);
+    if (fineVoid == 0) return;
+
+    // Each level queries its own representative column for the cell
+    // containing the anchor.
+    for (int32_t level = 1; level <= 4; ++level) {
+        const int64_t s = int64_t(1) << level;
+        if (s * kVoxelSizeMm >= (voidHi - voidLo + 1) * kVoxelSizeMm) continue; // cell taller than room
+        const int64_t cx = floorDiv(foundVx, s);
+        const int64_t cy = floorDiv(foundVy, s);
+        const ColumnSample rcol = amp.column(GeneratedWorld<B>::coarseRep(cx, level),
+                                             GeneratedWorld<B>::coarseRep(cy, level));
+        int64_t coarseVoid = 0;
+        for (int64_t cz = floorDiv(voidLo - s, s); cz <= floorDiv(voidHi + s, s); ++cz) {
+            const int64_t vz = GeneratedWorld<B>::coarseRep(cz, level);
+            if (Amplifier::stratigraphyAt(rcol, vz) != MAT_AIR &&
+                Amplifier::materialAt(rcol, vz) == MAT_AIR)
+                ++coarseVoid;
+        }
+        std::printf("    [coarsegen] L%d: %" PRId64 " coarse void cells (cell %" PRId64
+                    " fine voxels)\n",
+                    level, coarseVoid, s);
+        // Proportional survival: the void's coarse-cell count is at least
+        // half of fineVoid/s (nearest representative column can sit near
+        // the room wall, so demand proportionality, not equality).
+        CHECK(coarseVoid >= fineVoid / s / 2);
+        CHECK(coarseVoid > 0);
+    }
+}
