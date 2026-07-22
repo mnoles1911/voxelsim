@@ -378,6 +378,13 @@ void AVoxelClipmapActor::EnsureCaveRig()
 		CaveLamp->SetIntensity(0.f);
 	}
 	CaveLamp->SetAttenuationRadius(CaveLampRadiusUU);
+	// A finite source radius, not a mathematical point. -VoxelCaveTest can
+	// park the camera 0.4 m off a wall (it stands back against the wall
+	// OPPOSITE the longest open run, which in a narrow pocket is very close
+	// indeed), and a point light's 1/d^2 at 0.4 m blew 9.2% of that frame to
+	// pure white. Treating the lamp as a 40 cm emitter bounds the near-field
+	// term instead of letting it run to infinity.
+	CaveLamp->SetSourceRadius(40.f);
 	// Warm, like every lamp a person actually carries underground, and it
 	// separates the lit near field from the neutral-grey ambient behind it.
 	CaveLamp->SetLightColor(FLinearColor(1.0f, 0.86f, 0.68f));

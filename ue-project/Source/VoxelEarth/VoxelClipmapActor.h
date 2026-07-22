@@ -215,11 +215,13 @@ private:
 	float CaveExposureEV100 = 10.f;  // -VoxelCaveEV=
 	// Measured against that same fixed stop: 6000 lm and 2500 lm clip 15% and
 	// 6.5% of the frame respectively, 800 lm lifts the frame mean from 86 to
-	// 162 (flat, flash-lit), 250 lm lands at 135 with 0.01% clipped. 300 is
+	// 162 (flat, flash-lit), 250 lm lands at 135 with 0.01% clipped. 150 is
 	// the low end of that usable band, chosen so the lamp SHAPES the near
 	// field rather than replacing the falloff into darkness that makes the
-	// image read as a cave at all.
-	float CaveLampLumens = 300.f;    // -VoxelCaveLampLumens= (0 disables)
+	// image read as a cave at all. With voxel GI on (-VoxelGIOn), whose AO
+	// term buys back a lot of headroom, 400 lm is the better-looking number
+	// and is what the hero capture uses.
+	float CaveLampLumens = 150.f;    // -VoxelCaveLampLumens= (0 disables)
 	float CaveLampRadiusUU = 6000.f; // -VoxelCaveLampRadiusM= (x100)
 
 	// -VoxelVeilExtentM=<metres>: shrinks the veil box so it can be
