@@ -344,4 +344,29 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInterface> ChunkMaterial;
+
+	// --- -VoxelCavernShot: unattended cavern-vista capture --------------------
+	//
+	// See "Cavern vista capture" in VoxelWorldSubsystem.cpp for what this does
+	// and, more to the point, why the framing is computed the way it is: two
+	// previous attempts at an underground screenshot were defeated not by the
+	// streamer but by parking the camera somewhere useless (on a sunlit
+	// hillside; 0.9 m from a wall). This one measures the room it is standing
+	// in and reports the measurement alongside the image, so a bad frame is
+	// visible in the log rather than only in the PNG.
+	void TickCavernShot(float DeltaSeconds);
+	bool FindCavernPose(FVector& OutCameraUU, FRotator& OutLookRot, FString& OutReport) const;
+	void PoseCavernCamera() const;
+
+	double CavernShotElapsed = -1.0; // < 0 means -VoxelCavernShot was not passed
+	double CavernShotSettleSeconds = 45.0;
+	bool bCavernShotPosed = false;
+	bool bCavernShotCaptured = false;
+	bool bCavernShotFailed = false;
+	FVector CavernShotCameraUU = FVector::ZeroVector;
+	FRotator CavernShotLookRot = FRotator::ZeroRotator;
+	// Distance from the camera to the far wall, as MEASURED by FindCavernPose
+	// against the voxel world. The residency probe at capture reports how much
+	// of it was actually meshed, which is the whole claim under test.
+	double CavernShotSightlineUU = 0.0;
 };
