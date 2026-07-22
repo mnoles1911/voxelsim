@@ -34,6 +34,19 @@ git clone https://github.com/mnoles1911/voxelsim /workspace/voxelsim || git -C /
 Takes ~20–40 min, mostly downloading. It is **restartable** — if the browser
 terminal drops, paste the exact same line again and it skips what finished.
 
+> **If the clone asks for a username/password**, the repo is private and the
+> pod has no credentials. Use a GitHub personal access token with `repo`
+> scope for that one clone (the pod is destroyed afterwards, but revoke it
+> anyway):
+>
+> ```sh
+> git clone https://<TOKEN>@github.com/mnoles1911/voxelsim /workspace/voxelsim
+> ```
+>
+> then re-paste command 1, which will find the clone and continue. Driving
+> the pod over `ssh` instead (see below) avoids this entirely if you forward
+> an agent.
+
 It does, in order, and says so as it goes:
 
 1. **Preflight** — GPU present, ≥ 60 GB free. Fails immediately if not.
