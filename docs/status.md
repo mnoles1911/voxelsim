@@ -5162,3 +5162,177 @@ PATH ahead of `cl.exe`).
    equivalent, 8192 is measurably worse (3.34% of wall vs 2.57%), unbounded
    worst. 2048 was kept for starvation margin. No re-tune needed unless the
    drain rate changes a lot.
+
+### R2-R4 ring starvation fix (2026-07-21, worktree agent)
+
+PR #64 ranked this its follow-up #1: "R2/R3/R4 load ZERO chunks all run, with
+16.2k queued", attributed to dispatch being sorted by 3D distance while ring
+membership is XY, so R0's deep columns outrank every R1+ surface chunk forever.
+**Measured first, before changing anything, and the inference is half right.**
+There are TWO independent radial-global bounds starving the outer rings, and
+underneath both there is a third problem that no scheduling change can fix.
+
+**Method.** `-VoxelPerfRun=60`, seed 20260719, `Saved/VoxelWorlds` cleared
+before every run. Two new **command-line** switches (not cvars -- `-ExecCmds`
+lands after streaming has begun and silently measures the same state twice; the
+lesson `-VoxelNoUnderground` and `-VoxelPendingJobCap` already exist for):
+`-VoxelRingQuota=0|1` and `-VoxelRingFloors=a,b,c,d,e`. **One binary, both
+sides**, M1 runs interleaved A/B/A/B after a discarded warm-up. `voxelcore.lib`
+rebuilt in this worktree from this commit's sources.
+
+Instrumentation added first: the existing "Voxel rings" line reports per-level
+RESIDENCY and QUEUE DEPTH only, which cannot tell a ring starved of workers from
+a ring that is served but meshes entirely to buried rock -- both read `loaded=0
+pending=4000`. New **"Voxel ring dispatch"** line: per level, jobs dispatched
+(5 s window + cumulative), cumulative component loads, cumulative zero-quad
+results.
+
+**Measured BEFORE profile** (60 s flight, `-nullrhi`, per-ring cumulative):
+
+| | R0 | R1 | R2 | R3 | R4 |
+|---|---|---|---|---|---|
+| cap=2048 (default) dispatched | 137,526 | 44,457 | 3,776 | **0** | **0** |
+| ...components loaded | 31,589 | 16,335 | 1,247 | **0** | **0** |
+| ...steady pending | ~180 | ~410 | ~1,150 | **0** | **0** |
+| cap=0 (pre-#64) dispatched | 135,030 | 44,023 | 4,924 | **0** | **0** |
+| ...steady pending | ~180 | ~450 | ~3,700 | **5,560** | **5,185** |
+
+So: **R2 was never zero** -- it loaded ~1,250 chunks a run. And the mechanism
+differs by cap setting:
+
+* **cap=0**: R3/R4 are queued (10.7k of them, reproducing #64's 16.2k) and
+  dispatched zero. This IS the 3D-vs-XY story: strict global nearest-first, and
+  R0's 38.4 m deep column is nearer in 3D than any R1+ surface chunk.
+* **cap=2048 (the shipping default)**: R3/R4 pending is **0** -- they are not
+  starved at dispatch, they are **never admitted**. The single global admission
+  cutoff settles at **~246 m** and R3's annulus starts at **256 m**. A cutoff is
+  a radius; a radius applied to concentric annuli excludes the outermost ones
+  completely. This is a PR #64 regression, not the pre-existing bug, and it was
+  not in the original diagnosis.
+
+Their entry scans do run (`scans R3=4 R4=1` per 5 s window) -- the candidates
+are enumerated and then rejected, which is why the queue looked empty.
+
+**Fix: per-ring queues, not a different comparator.** The flat `PendingJobKeys`
+becomes one queue per level, each storing its chunk's cached 3D distance. Every
+bound the flat queue forced to be global is now per ring: a **share of the
+admission cap** (0.30/0.20/0.20/0.15/0.15), a **cutoff distance each**, and a
+**floor of in-flight worker slots**. Above the floors dispatch is still strictly
+nearest-first across the five queue heads, which reproduces the old flat
+ordering exactly, tie-break included.
+
+**The comparator was left alone, deliberately.** Ring-major ordering was tried
+in an earlier wave and measured worse (R3/R4 at 0 through a 90 s run, because
+the far larger inner rings never drain) -- the note is still in
+`SortPendingQueues`. 3D-distance-primary is a perfectly good *intra-ring*
+priority; the modelling error was never the metric, it was applying ONE global
+ordering, and one global cap, across rings whose membership is defined on a
+different metric and whose chunk counts differ by orders of magnitude. So the
+comparator keeps its semantics and loses its scope: nearest-first *within a
+ring*, explicit floors *between* rings.
+
+**The thing underneath: coarse-ring jobs are unaffordable.** Once R3/R4 actually
+dispatch, their cost is visible for the first time, and it is the real reason
+the cascade has never rendered:
+
+| | R0 | R1 | R2 | R3 | R4 |
+|---|---|---|---|---|---|
+| worker ms p50 | 0.85 | 2.0 | 2.2-18 | **150-292** | **2,850-5,241** |
+
+A level-4 chunk covers 16x the linear extent of a level-0 one, so ~4096x the
+volume, and the cost tracks that almost exactly -- the mip build has no cheap
+coarse path. **First floor attempt {0,2,3,4,4} was catastrophic**: it reserved
+13 of 24 slots, and since the task graph has ~12 real background threads the
+multi-second R4 jobs occupied the pool itself. Whole-run throughput fell from
+49,179 chunks to **558** (819 -> 9.3 chunks/s), R0 residency from ~3,000 to
+~10, and the 512 MB mip cache thrashed at 3.2M evictions/5 s. Floors were swept
+at {0,1,1,1,1}, {0,1,1,1,0} and {0,2,2,1,0} -- all three within noise of each
+other (704 / 694 / 691 chunks/s), because the binding constraint is job
+DURATION, not slot count. **{0,1,1,1,1} kept** (costs at most 4 of 24 slots).
+
+**Per-ring residency, before/after** (60 s flight, `-nullrhi`, same binary):
+
+| | R0 | R1 | R2 | R3 | R4 |
+|---|---|---|---|---|---|
+| before, loaded/run | 31,589 | 16,335 | 1,247 | **0** | **0** |
+| after, loaded/run | 30,377 | 11,320 | 543 | **23** | 0 (13 dispatched) |
+| before, resident | ~3,020 | ~2,051 | ~413 | **0** | **0** |
+| after, resident | ~2,998 | ~1,845 | ~137 | **8** | 0 |
+
+R3 goes 0 -> non-zero and stays there; R4 dispatches but at ~5 s/chunk cannot
+finish one inside a 60 s flight. Whole-run throughput costs 14% (49,179 ->
+42,271 chunks) -- that is the price of the coarse rings existing at all, paid by
+R1/R2 residency, and it is a real trade, not free.
+
+**A stationary anchor was never starved.** Held still for 90 s the rings
+populate either way (before: R0 1515 / R1 1712 / R2 1967 / R3 504 / R4 **0**;
+after: 1515 / 1568 / 1704 / 435 / **3**). The starvation is a MOVING-anchor
+phenomenon: in flight R0 continuously re-produces candidates and monopolises
+both the cap and the pool. Only R4 is starved in both -- because it is
+cost-bound, not schedule-bound.
+
+**Vista.** `-VoxelVistaShot[=<metres above spawn>] -VoxelVistaPitch=<deg>`
+added beside the existing screenshot switches: the default
+`-VoxelScreenshotAfter` framing is -40 deg from spawn height and fills the frame
+with R0/R1 terrain a few tens of metres away, which is why "the cascade renders"
+had never actually been looked at. Shots at 250 m / -18 deg, 90 s settle:
+`shot_vista_before.png` / `shot_vista_after.png` (plus `shot_ringsbefore.png` /
+`shot_ringsafter.png` with `-VoxelDebugRings`). Both render a genuine
+horizon-to-horizon vista and are near-identical.
+
+**That is itself the finding**: the long-distance vista is the **clipmap**, not
+the voxel ring cascade. `RingPresets` tops out at R4 = 512-1024 m, so the voxel
+cascade covers **1 km**, and everything beyond it in a 50 km vista is
+`AVoxelClipmapActor`. The M2 gate's "50 km+ vista" was passing on the clipmap
+all along -- not on a technicality exactly, but not on the ring cascade either.
+(A first attempt framed the camera at an ABSOLUTE 250 m and produced a frame of
+pure fog: terrain at the default spawn sits at ~1,200 m world Z, so the camera
+was inside rock. The switch is relative to spawn.)
+
+**M1 gate, real RHI** (min-spec proxy `sg.*Quality 0` + `r.ScreenPercentage
+100`, 1080p windowed, warm-up discarded, interleaved A/B/A/B):
+
+| | A1 (quota off) | B1 (on) | A2 (off) | B2 (on) |
+|---|---|---|---|---|
+| p95 (full run) | 4.88 | **4.76** | 4.85 | **4.78** |
+| post-warmup p95 | 4.94 | **4.81** | 4.91 | **4.82** |
+| post-warmup hitches (>33.3 ms) | 0 | 0 | 0 | 0 |
+| frames over the 16.6 ms bar | 7 | 7 | 6 | 9 |
+| chunks/s | 311.0 | 306.6 | 312.2 | 305.7 |
+| subsystem tick, % of wall | 4.32 | **3.74** | 4.27 | **3.74** |
+
+**Gate holds** (4.76-4.88 ms against the 16.6 ms bar, vs the 4.60-4.70 ms band
+this wave inherited; frames over 16.6 ms 6-9 against ~6). The quota side is
+slightly ahead on p95 and clearly ahead on tick cost, and ~2% behind on
+chunks/s.
+
+**PR #64's admission-cap wins are intact** (`-nullrhi`, steady state): tracked
+records **19,094** (was 20,335 with the cap and 34,536 uncapped), pending job
+queue **1,394** (1,290 / 14,951), worst exit scan **0.94 ms** (0.94 / 1.92).
+Nothing regressed; the cap is still doing its job, just five times over instead
+of once.
+
+**Contents unchanged, verified not asserted.** A/B of `-VoxelHeadlessDigTest=15
+-VoxelDumpDigestAfter=25 -VoxelNoLoad` (seed 20260719) with `-VoxelRingQuota=0`
+and `=1`: both carve **2,178,385** voxels, both report
+**`editedDigest=0xFB62844A74CB9121`** (server and client), both write an
+identical **8,039-entry / 4,135,443-byte** `.vxlog` -- byte-for-byte the same
+values PR #64 recorded.
+
+**Follow-ups, in priority order.**
+1. **R4/R3 mip build cost is now the whole ballgame** (5,241 ms and 292 ms p50
+   per chunk). No scheduling change can make a 1 km ring of 5-second chunks
+   converge. The cascade needs a coarse generation path that samples the
+   amplifier at the mip's own resolution instead of building and downsampling
+   ~4096x the volume. This is the single blocking item for M2's ring cascade.
+2. **Mip cache thrash**: 512 MB cap, 1.4-3.2M evictions/5 s once R3/R4 run.
+   Sized for R0-R2; useless at the coarse levels it exists to amortize.
+3. **Pre-dispatch "fully buried and unedited" test** -- still 72-77% of R0
+   output meshes to zero quads, and 63% of R4's. Not attempted here (it would
+   have muddied the scheduling A/B) but it is free throughput.
+4. **Restate the M2 gate honestly**: the ring cascade delivers 1 km, the clipmap
+   delivers the rest. Either widen `RingPresets` (blocked on #1) or write the
+   gate as a clipmap deliverable.
+5. Floors and cap shares are constants tuned on a 12-core box; they should scale
+   with `NumberOfCoresIncludingHyperthreads`.
+
