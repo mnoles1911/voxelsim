@@ -321,6 +321,7 @@
 #include <functional>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "voxelcore/brick.h"
@@ -730,6 +731,206 @@ private:
     std::set<BrickKey, BrickKeyLess> active_;
     uint64_t totalVolume_ = 0;
     size_t lastSteppedBrickCount_ = 0;
+};
+
+// ===========================================================================
+// WaterMobilizer — C8 "mobilize-on-approach" (docs/cavern-design.md §5.2)
+// ===========================================================================
+//
+// WHAT IT IS. Underground cavern lakes are generated STATIC AND IMPLICIT: a
+// per-column `floodZMm` (voxelcore/caverns.h, worldgen-owned, deterministic,
+// ZERO storage) says a cave-air voxel below that level "is water". Nothing is
+// stored, nothing ticks, an untouched lake costs exactly nothing. The moment
+// gameplay reaches one, the water it reaches must become REAL — otherwise a
+// player digs into a lake and gets a frozen wall of water.
+//
+// This class is that conversion, and nothing else. It is terrain-free and
+// worldgen-free by the same doctrine WaterCA follows: the implicit field
+// arrives as a caller-supplied `ImplicitFn`, so voxel-core's water layer never
+// includes caverns.h and the whole thing is testable against a synthetic lake.
+//
+// ---------------------------------------------------------------------------
+// THE OWNERSHIP PARTITION (this is the whole correctness argument — read it)
+// ---------------------------------------------------------------------------
+// Every water cell in the world is owned by EXACTLY ONE of two accountants:
+//
+//   * the IMPLICIT FIELD, for cells in a brick that has not mobilized, or
+//   * the CA, for cells in a brick that has.
+//
+// Mobilization is per-BRICK and one-way, recorded in `mobilizedBricks()`. The
+// total water in any bounded region is therefore always
+//
+//       implicitVolume(region) + ca.totalVolume()      [restricted to region]
+//
+// and mobilizing a brick moves units from the left term to the right term in
+// the same call. That is exact if and only if the CA never holds fill in a
+// cell the implicit field still owns — because a cell is one byte and cannot
+// carry both accountants' water at once. Note carefully that this is NOT a
+// conservation bug waiting to happen but a DOUBLE-OCCUPANCY one: if CA water
+// ever seeps into a still-implicit cell, then at mobilization time we would
+// have to either drop the CA's units or refuse the implicit field's, and
+// either way water is created or destroyed. There is no byte left to store
+// the difference in.
+//
+// SO WE MAKE IT STRUCTURALLY IMPOSSIBLE. `makeSolidFn()` wraps the caller's
+// terrain solidity query so that a still-implicit water cell reads as SOLID to
+// the CA. Unmobilized lake water is a WALL. The CA physically cannot write
+// fill into a cell the implicit field owns, so the partition holds by
+// construction rather than by discipline, timing, or call ordering — and
+// `mobilizeBrick` can then credit the FULL implicit amount into each cell
+// knowing it was empty. `shortfallVolume()` is the audit of that claim and
+// must be 0 forever (the tests assert it every tick).
+//
+// This is also what makes the per-tick BUDGET safe. Deferring a brick's
+// mobilization can never leak water, because a deferred brick is still a wall.
+// Water that has not been mobilized yet simply has not been given permission
+// to move; it is frozen for a few ticks, never duplicated and never lost.
+// Frozen is a visual lag measured in tenths of a second; duplicated is a
+// broken world.
+//
+// ---------------------------------------------------------------------------
+// HOW THE FRONT ADVANCES
+// ---------------------------------------------------------------------------
+// Two seeds, both required:
+//
+//   1. `mobilizeEditRegion` — an EDIT reaches the lake. This is the one that
+//      actually starts things: digging into the wall of a static lake produces
+//      no CA activity at all (there is no CA water yet), so without an edit
+//      hook the front would have nothing to grow from.
+//   2. `advanceFront` — CA ACTIVITY reaches the lake. Called before every
+//      `ca.step()`, it mobilizes the face-neighbours of every currently active
+//      brick, budget-bounded. Because a freshly mobilized brick is filled and
+//      woken by `addWaterAt`, it is itself active on the next tick, so the
+//      front advances one brick shell per tick, self-limiting: a lake drains
+//      progressively instead of converting a million cells in one hitch.
+//
+// Bricks found to hold no implicit water are remembered in a transient
+// negative memo (`noImplicit_`) rather than in the persisted set, so ordinary
+// surface water splashing around does not grow the save file.
+//
+// ---------------------------------------------------------------------------
+// DETERMINISM AND CLIENT/SERVER AGREEMENT
+// ---------------------------------------------------------------------------
+// The implicit field is a pure function of the seed, so both peers agree on
+// WHERE the water is for free. What they must also agree on is WHICH bricks
+// have mobilized, and that is simulation state, not worldgen: it depends on
+// where players dug and when.
+//
+// We therefore MOBILIZE ON THE AUTHORITY ONLY. `advanceFront` is driven by the
+// CA's active set, which on a client is a replication mirror rather than a
+// simulation, so a client that ran its own front would drift the moment a
+// packet was late. The authority mobilizes; the resulting CA fill replicates
+// through the existing water-diff channel; and the mobilized brick KEYS
+// replicate alongside them so the client stops drawing those bricks as
+// implicit water at exactly the moment it starts drawing them as CA water.
+// `markMobilized` is that inbound path (and the savegame load path): it
+// records the brick without crediting anything, because the units are already
+// in the replicated/persisted CA fill and crediting them again is precisely
+// the duplication this class exists to prevent.
+//
+// Within this class every set is BrickKeyLess-ordered and every per-brick
+// conversion is independent of every other, so the result is a pure function
+// of (implicit field, mobilized set, active set) with no iteration-order or
+// wall-clock dependence.
+//
+// kWaterCAVersion is NOT bumped: no tick rule changes, and a world in which
+// nothing ever mobilizes is bit-for-bit a world in which this class does not
+// exist. Mobilization state is SAVED alongside water state, never re-derived.
+class WaterMobilizer {
+public:
+    // Implicit static water at a voxel, in the CA's own 0..255 fill units
+    // (0 = none). In production this is
+    //   `cavernFloodedAt(col.cavern, vz) && materialAt(col, vz) == MAT_AIR ? 255 : 0`
+    // — see caverns.h's `cavernFloodedAt`, whose comment names this exact
+    // pairing. Must be a pure, deterministic function of position and seed.
+    using ImplicitFn = std::function<uint8_t(int64_t vx, int64_t vy, int64_t vz)>;
+
+    explicit WaterMobilizer(ImplicitFn implicit) : implicit_(std::move(implicit)) {}
+
+    // --- the ownership partition, as queries -------------------------------
+
+    // The implicit field's CURRENT contribution at this cell: 0 once the
+    // owning brick has mobilized (the CA owns it from then on). This — never
+    // the raw ImplicitFn — is the correct read for rendering and for volume
+    // accounting, precisely because it respects the handover.
+    uint8_t implicitFillAt(int64_t vx, int64_t vy, int64_t vz) const;
+
+    bool isMobilized(const BrickKey& k) const { return mobilized_.count(k) != 0; }
+
+    // Persisted state: the bricks whose implicit water the CA now owns. Only
+    // bricks that actually HELD implicit water are ever recorded.
+    const std::set<BrickKey, BrickKeyLess>& mobilizedBricks() const { return mobilized_; }
+
+    // --- the wall (see "SO WE MAKE IT STRUCTURALLY IMPOSSIBLE" above) ------
+
+    // Wraps `terrain` so still-implicit water reads as solid. The returned
+    // function captures `this`, so the mobilizer MUST outlive the WaterCA it
+    // is given to — declare it before the CA in the owning struct.
+    WaterCA::SolidFn makeSolidFn(WaterCA::SolidFn terrain) const;
+
+    // --- conversion --------------------------------------------------------
+
+    // Converts one brick's implicit water into CA fill and marks it mobilized.
+    // No-op (returns 0) if already mobilized or if the brick holds no implicit
+    // water. Returns the units credited into the CA.
+    uint32_t mobilizeBrick(WaterCA& ca, const BrickKey& k);
+
+    // Edit hook: mobilizes every brick overlapping the inclusive voxel box,
+    // grown by `kEditHaloBricks` so water on the far side of the dug face is
+    // released too. Returns bricks mobilized. This is the seed — call it from
+    // the same places that already call `WaterCA::wakeRegion`.
+    size_t mobilizeEditRegion(WaterCA& ca, int64_t minVx, int64_t minVy, int64_t minVz,
+                              int64_t maxVx, int64_t maxVy, int64_t maxVz);
+
+    // Advances the front by up to `maxBricks` bricks: mobilizes the face
+    // neighbours of every currently active CA brick. Call once before every
+    // `ca.step()`. Returns bricks mobilized this call; anything over budget
+    // stays queued in `pendingFrontBricks()` and is picked up next call, which
+    // is safe because a queued brick is still a wall.
+    static constexpr size_t kDefaultFrontBudgetBricks = 64;
+    static constexpr int kEditHaloBricks = 1;
+    size_t advanceFront(WaterCA& ca, size_t maxBricks = kDefaultFrontBudgetBricks);
+
+    size_t pendingFrontBricks() const { return pending_.size(); }
+
+    // --- ledger / audit -----------------------------------------------------
+
+    // Units this mobilizer has moved out of the implicit field, and units it
+    // actually credited into the CA. These must be EQUAL forever; their
+    // difference is `shortfallVolume()`, which is nonzero only if the wall
+    // invariant was broken (a cell the implicit field owned already held CA
+    // fill). Tests assert 0 every tick; production can log it as a red alarm.
+    uint64_t debitedVolume() const { return debited_; }
+    uint64_t creditedVolume() const { return credited_; }
+    uint64_t shortfallVolume() const { return debited_ - credited_; }
+
+    // --- replication / persistence inbound --------------------------------
+
+    // Records a brick as mobilized WITHOUT crediting anything into the CA.
+    // The savegame-load and client-replication path: the units are already
+    // present in the loaded/replicated CA fill, so crediting them again would
+    // duplicate exactly the water this class exists to protect.
+    void markMobilized(const BrickKey& k) { mobilized_.insert(k); }
+
+    // Deterministic digest of the mobilized set, in sorted key order.
+    void digest(Digest& d) const;
+
+private:
+    // Scans `k`'s 512 cells; returns total implicit units present.
+    uint64_t scanBrick(const BrickKey& k) const;
+
+    // Bricks scanned and found to hold no implicit water. A pure negative
+    // memo: it changes no answer, only the cost of re-asking, so it is never
+    // persisted and may be dropped at any time (it is dropped wholesale on
+    // overflow rather than evicted, same discipline as WaterCA's solid memo).
+    static constexpr size_t kMaxNoImplicitBricks = 1u << 16;
+
+    ImplicitFn implicit_;
+    std::set<BrickKey, BrickKeyLess> mobilized_;
+    std::set<BrickKey, BrickKeyLess> pending_;
+    mutable std::unordered_set<BrickKey, BrickKeyHash> noImplicit_;
+    uint64_t debited_ = 0;
+    uint64_t credited_ = 0;
 };
 
 } // namespace vxc
