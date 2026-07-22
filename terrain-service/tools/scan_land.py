@@ -58,16 +58,42 @@ def main() -> int:
     ap.add_argument("--radius", type=int, default=2, help="scan radius in strided steps")
     ap.add_argument("--stride", type=int, default=3, help="tiles skipped between samples")
     ap.add_argument("--json", help="write raw results here for tools/pick_origin.py")
+    ap.add_argument("--conditioning-digest", default=None,
+                    help="pin explicitly; default is to hash this box's rasters")
     args = ap.parse_args()
 
     if len(args.checkpoint_sha256) != 64 or args.checkpoint_sha256.startswith("<"):
         print("ERROR: sha256 must be 64 hex chars with no <> brackets.")
         return 2
 
-    from terrain_service.providers.diffusion import DiffusionConfig, DiffusionProvider
+    from terrain_service.providers.diffusion import (
+        ConditioningDataMissing,
+        DiffusionConfig,
+        DiffusionProvider,
+        compute_conditioning_digest,
+        resolve_conditioning_root,
+    )
+
+    # Inference refuses to run against UNVERIFIED conditioning data (the
+    # WorldClim/ETOPO rasters condition generation, so two boxes with
+    # different copies produce different terrain under one identity). This is
+    # a scan, not a canonical generate, so hashing whatever this box actually
+    # has is the honest pin -- it records what produced these numbers rather
+    # than asserting what should have.
+    digest = args.conditioning_digest
+    if digest is None:
+        try:
+            digest = compute_conditioning_digest()
+        except ConditioningDataMissing as e:
+            print(f"ERROR: {e}")
+            print(f"Run from the directory containing "
+                  f"{resolve_conditioning_root()}, and build ETOPO first:")
+            print("  python tools/fetch_etopo.py")
+            return 2
 
     config = DiffusionConfig(checkpoint_id=args.checkpoint_dir,
-                             checkpoint_sha256=args.checkpoint_sha256)
+                             checkpoint_sha256=args.checkpoint_sha256,
+                             conditioning_digest=digest)
     provider = DiffusionProvider(config=config)
 
     R, S = args.radius, args.stride

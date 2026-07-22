@@ -37,10 +37,20 @@ def main() -> int:
     ap.add_argument("--radius", type=int, default=2)
     ap.add_argument("--cache", default="/workspace/tile-cache")
     ap.add_argument("--out", default="/workspace/tile-cache-seed20260719.tar.gz")
+    ap.add_argument("--conditioning-digest", default=None,
+                    help="pin explicitly; default is to hash this box's rasters")
     args = ap.parse_args()
 
     if len(args.checkpoint_sha256) != 64 or args.checkpoint_sha256.startswith("<"):
         print("ERROR: sha256 must be 64 hex chars with no <> brackets.")
+        return 2
+    # Reject an unsubstituted placeholder outright. A literal "X,Y" left in a
+    # pasted command cost a whole overnight pregen on 2026-07-22: argparse's
+    # generic error went into a nohup log, where a job that never started
+    # looked exactly like one still running.
+    if any(c in args.origin for c in "<>XY"):
+        print(f"ERROR: --origin looks unsubstituted: {args.origin!r}")
+        print("Pass real integers, e.g. --origin 6,-3")
         return 2
     try:
         ox, oy = (int(v) for v in args.origin.split(","))
@@ -50,10 +60,31 @@ def main() -> int:
 
     from terrain_service import tile_codec
     from terrain_service.cache import TileCache
-    from terrain_service.providers.diffusion import DiffusionConfig, DiffusionProvider
+    from terrain_service.providers.diffusion import (
+        ConditioningDataMissing,
+        DiffusionConfig,
+        DiffusionProvider,
+        compute_conditioning_digest,
+        resolve_conditioning_root,
+    )
+
+    # Inference refuses to run against UNVERIFIED conditioning data. Hash what
+    # this box actually has, so the provider_id records the rasters that
+    # really produced these tiles.
+    digest = args.conditioning_digest
+    if digest is None:
+        try:
+            digest = compute_conditioning_digest()
+        except ConditioningDataMissing as e:
+            print(f"ERROR: {e}")
+            print(f"Run from the directory containing "
+                  f"{resolve_conditioning_root()}, and build ETOPO first:")
+            print("  python tools/fetch_etopo.py")
+            return 2
 
     config = DiffusionConfig(checkpoint_id=args.checkpoint_dir,
-                             checkpoint_sha256=args.checkpoint_sha256)
+                             checkpoint_sha256=args.checkpoint_sha256,
+                             conditioning_digest=digest)
     provider = DiffusionProvider(config=config)
     cache = TileCache(args.cache)
 
