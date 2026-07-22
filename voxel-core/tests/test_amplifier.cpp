@@ -87,13 +87,18 @@ VXC_TEST(amplifier_golden_digest) {
             d.u32(static_cast<uint32_t>(col.bedrockDepthMm));
             d.u8(col.surfaceMat);
         }
-    // GOLDEN(amplifier_columns) — kWorldGenVersion 5: bedrock top moved from a
-    // 40-60 m band to a 180-220 m one (200 m mean, Matt's decision). This
-    // digest covers surfaceMm/topsoilMm/subsoilMm/bedrockDepthMm/surfaceMat, of
-    // which ONLY bedrockDepthMm moved — the cave and cavern passes are not part
-    // of it, so the v5 cavern fold-in does not touch this value.
-    // (was 0x81785278E4DFCF67 at v3/v4, 0x73B43CAE621CA286 at v2)
-    CHECK_EQ(d.h, 0xA29A7A767DC1543Bull);
+    // GOLDEN(amplifier_columns) — kWorldGenVersion 6: the coarse-to-fine
+    // detail rework. surfaceMm moves at essentially every column, for three
+    // independent reasons, all in evalSurface: the octave table gained a fifth
+    // octave and every amplitude changed; the octaves are split into two bands
+    // with different scales; and they now use the quintic-faded value noise.
+    // topsoilMm/subsoilMm/bedrockDepthMm move with it because stratigraphy is
+    // conditioned on the surface and the tile slope. This digest MUST move —
+    // it is the whole point of the change — and a stable value here would mean
+    // the rework had not taken effect.
+    // (was 0xA29A7A767DC1543B at v5, 0x81785278E4DFCF67 at v3/v4,
+    //  0x73B43CAE621CA286 at v2)
+    CHECK_EQ(d.h, 0xA4D3290C4E1BC981ull);
 }
 
 // --- C4: the cavern pass is actually wired into the amplifier ---------------
@@ -199,7 +204,14 @@ VXC_TEST(amplifier_deep_column_golden_digest) {
     CHECK(cavernColumns > 0);
     std::printf("    [amplifier] deep golden covers %lld cavern columns\n",
                 static_cast<long long>(cavernColumns));
-    CHECK_EQ(d.h, 0xF88B88DB9D9341AAull);
+    // kWorldGenVersion 6: moves for the same reason amplifier_columns does —
+    // this walks materialAt down each column from the surface, so a surface
+    // that moved drags every sampled voxel's material with it. The cave and
+    // cavern GEOMETRY is unchanged (see GOLDEN(cave_layer) / GOLDEN(cavern_
+    // layer), which are pinned against a constant surface and did NOT move);
+    // what moved is where that unchanged geometry sits relative to the ground.
+    // (was 0xF88B88DB9D9341AA at v5)
+    CHECK_EQ(d.h, 0x569FDE13F50C287Eull);
 }
 
 VXC_TEST(generated_brick_matches_pointwise_queries) {
@@ -518,7 +530,14 @@ VXC_TEST(amplifier_surface_bound_golden_digest) {
                 d.i64(amp.surfaceUpperBoundMm(cx * span, cy * span, cx * span + span - 1,
                                               cy * span + span - 1));
     }
-    CHECK_EQ(d.h, 0x5588EBCD842ECE3Dull);
+    // kWorldGenVersion 6: the bound's DETAIL ALLOWANCE widened, from
+    // kDetailMaxMm * slopeScale to a two-band sum
+    // (kLandformMaxMm * slopeScale + kMicroMaxMm * microScale). At full slope
+    // that is 11424 mm -> 16166 mm. The base term is untouched. Soundness is
+    // re-established by amplifier_surface_bound_adversarial, which passes with
+    // VIOLATIONS=0 over 1189980 dense samples across 880 footprints.
+    // (was 0x5588EBCD842ECE3D at v5)
+    CHECK_EQ(d.h, 0xF9EF69A8978584F3ull);
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +724,15 @@ VXC_TEST(amplifier_solid_below_bound_golden_digest) {
     }
     std::printf("    [amplifier] solid-below golden digest = 0x%016llX\n",
                 (unsigned long long)d.h);
-    CHECK_EQ(d.h, 0xE9D395DF74D61495ull);
+    // kWorldGenVersion 6: mirror of the surface-bound move above — the
+    // symmetric envelope widened the same way (kLandformAbsMaxMm and
+    // kMicroAbsMaxMm, each with its own +1 mm for its own q10 truncation), and
+    // solidBelowBoundMm is derived from surfaceLowerBoundMm. The CARVE
+    // envelope it subtracts is unchanged; only the surface it is measured from
+    // moved. Soundness is re-established by
+    // amplifier_solid_below_bound_has_no_air_beneath_it, which passes with
+    // AIR BELOW FLOOR = 0 over 150031809 voxels.
+    // (was 0xE9D395DF74D61495 at v5)
+    CHECK_EQ(d.h, 0xC5988A848DBA26EEull);
 }
 
