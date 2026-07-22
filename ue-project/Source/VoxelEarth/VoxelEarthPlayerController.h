@@ -106,6 +106,25 @@ private:
 	// docs/debug-tooling-plan.md P1 "CVars + F3": cycles voxel.Debug 0->1->2->0.
 	void OnCycleDebugMode();
 
+	// In-game debug overlay (usability task). F1 shows/hides it; the arrow
+	// keys and Enter navigate it. All the state and the row table live on
+	// AVoxelEarthHUD -- these handlers only forward, and they are no-ops when
+	// the overlay is hidden so the arrow keys stay free for anything else that
+	// wants them later. Arrow keys and Enter were chosen because every other
+	// key this project binds is already spoken for (WASD/Space/Ctrl/Shift/Alt,
+	// G, C, T, F, 1-3, the mouse buttons and wheel, F3).
+	void OnToggleDebugOverlay();
+	void OnOverlayUp();
+	void OnOverlayDown();
+	void OnOverlayLeft();
+	void OnOverlayRight();
+	void OnOverlayActivate();
+
+	// Nullptr unless an AVoxelEarthHUD is the active HUD (it always is via
+	// AVoxelEarthGameMode::HUDClass, but a -game run with a HUD override
+	// should not crash).
+	class AVoxelEarthHUD* GetVoxelHUD() const;
+
 	int32 DigSizeVoxels = 1;
 
 	// vxc::MAT_ROCK == 2 (voxelcore/core.h); kept as a numeric literal here
@@ -134,6 +153,30 @@ private:
 	// (seed + World::editedDigest()) -- the dedicated server's equivalent
 	// dump lives in AVoxelEarthGameMode::BeginPlay (GameMode only exists
 	// server-side). Both read BeginPlay()'s command line once.
+	// Usability task verification fixtures. The overlay and the walk/fly mode
+	// line are HUD canvas drawing driven by key presses, and the existing
+	// -VoxelScreenshotAfter chain captures with bShowUI=FALSE -- so neither
+	// could ever appear in a verification shot. These three switches make both
+	// capturable headlessly, which is the only way this stays verifiable:
+	//
+	//   -VoxelWalkModeAfter=<s>  enter walk mode at <s> (default is fly)
+	//   -VoxelFlySpeedStep=<n>   set the fly speed table index (0-based)
+	//   -VoxelOverlayShot=<s>    at <s>: open the overlay, screenshot WITH UI
+	//                            ("VoxelOverlay*.png"), then quit 4 s later.
+	//   -VoxelOverlayRow=<n>     which overlay row is selected in that shot.
+	//
+	// -VoxelOverlayShot=<s> without -VoxelOverlayRow captures the overlay with
+	// its default (top) selection; pass -VoxelOverlayShot with the overlay
+	// suppressed by simply not passing it at all -- there is no "close" form,
+	// because the overlay is default-OFF and nothing else can open it.
+	//   -VoxelOverlayOn          open the overlay and leave it open (no shot,
+	//                            no quit) -- the overlay-on arm of the M1 perf
+	//                            A/B, which -VoxelOverlayShot cannot serve.
+	FTimerHandle WalkModeTimerHandle;
+	FTimerHandle OverlayOnTimerHandle;
+	FTimerHandle OverlayShotTimerHandle;
+	FTimerHandle OverlayQuitTimerHandle;
+
 	FTimerHandle AutoDigTimerHandle;
 	FTimerHandle DumpDigestTimerHandle;
 	// Self-quit a few seconds after DumpDigestTimerHandle fires (gate-run

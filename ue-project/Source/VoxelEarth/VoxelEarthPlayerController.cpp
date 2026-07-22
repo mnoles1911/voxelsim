@@ -9,7 +9,10 @@
 #include "Misc/Parse.h"
 #include "TimerManager.h"
 #include "VoxelDebug.h"
+#include "UnrealClient.h"
 #include "VoxelEarth.h"
+#include "VoxelEarthFlyPawn.h"
+#include "VoxelEarthHUD.h"
 #include "VoxelExplosive.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -43,6 +46,66 @@ void AVoxelEarthPlayerController::SetupInputComponent()
 	// docs/debug-tooling-plan.md P1 "CVars + F3": F3 cycles voxel.Debug
 	// 0(off)->1(perf HUD)->2(HUD+visualizations)->0 in PIE/game.
 	InputComponent->BindKey(EKeys::F3, IE_Pressed, this, &AVoxelEarthPlayerController::OnCycleDebugMode);
+
+	// In-game debug overlay (usability task): F1 toggles, arrows navigate,
+	// Enter activates. See the header for why these keys.
+	InputComponent->BindKey(EKeys::F1, IE_Pressed, this, &AVoxelEarthPlayerController::OnToggleDebugOverlay);
+	InputComponent->BindKey(EKeys::Up, IE_Pressed, this, &AVoxelEarthPlayerController::OnOverlayUp);
+	InputComponent->BindKey(EKeys::Down, IE_Pressed, this, &AVoxelEarthPlayerController::OnOverlayDown);
+	InputComponent->BindKey(EKeys::Left, IE_Pressed, this, &AVoxelEarthPlayerController::OnOverlayLeft);
+	InputComponent->BindKey(EKeys::Right, IE_Pressed, this, &AVoxelEarthPlayerController::OnOverlayRight);
+	InputComponent->BindKey(EKeys::Enter, IE_Pressed, this, &AVoxelEarthPlayerController::OnOverlayActivate);
+}
+
+AVoxelEarthHUD* AVoxelEarthPlayerController::GetVoxelHUD() const
+{
+	return Cast<AVoxelEarthHUD>(MyHUD);
+}
+
+void AVoxelEarthPlayerController::OnToggleDebugOverlay()
+{
+	if (AVoxelEarthHUD* Hud = GetVoxelHUD())
+	{
+		Hud->ToggleDebugOverlay();
+	}
+}
+
+void AVoxelEarthPlayerController::OnOverlayUp()
+{
+	if (AVoxelEarthHUD* Hud = GetVoxelHUD(); Hud && Hud->IsDebugOverlayVisible())
+	{
+		Hud->MoveOverlaySelection(-1);
+	}
+}
+
+void AVoxelEarthPlayerController::OnOverlayDown()
+{
+	if (AVoxelEarthHUD* Hud = GetVoxelHUD(); Hud && Hud->IsDebugOverlayVisible())
+	{
+		Hud->MoveOverlaySelection(+1);
+	}
+}
+
+void AVoxelEarthPlayerController::OnOverlayLeft()
+{
+	if (AVoxelEarthHUD* Hud = GetVoxelHUD(); Hud && Hud->IsDebugOverlayVisible())
+	{
+		Hud->AdjustOverlaySelection(-1);
+	}
+}
+
+void AVoxelEarthPlayerController::OnOverlayRight()
+{
+	if (AVoxelEarthHUD* Hud = GetVoxelHUD(); Hud && Hud->IsDebugOverlayVisible())
+	{
+		Hud->AdjustOverlaySelection(+1);
+	}
+}
+
+void AVoxelEarthPlayerController::OnOverlayActivate()
+{
+	// Enter behaves as "Right" -- flip a boolean, step a value forwards.
+	OnOverlayRight();
 }
 
 void AVoxelEarthPlayerController::BeginPlay()
@@ -75,6 +138,110 @@ void AVoxelEarthPlayerController::BeginPlay()
 	{
 		Subsystem->BeginJoinSync();
 		ServerRequestJoinSync();
+	}
+
+	// --- Usability task verification fixtures (see the header) -------------
+	//
+	// Read here, at init, alongside every other switch this controller owns --
+	// not via -ExecCmds, which lands after subsystems have already run.
+
+	float WalkModeAfterSeconds = 0.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelWalkModeAfter="), WalkModeAfterSeconds) && WalkModeAfterSeconds > 0.f)
+	{
+		World->GetTimerManager().SetTimer(WalkModeTimerHandle,
+		                                   FTimerDelegate::CreateWeakLambda(this,
+		                                                                     [this]()
+		                                                                     {
+			                                                                     if (AVoxelEarthFlyPawn* FlyPawn =
+			                                                                             Cast<AVoxelEarthFlyPawn>(GetPawn()))
+			                                                                     {
+				                                                                     FlyPawn->SetWalkMode(true);
+				                                                                     UE_LOG(LogVoxelEarth, Log,
+				                                                                            TEXT("VoxelWalkModeAfter: walk mode on"));
+			                                                                     }
+		                                                                     }),
+		                                   WalkModeAfterSeconds, false);
+	}
+
+	// -VoxelOverlayOn: open the overlay a moment after begin-play and LEAVE it
+	// open, with no screenshot and no quit. This is the overlay-on arm of the
+	// M1 perf A/B (-VoxelPerfRun), which -VoxelOverlayShot cannot serve
+	// because it self-quits 4 s after firing.
+	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelOverlayOn")))
+	{
+		World->GetTimerManager().SetTimer(OverlayOnTimerHandle,
+		                                   FTimerDelegate::CreateWeakLambda(this,
+		                                                                     [this]()
+		                                                                     {
+			                                                                     AVoxelEarthHUD* Hud = GetVoxelHUD();
+			                                                                     if (Hud && !Hud->IsDebugOverlayVisible())
+			                                                                     {
+				                                                                     Hud->ToggleDebugOverlay();
+				                                                                     UE_LOG(LogVoxelEarth, Log,
+				                                                                            TEXT("VoxelOverlayOn: overlay open"));
+			                                                                     }
+		                                                                     }),
+		                                   2.0f, false);
+	}
+
+	float OverlayShotAfterSeconds = 0.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelOverlayShot="), OverlayShotAfterSeconds) && OverlayShotAfterSeconds > 0.f)
+	{
+		World->GetTimerManager().SetTimer(
+		    OverlayShotTimerHandle,
+		    FTimerDelegate::CreateWeakLambda(
+		        this,
+		        [this]()
+		        {
+			        AVoxelEarthHUD* Hud = GetVoxelHUD();
+			        if (!Hud)
+			        {
+				        UE_LOG(LogVoxelEarth, Error, TEXT("VoxelOverlayShot: no AVoxelEarthHUD -- nothing to capture."));
+				        return;
+			        }
+
+			        // Applied here rather than in BeginPlay because the pawn
+			        // may not be possessed yet when this controller begins play.
+			        int32 FlySpeedStep = -1;
+			        if (FParse::Value(FCommandLine::Get(), TEXT("VoxelFlySpeedStep="), FlySpeedStep) && FlySpeedStep >= 0)
+			        {
+				        if (AVoxelEarthFlyPawn* FlyPawn = Cast<AVoxelEarthFlyPawn>(GetPawn()))
+				        {
+					        // AdjustFlySpeed clamps at both ends, so walking to
+					        // 0 and back up lands exactly on the requested step.
+					        FlyPawn->AdjustFlySpeed(-AVoxelEarthFlyPawn::GetFlySpeedStepCount());
+					        FlyPawn->AdjustFlySpeed(FlySpeedStep);
+				        }
+			        }
+
+			        // -VoxelHudShotOnly: capture the always-on HUD (walk/fly
+			        // mode line) WITHOUT the overlay panel over it.
+			        const bool bHudOnly = FParse::Param(FCommandLine::Get(), TEXT("VoxelHudShotOnly"));
+			        if (!bHudOnly && !Hud->IsDebugOverlayVisible())
+			        {
+				        Hud->ToggleDebugOverlay();
+			        }
+			        int32 Row = 0;
+			        if (!bHudOnly && FParse::Value(FCommandLine::Get(), TEXT("VoxelOverlayRow="), Row) && Row > 0)
+			        {
+				        Hud->MoveOverlaySelection(Row);
+			        }
+
+			        // bShowUI=TRUE, unlike the -VoxelScreenshotAfter chain: the
+			        // whole point of this fixture is the canvas HUD.
+			        FScreenshotRequest::RequestScreenshot(TEXT("VoxelOverlay"), /*bShowUI*/ true, /*bAddFilenameSuffix*/ true);
+			        UE_LOG(LogVoxelEarth, Log, TEXT("VoxelOverlayShot: overlay shown, screenshot requested (row %d)"), Row);
+
+			        UWorld* W = GetWorld();
+			        if (W)
+			        {
+				        W->GetTimerManager().SetTimer(OverlayQuitTimerHandle,
+				                                       FTimerDelegate::CreateWeakLambda(
+				                                           this, []() { FPlatformMisc::RequestExit(false); }),
+				                                       4.0f, false);
+			        }
+		        }),
+		    OverlayShotAfterSeconds, false);
 	}
 
 	// M3 gate verification switches (docs/m3-plan.md "two clients dig the

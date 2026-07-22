@@ -36,6 +36,41 @@ public:
 	virtual void SetupPlayerInputComponent(UInputComponent* PlayerInputComponent) override;
 	virtual void Tick(float DeltaTime) override;
 
+	// --- HUD queries (AVoxelEarthHUD mode line + debug overlay) -------------
+	//
+	// Read-only accessors; the HUD never mutates pawn state.
+
+	bool IsWalkMode() const { return bWalkMode; }
+	bool IsThirdPerson() const { return bThirdPerson; }
+	bool IsSprintHeld() const { return bSprintHeld; }
+
+	// Effective fly speed (UU/s) INCLUDING the boost/precision modifiers --
+	// i.e. what the pawn would actually top out at right now.
+	double GetEffectiveFlySpeedUU() const;
+
+	// Base fly speed step (UU/s) before modifiers, and its index/count in the
+	// speed table so the overlay can render "step 5/9".
+	double GetFlyBaseSpeedUU() const;
+	int32 GetFlySpeedIndex() const { return FlySpeedIndex; }
+	static int32 GetFlySpeedStepCount() { return kNumFlySpeedSteps; }
+
+	// Walk mode only: true while the pawn is holding position because the
+	// terrain under it has not streamed in yet (see TickWalkMode). The HUD
+	// surfaces this -- an unexplained hover is otherwise indistinguishable
+	// from a physics bug.
+	bool IsWaitingForTerrain() const { return bWaitingForTerrain; }
+
+	// Walk mode only: last tick's grounded / submerged state.
+	bool IsGroundedNow() const { return bGroundedLastTick; }
+	bool IsSwimmingNow() const { return bSwimmingLastTick; }
+
+	// Steps the fly speed table (Delta = +1 / -1), clamped. Public so the
+	// debug overlay can drive it as well as the ']' / '[' keys.
+	void AdjustFlySpeed(int32 Delta);
+
+	// Public so the debug overlay's "Movement mode" row can flip it.
+	void SetWalkMode(bool bInWalkMode);
+
 protected:
 	virtual void BeginPlay() override;
 
@@ -73,6 +108,10 @@ private:
 	void Turn(float Value);
 	void LookUp(float Value);
 	void ToggleWalkMode();
+	void OnFlySpeedUp();
+	void OnFlySpeedDown();
+	void OnPrecisionPressed();
+	void OnPrecisionReleased();
 	void OnJumpPressed();
 	void OnSprintPressed();
 	void OnSprintReleased();
@@ -80,6 +119,17 @@ private:
 
 	// Walk-mode kinematic step, called from Tick only while bWalkMode is set.
 	void TickWalkMode(float DeltaTime);
+
+	// Pushes the current fly speed step + modifiers onto UFloatingPawnMovement.
+	// Called every Tick in fly mode (the modifiers are held keys, so the
+	// effective speed can change between two presses of nothing).
+	void ApplyFlySpeedToMovement();
+
+	// True when the voxel world under Pos has actually streamed in, so walk
+	// mode's gravity may safely run. See the definition for the two-part rule
+	// (global "anything loaded at all" + local "this chunk is tracked but has
+	// no component yet") and why falling is never the right answer here.
+	bool IsTerrainReadyAt(const FVector& Pos) const;
 
 	// Runs every frame regardless of walk/fly mode: decays CameraZOffsetUU
 	// (step smoothing, see class comment on that field) toward 0 and applies
@@ -133,6 +183,47 @@ private:
 	float VerticalVelocity = 0.f;
 	bool bJumpRequested = false;
 	bool bSprintHeld = false;
+	// LeftAlt held: fly-mode precision modifier (see kFlyPrecisionScale).
+	bool bPrecisionHeld = false;
+
+	// Set by TickWalkMode; read by the HUD (IsWaitingForTerrain / grounded /
+	// swimming rows).
+	bool bWaitingForTerrain = false;
+	bool bGroundedLastTick = false;
+	bool bSwimmingLastTick = false;
+
+	// --- Fly speed (usability task) ---------------------------------------
+	//
+	// The world is kilometres across and a voxel is 10 cm, so one flat speed
+	// cannot serve both "read the material seam on this cliff face" and "cross
+	// four rings to the next tile". Three controls compose:
+	//   * a base STEP table below, ']' / '[' (also settable from the overlay),
+	//   * LeftShift held  -> kFlyBoostScale (fast traverse),
+	//   * LeftAlt held    -> kFlyPrecisionScale (10 cm inspection).
+	// Combined range is 0.075 m/s .. 8000 m/s. Step 4 (3000 UU/s) is the
+	// default and is byte-identical to the pre-task constant, so nothing that
+	// does not touch these keys changes behaviour.
+	static constexpr int32 kNumFlySpeedSteps = 9;
+	static constexpr double kFlySpeedStepsUU[kNumFlySpeedSteps] = {
+		50.0,     // 0.5 m/s  -- voxel-scale inspection
+		150.0,    // 1.5 m/s
+		400.0,    // 4 m/s    -- walking pace
+		1000.0,   // 10 m/s
+		3000.0,   // 30 m/s   -- DEFAULT (pre-task MaxSpeed)
+		8000.0,   // 80 m/s
+		20000.0,  // 200 m/s
+		60000.0,  // 600 m/s
+		200000.0, // 2 km/s   -- cross the streamed world in a breath
+	};
+	static constexpr int32 kDefaultFlySpeedIndex = 4;
+	static constexpr double kFlyBoostScale = 4.0;
+	static constexpr double kFlyPrecisionScale = 0.15;
+	// Acceleration as a multiple of max speed. 2.6667 keeps the default step
+	// at exactly the pre-task 8000 UU/s^2 while staying proportional (a 2 km/s
+	// step with 8000 UU/s^2 accel would take half a minute to reach speed).
+	static constexpr double kFlyAccelPerMaxSpeed = 8000.0 / 3000.0;
+
+	int32 FlySpeedIndex = kDefaultFlySpeedIndex;
 
 	// Accel-based horizontal velocity (Player experience decisions table,
 	// "Movement feel"): X/Y only (Z always 0), integrated in TickWalkMode via
@@ -163,6 +254,11 @@ private:
 	static constexpr double JumpSpeedUU = 442.7;         // UU/s, upward
 	static constexpr double StepUpHeightUU = 30.0;       // 3 voxels
 	static constexpr double CollisionEpsilonUU = 0.1;    // face clamp clearance
+	// Slack allowed below the analytic surface before the unstreamed-terrain
+	// backstop (see the end of TickWalkMode) engages. Generous enough that
+	// voxel quantisation, a step-down, or standing in a shallow dip never trip
+	// it; far smaller than the multi-metre free fall it exists to stop.
+	static constexpr double SurfaceBackstopToleranceUU = 300.0; // 3 m
 
 	// --- Cameras + step smoothing (Player experience decisions table) -----
 

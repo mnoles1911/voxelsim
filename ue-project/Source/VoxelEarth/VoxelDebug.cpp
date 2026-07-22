@@ -1,7 +1,15 @@
 #include "VoxelDebug.h"
 
 #include "HAL/IConsoleManager.h"
+#include "HAL/PlatformMisc.h"
 #include "Math/UnrealMathUtility.h"
+#include "Misc/App.h"
+#include "Misc/CommandLine.h"
+#include "Misc/DelayedAutoRegister.h"
+#include "Misc/OutputDeviceRedirector.h"
+#include "Misc/Parse.h"
+#include "Misc/ScopeLock.h"
+#include "VoxelCoords.h"
 
 DEFINE_LOG_CATEGORY(LogVoxelStream);
 DEFINE_LOG_CATEGORY(LogVoxelEdit);
@@ -107,6 +115,110 @@ TAutoConsoleVariable<int32> CVarVoxelStreamComponentPoolMax(
 	TEXT("AddPrimitive/RemovePrimitive churn the hitch-attribution instrumentation pinned as the dominant cost at ")
 	TEXT("ring-boundary crossings. Unloads past the cap fall back to DestroyComponent() (no unbounded growth)."),
 	ECVF_Default);
+
+// --- Tile-source log sniffer (see VoxelDebug.h FTileSourceStatus) -----------
+//
+// Parses the two lines MakeTileSampler (VoxelWorldSubsystem.cpp) already
+// emits, because the sampler choice survives nowhere else this module can
+// reach. Serialize() can be called from any thread and from inside a log
+// call, so it does the strict minimum: two substring tests on the fast path,
+// no logging of its own, and a plain FCriticalSection around the cached POD.
+FCriticalSection GTileSourceLock;
+VoxelDebug::FTileSourceStatus GTileSourceStatus;
+
+// Reads "<Key>=<int>" out of Line, starting the search at/after the key.
+// Returns false (Out untouched) if the key is absent.
+bool ParseTaggedInt(const FString& Line, const TCHAR* Key, int32& Out)
+{
+	const int32 KeyIdx = Line.Find(Key, ESearchCase::CaseSensitive);
+	if (KeyIdx == INDEX_NONE)
+	{
+		return false;
+	}
+	Out = FCString::Atoi(*Line + KeyIdx + FCString::Strlen(Key));
+	return true;
+}
+
+class FVoxelTileSourceSniffer final : public FOutputDevice
+{
+public:
+	virtual bool CanBeUsedOnAnyThread() const override { return true; }
+	virtual bool CanBeUsedOnMultipleThreads() const override { return true; }
+
+	virtual void Serialize(const TCHAR* V, ELogVerbosity::Type, const class FName&) override
+	{
+		if (!V || FCString::Strstr(V, TEXT("Voxel tile grid: ")) == nullptr)
+		{
+			return;
+		}
+		const FString Line(V);
+
+		// "Voxel tile grid: dir=%s loaded=%d rejected=%d seed=%llu scale=%d"
+		int32 Loaded = 0;
+		if (ParseTaggedInt(Line, TEXT("loaded="), Loaded))
+		{
+			int32 Rejected = 0;
+			ParseTaggedInt(Line, TEXT("rejected="), Rejected);
+
+			FString Dir;
+			const int32 DirIdx = Line.Find(TEXT("dir="), ESearchCase::CaseSensitive);
+			if (DirIdx != INDEX_NONE)
+			{
+				const int32 DirStart = DirIdx + 4;
+				const int32 LoadedIdx = Line.Find(TEXT(" loaded="), ESearchCase::CaseSensitive);
+				Dir = (LoadedIdx > DirStart) ? Line.Mid(DirStart, LoadedIdx - DirStart) : Line.Mid(DirStart);
+			}
+
+			FScopeLock Lock(&GTileSourceLock);
+			GTileSourceStatus.bKnown = true;
+			GTileSourceStatus.TilesLoaded = Loaded;
+			GTileSourceStatus.TilesRejected = Rejected;
+			GTileSourceStatus.TileDir = Dir;
+			// Mirrors MakeTileSampler's own rule exactly: Loaded == 0 falls
+			// back to the synthetic sampler rather than booting an empty world.
+			GTileSourceStatus.bUsingRealTiles = (Loaded > 0);
+			return;
+		}
+
+		// "Voxel tile grid: loaded tile coords bounding box x=[%d,%d] y=[%d,%d]"
+		int32 MinX = 0, MinY = 0;
+		if (ParseTaggedInt(Line, TEXT("x=["), MinX) && ParseTaggedInt(Line, TEXT("y=["), MinY))
+		{
+			// The second number of each pair follows the comma.
+			int32 MaxX = MinX, MaxY = MinY;
+			const int32 XIdx = Line.Find(TEXT("x=["), ESearchCase::CaseSensitive);
+			const int32 YIdx = Line.Find(TEXT("y=["), ESearchCase::CaseSensitive);
+			const int32 XComma = Line.Find(TEXT(","), ESearchCase::CaseSensitive, ESearchDir::FromStart, XIdx);
+			const int32 YComma = Line.Find(TEXT(","), ESearchCase::CaseSensitive, ESearchDir::FromStart, YIdx);
+			if (XComma != INDEX_NONE) { MaxX = FCString::Atoi(*Line + XComma + 1); }
+			if (YComma != INDEX_NONE) { MaxY = FCString::Atoi(*Line + YComma + 1); }
+
+			FScopeLock Lock(&GTileSourceLock);
+			GTileSourceStatus.bBoxKnown = true;
+			GTileSourceStatus.MinTileX = MinX;
+			GTileSourceStatus.MaxTileX = MaxX;
+			GTileSourceStatus.MinTileY = MinY;
+			GTileSourceStatus.MaxTileY = MaxY;
+		}
+	}
+};
+
+FVoxelTileSourceSniffer GTileSourceSniffer;
+
+// Registered at FileSystemReady -- comfortably before any UWorld (and so
+// before UVoxelWorldSubsystem::Initialize runs MakeTileSampler), and if this
+// module's static init happens to run after that phase the helper simply
+// invokes the lambda immediately. Never unregistered: GLog outlives the
+// module in every configuration this project ships, and the device is a
+// file-scope object with no destructor work.
+FDelayedAutoRegisterHelper GTileSourceSnifferRegistrar(EDelayedRegisterRunPhase::FileSystemReady,
+                                                        []()
+                                                        {
+	                                                        if (GLog)
+	                                                        {
+		                                                        GLog->AddOutputDevice(&GTileSourceSniffer);
+	                                                        }
+                                                        });
 } // namespace
 
 int32 VoxelDebug::GetDebugMode()
@@ -142,6 +254,71 @@ bool VoxelDebug::IsRingsEnabled()
 void VoxelDebug::SetRingsEnabled(bool bEnabled)
 {
 	CVarVoxelDebugRings->Set(bEnabled, ECVF_SetByCode);
+}
+
+void VoxelDebug::SetChunkStatesEnabled(bool bEnabled)
+{
+	CVarVoxelDebugChunkStates->Set(bEnabled, ECVF_SetByCode);
+}
+
+void VoxelDebug::SetBoundsEnabled(bool bEnabled)
+{
+	CVarVoxelDebugBounds->Set(bEnabled, ECVF_SetByCode);
+}
+
+bool VoxelDebug::GetChunkStatesCVar()
+{
+	return CVarVoxelDebugChunkStates.GetValueOnAnyThread();
+}
+
+bool VoxelDebug::GetBoundsCVar()
+{
+	return CVarVoxelDebugBounds.GetValueOnAnyThread();
+}
+
+bool VoxelDebug::GetRingsCVar()
+{
+	return CVarVoxelDebugRings.GetValueOnAnyThread();
+}
+
+VoxelDebug::FTileSourceStatus VoxelDebug::GetTileSourceStatus()
+{
+	FScopeLock Lock(&GTileSourceLock);
+	return GTileSourceStatus;
+}
+
+void VoxelDebug::WorldToTileCoords(double WorldXUU, double WorldYUU, int32& OutTileX, int32& OutTileY, int64& OutPixelX,
+                                    int64& OutPixelY)
+{
+	// vxc::tilePixelSizeMm: 30000 mm/px at scale 1, 11250 at scale 8; anything
+	// else is unsupported and MakeTileSampler rejects it, so fall back to
+	// scale 1 here rather than dividing by zero.
+	int32 TileScale = 1;
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelTileScale="), TileScale);
+	const double PixelSizeMm = (TileScale == 8) ? 11250.0 : 30000.0;
+
+	// 1 UU == 1 cm == 10 mm (VoxelCoords.h).
+	OutPixelX = (int64)FMath::FloorToDouble(WorldXUU * 10.0 / PixelSizeMm);
+	OutPixelY = (int64)FMath::FloorToDouble(WorldYUU * 10.0 / PixelSizeMm);
+
+	// vxc::TileData::kTileSize == 512 px per tile edge; tile = floorDiv(px, 512).
+	constexpr double kTileSizePx = 512.0;
+	OutTileX = (int32)FMath::FloorToDouble(double(OutPixelX) / kTileSizePx);
+	OutTileY = (int32)FMath::FloorToDouble(double(OutPixelY) / kTileSizePx);
+}
+
+bool VoxelDebug::IsUndergroundVeilEnabledForRun()
+{
+	// Same parse AVoxelClipmapActor::BeginPlay does (-VoxelUndergroundVeil=0
+	// disables); absent switch means enabled.
+	int32 VeilFlag = 1;
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelUndergroundVeil="), VeilFlag);
+	return VeilFlag != 0;
+}
+
+bool VoxelDebug::IsUnattendedFixtureRun()
+{
+	return FApp::IsUnattended();
 }
 
 FLinearColor VoxelDebug::RingLevelTint(int32 Level)
