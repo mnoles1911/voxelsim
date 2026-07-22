@@ -20,12 +20,15 @@
 #include "EngineUtils.h" // TActorIterator (locating the world's single AVoxelEditRelay)
 #include "GameFramework/Actor.h"
 #include "GameFramework/PlayerController.h"
+#include "HAL/FileManager.h"  // ADR-0005 water persistence: IFileManager (atomic rename, mkdir)
 #include "HAL/IConsoleManager.h"
 #include "HAL/PlatformTime.h"
 #include "MaterialDomain.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInterface.h"
 #include "Misc/CommandLine.h"
+#include "Misc/FileHelper.h" // ADR-0005 water persistence: FFileHelper (blob read/write)
+#include "Misc/Paths.h"      // ADR-0005 water persistence: FPaths::ProjectSavedDir (mirror the .vxlog path)
 #include "UObject/UObjectGlobals.h"
 
 #include <vector>
@@ -265,6 +268,17 @@ void MarkColumnDirty(FVoxelWaterImpl& Impl, int64_t Vx, int64_t Vy, int64_t VzSt
 }
 } // namespace
 
+// ADR-0005 water persistence: forward declarations. The definitions live in
+// the big anonymous namespace below (they lean on MarkMobilizedBricksDirty /
+// ToCoord, defined there), but OnWorldBeginPlay / Deinitialize / SaveWaterState
+// above them need to call them.
+namespace
+{
+FString GetWaterSaveFilePath(uint64 Seed);
+bool SaveWaterStateToDisk(const FVoxelWaterImpl& Impl, uint64 Seed);
+void LoadWaterStateFromDisk(FVoxelWaterImpl& Impl, uint64 Seed);
+} // namespace
+
 // UVoxelWaterSubsystem ------------------------------------------------------
 
 UVoxelWaterSubsystem::UVoxelWaterSubsystem() = default;
@@ -298,6 +312,25 @@ void UVoxelWaterSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UVoxelWaterSubsystem::Deinitialize()
 {
+	// ADR-0005: autosave the water blob on shutdown, mirroring
+	// UVoxelWorldSubsystem::Deinitialize's edit-log autosave lifetime exactly --
+	// authority only, and only for a world that genuinely began play (see
+	// bWorldBegunPlay). Additionally gated on there being real water state to
+	// persist (stored or mobilized bricks) so a run that never disturbed
+	// underground water leaves no sibling .vxwater to shadow a later same-seed
+	// session -- the edit log has no such gate because every world has a log,
+	// but an all-implicit world has nothing to serialize and an empty blob would
+	// only add a spurious file.
+	if (Impl && bWorldBegunPlay)
+	{
+		UWorld* World = GetWorld();
+		const ENetMode NetMode = World ? World->GetNetMode() : NM_Standalone;
+		if (NetMode != NM_Client && (Impl->CA.storedBrickCount() > 0 || !Impl->Mob.mobilizedBricks().empty()))
+		{
+			SaveWaterState();
+		}
+	}
+
 	ChunkRoot = nullptr;
 	ChunkOwner = nullptr;
 	WaterMaterial = nullptr;
@@ -319,6 +352,25 @@ void UVoxelWaterSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	if (!InWorld.IsGameWorld() || !Impl)
 	{
 		return;
+	}
+
+	// ADR-0005: from here on this is a genuine gameplay world (same reasoning as
+	// UVoxelWorldSubsystem's bWorldBegunPlay) -- gates Deinitialize's autosave.
+	bWorldBegunPlay = true;
+
+	// ADR-0005 water persistence: the authority (server/listen/standalone) loads
+	// Saved/VoxelWorlds/<seed>.vxwater, if present, before the first fixed step
+	// ever runs (Tick() below). This is the earliest point OnWorldBeginPlay
+	// reaches after the game-world/Impl guard, and it runs BEFORE the
+	// dedicated-server early-return below so it applies to every authority role,
+	// exactly mirroring UVoxelWorldSubsystem's LoadEditLogFromDisk placement. The
+	// live CA/mob are still fresh here (no addWater/mobilize has run yet), which
+	// is vxc::WaterState::applyTo's precondition. Fills-first load, three
+	// failure modes handled loudly -- see LoadWaterStateFromDisk. NM_Client never
+	// loads its own file: a joining client mirrors state via replication instead.
+	if (InWorld.GetNetMode() != NM_Client)
+	{
+		LoadWaterStateFromDisk(*Impl, Impl->Terrain.GetSeed());
 	}
 
 	// Dedicated server: no viewport, so no render chunks -- but the CA still
@@ -566,6 +618,163 @@ void MarkMobilizedBricksDirty(FVoxelWaterImpl& Impl)
 			Impl.ImplicitChunkComponents.Remove(C);
 		}
 	}
+}
+
+// --- ADR-0005 water persistence -------------------------------------------
+//
+// The blob is a SIBLING of the terrain edit log, written into the same
+// directory with the same per-seed naming and the same atomic tmp+rename write
+// UVoxelWorldSubsystem uses (GetWorldSaveFilePath / WriteBytesAtomic in
+// VoxelWorldSubsystem.cpp). Only the extension differs: <seed>.vxwater beside
+// <seed>.vxlog. See waterca.h's WaterState comment for why it is a separate
+// file rather than a section of the log (it invalidates on kWaterCAVersion and
+// is discardable without discarding terrain edits).
+FString GetWaterSaveFilePath(uint64 Seed)
+{
+	return FPaths::ProjectSavedDir() / TEXT("VoxelWorlds") / FString::Printf(TEXT("%llu.vxwater"), (unsigned long long)Seed);
+}
+
+// The .vxlog the terrain edit log saves to -- used only to decide how LOUD a
+// missing water blob should be (a missing blob beside an existing terrain save
+// means a world that had edits, some possibly drains, will refill every cavern;
+// a missing blob with no terrain save is just a fresh world).
+FString GetTerrainSaveFilePath(uint64 Seed)
+{
+	return FPaths::ProjectSavedDir() / TEXT("VoxelWorlds") / FString::Printf(TEXT("%llu.vxlog"), (unsigned long long)Seed);
+}
+
+// Atomic tmp+rename write, identical shape to VoxelWorldSubsystem.cpp's
+// WriteBytesAtomic: a process dying mid-write leaves only the .tmp behind,
+// never a truncated/corrupt blob a later load would have to reject.
+bool WriteWaterBytesAtomic(const FString& Path, const TArray<uint8>& Bytes)
+{
+	const FString TmpPath = Path + TEXT(".tmp");
+	if (!FFileHelper::SaveArrayToFile(Bytes, *TmpPath))
+	{
+		UE_LOG(LogVoxelWater, Error, TEXT("SaveWaterState: failed to write temp file %s"), *TmpPath);
+		return false;
+	}
+	if (!IFileManager::Get().Move(*Path, *TmpPath, /*Replace*/ true))
+	{
+		UE_LOG(LogVoxelWater, Error, TEXT("SaveWaterState: failed to rename %s -> %s"), *TmpPath, *Path);
+		IFileManager::Get().Delete(*TmpPath);
+		return false;
+	}
+	return true;
+}
+
+bool SaveWaterStateToDisk(const FVoxelWaterImpl& Impl, uint64 Seed)
+{
+	// vxc::WaterState::serialize appends the whole blob (magic + kFormatVersion +
+	// kWaterCAVersion + totalVolume integrity check + per-brick fill + active set
+	// + mobilized keys) into a caller-owned buffer, exactly like EditLog.
+	std::vector<uint8_t> Bytes;
+	vxc::WaterState::serialize(Impl.CA, Impl.Mob, Bytes);
+
+	TArray<uint8> OutBytes;
+	OutBytes.SetNumUninitialized((int32)Bytes.size());
+	if (!Bytes.empty())
+	{
+		FMemory::Memcpy(OutBytes.GetData(), Bytes.data(), Bytes.size());
+	}
+
+	const FString Dir = FPaths::ProjectSavedDir() / TEXT("VoxelWorlds");
+	IFileManager::Get().MakeDirectory(*Dir, /*Tree*/ true);
+	const FString Path = GetWaterSaveFilePath(Seed);
+	if (!WriteWaterBytesAtomic(Path, OutBytes))
+	{
+		return false;
+	}
+
+	vxc::Digest D;
+	Impl.CA.digest(D);
+	UE_LOG(LogVoxelWater, Log,
+	       TEXT("SaveWaterState: wrote %d bytes (%llu fill units, %llu stored brick(s), %llu mobilized brick(s)) to %s -- waterDigest=0x%016llX"),
+	       OutBytes.Num(), (unsigned long long)Impl.CA.totalVolume(), (unsigned long long)Impl.CA.storedBrickCount(),
+	       (unsigned long long)Impl.Mob.mobilizedBricks().size(), *Path, (unsigned long long)D.h);
+	return true;
+}
+
+void LoadWaterStateFromDisk(FVoxelWaterImpl& Impl, uint64 Seed)
+{
+	// Honor -VoxelNoLoad exactly as LoadEditLogFromDisk does: a fresh-start
+	// verification aid must start the water field fully implicit too, or terrain
+	// would start fresh while water came back from a stale blob.
+	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelNoLoad")))
+	{
+		UE_LOG(LogVoxelWater, Log,
+		       TEXT("LoadWaterState: -VoxelNoLoad passed -- skipping water-state load; underground water starts fully implicit."));
+		return;
+	}
+
+	const FString Path = GetWaterSaveFilePath(Seed);
+	if (!FPaths::FileExists(Path))
+	{
+		// FAILURE MODE 1 -- MISSING. Coherent (the world reverts to the implicit,
+		// full field) but every drained cavern refills, so it is LOUD whenever a
+		// terrain save exists (that world had edits; some may have been drains)
+		// and merely informational for a genuinely fresh world with no log either.
+		if (FPaths::FileExists(GetTerrainSaveFilePath(Seed)))
+		{
+			UE_LOG(LogVoxelWater, Warning,
+			       TEXT("LoadWaterState: a terrain save exists but there is NO water blob at %s -- falling back to a fully ")
+			       TEXT("implicit world. EVERY drained cavern in this world WILL REFILL (ADR-0005). Expected only for a save ")
+			       TEXT("that predates water persistence; otherwise the water blob was lost."),
+			       *Path);
+		}
+		else
+		{
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("LoadWaterState: no water blob at %s and no terrain save -- fresh world, underground water is fully implicit."),
+			       *Path);
+		}
+		return;
+	}
+
+	TArray<uint8> Bytes;
+	if (!FFileHelper::LoadFileToArray(Bytes, *Path))
+	{
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("LoadWaterState: water blob %s exists but could NOT be READ -- falling back to a fully implicit world; ")
+		       TEXT("every drained cavern WILL REFILL (ADR-0005)."),
+		       *Path);
+		return;
+	}
+
+	// FAILURE MODES 2 (stale kWaterCAVersion) and 3 (refused: corrupt/truncated,
+	// integrity cross-check mismatch, non-fresh target) collapse into the single
+	// signal the ADR-0005 handoff names: vxc::WaterState::load returning false.
+	// All three take the SAME loud fallback, because handling any of them quietly
+	// silently loses every drained lake. load() applies fills FIRST, then the
+	// active set, then markMobilized (waterca.h) -- so the world is never even
+	// momentarily in the both-accountants-report-zero state that reads as open air.
+	if (!vxc::WaterState::load(Bytes.GetData(), (size_t)Bytes.Num(), Impl.CA, Impl.Mob))
+	{
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("LoadWaterState: water blob %s (%d bytes) was REFUSED by vxc::WaterState::load -- stale kWaterCAVersion ")
+		       TEXT("(engine is now v%u), corrupt/truncated, or a failed totalVolume integrity cross-check. Falling back to a ")
+		       TEXT("fully implicit world; EVERY drained cavern in this world WILL REFILL (ADR-0005)."),
+		       *Path, Bytes.Num(), vxc::kWaterCAVersion);
+		return;
+	}
+
+	// Success. Every restored brick needs meshing on the first frame: the
+	// mobilized ones must stop drawing as implicit water and start drawing as CA
+	// water (drain takeRecentlyMobilized via MarkMobilizedBricksDirty, tearing
+	// down any implicit component -- there are none yet this early, so this just
+	// queues the CA re-mesh), and every stored CA brick must mesh its fill.
+	MarkMobilizedBricksDirty(Impl);
+	for (const auto& Entry : Impl.CA.bricks())
+	{
+		Impl.DirtyBricks.Add(ToCoord(Entry.first));
+	}
+
+	vxc::Digest D;
+	Impl.CA.digest(D);
+	UE_LOG(LogVoxelWater, Log,
+	       TEXT("LoadWaterState: restored %llu fill units across %llu stored brick(s), %llu mobilized brick(s) from %s -- waterDigest=0x%016llX"),
+	       (unsigned long long)Impl.CA.totalVolume(), (unsigned long long)Impl.CA.storedBrickCount(),
+	       (unsigned long long)Impl.Mob.mobilizedBricks().size(), *Path, (unsigned long long)D.h);
 }
 
 // How far around the camera implicit lake surfaces are built, in water bricks
@@ -1466,10 +1675,108 @@ bool UVoxelWaterSubsystem::ApplyReplicatedWaterDiffs(const TArray<uint8>& Bytes)
 	return true;
 }
 
+// --- ADR-0005 water persistence: public save + round-trip verification ------
+
+bool UVoxelWaterSubsystem::SaveWaterState() const
+{
+	if (!Impl)
+	{
+		UE_LOG(LogVoxelWater, Warning, TEXT("SaveWaterState: no water Impl -- nothing to save."));
+		return false;
+	}
+	UWorld* World = GetWorld();
+	const ENetMode NetMode = World ? World->GetNetMode() : NM_Standalone;
+	if (NetMode == NM_Client)
+	{
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("SaveWaterState: refused on NM_Client -- only the authority (server/listen/standalone) has an authoritative CA to persist."));
+		return false;
+	}
+	return SaveWaterStateToDisk(*Impl, Impl->Terrain.GetSeed());
+}
+
+bool UVoxelWaterSubsystem::VerifyWaterDiskRoundTrip(uint64& OutLiveDigest, uint64& OutReloadedDigest, uint64& OutLiveVolume,
+                                                     uint64& OutReloadedVolume, int32& OutLiveMobilized, int32& OutReloadedMobilized)
+{
+	OutLiveDigest = OutReloadedDigest = 0;
+	OutLiveVolume = OutReloadedVolume = 0;
+	OutLiveMobilized = OutReloadedMobilized = 0;
+	if (!Impl)
+	{
+		return false;
+	}
+
+	// Live side.
+	{
+		vxc::Digest D;
+		Impl->CA.digest(D);
+		OutLiveDigest = D.h;
+		OutLiveVolume = Impl->CA.totalVolume();
+		OutLiveMobilized = int32(Impl->Mob.mobilizedBricks().size());
+	}
+
+	// Read back the ACTUAL on-disk blob (proving the file wiring, not just the
+	// in-memory serializer) and apply it into a FRESH CA + mobilizer pair built
+	// over the same implicit-flood / terrain-solidity callbacks the live pair
+	// uses (FVoxelWaterImpl's constructor) -- this is the load path a genuine
+	// reload runs, isolated so it never touches live state.
+	const FString Path = GetWaterSaveFilePath(Impl->Terrain.GetSeed());
+	TArray<uint8> Bytes;
+	if (!FFileHelper::LoadFileToArray(Bytes, *Path))
+	{
+		UE_LOG(LogVoxelWater, Warning, TEXT("VerifyWaterDiskRoundTrip: could not read %s -- run SaveWaterState first."), *Path);
+		return false;
+	}
+
+	FVoxelWaterImpl& I = *Impl;
+	vxc::WaterMobilizer FreshMob(
+		[&I](int64_t vx, int64_t vy, int64_t vz) -> uint8_t
+		{ return vxc::cavernFloodedAt(I.Amp.columnCached(vx, vy).cavern, vz) ? uint8_t(255) : uint8_t(0); },
+		[&I](int64_t vx, int64_t vy, int64_t vz) -> vxc::MaterialId
+		{ return I.Terrain.IsSolidAtVoxel(vx, vy, vz) ? vxc::MAT_ROCK : vxc::MAT_AIR; });
+	vxc::WaterCA FreshCA(FreshMob.makeSolidFn());
+
+	if (!vxc::WaterState::load(Bytes.GetData(), (size_t)Bytes.Num(), FreshCA, FreshMob))
+	{
+		UE_LOG(LogVoxelWater, Warning, TEXT("VerifyWaterDiskRoundTrip: vxc::WaterState::load REFUSED the on-disk blob %s."), *Path);
+		return false;
+	}
+
+	vxc::Digest RD;
+	FreshCA.digest(RD);
+	OutReloadedDigest = RD.h;
+	OutReloadedVolume = FreshCA.totalVolume();
+	OutReloadedMobilized = int32(FreshMob.mobilizedBricks().size());
+	return true;
+}
+
 // --- voxel.SpawnWater console command (task item 2, dev tool) --------------
 
 namespace
 {
+// ADR-0005 dev/verification convenience: force a water-state save without
+// waiting for shutdown. Mirrors the voxel.SaveWorld console command
+// (VoxelWorldSubsystem.cpp) -- same manual-save-alongside-autosave shape.
+FAutoConsoleCommandWithWorld CVarVoxelSaveWater(
+	TEXT("voxel.SaveWater"),
+	TEXT("ADR-0005: write the water-state blob (Saved/VoxelWorlds/<seed>.vxwater) now, beside the terrain edit log."),
+	FConsoleCommandWithWorldDelegate::CreateLambda(
+		[](UWorld* World)
+		{
+			if (!World)
+			{
+				return;
+			}
+			if (UVoxelWaterSubsystem* Water = World->GetSubsystem<UVoxelWaterSubsystem>())
+			{
+				Water->SaveWaterState();
+			}
+			else
+			{
+				UE_LOG(LogVoxelWater, Warning, TEXT("voxel.SaveWater: no UVoxelWaterSubsystem in this world."));
+			}
+		}));
+
 FAutoConsoleCommandWithWorldAndArgs CVarVoxelSpawnWater(
 	TEXT("voxel.SpawnWater"),
 	TEXT("voxel.SpawnWater <amount> -- dev tool: dumps <amount> water fill units at the local player's crosshair (W2)."),
