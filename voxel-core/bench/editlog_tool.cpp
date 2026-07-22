@@ -127,6 +127,8 @@ void printStatsBlock(const char* label, const EditLog& log, size_t serializedByt
     std::printf("%s:\n", label);
     std::printf("  seed:            %llu\n", static_cast<unsigned long long>(log.seed()));
     std::printf("  brickEdge:       %d\n", int(log.brickEdge()));
+    std::printf("  providerId:      %s\n",
+                 log.providerId().empty() ? "(unstamped)" : log.providerId().c_str());
     std::printf("  entries:         %zu\n", log.size());
     std::printf("  uniqueBricks:    %zu\n", uniqueBrickCount(log));
     std::printf("  serializedBytes: %zu\n", serializedBytes);
@@ -281,6 +283,86 @@ EditLog buildMessyLog(uint64_t seed) {
     return w.log();
 }
 
+// Provider-identity guard check (data-integrity gap: an edit-log is a diff
+// against a specific base world/tile-set; replaying it against a DIFFERENT
+// one must not silently apply). Exercises World<8>::replay's
+// currentProviderId argument through all three ProviderCheck outcomes:
+// mismatch (refused), match (accepted), unstamped-legacy-log (accepted with
+// a flagged warning, never a hard failure). Returns true on PASS.
+bool runProviderMismatchCheck(bool quiet) {
+    constexpr uint64_t kSeed = 20260721;
+    bool ok = true;
+
+    // Record a log against a world stamped "tileset-A".
+    SyntheticTileSampler recordTiles(kSeed);
+    World<8> recorder(kSeed, recordTiles, "tileset-A-deadbeef");
+    recorder.setVoxel(0, 0, 0, MAT_ROCK);
+    std::vector<uint8_t> bytes;
+    recorder.log().serialize(bytes);
+    std::optional<EditLog> parsed = EditLog::parse(bytes.data(), bytes.size());
+    if (!parsed) {
+        std::fprintf(stderr, "vxc_editlog selftest: provider-check: failed to parse stamped log\n");
+        return false;
+    }
+
+    // 1) Replaying into a world stamped with a DIFFERENT provider must be
+    //    refused outright -- this is the exact silent-corruption case.
+    {
+        SyntheticTileSampler tiles(kSeed);
+        World<8> dst(kSeed, tiles, "tileset-B-cafefeed");
+        const bool replayed = dst.replay(*parsed, "tileset-B-cafefeed");
+        const bool checkOk = !replayed &&
+            dst.lastProviderCheck() == EditLog::ProviderCheck::kMismatch;
+        if (!checkOk) {
+            std::fprintf(stderr,
+                "vxc_editlog selftest: provider-check: expected mismatch to be REFUSED, "
+                "got replayed=%d\n", int(replayed));
+        }
+        ok = ok && checkOk;
+    }
+
+    // 2) Replaying into a world stamped with the SAME provider must succeed.
+    {
+        SyntheticTileSampler tiles(kSeed);
+        World<8> dst(kSeed, tiles, "tileset-A-deadbeef");
+        const bool replayed = dst.replay(*parsed, "tileset-A-deadbeef");
+        const bool checkOk = replayed &&
+            dst.lastProviderCheck() == EditLog::ProviderCheck::kMatch;
+        if (!checkOk) {
+            std::fprintf(stderr,
+                "vxc_editlog selftest: provider-check: expected match to be ACCEPTED, "
+                "got replayed=%d\n", int(replayed));
+        }
+        ok = ok && checkOk;
+    }
+
+    // 3) A legacy/unstamped log (no provider recorded) must still load --
+    //    flagged as kUnstamped for the caller to warn about, never refused.
+    {
+        SyntheticTileSampler legacyTiles(kSeed);
+        World<8> legacyRecorder(kSeed, legacyTiles); // no providerId stamped
+        legacyRecorder.setVoxel(0, 0, 0, MAT_ROCK);
+        std::vector<uint8_t> legacyBytes;
+        legacyRecorder.log().serialize(legacyBytes);
+        std::optional<EditLog> legacyParsed = EditLog::parse(legacyBytes.data(), legacyBytes.size());
+
+        SyntheticTileSampler tiles(kSeed);
+        World<8> dst(kSeed, tiles, "tileset-A-deadbeef");
+        const bool replayed = legacyParsed && dst.replay(*legacyParsed, "tileset-A-deadbeef");
+        const bool checkOk = replayed &&
+            dst.lastProviderCheck() == EditLog::ProviderCheck::kUnstamped;
+        if (!checkOk) {
+            std::fprintf(stderr,
+                "vxc_editlog selftest: provider-check: expected unstamped log to be "
+                "ACCEPTED-WITH-WARNING, got replayed=%d\n", int(replayed));
+        }
+        ok = ok && checkOk;
+    }
+
+    if (!quiet) std::printf("provider-check: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 int cmdSelftest() {
     constexpr uint64_t kSeed = 20260720;
 
@@ -304,6 +386,12 @@ int cmdSelftest() {
 
     bool ok = runCompact(origPath, compactPath, /*quiet=*/false);
     if (ok) ok = runVerify(origPath, compactPath, /*quiet=*/false);
+    // Independent of the compact/verify round trip above: proves the
+    // provider_id stamp guards a replay against a mismatched tile-set (see
+    // runProviderMismatchCheck's doc comment). Always run (not short-circuited)
+    // so a failure here is never masked by an earlier compact/verify failure.
+    const bool providerOk = runProviderMismatchCheck(/*quiet=*/false);
+    ok = ok && providerOk;
 
     std::error_code ec;
     if (!std::getenv("VXC_EDITLOG_SELFTEST_KEEP_TEMP")) {

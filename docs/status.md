@@ -64,6 +64,24 @@ Working plan + binding decisions: docs/m1-plan.md. UE 5.8.0 (retargeted
 
 Working plan + binding decisions: docs/m2-plan.md.
 
+**Gate system split (measured 2026-07-21, see "R2-R4 ring starvation fix"
+below for the full writeup):** the gate below reads "50km+ vista ... (only
+ring coarsening)", which is misleading about which system does the work.
+The voxel ring cascade (R0-R4, this section) tops out at R4's outer edge,
+**1024m** — it delivers close-range detail out to ~1km, not the 50km+
+vista. The long-distance vista is delivered by **Band 3**, the heightmap
+clipmap (`AVoxelClipmapActor`, docs/m2-plan.md's "Band 3 first slice"),
+covering ~1km out to ~16.4km radius (~32.8km diameter) via direct TILE
+elevation sampling — a different rendering system, not a coarser ring
+level. Vista screenshots (`-VoxelVistaShot`, 250m above spawn) confirm a
+real horizon-to-horizon vista renders today, but on the clipmap, not the
+ring cascade. An earlier internal note calling this "passing on a
+technicality" was imprecise and is superseded by this measurement: the
+gate was not passing on a technicality, it was passing on a DIFFERENT
+system than the one its wording credits. This is a documentation
+correction only — see the "Gate" bullets below for actual pass/fail status,
+unchanged by this note.
+
 - [x] Level-aware streaming: `VoxelCoords::FVoxelLevelChunkKey` generalizes
   every record/queue in `VoxelWorldSubsystem.cpp`; per-level annulus desired
   sets from the `RingPresets` table (R0 0-64m .. R4 512-1024m), outer-edge
@@ -97,7 +115,8 @@ Working plan + binding decisions: docs/m2-plan.md.
   overlay-aware path; R1-R4 always render pure-generated.
 - Gate (50km+ vista, 60fps, fast flight with no hitches): ⬜ open — this wave
   is streaming/rendering plumbing only; the flight/hitch gate run and
-  dithered cross-fade are later M2 items.
+  dithered cross-fade are later M2 items. (Vista range: delivered by the
+  Band 3 clipmap, not this ring cascade — see the system-split note above.)
 
 ### Wave 2 — cross-job mip caching + distant-edit propagation (2026-07-20)
 
@@ -210,7 +229,8 @@ all four verification logs (`perfrun_after.log`, `perfrun_before.log`,
   closes both wave-1 items on this list (cross-job mip cache, distant-edit
   propagation); the flight/hitch gate run and dithered cross-fade are still
   later M2 items, and R3/R4 cold-start fill time (wave-1's other open
-  follow-up) is unchanged by this wave.
+  follow-up) is unchanged by this wave. (Vista range: delivered by the
+  Band 3 clipmap, not this ring cascade — see the system-split note above.)
 
 ### Wave 3 — mip cache eviction, config-driven seed, SkyAtmosphere origin fix (2026-07-20, worktree agent)
 

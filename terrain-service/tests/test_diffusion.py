@@ -236,6 +236,69 @@ def test_make_provider_diffusion_dry_run():
     assert provider.dry_run is True
 
 
+def test_make_provider_diffusion_without_config_uses_unpinned_default():
+    """Documents the PRE-existing (still valid) behavior: no config given ->
+    DiffusionProvider's own UNPINNED default. Contrast with the next test,
+    where a caller-supplied pinned config is NOT silently discarded."""
+    provider = _make_provider("diffusion", dry_run=True)
+    assert provider.config.checkpoint_sha256 == "UNPINNED"
+
+
+def test_make_provider_diffusion_propagates_pinned_config():
+    """The gap docs/pod-bringup-commands.md Block 5 flags: a caller-built
+    pinned DiffusionConfig must actually reach DiffusionProvider, not be
+    dropped in favor of the UNPINNED default. This is the core of the
+    `_make_provider` fix."""
+    pinned = DiffusionConfig(checkpoint_id="ckpt-x", checkpoint_sha256="a" * 64)
+    provider = _make_provider("diffusion", dry_run=True, config=pinned)
+    assert provider.config is pinned
+    assert provider.config.checkpoint_sha256 == "a" * 64
+    assert provider.provider_id.startswith(pinned.provider_id())
+
+
+def test_make_provider_synthetic_ignores_config_arg():
+    # config is diffusion-only; passing one for "synthetic" must not error
+    # or affect the returned provider (kwarg is simply unused).
+    from terrain_service.providers.synthetic import SyntheticProvider
+
+    provider = _make_provider("synthetic", config=DiffusionConfig())
+    assert isinstance(provider, SyntheticProvider)
+
+
+def test_create_app_pins_diffusion_config_from_env(tmp_path, monkeypatch):
+    """create_app (no explicit `provider=` override) must build its
+    DiffusionProvider from TERRAIN_DIFFUSION_CHECKPOINT_ID/_SHA256, not
+    silently fall back to the UNPINNED default -- same gap as the pregen
+    CLI, same fix (_make_provider's config passthrough), same env
+    surface the Flask server actually runs under."""
+    monkeypatch.setenv("TERRAIN_PROVIDER", "diffusion")
+    monkeypatch.setenv("TERRAIN_DIFFUSION_DRY_RUN", "1")
+    monkeypatch.setenv("TERRAIN_DIFFUSION_CHECKPOINT_ID", "ckpt-env")
+    monkeypatch.setenv("TERRAIN_DIFFUSION_CHECKPOINT_SHA256", "b" * 64)
+
+    app = create_app(cache=TileCache(tmp_path))
+    client = app.test_client()
+
+    expected = (
+        DiffusionConfig(checkpoint_id="ckpt-env", checkpoint_sha256="b" * 64).provider_id()
+        + "-dryrun"
+    )
+    assert client.get("/healthz").get_json()["provider"] == expected
+
+
+def test_create_app_without_checkpoint_env_uses_unpinned_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERRAIN_PROVIDER", "diffusion")
+    monkeypatch.setenv("TERRAIN_DIFFUSION_DRY_RUN", "1")
+    monkeypatch.delenv("TERRAIN_DIFFUSION_CHECKPOINT_ID", raising=False)
+    monkeypatch.delenv("TERRAIN_DIFFUSION_CHECKPOINT_SHA256", raising=False)
+
+    app = create_app(cache=TileCache(tmp_path))
+    client = app.test_client()
+
+    expected = DiffusionConfig().provider_id() + "-dryrun"
+    assert client.get("/healthz").get_json()["provider"] == expected
+
+
 def test_tile_api_diffusion_dry_run(tmp_path):
     provider = DiffusionProvider(dry_run=True)
     app = create_app(provider=provider, cache=TileCache(tmp_path))

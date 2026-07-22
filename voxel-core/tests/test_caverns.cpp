@@ -513,7 +513,14 @@ VXC_TEST(cavern_segment_cap_headroom) {
             if (c.count > maxSegs) maxSegs = c.count;
         }
     CHECK(maxSegs > 0);
-    CHECK(maxSegs < kMaxCavernSegs); // strict: the cap must never bind
+    // kMaxCavernSegs was shrunk to exactly kCavernChildCount (the provable
+    // max -- see caverns.h's static_assert "at most one open, in-reach site
+    // can ever cover a given column" x at most kCavernChildCount rooms per
+    // site): there is no headroom left by design, so the meaningful checks
+    // are "never exceeds the theoretical bound" and "the storage cap really
+    // is that bound, not something smaller that would silently truncate".
+    CHECK(maxSegs <= kCavernChildCount);
+    CHECK_EQ(kMaxCavernSegs, kCavernChildCount);
     std::printf("    [caverns] segment cap: max %d rooms per column over %zu columns "
                 "(cap %d); %.3f%% of columns are over a cavern\n",
                 maxSegs, columns, kMaxCavernSegs, 100.0 * double(withAny) / double(columns));

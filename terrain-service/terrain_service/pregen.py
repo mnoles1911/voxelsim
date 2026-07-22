@@ -68,6 +68,27 @@ def main() -> int:
             "checkpoint is wired up. See docs/diffusion-bringup.md."
         ),
     )
+    parser.add_argument(
+        "--checkpoint-id",
+        type=str,
+        default=None,
+        help=(
+            "Diffusion provider only: pinned checkpoint id/local snapshot "
+            "path. Together with --checkpoint-sha256, builds a pinned "
+            "DiffusionConfig instead of letting the provider fall back to "
+            "its UNPINNED default -- the sha256 gate (verify_checkpoint_"
+            "sha256) refuses real inference against an unpinned checkpoint "
+            "regardless, but only deep inside the call stack; pinning here "
+            "makes the CLI itself explicit about which checkpoint it is "
+            "using. See docs/pod-bringup-commands.md Block 5."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-sha256",
+        type=str,
+        default=None,
+        help="Diffusion provider only: sha256 of --checkpoint-id's weights/snapshot.",
+    )
 
     args = parser.parse_args()
 
@@ -76,9 +97,26 @@ def main() -> int:
         print(f"error: seed must fit in u64, got {args.seed}", file=sys.stderr)
         return 1
 
+    # Build a pinned DiffusionConfig for the diffusion provider so this CLI
+    # can never silently fall back to DiffusionConfig()'s UNPINNED default
+    # (docs/pod-bringup-commands.md Block 5's documented gap) -- --scale is
+    # threaded through unconditionally so a pregen at --scale 8 doesn't hit
+    # DiffusionProvider.generate's scale-mismatch guard against a config
+    # that defaulted to scale=1.
+    config = None
+    if args.provider == "diffusion":
+        from .providers.diffusion import DiffusionConfig
+
+        config_kwargs: dict[str, object] = {"scale": args.scale}
+        if args.checkpoint_id is not None:
+            config_kwargs["checkpoint_id"] = args.checkpoint_id
+        if args.checkpoint_sha256 is not None:
+            config_kwargs["checkpoint_sha256"] = args.checkpoint_sha256
+        config = DiffusionConfig(**config_kwargs)
+
     # Initialize provider and cache
     try:
-        provider = _make_provider(args.provider, dry_run=args.dry_run)
+        provider = _make_provider(args.provider, dry_run=args.dry_run, config=config)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

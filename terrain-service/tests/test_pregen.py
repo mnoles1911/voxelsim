@@ -131,3 +131,78 @@ def test_pregen_cached_tile_roundtrips(tmp_path):
     assert decoded.scale == fresh.scale
     np.testing.assert_array_equal(decoded.elevation, fresh.elevation)
     np.testing.assert_array_equal(decoded.climate, fresh.climate)
+
+
+# ---------------------------------------------------------------------------
+# --checkpoint-id / --checkpoint-sha256: the pinned-config wiring
+# (docs/pod-bringup-commands.md Block 5's documented gap -- the CLI must not
+# silently fall back to DiffusionConfig()'s UNPINNED default when a pinned
+# checkpoint is given).
+# ---------------------------------------------------------------------------
+
+
+def test_pregen_diffusion_dry_run_uses_pinned_checkpoint_in_cache_key(tmp_path):
+    from terrain_service.providers.diffusion import DiffusionConfig
+
+    cache_dir = tmp_path / "cache"
+    result = subprocess.run(
+        [
+            "python",
+            "-m",
+            "terrain_service.pregen",
+            "--seed", "5",
+            "--radius", "0",
+            "--cache-dir", str(cache_dir),
+            "--provider", "diffusion",
+            "--dry-run",
+            "--checkpoint-id", "ckpt-cli",
+            "--checkpoint-sha256", "c" * 64,
+        ],
+        cwd=Path(__file__).parent.parent,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"pregen failed: {result.stderr}"
+    assert "generated=1" in result.stderr
+
+    # The tile must be cached under the PINNED config's provider_id -- proof
+    # --checkpoint-id/--checkpoint-sha256 actually reached DiffusionProvider
+    # via _make_provider(config=...), not just parsed and discarded.
+    pinned_id = (
+        DiffusionConfig(checkpoint_id="ckpt-cli", checkpoint_sha256="c" * 64, scale=1)
+        .provider_id()
+        + "-dryrun"
+    )
+    cache = TileCache(cache_dir)
+    assert cache.get(pinned_id, 5, 0, 0, 1) is not None
+
+
+def test_pregen_diffusion_dry_run_without_pin_uses_unpinned_default(tmp_path):
+    """Companion to the test above: omitting --checkpoint-id/--checkpoint-
+    sha256 still works (dry-run only needs a config object to exist, not a
+    pinned one) and caches under the plain UNPINNED-default provider_id --
+    proving the two cases are genuinely distinguishable, not coincidentally
+    identical."""
+    from terrain_service.providers.diffusion import DiffusionConfig
+
+    cache_dir = tmp_path / "cache"
+    result = subprocess.run(
+        [
+            "python",
+            "-m",
+            "terrain_service.pregen",
+            "--seed", "5",
+            "--radius", "0",
+            "--cache-dir", str(cache_dir),
+            "--provider", "diffusion",
+            "--dry-run",
+        ],
+        cwd=Path(__file__).parent.parent,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"pregen failed: {result.stderr}"
+
+    default_id = DiffusionConfig(scale=1).provider_id() + "-dryrun"
+    cache = TileCache(cache_dir)
+    assert cache.get(default_id, 5, 0, 0, 1) is not None

@@ -275,7 +275,7 @@ inline constexpr uint32_t kCavernFloodDryThreshold32 = static_cast<uint32_t>((4u
 // of any column (static_assert below), contributing at most kCavernChildCount
 // (4) segments; 6 leaves headroom exactly like caves.h's kMaxCaveSegs does
 // for tunnels, without changing the underlying "at most one site" argument.
-inline constexpr int32_t kMaxCavernSegs = 6;
+inline constexpr int32_t kMaxCavernSegs = 4; // tight == kCavernChildCount: the provable max (see comment above + static_assert below); verified empirically (max 4 over 16M+ columns, test_caverns.cpp's cavern_segment_cap_headroom).
 
 // --- structural invariants, checked at compile time -------------------------
 

@@ -13,11 +13,19 @@ Configuration via environment:
                        See providers/diffusion.py and
                        docs/diffusion-bringup.md. Ignored for
                        TERRAIN_PROVIDER=synthetic.
+    TERRAIN_DIFFUSION_CHECKPOINT_ID / TERRAIN_DIFFUSION_CHECKPOINT_SHA256
+                       Pin the diffusion provider's DiffusionConfig (doctrine
+                       §2.3: checkpoint sha256 must be pinned before ANY real
+                       inference, or verify_checkpoint_sha256 refuses).
+                       Leaving these unset keeps DiffusionConfig's UNPINNED
+                       default, which is fine for TERRAIN_DIFFUSION_DRY_RUN=1
+                       but is refused for a real (non-dry-run) call.
 """
 
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
 
 from flask import Flask, Response, abort, request
 
@@ -25,15 +33,43 @@ from . import tile_codec
 from .cache import TileCache
 from .providers.synthetic import SyntheticProvider
 
+if TYPE_CHECKING:
+    from .providers.diffusion import DiffusionConfig
 
-def _make_provider(name: str, dry_run: bool = False):
+
+def _make_provider(name: str, dry_run: bool = False, config: "DiffusionConfig | None" = None):
     if name == "synthetic":
         return SyntheticProvider()
     if name == "diffusion":
         from .providers.diffusion import DiffusionProvider
 
-        return DiffusionProvider(dry_run=dry_run)
+        # `config`, when given, is the CALLER's pinned DiffusionConfig
+        # (checkpoint id/sha256/sampler/scale) -- passing it through here
+        # (rather than letting DiffusionProvider fall back to its own
+        # UNPINNED-default DiffusionConfig()) is exactly what closes the gap
+        # documented in docs/pod-bringup-commands.md Block 5: a caller that
+        # built a pinned config must not have it silently discarded.
+        return DiffusionProvider(config=config, dry_run=dry_run)
     raise ValueError(f"unknown TERRAIN_PROVIDER {name!r}")
+
+
+def _diffusion_config_from_env() -> "DiffusionConfig | None":
+    """Build a pinned DiffusionConfig from TERRAIN_DIFFUSION_CHECKPOINT_ID /
+    _SHA256 if either is set in the environment, else None (caller falls
+    back to DiffusionProvider's own UNPINNED default -- unchanged prior
+    behavior, and still fine for TERRAIN_DIFFUSION_DRY_RUN=1)."""
+    checkpoint_id = os.environ.get("TERRAIN_DIFFUSION_CHECKPOINT_ID")
+    checkpoint_sha256 = os.environ.get("TERRAIN_DIFFUSION_CHECKPOINT_SHA256")
+    if checkpoint_id is None and checkpoint_sha256 is None:
+        return None
+    from .providers.diffusion import DiffusionConfig
+
+    kwargs = {}
+    if checkpoint_id is not None:
+        kwargs["checkpoint_id"] = checkpoint_id
+    if checkpoint_sha256 is not None:
+        kwargs["checkpoint_sha256"] = checkpoint_sha256
+    return DiffusionConfig(**kwargs)
 
 
 def create_app(provider=None, cache: TileCache | None = None) -> Flask:
@@ -41,6 +77,7 @@ def create_app(provider=None, cache: TileCache | None = None) -> Flask:
     provider = provider or _make_provider(
         os.environ.get("TERRAIN_PROVIDER", "synthetic"),
         dry_run=os.environ.get("TERRAIN_DIFFUSION_DRY_RUN", "") == "1",
+        config=_diffusion_config_from_env(),
     )
     cache = cache or TileCache(os.environ.get("TERRAIN_CACHE_DIR", "tile-cache"))
 

@@ -12,8 +12,11 @@ namespace vxc {
 template <int B>
 class World {
 public:
-    World(uint64_t seed, ITileSampler& tiles)
-        : amp_(seed, tiles), gen_(amp_), log_(seed, B) {}
+    // `providerId` stamps the world's OWN log (see EditLog::providerId) with
+    // the identity of the tile provider `tiles` was sourced from — "" (the
+    // default) leaves it unstamped, matching pre-existing callers exactly.
+    World(uint64_t seed, ITileSampler& tiles, std::string providerId = {})
+        : amp_(seed, tiles), gen_(amp_), log_(seed, B, std::move(providerId)) {}
 
     const Amplifier& amplifier() const { return amp_; }
     const GeneratedWorld<B>& generated() const { return gen_; }
@@ -55,15 +58,31 @@ public:
 
     // Replay a parsed log into a fresh world. Fails (returns false) on
     // seed/brick-size mismatch — a log only replays against the world that
-    // produced it.
-    bool replay(const EditLog& log) {
+    // produced it. `currentProviderId`, if non-empty, is checked against the
+    // log's stamped provider (EditLog::checkProvider): a real MISMATCH
+    // refuses the replay (returns false) since the log's diffs were
+    // recorded against different terrain; an UNSTAMPED log (recorded before
+    // provider stamping existed) is not refused, only flagged — inspect
+    // lastProviderCheck() to warn the caller. Passing "" (the default)
+    // skips the check entirely, preserving old behavior for callers that
+    // have no provider identity to check against yet.
+    bool replay(const EditLog& log, const std::string& currentProviderId = {}) {
         if (log.seed() != amp_.seed() || log.brickEdge() != B) return false;
+        lastProviderCheck_ = currentProviderId.empty()
+            ? std::nullopt
+            : std::optional<EditLog::ProviderCheck>(log.checkProvider(currentProviderId));
+        if (lastProviderCheck_ == EditLog::ProviderCheck::kMismatch) return false;
         for (const EditEntry& e : log.entries()) {
             log_.append(e.key, e.cells);
             applyToOverlay(e);
         }
         return true;
     }
+
+    // Result of the most recent replay()'s provider check: nullopt if no
+    // currentProviderId was passed (check skipped), else the ProviderCheck
+    // verdict (kMatch/kUnstamped/kMismatch — see EditLog::checkProvider).
+    std::optional<EditLog::ProviderCheck> lastProviderCheck() const { return lastProviderCheck_; }
 
     // Deterministic digest over the edited bricks (sorted key order) — used by
     // the replay identity test.
@@ -97,6 +116,7 @@ private:
     GeneratedWorld<B> gen_;
     ChunkMap<B> overlay_;
     EditLog log_;
+    std::optional<EditLog::ProviderCheck> lastProviderCheck_;
 };
 
 } // namespace vxc
