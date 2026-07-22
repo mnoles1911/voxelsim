@@ -1,6 +1,8 @@
 #include "VoxelClipmapActor.h"
 
 #include "Camera/PlayerCameraManager.h"
+#include "Components/PointLightComponent.h"
+#include "Components/PostProcessComponent.h"
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
@@ -89,7 +91,9 @@ constexpr double kSnowlineBandHighMeters = 2900.0;
 // BoxRadiusChunksL0/SkirtChunksNear), and the largest worldgen feature down
 // here is a cavern at 24-56 m across -- all an order of magnitude inside 300
 // m, so the veil can never occlude a real cave surface.
-constexpr double kVeilHalfExtentUU = 30000.0; // 300 m
+// (the runtime value lives in AVoxelClipmapActor::VeilHalfExtentUU, which this
+// initialises; -VoxelVeilExtentM overrides it for diagnosis only)
+constexpr double kVeilHalfExtentUUDefault = 30000.0; // 300 m
 
 // Near-black rock. Multiplied into M_VoxelClipmap's BaseColor via its existing
 // DebugTint VectorParameter, so the veil needs NO new material asset (and no
@@ -181,6 +185,34 @@ void AVoxelClipmapActor::BeginPlay()
 	}
 	UE_LOG(LogVoxelEarth, Log, TEXT("VoxelUndergroundVeil: %s"), bVeilEnabled ? TEXT("enabled") : TEXT("DISABLED"));
 
+	// Diagnostic: shrink the veil box so it can be photographed. See the
+	// VeilHalfExtentUU declaration in the header.
+	VeilHalfExtentUU = kVeilHalfExtentUUDefault;
+	double VeilExtentM = 0.0;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelVeilExtentM="), VeilExtentM) && VeilExtentM > 0.1)
+	{
+		VeilHalfExtentUU = VeilExtentM * 100.0;
+		UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelUndergroundVeil: DIAGNOSTIC half-extent %.1f m (shipped default is 300 m)"),
+		       VeilExtentM);
+	}
+
+	// ---- Underground presentation rig ------------------------------------
+	int32 CaveLightFlag = 1;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelCaveLight="), CaveLightFlag))
+	{
+		bCaveRigEnabled = (CaveLightFlag != 0);
+	}
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelCaveEV="), CaveExposureEV100);
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelCaveLampLumens="), CaveLampLumens);
+	float LampRadiusM = 0.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelCaveLampRadiusM="), LampRadiusM) && LampRadiusM > 0.f)
+	{
+		CaveLampRadiusUU = LampRadiusM * 100.f;
+	}
+	UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCaveLight: %s (EV100 %.2f, lamp %.0f lm / %.0f m)"),
+	       bCaveRigEnabled ? TEXT("enabled") : TEXT("DISABLED"), CaveExposureEV100, CaveLampLumens,
+	       CaveLampRadiusUU / 100.f);
+
 	BuildSharedTopology();
 }
 
@@ -203,7 +235,7 @@ void AVoxelClipmapActor::EnsureVeilShell()
 	VeilShell->bUseAttachParentBound = false;
 	VeilShell->SetCastShadow(false); // pure occluder; casting from it would black out the cave
 
-	const double H = kVeilHalfExtentUU;
+	const double H = VeilHalfExtentUU;
 	// 8 corners, z-minor ordering: index bit0 = +X, bit1 = +Y, bit2 = +Z.
 	TArray<FVector> V;
 	V.Reserve(8);
@@ -257,6 +289,124 @@ void AVoxelClipmapActor::EnsureVeilShell()
 	VeilShell->SetVisibility(false);
 }
 
+// ---- Underground presentation rig -----------------------------------------
+//
+// THE MEASUREMENT THIS IMPLEMENTS (three same-binary captures of the
+// -VoxelCaveTest cave, 14.5 m down, identical camera):
+//
+//   A  shipped                          -- lit faces clipped to pure white,
+//                                          shadowed faces pale blue-grey.
+//   B  -ExecCmds="r.EyeAdaptationQuality 0"
+//                                       -- no clipping at all, warm rock,
+//                                          black shadows. Same geometry, same
+//                                          lights, same frame.
+//   C  -ExecCmds="r.SkyLightingQuality 0"
+//                                       -- shadowed faces go to pure black,
+//                                          confirming the pale-grey fill in A
+//                                          is the real-time-capture SkyLight
+//                                          and NOT the material's base colour.
+//
+// A vs B is the whole story: nothing underground is over-lit in absolute
+// terms (the sun is 8 lux and the ambient is a fraction of that). What is
+// wrong is the EXPOSURE. UE's histogram eye adaptation defaults to a
+// -10..+20 EV100 clamp, i.e. effectively unbounded, and a lightless cave has
+// no 18%-grey subject anywhere in frame -- so adaptation walks the whole
+// image up until something is grey, which means the lit faces clip.
+//
+// That same mechanism, and not SkyAtmosphere and not the tint, is what makes
+// the veil render as a "flat pale plane": the veil's base colour is 0.020,
+// and 0.020 lifted until the frame averages 18% grey is a mid-grey wall. The
+// darker the thing you draw, the harder auto-exposure fights you -- which is
+// why every previous attempt to fix the veil by making it DARKER could not
+// have worked.
+//
+// So the fix is one thing, not three: pin the exposure. min == max collapses
+// the histogram's search to a constant, which is manual exposure expressed in
+// the parameters the rest of the engine already understands.
+//
+// EV100 0 is the measured value: it reproduces capture B, which is the frame
+// that looked right. The lamp is then sized to that fixed stop rather than
+// the other way round.
+void AVoxelClipmapActor::EnsureCaveRig()
+{
+	if (CaveExposurePP)
+	{
+		return;
+	}
+
+	CaveExposurePP = NewObject<UPostProcessComponent>(this, TEXT("CaveExposurePP"));
+	CaveExposurePP->SetupAttachment(ClipmapRoot);
+	CaveExposurePP->RegisterComponent();
+	// Unbound: the volume has no shape, it applies everywhere. Correct here
+	// because the gate is "is the camera under rock", which is a property of
+	// the camera and not of a region a designer could author.
+	CaveExposurePP->bUnbound = true;
+	// Above every default-priority volume, but the project ships none, so
+	// this is future-proofing rather than a fight anyone is having today.
+	CaveExposurePP->Priority = 100.f;
+
+	// EXACTLY TWO overrides. Everything else -- bloom, colour grading, DOF,
+	// vignette -- is deliberately left to the project defaults, so that when
+	// the rig switches off, the frame is byte-identical to a pre-change frame
+	// rather than "close enough".
+	//
+	// AEM_Manual, NOT "histogram with min == max". The first version of this
+	// did use the min/max clamp, which reads like the more surgical change --
+	// and it produced a frame that was 100.0% pure white, every pixel clipped.
+	// The clamp fields are interpreted through r.EyeAdaptation.ExposureFormat,
+	// so "0" is not unambiguously "EV100 0", and the wrong reading of it is an
+	// exposure divide that runs away. AEM_Manual has no such ambiguity: the
+	// stop comes from the physical camera fields below, and AutoExposureBias
+	// offsets it in whole stops.
+	FPostProcessSettings& S = CaveExposurePP->Settings;
+	S.bOverride_AutoExposureMethod = true;
+	S.AutoExposureMethod = AEM_Manual;
+	S.bOverride_AutoExposureBias = true;
+	S.AutoExposureBias = CaveExposureEV100; // stops, -VoxelCaveEV=
+
+	CaveLamp = NewObject<UPointLightComponent>(this, TEXT("CaveLamp"));
+	CaveLamp->SetupAttachment(ClipmapRoot);
+	CaveLamp->RegisterComponent();
+	CaveLamp->SetMobility(EComponentMobility::Movable);
+	CaveLamp->SetIntensityUnits(ELightUnits::Lumens);
+	CaveLamp->SetIntensity(CaveLampLumens);
+	CaveLamp->SetVisibility(false);
+	// Lamp off entirely at 0 lumens, so the exposure lock can be A/B'd on its
+	// own without a second switch.
+	if (CaveLampLumens <= 0.f)
+	{
+		CaveLamp->SetIntensity(0.f);
+	}
+	CaveLamp->SetAttenuationRadius(CaveLampRadiusUU);
+	// Warm, like every lamp a person actually carries underground, and it
+	// separates the lit near field from the neutral-grey ambient behind it.
+	CaveLamp->SetLightColor(FLinearColor(1.0f, 0.86f, 0.68f));
+	// NO shadow casting. Two reasons, both load-bearing: a point light at the
+	// camera casts a shadow of nothing the camera can see (every shadow it
+	// casts is hidden behind the caster), so the shadow pass is pure cost;
+	// and a 6-face cube shadow map at 60 fps is exactly the sort of thing
+	// that would show up in the M1 budget if the rig ever leaked above ground.
+	CaveLamp->SetCastShadows(false);
+	CaveLamp->SetVisibility(false);
+}
+
+void AVoxelClipmapActor::SetCaveRigActive(bool bActive)
+{
+	if (bActive)
+	{
+		EnsureCaveRig();
+	}
+	if (CaveExposurePP)
+	{
+		CaveExposurePP->bEnabled = bActive;
+	}
+	if (CaveLamp)
+	{
+		CaveLamp->SetVisibility(bActive);
+	}
+	bCaveRigActive = bActive;
+}
+
 bool AVoxelClipmapActor::IsCameraUnderRock(const FVector& CameraLocUU) const
 {
 	const UWorld* World = GetWorld();
@@ -308,6 +458,12 @@ void AVoxelClipmapActor::SetVeilActive(bool bActive)
 	if (VeilShell)
 	{
 		VeilShell->SetVisibility(bActive);
+	}
+	// Same latch, same transition: the rig's "am I underground" predicate IS
+	// the veil's, by construction, so the two can never disagree.
+	if (bCaveRigEnabled)
+	{
+		SetCaveRigActive(bActive);
 	}
 	for (UProceduralMeshComponent* PMC : LevelMeshes)
 	{
@@ -640,6 +796,10 @@ void AVoxelClipmapActor::Tick(float DeltaTime)
 			// Follow the camera. Component-relative because ClipmapRoot is at
 			// the actor origin, same convention RebuildLevel uses.
 			VeilShell->SetRelativeLocation(CameraLocUU - GetActorLocation());
+		}
+		if (bCaveRigActive && CaveLamp)
+		{
+			CaveLamp->SetRelativeLocation(CameraLocUU - GetActorLocation());
 		}
 	}
 
