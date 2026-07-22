@@ -33,9 +33,19 @@ TILE_SIZE = tile_codec.TILE_SIZE
 
 def _good_raster(mapping: dict[str, str] | None = None) -> dict[str, np.ndarray]:
     mapping = mapping or DEFAULT_CHANNEL_MAPPING
+    # Climate values are RAW WorldClim physical units (bio_1/4/12/15), not
+    # [0, 1] -- confirmed against a real checkpoint 2026-07-22. These are the
+    # exact midpoint of each channel's declared range, so every one quantizes
+    # to 128 and a normalization bug cannot hide behind a coincidence.
     raster = {mapping["elevation"]: np.full((TILE_SIZE, TILE_SIZE), 100.0, dtype=np.float32)}
-    for name in ("temperature", "seasonality", "precipitation", "precip_variability"):
-        raster[mapping[name]] = np.full((TILE_SIZE, TILE_SIZE), 0.5, dtype=np.float32)
+    midpoints = {
+        "temperature": 0.0,  # degrees C, range [-40, 40]
+        "seasonality": 1500.0,  # sd x 100, range [0, 3000]
+        "precipitation": 6000.0,  # mm/yr, range [0, 12000]
+        "precip_variability": 100.0,  # CV %, range [0, 200]
+    }
+    for name, value in midpoints.items():
+        raster[mapping[name]] = np.full((TILE_SIZE, TILE_SIZE), value, dtype=np.float32)
     return raster
 
 
@@ -80,7 +90,10 @@ def test_validate_model_output_rejects_wrong_dtype():
 
 def test_validate_model_output_rejects_out_of_range_values():
     raster = _good_raster()
-    raster["precipitation"] = np.full((TILE_SIZE, TILE_SIZE), 5.0, dtype=np.float32)
+    # 50,000 mm/yr is ~4x the wettest place on Earth, so it is out of range
+    # under the physical bio_12 bounds. (This used to be 5.0, which only
+    # worked while we wrongly believed climate arrived normalized to [0, 1].)
+    raster["precipitation"] = np.full((TILE_SIZE, TILE_SIZE), 50000.0, dtype=np.float32)
     with pytest.raises(ModelOutputMismatch) as exc:
         validate_model_output(raster)
     msg = str(exc.value)
@@ -92,7 +105,10 @@ def test_validate_model_output_reports_all_issues_at_once():
     one issue per re-run."""
     raster = _good_raster()
     raster["elevation"] = raster["elevation"].astype(np.float64)  # dtype issue
-    raster["precipitation"] = np.full((TILE_SIZE, TILE_SIZE), 5.0, dtype=np.float32)  # range issue
+    # 50,000 mm/yr is ~4x the wettest place on Earth, so it is out of range
+    # under the physical bio_12 bounds. (This used to be 5.0, which only
+    # worked while we wrongly believed climate arrived normalized to [0, 1].)
+    raster["precipitation"] = np.full((TILE_SIZE, TILE_SIZE), 50000.0, dtype=np.float32)  # range issue
     del raster["seasonality"]  # missing-channel issue
     with pytest.raises(ModelOutputMismatch) as exc:
         validate_model_output(raster)
@@ -122,12 +138,19 @@ def test_adapt_raster_to_tile_quantizes_correctly():
     config = DiffusionConfig()
     raster = _good_raster()
     raster["elevation"] = np.full((TILE_SIZE, TILE_SIZE), 1234.6, dtype=np.float32)
-    raster["temperature"] = np.full((TILE_SIZE, TILE_SIZE), 1.0, dtype=np.float32)
+    raster["temperature"] = np.full((TILE_SIZE, TILE_SIZE), 40.0, dtype=np.float32)
     tile = adapt_raster_to_tile(raster, config, seed=1, x=0, y=0, scale=1)
     assert tile.elevation.dtype == np.int16
     assert int(tile.elevation[0, 0]) == 1235  # rounds
     assert tile.climate.dtype == np.uint8
-    assert tile.climate[0, 0, 0] == 255  # temperature channel 0, scaled 1.0 -> 255
+    # +40 C is the top of temperature's physical range -> saturates to 255.
+    assert tile.climate[0, 0, 0] == 255
+    # The other three are at their range midpoints (see _good_raster) -> 128.
+    # Under the old `raw * 255` quantization these all clipped to 255, which
+    # is exactly the bug this asserts against.
+    assert tile.climate[1, 0, 0] == 128  # seasonality 1500 of [0, 3000]
+    assert tile.climate[2, 0, 0] == 128  # precipitation 6000 of [0, 12000]
+    assert tile.climate[3, 0, 0] == 128  # precip_variability 100 of [0, 200]
 
 
 def test_adapt_raster_to_tile_clips_out_of_range_elevation():
@@ -333,11 +356,13 @@ class _FakeBackend:
     def generate_rasters(self, seed: int, x: int, y: int, scale: int) -> dict[str, np.ndarray]:
         self.calls.append((seed, x, y, scale))
         raster = {
+            # Physical WorldClim units, chosen to land on distinct, exactly
+            # representable quantization results (see EXPECTED_CHANNELS).
             "elevation": np.full((TILE_SIZE, TILE_SIZE), 1234.6, dtype=np.float32),
-            "temperature": np.full((TILE_SIZE, TILE_SIZE), 1.0, dtype=np.float32),
+            "temperature": np.full((TILE_SIZE, TILE_SIZE), 40.0, dtype=np.float32),
             "seasonality": np.full((TILE_SIZE, TILE_SIZE), 0.0, dtype=np.float32),
-            "precipitation": np.full((TILE_SIZE, TILE_SIZE), 0.5, dtype=np.float32),
-            "precip_variability": np.full((TILE_SIZE, TILE_SIZE), 0.25, dtype=np.float32),
+            "precipitation": np.full((TILE_SIZE, TILE_SIZE), 6000.0, dtype=np.float32),
+            "precip_variability": np.full((TILE_SIZE, TILE_SIZE), 50.0, dtype=np.float32),
         }
         return raster
 
@@ -373,10 +398,10 @@ def test_injected_backend_produces_correct_tile():
     assert int(tile.elevation[0, 0]) == 1235  # 1234.6 rounds to 1235
 
     assert tile.climate.dtype == np.uint8
-    assert tile.climate[0, 0, 0] == 255  # temperature 1.0 -> 255
-    assert tile.climate[1, 0, 0] == 0  # seasonality 0.0 -> 0
-    assert tile.climate[2, 0, 0] == 128  # precipitation 0.5 -> 128 (rounds)
-    assert tile.climate[3, 0, 0] == 64  # precip_variability 0.25 -> 64 (rounds)
+    assert tile.climate[0, 0, 0] == 255  # temperature +40 C, top of range
+    assert tile.climate[1, 0, 0] == 0  # seasonality 0, bottom of range
+    assert tile.climate[2, 0, 0] == 128  # precipitation 6000 of [0, 12000]
+    assert tile.climate[3, 0, 0] == 64  # precip_variability 50 of [0, 200]
 
 
 def test_injected_backend_receives_exact_call_args():
