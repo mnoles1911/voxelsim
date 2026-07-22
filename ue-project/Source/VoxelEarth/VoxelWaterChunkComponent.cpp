@@ -152,6 +152,41 @@ public:
 			}
 		}
 
+		// -VoxelWindingCheck: geometric proof that the winding above agrees
+		// with the shading normals, and (run against both proxies) that water
+		// agrees with terrain.
+		//
+		// Worth more than a screenshot here. A screenshot of water is easy to
+		// misread -- the ocean plane, the translucent material and the sky are
+		// all similar blue, and the top and bottom of a water slab are
+		// coincident planes -- whereas the sign of
+		// dot(cross(P1-P0, P2-P0), N) over the emitted triangles answers the
+		// question directly and cannot be argued with. Terrain's convention was
+		// verified on screen when its winding was fixed, so "water reports the
+		// same sign as terrain" is the verification.
+		{
+			static const bool bWindingCheck = FParse::Param(FCommandLine::Get(), TEXT("VoxelWindingCheck"));
+			if (bWindingCheck && IndexBuffer.Indices.Num() >= 3)
+			{
+				double DotSum = 0.0;
+				int32 TriCount = 0;
+				for (int32 I = 0; I + 2 < IndexBuffer.Indices.Num(); I += 3)
+				{
+					const FVector3f& P0 = Vertices[IndexBuffer.Indices[I + 0]].Position;
+					const FVector3f& P1 = Vertices[IndexBuffer.Indices[I + 1]].Position;
+					const FVector3f& P2 = Vertices[IndexBuffer.Indices[I + 2]].Position;
+					const FVector3f Geo = FVector3f::CrossProduct(P1 - P0, P2 - P0).GetSafeNormal();
+					// TangentZ is the shading normal stored by SetTangents.
+					const FVector3f N = Vertices[IndexBuffer.Indices[I]].TangentZ.ToFVector3f();
+					DotSum += double(FVector3f::DotProduct(Geo, N));
+					++TriCount;
+				}
+				UE_LOG(LogTemp, Log,
+				       TEXT("VoxelWindingCheck WATER: tris=%d meanDot(geometricNormal, shadingNormal)=%+.3f"),
+				       TriCount, TriCount > 0 ? DotSum / double(TriCount) : 0.0);
+			}
+		}
+
 		VertexBuffers.InitFromDynamicVertex(&VertexFactory, Vertices);
 
 		BeginInitResource(&VertexBuffers.PositionVertexBuffer);

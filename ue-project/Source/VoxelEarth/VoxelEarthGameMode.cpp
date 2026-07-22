@@ -983,12 +983,25 @@ void AVoxelEarthGameMode::BeginPlay()
 					else if (bOverheadFraming && PC)
 					{
 						constexpr double HoverHeightAboveUU = 1500.0; // 15m: fills frame, clears splash geometry
+						// -VoxelWaterUnderside: same subject and same settle,
+						// but the camera sits INSIDE the water body looking
+						// straight up, so the frame is the top water face seen
+						// from beneath. That is the view that a wrong triangle
+						// winding destroys -- with the faces inverted the
+						// underside is culled and you see straight out through
+						// the surface -- so the above/below pair is the
+						// verification for the water winding fix.
+						const bool bUnderside = FParse::Param(FCommandLine::Get(), TEXT("VoxelWaterUnderside"));
+						const FVector Pose = bUnderside
+							? OverheadColumnWorld
+							: OverheadColumnWorld + FVector(0.0, 0.0, HoverHeightAboveUU);
+						const FRotator Look(bUnderside ? 85.f : -85.f, 0.f, 0.f);
 						if (APawn* P = PC->GetPawn())
 						{
-							P->SetActorLocation(OverheadColumnWorld + FVector(0.0, 0.0, HoverHeightAboveUU));
-							P->SetActorRotation(FRotator(-85.f, 0.f, 0.f));
+							P->SetActorLocation(Pose);
+							P->SetActorRotation(Look);
 						}
-						PC->SetControlRotation(FRotator(-85.f, 0.f, 0.f));
+						PC->SetControlRotation(Look);
 					}
 					else if (PC)
 					{
