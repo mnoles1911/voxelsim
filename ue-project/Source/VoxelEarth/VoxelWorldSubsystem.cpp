@@ -1111,6 +1111,36 @@ bool ComputeVoxelCoordBounds(const TArray<VoxelCoords::FVoxelCoord>& Coords, Vox
 }
 } // namespace
 
+// Bounded admission switch (docs/status.md "Streaming pipeline re-measure +
+// rework"; see FVoxelWorldImpl::AdmissionCutoffDistSq for what it does).
+//
+// Deliberately a COMMAND-LINE switch resolved once at first use, not a cvar:
+// `-ExecCmds` cvars are applied after streaming has already begun, so an
+// -ExecCmds A/B silently measures the same warmed-up state twice (this project
+// has been bitten by exactly that -- see -VoxelNoUnderground, which exists for
+// the same reason). `-VoxelPendingJobCap=0` restores the unbounded,
+// pre-this-wave behaviour for A/B measurement.
+namespace VoxelStreamAdmission
+{
+// Max chunks that may sit queued for worker meshing at once. At the measured
+// ~250 chunks/s drain rate this is ~8 seconds of queued work -- deep enough
+// that the worker pool never runs dry between recomputes (which happen ~8x/s),
+// shallow enough that the queue costs a fraction of what an uncapped ~28k-deep
+// one does in the per-recompute sort, filter and exit scan.
+constexpr int32 kDefaultPendingJobCap = 2048;
+
+int32 GetPendingJobCap()
+{
+	static const int32 Cap = []
+	{
+		int32 Value = kDefaultPendingJobCap;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelPendingJobCap="), Value);
+		return FMath::Max(0, Value); // 0 = unbounded (pre-wave behaviour)
+	}();
+	return Cap;
+}
+} // namespace VoxelStreamAdmission
+
 // FVoxelWorldImpl -- the voxel-core side of the subsystem, defined only here
 // so VoxelWorldSubsystem.h (UHT-parsed) never sees a voxel-core header. Also
 // owns ALL Stage 2 streaming state (chunk records, pending-work queues, the
@@ -1310,6 +1340,74 @@ struct FVoxelWorldImpl
 	};
 	mutable TMap<VoxelCoords::FVoxelLevelChunkKey, FFootprintZRange> FootprintZRangeCache;
 
+	// --- Bounded admission (docs/status.md "Streaming pipeline re-measure +
+	// rework") ---------------------------------------------------------------
+	//
+	// The desired set is produced far faster than the worker pool can drain it
+	// (measured: ~28-29k chunks queued, ~24 jobs in flight pinned at the cap,
+	// ~250 chunks/s consumed, and 207k evictions per 15k loads over a 60s
+	// flight -- i.e. ~93% of everything admitted left the desired set before a
+	// worker ever looked at it). Every one of those admissions cost a
+	// ChunkRecords TMap insert, a slot in the O(n log n) pending-queue sort
+	// (8x/second), a slot in the O(evictions) queue filter, AND a slot in the
+	// O(tracked) exit hysteresis scan -- all to describe work that was never
+	// going to happen.
+	//
+	// So the queue is capped at what can actually be consumed. Two gates, both
+	// keyed on the SAME 3D chunk-centre distance SortPendingQueues already
+	// prioritises by, so neither changes the ORDER work is done in -- only how
+	// much never-to-be-done work is materialised:
+	//  (a) AdmissionCutoffDistSq -- while the queue is full, a candidate farther
+	//      than the farthest currently-queued chunk is not made a record at all
+	//      (it would only be dropped again by (b) this same call). Candidates
+	//      NEARER than the cutoff are always admitted, so nothing near the
+	//      player ever waits behind a full queue of far work.
+	//  (b) TruncatePendingJobQueue -- after the sort, the farthest entries past
+	//      the cap are dropped, record and all. Only ever entries that have no
+	//      component and no job in flight (a queued chunk by definition has
+	//      never meshed), so a drop costs nothing and loses nothing: the entry
+	//      scan re-enumerates any untracked in-annulus footprint the next time
+	//      that level scans, which is exactly when its distance ranking can have
+	//      changed (the per-level gate fires on the anchor crossing a level-L
+	//      chunk boundary).
+	//
+	// Determinism is untouched -- this changes only WHICH chunks are queued,
+	// never what a chunk contains.
+	double AdmissionCutoffDistSq = DBL_MAX; // farthest queued chunk's distSq when the queue is at cap; DBL_MAX = not full
+
+	// True while the cap is holding work back (something was rejected or
+	// dropped by the two gates above). This is what makes the cap safe for a
+	// player who STOPS: RecomputeDesiredSet is triggered by anchor movement, so
+	// with an unbounded queue a stationary player kept a ~26k backlog feeding
+	// the workers for minutes, whereas a capped queue drains in seconds and --
+	// without this -- would then sit idle with unloaded chunks still in range,
+	// because nothing would ever re-enumerate them. TickStreaming therefore also
+	// recomputes when a deferring queue has drained (see its trigger), and that
+	// recompute clears the per-level scan gate so the entry scans actually run
+	// with the anchor sitting still.
+	bool bAdmissionDeferredWork = false;
+	// Per-RecomputeDesiredSet-call bookkeeping for the flag above (reset at the
+	// top of every call): how many levels actually ran their entry scan, and how
+	// many candidates gate (a) declined.
+	int32 LevelsScannedThisCall = 0;
+	int32 CandidatesRejectedThisCall = 0;
+	// Admission budget, per LEVEL per RecomputeDesiredSet call. The distance
+	// cutoff alone does not bound how much a single call admits: DispatchJobs
+	// pops from the NEAR end, so the queue steadily fills with the farthest
+	// candidates, the cutoff drifts out with it, and every call was admitting
+	// ~3k newly-near chunks and dropping ~3k newly-far ones (each an insert +
+	// an erase, and a slot in that call's sort). Bounding admissions bounds all
+	// three at once. Sized well above the measured per-call dispatch rate
+	// (~160), so it never starves the workers -- what it removes is churn, not
+	// throughput.
+	//
+	// Per level, not per call, because levels are scanned in ascending order
+	// and level 0 rescans on EVERY call while level 1 rescans on every second
+	// one: one shared budget let R0 spend it before R1 was even looked at, and
+	// R1 residency measured ~8% lower for it (620-664 loaded vs 699-705). A
+	// budget each keeps the ring mix where it was.
+	int32 AdmissionsThisLevel = 0;
+
 	// Bound on the memo above. The live working set is the union of all five
 	// annuli, ~5k footprints; this cap leaves an order of magnitude of slack
 	// for drift before PruneFootprintZRangeCache drops the entries that are
@@ -1405,6 +1503,30 @@ struct FVoxelWorldImpl
 	int32 LevelEntryScans[VoxelCoords::kNumLevels] = {}; // how many times each level's entry scan actually ran
 	int32 RecomputeCalls = 0;
 
+	// --- Streaming pipeline re-measure (docs/status.md "Streaming pipeline
+	// re-measure + rework") -------------------------------------------------
+	// The hitch log above only fires on frames over the 33.3ms threshold, and a
+	// -nullrhi throughput run has none -- so "where does per-tick time go" and
+	// "how much worker output is actually used" were both unmeasurable. These
+	// accumulate every tick and are reported (then reset) by the 5s periodic
+	// log. All are plain counter adds on a path that already calls
+	// FPlatformTime::Seconds four times per tick; nothing new is timed.
+	double AccumDispatchMs = 0.0;
+	double AccumApplyMs = 0.0;
+	double AccumRemeshMs = 0.0;
+	double AccumUnloadMs = 0.0;
+	double AccumRecomputeMs = 0.0;
+	double AccumTickMs = 0.0;
+	int32 AccumTicks = 0;
+	int64 JobsDispatchedSinceLog = 0;   // DispatchJobs: worker jobs actually launched
+	int64 ResultsDrainedSinceLog = 0;   // DrainResults: results dequeued (live + stale)
+	int64 StaleDiscardsSinceLog = 0;    // ...of which discarded (record gone / superseded)
+	int64 ZeroQuadAppliesSinceLog = 0;  // ...of which meshed to zero quads (buried: real work, no component)
+	int64 RecordsAddedSinceLog = 0;     // RecomputeDesiredSet: ChunkRecords.Add calls (admission)
+	int64 RecordsEvictedSinceLog = 0;   // DrainUnloads: records erased (component-less + parked)
+	int64 CandidatesRejectedSinceLog = 0; // bounded admission: in-annulus candidates NOT admitted (never became records)
+	int64 RecordsDroppedSinceLog = 0;     // bounded admission: queued-but-never-meshed records displaced by nearer work
+
 	// The 60fps bar is 16.6ms, but the hitch log/`UVoxelPerfRunSubsystem`'s
 	// hitch count both use the much looser 33.3ms threshold -- a recurring
 	// ~20-30ms burst is a hard 60fps violation that is completely invisible to
@@ -1497,6 +1619,9 @@ private:
 
 
 	void RecomputeDesiredSet(const FVector& Anchor);
+	// Bounded admission gate (b) -- see AdmissionCutoffDistSq. Called only from
+	// RecomputeDesiredSet, immediately after SortPendingQueues.
+	void TruncatePendingJobQueue();
 	void ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax) const;
 	// Memoized wrapper around ComputeFootprintChunkZRange -- see
 	// FootprintZRangeCache's doc comment for why memoizing is exact.
@@ -1676,9 +1801,28 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	const bool bUndergroundNow = EvaluateAnchorUnderground(Anchor);
 	const bool bUndergroundChanged = bUndergroundNow != bAnchorUnderground;
 	bAnchorUnderground = bUndergroundNow;
+
+	// Bounded admission (see bAdmissionDeferredWork): a third trigger, for the
+	// case the movement gates cannot see -- the queue has drained below a
+	// quarter of its cap while the cap is still holding candidates back. That
+	// only happens when the workers have caught up, which is exactly when more
+	// work should be admitted, and it is the standing-still case in particular
+	// (no movement trigger will ever fire). The per-level scan gate is cleared
+	// for this call, since it would otherwise skip every level for the same
+	// "anchor hasn't moved" reason.
+	const int32 AdmissionCap = VoxelStreamAdmission::GetPendingJobCap();
+	const bool bAdmissionRefill =
+		bHasRecomputed && bAdmissionDeferredWork && AdmissionCap > 0 && PendingJobKeys.Num() * 4 < AdmissionCap;
 	if (!bHasRecomputed || AnchorChunk.X != LastAnchorChunk.X || AnchorChunk.Y != LastAnchorChunk.Y ||
-	    bUndergroundChanged || (bAnchorUnderground && AnchorChunk.Z != LastAnchorChunk.Z))
+	    bUndergroundChanged || (bAnchorUnderground && AnchorChunk.Z != LastAnchorChunk.Z) || bAdmissionRefill)
 	{
+		if (bAdmissionRefill)
+		{
+			for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+			{
+				bHasRecomputedLevel[Level] = false;
+			}
+		}
 		RecomputeDesiredSet(Anchor);
 		LastAnchorChunk = AnchorChunk;
 		bHasRecomputed = true;
@@ -1711,6 +1855,16 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		ThisFrameApplyMs = float((T2 - T1) * 1000.0);
 		ThisFrameRemeshMs = float((T3 - T2) * 1000.0);
 		ThisFrameUnloadMs = float((T4 - T3) * 1000.0);
+
+		// Streaming re-measure: same four samples, also summed into the 5s
+		// window so the periodic log can report where tick time goes on runs
+		// that never cross the hitch threshold at all.
+		AccumDispatchMs += (T1 - T0) * 1000.0;
+		AccumApplyMs += (T2 - T1) * 1000.0;
+		AccumRemeshMs += (T3 - T2) * 1000.0;
+		AccumUnloadMs += (T4 - T3) * 1000.0;
+		AccumRecomputeMs += ThisFrameRecomputeMs;
+		++AccumTicks;
 	}
 
 	InFlightTasks.RemoveAllSwap([](const UE::Tasks::TTask<void>& T) { return T.IsCompleted(); }, EAllowShrinking::No);
@@ -1728,6 +1882,11 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// debug-mode gate). Both UpdatePerfSnapshot (below) and the hitch
 	// attribution log want it.
 	const float TickMsSoFar = float((FPlatformTime::Seconds() - TickStartSeconds) * 1000.0);
+	// Streaming re-measure: whole-tick cost into the same 5s window as the four
+	// stage timers above (MaybeLogCounters has already run for this tick, so a
+	// given window's ticks are all summed before the log that reports them --
+	// consistent, not lagged, because the reset happens in the same call).
+	AccumTickMs += TickMsSoFar;
 
 	// Constraint: "keep all debug work zero-cost when voxel.Debug=0 (branch
 	// out early)" -- FVoxelPerfSnapshot collection (array iteration, once/sec
@@ -1933,6 +2092,41 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       MaxLevelEntryMs[3], MaxLevelEntryMs[4], LevelEntryScans[0], LevelEntryScans[1], LevelEntryScans[2], LevelEntryScans[3],
 	       LevelEntryScans[4], ChunkRecords.Num(), PendingJobKeys.Num(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num(),
 	       FramesOver60FpsBarSinceLog, (long long)TotalFramesOver60FpsBar);
+	// Streaming pipeline re-measure (docs/status.md "Streaming pipeline
+	// re-measure + rework"): the two questions the existing logs could not
+	// answer. (1) Where does per-tick time go -- the hitch log breaks a tick
+	// down but only fires above 33.3ms, so a clean run reports nothing at all;
+	// these are the same four stage timers summed over the whole 5s window,
+	// which is what makes "streaming costs X% of the frame" answerable. (2) How
+	// much worker output is actually USED -- dispatched vs drained vs discarded
+	// as stale vs meshed-to-zero-quads. `loaded` in the line above counts only
+	// component creations, so it understates worker throughput by every buried
+	// chunk and overstates efficiency by every wasted job.
+	// The window is the log cadence itself (LogTimerAccumSeconds has already
+	// been reset to 0 above), i.e. 5s plus at most one frame.
+	constexpr double WindowMs = 5000.0;
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel tick budget (5s window): ticks=%d tickMs=%.1f (%.2f%% of wall) | recompute=%.1f dispatch=%.1f ")
+	       TEXT("apply=%.1f remesh=%.1f unload=%.1f | perTick tick=%.3f recompute=%.3f"),
+	       AccumTicks, AccumTickMs, WindowMs > 0.0 ? 100.0 * AccumTickMs / WindowMs : 0.0, AccumRecomputeMs, AccumDispatchMs,
+	       AccumApplyMs, AccumRemeshMs, AccumUnloadMs, AccumTicks > 0 ? AccumTickMs / AccumTicks : 0.0,
+	       AccumTicks > 0 ? AccumRecomputeMs / AccumTicks : 0.0);
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel job flow (5s window): dispatched=%lld drained=%lld stale=%lld (%.1f%%) zeroQuad=%lld ")
+	       TEXT("recordsAdded=%lld recordsEvicted=%lld candidatesRejected=%lld"),
+	       (long long)JobsDispatchedSinceLog, (long long)ResultsDrainedSinceLog, (long long)StaleDiscardsSinceLog,
+	       ResultsDrainedSinceLog > 0 ? 100.0 * double(StaleDiscardsSinceLog) / double(ResultsDrainedSinceLog) : 0.0,
+	       (long long)ZeroQuadAppliesSinceLog, (long long)RecordsAddedSinceLog, (long long)RecordsEvictedSinceLog,
+	       (long long)CandidatesRejectedSinceLog);
+	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel admission (5s window): cap=%d cutoffM=%.0f rejected=%lld dropped=%lld"),
+	       VoxelStreamAdmission::GetPendingJobCap(),
+	       AdmissionCutoffDistSq < DBL_MAX ? FMath::Sqrt(AdmissionCutoffDistSq) / 100.0 : -1.0,
+	       (long long)CandidatesRejectedSinceLog, (long long)RecordsDroppedSinceLog);
+	AccumDispatchMs = AccumApplyMs = AccumRemeshMs = AccumUnloadMs = AccumRecomputeMs = AccumTickMs = 0.0;
+	AccumTicks = 0;
+	JobsDispatchedSinceLog = ResultsDrainedSinceLog = StaleDiscardsSinceLog = ZeroQuadAppliesSinceLog = 0;
+	RecordsAddedSinceLog = RecordsEvictedSinceLog = CandidatesRejectedSinceLog = RecordsDroppedSinceLog = 0;
+
 	MaxRecomputeMs = 0.f;
 	MaxExitScanMs = 0.f;
 	MaxSortMs = 0.f;
@@ -2378,6 +2572,26 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// only runs on an anchor chunk crossing, never per-frame.
 	const double RecomputeT0 = FPlatformTime::Seconds();
 	EvictedThisCall.Reset();
+	LevelsScannedThisCall = 0;
+	CandidatesRejectedThisCall = 0;
+
+	// Bounded admission: the cutoff was computed at the end of the PREVIOUS
+	// call, when the queue was at cap; workers have been draining it since.
+	// Relax it only once the queue has drained MEANINGFULLY (below 3/4 cap),
+	// not on the handful of slots one inter-recompute interval frees: relaxing
+	// on every call would re-admit (and re-drop) the whole rejected annulus
+	// every call, which is the exact TMap add/erase churn the cap exists to
+	// remove -- measured at ~68k candidate chunks/second produced by the entry
+	// scans. Below 3/4 the queue genuinely has room (cold start, a teleport, or
+	// a throughput burst) and should refill without waiting for the anchor to
+	// move.
+	{
+		const int32 Cap = VoxelStreamAdmission::GetPendingJobCap();
+		if (Cap <= 0 || PendingJobKeys.Num() * 4 < Cap * 3)
+		{
+			AdmissionCutoffDistSq = DBL_MAX;
+		}
+	}
 
 	// 1. Hysteresis exit: currently-tracked chunks (any level) that drifted
 	// beyond their level's unload ring, OR drifted inside their level's inner
@@ -2487,6 +2701,8 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		LastAnchorChunkPerLevel[Level] = AnchorChunk;
 		bHasRecomputedLevel[Level] = true;
 		++LevelEntryScans[Level];
+		++LevelsScannedThisCall;
+		AdmissionsThisLevel = 0; // per-level admission budget (see its doc comment)
 
 		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[Level];
 		const double InnerUU = Preset.InnerMeters * 100.0;
@@ -2518,16 +2734,51 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				// horizontal distance, which the memo does not key on.
 				ChunkZMin -= VoxelUnderground::SkirtDepthChunks(Level, DistSq);
 
-				const auto AddCandidate = [this](const FVoxelLevelChunkKey& LevelKey, bool bDeepAnchorRelative)
+				const auto AddCandidate = [this, ChunkEdge, CenterX, CenterY, &Anchor](const FVoxelLevelChunkKey& LevelKey,
+				                                                                     bool bDeepAnchorRelative)
 				{
 					if (ChunkRecords.Contains(LevelKey))
 					{
 						return;
 					}
 
+					// Bounded admission gate (a): while the WORKER queue is at
+					// cap, a candidate farther than the farthest already-queued
+					// chunk would be dropped again by TruncatePendingJobQueue at
+					// the bottom of this very call -- so never make it a record.
+					// Same 3D chunk-centre distance the queue is sorted by.
+					// Applies only to the worker path: the game-thread queue is
+					// edit-driven (always near the player, never a backlog) and
+					// is not what the cap exists to bound.
+					const bool bOverlayAware = NeedsOverlayAwarePath(LevelKey);
+					const int32 Cap = VoxelStreamAdmission::GetPendingJobCap();
+					if (!bOverlayAware && Cap > 0 && AdmissionsThisLevel >= Cap / 4)
+					{
+						// Per-level admission budget (see AdmissionsThisLevel).
+						++CandidatesRejectedSinceLog;
+						++CandidatesRejectedThisCall;
+						bAdmissionDeferredWork = true;
+						return;
+					}
+					if (!bOverlayAware && AdmissionCutoffDistSq < DBL_MAX)
+					{
+						const double CenterZ = (double(LevelKey.Key.Z) + 0.5) * ChunkEdge;
+						const double DistSq3D = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) +
+						                        FMath::Square(CenterZ - Anchor.Z);
+						if (DistSq3D >= AdmissionCutoffDistSq)
+						{
+							++CandidatesRejectedSinceLog;
+							++CandidatesRejectedThisCall;
+							bAdmissionDeferredWork = true;
+							return;
+						}
+					}
+
 					VoxelStreaming::FChunkRecord& NewRecord = ChunkRecords.Add(LevelKey);
+					++RecordsAddedSinceLog;
+					AdmissionsThisLevel += bOverlayAware ? 0 : 1;
 					NewRecord.bDeepAnchorRelative = bDeepAnchorRelative;
-					if (NeedsOverlayAwarePath(LevelKey))
+					if (bOverlayAware)
 					{
 						PendingGameThreadKeys.Add(LevelKey);
 					}
@@ -2574,6 +2825,13 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 
 	const double SortT0 = FPlatformTime::Seconds();
 	SortPendingQueues(Anchor);
+	// Bounded admission gate (b) -- must run immediately after the sort, which
+	// is what puts the farthest (lowest-priority) entries at the front and
+	// leaves SortScratchJob's distances aligned with the queue. Timed inside
+	// sortMs: it is part of the same "get the queue into shape" stage, and
+	// keeping it there means the existing sortMs metric still accounts for
+	// 100% of the queue-maintenance cost.
+	TruncatePendingJobQueue();
 	const double SortT1 = FPlatformTime::Seconds();
 	ThisFrameSortMs = float((SortT1 - SortT0) * 1000.0);
 	ThisFrameRecomputeMs = float((SortT1 - RecomputeT0) * 1000.0);
@@ -2581,6 +2839,80 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	MaxExitScanMs = FMath::Max(MaxExitScanMs, ThisFrameExitScanMs);
 	MaxSortMs = FMath::Max(MaxSortMs, ThisFrameSortMs);
 	++RecomputeCalls;
+}
+
+void FVoxelWorldImpl::TruncatePendingJobQueue()
+{
+	// Bounded admission gate (b) -- see AdmissionCutoffDistSq's doc comment.
+	// Called only from RecomputeDesiredSet, immediately after SortPendingQueues:
+	// PendingJobKeys is sorted lowest-priority-first (farthest at index 0), and
+	// SortScratchJob[i].DistSq is the distance of PendingJobKeys[i].
+	const int32 Cap = VoxelStreamAdmission::GetPendingJobCap();
+	if (Cap <= 0 || PendingJobKeys.Num() <= Cap)
+	{
+		AdmissionCutoffDistSq = DBL_MAX; // not full: admit everything in range
+		// Nothing was held back by THIS call. Only clear the deferral flag if
+		// every level actually re-enumerated on this call (a movement-triggered
+		// call scans only the levels whose own chunk the anchor crossed, so a
+		// level gated out of it may still have candidates waiting -- clearing
+		// then would lose the refill trigger for them). A refill call always
+		// satisfies this, since it clears the per-level gate first.
+		if (LevelsScannedThisCall == VoxelCoords::kNumLevels && CandidatesRejectedThisCall == 0)
+		{
+			bAdmissionDeferredWork = false;
+		}
+		return;
+	}
+	bAdmissionDeferredWork = true;
+
+	const int32 OldNum = PendingJobKeys.Num();
+	int32 ToDrop = OldNum - Cap;
+	int32 Write = 0;
+	for (int32 Read = 0; Read < OldNum; ++Read)
+	{
+		const VoxelCoords::FVoxelLevelChunkKey Key = PendingJobKeys[Read];
+		if (ToDrop > 0)
+		{
+			VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Key);
+			if (!Rec)
+			{
+				--ToDrop; // already untracked: a queue entry with no record is dead weight anyway
+				continue;
+			}
+			// A queued chunk has never meshed, so it has no component and no job
+			// in flight -- both are asserted rather than assumed, because
+			// dropping a record that DOES own either would leak a component or
+			// strand an in-flight result. Anything already queued for unload is
+			// left to DrainUnloads (it owns that record's removal).
+			if (!Rec->Component.IsValid() && !Rec->bJobInFlight && !PendingUnloadSet.Contains(Key))
+			{
+				ChunkRecords.Remove(Key);
+				++RecordsDroppedSinceLog;
+				--ToDrop;
+				continue;
+			}
+		}
+		PendingJobKeys[Write++] = Key;
+	}
+	PendingJobKeys.SetNum(Write, EAllowShrinking::No);
+
+	// The cutoff is the distance of a surviving entry a headroom band IN FROM
+	// the farthest survivor. Entries are dropped from the front (farthest) in
+	// order, so survivors occupy [OldNum - Write, OldNum) of the still-sorted
+	// scratch, with distance decreasing as the index rises.
+	//
+	// Why not simply "distance of the farthest survivor": candidates cluster
+	// just inside it, so every call would admit a few thousand chunks barely
+	// nearer than the cutoff and then drop most of them again on this same pass
+	// -- a thrash costing one TMap insert + one erase per chunk per call
+	// (measured at ~46k/second before this band existed). The band admits only
+	// chunks that are clearly nearer, sized so a call's admissions are on the
+	// order of what a call's dispatches drain (~160 at the measured rate),
+	// which is the whole point of the exercise: make production track drain.
+	const int32 Headroom = FMath::Max(1, Cap / 8);
+	const int32 CutoffIndex = FMath::Min(OldNum - Write + Headroom, OldNum - 1);
+	AdmissionCutoffDistSq =
+		(Write > 0 && SortScratchJob.Num() == OldNum && CutoffIndex >= 0) ? SortScratchJob[CutoffIndex].DistSq : DBL_MAX;
 }
 
 // --- budgeted drains ----------------------------------------------------
@@ -2613,6 +2945,7 @@ void FVoxelWorldImpl::DispatchJobs()
 
 		Rec->bJobInFlight = true;
 		JobsInFlightCounter.Increment();
+		++JobsDispatchedSinceLog;
 
 		const uint64 GenId = Rec->GenerationId;
 		// Worker threading (decisions table): the job touches ONLY
@@ -2892,6 +3225,7 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 	while (Applied < MaxApplies && Drains < kMaxResultDrainsPerFrame && ResultsQueue.Dequeue(Result))
 	{
 		++Drains;
+		++ResultsDrainedSinceLog;
 
 		// docs/debug-tooling-plan.md P1 "Worker timings": recorded for every
 		// drained result, even ones about to be discarded as stale below --
@@ -2919,10 +3253,12 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		if (!Rec || Rec->GenerationId != Result.GenerationId)
 		{
 			++StaleResultsDiscarded;
+			++StaleDiscardsSinceLog;
 			continue;
 		}
 
 		Rec->bJobInFlight = false;
+		ZeroQuadAppliesSinceLog += (Result.Quads.Num() == 0) ? 1 : 0;
 		++Applied; // a live result: this IS a render-thread-facing apply
 		if (ApplyMeshResult(Owner, Root, Material, Result.Key, *Rec, MoveTemp(Result.Quads), /*bIsGameThreadMesh*/ false))
 		{
@@ -3054,6 +3390,7 @@ void FVoxelWorldImpl::DrainUnloads()
 		ResidentQuads -= Rec->LastQuadCount;
 		ChunkRecords.Remove(Key);
 		++TotalChunksUnloaded;
+		++RecordsEvictedSinceLog;
 	}
 	// Re-queue the deferred component-bearing unloads (still in PendingUnloadSet,
 	// still tracked) so they're retried next frame under the render budget.
