@@ -24,10 +24,30 @@ fraction so the choice is data, not vibes.
 """
 
 import argparse
+import json
+import os
 import sys
 import time
 
 import numpy as np
+
+
+def _write_json(path, args, results) -> None:
+    """Atomically dump scan state for tools/pick_origin.py to consume."""
+    payload = {
+        "seed": args.seed,
+        "radius": args.radius,
+        "stride": args.stride,
+        "checkpoint_dir": args.checkpoint_dir,
+        "tiles": [
+            {"x": x, "y": y, "land": land, "min": lo, "max": hi}
+            for (x, y), (land, lo, hi) in sorted(results.items())
+        ],
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, path)
 
 
 def main() -> int:
@@ -37,6 +57,7 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=20260719)
     ap.add_argument("--radius", type=int, default=2, help="scan radius in strided steps")
     ap.add_argument("--stride", type=int, default=3, help="tiles skipped between samples")
+    ap.add_argument("--json", help="write raw results here for tools/pick_origin.py")
     args = ap.parse_args()
 
     if len(args.checkpoint_sha256) != 64 or args.checkpoint_sha256.startswith("<"):
@@ -66,6 +87,10 @@ def main() -> int:
         print(f"({x:+4d},{y:+4d})  land={land * 100:5.1f}%  "
               f"min={elev.min():9.1f}  max={elev.max():8.1f}   "
               f"[{time.time() - t0:5.0f}s]", flush=True)
+        # Rewrite after EVERY tile, not at the end: a 25-tile scan is ~9 min
+        # of GPU time and a dropped web terminal must not cost all of it.
+        if args.json:
+            _write_json(args.json, args, results)
 
     # ASCII map, north up. Symbols are coarse on purpose -- this is for picking
     # a region to look at, not for measuring one.
@@ -88,7 +113,12 @@ def main() -> int:
         print("\nNo land found. Widen --radius/--stride and rerun; the scan is")
         print("restartable and each tile is ~22.5 s.")
         return 1
-    print(f"\nSuggested launch origin: {best}  (pregen R=2 centred there)")
+    # NB: this "best" is raw land fraction, which over-rewards inland
+    # plateaus. tools/pick_origin.py scores the same data for a COASTAL
+    # origin and is what generate_world.sh actually uses; this line is a
+    # human-readable cross-check, not the decision.
+    print(f"\nHighest land fraction: {best}  (see tools/pick_origin.py "
+          f"for the coastal-weighted pick actually used)")
     return 0
 
 
