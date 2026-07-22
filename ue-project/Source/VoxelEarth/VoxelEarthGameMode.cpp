@@ -765,6 +765,42 @@ void AVoxelEarthGameMode::BeginPlay()
 			SaveWorldAfterSeconds, false);
 	}
 
+	// LOD-cascade vista framing for -VoxelScreenshotAfter. Read once at first
+	// use, like every other switch in this file, so it cannot be raced by
+	// -ExecCmds landing after streaming has begun.
+	// -VoxelVistaShot            -> defaults (400 m camera, -10 deg pitch)
+	// -VoxelVistaShot=<metres>   -> camera height
+	// -VoxelVistaPitch=<degrees> -> pitch (negative looks down)
+	struct VoxelVistaShot
+	{
+		static bool IsActive()
+		{
+			static const bool bActive = FParse::Param(FCommandLine::Get(), TEXT("VoxelVistaShot")) ||
+			                            FCString::Strifind(FCommandLine::Get(), TEXT("VoxelVistaShot=")) != nullptr;
+			return bActive;
+		}
+		static float HeightMeters()
+		{
+			static const float Height = []
+			{
+				float Value = 400.f;
+				FParse::Value(FCommandLine::Get(), TEXT("VoxelVistaShot="), Value);
+				return Value;
+			}();
+			return Height;
+		}
+		static float PitchDegrees()
+		{
+			static const float Pitch = []
+			{
+				float Value = -10.f;
+				FParse::Value(FCommandLine::Get(), TEXT("VoxelVistaPitch="), Value);
+				return Value;
+			}();
+			return Pitch;
+		}
+	};
+
 	// Unattended visual verification: -VoxelScreenshotAfter=<seconds> waits
 	// for streaming to populate, captures a screenshot, then quits ~3s later
 	// (screenshot write is async). Drives phase-verification captures from
@@ -989,6 +1025,34 @@ void AVoxelEarthGameMode::BeginPlay()
 							P->SetActorRotation(FRotator(-85.f, 0.f, 0.f));
 						}
 						PC->SetControlRotation(FRotator(-85.f, 0.f, 0.f));
+					}
+					else if (VoxelVistaShot::IsActive() && PC)
+					{
+						// -VoxelVistaShot[=<heightMeters>] (docs/status.md "R2-R4
+						// ring starvation fix"): the LOD-cascade acceptance shot.
+						// The default -VoxelScreenshotAfter framing is a -40 deg
+						// pitch from the spawn height, which fills the frame with
+						// R0/R1 terrain a few tens of metres away and shows
+						// literally nothing about whether the coarse rings loaded
+						// -- it is why "the cascade renders" had never actually
+						// been looked at. This one lifts the camera and pitches
+						// shallow so the outer annuli (R2 128-256 m, R3 256-512 m,
+						// R4 512-1024 m) are what fills the frame.
+						// RELATIVE to the spawn height, not absolute: terrain at the
+						// default spawn sits around 1,200 m of world Z, so an
+						// absolute height buries the camera in rock (measured -- the
+						// first attempt produced a frame of nothing but fog, seen
+						// from inside the ground through back-face culling).
+						const float HeightUU = VoxelVistaShot::HeightMeters() * 100.f;
+						const FRotator Look(VoxelVistaShot::PitchDegrees(), 45.f, 0.f);
+						if (APawn* P = PC->GetPawn())
+						{
+							FVector Loc = P->GetActorLocation();
+							Loc.Z += HeightUU;
+							P->SetActorLocation(Loc);
+							P->SetActorRotation(Look);
+						}
+						PC->SetControlRotation(Look);
 					}
 					else if (PC)
 					{
