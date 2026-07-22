@@ -1,0 +1,6 @@
+# Shell scripts in this repo are pasted into Linux GPU pods. A CRLF line
+# ending makes bash fail with an opaque "\r: command not found", which is a
+# miserable thing to debug at 4am on a rented instance, so force LF even
+# though the dev machine is Windows.
+*.sh text eol=lf
+*.py text eol=lf

@@ -7,7 +7,13 @@
   edit-log diffs only). This ADR argues that §2.1 is a *replication* rule and
   that persistence is a different axis, but the distinction is load-bearing
   enough that it should be Matt's call rather than mine.
-- **Human sign-off:** **GRANTED (Matt, 2026-07-22).**
+- **Human sign-off:** **GRANTED by Matt, 2026-07-22.** He took the
+  recommendation below: persist water state, on the reading that §2.1
+  constrains the wire rather than the disk. The counter-argument stands on
+  record — this is the first simulation state we persist, and the SWE grid
+  and collapse scheduler will invoke the precedent. Those remain out of
+  scope and need their own decision; adopting this one does not pre-approve
+  them.
 
 ## Context
 

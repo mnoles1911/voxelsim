@@ -39,6 +39,37 @@ Design, top to bottom:
     real model's channel *names* differ from ours, that's a
     ``DiffusionConfig.channel_mapping`` edit, not a code change (task
     scaffolding item 1).
+  * ``provider_id`` — see ``DiffusionConfig.provider_id``. It is the tile-
+    cache namespace AND the value stamped into edit logs that
+    ``EditLog::checkProvider()`` compares before replaying a saved world
+    (``kMismatch`` = refuse the replay), so it must be content-addressed:
+    every input that can change tile bytes, and nothing about where those
+    bytes live. Identity schema v2 (2026-07-22) fixed two bugs found on the
+    first real generation run — the local checkpoint LOAD PATH was embedded
+    in it, and the conditioning data (WorldClim bio rasters +
+    ``data/global/etopo_10m.tif``, which condition generation via
+    ``synthetic_map._compute_map_stats``) was not hashed at all.
+
+    KNOWN REMAINING GAPS, in rough priority order — inputs that can still
+    change tile bytes without rolling the id:
+
+      1. ``SamplerConfig`` is hashed but never passed to ``WorldPipeline``,
+         so the sampler settings actually in force are upstream defaults
+         that are not in the id. See that class's docstring.
+      2. The execution environment. ``_load_pipeline`` silently falls back
+         to ``device="cpu"`` when no GPU is visible, so CPU- and
+         GPU-generated tiles share a namespace; ``torch``/cuDNN versions and
+         TF32 flags are likewise absent. Doctrine §2.3 accepts cross-GPU
+         non-determinism, but the id does not even record which side of the
+         CPU/GPU split a tile came from.
+      3. ``terrain_diffusion_version`` defaults to ``"UNRECORDED"`` and,
+         unlike ``UNPINNED``/``UNVERIFIED``, is neither refused before
+         inference nor marked in the id.
+      4. ``pipeline.bind()``'s caching strategy. ``(x, y)`` are not
+         independent per-tile seeds; seamlessness comes from the tile
+         store's cached context, so which neighbours are resident is
+         process-history state that can influence output.
+
   * ``DiffusionProvider`` — the ``TileProvider``. In ``dry_run=True`` mode
     (default off) it swaps the real model call for the synthetic
     provider's rasters reshaped to look like model output, then runs the
@@ -50,8 +81,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Protocol
 
 import numpy as np
@@ -279,11 +312,132 @@ def adapt_raster_to_tile(
 class SamplerConfig:
     """Diffusion sampler settings — part of the pinned config (doctrine §2.3):
     changing any of these changes generated tiles, so it must roll the
-    provider_id / cache key."""
+    provider_id / cache key.
+
+    KNOWN GAP (2026-07-22, not fixed here — flagged rather than silently
+    papered over): **these values currently reach nothing.**
+    ``TerrainDiffusionBackend`` calls ``WorldPipeline.from_pretrained(...)``,
+    ``.bind()`` and ``.get(i1, j1, i2, j2, with_climate=True)``, none of which
+    take sampler arguments, so the settings actually in force are
+    ``WorldPipeline``'s internal defaults. The identity is therefore wrong in
+    both directions: changing ``steps`` here rolls the id and invalidates a
+    cache while producing byte-identical tiles, and the real sampler
+    settings — including any upstream default change — are not in the id at
+    all. ``terrain_diffusion_version`` partially covers the second case.
+    Resolve by either wiring these through to the pipeline or deleting them;
+    do not leave a config field that lies about what it controls.
+    """
 
     steps: int = 30
     guidance_scale: float = 3.0
     scheduler: str = "ddim"
+
+
+#: Bumped whenever the *shape* of the provider_id payload changes (fields
+#: added/removed/renamed), so two schemes can never coincidentally collide.
+#: v1 = the bring-up scheme (checkpoint_id in the id, no conditioning hash).
+#: v2 = current: identity is content-addressed only (load path excluded),
+#: conditioning data + tile wire format folded in.
+IDENTITY_SCHEMA_VERSION = 2
+
+#: Placeholder meaning "the conditioning data behind this config has never
+#: been hashed". Deliberately mirrors ``"UNPINNED"`` for the checkpoint: a
+#: config carrying it is visibly marked in ``provider_id()`` and is refused
+#: by ``verify_conditioning_digest`` before any real inference.
+UNVERIFIED = "UNVERIFIED"
+
+#: Directory ``terrain_diffusion.synthetic_map._compute_map_stats`` reads
+#: from. It is RELATIVE and resolved from the process CWD by the upstream
+#: package, so we resolve it the same way (see ``resolve_conditioning_root``)
+#: and record only *relative* names in the digest manifest — an absolute path
+#: in an identity is exactly bug #1 all over again.
+DEFAULT_CONDITIONING_ROOT = "data/global"
+
+#: The conditioning rasters whose CONTENT changes generated terrain: the
+#: ETOPO relief raster built by ``tools/fetch_etopo.py`` (its bytes depend on
+#: which NOAA product was reachable — the candidate list includes both a
+#: ``_bed`` and a ``_surface`` variant, so divergence here is likely, not
+#: theoretical) plus the four WorldClim 2.1 10-arc-minute bio rasters that
+#: EXPECTED_CHANNELS is calibrated against (bio_1/4/12/15) and that
+#: ``fetch_etopo.py`` uses as its reference grid.
+#:
+#: This is an explicit ALLOW-LIST, not "hash the whole directory", on
+#: purpose: ``data/global`` also holds the multi-hundred-MB raw NOAA download
+#: (``_etopo_source.tif``, an intermediate the pipeline never reads) and
+#: whatever other bio rasters a given box happened to download. Hashing those
+#: would make identity depend on incidental local junk — a false kMismatch,
+#: which is the same class of bug as embedding the load path. The list itself
+#: is a config field, so extending it rolls the provider_id honestly.
+DEFAULT_CONDITIONING_FILES: tuple[str, ...] = (
+    "etopo_10m.tif",
+    "wc2.1_10m_bio_1.tif",
+    "wc2.1_10m_bio_4.tif",
+    "wc2.1_10m_bio_12.tif",
+    "wc2.1_10m_bio_15.tif",
+)
+
+
+#: MANUAL VERSION COUNTER for generation logic that is pure CODE and cannot
+#: be hashed automatically. **Bump it in the same commit as any change to:**
+#:
+#:   * ``derive_tile_seed``'s canonical string, field order, digest slice or
+#:     endianness — and the ``torch.manual_seed`` call that consumes it;
+#:   * ``TerrainDiffusionBackend.generate_rasters``' tile-to-pixel axis
+#:     mapping (``i1 = y*TILE_SIZE, j1 = x*TILE_SIZE`` — still marked
+#:     ``# ASSUMPTION:`` and the single most likely edit in this file: if
+#:     bring-up finds it transposed, the whole world transposes);
+#:   * ``_get_terrain_at_scale``'s upsampling math (``mode="bilinear"``,
+#:     ``align_corners=False``, the 1-native-pixel pad, the ceil-div, the
+#:     crop offsets) — ``scale`` is in the id but the INTERPOLATOR is not;
+#:   * ``adapt_raster_to_tile``'s conversion beyond the ranges already
+#:     covered below, or ``_synthetic_stand_in``'s stand-in arithmetic.
+#:
+#: A counter is not as good as hashing the source, but hashing source text
+#: would roll the id on comment edits and reformattings — a false kMismatch,
+#: the same failure mode as bug #1. An explicit, documented counter puts the
+#: decision where the judgement is.
+GENERATION_ALGORITHM_VERSION = 1
+
+
+def _tile_format_fingerprint() -> str:
+    """sha256 of everything OUTSIDE DiffusionConfig that still decides tile
+    bytes.
+
+    Three groups, none of them config fields — so before this they could all
+    be edited without rolling ``provider_id``, silently changing tile bytes
+    (or the cached byte FORMAT) under an unchanged identity:
+
+      * wire geometry: ``TILE_SIZE``, ``CLIMATE_CHANNELS``, ``PIXEL_SIZE_MM``;
+      * the encoded-tile container: ``tile_codec``'s ``MAGIC``, ``VERSION``
+        and header struct. A codec bump is especially nasty without this —
+        cache files are keyed only by provider_id, so the namespace would end
+        up holding two mutually incompatible formats and ``decode`` would
+        raise "unsupported tile version" on the old ones;
+      * the adapter's quantization contract: ``EXPECTED_CHANNELS`` min/max
+        (which ``adapt_raster_to_tile`` uses as the uint8 mapping range) and
+        ``_CLIMATE_ORDER`` (the plane packing order);
+
+    plus ``GENERATION_ALGORITHM_VERSION`` for the logic that can only be
+    tracked by hand (see that constant).
+    """
+    from .. import tile_codec
+
+    payload = {
+        "algorithm_version": GENERATION_ALGORITHM_VERSION,
+        "tile_size": TILE_SIZE,
+        "climate_channels": CLIMATE_CHANNELS,
+        "pixel_size_mm": {str(k): v for k, v in sorted(PIXEL_SIZE_MM.items())},
+        "codec_magic": tile_codec.MAGIC.decode("ascii"),
+        "codec_version": tile_codec.VERSION,
+        "codec_header": tile_codec._HEADER.format,
+        "climate_order": list(_CLIMATE_ORDER),
+        "expected_channels": [
+            [c.name, c.dtype, c.min, c.max] for c in EXPECTED_CHANNELS
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -291,22 +445,59 @@ class DiffusionConfig:
     """The pinned terrain-diffusion bring-up config.
 
     Everything a GPU bring-up session needs to pin down before generating
-    canonical tiles: which checkpoint, which sampler settings, which tile
-    scale it targets, and how the model's raw channel names map onto ours.
-    Per doctrine §2.3 ("Determinism boundary"), diffusion output is not
-    bit-deterministic across GPUs/versions, so tiles are generated once and
-    distributed as data — this config is exactly the set of knobs that must
-    be pinned (and folded into ``provider_id()``) so a cache can never
-    silently mix tiles from two different configs.
+    canonical tiles: which checkpoint (by CONTENT, never by location), which
+    conditioning data, which sampler settings, which tile scale it targets,
+    and how the model's raw channel names map onto ours. Per doctrine §2.3
+    ("Determinism boundary"), diffusion output is not bit-deterministic
+    across GPUs/versions, so tiles are generated once and distributed as
+    data — this config is exactly the set of knobs that must be pinned (and
+    folded into ``provider_id()``) so a cache can never silently mix tiles
+    from two different configs.
+
+    Identity rule (see ``provider_id``): a field belongs in the id if and
+    only if changing it can change generated bytes. ``checkpoint_id`` is a
+    load LOCATION and therefore does not.
     """
 
-    #: Model checkpoint identifier (e.g. HF repo id or release tag).
-    #: "UNPINNED" until a real checkpoint is selected at bring-up.
-    checkpoint_id: str = "terrain-diffusion-30m-UNPINNED"
+    #: WHERE to load the checkpoint from — a local filesystem path to a
+    #: pre-downloaded ``WorldPipeline`` snapshot (see
+    #: ``TerrainDiffusionBackend._load_pipeline``). This is deliberately NOT
+    #: part of ``provider_id()``: the same checkpoint mounted at
+    #: ``/workspace/ckpt/...`` on a pod and at ``D:\ckpt\...`` on a laptop is
+    #: the same checkpoint, and stamping the path into the id made
+    #: ``EditLog::checkProvider()`` report kMismatch — refusing a replay — on
+    #: a world that was byte-for-byte fine. Identity comes from
+    #: ``checkpoint_sha256`` + ``checkpoint_label``.
+    checkpoint_id: str = "./checkpoint"
+    #: Human-readable name for the checkpoint, e.g. "terrain-diffusion-30m".
+    #: Purely cosmetic (it makes cache directories and edit-log stamps
+    #: legible) but it IS hashed, so two runs cannot disagree about the label
+    #: while claiming one identity. Must not be a path — ``__post_init__``
+    #: rejects separators, so the old "put the mount point here" habit fails
+    #: loudly instead of silently re-introducing bug #1.
+    checkpoint_label: str = "unlabeled"
     #: sha256 of the checkpoint file/weights, pinned once known. Prevents a
     #: silent checkpoint swap (same id, different weights) from mixing into
-    #: an existing cache under the same provider_id.
+    #: an existing cache under the same provider_id. THIS, not the path, is
+    #: what makes the identity content-addressed.
     checkpoint_sha256: str = "UNPINNED"
+    #: sha256 manifest digest of the conditioning rasters
+    #: (``compute_conditioning_digest``). ``WorldPipeline`` does not generate
+    #: from weights alone — it conditions on the WorldClim bio rasters and
+    #: ``data/global/etopo_10m.tif`` via ``synthetic_map._compute_map_stats``
+    #: — so two boxes with different ETOPO/WorldClim bytes produce different
+    #: terrain. Without this in the id that divergence is invisible to
+    #: ``EditLog::checkProvider()``, which is precisely the failure it exists
+    #: to catch. ``UNVERIFIED`` until a bring-up session pins it.
+    conditioning_digest: str = UNVERIFIED
+    #: Which files ``conditioning_digest`` covers (relative to the
+    #: conditioning root). A config field so extending coverage rolls the id.
+    conditioning_files: tuple[str, ...] = DEFAULT_CONDITIONING_FILES
+    #: Version/commit of the terrain-diffusion package itself, when known.
+    #: Not bit-determinism (doctrine §2.3 says that is unattainable), but a
+    #: package upgrade can change output STRUCTURALLY, and that should not
+    #: hide under an unchanged id. "UNRECORDED" if a bring-up did not note it.
+    terrain_diffusion_version: str = "UNRECORDED"
     sampler: SamplerConfig = field(default_factory=SamplerConfig)
     #: Tile pixel scale this config is calibrated for (tile_codec.PIXEL_SIZE_MM
     #: key: 1 => 30m/px, 8 => 11.25m/px supersampled). Must match the `scale`
@@ -319,6 +510,13 @@ class DiffusionConfig:
     channel_mapping: dict[str, str] = field(
         default_factory=lambda: dict(DEFAULT_CHANNEL_MAPPING)
     )
+    #: COMPATIBILITY ESCAPE HATCH. When set, ``provider_id()`` returns this
+    #: string verbatim, ignoring everything above. Its only sanctioned use is
+    #: adopting a cache namespace that already exists on disk — e.g. resuming
+    #: or serving the tiles generated under the v1 (pre-fix) id. It defeats
+    #: every guarantee in this class, so it is explicit, opt-in, never
+    #: defaulted, and reported as-is in the cache path and edit-log stamp.
+    provider_id_override: str | None = None
 
     def __post_init__(self) -> None:
         if self.scale not in PIXEL_SIZE_MM:
@@ -326,28 +524,89 @@ class DiffusionConfig:
         missing = {c.name for c in EXPECTED_CHANNELS} - set(self.channel_mapping)
         if missing:
             raise ValueError(f"channel_mapping missing entries for: {sorted(missing)}")
+        label = self.checkpoint_label
+        if not label or label.strip() != label:
+            raise ValueError(
+                f"checkpoint_label must be a non-empty, unpadded name, got {label!r}"
+            )
+        bad = set(label) & set("/\\:")
+        if bad or label in (".", ".."):
+            raise ValueError(
+                f"checkpoint_label looks like a filesystem path ({label!r}): it is a "
+                "human-readable NAME and is hashed into provider_id, which must never "
+                "depend on where the bytes are mounted. Put the load path in "
+                "checkpoint_id (which is deliberately excluded from the identity) and "
+                "give the label something like 'terrain-diffusion-30m'."
+            )
+        # `frozen=True` stops attribute rebinding but NOT
+        # `config.channel_mapping["temperature"] = "t2m"`, and the mapping is
+        # read live on every generate() while provider_id was snapshotted at
+        # construction -- one mutation would repack the climate planes under
+        # an already-published identity. Freeze the contents too.
+        object.__setattr__(
+            self, "channel_mapping", MappingProxyType(dict(self.channel_mapping))
+        )
+        object.__setattr__(self, "conditioning_files", tuple(self.conditioning_files))
+        if not self.conditioning_files:
+            raise ValueError(
+                "conditioning_files must not be empty: an identity that covers no "
+                "conditioning data cannot detect the ETOPO/WorldClim divergence it "
+                "exists to detect"
+            )
 
     def provider_id(self) -> str:
         """Stable identity+version string for the cache key (TileProvider
-        contract). Deterministic hash of every field that can change
-        generated bytes — if a bring-up session edits ANY of checkpoint,
-        sampler, scale, or channel_mapping, this changes, so old and new
-        tiles never collide in the cache."""
+        contract), and the value stamped into the edit log that
+        ``EditLog::checkProvider()`` compares to decide whether replaying a
+        saved world against a tile set is safe.
+
+        Shape: ``terrain-diffusion-<label>[-UNPINNED][-UNVERIFIEDDATA]-<16 hex>``
+
+        The hash covers every input that can change generated bytes — model
+        content (``checkpoint_sha256``), conditioning-data content
+        (``conditioning_digest`` + the file list it covers), the
+        terrain-diffusion version, sampler settings, scale, channel mapping,
+        the human label, the tile wire/quantization format
+        (``_tile_format_fingerprint``), and the schema version — and NOTHING
+        about where any of those bytes live on disk. Same content, different
+        mount point => same id => ``kMatch``, as it must be.
+
+        Unpinned/unverified configs are marked IN PLAIN TEXT rather than
+        being allowed to look like a normal identity, so a stray cache
+        directory or edit-log stamp is self-describing. (Real inference is
+        refused outright by ``verify_checkpoint_sha256`` /
+        ``verify_conditioning_digest``; the marker is what protects anything
+        already written by a dry-run or a mis-wired config.)
+        """
+        if self.provider_id_override is not None:
+            return self.provider_id_override
         payload = {
-            "checkpoint_id": self.checkpoint_id,
+            "identity_schema": IDENTITY_SCHEMA_VERSION,
+            # NOTE: checkpoint_id (the load path) is intentionally absent.
+            "checkpoint_label": self.checkpoint_label,
             "checkpoint_sha256": self.checkpoint_sha256,
+            "conditioning_digest": self.conditioning_digest,
+            "conditioning_files": sorted(self.conditioning_files),
+            "terrain_diffusion_version": self.terrain_diffusion_version,
             "sampler": {
                 "steps": self.sampler.steps,
                 "guidance_scale": self.sampler.guidance_scale,
                 "scheduler": self.sampler.scheduler,
             },
             "scale": self.scale,
-            "channel_mapping": self.channel_mapping,
+            "channel_mapping": dict(self.channel_mapping),
+            "tile_format": _tile_format_fingerprint(),
         }
         digest = hashlib.sha256(
             json.dumps(payload, sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]
-        return f"terrain-diffusion-{self.checkpoint_id}-{digest}"
+        parts = ["terrain-diffusion", self.checkpoint_label]
+        if self.checkpoint_sha256 == "UNPINNED":
+            parts.append("UNPINNED")
+        if self.conditioning_digest == UNVERIFIED:
+            parts.append("UNVERIFIEDDATA")
+        parts.append(digest)
+        return "-".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +678,127 @@ def verify_checkpoint_sha256(path: "str | Path", expected: str) -> None:
             "checkpoint is intentionally different, mint a new "
             "DiffusionConfig with the new sha256 (this rolls provider_id, "
             "so old and new tiles never collide in the cache)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Conditioning-data verification (pure, torch-free -- unit-testable with
+# temp files, exactly like the checkpoint helpers above).
+#
+# WHY this exists: WorldPipeline does NOT generate from model weights alone.
+# At bring-up it downloads the WorldClim 2.1 10-arc-minute bio rasters and
+# reads data/global/etopo_10m.tif; synthetic_map._compute_map_stats derives
+# statistics from them that CONDITION generation. Those files are generation
+# inputs with none of the checkpoint's protections: tools/fetch_etopo.py
+# builds etopo_10m.tif by resampling whichever NOAA product was reachable
+# (its candidate list spans a _bed and a _surface variant), so two boxes can
+# easily hold different bytes. Before this, that produced different terrain
+# under an IDENTICAL provider_id -- silently, into one cache namespace, and
+# stamped identically into edit logs, so EditLog::checkProvider() could not
+# see the very divergence it exists to refuse.
+# ---------------------------------------------------------------------------
+
+
+class ConditioningDataMissing(FileNotFoundError):
+    """Raised when the conditioning rasters an identity must cover are absent.
+
+    A provider that cannot see its conditioning data must REFUSE to claim an
+    identity rather than invent one: inventing it is what would let two
+    materially different generation setups share a cache namespace.
+    """
+
+    def __init__(self, root: Path, missing: list[str]) -> None:
+        self.root = root
+        self.missing = missing
+        super().__init__(
+            f"conditioning data missing under {str(root)!r}: {missing} -- refusing "
+            "to compute a conditioning digest (and therefore refusing to claim a "
+            "provider identity) for data this process cannot see. These rasters "
+            "condition generation via terrain_diffusion's synthetic_map."
+            "_compute_map_stats. Run the pipeline once to fetch WorldClim, then "
+            "`python tools/fetch_etopo.py` from terrain-service/, or point "
+            "TERRAIN_CONDITIONING_ROOT at the directory that has them."
+        )
+
+
+def resolve_conditioning_root(root: "str | Path | None" = None) -> Path:
+    """Resolve the conditioning-data directory the way upstream does.
+
+    ``synthetic_map._compute_map_stats`` opens the RELATIVE path
+    ``data/global/etopo_10m.tif``, i.e. resolved against the process CWD, so
+    the effective location depends on where the worker was launched from.
+    This resolves the same way (``TERRAIN_CONDITIONING_ROOT`` env override >
+    explicit argument > ``TERRAIN_CONDITIONING_ROOT`` env >
+    ``DEFAULT_CONDITIONING_ROOT`` relative to CWD) so the digest describes
+    the files the model will ACTUALLY read.
+
+    The resolved absolute path is used only to open files; it never enters
+    the digest -- the manifest records relative names only (bug #1's lesson).
+    """
+    chosen = root or os.environ.get("TERRAIN_CONDITIONING_ROOT") or DEFAULT_CONDITIONING_ROOT
+    return Path(chosen).resolve()
+
+
+def compute_conditioning_digest(
+    files: "tuple[str, ...] | list[str]" = DEFAULT_CONDITIONING_FILES,
+    root: "str | Path | None" = None,
+) -> str:
+    """sha256 manifest digest over the CONTENT of the conditioning rasters.
+
+    Hashes file BYTES (via the same ``relative/path:sha256`` sorted-manifest
+    construction ``_sha256_of_checkpoint_path`` uses for a checkpoint tree),
+    not a metadata manifest. Names+sizes+mtimes were rejected outright:
+    mtimes differ on every fresh download, and size is not a content check --
+    ETOPO's ``_bed`` and ``_surface`` variants are the same grid, dtype and
+    compression family and can land within bytes of each other while
+    describing different planets' worth of bathymetry. Bytes are the only
+    answer that actually detects the divergence we are trying to detect.
+
+    Cost is not a concern: these are ~5-20 MB rasters read once per process,
+    against a 22.5 s per-tile generation cost.
+
+    Raises ``ConditioningDataMissing`` if any listed file is absent -- see
+    that exception for why refusing beats inventing.
+    """
+    resolved = resolve_conditioning_root(root)
+    names = sorted(files)
+    missing = [n for n in names if not (resolved / n).is_file()]
+    if missing:
+        raise ConditioningDataMissing(resolved, missing)
+    lines = [f"{n}:{_sha256_of_file(resolved / n)}" for n in names]
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def verify_conditioning_digest(
+    config: "DiffusionConfig", root: "str | Path | None" = None
+) -> None:
+    """Verify on-disk conditioning data against ``config.conditioning_digest``.
+
+    The exact counterpart of ``verify_checkpoint_sha256``, and called from
+    the same place (before any load/inference). Raises ``ValueError`` if the
+    config is ``UNVERIFIED`` or if the data on this box does not match what
+    the identity claims; ``ConditioningDataMissing`` if the data is absent.
+    """
+    if config.conditioning_digest == UNVERIFIED:
+        raise ValueError(
+            "conditioning_digest is 'UNVERIFIED' -- refusing to run inference "
+            "against unhashed conditioning data. WorldPipeline conditions on the "
+            "WorldClim bio rasters and data/global/etopo_10m.tif, so two boxes "
+            "with different copies generate different terrain; leaving this "
+            "unpinned would stamp both into edit logs under one identity and "
+            "defeat EditLog::checkProvider(). Pin it with "
+            "compute_conditioning_digest() -- see docs/diffusion-bringup.md step 3."
+        )
+    actual = compute_conditioning_digest(config.conditioning_files, root)
+    if actual != config.conditioning_digest:
+        raise ValueError(
+            f"conditioning data mismatch under {str(resolve_conditioning_root(root))!r}: "
+            f"config pins {config.conditioning_digest!r}, this box has {actual!r} -- "
+            "refusing to generate. The most likely cause is a different ETOPO source: "
+            "tools/fetch_etopo.py tries several NOAA URLs including both a '_bed' and "
+            "a '_surface' variant, so whichever was reachable decides the bytes. Copy "
+            "the canonical data/global across, or mint a new DiffusionConfig with the "
+            "new digest (this rolls provider_id, so the two tile sets never collide)."
         )
 
 
@@ -547,6 +927,22 @@ class TerrainDiffusionBackend:
         # inconvenient at bring-up, pinning HF's own commit sha (instead of
         # a content sha256) is the other option to evaluate.
         verify_checkpoint_sha256(self.config.checkpoint_id, self.config.checkpoint_sha256)
+        # The model's OTHER inputs. WorldPipeline conditions on the WorldClim
+        # bio rasters + data/global/etopo_10m.tif (via synthetic_map.
+        # _compute_map_stats), so this gate is exactly as load-bearing as the
+        # checkpoint one above: without it, a box with a different ETOPO
+        # build generates different terrain under the same provider_id.
+        #
+        # DEFAULT_CONDITIONING_ROOT is passed EXPLICITLY (an argument beats
+        # TERRAIN_CONDITIONING_ROOT) on purpose: upstream's
+        # synthetic_map._compute_map_stats opens the relative path
+        # data/global/... from the process CWD and knows nothing about our
+        # env var. Honouring the override here would let the gate verify a
+        # directory the model never opens -- passing against canonical data
+        # while generating from a different local copy, which is exactly the
+        # divergence this check exists to catch. The env var stays useful
+        # for computing a digest off-box; it must not move the gate.
+        verify_conditioning_digest(self.config, root=DEFAULT_CONDITIONING_ROOT)
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         pipeline = WorldPipeline.from_pretrained(self.config.checkpoint_id)
@@ -695,7 +1091,18 @@ class DiffusionProvider:
         # protocol; dry-run runs are tagged so they can never collide with
         # real generated tiles in a shared cache.
         base_id = self.config.provider_id()
-        self.provider_id = f"{base_id}-dryrun" if dry_run else base_id
+        if dry_run:
+            # Tag dry-run output so it can never collide with real generated
+            # tiles -- and tag it with the STAND-IN's own version, because in
+            # dry-run mode SyntheticProvider, not the checkpoint, is what
+            # decides the bytes. Without this, bumping "synthetic-v1" (the
+            # exact thing that string exists for) would leave every dry-run
+            # tile cached under an unchanged id.
+            from .synthetic import SyntheticProvider
+
+            self.provider_id = f"{base_id}-dryrun-{SyntheticProvider.provider_id}"
+        else:
+            self.provider_id = base_id
 
     def generate(self, seed: int, x: int, y: int, scale: int) -> Tile:
         if scale != self.config.scale:

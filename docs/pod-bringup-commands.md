@@ -1,195 +1,240 @@
-﻿# GPU pod bring-up â€” exact command blocks (Track B1)
+# GPU pod bring-up — the runbook
 
-Copy-paste blocks for the Vast.ai RTX 4090 pod, in order. Each block states
-its expected output. Context: the pod already ran the background install
-(clone `xandergos/terrain-diffusion`, its requirements, plus this repo's
-`terrain-service/requirements.txt`), logging to `/setup.log`. These blocks
-assume the voxelsim repo on the pod has pulled the commit containing the
-implemented `DiffusionProvider._call_model` (this document's commit).
+Generate terrain-diffusion tiles for a seed on a rented GPU. **Two commands.**
 
-Full narrative runbook: `terrain-service/docs/diffusion-bringup.md`. This
-file is just the compressed command sequence for the session.
+This replaces an earlier version of this file that was written before any
+real run; most of what it guessed turned out to be wrong. Everything below
+is from the 2026-07-19 session, which took ~6 hours, almost all of it
+archaeology. None of that should ever be repeated.
 
-## Block 0 â€” verify setup finished
+Narrative background: `terrain-service/docs/diffusion-bringup.md`.
 
-```sh
-tail -n 20 /setup.log
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-python -c "import terrain_diffusion; print('terrain_diffusion importable')"
-```
+---
 
-Expected: no errors in the log tail; torch version plus `True`;
-`terrain_diffusion importable`. If `terrain_diffusion` fails to import, run
-`pip install -e /path/to/terrain-diffusion` (wherever the clone landed) and
-retry.
+## Rent the pod
 
-## Block 1 â€” find the canonical checkpoint ids, download a local snapshot
+Vast.ai (or Runpod), **RTX 4090, PyTorch template, disk ≥ 60 GB**.
 
-Run from `terrain-service/` in the voxelsim repo (all later Python blocks
-too â€” they import `terrain_service`):
+> **The disk size is chosen at rental time and cannot be grown later.** Too
+> small means destroying the instance and starting over. 60 GB is the floor.
 
-```sh
-python -c "from terrain_diffusion.common.model_utils import MODEL_PATHS; print(MODEL_PATHS)"
-python - <<'EOF'
-from huggingface_hub import snapshot_download
-p = snapshot_download("xandergos/terrain-diffusion-30m",
-                      local_dir="/workspace/ckpt/terrain-diffusion-30m")
-print("snapshot at:", p)
-EOF
-ls /workspace/ckpt/terrain-diffusion-30m
-```
+Cost is roughly $0.35–0.70/hr; the whole run below is well under an hour of
+GPU time once the downloads are done.
 
-Expected: `MODEL_PATHS` dict printed (use it to correct the repo id in the
-`snapshot_download` call if `xandergos/terrain-diffusion-30m` is not the real
-30 m pipeline id â€” that id is our best guess from the terrain-diffusion
-source); download progress; then a directory listing containing
-`config.json` plus `coarse_model/`, `base_model/`, `decoder_model/`
-subfolders. If the listing does NOT have that shape, paste it back to
-Claude â€” `TerrainDiffusionBackend` expects a `WorldPipeline` snapshot tree.
+---
 
-## Block 2 â€” compute the checkpoint sha256 manifest hash
+## Command 1 — bring the pod up
+
+Paste this into the pod's terminal:
 
 ```sh
-python - <<'EOF'
-from terrain_service.providers.diffusion import _sha256_of_checkpoint_path
-print(_sha256_of_checkpoint_path("/workspace/ckpt/terrain-diffusion-30m"))
-EOF
+git clone https://github.com/mnoles1911/voxelsim /workspace/voxelsim || git -C /workspace/voxelsim pull; bash /workspace/voxelsim/terrain-service/tools/bootstrap_pod.sh
 ```
 
-Expected: one 64-character hex string. **Record it** â€” it is
-`checkpoint_sha256` for every block below (written `<HASH>` from here on).
+Takes ~20–40 min, mostly downloading. It is **restartable** — if the browser
+terminal drops, paste the exact same line again and it skips what finished.
 
-## Block 3 â€” one-tile inference + validate against EXPECTED_CHANNELS
+> **If the clone asks for a username/password**, the repo is private and the
+> pod has no credentials. Use a GitHub personal access token with `repo`
+> scope for that one clone (the pod is destroyed afterwards, but revoke it
+> anyway):
+>
+> ```sh
+> git clone https://<TOKEN>@github.com/mnoles1911/voxelsim /workspace/voxelsim
+> ```
+>
+> then re-paste command 1, which will find the clone and continue. Driving
+> the pod over `ssh` instead (see below) avoids this entirely if you forward
+> an agent.
 
-The single most important block of the session (backlog item "Confirm real
-terrain-diffusion tile outputs"):
+It does, in order, and says so as it goes:
+
+1. **Preflight** — GPU present, ≥ 60 GB free. Fails immediately if not.
+2. **Clones terrain-diffusion** to `/workspace/terrain-diffusion`.
+3. **Installs the inference deps** (~20 packages).
+4. **Reinstalls torch + torchvision** from the wheel index matching the
+   host driver.
+5. **Writes `/workspace/bringup.env`** — paths and the checkpoint hash.
+6. **Downloads the checkpoint** `xandergos/terrain-diffusion-30m`.
+7. **Builds the reference rasters** (WorldClim, then ETOPO).
+8. **Generates one real tile and validates it.** This is the gate.
+
+Success looks like `================ POD READY ================` followed by
+the checkpoint sha256 and the exact text of command 2. **If you do not see
+that banner, command 2 is not safe to run.**
+
+Full log: `/workspace/bringup.log`.
+
+---
+
+## Command 2 — scan, pregen, package
+
+The bring-up banner prints this line with everything filled in. It is:
 
 ```sh
-python - <<'EOF'
-from terrain_service.providers.diffusion import (
-    DiffusionConfig, DiffusionProvider, validate_model_output, ModelOutputMismatch)
-
-config = DiffusionConfig(
-    checkpoint_id="/workspace/ckpt/terrain-diffusion-30m",
-    checkpoint_sha256="<HASH>",
-)
-print("provider_id:", config.provider_id())
-
-provider = DiffusionProvider(config=config)
-raster = provider._call_model(seed=20260719, x=0, y=0, scale=1)
-for k, v in raster.items():
-    print(f"{k}: shape={v.shape} dtype={v.dtype} min={v.min():.3f} max={v.max():.3f}")
-try:
-    validate_model_output(raster, config.channel_mapping)
-    print("MATCHES our assumption - no adaptation needed")
-except ModelOutputMismatch as e:
-    for issue in e.issues:
-        print("-", issue)
-EOF
+bash /workspace/voxelsim/terrain-service/tools/generate_world.sh --seed 20260719
 ```
 
-Expected: a `provider_id` line (**record it** â€” it is the cache namespace),
-five raster lines (elevation ~[-12000, 9000] metres-ish, four climate
-channels in [0, 1], all `(512, 512) float32`), then
-`MATCHES our assumption - no adaptation needed`.
+~9 min to scan for land, then ~9 min to pregen 25 tiles. Also restartable —
+completed tiles come from the cache on a re-run.
 
-If it prints issue lines instead: paste them back to Claude â€” per the
-runbook that is a `channel_mapping`/`EXPECTED_CHANNELS` config edit, not a
-redesign. Also note the wall-clock time of this block: it bounds the pregen
-cost in Block 5.
+1. **Scans** 25 strided tiles (~230 km reach) and prints an ASCII land map.
+2. **Picks a coastal origin** and prints the scored ranking.
+3. **Pregens** a 5×5 grid there, writing a manifest with `provider_id`, the
+   checkpoint hash and per-tile hashes.
+4. **Packages** it to `/workspace/tile-cache-seed<SEED>.tar.gz`.
 
-## Block 4 â€” axis-mapping seam check (ASSUMPTION #2)
+Useful flags:
 
-```sh
-python - <<'EOF'
-import numpy as np
-from terrain_service.providers.diffusion import DiffusionConfig, DiffusionProvider
+| flag | why |
+|---|---|
+| `--origin X,Y` | override the automatic pick — skips the scan entirely |
+| `--radius 8`   | 289 tiles instead of 25 (~108 min) |
+| `--scan-radius 3 --stride 5 --rescan` | if the scan found no land |
 
-config = DiffusionConfig(checkpoint_id="/workspace/ckpt/terrain-diffusion-30m",
-                         checkpoint_sha256="<HASH>")
-p = DiffusionProvider(config=config)
-a = p._call_model(seed=20260719, x=0, y=0, scale=1)["elevation"]
-b = p._call_model(seed=20260719, x=1, y=0, scale=1)["elevation"]  # east neighbour
-c = p._call_model(seed=20260719, x=0, y=1, scale=1)["elevation"]  # south neighbour
-print("east seam  max|diff|:", float(np.abs(a[:, -1] - b[:, 0]).max()))
-print("south seam max|diff|:", float(np.abs(a[-1, :] - c[0, :]).max()))
-EOF
-```
+### Why it auto-picks the origin
 
-Expected: BOTH seam diffs small (roughly < 1 m â€” the pipeline generates one
-continuous world). If the east seam is huge while comparing `a`'s bottom row
-to `b`'s top row would have matched, the x/y -> (i,j) axis mapping in
-`TerrainDiffusionBackend.generate_rasters` is flipped â€” paste the numbers
-back to Claude; it's a two-line fix.
+**Something must pick.** Tile (0,0) of seed 20260719 is entirely underwater
+(max −8.9 m), so "just use the origin" buys 25 tiles of ocean. Every new seed
+has to be scanned.
 
-## Block 5 â€” pregen the launch grid + informational golden hash
+**But highest-land-fraction is the wrong answer** — it selects the tile
+furthest from any water, i.e. a featureless plateau with no coast, no river
+mouth, nothing to navigate by. So `tools/pick_origin.py` scores for a
+*coastal* tile (land fraction near 0.70) with real relief in a land-heavy
+neighbourhood.
 
-Start with radius 2 (25 tiles) so cost stays bounded; bump `R` to 8 only if
-per-tile time from Block 3 makes that reasonable. Uses an explicit pinned
-config (the `pregen` CLI's `--provider diffusion` would construct the
-UNPINNED default config and be refused by the sha256 gate â€” that CLI wiring
-is a known follow-up):
+It auto-picks **by default** so a rented GPU never sits idle waiting on a
+human. **You still get the final say**: the land map and the full ranking are
+printed before anything is spent, and re-running with `--origin X,Y` is cheap
+because overlapping tiles come from the cache. If the map looks interesting
+somewhere the scorer didn't pick — an archipelago, a big bay — take it.
 
-```sh
-python - <<'EOF'
-import hashlib, time
-from terrain_service.providers.diffusion import DiffusionConfig, DiffusionProvider
-from terrain_service.cache import TileCache
-from terrain_service import tile_codec
+---
 
-config = DiffusionConfig(checkpoint_id="/workspace/ckpt/terrain-diffusion-30m",
-                         checkpoint_sha256="<HASH>")
-provider = DiffusionProvider(config=config)
-cache = TileCache("/workspace/tile-cache")
-SEED, R, SCALE = 20260719, 2, 1
+## Then: download, and destroy the pod
 
-t0 = time.time()
-for x in range(-R, R + 1):
-    for y in range(-R, R + 1):
-        if cache.get(provider.provider_id, SEED, x, y, SCALE) is not None:
-            print(f"({x},{y}) cached, skip"); continue
-        data = tile_codec.encode(provider.generate(SEED, x, y, SCALE))
-        cache.put(provider.provider_id, SEED, x, y, SCALE, data)
-        print(f"({x},{y}) done  {time.time()-t0:6.0f}s  {len(data)} bytes", flush=True)
-
-golden = cache.get(provider.provider_id, SEED, 0, 0, SCALE)
-print("provider_id:", provider.provider_id)
-print("tile(0,0) sha256 (informational golden):",
-      hashlib.sha256(golden).hexdigest())
-EOF
-```
-
-Expected: 25 `(x,y) done` lines (~1.5 MB each), the `provider_id`, and one
-informational golden hash (record it in a comment near the pinned config
-later â€” NOT a cross-machine reproducibility promise, per doctrine).
-
-## Block 6 â€” package the cache and pull it off the pod
-
-```sh
-tar czf /workspace/tile-cache-seed20260719.tar.gz -C /workspace tile-cache
-ls -l /workspace/tile-cache-seed20260719.tar.gz
-```
-
-Expected: a tarball of roughly 25 x 1.5 MB (compression will shave some).
-Download it with your usual Vast method (e.g. from the dev machine:
-`scp -P <pod ssh port> root@<pod host>:/workspace/tile-cache-seed20260719.tar.gz D:\voxelsim\`),
-then **stop the pod** (not just idle).
-
-## Block 7 â€” consume on the dev machine (no pod needed)
-
-Extract, then point the game at the cache leaf directory:
+From the **dev machine**:
 
 ```powershell
+scp -P <pod-ssh-port> root@<pod-host>:/workspace/tile-cache-seed20260719.tar.gz D:\voxelsim\
 tar xzf D:\voxelsim\tile-cache-seed20260719.tar.gz -C D:\voxelsim
-# leaf dir shape: D:\voxelsim\tile-cache\<provider_id>\000000000135276f\s1
-"D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor.exe" "D:\voxelsim\ue-project\VoxelEarth.uproject" `
+```
+
+Then **destroy** the instance — not stop, not idle. Vast bills storage for as
+long as the instance exists.
+
+Point the game at the cache leaf directory (`provider_id` and the seed-hex
+directory are both in `manifest.json`):
+
+```powershell
+& "D:\UE5\Engine\Binaries\Win64\UnrealEditor.exe" "D:\voxelsim\ue-project\VoxelEarth.uproject" `
   -game -windowed -resx=1280 -resy=720 -log -unattended -nosplash `
   -VoxelTileDir="D:\voxelsim\tile-cache\<provider_id>\000000000135276f\s1" `
   -VoxelScreenshotAfter=25
 ```
 
-Expected: `LogVoxelEarth` reports the tiles loaded from that directory and
-the world renders REAL terrain-diffusion output â€” the first Earth-looking
-world in the project. (`000000000135276f` is hex for seed 20260719; pass
-`-VoxelSeed=` too if you pregen'd a different seed.)
+(`000000000135276f` is hex for seed 20260719; pass `-VoxelSeed=` for another.)
 
+---
+
+## You can skip the terminal entirely
+
+Both commands are ordinary non-interactive shell scripts that read nothing
+from stdin, so a future session doesn't need the browser terminal at all.
+Given the pod's SSH host and port from the Vast dashboard, the orchestrator
+can drive the whole bring-up from the dev machine:
+
+```powershell
+ssh -p <port> root@<host> 'git clone https://github.com/mnoles1911/voxelsim /workspace/voxelsim || git -C /workspace/voxelsim pull; bash /workspace/voxelsim/terrain-service/tools/bootstrap_pod.sh'
+ssh -p <port> root@<host> 'bash /workspace/voxelsim/terrain-service/tools/generate_world.sh --seed <SEED>'
+scp -P <port> root@<host>:/workspace/tile-cache-seed<SEED>.tar.gz D:\voxelsim\
+```
+
+This is strictly better: output lands in your own scrollback, Claude can read
+the failures directly, and there is no paste step to corrupt anything. **Hand
+Claude the SSH host and port and it can run the entire session.**
+
+---
+
+## When something fails
+
+Read `/workspace/bringup.log`. Then:
+
+| symptom | what it is | fix |
+|---|---|---|
+| `nvidia-smi not found` | not a GPU pod | destroy, re-rent |
+| `only N GB free` | disk too small | destroy, re-rent ≥ 60 GB — it cannot be resized |
+| probe exits **3**, `cuda.is_available() is False` | torch/driver mismatch | `rm /workspace/.bringup/torch` and re-run command 1 |
+| `MISMATCH -- channel_mapping needs adjusting` | model channels differ from `EXPECTED_CHANNELS` | a config edit in `providers/diffusion.py`, not a redesign — paste the issue lines to Claude |
+| `WorldClim did not land` | the consent prompt wasn't answered | run `cd /workspace/voxelsim/terrain-service && python3 tools/probe_tile.py $CKPT_DIR $CKPT_SHA` once by hand |
+| ETOPO build failed | NOAA moved the file again | `tools/fetch_etopo.py` prints a manual-download fallback |
+| `no tile in the scan had usable land` | seed's neighbourhood is ocean | `--scan-radius 3 --stride 5 --rescan` |
+| shell hangs with no output | you pasted a heredoc | Ctrl-C. Never paste heredocs — see below |
+
+Any step can be forced to redo by deleting its stamp from
+`/workspace/.bringup/` and re-running command 1.
+
+---
+
+## Confirmed numbers
+
+Measured, not estimated. Don't re-derive these.
+
+- **22.5 s per tile** on a 4090 → 25 tiles ≈ 9.4 min, 289 tiles ≈ 108 min.
+- Tiles are ~1.5 MB each.
+- One tile is 512 px × 30 m = **15.4 km** across.
+- Tile **(0,0) of seed 20260719 is entirely underwater** (max −8.9 m).
+- Tile boundaries are **continuous** — seam-vs-interior gradient ratio
+  **1.004**. No axis flip is needed; that open question is closed.
+- Climate channels are **raw WorldClim bioclim units**, not `[0,1]`. Already
+  fixed in `EXPECTED_CHANNELS`.
+- `scale` is a **supersample** knob: 1 → 30 m/px, 8 → 11.25 m/px. **A larger
+  scale covers LESS ground.** Bring up scale 8 as a separate
+  `DiffusionConfig` / `provider_id` if wanted.
+
+---
+
+## Traps, and why the scripts are shaped the way they are
+
+Each of these cost real time on 2026-07-19. They are all handled
+automatically now; this list exists so nobody "helpfully" undoes one.
+
+1. **`pip install -e ./terrain-diffusion` fails.** The repo has no `setup.py`
+   and no `pyproject.toml`. It is imported by path:
+   `export PYTHONPATH=/workspace/terrain-diffusion:$PYTHONPATH`.
+2. **Never run terrain-diffusion's `requirements.txt`.** It is the *training*
+   stack — wandb, optuna, cartopy, earthengine, lpips. It crawled at 29 kB/s
+   and killed a session outright. The real inference deps are the ~20
+   packages listed in `bootstrap_pod.sh`.
+3. **The image's torch is probably wrong for the driver.** The Vast image
+   shipped `torch 2.13.0+cu130` on a **12.8** driver. This does *not* crash —
+   `cuda.is_available()` just returns `False` and every tile silently renders
+   on **CPU**, at hours per tile, while a 4090 bills. `cuda_index.py` reads
+   the driver from `nvidia-smi` and picks a matching wheel index.
+   **torchvision must be installed from the same `--index-url`, in the same
+   command**, or it drags a PyPI torch back in and undoes the fix.
+4. **`MODEL_PATHS` is a red herring.** It lists three separate *training*
+   repos, which reads as "download all three". It is not.
+   `WorldPipeline.from_pretrained` takes **one** path and pulls
+   `coarse_model` / `base_model` / `decoder_model` out of it via
+   `subfolder=`. The bundle is **`xandergos/terrain-diffusion-30m`**. A
+   `-90m` bundle also exists — different resolution, not a newer version.
+5. **ETOPO must be built, not downloaded.** `_compute_map_stats` opens the
+   relative path `data/global/etopo_10m.tif`. The README says to download
+   NOAA's 30 arc-**second** GeoTIFF, but the filename it reads is a 10
+   arc-**minute** downsample NOAA doesn't publish. `tools/fetch_etopo.py`
+   resamples one onto the WorldClim grid.
+6. **WorldClim prompts for consent on stdin** on first run, which hangs any
+   unattended script forever. The bootstrap feeds it from `yes`.
+7. **Everything must run from `terrain-service/`.** Both WorldClim and ETOPO
+   resolve against the *current directory*.
+8. **Never paste a heredoc into a web terminal.** It gets silently
+   re-indented, so the closing `EOF` never matches and the shell hangs
+   forever with no output. This is why every step is a file in the repo.
+9. **Never paste the sha256 by hand.** On 2026-07-19 a placeholder went in
+   with its angle brackets still attached (`checkpoint_sha256="<ed06...>"`).
+   A wrong hash **does not fail loudly** — it silently changes `provider_id`,
+   which is both the tile-cache namespace *and* the edit-log provider stamp.
+   The scripts read it from `bringup.env`; the tools reject bracketed or
+   wrong-length values.
