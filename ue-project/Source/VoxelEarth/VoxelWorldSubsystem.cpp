@@ -1757,6 +1757,8 @@ struct FVoxelWorldImpl
 	int64 VerifyAirPredictions = 0;  // chunks predicted all-air AND checked against a real result
 	int64 VerifyAirViolations = 0;   // ...of which the worker produced quads for. Must stay 0.
 	int64 VerifyChunksChecked = 0;   // every non-stale result the verifier saw, air or not
+	int64 VerifyAirPredictionsByLevel[VoxelCoords::kNumLevels] = {};
+	int64 VerifyResultsByLevel[VoxelCoords::kNumLevels] = {};
 
 	// Chunks never dispatched because IsChunkProvablyAllAir proved them empty,
 	// per level (the headline saving) -- reported on the ring dispatch line.
@@ -2681,8 +2683,14 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	if (VoxelSkyBand::GetVerifyEnabled())
 	{
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("VoxelVerifySkyBand: results checked=%lld predicted-all-air=%lld VIOLATIONS=%lld"),
-		       (long long)VerifyChunksChecked, (long long)VerifyAirPredictions, (long long)VerifyAirViolations);
+		       TEXT("VoxelVerifySkyBand: results checked=%lld predicted-all-air=%lld VIOLATIONS=%lld | ")
+		       TEXT("R0 %lld/%lld | R1 %lld/%lld | R2 %lld/%lld | R3 %lld/%lld | R4 %lld/%lld (predicted/checked)"),
+		       (long long)VerifyChunksChecked, (long long)VerifyAirPredictions, (long long)VerifyAirViolations,
+		       (long long)VerifyAirPredictionsByLevel[0], (long long)VerifyResultsByLevel[0],
+		       (long long)VerifyAirPredictionsByLevel[1], (long long)VerifyResultsByLevel[1],
+		       (long long)VerifyAirPredictionsByLevel[2], (long long)VerifyResultsByLevel[2],
+		       (long long)VerifyAirPredictionsByLevel[3], (long long)VerifyResultsByLevel[3],
+		       (long long)VerifyAirPredictionsByLevel[4], (long long)VerifyResultsByLevel[4]);
 	}
 	for (int64& V : LevelJobsDispatchedSinceLog)
 	{
@@ -3034,19 +3042,92 @@ int64 FVoxelWorldImpl::FootprintSurfaceUpperBoundMm(int32 Level, int32 ChunkX, i
 		return INT64_MAX; // decline rather than pay an unbounded read count
 	}
 
-	int64 MaxElevMm = INT64_MIN;
-	for (int64 Py = Py0; Py <= Py1; ++Py)
+	// Read the corner elevations once. Everything below is derived from this
+	// grid -- no further sampler traffic, and the grid is at most 16x16.
+	const int32 NX = int32(Px1 - Px0 + 1);
+	const int32 NY = int32(Py1 - Py0 + 1);
+	int64 Elev[VoxelSkyBand::kMaxPixelCornersPerAxis * VoxelSkyBand::kMaxPixelCornersPerAxis];
+	for (int32 Iy = 0; Iy < NY; ++Iy)
 	{
-		for (int64 Px = Px0; Px <= Px1; ++Px)
+		for (int32 Ix = 0; Ix < NX; ++Ix)
 		{
-			MaxElevMm = FMath::Max<int64>(MaxElevMm, Tiles->elevationMm(Px, Py));
+			Elev[Ix + NX * Iy] = Tiles->elevationMm(Px0 + Ix, Py0 + Iy);
 		}
 	}
-	if (MaxElevMm == INT64_MIN)
+
+	// (a) EXACT maximum of the bilinear base over the footprint.
+	//
+	// Taking the largest corner elevation would be a valid bound but a badly
+	// loose one whenever the footprint is small relative to a 30 m tile pixel
+	// (levels 0-3), because the nearest pixel corner can be 30 m of relief away
+	// from any ground the footprint actually contains. Instead: the base
+	// restricted to one pixel cell is bilinear, and a bilinear patch is LINEAR
+	// along each axis with the other fixed, so its maximum over any axis-aligned
+	// sub-rectangle is attained at a CORNER of that sub-rectangle. Clip the
+	// footprint to each pixel cell it touches and evaluate the cell's own
+	// bilinear form at the four clipped corners -- exact, and at most 4x4 cells.
+	//
+	// (b) Bound on the detail term using this footprint's OWN slope.
+	//
+	// slopeScaleQ10 clamps to [256, 4096] q10, and the absolute worst case
+	// (4096, i.e. 11.44 m of detail) needs ~86 m of relief across a single 30 m
+	// pixel -- a cliff. slopeMmPerPx is |e10-e00| + |e01-e00| at the pixel the
+	// column falls in, and every such pixel is in the grid just read, so the
+	// maximum over the footprint is available exactly. On ordinary terrain this
+	// takes the detail allowance from 11.44 m to 1-3 m, which is the difference
+	// between the bound binding at level 4 and not.
+	int64 MaxBaseMm = INT64_MIN;
+	int64 MaxSlopeMmPerPx = 0;
+	for (int32 Iy = 0; Iy + 1 < NY; ++Iy)
 	{
-		return INT64_MAX;
+		for (int32 Ix = 0; Ix + 1 < NX; ++Ix)
+		{
+			const int64 E00 = Elev[Ix + NX * Iy];
+			const int64 E10 = Elev[(Ix + 1) + NX * Iy];
+			const int64 E01 = Elev[Ix + NX * (Iy + 1)];
+			const int64 E11 = Elev[(Ix + 1) + NX * (Iy + 1)];
+
+			// Amplifier::evalSurface's slope term for this pixel, verbatim.
+			MaxSlopeMmPerPx = FMath::Max(MaxSlopeMmPerPx,
+			                             FMath::Abs(E10 - E00) + FMath::Abs(E01 - E00));
+
+			// Footprint clipped to this cell, in cell-local mm [0, PxMm].
+			const int64 CellX0Mm = (Px0 + Ix) * PxMm;
+			const int64 CellY0Mm = (Py0 + Iy) * PxMm;
+			const int64 Lx0 = FMath::Max<int64>(0, X0Mm - CellX0Mm);
+			const int64 Lx1 = FMath::Min<int64>(PxMm, X1Mm - CellX0Mm);
+			const int64 Ly0 = FMath::Max<int64>(0, Y0Mm - CellY0Mm);
+			const int64 Ly1 = FMath::Min<int64>(PxMm, Y1Mm - CellY0Mm);
+			if (Lx0 > Lx1 || Ly0 > Ly1)
+			{
+				continue; // footprint does not reach this cell
+			}
+
+			const int64 Fxs[2] = {Lx0, Lx1};
+			const int64 Fys[2] = {Ly0, Ly1};
+			for (int64 Fx : Fxs)
+			{
+				for (int64 Fy : Fys)
+				{
+					// evalSurface's bilinear form, same integer math. Its
+					// division truncates toward zero, so +1 covers the one-mm
+					// the truncation can move the value upward for a negative
+					// numerator -- keeping this an upper bound unconditionally.
+					const int64 Gx = PxMm - Fx, Gy = PxMm - Fy;
+					const int64 BaseMm = ((E00 * Gx + E10 * Fx) * Gy + (E01 * Gx + E11 * Fx) * Fy) / (PxMm * PxMm) + 1;
+					MaxBaseMm = FMath::Max(MaxBaseMm, BaseMm);
+				}
+			}
+		}
 	}
-	return MaxElevMm + VoxelSkyBand::kMaxDetailMm;
+	if (MaxBaseMm == INT64_MIN)
+	{
+		return INT64_MAX; // degenerate grid (single corner): decline to bound
+	}
+
+	const int64 SlopeScaleQ10 = FMath::Clamp<int64>(512 + MaxSlopeMmPerPx / 24, 256, VoxelSkyBand::kMaxSlopeScaleQ10);
+	const int64 MaxDetailMm = VoxelSkyBand::kDetailAmplitudeSumMm * SlopeScaleQ10 / 1024;
+	return MaxBaseMm + MaxDetailMm;
 }
 
 bool FVoxelWorldImpl::IsChunkProvablyAllAir(const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const
@@ -4557,10 +4638,13 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		// violation, and counted for the run summary.
 		if (VoxelSkyBand::GetVerifyEnabled())
 		{
+			const int32 VLvl = FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1);
 			++VerifyChunksChecked;
+			++VerifyResultsByLevel[VLvl];
 			if (VerifyPredictedAirKeys.Remove(Result.Key) > 0)
 			{
 				++VerifyAirPredictions;
+				++VerifyAirPredictionsByLevel[VLvl];
 				if (Result.Quads.Num() != 0)
 				{
 					++VerifyAirViolations;
