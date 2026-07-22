@@ -3,9 +3,12 @@
 #include "Engine/Canvas.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
+#include "HAL/IConsoleManager.h"
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
+#include "VoxelEarthFlyPawn.h"
 #include "VoxelEarthPlayerController.h"
+#include "VoxelGI.h"
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -25,6 +28,18 @@ FString PaletteMaterialName(uint8 MaterialId)
 	default: return TEXT("?");
 	}
 }
+
+const FLinearColor kOverlayHeader(1.0f, 0.85f, 0.25f, 1.0f);
+const FLinearColor kOverlayInfo(0.75f, 0.85f, 1.0f, 1.0f);
+const FLinearColor kOverlayRow(0.85f, 0.85f, 0.85f, 1.0f);
+const FLinearColor kOverlaySelected(1.0f, 1.0f, 0.35f, 1.0f);
+const FLinearColor kOverlayOn(0.35f, 1.0f, 0.45f, 1.0f);
+const FLinearColor kOverlayWarn(1.0f, 0.45f, 0.35f, 1.0f);
+
+FString OnOff(bool bOn)
+{
+	return bOn ? TEXT("ON") : TEXT("off");
+}
 } // namespace
 
 void AVoxelEarthHUD::DrawHUD()
@@ -42,6 +57,14 @@ void AVoxelEarthHUD::DrawHUD()
 	{
 		DrawPerfHUD();
 	}
+
+	// Usability task: F1 overlay (default OFF -- see the header) and the
+	// always-on walk/fly mode line.
+	if (bOverlayVisible)
+	{
+		DrawDebugOverlay();
+	}
+	DrawModeLine();
 
 	// Crosshair: a small filled dot at the screen center (dig/place always
 	// traces camera-through-crosshair, m1-plan.md "Cameras" row).
@@ -175,4 +198,340 @@ void AVoxelEarthHUD::DrawPerfHUD()
 		DrawText(Line, FLinearColor(0.2f, 1.f, 0.3f, 1.f), PerfPanelMarginPx + 6.f, LineY, nullptr, 1.f, false);
 		LineY += PerfPanelLineHeightPx;
 	}
+}
+
+// ============================================================================
+// In-game debug overlay (usability task)
+// ============================================================================
+
+AVoxelEarthFlyPawn* AVoxelEarthHUD::GetVoxelPawn() const
+{
+	return PlayerOwner ? Cast<AVoxelEarthFlyPawn>(PlayerOwner->GetPawn()) : nullptr;
+}
+
+void AVoxelEarthHUD::ToggleDebugOverlay()
+{
+	bOverlayVisible = !bOverlayVisible;
+}
+
+void AVoxelEarthHUD::MoveOverlaySelection(int32 Delta)
+{
+	const int32 Count = (int32)EOverlayRow::Count;
+	const int32 Next = (((int32)OverlaySelection + Delta) % Count + Count) % Count;
+	OverlaySelection = (EOverlayRow)Next;
+}
+
+void AVoxelEarthHUD::AdjustOverlaySelection(int32 Delta)
+{
+	switch (OverlaySelection)
+	{
+	case EOverlayRow::MovementMode:
+		if (AVoxelEarthFlyPawn* Pawn = GetVoxelPawn())
+		{
+			Pawn->SetWalkMode(!Pawn->IsWalkMode());
+		}
+		break;
+
+	case EOverlayRow::FlySpeed:
+		if (AVoxelEarthFlyPawn* Pawn = GetVoxelPawn())
+		{
+			Pawn->AdjustFlySpeed(Delta >= 0 ? +1 : -1);
+		}
+		break;
+
+	case EOverlayRow::DebugMode:
+		// 0 -> 1 -> 2 -> 0, the same cycle F3 drives; Left steps backwards so
+		// the row behaves like every other value row.
+		VoxelDebug::SetDebugMode((VoxelDebug::GetDebugMode() + (Delta >= 0 ? 1 : 2)) % 3);
+		break;
+
+	case EOverlayRow::ChunkStates:
+		VoxelDebug::SetChunkStatesEnabled(!VoxelDebug::GetChunkStatesCVar());
+		break;
+
+	case EOverlayRow::Bounds:
+		VoxelDebug::SetBoundsEnabled(!VoxelDebug::GetBoundsCVar());
+		break;
+
+	case EOverlayRow::Rings:
+		VoxelDebug::SetRingsEnabled(!VoxelDebug::GetRingsCVar());
+		break;
+
+	case EOverlayRow::GlobalIllumination:
+		// voxel.GI.Enabled lives in VoxelGI.cpp and only exposes a getter
+		// (VoxelGI::IsEnabled), so drive the cvar itself -- still the one
+		// shared source of truth, not a parallel flag.
+		if (IConsoleVariable* GICVar = IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.GI.Enabled")))
+		{
+			GICVar->Set(VoxelGI::IsEnabled() ? 0 : 1, ECVF_SetByCode);
+		}
+		break;
+
+	case EOverlayRow::Wireframe:
+		// Show flags have no console read-back, hence the tracked bool (see
+		// the header). The voxel chunk/water scene proxies already honour
+		// EngineShowFlags.Wireframe, so this costs nothing to support.
+		bWireframeRequested = !bWireframeRequested;
+		if (PlayerOwner)
+		{
+			PlayerOwner->ConsoleCommand(bWireframeRequested ? TEXT("ShowFlag.Wireframe 1") : TEXT("ShowFlag.Wireframe 0"),
+			                            /*bWriteToLog*/ false);
+		}
+		break;
+
+	case EOverlayRow::Count:
+	default:
+		break;
+	}
+}
+
+void AVoxelEarthHUD::DrawOverlayInfo(const FString& Text, const FLinearColor& Color, float PanelX, float& InOutY)
+{
+	DrawText(Text, Color, PanelX + 8.f, InOutY, nullptr, 1.f, false);
+	InOutY += OverlayLineHeightPx;
+}
+
+void AVoxelEarthHUD::DrawOverlayRow(EOverlayRow Row, const FString& Label, const FString& Value, float PanelX, float& InOutY)
+{
+	const bool bSelected = (Row == OverlaySelection);
+	const FLinearColor Color = bSelected ? kOverlaySelected : kOverlayRow;
+	if (bSelected)
+	{
+		// Selection band: a filled row behind the text reads instantly at a
+		// glance, which a colour change alone does not over a busy scene.
+		DrawRect(FLinearColor(0.25f, 0.25f, 0.05f, 0.75f), PanelX + 4.f, InOutY - 1.f, OverlayPanelWidthPx - 8.f,
+		         OverlayLineHeightPx);
+	}
+	DrawText(FString::Printf(TEXT("%s %s"), bSelected ? TEXT(">") : TEXT(" "), *Label), Color, PanelX + 8.f, InOutY, nullptr, 1.f,
+	         false);
+	DrawText(Value, Color, PanelX + OverlayValueColumnPx, InOutY, nullptr, 1.f, false);
+	InOutY += OverlayLineHeightPx;
+}
+
+void AVoxelEarthHUD::DrawDebugOverlay()
+{
+	UWorld* World = GetWorld();
+	if (!World || !Canvas)
+	{
+		return;
+	}
+	UVoxelWorldSubsystem* Subsystem = World->GetSubsystem<UVoxelWorldSubsystem>();
+	AVoxelEarthFlyPawn* Pawn = GetVoxelPawn();
+
+	// Top-right, so it never overlaps the mode>=1 perf panel (top-left, 620px
+	// wide) or the dig/place text block (bottom-left).
+	const float PanelX = FMath::Max(OverlayMarginPx, Canvas->SizeX - OverlayPanelWidthPx - OverlayMarginPx);
+	// Row budget with a little slack: an over-estimate is invisible, an
+	// under-estimate clips text outside the panel.
+	const float PanelHeight = OverlayLineHeightPx * 28.f + 12.f;
+	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.70f), PanelX, OverlayMarginPx, OverlayPanelWidthPx, PanelHeight);
+
+	float Y = OverlayMarginPx + 5.f;
+	DrawOverlayInfo(TEXT("VOXEL DEBUG OVERLAY   (F1 close)"), kOverlayHeader, PanelX, Y);
+	DrawOverlayInfo(TEXT("Up/Down select   Left/Right/Enter change"), kOverlayInfo, PanelX, Y);
+	Y += 4.f;
+
+	// --- Where am I ---------------------------------------------------------
+
+	FVector Pos = FVector::ZeroVector;
+	if (Pawn)
+	{
+		Pos = Pawn->GetActorLocation();
+	}
+	else if (PlayerOwner && PlayerOwner->PlayerCameraManager)
+	{
+		Pos = PlayerOwner->PlayerCameraManager->GetCameraLocation();
+	}
+
+	DrawOverlayInfo(FString::Printf(TEXT("Pos     %.1f, %.1f, %.1f m"), Pos.X / 100.0, Pos.Y / 100.0, Pos.Z / 100.0), kOverlayInfo,
+	                PanelX, Y);
+	DrawOverlayInfo(FString::Printf(TEXT("Voxel   %lld, %lld, %lld"),
+	                                 (long long)FMath::FloorToDouble(Pos.X / VoxelCoords::VoxelSizeUU),
+	                                 (long long)FMath::FloorToDouble(Pos.Y / VoxelCoords::VoxelSizeUU),
+	                                 (long long)FMath::FloorToDouble(Pos.Z / VoxelCoords::VoxelSizeUU)),
+	                kOverlayInfo, PanelX, Y);
+
+	if (Subsystem)
+	{
+		const double SurfaceUU = Subsystem->GetSurfaceHeightUU(Pos.X, Pos.Y);
+		DrawOverlayInfo(FString::Printf(TEXT("Surface %.1f m   altitude %+.1f m"), SurfaceUU / 100.0, (Pos.Z - SurfaceUU) / 100.0),
+		                kOverlayInfo, PanelX, Y);
+	}
+
+	// Which diffusion tile the pawn is standing in -- the tiles on disk are
+	// named "<x>_<y>.vxtl", so this is directly checkable against the tile dir.
+	{
+		int32 TileX = 0, TileY = 0;
+		int64 PixelX = 0, PixelY = 0;
+		VoxelDebug::WorldToTileCoords(Pos.X, Pos.Y, TileX, TileY, PixelX, PixelY);
+		DrawOverlayInfo(
+			FString::Printf(TEXT("Tile    %d_%d   (tile px %lld, %lld)"), TileX, TileY, (long long)PixelX, (long long)PixelY),
+			kOverlayInfo, PanelX, Y);
+	}
+
+	// --- Tile source: real diffusion tiles, or the synthetic sampler? -------
+	//
+	// Worth the panel space on its own: a wrong -VoxelSeed / -VoxelTileScale /
+	// -VoxelTileDir silently boots a plausible-looking synthetic world, and
+	// that has cost this project hours more than once.
+	{
+		const VoxelDebug::FTileSourceStatus Tiles = VoxelDebug::GetTileSourceStatus();
+		if (!Tiles.bKnown)
+		{
+			DrawOverlayInfo(TEXT("Source  SYNTHETIC SAMPLER (no -VoxelTileDir)"), kOverlayWarn, PanelX, Y);
+		}
+		else if (Tiles.bUsingRealTiles)
+		{
+			DrawOverlayInfo(
+				FString::Printf(TEXT("Source  REAL TILES  loaded=%d rejected=%d"), Tiles.TilesLoaded, Tiles.TilesRejected),
+				Tiles.TilesRejected > 0 ? kOverlayWarn : kOverlayOn, PanelX, Y);
+			if (Tiles.bBoxKnown)
+			{
+				DrawOverlayInfo(FString::Printf(TEXT("        tiles x=[%d,%d] y=[%d,%d]"), Tiles.MinTileX, Tiles.MaxTileX,
+				                                 Tiles.MinTileY, Tiles.MaxTileY),
+				                kOverlayInfo, PanelX, Y);
+			}
+		}
+		else
+		{
+			DrawOverlayInfo(FString::Printf(TEXT("Source  SYNTHETIC (tile load FAILED, rejected=%d)"), Tiles.TilesRejected),
+			                kOverlayWarn, PanelX, Y);
+		}
+	}
+
+	// --- Streaming ----------------------------------------------------------
+
+	if (Subsystem)
+	{
+		const FVoxelPerfSnapshot Snap = Subsystem->GetPerfSnapshot();
+		FString RingsLine = TEXT("Rings  ");
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			RingsLine += FString::Printf(TEXT(" R%d %d/%d"), Level, Snap.LevelLoadedCount[Level], Snap.LevelPendingCount[Level]);
+		}
+		DrawOverlayInfo(RingsLine + TEXT("   (loaded/pending)"), kOverlayInfo, PanelX, Y);
+		DrawOverlayInfo(FString::Printf(TEXT("Jobs    %d/%d in flight   queues %d/%d/%d"), Snap.JobsInFlight, Snap.JobsInFlightCap,
+		                                 Snap.PendingJobQueueDepth, Snap.PendingGameThreadQueueDepth, Snap.PendingUnloadQueueDepth),
+		                kOverlayInfo, PanelX, Y);
+
+		// Per-position residency -- the same query walk mode's terrain-ready
+		// gate uses, so "why am I hovering" is answerable from the overlay.
+		bool bTracked = false, bHasComponent = false;
+		int32 Quads = 0;
+		const bool bFound = Subsystem->DebugChunkStatusAt(Pos, bTracked, bHasComponent, Quads);
+		DrawOverlayInfo(FString::Printf(TEXT("Here    %s  tracked=%s  component=%s  quads=%d"),
+		                                 bFound ? TEXT("chunk") : TEXT("none"), bTracked ? TEXT("y") : TEXT("n"),
+		                                 bHasComponent ? TEXT("y") : TEXT("n"), Quads),
+		                (bTracked && !bHasComponent) ? kOverlayWarn : kOverlayInfo, PanelX, Y);
+	}
+
+	DrawOverlayInfo(FString::Printf(TEXT("Veil    %s (run switch -VoxelUndergroundVeil)"),
+	                                 VoxelDebug::IsUndergroundVeilEnabledForRun() ? TEXT("enabled") : TEXT("DISABLED")),
+	                kOverlayInfo, PanelX, Y);
+
+	// --- Movement state -----------------------------------------------------
+
+	if (Pawn)
+	{
+		FString StateText;
+		if (Pawn->IsWalkMode())
+		{
+			StateText = Pawn->IsWaitingForTerrain() ? TEXT("WAITING FOR TERRAIN (holding position)")
+			            : Pawn->IsSwimmingNow()     ? TEXT("swimming")
+			            : Pawn->IsGroundedNow()     ? TEXT("grounded")
+			                                        : TEXT("airborne");
+		}
+		else
+		{
+			StateText = TEXT("flying (no collision: clips terrain, water, debris)");
+		}
+		DrawOverlayInfo(FString::Printf(TEXT("State   %s"), *StateText),
+		                Pawn->IsWaitingForTerrain() ? kOverlayWarn : kOverlayInfo, PanelX, Y);
+		DrawOverlayInfo(FString::Printf(TEXT("Camera  %s"), Pawn->IsThirdPerson() ? TEXT("third person") : TEXT("first person")),
+		                kOverlayInfo, PanelX, Y);
+	}
+
+	Y += 6.f;
+	DrawOverlayInfo(TEXT("--- settings ---"), kOverlayHeader, PanelX, Y);
+
+	// --- Selectable rows ----------------------------------------------------
+
+	DrawOverlayRow(EOverlayRow::MovementMode, TEXT("Movement mode  (G)"),
+	               Pawn ? (Pawn->IsWalkMode() ? TEXT("WALK") : TEXT("FLY")) : TEXT("(no pawn)"), PanelX, Y);
+
+	FString SpeedValue = TEXT("(no pawn)");
+	if (Pawn)
+	{
+		SpeedValue = FString::Printf(TEXT("step %d/%d  %.2f m/s%s"), Pawn->GetFlySpeedIndex() + 1,
+		                              AVoxelEarthFlyPawn::GetFlySpeedStepCount(), Pawn->GetEffectiveFlySpeedUU() / 100.0,
+		                              Pawn->IsSprintHeld() ? TEXT(" (boost)") : TEXT(""));
+	}
+	DrawOverlayRow(EOverlayRow::FlySpeed, TEXT("Fly speed      ( / )"), SpeedValue, PanelX, Y);
+
+	DrawOverlayRow(EOverlayRow::DebugMode, TEXT("voxel.Debug    (F3)"),
+	               FString::Printf(TEXT("%d  (0 off, 1 perf HUD, 2 +layers)"), VoxelDebug::GetDebugMode()), PanelX, Y);
+
+	// The three layer rows show the CVAR value and, when mode < 2 is holding
+	// them back, say so -- otherwise flipping one at mode 1 looks broken.
+	const TCHAR* Gated = (VoxelDebug::GetDebugMode() >= 2) ? TEXT("") : TEXT("  (needs voxel.Debug 2)");
+	DrawOverlayRow(EOverlayRow::ChunkStates, TEXT("  Chunk states"),
+	               FString::Printf(TEXT("%s%s"), *OnOff(VoxelDebug::GetChunkStatesCVar()), Gated), PanelX, Y);
+	DrawOverlayRow(EOverlayRow::Bounds, TEXT("  Chunk bounds"),
+	               FString::Printf(TEXT("%s%s"), *OnOff(VoxelDebug::GetBoundsCVar()), Gated), PanelX, Y);
+	DrawOverlayRow(EOverlayRow::Rings, TEXT("  Ring level tint"),
+	               FString::Printf(TEXT("%s%s"), *OnOff(VoxelDebug::GetRingsCVar()), Gated), PanelX, Y);
+
+	DrawOverlayRow(EOverlayRow::GlobalIllumination, TEXT("Voxel GI"), OnOff(VoxelGI::IsEnabled()), PanelX, Y);
+	DrawOverlayRow(EOverlayRow::Wireframe, TEXT("Wireframe"), OnOff(bWireframeRequested), PanelX, Y);
+
+	Y += 6.f;
+	DrawOverlayInfo(TEXT("WASD move   Space/Ctrl up-down   Shift boost   Alt slow"), kOverlayInfo, PanelX, Y);
+	DrawOverlayInfo(TEXT("G walk/fly   C camera   LMB dig   RMB place   T material"), kOverlayInfo, PanelX, Y);
+	DrawOverlayInfo(TEXT("1/2/3 or wheel dig size   F hold-throw   F3 debug mode"), kOverlayInfo, PanelX, Y);
+}
+
+void AVoxelEarthHUD::DrawModeLine()
+{
+	// Never in a headless verification capture (see the header). The overlay
+	// above is default-off and key-driven so it needs no such guard, but this
+	// line is always on and would otherwise be new pixels in every fixture
+	// screenshot.
+	if (VoxelDebug::IsUnattendedFixtureRun() || !Canvas)
+	{
+		return;
+	}
+	const AVoxelEarthFlyPawn* Pawn = GetVoxelPawn();
+	if (!Pawn)
+	{
+		return;
+	}
+
+	FString Text;
+	FLinearColor Color = FLinearColor::White;
+	if (Pawn->IsWalkMode())
+	{
+		if (Pawn->IsWaitingForTerrain())
+		{
+			Text = TEXT("WALK - waiting for terrain");
+			Color = kOverlayWarn;
+		}
+		else
+		{
+			Text = Pawn->IsSwimmingNow() ? TEXT("WALK - swimming") : TEXT("WALK");
+			Color = kOverlayOn;
+		}
+	}
+	else
+	{
+		Text = FString::Printf(TEXT("FLY - %.1f m/s%s"), Pawn->GetEffectiveFlySpeedUU() / 100.0,
+		                        Pawn->IsSprintHeld() ? TEXT(" boost") : TEXT(""));
+		Color = kOverlayHeader;
+	}
+	if (!bOverlayVisible)
+	{
+		Text += TEXT("   (G mode, F1 debug)");
+	}
+
+	// Bottom-right, clear of the bottom-left dig/place block.
+	DrawText(Text, Color, Canvas->SizeX - 380.f, Canvas->SizeY - MarginPx - LineHeightPx, nullptr, 1.f, false);
 }

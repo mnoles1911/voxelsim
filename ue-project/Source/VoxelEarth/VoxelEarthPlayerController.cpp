@@ -10,6 +10,7 @@
 #include "TimerManager.h"
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
+#include "VoxelEarthHUD.h"
 #include "VoxelExplosive.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -43,6 +44,66 @@ void AVoxelEarthPlayerController::SetupInputComponent()
 	// docs/debug-tooling-plan.md P1 "CVars + F3": F3 cycles voxel.Debug
 	// 0(off)->1(perf HUD)->2(HUD+visualizations)->0 in PIE/game.
 	InputComponent->BindKey(EKeys::F3, IE_Pressed, this, &AVoxelEarthPlayerController::OnCycleDebugMode);
+
+	// In-game debug overlay (usability task): F1 toggles, arrows navigate,
+	// Enter activates. See the header for why these keys.
+	InputComponent->BindKey(EKeys::F1, IE_Pressed, this, &AVoxelEarthPlayerController::OnToggleDebugOverlay);
+	InputComponent->BindKey(EKeys::Up, IE_Pressed, this, &AVoxelEarthPlayerController::OnOverlayUp);
+	InputComponent->BindKey(EKeys::Down, IE_Pressed, this, &AVoxelEarthPlayerController::OnOverlayDown);
+	InputComponent->BindKey(EKeys::Left, IE_Pressed, this, &AVoxelEarthPlayerController::OnOverlayLeft);
+	InputComponent->BindKey(EKeys::Right, IE_Pressed, this, &AVoxelEarthPlayerController::OnOverlayRight);
+	InputComponent->BindKey(EKeys::Enter, IE_Pressed, this, &AVoxelEarthPlayerController::OnOverlayActivate);
+}
+
+AVoxelEarthHUD* AVoxelEarthPlayerController::GetVoxelHUD() const
+{
+	return Cast<AVoxelEarthHUD>(MyHUD);
+}
+
+void AVoxelEarthPlayerController::OnToggleDebugOverlay()
+{
+	if (AVoxelEarthHUD* Hud = GetVoxelHUD())
+	{
+		Hud->ToggleDebugOverlay();
+	}
+}
+
+void AVoxelEarthPlayerController::OnOverlayUp()
+{
+	if (AVoxelEarthHUD* Hud = GetVoxelHUD(); Hud && Hud->IsDebugOverlayVisible())
+	{
+		Hud->MoveOverlaySelection(-1);
+	}
+}
+
+void AVoxelEarthPlayerController::OnOverlayDown()
+{
+	if (AVoxelEarthHUD* Hud = GetVoxelHUD(); Hud && Hud->IsDebugOverlayVisible())
+	{
+		Hud->MoveOverlaySelection(+1);
+	}
+}
+
+void AVoxelEarthPlayerController::OnOverlayLeft()
+{
+	if (AVoxelEarthHUD* Hud = GetVoxelHUD(); Hud && Hud->IsDebugOverlayVisible())
+	{
+		Hud->AdjustOverlaySelection(-1);
+	}
+}
+
+void AVoxelEarthPlayerController::OnOverlayRight()
+{
+	if (AVoxelEarthHUD* Hud = GetVoxelHUD(); Hud && Hud->IsDebugOverlayVisible())
+	{
+		Hud->AdjustOverlaySelection(+1);
+	}
+}
+
+void AVoxelEarthPlayerController::OnOverlayActivate()
+{
+	// Enter behaves as "Right" -- flip a boolean, step a value forwards.
+	OnOverlayRight();
 }
 
 void AVoxelEarthPlayerController::BeginPlay()

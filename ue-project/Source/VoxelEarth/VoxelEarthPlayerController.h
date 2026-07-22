@@ -106,6 +106,25 @@ private:
 	// docs/debug-tooling-plan.md P1 "CVars + F3": cycles voxel.Debug 0->1->2->0.
 	void OnCycleDebugMode();
 
+	// In-game debug overlay (usability task). F1 shows/hides it; the arrow
+	// keys and Enter navigate it. All the state and the row table live on
+	// AVoxelEarthHUD -- these handlers only forward, and they are no-ops when
+	// the overlay is hidden so the arrow keys stay free for anything else that
+	// wants them later. Arrow keys and Enter were chosen because every other
+	// key this project binds is already spoken for (WASD/Space/Ctrl/Shift/Alt,
+	// G, C, T, F, 1-3, the mouse buttons and wheel, F3).
+	void OnToggleDebugOverlay();
+	void OnOverlayUp();
+	void OnOverlayDown();
+	void OnOverlayLeft();
+	void OnOverlayRight();
+	void OnOverlayActivate();
+
+	// Nullptr unless an AVoxelEarthHUD is the active HUD (it always is via
+	// AVoxelEarthGameMode::HUDClass, but a -game run with a HUD override
+	// should not crash).
+	class AVoxelEarthHUD* GetVoxelHUD() const;
+
 	int32 DigSizeVoxels = 1;
 
 	// vxc::MAT_ROCK == 2 (voxelcore/core.h); kept as a numeric literal here

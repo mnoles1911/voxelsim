@@ -8,6 +8,7 @@
 #include "GameFramework/PlayerInput.h"
 #include "InputCoreTypes.h"
 #include "VoxelCoords.h"
+#include "VoxelDebug.h"
 #include "VoxelProxyBody.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -63,11 +64,32 @@ AVoxelEarthFlyPawn::AVoxelEarthFlyPawn()
 	ProxyBody->SetupAttachment(SceneRoot);
 
 	Movement = CreateDefaultSubobject<UFloatingPawnMovement>(TEXT("Movement"));
-	// Flying speed tuned for exploring a streaming radius measured in tens
-	// of meters (docs/m1-plan.md Stage 2: 64m load / 80m unload rings).
-	Movement->MaxSpeed = 3000.f;   // 30 m/s
-	Movement->Acceleration = 8000.f;
-	Movement->Deceleration = 8000.f;
+	// Fly speed now comes from the kFlySpeedStepsUU table (ApplyFlySpeedToMovement,
+	// called every fly-mode Tick); these initial values are the default step
+	// (index 4 == 3000 UU/s) so a pawn that never ticks still behaves exactly
+	// as it did before the speed control existed.
+	Movement->MaxSpeed = (float)kFlySpeedStepsUU[kDefaultFlySpeedIndex]; // 30 m/s
+	Movement->Acceleration = (float)(kFlySpeedStepsUU[kDefaultFlySpeedIndex] * kFlyAccelPerMaxSpeed);
+	Movement->Deceleration = Movement->Acceleration;
+
+	// FLY MODE CLIPS THROUGH EVERYTHING (task requirement). Two things already
+	// guaranteed most of it and one did not:
+	//   * the root is a bare USceneComponent, so UFloatingPawnMovement's swept
+	//     MoveUpdatedComponent has no collision shape to sweep and passes
+	//     through terrain regardless;
+	//   * voxel terrain and water chunk components carry no Chaos collision at
+	//     all (docs/m1-plan.md SS3.3 "no Chaos for terrain"), and the proxy
+	//     body's meshes are explicitly NoCollision;
+	//   * but DEBRIS (AVoxelDebris) and explosives are ordinary physics actors
+	//     WITH collision, and an overlap against those is the one way this pawn
+	//     could ever be stopped or shoved.
+	// Disabling actor collision outright makes "no collision at all in fly
+	// mode" true by construction rather than by three separate coincidences.
+	// Walk mode does not need it either: its collision is the DDA sweep against
+	// UVoxelWorldSubsystem::IsSolidAtVoxel (SweepAxis), which never consults
+	// Chaos -- so this stays off in both modes and there is no mode-dependent
+	// collision state to get wrong.
+	SetActorEnableCollision(false);
 
 	// Actor rotation follows the controller (mouse look), and movement input
 	// is applied in actor-local axes -- the standard "fly cam" setup. Walk
@@ -138,6 +160,16 @@ void AVoxelEarthFlyPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputC
 	PlayerInputComponent->BindKey(EKeys::LeftShift, IE_Pressed, this, &AVoxelEarthFlyPawn::OnSprintPressed);
 	PlayerInputComponent->BindKey(EKeys::LeftShift, IE_Released, this, &AVoxelEarthFlyPawn::OnSprintReleased);
 	PlayerInputComponent->BindKey(EKeys::C, IE_Pressed, this, &AVoxelEarthFlyPawn::ToggleCameraMode);
+
+	// Fly speed step (usability task): ']' faster, '[' slower, LeftAlt held =
+	// precision. Brackets rather than the mouse wheel because the wheel is
+	// already the dig/place size selector (AVoxelEarthPlayerController), and a
+	// key that silently does two things depending on mode is exactly the kind
+	// of thing this task exists to remove.
+	PlayerInputComponent->BindKey(EKeys::RightBracket, IE_Pressed, this, &AVoxelEarthFlyPawn::OnFlySpeedUp);
+	PlayerInputComponent->BindKey(EKeys::LeftBracket, IE_Pressed, this, &AVoxelEarthFlyPawn::OnFlySpeedDown);
+	PlayerInputComponent->BindKey(EKeys::LeftAlt, IE_Pressed, this, &AVoxelEarthFlyPawn::OnPrecisionPressed);
+	PlayerInputComponent->BindKey(EKeys::LeftAlt, IE_Released, this, &AVoxelEarthFlyPawn::OnPrecisionReleased);
 }
 
 void AVoxelEarthFlyPawn::MoveForward(float Value)
@@ -176,10 +208,70 @@ void AVoxelEarthFlyPawn::LookUp(float Value) { AddControllerPitchInput(-Value * 
 
 void AVoxelEarthFlyPawn::ToggleWalkMode()
 {
-	bWalkMode = !bWalkMode;
+	SetWalkMode(!bWalkMode);
+}
+
+void AVoxelEarthFlyPawn::OnFlySpeedUp() { AdjustFlySpeed(+1); }
+void AVoxelEarthFlyPawn::OnFlySpeedDown() { AdjustFlySpeed(-1); }
+void AVoxelEarthFlyPawn::OnPrecisionPressed() { bPrecisionHeld = true; }
+void AVoxelEarthFlyPawn::OnPrecisionReleased() { bPrecisionHeld = false; }
+
+void AVoxelEarthFlyPawn::AdjustFlySpeed(int32 Delta)
+{
+	FlySpeedIndex = FMath::Clamp(FlySpeedIndex + Delta, 0, kNumFlySpeedSteps - 1);
+	ApplyFlySpeedToMovement();
+}
+
+double AVoxelEarthFlyPawn::GetFlyBaseSpeedUU() const
+{
+	return kFlySpeedStepsUU[FMath::Clamp(FlySpeedIndex, 0, kNumFlySpeedSteps - 1)];
+}
+
+double AVoxelEarthFlyPawn::GetEffectiveFlySpeedUU() const
+{
+	double Speed = GetFlyBaseSpeedUU();
+	// Boost and precision compose (both held = 0.6x); that is the useful
+	// behaviour, not an accident -- there is no reason to make one win.
+	if (bSprintHeld)
+	{
+		Speed *= kFlyBoostScale;
+	}
+	if (bPrecisionHeld)
+	{
+		Speed *= kFlyPrecisionScale;
+	}
+	return Speed;
+}
+
+void AVoxelEarthFlyPawn::ApplyFlySpeedToMovement()
+{
+	if (!Movement)
+	{
+		return;
+	}
+	const double MaxSpeed = GetEffectiveFlySpeedUU();
+	Movement->MaxSpeed = (float)MaxSpeed;
+	// Proportional accel: a fixed 8000 UU/s^2 would take ~25 s to reach the
+	// top step and would make the slowest step feel teleporty.
+	Movement->Acceleration = (float)(MaxSpeed * kFlyAccelPerMaxSpeed);
+	Movement->Deceleration = Movement->Acceleration;
+}
+
+void AVoxelEarthFlyPawn::SetWalkMode(bool bInWalkMode)
+{
+	if (bWalkMode == bInWalkMode)
+	{
+		return;
+	}
+	bWalkMode = bInWalkMode;
 	VerticalVelocity = 0.f;
 	bJumpRequested = false;
 	HorizontalVelocity = FVector::ZeroVector;
+	// Only ever meaningful in walk mode; clear it so the HUD never shows a
+	// stale "waiting for terrain" after switching back to fly.
+	bWaitingForTerrain = false;
+	bGroundedLastTick = false;
+	bSwimmingLastTick = false;
 
 	if (Movement)
 	{
@@ -232,6 +324,50 @@ UVoxelWorldSubsystem* AVoxelEarthFlyPawn::GetVoxelWorldSubsystem() const
 {
 	UWorld* World = GetWorld();
 	return World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+}
+
+bool AVoxelEarthFlyPawn::IsTerrainReadyAt(const FVector& Pos) const
+{
+	// THE PROBLEM. Terrain streams in asynchronously, so a walking pawn can
+	// exist before the ground beneath it does. IsSolidAtVoxel answers "is
+	// there a solid voxel here" and CANNOT distinguish "empty air" from "not
+	// generated yet" -- both are false. Left alone, a pawn that spawns or
+	// toggles into walk mode a fraction of a second early falls forever, and
+	// (worse) it does so silently and looks like a collision bug.
+	//
+	// THE RULE. Gravity runs only when the world under the pawn is positively
+	// known. Two independent tests, either of which vetoes:
+	//
+	//   1. GLOBAL: no level-0 chunk has loaded at all yet. This is the boot
+	//      case and the reason the pawn must not fall the moment it spawns.
+	//   2. LOCAL: the level-0 chunk containing the pawn IS in the desired set
+	//      (tracked) but does not yet own a component. That is precisely
+	//      "queued, not here yet" -- the state a fast traverse into unstreamed
+	//      space produces.
+	//
+	// Anything else -- untracked chunk (out of the streaming footprint
+	// entirely, e.g. flying far out) or tracked-with-component -- counts as
+	// ready, so the veto is narrow and self-clearing. When it fires, the
+	// pawn HOLDS (see TickWalkMode); it never falls.
+	UVoxelWorldSubsystem* Subsystem = GetVoxelWorldSubsystem();
+	if (!Subsystem)
+	{
+		return false;
+	}
+
+	if (Subsystem->GetPerfSnapshot().LevelLoadedCount[0] <= 0)
+	{
+		return false;
+	}
+
+	bool bTracked = false;
+	bool bHasComponent = false;
+	int32 Quads = 0;
+	if (Subsystem->DebugChunkStatusAt(Pos, bTracked, bHasComponent, Quads) && bTracked && !bHasComponent)
+	{
+		return false;
+	}
+	return true;
 }
 
 bool AVoxelEarthFlyPawn::IsGroundedAt(const FVector& Pos) const
@@ -365,6 +501,14 @@ void AVoxelEarthFlyPawn::Tick(float DeltaTime)
 	{
 		TickWalkMode(DeltaTime);
 	}
+	else
+	{
+		// Fly speed step + held modifiers (LeftShift boost / LeftAlt
+		// precision) -> UFloatingPawnMovement. Done per-frame rather than only
+		// on key events because the modifiers are HELD keys: releasing Shift
+		// must drop the top speed immediately.
+		ApplyFlySpeedToMovement();
+	}
 
 	// Runs in both modes (see constructor comment on PrimaryActorTick):
 	// step-smoothing decay + the third-person boom, and the proxy body's
@@ -455,10 +599,38 @@ void AVoxelEarthFlyPawn::TickWalkMode(float DeltaTime)
 	UVoxelWorldSubsystem* Subsystem = GetVoxelWorldSubsystem();
 	if (!Subsystem)
 	{
+		bWaitingForTerrain = true;
 		return; // world not streamed in yet; hold position rather than fall through nothing
 	}
 
 	FVector Pos = GetActorLocation();
+
+	// Terrain not streamed under the pawn (see IsTerrainReadyAt): suspend
+	// gravity and hold Z. Horizontal movement is deliberately still allowed --
+	// freezing completely would strand you with no way to walk back to loaded
+	// ground -- but with no voxels to sweep against it is unobstructed, which
+	// is the honest behaviour: there is nothing there yet. The HUD shows
+	// "WAITING FOR TERRAIN" so this reads as a state, not a bug.
+	bWaitingForTerrain = !IsTerrainReadyAt(Pos);
+	if (bWaitingForTerrain)
+	{
+		VerticalVelocity = 0.f;
+		bJumpRequested = false;
+		bGroundedLastTick = false;
+		bSwimmingLastTick = false;
+
+		const FRotator HoldYawOnly(0.0, GetActorRotation().Yaw, 0.0);
+		const FRotationMatrix HoldYawMatrix(HoldYawOnly);
+		FVector HoldWish =
+			HoldYawMatrix.GetUnitAxis(EAxis::X) * CurrentForwardInput + HoldYawMatrix.GetUnitAxis(EAxis::Y) * CurrentRightInput;
+		if (HoldWish.SizeSquared() > 1.0)
+		{
+			HoldWish.Normalize();
+		}
+		HorizontalVelocity = HoldWish * (bSprintHeld ? SprintSpeedUU : WalkSpeedUU);
+		SetActorLocation(Pos + HorizontalVelocity * DeltaTime);
+		return;
+	}
 
 	// Water track W1 swimming placeholder (docs/voxel-earth-implementation-
 	// plan.md SS3.7): the walk-mode box counts as "in the water" once it is
@@ -468,6 +640,8 @@ void AVoxelEarthFlyPawn::TickWalkMode(float DeltaTime)
 	// W4).
 	const bool bSwimming = (Pos.Z + WalkBoxHalfExtentZ) < 0.0;
 	const bool bGrounded = !bSwimming && IsGroundedAt(Pos);
+	bSwimmingLastTick = bSwimming;
+	bGroundedLastTick = bGrounded;
 
 	if (bSwimming)
 	{
