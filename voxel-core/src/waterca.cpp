@@ -1184,22 +1184,33 @@ inline void brickOrigin(const BrickKey& k, int64_t& ox, int64_t& oy, int64_t& oz
 
 } // namespace
 
+uint8_t WaterMobilizer::sourceFillAt(int64_t vx, int64_t vy, int64_t vz) const {
+    // Implicit water exists only in open cave air -- see the constructor's
+    // "WHY TERRAIN IS PART OF THE IMPLICIT FIELD" comment for why this belongs
+    // here rather than being left to the ImplicitFn or to the CA.
+    if (terrain_(vx, vy, vz) != MAT_AIR) return 0;
+    return implicit_(vx, vy, vz);
+}
+
 uint8_t WaterMobilizer::implicitFillAt(int64_t vx, int64_t vy, int64_t vz) const {
     // The ownership handover, in one line: once the brick has mobilized the
     // CA owns these cells and the implicit field contributes nothing.
     if (mobilized_.count(waterKeyForVoxel(vx, vy, vz)) != 0) return 0;
-    return implicit_(vx, vy, vz);
+    return sourceFillAt(vx, vy, vz);
 }
 
-WaterCA::SolidFn WaterMobilizer::makeSolidFn(WaterCA::SolidFn terrain) const {
+WaterCA::SolidFn WaterMobilizer::makeSolidFn() const {
     // Terrain first: it is the cheaper query and the common answer. Only for
     // genuinely open air do we ask whether the implicit field still owns this
     // cell, in which case it reads as solid -- an unmobilized lake is a WALL,
     // which is what makes the ownership partition structural (waterca.h).
-    return [this, terrain = std::move(terrain)](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
-        const MaterialId m = terrain(vx, vy, vz);
+    // (Inlined rather than calling implicitFillAt, to avoid asking terrain_
+    // twice on the CA's hottest query.)
+    return [this](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
+        const MaterialId m = terrain_(vx, vy, vz);
         if (m != MAT_AIR) return m;
-        return implicitFillAt(vx, vy, vz) != 0 ? MAT_ROCK : MAT_AIR;
+        if (mobilized_.count(waterKeyForVoxel(vx, vy, vz)) != 0) return MAT_AIR;
+        return implicit_(vx, vy, vz) != 0 ? MAT_ROCK : MAT_AIR;
     };
 }
 
@@ -1209,7 +1220,7 @@ uint64_t WaterMobilizer::scanBrick(const BrickKey& k) const {
     uint64_t sum = 0;
     for (int z = 0; z < kEdge; ++z)
         for (int y = 0; y < kEdge; ++y)
-            for (int x = 0; x < kEdge; ++x) sum += implicit_(ox + x, oy + y, oz + z);
+            for (int x = 0; x < kEdge; ++x) sum += sourceFillAt(ox + x, oy + y, oz + z);
     return sum;
 }
 
@@ -1243,7 +1254,7 @@ uint32_t WaterMobilizer::mobilizeBrick(WaterCA& ca, const BrickKey& k) {
     for (int z = 0; z < kEdge; ++z)
         for (int y = 0; y < kEdge; ++y)
             for (int x = 0; x < kEdge; ++x) {
-                const uint8_t want = implicit_(ox + x, oy + y, oz + z);
+                const uint8_t want = sourceFillAt(ox + x, oy + y, oz + z);
                 if (want == 0) continue;
                 debited_ += want;
                 // The cell was owned by the implicit field, so it was a wall to

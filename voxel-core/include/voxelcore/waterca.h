@@ -839,13 +839,32 @@ private:
 class WaterMobilizer {
 public:
     // Implicit static water at a voxel, in the CA's own 0..255 fill units
-    // (0 = none). In production this is
-    //   `cavernFloodedAt(col.cavern, vz) && materialAt(col, vz) == MAT_AIR ? 255 : 0`
-    // — see caverns.h's `cavernFloodedAt`, whose comment names this exact
-    // pairing. Must be a pure, deterministic function of position and seed.
+    // (0 = none). In production this is the flood-level half of the predicate
+    //   `cavernFloodedAt(col.cavern, vz) ? 255 : 0`
+    // — see caverns.h's `cavernFloodedAt`, whose comment splits the predicate
+    // exactly this way. Must be a pure, deterministic function of position and
+    // seed. The other half (is this cell actually open cave air?) is supplied
+    // by the `terrain` function below and applied for you in implicitFillAt,
+    // so this callback never has to ask about terrain at all.
     using ImplicitFn = std::function<uint8_t(int64_t vx, int64_t vy, int64_t vz)>;
 
-    explicit WaterMobilizer(ImplicitFn implicit) : implicit_(std::move(implicit)) {}
+    // WHY TERRAIN IS PART OF THE IMPLICIT FIELD, NOT JUST OF THE CA.
+    // Implicit water only exists in open cave air, and "open" means CURRENT
+    // terrain, edits included — not the raw worldgen raster. If it meant
+    // worldgen, then a player who PLACES a block into an unmobilized lake
+    // would leave the implicit field still claiming 255 units in a cell that
+    // is now rock; the brick would mobilize on the next edit notification and
+    // the CA would refuse those units as solid, and the ledger would show a
+    // shortfall for what is really just ordinary gameplay. Folding solidity in
+    // here instead means a filled cell simply holds nothing, so mobilization
+    // always credits exactly what it debits.
+    //
+    // The volume a placement destroys is then a real, intended discontinuity
+    // in implicitVolume — precisely the one a placement into CA water already
+    // causes in totalVolume(). Filling a hole destroys water either way; the
+    // two kinds of water just behave the same.
+    WaterMobilizer(ImplicitFn implicit, WaterCA::SolidFn terrain)
+        : implicit_(std::move(implicit)), terrain_(std::move(terrain)) {}
 
     // --- the ownership partition, as queries -------------------------------
 
@@ -863,10 +882,15 @@ public:
 
     // --- the wall (see "SO WE MAKE IT STRUCTURALLY IMPOSSIBLE" above) ------
 
-    // Wraps `terrain` so still-implicit water reads as solid. The returned
-    // function captures `this`, so the mobilizer MUST outlive the WaterCA it
-    // is given to — declare it before the CA in the owning struct.
-    WaterCA::SolidFn makeSolidFn(WaterCA::SolidFn terrain) const;
+    // The constructor's terrain function, wrapped so still-implicit water
+    // reads as solid. This is what you hand to the WaterCA. The returned
+    // function captures `this`, so the mobilizer MUST outlive the WaterCA —
+    // declare it before the CA in the owning struct.
+    WaterCA::SolidFn makeSolidFn() const;
+
+    // The raw, unwrapped terrain query, for callers that need to know what the
+    // ground says without the implicit-water wall on top.
+    const WaterCA::SolidFn& terrainSolidFn() const { return terrain_; }
 
     // --- conversion --------------------------------------------------------
 
@@ -916,6 +940,12 @@ public:
     void digest(Digest& d) const;
 
 private:
+    // The implicit field BEFORE the mobilization handover is applied: the
+    // flood callback, gated on the cell actually being open cave air. This is
+    // what mobilizeBrick hands over (it marks the brick first, so implicitFillAt
+    // already reads 0 by then) and what implicitFillAt returns while unmobilized.
+    uint8_t sourceFillAt(int64_t vx, int64_t vy, int64_t vz) const;
+
     // Scans `k`'s 512 cells; returns total implicit units present.
     uint64_t scanBrick(const BrickKey& k) const;
 
@@ -926,6 +956,7 @@ private:
     static constexpr size_t kMaxNoImplicitBricks = 1u << 16;
 
     ImplicitFn implicit_;
+    WaterCA::SolidFn terrain_;
     std::set<BrickKey, BrickKeyLess> mobilized_;
     std::set<BrickKey, BrickKeyLess> pending_;
     mutable std::unordered_set<BrickKey, BrickKeyHash> noImplicit_;
