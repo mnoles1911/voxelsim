@@ -317,14 +317,18 @@
 // against actual stored state.
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "voxelcore/brick.h"
+#include "voxelcore/bytes.h"
 #include "voxelcore/core.h"
 
 namespace vxc {
@@ -555,6 +559,16 @@ public:
     void setReplicatedFill(int64_t vx, int64_t vy, int64_t vz, uint8_t newFill) {
         setFillAccounted(vx, vy, vz, newFill, nullptr);
     }
+
+    // Re-inserts a brick into the active set WITHOUT writing any fill — the
+    // savegame-load counterpart to wakeRegion()'s scheduling half (see
+    // WaterState below). Waking is purely a SCHEDULING act, so this cannot
+    // move the conservation ledger, and over-waking is always safe: a brick
+    // that produces no net change on its next tick settles straight back out.
+    // Restoring the active set is what makes a save taken MID-FLOW resume as
+    // mid-flow rather than as a frozen snapshot that waits for the next
+    // unrelated disturbance.
+    void markActive(const BrickKey& k) { activate(k); }
 
     // --- Terrain-edit reactivation (wakeRegion) ---------------------------
     //
@@ -974,6 +988,197 @@ private:
     mutable std::unordered_set<BrickKey, BrickKeyHash> noImplicit_;
     uint64_t debited_ = 0;
     uint64_t credited_ = 0;
+};
+
+// ===========================================================================
+// WaterState — the savegame blob (docs/adr/0005-water-persistence.md)
+// ===========================================================================
+//
+// WHY THIS IS NOT JUST A LIST OF MOBILIZED BRICK KEYS. The backlog item this
+// implements read "`mobilizedBricks` savegame serializer", which sounds like
+// an afternoon: write the keys out, read them back, call markMobilized for
+// each. BUILT LITERALLY THAT DESTROYS EVERY UNDERGROUND LAKE IN THE WORLD ON
+// THE FIRST RELOAD, and the reason is worth stating at the top of the file
+// that could still be "fixed" back into that shape.
+//
+// Per the ownership partition above, mobilization is a ONE-WAY SURRENDER of
+// the only remaining record of where the water was. Once a brick is in
+// `mobilized_`, implicitFillAt() returns 0 for its cells AND makeSolidFn()
+// stops reporting them solid. Restore the mobilized set WITHOUT the CA fill
+// and every one of those cells reports zero units from BOTH accountants and
+// reads as open air: the lake is not drained, it is gone, and the flooded
+// cave it filled is now a dry room. markMobilized's own doc comment states
+// the precondition — "the units are already present in the loaded/replicated
+// CA fill" — and before this class NOTHING on the persistence path satisfied
+// it, because there was no CA fill serializer in voxel-core at all
+// (setReplicatedFill is an inbound network API with no on-disk counterpart).
+//
+// So the blob carries BOTH halves, and load applies them FILLS FIRST. The
+// final state is order-independent, but filling first means the world is
+// never even momentarily in the both-report-zero state above — which matters
+// the day load is made incremental, or is interrupted.
+//
+// WHY WATER IS PERSISTED AT ALL (ADR-0005, accepted). Terrain is re-derivable
+// from seed + edit log in O(1) per column; CA water is not re-derivable in
+// bounded time (only by replaying every tick since world creation), and
+// persisting nothing is not neutral — it actively reverts every drained
+// cavern to FULL, because the implicit field is a pure function of the seed
+// and draining a lake leaves the cave as air, not rock. CA fill is
+// irreducible simulation state, not a cache.
+//
+// ---------------------------------------------------------------------------
+// WHERE THE BLOB LIVES: A SIBLING, NOT A SECTION OF THE EDIT LOG
+// ---------------------------------------------------------------------------
+// This is a standalone byte blob with its OWN magic and its own versioning,
+// serialized to/from a caller-owned buffer exactly like EditLog — voxel-core
+// opens no files itself, so "sibling file" is the caller's half of the
+// contract, not ours. It is deliberately NOT a section inside the edit log:
+//
+//   * Water state must be DISCARDABLE WITHOUT DISCARDING TERRAIN EDITS. Delete
+//     this blob and the world still loads: every dig the player ever made
+//     survives, and underground water simply reverts to its implicit (full)
+//     state. That is a degraded-but-coherent world. If water lived inside the
+//     log, discarding it would mean rewriting the one append-only structure
+//     doctrine §2.1/§2.4 makes THE authority path for world changes.
+//   * The two invalidate on DIFFERENT axes. The log turns over on
+//     EditLog::kFormatVersion and on providerId (which tile set the diffs were
+//     recorded against); water turns over on kWaterCAVersion (which tick rules
+//     produced the fill). A tick-rule change must not strand terrain edits, and
+//     a log format change must not silently keep water that predates it.
+//   * The log is APPEND-ONLY and grows with player history; this blob is a
+//     full-state snapshot rewritten wholesale each save. Different lifetimes,
+//     different files.
+//
+// VERSIONING. kMagic + kFormatVersion (this container's byte layout) +
+// kWaterCAVersion (the tick rules that produced the fill). The CA version must
+// match EXACTLY: fill produced by different tick rules is not the same
+// simulation state, and per docs/determinism.md that is precisely what the
+// constant exists to signal. Same separation ADR-0004 used to keep kSweVersion
+// from ever invalidating a water golden. Both parse defensively — a truncated
+// or garbage blob fails cleanly and NEVER half-loads (see parse/applyTo).
+//
+// ---------------------------------------------------------------------------
+// WHAT IS AND IS NOT IN THE BLOB
+// ---------------------------------------------------------------------------
+// IN: (a) per-brick CA fill for every stored (non-empty) brick, (b) the CA
+// active set, (c) the mobilized brick keys. Plus the total volume, stored
+// redundantly as an INTEGRITY CHECK: load re-derives the ledger from the fills
+// it actually decoded and refuses the blob if the two disagree, so a save/load
+// cycle cannot quietly lose (or invent) water — the exact failure ADR-0005 was
+// written to catch, made loud rather than commented.
+//
+// OUT, and deliberately — every one of these is DERIVED STATE whose absence
+// changes no answer, only the cost of re-asking:
+//   * WaterMobilizer::noImplicit_ — a pure NEGATIVE memo of "this brick holds
+//     no implicit water". It is already dropped wholesale on overflow, which
+//     is the proof it carries no information; persisting it would be a bug
+//     (a stale entry would suppress a legitimate mobilization forever).
+//   * WaterCA::solidCache_ — same property exactly, a memo of the caller's
+//     terrain query, and worse: it is only valid under an invalidation
+//     contract the LOADING caller has not yet entered into. Never persisted.
+//   * WaterMobilizer::pending_ — the front queue. advanceFront() rebuilds it
+//     from the CA's active set on its next call, which is exactly why the
+//     active set (b) IS persisted; and a queued brick is still a wall, so
+//     nothing can leak while it is re-derived.
+//   * WaterMobilizer::recentlyMobilized_ — a re-mesh queue. markMobilized
+//     repopulates it on load, which is what the engine wants anyway: every
+//     restored brick needs meshing as CA water on the first frame.
+//   * debited_/credited_ — a session audit of the handover. They are equal at
+//     save time (shortfallVolume()==0 is the invariant) and equal at 0 after
+//     load; carrying them across would make the audit measure two sessions.
+//   * totalVolume_ and every count — re-derived from the fills, and (b) above,
+//     cross-checked rather than trusted.
+//
+// ---------------------------------------------------------------------------
+// ENCODING
+// ---------------------------------------------------------------------------
+// Little-endian throughout (bytes.h), integer only.
+//
+//   u32 magic, u32 kFormatVersion, u32 kWaterCAVersion
+//   u64 totalVolume                       (integrity cross-check, see above)
+//   u64 brickCount, then per brick: i32 x, i32 y, i32 z, u8 mode, payload
+//   u64 activeCount,    then i32 x,y,z per key
+//   u64 mobilizedCount, then i32 x,y,z per key
+//
+// DETERMINISM OF THE BYTES. The active and mobilized sets are already
+// std::set<BrickKey, BrickKeyLess>, so they serialize in sorted order with no
+// extra work and the format is deterministic for free. The FILL map is the one
+// exception and it is worth being precise rather than repeating the ADR's
+// summary: WaterMap is an unordered_map, so its keys get one explicit sort
+// here — exactly as WaterCA::digest already does, and for the same reason.
+// Parse REQUIRES all three key lists to be strictly increasing in BrickKeyLess
+// order, so a re-serialized load is byte-identical and a shuffled blob is
+// rejected rather than silently accepted.
+//
+// PAYLOAD MODES, reusing EditLog's kSparse/kRle idea rather than inventing a
+// third scheme (a mobilized brick is 512 bytes of uint8 fill, and settled
+// water is overwhelmingly 0 or 255, so both of the log's intuitions transfer):
+//   kDense (0): 512 raw fill bytes.
+//   kSparse(1): u16 count, then (u16 cell, u8 fill) per NON-ZERO cell — wins
+//               on a barely-wet brick (a splash, a drip trail).
+//   kRle   (2): u16 runCount, then (u8 fill, u16 len) covering exactly 512
+//               cells in cellIndex order — wins on the settled interior of a
+//               lake (a full brick is ONE run: 3 bytes for 512 cells).
+// Every brick is encoded in all three and the SMALLEST wins (ties break to the
+// lower mode id, so the choice is deterministic). The mode is per brick, not
+// per file, because a real save holds both kinds at once.
+//
+// MEASURED, NOT ASSUMED — see waterca_state_sparse_and_rle_encoding_beat_dense,
+// which prints the numbers for four real scenarios and asserts the conclusions:
+//   * kRle carries almost everything: 11-21% of dense-only across a drained
+//     cavern lake, a mid-drain cavern, and a 16x16 settled pool.
+//   * kSparse wins on exactly one shape, and it is NOT the one first guessed.
+//     Water in motion is still SHEETS (kRle wins mid-drain by more than on the
+//     settled lake); what defeats kRle is cellIndex being x-fastest, so a
+//     one-cell-wide column lands as isolated bytes 64 apart and costs kRle two
+//     runs per wet cell. A drain shaft encodes to 8 bytes sparse vs 17 rle.
+//     That shape is a player cutting a drain to empty a cavern — ADR-0005's
+//     opening story — so the mode stays.
+//   * kDense won ZERO of the four and is kept only as the FLOOR: it is what
+//     makes "never larger than the raw brick" true by construction for the
+//     turbulent partial-fill brick (>170 non-zero cells AND >170 runs) that
+//     none of these scenarios happened to produce. It costs one byte of mode
+//     tag to keep and would cost an unbounded worst case to drop.
+class WaterState {
+public:
+    static constexpr uint32_t kMagic = 0x41575856; // "VXWA" little-endian
+    static constexpr uint32_t kFormatVersion = 1;
+
+    enum PayloadMode : uint8_t { kDense = 0, kSparse = 1, kRle = 2 };
+
+    using BrickFill = std::array<uint8_t, static_cast<size_t>(WaterBrick8::kCells)>;
+
+    // --- decoded contents (public so callers/tests can inspect a blob
+    // without applying it; parse() is total and applyTo() is the only
+    // mutating step) ---
+    uint64_t totalVolume = 0;
+    std::vector<std::pair<BrickKey, BrickFill>> bricks; // BrickKeyLess-sorted
+    std::vector<BrickKey> active;                       // BrickKeyLess-sorted
+    std::vector<BrickKey> mobilized;                    // BrickKeyLess-sorted
+
+    // Snapshots `ca` + `mob` into `out` (appends; does not clear).
+    static void serialize(const WaterCA& ca, const WaterMobilizer& mob, std::vector<uint8_t>& out);
+
+    // Fully decodes AND validates a blob without touching any live state.
+    // std::nullopt on: bad magic, format/CA version mismatch, truncation,
+    // trailing bytes, an out-of-range or non-ascending key, a payload that
+    // does not cover exactly 512 cells, an all-zero brick (never stored — see
+    // homogeneous-empty collapse), or a totalVolume that disagrees with the
+    // fills. Nothing is allocated in proportion to an untrusted count before
+    // the bytes backing it have been read, so a garbage length header fails
+    // fast rather than exhausting memory.
+    static std::optional<WaterState> parse(const uint8_t* data, size_t size);
+
+    // Applies decoded state, FILLS FIRST, then the active set, then
+    // markMobilized (see the top of this comment for why that order is the
+    // one written down). Requires a FRESH ca/mob pair — a non-empty target
+    // would leave stale cells the blob never mentions, which is a silent merge
+    // rather than a load — and returns false without touching anything if it
+    // is handed one.
+    bool applyTo(WaterCA& ca, WaterMobilizer& mob) const;
+
+    // parse + applyTo. False (with ca/mob untouched) if either step refuses.
+    static bool load(const uint8_t* data, size_t size, WaterCA& ca, WaterMobilizer& mob);
 };
 
 } // namespace vxc
