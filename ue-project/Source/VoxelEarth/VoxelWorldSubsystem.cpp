@@ -2491,12 +2491,21 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 				{
 					continue; // this ring has nothing waiting; an empty queue is just convergence
 				}
-				const int32 LevelCap =
-					VoxelStreamAdmission::GetRingQuotaEnabled()
-						? FMath::Max(1,
-						             FMath::RoundToInt(double(AdmissionCap) * VoxelStreamAdmission::kRingCapShare[Level]))
-						: AdmissionCap;
-				if (PendingJobKeysByLevel[Level].Num() * 4 < LevelCap)
+				// EMPTY, not "under a quarter of its share". The quarter
+				// threshold is what the summed form used, and carrying it over
+				// per level was measured as a ~3 ms p95 regression on the M1
+				// surface flight: R0's queue there sits at 146-314 against a
+				// share whose quarter is ~180, so the trigger was satisfied on
+				// most frames and R0 re-ran its full entry scan (1.6-2.4 ms)
+				// almost every tick, for nothing -- on a moving anchor the
+				// movement trigger was already going to rescan it.
+				//
+				// An EMPTY queue is a different statement, and it is exactly
+				// the pathology this fix exists for: workers with nothing left
+				// to do for this ring while candidates sit rejected. It cannot
+				// fire on a flight that is keeping the ring fed, and it fires
+				// immediately when a stationary underground anchor starves it.
+				if (PendingJobKeysByLevel[Level].IsEmpty())
 				{
 					bLevelWantsRefill[Level] = true;
 					bAdmissionRefill = true;
