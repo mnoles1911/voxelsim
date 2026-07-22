@@ -1139,6 +1139,97 @@ int32 GetPendingJobCap()
 	}();
 	return Cap;
 }
+
+// Ring quota switch (docs/status.md "R2-R4 ring starvation fix").
+//
+// Both of the bounded-admission gates above, and the dispatch order they were
+// built on top of, rank purely by 3D distance from the anchor. Ring MEMBERSHIP,
+// however, is an XY annulus per mip level (RingPresets), and the rings differ in
+// candidate count by orders of magnitude. Two independent consequences, both
+// measured on this build (see the status.md section):
+//
+//  * With the cap OFF, dispatch is globally nearest-first, and R0 alone -- whose
+//    footprint is a deep COLUMN reaching 38.4 m below the anchor since
+//    underground streaming landed -- out-produces the entire worker pool
+//    forever. R3/R4 sat at 5,560 + 5,185 chunks queued and 0 dispatched across a
+//    whole 60 s run.
+//  * With the cap ON (the default), the single global admission cutoff settles
+//    around 246 m, and R3's annulus starts at 256 m. The outer rings are not
+//    starved at dispatch any more -- they are never admitted at all, so they do
+//    not even appear in the queue. R3/R4 pending = 0.
+//
+// The fix gives every ring its own queue, its own share of the admission cap and
+// its own guaranteed floor of worker slots. `-VoxelRingQuota=0` restores the
+// single-global-ordering behaviour (one shared cap, one global cutoff, strictly
+// nearest-first dispatch across all levels) for A/B measurement, on the same
+// binary, for the same reason -VoxelPendingJobCap is a switch and not a cvar.
+bool GetRingQuotaEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelRingQuota="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+// Guaranteed floor of in-flight worker slots per ring level, out of the
+// 2xLogicalCores total (24 on this box). A FLOOR, not a fixed partition: a level
+// under its floor with work pending is dispatched ahead of nearer work from any
+// other level, but once every level is at or above its floor the remaining slots
+// are filled strictly nearest-first, exactly as before. So when the outer rings
+// are idle (cold start, or fully resident) R0 still gets every worker, and the
+// reservation costs nothing.
+//
+// Sized from the measured per-level worker cost: R0 jobs are ~0.8 ms p50 and R1
+// ~2 ms, so R0/R1 convert slots into chunks fast and need rate, not slots; R2
+// jobs measured 8-44 ms p50 (they build mip bricks), so a handful of slots is
+// already a meaningful share of throughput for them, and the coarse rings are
+// exactly the ones a 50 km vista is made of.
+// MEASURED CAVEAT, and the reason these are small: per-level worker cost is not
+// remotely uniform. On this box R0 jobs are 0.7 ms p50, R1 4.5 ms, R2 18 ms, R3
+// 150-198 ms and R4 **2,850-2,913 ms** -- a level-4 chunk covers 16x the linear
+// extent of a level-0 one, so its mip build is ~4096x the volume, and the cost
+// tracks that almost exactly. A reserved slot is therefore not a small loan for
+// the coarse rings; an R4 slot holds a real worker thread for ~3 seconds. Sizing
+// the floors by "share of the rings" rather than by cost was measured
+// catastrophic: floors {0,2,3,4,4} reserved 13 of 24 slots, and because the task
+// graph has ~12 actual background threads, the long jobs occupied the pool
+// itself -- whole-run throughput collapsed from 49,179 chunks to 558 (819 -> 9.3
+// chunks/s) and R0 residency from ~3,000 to ~10. The floors below cost at most 4
+// of 24 slots and are the largest that did not measurably move the near field.
+constexpr int32 kRingSlotFloorDefault[VoxelCoords::kNumLevels] = {0, 1, 1, 1, 1};
+
+// Overridable for tuning/measurement: `-VoxelRingFloors=0,1,1,1,1`.
+const int32* GetRingSlotFloors()
+{
+	static int32 Floors[VoxelCoords::kNumLevels];
+	static const bool bInit = []
+	{
+		FMemory::Memcpy(Floors, kRingSlotFloorDefault, sizeof(Floors));
+		FString Spec;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelRingFloors="), Spec))
+		{
+			TArray<FString> Parts;
+			Spec.ParseIntoArray(Parts, TEXT(","), true);
+			for (int32 I = 0; I < Parts.Num() && I < VoxelCoords::kNumLevels; ++I)
+			{
+				Floors[I] = FMath::Max(0, FCString::Atoi(*Parts[I]));
+			}
+		}
+		return true;
+	}();
+	(void)bInit;
+	return Floors;
+}
+
+// Share of the pending-job cap reserved for each ring level. Sums to 1.0. R0
+// keeps the largest single share (it has by far the highest churn -- it both
+// produces and drains the most), but every ring is guaranteed a share it cannot
+// be crowded out of, which is the whole point: with one shared cap R0+R1 filled
+// it inside 246 m and R3/R4 never got a record.
+constexpr double kRingCapShare[VoxelCoords::kNumLevels] = {0.30, 0.20, 0.20, 0.15, 0.15};
 } // namespace VoxelStreamAdmission
 
 // FVoxelWorldImpl -- the voxel-core side of the subsystem, defined only here
@@ -1242,18 +1333,64 @@ struct FVoxelWorldImpl
 	// within level, lower level (finer) wins priority at equal distance").
 	// Sorted so Pop() (O(1), removes from the back) always yields the
 	// highest-priority pending chunk -- see SortPendingQueues.
-	TArray<VoxelCoords::FVoxelLevelChunkKey> PendingJobKeys;        // worker-dispatch pending (any level, minus edited-ancestor chunks)
-	TArray<VoxelCoords::FVoxelLevelChunkKey> PendingGameThreadKeys; // overlay-aware game-thread mesh pending -- ANY level as of
-	                                                                 // M2 wave 2 (see MarkChunkDirtyForRemesh/PropagateEditToMips)
-	// SortPendingQueues' decorate-sort-undecorate scratch (see its body): kept
-	// as members purely to reuse the allocation across the ~8 calls/second.
+	// SortPendingQueues' decorate-sort-undecorate entry (see its body). The
+	// worker queues STORE these rather than bare keys: the cached distance is
+	// what lets DispatchJobs compare the heads of five separate per-level queues
+	// (and TruncatePendingJobQueue read a cutoff distance) without recomputing a
+	// chunk centre per comparison.
 	struct FSortEntry
 	{
 		double DistSq;
 		VoxelCoords::FVoxelLevelChunkKey Key;
 	};
-	TArray<FSortEntry> SortScratchJob;
+
+	// Worker-dispatch pending, ONE QUEUE PER RING LEVEL (R2-R4 starvation fix --
+	// see VoxelStreamAdmission::GetRingQuotaEnabled). Each is sorted
+	// lowest-priority-first so Pop() (O(1), from the back) yields that ring's
+	// nearest pending chunk. Splitting by level is what makes a per-ring
+	// admission share and a per-ring worker floor expressible at all; with one
+	// flat queue every bound that could be written was necessarily global, and a
+	// global bound on a radial quantity always cuts the outer rings first.
+	TArray<FSortEntry> PendingJobKeysByLevel[VoxelCoords::kNumLevels];
+	TArray<VoxelCoords::FVoxelLevelChunkKey> PendingGameThreadKeys; // overlay-aware game-thread mesh pending -- ANY level as of
+	                                                                 // M2 wave 2 (see MarkChunkDirtyForRemesh/PropagateEditToMips)
+	// Kept as a member purely to reuse the allocation across the ~8 calls/second.
 	TArray<FSortEntry> SortScratchGameThread;
+
+	// Total depth across every level's worker queue -- the quantity the old flat
+	// PendingJobKeys.Num() reported, kept for the logs, the perf snapshot and the
+	// drain-triggered refill test.
+	int32 PendingJobNum() const
+	{
+		int32 Total = 0;
+		for (const TArray<FSortEntry>& Q : PendingJobKeysByLevel)
+		{
+			Total += Q.Num();
+		}
+		return Total;
+	}
+
+	// TruncatePendingJobQueue's -VoxelRingQuota=0 path only: the union of every
+	// level's queue, re-sorted globally so the pre-fix single-cap behaviour can
+	// be reproduced exactly on the same binary. Never touched with the quota on.
+	TArray<FSortEntry> TruncateMergeScratch;
+
+	// Widest per-ring admission cutoff, in metres, for the periodic log -- -1 if
+	// no ring is capping. The WIDEST is the informative one: it is the outer
+	// rings' cutoff, and the whole bug was that a single global cutoff sat at
+	// ~246 m while R3's annulus starts at 256 m.
+	double WidestAdmissionCutoffM() const
+	{
+		double Widest = -1.0;
+		for (const double Cutoff : LevelAdmissionCutoffDistSq)
+		{
+			if (Cutoff < DBL_MAX)
+			{
+				Widest = FMath::Max(Widest, FMath::Sqrt(Cutoff) / 100.0);
+			}
+		}
+		return Widest;
+	}
 
 	// RecomputeDesiredSet's per-call eviction set (see its batched queue-filter
 	// pass); a member only to reuse the allocation.
@@ -1373,7 +1510,21 @@ struct FVoxelWorldImpl
 	//
 	// Determinism is untouched -- this changes only WHICH chunks are queued,
 	// never what a chunk contains.
-	double AdmissionCutoffDistSq = DBL_MAX; // farthest queued chunk's distSq when the queue is at cap; DBL_MAX = not full
+	// Per RING LEVEL, not global (see VoxelStreamAdmission::GetRingQuotaEnabled).
+	// A single global cutoff is a radius, and a radius applied to a set of
+	// concentric annuli excludes the outermost ones completely: measured, the
+	// global cutoff settled at ~246 m while R3's annulus begins at 256 m, so R3
+	// and R4 never admitted a single chunk. With the quota off, every entry here
+	// holds the same global value and the behaviour is exactly the old one.
+	// DBL_MAX = that level's queue is not full, admit everything in its annulus.
+	double LevelAdmissionCutoffDistSq[VoxelCoords::kNumLevels] = {DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX, DBL_MAX};
+
+	// Worker jobs currently in flight per ring level. JobsInFlightCounter is the
+	// total (and must stay atomic -- workers decrement it); this breakdown is
+	// only ever touched on the game thread, incremented in DispatchJobs and
+	// decremented in DrainResults, and is what DispatchJobs tests the per-ring
+	// slot floor against.
+	int32 LevelJobsInFlight[VoxelCoords::kNumLevels] = {};
 
 	// True while the cap is holding work back (something was rejected or
 	// dropped by the two gates above). This is what makes the cap safe for a
@@ -1641,6 +1792,10 @@ private:
 	void FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax) const;
 	void PruneFootprintZRangeCache(const FVector& Anchor);
 	void SortPendingQueues(const FVector& Anchor);
+	// Drops the farthest entries of an ALREADY-SORTED (farthest-first) queue
+	// until it fits EntryCap, removing their chunk records too, and writes the
+	// re-admission cutoff distance. Returns true if anything was held back.
+	bool DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 EntryCap, double& OutCutoffDistSq);
 	void DispatchJobs();
 	void DrainResults(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material);
 	void DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material);
@@ -1825,7 +1980,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// "anchor hasn't moved" reason.
 	const int32 AdmissionCap = VoxelStreamAdmission::GetPendingJobCap();
 	const bool bAdmissionRefill =
-		bHasRecomputed && bAdmissionDeferredWork && AdmissionCap > 0 && PendingJobKeys.Num() * 4 < AdmissionCap;
+		bHasRecomputed && bAdmissionDeferredWork && AdmissionCap > 0 && PendingJobNum() * 4 < AdmissionCap;
 	if (!bHasRecomputed || AnchorChunk.X != LastAnchorChunk.X || AnchorChunk.Y != LastAnchorChunk.Y ||
 	    bUndergroundChanged || (bAnchorUnderground && AnchorChunk.Z != LastAnchorChunk.Z) || bAdmissionRefill)
 	{
@@ -2049,7 +2204,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       TEXT("Voxel streaming: loaded=%lld unloaded=%lld quads=%lld tracked=%d jobsInFlight=%d pendingJobs=%d ")
 	       TEXT("pendingGameThread=%d pendingUnload=%d underground=%d deepTracked=%d deepWithGeometry=%d residentQuads=%lld"),
 	       (long long)TotalChunksLoaded, (long long)TotalChunksUnloaded, (long long)TotalQuadsLoaded, ChunkRecords.Num(),
-	       JobsInFlightCounter.GetValue(), PendingJobKeys.Num(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num(),
+	       JobsInFlightCounter.GetValue(), PendingJobNum(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num(),
 	       bAnchorUnderground ? 1 : 0, DeepTracked, DeepWithGeometry, (long long)ResidentQuads);
 
 	// M2 item 1: "Per-level loaded/pending counters into the perf snapshot/
@@ -2065,9 +2220,9 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			++LevelLoaded[FMath::Clamp(Pair.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
 		}
 	}
-	for (const VoxelCoords::FVoxelLevelChunkKey& K : PendingJobKeys)
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
-		++LevelPending[FMath::Clamp(K.Level, 0, VoxelCoords::kNumLevels - 1)];
+		LevelPending[Level] += PendingJobKeysByLevel[Level].Num();
 	}
 	for (const VoxelCoords::FVoxelLevelChunkKey& K : PendingGameThreadKeys)
 	{
@@ -2127,7 +2282,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       TEXT("tracked=%d pendingJob=%d pendingGT=%d pendingUnload=%d | framesOver16.6ms=%d (total %lld)"),
 	       MaxRecomputeMs, MaxExitScanMs, MaxSortMs, RecomputeCalls, MaxLevelEntryMs[0], MaxLevelEntryMs[1], MaxLevelEntryMs[2],
 	       MaxLevelEntryMs[3], MaxLevelEntryMs[4], LevelEntryScans[0], LevelEntryScans[1], LevelEntryScans[2], LevelEntryScans[3],
-	       LevelEntryScans[4], ChunkRecords.Num(), PendingJobKeys.Num(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num(),
+	       LevelEntryScans[4], ChunkRecords.Num(), PendingJobNum(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num(),
 	       FramesOver60FpsBarSinceLog, (long long)TotalFramesOver60FpsBar);
 	// Streaming pipeline re-measure (docs/status.md "Streaming pipeline
 	// re-measure + rework"): the two questions the existing logs could not
@@ -2157,7 +2312,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       (long long)CandidatesRejectedSinceLog);
 	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel admission (5s window): cap=%d cutoffM=%.0f rejected=%lld dropped=%lld"),
 	       VoxelStreamAdmission::GetPendingJobCap(),
-	       AdmissionCutoffDistSq < DBL_MAX ? FMath::Sqrt(AdmissionCutoffDistSq) / 100.0 : -1.0,
+	       WidestAdmissionCutoffM(),
 	       (long long)CandidatesRejectedSinceLog, (long long)RecordsDroppedSinceLog);
 	AccumDispatchMs = AccumApplyMs = AccumRemeshMs = AccumUnloadMs = AccumRecomputeMs = AccumTickMs = 0.0;
 	AccumTicks = 0;
@@ -2555,14 +2710,22 @@ void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
 	// bit-identical: same primary key (distance, descending), same tie-break
 	// (higher level first), and Sort() was already unstable, so elements equal
 	// under BOTH keys were never in a defined order to begin with.
-	const auto SortQueue = [&DistSq](TArray<VoxelCoords::FVoxelLevelChunkKey>& Queue, TArray<FSortEntry>& Scratch)
+	//
+	// R2-R4 starvation fix: the ORDER above is unchanged -- what changed is its
+	// SCOPE. Each ring level now has its own queue and is sorted independently,
+	// so this is still nearest-first, but nearest-first WITHIN A RING, which is
+	// the only scope on which a distance ranking is well defined: a ring is an
+	// XY annulus, so comparing an R0 chunk 38 m straight down against an R3
+	// chunk 300 m out ranks two things that were never competing for the same
+	// screen space. The cross-level decision moved out of the comparator and
+	// into DispatchJobs, where it is an explicit slot floor -- see the note in
+	// the ORIGINAL comment above about level-as-primary-key being measured
+	// wrong: a floor is not level-major ordering, it reserves a MINIMUM for the
+	// coarse rings and leaves everything above the floor nearest-first, so it
+	// does not reintroduce the failure that ordering had.
+	const auto SortEntries = [](TArray<FSortEntry>& Entries)
 	{
-		Scratch.Reset(Queue.Num());
-		for (const VoxelCoords::FVoxelLevelChunkKey& Key : Queue)
-		{
-			Scratch.Add(FSortEntry{DistSq(Key), Key});
-		}
-		Scratch.Sort(
+		Entries.Sort(
 		    [](const FSortEntry& A, const FSortEntry& B)
 		    {
 			    if (A.DistSq != B.DistSq)
@@ -2571,15 +2734,31 @@ void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
 			    }
 			    return A.Key.Level > B.Key.Level; // exact-distance tie: higher level number = lower priority
 		    });
-		for (int32 Index = 0; Index < Scratch.Num(); ++Index)
-		{
-			Queue[Index] = Scratch[Index].Key;
-		}
 	};
-	// Member scratch buffers (not locals): this runs ~8 times a second with
-	// ~19k elements, and reusing the allocation keeps it off the heap churn.
-	SortQueue(PendingJobKeys, SortScratchJob);
-	SortQueue(PendingGameThreadKeys, SortScratchGameThread);
+	// The worker queues already STORE their distance (FSortEntry), so a re-sort
+	// only has to refresh the cached keys against the new anchor -- no separate
+	// decorate pass, no scratch buffer, no undecorate write-back.
+	for (TArray<FSortEntry>& Queue : PendingJobKeysByLevel)
+	{
+		for (FSortEntry& Entry : Queue)
+		{
+			Entry.DistSq = DistSq(Entry.Key);
+		}
+		SortEntries(Queue);
+	}
+	// The game-thread queue is still a bare-key array (it is edit-driven, always
+	// near the player, and never deep enough for the storage to matter), so it
+	// keeps the decorate-sort-undecorate form over a member scratch buffer.
+	SortScratchGameThread.Reset(PendingGameThreadKeys.Num());
+	for (const VoxelCoords::FVoxelLevelChunkKey& Key : PendingGameThreadKeys)
+	{
+		SortScratchGameThread.Add(FSortEntry{DistSq(Key), Key});
+	}
+	SortEntries(SortScratchGameThread);
+	for (int32 Index = 0; Index < SortScratchGameThread.Num(); ++Index)
+	{
+		PendingGameThreadKeys[Index] = SortScratchGameThread[Index].Key;
+	}
 }
 
 bool FVoxelWorldImpl::EvaluateAnchorUnderground(const FVector& Anchor) const
@@ -2624,9 +2803,12 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// move.
 	{
 		const int32 Cap = VoxelStreamAdmission::GetPendingJobCap();
-		if (Cap <= 0 || PendingJobKeys.Num() * 4 < Cap * 3)
+		if (Cap <= 0 || PendingJobNum() * 4 < Cap * 3)
 		{
-			AdmissionCutoffDistSq = DBL_MAX;
+			for (double& Cutoff : LevelAdmissionCutoffDistSq)
+			{
+				Cutoff = DBL_MAX;
+			}
 		}
 	}
 
@@ -2695,8 +2877,11 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// DrainUnloads' "raced with a re-add/remesh" branch).
 	if (EvictedThisCall.Num() > 0)
 	{
-		PendingJobKeys.RemoveAllSwap([this](const FVoxelLevelChunkKey& K) { return EvictedThisCall.Contains(K); },
-		                             EAllowShrinking::No);
+		for (TArray<FSortEntry>& Queue : PendingJobKeysByLevel)
+		{
+			Queue.RemoveAllSwap([this](const FSortEntry& E) { return EvictedThisCall.Contains(E.Key); },
+			                    EAllowShrinking::No);
+		}
 		PendingGameThreadKeys.RemoveAllSwap([this](const FVoxelLevelChunkKey& K) { return EvictedThisCall.Contains(K); },
 		                                    EAllowShrinking::No);
 	}
@@ -2789,6 +2974,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					// is not what the cap exists to bound.
 					const bool bOverlayAware = NeedsOverlayAwarePath(LevelKey);
 					const int32 Cap = VoxelStreamAdmission::GetPendingJobCap();
+					const int32 QueueLevel = FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1);
 					if (!bOverlayAware && Cap > 0 && AdmissionsThisLevel >= Cap / 4)
 					{
 						// Per-level admission budget (see AdmissionsThisLevel).
@@ -2797,18 +2983,18 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 						bAdmissionDeferredWork = true;
 						return;
 					}
-					if (!bOverlayAware && AdmissionCutoffDistSq < DBL_MAX)
+					// The cutoff is now this RING's own (see
+					// LevelAdmissionCutoffDistSq): a single global radius always
+					// excluded the outer annuli entirely.
+					const double CenterZ = (double(LevelKey.Key.Z) + 0.5) * ChunkEdge;
+					const double DistSq3D = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) +
+					                        FMath::Square(CenterZ - Anchor.Z);
+					if (!bOverlayAware && DistSq3D >= LevelAdmissionCutoffDistSq[QueueLevel])
 					{
-						const double CenterZ = (double(LevelKey.Key.Z) + 0.5) * ChunkEdge;
-						const double DistSq3D = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) +
-						                        FMath::Square(CenterZ - Anchor.Z);
-						if (DistSq3D >= AdmissionCutoffDistSq)
-						{
-							++CandidatesRejectedSinceLog;
-							++CandidatesRejectedThisCall;
-							bAdmissionDeferredWork = true;
-							return;
-						}
+						++CandidatesRejectedSinceLog;
+						++CandidatesRejectedThisCall;
+						bAdmissionDeferredWork = true;
+						return;
 					}
 
 					VoxelStreaming::FChunkRecord& NewRecord = ChunkRecords.Add(LevelKey);
@@ -2821,7 +3007,9 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					}
 					else
 					{
-						PendingJobKeys.Add(LevelKey);
+						// Distance cached at admission; SortPendingQueues refreshes
+						// it against the anchor at the bottom of this same call.
+						PendingJobKeysByLevel[QueueLevel].Add(FSortEntry{DistSq3D, LevelKey});
 					}
 				};
 
@@ -2864,7 +3052,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	SortPendingQueues(Anchor);
 	// Bounded admission gate (b) -- must run immediately after the sort, which
 	// is what puts the farthest (lowest-priority) entries at the front and
-	// leaves SortScratchJob's distances aligned with the queue. Timed inside
+	// leaves each level queue's cached distances aligned with the anchor. Timed inside
 	// sortMs: it is part of the same "get the queue into shape" stage, and
 	// keeping it there means the existing sortMs metric still accounts for
 	// 100% of the queue-maintenance cost.
@@ -2878,39 +3066,26 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	++RecomputeCalls;
 }
 
-void FVoxelWorldImpl::TruncatePendingJobQueue()
+bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 EntryCap, double& OutCutoffDistSq)
 {
-	// Bounded admission gate (b) -- see AdmissionCutoffDistSq's doc comment.
-	// Called only from RecomputeDesiredSet, immediately after SortPendingQueues:
-	// PendingJobKeys is sorted lowest-priority-first (farthest at index 0), and
-	// SortScratchJob[i].DistSq is the distance of PendingJobKeys[i].
-	const int32 Cap = VoxelStreamAdmission::GetPendingJobCap();
-	if (Cap <= 0 || PendingJobKeys.Num() <= Cap)
+	// Bounded admission gate (b) -- see LevelAdmissionCutoffDistSq's doc
+	// comment. `Entries` must be sorted lowest-priority-first (farthest at
+	// index 0), which is what SortPendingQueues leaves behind.
+	const int32 OldNum = Entries.Num();
+	if (EntryCap <= 0 || OldNum <= EntryCap)
 	{
-		AdmissionCutoffDistSq = DBL_MAX; // not full: admit everything in range
-		// Nothing was held back by THIS call. Only clear the deferral flag if
-		// every level actually re-enumerated on this call (a movement-triggered
-		// call scans only the levels whose own chunk the anchor crossed, so a
-		// level gated out of it may still have candidates waiting -- clearing
-		// then would lose the refill trigger for them). A refill call always
-		// satisfies this, since it clears the per-level gate first.
-		if (LevelsScannedThisCall == VoxelCoords::kNumLevels && CandidatesRejectedThisCall == 0)
-		{
-			bAdmissionDeferredWork = false;
-		}
-		return;
+		OutCutoffDistSq = DBL_MAX; // not full: admit everything in range
+		return false;
 	}
-	bAdmissionDeferredWork = true;
 
-	const int32 OldNum = PendingJobKeys.Num();
-	int32 ToDrop = OldNum - Cap;
+	int32 ToDrop = OldNum - EntryCap;
 	int32 Write = 0;
 	for (int32 Read = 0; Read < OldNum; ++Read)
 	{
-		const VoxelCoords::FVoxelLevelChunkKey Key = PendingJobKeys[Read];
+		const FSortEntry Entry = Entries[Read];
 		if (ToDrop > 0)
 		{
-			VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Key);
+			VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Entry.Key);
 			if (!Rec)
 			{
 				--ToDrop; // already untracked: a queue entry with no record is dead weight anyway
@@ -2921,22 +3096,23 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 			// dropping a record that DOES own either would leak a component or
 			// strand an in-flight result. Anything already queued for unload is
 			// left to DrainUnloads (it owns that record's removal).
-			if (!Rec->Component.IsValid() && !Rec->bJobInFlight && !PendingUnloadSet.Contains(Key))
+			if (!Rec->Component.IsValid() && !Rec->bJobInFlight && !PendingUnloadSet.Contains(Entry.Key))
 			{
-				ChunkRecords.Remove(Key);
+				ChunkRecords.Remove(Entry.Key);
 				++RecordsDroppedSinceLog;
 				--ToDrop;
 				continue;
 			}
 		}
-		PendingJobKeys[Write++] = Key;
+		Entries[Write++] = Entry;
 	}
-	PendingJobKeys.SetNum(Write, EAllowShrinking::No);
+	Entries.SetNum(Write, EAllowShrinking::No);
 
 	// The cutoff is the distance of a surviving entry a headroom band IN FROM
-	// the farthest survivor. Entries are dropped from the front (farthest) in
-	// order, so survivors occupy [OldNum - Write, OldNum) of the still-sorted
-	// scratch, with distance decreasing as the index rises.
+	// the farthest survivor. Drops only ever happen while ToDrop > 0, i.e. from
+	// the front (farthest) of a sorted array, so the survivors are exactly the
+	// original tail in the original order -- original index OldNum - Write + H
+	// is survivor index H, and the array is still sorted.
 	//
 	// Why not simply "distance of the farthest survivor": candidates cluster
 	// just inside it, so every call would admit a few thousand chunks barely
@@ -2944,12 +3120,106 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 	// -- a thrash costing one TMap insert + one erase per chunk per call
 	// (measured at ~46k/second before this band existed). The band admits only
 	// chunks that are clearly nearer, sized so a call's admissions are on the
-	// order of what a call's dispatches drain (~160 at the measured rate),
-	// which is the whole point of the exercise: make production track drain.
-	const int32 Headroom = FMath::Max(1, Cap / 8);
-	const int32 CutoffIndex = FMath::Min(OldNum - Write + Headroom, OldNum - 1);
-	AdmissionCutoffDistSq =
-		(Write > 0 && SortScratchJob.Num() == OldNum && CutoffIndex >= 0) ? SortScratchJob[CutoffIndex].DistSq : DBL_MAX;
+	// order of what a call's dispatches drain, which is the whole point of the
+	// exercise: make production track drain.
+	const int32 Headroom = FMath::Max(1, EntryCap / 8);
+	const int32 CutoffIndex = FMath::Min(Headroom, Write - 1);
+	OutCutoffDistSq = (Write > 0) ? Entries[CutoffIndex].DistSq : DBL_MAX;
+	return true;
+}
+
+void FVoxelWorldImpl::TruncatePendingJobQueue()
+{
+	// Called only from RecomputeDesiredSet, immediately after SortPendingQueues,
+	// so every level's queue is sorted farthest-first with its distances current.
+	const int32 Cap = VoxelStreamAdmission::GetPendingJobCap();
+	bool bHeldBack = false;
+
+	if (Cap <= 0)
+	{
+		for (double& Cutoff : LevelAdmissionCutoffDistSq)
+		{
+			Cutoff = DBL_MAX;
+		}
+	}
+	else if (VoxelStreamAdmission::GetRingQuotaEnabled())
+	{
+		// Per-ring share of the cap. This is the half of the fix that matters
+		// with the cap ON: a single shared cap is spent by whichever ring
+		// enumerates the most candidates nearest the anchor, which is always R0
+		// and R1, and the resulting global cutoff radius (~246 m measured) then
+		// sits INSIDE R3's inner radius (256 m), so R3 and R4 never admitted a
+		// single chunk. A share each cannot be crowded out.
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			const int32 LevelCap =
+				FMath::Max(1, FMath::RoundToInt(double(Cap) * VoxelStreamAdmission::kRingCapShare[Level]));
+			bHeldBack |= DropFarthestOverCap(PendingJobKeysByLevel[Level], LevelCap, LevelAdmissionCutoffDistSq[Level]);
+		}
+	}
+	else
+	{
+		// -VoxelRingQuota=0: the pre-fix behaviour, reproduced exactly -- one
+		// shared cap over the union of every level's queue, dropped in global
+		// distance order, one cutoff radius for all rings. Kept so the A/B runs
+		// on ONE binary (see GetRingQuotaEnabled's comment).
+		TruncateMergeScratch.Reset();
+		for (const TArray<FSortEntry>& Queue : PendingJobKeysByLevel)
+		{
+			TruncateMergeScratch.Append(Queue);
+		}
+		if (TruncateMergeScratch.Num() > Cap)
+		{
+			TruncateMergeScratch.Sort(
+			    [](const FSortEntry& A, const FSortEntry& B)
+			    {
+				    if (A.DistSq != B.DistSq)
+				    {
+					    return A.DistSq > B.DistSq;
+				    }
+				    return A.Key.Level > B.Key.Level;
+			    });
+			double GlobalCutoff = DBL_MAX;
+			bHeldBack = DropFarthestOverCap(TruncateMergeScratch, Cap, GlobalCutoff);
+			for (TArray<FSortEntry>& Queue : PendingJobKeysByLevel)
+			{
+				Queue.Reset();
+			}
+			// The merged array is still globally sorted, so appending in order
+			// leaves each per-level queue sorted too.
+			for (const FSortEntry& Entry : TruncateMergeScratch)
+			{
+				PendingJobKeysByLevel[FMath::Clamp(Entry.Key.Level, 0, VoxelCoords::kNumLevels - 1)].Add(Entry);
+			}
+			for (double& Cutoff : LevelAdmissionCutoffDistSq)
+			{
+				Cutoff = GlobalCutoff;
+			}
+		}
+		else
+		{
+			for (double& Cutoff : LevelAdmissionCutoffDistSq)
+			{
+				Cutoff = DBL_MAX;
+			}
+		}
+	}
+
+	if (bHeldBack)
+	{
+		bAdmissionDeferredWork = true;
+		return;
+	}
+	// Nothing was held back by THIS call. Only clear the deferral flag if every
+	// level actually re-enumerated on this call (a movement-triggered call scans
+	// only the levels whose own chunk the anchor crossed, so a level gated out of
+	// it may still have candidates waiting -- clearing then would lose the refill
+	// trigger for them). A refill call always satisfies this, since it clears the
+	// per-level gate first.
+	if (LevelsScannedThisCall == VoxelCoords::kNumLevels && CandidatesRejectedThisCall == 0)
+	{
+		bAdmissionDeferredWork = false;
+	}
 }
 
 // --- budgeted drains ----------------------------------------------------
@@ -2959,10 +3229,71 @@ void FVoxelWorldImpl::DispatchJobs()
 	// docs/m1-plan.md Stage 2 decisions table: "<=2xLogicalCores jobs in
 	// flight."
 	const int32 MaxJobsInFlight = 2 * FPlatformMisc::NumberOfCoresIncludingHyperthreads();
+	const bool bRingQuota = VoxelStreamAdmission::GetRingQuotaEnabled();
 
-	while (JobsInFlightCounter.GetValue() < MaxJobsInFlight && PendingJobKeys.Num() > 0)
+	while (JobsInFlightCounter.GetValue() < MaxJobsInFlight)
 	{
-		const VoxelCoords::FVoxelLevelChunkKey LevelKey = PendingJobKeys.Pop(EAllowShrinking::No); // highest priority (see SortPendingQueues)
+		// Which ring gets this worker slot.
+		//
+		// Pass 1 (quota only): any ring that has work pending AND is below its
+		// guaranteed slot floor takes the slot ahead of nearer work from any
+		// other ring, most-starved ring first. This is a FLOOR, not a
+		// partition, and it is the half of the fix that matters with the cap
+		// OFF: strict nearest-first meant R0 -- whose footprint is a 38.4 m deep
+		// column since underground streaming landed, so its chunks are nearer in
+		// 3D than any R1+ surface chunk -- monopolised every worker forever,
+		// leaving R3/R4 at 0 dispatched with 10.7k queued across a 60 s run.
+		//
+		// Pass 2: every ring at or above its floor, so fill strictly
+		// nearest-first across the queue heads. Because each queue is sorted and
+		// stores its distance, comparing the five heads is exactly the ordering
+		// the old single flat queue produced -- including the "lower level wins
+		// at equal distance" tie-break, which falls out of scanning levels in
+		// ascending order with a strict <.
+		int32 PickLevel = INDEX_NONE;
+		if (bRingQuota)
+		{
+			const int32* const Floors = VoxelStreamAdmission::GetRingSlotFloors();
+			int32 BestDeficit = 0;
+			for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+			{
+				if (PendingJobKeysByLevel[Level].Num() == 0)
+				{
+					continue;
+				}
+				const int32 Deficit = Floors[Level] - LevelJobsInFlight[Level];
+				if (Deficit > BestDeficit)
+				{
+					BestDeficit = Deficit;
+					PickLevel = Level;
+				}
+			}
+		}
+		if (PickLevel == INDEX_NONE)
+		{
+			double BestDistSq = 0.0;
+			for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+			{
+				const TArray<FSortEntry>& Queue = PendingJobKeysByLevel[Level];
+				if (Queue.Num() == 0)
+				{
+					continue;
+				}
+				const double HeadDistSq = Queue.Last().DistSq; // nearest in this ring
+				if (PickLevel == INDEX_NONE || HeadDistSq < BestDistSq)
+				{
+					BestDistSq = HeadDistSq;
+					PickLevel = Level;
+				}
+			}
+		}
+		if (PickLevel == INDEX_NONE)
+		{
+			break; // nothing pending in any ring
+		}
+
+		const VoxelCoords::FVoxelLevelChunkKey LevelKey =
+			PendingJobKeysByLevel[PickLevel].Pop(EAllowShrinking::No).Key; // highest priority in that ring (see SortPendingQueues)
 
 		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(LevelKey);
 		if (!Rec)
@@ -2982,12 +3313,10 @@ void FVoxelWorldImpl::DispatchJobs()
 
 		Rec->bJobInFlight = true;
 		JobsInFlightCounter.Increment();
+		++LevelJobsInFlight[PickLevel];
 		++JobsDispatchedSinceLog;
-		{
-			const int32 L = FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1);
-			++LevelJobsDispatchedSinceLog[L];
-			++LevelJobsDispatchedTotal[L];
-		}
+		++LevelJobsDispatchedSinceLog[PickLevel];
+		++LevelJobsDispatchedTotal[PickLevel];
 
 		const uint64 GenId = Rec->GenerationId;
 		// Worker threading (decisions table): the job touches ONLY
@@ -3287,6 +3616,15 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			LevelWorkerJobMsWindowCount[Lvl] = FMath::Min(LevelWorkerJobMsWindowCount[Lvl] + 1, WorkerJobMsWindowSize);
 		}
 
+		// Per-ring in-flight bookkeeping (see LevelJobsInFlight): every job
+		// DispatchJobs launches produces exactly one result, live or stale, so
+		// this is the matching decrement and must happen BEFORE the stale
+		// `continue` below or a ring would leak slots against its floor.
+		{
+			const int32 Lvl = FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1);
+			LevelJobsInFlight[Lvl] = FMath::Max(0, LevelJobsInFlight[Lvl] - 1);
+		}
+
 		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Result.Key);
 		// Stale-result discard: the chunk left the desired set entirely (no
 		// record any more), or an edit re-mesh superseded this job while it
@@ -3538,7 +3876,10 @@ void FVoxelWorldImpl::MarkChunkDirtyForRemesh(const VoxelCoords::FVoxelLevelChun
 	}
 	++Rec->GenerationId; // invalidates any in-flight/queued worker result for this chunk
 	Rec->bJobInFlight = false;
-	PendingJobKeys.RemoveSingle(LevelKey); // a dirtied chunk is never worker-dispatched
+	// A dirtied chunk is never worker-dispatched; it moves to the game-thread
+	// (overlay-aware) queue below.
+	PendingJobKeysByLevel[FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1)].RemoveAll(
+	    [&LevelKey](const FSortEntry& E) { return E.Key == LevelKey; });
 	PendingGameThreadKeys.AddUnique(LevelKey);
 }
 
@@ -4156,7 +4497,7 @@ void FVoxelWorldImpl::UpdatePerfSnapshot(float DeltaTime, float TickMs)
 
 	LastPerfSnapshot.JobsInFlight = JobsInFlightCounter.GetValue();
 	LastPerfSnapshot.JobsInFlightCap = MaxJobsInFlight;
-	LastPerfSnapshot.PendingJobQueueDepth = PendingJobKeys.Num();
+	LastPerfSnapshot.PendingJobQueueDepth = PendingJobNum();
 	LastPerfSnapshot.PendingGameThreadQueueDepth = PendingGameThreadKeys.Num();
 	LastPerfSnapshot.PendingUnloadQueueDepth = PendingUnloadKeys.Num();
 	LastPerfSnapshot.StaleResultsDiscarded = StaleResultsDiscarded;
@@ -4227,9 +4568,9 @@ void FVoxelWorldImpl::UpdatePerfSnapshot(float DeltaTime, float TickMs)
 			++LevelLoaded[FMath::Clamp(Pair.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
 		}
 	}
-	for (const VoxelCoords::FVoxelLevelChunkKey& K : PendingJobKeys)
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
-		++LevelPending[FMath::Clamp(K.Level, 0, VoxelCoords::kNumLevels - 1)];
+		LevelPending[Level] += PendingJobKeysByLevel[Level].Num();
 	}
 	for (const VoxelCoords::FVoxelLevelChunkKey& K : PendingGameThreadKeys)
 	{
