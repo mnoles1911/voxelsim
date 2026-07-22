@@ -64,6 +64,30 @@ private:
 	FTimerHandle GICaveShotTimerHandle;
 	FTimerHandle GICaveQuitTimerHandle;
 
+	// --- C7/C8 underground water verification (docs/cavern-design.md SS5) ----
+	// -VoxelFloodTest[=<delaySeconds>]: finds a real flooded cavern near spawn,
+	// poses the camera on its shore and captures the STATIC IMPLICIT lake
+	// (VoxelFloodLake), then carves an outflow tunnel out through the flood
+	// reach and captures the same view again once the lake has DRAINED into it
+	// (VoxelFloodDrain). Two shots, one run, same camera -- the pair is the
+	// deliverable. Logs the mobilization ledger at every stage; shortfall must
+	// be 0 (waterca.h).
+	FTimerHandle FloodTestFindTimerHandle;
+	FTimerHandle FloodTestPose1TimerHandle;
+	FTimerHandle FloodTestShot1TimerHandle;
+	FTimerHandle FloodTestCarveTimerHandle;
+	FTimerHandle FloodTestPose2TimerHandle;
+	FTimerHandle FloodTestShot2TimerHandle;
+	FTimerHandle FloodTestQuitTimerHandle;
+	bool bFloodTestFound = false;
+	// The outflow carve re-arms itself on this delegate until it removes
+	// something (chunk residency makes a single attempt unreliable).
+	FTimerDelegate FloodTestCarveRetryDelegate;
+	int32 FloodTestCarveAttempts = 0;
+	FVector FloodTestLakeSurfaceUU = FVector::ZeroVector;
+	FVector FloodTestCameraUU = FVector::ZeroVector;
+	FRotator FloodTestCameraRot = FRotator::ZeroRotator;
+
 	FTimerHandle ServerDumpDigestTimerHandle;
 	FTimerHandle ServerDigestQuitTimerHandle;
 

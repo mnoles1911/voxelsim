@@ -575,7 +575,7 @@ constexpr int32 kImplicitRadiusBricks = 32;
 constexpr int32 kImplicitRadiusBricksZ = 16;
 // Same budget discipline as kMaxBrickMeshesPerTick: the candidate box is large
 // and a first refresh must never land as one frame's worth of work.
-constexpr int32 kMaxImplicitMeshesPerTick = 16;
+constexpr int32 kMaxImplicitMeshesPerTick = 192;
 
 // Rebuilds the implicit-water candidate list when the camera crosses into a new
 // brick, then meshes a budgeted slice of it every tick.
@@ -636,9 +636,26 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 				}
 			}
 		}
+
+		// Farthest first, because the drain below Pop()s from the BACK: the
+		// water actually in front of the camera has to mesh in the first few
+		// ticks, not after the whole 25 m disc has been walked.
+		UE_LOG(LogVoxelWater, Log,
+		       TEXT("RefreshImplicitWater: rebuilt at brick (%d,%d,%d) [cam (%.0f,%.0f,%.0f) UU] -- %d candidate brick(s)"),
+		       Center.X, Center.Y, Center.Z, CameraUU.X, CameraUU.Y, CameraUU.Z, Impl.PendingImplicitBricks.Num());
+		Impl.PendingImplicitBricks.Sort(
+			[Center](const VoxelCoords::FVoxelCoord& A, const VoxelCoords::FVoxelCoord& B)
+			{
+				const int64 Da = int64(A.X - Center.X) * (A.X - Center.X) + int64(A.Y - Center.Y) * (A.Y - Center.Y) +
+				                 int64(A.Z - Center.Z) * (A.Z - Center.Z);
+				const int64 Db = int64(B.X - Center.X) * (B.X - Center.X) + int64(B.Y - Center.Y) * (B.Y - Center.Y) +
+				                 int64(B.Z - Center.Z) * (B.Z - Center.Z);
+				return Da > Db;
+			});
 	}
 
 	int32 MeshesThisTick = 0;
+	int32 Built = 0;
 	while (Impl.PendingImplicitBricks.Num() > 0 && MeshesThisTick < kMaxImplicitMeshesPerTick)
 	{
 		const VoxelCoords::FVoxelCoord BrickCoord = Impl.PendingImplicitBricks.Pop(EAllowShrinking::No);
@@ -704,7 +721,15 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 			Impl.ImplicitChunkComponents.Add(BrickCoord, Comp);
 		}
 		Comp->SetChunkQuads(MoveTemp(Quads));
+		++Built;
 	}
+
+	if (MeshesThisTick > 0 && Impl.PendingImplicitBricks.Num() == 0)
+	{
+		UE_LOG(LogVoxelWater, Verbose, TEXT("RefreshImplicitWater: candidate list drained; %d implicit water component(s) live."),
+		       Impl.ImplicitChunkComponents.Num());
+	}
+	(void)Built;
 }
 
 // One fixed 10Hz step: Reservoir v0 top-up, then vxc::WaterCA::step(),
@@ -1135,6 +1160,241 @@ uint8 UVoxelWaterSubsystem::GetMaxStoredFill() const
 				for (int x = 0; x < vxc::WaterBrick8::kEdge; ++x) Max = FMath::Max(Max, B.get(x, y, z));
 	}
 	return Max;
+}
+
+// --- C7/C8 underground water ------------------------------------------------
+
+bool UVoxelWaterSubsystem::GetCavernFloodZUU(double WorldXUU, double WorldYUU, double& OutFloodZUU) const
+{
+	if (!Impl)
+	{
+		return false;
+	}
+	const int64 Vx = int64(FMath::FloorToDouble(WorldXUU / VoxelCoords::VoxelSizeUU));
+	const int64 Vy = int64(FMath::FloorToDouble(WorldYUU / VoxelCoords::VoxelSizeUU));
+	const int32 FloodZMm = Impl->Amp.columnCached(Vx, Vy).cavern.floodZMm;
+	if (FloodZMm == INT32_MIN)
+	{
+		return false;
+	}
+	OutFloodZUU = double(FloodZMm) / 10.0; // mm -> UU (1 UU = 10 mm)
+	return true;
+}
+
+bool UVoxelWaterSubsystem::FindFloodedCavernNear(const FVector& OriginUU, double SearchRadiusUU,
+                                                  FVector& OutWaterSurfaceUU) const
+{
+	if (!Impl)
+	{
+		return false;
+	}
+	// 30 m grid: under a cavern site's ~36 m reach radius, so a site inside the
+	// search radius cannot be stepped over.
+	constexpr double StepUU = 3000.0;
+	const int32 Steps = FMath::Max(1, int32(SearchRadiusUU / StepUU));
+
+	// Contiguous open voxels spanning the waterline at this column: how much
+	// lake there is below and how much headroom above. This, not a two-point
+	// probe, is what tells the middle of a chamber from its tapering edge.
+	constexpr int32 kProbeVoxels = 60; // +/- 6 m
+	constexpr int32 kMinAirSpanVoxels = 40; // 4 m of open water + headroom
+	// Scored as 2*min(headroom, depth) rather than the plain sum: a column with
+	// 6 m of water and no roof clearance scores the same as one with 6 m of
+	// roof and no water under the plain sum, and only the BALANCED one gives a
+	// camera both a lake to look at and somewhere to stand.
+	const auto AirSpanAround = [this](int64 Vx, int64 Vy, int64 Vz) -> int32
+	{
+		int32 Above = 0, Below = 0;
+		for (int32 D = 0; D < kProbeVoxels; ++D)
+		{
+			if (Impl->Terrain.IsSolidAtVoxel(Vx, Vy, Vz + D)) break;
+			++Above;
+		}
+		for (int32 D = 1; D < kProbeVoxels; ++D)
+		{
+			if (Impl->Terrain.IsSolidAtVoxel(Vx, Vy, Vz - D)) break;
+			++Below;
+		}
+		return 2 * FMath::Min(Above, Below);
+	};
+
+	// Expanding rings, so the NEAREST flooded cavern wins rather than whichever
+	// one a raster scan happens to reach first.
+	for (int32 Ring = 0; Ring <= Steps; ++Ring)
+	{
+		for (int32 Iy = -Ring; Iy <= Ring; ++Iy)
+		{
+			for (int32 Ix = -Ring; Ix <= Ring; ++Ix)
+			{
+				if (Ring > 0 && FMath::Abs(Ix) != Ring && FMath::Abs(Iy) != Ring)
+				{
+					continue; // interior of the ring: already tested on an earlier ring
+				}
+				const double Wx = OriginUU.X + double(Ix) * StepUU;
+				const double Wy = OriginUU.Y + double(Iy) * StepUU;
+				const int64 Vx = int64(FMath::FloorToDouble(Wx / VoxelCoords::VoxelSizeUU));
+				const int64 Vy = int64(FMath::FloorToDouble(Wy / VoxelCoords::VoxelSizeUU));
+
+				// BY VALUE, not by reference. Amplifier::columnCached returns a
+				// reference into a per-thread memo that the NEXT columnCached
+				// call overwrites, and the refinement loop below makes hundreds
+				// of them -- reading Col afterwards is a dangling read (it was
+				// silently reporting the wrong cavern seg count before this).
+				const vxc::ColumnSample Col = Impl->Amp.columnCached(Vx, Vy);
+				if (Col.cavern.floodZMm == INT32_MIN || Col.cavern.count == 0)
+				{
+					continue; // dry, or no room actually reaches this column
+				}
+
+				// A column can carry a site's flood level while its own rooms are
+				// truncated away by the roof/bedrock clamps, so require the
+				// column to be genuinely open here: water below the flood level
+				// and real headroom above it.
+				const int64 FloodVz = int64(Col.cavern.floodZMm) / vxc::kVoxelSizeMm;
+				if (AirSpanAround(Vx, Vy, FloodVz) < kMinAirSpanVoxels)
+				{
+					continue;
+				}
+
+				// REFINE. The search grid is 30 m and a room is 24-56 m across,
+				// so the first hit is usually somewhere on the reach disc's edge,
+				// where the roof closes down and a camera placed "just above the
+				// water" ends up inside rock -- which renders as a see-through
+				// world, because the surrounding geometry is all backfaces.
+				// Walk a local grid and take the column with the most open air
+				// around the waterline, i.e. the middle of the chamber.
+				double BestWx = Wx, BestWy = Wy;
+				int32 BestSpan = AirSpanAround(Vx, Vy, FloodVz);
+				constexpr double RefineStepUU = 200.0; // 2 m
+				constexpr int32 RefineSteps = 12;      // +/- 24 m
+				for (int32 Ry = -RefineSteps; Ry <= RefineSteps; ++Ry)
+				{
+					for (int32 Rx = -RefineSteps; Rx <= RefineSteps; ++Rx)
+					{
+						const double Cx = Wx + double(Rx) * RefineStepUU;
+						const double Cy = Wy + double(Ry) * RefineStepUU;
+						const int64 Cvx = int64(FMath::FloorToDouble(Cx / VoxelCoords::VoxelSizeUU));
+						const int64 Cvy = int64(FMath::FloorToDouble(Cy / VoxelCoords::VoxelSizeUU));
+						// Must belong to the SAME lake, not a neighbouring site.
+						if (Impl->Amp.columnCached(Cvx, Cvy).cavern.floodZMm != Col.cavern.floodZMm)
+						{
+							continue;
+						}
+						const int32 Span = AirSpanAround(Cvx, Cvy, FloodVz);
+						if (Span > BestSpan)
+						{
+							BestSpan = Span;
+							BestWx = Cx;
+							BestWy = Cy;
+						}
+					}
+				}
+
+				OutWaterSurfaceUU = FVector(BestWx, BestWy, double(Col.cavern.floodZMm) / 10.0);
+				UE_LOG(LogVoxelWater, Log,
+				       TEXT("FindFloodedCavernNear: flooded cavern at (%.0f, %.0f) UU, water surface z=%.0f UU (floodZ %d mm), %d seg(s), open air span %d voxels (%.1f m) around the waterline"),
+				       BestWx, BestWy, OutWaterSurfaceUU.Z, Col.cavern.floodZMm, Col.cavern.count, BestSpan,
+				       double(BestSpan) * VoxelCoords::VoxelSizeUU / 100.0);
+				return true;
+			}
+		}
+	}
+	UE_LOG(LogVoxelWater, Warning, TEXT("FindFloodedCavernNear: no flooded cavern within %.0f UU of (%.0f, %.0f)."),
+	       SearchRadiusUU, OriginUU.X, OriginUU.Y);
+	return false;
+}
+
+int32 UVoxelWaterSubsystem::CarveCavernOutflow(const FVector& LakeSurfaceUU)
+{
+	if (!Impl)
+	{
+		return 0;
+	}
+
+	// Walk +X until the flood field runs out -- that is the edge of this site's
+	// reach disc, and the first place water can actually go.
+	constexpr double ProbeStepUU = 200.0;  // 2 m
+	constexpr double MaxProbeUU = 8000.0;  // 80 m, comfortably past a site's reach
+	double ExitX = LakeSurfaceUU.X;
+	bool bFoundExit = false;
+	for (double D = ProbeStepUU; D <= MaxProbeUU; D += ProbeStepUU)
+	{
+		double Unused = 0.0;
+		if (!GetCavernFloodZUU(LakeSurfaceUU.X + D, LakeSurfaceUU.Y, Unused))
+		{
+			ExitX = LakeSurfaceUU.X + D;
+			bFoundExit = true;
+			break;
+		}
+	}
+	if (!bFoundExit)
+	{
+		UE_LOG(LogVoxelWater, Warning, TEXT("CarveCavernOutflow: no dry column within %.0f UU -- lake has nowhere to drain."), MaxProbeUU);
+		return 0;
+	}
+
+	// A tunnel just under the water surface, so it takes the top of the lake
+	// and the level visibly drops, then a shaft down past the dry edge so the
+	// water keeps running away instead of backing up.
+	constexpr double TunnelRadiusUU = 250.0; // 2.5 m
+	constexpr double StepUU = 150.0;         // 1.5 m, well under the radius: no gaps
+	const double TunnelZ = LakeSurfaceUU.Z - 100.0; // 1 m below the surface
+
+	int32 Removed = 0;
+	int32 Spheres = 0, ProductiveSpheres = 0;
+	for (double X = LakeSurfaceUU.X; X <= ExitX + 400.0; X += StepUU)
+	{
+		// Three stacked passes rather than one: a single-radius tunnel at a
+		// fixed z can thread a chamber that is open at that exact height for
+		// its whole length and remove NOTHING, which is a silent no-drain.
+		// Spanning 5 m vertically guarantees it meets the chamber's rock.
+		for (double DZ = -200.0; DZ <= 200.0; DZ += 200.0)
+		{
+			const int32 R = Impl->Terrain.CarveSphere(FVector(X, LakeSurfaceUU.Y, TunnelZ + DZ), TunnelRadiusUU, 0.0);
+			++Spheres;
+			if (R > 0) ++ProductiveSpheres;
+			Removed += R;
+		}
+	}
+	// Drop shaft at the dry end.
+	for (double Z = TunnelZ; Z >= TunnelZ - 1500.0; Z -= StepUU)
+	{
+		Removed += Impl->Terrain.CarveSphere(FVector(ExitX + 400.0, LakeSurfaceUU.Y, Z), TunnelRadiusUU, 0.0);
+	}
+
+	int32 MobBricks = 0;
+	uint64 Deb = 0, Cred = 0, Short = 0;
+	GetMobilizationStats(MobBricks, Deb, Cred, Short);
+	UE_LOG(LogVoxelWater, Log,
+	       TEXT("CarveCavernOutflow: removed %d voxels via %d/%d productive sphere(s), exit at x=%.0f UU. Mobilized %d brick(s), ledger %llu debited / %llu credited, shortfall %llu."),
+	       Removed, ProductiveSpheres, Spheres, ExitX, MobBricks, (unsigned long long)Deb, (unsigned long long)Cred,
+	       (unsigned long long)Short);
+	if (Removed == 0)
+	{
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("CarveCavernOutflow: carved nothing -- every target cell was already air, so no edit fired and nothing mobilized."));
+	}
+	return Removed;
+}
+
+uint8 UVoxelWaterSubsystem::GetImplicitFillAtWorld(const FVector& WorldUU) const
+{
+	if (!Impl)
+	{
+		return 0;
+	}
+	return Impl->Mob.implicitFillAt(int64(FMath::FloorToDouble(WorldUU.X / VoxelCoords::VoxelSizeUU)),
+	                                 int64(FMath::FloorToDouble(WorldUU.Y / VoxelCoords::VoxelSizeUU)),
+	                                 int64(FMath::FloorToDouble(WorldUU.Z / VoxelCoords::VoxelSizeUU)));
+}
+
+void UVoxelWaterSubsystem::GetMobilizationStats(int32& OutMobilizedBricks, uint64& OutDebited, uint64& OutCredited,
+                                                 uint64& OutShortfall) const
+{
+	OutMobilizedBricks = Impl ? int32(Impl->Mob.mobilizedBricks().size()) : 0;
+	OutDebited = Impl ? Impl->Mob.debitedVolume() : 0;
+	OutCredited = Impl ? Impl->Mob.creditedVolume() : 0;
+	OutShortfall = Impl ? Impl->Mob.shortfallVolume() : 0;
 }
 
 bool UVoxelWaterSubsystem::ApplyReplicatedWaterDiffs(const TArray<uint8>& Bytes)
