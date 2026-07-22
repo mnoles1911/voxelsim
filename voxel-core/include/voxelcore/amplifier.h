@@ -42,6 +42,20 @@ struct ColumnSample {
     CavernColumn cavern;
 };
 
+// --- surface upper bound (the sky-band trim's proof obligation) -------------
+//
+// Amplifier::surfaceUpperBoundMm returns this when it declines to bound. It is
+// deliberately INT64_MAX rather than a bool-out-param so a caller that forgets
+// to check still gets the SAFE answer ("the terrain might reach arbitrarily
+// high here"), never a false all-air verdict.
+inline constexpr int64_t kSurfaceBoundDeclined = INT64_MAX;
+
+// Tile-pixel corners the bound will read per axis before declining. A level-4
+// chunk (51.2 m) needs 4 corners against a 30 m pixel and 6 against the 11.25 m
+// scale-8 pixel; 16 leaves generous headroom while keeping the read count and
+// the on-stack corner grid bounded (16x16 int64 = 2 KB).
+inline constexpr int64_t kSurfaceBoundMaxCornersPerAxis = 16;
+
 class Amplifier {
 public:
     Amplifier(uint64_t seed, ITileSampler& tiles)
@@ -51,6 +65,41 @@ public:
 
     // Full stratigraphy for the column through voxel (vx, vy).
     ColumnSample column(int64_t vx, int64_t vy) const;
+
+    // The terrain surface elevation at (vx, vy) on its own — bit-identical to
+    // column(vx, vy).surfaceMm (it is literally the same evalSurface call), but
+    // without the climate read, stratigraphy, biome classification, cave pass
+    // and cavern pass that column() also does. For callers that want only the
+    // height: the surface-bound tests, and anything bounding or probing terrain
+    // height without needing materials.
+    int32_t surfaceMm(int64_t vx, int64_t vy) const;
+
+    // A PROVABLE UPPER BOUND on surfaceMm(vx, vy) over every column in the
+    // inclusive voxel-index rectangle [vx0, vx1] x [vy0, vy1] — i.e.
+    //
+    //     surfaceUpperBoundMm(...) >= surfaceMm(vx, vy)   for all such columns
+    //
+    // and returns kSurfaceBoundDeclined if it will not bound this footprint.
+    //
+    // WHY IT IS THE ONLY QUERY A SKY-BAND TRIM NEEDS. materialAt is
+    // unconditionally MAT_AIR above surfaceMm (stratigraphyAt's `depthMm < 0`
+    // test), and the cave and cavern passes only ever CARVE — no pass in the
+    // amplifier can turn air into solid. So a chunk whose lowest voxel centre
+    // sits above this bound is provably all air, and skipping it can never hide
+    // geometry.
+    //
+    // This is a BOUND, not the maximum: it is sound but conservative, and the
+    // conservatism is deliberate. It lives here, next to kDetailOctaves and
+    // slopeScaleQ10 in amplifier.cpp, precisely so that a worldgen tweak and the
+    // bound that depends on it cannot drift apart across a module boundary —
+    // which is exactly what happened while this logic lived UE-side. See
+    // amplifier.cpp for the derivation and the static_asserts that pin the
+    // couplings the derivation relies on.
+    //
+    // Cost: at most one 16x16 block of ITileSampler::elevationMm reads (served
+    // from the same per-thread tile memo column() uses) and no hashing at all —
+    // it never evaluates a single detail octave. Cheaper than ONE column.
+    int64_t surfaceUpperBoundMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t vy1) const;
 
     // Material of voxel (vx, vy, vz) given its precomputed column. A voxel is
     // solid iff its centre (vz*100+50 mm) is at or below the surface, MINUS
