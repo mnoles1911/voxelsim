@@ -2930,13 +2930,87 @@ static constexpr int32 SkirtChunksNear = 12;
 static constexpr int32 SkirtChunksMid = 5;
 static constexpr int32 SkirtChunksFar = 0;
 
-// (2) Underground deep box: vertical RADIUS in level-L chunks around the
-// anchor's chunk Z, per band. Radius 0 still means one chunk layer (the
-// anchor's own). Level 0 near-band 8 => +-25.6m, which overlaps the 19.2m
-// skirt above it, so a shaft up to ~45m deep stays vertically CONTIGUOUS
-// (skirt bottom meets box top) with no unmeshed gap in its walls.
-static constexpr int32 BoxRadiusChunksL0[3] = {8, 4, 0}; // near / mid / far
-static constexpr int32 BoxRadiusChunksL1 = 0;            // whole ring (fraction is always >= 0.5 there)
+// (2) Underground deep residency: vertical RADIUS in level-L chunks around
+// the anchor's chunk Z. Radius 0 still means one chunk layer (the anchor's
+// own).
+//
+// SHAPE: A SIGHT SPHERE, NOT A BANDED BOX.
+//
+// The shipped shape was a three-band step function of horizontal distance,
+// {8, 4, 0} level-0 chunks over the <0.25 / <0.5 / >=0.5 fractions of ring
+// 0's 64 m outer radius -- i.e. +-25.6 m of rock within 16 m of you, +-12.8 m
+// out to 32 m, and a single 3.2 m layer beyond that. Two problems, both
+// visible the moment you stand in a natural cavern:
+//
+//   - A cavern is BIGGER THAN THE WHOLE RESIDENT VOLUME. voxelcore/caverns.h
+//     gives rooms a horizontal semi-axis of kCavernRxyMinMm..MaxMm =
+//     12..28 m (24-56 m across) and deep children a vertical semi-axis up to
+//     kCavernRzDeepMaxMm = 40 m, chained downward. Standing in one, the far
+//     wall is 24-56 m away -- squarely in the old FAR band, where the deep
+//     residency was one 3.2 m layer. So the generator built the cavern and
+//     the streamer refused to show it: PR #74's veil correctly rendered the
+//     missing rock as darkness rather than sky, which is honest but is not a
+//     cavern vista.
+//   - The step function spends its depth exactly where it is least useful.
+//     Underground, "how far can I see" is a RADIUS, not a column height:
+//     +-25.6 m of rock directly overhead is 25 m of solid ceiling nobody can
+//     see through, while the 40 m sightline to the far wall gets nothing.
+//
+// So the deep set is now the set of chunks whose centre lies within
+// SightRadius of the anchor -- a sphere. The vertical radius at horizontal
+// distance d is sqrt(R^2 - d^2), which is naturally ANISOTROPIC in the
+// direction that matters: it trades the useless deep column overhead for
+// lateral reach, and it tapers to zero exactly at the horizon rather than
+// stepping there. It is also a strict SUPERSET of the old three-band box at
+// the default radius (see the table below), so nothing that used to be
+// resident stops being resident.
+//
+//   horizontal d | old box radius | sphere radius (R = 40 m)
+//   ------------ | -------------- | ------------------------
+//   0 m          | 8  (+-25.6 m)  | 12 (+-38.4 m)
+//   16 m         | 8  (+-25.6 m)  | 11 (+-35.2 m)
+//   32 m         | 4  (+-12.8 m)  | 7  (+-22.4 m)
+//   40 m         | 0  (one layer) | 0  (one layer)
+//   40-64 m      | 0  (one layer) | 0  (one layer)
+//
+// COST, and why this is affordable. The naive count says the sphere is ~1.9x
+// the old box (~8.2k vs ~4.4k level-0 chunks). The reason that is not ~1.9x
+// the WORK is the buried-chunk pre-dispatch skip already in this file: a
+// level-0 chunk whose footprint band says the chunk and its apron sit below
+// SolidBelowVoxel is all-solid, meshes to zero quads by construction, and is
+// never dispatched at all. Underground, that is the overwhelming majority of
+// the sphere -- solid rock -- and it is precisely the cave and cavern voids,
+// the thing we are trying to render, that the band declines to skip. The
+// steady-state census bears this out: ~5,000 of the ~6,600 skips per 5 s
+// window are the all-SOLID half. So the sphere buys sightline where there is
+// something to see and costs a band lookup where there is not.
+//
+// This whole path is gated on bAnchorUnderground, so the M1 surface flight --
+// which never goes below ground (underground=0, deepTracked=0 in every perf
+// run) -- is byte-for-byte unaffected. The cost is paid only while the player
+// is actually underground, which is exactly when the pixels are wanted.
+//
+// R is a cvar so the residency/cost trade can be A/B'd without a rebuild. It
+// is safe to drive from -ExecCmds, unlike the master switch above: the deep
+// set does not exist until the anchor first goes underground, which on any
+// scripted flight is long after cvars have been applied.
+static float GSightRadiusM = 40.0f;
+static FAutoConsoleVariableRef CVarUndergroundSightRadius(
+	TEXT("voxel.Stream.UndergroundSightM"),
+	GSightRadiusM,
+	TEXT("Radius in metres of the underground sight sphere: while the anchor is underground, level-0 chunks whose centre is within this distance are resident. 40 (default) covers the far wall of a mid-size cavern from its centre."),
+	ECVF_Default);
+
+static double SightRadiusUU()
+{
+	// Clamped rather than trusted: this multiplies a level-0 chunk count, and
+	// a fat-fingered 400 would admit ~8 million chunks. 64 m is ring 0's own
+	// outer radius -- beyond it the sphere would want chunks this level does
+	// not stream at all.
+	return double(FMath::Clamp(GSightRadiusM, 0.0f, 64.0f)) * 100.0;
+}
+
+static constexpr int32 BoxRadiusChunksL1 = 0; // whole ring (fraction is always >= 0.5 there)
 
 // Vertical keep-distance for the deep box, in level-L chunks, used by the
 // exit scan. Mirrors the XY hysteresis: keep out to KeepChunks * chunkEdge *
@@ -2945,6 +3019,26 @@ static constexpr int32 BoxRadiusChunksL1 = 0;            // whole ring (fraction
 // thrash chunks in and out; surfacing still evicts the whole box, because the
 // anchor's Z leaves the keep window entirely.
 static constexpr int32 KeepChunks[VoxelCoords::kNumLevels] = {9, 2, 0, 0, 0};
+
+// Vertical keep-distance in UU for a deep chunk of this level, used by the
+// exit scan. Level 0 derives it from the sight sphere rather than from the
+// constant above, and that is load-bearing rather than tidy: the keep window
+// MUST exceed the largest vertical offset admission can create, or the exit
+// scan queues a chunk for unload in the same recompute that admitted it and
+// the pair thrash forever. The shipped constant (9 -> 40.0 m of keep) was
+// generous against the old radius-8 box (25.6 m) but lands exactly ON the
+// default sphere's 12-chunk pole (40.0 m), and would be far under it at a
+// raised voxel.Stream.UndergroundSightM. Deriving it from the same radius the
+// admission side uses makes the invariant structural: keep = 1.25 * R + one
+// chunk of slack is always strictly greater than the R the sphere admits.
+static double VerticalKeepUU(int32 Level, double ChunkEdgeUU)
+{
+	if (Level == 0)
+	{
+		return SightRadiusUU() * UVoxelWorldSubsystem::UnloadRingMultiplier + ChunkEdgeUU;
+	}
+	return double(KeepChunks[Level] + 1) * ChunkEdgeUU * UVoxelWorldSubsystem::UnloadRingMultiplier;
+}
 
 // The anchor counts as underground once it is this far below the amplifier
 // surface, and stops counting as underground only once it comes back above the
@@ -2993,7 +3087,16 @@ static bool BoxRadiusChunks(int32 Level, double DistSq, int32& OutRadius)
 	}
 	if (Level == 0)
 	{
-		OutRadius = BoxRadiusChunksL0[BandForDistance(0, DistSq)];
+		// Sight sphere (see GSightRadiusM): vertical half-extent in level-0
+		// chunks at horizontal distance sqrt(DistSq). Outside the sphere the
+		// radius is 0, which still means the anchor's own chunk layer -- the
+		// same single layer the old far band granted, so the far field is
+		// unchanged rather than trimmed.
+		const double RadiusUU = SightRadiusUU();
+		const double RemainingSq = RadiusUU * RadiusUU - DistSq;
+		OutRadius = RemainingSq <= 0.0
+		                ? 0
+		                : FMath::FloorToInt32(FMath::Sqrt(RemainingSq) / VoxelCoords::ChunkEdgeUUForLevel(0));
 		return true;
 	}
 	if (Level == 1)
@@ -3561,8 +3664,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		bool bBeyondVertical = false;
 		if (Pair.Value.bDeepAnchorRelative)
 		{
-			const int32 KeepChunks = VoxelUnderground::KeepChunks[LevelKey.Level];
-			const double KeepUU = double(KeepChunks + 1) * ChunkEdge * UVoxelWorldSubsystem::UnloadRingMultiplier;
+			const double KeepUU = VoxelUnderground::VerticalKeepUU(LevelKey.Level, ChunkEdge);
 			const double CenterZ = (double(LevelKey.Key.Z) + 0.5) * ChunkEdge;
 			bBeyondVertical = FMath::Abs(CenterZ - Anchor.Z) > KeepUU;
 		}
