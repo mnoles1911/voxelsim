@@ -407,6 +407,32 @@ public:
 			IndexBuffer.Indices.Add(2);
 		}
 
+		// -VoxelWindingCheck: see the matching block in
+		// VoxelWaterChunkComponent.cpp. Terrain is the REFERENCE here -- its
+		// winding was verified on screen when the inversion was fixed -- so
+		// this line exists to be compared against water's.
+		{
+			static const bool bWindingCheck = FParse::Param(FCommandLine::Get(), TEXT("VoxelWindingCheck"));
+			if (bWindingCheck && IndexBuffer.Indices.Num() >= 3)
+			{
+				double DotSum = 0.0;
+				int32 TriCount = 0;
+				for (int32 I = 0; I + 2 < IndexBuffer.Indices.Num(); I += 3)
+				{
+					const FVector3f& P0 = Vertices[IndexBuffer.Indices[I + 0]].Position;
+					const FVector3f& P1 = Vertices[IndexBuffer.Indices[I + 1]].Position;
+					const FVector3f& P2 = Vertices[IndexBuffer.Indices[I + 2]].Position;
+					const FVector3f Geo = FVector3f::CrossProduct(P1 - P0, P2 - P0).GetSafeNormal();
+					const FVector3f N = Vertices[IndexBuffer.Indices[I]].TangentZ.ToFVector3f();
+					DotSum += double(FVector3f::DotProduct(Geo, N));
+					++TriCount;
+				}
+				UE_LOG(LogTemp, Log,
+				       TEXT("VoxelWindingCheck TERRAIN: tris=%d meanDot(geometricNormal, shadingNormal)=%+.3f"),
+				       TriCount, TriCount > 0 ? DotSum / double(TriCount) : 0.0);
+			}
+		}
+
 		VertexBuffers.InitFromDynamicVertex(&VertexFactory, Vertices);
 
 		// Enqueue initialization of render resources (matches
