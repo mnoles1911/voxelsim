@@ -926,6 +926,49 @@ struct FChunkRecord
 	bool bDeepAnchorRelative = false;
 };
 
+// --- Buried-chunk pre-dispatch skip -----------------------------------------
+//
+// docs/status.md "Buried-chunk pre-dispatch skip". Measured on this build:
+// ~76-79% of level-0 worker output meshes to ZERO quads, and those jobs are
+// 71-75% of level-0 worker wall time (the mesher's uniform-brick early-outs
+// save little, because the dominant cost is upstream of the mesher -- the
+// (32+2)^2 Amplifier::column grid alone is ~42% of a level-0 job). Roughly
+// 70% of the zero-quad level-0 chunks are fully-buried solid and ~30% are
+// entirely above the terrain.
+//
+// A FOOTPRINT BAND is a pair of level-0 voxel z values summarising everything
+// the whole (X,Y) footprint can contain, derived from the SAME 34x34 column
+// grid a level-0 job already builds. Every level-0 chunk in a given (X,Y)
+// shares that grid's XY extent exactly -- the mesher's 1-voxel apron makes a
+// chunk read columns [32X-1, 32X+32], which is precisely the grid -- so one
+// job's band answers the "can this chunk contain geometry" question for every
+// chunk stacked above and below it, for free. That is the whole trick: the
+// band costs one reduction over columns that were paid for anyway, and it is
+// then reused by the ~10-20 other chunks in the same footprint.
+//
+// WHICH WAY IT ERRS. Every bound below is an OUTER bound of the corresponding
+// voxel-core predicate, taken over a SUPERSET of the columns a chunk reads
+// (the apron-inclusive grid), with an extra one-voxel margin on each side. So
+// the band can only ever claim LESS emptiness than really exists: it may fail
+// to skip a chunk that is in fact featureless (pure lost opportunity, the
+// chunk meshes as before and still produces nothing), and it cannot claim
+// "definitely empty" for a chunk that has geometry. False "might have
+// geometry" is free; false "definitely empty" would be a rendering bug.
+struct FFootprintBand
+{
+	// Highest level-0 voxel z that is solid in ANY column of the footprint
+	// (apron included). Strictly above this every column is air, so a chunk
+	// whose interior starts above it has an all-air interior and hits
+	// meshBrick's early-out 1 in every one of its 64 bricks.
+	int32 MaxSurfaceTopVoxel = 0;
+	// Lowest level-0 voxel z at which air can exist in ANY column of the
+	// footprint. Strictly below this every column is solid, so a chunk whose
+	// apron-inclusive top is below it contains no AIR at all -- and
+	// voxelcore/mesher.h emits a face only where a solid voxel has an AIR
+	// neighbour, so it meshes to zero quads whatever materials it holds.
+	int32 SolidBelowVoxel = 0;
+};
+
 struct FJobResult
 {
 	VoxelCoords::FVoxelLevelChunkKey Key;
@@ -950,7 +993,118 @@ struct FJobResult
 	// 3 = zero quads but neither (mixed with no visible face). Only filled in
 	// when the measurement switch is on; otherwise stays 0.
 	uint8 EmptyClass = 0;
+
+	// Buried-chunk pre-dispatch skip: the level-0 footprint band this job
+	// derived as a by-product of the column grid it had to build anyway (see
+	// ComputeFootprintBand). Only level-0 jobs set this.
+	bool bBandValid = false;
+	FFootprintBand Band;
+
+	// -VoxelVerifyBuriedSkip: this chunk's band verdict said "provably no
+	// geometry", but it was dispatched anyway so the verdict can be checked
+	// against the real mesh. Any result with bPredictedEmpty && Quads.Num()>0
+	// is a soundness violation -- geometry the skip would have deleted.
+	bool bPredictedEmpty = false;
 };
+
+// Smallest integer >= sqrt(v), for v >= 0. The carve predicates all test
+// `dz*dz < marginSq`, i.e. |dz| < sqrt(marginSq); rounding the radius UP is
+// what keeps every bound below an outer bound.
+inline int64 CeilSqrtI64(int64 V)
+{
+	if (V <= 0)
+	{
+		return 0;
+	}
+	int64 R = int64(FMath::CeilToDouble(FMath::Sqrt(double(V))));
+	while (R * R < V) { ++R; }   // never under-estimate, whatever the FP rounding did
+	while (R > 0 && (R - 1) * (R - 1) >= V) { --R; }
+	return R;
+}
+
+// Topmost level-0 voxel z whose material is not AIR by stratigraphy alone.
+// Mirrors Amplifier::stratigraphyAt: a voxel's centre is vz*100+50 mm and it
+// is air iff surfaceMm - centre < 0. Caves and caverns only ever REMOVE solid,
+// never add it, so nothing above this can be solid.
+inline int64 ColumnSurfaceTopVoxel(const vxc::ColumnSample& Col)
+{
+	return vxc::floorDiv(int64(Col.surfaceMm) - vxc::kVoxelSizeMm / 2, int64(vxc::kVoxelSizeMm));
+}
+
+// Lowest level-0 voxel z at which this column can hold AIR. A conservative
+// OUTER bound (i.e. possibly lower than the truth, never higher) on the three
+// independent sources of air, mirroring voxelcore/amplifier.cpp's materialAt:
+//
+//  1. Everything strictly above the surface (always present).
+//  2. caveCarveAt (voxelcore/caves.h): air needs `depthMm < segs[s].depthMm +
+//     sqrt(marginSq)` for some segment, or `depthMm <= shaftDepthMaxMm` for a
+//     sinkhole shaft. The shaft term is taken OUTSIDE the bedrock clamp
+//     because caveCarveAt tests the shaft BEFORE its roof and bedrock guards.
+//  3. cavernCarveAt (voxelcore/caverns.h): air needs absolute
+//     `zAbs >= zFloorMm` and `zAbs > zCenterMm - sqrt(marginSq)`.
+//
+// Both carve passes independently refuse `vz < kCaveMinVoxelZ` (sea level:
+// the implicit ocean owns everything below z=0, so a void there is water, not
+// a cave) and refuse a column whose surface is below kCaveMinSurfaceMm -- both
+// are used to tighten the bound, but only against the CARVE terms, never
+// against source 1: terrain whose surface is itself below sea level has air
+// above it and must not be claimed solid.
+inline int64 ColumnDeepestAirVoxel(const vxc::ColumnSample& Col)
+{
+	const int64 SurfaceTop = ColumnSurfaceTopVoxel(Col);
+	int64 CarveMin = INT64_MAX;
+
+	const bool bCarveEligible = Col.surfaceMm >= vxc::kCaveMinSurfaceMm;
+	if (bCarveEligible && (Col.cave.count > 0 || Col.cave.shaftMarginSq > 0))
+	{
+		int64 MaxCaveDepthMm = INT64_MIN;
+		if (Col.cave.shaftMarginSq > 0)
+		{
+			MaxCaveDepthMm = FMath::Max(MaxCaveDepthMm, int64(Col.cave.shaftDepthMaxMm));
+		}
+		int64 SegDepthMm = INT64_MIN;
+		for (int32 S = 0; S < Col.cave.count; ++S)
+		{
+			SegDepthMm = FMath::Max(SegDepthMm, int64(Col.cave.segs[S].depthMm) + CeilSqrtI64(int64(Col.cave.segs[S].marginSq)));
+		}
+		if (SegDepthMm > INT64_MIN)
+		{
+			// caveCarveAt refuses once depthMm + kCaveBedrockMarginMm >= bedrockDepthMm.
+			SegDepthMm = FMath::Min(SegDepthMm, int64(Col.bedrockDepthMm) - vxc::kCaveBedrockMarginMm);
+			MaxCaveDepthMm = FMath::Max(MaxCaveDepthMm, SegDepthMm);
+		}
+		if (MaxCaveDepthMm > INT64_MIN)
+		{
+			// depthMm < MaxCaveDepthMm  <=>  vz*100+50 > surfaceMm - MaxCaveDepthMm.
+			CarveMin = FMath::Min(CarveMin, vxc::floorDiv(int64(Col.surfaceMm) - MaxCaveDepthMm - vxc::kVoxelSizeMm / 2,
+			                                             int64(vxc::kVoxelSizeMm)));
+		}
+	}
+
+	if (bCarveEligible && Col.cavern.count > 0)
+	{
+		int64 MinZAbsMm = INT64_MAX;
+		for (int32 S = 0; S < Col.cavern.count; ++S)
+		{
+			const vxc::CavernSeg& Sg = Col.cavern.segs[S];
+			MinZAbsMm = FMath::Min(MinZAbsMm, FMath::Max(int64(Sg.zFloorMm),
+			                                             int64(Sg.zCenterMm) - CeilSqrtI64(int64(Sg.marginSq))));
+		}
+		if (MinZAbsMm < INT64_MAX)
+		{
+			// cavernCarveAt refuses once depthMm + kCaveBedrockMarginMm >= bedrockDepthMm.
+			MinZAbsMm = FMath::Max(MinZAbsMm, int64(Col.surfaceMm) - int64(Col.bedrockDepthMm) + vxc::kCaveBedrockMarginMm);
+			CarveMin = FMath::Min(CarveMin, vxc::floorDiv(MinZAbsMm - vxc::kVoxelSizeMm / 2, int64(vxc::kVoxelSizeMm)));
+		}
+	}
+
+	if (CarveMin != INT64_MAX)
+	{
+		CarveMin = FMath::Max(CarveMin, int64(vxc::kCaveMinVoxelZ)); // no carving at or below sea level
+	}
+	// Source 1 is unconditional and must NOT be clamped to sea level.
+	return FMath::Min(CarveMin, SurfaceTop + 1);
+}
 } // namespace VoxelStreaming
 
 // M3 wave 1 (docs/m3-plan.md "Transport"): the wire format AVoxelEditRelay's
@@ -1176,6 +1330,36 @@ bool MeasureEmptyEnabled()
 	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelMeasureEmpty"));
 	return bEnabled;
 }
+
+// Buried-chunk pre-dispatch skip master switch, for A/B against the M1 gate
+// and the throughput run without a rebuild. `-VoxelBuriedSkip=0` restores the
+// pre-wave behaviour exactly (every candidate is dispatched). Command line
+// rather than cvar for the reason above: an -ExecCmds cvar would arrive after
+// streaming had already dispatched thousands of chunks and would silently
+// measure the same state on both sides of an A/B.
+// Soundness harness for the buried-chunk skip. With this on, the band verdict
+// is computed exactly as it would be in production but the job is dispatched
+// ANYWAY, and every result whose verdict said "provably no geometry" is
+// checked against the real mesh. It converts "I believe the bound is
+// conservative" into "N million chunks agreed", which is the only form of
+// that claim worth having: a false 'definitely empty' is a hole in the world,
+// and unlike a wasted job it is invisible until someone flies past it.
+bool VerifyBuriedSkipEnabled()
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelVerifyBuriedSkip"));
+	return bEnabled;
+}
+
+bool BuriedSkipEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelBuriedSkip="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
 } // namespace VoxelStreamAdmission
 
 // FVoxelWorldImpl -- the voxel-core side of the subsystem, defined only here
@@ -1376,6 +1560,18 @@ struct FVoxelWorldImpl
 		int32 ChunkZMax = 0;
 	};
 	mutable TMap<VoxelCoords::FVoxelLevelChunkKey, FFootprintZRange> FootprintZRangeCache;
+
+	// Buried-chunk pre-dispatch skip: level-0 footprint bands, keyed by the
+	// level-0 footprint (X,Y). Like FootprintZRangeCache this memoizes a PURE
+	// function of (X, Y) and the amplifier -- nothing anchor-relative and
+	// nothing edit-relative goes in here, so an entry never needs invalidating
+	// and is reusable for the whole session (edits are vetoed at the point of
+	// use instead, see DispatchJobs). Populated by level-0 worker results,
+	// which derive the band from the column grid they had to build anyway;
+	// never computed on the game thread, where 1156 Amplifier::column calls
+	// per footprint would be an M1-gate disaster. Pruned by distance alongside
+	// FootprintZRangeCache.
+	TMap<FIntPoint, VoxelStreaming::FFootprintBand> FootprintBandCache;
 
 	// --- Bounded admission (docs/status.md "Streaming pipeline re-measure +
 	// rework") ---------------------------------------------------------------
@@ -1591,6 +1787,22 @@ struct FVoxelWorldImpl
 	// lands inside JobMs and would inflate the zero-quad side badly.
 	double LevelZeroQuadMsSinceLog[VoxelCoords::kNumLevels] = {};
 	double LevelQuadMsSinceLog[VoxelCoords::kNumLevels] = {};
+
+	// Buried-chunk pre-dispatch skip: chunks proven featureless before any job
+	// was launched, over the same 5s window. Split by which half of the band
+	// proved it, because the two halves have very different causes (air =
+	// footprint above the terrain, solid = fully-buried interior) and the
+	// measured mix is the check that the band is behaving as the census said
+	// it should.
+	int64 BuriedSkipsSinceLog = 0;
+	int64 BuriedSkipsByLevelSinceLog[VoxelCoords::kNumLevels] = {};
+	int64 BuriedSkipAirSinceLog = 0;
+	int64 BuriedSkipSolidSinceLog = 0;
+	// -VoxelVerifyBuriedSkip: predicted-empty chunks actually meshed, and how
+	// many of them turned out to have geometry. The second must be 0.
+	int64 BuriedVerifyCheckedSinceLog = 0;
+	int64 BuriedVerifyCheckedTotal = 0;
+	int64 BuriedVerifyViolations = 0;
 
 	// The 60fps bar is 16.6ms, but the hitch log/`UVoxelPerfRunSubsystem`'s
 	// hitch count both use the much looser 33.3ms threshold -- a recurring
@@ -2215,6 +2427,20 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       (long long)LevelMixedEmptySinceLog[Level], LevelZeroQuadMsSinceLog[Level], LevelQuadMsSinceLog[Level],
 		       TotalMs > 0.0 ? 100.0 * LevelZeroQuadMsSinceLog[Level] / TotalMs : 0.0, *GridSuffix);
 	}
+	BuriedVerifyCheckedTotal += BuriedVerifyCheckedSinceLog;
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel buried skip (5s window): enabled=%d verify=%d skipped=%lld (air=%lld solid=%lld) R0=%lld | ")
+	       TEXT("bandCache=%d | verifyChecked=%lld (total %lld) violations=%lld"),
+	       VoxelStreamAdmission::BuriedSkipEnabled() ? 1 : 0, VoxelStreamAdmission::VerifyBuriedSkipEnabled() ? 1 : 0,
+	       (long long)BuriedSkipsSinceLog, (long long)BuriedSkipAirSinceLog, (long long)BuriedSkipSolidSinceLog,
+	       (long long)BuriedSkipsByLevelSinceLog[0], FootprintBandCache.Num(), (long long)BuriedVerifyCheckedSinceLog,
+	       (long long)BuriedVerifyCheckedTotal, (long long)BuriedVerifyViolations);
+	BuriedSkipsSinceLog = BuriedSkipAirSinceLog = BuriedSkipSolidSinceLog = BuriedVerifyCheckedSinceLog = 0;
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+	{
+		BuriedSkipsByLevelSinceLog[Level] = 0;
+	}
+
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
 		LevelResultsSinceLog[Level] = LevelZeroQuadSinceLog[Level] = LevelAllAirSinceLog[Level] = 0;
@@ -2503,6 +2729,27 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 	// cannot re-enter the annulus without a long journey back, and re-sampling
 	// them then costs the same as it did the first time. Cheap relative to what
 	// it protects (a pointer-chasing pass over the map, no amplifier sampling).
+	// Buried-chunk skip: the band cache is keyed on the level-0 footprint and
+	// grows with the same travel that grows FootprintZRangeCache, so it is
+	// pruned on the same trigger and by the same rule (twice level 0's unload
+	// ring). An entry is ~12 bytes and re-deriving one costs nothing extra --
+	// it comes back with the next level-0 job in that footprint.
+	{
+		const UVoxelWorldSubsystem::FRingPreset& L0Preset = UVoxelWorldSubsystem::RingPresets[0];
+		const double L0ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(0);
+		const double L0KeepRadiusUU = L0Preset.OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier * 2.0;
+		const double L0KeepRadiusSq = FMath::Square(L0KeepRadiusUU);
+		for (auto It = FootprintBandCache.CreateIterator(); It; ++It)
+		{
+			const double CenterX = (double(It.Key().X) + 0.5) * L0ChunkEdge;
+			const double CenterY = (double(It.Key().Y) + 0.5) * L0ChunkEdge;
+			if (FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) > L0KeepRadiusSq)
+			{
+				It.RemoveCurrent();
+			}
+		}
+	}
+
 	for (auto It = FootprintZRangeCache.CreateIterator(); It; ++It)
 	{
 		const VoxelCoords::FVoxelLevelChunkKey& Key = It.Key();
@@ -3044,6 +3291,73 @@ void FVoxelWorldImpl::DispatchJobs()
 			continue;
 		}
 
+		// --- Buried-chunk pre-dispatch skip ---------------------------------
+		//
+		// If this footprint's band is already known (some earlier level-0 job
+		// in the same (X,Y) returned it) and it proves this chunk can hold no
+		// visible face, do not dispatch a job at all. The record STAYS in
+		// ChunkRecords with no component, which is byte-for-byte the state
+		// ApplyMeshResult's Quads.Num()==0 branch would have left it in after
+		// a full generate+mesh -- so nothing downstream can tell the
+		// difference, and RecomputeDesiredSet will not re-queue it (candidates
+		// are admitted once, guarded by ChunkRecords.Contains).
+		//
+		// EDITS. This point is already past the NeedsOverlayAwarePath gate
+		// immediately above, which AT LEVEL 0 IS exactly
+		// ChunkHasEditedBrick(Key) -- an overlay scan of the chunk plus one
+		// brick of border on every axis. So any chunk that an edit could have
+		// made non-uniform, including a pristine chunk merely NEXT TO an
+		// edited brick, has already been routed to the game-thread path and
+		// can never reach here. The band itself is pure worldgen and knows
+		// nothing about edits; the veto is this gate, and it is the same gate
+		// the pre-existing worker path already trusted for correctness.
+		//
+		// LEVEL 0 ONLY. A level-L (L>=1) chunk spans 2^L x 2^L level-0
+		// footprints and the mip path samples columns at stride 2^L rather
+		// than building a dense grid, so no exact band is available for it --
+		// see the follow-up in docs/status.md.
+		bool bPredictedEmpty = false;
+		if (LevelKey.Level == 0)
+		{
+			if (const VoxelStreaming::FFootprintBand* Band = FootprintBandCache.Find(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y)))
+			{
+				constexpr int64 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
+				const int64 InteriorZMin = int64(LevelKey.Key.Z) * ChunkVox;
+				const int64 ApronZMax = InteriorZMin + ChunkVox; // interior top is +31; the mesher's apron reads +32
+				// All air: the whole interior sits above every column's
+				// topmost solid voxel, so every one of the 64 bricks hits
+				// meshBrick's early-out 1 (no solid voxel in the interior).
+				const bool bAllAir = InteriorZMin > int64(Band->MaxSurfaceTopVoxel);
+				// All solid: chunk AND apron sit below the lowest z at which
+				// any column can hold air, so no face has an AIR neighbour.
+				const bool bAllSolid = ApronZMax < int64(Band->SolidBelowVoxel);
+				if (bAllAir || bAllSolid)
+				{
+					bPredictedEmpty = true;
+					++BuriedSkipsSinceLog;
+					BuriedSkipsByLevelSinceLog[0] += 1;
+					(bAllAir ? BuriedSkipAirSinceLog : BuriedSkipSolidSinceLog) += 1;
+				}
+			}
+		}
+		// Under -VoxelVerifyBuriedSkip the verdict is computed and counted
+		// exactly as above but never acted on: the job runs, and DrainResults
+		// checks the verdict against the mesh it produced.
+		if (bPredictedEmpty && VoxelStreamAdmission::BuriedSkipEnabled() && !VoxelStreamAdmission::VerifyBuriedSkipEnabled())
+		{
+			// Defensive: a first dispatch always has a null component, but keep
+			// ResidentQuads exact if that ever stops holding.
+			ResidentQuads -= Rec->LastQuadCount;
+			Rec->LastQuadCount = 0;
+			if (UVoxelChunkComponent* Existing = Rec->Component.Get())
+			{
+				ReturnChunkComponentToPool(*Existing);
+			}
+			Rec->Component = nullptr;
+			Rec->bJobInFlight = false;
+			continue;
+		}
+
 		Rec->bJobInFlight = true;
 		JobsInFlightCounter.Increment();
 		++JobsDispatchedSinceLog;
@@ -3072,7 +3386,8 @@ void FVoxelWorldImpl::DispatchJobs()
 
 		UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
 			TEXT("VoxelChunkMeshJob"),
-			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot]()
+			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
+			 bPredictedEmpty]()
 			{
 				SCOPE_CYCLE_COUNTER(STAT_VoxelWorkerJob);
 				const double JobStartSeconds = FPlatformTime::Seconds();
@@ -3080,6 +3395,7 @@ void FVoxelWorldImpl::DispatchJobs()
 				VoxelStreaming::FJobResult Result;
 				Result.Key = LevelKey;
 				Result.GenerationId = GenId;
+				Result.bPredictedEmpty = bPredictedEmpty;
 
 				const VoxelCoords::FVoxelChunkKey& Key = LevelKey.Key;
 				const bool bMeasureEmpty = VoxelStreamAdmission::MeasureEmptyEnabled();
@@ -3160,6 +3476,28 @@ void FVoxelWorldImpl::DispatchJobs()
 						}
 					}
 					Result.GridMs = float((FPlatformTime::Seconds() - GridStartSeconds) * 1000.0);
+
+					// Buried-chunk pre-dispatch skip: reduce the grid this job
+					// just built into its footprint's band (see FFootprintBand).
+					// A max/min over 1156 already-resident ColumnSamples -- no
+					// amplifier work, no allocation -- whose value is that every
+					// OTHER level-0 chunk in this (X,Y) can then be answered
+					// without a job at all. The one-voxel widening on each side
+					// is pure insurance: the per-column bounds are already outer
+					// bounds, this makes an off-by-one in the derivation harmless
+					// rather than a hole in the world.
+					{
+						int64 MaxTop = INT64_MIN;
+						int64 MinAir = INT64_MAX;
+						for (const vxc::ColumnSample& Col : Columns)
+						{
+							MaxTop = FMath::Max(MaxTop, VoxelStreaming::ColumnSurfaceTopVoxel(Col));
+							MinAir = FMath::Min(MinAir, VoxelStreaming::ColumnDeepestAirVoxel(Col));
+						}
+						Result.Band.MaxSurfaceTopVoxel = int32(FMath::Clamp<int64>(MaxTop + 1, INT32_MIN, INT32_MAX));
+						Result.Band.SolidBelowVoxel = int32(FMath::Clamp<int64>(MinAir - 1, INT32_MIN, INT32_MAX));
+						Result.bBandValid = true;
+					}
 					const auto GridSampler = [&Columns, BaseVX, BaseVY](int64 X, int64 Y, int64 Z)
 					{
 						const int32 LX = int32(X - BaseVX) + 1;
@@ -3399,6 +3737,34 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			LevelWorkerJobMsWindow[Lvl][LevelWorkerJobMsWindowNext[Lvl]] = Result.JobMs;
 			LevelWorkerJobMsWindowNext[Lvl] = (LevelWorkerJobMsWindowNext[Lvl] + 1) % WorkerJobMsWindowSize;
 			LevelWorkerJobMsWindowCount[Lvl] = FMath::Min(LevelWorkerJobMsWindowCount[Lvl] + 1, WorkerJobMsWindowSize);
+		}
+
+		// Buried-chunk pre-dispatch skip: record this footprint's band. Done
+		// BEFORE the stale-result discard below, because the band is a pure
+		// function of (X,Y) and the amplifier -- it is equally true whether or
+		// not this particular chunk is still wanted, and a stale result is
+		// exactly as good a source for it as a live one.
+		if (Result.bBandValid)
+		{
+			FootprintBandCache.Add(FIntPoint(Result.Key.Key.X, Result.Key.Key.Y), Result.Band);
+		}
+
+		// -VoxelVerifyBuriedSkip soundness check: this chunk's band verdict
+		// claimed "provably no geometry" and we dispatched it anyway. If it
+		// produced quads, the bound is not conservative and the skip would
+		// have deleted visible geometry. Logged as an Error with the full key
+		// so it is impossible to miss in a headless run's log, and counted so
+		// the run can report a hard zero.
+		if (Result.bPredictedEmpty)
+		{
+			++BuriedVerifyCheckedSinceLog;
+			if (Result.Quads.Num() > 0)
+			{
+				++BuriedVerifyViolations;
+				UE_LOG(LogVoxelPerf, Error,
+				       TEXT("Voxel buried skip UNSOUND: chunk L%d (%d,%d,%d) was predicted empty but meshed %d quads"),
+				       Result.Key.Level, Result.Key.Key.X, Result.Key.Key.Y, Result.Key.Key.Z, Result.Quads.Num());
+			}
 		}
 
 		// Buried-chunk skip census. Counted here -- BEFORE the stale-result
