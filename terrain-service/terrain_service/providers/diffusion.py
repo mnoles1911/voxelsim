@@ -39,6 +39,37 @@ Design, top to bottom:
     real model's channel *names* differ from ours, that's a
     ``DiffusionConfig.channel_mapping`` edit, not a code change (task
     scaffolding item 1).
+  * ``provider_id`` — see ``DiffusionConfig.provider_id``. It is the tile-
+    cache namespace AND the value stamped into edit logs that
+    ``EditLog::checkProvider()`` compares before replaying a saved world
+    (``kMismatch`` = refuse the replay), so it must be content-addressed:
+    every input that can change tile bytes, and nothing about where those
+    bytes live. Identity schema v2 (2026-07-22) fixed two bugs found on the
+    first real generation run — the local checkpoint LOAD PATH was embedded
+    in it, and the conditioning data (WorldClim bio rasters +
+    ``data/global/etopo_10m.tif``, which condition generation via
+    ``synthetic_map._compute_map_stats``) was not hashed at all.
+
+    KNOWN REMAINING GAPS, in rough priority order — inputs that can still
+    change tile bytes without rolling the id:
+
+      1. ``SamplerConfig`` is hashed but never passed to ``WorldPipeline``,
+         so the sampler settings actually in force are upstream defaults
+         that are not in the id. See that class's docstring.
+      2. The execution environment. ``_load_pipeline`` silently falls back
+         to ``device="cpu"`` when no GPU is visible, so CPU- and
+         GPU-generated tiles share a namespace; ``torch``/cuDNN versions and
+         TF32 flags are likewise absent. Doctrine §2.3 accepts cross-GPU
+         non-determinism, but the id does not even record which side of the
+         CPU/GPU split a tile came from.
+      3. ``terrain_diffusion_version`` defaults to ``"UNRECORDED"`` and,
+         unlike ``UNPINNED``/``UNVERIFIED``, is neither refused before
+         inference nor marked in the id.
+      4. ``pipeline.bind()``'s caching strategy. ``(x, y)`` are not
+         independent per-tile seeds; seamlessness comes from the tile
+         store's cached context, so which neighbours are resident is
+         process-history state that can influence output.
+
   * ``DiffusionProvider`` — the ``TileProvider``. In ``dry_run=True`` mode
     (default off) it swaps the real model call for the synthetic
     provider's rasters reshaped to look like model output, then runs the
@@ -281,7 +312,21 @@ def adapt_raster_to_tile(
 class SamplerConfig:
     """Diffusion sampler settings — part of the pinned config (doctrine §2.3):
     changing any of these changes generated tiles, so it must roll the
-    provider_id / cache key."""
+    provider_id / cache key.
+
+    KNOWN GAP (2026-07-22, not fixed here — flagged rather than silently
+    papered over): **these values currently reach nothing.**
+    ``TerrainDiffusionBackend`` calls ``WorldPipeline.from_pretrained(...)``,
+    ``.bind()`` and ``.get(i1, j1, i2, j2, with_climate=True)``, none of which
+    take sampler arguments, so the settings actually in force are
+    ``WorldPipeline``'s internal defaults. The identity is therefore wrong in
+    both directions: changing ``steps`` here rolls the id and invalidates a
+    cache while producing byte-identical tiles, and the real sampler
+    settings — including any upstream default change — are not in the id at
+    all. ``terrain_diffusion_version`` partially covers the second case.
+    Resolve by either wiring these through to the pipeline or deleting them;
+    do not leave a config field that lies about what it controls.
+    """
 
     steps: int = 30
     guidance_scale: float = 3.0
