@@ -50,6 +50,15 @@ struct ColumnSample {
 // high here"), never a false all-air verdict.
 inline constexpr int64_t kSurfaceBoundDeclined = INT64_MAX;
 
+// The mirror sentinel, for the LOWER bound and the all-solid bound below.
+// INT64_MIN for exactly the same reason kSurfaceBoundDeclined is INT64_MAX: it
+// is the safe answer. A caller that forgets to check gets "the terrain might
+// reach arbitrarily low here" / "nothing is provably solid here", never a false
+// all-solid verdict. The two sentinels are deliberately different values so a
+// caller cannot pass one where the other is meant and still compile into
+// something that looks like it works.
+inline constexpr int64_t kSurfaceLowerBoundDeclined = INT64_MIN;
+
 // Tile-pixel corners the bound will read per axis before declining. A level-4
 // chunk (51.2 m) needs 4 corners against a 30 m pixel and 6 against the 11.25 m
 // scale-8 pixel; 16 leaves generous headroom while keeping the read count and
@@ -101,6 +110,76 @@ public:
     // it never evaluates a single detail octave. Cheaper than ONE column.
     int64_t surfaceUpperBoundMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t vy1) const;
 
+    // A PROVABLE LOWER BOUND on surfaceMm(vx, vy) over the same inclusive
+    // rectangle — the exact mirror of surfaceUpperBoundMm:
+    //
+    //     surfaceLowerBoundMm(...) <= surfaceMm(vx, vy)   for all such columns
+    //
+    // and returns kSurfaceLowerBoundDeclined if it will not bound this
+    // footprint. Same cost, same corner budget, same decline conditions; it
+    // shares surfaceUpperBoundMm's implementation body, so the two cannot drift.
+    //
+    // On its own this proves nothing about solidity — knowing the surface is at
+    // least X does not make everything below X solid, because caves and caverns
+    // carve. It is the input to solidBelowBoundMm, which adds the carve
+    // envelope. Exposed separately because it is independently meaningful and
+    // independently testable.
+    int64_t surfaceLowerBoundMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t vy1) const;
+
+    // A PROVABLE ALL-SOLID FLOOR for the inclusive voxel-index rectangle: every
+    // voxel in that footprint whose centre is strictly below the returned mm
+    // elevation is guaranteed non-air. Returns kSurfaceLowerBoundDeclined when
+    // it will not bound the footprint.
+    //
+    // THIS IS THE MIRROR OF THE SKY-BAND TRIM AND IT IS STRICTLY HARDER.
+    // Proving a chunk all-AIR needs only the surface, because nothing in the
+    // amplifier adds solid above it. Proving a chunk all-SOLID needs the
+    // surface AND the full depth envelope of everything that carves, because
+    // caves, crevices, sinkhole shafts and caverns all remove solid from below
+    // it. Get the envelope wrong and the result is not a cosmetic pop-in: it is
+    // a cave the player can see into but never reach, or a chunk that was never
+    // tracked at all sitting where someone is about to dig.
+    //
+    // THE DERIVATION (the static_asserts that pin every constant it uses live
+    // in amplifier.cpp, in the same coupling block surfaceUpperBoundMm uses):
+    //
+    //   materialAt returns air below the surface for exactly three reasons, and
+    //   this enumeration is closed — there is no MAT_WATER, and every non-air
+    //   material is solid:
+    //
+    //   1. Nothing: below every column's own surface, stratigraphyAt is solid
+    //      at every depth (MAT_ROCK, then the unbounded MAT_BEDROCK floor).
+    //      Handled by taking a LOWER bound on the surface over the footprint.
+    //
+    //   2. caveCarveAt — tunnels, crevices and sinkhole shafts. Every one of
+    //      these is bounded in the QUERYING COLUMN'S OWN depth space by
+    //      compile-time constants (deepest tube axis + widest radius, plus the
+    //      crevice's downward reach), so they cannot reach below
+    //      surfaceLowerBound - kMaxCaveCarveBelowSurfaceMm.
+    //
+    //   3. cavernCarveAt — the hard one, and the reason this bound needs a
+    //      dilated footprint. A cavern chain is anchored at ABSOLUTE z, derived
+    //      from the surface at the SITE'S OWN anchor xy, which is a different
+    //      column from the one being queried. Its depth below THAT surface is
+    //      constant-bounded (caveNode's own depth ceiling, three chain steps,
+    //      and the flat-floor clamp), but the site's surface can be far above
+    //      the querying column's. Since a site only reaches columns within
+    //      kCavernMaxReachMm of its anchor, dilating the footprint by that
+    //      radius and taking the surface lower bound over the DILATED rectangle
+    //      bounds every site that can possibly carve into it.
+    //
+    // So the bound is: lower-bound the surface over the footprint dilated by
+    // the cavern reach, then subtract the deepest carve envelope. Conservative
+    // twice over — the dilated lower bound is never above the tight one, and
+    // the envelope is the worst case over every hash draw rather than the draw
+    // actually taken.
+    //
+    // Cost: one surfaceLowerBoundMm call over the dilated rectangle. No
+    // hashing, no cave or cavern lattice evaluation, no column() — that is the
+    // entire point, since this runs per candidate chunk on the streaming
+    // admission path where a single column() would already be too expensive.
+    int64_t solidBelowBoundMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t vy1) const;
+
     // Material of voxel (vx, vy, vz) given its precomputed column. A voxel is
     // solid iff its centre (vz*100+50 mm) is at or below the surface, MINUS
     // whatever the M4 cave pass carves out of it (voxelcore/caves.h). Defined
@@ -142,6 +221,19 @@ private:
         int64_t px = 0, py = 0; // tile pixel the column falls in
     };
     SurfaceEval evalSurface(int64_t vx, int64_t vy) const;
+
+    // Shared body of surfaceUpperBoundMm / surfaceLowerBoundMm: one traversal
+    // of the footprint's tile-pixel corners producing BOTH bounds, so the two
+    // cannot drift apart in which cells they visit or what maximum slope they
+    // feed slopeScaleQ10. Returns false when it declines to bound.
+    bool surfaceBoundsMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t vy1, int64_t& outLowerMm,
+                         int64_t& outUpperMm) const;
+
+    // True if any cavern site reachable by any column of the rect has its
+    // anchor within kCavernMaxReachMm of the rect. Conservative in the safe
+    // direction: returns true when unsure. Selects which carve envelope
+    // solidBelowBoundMm subtracts; see its definition in amplifier.cpp.
+    bool cavernMayReachFootprint(int64_t vx0, int64_t vy0, int64_t vx1, int64_t vy1) const;
 
     // Identity for the per-thread tile-raster memo in amplifier.cpp. Drawn from
     // a never-reused counter rather than using `this` or `tiles_`, because a

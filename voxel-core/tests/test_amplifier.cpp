@@ -520,3 +520,191 @@ VXC_TEST(amplifier_surface_bound_golden_digest) {
     }
     CHECK_EQ(d.h, 0x5588EBCD842ECE3Dull);
 }
+
+// ---------------------------------------------------------------------------
+// Amplifier::surfaceLowerBoundMm / solidBelowBoundMm.
+//
+// solidBelowBoundMm is a SAFETY primitive and a strictly more dangerous one
+// than surfaceUpperBoundMm. The streaming layer skips ADMITTING any chunk that
+// sits entirely below it, so a bound that is ever too HIGH is not a pop-in: it
+// is a cave the player can see into but never reach, or a chunk that was never
+// tracked sitting exactly where someone is about to dig. These tests are
+// written to BREAK it. The central one does not compare the bound against
+// another bound or against a mirrored formula -- it calls the real
+// Amplifier::column and the real Amplifier::materialAt and demands that every
+// voxel below the claimed floor is genuinely not air.
+// ---------------------------------------------------------------------------
+
+VXC_TEST(amplifier_surface_lower_bound_is_never_above_truth) {
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    BoundRng rng(0xA1150117ull);
+    int64_t checked = 0, violations = 0, worstSlack = 1LL << 60;
+    for (int64_t f = 0; f < 900; ++f) {
+        const int64_t vx0 = rng.range(-400000, 400000), vy0 = rng.range(-400000, 400000);
+        const int64_t vx1 = vx0 + rng.range(0, 600), vy1 = vy0 + rng.range(0, 600);
+        const int64_t lo = amp.surfaceLowerBoundMm(vx0, vy0, vx1, vy1);
+        if (lo == kSurfaceLowerBoundDeclined) continue;
+        // The upper bound over the same rect must bracket it, always.
+        const int64_t hi = amp.surfaceUpperBoundMm(vx0, vy0, vx1, vy1);
+        CHECK(hi != kSurfaceBoundDeclined);
+        CHECK(lo <= hi);
+        for (int64_t x = vx0; x <= vx1; x += 7)
+            for (int64_t y = vy0; y <= vy1; y += 7) {
+                const int64_t s = amp.surfaceMm(x, y);
+                ++checked;
+                if (s < lo) {
+                    ++violations;
+                    if (violations <= 8)
+                        std::printf("    [LOWER BOUND VIOLATION] rect [%lld,%lld]x[%lld,%lld] "
+                                    "lower=%lld but surfaceMm(%lld,%lld)=%lld\n",
+                                    (long long)vx0, (long long)vx1, (long long)vy0, (long long)vy1,
+                                    (long long)lo, (long long)x, (long long)y, (long long)s);
+                }
+                if (s - lo < worstSlack) worstSlack = s - lo;
+            }
+    }
+    std::printf("    [amplifier] lower bound: %lld samples, tightest slack %lld mm\n",
+                (long long)checked, (long long)worstSlack);
+    CHECK_EQ(violations, 0);
+    CHECK(checked > 200000);
+    CHECK(worstSlack >= 0);
+    // Not trivially loose: somewhere it came within the detail allowance.
+    CHECK(worstSlack < 24000);
+}
+
+VXC_TEST(amplifier_solid_below_bound_has_no_air_beneath_it) {
+    // THE test. Randomised footprints across mountains-to-ocean relief; for
+    // each, take the claimed all-solid floor and hammer every sampled column in
+    // the footprint with real materialAt calls at real depths below it.
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    BoundRng rng(0x50110B0Aull);
+
+    int64_t footprints = 0, voxelsChecked = 0, airFound = 0, declined = 0;
+    int64_t caveColumns = 0, cavernColumns = 0;
+    int64_t worstHeadroomMm = 1LL << 60; // (deepest real air) - (claimed floor)
+
+    for (int64_t f = 0; f < 700; ++f) {
+        // A spread of footprint sizes matching the streaming levels this feeds
+        // (level 0 is 32 voxels, level 4 is 512), plus deliberately odd ones.
+        const int64_t span = rng.chance(50) ? (int64_t(32) << rng.range(0, 4)) : rng.range(1, 300);
+        const int64_t vx0 = rng.range(-300000, 300000), vy0 = rng.range(-300000, 300000);
+        const int64_t vx1 = vx0 + span - 1, vy1 = vy0 + span - 1;
+
+        const int64_t floorMm = amp.solidBelowBoundMm(vx0, vy0, vx1, vy1);
+        if (floorMm == kSurfaceLowerBoundDeclined) {
+            ++declined;
+            continue;
+        }
+        ++footprints;
+
+        // Sample columns across the footprint, and in each one walk DOWN from
+        // just above the claimed floor. Everything below it must be solid.
+        const int64_t stride = span > 24 ? span / 12 : 1;
+        const int64_t floorVz = floorDiv(floorMm - int64_t(kVoxelSizeMm) / 2, int64_t(kVoxelSizeMm));
+        for (int64_t x = vx0; x <= vx1; x += stride)
+            for (int64_t y = vy0; y <= vy1; y += stride) {
+                const ColumnSample col = amp.column(x, y);
+                if (col.cave.count > 0 || col.cave.shaftMarginSq > 0) ++caveColumns;
+                if (col.cavern.count > 0) ++cavernColumns;
+
+                // The upward reach is deliberately generous (140 m above the
+                // floor): the point is not only "no air below the floor" but
+                // also how much headroom the bound is leaving, and the carve
+                // envelope is 91 m, so a short window would find no air at all
+                // and leave the headroom statistic silently unset.
+                for (int64_t vz = floorVz + 1400; vz >= floorVz - 1200; --vz) {
+                    const MaterialId m = Amplifier::materialAt(col, vz);
+                    const int64_t centreMm = vz * int64_t(kVoxelSizeMm) + int64_t(kVoxelSizeMm) / 2;
+                    if (m == MAT_AIR) {
+                        if (centreMm < floorMm) {
+                            ++airFound;
+                            if (airFound <= 8)
+                                std::printf("    [SOLID BOUND VIOLATION] rect [%lld,%lld]x"
+                                            "[%lld,%lld] floor=%lld but AIR at (%lld,%lld,%lld) "
+                                            "centre=%lld surface=%d bedrockDepth=%d\n",
+                                            (long long)vx0, (long long)vx1, (long long)vy0,
+                                            (long long)vy1, (long long)floorMm, (long long)x,
+                                            (long long)y, (long long)vz, (long long)centreMm,
+                                            col.surfaceMm, col.bedrockDepthMm);
+                        }
+                        const int64_t headroom = centreMm - floorMm;
+                        if (headroom < worstHeadroomMm) worstHeadroomMm = headroom;
+                    }
+                    if (centreMm < floorMm) ++voxelsChecked;
+                }
+            }
+    }
+
+    std::printf("    [amplifier] solid-below bound: %lld footprints (%lld declined), %lld voxels "
+                "below the floor checked, %lld cave columns, %lld cavern columns, tightest "
+                "headroom %lld mm, AIR BELOW FLOOR = %lld\n",
+                (long long)footprints, (long long)declined, (long long)voxelsChecked,
+                (long long)caveColumns, (long long)cavernColumns, (long long)worstHeadroomMm,
+                (long long)airFound);
+
+    // THE claim.
+    CHECK_EQ(airFound, 0);
+
+    // The sweep must actually have swept. Without these the claim above passes
+    // trivially on an empty corpus -- and in particular it must have covered
+    // real CAVERN columns, since caverns are the term the bound is loosest
+    // against and the only one whose depth is not bounded in the querying
+    // column's own frame.
+    CHECK(footprints > 400);
+    CHECK(voxelsChecked > 1000000);
+    CHECK(caveColumns > 100);
+    CHECK(cavernColumns > 20);
+    // The scan window must actually have REACHED real air, or the "no air
+    // below the floor" result above is just a statement about an empty window.
+    CHECK(worstHeadroomMm < (1LL << 59));
+    // And tier 1 (no cavern in reach, 42.8 m envelope) must actually be firing:
+    // a flat 91 m envelope everywhere would leave a worst-case headroom near the
+    // 38 m this measured before the two-tier split, not ~11 m.
+    CHECK(worstHeadroomMm < 20000);
+    CHECK(worstHeadroomMm >= 0);
+}
+
+VXC_TEST(amplifier_solid_below_bound_declines_rather_than_guesses) {
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    // Empty footprints -> the SAFE sentinel (nothing is provably solid), and
+    // note it is the LOW sentinel, not surfaceUpperBoundMm's high one.
+    CHECK_EQ(amp.solidBelowBoundMm(10, 0, 9, 0), kSurfaceLowerBoundDeclined);
+    CHECK_EQ(amp.solidBelowBoundMm(0, 10, 0, 9), kSurfaceLowerBoundDeclined);
+    CHECK_EQ(kSurfaceLowerBoundDeclined, INT64_MIN);
+    // Too large for the corner budget -> decline. Note this declines EARLIER
+    // than surfaceUpperBoundMm does for the same rect, because the cavern
+    // dilation makes the rect it actually bounds bigger.
+    CHECK_EQ(amp.solidBelowBoundMm(0, 0, 1000000, 1000000), kSurfaceLowerBoundDeclined);
+    // A level-0 chunk footprint (32 voxels) must NOT decline -- if it did, the
+    // whole admission skip this exists for would silently do nothing.
+    CHECK(amp.solidBelowBoundMm(0, 0, 31, 31) != kSurfaceLowerBoundDeclined);
+    // The bound must sit strictly below the surface it is derived from.
+    CHECK(amp.solidBelowBoundMm(0, 0, 31, 31) < int64_t(amp.surfaceMm(16, 16)));
+}
+
+VXC_TEST(amplifier_solid_below_bound_golden_digest) {
+    // GOLDEN(amplifier_solid_below_bound) â€” NOT worldgen output, same argument
+    // as amplifier_surface_bound_golden_digest. Pinned so a change that only
+    // makes the floor LOWER (which the adversarial test accepts happily, and
+    // which costs real chunks at admission) shows up as a decision.
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    Digest d;
+    for (int64_t lvl = 0; lvl <= 4; ++lvl) {
+        const int64_t span = int64_t(16) << lvl;
+        for (int64_t cy = -6; cy < 6; ++cy)
+            for (int64_t cx = -6; cx < 6; ++cx) {
+                d.i64(amp.surfaceLowerBoundMm(cx * span, cy * span, cx * span + span - 1,
+                                              cy * span + span - 1));
+                d.i64(amp.solidBelowBoundMm(cx * span, cy * span, cx * span + span - 1,
+                                            cy * span + span - 1));
+            }
+    }
+    std::printf("    [amplifier] solid-below golden digest = 0x%016llX\n",
+                (unsigned long long)d.h);
+    CHECK_EQ(d.h, 0xE9D395DF74D61495ull);
+}
+
