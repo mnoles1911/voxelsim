@@ -23,7 +23,17 @@
 // voxel-core is UE-header-free C++20; safe to include directly from a UE
 // module .cpp (doctrine: never from a header UHT parses -- see
 // VoxelWorldSubsystem.h / VoxelChunkComponent.h, both voxel-core-free).
+// -VoxelCavernShot's unattended capture (FScreenshotRequest) and camera
+// readback (APlayerCameraManager). Ordinary engine headers, not the voxel-core
+// boundary.
+#include "Camera/PlayerCameraManager.h"
+#include "UnrealClient.h"
+
 #include "voxelcore/bytes.h"
+// -VoxelCavernShot searches for natural cavern rooms via ColumnSample::cavern
+// (CavernSeg::marginSq); amplifier.h already pulls this in, included
+// explicitly because this file names the type.
+#include "voxelcore/caverns.h"
 #include "voxelcore/collapse.h"     // M5 large-edit structural collapse: differential coarse support
 #include "voxelcore/connectivity.h" // M5 destruction: findDisconnectedIslands over the edited region
 #include "voxelcore/counters.h"
@@ -1382,6 +1392,23 @@ bool BuriedSkipEnabled()
 // single-global-ordering behaviour (one shared cap, one global cutoff, strictly
 // nearest-first dispatch across all levels) for A/B measurement, on the same
 // binary, for the same reason -VoxelPendingJobCap is a switch and not a cvar.
+// Admission refill: per level (1, default) or against the summed queue depth
+// across every level (0, the pre-change form). A cvar rather than a
+// command-line switch on purpose -- unlike -VoxelNoUnderground, this one is
+// read fresh on every tick and changes no latched state, so flipping it from
+// -ExecCmds mid-run genuinely measures both behaviours on one binary.
+static int32 GPerLevelRefill = 1;
+static FAutoConsoleVariableRef CVarPerLevelRefill(
+	TEXT("voxel.Stream.PerLevelRefill"),
+	GPerLevelRefill,
+	TEXT("1 (default): a ring's admission refill triggers on ITS OWN queue draining below its share of the cap. 0: the pre-change form, one threshold over the summed queue depth -- which let R4's multi-second jobs hold R0's refill hostage."),
+	ECVF_Default);
+
+bool GetPerLevelRefillEnabled()
+{
+	return GPerLevelRefill != 0;
+}
+
 bool GetRingQuotaEnabled()
 {
 	static const bool bEnabled = []
@@ -1893,12 +1920,23 @@ struct FVoxelWorldImpl
 	// recomputes when a deferring queue has drained (see its trigger), and that
 	// recompute clears the per-level scan gate so the entry scans actually run
 	// with the anchor sitting still.
-	bool bAdmissionDeferredWork = false;
-	// Per-RecomputeDesiredSet-call bookkeeping for the flag above (reset at the
-	// top of every call): how many levels actually ran their entry scan, and how
-	// many candidates gate (a) declined.
+	// PER LEVEL. It was one global flag, which was correct while the refill
+	// trigger was also global; now that a refill re-enumerates only the levels
+	// whose own queue drained (see TickStreaming), a global flag could never be
+	// cleared again -- its clear condition requires that EVERY level scanned on
+	// the call, and a partial refill by construction scans only some. The flag
+	// would then latch on, and since a converged level's queue is empty (and so
+	// always under its share of the cap), RecomputeDesiredSet would run every
+	// single tick forever. Splitting it per level keeps the clear reachable:
+	// each level's deferral is set and cleared by that level's own scan.
+	bool bAdmissionDeferredWork[VoxelCoords::kNumLevels] = {};
+	// Per-RecomputeDesiredSet-call bookkeeping for the flags above (reset at the
+	// top of every call): which levels actually ran their entry scan, and how
+	// many candidates gate (a) declined in each.
+	bool bLevelScannedThisCall[VoxelCoords::kNumLevels] = {};
 	int32 LevelsScannedThisCall = 0;
 	int32 CandidatesRejectedThisCall = 0;
+	int32 LevelCandidatesRejectedThisCall[VoxelCoords::kNumLevels] = {};
 	// Admission budget, per LEVEL per RecomputeDesiredSet call. The distance
 	// cutoff alone does not bound how much a single call admits: DispatchJobs
 	// pops from the NEAR end, so the queue steadily fills with the farthest
@@ -2397,17 +2435,99 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// (no movement trigger will ever fire). The per-level scan gate is cleared
 	// for this call, since it would otherwise skip every level for the same
 	// "anchor hasn't moved" reason.
+	// PER LEVEL, not against the summed queue depth. The summed form was a
+	// priority inversion severe enough to be the single thing standing between
+	// this project and an underground screenshot, and it is worth spelling out
+	// because nothing about it is visible from the surface flight:
+	//
+	// Standing still underground, `loaded` climbed at ~12 chunks/s and stalled
+	// with R0 holding 162 chunks and `pending=0` -- its queue completely
+	// EMPTY, workers idle for it -- while ~20,000 level-0 candidates sat
+	// rejected by the admission budget. The refill that would have let them in
+	// is gated on the TOTAL pending count falling under a quarter of the cap,
+	// and the total was 500-800 the whole time: R3 and R4 entries, which cost
+	// ~1 s and ~10 s each. So R0's refill waited on R4's queue. On a surface
+	// flight the movement triggers hide this completely (the anchor crosses a
+	// level-0 chunk every 3.2 m and recomputes anyway); it only bites when the
+	// player stands still, which is exactly what you do to look at a view.
+	//
+	// A level's queue draining is a statement about THAT level's workers, so
+	// the trigger and the rescan are both per level now. Each ring is measured
+	// against its own share of the cap -- the same kRingCapShare the truncate
+	// pass already divides the cap by, so the two halves agree on what "this
+	// ring's queue is empty" means.
+	// voxel.Stream.PerLevelRefill=0 restores the summed-queue form exactly, so
+	// the A/B for this change runs on ONE binary -- the same reason
+	// -VoxelRingQuota exists. It is safe from -ExecCmds because it is read
+	// fresh on every tick rather than latched at startup.
 	const int32 AdmissionCap = VoxelStreamAdmission::GetPendingJobCap();
-	const bool bAdmissionRefill =
-		bHasRecomputed && bAdmissionDeferredWork && AdmissionCap > 0 && PendingJobNum() * 4 < AdmissionCap;
+	bool bLevelWantsRefill[VoxelCoords::kNumLevels] = {};
+	bool bAdmissionRefill = false;
+	if (bHasRecomputed && AdmissionCap > 0)
+	{
+		bool bAnyDeferred = false;
+		for (const bool bDeferred : bAdmissionDeferredWork)
+		{
+			bAnyDeferred |= bDeferred;
+		}
+		if (!VoxelStreamAdmission::GetPerLevelRefillEnabled())
+		{
+			// Pre-change behaviour: one summed threshold, and every level
+			// re-enumerates when it fires.
+			if (bAnyDeferred && PendingJobNum() * 4 < AdmissionCap)
+			{
+				bAdmissionRefill = true;
+				for (bool& bWants : bLevelWantsRefill)
+				{
+					bWants = true;
+				}
+			}
+		}
+		else if (bAnyDeferred)
+		{
+			for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+			{
+				if (!bAdmissionDeferredWork[Level])
+				{
+					continue; // this ring has nothing waiting; an empty queue is just convergence
+				}
+				// EMPTY, not "under a quarter of its share". The quarter
+				// threshold is what the summed form used, and carrying it over
+				// per level was measured as a ~3 ms p95 regression on the M1
+				// surface flight: R0's queue there sits at 146-314 against a
+				// share whose quarter is ~180, so the trigger was satisfied on
+				// most frames and R0 re-ran its full entry scan (1.6-2.4 ms)
+				// almost every tick, for nothing -- on a moving anchor the
+				// movement trigger was already going to rescan it.
+				//
+				// An EMPTY queue is a different statement, and it is exactly
+				// the pathology this fix exists for: workers with nothing left
+				// to do for this ring while candidates sit rejected. It cannot
+				// fire on a flight that is keeping the ring fed, and it fires
+				// immediately when a stationary underground anchor starves it.
+				if (PendingJobKeysByLevel[Level].IsEmpty())
+				{
+					bLevelWantsRefill[Level] = true;
+					bAdmissionRefill = true;
+				}
+			}
+		}
+	}
 	if (!bHasRecomputed || AnchorChunk.X != LastAnchorChunk.X || AnchorChunk.Y != LastAnchorChunk.Y ||
 	    bUndergroundChanged || (bAnchorUnderground && AnchorChunk.Z != LastAnchorChunk.Z) || bAdmissionRefill)
 	{
 		if (bAdmissionRefill)
 		{
+			// Only the drained levels re-enumerate. Clearing the gate for all
+			// five would make a refill for R0 drag R3 and R4 through a full
+			// candidate scan they have no room for, which is the cost the
+			// per-level gate exists to avoid in the first place.
 			for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 			{
-				bHasRecomputedLevel[Level] = false;
+				if (bLevelWantsRefill[Level])
+				{
+					bHasRecomputedLevel[Level] = false;
+				}
 			}
 		}
 		RecomputeDesiredSet(Anchor);
@@ -2930,13 +3050,117 @@ static constexpr int32 SkirtChunksNear = 12;
 static constexpr int32 SkirtChunksMid = 5;
 static constexpr int32 SkirtChunksFar = 0;
 
-// (2) Underground deep box: vertical RADIUS in level-L chunks around the
-// anchor's chunk Z, per band. Radius 0 still means one chunk layer (the
-// anchor's own). Level 0 near-band 8 => +-25.6m, which overlaps the 19.2m
-// skirt above it, so a shaft up to ~45m deep stays vertically CONTIGUOUS
-// (skirt bottom meets box top) with no unmeshed gap in its walls.
-static constexpr int32 BoxRadiusChunksL0[3] = {8, 4, 0}; // near / mid / far
-static constexpr int32 BoxRadiusChunksL1 = 0;            // whole ring (fraction is always >= 0.5 there)
+// (2) Underground deep residency: vertical RADIUS in level-L chunks around
+// the anchor's chunk Z. Radius 0 still means one chunk layer (the anchor's
+// own).
+//
+// SHAPE: A SIGHT SPHERE, NOT A BANDED BOX.
+//
+// The shipped shape was a three-band step function of horizontal distance,
+// {8, 4, 0} level-0 chunks over the <0.25 / <0.5 / >=0.5 fractions of ring
+// 0's 64 m outer radius -- i.e. +-25.6 m of rock within 16 m of you, +-12.8 m
+// out to 32 m, and a single 3.2 m layer beyond that. Two problems, both
+// visible the moment you stand in a natural cavern:
+//
+//   - A cavern is BIGGER THAN THE WHOLE RESIDENT VOLUME. voxelcore/caverns.h
+//     gives rooms a horizontal semi-axis of kCavernRxyMinMm..MaxMm =
+//     12..28 m (24-56 m across) and deep children a vertical semi-axis up to
+//     kCavernRzDeepMaxMm = 40 m, chained downward. Standing in one, the far
+//     wall is 24-56 m away -- squarely in the old FAR band, where the deep
+//     residency was one 3.2 m layer. So the generator built the cavern and
+//     the streamer refused to show it: PR #74's veil correctly rendered the
+//     missing rock as darkness rather than sky, which is honest but is not a
+//     cavern vista.
+//   - The step function spends its depth exactly where it is least useful.
+//     Underground, "how far can I see" is a RADIUS, not a column height:
+//     +-25.6 m of rock directly overhead is 25 m of solid ceiling nobody can
+//     see through, while the 40 m sightline to the far wall gets nothing.
+//
+// So the deep set is now the set of chunks whose centre lies within
+// SightRadius of the anchor -- a sphere. The vertical radius at horizontal
+// distance d is sqrt(R^2 - d^2), which is naturally ANISOTROPIC in the
+// direction that matters: it trades the useless deep column overhead for
+// lateral reach, and it tapers to zero exactly at the horizon rather than
+// stepping there. It is also a strict SUPERSET of the old three-band box at
+// the default radius (see the table below), so nothing that used to be
+// resident stops being resident.
+//
+//   horizontal d | old box radius | sphere radius (R = 40 m)
+//   ------------ | -------------- | ------------------------
+//   0 m          | 8  (+-25.6 m)  | 12 (+-38.4 m)
+//   16 m         | 8  (+-25.6 m)  | 11 (+-35.2 m)
+//   32 m         | 4  (+-12.8 m)  | 7  (+-22.4 m)
+//   40 m         | 0  (one layer) | 0  (one layer)
+//   40-64 m      | 0  (one layer) | 0  (one layer)
+//
+// COST, and why this is affordable. The naive count says the sphere is ~1.9x
+// the old box (~8.2k vs ~4.4k level-0 chunks). The reason that is not ~1.9x
+// the WORK is the buried-chunk pre-dispatch skip already in this file: a
+// level-0 chunk whose footprint band says the chunk and its apron sit below
+// SolidBelowVoxel is all-solid, meshes to zero quads by construction, and is
+// never dispatched at all. Underground, that is the overwhelming majority of
+// the sphere -- solid rock -- and it is precisely the cave and cavern voids,
+// the thing we are trying to render, that the band declines to skip. The
+// steady-state census bears this out: ~5,000 of the ~6,600 skips per 5 s
+// window are the all-SOLID half. So the sphere buys sightline where there is
+// something to see and costs a band lookup where there is not.
+//
+// This whole path is gated on bAnchorUnderground, so the M1 surface flight --
+// which never goes below ground (underground=0, deepTracked=0 in every perf
+// run) -- is byte-for-byte unaffected. The cost is paid only while the player
+// is actually underground, which is exactly when the pixels are wanted.
+//
+// R is a cvar so the residency/cost trade can be A/B'd without a rebuild. It
+// is safe to drive from -ExecCmds, unlike the master switch above: the deep
+// set does not exist until the anchor first goes underground, which on any
+// scripted flight is long after cvars have been applied.
+// DEFAULT 64 m, which is exactly ring 0's own outer radius -- underground, the
+// level-0 ring is fully resident in three dimensions rather than as a slab.
+// Chosen by measurement, not taste. In the documented test cavern (a room
+// 46.6 m wide and 49.4 m tall, 60.7 m down, camera 2 m off one wall), the
+// capture probe reports where the sightline terminates and whether that rock
+// is meshed:
+//
+//   R = 40 m: +0deg wall at 44.9 m MESHED; +10/+20/+30deg walls at 46-51 m
+//             tracked but NOT MESHED -- i.e. everything the camera is actually
+//             pointed at is a hole, and the screenshot is open sky above a
+//             thin band of floor. At 44.6 m lateral an R = 40 sphere has zero
+//             vertical radius, so the resident set out there is the single
+//             3.2 m layer at the anchor's own Z. A horizontal ray runs down
+//             the middle of that band and sees rock the whole way, which is
+//             why a less careful probe called this a pass.
+//   R = 64 m: all four elevations MESHED. No sky in frame.
+//
+// Cost, same scene, stationary: deep records 9,350 -> 31,648 and tracked
+// 21,112 -> 44,331, for 548 -> 1,238 deep chunks that actually carry geometry
+// (3.9% -- the rest is solid rock the buried-chunk skip never dispatches).
+// Steady-state cost of that is close to nothing: recompute 0.0 ms (the refill
+// trigger stops firing once the ring converges) and subsystem tick 0.27-0.37%
+// of wall, against 0.29-0.33% at R = 40.
+//
+// WHAT IS NOT MEASURED, and it is the reason this is a cvar: MOVING
+// underground. The exit scan is O(ChunkRecords) and runs on every recompute,
+// so 44 k records is ~2.7x the surface flight's 16 k, where that scan cost
+// 2.4-2.7 ms. Nothing here exercises a moving underground anchor. See the
+// follow-up on skipping all-solid chunks at ADMISSION rather than at dispatch,
+// which would cut these records by ~25x and is the real fix if this bites.
+static float GSightRadiusM = 64.0f;
+static FAutoConsoleVariableRef CVarUndergroundSightRadius(
+	TEXT("voxel.Stream.UndergroundSightM"),
+	GSightRadiusM,
+	TEXT("Radius in metres of the underground sight sphere: while the anchor is underground, level-0 chunks whose centre is within this distance are resident. 40 (default) covers the far wall of a mid-size cavern from its centre."),
+	ECVF_Default);
+
+static double SightRadiusUU()
+{
+	// Clamped rather than trusted: this multiplies a level-0 chunk count, and
+	// a fat-fingered 400 would admit ~8 million chunks. 64 m is ring 0's own
+	// outer radius -- beyond it the sphere would want chunks this level does
+	// not stream at all.
+	return double(FMath::Clamp(GSightRadiusM, 0.0f, 64.0f)) * 100.0;
+}
+
+static constexpr int32 BoxRadiusChunksL1 = 0; // whole ring (fraction is always >= 0.5 there)
 
 // Vertical keep-distance for the deep box, in level-L chunks, used by the
 // exit scan. Mirrors the XY hysteresis: keep out to KeepChunks * chunkEdge *
@@ -2945,6 +3169,26 @@ static constexpr int32 BoxRadiusChunksL1 = 0;            // whole ring (fraction
 // thrash chunks in and out; surfacing still evicts the whole box, because the
 // anchor's Z leaves the keep window entirely.
 static constexpr int32 KeepChunks[VoxelCoords::kNumLevels] = {9, 2, 0, 0, 0};
+
+// Vertical keep-distance in UU for a deep chunk of this level, used by the
+// exit scan. Level 0 derives it from the sight sphere rather than from the
+// constant above, and that is load-bearing rather than tidy: the keep window
+// MUST exceed the largest vertical offset admission can create, or the exit
+// scan queues a chunk for unload in the same recompute that admitted it and
+// the pair thrash forever. The shipped constant (9 -> 40.0 m of keep) was
+// generous against the old radius-8 box (25.6 m) but lands exactly ON the
+// default sphere's 12-chunk pole (40.0 m), and would be far under it at a
+// raised voxel.Stream.UndergroundSightM. Deriving it from the same radius the
+// admission side uses makes the invariant structural: keep = 1.25 * R + one
+// chunk of slack is always strictly greater than the R the sphere admits.
+static double VerticalKeepUU(int32 Level, double ChunkEdgeUU)
+{
+	if (Level == 0)
+	{
+		return SightRadiusUU() * UVoxelWorldSubsystem::UnloadRingMultiplier + ChunkEdgeUU;
+	}
+	return double(KeepChunks[Level] + 1) * ChunkEdgeUU * UVoxelWorldSubsystem::UnloadRingMultiplier;
+}
 
 // The anchor counts as underground once it is this far below the amplifier
 // surface, and stops counting as underground only once it comes back above the
@@ -2993,7 +3237,16 @@ static bool BoxRadiusChunks(int32 Level, double DistSq, int32& OutRadius)
 	}
 	if (Level == 0)
 	{
-		OutRadius = BoxRadiusChunksL0[BandForDistance(0, DistSq)];
+		// Sight sphere (see GSightRadiusM): vertical half-extent in level-0
+		// chunks at horizontal distance sqrt(DistSq). Outside the sphere the
+		// radius is 0, which still means the anchor's own chunk layer -- the
+		// same single layer the old far band granted, so the far field is
+		// unchanged rather than trimmed.
+		const double RadiusUU = SightRadiusUU();
+		const double RemainingSq = RadiusUU * RadiusUU - DistSq;
+		OutRadius = RemainingSq <= 0.0
+		                ? 0
+		                : FMath::FloorToInt32(FMath::Sqrt(RemainingSq) / VoxelCoords::ChunkEdgeUUForLevel(0));
 		return true;
 	}
 	if (Level == 1)
@@ -3504,6 +3757,11 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	EvictedThisCall.Reset();
 	LevelsScannedThisCall = 0;
 	CandidatesRejectedThisCall = 0;
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+	{
+		bLevelScannedThisCall[Level] = false;
+		LevelCandidatesRejectedThisCall[Level] = 0;
+	}
 
 	// Bounded admission: the cutoff was computed at the end of the PREVIOUS
 	// call, when the queue was at cap; workers have been draining it since.
@@ -3561,8 +3819,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		bool bBeyondVertical = false;
 		if (Pair.Value.bDeepAnchorRelative)
 		{
-			const int32 KeepChunks = VoxelUnderground::KeepChunks[LevelKey.Level];
-			const double KeepUU = double(KeepChunks + 1) * ChunkEdge * UVoxelWorldSubsystem::UnloadRingMultiplier;
+			const double KeepUU = VoxelUnderground::VerticalKeepUU(LevelKey.Level, ChunkEdge);
 			const double CenterZ = (double(LevelKey.Key.Z) + 0.5) * ChunkEdge;
 			bBeyondVertical = FMath::Abs(CenterZ - Anchor.Z) > KeepUU;
 		}
@@ -3638,6 +3895,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		bHasRecomputedLevel[Level] = true;
 		++LevelEntryScans[Level];
 		++LevelsScannedThisCall;
+		bLevelScannedThisCall[Level] = true;
 		AdmissionsThisLevel = 0; // per-level admission budget (see its doc comment)
 
 		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[Level];
@@ -3712,7 +3970,8 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 						// Per-level admission budget (see AdmissionsThisLevel).
 						++CandidatesRejectedSinceLog;
 						++CandidatesRejectedThisCall;
-						bAdmissionDeferredWork = true;
+						++LevelCandidatesRejectedThisCall[QueueLevel];
+						bAdmissionDeferredWork[QueueLevel] = true;
 						return;
 					}
 					// The cutoff is now this RING's own (see
@@ -3725,7 +3984,8 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					{
 						++CandidatesRejectedSinceLog;
 						++CandidatesRejectedThisCall;
-						bAdmissionDeferredWork = true;
+						++LevelCandidatesRejectedThisCall[QueueLevel];
+						bAdmissionDeferredWork[QueueLevel] = true;
 						return;
 					}
 
@@ -3886,7 +4146,13 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 		{
 			const int32 LevelCap =
 				FMath::Max(1, FMath::RoundToInt(double(Cap) * VoxelStreamAdmission::kRingCapShare[Level]));
-			bHeldBack |= DropFarthestOverCap(PendingJobKeysByLevel[Level], LevelCap, LevelAdmissionCutoffDistSq[Level]);
+			if (DropFarthestOverCap(PendingJobKeysByLevel[Level], LevelCap, LevelAdmissionCutoffDistSq[Level]))
+			{
+				// This ring, and only this ring, still has candidates it could
+				// not take -- so only this ring's refill trigger stays armed.
+				bHeldBack = true;
+				bAdmissionDeferredWork[Level] = true;
+			}
 		}
 	}
 	else
@@ -3913,6 +4179,16 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 			    });
 			double GlobalCutoff = DBL_MAX;
 			bHeldBack = DropFarthestOverCap(TruncateMergeScratch, Cap, GlobalCutoff);
+			if (bHeldBack)
+			{
+				// -VoxelRingQuota=0 reproduces the pre-quota behaviour exactly,
+				// including its single global cap, so there is no per-ring
+				// attribution to make here: arm every ring's trigger.
+				for (bool& bDeferred : bAdmissionDeferredWork)
+				{
+					bDeferred = true;
+				}
+			}
 			for (TArray<FSortEntry>& Queue : PendingJobKeysByLevel)
 			{
 				Queue.Reset();
@@ -3939,8 +4215,7 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 
 	if (bHeldBack)
 	{
-		bAdmissionDeferredWork = true;
-		return;
+		return; // the per-level flags were set by whichever ring held work back
 	}
 	// Nothing was held back by THIS call. Only clear the deferral flag if every
 	// level actually re-enumerated on this call (a movement-triggered call scans
@@ -3948,9 +4223,12 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 	// it may still have candidates waiting -- clearing then would lose the refill
 	// trigger for them). A refill call always satisfies this, since it clears the
 	// per-level gate first.
-	if (LevelsScannedThisCall == VoxelCoords::kNumLevels && CandidatesRejectedThisCall == 0)
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
-		bAdmissionDeferredWork = false;
+		if (bLevelScannedThisCall[Level] && LevelCandidatesRejectedThisCall[Level] == 0)
+		{
+			bAdmissionDeferredWork[Level] = false;
+		}
 	}
 }
 
@@ -6462,6 +6740,26 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	// just be "Impl is non-null") -- gates Deinitialize's autosave.
 	bWorldBegunPlay = true;
 
+	// -VoxelCavernShot[=<settleSeconds>] (see "Cavern vista capture" below).
+	// Read from the command line, not a cvar, for the same reason
+	// -VoxelNoUnderground is: it has to be known before the first tick.
+	{
+		float Settle = 0.f;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelCavernShot="), Settle) && Settle > 0.f)
+		{
+			CavernShotSettleSeconds = double(Settle);
+			CavernShotElapsed = 0.0;
+		}
+		else if (FParse::Param(FCommandLine::Get(), TEXT("VoxelCavernShot")))
+		{
+			CavernShotElapsed = 0.0;
+		}
+		if (CavernShotElapsed >= 0.0)
+		{
+			UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCavernShot: enabled, settle %.1fs."), CavernShotSettleSeconds);
+		}
+	}
+
 	// M3 wave 2 persistence (docs/m3-plan.md "Save/load"): authority
 	// (server/listen/standalone) loads Saved/VoxelWorlds/<seed>.vxlog, if
 	// present, before ANY streaming/chunk work below reads from Impl->Voxels
@@ -6594,6 +6892,454 @@ void UVoxelWorldSubsystem::Tick(float DeltaTime)
 	}
 
 	Impl->TickStreaming(Anchor, *ChunkOwner, *ChunkRoot, ChunkMaterial, DeltaTime);
+
+	TickCavernShot(DeltaTime);
+}
+
+// --- Cavern vista capture (-VoxelCavernShot) ---------------------------------
+//
+// WHY THIS EXISTS AT ALL. The underground sight sphere above is a claim about
+// pixels ("you can see the far wall of a cavern"), and the only way to check a
+// claim about pixels is to look. The two existing unattended capture switches
+// cannot: -VoxelGICaveTest finds a SINKHOLE and points the camera UP the shaft
+// (it is a GI test -- it wants the daylight shaft), and -VoxelUndergroundTest
+// CARVES its own 1.3 m tunnel with the edit log, which is a corridor shot and
+// also writes to the edit overlay. Neither photographs natural cavern geometry.
+//
+// WHY THE FRAMING IS COMPUTED AND NOT HARDCODED. Framing, not streaming, is
+// what defeated the two previous attempts at this image: one pose sat on a
+// sunlit mountainside, the other 0.9-3.8 m from a wall (both were 120 UU up
+// the axis of a 130 UU-radius tunnel, i.e. jammed into the roof). Fixed poses
+// are fragile because the geometry they point at is generated. So this
+// MEASURES the room -- floor, ceiling, and both walls along the view axis --
+// picks the camera from those measurements, and logs every number it used. If
+// the shot is bad, the log says so before anyone opens the PNG.
+//
+// EVERY PROBE USES IsSolidAtVoxel, NEVER RaycastVoxelWorld, for the search.
+// RaycastVoxelWorld tests the RESIDENT chunk set, and at search time the
+// cavern is hundreds of metres away with nothing streamed, so it reports
+// "miss" straight through solid rock -- the documented way -VoxelGICaveTest
+// once parked its camera inside a wall. IsSolidAtVoxel goes to the amplifier
+// and is correct regardless of residency. Raycasts appear only in the
+// capture-time enclosure probe, where they are wanted precisely BECAUSE they
+// see the resident set: that is the measurement of whether the streamer
+// actually delivered the rock this change is about.
+//
+// The pose is applied by teleporting the PAWN, not by moving a camera: the
+// streaming anchor is the pawn's actor location (see Tick above), so a camera-
+// only move would leave the desired set behind and stream nothing underground.
+//
+// Switches:
+//   -VoxelCavernShot[=<settleSeconds>]  enable; default 45 s of settle
+//   -VoxelCavernAt=<X>,<Y>              search origin in UU (default 0,0)
+//   -VoxelCavernFlooded                 accept flooded caverns (default: dry
+//                                       only, so the shot is not underwater)
+bool UVoxelWorldSubsystem::FindCavernPose(FVector& OutCameraUU, FRotator& OutLookRot, FString& OutReport) const
+{
+	if (!Impl)
+	{
+		return false;
+	}
+	const vxc::Amplifier& Amp = Impl->Voxels.amplifier();
+
+	double OriginX = 0.0, OriginY = 0.0;
+	{
+		FString AtValue;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelCavernAt="), AtValue))
+		{
+			FString Xs, Ys;
+			if (AtValue.Split(TEXT(","), &Xs, &Ys))
+			{
+				OriginX = FCString::Atod(*Xs);
+				OriginY = FCString::Atod(*Ys);
+			}
+		}
+	}
+	const bool bAllowFlooded = FParse::Param(FCommandLine::Get(), TEXT("VoxelCavernFlooded"));
+
+	// Score a column by the vertical half-extent of the best cavern room
+	// reaching it. caverns.h defines CavernSeg::marginSq as
+	// rz^2 * (rxy^2 - d^2) / rxy^2, so sqrt(marginSq) IS that half-extent in
+	// mm and is maximised exactly on the room's vertical axis -- which makes
+	// "maximise marginSq" the same thing as "walk to the middle of the room",
+	// with no probing at all. Returns 0 for a column no room reaches.
+	const auto ScoreColumn = [&Amp, bAllowFlooded](int64 Vx, int64 Vy, int32& OutZCenterMm, int32& OutZFloorMm) -> double
+	{
+		// By VALUE: Amplifier::columnCached hands back a reference into a
+		// per-thread memo that the next call overwrites (the same trap
+		// VoxelWaterSubsystem::FindFloodedCavernNear documents). column() is
+		// the by-value form, but the copy here is deliberate regardless.
+		const vxc::ColumnSample Col = Amp.column(Vx, Vy);
+		if (Col.cavern.count == 0)
+		{
+			return 0.0;
+		}
+		if (!bAllowFlooded && Col.cavern.floodZMm != INT32_MIN)
+		{
+			return 0.0; // a flooded room photographs as water, not as a cavern vista
+		}
+		double Best = 0.0;
+		for (int32 S = 0; S < Col.cavern.count; ++S)
+		{
+			const double Half = FMath::Sqrt(double(FMath::Max(0, Col.cavern.segs[S].marginSq)));
+			if (Half > Best)
+			{
+				Best = Half;
+				OutZCenterMm = Col.cavern.segs[S].zCenterMm;
+				OutZFloorMm = Col.cavern.segs[S].zFloorMm;
+			}
+		}
+		return Best;
+	};
+
+	// 1. COARSE SEARCH, expanding square rings so the first acceptable hit is
+	// also the nearest. The step is 30 m, deliberately under caverns.h's
+	// kCavernMaxReachMm (~36.4 m): a coarser grid could step clean over a
+	// whole site. Perimeter-only per ring, so this is O(radius) rings not
+	// O(radius^2) rescans.
+	constexpr double StepUU = 3000.0;    // 30 m
+	constexpr double MaxRadiusUU = 60000.0; // 600 m
+	const int32 MaxRing = int32(MaxRadiusUU / StepUU);
+	double BestScore = 0.0;
+	double BestXUU = 0.0, BestYUU = 0.0;
+	int32 BestZCenterMm = 0, BestZFloorMm = 0;
+	for (int32 Ring = 0; Ring <= MaxRing && BestScore <= 0.0; ++Ring)
+	{
+		for (int32 Dy = -Ring; Dy <= Ring; ++Dy)
+		{
+			for (int32 Dx = -Ring; Dx <= Ring; ++Dx)
+			{
+				if (Ring > 0 && FMath::Abs(Dx) != Ring && FMath::Abs(Dy) != Ring)
+				{
+					continue; // interior of this ring was covered by an earlier one
+				}
+				const double Wx = OriginX + double(Dx) * StepUU;
+				const double Wy = OriginY + double(Dy) * StepUU;
+				int32 ZCenterMm = 0, ZFloorMm = 0;
+				const double Score = ScoreColumn(int64(FMath::FloorToDouble(Wx / VoxelCoords::VoxelSizeUU)),
+				                                 int64(FMath::FloorToDouble(Wy / VoxelCoords::VoxelSizeUU)), ZCenterMm,
+				                                 ZFloorMm);
+				if (Score > BestScore)
+				{
+					BestScore = Score;
+					BestXUU = Wx;
+					BestYUU = Wy;
+					BestZCenterMm = ZCenterMm;
+					BestZFloorMm = ZFloorMm;
+				}
+			}
+		}
+	}
+	if (BestScore <= 0.0)
+	{
+		OutReport = FString::Printf(TEXT("no dry cavern found within %.0f m of (%.0f,%.0f)"), MaxRadiusUU / 100.0,
+		                            OriginX, OriginY);
+		return false;
+	}
+
+	// 2. REFINE onto the room axis. The coarse grid lands anywhere inside the
+	// room; a 2 m grid over +-40 m (a whole room diameter, kCavernRxyMaxMm =
+	// 28 m) around it maximises the same score, i.e. walks to the axis. This
+	// matters for the shot: framed from the tapering EDGE of the room the far
+	// wall is close and the ceiling is low, which is the "photographed a
+	// crack" failure mode.
+	{
+		constexpr double RefineHalfUU = 4000.0;
+		constexpr double RefineStepUU = 200.0;
+		const double CenterX = BestXUU, CenterY = BestYUU;
+		for (double Wy = CenterY - RefineHalfUU; Wy <= CenterY + RefineHalfUU; Wy += RefineStepUU)
+		{
+			for (double Wx = CenterX - RefineHalfUU; Wx <= CenterX + RefineHalfUU; Wx += RefineStepUU)
+			{
+				int32 ZCenterMm = 0, ZFloorMm = 0;
+				const double Score = ScoreColumn(int64(FMath::FloorToDouble(Wx / VoxelCoords::VoxelSizeUU)),
+				                                 int64(FMath::FloorToDouble(Wy / VoxelCoords::VoxelSizeUU)), ZCenterMm,
+				                                 ZFloorMm);
+				if (Score > BestScore)
+				{
+					BestScore = Score;
+					BestXUU = Wx;
+					BestYUU = Wy;
+					BestZCenterMm = ZCenterMm;
+					BestZFloorMm = ZFloorMm;
+				}
+			}
+		}
+	}
+
+	// 3. MEASURE the room with solidity probes. Everything from here is the
+	// real carved world (caves, bedrock clamps and the roof guard all apply),
+	// not the analytic ellipsoid, so the numbers below are what the camera
+	// will actually see.
+	const auto IsAirAtUU = [this](double Wx, double Wy, double Wz)
+	{
+		return !IsSolidAtVoxel(int64(FMath::FloorToDouble(Wx / VoxelCoords::VoxelSizeUU)),
+		                       int64(FMath::FloorToDouble(Wy / VoxelCoords::VoxelSizeUU)),
+		                       int64(FMath::FloorToDouble(Wz / VoxelCoords::VoxelSizeUU)));
+	};
+	const double AxisZUU = double(BestZCenterMm) / 10.0;
+	if (!IsAirAtUU(BestXUU, BestYUU, AxisZUU))
+	{
+		OutReport = FString::Printf(TEXT("room axis at (%.0f,%.0f,%.0f) is solid -- carve guards rejected it"), BestXUU,
+		                            BestYUU, AxisZUU);
+		return false;
+	}
+	constexpr double ProbeStepUU = 20.0;   // 20 cm, two voxels
+	constexpr double ProbeLimitUU = 12000.0; // 120 m, well past kCavernRzDeepMaxMm*2
+	// Clamped for the same reason as the ceiling walk below: a chain descends
+	// through its own floor, so an unbounded downward walk lands in the room
+	// beneath this one.
+	const double FloorLimitUU = AxisZUU - BestScore / 10.0;
+	double FloorZUU = AxisZUU;
+	while (FloorZUU - ProbeStepUU >= FloorLimitUU && IsAirAtUU(BestXUU, BestYUU, FloorZUU - ProbeStepUU))
+	{
+		FloorZUU -= ProbeStepUU;
+	}
+	// The ceiling probe is CLAMPED to the analytic half-extent, and that clamp
+	// is not cosmetic. Rooms in a cavern chain overlap vertically, so a naive
+	// upward walk from the axis escapes through the join into the room above
+	// and keeps going: the first run of this harness measured a "130 m tall"
+	// room, aimed two thirds of the way up that, and produced a 62-degree
+	// pitch -- a photograph of the ceiling. BestScore is sqrt(marginSq), the
+	// half-height of THIS room at THIS column, so it is exactly the bound the
+	// walk should not cross.
+	const double CeilLimitUU = AxisZUU + BestScore / 10.0;
+	double CeilZUU = AxisZUU;
+	while (CeilZUU + ProbeStepUU <= CeilLimitUU && IsAirAtUU(BestXUU, BestYUU, CeilZUU + ProbeStepUU))
+	{
+		CeilZUU += ProbeStepUU;
+	}
+	// Eye height: 1.6 m off the floor. The -VoxelUndergroundTest lesson is
+	// that the camera's height offset has to be well INSIDE the local void,
+	// and that framing should come from pitch rather than from height -- its
+	// tunnel shot put the lens 10 UU under the roof of a 130 UU tunnel and
+	// photographed rock. A cavern room is metres tall, so 1.6 m is safe, but
+	// clamp anyway for the case where the axis probe found a low room.
+	const double EyeZUU = FMath::Min(FloorZUU + 160.0, (FloorZUU + CeilZUU) * 0.5);
+
+	// Walls along +X / -X at eye height. Stand near the -X wall and look
+	// across, so the whole room width becomes the sightline.
+	double WallNegXUU = BestXUU;
+	while (BestXUU - WallNegXUU < ProbeLimitUU && IsAirAtUU(WallNegXUU - ProbeStepUU, BestYUU, EyeZUU))
+	{
+		WallNegXUU -= ProbeStepUU;
+	}
+	double WallPosXUU = BestXUU;
+	while (WallPosXUU - BestXUU < ProbeLimitUU && IsAirAtUU(WallPosXUU + ProbeStepUU, BestYUU, EyeZUU))
+	{
+		WallPosXUU += ProbeStepUU;
+	}
+	// Stand 2 m off the near wall (not against it: the near-plane would clip
+	// into rock and the first metres of the vista would be wall).
+	const double StandXUU = FMath::Min(WallNegXUU + 200.0, BestXUU);
+	const double SightUU = WallPosXUU - StandXUU;
+
+	OutCameraUU = FVector(StandXUU, BestYUU, EyeZUU);
+	const_cast<UVoxelWorldSubsystem*>(this)->CavernShotSightlineUU = SightUU;
+	// Aim LOW on the far wall -- a third of its height -- and then clamp the
+	// pitch. Both halves are corrections from real runs. Aiming two thirds up
+	// gave 34.8 degrees in a room that is 49 m tall and 47 m wide, and the
+	// resulting frame was almost entirely ceiling: in a room whose height is
+	// comparable to its width, "look at the far wall" and "look up" are nearly
+	// the same instruction. Aiming low keeps the floor sweeping away to the
+	// far wall in frame, which is what makes the distance legible -- an
+	// unbroken floor running to a wall 45 m away IS the picture of the sight
+	// sphere working. The clamp is the backstop for a room shape the ratio
+	// does not anticipate.
+	const double TargetZUU = FloorZUU + (CeilZUU - FloorZUU) * 0.33;
+	const double RawPitch = FMath::RadiansToDegrees(FMath::Atan2(TargetZUU - EyeZUU, FMath::Max(SightUU, 1.0)));
+	OutLookRot = FRotator(FMath::Clamp(RawPitch, -15.0, 18.0), 0.0, 0.0);
+
+	const double SurfaceUU = GetSurfaceHeightUU(BestXUU, BestYUU);
+	OutReport = FString::Printf(
+		TEXT("room axis=(%.0f,%.0f) analytic halfHeight=%.1fm | floor=%.0f ceil=%.0f (height %.1fm) | ")
+		TEXT("walls x=[%.0f,%.0f] (width %.1fm) | camera=(%.0f,%.0f,%.0f) pitch=%.1f sightline=%.1fm | ")
+		TEXT("surface=%.0f depth=%.1fm"),
+		BestXUU, BestYUU, BestScore / 1000.0, FloorZUU, CeilZUU, (CeilZUU - FloorZUU) / 100.0, WallNegXUU, WallPosXUU,
+		(WallPosXUU - WallNegXUU) / 100.0, OutCameraUU.X, OutCameraUU.Y, OutCameraUU.Z, OutLookRot.Pitch,
+		SightUU / 100.0, SurfaceUU, (SurfaceUU - EyeZUU) / 100.0);
+	return true;
+}
+
+void UVoxelWorldSubsystem::PoseCavernCamera() const
+{
+	UWorld* World = GetWorld();
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+	if (!Pawn)
+	{
+		return;
+	}
+	// TeleportPhysics, and re-applied on a schedule below: a fly pawn with any
+	// residual velocity will drift out of a pose applied once, and the drift
+	// is exactly what turns a measured 20 m sightline into a shot of a wall.
+	Pawn->SetActorLocation(CavernShotCameraUU, false, nullptr, ETeleportType::TeleportPhysics);
+	Pawn->SetActorRotation(CavernShotLookRot);
+	PC->SetControlRotation(CavernShotLookRot);
+	PC->SetViewTarget(Pawn);
+}
+
+void UVoxelWorldSubsystem::TickCavernShot(float DeltaSeconds)
+{
+	if (CavernShotElapsed < 0.0 || bCavernShotFailed)
+	{
+		return;
+	}
+	const double Prev = CavernShotElapsed;
+	CavernShotElapsed += double(DeltaSeconds);
+
+	// Pose as early as the pawn exists. The teleport is what starts the
+	// underground desired set building, so every second before it is settle
+	// time wasted.
+	if (!bCavernShotPosed)
+	{
+		UWorld* World = GetWorld();
+		APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+		if (!PC || !PC->GetPawn())
+		{
+			return; // no pawn yet; do not consume settle time
+		}
+		FString Report;
+		if (!FindCavernPose(CavernShotCameraUU, CavernShotLookRot, Report))
+		{
+			UE_LOG(LogVoxelEarth, Error, TEXT("VoxelCavernShot: %s"), *Report);
+			bCavernShotFailed = true;
+			return;
+		}
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCavernShot: %s"), *Report);
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCavernShot: settling %.1fs (voxel.Stream.UndergroundSightM=%.0f)"),
+		       CavernShotSettleSeconds, double(VoxelUnderground::GSightRadiusM));
+		PoseCavernCamera();
+		bCavernShotPosed = true;
+		CavernShotElapsed = 0.0;
+		return;
+	}
+
+	// Re-pose twice more before the shot, for the drift reason above.
+	const double RepinAt[2] = {CavernShotSettleSeconds - 4.0, CavernShotSettleSeconds - 1.0};
+	for (const double T : RepinAt)
+	{
+		if (Prev < T && CavernShotElapsed >= T)
+		{
+			PoseCavernCamera();
+		}
+	}
+
+	if (!bCavernShotCaptured && CavernShotElapsed >= CavernShotSettleSeconds)
+	{
+		bCavernShotCaptured = true;
+		PoseCavernCamera();
+
+		// Where the camera ACTUALLY ended up. "The pose did not stick" is the
+		// other half of how the previous two attempts failed, and it is
+		// invisible in the PNG.
+		UWorld* World = GetWorld();
+		APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+		if (PC && PC->PlayerCameraManager)
+		{
+			const FVector Actual = PC->PlayerCameraManager->GetCameraLocation();
+			const FRotator ActualRot = PC->PlayerCameraManager->GetCameraRotation();
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("VoxelCavernShot: ACTUAL cam=(%.0f,%.0f,%.0f) rot=(pitch %.1f yaw %.1f) | intended=(%.0f,%.0f,%.0f) pitch %.1f"),
+			       Actual.X, Actual.Y, Actual.Z, ActualRot.Pitch, ActualRot.Yaw, CavernShotCameraUU.X,
+			       CavernShotCameraUU.Y, CavernShotCameraUU.Z, CavernShotLookRot.Pitch);
+		}
+
+		// GEOMETRY probe: where the rock IS, per the voxel world. Note this is
+		// NOT a statement about what is on screen -- RaycastVoxelWorld runs a
+		// DDA against the generated/overlaid voxel world, so it reports the
+		// wall whether or not a single chunk of it has been meshed. The first
+		// run of this harness reported "+X=44.9m" here and photographed open
+		// sky, which is exactly that distinction.
+		const FVector Dirs[6] = {FVector(1, 0, 0), FVector(-1, 0, 0), FVector(0, 1, 0),
+		                         FVector(0, -1, 0), FVector(0, 0, 1), FVector(0, 0, -1)};
+		const TCHAR* Names[6] = {TEXT("+X"), TEXT("-X"), TEXT("+Y"), TEXT("-Y"), TEXT("+Z"), TEXT("-Z")};
+		FString Probe;
+		for (int32 I = 0; I < 6; ++I)
+		{
+			FVector Hit, PrevVoxel;
+			if (RaycastVoxelWorld(CavernShotCameraUU, Dirs[I], 6000.0, Hit, PrevVoxel))
+			{
+				Probe += FString::Printf(TEXT("%s=%.1fm "), Names[I], (Hit - CavernShotCameraUU).Size() / 100.0);
+			}
+			else
+			{
+				Probe += FString::Printf(TEXT("%s=MISS "), Names[I]);
+			}
+		}
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCavernShot: voxel-world geometry probe (60m rays): %s"), *Probe);
+
+		// RESIDENCY probe: whether that rock is actually MESHED, which is the
+		// claim the sight sphere makes and the only one the screenshot can
+		// confirm. Asks DebugChunkStatusAt whether the chunk containing each
+		// sample is tracked and owns a component.
+		//
+		// A FAN, along the actual view direction and above it -- not a single
+		// horizontal ray. The horizontal-only version of this probe reported
+		// "23/23 meshed" for a frame whose entire middle was open sky, and the
+		// reason is the exact shape of what the sphere does: at 44.6 m lateral
+		// an R = 40 m sphere has ZERO vertical radius, so the resident set
+		// there is one 3.2 m band at the anchor's own Z. A ray at eye height
+		// runs straight down the middle of that band and sees rock the whole
+		// way, while everything the camera is actually looking at -- pitched
+		// 18 degrees up -- is above it and unmeshed. Sampling the view cone is
+		// what makes the probe answer the question the screenshot asks.
+		{
+			// For each elevation: raycast the VOXEL world to find where the rock
+			// the player is looking at actually is, then ask whether the chunk
+			// holding that rock is tracked and meshed. Both halves are needed
+			// and neither alone is honest.
+			//
+			// Walking a ray and counting "meshed" samples does NOT work, and
+			// the failure is instructive: a chunk of open cavern air is all-air,
+			// meshes to zero quads and correctly owns NO component, so a sample
+			// inside the room reads as "not meshed" while being exactly right.
+			// A first attempt at this probe scored +20deg as 0/23 for that
+			// reason alone. What matters is only the chunk the sightline
+			// TERMINATES in -- that is the surface that either draws or is a
+			// hole showing sky.
+			const double Elevations[4] = {0.0, 10.0, 20.0, 30.0}; // degrees above horizontal
+			FString Res;
+			for (const double ElevDeg : Elevations)
+			{
+				const double Rad = FMath::DegreesToRadians(ElevDeg);
+				const FVector Dir(FMath::Cos(Rad), 0.0, FMath::Sin(Rad));
+				FVector Hit, PrevVoxel;
+				if (!RaycastVoxelWorld(CavernShotCameraUU, Dir, 8000.0, Hit, PrevVoxel))
+				{
+					Res += FString::Printf(TEXT("[+%.0fdeg NO ROCK within 80m] "), ElevDeg);
+					continue;
+				}
+				const double DistM = (Hit - CavernShotCameraUU).Size() / 100.0;
+				// One voxel PAST the surface, so the sample lands in the solid
+				// chunk that owns the visible face rather than in the air chunk
+				// in front of it.
+				bool bTracked = false, bHasComponent = false;
+				int32 Quads = 0;
+				const bool bKnown = DebugChunkStatusAt(Hit + Dir * VoxelCoords::VoxelSizeUU, bTracked, bHasComponent, Quads);
+				Res += FString::Printf(TEXT("[+%.0fdeg wall at %.1fm: %s] "), ElevDeg, DistM,
+				                       !bKnown          ? TEXT("NOT TRACKED -> renders as a hole")
+				                       : !bHasComponent ? TEXT("tracked but NOT MESHED -> renders as a hole")
+				                                        : TEXT("MESHED -> draws"));
+			}
+			UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCavernShot: RESIDENCY fan (sightline %.1fm, sight sphere R=%.0fm): %s"),
+			       CavernShotSightlineUU / 100.0, double(VoxelUnderground::GSightRadiusM), *Res);
+		}
+
+		const FVoxelPerfSnapshot Snap = GetPerfSnapshot();
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCavernShot: residentComponents=%d residentQuads=%lld chunksLoaded=%lld"),
+		       Snap.ResidentComponents, (long long)Snap.ResidentQuads, (long long)Snap.TotalChunksLoaded);
+
+		FScreenshotRequest::RequestScreenshot(TEXT("VoxelCavern"), /*bShowUI*/ false, /*bAddFilenameSuffix*/ true);
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCavernShot: screenshot requested."));
+	}
+
+	if (bCavernShotCaptured && CavernShotElapsed >= CavernShotSettleSeconds + 4.0)
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCavernShot: done, exiting."));
+		FPlatformMisc::RequestExit(false);
+		bCavernShotFailed = true; // stop ticking this
+	}
 }
 
 TStatId UVoxelWorldSubsystem::GetStatId() const
