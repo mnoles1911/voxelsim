@@ -11,6 +11,15 @@ if(NOT MSVC)
   target_compile_options(vxc_waterca_bench PRIVATE -Wall -Wextra -Werror)
 endif()
 
+# --- vxc_terrainprobe: coarse-to-fine detail diagnostic. Structure function
+# and voxel terrace run lengths of the amplified surface against real tiles;
+# the numeric readout behind the ground-level corduroy artifact. ------------
+add_executable(vxc_terrainprobe terrainprobe.cpp)
+target_link_libraries(vxc_terrainprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_terrainprobe PRIVATE -Wall -Wextra -Werror)
+endif()
+
 # --- vxc_editlog: offline edit-log stats/compact/verify tool (M3 groundwork,
 # docs/status.md) -----------------------------------------------------------
 add_executable(vxc_editlog editlog_tool.cpp)
