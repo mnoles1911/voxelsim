@@ -163,6 +163,73 @@ private:
 	// Builds the 8-vertex / 12-triangle inward-facing box once, lazily.
 	void EnsureVeilShell();
 
+	// ---- Underground presentation rig -------------------------------------
+	//
+	// WHY THIS LIVES HERE. It is driven by exactly one predicate --
+	// IsCameraUnderRock -- which this actor already evaluates every tick for
+	// the veil. A second "am I underground" test would be a second thing to
+	// keep in sync, and the brief was explicit about reusing this one.
+	//
+	// WHY IT CANNOT REGRESS THE SURFACE. Both components below are created
+	// lazily on the first underground transition and are switched off
+	// (UPostProcessComponent::bEnabled = false, light visibility = false)
+	// by the SAME latch that hides the clipmap. Above ground they either do
+	// not exist or contribute nothing -- there is no code path in which a
+	// surface frame sees a different post-process stack than it did before
+	// this change. The M1 flight never goes underground, so it never even
+	// constructs them.
+	void EnsureCaveRig();
+
+	// Applies the rig's on/off state. Called only from SetVeilActive, i.e.
+	// only on a transition.
+	void SetCaveRigActive(bool bActive);
+
+	// Unbound (whole-world) post-process whose ONLY overrides are the two
+	// auto-exposure brightness clamps. Setting min == max pins eye adaptation
+	// to a fixed EV100 instead of letting the histogram hunt for 18% grey in a
+	// scene that has no 18% grey in it. See the .cpp for the measurement.
+	UPROPERTY(Transient)
+	TObjectPtr<class UPostProcessComponent> CaveExposurePP;
+
+	// Camera-mounted lamp. Inverse-square falloff is what turns a flat
+	// uniformly-lit box into a cave: near rock reads, far rock falls off into
+	// the dark the veil is there to provide.
+	UPROPERTY(Transient)
+	TObjectPtr<class UPointLightComponent> CaveLamp;
+
+	// -VoxelCaveLight=0 disables the whole rig (exposure lock + lamp) on the
+	// same binary, for the A/B. Read once at BeginPlay for the same reason
+	// bVeilEnabled is: -ExecCmds lands after init.
+	bool bCaveRigEnabled = true;
+	bool bCaveRigActive = false;
+
+	// Tunables, all overridable from the command line so a screenshot pass
+	// does not need a rebuild. Defaults are the measured values (see .cpp).
+	// +10 stops is not a taste value, it is a calibration. AEM_Manual's
+	// default physical camera (f/4, 1/60 s, ISO 100) is EV100 ~9.9, i.e. a
+	// bright-daylight stop, and the cave is lit by an 8-lux sun. Sweeping the
+	// bias at 8 / 10 / 12 against the r.EyeAdaptationQuality 0 reference
+	// frame, +10 reproduces it to within a percent of mean luminance
+	// (86.3 vs 84.8 over the whole frame, p50 33 vs 31, zero clipped pixels
+	// either way). +8 is 4 stops of crush, +12 puts the median back at 104.
+	float CaveExposureEV100 = 10.f;  // -VoxelCaveEV=
+	// Measured against that same fixed stop: 6000 lm and 2500 lm clip 15% and
+	// 6.5% of the frame respectively, 800 lm lifts the frame mean from 86 to
+	// 162 (flat, flash-lit), 250 lm lands at 135 with 0.01% clipped. 150 is
+	// the low end of that usable band, chosen so the lamp SHAPES the near
+	// field rather than replacing the falloff into darkness that makes the
+	// image read as a cave at all. With voxel GI on (-VoxelGIOn), whose AO
+	// term buys back a lot of headroom, 400 lm is the better-looking number
+	// and is what the hero capture uses.
+	float CaveLampLumens = 150.f;    // -VoxelCaveLampLumens= (0 disables)
+	float CaveLampRadiusUU = 6000.f; // -VoxelCaveLampRadiusM= (x100)
+
+	// -VoxelVeilExtentM=<metres>: shrinks the veil box so it can be
+	// PHOTOGRAPHED directly (at 300 m it is always behind real geometry, which
+	// is exactly why "the veil looks pale" went undiagnosed for three agents).
+	// Diagnostic only; the default is the shipped 300 m.
+	double VeilHalfExtentUU = 30000.0;
+
 	UPROPERTY(Transient)
 	TObjectPtr<UProceduralMeshComponent> VeilShell;
 
