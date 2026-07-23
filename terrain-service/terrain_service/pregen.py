@@ -43,7 +43,7 @@ def main() -> int:
         type=int,
         default=1,
         choices=[1, 8],
-        help="Tile scale: 1 (30m/px) or 8 (11.25m/px) (default 1)",
+        help="Tile scale: 1 (30m/px) or 8 (3.75m/px) (default 1)",
     )
     parser.add_argument(
         "--cache-dir",

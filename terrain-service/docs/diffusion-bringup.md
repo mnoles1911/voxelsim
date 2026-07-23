@@ -153,7 +153,7 @@ config = DiffusionConfig(
     conditioning_digest=compute_conditioning_digest(),
     terrain_diffusion_version="<git rev / package version>",
     sampler=SamplerConfig(steps=30, guidance_scale=3.0, scheduler="ddim"),  # tune to taste
-    scale=1,  # 30m/px. NB scale is a SUPERSAMPLE knob: 8 => 11.25m/px, which
+    scale=1,  # 30m/px. NB scale is a SUPERSAMPLE knob: 8 => 3.75m/px, which
               # covers LESS ground, not more. Bring it up as a SEPARATE
               # config/provider_id once scale=1 is trusted.
 )
@@ -252,7 +252,7 @@ What this GPU session still needs to do, in order:
      indistinguishable from the tile interior. No axis flip. This question
      is closed; do not re-open it without new evidence.
    - **Scale semantics**: `DiffusionConfig.scale` (1 => 30m/px, 8 =>
-     11.25m/px in our `tile_codec.py`) is passed straight through as
+     3.75m/px in our `tile_codec.py`) is passed straight through as
      terrain-diffusion's own upsample `scale` factor (relative to the
      pinned checkpoint's `native_resolution` config field). Confirm the
      pinned checkpoint's `native_resolution` actually makes `scale=1` mean
