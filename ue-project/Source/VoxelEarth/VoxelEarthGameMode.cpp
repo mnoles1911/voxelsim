@@ -3477,8 +3477,10 @@ void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 	// At a column where a cavern or cave void breaches down from (or up to) the
 	// surface, the worldgen surface is open air and a pawn spawned there+5m falls
 	// tens of metres and grounds on the cavern floor, enclosed by rock walls
-	// (the walk/fly agent's finding at -VoxelSpawnAt=-66240,67200: grounded ~24 m
-	// down inside a cavern). Ground the pawn on the ACTUAL walkable surface
+	// (originally observed at -VoxelSpawnAt=-66240,67200, which has since drifted
+	// to open ground under later worldgen; a currently-carved column is
+	// (116.7,-96.3) m -- worldgen surface 1077.4 m, true walkable surface 16.0 m
+	// below). Ground the pawn on the ACTUAL walkable surface
 	// instead: the highest solid voxel of the column that has air directly above
 	// it -- which is where a falling pawn would come to rest anyway, so this
 	// removes the long drop rather than changing where the pawn ends up.
