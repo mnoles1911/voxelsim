@@ -708,27 +708,90 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 		}
 	}
 
-	// Pass 3: skirts -- drop the outer grid edge AND the inner hole
-	// boundary by 2x this level's spacing (position only, after
-	// normals/colors are computed -- m2-plan.md "Cracks/overlap" row, class
-	// comment).
-	for (int32 i = 0; i < NumVertsPerSide; ++i)
+	// Pass 3: seam treatment at the outer grid edge (position only, after
+	// normals/colors are computed from the true surface).
+	//
+	// WHY THE OLD SKIRTS PRODUCED THE ARTIFACT. The v1 approach dropped BOTH
+	// the outer grid edge AND the inner hole boundary by 2x spacing. With the
+	// rings concentric (Tick's CommonOrigin fix), a finer level's outer edge
+	// (radius 32*S) and the next-coarser level's inner hole edge (also radius
+	// 32*S, since 16*2S == 32*S) land on exactly the SAME world square -- so
+	// both of those dropped rings sit at the same radius and dive AWAY from
+	// each other into an open V-trench (~3 cells wide, 2-4x spacing deep, with
+	// a whole-cell vertical gap at the floor). Looking down at the vista that
+	// trench is the "dark rectangular slab / hard step" at every ring boundary
+	// (below sea level it fills with ocean and reads as a blue band; on land it
+	// reads as a dark shadowed slab). The concentric fix aligned the boundaries
+	// but the coincident double-drop still opened the trench -- proven by the
+	// -VoxelNoClipmap control (bands vanish) at -VoxelVistaShot=600.
+	//
+	// THE FIX: no skirts at internal seams. Instead close the seam exactly with
+	// a T-junction STITCH. Along a finer level's outer edge the vertices at EVEN
+	// offsets from the centre coincide (same world XY, same sampled height) with
+	// the coarser level's hole-edge vertices; the ODD-offset vertices sit
+	// halfway between two coarser vertices, where the coarser surface is just
+	// the straight quad edge between them. Snapping each odd edge vertex to the
+	// average of its two even neighbours makes the finer edge trace exactly that
+	// straight coarser edge -- the two rings then share an identical polyline at
+	// the boundary and the seam is watertight (C0), no gap, no step, no trench,
+	// nothing to hide. (This is the localized CDLOD/geoclipmap edge-stitch; the
+	// full per-vertex distance morph remains the ADR-0002 M2-polish item, but
+	// the visible artifact was the trench, and the stitch removes it outright.)
+	// It reads only this level's own heights (avg of neighbours reproduces the
+	// coarser linear edge because both sample the same field at the even
+	// points), so it needs nothing from the coarser PMC and is robust to the
+	// round-robin rebuild order.
+	//
+	// The hole edge is left at full height on every level: from the finer
+	// neighbour's side the seam is already stitched (above), and level 0's hole
+	// edge meeting the 2 km voxel cascade at full height lines the two systems
+	// up better than the old dropped notch did.
+	//
+	// The OUTERMOST level (no coarser neighbour) keeps a real downward skirt on
+	// its outer perimeter: that edge is the true edge of the whole clipmap
+	// (~16-32 km out), and the drop makes the world edge fall away into dark
+	// downward geometry instead of showing void/sky past the horizon.
+	const bool bIsOutermost = (LevelIndex == NumLevels - 1);
+	if (bIsOutermost)
 	{
-		const int32 Dx = FMath::Abs(i - HalfIndex);
-		const bool bOuterX = (i == 0 || i == NumVertsPerSide - 1);
-		const bool bHoleEdgeX = (Dx == HoleHalfIndex);
-		for (int32 j = 0; j < NumVertsPerSide; ++j)
+		for (int32 i = 0; i < NumVertsPerSide; ++i)
 		{
-			const int32 Dy = FMath::Abs(j - HalfIndex);
-			const bool bOuterY = (j == 0 || j == NumVertsPerSide - 1);
-			const bool bHoleEdgeY = (Dy == HoleHalfIndex);
-
-			const bool bOuterSkirt = bOuterX || bOuterY;
-			const bool bHoleSkirt = (bHoleEdgeX && Dy <= HoleHalfIndex) || (bHoleEdgeY && Dx <= HoleHalfIndex);
-			if (bOuterSkirt || bHoleSkirt)
+			const bool bOuterX = (i == 0 || i == NumVertsPerSide - 1);
+			for (int32 j = 0; j < NumVertsPerSide; ++j)
 			{
-				Positions[i * NumVertsPerSide + j].Z -= SkirtDropUU;
+				const bool bOuterY = (j == 0 || j == NumVertsPerSide - 1);
+				if (bOuterX || bOuterY)
+				{
+					Positions[i * NumVertsPerSide + j].Z -= SkirtDropUU;
+				}
 			}
+		}
+	}
+	else
+	{
+		// T-junction stitch on the four outer edges. A vertex is on exactly one
+		// edge line unless it is a corner; corners are at index 0/64, which are
+		// EVEN offsets from HalfIndex (32) and therefore coincide with a coarser
+		// vertex -- so no odd-offset vertex is ever a corner, and each stitched
+		// vertex has both of its along-edge neighbours on the same edge line.
+		const auto StitchEdgeZ = [&](int32 i, int32 j, int32 iA, int32 jA, int32 iB, int32 jB)
+		{
+			Positions[i * NumVertsPerSide + j].Z =
+				0.5 * (HeightsUU[iA * NumVertsPerSide + jA] + HeightsUU[iB * NumVertsPerSide + jB]);
+		};
+		for (int32 k = 0; k < NumVertsPerSide; ++k)
+		{
+			const bool bOddOffset = (((k - HalfIndex) & 1) != 0);
+			if (!bOddOffset)
+			{
+				continue; // even offsets already coincide with the coarser edge
+			}
+			// Top/bottom edges (i fixed at 0 / NumVertsPerSide-1, varying j=k).
+			StitchEdgeZ(0, k, 0, k - 1, 0, k + 1);
+			StitchEdgeZ(NumVertsPerSide - 1, k, NumVertsPerSide - 1, k - 1, NumVertsPerSide - 1, k + 1);
+			// Left/right edges (j fixed at 0 / NumVertsPerSide-1, varying i=k).
+			StitchEdgeZ(k, 0, k - 1, 0, k + 1, 0);
+			StitchEdgeZ(k, NumVertsPerSide - 1, k - 1, NumVertsPerSide - 1, k + 1, NumVertsPerSide - 1);
 		}
 	}
 
@@ -866,6 +929,37 @@ void AVoxelClipmapActor::Tick(float DeltaTime)
 		}
 	}
 
+	// CONCENTRIC recenter (the ring-seam fix). ALL levels share ONE
+	// camera-snapped origin, so every level's outer boundary lands on exactly
+	// the same world-space square as the next-coarser level's inner hole
+	// boundary -- both are +-32*SpacingL == +-16*Spacing(L+1) measured from the
+	// SAME centre, so they coincide by construction.
+	//
+	// Previously each level snapped to its OWN spacing grid
+	// (GridSnap(cam, SpacingUUForLevel(Level))), giving each ring a DIFFERENT
+	// origin. A finer ring's outer edge and the coarser ring's hole edge, both
+	// nominally at the same radius, were then offset by up to a fine cell in
+	// world space -- opening an annular GAP (up to a whole coarse cell wide at
+	// the outer boundaries, i.e. hundreds of metres) that showed the dark
+	// underground veil / background straight through the seam: the "dark
+	// rectangular slabs of apparently-missing terrain" artifact. (Square,
+	// symmetric holes can only line up on all four sides when adjacent levels
+	// share an origin -- no per-level snap can fix it; concentricity is the
+	// only geometry that does, and is what a real clipmap uses regardless.)
+	// With the rings concentric the boundaries coincide, the gap closes, and
+	// the existing skirts (RebuildLevel pass 3) only have the residual
+	// T-junction crack left to hide -- exactly what a 2x-spacing skirt is for.
+	//
+	// Snapped to the FINEST level's spacing (not the coarsest): keeps level 0's
+	// inner hole within one fine cell of the camera so it still lines up with
+	// the voxel cascade's outer edge at the near (2 km) seam. The cost is that
+	// all four levels go dirty together each time the shared origin moves, but
+	// round-robin still rebuilds at most one per tick -- identical per-frame
+	// cost to before (the coarser levels simply refresh over the next few
+	// ticks; distant, cosmetic, never in the M1 budget's critical path).
+	const double Spacing0 = SpacingUUForLevel(0);
+	const FVector2D CommonOrigin(FMath::GridSnap(CameraLocUU.X, Spacing0), FMath::GridSnap(CameraLocUU.Y, Spacing0));
+
 	if (!bBootstrapped)
 	{
 		// One-time: build every level immediately (see class comment
@@ -873,10 +967,8 @@ void AVoxelClipmapActor::Tick(float DeltaTime)
 		// spawn -- a one-off cost, not a recurring per-frame one.
 		for (int32 Level = 0; Level < NumLevels; ++Level)
 		{
-			const double Spacing = SpacingUUForLevel(Level);
-			const FVector2D SnappedOrigin(FMath::GridSnap(CameraLocUU.X, Spacing), FMath::GridSnap(CameraLocUU.Y, Spacing));
-			RebuildLevel(Level, SnappedOrigin);
-			LastSnappedOriginUU[Level] = SnappedOrigin;
+			RebuildLevel(Level, CommonOrigin);
+			LastSnappedOriginUU[Level] = CommonOrigin;
 			bLevelBuilt[Level] = true;
 		}
 		bBootstrapped = true;
@@ -889,12 +981,10 @@ void AVoxelClipmapActor::Tick(float DeltaTime)
 	for (int32 Step = 0; Step < NumLevels; ++Step)
 	{
 		const int32 Level = (RoundRobinCursor + Step) % NumLevels;
-		const double Spacing = SpacingUUForLevel(Level);
-		const FVector2D SnappedOrigin(FMath::GridSnap(CameraLocUU.X, Spacing), FMath::GridSnap(CameraLocUU.Y, Spacing));
-		if (!bLevelBuilt[Level] || SnappedOrigin != LastSnappedOriginUU[Level])
+		if (!bLevelBuilt[Level] || CommonOrigin != LastSnappedOriginUU[Level])
 		{
-			RebuildLevel(Level, SnappedOrigin);
-			LastSnappedOriginUU[Level] = SnappedOrigin;
+			RebuildLevel(Level, CommonOrigin);
+			LastSnappedOriginUU[Level] = CommonOrigin;
 			bLevelBuilt[Level] = true;
 			RoundRobinCursor = (Level + 1) % NumLevels;
 			break;
