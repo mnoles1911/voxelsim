@@ -12,7 +12,7 @@ direction for 25 tiles (~9 min at 22.5 s/tile). Contiguous sampling would search
 a 77 km box for the same cost, and the whole problem is that the neighbourhood of
 the origin is ocean.
 
-Note `scale` is a SUPERSAMPLE knob (1 => 30 m/px, 8 => 11.25 m/px), so a larger
+Note `scale` is a SUPERSAMPLE knob (1 => 30 m/px, 8 => 3.75 m/px), so a larger
 scale covers LESS ground, not more. There is no cheap coarse query; sparse
 sampling is the lever.
 
