@@ -887,6 +887,32 @@ UVoxelChunkComponent::UVoxelChunkComponent(const FObjectInitializer& ObjectIniti
 	// render-only primitive must not participate in Chaos collision.
 	SetCollisionProfileName(UCollisionProfile::NoCollision_ProfileName);
 	SetGenerateOverlapEvents(false);
+
+	// SUN SHADOWING -- "the sun should not light a sealed cave" fix.
+	//
+	// UPrimitiveComponent::CastShadow defaults to FALSE (engine
+	// PrimitiveComponent.cpp), and nothing ever set it true on the voxel
+	// terrain chunks. The proxy-level shadow flags are all gated on it
+	// (PrimitiveSceneProxy.cpp: bCastDynamicShadow = bCastDynamicShadow &&
+	// CastShadow && ...), so with CastShadow off FPrimitiveSceneProxy::
+	// IsShadowCast() is false, GetViewRelevance() below reports
+	// bShadowRelevance=false, and the terrain was NEVER rendered into the
+	// directional light's shadow-depth pass. Consequence: the sun passed
+	// straight through solid rock, and a cave floor tens of metres underground
+	// was lit by the directional sun as if it were outdoors (Control C on the
+	// sealed-cave fixture measured the key light on those faces as the sun,
+	// 14.5 m under rock). The rock column's topmost +Z surface is a closed
+	// caster; once it writes shadow depth, everything beneath it (cave floors,
+	// walls, ceilings) is correctly occluded from the sun and is left to the
+	// local cave lighting (PR #86 veil/lamp) and voxel GI. The same flag also
+	// gives surface relief its sun shadows -- hills shadowing valleys at dawn.
+	//
+	// Mobility is Movable (never changed away from the UPrimitiveComponent
+	// default; VoxelWorldSubsystem.cpp precaches the Movable PSO variant), so
+	// this enables the dynamic cascaded-shadow-map path. bCastDynamicShadow is
+	// already true by default; CastShadow is the one flag that was suppressing
+	// all of it.
+	CastShadow = true;
 }
 
 void UVoxelChunkComponent::SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, int32 InChunkEdgeVoxels)

@@ -21,7 +21,12 @@ struct ClimateSample {
 class ITileSampler {
 public:
     virtual ~ITileSampler() = default;
-    virtual int32_t pixelSizeMm() const = 0; // 30000 at scale 1, 11250 at scale 8
+    // 30000 at scale 1, 3750 at scale 8 (scale is a SUPERSAMPLE factor on the
+    // pinned 30 m checkpoint: 30 m / 8 = 3.75 m/px). MIRROR: keep identical
+    // with terrain-service tile_codec.PIXEL_SIZE_MM and tilestore.h's
+    // tilePixelSizeMm(). (The old 11250 was 90 m / 8, from the superseded 90 m
+    // model — wrong by 3x here.)
+    virtual int32_t pixelSizeMm() const = 0;
     virtual int32_t elevationMm(int64_t px, int64_t py) = 0;
     virtual ClimateSample climate(int64_t px, int64_t py) = 0;
 };
