@@ -73,11 +73,22 @@ class UMaterialInterface;
 // Cracks/overlap (m2-plan.md "Cracks/overlap" row): with the rings concentric
 // (above) the only inter-level discontinuity left is the T-junction crack (a
 // finer ring's edge has 2x the coarser ring's vertex density along the shared
-// boundary), which the skirts hide: the outer grid edge and the inner hole
-// boundary both drop 2x that level's vertex spacing, and quads entirely inside
-// a level's hole are not emitted (annulus culling). Residual z-fighting against
-// the ring cascade at the near seam is an accepted v1 artifact; the full
-// per-vertex CDLOD morph (ADR-0002 tripwire) remains the M2-polish item.
+// boundary). The v1 skirts -- dropping BOTH the outer grid edge AND the inner
+// hole boundary by 2x spacing -- did NOT hide it once the rings were concentric:
+// the two coincident dropped rings dived away from each other into an open
+// V-trench (the "dark slab" artifact; see RebuildLevel pass 3). Internal seams
+// are now closed by a T-junction STITCH instead (RebuildLevel pass 3): each
+// finer level's odd-offset outer-edge vertices are snapped to the average of
+// their even neighbours, which coincide with the coarser hole-edge vertices, so
+// the shared boundary becomes an identical watertight polyline -- no gap, no
+// step, no trench. Quads entirely inside a level's hole are still not emitted
+// (annulus culling), and the OUTERMOST level keeps a real downward skirt on its
+// true world-edge perimeter. Residual: a per-coarse-cell slope crease at each
+// seam (the finer detail meets the coarser chord at a different gradient) --
+// cosmetic LOD shimmer, most visible on flat sea-level terrain under a low sun;
+// the full per-vertex CDLOD morph (ADR-0002 tripwire) remains the M2-polish item
+// that removes it. Residual z-fighting against the ring cascade at the near seam
+// is an accepted v1 artifact.
 UCLASS()
 class VOXELEARTH_API AVoxelClipmapActor : public AActor
 {
