@@ -109,6 +109,24 @@ private:
 	FTimerHandle SpawnWaterTestTimerHandle;
 	FTimerHandle SpawnWaterTestSettleTimerHandle;
 
+	// ADR-0005 water persistence verification (docs/adr/0005-water-persistence.md):
+	// -VoxelWaterPersistTest[=<delaySeconds>] pours a pool (and best-effort drains
+	// a flooded cavern) near spawn, lets it settle, then SaveWaterState()s the
+	// blob and runs an in-process disk round-trip (VerifyWaterDiskRoundTrip) that
+	// reloads the actual .vxwater file into a FRESH CA/mobilizer and asserts the
+	// digest/volume/mobilized-count match -- proving the UE save/load wiring, not
+	// just the serializer's own unit tests. Self-quits so a headless save run
+	// exits on its own, leaving the blob on disk for a cross-process reload.
+	// -VoxelWaterLoadCheck[=<delaySeconds>] is that second half: on a re-launch
+	// with the same seed it logs the water state the OnWorldBeginPlay load path
+	// restored from disk (volume/digest/mobilized) and quits -- the genuine
+	// reload, proving a drained cavern stays drained across processes.
+	FTimerHandle WaterPersistTestPourTimerHandle;
+	FTimerHandle WaterPersistTestSaveTimerHandle;
+	FTimerHandle WaterPersistTestQuitTimerHandle;
+	FTimerHandle WaterLoadCheckTimerHandle;
+	FTimerHandle WaterLoadCheckQuitTimerHandle;
+
 	// W2 verification (task item 5b): -VoxelBreachTest[=<delaySeconds>]
 	// scans for a below-sea-level column near spawn on BeginPlay (logged),
 	// then carves a crater there once the delay elapses, seeding a Reservoir

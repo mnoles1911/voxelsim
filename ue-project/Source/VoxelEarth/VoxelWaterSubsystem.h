@@ -199,8 +199,46 @@ public:
 	// affected chunk for re-mesh. Returns false on a corrupt/short buffer.
 	bool ApplyReplicatedWaterDiffs(const TArray<uint8>& Bytes);
 
+	// --- ADR-0005 water persistence (docs/adr/0005-water-persistence.md) ------
+	//
+	// Serializes the WaterState blob (vxc::WaterState::serialize -- per-brick CA
+	// fill + the active set + the mobilized brick keys) and writes it as a
+	// SIBLING of the terrain edit log's own save. UVoxelWorldSubsystem::SaveWorld
+	// persists Saved/VoxelWorlds/<seed>.vxlog; this writes Saved/VoxelWorlds/
+	// <seed>.vxwater right beside it -- same directory, same per-seed naming, the
+	// same atomic tmp+rename write, and the same lifetime (autosaved from
+	// Deinitialize on shutdown, loaded from OnWorldBeginPlay). It is deliberately
+	// a separate file, not a section of the log: water invalidates on
+	// kWaterCAVersion and is discardable without discarding terrain edits (see
+	// the .cpp and waterca.h's WaterState comment).
+	//
+	// Authority only (server/listen/standalone) -- a client has no authoritative
+	// CA to persist; returns false (logged) on NM_Client, on a missing Impl, or
+	// on a write failure. Also invoked directly by the voxel.SaveWater console
+	// command and the -VoxelWaterPersistTest fixture.
+	bool SaveWaterState() const;
+
+	// Diagnostic (task item: prove the drain->save->reload round trip in-engine):
+	// serializes the LIVE CA+mobilizer to the exact bytes SaveWaterState writes,
+	// then reads the on-disk .vxwater file back and applies it (vxc::WaterState::
+	// load, fills-first) into a FRESH CA+mobilizer pair, and reports both sides'
+	// digest / total volume / mobilized-brick count. Byte-identical digests plus
+	// conserved volume prove a save/load cycle keeps every drained cavern rather
+	// than trusting that the serializer's own unit tests mean the UE file wiring
+	// is correct. False if no blob could be read or parsed. Non-const: it walks
+	// the amplifier column memo to rebuild the fresh pair's implicit field.
+	bool VerifyWaterDiskRoundTrip(uint64& OutLiveDigest, uint64& OutReloadedDigest, uint64& OutLiveVolume,
+	                              uint64& OutReloadedVolume, int32& OutLiveMobilized, int32& OutReloadedMobilized);
+
 private:
 	TUniquePtr<FVoxelWaterImpl> Impl;
+
+	// M3-wave-2-style autosave gate, mirroring UVoxelWorldSubsystem's own
+	// bWorldBegunPlay: set true once OnWorldBeginPlay runs its genuine
+	// game-world/Impl-present body, so Deinitialize's water autosave never writes
+	// the empty state of the transient "Entry"/loading world's phantom subsystem
+	// instance over a real save file.
+	bool bWorldBegunPlay = false;
 
 	// Single actor hosting every UWaterChunkComponent (mirrors
 	// UVoxelWorldSubsystem's ChunkOwner/ChunkRoot pattern exactly, but kept

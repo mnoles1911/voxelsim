@@ -1030,6 +1030,16 @@ void AVoxelEarthGameMode::BeginPlay()
 					UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSaveWorldAfter: SaveWorld() -> %s (editedDigest=0x%016llX)"),
 					       bOk ? TEXT("OK") : TEXT("FAILED"), (unsigned long long)Subsystem->GetEditedDigest());
 
+					// ADR-0005: persist the water blob ALONGSIDE the edit log on
+					// the same explicit-save path (the Deinitialize autosave
+					// already pairs them on shutdown; this pairs them here too).
+					if (UVoxelWaterSubsystem* Water = SaveWorldPtr->GetSubsystem<UVoxelWaterSubsystem>())
+					{
+						const bool bWaterOk = Water->SaveWaterState();
+						UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSaveWorldAfter: SaveWaterState() -> %s (waterDigest=0x%016llX)"),
+						       bWaterOk ? TEXT("OK") : TEXT("skipped/failed"), (unsigned long long)Water->GetWaterDigest());
+					}
+
 					GetWorldTimerManager().SetTimer(
 						SaveWorldQuitTimerHandle,
 						FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(/*bForce*/ false); }), 5.f, false);
@@ -1468,6 +1478,137 @@ void AVoxelEarthGameMode::BeginPlay()
 						45.f, false);
 				}),
 			SpawnWaterTestDelaySeconds, false);
+	}
+
+	// ADR-0005 water persistence verification (docs/adr/0005-water-persistence.md):
+	// -VoxelWaterPersistTest[=<delaySeconds>] (default 12s) pours a pool at the
+	// spawn column and, best-effort, drains a flooded cavern near spawn (so the
+	// saved state carries BOTH plain CA fill and mobilized-cavern water), lets it
+	// settle, then SaveWaterState()s the blob and runs an in-process disk
+	// round-trip: it reloads the actual on-disk .vxwater into a FRESH CA/mobilizer
+	// and asserts digest/volume/mobilized-count all match. Self-quits, leaving the
+	// blob for a cross-process -VoxelWaterLoadCheck reload.
+	float WaterPersistDelaySeconds = 12.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterPersistTest="), WaterPersistDelaySeconds) ||
+	    FParse::Param(FCommandLine::Get(), TEXT("VoxelWaterPersistTest")))
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelWaterPersistTest: will pour+drain near spawn in %.1fs, then save + round-trip verify."),
+		       WaterPersistDelaySeconds);
+		GetWorldTimerManager().SetTimer(
+			WaterPersistTestPourTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this]()
+				{
+					UWorld* PW = GetWorld();
+					UVoxelWorldSubsystem* Terrain = PW ? PW->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					UVoxelWaterSubsystem* Water = PW ? PW->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+					if (!Terrain || !Water)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelWaterPersistTest: subsystems not ready, skipping."));
+						return;
+					}
+
+					double SpawnX = 0.0, SpawnY = 0.0;
+					ParseSpawnColumnUU(SpawnX, SpawnY); // (0,0) if -VoxelSpawnAt absent
+					const double SurfaceUU = Terrain->GetSurfaceHeightUU(SpawnX, SpawnY);
+
+					// (a) A plain CA-fill pour -- irreducible simulation state that
+					// is NOT re-derivable from seed+edit-log, exactly the thing
+					// ADR-0005 exists to persist. 30,000 units keeps enough above
+					// the mesher's fill>=128 threshold (see -VoxelSpawnWaterTest).
+					const uint32 Placed = Water->SpawnWaterAt(FVector(SpawnX, SpawnY, SurfaceUU + 500.0), 30000);
+
+					// (b) Best-effort: drain a flooded cavern near spawn so the
+					// blob also carries MOBILIZED water (the ADR's headline case:
+					// mobilized set WITHOUT the CA fill destroys the lake on
+					// reload). Carving fires the terrain-edit hooks that mobilize.
+					// If none is reachable/resident this logs and is skipped -- the
+					// pour alone still proves the round trip.
+					FVector LakeSurface = FVector::ZeroVector;
+					if (Water->FindFloodedCavernNear(FVector(SpawnX, SpawnY, SurfaceUU), 60000.0, LakeSurface))
+					{
+						const int32 Removed = Water->CarveCavernOutflow(LakeSurface);
+						UE_LOG(LogVoxelEarth, Log, TEXT("VoxelWaterPersistTest: cavern-outflow carve removed %d voxel(s)."), Removed);
+					}
+
+					int32 MobBricks = 0; uint64 Deb = 0, Cred = 0, Short = 0;
+					Water->GetMobilizationStats(MobBricks, Deb, Cred, Short);
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelWaterPersistTest: poured %u fill units; pre-settle volume=%llu mobilized=%d shortfall=%llu"),
+					       Placed, (unsigned long long)Water->GetPerfSnapshot().TotalVolume, MobBricks, (unsigned long long)Short);
+
+					// Let the CA settle, then save + verify the disk round trip.
+					GetWorldTimerManager().SetTimer(
+						WaterPersistTestSaveTimerHandle,
+						FTimerDelegate::CreateWeakLambda(this,
+							[this]()
+							{
+								UWorld* SW = GetWorld();
+								UVoxelWaterSubsystem* SWater = SW ? SW->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+								if (!SWater)
+								{
+									return;
+								}
+								const bool bSaved = SWater->SaveWaterState();
+
+								uint64 LiveDig = 0, RelDig = 0, LiveVol = 0, RelVol = 0;
+								int32 LiveMob = 0, RelMob = 0;
+								const bool bRT = SWater->VerifyWaterDiskRoundTrip(LiveDig, RelDig, LiveVol, RelVol, LiveMob, RelMob);
+								const bool bMatch = bRT && LiveDig == RelDig && LiveVol == RelVol && LiveMob == RelMob;
+								UE_LOG(LogVoxelEarth, Log,
+								       TEXT("VoxelWaterPersistTest: save=%s roundTrip=%s -- live[digest=0x%016llX vol=%llu mob=%d] ")
+								       TEXT("reloaded[digest=0x%016llX vol=%llu mob=%d] => %s"),
+								       bSaved ? TEXT("OK") : TEXT("FAILED"), bRT ? TEXT("read-back OK") : TEXT("read-back FAILED"),
+								       (unsigned long long)LiveDig, (unsigned long long)LiveVol, LiveMob,
+								       (unsigned long long)RelDig, (unsigned long long)RelVol, RelMob,
+								       bMatch ? TEXT("PASS (drained/poured state survives serialize->disk->reload)")
+								              : TEXT("FAIL (water state did NOT survive the round trip)"));
+
+								GetWorldTimerManager().SetTimer(
+									WaterPersistTestQuitTimerHandle,
+									FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(/*bForce*/ false); }), 5.f, false);
+							}),
+						30.f, false);
+				}),
+			WaterPersistDelaySeconds, false);
+	}
+
+	// ADR-0005 cross-process reload half: -VoxelWaterLoadCheck[=<delaySeconds>]
+	// (default 10s) logs the water state the OnWorldBeginPlay load path restored
+	// from the on-disk .vxwater (volume/digest/mobilized), then quits. Launch it
+	// on the SAME seed after a -VoxelWaterPersistTest run to prove the drained/
+	// poured water genuinely came back across a process boundary (and, when the
+	// blob is absent/stale, that the loud implicit fallback fires).
+	float WaterLoadCheckDelaySeconds = 10.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterLoadCheck="), WaterLoadCheckDelaySeconds) ||
+	    FParse::Param(FCommandLine::Get(), TEXT("VoxelWaterLoadCheck")))
+	{
+		GetWorldTimerManager().SetTimer(
+			WaterLoadCheckTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this]()
+				{
+					UWorld* LW = GetWorld();
+					UVoxelWaterSubsystem* LWater = LW ? LW->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+					if (!LWater)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelWaterLoadCheck: no water subsystem, skipping."));
+						return;
+					}
+					const FVoxelWaterPerfSnapshot Snap = LWater->GetPerfSnapshot();
+					int32 MobBricks = 0; uint64 Deb = 0, Cred = 0, Short = 0;
+					LWater->GetMobilizationStats(MobBricks, Deb, Cred, Short);
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelWaterLoadCheck: restored-from-disk water state storedBricks=%lld volume=%llu mobilized=%d ")
+					       TEXT("digest=0x%016llX (nonzero volume/mobilized => the drained/poured state survived the reload)"),
+					       Snap.StoredBricks, (unsigned long long)Snap.TotalVolume, MobBricks,
+					       (unsigned long long)LWater->GetWaterDigest());
+
+					GetWorldTimerManager().SetTimer(
+						WaterLoadCheckQuitTimerHandle,
+						FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(/*bForce*/ false); }), 5.f, false);
+				}),
+			WaterLoadCheckDelaySeconds, false);
 	}
 
 	// W2 verification (task item 5b): -VoxelBreachTest[=<delaySeconds>]
@@ -3332,8 +3473,67 @@ void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCameraHigh override: spawning %.0fm above the surface"), CameraHighMeters);
 	}
 
+	// GetSurfaceHeightUU is the PURE WORLDGEN column height -- it ignores caving.
+	// At a column where a cavern or cave void breaches down from (or up to) the
+	// surface, the worldgen surface is open air and a pawn spawned there+5m falls
+	// tens of metres and grounds on the cavern floor, enclosed by rock walls
+	// (originally observed at -VoxelSpawnAt=-66240,67200, which has since drifted
+	// to open ground under later worldgen; a currently-carved column is
+	// (116.7,-96.3) m -- worldgen surface 1077.4 m, true walkable surface 16.0 m
+	// below). Ground the pawn on the ACTUAL walkable surface
+	// instead: the highest solid voxel of the column that has air directly above
+	// it -- which is where a falling pawn would come to rest anyway, so this
+	// removes the long drop rather than changing where the pawn ends up.
 	const double SurfaceUU = Subsystem->GetSurfaceHeightUU(SpawnWorldX, SpawnWorldY);
-	const FVector SpawnLocation(SpawnWorldX, SpawnWorldY, SurfaceUU + SpawnHeightAboveSurfaceUU);
+	double GroundTopUU = SurfaceUU; // default / open-ground: worldgen surface, unchanged
+	{
+		const int64 Vx = int64(FMath::FloorToDouble(SpawnWorldX / VoxelCoords::VoxelSizeUU));
+		const int64 Vy = int64(FMath::FloorToDouble(SpawnWorldY / VoxelCoords::VoxelSizeUU));
+		// Start a couple of voxels ABOVE the worldgen surface so a column with a
+		// little placed/overhang material above it is still caught, and scan down.
+		const int64 TopVz = int64(FMath::CeilToDouble(SurfaceUU / VoxelCoords::VoxelSizeUU)) + 2;
+		// ~600 m of downward reach: far past the ~24 m cavern in the report and
+		// past any plausible near-surface void, still a cheap bounded probe (a few
+		// thousand IsSolidAtVoxel calls, worldgen-cheap, once per pawn spawn).
+		constexpr int64 MaxScanVoxels = 6000;
+		int64 FoundVz = INT64_MIN;
+		for (int64 Vz = TopVz; Vz >= TopVz - MaxScanVoxels; --Vz)
+		{
+			if (Subsystem->IsSolidAtVoxel(Vx, Vy, Vz) && !Subsystem->IsSolidAtVoxel(Vx, Vy, Vz + 1))
+			{
+				FoundVz = Vz;
+				break;
+			}
+		}
+		if (FoundVz != INT64_MIN)
+		{
+			const double TrueTopUU = double(FoundVz + 1) * VoxelCoords::VoxelSizeUU;
+			// Only override when the real walkable surface is meaningfully BELOW
+			// the worldgen surface (a genuine carved column). For ordinary open
+			// ground the two coincide to within a voxel, and keeping SurfaceUU
+			// verbatim there leaves every existing spawn and headless fixture
+			// (which assume the worldgen-surface spawn) byte-for-byte unchanged.
+			if (TrueTopUU < SurfaceUU - VoxelCoords::VoxelSizeUU)
+			{
+				GroundTopUU = TrueTopUU;
+				UE_LOG(LogVoxelEarth, Log,
+				       TEXT("Spawn column (%.1f, %.1f) m is carved: worldgen surface z=%.1f m but the true walkable surface ")
+				       TEXT("(top solid voxel with air above) is z=%.1f m, %.1f m down -- grounding the pawn there instead of ")
+				       TEXT("dropping it through the void."),
+				       SpawnWorldX / 100.0, SpawnWorldY / 100.0, SurfaceUU / 100.0, TrueTopUU / 100.0,
+				       (SurfaceUU - TrueTopUU) / 100.0);
+			}
+		}
+		else
+		{
+			UE_LOG(LogVoxelEarth, Warning,
+			       TEXT("Spawn column (%.1f, %.1f) m: no solid voxel found within %.0f m below the worldgen surface -- ")
+			       TEXT("using the worldgen surface height as the spawn ground."),
+			       SpawnWorldX / 100.0, SpawnWorldY / 100.0, double(MaxScanVoxels) * VoxelCoords::VoxelSizeUU / 100.0);
+		}
+	}
+
+	const FVector SpawnLocation(SpawnWorldX, SpawnWorldY, GroundTopUU + SpawnHeightAboveSurfaceUU);
 	const FTransform SpawnTransform(FRotator::ZeroRotator, SpawnLocation);
 
 	RestartPlayerAtTransform(NewPlayer, SpawnTransform);
