@@ -1080,6 +1080,18 @@ struct FChunkRecord
 	// the pre-change behaviour and the path for genuinely-gone chunks once their
 	// grace elapses).
 	float RetainUntilSeconds = -1000.f;
+
+	// Which LOD replaced this chunk when it was retained: RetainDir_Finer (a
+	// finer ring took over from the inside) or RetainDir_Coarser (a coarser ring
+	// from the outside). Tells ReplacementCovered which neighbour columns to
+	// check. 0 (RetainDir_None) = not an LOD-transition retention. RetainUntil-
+	// Seconds above is now a SAFETY CAP; the primary release is coverage-based.
+	uint8 RetainReplaceDir = 0;
+
+	// True iff this record currently contributes to ColumnGeomCount (applied
+	// component with LastQuadCount>0). Makes ReconcileColumnGeom idempotent so
+	// callers pass only the current has-geometry state.
+	bool bColumnCounted = false;
 };
 
 // --- Buried-chunk pre-dispatch skip -----------------------------------------
@@ -2340,6 +2352,15 @@ struct FVoxelWorldImpl
 	// has no UWorld& handy outside Tick/TickStreaming's parameters), used only
 	// for chunk-state tint flash decay timing.
 	float ElapsedSeconds = 0.f;
+
+	// Load-before-unload coverage index (streaming pass / ADR-0006). Keyed by
+	// (level, chunkX, chunkY) ignoring Z; value = number of resident records in
+	// that XY column currently contributing visible geometry (LastQuadCount>0).
+	// ReplacementCovered consults it so a retained stand-in chunk is parked the
+	// instant its replacement LOD's footprint is actually on screen -- coverage,
+	// not a timer. Game-thread only (every mutator/reader runs on the game
+	// thread). Maintained via ReconcileColumnGeom at the geometry gain/loss sites.
+	TMap<FIntVector, int32> ColumnGeomCount;
 
 	int64 ResidentQuads = 0;         // sum of FChunkRecord::LastQuadCount across every tracked record with a live component
 	int64 StaleResultsDiscarded = 0; // cumulative worker results dropped (chunk left the desired set, or superseded by an edit)
@@ -4209,6 +4230,11 @@ bool FVoxelWorldImpl::EvaluateAnchorUnderground(const FVector& Anchor) const
 	                          : (DepthUU > VoxelUnderground::EnterDepthUU);
 }
 
+// Load-before-unload replacement direction (FChunkRecord::RetainReplaceDir).
+// File scope so RecomputeDesiredSet (stamps it), ReplacementCovered (reads it),
+// and DrainUnloads (gates on it) all see it unqualified.
+enum : uint8 { RetainDir_None = 0, RetainDir_Finer = 1, RetainDir_Coarser = 2 };
+
 void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 {
 	using namespace VoxelCoords;
@@ -4305,6 +4331,11 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				if (RetentionSeconds > 0.f)
 				{
 					Rec.RetainUntilSeconds = ElapsedSeconds + RetentionSeconds;
+					// bInsideInner -> a FINER ring took over (check L-1 children);
+					// otherwise bBeyondOuter -> a COARSER ring took over (check the
+					// L+1 parent). ReplacementCovered uses this to release the
+					// stand-in the instant its replacement is on screen.
+					Rec.RetainReplaceDir = bInsideInner ? RetainDir_Finer : RetainDir_Coarser;
 				}
 			}
 			PendingUnloadKeys.Add(LevelKey);
@@ -4810,6 +4841,94 @@ static uint8 ComputeRingSkirtMask(const VoxelCoords::FVoxelLevelChunkKey& LevelK
 	if (NeighbourIsFiner(Cx, Cy - 1)) Mask |= RingSkirt_NegY;
 	if (NeighbourIsFiner(Cx, Cy + 1)) Mask |= RingSkirt_PosY;
 	return Mask;
+}
+
+// --- load-before-unload coverage index ----------------------------------
+//
+// A retained stand-in chunk (RecomputeDesiredSet kept it drawn when an LOD ring
+// took over its footprint) must be parked the instant its REPLACEMENT LOD is
+// actually on screen -- not after a fixed timer, which under fast movement
+// expires mid-transition and leaves a rolling ring of holes. ColumnGeomCount
+// tracks, per (level, chunkX, chunkY) XY column, how many resident records
+// currently contribute geometry; ReplacementCovered reads it to decide coverage.
+namespace
+{
+FIntVector ChunkColumnKey(const VoxelCoords::FVoxelLevelChunkKey& K)
+{
+	return FIntVector(K.Level, K.Key.X, K.Key.Y);
+}
+
+bool ColumnHasGeom(const TMap<FIntVector, int32>& Map, int32 L, int32 X, int32 Y)
+{
+	const int32* P = Map.Find(FIntVector(L, X, Y));
+	return P && *P > 0;
+}
+
+// Is the retained chunk's footprint now covered by resident geometry at the LOD
+// that replaced it? Finer took over -> all four child XY sub-columns at L-1 must
+// have geometry. Coarser took over -> the single parent XY column at L+1 must.
+// Edge levels, or a genuinely empty sub-column (e.g. a coastal quarter that is
+// all ocean and never grows a land chunk), never report covered here -- the
+// DrainUnloads safety cap parks those instead, so a never-covered footprint can
+// hold a stand-in for at most voxel.Stream.LodRetentionMs.
+bool ReplacementCovered(const TMap<FIntVector, int32>& Map,
+                        const VoxelCoords::FVoxelLevelChunkKey& Key, uint8 Dir)
+{
+	const int32 L = Key.Level, X = Key.Key.X, Y = Key.Key.Y;
+	if (Dir == RetainDir_Finer)
+	{
+		if (L == 0) return true; // nothing finer exists to wait for
+		for (int32 dx = 0; dx < 2; ++dx)
+		{
+			for (int32 dy = 0; dy < 2; ++dy)
+			{
+				if (!ColumnHasGeom(Map, L - 1, X * 2 + dx, Y * 2 + dy))
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+	if (Dir == RetainDir_Coarser)
+	{
+		if (L >= VoxelCoords::kNumLevels - 1) return true; // outermost: nothing coarser
+		return ColumnHasGeom(Map, L + 1, X >> 1, Y >> 1); // >> floors for negatives too
+	}
+	return true;
+}
+} // namespace
+
+// Reconcile one record's contribution to ColumnGeomCount. Idempotent via
+// Rec.bColumnCounted, so callers pass only the current has-geometry state; call
+// it wherever a record's LastQuadCount crosses 0 (gain on apply, loss on
+// park/skip/edit-to-empty). Free function on the map so it needs no method decl.
+static void ReconcileColumnGeom(TMap<FIntVector, int32>& Map,
+                                const VoxelCoords::FVoxelLevelChunkKey& Key,
+                                VoxelStreaming::FChunkRecord& Rec, bool bHasGeom)
+{
+	if (bHasGeom == Rec.bColumnCounted)
+	{
+		return;
+	}
+	const FIntVector Col = ChunkColumnKey(Key);
+	if (bHasGeom)
+	{
+		Map.FindOrAdd(Col) += 1;
+		Rec.bColumnCounted = true;
+	}
+	else if (int32* P = Map.Find(Col))
+	{
+		if (--(*P) <= 0)
+		{
+			Map.Remove(Col);
+		}
+		Rec.bColumnCounted = false;
+	}
+	else
+	{
+		Rec.bColumnCounted = false;
+	}
 }
 
 // --- budgeted drains ----------------------------------------------------
@@ -5327,6 +5446,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			ReturnChunkComponentToPool(*Existing);
 		}
 		Rec.Component = nullptr;
+		ReconcileColumnGeom(ColumnGeomCount, Key, Rec, false); // lost visible geometry
 		return false;
 	}
 
@@ -5356,6 +5476,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	TotalQuadsLoaded += Quads.Num();
 	Rec.LastQuadCount = Quads.Num();
 	ResidentQuads += Rec.LastQuadCount;
+	ReconcileColumnGeom(ColumnGeomCount, Key, Rec, true); // gained visible geometry (covers coarser/finer stand-ins)
 	Comp->SetChunkQuads(MoveTemp(Quads), VoxelCoords::ChunkEdgeVoxels);
 
 	// docs/debug-tooling-plan.md P1 chunk-state tints: "just-loaded" fires on
@@ -5690,13 +5811,19 @@ void FVoxelWorldImpl::DrainUnloads()
 		// tracked and re-queue it for the next frame (do NOT drop the chunk).
 		if (Rec->Component.IsValid())
 		{
-			// Load-before-unload (voxel.Stream.LodRetentionMs): still inside the
-			// stand-in grace window stamped by RecomputeDesiredSet -> keep this
-			// chunk drawn so its replacement LOD can stream in without a hole.
-			// Defer the park (does NOT consume the render unload budget). Chunks
-			// that were never retained have RetainUntilSeconds far in the past, so
-			// they fall straight through to the normal park path.
-			if (ElapsedSeconds < Rec->RetainUntilSeconds)
+			// Load-before-unload: keep this chunk drawn as a stand-in until its
+			// replacement LOD actually covers its footprint (coverage-based
+			// release -- no fixed-timer rolling ring of holes). The park is
+			// deferred while: still inside the safety cap (voxel.Stream.
+			// LodRetentionMs, a backstop against a never-covered footprint such as
+			// a coastal all-ocean quarter) AND this was an LOD transition AND the
+			// replacement is not yet on screen. Once covered -- or the safety cap
+			// elapses -- it falls through to the normal park. Chunks that were
+			// never retained have RetainUntilSeconds far in the past, so they park
+			// immediately as before.
+			if (ElapsedSeconds < Rec->RetainUntilSeconds &&
+			    Rec->RetainReplaceDir != RetainDir_None &&
+			    !ReplacementCovered(ColumnGeomCount, Key, Rec->RetainReplaceDir))
 			{
 				Deferred.Add(Key); // stays tracked + visible, retried next frame
 				continue;
@@ -5717,6 +5844,7 @@ void FVoxelWorldImpl::DrainUnloads()
 
 		PendingUnloadSet.Remove(Key);
 		ResidentQuads -= Rec->LastQuadCount;
+		ReconcileColumnGeom(ColumnGeomCount, Key, *Rec, false); // record leaving: drop its column contribution
 		ChunkRecords.Remove(Key);
 		++TotalChunksUnloaded;
 		++RecordsEvictedSinceLog;

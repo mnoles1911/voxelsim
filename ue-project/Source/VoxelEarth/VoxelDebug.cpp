@@ -104,14 +104,14 @@ TAutoConsoleVariable<float> CVarVoxelStreamApplyBudgetMs(
 
 TAutoConsoleVariable<float> CVarVoxelStreamLodRetentionMs(
 	TEXT("voxel.Stream.LodRetentionMs"),
-	1000.0f,
-	TEXT("Load-before-unload (2026-07-24 streaming-speed pass): when a VISIBLE chunk is evicted because a different ")
-	TEXT("LOD ring took over its footprint (moving toward -> finer ring, or away -> coarser ring), keep it drawn as a ")
-	TEXT("stand-in for this many ms before parking it, so its not-yet-loaded replacement has time to stream in. This ")
-	TEXT("is what removes the holes that open while walking/flying: you keep seeing the old (coarser but present) ")
-	TEXT("terrain until the new LOD lands, instead of a hole. Cost: a brief coarse+fine double-draw at the boundary ")
-	TEXT("during the window (minor shimmer, no hole) and a bounded rise in resident chunks (~eviction-rate * this). ")
-	TEXT("0 disables (revert to immediate unload). Raise if fast flight still flashes holes; lower to trim overlap."),
+	5000.0f,
+	TEXT("Load-before-unload SAFETY CAP (2026-07-24 streaming-speed pass). When a VISIBLE chunk is evicted because a ")
+	TEXT("different LOD ring took over its footprint (toward -> finer, away -> coarser), it is kept drawn as a stand-in ")
+	TEXT("until its replacement LOD is actually on screen -- COVERAGE-based release (ColumnGeomCount/ReplacementCovered), ")
+	TEXT("not a fixed timer, so there is no rolling ring of holes where a timer would expire mid-transition. This value ")
+	TEXT("is only the backstop: a footprint that never gets covered (e.g. a coastal quarter that is all ocean) is parked ")
+	TEXT("after this many ms so resident chunks cannot grow unbounded. Cost: brief coarse+fine double-draw at the ")
+	TEXT("boundary until coverage (minor shimmer, no hole). 0 disables retention entirely (immediate unload = holes)."),
 	ECVF_Default);
 
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxRemeshesPerFrame(
