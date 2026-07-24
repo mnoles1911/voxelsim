@@ -80,29 +80,55 @@ TAutoConsoleVariable<int32> CVarVoxelWaterMaxActiveBricks(
 
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxAppliesPerFrame(
 	TEXT("voxel.Stream.MaxAppliesPerFrame"),
-	3,
-	TEXT("Hitch isolation (docs/status.md 'Perf-run hitches'): max worker-mesh-result chunk-component applies ")
-	TEXT("(FVoxelWorldImpl::DrainResults) per frame. Lower to smooth proxy-creation/scene-mutation cost more evenly ")
-	TEXT("across frames. Was a compile-time constant of 8 (docs/m1-plan.md Stage 2); measured 2026-07-20 ")
-	TEXT("(-VoxelPerfRun hitch-attribution log) that EVERY hitch frame had this budget pinned at its cap, with the ")
-	TEXT("actual cost surfacing later as game-thread time OUTSIDE the subsystem tick (render-thread scene-mutation ")
-	TEXT("backlog) rather than in DrainResults itself -- tightened to 3 to spread that load thinner (steady-state ")
-	TEXT("hitches ~27->0-1 per 60s run at this value; see the M1 gate row in docs/status.md for the full trade)."),
+	64,
+	TEXT("Streaming throughput: HARD CEILING on worker-mesh-result chunk-component applies ")
+	TEXT("(FVoxelWorldImpl::DrainResults) per frame. As of the 2026-07-24 streaming-speed pass this is a safety ")
+	TEXT("ceiling, not the steady-state throttle -- the loop drains until voxel.Stream.ApplyBudgetMs of wall-clock ")
+	TEXT("is spent (or the queue empties, or this ceiling is hit), whichever comes first. History: constant 8 ")
+	TEXT("(m1-plan Stage 2) -> 3 (hitch isolation, 2026-07-20) starved fill to ~180 chunks/s, taking MINUTES to ")
+	TEXT("fill the ring cascade and leaving 1-2 min bare-terrain lag on every LOD upgrade. Raised + time-budgeted ")
+	TEXT("(Matt directive: prioritize silky/fast streaming, tolerate rare hitches during the initial load storm; ")
+	TEXT("steady state stays smooth because the queue is small so neither cap binds)."),
+	ECVF_Default);
+
+TAutoConsoleVariable<float> CVarVoxelStreamApplyBudgetMs(
+	TEXT("voxel.Stream.ApplyBudgetMs"),
+	6.0f,
+	TEXT("Streaming throughput (2026-07-24 pass): max WALL-CLOCK milliseconds FVoxelWorldImpl::DrainResults may spend ")
+	TEXT("applying finished chunk meshes to the scene per frame. The loop always applies at least a small floor for ")
+	TEXT("forward progress, then keeps going while under this budget, up to voxel.Stream.MaxAppliesPerFrame. Because ")
+	TEXT("the true proxy-create/GPU-upload cost partly surfaces on the render thread a frame or two later, a large ")
+	TEXT("budget during a load storm can hitch -- that is the accepted trade for fast fill. Lower it to protect frame ")
+	TEXT("pacing at the cost of slower fill; raise it to fill harder."),
+	ECVF_Default);
+
+TAutoConsoleVariable<float> CVarVoxelStreamLodRetentionMs(
+	TEXT("voxel.Stream.LodRetentionMs"),
+	5000.0f,
+	TEXT("Load-before-unload SAFETY CAP (2026-07-24 streaming-speed pass). When a VISIBLE chunk is evicted because a ")
+	TEXT("different LOD ring took over its footprint (toward -> finer, away -> coarser), it is kept drawn as a stand-in ")
+	TEXT("until its replacement LOD is actually on screen -- COVERAGE-based release (ColumnGeomCount/ReplacementCovered), ")
+	TEXT("not a fixed timer, so there is no rolling ring of holes where a timer would expire mid-transition. This value ")
+	TEXT("is only the backstop: a footprint that never gets covered (e.g. a coastal quarter that is all ocean) is parked ")
+	TEXT("after this many ms so resident chunks cannot grow unbounded. Cost: brief coarse+fine double-draw at the ")
+	TEXT("boundary until coverage (minor shimmer, no hole). 0 disables retention entirely (immediate unload = holes)."),
 	ECVF_Default);
 
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxRemeshesPerFrame(
 	TEXT("voxel.Stream.MaxRemeshesPerFrame"),
-	2,
-	TEXT("Hitch isolation: max game-thread overlay-aware edit re-meshes (FVoxelWorldImpl::DrainGameThreadMesh) per ")
-	TEXT("frame. Was a compile-time constant of 4; tightened to 2 alongside MaxAppliesPerFrame (see its comment)."),
+	8,
+	TEXT("Max game-thread overlay-aware edit re-meshes (FVoxelWorldImpl::DrainGameThreadMesh) per frame. History: ")
+	TEXT("constant 4 -> 2 (hitch isolation) -> 8 (2026-07-24 streaming-speed pass, raised alongside MaxAppliesPerFrame ")
+	TEXT("so edited-chunk loads keep pace with the faster clean-chunk apply path)."),
 	ECVF_Default);
 
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxUnloadsPerFrame(
 	TEXT("voxel.Stream.MaxUnloadsPerFrame"),
-	2,
-	TEXT("Hitch isolation: max chunk-component unload events (FVoxelWorldImpl::DrainUnloads -- pool-park, or ")
-	TEXT("DestroyComponent once the pool is at voxel.Stream.ComponentPoolMax) per frame. Was a compile-time constant ")
-	TEXT("of 4; tightened to 2 alongside MaxAppliesPerFrame (see its comment)."),
+	24,
+	TEXT("Max chunk-component unload events (FVoxelWorldImpl::DrainUnloads -- pool-park, or DestroyComponent once the ")
+	TEXT("pool is at voxel.Stream.ComponentPoolMax) per frame. History: constant 4 -> 2 (hitch isolation) -> 24 ")
+	TEXT("(2026-07-24 streaming-speed pass): unloads must keep pace with the raised apply rate or superseded coarse ")
+	TEXT("chunks pile up resident (measured R0 bloating ~4x its desired size, which itself loads the render thread)."),
 	ECVF_Default);
 
 TAutoConsoleVariable<int32> CVarVoxelStreamComponentPoolMax(
@@ -373,6 +399,16 @@ int32 VoxelDebug::GetWaterMaxActiveBricks()
 int32 VoxelDebug::GetStreamMaxAppliesPerFrame()
 {
 	return FMath::Max(1, CVarVoxelStreamMaxAppliesPerFrame.GetValueOnGameThread());
+}
+
+float VoxelDebug::GetStreamApplyBudgetMs()
+{
+	return FMath::Max(0.f, CVarVoxelStreamApplyBudgetMs.GetValueOnGameThread());
+}
+
+float VoxelDebug::GetStreamLodRetentionMs()
+{
+	return FMath::Max(0.f, CVarVoxelStreamLodRetentionMs.GetValueOnGameThread());
 }
 
 int32 VoxelDebug::GetStreamMaxRemeshesPerFrame()

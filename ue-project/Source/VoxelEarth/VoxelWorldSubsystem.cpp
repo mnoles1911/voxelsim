@@ -124,13 +124,35 @@ namespace
 // edited-chunk path calls it with a sampler closed over World::materialAt
 // (overlay-aware). Only the sampler differs -- the mesh-and-bake logic never
 // drifts between the two.
+// Ring-boundary skirt mask bits (VoxelWorldSubsystem.cpp, "voxel cascade seam"
+// fix). A level-L render chunk is meshed with a 1-voxel apron sampled by its
+// OWN level sampler, so at a ring boundary its outward apron is a PHANTOM
+// same-level neighbour -- but the chunk physically abutting it across the seam
+// is a different-resolution ring, sampling the surface at 2x spacing. The two
+// surfaces sit at different heights, and because each side culls its boundary
+// wall against the phantom neighbour, neither emits a wall: the seam is an open
+// edge that reads see-through (ocean shows past the lip) with dangling boundary
+// voxels. Forcing the apron to AIR on exactly the boundary faces makes the
+// mesher emit a watertight vertical wall there (a "skirt"), on BOTH sides of
+// the seam (the finer ring's outer face and the coarser ring's inner face), so
+// whichever ring's surface is higher, a wall closes the gap. Bits are the four
+// lateral chunk faces; Z faces are never ring boundaries (rings are XY annuli).
+enum ERingSkirtFace : uint8
+{
+	RingSkirt_NegX = 1 << 0,
+	RingSkirt_PosX = 1 << 1,
+	RingSkirt_NegY = 1 << 2,
+	RingSkirt_PosY = 1 << 3,
+};
+
 template <typename MaterialFn>
 void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const MaterialFn& MaterialAt, TArray<FVoxelChunkQuad>& OutQuads,
-                      vxc::Counters* PerfCounters = nullptr)
+                      vxc::Counters* PerfCounters = nullptr, uint8 RingSkirtMask = 0)
 {
 	using namespace vxc;
 	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
 	constexpr int32 BricksPerChunk = VoxelCoords::ChunkEdgeBricks;
+	constexpr int32 ChunkVox = BricksPerChunk * B; // 32
 
 	std::vector<Quad> BrickQuads;
 	for (int32 Dz = 0; Dz < BricksPerChunk; ++Dz)
@@ -142,13 +164,37 @@ void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const Material
 				const int64 OriginVX = (int64(ChunkKey.X) * BricksPerChunk + Dx) * int64(B);
 				const int64 OriginVY = (int64(ChunkKey.Y) * BricksPerChunk + Dy) * int64(B);
 				const int64 OriginVZ = (int64(ChunkKey.Z) * BricksPerChunk + Dz) * int64(B);
+				const int32 ChunkBaseX = Dx * B; // this brick's origin in chunk-relative voxels
+				const int32 ChunkBaseY = Dy * B;
 
 				// Sampler valid on [-1,B]^3 (mesher.h contract): MaterialAt
 				// reads straight across brick AND render-chunk borders via
 				// the same deterministic function, so no neighbor data needs
 				// to be materialized just to mesh this one brick.
+				//
+				// Ring-boundary skirt: when a lateral face of THIS render chunk
+				// (chunk-relative coord < 0 or >= ChunkVox on a flagged axis) is
+				// a ring boundary, report the apron there as AIR so the mesher
+				// emits the boundary wall. Only affects reads outside the chunk
+				// (the apron the boundary decision is made from); interior cells
+				// and internal brick borders are untouched, so within-ring chunks
+				// stay byte-for-byte identical.
 				const auto Sampler = [&](int X, int Y, int Z) -> MaterialId
-				{ return MaterialAt(OriginVX + X, OriginVY + Y, OriginVZ + Z); };
+				{
+					if (RingSkirtMask)
+					{
+						const int32 Xc = ChunkBaseX + X;
+						const int32 Yc = ChunkBaseY + Y;
+						if (((RingSkirtMask & RingSkirt_NegX) && Xc < 0) ||
+						    ((RingSkirtMask & RingSkirt_PosX) && Xc >= ChunkVox) ||
+						    ((RingSkirtMask & RingSkirt_NegY) && Yc < 0) ||
+						    ((RingSkirtMask & RingSkirt_PosY) && Yc >= ChunkVox))
+						{
+							return MAT_AIR;
+						}
+					}
+					return MaterialAt(OriginVX + X, OriginVY + Y, OriginVZ + Z);
+				};
 
 				BrickQuads.clear();
 				meshBrick<B>(Sampler, BrickQuads);
@@ -1024,6 +1070,28 @@ struct FChunkRecord
 	// Chunks in the surface band or the skirt are NEVER flagged, so they keep
 	// exactly their pre-change lifetime.
 	bool bDeepAnchorRelative = false;
+
+	// Load-before-unload (voxel.Stream.LodRetentionMs). When an LOD-ring
+	// transition evicts this chunk while it is still VISIBLE (has an applied
+	// component with geometry), RecomputeDesiredSet stamps this to
+	// ElapsedSeconds + retention. DrainUnloads then keeps the chunk drawn (defers
+	// the pool-park) until ElapsedSeconds passes it, giving the replacement LOD
+	// time to stream in so no hole opens. -1000 = not retained (park immediately,
+	// the pre-change behaviour and the path for genuinely-gone chunks once their
+	// grace elapses).
+	float RetainUntilSeconds = -1000.f;
+
+	// Which LOD replaced this chunk when it was retained: RetainDir_Finer (a
+	// finer ring took over from the inside) or RetainDir_Coarser (a coarser ring
+	// from the outside). Tells ReplacementCovered which neighbour columns to
+	// check. 0 (RetainDir_None) = not an LOD-transition retention. RetainUntil-
+	// Seconds above is now a SAFETY CAP; the primary release is coverage-based.
+	uint8 RetainReplaceDir = 0;
+
+	// True iff this record currently contributes to ColumnGeomCount (applied
+	// component with LastQuadCount>0). Makes ReconcileColumnGeom idempotent so
+	// callers pass only the current has-geometry state.
+	bool bColumnCounted = false;
 };
 
 // --- Buried-chunk pre-dispatch skip -----------------------------------------
@@ -1436,6 +1504,16 @@ int32 GetCoarseMinLevel()
 		return FMath::Max(1, Value); // level 0 has its own path; never route it here
 	}();
 	return MinLevel;
+}
+
+// Ring-boundary skirt (see MeshChunkBricks' ERingSkirtFace comment): default ON.
+// -VoxelNoRingSkirt is the A/B control that reverts to the pre-fix open-edge
+// seams (the concentric see-through cracks). Command-line, not a cvar, for the
+// same "lands after streaming starts" reason as the switches above.
+bool RingSkirtEnabled()
+{
+	static const bool bDisabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelNoRingSkirt"));
+	return !bDisabled;
 }
 
 // docs/status.md "Buried-chunk pre-dispatch skip", step 1 (measure before
@@ -2274,6 +2352,15 @@ struct FVoxelWorldImpl
 	// has no UWorld& handy outside Tick/TickStreaming's parameters), used only
 	// for chunk-state tint flash decay timing.
 	float ElapsedSeconds = 0.f;
+
+	// Load-before-unload coverage index (streaming pass / ADR-0006). Keyed by
+	// (level, chunkX, chunkY) ignoring Z; value = number of resident records in
+	// that XY column currently contributing visible geometry (LastQuadCount>0).
+	// ReplacementCovered consults it so a retained stand-in chunk is parked the
+	// instant its replacement LOD's footprint is actually on screen -- coverage,
+	// not a timer. Game-thread only (every mutator/reader runs on the game
+	// thread). Maintained via ReconcileColumnGeom at the geometry gain/loss sites.
+	TMap<FIntVector, int32> ColumnGeomCount;
 
 	int64 ResidentQuads = 0;         // sum of FChunkRecord::LastQuadCount across every tracked record with a live component
 	int64 StaleResultsDiscarded = 0; // cumulative worker results dropped (chunk left the desired set, or superseded by an edit)
@@ -4143,6 +4230,11 @@ bool FVoxelWorldImpl::EvaluateAnchorUnderground(const FVector& Anchor) const
 	                          : (DepthUU > VoxelUnderground::EnterDepthUU);
 }
 
+// Load-before-unload replacement direction (FChunkRecord::RetainReplaceDir).
+// File scope so RecomputeDesiredSet (stamps it), ReplacementCovered (reads it),
+// and DrainUnloads (gates on it) all see it unqualified.
+enum : uint8 { RetainDir_None = 0, RetainDir_Finer = 1, RetainDir_Coarser = 2 };
+
 void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 {
 	using namespace VoxelCoords;
@@ -4190,7 +4282,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// still inside the unload ring stay tracked untouched -- this is the
 	// same hysteresis gap the original single-ring code had, now evaluated
 	// per level.
-	for (const auto& Pair : ChunkRecords)
+	for (auto& Pair : ChunkRecords)
 	{
 		const FVoxelLevelChunkKey& LevelKey = Pair.Key;
 		if (PendingUnloadSet.Contains(LevelKey))
@@ -4222,6 +4314,30 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		}
 		if (bBeyondOuter || bInsideInner || bBeyondVertical)
 		{
+			// Load-before-unload (voxel.Stream.LodRetentionMs): if this eviction
+			// is an LOD-ring TRANSITION (a finer ring took over from the inside,
+			// or a coarser ring from the outside) and the chunk is still visible
+			// (live component with geometry), keep it drawn as a stand-in until
+			// its replacement can stream in -- DrainUnloads reads RetainUntilSeconds
+			// and defers the actual park. A purely-vertical underground exit has no
+			// coincident surface replacement, so it is NOT retained (nothing would
+			// cover it; retaining would only delay cleanup). A zero-quad chunk
+			// shows nothing, so there is no hole to bridge -- also not retained.
+			const bool bLodTransition = bBeyondOuter || bInsideInner;
+			auto& Rec = Pair.Value;
+			if (bLodTransition && Rec.Component.IsValid() && Rec.LastQuadCount > 0)
+			{
+				const float RetentionSeconds = VoxelDebug::GetStreamLodRetentionMs() / 1000.f;
+				if (RetentionSeconds > 0.f)
+				{
+					Rec.RetainUntilSeconds = ElapsedSeconds + RetentionSeconds;
+					// bInsideInner -> a FINER ring took over (check L-1 children);
+					// otherwise bBeyondOuter -> a COARSER ring took over (check the
+					// L+1 parent). ReplacementCovered uses this to release the
+					// stand-in the instant its replacement is on screen.
+					Rec.RetainReplaceDir = bInsideInner ? RetainDir_Finer : RetainDir_Coarser;
+				}
+			}
 			PendingUnloadKeys.Add(LevelKey);
 			PendingUnloadSet.Add(LevelKey);
 			EvictedThisCall.Add(LevelKey);
@@ -4676,6 +4792,145 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 	}
 }
 
+// Which of a render chunk's four lateral faces abut a DIFFERENT cascade ring
+// (or the clipmap/void past the outermost ring), i.e. where the neighbour chunk
+// at THIS level does not belong to this level's annulus. Those faces get the
+// ring-boundary skirt (see MeshChunkBricks' ERingSkirtFace comment). Uses the
+// exact annulus-membership test RecomputeDesiredSet admits candidates with, so
+// a set bit means precisely "RecomputeDesiredSet would not have placed a
+// same-level chunk across this face" -- the definition of a ring boundary.
+// Computed on the game thread at dispatch (anchor is fixed for the job) and
+// baked into the mesh; a chunk that later changes ring membership is unloaded
+// and re-meshed via the desired-set delta, so the baked mask never goes stale
+// while the chunk is resident.
+static uint8 ComputeRingSkirtMask(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, const FVector& Anchor)
+{
+	if (!VoxelStreamAdmission::RingSkirtEnabled())
+	{
+		return 0;
+	}
+	const int32 Level = LevelKey.Level;
+	if (Level == 0)
+	{
+		return 0; // finest ring: nothing finer sits inside it, so no seam to retain
+	}
+	const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[Level];
+	const double InnerSq = FMath::Square(Preset.InnerMeters * 100.0);
+	const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
+	// A face is retained only when the neighbour across it belongs to a FINER
+	// ring (its chunk centre falls inside this ring's inner hole). That is the
+	// side whose covering wall faces the camera (inward, -radius): the coarser
+	// ring drops an inward retaining wall down to meet the finer surface, which
+	// is what actually closes the see-through. The finer ring's OUTER edge needs
+	// no wall -- its outward-facing wall would be back-face culled, and the
+	// coarser ring physically overlaps just beyond it (both admitted by centre
+	// distance, and the coarser chunk is 2x wider), so the finer lip is backed
+	// by coarse terrain rather than ocean.
+	const auto NeighbourIsFiner = [&](int32 Cx, int32 Cy) -> bool
+	{
+		const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
+		const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
+		const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
+		return DistSq < InnerSq; // inside this ring's hole -> covered by a finer ring
+	};
+	const int32 Cx = LevelKey.Key.X;
+	const int32 Cy = LevelKey.Key.Y;
+	uint8 Mask = 0;
+	if (NeighbourIsFiner(Cx - 1, Cy)) Mask |= RingSkirt_NegX;
+	if (NeighbourIsFiner(Cx + 1, Cy)) Mask |= RingSkirt_PosX;
+	if (NeighbourIsFiner(Cx, Cy - 1)) Mask |= RingSkirt_NegY;
+	if (NeighbourIsFiner(Cx, Cy + 1)) Mask |= RingSkirt_PosY;
+	return Mask;
+}
+
+// --- load-before-unload coverage index ----------------------------------
+//
+// A retained stand-in chunk (RecomputeDesiredSet kept it drawn when an LOD ring
+// took over its footprint) must be parked the instant its REPLACEMENT LOD is
+// actually on screen -- not after a fixed timer, which under fast movement
+// expires mid-transition and leaves a rolling ring of holes. ColumnGeomCount
+// tracks, per (level, chunkX, chunkY) XY column, how many resident records
+// currently contribute geometry; ReplacementCovered reads it to decide coverage.
+namespace
+{
+FIntVector ChunkColumnKey(const VoxelCoords::FVoxelLevelChunkKey& K)
+{
+	return FIntVector(K.Level, K.Key.X, K.Key.Y);
+}
+
+bool ColumnHasGeom(const TMap<FIntVector, int32>& Map, int32 L, int32 X, int32 Y)
+{
+	const int32* P = Map.Find(FIntVector(L, X, Y));
+	return P && *P > 0;
+}
+
+// Is the retained chunk's footprint now covered by resident geometry at the LOD
+// that replaced it? Finer took over -> all four child XY sub-columns at L-1 must
+// have geometry. Coarser took over -> the single parent XY column at L+1 must.
+// Edge levels, or a genuinely empty sub-column (e.g. a coastal quarter that is
+// all ocean and never grows a land chunk), never report covered here -- the
+// DrainUnloads safety cap parks those instead, so a never-covered footprint can
+// hold a stand-in for at most voxel.Stream.LodRetentionMs.
+bool ReplacementCovered(const TMap<FIntVector, int32>& Map,
+                        const VoxelCoords::FVoxelLevelChunkKey& Key, uint8 Dir)
+{
+	const int32 L = Key.Level, X = Key.Key.X, Y = Key.Key.Y;
+	if (Dir == RetainDir_Finer)
+	{
+		if (L == 0) return true; // nothing finer exists to wait for
+		for (int32 dx = 0; dx < 2; ++dx)
+		{
+			for (int32 dy = 0; dy < 2; ++dy)
+			{
+				if (!ColumnHasGeom(Map, L - 1, X * 2 + dx, Y * 2 + dy))
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+	if (Dir == RetainDir_Coarser)
+	{
+		if (L >= VoxelCoords::kNumLevels - 1) return true; // outermost: nothing coarser
+		return ColumnHasGeom(Map, L + 1, X >> 1, Y >> 1); // >> floors for negatives too
+	}
+	return true;
+}
+} // namespace
+
+// Reconcile one record's contribution to ColumnGeomCount. Idempotent via
+// Rec.bColumnCounted, so callers pass only the current has-geometry state; call
+// it wherever a record's LastQuadCount crosses 0 (gain on apply, loss on
+// park/skip/edit-to-empty). Free function on the map so it needs no method decl.
+static void ReconcileColumnGeom(TMap<FIntVector, int32>& Map,
+                                const VoxelCoords::FVoxelLevelChunkKey& Key,
+                                VoxelStreaming::FChunkRecord& Rec, bool bHasGeom)
+{
+	if (bHasGeom == Rec.bColumnCounted)
+	{
+		return;
+	}
+	const FIntVector Col = ChunkColumnKey(Key);
+	if (bHasGeom)
+	{
+		Map.FindOrAdd(Col) += 1;
+		Rec.bColumnCounted = true;
+	}
+	else if (int32* P = Map.Find(Col))
+	{
+		if (--(*P) <= 0)
+		{
+			Map.Remove(Col);
+		}
+		Rec.bColumnCounted = false;
+	}
+	else
+	{
+		Rec.bColumnCounted = false;
+	}
+}
+
 // --- budgeted drains ----------------------------------------------------
 
 void FVoxelWorldImpl::DispatchJobs()
@@ -4915,11 +5170,14 @@ void FVoxelWorldImpl::DispatchJobs()
 		// insert time, EditEpochSnapshot is this moment's value.
 		const std::atomic<uint64>* EditEpochPtr = &EditEpoch;
 		const uint64 EditEpochSnapshot = EditEpoch.load();
+		// Ring-boundary skirt mask -- computed here on the game thread where the
+		// anchor and RingPresets are live, then baked into this job's mesh.
+		const uint8 RingSkirtMask = ComputeRingSkirtMask(LevelKey, LastAnchorLocation);
 
 		UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
 			TEXT("VoxelChunkMeshJob"),
 			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
-			 bPredictedEmpty, bComputeBand]()
+			 bPredictedEmpty, bComputeBand, RingSkirtMask]()
 			{
 				SCOPE_CYCLE_COUNTER(STAT_VoxelWorkerJob);
 				const double JobStartSeconds = FPlatformTime::Seconds();
@@ -5049,7 +5307,7 @@ void FVoxelWorldImpl::DispatchJobs()
 					// references, NOT a count of voxel-core-internal column work
 					// (that stays uninstrumented this pass, per P1 scope).
 					PerfCountersPtr->incColumnEvals(uint64_t(GridEdge) * GridEdge);
-					MeshChunkBricks(Key, GridSampler, Result.Quads, PerfCountersPtr);
+					MeshChunkBricks(Key, GridSampler, Result.Quads, PerfCountersPtr, RingSkirtMask);
 					if (bMeasureEmpty && Result.Quads.Num() == 0)
 					{
 						Result.EmptyClass = ClassifyEmpty(GridSampler, Key);
@@ -5081,7 +5339,7 @@ void FVoxelWorldImpl::DispatchJobs()
 						(LevelKey.Level >= VoxelStreamAdmission::GetCoarseMinLevel())
 							? MakeCoarseLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr)
 							: MakeLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot);
-					MeshChunkBricks(Key, LevelSampler, Result.Quads, PerfCountersPtr);
+					MeshChunkBricks(Key, LevelSampler, Result.Quads, PerfCountersPtr, RingSkirtMask);
 					if (bMeasureEmpty && Result.Quads.Num() == 0)
 					{
 						Result.EmptyClass = ClassifyEmpty(LevelSampler, Key);
@@ -5188,6 +5446,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			ReturnChunkComponentToPool(*Existing);
 		}
 		Rec.Component = nullptr;
+		ReconcileColumnGeom(ColumnGeomCount, Key, Rec, false); // lost visible geometry
 		return false;
 	}
 
@@ -5217,6 +5476,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	TotalQuadsLoaded += Quads.Num();
 	Rec.LastQuadCount = Quads.Num();
 	ResidentQuads += Rec.LastQuadCount;
+	ReconcileColumnGeom(ColumnGeomCount, Key, Rec, true); // gained visible geometry (covers coarser/finer stand-ins)
 	Comp->SetChunkQuads(MoveTemp(Quads), VoxelCoords::ChunkEdgeVoxels);
 
 	// docs/debug-tooling-plan.md P1 chunk-state tints: "just-loaded" fires on
@@ -5250,6 +5510,21 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 	// 8) so the ramp's apply rate can be smoothed/tightened without a
 	// recompile (docs/status.md "Perf-run hitches" isolation task).
 	const int32 MaxApplies = VoxelDebug::GetStreamMaxAppliesPerFrame();
+	// Streaming-speed pass (2026-07-24): applies are driven by a per-frame
+	// WALL-CLOCK budget, with MaxApplies as a hard safety ceiling. The old fixed
+	// count of 3 starved fill to ~180 chunks/s (minutes to fill the cascade,
+	// 1-2 min bare-terrain lag on every LOD upgrade). Now: always apply a small
+	// floor (forward progress even if the first chunk is slow), then keep
+	// applying while under ApplyBudgetMs. During a load storm the queue is deep
+	// so this drains hard (fast fill, at the cost of the odd render-thread hitch
+	// -- the accepted trade); in steady state the queue is near-empty so neither
+	// the budget nor the ceiling binds and frame pacing is untouched. Budget is
+	// game-thread wall-clock; the true proxy/GPU-upload cost partly lands on the
+	// render thread a frame or two later, so ApplyBudgetMs is deliberately below
+	// a full frame to leave that backlog room.
+	const double ApplyBudgetSeconds = double(VoxelDebug::GetStreamApplyBudgetMs()) / 1000.0;
+	const double ApplyLoopStart = FPlatformTime::Seconds();
+	constexpr int32 kMinAppliesPerFrame = 4; // forward-progress floor, budget-independent
 	// M1 gate (docs/status.md M1 gate row): MaxApplies gates only the
 	// RENDER-THREAD-FACING applies (ApplyMeshResult -> SetChunkQuads ->
 	// MarkRenderStateDirty -> FScene::AddPrimitive + GPU buffer upload). A
@@ -5269,6 +5544,16 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 	VoxelStreaming::FJobResult Result;
 	while (Applied < MaxApplies && Drains < kMaxResultDrainsPerFrame && ResultsQueue.Dequeue(Result))
 	{
+		// Wall-clock apply budget (see ApplyBudgetSeconds comment). Checked at
+		// the top of each iteration AFTER the min-applies floor: stale discards
+		// below are cheap and don't count against the render budget, but they DO
+		// count toward the wall-clock guard, which is correct -- a frame that
+		// spends its whole budget shovelling stale results should still yield.
+		if (Applied >= kMinAppliesPerFrame &&
+		    (FPlatformTime::Seconds() - ApplyLoopStart) >= ApplyBudgetSeconds)
+		{
+			break;
+		}
 		++Drains;
 		++ResultsDrainedSinceLog;
 
@@ -5526,6 +5811,23 @@ void FVoxelWorldImpl::DrainUnloads()
 		// tracked and re-queue it for the next frame (do NOT drop the chunk).
 		if (Rec->Component.IsValid())
 		{
+			// Load-before-unload: keep this chunk drawn as a stand-in until its
+			// replacement LOD actually covers its footprint (coverage-based
+			// release -- no fixed-timer rolling ring of holes). The park is
+			// deferred while: still inside the safety cap (voxel.Stream.
+			// LodRetentionMs, a backstop against a never-covered footprint such as
+			// a coastal all-ocean quarter) AND this was an LOD transition AND the
+			// replacement is not yet on screen. Once covered -- or the safety cap
+			// elapses -- it falls through to the normal park. Chunks that were
+			// never retained have RetainUntilSeconds far in the past, so they park
+			// immediately as before.
+			if (ElapsedSeconds < Rec->RetainUntilSeconds &&
+			    Rec->RetainReplaceDir != RetainDir_None &&
+			    !ReplacementCovered(ColumnGeomCount, Key, Rec->RetainReplaceDir))
+			{
+				Deferred.Add(Key); // stays tracked + visible, retried next frame
+				continue;
+			}
 			if (ComponentUnloads >= MaxUnloads)
 			{
 				Deferred.Add(Key); // stays in PendingUnloadSet, re-added below
@@ -5542,6 +5844,7 @@ void FVoxelWorldImpl::DrainUnloads()
 
 		PendingUnloadSet.Remove(Key);
 		ResidentQuads -= Rec->LastQuadCount;
+		ReconcileColumnGeom(ColumnGeomCount, Key, *Rec, false); // record leaving: drop its column contribution
 		ChunkRecords.Remove(Key);
 		++TotalChunksUnloaded;
 		++RecordsEvictedSinceLog;

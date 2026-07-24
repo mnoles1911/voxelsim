@@ -222,19 +222,32 @@ namespace VoxelDebug
 	// pre-cvar constants (docs/m1-plan.md Stage 2 decisions table), so leaving
 	// these untouched is a byte-identical no-op.
 
-	// voxel.Stream.MaxAppliesPerFrame: max worker-mesh-result chunk-component
-	// applies (DrainResults) drained per frame. Default 3 (tightened from the
-	// original 8 -- see VoxelDebug.cpp's cvar comment for the measurement).
+	// voxel.Stream.MaxAppliesPerFrame: HARD CEILING on worker-mesh-result
+	// chunk-component applies (DrainResults) per frame. Default 64. As of the
+	// 2026-07-24 streaming-speed pass this is a safety ceiling; the steady-state
+	// throttle is the wall-clock GetStreamApplyBudgetMs below.
 	VOXELEARTH_API int32 GetStreamMaxAppliesPerFrame();
+
+	// voxel.Stream.ApplyBudgetMs: max wall-clock ms DrainResults may spend
+	// applying finished chunks per frame (2026-07-24 pass). Default 6. The loop
+	// applies a small floor for progress, then drains while under this budget up
+	// to GetStreamMaxAppliesPerFrame.
+	VOXELEARTH_API float GetStreamApplyBudgetMs();
+
+	// voxel.Stream.LodRetentionMs: load-before-unload grace (2026-07-24 pass).
+	// A visible chunk evicted by an LOD-ring transition is kept drawn as a
+	// stand-in for this many ms before parking, so its replacement can stream in
+	// without a hole. Default 1000; 0 disables.
+	VOXELEARTH_API float GetStreamLodRetentionMs();
 
 	// voxel.Stream.MaxRemeshesPerFrame: max game-thread overlay-aware edit
 	// re-meshes (DrainGameThreadMesh -- first load of an edited chunk, or a
-	// post-edit dirty re-mesh) applied per frame. Default 2 (was 4).
+	// post-edit dirty re-mesh) applied per frame. Default 8 (2026-07-24 pass).
 	VOXELEARTH_API int32 GetStreamMaxRemeshesPerFrame();
 
 	// voxel.Stream.MaxUnloadsPerFrame: max chunk-component unload events
 	// (DrainUnloads -- pool-park, or DestroyComponent once the pool is at
-	// cap) per frame. Default 2 (was 4).
+	// cap) per frame. Default 24 (2026-07-24 pass -- keep pace with applies).
 	VOXELEARTH_API int32 GetStreamMaxUnloadsPerFrame();
 
 	// voxel.Stream.ComponentPoolMax (M1 hitch-gap wave, docs/status.md M1
