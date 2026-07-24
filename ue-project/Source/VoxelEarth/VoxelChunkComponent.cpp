@@ -825,6 +825,29 @@ namespace
 	constexpr float kInertLowStart = -2.f, kInertLowEnd = -1.f;
 	constexpr float kInertHighStart = 1.e7f, kInertHighEnd = 2.e7f;
 
+	// SEE-THROUGH RING BUG (Matt, 2026-07-24): the M2 cross-dissolve above is
+	// broken by construction and is the DOMINANT cause of the "holes" -- whole
+	// concentric annuli that read fully transparent and shift as the camera
+	// moves. The dither cross-fade only works if the two adjacent LODs OVERLAP
+	// spatially so both cover the fade band (plan SS3.3: "both LODs rendered in
+	// band"). They do NOT: UVoxelWorldSubsystem::RingPresets annuli ABUT exactly
+	// (OuterMeters_L == InnerMeters_{L+1}), zero overlap. So ring L's outer 15%
+	// band fades it to fully transparent over real ground that only ring L
+	// covers -- ring L+1's inner hole is behind it, not ring L+1 terrain -- and
+	// symmetrically for every inner band. The net is a see-through ring at every
+	// boundary, ~15% of each ring's width wide (tens of metres, scaling out),
+	// concentric to and moving with the camera. Until residency is reworked to
+	// make adjacent rings genuinely overlap across the band, the cross-fade is
+	// OFF by default: terrain renders opaque and LOD boundaries are hard pops
+	// (far less objectionable than holes; the ring-boundary skirt still closes
+	// the thin T-junction seam that motivated this branch). -VoxelRingCrossFade
+	// re-enables the old fade as an A/B control.
+	bool RingCrossFadeEnabled()
+	{
+		static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelRingCrossFade"));
+		return bEnabled;
+	}
+
 	// Plan SS3.3: "outer 15-20% of each ring" -- picked the low end of that
 	// range (15%) per the task spec; both the inner fade-in and outer
 	// fade-out bands use it, each sized against that LEVEL's own annulus
@@ -854,6 +877,13 @@ namespace
 		if (!ensure(Level >= 0 && Level < VoxelCoords::kNumLevels))
 		{
 			return Params; // fully inert on both sides -- never reached in practice
+		}
+		// See the RingCrossFadeEnabled comment: the abutting-ring cross-fade
+		// fades real terrain to transparent, so it is disabled by default. The
+		// inert Params (both sides) make OpacityMask saturate to 1 -> opaque.
+		if (!RingCrossFadeEnabled())
+		{
+			return Params;
 		}
 
 		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[Level];
