@@ -5360,6 +5360,21 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 	// 8) so the ramp's apply rate can be smoothed/tightened without a
 	// recompile (docs/status.md "Perf-run hitches" isolation task).
 	const int32 MaxApplies = VoxelDebug::GetStreamMaxAppliesPerFrame();
+	// Streaming-speed pass (2026-07-24): applies are driven by a per-frame
+	// WALL-CLOCK budget, with MaxApplies as a hard safety ceiling. The old fixed
+	// count of 3 starved fill to ~180 chunks/s (minutes to fill the cascade,
+	// 1-2 min bare-terrain lag on every LOD upgrade). Now: always apply a small
+	// floor (forward progress even if the first chunk is slow), then keep
+	// applying while under ApplyBudgetMs. During a load storm the queue is deep
+	// so this drains hard (fast fill, at the cost of the odd render-thread hitch
+	// -- the accepted trade); in steady state the queue is near-empty so neither
+	// the budget nor the ceiling binds and frame pacing is untouched. Budget is
+	// game-thread wall-clock; the true proxy/GPU-upload cost partly lands on the
+	// render thread a frame or two later, so ApplyBudgetMs is deliberately below
+	// a full frame to leave that backlog room.
+	const double ApplyBudgetSeconds = double(VoxelDebug::GetStreamApplyBudgetMs()) / 1000.0;
+	const double ApplyLoopStart = FPlatformTime::Seconds();
+	constexpr int32 kMinAppliesPerFrame = 4; // forward-progress floor, budget-independent
 	// M1 gate (docs/status.md M1 gate row): MaxApplies gates only the
 	// RENDER-THREAD-FACING applies (ApplyMeshResult -> SetChunkQuads ->
 	// MarkRenderStateDirty -> FScene::AddPrimitive + GPU buffer upload). A
@@ -5379,6 +5394,16 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 	VoxelStreaming::FJobResult Result;
 	while (Applied < MaxApplies && Drains < kMaxResultDrainsPerFrame && ResultsQueue.Dequeue(Result))
 	{
+		// Wall-clock apply budget (see ApplyBudgetSeconds comment). Checked at
+		// the top of each iteration AFTER the min-applies floor: stale discards
+		// below are cheap and don't count against the render budget, but they DO
+		// count toward the wall-clock guard, which is correct -- a frame that
+		// spends its whole budget shovelling stale results should still yield.
+		if (Applied >= kMinAppliesPerFrame &&
+		    (FPlatformTime::Seconds() - ApplyLoopStart) >= ApplyBudgetSeconds)
+		{
+			break;
+		}
 		++Drains;
 		++ResultsDrainedSinceLog;
 
