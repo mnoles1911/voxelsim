@@ -124,13 +124,35 @@ namespace
 // edited-chunk path calls it with a sampler closed over World::materialAt
 // (overlay-aware). Only the sampler differs -- the mesh-and-bake logic never
 // drifts between the two.
+// Ring-boundary skirt mask bits (VoxelWorldSubsystem.cpp, "voxel cascade seam"
+// fix). A level-L render chunk is meshed with a 1-voxel apron sampled by its
+// OWN level sampler, so at a ring boundary its outward apron is a PHANTOM
+// same-level neighbour -- but the chunk physically abutting it across the seam
+// is a different-resolution ring, sampling the surface at 2x spacing. The two
+// surfaces sit at different heights, and because each side culls its boundary
+// wall against the phantom neighbour, neither emits a wall: the seam is an open
+// edge that reads see-through (ocean shows past the lip) with dangling boundary
+// voxels. Forcing the apron to AIR on exactly the boundary faces makes the
+// mesher emit a watertight vertical wall there (a "skirt"), on BOTH sides of
+// the seam (the finer ring's outer face and the coarser ring's inner face), so
+// whichever ring's surface is higher, a wall closes the gap. Bits are the four
+// lateral chunk faces; Z faces are never ring boundaries (rings are XY annuli).
+enum ERingSkirtFace : uint8
+{
+	RingSkirt_NegX = 1 << 0,
+	RingSkirt_PosX = 1 << 1,
+	RingSkirt_NegY = 1 << 2,
+	RingSkirt_PosY = 1 << 3,
+};
+
 template <typename MaterialFn>
 void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const MaterialFn& MaterialAt, TArray<FVoxelChunkQuad>& OutQuads,
-                      vxc::Counters* PerfCounters = nullptr)
+                      vxc::Counters* PerfCounters = nullptr, uint8 RingSkirtMask = 0)
 {
 	using namespace vxc;
 	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
 	constexpr int32 BricksPerChunk = VoxelCoords::ChunkEdgeBricks;
+	constexpr int32 ChunkVox = BricksPerChunk * B; // 32
 
 	std::vector<Quad> BrickQuads;
 	for (int32 Dz = 0; Dz < BricksPerChunk; ++Dz)
@@ -142,13 +164,37 @@ void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const Material
 				const int64 OriginVX = (int64(ChunkKey.X) * BricksPerChunk + Dx) * int64(B);
 				const int64 OriginVY = (int64(ChunkKey.Y) * BricksPerChunk + Dy) * int64(B);
 				const int64 OriginVZ = (int64(ChunkKey.Z) * BricksPerChunk + Dz) * int64(B);
+				const int32 ChunkBaseX = Dx * B; // this brick's origin in chunk-relative voxels
+				const int32 ChunkBaseY = Dy * B;
 
 				// Sampler valid on [-1,B]^3 (mesher.h contract): MaterialAt
 				// reads straight across brick AND render-chunk borders via
 				// the same deterministic function, so no neighbor data needs
 				// to be materialized just to mesh this one brick.
+				//
+				// Ring-boundary skirt: when a lateral face of THIS render chunk
+				// (chunk-relative coord < 0 or >= ChunkVox on a flagged axis) is
+				// a ring boundary, report the apron there as AIR so the mesher
+				// emits the boundary wall. Only affects reads outside the chunk
+				// (the apron the boundary decision is made from); interior cells
+				// and internal brick borders are untouched, so within-ring chunks
+				// stay byte-for-byte identical.
 				const auto Sampler = [&](int X, int Y, int Z) -> MaterialId
-				{ return MaterialAt(OriginVX + X, OriginVY + Y, OriginVZ + Z); };
+				{
+					if (RingSkirtMask)
+					{
+						const int32 Xc = ChunkBaseX + X;
+						const int32 Yc = ChunkBaseY + Y;
+						if (((RingSkirtMask & RingSkirt_NegX) && Xc < 0) ||
+						    ((RingSkirtMask & RingSkirt_PosX) && Xc >= ChunkVox) ||
+						    ((RingSkirtMask & RingSkirt_NegY) && Yc < 0) ||
+						    ((RingSkirtMask & RingSkirt_PosY) && Yc >= ChunkVox))
+						{
+							return MAT_AIR;
+						}
+					}
+					return MaterialAt(OriginVX + X, OriginVY + Y, OriginVZ + Z);
+				};
 
 				BrickQuads.clear();
 				meshBrick<B>(Sampler, BrickQuads);
@@ -1436,6 +1482,16 @@ int32 GetCoarseMinLevel()
 		return FMath::Max(1, Value); // level 0 has its own path; never route it here
 	}();
 	return MinLevel;
+}
+
+// Ring-boundary skirt (see MeshChunkBricks' ERingSkirtFace comment): default ON.
+// -VoxelNoRingSkirt is the A/B control that reverts to the pre-fix open-edge
+// seams (the concentric see-through cracks). Command-line, not a cvar, for the
+// same "lands after streaming starts" reason as the switches above.
+bool RingSkirtEnabled()
+{
+	static const bool bDisabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelNoRingSkirt"));
+	return !bDisabled;
 }
 
 // docs/status.md "Buried-chunk pre-dispatch skip", step 1 (measure before
@@ -4676,6 +4732,57 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 	}
 }
 
+// Which of a render chunk's four lateral faces abut a DIFFERENT cascade ring
+// (or the clipmap/void past the outermost ring), i.e. where the neighbour chunk
+// at THIS level does not belong to this level's annulus. Those faces get the
+// ring-boundary skirt (see MeshChunkBricks' ERingSkirtFace comment). Uses the
+// exact annulus-membership test RecomputeDesiredSet admits candidates with, so
+// a set bit means precisely "RecomputeDesiredSet would not have placed a
+// same-level chunk across this face" -- the definition of a ring boundary.
+// Computed on the game thread at dispatch (anchor is fixed for the job) and
+// baked into the mesh; a chunk that later changes ring membership is unloaded
+// and re-meshed via the desired-set delta, so the baked mask never goes stale
+// while the chunk is resident.
+static uint8 ComputeRingSkirtMask(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, const FVector& Anchor)
+{
+	if (!VoxelStreamAdmission::RingSkirtEnabled())
+	{
+		return 0;
+	}
+	const int32 Level = LevelKey.Level;
+	if (Level == 0)
+	{
+		return 0; // finest ring: nothing finer sits inside it, so no seam to retain
+	}
+	const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[Level];
+	const double InnerSq = FMath::Square(Preset.InnerMeters * 100.0);
+	const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
+	// A face is retained only when the neighbour across it belongs to a FINER
+	// ring (its chunk centre falls inside this ring's inner hole). That is the
+	// side whose covering wall faces the camera (inward, -radius): the coarser
+	// ring drops an inward retaining wall down to meet the finer surface, which
+	// is what actually closes the see-through. The finer ring's OUTER edge needs
+	// no wall -- its outward-facing wall would be back-face culled, and the
+	// coarser ring physically overlaps just beyond it (both admitted by centre
+	// distance, and the coarser chunk is 2x wider), so the finer lip is backed
+	// by coarse terrain rather than ocean.
+	const auto NeighbourIsFiner = [&](int32 Cx, int32 Cy) -> bool
+	{
+		const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
+		const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
+		const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
+		return DistSq < InnerSq; // inside this ring's hole -> covered by a finer ring
+	};
+	const int32 Cx = LevelKey.Key.X;
+	const int32 Cy = LevelKey.Key.Y;
+	uint8 Mask = 0;
+	if (NeighbourIsFiner(Cx - 1, Cy)) Mask |= RingSkirt_NegX;
+	if (NeighbourIsFiner(Cx + 1, Cy)) Mask |= RingSkirt_PosX;
+	if (NeighbourIsFiner(Cx, Cy - 1)) Mask |= RingSkirt_NegY;
+	if (NeighbourIsFiner(Cx, Cy + 1)) Mask |= RingSkirt_PosY;
+	return Mask;
+}
+
 // --- budgeted drains ----------------------------------------------------
 
 void FVoxelWorldImpl::DispatchJobs()
@@ -4915,11 +5022,14 @@ void FVoxelWorldImpl::DispatchJobs()
 		// insert time, EditEpochSnapshot is this moment's value.
 		const std::atomic<uint64>* EditEpochPtr = &EditEpoch;
 		const uint64 EditEpochSnapshot = EditEpoch.load();
+		// Ring-boundary skirt mask -- computed here on the game thread where the
+		// anchor and RingPresets are live, then baked into this job's mesh.
+		const uint8 RingSkirtMask = ComputeRingSkirtMask(LevelKey, LastAnchorLocation);
 
 		UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
 			TEXT("VoxelChunkMeshJob"),
 			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
-			 bPredictedEmpty, bComputeBand]()
+			 bPredictedEmpty, bComputeBand, RingSkirtMask]()
 			{
 				SCOPE_CYCLE_COUNTER(STAT_VoxelWorkerJob);
 				const double JobStartSeconds = FPlatformTime::Seconds();
@@ -5049,7 +5159,7 @@ void FVoxelWorldImpl::DispatchJobs()
 					// references, NOT a count of voxel-core-internal column work
 					// (that stays uninstrumented this pass, per P1 scope).
 					PerfCountersPtr->incColumnEvals(uint64_t(GridEdge) * GridEdge);
-					MeshChunkBricks(Key, GridSampler, Result.Quads, PerfCountersPtr);
+					MeshChunkBricks(Key, GridSampler, Result.Quads, PerfCountersPtr, RingSkirtMask);
 					if (bMeasureEmpty && Result.Quads.Num() == 0)
 					{
 						Result.EmptyClass = ClassifyEmpty(GridSampler, Key);
@@ -5081,7 +5191,7 @@ void FVoxelWorldImpl::DispatchJobs()
 						(LevelKey.Level >= VoxelStreamAdmission::GetCoarseMinLevel())
 							? MakeCoarseLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr)
 							: MakeLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot);
-					MeshChunkBricks(Key, LevelSampler, Result.Quads, PerfCountersPtr);
+					MeshChunkBricks(Key, LevelSampler, Result.Quads, PerfCountersPtr, RingSkirtMask);
 					if (bMeasureEmpty && Result.Quads.Num() == 0)
 					{
 						Result.EmptyClass = ClassifyEmpty(LevelSampler, Key);
