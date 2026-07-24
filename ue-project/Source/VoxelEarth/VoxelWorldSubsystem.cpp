@@ -1070,6 +1070,16 @@ struct FChunkRecord
 	// Chunks in the surface band or the skirt are NEVER flagged, so they keep
 	// exactly their pre-change lifetime.
 	bool bDeepAnchorRelative = false;
+
+	// Load-before-unload (voxel.Stream.LodRetentionMs). When an LOD-ring
+	// transition evicts this chunk while it is still VISIBLE (has an applied
+	// component with geometry), RecomputeDesiredSet stamps this to
+	// ElapsedSeconds + retention. DrainUnloads then keeps the chunk drawn (defers
+	// the pool-park) until ElapsedSeconds passes it, giving the replacement LOD
+	// time to stream in so no hole opens. -1000 = not retained (park immediately,
+	// the pre-change behaviour and the path for genuinely-gone chunks once their
+	// grace elapses).
+	float RetainUntilSeconds = -1000.f;
 };
 
 // --- Buried-chunk pre-dispatch skip -----------------------------------------
@@ -4246,7 +4256,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// still inside the unload ring stay tracked untouched -- this is the
 	// same hysteresis gap the original single-ring code had, now evaluated
 	// per level.
-	for (const auto& Pair : ChunkRecords)
+	for (auto& Pair : ChunkRecords)
 	{
 		const FVoxelLevelChunkKey& LevelKey = Pair.Key;
 		if (PendingUnloadSet.Contains(LevelKey))
@@ -4278,6 +4288,25 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		}
 		if (bBeyondOuter || bInsideInner || bBeyondVertical)
 		{
+			// Load-before-unload (voxel.Stream.LodRetentionMs): if this eviction
+			// is an LOD-ring TRANSITION (a finer ring took over from the inside,
+			// or a coarser ring from the outside) and the chunk is still visible
+			// (live component with geometry), keep it drawn as a stand-in until
+			// its replacement can stream in -- DrainUnloads reads RetainUntilSeconds
+			// and defers the actual park. A purely-vertical underground exit has no
+			// coincident surface replacement, so it is NOT retained (nothing would
+			// cover it; retaining would only delay cleanup). A zero-quad chunk
+			// shows nothing, so there is no hole to bridge -- also not retained.
+			const bool bLodTransition = bBeyondOuter || bInsideInner;
+			auto& Rec = Pair.Value;
+			if (bLodTransition && Rec.Component.IsValid() && Rec.LastQuadCount > 0)
+			{
+				const float RetentionSeconds = VoxelDebug::GetStreamLodRetentionMs() / 1000.f;
+				if (RetentionSeconds > 0.f)
+				{
+					Rec.RetainUntilSeconds = ElapsedSeconds + RetentionSeconds;
+				}
+			}
 			PendingUnloadKeys.Add(LevelKey);
 			PendingUnloadSet.Add(LevelKey);
 			EvictedThisCall.Add(LevelKey);
@@ -5661,6 +5690,17 @@ void FVoxelWorldImpl::DrainUnloads()
 		// tracked and re-queue it for the next frame (do NOT drop the chunk).
 		if (Rec->Component.IsValid())
 		{
+			// Load-before-unload (voxel.Stream.LodRetentionMs): still inside the
+			// stand-in grace window stamped by RecomputeDesiredSet -> keep this
+			// chunk drawn so its replacement LOD can stream in without a hole.
+			// Defer the park (does NOT consume the render unload budget). Chunks
+			// that were never retained have RetainUntilSeconds far in the past, so
+			// they fall straight through to the normal park path.
+			if (ElapsedSeconds < Rec->RetainUntilSeconds)
+			{
+				Deferred.Add(Key); // stays tracked + visible, retried next frame
+				continue;
+			}
 			if (ComponentUnloads >= MaxUnloads)
 			{
 				Deferred.Add(Key); // stays in PendingUnloadSet, re-added below

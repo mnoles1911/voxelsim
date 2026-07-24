@@ -102,6 +102,18 @@ TAutoConsoleVariable<float> CVarVoxelStreamApplyBudgetMs(
 	TEXT("pacing at the cost of slower fill; raise it to fill harder."),
 	ECVF_Default);
 
+TAutoConsoleVariable<float> CVarVoxelStreamLodRetentionMs(
+	TEXT("voxel.Stream.LodRetentionMs"),
+	1000.0f,
+	TEXT("Load-before-unload (2026-07-24 streaming-speed pass): when a VISIBLE chunk is evicted because a different ")
+	TEXT("LOD ring took over its footprint (moving toward -> finer ring, or away -> coarser ring), keep it drawn as a ")
+	TEXT("stand-in for this many ms before parking it, so its not-yet-loaded replacement has time to stream in. This ")
+	TEXT("is what removes the holes that open while walking/flying: you keep seeing the old (coarser but present) ")
+	TEXT("terrain until the new LOD lands, instead of a hole. Cost: a brief coarse+fine double-draw at the boundary ")
+	TEXT("during the window (minor shimmer, no hole) and a bounded rise in resident chunks (~eviction-rate * this). ")
+	TEXT("0 disables (revert to immediate unload). Raise if fast flight still flashes holes; lower to trim overlap."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxRemeshesPerFrame(
 	TEXT("voxel.Stream.MaxRemeshesPerFrame"),
 	8,
@@ -392,6 +404,11 @@ int32 VoxelDebug::GetStreamMaxAppliesPerFrame()
 float VoxelDebug::GetStreamApplyBudgetMs()
 {
 	return FMath::Max(0.f, CVarVoxelStreamApplyBudgetMs.GetValueOnGameThread());
+}
+
+float VoxelDebug::GetStreamLodRetentionMs()
+{
+	return FMath::Max(0.f, CVarVoxelStreamLodRetentionMs.GetValueOnGameThread());
 }
 
 int32 VoxelDebug::GetStreamMaxRemeshesPerFrame()

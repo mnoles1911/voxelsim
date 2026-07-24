@@ -234,6 +234,12 @@ namespace VoxelDebug
 	// to GetStreamMaxAppliesPerFrame.
 	VOXELEARTH_API float GetStreamApplyBudgetMs();
 
+	// voxel.Stream.LodRetentionMs: load-before-unload grace (2026-07-24 pass).
+	// A visible chunk evicted by an LOD-ring transition is kept drawn as a
+	// stand-in for this many ms before parking, so its replacement can stream in
+	// without a hole. Default 1000; 0 disables.
+	VOXELEARTH_API float GetStreamLodRetentionMs();
+
 	// voxel.Stream.MaxRemeshesPerFrame: max game-thread overlay-aware edit
 	// re-meshes (DrainGameThreadMesh -- first load of an edited chunk, or a
 	// post-edit dirty re-mesh) applied per frame. Default 8 (2026-07-24 pass).
