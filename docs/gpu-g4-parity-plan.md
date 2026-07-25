@@ -133,9 +133,40 @@ the traps. Headlines:
 ### 2. Per-chunk debug tints
 
 Debug-only, and the storage question is already answered: `ChunkParams.w` is
-free. Still needs the material graph to read an interpolant instead of the
-`DebugTint` vector parameter, so this is the one item where the asset question
-genuinely returns — and it is the one item whose absence costs nothing in play.
+free. This is the one remaining item where the material-asset question genuinely
+returns — the tint is an RGB multiply, and all four vertex colour channels are
+taken (R biome tint, G AO, B/A climate), so it cannot ride the pipe the other
+items use.
+
+The route is to widen the factory's `TexCoords` interpolant from `float2` to
+`float4`, carry the tint packed into `.zw`, and have the material unpack it and
+fold it into the same multiply `DebugTint` feeds today.
+
+**The one design decision that makes this safe: encode identity as ZERO, not as
+white.** The component path's vertex factory supplies only a `float2` texture
+coordinate, so `TexCoord0.zw` arrives as zero there no matter what the graph
+does. If the encoding is chosen so that zero means "no tint" — store the tint as
+an offset from white, or reserve 0 as a sentinel the unpack maps to
+`FLinearColor::White` — then **the same graph is correct on both paths with no
+switch node and no permutation**, and the component path's rendering is
+bit-identical to what it is today.
+
+That is what makes this a genuinely small change rather than a risky one, and it
+is why the asset edit should not be attempted without it: a naive unpack that
+treats 0 as black would render every component-path chunk black the moment the
+material is regenerated.
+
+Regenerate with:
+
+```
+UnrealEditor-Cmd.exe <uproject> -run=pythonscript -script=Tools/create_voxel_material.py \
+  -unattended -nop4 -nosplash
+```
+
+Verify by rendering the **component** path before and after and diffing the
+screenshots numerically — not by reasoning about the graph. The bar is the
+same-path repeat-run noise floor (0.02–1.1% of pixels differing by more than
+8/255), and the CPU path must land inside it.
 
 ### 3. Ring cross-fade
 

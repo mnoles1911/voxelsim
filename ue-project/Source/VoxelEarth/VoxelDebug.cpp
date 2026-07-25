@@ -181,12 +181,44 @@ TAutoConsoleVariable<int32> CVarVoxelStreamGpuMaxChunks(
 	TEXT("quads through the pool are wrong' from 'the pool does not like a multi-million-quad draw'."),
 	ECVF_Default);
 
+// G5. Default TRUE as of 2026-07-25, on measurement rather than on the
+// programme plan saying so.
+//
+// 60 s scripted surface flight at 20 m/s, same spawn, post-warmup, this cvar the
+// only difference. Two pairs, the second run in reverse order so drift in
+// background load works against the result rather than for it:
+//
+//                p50      p95     worst   hitches   chunks/s
+//   component  17.50    40.50    221.4     204        608     (mean of 2)
+//   pool       17.16    23.05     76.6       9        818     (mean of 2)
+//
+// The median frame barely moves and never was the point. ADR-0006 removes an
+// FScene::AddPrimitive per chunk from the streaming path; that cost lands in the
+// TAIL, and the tail is what moved -- p95 -43%, worst frame -65%, hitches -96%,
+// streaming throughput +35%.
+//
+// Direction and rough magnitude, not gate numbers: all four legs ran with other
+// headless instances live on the same machine, and most of the spread between
+// the two component runs is that contention. What survives the noise is that the
+// pool wins on p95, worst frame, hitch count and throughput in EVERY one of the
+// four runs.
+//
+// The component path is deliberately KEPT, not retired. It still carries voxel
+// GI, the debug tints, the ring cross-fade A/B, several mesh-time diagnostics,
+// and -- most importantly -- it is the fallback that voxel.Stream.GPUMaxLevel and
+// GPUMaxChunks bisect against, which are the two sharpest debugging tools this
+// renderer has. Setting this to 0 is a complete revert.
+//
+// See docs/streaming-handoff.md for the measured parity evidence behind the
+// flip, and docs/gpu-g4-parity-plan.md for what is still component-path-only.
 TAutoConsoleVariable<bool> CVarVoxelStreamGpu(
 	TEXT("voxel.Stream.GPU"),
-	false,
+	true,
 	TEXT("Route chunk geometry through the ADR-0006 GPU pool (ONE primitive, ONE draw) instead of one scene ")
-	TEXT("component per chunk. Default false. Set before the world streams in; toggling mid-flight leaves ")
-	TEXT("already-resident chunks on whichever path loaded them."),
+	TEXT("component per chunk. Default TRUE. Set 0 to fall back to the per-chunk component renderer, which is ")
+	TEXT("still fully supported and is what voxel.GI.*, the debug tints and -VoxelRingCrossFade require. Set ")
+	TEXT("before the world streams in; toggling mid-flight leaves already-resident chunks on whichever path ")
+	TEXT("loaded them."),
 	ECVF_Default);
 
 // Worker slots in flight, as a multiple of logical cores (docs/m1-plan.md Stage
