@@ -5021,6 +5021,30 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 			                        bAdmissionDeferredWork[Level] ? 1 : 0);
 		}
 		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel admission pass: %s"), *Line);
+
+		// A ring stuck with a handful of entries it never dispatches is the
+		// pathology this whole investigation is about, and the entries are
+		// invisible in aggregate counters. Dump them, with the record state that
+		// decides whether DispatchJobs will act on them.
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			const TArray<FSortEntry>& Queue = PendingJobKeysByLevel[Level];
+			if (Queue.Num() == 0 || Queue.Num() > 8)
+			{
+				continue;
+			}
+			for (const FSortEntry& Entry : Queue)
+			{
+				const VoxelStreaming::FChunkRecord* R = ChunkRecords.Find(Entry.Key);
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("  stuck R%d (%d,%d,%d) rec=%d inFlight=%d settled=%d quads=%d overlay=%d dist=%.0fm"),
+				       Level, Entry.Key.Key.X, Entry.Key.Key.Y, Entry.Key.Key.Z,
+				       R != nullptr, R && R->bJobInFlight, R && R->bMeshSettled,
+				       R ? R->LastQuadCount : -1,
+				       NeedsOverlayAwarePath(Entry.Key) ? 1 : 0,
+				       FMath::Sqrt(Entry.DistSq) / 100.0);
+			}
+		}
 	}
 }
 

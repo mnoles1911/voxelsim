@@ -350,3 +350,53 @@ Two design notes for whoever fixes it:
 - **This is a CPU-path bug.** The component path shows `pending=0` only because
   it is slow enough that R0 keeps rescanning for other reasons. Fix it with a
   measured before/after on both paths.
+
+### The full chain, and the one link still missing (2026-07-25)
+
+Dumping the stuck entries names them exactly:
+
+```
+stuck R0 (-26401,16786,169) rec=1 inFlight=0 settled=0 quads=0 overlay=0 dist=44m
+stuck R0 (-26401,16786,170) rec=1 inFlight=0 settled=0 quads=0 overlay=0 dist=44m
+```
+
+Two chunks, one XY column, adjacent Z, 44 m out, records live and idle. They are
+deferred every dispatch pass by the **cold-band throttle**
+(`VoxelWorldSubsystem.cpp:5306`): a level-0 chunk whose column is absent from
+`FootprintBandCache` but present in `FootprintBlindJobInFlight` is pushed onto
+`DeferredColdBand` and put back, forever.
+
+So the chain is:
+
+```
+column (-26401,16786) stuck in FootprintBlindJobInFlight
+  -> its 2 R0 chunks deferred on every dispatch pass, never dispatched
+  -> R0's queue never reaches empty
+  -> the refill trigger, though armed (def=1) and unconstrained (cut=-1m),
+     never fires because it is gated on IsEmpty()
+  -> R0 never re-enumerates on a stationary anchor (scan=0)
+  -> R0 frozen at the 512 records of its single initial scan
+  -> 255 chunks drawn against ~1950 desired
+```
+
+**This is not the pooled path.** The mark is cleared in `DrainResults`
+(`:6156`) for EVERY level-0 result, before the stale-result discard and before
+`ApplyMeshResult` is reached, so it is independent of which renderer runs. The
+GPU path only changes how fast the loop spins.
+
+The missing link is why that column's seeding job result never arrives to clear
+the mark (`:5666` adds it at the launch site). Note the comment at `:5300`
+documents a previous instance of exactly this failure -- "the whole column stayed
+deferred forever (observed as blindInFlight pinned at 92)" -- fixed then by moving
+where the mark is set. This is a second path to the same state.
+
+Two fixes are wanted, and they are independent:
+
+1. **The leak**: ensure the blind-job mark is always released -- either by
+   guaranteeing a result for every launch, or by ageing the mark out. The
+   `:5300` comment shows the "guarantee a result" approach has already been
+   attempted once and has a history of missed exit paths.
+2. **The amplifier**: `IsEmpty()` is the wrong refill predicate regardless. A
+   ring should refill when it has no *dispatchable* work, so a bounded number of
+   permanently-deferred entries cannot starve it. Fixing only (1) leaves the
+   next stuck entry free to do this again.
