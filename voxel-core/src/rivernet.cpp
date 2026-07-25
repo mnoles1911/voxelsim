@@ -92,9 +92,21 @@ void RiverNetwork::buildFromFlowAccumulation(ITileSampler& tiles, uint64_t seed,
         return a < c;
     });
 
+    // Flow weight is RAINFALL IN MM/YR, not the raw wire byte (worldgen v8,
+    // kRiverNetVersion 2).
+    //
+    // The byte is a quantization of a physical range that the consumer had no
+    // way to know (see voxelcore/climate.h), so weighting by it meant "rivers
+    // form after N upstream pixels" depended on the encoding rather than on
+    // rainfall: the same terrain gave a river every ~4 pixels under the old
+    // synthetic tiles and every ~23 under real diffusion tiles, for no physical
+    // reason. Decoding first makes accumThreshold mean a real quantity --
+    // mm/yr of rain gathered upstream -- and makes it portable across any tile
+    // source. kRiverAccumThresholdDefault is rescaled by the same factor so
+    // river density is unchanged for the synthetic case it was tuned on.
     std::vector<int64_t> accum(count, 0);
     for (size_t oi : order) {
-        accum[oi] += precip[oi];
+        accum[oi] += climatePrecipMmPerYrFromU8(precip[oi]);
         const int8_t d = dir[oi];
         if (d < 0) continue;
         const int64_t px = b.px0 + static_cast<int64_t>(oi % static_cast<size_t>(w));
