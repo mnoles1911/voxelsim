@@ -126,7 +126,14 @@ public:
 
 IMPLEMENT_TYPE_LAYOUT(FVoxelQuadVertexFactoryShaderParameters);
 
+// Register BOTH frequencies. CreateShaderParameters dispatches through
+// TVertexFactoryParameterTraits<frequency, type> and returns null for any
+// (type, frequency) pair that was never specialised -- and a null parameters
+// object makes FMeshMaterialShader::GetElementShaderBindings skip the vertex
+// factory entirely, with no else, no ensure and no log.
 IMPLEMENT_VERTEX_FACTORY_PARAMETER_TYPE(FVoxelQuadVertexFactory, SF_Vertex,
+                                        FVoxelQuadVertexFactoryShaderParameters);
+IMPLEMENT_VERTEX_FACTORY_PARAMETER_TYPE(FVoxelQuadVertexFactory, SF_Pixel,
                                         FVoxelQuadVertexFactoryShaderParameters);
 
 IMPLEMENT_VERTEX_FACTORY_TYPE(FVoxelQuadVertexFactory,

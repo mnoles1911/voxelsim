@@ -220,7 +220,14 @@ returns null unless `TVertexFactoryParameterTraits` is specialised for that
 `(type, frequency)` pair — i.e. unless `IMPLEMENT_VERTEX_FACTORY_PARAMETER_TYPE`
 took effect for the frequency being drawn. Ours declares `SF_Vertex` only.
 
-**Next step:** register `SF_Pixel` as well (and confirm against
+**TRIED AND DID NOT FIX IT (2026-07-25):** registering `SF_Pixel` alongside
+`SF_Vertex` via a second `IMPLEMENT_VERTEX_FACTORY_PARAMETER_TYPE`. The hook
+still never fires. The registration is kept because it is more correct
+regardless, but the cause lies elsewhere -- so start the next attempt by
+confirming the runtime `VertexFactory->GetType()` is the same type the macro
+was applied to, and by breakpointing `CreateShaderParameters`.
+
+**Original next step (superseded):** register `SF_Pixel` as well (and confirm against
 `FLidarPointCloudVertexFactoryBase`, which declares `SF_Vertex` plus
 compute/ray-hit-group), or confirm the runtime `VertexFactory->GetType()`
 matches the type the macro was applied to. Until it resolves, the pool cannot
