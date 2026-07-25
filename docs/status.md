@@ -6817,10 +6817,77 @@ but the **37.1% of R0 worker time (and 37.2% of R1) spent on chunks that mesh to
 zero quads** -- see the empty census. That is where CPU-side headroom actually
 lives.
 
-**And it is probably not the hole bug anyway.** A screenshot with
-`voxel.Debug.Rings 1` shows the gaps pinned exactly to the ring colour
-transitions, at every boundary, persisting after 45 s stationary. Throughput
-shortfall would be patchy and directional. The remaining suspect is a
-coverage/geometry defect at the ring seam -- possibly a larger sibling of the
-known-unfinished T-junction skirt work (`3b33a79`).
+**And it is not the hole bug anyway.** See the next section -- the rings of holes
+are a desired-set coverage defect at the ring seams, found immediately after.
+
+### ROOT CAUSE of the concentric rings of holes: ring-seam coverage gap (2026-07-24)
+
+**This is the bug Matt has been reporting since the streaming-speed pass.** It is
+NOT the load-before-unload path (that was a separate, also-real bug, fixed
+above), not the empty-chunk skips (verifiers clean), and not throughput.
+
+Three independent investigations converged on the same defect:
+
+`RingPresets` annuli **abut exactly** -- `{0,64} {64,128} {128,256} {256,512}
+{512,1024} {1024,2048}` m, so `Outer[L] == Inner[L+1]`, zero overlap
+(`VoxelWorldSubsystem.h:86`). Admission tests the chunk **CENTRE** against those
+radii (`VoxelWorldSubsystem.cpp:4451-4457`). But chunks have **extent**, and
+adjacent levels have **different chunk sizes**. A level-L chunk's four
+level-(L-1) children sit at centre offsets `(+-e/2, +-e/2)`, i.e. up to
+`e/sqrt(2)` further out radially. So:
+
+> a child can be rejected at L-1 (its centre >= `Outer[L-1]`) while its parent is
+> rejected at L (the parent's centre < `Inner[L]` == `Outer[L-1]`).
+
+**That ground is requested by no level at all.** Direct enumeration at an
+arbitrary anchor:
+
+| seam | fine edge | uncovered columns | hole width |
+|---|---|---|---|
+| R0/R1 @ 64 m | 3.2 m | 32 | 3.2 m |
+| R1/R2 @ 128 m | 6.4 m | 28 | 6.4 m |
+| R2/R3 @ 256 m | 12.8 m | 29 | 12.8 m |
+| R3/R4 @ 512 m | 25.6 m | 36 | 25.6 m |
+| R4/R5 @ 1024 m | 51.2 m | 38 | 51.2 m |
+
+Each is a **full-height column** -- the entire `ChunkZMin..ChunkZMax` band is
+never enumerated for that `(Cx,Cy)` -- hence see-through to the sky, not a
+hairline crack. 20-40 per boundary, at all five boundaries, scaling with
+distance: a broken-but-continuous ring of holes all the way around, exactly as
+reported.
+
+**Why it never healed while standing still:** the desired set is a pure function
+of anchor position, the inner eviction test uses the same hard threshold with no
+hysteresis (`:4317-4319`, "hard boundary" by design), and `RecomputeDesiredSet`
+early-outs entirely when the anchor's chunk has not changed. Stop anywhere and
+the holes are permanent. This is also why `voxel.Stream.LodRetentionMs` 0 vs 5000
+made no difference -- these chunks were never candidates, so they never reached
+the retention path at all.
+
+**Two stale comments in the tree asserted the opposite** and are now known false:
+`ComputeRingSkirtMask` (`:4841-4847`) justifies skipping the outer-edge skirt on
+the grounds that "the coarser ring physically overlaps just beyond it" -- it does
+not; and that function's header claims it uses "the exact annulus-membership test
+RecomputeDesiredSet admits candidates with" while never loading `OuterMeters` at
+all. The ring cross-fade was ALSO disabled (`VoxelChunkComponent.cpp:828-844`)
+because the annuli do not overlap -- same root cause, diagnosed a second time
+without either diagnosis reaching the other.
+
+**FIX:** pad each level's OUTER admit radius by the chunk half-diagonal
+(`e/sqrt(2)`), so a chunk is admitted whenever any part of its footprint could
+fall inside the annulus. Padding by exactly `e/sqrt(2)` is provably sufficient
+and minimal (a gap child's centre is at most its parent's centre plus
+`e/sqrt(2)`, and the parent's centre is `< Outer[L-1]` by construction). Only the
+outer side needs it: the finer, more accurate mesh then wins in the overlap band,
+the coarser ring's inner hole stays hard, and the exit pass does not fight it
+(`bBeyondOuter` uses `Outer*1.25`, wider than `Outer + e/sqrt(2)` at every level).
+
+**Measured cost:** resident chunks 9,622 -> 10,503, **+9.2%** (per ring: R0 +6.4%,
+R1 +9.0%, R2 +10.0%, R3 +10.2%, R4 +10.0%, R5 +9.9%) -- matching the predicted
+7-10%. Before/after vista screenshots at the same anchor, both fully settled
+(`jobs 0/24`, `queues job=0`), show the dark notches along the ring seams gone.
+
+**Follow-on now unblocked:** the annuli genuinely overlap for the first time, so
+the ring cross-fade (`-VoxelRingCrossFade`, disabled because it had no second LOD
+to dissolve into) has the overlap band it always needed. Worth re-testing.
 

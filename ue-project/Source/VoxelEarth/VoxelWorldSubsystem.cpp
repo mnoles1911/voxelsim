@@ -4442,7 +4442,46 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		const double InnerUU = Preset.InnerMeters * 100.0;
 		const double OuterUU = Preset.OuterMeters * 100.0;
 		const double ChunkEdge = ChunkEdgeUUForLevel(Level);
-		const int32 ChunkSpan = FMath::CeilToInt32(OuterUU / ChunkEdge) + 1;
+
+		// RING SEAM COVERAGE (2026-07-24 fix). Admission is by chunk CENTRE
+		// distance, but chunks have EXTENT and adjacent levels have DIFFERENT
+		// chunk sizes -- and RingPresets annuli abut exactly (Outer[L] ==
+		// Inner[L+1], zero overlap). That combination leaves ground covered by
+		// NO level at every seam:
+		//
+		//   a level-L chunk's four level-(L-1) children sit at centre offsets
+		//   (+-e/2, +-e/2), i.e. up to e/sqrt(2) FURTHER OUT radially. So a child
+		//   can be rejected at L-1 (its centre >= Outer[L-1]) while its parent is
+		//   rejected at L (the parent's centre < Inner[L] == Outer[L-1]).
+		//
+		// The result is 20-40 entirely missing chunk COLUMNS per boundary -- full
+		// height, see-through to the sky -- 3.2 m wide at the 64 m seam up to
+		// 51.2 m wide at the 1024 m seam. It never heals while stationary,
+		// because the desired set is a pure function of anchor position and the
+		// inner eviction test uses the same hard threshold with no hysteresis.
+		// This is what Matt reported as "concentric rings of holes"; it is NOT
+		// the load-before-unload path, which was a separate (also real) bug.
+		//
+		// FIX: pad this level's OUTER admit radius by the chunk half-diagonal, so
+		// a chunk is admitted whenever any part of its footprint could fall
+		// inside the annulus. Padding by exactly e/sqrt(2) is provably sufficient
+		// and minimal: a gap child's centre is at most its parent's centre plus
+		// e/sqrt(2), and the parent's centre is < Outer[L-1] by construction.
+		//
+		// Only the OUTER side needs padding -- padding there admits the finer
+		// level slightly past the seam, so the finer (more accurate) mesh wins
+		// in the overlap band, and the coarser ring's inner hole stays hard. The
+		// exit pass does not fight this: bBeyondOuter uses Outer*1.25, which is
+		// wider than Outer + half-diagonal at every level.
+		//
+		// Cost: ~7-10% more resident chunks per level. That is the price of the
+		// annuli genuinely overlapping, which VoxelChunkComponent.cpp:828-844
+		// already identified as the prerequisite for re-enabling the ring
+		// cross-fade (disabled because the annuli did NOT overlap).
+		const double ChunkHalfDiagUU = ChunkEdge * 0.70710678118654752440; // (edge/2)*sqrt(2)
+		const double AdmitOuterUU = OuterUU + ChunkHalfDiagUU;
+
+		const int32 ChunkSpan = FMath::CeilToInt32(AdmitOuterUU / ChunkEdge) + 1;
 
 		for (int32 Cy = AnchorChunk.Y - ChunkSpan; Cy <= AnchorChunk.Y + ChunkSpan; ++Cy)
 		{
@@ -4451,9 +4490,9 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
 				const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
 				const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
-				if (DistSq >= FMath::Square(OuterUU) || (Level > 0 && DistSq < FMath::Square(InnerUU)))
+				if (DistSq >= FMath::Square(AdmitOuterUU) || (Level > 0 && DistSq < FMath::Square(InnerUU)))
 				{
-					continue; // outside this level's annulus
+					continue; // outside this level's annulus (outer padded by the chunk half-diagonal -- see above)
 				}
 
 				++ThisFrameLevelFootprints[Level];
