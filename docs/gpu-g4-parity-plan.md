@@ -82,9 +82,9 @@ material's own parameter defaults, so a pooled chunk with no material instance
 gets bit-identical opacity behaviour to a component chunk with an inert one.
 
 The ring-seam padding fix (`+e/sqrt(2)`, `status.md`) has since given the annuli
-the overlap band the fade always needed, so re-testing the fade is now
-*worthwhile* — but it is a rendering experiment, not a parity obligation, and it
-is not a G5 blocker. **Nothing in G5 depends on it.**
+the overlap band the fade always needed, so it was worth re-testing. **It has
+been re-tested and it is still broken** — see item 3 below. Nothing in G5 depends
+on it, and it should not be built for the pooled path.
 
 ## Correction 4: under `voxel.Stream.GPU`, the GI light field is empty
 
@@ -182,10 +182,35 @@ screenshots numerically — not by reasoning about the graph. The bar is the
 same-path repeat-run noise floor (0.02–1.1% of pixels differing by more than
 8/255), and the CPU path must land inside it.
 
-### 3. Ring cross-fade
+### 3. Ring cross-fade -- RE-TESTED, STILL BROKEN. Do not implement it.
 
-See correction 3. Re-test it as a rendering experiment now that the rings
-overlap. If it is kept, it needs the same material treatment as item 2.
+`status.md` recorded that the ring-seam padding fix (`+e/sqrt(2)`) had finally
+given the annuli the overlap band the cross-fade always needed, and that it was
+"worth re-testing". It has been re-tested, and the answer is no.
+
+Component path, same anchor, same 34 s settle, one flag differing:
+
+| | pixels differing > 8/255 |
+|---|---|
+| `-VoxelRingCrossFade` vs control | 2.44% |
+| same-path repeat-run noise floor | 1.83% |
+
+The aggregate number is barely above the floor, but the difference is
+**structured, not noise**: with the flag on, discrete blue see-through patches
+appear in the mid-distance -- water and sky visible *through* terrain -- exactly
+where the ring boundary falls. With it off the same region is solid. That is the
+original see-through-ring signature, unchanged in kind.
+
+So the overlap band was necessary but not sufficient. **Do not implement ring
+cross-fade for the pooled path**, and do not spend the material-graph change on
+it: it would be porting a defect. If it is ever revisited, the prerequisite is
+understanding why overlapping annuli still dissolve to nothing -- most likely
+that both rings fade *simultaneously* across the shared band rather than
+crossing over, so their opacities sum to less than one in the middle -- and that
+is a residency/fade-curve question, not a renderer one.
+
+This closes the item. The G0 checklist listed it first; it turns out to be the
+one thing on the list that should not be built.
 
 ### 4. Water surface pool
 
