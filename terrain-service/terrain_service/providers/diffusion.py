@@ -1029,14 +1029,25 @@ class TerrainDiffusionBackend:
         tile_seed = derive_tile_seed(seed, x, y, scale)
         torch.manual_seed(tile_seed & 0xFFFFFFFFFFFFFFFF)
 
-        # ASSUMPTION: tile (x, y) covers pixels [x*TILE_SIZE,(x+1)*TILE_SIZE)
-        # per tile_codec.py, with x=column (j) and y=row (i). world_pipeline.
-        # py names its own internal tile-hash args (ty, tx) row-then-col,
-        # which is what this mapping mirrors, but WorldPipeline.get()'s
-        # (i1, j1, i2, j2) axis order was not independently confirmed from
-        # source alone -- verify at GPU bring-up (e.g. generate two
-        # east-west-adjacent tiles and confirm the seam lines up on the x
-        # axis, not the y axis).
+        # CONFIRMED 2026-07-25 (was an open ASSUMPTION since bring-up): tile
+        # (x, y) covers pixels [x*TILE_SIZE,(x+1)*TILE_SIZE) per tile_codec.py,
+        # with x=column (j) and y=row (i). world_pipeline.py names its own
+        # internal tile-hash args (ty, tx) row-then-col, which is what this
+        # mapping mirrors, but WorldPipeline.get()'s (i1, j1, i2, j2) axis
+        # order could not be settled from source alone.
+        #
+        # It did not need a GPU after all. The COARSE model underlies both the
+        # generated tiles and the explorer's coarse map, so the mean elevation
+        # of each cached .vxtl must correlate with the coarse cells at its own
+        # footprint -- under the correct orientation only. Measured over the 25
+        # tiles of seed 20260719 by `tools/world_map.py --verify-axes`:
+        #
+        #     ci<-y, cj<-x  (this mapping): r = +0.999
+        #     ci<-x, cj<-y  (transposed):   r = -0.795
+        #
+        # Emphatic, not a near-tie, so the check is conclusive rather than
+        # suggestive. Re-run that command on a new seed if this line ever
+        # changes; note GENERATION_ALGORITHM_VERSION must be bumped if it does.
         i1, j1 = y * TILE_SIZE, x * TILE_SIZE
         i2, j2 = i1 + TILE_SIZE, j1 + TILE_SIZE
 
