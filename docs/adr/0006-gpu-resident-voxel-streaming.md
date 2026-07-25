@@ -1,13 +1,29 @@
 # ADR-0006: GPU-resident voxel streaming (display geometry off the render-thread apply funnel)
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-07-24
 - **Doctrine sections affected:** additive. Implements ADR-0001's GPU-compute
   posture at *runtime* (not just CI), and **clarifies** the §2 determinism
   boundary (plan §2 item 3): the bit-deterministic set is voxel *state*
   (amplifier → voxelization → water CA), **not** display geometry. Needs
   human sign-off because it interprets that boundary and redefines the M1 gate.
-- **Human sign-off:** pending — Matt Noles
+- **Human sign-off:** **GIVEN — Matt Noles, 2026-07-24 (in session).** Covers
+  the §2 determinism-boundary interpretation (invariant 3: display geometry is
+  not required to be cross-vendor bit-exact), invariant 3's fourth bullet
+  ("no gameplay system may read display geometry", added the same day), and the
+  M1 gate redefinition at G3.
+- **Empirical basis (added 2026-07-24):** this ADR originally *asserted* the
+  per-chunk apply funnel was the ceiling. It is now measured — see
+  `docs/status.md`, sections "M1 gate re-run", "Terrain sun shadows are NOT the
+  render cost", and "`renderMs` is NOT pixel work". Summary: a same-binary A/B
+  showed the streaming throttles buy 2.84x fill for 2.58x frame time (the trade
+  this ADR removes); `renderMs` is the frame (43.12 of 43.92 ms) while voxel
+  game-thread work is 0.26 ms; and both cheap alternative explanations for
+  `renderMs` are eliminated — terrain shadow-casting costs nothing measurable,
+  and quartering the pixel count via `r.ScreenPercentage 50` changes nothing.
+  What remains in `renderMs` is per-primitive culling, draw-command generation
+  and `FScene` mutation across ~24,700 records: exactly what invariants 1 and 2
+  collapse to O(1).
 
 ## Context
 
@@ -78,6 +94,16 @@ State these as invariants the implementation is checked against.
      enumerates (amplifier, voxelization, water CA). Classifying it display-only
      is consistent with that enumeration, but because it *interprets* the
      boundary it is called out here for explicit sign-off.
+   - **No gameplay system may read display geometry.** Collision, raycast,
+     dig/place, water and any future interaction query resolve against
+     `materialAt`, never against the pool, the draw args, or anything derived
+     from them. This is the condition the whole carve-out rests on, and it was
+     unstated in the first draft: the safety argument is "clients agree because
+     they share state, never vertex buffers", which holds only while nothing
+     gameplay-facing consults a vertex buffer. **This world is networked**
+     (Matt, 2026-07-24), so a client-side read of GPU geometry is not merely an
+     inconsistency — it is a desync vector, and a silent one. Stated as a rule so
+     it can be violated loudly rather than quietly.
 
 4. **One authority path is preserved (§2 item 4).** Edits mutate the
    authoritative CPU voxel state exactly as today; affected chunks are re-meshed

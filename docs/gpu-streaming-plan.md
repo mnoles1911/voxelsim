@@ -24,6 +24,17 @@ kernels chain end-to-end at runtime resolution.
 - **Deliverable:** a one-page table — for candidate view distances (2 km, 4 km,
   8 km…) the resident chunk count, packed-geometry VRAM, and generate-throughput,
   with a recommended target. **Matt picks the target here.**
+- **Evaluate engine-native GPU-driven paths BEFORE committing to a hand-rolled
+  one** (added 2026-07-24). G2 below proposes a private geometry pool plus a
+  custom `FPrimitiveSceneProxy` with indirect draws — that is where all of this
+  plan's schedule risk is concentrated, and it is close to re-implementing
+  machinery UE already ships. Spend part of G0 answering: can GPUScene /
+  Mesh Draw Commands be fed GPU-resident buffers directly? Does Nanite apply to
+  the outer rings, where geometry is effectively static between digs (note the
+  sibling Mira-Thal project already runs a working Nanite bake path over 10 cm
+  voxel terrain)? Building a private version of an engine feature is an
+  expensive way to discover the engine had one. **Deliverable:** a paragraph per
+  option — viable / not viable and why.
 - **Gate:** numbers produced; no code on the hot path yet. Cheap to abort.
 
 ## G1 — GPU greedy mesher kernel (`gpu-mesher-design.md`) + digest parity
