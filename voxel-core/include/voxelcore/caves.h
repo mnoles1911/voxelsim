@@ -3,7 +3,7 @@
 // CONNECTED tunnel network into the amplifier's stratigraphy.
 //
 // Header-only, integer-only (CI float-ban). Every expression here is mirrored
-// bit-for-bit in voxel-core/shaders/worldgen.hlsl's `caveColumnFor` /
+// bit-for-bit in voxel-core/shaders/worldgen.ush's `caveColumnFor` /
 // `caveCarveAt` (docs/determinism.md CPU/GPU mirror contract). ANY change here
 // must be made identically in both places, re-verified with vxc_gpu on real
 // hardware, and paired with a kWorldGenVersion bump.

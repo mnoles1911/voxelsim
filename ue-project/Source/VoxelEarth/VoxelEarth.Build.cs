@@ -36,7 +36,13 @@ public class VoxelEarth : ModuleRules
 			// PRAGMATIC EXCEPTION to the "no PMC" doctrine (that rule targets
 			// the voxel rendering path, not a conventional heightmap clipmap
 			// -- see VoxelClipmapActor.h's class comment).
-			"ProceduralMeshComponent"
+			"ProceduralMeshComponent",
+			// ADR-0006 G2a: the GPU worldgen/mesher kernels. They live in their
+			// own module because that module has to load at PostConfigInit to
+			// register its shader directory before the global shader map is
+			// built -- this one loads at Default, far too late. Used by
+			// VoxelGpuVerify.cpp's voxel.GPU.VerifyRegion command.
+			"VoxelEarthShaders"
 		});
 
 		// voxel-core: engine-agnostic, UE-header-free C++20 static library.

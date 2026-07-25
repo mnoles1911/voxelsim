@@ -23,6 +23,38 @@
 //                  vxc::Amplifier::materialAt / GeneratedWorld<8>::makeBrick).
 // Greedy meshing kernels build on this in later ports.
 
+// --- compile target: standalone DXC vs Unreal (G2a) ------------------------
+//
+// ONE SOURCE OF TRUTH. This file is compiled two ways and the determinism
+// gate is only worth anything if both ways compile the SAME text:
+//
+//   1. standalone DXC (tools/compile-shaders.ps1) -> SPIR-V for the Vulkan
+//      bench (voxel-core/bench/gpu_harness.cpp) and DXIL. Resources carry
+//      explicit register() slots; the bench's descriptor sets hardcode the
+//      -fvk-*-shift mapping of those slots (see the binding map below).
+//
+//   2. Unreal's shader pipeline (D3D12/SM6), which compiles this file
+//      directly as global compute shaders and defines VXC_UE. Unreal binds
+//      shader resources by REFLECTED NAME out of a generated parameter
+//      struct, and assigns its own register slots -- explicit register()
+//      declarations fight that, and a hand-rolled cbuffer collides with the
+//      one Unreal generates from the parameter struct.
+//
+// So the only thing VXC_UE changes is HOW THE SAME RESOURCES ARE DECLARED:
+// the names, the types, and every line of arithmetic below are identical.
+// The parameter struct on the Unreal side declares the WorldGenParams fields
+// as loose parameters with these exact names, so the kernel bodies do not
+// know or care which way they were compiled.
+//
+// VXC_UE is never defined for the bench, so the standalone output is
+// unchanged by construction -- verified by recompiling and diffing the SPIR-V
+// hashes in shaders/prebuilt/README.md, which must not move.
+#ifdef VXC_UE
+    #define VXC_REG(slot)
+#else
+    #define VXC_REG(slot) : register(slot)
+#endif
+
 // --- constants mirrored from voxel-core (compile checks in harness) --------
 
 static const int kVoxelSizeMm = 100;
@@ -318,6 +350,31 @@ struct GpuColumnSample
 // than a second one: it stays a single binding, and the fields ColumnMain
 // doesn't use (BrickZMin/BricksZ) or VoxelizeMain doesn't use (RasterOriginPx/
 // RasterSize/PixelSizeMm) simply go unread by that kernel's entry point.
+// Under VXC_UE the same fields are declared as LOOSE GLOBALS instead of an
+// explicit cbuffer. That is Unreal's convention for shader parameters (see
+// Engine/Shaders/Private/Tools/SetupIndirectArgs.usf -- `uint Multiplier;`
+// at file scope): loose globals land in the implicit $Globals constant
+// buffer, which is exactly where Unreal's BEGIN_SHADER_PARAMETER_STRUCT
+// binds SHADER_PARAMETER entries by reflected name. A hand-declared
+// `cbuffer WorldGenParams : register(b0)` would be a SEPARATE constant
+// buffer that Unreal never binds -- the kernel would read zeroes.
+//
+// Same names, same order, same types either way; only the wrapper differs.
+// The Unreal-side struct is FVoxelWorldGenParameters in VoxelGpuWorldGen.cpp,
+// which static_asserts its own layout against the 56 bytes the bench uses.
+#ifdef VXC_UE
+uint2 DispatchColumns;
+int2 RasterOriginPx;
+uint2 RasterSize;
+int PixelSizeMm;
+uint SeedLo;
+uint SeedHi;
+int OriginVx;
+int OriginVy;
+int BrickZMin;
+uint BricksZ;
+uint ScanCount;
+#else
 cbuffer WorldGenParams : register(b0)
 {
     uint2 DispatchColumns;  // columns along x, y for this dispatch (both kernels)
@@ -333,16 +390,17 @@ cbuffer WorldGenParams : register(b0)
     uint BricksZ;           // (VoxelizeMain) number of bricks in the vertical stack
     uint ScanCount;         // (Scan*Main) number of mask entries to scan
 };
+#endif
 
 // Raster window (elevation mm per pixel; climate packed t|s<<8|p<<16|v<<24).
 // The harness/RDG pass MUST size the window to cover every pixel the
 // dispatch bilinearly samples ([floorDiv(min xMm, px) .. floorDiv(max xMm,
 // px)+1]); reads clamp to the window edge deterministically as a defensive
 // backstop, but a clamped read means the caller sized the window wrong.
-StructuredBuffer<int> ElevationMm : register(t0);
-StructuredBuffer<uint> ClimatePacked : register(t1);
+StructuredBuffer<int> ElevationMm VXC_REG(t0);
+StructuredBuffer<uint> ClimatePacked VXC_REG(t1);
 
-RWStructuredBuffer<GpuColumnSample> OutColumns : register(u0);
+RWStructuredBuffer<GpuColumnSample> OutColumns VXC_REG(u0);
 
 // VoxelizeMain-only bindings. InColumns is the SAME buffer OutColumns was
 // written to by the chained ColumnMain dispatch — columns are read back, not
@@ -361,12 +419,12 @@ RWStructuredBuffer<GpuColumnSample> OutColumns : register(u0);
 //   u2 OutCells       -> binding 5   (VoxelizeMain)
 // voxel-core/bench/gpu_harness.cpp hardcodes this same layout for the
 // VoxelizeMain pipeline's descriptor set.
-StructuredBuffer<GpuColumnSample> InColumns : register(t3);
+StructuredBuffer<GpuColumnSample> InColumns VXC_REG(t3);
 
 // One uint per cell, material id 0-255 in the low byte (packing optimization
 // left for later). Layout — see the VoxelizeMain doc comment below for the
 // precise brick/cell indexing this buffer is written with.
-RWStructuredBuffer<uint> OutCells : register(u2);
+RWStructuredBuffer<uint> OutCells VXC_REG(u2);
 
 // HARDENING (2026-07 cross-vendor UB pass, issue 5). `RasterSize` is host-
 // controlled and unvalidated in-shader. When RasterSize.x == 0 the clamp
@@ -1226,9 +1284,9 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
 //   word0 = axis | positive<<4 | slice<<8 | u0<<16 | v0<<24
 //   word1 = w | h<<8 | ao<<16 | mat<<24
 
-RWStructuredBuffer<uint> OutQuadCounts : register(u4);
-StructuredBuffer<uint> InQuadOffsets : register(t5);
-RWStructuredBuffer<uint2> OutQuads : register(u5);
+RWStructuredBuffer<uint> OutQuadCounts VXC_REG(u4);
+StructuredBuffer<uint> InQuadOffsets VXC_REG(t5);
+RWStructuredBuffer<uint2> OutQuads VXC_REG(u5);
 
 // Region-voxel material read. rv is region-local voxel coords (region brick
 // (0,0,0) cell (0,0,0) is rv = (0,0,0)); callers only pass coords inside the
@@ -1481,8 +1539,8 @@ void MeshEmitMain(uint3 tid : SV_DispatchThreadID)
 // The emit pass then reads InQuadOffsets — the SAME buffer bound read-only.
 // ScanCount (cbuffer append) = number of masks in this dispatch.
 
-RWStructuredBuffer<uint> OutQuadOffsets : register(u6);
-RWStructuredBuffer<uint> OutBlockSums : register(u7);
+RWStructuredBuffer<uint> OutQuadOffsets VXC_REG(u6);
+RWStructuredBuffer<uint> OutBlockSums VXC_REG(u7);
 
 groupshared uint gsScan[256];
 

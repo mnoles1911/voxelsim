@@ -1,0 +1,102 @@
+// Packed quad -> triangle geometry, on the GPU (ADR-0006, G2).
+//
+// The GPU mesher writes quads, not vertices: 8 bytes each, one per merged
+// rectangular face. Nothing ever expands them on the CPU under the G2 path —
+// there is no vertex buffer to build. Instead the vertex shader is dispatched
+// with 6 vertices per quad and reconstructs each corner from SV_VertexID.
+//
+// THIS FILE MUST STAY A MIRROR OF BuildChunkVertexData in
+// VoxelChunkComponent.cpp. That function is the CPU path's decode and is what
+// the terrain currently looks like; if these two disagree, the GPU path draws
+// subtly different geometry (flipped faces, shifted seams, inverted AO) and
+// the G2 visual A/B is what will catch it. Every constant below is quoted from
+// there on purpose.
+//
+// Quad packing (worldgen.ush greedyMask, and vxc::Quad in mesher.h):
+//   word0 = axis | positive<<4 | slice<<8 | u0<<16 | v0<<24
+//   word1 = w    | h<<8        | ao<<16   | mat<<24
+
+#pragma once
+
+// VoxelCoords::VoxelSizeUU — 10 unreal units per voxel, i.e. 10 cm voxels.
+#define VOXEL_SIZE_UU 10.0f
+
+struct FVoxelQuadVertex
+{
+	float3 PositionUU;   // chunk-local, in unreal units
+	float3 Normal;
+	float  AmbientOcclusion;  // 0 = fully occluded, 1 = open
+	uint   MaterialId;
+};
+
+// Decodes one corner of one quad.
+//
+// CornerIndex is 0..5 — the six vertices of the quad's two triangles, in the
+// order the CPU path's index buffer emits them, so the winding matches.
+// LevelScale is (1 << chunkLevel): mip rings keep quads in level-relative
+// voxel units and scale at decode time, exactly as the CPU path does.
+FVoxelQuadVertex DecodeVoxelQuadVertex(uint2 PackedQuad, uint CornerIndex, float LevelScale)
+{
+	const uint Axis     =  PackedQuad.x        & 0xfu;
+	const uint Positive = (PackedQuad.x >>  4) & 0xfu;
+	const uint Slice    = (PackedQuad.x >>  8) & 0xffu;
+	const uint U0       = (PackedQuad.x >> 16) & 0xffu;
+	const uint V0       = (PackedQuad.x >> 24) & 0xffu;
+	const uint W        =  PackedQuad.y        & 0xffu;
+	const uint H        = (PackedQuad.y >>  8) & 0xffu;
+	const uint Ao       = (PackedQuad.y >> 16) & 0xffu;
+	const uint Mat      = (PackedQuad.y >> 24) & 0xffu;
+
+	const uint U = (Axis + 1u) % 3u;
+	const uint V = (Axis + 2u) % 3u;
+
+	// A face sits on the near plane of its voxel for a negative-facing quad
+	// and the far plane for a positive-facing one.
+	const float FaceCoordVox = float(Slice) + (Positive != 0u ? 1.0f : 0.0f);
+
+	// The four corners, in the CPU path's order:
+	//   0 = (u0,v0)  1 = (u0,v1)  2 = (u1,v1)  3 = (u1,v0)
+	// The winding below indexes into this, so the order is load-bearing.
+	const float Us[4] = { float(U0), float(U0), float(U0 + W), float(U0 + W) };
+	const float Vs[4] = { float(V0), float(V0 + H), float(V0 + H), float(V0) };
+
+	// Two triangles per quad. Negative-facing quads wind the opposite way so
+	// both end up front-facing — matching bReverseWinding = !Positive.
+	//
+	//   forward (positive): 0,1,2  0,2,3
+	//   reversed (negative): 0,2,1  0,3,2
+	const uint ForwardWinding[6]  = { 0u, 1u, 2u, 0u, 2u, 3u };
+	const uint ReversedWinding[6] = { 0u, 2u, 1u, 0u, 3u, 2u };
+	const uint Corner = (Positive != 0u) ? ForwardWinding[CornerIndex]
+	                                     : ReversedWinding[CornerIndex];
+
+	float3 PositionVox = float3(0.0f, 0.0f, 0.0f);
+	PositionVox[Axis] = FaceCoordVox;
+	PositionVox[U]    = Us[Corner];
+	PositionVox[V]    = Vs[Corner];
+
+	float3 Normal = float3(0.0f, 0.0f, 0.0f);
+	Normal[Axis] = (Positive != 0u) ? 1.0f : -1.0f;
+
+	// AO is 2 bits per corner, packed in the order (0,0),(1,0),(0,1),(1,1)
+	// — see vxc::detail::aoCorner in mesher.h. That is NOT the corner order
+	// used for positions above, so the remap is deliberate:
+	//   position corner 0 (u0,v0) -> ao bits 0-1
+	//   position corner 1 (u0,v1) -> ao bits 4-5
+	//   position corner 2 (u1,v1) -> ao bits 6-7
+	//   position corner 3 (u1,v0) -> ao bits 2-3
+	const uint AoShiftForCorner[4] = { 0u, 4u, 6u, 2u };
+	const uint AoRaw = (Ao >> AoShiftForCorner[Corner]) & 0x3u;
+
+	FVoxelQuadVertex Out;
+	Out.PositionUU = PositionVox * (VOXEL_SIZE_UU * LevelScale);
+	Out.Normal = Normal;
+	// 0..3 -> 0..1. The CPU path scales by 85/255, which is the same ratio;
+	// spelled as a divide by 3 here because that is what it means.
+	Out.AmbientOcclusion = float(AoRaw) * (1.0f / 3.0f);
+	Out.MaterialId = Mat;
+	return Out;
+}
+
+// Vertices per quad, for sizing a draw: two triangles, no index buffer.
+#define VOXEL_VERTICES_PER_QUAD 6

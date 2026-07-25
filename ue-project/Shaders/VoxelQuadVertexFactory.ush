@@ -1,0 +1,349 @@
+// Vertex factory for GPU-resident voxel quads (ADR-0006, G2).
+//
+// There is NO VERTEX BUFFER. The GPU mesher writes packed quads (8 bytes each)
+// into a persistent pool, and this factory reconstructs every corner from
+// SV_VertexID alone: 6 vertices per quad, two triangles, no index buffer.
+// That is the whole point of ADR-0006 -- geometry never round-trips through the
+// CPU, so streaming a chunk in or out never touches FScene.
+//
+// Modelled on FLidarPointCloudVertexFactory (Engine/Plugins/Enterprise/
+// LidarPointCloud), which does the same trick: read a buffer by SV_VertexID and
+// expand each entry into a quad in the vertex shader.
+//
+// The decode itself lives in VoxelQuadDecode.ush and is verified bit-exact
+// against a CPU reference by voxel.GPU.VerifyRegion -- so if terrain looks
+// wrong, the bug is in THIS file (framing, transforms, material plumbing),
+// not in the unpacking.
+
+#include "/Engine/Private/VertexFactoryCommon.ush"
+#include "/VoxelEarth/VoxelQuadDecode.ush"
+
+// The quad pool and its framing arrive in the VoxelVF uniform buffer, declared
+// by FVoxelQuadVertexFactoryParameters and injected into this shader by the
+// engine. Members are reached THROUGH the struct -- VoxelVF.QuadBuffer -- not
+// as loose globals of that name. Declaring loose globals here instead compiles
+// perfectly and then silently reads zeros, because they are different, unbound
+// symbols. So there is deliberately nothing to declare in this file.
+
+struct FVertexFactoryInput
+{
+	// No ATTRIBUTE bindings at all -- the vertex declaration is empty (see
+	// FVoxelQuadVertexFactory::InitRHI). SV_VertexID is a system value, not a
+	// stream, so it arrives without any vertex buffer bound.
+	// Zero-stride dummy, never read. It exists only because a draw going
+	// through the mesh-pass system needs a vertex declaration to describe --
+	// see FVoxelQuadVertexFactory::InitRHI.
+	half4 DummyAttribute : ATTRIBUTE0;
+
+	uint VertexId : SV_VertexID;
+
+	VF_INSTANCED_STEREO_DECLARE_INPUT_BLOCK()
+	VF_MOBILE_MULTI_VIEW_DECLARE_INPUT_BLOCK()
+};
+
+struct FVertexFactoryInterpolantsVSToPS
+{
+	TANGENTTOWORLD_INTERPOLATOR_BLOCK
+
+	half4  Color     : COLOR0;
+	float2 TexCoords : TEXCOORD0;
+};
+
+struct FVertexFactoryIntermediates
+{
+	half3x3 TangentToLocal;
+	half3x3 TangentToWorld;
+	half    TangentToWorldSign;
+	half4   Color;
+	float3  Position;      // primitive space, unreal units
+	float2  TexCoords;
+
+	FSceneDataIntermediates SceneData;
+};
+
+// Builds a tangent frame for an axis-aligned voxel face. The face normal is
+// one of the six axis directions, and the quad's own u/v axes are the other
+// two -- so the frame is exact, not approximated.
+half3x3 VoxelBuildTangentFrame(float3 Normal, uint Axis)
+{
+	const uint U = (Axis + 1u) % 3u;
+	const uint V = (Axis + 2u) % 3u;
+
+	float3 Tangent = float3(0.0f, 0.0f, 0.0f);
+	float3 Bitangent = float3(0.0f, 0.0f, 0.0f);
+	Tangent[U] = 1.0f;
+	Bitangent[V] = 1.0f;
+
+	half3x3 Frame;
+	Frame[0] = (half3)Tangent;
+	Frame[1] = (half3)Bitangent;
+	Frame[2] = (half3)Normal;
+	return Frame;
+}
+
+FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput Input)
+{
+	FVertexFactoryIntermediates Intermediates = (FVertexFactoryIntermediates)0;
+	Intermediates.SceneData = VF_GPUSCENE_GET_INTERMEDIATES(Input);
+
+	const uint QuadIndex = Input.VertexId / VOXEL_VERTICES_PER_QUAD;
+	const uint CornerIndex = Input.VertexId % VOXEL_VERTICES_PER_QUAD;
+
+	const uint2 Packed = VoxelVF.QuadBuffer[QuadIndex];
+
+	// In pool mode every quad names its own chunk, so one draw can span the
+	// whole pool with no per-draw state. In single-chunk mode the framing comes
+	// from the uniform buffer instead.
+	float3 ChunkOrigin = VoxelVF.ChunkOriginUU;
+	float ChunkScale = VoxelVF.LevelScale;
+	float2 ChunkClimate = float2(0.5f, 0.5f);
+	if (VoxelVF.PoolMode != 0u)
+	{
+		const uint ChunkId = VoxelVF.QuadChunkIds[QuadIndex];
+		const float4 Entry = VoxelVF.ChunkOrigins[ChunkId];
+		ChunkOrigin = Entry.xyz;
+		ChunkScale = Entry.w;
+		ChunkClimate = VoxelVF.ChunkClimate[ChunkId];
+	}
+
+	const FVoxelQuadVertex Decoded = DecodeVoxelQuadVertex(Packed, CornerIndex, ChunkScale);
+	Intermediates.Position = Decoded.PositionUU + ChunkOrigin;
+
+// TEMPORARY BISECT (VOXEL_VF_DEBUG_QUAD). Replaces all real geometry with one
+// large flat quad at the primitive origin. If this shows up and the real
+// geometry does not, the draw plumbing is fine and the fault is in the decoded
+// positions; if even this is invisible, the draw itself never rasterises and
+// the empty vertex declaration is the prime suspect. Remove once resolved.
+#if VOXEL_VF_DEBUG_QUAD
+	{
+		// A CUBE, not a single quad.
+		//
+		// The first version of this test drew one horizontal quad and concluded
+		// from its absence that the draw never rasterises. That conclusion was
+		// unsound: the quad sat above the camera, so we were looking at its
+		// underside, and backface culling alone would explain the blank frame.
+		//
+		// Six outward-facing sides cannot all be culled from any viewpoint, so
+		// this version distinguishes "nothing rasterises" from "I aimed a
+		// single-sided surface away from the camera".
+		const float S = 2000.0f;   // 20 m
+		const uint Face = QuadIndex;
+		const uint FAxis = Face / 2u;
+		const bool bPositiveFace = (Face % 2u) == 1u;
+		const uint FU = (FAxis + 1u) % 3u;
+		const uint FV = (FAxis + 2u) % 3u;
+
+		float2 Fwd[6] = { float2(0,0), float2(0,S), float2(S,S),
+		                  float2(0,0), float2(S,S), float2(S,0) };
+		float2 Rev[6] = { float2(0,0), float2(S,S), float2(0,S),
+		                  float2(0,0), float2(S,0), float2(S,S) };
+		const float2 C = bPositiveFace ? Fwd[CornerIndex] : Rev[CornerIndex];
+
+		float3 P = float3(0.0f, 0.0f, 0.0f);
+		P[FAxis] = bPositiveFace ? S : 0.0f;
+		P[FU] = C.x;
+		P[FV] = C.y;
+
+		// Faces 0-5 form the cube; every other quad collapses to a point.
+		Intermediates.Position = (QuadIndex < 6u) ? P : float3(0.0f, 0.0f, 0.0f);
+	}
+#endif
+
+	const uint Axis = Packed.x & 0xfu;
+	Intermediates.TangentToLocal = VoxelBuildTangentFrame(Decoded.Normal, Axis);
+	Intermediates.TangentToWorldSign = 1.0h;
+
+	// Matches the CPU path's vertex colour layout (BuildChunkVertexData):
+	//   R = material id, G = ambient occlusion, B/A = climate.
+	//
+	// KNOWN GAP: climate (B = temperature, A = precipitation) is sampled on the
+	// CPU from a 30 m raster and is not available here yet, so both are held at
+	// the neutral midpoint. Expect the GPU path's biome tint to differ from the
+	// CPU path until G4 supplies climate GPU-side. This is a predicted
+	// difference, not a bug to chase during the G2 visual A/B.
+	// B/A carry climate, sampled once per chunk on the CPU and looked up above.
+	// Single-chunk mode has no per-chunk table, so they stay neutral there and
+	// its biome tint will differ from the CPU path -- pool mode is the one
+	// that matches.
+	// R is a BINARY sky-facing flag, not the material id.
+	//
+	// The CPU path documents this at length (VoxelClimateProbe.h): thresholding
+	// a categorical id through the FColor->shader transform proved unreliable,
+	// so R is 0 or 255 -- the fixed points of any monotonic per-channel
+	// transform -- and surface-ness is derived from FACE DIRECTION rather than
+	// material id, because the ids voxel-core actually emits here are only
+	// MAT_ROCK and MAT_SUBSOIL. Writing the id instead makes every quad read as
+	// subsurface, which is exactly the grey/tan the first pool render showed.
+	//
+	// Not yet mirrored: the CPU path also gates on proximity to the chunk
+	// surface, so a cave FLOOR (also a +Z face) is not tinted as hillside. That
+	// needs the chunk surface height GPU-side; without it, underground +Z faces
+	// will tint as if they were open sky.
+	const uint QPositive = (Packed.x >> 4) & 0xfu;
+	const bool bSkyFacing = (Axis == 2u) && (QPositive != 0u);
+
+	Intermediates.Color = half4(
+		bSkyFacing ? 1.0h : 0.0h,
+		(half)Decoded.AmbientOcclusion,
+		(half)ChunkClimate.x,
+		(half)ChunkClimate.y);
+
+	// World-planar UVs on the face's two in-plane axes, matching the CPU
+	// path's "position / 100, wrapped to a 32 m period". The wrap keeps the
+	// value small so float precision stays sub-millimetre no matter how far
+	// the chunk sits from the world origin.
+	const uint U = (Axis + 1u) % 3u;
+	const uint V = (Axis + 2u) % 3u;
+	const float UVPeriodM = 32.0f;
+	Intermediates.TexCoords = float2(
+		fmod(Intermediates.Position[U] / 100.0f, UVPeriodM),
+		fmod(Intermediates.Position[V] / 100.0f, UVPeriodM));
+
+	// Rotate the tangent frame into world space, one basis vector at a time.
+	//
+	// There is no engine-wide "CalcTangentToWorld" -- the vertex factories that
+	// appear to call one each define their own local helper. The genuinely
+	// shared primitive is RotateLocalToWorld (VertexFactoryCommon.ush:147), and
+	// the FDFMatrix overload is the one to use because it works whether or not
+	// the factory opts into GPUScene primitive data.
+	const FPrimitiveSceneData VoxelPrimitive = Intermediates.SceneData.Primitive;
+	Intermediates.TangentToWorld[0] = (half3)RotateLocalToWorld(
+		Intermediates.TangentToLocal[0], VoxelPrimitive.LocalToWorld, VoxelPrimitive.InvNonUniformScale);
+	Intermediates.TangentToWorld[1] = (half3)RotateLocalToWorld(
+		Intermediates.TangentToLocal[1], VoxelPrimitive.LocalToWorld, VoxelPrimitive.InvNonUniformScale);
+	Intermediates.TangentToWorld[2] = (half3)RotateLocalToWorld(
+		Intermediates.TangentToLocal[2], VoxelPrimitive.LocalToWorld, VoxelPrimitive.InvNonUniformScale);
+
+	return Intermediates;
+}
+
+FVertexFactoryInterpolantsVSToPS VertexFactoryGetInterpolantsVSToPS(
+	FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates,
+	FMaterialVertexParameters VertexParameters)
+{
+	FVertexFactoryInterpolantsVSToPS Interpolants = (FVertexFactoryInterpolantsVSToPS)0;
+	Interpolants.TangentToWorld0 = float4(Intermediates.TangentToWorld[0], 0);
+	Interpolants.TangentToWorld2 = float4(Intermediates.TangentToWorld[2], Intermediates.TangentToWorldSign);
+	Interpolants.Color = VertexParameters.VertexColor;
+	Interpolants.TexCoords = Intermediates.TexCoords;
+	return Interpolants;
+}
+
+half3x3 VertexFactoryGetTangentToLocal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.TangentToLocal;
+}
+
+float4 VertexFactoryGetWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return TransformLocalToTranslatedWorld(Intermediates.Position, Intermediates.SceneData.Primitive.LocalToWorld);
+}
+
+float3 VertexFactoryGetInstanceSpacePosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	// No instancing: instance space == primitive space.
+	return Intermediates.Position;
+}
+
+float4 VertexFactoryGetRasterizedWorldPosition(
+	FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, float4 InWorldPosition)
+{
+	return InWorldPosition;
+}
+
+float3 VertexFactoryGetPositionForVertexLighting(
+	FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, float3 TranslatedWorldPosition)
+{
+	return TranslatedWorldPosition;
+}
+
+float3 VertexFactoryGetWorldNormal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.TangentToWorld[2];
+}
+
+float4 VertexFactoryGetPreviousWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	// Terrain does not move between frames; the only motion is the camera, so
+	// the previous position is this position under the previous transform.
+	return mul(float4(Intermediates.Position, 1),
+	           DFMultiplyAffineTranslationDemote(Intermediates.SceneData.InstanceData.PrevLocalToWorld,
+	                                             ResolvedView.PrevPreViewTranslation));
+}
+
+float3 VertexFactoryGetPreviousInstanceSpacePosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.Position;
+}
+
+FMaterialVertexParameters GetMaterialVertexParameters(
+	FVertexFactoryInput Input,
+	FVertexFactoryIntermediates Intermediates,
+	float3 WorldPosition,
+	half3x3 TangentToLocal,
+	bool bIsPreviousFrame = false)
+{
+	FMaterialVertexParameters Result = MakeInitializedMaterialVertexParameters();
+	Result.SceneData = Intermediates.SceneData;
+
+	Result.WorldPosition = WorldPosition;
+	if (bIsPreviousFrame)
+	{
+		Result.PositionInstanceSpace = VertexFactoryGetPreviousInstanceSpacePosition(Input, Intermediates);
+	}
+	else
+	{
+		Result.PositionInstanceSpace = VertexFactoryGetInstanceSpacePosition(Input, Intermediates);
+	}
+	Result.PositionPrimitiveSpace = Result.PositionInstanceSpace;
+
+	Result.TangentToWorld = Intermediates.TangentToWorld;
+	Result.PreSkinnedNormal = TangentToLocal[2];
+	Result.PreSkinnedPosition = WorldPosition;
+	Result.VertexColor = Intermediates.Color;
+
+#if NUM_MATERIAL_TEXCOORDS_VERTEX
+	Result.TexCoords[0] = Intermediates.TexCoords;
+#endif
+
+	Result.LWCData = MakeMaterialLWCData(Result);
+	return Result;
+}
+
+FMaterialPixelParameters GetMaterialPixelParameters(
+	FVertexFactoryInterpolantsVSToPS Interpolants, float4 SvPosition)
+{
+	FMaterialPixelParameters Result = MakeInitializedMaterialPixelParameters();
+
+	Result.TwoSidedSign = 1;
+	Result.VertexColor = Interpolants.Color;
+
+	half3 TangentToWorld0 = Interpolants.TangentToWorld0.xyz;
+	half4 TangentToWorld2 = Interpolants.TangentToWorld2;
+	Result.UnMirrored = TangentToWorld2.w;
+	Result.TangentToWorld = AssembleTangentToWorld(TangentToWorld0, TangentToWorld2);
+
+#if NUM_TEX_COORD_INTERPOLATORS
+	Result.TexCoords[0] = Interpolants.TexCoords;
+#endif
+
+	return Result;
+}
+
+float4 VertexFactoryGetTranslatedPrimitiveVolumeBounds(FVertexFactoryInterpolantsVSToPS Interpolants)
+{
+	FPrimitiveSceneData PrimitiveData = GetPrimitiveDataFromUniformBuffer();
+	return float4(DFFastToTranslatedWorld(PrimitiveData.ObjectWorldPosition, ResolvedView.PreViewTranslation),
+	              PrimitiveData.ObjectRadius);
+}
+
+uint VertexFactoryGetPrimitiveId(FVertexFactoryInterpolantsVSToPS Interpolants)
+{
+	// Not using GPUScene primitive IDs -- the per-draw primitive uniform buffer
+	// carries everything this factory needs.
+	return 0;
+}
+
+// Must come last: supplies defaults for the optional interface hooks this
+// factory does not override.
+#include "/Engine/Private/VertexFactoryDefaultInterface.ush"

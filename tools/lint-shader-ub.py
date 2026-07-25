@@ -5,7 +5,7 @@ WHY THIS EXISTS
 ---------------
 The M0 cross-vendor determinism gate passed on an AMD RX 7800 XT and failed on
 an NVIDIA RTX 4090 running the IDENTICAL committed SPIR-V. Root cause (commit
-6ab4b2a): `worldgen.hlsl`'s `floorDiv` derived its flooring correction from
+6ab4b2a): `worldgen.ush`'s `floorDiv` derived its flooring correction from
 `a % b`. HLSL defines `%` only when both operands share a sign, and every
 worldgen coordinate hits it with a negative dividend over a positive divisor.
 DXC lowers that to a 64-bit `OpSRem`; AMD's emulation carried the dividend's
@@ -767,9 +767,13 @@ def main() -> int:
     targets: list[pathlib.Path] = []
     for p in args.paths or ["voxel-core/shaders"]:
         path = pathlib.Path(p)
-        targets.extend(sorted(path.glob("*.hlsl")) if path.is_dir() else [path])
+        # .ush as well as .hlsl: worldgen was renamed to .ush so that Unreal's
+        # shader pipeline will load it (UE accepts only .usf/.ush -- see
+        # ShaderCore.cpp CheckVirtualShaderFilePath). Same file, same lint.
+        targets.extend(sorted([*path.glob("*.hlsl"), *path.glob("*.ush")])
+                       if path.is_dir() else [path])
     if not targets:
-        print("lint-shader-ub: no .hlsl files found", file=sys.stderr)
+        print("lint-shader-ub: no .hlsl/.ush files found", file=sys.stderr)
         return 1
 
     findings: list[Finding] = []

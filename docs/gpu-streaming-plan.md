@@ -16,7 +16,7 @@ byte-identical, in the `voxel-core/bench` harness.
 throughput trade (ADR-0006 says he decides here), and prove the two existing
 kernels chain end-to-end at runtime resolution.
 
-- Wire `worldgen.hlsl` voxelize into an RDG pass inside UE (not just the bench),
+- Wire `worldgen.ush` voxelize into an RDG pass inside UE (not just the bench),
   producing a chunk's cell buffer on the GPU. Reuse the AMD-verified kernel.
 - Measure: voxelize + (CPU-side, for now) mesh throughput at 10 cm for one
   chunk, per ring level; VRAM per chunk of packed geometry (2×uint32/quad per
@@ -24,20 +24,77 @@ kernels chain end-to-end at runtime resolution.
 - **Deliverable:** a one-page table — for candidate view distances (2 km, 4 km,
   8 km…) the resident chunk count, packed-geometry VRAM, and generate-throughput,
   with a recommended target. **Matt picks the target here.**
+- **Evaluate engine-native GPU-driven paths BEFORE committing to a hand-rolled
+  one** (added 2026-07-24). G2 below proposes a private geometry pool plus a
+  custom `FPrimitiveSceneProxy` with indirect draws — that is where all of this
+  plan's schedule risk is concentrated, and it is close to re-implementing
+  machinery UE already ships. Spend part of G0 answering: can GPUScene /
+  Mesh Draw Commands be fed GPU-resident buffers directly? Does Nanite apply to
+  the outer rings, where geometry is effectively static between digs (note the
+  sibling Mira-Thal project already runs a working Nanite bake path over 10 cm
+  voxel terrain)? Building a private version of an engine feature is an
+  expensive way to discover the engine had one. **Deliverable:** a paragraph per
+  option — viable / not viable and why.
 - **Gate:** numbers produced; no code on the hot path yet. Cheap to abort.
 
-## G1 — GPU greedy mesher kernel (`gpu-mesher-design.md`) + digest parity
+## G1 — GPU greedy mesher kernel (`gpu-mesher-design.md`) + digest parity ✅ COMPLETE
 
-**Goal:** build the deterministic mesher kernel so geometry can be produced
-entirely on the GPU.
+**Status: DONE (kernels landed 2026-07-21; gate re-verified 2026-07-25).**
 
-- Implement `MeshCountMain` → scan → `MeshEmitMain` (count→scan→emit, one thread
-  per face-mask) exactly as speced. Scan on CPU first if it ships faster; move
-  to GPU scan when readback shows in profiles.
-- **Gate:** bench meshes N regions CPU and GPU, **byte-identical quad streams**
-  (combined digest joins the existing columns+cells digest). This is the
-  kernel-correctness insurance of ADR-0006 invariant 3 — earned once here, not
-  required per-frame later. AMD leg green; NVIDIA CI leg green.
+- `MeshCountMain` → scan → `MeshEmitMain` implemented exactly as speced, one
+  thread per face-mask. The scan went **straight to the GPU**
+  (`ScanBlocksMain`/`ScanSumsMain`/`ScanAddMain`) — the "CPU scan for v1"
+  fallback was never needed.
+- **Gate: GREEN.** `vxc_gpu.exe --radius 64` compares 3,058,001 of 3,058,001
+  quads over 319/319 tiles, byte-identical to the CPU mesher. Combined digest
+  (columns + cells + quads) `591c7602bb9b0e62`, seed 20260719, worldgen v6.
+  End-to-end 0.147 s against the <1 s M0 target. AMD leg green.
+- **NVIDIA CI leg is still owed** — the only unmet part of the original gate.
+
+**Carried into G2:** the kernels exist only in the standalone Vulkan bench,
+compiled by `dxc` outside the engine. They have never run inside Unreal. Porting
+the HLSL to UE global shaders + RDG is the first task of G2, not a G1 remnant.
+
+## G2a — The kernels, in-engine, through RDG ✅ COMPLETE *(2026-07-25)*
+
+**Gate: GREEN, first run.** Two toolchains, two graphics APIs, one number:
+
+```
+bench  (dxc -> SPIR-V -> Vulkan) : f3c48a4df3e20e9a
+Unreal (UE  -> DXIL   -> D3D12)  : f3c48a4df3e20e9a
+```
+
+8192 columns, 393,216 cells, 6,666 quads compared field by field across both
+bench fixture regions. Zero mismatches. This is what carries G1's bit-exactness
+proof into the engine: the kernels Unreal compiles are byte-for-byte as correct
+as the ones the bench proved.
+
+**What landed:**
+
+- **`VoxelEarthShaders`**, a new module at `LoadingPhase: PostConfigInit`.
+  Required, not cosmetic — Unreal builds its global shader map inside
+  `PreInitPreStartupScreen`, *before* any `Default`-phase module loads, so a
+  shader directory registered by the primary game module is too late.
+- **`/VoxelCore` is mapped to `voxel-core/shaders`, not copied.** The bench and
+  the engine compile the same file. A copy would drift and the digest gate
+  would quietly stop meaning anything. `worldgen.hlsl` was renamed to
+  `worldgen.ush` because Unreal loads only `.usf`/`.ush`, and a `VXC_UE`
+  compile switch changes only how resources are *declared* — never the math.
+- **Per-kernel parameter structs.** `OutQuadOffsets` is a UAV in the scan and
+  an SRV in `MeshEmit`; RDG flags both bindings inside one pass.
+- **SM6 is now requested in `DefaultEngine.ini`.** UE 5.8 ships `PCD3D_SM5`
+  only, and worldgen is 64-bit integer throughout, so it does not compile on
+  SM5 at all.
+
+**Verify with:** `voxel.GPU.VerifyRegion` (no args). Headless — no PIE, no
+flying, no visual judgement:
+
+```
+UnrealEditor-Cmd.exe VoxelEarth.uproject -game -nosplash -unattended -sm6 \
+  -ExecCmds="voxel.GPU.VerifyRegion, quit"
+```
+
+First region costs ~1900 ms (shader compile + PSO warmup), the second ~3.4 ms.
 
 ## G2 — Persistent GPU geometry pool + custom draw (one static chunk on screen)
 

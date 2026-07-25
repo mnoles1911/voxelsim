@@ -1,6 +1,6 @@
 # Prebuilt SPIR-V (ADR-0001 M0 cross-vendor determinism gate)
 
-These 7 `.spv` files are the compiled output of `voxel-core/shaders/worldgen.hlsl`
+These 7 `.spv` files are the compiled output of `voxel-core/shaders/worldgen.ush`
 (ColumnMain, VoxelizeMain, MeshCountMain, MeshEmitMain, ScanBlocksMain,
 ScanSumsMain, ScanAddMain), committed here — rather than left in the
 gitignored `build/shaders/` directory `tools/compile-shaders.ps1` normally
@@ -13,7 +13,7 @@ the M0 determinism gate transitively (both legs agree with the CPU reference
 
 ## 2026-07 respin: signed `%` vendor-divergence fix (ColumnMain only)
 
-`worldgen.ColumnMain.spv` was recompiled after `worldgen.hlsl`'s `floorDiv`
+`worldgen.ColumnMain.spv` was recompiled after `worldgen.ush`'s `floorDiv`
 was rewritten to stop depending on signed `/` and `%` with mixed-sign
 operands (HLSL leaves `%` undefined unless both operands share a sign). That
 dependency is what failed the NVIDIA leg of this gate: on an RTX 4090 the
@@ -27,7 +27,7 @@ are bit-identical before and after the fix.
 
 ## 2026-07 respin 2: cross-vendor UB hardening (ColumnMain, MeshCount, MeshEmit)
 
-A follow-up audit of `worldgen.hlsl` found five more constructs in the same
+A follow-up audit of `worldgen.ush` found five more constructs in the same
 undefined-behavior family as the signed-`%` bug above — latent rather than
 live, each currently masked by a host-side contract that nothing in the
 shader enforced. All five are now guarded IN THE SHADER:
@@ -62,13 +62,13 @@ the `.spv` files in this directory.
 
 ## Provenance
 
-- Source: `voxel-core/shaders/worldgen.hlsl` at commit `8b834107701fd4a2a005b8dbd4a17352f44f26c1`
+- Source: `voxel-core/shaders/worldgen.ush` at commit `8b834107701fd4a2a005b8dbd4a17352f44f26c1`
   ("M4: biome classification core + per-biome surface materials (round 1)")
 - Compiler: Microsoft DXC, pinned version `v1.9.2602.24` (`tools/fetch-dxc.ps1`),
   `dxcompiler.dll: 1.9(5191-d355aa83)(1.9.2602.24) - 1.9.2602.24 (d355aa836)`
 - Compile command: `tools/compile-shaders.ps1`'s SPIR-V invocation —
   `dxc -T cs_6_0 -E <Entry> -O3 -spirv -fspv-target-env=vulkan1.1
-  -fvk-b-shift 0 0 -fvk-t-shift 1 0 -fvk-u-shift 3 0 worldgen.hlsl -Fo <out>.spv`
+  -fvk-b-shift 0 0 -fvk-t-shift 1 0 -fvk-u-shift 3 0 worldgen.ush -Fo <out>.spv`
 - Compiled and committed from: worktree HEAD `4b54e9f1118de70cec46b837e7e237547ef2fce8`
   (branch base: `main`, PR #40 "worldgen-vendor-ub-fix" merge) — ColumnMain,
   MeshCountMain and MeshEmitMain respun for the UB-hardening pass above.
@@ -122,13 +122,13 @@ against this list before trusting a copy of these files.
 GPU-output digests (`e1db29a9b6874012` at `--radius 64`, `583e91d62cefb8a9`
 at `--radius 128`) from **before** commit `8b83410` ("M4: biome
 classification core + per-biome surface materials, round 1") landed. That
-commit added new materials/biome constants to `worldgen.hlsl` itself (see
-`git diff 34c9de2..8b83410 -- voxel-core/shaders/worldgen.hlsl`), which
+commit added new materials/biome constants to `worldgen.ush` itself (see
+`git diff 34c9de2..8b83410 -- voxel-core/shaders/worldgen.ush`), which
 legitimately changes the GPU output — the old digests are stale relative to
 current `HEAD`, not a bug in these shaders.
 
 **What was actually verified** (2026-07 worldgen v3 pass, on this box, fresh
-rebuild from the pinned DXC + current `worldgen.hlsl`, using these exact
+rebuild from the pinned DXC + current `worldgen.ush`, using these exact
 committed `.spv` files via `vxc_gpu --spv .../prebuilt/...`):
 
 | Mode | Result | GPU output digest (columns+cells+quads) |
@@ -210,7 +210,7 @@ shader binaries are part of the determinism surface (ADR-0001).
 
 ## 2026-07 respin 3: M4 cave pass (kWorldGenVersion 3 -> 4)
 
-`worldgen.hlsl` gained a real code change this time — the M4 cave pass, a
+`worldgen.ush` gained a real code change this time — the M4 cave pass, a
 bit-exact HLSL mirror of `voxelcore/caves.h` (`caveEdgeExists`,
 `caveEdgeRadiusMm`, `caveColumnFor`, `caveCarveAt`), plus the split of the
 old `materialAt` into `stratigraphyAt` (layer model) and `materialAt`
@@ -254,7 +254,7 @@ mismatches.
 
 ## Respin 4 — caverns (C4), crevices (C2) and the 180-220 m bedrock band
 
-`worldgen.hlsl` now mirrors the C2 crevices, the C4 folded cavern pass and
+`worldgen.ush` now mirrors the C2 crevices, the C4 folded cavern pass and
 the `kWorldGenVersion` 5 bedrock move (40-60 m -> a jittered band centred on
 200 m). `VoxelizeMain` grew 20,816 -> 71,808 bytes; `ColumnMain` moved for
 the usual module-layout reason. The other five modules are byte-identical to
@@ -287,11 +287,11 @@ shader had not picked the change up at all.
 
 `python tools/lint-shader-ub.py` is clean on its own merits (5 rules,
 fail-closed); every `allow` annotation in the file carries a justification.
-`worldgen.hlsl` still contains zero `float`/`double`/`half`.
+`worldgen.ush` still contains zero `float`/`double`/`half`.
 
 ## Respin 5 — coarse-to-fine detail rework (kWorldGenVersion 5 -> 6)
 
-`worldgen.hlsl` gained the GPU mirror of the amplifier's coarse-to-fine
+`worldgen.ush` gained the GPU mirror of the amplifier's coarse-to-fine
 detail rework — the first change to the surface term made against REAL 30 m
 terrain-diffusion tiles rather than `SyntheticTileSampler`. Three pieces:
 
@@ -339,9 +339,9 @@ also grew relative to respin 4 (`--radius 64`: 305 -> 319 tiles,
 that is genuinely rougher at the voxel scale — more surface area, more
 meshed faces. That is the cost side of this change and it is real.
 
-`worldgen.hlsl` still contains zero `float`/`double`/`half`.
+`worldgen.ush` still contains zero `float`/`double`/`half`.
 
-- Source: `voxel-core/shaders/worldgen.hlsl` at worktree commit
+- Source: `voxel-core/shaders/worldgen.ush` at worktree commit
   `2d785e202dc60e3b055645a3e903494abe12c9cf` ("worldgen v6: mirror the detail
   rework to HLSL, bump version, re-pin goldens")
 - Compiler: the same pinned Microsoft DXC `v1.9.2602.24`

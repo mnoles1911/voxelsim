@@ -1,7 +1,7 @@
 #pragma once
 // Biome classification v1 (M4 round-1 scope, docs/m4-plan.md "How
 // biome<->terrain consistency works"). Header-only, integer-only — this
-// logic is mirrored bit-for-bit in voxel-core/shaders/worldgen.hlsl's
+// logic is mirrored bit-for-bit in voxel-core/shaders/worldgen.ush's
 // ColumnMain (docs/determinism.md's CPU/GPU mirror contract). ANY change
 // here must be made identically in both places and re-verified by vxc_gpu.
 //

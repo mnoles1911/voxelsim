@@ -240,6 +240,25 @@ namespace VoxelDebug
 	// without a hole. Default 1000; 0 disables.
 	VOXELEARTH_API float GetStreamLodRetentionMs();
 
+	// voxel.Render.CastShadow: do terrain chunks render into the directional
+	// light's shadow-depth pass (PR #95)? Default true. Exists to A/B the
+	// render-thread cost of terrain shadows on ONE primitive flag -- see the
+	// cvar's source comment for why r.ShadowQuality is not a valid substitute
+	// (it desyncs the BeginPlay PSO precache and measures that instead).
+	VOXELEARTH_API bool GetRenderCastShadow();
+
+	// voxel.Stream.GPU: route chunk geometry through the ADR-0006 GPU pool
+	// (ONE primitive, ONE draw) rather than one scene component per chunk.
+	// Default false until G5. See the cvar's source comment -- only the
+	// geometry handoff moves; every streaming decision upstream is shared.
+	VOXELEARTH_API bool GetStreamGpu();
+
+	// voxel.Stream.JobsInFlightPerCore: worker slots in flight as a multiple of
+	// logical cores. Default 2 (the historical hardcoded 2xLogicalCores). See
+	// the cvar's source comment for the dispatch-starvation measurement that
+	// made this tunable.
+	VOXELEARTH_API int32 GetStreamJobsInFlightPerCore();
+
 	// voxel.Stream.MaxRemeshesPerFrame: max game-thread overlay-aware edit
 	// re-meshes (DrainGameThreadMesh -- first load of an edited chunk, or a
 	// post-edit dirty re-mesh) applied per frame. Default 8 (2026-07-24 pass).
