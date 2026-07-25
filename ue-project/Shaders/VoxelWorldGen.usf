@@ -1,0 +1,23 @@
+// Unreal-side entry file for the voxel-core GPU kernels (ADR-0006, G2a).
+//
+// This file deliberately contains NO logic. It exists because Unreal compiles
+// a shader by (virtual file path, entry point name), and because the kernels
+// themselves live outside the Unreal project — in voxel-core/shaders, which is
+// engine-free and shared with the standalone Vulkan determinism bench.
+//
+// Keeping the kernels there rather than copying them here is the whole point:
+// the M0/G1 gate proves the GPU output is bit-exact with the CPU mesher, and
+// that proof only transfers to Unreal if Unreal compiles THE SAME TEXT. A copy
+// would drift, silently, and the first symptom would be wrong terrain.
+//
+// Platform.ush must come first — it defines the per-platform intrinsics and
+// type plumbing every Unreal shader is compiled against.
+//
+// VXC_UE is defined by FVoxelWorldGenShader::ModifyCompilationEnvironment. It
+// switches worldgen.ush's resource DECLARATIONS (not its math) over to
+// Unreal's conventions: no explicit register() slots, and the WorldGenParams
+// fields declared as loose globals so they land in $Globals where Unreal's
+// shader parameter struct binds them.
+
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelCore/worldgen.ush"

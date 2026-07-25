@@ -350,12 +350,31 @@ struct GpuColumnSample
 // than a second one: it stays a single binding, and the fields ColumnMain
 // doesn't use (BrickZMin/BricksZ) or VoxelizeMain doesn't use (RasterOriginPx/
 // RasterSize/PixelSizeMm) simply go unread by that kernel's entry point.
-// Under VXC_UE these same fields are declared, by these same names and in
-// this same order, by FVoxelWorldGenParams in VoxelGpuShaders.cpp -- Unreal
-// generates the constant buffer from that struct, so declaring one here too
-// would be a duplicate definition. Keep the two lists in sync; the Unreal
-// side static_asserts its own size against the 56 bytes the bench uses.
-#ifndef VXC_UE
+// Under VXC_UE the same fields are declared as LOOSE GLOBALS instead of an
+// explicit cbuffer. That is Unreal's convention for shader parameters (see
+// Engine/Shaders/Private/Tools/SetupIndirectArgs.usf -- `uint Multiplier;`
+// at file scope): loose globals land in the implicit $Globals constant
+// buffer, which is exactly where Unreal's BEGIN_SHADER_PARAMETER_STRUCT
+// binds SHADER_PARAMETER entries by reflected name. A hand-declared
+// `cbuffer WorldGenParams : register(b0)` would be a SEPARATE constant
+// buffer that Unreal never binds -- the kernel would read zeroes.
+//
+// Same names, same order, same types either way; only the wrapper differs.
+// The Unreal-side struct is FVoxelWorldGenParameters in VoxelGpuWorldGen.cpp,
+// which static_asserts its own layout against the 56 bytes the bench uses.
+#ifdef VXC_UE
+uint2 DispatchColumns;
+int2 RasterOriginPx;
+uint2 RasterSize;
+int PixelSizeMm;
+uint SeedLo;
+uint SeedHi;
+int OriginVx;
+int OriginVy;
+int BrickZMin;
+uint BricksZ;
+uint ScanCount;
+#else
 cbuffer WorldGenParams : register(b0)
 {
     uint2 DispatchColumns;  // columns along x, y for this dispatch (both kernels)
