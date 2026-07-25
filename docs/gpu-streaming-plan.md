@@ -55,27 +55,46 @@ kernels chain end-to-end at runtime resolution.
 compiled by `dxc` outside the engine. They have never run inside Unreal. Porting
 the HLSL to UE global shaders + RDG is the first task of G2, not a G1 remnant.
 
-## G2a — The kernels, in-engine, through RDG *(prerequisite; added 2026-07-25)*
+## G2a — The kernels, in-engine, through RDG ✅ COMPLETE *(2026-07-25)*
 
-**Goal:** run the G1 chain inside Unreal and prove it still produces the same
-bytes. Nothing renders. This is the bridge between a green standalone bench and
-any of the rendering work below, and it is the cheapest place to discover that
-engine-compiled HLSL diverges from `dxc`-compiled HLSL.
+**Gate: GREEN, first run.** Two toolchains, two graphics APIs, one number:
 
-- Register a shader directory for the `VoxelEarth` module; get `worldgen.ush`
-  compiling as UE global compute shaders (D3D12/SM6) with whatever `#ifdef`
-  work the Vulkan-specific syntax needs. **The HLSL must stay one source of
-  truth** — the bench and the engine compile the same file, or the digest gate
-  stops meaning anything.
-- Dispatch `ColumnMain` → `VoxelizeMain` → `MeshCount` → scan → `MeshEmit` as
-  RDG passes for a single chunk; read the quad buffer back.
-- **Gate:** a console command (`voxel.GPU.VerifyChunk`) meshes the chunk under
-  the player on both paths and logs a byte-comparison PASS/FAIL plus the quad
-  digest. Must match the CPU mesher exactly.
-- **Why this is its own milestone:** it is verifiable *headlessly* — no PIE
-  flying, no visual judgement, no designer time. If engine-compiled output
-  diverges, we find out here, against a known-good reference, instead of inside
-  a half-built renderer where a wrong quad looks like a pool-allocator bug.
+```
+bench  (dxc -> SPIR-V -> Vulkan) : f3c48a4df3e20e9a
+Unreal (UE  -> DXIL   -> D3D12)  : f3c48a4df3e20e9a
+```
+
+8192 columns, 393,216 cells, 6,666 quads compared field by field across both
+bench fixture regions. Zero mismatches. This is what carries G1's bit-exactness
+proof into the engine: the kernels Unreal compiles are byte-for-byte as correct
+as the ones the bench proved.
+
+**What landed:**
+
+- **`VoxelEarthShaders`**, a new module at `LoadingPhase: PostConfigInit`.
+  Required, not cosmetic — Unreal builds its global shader map inside
+  `PreInitPreStartupScreen`, *before* any `Default`-phase module loads, so a
+  shader directory registered by the primary game module is too late.
+- **`/VoxelCore` is mapped to `voxel-core/shaders`, not copied.** The bench and
+  the engine compile the same file. A copy would drift and the digest gate
+  would quietly stop meaning anything. `worldgen.hlsl` was renamed to
+  `worldgen.ush` because Unreal loads only `.usf`/`.ush`, and a `VXC_UE`
+  compile switch changes only how resources are *declared* — never the math.
+- **Per-kernel parameter structs.** `OutQuadOffsets` is a UAV in the scan and
+  an SRV in `MeshEmit`; RDG flags both bindings inside one pass.
+- **SM6 is now requested in `DefaultEngine.ini`.** UE 5.8 ships `PCD3D_SM5`
+  only, and worldgen is 64-bit integer throughout, so it does not compile on
+  SM5 at all.
+
+**Verify with:** `voxel.GPU.VerifyRegion` (no args). Headless — no PIE, no
+flying, no visual judgement:
+
+```
+UnrealEditor-Cmd.exe VoxelEarth.uproject -game -nosplash -unattended -sm6 \
+  -ExecCmds="voxel.GPU.VerifyRegion, quit"
+```
+
+First region costs ~1900 ms (shader compile + PSO warmup), the second ~3.4 ms.
 
 ## G2 — Persistent GPU geometry pool + custom draw (one static chunk on screen)
 

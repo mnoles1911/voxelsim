@@ -18,7 +18,8 @@ handoff. Build is clean; every change below is in the binary.
 | G0 sizing study | ✅ Delivered — `docs/gpu-g0-sizing.md` |
 | Terrain amplification proposal | ⏸️ Reconciled and PARKED — `docs/terrain-amplification-reconciliation.md` |
 | **G1 — GPU greedy mesher** | ✅ **COMPLETE. Gate green.** (was mis-recorded as unstarted) |
-| **G2 — GPU geometry in UE** | ⬜ **NEXT.** Nothing GPU exists inside the engine yet. |
+| **G2a — kernels in-engine via RDG** | ✅ **COMPLETE. Gate green, first run** — UE digest == bench digest |
+| **G2 — GPU geometry pool + custom draw** | ⬜ **NEXT.** The hard part: draw without per-chunk `AddPrimitive`. |
 
 ## G1 is done — do not rebuild it
 
@@ -42,10 +43,35 @@ gate in `docs/gpu-streaming-plan.md`. The kernels shipped 2026-07-21; the
 prebuilt SPIR-V is in `voxel-core/shaders/prebuilt/`. The scan is already on the
 GPU, so even the "CPU scan first" fallback in `gpu-mesher-design.md` was skipped.
 
-**The actual gap is that none of it exists inside Unreal.** The kernels run only
-in the standalone Vulkan bench, compiled by `dxc` outside the engine. Everything
-downstream (G2 pool + custom draw, G3 cascade) needs them running as UE global
-shaders through RDG first.
+## G2a is done too — the kernels run inside Unreal, bit-exact
+
+Closed 2026-07-25. The gate is a single number produced two completely
+different ways:
+
+```
+bench  (dxc -> SPIR-V -> Vulkan) : f3c48a4df3e20e9a
+Unreal (UE  -> DXIL   -> D3D12)  : f3c48a4df3e20e9a
+```
+
+Re-run it any time, headless, in about 30 seconds:
+
+```
+UnrealEditor-Cmd.exe VoxelEarth.uproject -game -nosplash -unattended -sm6 \
+  -ExecCmds="voxel.GPU.VerifyRegion, quit"
+```
+
+Three things about this are worth not rediscovering:
+
+1. **`VoxelEarthShaders` must stay `PostConfigInit`.** Unreal compiles its
+   global shader map before `Default`-phase modules load. Move the shader
+   directory registration into the game module and the shaders vanish.
+2. **`/VoxelCore` is a directory mapping, not a copy.** The bench and the engine
+   compile the same `worldgen.ush`. If anyone ever "simplifies" this by copying
+   the shader into the project, the cross-toolchain digest stops proving
+   anything the moment the copies drift.
+3. **SM6 is mandatory** (`+D3D12TargetedShaderFormats=PCD3D_SM6`, already in
+   `DefaultEngine.ini`). UE 5.8 defaults to SM5, where worldgen's 64-bit
+   integer math does not compile at all.
 
 ### Constraints G2/G3 must respect (found in G0, do not rediscover)
 
