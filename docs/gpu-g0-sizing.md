@@ -114,6 +114,38 @@ across every level, so the VRAM extrapolation above holds per-ring.
   fragmentation headroom, and any double-buffering the pool allocator needs.
   Budget ~1.5–2× the raw figure in practice — still trivial at these scales.
 
+## 5b. R0 = 128 m — Matt's call, and why it must wait for G1
+
+**Decision (Matt, 2026-07-24): target R0 = 128 m**, i.e. true 10 cm voxels out to
+128 m instead of today's 64 m. Recorded here as the G3 target.
+
+**It cannot ship on the CPU path, and the arithmetic is not close.** R0 is the one
+ring whose chunk count scales with the square of its own radius at full
+resolution, because its chunk edge stays at 3.2 m:
+
+| | R0 radius | R0 chunks (10 cm) | cascade total |
+|---|---|---|---|
+| today | 64 m | 2,035 | 10,503 |
+| target | 128 m | **~8,100** | **~16,600** |
+
+Four times the level-0 work. At the current measured 703 chunks/sec, filling R0
+alone goes from ~2.9 s to **~11.5 s**, and that is the near field — the terrain
+directly under the player, the part whose absence reads as holes. Shipping this
+before generation moves to the GPU would take the exact symptom being chased and
+multiply it by four.
+
+Against the G0 GPU throughput of ~92,000 chunks/sec, ~8,100 R0 chunks is **~0.09 s**.
+
+So R0 = 128 m is not a tuning change, it is a **reason to finish G1/G3**. It is
+the concrete payoff: the thing that is unaffordable today and nearly free after.
+
+Sequence: G1 (GPU mesher + digest parity) → G3 (GPU-driven cascade streaming) →
+flip R0 to 128 m and re-measure. Not before.
+
+The ring-preset table (`VoxelWorldSubsystem.h:86`) is `static constexpr`, so this
+also needs `RingPresets` to become a runtime accessor before it can be A/B'd on
+one binary — worth doing as part of G3 rather than as a standalone change now.
+
 ## 6. Recommendation into G1/G2
 
 1. **Take 8 km.** ~99 MB packed. VRAM is not the trade the ADR expected it to be.
