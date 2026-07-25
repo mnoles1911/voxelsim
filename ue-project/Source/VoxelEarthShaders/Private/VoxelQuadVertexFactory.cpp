@@ -99,6 +99,20 @@ public:
 	{
 		ChunkOriginUU.Bind(ParameterMap, TEXT("VoxelChunkOriginUU"));
 		ChunkLevelScale.Bind(ParameterMap, TEXT("VoxelChunkLevelScale"));
+
+		// Bind() running proves the parameters object was CREATED, i.e. that
+		// IMPLEMENT_VERTEX_FACTORY_PARAMETER_TYPE took effect. If this fires but
+		// GetElementShaderBindings never does, the object exists and the
+		// renderer simply is not calling it -- a completely different problem
+		// from the trait never being specialised.
+		static bool bLoggedBindCall = false;
+		if (!bLoggedBindCall)
+		{
+			bLoggedBindCall = true;
+			UE_LOG(LogTemp, Warning,
+			       TEXT("VoxelVF: Bind() CALLED — originBound=%d scaleBound=%d"),
+			       ChunkOriginUU.IsBound() ? 1 : 0, ChunkLevelScale.IsBound() ? 1 : 0);
+		}
 	}
 
 	void GetElementShaderBindings(
@@ -112,6 +126,15 @@ public:
 		FMeshDrawSingleShaderBindings& ShaderBindings,
 		FVertexInputStreamArray& VertexStreams) const
 	{
+		// Unconditional, before any branch: this answers "is it called at all",
+		// separately from "is UserData set".
+		static bool bLoggedEntry = false;
+		if (!bLoggedEntry)
+		{
+			bLoggedEntry = true;
+			UE_LOG(LogTemp, Warning, TEXT("VoxelVF: GetElementShaderBindings ENTERED"));
+		}
+
 		// One pool per factory instance in G2, so the buffer can be read
 		// straight off the factory rather than threaded through the batch
 		// element. G3 will need per-chunk ranges and will move to UserData.
