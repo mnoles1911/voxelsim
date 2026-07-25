@@ -156,12 +156,26 @@ one binary — worth doing as part of G3 rather than as a standalone change now.
    command, and `RHIMultiDrawIndexedPrimitiveIndirect` is not wired into the mesh
    pass system. This determines the pool layout and the mesher's output format
    and is expensive to discover later. (From the G0 engine-path evaluation.)
-4. **Build on the Landscape pattern, do not hand-roll a renderer.** Static
+4. ~~**Build on the Landscape pattern, do not hand-roll a renderer.** Static
    relevance + `EnableGPUSceneSupportFlags` + `bViewDependentArguments` +
-   `ApplyViewDependentMeshArguments`, with culling in a `FSceneViewExtension` in
-   the game module. That is a shipping precedent for ADR-0006 invariant 2 with no
-   engine fork. What is genuinely left to write: the pool suballocator, the GPU
-   mesher (G1), and one vertex factory doing manual vertex fetch from the pool.
+   `ApplyViewDependentMeshArguments`...~~
+
+   **CORRECTED 2026-07-25 — see `docs/gpu-g2-draw-path.md`.** Landscape
+   registers **one primitive per `ULandscapeComponent`**; streaming a section in
+   or out *does* call `AddPrimitive`/`RemovePrimitive`. It is a many-proxies
+   system, so it is **not** a precedent for holding N chunks under one
+   primitive. What it genuinely demonstrates is narrower: swapping indirect draw
+   arguments per view on an already-registered primitive
+   (`LandscapeRender.cpp:3030`).
+
+   The closer templates are `FGeometryCollectionSceneProxy` (one proxy, one
+   shared pool, pieces come and go by rewriting buffer contents) and the Niagara
+   GPU renderers (one proxy, per-frame `FMeshBatch` with fresh indirect args).
+   G2 starts on **dynamic relevance**, because there is no supported way to
+   change a cached static batch's `NumPrimitives` without re-caching the
+   primitive's draw commands. Still true and still the biggest constraint:
+   **one indirect draw per mesh draw command**, so the pool must compact into
+   one contiguous draw range.
 5. **Nanite is ruled out.** `NaniteBuilder` is an editor-only module; clusters
    cannot be built at runtime in 5.8, so "static between digs" does not rescue it
    for runtime-generated terrain.
