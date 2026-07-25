@@ -133,7 +133,25 @@ public:
 	{
 		if (NumQuads == 0 || !QuadBufferSRV.IsValid() || MaterialProxy == nullptr)
 		{
+			// Silence is ambiguous: a pool that draws nothing looks identical
+			// whether the renderer never asked or the batch was rejected. Say
+			// which.
+			if (!bLoggedElements)
+			{
+				bLoggedElements = true;
+				UE_LOG(LogTemp, Warning,
+				       TEXT("VoxelGpuPool draw SKIPPED: numQuads=%d srv=%d materialProxy=%d"),
+				       NumQuads, QuadBufferSRV.IsValid() ? 1 : 0, MaterialProxy != nullptr ? 1 : 0);
+			}
 			return;
+		}
+
+		if (!bLoggedElements)
+		{
+			bLoggedElements = true;
+			UE_LOG(LogTemp, Log,
+			       TEXT("VoxelGpuPool draw SUBMITTED: numQuads=%d views=%d visMap=0x%x"),
+			       NumQuads, Views.Num(), VisibilityMap);
 		}
 
 		for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ++ViewIndex)
@@ -245,6 +263,7 @@ private:
 	FBufferRHIRef QuadBuffer, ChunkIdBuffer, OriginBuffer, ClimateBuffer;
 	FShaderResourceViewRHIRef QuadBufferSRV, ChunkIdSRV, OriginSRV, ClimateSRV;
 
+	mutable bool bLoggedElements = false;
 	int32 NumQuads = 0;      // drawn
 	int32 BufferQuads = 0;   // allocated
 	int32 NumChunks = 0;
@@ -426,6 +445,23 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 
 	DirtyQuads = {};
 	bChunkTableDirty = false;
+
+	// Tell the RENDERER the pool grew, not just the component.
+	//
+	// UpdateBounds() only recomputes this component's cached bounds; the scene
+	// keeps whatever bounds it was given when the proxy was created. On the
+	// incremental path the proxy is created once and never rebuilt, so without
+	// this the renderer culls the pool against the bounds of however few chunks
+	// happened to be resident on the first frame -- measured as a 6.4 m box at
+	// the player's feet while 2.4 million quads sat in the buffer, drawing
+	// nothing because the primitive was frustum-culled almost every frame.
+	//
+	// MarkRenderTransformDirty, not MarkRenderStateDirty: this pushes bounds
+	// and transform to the existing proxy, where the latter would throw the
+	// proxy away and rebuild every buffer -- the exact cost the incremental
+	// path exists to avoid.
+	UpdateBounds();
+	MarkRenderTransformDirty();
 }
 
 void UVoxelGpuPoolComponent::DestroyRenderState_Concurrent()
@@ -540,6 +576,21 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 		            "tableEntries=%d hiddenEntry=(%.1f,%.1f,%.1f,scale=%.3f)"),
 		       Drawn, HiddenQuads, OutOfRangeQuads, MaxIdSeen, ChunkOrigins.Num(),
 		       ChunkOrigins[0].X, ChunkOrigins[0].Y, ChunkOrigins[0].Z, ChunkOrigins[0].W);
+
+		// Where the geometry actually is, versus where the renderer will look
+		// for it. A pooled draw that renders nothing is nearly always one of
+		// these two disagreeing.
+		const FBoxSphereBounds WorldBounds = CalcBounds(GetComponentTransform());
+		UE_LOG(LogTemp, Log,
+		       TEXT("VoxelGpuPool placement: comp@(%.0f,%.0f,%.0f) firstChunk=(%.0f,%.0f,%.0f,scale=%.1f) "
+		            "boundsOrigin=(%.0f,%.0f,%.0f) boundsExtent=(%.0f,%.0f,%.0f)"),
+		       GetComponentLocation().X, GetComponentLocation().Y, GetComponentLocation().Z,
+		       ChunkOrigins.Num() > 1 ? ChunkOrigins[1].X : 0.f,
+		       ChunkOrigins.Num() > 1 ? ChunkOrigins[1].Y : 0.f,
+		       ChunkOrigins.Num() > 1 ? ChunkOrigins[1].Z : 0.f,
+		       ChunkOrigins.Num() > 1 ? ChunkOrigins[1].W : 0.f,
+		       WorldBounds.Origin.X, WorldBounds.Origin.Y, WorldBounds.Origin.Z,
+		       WorldBounds.BoxExtent.X, WorldBounds.BoxExtent.Y, WorldBounds.BoxExtent.Z);
 	}
 
 	FVoxelGpuPoolSceneProxy* Proxy =

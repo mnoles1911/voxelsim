@@ -141,6 +141,37 @@ TAutoConsoleVariable<bool> CVarVoxelRenderCastShadow(
 	TEXT("sealed caves again, so it is a measurement tool, not a shipping setting."),
 	ECVF_Default);
 
+// ADR-0006 G3: route chunk geometry through the GPU pool instead of one scene
+// component per chunk.
+//
+// Default OFF. This is the flag the whole GPU streaming programme hides behind,
+// and it stays off until G5 flips it, so the shipping renderer is exactly the
+// one that has been flown and measured. On, every resident chunk becomes a
+// range in one persistent GPU buffer drawn by ONE primitive in ONE draw call,
+// and streaming a chunk in or out stops touching FScene entirely -- which is
+// the funnel ADR-0006 measured as the frame-time ceiling.
+//
+// Only the geometry handoff moves. The desired set, admission, dispatch,
+// retention and coverage logic upstream are shared and unaware of this flag,
+// so an A/B here changes how chunks are DRAWN and nothing about which chunks
+// are chosen. Toggling mid-flight is not supported: chunks already resident
+// under the old path keep their old representation until they unload.
+TAutoConsoleVariable<int32> CVarVoxelStreamGpuMaxChunks(
+	TEXT("voxel.Stream.GPUMaxChunks"),
+	0,
+	TEXT("Debug bisection: cap chunks admitted to the ADR-0006 GPU pool. 0 = unlimited. Exists so the streamed ")
+	TEXT("path can be run at the same small scale voxel.GPU.SpawnPool is known-good at, separating 'CPU-meshed ")
+	TEXT("quads through the pool are wrong' from 'the pool does not like a multi-million-quad draw'."),
+	ECVF_Default);
+
+TAutoConsoleVariable<bool> CVarVoxelStreamGpu(
+	TEXT("voxel.Stream.GPU"),
+	false,
+	TEXT("Route chunk geometry through the ADR-0006 GPU pool (ONE primitive, ONE draw) instead of one scene ")
+	TEXT("component per chunk. Default false. Set before the world streams in; toggling mid-flight leaves ")
+	TEXT("already-resident chunks on whichever path loaded them."),
+	ECVF_Default);
+
 // Worker slots in flight, as a multiple of logical cores (docs/m1-plan.md Stage
 // 2 decisions table pinned this at "<=2xLogicalCores", which was a hardcoded
 // 2 * NumberOfCoresIncludingHyperthreads() until 2026-07-24).
@@ -475,6 +506,11 @@ float VoxelDebug::GetStreamLodRetentionMs()
 bool VoxelDebug::GetRenderCastShadow()
 {
 	return CVarVoxelRenderCastShadow.GetValueOnGameThread();
+}
+
+bool VoxelDebug::GetStreamGpu()
+{
+	return CVarVoxelStreamGpu.GetValueOnGameThread();
 }
 
 int32 VoxelDebug::GetStreamJobsInFlightPerCore()

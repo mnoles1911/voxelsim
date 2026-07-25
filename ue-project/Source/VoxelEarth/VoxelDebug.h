@@ -247,6 +247,12 @@ namespace VoxelDebug
 	// (it desyncs the BeginPlay PSO precache and measures that instead).
 	VOXELEARTH_API bool GetRenderCastShadow();
 
+	// voxel.Stream.GPU: route chunk geometry through the ADR-0006 GPU pool
+	// (ONE primitive, ONE draw) rather than one scene component per chunk.
+	// Default false until G5. See the cvar's source comment -- only the
+	// geometry handoff moves; every streaming decision upstream is shared.
+	VOXELEARTH_API bool GetStreamGpu();
+
 	// voxel.Stream.JobsInFlightPerCore: worker slots in flight as a multiple of
 	// logical cores. Default 2 (the historical hardcoded 2xLogicalCores). See
 	// the cvar's source comment for the dispatch-starvation measurement that

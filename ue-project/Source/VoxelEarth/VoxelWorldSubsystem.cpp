@@ -1,6 +1,8 @@
 #include "VoxelWorldSubsystem.h"
 
 #include "VoxelChunkComponent.h"
+#include "VoxelClimateProbe.h"
+#include "VoxelGpuPoolComponent.h"
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
@@ -1039,7 +1041,23 @@ struct FChunkRecord
 {
 	// Weak: once registered, the component is owned (GC-rooted) by
 	// ChunkOwner's component list; this is a lookup handle, not ownership.
+	//
+	// Null under voxel.Stream.GPU (ADR-0006 G3) -- there is no per-chunk
+	// component on that path. Ask HoldsGeometry(), never Component directly,
+	// anywhere the question is "is this chunk currently drawn".
 	TWeakObjectPtr<UVoxelChunkComponent> Component;
+
+	// This chunk's range in the GPU geometry pool, or INDEX_NONE. The pooled
+	// counterpart of Component: exactly one of the two is ever set, decided by
+	// voxel.Stream.GPU at the moment the chunk loaded. Storing which one is
+	// what lets a mid-session cvar flip stay harmless -- a chunk unloads
+	// through the same path it loaded through.
+	int32 PoolSlot = INDEX_NONE;
+
+	// Is this chunk currently holding drawn geometry, on either path? The
+	// unload budget, the retention gate and the empty-chunk release sites all
+	// turn on this and must not care which renderer is in play.
+	bool HoldsGeometry() const { return Component.IsValid() || PoolSlot != INDEX_NONE; }
 
 	// Bumped by MarkChunkDirtyForRemesh whenever an edit dirties this chunk.
 	// A worker job snapshots the id at dispatch time; if it no longer
@@ -2017,6 +2035,11 @@ struct FVoxelWorldImpl
 	// practice (AcquireChunkComponent guards against it anyway).
 	TArray<TWeakObjectPtr<UVoxelChunkComponent>> ComponentPool;
 
+	// ADR-0006 G3. Weak for the same reason as FChunkRecord::Component: once
+	// registered it is owned by ChunkOwner's component list. Null until the
+	// first chunk loads under voxel.Stream.GPU.
+	TWeakObjectPtr<UVoxelGpuPoolComponent> GpuPool;
+
 	// Nearest-first-within-level, lower-level-wins-ties priority queues
 	// (docs/m2-plan.md item 1: "Budgets shared across levels, nearest-first
 	// within level, lower level (finer) wins priority at equal distance").
@@ -2717,6 +2740,30 @@ private:
 	// without recreating it is a real part of the pooling win, not just the
 	// register/unregister avoidance.
 	void ReturnChunkComponentToPool(UVoxelChunkComponent& InComp);
+
+	// --- ADR-0006 G3: the GPU-pool geometry path (voxel.Stream.GPU) --------
+
+	// The one pool component every chunk's geometry lives in when
+	// voxel.Stream.GPU is on. Created on first use and never destroyed per
+	// chunk -- that is the entire point: streaming stops touching FScene.
+	UVoxelGpuPoolComponent* GetOrCreateGpuPool(AActor& Owner, USceneComponent& Root,
+	                                           UMaterialInterface* Material,
+	                                           const FVector& FirstChunkOrigin);
+
+	// Origin the pooled chunk table is expressed relative to. See
+	// GetOrCreateGpuPool for why this exists at all.
+	FVector GpuPoolRebase = FVector::ZeroVector;
+
+	// Gives back whatever geometry a record is holding, on either path, and
+	// leaves the record geometry-less.
+	//
+	// Every "this chunk should stop being drawn" site routes through here.
+	// Before G3 there were four of them, each open-coding the same
+	// component-park-and-null dance; with two renderers that is four places to
+	// forget the pooled case. It dispatches on what the record HOLDS, not on
+	// the cvar, so a chunk loaded before a mid-session flip still releases
+	// correctly.
+	void ReleaseChunkGeometry(VoxelStreaming::FChunkRecord& Rec);
 	// M2 wave 2: generalized from a level-0-only helper (wave 1) to any
 	// level -- both level-0 edited chunks AND their level>=1 mip ancestors
 	// (see PropagateEditToMips) route through here identically.
@@ -3178,6 +3225,19 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       JobsInFlightCounter.GetValue(), PendingJobNum(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num(),
 	       bAnchorUnderground ? 1 : 0, DeepTracked, DeepWithGeometry, (long long)ResidentQuads);
 
+	// ADR-0006 G3. Only logged when the pool is actually in use, so the
+	// existing log shape is untouched on the shipping path. Free vs largest
+	// run is the fragmentation signal: they diverge long before allocations
+	// start failing, which is the whole point of watching them.
+	if (const UVoxelGpuPoolComponent* Pool = GpuPool.Get())
+	{
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel GPU pool: liveChunks=%d highWater=%u free=%u largestRun=%u freeRuns=%d "
+		            "-- ONE primitive, ONE draw"),
+		       Pool->GetNumChunks(), Pool->GetHighWaterMarkQuads(), Pool->GetFreeQuads(),
+		       Pool->GetLargestFreeRun(), Pool->GetFreeRunCount());
+	}
+
 	// M2 item 1: "Per-level loaded/pending counters into the perf snapshot/
 	// HUD" -- also into this periodic log line, so a headless run's log file
 	// alone (no HUD to screenshot) is enough to verify every ring level is
@@ -3186,7 +3246,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	int32 LevelPending[VoxelCoords::kNumLevels] = {};
 	for (const auto& Pair : ChunkRecords)
 	{
-		if (Pair.Value.Component.IsValid())
+		if (Pair.Value.HoldsGeometry())
 		{
 			++LevelLoaded[FMath::Clamp(Pair.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
 		}
@@ -4369,7 +4429,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 			// shows nothing, so there is no hole to bridge -- also not retained.
 			const bool bLodTransition = bBeyondOuter || bInsideInner;
 			auto& Rec = Pair.Value;
-			if (bLodTransition && Rec.Component.IsValid() && Rec.LastQuadCount > 0)
+			if (bLodTransition && Rec.HoldsGeometry() && Rec.LastQuadCount > 0)
 			{
 				const float RetentionSeconds = VoxelDebug::GetStreamLodRetentionMs() / 1000.f;
 				if (RetentionSeconds > 0.f)
@@ -4764,7 +4824,7 @@ bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 Ent
 			// dropping a record that DOES own either would leak a component or
 			// strand an in-flight result. Anything already queued for unload is
 			// left to DrainUnloads (it owns that record's removal).
-			if (!Rec->Component.IsValid() && !Rec->bJobInFlight && !PendingUnloadSet.Contains(Entry.Key))
+			if (!Rec->HoldsGeometry() && !Rec->bJobInFlight && !PendingUnloadSet.Contains(Entry.Key))
 			{
 				ChunkRecords.Remove(Entry.Key);
 				++RecordsDroppedSinceLog;
@@ -5243,11 +5303,7 @@ void FVoxelWorldImpl::DispatchJobs()
 			// ResidentQuads exact if that ever stops holding.
 			ResidentQuads -= Rec->LastQuadCount;
 			Rec->LastQuadCount = 0;
-			if (UVoxelChunkComponent* Existing = Rec->Component.Get())
-			{
-				ReturnChunkComponentToPool(*Existing);
-			}
-			Rec->Component = nullptr;
+			ReleaseChunkGeometry(*Rec);
 			Rec->bJobInFlight = false;
 			// Proven empty and never dispatched, so no ApplyMeshResult will ever
 			// run for it -- settle it HERE or it blocks a retained stand-in above
@@ -5300,11 +5356,7 @@ void FVoxelWorldImpl::DispatchJobs()
 				// leaves behind, exactly as the band skip above does.
 				ResidentQuads -= Rec->LastQuadCount;
 				Rec->LastQuadCount = 0;
-				if (UVoxelChunkComponent* Existing = Rec->Component.Get())
-				{
-					ReturnChunkComponentToPool(*Existing);
-				}
-				Rec->Component = nullptr;
+				ReleaseChunkGeometry(*Rec);
 				Rec->bJobInFlight = false;
 				Rec->bMeshSettled = true; // see the band-skip site above
 				continue;
@@ -5618,6 +5670,126 @@ void FVoxelWorldImpl::ReturnChunkComponentToPool(UVoxelChunkComponent& InComp)
 	ComponentPool.Add(&InComp);
 }
 
+// --- ADR-0006 G3: the GPU-pool geometry path ------------------------------
+
+UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, USceneComponent& Root,
+                                                           UMaterialInterface* Material,
+                                                           const FVector& FirstChunkOrigin)
+{
+	if (UVoxelGpuPoolComponent* Existing = GpuPool.Get())
+	{
+		return Existing;
+	}
+
+	// The pool gets its OWN actor with the pool as the root component, rather
+	// than hanging off ChunkRoot alongside the per-chunk components. That is
+	// the configuration voxel.GPU.SpawnPool has always used and the only one
+	// observed to actually reach the renderer: attached as a child, the
+	// primitive never entered the visible set at all -- GetDynamicMeshElements
+	// was never called on it, despite valid bounds and a live proxy.
+	FActorSpawnParameters PoolSpawnParams;
+	PoolSpawnParams.ObjectFlags |= RF_Transient;
+	AActor* PoolOwner = Owner.GetWorld()->SpawnActor<AActor>(
+		AActor::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, PoolSpawnParams);
+	if (PoolOwner == nullptr)
+	{
+		return nullptr;
+	}
+
+	UVoxelGpuPoolComponent* Pool = NewObject<UVoxelGpuPoolComponent>(PoolOwner);
+	// Same terrain material the per-chunk components use. Without it the
+	// proxy falls back to the engine default and the biome LUT never runs.
+	Pool->SetChunkMaterial(Material);
+	PoolOwner->SetRootComponent(Pool);
+	Pool->RegisterComponent();
+
+	// REBASE. The chunk table is float32 (FVector4f per chunk), and this world
+	// runs at ~8.4 MILLION unreal units from the origin. float32's ULP up there
+	// is 1.0 UU against a 10 UU voxel, so chunk origins expressed as absolute
+	// positions lose a tenth of a voxel before the shader even starts -- every
+	// chunk in the pool visibly wrong, with no per-chunk transform to hide
+	// behind the way the component path has.
+	//
+	// So the component carries the big offset in its (double-precision)
+	// transform and the table stores everything relative to it. Chunks stay
+	// within the cascade's couple of kilometres of this point, where float32's
+	// ULP is ~0.015 UU -- three orders of magnitude of headroom.
+	//
+	// Set once, from the first chunk to load, and never moved: re-basing a live
+	// pool would mean rewriting every entry in the table. Even a player crossing
+	// the whole 84 km world only reaches ~0.015 UU of error.
+	// SetWorldLocation AFTER RegisterComponent, not SetRelativeLocation before:
+	// SetRootComponent on a freshly NewObject'd component installs an identity
+	// transform and redefines the actor's location as the world origin, which
+	// in this world is 84 km from anything worth drawing.
+	GpuPoolRebase = FirstChunkOrigin;
+	Pool->SetWorldLocation(GpuPoolRebase);
+
+	// Sized once, up front, and never grown. The live 2 km cascade measured
+	// 9,441,170 quads (docs/gpu-g0-sizing.md); the headroom above that pays for
+	// two things the steady-state figure does not cover. Load-before-unload
+	// retention transiently holds a chunk's allocation WHILE its replacement
+	// takes another, so a footprint mid-LOD-transition is double-allocated. And
+	// first-fit fragments: the allocator soak refuses ~10% of allocations at
+	// small capacity while still reporting plenty free. If AddChunk starts
+	// refusing, GetLargestFreeRun() against GetFreeQuads() is the number that
+	// says whether this is genuinely full or merely fragmented -- they are very
+	// different problems and only the second one wants a compaction pass.
+	constexpr uint32 kPoolCapacityQuads = 14u * 1000u * 1000u;   // 112 MB at 8 B/quad
+	Pool->InitPool(kPoolCapacityQuads);
+
+	GpuPool = Pool;
+	UE_LOG(LogVoxelStream, Log,
+	       TEXT("voxel.Stream.GPU: geometry pool up, %u quad capacity (%.0f MB). Chunks now stream "
+	            "as ranges in ONE primitive."),
+	       kPoolCapacityQuads, double(kPoolCapacityQuads) * 8.0 / (1024.0 * 1024.0));
+	return Pool;
+}
+
+// Climate for one chunk, sampled at its world centre.
+//
+// The component path samples per QUAD and bakes the result into vertex colour;
+// the pooled path has no per-quad storage, so it samples once per chunk and the
+// shader looks it up by chunk id. A chunk is 3.2 m across a 30 m climate raster
+// cell -- about 1/100th of a pixel's area -- and climate is a smooth bilinear
+// ramp over that distance, so this is one step coarser on an already heavily
+// oversampled signal. The error is a gentle chunk-to-chunk gradient, not
+// banding. If boundary artifacts ever do show, docs/gpu-g3-integration-plan.md
+// records the two escalations.
+static FVector2f SampleChunkClimateForPool(const USceneComponent& Root,
+                                           const FVector& ChunkOriginRelative,
+                                           int32 Level)
+{
+	const double HalfEdgeUU = 0.5 * VoxelCoords::ChunkEdgeUU * double(int64(1) << Level);
+	const FVector Centre = Root.GetComponentLocation() + ChunkOriginRelative
+	                     + FVector(HalfEdgeUU, HalfEdgeUU, 0.0);
+
+	VoxelClimate::EnsureInitialized();
+	const FVoxelClimateBytes Bytes = VoxelClimate::SampleClimateAtWorldUU(Centre.X, Centre.Y);
+	return FVector2f(float(Bytes.Temperature) / 255.0f,
+	                 float(Bytes.Precipitation) / 255.0f);
+}
+
+void FVoxelWorldImpl::ReleaseChunkGeometry(VoxelStreaming::FChunkRecord& Rec)
+{
+	// Dispatch on what the record HOLDS, not on the cvar: a chunk that loaded
+	// before a mid-session voxel.Stream.GPU flip must unload the way it loaded.
+	if (UVoxelChunkComponent* Existing = Rec.Component.Get())
+	{
+		ReturnChunkComponentToPool(*Existing);
+	}
+	Rec.Component = nullptr;
+
+	if (Rec.PoolSlot != INDEX_NONE)
+	{
+		if (UVoxelGpuPoolComponent* Pool = GpuPool.Get())
+		{
+			Pool->RemoveChunk(Rec.PoolSlot);
+		}
+		Rec.PoolSlot = INDEX_NONE;
+	}
+}
+
 bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
                                        const VoxelCoords::FVoxelLevelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec,
                                        TArray<FVoxelChunkQuad>&& Quads, bool bIsGameThreadMesh)
@@ -5638,16 +5810,113 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		// ChunkRecords (this chunk key is still in the desired set; it might
 		// gain quads again on a future edit), it just has no live component
 		// until then.
-		if (UVoxelChunkComponent* Existing = Rec.Component.Get())
-		{
-			ReturnChunkComponentToPool(*Existing);
-		}
-		Rec.Component = nullptr;
+		ReleaseChunkGeometry(Rec);
 		// SETTLED, not "lost geometry": this chunk is genuinely empty here, so it
 		// covers its footprint and may release a retained stand-in above or below
 		// it. See FChunkRecord::bMeshSettled / ReplacementCovered.
 		Rec.bMeshSettled = true;
 		return false;
+	}
+
+	// ADR-0006 G3. A record already holding a component keeps the component
+	// path even if the cvar flipped underneath it -- mixing representations for
+	// one chunk is the one thing that would genuinely break, and a chunk always
+	// unloads the way it loaded. New chunks take whichever path is current.
+	if (VoxelDebug::GetStreamGpu() && !Rec.Component.IsValid())
+	{
+		const bool bWasFirstLoad = (Rec.PoolSlot == INDEX_NONE);
+
+		// The CPU mesher's quads, packed into the same 8 bytes the GPU mesher
+		// emits (see PackVoxelChunkQuad -- the layout is a contract with
+		// VoxelQuadDecode.ush). This is the whole bridge: the pooled renderer
+		// does not care which mesher produced the geometry.
+		TArray<uint64> Packed;
+		Packed.SetNumUninitialized(Quads.Num());
+		for (int32 I = 0; I < Quads.Num(); ++I)
+		{
+			Packed[I] = PackVoxelChunkQuad(Quads[I]);
+		}
+
+		const FVector OriginRelative = VoxelCoords::ChunkOriginWorldForLevel(Key.Key, Key.Level);
+		UVoxelGpuPoolComponent* Pool = GetOrCreateGpuPool(Owner, Root, Material, OriginRelative);
+
+		// Bisection aid: cap how many chunks the pool will accept, so the
+		// streamed path can be run at the same scale voxel.GPU.SpawnPool is
+		// known-good at. 0 = unlimited.
+		static const auto* CVarPoolCap = IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.Stream.GPUMaxChunks"));
+		const int32 PoolCap = CVarPoolCap ? CVarPoolCap->GetInt() : 0;
+		if (PoolCap > 0 && Rec.PoolSlot == INDEX_NONE && Pool->GetNumChunks() >= PoolCap)
+		{
+			return false;
+		}
+
+		static bool bLoggedFirstPooledChunk = false;
+		if (!bLoggedFirstPooledChunk && Quads.Num() > 0)
+		{
+			bLoggedFirstPooledChunk = true;
+			const FVoxelChunkQuad& Q = Quads[0];
+			UE_LOG(LogVoxelStream, Log,
+			       TEXT("voxel.Stream.GPU first pooled chunk: material=%s level=%d quads=%d "
+			            "q0(axis=%d pos=%d slice=%d u0=%d v0=%d w=%d h=%d ao=%d mat=%d) packed=0x%016llx"),
+			       Material ? *Material->GetName() : TEXT("<null>"), Key.Level, Quads.Num(),
+			       Q.Axis, Q.Positive, Q.Slice, Q.U0, Q.V0, Q.W, Q.H, Q.Ao, Q.Mat,
+			       (unsigned long long)PackVoxelChunkQuad(Q));
+		}
+		// Relative to the pool's own rebase origin, not the world -- see
+		// GetOrCreateGpuPool. Climate still samples at the ABSOLUTE position.
+		const FVector OriginInPool = OriginRelative - GpuPoolRebase;
+
+		if (bWasFirstLoad)
+		{
+			Rec.PoolSlot = Pool->AddChunk(
+				Packed, FVector3f(OriginInPool), Key.Level,
+				SampleChunkClimateForPool(Root, OriginRelative, Key.Level));
+		}
+		else
+		{
+			// Re-mesh in place. UpdateChunk reuses the existing range whenever
+			// the new quad count fits it, which is the common case for a dig --
+			// free+realloc would fragment the pool hardest on exactly the
+			// chunks that re-mesh most often.
+			Rec.PoolSlot = Pool->UpdateChunk(Rec.PoolSlot, Packed);
+		}
+
+		if (Rec.PoolSlot == INDEX_NONE)
+		{
+			// Out of contiguous room. Do NOT mark this settled: a settled
+			// record is allowed to release a retained stand-in, and releasing
+			// one in favour of a chunk that failed to allocate turns a
+			// capacity problem into a visible hole. Left unsettled and
+			// geometry-less, which is the honest state.
+			//
+			// Free vs largest-run is the diagnosis: close together means the
+			// pool is genuinely full and wants more capacity; far apart means
+			// it is fragmented and wants compaction. Very different fixes.
+			UE_LOG(LogVoxelStream, Warning,
+			       TEXT("voxel.Stream.GPU: no room for %d quads at level %d (%u free, largest run %u). "
+			            "Chunk left undrawn."),
+			       Packed.Num(), Key.Level, Pool->GetFreeQuads(), Pool->GetLargestFreeRun());
+			return false;
+		}
+
+		if (bWasFirstLoad)
+		{
+			++TotalChunksLoaded;
+			++LevelChunksLoadedTotal[FMath::Clamp(Key.Level, 0, VoxelCoords::kNumLevels - 1)];
+			Rec.LoadedAtSeconds = ElapsedSeconds;
+		}
+		else if (bIsGameThreadMesh)
+		{
+			Rec.RemeshedAtSeconds = ElapsedSeconds;
+		}
+
+		TotalQuadsLoaded += Quads.Num();
+		Rec.LastQuadCount = Quads.Num();
+		ResidentQuads += Rec.LastQuadCount;
+		Rec.bMeshSettled = true;
+		Rec.bHasOverlayBricks =
+			(Key.Level == 0) ? ChunkOwnsEditedBrick(Key.Key) : EditedAncestorChunks[Key.Level].Contains(Key.Key);
+		return bWasFirstLoad;
 	}
 
 	UVoxelChunkComponent* Comp = Rec.Component.Get();
@@ -6022,10 +6291,11 @@ void FVoxelWorldImpl::DrainUnloads()
 			continue;
 		}
 
-		// A live component here means this pop costs a render-thread
-		// RemovePrimitive -- gate it. Over budget this frame: keep the record
+		// Held geometry here means this pop costs something render-facing --
+		// a RemovePrimitive on the component path, a pool free plus an
+		// incremental buffer write on the GPU path -- so gate it either way. Over budget this frame: keep the record
 		// tracked and re-queue it for the next frame (do NOT drop the chunk).
-		if (Rec->Component.IsValid())
+		if (Rec->HoldsGeometry())
 		{
 			// Load-before-unload: keep this chunk drawn as a stand-in until its
 			// replacement LOD actually covers its footprint (coverage-based
@@ -6077,7 +6347,7 @@ void FVoxelWorldImpl::DrainUnloads()
 			// DrainResults finds no record for the key and discards it.
 			// M1 hitch-gap wave: park (not destroy) -- see
 			// ReturnChunkComponentToPool / docs/status.md M1 gate row.
-			ReturnChunkComponentToPool(*Rec->Component.Get());
+			ReleaseChunkGeometry(*Rec);
 			++ComponentUnloads;
 		}
 
@@ -6889,7 +7159,7 @@ void FVoxelWorldImpl::UpdatePerfSnapshot(float DeltaTime, float TickMs)
 	int32 LevelPending[VoxelCoords::kNumLevels] = {};
 	for (const auto& Pair : ChunkRecords)
 	{
-		if (Pair.Value.Component.IsValid())
+		if (Pair.Value.HoldsGeometry())
 		{
 			++ResidentComponents;
 			++LevelLoaded[FMath::Clamp(Pair.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
@@ -8518,7 +8788,7 @@ bool UVoxelWorldSubsystem::DebugChunkStatusAt(const FVector& WorldPos, bool& bOu
 	const VoxelCoords::FVoxelLevelChunkKey Key{0, VoxelCoords::ChunkKeyForVoxel(VoxelCoords::WorldToVoxel(WorldPos))};
 	const VoxelStreaming::FChunkRecord* Rec = Impl->ChunkRecords.Find(Key);
 	bOutTracked = (Rec != nullptr);
-	bOutHasComponent = Rec && Rec->Component.IsValid();
+	bOutHasComponent = Rec && Rec->HoldsGeometry();
 	OutQuads = Rec ? Rec->LastQuadCount : 0;
 	return true;
 }

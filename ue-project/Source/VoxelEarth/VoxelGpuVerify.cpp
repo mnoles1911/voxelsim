@@ -1148,6 +1148,35 @@ namespace
 		}
 	}
 
+	// Screenshot the live game N seconds from now.
+	//
+	// Exists because the interesting question is usually "what does the normal
+	// streamed world look like under some cvar", and every screenshot harness
+	// before this was welded to a spawn command. Headless runs pair it with
+	// -ExecCmds, e.g. "voxel.Stream.GPU 1, voxel.Debug.ShotIn 25" -- long
+	// enough for the cascade to fill, since a shot taken mid-fill shows coarse
+	// LOD and reads as a rendering bug.
+	void ShotInCommand(const TArray<FString>& Args, UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			return;
+		}
+		const float Delay = (Args.Num() > 0) ? FMath::Max(0.1f, FCString::Atof(*Args[0])) : 20.0f;
+		FTimerHandle Handle;
+		World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([]()
+		{
+			FScreenshotRequest::RequestScreenshot(false);
+			UE_LOG(LogVoxelGpuVerify, Log, TEXT("Screenshot requested (Saved/Screenshots/)"));
+		}), Delay, false);
+		UE_LOG(LogVoxelGpuVerify, Log, TEXT("Screenshot scheduled in %.1f s"), Delay);
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GVoxelDebugShotInCmd(
+		TEXT("voxel.Debug.ShotIn"),
+		TEXT("Take a screenshot N seconds from now (default 20). Usage: voxel.Debug.ShotIn [seconds]"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&ShotInCommand));
+
 	FAutoConsoleCommandWithWorldAndArgs GVoxelGpuSpawnPoolCmd(
 		TEXT("voxel.GPU.SpawnPool"),
 		TEXT("Put N chunks in one GPU pool drawn by ONE primitive in ONE draw call. "

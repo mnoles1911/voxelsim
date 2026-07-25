@@ -72,6 +72,10 @@ public:
 	uint32 GetHighWaterMarkQuads() const { return Pool.GetHighWaterMark(); }
 	uint32 GetFreeQuads() const { return Pool.GetFreeQuads(); }
 	uint32 GetLargestFreeRun() const { return Pool.GetLargestFreeRun(); }
+	// 1 means unfragmented. Rising while GetFreeQuads() stays healthy is the
+	// early warning that allocations are about to start failing on a pool that
+	// still looks half empty.
+	int32 GetFreeRunCount() const { return Pool.GetFreeRunCount(); }
 
 	void SetChunkMaterial(UMaterialInterface* InMaterial);
 	UMaterialInterface* GetChunkMaterialOrDefault() const;

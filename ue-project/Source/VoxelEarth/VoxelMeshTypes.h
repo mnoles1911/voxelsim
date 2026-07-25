@@ -26,3 +26,29 @@ struct FVoxelChunkQuad
 	uint8 Ao = 0xFF;      // 2 bits per corner: (0,0),(1,0),(0,1),(1,1); 3=unoccluded
 	uint8 Mat = 0;        // vxc::MaterialId
 };
+
+// Packs one quad into the 8 bytes the GPU pool stores and the vertex factory
+// decodes.
+//
+// THIS LAYOUT IS A CONTRACT with DecodeVoxelQuadVertex in
+// ue-project/Shaders/VoxelQuadDecode.ush, which reads the same 8 bytes as a
+// uint2 and pulls the fields back out at these exact shifts. The GPU mesher
+// emits this layout directly; this function is the CPU mesher's way into the
+// same buffer, which is what lets the pooled path render CPU-meshed chunks
+// without a second decode path. Change one side and you must change the other.
+//
+// Every field is <= 8 bits and Slice/U0/V0 are chunk-local (0..31), so nothing
+// here can overflow for a 32-voxel chunk.
+inline uint64 PackVoxelChunkQuad(const FVoxelChunkQuad& Q)
+{
+	const uint32 Lo = (uint32(Q.Axis)     & 0xfu)
+	                | ((uint32(Q.Positive) & 0xfu) <<  4)
+	                | (uint32(Q.Slice)             <<  8)
+	                | (uint32(Q.U0)                << 16)
+	                | (uint32(Q.V0)                << 24);
+	const uint32 Hi = uint32(Q.W)
+	                | (uint32(Q.H)   <<  8)
+	                | (uint32(Q.Ao)  << 16)
+	                | (uint32(Q.Mat) << 24);
+	return uint64(Lo) | (uint64(Hi) << 32);
+}
