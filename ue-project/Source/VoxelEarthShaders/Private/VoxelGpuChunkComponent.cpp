@@ -61,7 +61,6 @@ public:
 
 	void CreateRenderThreadResources(FRHICommandListBase& RHICmdList) override
 	{
-		UE_LOG(LogTemp, Warning, TEXT("VoxelGpuChunk: CreateRenderThreadResources, %d quads"), NumQuads);
 		if (NumQuads == 0)
 		{
 			return;
@@ -94,9 +93,6 @@ public:
 
 	FPrimitiveViewRelevance GetViewRelevance(const FSceneView* View) const override
 	{
-		static bool bLoggedRel = false;
-		if (!bLoggedRel) { bLoggedRel = true;
-			UE_LOG(LogTemp, Warning, TEXT("VoxelGpuChunk: GetViewRelevance shown=%d"), IsShown(View) ? 1 : 0); }
 		FPrimitiveViewRelevance Result;
 		Result.bDrawRelevance = IsShown(View);
 		Result.bShadowRelevance = IsShadowCast(View);
@@ -186,6 +182,7 @@ public:
 			Element.MaxVertexIndex = uint32(NumQuads) * 6 - 1;
 			Element.NumInstances = 1;
 			Element.PrimitiveUniformBuffer = GetUniformBuffer();
+			Element.UserData = &DrawData;
 
 			Collector.AddMesh(ViewIndex, Mesh);
 		}
@@ -202,6 +199,7 @@ private:
 
 	int32 NumQuads = 0;
 	float LevelScale = 1.0f;
+	FVoxelChunkDrawData DrawData;
 
 	FMaterialRenderProxy* MaterialProxy;
 	FMaterialRelevance MaterialRelevance;
@@ -252,8 +250,6 @@ FPrimitiveSceneProxy* UVoxelGpuChunkComponent::CreateSceneProxy()
 	{
 		return nullptr;
 	}
-	UE_LOG(LogTemp, Warning, TEXT("VoxelGpuChunk: CreateSceneProxy, %d quads, bounds %s"),
-	       Quads.Num(), *Bounds.GetBox().ToString());
 	return new FVoxelGpuChunkSceneProxy(this, Quads, ChunkLevel);
 }
 

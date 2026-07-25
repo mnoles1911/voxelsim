@@ -187,6 +187,54 @@ material in a project. Those flags are a fixed engine enum, so the choices are:
 Always OR in `bIsSpecialEngineMaterial`, or the default-material fallback fails
 to compile against the factory.
 
+## BLOCKER FOR POOLING: `GetElementShaderBindings` is never invoked
+
+Found 2026-07-25, empirically, and it constrains how the pool can work.
+
+The factory renders correctly — but its
+`FVertexFactoryShaderParameters::GetElementShaderBindings` **is never called**.
+Proven twice over:
+
+1. A one-shot `UE_LOG` at the top of it never fires, in any run.
+2. Moving the per-chunk framing (`ChunkOriginUU`, `LevelScale`) out of the
+   uniform buffer and into loose parameters bound there made the chunk vanish
+   — `LevelScale` stayed 0, collapsing every vertex to a point. Moving it back
+   into the uniform buffer restored rendering immediately.
+
+What *does* work is the factory's uniform buffer
+(`IMPLEMENT_GLOBAL_SHADER_PARAMETER_STRUCT` + `SHADER_PARAMETER_SRV`), which is
+bound without that hook.
+
+**Why this matters:** per-element bindings are the natural way to give one
+vertex factory many chunks — each chunk's quads are contiguous in the pool, so
+each draw needs only its own origin and mip scale from
+`FMeshBatchElement::UserData`. With that hook dead, one factory currently
+serves exactly one chunk, which means one primitive per chunk — i.e. **the
+`AddPrimitive` funnel ADR-0006 exists to remove is still there.**
+
+Likely cause, per the engine trace: `FMeshMaterialShader`'s
+`VertexFactoryParameters` is null, so `ShaderBaseClasses.cpp:494-502` skips the
+call with no `else`, no `ensure`, and no log. It is created by
+`VertexFactoryType->CreateShaderParameters(frequency, ParameterMap)`, which
+returns null unless `TVertexFactoryParameterTraits` is specialised for that
+`(type, frequency)` pair — i.e. unless `IMPLEMENT_VERTEX_FACTORY_PARAMETER_TYPE`
+took effect for the frequency being drawn. Ours declares `SF_Vertex` only.
+
+**Next step:** register `SF_Pixel` as well (and confirm against
+`FLidarPointCloudVertexFactoryBase`, which declares `SF_Vertex` plus
+compute/ray-hit-group), or confirm the runtime `VertexFactory->GetType()`
+matches the type the macro was applied to. Until it resolves, the pool cannot
+have per-chunk framing and there is no point building it.
+
+**Three ways round it if the hook stays dead**, cheapest first:
+1. A `StructuredBuffer` of per-chunk origins plus a per-quad chunk id
+   (+4 bytes/quad on top of 8 — G0 established VRAM is not the constraint).
+2. Bake the chunk offset into the quad coordinates at upload, as the brick
+   re-basing already does — limited by the uint8 fields to ~25 m of range.
+3. One uniform buffer per chunk, allocated per frame via
+   `Collector.AllocateOneFrameResource` — still needs a working bind hook, so
+   only viable if the cause turns out to be frequency registration.
+
 ## What is left for G2
 
 1. A custom vertex factory doing manual vertex fetch from the quad pool via

@@ -91,8 +91,15 @@ class FVoxelQuadVertexFactoryShaderParameters : public FVertexFactoryShaderParam
 {
 	DECLARE_TYPE_LAYOUT(FVoxelQuadVertexFactoryShaderParameters, NonVirtual);
 
+	LAYOUT_FIELD(FShaderParameter, ChunkOriginUU);
+	LAYOUT_FIELD(FShaderParameter, ChunkLevelScale);
+
 public:
-	void Bind(const FShaderParameterMap& ParameterMap) {}
+	void Bind(const FShaderParameterMap& ParameterMap)
+	{
+		ChunkOriginUU.Bind(ParameterMap, TEXT("VoxelChunkOriginUU"));
+		ChunkLevelScale.Bind(ParameterMap, TEXT("VoxelChunkLevelScale"));
+	}
 
 	void GetElementShaderBindings(
 		const FSceneInterface* Scene,

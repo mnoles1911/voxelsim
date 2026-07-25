@@ -26,13 +26,22 @@
 // because it would be a different, unbound symbol. Black terrain, no error.
 BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadVertexFactoryParameters, )
 	SHADER_PARAMETER_SRV(StructuredBuffer<uint2>, QuadBuffer)
-	// Chunk-space -> primitive-space offset for the quad range being drawn,
-	// and the mip level scale (1 << chunkLevel). One draw covers one chunk in
-	// G2; G3 replaces these with a per-chunk metadata buffer indexed in the
-	// shader, so that one draw can cover the whole pool.
 	SHADER_PARAMETER(FVector3f, ChunkOriginUU)
 	SHADER_PARAMETER(float, LevelScale)
 END_GLOBAL_SHADER_PARAMETER_STRUCT()
+
+// Per-chunk framing, bound PER DRAW rather than per factory.
+//
+// This is what lets one vertex factory -- and therefore one primitive -- serve
+// many chunks out of a shared pool. Each chunk's quads are contiguous in the
+// pool, so each draw covers one range and needs only its own origin and mip
+// scale. That is the whole point of ADR-0006: streaming a chunk in or out
+// writes into the pool and changes a draw range, and never touches FScene.
+struct FVoxelChunkDrawData
+{
+	FVector3f ChunkOriginUU = FVector3f::ZeroVector;
+	float LevelScale = 1.0f;
+};
 
 class VOXELEARTHSHADERS_API FVoxelQuadVertexFactory : public FVertexFactory
 {
