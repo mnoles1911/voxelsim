@@ -122,7 +122,16 @@ public:
 		Result.bShadowRelevance = IsShadowCast(View);
 		Result.bRenderInMainPass = ShouldRenderInMainPass();
 		Result.bDynamicRelevance = true;
+		Result.bUsesLightingChannels = GetLightingChannelMask() != GetDefaultLightingChannelMask();
+		Result.bRenderCustomDepth = ShouldRenderCustomDepth();
 		MaterialRelevance.SetPrimitiveViewRelevance(Result);
+		// Must come after SetPrimitiveViewRelevance, which is what fills in
+		// bOpaque. Same expression as FVoxelChunkSceneProxy so the two renderers
+		// contribute to the velocity pass identically -- the factory already
+		// implements VertexFactoryGetPreviousWorldPosition, so the geometry for
+		// it was always there; only the relevance flag that asks for it was
+		// missing, and without it TSR reprojects this terrain from depth alone.
+		Result.bVelocityRelevance = DrawsVelocity() && Result.bOpaque && Result.bRenderInMainPass;
 		return Result;
 	}
 
@@ -154,6 +163,23 @@ public:
 			       NumQuads, Views.Num(), VisibilityMap);
 		}
 
+		// Editor Wireframe view mode, mirroring FVoxelChunkSceneProxy. Without
+		// this the pooled terrain is the one thing in the level that stays solid
+		// when you switch to Wireframe -- which reads as "the pool is drawing
+		// with the wrong material" rather than "wireframe is unimplemented here".
+		// Same blue as the component path, so the two are indistinguishable when
+		// voxel.Stream.GPUMaxLevel puts both renderers in one frame.
+		const bool bWireframe = AllowDebugViewmodes() && ViewFamily.EngineShowFlags.Wireframe;
+		const FMaterialRenderProxy* BatchMaterialProxy = MaterialProxy;
+		if (bWireframe)
+		{
+			auto* WireframeMaterialInstance = new FColoredMaterialRenderProxy(
+				GEngine->WireframeMaterial ? GEngine->WireframeMaterial->GetRenderProxy() : nullptr,
+				FLinearColor(0, 0.5f, 1.f));
+			Collector.RegisterOneFrameMaterialProxy(WireframeMaterialInstance);
+			BatchMaterialProxy = WireframeMaterialInstance;
+		}
+
 		for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ++ViewIndex)
 		{
 			if ((VisibilityMap & (1 << ViewIndex)) == 0)
@@ -163,7 +189,8 @@ public:
 
 			FMeshBatch& Mesh = Collector.AllocateMesh();
 			Mesh.VertexFactory = &VertexFactory;
-			Mesh.MaterialRenderProxy = MaterialProxy;
+			Mesh.MaterialRenderProxy = BatchMaterialProxy;
+			Mesh.bWireframe = bWireframe;
 			Mesh.Type = PT_TriangleList;
 			Mesh.DepthPriorityGroup = SDPG_World;
 			Mesh.bCanApplyViewModeOverrides = false;
