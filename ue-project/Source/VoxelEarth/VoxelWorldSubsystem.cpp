@@ -1920,6 +1920,61 @@ int32 UVoxelWorldSubsystem::GetMaxRingLevel()
 	return MaxLevel;
 }
 
+// docs/streaming-handoff.md: RingPresets was static constexpr and had to
+// become a runtime accessor before R0 could move to 128 m. See the header
+// doc comment on GetRingPresets for why the override below is a command-line
+// switch and not a cvar.
+const UVoxelWorldSubsystem::FRingPreset* UVoxelWorldSubsystem::GetRingPresets()
+{
+	static FRingPreset Presets[VoxelCoords::kNumLevels];
+	static const bool bInit = []
+	{
+		FMemory::Memcpy(Presets, kDefaultRingPresets, sizeof(Presets));
+
+		// -VoxelRingInnerMeters=<L0>,<L1>,... : overrides InnerMeters for as
+		// many leading levels as values are given; trailing levels keep the
+		// default. Same comma-list convention as -VoxelRingFloors
+		// (VoxelStreamAdmission::GetRingSlotFloors, above).
+		FString InnerSpec;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelRingInnerMeters="), InnerSpec))
+		{
+			TArray<FString> Parts;
+			InnerSpec.ParseIntoArray(Parts, TEXT(","), true);
+			for (int32 I = 0; I < Parts.Num() && I < VoxelCoords::kNumLevels; ++I)
+			{
+				Presets[I].InnerMeters = FCString::Atod(*Parts[I]);
+			}
+		}
+
+		// -VoxelRingOuterMeters=<L0>,<L1>,... : same shape, for OuterMeters.
+		// This is the switch the verification for the runtime-accessor change
+		// uses to shrink R0 (e.g. -VoxelRingOuterMeters=16).
+		FString OuterSpec;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelRingOuterMeters="), OuterSpec))
+		{
+			TArray<FString> Parts;
+			OuterSpec.ParseIntoArray(Parts, TEXT(","), true);
+			for (int32 I = 0; I < Parts.Num() && I < VoxelCoords::kNumLevels; ++I)
+			{
+				Presets[I].OuterMeters = FCString::Atod(*Parts[I]);
+			}
+		}
+
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			UE_LOG(LogVoxelEarth, Log, TEXT("RingPresets[%d] = [%.1f, %.1f) m%s"), Level,
+			       Presets[Level].InnerMeters, Presets[Level].OuterMeters,
+			       (Presets[Level].InnerMeters != kDefaultRingPresets[Level].InnerMeters ||
+			        Presets[Level].OuterMeters != kDefaultRingPresets[Level].OuterMeters)
+			           ? TEXT(" [OVERRIDDEN]")
+			           : TEXT(""));
+		}
+		return true;
+	}();
+	(void)bInit;
+	return Presets;
+}
+
 template <typename FormatOneLevelFn>
 static FString JoinPerLevel(FormatOneLevelFn&& FormatOneLevel)
 {
@@ -3799,7 +3854,7 @@ static constexpr double ExitDepthUU = 100.0;  // 1.0m
 // 1 mid, 2 far), against the level's own outer radius.
 static int32 BandForDistance(int32 Level, double DistSq)
 {
-	const double OuterUU = UVoxelWorldSubsystem::RingPresets[Level].OuterMeters * 100.0;
+	const double OuterUU = UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0;
 	if (DistSq < FMath::Square(OuterUU * NearFrac))
 	{
 		return 0;
@@ -4194,7 +4249,7 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 	// ring). An entry is ~12 bytes and re-deriving one costs nothing extra --
 	// it comes back with the next level-0 job in that footprint.
 	{
-		const UVoxelWorldSubsystem::FRingPreset& L0Preset = UVoxelWorldSubsystem::RingPresets[0];
+		const UVoxelWorldSubsystem::FRingPreset& L0Preset = UVoxelWorldSubsystem::GetRingPresets()[0];
 		const double L0ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(0);
 		const double L0KeepRadiusUU = L0Preset.OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier * 2.0;
 		const double L0KeepRadiusSq = FMath::Square(L0KeepRadiusUU);
@@ -4216,7 +4271,7 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 		const int32 Level = It.Key().Level;
 		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
 		const double KeepRadiusUU =
-			UVoxelWorldSubsystem::RingPresets[Level].OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier * 2.0;
+			UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier * 2.0;
 		const double CenterX = (double(It.Key().Key.X) + 0.5) * ChunkEdge;
 		const double CenterY = (double(It.Key().Key.Y) + 0.5) * ChunkEdge;
 		if (FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) > FMath::Square(KeepRadiusUU))
@@ -4228,7 +4283,7 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 	for (auto It = FootprintZRangeCache.CreateIterator(); It; ++It)
 	{
 		const VoxelCoords::FVoxelLevelChunkKey& Key = It.Key();
-		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[Key.Level];
+		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::GetRingPresets()[Key.Level];
 		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Key.Level);
 		const double CenterX = (double(Key.Key.X) + 0.5) * ChunkEdge;
 		const double CenterY = (double(Key.Key.Y) + 0.5) * ChunkEdge;
@@ -4469,7 +4524,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		{
 			continue;
 		}
-		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[LevelKey.Level];
+		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::GetRingPresets()[LevelKey.Level];
 		const double ChunkEdge = ChunkEdgeUUForLevel(LevelKey.Level);
 		const double CenterX = (double(LevelKey.Key.X) + 0.5) * ChunkEdge;
 		const double CenterY = (double(LevelKey.Key.Y) + 0.5) * ChunkEdge;
@@ -4599,7 +4654,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		bLevelScannedThisCall[Level] = true;
 		AdmissionsThisLevel = 0; // per-level admission budget (see its doc comment)
 
-		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[Level];
+		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::GetRingPresets()[Level];
 		const double InnerUU = Preset.InnerMeters * 100.0;
 		const double OuterUU = Preset.OuterMeters * 100.0;
 		const double ChunkEdge = ChunkEdgeUUForLevel(Level);
@@ -5113,7 +5168,7 @@ static uint8 ComputeRingSkirtMask(const VoxelCoords::FVoxelLevelChunkKey& LevelK
 	{
 		return 0; // finest ring: nothing finer sits inside it, so no seam to retain
 	}
-	const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[Level];
+	const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::GetRingPresets()[Level];
 	const double InnerSq = FMath::Square(Preset.InnerMeters * 100.0);
 	const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
 	// A face is retained only when the neighbour across it belongs to a FINER
@@ -8399,7 +8454,7 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 	UE_LOG(LogVoxelStream, Log,
 	       TEXT("Voxel streaming initialized (seed %llu): load=%.0fm unload=%.0fm digRange=%.0fm"),
-	       (unsigned long long)Seed, LoadRadiusMeters, UnloadRadiusMeters, DigPlaceRangeMeters);
+	       (unsigned long long)Seed, GetLoadRadiusMeters(), GetUnloadRadiusMeters(), DigPlaceRangeMeters);
 }
 
 void UVoxelWorldSubsystem::Tick(float DeltaTime)
