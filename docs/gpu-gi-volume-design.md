@@ -303,11 +303,20 @@ House style: absolute `.uproject` path, `-game -unattended -sm6`, fixed
 `-VoxelSpawnAt`, screenshot at **25–30 s**, compared against a control run with
 byte-identical arguments. Discard the first run after any build.
 
-**Step 0 — feed the field from the pooled path.** (§0, prerequisite.) Add a
-pooled-chunk ingest to the GI subsystem and call it from the pooled streaming
-branch where the origin and the CPU-meshed quads are both already in hand.
-*Verify:* log lines only, no rendering — the resident-brick count must reach the
-same order on both paths (~2000 bricks). Today the pooled run reports 0.
+**Step 0 — feed the field from the pooled path. ✅ DONE (PR #105).** A pooled
+ingest queue in the GI subsystem, called from the pooled branch of
+`ApplyMeshResult` where the origin and the CPU-meshed quads are both already in
+hand, draining against the same per-frame budget. Measured: both paths settle at
+**2212 bricks / 10.1 MB** — the same number, not merely the same order, since
+both consume the same CPU mesher output for the same level-0 chunk set and the
+field is absolute-keyed. Before it, the pooled run reported `bricks=0`.
+
+One thing that had to come with it, and would have bitten silently: the re-shade
+drain bounds *refreshes* but not *pops*, and a miss deliberately does not consume
+the refresh budget (that is what makes the per-component dedupe free). On the
+pooled path every pop misses, so unbounded it walks `RemoveAt(0)` through the
+whole ~2000-entry queue every frame — O(n^2) memmove producing nothing. Pops are
+now capped at 8x the refresh budget, which never binds on the component path.
 
 **Step 1 — resource + known pattern + per-pixel sample, no real data.** Fill the
 volume with a world-space checkerboard (`A=255`, RGB alternating per brick).

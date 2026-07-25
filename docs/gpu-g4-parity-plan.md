@@ -98,6 +98,20 @@ difference.
 This is step 0 of the GI work: without it, every subsequent GI verification
 would compare an empty field against an empty field and pass.
 
+**Fixed (PR #105).** The pooled branch of `ApplyMeshResult` now feeds the field
+directly, moving the quads into a parallel voxelize queue that drains against the
+same per-frame budget. Measured: component path and pooled path both settle at
+**2212 bricks / 10.1 MB** — not the same order, the same number, since both
+renderers consume the same CPU mesher output for the same level-0 chunk set and
+the field is absolute-keyed. Before the fix the pooled run reported `bricks=0`
+for its whole duration.
+
+That change also had to bound the re-shade drain's *pops*, not just its
+refreshes: a miss deliberately does not consume the refresh budget (that is what
+makes the per-component dedupe free), and on the pooled path every pop misses, so
+unbounded it would `RemoveAt(0)` through the whole ~2000-entry queue every frame
+for no output at all.
+
 ## Where parity stands now
 
 Fixed this pass:
