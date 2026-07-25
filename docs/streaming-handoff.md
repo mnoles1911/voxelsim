@@ -53,8 +53,34 @@ Already ruled out:
   R0's *loaded* count barely moved, which is what shows the remaining problem is
   admission, not speed.
 
-Worth noting `tracked` is also lower under the pool (11,323 vs 16,417), so
-records are going missing, not just geometry.
+Sharper still, from the ring-dispatch line (`total` = chunks that produced a
+result at all, loaded + zero-quad):
+
+```
+CPU:  R0 total=3398 load=1947 zq=1451
+GPU:  R0 total= 408 load= 255 zq= 152
+```
+
+So R0 is not failing to *draw* 3,000 chunks -- it never *meshes* them. `tracked`
+is correspondingly lower (11,323 vs 16,417), and `bandCache` is 171 vs 1,288.
+Records are going missing upstream of any geometry handoff.
+
+And it is specifically R0-being-pooled that hurts R0: with
+`voxel.Stream.GPUMaxLevel 0` (only R0 pooled, R1-R5 on components) R0 falls
+further still, to 178. Whatever this is, it is triggered by a level-0 chunk
+taking the pooled branch, not by the pool's size or by the coarse rings.
+
+Things checked and NOT the cause: `DropFarthestOverCap`'s admission guard (a
+never-meshed chunk has neither a component nor a pool slot, so `HoldsGeometry()`
+is false there on both paths, exactly as before); `ReplacementCovered`; the
+per-update copy throttle (fixed, and it moved `pending`, not `total`).
+
+The next thing I would do is diff what the pooled branch of `ApplyMeshResult`
+leaves on `FChunkRecord` against what the component branch leaves, field by
+field, for a level-0 chunk -- the return value included, since `DrainResults`
+uses it for its apply budget and hitch attribution. The component branch also
+`MoveTemp`s `Quads` and the pooled branch does not, which is a real behavioural
+difference in what the caller sees afterwards.
 
 Two tools for narrowing it:
 
