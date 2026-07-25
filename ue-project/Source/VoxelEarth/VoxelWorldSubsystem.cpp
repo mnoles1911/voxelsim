@@ -1561,6 +1561,16 @@ bool VerifyBuriedSkipEnabled()
 // and the throughput run without a rebuild. `-VoxelBuriedSkip=0` restores the
 // pre-wave behaviour exactly (every candidate is dispatched). Command line
 // rather than cvar for the reason above.
+// Cold-band throttle kill switch (`-VoxelNoColdBandThrottle`), so the throttle
+// can be attributed on ONE binary. Added because a hitch regression (1 -> ~85
+// post-warmup hitches) appeared across two commits -- the ring-seam admission
+// fix and the throttle -- and guessing which is not good enough.
+bool ColdBandThrottleEnabled()
+{
+	static const bool bEnabled = !FParse::Param(FCommandLine::Get(), TEXT("VoxelNoColdBandThrottle"));
+	return bEnabled;
+}
+
 bool BuriedSkipEnabled()
 {
 	static const bool bEnabled = []
@@ -4505,9 +4515,42 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
 				const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
 				const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
-				if (DistSq >= FMath::Square(AdmitOuterUU) || (Level > 0 && DistSq < FMath::Square(InnerUU)))
+				if (Level > 0 && DistSq < FMath::Square(InnerUU))
 				{
-					continue; // outside this level's annulus (outer padded by the chunk half-diagonal -- see above)
+					continue; // a finer ring owns this footprint
+				}
+				if (DistSq >= FMath::Square(OuterUU))
+				{
+					// Past this level's outer edge. Normally the NEXT level owns
+					// this ground -- but only if the parent chunk containing it is
+					// itself admitted. Admit this chunk ONLY when the parent is
+					// not, which is exactly the seam gap and nothing else.
+					//
+					// (First cut padded the outer radius by the chunk half-diagonal
+					// for every chunk. Correct, but blanket: +9.2% resident chunks
+					// everywhere, measured at p50 14.9 -> 17.3 ms, chunks/s
+					// 968 -> 672 and post-warmup hitches 1 -> 47. This admits only
+					// the chunks that would otherwise be holes.)
+					if (DistSq >= FMath::Square(AdmitOuterUU) || Level + 1 >= VoxelCoords::kNumLevels)
+					{
+						continue; // too far to be a seam case, or no coarser ring exists (clipmap takes over)
+					}
+					// Parent at L+1 covering this same ground. Its lattice is 2x
+					// this one and origin-aligned, so the parent index is Cx>>1
+					// (>> floors for negatives, which is what we want).
+					const double ParentEdge = ChunkEdge * 2.0;
+					const double ParentCX = (double(Cx >> 1) + 0.5) * ParentEdge;
+					const double ParentCY = (double(Cy >> 1) + 0.5) * ParentEdge;
+					const double ParentDistSq =
+						FMath::Square(ParentCX - Anchor.X) + FMath::Square(ParentCY - Anchor.Y);
+					// The parent's ring starts exactly where this one ends
+					// (Inner[L+1] == Outer[L]), so the parent is admitted iff its
+					// centre is at or beyond OuterUU. If it is, the ground is
+					// covered and this chunk is redundant.
+					if (ParentDistSq >= FMath::Square(OuterUU))
+					{
+						continue;
+					}
 				}
 
 				++ThisFrameLevelFootprints[Level];
@@ -5010,7 +5053,8 @@ void FVoxelWorldImpl::DispatchJobs()
 	// Cold-band throttle (see the block after the record lookup below). Hoisted:
 	// loop-invariant, and the check runs on every popped level-0 candidate.
 	const bool bBandSkipActive =
-		VoxelStreamAdmission::BuriedSkipEnabled() || VoxelStreamAdmission::VerifyBuriedSkipEnabled();
+		(VoxelStreamAdmission::BuriedSkipEnabled() || VoxelStreamAdmission::VerifyBuriedSkipEnabled()) &&
+		VoxelStreamAdmission::ColdBandThrottleEnabled();
 	TArray<FSortEntry> DeferredColdBand;
 
 	while (JobsInFlightCounter.GetValue() < MaxJobsInFlight)
