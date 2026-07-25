@@ -97,13 +97,19 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	float3 ChunkOrigin = VoxelVF.ChunkOriginUU;
 	float ChunkScale = VoxelVF.LevelScale;
 	float2 ChunkClimate = float2(0.5f, 0.5f);
+	// Surface height at this chunk's centre, relative to the chunk's own origin.
+	// Single-chunk mode has no per-chunk table, so it takes the "no subsystem"
+	// fallback BuildChunkVertexData uses: everything counts as surface.
+	float ChunkSurfaceZRelUU = -1.0e30f;
 	if (VoxelVF.PoolMode != 0u)
 	{
 		const uint ChunkId = VoxelVF.QuadChunkIds[QuadIndex];
 		const float4 Entry = VoxelVF.ChunkOrigins[ChunkId];
 		ChunkOrigin = Entry.xyz;
 		ChunkScale = Entry.w;
-		ChunkClimate = VoxelVF.ChunkClimate[ChunkId];
+		const float4 Params = VoxelVF.ChunkParams[ChunkId];
+		ChunkClimate = Params.xy;
+		ChunkSurfaceZRelUU = Params.z;
 	}
 
 	const FVoxelQuadVertex Decoded = DecodeVoxelQuadVertex(Packed, CornerIndex, ChunkScale);
@@ -175,15 +181,38 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	// MAT_ROCK and MAT_SUBSOIL. Writing the id instead makes every quad read as
 	// subsurface, which is exactly the grey/tan the first pool render showed.
 	//
-	// Not yet mirrored: the CPU path also gates on proximity to the chunk
-	// surface, so a cave FLOOR (also a +Z face) is not tinted as hillside. That
-	// needs the chunk surface height GPU-side; without it, underground +Z faces
-	// will tint as if they were open sky.
+	// R is a full mirror of VoxelClimate::BiomeTintForFace (VoxelClimateProbe.cpp)
+	// AND of the surface-proximity gate that wraps it in BuildChunkVertexData
+	// (VoxelChunkComponent.cpp ~:192-225, :417-421). Both halves were missing
+	// here, and both are visible in ordinary play -- neither is behind a cvar:
+	//
+	//   * SIDE FACES. BiomeTintForFace returns 140 (not 0) for any non-Z face:
+	//     "the riser of a 10 cm step reads as part turf, part exposed soil. A
+	//     hard 0 stripes every hillside at voxel pitch." This factory returned 0
+	//     for them, so every vertical wall in the world lost its partial biome
+	//     blend. That is the larger of the two differences by area.
+	//   * CAVE FLOORS. A cave floor is a +Z face too, so face direction alone
+	//     paints it grassland green. The CPU path gates on the vertex being
+	//     within kSurfaceBandUU of the chunk's surface height; that height now
+	//     arrives per chunk in ChunkParams.z.
+	//
+	// The gate is expressed chunk-locally on both sides. The CPU asks
+	// `ComponentWorldOrigin.Z + Pos.Z > ChunkSurfaceZUU - Band`; subtracting
+	// ComponentWorldOrigin.Z from both sides gives exactly the test below, with
+	// the subtraction done once on the CPU in double precision. So no float32
+	// precision is spent on this world's 84 km offset, and the two paths agree
+	// bit for bit rather than approximately.
+	//
+	// 140.0/255.0 and 200.0 are quoted from the CPU constants on purpose; if
+	// either moves, both copies have to move together.
 	const uint QPositive = (Packed.x >> 4) & 0xfu;
-	const bool bSkyFacing = (Axis == 2u) && (QPositive != 0u);
+	const float kSurfaceBandUU = 200.0f;
+	const bool bNearSurface = Decoded.PositionUU.z > (ChunkSurfaceZRelUU - kSurfaceBandUU);
+	const float FaceTint = (Axis == 2u) ? ((QPositive != 0u) ? 1.0f : 0.0f)
+	                                    : (140.0f / 255.0f);
 
 	Intermediates.Color = half4(
-		bSkyFacing ? 1.0h : 0.0h,
+		bNearSurface ? (half)FaceTint : 0.0h,
 		(half)Decoded.AmbientOcclusion,
 		(half)ChunkClimate.x,
 		(half)ChunkClimate.y);

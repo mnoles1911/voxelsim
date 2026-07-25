@@ -79,7 +79,7 @@ void FVoxelQuadVertexFactory::InitRHI(FRHICommandListBase& RHICmdList)
 		// in a uniform buffer is a validation failure, not a tolerated no-op.
 		Parameters.ChunkOrigins = ChunkOriginsSRV.IsValid() ? ChunkOriginsSRV : QuadBufferSRV;
 		Parameters.QuadChunkIds = QuadChunkIdsSRV.IsValid() ? QuadChunkIdsSRV : QuadBufferSRV;
-		Parameters.ChunkClimate = ChunkClimateSRV.IsValid() ? ChunkClimateSRV : QuadBufferSRV;
+		Parameters.ChunkParams = ChunkParamsSRV.IsValid() ? ChunkParamsSRV : QuadBufferSRV;
 		UniformBuffer = TUniformBufferRef<FVoxelQuadVertexFactoryParameters>::CreateUniformBufferImmediate(
 			Parameters, UniformBuffer_MultiFrame);
 	}
