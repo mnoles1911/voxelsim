@@ -226,9 +226,11 @@ Water surface is a separate, near-identical task to the terrain pool.
 ## Open, not blocking G3
 
 - **Deep-column waste:** 44.6% of R0 worker time meshes buried chunks emitting
-  zero quads. Measured ceiling: **+34.8%** useful throughput. Safe path is moving
-  the exact band skip from dispatch-time to admission-time; needs a downward
-  escape hatch (`EditedFootprintMinZ` → widen `ChunkZMin`) first.
+  zero quads. The proposed fix — move the band skip from dispatch-time to
+  admission-time — was built, measured and **does not reach it**; see "The
+  admission-time band skip: built, measured, left off" below. The downward
+  escape hatch it needed was built anyway and shipped, because the hole it
+  closes turned out to be a live bug rather than a prerequisite.
 - **Residual perf cost of the seam fix:** p50 14.92 → 17.52 ms, 968 → 703
   chunks/s. Real extra chunks where holes used to be. Exactly what ADR-0006
   removes.
@@ -400,3 +402,97 @@ Two fixes are wanted, and they are independent:
    ring should refill when it has no *dispatchable* work, so a bounded number of
    permanently-deferred entries cannot starve it. Fixing only (1) leaves the
    next stuck entry free to do this again.
+
+## The admission-time band skip: built, measured, left off (2026-07-25)
+
+The "deep-column waste" item above proposed moving the buried-chunk band skip
+from dispatch-time to admission-time. It is built, it is correct, and it is
+**default-off** (`voxel.Stream.AdmissionBandSkip`, 0/1/2) because measurement
+says it cannot reach the waste it was aimed at. The escape hatch it needed is
+ON, and is the part that mattered.
+
+### Why it cannot reach the waste
+
+The band is derived from a level-0 job's own 34x34 column grid and lands in
+`FootprintBandCache` in `DrainResults`. So it **does not exist until some
+level-0 job in that footprint has completed AND drained.** Admission runs
+before that, and `AddCandidate` admits a footprint's ENTIRE
+`ChunkZMin..ChunkZMax` column in the single pass that first scans the
+footprint. By the time the band arrives, every chunk it could refuse is
+already a record, and `AddCandidate`'s `ChunkRecords.Contains` guard means it
+is never reconsidered.
+
+Mode 2 (compute the verdict, admit anyway) over one full stationary fill at
+`-VoxelSpawnAt=-84480,53760`:
+
+```
+Voxel band skip at admission:  warm=7325 cold=8131 skipped=89
+Voxel buried skip (dispatch, same run):        skipped=2186
+```
+
+**89 against 2186** -- ~4% of the opportunity. The `warm` scans are almost all
+re-scans of footprints whose chunks are already records, so they have nothing
+to refuse. Running mode 1 for real removes 61 records (`tracked` 16417 ->
+16356) and **zero quads**.
+
+And the 61 it does remove cost no worker time to begin with: the dispatch-time
+skip already refuses to mesh them. Moving the same predicate earlier saves a
+record, a queue slot and an admission slot -- not a job. The 44.6% of R0
+worker time in the item above is the chunks the band *declines* to skip (`R0
+total=3396 zq=1449`, 42.7% zero-quad on this spawn), and evaluating the same
+predicate one stage earlier cannot skip more of them.
+
+### What would actually reach it
+
+Not this. The residual waste is (a) blind seeds on cold footprints and (b)
+chunks the band is not tight enough to prove empty. Neither is an admission
+problem. The shape that WOULD work is to defer the sub-surface part of a cold
+footprint's column by one pass so the band is warm when it is scanned -- i.e.
+move the **cold-band throttle** to admission, not the skip. That is a
+different mechanism with a real latency risk and it was not attempted here.
+
+### The downward escape hatch, which shipped
+
+Intended as a prerequisite; turned out to close a live hole. `ChunkZMin` is
+worldgen's floor (lowest corner surface, -1 chunk, minus the 12-chunk depth
+skirt = ~41.6 m at level 0 near band). A player digging past it leaves the
+bottom of the shaft outside the desired set, and the anchor-relative deep box
+cannot cover for it because that box only exists once the anchor is itself
+underground. `-VoxelDigDownTest`, 60 m shaft, pawn stationary on the surface:
+
+| | tracked | deepestTracked | deepestGeometry |
+|---|---|---|---|
+| `-VoxelNoEditFloorHatch` | 13/25 | 41.6 m | 41.6 m |
+| hatch on | 19/25 | **60.8 m** | **60.8 m** |
+
+**Two things the one-line description of this fix does not cover, and both
+were found by running it, not by reading it:**
+
+1. **The widening alone does nothing.** `RecomputeDesiredSet`'s entry scan is
+   gated on the anchor having crossed a level-L chunk. A player standing still
+   and digging down widens `EditedFootprintMinZ` and no scan ever reads it --
+   the first build of this fix produced a result byte-identical to no fix at
+   all. `PropagateEditToMips` now clears `bHasRecomputedLevel[Level]` when a
+   footprint's recorded edit range actually changes (at most once per 3.2 m of
+   new depth per footprint; measured 152 clears for a whole 60 m shaft).
+2. **A saved world came back with the hatch dead.** `World::replay` writes the
+   overlay directly, so `EditedFootprintMinZ/MaxZ` and `EditedAncestorChunks`
+   were all empty after a load and the hole returned on reload -- which also
+   means the pre-existing **sky-band** hatch has been losing saved structures
+   above the trimmed band. `RebuildEditedFootprintsFromOverlay()` rebuilds all
+   three from the restored bricks at load. Verified: a fresh process loading
+   the saved shaft streams it to 60.8 m.
+
+### Correctness
+
+Stationary spawn, fully settled (`jobsInFlight=0 pendingJobs=0`), skip off vs
+on: `loaded=9822 quads=8813242` **both sides**, per-ring loaded identical at
+every level. Only `tracked` moves (16417 -> 16364).
+
+### Trap for whoever runs this next
+
+A git worktree of this repo has no `tile-cache/`, so the amplifier silently
+falls back to the **synthetic** sampler and every number moves. Junction it in
+before measuring anything (`New-Item -ItemType Junction`). With it in place
+this box reproduces the reference spawn at `loaded=9822 quads=8813242
+tracked=16417` against the recorded `9819 / 8809945 / 16417`.

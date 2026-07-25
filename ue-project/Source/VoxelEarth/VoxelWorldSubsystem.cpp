@@ -1164,6 +1164,30 @@ struct FFootprintBand
 	int32 SolidBelowVoxel = 0;
 };
 
+// The band verdict for one level-0 chunk Z, in ONE place. Two call sites now
+// ask it -- the pre-dispatch skip in DispatchJobs and the admission skip in
+// RecomputeDesiredSet -- and they must not be able to drift apart: an
+// admission site that skipped one chunk more than the dispatch site would
+// delete geometry the verify harness has never checked.
+//
+// Pure in (Band, ChunkZ). The band itself is a pure function of the level-0
+// footprint (X,Y) and the amplifier, so this verdict is too -- that is what
+// makes it legal to evaluate at admission time at all.
+inline bool BandProvesChunkEmpty(const FFootprintBand& Band, int32 ChunkZ, bool& bOutAllAir)
+{
+	constexpr int64 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
+	const int64 InteriorZMin = int64(ChunkZ) * ChunkVox;
+	const int64 ApronZMax = InteriorZMin + ChunkVox; // interior top is +31; the mesher's apron reads +32
+	// All air: the whole interior sits above every column's topmost solid
+	// voxel, so every one of the 64 bricks hits meshBrick's early-out 1.
+	const bool bAllAir = InteriorZMin > int64(Band.MaxSurfaceTopVoxel);
+	// All solid: chunk AND apron sit below the lowest z at which any column
+	// can hold air, so no face has an AIR neighbour.
+	const bool bAllSolid = ApronZMax < int64(Band.SolidBelowVoxel);
+	bOutAllAir = bAllAir;
+	return bAllAir || bAllSolid;
+}
+
 struct FJobResult
 {
 	VoxelCoords::FVoxelLevelChunkKey Key;
@@ -1668,6 +1692,61 @@ static FAutoConsoleVariableRef CVarSolidSkip(
 bool SolidSkipEnabled()
 {
 	return GSolidSkip != 0;
+}
+
+// Buried-chunk band skip at ADMISSION time (docs/streaming-handoff.md "Open,
+// not blocking G3" -> "Deep-column waste"). The band skip in DispatchJobs
+// already declines to MESH a buried level-0 chunk, but by then the chunk is a
+// record and has spent one of R0's Cap/4 admission slots and one of its 512
+// queue slots -- so the chunks that DO have geometry queue behind rock.
+// Evaluating the SAME verdict (VoxelStreaming::BandProvesChunkEmpty) one stage
+// earlier costs one TMap lookup per footprint per scan and never creates the
+// record at all.
+//
+// 0: off (the pre-change form -- admit, queue, then decline to dispatch).
+// 1: skip admitting.
+// 2: MEASURE ONLY -- compute and count the verdict, admit anyway. This is the
+//    control experiment for "can this predicate fire at admission at all",
+//    which is a real question and not a rhetorical one: the band does not
+//    exist until some level-0 job in that footprint has completed AND drained,
+//    so a footprint being scanned for the first time has nothing to consult.
+static int32 GAdmissionBandSkip = 0;
+static FAutoConsoleVariableRef CVarAdmissionBandSkip(
+	TEXT("voxel.Stream.AdmissionBandSkip"),
+	GAdmissionBandSkip,
+	TEXT("0 (default): the buried-chunk band skip runs at dispatch time only. 1: also refuse ADMISSION to level-0 "
+	     "chunks the cached footprint band proves empty. 2: measure the verdict without acting on it. Vetoed by "
+	     "EditedFootprintMinZ, exactly like voxel.Stream.AdmissionSolidSkip."),
+	ECVF_Default);
+
+// 0 off / 1 skip / 2 measure-only.
+//
+// -VoxelAdmissionBandSkip=<n> overrides the cvar and WINS, for the reason
+// -VoxelNoUnderground documents: an -ExecCmds cvar is applied after the world
+// has already begun streaming, and by then the first recomputes have admitted
+// the near footprints this switch is about. An A/B driven through -ExecCmds
+// would measure the same admitted set twice.
+inline int32 AdmissionBandSkipMode()
+{
+	static const int32 CmdLineOverride = []
+	{
+		int32 Value = -1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelAdmissionBandSkip="), Value);
+		return Value;
+	}();
+	return CmdLineOverride >= 0 ? CmdLineOverride : GAdmissionBandSkip;
+}
+
+// -VoxelNoEditFloorHatch: turn the DOWNWARD escape hatch off (see the
+// EditedFootprintMinZ block in RecomputeDesiredSet). Exists only so the
+// control experiment can show what a shaft dug past the depth skirt's floor
+// looks like WITHOUT it -- which, on every build before this one, is a hole.
+// A command-line switch and not a cvar, same reasoning as
+// -VoxelAdmissionBandSkip below.
+inline bool EditFloorHatchEnabled()
+{
+	static const bool bDisabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelNoEditFloorHatch"));
+	return !bDisabled;
 }
 
 // -VoxelVerifySolidSkip: admit the chunks the skip would have dropped, and
@@ -2608,6 +2687,30 @@ struct FVoxelWorldImpl
 	int64 SolidVerifyCheckedTotal = 0;
 	int64 SolidVerifyViolations = 0;
 
+	// Buried-band ADMISSION skip census (voxel.Stream.AdmissionBandSkip). The
+	// three numbers that decide whether this lever exists at all, counted over
+	// level-0 surface-band candidates that were not already records:
+	//   Warm    -- the footprint had a cached band to consult.
+	//   Cold    -- it did not, so the candidate had to be admitted blind. A band
+	//              only exists after some level-0 job in that (X,Y) has completed
+	//              AND drained, so this is the ceiling on what the lever can
+	//              never reach, and it is the number to read first.
+	//   Skipped -- warm AND the band proved the chunk empty AND no edit vetoed
+	//              it. Under mode 2 these are counted but still admitted.
+	int64 BandAdmitWarmSinceLog = 0;
+	int64 BandAdmitColdSinceLog = 0;
+	int64 BandSkippedAtAdmissionSinceLog = 0;
+	int64 BandSkippedAtAdmissionTotal = 0;
+	int64 BandAdmitEditVetoSinceLog = 0;
+	// Downward escape hatch: footprints whose ChunkZMin was widened by an edit
+	// below the worldgen floor, and the deepest such widening seen, in chunks.
+	int64 EditFloorWidenedSinceLog = 0;
+	int32 EditFloorWidestChunks = 0;
+	// Entry-scan gates cleared because an edit moved a footprint's recorded
+	// edit range (see PropagateEditToMips). Without these the hatches are
+	// dead code on a stationary anchor.
+	int64 EditForcedRescansSinceLog = 0;
+
 	// The 60fps bar is 16.6ms, but the hitch log/`UVoxelPerfRunSubsystem`'s
 	// hitch count both use the much looser 33.3ms threshold -- a recurring
 	// ~20-30ms burst is a hard 60fps violation that is completely invisible to
@@ -2810,6 +2913,15 @@ private:
 	// EditedAncestorChunks so it takes the overlay-aware path on any FUTURE
 	// load too (not just chunks that happen to be resident right now).
 	void PropagateEditToMips(const TSet<VoxelCoords::FVoxelChunkKey>& DirtyLevel0Chunks);
+
+public:
+	// Rebuild the edit-derived ADMISSION state (EditedFootprintMinZ/MaxZ,
+	// EditedAncestorChunks) from the restored overlay after a saved world is
+	// replayed. Public because the only caller is LoadWorld, a free function.
+	// See the definition for why a load cannot go through PropagateEditToMips.
+	void RebuildEditedFootprintsFromOverlay();
+
+private:
 	void CollectDirtyChunks(int64 Vx, int64 Vy, int64 Vz, TSet<VoxelCoords::FVoxelChunkKey>& Out) const;
 	bool ChunkHasEditedBrick(const VoxelCoords::FVoxelChunkKey& ChunkKey) const;
 	// M2 wave 2: "does this (level,chunk) currently need the overlay-aware
@@ -3501,6 +3613,23 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	{
 		N = 0;
 	}
+
+	// Buried-BAND admission skip census. `cold` is the number to read first: it
+	// is level-0 surface-band footprint scans that had no cached band to
+	// consult, i.e. the part of the opportunity an admission-time band skip can
+	// never reach however well it is implemented. `editFloor` is the downward
+	// escape hatch firing (footprint scans whose ChunkZMin was widened by a dig
+	// below the worldgen floor) and is expected to be 0 on any run with no edits.
+	BandSkippedAtAdmissionTotal += BandSkippedAtAdmissionSinceLog;
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel band skip at admission (5s window): mode=%d warm=%lld cold=%lld skipped=%lld (total %lld) ")
+	       TEXT("editVeto=%lld | editFloor widened=%lld deepest=%d chunks forcedRescans=%lld"),
+	       VoxelStreamAdmission::AdmissionBandSkipMode(), (long long)BandAdmitWarmSinceLog,
+	       (long long)BandAdmitColdSinceLog, (long long)BandSkippedAtAdmissionSinceLog,
+	       (long long)BandSkippedAtAdmissionTotal, (long long)BandAdmitEditVetoSinceLog,
+	       (long long)EditFloorWidenedSinceLog, EditFloorWidestChunks, (long long)EditForcedRescansSinceLog);
+	BandAdmitWarmSinceLog = BandAdmitColdSinceLog = BandSkippedAtAdmissionSinceLog = 0;
+	BandAdmitEditVetoSinceLog = EditFloorWidenedSinceLog = EditForcedRescansSinceLog = 0;
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
 		BuriedSkipsByLevelSinceLog[Level] = 0;
@@ -4718,6 +4847,47 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				// horizontal distance, which the memo does not key on.
 				ChunkZMin -= VoxelUnderground::SkirtDepthChunks(Level, DistSq);
 
+				// DOWNWARD ESCAPE HATCH -- the exact mirror of the sky-band
+				// trim's hatch above, and the prerequisite for skipping any
+				// candidate inside this band on a worldgen-only proof.
+				//
+				// ChunkZMin is worldgen's statement about where the visible
+				// world stops going down: the footprint's lowest corner surface,
+				// minus one chunk, minus the depth skirt (12 level-0 chunks =
+				// 38.4 m in the near band). Nothing WORLDGEN puts below that can
+				// ever be seen. A PLAYER digging can: a shaft driven past the
+				// skirt floor leaves its lowest chunks outside the desired set,
+				// so they are never admitted, never meshed and never drawn --
+				// a see-through hole at the bottom of the shaft that does not
+				// heal while the anchor stays above ground (the anchor-relative
+				// deep box, which would otherwise cover it, only exists once
+				// the anchor is itself underground).
+				//
+				// EditedFootprintMinZ is the lowest level-L chunk any edit in
+				// this footprint has touched, maintained by PropagateEditToMips
+				// in the same one place and by the same walk as
+				// EditedFootprintMaxZ, and already apron-extended across chunk
+				// borders by CollectDirtyChunks -- so an edit that breaks
+				// through a chunk floor records the chunk BELOW it too.
+				//
+				// Deliberately NOT clamped the way the sky hatch is. That one
+				// clamps to ChunkZMaxUntrimmed because it is only undoing its
+				// own trim; there is no untrimmed floor to clamp to here, and
+				// clamping to the skirt would defeat the entire purpose. The
+				// cost is bounded by how far somebody has actually dug.
+				if (EditedFootprintMinZ[Level].Num() > 0 && VoxelStreamAdmission::EditFloorHatchEnabled())
+				{
+					if (const int32* EditedMinZ = EditedFootprintMinZ[Level].Find(FIntPoint(Cx, Cy)))
+					{
+						if (*EditedMinZ < ChunkZMin)
+						{
+							EditFloorWidestChunks = FMath::Max(EditFloorWidestChunks, ChunkZMin - *EditedMinZ);
+							++EditFloorWidenedSinceLog;
+							ChunkZMin = *EditedMinZ;
+						}
+					}
+				}
+
 				const auto AddCandidate = [this, ChunkEdge, CenterX, CenterY, &Anchor](const FVoxelLevelChunkKey& LevelKey,
 				                                                                     bool bDeepAnchorRelative)
 				{
@@ -4778,9 +4948,76 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					}
 				};
 
+				// Buried-chunk band skip, ADMISSION side (see
+				// VoxelStreamAdmission::AdmissionBandSkipMode). Level 0 only,
+				// for the same reason the dispatch-side skip is: the band is
+				// derived from a level-0 job's own 34x34 column grid and a
+				// level-L (L>=1) chunk spans 2^L x 2^L level-0 footprints.
+				//
+				// One lookup per FOOTPRINT, not per chunk: the band is a
+				// property of (X,Y) alone, which is the whole reason it is
+				// cheap enough to consult here.
+				//
+				// WHAT THIS CANNOT DO. The band does not exist until some
+				// level-0 job in this footprint has completed AND drained, so a
+				// footprint entering the desired set for the first time has
+				// nothing to consult and every one of its chunks is admitted
+				// blind. That is counted (BandAdmitCold) rather than assumed
+				// away.
+				const int32 BandSkipMode = (Level == 0) ? VoxelStreamAdmission::AdmissionBandSkipMode() : 0;
+				const VoxelStreaming::FFootprintBand* AdmitBand = nullptr;
+				// Edit veto, identical in shape and reasoning to the all-solid
+				// admission skip's below: everything at or above the lowest
+				// edited chunk in this footprint is admitted normally. Chunks
+				// strictly BELOW it are untouched rock whose apron is untouched
+				// too -- CollectDirtyChunks extends an edit across every chunk
+				// border it touches, so an edit that reaches a chunk floor has
+				// already lowered this value to the chunk beneath.
+				int32 AdmitEditFloorZ = MAX_int32;
+				if (BandSkipMode != 0)
+				{
+					AdmitBand = FootprintBandCache.Find(FIntPoint(Cx, Cy));
+					(AdmitBand ? BandAdmitWarmSinceLog : BandAdmitColdSinceLog) += 1;
+					if (AdmitBand && EditedFootprintMinZ[0].Num() > 0)
+					{
+						if (const int32* E = EditedFootprintMinZ[0].Find(FIntPoint(Cx, Cy)))
+						{
+							AdmitEditFloorZ = *E;
+						}
+					}
+				}
+
 				for (int32 Cz = ChunkZMin; Cz <= ChunkZMax; ++Cz)
 				{
-					AddCandidate(FVoxelLevelChunkKey{Level, FVoxelChunkKey{Cx, Cy, Cz}}, /*bDeepAnchorRelative*/ false);
+					const FVoxelLevelChunkKey CandidateKey{Level, FVoxelChunkKey{Cx, Cy, Cz}};
+					bool bBandEmpty = false;
+					if (AdmitBand)
+					{
+						bool bAllAir = false;
+						// Ordered so the arithmetic (free) runs before either
+						// map lookup, and the ChunkRecords lookup replaces the
+						// one AddCandidate would have done rather than adding
+						// to it -- an already-tracked chunk is not a candidate
+						// and must not be counted as one.
+						bBandEmpty = VoxelStreaming::BandProvesChunkEmpty(*AdmitBand, Cz, bAllAir) &&
+						             !ChunkRecords.Contains(CandidateKey);
+					}
+					if (bBandEmpty)
+					{
+						if (Cz >= AdmitEditFloorZ)
+						{
+							++BandAdmitEditVetoSinceLog;
+						}
+						else
+						{
+							++BandSkippedAtAdmissionSinceLog;
+							if (BandSkipMode == 1)
+							{
+								continue; // never a record, never queued, never dispatched
+							}
+						}
+					}
+					AddCandidate(CandidateKey, /*bDeepAnchorRelative*/ false);
 				}
 
 				// Step 2: the anchor-relative deep box, only while underground.
@@ -5411,17 +5648,9 @@ void FVoxelWorldImpl::DispatchJobs()
 		{
 			if (const VoxelStreaming::FFootprintBand* Band = FootprintBandCache.Find(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y)))
 			{
-				constexpr int64 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
-				const int64 InteriorZMin = int64(LevelKey.Key.Z) * ChunkVox;
-				const int64 ApronZMax = InteriorZMin + ChunkVox; // interior top is +31; the mesher's apron reads +32
-				// All air: the whole interior sits above every column's
-				// topmost solid voxel, so every one of the 64 bricks hits
-				// meshBrick's early-out 1 (no solid voxel in the interior).
-				const bool bAllAir = InteriorZMin > int64(Band->MaxSurfaceTopVoxel);
-				// All solid: chunk AND apron sit below the lowest z at which
-				// any column can hold air, so no face has an AIR neighbour.
-				const bool bAllSolid = ApronZMax < int64(Band->SolidBelowVoxel);
-				if (bAllAir || bAllSolid)
+				// Shared with the admission-time skip -- see BandProvesChunkEmpty.
+				bool bAllAir = false;
+				if (VoxelStreaming::BandProvesChunkEmpty(*Band, LevelKey.Key.Z, bAllAir))
 				{
 					bPredictedEmpty = true;
 					++BuriedSkipsSinceLog;
@@ -6658,6 +6887,87 @@ void FVoxelWorldImpl::MarkChunkDirtyForRemesh(const VoxelCoords::FVoxelLevelChun
 	PendingGameThreadKeys.AddUnique(LevelKey);
 }
 
+void FVoxelWorldImpl::RebuildEditedFootprintsFromOverlay()
+{
+	using namespace VoxelCoords;
+	constexpr int32 BricksPerChunk = ChunkEdgeBricks;
+
+	// vxc::World::replay writes the overlay DIRECTLY -- it is the edit log
+	// replaying itself, not ApplyGroupedEdits -- so nothing on the UE side that
+	// PropagateEditToMips maintains exists after a load. EditedFootprintMaxZ,
+	// EditedFootprintMinZ and EditedAncestorChunks all come back empty, and
+	// every escape hatch keyed on them silently reverts to worldgen-only
+	// behaviour for edits that were saved rather than made this session.
+	//
+	// Both hatches are holes when that happens: the sky hatch loses a saved
+	// structure standing above the trimmed band, and the downward hatch loses
+	// the bottom of a saved shaft. Neither is visible until somebody reloads,
+	// which is exactly the kind of bug that survives a whole wave of testing.
+	//
+	// Brick granularity with ONE CHUNK of margin on every axis: the same
+	// conservative reach ChunkHasEditedBrick already scans with, and coarser
+	// than CollectDirtyChunks' per-voxel border test. Over-wide by design --
+	// a false entry costs a handful of admitted chunks in one footprint, a
+	// missing one costs terrain.
+	const vxc::ChunkMap<BrickEdgeVoxels>& Overlay = Voxels.editedBricks();
+	if (Overlay.size() == 0)
+	{
+		return;
+	}
+
+	TSet<FVoxelChunkKey> DirtyChunks;
+	DirtyChunks.Reserve(int32(Overlay.size()));
+	for (const auto& Entry : Overlay)
+	{
+		const vxc::BrickKey& BKey = Entry.first;
+		const int32 Bx = int32(FloorDiv(int64(BKey.x), int64(BricksPerChunk)));
+		const int32 By = int32(FloorDiv(int64(BKey.y), int64(BricksPerChunk)));
+		const int32 Bz = int32(FloorDiv(int64(BKey.z), int64(BricksPerChunk)));
+		for (int32 Dz = -1; Dz <= 1; ++Dz)
+		{
+			for (int32 Dy = -1; Dy <= 1; ++Dy)
+			{
+				for (int32 Dx = -1; Dx <= 1; ++Dx)
+				{
+					DirtyChunks.Add(FVoxelChunkKey{Bx + Dx, By + Dy, Bz + Dz});
+				}
+			}
+		}
+	}
+
+	// Deliberately NOT PropagateEditToMips: that call bumps EditEpoch,
+	// invalidates SharedMipCache and logs one line per ancestor per level.
+	// At load time nothing is resident, nothing is cached and no job is in
+	// flight, so all of that is either a no-op or pure log spam -- on a large
+	// save it would be tens of thousands of lines. Only the maps that outlive
+	// the load are rebuilt here, by the same rules.
+	int32 Level0Footprints = 0;
+	for (const FVoxelChunkKey& Chunk : DirtyChunks)
+	{
+		int32& MaxZ0 = EditedFootprintMaxZ[0].FindOrAdd(FIntPoint(Chunk.X, Chunk.Y), MIN_int32);
+		MaxZ0 = FMath::Max(MaxZ0, Chunk.Z);
+		int32& MinZ0 = EditedFootprintMinZ[0].FindOrAdd(FIntPoint(Chunk.X, Chunk.Y), MAX_int32);
+		MinZ0 = FMath::Min(MinZ0, Chunk.Z);
+		++Level0Footprints;
+
+		for (int32 Level = 1; Level < kNumLevels; ++Level)
+		{
+			const FVoxelChunkKey Ancestor = AncestorChunkKey(Chunk, Level);
+			EditedAncestorChunks[Level].Add(Ancestor);
+			int32& MaxZ = EditedFootprintMaxZ[Level].FindOrAdd(FIntPoint(Ancestor.X, Ancestor.Y), MIN_int32);
+			MaxZ = FMath::Max(MaxZ, Ancestor.Z);
+			int32& MinZ = EditedFootprintMinZ[Level].FindOrAdd(FIntPoint(Ancestor.X, Ancestor.Y), MAX_int32);
+			MinZ = FMath::Min(MinZ, Ancestor.Z);
+		}
+	}
+
+	UE_LOG(LogVoxelEdit, Log,
+	       TEXT("LoadWorld: rebuilt edit-derived admission state from %llu overlay bricks -- %d level-0 chunks, ")
+	       TEXT("%d level-0 footprints, %d level-1 edited ancestors"),
+	       (unsigned long long)Overlay.size(), Level0Footprints, EditedFootprintMinZ[0].Num(),
+	       EditedAncestorChunks[1].Num());
+}
+
 void FVoxelWorldImpl::PropagateEditToMips(const TSet<VoxelCoords::FVoxelChunkKey>& DirtyLevel0Chunks)
 {
 	using namespace VoxelCoords;
@@ -6674,13 +6984,33 @@ void FVoxelWorldImpl::PropagateEditToMips(const TSet<VoxelCoords::FVoxelChunkKey
 
 	// Sky-band trim escape hatch (see EditedFootprintMaxZ): record level 0's own
 	// edited footprints here, since the ancestor walk below starts at level 1.
+	//
+	// A CHANGED value must also force the level to re-enumerate. Both hatches
+	// are read in RecomputeDesiredSet's ENTRY scan, and that scan is gated on
+	// the anchor having crossed a level-L chunk (bHasRecomputedLevel /
+	// LastAnchorChunkPerLevel) -- so a player standing still and digging
+	// straight down widens EditedFootprintMinZ and nothing ever looks at it.
+	// Measured, not assumed: with the hatch in and this flag out, a 60 m shaft
+	// dug from a stationary spawn still ended at the 41.6 m skirt floor with
+	// the bottom 18 m untracked and unmeshed, byte-identical to having no
+	// hatch at all.
+	//
+	// Only on a CHANGE, which for a sustained dig is at most once per 3.2 m of
+	// new depth per footprint -- not once per edit. The flag costs exactly one
+	// extra entry scan of that level on the next tick.
 	for (const FVoxelChunkKey& Level0Chunk : DirtyLevel0Chunks)
 	{
 		int32& MaxZ = EditedFootprintMaxZ[0].FindOrAdd(FIntPoint(Level0Chunk.X, Level0Chunk.Y), MIN_int32);
-		MaxZ = FMath::Max(MaxZ, Level0Chunk.Z);
-		// ...and the mirror, for the all-solid admission skip's edit veto.
+		// ...and the mirror, for the all-solid admission skip's edit veto and
+		// the downward escape hatch.
 		int32& MinZ = EditedFootprintMinZ[0].FindOrAdd(FIntPoint(Level0Chunk.X, Level0Chunk.Y), MAX_int32);
-		MinZ = FMath::Min(MinZ, Level0Chunk.Z);
+		if (Level0Chunk.Z > MaxZ || Level0Chunk.Z < MinZ)
+		{
+			MaxZ = FMath::Max(MaxZ, Level0Chunk.Z);
+			MinZ = FMath::Min(MinZ, Level0Chunk.Z);
+			bHasRecomputedLevel[0] = false;
+			++EditForcedRescansSinceLog;
+		}
 	}
 
 	for (int32 Level = 1; Level < kNumLevels; ++Level)
@@ -6701,10 +7031,16 @@ void FVoxelWorldImpl::PropagateEditToMips(const TSet<VoxelCoords::FVoxelChunkKey
 			const bool bAlreadyEdited = EditedAncestorChunks[Level].Contains(Ancestor);
 			EditedAncestorChunks[Level].Add(Ancestor);
 			{
+				// Same change-triggered rescan as level 0 above.
 				int32& MaxZ = EditedFootprintMaxZ[Level].FindOrAdd(FIntPoint(Ancestor.X, Ancestor.Y), MIN_int32);
-				MaxZ = FMath::Max(MaxZ, Ancestor.Z);
 				int32& MinZ = EditedFootprintMinZ[Level].FindOrAdd(FIntPoint(Ancestor.X, Ancestor.Y), MAX_int32);
-				MinZ = FMath::Min(MinZ, Ancestor.Z);
+				if (Ancestor.Z > MaxZ || Ancestor.Z < MinZ)
+				{
+					MaxZ = FMath::Max(MaxZ, Ancestor.Z);
+					MinZ = FMath::Min(MinZ, Ancestor.Z);
+					bHasRecomputedLevel[Level] = false;
+					++EditForcedRescansSinceLog;
+				}
 			}
 
 			// SharedMipCache stores PURE bricks only (see its doc comment);
@@ -8115,6 +8451,11 @@ void LoadEditLogFromDisk(FVoxelWorldImpl& Impl, uint64 Seed)
 
 	UE_LOG(LogVoxelEdit, Log, TEXT("LoadWorld: restored %llu entries from %s -- editedDigest=0x%016llX"),
 	       (unsigned long long)ParsedLog->size(), *Path, (unsigned long long)Impl.Voxels.editedDigest());
+
+	// replay() only touches the overlay. Everything the ADMISSION path derives
+	// from edits has to be rebuilt explicitly, or a reloaded world streams as
+	// if it had never been dug.
+	Impl.RebuildEditedFootprintsFromOverlay();
 }
 } // namespace
 
