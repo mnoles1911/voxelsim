@@ -4971,6 +4971,27 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 			bAdmissionDeferredWork[Level] = false;
 		}
 	}
+
+	// voxel.Stream.LogAdmission: the admission loop's state, per level, per
+	// call. Whether a ring keeps filling is a function of four things
+	// interacting -- did it re-enumerate, how many did it take, how many did it
+	// turn away, and is its refill trigger still armed -- and no combination of
+	// the existing counters shows them together at the moment they decide.
+	static const auto* CVarLogAdmission =
+		IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.Stream.LogAdmission"));
+	if (CVarLogAdmission && CVarLogAdmission->GetInt() != 0)
+	{
+		FString Line;
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			Line += FString::Printf(TEXT("R%d[scan=%d rej=%d q=%d def=%d] "),
+			                        Level, bLevelScannedThisCall[Level] ? 1 : 0,
+			                        LevelCandidatesRejectedThisCall[Level],
+			                        PendingJobKeysByLevel[Level].Num(),
+			                        bAdmissionDeferredWork[Level] ? 1 : 0);
+		}
+		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel admission pass: %s"), *Line);
+	}
 }
 
 // Which of a render chunk's four lateral faces abut a DIFFERENT cascade ring

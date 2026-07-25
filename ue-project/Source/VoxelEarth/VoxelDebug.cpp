@@ -165,6 +165,14 @@ TAutoConsoleVariable<int32> CVarVoxelStreamGpuMaxLevel(
 	TEXT("pooling win scales with chunk count and that is concentrated in the dense near rings."),
 	ECVF_Default);
 
+TAutoConsoleVariable<int32> CVarVoxelStreamLogAdmission(
+	TEXT("voxel.Stream.LogAdmission"),
+	0,
+	TEXT("Log the per-level admission loop state on every RecomputeDesiredSet call: did the ring re-enumerate, ")
+	TEXT("how many candidates it turned away, its pending queue depth, and whether its refill trigger is still ")
+	TEXT("armed. Those four decide whether a ring keeps filling, and no existing counter shows them together."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarVoxelStreamGpuMaxChunks(
 	TEXT("voxel.Stream.GPUMaxChunks"),
 	0,
