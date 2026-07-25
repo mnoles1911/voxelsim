@@ -30,6 +30,11 @@ struct FVertexFactoryInput
 	// No ATTRIBUTE bindings at all -- the vertex declaration is empty (see
 	// FVoxelQuadVertexFactory::InitRHI). SV_VertexID is a system value, not a
 	// stream, so it arrives without any vertex buffer bound.
+	// Zero-stride dummy, never read. It exists only because a draw going
+	// through the mesh-pass system needs a vertex declaration to describe --
+	// see FVoxelQuadVertexFactory::InitRHI.
+	half4 DummyAttribute : ATTRIBUTE0;
+
 	uint VertexId : SV_VertexID;
 
 	VF_INSTANCED_STEREO_DECLARE_INPUT_BLOCK()
@@ -88,6 +93,26 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	const FVoxelQuadVertex Decoded = DecodeVoxelQuadVertex(Packed, CornerIndex, VoxelVF.LevelScale);
 
 	Intermediates.Position = Decoded.PositionUU + VoxelVF.ChunkOriginUU;
+
+// TEMPORARY BISECT (VOXEL_VF_DEBUG_QUAD). Replaces all real geometry with one
+// large flat quad at the primitive origin. If this shows up and the real
+// geometry does not, the draw plumbing is fine and the fault is in the decoded
+// positions; if even this is invisible, the draw itself never rasterises and
+// the empty vertex declaration is the prime suspect. Remove once resolved.
+#if VOXEL_VF_DEBUG_QUAD
+	{
+		const float S = 2000.0f;   // 20 m across, impossible to miss
+		float2 DebugCorners[6] = {
+			float2(0, 0), float2(0, S), float2(S, S),
+			float2(0, 0), float2(S, S), float2(S, 0)
+		};
+		// Only the first quad draws; the rest collapse to a degenerate point so
+		// they cost nothing and cannot obscure the result.
+		Intermediates.Position = (QuadIndex == 0)
+			? float3(DebugCorners[CornerIndex].x, DebugCorners[CornerIndex].y, 0.0f)
+			: float3(0.0f, 0.0f, 0.0f);
+	}
+#endif
 
 	const uint Axis = Packed.x & 0xfu;
 	Intermediates.TangentToLocal = VoxelBuildTangentFrame(Decoded.Normal, Axis);

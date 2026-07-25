@@ -78,7 +78,30 @@ struct FVoxelGpuRegionResult
 
 	TArray<FVoxelGpuColumnSample> Columns;  // DispatchColumns.x * .y
 	TArray<uint32> Cells;                   // one per voxel, material in low byte
-	TArray<uint64> Quads;                   // packed word0 | word1 << 32
+
+	// Packed quads, word0 | word1 << 32.
+	//
+	// IMPORTANT: these coordinates are BRICK-LOCAL. greedyMask packs slice/u0/v0
+	// as positions inside a single 8x8x8 brick; which brick is implied by the
+	// mask index and is deliberately NOT stored in the quad. So a quad here
+	// cannot be positioned in the world on its own -- every brick's geometry
+	// would pile up inside the same 8-voxel cube.
+	//
+	// The CPU mesher adds the brick offset when it converts vxc::Quad to
+	// FVoxelChunkQuad. Anything that draws these must do the equivalent; see
+	// QuadCounts/QuadOffsets below, which is what makes that possible.
+	//
+	// The digest gate is unaffected either way, because it compares brick by
+	// brick in the same order -- which is exactly why this can be got wrong
+	// without the gate noticing.
+	TArray<uint64> Quads;
+
+	// Per-mask quad counts and their exclusive-scanned start offsets, one entry
+	// per face-mask. maskIndex = meshBrickIndex * 48 + axis * 16 + dir * 8 +
+	// slice, so these are what let a caller map a quad back to the brick it
+	// came from and re-base its coordinates.
+	TArray<uint32> QuadCounts;
+	TArray<uint32> QuadOffsets;
 
 	// Quads is sized to the upper bound (32 per mask); this is how many the
 	// scan says are actually live. Only the first NumQuads entries are output.

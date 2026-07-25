@@ -581,3 +581,202 @@ namespace
 		TEXT("vxc_gpu.exe); 0 or 1 = a single region."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&VerifyRegionCommand));
 }
+
+// ---------------------------------------------------------------------------
+// voxel.GPU.SpawnTestChunk — the G2 visual check
+//
+// Everything up to here is verified numerically: the kernels are bit-exact vs
+// the CPU mesher, and the quad decode matches a CPU reference exactly. What no
+// number can answer is whether the DRAW path works -- whether the geometry is
+// lit, shaded, oriented and wound correctly once it reaches the renderer.
+//
+// So this meshes a region on the GPU and hangs the result in the air in front
+// of the player, drawn entirely by FVoxelQuadVertexFactory: no vertex buffer,
+// no index buffer, every corner rebuilt from SV_VertexID.
+//
+// It is deliberately floating and offset rather than sitting in the terrain --
+// against open sky a wrong winding or a flipped normal is obvious, whereas
+// buried in the landscape it would just look like more ground.
+// ---------------------------------------------------------------------------
+
+#include "VoxelGpuChunkComponent.h"
+#include "GameFramework/PlayerController.h"
+#include "GameFramework/Pawn.h"
+#include "Engine/World.h"
+#include "Engine/Engine.h"
+#include "UnrealClient.h"
+#include "TimerManager.h"
+
+namespace
+{
+	void SpawnTestChunkCommand(const TArray<FString>& Args, UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			UE_LOG(LogVoxelGpuVerify, Error, TEXT("No world"));
+			return;
+		}
+		if (!VoxelGpuWorldGen::IsSupportedOnCurrentRHI())
+		{
+			UE_LOG(LogVoxelGpuVerify, Error,
+			       TEXT("Needs SM6. Relaunch with -sm6."));
+			return;
+		}
+
+		// Mesh the origin fixture on the GPU -- the same region the digest gate
+		// uses, so its contents are already known-good.
+		vxc::SyntheticTileSampler Tiles(kSeed);
+		vxc::SyntheticTileSampler CpuTiles(kSeed);
+		vxc::Amplifier CpuAmp(kSeed, CpuTiles);
+
+		TArray<vxc::ColumnSample> CpuColumns;
+		const FVoxelGpuRegionRequest Req = BuildRequest(kRegions[0], CpuAmp, Tiles, CpuColumns);
+		const FVoxelGpuRegionResult Gpu = VoxelGpuWorldGen::RunRegionBlocking(Req);
+
+		if (!Gpu.bOk)
+		{
+			UE_LOG(LogVoxelGpuVerify, Error, TEXT("GPU mesh failed: %s"), *Gpu.Error);
+			return;
+		}
+		if (Gpu.Quads.IsEmpty())
+		{
+			UE_LOG(LogVoxelGpuVerify, Error, TEXT("GPU produced no quads — nothing to draw"));
+			return;
+		}
+
+		// RE-BASE THE QUADS FROM BRICK-LOCAL TO REGION-LOCAL.
+		//
+		// greedyMask packs slice/u0/v0 as coordinates inside one 8x8x8 brick and
+		// leaves the brick's own origin implied by the mask index. Uploading the
+		// raw stream therefore piles all 144 bricks into a single 8-voxel cube --
+		// which is exactly what the first screenshot showed: a 0.8 m speck where
+		// a 6.4 m chunk should have been.
+		//
+		// The CPU mesher does this same re-basing when it converts vxc::Quad to
+		// FVoxelChunkQuad. Doing it here on the CPU is a G2 stopgap: it is fine
+		// for one test chunk, but G3 must do it GPU-side (or have MeshEmit bake
+		// it) rather than round-tripping quads through the CPU, which is the
+		// whole thing ADR-0006 is trying to stop doing.
+		const uint32 BricksX = kRegions[0].Width / 8;
+		const uint32 BricksY = kRegions[0].Height / 8;
+		const uint32 InteriorX = BricksX - 2;
+		const uint32 InteriorY = BricksY - 2;
+
+		TArray<uint64> Rebased;
+		Rebased.Reserve(Gpu.Quads.Num());
+
+		for (int32 MaskIndex = 0; MaskIndex < Gpu.QuadCounts.Num(); ++MaskIndex)
+		{
+			const uint32 Count = Gpu.QuadCounts[MaskIndex];
+			if (Count == 0)
+			{
+				continue;
+			}
+			const uint32 Start = Gpu.QuadOffsets[MaskIndex];
+
+			// maskIndex = meshBrickIndex * 48 + axis * 16 + dir * 8 + slice
+			const uint32 MeshBrickIndex = uint32(MaskIndex) / 48u;
+			const uint32 Ix = MeshBrickIndex % InteriorX;
+			const uint32 Iy = (MeshBrickIndex / InteriorX) % InteriorY;
+			const uint32 Iz = MeshBrickIndex / (InteriorX * InteriorY);
+
+			// Interior brick (ix,iy,iz) is region brick (ix+1, iy+1, iz+1) --
+			// the +1 skips the halo brick that supplies apron reads.
+			const uint32 BrickOrigin[3] = { (Ix + 1u) * 8u, (Iy + 1u) * 8u, (Iz + 1u) * 8u };
+
+			for (uint32 Q = 0; Q < Count; ++Q)
+			{
+				const uint64 Packed = Gpu.Quads[int32(Start + Q)];
+				const uint32 W0 = uint32(Packed & 0xffffffffull);
+				const uint32 W1 = uint32(Packed >> 32);
+
+				const uint32 Axis  =  W0        & 0xfu;
+				const uint32 Dir   = (W0 >>  4) & 0xfu;
+				const uint32 Slice = (W0 >>  8) & 0xffu;
+				const uint32 U0    = (W0 >> 16) & 0xffu;
+				const uint32 V0    = (W0 >> 24) & 0xffu;
+
+				const uint32 U = (Axis + 1u) % 3u;
+				const uint32 V = (Axis + 2u) % 3u;
+
+				// Each coordinate shifts by the brick origin along ITS OWN axis:
+				// slice runs along Axis, u0 along U, v0 along V.
+				const uint32 NewSlice = Slice + BrickOrigin[Axis];
+				const uint32 NewU0    = U0    + BrickOrigin[U];
+				const uint32 NewV0    = V0    + BrickOrigin[V];
+
+				const uint32 NewW0 = Axis | (Dir << 4) | (NewSlice << 8)
+				                   | (NewU0 << 16) | (NewV0 << 24);
+				Rebased.Add(uint64(NewW0) | (uint64(W1) << 32));
+			}
+		}
+
+		// Put it in front of wherever the player is looking, well clear of the
+		// ground so it reads against the sky.
+		// Positioned from the CAMERA, not the pawn.
+		//
+		// The pawn's actor forward is not necessarily where the player is
+		// looking -- on a fly pawn the view can be rotated independently -- so
+		// "pawn location + actor forward" can put the chunk cleanly off-screen,
+		// which is indistinguishable from it failing to render. GetPlayerViewPoint
+		// is what the player actually sees.
+		//
+		// Lifted well above the view direction too, so it reads against open sky
+		// instead of being buried in the hillside the camera is pointed at.
+		FVector SpawnLocation = FVector::ZeroVector;
+		if (APlayerController* PC = World->GetFirstPlayerController())
+		{
+			FVector CamLoc = FVector::ZeroVector;
+			FRotator CamRot = FRotator::ZeroRotator;
+			PC->GetPlayerViewPoint(CamLoc, CamRot);
+			SpawnLocation = CamLoc + CamRot.Vector() * 2000.0 + FVector(0, 0, 800);
+		}
+
+		AActor* Actor = World->SpawnActor<AActor>(AActor::StaticClass(), SpawnLocation, FRotator::ZeroRotator);
+		if (Actor == nullptr)
+		{
+			UE_LOG(LogVoxelGpuVerify, Error, TEXT("Failed to spawn actor"));
+			return;
+		}
+		Actor->SetActorLabel(TEXT("VoxelGpuTestChunk"));
+
+		UVoxelGpuChunkComponent* Comp = NewObject<UVoxelGpuChunkComponent>(Actor);
+		Actor->SetRootComponent(Comp);
+		Comp->SetChunkLevel(0);
+		Comp->SetQuads(Rebased);
+		Comp->RegisterComponent();
+
+		UE_LOG(LogVoxelGpuVerify, Log,
+		       TEXT("Spawned a GPU-drawn chunk at %s: %d quads, %d triangles, drawn with no vertex ")
+		       TEXT("or index buffer. Look ~15 m ahead and slightly up."),
+		       *SpawnLocation.ToString(), Rebased.Num(), Rebased.Num() * 2);
+
+		// Optional self-check: "voxel.GPU.SpawnTestChunk shot" grabs a
+		// screenshot a couple of seconds later.
+		//
+		// The delay is the point. The component only marks its render state
+		// dirty here; the scene proxy is built, its RHI resources created and
+		// the first frame drawn some frames afterwards. Shooting immediately
+		// would reliably capture an empty sky and read as a failure.
+		//
+		// This exists so the visual half of the G2 gate can be inspected from a
+		// headless run instead of costing someone a play session.
+		const bool bWantScreenshot = Args.ContainsByPredicate(
+			[](const FString& A) { return A.Equals(TEXT("shot"), ESearchCase::IgnoreCase); });
+		if (bWantScreenshot)
+		{
+			FTimerHandle Handle;
+			World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([]()
+			{
+				FScreenshotRequest::RequestScreenshot(false);
+				UE_LOG(LogVoxelGpuVerify, Log, TEXT("Screenshot requested (Saved/Screenshots/)"));
+			}), 3.0f, false);
+		}
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GVoxelGpuSpawnTestChunkCmd(
+		TEXT("voxel.GPU.SpawnTestChunk"),
+		TEXT("Mesh a region on the GPU and draw it in front of the player through the GPU vertex "
+		     "factory (no vertex/index buffer). The G2 visual check."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&SpawnTestChunkCommand));
+}

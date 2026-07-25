@@ -4,6 +4,7 @@
 #include "MeshBatch.h"
 #include "MeshDrawShaderBindings.h"
 #include "DataDrivenShaderPlatformInfo.h"
+#include "CommonRenderResources.h"
 
 IMPLEMENT_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadVertexFactoryParameters, "VoxelVF");
 
@@ -36,22 +37,36 @@ void FVoxelQuadVertexFactory::ModifyCompilationEnvironment(
 	FShaderCompilerEnvironment& OutEnvironment)
 {
 	FVertexFactory::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+
+	// Set to 1 to replace all geometry with one 20 m quad -- see the
+	// VOXEL_VF_DEBUG_QUAD block in VoxelQuadVertexFactory.ush. Off by default.
+	OutEnvironment.SetDefine(TEXT("VOXEL_VF_DEBUG_QUAD"), 0);
 }
 
 void FVoxelQuadVertexFactory::InitRHI(FRHICommandListBase& RHICmdList)
 {
-	// EMPTY VERTEX DECLARATION, ON PURPOSE.
+	// ONE ZERO-STRIDE DUMMY STREAM. Nothing reads it.
 	//
-	// This factory binds no vertex streams at all -- SV_VertexID is a system
-	// value, not an attribute, so the vertex shader needs nothing bound to
-	// reconstruct geometry. InitDeclaration forwards an empty element list to
-	// GetOrCreateVertexDeclaration with no minimum-element requirement, which
-	// yields the same kind of object as the engine's own GEmptyVertexDeclaration
-	// (used by Nanite's raster passes for exactly this reason).
+	// An empty vertex declaration was tried first, and it was wrong. It compiles,
+	// the proxy is created, GetDynamicMeshElements is called, the draw is
+	// issued -- and nothing rasterises, silently. Proven by bisect: a hardcoded
+	// 20 m quad that ignored all buffer data was equally invisible, so the fault
+	// was never in the geometry.
 	//
-	// If a platform ever rejects this, the fallback is FLidarPointCloudVertexFactory's
-	// trick: bind one zero-stride dummy stream purely so a declaration exists.
-	InitDeclaration(FVertexDeclarationElementList());
+	// GEmptyVertexDeclaration does work for Nanite's raster passes, but those
+	// bypass the mesh-pass system entirely and set up their own PSO. A draw that
+	// goes through FMeshDrawCommand needs a stream to hang its vertex parameters
+	// on. So do what FLidarPointCloudVertexFactory does: bind one zero-stride
+	// element pointing at the engine's null colour buffer purely to give the
+	// declaration something to describe. Stride 0 means every vertex reads the
+	// same 4 bytes; no per-vertex memory is consumed and the shader ignores it.
+	//
+	// Geometry still comes entirely from SV_VertexID. This is a formality the
+	// draw path demands, not a real vertex stream.
+	FVertexDeclarationElementList Elements;
+	Elements.Add(AccessStreamComponent(
+		FVertexStreamComponent(&GNullColorVertexBuffer, 0, 0, VET_Color), 0));
+	InitDeclaration(Elements);
 
 	if (QuadBufferSRV.IsValid())
 	{

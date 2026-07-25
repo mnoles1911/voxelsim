@@ -570,6 +570,11 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 
 		QuadsOut.SetNum(Result.NumQuads, EAllowShrinking::No);
 		Result.Quads = MoveTemp(QuadsOut);
+
+		// Handed back so callers can map a quad to its brick and re-base the
+		// brick-local coordinates -- see the comment on FVoxelGpuRegionResult::Quads.
+		Result.QuadCounts = MoveTemp(CountsOut);
+		Result.QuadOffsets = MoveTemp(OffsetsOut);
 	}
 
 	Result.bOk = true;
