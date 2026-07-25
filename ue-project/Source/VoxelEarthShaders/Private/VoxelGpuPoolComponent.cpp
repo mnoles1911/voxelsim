@@ -30,8 +30,10 @@ public:
 		, ChunkIds(InChunkIds)
 		, Origins(InOrigins)
 		, Climate(InClimate)
-		, NumQuads(InQuads.Num())
+		, NumQuads(Component->GetHighWaterMarkQuads())
+		, BufferQuads(InQuads.Num())
 		, NumChunks(InOrigins.Num())
+		, MaxChunks(FMath::Max(InOrigins.Num() * 4, 1024))
 	{
 		UMaterialInterface* Material = Component->GetChunkMaterialOrDefault();
 		MaterialProxy = Material->GetRenderProxy();
@@ -53,36 +55,40 @@ public:
 
 	void CreateRenderThreadResources(FRHICommandListBase& RHICmdList) override
 	{
-		if (NumQuads == 0 || NumChunks == 0)
+		if (BufferQuads == 0 || NumChunks == 0)
 		{
 			return;
 		}
 
 		QuadBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
 			RHICmdList, TEXT("VoxelGpuPool.Quads"),
-			EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
+			EBufferUsageFlags::Dynamic | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
 			MakeConstArrayView(Quads));
 		QuadBufferSRV = RHICmdList.CreateShaderResourceView(
 			QuadBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(QuadBuffer));
 
 		ChunkIdBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
 			RHICmdList, TEXT("VoxelGpuPool.ChunkIds"),
-			EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
+			EBufferUsageFlags::Dynamic | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
 			MakeConstArrayView(ChunkIds));
 		ChunkIdSRV = RHICmdList.CreateShaderResourceView(
 			ChunkIdBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(ChunkIdBuffer));
 
+		TArray<FVector4f> PaddedOrigins = Origins;
+		PaddedOrigins.SetNumZeroed(MaxChunks);
 		OriginBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
 			RHICmdList, TEXT("VoxelGpuPool.ChunkOrigins"),
-			EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
-			MakeConstArrayView(Origins));
+			EBufferUsageFlags::Dynamic | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
+			MakeConstArrayView(PaddedOrigins));
 		OriginSRV = RHICmdList.CreateShaderResourceView(
 			OriginBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(OriginBuffer));
 
+		TArray<FVector2f> PaddedClimate = Climate;
+		PaddedClimate.SetNumZeroed(MaxChunks);
 		ClimateBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
 			RHICmdList, TEXT("VoxelGpuPool.ChunkClimate"),
-			EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
-			MakeConstArrayView(Climate));
+			EBufferUsageFlags::Dynamic | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
+			MakeConstArrayView(PaddedClimate));
 		ClimateSRV = RHICmdList.CreateShaderResourceView(
 			ClimateBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(ClimateBuffer));
 
@@ -94,10 +100,6 @@ public:
 		       TEXT("VoxelGpuPool: %d chunks, %d quads, %d triangles — ONE primitive, ONE draw"),
 		       NumChunks, NumQuads, NumQuads * 2);
 
-		Quads.Empty();
-		ChunkIds.Empty();
-		Origins.Empty();
-		Climate.Empty();
 	}
 
 	FPrimitiveViewRelevance GetViewRelevance(const FSceneView* View) const override
@@ -154,6 +156,69 @@ public:
 		}
 	}
 
+	// --- incremental update, render thread -------------------------------
+	//
+	// Writes only the quads that changed. The alternative -- rebuilding the
+	// whole buffer -- is 75 MB per change at cascade scale, which is what makes
+	// streaming through a pool viable or not.
+	void UpdateQuadRange_RenderThread(FRHICommandListBase& RHICmdList,
+	                                  const TArray<uint64>& NewQuads,
+	                                  const TArray<uint32>& NewIds,
+	                                  uint32 First, uint32 Count, int32 NewNumQuads)
+	{
+		if (!QuadBuffer.IsValid() || Count == 0)
+		{
+			NumQuads = NewNumQuads;
+			return;
+		}
+
+		const uint32 QuadOffsetBytes = First * sizeof(uint64);
+		const uint32 QuadSizeBytes = Count * sizeof(uint64);
+		if (void* Dst = RHICmdList.LockBuffer(QuadBuffer, QuadOffsetBytes, QuadSizeBytes, RLM_WriteOnly))
+		{
+			FMemory::Memcpy(Dst, NewQuads.GetData() + First, QuadSizeBytes);
+			RHICmdList.UnlockBuffer(QuadBuffer);
+		}
+
+		const uint32 IdOffsetBytes = First * sizeof(uint32);
+		const uint32 IdSizeBytes = Count * sizeof(uint32);
+		if (void* Dst = RHICmdList.LockBuffer(ChunkIdBuffer, IdOffsetBytes, IdSizeBytes, RLM_WriteOnly))
+		{
+			FMemory::Memcpy(Dst, NewIds.GetData() + First, IdSizeBytes);
+			RHICmdList.UnlockBuffer(ChunkIdBuffer);
+		}
+
+		NumQuads = NewNumQuads;
+	}
+
+	// The chunk table is tiny (one float4 + one float2 per chunk), so it is
+	// rewritten wholesale rather than tracked range by range.
+	void UpdateChunkTable_RenderThread(FRHICommandListBase& RHICmdList,
+	                                   const TArray<FVector4f>& NewOrigins,
+	                                   const TArray<FVector2f>& NewClimate)
+	{
+		if (!OriginBuffer.IsValid() || NewOrigins.Num() > MaxChunks)
+		{
+			return;   // outgrew the table; the caller rebuilds the render state
+		}
+
+		const uint32 OriginBytes = uint32(NewOrigins.Num()) * sizeof(FVector4f);
+		if (void* Dst = RHICmdList.LockBuffer(OriginBuffer, 0, OriginBytes, RLM_WriteOnly))
+		{
+			FMemory::Memcpy(Dst, NewOrigins.GetData(), OriginBytes);
+			RHICmdList.UnlockBuffer(OriginBuffer);
+		}
+
+		const uint32 ClimateBytes = uint32(NewClimate.Num()) * sizeof(FVector2f);
+		if (void* Dst = RHICmdList.LockBuffer(ClimateBuffer, 0, ClimateBytes, RLM_WriteOnly))
+		{
+			FMemory::Memcpy(Dst, NewClimate.GetData(), ClimateBytes);
+			RHICmdList.UnlockBuffer(ClimateBuffer);
+		}
+	}
+
+	int32 GetMaxChunks() const { return MaxChunks; }
+
 	uint32 GetMemoryFootprint() const override { return sizeof(*this) + GetAllocatedSize(); }
 
 private:
@@ -167,8 +232,12 @@ private:
 	FBufferRHIRef QuadBuffer, ChunkIdBuffer, OriginBuffer, ClimateBuffer;
 	FShaderResourceViewRHIRef QuadBufferSRV, ChunkIdSRV, OriginSRV, ClimateSRV;
 
-	int32 NumQuads = 0;
+	int32 NumQuads = 0;      // drawn
+	int32 BufferQuads = 0;   // allocated
 	int32 NumChunks = 0;
+	// Headroom in the chunk table so ordinary streaming churn never has to
+	// rebuild the render state just to add one more chunk.
+	int32 MaxChunks = 0;
 
 	FMaterialRenderProxy* MaterialProxy = nullptr;
 	FMaterialRelevance MaterialRelevance;
@@ -237,7 +306,9 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 		FVector(OriginUU.X, OriginUU.Y, OriginUU.Z),
 		FVector(OriginUU.X + EdgeUU, OriginUU.Y + EdgeUU, OriginUU.Z + EdgeUU));
 
-	MarkRenderStateDirty();
+	MarkQuadsDirty(Alloc.Offset, Alloc.NumQuads);
+	bChunkTableDirty = true;
+	PushUpdatesToProxy();
 	UpdateBounds();
 	return Handle;
 }
@@ -262,7 +333,8 @@ void UVoxelGpuPoolComponent::RemoveChunk(int32 Handle)
 	Allocations[Handle] = FVoxelGpuPoolAllocation{};
 	--NumLiveChunks;
 
-	MarkRenderStateDirty();
+	MarkQuadsDirty(Alloc.Offset, Alloc.NumQuads);
+	PushUpdatesToProxy();
 }
 
 void UVoxelGpuPoolComponent::ClearChunks()
@@ -273,6 +345,137 @@ void UVoxelGpuPoolComponent::ClearChunks()
 	}
 	MarkRenderStateDirty();
 	UpdateBounds();
+}
+
+
+void UVoxelGpuPoolComponent::MarkQuadsDirty(uint32 First, uint32 Count)
+{
+	if (Count == 0)
+	{
+		return;
+	}
+	const uint32 Last = First + Count - 1;
+	if (!DirtyQuads.bValid)
+	{
+		DirtyQuads = { First, Last, true };
+	}
+	else
+	{
+		DirtyQuads.First = FMath::Min(DirtyQuads.First, First);
+		DirtyQuads.Last = FMath::Max(DirtyQuads.Last, Last);
+	}
+}
+
+void UVoxelGpuPoolComponent::PushUpdatesToProxy()
+{
+	// No live proxy yet: the CPU arrays are the source of truth and the proxy
+	// will pick them up whole when it is created.
+	if (LiveProxy == nullptr)
+	{
+		MarkRenderStateDirty();
+		DirtyQuads = {};
+		bChunkTableDirty = false;
+		return;
+	}
+
+	// The chunk table outgrew its headroom -- rebuild rather than overrun it.
+	if (ChunkOrigins.Num() > LiveProxy->GetMaxChunks())
+	{
+		MarkRenderStateDirty();
+		DirtyQuads = {};
+		bChunkTableDirty = false;
+		return;
+	}
+
+	const uint32 First = DirtyQuads.bValid ? DirtyQuads.First : 0;
+	const uint32 Count = DirtyQuads.bValid ? (DirtyQuads.Last - DirtyQuads.First + 1) : 0;
+	const int32 NewNumQuads = int32(Pool.GetHighWaterMark());
+	const bool bTableDirty = bChunkTableDirty;
+
+	FVoxelGpuPoolSceneProxy* Proxy = LiveProxy;
+	TArray<uint64> QuadsCopy = PooledQuads;
+	TArray<uint32> IdsCopy = QuadChunkIds;
+	TArray<FVector4f> OriginsCopy = ChunkOrigins;
+	TArray<FVector2f> ClimateCopy = ChunkClimate;
+
+	ENQUEUE_RENDER_COMMAND(VoxelGpuPoolIncrementalUpdate)(
+		[Proxy, QuadsCopy = MoveTemp(QuadsCopy), IdsCopy = MoveTemp(IdsCopy),
+		 OriginsCopy = MoveTemp(OriginsCopy), ClimateCopy = MoveTemp(ClimateCopy),
+		 First, Count, NewNumQuads, bTableDirty](FRHICommandListImmediate& RHICmdList)
+	{
+		if (bTableDirty)
+		{
+			Proxy->UpdateChunkTable_RenderThread(RHICmdList, OriginsCopy, ClimateCopy);
+		}
+		Proxy->UpdateQuadRange_RenderThread(RHICmdList, QuadsCopy, IdsCopy,
+		                                    First, Count, NewNumQuads);
+	});
+
+	DirtyQuads = {};
+	bChunkTableDirty = false;
+}
+
+void UVoxelGpuPoolComponent::DestroyRenderState_Concurrent()
+{
+	LiveProxy = nullptr;
+	Super::DestroyRenderState_Concurrent();
+}
+
+int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& InQuads)
+{
+	if (!Allocations.IsValidIndex(Handle) || !Allocations[Handle].IsValid())
+	{
+		return INDEX_NONE;
+	}
+
+	const FVoxelGpuPoolAllocation Existing = Allocations[Handle];
+
+	// Fits the slot it already has: rewrite in place. This is the case that
+	// matters -- an actively dug chunk re-meshes constantly and its quad count
+	// barely moves, so free+realloc would churn the allocator for nothing.
+	if (uint32(InQuads.Num()) <= Existing.NumQuads)
+	{
+		const uint32 ChunkId = QuadChunkIds[int32(Existing.Offset)];
+		for (int32 I = 0; I < InQuads.Num(); ++I)
+		{
+			PooledQuads[int32(Existing.Offset) + I] = InQuads[I];
+			QuadChunkIds[int32(Existing.Offset) + I] = ChunkId;
+		}
+		// Any tail the chunk no longer needs is hidden rather than left drawing
+		// its previous contents.
+		for (uint32 I = uint32(InQuads.Num()); I < Existing.NumQuads; ++I)
+		{
+			QuadChunkIds[int32(Existing.Offset + I)] = kHiddenChunkId;
+		}
+		MarkQuadsDirty(Existing.Offset, Existing.NumQuads);
+		PushUpdatesToProxy();
+		return Handle;
+	}
+
+	// Outgrew its slot. Reallocate, reusing the chunk's existing table entry so
+	// the table does not grow on every edit.
+	const uint32 ChunkId = QuadChunkIds[int32(Existing.Offset)];
+	const FVector4f Origin = ChunkOrigins[int32(ChunkId)];
+	const FVector2f Climate = ChunkClimate[int32(ChunkId)];
+
+	RemoveChunk(Handle);
+
+	const FVoxelGpuPoolAllocation Alloc = Pool.Alloc(uint32(InQuads.Num()));
+	if (!Alloc.IsValid())
+	{
+		return INDEX_NONE;
+	}
+	for (int32 I = 0; I < InQuads.Num(); ++I)
+	{
+		PooledQuads[int32(Alloc.Offset) + I] = InQuads[I];
+		QuadChunkIds[int32(Alloc.Offset) + I] = ChunkId;
+	}
+	Allocations[Handle] = Alloc;
+	++NumLiveChunks;
+
+	MarkQuadsDirty(Alloc.Offset, Alloc.NumQuads);
+	PushUpdatesToProxy();
+	return Handle;
 }
 
 void UVoxelGpuPoolComponent::SetChunkMaterial(UMaterialInterface* InMaterial)
@@ -298,11 +501,15 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 	{
 		return nullptr;
 	}
-	// Only the used prefix is uploaded; the reserved tail has never been written.
-	const int32 Used = int32(Pool.GetHighWaterMark());
-	TArray<uint64> UsedQuads(PooledQuads.GetData(), Used);
-	TArray<uint32> UsedIds(QuadChunkIds.GetData(), Used);
-	return new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, ChunkOrigins, ChunkClimate);
+	// The whole capacity is uploaded, not just the used prefix: incremental
+	// writes address absolute pool offsets, so the buffer has to be that big
+	// from the start. Only [0, HighWaterMark) is ever drawn.
+	TArray<uint64> UsedQuads = PooledQuads;
+	TArray<uint32> UsedIds = QuadChunkIds;
+	FVoxelGpuPoolSceneProxy* Proxy =
+		new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, ChunkOrigins, ChunkClimate);
+	LiveProxy = Proxy;
+	return Proxy;
 }
 
 FBoxSphereBounds UVoxelGpuPoolComponent::CalcBounds(const FTransform& LocalToWorld) const

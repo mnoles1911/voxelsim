@@ -52,6 +52,18 @@ public:
 	// invocations until the range is reused, and produce no pixels.
 	void RemoveChunk(int32 Handle);
 
+	// Re-meshes a resident chunk in place.
+	//
+	// Edits are the reason this exists. Implementing a re-mesh as
+	// RemoveChunk + AddChunk would fragment the pool worst on exactly the
+	// chunks that re-mesh most -- the ones being actively dug. When the new
+	// quad count still fits the existing allocation the range is reused; only
+	// a chunk that outgrew its slot falls back to reallocating.
+	//
+	// Returns the handle (possibly a new one if it had to reallocate), or
+	// INDEX_NONE if there was no room.
+	int32 UpdateChunk(int32 Handle, const TArray<uint64>& InQuads);
+
 	// Drops every chunk.
 	void ClearChunks();
 
@@ -69,6 +81,7 @@ public:
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
 	virtual void GetUsedMaterials(TArray<UMaterialInterface*>& OutMaterials,
 	                              bool bGetDebugMaterials = false) const override;
+	virtual void DestroyRenderState_Concurrent() override;
 	//~ End UPrimitiveComponent
 
 private:
@@ -92,6 +105,21 @@ private:
 	FVoxelGpuGeometryPool Pool;
 	TArray<FVoxelGpuPoolAllocation> Allocations;  // indexed by handle
 	int32 NumLiveChunks = 0;
+
+	// Ranges written since the last upload, in quads. Streaming touches a few
+	// chunks per frame out of thousands, so uploading the whole pool for each
+	// change would be absurd -- at cascade scale that is 75 MB per edit.
+	struct FDirtyRange { uint32 First = 0; uint32 Last = 0; bool bValid = false; };
+	FDirtyRange DirtyQuads;
+	bool bChunkTableDirty = false;
+
+	void MarkQuadsDirty(uint32 First, uint32 Count);
+	void PushUpdatesToProxy();
+
+	// Set while a proxy is live so updates can go straight to it instead of
+	// rebuilding the render state. Render-thread lifetime is owned by the
+	// renderer; this is only ever dereferenced inside a render command.
+	class FVoxelGpuPoolSceneProxy* LiveProxy = nullptr;
 
 	FBox LocalBounds = FBox(ForceInit);
 
