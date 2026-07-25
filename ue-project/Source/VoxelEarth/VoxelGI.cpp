@@ -270,6 +270,7 @@ void UVoxelGISubsystem::ClearAllState()
 		Field->Reset();
 	}
 	PendingVoxelize.Reset();
+	PendingPooledVoxelize.Reset();
 	DirtyQueue.Reset();
 	DirtySet.Reset();
 	RefreshQueue.Reset();
@@ -306,6 +307,36 @@ void UVoxelGISubsystem::NotifyChunkMeshUpdated(UVoxelChunkComponent* Component)
 		PendingVoxelize.RemoveAt(0, 1, EAllowShrinking::No);
 	}
 	PendingVoxelize.Add(Component);
+	bHasState = true;
+}
+
+void UVoxelGISubsystem::NotifyPooledChunkMeshUpdated(const FVector& ChunkOriginUU, int32 ChunkLevel,
+                                                     TArray<FVoxelChunkQuad>&& Quads)
+{
+	// First branch, before anything else and BEFORE the move: with GI off this
+	// is one cvar read per pooled apply and nothing more -- no queue growth, no
+	// quad copy, and the caller's array is left exactly as it was.
+	if (!VoxelGI::IsEnabled())
+	{
+		return;
+	}
+	// Level-0 only, matching NotifyChunkMeshUpdated and the scene proxy's
+	// bGIEnabled = VoxelGI::IsEnabled() && ChunkLevel == 0. Coarse rings have
+	// no field coverage on either renderer.
+	if (ChunkLevel != 0 || Quads.Num() == 0)
+	{
+		return;
+	}
+	if (PendingPooledVoxelize.Num() >= kMaxPendingVoxelize)
+	{
+		// Same overflow policy as the component queue: drop the oldest rather
+		// than grow without bound. Costlier here because the entry owns its
+		// quads, which is exactly why the bound matters.
+		PendingPooledVoxelize.RemoveAt(0, 1, EAllowShrinking::No);
+	}
+	FPendingPooledChunk& Entry = PendingPooledVoxelize.AddDefaulted_GetRef();
+	Entry.OriginUU = ChunkOriginUU;
+	Entry.Quads = MoveTemp(Quads);
 	bHasState = true;
 }
 
@@ -402,6 +433,42 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		const FIntVector BrickCoord = FVoxelLightField::WorldToBrick(OriginUU);
 		Field->VoxelizeChunk(BrickCoord, OriginUU, Comp->GetChunkQuads());
 		BrickComponents.Add(BrickCoord, WeakComp);
+		MarkBrickNeighbourhoodDirty(BrickCoord, EditRadius);
+		bCoarseDirty = true;
+		++Voxelized;
+	}
+
+	// 1b) Pooled chunks, from the SAME budget. Identical admission rules
+	//     (build radius, brick cap) applied to a payload the queue carries
+	//     itself instead of reading back off a component -- see
+	//     NotifyPooledChunkMeshUpdated. Draining both queues against one
+	//     `Voxelized` counter is what keeps voxel.GI.MaxVoxelizePerFrame a
+	//     bound on TOTAL work rather than per-renderer work; with
+	//     voxel.Stream.GPUMaxLevel splitting the rings, both can be non-empty
+	//     in the same frame.
+	while (Voxelized < VoxelizeBudget && PendingPooledVoxelize.Num() > 0)
+	{
+		FPendingPooledChunk Pending = MoveTemp(PendingPooledVoxelize[0]);
+		PendingPooledVoxelize.RemoveAt(0, 1, EAllowShrinking::No);
+
+		if (FVector::Dist(Pending.OriginUU, FieldCentreUU) > BuildRadiusUU)
+		{
+			continue; // outside the GI ring; nothing to build
+		}
+		const FIntVector BrickCoord = FVoxelLightField::WorldToBrick(Pending.OriginUU);
+		if (Field->NumBricks() >= MaxBricks && !Field->HasBrick(BrickCoord))
+		{
+			continue; // at the memory cap and this would be a new brick
+		}
+
+		Field->VoxelizeChunk(BrickCoord, Pending.OriginUU, Pending.Quads);
+		// No BrickComponents entry: a pooled chunk has no component to
+		// re-shade (see the member's comment). Drop any stale entry a
+		// component-path residency of this same brick left behind, so the
+		// re-shade phase cannot write colours from this brick's new
+		// irradiance into a component that no longer owns it -- only reachable
+		// via a mid-session voxel.Stream.GPU flip, but free to get right.
+		BrickComponents.Remove(BrickCoord);
 		MarkBrickNeighbourhoodDirty(BrickCoord, EditRadius);
 		bCoarseDirty = true;
 		++Voxelized;
@@ -524,11 +591,23 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 	//
 	// Skipped duplicates deliberately do NOT consume the frame's budget: the
 	// budget exists to bound work done, and a dedupe hit does none.
+	//
+	// POPS are bounded as well as refreshes, which they were not before the
+	// pooled path existed. A pooled brick has no BrickComponents entry, so
+	// every pop of one misses and `Refreshed` never advances -- unbounded, this
+	// loop would RemoveAt(0) its way through the whole ~2000-entry queue every
+	// frame, an O(n^2) memmove producing no output at all. 8x the refresh
+	// budget leaves the dedupe-skip case (the reason misses deliberately do not
+	// consume the refresh budget) behaving exactly as before on the component
+	// path, where the queue is short and the bound never binds.
 	TSet<UVoxelChunkComponent*> RefreshedThisFrame;
 	int32 Refreshed = 0;
 	int32 DedupeSkips = 0;
-	while (Refreshed < RefreshChunkBudget && RefreshQueue.Num() > 0)
+	int32 Popped = 0;
+	const int32 MaxPops = FMath::Max(8 * RefreshChunkBudget, 32);
+	while (Refreshed < RefreshChunkBudget && Popped < MaxPops && RefreshQueue.Num() > 0)
 	{
+		++Popped;
 		const FIntVector Key = RefreshQueue[0];
 		RefreshQueue.RemoveAt(0, 1, EAllowShrinking::No);
 		RefreshSet.Remove(Key);
@@ -615,10 +694,10 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 	{
 		LastStatSeconds = Now;
 		UE_LOG(LogVoxelGI, Log,
-		       TEXT("GI: bricks=%d (%.1f MB) pendingVox=%d dirty=%d refresh=%d | solved %d bricks/%d cells in %.2fms, ")
+		       TEXT("GI: bricks=%d (%.1f MB) pendingVox=%d(+%d pooled) dirty=%d refresh=%d | solved %d bricks/%d cells in %.2fms, ")
 		       TEXT("reshaded %d chunks (%d dupes skipped), tick %.2fms"),
 		       Field->NumBricks(), double(Field->EstimatedBytes()) / (1024.0 * 1024.0),
-		       PendingVoxelize.Num(), DirtyQueue.Num(), RefreshQueue.Num(),
+		       PendingVoxelize.Num(), PendingPooledVoxelize.Num(), DirtyQueue.Num(), RefreshQueue.Num(),
 		       ToSolve.Num(), CellsSolved, SolveMs, Refreshed, DedupeSkips,
 		       (FPlatformTime::Seconds() - TickStart) * 1000.0);
 	}
