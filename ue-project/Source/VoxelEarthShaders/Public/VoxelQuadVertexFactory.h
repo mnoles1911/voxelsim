@@ -19,8 +19,19 @@
 // The quad pool SRV, handed to the shader in one uniform buffer. A stable
 // FRHIUniformBuffer* stays hashable, which keeps the door open to draw-command
 // caching later; a loose shader parameter rebound every draw would not.
+// NOTE ON NAMING: this struct is registered under the shader-side name
+// "VoxelVF", so in HLSL these members are reached as VoxelVF.QuadBuffer,
+// NOT as loose globals. Declaring a loose `StructuredBuffer<uint2> QuadBuffer;`
+// in the .ush instead would compile perfectly and then read zeros forever,
+// because it would be a different, unbound symbol. Black terrain, no error.
 BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadVertexFactoryParameters, )
-	SHADER_PARAMETER_SRV(StructuredBuffer<uint2>, VoxelVF_QuadBuffer)
+	SHADER_PARAMETER_SRV(StructuredBuffer<uint2>, QuadBuffer)
+	// Chunk-space -> primitive-space offset for the quad range being drawn,
+	// and the mip level scale (1 << chunkLevel). One draw covers one chunk in
+	// G2; G3 replaces these with a per-chunk metadata buffer indexed in the
+	// shader, so that one draw can cover the whole pool.
+	SHADER_PARAMETER(FVector3f, ChunkOriginUU)
+	SHADER_PARAMETER(float, LevelScale)
 END_GLOBAL_SHADER_PARAMETER_STRUCT()
 
 class VOXELEARTHSHADERS_API FVoxelQuadVertexFactory : public FVertexFactory
@@ -38,13 +49,21 @@ public:
 	virtual void InitRHI(FRHICommandListBase& RHICmdList) override;
 	virtual void ReleaseRHI() override;
 
-	// The pool this factory reads. Must be set before InitRHI; changing it
-	// afterwards needs a re-init so the uniform buffer picks up the new SRV.
+	// What this factory draws. All three must be set before InitRHI, because
+	// the uniform buffer is built there; changing any of them afterwards needs
+	// a re-init so the buffer picks up the new values.
 	void SetQuadBufferSRV(FShaderResourceViewRHIRef InSRV) { QuadBufferSRV = MoveTemp(InSRV); }
+	void SetChunkFraming(const FVector3f& InOriginUU, float InLevelScale)
+	{
+		ChunkOriginUU = InOriginUU;
+		LevelScale = InLevelScale;
+	}
 
 	FRHIUniformBuffer* GetUniformBuffer() const { return UniformBuffer.GetReference(); }
 
 private:
 	FShaderResourceViewRHIRef QuadBufferSRV;
+	FVector3f ChunkOriginUU = FVector3f::ZeroVector;
+	float LevelScale = 1.0f;
 	TUniformBufferRef<FVoxelQuadVertexFactoryParameters> UniformBuffer;
 };

@@ -56,7 +56,9 @@ void FVoxelQuadVertexFactory::InitRHI(FRHICommandListBase& RHICmdList)
 	if (QuadBufferSRV.IsValid())
 	{
 		FVoxelQuadVertexFactoryParameters Parameters;
-		Parameters.VoxelVF_QuadBuffer = QuadBufferSRV;
+		Parameters.QuadBuffer = QuadBufferSRV;
+		Parameters.ChunkOriginUU = ChunkOriginUU;
+		Parameters.LevelScale = LevelScale;
 		UniformBuffer = TUniformBufferRef<FVoxelQuadVertexFactoryParameters>::CreateUniformBufferImmediate(
 			Parameters, UniformBuffer_MultiFrame);
 	}

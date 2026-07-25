@@ -18,15 +18,12 @@
 #include "/Engine/Private/VertexFactoryCommon.ush"
 #include "/VoxelEarth/VoxelQuadDecode.ush"
 
-// The quad pool, bound through the factory's uniform buffer.
-// VoxelVF.QuadBuffer[i] is one packed quad.
-StructuredBuffer<uint2> VoxelVF_QuadBuffer;
-
-// Chunk-space -> primitive-space offset for the quad range being drawn, and
-// the mip level scale. One draw covers one chunk in G2; G3 replaces these
-// loose parameters with a per-chunk metadata buffer indexed in the shader.
-float3 VoxelVF_ChunkOriginUU;
-float  VoxelVF_LevelScale;
+// The quad pool and its framing arrive in the VoxelVF uniform buffer, declared
+// by FVoxelQuadVertexFactoryParameters and injected into this shader by the
+// engine. Members are reached THROUGH the struct -- VoxelVF.QuadBuffer -- not
+// as loose globals of that name. Declaring loose globals here instead compiles
+// perfectly and then silently reads zeros, because they are different, unbound
+// symbols. So there is deliberately nothing to declare in this file.
 
 struct FVertexFactoryInput
 {
@@ -87,10 +84,10 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	const uint QuadIndex = Input.VertexId / VOXEL_VERTICES_PER_QUAD;
 	const uint CornerIndex = Input.VertexId % VOXEL_VERTICES_PER_QUAD;
 
-	const uint2 Packed = VoxelVF_QuadBuffer[QuadIndex];
-	const FVoxelQuadVertex Decoded = DecodeVoxelQuadVertex(Packed, CornerIndex, VoxelVF_LevelScale);
+	const uint2 Packed = VoxelVF.QuadBuffer[QuadIndex];
+	const FVoxelQuadVertex Decoded = DecodeVoxelQuadVertex(Packed, CornerIndex, VoxelVF.LevelScale);
 
-	Intermediates.Position = Decoded.PositionUU + VoxelVF_ChunkOriginUU;
+	Intermediates.Position = Decoded.PositionUU + VoxelVF.ChunkOriginUU;
 
 	const uint Axis = Packed.x & 0xfu;
 	Intermediates.TangentToLocal = VoxelBuildTangentFrame(Decoded.Normal, Axis);
