@@ -387,6 +387,113 @@ def check_axis_mapping(url: str, tile_dir: Path) -> None:
     )
 
 
+def set_seed(url: str, seed: int) -> None:
+    """Re-seed the running pipeline in place -- no restart needed.
+
+    WorldPipeline.change_seed() rebuilds the internal tile hierarchy, so every
+    coarse cell must be regenerated afterwards; a re-seed saves reloading the
+    model, not the generation cost.
+    """
+    req = urllib.request.Request(
+        f"{url}/api/seed", data=json.dumps({"seed": int(seed)}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=600) as r:
+            got = json.load(r).get("seed")
+    except Exception as e:
+        sys.exit(f"could not set seed on {url}: {e}")
+    print(f"pipeline re-seeded to {got}")
+
+
+def inland_reach_km(elev: np.ndarray, sea_level: float) -> float:
+    """Farthest any land cell sits from open water, in km.
+
+    THE METRIC THAT PREDICTS WHETHER A SEED CAN HAVE DESERTS. Aridity on Earth
+    is mostly continentality and rain shadow: moisture comes off the ocean and
+    is spent crossing land. A world of islands cannot be dry however hot it is,
+    which is exactly what seed 20260719 turned out to be -- 6.9% of its land is
+    arid, but hot desert covers 9 cells in a million km2, because no land is
+    ever far from the sea.
+
+    Land FRACTION does not tell you this: an archipelago and a continent can
+    have identical land fractions and completely different climates. So this is
+    the number to compare seeds on, alongside the biome census.
+
+    Chamfer distance by iterative dilation -- these grids are ~64x64, so the
+    naive version is instant and worth the clarity.
+    """
+    land = elev > sea_level
+    if not land.any():
+        return 0.0
+    reach = np.zeros(elev.shape, dtype=np.int32)
+    frontier = ~land
+    for step in range(1, max(elev.shape) + 1):
+        grown = frontier.copy()
+        grown[1:, :] |= frontier[:-1, :]
+        grown[:-1, :] |= frontier[1:, :]
+        grown[:, 1:] |= frontier[:, :-1]
+        grown[:, :-1] |= frontier[:, 1:]
+        newly = grown & ~frontier & land
+        if not newly.any():
+            break
+        reach[newly] = step
+        frontier = grown
+    return float(reach.max()) * FINE_PER_COARSE * 30 / 1000
+
+
+def audition(url: str, seeds: list, half: int, k: dict, out: str) -> None:
+    """Render several seeds side by side with the numbers that decide between them."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = len(seeds)
+    cols = 2 if n <= 4 else 3
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(6.2 * cols, 7.0 * rows), dpi=110)
+    axes = np.atleast_1d(axes).ravel()
+    span_km = 2 * half * FINE_PER_COARSE * 30 / 1000
+
+    for ax, seed in zip(axes, seeds):
+        set_seed(url, seed)
+        print(f"  rendering seed {seed} ...")
+        d = fetch(url, -half, half, -half, half)
+        biome = classify(d["elev"], d["temp"], d["precip"], d["tstd"], k)
+        f = 6
+        elev = upsample(d["elev"], f)
+        b_up = np.kron(biome, np.ones((f, f), dtype=np.int8))
+        rgb, _ = compose(elev, b_up, k, style="blend", relief=3.0,
+                         cell_m=FINE_PER_COARSE * 30.0 / f)
+        ax.imshow(rgb, origin="upper", interpolation="bilinear")
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        land = d["elev"] > k["beach_upper_m"]
+        reach = inland_reach_km(d["elev"], k["beach_lower_m"])
+        counts = np.bincount(biome.ravel(), minlength=len(BIOMES)) / biome.size * 100
+        present = [BIOMES[i][0] for i in range(len(BIOMES)) if counts[i] >= 1.0]
+        tmed = float(np.median(d["temp"][land])) if land.any() else float("nan")
+        pmed = float(np.median(d["precip"][land])) if land.any() else float("nan")
+        ax.set_title(
+            "seed {}\nland {:.0f}%  |  inland reach {:.0f} km  |  peak {:.0f} m\n"
+            "land median {:.1f} C, {:.0f} mm/yr  |  {} biomes >=1%\n{}".format(
+                seed, land.mean() * 100, reach, d["elev"].max(), tmed, pmed,
+                len(present), ", ".join(x.lower() for x in present)),
+            fontsize=8.5)
+
+    for ax in axes[n:]:
+        ax.axis("off")
+    fig.suptitle(
+        "seed audition -- {:.0f} km window each, same thresholds from biome.h\n"
+        "INLAND REACH is the desert predictor: an archipelago cannot be dry. "
+        "This window caps it at {:.0f} km, so a reading well below that is real terrain, "
+        "not a measurement artifact.".format(span_km, span_km / 2),
+        fontsize=10, y=0.995)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(out, bbox_inches="tight")
+    print("\nwrote " + out)
+
+
 def fetch_detail(url: str, ci: int, cj: int, size: int) -> np.ndarray:
     """Real 30 m elevation for one window, straight off the full pipeline.
 
@@ -470,6 +577,17 @@ def main() -> None:
                     help="contour interval in metres; 0 disables")
     ap.add_argument("--detail", default=None,
                     help="ci,cj[,size]: REAL 30 m data for one window (slow)")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="re-seed the running pipeline before rendering")
+    ap.add_argument("--sea-level", type=float, default=0.0,
+                    help="render as if sea level were at this elevation (metres). "
+                         "A VIEW only: the game's sea level is z=0. Lowering the sea by X "
+                         "is arithmetically raising every elevation by X, so no regeneration "
+                         "is needed.")
+    ap.add_argument("--audition", default=None,
+                    help="comma-separated seeds: contact sheet comparing candidate worlds")
+    ap.add_argument("--audition-half", type=int, default=32,
+                    help="half-width in coarse cells per panel (default 32 = 492 km)")
     args = ap.parse_args()
 
     if args.verify_axes:
@@ -479,6 +597,16 @@ def main() -> None:
         return
 
     k = _read_constants()
+
+    if args.audition:
+        seeds = [int(v) for v in args.audition.split(",")]
+        print(f"auditioning {len(seeds)} seeds. Each needs a fresh coarse generation "
+              "(change_seed rebuilds the tile hierarchy), so allow ~15 s per seed.\n")
+        audition(args.url, seeds, args.audition_half, k, args.out)
+        return
+
+    if args.seed is not None:
+        set_seed(args.url, args.seed)
 
     if args.detail:
         parts = [int(v) for v in args.detail.split(",")]
@@ -510,6 +638,14 @@ def main() -> None:
     print(f"\nfetching coarse window ci=[{ci0},{ci1}) cj=[{cj0},{cj1}) "
           f"= {span_km:.0f} km across (first call is slow; the model caches) ...")
     d = fetch(args.url, ci0, ci1, cj0, cj1)
+
+    if args.sea_level:
+        # Lowering the sea by X == raising the land by X. Doing it this way
+        # keeps z=0 as "the waterline" for every downstream gate, so the biome
+        # coastal band and the colour ramps all stay consistent without any of
+        # them needing to know a sea level was applied.
+        d["elev"] = d["elev"] - args.sea_level
+        print(f"rendering at sea level {args.sea_level:+.0f} m (a VIEW; the game's is z=0)")
 
     biome_coarse = classify(d["elev"], d["temp"], d["precip"], d["tstd"], k)
     f = max(1, args.smooth)
