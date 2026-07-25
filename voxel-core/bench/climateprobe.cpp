@@ -96,20 +96,22 @@ int64_t probeSlopeMmPerPx(int64_t e00, int64_t e10, int64_t e01) {
 // reports a mismatch count. A gate reorder in biome.h that is not mirrored here
 // therefore shows up as a nonzero MISMATCH line rather than as quietly wrong
 // attribution.
-enum Gate { GATE_CLIFF, GATE_OCEAN, GATE_BEACH, GATE_TREELINE, GATE_WHITTAKER, kGateCount };
-const char* kGateName[kGateCount] = {"cliff-slope", "ocean", "beach", "treeline", "whittaker"};
+enum Gate { GATE_OCEAN, GATE_BEACH, GATE_CLIFF, GATE_TREELINE, GATE_WHITTAKER, kGateCount };
+const char* kGateName[kGateCount] = {"ocean", "beach", "cliff-slope", "treeline", "whittaker"};
 
 Gate attributeGate(int32_t tempU8, int32_t surfaceMm, int64_t slopeMmPerPx) {
-    if (slopeMmPerPx > kBiomeCliffSlopeMmPerPx) return GATE_CLIFF;
     if (surfaceMm < kBiomeBeachLowerMm) return GATE_OCEAN;
     if (surfaceMm <= kBiomeBeachUpperMm) return GATE_BEACH;
+    if (slopeMmPerPx > kBiomeCliffSlopeMmPerPx) return GATE_CLIFF;
     if (surfaceMm > biomeTreelineMm(tempU8)) return GATE_TREELINE;
     return GATE_WHITTAKER;
 }
 
 const char* kBiomeName[kBiomeCount] = {"OCEAN",   "BEACH",   "GRASSLAND", "TEMPERATE_FOREST",
                                        "RAINFOREST", "DESERT", "SAVANNA",  "TAIGA",
-                                       "TUNDRA_ALPINE"};
+                                       "TUNDRA_ALPINE", "BARE_ROCK"};
+static_assert(sizeof(kBiomeName) / sizeof(kBiomeName[0]) == kBiomeCount,
+              "a BiomeId was added without a name here -- the census would print a null");
 
 const char* materialName(MaterialId m) {
     switch (m) {
@@ -335,7 +337,8 @@ int main(int argc, char** argv) {
             // imply the id classifyBiome actually returned for the three gates
             // whose outcome is unambiguous.
             if ((g == GATE_OCEAN && biome != OCEAN) || (g == GATE_BEACH && biome != BEACH) ||
-                (g == GATE_CLIFF && biome != TUNDRA_ALPINE))
+                (g == GATE_CLIFF && biome != BARE_ROCK) ||
+                (g == GATE_TREELINE && biome != TUNDRA_ALPINE))
                 ++gateMismatch;
 
             if (col.surfaceMm < kBiomeBeachLowerMm) {

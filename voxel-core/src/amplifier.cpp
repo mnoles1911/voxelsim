@@ -597,6 +597,50 @@ static_assert(kDeepestCarveBelowSurfaceMm == 91000, "carve envelope moved");
 // two derivations would be wrong -- and this catches it at compile time.
 constexpr int64_t kBedrockDepthMinMm = 180000;
 constexpr int64_t kBedrockDepthJitterMm = 40000;
+
+// --- topsoil (worldgen v8) -------------------------------------------------
+//
+// The v6 formula was `clamp(300 + precipU8 * 8 - slopeMmPerPx / 4, 0, 2500)`
+// and it had two independent faults, the second much worse than the first.
+//
+//   1. `precipU8 * 8` read the raw wire byte with no scale, so it meant
+//      something different on synthetic tiles (byte centred on 128) than on
+//      real ones (physical WorldClim quantization). Fixed by decoding to
+//      mm/yr first, via climate.h.
+//
+//   2. `- slopeMmPerPx / 4` subtracted an ABSOLUTE depth, and at any realistic
+//      30 m-pixel slope it simply swamped the base. This was the dominant
+//      fault and it was NOT a real-tile problem -- measured with
+//      vxc_climateprobe, topsoil came out ZERO on 85.5% of synthetic land and
+//      91.3% of real land. The formula was broken on the very encoding it was
+//      written for; the encoding mismatch only made it worse. Because
+//      stratigraphyAt returns col.surfaceMat only while depth < topsoilMm,
+//      zero topsoil means the biome material is never visible: the in-engine
+//      -VoxelMatHistogram measured ROCK 15% / SUBSOIL 85% and not one surface
+//      material across 2M quads.
+//
+// So erosion is now a FRACTION RETAINED, not a depth removed. It is
+// dimensionless, so it cannot be swamped by a units mismatch again, and it
+// scales the way soil loss actually does -- with how much is there.
+//
+// The retention floor is tied to kBiomeCliffSlopeMmPerPx so soil reaches its
+// thinnest exactly where the cliff gate takes over and paints BARE_ROCK. One
+// constant, two consumers: the "bare soil-less ground that is not classified
+// as a cliff" state is unrepresentable by construction.
+constexpr int64_t kTopsoilBaseMm = 200;
+constexpr int64_t kTopsoilMmPerMetreOfRain = 200; // +200 mm of soil per m/yr of rain
+constexpr int64_t kTopsoilSlopeRetentionMinQ10 = 128; // 12.5% retained at the cliff angle
+// The FLOOR IS LOAD-BEARING, and it is applied after the jitter. The topmost
+// voxel's depth below the surface is in [0, kVoxelSizeMm) by construction, so
+// topsoilMm >= kVoxelSizeMm guarantees at least one visible biome-coloured
+// voxel on every column, everywhere. Clamping before the jitter (the v6 order)
+// would let a -25% draw take 100 mm to 75 mm and break that guarantee silently
+// on the flattest ground, which is exactly where it is most visible.
+constexpr int64_t kTopsoilMinMm = kVoxelSizeMm;
+constexpr int64_t kTopsoilMaxMm = 2500;
+static_assert(kTopsoilMinMm >= kVoxelSizeMm,
+              "topsoil must be at least one voxel deep or the biome surface material can "
+              "never appear in the world");
 static_assert(kDeepestCarveBelowSurfaceMm < kBedrockDepthMinMm - kCaveBedrockMarginMm,
               "the geometric carve envelope must stay inside the bedrock clamp; if it does "
               "not, either (8)/(9) or the bedrock depth range is wrong.");
@@ -948,15 +992,25 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     ColumnSample col;
     col.surfaceMm = s.surfaceMm;
 
-    // Topsoil deepens with precipitation, thins with slope; +/-25% hash jitter
-    // breaks up contour-following layer boundaries.
-    int64_t topsoil =
-        clampi64(300 + static_cast<int64_t>(cl.precipitation) * 8 - slopeMmPerPx / 4, 0, 2500);
+    // Topsoil deepens with rainfall and thins with slope; +/-25% hash jitter
+    // breaks up contour-following layer boundaries. See the constant block for
+    // why the slope term is a retained fraction rather than a subtracted depth.
+    const int64_t rainMmPerYr = climatePrecipMmPerYrFromU8(cl.precipitation);
+    const int64_t topsoilBaseMm =
+        kTopsoilBaseMm + rainMmPerYr * kTopsoilMmPerMetreOfRain / 1000;
+    const int64_t retainQ10 =
+        clampi64(1024 - slopeMmPerPx * 1024 / kBiomeCliffSlopeMmPerPx,
+                 kTopsoilSlopeRetentionMinQ10, 1024);
+    int64_t topsoil = topsoilBaseMm * retainQ10 / 1024;
     const int64_t tj = hashToSigned16(hash2(seed_, vx >> 4, vy >> 4, CH_TOPSOIL_JITTER));
     topsoil += topsoil * tj / (4 * 32768);
-    col.topsoilMm = static_cast<int32_t>(topsoil);
+    // Clamp AFTER the jitter -- see kTopsoilMinMm.
+    col.topsoilMm = static_cast<int32_t>(clampi64(topsoil, kTopsoilMinMm, kTopsoilMaxMm));
 
-    col.subsoilMm = clampi32(topsoil * 2 + 500, 0, 6000);
+    // From the CLAMPED topsoil, not the raw one -- otherwise a column whose
+    // topsoil was floored still gets the unfloored value's subsoil, and the
+    // two layers disagree about the same column.
+    col.subsoilMm = clampi32(int64_t(col.topsoilMm) * 2 + 500, 0, 6000);
 
     // Bedrock top: a jittered band CENTRED ON 200 m (Matt's decision; was
     // 40-60 m at kWorldGenVersion 4). Same deterministic shape as before — one
@@ -1049,8 +1103,17 @@ MaterialId Amplifier::stratigraphyAt(const ColumnSample& col, int64_t vz) {
     const int64_t depthMm = static_cast<int64_t>(col.surfaceMm) - centreMm;
     if (depthMm < 0) return MAT_AIR;
     if (depthMm < col.topsoilMm) return col.surfaceMat;
-    if (depthMm < col.topsoilMm + col.subsoilMm)
-        return col.surfaceMat == MAT_SAND ? MAT_GRAVEL : MAT_SUBSOIL;
+    if (depthMm < col.topsoilMm + col.subsoilMm) {
+        // Coarse subsoil under sandy surfaces; and under a BARE_ROCK surface
+        // (worldgen v8) there is no soil profile at all -- it is rock all the
+        // way down. Without this a cliff column read rock, then SUBSOIL, then
+        // rock again: a soil layer sandwiched under a rock skin, which is not
+        // a thing, and which also broke stratigraphy's depth-ordering
+        // invariant (the surface material reappearing below the top layer).
+        if (col.surfaceMat == MAT_SAND) return MAT_GRAVEL;
+        if (col.surfaceMat == MAT_ROCK) return MAT_ROCK;
+        return MAT_SUBSOIL;
+    }
     if (depthMm < col.bedrockDepthMm) return MAT_ROCK;
     return MAT_BEDROCK;
 }
