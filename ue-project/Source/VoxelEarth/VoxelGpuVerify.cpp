@@ -605,6 +605,9 @@ namespace
 #include "Engine/World.h"
 #include "Engine/Engine.h"
 #include "DrawDebugHelpers.h"
+#include "VoxelChunkComponent.h"
+#include "VoxelMeshTypes.h"
+#include "Materials/MaterialInterface.h"
 #include "Engine/StaticMesh.h"
 #include "Components/StaticMeshComponent.h"
 #include "UnrealClient.h"
@@ -797,9 +800,19 @@ namespace
 		}
 		Actor->SetActorLabel(TEXT("VoxelGpuTestChunk"));
 
+		// The real terrain material, so the A/B compares like with like. Without
+		// it the chunk falls back to WorldGridMaterial and every difference is
+		// swamped by "one is grey".
+		UMaterialInterface* TerrainMaterial = Cast<UMaterialInterface>(StaticLoadObject(
+			UMaterialInterface::StaticClass(), nullptr,
+			TEXT("/Game/Voxel/M_VoxelTerrain.M_VoxelTerrain")));
+		UE_LOG(LogVoxelGpuVerify, Log, TEXT("Terrain material: %s"),
+		       TerrainMaterial ? *TerrainMaterial->GetPathName() : TEXT("NOT FOUND (falling back to grey)"));
+
 		UVoxelGpuChunkComponent* Comp = NewObject<UVoxelGpuChunkComponent>(Actor);
 		Actor->SetRootComponent(Comp);
 		Comp->SetChunkLevel(0);
+		Comp->SetChunkMaterial(TerrainMaterial);
 		Comp->SetQuads(Rebased);
 		Comp->RegisterComponent();
 		// See the control above: without this the chunk sits at the world
@@ -808,8 +821,56 @@ namespace
 
 		UE_LOG(LogVoxelGpuVerify, Log,
 		       TEXT("Spawned a GPU-drawn chunk at %s: %d quads, %d triangles, drawn with no vertex ")
-		       TEXT("or index buffer. Look ~15 m ahead and slightly up."),
+		       TEXT("or index buffer."),
 		       *SpawnLocation.ToString(), Rebased.Num(), Rebased.Num() * 2);
+
+		// THE ACTUAL G2 GATE: the same quads, drawn by the shipping CPU path,
+		// placed alongside. Feeding both renderers identical geometry is what
+		// makes the comparison mean something -- any difference is the DRAW
+		// path, since the mesher input is byte-identical by construction.
+		if (Args.ContainsByPredicate(
+			[](const FString& A) { return A.Equals(TEXT("ab"), ESearchCase::IgnoreCase); }))
+		{
+			TArray<FVoxelChunkQuad> CpuQuads;
+			CpuQuads.Reserve(Rebased.Num());
+			for (const uint64 Packed : Rebased)
+			{
+				const uint32 W0 = uint32(Packed & 0xffffffffull);
+				const uint32 W1 = uint32(Packed >> 32);
+				FVoxelChunkQuad Q;
+				Q.Axis     = uint8( W0        & 0xfu);
+				Q.Positive = uint8((W0 >>  4) & 0xfu);
+				Q.Slice    = uint8((W0 >>  8) & 0xffu);
+				Q.U0       = uint8((W0 >> 16) & 0xffu);
+				Q.V0       = uint8((W0 >> 24) & 0xffu);
+				Q.W        = uint8( W1        & 0xffu);
+				Q.H        = uint8((W1 >>  8) & 0xffu);
+				Q.Ao       = uint8((W1 >> 16) & 0xffu);
+				Q.Mat      = uint8((W1 >> 24) & 0xffu);
+				CpuQuads.Add(Q);
+			}
+
+			// Offset sideways so both are in frame at once. 800 UU = 8 m, a bit
+			// wider than the 6.4 m region, so they sit adjacent without overlap.
+			const FVector CpuLocation = SpawnLocation + FVector(0, 800, 0);
+			AActor* CpuActor = World->SpawnActor<AActor>(
+				AActor::StaticClass(), CpuLocation, FRotator::ZeroRotator);
+			UVoxelChunkComponent* CpuComp = NewObject<UVoxelChunkComponent>(CpuActor);
+			CpuActor->SetRootComponent(CpuComp);
+			if (TerrainMaterial)
+			{
+				CpuComp->SetMaterial(0, TerrainMaterial);
+			}
+			// 64, not 32: this is a region, not one chunk.
+			CpuComp->SetChunkQuads(MoveTemp(CpuQuads), 64);
+			CpuComp->RegisterComponent();
+			CpuComp->SetWorldLocation(CpuLocation);
+
+			UE_LOG(LogVoxelGpuVerify, Log,
+			       TEXT("A/B: CPU-meshed chunk from the SAME quads at %s (GPU on the left, "
+			            "CPU 8 m to its right). They should be indistinguishable."),
+			       *CpuLocation.ToString());
+		}
 
 		// Optional self-check: "voxel.GPU.SpawnTestChunk shot" grabs a
 		// screenshot a couple of seconds later.
