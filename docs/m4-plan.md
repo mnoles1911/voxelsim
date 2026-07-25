@@ -130,7 +130,7 @@ this matter more.
 the climate sample, the already-computed `surfaceMm`, and the
 already-computed `slopeMmPerPx` — no new inputs, no `ColumnSample`/
 `GpuColumnSample` layout change (BiomeId is used internally only, per the
-"prefer not adding it to the struct" guidance). `worldgen.hlsl`'s
+"prefer not adding it to the struct" guidance). `worldgen.ush`'s
 `ColumnMain` mirrors `classifyBiome`/`biomeTreelineMm`/
 `biomeSurfaceMaterial` line-for-line in HLSL (same constants, same gate
 order) and calls it in the same place the old inline material logic sat.
@@ -178,7 +178,7 @@ touched this wave (`core.h`, `biome.h`, `amplifier.cpp`, `amplifier.h`,
 `test_amplifier.cpp`, `test_biome.cpp`, `test_mips.cpp`) — pre-existing
 `-Wsign-conversion` warnings elsewhere in `brick.h`/`world.h` (not touched
 this wave, not part of the standard build's flag set either) are
-unrelated and left as-is. `voxel-core/shaders/worldgen.hlsl` compiles
+unrelated and left as-is. `voxel-core/shaders/worldgen.ush` compiles
 clean to both DXIL and SPIR-V for all 7 kernels via `tools/compile-shaders.ps1`.
 float-ban clean (integer types only in the new/changed `voxel-core/src`
 and `voxel-core/include` code).

@@ -557,6 +557,11 @@ public:
 		: FPrimitiveSceneProxy(Component)
 		, VertexFactory(GetScene().GetFeatureLevel(), "FVoxelChunkSceneProxy")
 	{
+		// G1.5 (ADR-0006). Let GPUScene hold this primitive's data persistently
+		// instead of re-uploading it into the per-frame dynamic region every
+		// frame. Paired with bStaticRelevance + DrawStaticElements below; see
+		// GetViewRelevance for the measurement this is testing.
+		EnableGPUSceneSupportFlags();
 		// ONE shared builder produces geometry and colours (see
 		// BuildChunkVertexData above). The GI colour refresh path calls the
 		// same function for colours alone, which is what makes an in-place
@@ -667,11 +672,18 @@ public:
 	// proxy. All of that to alter one byte per vertex. Here the geometry is
 	// untouched and only the colour stream is overwritten.
 	//
-	// Safe without any proxy/scene churn because this primitive is
-	// DYNAMIC-relevance (GetViewRelevance sets bDynamicRelevance, and drawing
-	// goes through GetDynamicMeshElements): there are no cached mesh draw
-	// commands referencing the old buffer contents, and vertex colour is not
-	// part of GPUScene, so nothing outside this buffer needs invalidating.
+	// Safe without any proxy/scene churn. This was originally justified by the
+	// primitive being DYNAMIC-relevance ("no cached mesh draw commands"), which
+	// stopped being true at G1.5 when it went static -- but the conclusion is
+	// unchanged, for a better reason: a cached FMeshDrawCommand captures the
+	// vertex factory's stream BINDINGS, i.e. the FRHIBuffer* and its offset/
+	// stride, never the bytes inside it. Overwriting the buffer's contents in
+	// place leaves every cached binding valid and correct. Vertex colour is also
+	// not part of GPUScene, so nothing outside this buffer needs invalidating
+	// either. What would NOT be safe is reallocating the colour buffer (a new
+	// FRHIBuffer* the cached commands do not point at) -- and this function never
+	// does: it declines on any count/stride mismatch and lets the caller rebuild
+	// the proxy instead.
 	//
 	// Returns false if it declined (count/stride mismatch), which the caller
 	// turns into a proxy rebuild.
@@ -773,12 +785,110 @@ public:
 		}
 	}
 
+	// G1.5 (ADR-0006) A/B switch. OFF by default: static relevance MEASURED
+	// WORSE on this workload -- see the note on DrawStaticElements below.
+	// Command-line rather than a cvar for the same reason -VoxelRingCrossFade is:
+	// relevance is latched when a primitive is added to the scene, so flipping it
+	// mid-session would only affect chunks loaded after the flip and give a
+	// meaningless mixed measurement.
+	static bool StaticRelevanceEnabled()
+	{
+		static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelStaticRelevance"));
+		return bEnabled;
+	}
+
+	// G1.5 (ADR-0006): the STATIC draw path.
+	//
+	// Cached once by the renderer when the primitive is added, instead of
+	// rebuilt every frame. This is the falsification test for ADR-0006's model
+	// of where renderMs goes. The ADR blames per-chunk FScene::AddPrimitive; but
+	// this proxy was DYNAMIC-relevance, which opts every one of ~10,500 resident
+	// chunks out of all of UE's per-primitive amortisation and pays, per chunk,
+	// per view, EVERY FRAME:
+	//   - a fresh FDynamicPrimitiveUniformBuffer (an RHI uniform buffer alloc),
+	//   - a full FMeshDrawCommand rebuild incl. shader bindings, per pass,
+	//   - a GPUScene upload into the dynamic (non-persistent) region,
+	// with no state-bucket merging, since each chunk owns its own
+	// FLocalVertexFactory. Static-relevance primitives pay all of that ONCE, at
+	// add time, batched and ParallelFor'd across pending adds.
+	//
+	// That profile fits the measurements exactly: renderMs dominates the frame
+	// (43.12 of 43.92 ms), is NOT rasterisation-bound (r.ScreenPercentage 50
+	// changed nothing) and NOT shadow-bound, and scales with primitive count.
+	//
+	// RESULT: INCONCLUSIVE -- static relevance changed NOTHING. Two 60 s flights,
+	// same binary, same anchor, the switch below the only variable:
+	//
+	//              p50      p95    hitches   chunks/s
+	//   dynamic   17.19    31.28      90       742
+	//   static    17.39    31.13      79       695
+	//
+	// That is inside run-to-run variance. So the per-frame work static relevance
+	// removes -- the per-chunk FDynamicPrimitiveUniformBuffer, the per-frame
+	// FMeshDrawCommand rebuild, the dynamic GPUScene upload -- is NOT what
+	// renderMs is made of, at least not dominantly. The likely reason is that
+	// static relevance only moves the cost: it amortises across frames but pays
+	// FPrimitiveSceneInfo::CacheMeshDrawCommands at ADD time, and this scene adds
+	// ~700-1000 chunks/second, so there is nothing to amortise over.
+	//
+	// What that rules IN: the cost is the per-chunk primitive CHURN itself, which
+	// neither relevance mode avoids -- one pays per frame, the other per add.
+	// That is exactly what ADR-0006 removes by making a chunk a pool region plus
+	// a draw-arg update instead of a scene primitive. G1.5 was run as a cheap
+	// falsification test for G2 and did not falsify it.
+	//
+	// CAVEAT, do not over-read this: the falsification test was meant to run
+	// against a clean baseline and did not. A separate, unattributed regression
+	// landed between perf_20260724_203516 (p50 14.92, 1 hitch, 968 chunks/s) and
+	// these runs -- candidates are the ring-seam admission fix (+9.2% resident
+	// chunks, commit c02ea9f) and the cold-band throttle (commit 0d46f5b).
+	// Both arms above sit on TOP of that regression, so this comparison is valid
+	// for "static vs dynamic" and invalid for anything absolute. Attribute the
+	// regression before quoting these numbers for anything else.
+	//
+	// Kept behind the switch, not deleted: it is the control for any future claim
+	// about primitive-count cost, and DrawStaticElements is the shape G2's
+	// per-ring persistent primitives will need anyway.
+	//
+	// NOTE no PrimitiveUniformBufferResource is set here -- that is the point.
+	// GPUScene supplies the primitive data, which is what EnableGPUSceneSupportFlags
+	// in the constructor opts into.
+	virtual void DrawStaticElements(FStaticPrimitiveDrawInterface* PDI) override
+	{
+		if (Material == nullptr || IndexBuffer.Indices.Num() < 3 ||
+		    VertexBuffers.PositionVertexBuffer.GetNumVertices() == 0)
+		{
+			return;
+		}
+
+		FMeshBatch Mesh;
+		FMeshBatchElement& BatchElement = Mesh.Elements[0];
+		BatchElement.IndexBuffer = &IndexBuffer;
+		Mesh.VertexFactory = &VertexFactory;
+		Mesh.MaterialRenderProxy = Material->GetRenderProxy();
+		BatchElement.FirstIndex = 0;
+		BatchElement.NumPrimitives = IndexBuffer.Indices.Num() / 3;
+		BatchElement.MinVertexIndex = 0;
+		BatchElement.MaxVertexIndex = VertexBuffers.PositionVertexBuffer.GetNumVertices() - 1;
+		Mesh.ReverseCulling = IsLocalToWorldDeterminantNegative();
+		Mesh.Type = PT_TriangleList;
+		Mesh.DepthPriorityGroup = SDPG_World;
+		Mesh.bCanApplyViewModeOverrides = false;
+		PDI->DrawMesh(Mesh, FLT_MAX);
+	}
+
 	virtual FPrimitiveViewRelevance GetViewRelevance(const FSceneView* View) const override
 	{
+		// Wireframe (and any debug view mode) always needs the dynamic path,
+		// because it swaps in a one-frame material proxy per view.
+		const bool bWireframe = AllowDebugViewmodes() && View->Family->EngineShowFlags.Wireframe;
+		const bool bStatic = StaticRelevanceEnabled() && !bWireframe;
+
 		FPrimitiveViewRelevance Result;
 		Result.bDrawRelevance = IsShown(View);
 		Result.bShadowRelevance = IsShadowCast(View);
-		Result.bDynamicRelevance = true;
+		Result.bStaticRelevance = bStatic;
+		Result.bDynamicRelevance = !bStatic;
 		Result.bRenderInMainPass = ShouldRenderInMainPass();
 		Result.bUsesLightingChannels = GetLightingChannelMask() != GetDefaultLightingChannelMask();
 		Result.bRenderCustomDepth = ShouldRenderCustomDepth();

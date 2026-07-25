@@ -1,5 +1,5 @@
 // M0-gate Vulkan harness (ADR-0001): dispatches the SPIR-V worldgen kernels
-// (voxel-core/shaders/worldgen.hlsl, ColumnMain + VoxelizeMain) on this
+// (voxel-core/shaders/worldgen.ush, ColumnMain + VoxelizeMain) on this
 // machine's GPU and byte-compares every field/cell against the CPU reference
 // (vxc::Amplifier::column / vxc::Amplifier::materialAt). This desktop is the
 // ADR's AMD leg (RX 7800 XT) of the NVIDIA-vs-AMD M0 determinism gate.
@@ -21,7 +21,7 @@
 // VoxelizeMain's InColumns (a pipeline barrier makes the write visible to
 // the second dispatch's reads) — columns are never recomputed on GPU.
 //
-// Resource bindings mirror worldgen.hlsl exactly, but DXC's default SPIR-V
+// Resource bindings mirror worldgen.ush exactly, but DXC's default SPIR-V
 // codegen maps each HLSL register class (b/t/u) independently onto the same
 // flat Vulkan (set, binding) space, so b0/t0/u0 collide at (0,0) unless
 // shifted. tools/compile-shaders.ps1 compiles with -fvk-t-shift 1 0
@@ -87,7 +87,7 @@ namespace {
 // at px and px+1.
 //
 // The uploaded raster window must therefore extend this far past the column
-// range. Undersizing it does NOT fault: worldgen.hlsl's rasterElevationMm
+// range. Undersizing it does NOT fault: worldgen.ush's rasterElevationMm
 // clamps to the window edge as a defensive backstop, so the GPU would read a
 // different elevation than the CPU and the byte-compare would fail with no
 // other symptom. That is exactly the failure mode this constant prevents.
@@ -256,7 +256,7 @@ uint32_t findMemoryType(const VkPhysicalDeviceMemoryProperties& memProps, uint32
     fail("no Vulkan memory type with required properties " + std::to_string(required));
 }
 
-// GPU-side mirror of worldgen.hlsl's GpuColumnSample (5 x 4 bytes, tightly
+// GPU-side mirror of worldgen.ush's GpuColumnSample (5 x 4 bytes, tightly
 // packed — verified against the compiled SPIR-V's member offsets).
 struct GpuColumnSample {
     int32_t surfaceMm;
@@ -267,12 +267,12 @@ struct GpuColumnSample {
 };
 static_assert(sizeof(GpuColumnSample) == 20, "GpuColumnSample must match the HLSL layout");
 
-// GPU-side mirror of worldgen.hlsl's cbuffer WorldGenParams (56 bytes,
+// GPU-side mirror of worldgen.ush's cbuffer WorldGenParams (56 bytes,
 // tightly packed — verified against the compiled SPIR-V's member offsets;
 // nothing here straddles a 16-byte boundary so DXC's HLSL-style cbuffer
 // packing matches plain sequential layout). BrickZMin/BricksZ are read only
 // by VoxelizeMain; ScanCount only by Scan*Main; the rest is shared or
-// ColumnMain-only (see worldgen.hlsl).
+// ColumnMain-only (see worldgen.ush).
 struct WorldGenParamsCB {
     uint32_t DispatchColumnsX, DispatchColumnsY;
     int32_t RasterOriginPxX, RasterOriginPxY;
@@ -288,7 +288,7 @@ struct WorldGenParamsCB {
 };
 static_assert(sizeof(WorldGenParamsCB) == 56, "WorldGenParamsCB must match the HLSL cbuffer layout");
 
-// Host half of the 2026-07 cross-vendor UB hardening pass. worldgen.hlsl now
+// Host half of the 2026-07 cross-vendor UB hardening pass. worldgen.ush now
 // guards these in-shader (it returns without writing rather than executing an
 // OpUDiv-by-zero or an underflowed clamp bound), but a shader that silently
 // declines to produce output is a miserable thing to debug — and the guards
@@ -329,13 +329,13 @@ void validateScanCount(uint32_t scanCount, uint32_t maskCount, const char* where
 }
 
 // Cell index within one 8^3 brick — mirrors vxc::Brick<8>::cellIndex AND
-// worldgen.hlsl's cellIndexInBrick exactly.
+// worldgen.ush's cellIndexInBrick exactly.
 constexpr uint32_t cellIndexInBrick(uint32_t x, uint32_t y, uint32_t z) {
     return x + 8u * (y + 8u * z);
 }
 
 // OutCells (RWStructuredBuffer<uint>, one uint per cell, material id 0-255 in
-// the low byte) layout — mirrors worldgen.hlsl's VoxelizeMain doc comment
+// the low byte) layout — mirrors worldgen.ush's VoxelizeMain doc comment
 // exactly:
 //   bricksX = width / 8, bricksY = height / 8 (dispatch footprint, brick-aligned)
 //   bx = x / 8, by = y / 8, lx = x % 8, ly = y % 8
@@ -557,7 +557,7 @@ GpuContext createContext(const std::string& spvPath, const std::string& voxelize
     vkGetPhysicalDeviceFeatures(ctx.physicalDevice, &features);
     if (!features.shaderInt64) {
         fail("chosen GPU (" + ctx.deviceName +
-             ") does not support shaderInt64 — required by worldgen.hlsl's 64-bit hash "
+             ") does not support shaderInt64 — required by worldgen.ush's 64-bit hash "
              "(ADR-0001)");
     }
 
@@ -1116,14 +1116,14 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
     if (region.width % 8 != 0 || region.height % 8 != 0) {
         fail(std::string("region '") + region.name +
              "' dispatch footprint must be brick-aligned (width/height multiples of 8) "
-             "per worldgen.hlsl's VoxelizeMain contract");
+             "per worldgen.ush's VoxelizeMain contract");
     }
 
     SyntheticTileSampler tiles(seed);
     const int64_t pixelSizeMm = tiles.pixelSizeMm();
 
     // Raster window covering every bilinear tap the dispatch touches
-    // (worldgen.hlsl's documented contract): pixel range from the column mm
+    // (worldgen.ush's documented contract): pixel range from the column mm
     // range, +1 on the high end for the second bilinear tap, and
     // kRasterCavernMarginMm on both ends for VoxelizeMain's site-surface taps.
     const int64_t xMmMin = int64_t(region.originVx) * kVoxelSizeMm - kRasterCavernMarginMm;
@@ -1195,7 +1195,7 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
 
     // Fill the raster window exactly as Amplifier::column would read it
     // through the same SyntheticTileSampler (elevation mm, packed climate
-    // t | s<<8 | p<<16 | v<<24 — matches worldgen.hlsl's cl unpack).
+    // t | s<<8 | p<<16 | v<<24 — matches worldgen.ush's cl unpack).
     int32_t* elev = static_cast<int32_t*>(elevBuf.mapped);
     uint32_t* clim = static_cast<uint32_t*>(climBuf.mapped);
     for (uint32_t ly = 0; ly < rasterH; ++ly) {
@@ -2773,7 +2773,7 @@ int main(int argc, char** argv) {
                 // --- VoxelizeMain cell comparison for this column's brick
                 // stack (mirrors GeneratedWorld<8>::makeBrick's per-cell
                 // Amplifier::materialAt call; the same column c is reused,
-                // never recomputed). Layout matches worldgen.hlsl's
+                // never recomputed). Layout matches worldgen.ush's
                 // VoxelizeMain doc comment / cellIndexInBrick() above.
                 const uint32_t bx = x / 8u, by = y / 8u, lx = x % 8u, ly = y % 8u;
                 const uint32_t footprintIndex = bx + bricksX * by;

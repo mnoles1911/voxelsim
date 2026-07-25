@@ -10,5 +10,6 @@ public class VoxelEarthTarget : TargetRules
 		IncludeOrderVersion = EngineIncludeOrderVersion.Latest;
 
 		ExtraModuleNames.Add("VoxelEarth");
+		ExtraModuleNames.Add("VoxelEarthShaders");
 	}
 }

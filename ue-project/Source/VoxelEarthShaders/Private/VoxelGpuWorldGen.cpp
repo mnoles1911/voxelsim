@@ -1,0 +1,713 @@
+#include "VoxelGpuWorldGen.h"
+
+#include "GlobalShader.h"
+#include "RenderGraphBuilder.h"
+#include "RenderGraphUtils.h"
+#include "ShaderParameterStruct.h"
+#include "RHIGPUReadback.h"
+#include "DataDrivenShaderPlatformInfo.h"
+#include "RenderingThread.h"
+
+DEFINE_LOG_CATEGORY_STATIC(LogVoxelGpu, Log, All);
+
+// The virtual path every kernel is compiled from. VoxelWorldGen.usf is a
+// two-line include shim; the kernels themselves live in /VoxelCore/worldgen.ush.
+//
+// This has to be a macro rather than a `const TCHAR*` because
+// IMPLEMENT_GLOBAL_SHADER stringizes its path argument (it prepends L to make a
+// wide literal), so a variable name would be pasted into `LkShaderPath`.
+#define VOXEL_WORLDGEN_USF "/VoxelEarth/VoxelWorldGen.usf"
+
+// The HLSL struct this mirrors is five 32-bit fields with no padding. If this
+// ever stops being 20 bytes the readback silently misaligns, so assert it here
+// rather than debug it as "the GPU produced garbage".
+static_assert(sizeof(FVoxelGpuColumnSample) == 20, "GpuColumnSample must match worldgen.ush byte for byte");
+
+namespace
+{
+	// The kernels work in 8x8x8 bricks, and the mesher needs a one-brick halo
+	// on every side to read apron/AO neighbours — so a region needs at least
+	// 3 bricks per axis before a single interior brick exists to mesh.
+	constexpr uint32 kBrickEdge = 8;
+	constexpr uint32 kCellsPerBrick = 512;   // 8^3
+	constexpr uint32 kMasksPerBrick = 48;    // 3 axes * 2 dirs * 8 slices
+	constexpr uint32 kMaxQuadsPerMask = 32;  // upper bound, docs/gpu-mesher-design.md
+	constexpr uint32 kScanBlockSize = 256;
+
+	// ScanSumsMain scans the per-block totals in a SINGLE workgroup of 256
+	// threads, so the whole dispatch can carry at most 256 blocks of 256.
+	constexpr uint32 kMaxMasksPerDispatch = kScanBlockSize * kScanBlockSize;
+
+	// Every kernel reads the same loose parameters. worldgen.ush declares them
+	// as plain globals under VXC_UE precisely so they land in $Globals, which
+	// is where these bind by name.
+	#define VOXEL_WORLDGEN_LOOSE_PARAMETERS() \
+		SHADER_PARAMETER(FUintVector2, DispatchColumns) \
+		SHADER_PARAMETER(FIntPoint,    RasterOriginPx) \
+		SHADER_PARAMETER(FUintVector2, RasterSize) \
+		SHADER_PARAMETER(int32,        PixelSizeMm) \
+		SHADER_PARAMETER(uint32,       SeedLo) \
+		SHADER_PARAMETER(uint32,       SeedHi) \
+		SHADER_PARAMETER(int32,        OriginVx) \
+		SHADER_PARAMETER(int32,        OriginVy) \
+		SHADER_PARAMETER(int32,        BrickZMin) \
+		SHADER_PARAMETER(uint32,       BricksZ) \
+		SHADER_PARAMETER(uint32,       ScanCount)
+
+	// Shared compile policy for all seven kernels.
+	//
+	// SM6 IS NOT A PREFERENCE. worldgen.ush does all of its coordinate and
+	// hash math in 64-bit integers, and 64-bit integer shader ops exist only
+	// on the DXC/SM6 path. On SM5 these kernels do not compile at all, which
+	// is why ShouldCompilePermutation refuses rather than emitting something
+	// that would silently differ from the CPU reference.
+	class FVoxelWorldGenShader : public FGlobalShader
+	{
+	public:
+		FVoxelWorldGenShader() = default;
+		FVoxelWorldGenShader(const ShaderMetaType::CompiledShaderInitializerType& Initializer)
+			: FGlobalShader(Initializer) {}
+
+		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+		{
+			return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM6);
+		}
+
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+
+			// Switches worldgen.ush's resource declarations to Unreal's
+			// conventions. Nothing else about the shader changes — see the
+			// long comment at the top of worldgen.ush.
+			OutEnvironment.SetDefine(TEXT("VXC_UE"), 1);
+		}
+	};
+
+	// --- ColumnMain: one thread per column, full stratigraphy ---------------
+	class FVoxelColumnCS : public FVoxelWorldGenShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelColumnCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelColumnCS, FVoxelWorldGenShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, ElevationMm)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ClimatePacked)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<GpuColumnSample>, OutColumns)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- VoxelizeMain: reads those columns back, fills the cell grid --------
+	class FVoxelVoxelizeCS : public FVoxelWorldGenShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelVoxelizeCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelVoxelizeCS, FVoxelWorldGenShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
+			// Bound again because the cavern pass evaluates terrain height at
+			// a cave site's own xy, which is usually not a dispatch column.
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, ElevationMm)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuColumnSample>, InColumns)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutCells)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- MeshCountMain: greedy meshing, counting only ----------------------
+	class FVoxelMeshCountCS : public FVoxelWorldGenShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelMeshCountCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelMeshCountCS, FVoxelWorldGenShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
+			// Read-only here, but worldgen.ush declares OutCells as an
+			// RWStructuredBuffer (one declaration serves every kernel), so it
+			// has to be bound as a UAV.
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutCells)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutQuadCounts)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- The three scan kernels: exclusive prefix sum over the counts ------
+	class FVoxelScanBlocksCS : public FVoxelWorldGenShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelScanBlocksCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelScanBlocksCS, FVoxelWorldGenShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutQuadCounts)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutQuadOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBlockSums)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelScanSumsCS : public FVoxelWorldGenShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelScanSumsCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelScanSumsCS, FVoxelWorldGenShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBlockSums)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelScanAddCS : public FVoxelWorldGenShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelScanAddCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelScanAddCS, FVoxelWorldGenShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutQuadOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBlockSums)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- MeshEmitMain: re-runs greedy meshing, writes at scanned offsets ----
+	class FVoxelMeshEmitCS : public FVoxelWorldGenShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelMeshEmitCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelMeshEmitCS, FVoxelWorldGenShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutCells)
+			// Same buffer the scan wrote, bound read-only. It is an SRV here
+			// and a UAV in the scan passes; that is safe only because they are
+			// different passes — RDG would flag both bindings in one pass.
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InQuadOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, OutQuads)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+}
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelColumnCS,     VOXEL_WORLDGEN_USF, "ColumnMain",     SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelVoxelizeCS,   VOXEL_WORLDGEN_USF, "VoxelizeMain",   SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelMeshCountCS,  VOXEL_WORLDGEN_USF, "MeshCountMain",  SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelScanBlocksCS, VOXEL_WORLDGEN_USF, "ScanBlocksMain", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelScanSumsCS,   VOXEL_WORLDGEN_USF, "ScanSumsMain",   SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelScanAddCS,    VOXEL_WORLDGEN_USF, "ScanAddMain",    SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelMeshEmitCS,   VOXEL_WORLDGEN_USF, "MeshEmitMain",   SF_Compute);
+
+namespace
+{
+	// Fills the loose parameters that every kernel shares. ScanCount varies by
+	// pass, so it is set by the caller afterwards.
+	template <typename TParams>
+	void FillLooseParameters(TParams& Out, const FVoxelGpuRegionRequest& Req)
+	{
+		Out.DispatchColumns = Req.DispatchColumns;
+		Out.RasterOriginPx  = Req.RasterOriginPx;
+		Out.RasterSize      = Req.RasterSize;
+		Out.PixelSizeMm     = Req.PixelSizeMm;
+		Out.SeedLo          = static_cast<uint32>(Req.Seed & 0xffffffffull);
+		Out.SeedHi          = static_cast<uint32>(Req.Seed >> 32);
+		Out.OriginVx        = Req.OriginVx;
+		Out.OriginVy        = Req.OriginVy;
+		Out.BrickZMin       = Req.BrickZMin;
+		Out.BricksZ         = Req.BricksZ;
+		Out.ScanCount       = 0;
+	}
+
+	// Rejects anything the kernels' own guards would otherwise have to absorb.
+	// Every one of these is a caller bug, and catching it here produces a
+	// readable message instead of a wrong-but-plausible quad stream.
+	bool ValidateRequest(const FVoxelGpuRegionRequest& Req, FString& OutError)
+	{
+		const uint32 Cx = Req.DispatchColumns.X;
+		const uint32 Cy = Req.DispatchColumns.Y;
+
+		if (Cx == 0 || Cy == 0 || (Cx % kBrickEdge) != 0 || (Cy % kBrickEdge) != 0)
+		{
+			OutError = FString::Printf(TEXT("DispatchColumns (%u, %u) must be non-zero multiples of %u"),
+			                           Cx, Cy, kBrickEdge);
+			return false;
+		}
+		if (Req.BricksZ == 0)
+		{
+			OutError = TEXT("BricksZ must be non-zero");
+			return false;
+		}
+		if (Req.RasterSize.X == 0 || Req.RasterSize.Y == 0)
+		{
+			OutError = TEXT("RasterSize must be non-zero on both axes");
+			return false;
+		}
+
+		const uint64 Expected = uint64(Req.RasterSize.X) * uint64(Req.RasterSize.Y);
+		if (uint64(Req.ElevationMm.Num()) != Expected || uint64(Req.ClimatePacked.Num()) != Expected)
+		{
+			OutError = FString::Printf(
+				TEXT("Raster arrays do not match RasterSize %ux%u (=%llu): elevation=%d climate=%d"),
+				Req.RasterSize.X, Req.RasterSize.Y, Expected,
+				Req.ElevationMm.Num(), Req.ClimatePacked.Num());
+			return false;
+		}
+
+		if (Req.bMeshChain)
+		{
+			const uint32 BricksX = Cx / kBrickEdge;
+			const uint32 BricksY = Cy / kBrickEdge;
+			if (BricksX < 3 || BricksY < 3 || Req.BricksZ < 3)
+			{
+				OutError = FString::Printf(
+					TEXT("Mesh chain needs >= 3 bricks per axis (have %u, %u, %u) — a thinner region ")
+					TEXT("has no interior brick once the 1-brick halo is removed"),
+					BricksX, BricksY, Req.BricksZ);
+				return false;
+			}
+
+			const uint64 MaskCount = uint64(BricksX - 2) * uint64(BricksY - 2)
+			                       * uint64(Req.BricksZ - 2) * uint64(kMasksPerBrick);
+			if (MaskCount > kMaxMasksPerDispatch)
+			{
+				OutError = FString::Printf(
+					TEXT("Mask count %llu exceeds the %u the single-workgroup ScanSumsMain can scan — ")
+					TEXT("split the region into z-slabs like the bench does"),
+					MaskCount, kMaxMasksPerDispatch);
+				return false;
+			}
+		}
+		return true;
+	}
+}
+
+bool VoxelGpuWorldGen::IsSupportedOnCurrentRHI()
+{
+	return GMaxRHIFeatureLevel >= ERHIFeatureLevel::SM6;
+}
+
+FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionRequest& Request)
+{
+	FVoxelGpuRegionResult Result;
+
+	if (!ValidateRequest(Request, Result.Error))
+	{
+		return Result;
+	}
+	if (!IsSupportedOnCurrentRHI())
+	{
+		Result.Error = TEXT("Requires SM6 (64-bit integer shader ops). Add ")
+		               TEXT("+D3D12TargetedShaderFormats=PCD3D_SM6 and relaunch with -sm6.");
+		return Result;
+	}
+
+	const uint32 Cx = Request.DispatchColumns.X;
+	const uint32 Cy = Request.DispatchColumns.Y;
+	const uint32 BricksX = Cx / kBrickEdge;
+	const uint32 BricksY = Cy / kBrickEdge;
+	const uint32 NumColumns = Cx * Cy;
+	const uint32 NumCells = BricksX * BricksY * Request.BricksZ * kCellsPerBrick;
+
+	const bool bMesh = Request.bMeshChain;
+	const uint32 MaskCount = bMesh
+		? (BricksX - 2) * (BricksY - 2) * (Request.BricksZ - 2) * kMasksPerBrick
+		: 0;
+	const uint32 NumBlocks = bMesh ? FMath::DivideAndRoundUp(MaskCount, kScanBlockSize) : 0;
+	const uint32 MaxQuads = bMesh ? MaskCount * kMaxQuadsPerMask : 0;
+
+	// Filled on the render thread, read back on this one after the flush.
+	TArray<FVoxelGpuColumnSample> ColumnsOut;
+	TArray<uint32> CellsOut;
+	TArray<uint32> CountsOut;
+	TArray<uint32> OffsetsOut;
+	TArray<uint64> QuadsOut;
+	FString RenderError;
+
+	ENQUEUE_RENDER_COMMAND(VoxelGpuRunRegion)(
+		[&Request, &ColumnsOut, &CellsOut, &CountsOut, &OffsetsOut, &QuadsOut, &RenderError,
+		 Cx, Cy, NumColumns, NumCells, bMesh, MaskCount, NumBlocks, MaxQuads]
+		(FRHICommandListImmediate& RHICmdList)
+	{
+		FRDGBuilder GraphBuilder(RHICmdList);
+
+		// --- inputs -----------------------------------------------------
+		FRDGBufferRef ElevationBuffer = CreateStructuredBuffer(
+			GraphBuilder, TEXT("Voxel.ElevationMm"), sizeof(int32),
+			Request.ElevationMm.Num(), Request.ElevationMm.GetData(),
+			Request.ElevationMm.Num() * sizeof(int32));
+
+		FRDGBufferRef ClimateBuffer = CreateStructuredBuffer(
+			GraphBuilder, TEXT("Voxel.ClimatePacked"), sizeof(uint32),
+			Request.ClimatePacked.Num(), Request.ClimatePacked.GetData(),
+			Request.ClimatePacked.Num() * sizeof(uint32));
+
+		// --- outputs ----------------------------------------------------
+		FRDGBufferRef ColumnsBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(FVoxelGpuColumnSample), NumColumns),
+			TEXT("Voxel.Columns"));
+
+		FRDGBufferRef CellsBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), NumCells),
+			TEXT("Voxel.Cells"));
+
+		// --- pass 1: ColumnMain ----------------------------------------
+		{
+			FVoxelColumnCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelColumnCS::FParameters>();
+			FillLooseParameters(*Params, Request);
+			Params->ElevationMm = GraphBuilder.CreateSRV(ElevationBuffer);
+			Params->ClimatePacked = GraphBuilder.CreateSRV(ClimateBuffer);
+			Params->OutColumns = GraphBuilder.CreateUAV(ColumnsBuffer);
+
+			TShaderMapRef<FVoxelColumnCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(
+				GraphBuilder, RDG_EVENT_NAME("Voxel.ColumnMain"), Shader, Params,
+				FIntVector(Cx / kBrickEdge, Cy / kBrickEdge, 1));
+		}
+
+		// --- pass 2: VoxelizeMain --------------------------------------
+		{
+			FVoxelVoxelizeCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelVoxelizeCS::FParameters>();
+			FillLooseParameters(*Params, Request);
+			Params->ElevationMm = GraphBuilder.CreateSRV(ElevationBuffer);
+			Params->InColumns = GraphBuilder.CreateSRV(ColumnsBuffer);
+			Params->OutCells = GraphBuilder.CreateUAV(CellsBuffer);
+
+			TShaderMapRef<FVoxelVoxelizeCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(
+				GraphBuilder, RDG_EVENT_NAME("Voxel.VoxelizeMain"), Shader, Params,
+				FIntVector(Cx / kBrickEdge, Cy / kBrickEdge, 1));
+		}
+
+		FRDGBufferRef CountsBuffer = nullptr;
+		FRDGBufferRef OffsetsBuffer = nullptr;
+		FRDGBufferRef QuadsBuffer = nullptr;
+
+		if (bMesh)
+		{
+			CountsBuffer = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), MaskCount), TEXT("Voxel.QuadCounts"));
+			OffsetsBuffer = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), MaskCount), TEXT("Voxel.QuadOffsets"));
+			FRDGBufferRef BlockSumsBuffer = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), NumBlocks), TEXT("Voxel.BlockSums"));
+			QuadsBuffer = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32) * 2, MaxQuads), TEXT("Voxel.Quads"));
+
+			// --- pass 3: MeshCountMain ---------------------------------
+			{
+				FVoxelMeshCountCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelMeshCountCS::FParameters>();
+				FillLooseParameters(*Params, Request);
+				Params->ScanCount = MaskCount;
+				Params->OutCells = GraphBuilder.CreateUAV(CellsBuffer);
+				Params->OutQuadCounts = GraphBuilder.CreateUAV(CountsBuffer);
+
+				TShaderMapRef<FVoxelMeshCountCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FComputeShaderUtils::AddPass(
+					GraphBuilder, RDG_EVENT_NAME("Voxel.MeshCountMain"), Shader, Params,
+					FIntVector(FMath::DivideAndRoundUp(MaskCount, 64u), 1, 1));
+			}
+
+			// --- pass 4: ScanBlocksMain --------------------------------
+			{
+				FVoxelScanBlocksCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelScanBlocksCS::FParameters>();
+				FillLooseParameters(*Params, Request);
+				Params->ScanCount = MaskCount;
+				Params->OutQuadCounts = GraphBuilder.CreateUAV(CountsBuffer);
+				Params->OutQuadOffsets = GraphBuilder.CreateUAV(OffsetsBuffer);
+				Params->OutBlockSums = GraphBuilder.CreateUAV(BlockSumsBuffer);
+
+				TShaderMapRef<FVoxelScanBlocksCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FComputeShaderUtils::AddPass(
+					GraphBuilder, RDG_EVENT_NAME("Voxel.ScanBlocksMain"), Shader, Params,
+					FIntVector(NumBlocks, 1, 1));
+			}
+
+			// --- pass 5: ScanSumsMain (exactly one group, by design) ----
+			{
+				FVoxelScanSumsCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelScanSumsCS::FParameters>();
+				FillLooseParameters(*Params, Request);
+				Params->ScanCount = MaskCount;
+				Params->OutBlockSums = GraphBuilder.CreateUAV(BlockSumsBuffer);
+
+				TShaderMapRef<FVoxelScanSumsCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FComputeShaderUtils::AddPass(
+					GraphBuilder, RDG_EVENT_NAME("Voxel.ScanSumsMain"), Shader, Params,
+					FIntVector(1, 1, 1));
+			}
+
+			// --- pass 6: ScanAddMain -----------------------------------
+			{
+				FVoxelScanAddCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelScanAddCS::FParameters>();
+				FillLooseParameters(*Params, Request);
+				Params->ScanCount = MaskCount;
+				Params->OutQuadOffsets = GraphBuilder.CreateUAV(OffsetsBuffer);
+				Params->OutBlockSums = GraphBuilder.CreateUAV(BlockSumsBuffer);
+
+				TShaderMapRef<FVoxelScanAddCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FComputeShaderUtils::AddPass(
+					GraphBuilder, RDG_EVENT_NAME("Voxel.ScanAddMain"), Shader, Params,
+					FIntVector(NumBlocks, 1, 1));
+			}
+
+			// --- pass 7: MeshEmitMain ----------------------------------
+			{
+				FVoxelMeshEmitCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelMeshEmitCS::FParameters>();
+				FillLooseParameters(*Params, Request);
+				Params->ScanCount = MaskCount;
+				Params->OutCells = GraphBuilder.CreateUAV(CellsBuffer);
+				Params->InQuadOffsets = GraphBuilder.CreateSRV(OffsetsBuffer);
+				Params->OutQuads = GraphBuilder.CreateUAV(QuadsBuffer);
+
+				TShaderMapRef<FVoxelMeshEmitCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+				FComputeShaderUtils::AddPass(
+					GraphBuilder, RDG_EVENT_NAME("Voxel.MeshEmitMain"), Shader, Params,
+					FIntVector(FMath::DivideAndRoundUp(MaskCount, 64u), 1, 1));
+			}
+		}
+
+		// --- readback ---------------------------------------------------
+		// A verification path, so everything comes back. The streaming path
+		// (G3) will read none of this — the geometry stays on the GPU.
+		FRHIGPUBufferReadback ColumnsReadback(TEXT("Voxel.ColumnsReadback"));
+		FRHIGPUBufferReadback CellsReadback(TEXT("Voxel.CellsReadback"));
+		FRHIGPUBufferReadback CountsReadback(TEXT("Voxel.CountsReadback"));
+		FRHIGPUBufferReadback OffsetsReadback(TEXT("Voxel.OffsetsReadback"));
+		FRHIGPUBufferReadback QuadsReadback(TEXT("Voxel.QuadsReadback"));
+
+		const uint32 ColumnsBytes = NumColumns * sizeof(FVoxelGpuColumnSample);
+		const uint32 CellsBytes = NumCells * sizeof(uint32);
+		const uint32 CountsBytes = MaskCount * sizeof(uint32);
+		const uint32 QuadsBytes = MaxQuads * sizeof(uint64);
+
+		AddEnqueueCopyPass(GraphBuilder, &ColumnsReadback, ColumnsBuffer, ColumnsBytes);
+		AddEnqueueCopyPass(GraphBuilder, &CellsReadback, CellsBuffer, CellsBytes);
+		if (bMesh)
+		{
+			AddEnqueueCopyPass(GraphBuilder, &CountsReadback, CountsBuffer, CountsBytes);
+			AddEnqueueCopyPass(GraphBuilder, &OffsetsReadback, OffsetsBuffer, CountsBytes);
+			AddEnqueueCopyPass(GraphBuilder, &QuadsReadback, QuadsBuffer, QuadsBytes);
+		}
+
+		GraphBuilder.Execute();
+
+		// Blocking is normally the wrong thing to do on the render thread. It
+		// is correct here and only here: this is a console-driven verification
+		// that has to hand a finished answer back to the caller, and the
+		// readback objects above live on this stack frame.
+		RHICmdList.SubmitAndBlockUntilGPUIdle();
+
+		const auto CopyOut = [&RenderError](FRHIGPUBufferReadback& Readback, void* Dest, uint32 Bytes,
+		                                    const TCHAR* Name)
+		{
+			if (Bytes == 0)
+			{
+				return;
+			}
+			if (!Readback.IsReady())
+			{
+				RenderError = FString::Printf(TEXT("%s readback not ready after GPU idle"), Name);
+				return;
+			}
+			const void* Src = Readback.Lock(Bytes);
+			if (Src == nullptr)
+			{
+				RenderError = FString::Printf(TEXT("%s readback lock returned null"), Name);
+				return;
+			}
+			FMemory::Memcpy(Dest, Src, Bytes);
+			Readback.Unlock();
+		};
+
+		ColumnsOut.SetNumUninitialized(NumColumns);
+		CopyOut(ColumnsReadback, ColumnsOut.GetData(), ColumnsBytes, TEXT("Columns"));
+
+		CellsOut.SetNumUninitialized(NumCells);
+		CopyOut(CellsReadback, CellsOut.GetData(), CellsBytes, TEXT("Cells"));
+
+		if (bMesh)
+		{
+			CountsOut.SetNumUninitialized(MaskCount);
+			CopyOut(CountsReadback, CountsOut.GetData(), CountsBytes, TEXT("Counts"));
+
+			OffsetsOut.SetNumUninitialized(MaskCount);
+			CopyOut(OffsetsReadback, OffsetsOut.GetData(), CountsBytes, TEXT("Offsets"));
+
+			QuadsOut.SetNumUninitialized(MaxQuads);
+			CopyOut(QuadsReadback, QuadsOut.GetData(), QuadsBytes, TEXT("Quads"));
+		}
+	});
+
+	FlushRenderingCommands();
+
+	if (!RenderError.IsEmpty())
+	{
+		Result.Error = RenderError;
+		return Result;
+	}
+
+	Result.Columns = MoveTemp(ColumnsOut);
+	Result.Cells = MoveTemp(CellsOut);
+
+	if (bMesh)
+	{
+		// The scan is exclusive, so the live quad count is the last mask's
+		// offset plus its own count — the same derivation the bench uses.
+		Result.NumQuads = (MaskCount > 0)
+			? OffsetsOut[MaskCount - 1] + CountsOut[MaskCount - 1]
+			: 0;
+
+		if (Result.NumQuads > MaxQuads)
+		{
+			Result.Error = FString::Printf(
+				TEXT("Scan reports %u quads but the buffer holds at most %u — the ")
+				TEXT("%u-quads-per-mask bound is wrong or the scan is corrupt"),
+				Result.NumQuads, MaxQuads, kMaxQuadsPerMask);
+			return Result;
+		}
+
+		QuadsOut.SetNum(Result.NumQuads, EAllowShrinking::No);
+		Result.Quads = MoveTemp(QuadsOut);
+
+		// Handed back so callers can map a quad to its brick and re-base the
+		// brick-local coordinates -- see the comment on FVoxelGpuRegionResult::Quads.
+		Result.QuadCounts = MoveTemp(CountsOut);
+		Result.QuadOffsets = MoveTemp(OffsetsOut);
+	}
+
+	Result.bOk = true;
+	return Result;
+}
+
+// ---------------------------------------------------------------------------
+// Packed-quad decode test hook (G2)
+//
+// The vertex factory will call DecodeVoxelQuadVertex during rendering, where a
+// mistake in it shows up only as terrain that looks a bit wrong. This runs the
+// same function over a quad buffer and hands the results back so they can be
+// compared against a CPU reference numerically instead.
+// ---------------------------------------------------------------------------
+
+#define VOXEL_QUAD_DECODE_TEST_USF "/VoxelEarth/VoxelQuadDecodeTest.usf"
+
+namespace
+{
+	class FVoxelQuadDecodeTestCS : public FVoxelWorldGenShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelQuadDecodeTestCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelQuadDecodeTestCS, FVoxelWorldGenShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, NumQuads)
+			SHADER_PARAMETER(float, LevelScale)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InQuads)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, OutVertices)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+}
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelQuadDecodeTestCS, VOXEL_QUAD_DECODE_TEST_USF,
+                        "QuadDecodeTestMain", SF_Compute);
+
+bool VoxelGpuWorldGen::DecodeQuadsBlocking(const TArray<uint64>& Quads,
+                                           float LevelScale,
+                                           TArray<FDecodedVertex>& OutVertices,
+                                           FString& OutError)
+{
+	OutVertices.Reset();
+
+	if (!IsSupportedOnCurrentRHI())
+	{
+		OutError = TEXT("Requires SM6");
+		return false;
+	}
+	if (Quads.IsEmpty())
+	{
+		return true;
+	}
+
+	const uint32 NumQuads = uint32(Quads.Num());
+	const uint32 NumVertices = NumQuads * 6;
+
+	TArray<FVector4f> Raw;
+	FString RenderError;
+
+	ENQUEUE_RENDER_COMMAND(VoxelGpuDecodeQuads)(
+		[&Quads, &Raw, &RenderError, NumQuads, NumVertices, LevelScale]
+		(FRHICommandListImmediate& RHICmdList)
+	{
+		FRDGBuilder GraphBuilder(RHICmdList);
+
+		FRDGBufferRef QuadsBuffer = CreateStructuredBuffer(
+			GraphBuilder, TEXT("Voxel.DecodeIn"), sizeof(uint64), NumQuads,
+			Quads.GetData(), NumQuads * sizeof(uint64));
+
+		FRDGBufferRef VertsBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), NumVertices),
+			TEXT("Voxel.DecodeOut"));
+
+		FVoxelQuadDecodeTestCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelQuadDecodeTestCS::FParameters>();
+		Params->NumQuads = NumQuads;
+		Params->LevelScale = LevelScale;
+		Params->InQuads = GraphBuilder.CreateSRV(QuadsBuffer);
+		Params->OutVertices = GraphBuilder.CreateUAV(VertsBuffer);
+
+		TShaderMapRef<FVoxelQuadDecodeTestCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("Voxel.QuadDecodeTest"), Shader, Params,
+			FIntVector(FMath::DivideAndRoundUp(NumVertices, 64u), 1, 1));
+
+		FRHIGPUBufferReadback Readback(TEXT("Voxel.DecodeReadback"));
+		const uint32 Bytes = NumVertices * sizeof(FVector4f);
+		AddEnqueueCopyPass(GraphBuilder, &Readback, VertsBuffer, Bytes);
+
+		GraphBuilder.Execute();
+		RHICmdList.SubmitAndBlockUntilGPUIdle();
+
+		if (!Readback.IsReady())
+		{
+			RenderError = TEXT("decode readback not ready after GPU idle");
+			return;
+		}
+		const void* Src = Readback.Lock(Bytes);
+		if (Src == nullptr)
+		{
+			RenderError = TEXT("decode readback lock returned null");
+			return;
+		}
+		Raw.SetNumUninitialized(NumVertices);
+		FMemory::Memcpy(Raw.GetData(), Src, Bytes);
+		Readback.Unlock();
+	});
+
+	FlushRenderingCommands();
+
+	if (!RenderError.IsEmpty())
+	{
+		OutError = RenderError;
+		return false;
+	}
+
+	OutVertices.SetNumUninitialized(NumVertices);
+	for (uint32 I = 0; I < NumVertices; ++I)
+	{
+		const FVector4f& R = Raw[int32(I)];
+		FDecodedVertex& V = OutVertices[int32(I)];
+		V.PositionUU[0] = R.X;
+		V.PositionUU[1] = R.Y;
+		V.PositionUU[2] = R.Z;
+
+		// The shader packed ao | mat<<8 through asfloat, so reinterpret rather
+		// than convert -- a float cast here would mangle the bits.
+		uint32 Packed = 0;
+		FMemory::Memcpy(&Packed, &R.W, sizeof(uint32));
+		V.AmbientOcclusion = Packed & 0xffu;
+		V.MaterialId = (Packed >> 8) & 0xffu;
+	}
+
+	return true;
+}

@@ -244,7 +244,7 @@ the common case is zero. §3.7 replaces these estimates with measurements.
 
 - CPU: `Amplifier::column()` computes `CavernColumn` (it owns the tile
   sampler, so `surfaceMmAt(site)` is available). `materialAt` consults it.
-- GPU: mirror `cavernColumnFor` in `worldgen.hlsl`, evaluated in
+- GPU: mirror `cavernColumnFor` in `worldgen.ush`, evaluated in
   **`VoxelizeMain`** exactly like `caveColumnFor` is today (recompute, don't
   widen `GpuColumnSample` — carrying it would add ~80 B/column ≈ 64 MB at
   radius-64 harness scale for data that is pure hash+raster math).
@@ -493,7 +493,7 @@ The moment gameplay touches a lake, static water must become real:
 ## 7. Build plan (subagent-executable subtasks)
 
 Ordering respects the standing constraint that another agent may be working
-in `amplifier.cpp` / `worldgen.hlsl`: all early subtasks live in **new files
+in `amplifier.cpp` / `worldgen.ush`: all early subtasks live in **new files
 or caves.h only**; the two shared-file fold-ins are deliberately last and
 tiny.
 
@@ -520,7 +520,7 @@ tiny.
   those files; land last of the CPU wave.** Owner: amplifier.h/.cpp.
 - **C5 — version + goldens**: `kWorldGenVersion` 4→5 with changelog comment;
   re-pin per §9's predicted table; `vxc_tests` green. After C4.
-- **C6 — GPU mirror in `voxel-core/shaders/worldgen.hlsl` + harness**:
+- **C6 — GPU mirror in `voxel-core/shaders/worldgen.ush` + harness**:
   factor surface-at-xy into a shared function; bind ElevationMm into the
   VoxelizeMain pipeline (+2 px raster margin in `gpu_harness` and the UE
   dispatch path); mirror caverns + crevices bit-exactly; lint

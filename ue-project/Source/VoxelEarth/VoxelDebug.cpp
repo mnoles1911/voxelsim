@@ -107,11 +107,112 @@ TAutoConsoleVariable<float> CVarVoxelStreamLodRetentionMs(
 	5000.0f,
 	TEXT("Load-before-unload SAFETY CAP (2026-07-24 streaming-speed pass). When a VISIBLE chunk is evicted because a ")
 	TEXT("different LOD ring took over its footprint (toward -> finer, away -> coarser), it is kept drawn as a stand-in ")
-	TEXT("until its replacement LOD is actually on screen -- COVERAGE-based release (ColumnGeomCount/ReplacementCovered), ")
+	TEXT("until its replacement LOD is actually on screen -- COVERAGE-based release (ReplacementCovered vs ChunkRecords), ")
 	TEXT("not a fixed timer, so there is no rolling ring of holes where a timer would expire mid-transition. This value ")
 	TEXT("is only the backstop: a footprint that never gets covered (e.g. a coastal quarter that is all ocean) is parked ")
 	TEXT("after this many ms so resident chunks cannot grow unbounded. Cost: brief coarse+fine double-draw at the ")
 	TEXT("boundary until coverage (minor shimmer, no hole). 0 disables retention entirely (immediate unload = holes)."),
+	ECVF_Default);
+
+// Terrain sun-shadow casting (PR #95, "the sun should not light a sealed cave").
+// UVoxelChunkComponent sets CastShadow=true so terrain renders into the
+// directional light's shadow-depth pass; this exists to A/B what that COSTS on
+// the render thread, which is where the 2026-07-24 hitches live (renderMs=43.12
+// of a 43.92 ms frame -- docs/status.md "M1 gate re-run").
+//
+// WHY NOT JUST r.ShadowQuality 0: measured 2026-07-24 and it is INVALID for this
+// question. Turning it off produced 118 post-warmup hitches vs 2, with LOW
+// renderMs -- because this module PSO-precaches the terrain material at BeginPlay
+// (FPSOPrecacheParams), and changing render scalability at startup desyncs that
+// precache from what is actually drawn, so every chunk hits a pipeline-state
+// miss. That measures precache invalidation, not shadow cost. This cvar changes
+// ONE primitive flag and leaves scalability alone.
+//
+// Read per chunk-component load, so an -ExecCmds value applies to the whole run.
+// Flipping it mid-session affects only chunks loaded after the flip (already
+// resident components keep the flag they loaded with) -- fine for a startup A/B,
+// which is what it is for.
+TAutoConsoleVariable<bool> CVarVoxelRenderCastShadow(
+	TEXT("voxel.Render.CastShadow"),
+	true,
+	TEXT("Whether voxel terrain chunks cast sun/dynamic shadows (PR #95). Default true (shipping behaviour). Set 0 to ")
+	TEXT("A/B the render-thread cost of the terrain shadow-depth pass WITHOUT touching render scalability -- see the ")
+	TEXT("source comment for why r.ShadowQuality is not a valid substitute here. Turning this off makes the sun light ")
+	TEXT("sealed caves again, so it is a measurement tool, not a shipping setting."),
+	ECVF_Default);
+
+// ADR-0006 G3: route chunk geometry through the GPU pool instead of one scene
+// component per chunk.
+//
+// Default OFF. This is the flag the whole GPU streaming programme hides behind,
+// and it stays off until G5 flips it, so the shipping renderer is exactly the
+// one that has been flown and measured. On, every resident chunk becomes a
+// range in one persistent GPU buffer drawn by ONE primitive in ONE draw call,
+// and streaming a chunk in or out stops touching FScene entirely -- which is
+// the funnel ADR-0006 measured as the frame-time ceiling.
+//
+// Only the geometry handoff moves. The desired set, admission, dispatch,
+// retention and coverage logic upstream are shared and unaware of this flag,
+// so an A/B here changes how chunks are DRAWN and nothing about which chunks
+// are chosen. Toggling mid-flight is not supported: chunks already resident
+// under the old path keep their old representation until they unload.
+TAutoConsoleVariable<int32> CVarVoxelStreamGpuMaxLevel(
+	TEXT("voxel.Stream.GPUMaxLevel"),
+	-1,
+	TEXT("Pool only ring levels <= this under voxel.Stream.GPU; coarser rings stay on the per-chunk component ")
+	TEXT("path. -1 = all levels. The two renderers coexist per chunk, so this isolates 'the pooled path is wrong' ")
+	TEXT("from 'the pooled path is wrong FOR MIP RINGS' -- and may be a shipping mode in its own right, since the ")
+	TEXT("pooling win scales with chunk count and that is concentrated in the dense near rings."),
+	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarVoxelStreamGpuMaxChunks(
+	TEXT("voxel.Stream.GPUMaxChunks"),
+	0,
+	TEXT("Debug bisection: cap chunks admitted to the ADR-0006 GPU pool. 0 = unlimited. Exists so the streamed ")
+	TEXT("path can be run at the same small scale voxel.GPU.SpawnPool is known-good at, separating 'CPU-meshed ")
+	TEXT("quads through the pool are wrong' from 'the pool does not like a multi-million-quad draw'."),
+	ECVF_Default);
+
+TAutoConsoleVariable<bool> CVarVoxelStreamGpu(
+	TEXT("voxel.Stream.GPU"),
+	false,
+	TEXT("Route chunk geometry through the ADR-0006 GPU pool (ONE primitive, ONE draw) instead of one scene ")
+	TEXT("component per chunk. Default false. Set before the world streams in; toggling mid-flight leaves ")
+	TEXT("already-resident chunks on whichever path loaded them."),
+	ECVF_Default);
+
+// Worker slots in flight, as a multiple of logical cores (docs/m1-plan.md Stage
+// 2 decisions table pinned this at "<=2xLogicalCores", which was a hardcoded
+// 2 * NumberOfCoresIncludingHyperthreads() until 2026-07-24).
+//
+// WHY THIS IS NOW TUNABLE. Measured on the 20 m/s scripted flight: 14,540
+// records ADDED to the desired set per 5 s but only 7,704 jobs DISPATCHED, with
+// 12,306 evicted -- ~6,800 chunks per 5 s entered the desired set and were
+// evicted before a worker ever touched them. That is the rolling-ring hole, and
+// it is neither the apply funnel (budget only ~28% saturated) nor the workers
+// (drained == dispatched, stale = 0).
+//
+// It is dispatch STARVATION, and the arithmetic is stark: DispatchJobs tops the
+// queue up to the cap ONCE PER FRAME, an R0 job has p50 1.32 ms, and a frame is
+// ~15 ms. So each of the 24 slots does roughly ONE job per frame and then idles
+// ~13.7 ms. Measured dispatch was 1,540 jobs/s against a 24-slot x 1.32 ms
+// capacity of ~18,000/s -- about 9% worker utilisation. Raising the multiplier
+// keeps the task graph fed ACROSS frames instead of re-starving every frame.
+//
+// Default 2 deliberately preserves the pre-change behaviour exactly, so this
+// ships inert and the A/B runs on one binary.
+//
+// Costs to watch when raising it: more in-flight jobs means more results landing
+// per frame (bounded by voxel.Stream.MaxAppliesPerFrame / ApplyBudgetMs), more
+// peak memory in flight, and more STALE results (a chunk evicted while its job
+// runs is discarded -- currently 0.0%, watch the "job flow" census).
+TAutoConsoleVariable<int32> CVarVoxelStreamJobsInFlightPerCore(
+	TEXT("voxel.Stream.JobsInFlightPerCore"),
+	2,
+	TEXT("Worker jobs allowed in flight, as a multiple of logical cores (24 at the default 2 on a 12-thread box). ")
+	TEXT("DispatchJobs refills to this cap once per frame, so with short jobs (R0 p50 ~1.3ms) and a ~15ms frame the ")
+	TEXT("slots idle most of the frame -- measured ~9% worker utilisation and ~6,800 chunks per 5s evicted before ")
+	TEXT("ever being dispatched. Raise to keep the task graph fed across frames. Watch stale%% in the job-flow census."),
 	ECVF_Default);
 
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxRemeshesPerFrame(
@@ -409,6 +510,21 @@ float VoxelDebug::GetStreamApplyBudgetMs()
 float VoxelDebug::GetStreamLodRetentionMs()
 {
 	return FMath::Max(0.f, CVarVoxelStreamLodRetentionMs.GetValueOnGameThread());
+}
+
+bool VoxelDebug::GetRenderCastShadow()
+{
+	return CVarVoxelRenderCastShadow.GetValueOnGameThread();
+}
+
+bool VoxelDebug::GetStreamGpu()
+{
+	return CVarVoxelStreamGpu.GetValueOnGameThread();
+}
+
+int32 VoxelDebug::GetStreamJobsInFlightPerCore()
+{
+	return FMath::Clamp(CVarVoxelStreamJobsInFlightPerCore.GetValueOnGameThread(), 1, 64);
 }
 
 int32 VoxelDebug::GetStreamMaxRemeshesPerFrame()

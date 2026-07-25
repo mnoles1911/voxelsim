@@ -167,7 +167,7 @@ VXC_TEST(mesher_ao_darkens_inside_corner) {
 // --- Byte-exact output goldens -------------------------------------------
 // Pinned against the pre-optimisation reference implementation. The mesher is
 // mirrored bit-exactly by the GPU (MeshCountMain/MeshEmitMain in
-// worldgen.hlsl), so ANY movement in these digests is a semantic change that
+// worldgen.ush), so ANY movement in these digests is a semantic change that
 // must be mirrored in the shader — an optimisation must never move them.
 
 template <int E>

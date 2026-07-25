@@ -71,7 +71,7 @@ double SampleHeightUU(double WorldXUU, double WorldYUU, const UVoxelWorldSubsyst
 // Snow band (m2-plan.md "Material" row: "white above snowline (2800m,
 // matching amplifier constants)") -- a linear ramp centred on the
 // amplifier's 2800m snowline (voxel-core/src/amplifier.cpp,
-// voxel-core/shaders/worldgen.hlsl MAT_SNOW threshold) rather than a hard
+// voxel-core/shaders/worldgen.ush MAT_SNOW threshold) rather than a hard
 // cutoff, so the clipmap's coarse (64-512m/vertex) grid doesn't show a
 // jagged single-vertex-row edge at the line.
 // MOVED TO THE MATERIAL. The snow band is now a SnowlineLowMeters/

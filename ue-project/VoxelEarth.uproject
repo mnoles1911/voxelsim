@@ -5,6 +5,11 @@
 	"Description": "Voxel Earth - M1 scaffold consuming voxel-core.",
 	"Modules": [
 		{
+			"Name": "VoxelEarthShaders",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
 			"Name": "VoxelEarth",
 			"Type": "Runtime",
 			"LoadingPhase": "Default"
