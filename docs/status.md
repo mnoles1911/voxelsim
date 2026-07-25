@@ -7,7 +7,7 @@ gate definitions.
 
 | Gate | Status | Notes |
 |---|---|---|
-| Amplify+mesh 128m radius < 1s on RTX 3060 | 🟨 half-open | **AMD leg measured (2026-07-19)**: `vxc_gpu --radius <m>` (voxel-core/bench/gpu_harness.cpp) now runs the FULL GPU pipeline (ColumnMain→VoxelizeMain→MeshCount/EmitMain) over every surface-shell brick in a horizontal radius, tiled into 128×128-column dispatches with a 1-brick shared halo (14×14-brick/112-column interior per tile — partitions the target square with no gaps, no double-meshing). On this desktop's AMD Radeon RX 7800 XT: **radius 64m = 0.678s** (PASS, under target) and **radius 128m = 2.388s** (OVER target) — end-to-end gate time excludes per-tile CPU column setup and CPU-reference comparison, both timed and reported separately. At 128m the host prefix-scan step (CPU reads GPU-mapped mesh-mask counts, writes back scan offsets, between the count and emit dispatches) is the single largest bucket (1.20s of 2.39s) — larger than all four GPU dispatch stages combined (1.07s) — pointing at CPU↔GPU-mapped-memory round-trip cost in the count→scan→emit chain, not raw compute throughput, as the next optimization target (gpu-mesher-design.md's mesher lists moving the scan to GPU as exactly this contingency). **Host scan replaced with a GPU scan (2026-07-20)**: worldgen.hlsl gained `ScanBlocksMain`/`ScanSumsMain`/`ScanAddMain` (fixed-order shared-memory Hillis-Steele, per-256-block scan + single-workgroup block-sum scan + add-back — deterministic by construction, so quad order is byte-for-byte unchanged), and `gpu_harness.cpp`'s `runMeshChain()` now chains MeshCountMain→ScanBlocksMain→ScanSumsMain→ScanAddMain→MeshEmitMain in ONE command buffer (COMPUTE→COMPUTE buffer barriers write→read between every stage, one trailing COMPUTE→HOST barrier, ONE fence per tile/region) instead of the old two-submission count/emit split with a CPU-side scan in between. The emitted quads buffer is upper-bound sized (32 quads/mask max × maskCount, grow-only reused) *before* the chain is recorded, since MeshEmitMain now has no readback point to learn the exact total first; the true total (`counts[maskCount-1] + offsets[maskCount-1]`) is read back after the single fence. Per-stage GPU timing survives the merge to one fence via 6 `vkCmdWriteTimestamp` queries bracketing the 5 dispatches. maskCount is asserted ≤65,536 per dispatch (ScanSumsMain's single-workgroup limit) — never triggered by the 128×128 tile layout in practice. Result: **radius 64m = 0.529s** (PASS, was 0.678s) and **radius 128m = 1.134s** (still OVER target, was 2.388s — a 52.5% reduction). The host scan bucket (was 1.20s at 128m) is now a 6.98ms GPU-scan bucket (blocks 3.66ms + sums 2.22ms + add 1.10ms) — the scan is no longer a bottleneck at any radius tested. The four original GPU dispatch stages (columns+voxelize+meshcount+meshemit) are ~925ms at 128m, about the same as before (1.07s); marshalling overhead rose modestly (118ms→201ms — three descriptor sets now rewritten per tile instead of ≤2, plus the upper-bound quads allocation) — mesh count/emit dispatch cost (283ms+286ms=569ms) and columns/voxelize (224ms+132ms=356ms) are now the dominant buckets and the next optimization target, not the scan. Digests at both radii are byte-identical to the pre-scan run (see the determinism row below), confirming the GPU scan changes nothing about output, only how it's computed. NVIDIA leg still needs to run the same `vxc_gpu --radius 64/128` and compare digests. CPU reference baseline (single-threaded, container hardware) unchanged below. **Tiles batched into flights to close the 128m gate (2026-07-20)**: gate mode now processes tiles in flights of 8 (`kFlightSize`), each flight recording EVERY tile's full chain (ColumnMain→VoxelizeMain→MeshCount→GPU scan→MeshEmit) into ONE command buffer with ONE fence, replacing the old 3-fences/tile scheme (column, voxelize, mesh chain) — cuts Vulkan submission/fence count from ~1,587 (529 tiles × 3) to 67 at 128m. CPU/GPU overlap ("flight k+1's CPU marshalling runs while flight k's fence is still pending, via a deferred `vkWaitForFences` call") needed double-buffered slot banks (`kPipelineDepth=2`, 16 total per-tile buffer/descriptor slots): a bank is only reused once its owning flight's fence has actually been waited on, since reusing the same slots for two flights at once would race the CPU's buffer writes against the GPU still reading them. Persistent per-slot descriptor sets are now only rewritten when a slot's `GrowBuffer` actually reallocates, not every tile. Per-stage timing now comes from `vkCmdWriteTimestamp` queries bracketing all 7 stages per tile (not just the mesh chain), since batched submission means CPU-side submit/wait stopwatching no longer isolates individual stages — see `runGateMode()`'s report for the "hidden by flight double-buffering" figure (814ms at 128m: CPU marshalling of one flight overlapping GPU execution of another). Result on this AMD RX 7800 XT: **radius 64m = 0.112s** (was 0.529s) and **radius 128m = 0.191s** (was 1.134s — **GATE NOW PASSES**, an 83% reduction). Digests unchanged (see the determinism row below), confirming batching changed only execution overlap, never output or its order; `vxc_tests` green (64/64), default column-only regions mode still bit-exact. One correctness bug was found and fixed during this work: `vkGetQueryPoolResults(..., VK_QUERY_RESULT_WAIT_BIT)` was requesting a full bank's worth of timestamp queries even on a partial (last) flight, where only some tiles' queries were ever written by that flight's command buffer — the unwritten queries never become available, so the call hung indefinitely (surfaced as a multi-minute stall on both `--radius 16` and `--radius 128`, both of which have a partial last flight); fixed by requesting only `pf.count * kTimestampsPerTile` queries. NVIDIA leg still needs to run the same `vxc_gpu --radius 64/128` and compare digests. |
+| Amplify+mesh 128m radius < 1s on RTX 3060 | 🟨 half-open | **AMD leg measured (2026-07-19)**: `vxc_gpu --radius <m>` (voxel-core/bench/gpu_harness.cpp) now runs the FULL GPU pipeline (ColumnMain→VoxelizeMain→MeshCount/EmitMain) over every surface-shell brick in a horizontal radius, tiled into 128×128-column dispatches with a 1-brick shared halo (14×14-brick/112-column interior per tile — partitions the target square with no gaps, no double-meshing). On this desktop's AMD Radeon RX 7800 XT: **radius 64m = 0.678s** (PASS, under target) and **radius 128m = 2.388s** (OVER target) — end-to-end gate time excludes per-tile CPU column setup and CPU-reference comparison, both timed and reported separately. At 128m the host prefix-scan step (CPU reads GPU-mapped mesh-mask counts, writes back scan offsets, between the count and emit dispatches) is the single largest bucket (1.20s of 2.39s) — larger than all four GPU dispatch stages combined (1.07s) — pointing at CPU↔GPU-mapped-memory round-trip cost in the count→scan→emit chain, not raw compute throughput, as the next optimization target (gpu-mesher-design.md's mesher lists moving the scan to GPU as exactly this contingency). **Host scan replaced with a GPU scan (2026-07-20)**: worldgen.ush gained `ScanBlocksMain`/`ScanSumsMain`/`ScanAddMain` (fixed-order shared-memory Hillis-Steele, per-256-block scan + single-workgroup block-sum scan + add-back — deterministic by construction, so quad order is byte-for-byte unchanged), and `gpu_harness.cpp`'s `runMeshChain()` now chains MeshCountMain→ScanBlocksMain→ScanSumsMain→ScanAddMain→MeshEmitMain in ONE command buffer (COMPUTE→COMPUTE buffer barriers write→read between every stage, one trailing COMPUTE→HOST barrier, ONE fence per tile/region) instead of the old two-submission count/emit split with a CPU-side scan in between. The emitted quads buffer is upper-bound sized (32 quads/mask max × maskCount, grow-only reused) *before* the chain is recorded, since MeshEmitMain now has no readback point to learn the exact total first; the true total (`counts[maskCount-1] + offsets[maskCount-1]`) is read back after the single fence. Per-stage GPU timing survives the merge to one fence via 6 `vkCmdWriteTimestamp` queries bracketing the 5 dispatches. maskCount is asserted ≤65,536 per dispatch (ScanSumsMain's single-workgroup limit) — never triggered by the 128×128 tile layout in practice. Result: **radius 64m = 0.529s** (PASS, was 0.678s) and **radius 128m = 1.134s** (still OVER target, was 2.388s — a 52.5% reduction). The host scan bucket (was 1.20s at 128m) is now a 6.98ms GPU-scan bucket (blocks 3.66ms + sums 2.22ms + add 1.10ms) — the scan is no longer a bottleneck at any radius tested. The four original GPU dispatch stages (columns+voxelize+meshcount+meshemit) are ~925ms at 128m, about the same as before (1.07s); marshalling overhead rose modestly (118ms→201ms — three descriptor sets now rewritten per tile instead of ≤2, plus the upper-bound quads allocation) — mesh count/emit dispatch cost (283ms+286ms=569ms) and columns/voxelize (224ms+132ms=356ms) are now the dominant buckets and the next optimization target, not the scan. Digests at both radii are byte-identical to the pre-scan run (see the determinism row below), confirming the GPU scan changes nothing about output, only how it's computed. NVIDIA leg still needs to run the same `vxc_gpu --radius 64/128` and compare digests. CPU reference baseline (single-threaded, container hardware) unchanged below. **Tiles batched into flights to close the 128m gate (2026-07-20)**: gate mode now processes tiles in flights of 8 (`kFlightSize`), each flight recording EVERY tile's full chain (ColumnMain→VoxelizeMain→MeshCount→GPU scan→MeshEmit) into ONE command buffer with ONE fence, replacing the old 3-fences/tile scheme (column, voxelize, mesh chain) — cuts Vulkan submission/fence count from ~1,587 (529 tiles × 3) to 67 at 128m. CPU/GPU overlap ("flight k+1's CPU marshalling runs while flight k's fence is still pending, via a deferred `vkWaitForFences` call") needed double-buffered slot banks (`kPipelineDepth=2`, 16 total per-tile buffer/descriptor slots): a bank is only reused once its owning flight's fence has actually been waited on, since reusing the same slots for two flights at once would race the CPU's buffer writes against the GPU still reading them. Persistent per-slot descriptor sets are now only rewritten when a slot's `GrowBuffer` actually reallocates, not every tile. Per-stage timing now comes from `vkCmdWriteTimestamp` queries bracketing all 7 stages per tile (not just the mesh chain), since batched submission means CPU-side submit/wait stopwatching no longer isolates individual stages — see `runGateMode()`'s report for the "hidden by flight double-buffering" figure (814ms at 128m: CPU marshalling of one flight overlapping GPU execution of another). Result on this AMD RX 7800 XT: **radius 64m = 0.112s** (was 0.529s) and **radius 128m = 0.191s** (was 1.134s — **GATE NOW PASSES**, an 83% reduction). Digests unchanged (see the determinism row below), confirming batching changed only execution overlap, never output or its order; `vxc_tests` green (64/64), default column-only regions mode still bit-exact. One correctness bug was found and fixed during this work: `vkGetQueryPoolResults(..., VK_QUERY_RESULT_WAIT_BIT)` was requesting a full bank's worth of timestamp queries even on a partial (last) flight, where only some tiles' queries were ever written by that flight's command buffer — the unwritten queries never become available, so the call hung indefinitely (surfaced as a multi-minute stall on both `--radius 16` and `--radius 128`, both of which have a partial last flight); fixed by requesting only `pf.count * kTimestampsPerTile` queries. NVIDIA leg still needs to run the same `vxc_gpu --radius 64/128` and compare digests. |
 | Bit-identical amplifier output NVIDIA vs AMD | 🟨 half-open | **AMD leg PASSING** (2026-07-19): `vxc_gpu` (voxel-core/bench/gpu_harness.cpp, ADR-0001) dispatches the SPIR-V worldgen kernel (build/shaders/worldgen.ColumnMain.spv) on this desktop's AMD Radeon RX 7800 XT via a headless Vulkan 1.1 harness and byte-compares every field of every column against `vxc::Amplifier::column` — bit-exact over 32,768 columns across two dispatch regions (near-origin and a far/negative-coordinate region), digest `be28ce960bd5bcf6`. **`--radius` gate mode PASSING too** (2026-07-19, seed 20260719): full columns+cells+quads comparison at radius 64m (144/144 tiles, 100% verified: 2,359,296 columns / 87,687,168 cells / 1,129,674 quads, digest `e1db29a9b6874012`) and a deterministic every-8th-tile sample at radius 128m (67/529 tiles, 12.7% verified: 1,097,728 columns / 39,583,744 cells / 497,132 quads, digest `583e91d62cefb8a9`) — zero mismatches in both, and the digest covers ALL GPU output (not just the verified sample) so it's comparable across differently-sampled runs. **Re-verified after the GPU-scan wiring (2026-07-20)**: same seed, same two digests exactly (`e1db29a9b6874012` at radius 64m, `583e91d62cefb8a9` at radius 128m) and the default column-only regions mode also stays bit-exact — confirms the GPU scan is a pure re-implementation of the exclusive-scan step with no observable output change. NVIDIA leg still open: needs a rented/CI Linux+NVIDIA runner producing the same `vxc_gpu` digests (ADR-0001 gate = identical digest on both legs, for both the column-only regions AND the `--radius` gate digests). Interim cross-*compiler* proxy (gcc/clang/MSVC digests) still green as a secondary signal; see `determinism-cross-compiler` in CI. **Re-verified after flight batching (2026-07-20)**: same seed, same two digests exactly (`e1db29a9b6874012` at radius 64m, `583e91d62cefb8a9` at radius 128m) and the default column-only regions mode also stays bit-exact — confirms batching tiles into flights with double-buffered CPU/GPU overlap changes nothing about output, only how and when it's computed. |
 
 ### Early 8³ vs 16³ data (CPU ref, will re-decide after GPU port)
@@ -28,7 +28,7 @@ call needs GPU meshing + render/memory numbers (M1).
 - [x] Edit overlay + append-only log format (versioned, RLE brick diffs) + replay test
 - [x] Edit-log compaction (`voxelcore/editcompact.h`'s `compactLog()`) now has an offline caller: `vxc_editlog` (voxel-core/bench/editlog_tool.cpp) — `stats <file>` (parse + seed/brickEdge/entries/uniqueBricks/serializedBytes/cellsTouched), `compact <in> <out>` (compactLog → serialize → atomic tmp+rename write, before/after report), `verify <original> <compacted>` (replay both against `World<8>`/`SyntheticTileSampler` from the log's own seed, compare `editedDigest()`, PASS/FAIL exit code; brickEdge-16 logs error out cleanly, not yet supported). `vxc_editlog selftest` round-trips a messy in-memory log through the real file I/O end to end and is wired into CTest (`vxc_editlog_selftest`). Previously compaction had test coverage (`test_editcompact.cpp`) but no caller outside tests. **Remaining**: hook into a real server save/load cycle at M3 (persistence is currently informal — this tool operates on standalone log files, not a live server's log)
 - [ ] terrain-diffusion worker running (GPU machine)
-- [x] GPU compute port of amplifier (worldgen.hlsl ColumnMain, Vulkan harness verified bit-exact on AMD leg); mesher GPU port (MeshCount/EmitMain) also landed and verified bit-exact
+- [x] GPU compute port of amplifier (worldgen.ush ColumnMain, Vulkan harness verified bit-exact on AMD leg); mesher GPU port (MeshCount/EmitMain) also landed and verified bit-exact
 - [x] `vxc_gpu --radius <m>` M0 gate driver: tiled full pipeline (columns→voxelize→mesh) over every surface-shell brick in a radius; AMD leg measured, see gate row above
 - [ ] Cross-vendor (NV vs AMD) determinism CI (AMD leg passing locally, both column-only and `--radius` gate digests recorded; NVIDIA leg needs a rented/CI runner)
 
@@ -525,7 +525,7 @@ flora/ecotone blending remain pending design (rounds 2-3).
   `biomeSurfaceMaterial`. Full gate order and threshold rationale in
   m4-plan.md.
 - [x] **Wiring**: `Amplifier::column` (amplifier.cpp) and
-  `worldgen.hlsl`'s `ColumnMain` both call classifyBiome/
+  `worldgen.ush`'s `ColumnMain` both call classifyBiome/
   biomeSurfaceMaterial in place of the old v0 ad-hoc surfaceMat logic;
   `ColumnSample`/`GpuColumnSample` layout unchanged (BiomeId used
   internally only).
@@ -557,7 +557,7 @@ flora/ecotone blending remain pending design (rounds 2-3).
   bit-exact PASS (above). clang `-Wall -Wextra -Wconversion
   -Wsign-conversion` clean on every file touched this wave (pre-existing
   unrelated warnings elsewhere in brick.h/world.h, not touched, left
-  as-is — same precedent as M5's wave). `worldgen.hlsl` compiles clean to
+  as-is — same precedent as M5's wave). `worldgen.ush` compiles clean to
   DXIL + SPIR-V for all 7 kernels. float-ban clean.
 - [ ] Round 2 (trees/structures) and round 3 (flora/placement, ecotone
   blending) — pending design with Matt, m4-plan.md.
@@ -1650,13 +1650,13 @@ other).
 **Shaders compiled + committed**: `voxel-core/shaders/prebuilt/*.spv` (7
 kernels — ColumnMain, VoxelizeMain, MeshCountMain, MeshEmitMain,
 ScanBlocksMain, ScanSumsMain, ScanAddMain), compiled from the current
-`worldgen.hlsl` (commit `8b834107701fd4a2a005b8dbd4a17352f44f26c1`, "M4:
+`worldgen.ush` (commit `8b834107701fd4a2a005b8dbd4a17352f44f26c1`, "M4:
 biome classification core") with the pinned DXC `v1.9.2602.24`
 (`tools/fetch-dxc.ps1`). SHA-256 provenance for every file is in
 `voxel-core/shaders/prebuilt/README.md`. **Important**: these do NOT match
 the older `e1db29a9b6874012`/`583e91d62cefb8a9` digests recorded in the gate
 row above — those predate the M4 biome commit, which legitimately changed
-`worldgen.hlsl`'s output (new materials/biome constants). The gate row's
+`worldgen.ush`'s output (new materials/biome constants). The gate row's
 digests are stale relative to `HEAD` and should get refreshed in a
 follow-up; that refresh is out of scope here. What this pass actually
 re-verified, freshly, on this AMD Radeon RX 7800 XT, using these exact
@@ -1734,7 +1734,7 @@ byte-matches the CPU reference the same way AMD's does. The `#else`/CMake
 Linux paths are correct by construction and documented, not run — no Linux
 machine was available in this pass.
 
-**No float-in-shader risk found**: `worldgen.hlsl` has zero occurrences of
+**No float-in-shader risk found**: `worldgen.ush` has zero occurrences of
 `float`/`half`/`double` (checked directly) — every value is integer/
 fixed-point end to end, matching the float-free contract in
 `docs/determinism.md`. This is the actual reason cross-vendor bit-exactness
@@ -1748,7 +1748,7 @@ floats/doubles, but that never feeds GPU dispatch inputs or outputs).
 ### Cross-vendor UB hardening + CI guard (2026-07-21, worktree agent)
 
 Follow-up to the signed-`%` fix (PR #40, commit `6ab4b2a`) that closed the
-NVIDIA leg of the M0 gate. That bug — `worldgen.hlsl`'s `floorDiv` deriving
+NVIDIA leg of the M0 gate. That bug — `worldgen.ush`'s `floorDiv` deriving
 its flooring correction from `a % b`, which HLSL leaves undefined unless both
 operands share a sign, so `floorDiv` silently truncated on NVIDIA for every
 negative world coordinate — was one instance of a class. This pass fixed the
@@ -1756,7 +1756,7 @@ five remaining members of that class and, more importantly, made the class
 mechanically impossible to reintroduce.
 
 **Five latent issues, all confirmed real by reading the generated code, all
-fixed in `voxel-core/shaders/worldgen.hlsl`.** Each was live UB reachable
+fixed in `voxel-core/shaders/worldgen.ush`.** Each was live UB reachable
 from a cbuffer value, masked only by a host-side contract that nothing in the
 shader enforced:
 
@@ -1813,7 +1813,7 @@ annotation; a bare `allow` with no written reason is itself an error, and an
 annotation that stops matching anything is an error too, so a justification
 cannot rot into cover for new code. There is deliberately no exemption for
 `floorDiv`/`truncDiv` themselves — they are written against magnitude-only
-unsigned division precisely so they pass on their own merits. worldgen.hlsl
+unsigned division precisely so they pass on their own merits. worldgen.ush
 currently carries 16 annotations covering 19 findings, each recording a real
 invariant (e.g. "the `>= 3` early-out above proves every axis has at least 3
 bricks", "the enclosing `gtid.x >= offset` test is precisely the no-underflow
@@ -3965,7 +3965,7 @@ New cvars, all `voxel.GI.*`: `Enabled` (0), `Strength`, `AmbientFloor`,
 
 **Status: landed.** `voxelcore/caves.h` (new, header-only, integer-only) +
 the carve fold-in at `Amplifier::materialAt`, mirrored bit-exactly in
-`worldgen.hlsl`'s `VoxelizeMain`. `kWorldGenVersion` **3 -> 4**.
+`worldgen.ush`'s `VoxelizeMain`. `kWorldGenVersion` **3 -> 4**.
 
 **Formulation — a jittered lattice graph, not 3D noise.** Blobby noise caves
 give disconnected bubbles whose connectivity is an emergent property you can
@@ -4572,7 +4572,7 @@ bench built from the pre-change mesher and the new one were compared over
 clean; `mesher.h` compiles clean under
 `-Wall -Wextra -Wconversion -Wsign-conversion -Werror`.
 
-**Shader semantics did NOT change.** `worldgen.hlsl` is untouched — the quad
+**Shader semantics did NOT change.** `worldgen.ush` is untouched — the quad
 stream is identical, so `MeshCountMain`/`MeshEmitMain` need no mirror change,
 no SPIR-V rebuild, and the AMD digests `e21e2767591496eb` / `1e664cf6680a137c`
 / `7602afe508d2ee73` cannot move. The GPU harness was therefore not re-run
@@ -4988,7 +4988,7 @@ leave every single golden and both bench digests byte-identical — that is the
 evidence that the caching is output-neutral, rather than an argument that it
 ought to be.
 
-**The AMD GPU digests are now STALE.** `worldgen.hlsl`'s `ColumnMain` /
+**The AMD GPU digests are now STALE.** `worldgen.ush`'s `ColumnMain` /
 `VoxelizeMain` know nothing about caverns and still carry the 40-60 m bedrock
 band, so the CPU/GPU harness **will FAIL until C6 lands** — expected, not a
 regression. C6 must mirror `cavernCandidatesFor` / `cavernSiteFor` /
@@ -5458,7 +5458,7 @@ one-time popping delta on R1+ (coarse vs downsampled disagree on ~1-4% of
 shell cells); the cross-fade should absorb it, but eyeball it.
 
 **GPU follow-up**: if/when outer rings move to the GPU voxelize path, the
-coarse rule is the same `worldgen.hlsl` functions called at strided
+coarse rule is the same `worldgen.ush` functions called at strided
 coordinates — no new math to mirror. NOT touched this wave (C6 owns that
 file).
 
@@ -5467,16 +5467,16 @@ untouched), voxel-core/tests/test_coarsegen.cpp (7 tests: identity,
 pointwise/seam, surface-range formula, NEW golden, seed sensitivity,
 fidelity ceilings, cavern survival), voxel-core/tests/CMakeLists.txt,
 voxel-core/bench/bench_main.cpp (`--mips` mode; default modes untouched).
-No changes to mips.h, caves.h, caverns.h, amplifier.*, worldgen.hlsl, or
+No changes to mips.h, caves.h, caverns.h, amplifier.*, worldgen.ush, or
 anything under ue-project/.
 
 ---
 
-## C6b — worldgen.hlsl mirror finished, AMD cross-vendor determinism re-verified
+## C6b — worldgen.ush mirror finished, AMD cross-vendor determinism re-verified
 
 **State found.** C6's mirror was substantively complete and correct: the C2
 crevices, the C4 folded cavern pass and the 180-220 m bedrock band were all
-present in `voxel-core/shaders/worldgen.hlsl` (497 lines, 118 cavern
+present in `voxel-core/shaders/worldgen.ush` (497 lines, 118 cavern
 references), with the bedrock formula `180000 + ((bj >> 48) * 40000) / 65536`
 matching `amplifier.cpp:329` character for character. It had never been run
 against a GPU.
@@ -5520,7 +5520,7 @@ bumped). All six pinned goldens verify unchanged: `amplifier_columns`
 **Gates.** `tools/lint-shader-ub.py` clean on its own merits (1 HLSL file, 5
 rules, fail-closed); every `allow` annotation in the file carries a written
 justification, none are bare. Zero `float`/`double`/`half` in
-`worldgen.hlsl`. `vxc_tests` 205 PASS / 0 FAIL (clang/llvm-mingw).
+`worldgen.ush`. `vxc_tests` 205 PASS / 0 FAIL (clang/llvm-mingw).
 
 **Build note for the next agent on this box.** `vxc_gpu` needs MSVC + Vulkan
 and will not build under mingw, as documented — but VS 2026 here is
@@ -5538,7 +5538,7 @@ its gate comfortably at 0.202 s. The r64 regression is an allocator warm-up
 cost, not worldgen math, and is orthogonal to the byte-compare — worth a
 separate look at buffer pre-sizing for the small-radius case.
 
-**Files.** voxel-core/shaders/worldgen.hlsl (`kMaxCavernSegs` 6 -> 4),
+**Files.** voxel-core/shaders/worldgen.ush (`kMaxCavernSegs` 6 -> 4),
 voxel-core/shaders/prebuilt/*.spv (respun), voxel-core/shaders/prebuilt/
 README.md (respin 4 section), docs/status.md (this entry). No CPU source, no
 test, nothing under ue-project/.
@@ -6001,7 +6001,7 @@ synthetic-sampler runs; see follow-ups.
 - **GPU mirror: NOT needed for this work.** `floodZMm` is computed inside
   `cavernSiteFor`, which C6 is already mirroring; nothing new was added to
   worldgen. Mobilization is simulation, not worldgen, and never belongs in
-  `worldgen.hlsl`.
+  `worldgen.ush`.
 - `UVoxelWorldSubsystem` should expose a public column/cavern accessor so the
   water subsystem can stop building a second `Amplifier`. Until then a
   `-VoxelTileDir` run would disagree between the two samplers and put cavern

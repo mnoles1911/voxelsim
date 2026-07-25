@@ -104,7 +104,7 @@ jobs:
           print("float-ban clean")
 
   # ADR-0001 determinism surface: the M0 gate passed on AMD and failed on
-  # NVIDIA running the IDENTICAL committed SPIR-V, because worldgen.hlsl's
+  # NVIDIA running the IDENTICAL committed SPIR-V, because worldgen.ush's
   # floorDiv derived its flooring correction from `a % b` and HLSL leaves `%`
   # undefined unless both operands share a sign (commit 6ab4b2a). This job
   # makes that whole class mechanical: it fails on signed `/`/`%` that is not

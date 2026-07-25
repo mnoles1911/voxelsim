@@ -16,7 +16,7 @@ byte-identical, in the `voxel-core/bench` harness.
 throughput trade (ADR-0006 says he decides here), and prove the two existing
 kernels chain end-to-end at runtime resolution.
 
-- Wire `worldgen.hlsl` voxelize into an RDG pass inside UE (not just the bench),
+- Wire `worldgen.ush` voxelize into an RDG pass inside UE (not just the bench),
   producing a chunk's cell buffer on the GPU. Reuse the AMD-verified kernel.
 - Measure: voxelize + (CPU-side, for now) mesh throughput at 10 cm for one
   chunk, per ring level; VRAM per chunk of packed geometry (2×uint32/quad per
@@ -62,7 +62,7 @@ bytes. Nothing renders. This is the bridge between a green standalone bench and
 any of the rendering work below, and it is the cheapest place to discover that
 engine-compiled HLSL diverges from `dxc`-compiled HLSL.
 
-- Register a shader directory for the `VoxelEarth` module; get `worldgen.hlsl`
+- Register a shader directory for the `VoxelEarth` module; get `worldgen.ush`
   compiling as UE global compute shaders (D3D12/SM6) with whatever `#ifdef`
   work the Vulkan-specific syntax needs. **The HLSL must stay one source of
   truth** — the bench and the engine compile the same file, or the digest gate

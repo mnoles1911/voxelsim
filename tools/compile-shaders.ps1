@@ -12,7 +12,7 @@ $OutDir = Join-Path $Root "build\shaders"
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 
 # kernel source -> entry points
-$Kernels = @{ "voxel-core\shaders\worldgen.hlsl" = @("ColumnMain", "VoxelizeMain", "MeshCountMain", "MeshEmitMain", "ScanBlocksMain", "ScanSumsMain", "ScanAddMain") }
+$Kernels = @{ "voxel-core\shaders\worldgen.ush" = @("ColumnMain", "VoxelizeMain", "MeshCountMain", "MeshEmitMain", "ScanBlocksMain", "ScanSumsMain", "ScanAddMain") }
 
 foreach ($Src in $Kernels.Keys) {
     $SrcPath = Join-Path $Root $Src
@@ -27,7 +27,7 @@ foreach ($Src in $Kernels.Keys) {
         # HLSL register classes (b/t/u/s) are separate namespaces but Vulkan
         # descriptor bindings are one flat space per set; without shifts, b0/
         # t0/u0 would all collide at (set=0, binding=0). Shift t- and u-type
-        # registers so every resource in worldgen.hlsl lands on a distinct
+        # registers so every resource in worldgen.ush lands on a distinct
         # binding: b0->0, t0->1, t1->2, u0->3, t3->4, u2->5 (see
         # voxel-core/bench/gpu_harness.cpp, which hardcodes these same binding
         # numbers for both the ColumnMain and VoxelizeMain descriptor sets).

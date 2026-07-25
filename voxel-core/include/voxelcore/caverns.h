@@ -10,7 +10,7 @@
 // and testable. C4 wires `cavernColumnFor`'s output into `ColumnSample` and
 // `Amplifier::materialAt`, exactly the way `voxelcore/caves.h`'s `CaveColumn`
 // is wired in today. Every expression here must eventually be mirrored
-// bit-for-bit in `voxel-core/shaders/worldgen.hlsl` (C6) — same discipline as
+// bit-for-bit in `voxel-core/shaders/worldgen.ush` (C6) — same discipline as
 // caves.h: integer math only, `floorDiv`/power-of-two masks instead of signed
 // `%`, no unbounded allocation.
 //

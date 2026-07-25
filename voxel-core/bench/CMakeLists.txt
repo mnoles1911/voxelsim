@@ -34,7 +34,7 @@ add_test(NAME vxc_editlog_selftest COMMAND vxc_editlog selftest)
 # (etc.) and byte-compares against the CPU reference. Builds on Windows and
 # Linux (M0 cross-vendor NVIDIA-vs-AMD gate close-out); the .spv kernels are
 # committed under voxel-core/shaders/prebuilt/ (compiled once from
-# voxel-core/shaders/worldgen.hlsl via the Windows-only DXC flow,
+# voxel-core/shaders/worldgen.ush via the Windows-only DXC flow,
 # tools/compile-shaders.ps1 — SPIR-V is portable bytecode, so the SAME
 # committed bytes run unmodified on both platforms; see prebuilt/README.md
 # for provenance/hashes). No Vulkan SDK dependency either way: the loader

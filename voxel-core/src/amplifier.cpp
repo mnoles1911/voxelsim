@@ -983,7 +983,7 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // Surface material from biome classification (M4): morphology gates
     // (slope, coastal band, temperature-adjusted treeline) run before the
     // Whittaker climate lookup — see voxelcore/biome.h, mirrored bit-exactly
-    // in worldgen.hlsl's ColumnMain.
+    // in worldgen.ush's ColumnMain.
     const BiomeId biome = classifyBiome(cl.temperature, cl.precipitation, cl.seasonality,
                                          col.surfaceMm, slopeMmPerPx);
     col.surfaceMat = biomeSurfaceMaterial(biome, col.surfaceMm);
@@ -991,7 +991,7 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // M4 cave pass (voxelcore/caves.h): reduce the jittered lattice tunnel
     // network to the tube axes that pass near this column. Depends only on
     // (seed, vx, vy, surfaceMm) — no raster reads — which is what lets
-    // worldgen.hlsl recompute it inside VoxelizeMain rather than widening
+    // worldgen.ush recompute it inside VoxelizeMain rather than widening
     // GpuColumnSample. Mirrored bit-exactly there.
     // Served from the per-thread cave-lattice memo above; bit-identical to
     // caveColumnFor(seed_, vx, vy, col.surfaceMm).

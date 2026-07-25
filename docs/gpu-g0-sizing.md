@@ -98,7 +98,7 @@ across every level, so the VRAM extrapolation above holds per-ring.
 - **`--radius N` is not a cascade.** It generates 10 cm everywhere out to N
   metres, so §1 is an upper bound on work and a *lower* bound on chunks/sec for a
   real cascade (whose outer rings are far cheaper per unit area).
-- **GPU path is level-0 only.** `worldgen.hlsl` has no level parameter; coarse
+- **GPU path is level-0 only.** `worldgen.ush` has no level parameter; coarse
   generation is CPU-only today. Outer-ring GPU throughput is not measured and is
   not required for G0 — but G1/G3 will need it, or the outer rings stay on CPU
   (which §4 shows is cheap).

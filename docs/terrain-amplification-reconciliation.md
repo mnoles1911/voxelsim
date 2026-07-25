@@ -39,7 +39,7 @@ the budget a much heavier amplifier needs.
 `docs/determinism.md`: *"No floating point anywhere in world derivation.
 `float`/`double` are banned in `voxel-core/src` and `voxel-core/include` (CI
 greps for them)."* And `voxelcore/biome.h` states the mirror contract outright:
-*"this logic is mirrored bit-for-bit in worldgen.hlsl's ColumnMain. ANY change
+*"this logic is mirrored bit-for-bit in worldgen.ush's ColumnMain. ANY change
 here must be made identically in both places and re-verified by vxc_gpu."*
 
 **ADR-0006 does not relax this.** Its invariant 3 exempts the *mesh* from

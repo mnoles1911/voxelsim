@@ -52,7 +52,7 @@ What already exists to build on:
 - **ADR-0001**: GPU compute is integer HLSL, dual-hosted (UE RDG + a Vulkan
   bench harness), no CUDA / no wave-size assumptions. The AMD desktop is the
   canonical determinism leg.
-- **Worldgen voxelize kernel** (`voxel-core/shaders/worldgen.hlsl`): done and
+- **Worldgen voxelize kernel** (`voxel-core/shaders/worldgen.ush`): done and
   AMD-verified (git: "Merge GPU voxelize kernel, AMD PASS"), CPU↔GPU bit-exact.
   Currently wired only into CI/bench, not live streaming.
 - **`docs/gpu-mesher-design.md`**: the deterministic GPU greedy-mesher kernel
@@ -67,7 +67,7 @@ this ADR decides.
 State these as invariants the implementation is checked against.
 
 1. **Voxel-cascade display geometry is GPU-generated and GPU-resident.** A
-   compute pipeline — voxelize (`worldgen.hlsl`) → greedy mesh
+   compute pipeline — voxelize (`worldgen.ush`) → greedy mesh
    (`gpu-mesher-design.md`) → into a **persistent GPU geometry pool** (a large
    suballocated vertex/index buffer, ring-managed) — replaces the CPU worker
    mesh + per-chunk vertex upload for streaming. Streaming a chunk in or out is a
