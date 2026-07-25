@@ -23,7 +23,7 @@ from terrain_service.providers.diffusion import (
     DiffusionConfig,
     DiffusionProvider,
     ModelOutputMismatch,
-    SamplerConfig,
+    WorldShapeConfig,
     TerrainDiffusionBackend,
     adapt_raster_to_tile,
     compute_conditioning_digest,
@@ -201,7 +201,23 @@ def test_provider_id_changes_with_config():
         conditioning_files=DEFAULT_CONDITIONING_FILES + ("wc2.1_10m_bio_7.tif",)
     ).provider_id()
     diff_td_version = DiffusionConfig(terrain_diffusion_version="1.2.3").provider_id()
-    diff_sampler = DiffusionConfig(sampler=SamplerConfig(steps=50)).provider_id()
+    # Every world-shape kwarg must roll the id -- these are the ones that
+    # actually reach WorldPipeline, unlike the SamplerConfig they replaced.
+    diff_freq = DiffusionConfig(
+        world_shape=WorldShapeConfig(frequency_mult=(0.4, 3.0, 3.0, 3.0, 3.0))
+    ).provider_id()
+    diff_water = DiffusionConfig(
+        world_shape=WorldShapeConfig(drop_water_pct=0.25)
+    ).provider_id()
+    diff_snr = DiffusionConfig(
+        world_shape=WorldShapeConfig(cond_snr=(0.9, 0.1, 1.0, 0.1, 1.0))
+    ).provider_id()
+    diff_pool = DiffusionConfig(
+        world_shape=WorldShapeConfig(coarse_pooling=2)
+    ).provider_id()
+    diff_poolmode = DiffusionConfig(
+        world_shape=WorldShapeConfig(elev_coarse_pool_mode='max')
+    ).provider_id()
     diff_scale = DiffusionConfig(scale=8).provider_id()
     diff_mapping = DiffusionConfig(
         channel_mapping={**DEFAULT_CHANNEL_MAPPING, "precip_variability": "precip_var"}
@@ -213,11 +229,15 @@ def test_provider_id_changes_with_config():
         diff_conditioning,
         diff_cond_files,
         diff_td_version,
-        diff_sampler,
+        diff_freq,
+        diff_water,
+        diff_snr,
+        diff_pool,
+        diff_poolmode,
         diff_scale,
         diff_mapping,
     }
-    assert len(ids) == 9, "every byte-affecting config field must roll the provider_id"
+    assert len(ids) == 13, "every byte-affecting config field must roll the provider_id"
 
 
 def test_provider_id_ignores_checkpoint_load_path():
@@ -876,3 +896,40 @@ def test_channel_mapping_cannot_be_mutated_after_construction():
     before = config2.provider_id()
     caller_dict["temperature"] = "t2m"
     assert config2.provider_id() == before
+
+
+def test_world_shape_defaults_are_pinned():
+    """WorldShapeConfig's defaults must reproduce upstream WorldPipeline's.
+
+    They are a COPY of `world_pipeline.py`'s `__init__` defaults, taken
+    2026-07-25. A copy can go stale silently: upstream changes a default, we
+    keep passing the old value, and tiles change character with no signal. This
+    cannot detect that on its own -- terrain-diffusion is not importable in this
+    (torch-free) test environment -- but it does pin OUR side, so the copy can
+    only drift deliberately, and it documents the values to diff against
+    upstream when bumping `terrain_diffusion_version`.
+    """
+    kw = WorldShapeConfig().as_pipeline_kwargs()
+    assert kw == {
+        "frequency_mult": [1.5, 3.0, 3.0, 3.0, 3.0],
+        "drop_water_pct": 0.5,
+        "cond_snr": [0.3, 0.1, 1.0, 0.1, 1.0],
+        "coarse_pooling": 1,
+        "elev_coarse_pool_mode": "avg",
+        "p5_coarse_pool_mode": "avg",
+    }
+    # Lists, not tuples: upstream indexes and slices these.
+    assert isinstance(kw["frequency_mult"], list)
+    assert isinstance(kw["cond_snr"], list)
+
+
+def test_world_shape_is_hashable_and_frozen():
+    """The config is snapshotted into provider_id at construction, so a mutable
+    field would let the world change under an already-published identity --
+    the same class of bug __post_init__ freezes channel_mapping against."""
+    import dataclasses
+
+    ws = WorldShapeConfig()
+    hash(ws)  # tuples, not lists, on the dataclass itself
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        ws.drop_water_pct = 0.1

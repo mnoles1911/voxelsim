@@ -53,9 +53,12 @@ Design, top to bottom:
     KNOWN REMAINING GAPS, in rough priority order — inputs that can still
     change tile bytes without rolling the id:
 
-      1. ``SamplerConfig`` is hashed but never passed to ``WorldPipeline``,
-         so the sampler settings actually in force are upstream defaults
-         that are not in the id. See that class's docstring.
+      1. FIXED 2026-07-25 (identity schema v3). ``SamplerConfig`` was hashed
+         but never passed to anything; it is replaced by ``WorldShapeConfig``,
+         which carries the ``WorldPipeline`` kwargs that really do shape the
+         world (``frequency_mult``, ``drop_water_pct``, ``cond_snr``,
+         ``coarse_pooling``, the pool modes) and IS forwarded to
+         ``from_pretrained``. See ``docs/worldgen-levers.md``.
       2. The execution environment. ``_load_pipeline`` silently falls back
          to ``device="cpu"`` when no GPU is visible, so CPU- and
          GPU-generated tiles share a namespace; ``torch``/cuDNN versions and
@@ -309,28 +312,73 @@ def adapt_raster_to_tile(
 
 
 @dataclass(frozen=True)
-class SamplerConfig:
-    """Diffusion sampler settings — part of the pinned config (doctrine §2.3):
-    changing any of these changes generated tiles, so it must roll the
-    provider_id / cache key.
+class WorldShapeConfig:
+    """The ``WorldPipeline`` constructor kwargs that decide what the world LOOKS
+    LIKE — and, unlike the ``SamplerConfig`` this replaces, ones that are
+    actually passed to the model.
 
-    KNOWN GAP (2026-07-22, not fixed here — flagged rather than silently
-    papered over): **these values currently reach nothing.**
-    ``TerrainDiffusionBackend`` calls ``WorldPipeline.from_pretrained(...)``,
-    ``.bind()`` and ``.get(i1, j1, i2, j2, with_climate=True)``, none of which
-    take sampler arguments, so the settings actually in force are
-    ``WorldPipeline``'s internal defaults. The identity is therefore wrong in
-    both directions: changing ``steps`` here rolls the id and invalidates a
-    cache while producing byte-identical tiles, and the real sampler
-    settings — including any upstream default change — are not in the id at
-    all. ``terrain_diffusion_version`` partially covers the second case.
-    Resolve by either wiring these through to the pipeline or deleting them;
-    do not leave a config field that lies about what it controls.
+    WHY THE OLD FIELD WENT. ``SamplerConfig`` carried ``steps``,
+    ``guidance_scale`` and ``scheduler``, and its own docstring recorded that
+    they "currently reach nothing": ``WorldPipeline.from_pretrained``/``bind``/
+    ``get`` accept no sampler arguments, so the values in force were always
+    upstream defaults. That made the identity wrong in both directions — editing
+    ``steps`` rolled the id while producing byte-identical tiles, and the real
+    settings were absent from it. The docstring asked for exactly one of two
+    resolutions: wire them through, or delete them. There is nowhere to wire
+    them to, so they are deleted, and replaced with the knobs that DO reach the
+    model (``world_pipeline.py``'s ``__init__``, forwarded by
+    ``from_pretrained``).
+
+    Every field here changes generated tile bytes, so every field is hashed.
+
+    Defaults are copied from ``WorldPipeline.__init__`` as of terrain-diffusion
+    at 2026-07-25, so an unset config passes exactly what upstream would have
+    defaulted to and generates what it generated before this class existed.
+    That copy is the weak point — upstream could change a default and this would
+    keep passing the old one — so ``test_world_shape_defaults_are_pinned``
+    pins them, and ``terrain_diffusion_version`` is what records which upstream
+    a tile set was actually built against.
+
+    See ``terrain-service/docs/worldgen-levers.md`` for what each one does and
+    what it is worth.
     """
 
-    steps: int = 30
-    guidance_scale: float = 3.0
-    scheduler: str = "ddim"
+    #: Per-channel Perlin frequency of the coarse SKETCH the model is
+    #: conditioned on (elevation, temp, temp_std, precip, precip_cv). Index 0 is
+    #: the landmass-scale knob: measured, 1.5 -> 0.4 takes inland reach from
+    #: 123 km to 192 km and the largest landmass from 197k to 315k km2.
+    frequency_mult: tuple[float, ...] = (1.5, 3.0, 3.0, 3.0, 3.0)
+    #: Land/ocean ratio, via masking ocean pixels out of the elevation
+    #: histogram. NOTE: upstream caches the quantile tables in
+    #: data/global/synthetic_map_stats.json WITHOUT keying on this value, so it
+    #: silently does nothing unless that file is deleted first. Hashed anyway —
+    #: an identity that ignored it would be wrong the moment the cache is
+    #: cleared. See docs/worldgen-levers.md §6.
+    drop_water_pct: float = 0.5
+    #: Per-channel conditioning SNR: how tightly the coarse model must obey the
+    #: sketch. The analogue of tiff-export's --snr.
+    cond_snr: tuple[float, ...] = (0.3, 0.1, 1.0, 0.1, 1.0)
+    #: Pools the coarse output, compressing horizontal space.
+    coarse_pooling: int = 1
+    elev_coarse_pool_mode: str = "avg"
+    p5_coarse_pool_mode: str = "avg"
+
+    def as_pipeline_kwargs(self) -> dict:
+        """The exact kwargs to hand ``WorldPipeline.from_pretrained``.
+
+        Lists, not tuples: upstream indexes and slices these, and a tuple would
+        work by accident today and break on the first ``.append``-shaped change
+        upstream makes. Tuples are used on the dataclass only so it stays
+        hashable and frozen.
+        """
+        return {
+            "frequency_mult": list(self.frequency_mult),
+            "drop_water_pct": self.drop_water_pct,
+            "cond_snr": list(self.cond_snr),
+            "coarse_pooling": self.coarse_pooling,
+            "elev_coarse_pool_mode": self.elev_coarse_pool_mode,
+            "p5_coarse_pool_mode": self.p5_coarse_pool_mode,
+        }
 
 
 #: Bumped whenever the *shape* of the provider_id payload changes (fields
@@ -338,7 +386,10 @@ class SamplerConfig:
 #: v1 = the bring-up scheme (checkpoint_id in the id, no conditioning hash).
 #: v2 = current: identity is content-addressed only (load path excluded),
 #: conditioning data + tile wire format folded in.
-IDENTITY_SCHEMA_VERSION = 2
+#: v3 = the `sampler` field (hashed, never passed to anything) replaced by
+#: `world_shape` (hashed AND passed). Rolls every provider_id; adopt an existing
+#: cache with provider_id_override, which is exactly what it is for.
+IDENTITY_SCHEMA_VERSION = 3
 
 #: Placeholder meaning "the conditioning data behind this config has never
 #: been hashed". Deliberately mirrors ``"UNPINNED"`` for the checkpoint: a
@@ -498,7 +549,10 @@ class DiffusionConfig:
     #: package upgrade can change output STRUCTURALLY, and that should not
     #: hide under an unchanged id. "UNRECORDED" if a bring-up did not note it.
     terrain_diffusion_version: str = "UNRECORDED"
-    sampler: SamplerConfig = field(default_factory=SamplerConfig)
+    #: The WorldPipeline kwargs that shape the world. Replaces the old
+    #: ``sampler`` field, which was hashed but never passed to anything — see
+    #: WorldShapeConfig's docstring.
+    world_shape: WorldShapeConfig = field(default_factory=WorldShapeConfig)
     #: Tile pixel scale this config is calibrated for (tile_codec.PIXEL_SIZE_MM
     #: key: 1 => 30m/px, 8 => 3.75m/px supersampled). Must match the `scale`
     #: argument the provider is actually called with.
@@ -588,11 +642,12 @@ class DiffusionConfig:
             "conditioning_digest": self.conditioning_digest,
             "conditioning_files": sorted(self.conditioning_files),
             "terrain_diffusion_version": self.terrain_diffusion_version,
-            "sampler": {
-                "steps": self.sampler.steps,
-                "guidance_scale": self.sampler.guidance_scale,
-                "scheduler": self.sampler.scheduler,
-            },
+            # Everything that shapes the world AND is actually passed to
+            # WorldPipeline. Serialized from as_pipeline_kwargs() rather than
+            # field-by-field so the hash covers exactly what the model receives:
+            # a kwarg that stops being passed can no longer sit in the identity
+            # pretending to matter, which is precisely how `sampler` went wrong.
+            "world_shape": self.world_shape.as_pipeline_kwargs(),
             "scale": self.scale,
             "channel_mapping": dict(self.channel_mapping),
             "tile_format": _tile_format_fingerprint(),
@@ -945,7 +1000,12 @@ class TerrainDiffusionBackend:
         verify_conditioning_digest(self.config, root=DEFAULT_CONDITIONING_ROOT)
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        pipeline = WorldPipeline.from_pretrained(self.config.checkpoint_id)
+        # World-shape kwargs are forwarded to WorldPipeline.__init__ by
+        # from_pretrained. This is the half the old `sampler` field never had:
+        # the values in the identity are now the values the model receives.
+        pipeline = WorldPipeline.from_pretrained(
+            self.config.checkpoint_id, **self.config.world_shape.as_pipeline_kwargs()
+        )
         pipeline.to(device)
         # 'direct' (in-memory LRU) is WorldPipeline.bind's own default
         # caching_strategy; no hdf5_file needed for a single serverless
