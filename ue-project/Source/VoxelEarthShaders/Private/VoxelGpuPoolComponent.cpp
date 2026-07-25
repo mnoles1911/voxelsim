@@ -60,16 +60,29 @@ public:
 			return;
 		}
 
+		// Static, NOT Dynamic -- this is load-bearing, and it is the opposite of
+		// what "we update this every frame" instinctively suggests.
+		//
+		// These buffers are written in sub-ranges (see UpdateQuadRange_RenderThread).
+		// In the D3D12 RHI only the *static* lock path honours a lock offset: it
+		// allocates a staging buffer of exactly the locked size and issues a
+		// CopyBufferRegion into the destination at that offset
+		// (D3D12Buffer.cpp:750, :801, :818). The *dynamic* path ignores the offset
+		// completely and hands back the buffer's base address (:659), then renames
+		// the whole buffer to a fresh upload allocation on every lock after the
+		// first (:667, :697) -- so everything outside the range just written
+		// becomes uninitialised garbage. Marking these Dynamic silently corrupted
+		// the chunk table and put every partial write at quad 0.
 		QuadBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
 			RHICmdList, TEXT("VoxelGpuPool.Quads"),
-			EBufferUsageFlags::Dynamic | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
+			EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
 			MakeConstArrayView(Quads));
 		QuadBufferSRV = RHICmdList.CreateShaderResourceView(
 			QuadBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(QuadBuffer));
 
 		ChunkIdBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
 			RHICmdList, TEXT("VoxelGpuPool.ChunkIds"),
-			EBufferUsageFlags::Dynamic | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
+			EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
 			MakeConstArrayView(ChunkIds));
 		ChunkIdSRV = RHICmdList.CreateShaderResourceView(
 			ChunkIdBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(ChunkIdBuffer));
@@ -78,7 +91,7 @@ public:
 		PaddedOrigins.SetNumZeroed(MaxChunks);
 		OriginBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
 			RHICmdList, TEXT("VoxelGpuPool.ChunkOrigins"),
-			EBufferUsageFlags::Dynamic | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
+			EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
 			MakeConstArrayView(PaddedOrigins));
 		OriginSRV = RHICmdList.CreateShaderResourceView(
 			OriginBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(OriginBuffer));
@@ -87,7 +100,7 @@ public:
 		PaddedClimate.SetNumZeroed(MaxChunks);
 		ClimateBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
 			RHICmdList, TEXT("VoxelGpuPool.ChunkClimate"),
-			EBufferUsageFlags::Dynamic | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
+			EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
 			MakeConstArrayView(PaddedClimate));
 		ClimateSRV = RHICmdList.CreateShaderResourceView(
 			ClimateBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(ClimateBuffer));
