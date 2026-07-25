@@ -328,6 +328,118 @@ namespace
 		return OutMismatches.Num() == 0;
 	}
 
+	// CPU reference for the packed-quad decode.
+	//
+	// SCOPE, HONESTLY STATED: this is transcribed from BuildChunkVertexData in
+	// VoxelChunkComponent.cpp, it is not that function. So it proves the shader
+	// implements the SPEC — the bit unpacking, the corner order, the winding
+	// flip, the AO bit remap, the level scale — which is where transcription
+	// bugs actually live. It does NOT prove the GPU path matches the shipping
+	// CPU renderer; only the G2 visual A/B against real terrain does that, and
+	// that check is still owed.
+	void DecodeQuadVertexCpu(uint64 Packed, uint32 CornerIndex, float LevelScale,
+	                         float OutPosUU[3], uint32& OutAo, uint32& OutMat)
+	{
+		const uint32 W0 = uint32(Packed & 0xffffffffull);
+		const uint32 W1 = uint32(Packed >> 32);
+
+		const uint32 Axis     =  W0        & 0xfu;
+		const uint32 Positive = (W0 >>  4) & 0xfu;
+		const uint32 Slice    = (W0 >>  8) & 0xffu;
+		const uint32 U0       = (W0 >> 16) & 0xffu;
+		const uint32 V0       = (W0 >> 24) & 0xffu;
+		const uint32 QW       =  W1        & 0xffu;
+		const uint32 QH       = (W1 >>  8) & 0xffu;
+		const uint32 Ao       = (W1 >> 16) & 0xffu;
+		const uint32 Mat      = (W1 >> 24) & 0xffu;
+
+		const uint32 U = (Axis + 1u) % 3u;
+		const uint32 V = (Axis + 2u) % 3u;
+		const float FaceCoordVox = float(Slice) + (Positive != 0u ? 1.0f : 0.0f);
+
+		const float Us[4] = { float(U0), float(U0), float(U0 + QW), float(U0 + QW) };
+		const float Vs[4] = { float(V0), float(V0 + QH), float(V0 + QH), float(V0) };
+
+		static const uint32 ForwardWinding[6]  = { 0u, 1u, 2u, 0u, 2u, 3u };
+		static const uint32 ReversedWinding[6] = { 0u, 2u, 1u, 0u, 3u, 2u };
+		const uint32 Corner = (Positive != 0u) ? ForwardWinding[CornerIndex]
+		                                       : ReversedWinding[CornerIndex];
+
+		float PosVox[3] = { 0.f, 0.f, 0.f };
+		PosVox[Axis] = FaceCoordVox;
+		PosVox[U] = Us[Corner];
+		PosVox[V] = Vs[Corner];
+
+		// VoxelCoords::VoxelSizeUU
+		constexpr float VoxelSizeUU = 10.0f;
+		for (int32 I = 0; I < 3; ++I)
+		{
+			OutPosUU[I] = PosVox[I] * (VoxelSizeUU * LevelScale);
+		}
+
+		static const uint32 AoShiftForCorner[4] = { 0u, 4u, 6u, 2u };
+		OutAo = (Ao >> AoShiftForCorner[Corner]) & 0x3u;
+		OutMat = Mat;
+	}
+
+	// Compares the GPU decode against the CPU reference over a real quad
+	// stream. Returns the number of mismatching vertices.
+	int32 VerifyQuadDecode(const TArray<uint64>& Quads, float LevelScale)
+	{
+		TArray<VoxelGpuWorldGen::FDecodedVertex> GpuVerts;
+		FString Error;
+		if (!VoxelGpuWorldGen::DecodeQuadsBlocking(Quads, LevelScale, GpuVerts, Error))
+		{
+			UE_LOG(LogVoxelGpuVerify, Error, TEXT("  quad decode dispatch FAILED: %s"), *Error);
+			return -1;
+		}
+
+		const int32 Expected = Quads.Num() * 6;
+		if (GpuVerts.Num() != Expected)
+		{
+			UE_LOG(LogVoxelGpuVerify, Error,
+			       TEXT("  quad decode produced %d vertices, expected %d"),
+			       GpuVerts.Num(), Expected);
+			return -1;
+		}
+
+		int32 Mismatches = 0;
+		for (int32 QuadIdx = 0; QuadIdx < Quads.Num(); ++QuadIdx)
+		{
+			for (uint32 Corner = 0; Corner < 6; ++Corner)
+			{
+				float CpuPos[3];
+				uint32 CpuAo = 0, CpuMat = 0;
+				DecodeQuadVertexCpu(Quads[QuadIdx], Corner, LevelScale, CpuPos, CpuAo, CpuMat);
+
+				const VoxelGpuWorldGen::FDecodedVertex& G = GpuVerts[QuadIdx * 6 + int32(Corner)];
+
+				// Positions are small integers times a power-of-two scale, so
+				// they are exactly representable and an exact compare is
+				// correct here — no epsilon, which would hide a real error.
+				const bool bSame = G.PositionUU[0] == CpuPos[0]
+				                && G.PositionUU[1] == CpuPos[1]
+				                && G.PositionUU[2] == CpuPos[2]
+				                && G.AmbientOcclusion == CpuAo
+				                && G.MaterialId == CpuMat;
+				if (!bSame)
+				{
+					if (Mismatches < 10)
+					{
+						UE_LOG(LogVoxelGpuVerify, Error,
+						       TEXT("    quad %d corner %u: cpu (%.1f, %.1f, %.1f) ao=%u mat=%u ")
+						       TEXT("vs gpu (%.1f, %.1f, %.1f) ao=%u mat=%u"),
+						       QuadIdx, Corner, CpuPos[0], CpuPos[1], CpuPos[2], CpuAo, CpuMat,
+						       G.PositionUU[0], G.PositionUU[1], G.PositionUU[2],
+						       G.AmbientOcclusion, G.MaterialId);
+					}
+					++Mismatches;
+				}
+			}
+		}
+		return Mismatches;
+	}
+
 	void VerifyRegionCommand(const TArray<FString>& Args)
 	{
 		if (!VoxelGpuWorldGen::IsSupportedOnCurrentRHI())
@@ -401,6 +513,27 @@ namespace
 			       Req.BrickZMin + int32(Req.BricksZ) - 1, Ms);
 
 			bAllOk &= CompareRegion(Region, Req, Gpu, CpuColumns, Digest, Mismatches);
+
+			// G2 decode check, over this region's real quad stream. Level 0,
+			// so LevelScale is 1.
+			const int32 DecodeMismatches = VerifyQuadDecode(Gpu.Quads, 1.0f);
+			if (DecodeMismatches < 0)
+			{
+				bAllOk = false;
+			}
+			else if (DecodeMismatches > 0)
+			{
+				UE_LOG(LogVoxelGpuVerify, Error,
+				       TEXT("  [%s] quad decode: %d of %d vertices differ from the CPU reference"),
+				       Region.Name, DecodeMismatches, Gpu.Quads.Num() * 6);
+				bAllOk = false;
+			}
+			else
+			{
+				UE_LOG(LogVoxelGpuVerify, Log,
+				       TEXT("  [%s] quad decode: %d vertices match the CPU reference exactly"),
+				       Region.Name, Gpu.Quads.Num() * 6);
+			}
 		}
 
 		// vxc::Digest exposes its FNV-1a accumulator directly as `h`.

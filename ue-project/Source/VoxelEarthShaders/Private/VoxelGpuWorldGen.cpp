@@ -575,3 +575,134 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 	Result.bOk = true;
 	return Result;
 }
+
+// ---------------------------------------------------------------------------
+// Packed-quad decode test hook (G2)
+//
+// The vertex factory will call DecodeVoxelQuadVertex during rendering, where a
+// mistake in it shows up only as terrain that looks a bit wrong. This runs the
+// same function over a quad buffer and hands the results back so they can be
+// compared against a CPU reference numerically instead.
+// ---------------------------------------------------------------------------
+
+#define VOXEL_QUAD_DECODE_TEST_USF "/VoxelEarth/VoxelQuadDecodeTest.usf"
+
+namespace
+{
+	class FVoxelQuadDecodeTestCS : public FVoxelWorldGenShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelQuadDecodeTestCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelQuadDecodeTestCS, FVoxelWorldGenShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, NumQuads)
+			SHADER_PARAMETER(float, LevelScale)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InQuads)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, OutVertices)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+}
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelQuadDecodeTestCS, VOXEL_QUAD_DECODE_TEST_USF,
+                        "QuadDecodeTestMain", SF_Compute);
+
+bool VoxelGpuWorldGen::DecodeQuadsBlocking(const TArray<uint64>& Quads,
+                                           float LevelScale,
+                                           TArray<FDecodedVertex>& OutVertices,
+                                           FString& OutError)
+{
+	OutVertices.Reset();
+
+	if (!IsSupportedOnCurrentRHI())
+	{
+		OutError = TEXT("Requires SM6");
+		return false;
+	}
+	if (Quads.IsEmpty())
+	{
+		return true;
+	}
+
+	const uint32 NumQuads = uint32(Quads.Num());
+	const uint32 NumVertices = NumQuads * 6;
+
+	TArray<FVector4f> Raw;
+	FString RenderError;
+
+	ENQUEUE_RENDER_COMMAND(VoxelGpuDecodeQuads)(
+		[&Quads, &Raw, &RenderError, NumQuads, NumVertices, LevelScale]
+		(FRHICommandListImmediate& RHICmdList)
+	{
+		FRDGBuilder GraphBuilder(RHICmdList);
+
+		FRDGBufferRef QuadsBuffer = CreateStructuredBuffer(
+			GraphBuilder, TEXT("Voxel.DecodeIn"), sizeof(uint64), NumQuads,
+			Quads.GetData(), NumQuads * sizeof(uint64));
+
+		FRDGBufferRef VertsBuffer = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), NumVertices),
+			TEXT("Voxel.DecodeOut"));
+
+		FVoxelQuadDecodeTestCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelQuadDecodeTestCS::FParameters>();
+		Params->NumQuads = NumQuads;
+		Params->LevelScale = LevelScale;
+		Params->InQuads = GraphBuilder.CreateSRV(QuadsBuffer);
+		Params->OutVertices = GraphBuilder.CreateUAV(VertsBuffer);
+
+		TShaderMapRef<FVoxelQuadDecodeTestCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("Voxel.QuadDecodeTest"), Shader, Params,
+			FIntVector(FMath::DivideAndRoundUp(NumVertices, 64u), 1, 1));
+
+		FRHIGPUBufferReadback Readback(TEXT("Voxel.DecodeReadback"));
+		const uint32 Bytes = NumVertices * sizeof(FVector4f);
+		AddEnqueueCopyPass(GraphBuilder, &Readback, VertsBuffer, Bytes);
+
+		GraphBuilder.Execute();
+		RHICmdList.SubmitAndBlockUntilGPUIdle();
+
+		if (!Readback.IsReady())
+		{
+			RenderError = TEXT("decode readback not ready after GPU idle");
+			return;
+		}
+		const void* Src = Readback.Lock(Bytes);
+		if (Src == nullptr)
+		{
+			RenderError = TEXT("decode readback lock returned null");
+			return;
+		}
+		Raw.SetNumUninitialized(NumVertices);
+		FMemory::Memcpy(Raw.GetData(), Src, Bytes);
+		Readback.Unlock();
+	});
+
+	FlushRenderingCommands();
+
+	if (!RenderError.IsEmpty())
+	{
+		OutError = RenderError;
+		return false;
+	}
+
+	OutVertices.SetNumUninitialized(NumVertices);
+	for (uint32 I = 0; I < NumVertices; ++I)
+	{
+		const FVector4f& R = Raw[int32(I)];
+		FDecodedVertex& V = OutVertices[int32(I)];
+		V.PositionUU[0] = R.X;
+		V.PositionUU[1] = R.Y;
+		V.PositionUU[2] = R.Z;
+
+		// The shader packed ao | mat<<8 through asfloat, so reinterpret rather
+		// than convert -- a float cast here would mangle the bits.
+		uint32 Packed = 0;
+		FMemory::Memcpy(&Packed, &R.W, sizeof(uint32));
+		V.AmbientOcclusion = Packed & 0xffu;
+		V.MaterialId = (Packed >> 8) & 0xffu;
+	}
+
+	return true;
+}

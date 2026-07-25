@@ -102,4 +102,23 @@ namespace VoxelGpuWorldGen
 	// math is 64-bit integer throughout (hashing and world coordinates), which
 	// needs SM6 with 64-bit integer shader ops.
 	VOXELEARTHSHADERS_API bool IsSupportedOnCurrentRHI();
+
+	// One decoded corner, as DecodeVoxelQuadVertex produced it.
+	struct FDecodedVertex
+	{
+		float PositionUU[3];
+		uint32 AmbientOcclusion;  // 0..3, as packed in the quad
+		uint32 MaterialId;
+	};
+
+	// Runs the packed-quad decode over Quads and returns 6 vertices per quad.
+	//
+	// This is a TEST HOOK, not part of the draw path. The vertex factory calls
+	// the same DecodeVoxelQuadVertex during rendering; this runs it in
+	// isolation so its output can be compared against a CPU reference without
+	// drawing anything. Blocking, same as RunRegionBlocking.
+	VOXELEARTHSHADERS_API bool DecodeQuadsBlocking(const TArray<uint64>& Quads,
+	                                               float LevelScale,
+	                                               TArray<FDecodedVertex>& OutVertices,
+	                                               FString& OutError);
 }
