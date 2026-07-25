@@ -290,3 +290,63 @@ instrumentation to add rather than the next fix to guess at.
 Reminder that this is a **CPU-path bug too**: the component path only looks
 healthy because the loop spins slower there. Any fix wants a measured
 before/after on both paths.
+
+### The R0 freeze is located: two undispatchable queue entries (2026-07-25)
+
+Per-level record accounting settles what earlier readings got wrong:
+
+```
+R0[+512  -0    ev0]      <- and +0 on every window after
+R1[+3019 -760  ev0]
+R3[+2560 -1025 ev0]
+```
+
+R0 admits **exactly one pass worth of records, once**, and never admits again.
+Nothing removes them (0 dropped, 0 evicted). 512 records -> 408 results
+(255 drawn + 152 legitimately zero-quad), which is the entire shortfall.
+
+The admission log says why:
+
+```
+R0[scan=0 rej=0 q=2 def=1 cut=-1m]     ... every pass, from the first
+```
+
+- `def=1` -- the refill trigger is armed.
+- `cut=-1m` -- no distance cutoff; it would admit anything.
+- `scan=0` -- but it never re-enumerates.
+- `q=2` -- **because refill requires the ring's queue to be EMPTY, and two
+  entries never leave it.**
+
+A ring re-enumerates only when the anchor crosses one of its chunks or when its
+refill trigger fires. On a stationary anchor the first never happens, and the
+second is gated on `PendingJobKeysByLevel[Level].IsEmpty()`. Two stuck entries
+therefore starve the entire ring, permanently, with its trigger armed the whole
+time. This is `docs/status.md`'s **"bounded-admission straggler"** -- "a few
+chunks never load until the player moves" is the same bug seen from a moving
+anchor, where crossing a chunk boundary rescans the ring and hides it.
+
+Four hypotheses tested and killed by measurement, all reverted, none of them it:
+
+1. Refill trigger cleared too eagerly -- no, `def=1` throughout.
+2. Admission filling a queue that `DropFarthestOverCap` then trims -- guard
+   added, **byte-identical results on both paths**; the queue never exceeds cap.
+3. The `HoldsGeometry()` guard in `DropFarthestOverCap` blocking drops -- swapped
+   back to `Component.IsValid()`, **no change**.
+4. Dead queue entries (no record) blocking `IsEmpty()` -- pruned them in
+   `SortPendingQueues`, **no change**, so the two entries DO hold records.
+
+So: two entries with live records sit in R0's queue and never dispatch. The next
+question is the only one left -- why does `DispatchJobs` skip them every pass
+without removing them? Prime suspects are the buried/sky pre-dispatch skip sites,
+which clear `bJobInFlight` and `continue`; if they do not also pop the key, it
+loops forever.
+
+Two design notes for whoever fixes it:
+
+- **`IsEmpty()` is the wrong predicate for the refill gate** regardless of why
+  those two are stuck. "This ring has no dispatchable work" is the property
+  actually wanted, and it should not be defeatable by a bounded number of
+  permanently-stuck entries.
+- **This is a CPU-path bug.** The component path shows `pending=0` only because
+  it is slow enough that R0 keeps rescanning for other reasons. Fix it with a
+  measured before/after on both paths.
