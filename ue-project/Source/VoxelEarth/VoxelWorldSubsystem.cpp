@@ -2234,6 +2234,15 @@ struct FVoxelWorldImpl
 	// FootprintZRangeCache.
 	TMap<FIntPoint, VoxelStreaming::FFootprintBand> FootprintBandCache;
 
+	// Cold-band throttle (DispatchJobs). Level-0 XY footprints that have a
+	// band-seeding job in flight but no band yet: exactly one blind job per
+	// footprint is allowed, and its ~15 column-mates wait for the answer rather
+	// than each guessing. Added in DispatchJobs, removed in DrainResults on any
+	// level-0 result. Game-thread only, like FootprintBandCache itself.
+	TSet<FIntPoint> FootprintBlindJobInFlight;
+	int64 ColdBandDefersSinceLog = 0; // column-mates held back, per 5s log window
+	int32 ColdBandHeldThisFrame = 0;  // held on the most recent DispatchJobs pass
+
 	// --- Bounded admission (docs/status.md "Streaming pipeline re-measure +
 	// rework") ---------------------------------------------------------------
 	//
@@ -3308,6 +3317,12 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       (long long)BuriedSkipsSinceLog, (long long)BuriedSkipAirSinceLog, (long long)BuriedSkipSolidSinceLog,
 	       (long long)BuriedSkipsByLevelSinceLog[0], FootprintBandCache.Num(), (long long)BuriedVerifyCheckedSinceLog,
 	       (long long)BuriedVerifyCheckedTotal, (long long)BuriedVerifyViolations);
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel cold-band throttle (5s window): defers=%lld heldLastPass=%d bandCache=%d blindInFlight=%d"),
+	       (long long)ColdBandDefersSinceLog, ColdBandHeldThisFrame, FootprintBandCache.Num(),
+	       FootprintBlindJobInFlight.Num());
+	ColdBandDefersSinceLog = 0;
+
 	BuriedSkipsSinceLog = BuriedSkipAirSinceLog = BuriedSkipSolidSinceLog = BuriedVerifyCheckedSinceLog = 0;
 
 	// Load-before-unload retention census. capRel is the headline: it counts
@@ -4992,6 +5007,12 @@ void FVoxelWorldImpl::DispatchJobs()
 		VoxelDebug::GetStreamJobsInFlightPerCore() * FPlatformMisc::NumberOfCoresIncludingHyperthreads();
 	const bool bRingQuota = VoxelStreamAdmission::GetRingQuotaEnabled();
 
+	// Cold-band throttle (see the block after the record lookup below). Hoisted:
+	// loop-invariant, and the check runs on every popped level-0 candidate.
+	const bool bBandSkipActive =
+		VoxelStreamAdmission::BuriedSkipEnabled() || VoxelStreamAdmission::VerifyBuriedSkipEnabled();
+	TArray<FSortEntry> DeferredColdBand;
+
 	while (JobsInFlightCounter.GetValue() < MaxJobsInFlight)
 	{
 		// Which ring gets this worker slot.
@@ -5053,13 +5074,58 @@ void FVoxelWorldImpl::DispatchJobs()
 			break; // nothing pending in any ring
 		}
 
-		const VoxelCoords::FVoxelLevelChunkKey LevelKey =
-			PendingJobKeysByLevel[PickLevel].Pop(EAllowShrinking::No).Key; // highest priority in that ring (see SortPendingQueues)
+		// Keep the whole entry, not just the key: the cold-band throttle below may
+		// re-queue it, and re-queuing must preserve its DistSq priority.
+		const FSortEntry PoppedEntry =
+			PendingJobKeysByLevel[PickLevel].Pop(EAllowShrinking::No); // highest priority in that ring (see SortPendingQueues)
+		const VoxelCoords::FVoxelLevelChunkKey LevelKey = PoppedEntry.Key;
 
 		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(LevelKey);
 		if (!Rec)
 		{
 			continue; // left the desired set between recompute and dispatch
+		}
+
+		// --- Cold-band throttle: ONE blind job per footprint at a time -------
+		//
+		// The buried-skip band below can only fire once SOME level-0 job in this
+		// (X,Y) footprint has completed AND drained (FootprintBandCache is
+		// populated in DrainResults). Until then the footprint is COLD, and every
+		// chunk of its ~16-chunk column pops off the nearest-first queue and
+		// dispatches BLIND. Measured on a moving flight: ~3.8 blind dispatches per
+		// footprint, ~90% of which turn out to be solid rock emitting nothing.
+		//
+		// It is a pure tax on MOVEMENT -- standing still it is invisible because
+		// every band is already warm. That is exactly the asymmetry reported:
+		// correct and fast at rest, holes and a long catch-up as soon as you move.
+		//
+		// The fix costs nothing, because the column grid a job builds is a
+		// function of XY ONLY (Key.Z never enters it), so ANY one chunk of the
+		// column yields the band for ALL of them. Dispatch exactly one and hold
+		// the column-mates back; they are then skipped or dispatched on knowledge
+		// instead of on a guess.
+		//
+		// Placed BEFORE NeedsOverlayAwarePath deliberately: that call is a live
+		// overlay scan of the chunk plus a brick of border, and a cold column can
+		// defer hundreds of chunks per frame -- paying for that scan on every one
+		// would cost more than the dispatches this saves.
+		//
+		// Held chunks are re-queued after the pop loop, so this REORDERS work and
+		// never drops it. The in-flight mark is cleared in DrainResults for every
+		// level-0 result, band or not, so a stale result cannot strand a column.
+		// NOTE the mark is NOT set here -- only checked. Setting it at pop time
+		// was a bug: a popped chunk can still leave via NeedsOverlayAwarePath or
+		// either pre-dispatch skip WITHOUT launching a worker job, so no level-0
+		// result would ever arrive to clear the mark and the whole column stayed
+		// deferred forever (observed as blindInFlight pinned at 92 and useful
+		// throughput DOWN 15%). The mark is set at the actual launch site.
+		if (LevelKey.Level == 0 && bBandSkipActive &&
+		    !FootprintBandCache.Contains(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y)) &&
+		    FootprintBlindJobInFlight.Contains(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y)))
+		{
+			DeferredColdBand.Add(PoppedEntry);
+			++ColdBandDefersSinceLog;
+			continue;
 		}
 
 		// Defensive re-check (any level as of M2 wave 2 -- see
@@ -5411,6 +5477,34 @@ void FVoxelWorldImpl::DispatchJobs()
 			},
 			UE::Tasks::ETaskPriority::BackgroundNormal);
 		InFlightTasks.Add(MoveTemp(Task));
+
+		// Cold-band throttle: a job is now genuinely in flight for this footprint
+		// and will produce its band, so hold the column-mates back until it
+		// drains. Set HERE and nowhere earlier -- every path that leaves the loop
+		// without launching must leave the mark untouched, or the column strands.
+		if (LevelKey.Level == 0 && bBandSkipActive)
+		{
+			const FIntPoint SeedFootprint(LevelKey.Key.X, LevelKey.Key.Y);
+			if (!FootprintBandCache.Contains(SeedFootprint))
+			{
+				FootprintBlindJobInFlight.Add(SeedFootprint);
+			}
+		}
+
+	}
+
+	// Re-queue the chunks held back by the cold-band throttle. Order is
+	// irrelevant here -- SortPendingQueues re-sorts both queues on the next
+	// recompute -- and they are retried next frame, by which time the seeding
+	// job has usually drained and the band can answer for the whole column.
+	if (DeferredColdBand.Num() > 0)
+	{
+		PendingJobKeysByLevel[0].Append(DeferredColdBand);
+		ColdBandHeldThisFrame = DeferredColdBand.Num();
+	}
+	else
+	{
+		ColdBandHeldThisFrame = 0;
 	}
 }
 
@@ -5649,6 +5743,16 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		if (Result.bBandValid)
 		{
 			FootprintBandCache.Add(FIntPoint(Result.Key.Key.X, Result.Key.Key.Y), Result.Band);
+		}
+
+		// Cold-band throttle: this footprint's seeding job has landed, so release
+		// its column-mates. Cleared for EVERY level-0 result, band or not (and
+		// before the stale-result discard, same reasoning as the band above) --
+		// otherwise a result that yielded no band would strand the whole column
+		// behind a mark that nothing ever removes.
+		if (Result.Key.Level == 0)
+		{
+			FootprintBlindJobInFlight.Remove(FIntPoint(Result.Key.Key.X, Result.Key.Key.Y));
 		}
 
 		// -VoxelVerifyBuriedSkip soundness check: this chunk's band verdict
