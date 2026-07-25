@@ -950,7 +950,7 @@ namespace
 	//
 	// Returns 0..1 temperature/precipitation, matching what the CPU path writes
 	// into vertex colour B/A for T_VoxelBiomeLUT.
-	FVector2f SampleChunkClimate(const FVector& PoolWorldOrigin, const FVector3f& ChunkOriginUU)
+	FVector4f SampleChunkClimate(const FVector& PoolWorldOrigin, const FVector3f& ChunkOriginUU)
 	{
 		// Chunk centre: the region is 64 voxels, so 320 UU in from its origin.
 		const double CentreX = PoolWorldOrigin.X + double(ChunkOriginUU.X) + 320.0;
@@ -958,8 +958,16 @@ namespace
 
 		VoxelClimate::EnsureInitialized();
 		const FVoxelClimateBytes Bytes = VoxelClimate::SampleClimateAtWorldUU(CentreX, CentreY);
-		return FVector2f(float(Bytes.Temperature) / 255.0f,
-		                 float(Bytes.Precipitation) / 255.0f);
+		// Z is left at "no surface gate" deliberately. This pool is the
+		// known-good CONTROL (docs/gpu-pool-rendering-notes.md: "run the
+		// known-good test pool in the same process, same frame, same material as
+		// the failing one"), so its image has to stay comparable to every earlier
+		// screenshot of it. Gating it would change the reference for a reason
+		// that has nothing to do with what the control tests.
+		return FVector4f(float(Bytes.Temperature) / 255.0f,
+		                 float(Bytes.Precipitation) / 255.0f,
+		                 UVoxelGpuPoolComponent::kNoSurfaceGate,
+		                 0.0f);
 	}
 
 	void SpawnPoolCommand(const TArray<FString>& Args, UWorld* World)

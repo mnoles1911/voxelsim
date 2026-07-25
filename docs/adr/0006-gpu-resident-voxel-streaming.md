@@ -164,3 +164,50 @@ State these as invariants the implementation is checked against.
   stage leaves a working game on the CPU path.
 
 See `docs/gpu-streaming-plan.md` for the milestone-by-milestone execution plan.
+
+## Delivered (2026-07-25)
+
+G0–G5 are complete and merged. `voxel.Stream.GPU` **defaults to true**; the
+CPU component path is intact behind `voxel.Stream.GPU 0`, exactly as the risk
+posture above requires.
+
+The pooled cascade renders **9,822 chunks / 8,813,242 quads in ONE primitive and
+ONE draw call**, and matches the component path ring for ring.
+
+**The redefined M1 gate, measured.** 60 s scripted surface flight at 20 m/s, same
+spawn, post-warmup, this cvar the only difference; two pairs, second run in
+reverse order:
+
+| | component | pool | |
+|---|---|---|---|
+| p50 frame | 17.50 ms | 17.16 ms | −1.9% |
+| **p95 frame** | 40.50 ms | 23.05 ms | **−43.1%** |
+| **worst frame** | 221.4 ms | 76.6 ms | **−65.4%** |
+| **hitches (>33.3 ms)** | 204 | 8.5 | **−95.8%** |
+| chunks/s | 608 | 818 | **+34.6%** |
+
+This is the ADR's thesis measured directly. The empirical basis above records
+that the streaming throttles buy 2.84x fill for 2.58x frame time — **that trade
+is now gone**: the pool delivers *more* fill (+34.6%) at *fewer* hitches (−95.8%)
+simultaneously. The median frame is unchanged, which is correct — removing a
+per-chunk `FScene::AddPrimitive` was never going to move the median.
+
+**These are not yet an official gate row.** They are not min-spec-proxy protocol,
+and all four legs ran on a contended machine. The direction is unanimous across
+all four runs; the controlled re-run is still owed, and is now worth doing
+because for the first time there is a configuration that might pass.
+
+**What invariant 6 turned out to be worth.** Keeping the CPU path was written
+down as a risk-posture concession. It was not: `voxel.Stream.GPUMaxLevel` and
+`GPUMaxChunks` — which put both renderers in one frame and bisect between them —
+were the two tools that located every hard bug in G3 and G4, including proving
+that the R0 freeze was a pre-existing CPU-path bug the pool merely exposed. The
+component path is therefore **retained after G5, not retired**, and
+`docs/gpu-g4-parity-plan.md` records what still depends on it.
+
+**One correction to the plan this ADR pointed at.** The G4 checklist held that
+every remaining parity item required editing `M_VoxelTerrain.uasset`. That was
+wrong for the two that mattered: the pooled vertex factory owns both ends of the
+vertex-colour pipe, so anything expressible as a vertex colour channel is already
+an interpolant the material graph reads. The asset has not been modified, and
+nothing on the critical path required it. Only the debug tints still do.

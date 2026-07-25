@@ -6,6 +6,7 @@
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
+#include "VoxelGI.h" // pooled-path light field ingest (the component path reaches it via SetChunkQuads)
 #include "VoxelMeshTypes.h"
 // M3 wave 1 (docs/m3-plan.md): role split needs the relay actor (broadcast
 // target) and the player controller (owns the client->server intent RPCs --
@@ -5892,18 +5893,45 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 // oversampled signal. The error is a gentle chunk-to-chunk gradient, not
 // banding. If boundary artifacts ever do show, docs/gpu-g3-integration-plan.md
 // records the two escalations.
-static FVector2f SampleChunkClimateForPool(const USceneComponent& Root,
-                                           const FVector& ChunkOriginRelative,
-                                           int32 Level)
+// It also carries the surface height the pooled shader needs for its
+// biome-tint gate. The component path samples that per chunk too
+// (BuildChunkVertexData's ChunkSurfaceZUU), at the same point -- the chunk
+// centre -- so this is the same number, not an approximation of it.
+//
+// It is returned RELATIVE TO THE CHUNK ORIGIN. The subtraction has to happen
+// here, in double precision, because the absolute value is ~8.4M UU where
+// float32's ULP is 1.0 UU against a 10 UU voxel; the relative value is bounded
+// by the world's height range and is exact in float. This is the same reasoning
+// that puts chunk origins in a rebase frame (docs/gpu-pool-rendering-notes.md
+// invariant 4), applied to the one other absolute coordinate in the table.
+static FVector4f SampleChunkParamsForPool(const USceneComponent& Root,
+                                          const FVector& ChunkOriginRelative,
+                                          int32 Level)
 {
 	const double HalfEdgeUU = 0.5 * VoxelCoords::ChunkEdgeUU * double(int64(1) << Level);
-	const FVector Centre = Root.GetComponentLocation() + ChunkOriginRelative
-	                     + FVector(HalfEdgeUU, HalfEdgeUU, 0.0);
+	const FVector ChunkWorldOrigin = Root.GetComponentLocation() + ChunkOriginRelative;
+	const FVector Centre = ChunkWorldOrigin + FVector(HalfEdgeUU, HalfEdgeUU, 0.0);
 
 	VoxelClimate::EnsureInitialized();
 	const FVoxelClimateBytes Bytes = VoxelClimate::SampleClimateAtWorldUU(Centre.X, Centre.Y);
-	return FVector2f(float(Bytes.Temperature) / 255.0f,
-	                 float(Bytes.Precipitation) / 255.0f);
+
+	// No subsystem -> no gate, matching BuildChunkVertexData's fallback for
+	// transient/loading worlds ("always surface", how it behaved before the gate
+	// existed).
+	float SurfaceZRelUU = UVoxelGpuPoolComponent::kNoSurfaceGate;
+	if (const UWorld* World = Root.GetWorld())
+	{
+		if (const UVoxelWorldSubsystem* Sub = World->GetSubsystem<UVoxelWorldSubsystem>())
+		{
+			const double SurfaceZUU = Sub->GetSurfaceHeightUU(Centre.X, Centre.Y);
+			SurfaceZRelUU = float(SurfaceZUU - ChunkWorldOrigin.Z);
+		}
+	}
+
+	return FVector4f(float(Bytes.Temperature) / 255.0f,
+	                 float(Bytes.Precipitation) / 255.0f,
+	                 SurfaceZRelUU,
+	                 0.0f);
 }
 
 void FVoxelWorldImpl::ReleaseChunkGeometry(VoxelStreaming::FChunkRecord& Rec)
@@ -6014,7 +6042,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		{
 			Rec.PoolSlot = Pool->AddChunk(
 				Packed, FVector3f(OriginInPool), Key.Level,
-				SampleChunkClimateForPool(Root, OriginRelative, Key.Level));
+				SampleChunkParamsForPool(Root, OriginRelative, Key.Level));
 		}
 		else
 		{
@@ -6060,6 +6088,30 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		Rec.bMeshSettled = true;
 		Rec.bHasOverlayBricks =
 			(Key.Level == 0) ? ChunkOwnsEditedBrick(Key.Key) : EditedAncestorChunks[Key.Level].Contains(Key.Key);
+
+		// M4 voxel GI, pooled equivalent of SetChunkQuads' NotifyChunkMeshUpdated.
+		// This branch returns without ever constructing a UVoxelChunkComponent,
+		// so the component hook cannot fire here and, until this call existed,
+		// voxel.Stream.GPU 1 left the light field completely EMPTY -- no chunk
+		// voxelized, no brick solved, voxel.GI.Enabled 1 a silent no-op instead
+		// of a visible difference.
+		//
+		// Placed after the pool accepted the geometry (an INDEX_NONE slot
+		// returns above) and after the last read of Quads, since the quads are
+		// moved out: the GI queue has to own them, there being no component to
+		// read them back off. The origin is the chunk's WORLD origin, the same
+		// quantity GetComponentLocation() yields on the component path and
+		// composed the same way SampleChunkParamsForPool composes it.
+		// With voxel.GI.Enabled 0 this is one cvar read and an immediate
+		// return, before the move.
+		if (UWorld* World = VoxelGI::IsEnabled() ? Owner.GetWorld() : nullptr)
+		{
+			if (UVoxelGISubsystem* GI = World->GetSubsystem<UVoxelGISubsystem>())
+			{
+				GI->NotifyPooledChunkMeshUpdated(Root.GetComponentLocation() + OriginRelative,
+				                                 Key.Level, MoveTemp(Quads));
+			}
+		}
 		return bWasFirstLoad;
 	}
 
@@ -6160,15 +6212,38 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 	int32 Drains = 0;  // total results dequeued incl. stale discards (game-thread-cheap) -- gated by kMaxResultDrainsPerFrame
 	int32 ProxiesCreated = 0;
 	VoxelStreaming::FJobResult Result;
-	while (Applied < MaxApplies && Drains < kMaxResultDrainsPerFrame && ResultsQueue.Dequeue(Result))
+	while (Applied < MaxApplies && Drains < kMaxResultDrainsPerFrame)
 	{
 		// Wall-clock apply budget (see ApplyBudgetSeconds comment). Checked at
 		// the top of each iteration AFTER the min-applies floor: stale discards
 		// below are cheap and don't count against the render budget, but they DO
 		// count toward the wall-clock guard, which is correct -- a frame that
 		// spends its whole budget shovelling stale results should still yield.
+		//
+		// THE BUDGET TEST MUST COME BEFORE THE DEQUEUE, and this used to be the
+		// other way round -- Dequeue() sat in the loop condition, so an
+		// over-budget frame popped a result off the MPSC queue and then broke
+		// out of the body before doing anything with it. TQueue has no push-back
+		// and nothing re-enqueued it, so that result was destroyed on return,
+		// silently: the drop happened before ++ResultsDrainedSinceLog, so no
+		// counter moved. It took the whole tail of the body with it --
+		// FootprintBandCache.Add, FootprintBlindJobInFlight.Remove,
+		// --LevelJobsInFlight[Lvl], and Rec->bJobInFlight = false -- which is
+		// exactly the state the R0 freeze was diagnosed as: a footprint absent
+		// from the band cache AND present in the blind-job set is the precise
+		// conjunction the cold-band throttle defers on forever, and one dropped
+		// result creates both halves in a single step. That is why moving where
+		// the mark is SET could never fix this instance: the leak is entirely on
+		// the result side. The 5 s mark age-out added alongside it is a backstop
+		// for the symptom; this is the cause, and it strands the chunk itself
+		// (pinned bJobInFlight, never re-dispatched) whether or not the mark is
+		// involved, on the component path as much as the pooled one.
 		if (Applied >= kMinAppliesPerFrame &&
 		    (FPlatformTime::Seconds() - ApplyLoopStart) >= ApplyBudgetSeconds)
+		{
+			break;
+		}
+		if (!ResultsQueue.Dequeue(Result))
 		{
 			break;
 		}

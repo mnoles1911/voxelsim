@@ -6892,6 +6892,117 @@ the ring cross-fade (`-VoxelRingCrossFade`, disabled because it had no second LO
 to dissolve into) has the overlap band it always needed. Worth re-testing.
 
 
+## ADR-0006 G4/G5 — parity closed, default flipped, and what the M1 trade-off looks like now (2026-07-25, evening)
+
+Closes the thread opened by the M1 gate re-run above, whose conclusion was
+**"do not tune the dial; remove the trade-off via ADR-0006."** The trade-off is
+now measured on both sides of that dial.
+
+### The G4 checklist was wrong about which items mattered
+
+Three of the four recorded G4 parity items are off-by-default features
+(ring cross-fade, voxel GI, debug tints). The one item that was visibly
+different in ordinary play was on no list at all: **vertex colour R**, the biome
+tint. The pooled vertex factory computed it as a bare `Axis == 2 && positive`
+sky-facing flag, which is neither half of what `BuildChunkVertexData` does —
+`VoxelClimate::BiomeTintForFace` returns **140/255, not 0**, for any non-Z face,
+and the CPU path gates the whole tint on the vertex being within 200 UU of the
+chunk's surface height. So every vertical riser in the world rendered pink-tan
+where the CPU path blends turf, and every underground +Z face (cave floors)
+tinted as open sky.
+
+Measured, 30 s headless run at a fixed anchor, pooled against component, as
+**percentage of pixels differing by more than 8/255**:
+
+| | pixels > 8/255 |
+|---|---|
+| before | **17.4%** |
+| after | **4.3%** |
+| same-path repeat-run noise floor | 1.1% |
+
+The residual is the documented per-chunk (rather than per-quad) climate
+sampling. Method note worth keeping: the before/after screenshots "look the
+same" at a glance and differ by 17%. Diff numerically, always against a
+same-path noise floor.
+
+Also closed: `bVelocityRelevance` was never set on the pooled proxy, so pooled
+terrain contributed nothing to the velocity pass and TSR reprojected all of it
+from depth alone; plus `bUsesLightingChannels`, `bRenderCustomDepth`, and editor
+Wireframe view mode.
+
+**The "material gate" that G4 was organised around was mostly not real.** The
+pooled factory owns both ends of the vertex-colour pipe, so anything expressible
+as a vertex colour channel is already an interpolant the graph reads.
+`M_VoxelTerrain.uasset` was not touched and does not need to be for anything on
+the critical path — including GI. Only the debug tints genuinely still need it.
+
+### The M1 trade-off, measured on both paths
+
+60 s scripted surface flight at 20 m/s, same spawn, post-warmup,
+`voxel.Stream.GPU` the only difference. Two pairs, second run in reverse order.
+
+| | cpu #1 | cpu #2 | pool #1 | pool #2 | mean delta |
+|---|---|---|---|---|---|
+| p50 frame ms | 17.78 | 17.21 | 17.57 | 16.75 | −1.9% |
+| **p95 frame ms** | 29.17 | 51.83 | 24.34 | 21.77 | **−43.1%** |
+| **worst frame ms** | 333.1 | 109.7 | 66.5 | 86.7 | **−65.4%** |
+| **hitches (>33.3 ms)** | 35 | 373 | 11 | 6 | **−95.8%** |
+| chunks/s | 678 | 537 | 839 | 797 | **+34.6%** |
+
+This is the ADR-0006 thesis measured directly, and it is the same shape the
+earlier entry predicted: **fill speed and frame time stop trading against each
+other.** The component path buys 537–678 chunks/s at 35–373 hitches; the pool
+buys 797–839 chunks/s at 6–11. The median frame is unchanged, which is correct
+— removing a per-chunk `FScene::AddPrimitive` was never going to move the median.
+
+**These are NOT gate numbers and must not be quoted as an M1 row.** Two reasons,
+both disqualifying on their own: they are not min-spec-proxy protocol (same
+caveat as the 2026-07-24 runs above), and all four legs ran with other headless
+instances live on the same machine. Most of the spread between the two component
+runs is that contention — informative in itself, since the component path
+degrades far worse under load, but not a controlled measurement. What survives
+the noise is only the direction, and the direction is unanimous: the pool wins on
+p95, worst frame, hitch count and throughput in every one of the four runs.
+
+**The min-spec-proxy M1 gate re-run is therefore still owed**, and it is now
+worth doing, because for the first time there is a configuration that might
+actually pass it.
+
+### G5: default flipped, component path kept
+
+`voxel.Stream.GPU` now defaults to true. Verified with no cvar set at all: 9,822
+chunks, 8,813,242 quads, ONE primitive, ONE draw.
+
+The component path is deliberately **kept, not retired**. It still carries voxel
+GI, the debug tints, the ring cross-fade A/B, several mesh-time diagnostics, and
+— the reason that matters most — it is the fallback that
+`voxel.Stream.GPUMaxLevel` and `GPUMaxChunks` bisect against, which are the two
+sharpest debugging tools this renderer has and both presuppose two renderers
+coexisting in one frame. `voxel.Stream.GPU 0` is a complete revert.
+
+### Streaming: the R0 freeze had a cause upstream of everything diagnosed
+
+`DrainResults` had `ResultsQueue.Dequeue(Result)` in the `while` condition with
+the wall-clock budget check as the first statement of the body. Any frame that
+overran `voxel.Stream.ApplyBudgetMs` popped a result off the MPSC queue and then
+dropped it on the floor — silently, before the drain counter incremented — and
+skipped `FootprintBandCache.Add`, `FootprintBlindJobInFlight.Remove`,
+`--LevelJobsInFlight[Lvl]` and `Rec->bJobInFlight = false`.
+
+A footprint absent from the band cache **and** present in the blind-job set is
+the exact conjunction the cold-band throttle defers on forever, and one dropped
+result creates both halves in a single step. That is why the earlier fix —
+moving where the mark is *set* — could not touch this instance: the leak is
+entirely on the result side. Independently of the mark, the dropped result also
+stranded its own chunk (`bJobInFlight` pinned, never re-dispatched, never
+rendered) on both paths.
+
+Fixed by testing the budget before the dequeue. **Not reproduced under test** —
+the 30 s spawn runs show `markTimeouts=0`, i.e. they never overran the budget
+long enough — so this is a correctness fix argued from the code, not a measured
+before/after. Forcing it needs a low `ApplyBudgetMs`, and is worth doing if the
+symptom recurs.
+
 
 ## Worldgen v8 — the climate half of what v6 did for the surface (2026-07-25)
 

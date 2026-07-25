@@ -23,13 +23,13 @@ public:
 	                        const TArray<uint64>& InQuads,
 	                        const TArray<uint32>& InChunkIds,
 	                        const TArray<FVector4f>& InOrigins,
-	                        const TArray<FVector2f>& InClimate)
+	                        const TArray<FVector4f>& InParams)
 		: FPrimitiveSceneProxy(Component)
 		, VertexFactory(GetScene().GetFeatureLevel())
 		, Quads(InQuads)
 		, ChunkIds(InChunkIds)
 		, Origins(InOrigins)
-		, Climate(InClimate)
+		, Params(InParams)
 		, NumQuads(Component->GetHighWaterMarkQuads())
 		, BufferQuads(InQuads.Num())
 		, NumChunks(InOrigins.Num())
@@ -96,17 +96,17 @@ public:
 		OriginSRV = RHICmdList.CreateShaderResourceView(
 			OriginBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(OriginBuffer));
 
-		TArray<FVector2f> PaddedClimate = Climate;
-		PaddedClimate.SetNumZeroed(MaxChunks);
-		ClimateBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
-			RHICmdList, TEXT("VoxelGpuPool.ChunkClimate"),
+		TArray<FVector4f> PaddedParams = Params;
+		PaddedParams.SetNumZeroed(MaxChunks);
+		ParamsBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
+			RHICmdList, TEXT("VoxelGpuPool.ChunkParams"),
 			EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
-			MakeConstArrayView(PaddedClimate));
-		ClimateSRV = RHICmdList.CreateShaderResourceView(
-			ClimateBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(ClimateBuffer));
+			MakeConstArrayView(PaddedParams));
+		ParamsSRV = RHICmdList.CreateShaderResourceView(
+			ParamsBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(ParamsBuffer));
 
 		VertexFactory.SetQuadBufferSRV(QuadBufferSRV);
-		VertexFactory.SetPoolBuffers(OriginSRV, ChunkIdSRV, ClimateSRV);
+		VertexFactory.SetPoolBuffers(OriginSRV, ChunkIdSRV, ParamsSRV);
 		VertexFactory.InitResource(RHICmdList);
 
 		UE_LOG(LogTemp, Log,
@@ -122,7 +122,16 @@ public:
 		Result.bShadowRelevance = IsShadowCast(View);
 		Result.bRenderInMainPass = ShouldRenderInMainPass();
 		Result.bDynamicRelevance = true;
+		Result.bUsesLightingChannels = GetLightingChannelMask() != GetDefaultLightingChannelMask();
+		Result.bRenderCustomDepth = ShouldRenderCustomDepth();
 		MaterialRelevance.SetPrimitiveViewRelevance(Result);
+		// Must come after SetPrimitiveViewRelevance, which is what fills in
+		// bOpaque. Same expression as FVoxelChunkSceneProxy so the two renderers
+		// contribute to the velocity pass identically -- the factory already
+		// implements VertexFactoryGetPreviousWorldPosition, so the geometry for
+		// it was always there; only the relevance flag that asks for it was
+		// missing, and without it TSR reprojects this terrain from depth alone.
+		Result.bVelocityRelevance = DrawsVelocity() && Result.bOpaque && Result.bRenderInMainPass;
 		return Result;
 	}
 
@@ -154,6 +163,23 @@ public:
 			       NumQuads, Views.Num(), VisibilityMap);
 		}
 
+		// Editor Wireframe view mode, mirroring FVoxelChunkSceneProxy. Without
+		// this the pooled terrain is the one thing in the level that stays solid
+		// when you switch to Wireframe -- which reads as "the pool is drawing
+		// with the wrong material" rather than "wireframe is unimplemented here".
+		// Same blue as the component path, so the two are indistinguishable when
+		// voxel.Stream.GPUMaxLevel puts both renderers in one frame.
+		const bool bWireframe = AllowDebugViewmodes() && ViewFamily.EngineShowFlags.Wireframe;
+		const FMaterialRenderProxy* BatchMaterialProxy = MaterialProxy;
+		if (bWireframe)
+		{
+			auto* WireframeMaterialInstance = new FColoredMaterialRenderProxy(
+				GEngine->WireframeMaterial ? GEngine->WireframeMaterial->GetRenderProxy() : nullptr,
+				FLinearColor(0, 0.5f, 1.f));
+			Collector.RegisterOneFrameMaterialProxy(WireframeMaterialInstance);
+			BatchMaterialProxy = WireframeMaterialInstance;
+		}
+
 		for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ++ViewIndex)
 		{
 			if ((VisibilityMap & (1 << ViewIndex)) == 0)
@@ -163,7 +189,8 @@ public:
 
 			FMeshBatch& Mesh = Collector.AllocateMesh();
 			Mesh.VertexFactory = &VertexFactory;
-			Mesh.MaterialRenderProxy = MaterialProxy;
+			Mesh.MaterialRenderProxy = BatchMaterialProxy;
+			Mesh.bWireframe = bWireframe;
 			Mesh.Type = PT_TriangleList;
 			Mesh.DepthPriorityGroup = SDPG_World;
 			Mesh.bCanApplyViewModeOverrides = false;
@@ -228,7 +255,7 @@ public:
 	// rewritten wholesale rather than tracked range by range.
 	void UpdateChunkTable_RenderThread(FRHICommandListBase& RHICmdList,
 	                                   const TArray<FVector4f>& NewOrigins,
-	                                   const TArray<FVector2f>& NewClimate)
+	                                   const TArray<FVector4f>& NewParams)
 	{
 		if (!OriginBuffer.IsValid() || NewOrigins.Num() > MaxChunks)
 		{
@@ -242,11 +269,11 @@ public:
 			RHICmdList.UnlockBuffer(OriginBuffer);
 		}
 
-		const uint32 ClimateBytes = uint32(NewClimate.Num()) * sizeof(FVector2f);
-		if (void* Dst = RHICmdList.LockBuffer(ClimateBuffer, 0, ClimateBytes, RLM_WriteOnly))
+		const uint32 ParamsBytes = uint32(NewParams.Num()) * sizeof(FVector4f);
+		if (void* Dst = RHICmdList.LockBuffer(ParamsBuffer, 0, ParamsBytes, RLM_WriteOnly))
 		{
-			FMemory::Memcpy(Dst, NewClimate.GetData(), ClimateBytes);
-			RHICmdList.UnlockBuffer(ClimateBuffer);
+			FMemory::Memcpy(Dst, NewParams.GetData(), ParamsBytes);
+			RHICmdList.UnlockBuffer(ParamsBuffer);
 		}
 	}
 
@@ -260,10 +287,10 @@ private:
 	TArray<uint64> Quads;
 	TArray<uint32> ChunkIds;
 	TArray<FVector4f> Origins;
-	TArray<FVector2f> Climate;
+	TArray<FVector4f> Params;
 
-	FBufferRHIRef QuadBuffer, ChunkIdBuffer, OriginBuffer, ClimateBuffer;
-	FShaderResourceViewRHIRef QuadBufferSRV, ChunkIdSRV, OriginSRV, ClimateSRV;
+	FBufferRHIRef QuadBuffer, ChunkIdBuffer, OriginBuffer, ParamsBuffer;
+	FShaderResourceViewRHIRef QuadBufferSRV, ChunkIdSRV, OriginSRV, ParamsSRV;
 
 	mutable bool bLoggedElements = false;
 	int32 NumQuads = 0;      // drawn
@@ -294,8 +321,13 @@ void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 	// Reserve the hidden chunk at index 0. Everything freed points here.
 	ChunkOrigins.Reset();
 	ChunkOrigins.Add(FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
-	ChunkClimate.Reset();
-	ChunkClimate.Add(FVector2f(0.5f, 0.5f));
+	ChunkParams.Reset();
+	// Hidden chunk: neutral climate, and a surface height so far below the chunk
+	// that the shader's surface-proximity gate reads "at the surface" -- matching
+	// BuildChunkVertexData's own fallback when no world subsystem is available.
+	// Nothing is drawn from this entry (scale 0 collapses it), so the values only
+	// have to be harmless.
+	ChunkParams.Add(FVector4f(0.5f, 0.5f, kNoSurfaceGate, 0.0f));
 
 	Allocations.Reset();
 	NumLiveChunks = 0;
@@ -304,7 +336,7 @@ void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 
 int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
                                        const FVector3f& OriginUU, int32 Level,
-                                       const FVector2f& Climate)
+                                       const FVector4f& Params)
 {
 	check(Pool.GetCapacityQuads() > 0);   // InitPool first
 
@@ -322,7 +354,7 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 	const uint32 ChunkId = uint32(ChunkOrigins.Num());
 	const float Scale = float(1 << Level);
 	ChunkOrigins.Add(FVector4f(OriginUU.X, OriginUU.Y, OriginUU.Z, Scale));
-	ChunkClimate.Add(Climate);
+	ChunkParams.Add(Params);
 
 	for (int32 I = 0; I < InQuads.Num(); ++I)
 	{
@@ -450,16 +482,16 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 	}
 	// The chunk table is two small vectors per chunk, so it stays whole.
 	TArray<FVector4f> OriginsCopy = ChunkOrigins;
-	TArray<FVector2f> ClimateCopy = ChunkClimate;
+	TArray<FVector4f> ParamsCopy = ChunkParams;
 
 	ENQUEUE_RENDER_COMMAND(VoxelGpuPoolIncrementalUpdate)(
 		[Proxy, QuadsSlice = MoveTemp(QuadsSlice), IdsSlice = MoveTemp(IdsSlice),
-		 OriginsCopy = MoveTemp(OriginsCopy), ClimateCopy = MoveTemp(ClimateCopy),
+		 OriginsCopy = MoveTemp(OriginsCopy), ParamsCopy = MoveTemp(ParamsCopy),
 		 First, Count, NewNumQuads, bTableDirty](FRHICommandListImmediate& RHICmdList)
 	{
 		if (bTableDirty)
 		{
-			Proxy->UpdateChunkTable_RenderThread(RHICmdList, OriginsCopy, ClimateCopy);
+			Proxy->UpdateChunkTable_RenderThread(RHICmdList, OriginsCopy, ParamsCopy);
 		}
 		Proxy->UpdateQuadRange_RenderThread(RHICmdList, QuadsSlice, IdsSlice,
 		                                    First, Count, NewNumQuads);
@@ -527,7 +559,7 @@ int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& In
 	// the table does not grow on every edit.
 	const uint32 ChunkId = QuadChunkIds[int32(Existing.Offset)];
 	const FVector4f Origin = ChunkOrigins[int32(ChunkId)];
-	const FVector2f Climate = ChunkClimate[int32(ChunkId)];
+	const FVector4f Params = ChunkParams[int32(ChunkId)];
 
 	RemoveChunk(Handle);
 
@@ -616,7 +648,7 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 	}
 
 	FVoxelGpuPoolSceneProxy* Proxy =
-		new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, ChunkOrigins, ChunkClimate);
+		new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, ChunkOrigins, ChunkParams);
 	LiveProxy = Proxy;
 	return Proxy;
 }
