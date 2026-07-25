@@ -1,5 +1,6 @@
 #include "VoxelQuadVertexFactory.h"
 
+#include "VoxelGIVolume.h"
 #include "MeshMaterialShader.h"
 #include "MeshBatch.h"
 #include "MeshDrawShaderBindings.h"
@@ -149,6 +150,18 @@ public:
 		{
 			ShaderBindings.Add(
 				Shader->GetUniformBufferParameter<FVoxelQuadVertexFactoryParameters>(), Uniforms);
+		}
+
+		// The GI volume is a SECOND uniform buffer rather than more members on
+		// the factory's own, which is built once in InitRHI and documented as
+		// needing a re-init to change. This one changes whenever the volume
+		// re-centres. GetUniformBuffer() is never null -- when GI is off it
+		// points at GBlackVolumeTexture with Enabled=0, because an unbound
+		// member is a validation failure rather than a tolerated no-op.
+		if (FRHIUniformBuffer* GIUniforms = GVoxelGIVolume.GetUniformBuffer())
+		{
+			ShaderBindings.Add(
+				Shader->GetUniformBufferParameter<FVoxelGIVolumeParameters>(), GIUniforms);
 		}
 	}
 };

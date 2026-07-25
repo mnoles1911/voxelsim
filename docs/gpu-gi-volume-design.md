@@ -318,8 +318,27 @@ pooled path every pop misses, so unbounded it walks `RemoveAt(0)` through the
 whole ~2000-entry queue every frame — O(n^2) memmove producing nothing. Pops are
 now capped at 8x the refresh budget, which never binds on the component path.
 
-**Step 1 — resource + known pattern + per-pixel sample, no real data.** Fill the
-volume with a world-space checkerboard (`A=255`, RGB alternating per brick).
+**Step 1 — resource + known pattern + per-pixel sample, no real data. DONE.**
+Volume, second uniform buffer, `TEXCOORD1` interpolant and the per-pixel fold
+into `.g`, plus `voxel.GI.VolumeTest` to fill a per-brick checkerboard.
+
+*Result:* the checker renders. Measured as percentage of pixels differing by
+more than 8/255, at a fixed anchor: **28.6% and 28.3%** against two independent
+`voxel.GI.Volume 0` control runs, with a **1.83%** same-binary repeat-run noise
+floor. So the volume is created, bound, reachable **from the pixel shader**,
+correctly addressed, and pool-space precision is adequate -- and the off path
+sits at the noise floor.
+
+Two things the picture showed that are worth knowing before step 2. At N=64 the
+volume only covers +/-1280 UU, and `AM_Clamp` means everything beyond that
+samples the edge texels, which reads as large smeared bands rather than as a
+hard cutoff -- easy to mistake for a bug in the addressing when it is the
+sampler doing exactly what it was asked. And the fade constants are derived from
+the volume extent, so they shrink with `voxel.GI.VolumeDim`; step 4 and risk 8
+are the same issue seen from the other end.
+
+*(Original plan for this step, kept for the reasoning:)* Fill the volume with a
+world-space checkerboard (`A=255`, RGB alternating per brick).
 *Why:* this is the "does the same pool draw known-good data?" rung of the
 diagnostic ladder. A crisp 3.2 m checker aligned to chunk boundaries proves
 creation, binding, PS reachability, UVW mapping, origin, and pool-space precision
