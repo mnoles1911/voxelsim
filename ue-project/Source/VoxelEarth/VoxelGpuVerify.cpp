@@ -604,6 +604,9 @@ namespace
 #include "GameFramework/Pawn.h"
 #include "Engine/World.h"
 #include "Engine/Engine.h"
+#include "DrawDebugHelpers.h"
+#include "Engine/StaticMesh.h"
+#include "Components/StaticMeshComponent.h"
 #include "UnrealClient.h"
 #include "TimerManager.h"
 
@@ -729,7 +732,61 @@ namespace
 			FVector CamLoc = FVector::ZeroVector;
 			FRotator CamRot = FRotator::ZeroRotator;
 			PC->GetPlayerViewPoint(CamLoc, CamRot);
-			SpawnLocation = CamLoc + CamRot.Vector() * 2000.0 + FVector(0, 0, 800);
+			SpawnLocation = CamLoc + CamRot.Vector() * 2000.0 + FVector(0, 0, -700);
+		}
+
+		// CONTROL EXPERIMENT: "voxel.GPU.SpawnTestChunk control" puts an ordinary
+		// engine cube at the SAME place instead of the GPU chunk.
+		//
+		// Worth its few lines. Everything so far has assumed the test rig is
+		// sound -- that the spawn point is in view, lit, and not inside a hill.
+		// That assumption has never been checked, and if it is wrong then every
+		// "invisible" result so far says nothing about the draw path. A stock
+		// static mesh either shows up or it does not, and either answer is
+		// worth more than another round of guessing at the renderer.
+		const bool bControl = Args.ContainsByPredicate(
+			[](const FString& A) { return A.Equals(TEXT("control"), ESearchCase::IgnoreCase); });
+		if (bControl)
+		{
+			AActor* ControlActor = World->SpawnActor<AActor>(
+				AActor::StaticClass(), SpawnLocation, FRotator::ZeroRotator);
+			UStaticMeshComponent* SM = NewObject<UStaticMeshComponent>(ControlActor);
+			ControlActor->SetRootComponent(SM);
+			// Try both cube paths and SAY which one worked. The first version of
+			// this control silently did nothing when the mesh failed to load,
+			// which would have made "the control is invisible too" a false
+			// negative -- the worst possible outcome for a control experiment.
+			UStaticMesh* Cube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+			if (Cube == nullptr)
+			{
+				Cube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/EngineMeshes/Cube.Cube"));
+			}
+			UE_LOG(LogVoxelGpuVerify, Log, TEXT("CONTROL: cube mesh %s"),
+			       Cube ? *Cube->GetPathName() : TEXT("FAILED TO LOAD"));
+			if (Cube)
+			{
+				SM->SetStaticMesh(Cube);
+				SM->SetWorldScale3D(FVector(20.0));   // 20 m cube
+			}
+			SM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+			SM->RegisterComponent();
+			// MUST come after RegisterComponent. SetRootComponent on a freshly
+			// NewObject'd component installs it with an IDENTITY transform, and
+			// since the root component is what defines the actor's location,
+			// that silently teleports the actor to the world origin -- 8,448 km
+			// from the camera in this test.
+			SM->SetWorldLocation(SpawnLocation);
+			// Second, asset-free control: a persistent debug box. It goes through
+			// an entirely different rendering path from static meshes, so if the
+			// box appears and the cube does not, the fault is in the mesh/asset
+			// side; if NEITHER appears, the location itself is not visible.
+			DrawDebugBox(World, SpawnLocation, FVector(1000.0), FColor::Red, true, -1.0f, 0, 50.0f);
+			DrawDebugSphere(World, SpawnLocation, 800.0f, 16, FColor::Yellow, true, -1.0f, 0, 40.0f);
+
+			UE_LOG(LogVoxelGpuVerify, Log,
+			       TEXT("CONTROL: stock cube + debug box/sphere at %s. If NONE of them are ")
+			       TEXT("visible, the test rig is at fault, not the GPU draw path."),
+			       *SpawnLocation.ToString());
 		}
 
 		AActor* Actor = World->SpawnActor<AActor>(AActor::StaticClass(), SpawnLocation, FRotator::ZeroRotator);
@@ -745,6 +802,9 @@ namespace
 		Comp->SetChunkLevel(0);
 		Comp->SetQuads(Rebased);
 		Comp->RegisterComponent();
+		// See the control above: without this the chunk sits at the world
+		// origin regardless of where the actor was spawned.
+		Comp->SetWorldLocation(SpawnLocation);
 
 		UE_LOG(LogVoxelGpuVerify, Log,
 		       TEXT("Spawned a GPU-drawn chunk at %s: %d quads, %d triangles, drawn with no vertex ")
@@ -766,8 +826,29 @@ namespace
 		if (bWantScreenshot)
 		{
 			FTimerHandle Handle;
-			World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([]()
+			TWeakObjectPtr<UWorld> WeakWorld(World);
+			const FVector SpawnedAt = SpawnLocation;
+			World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([WeakWorld, SpawnedAt]()
 			{
+				// Log where the camera is NOW, not where it was at spawn time.
+				// The control cube being invisible proves the rig is wrong, and
+				// the likeliest reason is that the view moves between the
+				// command running at startup and the screenshot 3 s later --
+				// leaving everything spawned 20 m from where the camera used
+				// to be.
+				if (UWorld* W = WeakWorld.Get())
+				{
+					if (APlayerController* PC = W->GetFirstPlayerController())
+					{
+						FVector CamLoc = FVector::ZeroVector;
+						FRotator CamRot = FRotator::ZeroRotator;
+						PC->GetPlayerViewPoint(CamLoc, CamRot);
+						UE_LOG(LogVoxelGpuVerify, Log,
+						       TEXT("AT SCREENSHOT: camera %s rot %s | spawned at %s | distance %.0f UU"),
+						       *CamLoc.ToString(), *CamRot.ToString(), *SpawnedAt.ToString(),
+						       FVector::Dist(CamLoc, SpawnedAt));
+					}
+				}
 				FScreenshotRequest::RequestScreenshot(false);
 				UE_LOG(LogVoxelGpuVerify, Log, TEXT("Screenshot requested (Saved/Screenshots/)"));
 			}), 3.0f, false);

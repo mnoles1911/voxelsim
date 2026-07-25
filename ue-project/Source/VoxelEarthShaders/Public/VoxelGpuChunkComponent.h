@@ -42,6 +42,20 @@ public:
 
 	//~ UPrimitiveComponent
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
+
+	// REQUIRED, and easy to miss. FMeshBatch::Validate calls
+	// PrimitiveSceneProxy::VerifyUsedMaterial, which checks the material
+	// against the list the component declared here. A component that declares
+	// nothing has every one of its mesh batches rejected -- silently, before
+	// it ever reaches a mesh pass.
+	virtual void GetUsedMaterials(TArray<UMaterialInterface*>& OutMaterials,
+	                              bool bGetDebugMaterials = false) const override;
+
+	// The material this chunk draws with. Null falls back to the default
+	// surface material.
+	void SetChunkMaterial(UMaterialInterface* InMaterial);
+
+	UMaterialInterface* GetChunkMaterialOrDefault() const;
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
 	//~ End UPrimitiveComponent
 
@@ -50,4 +64,7 @@ private:
 
 	UPROPERTY()
 	int32 ChunkLevel = 0;
+
+	UPROPERTY()
+	TObjectPtr<UMaterialInterface> ChunkMaterial = nullptr;
 };

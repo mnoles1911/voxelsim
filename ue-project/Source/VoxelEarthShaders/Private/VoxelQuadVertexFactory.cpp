@@ -40,7 +40,7 @@ void FVoxelQuadVertexFactory::ModifyCompilationEnvironment(
 
 	// Set to 1 to replace all geometry with one 20 m quad -- see the
 	// VOXEL_VF_DEBUG_QUAD block in VoxelQuadVertexFactory.ush. Off by default.
-	OutEnvironment.SetDefine(TEXT("VOXEL_VF_DEBUG_QUAD"), 1);
+	OutEnvironment.SetDefine(TEXT("VOXEL_VF_DEBUG_QUAD"), 0);
 }
 
 void FVoxelQuadVertexFactory::InitRHI(FRHICommandListBase& RHICmdList)

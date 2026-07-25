@@ -9,6 +9,8 @@
 #include "SceneManagement.h"
 #include "RHIResourceUtils.h"
 #include "DataDrivenShaderPlatformInfo.h"
+#include "MaterialShared.h"
+#include "Materials/MaterialRenderProxy.h"
 
 namespace
 {
@@ -37,12 +39,18 @@ public:
 		, LevelScale(float(1 << InLevel))
 		, MaterialProxy(nullptr)
 	{
-		UMaterialInterface* Material = Component->GetMaterial(0);
-		if (Material == nullptr)
-		{
-			Material = UMaterial::GetDefaultMaterial(MD_Surface);
-		}
+		UMaterialInterface* Material = Component->GetChunkMaterialOrDefault();
 		MaterialProxy = Material->GetRenderProxy();
+
+		// Register the material for FMeshBatch::Validate's VerifyUsedMaterial
+		// check. Without this the batch is dropped before any mesh pass sees it.
+		#if !(UE_BUILD_SHIPPING)
+		{
+			TArray<UMaterialInterface*> UsedForVerification;
+			UsedForVerification.Add(Material);
+			SetUsedMaterialForVerification(UsedForVerification);
+		}
+		#endif
 		MaterialRelevance = Material->GetRelevance_Concurrent(GetScene().GetFeatureLevel());
 	}
 
@@ -127,6 +135,26 @@ public:
 			UE_LOG(LogTemp, Warning,
 			       TEXT("VoxelGpuChunk: GetDynamicMeshElements called — %d views, %d quads, SRV %s"),
 			       Views.Num(), NumQuads, QuadBufferSRV.IsValid() ? TEXT("valid") : TEXT("NULL"));
+
+			// THE DECISIVE CHECK. The batch dies between AddMesh and shader
+			// binding, and by far the most likely reason is that the material's
+			// shader map has no entry for this vertex factory type -- which is
+			// precisely the case the pass processor handles by silently
+			// dropping the batch. Ask the shader map directly instead of
+			// inferring it from a blank screen.
+			const ERHIFeatureLevel::Type FeatureLevel = GetScene().GetFeatureLevel();
+			const FMaterialRenderProxy* Fallback = MaterialProxy;
+			const FMaterial& Mat = MaterialProxy->GetMaterialWithFallback(FeatureLevel, Fallback);
+			const FMaterialShaderMap* ShaderMap = Mat.GetRenderingThreadShaderMap();
+			const FMeshMaterialShaderMap* MeshMap =
+				ShaderMap ? ShaderMap->GetMeshShaderMap(VertexFactory.GetType()) : nullptr;
+
+			UE_LOG(LogTemp, Warning,
+			       TEXT("VoxelGpuChunk: material '%s' fellBack=%d shaderMap=%s meshShaderMapForVF=%s"),
+			       *Mat.GetFriendlyName(),
+			       (Fallback != MaterialProxy) ? 1 : 0,
+			       ShaderMap ? TEXT("present") : TEXT("NULL"),
+			       MeshMap ? TEXT("PRESENT") : TEXT("MISSING <-- batch will be dropped"));
 		}
 
 		for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ++ViewIndex)
@@ -199,6 +227,23 @@ void UVoxelGpuChunkComponent::SetChunkLevel(int32 InLevel)
 	ChunkLevel = InLevel;
 	MarkRenderStateDirty();
 	UpdateBounds();
+}
+
+void UVoxelGpuChunkComponent::GetUsedMaterials(TArray<UMaterialInterface*>& OutMaterials,
+                                              bool bGetDebugMaterials) const
+{
+	OutMaterials.Add(GetChunkMaterialOrDefault());
+}
+
+void UVoxelGpuChunkComponent::SetChunkMaterial(UMaterialInterface* InMaterial)
+{
+	ChunkMaterial = InMaterial;
+	MarkRenderStateDirty();
+}
+
+UMaterialInterface* UVoxelGpuChunkComponent::GetChunkMaterialOrDefault() const
+{
+	return ChunkMaterial ? ChunkMaterial.Get() : UMaterial::GetDefaultMaterial(MD_Surface);
 }
 
 FPrimitiveSceneProxy* UVoxelGpuChunkComponent::CreateSceneProxy()
