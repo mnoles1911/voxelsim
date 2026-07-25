@@ -246,3 +246,47 @@ Water surface is a separate, near-identical task to the terrain pool.
 2. **Never A/B this renderer through scalability cvars.** `r.ShadowQuality 0`
    desyncs the BeginPlay PSO precache and measures precache invalidation instead.
    Change one primitive flag, or use `r.ScreenPercentage`.
+
+## R0 admission: one hypothesis tested and disproven (2026-07-25)
+
+`voxel.Stream.LogAdmission 1` now prints the loop state per level per
+`RecomputeDesiredSet` call. Under `voxel.Stream.GPU` it shows:
+
+```
+R0[scan=1 rej=4582 q=512 def=1]
+R0[scan=1 rej=4070 q=512 def=1]
+R0[scan=1 rej=3558 q=512 def=1]    ... -512 per pass, ending def=0 q=0
+```
+
+Read that carefully, because it kills the two readings that came before it:
+
+- **The refill trigger is not stuck.** R0 re-enumerates on nearly every call
+  (a level-0 chunk is 3.2 m, so the anchor crosses one constantly), takes
+  exactly its `Cap/4` = 512 pass budget, and correctly re-arms `def=1`. My
+  earlier "the deferred flag is cleared too eagerly" reading was wrong.
+- **`DropFarthestOverCap` is not eating the records either.** `kRingCapShare[0]`
+  is 0.25 and `Cap` is 2048, so R0's queue cap is *also* 512 -- the same number
+  as the pass budget. I hypothesised admission was filling a full queue and the
+  trim was deleting what it had just created, and added a guard refusing to
+  admit into a ring queue already at its cap. **It changed nothing**: R0 stayed
+  at `total=408` and the CPU path stayed at `3398`, byte-identical. The queue
+  goes 0 -> 512 *within* a pass, so it never exceeds the cap and the trim never
+  fires. Guard reverted rather than left in shared admission code unproven.
+
+So the live contradiction, stated precisely for whoever picks this up:
+
+> Across ~9 passes R0 rejects 512 fewer candidates each time, which can only
+> mean 512 more of them now hold records. That implies ~4,600 R0 records exist.
+> But `tracked` (11,323) minus the R1-R5 totals (10,800) leaves ~520 -- about
+> ONE pass worth. So R0 records are being created and then removed somewhere
+> between admission and dispatch, and the rejection count still falls as though
+> they had survived.
+
+Resolve that first; it is the whole bug. The two counters to reconcile are
+`RecordsAddedSinceLog` against `RecordsDroppedSinceLog` / `RecordsEvictedSinceLog`,
+per level -- neither is currently broken out by level, and that is the next
+instrumentation to add rather than the next fix to guess at.
+
+Reminder that this is a **CPU-path bug too**: the component path only looks
+healthy because the loop spins slower there. Any fix wants a measured
+before/after on both paths.
