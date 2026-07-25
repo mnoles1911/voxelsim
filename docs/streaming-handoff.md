@@ -17,27 +17,37 @@ handoff. Build is clean; every change below is in the binary.
 | ADR-0006 | ✅ **ACCEPTED**, signed by Matt, diagnosis measured not asserted |
 | G0 sizing study | ✅ Delivered — `docs/gpu-g0-sizing.md` |
 | Terrain amplification proposal | ⏸️ Reconciled and PARKED — `docs/terrain-amplification-reconciliation.md` |
-| **G1 — GPU greedy mesher** | ⬜ **NEXT. Not started.** |
+| **G1 — GPU greedy mesher** | ✅ **COMPLETE. Gate green.** (was mis-recorded as unstarted) |
+| **G2 — GPU geometry in UE** | ⬜ **NEXT.** Nothing GPU exists inside the engine yet. |
 
-## The one thing to build next: G1
+## G1 is done — do not rebuild it
 
-**Goal:** implement the deterministic GPU greedy mesher so geometry can be
-produced entirely on the GPU, and gate it on byte-identical quad streams vs the
-CPU mesher.
+Re-verified 2026-07-25 by running the gate:
 
-- **Spec:** `docs/gpu-mesher-design.md` — `MeshCountMain` → scan → `MeshEmitMain`,
-  one thread per face-mask. Fully speced, previously unbuilt.
-- **It may already be partly done.** `voxel-core/shaders/prebuilt/` contains
-  `MeshCountMain.spv` and `MeshEmitMain.spv`, and the M0 gate harness already
-  chains them. **Check what exists before writing anything** — G1 may be mostly
-  "wire the existing kernels into UE via RDG" rather than "write the kernel".
-- **Gate:** bench meshes N regions CPU and GPU with byte-identical quad streams
-  (joins the existing columns+cells digest). AMD leg green.
-- **Verify with:** `build/voxel-core-msvc/bench/vxc_gpu.exe --radius 64`
-  (already built, runs in ~140 ms + verification). Current digest at radius 64 is
-  `591c7602bb9b0e62` on **worldgen v6**.
+```
+build/voxel-core-msvc/bench/vxc_gpu.exe --radius 64
+```
+```
+GATE radius=64m: 0.147 s (target: <1.000 s) -> PASS
+verified 319/319 tiles (100.0%): 5226496 columns, 289406976 cells,
+  3058001/3058001 quads compared
+GATE output digest (columns + cells + quads): 591c7602bb9b0e62
+PASS: GPU output bit-exact with the CPU reference
+```
 
-### Constraints G1/G2 must respect (found in G0, do not rediscover)
+The full chain — `ColumnMain` → `VoxelizeMain` → `MeshCountMain` → GPU scan
+(`ScanBlocks`/`ScanSums`/`ScanAdd`) → `MeshEmitMain` — is implemented, and the
+**quad stream is byte-identical to the CPU mesher**, which is precisely the G1
+gate in `docs/gpu-streaming-plan.md`. The kernels shipped 2026-07-21; the
+prebuilt SPIR-V is in `voxel-core/shaders/prebuilt/`. The scan is already on the
+GPU, so even the "CPU scan first" fallback in `gpu-mesher-design.md` was skipped.
+
+**The actual gap is that none of it exists inside Unreal.** The kernels run only
+in the standalone Vulkan bench, compiled by `dxc` outside the engine. Everything
+downstream (G2 pool + custom draw, G3 cascade) needs them running as UE global
+shaders through RDG first.
+
+### Constraints G2/G3 must respect (found in G0, do not rediscover)
 
 1. **G2 must compact into ONE indirect draw.** `FMeshDrawCommand::SubmitDrawIndirectEnd`
    issues exactly one indirect draw per command, and

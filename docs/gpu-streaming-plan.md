@@ -37,18 +37,45 @@ kernels chain end-to-end at runtime resolution.
   option — viable / not viable and why.
 - **Gate:** numbers produced; no code on the hot path yet. Cheap to abort.
 
-## G1 — GPU greedy mesher kernel (`gpu-mesher-design.md`) + digest parity
+## G1 — GPU greedy mesher kernel (`gpu-mesher-design.md`) + digest parity ✅ COMPLETE
 
-**Goal:** build the deterministic mesher kernel so geometry can be produced
-entirely on the GPU.
+**Status: DONE (kernels landed 2026-07-21; gate re-verified 2026-07-25).**
 
-- Implement `MeshCountMain` → scan → `MeshEmitMain` (count→scan→emit, one thread
-  per face-mask) exactly as speced. Scan on CPU first if it ships faster; move
-  to GPU scan when readback shows in profiles.
-- **Gate:** bench meshes N regions CPU and GPU, **byte-identical quad streams**
-  (combined digest joins the existing columns+cells digest). This is the
-  kernel-correctness insurance of ADR-0006 invariant 3 — earned once here, not
-  required per-frame later. AMD leg green; NVIDIA CI leg green.
+- `MeshCountMain` → scan → `MeshEmitMain` implemented exactly as speced, one
+  thread per face-mask. The scan went **straight to the GPU**
+  (`ScanBlocksMain`/`ScanSumsMain`/`ScanAddMain`) — the "CPU scan for v1"
+  fallback was never needed.
+- **Gate: GREEN.** `vxc_gpu.exe --radius 64` compares 3,058,001 of 3,058,001
+  quads over 319/319 tiles, byte-identical to the CPU mesher. Combined digest
+  (columns + cells + quads) `591c7602bb9b0e62`, seed 20260719, worldgen v6.
+  End-to-end 0.147 s against the <1 s M0 target. AMD leg green.
+- **NVIDIA CI leg is still owed** — the only unmet part of the original gate.
+
+**Carried into G2:** the kernels exist only in the standalone Vulkan bench,
+compiled by `dxc` outside the engine. They have never run inside Unreal. Porting
+the HLSL to UE global shaders + RDG is the first task of G2, not a G1 remnant.
+
+## G2a — The kernels, in-engine, through RDG *(prerequisite; added 2026-07-25)*
+
+**Goal:** run the G1 chain inside Unreal and prove it still produces the same
+bytes. Nothing renders. This is the bridge between a green standalone bench and
+any of the rendering work below, and it is the cheapest place to discover that
+engine-compiled HLSL diverges from `dxc`-compiled HLSL.
+
+- Register a shader directory for the `VoxelEarth` module; get `worldgen.hlsl`
+  compiling as UE global compute shaders (D3D12/SM6) with whatever `#ifdef`
+  work the Vulkan-specific syntax needs. **The HLSL must stay one source of
+  truth** — the bench and the engine compile the same file, or the digest gate
+  stops meaning anything.
+- Dispatch `ColumnMain` → `VoxelizeMain` → `MeshCount` → scan → `MeshEmit` as
+  RDG passes for a single chunk; read the quad buffer back.
+- **Gate:** a console command (`voxel.GPU.VerifyChunk`) meshes the chunk under
+  the player on both paths and logs a byte-comparison PASS/FAIL plus the quad
+  digest. Must match the CPU mesher exactly.
+- **Why this is its own milestone:** it is verifiable *headlessly* — no PIE
+  flying, no visual judgement, no designer time. If engine-compiled output
+  diverges, we find out here, against a known-good reference, instead of inside
+  a half-built renderer where a wrong quad looks like a pool-allocator bug.
 
 ## G2 — Persistent GPU geometry pool + custom draw (one static chunk on screen)
 
