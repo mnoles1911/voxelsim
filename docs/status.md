@@ -6508,3 +6508,98 @@ worldgen output.
    while the default is 64 and `SightRadiusUU()` silently clamps to 64 â€” so
    raising it from `-ExecCmds` does nothing, invisibly. Not touched here.
 
+
+## Worldgen v8 — the climate half of what v6 did for the surface (2026-07-25)
+
+Branch `claude/climate-v8` off `main` (v6). Steps 0–2c landed; the
+`worldgen.ush` mirror + SPIR-V respin (2d) is deliberately outstanding, see
+"Not done" below. **This branch must not merge until 2d lands** — until then
+CPU and GPU disagree.
+
+**The defect.** `tiles.h` described `ClimateSample` as a "service-defined
+encoding, see terrain-service", so voxel-core did not know the encoding it was
+reading. Real tiles carry physical WorldClim values quantized over
+Earth-extreme ranges (`diffusion.py` `EXPECTED_CHANNELS`); `SyntheticTileSampler`
+emitted noise centred on 128. Every threshold over those bytes was calibrated
+against the second and pointed at the first. `kBiomePrecipAridU8 = 60` decoded
+to 2824 mm/yr — wetter than the Amazon — so every column took the arid branch
+and the three below it were dead code.
+
+**Measured with `vxc_climateprobe` (new, step 0a) over the 25-tile diffusion
+set, seed 20260719:**
+
+| | v6 | v8 | predicted |
+|---|---|---|---|
+| submarine terrain classified alpine | 17.8% | **0.00%** | 0% |
+| cliff gate share of world | 51.1% | **6.50%** | ~6.5% |
+| land with zero topsoil | 91.3% | **0.00%** | 0% |
+| top voxel showing its biome material | 12.4% | **100.00%** | ≥95% |
+| biome ids reachable | 5/9 | **7/10** | ≥6 |
+
+Census after: OCEAN 44.7, TUNDRA_ALPINE 21.7, TEMPERATE_FOREST 19.9,
+BARE_ROCK 6.5, TAIGA 4.2, GRASSLAND 2.3, BEACH 0.7. DESERT/SAVANNA/RAINFOREST
+stay 0% — correct, the region has no arid or tropical pixels.
+
+**Correction to the original diagnosis.** The topsoil collapse was attributed to
+the encoding mismatch. It was not: measured, the v6 formula produced zero
+topsoil on **85.5% of SYNTHETIC land** — the encoding it was written for. The
+dominant fault was `- slopeMmPerPx / 4`, an absolute subtraction that swamps the
+base at any realistic 30 m-pixel slope. The encoding mismatch took it from 85%
+to 91%. So the fix repairs the dev/bench path too, and the cliff gate and the
+topsoil slope term are the same miscalibration: both treated 30 m-pixel slopes
+as far gentler than they are.
+
+**Golden movement, predicted vs actual — all six as predicted, nothing else
+moved:** `amplifier_columns`, `amplifier_deep_materials`, `biome_map`,
+`mips_chain`, `coarsegen`, `rivernet_synthetic_slope`. Held still:
+every `test_hash` golden, and `amplifier_surface_bound` /
+`amplifier_solid_below_bound` — the sharp tripwires, since a move would mean the
+change had leaked into the surface term. The 25 `.vxtl` files are byte-identical;
+nothing here touches the wire format.
+
+**Two things the tests caught that the design did not.** `BARE_ROCK → MAT_ROCK`
+made cliff columns read rock → SUBSOIL → rock, a soil layer sandwiched under a
+rock skin; `stratigraphyAt` now carries rock through the subsoil band, which
+also resolved `coarsegen_fidelity_vs_true_mip` (it had exceeded its
+material-mismatch ceiling). And `subsoilMm` derived from the pre-clamp topsoil,
+so a floored column got the unfloored value's subsoil.
+
+**`kBiomeTreelineBaseMm = 900'000` is TUNED, not derived** — the only such
+constant in `biome.h`. Swept against the real tiles the alpine share barely
+responds (48.6% of land at 300 m, 39.9% at 900 m, 35.0% at 1200 m) because the
+region is genuinely cold and mountainous. Settle it by screenshot; it is the
+constant to move if the world reads too bare.
+
+**Not done (tracked):**
+1. **`worldgen.ush` mirror + SPIR-V respin + `vxc_gpu` on AMD/NVIDIA.** The
+   blocker for merging. Contested with the in-flight ADR-0006 G-phase work, so
+   it gets exactly one coordinated edit. Also carries the three stale `11250`
+   guard comments left from step 0b.
+2. **Rivernet (step 3).** `rivernet.cpp` weights flow accumulation by the raw
+   precipitation byte against `accumThreshold = 500`. 2a already moved its
+   golden; step 3 rescales the weight to mm/yr and rolls `kRiverNetVersion`.
+3. **Render-side calibration (step 4).** Re-derive `VoxelClimateProbe.h`'s
+   `kTempU8Lo/Hi`/`kPrecipU8Lo/Hi` from `climate.h` so they stop being a third
+   independent calibration. Pick endpoints that reproduce today's 100/189/14/32
+   exactly, so it is a provable no-op on rendered output.
+4. **GPU harness cannot see real tiles.** `gpu_harness.cpp` and
+   `VoxelGpuVerify.cpp` take a concrete `SyntheticTileSampler&`, so GPU parity
+   can never exercise the real-tile climate regime. Mitigated for now by 2a
+   making the synthetic emission span every threshold. Worth doing before
+   ADR-0006 makes the GPU path authoritative.
+5. **Scale-dependent slope thresholds.** `slopeMmPerPx` is proportional to
+   `pixelSizeMm`, so the cliff gate, the topsoil retention term and
+   `slopeScaleQ10`/`microScaleQ10` all change meaning at scale 8. Latent —
+   only scale 1 exists. Do all three together, before generating scale-8 tiles.
+6. **Narrow `diffusion.py`'s bio_12 range** from 0..12000 to ~0..4000 mm/yr.
+   Precipitation occupies 23 of 256 codes (1 LSB = 47 mm/yr), coarser than the
+   distinctions the thresholds draw. Changes tile bytes → GPU rental +
+   `provider_id` roll, so attach it as a rider to the next paid pregen run.
+
+**Lesson.** Calibration constants outlive the data they were calibrated
+against. Four independent climate calibrations had drifted apart here
+(`biome.h`, its HLSL copy, `VoxelClimateProbe`'s remap, `gen_terrain_textures`'
+LUT), and the render side worked around the voxel side rather than fixing it —
+`VoxelClimateProbe.h:127` says so outright: "that is voxel-core's to fix and
+this change does not touch it." Write thresholds in units that say what they
+mean, and measure before reasoning.
