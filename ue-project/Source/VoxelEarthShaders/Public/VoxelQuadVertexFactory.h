@@ -26,8 +26,21 @@
 // because it would be a different, unbound symbol. Black terrain, no error.
 BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadVertexFactoryParameters, )
 	SHADER_PARAMETER_SRV(StructuredBuffer<uint2>, QuadBuffer)
+	// Single-chunk framing (the G2 component). Ignored when PoolMode is 1.
 	SHADER_PARAMETER(FVector3f, ChunkOriginUU)
 	SHADER_PARAMETER(float, LevelScale)
+
+	// POOL MODE: many chunks, one factory, one draw.
+	//
+	// ChunkOrigins holds one entry per resident chunk (xyz = origin in unreal
+	// units, w = mip scale). QuadChunkIds names the owning chunk for every quad
+	// in the pool. The vertex shader then needs NO per-draw state at all --
+	// which is what lets a single draw span every chunk, and is why this uses
+	// SRVs in the uniform buffer rather than loose per-element parameters
+	// (which do not bind; see docs/gpu-g2-draw-path.md).
+	SHADER_PARAMETER_SRV(StructuredBuffer<float4>, ChunkOrigins)
+	SHADER_PARAMETER_SRV(StructuredBuffer<uint>, QuadChunkIds)
+	SHADER_PARAMETER(uint32, PoolMode)
 END_GLOBAL_SHADER_PARAMETER_STRUCT()
 
 // Per-chunk framing, bound PER DRAW rather than per factory.
@@ -41,6 +54,9 @@ struct FVoxelChunkDrawData
 {
 	FVector3f ChunkOriginUU = FVector3f::ZeroVector;
 	float LevelScale = 1.0f;
+	FShaderResourceViewRHIRef ChunkOriginsSRV;
+	FShaderResourceViewRHIRef QuadChunkIdsSRV;
+	bool bPoolMode = false;
 };
 
 class VOXELEARTHSHADERS_API FVoxelQuadVertexFactory : public FVertexFactory
@@ -68,11 +84,23 @@ public:
 		LevelScale = InLevelScale;
 	}
 
+	// Switches the factory to pool mode: per-quad chunk ids index a per-chunk
+	// origin table, so one factory serves every chunk in the pool.
+	void SetPoolBuffers(FShaderResourceViewRHIRef InOrigins, FShaderResourceViewRHIRef InChunkIds)
+	{
+		ChunkOriginsSRV = MoveTemp(InOrigins);
+		QuadChunkIdsSRV = MoveTemp(InChunkIds);
+		bPoolMode = true;
+	}
+
 	FRHIUniformBuffer* GetUniformBuffer() const { return UniformBuffer.GetReference(); }
 
 private:
 	FShaderResourceViewRHIRef QuadBufferSRV;
 	FVector3f ChunkOriginUU = FVector3f::ZeroVector;
 	float LevelScale = 1.0f;
+	FShaderResourceViewRHIRef ChunkOriginsSRV;
+	FShaderResourceViewRHIRef QuadChunkIdsSRV;
+	bool bPoolMode = false;
 	TUniformBufferRef<FVoxelQuadVertexFactoryParameters> UniformBuffer;
 };

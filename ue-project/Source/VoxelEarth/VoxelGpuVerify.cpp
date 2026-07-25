@@ -600,6 +600,7 @@ namespace
 // ---------------------------------------------------------------------------
 
 #include "VoxelGpuChunkComponent.h"
+#include "VoxelGpuPoolComponent.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/Pawn.h"
 #include "Engine/World.h"
@@ -615,6 +616,70 @@ namespace
 
 namespace
 {
+	// Re-bases packed quads from BRICK-LOCAL to region-local coordinates.
+	//
+	// greedyMask packs slice/u0/v0 inside a single 8x8x8 brick and leaves the
+	// brick's origin implied by the mask index, so the raw stream piles all
+	// bricks into one 8-voxel cube. The CPU mesher does this same re-basing
+	// when it converts vxc::Quad to FVoxelChunkQuad.
+	//
+	// This is a G2 stopgap: fine for a test chunk, but G3 must do it GPU-side
+	// (or have MeshEmit bake it) rather than round-tripping quads through the
+	// CPU, which is exactly what ADR-0006 is trying to stop doing.
+	TArray<uint64> RebaseQuadsToRegionLocal(const FVoxelGpuRegionResult& Gpu,
+	                                        uint32 BricksX, uint32 BricksY)
+	{
+		const uint32 InteriorX = BricksX - 2;
+		const uint32 InteriorY = BricksY - 2;
+
+		TArray<uint64> Rebased;
+		Rebased.Reserve(Gpu.Quads.Num());
+
+		for (int32 MaskIndex = 0; MaskIndex < Gpu.QuadCounts.Num(); ++MaskIndex)
+		{
+			const uint32 Count = Gpu.QuadCounts[MaskIndex];
+			if (Count == 0)
+			{
+				continue;
+			}
+			const uint32 Start = Gpu.QuadOffsets[MaskIndex];
+
+			// maskIndex = meshBrickIndex * 48 + axis * 16 + dir * 8 + slice
+			const uint32 MeshBrickIndex = uint32(MaskIndex) / 48u;
+			const uint32 Ix = MeshBrickIndex % InteriorX;
+			const uint32 Iy = (MeshBrickIndex / InteriorX) % InteriorY;
+			const uint32 Iz = MeshBrickIndex / (InteriorX * InteriorY);
+
+			// Interior brick (ix,iy,iz) is region brick (ix+1, iy+1, iz+1).
+			const uint32 BrickOrigin[3] = { (Ix + 1u) * 8u, (Iy + 1u) * 8u, (Iz + 1u) * 8u };
+
+			for (uint32 Q = 0; Q < Count; ++Q)
+			{
+				const uint64 Packed = Gpu.Quads[int32(Start + Q)];
+				const uint32 W0 = uint32(Packed & 0xffffffffull);
+				const uint32 W1 = uint32(Packed >> 32);
+
+				const uint32 Axis  =  W0        & 0xfu;
+				const uint32 Dir   = (W0 >>  4) & 0xfu;
+				const uint32 Slice = (W0 >>  8) & 0xffu;
+				const uint32 U0    = (W0 >> 16) & 0xffu;
+				const uint32 V0    = (W0 >> 24) & 0xffu;
+
+				const uint32 U = (Axis + 1u) % 3u;
+				const uint32 V = (Axis + 2u) % 3u;
+
+				const uint32 NewSlice = Slice + BrickOrigin[Axis];
+				const uint32 NewU0    = U0    + BrickOrigin[U];
+				const uint32 NewV0    = V0    + BrickOrigin[V];
+
+				const uint32 NewW0 = Axis | (Dir << 4) | (NewSlice << 8)
+				                   | (NewU0 << 16) | (NewV0 << 24);
+				Rebased.Add(uint64(NewW0) | (uint64(W1) << 32));
+			}
+		}
+		return Rebased;
+	}
+
 	void SpawnTestChunkCommand(const TArray<FString>& Args, UWorld* World)
 	{
 		if (World == nullptr)
@@ -650,75 +715,9 @@ namespace
 			return;
 		}
 
-		// RE-BASE THE QUADS FROM BRICK-LOCAL TO REGION-LOCAL.
-		//
-		// greedyMask packs slice/u0/v0 as coordinates inside one 8x8x8 brick and
-		// leaves the brick's own origin implied by the mask index. Uploading the
-		// raw stream therefore piles all 144 bricks into a single 8-voxel cube --
-		// which is exactly what the first screenshot showed: a 0.8 m speck where
-		// a 6.4 m chunk should have been.
-		//
-		// The CPU mesher does this same re-basing when it converts vxc::Quad to
-		// FVoxelChunkQuad. Doing it here on the CPU is a G2 stopgap: it is fine
-		// for one test chunk, but G3 must do it GPU-side (or have MeshEmit bake
-		// it) rather than round-tripping quads through the CPU, which is the
-		// whole thing ADR-0006 is trying to stop doing.
-		const uint32 BricksX = kRegions[0].Width / 8;
-		const uint32 BricksY = kRegions[0].Height / 8;
-		const uint32 InteriorX = BricksX - 2;
-		const uint32 InteriorY = BricksY - 2;
+		const TArray<uint64> Rebased = RebaseQuadsToRegionLocal(
+			Gpu, kRegions[0].Width / 8, kRegions[0].Height / 8);
 
-		TArray<uint64> Rebased;
-		Rebased.Reserve(Gpu.Quads.Num());
-
-		for (int32 MaskIndex = 0; MaskIndex < Gpu.QuadCounts.Num(); ++MaskIndex)
-		{
-			const uint32 Count = Gpu.QuadCounts[MaskIndex];
-			if (Count == 0)
-			{
-				continue;
-			}
-			const uint32 Start = Gpu.QuadOffsets[MaskIndex];
-
-			// maskIndex = meshBrickIndex * 48 + axis * 16 + dir * 8 + slice
-			const uint32 MeshBrickIndex = uint32(MaskIndex) / 48u;
-			const uint32 Ix = MeshBrickIndex % InteriorX;
-			const uint32 Iy = (MeshBrickIndex / InteriorX) % InteriorY;
-			const uint32 Iz = MeshBrickIndex / (InteriorX * InteriorY);
-
-			// Interior brick (ix,iy,iz) is region brick (ix+1, iy+1, iz+1) --
-			// the +1 skips the halo brick that supplies apron reads.
-			const uint32 BrickOrigin[3] = { (Ix + 1u) * 8u, (Iy + 1u) * 8u, (Iz + 1u) * 8u };
-
-			for (uint32 Q = 0; Q < Count; ++Q)
-			{
-				const uint64 Packed = Gpu.Quads[int32(Start + Q)];
-				const uint32 W0 = uint32(Packed & 0xffffffffull);
-				const uint32 W1 = uint32(Packed >> 32);
-
-				const uint32 Axis  =  W0        & 0xfu;
-				const uint32 Dir   = (W0 >>  4) & 0xfu;
-				const uint32 Slice = (W0 >>  8) & 0xffu;
-				const uint32 U0    = (W0 >> 16) & 0xffu;
-				const uint32 V0    = (W0 >> 24) & 0xffu;
-
-				const uint32 U = (Axis + 1u) % 3u;
-				const uint32 V = (Axis + 2u) % 3u;
-
-				// Each coordinate shifts by the brick origin along ITS OWN axis:
-				// slice runs along Axis, u0 along U, v0 along V.
-				const uint32 NewSlice = Slice + BrickOrigin[Axis];
-				const uint32 NewU0    = U0    + BrickOrigin[U];
-				const uint32 NewV0    = V0    + BrickOrigin[V];
-
-				const uint32 NewW0 = Axis | (Dir << 4) | (NewSlice << 8)
-				                   | (NewU0 << 16) | (NewV0 << 24);
-				Rebased.Add(uint64(NewW0) | (uint64(W1) << 32));
-			}
-		}
-
-		// Put it in front of wherever the player is looking, well clear of the
-		// ground so it reads against the sky.
 		// Positioned from the CAMERA, not the pawn.
 		//
 		// The pawn's actor forward is not necessarily where the player is
@@ -921,4 +920,98 @@ namespace
 		TEXT("Mesh a region on the GPU and draw it in front of the player through the GPU vertex "
 		     "factory (no vertex/index buffer). The G2 visual check."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&SpawnTestChunkCommand));
+}
+
+
+// ---------------------------------------------------------------------------
+// voxel.GPU.SpawnPool <N> — the ADR-0006 shape, demonstrated
+//
+// Puts N chunks into ONE pool, drawn by ONE primitive in ONE draw call. The
+// single-chunk command proves geometry is correct; this proves the thing the
+// ADR is actually for: that how many chunks are resident has no bearing on how
+// many primitives or draws the renderer sees.
+//
+// It meshes ONE region on the GPU and places that geometry at N different
+// origins. Re-meshing N distinct regions would cost N times the setup and
+// prove nothing extra about the DRAW path, which is what is under test here.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+	void SpawnPoolCommand(const TArray<FString>& Args, UWorld* World)
+	{
+		if (World == nullptr || !VoxelGpuWorldGen::IsSupportedOnCurrentRHI())
+		{
+			UE_LOG(LogVoxelGpuVerify, Error, TEXT("No world, or SM6 unavailable."));
+			return;
+		}
+
+		const int32 NumChunks = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), 1, 4096) : 64;
+
+		vxc::SyntheticTileSampler Tiles(kSeed);
+		vxc::SyntheticTileSampler CpuTiles(kSeed);
+		vxc::Amplifier CpuAmp(kSeed, CpuTiles);
+
+		TArray<vxc::ColumnSample> CpuColumns;
+		const FVoxelGpuRegionRequest Req = BuildRequest(kRegions[0], CpuAmp, Tiles, CpuColumns);
+		const FVoxelGpuRegionResult Gpu = VoxelGpuWorldGen::RunRegionBlocking(Req);
+		if (!Gpu.bOk || Gpu.Quads.IsEmpty())
+		{
+			UE_LOG(LogVoxelGpuVerify, Error, TEXT("GPU mesh failed: %s"), *Gpu.Error);
+			return;
+		}
+
+		const TArray<uint64> Rebased = RebaseQuadsToRegionLocal(Gpu, kRegions[0].Width / 8, kRegions[0].Height / 8);
+
+		FVector SpawnLocation = FVector::ZeroVector;
+		if (APlayerController* PC = World->GetFirstPlayerController())
+		{
+			FVector CamLoc; FRotator CamRot;
+			PC->GetPlayerViewPoint(CamLoc, CamRot);
+			SpawnLocation = CamLoc + CamRot.Vector() * 3000.0 + FVector(0, 0, -900);
+		}
+
+		UMaterialInterface* TerrainMaterial = Cast<UMaterialInterface>(StaticLoadObject(
+			UMaterialInterface::StaticClass(), nullptr,
+			TEXT("/Game/Voxel/M_VoxelTerrain.M_VoxelTerrain")));
+
+		AActor* Actor = World->SpawnActor<AActor>(AActor::StaticClass(), SpawnLocation, FRotator::ZeroRotator);
+		UVoxelGpuPoolComponent* Pool = NewObject<UVoxelGpuPoolComponent>(Actor);
+		Actor->SetRootComponent(Pool);
+		Pool->SetChunkMaterial(TerrainMaterial);
+
+		// Lay the chunks out in a grid. 640 UU = 6.4 m is the region edge, so
+		// they tile without overlapping.
+		const int32 Side = FMath::CeilToInt(FMath::Sqrt(double(NumChunks)));
+		for (int32 I = 0; I < NumChunks; ++I)
+		{
+			const int32 Gx = I % Side;
+			const int32 Gy = I / Side;
+			Pool->AddChunk(Rebased, FVector3f(float(Gx) * 640.0f, float(Gy) * 640.0f, 0.0f), 0);
+		}
+
+		Pool->RegisterComponent();
+		Pool->SetWorldLocation(SpawnLocation);
+
+		UE_LOG(LogVoxelGpuVerify, Log,
+		       TEXT("Pool: %d chunks, %d quads, %d triangles in ONE primitive at %s"),
+		       Pool->GetNumChunks(), Pool->GetNumQuads(), Pool->GetNumQuads() * 2,
+		       *SpawnLocation.ToString());
+
+		if (Args.ContainsByPredicate(
+			[](const FString& A) { return A.Equals(TEXT("shot"), ESearchCase::IgnoreCase); }))
+		{
+			FTimerHandle Handle;
+			World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([]()
+			{
+				FScreenshotRequest::RequestScreenshot(false);
+			}), 3.0f, false);
+		}
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GVoxelGpuSpawnPoolCmd(
+		TEXT("voxel.GPU.SpawnPool"),
+		TEXT("Put N chunks in one GPU pool drawn by ONE primitive in ONE draw call. "
+		     "Usage: voxel.GPU.SpawnPool [N] [shot]"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&SpawnPoolCommand));
 }

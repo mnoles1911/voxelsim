@@ -90,9 +90,22 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	const uint CornerIndex = Input.VertexId % VOXEL_VERTICES_PER_QUAD;
 
 	const uint2 Packed = VoxelVF.QuadBuffer[QuadIndex];
-	const FVoxelQuadVertex Decoded = DecodeVoxelQuadVertex(Packed, CornerIndex, VoxelVF.LevelScale);
 
-	Intermediates.Position = Decoded.PositionUU + VoxelVF.ChunkOriginUU;
+	// In pool mode every quad names its own chunk, so one draw can span the
+	// whole pool with no per-draw state. In single-chunk mode the framing comes
+	// from the uniform buffer instead.
+	float3 ChunkOrigin = VoxelVF.ChunkOriginUU;
+	float ChunkScale = VoxelVF.LevelScale;
+	if (VoxelVF.PoolMode != 0u)
+	{
+		const uint ChunkId = VoxelVF.QuadChunkIds[QuadIndex];
+		const float4 Entry = VoxelVF.ChunkOrigins[ChunkId];
+		ChunkOrigin = Entry.xyz;
+		ChunkScale = Entry.w;
+	}
+
+	const FVoxelQuadVertex Decoded = DecodeVoxelQuadVertex(Packed, CornerIndex, ChunkScale);
+	Intermediates.Position = Decoded.PositionUU + ChunkOrigin;
 
 // TEMPORARY BISECT (VOXEL_VF_DEBUG_QUAD). Replaces all real geometry with one
 // large flat quad at the primitive origin. If this shows up and the real

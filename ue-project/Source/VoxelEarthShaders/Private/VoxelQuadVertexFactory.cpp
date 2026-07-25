@@ -74,6 +74,11 @@ void FVoxelQuadVertexFactory::InitRHI(FRHICommandListBase& RHICmdList)
 		Parameters.QuadBuffer = QuadBufferSRV;
 		Parameters.ChunkOriginUU = ChunkOriginUU;
 		Parameters.LevelScale = LevelScale;
+		Parameters.PoolMode = bPoolMode ? 1u : 0u;
+		// Both SRVs must be non-null even in single-chunk mode: an unbound SRV
+		// in a uniform buffer is a validation failure, not a tolerated no-op.
+		Parameters.ChunkOrigins = ChunkOriginsSRV.IsValid() ? ChunkOriginsSRV : QuadBufferSRV;
+		Parameters.QuadChunkIds = QuadChunkIdsSRV.IsValid() ? QuadChunkIdsSRV : QuadBufferSRV;
 		UniformBuffer = TUniformBufferRef<FVoxelQuadVertexFactoryParameters>::CreateUniformBufferImmediate(
 			Parameters, UniformBuffer_MultiFrame);
 	}
