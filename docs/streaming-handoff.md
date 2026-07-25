@@ -65,10 +65,14 @@ So R0 is not failing to *draw* 3,000 chunks -- it never *meshes* them. `tracked`
 is correspondingly lower (11,323 vs 16,417), and `bandCache` is 171 vs 1,288.
 Records are going missing upstream of any geometry handoff.
 
-And it is specifically R0-being-pooled that hurts R0: with
-`voxel.Stream.GPUMaxLevel 0` (only R0 pooled, R1-R5 on components) R0 falls
-further still, to 178. Whatever this is, it is triggered by a level-0 chunk
-taking the pooled branch, not by the pool's size or by the coarse rings.
+It is specifically R0-being-pooled that costs R0. With
+`voxel.Stream.GPUMaxLevel 0` -- only R0 pooled, R1-R5 left on components --
+R0 is `total=408 load=255`, **identical** to pooling every level, and R1-R5 are
+untouched. So the trigger is a level-0 chunk taking the pooled branch, and the
+loss does not depend on pool size, chunk count, or the coarse rings at all.
+That an 8x smaller pool reproduces the number exactly is the strongest clue
+available: this is a per-chunk logic difference, not a resource or throughput
+effect.
 
 Things checked and NOT the cause: `DropFarthestOverCap`'s admission guard (a
 never-meshed chunk has neither a component nor a pool slot, so `HoldsGeometry()`
