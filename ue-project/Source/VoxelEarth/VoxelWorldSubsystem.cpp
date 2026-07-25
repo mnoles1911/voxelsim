@@ -6,6 +6,7 @@
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
+#include "VoxelGI.h" // pooled-path light field ingest (the component path reaches it via SetChunkQuads)
 #include "VoxelMeshTypes.h"
 // M3 wave 1 (docs/m3-plan.md): role split needs the relay actor (broadcast
 // target) and the player controller (owns the client->server intent RPCs --
@@ -6087,6 +6088,30 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		Rec.bMeshSettled = true;
 		Rec.bHasOverlayBricks =
 			(Key.Level == 0) ? ChunkOwnsEditedBrick(Key.Key) : EditedAncestorChunks[Key.Level].Contains(Key.Key);
+
+		// M4 voxel GI, pooled equivalent of SetChunkQuads' NotifyChunkMeshUpdated.
+		// This branch returns without ever constructing a UVoxelChunkComponent,
+		// so the component hook cannot fire here and, until this call existed,
+		// voxel.Stream.GPU 1 left the light field completely EMPTY -- no chunk
+		// voxelized, no brick solved, voxel.GI.Enabled 1 a silent no-op instead
+		// of a visible difference.
+		//
+		// Placed after the pool accepted the geometry (an INDEX_NONE slot
+		// returns above) and after the last read of Quads, since the quads are
+		// moved out: the GI queue has to own them, there being no component to
+		// read them back off. The origin is the chunk's WORLD origin, the same
+		// quantity GetComponentLocation() yields on the component path and
+		// composed the same way SampleChunkParamsForPool composes it.
+		// With voxel.GI.Enabled 0 this is one cvar read and an immediate
+		// return, before the move.
+		if (UWorld* World = VoxelGI::IsEnabled() ? Owner.GetWorld() : nullptr)
+		{
+			if (UVoxelGISubsystem* GI = World->GetSubsystem<UVoxelGISubsystem>())
+			{
+				GI->NotifyPooledChunkMeshUpdated(Root.GetComponentLocation() + OriginRelative,
+				                                 Key.Level, MoveTemp(Quads));
+			}
+		}
 		return bWasFirstLoad;
 	}
 
