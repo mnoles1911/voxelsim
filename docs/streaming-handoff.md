@@ -20,23 +20,50 @@ and verified headless.
 
 ## Start here
 
-G3 is wired and the pooled cascade renders, but it does not match the CPU path
-yet: **coarse-ring chunks draw as large flat slabs.** That is the next problem.
-Reproduce it with
+G3 is wired and the pooled cascade renders. **One bug is left, and it is
+precisely located: the R0 ring stops populating.**
 
-```
-... -ExecCmds="voxel.Stream.GPU 1, voxel.Debug.ShotIn 30"
-```
+Same 30 s headless run, same spawn, only `voxel.Stream.GPU` differing:
 
-Likely suspects, in order: mip-ring chunks pass `Key.Level` straight into
-`AddChunk` as the table's `w` (scale), so a wrong level or a skirt quad that
-belongs to a neighbouring chunk resolves against the wrong origin; and ring
-cross-fade, which the pooled path does not implement at all (it lives in the
-per-chunk MID the pool has no equivalent of -- see the G4 blockers below).
+| Ring | CPU path | GPU pool |
+|---|---|---|
+| **R0** | **1947** loaded, 0 pending | **255** loaded, 2 pending |
+| R1 | 1319 | 1319 |
+| R2 | 1602 | 1602 |
+| R3 | 1853 | 1853 |
+| R4 | 1675 | 1675 |
+| R5 | 1426 | 1426 |
 
-`voxel.Stream.GPUMaxChunks N` caps pool admission so the streamed path can be
-bisected at the small scale `voxel.GPU.SpawnPool` is known good at. That is what
-proved the earlier blank screen was not a scale problem.
+Every coarser ring is byte-identical. Only R0 differs, and `pending` is ~0, so
+it is **not** a throughput stall -- the cascade simply stops *asking* for R0
+chunks. That makes this a desired-set / admission bookkeeping difference, not a
+rendering one, and it is why the picture still looks wrong: the near-field
+detail never arrives, leaving the coarse rings' exposed interiors on screen as
+large flat slabs. Chasing the slabs is chasing the symptom.
+
+Already ruled out:
+
+- **Coverage/retention** (`ReplacementCovered`) keys on `bMeshSettled`, not on
+  the component, so it is already path-agnostic.
+- **The three load-bearing `Component.IsValid()` sites** now ask
+  `FChunkRecord::HoldsGeometry()` instead (retention gate, unload budget, and
+  the record-drop check -- that last one would have leaked pool allocations).
+- **Throughput.** The ~170 MB-per-update copy bug that did throttle streaming is
+  fixed; it took the pool from 2893 to 8130 chunks and R0 pending from 66 to 2.
+  R0's *loaded* count barely moved, which is what shows the remaining problem is
+  admission, not speed.
+
+Worth noting `tracked` is also lower under the pool (11,323 vs 16,417), so
+records are going missing, not just geometry.
+
+Two tools for narrowing it:
+
+- `voxel.Stream.GPUMaxLevel N` pools only rings <= N and leaves the rest on the
+  component path. Both renderers coexist per chunk, so R0 can be isolated
+  directly.
+- `voxel.Stream.GPUMaxChunks N` caps pool admission, so the streamed path can be
+  run at the small scale `voxel.GPU.SpawnPool` is known good at. That is what
+  proved the earlier blank screen was never a scale problem.
 
 Two things G3 uses that already exist and are easy to miss:
 
