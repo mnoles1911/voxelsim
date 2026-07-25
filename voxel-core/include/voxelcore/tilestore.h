@@ -24,7 +24,7 @@ namespace vxc {
 //   version  u16 (1)
 //   seed     u64
 //   x, y     i32  tile coords (tile (0,0) covers pixels [0,512) each axis)
-//   scale    u8   (1 => 30m/px, 8 => 11.25m/px)
+//   scale    u8   (1 => 30m/px, 8 => 3.75m/px -- see tilePixelSizeMm below)
 //   size     u16  (512)
 //   elevation int16[size*size], row-major, y outer, metres
 //   climate   uint8[4][size*size]  (temperature, seasonality, precipitation,
@@ -57,8 +57,15 @@ struct TileData {
 // mm-per-pixel by scale; must match terrain-service's
 // tile_codec.PIXEL_SIZE_MM and ITileSampler::pixelSizeMm's contract. Returns
 // 0 for unsupported scales.
+//
+// scale is a SUPERSAMPLE factor on the pinned 30 m checkpoint, so scale 8 is
+// 30 m / 8 = 3.75 m/px = 3750 mm. The old 11250 was 90 m / 8, left over from
+// the superseded 90 m model -- wrong by 3x. tile_codec.py and tiles.h were
+// corrected when that was found; THIS copy was missed, in the one file
+// tile_codec.py's own mirror comment names. No scale-8 tile has ever been
+// generated, so no cached tile is affected and no golden moves.
 constexpr int32_t tilePixelSizeMm(uint8_t scale) {
-    return scale == 1 ? 30000 : (scale == 8 ? 11250 : 0);
+    return scale == 1 ? 30000 : (scale == 8 ? 3750 : 0);
 }
 
 // Reads a whole file into memory. Returns nullopt on any I/O failure.

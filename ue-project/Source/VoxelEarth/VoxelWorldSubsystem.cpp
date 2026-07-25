@@ -904,7 +904,7 @@ std::unique_ptr<vxc::ITileSampler> MakeTileSampler(uint64 Seed, const FString& T
 	if (vxc::tilePixelSizeMm((uint8)TileScale) == 0)
 	{
 		UE_LOG(LogVoxelEarth, Error,
-		       TEXT("-VoxelTileScale=%d is not a supported tile scale (only 1 [30m/px] or 8 [11.25m/px] are valid) -- ")
+		       TEXT("-VoxelTileScale=%d is not a supported tile scale (only 1 [30m/px] or 8 [3.75m/px] are valid) -- ")
 		       TEXT("falling back to the synthetic sampler."),
 		       TileScale);
 		return std::make_unique<vxc::SyntheticTileSampler>(Seed);

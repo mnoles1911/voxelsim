@@ -347,9 +347,18 @@ VXC_TEST(amplifier_surfaceMm_matches_column) {
 }
 
 VXC_TEST(amplifier_surface_bound_adversarial) {
-    // Four environments: both real tile pixel sizes (30 m scale-1 and 11.25 m
-    // scale-8, which give DIFFERENT corner-grid shapes for the same footprint)
-    // crossed with different world seeds.
+    // Four environments: two tile pixel sizes (30 m and 11.25 m, which give
+    // DIFFERENT corner-grid shapes for the same footprint) crossed with
+    // different world seeds.
+    //
+    // 11250 is NOT the scale-8 pixel size -- that is 3750 (30 m / 8; see
+    // tilestore.h's tilePixelSizeMm). It is kept here purely as a second,
+    // arbitrary pixel size that exercises a different corner-grid shape,
+    // because GOLDEN(amplifier_surface_bound) is pinned against it and that
+    // digest is explicitly NOT worldgen output -- re-pinning it is a separate
+    // deliberate decision, not a free rider on a worldgen bump. FOLLOW-UP: add
+    // a 3750 environment so the real scale-8 shape is covered too; that is a
+    // new environment (and a re-pin), not an edit to this one.
     struct Env {
         uint64_t seed;
         int32_t pixelMm;

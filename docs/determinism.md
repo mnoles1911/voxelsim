@@ -15,7 +15,7 @@ deliberate.
 | World voxel coords | voxels, +z up, z=0 is sea level | `int64_t` |
 | Elevation / depths | millimetres | `int32_t` / `int64_t` |
 | Tile elevation | metres (signed, sea level = 0) | `int16_t` per pixel |
-| Tile pixel size | mm (30000 at scale 1, 11250 at scale 8) | `int32_t` |
+| Tile pixel size | mm (30000 at scale 1, 3750 at scale 8 — scale is a supersample factor on the 30 m checkpoint) | `int32_t` |
 | Climate channels | temperature, seasonality, precipitation, precip variability | `uint8_t` × 4 |
 
 Rounding rules:
