@@ -1066,10 +1066,14 @@ namespace
 			[](const FString& A) { return A.Equals(TEXT("shot"), ESearchCase::IgnoreCase); }))
 		{
 			FTimerHandle Handle;
+			// 10 s, not 3. The pool is spawned into the live streamed world, so
+			// a shot taken before the CPU cascade has filled shows half-loaded
+			// terrain around the pool and invites blaming the pool for it --
+			// which is exactly what happened once.
 			World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([]()
 			{
 				FScreenshotRequest::RequestScreenshot(false);
-			}), 3.0f, false);
+			}), 10.0f, false);
 		}
 	}
 

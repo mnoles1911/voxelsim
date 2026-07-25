@@ -519,6 +519,29 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 	// from the start. Only [0, HighWaterMark) is ever drawn.
 	TArray<uint64> UsedQuads = PooledQuads;
 	TArray<uint32> UsedIds = QuadChunkIds;
+
+	// What is actually about to be drawn, in terms the eye cannot check. A
+	// pooled draw has no per-chunk state, so when it renders wrong the only
+	// way to tell "the CPU tables are bad" from "the shader reads them wrong"
+	// is to print the tables.
+	{
+		const int32 Drawn = int32(Pool.GetHighWaterMark());
+		int32 HiddenQuads = 0, OutOfRangeQuads = 0;
+		uint32 MaxIdSeen = 0;
+		for (int32 I = 0; I < Drawn; ++I)
+		{
+			const uint32 Id = UsedIds[I];
+			HiddenQuads += (Id == kHiddenChunkId) ? 1 : 0;
+			OutOfRangeQuads += (Id >= uint32(ChunkOrigins.Num())) ? 1 : 0;
+			MaxIdSeen = FMath::Max(MaxIdSeen, Id);
+		}
+		UE_LOG(LogTemp, Log,
+		       TEXT("VoxelGpuPool upload: drawn=%d hidden=%d outOfRange=%d maxId=%u "
+		            "tableEntries=%d hiddenEntry=(%.1f,%.1f,%.1f,scale=%.3f)"),
+		       Drawn, HiddenQuads, OutOfRangeQuads, MaxIdSeen, ChunkOrigins.Num(),
+		       ChunkOrigins[0].X, ChunkOrigins[0].Y, ChunkOrigins[0].Z, ChunkOrigins[0].W);
+	}
+
 	FVoxelGpuPoolSceneProxy* Proxy =
 		new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, ChunkOrigins, ChunkClimate);
 	LiveProxy = Proxy;
