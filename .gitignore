@@ -33,3 +33,11 @@ ue-project/.vsconfig
 # fetched toolchains
 tools/dxc/
 tools/vulkan-headers/
+
+# Throwaway harness output. Headless runs are driven by piping editor stdout to
+# a file per experiment (A-baseline.stdout, perf-on1.stdout, ...); they are
+# scratch for one comparison and must never be committed.
+*.stdout
+
+# Tile-cache archives. Regenerated from the seed, and large.
+tile-cache-*.tar.gz
