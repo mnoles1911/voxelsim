@@ -20,6 +20,16 @@ if(NOT MSVC)
   target_compile_options(vxc_terrainprobe PRIVATE -Wall -Wextra -Werror)
 endif()
 
+# --- vxc_climateprobe: climate/biome/stratigraphy diagnostic. Channel
+# percentiles in u8 AND physical units, biome census WITH gate attribution,
+# topsoil depth, and the top-voxel material histogram -- the numeric readout
+# behind "the biome material never reaches the player". ---------------------
+add_executable(vxc_climateprobe climateprobe.cpp)
+target_link_libraries(vxc_climateprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_climateprobe PRIVATE -Wall -Wextra -Werror)
+endif()
+
 # --- vxc_editlog: offline edit-log stats/compact/verify tool (M3 groundwork,
 # docs/status.md) -----------------------------------------------------------
 add_executable(vxc_editlog editlog_tool.cpp)
