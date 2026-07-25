@@ -132,6 +132,8 @@ public:
 			FMeshBatchElement& Element = Mesh.Elements[0];
 			Element.IndexBuffer = nullptr;
 			Element.FirstIndex = 0;
+			// Up to the high-water mark only: everything above it has never
+			// been written, so there is nothing there to draw.
 			Element.NumPrimitives = uint32(NumQuads) * 2;
 			Element.MinVertexIndex = 0;
 			Element.MaxVertexIndex = uint32(NumQuads) * 6 - 1;
@@ -169,19 +171,49 @@ UVoxelGpuPoolComponent::UVoxelGpuPoolComponent()
 	SetCollisionEnabled(ECollisionEnabled::NoCollision);
 }
 
+void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
+{
+	Pool.Init(CapacityQuads);
+	PooledQuads.SetNumZeroed(int32(CapacityQuads));
+	QuadChunkIds.SetNumZeroed(int32(CapacityQuads));
+
+	// Reserve the hidden chunk at index 0. Everything freed points here.
+	ChunkOrigins.Reset();
+	ChunkOrigins.Add(FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
+
+	Allocations.Reset();
+	NumLiveChunks = 0;
+	LocalBounds = FBox(ForceInit);
+}
+
 int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
                                        const FVector3f& OriginUU, int32 Level)
 {
-	const int32 ChunkIndex = ChunkOrigins.Num();
+	check(Pool.GetCapacityQuads() > 0);   // InitPool first
+
+	const FVoxelGpuPoolAllocation Alloc = Pool.Alloc(uint32(InQuads.Num()));
+	if (!Alloc.IsValid())
+	{
+		// Out of CONTIGUOUS room, which is not the same as out of space --
+		// see FVoxelGpuGeometryPool. The caller decides whether to compact.
+		UE_LOG(LogTemp, Warning,
+		       TEXT("VoxelGpuPool: no room for %d quads (%u free, largest run %u)"),
+		       InQuads.Num(), Pool.GetFreeQuads(), Pool.GetLargestFreeRun());
+		return INDEX_NONE;
+	}
+
+	const uint32 ChunkId = uint32(ChunkOrigins.Num());
 	const float Scale = float(1 << Level);
 	ChunkOrigins.Add(FVector4f(OriginUU.X, OriginUU.Y, OriginUU.Z, Scale));
 
-	PooledQuads.Append(InQuads);
-	QuadChunkIds.Reserve(QuadChunkIds.Num() + InQuads.Num());
 	for (int32 I = 0; I < InQuads.Num(); ++I)
 	{
-		QuadChunkIds.Add(uint32(ChunkIndex));
+		PooledQuads[int32(Alloc.Offset) + I] = InQuads[I];
+		QuadChunkIds[int32(Alloc.Offset) + I] = ChunkId;
 	}
+
+	const int32 Handle = Allocations.Add(Alloc);
+	++NumLiveChunks;
 
 	// Grow the bounds by this chunk's extent. A chunk's quads never leave its
 	// own 32-voxel cube, scaled by the mip level.
@@ -192,15 +224,38 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 
 	MarkRenderStateDirty();
 	UpdateBounds();
-	return ChunkIndex;
+	return Handle;
+}
+
+void UVoxelGpuPoolComponent::RemoveChunk(int32 Handle)
+{
+	if (!Allocations.IsValidIndex(Handle) || !Allocations[Handle].IsValid())
+	{
+		return;
+	}
+
+	const FVoxelGpuPoolAllocation Alloc = Allocations[Handle];
+
+	// Point the freed quads at the hidden chunk (scale 0) so they collapse to
+	// a degenerate point rather than continuing to draw stale geometry.
+	for (uint32 I = 0; I < Alloc.NumQuads; ++I)
+	{
+		QuadChunkIds[int32(Alloc.Offset + I)] = kHiddenChunkId;
+	}
+
+	Pool.Free(Alloc);
+	Allocations[Handle] = FVoxelGpuPoolAllocation{};
+	--NumLiveChunks;
+
+	MarkRenderStateDirty();
 }
 
 void UVoxelGpuPoolComponent::ClearChunks()
 {
-	PooledQuads.Reset();
-	QuadChunkIds.Reset();
-	ChunkOrigins.Reset();
-	LocalBounds = FBox(ForceInit);
+	if (Pool.GetCapacityQuads() > 0)
+	{
+		InitPool(Pool.GetCapacityQuads());
+	}
 	MarkRenderStateDirty();
 	UpdateBounds();
 }
@@ -224,11 +279,15 @@ void UVoxelGpuPoolComponent::GetUsedMaterials(TArray<UMaterialInterface*>& OutMa
 
 FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 {
-	if (PooledQuads.IsEmpty())
+	if (Pool.GetHighWaterMark() == 0)
 	{
 		return nullptr;
 	}
-	return new FVoxelGpuPoolSceneProxy(this, PooledQuads, QuadChunkIds, ChunkOrigins);
+	// Only the used prefix is uploaded; the reserved tail has never been written.
+	const int32 Used = int32(Pool.GetHighWaterMark());
+	TArray<uint64> UsedQuads(PooledQuads.GetData(), Used);
+	TArray<uint32> UsedIds(QuadChunkIds.GetData(), Used);
+	return new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, ChunkOrigins);
 }
 
 FBoxSphereBounds UVoxelGpuPoolComponent::CalcBounds(const FTransform& LocalToWorld) const

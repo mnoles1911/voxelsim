@@ -19,6 +19,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/PrimitiveComponent.h"
+#include "VoxelGpuGeometryPool.h"
 #include "VoxelGpuPoolComponent.generated.h"
 
 UCLASS(ClassGroup = Rendering, meta = (BlueprintSpawnableComponent))
@@ -29,16 +30,32 @@ class VOXELEARTHSHADERS_API UVoxelGpuPoolComponent : public UPrimitiveComponent
 public:
 	UVoxelGpuPoolComponent();
 
+	// Sets the pool's capacity in quads. Must be called before the first
+	// AddChunk. For scale: the whole 2 km cascade measured 9,441,170 quads.
+	void InitPool(uint32 CapacityQuads);
+
 	// Adds one chunk's quads at a component-space origin. Quads are expected in
 	// the GPU mesher's packed form, already re-based out of brick-local coords.
-	// Returns the chunk's index in the pool.
+	// Returns a handle, or INDEX_NONE if the pool has no contiguous room.
 	int32 AddChunk(const TArray<uint64>& InQuads, const FVector3f& OriginUU, int32 Level);
 
-	// Drops every chunk. The buffers are rebuilt on the next render state update.
+	// Releases a chunk's range back to the pool.
+	//
+	// The quads are NOT removed from the buffer -- one draw covers the whole
+	// pool, so a freed range would otherwise keep rendering stale geometry.
+	// Instead its quads are pointed at the reserved hidden chunk, whose scale
+	// is zero, which collapses every vertex to a point. They cost vertex
+	// invocations until the range is reused, and produce no pixels.
+	void RemoveChunk(int32 Handle);
+
+	// Drops every chunk.
 	void ClearChunks();
 
-	int32 GetNumChunks() const { return ChunkOrigins.Num(); }
+	int32 GetNumChunks() const { return NumLiveChunks; }
 	int32 GetNumQuads() const { return PooledQuads.Num(); }
+	uint32 GetHighWaterMarkQuads() const { return Pool.GetHighWaterMark(); }
+	uint32 GetFreeQuads() const { return Pool.GetFreeQuads(); }
+	uint32 GetLargestFreeRun() const { return Pool.GetLargestFreeRun(); }
 
 	void SetChunkMaterial(UMaterialInterface* InMaterial);
 	UMaterialInterface* GetChunkMaterialOrDefault() const;
@@ -60,6 +77,14 @@ private:
 
 	// xyz = chunk origin in component space (unreal units), w = mip scale.
 	TArray<FVector4f> ChunkOrigins;
+
+	// Chunk id 0 is RESERVED as the hidden chunk: origin (0,0,0), scale 0.
+	// Freed quads point at it and collapse to a degenerate point.
+	static constexpr uint32 kHiddenChunkId = 0;
+
+	FVoxelGpuGeometryPool Pool;
+	TArray<FVoxelGpuPoolAllocation> Allocations;  // indexed by handle
+	int32 NumLiveChunks = 0;
 
 	FBox LocalBounds = FBox(ForceInit);
 

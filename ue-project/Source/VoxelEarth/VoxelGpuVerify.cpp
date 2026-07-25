@@ -980,23 +980,61 @@ namespace
 		Actor->SetRootComponent(Pool);
 		Pool->SetChunkMaterial(TerrainMaterial);
 
+		// Capacity with headroom, so churn has somewhere to go.
+		Pool->InitPool(uint32(Rebased.Num()) * uint32(NumChunks) * 2u);
+
 		// Lay the chunks out in a grid. 640 UU = 6.4 m is the region edge, so
 		// they tile without overlapping.
 		const int32 Side = FMath::CeilToInt(FMath::Sqrt(double(NumChunks)));
+		TArray<int32> Handles;
 		for (int32 I = 0; I < NumChunks; ++I)
 		{
 			const int32 Gx = I % Side;
 			const int32 Gy = I / Side;
-			Pool->AddChunk(Rebased, FVector3f(float(Gx) * 640.0f, float(Gy) * 640.0f, 0.0f), 0);
+			Handles.Add(Pool->AddChunk(Rebased,
+				FVector3f(float(Gx) * 640.0f, float(Gy) * 640.0f, 0.0f), 0));
+		}
+
+		// CHURN: drop every other chunk and re-add half of them. This is what
+		// streaming actually does, and the point is that none of it touches
+		// FScene -- the primitive count is 1 before, during and after.
+		if (Args.ContainsByPredicate(
+			[](const FString& A) { return A.Equals(TEXT("churn"), ESearchCase::IgnoreCase); }))
+		{
+			int32 Removed = 0;
+			for (int32 I = 0; I < Handles.Num(); I += 2)
+			{
+				if (Handles[I] != INDEX_NONE)
+				{
+					Pool->RemoveChunk(Handles[I]);
+					++Removed;
+				}
+			}
+			int32 ReAdded = 0;
+			for (int32 I = 0; I < Handles.Num() / 4; ++I)
+			{
+				const int32 Gx = I % Side;
+				const int32 Gy = I / Side;
+				if (Pool->AddChunk(Rebased,
+					FVector3f(float(Gx) * 640.0f, float(Gy) * 640.0f, 900.0f), 0) != INDEX_NONE)
+				{
+					++ReAdded;
+				}
+			}
+			UE_LOG(LogVoxelGpuVerify, Log,
+			       TEXT("Churn: removed %d, re-added %d — %d live chunks, %u quads used, "
+			            "%u free, largest run %u"),
+			       Removed, ReAdded, Pool->GetNumChunks(), Pool->GetHighWaterMarkQuads(),
+			       Pool->GetFreeQuads(), Pool->GetLargestFreeRun());
 		}
 
 		Pool->RegisterComponent();
 		Pool->SetWorldLocation(SpawnLocation);
 
 		UE_LOG(LogVoxelGpuVerify, Log,
-		       TEXT("Pool: %d chunks, %d quads, %d triangles in ONE primitive at %s"),
-		       Pool->GetNumChunks(), Pool->GetNumQuads(), Pool->GetNumQuads() * 2,
-		       *SpawnLocation.ToString());
+		       TEXT("Pool: %d live chunks, %u quads used, %d triangles in ONE primitive at %s"),
+		       Pool->GetNumChunks(), Pool->GetHighWaterMarkQuads(),
+		       int32(Pool->GetHighWaterMarkQuads()) * 2, *SpawnLocation.ToString());
 
 		if (Args.ContainsByPredicate(
 			[](const FString& A) { return A.Equals(TEXT("shot"), ESearchCase::IgnoreCase); }))
