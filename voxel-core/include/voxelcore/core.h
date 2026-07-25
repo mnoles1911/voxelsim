@@ -26,7 +26,22 @@ namespace vxc {
 // (hash.h valueNoise2Fade) instead of the raw bilinear one, which removes the
 // dead-straight lattice creases; (c) the surface bounds widened to match.
 // See amplifier.cpp kDetailOctaves for the measurements that forced this.
-inline constexpr uint32_t kWorldGenVersion = 6;
+// v8: the CLIMATE half of what v6 did for the surface half -- the first time
+// the biome and stratigraphy consumers were measured against real tiles rather
+// than SyntheticTileSampler. voxelcore/climate.h now defines the wire encoding
+// (physical WorldClim units, mirroring terrain-service's EXPECTED_CHANNELS),
+// every biome threshold is derived from it at compile time instead of being a
+// bare u8 literal, SyntheticTileSampler emits that same encoding (and finally
+// fills seasonality/precipVariability), classifyBiome tests sea level before
+// slope, BARE_ROCK is appended, and the topsoil formula erodes by a FRACTION
+// rather than subtracting an absolute depth. Measured with vxc_climateprobe;
+// see docs/status.md for the before/after census.
+//
+// NOTE ON THE SKIPPED v7: the unmerged branch claude/erosion-v7 already claims
+// 7 (drainage carving + a region-fitted precip retune). This work branched from
+// main at v6 and takes 8 so the two can land in either order without colliding.
+// The check at editlog.h is exact equality, not a range, so a gap is harmless.
+inline constexpr uint32_t kWorldGenVersion = 8;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 

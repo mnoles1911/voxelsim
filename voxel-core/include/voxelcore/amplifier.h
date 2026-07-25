@@ -60,25 +60,30 @@ inline constexpr int64_t kSurfaceBoundDeclined = INT64_MAX;
 inline constexpr int64_t kSurfaceLowerBoundDeclined = INT64_MIN;
 
 // Tile-pixel corners the bound will read per axis before declining. A level-4
-// chunk (51.2 m) needs 4 corners against a 30 m pixel and 6 against the 11.25 m
-// scale-8 pixel; 16 leaves generous headroom while keeping the read count and
-// the on-stack corner grid bounded (16x16 int64 = 2 KB).
+// chunk (51.2 m) needs 4 corners against a 30 m pixel and ~15 against the
+// 3.75 m scale-8 pixel; 16 leaves generous headroom at scale 1 while keeping
+// the read count and the on-stack corner grid bounded (16x16 int64 = 2 KB).
 //
 // Re-checked when the ring cascade grew to level 5 (2 km edge): a level-5
-// footprint is 102.4 m plus a 6.4 m apron = 108.8 m, needing ~6 corners at 30 m
-// and ~12 at 11.25 m -- still inside the cap, so the bound is COMPUTED (not
-// declined) at every level the cascade now uses. The bound does get looser with
-// a bigger footprint, because a larger rectangle spans more pixel cells and so
-// admits a wider base range and a higher max slope. That is the SAFE direction
-// for both consumers: surfaceUpperBoundMm rising and solidBelowBoundMm falling
-// each mean FEWER chunks are provably skippable, never more, so a looser bound
-// costs optimization and cannot open a hole in the world.
+// footprint is 102.4 m plus a 6.4 m apron = 108.8 m, needing ~6 corners at
+// 30 m -- still inside the cap, so at SCALE 1 (the only scale any tile has
+// ever been generated at) the bound is COMPUTED, not declined, at every level
+// the cascade now uses. The bound does get looser with a bigger footprint,
+// because a larger rectangle spans more pixel cells and so admits a wider base
+// range and a higher max slope. That is the SAFE direction for both consumers:
+// surfaceUpperBoundMm rising and solidBelowBoundMm falling each mean FEWER
+// chunks are provably skippable, never more, so a looser bound costs
+// optimization and cannot open a hole in the world.
 //
-// A level-6 footprint (217.6 m) would need ~21 corners at 11.25 m and would
-// therefore DECLINE rather than overrun the grid -- also safe (declining skips
-// nothing), but it means the sky-band and all-solid skips would quietly stop
-// paying off at level 6+. Raise this cap, and re-check the 2 KB stack grid,
-// before extending the cascade past level 5.
+// SCALE 8 IS DIFFERENT, and this comment previously got it wrong by 3x because
+// it used the superseded 11.25 m pixel (90 m / 8) instead of the real 3.75 m
+// (30 m / 8) -- see tilestore.h's tilePixelSizeMm. At 3.75 m a level-5
+// footprint needs ~30 corners and a level-4 one ~15, so the bound would
+// DECLINE from level 5 up rather than at level 6. Declining is safe (it skips
+// nothing), but it means the sky-band and all-solid trims would quietly stop
+// paying off above level 4 on scale-8 tiles. Raise this cap, and re-check the
+// 2 KB stack grid, before generating scale-8 tiles or extending the cascade
+// past level 5.
 inline constexpr int64_t kSurfaceBoundMaxCornersPerAxis = 16;
 
 class Amplifier {

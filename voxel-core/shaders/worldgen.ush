@@ -91,22 +91,47 @@ static const uint BIOME_DESERT = 5;
 static const uint BIOME_SAVANNA = 6;
 static const uint BIOME_TAIGA = 7;
 static const uint BIOME_TUNDRA_ALPINE = 8;
+static const uint BIOME_BARE_ROCK = 9;   // appended at worldgen v8
 
 // Biome gate/Whittaker thresholds (voxelcore/biome.h) — bit-exact mirror,
 // worldgen contract.
-static const int64_t kBiomeCliffSlopeMmPerPx = 6000;
+//
+// SINCE v8 THESE ARE DERIVED, NOT CHOSEN. biome.h states each threshold in
+// physical units and converts at compile time through voxelcore/climate.h --
+// e.g. `kBiomeTempColdU8 = climateTempU8FromDegC(5)`. HLSL has no climate.h and
+// no constexpr conversion, so the literals below are the CONVERTED values, and
+// the physical quantity each one came from is written beside it.
+//
+// DO NOT hand-compute these when biome.h changes. Run
+// `vxc_dump_biome_constants` (voxel-core/bench) and paste its output: it prints
+// them from the very headers the CPU path compiles against, which is the only
+// way this mirror cannot drift by arithmetic slip.
+static const int64_t kBiomeCliffSlopeMmPerPx = 21000; // 70% grade over a 30 m px, ~35 deg
 static const int kBiomeBeachLowerMm = -3000;
 static const int kBiomeBeachUpperMm = 4000;
-static const int kBiomeTreelineBaseMm = 2600000;
-static const int kBiomeTreelineMmPerTempUnit = 20000;
+static const int kBiomeTreelineBaseMm = 900000;       // 900 m at 0 C (TUNED, not derived)
+static const int kBiomeTreelineMmPerTempUnit = 47058; // 150 m/degC over the u8 range
 static const int kBiomeAlpineRockLineMm = 3200000;
-static const int kBiomeTempColdU8 = 70;
-static const int kBiomeTempWarmU8 = 140;
-static const int kBiomeTempHotU8 = 170;
-static const int kBiomePrecipAridU8 = 60;
-static const int kBiomePrecipSemiU8 = 100;
-static const int kBiomePrecipModU8 = 170;
-static const int kBiomeSeasonalHighU8 = 128;
+static const int kBiomeTempColdU8 = 143;   // climateTempU8FromDegC(5)
+static const int kBiomeTempWarmU8 = 185;   // climateTempU8FromDegC(18)
+static const int kBiomeTempHotU8 = 204;    // climateTempU8FromDegC(24)
+static const int kBiomePrecipAridU8 = 9;   // climatePrecipU8FromMmPerYr(400)
+static const int kBiomePrecipSemiU8 = 17;  // climatePrecipU8FromMmPerYr(800)
+static const int kBiomePrecipModU8 = 34;   // climatePrecipU8FromMmPerYr(1600)
+static const int kBiomeSeasonalHighU8 = 128; // climateSeasonalityU8From(1500)
+
+// Topsoil (amplifier.cpp). v8 replaced an absolute slope SUBTRACTION with a
+// retained FRACTION -- the old form was swamped by any realistic 30 m-pixel
+// slope and produced zero topsoil on 85-91% of land, which made the biome
+// surface material invisible everywhere. The retention floor is tied to the
+// cliff threshold so soil is thinnest exactly where BARE_ROCK takes over.
+static const int64_t kTopsoilBaseMm = 200;
+static const int64_t kTopsoilMmPerMetreOfRain = 200;
+static const int64_t kTopsoilSlopeRetentionMinQ10 = 128;
+static const int64_t kTopsoilMinMm = 100;  // == kVoxelSizeMm; guarantees one visible voxel
+static const int64_t kTopsoilMaxMm = 2500;
+//: climate.h's climatePrecipMmPerYrFromU8: (u8 * 12000) / 255
+static const int64_t kClimatePrecipSpanMmPerYr = 12000;
 
 // Detail octave table v2 (amplifier.cpp kDetailOctaves). Ordered coarse to
 // fine; the first kLandformOctaveCount entries take slopeScaleQ10 and the rest
@@ -302,9 +327,12 @@ int biomeTreelineMm(int tempU8)
 uint classifyBiome(int tempU8, int precipU8, int seasonalityU8, int surfaceMm,
                     int64_t slopeMmPerPx)
 {
-    if (slopeMmPerPx > kBiomeCliffSlopeMmPerPx) return BIOME_TUNDRA_ALPINE;
+    // SEA LEVEL FIRST (v8). The slope gate used to run ahead of these, so steep
+    // SEAFLOOR classified as TUNDRA_ALPINE -- measured at 17.8% of the real
+    // 25-tile world. Nothing below sea level can be alpine.
     if (surfaceMm < kBiomeBeachLowerMm) return BIOME_OCEAN;
     if (surfaceMm <= kBiomeBeachUpperMm) return BIOME_BEACH;
+    if (slopeMmPerPx > kBiomeCliffSlopeMmPerPx) return BIOME_BARE_ROCK;
     if (surfaceMm > biomeTreelineMm(tempU8)) return BIOME_TUNDRA_ALPINE;
 
     if (tempU8 < kBiomeTempColdU8) return BIOME_TAIGA;
@@ -330,8 +358,10 @@ uint biomeSurfaceMaterial(uint biome, int surfaceMm)
     if (biome == BIOME_DESERT) return MAT_SAND;
     if (biome == BIOME_SAVANNA) return MAT_SAVANNA_GRASS;
     if (biome == BIOME_TAIGA) return MAT_PODZOL;
-    // BIOME_TUNDRA_ALPINE (default) — see biome.h's biomeSurfaceMaterial doc
-    // comment for the elevation-based rock/permafrost split rationale.
+    if (biome == BIOME_BARE_ROCK) return MAT_ROCK;
+    // BIOME_TUNDRA_ALPINE (default). Since v8 only the treeline gate reaches
+    // here, so this is unambiguously cold high ground and the split is just
+    // permafrost below the rock line, exposed rock above.
     return surfaceMm > kBiomeAlpineRockLineMm ? MAT_ROCK : MAT_PERMAFROST;
 }
 
@@ -380,7 +410,7 @@ cbuffer WorldGenParams : register(b0)
     uint2 DispatchColumns;  // columns along x, y for this dispatch (both kernels)
     int2 RasterOriginPx;    // tile-pixel coordinate of raster window texel (0,0) (ColumnMain)
     uint2 RasterSize;       // raster window extent in pixels (ColumnMain)
-    int PixelSizeMm;        // 30000 (scale 1) or 11250 (scale 8) (ColumnMain)
+    int PixelSizeMm;        // 30000 (scale 1) or 3750 (scale 8) (ColumnMain)
     uint SeedLo;            // uint64 seed split across two 32-bit values (ColumnMain)
     uint SeedHi;
     int OriginVx;           // world voxel coord of dispatch column (0,0);
@@ -550,7 +580,7 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
     // (and on some stacks it can fault). There is no meaningful column to
     // derive from a zero-size pixel, so refuse the dispatch deterministically.
     // Mirrored by a host-side assert in voxel-core/bench/gpu_harness.cpp.
-    // GUARD ONLY: valid PixelSizeMm is 30000 (scale 1) or 11250 (scale 8) —
+    // GUARD ONLY: valid PixelSizeMm is 30000 (scale 1) or 3750 (scale 8) —
     // never 0 — so this branch is never taken on any real dispatch.
     if (PixelSizeMm == 0)
         return;
@@ -572,14 +602,30 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
     GpuColumnSample outCol;
     outCol.surfaceMm = se.surfaceMm;
 
-    int64_t topsoil =
-        clamp64(300 + (int64_t)clPrecipitation * 8 - truncDiv(slopeMmPerPx, 4), 0, 2500);
+    // Topsoil (v8). Mirrors amplifier.cpp exactly: decode precipitation to
+    // mm/yr, take a base from it, then RETAIN a slope-dependent fraction rather
+    // than subtracting an absolute depth. All operands here are provably
+    // non-negative, but truncDiv is used anyway -- the shader-UB lint rejects a
+    // bare signed `/` on principle and the CPU side truncates identically.
+    const int64_t rainMmPerYr =
+        truncDiv((int64_t)clPrecipitation * kClimatePrecipSpanMmPerYr, 255);
+    const int64_t topsoilBaseMm =
+        kTopsoilBaseMm + truncDiv(rainMmPerYr * kTopsoilMmPerMetreOfRain, 1000);
+    const int64_t retainQ10 =
+        clamp64(1024 - truncDiv(slopeMmPerPx * 1024, kBiomeCliffSlopeMmPerPx),
+                kTopsoilSlopeRetentionMinQ10, 1024);
+    int64_t topsoil = truncDiv(topsoilBaseMm * retainQ10, 1024);
     const int64_t tj =
         (int64_t)hashToSigned16(hash2(seed, vx >> 4, vy >> 4, CH_TOPSOIL_JITTER));
     topsoil += truncDiv(topsoil * tj, 4 * 32768); // tj is signed — truncDiv.
-    outCol.topsoilMm = (int)topsoil;
+    // Clamp AFTER the jitter: kTopsoilMinMm is what guarantees at least one
+    // visible biome-coloured voxel on every column, and clamping first would
+    // let a -25% draw break that.
+    outCol.topsoilMm = (int)clamp64(topsoil, kTopsoilMinMm, kTopsoilMaxMm);
 
-    outCol.subsoilMm = (int)clamp64(topsoil * 2 + 500, 0, 6000);
+    // From the CLAMPED topsoil, not the raw local -- otherwise a floored column
+    // gets the unfloored value's subsoil and the two layers disagree.
+    outCol.subsoilMm = (int)clamp64((int64_t)outCol.topsoilMm * 2 + 500, 0, 6000);
 
     // Bedrock top: a jittered band CENTRED ON 200 m. kWorldGenVersion 5 moved
     // this from 40-60 m to 180-220 m (amplifier.cpp — read its comment for
@@ -635,7 +681,15 @@ uint stratigraphyAt(GpuColumnSample col, int64_t vz)
     if (depthMm < 0) return MAT_AIR;
     if (depthMm < (int64_t)col.topsoilMm) return col.surfaceMat;
     if (depthMm < (int64_t)col.topsoilMm + (int64_t)col.subsoilMm)
-        return col.surfaceMat == MAT_SAND ? MAT_GRAVEL : MAT_SUBSOIL;
+    {
+        // Coarse subsoil under sandy surfaces; and under a BARE_ROCK surface
+        // (v8) it is rock all the way down. Without the second case a cliff
+        // column reads rock, then SUBSOIL, then rock -- a soil layer sandwiched
+        // under a rock skin, which also breaks stratigraphy's depth ordering.
+        if (col.surfaceMat == MAT_SAND) return MAT_GRAVEL;
+        if (col.surfaceMat == MAT_ROCK) return MAT_ROCK;
+        return MAT_SUBSOIL;
+    }
     if (depthMm < (int64_t)col.bedrockDepthMm) return MAT_ROCK;
     return MAT_BEDROCK;
 }
@@ -1217,7 +1271,7 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
 
     // Same guard as ColumnMain, and now load-bearing for the same reason: the
     // cavern pass calls evalSurface (for the SITE's surface height), which
-    // divides by PixelSizeMm. GUARD ONLY — valid values are 30000 or 11250.
+    // divides by PixelSizeMm. GUARD ONLY — valid values are 30000 or 3750.
     if (PixelSizeMm == 0)
         return;
 

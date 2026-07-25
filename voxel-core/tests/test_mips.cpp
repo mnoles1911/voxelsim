@@ -179,5 +179,5 @@ VXC_TEST(mips_chain_determinism_golden) {
     // because amplifier_columns moves; the mip RULE itself (threshold,
     // majority, tie-break) is unchanged and its own tests still pass.
     // (was 0xE827A786195B8A73 at v3/v4/v5, 0xE4CF1B376622A38F at v2)
-    CHECK_EQ(d.h, 0x288F276C803B1D0Aull);
+    CHECK_EQ(d.h, 0x40E35969FCD586D3ull);
 }

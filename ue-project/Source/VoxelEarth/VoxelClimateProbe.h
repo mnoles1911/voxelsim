@@ -8,9 +8,12 @@
 // precipitation, precipitation variability) and until now NOTHING on the UE side
 // consumed any of them -- a grep for climate/temperature/precip across
 // Source/VoxelEarth returned exactly one comment. voxel-core reads them
-// internally to pick a surface material id, but on real diffusion tiles that
-// classifier is degenerate (see kPrecipU8Lo below), so the material id alone
-// cannot drive appearance. This probe hands climate straight to the renderers.
+// internally to pick a surface material id; at the time that classifier was
+// degenerate on real diffusion tiles, so the material id alone could not drive
+// appearance. Worldgen v8 fixed the classifier (see the v8 note further down),
+// but this probe still earns its place: it hands climate to the renderers as a
+// CONTINUOUS pair for smooth LUT blending, which a discrete material id cannot
+// do however correct that id is.
 //
 // It is also what keeps AVoxelClipmapActor (the 50 km vista) and
 // UVoxelChunkComponent (the near field) in agreement: both encode climate into
@@ -29,6 +32,10 @@
 // change is not allowed to touch.
 
 #include "CoreMinimal.h"
+
+// The wire encoding the u8 window below is derived from. voxel-core is
+// UE-header-free by doctrine, so this dependency runs one way only.
+#include "voxelcore/climate.h"
 
 // Encoded climate for one column, ready to drop into an FColor.
 struct FVoxelClimateBytes
@@ -59,10 +66,33 @@ namespace VoxelClimate
 	// PRECIP_U8_LO/HI exactly -- that script bakes the same window into
 	// T_VoxelBiomeLUT's axes, and a mismatch silently shifts every biome. Each
 	// file names the other as the second copy.
-	inline constexpr int32 kTempU8Lo = 100;
-	inline constexpr int32 kTempU8Hi = 189;
-	inline constexpr int32 kPrecipU8Lo = 14;
-	inline constexpr int32 kPrecipU8Hi = 32;
+	//
+	// DERIVED, NOT MEASURED, since worldgen v8. These were hand-measured u8
+	// literals, which made this a THIRD independent climate calibration
+	// alongside biome.h and gen_terrain_textures.py's LUT -- and four such
+	// calibrations drifting apart is exactly what let the whole world classify
+	// as desert. They are now the physical window converted through
+	// voxelcore/climate.h, the same header biome.h's thresholds come from, so a
+	// change to the wire quantization carries here automatically instead of
+	// silently shifting the LUT axes.
+	//
+	// The physical endpoints are chosen to reproduce the measured values
+	// EXACTLY (asserted below), so this change is a provable no-op on rendered
+	// output -- a screenshot pair is its whole test. It is a display STRETCH,
+	// not a classification: its job is to use the full 8-bit LUT axis for a
+	// region that occupies ~7% of the wire range, and that job does not go away
+	// just because biome.h is now correct.
+	inline constexpr int32 kTempU8Lo = vxc::climateTempU8FromMilliC(-8'600);   // -8.6 C
+	inline constexpr int32 kTempU8Hi = vxc::climateTempU8FromMilliC(19'200);   // +19.2 C
+	inline constexpr int32 kPrecipU8Lo = vxc::climatePrecipU8FromMmPerYr(659);  // 659 mm/yr
+	inline constexpr int32 kPrecipU8Hi = vxc::climatePrecipU8FromMmPerYr(1506); // 1506 mm/yr
+
+	static_assert(kTempU8Lo == 100 && kTempU8Hi == 189,
+	              "the temperature LUT axis must not move -- if this fires, either the "
+	              "climate quantization range changed or someone retuned the window; "
+	              "either way T_VoxelBiomeLUT must be regenerated in the same commit");
+	static_assert(kPrecipU8Lo == 14 && kPrecipU8Hi == 32,
+	              "the precipitation LUT axis must not move -- see above");
 
 	// Samples the tile climate planes at a world XY (unreal units) and returns
 	// the remapped bytes. Bilinear across tile pixels, so the 30 m raster does
@@ -117,6 +147,22 @@ namespace VoxelClimate
 	//     MAT_ROCK    (2)  302,018   15%
 	//     MAT_SUBSOIL (5) 1,697,983  85%
 	//     ...and nothing else. No surface material at all.
+	//
+	// FIXED AT WORLDGEN v8 -- this note is kept because the reasoning below is
+	// still why the R channel is geometric, but its premise no longer holds.
+	// The cause was the topsoil formula subtracting an absolute slope term that
+	// swamped its base, so topsoilMm was 0 on 91% of land and stratigraphyAt
+	// never reached col.surfaceMat. It now erodes by a retained fraction with a
+	// one-voxel floor. Measured with vxc_climateprobe over the same 25 tiles:
+	// zero-topsoil land 91.3% -> 0.00%, and the top voxel carries its biome's
+	// surface material on 12.4% -> 100.00% of columns, spread across mud, sand,
+	// grass, topsoil, podzol, permafrost and rock.
+	//
+	// So an id-keyed rule COULD work now, and restoring per-material subsurface
+	// strata is worth revisiting. What has NOT been redone is the in-engine
+	// -VoxelMatHistogram run that produced the numbers above -- the figures here
+	// are the CPU-side equivalent (top-voxel census), not a quad census. Re-run
+	// the switch before trusting an id-keyed appearance rule.
 	//
 	// Not one quad carries MAT_GRASS / MAT_TOPSOIL / MAT_SAND / MAT_PODZOL or
 	// any other surface id, so no id-keyed rule can distinguish "hillside" from

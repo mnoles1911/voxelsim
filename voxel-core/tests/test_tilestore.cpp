@@ -169,11 +169,18 @@ VXC_TEST(tilegridsampler_pixel_routing_and_missing_tile_counter) {
     // default + counter increments.
     CHECK_EQ(s.elevationMm(512, 0), int32_t(0));
     CHECK_EQ(s.missingTileQueries.load(), uint64_t(1));
+    // Compared against ClimateSample{} rather than literals: the missing-tile
+    // answer IS the default-constructed sample, and pinning the numbers here
+    // twice only means updating them twice. What matters is that a miss is
+    // deterministic and is the documented bland default, not what byte that
+    // happens to be. (v8 moved it from 128/0/128/0 -- which decoded to a
+    // freezing 6000 mm/yr rainforest -- to ~10 C / 800 mm/yr.)
+    const ClimateSample kMissDefault{};
     ClimateSample cMiss = s.climate(512, 0);
-    CHECK_EQ(int(cMiss.temperature), 128);
-    CHECK_EQ(int(cMiss.seasonality), 0);
-    CHECK_EQ(int(cMiss.precipitation), 128);
-    CHECK_EQ(int(cMiss.precipVariability), 0);
+    CHECK_EQ(int(cMiss.temperature), int(kMissDefault.temperature));
+    CHECK_EQ(int(cMiss.seasonality), int(kMissDefault.seasonality));
+    CHECK_EQ(int(cMiss.precipitation), int(kMissDefault.precipitation));
+    CHECK_EQ(int(cMiss.precipVariability), int(kMissDefault.precipVariability));
     CHECK_EQ(s.missingTileQueries.load(), uint64_t(2));
 
     // Negative pixel coords: floorDiv(-1,512) == -1, a different (missing)
@@ -312,11 +319,12 @@ VXC_TEST(missing_tile_fallback_is_deterministic_through_amplifier) {
 
     for (TileGridSampler* s : {&samplerA, &samplerB}) {
         CHECK_EQ(s->elevationMm(1'000'000, 1'000'000), int32_t(0));
+        const ClimateSample kDefault{};
         const ClimateSample c = s->climate(1'000'000, 1'000'000);
-        CHECK_EQ(int(c.temperature), 128);
-        CHECK_EQ(int(c.seasonality), 0);
-        CHECK_EQ(int(c.precipitation), 128);
-        CHECK_EQ(int(c.precipVariability), 0);
+        CHECK_EQ(int(c.temperature), int(kDefault.temperature));
+        CHECK_EQ(int(c.seasonality), int(kDefault.seasonality));
+        CHECK_EQ(int(c.precipitation), int(kDefault.precipitation));
+        CHECK_EQ(int(c.precipVariability), int(kDefault.precipVariability));
     }
     CHECK_EQ(samplerA.missingTileQueries.load(), uint64_t(2));
     CHECK_EQ(samplerB.missingTileQueries.load(), uint64_t(2));
@@ -380,8 +388,11 @@ VXC_TEST(concurrent_queries_are_thread_safe_and_counter_is_exact) {
                     mismatches.fetch_add(1, std::memory_order_relaxed);
             } else {
                 if (elev != 0) mismatches.fetch_add(1, std::memory_order_relaxed);
-                if (c.temperature != 128 || c.seasonality != 0 || c.precipitation != 128 ||
-                    c.precipVariability != 0)
+                const ClimateSample kDefault{};
+                if (c.temperature != kDefault.temperature ||
+                    c.seasonality != kDefault.seasonality ||
+                    c.precipitation != kDefault.precipitation ||
+                    c.precipVariability != kDefault.precipVariability)
                     mismatches.fetch_add(1, std::memory_order_relaxed);
             }
         }

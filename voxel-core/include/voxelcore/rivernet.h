@@ -154,7 +154,26 @@ namespace vxc {
 // Bumped on any deliberate change to the generation (D8/accumulation) or
 // routing (Muskingum-class step) math above -- invalidates saved graph
 // diffs and golden digests, exactly like kWorldGenVersion/kWaterCAVersion.
-inline constexpr uint32_t kRiverNetVersion = 1;
+// v2: flow accumulation weights by rainfall in MM/YR rather than the raw
+// climate wire byte, so a river's catchment threshold means a physical
+// quantity instead of an artifact of the u8 encoding. See rivernet.cpp.
+inline constexpr uint32_t kRiverNetVersion = 2;
+
+// Default minimum accumulated rainfall, in mm/yr summed over the upstream
+// catchment, for a pixel to become a river node.
+//
+// DERIVED from the v1 value so river density is preserved for a given
+// precipitation field: v1 accumulated the raw u8 byte with a threshold of 500,
+// and one u8 step is climatePrecipMmPerYrFromU8(1) worth of rain, so the same
+// catchment now sums 12000/255 times as much. 500 * 12000 / 255 = 23529.
+//
+// Note this preserves density with respect to the SAME precipitation field.
+// The synthetic sampler's field also moved at worldgen v8 (it now emits the
+// physical encoding rather than a byte centred on 128), so synthetic river
+// density does change -- correctly, since the old synthetic precip decoded to
+// a median of 5223 mm/yr, which is not a climate that exists.
+inline constexpr int64_t kRiverAccumThresholdDefault =
+    500 * (kClimatePrecipMaxMmPerYr - kClimatePrecipMinMmPerYr) / 255;
 
 struct RiverNode {
     int64_t vx = 0, vy = 0; // world VOXEL coords (doctrine convention, core.h) of the source tile pixel's center
@@ -202,7 +221,7 @@ public:
     // (precip-weighted upstream) value for a pixel to become a RiverNode.
     void buildFromFlowAccumulation(ITileSampler& tiles, uint64_t seed,
                                    const RegionBounds& bounds,
-                                   int64_t accumThreshold = 500);
+                                   int64_t accumThreshold = kRiverAccumThresholdDefault);
 
     const std::vector<RiverNode>& nodes() const { return nodes_; }
     const std::vector<RiverSegment>& segments() const { return segments_; }

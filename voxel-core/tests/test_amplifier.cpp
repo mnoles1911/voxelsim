@@ -30,6 +30,33 @@ VXC_TEST(amplifier_is_deterministic) {
         }
 }
 
+VXC_TEST(amplifier_top_voxel_is_surface_material) {
+    // The biome material a column classifies to must actually be the material
+    // at its topmost solid voxel -- i.e. it must be VISIBLE and DIGGABLE.
+    //
+    // This is the regression guard for worldgen v8's headline bug. The v6
+    // topsoil formula subtracted an absolute slope term that swamped its base,
+    // so topsoilMm came out ZERO on 91% of real-tile land and 85% of synthetic
+    // land. stratigraphyAt returns col.surfaceMat only while depth <
+    // topsoilMm, so on all that ground the biome material existed in the
+    // ColumnSample and was never once rendered or dug: the in-engine
+    // -VoxelMatHistogram measured ROCK 15% / SUBSOIL 85% across 2M quads and
+    // not a single surface material.
+    //
+    // kTopsoilMinMm >= kVoxelSizeMm is what makes this hold everywhere, and
+    // that floor is applied after the jitter precisely so this cannot fail on
+    // an unlucky draw.
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    for (int64_t x = -3000; x <= 3000; x += 271)
+        for (int64_t y = -3000; y <= 3000; y += 337) {
+            const ColumnSample col = amp.column(x, y);
+            const int64_t topVz = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
+            CHECK_EQ(Amplifier::stratigraphyAt(col, topVz), col.surfaceMat);
+            CHECK(col.topsoilMm >= kVoxelSizeMm);
+        }
+}
+
 VXC_TEST(amplifier_stratigraphy_ordering) {
     SyntheticTileSampler tiles(kSeed);
     Amplifier amp(kSeed, tiles);
@@ -98,7 +125,7 @@ VXC_TEST(amplifier_golden_digest) {
     // the rework had not taken effect.
     // (was 0xA29A7A767DC1543B at v5, 0x81785278E4DFCF67 at v3/v4,
     //  0x73B43CAE621CA286 at v2)
-    CHECK_EQ(d.h, 0x5CD8357DE5D30653ull);
+    CHECK_EQ(d.h, 0x289317C457460336ull);
 }
 
 // --- C4: the cavern pass is actually wired into the amplifier ---------------
@@ -211,7 +238,7 @@ VXC_TEST(amplifier_deep_column_golden_digest) {
     // layer), which are pinned against a constant surface and did NOT move);
     // what moved is where that unchanged geometry sits relative to the ground.
     // (was 0xF88B88DB9D9341AA at v5)
-    CHECK_EQ(d.h, 0xB1CE3A51E23B7925ull);
+    CHECK_EQ(d.h, 0xB8D2F2AA6BE9186Aull);
 }
 
 VXC_TEST(generated_brick_matches_pointwise_queries) {
@@ -347,9 +374,18 @@ VXC_TEST(amplifier_surfaceMm_matches_column) {
 }
 
 VXC_TEST(amplifier_surface_bound_adversarial) {
-    // Four environments: both real tile pixel sizes (30 m scale-1 and 11.25 m
-    // scale-8, which give DIFFERENT corner-grid shapes for the same footprint)
-    // crossed with different world seeds.
+    // Four environments: two tile pixel sizes (30 m and 11.25 m, which give
+    // DIFFERENT corner-grid shapes for the same footprint) crossed with
+    // different world seeds.
+    //
+    // 11250 is NOT the scale-8 pixel size -- that is 3750 (30 m / 8; see
+    // tilestore.h's tilePixelSizeMm). It is kept here purely as a second,
+    // arbitrary pixel size that exercises a different corner-grid shape,
+    // because GOLDEN(amplifier_surface_bound) is pinned against it and that
+    // digest is explicitly NOT worldgen output -- re-pinning it is a separate
+    // deliberate decision, not a free rider on a worldgen bump. FOLLOW-UP: add
+    // a 3750 environment so the real scale-8 shape is covered too; that is a
+    // new environment (and a re-pin), not an edit to this one.
     struct Env {
         uint64_t seed;
         int32_t pixelMm;

@@ -31,11 +31,24 @@ tile-cache/terrain-diffusion-unlabeled-3e11cf157a836c70/000000000135276f/s1
 Precipitation only occupies u8 13..33 because terrain-service quantizes bio_12
 against a 0..12000 mm/yr full scale while this world is cool-temperate maritime
 (611..1647 mm/yr). Consuming the raw u8 throws away ~92% of the available
-precision AND lands the entire world below voxel-core biome.h's kBiomePrecipAridU8
-(60) -- which is why every land voxel currently classifies DESERT -> MAT_SAND and
-the world renders as one flat beige. Remapping p1..p99 onto 0..255 recovers the
-signal. These two constants are duplicated in VoxelClimateProbe.h and MUST match
-it exactly; that header documents this file as the other copy.
+precision, so remapping p1..p99 onto 0..255 recovers the signal.
+
+HISTORICAL NOTE, corrected at worldgen v8: this docstring used to add that the
+same narrow window "lands the entire world below voxel-core biome.h's
+kBiomePrecipAridU8 (60) -- which is why every land voxel currently classifies
+DESERT -> MAT_SAND and the world renders as one flat beige". That was true and
+is now fixed. biome.h states its thresholds physically and converts through
+voxelcore/climate.h, so kBiomePrecipAridU8 is 9 (= 400 mm/yr) and the Whittaker
+table spreads properly. The REMAP still earns its place -- it is a display
+stretch that uses the full LUT axis for a narrow region -- but it is no longer
+compensating for a broken classifier.
+
+These two constants are duplicated in VoxelClimateProbe.h and MUST match it
+exactly. Since v8 that header DERIVES them from climate.h's physical constants
+(-8.6 C, +19.2 C, 659 mm/yr, 1506 mm/yr) and static_asserts that they still come
+out 100/189/14/32, so the C++ side cannot drift silently. This copy is still a
+copy: if that assert ever fires, change both files and regenerate the LUT in the
+same commit.
 """
 
 import os

@@ -178,7 +178,13 @@ VXC_TEST(rivernet_determinism_golden_digest) {
     netA.digest(dA);
     netB.digest(dB);
     CHECK_EQ(dA.h, dB.h);
-    CHECK_EQ(dA.h, 0xA4D30E5715339878ull); // GOLDEN(rivernet_synthetic_slope) — kWorldGenVersion 3: synthetic-tile spectral-gap octaves (was 0xE4944F92B37F60FB at v2)
+    CHECK_EQ(dA.h, 0xEC84E0B592821C38ull); // GOLDEN(rivernet_synthetic_slope)
+    // Moved TWICE in the v8 wave, as predicted. First at 2a, when
+    // SyntheticTileSampler began emitting the physical climate encoding and so
+    // changed the precipitation byte this graph is weighted by (0xA4D30E5715339878
+    // -> 0xB5EBA6B2D131223E). Then here, when the weight itself became mm/yr
+    // rather than the raw byte (kRiverNetVersion 1 -> 2). Both are recorded
+    // because a single re-pin would hide that two independent things moved. — kWorldGenVersion 3: synthetic-tile spectral-gap octaves (was 0xE4944F92B37F60FB at v2)
 }
 
 VXC_TEST(rivernet_graph_diff_dam_replay_matches_live) {
