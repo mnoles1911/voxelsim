@@ -2516,6 +2516,15 @@ struct FVoxelWorldImpl
 	int64 CandidatesRejectedSinceLog = 0; // bounded admission: in-annulus candidates NOT admitted (never became records)
 	int64 RecordsDroppedSinceLog = 0;     // bounded admission: queued-but-never-meshed records displaced by nearer work
 
+	// Per-level breakouts of the three above. The global tallies cannot answer
+	// "this ring keeps admitting records that never mesh -- who is removing
+	// them", because every ring's adds and removes land in the same number.
+	// Added when R0 was measured admitting ~512 records per pass while its
+	// tracked count stayed at about one pass worth.
+	int64 LevelRecordsAdded[VoxelCoords::kNumLevels] = {};
+	int64 LevelRecordsDropped[VoxelCoords::kNumLevels] = {};
+	int64 LevelRecordsEvicted[VoxelCoords::kNumLevels] = {};
+
 	// --- Buried-chunk pre-dispatch skip, step 1 census (docs/status.md).
 	// Per RING LEVEL, over the same 5s window as everything above: results
 	// drained, of which zero-quad, split by composition. The existing
@@ -3356,6 +3365,22 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       VoxelStreamAdmission::GetPendingJobCap(),
 	       WidestAdmissionCutoffM(),
 	       (long long)CandidatesRejectedSinceLog, (long long)RecordsDroppedSinceLog);
+
+	{
+		// added / dropped / evicted per ring. A ring whose adds far exceed its
+		// residency, with drops and evictions to match, is churning rather than
+		// filling -- and which of the two columns is non-zero says WHICH removal
+		// path is doing it.
+		FString Line;
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			Line += FString::Printf(TEXT("R%d[+%lld -%lld ev%lld] "), Level,
+			                        (long long)LevelRecordsAdded[Level],
+			                        (long long)LevelRecordsDropped[Level],
+			                        (long long)LevelRecordsEvicted[Level]);
+		}
+		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel records/level (5s window): %s"), *Line);
+	}
 	// Buried-chunk pre-dispatch skip, step 1 census. One line per ring level:
 	// results/zeroQuad is the fraction of that ring's worker output that
 	// produced no geometry at all, and air/solid/mixed says what those chunks
@@ -3451,6 +3476,9 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	AccumTicks = 0;
 	JobsDispatchedSinceLog = ResultsDrainedSinceLog = StaleDiscardsSinceLog = ZeroQuadAppliesSinceLog = 0;
 	RecordsAddedSinceLog = RecordsEvictedSinceLog = CandidatesRejectedSinceLog = RecordsDroppedSinceLog = 0;
+	FMemory::Memzero(LevelRecordsAdded);
+	FMemory::Memzero(LevelRecordsDropped);
+	FMemory::Memzero(LevelRecordsEvicted);
 
 	MaxRecomputeMs = 0.f;
 	MaxExitScanMs = 0.f;
@@ -4693,6 +4721,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 
 					VoxelStreaming::FChunkRecord& NewRecord = ChunkRecords.Add(LevelKey);
 					++RecordsAddedSinceLog;
+					++LevelRecordsAdded[QueueLevel];
 					AdmissionsThisLevel += bOverlayAware ? 0 : 1;
 					NewRecord.bDeepAnchorRelative = bDeepAnchorRelative;
 					if (bOverlayAware)
@@ -4833,6 +4862,7 @@ bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 Ent
 			{
 				ChunkRecords.Remove(Entry.Key);
 				++RecordsDroppedSinceLog;
+				++LevelRecordsDropped[FMath::Clamp(Entry.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
 				--ToDrop;
 				continue;
 			}
@@ -6390,6 +6420,7 @@ void FVoxelWorldImpl::DrainUnloads()
 		ChunkRecords.Remove(Key);
 		++TotalChunksUnloaded;
 		++RecordsEvictedSinceLog;
+		++LevelRecordsEvicted[FMath::Clamp(Key.Level, 0, VoxelCoords::kNumLevels - 1)];
 	}
 	// Re-queue the deferred component-bearing unloads (still in PendingUnloadSet,
 	// still tracked) so they're retried next frame under the render budget.
