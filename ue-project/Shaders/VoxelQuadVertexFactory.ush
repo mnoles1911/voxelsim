@@ -101,16 +101,36 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 // the empty vertex declaration is the prime suspect. Remove once resolved.
 #if VOXEL_VF_DEBUG_QUAD
 	{
-		const float S = 2000.0f;   // 20 m across, impossible to miss
-		float2 DebugCorners[6] = {
-			float2(0, 0), float2(0, S), float2(S, S),
-			float2(0, 0), float2(S, S), float2(S, 0)
-		};
-		// Only the first quad draws; the rest collapse to a degenerate point so
-		// they cost nothing and cannot obscure the result.
-		Intermediates.Position = (QuadIndex == 0)
-			? float3(DebugCorners[CornerIndex].x, DebugCorners[CornerIndex].y, 0.0f)
-			: float3(0.0f, 0.0f, 0.0f);
+		// A CUBE, not a single quad.
+		//
+		// The first version of this test drew one horizontal quad and concluded
+		// from its absence that the draw never rasterises. That conclusion was
+		// unsound: the quad sat above the camera, so we were looking at its
+		// underside, and backface culling alone would explain the blank frame.
+		//
+		// Six outward-facing sides cannot all be culled from any viewpoint, so
+		// this version distinguishes "nothing rasterises" from "I aimed a
+		// single-sided surface away from the camera".
+		const float S = 2000.0f;   // 20 m
+		const uint Face = QuadIndex;
+		const uint FAxis = Face / 2u;
+		const bool bPositiveFace = (Face % 2u) == 1u;
+		const uint FU = (FAxis + 1u) % 3u;
+		const uint FV = (FAxis + 2u) % 3u;
+
+		float2 Fwd[6] = { float2(0,0), float2(0,S), float2(S,S),
+		                  float2(0,0), float2(S,S), float2(S,0) };
+		float2 Rev[6] = { float2(0,0), float2(S,S), float2(0,S),
+		                  float2(0,0), float2(S,0), float2(S,S) };
+		const float2 C = bPositiveFace ? Fwd[CornerIndex] : Rev[CornerIndex];
+
+		float3 P = float3(0.0f, 0.0f, 0.0f);
+		P[FAxis] = bPositiveFace ? S : 0.0f;
+		P[FU] = C.x;
+		P[FV] = C.y;
+
+		// Faces 0-5 form the cube; every other quad collapses to a point.
+		Intermediates.Position = (QuadIndex < 6u) ? P : float3(0.0f, 0.0f, 0.0f);
 	}
 #endif
 
