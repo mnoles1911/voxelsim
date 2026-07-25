@@ -601,6 +601,7 @@ namespace
 
 #include "VoxelGpuChunkComponent.h"
 #include "VoxelGpuPoolComponent.h"
+#include "VoxelClimateProbe.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/Pawn.h"
 #include "Engine/World.h"
@@ -938,6 +939,29 @@ namespace
 
 namespace
 {
+	// Climate for one chunk, sampled at its world centre.
+	//
+	// The CPU path samples per QUAD; this samples per CHUNK. A chunk is 3.2 m
+	// across a 30 m climate raster cell -- roughly 1/100th of a pixel's area --
+	// and climate varies as a smooth bilinear ramp over that distance, so the
+	// difference is a gentle chunk-to-chunk gradient rather than banding. The
+	// CPU path's own comment already describes its per-quad sampling as ~10x
+	// oversampling the source raster.
+	//
+	// Returns 0..1 temperature/precipitation, matching what the CPU path writes
+	// into vertex colour B/A for T_VoxelBiomeLUT.
+	FVector2f SampleChunkClimate(const FVector& PoolWorldOrigin, const FVector3f& ChunkOriginUU)
+	{
+		// Chunk centre: the region is 64 voxels, so 320 UU in from its origin.
+		const double CentreX = PoolWorldOrigin.X + double(ChunkOriginUU.X) + 320.0;
+		const double CentreY = PoolWorldOrigin.Y + double(ChunkOriginUU.Y) + 320.0;
+
+		VoxelClimate::EnsureInitialized();
+		const FVoxelClimateBytes Bytes = VoxelClimate::SampleClimateAtWorldUU(CentreX, CentreY);
+		return FVector2f(float(Bytes.Temperature) / 255.0f,
+		                 float(Bytes.Precipitation) / 255.0f);
+	}
+
 	void SpawnPoolCommand(const TArray<FString>& Args, UWorld* World)
 	{
 		if (World == nullptr || !VoxelGpuWorldGen::IsSupportedOnCurrentRHI())
@@ -991,8 +1015,9 @@ namespace
 		{
 			const int32 Gx = I % Side;
 			const int32 Gy = I / Side;
-			Handles.Add(Pool->AddChunk(Rebased,
-				FVector3f(float(Gx) * 640.0f, float(Gy) * 640.0f, 0.0f), 0));
+			const FVector3f Origin(float(Gx) * 640.0f, float(Gy) * 640.0f, 0.0f);
+			Handles.Add(Pool->AddChunk(Rebased, Origin, 0,
+				SampleChunkClimate(SpawnLocation, Origin)));
 		}
 
 		// CHURN: drop every other chunk and re-add half of them. This is what
@@ -1015,8 +1040,9 @@ namespace
 			{
 				const int32 Gx = I % Side;
 				const int32 Gy = I / Side;
-				if (Pool->AddChunk(Rebased,
-					FVector3f(float(Gx) * 640.0f, float(Gy) * 640.0f, 900.0f), 0) != INDEX_NONE)
+				const FVector3f ReAddOrigin(float(Gx) * 640.0f, float(Gy) * 640.0f, 900.0f);
+				if (Pool->AddChunk(Rebased, ReAddOrigin, 0,
+					SampleChunkClimate(SpawnLocation, ReAddOrigin)) != INDEX_NONE)
 				{
 					++ReAdded;
 				}

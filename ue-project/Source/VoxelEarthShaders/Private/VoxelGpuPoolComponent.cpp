@@ -22,12 +22,14 @@ public:
 	FVoxelGpuPoolSceneProxy(UVoxelGpuPoolComponent* Component,
 	                        const TArray<uint64>& InQuads,
 	                        const TArray<uint32>& InChunkIds,
-	                        const TArray<FVector4f>& InOrigins)
+	                        const TArray<FVector4f>& InOrigins,
+	                        const TArray<FVector2f>& InClimate)
 		: FPrimitiveSceneProxy(Component)
 		, VertexFactory(GetScene().GetFeatureLevel())
 		, Quads(InQuads)
 		, ChunkIds(InChunkIds)
 		, Origins(InOrigins)
+		, Climate(InClimate)
 		, NumQuads(InQuads.Num())
 		, NumChunks(InOrigins.Num())
 	{
@@ -77,8 +79,15 @@ public:
 		OriginSRV = RHICmdList.CreateShaderResourceView(
 			OriginBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(OriginBuffer));
 
+		ClimateBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
+			RHICmdList, TEXT("VoxelGpuPool.ChunkClimate"),
+			EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
+			MakeConstArrayView(Climate));
+		ClimateSRV = RHICmdList.CreateShaderResourceView(
+			ClimateBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(ClimateBuffer));
+
 		VertexFactory.SetQuadBufferSRV(QuadBufferSRV);
-		VertexFactory.SetPoolBuffers(OriginSRV, ChunkIdSRV);
+		VertexFactory.SetPoolBuffers(OriginSRV, ChunkIdSRV, ClimateSRV);
 		VertexFactory.InitResource(RHICmdList);
 
 		UE_LOG(LogTemp, Log,
@@ -88,6 +97,7 @@ public:
 		Quads.Empty();
 		ChunkIds.Empty();
 		Origins.Empty();
+		Climate.Empty();
 	}
 
 	FPrimitiveViewRelevance GetViewRelevance(const FSceneView* View) const override
@@ -152,9 +162,10 @@ private:
 	TArray<uint64> Quads;
 	TArray<uint32> ChunkIds;
 	TArray<FVector4f> Origins;
+	TArray<FVector2f> Climate;
 
-	FBufferRHIRef QuadBuffer, ChunkIdBuffer, OriginBuffer;
-	FShaderResourceViewRHIRef QuadBufferSRV, ChunkIdSRV, OriginSRV;
+	FBufferRHIRef QuadBuffer, ChunkIdBuffer, OriginBuffer, ClimateBuffer;
+	FShaderResourceViewRHIRef QuadBufferSRV, ChunkIdSRV, OriginSRV, ClimateSRV;
 
 	int32 NumQuads = 0;
 	int32 NumChunks = 0;
@@ -180,6 +191,8 @@ void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 	// Reserve the hidden chunk at index 0. Everything freed points here.
 	ChunkOrigins.Reset();
 	ChunkOrigins.Add(FVector4f(0.0f, 0.0f, 0.0f, 0.0f));
+	ChunkClimate.Reset();
+	ChunkClimate.Add(FVector2f(0.5f, 0.5f));
 
 	Allocations.Reset();
 	NumLiveChunks = 0;
@@ -187,7 +200,8 @@ void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 }
 
 int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
-                                       const FVector3f& OriginUU, int32 Level)
+                                       const FVector3f& OriginUU, int32 Level,
+                                       const FVector2f& Climate)
 {
 	check(Pool.GetCapacityQuads() > 0);   // InitPool first
 
@@ -205,6 +219,7 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 	const uint32 ChunkId = uint32(ChunkOrigins.Num());
 	const float Scale = float(1 << Level);
 	ChunkOrigins.Add(FVector4f(OriginUU.X, OriginUU.Y, OriginUU.Z, Scale));
+	ChunkClimate.Add(Climate);
 
 	for (int32 I = 0; I < InQuads.Num(); ++I)
 	{
@@ -287,7 +302,7 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 	const int32 Used = int32(Pool.GetHighWaterMark());
 	TArray<uint64> UsedQuads(PooledQuads.GetData(), Used);
 	TArray<uint32> UsedIds(QuadChunkIds.GetData(), Used);
-	return new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, ChunkOrigins);
+	return new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, ChunkOrigins, ChunkClimate);
 }
 
 FBoxSphereBounds UVoxelGpuPoolComponent::CalcBounds(const FTransform& LocalToWorld) const

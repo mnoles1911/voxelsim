@@ -19,7 +19,8 @@ handoff. Build is clean; every change below is in the binary.
 | Terrain amplification proposal | ⏸️ Reconciled and PARKED — `docs/terrain-amplification-reconciliation.md` |
 | **G1 — GPU greedy mesher** | ✅ **COMPLETE. Gate green.** (was mis-recorded as unstarted) |
 | **G2a — kernels in-engine via RDG** | ✅ **COMPLETE. Gate green, first run** — UE digest == bench digest |
-| **G2 — GPU geometry pool + custom draw** | ⬜ **NEXT.** The hard part: draw without per-chunk `AddPrimitive`. |
+| **G2 — GPU geometry pool + custom draw** | ✅ **DONE.** 256 chunks / 876k quads in ONE primitive, ONE draw. Survives churn. Visually matches the CPU path. |
+| **G3 — drive the pool from the cascade** | ⬜ **NEXT.** Plan in `docs/gpu-g3-integration-plan.md`. |
 
 ## G1 is done — do not rebuild it
 

@@ -96,12 +96,14 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	// from the uniform buffer instead.
 	float3 ChunkOrigin = VoxelVF.ChunkOriginUU;
 	float ChunkScale = VoxelVF.LevelScale;
+	float2 ChunkClimate = float2(0.5f, 0.5f);
 	if (VoxelVF.PoolMode != 0u)
 	{
 		const uint ChunkId = VoxelVF.QuadChunkIds[QuadIndex];
 		const float4 Entry = VoxelVF.ChunkOrigins[ChunkId];
 		ChunkOrigin = Entry.xyz;
 		ChunkScale = Entry.w;
+		ChunkClimate = VoxelVF.ChunkClimate[ChunkId];
 	}
 
 	const FVoxelQuadVertex Decoded = DecodeVoxelQuadVertex(Packed, CornerIndex, ChunkScale);
@@ -159,11 +161,32 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	// the neutral midpoint. Expect the GPU path's biome tint to differ from the
 	// CPU path until G4 supplies climate GPU-side. This is a predicted
 	// difference, not a bug to chase during the G2 visual A/B.
+	// B/A carry climate, sampled once per chunk on the CPU and looked up above.
+	// Single-chunk mode has no per-chunk table, so they stay neutral there and
+	// its biome tint will differ from the CPU path -- pool mode is the one
+	// that matches.
+	// R is a BINARY sky-facing flag, not the material id.
+	//
+	// The CPU path documents this at length (VoxelClimateProbe.h): thresholding
+	// a categorical id through the FColor->shader transform proved unreliable,
+	// so R is 0 or 255 -- the fixed points of any monotonic per-channel
+	// transform -- and surface-ness is derived from FACE DIRECTION rather than
+	// material id, because the ids voxel-core actually emits here are only
+	// MAT_ROCK and MAT_SUBSOIL. Writing the id instead makes every quad read as
+	// subsurface, which is exactly the grey/tan the first pool render showed.
+	//
+	// Not yet mirrored: the CPU path also gates on proximity to the chunk
+	// surface, so a cave FLOOR (also a +Z face) is not tinted as hillside. That
+	// needs the chunk surface height GPU-side; without it, underground +Z faces
+	// will tint as if they were open sky.
+	const uint QPositive = (Packed.x >> 4) & 0xfu;
+	const bool bSkyFacing = (Axis == 2u) && (QPositive != 0u);
+
 	Intermediates.Color = half4(
-		(half)(Decoded.MaterialId / 255.0f),
+		bSkyFacing ? 1.0h : 0.0h,
 		(half)Decoded.AmbientOcclusion,
-		0.5h,
-		0.5h);
+		(half)ChunkClimate.x,
+		(half)ChunkClimate.y);
 
 	// World-planar UVs on the face's two in-plane axes, matching the CPU
 	// path's "position / 100, wrapped to a 32 m period". The wrap keeps the

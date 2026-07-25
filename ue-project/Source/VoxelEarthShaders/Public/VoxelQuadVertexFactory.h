@@ -40,6 +40,12 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadVertexFactoryParameters, )
 	// (which do not bind; see docs/gpu-g2-draw-path.md).
 	SHADER_PARAMETER_SRV(StructuredBuffer<float4>, ChunkOrigins)
 	SHADER_PARAMETER_SRV(StructuredBuffer<uint>, QuadChunkIds)
+	// Per-chunk climate: x = temperature, y = precipitation, both already
+	// remapped to 0..1 across this world's p1..p99 window. The material feeds
+	// them to the biome LUT. Sampled once per chunk on the CPU -- a chunk is
+	// ~1/100th the area of one 30 m climate pixel and the ramp across it is
+	// smooth, so the error is a gentle gradient rather than banding.
+	SHADER_PARAMETER_SRV(StructuredBuffer<float2>, ChunkClimate)
 	SHADER_PARAMETER(uint32, PoolMode)
 END_GLOBAL_SHADER_PARAMETER_STRUCT()
 
@@ -56,6 +62,7 @@ struct FVoxelChunkDrawData
 	float LevelScale = 1.0f;
 	FShaderResourceViewRHIRef ChunkOriginsSRV;
 	FShaderResourceViewRHIRef QuadChunkIdsSRV;
+	FShaderResourceViewRHIRef ChunkClimateSRV;
 	bool bPoolMode = false;
 };
 
@@ -86,10 +93,12 @@ public:
 
 	// Switches the factory to pool mode: per-quad chunk ids index a per-chunk
 	// origin table, so one factory serves every chunk in the pool.
-	void SetPoolBuffers(FShaderResourceViewRHIRef InOrigins, FShaderResourceViewRHIRef InChunkIds)
+	void SetPoolBuffers(FShaderResourceViewRHIRef InOrigins, FShaderResourceViewRHIRef InChunkIds,
+	                    FShaderResourceViewRHIRef InClimate)
 	{
 		ChunkOriginsSRV = MoveTemp(InOrigins);
 		QuadChunkIdsSRV = MoveTemp(InChunkIds);
+		ChunkClimateSRV = MoveTemp(InClimate);
 		bPoolMode = true;
 	}
 
@@ -101,6 +110,7 @@ private:
 	float LevelScale = 1.0f;
 	FShaderResourceViewRHIRef ChunkOriginsSRV;
 	FShaderResourceViewRHIRef QuadChunkIdsSRV;
+	FShaderResourceViewRHIRef ChunkClimateSRV;
 	bool bPoolMode = false;
 	TUniformBufferRef<FVoxelQuadVertexFactoryParameters> UniformBuffer;
 };

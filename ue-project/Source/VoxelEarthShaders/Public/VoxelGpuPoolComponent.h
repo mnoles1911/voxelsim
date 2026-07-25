@@ -37,7 +37,11 @@ public:
 	// Adds one chunk's quads at a component-space origin. Quads are expected in
 	// the GPU mesher's packed form, already re-based out of brick-local coords.
 	// Returns a handle, or INDEX_NONE if the pool has no contiguous room.
-	int32 AddChunk(const TArray<uint64>& InQuads, const FVector3f& OriginUU, int32 Level);
+	// Climate is temperature/precipitation already remapped to 0..1 across this
+	// world's p1..p99 window -- the same values the CPU path writes into vertex
+	// colour B/A for the biome LUT.
+	int32 AddChunk(const TArray<uint64>& InQuads, const FVector3f& OriginUU, int32 Level,
+	               const FVector2f& Climate = FVector2f(0.5f, 0.5f));
 
 	// Releases a chunk's range back to the pool.
 	//
@@ -77,6 +81,9 @@ private:
 
 	// xyz = chunk origin in component space (unreal units), w = mip scale.
 	TArray<FVector4f> ChunkOrigins;
+
+	// Parallel to ChunkOrigins, indexed by the same chunk id.
+	TArray<FVector2f> ChunkClimate;
 
 	// Chunk id 0 is RESERVED as the hidden chunk: origin (0,0,0), scale 0.
 	// Freed quads point at it and collapse to a degenerate point.
