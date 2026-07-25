@@ -1,138 +1,119 @@
-# Streaming-speed + GPU-rendering handoff (2026-07-24)
+# Handoff: streaming fixed, ADR-0006 signed, G1 is next (2026-07-25)
 
-Session handoff for the next engineer. All work is on branch
-**`claude/terrain-holes-wip`** (pushed to origin). **Nothing is merged to
-`main`.** Everything below is CPU-side streaming work plus a GPU design doc.
+Supersedes the 2026-07-24 handoff entirely. All work is on
+**`claude/terrain-holes-wip`**, pushed to origin, 9 commits ahead of the previous
+handoff. Build is clean; every change below is in the binary.
 
-## TL;DR state
+## State
 
 | Item | Status |
 |---|---|
-| See-through concentric rings (broken ring cross-fade) | ✅ Fixed, Matt confirmed |
-| Slow fill (minutes) | ✅ Adaptive applies → ~45 s, Matt confirmed |
-| Holes while moving | ⚠️ Coverage-based load-before-unload landed but **NOT yet tested in-engine** |
-| GPU-resident rendering | 📄 ADR-0006 + plan written, **pending Matt sign-off**, no code |
-| D (apply-priority), F (trim underground) | ⏸️ Held, not started |
+| Concentric rings of holes | ✅ **ROOT-CAUSED AND FIXED** (ring-seam admission, `749ad7b`) |
+| Radial line of missing chunks | ✅ Fixed by the same change, confirmed by Matt |
+| Chunks missing at rest | ✅ Gone — Matt confirmed "all chunks loaded, feels very fast" |
+| Load-before-unload coverage | ✅ Rewritten against `ChunkRecords` (`a4e35af`) — was a real bug, was NOT the holes |
+| Hitch regression from the fix | ✅ 47 → 6 (exact-seam admission); residual p50 cost accepted |
+| Real diffusion tiles | ✅ Now the project default, no command line needed |
+| ADR-0006 | ✅ **ACCEPTED**, signed by Matt, diagnosis measured not asserted |
+| G0 sizing study | ✅ Delivered — `docs/gpu-g0-sizing.md` |
+| Terrain amplification proposal | ⏸️ Reconciled and PARKED — `docs/terrain-amplification-reconciliation.md` |
+| **G1 — GPU greedy mesher** | ⬜ **NEXT. Not started.** |
 
-The **immediate next action is Matt (or you) testing the latest build in UE** —
-walk/fly fast and check whether the rolling-ring holes are gone. The editor DLL
-is already relinked; just reopen and play. If holes remain, see "If holes
-persist" below.
+## The one thing to build next: G1
 
-## What changed, commit by commit (on `claude/terrain-holes-wip`)
+**Goal:** implement the deterministic GPU greedy mesher so geometry can be
+produced entirely on the GPU, and gate it on byte-identical quad streams vs the
+CPU mesher.
 
-1. **`3db8089` Fix see-through LOD rings** — the M2 ring cross-fade
-   (`ComputeRingFadeParams` in `VoxelChunkComponent.cpp`) was fading real terrain
-   to transparent because `RingPresets` annuli ABUT with zero overlap, so the
-   dither cross-dissolve had no second LOD to dissolve into. Disabled by default;
-   `-VoxelRingCrossFade` re-enables the old fade for A/B. **Confirmed fixed.**
+- **Spec:** `docs/gpu-mesher-design.md` — `MeshCountMain` → scan → `MeshEmitMain`,
+  one thread per face-mask. Fully speced, previously unbuilt.
+- **It may already be partly done.** `voxel-core/shaders/prebuilt/` contains
+  `MeshCountMain.spv` and `MeshEmitMain.spv`, and the M0 gate harness already
+  chains them. **Check what exists before writing anything** — G1 may be mostly
+  "wire the existing kernels into UE via RDG" rather than "write the kernel".
+- **Gate:** bench meshes N regions CPU and GPU with byte-identical quad streams
+  (joins the existing columns+cells digest). AMD leg green.
+- **Verify with:** `build/voxel-core-msvc/bench/vxc_gpu.exe --radius 64`
+  (already built, runs in ~140 ms + verification). Current digest at radius 64 is
+  `591c7602bb9b0e62` on **worldgen v6**.
 
-2. **`ebf4fc7` Adaptive time-budgeted applies** — root cause of slow fill was
-   `voxel.Stream.MaxAppliesPerFrame=3` (render-thread `AddPrimitive` funnel).
-   `DrainResults` now drains until `voxel.Stream.ApplyBudgetMs` (default 6 ms)
-   with `MaxAppliesPerFrame` raised 3→64 as a ceiling. Companion caps: unloads
-   2→24, remeshes 2→8. Fill minutes→~45 s. **Confirmed better.**
+### Constraints G1/G2 must respect (found in G0, do not rediscover)
 
-3. **`5fc8145` Load-before-unload (timer)** — kept a visible LOD-transition chunk
-   drawn as a stand-in for `voxel.Stream.LodRetentionMs`. Helped but left
-   **rolling rings of holes**: under fast movement the fixed 1 s timer expired
-   before the replacement streamed in.
+1. **G2 must compact into ONE indirect draw.** `FMeshDrawCommand::SubmitDrawIndirectEnd`
+   issues exactly one indirect draw per command, and
+   `RHIMultiDrawIndexedPrimitiveIndirect` is **not** wired into the mesh-pass
+   system. This determines pool layout AND mesher output format.
+2. **Build on the Landscape pattern, do not hand-roll a renderer.** Static
+   relevance + `EnableGPUSceneSupportFlags` + `bViewDependentArguments` +
+   `ApplyViewDependentMeshArguments`, with culling in an `FSceneViewExtension` in
+   the game module. Shipping precedent, no engine fork. What genuinely needs
+   writing: pool suballocator, the mesher, one vertex factory with manual vertex
+   fetch.
+3. **Nanite is ruled out.** `NaniteBuilder` is an editor-only module; clusters
+   cannot be built at runtime in 5.8.
+4. **Voxel STATE stays bit-exact CPU↔GPU.** ADR-0006's display-only carve-out
+   covers the mesh only. No floats in `voxel-core` (CI-enforced).
+5. **No gameplay system may read display geometry** (ADR-0006 invariant 3,
+   fourth bullet). This world is networked; a client-side read of GPU geometry
+   is a desync vector.
 
-4. **`75a48a1` ADR-0006 + `docs/gpu-streaming-plan.md`** — GPU rendering design
-   (see below). Design only.
+## Why G1 matters, in one number
 
-5. **`995f054` Coverage-based load-before-unload** — replaces the timer with
-   actual-coverage release. This is the **untested** change that should kill the
-   rolling rings. Mechanism:
-   - `ColumnGeomCount` (member `TMap<FIntVector,int32>` in `FVoxelWorldImpl`):
-     per `(level, chunkX, chunkY)` XY-column count of resident records with
-     visible geometry (`LastQuadCount>0`). Maintained by `ReconcileColumnGeom`
-     at geometry gain/loss sites.
-   - On an LOD-transition eviction, `RecomputeDesiredSet` stamps
-     `FChunkRecord::RetainReplaceDir` (finer took over from inside / coarser from
-     outside) and a safety-cap time.
-   - `DrainUnloads` keeps the stand-in drawn until `ReplacementCovered` reports
-     the replacement footprint is on screen (finer: all 4 child columns at L-1
-     have geometry; coarser: the L+1 parent column does), OR the safety cap
-     (`LodRetentionMs`, now default 5000 ms) elapses.
+- GPU generation measured: **~92,000 chunks/sec** (AMD RX 7800 XT, radius 128 m).
+- CPU worker fleet measured in-engine the same day: **703–968 chunks/sec**.
+- The whole 2 km cascade (10,503 chunks) is ~0.11 s on GPU vs ~11–14 s on CPU.
+  That ~11 s **is** the fast-flight catch-up Matt reports.
 
-## How to build + test
+**Matt's decision: R0 target = 128 m** (10 cm voxels out to 128 m, from 64 m
+today). It is 4× the level-0 work — ~8,100 R0 chunks vs 2,035 — which is ~11.5 s
+of CPU fill and ~0.09 s of GPU. **Do not flip R0 before G1/G3 land.**
+`RingPresets` (`VoxelWorldSubsystem.h:86`) is `static constexpr` and must become
+a runtime accessor first; fold that into G3.
+
+## Open, not blocking G1
+
+- **Residual perf cost of the seam fix:** p50 14.92 → 17.52 ms, chunks/s
+  968 → 703 vs the pre-fix baseline. Real extra chunks where holes used to be.
+  Exactly what ADR-0006 removes.
+- **Deep-column waste:** 44.6% of R0 worker time meshes buried chunks emitting
+  zero quads. Measured ceiling for fixing it: **+34.8% useful throughput**
+  (`-VoxelNoUnderground` is the upper-bound switch, already exists). Safe path is
+  moving the exact band skip from dispatch-time to admission-time; the deep column
+  is residency-independent for collision/dig/water (all go through
+  `World::materialAt`), so the handoff's old "RISKY — touches collision" note was
+  wrong. Needs a downward escape hatch (`EditedFootprintMinZ` → widen `ChunkZMin`)
+  first.
+- **Bounded-admission straggler:** a few chunks never load until the player moves.
+  Diagnosed to the refill path, not fixed. In the `docs/status.md` backlog.
+- **Min-spec-proxy M1 gate re-run** still owed; today's numbers are
+  default-quality and cannot be read against the historical gate rows.
+- **`status.md` determinism row is stale** — goldens predate worldgen v6.
+
+## Two methodology rules earned the hard way
+
+1. **Discard the first run after any build.** Cold PSO state costs ~20%
+   throughput and reads exactly like a regression. It produced one false
+   "regression" report this session.
+2. **Never A/B this renderer through scalability cvars.** `r.ShadowQuality 0`
+   desyncs the BeginPlay PSO precache and measures precache invalidation instead
+   — 118 hitches of pure artifact. Change one primitive flag, or use
+   `r.ScreenPercentage` (resolution scale, no shader permutation change).
+
+## A/B switches that now exist (all default to current behaviour)
+
+`voxel.Render.CastShadow` · `voxel.Stream.JobsInFlightPerCore` ·
+`-VoxelNoColdBandThrottle` · `-VoxelStaticRelevance` · `-VoxelNoUnderground` ·
+`-VoxelBuriedSkip=0` · `voxel.Stream.LodRetentionMs`
+
+## Verification recipe
 
 ```
 "D:/UE_5.8/Engine/Build/BatchFiles/Build.bat" VoxelEarthEditor Win64 Development \
   -Project="D:/voxelsim/ue-project/VoxelEarth.uproject" -WaitMutex -NoHotReloadFromIDE
+
+UnrealEditor.exe VoxelEarth.uproject -game -windowed -resx=1920 -resy=1080 \
+  -nosplash -unattended "-VoxelSpawnAt=-84480,53760" "-VoxelPerfRun=60"
 ```
-Close the UE editor first (it locks `UnrealEditor-VoxelEarth.dll`; a compile
-succeeds but the link fails with LNK1104 while it's open). Repro framing for the
-holes: real tiles, `-VoxelSpawnAt=-84480,53760`, then walk/fly fast.
-
-Runtime knobs (no rebuild needed):
-- `voxel.Stream.ApplyBudgetMs 10` — fill harder.
-- `voxel.Stream.LodRetentionMs 0` — disable retention (holes return; A/B proof).
-- `voxel.Stream.LodRetentionMs 8000` — longer safety cap.
-- `-VoxelRingCrossFade` — restore the old (broken) fade.
-
-## If holes persist after the coverage change
-
-Debug order:
-1. Confirm retention fires at all: temporarily log in the eviction block
-   (`RecomputeDesiredSet`, where `RetainReplaceDir` is set) and in the
-   `DrainUnloads` coverage gate.
-2. Check `ColumnGeomCount` correctness — **prime suspect: a leak makes a column
-   read "covered" when it isn't → premature park → hole.** The two pre-dispatch
-   **buried/sky skip sites** in `DispatchJobs` (search `BuriedSkipEnabled` and
-   `IsChunkProvablyAllAir`) clear a record's geometry but were **left without a
-   `ReconcileColumnGeom(..., false)` call** (records there normally have no
-   component, so low-risk — but verify). Add the reconcile there if a counted
-   chunk can reach those paths.
-3. Consider that some holes may be the **residual ring-boundary T-junction
-   seams** (the original bug on this branch, commit `3b33a79` — a partial skirt
-   fix in `MeshChunkBricks`/`ComputeRingSkirtMask`). Those are thin cracks at
-   boundaries, present regardless of load speed. Bisect with
-   `voxel.Stream.LodRetentionMs 0` (if holes remain with retention off AND on,
-   they're likely seams, not load/unload).
-
-## Not started / TODO backlog
-
-- **D — apply-priority**: the `ResultsQueue` applies FIFO-by-completion. Dispatch
-  is already near-first (ring quota + sorted queues), so only add explicit
-  apply-side priority if testing shows far/underground chunks landing ahead of
-  the terrain under the player. Held pending the coverage test.
-- **F — trim underground R0 column**: the deep R0 column (38.4 m, hidden) competes
-  for the apply budget with the visible surface. Defer/skip it until dug.
-  **Risky** — touches dig-reveal + collision; do it isolated, after the moving-
-  holes are confirmed fixed, with its own A/B. (`bDeepAnchorRelative` on
-  `FChunkRecord`, `VoxelUnderground` namespace.)
-- **Debug overlay**: add `ColumnGeomCount` size + retained-stand-in count to the
-  HUD (`VoxelEarthHUD.cpp`) so this is observable in-engine.
-- **Reconcile the two skip sites** (see debug step 2 above) for full correctness.
-- **M1 gate re-run**: these throttles were raised past the M1 zero-hitch tuning
-  (Matt approved trading strict zero-hitch for silky/fast). A fresh
-  `-VoxelPerfRun` p95 + hitch count should be recorded before merging to main.
-- **Residual ring-boundary T-junction skirt** (`3b33a79`) — the skirt only fires
-  on faces whose neighbour is a finer ring; verify it actually closes the thin
-  seams or finish it.
-- **Underground rework** (caves/tunnels/cavern-lakes) — separate design-led
-  backlog item, Matt wants human input; NOT part of this workstream. See the
-  `underground-rework-backlog` memory.
-
-## GPU rendering — the big leap (design done, needs sign-off)
-
-`docs/adr/0006-gpu-resident-voxel-streaming.md` + `docs/gpu-streaming-plan.md`.
-Core decision: GPU-generated, GPU-resident geometry drawn via a few persistent
-primitives + indirect draws, so streaming a chunk is a pool-region + draw-arg
-update, **never a per-chunk `FScene` mutation** (that funnel is the real ceiling;
-the CPU work above only widens it). **Key doctrine call:** the runtime mesh is
-DISPLAY-ONLY and not required cross-vendor bit-exact — authority (voxel state,
-collision, dig, water, replication) stays on the CPU integer-deterministic path.
-This is flagged in the ADR for **Matt's explicit sign-off** because it interprets
-the §2 determinism boundary. Builds on ADR-0001 (integer HLSL), the done+AMD-
-verified voxelize kernel, and the speced-but-unbuilt `docs/gpu-mesher-design.md`.
-Milestones G0 (sizing study — Matt picks view distance vs VRAM) → G5 (flip
-default). **Do not start coding until Matt signs off ADR-0006.**
-
-## Merge path
-When the coverage change is verified in-engine and the M1 gate is re-run, this
-branch (`claude/terrain-holes-wip`) can go to `main` as one PR (it also carries
-the ADR + plan docs). Consider splitting the docs into their own PR if you want
-the ADR reviewable independently of the code.
+Writes `Saved/PerfRuns/perf_*.json`. Close the editor first (it locks the DLL —
+a failed link DELETES it and the project then will not launch until a good build).
+Current reference: post-warmup p50 ~17.5 ms, p95 ~26 ms, ~6 hitches, ~703 chunks/s.
