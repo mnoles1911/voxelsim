@@ -526,7 +526,7 @@ double AVoxelClipmapActor::SpacingUUForLevel(int32 LevelIndex)
 	// also what makes a radius A/B a fair comparison rather than one side
 	// photographing a hole.
 	static const double RingEdgeUU =
-		UVoxelWorldSubsystem::RingPresets[UVoxelWorldSubsystem::GetMaxRingLevel()].OuterMeters * 100.0;
+		UVoxelWorldSubsystem::GetRingPresets()[UVoxelWorldSubsystem::GetMaxRingLevel()].OuterMeters * 100.0;
 	static const double Spacing0UU = RingEdgeUU / double(HoleHalfIndex);
 	return Spacing0UU * double(int64(1) << LevelIndex);
 }

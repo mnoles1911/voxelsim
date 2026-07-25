@@ -83,7 +83,13 @@ public:
 		double InnerMeters = 0.0;
 		double OuterMeters = 0.0;
 	};
-	static constexpr FRingPreset RingPresets[VoxelCoords::kNumLevels] = {
+	// Compile-time DEFAULTS only -- unchanged numeric values from the pre-M2
+	// single ring. Nothing outside GetRingPresets() below should read this
+	// table directly any more: a runtime override
+	// (-VoxelRingInnerMeters=/-VoxelRingOuterMeters=) must be visible to every
+	// reader of ring radii, and GetRingPresets() is the only place that knows
+	// both the defaults and the override switches.
+	static constexpr FRingPreset kDefaultRingPresets[VoxelCoords::kNumLevels] = {
 		{0.0, 64.0},
 		{64.0, 128.0},
 		{128.0, 256.0},
@@ -96,11 +102,29 @@ public:
 	// chunks at that level, and AVoxelClipmapActor derives its ENTIRE vertex
 	// spacing from RingPresets[kNumLevels-1].OuterMeters, so a zero there
 	// collapses the whole 30 km heightmap to a degenerate zero-extent mesh.
-	static_assert(UE_ARRAY_COUNT(RingPresets) == VoxelCoords::kNumLevels, "RingPresets must have one entry per level");
+	static_assert(UE_ARRAY_COUNT(kDefaultRingPresets) == VoxelCoords::kNumLevels, "kDefaultRingPresets must have one entry per level");
 	static constexpr double UnloadRingMultiplier = 1.25;
 
+	// Runtime accessor for the ring radii (docs/streaming-handoff.md: this
+	// table was static constexpr and had to become a runtime accessor before
+	// R0 could move to 128 m -- this is that accessor; R0 itself is NOT moved
+	// by this change, only the storage). Returns kDefaultRingPresets unless
+	// overridden via -VoxelRingInnerMeters=<L0>,<L1>,.../-VoxelRingOuterMeters=
+	// <L0>,<L1>,... (comma lists, one entry per level, trailing levels left at
+	// default if the list is short -- same convention as
+	// VoxelStreamAdmission::GetRingSlotFloors's -VoxelRingFloors=).
+	//
+	// Command-line rather than a cvar: ring radii decide the shape of the
+	// FIRST desired set. FVoxelWorldImpl::RecomputeDesiredSet runs on the
+	// very first tick, before any -ExecCmds console command has had a chance
+	// to run, so a cvar set that way would only affect chunks streamed in
+	// AFTER the command executes and would leave the initial set built from
+	// stale radii -- same reasoning as -VoxelMaxRingLevel and -VoxelPerfFlight
+	// (see their doc comments). Resolved once, on first call, and cached.
+	static const FRingPreset* GetRingPresets();
+
 	// Outermost ring level actually streaming this run (-VoxelMaxRingLevel=<N>,
-	// default kNumLevels-1). RingPresets[GetMaxRingLevel()].OuterMeters is
+	// default kNumLevels-1). GetRingPresets()[GetMaxRingLevel()].OuterMeters is
 	// therefore where the voxel world really ends, which is what
 	// AVoxelClipmapActor has to butt its inner hole against -- see
 	// SpacingUUForLevel. Resolved once from the command line at first use.
@@ -108,8 +132,10 @@ public:
 
 	// Back-compat aliases (R0's radii; a handful of log lines still reference
 	// these by name -- unchanged numeric values from the pre-M2 single ring).
-	static constexpr double LoadRadiusMeters = RingPresets[0].OuterMeters;
-	static constexpr double UnloadRadiusMeters = RingPresets[0].OuterMeters * UnloadRingMultiplier;
+	// Functions, not constants, now that level 0's radii can be overridden at
+	// runtime (-VoxelRingOuterMeters=).
+	static double GetLoadRadiusMeters() { return GetRingPresets()[0].OuterMeters; }
+	static double GetUnloadRadiusMeters() { return GetRingPresets()[0].OuterMeters * UnloadRingMultiplier; }
 
 	// Stage 2 decisions table: dig/place raycast range.
 	static constexpr double DigPlaceRangeMeters = 8.0;

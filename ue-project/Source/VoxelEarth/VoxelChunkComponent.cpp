@@ -996,7 +996,7 @@ namespace
 			return Params;
 		}
 
-		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::RingPresets[Level];
+		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::GetRingPresets()[Level];
 		const float InnerUU = float(Preset.InnerMeters * 100.0);
 		const float OuterUU = float(Preset.OuterMeters * 100.0);
 		const float Band = (OuterUU - InnerUU) * kFadeBandFraction;
