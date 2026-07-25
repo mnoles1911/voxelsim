@@ -79,12 +79,47 @@ never-meshed chunk has neither a component nor a pool slot, so `HoldsGeometry()`
 is false there on both paths, exactly as before); `ReplacementCovered`; the
 per-update copy throttle (fixed, and it moved `pending`, not `total`).
 
-The next thing I would do is diff what the pooled branch of `ApplyMeshResult`
-leaves on `FChunkRecord` against what the component branch leaves, field by
-field, for a level-0 chunk -- the return value included, since `DrainResults`
-uses it for its apply budget and hitch attribution. The component branch also
-`MoveTemp`s `Quads` and the pooled branch does not, which is a real behavioural
-difference in what the caller sees afterwards.
+### Traced: this is the bounded-admission straggler, amplified
+
+It is not in the pooled branch at all. The anchor is byte-identical between the
+two runs (`-8448000, 5376000, 55054`), and `tracked` is almost exactly the sum
+of the ring totals, so R0 genuinely only ever gets ~408 *records* --
+`RecomputeDesiredSet` stops admitting.
+
+R0 is admitted a slice at a time: `AdmissionsThisLevel >= Cap / 4` rejects the
+rest of a pass and arms `bAdmissionDeferredWork[0]`. A later pass refills, but
+only when that ring's pending queue is **empty**
+(`GetPerLevelRefillEnabled` branch, ~2970). And at the end of every
+`RecomputeDesiredSet` (~4967):
+
+```cpp
+if (bLevelScannedThisCall[Level] && LevelCandidatesRejectedThisCall[Level] == 0)
+    bAdmissionDeferredWork[Level] = false;
+```
+
+So the refill trigger is disarmed by any pass that happens to enumerate without
+rejecting, and re-armed only by a pass that rejects. That is a race against how
+fast the ring's queue drains -- and the pooled path drains R0 much faster,
+because applying a chunk no longer costs an `FScene::AddPrimitive`. Same code,
+same flags, different timing: `scans R0=1` under the pool versus `11` on the
+component path.
+
+This is the **"bounded-admission straggler"** already in the backlog below
+("a few chunks never load until the player moves. Diagnosed to the refill path,
+not fixed"). ADR-0006 turned "a few chunks" into ~3000, because it removed the
+very cost that was accidentally keeping the queue non-empty long enough for the
+trigger to stay armed.
+
+Two consequences worth stating plainly:
+
+1. **Fix it in the refill path, not in the pool.** The pooled path is behaving
+   correctly; it is exposing a latent bug. Likely shape: arm the trigger from
+   "this ring still has undesired-but-wanted footprints" rather than from
+   "this pass rejected something", so it does not depend on timing at all.
+2. **It is a pre-existing CPU-path bug too**, and fixing it should be validated
+   on both paths. Anything that makes the component path faster -- which is the
+   whole point of the remaining G phases -- will start surfacing it there as
+   well.
 
 Two tools for narrowing it:
 

@@ -3225,6 +3225,11 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       JobsInFlightCounter.GetValue(), PendingJobNum(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num(),
 	       bAnchorUnderground ? 1 : 0, DeepTracked, DeepWithGeometry, (long long)ResidentQuads);
 
+	// The anchor drives every ring footprint, so when one ring's population
+	// differs between two runs this is the first thing to compare.
+	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel anchor: (%.0f, %.0f, %.0f)"),
+	       LastAnchorLocation.X, LastAnchorLocation.Y, LastAnchorLocation.Z);
+
 	// ADR-0006 G3. Only logged when the pool is actually in use, so the
 	// existing log shape is untouched on the shipping path. Free vs largest
 	// run is the fragmentation signal: they diverge long before allocations
