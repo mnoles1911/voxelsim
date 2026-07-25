@@ -32,9 +32,21 @@ public class VoxelEarthShaders : ModuleRules
 		PublicDependencyModuleNames.AddRange(new string[]
 		{
 			"Core",
+			"CoreUObject",
 			"RenderCore",   // AddShaderSourceDirectoryMapping, FGlobalShader, FRDGBuilder
-			"RHI"           // FRHIGPUBufferReadback, buffer descriptors
+			"RHI",          // FRHIGPUBufferReadback, buffer descriptors
+			// The vertex factory needs both: FMaterialShaderParameters (for
+			// ShouldCompilePermutation) and FMeshBatch live in Engine,
+			// FMeshMaterialShader and FMeshDrawSingleShaderBindings in Renderer.
+			"Engine",
+			"Renderer"
 		});
+
+		// Depending on Engine/Renderer from a PostConfigInit module is fine and
+		// is what shipping engine plugins do -- OpenColorIO is PostConfigInit
+		// and depends on both, and LidarPointCloudRuntime (the vertex factory
+		// this one is modelled on) is PostConfigInit too. Module dependency is
+		// DLL load order, which is a separate thing from engine initialisation.
 
 		// Projects supplies IPluginManager/plugin paths. Not needed today (the
 		// shader directories are resolved from FPaths::ProjectDir), but the
