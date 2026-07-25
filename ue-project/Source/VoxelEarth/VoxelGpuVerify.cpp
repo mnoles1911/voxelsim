@@ -1062,6 +1062,77 @@ namespace
 		       Pool->GetNumChunks(), Pool->GetHighWaterMarkQuads(),
 		       int32(Pool->GetHighWaterMarkQuads()) * 2, *SpawnLocation.ToString());
 
+		// "churnlive" is the mode that actually tests G3.
+		//
+		// Plain "churn" adds and churns inside this one console command, so the
+		// scene proxy does not exist yet for any of it and every edit collapses
+		// into a single full rebuild at end of frame. The incremental upload
+		// path -- the thing streaming will lean on constantly -- never runs, and
+		// a bug in it renders a perfectly clean screenshot. That is precisely
+		// how a wrong buffer usage flag survived verification once already.
+		//
+		// Deferring the churn by a few seconds puts it after the proxy is live,
+		// so RemoveChunk/AddChunk/UpdateChunk go through PushUpdatesToProxy and
+		// write real sub-ranges of a real GPU buffer.
+		if (Args.ContainsByPredicate(
+			[](const FString& A) { return A.Equals(TEXT("churnlive"), ESearchCase::IgnoreCase); }))
+		{
+			TWeakObjectPtr<UVoxelGpuPoolComponent> WeakPool(Pool);
+			FTimerHandle ChurnHandle;
+			World->GetTimerManager().SetTimer(ChurnHandle, FTimerDelegate::CreateLambda(
+				[WeakPool, Handles, Rebased, Side, SpawnLocation]()
+			{
+				UVoxelGpuPoolComponent* LivePool = WeakPool.Get();
+				if (LivePool == nullptr)
+				{
+					return;
+				}
+
+				int32 Removed = 0;
+				for (int32 I = 0; I < Handles.Num(); I += 2)
+				{
+					if (Handles[I] != INDEX_NONE)
+					{
+						LivePool->RemoveChunk(Handles[I]);
+						++Removed;
+					}
+				}
+
+				// Re-add into the runs just freed, one Z-step up so the result is
+				// visually unambiguous: anything still drawing at the old height
+				// is a stale range that was not actually overwritten.
+				int32 ReAdded = 0;
+				for (int32 I = 0; I < Handles.Num() / 4; ++I)
+				{
+					const FVector3f ReAddOrigin(
+						float(I % Side) * 640.0f, float(I / Side) * 640.0f, 900.0f);
+					if (LivePool->AddChunk(Rebased, ReAddOrigin, 0,
+						SampleChunkClimate(SpawnLocation, ReAddOrigin)) != INDEX_NONE)
+					{
+						++ReAdded;
+					}
+				}
+
+				// And re-mesh a survivor in place, which is the case G3 hits on
+				// every dig: same handle, same slot, rewritten contents.
+				int32 Updated = 0;
+				for (int32 I = 1; I < Handles.Num(); I += 8)
+				{
+					if (Handles[I] != INDEX_NONE &&
+					    LivePool->UpdateChunk(Handles[I], Rebased) != INDEX_NONE)
+					{
+						++Updated;
+					}
+				}
+
+				UE_LOG(LogVoxelGpuVerify, Log,
+				       TEXT("Live churn (proxy already up): removed %d, re-added %d, "
+				            "updated-in-place %d — %d live chunks, %u high water, %u free"),
+				       Removed, ReAdded, Updated, LivePool->GetNumChunks(),
+				       LivePool->GetHighWaterMarkQuads(), LivePool->GetFreeQuads());
+			}), 5.0f, false);
+		}
+
 		if (Args.ContainsByPredicate(
 			[](const FString& A) { return A.Equals(TEXT("shot"), ESearchCase::IgnoreCase); }))
 		{
@@ -1080,6 +1151,8 @@ namespace
 	FAutoConsoleCommandWithWorldAndArgs GVoxelGpuSpawnPoolCmd(
 		TEXT("voxel.GPU.SpawnPool"),
 		TEXT("Put N chunks in one GPU pool drawn by ONE primitive in ONE draw call. "
-		     "Usage: voxel.GPU.SpawnPool [N] [shot]"),
+		     "Usage: voxel.GPU.SpawnPool [N] [churn|churnlive] [shot]. "
+		     "churn edits before the proxy exists (one rebuild); churnlive edits "
+		     "after it is up, which is the path streaming actually uses."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&SpawnPoolCommand));
 }
