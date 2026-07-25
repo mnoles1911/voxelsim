@@ -6160,15 +6160,38 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 	int32 Drains = 0;  // total results dequeued incl. stale discards (game-thread-cheap) -- gated by kMaxResultDrainsPerFrame
 	int32 ProxiesCreated = 0;
 	VoxelStreaming::FJobResult Result;
-	while (Applied < MaxApplies && Drains < kMaxResultDrainsPerFrame && ResultsQueue.Dequeue(Result))
+	while (Applied < MaxApplies && Drains < kMaxResultDrainsPerFrame)
 	{
 		// Wall-clock apply budget (see ApplyBudgetSeconds comment). Checked at
 		// the top of each iteration AFTER the min-applies floor: stale discards
 		// below are cheap and don't count against the render budget, but they DO
 		// count toward the wall-clock guard, which is correct -- a frame that
 		// spends its whole budget shovelling stale results should still yield.
+		//
+		// THE BUDGET TEST MUST COME BEFORE THE DEQUEUE, and this used to be the
+		// other way round -- Dequeue() sat in the loop condition, so an
+		// over-budget frame popped a result off the MPSC queue and then broke
+		// out of the body before doing anything with it. TQueue has no push-back
+		// and nothing re-enqueued it, so that result was destroyed on return,
+		// silently: the drop happened before ++ResultsDrainedSinceLog, so no
+		// counter moved. It took the whole tail of the body with it --
+		// FootprintBandCache.Add, FootprintBlindJobInFlight.Remove,
+		// --LevelJobsInFlight[Lvl], and Rec->bJobInFlight = false -- which is
+		// exactly the state the R0 freeze was diagnosed as: a footprint absent
+		// from the band cache AND present in the blind-job set is the precise
+		// conjunction the cold-band throttle defers on forever, and one dropped
+		// result creates both halves in a single step. That is why moving where
+		// the mark is SET could never fix this instance: the leak is entirely on
+		// the result side. The 5 s mark age-out added alongside it is a backstop
+		// for the symptom; this is the cause, and it strands the chunk itself
+		// (pinned bJobInFlight, never re-dispatched) whether or not the mark is
+		// involved, on the component path as much as the pooled one.
 		if (Applied >= kMinAppliesPerFrame &&
 		    (FPlatformTime::Seconds() - ApplyLoopStart) >= ApplyBudgetSeconds)
+		{
+			break;
+		}
+		if (!ResultsQueue.Dequeue(Result))
 		{
 			break;
 		}
