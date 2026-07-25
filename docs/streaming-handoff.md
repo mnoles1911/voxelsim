@@ -14,19 +14,31 @@ and verified headless.
 | **G2a — kernels in-engine via RDG** | ✅ Complete. Cross-toolchain digest `f3c48a4df3e20e9a` |
 | **G2 — GPU geometry pool + custom draw** | ✅ **Complete.** 256 chunks / 876k quads, ONE primitive, ONE draw |
 | **G2 incremental upload** | ✅ **Verified.** Partial writes match a full rebuild exactly |
-| **G3 — drive the pool from the cascade** | ⬜ **NEXT.** Plan in `docs/gpu-g3-integration-plan.md` |
+| **G3 — drive the pool from the cascade** | 🟨 **Wired and rendering, not yet correct.** 2893 chunks / 2.4M quads / ONE draw. Coarse rings render as flat slabs. |
 | G4 parity | ⬜ Checklist done; two real blockers, see below |
 | G5 — flip the default, retire per-chunk components | ⬜ |
 
 ## Start here
 
-The pool is done and the incremental path under it is proven. G3 is now
-ordinary integration work: wire `VoxelWorldSubsystem`'s `ApplyMeshResult` and
-`DrainUnloads` to `AddChunk` / `UpdateChunk` / `RemoveChunk` behind a
-`voxel.Stream.GPU` cvar defaulting off. File-level seams are in
-`docs/gpu-g3-integration-plan.md`.
+G3 is wired and the pooled cascade renders, but it does not match the CPU path
+yet: **coarse-ring chunks draw as large flat slabs.** That is the next problem.
+Reproduce it with
 
-Two things G3 needs that already exist and are easy to miss:
+```
+... -ExecCmds="voxel.Stream.GPU 1, voxel.Debug.ShotIn 30"
+```
+
+Likely suspects, in order: mip-ring chunks pass `Key.Level` straight into
+`AddChunk` as the table's `w` (scale), so a wrong level or a skirt quad that
+belongs to a neighbouring chunk resolves against the wrong origin; and ring
+cross-fade, which the pooled path does not implement at all (it lives in the
+per-chunk MID the pool has no equivalent of -- see the G4 blockers below).
+
+`voxel.Stream.GPUMaxChunks N` caps pool admission so the streamed path can be
+bisected at the small scale `voxel.GPU.SpawnPool` is known good at. That is what
+proved the earlier blank screen was not a scale problem.
+
+Two things G3 uses that already exist and are easy to miss:
 
 - **`UpdateChunk(Handle, Quads)`** re-meshes in place when the new quad count
   fits the existing slot, and only reallocates when a chunk outgrows it. Use it
@@ -90,7 +102,20 @@ UnrealEditor.exe "D:/voxelsim/ue-project/VoxelEarth.uproject" -game -windowed \
    identity transform**, redefining the actor's location as the world origin —
    8,448 km away, i.e. invisible. Call `SetWorldLocation()` after
    `RegisterComponent()`.
-4. **`VoxelEarthShaders` must stay `PostConfigInit`**, and `/VoxelCore` is a
+4. **The pool must be the ROOT component of its own actor.** Attached as a
+   child of `ChunkRoot` the primitive never enters the visible set at all --
+   `GetDynamicMeshElements` is never called, with a live proxy and valid
+   bounds. Same trap as (3): `SetWorldLocation` after `RegisterComponent`.
+5. **Bounds do not reach the renderer by themselves.** On the incremental path
+   the proxy is created once and never rebuilt, and `UpdateBounds()` only
+   updates the component -- the scene keeps the bounds it got on frame 1. That
+   culled a 6.4 m box at the player's feet while 2.4M quads sat in the buffer.
+   `MarkRenderTransformDirty()`, never `MarkRenderStateDirty()` (which rebuilds
+   every buffer and defeats the incremental path).
+6. **The chunk table is float32 and this world is 84 km wide.** At ~8.4M UU the
+   ULP is 1.0 UU against a 10 UU voxel, so chunk origins are stored relative to
+   a rebase origin the component carries in its double-precision transform.
+7. **`VoxelEarthShaders` must stay `PostConfigInit`**, and `/VoxelCore` is a
    directory *mapping*, not a copy. Copying `worldgen.ush` into the project would
    void the cross-toolchain digest the moment the copies drift.
 
