@@ -47,6 +47,12 @@ struct FVertexFactoryInterpolantsVSToPS
 
 	half4  Color     : COLOR0;
 	float2 TexCoords : TEXCOORD0;
+	// Voxel GI lookup, as a [0,1] volume coordinate rather than a position.
+	// Carrying UVW keeps the magnitudes small (perfect interpolation precision)
+	// and makes the distance fade recoverable without a second interpolant.
+	// TEXCOORD1 is free -- TANGENTTOWORLD_INTERPOLATOR_BLOCK lands on
+	// TEXCOORD10/11 (+15), not here.
+	float3 GIUVW     : TEXCOORD1;
 };
 
 struct FVertexFactoryIntermediates
@@ -57,6 +63,7 @@ struct FVertexFactoryIntermediates
 	half4   Color;
 	float3  Position;      // primitive space, unreal units
 	float2  TexCoords;
+	float3  GIUVW;
 
 	FSceneDataIntermediates SceneData;
 };
@@ -228,6 +235,21 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 		fmod(Intermediates.Position[U] / 100.0f, UVPeriodM),
 		fmod(Intermediates.Position[V] / 100.0f, UVPeriodM));
 
+	// Voxel GI probe coordinate. Pushed out along the face normal into the air
+	// cell in front of the surface, matching the CPU sampler's first probe
+	// offset -- the normal is constant across a quad, so doing it here is exact
+	// and costs nothing at pixel rate.
+	//
+	// Intermediates.Position is POOL space, which is the only space this may be
+	// computed in: the pool component carries the world's 84 km offset in its
+	// double-precision transform, so this value is small and float32-exact,
+	// whereas a world position would be quantised to ~1 UU against a 40 UU cell.
+	{
+		const float kGIProbeOffsetUU = 0.6f * 40.0f;
+		const float3 ProbePos = Intermediates.Position + Decoded.Normal * kGIProbeOffsetUU;
+		Intermediates.GIUVW = (ProbePos - VoxelGIVol.OriginPoolUU) * VoxelGIVol.InvSizeUU;
+	}
+
 	// Rotate the tangent frame into world space, one basis vector at a time.
 	//
 	// There is no engine-wide "CalcTangentToWorld" -- the vertex factories that
@@ -255,6 +277,7 @@ FVertexFactoryInterpolantsVSToPS VertexFactoryGetInterpolantsVSToPS(
 	Interpolants.TangentToWorld2 = float4(Intermediates.TangentToWorld[2], Intermediates.TangentToWorldSign);
 	Interpolants.Color = VertexParameters.VertexColor;
 	Interpolants.TexCoords = Intermediates.TexCoords;
+	Interpolants.GIUVW = Intermediates.GIUVW;
 	return Interpolants;
 }
 
@@ -345,7 +368,66 @@ FMaterialPixelParameters GetMaterialPixelParameters(
 	FMaterialPixelParameters Result = MakeInitializedMaterialPixelParameters();
 
 	Result.TwoSidedSign = 1;
-	Result.VertexColor = Interpolants.Color;
+
+	// VOXEL GI, folded into vertex colour G at PIXEL rate.
+	//
+	// G already carries the mesher's AO, and the material computes
+	// BaseColor = albedo * VertexColor.G * DebugTint, so modulating it here is
+	// authoritative for every downstream node and the material graph is
+	// untouched. M_VoxelTerrain.uasset does not change for this feature.
+	//
+	// PER PIXEL, not per vertex, and that is not a luxury. The component path
+	// compensates for per-vertex GI by SUBDIVIDING greedy quads
+	// (voxel.GI.MaxQuadSpanVoxels); this factory structurally cannot -- every
+	// quad is exactly 6 vertices reconstructed from SV_VertexID, and subdividing
+	// would multiply the pool's quad count against its memory budget. So
+	// per-vertex here would be strictly worse than per-vertex there, while
+	// per-pixel is better than either AND deletes the subdivision cost.
+	//
+	// With Enabled=0 this whole block is skipped and G is byte-identical to what
+	// it was before this feature existed.
+	half4 VertexColorWithGI = Interpolants.Color;
+	if (VoxelGIVol.Enabled != 0u)
+	{
+		const float4 T = Texture3DSampleLevel(VoxelGIVol.Volume, VoxelGIVol.VolumeSampler,
+		                                      Interpolants.GIUVW, 0);
+		// A is the validity weight, and dividing by it is what makes hardware
+		// trilinear reproduce the CPU sampler's "skip unsolved taps and
+		// renormalise by the surviving weight" EXACTLY rather than approximately
+		// -- same arithmetic, executed by the texture unit. A ~= 0 means no data
+		// there, which falls back to plain AO, matching the CPU's miss path.
+		const float W = T.a;
+		if (W > 1.0e-3f)
+		{
+			// Ambient-cube slot from the face normal. Every greedy-mesh normal is
+			// axis-aligned, so exactly one slot is selected and the floor/ceiling
+			// distinction the light field exists for is preserved.
+			const float Nz = Interpolants.TangentToWorld2.z;
+			const float Irr = ((Nz > 0.5f) ? T.r : ((Nz < -0.5f) ? T.g : T.b)) / W;
+
+			// Distance to the volume centre, recovered from the UVW rather than
+			// carried as a second interpolant.
+			const float DistUU = length((Interpolants.GIUVW - 0.5f) / VoxelGIVol.InvSizeUU);
+			const float Fade = 1.0f - saturate((DistUU - VoxelGIVol.FadeStartUU)
+			                                 / max(1.0f, VoxelGIVol.FadeEndUU - VoxelGIVol.FadeStartUU));
+			const float Ambient = lerp(VoxelGIVol.AmbientFloor, 1.0f, saturate(Irr));
+			const float Weight = saturate(VoxelGIVol.Strength * Fade);
+
+			// Must match VoxelChunkComponent.cpp's shade term for term:
+			// voxel.Stream.GPUMaxLevel puts both renderers in one frame, so a
+			// divergence here shows up as a lighting seam at the ring boundary.
+			VertexColorWithGI.g *= (half)lerp(1.0f, Ambient, Weight);
+
+			// DebugVis 3: show the sampled value raw, ignoring AO and the fade.
+			// Kept permanently -- a pooled primitive fails silently, and this is
+			// the cheapest proof the path is reachable from the PIXEL shader.
+			if (VoxelGIVol.DebugVis == 3u)
+			{
+				VertexColorWithGI.g = (half)saturate(Irr);
+			}
+		}
+	}
+	Result.VertexColor = VertexColorWithGI;
 
 	half3 TangentToWorld0 = Interpolants.TangentToWorld0.xyz;
 	half4 TangentToWorld2 = Interpolants.TangentToWorld2;
