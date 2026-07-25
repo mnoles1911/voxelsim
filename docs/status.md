@@ -2555,6 +2555,8 @@ really does detect a missed invalidation. Clang `-Wall -Wextra -Wconversion
 
 | Item | State | Unblock |
 |---|---|---|
+| **Terrain amplification refactor** (conditioned amplification stack: regime classifier, calibrated spectral synthesis, geomorph passes, clast scattering, stratigraphy/overhangs, learned 30m→1m SR) | **PARKED 2026-07-24 by Matt** behind ADR-0006. Full reconciliation against this project's determinism doctrine, CPU/GPU mirror contract and chunk granularity in `docs/terrain-amplification-reconciliation.md`; source proposal preserved at `docs/research/terrain-amplification-design-doc.md`. Headline: complementary (it loads the AUTHORITY path, ADR-0006 relieves the DISPLAY path), and most of the visual payoff (§4/§5/§7/§8) needs no architecture change — only §6's grid-iterative passes break O(1) point queries. Every stage costs ~2x to implement (integer fixed-point + HLSL mirror + digest parity) | ADR-0006 landing; §6 deferred behind §5/§7/§8 even then; learned SR gated on GPU access |
+| **Bounded-admission refill straggler** — a few chunks near LOD ring boundaries never load until the player MOVES | Reported by Matt 2026-07-24, NOT yet diagnosed. Distinct from the load-before-unload holes (fixed). `RecomputeDesiredSet` is the only thing that admits chunks and runs only on an anchor chunk crossing, an underground flip, or the per-level admission refill; candidates rejected by the cap when a level's queue is full are dropped and only return on a later recompute. Standing still, the only path back is the refill trigger (`bAdmissionDeferredWork[Level]` + that level's queue under its share of cap). Same class as the priority inversion already documented above (~20k rejected R0 candidates while standing still underground), which was fixed by making refill per-level — this looks like a residual case | needs a repro + the refill trigger instrumented |
 | **Confirm real terrain-diffusion tile outputs** (exact climate-channel count/semantics/ranges vs our 4-channel assumption: temp, seasonality, precip, precip-variability) — then reconcile the tile codec + amplifier climate lookup + M4 biome table to reality, addressing gaps/tweaks | **SCAFFOLDED 2026-07-20**: the confirm-tool now exists — `terrain_service/providers/diffusion.py`'s `EXPECTED_CHANNELS` manifest + `validate_model_output(raster_dict)` checks a real model raster dict's channel count/names/dtype/ranges against our assumption and raises every mismatch found (not just the first); `docs/diffusion-bringup.md` step 5 is "run this against ONE real tile." Still gates M4 biome tuning | cloud NVIDIA rental, run `validate_model_output` against the real checkpoint (docs/diffusion-bringup.md); until then synthetic tiles stand in |
 | NVIDIA cloud digest run (closes BOTH M0 gates) | blocked on rental spend (Matt) | ~$1, minutes of runtime; same session can bring up terrain-diffusion + confirm tile outputs above |
 | terrain-diffusion worker bring-up | **SCAFFOLDED 2026-07-20** (worktree agent): deferred by ADR-0001 to vistas, but no longer a research project when eligible — `DiffusionConfig` (pinned checkpoint id/hash, sampler, scale, channel mapping → stable `provider_id()`), `adapt_raster_to_tile` (config-driven raster→Tile adapter), and dry-run mode (`DiffusionProvider(dry_run=True)` / `TERRAIN_DIFFUSION_DRY_RUN=1` / `pregen --dry-run`, synthetic rasters through the real config→adapter→validate→encode path) are all implemented and tested (`tests/test_diffusion.py`, 20 tests, no GPU); only `DiffusionProvider._call_model` (the actual inference call) remains, behind a numbered TODO. `terrain-service/docs/diffusion-bringup.md` is the turnkey runbook (rent GPU → install → pin checkpoint → validate → pregen radius) with the §3.4 cost model. `Dockerfile.diffusion` (CUDA base, torch, terrain-diffusion install placeholder) added, unbuildable here (no GPU cloud network access) but shaped for the rented box. Remaining = actual GPU rental + wiring `_call_model` + running `validate_model_output` against the real checkpoint | cloud NVIDIA rental |
@@ -6507,4 +6509,318 @@ worldgen output.
 3. **`voxel.Stream.UndergroundSightM`'s help text still says "40 (default)"**
    while the default is 64 and `SightRadiusUU()` silently clamps to 64 â€” so
    raising it from `-ExecCmds` does nothing, invisibly. Not touched here.
+
+## M1 gate re-run after the streaming-speed pass: FAILS on `main` (2026-07-24)
+
+The handoff (`docs/streaming-handoff.md`) listed "M1 gate re-run" as required
+before merging the 2026-07-24 streaming-speed work, because those commits raised
+the apply/unload throttles past the tuning the zero-hitch gate was closed on
+(`voxel.Stream.MaxAppliesPerFrame` 3 -> 64, unloads 2 -> 24, remeshes 2 -> 8,
+plus the new `ApplyBudgetMs` 6 ms drain and `LodRetentionMs` 5000). That re-run
+did not happen before the merge -- **PR #99 landed on `main` first (8ed14aa),
+and the numbers below were taken afterward.** They describe `main` as it stands.
+
+Matt's call on the result is recorded at the bottom: **do not tune the dial;
+remove the trade-off via ADR-0006.**
+
+### Protocol caveat -- these are NOT min-spec-proxy numbers
+
+Every historical M1 gate figure in this file uses the real-RHI **min-spec
+proxy** (`sg.ViewDistanceQuality 0, sg.ShadowQuality 0, sg.PostProcessQuality 0,
+sg.EffectsQuality 0, r.ScreenPercentage 100`). **These runs do not.** They are
+1080p windowed at default quality, `-game`, real tiles
+(`loaded=25 rejected=0`, seed 20260719), `-VoxelSpawnAt=-84480,53760`,
+`-VoxelPerfRun=60` (scripted surface flight, 20 m/s, depth 60 m).
+
+So the absolute values are NOT comparable to the min-spec gate rows above, and
+the 16.6 ms bar should not be read against them directly. What IS trustworthy is
+the **A/B between the two runs**, which used the same binary, same seed, same
+terrain, same cascade and same shadow settings, differing only in the throttle
+cvars. A min-spec-proxy re-run is still owed before the gate row is formally
+re-coloured.
+
+### A/B on one binary: throttles are the only variable
+
+Run B restored the pre-change throttles at runtime, which is exactly the
+one-binary A/B the cvars were designed for (they are read fresh per frame, so
+`-ExecCmds` reaches them):
+
+```
+-ExecCmds="voxel.Stream.MaxAppliesPerFrame 3, voxel.Stream.ApplyBudgetMs 0.5,
+           voxel.Stream.MaxUnloadsPerFrame 2, voxel.Stream.MaxRemeshesPerFrame 2,
+           voxel.Stream.LodRetentionMs 0"
+```
+
+Post-warmup (t>=10 s) unless noted:
+
+| | B: old throttles | A: new throttles (`main`) | ratio |
+|---|---|---|---|
+| p50 frame | **5.863 ms** | **15.132 ms** | 2.58x worse |
+| p95 frame | 10.635 ms | 21.357 ms | 2.01x worse |
+| **max frame** | **15.059 ms** | **43.924 ms** | 2.92x worse |
+| **hitches** | **0** | **2** | gate broken |
+| frames in 60 s | 10,667 | 3,907 | |
+| chunks loaded | 19,771 | 56,228 | |
+| chunks/sec | 329.5 | **937.1** | **2.84x faster** |
+| budget saturation | 53.95% | 27.55% | |
+
+Artifacts: `Saved/PerfRuns/perf_20260724_191652.json` (B),
+`perf_20260724_191124.json` (A).
+
+**The single most telling number is max frame.** With the old throttles no frame
+after warmup exceeded **15.06 ms** -- the entire run stayed inside a 60 fps
+budget, every frame. With the new throttles it spikes to **43.92 ms**.
+
+**Verdict: the streaming-speed pass buys 2.84x fill throughput for 2.58x p50
+frame time and costs the zero-hitch gate (0 -> 2). M1 FAILS as `main` stands.**
+
+### Three-way attribution -- do not blame it all on the throttles
+
+The nearest prior artifacts (`perf_20260722_1232/1235/1238`, post-warmup p50
+3.55-3.59 ms, 0 hitches) are **not a clean baseline**: they predate
+PR #94 (`cascade-2km`, R5 ring, merged 07-22 18:42 local) and PR #95
+(`cave-shadows`, terrain casts sun shadows, 07-23) -- and their quality settings
+are not recorded in the JSON, so they may not even be the same protocol.
+Splitting post-warmup p50 anyway:
+
+- 07-22 artifacts: **3.59 ms**
+- today, old throttles (includes 2 km cascade + sun shadows): **5.86 ms**
+  -- roughly **+63%** attributable to that intervening work, not to streaming
+- today, new throttles: **15.13 ms** -- the remaining **+158%** is the throttles
+
+An earlier read of this data quoted "4.4x worse" by comparing today's `main`
+straight to the 07-22 artifacts. That figure is inflated and should not be
+cited; **2.58x, from the same-binary A/B, is the honest number.**
+
+### The hitches are the render thread, not the voxel subsystem
+
+Both post-warmup hitches in run A attribute almost entirely to `renderMs`:
+
+```
+frameMs=43.92 | subsystemTickMs=0.26 | elsewhereMs=43.66 | renderMs=43.12
+frameMs=39.84 | subsystemTickMs=0.38 | elsewhereMs=39.46 | renderMs=18.72
+```
+
+On the first, the render thread **is** the frame; voxel game-thread work is
+0.26 ms. This reproduces in `-game`, so it is not PIE overhead (an earlier
+in-editor observation of the same shape was inconclusive for that reason).
+
+(The recurring `maxFrameMs=400.00` entries in both runs are startup shader
+compilation -- `renderWaitMs` up to 12,437 ms, all inside the first 10 s and
+excluded by the warmup window. Not signal.)
+
+This is ADR-0006's thesis measured directly: fill speed and frame time trade
+against each other **because both flow through the same per-chunk render-thread
+apply funnel**. More applies per frame is literally more `FScene::AddPrimitive`
+on the render thread. No throttle value escapes the trade; it only picks a point
+on it.
+
+### Decision (Matt, in-session 2026-07-24)
+
+Offered: probe `voxel.Stream.ApplyBudgetMs 3` for a knee between the two
+extremes and ship that as the default. **Declined.** The call is to stop tuning
+the CPU funnel and remove the trade-off by building the GPU-resident path --
+i.e. proceed to consider ADR-0006 (`docs/adr/0006-gpu-resident-voxel-streaming.md`),
+which remains `proposed` and unsigned.
+
+Consequences to track:
+- `main` currently ships the fast-fill / broken-zero-hitch end of the trade.
+  That is deliberate and Matt-approved (the handoff records him accepting
+  "silky/fast" over strict zero-hitch), but it is now a **measured** failure of
+  the M1 gate rather than an assumed-tolerable one.
+- The M1 gate row is left as-is pending a **min-spec-proxy** re-run under the
+  historical protocol; these default-quality numbers are not a substitute.
+- ADR-0006's G3 milestone redefines this gate anyway (GPU frame time +
+  chunks/s + zero hitches). If ADR-0006 is signed, re-colouring the M1 row on
+  the CPU path may be moot.
+
+### Terrain sun shadows are NOT the render cost (2026-07-24, measured)
+
+PR #95 (terrain chunks cast sun shadows) merged 07-23, immediately before the
+hitch symptoms appeared, and `renderMs` is the hitch driver -- so it was the
+obvious cheap suspect. It is not the cause. New cvar `voxel.Render.CastShadow`
+(default 1) flips the single `UPrimitiveComponent::CastShadow` flag at chunk
+load; 60 s scripted flight, 20 m/s, everything else identical:
+
+| | shadows ON | shadows OFF | shadows ON (repeat) |
+|---|---|---|---|
+| post-warmup p50 | 14.115 ms | 15.030 ms | 14.923 ms |
+| post-warmup p95 | 21.964 ms | 20.561 ms | 20.300 ms |
+| post-warmup hitches | 4 | 2 | 1 |
+| chunks/sec | 779.17 | **967.07** | **968.20** |
+
+**Shadows-off and shadows-on-repeat are the same run to within noise** (967.07 vs
+968.20 chunks/s; p50 15.03 vs 14.92). Terrain shadow casting costs nothing
+measurable here. Keep it on -- it is what stops the sun lighting sealed caves.
+
+Two corrections fall out of that third column, and both were wrong in the
+direction of alarm:
+
+1. **The first "shadows ON" run (779 chunks/s) was a COLD run**, the first flight
+   after a rebuild, not a shadow effect and not a regression. Steady-state
+   post-fix throughput is 967-968 chunks/s, at or above the pre-fix band
+   (855-937). The load-before-unload rewrite below is throughput-neutral, not the
+   ~9% cost first reported off that cold run.
+2. **Always discard the first run after a build.** Cold shader/PSO state costs
+   ~20% throughput and it looks exactly like a regression.
+
+**Methodology, learned the hard way:** the first attempt at this A/B used
+`r.ShadowQuality 0` and produced **118 post-warmup hitches vs 2** -- with LOW
+`renderMs` (21 of an 86 ms frame), the opposite shape of a render-cost change.
+This module PSO-precaches the terrain material at BeginPlay
+(`FPSOPrecacheParams`), so changing render scalability at startup desyncs the
+precache from what is actually drawn and every chunk takes a pipeline-state miss.
+**A/B-ing this renderer through scalability cvars measures precache invalidation,
+not the thing you meant.** Change one primitive flag instead.
+
+Consequence for ADR-0006: the cheap alternative explanation for `renderMs` is now
+ruled out. `renderMs`-dominated hitches persist with shadows off (one at
+`renderMs=52.37` of a 52.15 ms frame), which is consistent with per-primitive
+draw/culling overhead -- ADR-0006's actual target. Still not a substitute for
+profiling *inside* `renderMs`, which remains the open measurement.
+
+### Load-before-unload: coverage rewritten against ChunkRecords (2026-07-24)
+
+Matt reported rolling rings of holes still opening at LOD boundaries while
+moving, and separately a few chunks that never load until the player moves. The
+first is fixed here; the second is a different, older bug (bounded-admission
+refill, see the backlog).
+
+The 07-24 first cut maintained a side index `ColumnGeomCount`, keyed
+`(level, chunkX, chunkY)` and counting records with `LastQuadCount>0`. It was
+wrong twice:
+
+1. **It dropped Z.** "Column has geometry" was true if ANY chunk in that vertical
+   stack had geometry, so a deep `bDeepAnchorRelative` chunk (~38 m down,
+   invisible) vouched for a surface chunk that had not arrived -- releasing the
+   stand-in early and opening the exact hole retention exists to prevent.
+2. **It keyed on geometry, not residency.** A replacement that legitimately
+   meshes to zero quads (all air, all solid, an all-ocean quarter) could never
+   report covered and always fell through to the safety cap.
+
+Plus it needed hand-maintained reconcile calls at every gain/loss site, and the
+two pre-dispatch skip sites (buried, sky-band) were missing theirs -- the leak
+`docs/streaming-handoff.md` flagged as prime suspect.
+
+Fix: delete the index. `ReplacementCovered` now looks the replacement chunks up
+in `ChunkRecords` directly and asks whether each has **settled**
+(`FChunkRecord::bMeshSettled` -- mesh applied with or without quads, or proven
+empty pre-dispatch). Z-aware (8 children at L-1, or the one parent at L+1); a key
+with no record is not desired and cannot block. `ColumnGeomCount`,
+`ReconcileColumnGeom` and `bColumnCounted` are gone, and with them the whole
+drift-between-two-copies-of-the-truth bug class.
+
+New telemetry, `LogVoxelPerf` "Voxel LOD retention" every 5 s: `held` (stand-ins
+currently drawn waiting), `covRel` (released because the replacement arrived),
+`capRel` (released because `LodRetentionMs` expired -- **each one a hole the
+player could have seen**). Measured post-fix:
+
+| flight | held | covRel / 5 s | capRel / 5 s |
+|---|---|---|---|
+| 20 m/s | 42-372 | 8,300-11,400 | 7-110 (0.1-1.1%) |
+| 100 m/s | 0-83 | ~7,000 | **0** |
+
+`capRel` at 100 m/s is zero and `held` collapses -- because at that speed chunks
+are evicted *before they ever loaded*, so they never enter the retention path at
+all. There is no stand-in to hold. Retention can delay a hole; it cannot
+manufacture a chunk. The 100 m/s flight otherwise degrades hard (p50 29.7 ms, 259
+post-warmup hitches, 618 chunks/s) and that degradation is the ADR-0006 funnel,
+not this mechanism.
+
+**Not visually confirmed.** The scripted flight is a fixed circle; the reported
+symptom came from free flight. Telemetry says the mechanism now behaves
+correctly; a human still has to look.
+
+### `renderMs` is NOT pixel work -- ADR-0006's diagnosis confirmed by elimination
+
+ADR-0006 asserts the per-chunk render-thread apply funnel is the ceiling. The
+2026-07-24 measurements established that **`renderMs` is the frame** (43.12 ms of
+a 43.92 ms hitch, voxel game-thread work 0.26 ms) but not **what inside
+`renderMs`**. Those are different claims, and six milestones rest on the second.
+Two eliminations, both cheap, both on one binary:
+
+**1. Not the shadow-depth pass.** `voxel.Render.CastShadow 0` vs `1`: identical
+to within noise (see the shadow section above). `renderMs`-dominated hitches
+persist with shadows off.
+
+**2. Not rasterisation or shading.** `r.ScreenPercentage 50` quarters the pixel
+count while leaving primitive count, draw-call count and culling work **exactly
+unchanged**. 60 s flight, everything else identical:
+
+| | full res | 50% screen (1/4 pixels) |
+|---|---|---|
+| post-warmup p50 | 14.923 ms | 14.757 ms |
+| post-warmup p95 | 20.300 ms | 20.631 ms |
+| chunks/sec | 968.20 | 934.65 |
+
+**Nothing moved.** A frame that is unchanged by a 4x cut in pixels is not pixel
+bound. And hitches in that same run still attribute to render
+(`renderMs=62.57` of a 62.63 ms frame).
+
+(`r.ScreenPercentage` is safe for this A/B where `r.ShadowQuality` was not: it
+scales resolution, it does not change shader permutations, so the BeginPlay PSO
+precache stays valid. No 118-hitch signature appeared -- 5 hitches vs 1.)
+
+**What is left in `renderMs`** once shadow-depth and rasterisation are excluded:
+per-primitive visibility/culling, draw-command generation, and `FScene`
+primitive mutation across ~24,700 tracked records. All three are precisely what
+ADR-0006 collapses to O(1) primitives + indirect draws.
+
+**Verdict: proceed to G0.** The pre-sign-off gate ("is the prize real, or would
+we spend months moving a minority of the cost?") is passed by elimination.
+Direct attribution inside `renderMs` via Unreal Insights is still worth doing at
+G0 to size the win, but it is no longer a blocker on the decision.
+
+**ADR-0006 signed by Matt 2026-07-24 (in session).**
+
+### Dispatch starvation: hypothesis RAISED and DISPROVEN the same day
+
+Worth recording because the reasoning looked airtight and was not.
+
+**The observation is real.** At 20 m/s, per 5 s window: `recordsAdded=14540`,
+`dispatched=7704`, `recordsEvicted=12306`, `stale=0`, apply budget only ~28%
+saturated. So ~6,800 chunks per 5 s enter the desired set and are evicted before
+any worker touches them -- not slow, never asked for.
+
+**The (wrong) inference.** `MaxJobsInFlight` was a hardcoded
+`2 * NumberOfCoresIncludingHyperthreads()` = 24, and `DispatchJobs` refills it
+once per frame. With an R0 job at p50 1.32 ms and a ~15 ms frame, each slot
+looked like it did one job per frame then idled ~13.7 ms -- an apparent ~9%
+worker utilisation, and `24 slots x 66 fps = 1584/s` matched the measured
+1540/s almost exactly. Prediction: raising the multiplier multiplies throughput.
+
+**The measurement says no.** New cvar `voxel.Stream.JobsInFlightPerCore`
+(default 2 = byte-identical to the old hardcoded form), 45 s flights, first run
+discarded as cold:
+
+| | cfg 2 | cfg 8 | cfg 16 |
+|---|---|---|---|
+| post-warmup p50 | 14.632 ms | 14.207 ms | **33.977 ms** |
+| post-warmup p95 | 22.221 ms | 21.975 ms | 52.542 ms |
+| post-warmup hitches | 9 | 5 | **564** |
+| chunks/sec | 797.22 | **790.84** | 966.60 |
+| budget saturation | 24.5% | 24.0% | 59.6% |
+| stale results | 0.0% | 1.3-5.0% | 3.2% |
+
+**8x the slots produced 0% more chunks per second.** Dispatch count rose ~33%
+(6,300 -> 8,400 per window) but useful throughput did not move at all, and stale
+results appeared. 16x buys throughput only by wrecking frame time -- 564 hitches.
+
+**Why the arithmetic lied:** it used R0's p50 (1.32 ms) as if it were the whole
+mix, but R1-R5 jobs run ~4 ms, and the UE task graph never dedicates all 12
+logical cores to voxel meshing. The workers were already near their real
+capacity; the 24-slot cap was only mildly binding. There was no idle fleet.
+
+**Outcome:** default stays 2. The cvar is kept -- inert, and it makes this
+measurable instead of arguable. The genuine throughput lever is not slot count
+but the **37.1% of R0 worker time (and 37.2% of R1) spent on chunks that mesh to
+zero quads** -- see the empty census. That is where CPU-side headroom actually
+lives.
+
+**And it is probably not the hole bug anyway.** A screenshot with
+`voxel.Debug.Rings 1` shows the gaps pinned exactly to the ring colour
+transitions, at every boundary, persisting after 45 s stationary. Throughput
+shortfall would be patchy and directional. The remaining suspect is a
+coverage/geometry defect at the ring seam -- possibly a larger sibling of the
+known-unfinished T-junction skirt work (`3b33a79`).
 
