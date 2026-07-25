@@ -115,6 +115,57 @@ cdcf478bcf5bac50e19f516543cb8fade86f79d514c5586873bf40cafeab7df0  worldgen.Voxel
 Verify with `sha256sum -c` (or `Get-FileHash -Algorithm SHA256` on Windows)
 against this list before trusting a copy of these files.
 
+## 2026-07-25 respin: worldgen v8, the climate recalibration
+
+`ColumnMain`, `VoxelizeMain`, `MeshCountMain` and `MeshEmitMain` were
+recompiled after `worldgen.ush`'s biome/stratigraphy mirror moved to
+`kWorldGenVersion` 8. The three Scan kernels are **byte-identical** to the
+previous respin — they touch neither columns nor materials, which is the
+expected signature of a change confined to ColumnMain's classification and
+VoxelizeMain's layer lookup.
+
+What moved in the shader, mirroring `biome.h` / `amplifier.cpp` exactly:
+
+* every Whittaker/gate threshold, now the CONVERTED value of a physical
+  constant (`kBiomeTempColdU8 = 143` is `climateTempU8FromDegC(5)`, and so on).
+  HLSL has no `climate.h`, so these are transcribed — **run
+  `vxc_dump_biome_constants` and paste, never hand-compute**;
+* the cliff gate 6000 → 21000 (a 70% grade, ~35°, the angle of repose);
+* the treeline base 2 600 000 → 900 000 mm and its per-u8 rate 20 000 → 47 058;
+* gate ORDER: sea level now precedes slope, so seafloor can no longer classify
+  alpine, and the cliff gate returns the new `BIOME_BARE_ROCK = 9`;
+* the topsoil formula: a retained slope FRACTION instead of an absolute
+  subtraction, with the clamp applied after the jitter;
+* `stratigraphyAt` carries rock through the subsoil band under a rock surface.
+
+**Verified on this box** (fresh DXC 1.9.2602.24 build from current
+`worldgen.ush`, these exact committed `.spv`):
+
+| Mode | Result | GPU output digest (columns+cells+quads) |
+|---|---|---|
+| default (2 regions) | **PASS**, bit-exact, 8192 columns / 393216 cells / 6668 quads | `6e893ab3679a8c81` |
+| `--radius 64` | **PASS**, bit-exact, gate 0.137 s (< 1 s target) | `8200c4b066ce3219` |
+| `--radius 128` | **PASS**, bit-exact, gate 0.197 s (< 1 s target) | `8eed2f023bc57365` |
+
+Device: AMD Radeon RX 7800 XT.
+
+sha256 of the respun files:
+
+```
+1e72b08bf53f92945512cf57e7f0477bbc092ccdc568c9b786634a2be33ff5a1  worldgen.ColumnMain.spv
+052f9e8a0cc5964081123020d33ff1c74dfadef2aa5ff5d0fac02246fe3a0c1d  worldgen.MeshCountMain.spv
+f45164aff1118f7c41bc579299fcc9273a0d141328143d3cb958e09645be4c28  worldgen.MeshEmitMain.spv
+72cb57ed63c531b0745f109e1b7c9a2054ed1e201b0ef59dbb062171ed207130  worldgen.ScanAddMain.spv
+0168a302618b437e31b0b4e8bf69aa4ea203383dfd6d1e38b13acd0618d277e1  worldgen.ScanBlocksMain.spv
+e2060888d9938627c0e5c899d4402c804aeee61aae04b86ffcf9c3c5ec4cdf8e  worldgen.ScanSumsMain.spv
+5bcdadb2e0b316bc73a03bc25a7f54ee4736ad4f64516026158e53d01c74a81b  worldgen.VoxelizeMain.spv
+```
+
+**NVIDIA leg still owed**, as it was before this change (`docs/gpu-streaming-plan.md`:
+"NVIDIA CI leg is still owed — the only unmet part of the original gate"). This
+respin does not make that worse, but the cross-vendor claim rests on one vendor
+until `tools/run-nvidia-digest.sh` is run against these `.spv`.
+
 ## IMPORTANT: these are NOT byte-identical to the digests previously recorded
 ## in docs/status.md
 

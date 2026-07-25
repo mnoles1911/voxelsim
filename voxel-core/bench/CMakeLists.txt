@@ -30,6 +30,15 @@ if(NOT MSVC)
   target_compile_options(vxc_climateprobe PRIVATE -Wall -Wextra -Werror)
 endif()
 
+# --- vxc_dump_biome_constants: prints biome.h's compile-time-derived
+# thresholds as plain integers, for hand-transcription into worldgen.ush's
+# mirror (HLSL has no climate.h). Hand-arithmetic is how a mirror drifts. -----
+add_executable(vxc_dump_biome_constants dump_biome_constants.cpp)
+target_link_libraries(vxc_dump_biome_constants PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_dump_biome_constants PRIVATE -Wall -Wextra -Werror)
+endif()
+
 # --- vxc_editlog: offline edit-log stats/compact/verify tool (M3 groundwork,
 # docs/status.md) -----------------------------------------------------------
 add_executable(vxc_editlog editlog_tool.cpp)
