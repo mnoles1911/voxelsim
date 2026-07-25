@@ -40,12 +40,25 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadVertexFactoryParameters, )
 	// (which do not bind; see docs/gpu-g2-draw-path.md).
 	SHADER_PARAMETER_SRV(StructuredBuffer<float4>, ChunkOrigins)
 	SHADER_PARAMETER_SRV(StructuredBuffer<uint>, QuadChunkIds)
-	// Per-chunk climate: x = temperature, y = precipitation, both already
-	// remapped to 0..1 across this world's p1..p99 window. The material feeds
-	// them to the biome LUT. Sampled once per chunk on the CPU -- a chunk is
-	// ~1/100th the area of one 30 m climate pixel and the ramp across it is
-	// smooth, so the error is a gentle gradient rather than banding.
-	SHADER_PARAMETER_SRV(StructuredBuffer<float2>, ChunkClimate)
+	// Per-chunk shading inputs the quad packing has no room for.
+	//
+	//   x = temperature, y = precipitation, both already remapped to 0..1
+	//       across this world's p1..p99 window. The material feeds them to the
+	//       biome LUT. Sampled once per chunk on the CPU -- a chunk is ~1/100th
+	//       the area of one 30 m climate pixel and the ramp across it is smooth,
+	//       so the error is a gentle gradient rather than banding.
+	//   z = the terrain surface height at this chunk's centre, expressed
+	//       RELATIVE TO THIS CHUNK'S OWN ORIGIN in unreal units. That framing is
+	//       deliberate: it makes the value small and rebase-independent, so no
+	//       float32 precision is spent on the 84 km world offset (see
+	//       docs/gpu-pool-rendering-notes.md invariant 4). The vertex factory
+	//       compares a corner's chunk-local Z against it to reproduce
+	//       BuildChunkVertexData's surface-proximity gate exactly.
+	//   w = reserved (per-chunk debug tint, docs/gpu-g4-parity-plan.md item 2).
+	//
+	// Widened from float2 to float4 for z; at a table sized in thousands of
+	// entries the extra 8 bytes per chunk is noise against the quad pool.
+	SHADER_PARAMETER_SRV(StructuredBuffer<float4>, ChunkParams)
 	SHADER_PARAMETER(uint32, PoolMode)
 END_GLOBAL_SHADER_PARAMETER_STRUCT()
 
@@ -62,7 +75,7 @@ struct FVoxelChunkDrawData
 	float LevelScale = 1.0f;
 	FShaderResourceViewRHIRef ChunkOriginsSRV;
 	FShaderResourceViewRHIRef QuadChunkIdsSRV;
-	FShaderResourceViewRHIRef ChunkClimateSRV;
+	FShaderResourceViewRHIRef ChunkParamsSRV;
 	bool bPoolMode = false;
 };
 
@@ -94,11 +107,11 @@ public:
 	// Switches the factory to pool mode: per-quad chunk ids index a per-chunk
 	// origin table, so one factory serves every chunk in the pool.
 	void SetPoolBuffers(FShaderResourceViewRHIRef InOrigins, FShaderResourceViewRHIRef InChunkIds,
-	                    FShaderResourceViewRHIRef InClimate)
+	                    FShaderResourceViewRHIRef InParams)
 	{
 		ChunkOriginsSRV = MoveTemp(InOrigins);
 		QuadChunkIdsSRV = MoveTemp(InChunkIds);
-		ChunkClimateSRV = MoveTemp(InClimate);
+		ChunkParamsSRV = MoveTemp(InParams);
 		bPoolMode = true;
 	}
 
@@ -110,7 +123,7 @@ private:
 	float LevelScale = 1.0f;
 	FShaderResourceViewRHIRef ChunkOriginsSRV;
 	FShaderResourceViewRHIRef QuadChunkIdsSRV;
-	FShaderResourceViewRHIRef ChunkClimateSRV;
+	FShaderResourceViewRHIRef ChunkParamsSRV;
 	bool bPoolMode = false;
 	TUniformBufferRef<FVoxelQuadVertexFactoryParameters> UniformBuffer;
 };

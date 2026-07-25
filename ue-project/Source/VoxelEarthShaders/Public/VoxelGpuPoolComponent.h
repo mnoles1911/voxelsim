@@ -34,14 +34,22 @@ public:
 	// AddChunk. For scale: the whole 2 km cascade measured 9,441,170 quads.
 	void InitPool(uint32 CapacityQuads);
 
+	// A surface height that can never gate anything off. Used for the hidden
+	// chunk and by callers with no world subsystem to sample, mirroring
+	// BuildChunkVertexData's own "no subsystem -> always surface" fallback.
+	// -1e30 rather than -FLT_MAX so the shader's `- kSurfaceBandUU` stays finite.
+	static constexpr float kNoSurfaceGate = -1.0e30f;
+
 	// Adds one chunk's quads at a component-space origin. Quads are expected in
 	// the GPU mesher's packed form, already re-based out of brick-local coords.
 	// Returns a handle, or INDEX_NONE if the pool has no contiguous room.
-	// Climate is temperature/precipitation already remapped to 0..1 across this
-	// world's p1..p99 window -- the same values the CPU path writes into vertex
-	// colour B/A for the biome LUT.
+	//
+	// Params carries the per-chunk shading inputs the 8-byte quad packing has no
+	// room for -- climate in xy, surface height in z, one spare in w. See
+	// FVoxelQuadVertexFactoryParameters::ChunkParams for the exact layout and
+	// the reason z is chunk-relative.
 	int32 AddChunk(const TArray<uint64>& InQuads, const FVector3f& OriginUU, int32 Level,
-	               const FVector2f& Climate = FVector2f(0.5f, 0.5f));
+	               const FVector4f& Params = FVector4f(0.5f, 0.5f, kNoSurfaceGate, 0.0f));
 
 	// Releases a chunk's range back to the pool.
 	//
@@ -99,8 +107,9 @@ private:
 	// xyz = chunk origin in component space (unreal units), w = mip scale.
 	TArray<FVector4f> ChunkOrigins;
 
-	// Parallel to ChunkOrigins, indexed by the same chunk id.
-	TArray<FVector2f> ChunkClimate;
+	// Parallel to ChunkOrigins, indexed by the same chunk id. See
+	// FVoxelQuadVertexFactoryParameters::ChunkParams for the channel layout.
+	TArray<FVector4f> ChunkParams;
 
 	// Chunk id 0 is RESERVED as the hidden chunk: origin (0,0,0), scale 0.
 	// Freed quads point at it and collapse to a degenerate point.
