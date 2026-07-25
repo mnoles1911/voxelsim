@@ -156,6 +156,15 @@ TAutoConsoleVariable<bool> CVarVoxelRenderCastShadow(
 // so an A/B here changes how chunks are DRAWN and nothing about which chunks
 // are chosen. Toggling mid-flight is not supported: chunks already resident
 // under the old path keep their old representation until they unload.
+TAutoConsoleVariable<int32> CVarVoxelStreamGpuMaxLevel(
+	TEXT("voxel.Stream.GPUMaxLevel"),
+	-1,
+	TEXT("Pool only ring levels <= this under voxel.Stream.GPU; coarser rings stay on the per-chunk component ")
+	TEXT("path. -1 = all levels. The two renderers coexist per chunk, so this isolates 'the pooled path is wrong' ")
+	TEXT("from 'the pooled path is wrong FOR MIP RINGS' -- and may be a shipping mode in its own right, since the ")
+	TEXT("pooling win scales with chunk count and that is concentrated in the dense near rings."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarVoxelStreamGpuMaxChunks(
 	TEXT("voxel.Stream.GPUMaxChunks"),
 	0,

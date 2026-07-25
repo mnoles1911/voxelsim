@@ -192,6 +192,8 @@ public:
 	// Writes only the quads that changed. The alternative -- rebuilding the
 	// whole buffer -- is 75 MB per change at cascade scale, which is what makes
 	// streaming through a pool viable or not.
+	// NewQuads/NewIds hold ONLY the dirty range, indexed from zero; First is
+	// where it lands in the GPU buffer.
 	void UpdateQuadRange_RenderThread(FRHICommandListBase& RHICmdList,
 	                                  const TArray<uint64>& NewQuads,
 	                                  const TArray<uint32>& NewIds,
@@ -207,7 +209,7 @@ public:
 		const uint32 QuadSizeBytes = Count * sizeof(uint64);
 		if (void* Dst = RHICmdList.LockBuffer(QuadBuffer, QuadOffsetBytes, QuadSizeBytes, RLM_WriteOnly))
 		{
-			FMemory::Memcpy(Dst, NewQuads.GetData() + First, QuadSizeBytes);
+			FMemory::Memcpy(Dst, NewQuads.GetData(), QuadSizeBytes);
 			RHICmdList.UnlockBuffer(QuadBuffer);
 		}
 
@@ -215,7 +217,7 @@ public:
 		const uint32 IdSizeBytes = Count * sizeof(uint32);
 		if (void* Dst = RHICmdList.LockBuffer(ChunkIdBuffer, IdOffsetBytes, IdSizeBytes, RLM_WriteOnly))
 		{
-			FMemory::Memcpy(Dst, NewIds.GetData() + First, IdSizeBytes);
+			FMemory::Memcpy(Dst, NewIds.GetData(), IdSizeBytes);
 			RHICmdList.UnlockBuffer(ChunkIdBuffer);
 		}
 
@@ -425,13 +427,33 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 	const bool bTableDirty = bChunkTableDirty;
 
 	FVoxelGpuPoolSceneProxy* Proxy = LiveProxy;
-	TArray<uint64> QuadsCopy = PooledQuads;
-	TArray<uint32> IdsCopy = QuadChunkIds;
+
+	// Copy ONLY the dirty slice, never the whole pool.
+	//
+	// This used to hand the render command a copy of the entire PooledQuads and
+	// QuadChunkIds arrays -- at cascade capacity that is ~170 MB of memcpy per
+	// chunk added. It did not corrupt anything, which is why it survived the
+	// small-scale tests; it simply ate the streaming apply budget alive. The
+	// near ring stalled at 178 of ~1900 chunks while every coarser ring filled
+	// normally, and the visible symptom was the coarse rings' exposed interiors
+	// where the missing fine terrain should have been.
+	//
+	// Copying a full buffer per incremental update is precisely the cost
+	// ADR-0006 exists to remove, so getting it wrong here forfeits the win the
+	// pool was built for.
+	TArray<uint64> QuadsSlice;
+	TArray<uint32> IdsSlice;
+	if (Count > 0)
+	{
+		QuadsSlice.Append(PooledQuads.GetData() + First, int32(Count));
+		IdsSlice.Append(QuadChunkIds.GetData() + First, int32(Count));
+	}
+	// The chunk table is two small vectors per chunk, so it stays whole.
 	TArray<FVector4f> OriginsCopy = ChunkOrigins;
 	TArray<FVector2f> ClimateCopy = ChunkClimate;
 
 	ENQUEUE_RENDER_COMMAND(VoxelGpuPoolIncrementalUpdate)(
-		[Proxy, QuadsCopy = MoveTemp(QuadsCopy), IdsCopy = MoveTemp(IdsCopy),
+		[Proxy, QuadsSlice = MoveTemp(QuadsSlice), IdsSlice = MoveTemp(IdsSlice),
 		 OriginsCopy = MoveTemp(OriginsCopy), ClimateCopy = MoveTemp(ClimateCopy),
 		 First, Count, NewNumQuads, bTableDirty](FRHICommandListImmediate& RHICmdList)
 	{
@@ -439,7 +461,7 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 		{
 			Proxy->UpdateChunkTable_RenderThread(RHICmdList, OriginsCopy, ClimateCopy);
 		}
-		Proxy->UpdateQuadRange_RenderThread(RHICmdList, QuadsCopy, IdsCopy,
+		Proxy->UpdateQuadRange_RenderThread(RHICmdList, QuadsSlice, IdsSlice,
 		                                    First, Count, NewNumQuads);
 	});
 

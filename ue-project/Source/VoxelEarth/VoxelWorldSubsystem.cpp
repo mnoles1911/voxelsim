@@ -5822,7 +5822,15 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	// path even if the cvar flipped underneath it -- mixing representations for
 	// one chunk is the one thing that would genuinely break, and a chunk always
 	// unloads the way it loaded. New chunks take whichever path is current.
-	if (VoxelDebug::GetStreamGpu() && !Rec.Component.IsValid())
+	// voxel.Stream.GPUMaxLevel: pool only rings at or below this level, leaving
+	// coarser ones on the component path. Both renderers coexist per chunk, so
+	// this is a real A/B and arguably a real shipping mode -- the pooling win
+	// scales with chunk COUNT, which is concentrated in the dense near rings.
+	static const auto* CVarGpuMaxLevel = IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.Stream.GPUMaxLevel"));
+	const int32 GpuMaxLevel = CVarGpuMaxLevel ? CVarGpuMaxLevel->GetInt() : -1;
+	const bool bLevelPoolable = (GpuMaxLevel < 0) || (Key.Level <= GpuMaxLevel);
+
+	if (VoxelDebug::GetStreamGpu() && bLevelPoolable && !Rec.Component.IsValid())
 	{
 		const bool bWasFirstLoad = (Rec.PoolSlot == INDEX_NONE);
 
