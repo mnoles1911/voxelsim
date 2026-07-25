@@ -2272,8 +2272,32 @@ struct FVoxelWorldImpl
 	// footprint is allowed, and its ~15 column-mates wait for the answer rather
 	// than each guessing. Added in DispatchJobs, removed in DrainResults on any
 	// level-0 result. Game-thread only, like FootprintBandCache itself.
-	TSet<FIntPoint> FootprintBlindJobInFlight;
+	// Value is ElapsedSeconds at the moment the mark was set, so it can AGE OUT.
+	//
+	// The mark is meant to be released by DrainResults on any level-0 result for
+	// the column. Relying on that alone has now failed twice: once by setting it
+	// at pop time (a popped chunk can still leave via NeedsOverlayAwarePath or
+	// either pre-dispatch skip without launching anything), and once again here,
+	// where a column was measured stranded for an entire run -- two chunks 44 m
+	// from the anchor, deferred on every dispatch pass forever, which starved
+	// their whole ring of ~1,700 chunks.
+	//
+	// Both times the bug was a launch path that produced no result. Enumerating
+	// those paths correctly is exactly what keeps being got wrong, so the mark no
+	// longer depends on it: a mark older than kBlindJobMarkTimeoutSeconds is
+	// treated as absent. Releasing early costs at most one extra blind job for
+	// that column -- the throttle exists to save work, not for correctness --
+	// while holding one forever costs the ring.
+	TMap<FIntPoint, double> FootprintBlindJobInFlight;
+	// Generous next to a worker job (measured p50 well under 100 ms) so a healthy
+	// column is never released early, but short enough that a stranded one
+	// recovers in seconds rather than never.
+	static constexpr double kBlindJobMarkTimeoutSeconds = 5.0;
 	int64 ColdBandDefersSinceLog = 0; // column-mates held back, per 5s log window
+	// Marks released by the age-out above. Should be ZERO on a healthy run --
+	// any non-zero value means a launch path produced no result, which is the
+	// bug this backstop exists to survive, and is worth chasing.
+	int64 ColdBandMarkTimeoutsSinceLog = 0;
 	int32 ColdBandHeldThisFrame = 0;  // held on the most recent DispatchJobs pass
 
 	// --- Bounded admission (docs/status.md "Streaming pipeline re-measure +
@@ -2515,6 +2539,15 @@ struct FVoxelWorldImpl
 	int64 RecordsEvictedSinceLog = 0;   // DrainUnloads: records erased (component-less + parked)
 	int64 CandidatesRejectedSinceLog = 0; // bounded admission: in-annulus candidates NOT admitted (never became records)
 	int64 RecordsDroppedSinceLog = 0;     // bounded admission: queued-but-never-meshed records displaced by nearer work
+
+	// Per-level breakouts of the three above. The global tallies cannot answer
+	// "this ring keeps admitting records that never mesh -- who is removing
+	// them", because every ring's adds and removes land in the same number.
+	// Added when R0 was measured admitting ~512 records per pass while its
+	// tracked count stayed at about one pass worth.
+	int64 LevelRecordsAdded[VoxelCoords::kNumLevels] = {};
+	int64 LevelRecordsDropped[VoxelCoords::kNumLevels] = {};
+	int64 LevelRecordsEvicted[VoxelCoords::kNumLevels] = {};
 
 	// --- Buried-chunk pre-dispatch skip, step 1 census (docs/status.md).
 	// Per RING LEVEL, over the same 5s window as everything above: results
@@ -2985,7 +3018,23 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 				// to do for this ring while candidates sit rejected. It cannot
 				// fire on a flight that is keeping the ring fed, and it fires
 				// immediately when a stationary underground anchor starves it.
-				if (PendingJobKeysByLevel[Level].IsEmpty())
+				// EMPTY is not the property wanted here -- "has no work this ring
+				// can actually dispatch" is.
+				//
+				// A ring only re-enumerates when the anchor crosses one of its
+				// chunks or when this trigger fires. Gating the trigger on an
+				// empty queue lets a BOUNDED number of permanently-undispatchable
+				// entries starve the whole ring: measured, two cold-band-deferred
+				// chunks held R0 at 255 drawn against ~1,950 desired, on a
+				// stationary anchor, with the trigger armed the entire time.
+				//
+				// So discount the entries the last dispatch pass put straight
+				// back. If nothing else remains, this ring is drained as far as it
+				// can act on, and refilling is exactly right. The two bugs are
+				// independent -- the stranded mark is fixed separately -- but this
+				// is what stops the NEXT stuck entry doing the same thing.
+				const int32 Undispatchable = (Level == 0) ? ColdBandHeldThisFrame : 0;
+				if (PendingJobKeysByLevel[Level].Num() <= Undispatchable)
 				{
 					bLevelWantsRefill[Level] = true;
 					bAdmissionRefill = true;
@@ -3356,6 +3405,22 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       VoxelStreamAdmission::GetPendingJobCap(),
 	       WidestAdmissionCutoffM(),
 	       (long long)CandidatesRejectedSinceLog, (long long)RecordsDroppedSinceLog);
+
+	{
+		// added / dropped / evicted per ring. A ring whose adds far exceed its
+		// residency, with drops and evictions to match, is churning rather than
+		// filling -- and which of the two columns is non-zero says WHICH removal
+		// path is doing it.
+		FString Line;
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			Line += FString::Printf(TEXT("R%d[+%lld -%lld ev%lld] "), Level,
+			                        (long long)LevelRecordsAdded[Level],
+			                        (long long)LevelRecordsDropped[Level],
+			                        (long long)LevelRecordsEvicted[Level]);
+		}
+		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel records/level (5s window): %s"), *Line);
+	}
 	// Buried-chunk pre-dispatch skip, step 1 census. One line per ring level:
 	// results/zeroQuad is the fraction of that ring's worker output that
 	// produced no geometry at all, and air/solid/mixed says what those chunks
@@ -3393,10 +3458,12 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       (long long)BuriedSkipsByLevelSinceLog[0], FootprintBandCache.Num(), (long long)BuriedVerifyCheckedSinceLog,
 	       (long long)BuriedVerifyCheckedTotal, (long long)BuriedVerifyViolations);
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel cold-band throttle (5s window): defers=%lld heldLastPass=%d bandCache=%d blindInFlight=%d"),
+	       TEXT("Voxel cold-band throttle (5s window): defers=%lld heldLastPass=%d bandCache=%d blindInFlight=%d "
+	            "markTimeouts=%lld"),
 	       (long long)ColdBandDefersSinceLog, ColdBandHeldThisFrame, FootprintBandCache.Num(),
-	       FootprintBlindJobInFlight.Num());
+	       FootprintBlindJobInFlight.Num(), (long long)ColdBandMarkTimeoutsSinceLog);
 	ColdBandDefersSinceLog = 0;
+	ColdBandMarkTimeoutsSinceLog = 0;
 
 	BuriedSkipsSinceLog = BuriedSkipAirSinceLog = BuriedSkipSolidSinceLog = BuriedVerifyCheckedSinceLog = 0;
 
@@ -3451,6 +3518,9 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	AccumTicks = 0;
 	JobsDispatchedSinceLog = ResultsDrainedSinceLog = StaleDiscardsSinceLog = ZeroQuadAppliesSinceLog = 0;
 	RecordsAddedSinceLog = RecordsEvictedSinceLog = CandidatesRejectedSinceLog = RecordsDroppedSinceLog = 0;
+	FMemory::Memzero(LevelRecordsAdded);
+	FMemory::Memzero(LevelRecordsDropped);
+	FMemory::Memzero(LevelRecordsEvicted);
 
 	MaxRecomputeMs = 0.f;
 	MaxExitScanMs = 0.f;
@@ -4693,6 +4763,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 
 					VoxelStreaming::FChunkRecord& NewRecord = ChunkRecords.Add(LevelKey);
 					++RecordsAddedSinceLog;
+					++LevelRecordsAdded[QueueLevel];
 					AdmissionsThisLevel += bOverlayAware ? 0 : 1;
 					NewRecord.bDeepAnchorRelative = bDeepAnchorRelative;
 					if (bOverlayAware)
@@ -4833,6 +4904,7 @@ bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 Ent
 			{
 				ChunkRecords.Remove(Entry.Key);
 				++RecordsDroppedSinceLog;
+				++LevelRecordsDropped[FMath::Clamp(Entry.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
 				--ToDrop;
 				continue;
 			}
@@ -4969,6 +5041,51 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 		if (bLevelScannedThisCall[Level] && LevelCandidatesRejectedThisCall[Level] == 0)
 		{
 			bAdmissionDeferredWork[Level] = false;
+		}
+	}
+
+	// voxel.Stream.LogAdmission: the admission loop's state, per level, per
+	// call. Whether a ring keeps filling is a function of four things
+	// interacting -- did it re-enumerate, how many did it take, how many did it
+	// turn away, and is its refill trigger still armed -- and no combination of
+	// the existing counters shows them together at the moment they decide.
+	static const auto* CVarLogAdmission =
+		IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.Stream.LogAdmission"));
+	if (CVarLogAdmission && CVarLogAdmission->GetInt() != 0)
+	{
+		FString Line;
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			Line += FString::Printf(TEXT("R%d[scan=%d rej=%d q=%d def=%d] "),
+			                        Level, bLevelScannedThisCall[Level] ? 1 : 0,
+			                        LevelCandidatesRejectedThisCall[Level],
+			                        PendingJobKeysByLevel[Level].Num(),
+			                        bAdmissionDeferredWork[Level] ? 1 : 0);
+		}
+		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel admission pass: %s"), *Line);
+
+		// A ring stuck with a handful of entries it never dispatches is the
+		// pathology this whole investigation is about, and the entries are
+		// invisible in aggregate counters. Dump them, with the record state that
+		// decides whether DispatchJobs will act on them.
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			const TArray<FSortEntry>& Queue = PendingJobKeysByLevel[Level];
+			if (Queue.Num() == 0 || Queue.Num() > 8)
+			{
+				continue;
+			}
+			for (const FSortEntry& Entry : Queue)
+			{
+				const VoxelStreaming::FChunkRecord* R = ChunkRecords.Find(Entry.Key);
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("  stuck R%d (%d,%d,%d) rec=%d inFlight=%d settled=%d quads=%d overlay=%d dist=%.0fm"),
+				       Level, Entry.Key.Key.X, Entry.Key.Key.Y, Entry.Key.Key.Z,
+				       R != nullptr, R && R->bJobInFlight, R && R->bMeshSettled,
+				       R ? R->LastQuadCount : -1,
+				       NeedsOverlayAwarePath(Entry.Key) ? 1 : 0,
+				       FMath::Sqrt(Entry.DistSq) / 100.0);
+			}
 		}
 	}
 }
@@ -5229,12 +5346,26 @@ void FVoxelWorldImpl::DispatchJobs()
 		// deferred forever (observed as blindInFlight pinned at 92 and useful
 		// throughput DOWN 15%). The mark is set at the actual launch site.
 		if (LevelKey.Level == 0 && bBandSkipActive &&
-		    !FootprintBandCache.Contains(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y)) &&
-		    FootprintBlindJobInFlight.Contains(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y)))
+		    !FootprintBandCache.Contains(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y)))
 		{
-			DeferredColdBand.Add(PoppedEntry);
-			++ColdBandDefersSinceLog;
-			continue;
+			const FIntPoint Footprint(LevelKey.Key.X, LevelKey.Key.Y);
+			if (const double* MarkedAt = FootprintBlindJobInFlight.Find(Footprint))
+			{
+				if (ElapsedSeconds - *MarkedAt >= kBlindJobMarkTimeoutSeconds)
+				{
+					// Stale: the seeding job never produced a result. Drop the
+					// mark and let this chunk through as the new seed rather
+					// than deferring its column forever.
+					FootprintBlindJobInFlight.Remove(Footprint);
+					++ColdBandMarkTimeoutsSinceLog;
+				}
+				else
+				{
+					DeferredColdBand.Add(PoppedEntry);
+					++ColdBandDefersSinceLog;
+					continue;
+				}
+			}
 		}
 
 		// Defensive re-check (any level as of M2 wave 2 -- see
@@ -5588,7 +5719,7 @@ void FVoxelWorldImpl::DispatchJobs()
 			const FIntPoint SeedFootprint(LevelKey.Key.X, LevelKey.Key.Y);
 			if (!FootprintBandCache.Contains(SeedFootprint))
 			{
-				FootprintBlindJobInFlight.Add(SeedFootprint);
+				FootprintBlindJobInFlight.Add(SeedFootprint, ElapsedSeconds);
 			}
 		}
 
@@ -6369,6 +6500,7 @@ void FVoxelWorldImpl::DrainUnloads()
 		ChunkRecords.Remove(Key);
 		++TotalChunksUnloaded;
 		++RecordsEvictedSinceLog;
+		++LevelRecordsEvicted[FMath::Clamp(Key.Level, 0, VoxelCoords::kNumLevels - 1)];
 	}
 	// Re-queue the deferred component-bearing unloads (still in PendingUnloadSet,
 	// still tracked) so they're retried next frame under the render budget.
