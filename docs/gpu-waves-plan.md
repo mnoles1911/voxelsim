@@ -840,9 +840,41 @@ the value case:
 `FVoxelGpuColumnSample` does not carry. The band feeds two admission/dispatch
 skips *and* the cold-band throttle, which deadlocks a whole (X,Y) column if
 bands stop arriving. So a GPU-meshed chunk **still needs a CPU column pass**,
-and the wave's ceiling is the ~55% of level-0 job time that is meshing — until
-the GPU column struct grows. That materially tempers the value case for the
-whole wave and should be read next to the ~0.09 s figure, not instead of it.
+and the wave's ceiling is the ~55% of level-0 job time that is meshing. That
+materially tempers the value case for the whole wave and should be read next to
+the ~0.09 s figure, not instead of it.
+
+#### …but the ceiling is NOT structural. Corrected 2026-07-26, same session.
+
+~~until the GPU column struct grows~~ — that phrasing (mine, one commit
+earlier) implies the fix is to widen `GpuColumnSample` and read it back. **It is
+not, and doing that would re-create the exact problem D3 just removed:**
+
+| | bytes |
+|---|---|
+| `vxc::ColumnSample` = 5 scalars + `CaveColumn` (108) + `CavernColumn` (56) | **184** |
+| `FVoxelGpuColumnSample` — the 5 scalars only | **20** (11% of it) |
+| widened struct, read back over a 34×34 band grid (1,156 columns) | **213 KB/chunk** |
+
+**The cave and cavern data already exists on the GPU.** `worldgen.ush` mirrors
+`caveColumnFor` and `cavernColumnFor` **bit-for-bit** (`:812-814`, `:1170-1173`)
+and `VoxelizeMain` computes `GpuCaveColumn cave` / `GpuCavernColumn cavern` per
+column at `:1325`/`:1334` — then discards them. That was a deliberate choice
+recorded in `amplifier.h:36-41`: *"the GPU mirror recomputes it inside
+VoxelizeMain rather than widening GpuColumnSample"*.
+
+And `ColumnDeepestAirVoxel` (`VoxelWorldSubsystem.cpp:1305`) is a **pure
+per-column reduction** — one `vxc::ColumnSample` in, one `int64` out. So the
+right move is **a band-reduction kernel, not a wider struct**: run the reduction
+where the cave/cavern data already is, and read back **~4 bytes per column
+(~4.6 KB per chunk)** instead of 213 KB. No new worldgen mirroring is needed —
+the hard part is done and is already gated by the determinism digest.
+
+**So "GPU meshing removes the meshing, not the job" is true of D1–D4 as scoped,
+and is a missing kernel rather than a permanent ceiling.** Sequence it after
+D1–D4 are measured, like D5: it is the change that would let a level-0 job stop
+touching the CPU column path at all. Do not let the caveat above be read as an
+argument that the wave cannot go further than ~55%.
 
 **The invariant that must not break**, quoted from `VoxelWorldSubsystem.cpp:7183-7188`:
 
