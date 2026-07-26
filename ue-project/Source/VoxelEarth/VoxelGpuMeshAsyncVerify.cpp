@@ -227,10 +227,20 @@ namespace VoxelGpuMeshAsyncVerify
 			}
 			CpuTotalMs = (FPlatformTime::Seconds() - CpuStart) * 1000.0;
 
+			// Which emit permutation this run is about. Without it a PASS here
+			// says nothing about WHICH of the two paths passed, and the whole
+			// point of D2's control is that both are run.
+			const IConsoleVariable* ChunkLocalCVar =
+				IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.GPU.MeshChunkLocal"));
+			const bool bChunkLocal = ChunkLocalCVar == nullptr || ChunkLocalCVar->GetInt() != 0;
+
 			UE_LOG(LogVoxelGpuAsync, Log,
-			       TEXT("voxel.GPU.VerifyAsyncMesh: %d chunks, %d in flight, seed %llu. "
+			       TEXT("voxel.GPU.VerifyAsyncMesh: %d chunks, %d in flight, seed %llu, emit=%s. "
 			            "CPU reference: %d quads in %.1f ms (%.2f ms/chunk)."),
-			       NumChunks, MaxInFlight, kSeed, TotalCpuQuads, CpuTotalMs,
+			       NumChunks, MaxInFlight, kSeed,
+			       bChunkLocal ? TEXT("GPU chunk-local (voxel.GPU.MeshChunkLocal 1)")
+			                   : TEXT("GPU brick-local + CPU rebase (voxel.GPU.MeshChunkLocal 0)"),
+			       TotalCpuQuads, CpuTotalMs,
 			       CpuTotalMs / double(FMath::Max(1, NumChunks)));
 
 			FirstSubmitSeconds = FPlatformTime::Seconds();

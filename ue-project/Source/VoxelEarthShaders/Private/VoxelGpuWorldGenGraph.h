@@ -41,13 +41,22 @@ namespace VoxelGpuWorldGen
 		uint32 NumBlocks = 0;
 		uint32 MaxQuads = 0;
 
+		// Wave D / D2. The quad buffer holds QuadWriteBase slots this dispatch
+		// must not touch, followed by its own MaxQuads. Equal to MaxQuads
+		// whenever the base is zero, which is every path except a batched
+		// emit into a shared buffer.
+		uint32 QuadWriteBase = 0;
+		uint32 QuadBufferElements = 0;
+
 		bool bMesh = false;
 
 		// Byte sizes of the five readbackable buffers.
 		uint32 ColumnsBytes() const;
 		uint32 CellsBytes() const { return NumCells * uint32(sizeof(uint32)); }
 		uint32 CountsBytes() const { return MaskCount * uint32(sizeof(uint32)); }
-		uint32 QuadsBytes() const { return MaxQuads * uint32(sizeof(uint64)); }
+		// The WHOLE quad buffer, base included — that is what a readback of it
+		// costs, and what AddEnqueueCopyPass has to be given.
+		uint32 QuadsBytes() const { return QuadBufferElements * uint32(sizeof(uint64)); }
 	};
 
 	// The graph's output buffers. Counts/Offsets/Quads are null when the request

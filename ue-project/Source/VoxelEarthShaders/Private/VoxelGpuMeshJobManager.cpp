@@ -11,6 +11,24 @@
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelGpuMeshJob, Log, All);
 
+// Wave D / D2. Which MeshEmitMain permutation the async runner dispatches.
+//
+// This is an A/B, not a feature flag, and it is the one that matters: at 1 the
+// GPU emits chunk-local quads and RebaseQuadsToChunkLocal never runs; at 0 the
+// GPU emits brick-local quads and the CPU rebases them exactly as it did
+// before D2. Both are supposed to produce byte-identical results, and
+// voxel.GPU.VerifyAsyncMesh compares BOTH against MeshChunkBricks — so
+// flipping this and re-running is the whole correctness argument for the
+// permutation, runnable in one session on one binary.
+static int32 GVoxelGpuMeshChunkLocal = 1;
+static FAutoConsoleVariableRef CVarVoxelGpuMeshChunkLocal(
+	TEXT("voxel.GPU.MeshChunkLocal"),
+	GVoxelGpuMeshChunkLocal,
+	TEXT("1 = the GPU emits chunk-local quads (VXC_MESH_CHUNK_LOCAL permutation, no CPU rebase). ")
+	TEXT("0 = the GPU emits brick-local quads and FVoxelGpuMeshJobManager rebases them on the CPU. ")
+	TEXT("Default 1. Read once per Submit, so it takes effect on the next job."),
+	ECVF_Default);
+
 const TCHAR* LexToString(EVoxelGpuMeshJobStatus Status)
 {
 	switch (Status)
@@ -249,6 +267,10 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 	Job->JobId = NextJobId++;
 	Job->UserTag = UserTag;
 	Job->Region = MoveTemp(Region);
+	// Latched per job rather than read at delivery: a cvar flip between
+	// dispatch and readback would otherwise rebase quads that were already
+	// rebased on the GPU, which is silent and looks like a mesher bug.
+	Job->Region.bChunkLocalQuads = GVoxelGpuMeshChunkLocal != 0;
 	Job->SubmitSeconds = FPlatformTime::Seconds();
 
 	Queued.Add(Job);
@@ -270,7 +292,14 @@ void FVoxelGpuMeshJobManager::Deliver(const FJobPtr& Job, EVoxelGpuMeshJobStatus
 
 	if (Status == EVoxelGpuMeshJobStatus::Success)
 	{
-		Result.Quads = RebaseQuadsToChunkLocal(*Job);
+		// Under the D2 permutation the shader has already baked each brick's
+		// chunk-local origin into the quad positions, so the stream is
+		// pool-ready and the CPU rebase would double-apply the offset. The
+		// brick-local branch below is kept, not vestigial: it is the control
+		// voxel.GPU.MeshChunkLocal 0 selects, and the two must agree.
+		Result.Quads = Job->Region.bChunkLocalQuads
+			? MoveTemp(Job->RawQuads)
+			: RebaseQuadsToChunkLocal(*Job);
 	}
 
 	OnJobComplete.ExecuteIfBound(MoveTemp(Result));
@@ -443,11 +472,13 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 				Job->ReadySeconds = FPlatformTime::Seconds();
 
 				const uint32 MaskCount = Job->Sizes.MaskCount;
-				const uint32 MaxQuads = Job->Sizes.MaxQuads;
 
 				Job->Counts.SetNumUninitialized(int32(MaskCount));
 				Job->Offsets.SetNumUninitialized(int32(MaskCount));
-				Job->RawQuads.SetNumUninitialized(int32(MaxQuads));
+				// The WHOLE quad buffer, including any QuadWriteBase prefix
+				// belonging to other chunks — QuadsBytes() is sized the same
+				// way, and the harvest below is what trims it.
+				Job->RawQuads.SetNumUninitialized(int32(Job->Sizes.QuadBufferElements));
 
 				FString Error;
 				const bool bOk =
@@ -509,6 +540,13 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 			}
 			else
 			{
+				// Drop the QuadWriteBase prefix first, then the unused tail, so
+				// RawQuads is exactly this job's live quads either way. The
+				// prefix is empty on every path today.
+				if (Job->Sizes.QuadWriteBase > 0)
+				{
+					Job->RawQuads.RemoveAt(0, int32(Job->Sizes.QuadWriteBase), EAllowShrinking::No);
+				}
 				Job->RawQuads.SetNum(int32(NumQuads), EAllowShrinking::No);
 				Finished.Add({ Job, EVoxelGpuMeshJobStatus::Success, FString() });
 			}

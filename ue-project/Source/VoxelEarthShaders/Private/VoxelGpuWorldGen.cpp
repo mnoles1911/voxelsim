@@ -198,8 +198,20 @@ namespace
 		DECLARE_GLOBAL_SHADER(FVoxelMeshEmitCS);
 		SHADER_USE_PARAMETER_STRUCT(FVoxelMeshEmitCS, FVoxelWorldGenShader);
 
+		// Wave D / D2. The ONLY kernel with a permutation, and the reason it is
+		// a permutation rather than an edit is in worldgen.ush next to the
+		// define: the determinism digest hashes packed quad fields, and this
+		// changes three of them. Both permutations are compiled, so one binary
+		// can run the pinned gate and the streaming path.
+		class FChunkLocalDim : SHADER_PERMUTATION_BOOL("VXC_MESH_CHUNK_LOCAL");
+		using FPermutationDomain = TShaderPermutationDomain<FChunkLocalDim>;
+
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
+			// Read only by the chunk-local permutation. Set to 0 otherwise —
+			// on the off permutation the name does not exist in the compiled
+			// shader, and binding an unbound parameter is a silent no-op.
+			SHADER_PARAMETER(uint32, QuadWriteBase)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutCells)
 			// Same buffer the scan wrote, bound read-only. It is an SRV here
 			// and a UAV in the scan passes; that is safe only because they are
@@ -303,6 +315,29 @@ bool VoxelGpuWorldGen::ValidateRegionRequest(const FVoxelGpuRegionRequest& Req, 
 				MaskCount, kMaxMasksPerDispatch);
 			return false;
 		}
+
+		// A parameter that silently does nothing is the failure mode this
+		// project has already been bitten by twice (the unbound
+		// FShaderParameter, the dead GPUCullMergeGap cvar). QuadWriteBase is
+		// only read by the chunk-local permutation, so asking for one without
+		// the other is a caller bug and says so.
+		if (Req.QuadWriteBase != 0 && !Req.bChunkLocalQuads)
+		{
+			OutError = FString::Printf(
+				TEXT("QuadWriteBase %u requires bChunkLocalQuads — the default emit permutation ")
+				TEXT("does not read it, so the base would be silently ignored and every quad ")
+				TEXT("would land at offset 0"),
+				Req.QuadWriteBase);
+			return false;
+		}
+		const uint64 MaxQuads = MaskCount * uint64(kMaxQuadsPerMask);
+		if (uint64(Req.QuadWriteBase) + MaxQuads > uint64(TNumericLimits<uint32>::Max()))
+		{
+			OutError = FString::Printf(
+				TEXT("QuadWriteBase %u + %llu quads overflows a uint32 quad index"),
+				Req.QuadWriteBase, MaxQuads);
+			return false;
+		}
 	}
 	return true;
 }
@@ -324,6 +359,8 @@ VoxelGpuWorldGen::ComputeRegionGraphSizes(const FVoxelGpuRegionRequest& Request)
 		S.MaskCount = (S.BricksX - 2) * (S.BricksY - 2) * (S.BricksZ - 2) * kMasksPerBrick;
 		S.NumBlocks = FMath::DivideAndRoundUp(S.MaskCount, kScanBlockSize);
 		S.MaxQuads = S.MaskCount * kMaxQuadsPerMask;
+		S.QuadWriteBase = Request.bChunkLocalQuads ? Request.QuadWriteBase : 0;
+		S.QuadBufferElements = S.QuadWriteBase + S.MaxQuads;
 	}
 	return S;
 }
@@ -402,7 +439,8 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	FRDGBufferRef BlockSumsBuffer = GraphBuilder.CreateBuffer(
 		FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumBlocks), TEXT("Voxel.BlockSums"));
 	Out.Quads = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32) * 2, S.MaxQuads), TEXT("Voxel.Quads"));
+		FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32) * 2, S.QuadBufferElements),
+		TEXT("Voxel.Quads"));
 
 	// --- pass 3: MeshCountMain ---------------------------------
 	{
@@ -465,13 +503,19 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 		FVoxelMeshEmitCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelMeshEmitCS::FParameters>();
 		FillLooseParameters(*Params, Request);
 		Params->ScanCount = S.MaskCount;
+		Params->QuadWriteBase = S.QuadWriteBase;
 		Params->OutCells = GraphBuilder.CreateUAV(Out.Cells);
 		Params->InQuadOffsets = GraphBuilder.CreateSRV(Out.Offsets);
 		Params->OutQuads = GraphBuilder.CreateUAV(Out.Quads);
 
-		TShaderMapRef<FVoxelMeshEmitCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FVoxelMeshEmitCS::FPermutationDomain Permutation;
+		Permutation.Set<FVoxelMeshEmitCS::FChunkLocalDim>(Request.bChunkLocalQuads);
+
+		TShaderMapRef<FVoxelMeshEmitCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel), Permutation);
 		FComputeShaderUtils::AddPass(
-			GraphBuilder, RDG_EVENT_NAME("Voxel.MeshEmitMain"), Shader, Params,
+			GraphBuilder, RDG_EVENT_NAME("Voxel.MeshEmitMain(%s)",
+			                             Request.bChunkLocalQuads ? TEXT("chunk-local") : TEXT("brick-local")),
+			Shader, Params,
 			FIntVector(FMath::DivideAndRoundUp(S.MaskCount, 64u), 1, 1));
 	}
 
@@ -504,6 +548,11 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 	const uint32 NumCells = Sizes.NumCells;
 	const uint32 MaskCount = Sizes.MaskCount;
 	const uint32 MaxQuads = Sizes.MaxQuads;
+	// The quad buffer is QuadWriteBase slots of other people's geometry
+	// followed by this dispatch's MaxQuads. Equal to MaxQuads on every path
+	// that does not set a base, which is every caller of this blocking one.
+	const uint32 QuadElements = Sizes.QuadBufferElements;
+	const uint32 QuadBase = Sizes.QuadWriteBase;
 
 	// Filled on the render thread, read back on this one after the flush.
 	TArray<FVoxelGpuColumnSample> ColumnsOut;
@@ -515,7 +564,7 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 
 	ENQUEUE_RENDER_COMMAND(VoxelGpuRunRegion)(
 		[&Request, &ColumnsOut, &CellsOut, &CountsOut, &OffsetsOut, &QuadsOut, &RenderError,
-		 NumColumns, NumCells, bMesh, MaskCount, MaxQuads]
+		 NumColumns, NumCells, bMesh, MaskCount, QuadElements]
 		(FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
@@ -540,7 +589,7 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 		const uint32 ColumnsBytes = NumColumns * sizeof(FVoxelGpuColumnSample);
 		const uint32 CellsBytes = NumCells * sizeof(uint32);
 		const uint32 CountsBytes = MaskCount * sizeof(uint32);
-		const uint32 QuadsBytes = MaxQuads * sizeof(uint64);
+		const uint32 QuadsBytes = QuadElements * sizeof(uint64);
 
 		AddEnqueueCopyPass(GraphBuilder, &ColumnsReadback, ColumnsBuffer, ColumnsBytes);
 		AddEnqueueCopyPass(GraphBuilder, &CellsReadback, CellsBuffer, CellsBytes);
@@ -595,7 +644,7 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 			OffsetsOut.SetNumUninitialized(MaskCount);
 			CopyOut(OffsetsReadback, OffsetsOut.GetData(), CountsBytes, TEXT("Offsets"));
 
-			QuadsOut.SetNumUninitialized(MaxQuads);
+			QuadsOut.SetNumUninitialized(QuadElements);
 			CopyOut(QuadsReadback, QuadsOut.GetData(), QuadsBytes, TEXT("Quads"));
 		}
 	});
@@ -628,6 +677,13 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 			return Result;
 		}
 
+		// Trim to [QuadBase, QuadBase + NumQuads): the live quads this dispatch
+		// wrote, with anyone else's slots dropped. QuadBase is 0 on every
+		// current caller, so this is a no-op removal today.
+		if (QuadBase > 0)
+		{
+			QuadsOut.RemoveAt(0, int32(QuadBase), EAllowShrinking::No);
+		}
 		QuadsOut.SetNum(Result.NumQuads, EAllowShrinking::No);
 		Result.Quads = MoveTemp(QuadsOut);
 

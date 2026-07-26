@@ -69,6 +69,28 @@ struct FVoxelGpuRegionRequest
 	// Skip the mesh chain and stop after voxelization. Useful to isolate a
 	// failure to the generation half.
 	bool bMeshChain = true;
+
+	// --- Wave D / D2: the chunk-local emit permutation ----------------------
+	//
+	// Selects FVoxelMeshEmitCS's VXC_MESH_CHUNK_LOCAL permutation, which bakes
+	// each interior brick's chunk-local origin into the emitted quad positions.
+	// The quad stream then needs no rebase: it is already in the 0..31
+	// chunk-local coordinates MeshChunkBricks produces and the geometry pool
+	// consumes.
+	//
+	// MUST STAY FALSE ON THE DETERMINISM GATE. The digest folds in the packed
+	// quad FIELDS, and slice/u0/v0 are quad fields, so flipping this changes
+	// the digest for geometry that is identical. voxel.GPU.VerifyRegion is
+	// pinned against the false permutation; voxel.GPU.VerifyAsyncMesh (a byte
+	// compare against the shipping CPU mesher) is what gates the true one.
+	bool bChunkLocalQuads = false;
+
+	// First slot in the quad buffer this dispatch may write, so several chunks
+	// can emit into disjoint slices of one buffer. Only honoured under
+	// bChunkLocalQuads — the kernel reads it only in that permutation — so
+	// ValidateRegionRequest REJECTS a non-zero base without it rather than let
+	// it be silently ignored.
+	uint32 QuadWriteBase = 0;
 };
 
 struct FVoxelGpuRegionResult
@@ -80,6 +102,12 @@ struct FVoxelGpuRegionResult
 	TArray<uint32> Cells;                   // one per voxel, material in low byte
 
 	// Packed quads, word0 | word1 << 32.
+	//
+	// Everything below describes the DEFAULT (bChunkLocalQuads == false)
+	// permutation. Under bChunkLocalQuads the coordinates are already
+	// chunk-local and none of the rebase discussion applies — the shader has
+	// done it, and the first NumQuads entries starting at QuadWriteBase are
+	// pool-ready as they stand.
 	//
 	// IMPORTANT: these coordinates are BRICK-LOCAL. greedyMask packs slice/u0/v0
 	// as positions inside a single 8x8x8 brick; which brick is implied by the

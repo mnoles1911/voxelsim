@@ -29,8 +29,21 @@
 //    because there is no return value to forget.
 //
 // SCOPE. Stage 1 is the runner only. Nothing here is wired into DispatchJobs or
-// the streaming path, and the brick-local -> chunk-local rebase still happens on
-// the CPU after readback (a GPU-side rebase is a later stage).
+// the streaming path yet.
+//
+// WAVE D / D2 UPDATE. The brick-local -> chunk-local rebase no longer happens
+// on the CPU by default: Submit sets FVoxelGpuRegionRequest::bChunkLocalQuads
+// from voxel.GPU.MeshChunkLocal (default 1), which selects a MeshEmitMain
+// permutation that bakes the offset in on the GPU. Setting that cvar to 0
+// restores the CPU rebase, and it is a genuine control rather than a fallback:
+// voxel.GPU.VerifyAsyncMesh byte-compares both against MeshChunkBricks, so the
+// two paths agreeing is what makes the permutation trustworthy.
+//
+// The readbacks themselves are still here. Removing them needs the pool's
+// buffers to be UAV-writable and RDG-registered (D1) and an allocation scheme
+// that does not need the quad stream on the CPU at all (D3); until then this
+// stages quads through system memory, which is correct but is NOT the
+// throughput story Wave D exists for.
 
 #pragma once
 
@@ -100,8 +113,9 @@ struct FVoxelGpuMeshJobResult
 
 	// CHUNK-LOCAL packed quads, byte-identical in layout to
 	// PackVoxelChunkQuad(FVoxelChunkQuad) -- i.e. exactly what
-	// UVoxelGpuPoolComponent::AddChunk consumes. The GPU emits brick-local
-	// coordinates; the rebase happens on the CPU in Tick (see the class comment).
+	// UVoxelGpuPoolComponent::AddChunk consumes. Produced chunk-local by the
+	// GPU under voxel.GPU.MeshChunkLocal 1, or rebased on the CPU in Tick under
+	// 0; the contract on this field is the same either way.
 	TArray<uint64> Quads;
 
 	// Wall-clock, all measured from the game thread's point of view except
