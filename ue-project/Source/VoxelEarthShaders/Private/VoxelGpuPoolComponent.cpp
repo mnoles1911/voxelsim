@@ -1461,9 +1461,24 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 	{
 		// Out of CONTIGUOUS room, which is not the same as out of space --
 		// see FVoxelGpuGeometryPool. The caller decides whether to compact.
-		UE_LOG(LogTemp, Warning,
-		       TEXT("%s: no room for %d quads (%u free, largest run %u)"),
-		       *PoolName, InQuads.Num(), Pool.GetFreeQuads(), Pool.GetLargestFreeRun());
+		//
+		// Counted as well as logged: the caller's only signal is INDEX_NONE, and
+		// every caller in the tree treats that as "no geometry for this chunk"
+		// and moves on. See GetAllocFailureCount for why a per-occurrence warning
+		// is not enough on its own.
+		++AllocFailureCount;
+		AllocFailureQuads += InQuads.Num();
+		// Warn on the first, then at powers of ten: a pool that has genuinely run
+		// out fails on nearly every subsequent chunk, and a per-chunk warning at
+		// that rate buries the streaming log it would be diagnosed from.
+		if (FMath::IsPowerOfTwo(AllocFailureCount) || AllocFailureCount == 1)
+		{
+			UE_LOG(LogTemp, Warning,
+			       TEXT("%s: no room for %d quads (%u free, largest run %u) -- "
+			            "GEOMETRY DROPPED, failure %lld of this run (%lld quads total)"),
+			       *PoolName, InQuads.Num(), Pool.GetFreeQuads(), Pool.GetLargestFreeRun(),
+			       (long long)AllocFailureCount, (long long)AllocFailureQuads);
+		}
 		return INDEX_NONE;
 	}
 
@@ -1831,6 +1846,18 @@ int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& In
 			FreeChunkIds.Add(ChunkId);
 			bChunkTableDirty = true;
 		}
+		// Counted with the AddChunk failures, and this is the WORSE of the two:
+		// RemoveChunkInternal has already run, so a chunk that was on screen a
+		// moment ago is now gone. On a full pool an ordinary re-mesh therefore
+		// DELETES existing terrain rather than merely failing to add new terrain,
+		// and it does so with no other trace. This path had no log at all.
+		++AllocFailureCount;
+		AllocFailureQuads += InQuads.Num();
+		UE_LOG(LogTemp, Warning,
+		       TEXT("%s: re-mesh outgrew its slot and the pool is full (%d quads wanted, %u free, "
+		            "largest run %u) -- RESIDENT GEOMETRY DROPPED, failure %lld of this run"),
+		       *PoolName, InQuads.Num(), Pool.GetFreeQuads(), Pool.GetLargestFreeRun(),
+		       (long long)AllocFailureCount);
 		return INDEX_NONE;
 	}
 	for (int32 I = 0; I < InQuads.Num(); ++I)
