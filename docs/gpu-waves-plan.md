@@ -679,8 +679,53 @@ the box was queued to other waves.**
 | shader lint | `lint-shader-ub.py` clean, incl. the new `UNSIGNED_UNDERFLOW` annotation |
 | it links | `VoxelEarthEditor Win64 Development` Succeeded, `voxelcore.lib` rebuilt first so the staleness warning could not fire |
 
-**Still owed:** `voxel.GPU.VerifyAsyncMesh 64 8` at `MeshChunkLocal` 1 and 0,
-×2 legs each. Pure correctness, ~2 min of box time, no camera or settle needed.
+**MEASURED 2026-07-26, AMD Radeon RX 7800 XT. D2 and D3 are both GREEN.**
+
+Four legs, `voxel.GPU.VerifyAsyncMesh 64 8`, 64 chunks × 8 in flight, seed
+20260719, two separate processes:
+
+| leg | emit path | result |
+|---|---|---|
+| 1a | GPU chunk-local (`MeshChunkLocal 1`) | 64/64, gpu 88,860 quads = cpu 88,860, **BYTE-IDENTICAL** |
+| 1b | GPU chunk-local | 64/64, 88,860 = 88,860, **BYTE-IDENTICAL** |
+| 2a | GPU brick-local + CPU rebase (`MeshChunkLocal 0`, the control) | 64/64, 88,860 = 88,860, **BYTE-IDENTICAL** |
+| 2b | GPU brick-local + CPU rebase | 64/64, 88,860 = 88,860, **BYTE-IDENTICAL** |
+
+Both permutations produce the **same 88,860 quads** and both are byte-identical
+to `MeshChunkBricks` + `PackVoxelChunkQuad`. Zero job failures, zero double
+deliveries, 64/64 delivered on every leg — the exactly-one-outcome contract held.
+
+**The determinism gate did not move, which is the whole point of D2 being a
+permutation:**
+
+```
+CPU reference digest: 6e893ab3679a8c81 (matches the pinned value; vxc::kWorldGenVersion = 8)
+PASS: Unreal-compiled GPU output is bit-exact with the CPU reference (13.8 ms total)
+```
+
+**D3's quad-total guard, first firing in anger — PASS, both fixture regions:**
+
+```
+[D3 quad-total cross-check] PASS — QuadTotalMain 3424 == CPU-derived 3424 (Offsets[6911] + Counts[6911], 6912 masks)
+[D3 quad-total cross-check] PASS — QuadTotalMain 3244 == CPU-derived 3244 (Offsets[6911] + Counts[6911], 6912 masks)
+```
+
+**NO THROUGHPUT NUMBER IS QUOTED FROM THIS RUN, and none should be.** Three
+reasons, all disqualifying on their own:
+1. **Leg 1a is warmup-contaminated** — `dispatch->ready` max 921 ms against
+   ~22 ms on every subsequent leg. That is shader compile and PSO warmup, and it
+   dragged 1a's rate to 46.3 chunks/s against 127–136 on the three warm legs.
+   Ground rule 1, exactly.
+2. **The world was streaming the full cascade concurrently** in every leg
+   (`dispatched=7137` in the first 5 s window). That is contention.
+3. It is a synthetic harness at a fixed in-flight cap of 8, not the streaming
+   path. Wave D's throughput claim has to come from per-ring dispatch rate under
+   motion, which needs the D4 wiring first.
+
+What the run *does* support: `dispatch->ready` p50 is **~21 ms** on all three
+warm legs, and chunk-local vs brick-local are indistinguishable (132.3 vs 127.3
+/ 135.5 chunks/s) — i.e. **D2 costs nothing measurable**, which is expected, as
+it is the same kernel plus an add.
 
 **Two design points worth keeping:**
 - The CPU rebase is **kept as the control**, not deleted. `voxel.GPU.MeshChunkLocal`
