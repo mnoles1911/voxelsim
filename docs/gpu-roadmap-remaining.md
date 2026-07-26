@@ -19,24 +19,40 @@ closed as "do not build".
 
 ---
 
-## Wave A — Make the pooled renderer worth having (frustum culling)
+## Wave A — Make the pooled renderer worth having (frustum culling) — **LANDED 2026-07-26 (PR #127)**
 
-**What the pool already does:** draws ~9,822 chunks / 8.8M quads as **one
-primitive, one draw call**, instead of 9,822 scene primitives. Streaming a chunk
-in or out writes into a buffer instead of calling `FScene::AddPrimitive`.
+**Result, 12 legs on one box state, every leg settled identically:**
 
-**What is wrong with it:** it has **no per-chunk frustum culling**, so it pays for
-every resident quad every frame regardless of where you look. Measured on a
-settled scene with a pinned camera: **+23% frame time at p50 vs the component
-path, +253% when little is in frustum.** The control is decisive — point the
-camera at almost nothing and the component path gets 64% cheaper while the pool
-does not move (18.58 → 19.05 ms). A renderer whose cost is invariant to what is
-on screen is not culling.
+| pose | component | pooled-uncull | pooled-cull |
+|---|---|---|---|
+| horizon | 9.42 / 9.89 | 12.47 / 12.46 | **9.34 / 9.31** |
+| straight down | 2.25 / 2.30 | 12.60 / 12.65 | **2.42 / 2.43** |
+| **horizon → down** | −76% / −77% | **+1.0% / +1.5%** | **−74% / −74%** |
+
+The pool's cost now tracks visibility instead of residency. **`voxel.Stream.GPUCull`
+is ON by default; `voxel.Stream.GPU` stays 0**, decided by a criterion committed
+before the deciding legs ran (residual 0.17/0.13 ms against a 0.114 ms threshold).
+
+**Root cause:** `SV_VertexID` does **not** include the draw's base vertex on D3D12
+— `RHISupportsAbsoluteVertexID` is true only for Vulkan. Every range was drawing
+pool quads `[0, Count)` regardless of where it started.
+
+**The finding that outlived the wave:** pooled cost is a **~2 ms fixed floor plus
+~1.19 µs per 1000 quads *drawn*** — two poses, 4× apart in frame time, agreeing to
+1.1%. That model makes the residual *geometry*, not overhead: straight down the
+cull draws 3.0% against 1.9% visible (**1.62× over-draw**), priced at 0.122 ms
+against 0.17/0.13 measured. **Compaction is therefore worth ~0.12 ms straight down
+and ~4.7 ms at the horizon**, where over-draw is 2.72× and the 64-range cap binds
+— likely enough to put the pooled path ahead of the component path outright.
+
+*(The original defect, for the record: +23% at p50 and +253% with little in
+frustum, with the pool unmoved at 18.58 → 19.05 ms while the component path got
+64% cheaper.)*
 
 | | |
 |---|---|
-| **In-game effect** | Frame cost stops scaling with *resident* geometry and starts scaling with *visible* geometry. This is what makes `voxel.Stream.GPU` shippable as a default at all. |
-| **Status** | CPU-side cull written; the parallel-`GetDynamicMeshElements` race that corrupted its working set is **fixed** (that also fixed a crash). It still drops geometry, so it stays `voxel.Stream.GPUCull 0`. |
+| **In-game effect** | Frame cost stops scaling with *resident* geometry and starts scaling with *visible* geometry. |
+| **Status** | **Done.** Cull on by default, output verified pixel-identical to the single full draw (0.00% of 745,600 px, twice). |
 | **Next lead** | ~~The zero-stride vertex stream.~~ **CORRECTED** — `GNullColorVertexBuffer` is 16 bytes at **stride 0**, so the fetch address is `Base + StartVertexLocation * 0` and is always in bounds. The real lead is `RHISupportsAbsoluteVertexID`, which returns **false on D3D12**: `SV_VertexID` may not include the draw's base vertex, so every range would draw quads `[0, Count)`. See `gpu-waves-plan.md` Wave A2. |
 | **Real fix if confirmed** | Pass each range's base quad down so every draw starts at vertex 0 and the shader computes `QuadIndex = BaseQuad + VertexId/6`. **CORRECTED** — this must go through a **uniform buffer**, not a loose per-element `FShaderParameter`: those are measured **not to bind** in this project (`gpu-g2-draw-path.md`), and `ShaderBindings.Add()` on an unbound parameter is a **silent** no-op. |
 | **End state** | GPU-driven culling — a compute pass over the chunk table emitting an **indirect draw**, which keeps *one* draw call rather than one per visible run. This is the ADR's own design (`gpu-g2-draw-path.md`), and the docs state twice that the pool must compact into one contiguous range per frame. |
@@ -82,10 +98,38 @@ lighting responding to digging).
 
 ---
 
-## Wave C — Correctness gates (blockers, not features)
+## Wave C — Correctness gates — **GREEN, landed 2026-07-26 (PR #124)**
 
-Nothing here is visible in normal play, but C1 blocks any GPU-generated voxel
-state from being trusted.
+**Both legs are bit-exact at `6e893ab3679a8c81`**, two legs each: `bench/vxc_gpu.exe`
+via DXC → SPIR-V → Vulkan, and `voxel.GPU.VerifyRegion` via UE → DXIL → D3D12.
+
+**The cause was never the toolchain — it was worldgen version skew.** The failing
+run compared a **v6 CPU reference** against a **v8 GPU kernel**: `voxelcore.lib`
+predated the v8 climate landing while Unreal compiled the current `worldgen.ush`.
+Proven by reconstruction rather than argued — voxel-core rebuilt at the pre-v8
+commit and driven with the current SPIR-V reproduces the recorded failure's exact
+values, and the reverse pairing gives the mirror image.
+
+**Both compile-flag hypotheses were falsified**: the `VXC_UE` `$Globals` layout is
+byte-identical to the bench's explicit cbuffer at both shader models, and a packing
+or int64-codegen divergence cannot coexist with bit-exactness over 393,216 cells.
+
+**Guards added so it cannot present this way again:** `voxel.GPU.VerifyRegion` pins
+its own CPU-reference digest with nothing from the GPU in it; mismatches are
+classified by stage and counted uncapped; and `worldgen.ush` carries a compile-time
+version lock against `vxc::kWorldGenVersion`.
+
+**Still owed, recorded as unverified:** C2 (NVIDIA leg — no NVIDIA GPU on this box)
+and C3 (min-spec-proxy M1 gate).
+
+> **A third error, and the one that mattered most.** The failing entry recorded
+> "all 4,096 columns match" as a localising fact. **The columns did not match** —
+> that was an inference from a log excerpt whose column-mismatch lines had been
+> truncated away. Every investigation since, including two in this document,
+> started from "columns fine, cells wrong" and so came out kernel-shaped. One
+> wrong sentence cost three root causes.
+
+<details><summary>The original failing entry, kept for the record</summary>
 
 **C1 — The Unreal leg of the cross-toolchain determinism gate is FAILING.**
 Same HLSL, same GPU, same CPU reference: the standalone bench passes bit-exact
@@ -119,9 +163,11 @@ the first time there may be a configuration that passes it.
 **Verdict: C1 is a hard blocker for Wave D and should be fixed regardless** — a
 red determinism gate is the project's most important invariant failing quietly.
 
+</details>
+
 ---
 
-## Wave D — GPU meshing in the streaming path — **QUESTIONABLE VALUE**
+## Wave D — GPU meshing in the streaming path — **IN PROGRESS**
 
 This is the never-built headline of ADR-0006 invariant 1: *"a compute pipeline …
 replaces the CPU worker mesh + per-chunk vertex upload for streaming."*
@@ -129,6 +175,38 @@ replaces the CPU worker mesh + per-chunk vertex upload for streaming."*
 **What it was designed to accomplish:** move chunk geometry generation off the CPU
 entirely, freeing the ~24 saturated worker threads for physics, NPCs and water,
 and removing meshing as a limit on view distance.
+
+> **Scope decision (Matt, 2026-07-26): build it, including coarse levels.** The
+> "questionable value" verdict below is superseded — it was conditioned on R0 = 128 m
+> not being on the table, and R0 = 128 m is now the plan's Wave F. The evidence
+> against it is kept because points 1 and 2 are still true and still bound what the
+> wave can claim.
+
+**Landed so far (PR #126, `70481ab`):**
+
+- **D2 — gated chunk-local `MeshEmit` permutation.** Verified byte-identical to the
+  shipping CPU mesher over 88,860 quads, four legs, in **both** permutations; the
+  determinism digest did not move (`6e893ab3679a8c81`); all seven kernels respun
+  **SHA-256 byte-identical** so the bench leg provably did not change.
+- **D3 — 4-byte scan total**, replacing a **786 KB per-chunk readback** — a 65–100×
+  over-read against a typical ~900–1,500 live quads, which at R0 = 128 m would have
+  meant **~6.4 GB of PCIe traffic against a ~0.09 s kernel**. Recorded honestly as a
+  **trade**: bandwidth down 70–100×, latency-to-delivery roughly doubled.
+
+**The correction that most changes what this wave can claim:**
+
+> **GPU meshing does not remove the CPU job. It removes the meshing inside it.**
+
+`FootprintBandCache` is reduced from a CPU column pass whose fields
+(`cave.segs[]`, `shaftMarginSq`, `cavern`, `bedrockDepthMm`) `FVoxelGpuColumnSample`
+does not carry — and that pass is **~45% of level-0 job time**. Whether it can move
+to the GPU is being costed as a design pass before the `DispatchJobs` wiring, since
+the band is a **scheduling** input consumed on the game thread *before* dispatch,
+and a readback there sits on the admission critical path.
+
+**Also corrected:** the plan's instruction to "delete the poll/`Lock` tail" would
+have deleted the only completion event and hung nothing off `LevelJobsInFlight[]--`
+— reintroducing the stranded-column bug the same plan warns about.
 
 | piece | what it needs |
 |---|---|
@@ -156,7 +234,16 @@ quadruples level-0 work and which `gpu-g0-sizing.md` says "cannot ship on the CP
 path". That is the regime where CPU meshing stops being adequate. Also: sustained
 CPU core pressure from physics/NPCs competing with 24 meshing workers.
 
-**Verdict: do not build now. Revisit when R0 = 128 m is on the table.**
+~~**Verdict: do not build now. Revisit when R0 = 128 m is on the table.**~~
+**Superseded — R0 = 128 m is on the table (Wave F), so the condition this verdict
+named has been met.** Point 4 also turned out to understate the case: the 188
+chunks/s figure was GPU *plus* a readback that D3 has since cut by 65–100×.
+
+**What this wave may claim, and may not.** Producer-side chunk throughput and
+cold-fill time — which is what Wave F depends on. **Not** an end-to-end frame win:
+Wave A measured the pooled path still costing more than the component path at the
+down pose, and that residual is a *rendering* problem with a *rendering* fix
+(compaction). The two must not be added together in a summary.
 
 ---
 
