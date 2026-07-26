@@ -45,6 +45,8 @@ boilerplate.
    percentile improvements was retracted this way once already.
 2. **Pin the camera.** `-VoxelPerfFlight=static` with `-VoxelPerfYaw=`/`-VoxelPerfPitch=`
    pins position *and* rotation and logs the pose. Unpinned poses swamp the signal.
+   `-VoxelPerfStaticAt=X,Y,Z` (UU) pins somewhere other than the spawn column,
+   which is the only way to aim this fixture at anything underground.
 3. **Rebuild voxel-core before believing any terrain.** `VoxelEarth.Build.cs:96-143`
    now warns on a stale `voxelcore.lib`. That staleness has already sent two
    investigations into the wrong subsystem and produced one wrong conclusion
@@ -1477,9 +1479,52 @@ that cannot be exercised in this wave, under an encoding that would then have to
 change again, is exactly that. The asset was edited only by the probe and
 restored with `git checkout --`.
 
-### E2 — HELD, not run (2026-07-26)
+### E2 — attempted on an idle box; NO NUMBER, and the reason is the harness
 
-Not attempted, deliberately, and this is a decision rather than an omission.
+**Result: `-VoxelPerfRun` cannot measure this scene at all.** Not "the effect is
+inside the noise" — the instrument reads a constant.
+
+The scene, the fixture and the gates all worked. On an exclusive box:
+
+- `STATIC pose pinned at (42030, 21000, 96062) yaw=0.0 pitch=-25.0
+  (-VoxelPerfStaticAt)` — the pin path verified end to end.
+- `LogInit: Command Line:` checked per leg for the `voxel.Water.GPU` value, so an
+  A/B silently running two identical configs was ruled out rather than assumed.
+- Camera underground at the lake, `55972 candidate brick(s)` in the implicit
+  pass.
+
+And then every frame-time sample came back **exactly 400.00 ms**. The delta-clamp ground
+rule above is the mechanism: the world delta is clamped at `MaxUndilatedFrameTime`,
+this anchor never rises above 2.5 fps, so `p50` would have been 400.00 for all
+six legs whatever `voxel.Water.GPU` was set to.
+
+| attempt | cascade | frames sampled | at the 400 ms clamp | below it |
+|---|---|---|---|---|
+| full | 6 rings, 2 km | 159 | 159 | **0** |
+| trimmed | 4 rings, 512 m *(rejected — see below)* | 51 | 51 | **0** |
+| trimmed | 6 rings, 1 km | 33 | 33 | **0** |
+
+Trimming the cascade was the right idea and did not work: the cost here is
+**underground streaming and deep-column tracking**, not ring extent. At 1 km the
+tracked-chunk count fell only 2726 → 2101 and the scene stayed under 2.5 fps.
+Note also that the 4-entry override was **silently ignored** — `tracked` matched
+the full-cascade run frame for frame — so `-VoxelRingInnerMeters`/`OuterMeters`
+appear to require all six entries, and nothing in the log says so.
+
+**What would actually work**, for whoever picks this up:
+
+1. **A surface pour, not a cavern lake.** `voxel.Water.SpawnIn` puts real voxel
+   water at a *surface* anchor, where the scene runs far above 2.5 fps and the
+   terrain A/B already enjoys a 1.1% floor. This is the candidate
+   `gpu-water-pool-design.md:158-163` already names, and the clamp is now a
+   second, independent reason to prefer it. The trade is that a pour is CA water
+   rather than the implicit lake, so let it settle to `activeBricks=0` first or
+   the 10 Hz re-mesh becomes the variable.
+2. Or measure with `stat unit` by hand at the cavern (manual checklist 4a), which
+   reads the real frame time and is not clamped.
+
+**Do not** re-run the cavern legs against this harness expecting a different
+answer. The null it produces is manufactured.
 
 The measurement needs the box to itself. During this session there were up to
 **four concurrent UE instances** (Wave A, Wave B, Wave C and this one) plus
