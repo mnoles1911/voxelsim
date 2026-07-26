@@ -1853,6 +1853,41 @@ intersecting the water volume. Do not add them and assume the pool still holds.
 
 ---
 
+## UNOWNED WORK ON THE CRITICAL PATH — compute compaction
+
+**Raised 2026-07-26 from Wave D, escalated to the owner. Recorded here because
+it is a gap in the plan, not in any one wave.**
+
+The dependency chain, end to end:
+
+> **Wave F needs D4** → D4 delivers GPU-produced geometry **into the pool** →
+> the pool is **defaulted off** (`voxel.Stream.GPU 0`), because Wave A measured
+> it ~0.15 ms *worse* than the component path at a down-facing pose against a
+> pre-registered criterion → closing that gap needs **compute compaction** →
+> **nobody is building compaction.**
+
+So D1–D6 are currently improving a renderer the project has chosen not to ship,
+and Wave F's payoff is gated behind a step with no owner. That is a structural
+problem with the plan rather than a technical one with any wave, which is why it
+is recorded at this level.
+
+**The evidence says it is closable, not that the pool is a dead end.** Wave A's
+cost model — a ~2 ms fixed floor plus ~1.19 µs per 1000 quads drawn, holding to
+1.1% across two poses 4× apart in frame time — prices the remaining deficit as
+**over-draw**, not overhead: 1.62× straight down and 2.72× at the horizon where
+the 64-range cap binds. Compaction is worth **~0.12 ms straight down and ~4.7 ms
+at the horizon** under that model, which would not merely close the 0.15 ms gap
+but likely put the pooled path clearly ahead.
+
+**Wave D's D1 work is a precondition for compaction itself, not only for D4.** A
+compute pass writing a compacted quad-id list needs exactly what D1 built: a
+**component-owned** buffer set (so it survives proxy recreation), **GPU-writable**
+(UAVs), and a dirty-tracking scheme that cannot overwrite GPU-authored ranges
+(the interval list). Whoever picks compaction up should start from D1 rather than
+alongside it. The one shader line that changes is
+`QuadIndex` in `VoxelQuadVertexFactory.ush`, which Wave A notes is derived in
+exactly one place.
+
 ## Wave F — R0 = 128 m
 
 The recorded target, and the reason A–D exist. **Land last**, after Wave D is
