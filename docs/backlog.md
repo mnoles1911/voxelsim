@@ -192,63 +192,88 @@ which is not needed to run inference. Invoke the module function directly —
 
 ---
 
-## 6a. LIVE REGRESSION: the cross-toolchain determinism gate is FAILING on main
+## 6a. LIVE REGRESSION: the UNREAL leg of the determinism gate is failing (the bench leg is green)
 
-**`voxel.GPU.VerifyRegion` fails as of 2026-07-26.** The GPU worldgen kernels and
-the CPU amplifier disagree on voxel MATERIAL assignment. This is the gate that
-backs ADR-0001's cross-vendor determinism posture, and it is currently red.
+**`voxel.GPU.VerifyRegion` fails in-engine while the standalone bench passes
+bit-exact, from the same HLSL source, on the same GPU, against the same CPU
+reference.** The two legs of the cross-toolchain gate disagree with each other,
+which is precisely the class of fault this two-leg gate exists to detect.
 
-Evidence, from the origin fixture region (`voxel.GPU.VerifyRegion 0`):
+| leg | toolchain | result | digest |
+|---|---|---|---|
+| `build/voxel-core-msvc/bench/vxc_gpu.exe` | DXC -> SPIR-V -> Vulkan | **PASS**, bit-exact over 8192 columns / 393216 cells / 6668 quads | `6e893ab3679a8c81` |
+| `voxel.GPU.VerifyRegion` | UE -> DXIL -> D3D12 | **FAIL** vs the CPU reference | `046b4a9f9c5e49b7` |
+
+Both on the same AMD Radeon RX 7800 XT.
+
+### An earlier version of this entry blamed worldgen v8. That was wrong.
+
+The first diagnosis here said the v8 climate wave had changed CPU material rules
+without mirroring them into the HLSL. **It had not.** The mirror exists and is
+correct: `3fbf3f7` ("Step 2d: the worldgen.ush mirror + SPIR-V respin -- AMD leg
+GREEN", 18:37) lands *after* `e25d563` ("Step 2 (CPU half)", 14:55), both are on
+main, no CPU worldgen commit follows the mirror, and the bench passing bit-exact
+proves the mirror is faithful. The wrong diagnosis is recorded rather than
+deleted because it is the obvious one and the next person will reach for it too.
+
+### Where the divergence actually is
+
+From the in-engine failure (`voxel.GPU.VerifyRegion 0`):
 
 ```
 [origin] 4096 columns, 196608 cells, 3424 quads (cpu 3422)
 [origin] quad decode: 20544 vertices match the CPU reference exactly
-First 21 mismatch(es):
-    cell(-64,-64,vz=11648): cpu=2 gpu=5
-    cell(-64,-64,vz=11654): cpu=5 gpu=12
-    ...
-    quad count: cpu=3422 gpu=3424
+    cell(-64,-64,vz=11648): cpu=2 gpu=5      MAT_ROCK    vs MAT_SUBSOIL
+    cell(-64,-64,vz=11654): cpu=5 gpu=12     MAT_SUBSOIL vs MAT_PERMAFROST
 ```
 
-**Localised, and the localisation is the useful part:**
+- **Columns match** (all 4,096) — `ColumnMain` agrees under both toolchains.
+- **Cells differ**, material ids only, and in a consistent direction: the DXIL
+  build's soil column sits one layer shallower than the CPU's. What the CPU calls
+  rock, it calls subsoil; what the CPU calls subsoil, it calls the *surface*
+  biome material.
+- **The mesher is innocent** — quad decode matches exactly (20,544 vertices); the
+  2-quad count difference is downstream of the cell mismatch.
 
-- **Columns match.** All 4,096. `ColumnMain` and `Amplifier::column` agree, so
-  the stratigraphy/climate column stage is fine.
-- **Cells differ** — material ids only, in a consistent pattern (`2 -> 5`,
-  `5 -> 12`). So the break is in **voxelization**: `VoxelizeMain` in
-  `voxel-core/shaders/worldgen.ush` against the CPU material rules in
-  `voxel-core/src/amplifier.cpp`.
-- **The mesher is innocent.** Quad decode matches the CPU reference exactly, and
-  the 2-quad count difference is downstream of the cell mismatch.
+So the fault is isolated to **`VoxelizeMain` as compiled by Unreal**. Given that
+identical source is bit-exact under DXC/SPIR-V, the prime suspect is
+**floating-point contraction**: an FMA or reassociation in UE's HLSL compilation
+flipping a `<` at a layer boundary by one ULP. Layer-boundary comparisons are
+exactly where a one-ULP difference becomes a whole different material.
 
-**Not a stale-library artifact.** `build/voxel-core-msvc/voxelcore.lib` *was*
-stale (built 15:37 against `amplifier.cpp` modified 19:40), which is its own
-problem — see the `VoxelEarth.Build.cs` hardcoded-lib item below. But rebuilding
-voxel-core from scratch and relinking reproduces the identical failure, so the
-disagreement is real and not a build artifact.
+### Next step
 
-**Cause, most likely:** the worldgen v8 climate wave changed CPU material
-assignment without mirroring the change into the HLSL. `docs/terrain-amplification-reconciliation.md`
-already states the rule that any change to the generation kernels must be
-mirrored bit-for-bit; this is that rule being broken in practice.
+Compare the shader compilation flags UE uses for these kernels against the
+standalone DXC invocation in `voxel-core/bench` — specifically anything affecting
+FMA contraction, fast math, or IEEE strictness. If contraction is the cause, the
+fix is to force strict IEEE / disable contraction for `VoxelizeMain`, not to
+change the kernel maths.
 
-**Consequences while it is red:**
+### On the recorded digest — deliberately NOT updated
 
-- The digest recorded in four places is stale. `docs/gpu-streaming-plan.md:63-64`,
-  `docs/streaming-handoff.md:12,120`, `docs/gpu-g2-draw-path.md:115` and
-  `voxel-core/shaders/prebuilt/README.md:378` all say `f3c48a4df3e20e9a`. The
-  current GPU-side digest is `046b4a9f9c5e49b7` for the two-region default and
-  `391439595abbbcc1` for region 0 alone. **Do not simply update the numbers** --
-  they should not be re-baselined until the CPU/GPU disagreement is resolved, or
-  the gate is re-baselined around a known-broken state.
-- Any future GPU-meshed terrain would differ from CPU-meshed terrain, so this
-  blocks the GPU meshing programme (6b) on correctness, independently of its
+Four files quote `f3c48a4df3e20e9a` (`gpu-streaming-plan.md:63-64`,
+`streaming-handoff.md:12,120`, `gpu-g2-draw-path.md:115`,
+`voxel-core/shaders/prebuilt/README.md:378`). The current **bench** value is
+`6e893ab3679a8c81` and it is green, so that one is a legitimate re-baseline
+whenever someone wants it. The **Unreal** value `046b4a9f9c5e49b7` must not be
+recorded as a baseline at all: it is the output of a build that disagrees with
+the CPU, and blessing it would turn a loud failure into a silent one.
+
+### Related but separate: a stale prebuilt library
+
+`build/voxel-core-msvc/voxelcore.lib` was built at 15:37 against an
+`amplifier.cpp` last modified at 19:40, so UE builds on main were linking pre-v8
+CPU worldgen. That is a real problem in its own right and gives the
+`VoxelEarth.Build.cs` hardcoded-lib item below teeth. It is **not** the cause
+here — rebuilding voxel-core from scratch and relinking reproduces the identical
+in-engine failure.
+
+### Consequences while the Unreal leg is red
+
+- GPU-meshed terrain would differ from CPU-meshed terrain **in-engine**, so this
+  blocks the GPU meshing programme (6b) on correctness independently of its
   performance question.
-- The NVIDIA leg below cannot be meaningfully run until this is green.
-
-**Next step:** diff the worldgen v8 changes to `amplifier.cpp`'s material
-assignment against `worldgen.ush`'s `VoxelizeMain`, and mirror them. The
-mismatching ids (2, 5, 12) name the specific rules to look at.
+- The NVIDIA leg cannot be meaningfully run until this is green.
 
 ---
 
