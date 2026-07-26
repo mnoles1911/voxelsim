@@ -106,14 +106,37 @@ wave exists to afford.
 
 ---
 
-## Wave A — per-chunk frustum culling for the pool
+## Wave A — per-chunk frustum culling for the pool — **LANDED 2026-07-26**
 
 **In-game:** frame cost stops scaling with *resident* geometry and starts scaling
 with *visible* geometry. This is the precondition for `voxel.Stream.GPU` being
 defensible as a default, and for R0 = 128 m not making frames worse.
 
-**The measured defect** (pinned camera, settled scene, identical geometry both
-paths, `loaded=9822 quads=8813242`, three legs each):
+### Result
+
+**The cull is correct and the pool now scales with visibility.** The cause was
+the second of the three hypotheses A1 was built to separate: **`SV_VertexID` does
+not include the draw's base vertex on D3D12**, so every range drew pool quads
+`[0, Count)` instead of `[First, First+Count)`. Fixed by passing the range's start
+explicitly — `QuadIndex = VoxelRange.BaseQuad + VertexId/6`, with every draw
+starting at vertex 0.
+
+| pose | component | pooled-uncull | pooled-cull |
+|---|---|---|---|
+| horizon (yaw 200, pitch −5) p50 | TBD | TBD | TBD |
+| straight down (pitch −89) p50 | TBD | TBD | TBD |
+| **horizon → down** | TBD | TBD | TBD |
+
+*(TBD — filled from the clean 14-leg run; see A4.)*
+
+**Defaults: `voxel.Stream.GPUCull` → TBD. `voxel.Stream.GPU` stays 0.** The second
+is not a formality — see "The fixed per-frame pooled cost" below, which is the
+finding this wave should be remembered for.
+
+### The defect, as it was
+
+Pinned camera, settled scene, identical geometry both paths,
+`loaded=9822 quads=8813242`, three legs each:
 
 | camera | component | pooled | delta |
 |---|---|---|---|
@@ -124,56 +147,62 @@ The control is the second row: looking at almost nothing makes the component pat
 64% cheaper and leaves the pool unchanged. A renderer whose cost does not depend
 on what is on screen is not culling.
 
-**Already built and building** in `VoxelEarthShaders/Private/VoxelGpuPoolComponent.cpp`:
-`FChunkRun` + `BuildChunkRuns()` (declared `VoxelGpuPoolComponent.h:49-54,211`),
-`BuildCulledRanges()`, the `bRunsDirty` fix for the parallel-GDME race
-(`VoxelGpuPoolComponent.h:207`), and cvars `voxel.Stream.GPUCull`,
-`GPUCullMergeGap`, `GPUCullMaxRanges`, plus three isolation diagnostics already in
-the tree — `GPUCullDebugAllVisible`, `GPUCullDebugSplit`, `GPUCullDebugInvert`
-(`:50,66,78`). **It still drops geometry**, so it ships disabled (`GEnabled = 0`,
-`:15`).
+**This wave reproduced that defect and then removed it in the same run.** The
+`pooled-uncull` config is the old behaviour, unchanged, and it still measures
+**+0.7%** horizon→down — invariant, exactly as before. `pooled-cull` over the same
+pose pair, same scene, same harness, measures TBD. One config still shows the
+defect and one no longer does, which is as clean a before/after as this programme
+has produced.
 
-*Two things to fix on the way past, both of which mislead a reader:*
-`voxel.Stream.GPUCull`'s help text says **"1 = on (default)"** while the default is
-0 (`:15-21`) — that is how someone concludes the cull is active when it is not.
-And **`voxel.Stream.GPUCullMergeGap` is dead**: declared at `:29-34`, referenced
-only in a comment at `:689`; the merge actually uses a threshold computed from
-`GPUCullMaxRanges`. Tuning it does nothing. Either wire it up or delete it — do not
-leave a knob that silently ignores you, and do not report a "tuned merge gap"
-measurement until it is real.
+### A1 — the experiment, and what it said — **RESOLVED: outcome 2**
 
-**The CPU range list is not the problem.** `BuildCulledRanges`
-(`VoxelGpuPoolComponent.cpp:477-715`) only ever *adds* quads when it merges and
-never drops a range; runs are sorted by pool offset (`:1121`). So geometry is lost
-between `Ranges` and the rasteriser — and because runs are pool-ordered, "near
-quad 0 draws, far in does not" is diagnostic rather than incidental.
+`GPUCullDebugSplit N` tiles the pool into N exact contiguous ranges — the same
+quads as the single full draw, with the frustum test bypassed. Run at N = 2, 8
+and 64 on a settled scene (`jobsInFlight=0 pendingJobs=0`, `loaded=9822
+quads=8828373`), screenshot at 40 s:
 
-### A1 — one screenshot that separates three hypotheses
+| outcome | predicted | observed |
+|---|---|---|
+| identical to the full draw | `SV_VertexID` fine, fault in the frustum test | **no** — geometry visibly missing at every N |
+| **first half renders twice, second half missing** | `SV_VertexID` does **not** include the base vertex | **YES** |
+| second half missing, first half renders once | the draw itself is being rejected | **no** — see the cost row |
 
-`GPUCullDebugSplit 2` (`VoxelGpuPoolComponent.cpp:482-508`) tiles the pool into two
-exact contiguous ranges — the same quads as the single full draw, with the frustum
-test bypassed. The three candidate faults predict **visibly different** pictures:
+At every N, **only the first 1/N of the pool reached the screen** — at N=64 a
+single sliver of terrain in an otherwise empty world. Pictures alone cannot
+separate outcomes 2 and 3, because both leave exactly the first 1/N visible. The
+**cost** separates them:
 
-| outcome | means |
-|---|---|
-| identical to the full draw | `SV_VertexID` is fine; the fault is in the frustum test |
-| **first half renders twice, second half missing** | `SV_VertexID` does **not** include the base vertex |
-| second half missing, first half renders **once** | the draw itself is being rejected |
+| config | drawn fraction of pool | p50 |
+|---|---|---|
+| full draw | 100% | 12.26 ms |
+| split 2 | first 50% visible | 12.02 ms |
+| split 8 | first 12.5% visible | 11.86 ms |
+| split 64 | first 1.6% visible | **14.07 ms** |
 
-*This is the experiment the earlier control failed to be. That control was already
-retracted in `52c8a73` — "a single range spanning first-visible..last-visible
+If the draws were being *rejected* (outcome 3) the vertex workload would have
+fallen 64-fold and the cost with it. Instead the cost stayed flat and then **rose**,
+because each of the 64 draws still processed its full quad count starting at pool
+quad 0, and N=64 added 63 draw calls on top. That is outcome 2, and only outcome 2.
+
+*These four cost figures were taken before the exclusive-box protocol existed and
+may have been contended. They are load-bearing only as a 64× directional argument
+— cost failing to fall while 63/64 of the world vanished — which contention
+cannot manufacture. Do not quote them as clean numbers.*
+
+*This is the experiment the earlier control failed to be. That control was
+retracted in `52c8a73`: "a single range spanning first-visible..last-visible
 covers 98% of the pool no matter whose runs are in the array. The experiment could
-not fail." Treat `FirstIndex = FirstQuad * 6` as **untested**, not proven.*
+not fail."*
 
-### A2 — the likely fault, and why the roadmap's stated one is weak
+### A2 — confirmed: the engine declines to make the assumption the code made
 
-**Discard the zero-stride theory.** `GNullColorVertexBuffer` is 16 bytes with
-**stride 0**, so the D3D12 fetch address is `Base + StartVertexLocation * 0` —
-always in bounds no matter how large the start vertex is. It deserves one
-debug-layer run, not a plan built on it.
+**The zero-stride theory is dead.** `GNullColorVertexBuffer` is 16 bytes with
+stride 0, so the fetch address is `Base + StartVertexLocation * 0` — always in
+bounds. A1 settles it independently: the draws executed and cost full price, they
+simply addressed the wrong quads. Nothing was rejected.
 
-**The real lead is in the engine's own header.**
-`D:\UE_5.8\...\RHI\Public\DataDrivenShaderPlatformInfo.h:1195-1201`:
+**The engine's own header was the right lead**
+(`RHI/Public/DataDrivenShaderPlatformInfo.h`):
 
 ```cpp
 // Returns true if SV_VertexID contains BaseVertexIndex passed to the draw call,
@@ -184,94 +213,143 @@ inline bool RHISupportsAbsoluteVertexID(const FStaticShaderPlatform P)
 }
 ```
 
-**D3D12 is not in that set**, and `FLocalVertexFactory` compensates by threading the
-base through a uniform buffer and adding it in the shader (`LocalVertexFactory.cpp:128`,
-`LocalVertexFactory.ush:730`, `VF_VertexOffset`). The comment now sitting at
-`VoxelGpuPoolComponent.cpp:336-337` — *"SV_VertexID includes the draw's start vertex
-for a non-indexed draw"* — is an assumption **the engine explicitly declines to
-make**. If it is wrong, every range draws pool quads `[0, Count)` instead of
-`[First, First+Count)`, which reads on screen exactly as the reported symptom and
-also explains why the 98% control passed.
+D3D12 is not in that set, and `FLocalVertexFactory` compensates by threading the
+base through a uniform buffer (`VF_VertexOffset`). The comment that used to sit in
+`VoxelGpuPoolComponent.cpp` — *"SV_VertexID includes the draw's start vertex for a
+non-indexed draw"* — asserted exactly what the engine declines to assume. The
+caveat that every in-engine call site of that helper is an *indexed* draw is now
+moot: A1 measured the non-indexed case directly.
 
-*Honest caveat: every in-engine call site of that helper is an **indexed** draw, so
-it does not strictly settle the non-indexed case. A1 settles it.*
+### A3 — the fix, as built
 
-### A3 — the fix: explicit `BaseQuad` through a uniform buffer
+Every range draws from vertex 0 and names its start explicitly, so `VertexId`
+unambiguously runs `[0, Count*6)` and the result is correct whether or not the
+platform includes the base vertex.
 
-Correct under either hypothesis, and it matches the engine's own `VF_VertexOffset`
-idiom: every draw starts at vertex 0 and the shader computes
-`QuadIndex = BaseQuad + VertexId / 6`.
+- `FVoxelQuadRangeParameters` — one `SHADER_PARAMETER(uint32, BaseQuad)`,
+  registered shader-side as `VoxelRange`, created per range with
+  `CreateUniformBufferImmediate(..., UniformBuffer_SingleFrame)`.
+- Carried on `FMeshBatchElement::UserData` as `FVoxelQuadRangeUserData`, allocated
+  with `Collector.AllocateOneFrameResource<T>()`. A stack local does not survive to
+  draw submission — `GetDynamicMeshElements` only *gathers*; bindings are read
+  later when draw commands are built.
+- **Not** a loose `FShaderParameter`. Those measurably do not bind here, and
+  `ShaderBindings.Add()` on an unbound parameter is a **silent no-op** — that
+  version would have compiled, run, logged nothing, and drawn the wrong geometry.
+- Elements with no `UserData` bind the factory's `BaseQuad = 0` buffer, so the
+  single full-pool draw and the single-chunk component compute the identical
+  expression to before. The uncull path is unchanged, not merely equivalent, which
+  is what makes it usable as the control.
+- Shader change is one expression, in the one place `QuadIndex` is derived.
 
-**The constraint that decides the implementation:** loose per-element
-`FShaderParameter`s **do not bind in this project** — measured, and the reason the
-current design uses SRVs in a uniform buffer. From `docs/gpu-g2-draw-path.md`:
+**Visual gate — pixel identity, not similarity.** Settled scene, pinned pose,
+`r.AntiAliasingMethod 0`, 1280×720, HUD masked, threshold 8/255:
 
-> `FShaderParameter::IsBound()` returns false for both `VoxelChunkOriginUU` and
-> `VoxelChunkLevelScale` … Because `ShaderBindings.Add()` on an unbound parameter
-> is a **silent no-op**, `LevelScale` arrives as 0, every vertex collapses to a
-> point, and the chunk vanishes with nothing in the log.
+| comparison | pixels differing |
+|---|---|
+| full draw vs 64-way split | **0.00%** (0 / 745,600) |
+| full draw vs frustum cull | **0.00%** (0 / 745,600) |
+| same-config repeat (noise floor) | 1.81% |
 
-So route `BaseQuad` through a **second small uniform buffer**, which is exactly the
-shape already working for `FVoxelGIVolumeParameters` in the same hook
-(`VoxelQuadVertexFactory.cpp:161-165`):
+The floor turned out to be **bimodal**, not noise-like: captures fall into two
+clusters (some per-session latch, probably eye adaptation), **0.00% within each
+cluster** and 1.81–1.82% between, identical magnitude across all four cross pairs.
+Each cluster contains one unmodified full draw *and* one changed-path capture — so
+the culled image and the 64-way split image are each pixel-identical to an
+unmodified full draw, not merely close to one. Wave A's falsification condition
+("culled and unculled frames differ visually at all") is met by construction.
 
-1. `BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadRangeParameters, )` with one
-   `SHADER_PARAMETER(uint32, BaseQuad)`, created per range with
-   `CreateUniformBufferImmediate(..., UniformBuffer_SingleFrame)`.
-2. Store it in `Element.UserData` allocated via
-   **`Collector.AllocateOneFrameResource<T>()`** — a stack local will not survive to
-   draw submission. (Do **not** copy `VoxelGpuChunkComponent.cpp:185`, which points
-   `UserData` at a proxy member and is dead code nothing reads.)
-3. `GetElementShaderBindings` already exists and already runs
-   (`VoxelQuadVertexFactory.cpp:97-179`); today it reads nothing from
-   `BatchElement`. Its own comment says *"G3 will need per-chunk ranges and will
-   move to UserData"* — this is that change. Landscape's
-   `LandscapeRender.cpp:3607-3613` is the in-engine reference.
-4. Shader change is **two lines**: `QuadIndex` is derived in exactly one place
-   (`VoxelQuadVertexFactory.ush:96`) and everything downstream is already expressed
-   in terms of it. Reach it as `VoxelRange.BaseQuad` through the struct, never as a
-   loose global — `:21-26` explains that loose globals compile fine and silently
-   read zeros.
-5. **Keep `BaseQuad = 0` on the uncull path** so the single-draw case stays
-   byte-identical, and verify that before enabling the cull.
+**Also fixed, all three of which actively mislead a reader:**
 
-*Clean-ups while in here:* delete the two vestigial `LAYOUT_FIELD(FShaderParameter)`
-bindings at `VoxelQuadVertexFactory.cpp:101-102` (neither name exists in the `.ush`
-any more), and the dead `FVoxelChunkDrawData`. Also `GPUCullMaxRanges` defaults to
-**256** while the renderer's element loop is `(1ull << BatchElementIndex) &
-BatchElementMask` — undefined for index ≥ 64. Cap it.
+- `voxel.Stream.GPUCull`'s help text said **"1 = on (default)"** while the default
+  is 0 — that is how someone concludes the cull is active when it is not.
+- **`voxel.Stream.GPUCullMergeGap` was dead**: declared, documented, referenced
+  only from a comment; the merge ran entirely off a threshold derived from
+  `GPUCullMaxRanges`. It is now the *first* merge pass, with the range-cap merge as
+  the backstop that still guarantees the element limit by construction.
+- **`GPUCullMaxRanges` defaulted to 256** against an element loop of
+  `(1ull << BatchElementIndex) & BatchElementMask` — undefined for index ≥ 64.
+  Capped at 64, including the debug-split path.
 
-### A4 — measure
+Deleted: the two vestigial `LAYOUT_FIELD(FShaderParameter)` bindings (neither name
+had existed in the `.ush` for some time; both reported `IsBound() == 0`), and
+`FVoxelChunkDrawData` with the `UserData` pointer at it. That pointer was dead
+code, but `UserData` is now *read* by the factory, so a differently-typed pointer
+there would have become a type confusion rather than merely unused.
 
-`-VoxelPerfFlight=static` at both poses (horizon, straight down), ≥2 legs per
-config, three configs: component / pooled-uncull / pooled-cull. **Success is the
-pool tracking the component path's visibility scaling** — the straight-down case
-getting dramatically cheaper — not merely getting faster at the horizon. Log range
-count and redrawn quads. Only add a merge-gap sweep as a fourth config **after**
-the dead cvar is wired up.
+### A4 — measured
 
-**Falsified if:** culled and unculled frames differ visually at all, or the range
-count is high enough that draw-call overhead eats the saving.
+`-VoxelPerfFlight=static`, two poses, ≥2 legs per config, 50 s per leg,
+`postWarmup` (t ≥ 10 s) percentiles. Every leg logs its own settle state and scene
+size beside its timing, so scene equivalence across configs is visible rather than
+assumed.
 
-**Then:** default `voxel.Stream.GPUCull` on, and re-flip `voxel.Stream.GPU` on
-**only if A3 shows the pool at or below the component path**. That flip was
-reverted once for exactly this reason; do not repeat it on hope.
+TBD — table, per-leg, with `loaded`/`quads` beside each.
 
-**Deferred, not dropped — and there is a real tension to record.** The ADR says
-twice that the pool **must compact into one contiguous draw range per frame**,
-because `RHIMultiDrawIndexedPrimitiveIndirect` is never called with
+**Method note, recorded because it cost a run.** The first attempt produced six
+clean legs and then six invalid ones: the **component** path — which this wave does
+not touch at all — moved from 10.38 ms to 29.75 ms between passes. When the
+untouched control triples, nothing in that pass is a measurement, and it was
+discarded whole rather than reasoned around. The box is now held by one agent at a
+time by explicit handover rather than by checking for a running process; a process
+check cannot distinguish "finished" from "between legs".
+
+### The fixed per-frame pooled cost — the finding that outlives this wave
+
+The cull's own numbers, logged per frame:
+
+| pose | visible | drawn | ranges | pooled-cull vs component |
+|---|---|---|---|---|
+| horizon | 25.9% | 72.1% | **64 (capped)** | pool ahead |
+| straight down | 1.9% | 3.0% | 31 (uncapped) | **pool still behind** |
+
+The obvious reading of the first row is that the 64-range cap is throwing away
+most of the win, and that a compute compaction pass would recover it. **The second
+row says that story is incomplete.** Straight down the cap does not bind at all —
+31 ranges, 3.0% of the pool drawn against 1.9% visible, near-optimal culling — and
+the pool *still* loses to the component path there. Whatever the residual is, it
+is not geometry, and compaction cannot remove it.
+
+The likely candidate is the cull's own render-thread work: `BuildCulledRanges` is
+O(runs) per view per frame over ~9,800 runs, with an O(n log n) sort over the gaps,
+run for the main view *and* every shadow cascade. The straight-down `p95`/`p50`
+shape is consistent with that — occasional expensive frames rather than uniformly
+heavier ones.
+
+TBD — direct measurement via `GPUCullDebugAllVisible`, which runs the whole CPU
+cull and then keeps everything, so the GPU draws exactly what `uncull` draws and
+the delta against `uncull` at the same pose is the fixed cost alone.
+
+**Wave D must not assume compaction fixes this.** A fixed per-frame pooled cost is
+a different problem with a different fix from a draw-range budget, and Wave D is
+about to build on the pool.
+
+### Deferred, not dropped — and there is a real tension to record
+
+The ADR says twice that the pool **must compact into one contiguous draw range per
+frame**, because `RHIMultiDrawIndexedPrimitiveIndirect` is never called with
 `MaxDrawArguments > 1` and D3D12 implements the single-draw entry point on top of
 it. N draw ranges is the thing the design says not to do, and multi-element batches
 additionally foreclose the static-relevance upgrade path (static-mesh command
 caching requires exactly one `FMeshBatchElement`, `PrimitiveSceneProxy.cpp:164`).
+**The multi-range draw shipped here is explicitly an interim.**
 
-The end state is therefore a compute cull/compaction pass writing
-`FRHIDrawIndexedIndirectParameters`, with `NumPrimitives = 0` as the documented
-signal to use `IndirectArgsBuffer` (`MeshBatch.h:272`). **The project has zero
-indirect draws today** — no `DrawPrimitiveIndirect`, no indirect args anywhere in
-`ue-project/`. Land the CPU cull first as the measurable, correct step; revisit
-after Wave D, when the pool is already GPU-written and the chunk table already
-lives on the GPU. Record the multi-range version explicitly as an interim.
+**What `BaseQuad` means for that end state, learned while building it.** An
+indirect draw supplies `StartVertexLocation` from a GPU buffer — and A1 just
+measured that D3D12 does not put `StartVertexLocation` into `SV_VertexID`. So an
+indirect draw *cannot* express "start at pool quad F" either. Anything drawing a
+sub-range of the pool needs the base in-shader regardless of how the draw is
+issued; this wave built the CPU-sourced version of a value the GPU-driven version
+would write itself. The end state that genuinely reaches one draw is therefore not
+"indirect draw plus a base" — it is **compaction**: a compute pass writing a
+compacted quad-id list, after which the shader reads
+`QuadIndex = CompactedIds[VertexId/6]` and `BaseQuad` is 0 forever. That is an
+indirection, not an offset. `QuadIndex` is derived in exactly one place in the
+`.ush`, which is the line that change would replace.
+
+**The project has zero indirect draws today** — no `DrawPrimitiveIndirect`, no
+indirect args anywhere in `ue-project/`. Revisit after Wave D, when the pool is
+already GPU-written and the chunk table already lives on the GPU.
 
 ---
 
