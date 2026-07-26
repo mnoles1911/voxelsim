@@ -1,4 +1,4 @@
-#include "VoxelGpuPoolComponent.h"
+﻿#include "VoxelGpuPoolComponent.h"
 
 #include "VoxelQuadVertexFactory.h"
 #include "PrimitiveSceneProxy.h"
@@ -10,6 +10,81 @@
 #include "RHIResourceUtils.h"
 
 // Draws every chunk in the pool with a single mesh batch.
+namespace VoxelGpuPoolCull
+{
+	static int32 GEnabled = 0;
+	static FAutoConsoleVariableRef CVarEnabled(
+		TEXT("voxel.Stream.GPUCull"), GEnabled,
+		TEXT("Frustum-cull the GPU pool per chunk and draw only the surviving pool ranges. 1 = on (default). ")
+		TEXT("0 = one draw over the whole pool, which is the pre-cull behaviour and pays for every resident ")
+		TEXT("quad regardless of where the camera looks."),
+		ECVF_RenderThreadSafe);
+
+	// Merging tolerance, in quads. Two surviving ranges separated by a gap
+	// smaller than this are drawn as one, which re-draws the gap. That is a good
+	// trade well past the point it looks wasteful: a quad costs six vertex
+	// invocations and no pixels if it is off-screen, while a draw costs a state
+	// change and a command. Tuned by measurement, not taste -- raise it if the
+	// range count is high, lower it if the drawn-quad count is.
+	static int32 GMergeGapQuads = 4096;
+	static FAutoConsoleVariableRef CVarMergeGap(
+		TEXT("voxel.Stream.GPUCullMergeGap"), GMergeGapQuads,
+		TEXT("Quads. Surviving pool ranges closer together than this are merged into one draw, re-drawing ")
+		TEXT("the gap between them. Trades redrawn off-screen quads against draw count."),
+		ECVF_RenderThreadSafe);
+
+	// Above this, stop merging and just draw the whole pool. A view that can see
+	// nearly everything gains nothing from culling and would pay for hundreds of
+	// draws to prove it.
+	static int32 GMaxRanges = 256;
+	static FAutoConsoleVariableRef CVarMaxRanges(
+		TEXT("voxel.Stream.GPUCullMaxRanges"), GMaxRanges,
+		TEXT("If the cull cannot get below this many draw ranges, fall back to one draw over the whole pool."),
+		ECVF_RenderThreadSafe);
+
+	// Control experiment: run the whole range/merge/multi-draw path but treat
+	// EVERY chunk as visible. If the picture is correct with this on and wrong
+	// with it off, the frustum test is selecting the wrong chunks; if it is wrong
+	// both ways, the fault is in emitting many draw elements per batch. One cvar
+	// separates two hypotheses that produce the identical symptom.
+	static int32 GDebugAllVisible = 0;
+	static FAutoConsoleVariableRef CVarDebugAllVisible(
+		TEXT("voxel.Stream.GPUCullDebugAllVisible"), GDebugAllVisible,
+		TEXT("1 = skip the frustum test and treat every chunk as visible, while still going through the "
+		     "range merge and multi-element draw path. Isolates 'the cull picks the wrong chunks' from "
+		     "'many draw elements per batch is broken'."),
+		ECVF_RenderThreadSafe);
+
+	// The control DebugAllVisible could not be. With every chunk visible the
+	// surviving runs are contiguous, so the merge collapses them to ONE range and
+	// the experiment degenerates into the single full draw it was meant to be
+	// compared against. This one ignores the runs entirely and chops [0, NumQuads)
+	// into N equal contiguous ranges that together cover the pool exactly once, so
+	// N draw elements are exercised while the drawn SET is provably identical to
+	// the full draw. Any difference in the picture is the multi-element draw path,
+	// not the chunk selection.
+	static int32 GDebugSplit = 0;
+	static FAutoConsoleVariableRef CVarDebugSplit(
+		TEXT("voxel.Stream.GPUCullDebugSplit"), GDebugSplit,
+		TEXT("N>1: ignore the frustum and draw the whole pool as N equal contiguous ranges. Covers exactly "
+		     "the same quads as the single full draw, so it isolates 'many draw elements per batch' from "
+		     "'the cull picks the wrong chunks'. 0/1 = off."),
+		ECVF_RenderThreadSafe);
+
+	// Draws the chunks the frustum test REJECTED instead of the ones it accepted.
+	// A one-bit answer to "is the frustum test picking the right chunks": if it is,
+	// this renders (nearly) nothing. Merging is skipped here, so what reaches the
+	// screen is exactly the rejected set and nothing else.
+	static int32 GDebugInvert = 0;
+	static FAutoConsoleVariableRef CVarDebugInvert(
+		TEXT("voxel.Stream.GPUCullDebugInvert"), GDebugInvert,
+		TEXT("1 = draw exactly the runs the frustum test rejected, unmerged. If the cull is correct this "
+		     "renders almost nothing; terrain still on screen is geometry the cull is wrongly discarding."),
+		ECVF_RenderThreadSafe);
+
+	inline bool IsEnabled() { return GEnabled != 0; }
+}
+
 class FVoxelGpuPoolSceneProxy final : public FPrimitiveSceneProxy
 {
 public:
@@ -24,6 +99,7 @@ public:
 	                        const TArray<uint32>& InChunkIds,
 	                        const TArray<FVector4f>& InOrigins,
 	                        const TArray<FVector4f>& InParams,
+	                        const TArray<UVoxelGpuPoolComponent::FChunkRun>& InRuns,
 	                        const FString& InPoolName,
 	                        int32 InChunkTableCapacity)
 		: FPrimitiveSceneProxy(Component)
@@ -33,6 +109,8 @@ public:
 		, ChunkIds(InChunkIds)
 		, Origins(InOrigins)
 		, Params(InParams)
+		, Runs(InRuns)
+		, ChunkEdgeVoxels(Component->GetChunkEdgeVoxels())
 		, NumQuads(Component->GetHighWaterMarkQuads())
 		, BufferQuads(InQuads.Num())
 		, NumChunks(InOrigins.Num())
@@ -113,7 +191,7 @@ public:
 		VertexFactory.InitResource(RHICmdList);
 
 		UE_LOG(LogTemp, Log,
-		       TEXT("%s: %d chunks, %d quads, %d triangles — ONE primitive, ONE draw"),
+		       TEXT("%s: %d chunks, %d quads, %d triangles â€” ONE primitive, ONE draw"),
 		       *PoolName, NumChunks, NumQuads, NumQuads * 2);
 
 	}
@@ -153,9 +231,8 @@ public:
 			// Silence is ambiguous: a pool that draws nothing looks identical
 			// whether the renderer never asked or the batch was rejected. Say
 			// which.
-			if (!bLoggedElements)
+			if (ElementsLogged.Increment() == 1)
 			{
-				bLoggedElements = true;
 				UE_LOG(LogTemp, Warning,
 				       TEXT("%s draw SKIPPED: numQuads=%d srv=%d materialProxy=%d"),
 				       *PoolName, NumQuads, QuadBufferSRV.IsValid() ? 1 : 0, MaterialProxy != nullptr ? 1 : 0);
@@ -163,9 +240,8 @@ public:
 			return;
 		}
 
-		if (!bLoggedElements)
+		if (ElementsLogged.Increment() == 1)
 		{
-			bLoggedElements = true;
 			UE_LOG(LogTemp, Log,
 			       TEXT("%s draw SUBMITTED: numQuads=%d views=%d visMap=0x%x"),
 			       *PoolName, NumQuads, Views.Num(), VisibilityMap);
@@ -204,19 +280,80 @@ public:
 			Mesh.bCanApplyViewModeOverrides = false;
 			Mesh.CastShadow = IsShadowCast(Views[ViewIndex]);
 
-			// ONE element covering EVERY chunk. This is the whole point: the
-			// number of chunks resident has no bearing on how many primitives
-			// or draws the renderer sees.
-			FMeshBatchElement& Element = Mesh.Elements[0];
-			Element.IndexBuffer = nullptr;
-			Element.FirstIndex = 0;
-			// Up to the high-water mark only: everything above it has never
-			// been written, so there is nothing there to draw.
-			Element.NumPrimitives = uint32(NumQuads) * 2;
-			Element.MinVertexIndex = 0;
-			Element.MaxVertexIndex = uint32(NumQuads) * 6 - 1;
-			Element.NumInstances = 1;
-			Element.PrimitiveUniformBuffer = GetUniformBuffer();
+			// ONE element covering EVERY chunk, unless culling is on.
+			//
+			// One draw over the whole pool is the design, and it is what removes
+			// the per-chunk cost from the renderer. What it also removes is
+			// per-chunk FRUSTUM CULLING, and that is not free: measured on a
+			// settled scene, the pooled path's frame time does not depend on what
+			// is on screen at all (18.58 -> 19.05 ms when the camera is pointed at
+			// almost nothing) while the per-chunk component path gets 64% cheaper
+			// over the same change. A renderer whose cost is invariant to
+			// visibility is a renderer that is not culling.
+			//
+			// So: cull per chunk on the render thread, then draw the surviving
+			// pool RANGES. Chunks own contiguous spans, and the pool fills in
+			// roughly spatial order, so neighbours in the pool are usually
+			// neighbours in the world and the surviving spans merge back down to
+			// far fewer draws than there are chunks. This keeps one primitive --
+			// nothing here touches FScene -- and trades "one draw" for "one draw
+			// per visible run", which is the trade the measurement says is worth
+			// making.
+			// LOCAL, not a member. GetDynamicMeshElements is called CONCURRENTLY --
+			// bSupportsParallelGDME defaults to true, so the renderer gathers the
+			// main view and every shadow cascade on parallel tasks, all through this
+			// one const method on this one proxy. Holding the cull's working set in
+			// mutable members therefore had several views writing the same array at
+			// once, and what got drawn was a mixture of their answers: a plausible
+			// count of quads, spatially unrelated to any one view's frustum. That is
+			// the whole under-selection. It also crashed -- reassigning the array
+			// while another thread iterated it asserted in the D3D12 RHI.
+			TArray<FQuadRange> Ranges;
+			const bool bCull = VoxelGpuPoolCull::IsEnabled() && Runs.Num() > 0 && NumQuads > 0;
+			if (bCull)
+			{
+				BuildCulledRanges(*Views[ViewIndex], Ranges);
+			}
+
+			if (!bCull || Ranges.Num() == 0)
+			{
+				// Not culling, or the cull produced nothing usable -- draw
+				// everything, which is always correct and never worse than
+				// before this option existed.
+				FMeshBatchElement& Element = Mesh.Elements[0];
+				Element.IndexBuffer = nullptr;
+				Element.FirstIndex = 0;
+				// Up to the high-water mark only: everything above it has never
+				// been written, so there is nothing there to draw.
+				Element.NumPrimitives = uint32(NumQuads) * 2;
+				Element.MinVertexIndex = 0;
+				Element.MaxVertexIndex = uint32(NumQuads) * 6 - 1;
+				Element.NumInstances = 1;
+				Element.PrimitiveUniformBuffer = GetUniformBuffer();
+			}
+			else
+			{
+				// SV_VertexID includes the draw's start vertex for a non-indexed
+				// draw, and the vertex factory derives its quad index straight
+				// from it (QuadIndex = VertexId / 6). So a range starting at quad
+				// F is expressed as FirstIndex = F*6 and the factory addresses the
+				// pool correctly with no extra state. That equivalence is the
+				// reason this works at all, and it is worth checking with a
+				// screenshot rather than trusting: getting it wrong draws the
+				// wrong geometry rather than none.
+				Mesh.Elements.Reset();
+				for (const FQuadRange& Range : Ranges)
+				{
+					FMeshBatchElement& Element = Mesh.Elements.AddDefaulted_GetRef();
+					Element.IndexBuffer = nullptr;
+					Element.FirstIndex = Range.First * 6;
+					Element.NumPrimitives = Range.Count * 2;
+					Element.MinVertexIndex = Range.First * 6;
+					Element.MaxVertexIndex = (Range.First + Range.Count) * 6 - 1;
+					Element.NumInstances = 1;
+					Element.PrimitiveUniformBuffer = GetUniformBuffer();
+				}
+			}
 
 			Collector.AddMesh(ViewIndex, Mesh);
 		}
@@ -263,8 +400,21 @@ public:
 	// rewritten wholesale rather than tracked range by range.
 	void UpdateChunkTable_RenderThread(FRHICommandListBase& RHICmdList,
 	                                   const TArray<FVector4f>& NewOrigins,
-	                                   const TArray<FVector4f>& NewParams)
+	                                   const TArray<FVector4f>& NewParams,
+	                                   const TArray<UVoxelGpuPoolComponent::FChunkRun>& NewRuns)
 	{
+		// Origins and Runs are the cull's two inputs and must not disagree: a run
+		// naming a chunk id the table no longer describes would be culled against
+		// a stale box. They are updated together, from the same game-thread
+		// snapshot, for that reason.
+		Origins = NewOrigins;
+		// Assigned unconditionally. This is only ever called with a fresh
+		// game-thread snapshot of both, so an EMPTY run list means the pool
+		// genuinely holds no live chunks -- the previous "keep the old runs if the
+		// new list is empty" guard turned that state into stale runs pointing at
+		// quads that no longer belong to anyone.
+		Runs = NewRuns;
+
 		if (!OriginBuffer.IsValid() || NewOrigins.Num() > MaxChunks)
 		{
 			return;   // outgrew the table; the caller rebuilds the render state
@@ -306,11 +456,277 @@ private:
 	TArray<uint32> ChunkIds;
 	TArray<FVector4f> Origins;
 	TArray<FVector4f> Params;
+	// Which quads belong to which chunk, sorted by pool offset. The cull's
+	// input; see UVoxelGpuPoolComponent::FChunkRun for why the proxy cannot
+	// derive this itself.
+	TArray<UVoxelGpuPoolComponent::FChunkRun> Runs;
+	int32 ChunkEdgeVoxels = 32;
+
+	struct FQuadRange { uint32 First = 0; uint32 Count = 0; };
+
+	// Frustum-test every run, then merge the survivors back into as few pool
+	// ranges as possible. Runs arrive sorted by pool offset, so the merge is a
+	// single linear pass.
+	//
+	// RE-ENTRANT BY CONSTRUCTION. Everything this touches is either read-only
+	// proxy state or a local -- see the note in GetDynamicMeshElements about
+	// bSupportsParallelGDME. The earlier version kept the working arrays as
+	// mutable members "reused across frames so the per-frame cull allocates
+	// nothing", which is a sound instinct for a method called once per frame and
+	// wrong for one called once per frame PER VIEW, in parallel.
+	void BuildCulledRanges(const FSceneView& View, TArray<FQuadRange>& CulledRanges) const
+	{
+		const FMatrix& LocalToWorldMatrix = GetLocalToWorld();
+		uint32 VisibleQuads = 0;
+
+		// N EQUAL RANGES OVER THE WHOLE POOL, no frustum test. See GDebugSplit.
+		const int32 SplitCount = VoxelGpuPoolCull::GDebugSplit;
+		if (SplitCount > 1 && NumQuads > 0)
+		{
+			const uint32 Total = uint32(NumQuads);
+			const uint32 Parts = uint32(FMath::Min(SplitCount, NumQuads));
+			for (uint32 I = 0; I < Parts; ++I)
+			{
+				// Computed from the boundaries rather than a running total so the
+				// parts tile [0, Total) exactly, with no rounding gap or overlap.
+				const uint32 Begin = uint32((uint64(Total) * I) / Parts);
+				const uint32 End = uint32((uint64(Total) * (I + 1)) / Parts);
+				if (End > Begin)
+				{
+					CulledRanges.Add(FQuadRange{ Begin, End - Begin });
+				}
+			}
+			// Deliberately NOT merged: adjacent ranges have a zero gap, so the
+			// merge below would collapse them straight back to one draw and the
+			// experiment would test nothing.
+			if (CullLogCounter.Increment() % 600 == 1)
+			{
+				UE_LOG(LogTemp, Log, TEXT("%s cull: DEBUG SPLIT into %d ranges covering %d quads"),
+				       *PoolName, CulledRanges.Num(), NumQuads);
+			}
+			return;
+		}
+
+		// WHICH FRUSTUM. GetDynamicMeshElements is called for shadow gathers as
+		// well as for the camera (FProjectedShadowInfo::GatherDynamicMeshElements),
+		// and there the view handed in is a SNAPSHOT of the main view -- so
+		// View.ViewFrustum is still the camera's. Culling shadow casters against
+		// the camera means every caster outside the camera frustum stops casting.
+		// The renderer's own answer to this is a per-gather cull frustum on the
+		// view, which is the shadow's bounds; its planes are expressed in
+		// pre-shadow-translated world space, so the translation has to come back
+		// out before they can be tested against absolute world boxes. Same
+		// adjustment FHierarchicalStaticMeshSceneProxy makes for foliage.
+		FConvexVolume ShadowFrustumLocal;
+		const FConvexVolume* Frustum = &View.ViewFrustum;
+		const bool bShadowGather = View.GetDynamicMeshElementsShadowCullFrustum() != nullptr;
+		if (bShadowGather)
+		{
+			const FConvexVolume& ShadowFrustum = *View.GetDynamicMeshElementsShadowCullFrustum();
+			for (const FPlane& Src : ShadowFrustum.Planes)
+			{
+				FPlane Norm = Src / Src.Size();
+				Norm.W -= (FVector(Norm) | View.GetPreShadowTranslation());
+				ShadowFrustumLocal.Planes.Add(Norm);
+			}
+			ShadowFrustumLocal.Init();
+			Frustum = &ShadowFrustumLocal;
+		}
+
+		// Why each run was dropped. Every one of these paths is a `continue` that
+		// looks exactly like a frustum rejection from outside, and one of them
+		// silently dropping most of the pool is indistinguishable in the picture
+		// from a cull that aims wrongly.
+		int32 SkippedEmpty = 0, SkippedBadId = 0, SkippedAboveWatermark = 0, SkippedHidden = 0, SkippedFrustum = 0;
+		uint32 RunQuads = 0;
+
+		for (const UVoxelGpuPoolComponent::FChunkRun& Run : Runs)
+		{
+			RunQuads += Run.NumQuads;
+			if (Run.NumQuads == 0 || !Origins.IsValidIndex(int32(Run.ChunkId)))
+			{
+				++(Run.NumQuads == 0 ? SkippedEmpty : SkippedBadId);
+				continue;
+			}
+			// Ranges above the high-water mark hold nothing that was ever
+			// written; drawing them would be reading uninitialised pool.
+			if (Run.FirstQuad + Run.NumQuads > uint32(NumQuads))
+			{
+				++SkippedAboveWatermark;
+				continue;
+			}
+
+			const FVector4f& Entry = Origins[int32(Run.ChunkId)];
+			const float Scale = Entry.W;
+			if (Scale <= 0.f)
+			{
+				++SkippedHidden;
+				continue; // hidden entry: collapsed to a point, nothing to draw
+			}
+
+			// Same extent AddChunk grows LocalBounds by, so the cull can never be
+			// tighter than the bounds the scene already culled the whole
+			// primitive against.
+			const float EdgeUU = float(ChunkEdgeVoxels) * 10.0f * Scale;
+			const FVector Min(Entry.X, Entry.Y, Entry.Z);
+			const FBox LocalBox(Min, Min + FVector(EdgeUU));
+			const FBox WorldBox = LocalBox.TransformBy(LocalToWorldMatrix);
+
+			// One-shot: the actual numbers the frustum test is fed, against the
+			// view it is tested with. A cull that selects the wrong chunks and a
+			// cull that selects none look identical from the outside, and both
+			// read as "the pool is broken"; this prints the operands instead of
+			// inferring them.
+			if (CullSpaceLogged.Increment() == 1)
+			{
+				UE_LOG(LogTemp, Warning,
+				       TEXT("%s cullspace: chunk0 local=(%.0f,%.0f,%.0f) edge=%.0f -> worldCentre=(%.0f,%.0f,%.0f) ext=(%.0f,%.0f,%.0f) | viewOrigin=(%.0f,%.0f,%.0f) | l2wTrans=(%.0f,%.0f,%.0f)"),
+				       *PoolName, Entry.X, Entry.Y, Entry.Z, EdgeUU,
+				       WorldBox.GetCenter().X, WorldBox.GetCenter().Y, WorldBox.GetCenter().Z,
+				       WorldBox.GetExtent().X, WorldBox.GetExtent().Y, WorldBox.GetExtent().Z,
+				       View.ViewMatrices.GetViewOrigin().X, View.ViewMatrices.GetViewOrigin().Y,
+				       View.ViewMatrices.GetViewOrigin().Z,
+				       LocalToWorldMatrix.GetOrigin().X, LocalToWorldMatrix.GetOrigin().Y,
+				       LocalToWorldMatrix.GetOrigin().Z);
+			}
+
+			const bool bInFrustum = VoxelGpuPoolCull::GDebugAllVisible != 0 ||
+			                        Frustum->IntersectBox(WorldBox.GetCenter(), WorldBox.GetExtent());
+			const bool bKeep = VoxelGpuPoolCull::GDebugInvert != 0 ? !bInFrustum : bInFrustum;
+			if (!bKeep)
+			{
+				++SkippedFrustum;
+				continue;
+			}
+
+			VisibleQuads += Run.NumQuads;
+			CulledRanges.Add(FQuadRange{ Run.FirstQuad, Run.NumQuads });
+		}
+
+		// Inverted: what reaches the screen must be exactly the rejected set, so
+		// merging (which only ever ADDS quads) would destroy the experiment.
+		if (VoxelGpuPoolCull::GDebugInvert != 0)
+		{
+			if (CullLogCounter.Increment() % 600 == 1)
+			{
+				UE_LOG(LogTemp, Log,
+				       TEXT("%s cull: DEBUG INVERT drawing the REJECTED set: ranges=%d quads=%u/%d"),
+				       *PoolName, CulledRanges.Num(), VisibleQuads, NumQuads);
+			}
+			return;
+		}
+
+		// MERGE TO A DRAW-CALL BUDGET, CHEAPEST GAPS FIRST.
+		//
+		// The first version merged on a fixed gap threshold and then discarded
+		// the whole result if it still exceeded the range cap. That is the wrong
+		// shape twice over: the threshold is a magic constant with no relation to
+		// what a draw costs, and the discard meant a scene the cull had correctly
+		// reduced to 25% visible was drawn in full anyway -- measured
+		// visibleQuads=2205034/8808161 with ranges=0, i.e. all the work and none
+		// of the benefit.
+		//
+		// The real objective is: no more than N draws, with as few redrawn
+		// off-screen quads as possible. So sort the GAPS between adjacent visible
+		// runs, and merge the smallest ones until the range count fits. Merging
+		// the smallest gap first is optimal for this objective -- each merge
+		// removes exactly one draw and costs exactly that gap in redrawn quads.
+		const int32 MaxRanges = FMath::Max(1, VoxelGpuPoolCull::GMaxRanges);
+		if (CulledRanges.Num() > MaxRanges)
+		{
+			TArray<uint32> Sorted;
+			Sorted.Reserve(CulledRanges.Num() - 1);
+			for (int32 I = 1; I < CulledRanges.Num(); ++I)
+			{
+				const uint32 PrevEnd = CulledRanges[I - 1].First + CulledRanges[I - 1].Count;
+				Sorted.Add(CulledRanges[I].First >= PrevEnd ? CulledRanges[I].First - PrevEnd : 0u);
+			}
+			// The (n - MaxRanges)th smallest gap is the threshold that leaves
+			// exactly MaxRanges ranges. Sorting is O(n log n) on a few thousand
+			// entries, once per view per frame.
+			Sorted.Sort();
+			const int32 MergesNeeded = CulledRanges.Num() - MaxRanges;
+			const uint32 GapThreshold = Sorted[FMath::Clamp(MergesNeeded - 1, 0, Sorted.Num() - 1)];
+
+			TArray<FQuadRange> Merged;
+			Merged.Reserve(MaxRanges);
+			Merged.Add(CulledRanges[0]);
+			for (int32 I = 1; I < CulledRanges.Num(); ++I)
+			{
+				FQuadRange& Last = Merged.Last();
+				const uint32 LastEnd = Last.First + Last.Count;
+				const uint32 Gap = CulledRanges[I].First >= LastEnd ? CulledRanges[I].First - LastEnd : 0u;
+				if (Gap <= GapThreshold)
+				{
+					Last.Count = (CulledRanges[I].First + CulledRanges[I].Count) - Last.First;
+				}
+				else
+				{
+					Merged.Add(CulledRanges[I]);
+				}
+			}
+			CulledRanges = MoveTemp(Merged);
+		}
+
+		// Too fragmented to be worth it, or nothing visible at all -- either way
+		// the caller falls back to the single full draw. Nothing visible is
+		// deliberately NOT treated as "draw nothing": a wrong cull that hides the
+		// world is the failure mode this pool is worst at diagnosing, so the
+		// conservative branch is the one that draws.
+		// Nothing visible -> fall back to the full draw rather than drawing
+		// nothing. A wrong cull that hides the world is the failure this pool is
+		// worst at diagnosing, so the conservative branch is the one that draws.
+		// The range cap no longer needs a bail-out: the merge above satisfies it
+		// by construction.
+		if (VisibleQuads == 0)
+		{
+			CulledRanges.Reset();
+		}
+
+		// What the merged ranges actually submit, as against VisibleQuads which is
+		// the pre-merge total. The gap between the two is the cost of merging --
+		// quads redrawn because they sit inside a tolerated gap. Both numbers are
+		// needed to tune GPUCullMergeGap; one alone cannot say whether merging is
+		// paying for itself.
+		uint32 DrawnQuads = 0;
+		for (const FQuadRange& R : CulledRanges)
+		{
+			DrawnQuads += R.Count;
+		}
+
+		// Logged PERIODICALLY, not once. The first version logged on the first
+		// frame only, which is useless for this diagnostic: at t=0 the pool holds
+		// a handful of chunks and the camera may legitimately see none of them,
+		// so "visibleQuads=0" reads identically whether the cull is working or
+		// rejecting everything. That ambiguity hid a broken cull for a whole
+		// verification cycle -- and because the empty case falls back to the full
+		// draw, the picture was correct either way and proved nothing.
+		if (CullLogCounter.Increment() % 600 == 1)
+		{
+			UE_LOG(LogTemp, Log,
+			       TEXT("%s cull: runs=%d runQuads=%u/%d visibleQuads=%u (%.1f%%) ranges=%d drawnQuads=%u "
+			            "| skipped empty=%d badId=%d aboveHWM=%d hidden=%d frustum=%d | shadowGather=%d"),
+			       *PoolName, Runs.Num(), RunQuads, NumQuads, VisibleQuads,
+			       NumQuads > 0 ? 100.0 * double(VisibleQuads) / double(NumQuads) : 0.0,
+			       CulledRanges.Num(), DrawnQuads,
+			       SkippedEmpty, SkippedBadId, SkippedAboveWatermark, SkippedHidden, SkippedFrustum,
+			       bShadowGather ? 1 : 0);
+		}
+	}
+
+	// Concurrent, for the same reason the cull's working set had to stop being a
+	// member: several views run this method at once. A racing ++ on a plain int
+	// is undefined behaviour and, more practically, would let the periodic log
+	// miss or duplicate its slot.
+	mutable FThreadSafeCounter CullLogCounter;
+	mutable FThreadSafeCounter CullSpaceLogged;
+
+
 
 	FBufferRHIRef QuadBuffer, ChunkIdBuffer, OriginBuffer, ParamsBuffer;
 	FShaderResourceViewRHIRef QuadBufferSRV, ChunkIdSRV, OriginSRV, ParamsSRV;
 
-	mutable bool bLoggedElements = false;
+	mutable FThreadSafeCounter ElementsLogged;
 	int32 NumQuads = 0;      // drawn
 	int32 BufferQuads = 0;   // allocated
 	int32 NumChunks = 0;
@@ -352,6 +768,9 @@ void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 	AllocationChunkIds.Reset();
 	NumLiveChunks = 0;
 	LocalBounds = FBox(ForceInit);
+	DirtyQuads = {};
+	bChunkTableDirty = false;
+	bRunsDirty = false;
 }
 
 int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
@@ -410,6 +829,7 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 
 	MarkQuadsDirty(Alloc.Offset, Alloc.NumQuads);
 	bChunkTableDirty = true;
+	bRunsDirty = true;
 	PushUpdatesToProxy();
 	UpdateBounds();
 	return Handle;
@@ -456,6 +876,10 @@ void UVoxelGpuPoolComponent::RemoveChunkInternal(int32 Handle, bool bRecycleChun
 	Allocations[Handle] = FVoxelGpuPoolAllocation{};
 	--NumLiveChunks;
 
+	// The allocation set changed even when the table entry did not (the realloc
+	// caller keeps its entry), so the runs are stale either way.
+	bRunsDirty = true;
+
 	MarkQuadsDirty(Alloc.Offset, Alloc.NumQuads);
 	PushUpdatesToProxy();
 }
@@ -498,6 +922,7 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 		MarkRenderStateDirty();
 		DirtyQuads = {};
 		bChunkTableDirty = false;
+		bRunsDirty = false;
 		return;
 	}
 
@@ -507,13 +932,17 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 		MarkRenderStateDirty();
 		DirtyQuads = {};
 		bChunkTableDirty = false;
+		bRunsDirty = false;
 		return;
 	}
 
 	const uint32 First = DirtyQuads.bValid ? DirtyQuads.First : 0;
 	const uint32 Count = DirtyQuads.bValid ? (DirtyQuads.Last - DirtyQuads.First + 1) : 0;
 	const int32 NewNumQuads = int32(Pool.GetHighWaterMark());
-	const bool bTableDirty = bChunkTableDirty;
+	// The runs travel on the table update, so a run-only change has to send the
+	// table too. It is two small vectors per chunk; the quad buffer, which is the
+	// expensive one, is still written by range.
+	const bool bTableDirty = bChunkTableDirty || bRunsDirty;
 
 	FVoxelGpuPoolSceneProxy* Proxy = LiveProxy;
 
@@ -540,15 +969,21 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 	// The chunk table is two small vectors per chunk, so it stays whole.
 	TArray<FVector4f> OriginsCopy = ChunkOrigins;
 	TArray<FVector4f> ParamsCopy = ChunkParams;
+	// Runs travel with the table because they describe the same thing: which
+	// chunk owns which quads. Rebuilt whenever the ALLOCATION set changed, not
+	// whenever the table did -- see bRunsDirty. Still not per frame: residency
+	// changes a handful of times a second, the camera moves every frame, and only
+	// the second of those needs re-culling.
+	TArray<FChunkRun> RunsCopy = bTableDirty ? BuildChunkRuns() : TArray<FChunkRun>();
 
 	ENQUEUE_RENDER_COMMAND(VoxelGpuPoolIncrementalUpdate)(
 		[Proxy, QuadsSlice = MoveTemp(QuadsSlice), IdsSlice = MoveTemp(IdsSlice),
-		 OriginsCopy = MoveTemp(OriginsCopy), ParamsCopy = MoveTemp(ParamsCopy),
+		 OriginsCopy = MoveTemp(OriginsCopy), ParamsCopy = MoveTemp(ParamsCopy), RunsCopy = MoveTemp(RunsCopy),
 		 First, Count, NewNumQuads, bTableDirty](FRHICommandListImmediate& RHICmdList)
 	{
 		if (bTableDirty)
 		{
-			Proxy->UpdateChunkTable_RenderThread(RHICmdList, OriginsCopy, ParamsCopy);
+			Proxy->UpdateChunkTable_RenderThread(RHICmdList, OriginsCopy, ParamsCopy, RunsCopy);
 		}
 		Proxy->UpdateQuadRange_RenderThread(RHICmdList, QuadsSlice, IdsSlice,
 		                                    First, Count, NewNumQuads);
@@ -556,6 +991,7 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 
 	DirtyQuads = {};
 	bChunkTableDirty = false;
+	bRunsDirty = false;
 
 	// Tell the RENDERER the pool grew, not just the component.
 	//
@@ -645,9 +1081,45 @@ int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& In
 	AllocationChunkIds[Handle] = ChunkId;
 	++NumLiveChunks;
 
+	// The chunk moved. Its table entry is unchanged -- that is the whole point of
+	// reusing it -- but the run that names its quads is now wrong, and a stale run
+	// does not merely fail to draw this chunk: it points the cull at somebody
+	// else's quads.
+	bRunsDirty = true;
+
 	MarkQuadsDirty(Alloc.Offset, Alloc.NumQuads);
 	PushUpdatesToProxy();
 	return Handle;
+}
+
+TArray<UVoxelGpuPoolComponent::FChunkRun> UVoxelGpuPoolComponent::BuildChunkRuns() const
+{
+	// One entry per LIVE allocation. A freed handle has NumQuads == 0 and its
+	// quads already point at the hidden entry, so skipping it here is the same
+	// statement the renderer already makes about it -- there is nothing there.
+	TArray<FChunkRun> Runs;
+	Runs.Reserve(Allocations.Num());
+	for (int32 Handle = 0; Handle < Allocations.Num(); ++Handle)
+	{
+		const FVoxelGpuPoolAllocation& Alloc = Allocations[Handle];
+		if (Alloc.NumQuads == 0 || !AllocationChunkIds.IsValidIndex(Handle))
+		{
+			continue;
+		}
+		const uint32 ChunkId = AllocationChunkIds[Handle];
+		if (ChunkId == kHiddenChunkId)
+		{
+			continue;
+		}
+		Runs.Add(FChunkRun{ ChunkId, Alloc.Offset, Alloc.NumQuads });
+	}
+	// Sorted by pool offset so the proxy can merge neighbours without sorting
+	// every frame -- the merge is the difference between one draw per visible
+	// chunk and one draw per visible RUN of chunks, and streaming fills the pool
+	// in roughly spatial order, so neighbours in the pool are usually neighbours
+	// in the world.
+	Runs.Sort([](const FChunkRun& A, const FChunkRun& B) { return A.FirstQuad < B.FirstQuad; });
+	return Runs;
 }
 
 void UVoxelGpuPoolComponent::SetChunkMaterial(UMaterialInterface* InMaterial)
@@ -717,7 +1189,7 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 	}
 
 	FVoxelGpuPoolSceneProxy* Proxy =
-		new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, ChunkOrigins, ChunkParams,
+		new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, ChunkOrigins, ChunkParams, BuildChunkRuns(),
 		                            PoolName, ChunkTableCapacity);
 	LiveProxy = Proxy;
 	return Proxy;
