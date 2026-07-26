@@ -879,6 +879,41 @@ this plan was supposed to be:
   follow.
 - **Buffer identity must stay stable.** The factory bakes these SRVs into a uniform
   buffer built once in `InitRHI`. In-place UAV writes are fine; reallocation is not.
+**Scoped 2026-07-26, not built. And one thing I reported earlier was wrong.**
+
+~~`BufferQuads = InQuads.Num()` means the GPU buffer is sized to the CPU
+shadow's current length, so a GPU-written range only exists if the shadow
+already covers it.~~ **Wrong — retracted.** `PooledQuads.SetNumZeroed(CapacityQuads)`
+(`:852`) sizes the shadow to the **full pool capacity**, and `CreateSceneProxy`
+says so explicitly (`:1248-1250`): *"The whole capacity is uploaded, not just the
+used prefix: incremental writes address absolute pool offsets, so the buffer has
+to be that big from the start."* So `InQuads.Num()` **is** capacity and the range
+always exists. Recorded rather than quietly fixed, because it was reported
+upward as a finding.
+
+**The real clobber, which is exactly what the brief said.** Steady state is fine:
+updates go through `UpdateQuadRange_RenderThread` (`:1088`), which writes only the
+dirty slice. The danger is **proxy recreation** — four `MarkRenderStateDirty`
+sites (`:993`, `:1022`, `:1032`, `:1228`) — after which `CreateSceneProxy`
+re-uploads all of `PooledQuads`. For a GPU-written range the CPU shadow holds
+zeros or stale content, so the geometry silently reverts.
+
+**Three candidate fixes, in increasing order of correctness:**
+1. *Mark GPU-owned ranges and skip them on rebuild.* Cheapest, but the rebuild is
+   the only thing that populates the buffer, so a skipped range is left
+   uninitialised — trades a revert for a garbage read.
+2. *Re-dispatch GPU chunks on recreation.* Correct, and recreation is rare, but it
+   couples the pool to the mesher and makes an unrelated event cost a GPU burst.
+3. **Move quad-buffer ownership off the proxy** so recreation rebinds rather than
+   re-uploads. This is what "buffer identity must stay stable" is really asking
+   for, and it removes the clobber structurally rather than defending against it.
+   It is also the shape a compute compaction pass wants. Interacts with the
+   vertex factory baking the SRVs into a uniform buffer in `InitRHI`, so it needs
+   care around Wave A's work.
+
+**Recommendation: (3), and cost it before building it** — the same order that
+just paid off for D6.
+
 - **Neutralise the CPU shadow clobber — the highest-severity silent-corruption risk
   in this wave.** `PooledQuads`/`QuadChunkIds` (`VoxelGpuPoolComponent.h:148-152`)
   are a full CPU mirror, and `CreateSceneProxy` re-uploads all of it. Any
