@@ -62,21 +62,50 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadVertexFactoryParameters, )
 	SHADER_PARAMETER(uint32, PoolMode)
 END_GLOBAL_SHADER_PARAMETER_STRUCT()
 
-// Per-chunk framing, bound PER DRAW rather than per factory.
+// WHERE THIS DRAW STARTS IN THE POOL, in quads. Bound PER BATCH ELEMENT.
 //
-// This is what lets one vertex factory -- and therefore one primitive -- serve
-// many chunks out of a shared pool. Each chunk's quads are contiguous in the
-// pool, so each draw covers one range and needs only its own origin and mip
-// scale. That is the whole point of ADR-0006: streaming a chunk in or out
-// writes into the pool and changes a draw range, and never touches FScene.
-struct FVoxelChunkDrawData
+// SV_VertexID DOES NOT INCLUDE THE DRAW'S BASE VERTEX on D3D12. The engine says
+// so itself -- RHISupportsAbsoluteVertexID (DataDrivenShaderPlatformInfo.h)
+// returns true only for Vulkan, and FLocalVertexFactory compensates by
+// threading the base through a uniform buffer and adding it in the shader
+// (VF_VertexOffset). Measured here, not assumed: with the frustum test bypassed
+// and the pool tiled into N exact contiguous ranges
+// (voxel.Stream.GPUCullDebugSplit), only the FIRST 1/N of the pool reached the
+// screen at N = 2, 8 and 64, while the frame cost stayed flat (12.26 -> 11.86 ms
+// at N=8) and then ROSE at N=64 (14.07 ms) -- i.e. every range still processed
+// its full quad count, starting at pool quad 0, and paid for 63 extra draws on
+// top. See docs/gpu-waves-plan.md "Wave A".
+//
+// So every range draws from vertex 0 and names its start explicitly. The
+// alternative -- expressing the start as FMeshBatchElement::FirstIndex and
+// trusting SV_VertexID to carry it -- is what produced the picture above.
+//
+// A UNIFORM BUFFER, not a loose FShaderParameter. Loose vertex-factory
+// parameters do not bind in this project (measured; docs/gpu-g2-draw-path.md),
+// and ShaderBindings.Add() on an unbound parameter is a SILENT no-op -- so the
+// loose version would have compiled, run, logged nothing, and drawn the wrong
+// geometry. This is the same shape FVoxelGIVolumeParameters already uses in the
+// same hook.
+//
+// NAMING: registered shader-side as "VoxelRange", so HLSL reaches this as
+// VoxelRange.BaseQuad. A loose `uint BaseQuad;` in the .ush would be a
+// different, unbound symbol that reads zero forever -- which is exactly the
+// pre-fix behaviour, silently.
+BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadRangeParameters, )
+	SHADER_PARAMETER(uint32, BaseQuad)
+END_GLOBAL_SHADER_PARAMETER_STRUCT()
+
+// What FMeshBatchElement::UserData points at on the pooled path.
+//
+// MUST be allocated with FMeshElementCollector::AllocateOneFrameResource<T>().
+// A stack local, or a member of the proxy, does not survive to draw submission:
+// GetDynamicMeshElements only GATHERS batches, and the bindings are read later
+// when the mesh draw commands are built. (Do not copy the older
+// VoxelGpuChunkComponent pattern of pointing UserData at a proxy member -- that
+// was dead code nothing read, and it is gone.)
+struct FVoxelQuadRangeUserData
 {
-	FVector3f ChunkOriginUU = FVector3f::ZeroVector;
-	float LevelScale = 1.0f;
-	FShaderResourceViewRHIRef ChunkOriginsSRV;
-	FShaderResourceViewRHIRef QuadChunkIdsSRV;
-	FShaderResourceViewRHIRef ChunkParamsSRV;
-	bool bPoolMode = false;
+	TUniformBufferRef<FVoxelQuadRangeParameters> RangeUniformBuffer;
 };
 
 class VOXELEARTHSHADERS_API FVoxelQuadVertexFactory : public FVertexFactory
@@ -117,6 +146,16 @@ public:
 
 	FRHIUniformBuffer* GetUniformBuffer() const { return UniformBuffer.GetReference(); }
 
+	// BaseQuad = 0, built once. Bound for any element that carries no range of
+	// its own -- the single full-pool draw and the single-chunk component -- so
+	// those paths compute QuadIndex = 0 + VertexId/6, which is byte for byte
+	// what they computed before this parameter existed.
+	//
+	// It has to be a real buffer rather than nullptr: ShaderBindings.Add()
+	// checkf()s a non-null value once the parameter IS bound, and it is bound in
+	// every permutation because the shader always reads it.
+	FRHIUniformBuffer* GetZeroRangeUniformBuffer() const { return ZeroRangeUniformBuffer.GetReference(); }
+
 private:
 	FShaderResourceViewRHIRef QuadBufferSRV;
 	FVector3f ChunkOriginUU = FVector3f::ZeroVector;
@@ -126,4 +165,5 @@ private:
 	FShaderResourceViewRHIRef ChunkParamsSRV;
 	bool bPoolMode = false;
 	TUniformBufferRef<FVoxelQuadVertexFactoryParameters> UniformBuffer;
+	TUniformBufferRef<FVoxelQuadRangeParameters> ZeroRangeUniformBuffer;
 };

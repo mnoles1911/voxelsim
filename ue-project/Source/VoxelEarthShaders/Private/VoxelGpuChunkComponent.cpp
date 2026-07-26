@@ -182,7 +182,12 @@ public:
 			Element.MaxVertexIndex = uint32(NumQuads) * 6 - 1;
 			Element.NumInstances = 1;
 			Element.PrimitiveUniformBuffer = GetUniformBuffer();
-			Element.UserData = &DrawData;
+			// UserData stays null. It used to point at a proxy member of the
+			// now-deleted FVoxelChunkDrawData, which nothing ever read. The
+			// vertex factory DOES read UserData now (as FVoxelQuadRangeUserData),
+			// so leaving a differently-typed pointer there would have been a
+			// type confusion rather than merely dead. Null means "start at pool
+			// quad 0", which is what this single-chunk draw wants.
 
 			Collector.AddMesh(ViewIndex, Mesh);
 		}
@@ -199,7 +204,6 @@ private:
 
 	int32 NumQuads = 0;
 	float LevelScale = 1.0f;
-	FVoxelChunkDrawData DrawData;
 
 	FMaterialRenderProxy* MaterialProxy;
 	FMaterialRelevance MaterialRelevance;

@@ -12,12 +12,20 @@
 // Draws every chunk in the pool with a single mesh batch.
 namespace VoxelGpuPoolCull
 {
+	// HARD CEILING ON DRAW RANGES, and it is a correctness limit rather than a
+	// taste one. The renderer selects batch elements with
+	// `(1ull << BatchElementIndex) & BatchElementMask` (FMeshBatch), which is
+	// undefined for any index >= 64. GPUCullMaxRanges used to default to 256, so
+	// a sufficiently fragmented view was one shift away from undefined
+	// behaviour that would have presented as random missing terrain.
+	static constexpr int32 kMaxBatchElements = 64;
+
 	static int32 GEnabled = 0;
 	static FAutoConsoleVariableRef CVarEnabled(
 		TEXT("voxel.Stream.GPUCull"), GEnabled,
-		TEXT("Frustum-cull the GPU pool per chunk and draw only the surviving pool ranges. 1 = on (default). ")
-		TEXT("0 = one draw over the whole pool, which is the pre-cull behaviour and pays for every resident ")
-		TEXT("quad regardless of where the camera looks."),
+		TEXT("Frustum-cull the GPU pool per chunk and draw only the surviving pool ranges. 1 = on, 0 = off ")
+		TEXT("(default). 0 is one draw over the whole pool, which is the pre-cull behaviour and pays for ")
+		TEXT("every resident quad regardless of where the camera looks."),
 		ECVF_RenderThreadSafe);
 
 	// Merging tolerance, in quads. Two surviving ranges separated by a gap
@@ -26,21 +34,32 @@ namespace VoxelGpuPoolCull
 	// invocations and no pixels if it is off-screen, while a draw costs a state
 	// change and a command. Tuned by measurement, not taste -- raise it if the
 	// range count is high, lower it if the drawn-quad count is.
+	//
+	// THIS USED TO DO NOTHING. It was declared, documented, and referenced only
+	// from a comment; the merge ran exclusively off a threshold derived from
+	// GPUCullMaxRanges, so tuning this knob silently changed nothing and any
+	// "tuned merge gap" measurement would have been measuring the default. It is
+	// now the FIRST merge pass, with the range-cap merge below it as the backstop
+	// that guarantees the element limit.
 	static int32 GMergeGapQuads = 4096;
 	static FAutoConsoleVariableRef CVarMergeGap(
 		TEXT("voxel.Stream.GPUCullMergeGap"), GMergeGapQuads,
 		TEXT("Quads. Surviving pool ranges closer together than this are merged into one draw, re-drawing ")
-		TEXT("the gap between them. Trades redrawn off-screen quads against draw count."),
+		TEXT("the gap between them. Trades redrawn off-screen quads against draw count. 0 disables this ")
+		TEXT("pass, leaving only the range-cap merge."),
 		ECVF_RenderThreadSafe);
 
-	// Above this, stop merging and just draw the whole pool. A view that can see
-	// nearly everything gains nothing from culling and would pay for hundreds of
-	// draws to prove it.
-	static int32 GMaxRanges = 256;
+	// The draw-range budget the merge works down to. Clamped to
+	// kMaxBatchElements wherever it is read -- see that constant.
+	static int32 GMaxRanges = kMaxBatchElements;
 	static FAutoConsoleVariableRef CVarMaxRanges(
 		TEXT("voxel.Stream.GPUCullMaxRanges"), GMaxRanges,
-		TEXT("If the cull cannot get below this many draw ranges, fall back to one draw over the whole pool."),
+		TEXT("Draw-range budget for the cull. The merge always reaches it by construction. CLAMPED TO 64: ")
+		TEXT("the renderer's batch-element mask is a uint64 and index >= 64 is undefined."),
 		ECVF_RenderThreadSafe);
+
+	// The budget actually used, never above the element-mask limit.
+	inline int32 GetMaxRanges() { return FMath::Clamp(GMaxRanges, 1, kMaxBatchElements); }
 
 	// Control experiment: run the whole range/merge/multi-draw path but treat
 	// EVERY chunk as visible. If the picture is correct with this on and wrong
@@ -320,6 +339,12 @@ public:
 				// Not culling, or the cull produced nothing usable -- draw
 				// everything, which is always correct and never worse than
 				// before this option existed.
+				//
+				// UserData stays null, so the factory binds its BaseQuad = 0
+				// buffer and the shader computes QuadIndex = 0 + VertexId/6 --
+				// the identical expression to before BaseQuad existed. This path
+				// is unchanged, not merely equivalent, and that is deliberate:
+				// it is the control every cull measurement is read against.
 				FMeshBatchElement& Element = Mesh.Elements[0];
 				Element.IndexBuffer = nullptr;
 				Element.FirstIndex = 0;
@@ -333,25 +358,54 @@ public:
 			}
 			else
 			{
-				// SV_VertexID includes the draw's start vertex for a non-indexed
-				// draw, and the vertex factory derives its quad index straight
-				// from it (QuadIndex = VertexId / 6). So a range starting at quad
-				// F is expressed as FirstIndex = F*6 and the factory addresses the
-				// pool correctly with no extra state. That equivalence is the
-				// reason this works at all, and it is worth checking with a
-				// screenshot rather than trusting: getting it wrong draws the
-				// wrong geometry rather than none.
+				// EVERY RANGE DRAWS FROM VERTEX 0 AND NAMES ITS START EXPLICITLY.
+				//
+				// The obvious encoding -- FirstIndex = Range.First * 6, and let
+				// SV_VertexID carry the offset into the factory's
+				// QuadIndex = VertexId/6 -- is what shipped, and it is wrong.
+				// SV_VertexID does not include the draw's base vertex on D3D12;
+				// RHISupportsAbsoluteVertexID (DataDrivenShaderPlatformInfo.h)
+				// returns true only for Vulkan, and FLocalVertexFactory threads
+				// the base through a uniform buffer for exactly this reason.
+				//
+				// Measured with the frustum test bypassed and the pool tiled into
+				// N exact contiguous ranges (GPUCullDebugSplit): at N = 2, 8 and
+				// 64 only the first 1/N of the pool reached the screen, while the
+				// frame cost stayed flat and then rose (12.26 -> 11.86 -> 14.07 ms
+				// p50) -- every range drew its full quad count starting at pool
+				// quad 0, and N=64 simply added 63 draw calls on top. That is a
+				// renderer silently drawing the wrong geometry, which is the
+				// failure mode this pool is worst at showing.
+				//
+				// So: FirstIndex = 0 everywhere, and the start goes through
+				// FVoxelQuadRangeParameters. Correct whether or not the platform
+				// includes the base vertex, because VertexId now unambiguously
+				// runs [0, Count*6) for every range.
 				Mesh.Elements.Reset();
 				for (const FQuadRange& Range : Ranges)
 				{
+					// ONE FRAME RESOURCE, not a local and not a proxy member.
+					// GetDynamicMeshElements only gathers; the bindings are read
+					// later when the draw commands are built, by which time a
+					// stack local is gone. The collector owns this until the
+					// frame ends.
+					FVoxelQuadRangeUserData& RangeData =
+						Collector.AllocateOneFrameResource<FVoxelQuadRangeUserData>();
+					FVoxelQuadRangeParameters RangeParams;
+					RangeParams.BaseQuad = Range.First;
+					RangeData.RangeUniformBuffer =
+						TUniformBufferRef<FVoxelQuadRangeParameters>::CreateUniformBufferImmediate(
+							RangeParams, UniformBuffer_SingleFrame);
+
 					FMeshBatchElement& Element = Mesh.Elements.AddDefaulted_GetRef();
 					Element.IndexBuffer = nullptr;
-					Element.FirstIndex = Range.First * 6;
+					Element.FirstIndex = 0;
 					Element.NumPrimitives = Range.Count * 2;
-					Element.MinVertexIndex = Range.First * 6;
-					Element.MaxVertexIndex = (Range.First + Range.Count) * 6 - 1;
+					Element.MinVertexIndex = 0;
+					Element.MaxVertexIndex = Range.Count * 6 - 1;
 					Element.NumInstances = 1;
 					Element.PrimitiveUniformBuffer = GetUniformBuffer();
+					Element.UserData = &RangeData;
 				}
 			}
 
@@ -480,7 +534,10 @@ private:
 		uint32 VisibleQuads = 0;
 
 		// N EQUAL RANGES OVER THE WHOLE POOL, no frustum test. See GDebugSplit.
-		const int32 SplitCount = VoxelGpuPoolCull::GDebugSplit;
+		// Capped at the batch-element limit for the same reason GetMaxRanges() is:
+		// asking for 256 parts would index a uint64 mask past bit 63.
+		const int32 SplitCount = FMath::Min(VoxelGpuPoolCull::GDebugSplit,
+		                                    VoxelGpuPoolCull::kMaxBatchElements);
 		if (SplitCount > 1 && NumQuads > 0)
 		{
 			const uint32 Total = uint32(NumQuads);
@@ -616,7 +673,46 @@ private:
 			return;
 		}
 
-		// MERGE TO A DRAW-CALL BUDGET, CHEAPEST GAPS FIRST.
+		// PASS 1: MERGE ON THE TOLERATED GAP (voxel.Stream.GPUCullMergeGap).
+		//
+		// This is what that cvar always claimed to do and never did. Its own
+		// declaration described the trade exactly -- an off-screen quad costs six
+		// vertex invocations and no pixels, a draw costs a state change and a
+		// command -- and then nothing read it, because the range-cap merge below
+		// was the only merge that existed. A knob that silently ignores you is
+		// worse than no knob, so it is wired here rather than deleted: it is the
+		// only control over redrawn quads at range counts that are already under
+		// the cap, which is the common case.
+		//
+		// Runs into the cap merge below, which is what still GUARANTEES the
+		// element limit; this pass only ever reduces the count it starts from.
+		const uint32 MergeGap = uint32(FMath::Max(0, VoxelGpuPoolCull::GMergeGapQuads));
+		if (MergeGap > 0 && CulledRanges.Num() > 1)
+		{
+			TArray<FQuadRange> Merged;
+			Merged.Reserve(CulledRanges.Num());
+			Merged.Add(CulledRanges[0]);
+			for (int32 I = 1; I < CulledRanges.Num(); ++I)
+			{
+				FQuadRange& Last = Merged.Last();
+				const uint32 LastEnd = Last.First + Last.Count;
+				const uint32 Gap = CulledRanges[I].First >= LastEnd ? CulledRanges[I].First - LastEnd : 0u;
+				if (Gap <= MergeGap)
+				{
+					// Max, not +=: runs are sorted by pool offset but a merged
+					// range can already extend past the next one's end.
+					const uint32 NewEnd = FMath::Max(LastEnd, CulledRanges[I].First + CulledRanges[I].Count);
+					Last.Count = NewEnd - Last.First;
+				}
+				else
+				{
+					Merged.Add(CulledRanges[I]);
+				}
+			}
+			CulledRanges = MoveTemp(Merged);
+		}
+
+		// PASS 2: MERGE TO A DRAW-CALL BUDGET, CHEAPEST GAPS FIRST.
 		//
 		// The first version merged on a fixed gap threshold and then discarded
 		// the whole result if it still exceeded the range cap. That is the wrong
@@ -631,7 +727,7 @@ private:
 		// runs, and merge the smallest ones until the range count fits. Merging
 		// the smallest gap first is optimal for this objective -- each merge
 		// removes exactly one draw and costs exactly that gap in redrawn quads.
-		const int32 MaxRanges = FMath::Max(1, VoxelGpuPoolCull::GMaxRanges);
+		const int32 MaxRanges = VoxelGpuPoolCull::GetMaxRanges();
 		if (CulledRanges.Num() > MaxRanges)
 		{
 			TArray<uint32> Sorted;
@@ -658,7 +754,8 @@ private:
 				const uint32 Gap = CulledRanges[I].First >= LastEnd ? CulledRanges[I].First - LastEnd : 0u;
 				if (Gap <= GapThreshold)
 				{
-					Last.Count = (CulledRanges[I].First + CulledRanges[I].Count) - Last.First;
+					const uint32 NewEnd = FMath::Max(LastEnd, CulledRanges[I].First + CulledRanges[I].Count);
+					Last.Count = NewEnd - Last.First;
 				}
 				else
 				{
@@ -704,11 +801,14 @@ private:
 		if (CullLogCounter.Increment() % 600 == 1)
 		{
 			UE_LOG(LogTemp, Log,
-			       TEXT("%s cull: runs=%d runQuads=%u/%d visibleQuads=%u (%.1f%%) ranges=%d drawnQuads=%u "
-			            "| skipped empty=%d badId=%d aboveHWM=%d hidden=%d frustum=%d | shadowGather=%d"),
+			       TEXT("%s cull: runs=%d runQuads=%u/%d visibleQuads=%u (%.1f%%) ranges=%d drawnQuads=%u (%.1f%%) "
+			            "| mergeGap=%u maxRanges=%d | skipped empty=%d badId=%d aboveHWM=%d hidden=%d frustum=%d "
+			            "| shadowGather=%d"),
 			       *PoolName, Runs.Num(), RunQuads, NumQuads, VisibleQuads,
 			       NumQuads > 0 ? 100.0 * double(VisibleQuads) / double(NumQuads) : 0.0,
 			       CulledRanges.Num(), DrawnQuads,
+			       NumQuads > 0 ? 100.0 * double(DrawnQuads) / double(NumQuads) : 0.0,
+			       MergeGap, MaxRanges,
 			       SkippedEmpty, SkippedBadId, SkippedAboveWatermark, SkippedHidden, SkippedFrustum,
 			       bShadowGather ? 1 : 0);
 		}
