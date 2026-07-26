@@ -7132,3 +7132,81 @@ argument for ADR-0006 and which tonight did not re-measure.
 
 Full write-up and the proposed replacement protocol in
 `docs/streaming-handoff.md`, "CORRECTION: the G5 frame-time numbers were noise".
+
+## erosion-v7 is PARKED, and why it cannot simply be rebased (2026-07-25)
+
+`origin/claude/erosion-v7` carries ~340 lines of dendritic drainage carving
+that are still wanted. It is parked, by Matt's decision, and this records the
+reason so the next person does not spend a session rediscovering it.
+
+**It is not the version collision.** The branch claims `kWorldGenVersion` 7 and
+`main` is now 8, and its region-fitted precip retune (20/24/30) is superseded by
+v8's physically-derived thresholds. Both are trivial to resolve: drop the biome
+change, keep the drainage, re-pin.
+
+**It is that the branch's central design assumption expired the same day.** The
+drainage carve is CPU-only: `worldgen.ush` keeps it compile-time off
+(`kDrainageEnabled = false`) because the flow-accumulation precompute is a
+reduction over a ~64x64 lattice window that the per-column dispatch cannot
+afford and does not bind a raster window wide enough for. A faithful GPU port
+needs a separate compute pass in `gpu_harness`/RDG. The branch handles this
+honestly — an `Amplifier` ctor flag, defaulting ON, with the cross-vendor gate
+comparing the drainage-OFF surface — and its own comment calls this "the
+sanctioned 'land CPU-side behind a switch and say so' path".
+
+That was sound on 2026-07-23. It stopped being sound on 2026-07-25, when
+**PR #104 landed `voxel.Stream.GPU` on by default**. Under ADR-0006, display
+geometry is GPU-generated while collision, raycast and digging stay on the CPU
+authority path. So with drainage on:
+
+* the GPU renders the surface **without** the carve,
+* the CPU authority has the valley,
+* and `kDrainMaxCarveMm = 5600` — up to **5.6 m, i.e. 56 voxels** — of
+  solid-looking ground you fall straight through.
+
+ADR-0006's invariant 3 permits display/authority divergence for cross-vendor
+bit-exactness, which is a rounding-scale allowance. It does not sanction a
+systematic multi-metre geometric difference.
+`docs/terrain-amplification-reconciliation.md` had already called this exact
+case: *"There is no way to make it display-only — falling through visibly solid
+ground is not an option in a digging game."*
+
+**What unblocks it**, in preference order:
+
+1. Land the drainage with the ctor flag defaulting **OFF**. Default worldgen
+   output then equals `main` byte-for-byte, so no golden moves and no
+   `kWorldGenVersion` bump is needed at all — the cheapest possible way to bank
+   the code and its tests. Turning it on stays a separate, scoped decision.
+2. Port flow accumulation to a GPU compute pass so both sides carve. This is the
+   real fix and it is a substantial job in files the G-track is actively working
+   in; it pairs naturally with the already-backlogged widening of the GPU
+   harness to accept an `ITileSampler&`.
+
+Do NOT rebase-and-land it as-is while `voxel.Stream.GPU` defaults on.
+
+## Continents are not a `frequency_mult` decision (2026-07-25)
+
+Measured, so the option can be closed rather than relitigated. Lowering
+`frequency_mult[0]` from 1.5 to 0.4 does enlarge landmasses (inland reach
+123 -> 192 km, largest landmass 197k -> 315k km2). But the interiors are not
+habitable: profiling elevation against distance from the coast in that world,
+
+| km inland | mean elevation | mean temp | above treeline |
+|---|---|---|---|
+| 0-25 | 462 m | 8.6 C | 8.8% |
+| 25-50 | 1159 m | 4.5 C | 39.0% |
+| 50-100 | 1596 m | 3.7 C | 47.4% |
+| 100-200 | **2240 m** | **0.7 C** | **66.2%** |
+
+Elevation climbs monotonically inland, so two thirds of deep-interior land sits
+above the treeline, and precipitation barely moves (921 -> 809 mm/yr) because it
+is decoupled from terrain. The model learned Earth's hypsometry, where large
+landmasses have high interiors — Tibet, the Altiplano — and the lapse rate does
+the rest. A 30 m render 184 km inland came back 2889-5899 m at -8.7 C: superb
+alpine terrain, and nowhere to put a settlement.
+
+So `frequency_mult` buys **alpine plateau, not continental interior**, and it is
+the third lever measured and rejected for this goal after seed selection and sea
+level. The route that does work is `tools/make_conditioning.py`, where elevation
+and precipitation are authored independently and a low dry interior is simply a
+spec. Recommend leaving `frequency_mult` at its default.
