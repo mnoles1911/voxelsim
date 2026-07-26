@@ -120,10 +120,12 @@ public:
 	                        const TArray<FVector4f>& InParams,
 	                        const TArray<UVoxelGpuPoolComponent::FChunkRun>& InRuns,
 	                        const FString& InPoolName,
-	                        int32 InChunkTableCapacity)
+	                        int32 InChunkTableCapacity,
+	                        FVoxelGpuPoolBuffersRef InSharedBuffers)
 		: FPrimitiveSceneProxy(Component)
 		, VertexFactory(GetScene().GetFeatureLevel())
 		, PoolName(InPoolName)
+		, SharedBuffers(MoveTemp(InSharedBuffers))
 		, Quads(InQuads)
 		, ChunkIds(InChunkIds)
 		, Origins(InOrigins)
@@ -173,19 +175,61 @@ public:
 		// first (:667, :697) -- so everything outside the range just written
 		// becomes uninitialised garbage. Marking these Dynamic silently corrupted
 		// the chunk table and put every partial write at quad 0.
-		QuadBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
-			RHICmdList, TEXT("VoxelGpuPool.Quads"),
-			EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
-			MakeConstArrayView(Quads));
-		QuadBufferSRV = RHICmdList.CreateShaderResourceView(
-			QuadBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(QuadBuffer));
+		// --- the persistent half (Wave D / D1) ----------------------------
+		//
+		// UPLOADED ON FIRST CREATION ONLY. This one branch is what removes the
+		// CPU-shadow clobber: every later proxy rebinds buffers that already
+		// hold the live geometry instead of overwriting them with whatever the
+		// CPU shadow happens to contain. Once the GPU writes quads directly,
+		// re-uploading here would silently revert them.
+		check(SharedBuffers.IsValid());
+		if (!SharedBuffers->IsValid() || SharedBuffers->CapacityQuads < Quads.Num())
+		{
+			// First proxy, or the pool outgrew the allocation. The latter means
+			// the GPU-resident contents are genuinely gone, so re-uploading from
+			// the CPU shadow is the correct and only thing to do.
+			SharedBuffers->QuadBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
+				RHICmdList, TEXT("VoxelGpuPool.Quads"),
+				EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource
+					| EBufferUsageFlags::UnorderedAccess | EBufferUsageFlags::StructuredBuffer,
+				MakeConstArrayView(Quads));
+			SharedBuffers->QuadSRV = RHICmdList.CreateShaderResourceView(
+				SharedBuffers->QuadBuffer,
+				FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(SharedBuffers->QuadBuffer));
+			SharedBuffers->QuadUAV = RHICmdList.CreateUnorderedAccessView(
+				SharedBuffers->QuadBuffer,
+				FRHIViewDesc::CreateBufferUAV().SetTypeFromBuffer(SharedBuffers->QuadBuffer));
 
-		ChunkIdBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
-			RHICmdList, TEXT("VoxelGpuPool.ChunkIds"),
-			EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
-			MakeConstArrayView(ChunkIds));
-		ChunkIdSRV = RHICmdList.CreateShaderResourceView(
-			ChunkIdBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(ChunkIdBuffer));
+			SharedBuffers->ChunkIdBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
+				RHICmdList, TEXT("VoxelGpuPool.ChunkIds"),
+				EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource
+					| EBufferUsageFlags::UnorderedAccess | EBufferUsageFlags::StructuredBuffer,
+				MakeConstArrayView(ChunkIds));
+			SharedBuffers->ChunkIdSRV = RHICmdList.CreateShaderResourceView(
+				SharedBuffers->ChunkIdBuffer,
+				FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(SharedBuffers->ChunkIdBuffer));
+			SharedBuffers->ChunkIdUAV = RHICmdList.CreateUnorderedAccessView(
+				SharedBuffers->ChunkIdBuffer,
+				FRHIViewDesc::CreateBufferUAV().SetTypeFromBuffer(SharedBuffers->ChunkIdBuffer));
+
+			SharedBuffers->CapacityQuads = Quads.Num();
+
+			UE_LOG(LogTemp, Log, TEXT("%s: created persistent pool buffers, capacity %d quads"),
+			       *PoolName, SharedBuffers->CapacityQuads);
+		}
+		else
+		{
+			// The line that makes the clobber impossible rather than unlikely.
+			UE_LOG(LogTemp, Log,
+			       TEXT("%s: REBOUND persistent pool buffers (capacity %d quads) — no re-upload, "
+			            "GPU-written quads preserved across proxy recreation"),
+			       *PoolName, SharedBuffers->CapacityQuads);
+		}
+
+		QuadBuffer = SharedBuffers->QuadBuffer;
+		QuadBufferSRV = SharedBuffers->QuadSRV;
+		ChunkIdBuffer = SharedBuffers->ChunkIdBuffer;
+		ChunkIdSRV = SharedBuffers->ChunkIdSRV;
 
 		TArray<FVector4f> PaddedOrigins = Origins;
 		PaddedOrigins.SetNumZeroed(MaxChunks);
@@ -505,6 +549,11 @@ private:
 	// Which pool this is, for the log lines below. There is more than one
 	// instance now and they are diagnosed almost entirely from those lines.
 	FString PoolName;
+
+	// The component's buffers, not the proxy's. Held by shared pointer so this
+	// proxy dying does not take the GPU-resident geometry with it — see
+	// FVoxelGpuPoolBuffers for why that matters.
+	FVoxelGpuPoolBuffersRef SharedBuffers;
 
 	TArray<uint64> Quads;
 	TArray<uint32> ChunkIds;
@@ -1239,6 +1288,128 @@ void UVoxelGpuPoolComponent::GetUsedMaterials(TArray<UMaterialInterface*>& OutMa
 	OutMaterials.Add(GetChunkMaterialOrDefault());
 }
 
+// ---------------------------------------------------------------------------
+// voxel.Stream.PoolClobberTest — the experiment that can actually fail
+//
+// The clobber this wave fixes is invisible in the happy path: with no GPU
+// writer yet, the CPU shadow and the GPU buffer hold identical bytes, so a
+// re-upload and a rebind are indistinguishable. A test that merely forces
+// proxy recreation and observes "nothing broke" proves nothing at all.
+//
+// So this makes them distinguishable the only honest way: it DELIBERATELY
+// CORRUPTS the CPU shadow, then forces recreation.
+//
+//   old behaviour (re-upload) -> the corruption reaches the GPU, and the
+//                                terrain visibly loses the clobbered quads
+//   new behaviour (rebind)    -> the buffer is never rewritten, the corruption
+//                                stays on the CPU, and the terrain is unchanged
+//
+// This is the pool's equivalent of GPUCullDebugSplit: the two hypotheses
+// predict visibly different pictures, so the run can come back either way.
+//
+// DESTRUCTIVE AND DEBUG-ONLY. It leaves the CPU shadow wrong on purpose, so the
+// session it runs in is spent — any later edit to a clobbered chunk will write
+// from the corrupted shadow. Never leave this in a measurement run.
+static void VoxelGpuPoolClobberTest(const TArray<FString>& Args)
+{
+	const int32 NumToClobber = (Args.Num() > 0) ? FMath::Max(1, FCString::Atoi(*Args[0])) : 200000;
+
+	int32 Found = 0;
+	for (TObjectIterator<UVoxelGpuPoolComponent> It; It; ++It)
+	{
+		UVoxelGpuPoolComponent* Comp = *It;
+		if (Comp == nullptr || Comp->IsTemplate() || !IsValid(Comp))
+		{
+			continue;
+		}
+		++Found;
+		Comp->DebugClobberShadowAndRecreate(NumToClobber);
+	}
+
+	if (Found == 0)
+	{
+		UE_LOG(LogTemp, Error,
+		       TEXT("voxel.Stream.PoolClobberTest: no live pool component — nothing to test. ")
+		       TEXT("Run this after the world has streamed, with voxel.Stream.GPU on."));
+	}
+}
+
+static FAutoConsoleCommand GVoxelGpuPoolClobberTestCmd(
+	TEXT("voxel.Stream.PoolClobberTest"),
+	TEXT("DESTRUCTIVE DEBUG. Corrupts the first N quads of the CPU shadow, then forces proxy "
+	     "recreation. If the pool buffers are persistent (Wave D / D1) the terrain is UNCHANGED, "
+	     "because the corruption never reaches the GPU. If they are re-uploaded, the terrain "
+	     "visibly loses those quads. Usage: voxel.Stream.PoolClobberTest [N=200000]"),
+	FConsoleCommandWithArgsDelegate::CreateStatic(&VoxelGpuPoolClobberTest));
+
+void UVoxelGpuPoolComponent::DebugClobberShadowAndRecreate(int32 NumQuadsToClobber)
+{
+	const int32 Drawn = int32(Pool.GetHighWaterMark());
+	if (Drawn == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("%s clobber test: pool is empty, nothing to prove"), *PoolName);
+		return;
+	}
+
+	const int32 N = FMath::Min(NumQuadsToClobber, Drawn);
+
+	// Point them at the hidden chunk (scale 0), which is the pool's own
+	// "collapse to a point" encoding — so if this DOES reach the GPU the result
+	// is unambiguous missing geometry rather than random garbage that might be
+	// mistaken for a shader bug.
+	for (int32 I = 0; I < N; ++I)
+	{
+		QuadChunkIds[I] = kHiddenChunkId;
+		PooledQuads[I] = 0;
+	}
+
+	UE_LOG(LogTemp, Warning,
+	       TEXT("%s clobber test: corrupted the first %d of %d drawn quads in the CPU shadow, "
+	            "now forcing proxy recreation. EXPECT: terrain UNCHANGED (buffers rebound). "
+	            "A visible hole means the re-upload clobber is still live."),
+	       *PoolName, N, Drawn);
+
+	MarkRenderStateDirty();
+}
+
+// Lazily allocates the (empty) shared holder. The BUFFERS inside it are created
+// on the render thread by the first proxy that runs CreateRenderThreadResources;
+// this only guarantees there is somewhere for them to live that outlives any one
+// proxy.
+FVoxelGpuPoolBuffersRef UVoxelGpuPoolComponent::GetOrCreatePoolBuffers()
+{
+	if (!PoolBuffers.IsValid())
+	{
+		PoolBuffers = MakeShared<FVoxelGpuPoolBuffers, ESPMode::ThreadSafe>();
+	}
+	return PoolBuffers;
+}
+
+void UVoxelGpuPoolComponent::BeginDestroy()
+{
+	// Drop our reference ON THE RENDER THREAD.
+	//
+	// These are RHI resources whose views were handed to a vertex factory, and
+	// the render thread may still be a frame or two behind. Moving the last
+	// reference into a render command means the actual release happens in
+	// render-thread order behind everything that could still be reading them,
+	// rather than wherever the garbage collector happens to run. Getting this
+	// wrong does not fail as a compile error or even a visible glitch — it fails
+	// as a crash on exit, which is why it is explicit rather than left to the
+	// shared pointer's destructor.
+	if (PoolBuffers.IsValid())
+	{
+		ENQUEUE_RENDER_COMMAND(VoxelGpuPoolReleaseBuffers)(
+			[Buffers = MoveTemp(PoolBuffers)](FRHICommandListImmediate&) mutable
+		{
+			Buffers.Reset();
+		});
+		PoolBuffers.Reset();
+	}
+
+	Super::BeginDestroy();
+}
+
 FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 {
 	if (Pool.GetHighWaterMark() == 0)
@@ -1290,7 +1461,7 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 
 	FVoxelGpuPoolSceneProxy* Proxy =
 		new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, ChunkOrigins, ChunkParams, BuildChunkRuns(),
-		                            PoolName, ChunkTableCapacity);
+		                            PoolName, ChunkTableCapacity, GetOrCreatePoolBuffers());
 	LiveProxy = Proxy;
 	return Proxy;
 }
