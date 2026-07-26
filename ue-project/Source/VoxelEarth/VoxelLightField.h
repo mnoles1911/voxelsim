@@ -273,19 +273,40 @@ public:
 	// black flash on a chunk whose brick has streamed in but not yet solved.
 	bool SampleIrradiance(const FVector& WorldUU, const FVector3f& Normal, float& OutIrradiance) const;
 
-	// --- GPU volume encode (docs/gpu-gi-volume-design.md §2, Scheme B) ------
+	// --- GPU volume encode (docs/gpu-gi-volume-design.md §2, Scheme A) ------
 	//
-	// Bytes one brick produces for the GPU volume: 8x8x8 cells x RGBA8, laid
-	// out X-fastest then Y then Z, i.e. VoxelLF::CellIndex order.
+	// Bytes one brick produces PER VOLUME: 8x8x8 cells x RGBA8, laid out
+	// X-fastest then Y then Z, i.e. VoxelLF::CellIndex order. There are two
+	// volumes, so a brick costs 2 * BrickTexelBytes in total.
 	static constexpr int32 BrickTexelBytes = VoxelLF::BrickCells * 4;
 
-	// Encodes one brick's Vis + SolvedCells into RGBA8 texels:
+	// Encodes one brick's Vis + SolvedCells into TWO RGBA8 texel streams --
+	// Scheme A, the full ambient cube:
 	//
-	//   R = Vis[+Z] * v   G = Vis[-Z] * v   B = mean(Vis[+-X], Vis[+-Y]) * v   A = v
+	//   OutPos:  R = Vis[+X]*v  G = Vis[+Y]*v  B = Vis[+Z]*v  A = v
+	//   OutNeg:  R = Vis[-X]*v  G = Vis[-Y]*v  B = Vis[-Z]*v  A = v
 	//
 	// with v the per-cell validity (255 when SolvedCells is set, 0 otherwise).
-	// Exact for the +-Z face classes -- the ones where directionality visually
-	// dominates -- and the horizontal mean for the other four.
+	// EXACT for every face direction.
+	//
+	// WHY THIS AND NOT SCHEME B, which stored one texture with the four
+	// horizontals collapsed to their mean. Measured, not argued: the design
+	// doc's bar is an RMS under 8/255 and Scheme B's RMS is 20.4-21.1 -- it
+	// misses the stated bar by 2.6x, and the figures that appeared to pass it
+	// (5.950, 6.165) were a mean-abs compared against an RMS threshold. The error
+	// is bimodal: near zero wherever the four horizontal directions agree, and up
+	// to 105/255 wherever they disagree, which is a side face beside a vertical
+	// occluder -- most of a cave wall, i.e. the exact geometry this feature
+	// exists for.
+	//
+	// The cost objection to Scheme A turned out to be false. §2 lists it as "two
+	// samples", but §2 also establishes that every greedy-mesh normal is
+	// axis-aligned and therefore selects exactly one ambient-cube slot: a face
+	// reads ONE of the two volumes, chosen by the sign of its normal, and takes
+	// ONE component of it. Two samples is the cost for a general normal, which
+	// this mesh never produces. Scheme A costs memory and nothing else -- and at
+	// VolumeDim 192 it costs less of it (56.6 MB) than Scheme B did at the size
+	// the design recommended (67.1 MB at 256).
 	//
 	// PREMULTIPLYING BY VALIDITY IS THE LOAD-BEARING PART, not a compression
 	// trick. Storing Vis*v and v separately and dividing in the shader makes
@@ -297,12 +318,12 @@ public:
 	// which the shader turns into plain AO, matching this class's `return
 	// false` path -- so zeroing a brick's texels is "no data", never "black".
 	//
-	// Returns false and ZEROES OutRGBA when the brick is absent or has not been
-	// solved since its last re-voxelize. Callers want that: a dug tunnel that
-	// kept its pre-dig texels would stay lit until the solve landed.
-	// OutRGBA must have room for BrickTexelBytes. Takes the read lock; the
+	// Returns false and ZEROES both outputs when the brick is absent or has not
+	// been solved since its last re-voxelize. Callers want that: a dug tunnel
+	// that kept its pre-dig texels would stay lit until the solve landed.
+	// Each output must have room for BrickTexelBytes. Takes the read lock; the
 	// FReadScope form below is the one to use when encoding several bricks.
-	bool EncodeBrickTexels(const FIntVector& Key, uint8* OutRGBA) const;
+	bool EncodeBrickTexels(const FIntVector& Key, uint8* OutPos, uint8* OutNeg) const;
 
 	// Batched form of the above. A scene proxy shades thousands of vertices in
 	// one construction; taking the read lock per vertex would cost more atomics
@@ -328,9 +349,9 @@ public:
 		// See FVoxelLightField::EncodeBrickTexels. The GPU volume driver encodes
 		// a whole frame's dirty bricks under one scope, for the same reason the
 		// proxy shades a whole chunk under one: the lock is the expensive part.
-		bool EncodeBrick(const FIntVector& Key, uint8* OutRGBA) const
+		bool EncodeBrick(const FIntVector& Key, uint8* OutPos, uint8* OutNeg) const
 		{
-			return Field.EncodeBrickTexelsUnlocked(Key, OutRGBA);
+			return Field.EncodeBrickTexelsUnlocked(Key, OutPos, OutNeg);
 		}
 
 		// Raw brick access for diagnostics that need SolvedCells directly (the
@@ -366,7 +387,7 @@ public:
 
 private:
 	bool SampleIrradianceUnlocked(const FVector& WorldUU, const FVector3f& Normal, float& OutIrradiance) const;
-	bool EncodeBrickTexelsUnlocked(const FIntVector& Key, uint8* OutRGBA) const;
+	bool EncodeBrickTexelsUnlocked(const FIntVector& Key, uint8* OutPos, uint8* OutNeg) const;
 	bool SampleIrradianceAtProbe(const FVector& P, const float (&DirWeight)[VoxelLF::NumDirs],
 	                             float InvDirWeightSum, float& OutIrradiance) const;
 

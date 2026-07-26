@@ -60,7 +60,7 @@ frustum, with the pool unmoved at 18.58 → 19.05 ms while the component path go
 
 ---
 
-## Wave B — Voxel GI as a GPU volume (steps 3–5)
+## Wave B — Voxel GI as a GPU volume (steps 3–5) — **LANDED 2026-07-26 (PR #131), and GI did NOT ship on**
 
 **The point is not throughput.** Today GI is baked into vertex colours at mesh
 time, so a dig re-shades a chunk partly just to refresh its lighting. Sampling a
@@ -95,6 +95,53 @@ by construction only.
 **Verdict: worth doing, and the most clearly valuable GPU work left.** It stands
 regardless of where meshing runs, and it improves something a player sees (cave
 lighting responding to digging).
+
+> **LANDED 2026-07-26 (PR #131). The owner asked for GI on by default; the
+> measurement said no, and B7's own escape clause was used as written.** Both
+> `voxel.GI.Enabled` and `voxel.GI.Volume` remain **0** on main
+> (`VoxelGI.cpp:36`, `VoxelGIVolume.cpp:15`). `-VoxelGIOn` is the opt-in.
+>
+> Component path, pinned pose, one binary, command line verified against
+> `LogInit` on every leg:
+>
+> | | p50 | p95 | max | hitches |
+> |---|---|---|---|---|
+> | GI off (3 legs) | 23.25 | 27.41 | 40.9 | 23.3 |
+> | GI on (2 legs) | 23.37 | 31.39 | 49.0 | 74.0 |
+> | delta | +0.6% | **+14.9%** | +19% | **×3.2** |
+>
+> p50 is inside the noise; p95 and hitch count do not overlap. **GI is free at the
+> median and expensive in the tail**, and a 3.2× hitch count is what a player
+> actually feels. This independently reproduces the shape already on record for
+> this module from the `voxel.GI.LegacyProxyRebuild` A/B — "mostly a TAIL and
+> throughput problem, not a median one". Two unrelated experiments agreeing on the
+> shape is worth more than either alone.
+>
+> A **third** off leg exists because the pre-registered 0.5% rule rejected the
+> first pair at 1.97%. A rule that only ever confirms is not a rule.
+>
+> **What would change the answer:** `voxel.GI.MaxChunkRefreshesPerFrame`
+> (default 4) bounds the re-shade drain the tail comes from. The sweep is owed,
+> judged on hitches and p95 rather than p50, and it must also report the
+> edit-to-relight latency it buys back — so the choice is between two named
+> things rather than one number.
+>
+> Also landed: **B1 chose Scheme A, not Scheme B** — the measurement contradicted
+> the plan's expected outcome and the plan was wrong, not the measurement. B2's
+> re-centring ships **disabled twice over** (`voxel.GI.Volume 0`, and its only
+> consumer `voxel.Stream.GPU 0`), with the transient stated exactly as measured:
+> bounded to 8 frames, camera's row last, nearest stale row 3.3 m away — and
+> explicitly **not** as "confined to the far field", because peak stale texels hit
+> 95.4% and that is not a far-field number. Ordering controls **where** staleness
+> is, not **how much**.
+>
+> **Still owed and recorded as unverified rather than quietly dropped:** B5's
+> dig-shaped test, the Dim 256 coverage run, and B-M's underground control. B-M is
+> confirmed-but-open: the surface fixture pins Z while terrain drops away, so the
+> camera flew out of GI range for most of the circle (`camAboveSurface` 62–128 m
+> against a 70 m radius) — but bricks stayed 0 even at the 62 m minimum, where a
+> ~32 m disc of terrain sits inside the sphere. The fixture explains most and not
+> provably all of it.
 
 ---
 
@@ -247,7 +294,15 @@ down pose, and that residual is a *rendering* problem with a *rendering* fix
 
 ---
 
-## Wave E — Remaining G4 parity items
+## Wave E — Remaining G4 parity items — **PARTIALLY LANDED 2026-07-26 (PRs #125, #129)**
+
+> **Read the per-item status before picking this up; "Wave E landed" is false as a
+> whole sentence.** E1 is **designed and corrected but NOT built** — the material
+> asset was never edited, and `manual-verification-checklist.md` item 7 is still
+> written as "when they land". E2's *feature* landed but **its parity number did
+> not**, and that number is the entire verdict. E3 is **closed as do-not-build**.
+> What PRs #125 and #129 actually delivered was the measurement that inverted E1's
+> safety argument, plus the water pool's shipped-but-unmeasured state.
 
 **E1 — Per-chunk debug tints.** The last G4 item, and the **only** one that still
 needs `M_VoxelTerrain.uasset` edited. Storage is solved (`ChunkParams.w` is free);
@@ -299,10 +354,27 @@ porting a defect.
 
 ## Wave F — Adjacent streaming items
 
-**R0 to 128 m** — now unblocked (`RingPresets` became a runtime accessor,
-overridable via `-VoxelRingInnerMeters=` / `-VoxelRingOuterMeters=`). Moving it is
-still an open call, and the `+9.2%` resident-chunk cost of the seam-padding fix is
-what to weigh it against. *This is also the decision that would revive Wave D.*
+> **NAMING COLLISION — this is not the same "Wave F" as the execution plan's.**
+> `docs/gpu-waves-plan.md` uses **Wave F** to mean *one* thing: **R0 = 128 m**,
+> decided and in progress. This section uses it as a grab-bag of adjacent
+> streaming items, only the first of which is that. When a session says "Wave F",
+> it means the plan's. The other two items below have **no owner and are not part
+> of the A–F programme**; they are parked here because this is where they were
+> found.
+
+**R0 to 128 m — DECIDED, NOT AN OPEN CALL.** The text below said "moving it is
+still an open call". **That is wrong and has been wrong since `gpu-g0-sizing.md`
+recorded the owner's decision** (2026-07-24: *"target R0 = 128 m"*), which the
+founding request for this programme then reaffirmed. The dependency also runs the
+opposite way from what was written here: R0 = 128 m is not the decision that
+*revives* Wave D — Wave D is the work that makes R0 = 128 m **affordable**, which
+is why the plan runs A→F in order and moves R0 **last**. Moving it first would
+quadruple the near field on a CPU path that already cannot keep up.
+
+Now unblocked mechanically (`RingPresets` became a runtime accessor, overridable
+via `-VoxelRingInnerMeters=` / `-VoxelRingOuterMeters=`), so **no code change is
+needed to prototype it**. The `+9.2%` resident-chunk cost of the seam-padding fix
+is still a real input to sizing the pool, just not to the go/no-go.
 
 **`voxel.Stream.AdmissionBandSkip` — off, and should stay off.** It reaches ~4% of
 the waste it was aimed at (89 skips against 2,186), its edit veto differs from the
@@ -318,11 +390,26 @@ moving.
 
 ---
 
-## Suggested order
+## Suggested order — **SUPERSEDED 2026-07-26. Do not plan from this list.**
 
-1. **C1** — the determinism gate is red; that is the project's core invariant.
-2. **The ring gaps** — the actual reported symptom, still unexplained.
-3. **Wave A** — makes the pooled renderer a win instead of a regression.
-4. **Wave B** — the clearest remaining value, and player-visible.
-5. **E1/E2** — small, low priority.
-6. **Wave D** — only if R0 = 128 m goes ahead.
+The order below was written before the A–F programme existed and is now wrong in
+both its sequencing and its facts. **`docs/gpu-waves-plan.md` is the live plan**;
+this list is kept only so a reader who remembers it can see it was retired
+deliberately rather than silently dropped.
+
+Where it is wrong: item 1 (C1) is **green and landed**. Item 3 (Wave A) is
+**landed**. Item 4 (Wave B) is **landed**, with GI deliberately shipped **off**.
+Item 6 gets the dependency backwards — Wave D is not conditional on R0 = 128 m
+going ahead; it is what **makes** R0 = 128 m affordable, and R0 = 128 m was
+already decided. Only item 2 (the ring gaps) survives unchanged, and it is
+explicitly **out of scope** for this programme: the owner is investigating it
+manually via `manual-verification-checklist.md` item 1, because it is a
+movement-induced symptom and every capture the harness can take is of a settled,
+stationary scene.
+
+~~1. **C1** — the determinism gate is red; that is the project's core invariant.~~
+~~2. **The ring gaps** — the actual reported symptom, still unexplained.~~
+~~3. **Wave A** — makes the pooled renderer a win instead of a regression.~~
+~~4. **Wave B** — the clearest remaining value, and player-visible.~~
+~~5. **E1/E2** — small, low priority.~~
+~~6. **Wave D** — only if R0 = 128 m goes ahead.~~

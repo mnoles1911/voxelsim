@@ -8,6 +8,11 @@
 // pulls in no voxel-core headers, so the "UHT-parsed headers stay voxel-core-free"
 // doctrine still holds.
 #include "VoxelLightField.h"
+// FVoxelGIVolumeSettings by value below. VoxelEarth already depends on
+// VoxelEarthShaders (never the reverse), and this header is UE-only -- it pulls
+// in no voxel-core headers, so the "UHT-parsed headers stay voxel-core-free"
+// doctrine still holds.
+#include "VoxelGIVolume.h"
 #include "VoxelGI.generated.h"
 
 class UVoxelChunkComponent;
@@ -88,6 +93,20 @@ public:
 	void NotifyPooledChunkMeshUpdated(const FVector& ChunkOriginUU, int32 ChunkLevel,
 	                                  TArray<FVoxelChunkQuad>&& Quads);
 
+	// voxel.GI.VolumeDigTest. Public because the console command reaches it
+	// through the subsystem; see StepDigTest for what it measures and why.
+	void StartDigTest(double RadiusUU);
+
+	// voxel.GI.VolumeRecentreTest. Forces a staged re-centre of N bricks on the
+	// currently resident field; see the definition for why the scripted flight
+	// cannot verify re-centring on its own.
+	void ForceVolumeRecentre(int32 ShiftBricks);
+
+	// voxel.GI.RelightTest. Carves through the real edit path and times until the
+	// dig is FULLY relit -- both the solve queue and the re-shade queue drained.
+	// This is the cost side of lowering voxel.GI.MaxChunkRefreshesPerFrame.
+	void StartRelightTest(double RadiusUU);
+
 	// Read access for the scene proxy. Never null once Initialize has run.
 	const FVoxelLightField& GetField() const { return *Field; }
 
@@ -103,16 +122,45 @@ private:
 	void PushDirty(const FIntVector& Key);
 	FVector ResolveViewOriginUU() const;
 
-	// --- GPU volume driver (docs/gpu-gi-volume-design.md §3) ----------------
+	// --- GPU volume driver (docs/gpu-gi-volume-design.md §3, §4) ------------
 	void PushVolumeUpload(const FIntVector& Key);
-	// Establishes the volume origin (once) from the field centre, brick-snapped,
-	// and expressed in POOL-PRIMITIVE space. False until the pool exists.
+	// Establishes the volume origin from the field centre, brick-snapped, and
+	// expressed in POOL-PRIMITIVE space. False until the pool exists.
 	bool EnsureVolumeOrigin();
 	// Encodes and uploads at most Budget bricks (Budget < 0 = the whole queue).
 	// Returns the number of bricks encoded. Game thread; reads the field under
 	// one FReadScope and hands the staged bytes to the render thread.
 	int32 DrainVolumeUploads(int32 Budget);
 	void RunVolumeCheck(int32 NumSamples);
+
+	// The whole per-frame volume driver: allocate, re-centre, upload, and
+	// re-publish the uniform buffer when any of its inputs moved. Called from
+	// Tick. This is also the answer to voxel.GI.Volume's "read per frame" claim,
+	// which before Wave B was false -- UpdateParameters_RenderThread had three
+	// callers and none of them ran per frame, so Enabled/DebugVis were latched.
+	void TickVolume();
+	// True when the camera has left the dead zone around the volume centre.
+	bool VolumeNeedsRecentre() const;
+	// Starts a staged re-centre: recomputes the brick-snapped origin, and
+	// schedules the whole texture to be re-encoded and re-uploaded a few
+	// brick-rows at a time. Does NOT move the origin uniform -- see StepRecentre.
+	void BeginVolumeRecentre();
+	// Advances a staged re-centre by one frame's worth of brick-rows. Commits the
+	// new origin (one ENQUEUE_RENDER_COMMAND, one frame) when the last row lands.
+	void StepVolumeRecentre();
+	// Zeroes, re-encodes from the field, and uploads texel Z rows [Z0, Z1) of the
+	// volume, addressed by the STAGING origin. Game thread, one FReadScope.
+	void RestageVolumeZRange(int32 Z0, int32 Z1);
+	// Runs any in-flight re-centre to completion and drains the whole upload
+	// queue, so VolumeShadow and the GPU texture agree and both are addressed by
+	// the committed origin. The equivalence harness needs that; nothing else does.
+	void FlushVolume();
+	// Rebuilds FVoxelGIVolumeSettings from the cvars and the committed origin,
+	// and re-publishes only if something actually changed.
+	void PushVolumeParamsIfChanged();
+	// Drives voxel.GI.VolumeDigTest's phases from the tick.
+	void StepDigTest();
+	void StepRelightTest();
 
 	TUniquePtr<FVoxelLightField> Field;
 
@@ -179,21 +227,37 @@ private:
 	TArray<FIntVector> VolumeUploadQueue;
 	TSet<FIntVector> VolumeUploadSet;
 
-	// CPU mirror of exactly the bytes staged to the volume, Dim^3 * 4. This is
+	// CPU mirror of exactly the bytes staged to the volume, Dim^3 * 4 PER
+	// VOLUME -- Scheme A has two, split by the sign of the face normal. This is
 	// what voxel.GI.VolumeCheck compares the field against -- "what would the
 	// shader return" has to be answered from the bytes that were actually
 	// uploaded, not from a re-encode, or the harness cannot catch an addressing
 	// or run-merging bug. 1 MB at the default Dim=64, 67 MB at 256.
-	TArray<uint8> VolumeShadow;
+	TArray<uint8> VolumeShadow;    // (+X,+Y,+Z,v)
+	TArray<uint8> VolumeShadowNeg; // (-X,-Y,-Z,v)
 
 	// World UU of texel (0,0,0)'s CELL ORIGIN (not its centre), snapped to a
 	// whole 320 UU brick so the texel lattice coincides with the field's cell
 	// lattice and no sample ever resamples. Texel i is world
 	// VolumeOriginWorldUU + (i+0.5)*40, which is what the CPU sampler's
 	// P/40 - 0.5 convention expects with no half-texel fixup.
+	//
+	// This is the STAGING origin: the one VolumeShadow is addressed in, and the
+	// one texels are encoded against. While a re-centre is in flight it runs
+	// AHEAD of the origin the shader is using (CommittedOriginPoolUU below);
+	// outside a re-centre the two agree. Keeping them separate is what makes
+	// "swap the origin uniform on exactly the frame the last upload lands"
+	// expressible at all.
 	FVector VolumeOriginWorldUU = FVector::ZeroVector;
 	// Same origin in units of cells, so brick key -> texel base is integer.
 	FIntVector VolumeCellOrigin = FIntVector::ZeroValue;
+	// The origin the GPU uniform buffer currently holds, in pool space. Moves
+	// exactly once per re-centre, on the frame the staged upload finishes.
+	FVector3f CommittedOriginPoolUU = FVector3f::ZeroVector;
+	// Pool component world location, cached at EnsureVolumeOrigin. The pool's
+	// rebase does not move for the life of a session; re-reading it per frame
+	// would be a TObjectIterator scan per frame for a constant.
+	FVector PoolWorldUU = FVector::ZeroVector;
 	int32 VolumeDim = 0;
 	bool bVolumeOriginSet = false;
 	int32 VolumeBricksUploaded = 0;
@@ -201,6 +265,79 @@ private:
 	double FirstVolumeUploadSeconds = 0.0;
 	bool bVolumeCheckDone = false;
 	bool bLoggedNoPool = false;
+	bool bVolumeAllocated = false;
+	// Bricks the volume driver pushed this frame, for the voxel.GI.Debug 1 line.
+	int32 VolumeUploadedThisFrame = 0;
+
+	// voxel.GI.VolumeDigTest state. Phase 0 = idle, 1 = waiting for the dig's
+	// remeshes to be ingested, 2 = waiting for the re-solve.
+	int32 DigTestPhase = 0;
+	double DigTestPhaseSeconds = 0.0;
+	TArray<FIntVector> DigTestBricks;
+
+	// -VoxelGIRelightAfter=<seconds>. Command line rather than -ExecCmds for the
+	// same reason -VoxelGIVis is: ExecCmds lands before the field has streamed in,
+	// and a relight test on an empty field measures nothing. Fires once.
+	float RelightAfterSeconds = 0.f;
+	bool bRelightArmed = false;
+
+	// voxel.GI.RelightTest state.
+	bool bRelightTestActive = false;
+	double RelightTestStartSeconds = 0.0;
+	int32 RelightTestPeakDirty = 0;
+	int32 RelightTestPeakRefresh = 0;
+	TArray<FIntVector> RelightTestBricks;
+	// See StepRelightTest: an edit does not dirty bricks synchronously, so the
+	// drain wait must not begin until work has actually arrived.
+	bool bRelightWorkSeen = false;
+
+	// Chunks the voxelize drain skipped because they were further than
+	// voxel.GI.RadiusUU from the view origin, accumulated between debug lines.
+	//
+	// THE FIELD THAT DECIDES FINDING B-M. "The light field is empty under motion"
+	// has two very different causes with the same symptom: chunks never arriving
+	// (an ingest or streaming problem) or chunks arriving and being REJECTED for
+	// range (the camera is simply too far above the terrain). One counter tells
+	// those apart, and it is cheaper than either of the runs that were planned to
+	// do the same job.
+	int32 VoxRejectedRadius = 0;
+
+	// --- staged re-centre (docs/gpu-gi-volume-design.md §4) -----------------
+	//
+	// Brick-row bounds still to be restaged, in BRICK rows (8 texels each). Each
+	// step takes from whichever END IS FURTHER FROM THE CAMERA'S OWN ROW, so the
+	// last row standing is always the camera's.
+	//
+	// That is the whole mitigation, and it is narrower than it first looks.
+	// Staging over ~8 frames means most of the volume is stale by the penultimate
+	// frame regardless -- measured at 69.3% of occupied texels -- so ordering
+	// cannot reduce HOW MUCH is wrong, only WHERE. What it buys is that the wrong
+	// region is the far field, which the distance fade is already attenuating,
+	// rather than the ground under the player. An earlier version took two rows
+	// off the low end and one off the high end, which drifted the meeting point
+	// off the camera and put a stale row under it for one frame
+	// (nearestStaleRowToCamera = 0 UU).
+	bool bVolumeRecentring = false;
+	int32 RecentreLoRow = 0;
+	int32 RecentreHiRow = 0;
+	int32 RecentreFrames = 0;
+	int32 RecentreCount = 0;
+	double RecentreStartSeconds = 0.0;
+	// Resident bricks bucketed by their brick-row under the STAGING origin, so
+	// restaging a row does not rescan the whole resident set. Built once per
+	// re-centre.
+	TArray<TArray<FIntVector>> RecentreRowBricks;
+	// voxel.GI.Debug >= 2 transient accounting, see RestageVolumeZRange.
+	int64 RecentreStepOccupied = 0;
+	int64 RecentreOccupiedBeforeLast = 0;
+	int64 RecentreTotalOccupied = 0;
+	double RecentreStepNearestUU = 0.0;
+	double RecentreNearestBeforeLastUU = 0.0;
+
+	// Last settings published to the render thread, so the per-frame refresh can
+	// skip the uniform-buffer rebuild when nothing moved.
+	FVoxelGIVolumeSettings LastVolumeSettings;
+	bool bVolumeSettingsValid = false;
 
 	FVector FieldCentreUU = FVector::ZeroVector;
 	bool bCoarseDirty = false;
