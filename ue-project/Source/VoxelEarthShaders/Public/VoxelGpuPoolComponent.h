@@ -162,6 +162,20 @@ public:
 	// still looks half empty.
 	int32 GetFreeRunCount() const { return Pool.GetFreeRunCount(); }
 
+	// Cumulative count of AddChunk/UpdateChunk calls that found no room, and the
+	// quads they wanted. NON-ZERO MEANS GEOMETRY IS MISSING FROM THE WORLD.
+	//
+	// This is a counter rather than only a log line because the failure is
+	// otherwise invisible in every aggregate: a chunk that fails to allocate is
+	// simply not added, so liveChunks, highWater and the resident quad count all
+	// stay self-consistently smaller and nothing looks wrong. A cascade that
+	// overflowed the pool and dropped a third of its chunks reads as a cheaper,
+	// faster run -- i.e. exactly like a success. Wave F moves R0 to 128 m against
+	// a pool already at ~93% of capacity, so this is the difference between a
+	// result and an artefact.
+	int64 GetAllocFailureCount() const { return AllocFailureCount; }
+	int64 GetAllocFailureQuads() const { return AllocFailureQuads; }
+
 	void SetChunkMaterial(UMaterialInterface* InMaterial);
 	UMaterialInterface* GetChunkMaterialOrDefault() const;
 
@@ -262,6 +276,12 @@ private:
 	// freeing the entry does not depend on the allocation still being non-empty.
 	TArray<uint32> AllocationChunkIds;
 	int32 NumLiveChunks = 0;
+
+	// See GetAllocFailureCount. Cumulative for the pool's lifetime; never reset
+	// by ClearChunks, because the question these answer is "did this RUN ever
+	// drop geometry", not "is it dropping geometry right now".
+	int64 AllocFailureCount = 0;
+	int64 AllocFailureQuads = 0;
 
 	// Ranges written since the last upload, in quads. Streaming touches a few
 	// chunks per frame out of thousands, so uploading the whole pool for each
