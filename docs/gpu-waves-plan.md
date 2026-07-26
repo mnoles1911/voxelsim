@@ -701,18 +701,48 @@ been measuring the one case where it works. It also means the B2 re-centring
 verification cannot be done on the scripted flight at all, which is how this was
 found.
 
-**Explicitly not root-caused.** Candidates not yet separated: the build-radius
-test in the voxelize drain (`Dist(Origin, FieldCentreUU) > voxel.GI.RadiusUU`)
-rejecting chunks whose camera moved on between enqueue and drain;
-`EvictFarBricks` at twice a second outrunning a 16-chunk-per-frame voxelize
-budget; or the ingest hook not firing for most pooled applies. These have very
-different fixes and the evidence so far does not choose between them.
+**Leading hypothesis, from reading the fixture rather than from a run: the
+surface perf flight leaves GI range, and this is a property of the HARNESS.**
 
-**The two cheap legs that would split it** (owed, not run): field brick count
-during the flight, and again ~5 s after coming to rest. Recovering on stop means
-a throughput/priority problem; not recovering means bricks are never requested —
-the same fork that splits the owner's ring-gap symptom in
-`docs/manual-verification-checklist.md` §1, which makes it interesting beyond GI.
+- `voxel.GI.RadiusUU` is **7000 UU (70 m)**, and the voxelize drain skips any
+  chunk with `Dist(OriginUU, FieldCentreUU) > BuildRadiusUU`.
+- `-VoxelPerfFlight=surface` computes `FixedHeightUU` **once**, from the surface
+  height at the circle *centre*, plus `HeightAboveSurfaceUU = 3000` (30 m), then
+  pins `NewLocation.Z = FixedHeightUU` for the entire **100 m-radius** circle
+  (`VoxelPerfRunSubsystem.cpp`, `CircleRadiusUU = 10000`).
+- The **underground** flight deliberately does not do this, and its own comment
+  says why: *"over a 100 m circle the surface can easily move more than 60 m, and
+  a fixed Z would surface partway round."*
+
+So the fixture states in its own source that terrain along the circle can move
+>60 m while the surface variant pins Z. Wherever the terrain drops more than
+~40 m below the spawn column, the camera is >7000 UU above it, **every** level-0
+chunk fails the range test, and the field empties — producing exactly the
+observed `pendingVox=0` / 0–12 bricks / `0 of 0 occupied` signature. Consistent
+with the logged flight camera Z of **84543 held constant** across all seven
+re-centres.
+
+**If this is right it is a finding about every measurement that fixture has ever
+produced**, not just this one — and it *removes* a caveat from B7 rather than
+adding one, because it would mean GI is absent in the harness rather than in the
+game.
+
+**Not yet distinguished from:** `EvictFarBricks` (up to 64 per half-second)
+outrunning the 16-chunk-per-frame voxelize budget, or the ingest hook not firing
+for most pooled applies.
+
+**Made decidable in one log line rather than two runs.** `voxel.GI.Debug 1` now
+prints `rejectedRadius=` (chunks skipped by the range test) beside
+`camAboveSurface=` and the radius itself. Chunks arriving and being rejected for
+range is the fixture hypothesis; chunks never arriving is a real ingest or
+streaming fault. The counter separates them without inference.
+
+**Legs still owed:** the **underground** flight as a control (it tracks the
+surface at a constant offset by construction, so bricks staying populated there
+while the surface flight collapses implicates the fixture), and brick count
+**~5 s after coming to rest** — which answers the question the owner actually
+cares about, and whose recover/does-not-recover fork is the same one that splits
+the ring-gap symptom in `docs/manual-verification-checklist.md` §1.
 
 **Deliberately not chased in this wave.** Recorded so it survives, and carried as
 a caveat on the B7 recommendation rather than fixed under it.

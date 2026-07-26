@@ -1829,6 +1829,7 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		const FVector OriginUU = Comp->GetComponentLocation();
 		if (FVector::Dist(OriginUU, FieldCentreUU) > BuildRadiusUU)
 		{
+			++VoxRejectedRadius;
 			continue; // outside the GI ring; nothing to build
 		}
 		if (Field->NumBricks() >= MaxBricks && !Field->HasBrick(FVoxelLightField::WorldToBrick(OriginUU)))
@@ -1864,6 +1865,7 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 
 		if (FVector::Dist(Pending.OriginUU, FieldCentreUU) > BuildRadiusUU)
 		{
+			++VoxRejectedRadius;
 			continue; // outside the GI ring; nothing to build
 		}
 		const FIntVector BrickCoord = FVoxelLightField::WorldToBrick(Pending.OriginUU);
@@ -2167,14 +2169,36 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 	if (VoxelGI::GetDebugLevel() > 0 && Now - LastStatSeconds > 1.0)
 	{
 		LastStatSeconds = Now;
+		// Height above the terrain directly under the view origin, logged beside
+		// the brick count because the two together settle finding B-M in one
+		// line: voxel.GI.RadiusUU is 7000 UU, so a camera more than that above
+		// the surface has NO level-0 chunk in range and the field empties out
+		// through the rejection counter rather than through a streaming fault.
+		// The -VoxelPerfFlight=surface fixture pins Z for a whole 100 m circle
+		// (VoxelPerfRunSubsystem.cpp: FixedHeightUU is computed once at the
+		// circle centre), and its own underground counterpart warns that the
+		// surface can move more than 60 m over that circle -- so this is a
+		// property of the HARNESS that any measurement taken with it inherits.
+		double CamAboveSurfaceUU = -1.0;
+		if (const UWorld* HeightWorld = GetWorld())
+		{
+			if (const UVoxelWorldSubsystem* Terrain = HeightWorld->GetSubsystem<UVoxelWorldSubsystem>())
+			{
+				CamAboveSurfaceUU = FieldCentreUU.Z - Terrain->GetSurfaceHeightUU(FieldCentreUU.X, FieldCentreUU.Y);
+			}
+		}
 		UE_LOG(LogVoxelGI, Log,
-		       TEXT("GI: bricks=%d (%.1f MB) pendingVox=%d(+%d pooled) dirty=%d refresh=%d | solved %d bricks/%d cells in %.2fms, ")
+		       TEXT("GI: bricks=%d (%.1f MB) pendingVox=%d(+%d pooled) rejectedRadius=%d camAboveSurface=%.0f (radius %.0f) ")
+		       TEXT("dirty=%d refresh=%d | solved %d bricks/%d cells in %.2fms, ")
 		       TEXT("reshaded %d chunks (%d dupes skipped), volumeUp %d bricks (queue %d, total %d bricks/%d runs), tick %.2fms"),
 		       Field->NumBricks(), double(Field->EstimatedBytes()) / (1024.0 * 1024.0),
-		       PendingVoxelize.Num(), PendingPooledVoxelize.Num(), DirtyQueue.Num(), RefreshQueue.Num(),
+		       PendingVoxelize.Num(), PendingPooledVoxelize.Num(),
+		       VoxRejectedRadius, CamAboveSurfaceUU, BuildRadiusUU,
+		       DirtyQueue.Num(), RefreshQueue.Num(),
 		       ToSolve.Num(), CellsSolved, SolveMs, Refreshed, DedupeSkips,
 		       VolumeUploaded, VolumeUploadQueue.Num(), VolumeBricksUploaded, VolumeRunsUploaded,
 		       (FPlatformTime::Seconds() - TickStart) * 1000.0);
+		VoxRejectedRadius = 0;
 	}
 }
 

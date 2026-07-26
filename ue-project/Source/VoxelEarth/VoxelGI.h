@@ -269,6 +269,17 @@ private:
 	double DigTestPhaseSeconds = 0.0;
 	TArray<FIntVector> DigTestBricks;
 
+	// Chunks the voxelize drain skipped because they were further than
+	// voxel.GI.RadiusUU from the view origin, accumulated between debug lines.
+	//
+	// THE FIELD THAT DECIDES FINDING B-M. "The light field is empty under motion"
+	// has two very different causes with the same symptom: chunks never arriving
+	// (an ingest or streaming problem) or chunks arriving and being REJECTED for
+	// range (the camera is simply too far above the terrain). One counter tells
+	// those apart, and it is cheaper than either of the runs that were planned to
+	// do the same job.
+	int32 VoxRejectedRadius = 0;
+
 	// --- staged re-centre (docs/gpu-gi-volume-design.md §4) -----------------
 	//
 	// Brick-row bounds still to be restaged, in BRICK rows (8 texels each). Each
