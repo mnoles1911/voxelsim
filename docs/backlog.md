@@ -317,6 +317,22 @@ zero there regardless of the graph, and a naive unpack treating 0 as black would
 render every component-path chunk black the moment the material is regenerated.
 Debug-only, so its absence costs nothing in play.
 
+**CORRECTED 2026-07-26 — identity-as-zero is unsafe, for the opposite reason.**
+Superseded text kept above, per §6a's convention. A material asking for texture
+coordinate 1 gets **texture coordinate 0** on the component path, not zero:
+`FLocalVertexFactory` clamps the request to the mesh's UV count and clamping
+duplicates (`LocalVertexFactory.ush:729-730`, `:737`), and the mesh has one UV
+set because `VoxelChunkComponent.cpp:634` takes `InitFromDynamicVertex`'s default
+`NumTexCoords = 1`. The value is the world-planar UV wrapped to 32 m, so ±32 of
+position-dependent garbage would have been multiplied into the **default**
+renderer's BaseColor. The path that does deliver zero is the pooled one. Measured
+with a probe material adding `EmissiveColor = abs(TexCoord1) * 0.05`: 30.91% of
+pixels differing at >8/255 on the component path against a 3.58% same-run floor,
+nothing on the pooled path. **Corrected encoding:** a sentinel range — both paths
+`fmod` UVs to a 32 m period, so nothing can leave (−32, 32); store `tint + 1000`
+and treat anything under ~100 as identity, which is correct on both paths with
+one graph and no switch node. Full write-up in `docs/gpu-waves-plan.md` Wave E.
+
 **`voxel.Stream.AdmissionBandSkip` is off, and should stay off** until two things
 are checked: its edit veto uses `EditedFootprintMinZ` where the dispatch site
 uses `ChunkHasEditedBrick`, and the argument that they agree is reasoning rather
