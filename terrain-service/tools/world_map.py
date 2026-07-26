@@ -276,9 +276,27 @@ HYPSO = [
 ]
 
 
-def hypsometric(elev_m: np.ndarray) -> np.ndarray:
+def hypsometric(elev_m: np.ndarray, stretch: bool = False) -> np.ndarray:
+    """Elevation -> colour along the HYPSO ramp.
+
+    ABSOLUTE by default, so "brown means 1200 m" holds across every render and
+    two maps of different regions are comparable.
+
+    stretch=True rescales the ramp onto the window's own land range. That is
+    wrong for comparing maps and right for looking at ONE place: a detail window
+    on a 3000-5900 m plateau is entirely above the ramp's 3600 m top stop, so
+    the absolute version renders it uniformly white and shows nothing at all --
+    which is exactly what the first continent-interior render did.
+    """
     stops = np.array([s for s, _ in HYPSO], dtype=np.float64)
     cols = np.array([c for _, c in HYPSO], dtype=np.float64)
+    if stretch:
+        land = elev_m[elev_m > 0]
+        if land.size:
+            lo, hi = float(np.percentile(land, 1)), float(np.percentile(land, 99))
+            if hi - lo > 1.0:
+                stops = stops[0] + (stops - stops[0]) * (hi - lo) / (stops[-1] - stops[0])
+                stops = stops + (lo - stops[0])
     e = np.clip(elev_m, stops[0], stops[-1])
     return np.stack([np.interp(e, stops, cols[:, i]) for i in range(3)], axis=-1)
 
@@ -289,7 +307,8 @@ def bathymetric(elev_m: np.ndarray) -> np.ndarray:
     return np.stack([0.18 - 0.12 * d, 0.38 - 0.24 * d, 0.62 - 0.30 * d], axis=-1)
 
 
-def compose(elev, biome, k, style="blend", relief=3.0, cell_m=None, sea_level=None):
+def compose(elev, biome, k, style="blend", relief=3.0, cell_m=None, sea_level=None,
+            stretch=False):
     """Colour + shade one field. Shared by the coarse and detail paths."""
     sea_level = k["beach_lower_m"] if sea_level is None else sea_level
     sea = elev < sea_level
@@ -299,7 +318,7 @@ def compose(elev, biome, k, style="blend", relief=3.0, cell_m=None, sea_level=No
         for i, (_, colour) in enumerate(BIOMES):
             rgb[biome == i] = colour
     elif style == "elevation" or biome is None:
-        rgb = hypsometric(elev)
+        rgb = hypsometric(elev, stretch=stretch)
     else:
         # Height decides the colour, biome tints it. Elevation is what the eye
         # should read first -- a flat per-biome fill hides all topography
@@ -613,8 +632,11 @@ def main() -> None:
         ci, cj = parts[0], parts[1]
         size = parts[2] if len(parts) > 2 else 512
         elev = fetch_detail(args.url, ci, cj, size)
+        # stretch=True: a detail window is about local relief, and an
+        # absolute ramp renders a high plateau as a white sheet.
         rgb, _ = compose(elev, None, k, style="elevation",
-                         relief=max(1.0, args.relief / 3.0), cell_m=30.0)
+                         relief=max(1.0, args.relief / 3.0), cell_m=30.0,
+                         stretch=True)
         km = size * 30 / 1000
         _draw(rgb, elev, [0, km, km, 0], "km east", "km south",
               f"REAL 30 m terrain at coarse ({ci},{cj}) -- {km:.1f} km across, "
