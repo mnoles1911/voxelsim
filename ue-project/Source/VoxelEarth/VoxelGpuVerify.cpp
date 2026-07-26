@@ -25,6 +25,7 @@
 #include "CoreMinimal.h"
 #include "HAL/IConsoleManager.h"
 #include "VoxelGpuWorldGen.h"
+#include "VoxelGpuRegionBuild.h"
 
 #include "voxelcore/core.h"
 #include "voxelcore/tiles.h"
@@ -55,19 +56,11 @@ namespace
 		{ TEXT("far-negative"), -100000, 250000, 64, 64 },
 	};
 
-	// How far past the dispatch footprint the raster window must reach.
-	//
-	// This is NOT slack. VoxelizeMain's cavern pass evaluates the terrain
-	// surface at a cave site's own xy, and a site can sit up to
-	// kCavernMaxReachMm away from the column that queried it; the shader then
-	// floors that to a voxel (one more voxel of reach) and takes bilinear taps
-	// at px and px+1. Undersizing the window does not fault — the kernel
-	// clamps to the window edge — it just silently produces different terrain
-	// from the CPU, which is exactly the failure this command exists to catch.
-	constexpr int64 kRasterCavernMarginMm = vxc::kCavernMaxReachMm + vxc::kVoxelSizeMm;
-
 	// Builds one region's GPU request: the raster window, its contents, and the
 	// z-range, exactly as gpu_harness.cpp::runRegion does.
+	//
+	// The raster window sizing itself lives in VoxelGpuRegionBuild.h so the async
+	// runner's harness cannot get it subtly different from this proven one.
 	//
 	// OutCpuColumns is filled as a side effect because deriving the z-range
 	// requires every column anyway, and the comparison needs them again later.
@@ -82,47 +75,7 @@ namespace
 		Req.OriginVy = Region.OriginVy;
 		Req.Seed = kSeed;
 
-		const int64 PixelSizeMm = Tiles.pixelSizeMm();
-		Req.PixelSizeMm = static_cast<int32>(PixelSizeMm);
-
-		// --- raster window extent -------------------------------------------
-		const int64 XMmMin = int64(Region.OriginVx) * vxc::kVoxelSizeMm - kRasterCavernMarginMm;
-		const int64 XMmMax = int64(Region.OriginVx + int32(Region.Width) - 1) * vxc::kVoxelSizeMm
-		                   + kRasterCavernMarginMm;
-		const int64 YMmMin = int64(Region.OriginVy) * vxc::kVoxelSizeMm - kRasterCavernMarginMm;
-		const int64 YMmMax = int64(Region.OriginVy + int32(Region.Height) - 1) * vxc::kVoxelSizeMm
-		                   + kRasterCavernMarginMm;
-
-		const int64 PxMin = vxc::floorDiv(XMmMin, PixelSizeMm);
-		const int64 PxMax = vxc::floorDiv(XMmMax, PixelSizeMm) + 1;  // +1: second bilinear tap
-		const int64 PyMin = vxc::floorDiv(YMmMin, PixelSizeMm);
-		const int64 PyMax = vxc::floorDiv(YMmMax, PixelSizeMm) + 1;
-
-		const uint32 RasterW = static_cast<uint32>(PxMax - PxMin + 1);
-		const uint32 RasterH = static_cast<uint32>(PyMax - PyMin + 1);
-
-		Req.RasterOriginPx = FIntPoint(static_cast<int32>(PxMin), static_cast<int32>(PyMin));
-		Req.RasterSize = FUintVector2(RasterW, RasterH);
-
-		// --- raster contents (row-major, x fastest) -------------------------
-		Req.ElevationMm.SetNumUninitialized(RasterW * RasterH);
-		Req.ClimatePacked.SetNumUninitialized(RasterW * RasterH);
-		for (uint32 Ly = 0; Ly < RasterH; ++Ly)
-		{
-			for (uint32 Lx = 0; Lx < RasterW; ++Lx)
-			{
-				const int64 Px = PxMin + Lx;
-				const int64 Py = PyMin + Ly;
-				const int32 Idx = int32(Lx + Ly * RasterW);
-				Req.ElevationMm[Idx] = Tiles.elevationMm(Px, Py);
-
-				const vxc::ClimateSample Cl = Tiles.climate(Px, Py);
-				Req.ClimatePacked[Idx] = uint32(Cl.temperature)
-				                       | (uint32(Cl.seasonality) << 8)
-				                       | (uint32(Cl.precipitation) << 16)
-				                       | (uint32(Cl.precipVariability) << 24);
-			}
-		}
+		VoxelGpuRegionBuild::FillRasterWindow(Req, Tiles);
 
 		// --- columns + vertical extent --------------------------------------
 		// Mirrors GeneratedWorld<8>::surfaceBrickRange, but reduced over the
