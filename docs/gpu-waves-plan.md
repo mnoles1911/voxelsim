@@ -729,6 +729,25 @@ every leg.
 pair** (off-1 vs off-2 spread 1.97%). With it the off p50 tightens to
 23.25 ± 0.9%. A rule that only ever confirms is not a rule.
 
+**Clamp check: all five legs verified UNCLAMPED.** `AWorldSettings::MaxUndilatedFrameTime`
+is 0.4 (`BaseGame.ini:199`) and `UVoxelPerfRunSubsystem` is a tickable *world*
+subsystem, so the `DeltaTime` it samples is already clamped at **400 ms** — a
+scene below 2.5 fps records every frame as exactly `400.000`, and each one counts
+as a hitch. Wave E found this. These five legs peak at **38.6–50.7 ms**, an order
+of magnitude clear of it, so nothing in the table above is the clamp.
+
+**One leg in this wave WAS clamped, and none of its numbers are used for a
+frame-time claim.** The B-M surface flight (finding B-M below) reports
+`maxFrameMs = 400.000` with 360 hitches in 2,046 post-warmup frames. Everything
+taken from that leg — brick counts, `rejectedRadius`, `camAboveSurface` — is read
+from the GI debug line and is not frame-time derived, so B-M's conclusion stands.
+Its `max`, `hitchCount` and `p95` are **not** quotable as scene properties.
+Same caveat applies to Wave A's merged figures, whose legs also show
+`maxFrameMs: 400.000`: its verdict rests on p50/p95 far above the clamp and is
+unaffected, but its `max` and hitch numbers are the clamp, not the scene — which
+is why the Wave A results cited elsewhere in this section are the **p50 delta and
+the cost model**, never a hitch count.
+
 | metric | off | on | delta | ranges overlap? |
 |---|---|---|---|---|
 | p50 | 23.25 | 23.37 | **+0.6%** | yes — below noise |
@@ -755,6 +774,29 @@ count and p95 — not p50, which this measurement has already shown is not where
 the cost lives** — and it must also report what it costs on the other side, since
 a smaller drain means lighting converges more slowly after an edit. If no setting
 brings hitches near the off-baseline, that is a complete answer too.
+
+**Sweep protocol, pre-registered before running it**, because the sweep
+deliberately explores configurations expected to be *worse* than the ones above
+and is decided on exactly the two statistics the 400 ms clamp corrupts:
+
+1. **Read `postWarmupMaxFrameMs` on every leg first.** Exactly `400.000` means
+   the clamp fired.
+2. If it fired, that leg's **`max` and `hitchCount` are the clamp, not the
+   scene**, and are reported as such rather than tabulated beside unclamped rows.
+   A genuinely terrible config would otherwise be indistinguishable from a merely
+   bad one — or look *better*, by having its tail flattened to a constant.
+3. **Bound the clamped fraction** by `postWarmupHitchCount / postWarmupFrameCount`
+   (every clamped frame is necessarily a hitch, so this is an upper bound). p50
+   survives below 50%, p95 below 5%. On the B-M leg that bound is 17.6%, which is
+   why its p95 is not quoted either.
+4. The GI-off baseline (23.3 hitches / 27.41 ms p95) sits in the sweep table as a
+   **row**, not a footnote, so the target is visible rather than only the trend.
+5. Report `edit → fully-relit` wall-clock per config, **measured** rather than
+   inferred from the budget arithmetic, so the owner chooses between two named
+   quantities.
+6. Report resident brick count per config as well: a slower drain could **deepen
+   finding B-M** rather than being neutral to it, and an interaction between the
+   fix and an open finding belongs in the recommendation, not a follow-up.
 
 ### Considered and rejected: making the COMPONENT path sample the volume
 
