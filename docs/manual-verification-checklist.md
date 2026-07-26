@@ -13,11 +13,11 @@ Current defaults, so you know what you are looking at without setting anything:
 
 | cvar / switch | default | meaning |
 |---|---|---|
-| `voxel.Stream.GPU` | **0** | terrain renders on the per-chunk component path |
-| `voxel.Stream.GPUCull` | **0** | pooled frustum cull is off (it still drops geometry) |
+| `voxel.Stream.GPU` | **0** | terrain renders on the per-chunk component path. The reason has changed: not "it drops geometry" (fixed) but that the pooled path costs ~0.15 ms **more** than the component path at a down-facing pose. The fix is compaction, which is not built. |
+| `voxel.Stream.GPUCull` | **1** | pooled frustum cull is **on**, and its output is verified pixel-identical to the single full draw. The pool's cost now tracks what is on screen. |
 | `voxel.Water.GPU` | 0 | water on the per-chunk path |
-| `voxel.GI.Enabled` | 0 | voxel GI off |
-| `voxel.GI.Volume` | 0 | GPU GI volume off |
+| `voxel.GI.Enabled` | **0** | voxel GI off. Measured cost of turning it on: free at the median (+0.6% p50) but **3.2× the hitches and +14.9% p95**, neither overlapping the off-baseline. |
+| `voxel.GI.Volume` | 0 | GPU GI volume off. Additionally it has **no consumer** under `voxel.Stream.GPU 0` — only the pooled vertex factory samples it, so with the default above it changes nothing at all. See §6. |
 | `-VoxelCoarseGrid` | on | coarse chunks use the flat-grid fast path |
 | `-VoxelL0BrickSkip` | on | level-0 skips provably-empty bricks |
 
@@ -82,9 +82,24 @@ Holding the pose fixed is the whole trick — it is what my headless harness cou
 not do, and without it the run-to-run spread swamps the difference. Two identical
 runs at an unpinned pose gave me 43 fps and 103 fps on the same settled scene.
 
-Expect the pooled path to be **slower** here (~23% at p50, more when little is on
-screen) because it has no per-chunk culling yet. That is known, measured, and why
-it is not the default.
+**SUPERSEDED — do not test against the old expectation.** This used to say to
+expect the pooled path to be *"~23% slower at p50, more when little is on
+screen, because it has no per-chunk culling yet"*. The cull now exists, is on by
+default, and is verified pixel-identical to the single full draw. **If you
+measure against the old text you will conclude the cull did not work.**
+
+What to expect now: the pooled path is **level with the component path at the
+horizon**, and **~0.17 ms behind at a down-facing pose**. That remaining gap is
+why `voxel.Stream.GPU` is still 0; the fix is draw compaction, which is not
+built. So the interesting reading here is no longer "how much slower" but
+**whether the two are close enough that you would not notice** — and, at a
+down-facing pose, whether the pool still costs anything when almost nothing is
+on screen.
+
+If you also want to see the GI cost from §6, note it is **not** visible in a
+still-camera `stat unit` reading: it is free at the median and lives entirely in
+the tail (3.2× hitches, +14.9% p95). Watch for intermittent stutter over a
+minute rather than a worse steady number.
 
 ## 4. Water (optional)
 
@@ -144,7 +159,88 @@ any of W5's fill-fraction shading, foam, caustics or refraction can land.
 - Save, quit, reload, and look at the same shaft. Saved worlds used to lose
   structures above the sky-band trim.
 
-## 6. Per-chunk debug tints, when they land (added Wave E)
+## 6. Voxel GI through the GPU volume (Wave B)
+
+**Everything here needs `voxel.Stream.GPU 1`.** Only the pooled vertex factory
+samples the volume; the per-chunk component path bakes GI into vertex colours and
+never reads the texture. With `voxel.Stream.GPU 0`, `voxel.GI.Volume 1` allocates
+nothing and changes nothing — that is by design, not a bug, and it is the single
+easiest way to conclude "the GI volume does nothing".
+
+Launch with:
+
+```
+-VoxelGIOn -dpcvars=voxel.Stream.GPU=1,voxel.GI.Volume=1,voxel.GI.VolumeDim=192
+```
+
+`voxel.GI.VolumeDim` is **startup only** (it sizes an allocation), which is why it
+goes through `-dpcvars` rather than the console. Everything else on this list can
+be toggled live now.
+
+### 6a. The fade at the volume face — the one a harness cannot score
+
+This is design risk 8 and it is the hardest kind of wrong to notice, because it
+produces a *plausible* image. The volume covers ±38.4 m at `VolumeDim 192`;
+beyond it GI must hand back to the mesher's plain AO **smoothly**.
+
+1. Settle, then fly slowly outward in a straight line over open, uneven ground.
+2. Watch for a **ring** — a circle centred on you where the ground brightness
+   steps rather than ramps. It moves with you, which is what distinguishes it
+   from a terrain feature.
+3. `voxel.GI.Volume 0` / `1` toggles live now; flipping it at the suspect
+   distance is the cheapest A/B.
+
+The clamp that keeps the fade inside the volume logs its effect. Grep the log for
+`VoxelGI volume params:` — if `fade=` differs from `cvars asked`, the clamp fired
+and the fade you are looking at is not the one the cvars requested.
+
+### 6b. Re-centring, under motion
+
+Automated capture structurally cannot answer this: the volume re-centres over
+~8 frames (~130 ms) and every screenshot in this repo is a settled, stationary
+scene.
+
+1. Settle, then fly **continuously** for a minute or so at normal speed.
+2. Watch for a brief, whole-screen brightness flicker in the middle distance —
+   not at a ring, not tied to a chunk boundary.
+3. The log says exactly when to expect one: `re-centre BEGIN` … `re-centre COMMIT`
+   pairs. If a flicker does not line up with one of those timestamps, it is not
+   this.
+
+What the code guarantees, so you know what you are looking for: the camera's own
+neighbourhood is restaged in the *same* frame the origin swaps, so any artifact
+should be in the **middle distance**, never underfoot. `voxel.GI.Debug 2` prints
+`VOLUMERECENTRE transient:` with how many occupied texels were stale at the worst
+moment and how close the nearest one got to the camera.
+
+### 6c. Scheme B's horizontal error — worth one look in a cave
+
+Measured, not suspected: the volume stores ±Z irradiance exactly and the four
+horizontal directions as their **mean**. The error is bimodal — half the samples
+are essentially exact, but p95 is ~52/255 and the worst is ~105/255, and it
+concentrates on **side faces near vertical occluders**, which is most of a cave
+wall. See the Wave B section of `docs/gpu-waves-plan.md` for the numbers.
+
+Nothing automated can decide whether that is acceptable, because it is a
+question about appearance. Go underground, look at a wall lit from one side, and
+compare `voxel.GI.Volume 1` against `voxel.GI.Volume 0` with `voxel.GI.Enabled 1`
+on the component path (`voxel.Stream.GPU 0`, restart) — the component path
+evaluates the full ambient cube and is the reference. If the volume's cave walls
+read flat or wrongly-lit next to it, Scheme A is worth its 2× memory and the
+Wave B section records what that would cost.
+
+### 6d. A dig should relight without re-meshing
+
+`voxel.GI.VolumeDigTest` automates the numeric half (it logs `VOLUMEDIG` lines).
+The visual half:
+
+1. Settle, dig a short tunnel into a hillside, then **stand still and watch**.
+2. The tunnel interior should **darken progressively over a second or two** as
+   the solve lands, not pop from lit to dark in one frame, and not stay lit.
+3. The one failure this is looking for: a dug tunnel that keeps its **pre-dig**
+   lighting indefinitely. That is zero-on-revoxelize not reaching the texture.
+
+## 7. Per-chunk debug tints, when they land (added Wave E)
 
 Not built — it needs a vertex-factory change this wave did not own. When it does
 land, the thing to check is **the renderer that is not being demoed**: the tint

@@ -75,11 +75,7 @@ boilerplate.
    unverified. This programme has now retracted one set of numbers and corrected
    **two** root-cause diagnoses (the determinism gate twice); all three would have
    been caught by this rule.
-9. **Line numbers in this plan drift.** `VoxelWorldSubsystem.cpp` is ~10,600 lines
-   and moves under every PR. Anchor on symbol names — `DispatchJobs`,
-   `DrainResults`, `MeshChunkBricks`, `EnsureVolumeOrigin` — and treat the numbers
-   as hints. Several quoted here were already stale when this plan was written.
-10. **Never edit a `.ush` while any editor run is in flight.** Shader source is
+9. **Never edit a `.ush` while any editor run is in flight.** Shader source is
     loaded from disk at runtime, not compiled into the DLL, so an edit under a
     live editor kills the whole shader compile batch and presents as a GPU fault
     at `ShaderCompiler.cpp:2298` — not as an edit collision. It cost Wave B a
@@ -100,6 +96,50 @@ boilerplate.
     edit a `.ush` in a checkout an in-flight editor was launched from"*, and the
     safe habit is to do all `.ush` work in your own worktree. **Wave D5 changes
     `worldgen.ush` unconditionally and will hit this.**
+
+10. **Frame times are CLAMPED at 400 ms, and a slow enough scene reports a clean
+    null.** *(Mechanism found by Wave E; the survival test below added by
+    Wave B.)* `AWorldSettings::MaxUndilatedFrameTime = 0.4`
+    (`BaseGame.ini:199`) clamps `DeltaTime`, and `UVoxelPerfRunSubsystem` is a
+    tickable **world** subsystem, so the value it samples is **already clamped**.
+    Below 2.5 fps every frame records as exactly `400.000` and each one counts as
+    a hitch — Wave E measured 159 of 159 frames at that value. The danger is not
+    that it is obviously broken; it is that a genuinely terrible configuration
+    has its tail **flattened to a constant** and can therefore score *better* on
+    `max` and `hitchCount` than a merely bad one.
+
+    - **The tell:** `postWarmupMaxFrameMs` exactly `400.000`.
+    - **Which statistics survive, quantitatively, from fields every leg already
+      emits:** every clamped frame is necessarily a hitch, so
+      `postWarmupHitchCount / postWarmupFrameCount` is an **upper bound** on the
+      clamped fraction. **p50 survives below 50%; p95 survives below 5%.** No new
+      instrumentation, and it applies retroactively to every leg anyone has
+      already taken.
+    - A clamped leg's `max` and `hitchCount` are **the clamp, not the scene**.
+      Report them as such; never tabulate them beside unclamped rows.
+
+    Audited across this programme: Wave B's five B7 shipping legs are clean
+    (38.6–50.7 ms). Wave B's B-M surface leg is clamped at a 17.6% bound, so
+    neither its `max`, its `hitchCount` **nor** its p95 is quotable. Wave A's
+    merged legs are clamped too — its verdict is unaffected because it rests on
+    p50/p95 far above the clamp, but its `max` and hitch figures are not scene
+    properties.
+11. **The edit log PERSISTS across runs, so a repeated edit measures nothing.**
+    `ue-project/Saved/VoxelWorlds/<seed>.vxlog` survives process exit. A harness
+    that carves at a fixed world position therefore digs virgin ground on its
+    first run and **an already-empty hole on every run after** — the second leg
+    reports `carved 0 voxels`, no chunk is dirtied, no brick is re-solved, and
+    whatever it was timing completes instantly or times out. Measured in Wave B:
+    the first relight leg carved 43,260 voxels, the identical second leg carved
+    **0**. This invalidates *any* edit-based measurement on its second run and is
+    not specific to GI — it applies equally to dig, explosion, water-breach and
+    structural-collapse harnesses. **Delete `Saved/VoxelWorlds/*.vxlog` between
+    legs**, or carve somewhere new each time, and check the carved-voxel count in
+    the log before believing the number that follows it.
+12. **Line numbers in this plan drift.** `VoxelWorldSubsystem.cpp` is ~10,600 lines
+   and moves under every PR. Anchor on symbol names — `DispatchJobs`,
+   `DrainResults`, `MeshChunkBricks`, `EnsureVolumeOrigin` — and treat the numbers
+   as hints. Several quoted here were already stale when this plan was written.
 
 ## How to use this document
 
@@ -540,94 +580,713 @@ dig lighting become correct at range instead of only within 12.8 m of spawn.
 Steps 0–2 landed and are verified: the pooled path feeds the light field (it
 previously never did — `voxel.GI.Enabled 1` was a silent no-op under
 `voxel.Stream.GPU`), the volume is sampled **per pixel** via a `GIUVW : TEXCOORD1`
-interpolant folded into vertex colour `.g` in `GetMaterialPixelParameters`
-(`ue-project/Shaders/VoxelQuadVertexFactory.ush:50-55,238-251,389-430`), and the
-±Z encode matches the CPU sampler at **0.000 mean error** against a half-cell
+interpolant folded into vertex colour `.g` in `GetMaterialPixelParameters`, and
+the ±Z encode matches the CPU sampler at **0.000 mean error** against a half-cell
 shifted control.
 
-**Correction to carry into this wave.** The roadmap framed step 5 as "stop
-re-meshing a chunk to refresh its lighting on the pooled path". That is not what
-exists: `BrickComponents` has **no entry** for pooled bricks
-(`VoxelEarth/VoxelGI.h:154-161`), so pooled chunks are never re-shaded at all, and
-`CollectDirtyChunks` (`VoxelWorldSubsystem.cpp:7438-7473`) already expands an edit
-only to the 1-voxel mesher apron, never to a lighting radius. The 5×5×5 re-shade
-that is genuinely retirable lives on the **component** path
-(`voxel.GI.EditDirtyRadiusBricks` → `RefreshQueue` → `UpdateGIVertexColors`).
-Wave B's real prize is therefore (a) making the volume authoritative on **both**
-paths and (b) deleting the quad subdivision, which is where GI's median cost
-actually lives.
+> **RESULT (2026-07-26).** All measurements below are from
+> `.claude/worktrees/wave-b-gi`, `-VoxelSpawnAt=-84480,53760`, settled
+> (`jobsInFlight=0 pendingJobs=0`), 2,212 resident bricks, unless stated.
+>
+> - **B1 — closed, by reversing the expected answer.** Scheme B never passed the
+>   design's own bar (an **RMS**, fed a mean-abs for three transcripts running);
+>   Scheme A is built and measures **0.000 on every direction class**.
+> - **B3, B4, B5, B6 — landed.**
+> - **B2 — one claim retracted and re-measured**; the transient is real
+>   (69.3% of occupied texels, reaching the camera's own row). Ships only on the
+>   corrected claim, or defaults off.
+> - **B7 — target changed** to `voxel.GI.Enabled 1` / `voxel.GI.Volume 0`, once
+>   the coupling to Wave A was found; then **not shipped**. GI is free at the
+>   median (+0.6% p50) and expensive in the tail (**+14.9% p95, 3.2x hitches**,
+>   neither overlapping). Reported rather than flipped, per the plan's own rule.
+>   `voxel.GI.MaxChunkRefreshesPerFrame` was swept 4/2/1 and **no setting reaches
+>   Ship or Conditional**: the knob trades hitches against relight latency and
+>   there is no acceptable point on it. GI cannot ship on by default without
+>   further work; the fix indicated is priority (edits ahead of the round-robin),
+>   not throughput.
+> - **B5 and the Dim 256 coverage run — not run, unverified.**
+> - **B-M — a new finding, not root-caused**: the light field is effectively
+>   **empty under motion** (0–12 bricks against 2,212 settled). It qualifies the
+>   B7 recommendation and is recorded rather than fixed.
 
-- **B1 (step 3) — settle the encoding.** The doc's bar is "mean horizontal error
-  under 8/255 ⇒ Scheme B is free quality" (`gpu-gi-volume-design.md:103`); the
-  measurement is 5.95–6.165, so **the expected outcome is: keep Scheme B, and
-  record why**. Two loose ends first: `maxAbsErr` is ~102 bytes, so the passing
-  mean hides a heavy tail worth characterising; and the number is a mean-abs where
-  §2 asked for an **RMS**. Also reconcile the two transcripts in the tree — the
-  design doc records `5.950 / control 0.591`, `backlog.md:301` and the roadmap
-  record `6.165 / control 0.565`. Different runs, never reconciled.
-- **B2 (step 4) — camera-following re-centring.** `EnsureVolumeOrigin`
-  (`VoxelGI.cpp:482-555`) latches on `bVolumeOriginSet` and never re-enters, so at
-  the shipped `voxel.GI.VolumeDim 64` only **36 of ~1,950** resident bricks are
-  inside the volume, and `DrainVolumeUploads:585-589` silently **drops** the rest.
-  Design is already decided (§4): **dead zone + staged re-upload over ~8 frames,
-  with the origin uniform swapped on exactly the frame the last upload lands** —
-  toroidal addressing and double-buffering were both considered and rejected. Add
-  the proposed `voxel.GI.VolumeRecentreCells` (default 64). Needs a driver that can
-  call `UpdateParameters_RenderThread` more than twice per session, and a
-  re-address of `VolumeShadow`.
-- **B3 (step 5) — make the volume authoritative and delete the baked path's cost.**
-  Retire the component path's 5×5×5 re-shade for chunks inside volume coverage, and
-  **turn off `voxel.GI.MaxQuadSpanVoxels` subdivision** (`VoxelChunkComponent.cpp:188,314-331`)
-  when the volume supplies GI. Keep `NotifyPooledChunkMeshUpdated`'s quad hand-off
-  — the field must still be fed.
-- **B4 — reconcile the two shade formulas** before either can be authoritative in
-  the same frame under `voxel.Stream.GPUMaxLevel`. Four live divergences, all found
-  in the tree:
-  1. `Strength`/`AmbientFloor` are **hardcoded** in `UpdateParameters_RenderThread`
-     (`VoxelGIVolume.cpp:98-125`) rather than read from `voxel.GI.Strength` /
-     `voxel.GI.AmbientFloor`. They coincide today (1.0 / 0.06) and diverge silently
-     the moment either cvar moves.
-  2. The fade radii are **derived from the volume extent** (896/1152 UU at Dim=64)
-     instead of the CPU's 4800/6400. This is the design doc's risk 8, live: GI cuts
-     off at the volume face as a plausible-looking lighting ring.
-  3. The shader's `DistUU` is distance to the **volume centre**, not to the camera —
-     equivalent only while the origin is camera-centred, which B2 is what makes true.
-  4. The shader tries **one** probe offset (0.6 cells); the CPU tries three
-     (`{0.6, 1.25, 2.0}`, `VoxelLightField.cpp:398-415`) specifically because a
-     20 cm roof slab is half a cell thick. Thin geometry falls back to plain AO in
-     the volume path where the CPU finds data.
-- **B5 — close the two untested step-2 claims:** the X-run upload merge on a dig's
-  contiguous neighbourhood (measured at 1.4 bricks/run in *steady state*, but the
-  dig case is what it was built for), and zero-on-revoxelize / zero-on-evict, which
-  are correct by construction only. Both need a dig-shaped test.
-- **B6 — fix the live-toggle claim.** `voxel.GI.Volume`'s help text says it is read
-  per frame; `UpdateParameters_RenderThread` has only three callers and no per-frame
-  refresh, so `Enabled`/`DebugVis` are latched. B2's driver is the same hook — either
-  make it true or correct the text.
+### The correction this wave owes the plan (and the plan owed the roadmap)
 
-- **B7 — ship it on.** Owner's call: Wave B is complete when **`voxel.GI.Enabled 1`
-  and `voxel.GI.Volume 1` are the defaults**. That adds two obligations beyond
-  correctness:
-  - **Size the volume for real coverage.** `voxel.GI.VolumeDim 64` covers ±12.8 m.
-    The design doc's sizing table recommends **N=256 → 51.2 m, 67.1 MB**
-    (`gpu-gi-volume-design.md:119-124`); full-coverage parity at 349 MB is
-    explicitly ruled out. Pick from a measured resident-brick-coverage run, not the
-    table alone, and note `GetDim()` clamps to `[16,256]` and rounds down to whole
-    bricks (`VoxelGIVolume.cpp:41-52`).
-  - **Retune the fade** (design risk 8, and B4.2 above). Beyond the volume face, GI
-    must hand back to plain AO without a visible ring. This is the one part of Wave
-    B that a harness cannot score — it goes on the manual checklist.
-  - **Measure the frame cost with the pinned-pose harness**, ≥2 legs, GI on vs off.
-    The material is masked, so the depth pass samples the volume too
-    (`gpu-gi-volume-design.md:230-236`). If the cost is not acceptable, report the
-    number rather than shipping it on regardless.
+The roadmap said step 5 was "stop re-meshing a chunk to refresh its lighting on
+the pooled path". This plan corrected that to "the retirable cost is the
+**component** path's 5×5×5 re-shade plus the `voxel.GI.MaxQuadSpanVoxels`
+subdivision". **That correction is also wrong, and in the same direction.**
 
-**Verification:** `voxel.GI.VolumeCheck` (`VoxelGI.cpp:727-987`) — the harness that
-produced the 0.000 / control pair — re-run after each step; shots at 15/30/45 s on
-the scripted flight for B2 (no lighting pop, origin uniform changing on exactly one
-frame per re-centre); a dig-and-hold PIE capture for B3; a pinned-pose A/B for B7.
+Read `ApplyMeshResult`: under `voxel.Stream.GPU 1` with the default
+`GPUMaxLevel -1`, the pooled branch returns before any `UVoxelChunkComponent` is
+constructed, for **every** level-0 chunk. `BuildChunkVertexData` gates all of its
+GI work on `bGIEnabled = VoxelGI::IsEnabled() && ChunkLevel == 0`, and GI is
+level-0-only. So on the pooled path there is **no component to re-shade and no
+quad to subdivide** — both costs are already exactly zero, and were before this
+wave started.
 
----
+What *was* real, and is now fixed: every solved pooled brick was still being
+pushed onto `RefreshQueue`, where it could only ever be popped and discarded
+(pooled bricks have no `BrickComponents` entry, by design). That is what forced
+the 8× pop cap added in step 0. Bricks with no component no longer go on the
+queue at all.
+
+**So Wave B's prize is not a cost saving. It is a capability**: on the pooled
+renderer, per-vertex baked GI does not exist at all, and the volume is the only
+thing that can light a dig or a cave there. Worth stating plainly, because
+"retire the baked path's cost" set an expectation this wave cannot meet and does
+not need to.
+
+### B1 (step 3) — the encoding: **the stated bar is failed, and it was the wrong statistic**
+
+Expected outcome was "keep Scheme B and record why". Scheme B stays — but not
+because it passed.
+
+`voxel.GI.VolumeCheck 20000`, `VolumeDim 192`, two legs on one build:
+
+| | leg A | leg B |
+|---|---|---|
+| ±Z mean / RMS / max | **0.000 / 0.000 / 0.000** | **0.000 / 0.000 / 0.000** |
+| horizontal mean | **9.629** | **9.463** |
+| horizontal RMS | 21.051 | 20.405 |
+| horizontal p50 / p90 / p95 / p99 / max | 0.013 / 37.4 / 53.0 / 91.6 / 105.0 | 0.229 / 36.8 / 51.1 / 81.8 / 105.0 |
+| fraction over the 8/255 bar | **27.68%** | **27.69%** |
+| control (half-cell X shift) | 1.576 | 1.662 |
+| signal (±Z irradiance) mean / sd | 19.7 / 40.7 | 20.3 / 41.0 |
+
+Three findings, in order of how much they change the decision.
+
+**1. The two in-tree transcripts are reconciled, and neither was wrong.** The
+design doc records `5.950 / control 0.591`; `backlog.md:301` and the roadmap
+record `6.165 / control 0.565`. My two legs agree with *each other* to **±0.17
+bytes**, so the harness is precise. What moves the number is **the field's
+composition when it fires** — the design-doc run measured 1,947 resident bricks,
+mine 2,212 (the settled figure step 0 itself records). Different resident sets,
+different mix of open sky and enclosed geometry, different horizontal error.
+**They are three measurements of three field states, not three attempts at one
+number.** Anyone re-running this must quote the brick count beside the error or
+the figure means nothing.
+
+**2. At the settled state the design's bar is failed.**
+`gpu-gi-volume-design.md:103` says "under ~8/255 means Scheme B is free quality".
+At settle it is **9.5**. The two passing readings on record were taken on a
+less-settled field.
+
+**3. The mean was the wrong statistic anyway, and this is the finding that
+matters.** The distribution is **bimodal**: p50 ≈ 0.02–0.23 (essentially exact)
+while p95 ≈ 52 and max = 105. Scheme B stores `B = mean(±X, ±Y)`, so it is exact
+wherever the four horizontal directions agree — open ground, uniformly-lit
+interiors — and wrong by up to 41% of full scale wherever they disagree, which is
+precisely **a side face next to a vertical occluder**, i.e. most of a cave wall.
+A mean of 6 or 9 averages those two populations and describes neither. §2 asked
+for an RMS and got a mean-abs; the harness now reports both, plus percentiles and
+the fraction over the bar.
+
+**4. On the statistic §2 actually asked for, Scheme B fails by 2.6× — and always
+did.** §2's words are *"report `RMS(Vis[±X], Vis[±Y] − their mean)` in irradiance
+bytes. Under ~8/255 means Scheme B is free quality."* **The bar is an RMS.** The
+harness reported a mean-abs and it was compared against the RMS threshold as
+though the two were interchangeable. Measured RMS is **20.4–21.1**. So the
+5.950/6.165 readings on record never passed §2's bar; they were a different,
+smaller statistic that happened to land just under the number.
+
+**Decision: ship Scheme A.** My first conclusion here was "keep Scheme B", and it
+was wrong. Two errors in it, both mine:
+
+- I compared against the mean-abs bar rather than §2's RMS bar, so I recorded a
+  marginal failure (9.5 vs 8) where the real one is 2.6×.
+- I asserted Scheme A "doubles a sample the depth pass also pays". **It does not.**
+  Scheme A stores `(+X,+Y,+Z,v)` and `(−X,−Y,−Z,v)` in two textures, and §2 itself
+  establishes that *every greedy-mesh normal is axis-aligned, so exactly one slot
+  is selected*. A given face therefore needs exactly **one** of the two textures —
+  branch on the sign of the normal, sample one, take one component. §2's own "two
+  samples" is the cost for a general normal, which this mesh never produces.
+  **Scheme A costs memory and nothing else.**
+
+With the sample-count objection gone, the trade is memory against wall accuracy,
+and the design's sizing table does not show the configuration that settles it:
+
+| config | VRAM | CPU shadow | reach | walls |
+|---|---|---|---|---|
+| Scheme B, N=256 (design's recommendation) | 67.1 MB | 64 MB | ±51.2 m | **approximate** |
+| **Scheme A, N=192** | **56.6 MB** | 54 MB | ±38.4 m | **exact** |
+| Scheme A, N=256 | 134.2 MB | 128 MB | ±51.2 m | exact |
+
+**Scheme A at N=192 costs less VRAM and less RAM than the configuration the design
+already recommends**, and buys exactness on every face. What it gives up is 13 m
+of reach. For a game whose GI exists for caves and digging, that is the cheaper
+thing to give up — and reach is the axis the fade already has to hand back on
+anyway (risk 8), whereas a wall lit by the mean of four directions is wrong in a
+way no amount of fading fixes.
+
+Two costs of Scheme A the table does not show, recorded so the decision is not
+taken on VRAM alone: the CPU shadow doubles (it is a full mirror of the staged
+bytes), and B2's staged re-centre moves `Dim^3 * 8` rather than `Dim^3 * 4` bytes, so
+re-centre upload traffic doubles too (~54 MB per re-centre at N=192, ~42 MB/s at
+20 m/s across the default dead zone).
+
+**Still owed, and it is the thing that would overturn this:** a screenshot. p95 of
+52/255 is 20% of range, and on a *dark* wall the relative error is larger still —
+an irradiance error of 0.20 swings `lerp(AmbientFloor, 1, Irr)` from 0.06 to 0.35
+where `Irr` is small, a factor of ~2 in brightness. That is an arithmetic
+projection, not an observation. The `-VoxelGITest` wall-and-roof fixture puts a
+side face under a roof, which is exactly the geometry the error concentrates on,
+and is the capture that settles whether this reads as wrong lighting or as
+nothing.
+
+**Scheme A is built and measured.** Same harness, same scene, same 20,000
+samples, Dim 192, settled at 2,212 resident bricks / 933 in volume:
+
+| statistic | Scheme B (2 legs) | **Scheme A** |
+|---|---|---|
+| ±Z mean / RMS / max | 0.000 / 0.000 / 0.000 | 0.000 / 0.000 / 0.000 |
+| horizontal mean | 9.629 / 9.463 | **0.000** |
+| horizontal RMS | 21.051 / 20.405 | **0.000** |
+| horizontal p50 / p90 / p95 / p99 | 0.013 / 37.4 / 53.0 / 91.6 | **0 / 0 / 0 / 0** |
+| horizontal max | 105.0 | **0.000** |
+| fraction over the 8/255 bar | 27.68% / 27.69% | **0.0000** |
+| control (half-cell X shift) | 1.576 / 1.662 | 1.525 (max 58.8) |
+| verdict | PASS (±Z only) | **PASS (both classes)** |
+
+**The control is what makes the zeros load-bearing.** A harness comparing a thing
+against itself also reports 0.000; this one still reports 1.525 mean and 58.8 max
+on the deliberately mis-addressed probe, so it is still measuring something.
+
+**Measured memory: 54.0 MiB** for both volumes at Dim 192. The design doc's table
+says 56.6 MB for Scheme A at N=192 — **these are the same quantity**, 56.6 × 10⁶
+bytes = 54.0 × 2²⁰ bytes. Flagged because a future reader comparing the log line
+against the table will otherwise go looking for a 5% discrepancy that does not
+exist.
+
+**Implementation note that is the whole reason this was affordable:** a face picks
+the volume by the **sign** of its normal and the channel by the **axis** — one
+sample, one channel. The second volume is never read.
+
+
+### B2 (step 4) — camera-following re-centring
+
+`EnsureVolumeOrigin` latched on `bVolumeOriginSet` and never re-entered, so the
+volume sat wherever the camera was at the first upload and `DrainVolumeUploads`
+silently dropped every brick outside it. Now: dead zone
+(`voxel.GI.VolumeRecentreCells`, default 64 cells = 2560 UU) + staged re-upload +
+a one-frame origin swap, exactly as §4 decided. Toroidal addressing and
+double-buffering stay rejected.
+
+**The gap in §4's design, which the implementation cannot remove and which anyone
+reading that section should know about.** §4 says the dead zone "guarantees the
+old volume still covers the camera throughout", and reads as if that made the
+staged re-upload invisible. Coverage is not the issue. The issue is that the
+texture has no per-region origin: while the staged upload is in flight it holds a
+**mix** of old-addressed and new-addressed bytes, and the shader is reading all
+of it with the old origin. Every row already restaged is therefore returning
+irradiance from a point one re-centre shift away until the swap lands. §4 does
+not mention this, and it is not avoidable without the two options §4 rejected.
+
+Two things bound it, both deliberate:
+
+- rows are restaged **from both ends inward**, so the stale region is furthest
+  from the camera — where the distance fade is already attenuating GI — and the
+  camera's own row is restaged in the **committing frame**, whose upload and
+  origin swap are enqueued into the same render frame;
+- the swap is a single uniform-buffer publish, so no frame ever mixes two
+  origins.
+
+`voxel.GI.Debug 2` prints `VOLUMERECENTRE transient:` with the peak stale
+occupied-texel count and how close the nearest stale row got to the camera, so
+this is a number rather than an argument.
+
+> **RETRACTED (2026-07-26), original left visible above.** The two bullets above
+> claimed the transient "is bounded" by the both-ends-inward ordering, and
+> specifically that *"the camera's own row is restaged in the committing frame,
+> whose upload and origin swap are enqueued into the same render frame"*. **The
+> first claim holds. The second is false.** Both are now measured rather than
+> argued.
+
+**MEASURED.** A forced re-centre over a *populated* field
+(`voxel.GI.VolumeRecentreTest`, 163 bricks restaged, shift 176×48×−160 cells,
+Dim 192, `voxel.GI.Debug 2`):
+
+```
+VOLUMERECENTRE transient: peakStaleTexels=14645 of 21122 occupied (69.3%),
+                          nearestStaleRowToCamera=0 UU
+```
+
+Two things wrong with what was written:
+
+1. **69.3% of occupied texels are misaddressed in the frame before the swap.**
+   That is inherent to staging over ~8 frames — by the penultimate frame 7/8 of
+   the volume has been rewritten — and **no ordering can reduce it**. Ordering
+   controls *where* the stale region is, not *how much* of it there is. The
+   original wording implied the quantity was small. It is most of the volume.
+2. **`nearestStaleRowToCamera = 0 UU`: the stale region reached the camera's own
+   row one frame before the commit**, so there is a potential one-frame artifact
+   in exactly the place the original claim said there could not be one. Cause:
+   the step loop takes **two** rows off the low end and **one** off the high end
+   per frame, so the meeting point drifts toward the high end instead of staying
+   on the camera. The camera's row lands in frame 7 of 8, not frame 8.
+
+**Why the scripted flight did not catch it, and why that is its own finding.**
+The first B2 verification ran the 20 m/s scripted flight and reported seven
+re-centres, each exactly 8 frames with a one-frame origin commit — and every one
+of them reported `0 of 0 occupied`. The transient measurement was vacuous because
+**the field was empty**. See finding B-M below; it is a bigger problem than this
+one.
+
+**Status: the ordering fix (order rows by descending distance from the camera's
+row) is owed, followed by a re-measurement.** B2 ships only on whichever of these
+the re-measurement supports:
+
+- *"A transient exists, bounded to ≤8 frames, confined to the far field, camera's
+  row last"* — ship with exactly that claim, not rounded up to "cannot pop"; or
+- re-centring **defaults off** and is recorded as not ready.
+
+**RE-MEASURED after the ordering fix**, same fixture, same populated field
+(163 bricks restaged, Dim 192, `voxel.GI.Debug 2`):
+
+| | before (two rows off the low end, one off the high) | after (furthest-from-camera-row first) |
+|---|---|---|
+| `nearestStaleRowToCamera` | **0 UU** | **333 UU** |
+| `peakStaleTexels` | 14645 / 21122 (**69.3%**) | 20146 / 21122 (**95.4%**) |
+| frames per re-centre | 8 | 8 |
+
+**Both numbers moved, in opposite directions, and that is the point.** The
+ordering fix does what it was for — the camera's own row is now genuinely last,
+so the stale region no longer reaches the ground under the player. It also made
+the *total* worse, because the rows that now go last are the camera's, which hold
+fewer occupied texels than the terrain-dense rows the old ordering happened to
+leave until the end. **Ordering controls where the staleness is, not how much of
+it there is**, and these two numbers are that sentence measured.
+
+**The claim this ships on, stated exactly as measured:**
+
+> A transient exists. It is bounded to ≤8 frames, the camera's own row is
+> restaged last, and the nearest stale row is 3.3 m from the camera.
+
+**It is NOT "confined to the far field" and that phrasing is not used**, because
+95.4% is not a far-field number. The 3.3 m is also a *vertical* gap only — stale
+rows are whole XY slabs, so at that Z the staleness extends horizontally
+everywhere. Whether any of this is visible is unmeasured; it is on the manual
+checklist (§6b) as something only a moving camera and a human eye can answer.
+
+**How much this matters today: less than it looks.** Re-centring only runs inside
+a path that is off by default *twice over* — `voxel.GI.Volume 0`, and its only
+consumer `voxel.Stream.GPU 0`. So it ships disabled in practice, and the residual
+risk is carried by a feature nobody can enable by accident.
+
+### B3 (step 5) — see "the correction this wave owes the plan" above
+
+Retired: the pooled path's dead `RefreshQueue` traffic. Kept, as required:
+`NotifyPooledChunkMeshUpdated`'s quad hand-off — the field must still be fed.
+Not retired, because it does not exist on this path: the 5×5×5 re-shade and the
+quad subdivision.
+
+### B4 — the two shade formulas, reconciled
+
+All four divergences were live, and all four would have surfaced as a lighting
+seam at the `voxel.Stream.GPUMaxLevel` boundary where both renderers draw into
+one frame.
+
+| # | was | now |
+|---|---|---|
+| 1 | `Strength`/`AmbientFloor` **hardcoded** 1.0/0.06, ignoring `voxel.GI.Strength` / `voxel.GI.AmbientFloor` | supplied by the subsystem through `FVoxelGIVolumeSettings` (VoxelEarthShaders may not depend on VoxelEarth, so they cannot be read there) |
+| 2 | fade radii derived from the volume extent (896/1152 UU at Dim 64) vs the CPU's 4800/6400 — design risk 8, live | the same cvars feed both paths, clamped to the half-extent |
+| 3 | `DistUU` measured to the **volume centre** | measured to the **camera**, which is what the CPU measures; the dead zone makes those differ by up to 2560 UU |
+| 4 | **one** probe offset (0.6 cells) vs the CPU's three | the same three, `{0.6, 1.25, 2.0}`; later samples only execute where the first missed |
+
+On (2), the clamp **slides the band rather than truncating it**. Clamping
+`FadeEnd` alone would have left `FadeStart` where it was and collapsed a 1600 UU
+fade into a **40 UU** one at `VolumeDim 192` — which is the hard lighting ring
+risk 8 describes, reached from the other direction. A fired clamp is now logged
+(`VoxelGI volume params:` prints both the effective fade and the one the cvars
+asked for), because risk 8's whole difficulty is that it produces a plausible
+image.
+
+On (4), the CPU walks three offsets specifically because a 20 cm roof slab is
+half a light-field cell thick. Shipping one offset GPU-side had quietly
+reintroduced the roof-underside defect this module already fixed once.
+
+**A cost fix found while doing (2), worth its own line.** The shader now skips
+the volume sample entirely when the probe UVW is outside `[0,1]`. That is not an
+edge case: the volume covers ±38.4 m of a **2 km** cascade, so most pixels on
+screen are outside it; the sampler is `AM_Clamp`, so an outside lookup returns the
+face texel (step 1 saw exactly this as "large smeared bands" and nearly diagnosed
+it as an addressing bug); and the material is masked, so the **depth pass pays it
+too**. Skipping is exact, not approximate — the fade is clamped to end inside the
+half-extent, so `Weight` is already 0 wherever the branch fires.
+
+### B5 — the two correct-by-construction claims, now measurable
+
+`voxel.GI.VolumeDigTest [radiusUU]` carves through the real edit path
+(`CarveSphere`), **suppresses the round-robin re-solve** for the duration — the
+round-robin delivers bricks in `TMap` iteration order, which is exactly what makes
+the steady-state 1.4 bricks/run figure uninformative about the dig case — and
+then reads its answers out of `VolumeShadow`, the actual staged bytes rather than
+a re-encode.
+
+It reports three things: bricks-per-run on a contiguous neighbourhood,
+zero-on-revoxelize (dug bricks reach the volume as `A = 0` **before** the solve
+lands, so a tunnel cannot keep its pre-dig lighting), and zero-on-evict, driven
+through the real `EvictFarBricks` rather than waited for.
+
+**NOT RUN — unverified.** The harness is built, committed and compiles, but the
+box time went to B7 (which decides the release), the B2 re-measure and B-M. The
+X-run merge on a dig, zero-on-revoxelize and zero-on-evict therefore remain
+**correct by construction only**, exactly as they were before this wave, with the
+one difference that measuring them is now a single console command rather than a
+piece of work. Same for the **Dim 256 coverage** run: coverage is measured at
+Dim 64 (48 of 2,212 bricks in volume) and Dim 128 (323 of 2,212), and the
+192 figure is 933 of 2,212, but 256 was not reached.
+
+### B6 — the live-toggle claim is now true
+
+`voxel.GI.Volume`'s help text said it was read per frame. It was not:
+`UpdateParameters_RenderThread` had three callers, none per-frame, so `Enabled`
+and `DebugVis` were latched for the session. There is now a real per-frame driver
+(`TickVolume`) that re-publishes the uniform buffer whenever any input actually
+changes — the same hook B2 needed, as predicted.
+
+**Also fixed while in here:** the volume texture was allocated in `InitRHI`. It is
+a `TGlobalResource`, so that charged **every** session for it whether or not GI
+was ever enabled — 1 MB at the bring-up `Dim 64`, but **67 MB at the recommended
+shipping `Dim 256`**, handed to players who never turn GI on. It is now allocated
+on first enable, and zeroed on creation (undefined bytes in the validity channel
+read as "there is data here", i.e. arbitrary irradiance on every surface until the
+first upload covers that texel).
+
+### B7 — ship it on
+
+**Target, as it now stands: `voxel.GI.Enabled 1` and `voxel.GI.Volume 0`.**
+
+The original wording was "Wave B is complete when `voxel.GI.Enabled 1` **and**
+`voxel.GI.Volume 1` are the defaults". That conflated two things, and the
+conflation only became visible once the coupling below was found.
+
+**The coupling the plan missed: `voxel.GI.Volume 1` has no consumer under
+`voxel.Stream.GPU 0`, which is the default.** Only the pooled vertex factory
+samples the volume; the per-chunk component path bakes GI into vertex colours
+and never reads the texture. So shipping the volume on by default is not a Wave B
+decision at all — it is gated on Wave A's `voxel.Stream.GPU` flip, which Wave A
+has measured as not ready. The plan's "Order of execution" treats A and B as
+independent and disjoint. They are disjoint in *files*; they are not independent
+in *shipping*.
+
+**What that leaves is better, not worse: GI can ship today, on the renderer that
+is actually the default, with no new work.** The component path's CPU-baked
+per-vertex GI already works. `voxel.GI.Enabled 1` with `voxel.GI.Volume 0` is a
+shipping configuration right now, and it satisfies the owner's actual request —
+"ship GI on by default" — rather than the narrower reading.
+
+**The volume is correct-and-off, not unfinished.** Its encoding is exact
+(B1: 0.000 on every direction class, against a live control), its shade formula
+matches the CPU's term for term (B4), its parameters are live (B6), and its
+uploads are measured (B5). What it lacks is a renderer that reads it.
+
+**And it is gated on something with a known fix, not on a mystery — which is a
+materially different thing to tell the owner.** Wave A confirmed
+`voxel.Stream.GPU` stays 0 (both legs put the pooled path above the component
+path straight down, 0.17 and 0.13 ms against a pre-registered 0.114 ms
+threshold), so the gate is real. But Wave A also retracted its own "the residual
+is not geometry" claim and landed a **linear cost model**: pooled cost is a ~2 ms
+floor plus **~1.19 µs per 1000 quads drawn**, holding to **1.1%** across two
+poses that differ 4× in frame time. Under that model compaction is worth ~4.7 ms
+at the horizon, which would plausibly put the pooled path ahead outright. So the
+honest framing is **"correct-and-off, waiting on a known fix"**, not
+"correct-and-off, indefinitely" — the day `voxel.Stream.GPU` flips, the volume is
+already exact, already matched to the CPU shade term for term, and already
+measured.
+
+**Noise floor, pre-registered.** Wave A measured **four of five control pairs
+repeating to under 0.5%** on a quiet box, on the same pinned-pose harness. That
+is a sharper prior than this programme had before, and it is used here as a
+*rejection* criterion, not a comfort: a spread much wider than 0.5% between
+identical configs means something is wrong with the leg and it gets re-run, it
+does not get reported as noise.
+
+**MEASURED. Recommendation: do NOT flip `voxel.GI.Enabled` on yet.** One binary,
+warm box (the first leg of the session was discarded as warmup), pinned pose
+`-VoxelPerfFlight=static -VoxelPerfYaw=45 -VoxelPerfPitch=-20`, component path
+(`voxel.Stream.GPU 0`), command line verified against `LogInit: Command Line:` on
+every leg.
+
+| leg | p50 (ms) | p95 (ms) | max (ms) | hitches |
+|---|---|---|---|---|
+| GI off — 1 / 2 / 3 | 22.955 / 23.408 / 23.375 | 26.592 / 28.129 / 27.518 | 38.6 / 41.6 / 42.5 | 26 / 21 / 23 |
+| **GI on** — 1 / 2 | 23.337 / 23.399 | 31.453 / 31.318 | 47.3 / 50.7 | **70 / 78** |
+
+**A third off leg exists because the pre-registered 0.5% rule rejected the first
+pair** (off-1 vs off-2 spread 1.97%). With it the off p50 tightens to
+23.25 ± 0.9%. A rule that only ever confirms is not a rule.
+
+**Clamp check: all five legs verified UNCLAMPED.** `AWorldSettings::MaxUndilatedFrameTime`
+is 0.4 (`BaseGame.ini:199`) and `UVoxelPerfRunSubsystem` is a tickable *world*
+subsystem, so the `DeltaTime` it samples is already clamped at **400 ms** — a
+scene below 2.5 fps records every frame as exactly `400.000`, and each one counts
+as a hitch. Wave E found this. These five legs peak at **38.6–50.7 ms**, an order
+of magnitude clear of it, so nothing in the table above is the clamp.
+
+**One leg in this wave WAS clamped, and none of its numbers are used for a
+frame-time claim.** The B-M surface flight (finding B-M below) reports
+`maxFrameMs = 400.000` with 360 hitches in 2,046 post-warmup frames. Everything
+taken from that leg — brick counts, `rejectedRadius`, `camAboveSurface` — is read
+from the GI debug line and is not frame-time derived, so B-M's conclusion stands.
+Its `max`, `hitchCount` and `p95` are **not** quotable as scene properties.
+Same caveat applies to Wave A's merged figures, whose legs also show
+`maxFrameMs: 400.000`: its verdict rests on p50/p95 far above the clamp and is
+unaffected, but its `max` and hitch numbers are the clamp, not the scene — which
+is why the Wave A results cited elsewhere in this section are the **p50 delta and
+the cost model**, never a hitch count.
+
+| metric | off | on | delta | ranges overlap? |
+|---|---|---|---|---|
+| p50 | 23.25 | 23.37 | **+0.6%** | yes — below noise |
+| p95 | 27.41 | 31.39 | **+14.9%** | **no** |
+| hitches | 23.3 | 74.0 | **×3.2** | **no** |
+| max | 40.9 | 49.0 | +19% | no |
+
+**GI is free at the median and expensive in the tail.** That independently
+reproduces the shape already on record for this module from a different
+experiment: the `voxel.GI.LegacyProxyRebuild` A/B concluded the re-shade cost was
+*"mostly a TAIL and throughput problem, not a median one"*. Two unrelated
+measurements agreeing on the shape is worth more than either alone.
+
+**Why this is a "report it" and not a "ship it".** The plan's own instruction is
+*"if the cost is not acceptable, report the number rather than shipping it on
+regardless"*. A 3.2× hitch count is the metric a player actually feels; p50 being
+free does not compensate for it. The owner asked for GI on by default and the
+honest answer is that it costs a tripling of hitches at the current tuning.
+
+**The knob, and it is tuning rather than a rebuild.**
+`voxel.GI.MaxChunkRefreshesPerFrame` (default 4) bounds the re-shade drain, which
+is where this tail comes from. A sweep of 4 / 2 / 1 is owed, judged on **hitch
+count and p95 — not p50, which this measurement has already shown is not where
+the cost lives** — and it must also report what it costs on the other side, since
+a smaller drain means lighting converges more slowly after an edit. If no setting
+brings hitches near the off-baseline, that is a complete answer too.
+
+**Sweep protocol, pre-registered before running it**, because the sweep
+deliberately explores configurations expected to be *worse* than the ones above
+and is decided on exactly the two statistics the 400 ms clamp corrupts:
+
+1. **Read `postWarmupMaxFrameMs` on every leg first.** Exactly `400.000` means
+   the clamp fired.
+2. If it fired, that leg's **`max` and `hitchCount` are the clamp, not the
+   scene**, and are reported as such rather than tabulated beside unclamped rows.
+   A genuinely terrible config would otherwise be indistinguishable from a merely
+   bad one — or look *better*, by having its tail flattened to a constant.
+3. **Bound the clamped fraction** by `postWarmupHitchCount / postWarmupFrameCount`
+   (every clamped frame is necessarily a hitch, so this is an upper bound). p50
+   survives below 50%, p95 below 5%. On the B-M leg that bound is 17.6%, which is
+   why its p95 is not quoted either.
+4. The GI-off baseline (23.3 hitches / 27.41 ms p95) sits in the sweep table as a
+   **row**, not a footnote, so the target is visible rather than only the trend.
+5. Report `edit → fully-relit` wall-clock per config, **measured** rather than
+   inferred from the budget arithmetic, so the owner chooses between two named
+   quantities.
+6. Report resident brick count per config as well: a slower drain could **deepen
+   finding B-M** rather than being neutral to it, and an interaction between the
+   fix and an open finding belongs in the recommendation, not a follow-up.
+
+**The ship criterion, fixed BEFORE the rows exist.** Otherwise the sweep produces
+four rows and a judgement call, which is the situation pre-registration exists to
+prevent. Thresholds are derived from this wave's own measured run-to-run spread
+on the *off* configuration, not chosen for roundness: p95 varied **5.6%** across
+three legs (26.592 / 28.129 / 27.518) and hitch count varied **±11%**
+(26 / 21 / 23). Each threshold below is about **twice** the corresponding noise —
+the smallest increase that can be resolved from noise at all, doubled, so a
+passing config is one whose cost is real but barely detectable.
+
+| tier | hitches | p95 | edit→relit | verdict |
+|---|---|---|---|---|
+| **Ship** | ≤ **1.25×** baseline (≤ 29.1) | ≤ **1.10×** (≤ 30.15 ms) | ≤ **2.0 s** | recommend `voxel.GI.Enabled 1` as the default |
+| **Conditional** | ≤ 1.5× (≤ 35.0) | ≤ 1.15× (≤ 31.5 ms) | ≤ 3.0 s | shippable **only** if the owner accepts a named, quantified cost |
+| **No** | anything worse | | | do not ship; report the knob's whole range |
+
+All tiers additionally require **≥2 unclamped legs** at that setting. A tie
+between tiers resolves **downward**.
+
+#### The sweep result: **no setting reaches Ship or Conditional. GI cannot ship on by default without further work.**
+
+Frame-time half (≥2 unclamped legs each; max 41–46 ms, clamped-fraction bound
+1.0–3.8%, all well under the 5% p95 limit) and latency half (one leg each,
+`voxel.GI.RelightTest`, 300 UU carve through the real edit path):
+
+| config | p50 | p95 | hitches | **edit → fully relit** | tier |
+|---|---|---|---|---|---|
+| **GI off** (target) | 23.25 | **27.41** | **23.3** | n/a | — |
+| refresh **4** (default) | 23.37 | 31.39 | 74.0 (×3.2) | **335 ms** | **No** — hitches |
+| refresh **2** | 23.52 | 29.74 | 40.5 (×1.74) | **2550 ms** | **No** — both |
+| refresh **1** | 23.35 | **28.86** (×1.05) | **26.7** (×1.14) | **TIMEOUT >30 s** | **No** — latency |
+
+Ship needs hitches ≤29.1, p95 ≤30.15 ms **and** relight ≤2.0 s; Conditional ≤35.0,
+≤31.5 ms, ≤3.0 s. Peak queue depths are reported beside each duration
+(`peakDirtyQueue=206`, `peakRefreshQueue=66/337`) so a reader can confirm the work
+existed rather than taking a fast number on trust.
+
+**The knob does not have a good setting; it has an exchange rate.** Refresh 1 is
+the only config whose frame cost is acceptable (1.14× hitches, 1.05× p95 — both
+inside Ship) and it is the *worst* on latency by a wide margin. Refresh 4 relights
+in a third of a second and costs 3.2× the hitches. Refresh 2 manages to be bad at
+both. **There is no setting where a dug tunnel relights promptly and the frame
+tail is acceptable**, which is a complete answer to the sweep and the reason the
+recommendation is unchanged.
+
+**Why refresh 1 times out, which is the actionable part.** 174 bricks do not take
+30 s to re-shade at one chunk per frame — 30 s is ~1,290 frames. The edit's
+chunks are **queued behind the round-robin re-solve**: `RefreshQueue` sits at
+~1,288 entries in steady state at this budget (measured in the sweep legs), it is
+FIFO, and an edit's entries join the back. So the edit waits for the entire
+background backlog to drain ahead of it. At refresh 4 the backlog is short enough
+that this does not bite; at refresh 1 it is fatal.
+
+That points at a fix which is neither a bigger budget nor a smaller one:
+**priority, not throughput.** An edit-driven refresh serves a change the player
+just made and is watching; a round-robin refresh serves slow convergence nobody
+is waiting on. Draining edit-driven entries first — or giving them a separate
+reserved budget — would decouple the two axes this sweep found locked together,
+and is the obvious next thing to try. It is a code change, not a tuning change,
+so it is out of Wave B's scope and recorded here rather than attempted.
+
+**And the recommendation carries finding B-M regardless of which tier is hit.**
+If GI is largely absent under motion, shipping it on by default buys less than
+these numbers suggest — a cheap feature that is mostly not there is a different
+proposition from a cheap feature that works, and the owner gets that sentence
+attached to whichever tier the sweep lands in.
+
+### Considered and rejected: making the COMPONENT path sample the volume
+
+The obvious way to decouple B7 from Wave A. **Do not build it.** Recorded with
+reasons so it is not reached for again:
+
+- It needs a **material-graph change** to `M_VoxelTerrain` — the single thing
+  §0 of the design doc establishes this whole feature does *not* need, and the
+  reason the vertex-colour fold was chosen in the first place.
+- The volume is a raw `FRHITexture` in a global uniform buffer that nothing binds
+  for component draws. Reaching it from a material needs either a
+  `UVolumeTexture` wrapper set on a material instance, or a custom vertex factory
+  for the component path. Material Parameter Collections cannot carry textures.
+- The UVW cannot be computed from world position in the material without hitting
+  §6's precision rule (float32 ULP is 1.0 UU at 8.4 M UU against a 40 UU cell).
+  The workable route is per-chunk **custom primitive data** carrying
+  `ChunkOrigin − VolumeOrigin` — which then has to be **rewritten on every one of
+  ~2,000 components at every re-centre**, i.e. roughly the per-component touch
+  the volume exists to delete.
+- Worst: it would make the material graph a **third** copy of the shade formula.
+  B4 found the existing **two** copies had silently diverged in **four** places.
+  A third copy, in a graph where a divergence cannot be grepped for, is the wrong
+  direction.
+
+### B-M — **the light field is effectively empty under motion. NOT ROOT-CAUSED.**
+
+Found while trying to verify B2, and it is a bigger question than B2: it asks
+whether voxel GI works at all in play, as opposed to in a stationary capture.
+
+**Measured**, same build, same seed, same spawn (`-VoxelSpawnAt=-84480,53760`):
+
+| scene | resident light-field bricks |
+|---|---|
+| settled, camera stationary | **2,212** |
+| during `-VoxelPerfFlight=surface` (~20 m/s), whole 90 s run | **0–12** |
+
+Throughout the flight the GI tick reports `pendingVox=0(+0 pooled)` — the ingest
+queue is not backed up, it is **empty** — while the streaming system is loading
+normally around it (`R0 loaded=3131`, `loaded=53855` cumulative, pool active).
+So chunks are being meshed and pooled, but almost none of them are reaching
+`NotifyPooledChunkMeshUpdated` → `PendingPooledVoxelize` → `VoxelizeChunk`, or
+they are being dropped immediately after.
+
+**Why it matters, and where it lands.** A player is moving most of the time. If
+GI is present only when standing still, then `voxel.GI.Enabled 1` as a default
+buys much less than the cost legs suggest, and every screenshot ever taken of
+this feature — all of which are settled, stationary scenes by house style — has
+been measuring the one case where it works. It also means the B2 re-centring
+verification cannot be done on the scripted flight at all, which is how this was
+found.
+
+**Leading hypothesis, from reading the fixture rather than from a run: the
+surface perf flight leaves GI range, and this is a property of the HARNESS.**
+
+- `voxel.GI.RadiusUU` is **7000 UU (70 m)**, and the voxelize drain skips any
+  chunk with `Dist(OriginUU, FieldCentreUU) > BuildRadiusUU`.
+- `-VoxelPerfFlight=surface` computes `FixedHeightUU` **once**, from the surface
+  height at the circle *centre*, plus `HeightAboveSurfaceUU = 3000` (30 m), then
+  pins `NewLocation.Z = FixedHeightUU` for the entire **100 m-radius** circle
+  (`VoxelPerfRunSubsystem.cpp`, `CircleRadiusUU = 10000`).
+- The **underground** flight deliberately does not do this, and its own comment
+  says why: *"over a 100 m circle the surface can easily move more than 60 m, and
+  a fixed Z would surface partway round."*
+
+So the fixture states in its own source that terrain along the circle can move
+>60 m while the surface variant pins Z. Wherever the terrain drops more than
+~40 m below the spawn column, the camera is >7000 UU above it, **every** level-0
+chunk fails the range test, and the field empties — which would produce exactly
+the observed `pendingVox=0` / 0–12 bricks / `0 of 0 occupied` signature.
+
+**Be precise about what is and is not evidence here.** The logged flight camera Z
+of **84543 held constant** across all seven re-centres establishes only that the
+**mechanism is live** — Z really is pinned. It is *not* corroboration that the
+hypothesis fires. Against the settled camera Z of 82044 at the same spawn, that
+is a gap of ~25 m, **comfortably inside** the 70 m radius: at the spawn column a
+camera 25 m up still has level-0 chunks well within range. **The pinned Z is the
+mechanism; the terrain profile around the circle is the trigger**, and only the
+counter shows whether the trigger is pulled.
+
+**How to read the result, decided in advance so it cannot be read to taste:**
+
+| observation | conclusion |
+|---|---|
+| `camAboveSurface` > 7000 for a **sustained fraction** of the circle, with `rejectedRadius` high | the artifact is real and material; B-M is a harness property |
+| `camAboveSurface` > 7000 only **briefly**, or never | the pinned Z is a **latent hazard but not the explanation**; B-M stays open and unexplained |
+| `rejectedRadius` ≈ 0 while bricks stay empty | not a range problem at all — a real ingest or streaming fault |
+
+The middle row is a live possibility. This is the fourth root-cause hypothesis
+raised in this programme and three of the previous ones were wrong, so it is
+recorded as a hypothesis with a falsification condition attached rather than as
+an explanation waiting for confirmation.
+
+**If this is right it is a finding about every measurement that fixture has ever
+produced**, not just this one — and it *removes* a caveat from B7 rather than
+adding one, because it would mean GI is absent in the harness rather than in the
+game.
+
+**Not yet distinguished from:** `EvictFarBricks` (up to 64 per half-second)
+outrunning the 16-chunk-per-frame voxelize budget, or the ingest hook not firing
+for most pooled applies.
+
+**Made decidable in one log line rather than two runs.** `voxel.GI.Debug 1` now
+prints `rejectedRadius=` (chunks skipped by the range test) beside
+`camAboveSurface=` and the radius itself. Chunks arriving and being rejected for
+range is the fixture hypothesis; chunks never arriving is a real ingest or
+streaming fault. The counter separates them without inference.
+
+**MEASURED — the top row of the table above, confirmed and material.** Surface
+flight, `voxel.GI.Debug 1`, per-second samples across the whole circle:
+
+- `camAboveSurface` ran **6188 → 12849 UU (62–128 m)** against the 70 m radius,
+  **exceeding it for most of the circle**;
+- `rejectedRadius` ran **162–1244 chunks per second** — chunks are arriving and
+  being rejected for range, not failing to arrive;
+- `bricks` stayed **0** throughout.
+
+So the fixture pins Z, the terrain drops away beneath it, and the camera spends
+most of the circle outside the GI build radius. **This is a property of the
+`-VoxelPerfFlight=surface` harness that every measurement taken with it
+inherits**, not only this one.
+
+**The caveat is the valuable half, and it keeps the finding open.** Bricks stayed
+at **0 even at the 6188 UU minimum**, where the camera is *nominally in range* —
+at that height a disc of terrain ~32 m in radius sits inside the 70 m sphere and
+should have voxelized. So the fixture explains **most, but not provably all**, of
+B-M. Something else may also be suppressing ingest, and this is not closed.
+
+**Legs still owed:** the **underground** flight as a control (it tracks the
+surface at a constant offset by construction, so bricks staying populated there
+while the surface flight collapses would implicate the fixture and would also
+speak to the residual), and brick count **~5 s after coming to rest** — which
+answers the question the owner actually cares about, and whose
+recover/does-not-recover fork is the same one that splits the ring-gap symptom in
+`docs/manual-verification-checklist.md` §1.
+
+**Deliberately not chased in this wave.** Recorded so it survives, and carried as
+a caveat on the B7 recommendation rather than fixed under it.
 
 ## Wave C — the determinism gate — **GREEN, landed 2026-07-26**
 
@@ -2052,9 +2711,23 @@ Four, all found while planning this from the source:
 3. **Wave B's stated purpose describes work that does not exist.** Pooled bricks are
    never re-shaded, so there is no lighting-driven pooled re-mesh to retire. The
    retirable cost is on the component path, plus the quad subdivision.
+   **— CORRECTED AGAIN (2026-07-26, Wave B), same direction.** The component
+   path does not pay it either, under the configuration that has a volume to
+   sample: `ApplyMeshResult`'s pooled branch returns before constructing a
+   `UVoxelChunkComponent` for every level-0 chunk, and `BuildChunkVertexData`
+   gates all GI work on `ChunkLevel == 0`. Both costs are already zero on that
+   path. Wave B's prize is a **capability**, not a saving — see Wave B above.
+   Third statement of this item, second correction; the pattern is that each
+   version was written one level of indirection away from the code.
 4. **The horizontal-error figure disagrees across the tree** — `6.165 / control
    0.565` in the roadmap and backlog, `5.950 / control 0.591` in the design doc's
    own transcript. Reconcile to one run, or record that they are two.
+   **— RESOLVED (2026-07-26, Wave B): they are two, and a third.** Two legs on one
+   build agree to ±0.17 bytes, so the harness is precise; the figure tracks the
+   **field composition** at the moment it fires (1,947 vs 2,212 resident bricks).
+   At the settled 2,212-brick state it is **9.5**, which **fails** the design
+   doc's own 8/255 bar. Quote the brick count beside the error or the number
+   means nothing. Full working in Wave B, B1.
 
 That is three of six waves whose published root cause or fix was wrong. Worth
 noting plainly in the doc: **the roadmap was written from summaries, and this plan
