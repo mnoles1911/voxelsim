@@ -717,10 +717,30 @@ surface perf flight leaves GI range, and this is a property of the HARNESS.**
 So the fixture states in its own source that terrain along the circle can move
 >60 m while the surface variant pins Z. Wherever the terrain drops more than
 ~40 m below the spawn column, the camera is >7000 UU above it, **every** level-0
-chunk fails the range test, and the field empties — producing exactly the
-observed `pendingVox=0` / 0–12 bricks / `0 of 0 occupied` signature. Consistent
-with the logged flight camera Z of **84543 held constant** across all seven
-re-centres.
+chunk fails the range test, and the field empties — which would produce exactly
+the observed `pendingVox=0` / 0–12 bricks / `0 of 0 occupied` signature.
+
+**Be precise about what is and is not evidence here.** The logged flight camera Z
+of **84543 held constant** across all seven re-centres establishes only that the
+**mechanism is live** — Z really is pinned. It is *not* corroboration that the
+hypothesis fires. Against the settled camera Z of 82044 at the same spawn, that
+is a gap of ~25 m, **comfortably inside** the 70 m radius: at the spawn column a
+camera 25 m up still has level-0 chunks well within range. **The pinned Z is the
+mechanism; the terrain profile around the circle is the trigger**, and only the
+counter shows whether the trigger is pulled.
+
+**How to read the result, decided in advance so it cannot be read to taste:**
+
+| observation | conclusion |
+|---|---|
+| `camAboveSurface` > 7000 for a **sustained fraction** of the circle, with `rejectedRadius` high | the artifact is real and material; B-M is a harness property |
+| `camAboveSurface` > 7000 only **briefly**, or never | the pinned Z is a **latent hazard but not the explanation**; B-M stays open and unexplained |
+| `rejectedRadius` ≈ 0 while bricks stay empty | not a range problem at all — a real ingest or streaming fault |
+
+The middle row is a live possibility. This is the fourth root-cause hypothesis
+raised in this programme and three of the previous ones were wrong, so it is
+recorded as a hypothesis with a falsification condition attached rather than as
+an explanation waiting for confirmation.
 
 **If this is right it is a finding about every measurement that fixture has ever
 produced**, not just this one — and it *removes* a caveat from B7 rather than
