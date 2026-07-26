@@ -256,7 +256,7 @@ works.
 
 ---
 
-## 7. How far out terrain should cast shadows — a quality call, and only you can make it (added Wave G)
+## 8. How far out terrain should cast shadows — a quality call, and only you can make it (added Wave G)
 
 **This one is not a bug hunt. It is a trade between two named quantities, and no
 harness in this project can score it.**
