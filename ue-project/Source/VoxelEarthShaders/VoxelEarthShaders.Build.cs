@@ -17,6 +17,7 @@
 // Engine/Plugins/Experimental/DynamicWind, whose .uplugin marks its runtime
 // module PostConfigInit for exactly this reason.
 
+using System.IO;
 using UnrealBuildTool;
 
 public class VoxelEarthShaders : ModuleRules
@@ -28,6 +29,16 @@ public class VoxelEarthShaders : ModuleRules
 		// Matches VoxelEarth. voxel-core is C++20 and its headers are included
 		// by the verification path, so both modules must agree.
 		CppStandard = CppStandardVersion.Cpp20;
+
+		// voxel-core HEADERS ONLY. VoxelGpuWorldGen.cpp's
+		// ModifyCompilationEnvironment passes vxc::kWorldGenVersion into
+		// worldgen.ush, which #errors if the two disagree — the version half of
+		// the mirror contract described at the top of that shader. This module
+		// deliberately links nothing from voxel-core: VoxelEarth owns
+		// voxelcore.lib and its staleness guard, and adding a second linker
+		// dependency here would give that guard a second place to be wrong.
+		PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "..", "..", "..",
+		                                    "voxel-core", "include"));
 
 		PublicDependencyModuleNames.AddRange(new string[]
 		{

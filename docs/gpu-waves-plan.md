@@ -373,10 +373,123 @@ frame per re-centre); a dig-and-hold PIE capture for B3; a pinned-pose A/B for B
 
 ---
 
-## Wave C — the determinism gate (blocks Wave D on correctness)
+## Wave C — the determinism gate — **GREEN, landed 2026-07-26**
 
-**In-game:** nothing directly. But while this is red, GPU-generated voxel state
-cannot be trusted, and Wave D writes exactly that.
+**In-game:** nothing directly. But while this was red, GPU-generated voxel state
+could not be trusted, and Wave D writes exactly that. **Wave D's correctness
+precondition is now met.**
+
+### Result
+
+| leg | toolchain | result | digest |
+|---|---|---|---|
+| `bench/vxc_gpu.exe` | DXC `cs_6_0` → SPIR-V → Vulkan | **PASS**, bit-exact, ×2 legs | `6e893ab3679a8c81` |
+| `voxel.GPU.VerifyRegion` | UE `cs_6_6`/`6_8` → DXIL → D3D12 | **PASS**, bit-exact, ×2 legs | `6e893ab3679a8c81` |
+
+8,192 columns / 393,216 cells / 6,668 quads, AMD Radeon RX 7800 XT, both legs on
+the same box on 2026-07-26.
+
+### The cause: worldgen version skew inside one process
+
+**Neither C1a nor C1b. Not the toolchain and not the shader.** The failing run
+compared a **worldgen v6 CPU reference** against a **worldgen v8 GPU kernel**:
+`voxelcore.lib` predated the v8 climate landing (`e25d563`, on `main` from
+`2c7eb68`, 19:28) while Unreal compiled the current `worldgen.ush`. The gate went
+green the moment the library was rebuilt (02:00) and the editor relinked (03:00);
+no source commit in between touched `worldgen.ush`, `shaders/prebuilt/`,
+`VoxelGpuWorldGen.cpp` or voxel-core's amplifier.
+
+Established by reconstruction, not by argument — three isolated bench runs:
+
+| CPU build | shader | result |
+|---|---|---|
+| v6 (`2c7eb68^1`, separate worktree and build dir) | its own v6 SPIR-V | **PASS** `f3c48a4df3e20e9a` — the reconstruction is faithful |
+| **v6** | **current v8 SPIR-V** | `cpu=2 gpu=5` @ vz=11648, `cpu=5 gpu=12` @ vz=11654 — **the recorded failure, exactly** |
+| current v8 | pre-mirror v6 SPIR-V (`3fbf3f7^`) | the mirror image, `cpu=5 gpu=2` / `cpu=12 gpu=5` — so the shader was not the stale half |
+
+Corroborating: the recorded `3424 quads (cpu 3422)` is GPU-then-CPU, and 3,422 is
+measured to be the **v6** quad count for that region while 3,424 is the **v8**
+count. The two numbers on that one line came from different worldgen versions.
+
+### C1a and C1b: both falsified, both cheaply
+
+- **C1a — `$Globals` packing.** Clean. Disassembling both variants (`dxc -Fc`)
+  gives byte-identical constant-buffer layouts: `DispatchColumns` 0,
+  `RasterOriginPx` 8, `RasterSize` 16, `PixelSizeMm` 24, `SeedLo` 28, `SeedHi`
+  32, `OriginVx` 36, `OriginVy` 40, **`BrickZMin` 44**, `BricksZ` 48,
+  `ScanCount` 52, total 56 bytes — identical for the `VXC_UE` `$Globals` at
+  `cs_6_6` and the bench's explicit `cbuffer` at `cs_6_0`. The proposed "write
+  `BrickZMin` into an unused output slot" probe was not needed: a packing
+  mismatch cannot coexist with bit-exactness over 393,216 cells, which the DXIL
+  leg now delivers.
+- **C1b — int64 codegen across shader models.** Clean. UE compiles the DXIL leg
+  at `cs_6_6`/`6_8` and `tools/compile-shaders.ps1` compiles the SPIR-V leg at
+  `cs_6_0`; they agree bit-for-bit. Nothing to isolate.
+- **C0 — source/bytecode skew.** Re-verified live rather than on the record:
+  `tools/compile-shaders.ps1` respun all seven kernels and every `.spv` came out
+  **byte-identical** to the committed bytecode (SHA-256 matches
+  `shaders/prebuilt/README.md`'s v8 table).
+
+### What was actually changed, and why
+
+The gate was already green when Wave C opened, so the work is the guards that
+stop this failure presenting the same way a fourth time.
+
+1. **`voxel.GPU.VerifyRegion` pins a CPU-reference digest** (`kExpectedCpuDigest`),
+   folded from `vxc::Amplifier`/`vxc::meshBrick` with nothing from the GPU in it.
+   A mismatched `voxelcore.lib` now fails with *"the linked voxelcore.lib is NOT
+   the worldgen this gate is pinned to"* instead of a list of cell materials, and
+   it catches both sides moving **together**, which GPU-vs-CPU equality
+   structurally cannot. This is **not** a re-baseline of the Unreal GPU digest —
+   `046b4a9f9c5e49b7` is recorded nowhere.
+2. **Mismatches are classified by stage** (column field / cell / quad), counted
+   uncapped, and the printed list is labelled as an ordered subset that must not
+   be quoted piecemeal.
+3. **A compile-time worldgen version lock in `worldgen.ush`.**
+   `VXC_WORLDGEN_VERSION_USH` must equal `vxc::kWorldGenVersion`, which
+   `ModifyCompilationEnvironment` passes in as `VXC_WORLDGEN_VERSION_CPP`; a
+   mismatch is a shader `#error` (verified by compiling with a deliberately wrong
+   value, and with the define absent). Because defines feed the shader's DDC key,
+   a version bump now also forces a recompile instead of silently reusing the
+   previous version's bytecode. Scope stated in the file: `kWorldGenVersion` is a
+   header constant, so this catches **source** skew and not a stale `.lib` —
+   that is guard 1's job, plus `VoxelEarth.Build.cs`'s timestamp warning.
+
+`worldgen.ush`'s only edit is preprocessor-level and inside `#ifdef VXC_UE`,
+which is why the SPIR-V respin is byte-identical: the bench leg is provably
+running the same program as before.
+
+### The lesson, which is not about shaders
+
+Three published root causes, all wrong, and the same mechanism produced all
+three: **each was derived from a transcript rather than from a re-run.** The
+failing log's own first lines named the cause — column fields disagreeing — and
+were dropped when the log was excerpted into `backlog.md`. Everything downstream
+then had to explain a cells-only divergence, which is a kernel-shaped fault, so
+three kernel-shaped hypotheses followed.
+
+The cheap habit that closes it: **before theorising about a compiler, rebuild the
+static library and re-run.** A stale `.lib` is not a "separate issue" from a
+determinism-gate failure; it is one of its two likeliest causes and by far the
+cheaper one to eliminate.
+
+### Still owed
+
+- **C2 — NVIDIA determinism leg.** Never run; the cross-vendor claim still rests
+  on one AMD card. Now unblocked. **Not run here: this box has no NVIDIA GPU and
+  no rented one was available to the session.** `tools/run-nvidia-digest.sh` is
+  the entry point.
+- **C3 — min-spec-proxy M1 gate re-run.** Not attempted, deliberately: it is a
+  60 s frame-time measurement and this box was running three other build/editor
+  agents concurrently. Ground rule 1 exists because numbers taken that way have
+  already been retracted once. It also wants to land after Wave A, which changes
+  what it measures.
+- **`gpu-streaming-plan.md:63-64`, `streaming-handoff.md:12,120` and
+  `gpu-g2-draw-path.md:115` still quote the pre-v8 bench digest
+  `f3c48a4df3e20e9a`.** Re-baselining those to `6e893ab3679a8c81` is legitimate;
+  left alone here only to stay off files other waves are editing.
+
+### The original analysis, kept for the record
 
 Same HLSL, same GPU, same CPU reference:
 
@@ -692,7 +805,7 @@ today's — in which case Wave D did not deliver and R0 must stay at 64 m.
 |---|---|
 | A | `-VoxelPerfFlight=static` at two poses, ≥2 legs × 4 configs; pool must track the component path's visibility scaling |
 | B | existing GI equivalence harness (the 0.000 / 0.565 control pair) + a dig-and-hold PIE capture |
-| C | `voxel.GPU.VerifyRegion` bit-exact **and** `bench/vxc_gpu.exe` still bit-exact — both legs, or it is not fixed |
+| C | ✅ **DONE 2026-07-26.** Both legs bit-exact at `6e893ab3679a8c81`, ×2 legs each. C2 (NVIDIA) and C3 (M1 gate) still owed |
 | D | packed-quad byte equality first; then screenshot diff vs noise floor; then per-ring dispatch-rate × p50 under motion |
 | E | E1 screenshot on both render paths; E2 a water-only-variable scene, ≥2 legs |
 | F | cold-fill time, motion residency per ring, pool high-water mark, clipmap seam screenshot |
@@ -712,6 +825,14 @@ Four, all found while planning this from the source:
    correction beside the existing one rather than replacing it — same reasoning the
    last correction used, and this is now the second wrong diagnosis on this one
    failure.
+   **Settled 2026-07-26 — and this correction was itself incomplete.** Getting
+   rid of the floating-point theory was right, but the replacement hypotheses
+   (C1a `$Globals` packing, C1b shader model) were built on the same inherited
+   error: *"all 4,096 columns match"*, which came from an excerpt with the
+   `col(...)` mismatch lines dropped. The columns did **not** match, and the
+   cause was worldgen version skew — a `voxelcore.lib` predating v8 against a v8
+   kernel. Three wrong root causes on one failure, all three derived from a
+   transcript instead of a re-run. See Wave C above.
 2. **Wave A's stated cause is weak and its stated fix would not have worked.** The
    zero-stride buffer has stride 0, so a large `StartVertexLocation` is harmless;
    and "pass BaseQuad as per-element shader data" via a loose `FShaderParameter`

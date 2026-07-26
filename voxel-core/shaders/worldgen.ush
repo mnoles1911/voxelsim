@@ -55,6 +55,41 @@
     #define VXC_REG(slot) : register(slot)
 #endif
 
+// --- worldgen version lock (Unreal leg only) -------------------------------
+//
+// The version of vxc::kWorldGenVersion this file is a mirror of. Bump it in
+// the SAME commit that re-mirrors the constants below and respins
+// shaders/prebuilt -- that is the whole contract this number encodes.
+//
+// WHY IT IS CHECKED AGAINST THE C++ SIDE. Both of the wrong root causes ever
+// published for the determinism gate were version skew wearing a compiler's
+// clothes: first "the v8 CPU rules were never mirrored into HLSL" (they were),
+// then "DXIL floating-point contraction flipped a layer comparison" (there is
+// no floating point in this file). The failure was a CPU worldgen and an HLSL
+// worldgen from different versions meeting in one process. A number that both
+// sides must agree on turns that from a per-cell mystery into a compile error.
+//
+// VoxelGpuWorldGen.cpp's ModifyCompilationEnvironment passes
+// vxc::kWorldGenVersion in as VXC_WORLDGEN_VERSION_CPP. Because a define is
+// part of the shader's DDC key, bumping either number also forces a recompile
+// rather than silently reusing cached bytecode from the previous version.
+//
+// SCOPE, HONESTLY: vxc::kWorldGenVersion lives in a HEADER (core.h), so this
+// catches source-level skew -- an unmirrored kernel -- and NOT a stale
+// voxelcore.lib, where fresh headers sit on top of old object code. The
+// stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
+// timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
+// digest. Two different faults, two different guards.
+#define VXC_WORLDGEN_VERSION_USH 8
+#ifdef VXC_UE
+    #ifndef VXC_WORLDGEN_VERSION_CPP
+        #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
+    #endif
+    #if VXC_WORLDGEN_VERSION_CPP != VXC_WORLDGEN_VERSION_USH
+        #error "worldgen version skew: the linked voxel-core headers and worldgen.ush mirror different worldgen versions. Re-mirror this file from amplifier.cpp/biome.h, bump VXC_WORLDGEN_VERSION_USH, and respin voxel-core/shaders/prebuilt via tools/compile-shaders.ps1."
+    #endif
+#endif
+
 // --- constants mirrored from voxel-core (compile checks in harness) --------
 
 static const int kVoxelSizeMm = 100;
