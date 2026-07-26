@@ -12,7 +12,7 @@
 // Draws every chunk in the pool with a single mesh batch.
 namespace VoxelGpuPoolCull
 {
-	static int32 GEnabled = 1;
+	static int32 GEnabled = 0;
 	static FAutoConsoleVariableRef CVarEnabled(
 		TEXT("voxel.Stream.GPUCull"), GEnabled,
 		TEXT("Frustum-cull the GPU pool per chunk and draw only the surviving pool ranges. 1 = on (default). ")
