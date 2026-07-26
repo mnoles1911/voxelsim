@@ -12,12 +12,20 @@
 // Draws every chunk in the pool with a single mesh batch.
 namespace VoxelGpuPoolCull
 {
+	// HARD CEILING ON DRAW RANGES, and it is a correctness limit rather than a
+	// taste one. The renderer selects batch elements with
+	// `(1ull << BatchElementIndex) & BatchElementMask` (FMeshBatch), which is
+	// undefined for any index >= 64. GPUCullMaxRanges used to default to 256, so
+	// a sufficiently fragmented view was one shift away from undefined
+	// behaviour that would have presented as random missing terrain.
+	static constexpr int32 kMaxBatchElements = 64;
+
 	static int32 GEnabled = 0;
 	static FAutoConsoleVariableRef CVarEnabled(
 		TEXT("voxel.Stream.GPUCull"), GEnabled,
-		TEXT("Frustum-cull the GPU pool per chunk and draw only the surviving pool ranges. 1 = on (default). ")
-		TEXT("0 = one draw over the whole pool, which is the pre-cull behaviour and pays for every resident ")
-		TEXT("quad regardless of where the camera looks."),
+		TEXT("Frustum-cull the GPU pool per chunk and draw only the surviving pool ranges. 1 = on, 0 = off ")
+		TEXT("(default). 0 is one draw over the whole pool, which is the pre-cull behaviour and pays for ")
+		TEXT("every resident quad regardless of where the camera looks."),
 		ECVF_RenderThreadSafe);
 
 	// Merging tolerance, in quads. Two surviving ranges separated by a gap
@@ -26,21 +34,32 @@ namespace VoxelGpuPoolCull
 	// invocations and no pixels if it is off-screen, while a draw costs a state
 	// change and a command. Tuned by measurement, not taste -- raise it if the
 	// range count is high, lower it if the drawn-quad count is.
+	//
+	// THIS USED TO DO NOTHING. It was declared, documented, and referenced only
+	// from a comment; the merge ran exclusively off a threshold derived from
+	// GPUCullMaxRanges, so tuning this knob silently changed nothing and any
+	// "tuned merge gap" measurement would have been measuring the default. It is
+	// now the FIRST merge pass, with the range-cap merge below it as the backstop
+	// that guarantees the element limit.
 	static int32 GMergeGapQuads = 4096;
 	static FAutoConsoleVariableRef CVarMergeGap(
 		TEXT("voxel.Stream.GPUCullMergeGap"), GMergeGapQuads,
 		TEXT("Quads. Surviving pool ranges closer together than this are merged into one draw, re-drawing ")
-		TEXT("the gap between them. Trades redrawn off-screen quads against draw count."),
+		TEXT("the gap between them. Trades redrawn off-screen quads against draw count. 0 disables this ")
+		TEXT("pass, leaving only the range-cap merge."),
 		ECVF_RenderThreadSafe);
 
-	// Above this, stop merging and just draw the whole pool. A view that can see
-	// nearly everything gains nothing from culling and would pay for hundreds of
-	// draws to prove it.
-	static int32 GMaxRanges = 256;
+	// The draw-range budget the merge works down to. Clamped to
+	// kMaxBatchElements wherever it is read -- see that constant.
+	static int32 GMaxRanges = kMaxBatchElements;
 	static FAutoConsoleVariableRef CVarMaxRanges(
 		TEXT("voxel.Stream.GPUCullMaxRanges"), GMaxRanges,
-		TEXT("If the cull cannot get below this many draw ranges, fall back to one draw over the whole pool."),
+		TEXT("Draw-range budget for the cull. The merge always reaches it by construction. CLAMPED TO 64: ")
+		TEXT("the renderer's batch-element mask is a uint64 and index >= 64 is undefined."),
 		ECVF_RenderThreadSafe);
+
+	// The budget actually used, never above the element-mask limit.
+	inline int32 GetMaxRanges() { return FMath::Clamp(GMaxRanges, 1, kMaxBatchElements); }
 
 	// Control experiment: run the whole range/merge/multi-draw path but treat
 	// EVERY chunk as visible. If the picture is correct with this on and wrong
@@ -101,10 +120,12 @@ public:
 	                        const TArray<FVector4f>& InParams,
 	                        const TArray<UVoxelGpuPoolComponent::FChunkRun>& InRuns,
 	                        const FString& InPoolName,
-	                        int32 InChunkTableCapacity)
+	                        int32 InChunkTableCapacity,
+	                        FVoxelGpuPoolBuffersRef InSharedBuffers)
 		: FPrimitiveSceneProxy(Component)
 		, VertexFactory(GetScene().GetFeatureLevel())
 		, PoolName(InPoolName)
+		, SharedBuffers(MoveTemp(InSharedBuffers))
 		, Quads(InQuads)
 		, ChunkIds(InChunkIds)
 		, Origins(InOrigins)
@@ -154,19 +175,61 @@ public:
 		// first (:667, :697) -- so everything outside the range just written
 		// becomes uninitialised garbage. Marking these Dynamic silently corrupted
 		// the chunk table and put every partial write at quad 0.
-		QuadBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
-			RHICmdList, TEXT("VoxelGpuPool.Quads"),
-			EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
-			MakeConstArrayView(Quads));
-		QuadBufferSRV = RHICmdList.CreateShaderResourceView(
-			QuadBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(QuadBuffer));
+		// --- the persistent half (Wave D / D1) ----------------------------
+		//
+		// UPLOADED ON FIRST CREATION ONLY. This one branch is what removes the
+		// CPU-shadow clobber: every later proxy rebinds buffers that already
+		// hold the live geometry instead of overwriting them with whatever the
+		// CPU shadow happens to contain. Once the GPU writes quads directly,
+		// re-uploading here would silently revert them.
+		check(SharedBuffers.IsValid());
+		if (!SharedBuffers->IsValid() || SharedBuffers->CapacityQuads < Quads.Num())
+		{
+			// First proxy, or the pool outgrew the allocation. The latter means
+			// the GPU-resident contents are genuinely gone, so re-uploading from
+			// the CPU shadow is the correct and only thing to do.
+			SharedBuffers->QuadBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
+				RHICmdList, TEXT("VoxelGpuPool.Quads"),
+				EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource
+					| EBufferUsageFlags::UnorderedAccess | EBufferUsageFlags::StructuredBuffer,
+				MakeConstArrayView(Quads));
+			SharedBuffers->QuadSRV = RHICmdList.CreateShaderResourceView(
+				SharedBuffers->QuadBuffer,
+				FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(SharedBuffers->QuadBuffer));
+			SharedBuffers->QuadUAV = RHICmdList.CreateUnorderedAccessView(
+				SharedBuffers->QuadBuffer,
+				FRHIViewDesc::CreateBufferUAV().SetTypeFromBuffer(SharedBuffers->QuadBuffer));
 
-		ChunkIdBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
-			RHICmdList, TEXT("VoxelGpuPool.ChunkIds"),
-			EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
-			MakeConstArrayView(ChunkIds));
-		ChunkIdSRV = RHICmdList.CreateShaderResourceView(
-			ChunkIdBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(ChunkIdBuffer));
+			SharedBuffers->ChunkIdBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
+				RHICmdList, TEXT("VoxelGpuPool.ChunkIds"),
+				EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource
+					| EBufferUsageFlags::UnorderedAccess | EBufferUsageFlags::StructuredBuffer,
+				MakeConstArrayView(ChunkIds));
+			SharedBuffers->ChunkIdSRV = RHICmdList.CreateShaderResourceView(
+				SharedBuffers->ChunkIdBuffer,
+				FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(SharedBuffers->ChunkIdBuffer));
+			SharedBuffers->ChunkIdUAV = RHICmdList.CreateUnorderedAccessView(
+				SharedBuffers->ChunkIdBuffer,
+				FRHIViewDesc::CreateBufferUAV().SetTypeFromBuffer(SharedBuffers->ChunkIdBuffer));
+
+			SharedBuffers->CapacityQuads = Quads.Num();
+
+			UE_LOG(LogTemp, Log, TEXT("%s: created persistent pool buffers, capacity %d quads"),
+			       *PoolName, SharedBuffers->CapacityQuads);
+		}
+		else
+		{
+			// The line that makes the clobber impossible rather than unlikely.
+			UE_LOG(LogTemp, Log,
+			       TEXT("%s: REBOUND persistent pool buffers (capacity %d quads) — no re-upload, "
+			            "GPU-written quads preserved across proxy recreation"),
+			       *PoolName, SharedBuffers->CapacityQuads);
+		}
+
+		QuadBuffer = SharedBuffers->QuadBuffer;
+		QuadBufferSRV = SharedBuffers->QuadSRV;
+		ChunkIdBuffer = SharedBuffers->ChunkIdBuffer;
+		ChunkIdSRV = SharedBuffers->ChunkIdSRV;
 
 		TArray<FVector4f> PaddedOrigins = Origins;
 		PaddedOrigins.SetNumZeroed(MaxChunks);
@@ -320,6 +383,12 @@ public:
 				// Not culling, or the cull produced nothing usable -- draw
 				// everything, which is always correct and never worse than
 				// before this option existed.
+				//
+				// UserData stays null, so the factory binds its BaseQuad = 0
+				// buffer and the shader computes QuadIndex = 0 + VertexId/6 --
+				// the identical expression to before BaseQuad existed. This path
+				// is unchanged, not merely equivalent, and that is deliberate:
+				// it is the control every cull measurement is read against.
 				FMeshBatchElement& Element = Mesh.Elements[0];
 				Element.IndexBuffer = nullptr;
 				Element.FirstIndex = 0;
@@ -333,25 +402,54 @@ public:
 			}
 			else
 			{
-				// SV_VertexID includes the draw's start vertex for a non-indexed
-				// draw, and the vertex factory derives its quad index straight
-				// from it (QuadIndex = VertexId / 6). So a range starting at quad
-				// F is expressed as FirstIndex = F*6 and the factory addresses the
-				// pool correctly with no extra state. That equivalence is the
-				// reason this works at all, and it is worth checking with a
-				// screenshot rather than trusting: getting it wrong draws the
-				// wrong geometry rather than none.
+				// EVERY RANGE DRAWS FROM VERTEX 0 AND NAMES ITS START EXPLICITLY.
+				//
+				// The obvious encoding -- FirstIndex = Range.First * 6, and let
+				// SV_VertexID carry the offset into the factory's
+				// QuadIndex = VertexId/6 -- is what shipped, and it is wrong.
+				// SV_VertexID does not include the draw's base vertex on D3D12;
+				// RHISupportsAbsoluteVertexID (DataDrivenShaderPlatformInfo.h)
+				// returns true only for Vulkan, and FLocalVertexFactory threads
+				// the base through a uniform buffer for exactly this reason.
+				//
+				// Measured with the frustum test bypassed and the pool tiled into
+				// N exact contiguous ranges (GPUCullDebugSplit): at N = 2, 8 and
+				// 64 only the first 1/N of the pool reached the screen, while the
+				// frame cost stayed flat and then rose (12.26 -> 11.86 -> 14.07 ms
+				// p50) -- every range drew its full quad count starting at pool
+				// quad 0, and N=64 simply added 63 draw calls on top. That is a
+				// renderer silently drawing the wrong geometry, which is the
+				// failure mode this pool is worst at showing.
+				//
+				// So: FirstIndex = 0 everywhere, and the start goes through
+				// FVoxelQuadRangeParameters. Correct whether or not the platform
+				// includes the base vertex, because VertexId now unambiguously
+				// runs [0, Count*6) for every range.
 				Mesh.Elements.Reset();
 				for (const FQuadRange& Range : Ranges)
 				{
+					// ONE FRAME RESOURCE, not a local and not a proxy member.
+					// GetDynamicMeshElements only gathers; the bindings are read
+					// later when the draw commands are built, by which time a
+					// stack local is gone. The collector owns this until the
+					// frame ends.
+					FVoxelQuadRangeUserData& RangeData =
+						Collector.AllocateOneFrameResource<FVoxelQuadRangeUserData>();
+					FVoxelQuadRangeParameters RangeParams;
+					RangeParams.BaseQuad = Range.First;
+					RangeData.RangeUniformBuffer =
+						TUniformBufferRef<FVoxelQuadRangeParameters>::CreateUniformBufferImmediate(
+							RangeParams, UniformBuffer_SingleFrame);
+
 					FMeshBatchElement& Element = Mesh.Elements.AddDefaulted_GetRef();
 					Element.IndexBuffer = nullptr;
-					Element.FirstIndex = Range.First * 6;
+					Element.FirstIndex = 0;
 					Element.NumPrimitives = Range.Count * 2;
-					Element.MinVertexIndex = Range.First * 6;
-					Element.MaxVertexIndex = (Range.First + Range.Count) * 6 - 1;
+					Element.MinVertexIndex = 0;
+					Element.MaxVertexIndex = Range.Count * 6 - 1;
 					Element.NumInstances = 1;
 					Element.PrimitiveUniformBuffer = GetUniformBuffer();
+					Element.UserData = &RangeData;
 				}
 			}
 
@@ -366,31 +464,44 @@ public:
 	// streaming through a pool viable or not.
 	// NewQuads/NewIds hold ONLY the dirty range, indexed from zero; First is
 	// where it lands in the GPU buffer.
+	// One lock/unlock pair per RUN. NewQuads/NewIds are the flattened payload;
+	// each run says where its slice starts in them and where it lands in the
+	// pool. Several exact runs, not one span covering the untouched geometry
+	// between them -- see UVoxelGpuPoolComponent::DirtyQuadRanges.
 	void UpdateQuadRange_RenderThread(FRHICommandListBase& RHICmdList,
 	                                  const TArray<uint64>& NewQuads,
 	                                  const TArray<uint32>& NewIds,
-	                                  uint32 First, uint32 Count, int32 NewNumQuads)
+	                                  const TArray<FVoxelQuadUploadRun>& UploadRuns,
+	                                  int32 NewNumQuads)
 	{
-		if (!QuadBuffer.IsValid() || Count == 0)
+		if (!QuadBuffer.IsValid() || UploadRuns.Num() == 0)
 		{
 			NumQuads = NewNumQuads;
 			return;
 		}
 
-		const uint32 QuadOffsetBytes = First * sizeof(uint64);
-		const uint32 QuadSizeBytes = Count * sizeof(uint64);
-		if (void* Dst = RHICmdList.LockBuffer(QuadBuffer, QuadOffsetBytes, QuadSizeBytes, RLM_WriteOnly))
+		for (const FVoxelQuadUploadRun& Run : UploadRuns)
 		{
-			FMemory::Memcpy(Dst, NewQuads.GetData(), QuadSizeBytes);
-			RHICmdList.UnlockBuffer(QuadBuffer);
-		}
+			if (Run.Count == 0)
+			{
+				continue;
+			}
 
-		const uint32 IdOffsetBytes = First * sizeof(uint32);
-		const uint32 IdSizeBytes = Count * sizeof(uint32);
-		if (void* Dst = RHICmdList.LockBuffer(ChunkIdBuffer, IdOffsetBytes, IdSizeBytes, RLM_WriteOnly))
-		{
-			FMemory::Memcpy(Dst, NewIds.GetData(), IdSizeBytes);
-			RHICmdList.UnlockBuffer(ChunkIdBuffer);
+			const uint32 QuadSizeBytes = Run.Count * sizeof(uint64);
+			if (void* Dst = RHICmdList.LockBuffer(QuadBuffer, Run.First * sizeof(uint64),
+			                                      QuadSizeBytes, RLM_WriteOnly))
+			{
+				FMemory::Memcpy(Dst, NewQuads.GetData() + Run.SrcOffset, QuadSizeBytes);
+				RHICmdList.UnlockBuffer(QuadBuffer);
+			}
+
+			const uint32 IdSizeBytes = Run.Count * sizeof(uint32);
+			if (void* Dst = RHICmdList.LockBuffer(ChunkIdBuffer, Run.First * sizeof(uint32),
+			                                      IdSizeBytes, RLM_WriteOnly))
+			{
+				FMemory::Memcpy(Dst, NewIds.GetData() + Run.SrcOffset, IdSizeBytes);
+				RHICmdList.UnlockBuffer(ChunkIdBuffer);
+			}
 		}
 
 		NumQuads = NewNumQuads;
@@ -452,6 +563,11 @@ private:
 	// instance now and they are diagnosed almost entirely from those lines.
 	FString PoolName;
 
+	// The component's buffers, not the proxy's. Held by shared pointer so this
+	// proxy dying does not take the GPU-resident geometry with it — see
+	// FVoxelGpuPoolBuffers for why that matters.
+	FVoxelGpuPoolBuffersRef SharedBuffers;
+
 	TArray<uint64> Quads;
 	TArray<uint32> ChunkIds;
 	TArray<FVector4f> Origins;
@@ -480,7 +596,10 @@ private:
 		uint32 VisibleQuads = 0;
 
 		// N EQUAL RANGES OVER THE WHOLE POOL, no frustum test. See GDebugSplit.
-		const int32 SplitCount = VoxelGpuPoolCull::GDebugSplit;
+		// Capped at the batch-element limit for the same reason GetMaxRanges() is:
+		// asking for 256 parts would index a uint64 mask past bit 63.
+		const int32 SplitCount = FMath::Min(VoxelGpuPoolCull::GDebugSplit,
+		                                    VoxelGpuPoolCull::kMaxBatchElements);
 		if (SplitCount > 1 && NumQuads > 0)
 		{
 			const uint32 Total = uint32(NumQuads);
@@ -616,7 +735,46 @@ private:
 			return;
 		}
 
-		// MERGE TO A DRAW-CALL BUDGET, CHEAPEST GAPS FIRST.
+		// PASS 1: MERGE ON THE TOLERATED GAP (voxel.Stream.GPUCullMergeGap).
+		//
+		// This is what that cvar always claimed to do and never did. Its own
+		// declaration described the trade exactly -- an off-screen quad costs six
+		// vertex invocations and no pixels, a draw costs a state change and a
+		// command -- and then nothing read it, because the range-cap merge below
+		// was the only merge that existed. A knob that silently ignores you is
+		// worse than no knob, so it is wired here rather than deleted: it is the
+		// only control over redrawn quads at range counts that are already under
+		// the cap, which is the common case.
+		//
+		// Runs into the cap merge below, which is what still GUARANTEES the
+		// element limit; this pass only ever reduces the count it starts from.
+		const uint32 MergeGap = uint32(FMath::Max(0, VoxelGpuPoolCull::GMergeGapQuads));
+		if (MergeGap > 0 && CulledRanges.Num() > 1)
+		{
+			TArray<FQuadRange> Merged;
+			Merged.Reserve(CulledRanges.Num());
+			Merged.Add(CulledRanges[0]);
+			for (int32 I = 1; I < CulledRanges.Num(); ++I)
+			{
+				FQuadRange& Last = Merged.Last();
+				const uint32 LastEnd = Last.First + Last.Count;
+				const uint32 Gap = CulledRanges[I].First >= LastEnd ? CulledRanges[I].First - LastEnd : 0u;
+				if (Gap <= MergeGap)
+				{
+					// Max, not +=: runs are sorted by pool offset but a merged
+					// range can already extend past the next one's end.
+					const uint32 NewEnd = FMath::Max(LastEnd, CulledRanges[I].First + CulledRanges[I].Count);
+					Last.Count = NewEnd - Last.First;
+				}
+				else
+				{
+					Merged.Add(CulledRanges[I]);
+				}
+			}
+			CulledRanges = MoveTemp(Merged);
+		}
+
+		// PASS 2: MERGE TO A DRAW-CALL BUDGET, CHEAPEST GAPS FIRST.
 		//
 		// The first version merged on a fixed gap threshold and then discarded
 		// the whole result if it still exceeded the range cap. That is the wrong
@@ -631,7 +789,7 @@ private:
 		// runs, and merge the smallest ones until the range count fits. Merging
 		// the smallest gap first is optimal for this objective -- each merge
 		// removes exactly one draw and costs exactly that gap in redrawn quads.
-		const int32 MaxRanges = FMath::Max(1, VoxelGpuPoolCull::GMaxRanges);
+		const int32 MaxRanges = VoxelGpuPoolCull::GetMaxRanges();
 		if (CulledRanges.Num() > MaxRanges)
 		{
 			TArray<uint32> Sorted;
@@ -658,7 +816,8 @@ private:
 				const uint32 Gap = CulledRanges[I].First >= LastEnd ? CulledRanges[I].First - LastEnd : 0u;
 				if (Gap <= GapThreshold)
 				{
-					Last.Count = (CulledRanges[I].First + CulledRanges[I].Count) - Last.First;
+					const uint32 NewEnd = FMath::Max(LastEnd, CulledRanges[I].First + CulledRanges[I].Count);
+					Last.Count = NewEnd - Last.First;
 				}
 				else
 				{
@@ -704,11 +863,14 @@ private:
 		if (CullLogCounter.Increment() % 600 == 1)
 		{
 			UE_LOG(LogTemp, Log,
-			       TEXT("%s cull: runs=%d runQuads=%u/%d visibleQuads=%u (%.1f%%) ranges=%d drawnQuads=%u "
-			            "| skipped empty=%d badId=%d aboveHWM=%d hidden=%d frustum=%d | shadowGather=%d"),
+			       TEXT("%s cull: runs=%d runQuads=%u/%d visibleQuads=%u (%.1f%%) ranges=%d drawnQuads=%u (%.1f%%) "
+			            "| mergeGap=%u maxRanges=%d | skipped empty=%d badId=%d aboveHWM=%d hidden=%d frustum=%d "
+			            "| shadowGather=%d"),
 			       *PoolName, Runs.Num(), RunQuads, NumQuads, VisibleQuads,
 			       NumQuads > 0 ? 100.0 * double(VisibleQuads) / double(NumQuads) : 0.0,
 			       CulledRanges.Num(), DrawnQuads,
+			       NumQuads > 0 ? 100.0 * double(DrawnQuads) / double(NumQuads) : 0.0,
+			       MergeGap, MaxRanges,
 			       SkippedEmpty, SkippedBadId, SkippedAboveWatermark, SkippedHidden, SkippedFrustum,
 			       bShadowGather ? 1 : 0);
 		}
@@ -768,7 +930,7 @@ void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 	AllocationChunkIds.Reset();
 	NumLiveChunks = 0;
 	LocalBounds = FBox(ForceInit);
-	DirtyQuads = {};
+	DirtyQuadRanges.Reset();
 	bChunkTableDirty = false;
 	bRunsDirty = false;
 }
@@ -895,6 +1057,43 @@ void UVoxelGpuPoolComponent::ClearChunks()
 }
 
 
+// How close two dirty runs must be before they are merged into one.
+//
+// The trade is real in both directions: merging uploads quads nobody wrote,
+// while not merging costs an extra LockBuffer/UnlockBuffer per run. The old
+// code sat at one extreme (always merge, one run, unbounded waste).
+//
+// DEFAULT 0 = MERGE ONLY WHAT ACTUALLY TOUCHES. That is the setting that makes
+// the path-2 correctness property hold exactly: a merged run can span quads the
+// CPU did not write, which for a non-zero gap could include a GPU-written
+// range. Raise it only for measured upload-call savings on a CPU-only pool, and
+// never above the smallest GPU-written allocation.
+//
+// This knob is PROVEN LIVE, not assumed: voxel.Stream.PoolUploadStats prints
+// the run count and bytes per update, so changing the gap visibly changes both.
+// That check exists because this project already shipped
+// voxel.Stream.GPUCullMergeGap, which was declared, documented, and never read
+// by anything -- a knob that silently ignores you is worse than no knob.
+static int32 GVoxelPoolDirtyMergeGap = 0;
+static FAutoConsoleVariableRef CVarVoxelPoolDirtyMergeGap(
+	TEXT("voxel.Stream.PoolDirtyMergeGap"),
+	GVoxelPoolDirtyMergeGap,
+	TEXT("Quads of gap tolerated when merging two dirty pool runs into one upload. ")
+	TEXT("0 (default) merges only touching/overlapping runs. Higher trades wasted upload ")
+	TEXT("bytes for fewer buffer locks. Verify with voxel.Stream.PoolUploadStats 1."),
+	ECVF_Default);
+
+// Prints what each incremental upload actually cost. A mechanism count, not a
+// frame time -- it is not vulnerable to contention or to the clamp, so it is
+// safe to quote from a shared box.
+static int32 GVoxelPoolUploadStats = 0;
+static FAutoConsoleVariableRef CVarVoxelPoolUploadStats(
+	TEXT("voxel.Stream.PoolUploadStats"),
+	GVoxelPoolUploadStats,
+	TEXT("1 = log runs and bytes uploaded per incremental pool update. This is how the ")
+	TEXT("dirty-run merge gap is shown to be live rather than decorative."),
+	ECVF_Default);
+
 void UVoxelGpuPoolComponent::MarkQuadsDirty(uint32 First, uint32 Count)
 {
 	if (Count == 0)
@@ -902,14 +1101,34 @@ void UVoxelGpuPoolComponent::MarkQuadsDirty(uint32 First, uint32 Count)
 		return;
 	}
 	const uint32 Last = First + Count - 1;
-	if (!DirtyQuads.bValid)
+
+	// Insert in ascending First order, then sweep once and coalesce. The list
+	// holds one entry per chunk touched since the last upload, which the apply
+	// budget already bounds to a handful per frame, so linear is right here and
+	// an interval tree would be strictly more code for no measurable gain.
+	int32 Index = 0;
+	while (Index < DirtyQuadRanges.Num() && DirtyQuadRanges[Index].First < First)
 	{
-		DirtyQuads = { First, Last, true };
+		++Index;
 	}
-	else
+	DirtyQuadRanges.Insert(FDirtyRange{ First, Last, true }, Index);
+
+	const uint64 Gap = uint64(FMath::Max(0, GVoxelPoolDirtyMergeGap));
+	for (int32 I = 0; I + 1 < DirtyQuadRanges.Num(); )
 	{
-		DirtyQuads.First = FMath::Min(DirtyQuads.First, First);
-		DirtyQuads.Last = FMath::Max(DirtyQuads.Last, Last);
+		FDirtyRange& A = DirtyQuadRanges[I];
+		const FDirtyRange& B = DirtyQuadRanges[I + 1];
+		// Touching, overlapping, or within the gap. +1 makes [0,3] and [4,7]
+		// adjacent rather than separate at Gap 0.
+		if (uint64(B.First) <= uint64(A.Last) + 1ull + Gap)
+		{
+			A.Last = FMath::Max(A.Last, B.Last);
+			DirtyQuadRanges.RemoveAt(I + 1, EAllowShrinking::No);
+		}
+		else
+		{
+			++I;
+		}
 	}
 }
 
@@ -920,7 +1139,7 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 	if (LiveProxy == nullptr)
 	{
 		MarkRenderStateDirty();
-		DirtyQuads = {};
+		DirtyQuadRanges.Reset();
 		bChunkTableDirty = false;
 		bRunsDirty = false;
 		return;
@@ -930,14 +1149,24 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 	if (ChunkOrigins.Num() > LiveProxy->GetMaxChunks())
 	{
 		MarkRenderStateDirty();
-		DirtyQuads = {};
+		DirtyQuadRanges.Reset();
 		bChunkTableDirty = false;
 		bRunsDirty = false;
 		return;
 	}
 
-	const uint32 First = DirtyQuads.bValid ? DirtyQuads.First : 0;
-	const uint32 Count = DirtyQuads.bValid ? (DirtyQuads.Last - DirtyQuads.First + 1) : 0;
+	// Flatten the dirty runs into one staging payload. Several small runs beat
+	// one span covering all the untouched geometry between them -- see
+	// DirtyQuadRanges' comment for why that is both a correctness and a
+	// bandwidth argument.
+	TArray<FVoxelQuadUploadRun> UploadRuns;
+	uint32 TotalQuadsToUpload = 0;
+	for (const FDirtyRange& R : DirtyQuadRanges)
+	{
+		const uint32 RunCount = R.Last - R.First + 1;
+		UploadRuns.Add(FVoxelQuadUploadRun{ R.First, RunCount, TotalQuadsToUpload });
+		TotalQuadsToUpload += RunCount;
+	}
 	const int32 NewNumQuads = int32(Pool.GetHighWaterMark());
 	// The runs travel on the table update, so a run-only change has to send the
 	// table too. It is two small vectors per chunk; the quad buffer, which is the
@@ -961,10 +1190,27 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 	// pool was built for.
 	TArray<uint64> QuadsSlice;
 	TArray<uint32> IdsSlice;
-	if (Count > 0)
+	QuadsSlice.Reserve(int32(TotalQuadsToUpload));
+	IdsSlice.Reserve(int32(TotalQuadsToUpload));
+	for (const FVoxelQuadUploadRun& Run : UploadRuns)
 	{
-		QuadsSlice.Append(PooledQuads.GetData() + First, int32(Count));
-		IdsSlice.Append(QuadChunkIds.GetData() + First, int32(Count));
+		QuadsSlice.Append(PooledQuads.GetData() + Run.First, int32(Run.Count));
+		IdsSlice.Append(QuadChunkIds.GetData() + Run.First, int32(Run.Count));
+	}
+
+	if (GVoxelPoolUploadStats != 0 && UploadRuns.Num() > 0)
+	{
+		// Span-equivalent cost, for comparison: what the single-span version
+		// would have uploaded for exactly this set of dirty chunks.
+		const uint32 SpanFirst = UploadRuns[0].First;
+		const uint32 SpanLast = UploadRuns.Last().First + UploadRuns.Last().Count - 1;
+		const uint32 SpanQuads = SpanLast - SpanFirst + 1;
+		UE_LOG(LogTemp, Log,
+		       TEXT("%s upload: %d run(s), %u quads (%u KB) — a single span would have been "
+		            "%u quads (%u KB), gap=%d"),
+		       *PoolName, UploadRuns.Num(), TotalQuadsToUpload,
+		       (TotalQuadsToUpload * uint32(sizeof(uint64))) / 1024u,
+		       SpanQuads, (SpanQuads * uint32(sizeof(uint64))) / 1024u, GVoxelPoolDirtyMergeGap);
 	}
 	// The chunk table is two small vectors per chunk, so it stays whole.
 	TArray<FVector4f> OriginsCopy = ChunkOrigins;
@@ -979,17 +1225,17 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 	ENQUEUE_RENDER_COMMAND(VoxelGpuPoolIncrementalUpdate)(
 		[Proxy, QuadsSlice = MoveTemp(QuadsSlice), IdsSlice = MoveTemp(IdsSlice),
 		 OriginsCopy = MoveTemp(OriginsCopy), ParamsCopy = MoveTemp(ParamsCopy), RunsCopy = MoveTemp(RunsCopy),
-		 First, Count, NewNumQuads, bTableDirty](FRHICommandListImmediate& RHICmdList)
+		 UploadRuns = MoveTemp(UploadRuns), NewNumQuads, bTableDirty](FRHICommandListImmediate& RHICmdList)
 	{
 		if (bTableDirty)
 		{
 			Proxy->UpdateChunkTable_RenderThread(RHICmdList, OriginsCopy, ParamsCopy, RunsCopy);
 		}
 		Proxy->UpdateQuadRange_RenderThread(RHICmdList, QuadsSlice, IdsSlice,
-		                                    First, Count, NewNumQuads);
+		                                    UploadRuns, NewNumQuads);
 	});
 
-	DirtyQuads = {};
+	DirtyQuadRanges.Reset();
 	bChunkTableDirty = false;
 	bRunsDirty = false;
 
@@ -1139,6 +1385,128 @@ void UVoxelGpuPoolComponent::GetUsedMaterials(TArray<UMaterialInterface*>& OutMa
 	OutMaterials.Add(GetChunkMaterialOrDefault());
 }
 
+// ---------------------------------------------------------------------------
+// voxel.Stream.PoolClobberTest — the experiment that can actually fail
+//
+// The clobber this wave fixes is invisible in the happy path: with no GPU
+// writer yet, the CPU shadow and the GPU buffer hold identical bytes, so a
+// re-upload and a rebind are indistinguishable. A test that merely forces
+// proxy recreation and observes "nothing broke" proves nothing at all.
+//
+// So this makes them distinguishable the only honest way: it DELIBERATELY
+// CORRUPTS the CPU shadow, then forces recreation.
+//
+//   old behaviour (re-upload) -> the corruption reaches the GPU, and the
+//                                terrain visibly loses the clobbered quads
+//   new behaviour (rebind)    -> the buffer is never rewritten, the corruption
+//                                stays on the CPU, and the terrain is unchanged
+//
+// This is the pool's equivalent of GPUCullDebugSplit: the two hypotheses
+// predict visibly different pictures, so the run can come back either way.
+//
+// DESTRUCTIVE AND DEBUG-ONLY. It leaves the CPU shadow wrong on purpose, so the
+// session it runs in is spent — any later edit to a clobbered chunk will write
+// from the corrupted shadow. Never leave this in a measurement run.
+static void VoxelGpuPoolClobberTest(const TArray<FString>& Args)
+{
+	const int32 NumToClobber = (Args.Num() > 0) ? FMath::Max(1, FCString::Atoi(*Args[0])) : 200000;
+
+	int32 Found = 0;
+	for (TObjectIterator<UVoxelGpuPoolComponent> It; It; ++It)
+	{
+		UVoxelGpuPoolComponent* Comp = *It;
+		if (Comp == nullptr || Comp->IsTemplate() || !IsValid(Comp))
+		{
+			continue;
+		}
+		++Found;
+		Comp->DebugClobberShadowAndRecreate(NumToClobber);
+	}
+
+	if (Found == 0)
+	{
+		UE_LOG(LogTemp, Error,
+		       TEXT("voxel.Stream.PoolClobberTest: no live pool component — nothing to test. ")
+		       TEXT("Run this after the world has streamed, with voxel.Stream.GPU on."));
+	}
+}
+
+static FAutoConsoleCommand GVoxelGpuPoolClobberTestCmd(
+	TEXT("voxel.Stream.PoolClobberTest"),
+	TEXT("DESTRUCTIVE DEBUG. Corrupts the first N quads of the CPU shadow, then forces proxy "
+	     "recreation. If the pool buffers are persistent (Wave D / D1) the terrain is UNCHANGED, "
+	     "because the corruption never reaches the GPU. If they are re-uploaded, the terrain "
+	     "visibly loses those quads. Usage: voxel.Stream.PoolClobberTest [N=200000]"),
+	FConsoleCommandWithArgsDelegate::CreateStatic(&VoxelGpuPoolClobberTest));
+
+void UVoxelGpuPoolComponent::DebugClobberShadowAndRecreate(int32 NumQuadsToClobber)
+{
+	const int32 Drawn = int32(Pool.GetHighWaterMark());
+	if (Drawn == 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("%s clobber test: pool is empty, nothing to prove"), *PoolName);
+		return;
+	}
+
+	const int32 N = FMath::Min(NumQuadsToClobber, Drawn);
+
+	// Point them at the hidden chunk (scale 0), which is the pool's own
+	// "collapse to a point" encoding — so if this DOES reach the GPU the result
+	// is unambiguous missing geometry rather than random garbage that might be
+	// mistaken for a shader bug.
+	for (int32 I = 0; I < N; ++I)
+	{
+		QuadChunkIds[I] = kHiddenChunkId;
+		PooledQuads[I] = 0;
+	}
+
+	UE_LOG(LogTemp, Warning,
+	       TEXT("%s clobber test: corrupted the first %d of %d drawn quads in the CPU shadow, "
+	            "now forcing proxy recreation. EXPECT: terrain UNCHANGED (buffers rebound). "
+	            "A visible hole means the re-upload clobber is still live."),
+	       *PoolName, N, Drawn);
+
+	MarkRenderStateDirty();
+}
+
+// Lazily allocates the (empty) shared holder. The BUFFERS inside it are created
+// on the render thread by the first proxy that runs CreateRenderThreadResources;
+// this only guarantees there is somewhere for them to live that outlives any one
+// proxy.
+FVoxelGpuPoolBuffersRef UVoxelGpuPoolComponent::GetOrCreatePoolBuffers()
+{
+	if (!PoolBuffers.IsValid())
+	{
+		PoolBuffers = MakeShared<FVoxelGpuPoolBuffers, ESPMode::ThreadSafe>();
+	}
+	return PoolBuffers;
+}
+
+void UVoxelGpuPoolComponent::BeginDestroy()
+{
+	// Drop our reference ON THE RENDER THREAD.
+	//
+	// These are RHI resources whose views were handed to a vertex factory, and
+	// the render thread may still be a frame or two behind. Moving the last
+	// reference into a render command means the actual release happens in
+	// render-thread order behind everything that could still be reading them,
+	// rather than wherever the garbage collector happens to run. Getting this
+	// wrong does not fail as a compile error or even a visible glitch — it fails
+	// as a crash on exit, which is why it is explicit rather than left to the
+	// shared pointer's destructor.
+	if (PoolBuffers.IsValid())
+	{
+		ENQUEUE_RENDER_COMMAND(VoxelGpuPoolReleaseBuffers)(
+			[Buffers = MoveTemp(PoolBuffers)](FRHICommandListImmediate&) mutable
+		{
+			Buffers.Reset();
+		});
+		PoolBuffers.Reset();
+	}
+
+	Super::BeginDestroy();
+}
+
 FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 {
 	if (Pool.GetHighWaterMark() == 0)
@@ -1190,7 +1558,7 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 
 	FVoxelGpuPoolSceneProxy* Proxy =
 		new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, ChunkOrigins, ChunkParams, BuildChunkRuns(),
-		                            PoolName, ChunkTableCapacity);
+		                            PoolName, ChunkTableCapacity, GetOrCreatePoolBuffers());
 	LiveProxy = Proxy;
 	return Proxy;
 }

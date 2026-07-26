@@ -192,19 +192,85 @@ which is not needed to run inference. Invoke the module function directly —
 
 ---
 
-## 6a. LIVE REGRESSION: the UNREAL leg of the determinism gate is failing (the bench leg is green)
+## 6a. RESOLVED 2026-07-26 (Wave C): the determinism gate is GREEN on both legs
 
-**`voxel.GPU.VerifyRegion` fails in-engine while the standalone bench passes
-bit-exact, from the same HLSL source, on the same GPU, against the same CPU
-reference.** The two legs of the cross-toolchain gate disagree with each other,
-which is precisely the class of fault this two-leg gate exists to detect.
+**Both legs now print `6e893ab3679a8c81` and PASS bit-exact.** Two legs each,
+same box, AMD Radeon RX 7800 XT:
 
 | leg | toolchain | result | digest |
 |---|---|---|---|
-| `build/voxel-core-msvc/bench/vxc_gpu.exe` | DXC -> SPIR-V -> Vulkan | **PASS**, bit-exact over 8192 columns / 393216 cells / 6668 quads | `6e893ab3679a8c81` |
-| `voxel.GPU.VerifyRegion` | UE -> DXIL -> D3D12 | **FAIL** vs the CPU reference | `046b4a9f9c5e49b7` |
+| `build/voxel-core-msvc/bench/vxc_gpu.exe` | DXC `cs_6_0` -> SPIR-V -> Vulkan | **PASS**, bit-exact, 8192 columns / 393216 cells / 6668 quads | `6e893ab3679a8c81` |
+| `voxel.GPU.VerifyRegion` | UE `cs_6_6`/`6_8` -> DXIL -> D3D12 | **PASS**, bit-exact | `6e893ab3679a8c81` |
 
-Both on the same AMD Radeon RX 7800 XT.
+### The cause was VERSION SKEW inside one process, not the toolchain
+
+The failing run compared a **worldgen v6 CPU reference** against a **worldgen v8
+GPU kernel**. `voxelcore.lib` predated the v8 climate landing (`e25d563`, which
+reached `main` at `2c7eb68`, 2026-07-25 19:28) while Unreal compiled the current
+`worldgen.ush`. Nothing about DXIL, D3D12, `$Globals` packing or shader model was
+ever involved.
+
+**How that was established, rather than argued** (all on this box, 2026-07-26):
+
+1. Built voxel-core at `2c7eb68^1` — `main` immediately before v8 — into an
+   isolated worktree, and ran its `vxc_gpu` against its own committed SPIR-V:
+   **PASS**, digest `f3c48a4df3e20e9a`. That is the pre-v8 baseline the four
+   files listed below still quote, so the reconstruction is faithful.
+2. Ran that same **v6 CPU** binary against the **current v8 SPIR-V**. It
+   reproduces the recorded failure's values exactly:
+   `cell(-64,-64,vz=11648): cpu=2 gpu=5` and `vz=11654: cpu=5 gpu=12`.
+3. Ran the **reverse** pairing (current v8 CPU, pre-mirror v6 SPIR-V from
+   `3fbf3f7^`). It produces the mirror image — `cpu=5 gpu=2`, `cpu=12 gpu=5` —
+   which rules out "the shader was the stale half".
+4. The recorded quad counts corroborate the direction: `3424 quads (cpu 3422)`
+   is GPU-then-CPU, and 3422 is measured to be the **v6** count for that region
+   while 3424 is the **v8** count.
+5. No commit after the failure was recorded (`84b90fc`, 01:12) touched
+   `worldgen.ush`, `shaders/prebuilt/`, `VoxelGpuWorldGen.cpp` or voxel-core's
+   amplifier. Only the artifacts moved: `voxelcore.lib` was rebuilt at 02:00 and
+   the editor relinked at 03:00. The gate has passed on every run since.
+
+### Three wrong diagnoses, all kept, and what each one got wrong
+
+1. **"worldgen v8 was never mirrored into the HLSL."** Wrong — the mirror
+   (`3fbf3f7`) is faithful, as the bench proves. But the *class* was right: this
+   was version skew. It looked for it in the source instead of in the link.
+2. **"Floating-point contraction in DXIL flipped a layer comparison."**
+   Impossible: `worldgen.ush` has no floating-point arithmetic anywhere (every
+   operand is `int64_t`/`uint64_t`), and UE 5.8's D3D12 backend never translates
+   `CFLAG_NoFastMath` (`D3DShaderCompiler.cpp:52-61`), so the proposed fix could
+   not have been written either.
+3. **"All 4,096 columns match, only cells differ."** Also wrong, and it is what
+   sent both of the above hunting in the kernel. Under v6-CPU/v8-GPU the column
+   fields `topsoilMm`/`subsoilMm` differ too (measured: `cpu=0 gpu=366`,
+   `cpu=500 gpu=1232`), and `CompareRegion` prints a column's field mismatches
+   *before* that column's cells. The quoted transcript was an excerpt with the
+   `col(...)` lines dropped, and the conclusion was drawn from the excerpt.
+
+### Guards added so this cannot present the same way again
+
+* **`voxel.GPU.VerifyRegion` now pins a CPU-REFERENCE digest** of its own
+  (`kExpectedCpuDigest`, `VoxelGpuVerify.cpp`), folded from
+  `vxc::Amplifier`/`vxc::meshBrick` with no GPU involvement. A stale or
+  mismatched `voxelcore.lib` now fails with "the linked voxelcore.lib is NOT the
+  worldgen this gate is pinned to" instead of a list of per-cell materials. It
+  also catches both sides moving *together*, which GPU-vs-CPU equality
+  structurally cannot.
+* **Mismatches are now counted and classified by stage** (column field / cell /
+  quad) with the totals printed uncapped, and the capped list is labelled as an
+  ordered subset that must not be quoted piecemeal. That is diagnosis 3's exact
+  failure mode, closed.
+* **`worldgen.ush` carries a compile-time version lock.**
+  `VXC_WORLDGEN_VERSION_USH` must equal `vxc::kWorldGenVersion`, which
+  `ModifyCompilationEnvironment` passes in as `VXC_WORLDGEN_VERSION_CPP`; a
+  mismatch is a shader `#error` (verified by compiling with a deliberately wrong
+  value). Because a define is part of the shader's DDC key, a version bump also
+  forces a recompile instead of silently reusing the previous version's
+  bytecode. Scope stated honestly in the file: this catches **source** skew, not
+  a stale `.lib` — the header constant would still read 8. The two guards cover
+  the two different faults.
+
+### The historical entry, kept for the record
 
 ### An earlier version of this entry blamed worldgen v8. That was wrong.
 
@@ -227,7 +293,12 @@ From the in-engine failure (`voxel.GPU.VerifyRegion 0`):
     cell(-64,-64,vz=11654): cpu=5 gpu=12     MAT_SUBSOIL vs MAT_PERMAFROST
 ```
 
-- **Columns match** (all 4,096) — `ColumnMain` agrees under both toolchains.
+- ~~**Columns match** (all 4,096) — `ColumnMain` agrees under both toolchains.~~
+  **CORRECTED 2026-07-26: they did not.** The block above is an excerpt whose
+  `col(-64,-64).topsoilMm` / `.subsoilMm` lines were dropped; the harness emits a
+  column's field mismatches before that column's cells, so they were there. This
+  single inferred sentence is what made the fault look confined to
+  `VoxelizeMain`, and it produced the two wrong diagnoses that followed.
 - **Cells differ**, material ids only, and in a consistent direction: the DXIL
   build's soil column sits one layer shallower than the CPU's. What the CPU calls
   rock, it calls subsoil; what the CPU calls subsoil, it calls the *surface*
@@ -235,19 +306,27 @@ From the in-engine failure (`voxel.GPU.VerifyRegion 0`):
 - **The mesher is innocent** — quad decode matches exactly (20,544 vertices); the
   2-quad count difference is downstream of the cell mismatch.
 
-So the fault is isolated to **`VoxelizeMain` as compiled by Unreal**. Given that
+~~So the fault is isolated to **`VoxelizeMain` as compiled by Unreal**. Given that
 identical source is bit-exact under DXC/SPIR-V, the prime suspect is
 **floating-point contraction**: an FMA or reassociation in UE's HLSL compilation
-flipping a `<` at a layer boundary by one ULP. Layer-boundary comparisons are
-exactly where a one-ULP difference becomes a whole different material.
+flipping a `<` at a layer boundary by one ULP.~~ **Both sentences are wrong.**
+`worldgen.ush` contains no floating-point arithmetic to contract, and the two
+sides of the comparison were different worldgen versions — see the resolution at
+the top.
 
-### Next step
+### ~~Next step~~ — superseded, and unbuildable as written
 
-Compare the shader compilation flags UE uses for these kernels against the
-standalone DXC invocation in `voxel-core/bench` — specifically anything affecting
-FMA contraction, fast math, or IEEE strictness. If contraction is the cause, the
-fix is to force strict IEEE / disable contraction for `VoxelizeMain`, not to
-change the kernel maths.
+~~Compare the shader compilation flags UE uses for these kernels against the
+standalone DXC invocation in `voxel-core/bench`.~~ Done, and they are not the
+cause. For the record, since it is the obvious next reach: UE 5.8's D3D12 backend
+maps only `PreferFlowControl`, `AvoidFlowControl` and `WarningsAsErrors`
+(`D3DShaderCompiler.cpp:52-61`) and returns 0 for everything else, so
+"force strict IEEE for `VoxelizeMain`" could not have been written at all. The
+two real flag deltas — `cs_6_0` vs `cs_6_6`/`6_8`, and the explicit `cbuffer` vs
+loose `$Globals` scalars — were both checked in Wave C and are both innocent:
+DXC emits `$Globals` for the `VXC_UE` variant at byte-identical offsets to the
+bench's `cbuffer` (`BrickZMin` at offset 44, 56 bytes, verified by disassembling
+both), and the `cs_6_6` DXIL leg is now bit-exact over 393,216 cells.
 
 ### On the recorded digest — deliberately NOT updated
 
@@ -259,21 +338,39 @@ whenever someone wants it. The **Unreal** value `046b4a9f9c5e49b7` must not be
 recorded as a baseline at all: it is the output of a build that disagrees with
 the CPU, and blessing it would turn a loud failure into a silent one.
 
-### Related but separate: a stale prebuilt library
+### ~~Related but separate~~: a stale prebuilt library — **THIS WAS THE CAUSE**
 
 `build/voxel-core-msvc/voxelcore.lib` was built at 15:37 against an
 `amplifier.cpp` last modified at 19:40, so UE builds on main were linking pre-v8
 CPU worldgen. That is a real problem in its own right and gives the
-`VoxelEarth.Build.cs` hardcoded-lib item below teeth. It is **not** the cause
+`VoxelEarth.Build.cs` hardcoded-lib item below teeth. ~~It is **not** the cause
 here — rebuilding voxel-core from scratch and relinking reproduces the identical
-in-engine failure.
+in-engine failure.~~
 
-### Consequences while the Unreal leg is red
+**Corrected 2026-07-26.** This paragraph had the answer in its first sentence and
+then dismissed it. The dismissal rests on a claimed from-scratch rebuild that
+does not reproduce today and left no transcript in the tree; every run since
+`voxelcore.lib` was actually rebuilt (02:00) and the editor relinked (03:00) has
+passed. The reconstruction at the top of this entry then confirms the direction
+numerically. **The lesson worth keeping: a stale static library is not a
+"separate" problem from a determinism-gate failure — it is one of its two most
+likely causes, and it is the cheaper one to eliminate.** Eliminate it by rebuild,
+never by argument.
 
-- GPU-meshed terrain would differ from CPU-meshed terrain **in-engine**, so this
-  blocks the GPU meshing programme (6b) on correctness independently of its
-  performance question.
-- The NVIDIA leg cannot be meaningfully run until this is green.
+### Consequences while the Unreal leg was red — now cleared
+
+- ~~GPU-meshed terrain would differ from CPU-meshed terrain **in-engine**, so this
+  blocks the GPU meshing programme (6b) on correctness.~~ Unblocked: Wave D's
+  correctness precondition is met.
+- **The NVIDIA leg (Wave C2) is now unblocked and still owed.** It has never been
+  run; the cross-vendor claim rests on one AMD RX 7800 XT.
+  `tools/run-nvidia-digest.sh` exists for a rented box. Not runnable from this
+  machine — there is no NVIDIA GPU on it.
+- **The min-spec-proxy M1 gate re-run (Wave C3) is still owed**, deliberately not
+  attempted in Wave C: it is a 60 s frame-time measurement and this box was
+  running three other build/editor agents concurrently. Ground rule 1 exists
+  because numbers taken like that have already been retracted once. It also wants
+  to land after Wave A's cull work, which changes what it measures.
 
 ---
 
@@ -381,6 +478,22 @@ path supplies only a `float2` texture coordinate, so `TexCoord0.zw` arrives as
 zero there regardless of the graph, and a naive unpack treating 0 as black would
 render every component-path chunk black the moment the material is regenerated.
 Debug-only, so its absence costs nothing in play.
+
+**CORRECTED 2026-07-26 — identity-as-zero is unsafe, for the opposite reason.**
+Superseded text kept above, per §6a's convention. A material asking for texture
+coordinate 1 gets **texture coordinate 0** on the component path, not zero:
+`FLocalVertexFactory` clamps the request to the mesh's UV count and clamping
+duplicates (`LocalVertexFactory.ush:729-730`, `:737`), and the mesh has one UV
+set because `VoxelChunkComponent.cpp:634` takes `InitFromDynamicVertex`'s default
+`NumTexCoords = 1`. The value is the world-planar UV wrapped to 32 m, so ±32 of
+position-dependent garbage would have been multiplied into the **default**
+renderer's BaseColor. The path that does deliver zero is the pooled one. Measured
+with a probe material adding `EmissiveColor = abs(TexCoord1) * 0.05`: 30.91% of
+pixels differing at >8/255 on the component path against a 3.58% same-run floor,
+nothing on the pooled path. **Corrected encoding:** a sentinel range — both paths
+`fmod` UVs to a 32 m period, so nothing can leave (−32, 32); store `tint + 1000`
+and treat anything under ~100 as identity, which is correct on both paths with
+one graph and no switch node. Full write-up in `docs/gpu-waves-plan.md` Wave E.
 
 **`voxel.Stream.AdmissionBandSkip` is off, and should stay off** until two things
 are checked: its edit veto uses `EditedFootprintMinZ` where the dispatch site

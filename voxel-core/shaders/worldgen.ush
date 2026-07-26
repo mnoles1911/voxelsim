@@ -55,6 +55,41 @@
     #define VXC_REG(slot) : register(slot)
 #endif
 
+// --- worldgen version lock (Unreal leg only) -------------------------------
+//
+// The version of vxc::kWorldGenVersion this file is a mirror of. Bump it in
+// the SAME commit that re-mirrors the constants below and respins
+// shaders/prebuilt -- that is the whole contract this number encodes.
+//
+// WHY IT IS CHECKED AGAINST THE C++ SIDE. Both of the wrong root causes ever
+// published for the determinism gate were version skew wearing a compiler's
+// clothes: first "the v8 CPU rules were never mirrored into HLSL" (they were),
+// then "DXIL floating-point contraction flipped a layer comparison" (there is
+// no floating point in this file). The failure was a CPU worldgen and an HLSL
+// worldgen from different versions meeting in one process. A number that both
+// sides must agree on turns that from a per-cell mystery into a compile error.
+//
+// VoxelGpuWorldGen.cpp's ModifyCompilationEnvironment passes
+// vxc::kWorldGenVersion in as VXC_WORLDGEN_VERSION_CPP. Because a define is
+// part of the shader's DDC key, bumping either number also forces a recompile
+// rather than silently reusing cached bytecode from the previous version.
+//
+// SCOPE, HONESTLY: vxc::kWorldGenVersion lives in a HEADER (core.h), so this
+// catches source-level skew -- an unmirrored kernel -- and NOT a stale
+// voxelcore.lib, where fresh headers sit on top of old object code. The
+// stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
+// timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
+// digest. Two different faults, two different guards.
+#define VXC_WORLDGEN_VERSION_USH 8
+#ifdef VXC_UE
+    #ifndef VXC_WORLDGEN_VERSION_CPP
+        #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
+    #endif
+    #if VXC_WORLDGEN_VERSION_CPP != VXC_WORLDGEN_VERSION_USH
+        #error "worldgen version skew: the linked voxel-core headers and worldgen.ush mirror different worldgen versions. Re-mirror this file from amplifier.cpp/biome.h, bump VXC_WORLDGEN_VERSION_USH, and respin voxel-core/shaders/prebuilt via tools/compile-shaders.ps1."
+    #endif
+#endif
+
 // --- constants mirrored from voxel-core (compile checks in harness) --------
 
 static const int kVoxelSizeMm = 100;
@@ -1342,6 +1377,85 @@ RWStructuredBuffer<uint> OutQuadCounts VXC_REG(u4);
 StructuredBuffer<uint> InQuadOffsets VXC_REG(t5);
 RWStructuredBuffer<uint2> OutQuads VXC_REG(u5);
 
+// --- Wave D / D2: the chunk-local emit permutation --------------------------
+//
+// WHAT IT CHANGES. Two things, both only in the emit path:
+//
+//   1. Quad positions are baked to CHUNK-local voxel coordinates (0..31) here
+//      instead of brick-local (0..7). That is exactly what MeshChunkBricks
+//      produces and exactly what the geometry pool consumes, so the CPU-side
+//      rebase in FVoxelGpuMeshJobManager (RebaseQuadsToChunkLocal) becomes
+//      dead: the quad stream is pool-ready as it leaves the GPU.
+//   2. Writes are offset by QuadWriteBase, so several chunks can emit into
+//      disjoint slices of ONE buffer in one dispatch batch, and so a later
+//      stage can point OutQuads straight at the pool's allocated range.
+//
+// WHY IT IS A PERMUTATION AND NOT AN EDIT IN PLACE. The determinism gate
+// (voxel.GPU.VerifyRegion and the Vulkan bench) folds the packed quad FIELDS
+// into its digest. slice/u0/v0 are quad fields. Rebasing them changes the
+// digest even though the quads are display-only and the underlying geometry is
+// identical — so an unconditional edit here would turn Wave C's freshly green
+// gate red for a reason that has nothing to do with worldgen. Gating it means
+// the gate keeps compiling and running the byte-for-byte identical program it
+// was pinned against, and the streaming path gets its own permutation.
+//
+// The gate on the NEW permutation is voxel.GPU.VerifyAsyncMesh, which
+// byte-compares against MeshChunkBricks + PackVoxelChunkQuad — a strictly
+// stronger check than the digest for this purpose, because the CPU mesher it
+// compares against is the shipping one and it compares CHUNK-local quads.
+//
+// UNREAL ONLY, DELIBERATELY. Keeping the whole thing behind a define that the
+// standalone DXC leg never sets means tools/compile-shaders.ps1 re-emits
+// byte-identical SPIR-V — the same property Wave C's version-lock edit relied
+// on, and the reason the bench leg is provably still running the program its
+// digest was recorded from.
+#ifndef VXC_MESH_CHUNK_LOCAL
+    #define VXC_MESH_CHUNK_LOCAL 0
+#endif
+#if VXC_MESH_CHUNK_LOCAL && !defined(VXC_UE)
+    #error "VXC_MESH_CHUNK_LOCAL is an Unreal-side permutation (FVoxelMeshEmitCS::FChunkLocalDim). The standalone DXC/SPIR-V leg must never define it, or the bench stops running the program its determinism digest was recorded against."
+#endif
+
+#if VXC_MESH_CHUNK_LOCAL
+// Bricks along one edge of a render chunk: VoxelCoords::ChunkEdgeVoxels (32)
+// divided by the 8-voxel brick edge. Mirrored, not derived, because this file
+// deliberately does not know about render chunks anywhere else.
+static const uint kBricksPerChunkEdge = 4u;
+
+// First slot in OutQuads this dispatch may write. Zero for a single chunk
+// meshing into its own buffer; non-zero when several chunks share one buffer.
+// Loose global under VXC_UE, bound by reflected name out of
+// FVoxelMeshEmitCS::FParameters — see the $Globals comment above.
+uint QuadWriteBase;
+
+// Chunk-local voxel origin of the interior brick that owns this mask.
+//
+// Interior brick (ix,iy,iz) of the region sits at region-local voxel origin
+// ((ix+1)*8, (iy+1)*8, (iz+1)*8) — the +1 is the halo brick decodeMask adds.
+// Its CHUNK-local origin is (ix*8, iy*8, iz*8) modulo the chunk, i.e. the halo
+// term comes straight back out. The `% kBricksPerChunkEdge` is what makes a
+// multi-chunk region work: interior brick 4 on an axis is brick 0 of the NEXT
+// chunk, so its chunk-local origin is 0 again, not 32 (which would not even
+// fit the 8-bit field). For the one-chunk-per-region case the interior is
+// 4x4x4 and the modulo is the identity.
+//
+// PRECONDITION: only valid for a maskIndex decodeMask has already accepted.
+uint3 maskChunkLocalOrigin(uint maskIndex)
+{
+    const uint bricksX = DispatchColumns.x / 8u;
+    const uint bricksY = DispatchColumns.y / 8u;
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - identical subtraction to decodeMask's, under the same precondition: this is only reached for a maskIndex decodeMask returned true for, and decodeMask's `bricksX < 3u || bricksY < 3u || BricksZ < 3u` early-out is what proves every axis has at least 3 bricks
+    const uint mbx = bricksX - 2u, mby = bricksY - 2u;
+    const uint meshBrickIndex = maskIndex / 48u;
+    const uint ix = meshBrickIndex % mbx;
+    const uint iy = (meshBrickIndex / mbx) % mby;
+    const uint iz = meshBrickIndex / (mbx * mby);
+    return uint3((ix % kBricksPerChunkEdge) * 8u,
+                 (iy % kBricksPerChunkEdge) * 8u,
+                 (iz % kBricksPerChunkEdge) * 8u);
+}
+#endif
+
 // Region-voxel material read. rv is region-local voxel coords (region brick
 // (0,0,0) cell (0,0,0) is rv = (0,0,0)); callers only pass coords inside the
 // voxelized region (interior brick +/-1 cell stays inside because of the
@@ -1367,7 +1481,13 @@ uint aoCorner(bool s1, bool s2, bool c)
 // CPU greedy algorithm. When emit != 0, writes packed quads at
 // OutQuads[baseOffset + n]; always returns the quad count. Mirrors
 // vxc::meshBrick<8> exactly: mask key = mat | ao<<8 | 1<<16.
-uint greedyMask(int3 brickOriginRv, uint axis, uint dir, uint slice, uint emit, uint baseOffset)
+uint greedyMask(int3 brickOriginRv, uint axis, uint dir, uint slice, uint emit, uint baseOffset
+#if VXC_MESH_CHUNK_LOCAL
+                // Chunk-local voxel origin to bake into the emitted positions;
+                // see maskChunkLocalOrigin. Unused when emit == 0.
+              , uint3 quadOrigin
+#endif
+               )
 {
     const uint u = (axis + 1u) % 3u;
     const uint v = (axis + 2u) % 3u;
@@ -1468,7 +1588,20 @@ uint greedyMask(int3 brickOriginRv, uint axis, uint dir, uint slice, uint emit, 
                 const uint ao8 = (key >> 8) & 0xffu;
                 const uint mat = key & 0xffu;
                 uint2 q;
+#if VXC_MESH_CHUNK_LOCAL
+                // D2: bake the brick's chunk-local origin into the three
+                // position fields, so the quad is positioned in the chunk on
+                // its own. slice runs along `axis`, i2 along u, j2 along v —
+                // the same axis assignment RebaseQuadsToChunkLocal used on the
+                // CPU, which is the code this replaces. Every term stays under
+                // 32 for a 32-voxel chunk, so the 8-bit fields do not overflow.
+                q.x = axis | (dir << 4)
+                    | ((slice + quadOrigin[axis]) << 8)
+                    | ((i2    + quadOrigin[u])    << 16)
+                    | ((j2    + quadOrigin[v])    << 24);
+#else
                 q.x = axis | (dir << 4) | (slice << 8) | (i2 << 16) | (j2 << 24);
+#endif
                 q.y = w | (h << 8) | (ao8 << 16) | (mat << 24);
                 // HARDENING (2026-07 cross-vendor UB pass, issue 3).
                 // `baseOffset` comes from InQuadOffsets, i.e. from whatever
@@ -1486,9 +1619,20 @@ uint greedyMask(int3 brickOriginRv, uint axis, uint dir, uint slice, uint emit, 
                 // quadIndex < quadCap holds and every quad is still written.
                 uint quadCap, quadStride;
                 OutQuads.GetDimensions(quadCap, quadStride);
+#if VXC_MESH_CHUNK_LOCAL
+                // Same guard, one term longer. QuadWriteBase is a host-supplied
+                // uniform, so it gets the identical treatment InQuadOffsets
+                // does: both additions are checked for wraparound and the final
+                // index is bounded against the buffer's own length.
+                const uint writeBase = QuadWriteBase + baseOffset;
+                const uint quadIndex = writeBase + quadCount;
+                if (writeBase >= QuadWriteBase && quadIndex >= writeBase && quadIndex < quadCap)
+                    OutQuads[quadIndex] = q;
+#else
                 const uint quadIndex = baseOffset + quadCount;
                 if (quadIndex >= baseOffset && quadIndex < quadCap)
                     OutQuads[quadIndex] = q;
+#endif
             }
             ++quadCount;
             i2 += w;
@@ -1555,7 +1699,15 @@ void MeshCountMain(uint3 tid : SV_DispatchThreadID)
     uint axis, dir, slice;
     if (!decodeMask(tid.x, origin, axis, dir, slice))
         return;
-    OutQuadCounts[tid.x] = greedyMask(origin, axis, dir, slice, 0u, 0u);
+    // The chunk-local origin is an emit-time concern only: counting is
+    // position-independent, so this passes zero and the count is identical
+    // under either permutation. That matters — the scan chain between count
+    // and emit must produce the SAME offsets whichever way emit is compiled.
+    OutQuadCounts[tid.x] = greedyMask(origin, axis, dir, slice, 0u, 0u
+#if VXC_MESH_CHUNK_LOCAL
+                                    , uint3(0u, 0u, 0u)
+#endif
+                                     );
 }
 
 [numthreads(64, 1, 1)]
@@ -1575,7 +1727,11 @@ void MeshEmitMain(uint3 tid : SV_DispatchThreadID)
     // tid.x >= maskCount above, so this is unreachable on a valid dispatch.
     if (tid.x >= ScanCount)
         return;
-    greedyMask(origin, axis, dir, slice, 1u, InQuadOffsets[tid.x]);
+    greedyMask(origin, axis, dir, slice, 1u, InQuadOffsets[tid.x]
+#if VXC_MESH_CHUNK_LOCAL
+             , maskChunkLocalOrigin(tid.x)
+#endif
+              );
 }
 
 // --- GPU exclusive scan over per-mask quad counts ---------------------------

@@ -93,7 +93,21 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	FVertexFactoryIntermediates Intermediates = (FVertexFactoryIntermediates)0;
 	Intermediates.SceneData = VF_GPUSCENE_GET_INTERMEDIATES(Input);
 
-	const uint QuadIndex = Input.VertexId / VOXEL_VERTICES_PER_QUAD;
+	// WHERE THIS DRAW STARTS IN THE POOL COMES FROM VoxelRange.BaseQuad, NOT
+	// FROM SV_VertexID.
+	//
+	// SV_VertexID does not include the draw's base vertex on D3D12
+	// (RHISupportsAbsoluteVertexID is Vulkan-only), so a draw that starts at
+	// pool quad F still sees VertexId running from 0. Every draw therefore
+	// starts at vertex 0 and names F explicitly -- the same idiom
+	// FLocalVertexFactory uses for VF_VertexOffset. BaseQuad is 0 for the single
+	// full-pool draw and for the single-chunk component, so those are unchanged.
+	//
+	// Measured, not assumed: with this expression reading SV_VertexID alone,
+	// tiling the pool into N exact contiguous ranges drew only the first 1/N of
+	// it at N = 2, 8 and 64 while still paying for every quad. See
+	// docs/gpu-waves-plan.md "Wave A".
+	const uint QuadIndex = VoxelRange.BaseQuad + (Input.VertexId / VOXEL_VERTICES_PER_QUAD);
 	const uint CornerIndex = Input.VertexId % VOXEL_VERTICES_PER_QUAD;
 
 	const uint2 Packed = VoxelVF.QuadBuffer[QuadIndex];

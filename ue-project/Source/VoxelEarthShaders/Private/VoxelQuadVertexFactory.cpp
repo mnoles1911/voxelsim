@@ -8,6 +8,7 @@
 #include "CommonRenderResources.h"
 
 IMPLEMENT_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadVertexFactoryParameters, "VoxelVF");
+IMPLEMENT_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadRangeParameters, "VoxelRange");
 
 bool FVoxelQuadVertexFactory::ShouldCompilePermutation(
 	const FVertexFactoryShaderPermutationParameters& Parameters)
@@ -69,6 +70,16 @@ void FVoxelQuadVertexFactory::InitRHI(FRHICommandListBase& RHICmdList)
 		FVertexStreamComponent(&GNullColorVertexBuffer, 0, 0, VET_Color), 0));
 	InitDeclaration(Elements);
 
+	// The BaseQuad = 0 fallback. Built unconditionally -- the single-chunk
+	// component has no QuadBufferSRV set at this point in some paths, and every
+	// permutation of the shader reads VoxelRange.BaseQuad regardless.
+	{
+		FVoxelQuadRangeParameters ZeroRange;
+		ZeroRange.BaseQuad = 0u;
+		ZeroRangeUniformBuffer = TUniformBufferRef<FVoxelQuadRangeParameters>::CreateUniformBufferImmediate(
+			ZeroRange, UniformBuffer_MultiFrame);
+	}
+
 	if (QuadBufferSRV.IsValid())
 	{
 		FVoxelQuadVertexFactoryParameters Parameters;
@@ -89,6 +100,7 @@ void FVoxelQuadVertexFactory::InitRHI(FRHICommandListBase& RHICmdList)
 void FVoxelQuadVertexFactory::ReleaseRHI()
 {
 	UniformBuffer.SafeRelease();
+	ZeroRangeUniformBuffer.SafeRelease();
 	QuadBufferSRV.SafeRelease();
 	FVertexFactory::ReleaseRHI();
 }
@@ -98,28 +110,19 @@ class FVoxelQuadVertexFactoryShaderParameters : public FVertexFactoryShaderParam
 {
 	DECLARE_TYPE_LAYOUT(FVoxelQuadVertexFactoryShaderParameters, NonVirtual);
 
-	LAYOUT_FIELD(FShaderParameter, ChunkOriginUU);
-	LAYOUT_FIELD(FShaderParameter, ChunkLevelScale);
+	// NO LOOSE FShaderParameters HERE, deliberately. Two used to sit in this
+	// slot -- VoxelChunkOriginUU and VoxelChunkLevelScale -- and both were dead:
+	// neither name exists in the .ush any more, both moved into the VoxelVF
+	// uniform buffer because loose parameters measurably do not bind here, and
+	// IsBound() reported 0 for both on every launch. Anything per-element this
+	// factory needs goes through a uniform buffer; see FVoxelQuadRangeParameters.
 
 public:
 	void Bind(const FShaderParameterMap& ParameterMap)
 	{
-		ChunkOriginUU.Bind(ParameterMap, TEXT("VoxelChunkOriginUU"));
-		ChunkLevelScale.Bind(ParameterMap, TEXT("VoxelChunkLevelScale"));
-
-		// Bind() running proves the parameters object was CREATED, i.e. that
-		// IMPLEMENT_VERTEX_FACTORY_PARAMETER_TYPE took effect. If this fires but
-		// GetElementShaderBindings never does, the object exists and the
-		// renderer simply is not calling it -- a completely different problem
-		// from the trait never being specialised.
-		static bool bLoggedBindCall = false;
-		if (!bLoggedBindCall)
-		{
-			bLoggedBindCall = true;
-			UE_LOG(LogTemp, Warning,
-			       TEXT("VoxelVF: Bind() CALLED — originBound=%d scaleBound=%d"),
-			       ChunkOriginUU.IsBound() ? 1 : 0, ChunkLevelScale.IsBound() ? 1 : 0);
-		}
+		// Required by IMPLEMENT_VERTEX_FACTORY_PARAMETER_TYPE and intentionally
+		// empty: everything this factory binds is a uniform buffer, which is
+		// resolved by type in GetElementShaderBindings rather than by name here.
 	}
 
 	void GetElementShaderBindings(
@@ -142,14 +145,40 @@ public:
 			UE_LOG(LogTemp, Warning, TEXT("VoxelVF: GetElementShaderBindings ENTERED"));
 		}
 
-		// One pool per factory instance in G2, so the buffer can be read
-		// straight off the factory rather than threaded through the batch
-		// element. G3 will need per-chunk ranges and will move to UserData.
+		// The pool itself is per FACTORY -- one factory serves every chunk -- so
+		// it is read straight off the factory.
 		const FVoxelQuadVertexFactory* Factory = static_cast<const FVoxelQuadVertexFactory*>(VertexFactory);
 		if (FRHIUniformBuffer* Uniforms = Factory->GetUniformBuffer())
 		{
 			ShaderBindings.Add(
 				Shader->GetUniformBufferParameter<FVoxelQuadVertexFactoryParameters>(), Uniforms);
+		}
+
+		// WHERE THIS ELEMENT STARTS IN THE POOL. This is the per-element state
+		// the comment that used to sit here promised G3 would need.
+		//
+		// UserData is the only channel that is per BATCH ELEMENT rather than per
+		// batch, and a frustum-culled pool submits one element per surviving pool
+		// range. An element that carries none -- the single full-pool draw, and
+		// the single-chunk component -- falls back to the factory's BaseQuad = 0
+		// buffer, which makes those paths identical to what they were before this
+		// existed rather than merely equivalent.
+		//
+		// Never pass nullptr: Add() checkf()s a non-null value for a bound
+		// uniform-buffer parameter, and this one is bound in every permutation.
+		FRHIUniformBuffer* RangeUniforms = Factory->GetZeroRangeUniformBuffer();
+		if (const FVoxelQuadRangeUserData* Range =
+		        static_cast<const FVoxelQuadRangeUserData*>(BatchElement.UserData))
+		{
+			if (FRHIUniformBuffer* FromElement = Range->RangeUniformBuffer.GetReference())
+			{
+				RangeUniforms = FromElement;
+			}
+		}
+		if (RangeUniforms != nullptr)
+		{
+			ShaderBindings.Add(
+				Shader->GetUniformBufferParameter<FVoxelQuadRangeParameters>(), RangeUniforms);
 		}
 
 		// The GI volume is a SECOND uniform buffer rather than more members on

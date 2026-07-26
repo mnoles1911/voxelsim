@@ -398,3 +398,37 @@ meshed faces. That is the cost side of this change and it is real.
 - Compiler: the same pinned Microsoft DXC `v1.9.2602.24`
   (`dxcompiler.dll: 1.9(5191-d355aa83)(1.9.2602.24) - 1.9.2602.24
   (d355aa836)`), via `tools/compile-shaders.ps1` with no flag changes.
+
+## 2026-07-26 respin (Wave C): version lock added, BYTECODE UNCHANGED
+
+`worldgen.ush` gained a compile-time worldgen version lock —
+`VXC_WORLDGEN_VERSION_USH`, checked against the `VXC_WORLDGEN_VERSION_CPP` that
+`VoxelGpuWorldGen.cpp`'s `ModifyCompilationEnvironment` passes in from
+`vxc::kWorldGenVersion`. **All seven `.spv` files are byte-identical**, and they
+have to be: the whole edit is preprocessor-level and lives inside
+`#ifdef VXC_UE`, which `tools/compile-shaders.ps1` never defines.
+
+That identity is the useful part of this entry. It is a live re-check of the
+source/bytecode skew question — the committed SPIR-V *is* what today's
+`worldgen.ush` compiles to — and it is what makes the claim "the Vulkan leg is
+still running the same program" a measurement rather than an assertion. SHA-256
+table above is unchanged; verify with `sha256sum -c`.
+
+Gate after the respin, same box (AMD Radeon RX 7800 XT), two legs each:
+
+| leg | result | digest |
+|---|---|---|
+| `vxc_gpu.exe` (DXC `cs_6_0` -> SPIR-V -> Vulkan) | **PASS**, bit-exact, 8192 columns / 393216 cells / 6668 quads | `6e893ab3679a8c81` |
+| `voxel.GPU.VerifyRegion` (UE `cs_6_6`/`6_8` -> DXIL -> D3D12) | **PASS**, bit-exact | `6e893ab3679a8c81` |
+
+The Unreal leg had been red since 2026-07-25. It was never a toolchain problem:
+`voxelcore.lib` predated the worldgen v8 CPU landing while Unreal compiled the v8
+`worldgen.ush`, so a v6 CPU reference was being compared against a v8 kernel.
+Full reconstruction in `docs/backlog.md` §6a and `docs/gpu-waves-plan.md`
+Wave C. Also checked and clean while in here: DXC emits the `VXC_UE` `$Globals`
+at byte-identical offsets to the bench's explicit `cbuffer` (`BrickZMin` at
+offset 44, 56 bytes total), at both `cs_6_0` and `cs_6_6`.
+
+- Source: `voxel-core/shaders/worldgen.ush` on `claude/wave-c-determinism`.
+- Compiler: the same pinned Microsoft DXC `v1.9.2602.24`, via
+  `tools/compile-shaders.ps1` with no flag changes.
