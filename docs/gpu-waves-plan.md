@@ -905,6 +905,78 @@ rather than against worker count — **and one knob at a time.** The recorded
 catastrophe is what happens otherwise: floors `{0,2,3,4,4}` reserved 13 of 24
 slots and collapsed throughput from 49,179 chunks to 558.
 
+### D4 wiring design — written from the code, 2026-07-26
+
+Read-only survey of `VoxelWorldSubsystem.cpp` done while waiting for box time.
+Line numbers are today's.
+
+**The finding that shapes everything: the 34×34 column grid is built on the
+WORKER thread, inside the job lambda — not in `DispatchJobs`.** Storage is
+`static thread_local vxc::ColumnSample ScratchColumns[1156]` (`:6212-6251`),
+built at `:6261-6268`, and `DispatchJobs` touches no columns anywhere. The
+`static thread_local` idiom settles it; the comment at `:6227` names the cost as
+"24 workers × 208 KB".
+
+**Consequence: there is no CPU column pass for a GPU job to reuse.** If
+`DispatchJobs` submits to the GPU instead of launching a task, no worker runs,
+so no columns are evaluated and **no band is produced**. That is not a
+performance detail — the band feeds the cold-band throttle, and a (X,Y) column
+that stops receiving bands is the stranded-column bug. So a GPU level-0 job must
+do one of:
+
+  - **(i) keep a worker task that builds columns and the band but does NOT
+    mesh.** This is exactly "GPU meshing removes the meshing, not the job", and
+    it is the D4 scope. `Result.GridMs`/`GridCycles` already exist (`:1238`) so
+    the split is already measurable.
+  - **(ii) the band-reduction kernel** (see the correction above). Removes the
+    CPU pass entirely. After D1–D4, not during.
+
+**The job has no struct — it is a lambda capture list** (`:6142-6143`), launched
+via `UE::Tasks::Launch(TEXT("VoxelChunkMeshJob"), ..., BackgroundNormal)`. So
+the GPU branch is a clean fork at `:6140`, after every gate has already passed.
+
+**Counters, with the "completed" ruling applied.** The two are asymmetric today:
+
+| counter | inc | dec | thread |
+|---|---|---|---|
+| `JobsInFlightCounter` | `:6109` game | `:6535` **worker**, after `ResultsQueue.Enqueue` | mixed |
+| `LevelJobsInFlight[]` | `:6110` game | `:7188` game, in `DrainResults`, before the stale `continue` | game |
+
+For a GPU job there is no worker, so `JobsInFlightCounter.Decrement()` moves to
+**the manager's `OnJobComplete`, at the moment the result is pushed to
+`ResultsQueue`** — the exact analogue of `:6535`. `LevelJobsInFlight[]` is
+untouched: it already decrements in `DrainResults`, which is what "in flight
+means completed" requires.
+
+**Three things `DrainResults` does before the stale check, all of which a GPU
+result must still trigger** (`:7101`, `:7113`, `:7188`): the band `Add`, the
+`FootprintBlindJobInFlight.Remove`, and the per-ring decrement. A GPU result must
+enter the same `ResultsQueue` as a CPU one and be indistinguishable to
+`DrainResults`, or all three are lost.
+
+**A wiring detail the plan missed: `ApplyMeshResult` takes
+`TArray<FVoxelChunkQuad>` and packs internally** at `:6835`
+(`Packed[I] = PackVoxelChunkQuad(Quads[I])`). The GPU delivers **already-packed
+`TArray<uint64>`**. D4 needs an overload that takes pre-packed quads and skips
+the pack loop, or it will unpack GPU quads solely to repack them.
+
+**Tiles are a non-issue, verified.** `VoxelGpuRegionBuild::FillRasterWindow` is
+templated and needs only `pixelSizeMm()` / `elevationMm()` / `climate()` — i.e.
+exactly `vxc::ITileSampler`. The production path passes `*Impl->Tiles` instead of
+a `SyntheticTileSampler`; the only change is widening the two existing callers'
+parameter from the concrete synthetic type to `vxc::ITileSampler&`.
+`TileGridSampler` loads every `.vxtl` eagerly with a deterministic flat-sea
+fallback on a miss — but the CPU path reads the *same* sampler through
+`Amp.column`, so this is **not a GPU-specific risk**.
+
+**Two asymmetries to measure rather than assume:**
+- The CPU path has a per-brick `SkipBrick` lambda (`:6357-6409`) driven by the
+  same band scratch arrays, so it skips provably-all-air/all-solid bricks. **The
+  GPU mesher has no equivalent and meshes all 64.** That compounds with the 3.4×
+  halo waste below.
+- `EditEpochSnapshot` (`:6143`) and `GenerationId` (`:7191`) both widen as a
+  failure window when a job spans frames. Watch `StaleResultsDiscarded`.
+
 **Batch across chunks.** A region dispatch is a brick-aligned slab with a 1-brick
 halo, so meshing one 32³ chunk alone dispatches 48³ voxels — 3.4× waste. Batch a
 footprint's column or a tile of neighbours and slice the quad stream by
