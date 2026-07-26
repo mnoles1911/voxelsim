@@ -42,11 +42,30 @@
 
 // INT64_MAX / INT64_MIN as named constants rather than inline literals.
 //
-// Not style. `-0x8000000000000000` is a unary minus applied to a hex literal
-// that does not fit a signed 64-bit int, so its type is decided by the
-// compiler before the minus is applied -- exactly the kind of
-// compiler-determined typing this file's determinism history says not to leave
-// lying around. Deriving the min from the max keeps both provably in range.
+// DO NOT "SIMPLIFY" THESE BACK TO `-0x8000000000000000L`. That is not a style
+// preference, and the reason is worth spelling out because the naive form looks
+// obviously correct.
+//
+// 0x8000000000000000 is 2^63. It does not fit int64_t (max 2^63 - 1) but does
+// fit uint64_t, so the compiler types the LITERAL before the unary minus is
+// applied, and the type it picks is not pinned down by anything this file
+// controls. If it picks uint64_t, negation wraps and the value still comes out
+// as INT64_MIN when stored into an int64_t -- so the ASSIGNMENTS look fine.
+//
+// The COMPARISONS do not. `segDepthMm > -0x8000000000000000L` with a uint64_t
+// right-hand side converts the signed left-hand side to unsigned under the
+// usual arithmetic conversions, and then every POSITIVE segDepthMm compares as
+// less than 2^63 and the guard reads FALSE where it must read true. That guard
+// is "at least one cave segment existed"; inverting it drops the cave term out
+// of the band entirely, which raises SolidBelowVoxel and skips chunks that have
+// geometry -- the unsafe direction, silently.
+//
+// NOT VERIFIED, and deliberately not: which type DXC actually picks was never
+// established, because deriving the min from the max makes the question moot
+// rather than answered. Recorded so the next reader knows the naive form was
+// removed for a possible wrong answer, not for tidiness. (If it ever did
+// misbehave, the cave-rich single-column probes in voxel.GPU.VerifyRegion's D6
+// sweep are exactly the probes that would have caught it.)
 static const int64_t kBandI64Max = 0x7fffffffffffffffL;
 static const int64_t kBandI64Min = -kBandI64Max - (int64_t)1;
 

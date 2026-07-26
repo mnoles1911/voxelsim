@@ -506,10 +506,33 @@ namespace
 		Probes.Add({ Region.Width - kProdEdge, kProdEdge, TEXT("production-shaped window, offset") });
 		Probes.Add({ 17, 8, TEXT("small offset window") });
 
-		// Single-column probes on the diagonal, aimed at the richest columns.
-		// A featureless column tests only `surfaceTop + 1`; these are what test
-		// the cave-segment loop, the sinkhole shaft term, the bedrock clamps and
-		// the integer ceil-sqrt against the CPU's FP-seeded one.
+		// Single-column probes. A featureless column tests only
+		// `surfaceTop + 1`; these are what test the cave-segment loop, the
+		// sinkhole shaft term, the two bedrock clamps and the integer ceil-sqrt
+		// against the CPU's FP-seeded one.
+		//
+		// HOW THEY ARE CHOSEN, PRECISELY, because the PASS line makes a claim
+		// about its own coverage and that claim has to be true:
+		//
+		//   * The segments are COUNTED, not assumed. The loop below reads
+		//     Col.cave.count, Col.cave.shaftMarginSq and Col.cavern.count out of
+		//     the real vxc::ColumnSample the CPU reference already built for
+		//     this region, scores every candidate, and takes the top three. It
+		//     is not a guess that features cluster anywhere in particular.
+		//   * The candidates are the DIAGONAL ONLY -- 64 of this fixture's 4,096
+		//     columns. BandOriginI is one scalar for both axes, so a
+		//     single-column window can only sit at (k, k). "The three richest
+		//     columns available to a single-column probe" is the true claim;
+		//     "the three richest columns in the region" is not, and is not
+		//     claimed anywhere.
+		//   * The three window probes above cover all 4,096 columns between
+		//     them. What they cannot do is localise a per-column error, which is
+		//     what these three are for.
+		//
+		// If the diagonal turns out to have no cave or cavern columns at all,
+		// the sweep still runs -- but its strongest leg has not fired, and that
+		// is said out loud below rather than left to be inferred from three
+		// "0 cave / 0 shaft / 0 cavern" PASS lines.
 		{
 			struct FScored { uint32 K; int32 Score; };
 			TArray<FScored> Scored;
@@ -521,14 +544,34 @@ namespace
 				                  + Col.cavern.count * 3;
 				Scored.Add({ K, Score });
 			}
-			Scored.Sort([](const FScored& A, const FScored& B) { return A.Score > B.Score; });
+			// Ties broken by K so the gate probes the SAME columns every run.
+			// TArray::Sort is introsort and is not stable; without this, two
+			// runs of the same binary on the same fixture could report coverage
+			// from different columns, and a gate whose scope moves between runs
+			// is not a gate.
+			Scored.Sort([](const FScored& A, const FScored& B)
+			{
+				return (A.Score != B.Score) ? (A.Score > B.Score) : (A.K < B.K);
+			});
+
+			if (Scored.Num() > 0 && Scored[0].Score == 0)
+			{
+				UE_LOG(LogVoxelGpuVerify, Warning,
+				       TEXT("[D6 band cross-check] [%s] NO cave or cavern column anywhere on the ")
+				       TEXT("diagonal, so the single-column probes below exercise only ")
+				       TEXT("`surfaceTop + 1`. The cave-segment loop, the shaft term, the bedrock ")
+				       TEXT("clamps and ceilSqrt are NOT covered by this region's probes -- read ")
+				       TEXT("their PASS lines accordingly."),
+				       Region.Name);
+			}
+
 			for (int32 N = 0; N < 3 && N < Scored.Num(); ++N)
 			{
 				Probes.Add({ Scored[N].K, 1,
-				             FString::Printf(TEXT("single column (%d,%d), richness %d"),
+				             FString::Printf(TEXT("single column (%d,%d), richest-on-diagonal rank %d, score %d"),
 				                             Region.OriginVx + int32(Scored[N].K),
 				                             Region.OriginVy + int32(Scored[N].K),
-				                             Scored[N].Score) });
+				                             N + 1, Scored[N].Score) });
 			}
 		}
 

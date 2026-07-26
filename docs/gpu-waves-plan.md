@@ -140,6 +140,45 @@ boilerplate.
    and moves under every PR. Anchor on symbol names — `DispatchJobs`,
    `DrainResults`, `MeshChunkBricks`, `EnsureVolumeOrigin` — and treat the numbers
    as hints. Several quoted here were already stale when this plan was written.
+13. **A new `.usf` that has never been executed is NOT BUILT, however green the
+    compile.** *(Wave D6, 2026-07-26.)* `IMPLEMENT_GLOBAL_SHADER` records a
+    `(virtual path, entry point)` pair and **nothing else** — no file existence
+    check, no compile, no validation. Shader source is loaded from disk and
+    compiled the first time the editor asks for the shader, which on a gated
+    kernel may be never. So a clean `Build.bat` says the module linked; it says
+    nothing whatever about whether the kernel exists, parses, or binds.
+
+    `VoxelBandReduce.usf` shipped in `e3f0186` described as "compiles", and it
+    was missing `#include "/Engine/Public/Platform.ush"` — which Unreal's shader
+    preprocessor **rejects outright**. The kernel would have failed the first
+    time anything asked for it. Nothing in the C++ build could have said so.
+
+    **This is the sixth instance of the silent-nothing shape on this project**
+    (the unbound `FShaderParameter`, the dead `GPUCullMergeGap` cvar, the
+    silently-ignored `QuadWriteBase`, `voxel.GI.Enabled` as a no-op under
+    `voxel.Stream.GPU`, the latched `voxel.GI.Volume` help text), and it is
+    structurally the worst of them, because **the build system itself is the
+    thing reporting success**.
+
+    **The rule: any wave adding a kernel must RUN it once before claiming it
+    exists.** One headless leg that reaches the shader is the whole cost. Until
+    that leg, the correct description is "written", never "built" and never
+    "compiles".
+14. **CI's shader lint only ever sees `voxel-core/shaders`** — an owned gap, not
+    an oversight to rediscover. `.github/workflows` runs
+    `python tools/lint-shader-ub.py voxel-core/shaders`, so **nothing under
+    `ue-project/Shaders/` has ever been linted**, and `VoxelBandReduce.usf`
+    (Wave D6) is the first file there carrying real integer worldgen math. Run
+    explicitly it had five findings — all provably safe, all now annotated in
+    place.
+
+    **Whoever closes this will hit `VoxelQuadDecode.ush` first:** it fails
+    `VARIABLE_SHIFT` on `AoShiftForCorner[Corner]` (`:89`), a table-indexed shift
+    distance. That belongs to the pooled draw path, not to D6, so D6 deliberately
+    did **not** extend the CI invocation — suppressing another wave's finding to
+    make your own job green is how a lint stops meaning anything. Closing this
+    means adjudicating that shift on its merits first, then adding the second
+    path to the CI step.
 
 ## How to use this document
 
@@ -2267,9 +2306,95 @@ bytes, same result object), which is the design's whole point and is where the
 zero-new-invariant-surface property comes from. Until that lands the kernel
 computes a band nobody reads.
 
+#### Gated 2026-07-26 — the lift, the sweep and the fold. **STILL NOT RUN.**
+
+All three of the above are built. **Nothing has executed yet**, so `BandReduceMain`
+remains unverified — see ground rule 13, which this item is the source of.
+
+**1a — the lift.** `ue-project/Source/VoxelEarth/VoxelFootprintBand.h`.
+`FFootprintBand`, `BandProvesChunkEmpty`, `CeilSqrtI64`, `ColumnSurfaceTopVoxel`
+and `ColumnDeepestAirVoxel` moved verbatim out of `VoxelWorldSubsystem.cpp`.
+**The lift is clean** — the three helpers depend on nothing but voxel-core
+(`ColumnSample`, `floorDiv`, `kVoxelSizeMm`, the three cave constants,
+`CavernSeg`) and `FMath`. No subsystem state, no statics, no UHT exposure. Same
+shape and the same four includes as `VoxelChunkMesher.h`.
+
+Added while moving: **`MakeFootprintBand(maxTop, minAir)`**, the `+1 / −1 /`
+clamp that was four lines inlined in the worker-job lambda. There are now
+**three** producers of a band — the worker job, the gate, and the GPU readback —
+and the widening is exactly the thing that must not drift between them.
+
+**1b — the gate.** `voxel.GPU.VerifyRegion` runs **six band probes per fixture
+region**, each its own PASS/FAIL line in D3's style, comparing against the
+lifted functions themselves.
+
+*Why six and not one:* the band is a max/min over ~1,156 columns, so a
+per-column error away from the extremum is **invisible in the reduced answer**.
+One window-shaped probe can pass while the reduction is wrong for most of the
+world. So: three window probes at different origins and sizes (a dropped
+`BandOriginI` fails probe 2 and not probe 1), then three **single-column** probes
+where `BandEdge 1` makes the reduction degenerate and the comparison becomes an
+exact test of the per-column function.
+
+*How the three columns are chosen, stated precisely because the PASS line makes
+a claim about its own coverage:* the segments are **counted, not assumed** — the
+harness reads `cave.count`, `cave.shaftMarginSq` and `cavern.count` out of the
+real `vxc::ColumnSample`s the CPU reference already built, scores every
+candidate and takes the top three, ties broken by index so the gate probes the
+same columns every run. The candidates are the **diagonal only** (64 of 4,096
+columns), because `BandOriginI` is one scalar for both axes and a single-column
+window can only sit at `(k, k)`. *"The three richest columns available to a
+single-column probe"* is the true claim; *"the three richest columns in the
+region"* is not, and is not made. The three window probes cover all 4,096
+columns between them; what they cannot do is localise a per-column error, which
+is what these three are for. If the diagonal has no cave or cavern column at all
+the harness **says so as a warning** rather than letting three
+`0 cave / 0 shaft / 0 cavern` PASS lines read as a strong result.
+
+Band probes run with `bMeshChain false` — the band is a pure function of the
+columns — which is what makes a six-probe sweep cheap.
+
+**1c — the fold.** 4 bytes → 12 on the **same result object**; `DrainResults`
+untouched. The band did **not** get its own async stream: that would give a job
+two things to deliver exactly once and make *"delivered quads but no band"*
+representable. The two readbacks ride the same graph and are harvested
+**all-or-none in phase 1** — the rule the brick-local control path's
+`Counts`/`Offsets` already follow — so there is still exactly one completion
+event. `bBandValid` is false rather than `{0, 0}` when absent, because a zero
+band claims the footprint is empty.
+
+**Also fixed, and neither was visible from a green build:**
+
+- **The missing `Platform.ush` include** — see ground rule 13, which exists
+  because of this.
+- **The `INT64_MIN` sentinels were inline `-0x8000000000000000L`.** `2^63` does
+  not fit `int64_t` but does fit `uint64_t`, so the compiler types the literal
+  before the minus is applied. The *assignments* survive that (negation wraps
+  and the stored value is still `INT64_MIN`); the **comparisons do not**.
+  `segDepthMm > -0x8000000000000000L` against a `uint64_t` converts the signed
+  side to unsigned, and every **positive** `segDepthMm` then reads FALSE where
+  it must read true. That guard is *"at least one cave segment existed"*;
+  inverting it drops the cave term out of the band, raises `SolidBelowVoxel`,
+  and skips chunks that have geometry — **the unsafe direction, silently.**
+  *Which type DXC actually picks was never established, and deliberately so:
+  deriving the min from the max makes the question moot rather than answered.*
+  Recorded because the naive form looks obviously correct and will be
+  "simplified" back otherwise. Had it misbehaved, the cave-rich single-column
+  probes are precisely the probes that would have caught it.
+- **`ValidateRegionRequest` now rejects a band window that does not fit inside
+  `DispatchColumns`.** The kernel skipped out-of-range cells rather than reading
+  out of bounds, which silently reduces over a **partial window** — a band that
+  is not an outer bound of the columns asked about, in the unsafe direction.
+  Same class as the unbound `FShaderParameter` and the dead `GPUCullMergeGap`.
+- **Five `lint-shader-ub` findings annotated** (three `SIGNED_DIVISION` on
+  `kVoxelSizeMm / 2`, two `UNGUARDED_WRITE` on a 2-element buffer with literal
+  indices). All provably safe. The reason they were never seen is ground rule 14.
+
 **Sequencing: after D1–D4 are landed and measured**, alongside D5, for the same
 reason D5 waits — debugging shared plumbing against a novel path doubles the
-search space for any failure.
+search space for any failure. **D6's gate, however, lands before D4's wiring**
+(owner's ratification, 2026-07-26): debugging the `DispatchJobs` fork against an
+unverified band doubles the same search space.
 
 ### D5 — coarse-level GPU generation (levels 1–5) — **in scope (owner's call)**
 
