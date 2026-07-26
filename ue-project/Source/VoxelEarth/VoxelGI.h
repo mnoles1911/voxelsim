@@ -102,6 +102,11 @@ public:
 	// cannot verify re-centring on its own.
 	void ForceVolumeRecentre(int32 ShiftBricks);
 
+	// voxel.GI.RelightTest. Carves through the real edit path and times until the
+	// dig is FULLY relit -- both the solve queue and the re-shade queue drained.
+	// This is the cost side of lowering voxel.GI.MaxChunkRefreshesPerFrame.
+	void StartRelightTest(double RadiusUU);
+
 	// Read access for the scene proxy. Never null once Initialize has run.
 	const FVoxelLightField& GetField() const { return *Field; }
 
@@ -155,6 +160,7 @@ private:
 	void PushVolumeParamsIfChanged();
 	// Drives voxel.GI.VolumeDigTest's phases from the tick.
 	void StepDigTest();
+	void StepRelightTest();
 
 	TUniquePtr<FVoxelLightField> Field;
 
@@ -268,6 +274,22 @@ private:
 	int32 DigTestPhase = 0;
 	double DigTestPhaseSeconds = 0.0;
 	TArray<FIntVector> DigTestBricks;
+
+	// -VoxelGIRelightAfter=<seconds>. Command line rather than -ExecCmds for the
+	// same reason -VoxelGIVis is: ExecCmds lands before the field has streamed in,
+	// and a relight test on an empty field measures nothing. Fires once.
+	float RelightAfterSeconds = 0.f;
+	bool bRelightArmed = false;
+
+	// voxel.GI.RelightTest state.
+	bool bRelightTestActive = false;
+	double RelightTestStartSeconds = 0.0;
+	int32 RelightTestPeakDirty = 0;
+	int32 RelightTestPeakRefresh = 0;
+	TArray<FIntVector> RelightTestBricks;
+	// See StepRelightTest: an edit does not dirty bricks synchronously, so the
+	// drain wait must not begin until work has actually arrived.
+	bool bRelightWorkSeen = false;
 
 	// Chunks the voxelize drain skipped because they were further than
 	// voxel.GI.RadiusUU from the view origin, accumulated between debug lines.

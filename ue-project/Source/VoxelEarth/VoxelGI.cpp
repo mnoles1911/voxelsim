@@ -297,6 +297,18 @@ void UVoxelGISubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		}
 	}
 
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelGIRelightAfter="), RelightAfterSeconds) && RelightAfterSeconds > 0.f)
+	{
+		bRelightArmed = true;
+		if (IConsoleVariable* V = IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.GI.Enabled")))
+		{
+			V->Set(1, ECVF_SetByCode); // the harness is meaningless with GI off
+		}
+		UE_LOG(LogVoxelGI, Log,
+		       TEXT("VoxelGIRelightAfter: carving and timing a full relight at %.0fs. GI forced on."),
+		       RelightAfterSeconds);
+	}
+
 	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelGIConverge="), ConvergePasses) && ConvergePasses > 0)
 	{
 		ConvergePasses = FMath::Clamp(ConvergePasses, 1, 64);
@@ -1672,6 +1684,148 @@ void UVoxelGISubsystem::StepDigTest()
 	}
 }
 
+// voxel.GI.RelightTest -- the OTHER SIDE of the voxel.GI.MaxChunkRefreshesPerFrame
+// trade, measured instead of inferred from the budget arithmetic.
+//
+// Lowering that budget is the candidate fix for GI's frame-time tail (B7: 3.2x
+// hitches at the default 4). But the budget bounds the re-shade drain, so a
+// smaller one necessarily means an edit takes longer to become visible. Reporting
+// only the hitch improvement would be offering the owner a free lunch that is not
+// free; this puts a number on the bill.
+//
+// Method: carve through the real edit path, then time until BOTH the solve queue
+// and the re-shade queue have drained -- i.e. until every brick the edit dirtied
+// has been re-solved AND every chunk owning one has had its vertex colours
+// rewritten. That is the moment the dig is actually, fully relit on screen.
+void UVoxelGISubsystem::StartRelightTest(double RadiusUU)
+{
+	if (!Field || !VoxelGI::IsEnabled())
+	{
+		UE_LOG(LogVoxelGI, Warning, TEXT("VOLUMERELIGHT: needs voxel.GI.Enabled 1 and a settled field."));
+		return;
+	}
+	UWorld* World = GetWorld();
+	UVoxelWorldSubsystem* WorldSub = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	if (!WorldSub)
+	{
+		return;
+	}
+
+	const FVector CentreUU = FieldCentreUU - FVector(0, 0, 2.0 * double(VoxelLF::BrickEdgeUU));
+	const int32 Removed = WorldSub->CarveSphere(CentreUU, RadiusUU, 0.0);
+
+	// THE BRICKS THIS EDIT DIRTIED, not the global queues.
+	//
+	// Waiting on DirtyQueue/RefreshQueue to empty does not work and the sweep
+	// data says so outright: the round-robin re-solve
+	// (voxel.GI.RefreshBricksPerFrame) feeds those queues continuously, so in
+	// steady state they sit at ~853 entries at refresh 2 and ~1288 at refresh 1
+	// and NEVER reach zero. A timer waiting on that would have returned TIMEOUT
+	// on every leg -- or worse, on a quieter scene, a plausible number that
+	// actually measured the round-robin rather than the edit.
+	const FIntVector Centre = FVoxelLightField::WorldToBrick(CentreUU);
+	const int32 R = 1 + FMath::CeilToInt(RadiusUU / double(VoxelLF::BrickEdgeUU))
+	              + FMath::Clamp(CVarGIEditDirtyRadiusBricks.GetValueOnGameThread(), 0, 4);
+	RelightTestBricks.Reset();
+	for (int32 DZ = -R; DZ <= R; ++DZ)
+	for (int32 DY = -R; DY <= R; ++DY)
+	for (int32 DX = -R; DX <= R; ++DX)
+	{
+		const FIntVector Key = Centre + FIntVector(DX, DY, DZ);
+		if (Field->HasBrick(Key))
+		{
+			RelightTestBricks.Add(Key);
+		}
+	}
+
+	RelightTestStartSeconds = FPlatformTime::Seconds();
+	bRelightTestActive = true;
+	RelightTestPeakDirty = 0;
+	RelightTestPeakRefresh = 0;
+	bRelightWorkSeen = false;
+	UE_LOG(LogVoxelGI, Log,
+	       TEXT("VOLUMERELIGHT: carved %d voxels at (%.0f,%.0f,%.0f) r=%.0f UU; timing to fully relit ")
+	       TEXT("(%d resident bricks in the edit's neighbourhood, refreshBudget=%d solveBudget=%d)"),
+	       Removed, CentreUU.X, CentreUU.Y, CentreUU.Z, RadiusUU, RelightTestBricks.Num(),
+	       CVarGIMaxChunkRefreshesPerFrame.GetValueOnGameThread(),
+	       CVarGIMaxBrickSolvesPerFrame.GetValueOnGameThread());
+}
+
+void UVoxelGISubsystem::StepRelightTest()
+{
+	if (!bRelightTestActive)
+	{
+		return;
+	}
+	RelightTestPeakDirty = FMath::Max(RelightTestPeakDirty, DirtyQueue.Num());
+	RelightTestPeakRefresh = FMath::Max(RelightTestPeakRefresh, RefreshQueue.Num());
+
+	// Done when every brick THIS EDIT dirtied has left both work sets: out of
+	// DirtySet means it has been re-solved, out of RefreshSet means the chunk
+	// owning it has had its vertex colours rewritten. Other bricks arriving from
+	// the round-robin are irrelevant and are deliberately not waited on.
+	int32 Outstanding = 0;
+	for (const FIntVector& Key : RelightTestBricks)
+	{
+		if (DirtySet.Contains(Key) || RefreshSet.Contains(Key))
+		{
+			++Outstanding;
+		}
+	}
+	// WAIT FOR THE WORK TO ARRIVE BEFORE WAITING FOR IT TO DRAIN.
+	//
+	// Without this the timer returns 0 ms on its first tick and looks entirely
+	// plausible. An edit does not dirty a light-field brick synchronously: the
+	// carve dirties CHUNKS, which are re-meshed over the next several frames,
+	// and only then does SetChunkQuads -> NotifyChunkMeshUpdated ->
+	// VoxelizeChunk -> MarkBrickNeighbourhoodDirty put anything in DirtySet. At
+	// the instant of the carve, Outstanding is legitimately 0 -- not because the
+	// relight finished, but because it has not started.
+	//
+	// Measured on the first leg: editToFullyRelitMs=0 with peak queues of 0,
+	// while the independent per-second log showed the refresh queue going
+	// 0 -> 58 -> 0 around the carve. Three plausible sub-second numbers and a
+	// wrong verdict is exactly what this would have produced.
+	if (Outstanding > 0)
+	{
+		bRelightWorkSeen = true;
+	}
+	if (!bRelightWorkSeen)
+	{
+		// Nothing has arrived yet. Keep the clock running -- the wait IS part of
+		// edit-to-relit latency -- but do not let the run end here.
+		if (FPlatformTime::Seconds() - RelightTestStartSeconds > 30.0)
+		{
+			bRelightTestActive = false;
+			UE_LOG(LogVoxelGI, Warning,
+			       TEXT("VOLUMERELIGHT RESULT: TIMEOUT after 30 s | refreshBudget=%d -- no brick from this ")
+			       TEXT("edit ever entered the work sets, so nothing was measured"),
+			       CVarGIMaxChunkRefreshesPerFrame.GetValueOnGameThread());
+		}
+		return;
+	}
+	if (Outstanding > 0)
+	{
+		if (FPlatformTime::Seconds() - RelightTestStartSeconds > 30.0)
+		{
+			bRelightTestActive = false;
+			UE_LOG(LogVoxelGI, Warning,
+			       TEXT("VOLUMERELIGHT RESULT: TIMEOUT after 30 s | refreshBudget=%d outstanding=%d of %d bricks"),
+			       CVarGIMaxChunkRefreshesPerFrame.GetValueOnGameThread(),
+			       Outstanding, RelightTestBricks.Num());
+		}
+		return;
+	}
+
+	bRelightTestActive = false;
+	UE_LOG(LogVoxelGI, Log,
+	       TEXT("VOLUMERELIGHT RESULT: editToFullyRelitMs=%.0f | refreshBudget=%d editBricks=%d ")
+	       TEXT("peakDirtyQueue=%d peakRefreshQueue=%d"),
+	       (FPlatformTime::Seconds() - RelightTestStartSeconds) * 1000.0,
+	       CVarGIMaxChunkRefreshesPerFrame.GetValueOnGameThread(),
+	       RelightTestBricks.Num(), RelightTestPeakDirty, RelightTestPeakRefresh);
+}
+
 void UVoxelGISubsystem::StartDigTest(double RadiusUU)
 {
 	if (!Field || !VoxelGIVolume::IsEnabled() || !bVolumeOriginSet)
@@ -1763,6 +1917,24 @@ namespace
 		{
 			const int32 Bricks = Args.Num() > 0 ? FMath::Clamp(FCString::Atoi(*Args[0]), 1, 64) : 8;
 			GI->ForceVolumeRecentre(Bricks);
+		}
+	}));
+
+	FAutoConsoleCommandWithWorldAndArgs GVoxelGIRelightTestCmd(
+		TEXT("voxel.GI.RelightTest"),
+		TEXT("Carve a sphere below the camera and time how long until it is FULLY relit -- both the brick ")
+		TEXT("solve queue and the chunk re-shade queue drained. This is the cost side of lowering ")
+		TEXT("voxel.GI.MaxChunkRefreshesPerFrame to cut GI's frame-time tail: a smaller drain means fewer ")
+		TEXT("hitches AND a slower relight, and this is the second number. Optional argument: carve radius ")
+		TEXT("in UU (default 300). Logs VOLUMERELIGHT RESULT. DESTRUCTIVE: it really digs."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+			[](const TArray<FString>& Args, UWorld* World)
+	{
+		if (!World) { return; }
+		if (UVoxelGISubsystem* GI = World->GetSubsystem<UVoxelGISubsystem>())
+		{
+			const double RadiusUU = Args.Num() > 0 ? FMath::Clamp(FCString::Atod(*Args[0]), 40.0, 2000.0) : 300.0;
+			GI->StartRelightTest(RadiusUU);
 		}
 	}));
 
@@ -2087,6 +2259,21 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 	VolumeUploadedThisFrame = 0;
 	TickVolume();
 	StepDigTest();
+	// Arm the relight harness once the field has had time to stream in. Uses the
+	// same clock the convergence harness does.
+	if (bRelightArmed)
+	{
+		if (FirstTickSeconds == 0.0)
+		{
+			FirstTickSeconds = Now;
+		}
+		else if (Now - FirstTickSeconds >= double(RelightAfterSeconds))
+		{
+			bRelightArmed = false;
+			StartRelightTest(300.0);
+		}
+	}
+	StepRelightTest();
 	const int32 VolumeUploaded = VolumeUploadedThisFrame;
 
 	// 5) Eviction, at most twice a second. Distance-based rather than
