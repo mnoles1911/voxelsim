@@ -435,12 +435,58 @@ re-scans of footprints whose chunks are already records, so they have nothing
 to refuse. Running mode 1 for real removes 61 records (`tracked` 16417 ->
 16356) and **zero quads**.
 
+**That 4% is a property of the stationary fill, not of the lever, and reading
+it as the general case would be wrong.** On `-VoxelPerfFlight=surface` the
+same census reads `warm=46258 cold=0 skipped=5443` per 5 s window against the
+dispatch-time skip's `skipped=5359` in the same window -- essentially **1:1**.
+A moving anchor evicts footprints behind it and re-enters them later, and
+`FootprintBandCache` is pruned only at twice level 0's unload ring, so a
+re-entering footprint arrives with its band already warm. `cold` collapses to
+0 about 40 s into the flight. So the predicate IS available under movement,
+which is the case the 44.6% figure came from. What follows is why that still
+did not turn into throughput.
+
 And the 61 it does remove cost no worker time to begin with: the dispatch-time
 skip already refuses to mesh them. Moving the same predicate earlier saves a
 record, a queue slot and an admission slot -- not a job. The 44.6% of R0
 worker time in the item above is the chunks the band *declines* to skip (`R0
 total=3396 zq=1449`, 42.7% zero-quad on this spawn), and evaluating the same
 predicate one stage earlier cannot skip more of them.
+
+### Throughput A/B: it measured as a large REGRESSION, unexplained
+
+Interleaved, one binary, `-VoxelPerfRun=60 -VoxelPerfFlight=surface`, all four
+runs shown, first-after-build discarded:
+
+| run | chunks/s | postWarmup p50 | hitches |
+|---|---|---|---|
+| off 1 | 595.7 | 21.01 | 129 |
+| on 1 | **309.3** | 33.85 | 745 |
+| off 2 | 695.9 | 16.45 | 11 |
+| on 2 | **374.3** | 25.62 | 558 |
+
+Both on-runs lose to both off-runs with no overlap. **-46% chunks/s.**
+
+Inside the subsystem the change does exactly what it was designed to do:
+`tracked` 15,003 -> 5,256 (**-65%**), streaming tick 4.03% -> 1.51% of wall,
+exit scan 1.13 -> 0.54 ms. The cost is somewhere else entirely -- ticks per
+5 s window fall **279 -> 89** (~56 fps -> ~18 fps), and everything else on the
+streaming side follows from that: with a third of the passes covering the same
+20 m/s flight, each pass sees far more ground, `candidatesRejected` goes
+31,872 -> 78,138, and the outer rings starve (R1 loaded 878 -> 59, R2 221 ->
+32, R3 339 -> 78).
+
+**I could not isolate what makes the frame slower, and I am not going to guess
+at it.** The two off-runs differ from each other by 100 chunks/s and 11 vs 129
+hitches, which is the signature of external CPU contention -- this box was
+shared with two other agents running editors throughout. Two pairs is not
+enough to separate "the skip does this" from "the machine was busy", and the
+one causal story that fits (fewer tracked records -> `ReplacementCovered`
+releases retained stand-ins sooner -> more re-meshing) was not tested.
+
+What is certain either way: the lever's whole claimed benefit was worker time,
+it demonstrably saves none, and enabling it measured 46% worse. Default 0.
+Anyone re-opening this needs a quiet box and at least three pairs.
 
 ### What would actually reach it
 
