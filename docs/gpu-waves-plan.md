@@ -967,6 +967,58 @@ crash-on-exit rather than a compile error.
 is precisely where a compute compaction pass's compacted-quad-id buffer wants to
 live, so this is the enabling step for that too rather than a detour around it.
 
+#### Built 2026-07-26 — and it closes ONE of THREE clobber paths, not all of them
+
+The two "remaining unknowns" were written down and then actually checked. One
+came back clean; **the other did not, and it matters more than the one that was
+fixed.**
+
+**Path 1 — proxy recreation. FIXED.** `CreateSceneProxy` → `CreateRenderThreadResources`
+re-uploading the whole CPU shadow. Now uploads on first creation only; later
+proxies rebind. Four triggers (`MarkRenderStateDirty` at `:993`, `:1022`,
+`:1032`, `:1228`). Gated by `voxel.Stream.PoolClobberTest`.
+
+**Path 2 — the incremental dirty span. NOT FIXED, and it is the frequent one.**
+`DirtyQuads` is a **span, not a set**: `PushUpdatesToProxy` merges every dirty
+region with `Min(First)` / `Max(Last)` (`:1060-1061`), and
+`UpdateQuadRange_RenderThread` then writes that whole span **from `PooledQuads`**
+(`:1088-1089`, writer at `:436-448`).
+
+So two CPU-written chunks at distant pool offsets produce a dirty span covering
+**everything between them** — and any GPU-written range in that gap is
+overwritten with CPU-shadow content on the very next update. This is the
+**steady-state** path, not a rare one: it runs whenever a chunk is added or
+removed, which is continuously during streaming. It is *more* likely to bite than
+proxy recreation, not less.
+
+*This is the same shape of mistake as the original brief's option 1: a fix that
+addresses the path you were looking at while the more frequent one stays open.
+The persistent buffers are still a precondition for fixing it — they are just not
+sufficient on their own.*
+
+Candidate fixes, not yet costed: track GPU-owned ranges and split the dirty span
+around them (turns one write into several, but the span is already a coarse
+over-approximation); or keep the dirty set as an interval list rather than a
+single span; or have the GPU writer also update the CPU shadow, which defeats the
+purpose. **Cost before building — the same rule that has now paid off three
+times in this wave.**
+
+**Path 3 — buffer growth. HANDLED, but with a gap the caller has to close.** If a
+later proxy needs more than the allocation, the buffers are rebuilt and
+re-uploaded from the CPU shadow. That is *correct in itself* — the GPU-resident
+contents genuinely are gone once the old buffer is destroyed, so there is nothing
+else to restore from. **But nothing currently re-dispatches the GPU-written
+chunks afterwards**, so their geometry silently reverts to whatever the shadow
+holds. Stated plainly because it is the branch a reader will most want to see:
+growth **invalidates every GPU-written range**, and D4 must treat a capacity
+rebuild as a re-mesh trigger. The capacity is allocated up front from
+`kPoolCapacityQuads`, so this should be rare — but "rare and silent" is the
+combination this wave keeps being bitten by.
+
+**Status: D1 is not done.** The persistent-buffer work is correct and is the
+necessary foundation, but path 2 must close before any GPU writer can be trusted,
+and path 3 needs a re-dispatch hook in D4.
+
 - **Neutralise the CPU shadow clobber — the highest-severity silent-corruption risk
   in this wave.** `PooledQuads`/`QuadChunkIds` (`VoxelGpuPoolComponent.h:148-152`)
   are a full CPU mirror, and `CreateSceneProxy` re-uploads all of it. Any
