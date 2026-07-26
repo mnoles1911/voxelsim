@@ -178,9 +178,32 @@ enum ERingSkirtFace : uint8
 	RingSkirt_PosY = 1 << 3,
 };
 
-template <typename MaterialFn>
+// A per-brick "this brick provably emits nothing" predicate, and the default
+// that never fires. A caller with no cheap proof pays nothing for this: the
+// predicate is a template parameter, so an always-false one inlines away
+// entirely and the loop below is byte-for-byte the loop it was before.
+//
+// WHAT A CALLER MUST PROVE. meshBrick's mask loop sets a non-zero key only when
+// an INTERIOR voxel is non-air AND its neighbour (which may be an apron voxel)
+// is air (voxelcore/mesher.h). So either of these is sufficient, and each is
+// exactly one of the mesher's own guarantees restated:
+//
+//   * no SOLID in the brick interior  -- meshBrick's early-out 1, verbatim;
+//   * no AIR in the brick + its apron -- no face can have an air neighbour.
+//
+// Skipping such a brick is byte-identical to meshing it, because meshing it
+// appends nothing to OutQuads. The value is that meshBrick's 1,000 sampler
+// calls happen BEFORE either early-out can fire -- filling `mat[10^3]` is the
+// cost, and a predicate answered from data the caller already holds skips it.
+struct FNeverSkipBrick
+{
+	bool operator()(int32 /*Dx*/, int32 /*Dy*/, int32 /*Dz*/) const { return false; }
+};
+
+template <typename MaterialFn, typename BrickSkipFn = FNeverSkipBrick>
 void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const MaterialFn& MaterialAt, TArray<FVoxelChunkQuad>& OutQuads,
-                      vxc::Counters* PerfCounters = nullptr, uint8 RingSkirtMask = 0)
+                      vxc::Counters* PerfCounters = nullptr, uint8 RingSkirtMask = 0,
+                      const BrickSkipFn& SkipBrick = BrickSkipFn())
 {
 	using namespace vxc;
 	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
@@ -194,6 +217,21 @@ void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const Material
 		{
 			for (int32 Dx = 0; Dx < BricksPerChunk; ++Dx)
 			{
+				// Provably emits nothing (see FNeverSkipBrick): skip the 1,000
+				// sampler calls meshBrick would make before its own early-out
+				// could fire. Counted as generated so the census keeps meaning
+				// what it meant -- the brick WAS accounted for, it just cost
+				// nothing.
+				if (SkipBrick(Dx, Dy, Dz))
+				{
+					if (PerfCounters)
+					{
+						PerfCounters->incBricksGenerated();
+						PerfCounters->incCellsWritten(uint64_t(B) * B * B);
+					}
+					continue;
+				}
+
 				const int64 OriginVX = (int64(ChunkKey.X) * BricksPerChunk + Dx) * int64(B);
 				const int64 OriginVY = (int64(ChunkKey.Y) * BricksPerChunk + Dy) * int64(B);
 				const int64 OriginVZ = (int64(ChunkKey.Z) * BricksPerChunk + Dz) * int64(B);
@@ -1359,6 +1397,11 @@ struct FJobResult
 	// way a sampling profiler would.
 	uint64 JobCycles = 0;
 	uint64 GridCycles = 0;
+	// Per-brick skip census (level 0, -VoxelL0BrickSkip): of this chunk's 64
+	// bricks, how many were proven to emit nothing before meshBrick was called,
+	// split by which of the two proofs fired. See FNeverSkipBrick.
+	uint16 BricksSkippedAir = 0;
+	uint16 BricksSkippedSolid = 0;
 	// 0 = produced quads, 1 = all air, 2 = all solid (no AIR in chunk+apron),
 	// 3 = zero quads but neither (mixed with no visible face). Only filled in
 	// when the measurement switch is on; otherwise stays 0.
@@ -1763,6 +1806,88 @@ bool L0GridScratchEnabled()
 		return Value != 0;
 	}();
 	return bEnabled;
+}
+
+// Per-BRICK emptiness skip inside a level-0 job (default ON).
+//
+// The existing buried-chunk skip works on a whole 32-voxel-tall chunk, so it can
+// only ever fire on chunks entirely above the terrain or entirely inside it --
+// and it already has. What it leaves behind is measured at 40% of level-0 worker
+// time spent on chunks that still mesh to ZERO quads, plus every surface chunk,
+// where typically one of the four brick layers in z straddles the surface and
+// the other three do not.
+//
+// The same two proofs the band uses are decisive brick by brick, from the SAME
+// per-column numbers the band is a reduction of -- no new generation, no new
+// amplifier work, ~164 integer compares per brick against the 1,000 sampler
+// calls meshBrick makes before its own early-out can fire. See FNeverSkipBrick
+// for the soundness argument and the level-0 job for the two tests.
+//
+// `-VoxelL0BrickSkip=0` restores the unconditional mesh as the A/B control, and
+// -VoxelL0GridVerify checks the two paths quad-for-quad. Command line, not a
+// cvar, for the reason documented on -VoxelCoarseMinLevel above.
+bool L0BrickSkipEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelL0BrickSkip="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+// Equivalence harness for the LEVEL-0 path, the exact counterpart of
+// -VoxelCoarseGridVerify below and held to the same bar: every level-0 chunk is
+// meshed TWICE -- once through whatever the level-0 fast path currently does,
+// and once through a freshly allocated per-job TArray filled by a plain
+// `Amp.column` loop, which is the pre-change reference implementation
+// character-for-character -- and the two quad arrays are compared field by field
+// IN ORDER. Both sides run the identical MeshChunkBricks traversal, so a change
+// that only moves storage around must reproduce the same quads in the same
+// sequence, not merely the same set.
+//
+// Measurement switch: it more than doubles level-0 job cost, so never on in a
+// throughput run.
+bool L0GridVerifyEnabled()
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelL0GridVerify"));
+	return bEnabled;
+}
+
+// Verify tallies (worker threads write, the 1 Hz perf log reads).
+std::atomic<int64> GL0GridVerifyChecked{0};
+std::atomic<int64> GL0GridVerifyMismatches{0};
+
+// Cross-job level-0 column-grid cache: MEASUREMENT ONLY, and deliberately so.
+//
+// A level-0 job's 34x34 grid depends only on the footprint (X,Y) -- the whole
+// vertical stack of chunks at one (X,Y) builds the identical 1156 columns. A
+// shared cross-job cache of those grids is the obvious next move once the grid
+// is 41% of level-0 job time, and the estimate going in was that it is worth
+// ~15%. That estimate rests entirely on how much REUSE there actually is in
+// dispatch order, and that is measurable without writing a single line of cache.
+//
+// `-VoxelL0GridCacheProbe=<entries>` simulates an LRU of that capacity over the
+// level-0 dispatch stream on the game thread: one packed-key probe per dispatch,
+// no grids stored, no locks, no worker-side change at all. It reports hits,
+// misses and the DISTINCT footprint count per window, so the ceiling (distinct /
+// dispatches) and the achievable rate at a given capacity can be read off
+// separately -- the difference between them is what capacity buys, and it is the
+// number that decides whether a real cache is worth its memory (a stored grid is
+// 208 KB, so 256 entries is 53 MB) and its lock.
+//
+// 0 = off. Command line for the usual reason: the reuse pattern during the
+// cascade fill is part of what is being measured.
+int32 L0GridCacheProbeEntries()
+{
+	static const int32 Entries = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelL0GridCacheProbe="), Value);
+		return FMath::Max(0, Value);
+	}();
+	return Entries;
 }
 
 // Equivalence harness for the switch above: every coarse chunk is meshed TWICE,
@@ -2934,6 +3059,23 @@ struct FVoxelWorldImpl
 	uint64 AccumLevel0GridCycles = 0;
 	uint64 AccumLevel0JobCycles = 0;
 	int64 AccumLevel0Jobs = 0;
+	// Per-brick skip census (see FJobResult::BricksSkippedAir). Denominator is
+	// AccumLevel0Jobs * 64.
+	int64 AccumLevel0BricksSkippedAir = 0;
+	int64 AccumLevel0BricksSkippedSolid = 0;
+
+	// -VoxelL0GridCacheProbe: simulated cross-job level-0 column-grid cache.
+	// Game thread only, one packed-key probe per level-0 dispatch, no grids
+	// stored -- see VoxelStreamAdmission::L0GridCacheProbeEntries for why the
+	// measurement is worth taking before the cache is worth building.
+	// L0ProbeRecency is least-recent-first; L0ProbeDistinct is unbounded and so
+	// gives the ceiling an infinite-capacity cache would reach.
+	TArray<uint64> L0ProbeRecency;
+	TSet<uint64> L0ProbeResident;
+	TSet<uint64> L0ProbeDistinct;
+	int64 L0ProbeHitsSinceLog = 0;
+	int64 L0ProbeMissesSinceLog = 0;
+	int64 L0ProbeColdMissesSinceLog = 0; // misses on a footprint never seen this window
 	// THE decisive number for this wave, and the one the job-count census
 	// cannot give: worker WALL TIME split by outcome. 77% of jobs meshing to
 	// zero quads only justifies a skip if those jobs are also a large share of
@@ -3764,6 +3906,36 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       { return FString::Printf(TEXT("R%d p50=%.2f p95=%.2f"), L, Snap.LevelWorkerMsP50[L], Snap.LevelWorkerMsP95[L]); }),
 	       (long long)Snap.MipCacheBrickCount, (long long)Snap.MipCacheBytes, (long long)Snap.MipCacheEvictions);
 
+	// -VoxelL0GridVerify running total: level-0 chunks meshed BOTH ways and
+	// compared quad-for-quad. Any level-0 storage change is only legitimate if
+	// MISMATCHES stays 0 -- see VoxelStreamAdmission::L0GridVerifyEnabled.
+	if (VoxelStreamAdmission::L0GridVerifyEnabled())
+	{
+		UE_LOG(LogVoxelPerf, Log, TEXT("VoxelL0GridVerify: level-0 chunks checked=%lld MISMATCHES=%lld"),
+		       (long long)VoxelStreamAdmission::GL0GridVerifyChecked.load(std::memory_order_relaxed),
+		       (long long)VoxelStreamAdmission::GL0GridVerifyMismatches.load(std::memory_order_relaxed));
+	}
+
+	// -VoxelL0GridCacheProbe: what a cross-job level-0 column-grid cache WOULD
+	// have hit, per 5s window. `distinct` is the ceiling (an infinite cache can
+	// never do better than one build per distinct footprint); `hit%` is what the
+	// probed capacity actually reaches. Multiply hit% by the grid's share of
+	// level-0 job time -- the `grid N% of job` figure on the R0 census line
+	// below -- to get the honest upper bound on what the cache is worth.
+	if (const int32 ProbeCap = VoxelStreamAdmission::L0GridCacheProbeEntries(); ProbeCap > 0)
+	{
+		const int64 Probes = L0ProbeHitsSinceLog + L0ProbeMissesSinceLog;
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel L0 grid-cache probe (5s window): cap=%d dispatches=%lld distinct=%d hits=%lld (%.1f%%) ")
+		       TEXT("misses=%lld coldMisses=%lld | ceiling=%.1f%%"),
+		       ProbeCap, (long long)Probes, L0ProbeDistinct.Num(), (long long)L0ProbeHitsSinceLog,
+		       Probes > 0 ? 100.0 * double(L0ProbeHitsSinceLog) / double(Probes) : 0.0,
+		       (long long)L0ProbeMissesSinceLog, (long long)L0ProbeColdMissesSinceLog,
+		       Probes > 0 ? 100.0 * double(Probes - L0ProbeDistinct.Num()) / double(Probes) : 0.0);
+		L0ProbeHitsSinceLog = L0ProbeMissesSinceLog = L0ProbeColdMissesSinceLog = 0;
+		L0ProbeDistinct.Reset();
+	}
+
 	// -VoxelCoarseGridVerify running total: coarse chunks meshed BOTH ways and
 	// compared quad-for-quad. The flat coarse grid is only a legitimate change
 	// if MISMATCHES stays 0 -- see VoxelStreamAdmission::CoarseGridVerifyEnabled.
@@ -3871,6 +4043,14 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 					(long long)AccumLevel0Jobs, JobUs, JobKcyc, JobUs > 0.0 ? JobKcyc / JobUs : 0.0, GridUsPerJob,
 					GridKcycPerJob, GridUsPerJob > 0.0 ? GridKcycPerJob / GridUsPerJob : 0.0,
 					double(AccumLevel0GridCycles) / N / 1156.0);
+				const double TotalBricks = N * double(VoxelCoords::ChunkEdgeBricks * VoxelCoords::ChunkEdgeBricks *
+				                                      VoxelCoords::ChunkEdgeBricks);
+				GridSuffix += FString::Printf(
+					TEXT(" | brickSkip air=%lld solid=%lld of %.0f (%.1f%%)"), (long long)AccumLevel0BricksSkippedAir,
+					(long long)AccumLevel0BricksSkippedSolid, TotalBricks,
+					TotalBricks > 0.0
+						? 100.0 * double(AccumLevel0BricksSkippedAir + AccumLevel0BricksSkippedSolid) / TotalBricks
+						: 0.0);
 			}
 		}
 		const double TotalMs = LevelZeroQuadMsSinceLog[Level] + LevelQuadMsSinceLog[Level];
@@ -3966,6 +4146,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	AccumLevel0GridMs = AccumLevel0JobMs = 0.0;
 	AccumLevel0GridCycles = AccumLevel0JobCycles = 0;
 	AccumLevel0Jobs = 0;
+	AccumLevel0BricksSkippedAir = AccumLevel0BricksSkippedSolid = 0;
 
 	AccumDispatchMs = AccumApplyMs = AccumRemeshMs = AccumUnloadMs = AccumRecomputeMs = AccumTickMs = 0.0;
 	AccumTicks = 0;
@@ -6052,6 +6233,38 @@ void FVoxelWorldImpl::DispatchJobs()
 			}
 		}
 
+		// -VoxelL0GridCacheProbe: this job is definitely going to build a 34x34
+		// column grid for footprint (X,Y). Probe the simulated LRU here, at the
+		// last point before launch, so the stream it sees is exactly the stream a
+		// real cross-job cache would see -- every skip above has already fired.
+		if (LevelKey.Level == 0)
+		{
+			if (const int32 ProbeCap = VoxelStreamAdmission::L0GridCacheProbeEntries(); ProbeCap > 0)
+			{
+				const uint64 Footprint = (uint64(uint32(LevelKey.Key.X)) << 32) | uint64(uint32(LevelKey.Key.Y));
+				const bool bNewThisWindow = (L0ProbeDistinct.Find(Footprint) == nullptr);
+				L0ProbeDistinct.Add(Footprint);
+				if (L0ProbeResident.Contains(Footprint))
+				{
+					++L0ProbeHitsSinceLog;
+					L0ProbeRecency.RemoveSingle(Footprint);
+					L0ProbeRecency.Add(Footprint);
+				}
+				else
+				{
+					++L0ProbeMissesSinceLog;
+					L0ProbeColdMissesSinceLog += bNewThisWindow ? 1 : 0;
+					if (L0ProbeRecency.Num() >= ProbeCap)
+					{
+						L0ProbeResident.Remove(L0ProbeRecency[0]);
+						L0ProbeRecency.RemoveAt(0);
+					}
+					L0ProbeResident.Add(Footprint);
+					L0ProbeRecency.Add(Footprint);
+				}
+			}
+		}
+
 		Rec->bJobInFlight = true;
 		JobsInFlightCounter.Increment();
 		++LevelJobsInFlight[PickLevel];
@@ -6230,15 +6443,47 @@ void FVoxelWorldImpl::DispatchJobs()
 					// the reduction (1156 columns x up to 18 segment tests), which
 					// would quietly flatter the "on" side by handicapping its
 					// control. Costs nothing in production, where it is always on.
+					// --- Per-column emptiness bounds -----------------------------
+					//
+					// The two numbers the band is a reduction of, kept PER COLUMN
+					// instead of collapsed immediately, because the same 1156
+					// values answer a second and much larger question: which of
+					// this chunk's 64 BRICKS can emit nothing.
+					//
+					// The band proves things about a whole 32-voxel-tall chunk and
+					// so is only ever decisive for chunks entirely above the
+					// terrain or entirely inside it -- and the pre-dispatch skip has
+					// already removed those. What is left is measured at 40% of
+					// level-0 worker time spent on chunks that mesh to ZERO quads,
+					// plus every surface chunk, in which typically only one of the
+					// four brick layers in z straddles the surface at all. Reduced
+					// over a single brick's 10x10 column block the same two bounds
+					// ARE decisive, brick by brick, and the reduction is ~164
+					// integer compares against the 1,000 sampler calls it saves.
+					//
+					// Nothing new is generated: these are the values the band
+					// reduction was already computing per column and discarding.
+					// -VoxelL0BrickSkip=0 restores the unconditional mesh.
+					static thread_local int64 ScratchTopSolid[GridCells];
+					static thread_local int64 ScratchDeepestAir[GridCells];
+					const bool bBrickSkip = VoxelStreamAdmission::L0BrickSkipEnabled();
+					if (bComputeBand || bBrickSkip)
+					{
+						for (int32 I = 0; I < GridCells; ++I)
+						{
+							const vxc::ColumnSample& Col = Columns[I];
+							ScratchTopSolid[I] = VoxelStreaming::ColumnSurfaceTopVoxel(Col);
+							ScratchDeepestAir[I] = VoxelStreaming::ColumnDeepestAirVoxel(Col);
+						}
+					}
 					if (bComputeBand)
 					{
 						int64 MaxTop = INT64_MIN;
 						int64 MinAir = INT64_MAX;
 						for (int32 I = 0; I < GridCells; ++I)
 						{
-							const vxc::ColumnSample& Col = Columns[I];
-							MaxTop = FMath::Max(MaxTop, VoxelStreaming::ColumnSurfaceTopVoxel(Col));
-							MinAir = FMath::Min(MinAir, VoxelStreaming::ColumnDeepestAirVoxel(Col));
+							MaxTop = FMath::Max(MaxTop, ScratchTopSolid[I]);
+							MinAir = FMath::Min(MinAir, ScratchDeepestAir[I]);
 						}
 						Result.Band.MaxSurfaceTopVoxel = int32(FMath::Clamp<int64>(MaxTop + 1, INT32_MIN, INT32_MAX));
 						Result.Band.SolidBelowVoxel = int32(FMath::Clamp<int64>(MinAir - 1, INT32_MIN, INT32_MAX));
@@ -6257,10 +6502,111 @@ void FVoxelWorldImpl::DispatchJobs()
 					// references, NOT a count of voxel-core-internal column work
 					// (that stays uninstrumented this pass, per P1 scope).
 					PerfCountersPtr->incColumnEvals(uint64_t(GridEdge) * GridEdge);
-					MeshChunkBricks(Key, GridSampler, Result.Quads, PerfCountersPtr, RingSkirtMask);
+
+					// The brick-level counterpart of BandProvesChunkEmpty, over
+					// this brick's own column block rather than the whole chunk's.
+					// Both halves carry the same one-voxel widening the band uses
+					// -- the per-column bounds are already outer bounds, so this is
+					// insurance against an off-by-one in a derivation, not part of
+					// it.
+					constexpr int32 BrickVox = VoxelCoords::BrickEdgeVoxels;
+					constexpr int32 BricksPerChunkEdge = VoxelCoords::ChunkEdgeBricks;
+					const int64 ChunkBaseVZ = int64(Key.Z) * ChunkVox;
+					int32 SkippedAir = 0;
+					int32 SkippedSolid = 0;
+					const auto SkipBrick = [&](int32 Dx, int32 Dy, int32 Dz) -> bool
+					{
+						if (!bBrickSkip)
+						{
+							return false;
+						}
+						const int64 InteriorZMin = ChunkBaseVZ + int64(Dz) * BrickVox;
+						// (a) No SOLID in the interior -- meshBrick's own early-out
+						// 1, which looks at the interior alone, so the ring skirt
+						// (an APRON rewrite) cannot affect it.
+						int64 MaxTopInterior = INT64_MIN;
+						for (int32 J = 0; J < BrickVox; ++J)
+						{
+							const int32 RowBase = GridEdge * (Dy * BrickVox + 1 + J) + Dx * BrickVox + 1;
+							for (int32 I = 0; I < BrickVox; ++I)
+							{
+								MaxTopInterior = FMath::Max(MaxTopInterior, ScratchTopSolid[RowBase + I]);
+							}
+						}
+						if (InteriorZMin > MaxTopInterior + 1)
+						{
+							++SkippedAir;
+							return true;
+						}
+						// (b) No AIR in brick + apron. This one DOES read the apron,
+						// so it is unusable on a brick whose apron the ring skirt
+						// rewrites to AIR -- that is a lateral chunk face, i.e. the
+						// outermost brick on a flagged axis.
+						if (((RingSkirtMask & RingSkirt_NegX) && Dx == 0) ||
+						    ((RingSkirtMask & RingSkirt_PosX) && Dx == BricksPerChunkEdge - 1) ||
+						    ((RingSkirtMask & RingSkirt_NegY) && Dy == 0) ||
+						    ((RingSkirtMask & RingSkirt_PosY) && Dy == BricksPerChunkEdge - 1))
+						{
+							return false;
+						}
+						int64 MinAirApron = INT64_MAX;
+						for (int32 J = 0; J < BrickVox + 2; ++J)
+						{
+							const int32 RowBase = GridEdge * (Dy * BrickVox + J) + Dx * BrickVox;
+							for (int32 I = 0; I < BrickVox + 2; ++I)
+							{
+								MinAirApron = FMath::Min(MinAirApron, ScratchDeepestAir[RowBase + I]);
+							}
+						}
+						// meshBrick samples z over [-1, B] relative to the brick
+						// origin, so the topmost cell it reads is InteriorZMin + B.
+						if (InteriorZMin + BrickVox < MinAirApron - 1)
+						{
+							++SkippedSolid;
+							return true;
+						}
+						return false;
+					};
+					MeshChunkBricks(Key, GridSampler, Result.Quads, PerfCountersPtr, RingSkirtMask, SkipBrick);
+					Result.BricksSkippedAir = uint16(SkippedAir);
+					Result.BricksSkippedSolid = uint16(SkippedSolid);
 					if (bMeasureEmpty && Result.Quads.Num() == 0)
 					{
 						Result.EmptyClass = ClassifyEmpty(GridSampler, Key);
+					}
+					// Equivalence harness (-VoxelL0GridVerify): mesh the SAME chunk
+					// through the pre-change reference -- a fresh per-job TArray
+					// filled by a plain Amp.column loop -- and compare quad for
+					// quad. A mismatch here is terrain that changed shape, not a
+					// tuning result, so the chunk key is logged.
+					if (VoxelStreamAdmission::L0GridVerifyEnabled())
+					{
+						TArray<vxc::ColumnSample> RefColumns;
+						RefColumns.SetNumUninitialized(GridCells);
+						for (int32 LY = 0; LY < GridEdge; ++LY)
+						{
+							for (int32 LX = 0; LX < GridEdge; ++LX)
+							{
+								RefColumns[LX + GridEdge * LY] = Amp.column(BaseVX + LX - 1, BaseVY + LY - 1);
+							}
+						}
+						const auto RefSampler = [&RefColumns, BaseVX, BaseVY](int64 X, int64 Y, int64 Z)
+						{
+							const int32 LX = int32(X - BaseVX) + 1;
+							const int32 LY = int32(Y - BaseVY) + 1;
+							return vxc::Amplifier::materialAt(RefColumns[LX + GridEdge * LY], Z);
+						};
+						TArray<FVoxelChunkQuad> RefQuads;
+						MeshChunkBricks(Key, RefSampler, RefQuads, /*PerfCounters*/ nullptr, RingSkirtMask);
+						int32 FirstDiff = -1;
+						VoxelStreamAdmission::GL0GridVerifyChecked.fetch_add(1, std::memory_order_relaxed);
+						if (!VoxelChunkQuadsIdentical(Result.Quads, RefQuads, FirstDiff))
+						{
+							VoxelStreamAdmission::GL0GridVerifyMismatches.fetch_add(1, std::memory_order_relaxed);
+							UE_LOG(LogVoxelPerf, Error,
+							       TEXT("VoxelL0GridVerify MISMATCH: L0 chunk (%d, %d, %d) fast=%d quads ref=%d quads firstDiff=%d"),
+							       Key.X, Key.Y, Key.Z, Result.Quads.Num(), RefQuads.Num(), FirstDiff);
+						}
 					}
 				}
 				else
@@ -6990,6 +7336,8 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 				AccumLevel0JobMs += Result.JobMs;
 				AccumLevel0GridCycles += Result.GridCycles;
 				AccumLevel0JobCycles += Result.JobCycles;
+				AccumLevel0BricksSkippedAir += Result.BricksSkippedAir;
+				AccumLevel0BricksSkippedSolid += Result.BricksSkippedSolid;
 				++AccumLevel0Jobs;
 			}
 			// Per-ring in-flight bookkeeping (see LevelJobsInFlight): every job
