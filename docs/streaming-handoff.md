@@ -202,6 +202,16 @@ voxel.GPU.SpawnPool 64 churnlive shot — edits AFTER the proxy is up. This is t
    desyncs the BeginPlay PSO precache and measures precache invalidation instead.
 10. **Prefer a control experiment to a bisect.** Four hypotheses died to
     measurement on the R0 freeze alone; each looked airtight on paper.
+11. **Check the ANCHOR before believing a streaming count.** Occasionally a run
+    spawns with the pawn displaced -- it drifts a couple of hundred metres and
+    climbs, and the counts roughly double (`loaded=20486 quads=18211385
+    unloaded=21842` against the stationary `9822 / 8813242 / 0`), with every
+    per-ring number up. It reads exactly like a residency regression from
+    whatever you just merged. `Voxel anchor:` first line versus last line
+    settles it in seconds, and re-running settles it completely: the immediate
+    repeat on the identical binary and command line came back stationary and
+    byte-identical to every earlier run. Compare anchors before comparing
+    counts.
 
 ## Streaming bugs: what was actually wrong
 
