@@ -29,6 +29,30 @@ enum class EVoxelPerfFlight : uint8
 {
 	Surface,
 	Underground,
+	// Neither a flight nor a fixture that merely "stands still" -- it PINS the
+	// pose, every frame, and logs it.
+	//
+	// Exists because the surface and underground flights cannot answer "is
+	// renderer A faster than renderer B". They deliberately move, so the
+	// streaming load differs run to run, and the resulting spread swamps the
+	// difference being looked for: twelve 60 s legs comparing the pooled and
+	// component renderers produced overlapping ranges and a retracted result
+	// (docs/streaming-handoff.md, "CORRECTION: the G5 frame-time numbers were
+	// noise").
+	//
+	// The obvious repair -- stand still and let the cascade settle, so
+	// streaming is quiescent -- was tried WITHOUT pinning the pose, and failed
+	// the same way: the component path rendered an identical settled scene at
+	// 43 fps in one run and 103 fps in another. The anchor is a POSITION; an
+	// unattended pawn's yaw and pitch are neither pinned nor recorded, and a
+	// camera facing sky versus facing down a valley is exactly that size of
+	// effect.
+	//
+	// So this mode fixes position AND rotation, holds them against anything
+	// else that might move the pawn, and logs the pose in the summary so the
+	// assumption is checkable rather than assumed. That makes the renderer the
+	// only variable between two runs, which is the whole point.
+	Static,
 };
 
 UCLASS()
@@ -79,6 +103,14 @@ private:
 	// -VoxelPerfFlight=surface|underground. Surface is the default so every
 	// existing invocation in docs/status.md keeps meaning what it meant.
 	EVoxelPerfFlight Flight = EVoxelPerfFlight::Surface;
+
+	// Static-mode pose. -VoxelPerfYaw= / -VoxelPerfPitch=. The defaults look
+	// slightly down and along +X, which at the reference spawn puts terrain
+	// across the whole frame rather than sky.
+	float StaticYawDeg = 0.f;
+	float StaticPitchDeg = -15.f;
+	bool bStaticPoseCaptured = false;
+	FVector StaticLocationUU = FVector::ZeroVector;
 
 	// -VoxelPerfDepth=<metres>, underground flight only. 60 m is chosen to
 	// match the documented test cavern's depth (60.7 m down), which is the one
