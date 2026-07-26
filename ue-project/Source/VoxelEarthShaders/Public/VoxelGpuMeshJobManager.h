@@ -126,13 +126,19 @@ struct FVoxelGpuMeshJobResult
 	// true. That is the number that describes the GPU, and it is quantised by
 	// the poll interval (one game-thread tick).
 	//
-	// D3 CHANGED WHAT THIS MEASURES — do not compare it across that change
-	// without saying so. It is now the moment the 4-BYTE TOTAL landed, i.e.
-	// when the GPU finished the mesh chain. It used to be the moment the whole
-	// ~810 KB readback landed, so it included a transfer that no longer
-	// happens on this path. The new number should be LOWER for reasons that
-	// have nothing to do with the GPU being faster. SubmitToDeliverMs is the
-	// one that covers both phases and is the honest end-to-end figure.
+	// *** DO NOT COMPARE ACROSS D3; QUOTE SubmitToDeliverMs. ***
+	//
+	// D3 changed what this measures. It is now the moment the 4-BYTE TOTAL
+	// landed — when the GPU finished the mesh chain. It used to be the moment
+	// the whole ~810 KB readback landed, so it included a transfer that no
+	// longer happens on this path.
+	//
+	// So this number WILL be lower after D3, and lower for a reason that has
+	// nothing to do with the GPU being faster. A before/after quoted from this
+	// field is a flattering artefact of a metric that changed definition, which
+	// is exactly how this programme has previously published figures it then
+	// had to retract. SubmitToDeliverMs covers both phases and is the honest
+	// end-to-end figure; quote that one.
 	double DispatchToReadyMs = 0.0;
 	// Submit() to the OnJobComplete call. Includes queueing behind the in-flight
 	// cap, the render thread being a frame behind, and the poll quantisation.

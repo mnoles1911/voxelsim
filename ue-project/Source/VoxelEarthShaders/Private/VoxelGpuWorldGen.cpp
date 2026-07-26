@@ -733,6 +733,11 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 		// back. Checking it here means the kernel is gated by every
 		// voxel.GPU.VerifyRegion run rather than first being exercised, and
 		// first being wrong, inside DispatchJobs.
+		//
+		// THE RESULT IS LOGGED EITHER WAY, deliberately. A guard that has never
+		// been observed firing is a guard nobody has tested, and a guard that
+		// prints nothing on success is indistinguishable from one that was
+		// never reached.
 		if (GpuTotalOut != Result.NumQuads)
 		{
 			Result.Error = FString::Printf(
@@ -740,8 +745,13 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 				TEXT("(Offsets[%u] + Counts[%u]). The 4-byte total is what D3's streaming ")
 				TEXT("path allocates from, so this must be exact."),
 				GpuTotalOut, Result.NumQuads, MaskCount - 1, MaskCount - 1);
+			UE_LOG(LogVoxelGpu, Error, TEXT("[D3 quad-total cross-check] FAIL — %s"), *Result.Error);
 			return Result;
 		}
+		UE_LOG(LogVoxelGpu, Log,
+		       TEXT("[D3 quad-total cross-check] PASS — QuadTotalMain %u == CPU-derived %u ")
+		       TEXT("(Offsets[%u] + Counts[%u], %u masks)"),
+		       GpuTotalOut, Result.NumQuads, MaskCount - 1, MaskCount - 1, MaskCount);
 
 		if (Result.NumQuads > MaxQuads)
 		{

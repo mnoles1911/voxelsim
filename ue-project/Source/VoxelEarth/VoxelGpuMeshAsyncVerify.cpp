@@ -400,19 +400,38 @@ namespace VoxelGpuMeshAsyncVerify
 			UE_LOG(LogVoxelGpuAsync, Log,
 			       TEXT("  quads: gpu %d, cpu %d"), TotalGpuQuads, TotalCpuQuads);
 
+			// The caveats are printed NEXT TO the numbers, not left in a doc.
+			// Both of these describe ways a reader could quote a figure from
+			// this block and be wrong about what it means, and this programme
+			// has already had to retract one set of numbers that way.
 			UE_LOG(LogVoxelGpuAsync, Log,
 			       TEXT("  dispatch->ready latency ms: min %.2f  p50 %.2f  p95 %.2f  max %.2f"),
 			       Percentile(ReadyLatenciesMs, 0.0), Percentile(ReadyLatenciesMs, 0.5),
 			       Percentile(ReadyLatenciesMs, 0.95), Percentile(ReadyLatenciesMs, 1.0));
+			UE_LOG(LogVoxelGpuAsync, Warning,
+			       TEXT("    ^ DO NOT COMPARE ACROSS D3; QUOTE submit->deliver. Since D3 this "
+			            "is when the 4-BYTE TOTAL landed (GPU work done). It used to be when "
+			            "the whole ~810 KB readback landed, so it WILL be lower for a reason "
+			            "that has nothing to do with the GPU being faster."));
+
 			UE_LOG(LogVoxelGpuAsync, Log,
 			       TEXT("  submit->deliver latency ms: min %.2f  p50 %.2f  p95 %.2f  max %.2f"),
 			       Percentile(DeliverLatenciesMs, 0.0), Percentile(DeliverLatenciesMs, 0.5),
 			       Percentile(DeliverLatenciesMs, 0.95), Percentile(DeliverLatenciesMs, 1.0));
 			UE_LOG(LogVoxelGpuAsync, Log,
+			       TEXT("    ^ the honest end-to-end number: covers both D3 phases."));
+
+			UE_LOG(LogVoxelGpuAsync, Log,
 			       TEXT("  throughput: %.1f chunks/s at an in-flight cap of %d "
 			            "(cpu reference meshed %.1f chunks/s single-threaded)"),
 			       Throughput, MaxInFlight,
 			       double(NumChunks) / FMath::Max(1e-6, CpuTotalMs / 1000.0));
+			UE_LOG(LogVoxelGpuAsync, Warning,
+			       TEXT("    ^ D3 IS A TRADE, quote it with this number: bandwidth down "
+			            "~70-100x (786 KB -> ~7-12 KB per chunk), latency-to-delivery roughly "
+			            "DOUBLED (two round trips instead of one). Also: the cpu reference is "
+			            "SINGLE-THREADED and the shipping path uses ~24 workers, so it is a "
+			            "per-chunk cost comparison, NOT a throughput ratio."));
 
 			const bool bPass = NumFailed == 0 && NumMismatched == 0 && NumDoubleDelivered == 0
 			                && NumDelivered == NumChunks && NumMatched == NumChunks;
