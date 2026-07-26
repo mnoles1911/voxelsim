@@ -487,6 +487,136 @@ these is Wave G scaffolding:
 They cost nothing when `voxel.Stream.GPUCullStatsPeriod` is 0, which is the
 default.
 
+## 4f. Costing the shadow-casting cap — NOT BUILT, owner's decision
+
+Costed on request, 2026-07-26. **No code written, no legs spent.** One leg would
+replace this section's single estimate with a measurement; see the end.
+
+### 1. What it would take — and the framing question turns out to be moot
+
+The question asked was whether **per-chunk shadow relevance is expressible when
+one primitive covers the whole pool**. Engine-side the answer is no: shadow
+relevance is per-primitive (`Result.bShadowRelevance = IsShadowCast(View)`,
+`Mesh.CastShadow = IsShadowCast(Views[ViewIndex])`), one primitive means one
+answer, and nothing in `FPrimitiveViewRelevance` is per-chunk.
+
+**But we never need relevance to express it, because the pool already runs its own
+per-chunk cull inside the shadow gather.** Three facts, all already true in the
+shipped code:
+
+- `BuildCulledRanges` runs **once per gather**, and already distinguishes shadow
+  gathers — `bShadowGather`, from `View.GetDynamicMeshElementsShadowCullFrustum()`.
+- It already **iterates per-chunk runs** in that gather.
+- It already reads each chunk's **level**, because `AddChunk` stores
+  `Scale = float(1 << Level)` in the chunk table's `.w` and the cull loads it as
+  `const float Scale = Entry.W` — three lines above the frustum test.
+
+So the cap is one extra rejection in a loop that already exists:
+
+```cpp
+if (bShadowGather && Scale > MaxShadowScale) { ++SkippedShadowLevel; continue; }
+```
+
+**No new buffers, no new plumbing, no relevance change, no shader change, and no
+per-chunk data that is not already resident.** The level is already there because
+the vertex factory needs it for mip scale.
+
+That makes this by a wide margin the cheapest lever on the board — cheaper than
+the range budget, and not comparable to compaction.
+
+### The hazard that would otherwise ship silently
+
+**`VisibleQuads == 0` currently falls back to drawing the ENTIRE pool.** That is
+deliberate and correct today — a cull that hides the world is this pool's worst
+failure mode, so the conservative branch draws. But with a shadow cap it inverts:
+a distant cascade whose entire visible set is above the level cap would empty its
+range list, hit that fallback, and draw **13.09M quads instead of 0** — turning
+the optimisation into the largest regression available.
+
+The fix is not difficult but it is not optional: the empty case needs three states,
+not two — *nothing visible* (draw everything, as now), *everything capped* (draw
+nothing, correctly), and *cull produced ranges* (draw them). Anyone building this
+must handle it explicitly, and it is exactly the shape of bug this codebase has
+shipped before.
+
+**Two unknowns I did not resolve and would not assume:**
+- **Shadow-map caching.** If cached whole-scene shadows or VSM pages hold
+  geometry that later stops casting, the cache needs invalidating. Dynamic
+  relevance suggests this is fine; I have not verified it.
+- The cap must apply **only** to shadow gathers. The camera must still draw
+  everything it can see, at every level.
+
+### 2. What it would save
+
+Ring occupancy at the settled scene (`loaded=13190`, pool 13,088,897 quads), and
+the distance band each level covers under `kDefaultRingPresets`:
+
+| level | band | chunks | share | cumulative share at level ≥ N |
+|---|---|---|---|---|
+| 0 | 0–64 m | 3,042 | 23.1% | 100% |
+| 1 | 64–128 m | 2,029 | 15.4% | 76.9% |
+| 2 | 128–256 m | 2,225 | 16.9% | 61.6% |
+| 3 | 256–512 m | 2,262 | 17.1% | **44.7%** |
+| 4 | 512–1024 m | 2,014 | 15.3% | **27.5%** |
+| 5 | 1024–2048 m | 1,618 | 12.3% | **12.3%** |
+
+Against the measured shadow floor of **11.85M quads visible to some cascade** —
+the floor that survives even perfect compaction — a cap would remove roughly:
+
+| cap | terrain stops casting beyond | est. share of pool | est. quads removed from the floor |
+|---|---|---|---|
+| level ≥ 5 | 1,024 m | 12.3% | ~1.5M |
+| level ≥ 4 | 512 m | 27.5% | ~3.3M |
+| level ≥ 3 | 256 m | 44.7% | ~5.3M |
+
+**This rests on one assumption I could not verify and am flagging rather than
+burying: that quads-per-chunk is roughly uniform across levels.** It is plausible
+— the clipmap keeps every chunk at 32³ voxels regardless of level, which is the
+whole point of the structure — and it may lean conservative, since coarser terrain
+is smoother and likely meshes to *fewer* quads per chunk. But it is an assumption,
+and the numbers above are estimates, not measurements. **Nothing in the census
+breaks quads down by level**, which is the one thing it cannot currently answer.
+
+For scale: even the mildest cap (~1.5M) is comparable to the **entire** camera-view
+over-draw that Wave G was originally built to remove (1.09M straight down), and
+the level ≥ 3 cap is roughly **five times** it.
+
+### 3. What it would cost visually — and this needs a human, not a diff
+
+This is a **quality reduction**, stated plainly:
+
+- **Terrain beyond the cap stops casting shadows onto anything.** At a low sun
+  angle, long shadows thrown by distant ridges across intervening valleys simply
+  disappear.
+- **Distant terrain stops self-shadowing**, which is the more noticeable loss.
+  Relief at distance reads substantially through its own shadowing; without it,
+  far mountains flatten and read brighter than they should.
+- **The cap boundary is a hard edge in world space.** Shadows stopping at exactly
+  256 m or 512 m is the kind of artefact that reads as a bug rather than a
+  setting, unless the boundary is chosen to coincide with a cascade transition
+  where the shadow resolution already changes.
+
+Mitigations exist — align the cap with a cascade edge, or cap the *outermost*
+level only (level ≥ 5, beyond 1 km, where a chunk's shadow subtends very little
+screen area) — but **which cap is acceptable is a judgement about how the game
+looks, and no harness in this project can score it.** It belongs on
+`docs/manual-verification-checklist.md` and in front of the owner's eyes, in a
+scene with a low sun.
+
+The honest framing for that decision: **level ≥ 5 is close to free visually and
+removes ~1.5M quads; level ≥ 3 removes ~5.3M and will be seen.** The curve between
+them is the whole trade.
+
+### One leg would replace the estimate with a measurement
+
+The only soft number above is quads-per-level. Adding a per-level breakdown to the
+census — the chunk table already carries the level, and the census already runs
+per gather — turns every estimate in this section into a measured count, split by
+cascade, still immune to the frame-time clamp and to contention. **It is one short
+leg and no draw-path change.** Not run, because this section was commissioned as a
+costing rather than a measurement, and the shape of the answer is already clear
+enough to decide on.
+
 ## 5. Why compaction, and not "indirect draw plus a base"
 
 Recorded in `gpu-waves-plan.md` Wave A and re-confirmed here: an indirect draw
