@@ -77,6 +77,27 @@ boilerplate.
    and moves under every PR. Anchor on symbol names — `DispatchJobs`,
    `DrainResults`, `MeshChunkBricks`, `EnsureVolumeOrigin` — and treat the numbers
    as hints. Several quoted here were already stale when this plan was written.
+10. **Never edit a `.ush` while any editor run is in flight.** Shader source is
+    loaded from disk at runtime, not compiled into the DLL, so an edit under a
+    live editor kills the whole shader compile batch and presents as a GPU fault
+    at `ShaderCompiler.cpp:2298` — not as an edit collision. It cost Wave B a
+    whole batch of legs.
+
+    **Scope, precisely, because the cheap version of this rule blocks work that
+    is actually safe.** `VoxelEarthShadersModule.cpp:40-42` maps `/VoxelCore` to
+    `FPaths::ProjectDir()/../voxel-core/shaders`, so an editor launched with
+    `-project=<worktree>/ue-project/...` reads **that worktree's** copy and no
+    other. Editing `worldgen.ush` inside your own worktree therefore cannot
+    disturb another agent. (The DDC is not a collision vector either: differing
+    preprocessed source yields different shader map keys, so the two coexist.)
+
+    **THE EXCEPTION THAT MATTERS: not every wave works in a worktree.** Wave A
+    works in the main checkout `D:\voxelsim`. So `D:\voxelsim`'s copy of any
+    `.ush` is genuinely dangerous whenever an editor is running out of the main
+    checkout, and it is the copy to leave alone. The rule is therefore *"never
+    edit a `.ush` in a checkout an in-flight editor was launched from"*, and the
+    safe habit is to do all `.ush` work in your own worktree. **Wave D5 changes
+    `worldgen.ush` unconditionally and will hit this.**
 
 ## How to use this document
 
@@ -583,6 +604,39 @@ measures ~8,100 R0 chunks at **~0.09 s** on the GPU against **~11.5 s** on the C
 
 Gated on Wave C being green.
 
+**The claim this wave is allowed to make, narrowed 2026-07-26.** Wave A's result
+is in and it changes what Wave D may be sold on: with the cull working and near
+optimal (drawing 3.0% of the pool against 1.9% visible), the pooled path
+straight down still costs **2.44 ms against the component path's 2.15**, with a
+3.3× worse p95. There is a fixed per-frame pooled cost that culling does not
+touch and compaction will not fix. So **Wave D must not claim an end-to-end
+frame win.** The defensible claim — and the only one `gpu-g0-sizing.md` actually
+supports, and the one Wave F depends on — is **producer-side: per-ring chunk
+throughput under motion, and cold-fill time.** Measure those; do not quote frame
+time as a Wave D result.
+
+### D0 — what already exists, which the rest of this section under-counted
+
+Written after reading the code rather than the summaries, same as the rest of
+this plan was supposed to be:
+
+- **The async runner is real and complete.** See D4 below.
+- **Verification step 1 is already built**, and this plan did not know it.
+  `ue-project/Source/VoxelEarth/VoxelGpuMeshAsyncVerify.cpp` (~640 lines) gives
+  `voxel.GPU.VerifyAsyncMesh`: it meshes K chunks through
+  `FVoxelGpuMeshJobManager` and **byte-compares the packed quads against
+  `MeshChunkBricks` + `PackVoxelChunkQuad`** — the shipping CPU mesher, not a
+  transcription — checks the exactly-one-outcome contract by catching double
+  delivery, and reports dispatch→ready p50/p95 and chunks/s. It also ships
+  `voxel.GPU.VerifyAsyncMesh.Control`, which runs the *identical* requests
+  through `RunRegionBlocking` and so splits "the region setup is wrong" from
+  "the async runner is wrong" in one run.
+
+  **Correction:** the "Verification, in this order" list below says to extend
+  `voxel.GPU.SpawnPool`'s CPU round trip. ~~Do that.~~ Do not — this harness is
+  purpose-built, strictly stronger (it compares chunk-local quads against the
+  real mesher), and already has the control experiment. Build on it.
+
 ### D1 — make the pool GPU-writable (`VoxelGpuPoolComponent.cpp:117-147`)
 
 - Add `EBufferUsageFlags::UnorderedAccess` to the quad and chunk-id buffers; create
@@ -600,7 +654,48 @@ Gated on Wave C being green.
   event**. Mark GPU-owned ranges and skip them on rebuild, or drive rebuilds from a
   re-dispatch.
 
-### D2 — gated `MeshEmit` variant emitting pool-ready quads
+### D2 — gated `MeshEmit` variant emitting pool-ready quads — **LANDED 2026-07-26 (PR #126)**
+
+**What shipped.** `VXC_MESH_CHUNK_LOCAL`, a permutation on `FVoxelMeshEmitCS`
+and the only permutation domain in `VoxelGpuWorldGen.cpp`. Under it the kernel
+bakes each interior brick's chunk-local origin into `slice/u0/v0` as it packs,
+and offsets its writes by a new `QuadWriteBase` uniform. The CPU-side
+`RebaseQuadsToChunkLocal` no longer runs on the default path.
+
+The `% kBricksPerChunkEdge` in `maskChunkLocalOrigin` is what makes the
+**batched** multi-chunk region D4 wants work later: interior brick 4 on an axis
+is brick 0 of the *next* chunk, so its chunk-local origin is 0 again — not 32,
+which would not even fit the 8-bit field.
+
+**Verification — every claim, and how it was checked. No editor run was made;
+the box was queued to other waves.**
+
+| claim | evidence |
+|---|---|
+| the bench leg still runs the program its digest was recorded from | all seven kernels respun with `compile-shaders.ps1`'s exact flags; **SHA-256 byte-identical** to `voxel-core/shaders/prebuilt/*.spv` |
+| the permutation is not a no-op | `MeshEmitMain` DXIL at `cs_6_6` with the define 0 vs 1 — hashes **differ** |
+| both permutations compile, including the shared `greedyMask` | `MeshEmitMain` ×2 and `MeshCountMain` at `=1`, all exit 0 |
+| it cannot leak into the SPIR-V leg | `=1` without `VXC_UE` fails with the intended `#error` |
+| shader lint | `lint-shader-ub.py` clean, incl. the new `UNSIGNED_UNDERFLOW` annotation |
+| it links | `VoxelEarthEditor Win64 Development` Succeeded, `voxelcore.lib` rebuilt first so the staleness warning could not fire |
+
+**Still owed:** `voxel.GPU.VerifyAsyncMesh 64 8` at `MeshChunkLocal` 1 and 0,
+×2 legs each. Pure correctness, ~2 min of box time, no camera or settle needed.
+
+**Two design points worth keeping:**
+- The CPU rebase is **kept as the control**, not deleted. `voxel.GPU.MeshChunkLocal`
+  0 restores it, and the harness logs which permutation a run used — a PASS that
+  does not say which path passed is not evidence about either.
+- The choice is **latched per job at `Submit`**, not read at delivery. A cvar
+  flip between dispatch and readback would otherwise rebase quads the GPU had
+  already rebased: silent, and looks exactly like a mesher bug.
+- `ValidateRegionRequest` **rejects** a non-zero `QuadWriteBase` without the
+  permutation. The off permutation does not read that uniform, so it would be
+  silently ignored and every quad would land at offset 0 — the same shape as the
+  unbound-`FShaderParameter` and dead-`GPUCullMergeGap` failures already on this
+  project's record.
+
+### D2 — the original brief, for the record
 
 `voxel-core/shaders/worldgen.ush` emit block, `VoxelGpuWorldGen.cpp:455-468`.
 Today's quads are brick-local (`slice/u0/v0` are 0..7 inside one 8³ brick). Bake in
@@ -613,13 +708,29 @@ so this is an added uniform, not a restructure.
 fields, so changing emitted bytes changes the digest even though quads are
 display-only.
 
-### D3 — allocation without a big readback
+### D3 — allocation without a big readback — **RESEQUENCED: do this BEFORE D4's wiring**
 
-Upper-bound reservation does not work (static bound ≈98k quads/chunk against a
-typical ~900, and the draw's vertex count comes from `Pool.GetHighWaterMark()`, so
-over-allocation directly inflates the thing Wave A just proved the renderer is
-bound by). **Read back only the 4-byte scan total per chunk**, which the scan
-already computes. Latency, not bandwidth:
+**Sequencing correction, 2026-07-26. This plan had the dependency backwards.**
+D3 was written as a refinement to apply after D4 had wired GPU meshing into
+`DispatchJobs`. It is not a refinement; it is the thing that makes D4 worth
+doing, and the arithmetic is not close:
+
+> `MaskCount` is 3,072 for a one-chunk region, so `MaxQuads` = 3,072 × 32 =
+> **98,304**, and the quad readback is **786 KB per chunk** — against a typical
+> ~900–1,500 live quads, i.e. **~7–12 KB**. That is a **65–100× over-read on
+> every single chunk**. At `MaxInFlight` 8 it is 6.3 MB of readback per batch,
+> and filling R0 once at 128 m (~8,100 chunks) is **~6.4 GB of PCIe traffic**
+> against a kernel time `gpu-g0-sizing.md` puts at **~0.09 s**.
+
+So on the readback path it is the *readback*, not the kernel, that sets
+throughput, and a D4 measured with it in place would be measuring the wrong
+thing. **Land D3 first**, then wire `Submit` into `DispatchJobs`.
+
+Upper-bound reservation does not work either (that same static ≈98k
+quads/chunk bound, and the draw's vertex count comes from
+`Pool.GetHighWaterMark()`, so over-allocation directly inflates the thing Wave A
+just proved the renderer is bound by). **Read back only the 4-byte scan total
+per chunk.** Latency, not bandwidth:
 
 1. frame N: dispatch into a **persistent** scratch buffer (external, not an RDG
    transient — today's `Voxel.Quads` dies at `GraphBuilder.Execute()`), enqueue the
@@ -627,6 +738,19 @@ already computes. Latency, not bandwidth:
 2. frame N+k: count lands → `Pool.Alloc(exact)` → GPU→GPU compaction copy into the
    allocated range;
 3. CPU writes the chunk-table entry as it does today.
+
+**The 4-byte total is not free — it is a new kernel.** Nothing on the GPU holds
+it today: `RunRegionBlocking` and the manager both derive it CPU-side as
+`Offsets[MaskCount-1] + Counts[MaskCount-1]`, which is *why* the whole 12 KB
+`Counts` and `Offsets` arrays come back. Producing a 1-element total needs a
+pass that writes it. Put that pass in a **new `.usf` under
+`ue-project/Shaders/`, not in `worldgen.ush`** (`VoxelQuadDecodeTest.usf` is the
+precedent): it keeps the total out of the determinism digest's blast radius,
+needs no SPIR-V respin, and stays clear of ground rule 10's `.ush` hazard.
+
+The same file is the natural home for the **GPU→GPU compaction copy** step 2
+needs, so writing it now is not throwaway work — it is what D1 will plug the
+pool range into.
 
 ### D4 — wire the async runner into dispatch
 
@@ -639,13 +763,57 @@ per-request state machine with `Submit`/`Tick`/`CancelAll`, it calls
 is wired into DispatchJobs or the streaming path, and the brick-local → chunk-local
 rebase still happens on the CPU after readback."*
 
-So D4 is: delete the three `AddEnqueueCopyPass` calls at
+~~So D4 is: delete the three `AddEnqueueCopyPass` calls at
 `VoxelGpuMeshJobManager.cpp:370-375` and the poll/`Lock`/rebase tail, point the
 emit at the pool UAV from D1/D2, and wire `Submit` into `DispatchJobs`
-(`VoxelWorldSubsystem.cpp:5807`) behind a cvar, **level 0, non-edited chunks only**.
+(`VoxelWorldSubsystem.cpp:5807`) behind a cvar, **level 0, non-edited chunks only**.~~
+
 Do **not** build on `RunRegionBlocking` — it captures its outputs **by reference**
 into the render command (`VoxelGpuWorldGen.cpp:493-502`), which is safe only
-because of the flush at `:544`/`:587`.
+because of the flush at `:544`/`:587`. *(That part was right and stands.)*
+
+**CORRECTED 2026-07-26, from reading the file. The runner is as small as claimed;
+the work item is not.** Struck rather than deleted, because the estimate is the
+obvious one and the next person will make it too. Three ways it is wrong:
+
+**(a) "Delete the three `AddEnqueueCopyPass` calls" contradicts D3 above.** D3
+requires a 4-byte scan-total readback, and that total does not exist as a buffer
+— it is derived CPU-side from the full `Counts`/`Offsets` arrays. So D4 deletes
+**one** copy (the 786 KB `Quads` one), replaces the other two with a smaller one,
+and **adds a kernel** to produce it. A net addition, not a deletion.
+
+**(b) "Delete the poll/`Lock` tail" would delete the only completion event —
+i.e. it breaks this section's own hard invariant, two paragraphs below where it
+is stated.** The render-thread poll is the *only* thing that knows the GPU
+finished. Delete it and there is nothing to hang `LevelJobsInFlight[]--`,
+`FootprintBandCache.Add`, `FootprintBlindJobInFlight.Remove` and
+`Rec->bJobInFlight` on — which is exactly the dropped-result / stranded-(X,Y)-column
+bug this plan warns about and that has already been diagnosed and fixed once
+here. With no readback at all, "exactly one result" would have to degrade to
+fire-and-forget at dispatch. **The poll stays**; what shrinks is what gets
+`Lock()`ed, from ~810 KB to 4 bytes. Only the **rebase** tail is genuinely
+deletable — and that is D2, landed 2026-07-26.
+
+**(c) The `DispatchJobs` wiring is the bulk of D4 and this estimate did not cost
+it at all.** Everything `voxel.GPU.VerifyAsyncMesh` gets to skip by being
+synthetic is real work there: the raster window from real tiles instead of
+`vxc::SyntheticTileSampler`; the two counters decrementing on different threads
+in different places; `GenerationId` snapshot/compare, whose stale rate gets
+*worse* with multi-frame latency; and the `NeedsOverlayAwarePath` carve-out.
+
+And one this plan states under "What stays on the CPU" but never carries into
+the value case:
+
+> **GPU meshing does not remove the CPU job. It removes the meshing inside it.**
+
+`FootprintBandCache` is reduced via `ColumnDeepestAirVoxel`, which needs
+`Col.cave.segs[]`, `shaftMarginSq`, `cavern` and `bedrockDepthMm` — fields
+`FVoxelGpuColumnSample` does not carry. The band feeds two admission/dispatch
+skips *and* the cold-band throttle, which deadlocks a whole (X,Y) column if
+bands stop arriving. So a GPU-meshed chunk **still needs a CPU column pass**,
+and the wave's ceiling is the ~55% of level-0 job time that is meshing — until
+the GPU column struct grows. That materially tempers the value case for the
+whole wave and should be read next to the ~0.09 s figure, not instead of it.
 
 **The invariant that must not break**, quoted from `VoxelWorldSubsystem.cpp:7183-7188`:
 
@@ -665,6 +833,16 @@ Decide explicitly whether "in flight" means dispatched or completed; with GPU
 latency those differ by frames. Watch `StaleResultsDiscarded` (`:7191-7202`):
 multi-frame latency makes stale results *more* common, and `GenerationId` is
 snapshotted at `:6115` and compared at `:7191`.
+
+**Decided 2026-07-26: "in flight" means COMPLETED** — `LevelJobsInFlight[]` keeps
+decrementing in `DrainResults` on delivery of the GPU result, exactly as the CPU
+path does today. Reason: the throttle exists to bound *outstanding* work, and
+"dispatched" would let a ring re-admit the same columns repeatedly before the
+first result lands. The cost is that the in-flight cap now has to absorb GPU
+latency as well as work, so the slot floor wants sizing against latency × rate
+rather than against worker count — **and one knob at a time.** The recorded
+catastrophe is what happens otherwise: floors `{0,2,3,4,4}` reserved 13 of 24
+slots and collapsed throughput from 49,179 chunks to 558.
 
 **Batch across chunks.** A region dispatch is a brick-aligned slab with a 1-brick
 halo, so meshing one 32³ chunk alone dispatches 48³ voxels — 3.4× waste. Batch a
@@ -716,8 +894,12 @@ last level that passes and ship that as `GPUMaxLevel`; do not relax the gate.
 ### Verification, in this order
 
 1. **Bit-exactness before any rendering claim.** Mesh the same chunk both ways,
-   compare packed quads byte for byte. Extend `voxel.GPU.SpawnPool`'s existing CPU
-   round trip into an A/B assert rather than inventing a harness.
+   compare packed quads byte for byte. ~~Extend `voxel.GPU.SpawnPool`'s existing CPU
+   round trip into an A/B assert rather than inventing a harness.~~
+   **Corrected — use `voxel.GPU.VerifyAsyncMesh`, which already does exactly
+   this and more; see D0.** D2 additionally uses it as its own A/B: run it at
+   `voxel.GPU.MeshChunkLocal 1` and `0` and both producers are compared against
+   the shipping CPU mesher, in one session on one binary.
 2. **Screenshot diff** of GPU-meshed vs CPU-meshed level 0 against a measured
    same-path noise floor.
 3. **Motion measurement** — per-ring dispatch rate × per-ring p50, before and after.
