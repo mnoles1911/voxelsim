@@ -56,6 +56,47 @@ void UVoxelPerfRunSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 				// only as good as the amount of world in frame.
 				FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfYaw="), StaticYawDeg);
 				FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfPitch="), StaticPitchDeg);
+
+				// -VoxelPerfStaticAt=X,Y,Z in UU (world), optional.
+				//
+				// Without it, static mode pins wherever the pawn spawned, and the
+				// spawn is always a SURFACE column: RestartPlayer grounds the pawn
+				// on the highest solid voxel with air above it
+				// (VoxelEarthGameMode.cpp), and -VoxelCameraHigh only moves it
+				// further UP (it rejects values <= 0). So there was no way to pin
+				// this fixture inside a cave or on a cavern lake shore, which is
+				// exactly the scene the water A/B needs -- the only voxel water in
+				// the default world is underground, and the fixtures that DO go
+				// there (-VoxelFloodTest, -VoxelCavernShot) move the camera on
+				// their own timers, which static mode then overwrites every tick.
+				//
+				// UU rather than metres deliberately: the pose this is meant to
+				// reproduce is the one the flood-test fixture prints, and that line
+				// is in UU. Copying it verbatim is the point.
+				FString StaticAt;
+				if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfStaticAt="), StaticAt))
+				{
+					TArray<FString> Parts;
+					StaticAt.ParseIntoArray(Parts, TEXT(","), /*InCullEmpty*/ true);
+					if (Parts.Num() == 3)
+					{
+						StaticLocationOverrideUU = FVector(FCString::Atod(*Parts[0]),
+						                                   FCString::Atod(*Parts[1]),
+						                                   FCString::Atod(*Parts[2]));
+						bStaticLocationOverride = true;
+					}
+					else
+					{
+						// Same reasoning as the unknown-flight-name branch below:
+						// silently falling back to the spawn pose would produce a
+						// plausible JSON summary for a scene nobody asked for.
+						UE_LOG(LogVoxelPerf, Error,
+						       TEXT("VoxelPerfRun: -VoxelPerfStaticAt=%s is not X,Y,Z in UU. Aborting run."),
+						       *StaticAt);
+						bRequested = false;
+						return;
+					}
+				}
 			}
 			else if (!FlightName.Equals(TEXT("surface"), ESearchCase::IgnoreCase))
 			{
@@ -203,11 +244,12 @@ void UVoxelPerfRunSubsystem::StepFlightPath(float DeltaTime)
 		if (!bStaticPoseCaptured)
 		{
 			bStaticPoseCaptured = true;
-			StaticLocationUU = Pawn->GetActorLocation();
+			StaticLocationUU = bStaticLocationOverride ? StaticLocationOverrideUU : Pawn->GetActorLocation();
 			UE_LOG(LogVoxelPerf, Log,
-			       TEXT("VoxelPerfRun: STATIC pose pinned at (%.0f, %.0f, %.0f) yaw=%.1f pitch=%.1f -- "
+			       TEXT("VoxelPerfRun: STATIC pose pinned at (%.0f, %.0f, %.0f) yaw=%.1f pitch=%.1f (%s) -- "
 			            "position AND rotation held for the whole run, so the renderer is the only variable."),
-			       StaticLocationUU.X, StaticLocationUU.Y, StaticLocationUU.Z, StaticYawDeg, StaticPitchDeg);
+			       StaticLocationUU.X, StaticLocationUU.Y, StaticLocationUU.Z, StaticYawDeg, StaticPitchDeg,
+			       bStaticLocationOverride ? TEXT("-VoxelPerfStaticAt") : TEXT("spawn pose"));
 		}
 
 		const FRotator StaticRotation(StaticPitchDeg, StaticYawDeg, 0.f);

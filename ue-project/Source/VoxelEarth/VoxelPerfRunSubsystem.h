@@ -112,6 +112,13 @@ private:
 	bool bStaticPoseCaptured = false;
 	FVector StaticLocationUU = FVector::ZeroVector;
 
+	// -VoxelPerfStaticAt=X,Y,Z (UU). Pins somewhere other than the spawn column.
+	// The spawn is always on the surface, so without this the static fixture
+	// cannot be aimed at the only voxel water this world has, which is
+	// underground. See the parse site for the full reasoning.
+	bool bStaticLocationOverride = false;
+	FVector StaticLocationOverrideUU = FVector::ZeroVector;
+
 	// -VoxelPerfDepth=<metres>, underground flight only. 60 m is chosen to
 	// match the documented test cavern's depth (60.7 m down), which is the one
 	// underground scene in the tree with a measured residency result to compare
