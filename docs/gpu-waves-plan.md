@@ -1454,6 +1454,25 @@ parameter from the concrete synthetic type to `vxc::ITileSampler&`.
 fallback on a miss — but the CPU path reads the *same* sampler through
 `Amp.column`, so this is **not a GPU-specific risk**.
 
+**REQUIREMENT D4-R1 — a pool capacity rebuild must trigger a re-mesh. Owner: D4.**
+
+Not a risk to watch, a correctness obligation on the wiring. When the pool
+outgrows its buffer allocation, `CreateRenderThreadResources` rebuilds the
+buffers and re-uploads from the CPU shadow. That is correct in itself — the old
+buffer's contents genuinely are gone, so there is nothing else to restore from —
+but it means **a capacity rebuild invalidates every GPU-written range**, and
+nothing currently re-dispatches them. Their geometry silently reverts to whatever
+the shadow holds.
+
+D4 must treat a capacity rebuild as a re-mesh trigger for every GPU-meshed
+resident chunk: bump their `GenerationId` (or clear `bMeshSettled`) so
+`RecomputeDesiredSet` re-queues them. **It is deliberately stated as a
+requirement rather than filed under risks because it is *rare and silent*, which
+is the combination this wave has repeatedly been caught by and the one least
+likely to be found by testing** — capacity is allocated up front from
+`kPoolCapacityQuads`, so a test would have to deliberately undersize the pool to
+reach it.
+
 **Two asymmetries to measure rather than assume:**
 - The CPU path has a per-brick `SkipBrick` lambda (`:6357-6409`) driven by the
   same band scratch arrays, so it skips provably-all-air/all-solid bricks. **The
