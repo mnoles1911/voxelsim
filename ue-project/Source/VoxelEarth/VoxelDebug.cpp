@@ -600,7 +600,23 @@ bool VoxelDebug::GetWaterGpu()
 
 int32 VoxelDebug::GetStreamJobsInFlightPerCore()
 {
-	return FMath::Clamp(CVarVoxelStreamJobsInFlightPerCore.GetValueOnGameThread(), 1, 64);
+	// -VoxelJobsInFlightPerCore=<n> wins over the cvar, resolved once at first
+	// use. The cvar alone cannot sweep this honestly: it is only settable
+	// through -ExecCmds, which lands AFTER streaming has begun, so the first
+	// seconds of every run -- the cascade fill, where the pool is busiest and
+	// contention is at its worst -- would run at the default whatever the sweep
+	// asked for. Same reason -VoxelCoarseMinLevel and -VoxelPendingJobCap are
+	// command-line switches (VoxelWorldSubsystem.cpp, namespace
+	// VoxelStreamAdmission). 0/absent = use the cvar.
+	static const int32 CommandLineOverride = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelJobsInFlightPerCore="), Value);
+		return Value;
+	}();
+	const int32 Requested =
+		CommandLineOverride > 0 ? CommandLineOverride : CVarVoxelStreamJobsInFlightPerCore.GetValueOnGameThread();
+	return FMath::Clamp(Requested, 1, 64);
 }
 
 int32 VoxelDebug::GetStreamMaxRemeshesPerFrame()
