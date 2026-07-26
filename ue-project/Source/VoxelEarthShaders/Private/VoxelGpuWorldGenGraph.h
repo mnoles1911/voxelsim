@@ -1,0 +1,81 @@
+// The seven-pass RDG graph, factored out of RunRegionBlocking so the blocking
+// verification path and the async streaming runner build the SAME passes.
+//
+// WHY THIS HEADER EXISTS. RunRegionBlocking used to inline the whole graph
+// inside its render command. FVoxelGpuMeshJobManager needs the identical chain
+// -- ColumnMain, VoxelizeMain, MeshCountMain, the three scan passes, MeshEmitMain
+// -- and copying it would have created two graphs that agree today and drift the
+// first time a pass is added. So the graph construction lives in exactly one
+// function and both callers call it. What each caller does differ on is what it
+// reads BACK: the blocking path pulls columns and cells too (it is a bit-exactness
+// harness), the async path pulls only the quad stream and its scan tables.
+//
+// PRIVATE ON PURPOSE. It exposes FRDGBufferRef, which is only meaningful on the
+// render thread while a specific FRDGBuilder is alive, so it must not become
+// part of the module's public surface.
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "RenderGraphFwd.h"
+
+struct FVoxelGpuRegionRequest;
+class FRDGBuilder;
+
+namespace VoxelGpuWorldGen
+{
+	// Every count the graph and its readbacks are sized from. Derived purely
+	// from the request, so a caller can size staging buffers before touching the
+	// render thread.
+	struct FRegionGraphSizes
+	{
+		uint32 BricksX = 0;
+		uint32 BricksY = 0;
+		uint32 BricksZ = 0;
+
+		uint32 NumColumns = 0;
+		uint32 NumCells = 0;
+
+		// Zero when bMeshChain is false.
+		uint32 MaskCount = 0;
+		uint32 NumBlocks = 0;
+		uint32 MaxQuads = 0;
+
+		bool bMesh = false;
+
+		// Byte sizes of the five readbackable buffers.
+		uint32 ColumnsBytes() const;
+		uint32 CellsBytes() const { return NumCells * uint32(sizeof(uint32)); }
+		uint32 CountsBytes() const { return MaskCount * uint32(sizeof(uint32)); }
+		uint32 QuadsBytes() const { return MaxQuads * uint32(sizeof(uint64)); }
+	};
+
+	// The graph's output buffers. Counts/Offsets/Quads are null when the request
+	// asked for generation only.
+	struct FRegionGraphResources
+	{
+		FRDGBufferRef Columns = nullptr;
+		FRDGBufferRef Cells = nullptr;
+		FRDGBufferRef Counts = nullptr;
+		FRDGBufferRef Offsets = nullptr;
+		FRDGBufferRef Quads = nullptr;
+		FRegionGraphSizes Sizes;
+	};
+
+	// Rejects anything the kernels' own guards would otherwise have to absorb.
+	// Safe to call from any thread; it only reads the request.
+	bool ValidateRegionRequest(const FVoxelGpuRegionRequest& Request, FString& OutError);
+
+	// Pure arithmetic over the request. Assumes it already validated.
+	FRegionGraphSizes ComputeRegionGraphSizes(const FVoxelGpuRegionRequest& Request);
+
+	// Adds the seven passes to GraphBuilder and returns the buffers they wrote.
+	// RENDER THREAD ONLY. Does not execute the graph, does not enqueue any
+	// readback, and does not block -- the caller owns all three decisions.
+	//
+	// Request must stay alive for the duration of this call. It does NOT need to
+	// outlive it: the raster arrays are copied into RDG's own allocator here
+	// (CreateStructuredBuffer with the default ERDGInitialDataFlags copies), and
+	// the loose parameters are plain scalars written into the parameter struct.
+	FRegionGraphResources AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegionRequest& Request);
+}
