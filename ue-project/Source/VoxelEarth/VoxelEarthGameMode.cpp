@@ -279,6 +279,112 @@ void AVoxelEarthGameMode::BeginPlay()
 			DigTestDelaySeconds, false);
 	}
 
+	// ==== downward escape hatch proof: dig past the skirt floor =============
+	//
+	// -VoxelDigDownTest[=<delaySeconds>]   (default 30s)
+	// -VoxelDigDownDepth=<metres>          (default 60m -- the skirt floor is
+	//                                       ~41.6m, so this clears it by ~18m)
+	// -VoxelDigDownSettle=<seconds>        (default 20s)
+	//
+	// This is the test that protects the terrain, so it is deliberately the
+	// crudest possible one: carve a vertical shaft with the same authoritative
+	// CarveSphere path a player's explosive uses, then read the column back out
+	// of the streaming system and print it. No screenshot, no framing, nothing
+	// that can be argued with -- either the chunks under the shaft are tracked
+	// with geometry or they are not.
+	//
+	// The pawn is NOT moved. It stands on the surface for the whole test, so
+	// bAnchorUnderground stays false and the anchor-relative deep box never
+	// opens. The only thing that can put the bottom of the shaft into the
+	// desired set is the EditedFootprintMinZ widening of ChunkZMin.
+	float DigDownDelaySeconds = 30.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelDigDownTest="), DigDownDelaySeconds) ||
+	    FParse::Param(FCommandLine::Get(), TEXT("VoxelDigDownTest")))
+	{
+		float DigDownDepthM = 60.f;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelDigDownDepth="), DigDownDepthM);
+		float DigDownSettleSeconds = 20.f;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelDigDownSettle="), DigDownSettleSeconds);
+		const bool bDigDownQuit = FParse::Param(FCommandLine::Get(), TEXT("VoxelDigDownQuit"));
+
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelDigDownTest: shaft to %.0fm below the surface in %.1fs, report %.1fs later."),
+		       DigDownDepthM, DigDownDelaySeconds, DigDownSettleSeconds);
+
+		GetWorldTimerManager().SetTimer(
+			DigDownTestDigTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this, DigDownDepthM, DigDownSettleSeconds, bDigDownQuit]()
+				{
+					UWorld* DigWorld = GetWorld();
+					APlayerController* PC = DigWorld ? DigWorld->GetFirstPlayerController() : nullptr;
+					APawn* Pawn = PC ? PC->GetPawn() : nullptr;
+					UVoxelWorldSubsystem* Subsystem = DigWorld ? DigWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					if (!Pawn || !Subsystem)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelDigDownTest: no pawn/subsystem yet, skipping."));
+						return;
+					}
+					const FVector PawnLoc = Pawn->GetActorLocation();
+					// Offset a few metres so the shaft is not directly under the
+					// pawn's collision capsule (which would drop it in and make
+					// the anchor underground -- the one thing this test must not
+					// let happen), but well inside R0's near band so the skirt
+					// really is 12 chunks deep there.
+					const double ColX = PawnLoc.X + 600.0;
+					const double ColY = PawnLoc.Y;
+					const double SurfaceUU = Subsystem->GetSurfaceHeightUU(ColX, ColY);
+
+					LogDigDownColumn(*Subsystem, ColX, ColY, TEXT("pre-dig"));
+
+					// One sphere per metre of depth, radius 1.5m: overlapping,
+					// so the shaft is continuous rather than a string of beads.
+					const double DepthUU = double(DigDownDepthM) * 100.0;
+					int32 Removed = 0;
+					int32 Spheres = 0;
+					for (double D = 100.0; D <= DepthUU; D += 100.0)
+					{
+						Removed += Subsystem->CarveSphere(FVector(ColX, ColY, SurfaceUU - D), 150.0, 0.0);
+						++Spheres;
+					}
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelDigDownTest: carved a shaft at (%.0f,%.0f) surface=%.0f, %d spheres, %d voxels removed, ")
+					       TEXT("floor %.0fm below the surface (skirt floor is ~41.6m)."),
+					       ColX, ColY, SurfaceUU, Spheres, Removed, double(DigDownDepthM));
+
+					GetWorldTimerManager().SetTimer(
+						DigDownTestReportTimerHandle,
+						FTimerDelegate::CreateWeakLambda(this,
+							[this, ColX, ColY, bDigDownQuit]()
+							{
+								UWorld* RWorld = GetWorld();
+								UVoxelWorldSubsystem* Sub = RWorld ? RWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+								if (Sub)
+								{
+									LogDigDownColumn(*Sub, ColX, ColY, TEXT("post-dig"));
+								}
+								if (bDigDownQuit)
+								{
+									GetWorldTimerManager().SetTimer(
+										DigDownTestQuitTimerHandle,
+										FTimerDelegate::CreateWeakLambda(this,
+											[this]()
+											{
+												if (UWorld* QWorld = GetWorld())
+												{
+													if (APlayerController* QPC = QWorld->GetFirstPlayerController())
+													{
+														QPC->ConsoleCommand(TEXT("quit"), true);
+													}
+												}
+											}),
+										2.f, false);
+								}
+							}),
+						DigDownSettleSeconds, false);
+				}),
+			DigDownDelaySeconds, false);
+	}
+
 	// ==== M4 voxel light field + cone-traced GI verification ================
 	// (ONE self-contained block, deliberately: it does its own fixture, its own
 	// camera framing and its own capture/quit rather than adding a branch to
@@ -3063,6 +3169,47 @@ void AVoxelEarthGameMode::BeginPlay()
 				}),
 			Tier1TestSpawnDelaySeconds, false);
 	}
+}
+
+// --- downward escape hatch proof: read the whole column back -----------------
+
+void AVoxelEarthGameMode::LogDigDownColumn(UVoxelWorldSubsystem& Subsystem, double ColumnXUU, double ColumnYUU,
+                                           const TCHAR* Phase) const
+{
+	// One entry per level-0 chunk from just above the surface down to 25
+	// chunks (80 m) below it -- well past both the 12-chunk depth skirt and any
+	// shaft this test digs. Each entry is "<depth>:<T|-><C|-><quads>", the same
+	// shape LogUndergroundChunkStatus uses, plus a summary of the part that
+	// actually matters: how deep the TRACKED column reaches.
+	const double SurfaceUU = Subsystem.GetSurfaceHeightUU(ColumnXUU, ColumnYUU);
+	FString Line;
+	int32 DeepestTrackedStep = 0;
+	int32 DeepestGeometryStep = 0;
+	int32 TrackedCount = 0;
+	for (int32 Step = 1; Step <= 25; ++Step)
+	{
+		const double Z = SurfaceUU - double(Step) * VoxelCoords::ChunkEdgeUU;
+		bool bTracked = false, bComp = false;
+		int32 Quads = 0;
+		Subsystem.DebugChunkStatusAt(FVector(ColumnXUU, ColumnYUU, Z), bTracked, bComp, Quads);
+		Line += FString::Printf(TEXT("%-.0fm:%s%s%d "), (SurfaceUU - Z) / 100.0, bTracked ? TEXT("T") : TEXT("-"),
+		                        bComp ? TEXT("C") : TEXT("-"), Quads);
+		if (bTracked)
+		{
+			++TrackedCount;
+			DeepestTrackedStep = Step;
+		}
+		if (Quads > 0)
+		{
+			DeepestGeometryStep = Step;
+		}
+	}
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("VoxelDigDownTest [%s] column at (%.0f,%.0f) surface=%.0f: tracked=%d/25 deepestTracked=%.1fm ")
+	       TEXT("deepestGeometry=%.1fm | %s"),
+	       Phase, ColumnXUU, ColumnYUU, SurfaceUU, TrackedCount,
+	       double(DeepestTrackedStep) * VoxelCoords::ChunkEdgeUU / 100.0,
+	       double(DeepestGeometryStep) * VoxelCoords::ChunkEdgeUU / 100.0, *Line);
 }
 
 // --- underground streaming proof: streaming diagnostic -----------------------
