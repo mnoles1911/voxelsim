@@ -914,6 +914,59 @@ zeros or stale content, so the geometry silently reverts.
 **Recommendation: (3), and cost it before building it** — the same order that
 just paid off for D6.
 
+#### Option 3 costed, 2026-07-26, against Wave A's merged code
+
+**The lifetime today is coherent, which is why the current design works.** All of
+it is proxy-owned and dies together:
+
+| thing | where |
+|---|---|
+| `FVoxelQuadVertexFactory VertexFactory` | proxy **member** (`VoxelGpuPoolComponent.cpp:503`) |
+| `QuadBuffer` / `ChunkIdSRV` / `OriginSRV` / `ParamsSRV` | created in `CreateRenderThreadResources` (`:176-182`, `:827`) |
+| handed to the factory | `SetQuadBufferSRV` / `SetPoolBuffers` (`:208-209`), then `InitResource` (`:210`) |
+| baked into a uniform buffer | `InitRHI` (`VoxelQuadVertexFactory.cpp:95-96`), `UniformBuffer_MultiFrame`, built **once** |
+| torn down | `~FVoxelGpuPoolSceneProxy` → `VertexFactory.ReleaseResource()` (`:153`) → `ReleaseRHI` releases the uniform buffer **and** the SRVs (`:102-104`) |
+
+**The good news, and it is the thing worth costing for: the uniform buffer does
+NOT have to survive.** It is built *from* the SRVs and holds nothing else of
+substance. If the **buffers and SRVs** outlive the proxy, a new proxy's
+`InitRHI` simply builds a fresh uniform buffer pointing at the *same* SRVs — and
+the GPU-resident quads survive because the buffer was never destroyed or
+re-uploaded. So "buffer identity must stay stable" is satisfied by moving one
+level of ownership, not by making the factory immortal.
+
+That makes option 3 substantially smaller than it looks:
+
+1. A component-owned render resource (`FVoxelGpuPoolBuffers`) holding
+   `QuadBuffer` + `ChunkIdBuffer`, their SRVs, and — for D1 — their **UAVs**.
+   Created once, released at component destruction via `BeginReleaseResource` +
+   fence.
+2. `CreateRenderThreadResources` stops *creating* those two buffers and just
+   takes references, calling `SetQuadBufferSRV` / `SetPoolBuffers` exactly as it
+   does now. **No vertex factory change. No shader change.**
+3. `CreateSceneProxy` stops re-uploading `PooledQuads` — the buffer already holds
+   the data. It uploads on **first** creation only. *This is the line that
+   removes the clobber.*
+4. `UpdateQuadRange_RenderThread` retargets to the component-side buffer.
+
+The chunk table (origins / params / runs) is small, genuinely proxy-scoped, and
+**stays where it is** — `MaxChunks` is derived per proxy and nothing about the
+clobber involves it.
+
+**Precedent that this is an accepted shape here:** `GetElementShaderBindings`
+already fetches `GVoxelGIVolume.GetUniformBuffer()` (`VoxelQuadVertexFactory.cpp:190`),
+a resource that outlives every proxy.
+
+**Estimate:** one file plus a small header, ~200–300 lines touched, no `.ush`
+edit, no digest exposure, no bench impact. **The one genuinely delicate part is
+render-resource lifetime** — created on the render thread, released behind a
+fence — which is standard but is exactly the kind of thing that fails as a
+crash-on-exit rather than a compile error.
+
+**It is also the right destination on the merits:** a component-owned buffer set
+is precisely where a compute compaction pass's compacted-quad-id buffer wants to
+live, so this is the enabling step for that too rather than a detour around it.
+
 - **Neutralise the CPU shadow clobber — the highest-severity silent-corruption risk
   in this wave.** `PooledQuads`/`QuadChunkIds` (`VoxelGpuPoolComponent.h:148-152`)
   are a full CPU mirror, and `CreateSceneProxy` re-uploads all of it. Any
