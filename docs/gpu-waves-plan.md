@@ -343,7 +343,11 @@ shifted control.
 >   the coupling to Wave A was found; then **not shipped**. GI is free at the
 >   median (+0.6% p50) and expensive in the tail (**+14.9% p95, 3.2x hitches**,
 >   neither overlapping). Reported rather than flipped, per the plan's own rule.
->   `voxel.GI.MaxChunkRefreshesPerFrame` is the knob and the sweep is owed.
+>   `voxel.GI.MaxChunkRefreshesPerFrame` was swept 4/2/1 and **no setting reaches
+>   Ship or Conditional**: the knob trades hitches against relight latency and
+>   there is no acceptable point on it. GI cannot ship on by default without
+>   further work; the fix indicated is priority (edits ahead of the round-robin),
+>   not throughput.
 > - **B5 and the Dim 256 coverage run — not run, unverified.**
 > - **B-M — a new finding, not root-caused**: the light field is effectively
 >   **empty under motion** (0–12 bricks against 2,212 settled). It qualifies the
@@ -842,6 +846,48 @@ passing config is one whose cost is real but barely detectable.
 
 All tiers additionally require **≥2 unclamped legs** at that setting. A tie
 between tiers resolves **downward**.
+
+#### The sweep result: **no setting reaches Ship or Conditional. GI cannot ship on by default without further work.**
+
+Frame-time half (≥2 unclamped legs each; max 41–46 ms, clamped-fraction bound
+1.0–3.8%, all well under the 5% p95 limit) and latency half (one leg each,
+`voxel.GI.RelightTest`, 300 UU carve through the real edit path):
+
+| config | p50 | p95 | hitches | **edit → fully relit** | tier |
+|---|---|---|---|---|---|
+| **GI off** (target) | 23.25 | **27.41** | **23.3** | n/a | — |
+| refresh **4** (default) | 23.37 | 31.39 | 74.0 (×3.2) | **335 ms** | **No** — hitches |
+| refresh **2** | 23.52 | 29.74 | 40.5 (×1.74) | **2550 ms** | **No** — both |
+| refresh **1** | 23.35 | **28.86** (×1.05) | **26.7** (×1.14) | **TIMEOUT >30 s** | **No** — latency |
+
+Ship needs hitches ≤29.1, p95 ≤30.15 ms **and** relight ≤2.0 s; Conditional ≤35.0,
+≤31.5 ms, ≤3.0 s. Peak queue depths are reported beside each duration
+(`peakDirtyQueue=206`, `peakRefreshQueue=66/337`) so a reader can confirm the work
+existed rather than taking a fast number on trust.
+
+**The knob does not have a good setting; it has an exchange rate.** Refresh 1 is
+the only config whose frame cost is acceptable (1.14× hitches, 1.05× p95 — both
+inside Ship) and it is the *worst* on latency by a wide margin. Refresh 4 relights
+in a third of a second and costs 3.2× the hitches. Refresh 2 manages to be bad at
+both. **There is no setting where a dug tunnel relights promptly and the frame
+tail is acceptable**, which is a complete answer to the sweep and the reason the
+recommendation is unchanged.
+
+**Why refresh 1 times out, which is the actionable part.** 174 bricks do not take
+30 s to re-shade at one chunk per frame — 30 s is ~1,290 frames. The edit's
+chunks are **queued behind the round-robin re-solve**: `RefreshQueue` sits at
+~1,288 entries in steady state at this budget (measured in the sweep legs), it is
+FIFO, and an edit's entries join the back. So the edit waits for the entire
+background backlog to drain ahead of it. At refresh 4 the backlog is short enough
+that this does not bite; at refresh 1 it is fatal.
+
+That points at a fix which is neither a bigger budget nor a smaller one:
+**priority, not throughput.** An edit-driven refresh serves a change the player
+just made and is watching; a round-robin refresh serves slow convergence nobody
+is waiting on. Draining edit-driven entries first — or giving them a separate
+reserved budget — would decouple the two axes this sweep found locked together,
+and is the obvious next thing to try. It is a code change, not a tuning change,
+so it is out of Wave B's scope and recorded here rather than attempted.
 
 **And the recommendation carries finding B-M regardless of which tier is hit.**
 If GI is largely absent under motion, shipping it on by default buys less than
