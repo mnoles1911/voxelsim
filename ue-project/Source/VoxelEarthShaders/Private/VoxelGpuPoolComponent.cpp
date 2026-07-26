@@ -1439,6 +1439,91 @@ static FAutoConsoleCommand GVoxelGpuPoolClobberTestCmd(
 	     "visibly loses those quads. Usage: voxel.Stream.PoolClobberTest [N=200000]"),
 	FConsoleCommandWithArgsDelegate::CreateStatic(&VoxelGpuPoolClobberTest));
 
+// The full clobber experiment, sequenced on a ticker so the three captures are
+// taken in ONE session with nothing else changing between them.
+//
+// WHY IT TAKES TWO "BEFORE" SHOTS. The noise floor has to come from a same-path
+// pair inside this same session, because the measured floor at a settled scene
+// is BIMODAL rather than noise-like: 0.00% within a cluster and ~1.81% between
+// clusters, from a per-session latch (eye adaptation / sky phase). Assuming a
+// fixed threshold would let that latch read as signal. So:
+//
+//   diff(A, B) = the floor, this session, same path, nothing changed
+//   diff(B, C) = the effect, with only the clobber+recreation between them
+//
+// A result is only meaningful relative to the floor measured beside it.
+static void VoxelGpuPoolClobberSession(const TArray<FString>& Args)
+{
+	const double StartDelay = (Args.Num() > 0) ? FMath::Max(0.0, FCString::Atod(*Args[0])) : 45.0;
+	const int32 NumToClobber = (Args.Num() > 1) ? FMath::Max(1, FCString::Atoi(*Args[1])) : 200000;
+
+	TSharedPtr<double> Elapsed = MakeShared<double>(0.0);
+	TSharedPtr<int32> Step = MakeShared<int32>(0);
+
+	UE_LOG(LogTemp, Warning,
+	       TEXT("PoolClobberSession queued: settle %.0f s, then shotA, shotB (noise floor pair), "
+	            "clobber %d quads, shotC. Screenshots land in Saved/Screenshots."),
+	       StartDelay, NumToClobber);
+
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		[Elapsed, Step, StartDelay, NumToClobber](float Dt) -> bool
+	{
+		*Elapsed += double(Dt);
+		const double T = *Elapsed;
+
+		const auto Shot = [](const TCHAR* Name)
+		{
+			FScreenshotRequest::RequestScreenshot(FString(Name), false, false);
+		};
+
+		switch (*Step)
+		{
+		case 0:
+			if (T < StartDelay) { return true; }
+			UE_LOG(LogTemp, Warning, TEXT("PoolClobberSession: shotA (settled baseline)"));
+			Shot(TEXT("clobberA"));
+			++*Step;
+			return true;
+		case 1:
+			if (T < StartDelay + 3.0) { return true; }
+			UE_LOG(LogTemp, Warning, TEXT("PoolClobberSession: shotB — A/B is the SAME-SESSION noise floor"));
+			Shot(TEXT("clobberB"));
+			++*Step;
+			return true;
+		case 2:
+			if (T < StartDelay + 6.0) { return true; }
+			for (TObjectIterator<UVoxelGpuPoolComponent> It; It; ++It)
+			{
+				if (*It && !It->IsTemplate() && IsValid(*It))
+				{
+					It->DebugClobberShadowAndRecreate(NumToClobber);
+				}
+			}
+			++*Step;
+			return true;
+		case 3:
+			if (T < StartDelay + 10.0) { return true; }
+			UE_LOG(LogTemp, Warning,
+			       TEXT("PoolClobberSession: shotC — B/C is the EFFECT. Equal to the A/B floor "
+			            "means the buffers were rebound and path 1 is closed."));
+			Shot(TEXT("clobberC"));
+			++*Step;
+			return true;
+		default:
+			if (T < StartDelay + 14.0) { return true; }
+			UE_LOG(LogTemp, Warning, TEXT("PoolClobberSession: done"));
+			return false;
+		}
+	}), 0.0f);
+}
+
+static FAutoConsoleCommand GVoxelGpuPoolClobberSessionCmd(
+	TEXT("voxel.Stream.PoolClobberSession"),
+	TEXT("Runs the whole path-1 clobber experiment in one session: settle, two baseline shots "
+	     "(their diff is the same-session noise floor), clobber the CPU shadow, force recreation, "
+	     "third shot. Usage: [settleSeconds=45] [quads=200000]"),
+	FConsoleCommandWithArgsDelegate::CreateStatic(&VoxelGpuPoolClobberSession));
+
 void UVoxelGpuPoolComponent::DebugClobberShadowAndRecreate(int32 NumQuadsToClobber)
 {
 	const int32 Drawn = int32(Pool.GetHighWaterMark());

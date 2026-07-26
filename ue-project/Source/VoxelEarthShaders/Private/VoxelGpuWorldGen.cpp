@@ -246,7 +246,34 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutQuadTotal)
 		END_SHADER_PARAMETER_STRUCT()
 	};
+	// --- BandReduceMain: the footprint band (Wave D / D6) ------------------
+	//
+	// Derives from FVoxelWorldGenShader, unlike the quad-total kernel, because
+	// it #includes worldgen.ush and therefore needs both VXC_UE and the
+	// worldgen version lock's VXC_WORLDGEN_VERSION_CPP. It also genuinely needs
+	// SM6: caveColumnFor and cavernColumnFor are 64-bit integer throughout.
+	class FVoxelBandReduceCS : public FVoxelWorldGenShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBandReduceCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBandReduceCS, FVoxelWorldGenShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
+			SHADER_PARAMETER(uint32, BandOriginI)
+			SHADER_PARAMETER(uint32, BandEdge)
+			// cavernColumnFor evaluates terrain height at a cave site's own xy,
+			// so the raster is live here for the same reason it is in
+			// VoxelizeMain.
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, ElevationMm)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuColumnSample>, InColumns)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<int>, OutBand)
+		END_SHADER_PARAMETER_STRUCT()
+	};
 }
+
+#define VOXEL_BAND_REDUCE_USF "/VoxelEarth/VoxelBandReduce.usf"
+IMPLEMENT_GLOBAL_SHADER(FVoxelBandReduceCS, VOXEL_BAND_REDUCE_USF, "BandReduceMain", SF_Compute);
 
 #define VOXEL_QUAD_SCAN_USF "/VoxelEarth/VoxelQuadScan.usf"
 
@@ -455,6 +482,31 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 		FComputeShaderUtils::AddPass(
 			GraphBuilder, RDG_EVENT_NAME("Voxel.VoxelizeMain"), Shader, Params,
 			FIntVector(Cx / kBrickEdge, Cy / kBrickEdge, 1));
+	}
+
+	// --- pass 2b: BandReduceMain (Wave D / D6) -----------------------
+	//
+	// After ColumnMain, before anything else needs it, and independent of the
+	// mesh chain: the band is a pure function of the columns and does not know
+	// about chunk-z. Requested per job because only one chunk per (X,Y)
+	// footprint needs to produce one.
+	if (Request.BandEdge > 0)
+	{
+		Out.Band = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(int32), 2), TEXT("Voxel.Band"));
+
+		FVoxelBandReduceCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelBandReduceCS::FParameters>();
+		FillLooseParameters(*Params, Request);
+		Params->BandOriginI = Request.BandOriginI;
+		Params->BandEdge = Request.BandEdge;
+		Params->ElevationMm = GraphBuilder.CreateSRV(ElevationBuffer);
+		Params->InColumns = GraphBuilder.CreateSRV(Out.Columns);
+		Params->OutBand = GraphBuilder.CreateUAV(Out.Band);
+
+		TShaderMapRef<FVoxelBandReduceCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("Voxel.BandReduceMain"), Shader, Params,
+			FIntVector(1, 1, 1));   // exactly one workgroup, by design
 	}
 
 	if (!S.bMesh)

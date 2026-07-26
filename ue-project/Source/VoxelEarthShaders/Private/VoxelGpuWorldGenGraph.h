@@ -78,6 +78,12 @@ namespace VoxelGpuWorldGen
 		// of the wave.
 		FRDGBufferRef Total = nullptr;
 
+		// Wave D / D6: two ints -- max ColumnSurfaceTopVoxel and min
+		// ColumnDeepestAirVoxel over the band grid, as raw voxel z. Null unless
+		// the request asked for a band. The +1/-1 widening and the clamp that
+		// turn these into an FFootprintBand stay on the CPU.
+		FRDGBufferRef Band = nullptr;
+
 		FRegionGraphSizes Sizes;
 	};
 
