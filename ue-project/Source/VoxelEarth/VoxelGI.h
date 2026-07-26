@@ -103,6 +103,17 @@ private:
 	void PushDirty(const FIntVector& Key);
 	FVector ResolveViewOriginUU() const;
 
+	// --- GPU volume driver (docs/gpu-gi-volume-design.md §3) ----------------
+	void PushVolumeUpload(const FIntVector& Key);
+	// Establishes the volume origin (once) from the field centre, brick-snapped,
+	// and expressed in POOL-PRIMITIVE space. False until the pool exists.
+	bool EnsureVolumeOrigin();
+	// Encodes and uploads at most Budget bricks (Budget < 0 = the whole queue).
+	// Returns the number of bricks encoded. Game thread; reads the field under
+	// one FReadScope and hands the staged bytes to the render thread.
+	int32 DrainVolumeUploads(int32 Budget);
+	void RunVolumeCheck(int32 NumSamples);
+
 	TUniquePtr<FVoxelLightField> Field;
 
 	// Chunks whose geometry changed and still need voxelizing into the field.
@@ -153,6 +164,43 @@ private:
 	// progressive bounce converge and keeps stale bricks fresh.
 	TArray<FIntVector> RefreshRotation;
 	int32 RefreshCursor = 0;
+
+	// --- GPU volume state ---------------------------------------------------
+	//
+	// Bricks whose TEXELS are stale. Fed from exactly the three events
+	// docs/gpu-gi-volume-design.md §3.3 lists -- solved, re-voxelized, evicted
+	// -- which is the same work RefreshQueue carries on the component path.
+	//
+	// A SEPARATE array rather than RefreshQueue itself, deliberately: the
+	// re-shade drain POPS RefreshQueue destructively, and voxel.Stream.GPUMaxLevel
+	// puts both renderers in one frame, so sharing one array would have the two
+	// drains stealing entries from each other. Same events, same dedupe shape,
+	// its own cursor.
+	TArray<FIntVector> VolumeUploadQueue;
+	TSet<FIntVector> VolumeUploadSet;
+
+	// CPU mirror of exactly the bytes staged to the volume, Dim^3 * 4. This is
+	// what voxel.GI.VolumeCheck compares the field against -- "what would the
+	// shader return" has to be answered from the bytes that were actually
+	// uploaded, not from a re-encode, or the harness cannot catch an addressing
+	// or run-merging bug. 1 MB at the default Dim=64, 67 MB at 256.
+	TArray<uint8> VolumeShadow;
+
+	// World UU of texel (0,0,0)'s CELL ORIGIN (not its centre), snapped to a
+	// whole 320 UU brick so the texel lattice coincides with the field's cell
+	// lattice and no sample ever resamples. Texel i is world
+	// VolumeOriginWorldUU + (i+0.5)*40, which is what the CPU sampler's
+	// P/40 - 0.5 convention expects with no half-texel fixup.
+	FVector VolumeOriginWorldUU = FVector::ZeroVector;
+	// Same origin in units of cells, so brick key -> texel base is integer.
+	FIntVector VolumeCellOrigin = FIntVector::ZeroValue;
+	int32 VolumeDim = 0;
+	bool bVolumeOriginSet = false;
+	int32 VolumeBricksUploaded = 0;
+	int32 VolumeRunsUploaded = 0;
+	double FirstVolumeUploadSeconds = 0.0;
+	bool bVolumeCheckDone = false;
+	bool bLoggedNoPool = false;
 
 	FVector FieldCentreUU = FVector::ZeroVector;
 	bool bCoarseDirty = false;

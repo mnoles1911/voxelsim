@@ -273,6 +273,37 @@ public:
 	// black flash on a chunk whose brick has streamed in but not yet solved.
 	bool SampleIrradiance(const FVector& WorldUU, const FVector3f& Normal, float& OutIrradiance) const;
 
+	// --- GPU volume encode (docs/gpu-gi-volume-design.md §2, Scheme B) ------
+	//
+	// Bytes one brick produces for the GPU volume: 8x8x8 cells x RGBA8, laid
+	// out X-fastest then Y then Z, i.e. VoxelLF::CellIndex order.
+	static constexpr int32 BrickTexelBytes = VoxelLF::BrickCells * 4;
+
+	// Encodes one brick's Vis + SolvedCells into RGBA8 texels:
+	//
+	//   R = Vis[+Z] * v   G = Vis[-Z] * v   B = mean(Vis[+-X], Vis[+-Y]) * v   A = v
+	//
+	// with v the per-cell validity (255 when SolvedCells is set, 0 otherwise).
+	// Exact for the +-Z face classes -- the ones where directionality visually
+	// dominates -- and the horizontal mean for the other four.
+	//
+	// PREMULTIPLYING BY VALIDITY IS THE LOAD-BEARING PART, not a compression
+	// trick. Storing Vis*v and v separately and dividing in the shader makes
+	// hardware trilinear reproduce SampleIrradianceAtProbe's "skip unsolved
+	// taps and renormalize by the surviving weight" EXACTLY: the texture unit
+	// computes sum(w*Vis*v) and sum(w*v) for the same 8 taps and the same
+	// weights, and the quotient is the same number this class computes in
+	// software. It also gives the miss case for free -- A == 0 means no data,
+	// which the shader turns into plain AO, matching this class's `return
+	// false` path -- so zeroing a brick's texels is "no data", never "black".
+	//
+	// Returns false and ZEROES OutRGBA when the brick is absent or has not been
+	// solved since its last re-voxelize. Callers want that: a dug tunnel that
+	// kept its pre-dig texels would stay lit until the solve landed.
+	// OutRGBA must have room for BrickTexelBytes. Takes the read lock; the
+	// FReadScope form below is the one to use when encoding several bricks.
+	bool EncodeBrickTexels(const FIntVector& Key, uint8* OutRGBA) const;
+
 	// Batched form of the above. A scene proxy shades thousands of vertices in
 	// one construction; taking the read lock per vertex would cost more atomics
 	// than the lookup itself, so it is hoisted into this RAII scope. Game
@@ -293,6 +324,20 @@ public:
 		{
 			return Field.SampleIrradianceUnlocked(WorldUU, Normal, OutIrradiance);
 		}
+
+		// See FVoxelLightField::EncodeBrickTexels. The GPU volume driver encodes
+		// a whole frame's dirty bricks under one scope, for the same reason the
+		// proxy shades a whole chunk under one: the lock is the expensive part.
+		bool EncodeBrick(const FIntVector& Key, uint8* OutRGBA) const
+		{
+			return Field.EncodeBrickTexelsUnlocked(Key, OutRGBA);
+		}
+
+		// Raw brick access for diagnostics that need SolvedCells directly (the
+		// voxel.GI.VolumeCheck harness picks random SOLVED cells, which is not
+		// expressible through the sampler). Read-locked by construction; the
+		// pointer must not outlive the scope.
+		const FVoxelLFBrick* FindBrick(const FIntVector& Key) const { return Field.FindBrick(Key); }
 
 	private:
 		const FVoxelLightField& Field;
@@ -321,6 +366,7 @@ public:
 
 private:
 	bool SampleIrradianceUnlocked(const FVector& WorldUU, const FVector3f& Normal, float& OutIrradiance) const;
+	bool EncodeBrickTexelsUnlocked(const FIntVector& Key, uint8* OutRGBA) const;
 	bool SampleIrradianceAtProbe(const FVector& P, const float (&DirWeight)[VoxelLF::NumDirs],
 	                             float InvDirWeightSum, float& OutIrradiance) const;
 
