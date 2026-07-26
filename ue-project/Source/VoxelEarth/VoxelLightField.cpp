@@ -494,15 +494,15 @@ bool FVoxelLightField::SampleIrradianceAtProbe(const FVector& P, const float (&D
 
 // --- GPU volume encode -----------------------------------------------------
 
-bool FVoxelLightField::EncodeBrickTexels(const FIntVector& Key, uint8* OutRGBA) const
+bool FVoxelLightField::EncodeBrickTexels(const FIntVector& Key, uint8* OutPos, uint8* OutNeg) const
 {
 	FRWScopeLock ScopeLock(Lock, SLT_ReadOnly);
-	return EncodeBrickTexelsUnlocked(Key, OutRGBA);
+	return EncodeBrickTexelsUnlocked(Key, OutPos, OutNeg);
 }
 
-bool FVoxelLightField::EncodeBrickTexelsUnlocked(const FIntVector& Key, uint8* OutRGBA) const
+bool FVoxelLightField::EncodeBrickTexelsUnlocked(const FIntVector& Key, uint8* OutPos, uint8* OutNeg) const
 {
-	check(OutRGBA);
+	check(OutPos && OutNeg);
 
 	const FVoxelLFBrick* Brick = FindBrick(Key);
 	// bSolved is checked as well as presence because VoxelizeChunk clears it,
@@ -512,28 +512,31 @@ bool FVoxelLightField::EncodeBrickTexelsUnlocked(const FIntVector& Key, uint8* O
 	// the intent, and the eviction path relies on the same all-zero output.
 	if (!Brick || !Brick->bSolved)
 	{
-		FMemory::Memzero(OutRGBA, BrickTexelBytes);
+		FMemory::Memzero(OutPos, BrickTexelBytes);
+		FMemory::Memzero(OutNeg, BrickTexelBytes);
 		return false;
 	}
 
 	for (int32 Idx = 0; Idx < VoxelLF::BrickCells; ++Idx)
 	{
-		uint8* Texel = OutRGBA + Idx * 4;
+		uint8* P = OutPos + Idx * 4;
+		uint8* N = OutNeg + Idx * 4;
 		if (!Brick->SolvedCells[Idx])
 		{
 			// A = 0, and RGB = 0 BECAUSE they are premultiplied by it. Any other
 			// RGB here would leak into a neighbouring texel's trilinear tap with
 			// zero weight in the denominator -- i.e. energy from nowhere.
-			Texel[0] = 0; Texel[1] = 0; Texel[2] = 0; Texel[3] = 0;
+			P[0] = 0; P[1] = 0; P[2] = 0; P[3] = 0;
+			N[0] = 0; N[1] = 0; N[2] = 0; N[3] = 0;
 			continue;
 		}
 
 		const uint8* Vis = Brick->Vis + Idx * VoxelLF::NumDirs;
-		// DirTable order: +X -X +Y -Y +Z -Z.
-		Texel[0] = Vis[4];                                                  // +Z
-		Texel[1] = Vis[5];                                                  // -Z
-		Texel[2] = uint8((uint32(Vis[0]) + Vis[1] + Vis[2] + Vis[3] + 2) / 4); // mean(+-X, +-Y)
-		Texel[3] = 255;                                                     // validity
+		// DirTable order: +X -X +Y -Y +Z -Z. The two volumes split it by SIGN, so
+		// a face reads exactly one of them and takes exactly one component --
+		// which is what makes Scheme A cost memory and not bandwidth.
+		P[0] = Vis[0]; P[1] = Vis[2]; P[2] = Vis[4]; P[3] = 255;
+		N[0] = Vis[1]; N[1] = Vis[3]; N[2] = Vis[5]; N[3] = 255;
 	}
 	return true;
 }

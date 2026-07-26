@@ -15,9 +15,25 @@ namespace
 		TEXT("voxel.GI.Volume"), 0,
 		TEXT("Sample the voxel GI light field from a GPU volume texture instead of reading it off ")
 		TEXT("baked vertex colours. 0 = off (default) and genuinely zero-cost: the vertex factory ")
-		TEXT("skips the sample and emits byte-identical vertex colours. Read on the render thread ")
-		TEXT("per frame, so it can be toggled live."),
+		TEXT("skips the sample, the texture is not even allocated, and the emitted vertex colours ")
+		TEXT("are byte-identical. Toggling it live works: UVoxelGISubsystem re-pushes the uniform ")
+		TEXT("buffer from its tick whenever any input to it changes. NOTE it needs a CONSUMER -- ")
+		TEXT("only the pooled vertex factory samples the volume, so with voxel.Stream.GPU 0 this ")
+		TEXT("allocates nothing and changes nothing."),
 		ECVF_RenderThreadSafe);
+
+	// docs/gpu-gi-volume-design.md §4. Half-width of the box the camera may move
+	// inside before the volume re-centres, in 40 UU cells. 64 -> +/-2560 UU.
+	TAutoConsoleVariable<int32> CVarGIVolumeRecentreCells(
+		TEXT("voxel.GI.VolumeRecentreCells"), 64,
+		TEXT("Dead-zone half-width for camera-following re-centring of the GI volume, in 40 UU cells. ")
+		TEXT("The volume re-centres when the camera leaves this box around the volume centre, staging ")
+		TEXT("the whole texture's worth of re-addressed texels over a few frames and swapping the ")
+		TEXT("origin uniform on exactly the frame the last upload lands. Smaller = the volume tracks ")
+		TEXT("the camera more tightly and re-centres more often (each re-centre is Dim^3*4 bytes of ")
+		TEXT("upload); larger = fewer re-centres but the camera sits further off centre. Clamped to ")
+		TEXT("leave the camera inside the volume."),
+		ECVF_Default);
 
 	TAutoConsoleVariable<int32> CVarGIVolumeDim(
 		TEXT("voxel.GI.VolumeDim"), 64,
@@ -60,62 +76,119 @@ namespace VoxelGIVolume
 	{
 		return CVarGIVolumeDebugVis.GetValueOnAnyThread();
 	}
+
+	int32 GetRecentreCells()
+	{
+		return FMath::Max(1, CVarGIVolumeRecentreCells.GetValueOnAnyThread());
+	}
 }
 
 void FVoxelGIVolume::InitRHI(FRHICommandListBase& RHICmdList)
 {
 	DimTexels = VoxelGIVolume::GetDim();
+	// The TEXTURE is deliberately not created here -- see
+	// EnsureAllocated_RenderThread. What is created is the uniform buffer, which
+	// must exist and must not contain a null member from the very first draw.
+	UpdateParameters_RenderThread(Settings);
+}
+
+void FVoxelGIVolume::EnsureAllocated_RenderThread(FRHICommandListBase& RHICmdList)
+{
+	if (VolumePos.IsValid())
+	{
+		return;
+	}
+	if (DimTexels <= 0)
+	{
+		DimTexels = VoxelGIVolume::GetDim();
+	}
 
 	// NOT ETextureCreateFlags::Dynamic, and no lock/Map path anywhere. That is
 	// the texture-side reading of gpu-pool-rendering-notes.md invariant 5, and
 	// it is avoided by construction as long as every write goes through
 	// UpdateTexture3D -- which, unlike the buffer lock path, does honour its
 	// destination offsets (verified in D3D12Texture.cpp).
-	const FRHITextureCreateDesc Desc =
-		FRHITextureCreateDesc::Create3D(TEXT("VoxelGI.Irradiance"),
+	const FRHITextureCreateDesc DescPos =
+		FRHITextureCreateDesc::Create3D(TEXT("VoxelGI.IrradiancePos"),
+		                                DimTexels, DimTexels, DimTexels,
+		                                PF_R8G8B8A8)
+			.SetFlags(ETextureCreateFlags::ShaderResource);
+	const FRHITextureCreateDesc DescNeg =
+		FRHITextureCreateDesc::Create3D(TEXT("VoxelGI.IrradianceNeg"),
 		                                DimTexels, DimTexels, DimTexels,
 		                                PF_R8G8B8A8)
 			.SetFlags(ETextureCreateFlags::ShaderResource);
 
-	Volume = RHICmdList.CreateTexture(Desc);
+	VolumePos = RHICmdList.CreateTexture(DescPos);
+	VolumeNeg = RHICmdList.CreateTexture(DescNeg);
 
 	UE_LOG(LogTemp, Log,
-	       TEXT("VoxelGI volume: dims=%dx%dx%d fmt=RGBA8 MB=%.1f coverage=+/-%.0f UU"),
+	       TEXT("VoxelGI volume: allocated 2x dims=%dx%dx%d fmt=RGBA8 (Scheme A) MB=%.1f coverage=+/-%.0f UU"),
 	       DimTexels, DimTexels, DimTexels,
-	       double(DimTexels) * DimTexels * DimTexels * 4.0 / (1024.0 * 1024.0),
+	       2.0 * double(DimTexels) * DimTexels * DimTexels * 4.0 / (1024.0 * 1024.0),
 	       0.5 * DimTexels * VoxelGIVolume::kCellSizeUU);
 
-	UpdateParameters_RenderThread(OriginPoolUU);
+	// A freshly created texture's contents are undefined, and undefined bytes in
+	// the validity channel read as "there is data here" -- i.e. arbitrary
+	// irradiance on every surface until the first upload covers that texel.
+	// Zeroing means A=0 everywhere, which the shader turns into plain AO.
+	{
+		TArray<uint8> ZeroSlab;
+		ZeroSlab.SetNumZeroed(int64(DimTexels) * DimTexels * 4);
+		for (int32 Z = 0; Z < DimTexels; ++Z)
+		{
+			const FUpdateTextureRegion3D Slab(0, 0, Z, 0, 0, 0, DimTexels, DimTexels, 1);
+			RHICmdList.UpdateTexture3D(VolumePos, 0, Slab,
+			                           uint32(DimTexels) * 4, uint32(DimTexels) * DimTexels * 4,
+			                           ZeroSlab.GetData());
+			RHICmdList.UpdateTexture3D(VolumeNeg, 0, Slab,
+			                           uint32(DimTexels) * 4, uint32(DimTexels) * DimTexels * 4,
+			                           ZeroSlab.GetData());
+		}
+	}
+
+	// Re-publish so Parameters.Volume stops pointing at GBlackVolumeTexture.
+	UpdateParameters_RenderThread(Settings);
 }
 
 void FVoxelGIVolume::ReleaseRHI()
 {
 	UniformBuffer.SafeRelease();
-	Volume.SafeRelease();
+	VolumePos.SafeRelease();
+	VolumeNeg.SafeRelease();
 	DimTexels = 0;
 }
 
-void FVoxelGIVolume::UpdateParameters_RenderThread(const FVector3f& InOriginPoolUU)
+void FVoxelGIVolume::UpdateParameters_RenderThread(const FVoxelGIVolumeSettings& InSettings)
 {
-	OriginPoolUU = InOriginPoolUU;
+	Settings = InSettings;
 
-	const bool bEnabled = VoxelGIVolume::IsEnabled() && Volume.IsValid();
+	const bool bEnabled = Settings.bEnabled && VolumePos.IsValid() && VolumeNeg.IsValid();
 	const float ExtentUU = FMath::Max(1.0f, float(DimTexels) * VoxelGIVolume::kCellSizeUU);
 
 	FVoxelGIVolumeParameters Parameters;
 	// Never null even when off -- an unbound member of a uniform buffer is a
 	// validation failure, not a tolerated no-op (the factory's own buffer
 	// documents the same rule for its SRVs).
-	Parameters.Volume = bEnabled ? Volume.GetReference() : GBlackVolumeTexture->TextureRHI.GetReference();
+	Parameters.VolumePos = bEnabled ? VolumePos.GetReference() : GBlackVolumeTexture->TextureRHI.GetReference();
+	Parameters.VolumeNeg = bEnabled ? VolumeNeg.GetReference() : GBlackVolumeTexture->TextureRHI.GetReference();
 	Parameters.VolumeSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-	Parameters.OriginPoolUU = OriginPoolUU;
+	Parameters.OriginPoolUU = Settings.OriginPoolUU;
 	Parameters.InvSizeUU = FVector3f(1.0f / ExtentUU);
-	Parameters.Strength = 1.0f;
-	Parameters.AmbientFloor = 0.06f;
-	Parameters.FadeStartUU = 0.35f * ExtentUU;
-	Parameters.FadeEndUU = 0.45f * ExtentUU;
+	Parameters.FadeCentrePoolUU = Settings.FadeCentrePoolUU;
+	// SUPPLIED, not invented here. Until Wave B these four were hardcoded to
+	// 1.0 / 0.06 and to fractions of the volume extent, which (a) silently
+	// ignored voxel.GI.Strength and voxel.GI.AmbientFloor and (b) made the fade
+	// radii shrink with voxel.GI.VolumeDim while the CPU path kept using
+	// 4800/6400 -- the design doc's risk 8, live, as a plausible-looking
+	// lighting ring at the volume face.
+	Parameters.Strength = Settings.Strength;
+	Parameters.AmbientFloor = Settings.AmbientFloor;
+	Parameters.FadeStartUU = Settings.FadeStartUU;
+	Parameters.FadeEndUU = Settings.FadeEndUU;
+	Parameters.CellSizeUU = VoxelGIVolume::kCellSizeUU;
 	Parameters.Enabled = bEnabled ? 1u : 0u;
-	Parameters.DebugVis = uint32(FMath::Max(0, VoxelGIVolume::GetDebugVis()));
+	Parameters.DebugVis = uint32(FMath::Max(0, Settings.DebugVis));
 
 	// MultiFrame, not SingleFrame: this is rebuilt when the volume re-centres or
 	// a cvar moves, not every frame, so a single-frame lifetime would free it
@@ -126,7 +199,7 @@ void FVoxelGIVolume::UpdateParameters_RenderThread(const FVector3f& InOriginPool
 
 void FVoxelGIVolume::FillCheckerboard_RenderThread(FRHICommandListBase& RHICmdList)
 {
-	if (!Volume.IsValid() || DimTexels <= 0)
+	if (!VolumePos.IsValid() || DimTexels <= 0)
 	{
 		return;
 	}
@@ -161,7 +234,11 @@ void FVoxelGIVolume::FillCheckerboard_RenderThread(FRHICommandListBase& RHICmdLi
 		}
 
 		const FUpdateTextureRegion3D Region(0, 0, Z, 0, 0, 0, DimTexels, DimTexels, 1);
-		RHICmdList.UpdateTexture3D(Volume, /*MipIndex*/ 0, Region,
+		RHICmdList.UpdateTexture3D(VolumePos, /*MipIndex*/ 0, Region,
+		                           /*SourceRowPitch*/ uint32(DimTexels) * 4,
+		                           /*SourceDepthPitch*/ uint32(DimTexels) * DimTexels * 4,
+		                           Slab.GetData());
+		RHICmdList.UpdateTexture3D(VolumeNeg, /*MipIndex*/ 0, Region,
 		                           /*SourceRowPitch*/ uint32(DimTexels) * 4,
 		                           /*SourceDepthPitch*/ uint32(DimTexels) * DimTexels * 4,
 		                           Slab.GetData());
@@ -174,9 +251,9 @@ void FVoxelGIVolume::FillCheckerboard_RenderThread(FRHICommandListBase& RHICmdLi
 
 void FVoxelGIVolume::UpdateTexels_RenderThread(FRHICommandListBase& RHICmdList,
                                                const FIntVector& DestMin, const FIntVector& Size,
-                                               const uint8* SrcRGBA)
+                                               const uint8* SrcPos, const uint8* SrcNeg)
 {
-	if (!Volume.IsValid() || DimTexels <= 0 || !SrcRGBA)
+	if (!VolumePos.IsValid() || !VolumeNeg.IsValid() || DimTexels <= 0 || !SrcPos || !SrcNeg)
 	{
 		return;
 	}
@@ -200,10 +277,14 @@ void FVoxelGIVolume::UpdateTexels_RenderThread(FRHICommandListBase& RHICmdList,
 	const FUpdateTextureRegion3D Region(uint32(DestMin.X), uint32(DestMin.Y), uint32(DestMin.Z),
 	                                    0, 0, 0,
 	                                    uint32(Size.X), uint32(Size.Y), uint32(Size.Z));
-	RHICmdList.UpdateTexture3D(Volume, /*MipIndex*/ 0, Region,
+	RHICmdList.UpdateTexture3D(VolumePos, /*MipIndex*/ 0, Region,
 	                           /*SourceRowPitch*/ uint32(Size.X) * 4,
 	                           /*SourceDepthPitch*/ uint32(Size.X) * uint32(Size.Y) * 4,
-	                           SrcRGBA);
+	                           SrcPos);
+	RHICmdList.UpdateTexture3D(VolumeNeg, /*MipIndex*/ 0, Region,
+	                           /*SourceRowPitch*/ uint32(Size.X) * 4,
+	                           /*SourceDepthPitch*/ uint32(Size.X) * uint32(Size.Y) * 4,
+	                           SrcNeg);
 }
 
 namespace
@@ -230,11 +311,23 @@ namespace
 		       VoxelGIVolume::IsEnabled() ? 1 : 0, VoxelGIVolume::GetDebugVis(), Dim,
 		       OriginPoolUU.X, OriginPoolUU.Y, OriginPoolUU.Z);
 
+		FVoxelGIVolumeSettings TestSettings;
+		TestSettings.bEnabled = VoxelGIVolume::IsEnabled();
+		TestSettings.DebugVis = VoxelGIVolume::GetDebugVis();
+		TestSettings.OriginPoolUU = OriginPoolUU;
+		TestSettings.FadeCentrePoolUU = FVector3f::ZeroVector;
+		// No fade at all for the bring-up pattern: a checkerboard that dims
+		// toward the edges is harder to read than one that does not, and the
+		// point of this rung is addressing, not shading.
+		TestSettings.FadeStartUU = 1.0e9f;
+		TestSettings.FadeEndUU = 1.0e9f + 1.0f;
+
 		ENQUEUE_RENDER_COMMAND(VoxelGIVolumeTest)(
-			[OriginPoolUU](FRHICommandListImmediate& RHICmdList)
+			[TestSettings](FRHICommandListImmediate& RHICmdList)
 		{
+			GVoxelGIVolume.EnsureAllocated_RenderThread(RHICmdList);
 			GVoxelGIVolume.FillCheckerboard_RenderThread(RHICmdList);
-			GVoxelGIVolume.UpdateParameters_RenderThread(OriginPoolUU);
+			GVoxelGIVolume.UpdateParameters_RenderThread(TestSettings);
 		});
 	}
 

@@ -401,10 +401,78 @@ FMaterialPixelParameters GetMaterialPixelParameters(
 	// With Enabled=0 this whole block is skipped and G is byte-identical to what
 	// it was before this feature existed.
 	half4 VertexColorWithGI = Interpolants.Color;
-	if (VoxelGIVol.Enabled != 0u)
+	// OUTSIDE THE VOLUME, DO NOT SAMPLE AT ALL.
+	//
+	// This is the majority of the frame, not an edge case: the volume covers
+	// +/-N*20 UU (38.4 m at VolumeDim 192) out of a 2 km cascade, so most pixels
+	// on screen are outside it. The sampler is AM_Clamp on all three axes, so a
+	// lookup out there returns the FACE texel rather than nothing -- which is
+	// what step 1 saw as "large smeared bands" and mistook for an addressing bug.
+	// Skipping is not an approximation: the fade is clamped to end inside the
+	// half-extent, so Weight is already 0 wherever this branch fires. What it
+	// buys is the sample itself, one to three of them, on every pixel outside the
+	// volume AND in the depth pass, which this masked material also runs.
+	const float3 GIUVW = Interpolants.GIUVW;
+	const bool bInsideVolume = all(GIUVW > 0.0f) && all(GIUVW < 1.0f);
+	if (VoxelGIVol.Enabled != 0u && bInsideVolume)
 	{
-		const float4 T = Texture3DSampleLevel(VoxelGIVol.Volume, VoxelGIVol.VolumeSampler,
-		                                      Interpolants.GIUVW, 0);
+		// THREE probe offsets, not one, matching FVoxelLightField's
+		// kProbeOffsets {0.6, 1.25, 2.0} cells term for term.
+		//
+		// The single 0.6-cell probe this used to do is not a cheaper
+		// approximation of the CPU sampler, it is a DIFFERENT one, and the
+		// difference is concentrated exactly where GI matters: a 20 cm roof slab
+		// is half a light-field cell thick, so a 0.6-cell push-out along the
+		// normal frequently stays inside the slab's own solid cell, finds nothing
+		// solved, and falls back to plain AO -- while the CPU walks on to 1.25 and
+		// 2.0 cells and finds data. That asymmetry is precisely the roof-underside
+		// defect this module already fixed once on the CPU side, and it would have
+		// reappeared as a lighting seam at the voxel.Stream.GPUMaxLevel boundary.
+		//
+		// The VS hands over the first probe's UVW; the extra offsets are the same
+		// step along the world normal, which the pool's pure-translation transform
+		// makes usable directly. Costs nothing on a hit -- the later samples only
+		// execute where the first one missed, which is a small minority of pixels.
+		const float3 N = float3(Interpolants.TangentToWorld2.xyz);
+		const float3 StepUVW = N * VoxelGIVol.CellSizeUU * VoxelGIVol.InvSizeUU;
+
+		// SCHEME A slot selection. VolumePos holds (Vis[+X], Vis[+Y], Vis[+Z], v)
+		// and VolumeNeg holds (Vis[-X], Vis[-Y], Vis[-Z], v), so the face's own
+		// direction picks the volume by SIGN and the component by AXIS -- one
+		// sample, one channel, exact.
+		//
+		// This is what makes Scheme A cost memory and nothing else. The design
+		// doc lists it as "two samples", but that is the cost for a general
+		// normal; every greedy-mesh normal is axis-aligned, so exactly one
+		// ambient-cube slot is ever selected and the other volume is never read.
+		// Scheme B collapsed the four horizontals to their mean to save the
+		// second texture, and measured 2.6x over the doc's own RMS bar, worst on
+		// side faces beside vertical occluders -- most of a cave wall.
+		const float3 AbsN = abs(N);
+		const bool bAxisX = AbsN.x > 0.5f;
+		const bool bAxisY = !bAxisX && AbsN.y > 0.5f;
+		const float NAxis = bAxisX ? N.x : (bAxisY ? N.y : N.z);
+		const bool bPositive = NAxis > 0.0f;
+
+		float3 ProbeUVW = Interpolants.GIUVW;
+		float4 T = bPositive
+			? Texture3DSampleLevel(VoxelGIVol.VolumePos, VoxelGIVol.VolumeSampler, ProbeUVW, 0)
+			: Texture3DSampleLevel(VoxelGIVol.VolumeNeg, VoxelGIVol.VolumeSampler, ProbeUVW, 0);
+		if (T.a <= 1.0e-3f)
+		{
+			ProbeUVW = Interpolants.GIUVW + StepUVW * 0.65f;   // 1.25 cells total
+			T = bPositive
+				? Texture3DSampleLevel(VoxelGIVol.VolumePos, VoxelGIVol.VolumeSampler, ProbeUVW, 0)
+				: Texture3DSampleLevel(VoxelGIVol.VolumeNeg, VoxelGIVol.VolumeSampler, ProbeUVW, 0);
+		}
+		if (T.a <= 1.0e-3f)
+		{
+			ProbeUVW = Interpolants.GIUVW + StepUVW * 1.4f;    // 2.0 cells total
+			T = bPositive
+				? Texture3DSampleLevel(VoxelGIVol.VolumePos, VoxelGIVol.VolumeSampler, ProbeUVW, 0)
+				: Texture3DSampleLevel(VoxelGIVol.VolumeNeg, VoxelGIVol.VolumeSampler, ProbeUVW, 0);
+		}
+
 		// A is the validity weight, and dividing by it is what makes hardware
 		// trilinear reproduce the CPU sampler's "skip unsolved taps and
 		// renormalise by the surviving weight" EXACTLY rather than approximately
@@ -413,15 +481,27 @@ FMaterialPixelParameters GetMaterialPixelParameters(
 		const float W = T.a;
 		if (W > 1.0e-3f)
 		{
-			// Ambient-cube slot from the face normal. Every greedy-mesh normal is
-			// axis-aligned, so exactly one slot is selected and the floor/ceiling
-			// distinction the light field exists for is preserved.
-			const float Nz = Interpolants.TangentToWorld2.z;
-			const float Irr = ((Nz > 0.5f) ? T.r : ((Nz < -0.5f) ? T.g : T.b)) / W;
+			// The volume was already chosen by the normal's sign above, so all that
+			// is left is the axis: X -> r, Y -> g, Z -> b. Every direction is
+			// stored exactly, so unlike Scheme B there is no "and the four
+			// horizontals share a channel" caveat here.
+			const float Irr = (bAxisX ? T.r : (bAxisY ? T.g : T.b)) / W;
 
-			// Distance to the volume centre, recovered from the UVW rather than
-			// carried as a second interpolant.
-			const float DistUU = length((Interpolants.GIUVW - 0.5f) / VoxelGIVol.InvSizeUU);
+			// Distance from this pixel to the CAMERA, which is what the CPU shade
+			// measures (Dist(WorldPos, GICentreUU)). NOT the distance to the
+			// volume centre, which is what this used to compute: the volume origin
+			// only follows the camera to within the re-centring dead zone
+			// (voxel.GI.VolumeRecentreCells, 2560 UU by default), so measuring
+			// from it slides the whole fade band by up to that much and puts a
+			// slowly moving brightness gradient on stationary geometry.
+			//
+			// The pixel's own pool-space position is recovered from the UVW rather
+			// than carried as a second interpolant -- and it must be the FIRST
+			// probe's UVW, not whichever fallback hit, so the fade does not step
+			// by a cell where the fallback engages.
+			const float3 ProbePoolUU = Interpolants.GIUVW / VoxelGIVol.InvSizeUU
+			                         + VoxelGIVol.OriginPoolUU;
+			const float DistUU = length(ProbePoolUU - VoxelGIVol.FadeCentrePoolUU);
 			const float Fade = 1.0f - saturate((DistUU - VoxelGIVol.FadeStartUU)
 			                                 / max(1.0f, VoxelGIVol.FadeEndUU - VoxelGIVol.FadeStartUU));
 			const float Ambient = lerp(VoxelGIVol.AmbientFloor, 1.0f, saturate(Irr));
