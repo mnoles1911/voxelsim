@@ -795,6 +795,15 @@ failure mode as the retracted G5 numbers.
   their own timers, which static mode then overwrites on the next tick.
   **`-VoxelPerfStaticAt=X,Y,Z` (UU)** closes that, and takes UU rather than
   metres so the pose `-VoxelFloodTest` prints can be copied verbatim.
+  **Status: compiles; its abort-on-malformed branch is confirmed working in a
+  live run; the pin itself is NOT yet exercised end to end.** The abort fired for
+  real on the first attempt — `FParse::Value`'s default terminator set includes
+  `,`, so `-VoxelPerfStaticAt=42030,21000,96062` was read as `42030`, exactly the
+  trap `ParseSpawnColumnUU` documents for `-VoxelSpawnAt`
+  (`VoxelEarthGameMode.cpp:37-41`). Fixed with `bShouldStopOnSeparator=false`.
+  Without the abort the fixture would have silently pinned at the surface spawn
+  and produced a perfectly plausible "cavern lake" measurement of a mountaintop.
+  Re-run the pin before trusting any leg.
 - The scene: `-VoxelFloodTest=70` locates the flooded cavern at lake surface
   `(42000, 21000, 95848)` UU and reports its shore pose as
   `(42030, 21000, 96062) rot(pitch −25, yaw 0)` — reproduced this session, with

@@ -73,8 +73,22 @@ void UVoxelPerfRunSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 				// UU rather than metres deliberately: the pose this is meant to
 				// reproduce is the one the flood-test fixture prints, and that line
 				// is in UU. Copying it verbatim is the point.
+				// bShouldStopOnSeparator=false for the reason
+				// VoxelEarthGameMode.cpp's ParseSpawnColumnUU spells out for
+				// -VoxelSpawnAt=X,Y: FParse::Value's default terminator set
+				// includes ',', so it truncates "X,Y,Z" at the first comma and
+				// hands back "X". This switch's value is the whole triple, so
+				// read to the next whitespace instead.
+				//
+				// Reproduced here before the flag was added -- the first run
+				// aborted with "-VoxelPerfStaticAt=42030 is not X,Y,Z in UU",
+				// which is precisely what the abort-rather-than-fall-back
+				// branch below exists for: without it the fixture would have
+				// pinned at the surface spawn and produced a perfectly
+				// plausible cavern-lake measurement of the wrong scene.
 				FString StaticAt;
-				if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfStaticAt="), StaticAt))
+				if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfStaticAt="), StaticAt,
+				                  /*bShouldStopOnSeparator=*/false))
 				{
 					TArray<FString> Parts;
 					StaticAt.ParseIntoArray(Parts, TEXT(","), /*InCullEmpty*/ true);
