@@ -42,6 +42,22 @@ namespace
 	// comparable across the two toolchains.
 	constexpr uint64 kSeed = 20260719;
 
+	// Digest of the CPU REFERENCE over both fixture regions — same fields, same
+	// order as the GPU digest, but folded from vxc::Amplifier / vxc::meshBrick
+	// instead of from the readback. Nothing about the GPU enters it.
+	//
+	// It exists to answer "which side moved?" before anyone reads a per-cell
+	// mismatch. Re-pin it ONLY on a deliberate vxc::kWorldGenVersion bump, and
+	// in the same commit as the worldgen.ush re-mirror and the SPIR-V respin.
+	// Pinned at kWorldGenVersion 8, measured 2026-07-26 against
+	// build/voxel-core-msvc/voxelcore.lib rebuilt from main @ a416a8b.
+	//
+	// It coincides with the GPU digest today, and must: when the gate passes,
+	// the two folds see identical bytes. The value is still worth pinning
+	// separately, because GPU-vs-CPU equality cannot detect BOTH sides moving
+	// together — which is the shape of every worldgen-version accident.
+	constexpr uint64 kExpectedCpuDigest = 0x6e893ab3679a8c81ull;
+
 	struct FRegionSpec
 	{
 		const TCHAR* Name;
@@ -121,6 +137,27 @@ namespace
 		int64 Gpu;
 	};
 
+	// Mismatch counts split by WHICH STAGE disagreed, uncapped.
+	//
+	// THIS SPLIT IS THE POINT, and it is here because its absence produced a
+	// published wrong diagnosis. When the gate went red in July 2026 the
+	// printed list was capped at 20 and was quoted into docs/backlog.md with
+	// only its `cell(...)` lines; the `col(...).topsoilMm` lines above them
+	// were dropped, and the entry then asserted "all 4,096 columns match" —
+	// which pointed the whole investigation at the compiled kernel when the
+	// actual fault was a stale voxelcore.lib whose CPU worldgen predated the
+	// v8 climate landing. Column fields disagreeing is a completely different
+	// failure from cells-only disagreeing, so print the classification rather
+	// than leaving it to be inferred from a truncated list.
+	struct FTally
+	{
+		int64 Columns = 0;
+		int64 Cells = 0;
+		int64 Quads = 0;
+
+		int64 Total() const { return Columns + Cells + Quads; }
+	};
+
 	// Compares one region and folds its output into the running digest, in the
 	// bench's exact order: per column, the five column fields then that
 	// column's whole vertical cell stack; then, after every column, the quads.
@@ -131,6 +168,8 @@ namespace
 	                   const FVoxelGpuRegionResult& Gpu,
 	                   const TArray<vxc::ColumnSample>& CpuColumns,
 	                   vxc::Digest& Digest,
+	                   vxc::Digest& CpuDigest,
+	                   FTally& Tally,
 	                   TArray<FMismatch>& OutMismatches)
 	{
 		constexpr int32 kMaxMismatchesPrinted = 20;
@@ -151,14 +190,25 @@ namespace
 				Digest.u32(static_cast<uint32_t>(G.BedrockDepthMm));
 				Digest.u8(static_cast<uint8_t>(G.SurfaceMat));
 
+				// Same fields, same order, from the CPU side. See kExpectedCpuDigest.
+				CpuDigest.u32(static_cast<uint32_t>(C.surfaceMm));
+				CpuDigest.u32(static_cast<uint32_t>(C.topsoilMm));
+				CpuDigest.u32(static_cast<uint32_t>(C.subsoilMm));
+				CpuDigest.u32(static_cast<uint32_t>(C.bedrockDepthMm));
+				CpuDigest.u8(static_cast<uint8_t>(C.surfaceMat));
+
 				const auto Record = [&](const TCHAR* Field, int64 CpuVal, int64 GpuVal)
 				{
-					if (CpuVal != GpuVal && OutMismatches.Num() < kMaxMismatchesPrinted)
+					if (CpuVal != GpuVal)
 					{
-						OutMismatches.Add({ FString::Printf(TEXT("col(%d,%d).%s"),
-						                                    int32(Region.OriginVx + X),
-						                                    int32(Region.OriginVy + Y), Field),
-						                    CpuVal, GpuVal });
+						++Tally.Columns;
+						if (OutMismatches.Num() < kMaxMismatchesPrinted)
+						{
+							OutMismatches.Add({ FString::Printf(TEXT("col(%d,%d).%s"),
+							                                    int32(Region.OriginVx + X),
+							                                    int32(Region.OriginVy + Y), Field),
+							                    CpuVal, GpuVal });
+						}
 					}
 				};
 				Record(TEXT("surfaceMm"), C.surfaceMm, G.SurfaceMm);
@@ -182,12 +232,17 @@ namespace
 						const uint8 GpuMat = static_cast<uint8>(Gpu.Cells[CellIdx] & 0xffu);
 
 						Digest.u8(GpuMat);
-						if (CpuMat != GpuMat && OutMismatches.Num() < kMaxMismatchesPrinted)
+						CpuDigest.u8(CpuMat);
+						if (CpuMat != GpuMat)
 						{
-							OutMismatches.Add({ FString::Printf(TEXT("cell(%d,%d,vz=%lld)"),
-							                                    int32(Region.OriginVx + X),
-							                                    int32(Region.OriginVy + Y), Vz),
-							                    CpuMat, GpuMat });
+							++Tally.Cells;
+							if (OutMismatches.Num() < kMaxMismatchesPrinted)
+							{
+								OutMismatches.Add({ FString::Printf(TEXT("cell(%d,%d,vz=%lld)"),
+								                                    int32(Region.OriginVx + X),
+								                                    int32(Region.OriginVy + Y), Vz),
+								                    CpuMat, GpuMat });
+							}
 						}
 					}
 				}
@@ -249,19 +304,27 @@ namespace
 						Digest.u8(GU0);    Digest.u8(GV0);   Digest.u8(GW);
 						Digest.u8(GH);     Digest.u8(GAo);   Digest.u8(GMat);
 
+						CpuDigest.u8(Q.axis);  CpuDigest.u8(Q.positive); CpuDigest.u8(Q.slice);
+						CpuDigest.u8(Q.u0);    CpuDigest.u8(Q.v0);       CpuDigest.u8(Q.w);
+						CpuDigest.u8(Q.h);     CpuDigest.u8(Q.ao);       CpuDigest.u8(uint8(Q.mat));
+
 						const bool bSame = GAxis == Q.axis && GDir == Q.positive
 						                && GSlice == Q.slice && GU0 == Q.u0 && GV0 == Q.v0
 						                && GW == Q.w && GH == Q.h && GAo == Q.ao
 						                && GMat == uint8(Q.mat);
-						if (!bSame && OutMismatches.Num() < kMaxMismatchesPrinted)
+						if (!bSame)
 						{
-							OutMismatches.Add({
-								FString::Printf(TEXT("quad[%u] brick(%u,%u,%u) cpu(ax%u d%u s%u ")
-								                TEXT("u%u v%u w%u h%u ao%u m%u)"),
-								                GpuCursor, Ix, Iy, Iz,
-								                Q.axis, Q.positive, Q.slice, Q.u0, Q.v0,
-								                Q.w, Q.h, Q.ao, uint32(Q.mat)),
-								int64(Q.axis), int64(GAxis) });
+							++Tally.Quads;
+							if (OutMismatches.Num() < kMaxMismatchesPrinted)
+							{
+								OutMismatches.Add({
+									FString::Printf(TEXT("quad[%u] brick(%u,%u,%u) cpu(ax%u d%u s%u ")
+									                TEXT("u%u v%u w%u h%u ao%u m%u)"),
+									                GpuCursor, Ix, Iy, Iz,
+									                Q.axis, Q.positive, Q.slice, Q.u0, Q.v0,
+									                Q.w, Q.h, Q.ao, uint32(Q.mat)),
+									int64(Q.axis), int64(GAxis) });
+							}
 						}
 						++GpuCursor;
 					}
@@ -271,6 +334,7 @@ namespace
 
 		if (GpuCursor != Gpu.NumQuads)
 		{
+			++Tally.Quads;
 			OutMismatches.Add({ TEXT("quad count"), int64(GpuCursor), int64(Gpu.NumQuads) });
 		}
 
@@ -427,6 +491,8 @@ namespace
 		vxc::Amplifier CpuAmp(kSeed, CpuTiles);
 
 		vxc::Digest Digest;
+		vxc::Digest CpuDigest;
+		FTally Tally;
 		TArray<FMismatch> Mismatches;
 		bool bAllOk = true;
 		double TotalMs = 0.0;
@@ -465,7 +531,8 @@ namespace
 			       Req.RasterSize.X, Req.RasterSize.Y, Req.BrickZMin,
 			       Req.BrickZMin + int32(Req.BricksZ) - 1, Ms);
 
-			bAllOk &= CompareRegion(Region, Req, Gpu, CpuColumns, Digest, Mismatches);
+			bAllOk &= CompareRegion(Region, Req, Gpu, CpuColumns, Digest, CpuDigest, Tally,
+			                        Mismatches);
 
 			// G2 decode check, over this region's real quad stream. Level 0,
 			// so LevelScale is 1.
@@ -491,10 +558,77 @@ namespace
 
 		// vxc::Digest exposes its FNV-1a accumulator directly as `h`.
 		const uint64 Value = Digest.h;
+		const uint64 CpuValue = CpuDigest.h;
+
+		// WHICH SIDE MOVED. Run this before printing anything about the GPU.
+		//
+		// The CPU digest is a pure function of the LINKED voxel-core, over
+		// fixtures this file pins itself. If it is not the pinned value then
+		// the reference this gate compares against is not the one the kernel
+		// mirrors, and every per-cell "cpu=N gpu=M" line below is a version
+		// skew, not a toolchain divergence. That is exactly what happened in
+		// July 2026: voxelcore.lib predated the worldgen v8 CPU landing while
+		// Unreal compiled the current worldgen.ush, and the resulting cell
+		// mismatches were published twice as a shader-compilation fault.
+		//
+		// Only meaningful over BOTH fixture regions, so it is skipped when a
+		// single region was requested.
+		bool bCpuReferenceSuspect = false;
+		if (Only < 0)
+		{
+			if (CpuValue != kExpectedCpuDigest)
+			{
+				bCpuReferenceSuspect = true;
+				bAllOk = false;
+				UE_LOG(LogVoxelGpuVerify, Error,
+				       TEXT("CPU REFERENCE DIGEST MISMATCH: got %016llx, expected %016llx ")
+				       TEXT("(vxc::kWorldGenVersion = %u). The linked voxelcore.lib is NOT the ")
+				       TEXT("worldgen this gate is pinned to — rebuild it before reading ")
+				       TEXT("anything below:  cmake --build build/voxel-core-msvc --config Release"),
+				       CpuValue, kExpectedCpuDigest, vxc::kWorldGenVersion);
+			}
+			else
+			{
+				UE_LOG(LogVoxelGpuVerify, Log,
+				       TEXT("CPU reference digest: %016llx (matches the pinned value; ")
+				       TEXT("vxc::kWorldGenVersion = %u)"), CpuValue, vxc::kWorldGenVersion);
+			}
+		}
+
+		if (Tally.Total() > 0)
+		{
+			UE_LOG(LogVoxelGpuVerify, Error,
+			       TEXT("Mismatches by stage: %lld column field(s), %lld cell(s), %lld quad(s)."),
+			       Tally.Columns, Tally.Cells, Tally.Quads);
+			if (Tally.Columns > 0)
+			{
+				UE_LOG(LogVoxelGpuVerify, Error,
+				       TEXT("  COLUMN FIELDS DIFFER. ColumnMain and vxc::Amplifier::column ")
+				       TEXT("disagree, so this is not a mesher or voxelize fault. If the CPU ")
+				       TEXT("reference digest above also failed, it is a stale voxelcore.lib; ")
+				       TEXT("otherwise worldgen.ush has drifted from the CPU worldgen and needs ")
+				       TEXT("re-mirroring."));
+			}
+			else if (Tally.Cells > 0)
+			{
+				UE_LOG(LogVoxelGpuVerify, Error,
+				       TEXT("  CELLS ONLY. Columns agree, so ColumnMain is fine and the fault is ")
+				       TEXT("in VoxelizeMain's stratigraphy/cave/cavern path or in the ")
+				       TEXT("BrickZMin/BricksZ it received."));
+			}
+			if (bCpuReferenceSuspect)
+			{
+				UE_LOG(LogVoxelGpuVerify, Error,
+				       TEXT("  Do NOT diagnose the shader toolchain until the CPU reference ")
+				       TEXT("digest above matches."));
+			}
+		}
 
 		if (!Mismatches.IsEmpty())
 		{
-			UE_LOG(LogVoxelGpuVerify, Error, TEXT("First %d mismatch(es):"), Mismatches.Num());
+			UE_LOG(LogVoxelGpuVerify, Error, TEXT("First %d mismatch(es) (in comparison order — ")
+			       TEXT("column fields precede that column's cells; do not quote a subset):"),
+			       Mismatches.Num());
 			for (const FMismatch& M : Mismatches)
 			{
 				UE_LOG(LogVoxelGpuVerify, Error, TEXT("    %s: cpu=%lld gpu=%lld"),
@@ -507,6 +641,15 @@ namespace
 			UE_LOG(LogVoxelGpuVerify, Log,
 			       TEXT("PASS: Unreal-compiled GPU output is bit-exact with the CPU reference ")
 			       TEXT("(%.1f ms total)"), TotalMs);
+		}
+		else if (Tally.Total() == 0 && bCpuReferenceSuspect)
+		{
+			// The two sides agree with each other and disagree with the pinned
+			// baseline — i.e. both moved together. Say so, because "GPU differs
+			// from the CPU reference" would be a false statement here.
+			UE_LOG(LogVoxelGpuVerify, Error,
+			       TEXT("FAIL: GPU and CPU agree with each other but not with the pinned ")
+			       TEXT("worldgen baseline — the whole reference moved, not one leg of it"));
 		}
 		else
 		{

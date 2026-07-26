@@ -9,6 +9,10 @@
 #include "DataDrivenShaderPlatformInfo.h"
 #include "RenderingThread.h"
 
+// For vxc::kWorldGenVersion, which ModifyCompilationEnvironment hands to
+// worldgen.ush as the version half of the mirror contract.
+#include "voxelcore/core.h"
+
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelGpu, Log, All);
 
 // The virtual path every kernel is compiled from. VoxelWorldGen.usf is a
@@ -83,6 +87,18 @@ namespace
 			// conventions. Nothing else about the shader changes — see the
 			// long comment at the top of worldgen.ush.
 			OutEnvironment.SetDefine(TEXT("VXC_UE"), 1);
+
+			// Version lock. worldgen.ush #errors if this disagrees with its own
+			// VXC_WORLDGEN_VERSION_USH, so a CPU worldgen change that never got
+			// mirrored into HLSL fails the shader compile instead of surfacing
+			// as per-cell material mismatches in voxel.GPU.VerifyRegion — which
+			// is how this one produced two published wrong root causes.
+			//
+			// It is also load-bearing as a cache key: defines feed the shader
+			// map hash, so bumping vxc::kWorldGenVersion guarantees a recompile
+			// rather than a silent reuse of the previous version's bytecode.
+			OutEnvironment.SetDefine(TEXT("VXC_WORLDGEN_VERSION_CPP"),
+			                         uint32(vxc::kWorldGenVersion));
 		}
 	};
 
