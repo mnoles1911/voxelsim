@@ -294,29 +294,34 @@ pose. Start from `-VoxelFloodTest` / `Tools/capture_terrain_shots.ps1`. Until
 then make no frame-time claim in either direction, including a negative one.
 Full write-up in `docs/streaming-handoff.md`.
 
-**GI volume steps 3-5 — LANDED (Wave B, 2026-07-26), with two corrections and
-one escalation.** Steps 0-2 had landed: the pooled path feeds the light field,
+**GI volume steps 3-5 — LANDED (Wave B, 2026-07-26), with three corrections.** Steps 0-2 had landed: the pooled path feeds the light field,
 the volume is sampled per pixel, and the encode matches the CPU sampler at
 **0.000 mean error** (with a deliberate half-cell-shifted control to prove the
 harness is not comparing a thing against itself). Steps 3-5 are now done; the
 full write-up with every number and how it was measured is the Wave B section of
 `docs/gpu-waves-plan.md`. The three things worth carrying here:
 
-- **(3) Scheme B stays, but "free quality" is measured as FALSE.** The design
-  doc's bar is a horizontal mean under 8/255. At the settled field (2,212 bricks)
-  it is **9.5**, not the 5.950/6.165 on record — and those two transcripts are
-  now reconciled: two legs on one build agree to ±0.17 bytes, so the harness is
-  precise and the figure tracks **how settled the field was** (1,947 vs 2,212
-  resident bricks). Quote the brick count beside the error or the number means
-  nothing. More importantly the mean was the wrong statistic: the distribution is
-  **bimodal** (p50 ≈ 0.02, p95 ≈ 52, max 105), because Scheme B stores the four
-  horizontal directions as their mean and is therefore exact where they agree and
-  badly wrong where they do not — which is precisely a side face beside a
-  vertical occluder, i.e. most of a cave wall. Kept for memory and sample count,
-  not because the quality cost is negligible. **The trade the design's table does
-  not show: Scheme A at N=192 costs 56.6 MB, less than Scheme B at N=256's
-  67.1 MB**, buying exactness everywhere at the price of reach. That is an
-  appearance judgement and is on the manual checklist (§6c).
+- **(3) Scheme A, not Scheme B - the recorded bar was never passed.**
+  `gpu-gi-volume-design.md:100-103` asks for an **RMS** under ~8/255. The figures
+  on record (5.950, 6.165) are **mean-abs** compared against an RMS threshold.
+  Measured RMS at the settled field is **20.4-21.1**, i.e. Scheme B misses the
+  actual bar by **2.6x** and always did. The distribution is bimodal (p50 ~ 0.02,
+  p95 ~ 52, max 105) because Scheme B stores the four horizontal directions as
+  their mean: exact where they agree, worst where they disagree - a side face
+  beside a vertical occluder, i.e. most of a cave wall. The two transcripts that
+  disagreed in the tree are also reconciled: two legs on one build agree to
+  +/-0.17 bytes, so the harness is precise and the figure tracks how settled the
+  field was (1,947 vs 2,212 resident bricks). Quote the brick count beside the
+  error or the number means nothing.
+  Section 2's **"two samples"** cost for Scheme A **does not apply to this mesh**.
+  Scheme A stores (+X,+Y,+Z,v) and (-X,-Y,-Z,v); section 2 itself establishes that
+  every greedy-mesh normal is axis-aligned, so a face needs exactly **one** of the
+  two textures. Scheme A costs memory and nothing else. And the configuration that
+  settles it is missing from the sizing table: **Scheme A at N=192 is 56.6 MB,
+  less VRAM and less RAM than Scheme B at N=256 (67.1 MB), which the design
+  already recommends** - exact walls everywhere, at the price of 13 m of reach.
+  Owed before this is final: a screenshot of the wall+roof fixture, which is the
+  geometry the error concentrates on.
 - **(5) The retirable cost does not exist, and this is the third statement of
   this item.** The roadmap said "stop re-meshing to refresh lighting on the
   pooled path"; `gpu-waves-plan.md` corrected that to "the component path's 5×5×5

@@ -365,19 +365,57 @@ A mean of 6 or 9 averages those two populations and describes neither. §2 asked
 for an RMS and got a mean-abs; the harness now reports both, plus percentiles and
 the fraction over the bar.
 
-**Decision: keep Scheme B, and escalate rather than close.** The reasons are
-memory and sample count, not quality: Scheme A is 2 × RGBA8, so 134.2 MB at
-N=256 against the geometry pool's own 112 MB, and it doubles a sample the depth
-pass also pays. But "free quality" is now measured as false, so the honest record
-is that this is a **cost decision taken with the quality cost quantified**, not a
-finding that the cost is negligible.
+**4. On the statistic §2 actually asked for, Scheme B fails by 2.6× — and always
+did.** §2's words are *"report `RMS(Vis[±X], Vis[±Y] − their mean)` in irradiance
+bytes. Under ~8/255 means Scheme B is free quality."* **The bar is an RMS.** The
+harness reported a mean-abs and it was compared against the RMS threshold as
+though the two were interchangeable. Measured RMS is **20.4–21.1**. So the
+5.950/6.165 readings on record never passed §2's bar; they were a different,
+smaller statistic that happened to land just under the number.
 
-**The trade worth putting in front of the owner, which the design's table does
-not show:** Scheme A at **N=192 is 56.6 MB** — *less* than Scheme B at N=256
-(67.1 MB) — and buys exact directionality on every face at ±38.4 m instead of
-approximate directionality at ±51.2 m. For a game about caves and digging, reach
-is plausibly the cheaper thing to give up. That is a judgement about appearance,
-so it goes on the manual checklist (§6c) rather than being decided here.
+**Decision: ship Scheme A.** My first conclusion here was "keep Scheme B", and it
+was wrong. Two errors in it, both mine:
+
+- I compared against the mean-abs bar rather than §2's RMS bar, so I recorded a
+  marginal failure (9.5 vs 8) where the real one is 2.6×.
+- I asserted Scheme A "doubles a sample the depth pass also pays". **It does not.**
+  Scheme A stores `(+X,+Y,+Z,v)` and `(−X,−Y,−Z,v)` in two textures, and §2 itself
+  establishes that *every greedy-mesh normal is axis-aligned, so exactly one slot
+  is selected*. A given face therefore needs exactly **one** of the two textures —
+  branch on the sign of the normal, sample one, take one component. §2's own "two
+  samples" is the cost for a general normal, which this mesh never produces.
+  **Scheme A costs memory and nothing else.**
+
+With the sample-count objection gone, the trade is memory against wall accuracy,
+and the design's sizing table does not show the configuration that settles it:
+
+| config | VRAM | CPU shadow | reach | walls |
+|---|---|---|---|---|
+| Scheme B, N=256 (design's recommendation) | 67.1 MB | 64 MB | ±51.2 m | **approximate** |
+| **Scheme A, N=192** | **56.6 MB** | 54 MB | ±38.4 m | **exact** |
+| Scheme A, N=256 | 134.2 MB | 128 MB | ±51.2 m | exact |
+
+**Scheme A at N=192 costs less VRAM and less RAM than the configuration the design
+already recommends**, and buys exactness on every face. What it gives up is 13 m
+of reach. For a game whose GI exists for caves and digging, that is the cheaper
+thing to give up — and reach is the axis the fade already has to hand back on
+anyway (risk 8), whereas a wall lit by the mean of four directions is wrong in a
+way no amount of fading fixes.
+
+Two costs of Scheme A the table does not show, recorded so the decision is not
+taken on VRAM alone: the CPU shadow doubles (it is a full mirror of the staged
+bytes), and B2's staged re-centre moves `Dim^3 * 8` rather than `Dim^3 * 4` bytes, so
+re-centre upload traffic doubles too (~54 MB per re-centre at N=192, ~42 MB/s at
+20 m/s across the default dead zone).
+
+**Still owed, and it is the thing that would overturn this:** a screenshot. p95 of
+52/255 is 20% of range, and on a *dark* wall the relative error is larger still —
+an irradiance error of 0.20 swings `lerp(AmbientFloor, 1, Irr)` from 0.06 to 0.35
+where `Irr` is small, a factor of ~2 in brightness. That is an arithmetic
+projection, not an observation. The `-VoxelGITest` wall-and-roof fixture puts a
+side face under a roof, which is exactly the geometry the error concentrates on,
+and is the capture that settles whether this reads as wrong lighting or as
+nothing.
 
 ### B2 (step 4) — camera-following re-centring
 
