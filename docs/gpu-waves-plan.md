@@ -313,7 +313,11 @@ shifted control.
 >   (69.3% of occupied texels, reaching the camera's own row). Ships only on the
 >   corrected claim, or defaults off.
 > - **B7 — target changed** to `voxel.GI.Enabled 1` / `voxel.GI.Volume 0`, once
->   the coupling to Wave A was found. The volume is correct-and-off.
+>   the coupling to Wave A was found; then **not shipped**. GI is free at the
+>   median (+0.6% p50) and expensive in the tail (**+14.9% p95, 3.2x hitches**,
+>   neither overlapping). Reported rather than flipped, per the plan's own rule.
+>   `voxel.GI.MaxChunkRefreshesPerFrame` is the knob and the sweep is owed.
+> - **B5 and the Dim 256 coverage run — not run, unverified.**
 > - **B-M — a new finding, not root-caused**: the light field is effectively
 >   **empty under motion** (0–12 bricks against 2,212 settled). It qualifies the
 >   B7 recommendation and is recorded rather than fixed.
@@ -548,6 +552,39 @@ the re-measurement supports:
   row last"* — ship with exactly that claim, not rounded up to "cannot pop"; or
 - re-centring **defaults off** and is recorded as not ready.
 
+**RE-MEASURED after the ordering fix**, same fixture, same populated field
+(163 bricks restaged, Dim 192, `voxel.GI.Debug 2`):
+
+| | before (two rows off the low end, one off the high) | after (furthest-from-camera-row first) |
+|---|---|---|
+| `nearestStaleRowToCamera` | **0 UU** | **333 UU** |
+| `peakStaleTexels` | 14645 / 21122 (**69.3%**) | 20146 / 21122 (**95.4%**) |
+| frames per re-centre | 8 | 8 |
+
+**Both numbers moved, in opposite directions, and that is the point.** The
+ordering fix does what it was for — the camera's own row is now genuinely last,
+so the stale region no longer reaches the ground under the player. It also made
+the *total* worse, because the rows that now go last are the camera's, which hold
+fewer occupied texels than the terrain-dense rows the old ordering happened to
+leave until the end. **Ordering controls where the staleness is, not how much of
+it there is**, and these two numbers are that sentence measured.
+
+**The claim this ships on, stated exactly as measured:**
+
+> A transient exists. It is bounded to ≤8 frames, the camera's own row is
+> restaged last, and the nearest stale row is 3.3 m from the camera.
+
+**It is NOT "confined to the far field" and that phrasing is not used**, because
+95.4% is not a far-field number. The 3.3 m is also a *vertical* gap only — stale
+rows are whole XY slabs, so at that Z the staleness extends horizontally
+everywhere. Whether any of this is visible is unmeasured; it is on the manual
+checklist (§6b) as something only a moving camera and a human eye can answer.
+
+**How much this matters today: less than it looks.** Re-centring only runs inside
+a path that is off by default *twice over* — `voxel.GI.Volume 0`, and its only
+consumer `voxel.Stream.GPU 0`. So it ships disabled in practice, and the residual
+risk is carried by a feature nobody can enable by accident.
+
 ### B3 (step 5) — see "the correction this wave owes the plan" above
 
 Retired: the pooled path's dead `RefreshQueue` traffic. Kept, as required:
@@ -603,7 +640,14 @@ zero-on-revoxelize (dug bricks reach the volume as `A = 0` **before** the solve
 lands, so a tunnel cannot keep its pre-dig lighting), and zero-on-evict, driven
 through the real `EvictFarBricks` rather than waited for.
 
-RESULT_B5_PLACEHOLDER
+**NOT RUN — unverified.** The harness is built, committed and compiles, but the
+box time went to B7 (which decides the release), the B2 re-measure and B-M. The
+X-run merge on a dig, zero-on-revoxelize and zero-on-evict therefore remain
+**correct by construction only**, exactly as they were before this wave, with the
+one difference that measuring them is now a single console command rather than a
+piece of work. Same for the **Dim 256 coverage** run: coverage is measured at
+Dim 64 (48 of 2,212 bricks in volume) and Dim 128 (323 of 2,212), and the
+192 figure is 933 of 2,212, but 256 was not reached.
 
 ### B6 — the live-toggle claim is now true
 
@@ -670,7 +714,47 @@ is a sharper prior than this programme had before, and it is used here as a
 identical configs means something is wrong with the leg and it gets re-run, it
 does not get reported as noise.
 
-RESULT_B7_COST_PLACEHOLDER
+**MEASURED. Recommendation: do NOT flip `voxel.GI.Enabled` on yet.** One binary,
+warm box (the first leg of the session was discarded as warmup), pinned pose
+`-VoxelPerfFlight=static -VoxelPerfYaw=45 -VoxelPerfPitch=-20`, component path
+(`voxel.Stream.GPU 0`), command line verified against `LogInit: Command Line:` on
+every leg.
+
+| leg | p50 (ms) | p95 (ms) | max (ms) | hitches |
+|---|---|---|---|---|
+| GI off — 1 / 2 / 3 | 22.955 / 23.408 / 23.375 | 26.592 / 28.129 / 27.518 | 38.6 / 41.6 / 42.5 | 26 / 21 / 23 |
+| **GI on** — 1 / 2 | 23.337 / 23.399 | 31.453 / 31.318 | 47.3 / 50.7 | **70 / 78** |
+
+**A third off leg exists because the pre-registered 0.5% rule rejected the first
+pair** (off-1 vs off-2 spread 1.97%). With it the off p50 tightens to
+23.25 ± 0.9%. A rule that only ever confirms is not a rule.
+
+| metric | off | on | delta | ranges overlap? |
+|---|---|---|---|---|
+| p50 | 23.25 | 23.37 | **+0.6%** | yes — below noise |
+| p95 | 27.41 | 31.39 | **+14.9%** | **no** |
+| hitches | 23.3 | 74.0 | **×3.2** | **no** |
+| max | 40.9 | 49.0 | +19% | no |
+
+**GI is free at the median and expensive in the tail.** That independently
+reproduces the shape already on record for this module from a different
+experiment: the `voxel.GI.LegacyProxyRebuild` A/B concluded the re-shade cost was
+*"mostly a TAIL and throughput problem, not a median one"*. Two unrelated
+measurements agreeing on the shape is worth more than either alone.
+
+**Why this is a "report it" and not a "ship it".** The plan's own instruction is
+*"if the cost is not acceptable, report the number rather than shipping it on
+regardless"*. A 3.2× hitch count is the metric a player actually feels; p50 being
+free does not compensate for it. The owner asked for GI on by default and the
+honest answer is that it costs a tripling of hitches at the current tuning.
+
+**The knob, and it is tuning rather than a rebuild.**
+`voxel.GI.MaxChunkRefreshesPerFrame` (default 4) bounds the re-shade drain, which
+is where this tail comes from. A sweep of 4 / 2 / 1 is owed, judged on **hitch
+count and p95 — not p50, which this measurement has already shown is not where
+the cost lives** — and it must also report what it costs on the other side, since
+a smaller drain means lighting converges more slowly after an edit. If no setting
+brings hitches near the off-baseline, that is a complete answer too.
 
 ### Considered and rejected: making the COMPONENT path sample the volume
 
@@ -778,12 +862,33 @@ prints `rejectedRadius=` (chunks skipped by the range test) beside
 range is the fixture hypothesis; chunks never arriving is a real ingest or
 streaming fault. The counter separates them without inference.
 
+**MEASURED — the top row of the table above, confirmed and material.** Surface
+flight, `voxel.GI.Debug 1`, per-second samples across the whole circle:
+
+- `camAboveSurface` ran **6188 → 12849 UU (62–128 m)** against the 70 m radius,
+  **exceeding it for most of the circle**;
+- `rejectedRadius` ran **162–1244 chunks per second** — chunks are arriving and
+  being rejected for range, not failing to arrive;
+- `bricks` stayed **0** throughout.
+
+So the fixture pins Z, the terrain drops away beneath it, and the camera spends
+most of the circle outside the GI build radius. **This is a property of the
+`-VoxelPerfFlight=surface` harness that every measurement taken with it
+inherits**, not only this one.
+
+**The caveat is the valuable half, and it keeps the finding open.** Bricks stayed
+at **0 even at the 6188 UU minimum**, where the camera is *nominally in range* —
+at that height a disc of terrain ~32 m in radius sits inside the 70 m sphere and
+should have voxelized. So the fixture explains **most, but not provably all**, of
+B-M. Something else may also be suppressing ingest, and this is not closed.
+
 **Legs still owed:** the **underground** flight as a control (it tracks the
 surface at a constant offset by construction, so bricks staying populated there
-while the surface flight collapses implicates the fixture), and brick count
-**~5 s after coming to rest** — which answers the question the owner actually
-cares about, and whose recover/does-not-recover fork is the same one that splits
-the ring-gap symptom in `docs/manual-verification-checklist.md` §1.
+while the surface flight collapses would implicate the fixture and would also
+speak to the residual), and brick count **~5 s after coming to rest** — which
+answers the question the owner actually cares about, and whose
+recover/does-not-recover fork is the same one that splits the ring-gap symptom in
+`docs/manual-verification-checklist.md` §1.
 
 **Deliberately not chased in this wave.** Recorded so it survives, and carried as
 a caveat on the B7 recommendation rather than fixed under it.
