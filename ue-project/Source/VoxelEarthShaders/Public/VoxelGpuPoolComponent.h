@@ -19,8 +19,66 @@
 
 #include "CoreMinimal.h"
 #include "Components/PrimitiveComponent.h"
+#include "RHIResources.h"
 #include "VoxelGpuGeometryPool.h"
 #include "VoxelGpuPoolComponent.generated.h"
+
+// The pool's two big GPU buffers, owned by the COMPONENT rather than the scene
+// proxy (Wave D / D1).
+//
+// WHY THIS EXISTS, AND WHAT IT FIXES. These used to be created inside
+// FVoxelGpuPoolSceneProxy::CreateRenderThreadResources and destroyed with the
+// proxy, and CreateSceneProxy re-uploaded the whole CPU shadow every time a new
+// proxy was built. That is correct only while the CPU shadow is the sole author
+// of the quads. Once the GPU writes into the pool directly, any of the four
+// MarkRenderStateDirty paths throws the proxy away and re-uploads stale CPU
+// content over GPU-written geometry -- which presents as TERRAIN REVERTING TO
+// OLDER GEOMETRY AFTER AN UNRELATED EVENT, the hardest failure in this wave to
+// trace back to its cause.
+//
+// The fix is one level of ownership, not an immortal vertex factory. The
+// factory bakes these SRVs into a uniform buffer in InitRHI, but that uniform
+// buffer holds nothing else of substance -- so a new proxy simply builds a
+// fresh one pointing at the SAME SRVs. The quads survive because the buffer was
+// never destroyed and never re-uploaded.
+//
+// Held by shared pointer so the last reference can be dropped on the render
+// thread (see UVoxelGpuPoolComponent::BeginDestroy) rather than wherever the
+// component happens to be collected.
+struct FVoxelGpuPoolBuffers
+{
+	FBufferRHIRef QuadBuffer;
+	FBufferRHIRef ChunkIdBuffer;
+
+	FShaderResourceViewRHIRef QuadSRV;
+	FShaderResourceViewRHIRef ChunkIdSRV;
+
+	// D1: the GPU-write half. Created alongside the SRVs so a compute pass can
+	// write quads in place. Nothing dispatches through these yet -- they are the
+	// buffers the mesher will target once D4 wires it up.
+	FUnorderedAccessViewRHIRef QuadUAV;
+	FUnorderedAccessViewRHIRef ChunkIdUAV;
+
+	// Elements the buffers were created with. The whole capacity is allocated up
+	// front because writes address ABSOLUTE pool offsets; if a later proxy wants
+	// more than this, the buffers must be rebuilt (and the GPU content is
+	// genuinely gone, so that path re-uploads from the CPU shadow).
+	int32 CapacityQuads = 0;
+
+	bool IsValid() const { return QuadBuffer.IsValid() && ChunkIdBuffer.IsValid(); }
+};
+
+using FVoxelGpuPoolBuffersRef = TSharedPtr<FVoxelGpuPoolBuffers, ESPMode::ThreadSafe>;
+
+// One contiguous run of quads to write into the GPU buffer. First is the
+// destination offset in the pool; SrcOffset indexes the flat staging array the
+// render command carries, since several runs travel in one payload.
+struct FVoxelQuadUploadRun
+{
+	uint32 First = 0;
+	uint32 Count = 0;
+	uint32 SrcOffset = 0;
+};
 
 UCLASS(ClassGroup = Rendering, meta = (BlueprintSpawnableComponent))
 class VOXELEARTHSHADERS_API UVoxelGpuPoolComponent : public UPrimitiveComponent
@@ -143,7 +201,25 @@ public:
 	virtual void DestroyRenderState_Concurrent() override;
 	//~ End UPrimitiveComponent
 
+	//~ Begin UObject
+	// Drops the persistent buffers' last reference on the RENDER thread. Not
+	// DestroyRenderState_Concurrent -- that fires on every MarkRenderStateDirty,
+	// which is precisely the event these buffers exist to survive.
+	virtual void BeginDestroy() override;
+	//~ End UObject
+
+	// DESTRUCTIVE DEBUG — see voxel.Stream.PoolClobberTest. Corrupts the first N
+	// quads of the CPU shadow and forces proxy recreation, so that "rebound" and
+	// "re-uploaded" predict different pictures instead of being indistinguishable.
+	void DebugClobberShadowAndRecreate(int32 NumQuadsToClobber);
+
 private:
+	// See FVoxelGpuPoolBuffers. The holder is allocated on demand; the buffers
+	// inside it are created on the render thread by the FIRST proxy and reused
+	// by every proxy after it.
+	FVoxelGpuPoolBuffersRef PoolBuffers;
+	FVoxelGpuPoolBuffersRef GetOrCreatePoolBuffers();
+
 	// One flat buffer for every chunk's quads, in insertion order.
 	TArray<uint64> PooledQuads;
 
@@ -190,8 +266,27 @@ private:
 	// Ranges written since the last upload, in quads. Streaming touches a few
 	// chunks per frame out of thousands, so uploading the whole pool for each
 	// change would be absurd -- at cascade scale that is 75 MB per edit.
+	//
+	// A LIST, NOT ONE SPAN (Wave D / D1, path 2). This used to be a single
+	// {First, Last} merged with Min/Max, which meant two chunks written at
+	// distant pool offsets marked EVERYTHING BETWEEN THEM dirty and re-uploaded
+	// it from the CPU shadow. That is a large amount of pointless upload on the
+	// CPU path -- and once the GPU writes quads into the pool directly, it is
+	// silent corruption: any GPU-written range caught in the gap between two
+	// CPU-written chunks gets overwritten with stale shadow content, on every
+	// add or remove.
+	//
+	// The span was always an OVER-APPROXIMATION of what the CPU actually wrote:
+	// every dirty region comes from a write to one chunk's range, and the
+	// Min/Max merge threw that precision away. Keeping the intervals is not
+	// extra bookkeeping, it is declining to discard information already in hand.
+	//
+	// The property that makes this the whole fix for path 2: an interval only
+	// ever covers quads the CPU WROTE, so a GPU-written range is untouchable by
+	// construction -- no GPU-range tracking, nothing to keep in sync, and no way
+	// for the two to drift apart.
 	struct FDirtyRange { uint32 First = 0; uint32 Last = 0; bool bValid = false; };
-	FDirtyRange DirtyQuads;
+	TArray<FDirtyRange> DirtyQuadRanges;
 	bool bChunkTableDirty = false;
 
 	// Set whenever the set of live ALLOCATIONS changes -- which is not the same

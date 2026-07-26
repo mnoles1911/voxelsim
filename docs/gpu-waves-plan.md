@@ -881,6 +881,213 @@ this plan was supposed to be:
   follow.
 - **Buffer identity must stay stable.** The factory bakes these SRVs into a uniform
   buffer built once in `InitRHI`. In-place UAV writes are fine; reallocation is not.
+**Scoped 2026-07-26, not built. And one thing I reported earlier was wrong.**
+
+~~`BufferQuads = InQuads.Num()` means the GPU buffer is sized to the CPU
+shadow's current length, so a GPU-written range only exists if the shadow
+already covers it.~~ **Wrong — retracted.** `PooledQuads.SetNumZeroed(CapacityQuads)`
+(`:852`) sizes the shadow to the **full pool capacity**, and `CreateSceneProxy`
+says so explicitly (`:1248-1250`): *"The whole capacity is uploaded, not just the
+used prefix: incremental writes address absolute pool offsets, so the buffer has
+to be that big from the start."* So `InQuads.Num()` **is** capacity and the range
+always exists. Recorded rather than quietly fixed, because it was reported
+upward as a finding.
+
+**The real clobber, which is exactly what the brief said.** Steady state is fine:
+updates go through `UpdateQuadRange_RenderThread` (`:1088`), which writes only the
+dirty slice. The danger is **proxy recreation** — four `MarkRenderStateDirty`
+sites (`:993`, `:1022`, `:1032`, `:1228`) — after which `CreateSceneProxy`
+re-uploads all of `PooledQuads`. For a GPU-written range the CPU shadow holds
+zeros or stale content, so the geometry silently reverts.
+
+**Three candidate fixes, in increasing order of correctness:**
+1. *Mark GPU-owned ranges and skip them on rebuild.* Cheapest, but the rebuild is
+   the only thing that populates the buffer, so a skipped range is left
+   uninitialised — trades a revert for a garbage read.
+2. *Re-dispatch GPU chunks on recreation.* Correct, and recreation is rare, but it
+   couples the pool to the mesher and makes an unrelated event cost a GPU burst.
+3. **Move quad-buffer ownership off the proxy** so recreation rebinds rather than
+   re-uploads. This is what "buffer identity must stay stable" is really asking
+   for, and it removes the clobber structurally rather than defending against it.
+   It is also the shape a compute compaction pass wants. Interacts with the
+   vertex factory baking the SRVs into a uniform buffer in `InitRHI`, so it needs
+   care around Wave A's work.
+
+**Recommendation: (3), and cost it before building it** — the same order that
+just paid off for D6.
+
+#### Option 3 costed, 2026-07-26, against Wave A's merged code
+
+**The lifetime today is coherent, which is why the current design works.** All of
+it is proxy-owned and dies together:
+
+| thing | where |
+|---|---|
+| `FVoxelQuadVertexFactory VertexFactory` | proxy **member** (`VoxelGpuPoolComponent.cpp:503`) |
+| `QuadBuffer` / `ChunkIdSRV` / `OriginSRV` / `ParamsSRV` | created in `CreateRenderThreadResources` (`:176-182`, `:827`) |
+| handed to the factory | `SetQuadBufferSRV` / `SetPoolBuffers` (`:208-209`), then `InitResource` (`:210`) |
+| baked into a uniform buffer | `InitRHI` (`VoxelQuadVertexFactory.cpp:95-96`), `UniformBuffer_MultiFrame`, built **once** |
+| torn down | `~FVoxelGpuPoolSceneProxy` → `VertexFactory.ReleaseResource()` (`:153`) → `ReleaseRHI` releases the uniform buffer **and** the SRVs (`:102-104`) |
+
+**The good news, and it is the thing worth costing for: the uniform buffer does
+NOT have to survive.** It is built *from* the SRVs and holds nothing else of
+substance. If the **buffers and SRVs** outlive the proxy, a new proxy's
+`InitRHI` simply builds a fresh uniform buffer pointing at the *same* SRVs — and
+the GPU-resident quads survive because the buffer was never destroyed or
+re-uploaded. So "buffer identity must stay stable" is satisfied by moving one
+level of ownership, not by making the factory immortal.
+
+That makes option 3 substantially smaller than it looks:
+
+1. A component-owned render resource (`FVoxelGpuPoolBuffers`) holding
+   `QuadBuffer` + `ChunkIdBuffer`, their SRVs, and — for D1 — their **UAVs**.
+   Created once, released at component destruction via `BeginReleaseResource` +
+   fence.
+2. `CreateRenderThreadResources` stops *creating* those two buffers and just
+   takes references, calling `SetQuadBufferSRV` / `SetPoolBuffers` exactly as it
+   does now. **No vertex factory change. No shader change.**
+3. `CreateSceneProxy` stops re-uploading `PooledQuads` — the buffer already holds
+   the data. It uploads on **first** creation only. *This is the line that
+   removes the clobber.*
+4. `UpdateQuadRange_RenderThread` retargets to the component-side buffer.
+
+The chunk table (origins / params / runs) is small, genuinely proxy-scoped, and
+**stays where it is** — `MaxChunks` is derived per proxy and nothing about the
+clobber involves it.
+
+**Precedent that this is an accepted shape here:** `GetElementShaderBindings`
+already fetches `GVoxelGIVolume.GetUniformBuffer()` (`VoxelQuadVertexFactory.cpp:190`),
+a resource that outlives every proxy.
+
+**Estimate:** one file plus a small header, ~200–300 lines touched, no `.ush`
+edit, no digest exposure, no bench impact. **The one genuinely delicate part is
+render-resource lifetime** — created on the render thread, released behind a
+fence — which is standard but is exactly the kind of thing that fails as a
+crash-on-exit rather than a compile error.
+
+**It is also the right destination on the merits:** a component-owned buffer set
+is precisely where a compute compaction pass's compacted-quad-id buffer wants to
+live, so this is the enabling step for that too rather than a detour around it.
+
+#### Built 2026-07-26 — and it closes ONE of THREE clobber paths, not all of them
+
+The two "remaining unknowns" were written down and then actually checked. One
+came back clean; **the other did not, and it matters more than the one that was
+fixed.**
+
+**Path 1 — proxy recreation. FIXED.** `CreateSceneProxy` → `CreateRenderThreadResources`
+re-uploading the whole CPU shadow. Now uploads on first creation only; later
+proxies rebind. Four triggers (`MarkRenderStateDirty` at `:993`, `:1022`,
+`:1032`, `:1228`). Gated by `voxel.Stream.PoolClobberTest`.
+
+**Path 2 — the incremental dirty span. NOT FIXED, and it is the frequent one.**
+`DirtyQuads` is a **span, not a set**: `PushUpdatesToProxy` merges every dirty
+region with `Min(First)` / `Max(Last)` (`:1060-1061`), and
+`UpdateQuadRange_RenderThread` then writes that whole span **from `PooledQuads`**
+(`:1088-1089`, writer at `:436-448`).
+
+So two CPU-written chunks at distant pool offsets produce a dirty span covering
+**everything between them** — and any GPU-written range in that gap is
+overwritten with CPU-shadow content on the very next update. This is the
+**steady-state** path, not a rare one: it runs whenever a chunk is added or
+removed, which is continuously during streaming. It is *more* likely to bite than
+proxy recreation, not less.
+
+*This is the same shape of mistake as the original brief's option 1: a fix that
+addresses the path you were looking at while the more frequent one stays open.
+The persistent buffers are still a precondition for fixing it — they are just not
+sufficient on their own.*
+
+Candidate fixes, not yet costed: track GPU-owned ranges and split the dirty span
+around them (turns one write into several, but the span is already a coarse
+over-approximation); or keep the dirty set as an interval list rather than a
+single span; or have the GPU writer also update the CPU shadow, which defeats the
+purpose. **Cost before building — the same rule that has now paid off three
+times in this wave.**
+
+**Path 3 — buffer growth. HANDLED, but with a gap the caller has to close.** If a
+later proxy needs more than the allocation, the buffers are rebuilt and
+re-uploaded from the CPU shadow. That is *correct in itself* — the GPU-resident
+contents genuinely are gone once the old buffer is destroyed, so there is nothing
+else to restore from. **But nothing currently re-dispatches the GPU-written
+chunks afterwards**, so their geometry silently reverts to whatever the shadow
+holds. Stated plainly because it is the branch a reader will most want to see:
+growth **invalidates every GPU-written range**, and D4 must treat a capacity
+rebuild as a re-mesh trigger. The capacity is allocated up front from
+`kPoolCapacityQuads`, so this should be rare — but "rare and silent" is the
+combination this wave keeps being bitten by.
+
+**Status: D1 is not done.** The persistent-buffer work is correct and is the
+**necessary foundation, not a sufficient fix**. Path 2 must close before any GPU
+writer can be trusted, and path 3 is a D4 correctness requirement (below).
+
+**The lesson is not "the pool has three clobber paths."** It is that **a fix
+aimed at the failure you happened to notice is not a fix.** Option 1 in the
+original brief, and my own path-1 work, are the same shape: both close the door
+you were looking at while the busier one stays open. The only reason path 2 was
+found is that it was written down as an unknown and then actually checked.
+
+#### Path 2 costed, 2026-07-26 — and the structural option LOSES this time
+
+Three candidates, costed rather than pre-judged. **The expectation going in was
+that a structural fix would beat a defensive one, as it did twice earlier in this
+wave. It does not here**, and the reason is worth keeping.
+
+**A — make the dirty region an interval list instead of one span. RECOMMENDED.**
+
+The decisive observation: **the span is already an over-approximation of data the
+CPU actually wrote.** Every dirty region is generated by a CPU write to one
+chunk's range (`AddChunk` `:913`, `UpdateChunk` `:1137`/`:1177`, `RemoveChunk`'s
+repoint). The `Min(First)`/`Max(Last)` merge at `:1060-1061` is what throws that
+precision away. Restoring it is *not adding information* — it is **stopping the
+discarding of information already present**.
+
+That makes it exactly correct for any CPU/GPU mix, and — the part that matters —
+**it needs no GPU-range tracking at all.** An interval only ever covers quads the
+CPU wrote, so a GPU-written range is untouchable by construction rather than by
+exclusion.
+
+- Touches ~5 sites (`:920`, `:1054-1061`, `:1072`, `:1082`, `:1088-1089`, `:1141`)
+  plus `UpdateQuadRange_RenderThread` taking N slices instead of 1.
+- The single span exists to make the upload ONE lock, so N slices is the real
+  cost. Bounded, though: chunks applied per frame are already throttled by the
+  streaming apply budget, so N is small per update. Merge intervals within a gap
+  threshold to cap it.
+- **Likely a win on the shipped CPU path today, independent of Wave D.** The span
+  currently uploads every quad between the lowest and highest dirty chunk,
+  including all the untouched geometry in the gaps; with chunks scattered across
+  a 14 M-quad pool that can be most of the buffer per update. The comment at
+  `:1051-1061` records that this code already caused one streaming collapse by
+  copying too much. **This should be measured on its own merits before Wave D
+  needs it.**
+
+**B — split the span around known GPU-owned ranges.** Requires tracking GPU
+ranges, and produces up to (GPU ranges + 1) slices — so it degrades to *more*
+slices than A precisely as GPU meshing becomes the common case. Strictly worse
+than A. Rejected.
+
+**C — give GPU-written chunks their own buffer or pool region.** The structural
+option: a CPU dirty span could never span a GPU range because they would not
+share an address space.
+
+Two buffers is the expensive form — two SRVs, and the draw stops being one
+contiguous range, which ADR-0006 forbids and which forecloses the static-relevance
+path. The cheap form is **one buffer, two allocator regions** (CPU allocates from
+one end, GPU from the other): one SRV, one draw range, no draw-path change at all.
+
+**Rejected anyway, for a reason the codebase already documents.** Two regions
+cannot share headroom, so the split has to be sized in advance — and
+`VoxelGpuPoolComponent.h` already flags `GetLargestFreeRun`/`GetFreeRunCount` as
+the early warning that *allocations start failing on a pool that still looks half
+empty*. A fixed partition manufactures exactly that condition, and it would be
+wrong at a different ratio for terrain and for water. It trades a fixable
+correctness bug for a capacity-tuning problem that fails in the mode this pool is
+already fragile in.
+
+**So: A.** Smaller than the structural fix, exactly correct, no GPU-range
+bookkeeping, and probably a performance win in its own right. Cost before
+building still applies to the interval-merge threshold — do not tune it blind.
+
 - **Neutralise the CPU shadow clobber — the highest-severity silent-corruption risk
   in this wave.** `PooledQuads`/`QuadChunkIds` (`VoxelGpuPoolComponent.h:148-152`)
   are a full CPU mirror, and `CreateSceneProxy` re-uploads all of it. Any
@@ -1249,6 +1456,25 @@ parameter from the concrete synthetic type to `vxc::ITileSampler&`.
 fallback on a miss — but the CPU path reads the *same* sampler through
 `Amp.column`, so this is **not a GPU-specific risk**.
 
+**REQUIREMENT D4-R1 — a pool capacity rebuild must trigger a re-mesh. Owner: D4.**
+
+Not a risk to watch, a correctness obligation on the wiring. When the pool
+outgrows its buffer allocation, `CreateRenderThreadResources` rebuilds the
+buffers and re-uploads from the CPU shadow. That is correct in itself — the old
+buffer's contents genuinely are gone, so there is nothing else to restore from —
+but it means **a capacity rebuild invalidates every GPU-written range**, and
+nothing currently re-dispatches them. Their geometry silently reverts to whatever
+the shadow holds.
+
+D4 must treat a capacity rebuild as a re-mesh trigger for every GPU-meshed
+resident chunk: bump their `GenerationId` (or clear `bMeshSettled`) so
+`RecomputeDesiredSet` re-queues them. **It is deliberately stated as a
+requirement rather than filed under risks because it is *rare and silent*, which
+is the combination this wave has repeatedly been caught by and the one least
+likely to be found by testing** — capacity is allocated up front from
+`kPoolCapacityQuads`, so a test would have to deliberately undersize the pool to
+reach it.
+
 **Two asymmetries to measure rather than assume:**
 - The CPU path has a per-brick `SkipBrick` lambda (`:6357-6409`) driven by the
   same band scratch arrays, so it skips provably-all-air/all-solid bricks. **The
@@ -1262,6 +1488,99 @@ halo, so meshing one 32³ chunk alone dispatches 48³ voxels — 3.4× waste. Ba
 footprint's column or a tile of neighbours and slice the quad stream by
 `meshBrickIndex`. Cap: `MaskCount ≤ 65,536` (single-workgroup scan) ⇒ ≤1,365
 interior bricks per dispatch.
+
+### D6 — move the footprint band to the GPU — **costed and APPROVED 2026-07-26, not yet built**
+
+Costed *before* wiring, deliberately, so the answer could shape the build. It
+did — the brief's stated risk was wrong, and the design that survives is
+smaller than the one that was asked for.
+
+#### The brief's risk was wrong, and this is why
+
+The question was *"can admission tolerate a band that arrives a few frames
+late?"*, on the assumption that a late band would stall admission. **It does not,
+and the system already depends on it not doing so.**
+
+The cold-band throttle (`VoxelWorldSubsystem.cpp:5930-5951`) defers a chunk only
+when there is **no band AND** a live `FootprintBlindJobInFlight` mark younger
+than `kBlindJobMarkTimeoutSeconds`. That mark is added (`:6549`) only *after* a
+launch and only for a footprint with no band yet. So **the first job for every
+footprint already runs blind**, produces the band, and later chunks in that (X,Y)
+column benefit from it.
+
+The band is therefore an **optimisation** — skip provably-empty chunks — **not an
+admission gate**, and lateness is the designed-for case, not a hazard.
+
+**The real risk is not *late*, it is *never*.** If bands stop arriving at all the
+column throttles; the mark timeout is the existing backstop that stops even that
+being permanent. Recorded because the wrong version of this ("cannot tolerate a
+late band") would have killed a change that is actually cheap.
+
+#### Design, as approved
+
+1. **The band rides D3's phase-1 readback. 4 bytes → 12** (`QuadTotal`,
+   `MaxSurfaceTopVoxel`, `SolidBelowVoxel`), in the **same** result object.
+   `DrainResults` is untouched and keeps doing `FootprintBandCache.Add`
+   (`:7101`), `FootprintBlindJobInFlight.Remove` (`:7113`) and
+   `--LevelJobsInFlight` (`:7188`) in one pass on one result.
+
+   **This is the load-bearing choice.** A separate band readback would create two
+   independent async streams that must *both* satisfy exactly-one-outcome, with a
+   job able to deliver quads but no band. Doubling that invariant surface is the
+   class of change that produced the stranded-column bug in the first place. Zero
+   new invariant surface is worth far more than the bytes.
+
+2. **The band is z-independent.** `ColumnSurfaceTopVoxel` (`:1282`) and
+   `ColumnDeepestAirVoxel` (`:1305`) are pure functions of one
+   `vxc::ColumnSample` — no chunk-z anywhere. So the band needs `ColumnMain`
+   plus cave/cavern, and **does not need `VoxelizeMain` or its cell grid at
+   all**. Much smaller than the brief assumed.
+
+3. **No `worldgen.ush` edit, and no atomics.** A **new `.usf` that `#include`s
+   `worldgen.ush`** and adds a `BandReduceMain` entry point — the same shim shape
+   `VoxelWorldGen.usf` already uses. That gives it `caveColumnFor` /
+   `cavernColumnFor` for free while leaving `worldgen.ush` byte-identical: no
+   SPIR-V respin, no new bench descriptor bindings, nothing added to the
+   determinism digest's blast radius, and clear of ground rule 10.
+
+   **The atomic min/max question dissolves rather than needing a verdict.** One
+   workgroup of 256 striding over the 34×34 = 1,156 columns, local min/max, then
+   a fixed-order groupshared tree reduction — exactly the pattern `ScanSumsMain`
+   already uses and that the gate already covers. Deterministic by construction,
+   with no order-independence argument to defend. *(The atomic route was going to
+   be verified against the gate rather than assumed, on the grounds that this file
+   has already produced one vendor divergence from an operation that looked
+   order-independent on paper. Not needing the argument at all is better.)*
+
+   Cost of this route: cave/cavern are recomputed for 1,156 columns rather than
+   read out of `VoxelizeMain`'s registers, so ~50% extra cave work against
+   `VoxelizeMain`'s 2,304 columns. Accepted, because it buys deleting the CPU
+   column pass entirely and keeps `VoxelizeMain` out of a change it does not need
+   to be in.
+
+4. **The integer sqrt is not a determinism risk.** `ColumnDeepestAirVoxel` needs
+   `CeilSqrtI64` (`:1266`), which seeds with `FMath::Sqrt(double(V))` and then
+   corrects with `while (R*R < V) ++R; while (R > 0 && (R-1)*(R-1) >= V) --R;`.
+   `worldgen.ush` has **no sqrt of any kind** and is integer-only by contract and
+   by CI's float ban.
+
+   That is fine, because **ceil-sqrt has a unique integer answer** — the `R` with
+   `(R-1)² < V ≤ R²`. A pure-integer binary-search isqrt in HLSL and the
+   FP-seeded CPU version converge on the same `R` **by construction**. The fix
+   removes floating point from the comparison rather than trying to make two FP
+   paths agree, which is the correct shape given this file's history with vendor
+   divergence (`floorDiv`'s `OpSRem`, the M0 AMD-vs-NVIDIA failure).
+
+#### What it is worth
+
+It removes the CPU column pass from a GPU-meshed level-0 job, i.e. the
+**~45%** of job time that is not meshing — the other half of the ~55% D1–D4
+address. Together they are what turns *"GPU meshing removes the meshing, not the
+job"* into removing the job.
+
+**Sequencing: after D1–D4 are landed and measured**, alongside D5, for the same
+reason D5 waits — debugging shared plumbing against a novel path doubles the
+search space for any failure.
 
 ### D5 — coarse-level GPU generation (levels 1–5) — **in scope (owner's call)**
 
@@ -1578,6 +1897,41 @@ refraction would each break that, as would a second translucent material
 intersecting the water volume. Do not add them and assume the pool still holds.
 
 ---
+
+## UNOWNED WORK ON THE CRITICAL PATH — compute compaction
+
+**Raised 2026-07-26 from Wave D, escalated to the owner. Recorded here because
+it is a gap in the plan, not in any one wave.**
+
+The dependency chain, end to end:
+
+> **Wave F needs D4** → D4 delivers GPU-produced geometry **into the pool** →
+> the pool is **defaulted off** (`voxel.Stream.GPU 0`), because Wave A measured
+> it ~0.15 ms *worse* than the component path at a down-facing pose against a
+> pre-registered criterion → closing that gap needs **compute compaction** →
+> **nobody is building compaction.**
+
+So D1–D6 are currently improving a renderer the project has chosen not to ship,
+and Wave F's payoff is gated behind a step with no owner. That is a structural
+problem with the plan rather than a technical one with any wave, which is why it
+is recorded at this level.
+
+**The evidence says it is closable, not that the pool is a dead end.** Wave A's
+cost model — a ~2 ms fixed floor plus ~1.19 µs per 1000 quads drawn, holding to
+1.1% across two poses 4× apart in frame time — prices the remaining deficit as
+**over-draw**, not overhead: 1.62× straight down and 2.72× at the horizon where
+the 64-range cap binds. Compaction is worth **~0.12 ms straight down and ~4.7 ms
+at the horizon** under that model, which would not merely close the 0.15 ms gap
+but likely put the pooled path clearly ahead.
+
+**Wave D's D1 work is a precondition for compaction itself, not only for D4.** A
+compute pass writing a compacted quad-id list needs exactly what D1 built: a
+**component-owned** buffer set (so it survives proxy recreation), **GPU-writable**
+(UAVs), and a dirty-tracking scheme that cannot overwrite GPU-authored ranges
+(the interval list). Whoever picks compaction up should start from D1 rather than
+alongside it. The one shader line that changes is
+`QuadIndex` in `VoxelQuadVertexFactory.ush`, which Wave A notes is derived in
+exactly one place.
 
 ## Wave F — R0 = 128 m
 
