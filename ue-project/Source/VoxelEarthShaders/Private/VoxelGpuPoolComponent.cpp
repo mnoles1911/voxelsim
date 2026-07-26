@@ -948,6 +948,11 @@ private:
 		// quantitative claim should now be read from -- come from the census
 		// (voxel.Stream.GPUCullStatsPeriod), which accumulates instead of
 		// sampling.
+		//
+		// DO NOT "FIX" THE NOISE BY ROUNDING THIS BACK TO 600, OR TO ANY OTHER
+		// NUMBER WITH SMALL FACTORS. A round period is exactly the bug. If a
+		// steadier line is wanted, read the census, which averages over every
+		// gather in a window instead of showing you one.
 		const int32 GatherOrdinal = CullLogCounter.Increment();
 		if (GatherOrdinal % 601 == 1)
 		{
@@ -1072,6 +1077,25 @@ private:
 		}
 
 		const uint64 WinTotalQuads = WinCamQuads + WinShadowQuads;
+
+		// A MEASURED ZERO, SAID OUT LOUD.
+		//
+		// shadowGathers == 0 is this experiment's best case -- it makes S_delta
+		// exactly 1, which leaves Wave A's cost model standing unmodified. But an
+		// absent count and a zero count look identical in a log, and that is
+		// precisely how the original aliasing hid: 112 samples all reading
+		// shadowGather=0 were taken as "no shadow gathers happen" when they were
+		// really "this instrument cannot see them". So the zero is asserted on its
+		// own line, by a counter that increments on every gather of either kind,
+		// rather than being inferred from lines that are not there.
+		if (WinShadowGathers == 0)
+		{
+			UE_LOG(LogTemp, Log,
+			       TEXT("%s census[window]: shadowGathers=0 MEASURED (not absent) over %llu camera gathers "
+			            "-- this proxy submitted no shadow-cascade draws in this window, so S_delta = 1 "
+			            "and a camera-only quad count is the whole frame's quad count"),
+			       *PoolName, WinCamGathers);
+		}
 
 		// S is the whole point of the experiment: the factor by which a
 		// main-view-only quad count understates what the frame actually drew.
