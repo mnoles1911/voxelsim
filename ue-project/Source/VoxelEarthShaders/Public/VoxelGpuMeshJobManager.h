@@ -125,6 +125,14 @@ struct FVoxelGpuMeshJobResult
 	// GraphBuilder.Execute() returned to the moment a poll first saw IsReady()
 	// true. That is the number that describes the GPU, and it is quantised by
 	// the poll interval (one game-thread tick).
+	//
+	// D3 CHANGED WHAT THIS MEASURES — do not compare it across that change
+	// without saying so. It is now the moment the 4-BYTE TOTAL landed, i.e.
+	// when the GPU finished the mesh chain. It used to be the moment the whole
+	// ~810 KB readback landed, so it included a transfer that no longer
+	// happens on this path. The new number should be LOWER for reasons that
+	// have nothing to do with the GPU being faster. SubmitToDeliverMs is the
+	// one that covers both phases and is the honest end-to-end figure.
 	double DispatchToReadyMs = 0.0;
 	// Submit() to the OnJobComplete call. Includes queueing behind the in-flight
 	// cap, the render thread being a frame behind, and the poll quantisation.
@@ -182,6 +190,9 @@ public:
 
 private:
 	void DispatchBatch(TArray<TSharedPtr<FJob, ESPMode::ThreadSafe>>&& Batch);
+	// D3 phase 2: fetch exactly the quads the 4-byte total said exist. Becomes
+	// a GPU->GPU copy into a pool range, with no readback, once D1 lands.
+	void DispatchQuadFetch(TArray<TSharedPtr<FJob, ESPMode::ThreadSafe>>&& Batch);
 	void PollInFlight();
 	void Deliver(const TSharedPtr<FJob, ESPMode::ThreadSafe>& Job,
 	             EVoxelGpuMeshJobStatus Status, const FString& Error);

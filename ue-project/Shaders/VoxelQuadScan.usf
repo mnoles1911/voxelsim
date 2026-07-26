@@ -1,0 +1,72 @@
+// The 4-byte scan total (ADR-0006, Wave D / D3).
+//
+// WHY THIS FILE EXISTS AT ALL. The greedy mesher's emit pass writes quads at
+// exclusive-scanned offsets, so the number it actually produced is
+// Offsets[MaskCount-1] + Counts[MaskCount-1]. That derivation is trivial — and
+// today it happens on the CPU, which is why the WHOLE Counts and Offsets
+// arrays are read back (2 x MaskCount x 4 bytes, ~24 KB for a render chunk)
+// purely to recover 4 bytes of information. The quad buffer then comes back
+// too, at its 32-quads-per-mask upper bound, because nothing knows how much of
+// it is live until those arrays have landed:
+//
+//   MaskCount 3,072 -> MaxQuads 98,304 -> 786 KB read back per chunk,
+//   against a typical ~900-1,500 live quads, i.e. ~7-12 KB.
+//
+// A 65-100x over-read on every chunk, and ~6.4 GB of PCIe traffic to fill R0
+// once at 128 m against a kernel time measured at ~0.09 s. On that path it is
+// the readback, not the GPU, that sets streaming throughput.
+//
+// So the total is computed HERE, on the GPU, into a one-element buffer, and
+// that is the only thing frame N reads back.
+//
+// WHY IT IS NOT IN worldgen.ush, WHICH IS WHERE THE SCAN LIVES. Two reasons,
+// both about blast radius rather than tidiness:
+//
+//   1. The determinism gate compiles worldgen.ush two ways and pins a digest
+//      over the result. This kernel has nothing to do with worldgen and no
+//      business inside that contract; putting it here means it cannot move the
+//      digest, cannot require a SPIR-V respin, and cannot fail the shader lint
+//      for reasons unrelated to world generation.
+//   2. worldgen.ush is the file ground rule 10 is about: it is shared with the
+//      main checkout that other waves run editors out of, and editing a .ush
+//      under a live editor kills the whole shader compile batch.
+//
+// VoxelQuadDecodeTest.usf is the precedent for a small kernel living project-
+// side rather than in voxel-core.
+
+#include "/Engine/Public/Platform.ush"
+
+StructuredBuffer<uint> InQuadCounts;
+StructuredBuffer<uint> InQuadOffsets;
+RWStructuredBuffer<uint> OutQuadTotal;   // exactly one element
+uint MaskCount;
+
+// One thread. The work is two loads and an add; a wider dispatch would only
+// add ways for it to be wrong.
+[numthreads(1, 1, 1)]
+void QuadTotalMain(uint3 tid : SV_DispatchThreadID)
+{
+	if (tid.x != 0)
+	{
+		return;
+	}
+
+	// A zero-mask region has no interior brick to mesh, so it emits nothing.
+	// ValidateRegionRequest already rejects that shape, but reading
+	// InQuadCounts[MaskCount - 1] with MaskCount == 0 would underflow to
+	// 0xFFFFFFFF and index wildly out of bounds -- the exact class of fault
+	// tools/lint-shader-ub.py exists to prevent, so it is guarded here even
+	// though the host cannot currently produce it.
+	if (MaskCount == 0)
+	{
+		OutQuadTotal[0] = 0;
+		return;
+	}
+
+	// The scan is EXCLUSIVE, so the last mask's start offset plus its own
+	// count is the total. Identical derivation to the CPU one this replaces
+	// (VoxelGpuWorldGen.cpp's RunRegionBlocking and the async manager's
+	// harvest), deliberately, so the two can be cross-checked.
+	const uint Last = MaskCount - 1;
+	OutQuadTotal[0] = InQuadOffsets[Last] + InQuadCounts[Last];
+}

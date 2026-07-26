@@ -71,10 +71,27 @@ namespace
 	// the other, so it is an atomic with acquire/release ordering rather than a
 	// plain int -- Error and the staging arrays are published by the same
 	// release-store that moves the state, and read after the matching acquire.
+	// Where a job is.
+	//
+	// WAVE D / D3 SPLIT THIS IN TWO. There used to be one round trip: dispatch,
+	// then read back Counts + Offsets + the whole upper-bound quad buffer and
+	// work out afterwards how much of it was live. That is ~810 KB per chunk to
+	// recover ~7-12 KB of quads (see VoxelQuadScan.usf for the arithmetic and
+	// why it, not the kernel, sets streaming throughput).
+	//
+	// Now frame N reads back FOUR BYTES -- the scan total -- and frame N+k reads
+	// back exactly that many quads. Two round trips instead of one, which costs
+	// latency and saves ~70-100x the bandwidth. That is the right trade for a
+	// streaming path whose in-flight cap already absorbs latency, and it is
+	// transitional either way: once the pool's buffers are UAV-writable and
+	// RDG-registered (D1), phase 2 becomes a GPU->GPU copy into the allocated
+	// range and reads back NOTHING.
 	enum class EJobState : int32
 	{
 		Queued = 0,      // game thread owns it
-		Dispatched,      // render thread has executed the graph; readbacks pending
+		Dispatched,      // graph executed; the 4-byte total readback is pending
+		TotalDone,       // total has landed; the game thread must start phase 2
+		QuadsDispatched, // phase 2 enqueued; the sized quad readback is pending
 		ReadbackDone,    // render thread has copied everything out
 		Failed,          // render thread gave up; Error says why
 	};
@@ -97,15 +114,30 @@ struct FVoxelGpuMeshJobManager::FJob
 
 	// Created and destroyed on the render thread, kept alive by this object's
 	// refcount for as long as any render command can still touch them.
+	//
+	// TotalReadback is phase 1 and always present. QuadsReadback is phase 2.
+	// Counts/Offsets are only created for the brick-local control path, which
+	// is the one that still has to rebase on the CPU and therefore still needs
+	// the per-mask tables; the chunk-local path never reads them.
+	TUniquePtr<FRHIGPUBufferReadback> TotalReadback;
 	TUniquePtr<FRHIGPUBufferReadback> CountsReadback;
 	TUniquePtr<FRHIGPUBufferReadback> OffsetsReadback;
 	TUniquePtr<FRHIGPUBufferReadback> QuadsReadback;
+
+	// The quad buffer, kept alive ACROSS GRAPHS. Today's Voxel.Quads is an RDG
+	// transient and dies at GraphBuilder.Execute(); phase 2 runs in a different
+	// graph a frame or more later, so it has to outlive the first one. This is
+	// the reference that makes that true, and dropping it is what frees the
+	// memory.
+	TRefCountPtr<FRDGPooledBuffer> QuadBuffer;
 
 	// Staged by the render thread, consumed by the game thread after State goes
 	// to ReadbackDone.
 	TArray<uint32> Counts;
 	TArray<uint32> Offsets;
 	TArray<uint64> RawQuads;
+	// What QuadTotalMain said, i.e. how many quads phase 2 actually fetches.
+	uint32 NumQuads = 0;
 	FString Error;
 
 	std::atomic<int32> State{ int32(EJobState::Queued) };
@@ -116,6 +148,11 @@ struct FVoxelGpuMeshJobManager::FJob
 	// Set by the game thread when it has given up on this job (timeout /
 	// cancellation). The render thread checks it so a late poll does no work.
 	std::atomic<int32> Abandoned{ 0 };
+	// Set by the game thread when it has enqueued phase 2 for this job. The
+	// state does not move to QuadsDispatched until the render command runs, so
+	// without this the next tick would see TotalDone again and enqueue a second
+	// fetch — two readbacks racing to fill one array.
+	std::atomic<int32> QuadFetchStarted{ 0 };
 
 	double SubmitSeconds = 0.0;
 	double DispatchSeconds = 0.0;
@@ -161,9 +198,14 @@ namespace
 		ENQUEUE_RENDER_COMMAND(VoxelGpuMeshReleaseReadbacks)(
 			[Job](FRHICommandListImmediate&)
 		{
+			Job->TotalReadback.Reset();
 			Job->CountsReadback.Reset();
 			Job->OffsetsReadback.Reset();
 			Job->QuadsReadback.Reset();
+			// Frees the persistent quad buffer back to RDG's pool. Deliberately
+			// on the render thread with everything else: this is an RHI resource
+			// reference and it is the last thing holding it.
+			Job->QuadBuffer.SafeRelease();
 		});
 	}
 
@@ -385,23 +427,38 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			const VoxelGpuWorldGen::FRegionGraphResources Graph =
 				VoxelGpuWorldGen::AddRegionPasses(GraphBuilder, Job->Region);
 
-			if (Graph.Quads == nullptr || Graph.Counts == nullptr || Graph.Offsets == nullptr)
+			if (Graph.Quads == nullptr || Graph.Counts == nullptr ||
+			    Graph.Offsets == nullptr || Graph.Total == nullptr)
 			{
 				Job->Error = TEXT("mesh chain produced no quad buffers");
 				Job->SetState(EJobState::Failed);
 				continue;
 			}
 
-			Job->CountsReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.Async.Counts"));
-			Job->OffsetsReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.Async.Offsets"));
-			Job->QuadsReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.Async.Quads"));
+			// The quad buffer has to survive this graph: phase 2 fetches from
+			// it in a later one. Everything else here dies at Execute, as it
+			// should.
+			Job->QuadBuffer = GraphBuilder.ConvertToExternalBuffer(Graph.Quads);
 
-			AddEnqueueCopyPass(GraphBuilder, Job->CountsReadback.Get(), Graph.Counts,
-			                   Job->Sizes.CountsBytes());
-			AddEnqueueCopyPass(GraphBuilder, Job->OffsetsReadback.Get(), Graph.Offsets,
-			                   Job->Sizes.CountsBytes());
-			AddEnqueueCopyPass(GraphBuilder, Job->QuadsReadback.Get(), Graph.Quads,
-			                   Job->Sizes.QuadsBytes());
+			// PHASE 1 READS FOUR BYTES. That is the whole point of D3 — see the
+			// EJobState comment.
+			Job->TotalReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.Async.QuadTotal"));
+			AddEnqueueCopyPass(GraphBuilder, Job->TotalReadback.Get(), Graph.Total, sizeof(uint32));
+
+			// ...except on the brick-local control path, which rebases on the
+			// CPU and so genuinely needs the per-mask tables. Kept honest
+			// rather than lean: voxel.GPU.MeshChunkLocal 0 is meant to be the
+			// PREVIOUS behaviour, and that included these reads.
+			if (!Job->Region.bChunkLocalQuads)
+			{
+				Job->CountsReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.Async.Counts"));
+				Job->OffsetsReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.Async.Offsets"));
+
+				AddEnqueueCopyPass(GraphBuilder, Job->CountsReadback.Get(), Graph.Counts,
+				                   Job->Sizes.CountsBytes());
+				AddEnqueueCopyPass(GraphBuilder, Job->OffsetsReadback.Get(), Graph.Offsets,
+				                   Job->Sizes.CountsBytes());
+			}
 
 			Built.Add(Job);
 		}
@@ -420,16 +477,73 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 	});
 }
 
+// PHASE 2. The total has landed, so fetch exactly that many quads out of the
+// buffer phase 1 kept alive.
+//
+// THIS IS THE TRANSITIONAL HALF OF D3. Once the pool's buffers are UAV-writable
+// and RDG-registered (D1), this stops being a readback at all: it becomes
+// Pool.Alloc(NumQuads) plus a GPU->GPU copy into the allocated range, the quad
+// stream never touches system memory, and delivery happens off the 4-byte total
+// alone. The structure here is deliberately the shape that change slots into —
+// one place that turns a known quad count into a destination.
+void FVoxelGpuMeshJobManager::DispatchQuadFetch(TArray<FJobPtr>&& Batch)
+{
+	ENQUEUE_RENDER_COMMAND(VoxelGpuMeshFetchQuads)(
+		[Jobs = MoveTemp(Batch)](FRHICommandListImmediate& RHICmdList)
+	{
+		FRDGBuilder GraphBuilder(RHICmdList);
+
+		TArray<FJobPtr> Built;
+		Built.Reserve(Jobs.Num());
+
+		for (const FJobPtr& Job : Jobs)
+		{
+			if (Job->Abandoned.load(std::memory_order_acquire) != 0)
+			{
+				continue;
+			}
+			if (!Job->QuadBuffer.IsValid())
+			{
+				Job->Error = TEXT("quad buffer did not survive phase 1");
+				Job->SetState(EJobState::Failed);
+				continue;
+			}
+
+			FRDGBufferRef Quads = GraphBuilder.RegisterExternalBuffer(
+				Job->QuadBuffer, TEXT("Voxel.Async.QuadsPersistent"));
+
+			// Exactly the live range. Offsets are exclusive-scanned from zero,
+			// so the live quads are [QuadWriteBase, QuadWriteBase + NumQuads)
+			// and the base is zero on every path today — the copy starts at 0
+			// and the harvest trims any prefix.
+			const uint32 Bytes =
+				(Job->Sizes.QuadWriteBase + Job->NumQuads) * uint32(sizeof(uint64));
+
+			Job->QuadsReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.Async.Quads"));
+			AddEnqueueCopyPass(GraphBuilder, Job->QuadsReadback.Get(), Quads, Bytes);
+
+			Built.Add(Job);
+		}
+
+		GraphBuilder.Execute();
+
+		for (const FJobPtr& Job : Built)
+		{
+			Job->SetState(EJobState::QuadsDispatched);
+		}
+	});
+}
+
 void FVoxelGpuMeshJobManager::PollInFlight()
 {
 	const double Now = FPlatformTime::Seconds();
 
-	// Ask the render thread to look at every job that is dispatched and does not
-	// already have a poll outstanding. One command for all of them.
+	// --- poll both pending phases in one render command ---------------------
 	TArray<FJobPtr> ToPoll;
 	for (const FJobPtr& Job : InFlight)
 	{
-		if (Job->GetState() != EJobState::Dispatched)
+		const EJobState State = Job->GetState();
+		if (State != EJobState::Dispatched && State != EJobState::QuadsDispatched)
 		{
 			continue;
 		}
@@ -449,55 +563,143 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 			{
 				ON_SCOPE_EXIT { Job->PollPending.store(0, std::memory_order_release); };
 
-				if (Job->Abandoned.load(std::memory_order_acquire) != 0 ||
-				    Job->GetState() != EJobState::Dispatched)
-				{
-					continue;
-				}
-				if (!Job->CountsReadback.IsValid() || !Job->OffsetsReadback.IsValid() ||
-				    !Job->QuadsReadback.IsValid())
-				{
-					Job->Error = TEXT("readback objects missing");
-					Job->SetState(EJobState::Failed);
-					continue;
-				}
-				// All three or none: a partially-landed set would produce a quad
-				// stream indexed by stale offsets, which is worse than waiting.
-				if (!Job->CountsReadback->IsReady() || !Job->OffsetsReadback->IsReady() ||
-				    !Job->QuadsReadback->IsReady())
+				if (Job->Abandoned.load(std::memory_order_acquire) != 0)
 				{
 					continue;
 				}
 
-				Job->ReadySeconds = FPlatformTime::Seconds();
+				const EJobState State = Job->GetState();
 
-				const uint32 MaskCount = Job->Sizes.MaskCount;
-
-				Job->Counts.SetNumUninitialized(int32(MaskCount));
-				Job->Offsets.SetNumUninitialized(int32(MaskCount));
-				// The WHOLE quad buffer, including any QuadWriteBase prefix
-				// belonging to other chunks — QuadsBytes() is sized the same
-				// way, and the harvest below is what trims it.
-				Job->RawQuads.SetNumUninitialized(int32(Job->Sizes.QuadBufferElements));
-
-				FString Error;
-				const bool bOk =
-					CopyReadback(*Job->CountsReadback, Job->Counts.GetData(),
-					             Job->Sizes.CountsBytes(), TEXT("Counts"), Error) &&
-					CopyReadback(*Job->OffsetsReadback, Job->Offsets.GetData(),
-					             Job->Sizes.CountsBytes(), TEXT("Offsets"), Error) &&
-					CopyReadback(*Job->QuadsReadback, Job->RawQuads.GetData(),
-					             Job->Sizes.QuadsBytes(), TEXT("Quads"), Error);
-
-				if (!bOk)
+				// --- phase 1: the 4-byte total (+ the control path's tables) --
+				if (State == EJobState::Dispatched)
 				{
-					Job->Error = Error;
-					Job->SetState(EJobState::Failed);
+					const bool bNeedTables = !Job->Region.bChunkLocalQuads;
+					if (!Job->TotalReadback.IsValid() ||
+					    (bNeedTables && (!Job->CountsReadback.IsValid() ||
+					                     !Job->OffsetsReadback.IsValid())))
+					{
+						Job->Error = TEXT("phase 1 readback objects missing");
+						Job->SetState(EJobState::Failed);
+						continue;
+					}
+					// All or none: a total that landed without its tables would
+					// have the control path rebasing against stale offsets.
+					if (!Job->TotalReadback->IsReady() ||
+					    (bNeedTables && (!Job->CountsReadback->IsReady() ||
+					                     !Job->OffsetsReadback->IsReady())))
+					{
+						continue;
+					}
+
+					// The GPU number. This is what D3 exists to fetch, and it
+					// is 4 bytes.
+					Job->ReadySeconds = FPlatformTime::Seconds();
+
+					FString Error;
+					bool bOk = CopyReadback(*Job->TotalReadback, &Job->NumQuads,
+					                        sizeof(uint32), TEXT("QuadTotal"), Error);
+
+					if (bOk && bNeedTables)
+					{
+						const uint32 MaskCount = Job->Sizes.MaskCount;
+						Job->Counts.SetNumUninitialized(int32(MaskCount));
+						Job->Offsets.SetNumUninitialized(int32(MaskCount));
+						bOk = CopyReadback(*Job->CountsReadback, Job->Counts.GetData(),
+						                   Job->Sizes.CountsBytes(), TEXT("Counts"), Error) &&
+						      CopyReadback(*Job->OffsetsReadback, Job->Offsets.GetData(),
+						                   Job->Sizes.CountsBytes(), TEXT("Offsets"), Error);
+					}
+
+					if (!bOk)
+					{
+						Job->Error = Error;
+						Job->SetState(EJobState::Failed);
+						continue;
+					}
+					Job->SetState(EJobState::TotalDone);
 					continue;
 				}
-				Job->SetState(EJobState::ReadbackDone);
+
+				// --- phase 2: exactly NumQuads quads --------------------------
+				if (State == EJobState::QuadsDispatched)
+				{
+					if (!Job->QuadsReadback.IsValid())
+					{
+						Job->Error = TEXT("phase 2 readback object missing");
+						Job->SetState(EJobState::Failed);
+						continue;
+					}
+					if (!Job->QuadsReadback->IsReady())
+					{
+						continue;
+					}
+
+					const uint32 Elements = Job->Sizes.QuadWriteBase + Job->NumQuads;
+					Job->RawQuads.SetNumUninitialized(int32(Elements));
+
+					FString Error;
+					if (!CopyReadback(*Job->QuadsReadback, Job->RawQuads.GetData(),
+					                  Elements * uint32(sizeof(uint64)), TEXT("Quads"), Error))
+					{
+						Job->Error = Error;
+						Job->SetState(EJobState::Failed);
+						continue;
+					}
+					Job->SetState(EJobState::ReadbackDone);
+				}
 			}
 		});
+	}
+
+	// --- start phase 2 for anything whose total has landed -------------------
+	//
+	// Game thread, because it is the thread that owns the decision and because
+	// it is where the "is this count even sane" check belongs. Batched into one
+	// render command for the same reason phase 1 is.
+	{
+		TArray<FJobPtr> ToFetch;
+		for (const FJobPtr& Job : InFlight)
+		{
+			if (Job->GetState() != EJobState::TotalDone)
+			{
+				continue;
+			}
+			int32 Expected = 0;
+			if (!Job->QuadFetchStarted.compare_exchange_strong(Expected, 1, std::memory_order_acq_rel))
+			{
+				continue;
+			}
+
+			if (Job->NumQuads > Job->Sizes.MaxQuads)
+			{
+				// Caught HERE rather than after a fetch, because the fetch would
+				// be sized from this number: a corrupt total would ask for a
+				// copy far larger than the buffer.
+				Job->Error = FString::Printf(
+					TEXT("QuadTotalMain reports %u quads but the buffer holds at most %u"),
+					Job->NumQuads, Job->Sizes.MaxQuads);
+				Job->SetState(EJobState::Failed);
+				continue;
+			}
+
+			if (Job->NumQuads == 0)
+			{
+				// An all-air or all-solid chunk. Nothing to fetch, so it skips
+				// phase 2 entirely and delivers a frame earlier — which is not
+				// an edge case at level 0, where most of the vertical stack is
+				// one or the other.
+				Job->RawQuads.Reset();
+				Job->SetState(EJobState::ReadbackDone);
+				continue;
+			}
+
+			ToFetch.Add(Job);
+		}
+
+		if (ToFetch.Num() > 0)
+		{
+			DispatchQuadFetch(MoveTemp(ToFetch));
+		}
 	}
 
 	// Harvest, in two phases.
@@ -523,33 +725,20 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 
 		if (State == EJobState::ReadbackDone)
 		{
-			// The scan is exclusive, so the live quad count is the last mask's
-			// offset plus its own count.
-			const uint32 MaskCount = Job->Sizes.MaskCount;
-			const uint32 NumQuads = (MaskCount > 0)
-				? Job->Offsets[int32(MaskCount) - 1] + Job->Counts[int32(MaskCount) - 1]
-				: 0;
-
+			// NumQuads came off the GPU in phase 1 and was range-checked before
+			// phase 2 was sized from it, so there is nothing left to derive
+			// here. On the brick-local control path the per-mask tables are
+			// present too and RebaseQuadsToChunkLocal walks them; on the
+			// chunk-local path they were never read.
 			InFlight.RemoveAt(I, EAllowShrinking::No);
 
-			if (NumQuads > Job->Sizes.MaxQuads)
+			// Drop the QuadWriteBase prefix, leaving exactly this job's live
+			// quads. The prefix is empty on every path today.
+			if (Job->Sizes.QuadWriteBase > 0 && Job->RawQuads.Num() > 0)
 			{
-				Finished.Add({ Job, EVoxelGpuMeshJobStatus::ReadbackFailed,
-					FString::Printf(TEXT("scan reports %u quads but the buffer holds at most %u"),
-					                NumQuads, Job->Sizes.MaxQuads) });
+				Job->RawQuads.RemoveAt(0, int32(Job->Sizes.QuadWriteBase), EAllowShrinking::No);
 			}
-			else
-			{
-				// Drop the QuadWriteBase prefix first, then the unused tail, so
-				// RawQuads is exactly this job's live quads either way. The
-				// prefix is empty on every path today.
-				if (Job->Sizes.QuadWriteBase > 0)
-				{
-					Job->RawQuads.RemoveAt(0, int32(Job->Sizes.QuadWriteBase), EAllowShrinking::No);
-				}
-				Job->RawQuads.SetNum(int32(NumQuads), EAllowShrinking::No);
-				Finished.Add({ Job, EVoxelGpuMeshJobStatus::Success, FString() });
-			}
+			Finished.Add({ Job, EVoxelGpuMeshJobStatus::Success, FString() });
 			continue;
 		}
 

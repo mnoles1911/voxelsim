@@ -59,8 +59,8 @@ namespace VoxelGpuWorldGen
 		uint32 QuadsBytes() const { return QuadBufferElements * uint32(sizeof(uint64)); }
 	};
 
-	// The graph's output buffers. Counts/Offsets/Quads are null when the request
-	// asked for generation only.
+	// The graph's output buffers. Counts/Offsets/Quads/Total are null when the
+	// request asked for generation only.
 	struct FRegionGraphResources
 	{
 		FRDGBufferRef Columns = nullptr;
@@ -68,6 +68,16 @@ namespace VoxelGpuWorldGen
 		FRDGBufferRef Counts = nullptr;
 		FRDGBufferRef Offsets = nullptr;
 		FRDGBufferRef Quads = nullptr;
+
+		// Wave D / D3: ONE uint — how many quads the emit pass actually wrote.
+		//
+		// This is the only thing a streaming job needs off the GPU before it can
+		// allocate a pool range, and reading it instead of Counts+Offsets+Quads
+		// is the difference between 4 bytes and ~810 KB per chunk. See
+		// VoxelQuadScan.usf for the arithmetic that makes that the whole point
+		// of the wave.
+		FRDGBufferRef Total = nullptr;
+
 		FRegionGraphSizes Sizes;
 	};
 
