@@ -91,6 +91,19 @@ struct FVoxelGpuRegionRequest
 	// ValidateRegionRequest REJECTS a non-zero base without it rather than let
 	// it be silently ignored.
 	uint32 QuadWriteBase = 0;
+
+	// --- Wave D / D6: the footprint band ------------------------------------
+	//
+	// BandEdge 0 (the default) skips the band pass entirely. Set it to the
+	// column-grid edge the CPU uses (ChunkEdgeVoxels + 2 = 34) and BandOriginI
+	// to the dispatch-column index that grid starts at, and the graph reduces
+	// the band on the GPU instead of the streaming job doing a 34x34 column
+	// pass on a worker thread -- ~45% of level-0 job time.
+	//
+	// Only one chunk per (X,Y) footprint needs to ask for it, which is why it
+	// is opt-in per request rather than implied by bMeshChain.
+	uint32 BandOriginI = 0;
+	uint32 BandEdge = 0;
 };
 
 struct FVoxelGpuRegionResult

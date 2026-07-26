@@ -2265,6 +2265,36 @@ It removes the CPU column pass from a GPU-meshed level-0 job, i.e. the
 address. Together they are what turns *"GPU meshing removes the meshing, not the
 job"* into removing the job.
 
+#### Built 2026-07-26 — kernel and graph pass only. **NOT VERIFIED, NOT WIRED.**
+
+`ue-project/Shaders/VoxelBandReduce.usf` / `BandReduceMain`, plus pass 2b in
+`AddRegionPasses` and `BandOriginI`/`BandEdge` on the request (0 skips it).
+Compiles; `worldgen.ush` untouched, so no respin and no digest exposure.
+
+**It must not be trusted until it is gated, and the gate does not exist yet.**
+What it needs, and the one obstacle:
+
+`VoxelStreaming::ColumnDeepestAirVoxel` and `ColumnSurfaceTopVoxel` live **inside
+`VoxelWorldSubsystem.cpp`**, so nothing else can call them. A verification
+harness therefore cannot compare against the shipping reduction — only against a
+**transcription** of it, which is exactly what `VoxelGpuMeshAsyncVerify.cpp`'s
+own header warns against: it compares against `MeshChunkBricks`, *"the actual
+shipping CPU mesher, not a transcription of it — that is why it lives in
+VoxelChunkMesher.h now."*
+
+**So the gate wants the same move `MeshChunkBricks` already got:** lift both
+helpers (and `CeilSqrtI64`) into a header, then extend `voxel.GPU.VerifyRegion`
+to compare the GPU band against the real CPU one over the fixture regions. That
+is a small refactor and it is a **precondition**, not a nicety — a band that is
+wrong in the conservative direction wastes work, but wrong in the *other*
+direction skips chunks that should have been meshed, which reads as holes in the
+world and would be blamed on streaming.
+
+**Also still owed:** folding the two ints into D3's phase-1 readback (4 → 12
+bytes, same result object), which is the design's whole point and is where the
+zero-new-invariant-surface property comes from. Until that lands the kernel
+computes a band nobody reads.
+
 **Sequencing: after D1–D4 are landed and measured**, alongside D5, for the same
 reason D5 waits — debugging shared plumbing against a novel path doubles the
 search space for any failure.
