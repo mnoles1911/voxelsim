@@ -110,3 +110,19 @@ not the mesh), and running the known-good pool beside the failing one.
   and reads exactly like a regression.
 - **Never A/B this renderer through scalability cvars.** `r.ShadowQuality 0`
   desyncs the BeginPlay PSO precache and measures precache invalidation instead.
+- **A stale `voxelcore.lib` reads exactly like a broken GPU kernel.** The GPU
+  kernels are compiled from `voxel-core/shaders/worldgen.ush` at editor startup,
+  every time. The CPU reference they are compared against is *linked* from
+  `build/voxel-core-msvc/voxelcore.lib`, which is not rebuilt by
+  `Build.bat` and not checked for staleness by anything. Change worldgen on the
+  CPU side without re-running cmake and every parity gate fails, with the shader
+  — the half that is definitely current — looking like the guilty party. It cost
+  a full debugging cycle: `topsoilMm` came back 0 from the CPU and 100–180 from
+  the GPU, and `amplifier.cpp` clamps it to a floor of 100 and provably cannot
+  return 0. **A CPU reference producing a value its own source forbids means the
+  binary is older than the source.** `cmake --build build/voxel-core-msvc
+  --config Release` first, and note that UBT caches the resolved library path in
+  its makefile — touch `VoxelEarth.Build.cs` to make it look again.
+- **A worktree needs its own `build/`, not a junction to the main one.** The
+  junction is tempting (it makes the UE build configure immediately) and it is
+  how the stale library above got linked in the first place.

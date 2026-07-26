@@ -45,7 +45,12 @@
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelGpuAsync, Log, All);
 
-namespace
+// A NAMED namespace, not an anonymous one. VoxelGpuVerify.cpp has its own
+// file-local kSeed, and UE's unity build concatenates the two translation units
+// -- at which point two anonymous namespaces are one namespace and the names
+// collide. Naming this one keeps it file-local in intent without depending on
+// which unity group the file lands in.
+namespace VoxelGpuMeshAsyncVerify
 {
 	// Same fixture seed as voxel.GPU.VerifyRegion / the bench, so anything this
 	// finds is about the runner and not about which world we are in.

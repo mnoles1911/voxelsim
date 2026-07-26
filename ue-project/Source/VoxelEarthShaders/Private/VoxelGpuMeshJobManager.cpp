@@ -281,7 +281,11 @@ void FVoxelGpuMeshJobManager::Tick()
 	check(IsInGameThread());
 
 	// --- 1. promote queued jobs, one RDG graph for the whole batch ----------
+	//
+	// Rejections are collected rather than delivered inline, for the same
+	// reentrancy reason as the harvest below.
 	TArray<FJobPtr> Batch;
+	TArray<TPair<FJobPtr, FString>> Rejected;
 	while (Queued.Num() > 0 && InFlight.Num() + Batch.Num() < MaxInFlight)
 	{
 		FJobPtr Job = Queued[0];
@@ -290,19 +294,17 @@ void FVoxelGpuMeshJobManager::Tick()
 		FString ValidationError;
 		if (!VoxelGpuWorldGen::IsSupportedOnCurrentRHI())
 		{
-			Deliver(Job, EVoxelGpuMeshJobStatus::Rejected,
-			        TEXT("Requires SM6 (64-bit integer shader ops). Relaunch with -sm6."));
+			Rejected.Emplace(Job, TEXT("Requires SM6 (64-bit integer shader ops). Relaunch with -sm6."));
 			continue;
 		}
 		if (!VoxelGpuWorldGen::ValidateRegionRequest(Job->Region, ValidationError))
 		{
-			Deliver(Job, EVoxelGpuMeshJobStatus::Rejected, ValidationError);
+			Rejected.Emplace(Job, ValidationError);
 			continue;
 		}
 		if (!Job->Region.bMeshChain)
 		{
-			Deliver(Job, EVoxelGpuMeshJobStatus::Rejected,
-			        TEXT("bMeshChain must be true — this manager exists to produce quads"));
+			Rejected.Emplace(Job, TEXT("bMeshChain must be true — this manager exists to produce quads"));
 			continue;
 		}
 
@@ -318,6 +320,11 @@ void FVoxelGpuMeshJobManager::Tick()
 	{
 		InFlight.Append(Batch);
 		DispatchBatch(MoveTemp(Batch));
+	}
+
+	for (const TPair<FJobPtr, FString>& R : Rejected)
+	{
+		Deliver(R.Key, EVoxelGpuMeshJobStatus::Rejected, R.Value);
 	}
 
 	// --- 2. poll and harvest ------------------------------------------------
@@ -462,8 +469,22 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 		});
 	}
 
-	// Harvest. Everything that leaves InFlight is delivered here, in this loop,
-	// exactly once -- there is no other exit.
+	// Harvest, in two phases.
+	//
+	// PHASE 1 decides and detaches; PHASE 2 delivers. They are separate because a
+	// completion callback is free to call back into the manager -- Submit is the
+	// obvious one, but CancelAll or destroying the manager are both legitimate
+	// reactions to a failure, and either would mutate InFlight underneath a loop
+	// that was still iterating it. Detaching first means the delivery loop owns
+	// its jobs outright and nothing it triggers can invalidate them.
+	struct FPending
+	{
+		FJobPtr Job;
+		EVoxelGpuMeshJobStatus Status;
+		FString Error;
+	};
+	TArray<FPending> Finished;
+
 	for (int32 I = InFlight.Num() - 1; I >= 0; --I)
 	{
 		const FJobPtr Job = InFlight[I];
@@ -482,24 +503,22 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 
 			if (NumQuads > Job->Sizes.MaxQuads)
 			{
-				Deliver(Job, EVoxelGpuMeshJobStatus::ReadbackFailed,
-				        FString::Printf(TEXT("scan reports %u quads but the buffer holds at most %u"),
-				                        NumQuads, Job->Sizes.MaxQuads));
+				Finished.Add({ Job, EVoxelGpuMeshJobStatus::ReadbackFailed,
+					FString::Printf(TEXT("scan reports %u quads but the buffer holds at most %u"),
+					                NumQuads, Job->Sizes.MaxQuads) });
 			}
 			else
 			{
 				Job->RawQuads.SetNum(int32(NumQuads), EAllowShrinking::No);
-				Deliver(Job, EVoxelGpuMeshJobStatus::Success, FString());
+				Finished.Add({ Job, EVoxelGpuMeshJobStatus::Success, FString() });
 			}
-			ReleaseReadbacksOnRenderThread(Job);
 			continue;
 		}
 
 		if (State == EJobState::Failed)
 		{
 			InFlight.RemoveAt(I, EAllowShrinking::No);
-			Deliver(Job, EVoxelGpuMeshJobStatus::DispatchFailed, Job->Error);
-			ReleaseReadbacksOnRenderThread(Job);
+			Finished.Add({ Job, EVoxelGpuMeshJobStatus::DispatchFailed, Job->Error });
 			continue;
 		}
 
@@ -510,10 +529,15 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 			// render command still holding a reference.
 			Job->Abandoned.store(1, std::memory_order_release);
 			InFlight.RemoveAt(I, EAllowShrinking::No);
-			Deliver(Job, EVoxelGpuMeshJobStatus::TimedOut,
-			        FString::Printf(TEXT("readback not ready after %.1f s"), TimeoutSeconds));
-			ReleaseReadbacksOnRenderThread(Job);
+			Finished.Add({ Job, EVoxelGpuMeshJobStatus::TimedOut,
+				FString::Printf(TEXT("readback not ready after %.1f s"), TimeoutSeconds) });
 		}
+	}
+
+	for (const FPending& P : Finished)
+	{
+		Deliver(P.Job, P.Status, P.Error);
+		ReleaseReadbacksOnRenderThread(P.Job);
 	}
 }
 
