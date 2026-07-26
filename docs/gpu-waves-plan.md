@@ -1261,6 +1261,99 @@ footprint's column or a tile of neighbours and slice the quad stream by
 `meshBrickIndex`. Cap: `MaskCount ≤ 65,536` (single-workgroup scan) ⇒ ≤1,365
 interior bricks per dispatch.
 
+### D6 — move the footprint band to the GPU — **costed and APPROVED 2026-07-26, not yet built**
+
+Costed *before* wiring, deliberately, so the answer could shape the build. It
+did — the brief's stated risk was wrong, and the design that survives is
+smaller than the one that was asked for.
+
+#### The brief's risk was wrong, and this is why
+
+The question was *"can admission tolerate a band that arrives a few frames
+late?"*, on the assumption that a late band would stall admission. **It does not,
+and the system already depends on it not doing so.**
+
+The cold-band throttle (`VoxelWorldSubsystem.cpp:5930-5951`) defers a chunk only
+when there is **no band AND** a live `FootprintBlindJobInFlight` mark younger
+than `kBlindJobMarkTimeoutSeconds`. That mark is added (`:6549`) only *after* a
+launch and only for a footprint with no band yet. So **the first job for every
+footprint already runs blind**, produces the band, and later chunks in that (X,Y)
+column benefit from it.
+
+The band is therefore an **optimisation** — skip provably-empty chunks — **not an
+admission gate**, and lateness is the designed-for case, not a hazard.
+
+**The real risk is not *late*, it is *never*.** If bands stop arriving at all the
+column throttles; the mark timeout is the existing backstop that stops even that
+being permanent. Recorded because the wrong version of this ("cannot tolerate a
+late band") would have killed a change that is actually cheap.
+
+#### Design, as approved
+
+1. **The band rides D3's phase-1 readback. 4 bytes → 12** (`QuadTotal`,
+   `MaxSurfaceTopVoxel`, `SolidBelowVoxel`), in the **same** result object.
+   `DrainResults` is untouched and keeps doing `FootprintBandCache.Add`
+   (`:7101`), `FootprintBlindJobInFlight.Remove` (`:7113`) and
+   `--LevelJobsInFlight` (`:7188`) in one pass on one result.
+
+   **This is the load-bearing choice.** A separate band readback would create two
+   independent async streams that must *both* satisfy exactly-one-outcome, with a
+   job able to deliver quads but no band. Doubling that invariant surface is the
+   class of change that produced the stranded-column bug in the first place. Zero
+   new invariant surface is worth far more than the bytes.
+
+2. **The band is z-independent.** `ColumnSurfaceTopVoxel` (`:1282`) and
+   `ColumnDeepestAirVoxel` (`:1305`) are pure functions of one
+   `vxc::ColumnSample` — no chunk-z anywhere. So the band needs `ColumnMain`
+   plus cave/cavern, and **does not need `VoxelizeMain` or its cell grid at
+   all**. Much smaller than the brief assumed.
+
+3. **No `worldgen.ush` edit, and no atomics.** A **new `.usf` that `#include`s
+   `worldgen.ush`** and adds a `BandReduceMain` entry point — the same shim shape
+   `VoxelWorldGen.usf` already uses. That gives it `caveColumnFor` /
+   `cavernColumnFor` for free while leaving `worldgen.ush` byte-identical: no
+   SPIR-V respin, no new bench descriptor bindings, nothing added to the
+   determinism digest's blast radius, and clear of ground rule 10.
+
+   **The atomic min/max question dissolves rather than needing a verdict.** One
+   workgroup of 256 striding over the 34×34 = 1,156 columns, local min/max, then
+   a fixed-order groupshared tree reduction — exactly the pattern `ScanSumsMain`
+   already uses and that the gate already covers. Deterministic by construction,
+   with no order-independence argument to defend. *(The atomic route was going to
+   be verified against the gate rather than assumed, on the grounds that this file
+   has already produced one vendor divergence from an operation that looked
+   order-independent on paper. Not needing the argument at all is better.)*
+
+   Cost of this route: cave/cavern are recomputed for 1,156 columns rather than
+   read out of `VoxelizeMain`'s registers, so ~50% extra cave work against
+   `VoxelizeMain`'s 2,304 columns. Accepted, because it buys deleting the CPU
+   column pass entirely and keeps `VoxelizeMain` out of a change it does not need
+   to be in.
+
+4. **The integer sqrt is not a determinism risk.** `ColumnDeepestAirVoxel` needs
+   `CeilSqrtI64` (`:1266`), which seeds with `FMath::Sqrt(double(V))` and then
+   corrects with `while (R*R < V) ++R; while (R > 0 && (R-1)*(R-1) >= V) --R;`.
+   `worldgen.ush` has **no sqrt of any kind** and is integer-only by contract and
+   by CI's float ban.
+
+   That is fine, because **ceil-sqrt has a unique integer answer** — the `R` with
+   `(R-1)² < V ≤ R²`. A pure-integer binary-search isqrt in HLSL and the
+   FP-seeded CPU version converge on the same `R` **by construction**. The fix
+   removes floating point from the comparison rather than trying to make two FP
+   paths agree, which is the correct shape given this file's history with vendor
+   divergence (`floorDiv`'s `OpSRem`, the M0 AMD-vs-NVIDIA failure).
+
+#### What it is worth
+
+It removes the CPU column pass from a GPU-meshed level-0 job, i.e. the
+**~45%** of job time that is not meshing — the other half of the ~55% D1–D4
+address. Together they are what turns *"GPU meshing removes the meshing, not the
+job"* into removing the job.
+
+**Sequencing: after D1–D4 are landed and measured**, alongside D5, for the same
+reason D5 waits — debugging shared plumbing against a novel path doubles the
+search space for any failure.
+
 ### D5 — coarse-level GPU generation (levels 1–5) — **in scope (owner's call)**
 
 `voxel-core/shaders/worldgen.ush` has **no level parameter**. Levels ≥1 are ~80% of
