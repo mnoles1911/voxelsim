@@ -267,49 +267,6 @@ So: with debug tints **off**, `voxel.Stream.GPU 0` terrain must look exactly as
 it does today. That is the regression to watch, not whether the tint itself
 works.
 
-## 8. The shadow cap — its own author says his screenshots cannot score it (added Wave G)
-
-`voxel.Stream.GPUShadowMaxLevel` (default **4**) stops the coarsest cascade level
-from being submitted to the shadow depth passes. Its **counts are measured and
-clean**: `cappedQuads=837688` on the one cascade holding level-5 geometry and 0 on
-the other three — predicted from an earlier leg and then confirmed **exact to the
-quad**; 1,457,710 submitted shadow quads removed per frame (*more* than the visible
-removal, because dropping 756 far runs collapses spans the merge was covering);
-camera-visible geometry identical at 962,859 both ways; 58 EMPTY gather events
-before the cap and 58 after, so it introduced no new empty cases.
-
-**What is not measured is whether it looks the same**, and the author said so
-rather than claiming otherwise. Four screenshots came in ~0.05pp above a 0.13%
-same-config floor — consistent in direction, but the anchor was a **coastal
-vista**: ocean, sky, distant snow islands, high sun. There is almost no distant
-terrain casting long shadows there and little middle-distance relief to lose
-self-shadowing on. That is very close to the empty-sky case that cannot fail.
-
-So this needs an eye, at an anchor the harness did not have:
-
-1. **Inland, with middle-distance relief** — a valley or ridgeline, terrain
-   receding a kilometre or more. Not a shoreline.
-2. **Low sun.** Long shadows are the entire point; a high sun hides the effect
-   being tested.
-3. A/B `voxel.Stream.GPUShadowMaxLevel 5` (uncapped) against the default `4`, same
-   pose, settled both times.
-
-You are looking for **distant terrain that stops casting** — a mountain whose
-shadow vanishes, or a far hillside that flattens because it lost its own
-self-shadowing. If the two are indistinguishable at a low-sun inland anchor, the
-cap is visually free and its counts stand on their own.
-
-**A warning about the instrument, not the feature.** The census behind these counts
-*lied once already*, reporting 185,612,113 shadow quads against a 13-million-quad
-pool. `Collector.AllocateMesh()` hands back a **recycled** `FMeshBatch`, and the
-census read `Elements[0].NumPrimitives` before it was populated — so it reported a
-previous gather's value. The draw had been correct the whole time. It was caught
-because the frame got 3.5× *faster* while apparently drawing 14× more. If any
-number here disagrees with another number in the same run, that disagreement is
-the finding.
-
----
-
 ## 8. How far out terrain should cast shadows — a quality call, and only you can make it (added Wave G)
 
 **This one is not a bug hunt. It is a trade between two named quantities, and no
@@ -358,6 +315,47 @@ increasing order of how easy they are to miss:
 **Tell us which of 4 / 3 / 2 you can live with.** If 3 is acceptable it roughly
 doubles the saving; if only 4 is, that is a complete answer and the shipped
 default already reflects it.
+
+### Why the harness could not do this part, stated exactly
+
+The shipped default's **counts** are measured and clean, and it is worth knowing
+how clean before you weigh what your eye tells you: `cappedQuads=837688` on the
+one cascade holding level-5 geometry and 0 on the other three — **predicted from
+an earlier leg and then confirmed exact to the quad**; 1,457,710 submitted shadow
+quads removed per frame (*more* than the visible removal, because dropping 756 far
+runs collapses spans the merge was covering); camera-visible geometry identical at
+962,859 both ways; 58 EMPTY gather events before the cap and 58 after, so it
+introduced no new empty cases.
+
+**Screenshots were attempted and they do not settle it.** Four shots came in
+~0.05pp above a 0.13% same-config floor — consistent in direction, but the anchor
+was a **coastal vista**: ocean, sky, distant snow islands, high sun. Almost no
+distant terrain casting long shadows, little middle-distance relief to lose
+self-shadowing on. That is very close to a test that cannot fail. What they
+establish is that nothing gross broke and no stale-shadow-page artifact appeared
+at that pose; what they do **not** establish is that the cap is free where distant
+shadows actually matter. Hence the low-sun inland anchor above.
+
+### A warning about the instrument, not the feature
+
+The census behind these counts **lied once already**, reporting 185,612,113 shadow
+quads against a 13-million-quad pool. `Collector.AllocateMesh()` hands back a
+**recycled** `FMeshBatch`, and the census read `Elements[0].NumPrimitives` before
+it was populated — so it reported a previous gather's value. The draw had been
+correct the whole time. It was caught because the frame got 3.5× *faster* while
+apparently drawing 14× more.
+
+A second instrument bug was found the same way and matters more, because it
+reaches backwards: the periodic cull log sampled on a **period of 600**, and
+600 = 2³·3·5² is divisible by every plausible gathers-per-frame count, so **every
+cull line ever recorded sampled gather index 0 and only gather index 0**. Its
+famous stability — `visibleQuads=164534` identical to the digit across many
+samples — was the aliasing, not the renderer. The period is now 601, which is
+prime. **Expect that line to look noisier than it used to; that is the fix
+working.**
+
+If any number here disagrees with another number in the same run, that
+disagreement is the finding — chase it rather than averaging it away.
 
 ### One thing to check that is a bug rather than a preference
 
