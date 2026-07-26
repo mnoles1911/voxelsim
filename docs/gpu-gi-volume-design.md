@@ -347,14 +347,53 @@ but not the PS — the "compiles perfectly, reads zeros" failure. Add a
 `VoxelGI volume:` log line mirroring `VoxelGpuPool upload:`/`placement:` before
 you need it.
 
-**Step 2 — real data.** Encode under `FReadScope`, X-run merge, zero-on-revoxelize,
-zero-on-evict, swap the re-shade phase for uploads.
-*Verify (numeric, primary):* a `voxel.GI.VolumeCheck` harness that samples random
-solved cells, computes what the shader would return from the staged bytes, and
-compares against `SampleIrradiance` at the same point and normal — turns "the
-volume matches the field" into a grep. *Verify (visual, secondary):* A/B from the
-underground camera. Caves are where the difference lives; the ground camera is a
-poor discriminator.
+**Step 2 — real data. DONE.** Encode under `FReadScope` (Scheme B), X-run merge,
+zero-on-revoxelize, zero-on-evict, uploads driven off a `VolumeUploadQueue` in
+the subsystem tick.
+
+*Result (numeric, primary).* `voxel.GI.VolumeCheck`, at `-VoxelSpawnAt=-84480,53760`
+with `voxel.GI.VolumeDim=192`, 20,000 samples over 1,947 resident bricks / 852
+inside the volume:
+
+```
+VOLUMECHECK: cells=6814 meanAbsErr=0.000 maxAbsErr=0.000
+horizontal (+-X/+-Y):  cells=13186 meanAbsErr=5.950 maxAbsErr=101.988
+control (half-cell X): cells=6814  meanAbsErr=0.591 maxAbsErr=44.500
+signal (+-Z irradiance): mean=31.4 sd=46.5 min=0.0 bytes
+volumeMiss=0 fieldFirstProbeMiss=0
+```
+
+Pass bar was ±Z mean < 2/255. **Exactly 0 is the correct answer, not a
+suspicious one:** with validity premultiplied, both sides evaluate the same
+float expression over the same 8 bytes with the same weights — §2.2's claim that
+hardware trilinear reproduces the CPU sampler *exactly* rather than
+approximately, measured.
+
+Two supporting lines exist because a harness comparing a thing against itself
+also reports 0.000. The **control** repeats the comparison with the volume probe
+displaced half a cell in X — the smallest addressing mistake the origin snap
+exists to prevent — and comes out at 0.591/44.500. The **signal** line reports
+the spread of the values the error was measured over, because an unoccluded cell
+solves to exactly 1.0 and a uniformly-lit field would score 0.000 for any
+encoding at all; sd = 46.5 bytes says there was something to get wrong.
+
+The horizontal number is Scheme B's documented cost, not a defect, and it is the
+measurement step 3 decides A vs B on.
+
+*Two things worth knowing before step 3 or 4.* The X-run merge is measured at
+**1.4 bricks per run in steady state** — because the round-robin re-solve
+delivers bricks in `TMap` iteration order, so a 64-brick batch out of ~2,000
+scattered residents rarely contains X-adjacent pairs. It is the *dig* case (a
+contiguous 5×5×5 neighbourhood) the merge was designed for and that case is
+untested here. And the origin is **static**: set once from the field centre at
+the first upload and never moved, so at `VolumeDim` 64 only 36 of 1,947 resident
+bricks were inside the volume and even at 192 only 852 were. Step 4 is what
+makes the volume follow the camera.
+
+*Verify (visual, secondary):* A/B from the underground camera. Caves are where
+the difference lives; the ground camera is a poor discriminator — the surface
+capture at 40 s shows healthy terrain and no artifacts, which is a smoke test
+and not evidence of anything else.
 
 **Step 3 — pick the encoding by measurement** (§2), now against a real streamed
 field.
@@ -402,8 +441,9 @@ Read `gpu-pool-rendering-notes.md` first. The ones that bite here:
 | Name | Default | Purpose |
 |---|---|---|
 | `voxel.GI.Volume` | 0 | master switch; prefer a `-VoxelGIVolume` switch for A/B |
-| `voxel.GI.VolumeDim` | 256 | per-axis texels, startup only |
+| `voxel.GI.VolumeDim` | 64 | per-axis texels, startup only. Rounded down to a multiple of 8 so the volume is a whole number of bricks. Still 64 from step 1's bring-up rather than the recommended 256; it is read-only, so set it with `-dpcvars=voxel.GI.VolumeDim=192` |
 | `voxel.GI.MaxBrickUploadsPerFrame` | 64 | replaces the chunk-refresh budget on the pooled path |
-| `voxel.GI.VolumeRecentreCells` | 64 | dead-zone half-width |
-| `voxel.GI.VolumeCheck` | 0 | numeric field-vs-volume equivalence harness |
+| `voxel.GI.VolumeRecentreCells` | 64 | dead-zone half-width (step 4, not implemented) |
+| `voxel.GI.VolumeCheck` | 0 | numeric field-vs-volume equivalence harness. Non-zero arms it; the value is the sample count (1 = 4096). Runs once, re-armable by setting it back to 0 |
+| `voxel.GI.VolumeCheckSettleSeconds` | 20 | delay after the first texel upload before the harness runs |
 | `voxel.GI.VolumeDebugVis` | 0 | 1 raw irradiance, 2 validity, 3 checkerboard (keep step 1's pattern as a permanent ladder rung) |
