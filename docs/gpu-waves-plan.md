@@ -708,7 +708,36 @@ so this is an added uniform, not a restructure.
 fields, so changing emitted bytes changes the digest even though quads are
 display-only.
 
-### D3 — allocation without a big readback — **RESEQUENCED: do this BEFORE D4's wiring**
+### D3 — allocation without a big readback — **RESEQUENCED, and LANDED 2026-07-26 (PR #126)**
+
+**What shipped.** `ue-project/Shaders/VoxelQuadScan.usf` / `QuadTotalMain` (one
+thread, one add), added to the graph **unconditionally** so `RunRegionBlocking`
+cross-checks the GPU total against the CPU derivation on every
+`voxel.GPU.VerifyRegion` run — a kernel only the streaming path exercises is a
+kernel whose first bug appears in the streaming path.
+
+`FVoxelGpuMeshJobManager` is now three-phase: `Dispatched` (4-byte total
+pending) → `TotalDone` → `QuadsDispatched` → `ReadbackDone`. `Voxel.Quads` is
+`ConvertToExternalBuffer`'d in phase 1 because it must outlive its graph;
+`NumQuads == 0` skips phase 2 and delivers a frame early, which at level 0 is
+common rather than an edge case; and `Counts`/`Offsets` are still read only on
+the brick-local control path, so that control stays an honest reproduction of
+the old behaviour.
+
+**The cost, stated so it gets measured rather than assumed:** two round trips
+instead of one — latency-to-delivery roughly doubles while bandwidth drops
+~70–100×. Right trade for a path whose in-flight cap already absorbs latency,
+but a trade. If latency binds before bandwidth does, the next lever is a
+single-phase speculative read of a bounded prefix (~4,096 quads covers a typical
+chunk in one trip). Deliberately not built on spec, since D1 deletes this half.
+
+**`DispatchToReadyMs` changed meaning** — it is now "the total landed", not "the
+whole readback landed". It will drop for reasons unrelated to GPU speed. Do not
+compare it across this change; `SubmitToDeliverMs` is the honest end-to-end one.
+
+**Still owed:** the same box time D2 owes. Nothing measured.
+
+### D3 — the original brief, for the record
 
 **Sequencing correction, 2026-07-26. This plan had the dependency backwards.**
 D3 was written as a refinement to apply after D4 had wired GPU meshing into
