@@ -8,7 +8,9 @@ integer math.
 
 Read [docs/voxel-earth-implementation-plan.md](docs/voxel-earth-implementation-plan.md)
 first — it is the project's source of truth (vision, architecture doctrine,
-milestones). Current milestone status lives in [docs/status.md](docs/status.md).
+milestones). Current milestone status lives in [docs/status.md](docs/status.md),
+and everything known-and-not-done is in [docs/backlog.md](docs/backlog.md) —
+including a "measured and CLOSED" section for options already ruled out.
 
 ## Repo layout
 
