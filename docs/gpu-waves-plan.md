@@ -284,94 +284,211 @@ dig lighting become correct at range instead of only within 12.8 m of spawn.
 Steps 0–2 landed and are verified: the pooled path feeds the light field (it
 previously never did — `voxel.GI.Enabled 1` was a silent no-op under
 `voxel.Stream.GPU`), the volume is sampled **per pixel** via a `GIUVW : TEXCOORD1`
-interpolant folded into vertex colour `.g` in `GetMaterialPixelParameters`
-(`ue-project/Shaders/VoxelQuadVertexFactory.ush:50-55,238-251,389-430`), and the
-±Z encode matches the CPU sampler at **0.000 mean error** against a half-cell
+interpolant folded into vertex colour `.g` in `GetMaterialPixelParameters`, and
+the ±Z encode matches the CPU sampler at **0.000 mean error** against a half-cell
 shifted control.
 
-**Correction to carry into this wave.** The roadmap framed step 5 as "stop
-re-meshing a chunk to refresh its lighting on the pooled path". That is not what
-exists: `BrickComponents` has **no entry** for pooled bricks
-(`VoxelEarth/VoxelGI.h:154-161`), so pooled chunks are never re-shaded at all, and
-`CollectDirtyChunks` (`VoxelWorldSubsystem.cpp:7438-7473`) already expands an edit
-only to the 1-voxel mesher apron, never to a lighting radius. The 5×5×5 re-shade
-that is genuinely retirable lives on the **component** path
-(`voxel.GI.EditDirtyRadiusBricks` → `RefreshQueue` → `UpdateGIVertexColors`).
-Wave B's real prize is therefore (a) making the volume authoritative on **both**
-paths and (b) deleting the quad subdivision, which is where GI's median cost
-actually lives.
+> **RESULT (2026-07-26).** B1–B6 landed. B7 did not, and the reason is not a cost
+> number — see B7. All measurements below are from `.claude/worktrees/wave-b-gi`,
+> `-VoxelSpawnAt=-84480,53760`, settled (`jobsInFlight=0 pendingJobs=0`), 2,212
+> resident bricks.
 
-- **B1 (step 3) — settle the encoding.** The doc's bar is "mean horizontal error
-  under 8/255 ⇒ Scheme B is free quality" (`gpu-gi-volume-design.md:103`); the
-  measurement is 5.95–6.165, so **the expected outcome is: keep Scheme B, and
-  record why**. Two loose ends first: `maxAbsErr` is ~102 bytes, so the passing
-  mean hides a heavy tail worth characterising; and the number is a mean-abs where
-  §2 asked for an **RMS**. Also reconcile the two transcripts in the tree — the
-  design doc records `5.950 / control 0.591`, `backlog.md:301` and the roadmap
-  record `6.165 / control 0.565`. Different runs, never reconciled.
-- **B2 (step 4) — camera-following re-centring.** `EnsureVolumeOrigin`
-  (`VoxelGI.cpp:482-555`) latches on `bVolumeOriginSet` and never re-enters, so at
-  the shipped `voxel.GI.VolumeDim 64` only **36 of ~1,950** resident bricks are
-  inside the volume, and `DrainVolumeUploads:585-589` silently **drops** the rest.
-  Design is already decided (§4): **dead zone + staged re-upload over ~8 frames,
-  with the origin uniform swapped on exactly the frame the last upload lands** —
-  toroidal addressing and double-buffering were both considered and rejected. Add
-  the proposed `voxel.GI.VolumeRecentreCells` (default 64). Needs a driver that can
-  call `UpdateParameters_RenderThread` more than twice per session, and a
-  re-address of `VolumeShadow`.
-- **B3 (step 5) — make the volume authoritative and delete the baked path's cost.**
-  Retire the component path's 5×5×5 re-shade for chunks inside volume coverage, and
-  **turn off `voxel.GI.MaxQuadSpanVoxels` subdivision** (`VoxelChunkComponent.cpp:188,314-331`)
-  when the volume supplies GI. Keep `NotifyPooledChunkMeshUpdated`'s quad hand-off
-  — the field must still be fed.
-- **B4 — reconcile the two shade formulas** before either can be authoritative in
-  the same frame under `voxel.Stream.GPUMaxLevel`. Four live divergences, all found
-  in the tree:
-  1. `Strength`/`AmbientFloor` are **hardcoded** in `UpdateParameters_RenderThread`
-     (`VoxelGIVolume.cpp:98-125`) rather than read from `voxel.GI.Strength` /
-     `voxel.GI.AmbientFloor`. They coincide today (1.0 / 0.06) and diverge silently
-     the moment either cvar moves.
-  2. The fade radii are **derived from the volume extent** (896/1152 UU at Dim=64)
-     instead of the CPU's 4800/6400. This is the design doc's risk 8, live: GI cuts
-     off at the volume face as a plausible-looking lighting ring.
-  3. The shader's `DistUU` is distance to the **volume centre**, not to the camera —
-     equivalent only while the origin is camera-centred, which B2 is what makes true.
-  4. The shader tries **one** probe offset (0.6 cells); the CPU tries three
-     (`{0.6, 1.25, 2.0}`, `VoxelLightField.cpp:398-415`) specifically because a
-     20 cm roof slab is half a cell thick. Thin geometry falls back to plain AO in
-     the volume path where the CPU finds data.
-- **B5 — close the two untested step-2 claims:** the X-run upload merge on a dig's
-  contiguous neighbourhood (measured at 1.4 bricks/run in *steady state*, but the
-  dig case is what it was built for), and zero-on-revoxelize / zero-on-evict, which
-  are correct by construction only. Both need a dig-shaped test.
-- **B6 — fix the live-toggle claim.** `voxel.GI.Volume`'s help text says it is read
-  per frame; `UpdateParameters_RenderThread` has only three callers and no per-frame
-  refresh, so `Enabled`/`DebugVis` are latched. B2's driver is the same hook — either
-  make it true or correct the text.
+### The correction this wave owes the plan (and the plan owed the roadmap)
 
-- **B7 — ship it on.** Owner's call: Wave B is complete when **`voxel.GI.Enabled 1`
-  and `voxel.GI.Volume 1` are the defaults**. That adds two obligations beyond
-  correctness:
-  - **Size the volume for real coverage.** `voxel.GI.VolumeDim 64` covers ±12.8 m.
-    The design doc's sizing table recommends **N=256 → 51.2 m, 67.1 MB**
-    (`gpu-gi-volume-design.md:119-124`); full-coverage parity at 349 MB is
-    explicitly ruled out. Pick from a measured resident-brick-coverage run, not the
-    table alone, and note `GetDim()` clamps to `[16,256]` and rounds down to whole
-    bricks (`VoxelGIVolume.cpp:41-52`).
-  - **Retune the fade** (design risk 8, and B4.2 above). Beyond the volume face, GI
-    must hand back to plain AO without a visible ring. This is the one part of Wave
-    B that a harness cannot score — it goes on the manual checklist.
-  - **Measure the frame cost with the pinned-pose harness**, ≥2 legs, GI on vs off.
-    The material is masked, so the depth pass samples the volume too
-    (`gpu-gi-volume-design.md:230-236`). If the cost is not acceptable, report the
-    number rather than shipping it on regardless.
+The roadmap said step 5 was "stop re-meshing a chunk to refresh its lighting on
+the pooled path". This plan corrected that to "the retirable cost is the
+**component** path's 5×5×5 re-shade plus the `voxel.GI.MaxQuadSpanVoxels`
+subdivision". **That correction is also wrong, and in the same direction.**
 
-**Verification:** `voxel.GI.VolumeCheck` (`VoxelGI.cpp:727-987`) — the harness that
-produced the 0.000 / control pair — re-run after each step; shots at 15/30/45 s on
-the scripted flight for B2 (no lighting pop, origin uniform changing on exactly one
-frame per re-centre); a dig-and-hold PIE capture for B3; a pinned-pose A/B for B7.
+Read `ApplyMeshResult`: under `voxel.Stream.GPU 1` with the default
+`GPUMaxLevel -1`, the pooled branch returns before any `UVoxelChunkComponent` is
+constructed, for **every** level-0 chunk. `BuildChunkVertexData` gates all of its
+GI work on `bGIEnabled = VoxelGI::IsEnabled() && ChunkLevel == 0`, and GI is
+level-0-only. So on the pooled path there is **no component to re-shade and no
+quad to subdivide** — both costs are already exactly zero, and were before this
+wave started.
 
----
+What *was* real, and is now fixed: every solved pooled brick was still being
+pushed onto `RefreshQueue`, where it could only ever be popped and discarded
+(pooled bricks have no `BrickComponents` entry, by design). That is what forced
+the 8× pop cap added in step 0. Bricks with no component no longer go on the
+queue at all.
+
+**So Wave B's prize is not a cost saving. It is a capability**: on the pooled
+renderer, per-vertex baked GI does not exist at all, and the volume is the only
+thing that can light a dig or a cave there. Worth stating plainly, because
+"retire the baked path's cost" set an expectation this wave cannot meet and does
+not need to.
+
+### B1 (step 3) — the encoding: **the stated bar is failed, and it was the wrong statistic**
+
+Expected outcome was "keep Scheme B and record why". Scheme B stays — but not
+because it passed.
+
+`voxel.GI.VolumeCheck 20000`, `VolumeDim 192`, two legs on one build:
+
+| | leg A | leg B |
+|---|---|---|
+| ±Z mean / RMS / max | **0.000 / 0.000 / 0.000** | **0.000 / 0.000 / 0.000** |
+| horizontal mean | **9.629** | **9.463** |
+| horizontal RMS | 21.051 | 20.405 |
+| horizontal p50 / p90 / p95 / p99 / max | 0.013 / 37.4 / 53.0 / 91.6 / 105.0 | 0.229 / 36.8 / 51.1 / 81.8 / 105.0 |
+| fraction over the 8/255 bar | **27.68%** | **27.69%** |
+| control (half-cell X shift) | 1.576 | 1.662 |
+| signal (±Z irradiance) mean / sd | 19.7 / 40.7 | 20.3 / 41.0 |
+
+Three findings, in order of how much they change the decision.
+
+**1. The two in-tree transcripts are reconciled, and neither was wrong.** The
+design doc records `5.950 / control 0.591`; `backlog.md:301` and the roadmap
+record `6.165 / control 0.565`. My two legs agree with *each other* to **±0.17
+bytes**, so the harness is precise. What moves the number is **the field's
+composition when it fires** — the design-doc run measured 1,947 resident bricks,
+mine 2,212 (the settled figure step 0 itself records). Different resident sets,
+different mix of open sky and enclosed geometry, different horizontal error.
+**They are three measurements of three field states, not three attempts at one
+number.** Anyone re-running this must quote the brick count beside the error or
+the figure means nothing.
+
+**2. At the settled state the design's bar is failed.**
+`gpu-gi-volume-design.md:103` says "under ~8/255 means Scheme B is free quality".
+At settle it is **9.5**. The two passing readings on record were taken on a
+less-settled field.
+
+**3. The mean was the wrong statistic anyway, and this is the finding that
+matters.** The distribution is **bimodal**: p50 ≈ 0.02–0.23 (essentially exact)
+while p95 ≈ 52 and max = 105. Scheme B stores `B = mean(±X, ±Y)`, so it is exact
+wherever the four horizontal directions agree — open ground, uniformly-lit
+interiors — and wrong by up to 41% of full scale wherever they disagree, which is
+precisely **a side face next to a vertical occluder**, i.e. most of a cave wall.
+A mean of 6 or 9 averages those two populations and describes neither. §2 asked
+for an RMS and got a mean-abs; the harness now reports both, plus percentiles and
+the fraction over the bar.
+
+**Decision: keep Scheme B, and escalate rather than close.** The reasons are
+memory and sample count, not quality: Scheme A is 2 × RGBA8, so 134.2 MB at
+N=256 against the geometry pool's own 112 MB, and it doubles a sample the depth
+pass also pays. But "free quality" is now measured as false, so the honest record
+is that this is a **cost decision taken with the quality cost quantified**, not a
+finding that the cost is negligible.
+
+**The trade worth putting in front of the owner, which the design's table does
+not show:** Scheme A at **N=192 is 56.6 MB** — *less* than Scheme B at N=256
+(67.1 MB) — and buys exact directionality on every face at ±38.4 m instead of
+approximate directionality at ±51.2 m. For a game about caves and digging, reach
+is plausibly the cheaper thing to give up. That is a judgement about appearance,
+so it goes on the manual checklist (§6c) rather than being decided here.
+
+### B2 (step 4) — camera-following re-centring
+
+`EnsureVolumeOrigin` latched on `bVolumeOriginSet` and never re-entered, so the
+volume sat wherever the camera was at the first upload and `DrainVolumeUploads`
+silently dropped every brick outside it. Now: dead zone
+(`voxel.GI.VolumeRecentreCells`, default 64 cells = 2560 UU) + staged re-upload +
+a one-frame origin swap, exactly as §4 decided. Toroidal addressing and
+double-buffering stay rejected.
+
+**The gap in §4's design, which the implementation cannot remove and which anyone
+reading that section should know about.** §4 says the dead zone "guarantees the
+old volume still covers the camera throughout", and reads as if that made the
+staged re-upload invisible. Coverage is not the issue. The issue is that the
+texture has no per-region origin: while the staged upload is in flight it holds a
+**mix** of old-addressed and new-addressed bytes, and the shader is reading all
+of it with the old origin. Every row already restaged is therefore returning
+irradiance from a point one re-centre shift away until the swap lands. §4 does
+not mention this, and it is not avoidable without the two options §4 rejected.
+
+Two things bound it, both deliberate:
+
+- rows are restaged **from both ends inward**, so the stale region is furthest
+  from the camera — where the distance fade is already attenuating GI — and the
+  camera's own row is restaged in the **committing frame**, whose upload and
+  origin swap are enqueued into the same render frame;
+- the swap is a single uniform-buffer publish, so no frame ever mixes two
+  origins.
+
+`voxel.GI.Debug 2` prints `VOLUMERECENTRE transient:` with the peak stale
+occupied-texel count and how close the nearest stale row got to the camera, so
+this is a number rather than an argument.
+
+RESULT_B2_PLACEHOLDER
+
+### B3 (step 5) — see "the correction this wave owes the plan" above
+
+Retired: the pooled path's dead `RefreshQueue` traffic. Kept, as required:
+`NotifyPooledChunkMeshUpdated`'s quad hand-off — the field must still be fed.
+Not retired, because it does not exist on this path: the 5×5×5 re-shade and the
+quad subdivision.
+
+### B4 — the two shade formulas, reconciled
+
+All four divergences were live, and all four would have surfaced as a lighting
+seam at the `voxel.Stream.GPUMaxLevel` boundary where both renderers draw into
+one frame.
+
+| # | was | now |
+|---|---|---|
+| 1 | `Strength`/`AmbientFloor` **hardcoded** 1.0/0.06, ignoring `voxel.GI.Strength` / `voxel.GI.AmbientFloor` | supplied by the subsystem through `FVoxelGIVolumeSettings` (VoxelEarthShaders may not depend on VoxelEarth, so they cannot be read there) |
+| 2 | fade radii derived from the volume extent (896/1152 UU at Dim 64) vs the CPU's 4800/6400 — design risk 8, live | the same cvars feed both paths, clamped to the half-extent |
+| 3 | `DistUU` measured to the **volume centre** | measured to the **camera**, which is what the CPU measures; the dead zone makes those differ by up to 2560 UU |
+| 4 | **one** probe offset (0.6 cells) vs the CPU's three | the same three, `{0.6, 1.25, 2.0}`; later samples only execute where the first missed |
+
+On (2), the clamp **slides the band rather than truncating it**. Clamping
+`FadeEnd` alone would have left `FadeStart` where it was and collapsed a 1600 UU
+fade into a **40 UU** one at `VolumeDim 192` — which is the hard lighting ring
+risk 8 describes, reached from the other direction. A fired clamp is now logged
+(`VoxelGI volume params:` prints both the effective fade and the one the cvars
+asked for), because risk 8's whole difficulty is that it produces a plausible
+image.
+
+On (4), the CPU walks three offsets specifically because a 20 cm roof slab is
+half a light-field cell thick. Shipping one offset GPU-side had quietly
+reintroduced the roof-underside defect this module already fixed once.
+
+**A cost fix found while doing (2), worth its own line.** The shader now skips
+the volume sample entirely when the probe UVW is outside `[0,1]`. That is not an
+edge case: the volume covers ±38.4 m of a **2 km** cascade, so most pixels on
+screen are outside it; the sampler is `AM_Clamp`, so an outside lookup returns the
+face texel (step 1 saw exactly this as "large smeared bands" and nearly diagnosed
+it as an addressing bug); and the material is masked, so the **depth pass pays it
+too**. Skipping is exact, not approximate — the fade is clamped to end inside the
+half-extent, so `Weight` is already 0 wherever the branch fires.
+
+### B5 — the two correct-by-construction claims, now measurable
+
+`voxel.GI.VolumeDigTest [radiusUU]` carves through the real edit path
+(`CarveSphere`), **suppresses the round-robin re-solve** for the duration — the
+round-robin delivers bricks in `TMap` iteration order, which is exactly what makes
+the steady-state 1.4 bricks/run figure uninformative about the dig case — and
+then reads its answers out of `VolumeShadow`, the actual staged bytes rather than
+a re-encode.
+
+It reports three things: bricks-per-run on a contiguous neighbourhood,
+zero-on-revoxelize (dug bricks reach the volume as `A = 0` **before** the solve
+lands, so a tunnel cannot keep its pre-dig lighting), and zero-on-evict, driven
+through the real `EvictFarBricks` rather than waited for.
+
+RESULT_B5_PLACEHOLDER
+
+### B6 — the live-toggle claim is now true
+
+`voxel.GI.Volume`'s help text said it was read per frame. It was not:
+`UpdateParameters_RenderThread` had three callers, none per-frame, so `Enabled`
+and `DebugVis` were latched for the session. There is now a real per-frame driver
+(`TickVolume`) that re-publishes the uniform buffer whenever any input actually
+changes — the same hook B2 needed, as predicted.
+
+**Also fixed while in here:** the volume texture was allocated in `InitRHI`. It is
+a `TGlobalResource`, so that charged **every** session for it whether or not GI
+was ever enabled — 1 MB at the bring-up `Dim 64`, but **67 MB at the recommended
+shipping `Dim 256`**, handed to players who never turn GI on. It is now allocated
+on first enable, and zeroed on creation (undefined bytes in the validity channel
+read as "there is data here", i.e. arbitrary irradiance on every surface until the
+first upload covers that texel).
+
+### B7 — ship it on
+
+RESULT_B7_PLACEHOLDER
 
 ## Wave C — the determinism gate (blocks Wave D on correctness)
 
@@ -720,9 +837,23 @@ Four, all found while planning this from the source:
 3. **Wave B's stated purpose describes work that does not exist.** Pooled bricks are
    never re-shaded, so there is no lighting-driven pooled re-mesh to retire. The
    retirable cost is on the component path, plus the quad subdivision.
+   **— CORRECTED AGAIN (2026-07-26, Wave B), same direction.** The component
+   path does not pay it either, under the configuration that has a volume to
+   sample: `ApplyMeshResult`'s pooled branch returns before constructing a
+   `UVoxelChunkComponent` for every level-0 chunk, and `BuildChunkVertexData`
+   gates all GI work on `ChunkLevel == 0`. Both costs are already zero on that
+   path. Wave B's prize is a **capability**, not a saving — see Wave B above.
+   Third statement of this item, second correction; the pattern is that each
+   version was written one level of indirection away from the code.
 4. **The horizontal-error figure disagrees across the tree** — `6.165 / control
    0.565` in the roadmap and backlog, `5.950 / control 0.591` in the design doc's
    own transcript. Reconcile to one run, or record that they are two.
+   **— RESOLVED (2026-07-26, Wave B): they are two, and a third.** Two legs on one
+   build agree to ±0.17 bytes, so the harness is precise; the figure tracks the
+   **field composition** at the moment it fires (1,947 vs 2,212 resident bricks).
+   At the settled 2,212-brick state it is **9.5**, which **fails** the design
+   doc's own 8/255 bar. Quote the brick count beside the error or the number
+   means nothing. Full working in Wave B, B1.
 
 That is three of six waves whose published root cause or fix was wrong. Worth
 noting plainly in the doc: **the roadmap was written from summaries, and this plan

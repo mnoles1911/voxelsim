@@ -17,7 +17,7 @@ Current defaults, so you know what you are looking at without setting anything:
 | `voxel.Stream.GPUCull` | **0** | pooled frustum cull is off (it still drops geometry) |
 | `voxel.Water.GPU` | 0 | water on the per-chunk path |
 | `voxel.GI.Enabled` | 0 | voxel GI off |
-| `voxel.GI.Volume` | 0 | GPU GI volume off |
+| `voxel.GI.Volume` | 0 | GPU GI volume off (and it only has a consumer under `voxel.Stream.GPU 1` — see §6) |
 | `-VoxelCoarseGrid` | on | coarse chunks use the flat-grid fast path |
 | `-VoxelL0BrickSkip` | on | level-0 skips provably-empty bricks |
 
@@ -100,6 +100,87 @@ it.
   there matters.
 - Save, quit, reload, and look at the same shaft. Saved worlds used to lose
   structures above the sky-band trim.
+
+## 6. Voxel GI through the GPU volume (Wave B)
+
+**Everything here needs `voxel.Stream.GPU 1`.** Only the pooled vertex factory
+samples the volume; the per-chunk component path bakes GI into vertex colours and
+never reads the texture. With `voxel.Stream.GPU 0`, `voxel.GI.Volume 1` allocates
+nothing and changes nothing — that is by design, not a bug, and it is the single
+easiest way to conclude "the GI volume does nothing".
+
+Launch with:
+
+```
+-VoxelGIOn -dpcvars=voxel.Stream.GPU=1,voxel.GI.Volume=1,voxel.GI.VolumeDim=192
+```
+
+`voxel.GI.VolumeDim` is **startup only** (it sizes an allocation), which is why it
+goes through `-dpcvars` rather than the console. Everything else on this list can
+be toggled live now.
+
+### 6a. The fade at the volume face — the one a harness cannot score
+
+This is design risk 8 and it is the hardest kind of wrong to notice, because it
+produces a *plausible* image. The volume covers ±38.4 m at `VolumeDim 192`;
+beyond it GI must hand back to the mesher's plain AO **smoothly**.
+
+1. Settle, then fly slowly outward in a straight line over open, uneven ground.
+2. Watch for a **ring** — a circle centred on you where the ground brightness
+   steps rather than ramps. It moves with you, which is what distinguishes it
+   from a terrain feature.
+3. `voxel.GI.Volume 0` / `1` toggles live now; flipping it at the suspect
+   distance is the cheapest A/B.
+
+The clamp that keeps the fade inside the volume logs its effect. Grep the log for
+`VoxelGI volume params:` — if `fade=` differs from `cvars asked`, the clamp fired
+and the fade you are looking at is not the one the cvars requested.
+
+### 6b. Re-centring, under motion
+
+Automated capture structurally cannot answer this: the volume re-centres over
+~8 frames (~130 ms) and every screenshot in this repo is a settled, stationary
+scene.
+
+1. Settle, then fly **continuously** for a minute or so at normal speed.
+2. Watch for a brief, whole-screen brightness flicker in the middle distance —
+   not at a ring, not tied to a chunk boundary.
+3. The log says exactly when to expect one: `re-centre BEGIN` … `re-centre COMMIT`
+   pairs. If a flicker does not line up with one of those timestamps, it is not
+   this.
+
+What the code guarantees, so you know what you are looking for: the camera's own
+neighbourhood is restaged in the *same* frame the origin swaps, so any artifact
+should be in the **middle distance**, never underfoot. `voxel.GI.Debug 2` prints
+`VOLUMERECENTRE transient:` with how many occupied texels were stale at the worst
+moment and how close the nearest one got to the camera.
+
+### 6c. Scheme B's horizontal error — worth one look in a cave
+
+Measured, not suspected: the volume stores ±Z irradiance exactly and the four
+horizontal directions as their **mean**. The error is bimodal — half the samples
+are essentially exact, but p95 is ~52/255 and the worst is ~105/255, and it
+concentrates on **side faces near vertical occluders**, which is most of a cave
+wall. See the Wave B section of `docs/gpu-waves-plan.md` for the numbers.
+
+Nothing automated can decide whether that is acceptable, because it is a
+question about appearance. Go underground, look at a wall lit from one side, and
+compare `voxel.GI.Volume 1` against `voxel.GI.Volume 0` with `voxel.GI.Enabled 1`
+on the component path (`voxel.Stream.GPU 0`, restart) — the component path
+evaluates the full ambient cube and is the reference. If the volume's cave walls
+read flat or wrongly-lit next to it, Scheme A is worth its 2× memory and the
+Wave B section records what that would cost.
+
+### 6d. A dig should relight without re-meshing
+
+`voxel.GI.VolumeDigTest` automates the numeric half (it logs `VOLUMEDIG` lines).
+The visual half:
+
+1. Settle, dig a short tunnel into a hillside, then **stand still and watch**.
+2. The tunnel interior should **darken progressively over a second or two** as
+   the solve lands, not pop from lit to dark in one frame, and not stay lit.
+3. The one failure this is looking for: a dug tunnel that keeps its **pre-dig**
+   lighting indefinitely. That is zero-on-revoxelize not reaching the texture.
 
 ---
 

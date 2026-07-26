@@ -294,19 +294,51 @@ pose. Start from `-VoxelFloodTest` / `Tools/capture_terrain_shots.ps1`. Until
 then make no frame-time claim in either direction, including a negative one.
 Full write-up in `docs/streaming-handoff.md`.
 
-**GI volume steps 3-5.** Steps 0-2 landed: the pooled path feeds the light
-field, the volume is sampled per pixel, and the encode matches the CPU sampler at
-**0.000 mean error** (with a deliberate half-cell-shifted control at 0.565 to
-prove the harness is not comparing a thing against itself). Remaining: **(3)**
-decide Scheme A vs B from the measured horizontal error (6.165 bytes — the number
-that decision turns on); **(4)** camera-following re-centring, currently a static
-origin, so at the default `VolumeDim=64` only 36 of ~1,950 resident bricks are
-inside the volume; **(5)** retire baked GI on the pooled path, which is the
-actual prize — a dig would then update lighting by texel upload instead of
-re-meshing. Design and staging in `docs/gpu-gi-volume-design.md`. Also untested:
-the X-run upload merge on a dig's contiguous neighbourhood (measured at 1.4
-bricks/run in steady state, but the dig case is what it was built for), and
-zero-on-revoxelize / zero-on-evict, which are correct by construction only.
+**GI volume steps 3-5 — LANDED (Wave B, 2026-07-26), with two corrections and
+one escalation.** Steps 0-2 had landed: the pooled path feeds the light field,
+the volume is sampled per pixel, and the encode matches the CPU sampler at
+**0.000 mean error** (with a deliberate half-cell-shifted control to prove the
+harness is not comparing a thing against itself). Steps 3-5 are now done; the
+full write-up with every number and how it was measured is the Wave B section of
+`docs/gpu-waves-plan.md`. The three things worth carrying here:
+
+- **(3) Scheme B stays, but "free quality" is measured as FALSE.** The design
+  doc's bar is a horizontal mean under 8/255. At the settled field (2,212 bricks)
+  it is **9.5**, not the 5.950/6.165 on record — and those two transcripts are
+  now reconciled: two legs on one build agree to ±0.17 bytes, so the harness is
+  precise and the figure tracks **how settled the field was** (1,947 vs 2,212
+  resident bricks). Quote the brick count beside the error or the number means
+  nothing. More importantly the mean was the wrong statistic: the distribution is
+  **bimodal** (p50 ≈ 0.02, p95 ≈ 52, max 105), because Scheme B stores the four
+  horizontal directions as their mean and is therefore exact where they agree and
+  badly wrong where they do not — which is precisely a side face beside a
+  vertical occluder, i.e. most of a cave wall. Kept for memory and sample count,
+  not because the quality cost is negligible. **The trade the design's table does
+  not show: Scheme A at N=192 costs 56.6 MB, less than Scheme B at N=256's
+  67.1 MB**, buying exactness everywhere at the price of reach. That is an
+  appearance judgement and is on the manual checklist (§6c).
+- **(5) The retirable cost does not exist, and this is the third statement of
+  this item.** The roadmap said "stop re-meshing to refresh lighting on the
+  pooled path"; `gpu-waves-plan.md` corrected that to "the component path's 5×5×5
+  re-shade plus the quad subdivision". Both are wrong in the same direction:
+  under `voxel.Stream.GPU 1` no level-0 `UVoxelChunkComponent` is ever
+  constructed, and GI is level-0-only, so **both costs are already exactly zero
+  on the path that has a volume to sample**. What was real and is now fixed:
+  solved pooled bricks were still being pushed onto `RefreshQueue` to be popped
+  and discarded, which is what forced step 0's 8× pop cap. **Wave B's prize is a
+  capability, not a saving** — on the pooled renderer, baked per-vertex GI does
+  not exist at all.
+- **`voxel.GI.Volume 1` has no consumer under `voxel.Stream.GPU 0`,** which is
+  the default. Only the pooled vertex factory samples the volume. So shipping the
+  GI volume on by default is **coupled to Wave A's outcome**, not independent of
+  it.
+
+Closed by the same wave: the X-run merge on a dig's contiguous neighbourhood and
+zero-on-revoxelize / zero-on-evict now have a harness rather than an argument
+(`voxel.GI.VolumeDigTest`), `voxel.GI.Volume`'s "read per frame" claim is true
+rather than aspirational, and the volume texture is no longer allocated for
+sessions that never enable GI (it was a `TGlobalResource` built in `InitRHI` —
+67 MB at the recommended shipping size, charged to everyone).
 
 **Per-chunk debug tints — the last G4 item, and the only one that still needs the
 material asset.** Storage is already solved (`ChunkParams.w` is free). The route

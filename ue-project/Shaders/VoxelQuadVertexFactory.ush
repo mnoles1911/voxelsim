@@ -387,7 +387,20 @@ FMaterialPixelParameters GetMaterialPixelParameters(
 	// With Enabled=0 this whole block is skipped and G is byte-identical to what
 	// it was before this feature existed.
 	half4 VertexColorWithGI = Interpolants.Color;
-	if (VoxelGIVol.Enabled != 0u)
+	// OUTSIDE THE VOLUME, DO NOT SAMPLE AT ALL.
+	//
+	// This is the majority of the frame, not an edge case: the volume covers
+	// +/-N*20 UU (38.4 m at VolumeDim 192) out of a 2 km cascade, so most pixels
+	// on screen are outside it. The sampler is AM_Clamp on all three axes, so a
+	// lookup out there returns the FACE texel rather than nothing -- which is
+	// what step 1 saw as "large smeared bands" and mistook for an addressing bug.
+	// Skipping is not an approximation: the fade is clamped to end inside the
+	// half-extent, so Weight is already 0 wherever this branch fires. What it
+	// buys is the sample itself, one to three of them, on every pixel outside the
+	// volume AND in the depth pass, which this masked material also runs.
+	const float3 GIUVW = Interpolants.GIUVW;
+	const bool bInsideVolume = all(GIUVW > 0.0f) && all(GIUVW < 1.0f);
+	if (VoxelGIVol.Enabled != 0u && bInsideVolume)
 	{
 		// THREE probe offsets, not one, matching FVoxelLightField's
 		// kProbeOffsets {0.6, 1.25, 2.0} cells term for term.

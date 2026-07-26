@@ -1476,6 +1476,13 @@ void UVoxelGISubsystem::StepDigTest()
 	{
 		return;
 	}
+	// A runtime toggle-off clears the field out from under an armed test.
+	if (!Field || !bVolumeOriginSet || VolumeShadow.Num() == 0)
+	{
+		DigTestPhase = 0;
+		DigTestBricks.Reset();
+		return;
+	}
 
 	const int32 E = VoxelLF::BrickEdgeCells;
 	auto BrickAllZero = [this, E](const FIntVector& Key, int32& OutInside) -> bool
