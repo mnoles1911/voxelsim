@@ -530,3 +530,50 @@ never taken until the numbers had already been written into a commit message, a
 PR, an ADR and a cvar comment. Take the noise-floor measurement *first*, and
 quote every delta against it -- exactly the discipline the screenshot diffs in
 this same session used, and the timing measurements did not.
+
+### Follow-up: even a settled, stationary scene will not answer it (2026-07-25, latest)
+
+One more attempt, designed to remove the variance source identified above.
+Reasoning: the flight harness varies because streaming load varies, so measure
+with the anchor **stationary** and the cascade **fully settled** — then streaming
+is quiescent and the only difference between the paths is 9,822 primitives
+against 1. Four legs, interleaved, idle machine, frame rate taken from the
+`ticks=` field of the last five 5 s windows of each run.
+
+Every leg reached an identical state first: `loaded=9822 quads=8813242
+unloaded=0 jobsInFlight=0 pendingJobs=0`, anchor pinned at
+`(-8448000, 5376000, 55054)` from first log line to last.
+
+| leg | fps per window | median |
+|---|---|---|
+| component a | 43.4 50.4 43.2 51.8 46.6 | 46.6 |
+| component b | 66.6 75.6 80.8 102.2 103.0 | **80.8** |
+| pooled a | 58.2 58.0 58.4 58.8 57.0 | 58.2 |
+| pooled b | 62.8 64.6 62.8 61.6 64.6 | 62.8 |
+
+**The component path rendered the identical settled scene at 43 fps in one run
+and 103 fps in another — a 2.4x within-path spread with streaming quiescent.**
+The two pooled legs are tight (57.0–64.6) and the first three legs looked like a
+clean result; the fourth destroyed it.
+
+That is the useful part, because it rules out the obvious explanation.
+**Streaming load is NOT what makes this harness noisy** — these runs had none.
+Something per-run and outside the voxel system dominates. Note component b's
+windows *rise monotonically* (333 → 515 ticks) while every other leg is flat,
+which is not a thermal or clock story.
+
+**Leading suspect: camera orientation.** The anchor is a position; the pawn's
+yaw and pitch are not logged and nothing pins them. A pawn looking at sky and a
+pawn looking down a valley render wildly different amounts of the same settled
+world, and that is exactly the size of effect seen. It cannot be confirmed from
+these logs because the pose is not recorded.
+
+**So the next attempt should fix the camera pose, not the streaming load**, and
+should log the pose so the assumption is checkable rather than assumed. The
+existing fixed-camera harnesses (`-VoxelFloodTest`, `Tools/capture_terrain_shots.ps1`)
+are the place to start. Until then, no frame-time claim about ADR-0006 should be
+made in either direction — including a negative one.
+
+What remains verified without any timing at all: 9,822 chunks and 8,813,242
+quads as ONE primitive and ONE draw call, against 9,822 primitives. That is the
+mechanism the ADR predicted, and it is a count, not a measurement.
