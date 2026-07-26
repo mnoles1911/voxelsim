@@ -106,6 +106,46 @@ namespace VoxelGpuPoolCull
 
 	inline bool IsEnabled() { return GEnabled != 0; }
 
+	// HOW MANY LEVELS OF THE CASCADE CAST DYNAMIC SHADOWS.
+	//
+	// Measured 2026-07-26 (Wave G / G0): the four shadow cascades collectively see
+	// 90.6% of the pool, against 7.4% for the camera at the same pose, and shadow
+	// gathers submit 92.6% of all quads. That is not merge waste -- it is geometry
+	// genuinely inside some cascade's frustum, so it is a floor that survives even
+	// perfect compaction. The cause is that every resident chunk out to 2 km casts
+	// a dynamic shadow, including the coarse outer rings whose shadow subtends
+	// almost no screen area.
+	//
+	// This caps that by LEVEL, which maps directly to distance under
+	// kDefaultRingPresets: L0 0-64 m, L1 64-128, L2 128-256, L3 256-512,
+	// L4 512-1024, L5 1024-2048.
+	//
+	// THE DEFAULT IS THE CONSERVATIVE END ON PURPOSE. 4 drops only level 5 --
+	// terrain beyond 1 km -- worth roughly 1.5M quads a frame off an 11.85M floor,
+	// which is comparable to the ENTIRE camera-view over-draw the pool's frustum
+	// cull was built to remove. The more aggressive settings are worth
+	// substantially more (~3.3M at 3, ~5.3M at 2) and they are a QUALITY
+	// judgement, not a performance one: distant terrain stops casting and, more
+	// noticeably, stops SELF-shadowing, so far relief flattens and reads bright.
+	// No harness in this project can score that -- it needs eyes on a low-sun
+	// scene, which is why it is a live cvar and why the aggressive values are on
+	// the manual checklist rather than in this default.
+	static int32 GShadowMaxLevel = 4;
+	static FAutoConsoleVariableRef CVarShadowMaxLevel(
+		TEXT("voxel.Stream.GPUShadowMaxLevel"), GShadowMaxLevel,
+		TEXT("Highest cascade level whose pool chunks cast dynamic shadows. Levels above this are culled "
+		     "from shadow gathers only; the camera still draws every level it can see. Default 4 (terrain "
+		     "beyond ~1 km stops casting). Lower saves more and costs distant self-shadowing. 5+ = no cap."),
+		ECVF_RenderThreadSafe);
+
+	// A chunk's level, recovered from the chunk table. AddChunk stores
+	// Scale = float(1 << Level) in .w for the vertex factory's mip scale, so the
+	// level is already resident and needs no new per-chunk data.
+	inline int32 LevelFromScale(float Scale)
+	{
+		return Scale >= 1.0f ? int32(FMath::FloorLog2(uint32(Scale))) : 0;
+	}
+
 	// THE GATHER CENSUS (Wave G / G0). How many quads this proxy actually asks
 	// the GPU to draw per frame, split by whether the gather was the camera or a
 	// shadow cascade.
@@ -423,10 +463,23 @@ public:
 			// control, where nothing measures visibility at all -- which the
 			// census report must not present as "zero quads were visible".
 			uint32 VisibleQuadsThisGather = 0;
+			ECullOutcome Outcome = ECullOutcome::Ranges;
 			const bool bCull = VoxelGpuPoolCull::IsEnabled() && Runs.Num() > 0 && NumQuads > 0;
 			if (bCull)
 			{
-				BuildCulledRanges(*Views[ViewIndex], Ranges, VisibleQuadsThisGather);
+				BuildCulledRanges(*Views[ViewIndex], Ranges, VisibleQuadsThisGather, Outcome);
+			}
+
+			// EVERYTHING THIS GATHER COULD SEE IS ABOVE THE SHADOW CAP. Draw
+			// nothing and submit nothing -- do NOT fall through to the full-pool
+			// draw below, which is the conservative answer to a DIFFERENT question
+			// (see ECullOutcome). The census still records the gather, at zero
+			// quads, so a capped-out cascade is visible in the counts as a real
+			// measured zero rather than as a gather that never happened.
+			if (bCull && Outcome == ECullOutcome::AllCapped)
+			{
+				RecordGather(*Views[ViewIndex], Mesh, VisibleQuadsThisGather);
+				continue;
 			}
 
 			if (!bCull || Ranges.Num() == 0)
@@ -636,6 +689,29 @@ private:
 
 	struct FQuadRange { uint32 First = 0; uint32 Count = 0; };
 
+	// WHY AN EMPTY RANGE LIST IS NOT ONE SITUATION.
+	//
+	// Before the shadow cap existed, "no ranges" had exactly one meaning -- the
+	// cull selected nothing -- and exactly one safe response: draw the whole pool.
+	// A cull that wrongly hides the world is the failure this pool is worst at
+	// diagnosing, so the conservative branch is the one that draws.
+	//
+	// THE SHADOW CAP INVERTS THAT, and it is the single most dangerous thing about
+	// building it. A distant cascade whose entire visible set sits above
+	// GPUShadowMaxLevel legitimately has nothing to draw. Routed through the old
+	// fallback it would draw 13.09M quads instead of 0 -- turning the largest
+	// saving on the board into the largest regression on the board, silently, and
+	// looking exactly like the feature working.
+	//
+	// So the empty case carries WHICH empty it is, and the two are handled
+	// oppositely. Logged when it fires, because neither is visible in a picture.
+	enum class ECullOutcome : uint8
+	{
+		Ranges,          // normal: draw what came back
+		NothingVisible,  // nothing passed the frustum -> draw everything (conservative, unchanged)
+		AllCapped,       // everything visible was above the shadow cap -> draw NOTHING (correct)
+	};
+
 	// Frustum-test every run, then merge the survivors back into as few pool
 	// ranges as possible. Runs arrive sorted by pool offset, so the merge is a
 	// single linear pass.
@@ -647,10 +723,11 @@ private:
 	// nothing", which is a sound instinct for a method called once per frame and
 	// wrong for one called once per frame PER VIEW, in parallel.
 	void BuildCulledRanges(const FSceneView& View, TArray<FQuadRange>& CulledRanges,
-	                       uint32& OutVisibleQuads) const
+	                       uint32& OutVisibleQuads, ECullOutcome& OutOutcome) const
 	{
 		const FMatrix& LocalToWorldMatrix = GetLocalToWorld();
 		uint32 VisibleQuads = 0;
+		OutOutcome = ECullOutcome::Ranges;
 		// Assigned on every return path below via this reference, so a caller
 		// cannot read a stale or uninitialised count from an early exit.
 		ON_SCOPE_EXIT { OutVisibleQuads = VisibleQuads; };
@@ -718,7 +795,28 @@ private:
 		// silently dropping most of the pool is indistinguishable in the picture
 		// from a cull that aims wrongly.
 		int32 SkippedEmpty = 0, SkippedBadId = 0, SkippedAboveWatermark = 0, SkippedHidden = 0, SkippedFrustum = 0;
+		// Chunks that PASSED the frustum test and were then removed by the shadow
+		// level cap. See the cap's own comment for why the ordering matters.
+		int32 SkippedShadowLevel = 0;
+		uint32 CappedQuads = 0;
 		uint32 RunQuads = 0;
+
+		// PER-LEVEL BREAKDOWN, to replace the one estimate in the shadow-cap
+		// costing with a measurement.
+		//
+		// That costing priced each cap setting by assuming quads-per-chunk is
+		// roughly uniform across levels -- plausible, because the clipmap holds
+		// every chunk at 32^3 voxels whatever its level, and probably conservative,
+		// because coarse terrain is smoother and should mesh to FEWER quads. But
+		// "probably conservative" is how estimates have gone wrong in both
+		// directions in this programme, and the pool knows the real answer.
+		//
+		// Pool[] is view-independent (every run, regardless of frustum) and is what
+		// validates or refutes the uniformity assumption. Visible[] is per gather
+		// and is what a cap would actually remove from THIS cascade.
+		static constexpr int32 kMaxLevels = 8;
+		uint32 PoolQuadsByLevel[kMaxLevels] = {};
+		uint32 VisibleQuadsByLevel[kMaxLevels] = {};
 
 		for (const UVoxelGpuPoolComponent::FChunkRun& Run : Runs)
 		{
@@ -743,6 +841,12 @@ private:
 				++SkippedHidden;
 				continue; // hidden entry: collapsed to a point, nothing to draw
 			}
+
+			// Already resident -- AddChunk stores float(1 << Level) here for the
+			// vertex factory's mip scale, so the cap needs no new per-chunk data.
+			const int32 ChunkLevel = VoxelGpuPoolCull::LevelFromScale(Scale);
+			const int32 LevelSlot = FMath::Clamp(ChunkLevel, 0, kMaxLevels - 1);
+			PoolQuadsByLevel[LevelSlot] += Run.NumQuads;
 
 			// Same extent AddChunk grows LocalBounds by, so the cull can never be
 			// tighter than the bounds the scene already culled the whole
@@ -776,6 +880,34 @@ private:
 			if (!bKeep)
 			{
 				++SkippedFrustum;
+				continue;
+			}
+
+			// THE SHADOW-LEVEL CAP, AND IT IS DELIBERATELY *AFTER* THE FRUSTUM
+			// TEST rather than before it.
+			//
+			// Testing first would be marginally cheaper and would make this
+			// counter a lie: it would then count chunks the frustum was going to
+			// reject anyway, and the empty-case decision below turns on exactly
+			// this number meaning "geometry this cascade WOULD have drawn, which
+			// only the cap removed". A counter that decides a branch has to mean
+			// what the branch assumes it means. The frustum test is a handful of
+			// dot products; correctness wins.
+			//
+			// Shadow gathers only. The camera must still draw every level it can
+			// see, or the cap would delete visible terrain rather than its
+			// shadow.
+			// Counted BEFORE the cap, so it answers "what would this gather draw if
+			// nothing were capped" -- which is the quantity a cap setting is chosen
+			// against. Counting it after would make every level above the cap read
+			// as zero and the breakdown would only ever confirm the cap already in
+			// force.
+			VisibleQuadsByLevel[LevelSlot] += Run.NumQuads;
+
+			if (bShadowGather && ChunkLevel > VoxelGpuPoolCull::GShadowMaxLevel)
+			{
+				++SkippedShadowLevel;
+				CappedQuads += Run.NumQuads;
 				continue;
 			}
 
@@ -963,9 +1095,35 @@ private:
 		// worst at diagnosing, so the conservative branch is the one that draws.
 		// The range cap no longer needs a bail-out: the merge above satisfies it
 		// by construction.
+		// THE THREE-STATE EMPTY CASE. See ECullOutcome for why this is not one
+		// situation, and why getting it wrong is the largest regression available
+		// rather than a missing optimisation.
 		if (VisibleQuads == 0)
 		{
 			CulledRanges.Reset();
+
+			// Did the cap remove geometry this gather would otherwise have drawn?
+			// SkippedShadowLevel counts only runs that PASSED the frustum test, so
+			// a non-zero value means exactly that -- this cascade has real
+			// geometry in it and every last quad of it is above the cap. Drawing
+			// nothing is then the correct answer and drawing everything is the
+			// catastrophic one.
+			OutOutcome = SkippedShadowLevel > 0 ? ECullOutcome::AllCapped
+			                                    : ECullOutcome::NothingVisible;
+
+			// Logged unconditionally, not on the periodic sample. Both states are
+			// invisible in a picture and one of them is a 13M-quad mistake, so
+			// neither may depend on winning a 1-in-601 lottery to be seen. They
+			// are also rare by construction, so this cannot spam.
+			UE_LOG(LogTemp, Log,
+			       TEXT("%s cull: EMPTY (%s) shadowGather=%d cappedRuns=%d cappedQuads=%u frustumSkipped=%d "
+			            "-- %s"),
+			       *PoolName,
+			       OutOutcome == ECullOutcome::AllCapped ? TEXT("all capped") : TEXT("nothing visible"),
+			       bShadowGather ? 1 : 0, SkippedShadowLevel, CappedQuads, SkippedFrustum,
+			       OutOutcome == ECullOutcome::AllCapped
+			           ? TEXT("drawing NOTHING, which is correct: every visible chunk is above GPUShadowMaxLevel")
+			           : TEXT("falling back to the FULL POOL draw, which is the conservative answer"));
 		}
 
 		// What the merged ranges actually submit, as against VisibleQuads which is
@@ -1031,6 +1189,29 @@ private:
 			       MergeGap, MaxRanges,
 			       SkippedEmpty, SkippedBadId, SkippedAboveWatermark, SkippedHidden, SkippedFrustum,
 			       bShadowGather ? 1 : 0);
+
+			// PER-LEVEL, on its own line so it stays readable at six levels.
+			//
+			// `pool` is the pool's composition and is view-independent, so it is
+			// the same on every gather and is what settles the quads-per-chunk
+			// uniformity question. `visible` is pre-cap and per gather, so summing
+			// it above a candidate cap gives exactly what that cap would remove
+			// from THIS cascade -- no estimate, no uniformity assumption.
+			FString PoolByLevel, VisByLevel;
+			for (int32 L = 0; L < kMaxLevels; ++L)
+			{
+				if (PoolQuadsByLevel[L] == 0 && VisibleQuadsByLevel[L] == 0)
+				{
+					continue;
+				}
+				PoolByLevel += FString::Printf(TEXT(" L%d=%u"), L, PoolQuadsByLevel[L]);
+				VisByLevel += FString::Printf(TEXT(" L%d=%u"), L, VisibleQuadsByLevel[L]);
+			}
+			UE_LOG(LogTemp, Log,
+			       TEXT("%s levels: shadowGather=%d shadowMaxLevel=%d cappedRuns=%d cappedQuads=%u "
+			            "| pool:%s | visiblePreCap:%s"),
+			       *PoolName, bShadowGather ? 1 : 0, VoxelGpuPoolCull::GShadowMaxLevel,
+			       SkippedShadowLevel, CappedQuads, *PoolByLevel, *VisByLevel);
 		}
 	}
 
