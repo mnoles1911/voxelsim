@@ -113,7 +113,19 @@ boilerplate.
     merged legs are clamped too — its verdict is unaffected because it rests on
     p50/p95 far above the clamp, but its `max` and hitch figures are not scene
     properties.
-11. **Line numbers in this plan drift.** `VoxelWorldSubsystem.cpp` is ~10,600 lines
+11. **The edit log PERSISTS across runs, so a repeated edit measures nothing.**
+    `ue-project/Saved/VoxelWorlds/<seed>.vxlog` survives process exit. A harness
+    that carves at a fixed world position therefore digs virgin ground on its
+    first run and **an already-empty hole on every run after** — the second leg
+    reports `carved 0 voxels`, no chunk is dirtied, no brick is re-solved, and
+    whatever it was timing completes instantly or times out. Measured in Wave B:
+    the first relight leg carved 43,260 voxels, the identical second leg carved
+    **0**. This invalidates *any* edit-based measurement on its second run and is
+    not specific to GI — it applies equally to dig, explosion, water-breach and
+    structural-collapse harnesses. **Delete `Saved/VoxelWorlds/*.vxlog` between
+    legs**, or carve somewhere new each time, and check the carved-voxel count in
+    the log before believing the number that follows it.
+12. **Line numbers in this plan drift.** `VoxelWorldSubsystem.cpp` is ~10,600 lines
    and moves under every PR. Anchor on symbol names — `DispatchJobs`,
    `DrainResults`, `MeshChunkBricks`, `EnsureVolumeOrigin` — and treat the numbers
    as hints. Several quoted here were already stale when this plan was written.
