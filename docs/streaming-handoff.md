@@ -404,3 +404,50 @@ falls back to the **synthetic** sampler and every number moves. Junction it in
 before measuring anything (`New-Item -ItemType Junction`). With it in place
 this box reproduces the reference spawn at `loaded=9822 quads=8813242
 tracked=16417` against the recorded `9819 / 8809945 / 16417`.
+
+## The perf numbers are still owed a clean run (2026-07-25, late)
+
+The table above is labelled "direction and rough magnitude, not gate numbers".
+A re-run was attempted to upgrade it and **failed to produce a signal at all**.
+Recording the failure because the shape of it is the useful part.
+
+Four legs, interleaved GPU/CPU/GPU/CPU, 60 s each, one other headless instance
+live on the machine throughout:
+
+| | cpu-a | cpu-b | gpu-a | gpu-b |
+|---|---|---|---|---|
+| p50 ms | 42.02 | 27.00 | 26.42 | 43.21 |
+| p95 ms | 77.59 | 43.98 | 63.88 | 77.63 |
+| hitches | 810 | 524 | 636 | 781 |
+
+**Two identical CPU-path runs gave p50 42.0 and 27.0 ms — a 55% spread on the
+same binary and the same cvar.** The within-path variance exceeds any
+between-path difference, so nothing can be concluded from this, in either
+direction.
+
+Two things follow, and the second one is an open question rather than a finding:
+
+1. **Interleaving does not rescue a contended measurement.** Alternating the
+   legs was supposed to make drift work against the result; it does nothing when
+   the noise is this large relative to the effect. The only fix is an idle
+   machine.
+2. **Absolute frame times here are far worse than the earlier session** (p50
+   27-43 ms against 17-18 ms, chunks/s 320-510 against 540-840) on a `main` that
+   has since gained the escape hatch, the water pool and the GI volume. That is
+   *probably* contention, but it is **not established**, and "probably" is not
+   good enough for a frame-time regression. Worth an explicit before/after across
+   tonight's merges on an idle box.
+
+What is NOT in doubt: streaming counts are contention-independent and identical
+across every run tonight -- `loaded=9822 quads=8813242 tracked=16417`, per-ring
+`R0=1947 R1=1319 R2=1602 R3=1853 R4=1675 R5=1426`. Terrain correctness is fine;
+it is only the timing that is unmeasured.
+
+**Protocol for whoever runs this properly:** no other UE process on the box, one
+warm-up run discarded after the build, then at least two legs per path
+interleaved, and report the within-path spread alongside the between-path delta.
+If the within-path spread is comparable to the delta, the run is void -- say so
+rather than reporting the mean. The min-spec-proxy variant is a separate and
+still-owed measurement on top of this one, and note `gpu-pool-rendering-notes.md`
+warns that A/B-ing this renderer through scalability cvars measures PSO precache
+invalidation instead of the change.
