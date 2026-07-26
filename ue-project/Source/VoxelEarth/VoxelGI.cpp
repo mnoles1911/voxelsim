@@ -10,6 +10,10 @@
 // renderer module reach back for the field.
 #include "VoxelGIVolume.h"
 #include "VoxelGpuPoolComponent.h"
+// voxel.GI.VolumeDigTest carves through the real edit path (CarveSphere) rather
+// than poking the field, so the dig test exercises the same remesh -> ingest ->
+// upload chain a player's dig does.
+#include "VoxelWorldSubsystem.h"
 
 #include "Camera/PlayerCameraManager.h"
 #include "Engine/Engine.h"
@@ -353,10 +357,15 @@ void UVoxelGISubsystem::ClearAllState()
 	RefreshCursor = 0;
 	VolumeUploadQueue.Reset();
 	VolumeUploadSet.Reset();
+	// An in-flight re-centre must not survive a toggle-off: its row buckets name
+	// bricks the field is about to drop, and resuming it later would restage the
+	// volume from a resident set that no longer exists.
+	bVolumeRecentring = false;
+	RecentreRowBricks.Reset();
 	// The shadow and the origin deliberately SURVIVE a toggle-off: the GPU
 	// texture still holds those bytes, and throwing the mirror away would leave
 	// the harness comparing against nothing while the volume kept rendering.
-	// The origin is set once for the session anyway (step 4 owns re-centring).
+	// Re-centring picks up from wherever the origin was left.
 	bCoarseDirty = false;
 	bHasState = false;
 }
@@ -486,12 +495,9 @@ bool UVoxelGISubsystem::EnsureVolumeOrigin()
 		return true;
 	}
 
-	// STEP 2 SCOPE: the origin is set ONCE, from the field centre at the moment
-	// of the first upload, and then never moves. Camera-following re-centring is
-	// step 4 (dead zone + staged re-upload + a one-frame origin swap) and is
-	// deliberately not attempted here -- a half-done re-centre is the failure
-	// mode that produces a plausible image with a moving artifact plane.
-	FVector PoolWorldUU;
+	// First-time establishment only. Camera-following re-centring afterwards is
+	// BeginVolumeRecentre/StepVolumeRecentre (dead zone + staged re-upload + a
+	// one-frame origin swap, docs/gpu-gi-volume-design.md §4).
 	if (!FindPoolWorldLocation(GetWorld(), PoolWorldUU))
 	{
 		// No pooled primitive means nothing samples the volume: the per-chunk
@@ -532,6 +538,7 @@ bool UVoxelGISubsystem::EnsureVolumeOrigin()
 	// (§6). Passing the world-space origin as an FVector3f is explicitly
 	// prohibited: at ~8.4M UU float32's ULP is 1.0 UU against a 40 UU cell.
 	const FVector3f OriginPoolUU = FVector3f(VolumeOriginWorldUU - PoolWorldUU);
+	CommittedOriginPoolUU = OriginPoolUU;
 
 	VolumeShadow.Empty();
 	VolumeShadow.SetNumZeroed(int64(VolumeDim) * VolumeDim * VolumeDim * 4);
@@ -546,12 +553,436 @@ bool UVoxelGISubsystem::EnsureVolumeOrigin()
 	       OriginPoolUU.X, OriginPoolUU.Y, OriginPoolUU.Z,
 	       HalfExtentUU, double(VolumeShadow.Num()) / (1024.0 * 1024.0));
 
-	ENQUEUE_RENDER_COMMAND(VoxelGIVolumeSetOrigin)(
-		[OriginPoolUU](FRHICommandListImmediate&)
-	{
-		GVoxelGIVolume.UpdateParameters_RenderThread(OriginPoolUU);
-	});
+	// The uniform buffer is published by PushVolumeParamsIfChanged, which runs
+	// straight after this in TickVolume and now owns every input to it.
+	bVolumeSettingsValid = false;
 	return true;
+}
+
+// --- camera-following re-centring (docs/gpu-gi-volume-design.md §4) ---------
+//
+// WHY NOT THE OTHER TWO. Toroidal addressing only uploads the new slabs, but
+// hardware trilinear bleeds across the wrap plane and that plane SWEEPS THROUGH
+// THE INTERIOR as the origin scrolls -- a 40 UU artifact plane moving across the
+// world, fixable only by replacing the free trilinear with a manual 8-tap
+// Load(). Double-buffering is 2x VRAM, which at the shipping size is another
+// 67 MB. Both were considered and rejected in the design; this is the third
+// option, and it costs one texture, no seam, and Dim^3*4 bytes of upload spread
+// over a handful of frames per re-centre.
+//
+// THE ONE HONEST CAVEAT, which the design does not state and the implementation
+// cannot remove: while the staged upload is in flight the texture holds a MIX of
+// old-addressed and new-addressed bytes, and the shader is still reading it with
+// the old origin. So the restaged region is transiently wrong -- by exactly the
+// re-centre shift -- until the origin swaps. Two things make that not a pop, and
+// both are deliberate rather than lucky:
+//
+//   * rows are restaged from BOTH ENDS INWARD, so the wrongness lives furthest
+//     from the camera (where the distance fade is already attenuating GI) and
+//     reaches the camera's own neighbourhood only in the last frame or two;
+//   * the swap is atomic -- one uniform-buffer publish on one frame -- so there
+//     is never a frame where part of the image uses one origin and part another.
+
+bool UVoxelGISubsystem::VolumeNeedsRecentre() const
+{
+	if (!bVolumeOriginSet || VolumeDim <= 0 || bVolumeRecentring)
+	{
+		return false;
+	}
+	// Nothing resident means nothing to re-address, and the first seconds of a
+	// session are exactly when the camera can be a long way from wherever the
+	// origin was first established. Re-centring an empty field would spend a
+	// whole staged upload writing zeros over zeros.
+	if (!Field || Field->NumBricks() == 0)
+	{
+		return false;
+	}
+	const double HalfExtentUU = 0.5 * double(VolumeDim) * double(VoxelLF::CellSizeUU);
+	const FVector Centre = VolumeOriginWorldUU + FVector(HalfExtentUU);
+
+	// Clamped so the dead zone always leaves at least a two-brick margin of
+	// volume beyond the camera. A dead zone wider than the half-extent would let
+	// the camera leave coverage entirely without ever triggering a re-centre,
+	// which presents as "GI stopped working over there" rather than as a bad
+	// cvar value.
+	const double MaxDeadZoneUU = FMath::Max(double(VoxelLF::BrickEdgeUU),
+	                                        HalfExtentUU - 2.0 * double(VoxelLF::BrickEdgeUU));
+	const double DeadZoneUU = FMath::Min(double(VoxelGIVolume::GetRecentreCells()) * double(VoxelLF::CellSizeUU),
+	                                     MaxDeadZoneUU);
+
+	return FMath::Abs(FieldCentreUU.X - Centre.X) > DeadZoneUU
+	    || FMath::Abs(FieldCentreUU.Y - Centre.Y) > DeadZoneUU
+	    || FMath::Abs(FieldCentreUU.Z - Centre.Z) > DeadZoneUU;
+}
+
+void UVoxelGISubsystem::BeginVolumeRecentre()
+{
+	if (!Field || VolumeDim <= 0 || VolumeShadow.Num() == 0)
+	{
+		return;
+	}
+
+	// Brick-snap in DOUBLE, exactly as EnsureVolumeOrigin does. The two must use
+	// the same expression or the very first re-centre would shift the lattice by
+	// a fraction of a cell and every sample after it would resample.
+	const double HalfExtentUU = 0.5 * double(VolumeDim) * double(VoxelLF::CellSizeUU);
+	auto SnapDownToBrick = [](double V) -> double
+	{
+		return FMath::FloorToDouble(V / double(VoxelLF::BrickEdgeUU)) * double(VoxelLF::BrickEdgeUU);
+	};
+	const FVector NewOriginWorldUU(SnapDownToBrick(FieldCentreUU.X - HalfExtentUU),
+	                               SnapDownToBrick(FieldCentreUU.Y - HalfExtentUU),
+	                               SnapDownToBrick(FieldCentreUU.Z - HalfExtentUU));
+	if (NewOriginWorldUU.Equals(VolumeOriginWorldUU, 0.5))
+	{
+		return; // dead zone tripped but the snap lands on the same brick
+	}
+
+	const FIntVector OldCellOrigin = VolumeCellOrigin;
+	VolumeOriginWorldUU = NewOriginWorldUU;
+	VolumeCellOrigin = FIntVector(int32(FMath::FloorToDouble(VolumeOriginWorldUU.X / VoxelLF::CellSizeUU)),
+	                              int32(FMath::FloorToDouble(VolumeOriginWorldUU.Y / VoxelLF::CellSizeUU)),
+	                              int32(FMath::FloorToDouble(VolumeOriginWorldUU.Z / VoxelLF::CellSizeUU)));
+
+	// Bucket the resident bricks that land inside the NEW volume by brick row, so
+	// restaging a row is a lookup rather than a rescan. Everything else in the
+	// volume legitimately becomes A=0 -- "no data", which the shader turns into
+	// plain AO -- because there is no resident brick there to say otherwise.
+	const int32 E = VoxelLF::BrickEdgeCells;
+	const int32 Rows = VolumeDim / E;
+	RecentreRowBricks.Reset();
+	RecentreRowBricks.SetNum(Rows);
+
+	TArray<FIntVector> Keys;
+	Field->GetResidentKeys(Keys);
+	int32 Inside = 0;
+	for (const FIntVector& Key : Keys)
+	{
+		const FIntVector Base(Key.X * E - VolumeCellOrigin.X,
+		                      Key.Y * E - VolumeCellOrigin.Y,
+		                      Key.Z * E - VolumeCellOrigin.Z);
+		if (Base.X < 0 || Base.Y < 0 || Base.Z < 0 ||
+		    Base.X + E > VolumeDim || Base.Y + E > VolumeDim || Base.Z + E > VolumeDim)
+		{
+			continue;
+		}
+		RecentreRowBricks[Base.Z / E].Add(Key);
+		++Inside;
+	}
+
+	// The per-brick queue is redundant now: every resident brick inside the new
+	// volume is about to be re-encoded from the live field. Anything solved
+	// DURING the re-centre re-queues itself and drains normally afterwards.
+	VolumeUploadQueue.Reset();
+	VolumeUploadSet.Reset();
+
+	bVolumeRecentring = true;
+	RecentreLoRow = 0;
+	RecentreHiRow = Rows;
+	RecentreFrames = 0;
+	RecentreCount = Inside;
+	RecentreStartSeconds = FPlatformTime::Seconds();
+	RecentreStepOccupied = 0;
+	RecentreOccupiedBeforeLast = 0;
+	RecentreTotalOccupied = 0;
+	RecentreStepNearestUU = TNumericLimits<double>::Max();
+	RecentreNearestBeforeLastUU = TNumericLimits<double>::Max();
+
+	UE_LOG(LogVoxelGI, Log,
+	       TEXT("VoxelGI volume: re-centre BEGIN camera=(%.0f,%.0f,%.0f) originWorld (%.0f,%.0f,%.0f) -> (%.0f,%.0f,%.0f) ")
+	       TEXT("shift=(%d,%d,%d) cells | %d/%d resident bricks inside | staging %d rows"),
+	       FieldCentreUU.X, FieldCentreUU.Y, FieldCentreUU.Z,
+	       double(OldCellOrigin.X) * VoxelLF::CellSizeUU, double(OldCellOrigin.Y) * VoxelLF::CellSizeUU,
+	       double(OldCellOrigin.Z) * VoxelLF::CellSizeUU,
+	       VolumeOriginWorldUU.X, VolumeOriginWorldUU.Y, VolumeOriginWorldUU.Z,
+	       VolumeCellOrigin.X - OldCellOrigin.X, VolumeCellOrigin.Y - OldCellOrigin.Y,
+	       VolumeCellOrigin.Z - OldCellOrigin.Z,
+	       Inside, Keys.Num(), Rows);
+}
+
+void UVoxelGISubsystem::RestageVolumeZRange(int32 Z0, int32 Z1)
+{
+	if (!Field || Z1 <= Z0)
+	{
+		return;
+	}
+	const int32 E = VoxelLF::BrickEdgeCells;
+	const int64 SliceBytes = int64(VolumeDim) * VolumeDim * 4;
+
+	// 1) Zero the range. Everything not covered by a resident brick MUST read
+	//    A=0: it is the "no data -> plain AO" case, and leaving the previous
+	//    occupant's bytes there would light new geometry with old irradiance
+	//    from somewhere else entirely.
+	FMemory::Memzero(VolumeShadow.GetData() + int64(Z0) * SliceBytes,
+	                 int64(Z1 - Z0) * SliceBytes);
+
+	// 2) Re-encode the resident bricks whose rows fall in this range, under ONE
+	//    read scope on the GAME thread (§1: never read the field from the render
+	//    thread).
+	{
+		const FVoxelLightField::FReadScope Read(*Field);
+		uint8 BrickTexels[FVoxelLightField::BrickTexelBytes];
+		for (int32 Row = Z0 / E; Row < Z1 / E; ++Row)
+		{
+			if (!RecentreRowBricks.IsValidIndex(Row))
+			{
+				continue;
+			}
+			for (const FIntVector& Key : RecentreRowBricks[Row])
+			{
+				Read.EncodeBrick(Key, BrickTexels);
+				const FIntVector Base(Key.X * E - VolumeCellOrigin.X,
+				                      Key.Y * E - VolumeCellOrigin.Y,
+				                      Key.Z * E - VolumeCellOrigin.Z);
+				for (int32 Z = 0; Z < E; ++Z)
+				for (int32 Y = 0; Y < E; ++Y)
+				{
+					const int64 DstOffset = ((int64(Base.Z + Z) * VolumeDim + (Base.Y + Y)) * VolumeDim + Base.X) * 4;
+					const int32 SrcOffset = (Z * E + Y) * E * 4;
+					FMemory::Memcpy(VolumeShadow.GetData() + DstOffset, BrickTexels + SrcOffset, E * 4);
+				}
+			}
+		}
+	}
+
+	// 3) One whole-XY-slab upload for the range. Full-width rows have zero
+	//    staging waste (§0's 256-byte row pitch), and a contiguous Z range is
+	//    contiguous in the shadow, so this is one UpdateTexture3D for the lot.
+	TArray<uint8> Payload;
+	Payload.SetNumUninitialized(int64(Z1 - Z0) * SliceBytes);
+	FMemory::Memcpy(Payload.GetData(), VolumeShadow.GetData() + int64(Z0) * SliceBytes,
+	                int64(Z1 - Z0) * SliceBytes);
+
+	// TRANSIENT ACCOUNTING (voxel.GI.Debug >= 2). This is what turns "no lighting
+	// pop" from an assertion into a number: every row restaged BEFORE the origin
+	// swap is, for the frames until that swap, being read with the old origin and
+	// therefore returning irradiance from a point one re-centre shift away. How
+	// bad that is depends on two things this measures -- how many of those texels
+	// carry data at all (most of the volume is A=0 rock/sky/unloaded, and an
+	// A=0 texel reads as plain AO both before and after, so it cannot pop), and
+	// how far the nearest of them is from the camera.
+	if (VoxelGI::GetDebugLevel() >= 2)
+	{
+		int64 Occupied = 0;
+		const uint8* Base = VolumeShadow.GetData() + int64(Z0) * SliceBytes;
+		const int64 Count = int64(Z1 - Z0) * int64(VolumeDim) * VolumeDim;
+		for (int64 I = 0; I < Count; ++I)
+		{
+			if (Base[I * 4 + 3] != 0) { ++Occupied; }
+		}
+		RecentreStepOccupied = Occupied;
+		RecentreOccupiedBeforeLast += Occupied;
+
+		const double RowMinZ = VolumeOriginWorldUU.Z + double(Z0) * VoxelLF::CellSizeUU;
+		const double RowMaxZ = VolumeOriginWorldUU.Z + double(Z1) * VoxelLF::CellSizeUU;
+		const double DistZ = FMath::Max(0.0, FMath::Max(RowMinZ - FieldCentreUU.Z, FieldCentreUU.Z - RowMaxZ));
+		RecentreStepNearestUU = FMath::Min(RecentreStepNearestUU, DistZ);
+	}
+
+	const FIntVector Min(0, 0, Z0);
+	const FIntVector Size(VolumeDim, VolumeDim, Z1 - Z0);
+	ENQUEUE_RENDER_COMMAND(VoxelGIVolumeRestage)(
+		[Min, Size, Bytes = MoveTemp(Payload)](FRHICommandListImmediate& RHICmdList)
+	{
+		GVoxelGIVolume.UpdateTexels_RenderThread(RHICmdList, Min, Size, Bytes.GetData());
+	});
+	++VolumeRunsUploaded;
+}
+
+void UVoxelGISubsystem::StepVolumeRecentre()
+{
+	if (!bVolumeRecentring)
+	{
+		return;
+	}
+	const int32 E = VoxelLF::BrickEdgeCells;
+	const int32 Rows = VolumeDim / E;
+	// ~8 frames, the design's figure. Expressed as rows-per-frame so the wall
+	// time of a re-centre does not scale with voxel.GI.VolumeDim.
+	constexpr int32 kRecentreFrames = 8;
+	const int32 RowsThisFrame = FMath::Max(2, FMath::DivideAndRoundUp(Rows, kRecentreFrames));
+
+	// Snapshot what the transient looked like going INTO this frame. If this
+	// frame turns out to be the committing one, these are the peak numbers --
+	// the rows restaged in the committing frame are swapped in the same frame
+	// they are written, so they are never read with the stale origin at all.
+	RecentreNearestBeforeLastUU = RecentreStepNearestUU;
+	const int64 OccupiedBeforeThisFrame = RecentreOccupiedBeforeLast;
+
+	// From both ends inward: half the budget off each end. See the member's
+	// comment for why that order, not "front to back".
+	int32 Remaining = RowsThisFrame;
+	while (Remaining > 0 && RecentreLoRow < RecentreHiRow)
+	{
+		RestageVolumeZRange(RecentreLoRow * E, (RecentreLoRow + 1) * E);
+		++RecentreLoRow;
+		--Remaining;
+		if (Remaining > 0 && RecentreLoRow < RecentreHiRow)
+		{
+			RestageVolumeZRange((RecentreHiRow - 1) * E, RecentreHiRow * E);
+			--RecentreHiRow;
+			--Remaining;
+		}
+	}
+	++RecentreFrames;
+
+	if (RecentreLoRow >= RecentreHiRow)
+	{
+		// THE ORIGIN SWAP. One publish, one frame, everything correct from here.
+		bVolumeRecentring = false;
+		RecentreRowBricks.Reset();
+		CommittedOriginPoolUU = FVector3f(VolumeOriginWorldUU - PoolWorldUU);
+		PushVolumeParamsIfChanged();
+		RecentreTotalOccupied = RecentreOccupiedBeforeLast;
+		UE_LOG(LogVoxelGI, Log,
+		       TEXT("VoxelGI volume: re-centre COMMIT after %d frames (%.1f ms wall), %d bricks restaged, ")
+		       TEXT("originPool=(%.1f,%.1f,%.1f)"),
+		       RecentreFrames, (FPlatformTime::Seconds() - RecentreStartSeconds) * 1000.0, RecentreCount,
+		       CommittedOriginPoolUU.X, CommittedOriginPoolUU.Y, CommittedOriginPoolUU.Z);
+		if (VoxelGI::GetDebugLevel() >= 2)
+		{
+			// The two numbers that decide whether the staged re-upload can pop:
+			// how many occupied texels were read with the stale origin at the
+			// worst moment (the frame before the commit), and how close to the
+			// camera the nearest of them got. Rows written in the committing
+			// frame are excluded because their upload and the origin swap are
+			// enqueued in that order into the same render frame.
+			UE_LOG(LogVoxelGI, Log,
+			       TEXT("VOLUMERECENTRE transient: peakStaleTexels=%lld of %lld occupied (%.1f%%), ")
+			       TEXT("nearestStaleRowToCamera=%.0f UU, fadeEnd=%.0f UU"),
+			       (long long)OccupiedBeforeThisFrame, (long long)RecentreTotalOccupied,
+			       RecentreTotalOccupied > 0 ? 100.0 * double(OccupiedBeforeThisFrame) / double(RecentreTotalOccupied) : 0.0,
+			       RecentreNearestBeforeLastUU == TNumericLimits<double>::Max() ? -1.0 : RecentreNearestBeforeLastUU,
+			       double(LastVolumeSettings.FadeEndUU));
+		}
+	}
+}
+
+void UVoxelGISubsystem::FlushVolume()
+{
+	int32 Guard = 0;
+	while (bVolumeRecentring && Guard++ < 4096)
+	{
+		StepVolumeRecentre();
+	}
+	DrainVolumeUploads(-1);
+}
+
+void UVoxelGISubsystem::PushVolumeParamsIfChanged()
+{
+	FVoxelGIVolumeSettings New;
+	New.bEnabled = VoxelGIVolume::IsEnabled() && bVolumeOriginSet;
+	New.DebugVis = VoxelGIVolume::GetDebugVis();
+	New.OriginPoolUU = CommittedOriginPoolUU;
+	// The CAMERA in pool space, not the volume centre: this is the quantity the
+	// CPU shade measures its fade from (GICentreUU), and B4.3. Subtracted in
+	// double and narrowed once, same rule as the origin.
+	New.FadeCentrePoolUU = FVector3f(FieldCentreUU - PoolWorldUU);
+	New.Strength = VoxelGI::GetStrength();
+	New.AmbientFloor = VoxelGI::GetAmbientFloor();
+
+	// Risk 8, enforced rather than documented. Beyond the volume face AM_Clamp
+	// returns the edge texel, so a fade that has not finished by then does not
+	// fade at all -- GI cuts off as a hard, plausible-looking lighting ring.
+	// Clamping here means a fade that is too wide for the configured VolumeDim
+	// degrades to "fades slightly early" instead.
+	const float HalfExtentUU = 0.5f * float(VolumeDim > 0 ? VolumeDim : VoxelGIVolume::GetDim())
+	                         * float(VoxelLF::CellSizeUU);
+	//
+	// The clamp SLIDES the band rather than truncating it. Clamping FadeEnd alone
+	// would leave FadeStart where it was and collapse a 1600 UU fade into a
+	// 40 UU one at VolumeDim 192 -- which is the hard ring this is meant to
+	// prevent, arrived at from the other direction. Preserving the band width and
+	// moving both ends down degrades to "GI fades out somewhat early", which is
+	// the failure mode a player cannot see.
+	const float MaxFadeEndUU = FMath::Max(2.0f * float(VoxelLF::BrickEdgeUU),
+	                                      HalfExtentUU - float(VoxelLF::BrickEdgeUU));
+	const float WantEndUU = VoxelGI::GetFadeEndUU();
+	const float WantStartUU = FMath::Min(VoxelGI::GetFadeStartUU(), WantEndUU - float(VoxelLF::CellSizeUU));
+	const float ShiftUU = FMath::Max(0.0f, WantEndUU - MaxFadeEndUU);
+	New.FadeEndUU = WantEndUU - ShiftUU;
+	New.FadeStartUU = FMath::Max(float(VoxelLF::BrickEdgeUU), WantStartUU - ShiftUU);
+	New.FadeStartUU = FMath::Min(New.FadeStartUU, New.FadeEndUU - float(VoxelLF::CellSizeUU));
+
+	if (bVolumeSettingsValid && New == LastVolumeSettings)
+	{
+		return;
+	}
+	// Announce the SHADING terms whenever they move, not the origin/fade-centre
+	// (which move every frame the camera does and would drown the log). This is
+	// the line that makes a fired clamp visible: risk 8's failure mode is a
+	// plausible image, so "the fade you asked for is not the fade you got" has to
+	// be greppable rather than inferable.
+	if (!bVolumeSettingsValid
+	    || New.bEnabled != LastVolumeSettings.bEnabled
+	    || New.Strength != LastVolumeSettings.Strength
+	    || New.AmbientFloor != LastVolumeSettings.AmbientFloor
+	    || New.FadeStartUU != LastVolumeSettings.FadeStartUU
+	    || New.FadeEndUU != LastVolumeSettings.FadeEndUU
+	    || New.DebugVis != LastVolumeSettings.DebugVis)
+	{
+		UE_LOG(LogVoxelGI, Log,
+		       TEXT("VoxelGI volume params: enabled=%d strength=%.3f ambientFloor=%.3f fade=%.0f..%.0f UU ")
+		       TEXT("(cvars asked %.0f..%.0f; volume half-extent %.0f) debugVis=%d"),
+		       New.bEnabled ? 1 : 0, New.Strength, New.AmbientFloor, New.FadeStartUU, New.FadeEndUU,
+		       VoxelGI::GetFadeStartUU(), VoxelGI::GetFadeEndUU(), HalfExtentUU, New.DebugVis);
+	}
+	LastVolumeSettings = New;
+	bVolumeSettingsValid = true;
+
+	ENQUEUE_RENDER_COMMAND(VoxelGIVolumeParams)(
+		[New](FRHICommandListImmediate& RHICmdList)
+	{
+		GVoxelGIVolume.UpdateParameters_RenderThread(New);
+	});
+}
+
+void UVoxelGISubsystem::TickVolume()
+{
+	if (!VoxelGIVolume::IsEnabled())
+	{
+		// One publish on the way down, so a live toggle-off actually reaches the
+		// shader instead of leaving the last Enabled=1 buffer bound forever.
+		if (bVolumeSettingsValid && LastVolumeSettings.bEnabled)
+		{
+			FVoxelGIVolumeSettings Off = LastVolumeSettings;
+			Off.bEnabled = false;
+			LastVolumeSettings = Off;
+			ENQUEUE_RENDER_COMMAND(VoxelGIVolumeOff)(
+				[Off](FRHICommandListImmediate&) { GVoxelGIVolume.UpdateParameters_RenderThread(Off); });
+		}
+		return;
+	}
+	if (!EnsureVolumeOrigin())
+	{
+		return;
+	}
+	if (!bVolumeAllocated)
+	{
+		bVolumeAllocated = true;
+		ENQUEUE_RENDER_COMMAND(VoxelGIVolumeAlloc)(
+			[](FRHICommandListImmediate& RHICmdList) { GVoxelGIVolume.EnsureAllocated_RenderThread(RHICmdList); });
+	}
+
+	if (bVolumeRecentring)
+	{
+		// The per-brick drain is suspended for the duration: every resident brick
+		// is being re-encoded anyway, and letting the two upload paths interleave
+		// would make "the origin uniform changed on exactly one frame" harder to
+		// state than it needs to be.
+		StepVolumeRecentre();
+	}
+	else if (VolumeNeedsRecentre())
+	{
+		BeginVolumeRecentre();
+		StepVolumeRecentre();
+	}
+	else
+	{
+		DrainVolumeUploads(FMath::Max(0, CVarGIMaxBrickUploadsPerFrame.GetValueOnGameThread()));
+	}
+
+	PushVolumeParamsIfChanged();
 }
 
 int32 UVoxelGISubsystem::DrainVolumeUploads(int32 Budget)
@@ -680,6 +1111,7 @@ int32 UVoxelGISubsystem::DrainVolumeUploads(int32 Budget)
 	}
 
 	VolumeBricksUploaded += Batch.Num();
+	VolumeUploadedThisFrame += Batch.Num();
 	VolumeRunsUploaded += Runs.Num();
 	if (FirstVolumeUploadSeconds == 0.0)
 	{
@@ -740,7 +1172,9 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 	// Flush the whole upload queue first, ignoring the per-frame budget. A
 	// diagnostic that measures a volume which is merely BEHIND the field
 	// measures the queue, not the encoding.
-	const int32 Flushed = DrainVolumeUploads(-1);
+	const int32 BeforeFlush = VolumeBricksUploaded;
+	FlushVolume();
+	const int32 Flushed = VolumeBricksUploaded - BeforeFlush;
 
 	TArray<FIntVector> Keys;
 	Field->GetResidentKeys(Keys);
@@ -834,14 +1268,42 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 	{
 		int32 Count = 0;
 		double SumAbsErr = 0.0;
+		double SumSqErr = 0.0;
 		double MaxAbsErr = 0.0;
+		// Kept so the TAIL can be reported, not just the mean. Step 3's decision
+		// turns on the horizontal class, whose mean passed its bar at ~6 bytes
+		// while maxAbsErr sat at ~102 -- a mean that low with a max that high is
+		// either a thin tail (fine, ship Scheme B) or a fat one (a visible defect
+		// hiding behind an average), and only percentiles tell those apart.
+		TArray<double> Samples;
 		void Add(double ErrBytes)
 		{
 			++Count;
 			SumAbsErr += ErrBytes;
+			SumSqErr += ErrBytes * ErrBytes;
 			MaxAbsErr = FMath::Max(MaxAbsErr, ErrBytes);
+			Samples.Add(ErrBytes);
 		}
 		double Mean() const { return Count > 0 ? SumAbsErr / Count : 0.0; }
+		// §2 asked for an RMS and the transcript reported a mean-abs. RMS is the
+		// stricter statistic (it weights the tail), so reporting both is what
+		// makes the two comparable rather than merely both present.
+		double Rms() const { return Count > 0 ? FMath::Sqrt(SumSqErr / Count) : 0.0; }
+		double Percentile(double P)
+		{
+			if (Samples.Num() == 0) { return 0.0; }
+			Samples.Sort();
+			const int32 Idx = FMath::Clamp(int32(P * double(Samples.Num() - 1) + 0.5), 0, Samples.Num() - 1);
+			return Samples[Idx];
+		}
+		// Share of samples above the design doc's "free quality" bar of 8/255.
+		double FractionAbove(double Bytes) const
+		{
+			if (Count == 0) { return 0.0; }
+			int32 N = 0;
+			for (double S : Samples) { if (S > Bytes) { ++N; } }
+			return double(N) / double(Count);
+		}
 	};
 	FClassStats StatsZ;   // +-Z normals: Scheme B is exact here
 	FClassStats StatsXY;  // +-X/+-Y normals: the horizontal mean
@@ -953,15 +1415,18 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 	// claims to reproduce exactly and therefore the one that can falsify the
 	// encoding, the addressing, the origin snap and the run merge in one number.
 	UE_LOG(LogVoxelGI, Log,
-	       TEXT("VOLUMECHECK: cells=%d meanAbsErr=%.3f maxAbsErr=%.3f"),
-	       StatsZ.Count, StatsZ.Mean(), StatsZ.MaxAbsErr);
+	       TEXT("VOLUMECHECK: cells=%d meanAbsErr=%.3f rms=%.3f maxAbsErr=%.3f"),
+	       StatsZ.Count, StatsZ.Mean(), StatsZ.Rms(), StatsZ.MaxAbsErr);
 	UE_LOG(LogVoxelGI, Log,
-	       TEXT("VOLUMECHECK horizontal (+-X/+-Y, Scheme B mean channel): cells=%d meanAbsErr=%.3f maxAbsErr=%.3f"),
-	       StatsXY.Count, StatsXY.Mean(), StatsXY.MaxAbsErr);
+	       TEXT("VOLUMECHECK horizontal (+-X/+-Y, Scheme B mean channel): cells=%d meanAbsErr=%.3f rms=%.3f ")
+	       TEXT("p50=%.3f p90=%.3f p95=%.3f p99=%.3f maxAbsErr=%.3f frac>8/255=%.4f"),
+	       StatsXY.Count, StatsXY.Mean(), StatsXY.Rms(),
+	       StatsXY.Percentile(0.50), StatsXY.Percentile(0.90), StatsXY.Percentile(0.95),
+	       StatsXY.Percentile(0.99), StatsXY.MaxAbsErr, StatsXY.FractionAbove(8.0));
 	UE_LOG(LogVoxelGI, Log,
 	       TEXT("VOLUMECHECK control (+-Z, volume probe shifted half a cell in X -- MUST be large, else the ")
-	       TEXT("line above is measuring nothing): cells=%d meanAbsErr=%.3f maxAbsErr=%.3f"),
-	       StatsControl.Count, StatsControl.Mean(), StatsControl.MaxAbsErr);
+	       TEXT("line above is measuring nothing): cells=%d meanAbsErr=%.3f rms=%.3f maxAbsErr=%.3f"),
+	       StatsControl.Count, StatsControl.Mean(), StatsControl.Rms(), StatsControl.MaxAbsErr);
 	{
 		const double N = FMath::Max(1, StatsZ.Count);
 		const double SigMean = SignalSum / N;
@@ -984,6 +1449,220 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 	       Flushed, VolumeBricksUploaded, VolumeRunsUploaded, VolumeUploadQueue.Num(),
 	       Attempts, Unsolved, VolMiss, CpuMiss,
 	       VolumeOriginWorldUU.X, VolumeOriginWorldUU.Y, VolumeOriginWorldUU.Z);
+}
+
+// --- voxel.GI.VolumeDigTest -------------------------------------------------
+//
+// THE DELIVERABLE FOR TWO STEP-2 CLAIMS THAT WERE "CORRECT BY CONSTRUCTION ONLY".
+//
+//   * The X-run upload merge exists for the DIG case -- a contiguous 5x5x5 brick
+//     neighbourhood -- and the only number ever measured for it was 1.4
+//     bricks/run in STEADY STATE, where the round-robin re-solve delivers bricks
+//     in TMap iteration order and X-adjacent pairs are rare by construction. That
+//     number says nothing about the case the merge was built for.
+//   * zero-on-revoxelize: a dug brick must reach the volume as A=0 (which the
+//     shader reads as "no data" and turns into plain AO) BEFORE its re-solve
+//     lands, or the tunnel keeps its pre-dig lighting for as long as the solve
+//     queue is deep. Never observed, only argued.
+//   * zero-on-evict: same, for a brick that leaves the resident set.
+//
+// Method: carve a real sphere through the real edit path at the camera, suppress
+// the round-robin re-solve for the duration so the upload queue contains the
+// dig's bricks and nothing else, then flush and read the answer out of
+// VolumeShadow -- the actual staged bytes, not a re-encode.
+void UVoxelGISubsystem::StepDigTest()
+{
+	if (DigTestPhase == 0)
+	{
+		return;
+	}
+
+	const int32 E = VoxelLF::BrickEdgeCells;
+	auto BrickAllZero = [this, E](const FIntVector& Key, int32& OutInside) -> bool
+	{
+		const FIntVector Base(Key.X * E - VolumeCellOrigin.X,
+		                      Key.Y * E - VolumeCellOrigin.Y,
+		                      Key.Z * E - VolumeCellOrigin.Z);
+		if (Base.X < 0 || Base.Y < 0 || Base.Z < 0 ||
+		    Base.X + E > VolumeDim || Base.Y + E > VolumeDim || Base.Z + E > VolumeDim)
+		{
+			return true; // outside the volume; not counted
+		}
+		++OutInside;
+		for (int32 Z = 0; Z < E; ++Z)
+		for (int32 Y = 0; Y < E; ++Y)
+		for (int32 X = 0; X < E; ++X)
+		{
+			const int64 Off = ((int64(Base.Z + Z) * VolumeDim + (Base.Y + Y)) * VolumeDim + (Base.X + X)) * 4;
+			if (VolumeShadow[Off + 3] != 0) { return false; }
+		}
+		return true;
+	};
+
+	const double Now = FPlatformTime::Seconds();
+
+	if (DigTestPhase == 1)
+	{
+		// Wait until the dig's remeshes have been ingested. The streaming system
+		// budgets remeshes per frame, so this is several frames, not one.
+		if ((PendingVoxelize.Num() > 0 || PendingPooledVoxelize.Num() > 0)
+		    && Now - DigTestPhaseSeconds < 5.0)
+		{
+			return;
+		}
+
+		const int32 BricksBefore = VolumeBricksUploaded;
+		const int32 RunsBefore = VolumeRunsUploaded;
+		FlushVolume();
+		const int32 Bricks = VolumeBricksUploaded - BricksBefore;
+		const int32 Runs = VolumeRunsUploaded - RunsBefore;
+
+		int32 Inside = 0;
+		int32 Zeroed = 0;
+		for (const FIntVector& Key : DigTestBricks)
+		{
+			int32 WasInside = 0;
+			const bool bZero = BrickAllZero(Key, WasInside);
+			Inside += WasInside;
+			if (WasInside > 0 && bZero) { ++Zeroed; }
+		}
+
+		UE_LOG(LogVoxelGI, Log,
+		       TEXT("VOLUMEDIG revoxelize: dirtied=%d bricks (%d inside the volume) | uploaded %d bricks in %d runs ")
+		       TEXT("= %.2f bricks/run | zeroed=%d/%d %s"),
+		       DigTestBricks.Num(), Inside, Bricks, Runs,
+		       Runs > 0 ? double(Bricks) / double(Runs) : 0.0,
+		       Zeroed, Inside,
+		       (Inside > 0 && Zeroed == Inside) ? TEXT("PASS") : TEXT("FAIL"));
+
+		DigTestPhase = 2;
+		DigTestPhaseSeconds = Now;
+		return;
+	}
+
+	if (DigTestPhase == 2)
+	{
+		// Let the solve land, then confirm the same bricks come BACK -- otherwise
+		// "zeroed" would also be the reading for "the upload path is broken".
+		if (Now - DigTestPhaseSeconds < 6.0)
+		{
+			return;
+		}
+		FlushVolume();
+		int32 Inside = 0;
+		int32 Relit = 0;
+		for (const FIntVector& Key : DigTestBricks)
+		{
+			int32 WasInside = 0;
+			const bool bZero = BrickAllZero(Key, WasInside);
+			Inside += WasInside;
+			if (WasInside > 0 && !bZero) { ++Relit; }
+		}
+		UE_LOG(LogVoxelGI, Log,
+		       TEXT("VOLUMEDIG resolve: %d/%d bricks carry data again after the solve %s"),
+		       Relit, Inside, (Inside > 0 && Relit > 0) ? TEXT("PASS") : TEXT("FAIL"));
+
+		// --- zero-on-evict, through the real eviction path -------------------
+		//
+		// Driven rather than waited for: eviction is distance-based and at the
+		// default radius nothing near the camera ever evicts, so waiting for one
+		// would mean flying for a minute and hoping. This calls the same
+		// EvictFarBricks the tick calls, with a radius chosen to catch a handful,
+		// and pushes the result through the same PushVolumeUpload the tick uses.
+		// It is destructive -- the evicted bricks come back only when their chunk
+		// re-meshes -- which is why it lives behind a diagnostic command.
+		TArray<FIntVector> Evicted;
+		const double EvictRadiusUU = 0.35 * 0.5 * double(VolumeDim) * double(VoxelLF::CellSizeUU);
+		const int32 NumEvicted = Field->EvictFarBricks(FieldCentreUU, EvictRadiusUU, 32, Evicted);
+		for (const FIntVector& Key : Evicted)
+		{
+			BrickComponents.Remove(Key);
+			PushVolumeUpload(Key);
+		}
+		FlushVolume();
+		int32 EInside = 0;
+		int32 EZeroed = 0;
+		for (const FIntVector& Key : Evicted)
+		{
+			int32 WasInside = 0;
+			const bool bZero = BrickAllZero(Key, WasInside);
+			EInside += WasInside;
+			if (WasInside > 0 && bZero) { ++EZeroed; }
+		}
+		UE_LOG(LogVoxelGI, Log,
+		       TEXT("VOLUMEDIG evict: evicted=%d (%d inside the volume at radius %.0f UU) zeroed=%d %s"),
+		       NumEvicted, EInside, EvictRadiusUU, EZeroed,
+		       (EInside > 0 && EZeroed == EInside) ? TEXT("PASS") : TEXT("FAIL (0 inside = inconclusive)"));
+
+		DigTestPhase = 0;
+		DigTestBricks.Reset();
+		bCoarseDirty = true;
+		RefreshRotation.Reset();
+		RefreshCursor = 0;
+	}
+}
+
+void UVoxelGISubsystem::StartDigTest(double RadiusUU)
+{
+	if (!Field || !VoxelGIVolume::IsEnabled() || !bVolumeOriginSet)
+	{
+		UE_LOG(LogVoxelGI, Warning,
+		       TEXT("VOLUMEDIG: needs voxel.GI.Enabled 1, voxel.GI.Volume 1, voxel.Stream.GPU 1 and a settled ")
+		       TEXT("field (originSet=%d)."), bVolumeOriginSet ? 1 : 0);
+		return;
+	}
+	UWorld* World = GetWorld();
+	UVoxelWorldSubsystem* WorldSub = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	if (!WorldSub)
+	{
+		return;
+	}
+
+	// Straight down from the camera, which is where a dig actually goes and, more
+	// usefully, is guaranteed to hit solid geometry on a surface spawn.
+	const FVector CentreUU = FieldCentreUU - FVector(0, 0, 2.0 * double(VoxelLF::BrickEdgeUU));
+	const int32 Removed = WorldSub->CarveSphere(CentreUU, RadiusUU, 0.0);
+
+	// The bricks a dig of this size dirties: the touched neighbourhood plus the
+	// voxel.GI.EditDirtyRadiusBricks halo, which is what MarkBrickNeighbourhoodDirty
+	// will expand it to.
+	const FIntVector Centre = FVoxelLightField::WorldToBrick(CentreUU);
+	const int32 R = 1 + FMath::CeilToInt(RadiusUU / double(VoxelLF::BrickEdgeUU));
+	DigTestBricks.Reset();
+	for (int32 DZ = -R; DZ <= R; ++DZ)
+	for (int32 DY = -R; DY <= R; ++DY)
+	for (int32 DX = -R; DX <= R; ++DX)
+	{
+		DigTestBricks.Add(Centre + FIntVector(DX, DY, DZ));
+	}
+
+	DigTestPhase = 1;
+	DigTestPhaseSeconds = FPlatformTime::Seconds();
+	UE_LOG(LogVoxelGI, Log,
+	       TEXT("VOLUMEDIG: carved %d voxels at (%.0f,%.0f,%.0f) r=%.0f UU; watching %d bricks. ")
+	       TEXT("Round-robin re-solve suppressed until the test completes so the run-merge number is the DIG's."),
+	       Removed, CentreUU.X, CentreUU.Y, CentreUU.Z, RadiusUU, DigTestBricks.Num());
+}
+
+namespace
+{
+	FAutoConsoleCommandWithWorldAndArgs GVoxelGIVolumeDigTestCmd(
+		TEXT("voxel.GI.VolumeDigTest"),
+		TEXT("Carve a sphere below the camera and measure the three GPU-volume behaviours that were ")
+		TEXT("previously correct-by-construction only: the X-run upload merge on a dig's CONTIGUOUS brick ")
+		TEXT("neighbourhood (the case it was built for -- the only number on record, 1.4 bricks/run, is ")
+		TEXT("steady state), zero-on-revoxelize, and zero-on-evict. Optional argument: carve radius in UU ")
+		TEXT("(default 300). Logs VOLUMEDIG lines. DESTRUCTIVE: it really digs, and it really evicts."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+			[](const TArray<FString>& Args, UWorld* World)
+	{
+		if (!World) { return; }
+		if (UVoxelGISubsystem* GI = World->GetSubsystem<UVoxelGISubsystem>())
+		{
+			const double RadiusUU = Args.Num() > 0 ? FMath::Clamp(FCString::Atod(*Args[0]), 40.0, 2000.0) : 300.0;
+			GI->StartDigTest(RadiusUU);
+		}
+	}));
 }
 
 // --- tick ------------------------------------------------------------------
@@ -1120,7 +1799,12 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		}
 	}
 
-	const int32 RefreshBudget = FMath::Max(0, CVarGIRefreshBricksPerFrame.GetValueOnGameThread());
+	// Suppressed for the duration of voxel.GI.VolumeDigTest: the round-robin
+	// delivers bricks in TMap iteration order, and mixing those into the upload
+	// queue is exactly what makes the steady-state 1.4 bricks/run number
+	// uninformative about the dig case.
+	const int32 RefreshBudget = (DigTestPhase != 0)
+		? 0 : FMath::Max(0, CVarGIRefreshBricksPerFrame.GetValueOnGameThread());
 	if (RefreshBudget > 0)
 	{
 		if (RefreshCursor >= RefreshRotation.Num())
@@ -1148,11 +1832,28 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 
 		for (const FIntVector& Key : ToSolve)
 		{
-			bool bAlready = false;
-			RefreshSet.Add(Key, &bAlready);
-			if (!bAlready)
+			// ONLY bricks a component actually owns go on the re-shade queue.
+			//
+			// Step 5's cost retirement, and it is smaller and more specific than
+			// the roadmap claimed. Pooled bricks have no BrickComponents entry by
+			// design (see the member's comment), so every pop of one was
+			// guaranteed to miss: under voxel.Stream.GPU 1 the queue filled with
+			// ~2,000 entries that could only ever be popped and discarded, which
+			// is what forced the 8x pop cap below. Not enqueueing them at all
+			// deletes the queue growth, the RemoveAt(0) memmove and the TSet
+			// churn outright, and the pop cap stops being load-bearing.
+			//
+			// This is NOT "the volume replaces a re-shade": there was never a
+			// re-shade to replace on the pooled path. What the volume replaces is
+			// the ABSENCE of one.
+			if (BrickComponents.Contains(Key))
 			{
-				RefreshQueue.Add(Key);
+				bool bAlready = false;
+				RefreshSet.Add(Key, &bAlready);
+				if (!bAlready)
+				{
+					RefreshQueue.Add(Key);
+				}
 			}
 			// §3.3 row 1: brick solved -> write Vis*v, v. Same work list as the
 			// component path's re-shade, separate cursor (see the member decl).
@@ -1261,8 +1962,10 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 	//
 	//     Costs nothing with voxel.GI.Volume 0: both PushVolumeUpload and this
 	//     drain return on the cvar read before touching the queue.
-	const int32 VolumeUploaded = DrainVolumeUploads(
-		FMath::Max(0, CVarGIMaxBrickUploadsPerFrame.GetValueOnGameThread()));
+	VolumeUploadedThisFrame = 0;
+	TickVolume();
+	StepDigTest();
+	const int32 VolumeUploaded = VolumeUploadedThisFrame;
 
 	// 5) Eviction, at most twice a second. Distance-based rather than
 	//    hooked to chunk unload: UVoxelChunkComponent has no unload callback

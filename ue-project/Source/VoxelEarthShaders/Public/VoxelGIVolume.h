@@ -43,10 +43,25 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelGIVolumeParameters, VOXELEARTHSHADERS
 	// lookup in the range where float32 has ~0.015 UU of headroom.
 	SHADER_PARAMETER(FVector3f, OriginPoolUU)
 	SHADER_PARAMETER(FVector3f, InvSizeUU)
+	// Centre the distance fade is measured FROM, in the same pool space. This is
+	// the CAMERA, not the volume centre.
+	//
+	// They are not the same thing and the difference is not small. The CPU shade
+	// (VoxelChunkComponent.cpp, BuildChunkVertexData) measures
+	// Dist(WorldPos, GICentreUU) where GICentreUU is the camera; the volume's
+	// origin follows the camera only to within the re-centring dead zone
+	// (voxel.GI.VolumeRecentreCells, 2560 UU by default), so using the volume
+	// centre here would slide the whole fade band by up to that much and put a
+	// moving brightness gradient on static geometry. Supplied per frame.
+	SHADER_PARAMETER(FVector3f, FadeCentrePoolUU)
 	SHADER_PARAMETER(float, Strength)
 	SHADER_PARAMETER(float, AmbientFloor)
 	SHADER_PARAMETER(float, FadeStartUU)
 	SHADER_PARAMETER(float, FadeEndUU)
+	// VoxelLF::CellSizeUU, so the shader's fallback probe offsets are expressed
+	// in the same units the CPU sampler's {0.6, 1.25, 2.0} cells are, rather
+	// than in a second hardcoded 40.
+	SHADER_PARAMETER(float, CellSizeUU)
 	// 0 = the factory skips the sample entirely and vertex colour G keeps the
 	// mesher's AO, byte-identical to today.
 	SHADER_PARAMETER(uint32, Enabled)
@@ -73,7 +88,52 @@ namespace VoxelGIVolume
 	VOXELEARTHSHADERS_API bool IsEnabled();
 
 	VOXELEARTHSHADERS_API int32 GetDebugVis();
+
+	// Dead-zone half-width in CELLS for camera-following re-centring
+	// (docs/gpu-gi-volume-design.md §4). Clamped against the volume's own
+	// half-extent by the caller: a dead zone wider than the volume would let the
+	// camera leave coverage without ever triggering a re-centre, which is the
+	// one failure this knob can produce and it looks like "GI stopped working"
+	// rather than like a bad setting.
+	VOXELEARTHSHADERS_API int32 GetRecentreCells();
 }
+
+// Everything the shader needs that is NOT the texture itself. Passed as one
+// struct rather than as a growing argument list because the caller
+// (UVoxelGISubsystem) diffs it against the last one it sent to decide whether a
+// uniform-buffer rebuild is needed at all -- which is what makes
+// voxel.GI.Volume's "read per frame" claim true instead of aspirational.
+//
+// Strength/AmbientFloor/Fade* are supplied by the caller rather than read from
+// cvars here ON PURPOSE. The cvars live in VoxelEarth (voxel.GI.Strength,
+// voxel.GI.AmbientFloor, voxel.GI.FadeStartUU, voxel.GI.FadeEndUU) and
+// VoxelEarthShaders may not depend on VoxelEarth. Hardcoding them here -- which
+// is what this file did until Wave B -- made the two shade formulas identical by
+// coincidence (1.0 / 0.06) and silently divergent the moment either cvar moved.
+struct FVoxelGIVolumeSettings
+{
+	FVector3f OriginPoolUU = FVector3f::ZeroVector;
+	FVector3f FadeCentrePoolUU = FVector3f::ZeroVector;
+	float Strength = 1.0f;
+	float AmbientFloor = 0.06f;
+	float FadeStartUU = 4800.0f;
+	float FadeEndUU = 6400.0f;
+	int32 DebugVis = 0;
+	bool bEnabled = false;
+
+	bool operator==(const FVoxelGIVolumeSettings& Other) const
+	{
+		return OriginPoolUU == Other.OriginPoolUU
+			&& FadeCentrePoolUU == Other.FadeCentrePoolUU
+			&& Strength == Other.Strength
+			&& AmbientFloor == Other.AmbientFloor
+			&& FadeStartUU == Other.FadeStartUU
+			&& FadeEndUU == Other.FadeEndUU
+			&& DebugVis == Other.DebugVis
+			&& bEnabled == Other.bEnabled;
+	}
+	bool operator!=(const FVoxelGIVolumeSettings& Other) const { return !(*this == Other); }
+};
 
 // The volume itself. One per process, as a TGlobalResource -- the light field is
 // centred on the camera and there is one camera.
@@ -93,7 +153,17 @@ public:
 
 	// Rebuilds the uniform buffer. Render thread. Cheap -- it is a handful of
 	// scalars plus two resource pointers.
-	void UpdateParameters_RenderThread(const FVector3f& InOriginPoolUU);
+	void UpdateParameters_RenderThread(const FVoxelGIVolumeSettings& InSettings);
+
+	// Creates the volume texture if it does not exist yet. Render thread.
+	//
+	// LAZY ON PURPOSE. The texture is N^3*4 bytes and this is a TGlobalResource,
+	// so allocating it in InitRHI charges every session for it whether or not GI
+	// is on -- 1 MB at the bring-up N=64, but 67 MB at the shipping N=256, which
+	// is not a rounding error to hand to a player who never enables GI. Nothing
+	// samples the volume while voxel.GI.Volume is 0 (the factory binds
+	// GBlackVolumeTexture and Enabled=0), so there is nothing to allocate for.
+	void EnsureAllocated_RenderThread(FRHICommandListBase& RHICmdList);
 
 	// docs/gpu-gi-volume-design.md §7 step 1: fills every texel with a
 	// per-brick checkerboard, A=255. This is the "does the same pool draw
@@ -126,7 +196,7 @@ public:
 private:
 	FTextureRHIRef Volume;
 	TUniformBufferRef<FVoxelGIVolumeParameters> UniformBuffer;
-	FVector3f OriginPoolUU = FVector3f::ZeroVector;
+	FVoxelGIVolumeSettings Settings;
 	int32 DimTexels = 0;
 };
 
