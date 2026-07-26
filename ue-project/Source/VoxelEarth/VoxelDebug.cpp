@@ -78,6 +78,24 @@ TAutoConsoleVariable<int32> CVarVoxelWaterMaxActiveBricks(
 	TEXT("UVoxelWaterSubsystem::TickWater."),
 	ECVF_Default);
 
+// The water half of ADR-0006. Deliberately a SEPARATE cvar from
+// voxel.Stream.GPU rather than a rider on it: water and terrain are different
+// primitives with different materials, and the water one is TRANSLUCENT. That
+// makes their failure modes different enough that being able to run pooled
+// terrain against per-brick water (or the reverse) is the bisection this needed
+// -- exactly the argument voxel.Stream.GPUMaxLevel makes for mip rings.
+//
+// Read once per brick handoff, so like voxel.Stream.GPU it must be set before
+// the water it should affect meshes; bricks already drawn keep the
+// representation they were built with, and unload the way they loaded.
+TAutoConsoleVariable<bool> CVarVoxelWaterGpu(
+	TEXT("voxel.Water.GPU"),
+	false,
+	TEXT("Route active + implicit water surface geometry through its own ADR-0006 GPU pool (ONE primitive, ONE ")
+	TEXT("draw) instead of one UWaterChunkComponent per vxc::WaterBrick8. Default false. Independent of ")
+	TEXT("voxel.Stream.GPU -- water is a separate pool with a separate, translucent material."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxAppliesPerFrame(
 	TEXT("voxel.Stream.MaxAppliesPerFrame"),
 	64,
@@ -528,6 +546,11 @@ bool VoxelDebug::GetRenderCastShadow()
 bool VoxelDebug::GetStreamGpu()
 {
 	return CVarVoxelStreamGpu.GetValueOnGameThread();
+}
+
+bool VoxelDebug::GetWaterGpu()
+{
+	return CVarVoxelWaterGpu.GetValueOnGameThread();
 }
 
 int32 VoxelDebug::GetStreamJobsInFlightPerCore()

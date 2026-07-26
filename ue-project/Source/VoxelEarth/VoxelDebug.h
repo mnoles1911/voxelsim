@@ -212,6 +212,12 @@ namespace VoxelDebug
 	// (task spec: "do not explode") rather than truncating the tick.
 	VOXELEARTH_API int32 GetWaterMaxActiveBricks();
 
+	// voxel.Water.GPU: route water surface geometry through its own ADR-0006
+	// GPU pool (ONE primitive, ONE draw) rather than one UWaterChunkComponent
+	// per vxc::WaterBrick8. Default false. Independent of voxel.Stream.GPU --
+	// see the cvar's source comment for why the two are separate switches.
+	VOXELEARTH_API bool GetWaterGpu();
+
 	// --- voxel.Stream.* (M1/M2 "Perf-run hitches" isolation work, docs/status.md) ---
 	//
 	// Per-frame streaming budgets, previously compile-time constexpr in

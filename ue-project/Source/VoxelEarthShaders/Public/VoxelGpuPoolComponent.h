@@ -88,6 +88,30 @@ public:
 	void SetChunkMaterial(UMaterialInterface* InMaterial);
 	UMaterialInterface* GetChunkMaterialOrDefault() const;
 
+	// Names this pool in every log line it emits. There is more than one pool
+	// instance now (terrain under voxel.Stream.GPU, water under
+	// voxel.Water.GPU), and a pooled primitive is diagnosed almost entirely
+	// from its log lines -- two pools both printing "VoxelGpuPool draw
+	// SUBMITTED" would make the one number that matters unattributable.
+	// Must be set BEFORE the proxy is created; the proxy takes a copy.
+	void SetPoolName(const FString& InName) { PoolName = InName; }
+
+	// Edge length, in voxels, of one entry in this pool -- 32 for a terrain
+	// render chunk, 8 for a vxc::WaterBrick8. Used only to grow LocalBounds by
+	// the right amount per AddChunk. Getting it too LARGE is merely a looser
+	// cull; too small culls away geometry that is genuinely there, so the
+	// default stays at terrain's 32.
+	void SetChunkEdgeVoxels(int32 InEdgeVoxels) { ChunkEdgeVoxels = FMath::Max(1, InEdgeVoxels); }
+
+	// Floor on the chunk table's GPU allocation, in entries. Exceeding whatever
+	// the proxy was built with is not an error but it IS a full render-state
+	// rebuild (PushUpdatesToProxy falls back to MarkRenderStateDirty), which
+	// re-uploads the entire quad buffer. Terrain grows past its floor a handful
+	// of times while the cascade fills and then stops; a pool whose resident
+	// count oscillates around the floor would pay that repeatedly, so it wants a
+	// floor above its own steady state. Must be set before the proxy is created.
+	void SetChunkTableCapacity(int32 InEntries) { ChunkTableCapacity = FMath::Max(1, InEntries); }
+
 	//~ UPrimitiveComponent
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
@@ -115,8 +139,29 @@ private:
 	// Freed quads point at it and collapse to a degenerate point.
 	static constexpr uint32 kHiddenChunkId = 0;
 
+	// Table entries whose chunk was removed, available for the next AddChunk.
+	//
+	// Without this the chunk table only ever GREW: AddChunk appended a fresh
+	// entry every time and RemoveChunk gave nothing back, so the table tracked
+	// "chunks ever added" rather than "chunks resident". Terrain streaming hides
+	// that -- its churn is slow -- but water re-meshes at 10 Hz and its bricks
+	// appear and vanish continuously, so the table crosses the proxy's MaxChunks
+	// headroom within a minute or two. Crossing it is not a slow leak but a
+	// cliff: PushUpdatesToProxy falls back to MarkRenderStateDirty, which throws
+	// the proxy away and re-uploads the WHOLE pool buffer -- the exact cost the
+	// incremental path exists to avoid, now on a repeating timer.
+	//
+	// Recycling is safe because RemoveChunk first repoints every one of the
+	// chunk's quads at kHiddenChunkId, so no quad in the pool still references
+	// the id being handed back.
+	TArray<uint32> FreeChunkIds;
+
 	FVoxelGpuGeometryPool Pool;
 	TArray<FVoxelGpuPoolAllocation> Allocations;  // indexed by handle
+	// Parallel to Allocations: which table entry each handle owns. Kept
+	// explicitly rather than re-derived from QuadChunkIds[Offset] so that
+	// freeing the entry does not depend on the allocation still being non-empty.
+	TArray<uint32> AllocationChunkIds;
 	int32 NumLiveChunks = 0;
 
 	// Ranges written since the last upload, in quads. Streaming touches a few
@@ -129,12 +174,22 @@ private:
 	void MarkQuadsDirty(uint32 First, uint32 Count);
 	void PushUpdatesToProxy();
 
+	// RemoveChunk's body. bRecycleChunkId is false for the one caller that means
+	// to keep the table entry alive across the removal -- UpdateChunk's realloc
+	// branch, which re-uses the same entry for the chunk's new range so that an
+	// actively-dug chunk does not consume a fresh table slot on every edit.
+	void RemoveChunkInternal(int32 Handle, bool bRecycleChunkId);
+
 	// Set while a proxy is live so updates can go straight to it instead of
 	// rebuilding the render state. Render-thread lifetime is owned by the
 	// renderer; this is only ever dereferenced inside a render command.
 	class FVoxelGpuPoolSceneProxy* LiveProxy = nullptr;
 
 	FBox LocalBounds = FBox(ForceInit);
+
+	FString PoolName = TEXT("VoxelGpuPool");
+	int32 ChunkEdgeVoxels = 32;
+	int32 ChunkTableCapacity = 1024;
 
 	UPROPERTY()
 	TObjectPtr<UMaterialInterface> ChunkMaterial = nullptr;
