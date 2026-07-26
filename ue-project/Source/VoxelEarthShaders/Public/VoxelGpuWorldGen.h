@@ -91,6 +91,19 @@ struct FVoxelGpuRegionRequest
 	// ValidateRegionRequest REJECTS a non-zero base without it rather than let
 	// it be silently ignored.
 	uint32 QuadWriteBase = 0;
+
+	// --- Wave D / D6: the footprint band ------------------------------------
+	//
+	// BandEdge 0 (the default) skips the band pass entirely. Set it to the
+	// column-grid edge the CPU uses (ChunkEdgeVoxels + 2 = 34) and BandOriginI
+	// to the dispatch-column index that grid starts at, and the graph reduces
+	// the band on the GPU instead of the streaming job doing a 34x34 column
+	// pass on a worker thread -- ~45% of level-0 job time.
+	//
+	// Only one chunk per (X,Y) footprint needs to ask for it, which is why it
+	// is opt-in per request rather than implied by bMeshChain.
+	uint32 BandOriginI = 0;
+	uint32 BandEdge = 0;
 };
 
 struct FVoxelGpuRegionResult
@@ -134,6 +147,20 @@ struct FVoxelGpuRegionResult
 	// Quads is sized to the upper bound (32 per mask); this is how many the
 	// scan says are actually live. Only the first NumQuads entries are output.
 	uint32 NumQuads = 0;
+
+	// --- Wave D / D6: the footprint band ------------------------------------
+	//
+	// RAW voxel z, exactly as BandReduceMain wrote them: the max of
+	// ColumnSurfaceTopVoxel and the min of ColumnDeepestAirVoxel over the band
+	// window. NOT an FFootprintBand -- the +1/-1 widening and the int32 clamp
+	// that turn these into one live in VoxelStreaming::MakeFootprintBand, on the
+	// CPU, because every constant mirrored into HLSL is a determinism liability.
+	//
+	// bBandValid is false whenever the request did not ask for a band
+	// (BandEdge 0), and the two values are then meaningless rather than zero.
+	bool bBandValid = false;
+	int32 BandMaxSurfaceTopVoxel = 0;
+	int32 BandMinDeepestAirVoxel = 0;
 };
 
 namespace VoxelGpuWorldGen

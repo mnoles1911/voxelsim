@@ -120,6 +120,11 @@ struct FVoxelGpuMeshJobManager::FJob
 	// is the one that still has to rebase on the CPU and therefore still needs
 	// the per-mask tables; the chunk-local path never reads them.
 	TUniquePtr<FRHIGPUBufferReadback> TotalReadback;
+	// Wave D / D6. Phase 1 as well, harvested all-or-none with the total, so a
+	// job still has exactly one completion event rather than two async streams
+	// that must both satisfy exactly-one-outcome. Null when the request did not
+	// ask for a band.
+	TUniquePtr<FRHIGPUBufferReadback> BandReadback;
 	TUniquePtr<FRHIGPUBufferReadback> CountsReadback;
 	TUniquePtr<FRHIGPUBufferReadback> OffsetsReadback;
 	TUniquePtr<FRHIGPUBufferReadback> QuadsReadback;
@@ -138,6 +143,12 @@ struct FVoxelGpuMeshJobManager::FJob
 	TArray<uint64> RawQuads;
 	// What QuadTotalMain said, i.e. how many quads phase 2 actually fetches.
 	uint32 NumQuads = 0;
+	// Wave D / D6: BandReduceMain's two raw voxel-z extrema. bBandValid only
+	// goes true once the copy has actually landed, so a band that never arrived
+	// reads as absent rather than as {0, 0} -- which would claim the whole
+	// footprint is empty.
+	int32 Band[2] = { 0, 0 };
+	bool bBandValid = false;
 	FString Error;
 
 	std::atomic<int32> State{ int32(EJobState::Queued) };
@@ -342,6 +353,14 @@ void FVoxelGpuMeshJobManager::Deliver(const FJobPtr& Job, EVoxelGpuMeshJobStatus
 		Result.Quads = Job->Region.bChunkLocalQuads
 			? MoveTemp(Job->RawQuads)
 			: RebaseQuadsToChunkLocal(*Job);
+
+		// Wave D / D6. Only on Success, and only from a job that actually
+		// harvested one — phase 1 is all-or-none, so a successful job that
+		// asked for a band has one, and a failed job publishes nothing rather
+		// than a {0, 0} band claiming its whole footprint is empty.
+		Result.bBandValid = Job->bBandValid;
+		Result.BandMaxSurfaceTopVoxel = Job->Band[0];
+		Result.BandMinDeepestAirVoxel = Job->Band[1];
 	}
 
 	OnJobComplete.ExecuteIfBound(MoveTemp(Result));
@@ -444,6 +463,18 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			// EJobState comment.
 			Job->TotalReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.Async.QuadTotal"));
 			AddEnqueueCopyPass(GraphBuilder, Job->TotalReadback.Get(), Graph.Total, sizeof(uint32));
+
+			// ...twelve, when this job is the one producing its footprint's
+			// band (Wave D / D6). Same graph, same phase, same delivery: the
+			// point of folding it in here rather than giving it its own stream
+			// is that a job still has exactly one outcome. See the comment on
+			// FVoxelGpuMeshJobResult::bBandValid.
+			if (Job->Region.BandEdge > 0 && Graph.Band != nullptr)
+			{
+				Job->BandReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.Async.Band"));
+				AddEnqueueCopyPass(GraphBuilder, Job->BandReadback.Get(), Graph.Band,
+				                   2 * uint32(sizeof(int32)));
+			}
 
 			// ...except on the brick-local control path, which rebases on the
 			// CPU and so genuinely needs the per-mask tables. Kept honest
@@ -574,7 +605,9 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 				if (State == EJobState::Dispatched)
 				{
 					const bool bNeedTables = !Job->Region.bChunkLocalQuads;
+					const bool bNeedBand = Job->Region.BandEdge > 0;
 					if (!Job->TotalReadback.IsValid() ||
+					    (bNeedBand && !Job->BandReadback.IsValid()) ||
 					    (bNeedTables && (!Job->CountsReadback.IsValid() ||
 					                     !Job->OffsetsReadback.IsValid())))
 					{
@@ -583,8 +616,13 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 						continue;
 					}
 					// All or none: a total that landed without its tables would
-					// have the control path rebasing against stale offsets.
+					// have the control path rebasing against stale offsets, and
+					// a total that landed without its band would deliver a
+					// result the streaming path reads as "this footprint has no
+					// band" — which is silent, and costs a whole (X,Y) column
+					// its cold-band throttle release.
 					if (!Job->TotalReadback->IsReady() ||
+					    (bNeedBand && !Job->BandReadback->IsReady()) ||
 					    (bNeedTables && (!Job->CountsReadback->IsReady() ||
 					                     !Job->OffsetsReadback->IsReady())))
 					{
@@ -598,6 +636,13 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 					FString Error;
 					bool bOk = CopyReadback(*Job->TotalReadback, &Job->NumQuads,
 					                        sizeof(uint32), TEXT("QuadTotal"), Error);
+
+					if (bOk && bNeedBand)
+					{
+						bOk = CopyReadback(*Job->BandReadback, Job->Band,
+						                   2 * uint32(sizeof(int32)), TEXT("Band"), Error);
+						Job->bBandValid = bOk;
+					}
 
 					if (bOk && bNeedTables)
 					{

@@ -52,3 +52,36 @@ inline uint64 PackVoxelChunkQuad(const FVoxelChunkQuad& Q)
 	                | (uint32(Q.Mat) << 24);
 	return uint64(Lo) | (uint64(Hi) << 32);
 }
+
+// The exact inverse. UnpackVoxelChunkQuad(PackVoxelChunkQuad(Q)) == Q for every
+// quad the meshers produce, and the round trip is LOSSLESS by construction:
+// every field above is a whole byte except Axis and Positive, which are nibbles
+// holding values 0..2 and 0..1.
+//
+// WHY IT EXISTS, because "the packed form is what the GPU wants" argues against
+// ever needing it. Wave D4 delivers GPU-meshed chunks as packed uint64 and the
+// pooled renderer consumes them as they stand — but `NotifyPooledChunkMeshUpdated`
+// (the voxel GI light-field ingest) takes `TArray<FVoxelChunkQuad>`, because it
+// reads Slice/U0/V0/W/H to voxelize the chunk into the field. Without this, a
+// GPU-meshed chunk would be drawn correctly and silently contribute NOTHING to
+// GI — which is precisely the defect Wave B fixed once already ("voxel.GI.Enabled 1
+// was a silent no-op under voxel.Stream.GPU"), reintroduced through a different
+// door.
+//
+// So this is not a convenience. It is what stops D4 from un-fixing Wave B.
+inline FVoxelChunkQuad UnpackVoxelChunkQuad(uint64 Packed)
+{
+	const uint32 Lo = uint32(Packed & 0xffffffffull);
+	const uint32 Hi = uint32(Packed >> 32);
+	FVoxelChunkQuad Q;
+	Q.Axis     = uint8( Lo        & 0xfu);
+	Q.Positive = uint8((Lo >>  4) & 0xfu);
+	Q.Slice    = uint8((Lo >>  8) & 0xffu);
+	Q.U0       = uint8((Lo >> 16) & 0xffu);
+	Q.V0       = uint8((Lo >> 24) & 0xffu);
+	Q.W        = uint8( Hi        & 0xffu);
+	Q.H        = uint8((Hi >>  8) & 0xffu);
+	Q.Ao       = uint8((Hi >> 16) & 0xffu);
+	Q.Mat      = uint8((Hi >> 24) & 0xffu);
+	return Q;
+}

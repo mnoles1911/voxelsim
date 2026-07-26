@@ -246,7 +246,34 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutQuadTotal)
 		END_SHADER_PARAMETER_STRUCT()
 	};
+	// --- BandReduceMain: the footprint band (Wave D / D6) ------------------
+	//
+	// Derives from FVoxelWorldGenShader, unlike the quad-total kernel, because
+	// it #includes worldgen.ush and therefore needs both VXC_UE and the
+	// worldgen version lock's VXC_WORLDGEN_VERSION_CPP. It also genuinely needs
+	// SM6: caveColumnFor and cavernColumnFor are 64-bit integer throughout.
+	class FVoxelBandReduceCS : public FVoxelWorldGenShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBandReduceCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBandReduceCS, FVoxelWorldGenShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
+			SHADER_PARAMETER(uint32, BandOriginI)
+			SHADER_PARAMETER(uint32, BandEdge)
+			// cavernColumnFor evaluates terrain height at a cave site's own xy,
+			// so the raster is live here for the same reason it is in
+			// VoxelizeMain.
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, ElevationMm)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuColumnSample>, InColumns)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<int>, OutBand)
+		END_SHADER_PARAMETER_STRUCT()
+	};
 }
+
+#define VOXEL_BAND_REDUCE_USF "/VoxelEarth/VoxelBandReduce.usf"
+IMPLEMENT_GLOBAL_SHADER(FVoxelBandReduceCS, VOXEL_BAND_REDUCE_USF, "BandReduceMain", SF_Compute);
 
 #define VOXEL_QUAD_SCAN_USF "/VoxelEarth/VoxelQuadScan.usf"
 
@@ -320,6 +347,29 @@ bool VoxelGpuWorldGen::ValidateRegionRequest(const FVoxelGpuRegionRequest& Req, 
 			Req.RasterSize.X, Req.RasterSize.Y, Expected,
 			Req.ElevationMm.Num(), Req.ClimatePacked.Num());
 		return false;
+	}
+
+	// --- Wave D / D6: the band window ---------------------------------------
+	//
+	// BandReduceMain's inner loop skips any cell that falls outside
+	// DispatchColumns rather than reading out of bounds — which would silently
+	// reduce over a PARTIAL window and hand back a band that is not an outer
+	// bound of the columns the caller asked about. A band that is wrong in that
+	// direction skips chunks that should have been meshed, i.e. holes in the
+	// world. So the mis-sizing is rejected here instead of being absorbed
+	// there, and the kernel's guard stays as unreachable defence.
+	if (Req.BandEdge > 0)
+	{
+		const uint64 EndI = uint64(Req.BandOriginI) + uint64(Req.BandEdge);
+		if (EndI > uint64(Cx) || EndI > uint64(Cy))
+		{
+			OutError = FString::Printf(
+				TEXT("Band window [%u, %llu) does not fit inside DispatchColumns (%u, %u) — the ")
+				TEXT("reduction would silently run over a partial window and return a band that ")
+				TEXT("is not an outer bound of the columns asked about"),
+				Req.BandOriginI, EndI, Cx, Cy);
+			return false;
+		}
 	}
 
 	if (Req.bMeshChain)
@@ -455,6 +505,31 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 		FComputeShaderUtils::AddPass(
 			GraphBuilder, RDG_EVENT_NAME("Voxel.VoxelizeMain"), Shader, Params,
 			FIntVector(Cx / kBrickEdge, Cy / kBrickEdge, 1));
+	}
+
+	// --- pass 2b: BandReduceMain (Wave D / D6) -----------------------
+	//
+	// After ColumnMain, before anything else needs it, and independent of the
+	// mesh chain: the band is a pure function of the columns and does not know
+	// about chunk-z. Requested per job because only one chunk per (X,Y)
+	// footprint needs to produce one.
+	if (Request.BandEdge > 0)
+	{
+		Out.Band = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(int32), 2), TEXT("Voxel.Band"));
+
+		FVoxelBandReduceCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelBandReduceCS::FParameters>();
+		FillLooseParameters(*Params, Request);
+		Params->BandOriginI = Request.BandOriginI;
+		Params->BandEdge = Request.BandEdge;
+		Params->ElevationMm = GraphBuilder.CreateSRV(ElevationBuffer);
+		Params->InColumns = GraphBuilder.CreateSRV(Out.Columns);
+		Params->OutBand = GraphBuilder.CreateUAV(Out.Band);
+
+		TShaderMapRef<FVoxelBandReduceCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("Voxel.BandReduceMain"), Shader, Params,
+			FIntVector(1, 1, 1));   // exactly one workgroup, by design
 	}
 
 	if (!S.bMesh)
@@ -616,11 +691,19 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 	// Wave D / D3: what QuadTotalMain computed, so it can be checked against
 	// the CPU derivation below. 0xffffffff means "the readback never ran".
 	uint32 GpuTotalOut = 0xffffffffu;
+	// Wave D / D6: BandReduceMain's two raw voxel-z extrema, only when asked
+	// for. bBandOut stays false unless the copy actually landed, so a missing
+	// readback reads as "no band" rather than as a band of zeroes -- and a band
+	// of zeroes claims the whole world is empty.
+	int32 BandOut[2] = { 0, 0 };
+	bool bBandOut = false;
+	const bool bWantBand = Request.BandEdge > 0;
 	FString RenderError;
 
 	ENQUEUE_RENDER_COMMAND(VoxelGpuRunRegion)(
 		[&Request, &ColumnsOut, &CellsOut, &CountsOut, &OffsetsOut, &QuadsOut, &GpuTotalOut,
-		 &RenderError, NumColumns, NumCells, bMesh, MaskCount, QuadElements]
+		 &BandOut, &bBandOut, &RenderError, NumColumns, NumCells, bMesh, MaskCount, QuadElements,
+		 bWantBand]
 		(FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
@@ -642,6 +725,7 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 		FRHIGPUBufferReadback OffsetsReadback(TEXT("Voxel.OffsetsReadback"));
 		FRHIGPUBufferReadback QuadsReadback(TEXT("Voxel.QuadsReadback"));
 		FRHIGPUBufferReadback TotalReadback(TEXT("Voxel.QuadTotalReadback"));
+		FRHIGPUBufferReadback BandReadback(TEXT("Voxel.BandReadback"));
 
 		const uint32 ColumnsBytes = NumColumns * sizeof(FVoxelGpuColumnSample);
 		const uint32 CellsBytes = NumCells * sizeof(uint32);
@@ -650,6 +734,13 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 
 		AddEnqueueCopyPass(GraphBuilder, &ColumnsReadback, ColumnsBuffer, ColumnsBytes);
 		AddEnqueueCopyPass(GraphBuilder, &CellsReadback, CellsBuffer, CellsBytes);
+		// The band is independent of the mesh chain -- it is a pure function of
+		// the columns -- so it is copied outside the bMesh block, which is what
+		// lets the gate run band-only (bMeshChain false) probes cheaply.
+		if (bWantBand && Graph.Band != nullptr)
+		{
+			AddEnqueueCopyPass(GraphBuilder, &BandReadback, Graph.Band, 2 * sizeof(int32));
+		}
 		if (bMesh)
 		{
 			AddEnqueueCopyPass(GraphBuilder, &CountsReadback, CountsBuffer, CountsBytes);
@@ -694,6 +785,12 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 		CellsOut.SetNumUninitialized(NumCells);
 		CopyOut(CellsReadback, CellsOut.GetData(), CellsBytes, TEXT("Cells"));
 
+		if (bWantBand && Graph.Band != nullptr)
+		{
+			CopyOut(BandReadback, BandOut, 2 * sizeof(int32), TEXT("Band"));
+			bBandOut = RenderError.IsEmpty();
+		}
+
 		if (bMesh)
 		{
 			CountsOut.SetNumUninitialized(MaskCount);
@@ -719,6 +816,9 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 
 	Result.Columns = MoveTemp(ColumnsOut);
 	Result.Cells = MoveTemp(CellsOut);
+	Result.bBandValid = bBandOut;
+	Result.BandMaxSurfaceTopVoxel = BandOut[0];
+	Result.BandMinDeepestAirVoxel = BandOut[1];
 
 	if (bMesh)
 	{

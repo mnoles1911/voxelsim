@@ -26,6 +26,10 @@
 #include "HAL/IConsoleManager.h"
 #include "VoxelGpuWorldGen.h"
 #include "VoxelGpuRegionBuild.h"
+#include "VoxelMeshTypes.h" // PackVoxelChunkQuad / UnpackVoxelChunkQuad, for the D4 round-trip check
+// The SHIPPING footprint-band reduction, lifted out of VoxelWorldSubsystem.cpp
+// so this gate compares BandReduceMain against it rather than a transcription.
+#include "VoxelFootprintBand.h"
 
 #include "voxelcore/core.h"
 #include "voxelcore/tiles.h"
@@ -345,6 +349,241 @@ namespace
 		return OutMismatches.Num() == 0;
 	}
 
+	// --- Wave D / D6: the footprint band gate -------------------------------
+	//
+	// WHAT IT COMPARES AGAINST, AND WHY THAT IS THE WHOLE POINT.
+	// VoxelStreaming::ColumnSurfaceTopVoxel and ColumnDeepestAirVoxel, called
+	// directly out of VoxelFootprintBand.h — the SAME functions the level-0
+	// worker job reduces its 34x34 column grid with, not a transcription of
+	// them. They were lifted out of VoxelWorldSubsystem.cpp specifically so this
+	// could call them, exactly the way MeshChunkBricks was lifted so
+	// voxel.GPU.VerifyAsyncMesh could compare against the shipping mesher.
+	//
+	// WHY IT IS NOT ONE PROBE. The band is a max/min over ~1,156 columns, so a
+	// per-column error that is not at the extremum is invisible in the reduced
+	// answer: one window-shaped probe can pass while the reduction is wrong for
+	// most of the world. So the sweep below runs THREE window probes (different
+	// origins and sizes — a dropped BandOriginI fails probe 2 but not probe 1)
+	// and then SINGLE-COLUMN probes, where BandEdge 1 makes the reduction
+	// degenerate and the comparison becomes an exact test of the per-column
+	// function itself. The single-column probes are aimed at the columns with
+	// the most cave and cavern segments, because those are the branches the
+	// kernel had to mirror; a probe over featureless ground exercises only
+	// `surfaceTop + 1` and would certify almost nothing.
+	//
+	// Single-column probes can only sit on the DIAGONAL: BandOriginI is one
+	// scalar for both axes (see the .usf — the production window is square, and
+	// a square window's max/min is transposition-invariant, so a second origin
+	// would only add API surface).
+	struct FBandProbe
+	{
+		uint32 OriginI;
+		uint32 Edge;
+		FString Why;
+	};
+
+	// One probe: reduce the CPU side over exactly the same window and compare.
+	bool CompareOneBandProbe(const FRegionSpec& Region,
+	                         const FVoxelGpuRegionRequest& BaseReq,
+	                         const TArray<vxc::ColumnSample>& CpuColumns,
+	                         const FBandProbe& Probe)
+	{
+		FVoxelGpuRegionRequest Req = BaseReq;
+		// The band is a pure function of the columns, so the mesh chain is dead
+		// weight here — and dropping it is what makes a multi-probe sweep cheap
+		// enough to be worth having.
+		Req.bMeshChain = false;
+		Req.BandOriginI = Probe.OriginI;
+		Req.BandEdge = Probe.Edge;
+
+		const FVoxelGpuRegionResult Gpu = VoxelGpuWorldGen::RunRegionBlocking(Req);
+		if (!Gpu.bOk)
+		{
+			UE_LOG(LogVoxelGpuVerify, Error,
+			       TEXT("[D6 band cross-check] FAIL — [%s] probe origin=%u edge=%u dispatch failed: %s"),
+			       Region.Name, Probe.OriginI, Probe.Edge, *Gpu.Error);
+			return false;
+		}
+		if (!Gpu.bBandValid)
+		{
+			UE_LOG(LogVoxelGpuVerify, Error,
+			       TEXT("[D6 band cross-check] FAIL — [%s] probe origin=%u edge=%u asked for a band ")
+			       TEXT("and did not get one. BandReduceMain did not run, or its readback never ")
+			       TEXT("landed — either way nothing below was measured."),
+			       Region.Name, Probe.OriginI, Probe.Edge);
+			return false;
+		}
+
+		// The shipping reduction, over the identical window.
+		int64 CpuMaxTop = MIN_int64;
+		int64 CpuMinAir = MAX_int64;
+		int32 CaveCols = 0;
+		int32 CavernCols = 0;
+		int32 ShaftCols = 0;
+		for (uint32 J = 0; J < Probe.Edge; ++J)
+		{
+			for (uint32 I = 0; I < Probe.Edge; ++I)
+			{
+				const uint32 Dx = Probe.OriginI + I;
+				const uint32 Dy = Probe.OriginI + J;
+				const vxc::ColumnSample& Col = CpuColumns[int32(Dx + Dy * Region.Width)];
+				CpuMaxTop = FMath::Max(CpuMaxTop, VoxelStreaming::ColumnSurfaceTopVoxel(Col));
+				CpuMinAir = FMath::Min(CpuMinAir, VoxelStreaming::ColumnDeepestAirVoxel(Col));
+				CaveCols += (Col.cave.count > 0) ? 1 : 0;
+				ShaftCols += (Col.cave.shaftMarginSq > 0) ? 1 : 0;
+				CavernCols += (Col.cavern.count > 0) ? 1 : 0;
+			}
+		}
+
+		const bool bMatch = int64(Gpu.BandMaxSurfaceTopVoxel) == CpuMaxTop
+		                 && int64(Gpu.BandMinDeepestAirVoxel) == CpuMinAir;
+
+		// The band as the streaming path would actually hold it. Compared as
+		// well as the raw extrema so the widening cannot be the thing that is
+		// wrong — MakeFootprintBand is shared with the worker job, so this also
+		// pins that the GPU path feeds it the values it expects.
+		const VoxelStreaming::FFootprintBand CpuBand =
+			VoxelStreaming::MakeFootprintBand(CpuMaxTop, CpuMinAir);
+		const VoxelStreaming::FFootprintBand GpuBand =
+			VoxelStreaming::MakeFootprintBand(Gpu.BandMaxSurfaceTopVoxel, Gpu.BandMinDeepestAirVoxel);
+
+		if (!bMatch)
+		{
+			UE_LOG(LogVoxelGpuVerify, Error,
+			       TEXT("[D6 band cross-check] FAIL — [%s] %s (origin=%u edge=%u): ")
+			       TEXT("maxSurfaceTop gpu %d vs cpu %lld, minDeepestAir gpu %d vs cpu %lld. ")
+			       TEXT("Band would be {max %d, solidBelow %d} instead of {max %d, solidBelow %d}. ")
+			       TEXT("%d cave / %d shaft / %d cavern column(s) in this window."),
+			       Region.Name, *Probe.Why, Probe.OriginI, Probe.Edge,
+			       Gpu.BandMaxSurfaceTopVoxel, CpuMaxTop, Gpu.BandMinDeepestAirVoxel, CpuMinAir,
+			       GpuBand.MaxSurfaceTopVoxel, GpuBand.SolidBelowVoxel,
+			       CpuBand.MaxSurfaceTopVoxel, CpuBand.SolidBelowVoxel,
+			       CaveCols, ShaftCols, CavernCols);
+
+			// WHICH WAY IT IS WRONG IS NOT A DETAIL. A band that claims MORE
+			// emptiness than the truth skips chunks that should have been
+			// meshed — holes in the world, blamed on streaming. The other
+			// direction only wastes work.
+			const bool bUnsafeAir = GpuBand.MaxSurfaceTopVoxel < CpuBand.MaxSurfaceTopVoxel;
+			const bool bUnsafeSolid = GpuBand.SolidBelowVoxel > CpuBand.SolidBelowVoxel;
+			if (bUnsafeAir || bUnsafeSolid)
+			{
+				UE_LOG(LogVoxelGpuVerify, Error,
+				       TEXT("  UNSAFE DIRECTION: the GPU band claims MORE emptiness than the CPU ")
+				       TEXT("one (%s%s). This would skip chunks that have geometry."),
+				       bUnsafeAir ? TEXT("all-air bound too low") : TEXT(""),
+				       bUnsafeSolid ? TEXT(" all-solid bound too high") : TEXT(""));
+			}
+			else
+			{
+				UE_LOG(LogVoxelGpuVerify, Error,
+				       TEXT("  Conservative direction (wastes work rather than deleting geometry) ")
+				       TEXT("— still a failure: the two reductions must be exact."));
+			}
+			return false;
+		}
+
+		UE_LOG(LogVoxelGpuVerify, Log,
+		       TEXT("[D6 band cross-check] PASS — [%s] %s (origin=%u edge=%u, %u columns): ")
+		       TEXT("maxSurfaceTop %lld, minDeepestAir %lld, band {max %d, solidBelow %d}; ")
+		       TEXT("%d cave / %d shaft / %d cavern column(s) exercised"),
+		       Region.Name, *Probe.Why, Probe.OriginI, Probe.Edge, Probe.Edge * Probe.Edge,
+		       CpuMaxTop, CpuMinAir, CpuBand.MaxSurfaceTopVoxel, CpuBand.SolidBelowVoxel,
+		       CaveCols, ShaftCols, CavernCols);
+		return true;
+	}
+
+	// Builds the sweep and runs it. Returns false if any probe failed.
+	bool VerifyBandForRegion(const FRegionSpec& Region,
+	                         const FVoxelGpuRegionRequest& BaseReq,
+	                         const TArray<vxc::ColumnSample>& CpuColumns)
+	{
+		// The production window is 34 (a 32-voxel chunk plus its one-column
+		// apron), which fits inside these 64x64 fixtures at any origin up to 30.
+		constexpr uint32 kProdEdge = 32 + 2;
+
+		TArray<FBandProbe> Probes;
+		Probes.Add({ 0, kProdEdge, TEXT("production-shaped window at origin") });
+		Probes.Add({ Region.Width - kProdEdge, kProdEdge, TEXT("production-shaped window, offset") });
+		Probes.Add({ 17, 8, TEXT("small offset window") });
+
+		// Single-column probes. A featureless column tests only
+		// `surfaceTop + 1`; these are what test the cave-segment loop, the
+		// sinkhole shaft term, the two bedrock clamps and the integer ceil-sqrt
+		// against the CPU's FP-seeded one.
+		//
+		// HOW THEY ARE CHOSEN, PRECISELY, because the PASS line makes a claim
+		// about its own coverage and that claim has to be true:
+		//
+		//   * The segments are COUNTED, not assumed. The loop below reads
+		//     Col.cave.count, Col.cave.shaftMarginSq and Col.cavern.count out of
+		//     the real vxc::ColumnSample the CPU reference already built for
+		//     this region, scores every candidate, and takes the top three. It
+		//     is not a guess that features cluster anywhere in particular.
+		//   * The candidates are the DIAGONAL ONLY -- 64 of this fixture's 4,096
+		//     columns. BandOriginI is one scalar for both axes, so a
+		//     single-column window can only sit at (k, k). "The three richest
+		//     columns available to a single-column probe" is the true claim;
+		//     "the three richest columns in the region" is not, and is not
+		//     claimed anywhere.
+		//   * The three window probes above cover all 4,096 columns between
+		//     them. What they cannot do is localise a per-column error, which is
+		//     what these three are for.
+		//
+		// If the diagonal turns out to have no cave or cavern columns at all,
+		// the sweep still runs -- but its strongest leg has not fired, and that
+		// is said out loud below rather than left to be inferred from three
+		// "0 cave / 0 shaft / 0 cavern" PASS lines.
+		{
+			struct FScored { uint32 K; int32 Score; };
+			TArray<FScored> Scored;
+			for (uint32 K = 0; K < Region.Width; ++K)
+			{
+				const vxc::ColumnSample& Col = CpuColumns[int32(K + K * Region.Width)];
+				const int32 Score = Col.cave.count * 2
+				                  + ((Col.cave.shaftMarginSq > 0) ? 5 : 0)
+				                  + Col.cavern.count * 3;
+				Scored.Add({ K, Score });
+			}
+			// Ties broken by K so the gate probes the SAME columns every run.
+			// TArray::Sort is introsort and is not stable; without this, two
+			// runs of the same binary on the same fixture could report coverage
+			// from different columns, and a gate whose scope moves between runs
+			// is not a gate.
+			Scored.Sort([](const FScored& A, const FScored& B)
+			{
+				return (A.Score != B.Score) ? (A.Score > B.Score) : (A.K < B.K);
+			});
+
+			if (Scored.Num() > 0 && Scored[0].Score == 0)
+			{
+				UE_LOG(LogVoxelGpuVerify, Warning,
+				       TEXT("[D6 band cross-check] [%s] NO cave or cavern column anywhere on the ")
+				       TEXT("diagonal, so the single-column probes below exercise only ")
+				       TEXT("`surfaceTop + 1`. The cave-segment loop, the shaft term, the bedrock ")
+				       TEXT("clamps and ceilSqrt are NOT covered by this region's probes -- read ")
+				       TEXT("their PASS lines accordingly."),
+				       Region.Name);
+			}
+
+			for (int32 N = 0; N < 3 && N < Scored.Num(); ++N)
+			{
+				Probes.Add({ Scored[N].K, 1,
+				             FString::Printf(TEXT("single column (%d,%d), richest-on-diagonal rank %d, score %d"),
+				                             Region.OriginVx + int32(Scored[N].K),
+				                             Region.OriginVy + int32(Scored[N].K),
+				                             N + 1, Scored[N].Score) });
+			}
+		}
+
+		bool bOk = true;
+		for (const FBandProbe& Probe : Probes)
+		{
+			bOk &= CompareOneBandProbe(Region, BaseReq, CpuColumns, Probe);
+		}
+		return bOk;
+	}
+
 	// CPU reference for the packed-quad decode.
 	//
 	// SCOPE, HONESTLY STATED: this is transcribed from BuildChunkVertexData in
@@ -554,6 +793,56 @@ namespace
 				       TEXT("  [%s] quad decode: %d vertices match the CPU reference exactly"),
 				       Region.Name, Gpu.Quads.Num() * 6);
 			}
+
+			// Wave D / D4. UnpackVoxelChunkQuad is what lets a GPU-meshed chunk
+			// feed the GI light field, which takes FVoxelChunkQuad and not the
+			// packed word. Checked HERE, against the real GPU quad stream,
+			// rather than in a unit test over synthetic values: the failure
+			// that matters is a field the packer and unpacker disagree about on
+			// geometry that actually occurs, and this region has 3,000+ of it.
+			// The round trip is lossless by construction, so any mismatch is a
+			// transcription error in one of the two shift tables.
+			{
+				int32 RoundTripMismatches = 0;
+				for (int32 QI = 0; QI < Gpu.Quads.Num(); ++QI)
+				{
+					const uint64 Packed = Gpu.Quads[QI];
+					if (PackVoxelChunkQuad(UnpackVoxelChunkQuad(Packed)) != Packed)
+					{
+						if (RoundTripMismatches < 5)
+						{
+							UE_LOG(LogVoxelGpuVerify, Error,
+							       TEXT("    quad %d: 0x%016llx -> unpack -> repack -> 0x%016llx"),
+							       QI, Packed, PackVoxelChunkQuad(UnpackVoxelChunkQuad(Packed)));
+						}
+						++RoundTripMismatches;
+					}
+				}
+				if (RoundTripMismatches > 0)
+				{
+					UE_LOG(LogVoxelGpuVerify, Error,
+					       TEXT("[D4 quad pack round-trip] FAIL — [%s] %d of %d quads do not survive ")
+					       TEXT("UnpackVoxelChunkQuad -> PackVoxelChunkQuad. A GPU-meshed chunk feeds ")
+					       TEXT("the GI light field through that inverse, so this is silent wrong ")
+					       TEXT("lighting, not a draw fault."),
+					       Region.Name, RoundTripMismatches, Gpu.Quads.Num());
+					bAllOk = false;
+				}
+				else
+				{
+					UE_LOG(LogVoxelGpuVerify, Log,
+					       TEXT("[D4 quad pack round-trip] PASS — [%s] all %d quads survive ")
+					       TEXT("unpack->repack byte-identically"),
+					       Region.Name, Gpu.Quads.Num());
+				}
+			}
+
+			// Wave D / D6. Its own PASS/FAIL lines, like D3's quad-total
+			// cross-check, because a band is not part of the digest and a
+			// failure here means something different from a cell mismatch:
+			// the geometry is right and the decision to SKIP producing it is
+			// wrong.
+			bAllOk &= VerifyBandForRegion(Region, Req, CpuColumns);
 		}
 
 		// vxc::Digest exposes its FNV-1a accumulator directly as `h`.

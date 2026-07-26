@@ -1,0 +1,276 @@
+// The footprint band, computed on the GPU (ADR-0006, Wave D / D6).
+//
+// WHAT THIS REPLACES. A level-0 streaming job builds a 34x34 grid of
+// vxc::ColumnSample on a worker thread and reduces it to two integers -- the
+// FootprintBand that feeds two admission/dispatch skips and the cold-band
+// throttle. That column pass is ~45% of level-0 job time and is the half GPU
+// MESHING does not remove: "GPU meshing removes the meshing, not the job".
+// This removes the rest of the job.
+//
+// WHY IT IS A SEPARATE .usf THAT INCLUDES worldgen.ush, RATHER THAN AN EDIT TO IT.
+// Everything here needs is already in worldgen.ush -- caveColumnFor and
+// cavernColumnFor are mirrored there bit-for-bit and VoxelizeMain already
+// computes both per column and throws them away. Including the file gets all of
+// that for free while leaving it BYTE-IDENTICAL: no SPIR-V respin, no new bench
+// descriptor bindings, nothing added to the determinism digest's blast radius,
+// and clear of the rule about editing a .ush under a live editor.
+// VoxelWorldGen.usf is the same shim shape.
+//
+// DETERMINISM. No atomics. One workgroup of 256 strides the band grid and then
+// runs a FIXED-ORDER groupshared tree reduction -- the same pattern
+// ScanSumsMain uses and the gate already covers. Integer min/max are
+// commutative and associative, so an atomic version would also be
+// order-independent in result; this way there is no argument to defend at all.
+//
+// The band is Z-INDEPENDENT: both halves are pure functions of one column, with
+// no chunk-z anywhere. So this needs ColumnMain's output plus cave/cavern, and
+// does not touch VoxelizeMain or the cell grid.
+
+// Platform.ush MUST come first, and must be present at all: Unreal's shader
+// preprocessor rejects any shader that does not include it ("Shader is required
+// to include /Engine/Public/Platform.ush"), and it is what defines the
+// per-platform intrinsics and type plumbing worldgen.ush is compiled against.
+// Every other .usf in this project opens the same way -- VoxelWorldGen.usf,
+// VoxelQuadScan.usf, VoxelQuadDecodeTest.usf.
+//
+// Its absence is invisible to a C++ build: IMPLEMENT_GLOBAL_SHADER only records
+// (path, entry), so the shader itself is not compiled until the editor asks for
+// it at runtime. "It compiles" about a new .usf therefore means the module
+// linked, not that the kernel exists.
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelCore/worldgen.ush"
+
+// INT64_MAX / INT64_MIN as named constants rather than inline literals.
+//
+// DO NOT "SIMPLIFY" THESE BACK TO `-0x8000000000000000L`. That is not a style
+// preference, and the reason is worth spelling out because the naive form looks
+// obviously correct.
+//
+// 0x8000000000000000 is 2^63. It does not fit int64_t (max 2^63 - 1) but does
+// fit uint64_t, so the compiler types the LITERAL before the unary minus is
+// applied, and the type it picks is not pinned down by anything this file
+// controls. If it picks uint64_t, negation wraps and the value still comes out
+// as INT64_MIN when stored into an int64_t -- so the ASSIGNMENTS look fine.
+//
+// The COMPARISONS do not. `segDepthMm > -0x8000000000000000L` with a uint64_t
+// right-hand side converts the signed left-hand side to unsigned under the
+// usual arithmetic conversions, and then every POSITIVE segDepthMm compares as
+// less than 2^63 and the guard reads FALSE where it must read true. That guard
+// is "at least one cave segment existed"; inverting it drops the cave term out
+// of the band entirely, which raises SolidBelowVoxel and skips chunks that have
+// geometry -- the unsafe direction, silently.
+//
+// NOT VERIFIED, and deliberately not: which type DXC actually picks was never
+// established, because deriving the min from the max makes the question moot
+// rather than answered. Recorded so the next reader knows the naive form was
+// removed for a possible wrong answer, not for tidiness. (If it ever did
+// misbehave, the cave-rich single-column probes in voxel.GPU.VerifyRegion's D6
+// sweep are exactly the probes that would have caught it.)
+static const int64_t kBandI64Max = 0x7fffffffffffffffL;
+static const int64_t kBandI64Min = -kBandI64Max - (int64_t)1;
+
+// Dispatch-column index of the band grid's (0,0), and the grid edge (34 for a
+// 32-voxel chunk plus its one-column apron). Passed in rather than derived so
+// this kernel does not need to know what a render chunk is.
+//
+// ONE scalar for both axes, not two. The production grid is symmetric (a
+// 48-column chunk dispatch has an 8-brick halo and a 1-column apron, so the
+// band starts at column 7 on both axes), and the window is square, so a max/min
+// reduction over it is transposition-invariant: an x/y index swap in the loop
+// below could not change the answer even if it existed. Two origins would add
+// API surface to test for a bug class that cannot exist here.
+//
+// ValidateRegionRequest rejects BandOriginI + BandEdge > DispatchColumns rather
+// than letting the bounds guard below silently reduce over a partial window.
+uint BandOriginI;
+uint BandEdge;
+
+// Two ints: the max of ColumnSurfaceTopVoxel and the min of
+// ColumnDeepestAirVoxel over the grid, as raw voxel z.
+//
+// The +1 / -1 widening and the clamp that turn these into an FFootprintBand
+// stay on the CPU deliberately. They are two additions and a clamp against
+// constants that live in VoxelWorldSubsystem.cpp, and every constant mirrored
+// into HLSL is a determinism liability. The expensive part -- 1,156 columns of
+// cave and cavern reduction -- is what belongs here.
+RWStructuredBuffer<int> OutBand;
+
+// Ceil of the integer square root: the unique R with (R-1)^2 < V <= R^2.
+//
+// The CPU's CeilSqrtI64 seeds with a double sqrt and then corrects with an
+// integer loop. worldgen.ush has no floating point at all and is integer-only
+// by contract, so this is a pure binary search instead -- and the two agree BY
+// CONSTRUCTION, because they converge on the same unique integer. That removes
+// floating point from the comparison rather than trying to make two FP paths
+// agree, which is the right shape for a file whose one cross-vendor divergence
+// came from exactly that class of mistake.
+//
+// Input is a marginSq, i.e. a non-negative int32, so hi stays <= 65535 and
+// mid*mid <= 65535^2 < 2^32 -- no overflow.
+uint ceilSqrtU(uint v)
+{
+    if (v == 0u)
+    {
+        return 0u;
+    }
+    uint lo = 0u;
+    uint hi = 1u;
+    while (hi < 65535u && hi * hi < v)
+    {
+        hi <<= 1;
+    }
+    while (lo + 1u < hi)
+    {
+        const uint mid = (lo + hi) >> 1;
+        if (mid * mid < v)
+        {
+            lo = mid;
+        }
+        else
+        {
+            hi = mid;
+        }
+    }
+    return hi;
+}
+
+// Mirrors VoxelStreaming::ColumnSurfaceTopVoxel.
+int64_t columnSurfaceTopVoxel(int surfaceMm)
+{
+    // lint-shader-ub: allow SIGNED_DIVISION - both operands are positive compile-time constants (kVoxelSizeMm is 100), so this folds to 50 and no sign is involved; worldgen.ush writes the identical expression and lints clean there, where the constant is declared in-file
+    return floorDiv((int64_t)surfaceMm - (int64_t)kVoxelSizeMm / 2, (int64_t)kVoxelSizeMm);
+}
+
+// Mirrors VoxelStreaming::ColumnDeepestAirVoxel. A conservative OUTER bound on
+// the lowest voxel that can hold air, over the three independent sources: above
+// the surface (unconditional), caveCarveAt, and cavernCarveAt.
+int64_t columnDeepestAirVoxel(GpuColumnSample col, GpuCaveColumn cave, GpuCavernColumn cavern)
+{
+    const int64_t surfaceTop = columnSurfaceTopVoxel(col.surfaceMm);
+    int64_t carveMin = kBandI64Max;
+
+    const bool carveEligible = col.surfaceMm >= kCaveMinSurfaceMm;
+
+    if (carveEligible && (cave.segCount > 0 || cave.shaftMarginSq > 0))
+    {
+        int64_t maxCaveDepthMm = kBandI64Min;
+        if (cave.shaftMarginSq > 0)
+        {
+            maxCaveDepthMm = max(maxCaveDepthMm, (int64_t)cave.shaftDepthMaxMm);
+        }
+        int64_t segDepthMm = kBandI64Min;
+        for (int s = 0; s < cave.segCount; ++s)
+        {
+            segDepthMm = max(segDepthMm,
+                             (int64_t)cave.segDepthMm[s] + (int64_t)ceilSqrtU((uint)cave.segMarginSq[s]));
+        }
+        if (segDepthMm > kBandI64Min)
+        {
+            // caveCarveAt refuses once depthMm + kCaveBedrockMarginMm >= bedrockDepthMm.
+            segDepthMm = min(segDepthMm, (int64_t)col.bedrockDepthMm - kCaveBedrockMarginMm);
+            maxCaveDepthMm = max(maxCaveDepthMm, segDepthMm);
+        }
+        if (maxCaveDepthMm > kBandI64Min)
+        {
+            carveMin = min(carveMin,
+    // lint-shader-ub: allow SIGNED_DIVISION - both operands are positive compile-time constants (kVoxelSizeMm is 100), so this folds to 50 and no sign is involved; worldgen.ush writes the identical expression and lints clean there, where the constant is declared in-file
+                           floorDiv((int64_t)col.surfaceMm - maxCaveDepthMm - (int64_t)kVoxelSizeMm / 2,
+                                    (int64_t)kVoxelSizeMm));
+        }
+    }
+
+    if (carveEligible && cavern.count > 0)
+    {
+        int64_t minZAbsMm = kBandI64Max;
+        for (int s = 0; s < cavern.count; ++s)
+        {
+            minZAbsMm = min(minZAbsMm,
+                            max((int64_t)cavern.zFloorMm[s],
+                                (int64_t)cavern.zCenterMm[s] - (int64_t)ceilSqrtU((uint)cavern.marginSq[s])));
+        }
+        if (minZAbsMm < kBandI64Max)
+        {
+            // cavernCarveAt refuses once depthMm + kCaveBedrockMarginMm >= bedrockDepthMm.
+            minZAbsMm = max(minZAbsMm,
+                            (int64_t)col.surfaceMm - (int64_t)col.bedrockDepthMm + kCaveBedrockMarginMm);
+            carveMin = min(carveMin,
+    // lint-shader-ub: allow SIGNED_DIVISION - both operands are positive compile-time constants (kVoxelSizeMm is 100), so this folds to 50 and no sign is involved; worldgen.ush writes the identical expression and lints clean there, where the constant is declared in-file
+                           floorDiv(minZAbsMm - (int64_t)kVoxelSizeMm / 2, (int64_t)kVoxelSizeMm));
+        }
+    }
+
+    if (carveMin != kBandI64Max)
+    {
+        carveMin = max(carveMin, kCaveMinVoxelZ);   // no carving at or below sea level
+    }
+    // Source 1 is unconditional and must NOT be clamped to sea level.
+    return min(carveMin, surfaceTop + 1);
+}
+
+groupshared int64_t gsTop[256];
+groupshared int64_t gsAir[256];
+
+[numthreads(256, 1, 1)]
+void BandReduceMain(uint3 gtid : SV_GroupThreadID)
+{
+    const uint lane = gtid.x;
+    const uint cells = BandEdge * BandEdge;
+
+    int64_t localTop = kBandI64Min;
+    int64_t localAir = kBandI64Max;
+
+    const uint64_t caveSeed = ((uint64_t)SeedHi << 32) | (uint64_t)SeedLo;
+
+    // Grid-stride over the band cells. Fixed stride and fixed lane assignment,
+    // so which lane sees which column is identical on every run and every
+    // vendor -- the reduction below is order-independent anyway, but there is
+    // no reason to depend on that twice.
+    for (uint c = lane; c < cells; c += 256u)
+    {
+        const uint bi = c % BandEdge;
+        const uint bj = c / BandEdge;
+        const uint dx = BandOriginI + bi;
+        const uint dy = BandOriginI + bj;
+        if (dx >= DispatchColumns.x || dy >= DispatchColumns.y)
+        {
+            continue;   // the caller sized the dispatch wrong; skip rather than read out of bounds
+        }
+
+        const GpuColumnSample col = InColumns[dx + dy * DispatchColumns.x];
+
+        const int64_t colVx = (int64_t)OriginVx + (int64_t)dx;
+        const int64_t colVy = (int64_t)OriginVy + (int64_t)dy;
+        const GpuCaveColumn cave = caveColumnFor(caveSeed, colVx, colVy, col.surfaceMm);
+        const GpuCavernColumn cavern = cavernColumnFor(caveSeed, colVx, colVy, col.surfaceMm);
+
+        localTop = max(localTop, columnSurfaceTopVoxel(col.surfaceMm));
+        localAir = min(localAir, columnDeepestAirVoxel(col, cave, cavern));
+    }
+
+    gsTop[lane] = localTop;
+    gsAir[lane] = localAir;
+    GroupMemoryBarrierWithGroupSync();
+
+    // Fixed-order tree reduction. Same shape as ScanSumsMain's, which the
+    // determinism gate already covers.
+    [unroll]
+    for (uint s = 128u; s > 0u; s >>= 1)
+    {
+        if (lane < s)
+        {
+            gsTop[lane] = max(gsTop[lane], gsTop[lane + s]);
+            gsAir[lane] = min(gsAir[lane], gsAir[lane + s]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (lane == 0u)
+    {
+        // Raw voxel z. The CPU applies the +1/-1 widening and the clamp -- see
+        // the comment on OutBand.
+        // lint-shader-ub: allow UNGUARDED_WRITE - literal indices into a buffer the host creates with exactly 2 elements (AddRegionPasses: CreateStructuredDesc(sizeof(int32), 2)); there is no index to bound
+        OutBand[0] = (int)gsTop[0];
+        // lint-shader-ub: allow UNGUARDED_WRITE - same 2-element buffer, literal index 1
+        OutBand[1] = (int)gsAir[0];
+    }
+}
