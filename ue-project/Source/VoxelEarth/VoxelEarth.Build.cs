@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Logging;
+using System;
 using System.IO;
 using UnrealBuildTool;
 
@@ -89,6 +91,55 @@ public class VoxelEarth : ModuleRules
 				"  cmake -S voxel-core -B build/voxel-core-msvc\n" +
 				"  cmake --build build/voxel-core-msvc --config Release"
 			);
+		}
+
+		// STALENESS GUARD.
+		//
+		// This links a PREBUILT static library. Nothing in UBT's dependency graph
+		// knows about voxel-core's sources, so editing amplifier.cpp and
+		// rebuilding the editor silently links the OLD generator -- and the
+		// failure is not a link error, it is WRONG TERRAIN. That is the worst
+		// shape a build problem can have here, and it has already cost real time
+		// twice: once as a GPU/CPU material mismatch chased into the shaders, and
+		// once as a cross-toolchain determinism gate failure investigated as a
+		// worldgen bug. In both cases the library was simply four hours older
+		// than the sources it was built from.
+		//
+		// A warning, not an error: the lib may legitimately be newer than a
+		// comment-only edit, and failing the build on a timestamp would be worse
+		// than the problem. The point is that the next person sees it in the
+		// build log instead of in the terrain.
+		try
+		{
+			DateTime LibTime = File.GetLastWriteTimeUtc(VoxelCoreLib);
+			string NewestName = null;
+			DateTime NewestTime = DateTime.MinValue;
+			foreach (string Dir in new string[] { Path.Combine(VoxelCoreRoot, "src"),
+			                                      Path.Combine(VoxelCoreRoot, "include") })
+			{
+				if (!Directory.Exists(Dir)) { continue; }
+				foreach (string Src in Directory.GetFiles(Dir, "*.*", SearchOption.AllDirectories))
+				{
+					string Ext = Path.GetExtension(Src).ToLowerInvariant();
+					if (Ext != ".cpp" && Ext != ".h" && Ext != ".hpp" && Ext != ".inl") { continue; }
+					DateTime T = File.GetLastWriteTimeUtc(Src);
+					if (T > NewestTime) { NewestTime = T; NewestName = Src; }
+				}
+			}
+
+			if (NewestName != null && NewestTime > LibTime)
+			{
+				Target.Logger.LogWarning(
+					"VoxelEarth: voxelcore.lib is STALE (lib {LibTime}, newest source {SrcTime} -- {SrcName}). " +
+					"This build will link an out-of-date generator and may produce wrong terrain or " +
+					"fail the cross-toolchain determinism gate. " +
+					"Rebuild it: cmake --build build/voxel-core-msvc --config Release",
+					LibTime, NewestTime, NewestName);
+			}
+		}
+		catch (Exception)
+		{
+			// A diagnostic must never be the reason a build fails.
 		}
 
 		PublicAdditionalLibraries.Add(VoxelCoreLib);
