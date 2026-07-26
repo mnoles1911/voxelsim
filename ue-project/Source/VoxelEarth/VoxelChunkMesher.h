@@ -49,9 +49,27 @@ enum ERingSkirtFace : uint8
 // edited-chunk path calls it with a sampler closed over World::materialAt
 // (overlay-aware). Only the sampler differs -- the mesh-and-bake logic never
 // drifts between the two.
-template <typename MaterialFn>
+// WHAT A CALLER MUST PROVE to supply a BrickSkipFn. meshBrick's mask loop sets
+// a non-zero face key only where an INTERIOR voxel is non-air AND its neighbour
+// is air, so either of these is sufficient on its own, and each is one of the
+// mesher's own guarantees restated:
+//
+//   * no SOLID in the brick interior  -- meshBrick's early-out 1, verbatim;
+//   * no AIR in the brick + its apron -- no face can have an air neighbour.
+//
+// Skipping such a brick is byte-identical to meshing it, because meshing it
+// appends nothing to OutQuads. The value is that meshBrick's 1,000 sampler
+// calls happen BEFORE either early-out can fire -- filling `mat[10^3]` IS the
+// cost, and a predicate answered from data the caller already holds skips it.
+struct FNeverSkipBrick
+{
+	bool operator()(int32 /*Dx*/, int32 /*Dy*/, int32 /*Dz*/) const { return false; }
+};
+
+template <typename MaterialFn, typename BrickSkipFn = FNeverSkipBrick>
 void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const MaterialFn& MaterialAt, TArray<FVoxelChunkQuad>& OutQuads,
-                      vxc::Counters* PerfCounters = nullptr, uint8 RingSkirtMask = 0)
+                      vxc::Counters* PerfCounters = nullptr, uint8 RingSkirtMask = 0,
+                      const BrickSkipFn& SkipBrick = BrickSkipFn())
 {
 	using namespace vxc;
 	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
@@ -65,6 +83,21 @@ void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const Material
 		{
 			for (int32 Dx = 0; Dx < BricksPerChunk; ++Dx)
 			{
+				// Provably emits nothing (see FNeverSkipBrick): skip the 1,000
+				// sampler calls meshBrick would make before its own early-out
+				// could fire. Counted as generated so the census keeps meaning
+				// what it meant -- the brick WAS accounted for, it just cost
+				// nothing.
+				if (SkipBrick(Dx, Dy, Dz))
+				{
+					if (PerfCounters)
+					{
+						PerfCounters->incBricksGenerated();
+						PerfCounters->incCellsWritten(uint64_t(B) * B * B);
+					}
+					continue;
+				}
+
 				const int64 OriginVX = (int64(ChunkKey.X) * BricksPerChunk + Dx) * int64(B);
 				const int64 OriginVY = (int64(ChunkKey.Y) * BricksPerChunk + Dy) * int64(B);
 				const int64 OriginVZ = (int64(ChunkKey.Z) * BricksPerChunk + Dz) * int64(B);
