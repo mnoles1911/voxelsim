@@ -1,10 +1,13 @@
 #include "VoxelClimateProbe.h"
 
 #include "VoxelEarth.h" // LogVoxelEarth
+#include "VoxelWorldSubsystem.h" // DefaultSeed -- shared, not re-typed
 
 #include "HAL/CriticalSection.h"
 #include "Misc/CommandLine.h"
+#include "Misc/ConfigCacheIni.h" // DefaultTileDir ini fallback, mirroring the subsystem
 #include "Misc/Parse.h"
+#include "Misc/Paths.h"
 
 #include "voxelcore/tiles.h"
 #include "voxelcore/tilestore.h"
@@ -36,13 +39,46 @@ namespace
 	// synthetic on zero loaded).
 	void LoadTiles()
 	{
+		// PRECEDENCE MUST MATCH UVoxelWorldSubsystem::Initialize EXACTLY:
+		// command line wins, then DefaultTileDir from DefaultGame.ini, then
+		// nothing. Relative paths resolve against Content/.
+		//
+		// This block is why the comment above matters. When the ini fallback was
+		// added to the subsystem (2026-07-24) it was NOT added here, so on every
+		// ordinary launch -- the exact case the ini default exists to fix --
+		// geometry loaded the real diffusion tiles while this probe loaded ZERO
+		// and fell back to synthetic, handing the renderers a neutral 128/128
+		// climate everywhere. The world rendered flat and untextured, and the
+		// startup log said so plainly ("SYNTHETIC (no -VoxelTileDir), tiles=0")
+		// for anyone who read it. That is precisely the "climate sampled from a
+		// different tile set than the geometry" failure the comment above warns
+		// about, so keep the two in step.
 		FString TileDir;
-		FParse::Value(FCommandLine::Get(), TEXT("VoxelTileDir="), TileDir);
+		if (!FParse::Value(FCommandLine::Get(), TEXT("VoxelTileDir="), TileDir) && GConfig)
+		{
+			GConfig->GetString(TEXT("/Script/VoxelEarth.VoxelWorldSubsystem"),
+			                   TEXT("DefaultTileDir"), TileDir, GGameIni);
+		}
+		if (!TileDir.IsEmpty() && FPaths::IsRelative(TileDir))
+		{
+			TileDir = FPaths::Combine(FPaths::ProjectContentDir(), TileDir);
+			FPaths::CollapseRelativeDirectories(TileDir);
+		}
 
 		int32 TileScale = 1;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelTileScale="), TileScale);
 
-		uint64 Seed = 0;
+		// Default MUST be UVoxelWorldSubsystem::DefaultSeed, not 0 -- taken from
+		// that class rather than re-typed, so this one cannot drift again.
+		//
+		// The second half of the same divergence as the TileDir block above: with
+		// a default of 0, every tile in a directory generated for seed 20260719
+		// failed loadTile's seed check, so the probe loaded ZERO tiles and fell
+		// back to synthetic even once it was looking at the right directory. The
+		// symptom is identical to having no tiles at all -- flat, untextured
+		// terrain -- and the log line distinguishes them ("zero tiles loaded
+		// from <path>" vs "no -VoxelTileDir").
+		uint64 Seed = UVoxelWorldSubsystem::DefaultSeed;
 		{
 			FString SeedStr;
 			if (FParse::Value(FCommandLine::Get(), TEXT("VoxelSeed="), SeedStr))
