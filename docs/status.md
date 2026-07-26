@@ -7210,3 +7210,76 @@ the third lever measured and rejected for this goal after seed selection and sea
 level. The route that does work is `tools/make_conditioning.py`, where elevation
 and precipitation are authored independently and a low dry interior is simply a
 spec. Recommend leaving `frequency_mult` at its default.
+
+## Coarse chunks meshed from a flat column grid (2026-07-26)
+
+Coarse (level >= 1) chunk jobs cost **4.4-5.3 ms/chunk** against level 0's
+**1.55 ms**, even though the coarse sampling rule was designed to cost the SAME
+as level 0 at any level (generator.h: `B*B` amplifier columns per brick
+footprint, `B^3` `materialAt` calls, independent of L) and docs/gpu-g0-sizing.md
+measures the generator itself flat at ~2.6-3.0 ms across levels. **The gap was
+plumbing, not generation.**
+
+Level 0 builds one flat 34x34 `ColumnSample` array per chunk and meshes through
+a raw lambda that indexes it. Coarse went through `MakeCoarseLevelSampler`
+instead: a `std::function`, three `floorDiv` + three `floorMod` and an
+`unordered_map` probe for each of the ~64k voxel queries a chunk makes, plus
+eager materialization of a whole `Brick<8>` (512 `materialAt` calls, palette
+writes, `tryCollapse`) per brick key touched -- up to ~216 bricks for a chunk's
+4x4x4 interior plus apron, ~2,300 amplifier columns against level 0's 1,156.
+
+**Why the replacement is a pure refactor.** Unfold what that sampler computes
+for absolute level-L voxel (X,Y,Z): its brick key is `floorDiv(X,B)` and its
+local index `floorMod(X,B)`, so `key*B + local == X` on every axis;
+`coarseColumns(L,bx,by)` stores `amp.column(coarseRep(bx*B+lx,L),
+coarseRep(by*B+ly,L))` and `makeCoarseBrick` writes cell (lx,ly,lz) =
+`materialAt(that column, coarseRep(bz*B+lz,L))` (generator.h:117-142), and
+`Brick::set`/`get` round-trips a `MaterialId` exactly through its palette
+(brick.h:56-76). Substituting, the sampler is exactly
+
+    materialAt(amp.column(coarseRep(X,L), coarseRep(Y,L)), coarseRep(Z,L))
+
+with no dependence on brick boundaries at all. The brick layer is a cache of a
+function cheaper to call than to cache. `FCoarseChunkGridSampler`
+(VoxelWorldSubsystem.cpp) builds the chunk's (32+2)^2 coarse columns once and
+evaluates that composition directly, as a concrete functor (not a
+`std::function`) so the per-voxel call inlines like the level-0 lambda.
+
+`-VoxelCoarseGrid=0` restores the brick-cache path as the A/B control (command
+line, not a cvar, for the `-VoxelCoarseMinLevel` reason: `-ExecCmds` lands after
+streaming starts).
+
+### Equivalence: `-VoxelCoarseGridVerify`
+
+Meshes every coarse chunk BOTH ways and compares the emitted quad arrays
+field-by-field **in order** (both paths run the identical `MeshChunkBricks`
+traversal, so a pure refactor must reproduce the same quads in the same
+sequence, not merely the same set), logging the chunk key on any mismatch plus a
+running total in the 1 Hz perf log. Full cascade fill at
+`-VoxelSpawnAt=-84480,53760`, real diffusion tiles (25 loaded), seed 20260719:
+
+    VoxelCoarseGridVerify: coarse chunks checked=10800 MISMATCHES=0
+
+### Worker p50 ms/chunk per ring, A/B on one binary
+
+Cold-PSO run discarded; stale editor processes killed between runs (one left
+running triples every p50).
+
+| ring | `-VoxelCoarseGrid=0` | default (flat grid) |
+|---|---|---|
+| R0 (level 0, untouched) | 1.54 / 1.58 | 1.90 / 2.17 |
+| R1 | 4.11 / 4.23 | **1.65 / 1.83** |
+| R2 | 4.09 / 4.22 | **1.91 / 1.82** |
+| R3 | 4.29 / 4.36 | **1.75 / 2.08** |
+| R4 | 4.23 / 4.49 | **1.83 / 2.21** |
+| R5 | 4.31 / 4.50 | **1.90 / 2.50** |
+
+**R1-R5 fall ~2.3x, to level 0's own cost** -- which is the point: the coarse
+rule always did the same amount of generation as level 0, and now it pays the
+same amount of plumbing. R0 rising 1.54 -> 1.90 is not a regression in level-0
+code (untouched): the cascade now fills in less wall time, so more jobs overlap
+and each job's measured wall time absorbs more pool contention.
+
+Streaming totals identical across every run on both sides: `loaded=9822
+quads=8828367 tracked=16417`, anchor `(-8448000, 5376000, 55054)` first sample
+to last.
