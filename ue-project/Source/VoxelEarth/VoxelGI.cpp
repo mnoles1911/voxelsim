@@ -845,10 +845,26 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 	};
 	FClassStats StatsZ;   // +-Z normals: Scheme B is exact here
 	FClassStats StatsXY;  // +-X/+-Y normals: the horizontal mean
+	// NEGATIVE CONTROL. Scheme B is exact on +-Z by construction, so a correct
+	// implementation reports 0.000 -- and a harness that reports 0.000 because
+	// it is comparing a thing against itself reports exactly the same number.
+	// This runs the identical comparison with the volume probe displaced HALF A
+	// CELL in X, i.e. the smallest addressing mistake the origin snap exists to
+	// prevent. It must come out large. If it does not, the measurement above is
+	// worthless and nothing else in this log line should be believed.
+	FClassStats StatsControl;
 	int32 CpuMiss = 0;    // volume had data, field's first probe did not
 	int32 VolMiss = 0;    // field had data, volume did not (upload lag or a hole)
 	int32 Attempts = 0;
 	int32 Unsolved = 0;
+	// How much dynamic range the +-Z measurement actually had. A field of
+	// uniformly-1.0 irradiance -- which is what open sky looks like, since an
+	// unoccluded cell solves to exactly 1.0 -- would make any encoding score
+	// 0.000 regardless of whether it works. Reported so "meanAbsErr=0.000" can
+	// be read together with the spread of the values it was computed over.
+	double SignalSum = 0.0;
+	double SignalSumSq = 0.0;
+	double SignalMin = 1.0;
 
 	// Deterministic stream, so two runs of the same build compare like for like.
 	FRandomStream Rand(0x5EED0002);
@@ -913,7 +929,23 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 			}
 
 			const double ErrBytes = FMath::Abs(double(FieldIrr) - double(VolIrr)) * 255.0;
-			if (Dir >= 4) { StatsZ.Add(ErrBytes); } else { StatsXY.Add(ErrBytes); }
+			if (Dir >= 4)
+			{
+				StatsZ.Add(ErrBytes);
+				SignalSum += double(FieldIrr);
+				SignalSumSq += double(FieldIrr) * double(FieldIrr);
+				SignalMin = FMath::Min(SignalMin, double(FieldIrr));
+
+				float ShiftedIrr = 0.f;
+				if (SampleShadow(Probe + FVector(0.5 * VoxelLF::CellSizeUU, 0, 0), Slot, ShiftedIrr))
+				{
+					StatsControl.Add(FMath::Abs(double(FieldIrr) - double(ShiftedIrr)) * 255.0);
+				}
+			}
+			else
+			{
+				StatsXY.Add(ErrBytes);
+			}
 		}
 	}
 
@@ -926,6 +958,19 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 	UE_LOG(LogVoxelGI, Log,
 	       TEXT("VOLUMECHECK horizontal (+-X/+-Y, Scheme B mean channel): cells=%d meanAbsErr=%.3f maxAbsErr=%.3f"),
 	       StatsXY.Count, StatsXY.Mean(), StatsXY.MaxAbsErr);
+	UE_LOG(LogVoxelGI, Log,
+	       TEXT("VOLUMECHECK control (+-Z, volume probe shifted half a cell in X -- MUST be large, else the ")
+	       TEXT("line above is measuring nothing): cells=%d meanAbsErr=%.3f maxAbsErr=%.3f"),
+	       StatsControl.Count, StatsControl.Mean(), StatsControl.MaxAbsErr);
+	{
+		const double N = FMath::Max(1, StatsZ.Count);
+		const double SigMean = SignalSum / N;
+		const double SigVar = FMath::Max(0.0, SignalSumSq / N - SigMean * SigMean);
+		UE_LOG(LogVoxelGI, Log,
+		       TEXT("VOLUMECHECK signal (+-Z sampled irradiance, the range the error above was measured over): ")
+		       TEXT("mean=%.1f sd=%.1f min=%.1f bytes"),
+		       SigMean * 255.0, FMath::Sqrt(SigVar) * 255.0, SignalMin * 255.0);
+	}
 	// Pass bar, in irradiance bytes: Scheme B is EXACT on +-Z normals, so
 	// anything above a byte of mean error is an addressing, origin or staging
 	// bug rather than an encoding tradeoff.
