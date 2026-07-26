@@ -160,6 +160,64 @@ works.
 
 ---
 
+## 7. How far out terrain should cast shadows — a quality call, and only you can make it (added Wave G)
+
+**This one is not a bug hunt. It is a trade between two named quantities, and no
+harness in this project can score it.**
+
+### The measurement behind it
+
+The pooled renderer's four shadow cascades collectively see **90.6% of the whole
+resident pool**, against **7.4%** for the camera at the same pose. Shadow gathers
+submit **92.6%** of all quads the pool draws. That is not waste from merging — it
+is geometry genuinely inside some cascade's frustum, so it survives even a perfect
+renderer. The cause is that **every resident chunk out to 2 km casts a dynamic
+shadow**, including the coarse outer rings whose shadow covers very little screen.
+
+`voxel.Stream.GPUShadowMaxLevel` caps that by cascade level, which maps straight to
+distance:
+
+| setting | terrain stops casting beyond | quads saved per frame | what it costs |
+|---|---|---|---|
+| **4 (shipped default)** | **~1 km** | **~1.5M** | expected to be invisible |
+| 3 | ~512 m | ~3.3M | likely visible on a clear day |
+| 2 | ~256 m | ~5.3M | will be visible |
+
+*(Savings are against a measured 11.85M-quad shadow floor. For scale, the mildest
+setting saves about as much as the pool's entire camera-view over-draw.)*
+
+### What to look for, and it is not the obvious thing
+
+Set `r.ShadowQuality` high, find a **low sun angle** — early or late — and stand
+somewhere with real relief in the middle distance. Then step
+`voxel.Stream.GPUShadowMaxLevel` down 4 → 3 → 2 and watch for three things, in
+increasing order of how easy they are to miss:
+
+1. **Long shadows thrown by distant ridges across nearer ground** simply stop
+   existing. Obvious when you know to look.
+2. **Distant terrain stops self-shadowing.** This is the one that matters more.
+   Relief at distance reads substantially through its own shadowing; without it,
+   far mountains flatten out and read *brighter* than they should. It does not
+   look like "a shadow is missing" — it looks like the distance is hazy or
+   washed out.
+3. **A hard edge in world space at the cap distance.** Shadows ending at exactly
+   512 m reads as a bug rather than a setting. If you see a line, that setting is
+   too aggressive *or* the cap wants aligning to a cascade transition, where the
+   shadow resolution already changes and the eye already forgives a seam.
+
+**Tell us which of 4 / 3 / 2 you can live with.** If 3 is acceptable it roughly
+doubles the saving; if only 4 is, that is a complete answer and the shipped
+default already reflects it.
+
+### One thing to check that is a bug rather than a preference
+
+Change the cvar **while standing still and looking at shadowed distant terrain**,
+rather than changing it and then walking there. If shadows do *not* update until
+you move, that is a **stale shadow-map cache** (cached whole-scene shadows or a
+virtual-shadow-map page holding geometry that has stopped casting). That is a real
+defect and worth reporting; it is not the quality trade above and it would make
+the cap look correct in every measurement while being wrong on screen.
+
 ## Why this file exists
 
 Every screenshot I took was a **stationary camera on a settled world**. That

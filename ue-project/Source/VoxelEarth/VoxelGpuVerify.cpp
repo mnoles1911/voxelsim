@@ -1281,6 +1281,74 @@ namespace
 		TEXT("Take a screenshot N seconds from now (default 20). Usage: voxel.Debug.ShotIn [seconds]"),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&ShotInCommand));
 
+	// Set a cvar N seconds from now, so ONE session can screenshot BOTH sides of
+	// an A/B.
+	//
+	// WHY THIS IS NOT A CONVENIENCE. -ExecCmds runs everything at startup, and
+	// every screenshot fixture in this project either fires once and quits
+	// (-VoxelScreenshotAfter) or cannot change anything between shots
+	// (voxel.Debug.ShotIn). So a visual A/B has meant two sessions -- and Wave A
+	// measured this project's screenshot noise floor to be BIMODAL rather than
+	// noise-like: captures fall into two clusters, 0.00% different WITHIN a
+	// cluster and 1.81% BETWEEN, from some per-session latch (probably eye
+	// adaptation).
+	//
+	// A cross-session pair therefore carries a latch difference on top of the
+	// effect, and 1.81% is larger than plenty of real effects. Same session means
+	// same cluster, which is what makes "0.00% differing pixels" a statement about
+	// the change rather than about which cluster each run happened to land in.
+	//
+	// Usage: voxel.Debug.SetIn <seconds> <cvar> <value>
+	// Note -ExecCmds splits on COMMAS, so this takes space-separated args and no
+	// argument here may contain a comma.
+	void SetInCommand(const TArray<FString>& Args, UWorld* World)
+	{
+		if (World == nullptr || Args.Num() < 3)
+		{
+			UE_LOG(LogVoxelGpuVerify, Warning,
+			       TEXT("voxel.Debug.SetIn: need <seconds> <cvar> <value>"));
+			return;
+		}
+		const float Delay = FMath::Max(0.0f, FCString::Atof(*Args[0]));
+		const FString CvarName = Args[1];
+		const FString Value = Args[2];
+
+		// Resolved NOW, not at fire time, so a typo is a loud error at t=0 rather
+		// than a silent no-op forty seconds later in the middle of a measurement.
+		// A misspelt cvar that quietly does nothing would leave an A/B running two
+		// identical configs and looking exactly like a null result.
+		if (IConsoleManager::Get().FindConsoleVariable(*CvarName) == nullptr)
+		{
+			UE_LOG(LogVoxelGpuVerify, Error,
+			       TEXT("voxel.Debug.SetIn: no such cvar '%s' -- NOT scheduling. This would have run an A/B "
+			            "against itself."), *CvarName);
+			return;
+		}
+
+		FTimerHandle Handle;
+		World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([CvarName, Value]()
+		{
+			if (IConsoleVariable* Cvar = IConsoleManager::Get().FindConsoleVariable(*CvarName))
+			{
+				Cvar->Set(*Value, ECVF_SetByConsole);
+				// Echoed back by READING it, not by repeating what was asked for.
+				// A cvar can refuse or clamp a value, and the log has to say what
+				// the run actually used or it is not evidence.
+				UE_LOG(LogVoxelGpuVerify, Log,
+				       TEXT("voxel.Debug.SetIn FIRED: %s = %s (requested %s)"),
+				       *CvarName, *Cvar->GetString(), *Value);
+			}
+		}), Delay, false);
+		UE_LOG(LogVoxelGpuVerify, Log,
+		       TEXT("voxel.Debug.SetIn scheduled: %s = %s in %.1f s"), *CvarName, *Value, Delay);
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GVoxelDebugSetInCmd(
+		TEXT("voxel.Debug.SetIn"),
+		TEXT("Set a cvar N seconds from now, so one session can capture both sides of an A/B against a "
+		     "within-session screenshot floor. Usage: voxel.Debug.SetIn <seconds> <cvar> <value>"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&SetInCommand));
+
 	FAutoConsoleCommandWithWorldAndArgs GVoxelGpuSpawnPoolCmd(
 		TEXT("voxel.GPU.SpawnPool"),
 		TEXT("Put N chunks in one GPU pool drawn by ONE primitive in ONE draw call. "
