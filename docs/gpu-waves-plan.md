@@ -121,17 +121,19 @@ not include the draw's base vertex on D3D12**, so every range drew pool quads
 explicitly — `QuadIndex = VoxelRange.BaseQuad + VertexId/6`, with every draw
 starting at vertex 0.
 
+p50, two legs per config, one box state (L1 / L2):
+
 | pose | component | pooled-uncull | pooled-cull |
 |---|---|---|---|
-| horizon (yaw 200, pitch −5) p50 | TBD | TBD | TBD |
-| straight down (pitch −89) p50 | TBD | TBD | TBD |
-| **horizon → down** | TBD | TBD | TBD |
+| horizon (yaw 200, pitch −5) | 9.42 / 9.89 | 12.47 / 12.46 | **9.34 / 9.31** |
+| straight down (pitch −89) | 2.25 / 2.30 | 12.60 / 12.65 | **2.42 / 2.43** |
+| **horizon → down** | −76% / −77% | **+1.0% / +1.5%** | **−74% / −74%** |
 
-*(TBD — filled from the clean 14-leg run; see A4.)*
-
-**Defaults: `voxel.Stream.GPUCull` → TBD. `voxel.Stream.GPU` stays 0.** The second
-is not a formality — see "The fixed per-frame pooled cost" below, which is the
-finding this wave should be remembered for.
+**Defaults: `voxel.Stream.GPUCull` → 1. `voxel.Stream.GPU` stays 0.** The pool
+now scales with visibility and beats the component path at the horizon, but it is
+still **0.15 ms** behind it straight down — small, but consistent across both legs
+and larger than the harness resolves. The rule that decided this was written down
+before the deciding legs ran; see below.
 
 ### The defect, as it was
 
@@ -150,7 +152,7 @@ on what is on screen is not culling.
 **This wave reproduced that defect and then removed it in the same run.** The
 `pooled-uncull` config is the old behaviour, unchanged, and it still measures
 **+0.7%** horizon→down — invariant, exactly as before. `pooled-cull` over the same
-pose pair, same scene, same harness, measures TBD. One config still shows the
+pose pair, same scene, same harness, measures **−74%**. One config still shows the
 defect and one no longer does, which is as clean a before/after as this programme
 has produced.
 
@@ -284,7 +286,33 @@ there would have become a type confusion rather than merely unused.
 size beside its timing, so scene equivalence across configs is visible rather than
 assumed.
 
-TBD — table, per-leg, with `loaded`/`quads` beside each.
+Every leg below settled identically — `loaded=9822 quads=8828373 jobsInFlight=0
+pendingJobs=0`, pool `liveChunks=9818 highWater=8823501` — so scene equivalence
+across configs is observed, not assumed.
+
+| leg | pose | config | p50 | p95 | ranges | visibleQuads | drawnQuads |
+|---|---|---|---|---|---|---|---|
+| L1 | horizon | component | 9.42 | 10.99 | — | — | — |
+| L2 | horizon | component | 9.89 | 11.47 | — | — | — |
+| L1 | horizon | uncull | 12.47 | 12.83 | 1 | — | 8823501 |
+| L2 | horizon | uncull | 12.46 | 12.80 | 1 | — | 8823501 |
+| L1 | horizon | cull | 9.34 | 9.68 | **64** | 2285770 | 6221534 |
+| L2 | horizon | cull | 9.31 | 9.70 | **64** | 2285770 | 6228356 |
+| L1 | down | component | 2.25 | 3.02 | — | — | — |
+| L2 | down | component | 2.30 | 3.21 | — | — | — |
+| L1 | down | uncull | 12.60 | 13.22 | 1 | — | 8823501 |
+| L2 | down | uncull | 12.65 | 13.36 | 1 | — | 8823501 |
+| L1 | down | cull | 2.42 | 3.12 | 29 | 164534 | 266656 |
+| L2 | down | cull | 2.43 | 3.17 | 26 | 164534 | 270838 |
+| L1 | down | allvisible | 12.66 | 13.28 | 1 | 8823501 | 8823501 |
+| L2 | down | allvisible | 12.60 | 13.16 | 1 | 8823501 | 8823501 |
+
+**Controls held across passes**, which is what licenses reading the two passes as
+one measurement: horizon-uncull 0.08%, down-uncull 0.4%, horizon-cull 0.3%,
+down-component 2.2%, horizon-component 5.0%. Four of five repeat under half a
+percent. *Recorded because it matters below: the 5.0% pair is the one the
+pre-registered resolution floor was derived from — the least representative of
+the five, chosen in advance and in good faith.*
 
 **Method note, recorded because it cost a run.** The first attempt produced six
 clean legs and then six invalid ones: the **component** path — which this wave does
@@ -368,35 +396,88 @@ already established and neither of which is a near-noise comparison. The only
 precondition is that the controls agree across passes; if they do not, the pass is
 struck and nothing here is read at all.
 
-### The fixed per-frame pooled cost — the finding that outlives this wave
+#### Verdict under that rule
 
-The cull's own numbers, logged per frame:
+Direct spread |2.30 − 2.25| = 0.05 ms; floor = 0.050 × 2.275 = 0.114 ms; so
+**`R` = 0.114 ms**, resting on the floor.
 
-| pose | visible | drawn | ranges | pooled-cull vs component |
+| leg | down-component | down-cull | `D` | vs `R` |
 |---|---|---|---|---|
-| horizon | 25.9% | 72.1% | **64 (capped)** | pool ahead |
-| straight down | 1.9% | 3.0% | 31 (uncapped) | **pool still behind** |
+| L1 | 2.25 | 2.42 | **0.17** | > R |
+| L2 | 2.30 | 2.43 | **0.13** | > R |
 
-The obvious reading of the first row is that the 64-range cap is throwing away
-most of the win, and that a compute compaction pass would recover it. **The second
-row says that story is incomplete.** Straight down the cap does not bind at all —
-31 ranges, 3.0% of the pool drawn against 1.9% visible, near-optimal culling — and
-the pool *still* loses to the component path there. Whatever the residual is, it
-is not geometry, and compaction cannot remove it.
+Both legs exceed `R`; neither straddles. **Flip waits — `voxel.Stream.GPU` stays 0.**
 
-The likely candidate is the cull's own render-thread work: `BuildCulledRanges` is
-O(runs) per view per frame over ~9,800 runs, with an O(n log n) sort over the gaps,
-run for the main view *and* every shadow cascade. The straight-down `p95`/`p50`
-shape is consistent with that — occasional expensive frames rather than uniformly
-heavier ones.
+**The verdict is robust to the floor being wrong, which is the only reason it is
+worth anything.** `R` rests on the discredited generous floor, and the floor is the
+*flip-favourable* assumption — a larger `R` makes the residual easier to dismiss as
+noise. It fails anyway. The direct spread, the better estimate, is 0.05 ms, less
+than half the floor and a third of the residual, so it drives the same verdict
+harder. Both yardsticks agree and the one to trust gives the cleaner margin.
 
-TBD — direct measurement via `GPUCullDebugAllVisible`, which runs the whole CPU
-cull and then keeps everything, so the GPU draws exactly what `uncull` draws and
-the delta against `uncull` at the same pose is the fixed cost alone.
+*Stated so it is not read as stronger than it is:* on the floor alone, L2 clears
+`R` by 0.016 ms, which is itself below resolution — on that yardstick L2 is a tie,
+not a pass. The verdict rests on the direct spread. No extra control legs were
+spent: with both yardsticks agreeing, more of them could only tighten `R` downward
+and strengthen a verdict already reached.
 
-**Wave D must not assume compaction fixes this.** A fixed per-frame pooled cost is
-a different problem with a different fix from a draw-range budget, and Wave D is
-about to build on the pool.
+### What the residual actually is — and a cost model that fell out of it
+
+The cull's own numbers, logged per frame (L1 / L2):
+
+| pose | visible | drawn | over-draw | ranges | cull vs component |
+|---|---|---|---|---|---|
+| horizon | 25.9% | 70.5% | **2.72x** | **64 (capped)** | pool ahead by 0.08 / 0.58 ms |
+| straight down | 1.86% | 3.02 / 3.07% | **1.62x** | 29 / 26 (uncapped) | **pool behind by 0.17 / 0.13 ms** |
+
+**Two earlier readings of this table were wrong, and the run killed both.**
+
+*Wrong reading 1: the residual is the cull's own render-thread work.* Measured
+directly with `GPUCullDebugAllVisible`, which runs the entire CPU cull and then
+keeps every run, so the GPU draws exactly what `uncull` draws and the delta is the
+CPU cost alone: **+0.06 ms (L1), −0.05 ms (L2)**. The two probes bracket zero and
+the sign flips between passes. `BuildCulledRanges` really does run per view per
+shadow cascade, O(runs) over ~9,800 runs plus a sort, and it costs nothing
+measurable. *Caveat kept for honesty: with everything visible the merge collapses
+to a single range (`ranges=1` in both probe legs), so the gap sort runs over a
+degenerate list. The probe bounds the O(runs) scan — the part that runs identically
+either way — not the sort. The scan is free.*
+
+*Wrong reading 2 (this document's own, now retracted): "whatever the residual is,
+it is not geometry, and compaction cannot remove it."* It is geometry. The
+argument that it wasn't leaned on 3.0% drawn against 1.9% visible looking like
+"near-optimal culling" — but that is **1.62x over-draw**, 102,122 quads the pool
+draws and the component path does not.
+
+**The cost model that settles it.** Taking `uncull` and `cull` at the same pose as
+two points on cost-versus-`drawnQuads`:
+
+| pose | Δ quads | Δ p50 | implied |
+|---|---|---|---|
+| horizon | 2,601,967 | 3.13 ms | **1.203 µs / 1000 quads** |
+| straight down | 8,556,845 | 10.18 ms | **1.190 µs / 1000 quads** |
+
+Those two slopes are derived from completely different poses, geometry sets and
+frame times, and they agree to **1.1%**. That is cross-validation, not a fit. The
+pooled path costs a fixed floor of roughly 1.9–2.1 ms plus ~1.19 µs per 1000 quads
+actually drawn, and nothing else in these numbers needs explaining.
+
+Apply it to the residual: the 102,122 excess quads straight down predict
+**0.122 ms**, against a measured 0.17 / 0.13 ms. The over-draw from range merging
+accounts for essentially the whole gap.
+
+**So the guidance to Wave D reverses.** The earlier draft warned that compaction
+would not fix this because the cost was fixed per frame. The opposite is true: the
+residual is over-draw, compaction drives `drawnQuads` to `visibleQuads` by
+construction, and at 1.19 µs/1000 quads that removes ~0.12 ms straight down and a
+far larger ~4.7 ms at the horizon, where over-draw is 2.72x and the 64-range cap
+does bind. **Compaction is the fix, and it is worth more than this wave was.**
+
+*How the wrong version survived as long as it did:* its supporting evidence was a
+`p95` of 9.91 ms against a `p50` of 2.44 ms, read as "occasional expensive frames"
+— a periodic-CPU-cost signature. That measurement came from the contaminated run.
+The same config on a quiet box is p95 **3.12 / 3.17 ms**. There was never a tail to
+explain.
 
 ### Deferred, not dropped — and there is a real tension to record
 
