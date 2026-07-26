@@ -194,6 +194,18 @@ private:
 	FDirtyRange DirtyQuads;
 	bool bChunkTableDirty = false;
 
+	// Set whenever the set of live ALLOCATIONS changes -- which is not the same
+	// event as the chunk table changing, and conflating the two is what made the
+	// proxy's cull test one chunk's bounds against another chunk's quads.
+	// UpdateChunk's realloc branch moves a chunk to a new pool offset while
+	// deliberately keeping its table entry (so an actively-dug chunk does not burn
+	// a fresh entry per edit), so it leaves the table clean and the runs wrong: the
+	// run still names the offset the chunk used to occupy, which the allocator is
+	// free to hand to somebody else. A run's ChunkId then describes a different
+	// chunk from the quads at its FirstQuad, and a perfectly correct frustum test
+	// on a perfectly correct bounding box selects the wrong geometry.
+	bool bRunsDirty = false;
+
 	// Rebuilt from Allocations whenever the chunk table changes, and handed to
 	// the proxy with it. Live chunks only -- a freed handle contributes nothing.
 	TArray<FChunkRun> BuildChunkRuns() const;
