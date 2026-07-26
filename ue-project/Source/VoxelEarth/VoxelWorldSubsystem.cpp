@@ -90,6 +90,35 @@
 #include <unordered_map>
 #include <vector>
 
+// QueryThreadCycleTime for the worker-job CPU-cycle probe (FJobResult::JobCycles
+// -- see its doc comment for why WALL time alone cannot tell contention from
+// work). The only Windows API this module calls; everything else goes through
+// FPlatformTime. Guarded and stubbed below so a non-Windows build simply
+// reports zero cycles and the wall-time numbers are unaffected.
+#if PLATFORM_WINDOWS
+#include "Windows/AllowWindowsPlatformTypes.h"
+#include <processthreadsapi.h>
+#include "Windows/HideWindowsPlatformTypes.h"
+#endif
+
+namespace
+{
+// This thread's retired CPU cycles, or 0 where the platform cannot answer.
+// Cheap (a user-mode read of the thread's own counter), so it can sit on the
+// worker hot path without changing what it measures.
+inline uint64 VoxelThreadCycles()
+{
+#if PLATFORM_WINDOWS
+	uint64 Cycles = 0;
+	if (::QueryThreadCycleTime(::GetCurrentThread(), &Cycles))
+	{
+		return Cycles;
+	}
+#endif
+	return 0;
+}
+} // namespace
+
 // VoxelCoords.h intentionally duplicates this constant (in UU) so it stays
 // voxel-core-free; check the two never drift apart.
 static_assert(vxc::kVoxelSizeMm == int32(VoxelCoords::VoxelSizeUU) * 10,
@@ -1306,6 +1335,30 @@ struct FJobResult
 	// early-outs already make a buried chunk nearly free, the only thing left
 	// to reclaim is the column grid.
 	float GridMs = 0.f;
+	// CPU CYCLES this worker thread actually retired inside the job body, and
+	// inside the column-grid build specifically (0 off Windows, or when the
+	// query fails). Paired with JobMs/GridMs, which are WALL time, these are
+	// what separate the two candidate explanations for level-0 job time nearly
+	// doubling under motion (docs/status.md "Streaming under motion"):
+	//
+	//   * cycles/job roughly CONSTANT while ms/job doubles  -> the thread is not
+	//     doing more work; it is being descheduled, or running at a lower clock.
+	//     Contention/scheduling, and the fix is a concurrency or ordering one.
+	//   * cycles/job RISING with ms/job                     -> the thread really
+	//     is burning more cycles for the same 1156 columns, i.e. cache/memory
+	//     pressure. The fix is a working-set one.
+	//
+	// The grid build is the ideal probe because its work is EXACTLY FIXED: every
+	// level-0 job evaluates 34x34 = 1156 Amplifier::column calls, no more and no
+	// fewer, whatever the chunk contains. Cycles per column is therefore a
+	// like-for-like number across runs in a way that ms/job is not (chunk mix
+	// moves the mesh half).
+	//
+	// QueryThreadCycleTime is a cheap user-mode read of the thread's own cycle
+	// counter (two calls per job) and cannot perturb the number it reports the
+	// way a sampling profiler would.
+	uint64 JobCycles = 0;
+	uint64 GridCycles = 0;
 	// 0 = produced quads, 1 = all air, 2 = all solid (no AIR in chunk+apron),
 	// 3 = zero quads but neither (mixed with no visible face). Only filled in
 	// when the measurement switch is on; otherwise stays 0.
@@ -1687,6 +1740,26 @@ bool CoarseGridEnabled()
 	{
 		int32 Value = 1;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelCoarseGrid="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+// Per-worker-thread scratch buffer for the LEVEL-0 34x34 column grid, replacing
+// a per-job heap allocation (default ON). See the block comment at the
+// allocation site in DispatchJobs for the sizes and the byte-identity argument.
+//
+// `-VoxelL0GridScratch=0` restores the per-job TArray as the A/B control.
+// Command line, not a cvar, for the reason documented on -VoxelCoarseMinLevel
+// above: -ExecCmds lands after streaming has begun, so a cvar A/B would measure
+// the same warmed-up state twice and would miss the cascade fill entirely --
+// which is precisely the phase where concurrent allocation is heaviest.
+bool L0GridScratchEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelL0GridScratch="), Value);
 		return Value != 0;
 	}();
 	return bEnabled;
@@ -2853,6 +2926,14 @@ struct FVoxelWorldImpl
 	// the "what could a skip possibly reclaim" ratio.
 	double AccumLevel0GridMs = 0.0;
 	double AccumLevel0JobMs = 0.0;
+	// Same two intervals in RETIRED CPU CYCLES rather than wall time, plus the
+	// job count they are averaged over. See FJobResult::JobCycles: cycles/job
+	// against ms/job is what distinguishes "the thread was descheduled or
+	// downclocked" from "the thread burned more cycles on the same work", and
+	// the grid build is the fixed-work probe (always exactly 1156 columns).
+	uint64 AccumLevel0GridCycles = 0;
+	uint64 AccumLevel0JobCycles = 0;
+	int64 AccumLevel0Jobs = 0;
 	// THE decisive number for this wave, and the one the job-count census
 	// cannot give: worker WALL TIME split by outcome. 77% of jobs meshing to
 	// zero quads only justifies a skip if those jobs are also a large share of
@@ -3769,6 +3850,28 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		{
 			GridSuffix = FString::Printf(TEXT(" | gridMs=%.1f jobMs=%.1f (grid %.1f%% of job)"), AccumLevel0GridMs,
 			                             AccumLevel0JobMs, 100.0 * AccumLevel0GridMs / AccumLevel0JobMs);
+			// Per-JOB normalisation plus the cycle probe. Read gridGHz first: the
+			// grid build is exactly 1156 Amplifier::column calls in every level-0
+			// job ever dispatched, so gridKcyc (thousands of retired cycles per
+			// job) is a fixed-work number, and gridGHz = gridKcyc / gridUs is the
+			// rate the thread actually ran at. If ms/job rises while gridKcyc
+			// holds and gridGHz falls, the job was descheduled or downclocked --
+			// contention. If gridKcyc rises with it, the work itself got more
+			// expensive -- cache/memory pressure. See FJobResult::JobCycles.
+			if (AccumLevel0Jobs > 0)
+			{
+				const double N = double(AccumLevel0Jobs);
+				const double GridUsPerJob = 1000.0 * AccumLevel0GridMs / N;
+				const double GridKcycPerJob = double(AccumLevel0GridCycles) / N / 1000.0;
+				const double JobUs = 1000.0 * AccumLevel0JobMs / N;
+				const double JobKcyc = double(AccumLevel0JobCycles) / N / 1000.0;
+				GridSuffix += FString::Printf(
+					TEXT(" | jobs=%lld perJob jobUs=%.0f jobKcyc=%.0f jobGHz=%.2f | gridUs=%.0f gridKcyc=%.0f gridGHz=%.2f")
+					TEXT(" cycPerColumn=%.0f"),
+					(long long)AccumLevel0Jobs, JobUs, JobKcyc, JobUs > 0.0 ? JobKcyc / JobUs : 0.0, GridUsPerJob,
+					GridKcycPerJob, GridUsPerJob > 0.0 ? GridKcycPerJob / GridUsPerJob : 0.0,
+					double(AccumLevel0GridCycles) / N / 1156.0);
+			}
 		}
 		const double TotalMs = LevelZeroQuadMsSinceLog[Level] + LevelQuadMsSinceLog[Level];
 		UE_LOG(LogVoxelPerf, Log,
@@ -3861,6 +3964,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		LevelZeroQuadMsSinceLog[Level] = LevelQuadMsSinceLog[Level] = 0.0;
 	}
 	AccumLevel0GridMs = AccumLevel0JobMs = 0.0;
+	AccumLevel0GridCycles = AccumLevel0JobCycles = 0;
+	AccumLevel0Jobs = 0;
 
 	AccumDispatchMs = AccumApplyMs = AccumRemeshMs = AccumUnloadMs = AccumRecomputeMs = AccumTickMs = 0.0;
 	AccumTicks = 0;
@@ -5986,6 +6091,9 @@ void FVoxelWorldImpl::DispatchJobs()
 			{
 				SCOPE_CYCLE_COUNTER(STAT_VoxelWorkerJob);
 				const double JobStartSeconds = FPlatformTime::Seconds();
+				// Paired with JobStartSeconds: wall time and retired cycles for
+				// the SAME interval, which is the whole point (FJobResult::JobCycles).
+				const uint64 JobStartCycles = VoxelThreadCycles();
 
 				VoxelStreaming::FJobResult Result;
 				Result.Key = LevelKey;
@@ -6052,8 +6160,42 @@ void FVoxelWorldImpl::DispatchJobs()
 					constexpr int32 GridEdge = ChunkVox + 2;
 					const int64 BaseVX = int64(Key.X) * ChunkVox;
 					const int64 BaseVY = int64(Key.Y) * ChunkVox;
-					TArray<vxc::ColumnSample> Columns;
-					Columns.SetNumUninitialized(GridEdge * GridEdge);
+					// Where the 34x34 grid LIVES, which is not a detail at this
+					// size. sizeof(vxc::ColumnSample) is 184 bytes (16 B of
+					// stratigraphy + surfaceMat, a 108 B CaveColumn and a 56 B
+					// CavernColumn), so the grid is 1156 * 184 = 208 KB -- far above
+					// any binned small-block pool, i.e. one OS-backed allocation,
+					// commit, first-touch page-fault storm over 52 pages, and free
+					// PER JOB. At the measured level-0 dispatch rate that is
+					// hundreds of MB/s of virtual-memory churn through a shared
+					// allocator, and the number of jobs doing it CONCURRENTLY is
+					// exactly what rises under motion.
+					//
+					// A per-worker-thread scratch buffer removes the allocation
+					// entirely: a job's grid is dead the moment the job returns, no
+					// job outlives its own thread, and level-0 grid work never
+					// nests, so one buffer per thread is sufficient and is reused
+					// for the life of the process (24 workers x 208 KB = 5 MB,
+					// which is what was transiently live anyway).
+					//
+					// BYTE-IDENTICAL by construction: every one of the 1156 cells is
+					// unconditionally assigned by the loop below before anything
+					// reads it, exactly as SetNumUninitialized + assignment did, so
+					// no value from a previous job can survive into this one. Only
+					// the address of the storage changes.
+					//
+					// -VoxelL0GridScratch=0 restores the per-job TArray as the A/B
+					// control (command line, not a cvar, for the -VoxelCoarseMinLevel
+					// reason: -ExecCmds lands after streaming has begun).
+					constexpr int32 GridCells = GridEdge * GridEdge;
+					static thread_local vxc::ColumnSample ScratchColumns[GridCells];
+					TArray<vxc::ColumnSample> HeapColumns; // only populated when the switch is off
+					vxc::ColumnSample* Columns = ScratchColumns;
+					if (!VoxelStreamAdmission::L0GridScratchEnabled())
+					{
+						HeapColumns.SetNumUninitialized(GridCells);
+						Columns = HeapColumns.GetData();
+					}
 					const vxc::Amplifier& Amp = GenPtr->amplifier();
 					// Buried-chunk skip step 1: time the column-grid build apart
 					// from the mesh. These (32+2)^2 Amplifier::column calls are
@@ -6062,6 +6204,7 @@ void FVoxelWorldImpl::DispatchJobs()
 					// the mesh of a uniform chunk cheap -- so this split is what
 					// decides whether the skip is worth building at all.
 					const double GridStartSeconds = FPlatformTime::Seconds();
+					const uint64 GridStartCycles = VoxelThreadCycles();
 					for (int32 LY = 0; LY < GridEdge; ++LY)
 					{
 						for (int32 LX = 0; LX < GridEdge; ++LX)
@@ -6070,6 +6213,7 @@ void FVoxelWorldImpl::DispatchJobs()
 								Amp.column(BaseVX + LX - 1, BaseVY + LY - 1);
 						}
 					}
+					Result.GridCycles = VoxelThreadCycles() - GridStartCycles;
 					Result.GridMs = float((FPlatformTime::Seconds() - GridStartSeconds) * 1000.0);
 
 					// Buried-chunk pre-dispatch skip: reduce the grid this job
@@ -6090,8 +6234,9 @@ void FVoxelWorldImpl::DispatchJobs()
 					{
 						int64 MaxTop = INT64_MIN;
 						int64 MinAir = INT64_MAX;
-						for (const vxc::ColumnSample& Col : Columns)
+						for (int32 I = 0; I < GridCells; ++I)
 						{
+							const vxc::ColumnSample& Col = Columns[I];
 							MaxTop = FMath::Max(MaxTop, VoxelStreaming::ColumnSurfaceTopVoxel(Col));
 							MinAir = FMath::Min(MinAir, VoxelStreaming::ColumnDeepestAirVoxel(Col));
 						}
@@ -6099,7 +6244,7 @@ void FVoxelWorldImpl::DispatchJobs()
 						Result.Band.SolidBelowVoxel = int32(FMath::Clamp<int64>(MinAir - 1, INT32_MIN, INT32_MAX));
 						Result.bBandValid = true;
 					}
-					const auto GridSampler = [&Columns, BaseVX, BaseVY](int64 X, int64 Y, int64 Z)
+					const auto GridSampler = [Columns, BaseVX, BaseVY](int64 X, int64 Y, int64 Z)
 					{
 						const int32 LX = int32(X - BaseVX) + 1;
 						const int32 LY = int32(Y - BaseVY) + 1;
@@ -6198,6 +6343,7 @@ void FVoxelWorldImpl::DispatchJobs()
 					}
 				}
 
+				Result.JobCycles = VoxelThreadCycles() - JobStartCycles;
 				Result.JobMs = float((FPlatformTime::Seconds() - JobStartSeconds) * 1000.0);
 				QueuePtr->Enqueue(MoveTemp(Result));
 				CounterPtr->Decrement();
@@ -6842,6 +6988,9 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			{
 				AccumLevel0GridMs += Result.GridMs;
 				AccumLevel0JobMs += Result.JobMs;
+				AccumLevel0GridCycles += Result.GridCycles;
+				AccumLevel0JobCycles += Result.JobCycles;
+				++AccumLevel0Jobs;
 			}
 			// Per-ring in-flight bookkeeping (see LevelJobsInFlight): every job
 			// DispatchJobs launches produces exactly one result, live or stale,
