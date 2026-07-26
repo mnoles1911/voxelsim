@@ -86,7 +86,34 @@ boilerplate.
    batch, then edit.** The corollary is that a `.ush` edit and its matching
    `.h`/`.cpp` edit must land in the same build before any run, because the two
    halves are versioned independently by the filesystem.
-10. **Line numbers in this plan drift.** `VoxelWorldSubsystem.cpp` is ~10,600 lines
+10. **Frame times are CLAMPED at 400 ms, and a slow enough scene reports a clean
+    null.** *(Mechanism found by Wave E; the survival test below added by
+    Wave B.)* `AWorldSettings::MaxUndilatedFrameTime = 0.4`
+    (`BaseGame.ini:199`) clamps `DeltaTime`, and `UVoxelPerfRunSubsystem` is a
+    tickable **world** subsystem, so the value it samples is **already clamped**.
+    Below 2.5 fps every frame records as exactly `400.000` and each one counts as
+    a hitch — Wave E measured 159 of 159 frames at that value. The danger is not
+    that it is obviously broken; it is that a genuinely terrible configuration
+    has its tail **flattened to a constant** and can therefore score *better* on
+    `max` and `hitchCount` than a merely bad one.
+
+    - **The tell:** `postWarmupMaxFrameMs` exactly `400.000`.
+    - **Which statistics survive, quantitatively, from fields every leg already
+      emits:** every clamped frame is necessarily a hitch, so
+      `postWarmupHitchCount / postWarmupFrameCount` is an **upper bound** on the
+      clamped fraction. **p50 survives below 50%; p95 survives below 5%.** No new
+      instrumentation, and it applies retroactively to every leg anyone has
+      already taken.
+    - A clamped leg's `max` and `hitchCount` are **the clamp, not the scene**.
+      Report them as such; never tabulate them beside unclamped rows.
+
+    Audited across this programme: Wave B's five B7 shipping legs are clean
+    (38.6–50.7 ms). Wave B's B-M surface leg is clamped at a 17.6% bound, so
+    neither its `max`, its `hitchCount` **nor** its p95 is quotable. Wave A's
+    merged legs are clamped too — its verdict is unaffected because it rests on
+    p50/p95 far above the clamp, but its `max` and hitch figures are not scene
+    properties.
+11. **Line numbers in this plan drift.** `VoxelWorldSubsystem.cpp` is ~10,600 lines
    and moves under every PR. Anchor on symbol names — `DispatchJobs`,
    `DrainResults`, `MeshChunkBricks`, `EnsureVolumeOrigin` — and treat the numbers
    as hints. Several quoted here were already stale when this plan was written.
@@ -797,6 +824,30 @@ and is decided on exactly the two statistics the 400 ms clamp corrupts:
 6. Report resident brick count per config as well: a slower drain could **deepen
    finding B-M** rather than being neutral to it, and an interaction between the
    fix and an open finding belongs in the recommendation, not a follow-up.
+
+**The ship criterion, fixed BEFORE the rows exist.** Otherwise the sweep produces
+four rows and a judgement call, which is the situation pre-registration exists to
+prevent. Thresholds are derived from this wave's own measured run-to-run spread
+on the *off* configuration, not chosen for roundness: p95 varied **5.6%** across
+three legs (26.592 / 28.129 / 27.518) and hitch count varied **±11%**
+(26 / 21 / 23). Each threshold below is about **twice** the corresponding noise —
+the smallest increase that can be resolved from noise at all, doubled, so a
+passing config is one whose cost is real but barely detectable.
+
+| tier | hitches | p95 | edit→relit | verdict |
+|---|---|---|---|---|
+| **Ship** | ≤ **1.25×** baseline (≤ 29.1) | ≤ **1.10×** (≤ 30.15 ms) | ≤ **2.0 s** | recommend `voxel.GI.Enabled 1` as the default |
+| **Conditional** | ≤ 1.5× (≤ 35.0) | ≤ 1.15× (≤ 31.5 ms) | ≤ 3.0 s | shippable **only** if the owner accepts a named, quantified cost |
+| **No** | anything worse | | | do not ship; report the knob's whole range |
+
+All tiers additionally require **≥2 unclamped legs** at that setting. A tie
+between tiers resolves **downward**.
+
+**And the recommendation carries finding B-M regardless of which tier is hit.**
+If GI is largely absent under motion, shipping it on by default buys less than
+these numbers suggest — a cheap feature that is mostly not there is a different
+proposition from a cheap feature that works, and the owner gets that sentence
+attached to whichever tier the sweep lands in.
 
 ### Considered and rejected: making the COMPONENT path sample the volume
 
