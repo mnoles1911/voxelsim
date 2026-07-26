@@ -569,6 +569,18 @@ the floor that survives even perfect compaction — a cap would remove roughly:
 | level ≥ 4 | 512 m | 27.5% | ~3.3M |
 | level ≥ 3 | 256 m | 44.7% | ~5.3M |
 
+> **MEASURED 2026-07-26, AND THIS TABLE IS WRONG BY ~45%. Kept visible rather
+> than overwritten, per ground rule 8 — the corrected figures are in §4g.**
+> The flagged assumption below (uniform quads-per-chunk) **held**: 920–1135 quads
+> per chunk across levels, ±10%. The assumption I did *not* flag is the one that
+> failed — that a level's **shadow-visible** share tracks its **pool** share. It
+> does not: only **46%** of level-5 quads are inside any cascade's frustum. Real
+> savings are **0.84M / 2.14M / 4.25M** for caps 4 / 3 / 2, not 1.5M / 3.3M / 5.3M.
+>
+> *The lesson is not "estimate better". It is that the assumption I wrote down was
+> the one that survived, and the one that sank the estimate was the one I did not
+> notice I was making.*
+
 **This rests on one assumption I could not verify and am flagging rather than
 burying: that quads-per-chunk is roughly uniform across levels.** It is plausible
 — the clipmap keeps every chunk at 32³ voxels regardless of level, which is the
@@ -616,6 +628,100 @@ cascade, still immune to the frame-time clamp and to contention. **It is one sho
 leg and no draw-path change.** Not run, because this section was commissioned as a
 costing rather than a measurement, and the shape of the answer is already clear
 enough to decide on.
+
+## 4g. The shadow cap, MEASURED — and one lying instrument caught on the way
+
+Five legs, 2026-07-26. **Every count below is a deterministic counter and is
+unaffected by the box contention described at the end of this section.**
+
+### Pool composition, and the assumption that actually failed
+
+| level | band | pool quads | chunks | quads/chunk | share |
+|---|---|---|---|---|---|
+| 0 | 0–64 m | 2,921,363 | 3,042 | 960 | 22.3% |
+| 1 | 64–128 m | 1,914,289 | 2,029 | 943 | 14.6% |
+| 2 | 128–256 m | 2,046,261 | 2,225 | 920 | 15.6% |
+| 3 | 256–512 m | 2,247,306 | 2,262 | 993 | 17.2% |
+| 4 | 512–1024 m | 2,122,572 | 2,014 | 1,054 | 16.2% |
+| 5 | 1024–2048 m | 1,837,106 | 1,618 | 1,135 | 14.0% |
+
+Sums to 13,088,897 — the pool exactly. **Quads-per-chunk is uniform to ±10%**, so
+the assumption §4f flagged held. (It was even wrong in the direction I guessed:
+coarse chunks carry *more* quads per chunk, not fewer.)
+
+**What failed was the assumption I did not flag.** Shadow-visible share does not
+track pool share. Per-cascade visible-by-level, settled:
+
+| gather | L0 | L1 | L2 | L3 | L4 | L5 | total |
+|---|---|---|---|---|---|---|---|
+| camera | 841,714 | 103,358 | 17,787 | 0 | 0 | 0 | 962,859 |
+| shadow A | 900,242 | 1,109,524 | 1,170,806 | 1,071,005 | 197,477 | 0 | 4,449,054 |
+| shadow B | 2,007,800 | 1,049,697 | 95,316 | 0 | 0 | 0 | 3,152,813 |
+| shadow C | 0 | 152,960 | 753,235 | 1,043,837 | 1,100,871 | 837,688 | 3,888,591 |
+| shadow D | 363,312 | 0 | 0 | 0 | 0 | 0 | 363,312 |
+| **shadow total** | 3,271,354 | 2,312,181 | 2,019,357 | 2,114,842 | 1,298,348 | **837,688** | **11,853,770** |
+
+Only **837,688 of level 5's 1,837,106 pool quads (46%)** are inside any cascade.
+So:
+
+| cap | drops | **measured** saving | superseded estimate |
+|---|---|---|---|
+| **4 (default)** | L5 | **837,688** | ~1.5M |
+| 3 | L4, L5 | **2,136,036** | ~3.3M |
+| 2 | L3, L4, L5 | **4,250,878** | ~5.3M |
+
+### Leg B: predicted, then confirmed exactly
+
+Leg A predicted `cappedQuads = 837,688`. Leg B measured **837,688**, to the quad,
+on the one cascade holding level-5 geometry and `0` on the other three.
+
+- **Submitted shadow quads fell 1,457,710/frame** — *more* than the visible
+  removal, because dropping 756 far runs also collapses spans the merge was
+  paying to cover. A bonus, not a discrepancy.
+- **Camera untouched:** camera visible identical at 962,859 in both legs.
+- **58 EMPTY events in leg B — and 58 in leg A**, all `nothing visible`, none
+  `all capped`. The cap introduced **zero** new empty cases.
+
+### The dangerous path, forced — and the instrument that lied
+
+`AllCapped` never fired in either measured leg, so it was forced with
+`GPUShadowMaxLevel -1`. It reported **185,612,113 shadow quads per camera gather
+against a 13,088,897-quad pool**.
+
+The magnitude is not what caught it. **The frame time is**: the same run was
+**3.5× faster** than the un-capped config while apparently drawing **14× more**.
+The draw was correct; `RecordGather` was reading `Elements[0].NumPrimitives` off a
+**recycled** `FMeshBatch` before populating it. Fixed by passing the count in.
+
+**Positive control for the census, all three legs on the counter that matters:**
+
+| leg | config | shadow quads / camera gather | S |
+|---|---|---|---|
+| A | uncapped | 25,479,126 | 13.69 |
+| B | cap 4 (default) | 24,021,416 | 12.80 |
+| C2 | all capped | **0** | **1.000** |
+
+The zero is bracketed by two non-zero readings of the same counter, and the camera
+half reads 2,026,682 **on the same log line** as the shadow zero — so a census
+that silently failed to run is excluded, not assumed against.
+
+### Two caveats, both load-bearing
+
+**The frame times above are contaminated and are not performance figures.**
+Another wave held the box concurrently throughout. The 5.85 ms / 20.73 ms pair is
+used here **only as corroboration that the census's zero is real** — a 3.5× gap is
+far outside anything contention produces, and it points the same way as the
+counts. Do not quote either number as a measurement of anything.
+
+**The visual question is open.** Four screenshots, one session, within-config
+floor 0.13%/0.12% against cross-config 0.18%/0.17% — consistent in direction but
+~0.05pp above floor. **The anchor is a coastal vista: ocean, sky, distant snow
+islands, high sun.** There is almost no distant terrain casting long shadows and
+little middle-distance relief to lose self-shadowing on, so the shot cannot answer
+the question it was taken for. It establishes only that nothing gross broke and no
+stale shadow-map artefact appeared at this pose. An inland low-sun anchor with
+middle-distance relief is owed, and it is a human judgement — see
+`manual-verification-checklist.md` item 7.
 
 ## 5. Why compaction, and not "indirect draw plus a base"
 
