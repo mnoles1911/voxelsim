@@ -60,7 +60,7 @@ frustum, with the pool unmoved at 18.58 → 19.05 ms while the component path go
 
 ---
 
-## Wave B — Voxel GI as a GPU volume (steps 3–5)
+## Wave B — Voxel GI as a GPU volume (steps 3–5) — **LANDED 2026-07-26 (PR #131), and GI did NOT ship on**
 
 **The point is not throughput.** Today GI is baked into vertex colours at mesh
 time, so a dig re-shades a chunk partly just to refresh its lighting. Sampling a
@@ -95,6 +95,53 @@ by construction only.
 **Verdict: worth doing, and the most clearly valuable GPU work left.** It stands
 regardless of where meshing runs, and it improves something a player sees (cave
 lighting responding to digging).
+
+> **LANDED 2026-07-26 (PR #131). The owner asked for GI on by default; the
+> measurement said no, and B7's own escape clause was used as written.** Both
+> `voxel.GI.Enabled` and `voxel.GI.Volume` remain **0** on main
+> (`VoxelGI.cpp:36`, `VoxelGIVolume.cpp:15`). `-VoxelGIOn` is the opt-in.
+>
+> Component path, pinned pose, one binary, command line verified against
+> `LogInit` on every leg:
+>
+> | | p50 | p95 | max | hitches |
+> |---|---|---|---|---|
+> | GI off (3 legs) | 23.25 | 27.41 | 40.9 | 23.3 |
+> | GI on (2 legs) | 23.37 | 31.39 | 49.0 | 74.0 |
+> | delta | +0.6% | **+14.9%** | +19% | **×3.2** |
+>
+> p50 is inside the noise; p95 and hitch count do not overlap. **GI is free at the
+> median and expensive in the tail**, and a 3.2× hitch count is what a player
+> actually feels. This independently reproduces the shape already on record for
+> this module from the `voxel.GI.LegacyProxyRebuild` A/B — "mostly a TAIL and
+> throughput problem, not a median one". Two unrelated experiments agreeing on the
+> shape is worth more than either alone.
+>
+> A **third** off leg exists because the pre-registered 0.5% rule rejected the
+> first pair at 1.97%. A rule that only ever confirms is not a rule.
+>
+> **What would change the answer:** `voxel.GI.MaxChunkRefreshesPerFrame`
+> (default 4) bounds the re-shade drain the tail comes from. The sweep is owed,
+> judged on hitches and p95 rather than p50, and it must also report the
+> edit-to-relight latency it buys back — so the choice is between two named
+> things rather than one number.
+>
+> Also landed: **B1 chose Scheme A, not Scheme B** — the measurement contradicted
+> the plan's expected outcome and the plan was wrong, not the measurement. B2's
+> re-centring ships **disabled twice over** (`voxel.GI.Volume 0`, and its only
+> consumer `voxel.Stream.GPU 0`), with the transient stated exactly as measured:
+> bounded to 8 frames, camera's row last, nearest stale row 3.3 m away — and
+> explicitly **not** as "confined to the far field", because peak stale texels hit
+> 95.4% and that is not a far-field number. Ordering controls **where** staleness
+> is, not **how much**.
+>
+> **Still owed and recorded as unverified rather than quietly dropped:** B5's
+> dig-shaped test, the Dim 256 coverage run, and B-M's underground control. B-M is
+> confirmed-but-open: the surface fixture pins Z while terrain drops away, so the
+> camera flew out of GI range for most of the circle (`camAboveSurface` 62–128 m
+> against a 70 m radius) — but bricks stayed 0 even at the 62 m minimum, where a
+> ~32 m disc of terrain sits inside the sphere. The fixture explains most and not
+> provably all of it.
 
 ---
 
