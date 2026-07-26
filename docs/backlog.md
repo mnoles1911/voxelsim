@@ -192,6 +192,68 @@ which is not needed to run inference. Invoke the module function directly —
 
 ---
 
+## 6b. GPU streaming (ADR-0006), after G0-G5 landed
+
+**Does the pool actually make frames faster? Unmeasured, and the harness cannot
+currently say.** G5 flipped `voxel.Stream.GPU` on by default. The parity case is
+solid (17.4% -> 4.3% of pixels differing, against a measured 1.1% noise floor)
+and the mechanism is verified as a count (9,822 chunks / 8,813,242 quads as ONE
+primitive and ONE draw, against 9,822 primitives). **The frame-time claim is
+not** — an earlier p95/hitch table was retracted after twelve legs showed the
+ranges overlapping, and a follow-up designed to remove streaming noise (anchor
+stationary, cascade fully settled) still saw the component path render the
+identical scene at 43 fps and 103 fps in two runs. Leading suspect is camera
+orientation: the anchor is a position, and the pawn's yaw/pitch are neither
+pinned nor logged. **Unblocks:** a fixed-camera perf harness that also LOGS the
+pose. Start from `-VoxelFloodTest` / `Tools/capture_terrain_shots.ps1`. Until
+then make no frame-time claim in either direction, including a negative one.
+Full write-up in `docs/streaming-handoff.md`.
+
+**GI volume steps 3-5.** Steps 0-2 landed: the pooled path feeds the light
+field, the volume is sampled per pixel, and the encode matches the CPU sampler at
+**0.000 mean error** (with a deliberate half-cell-shifted control at 0.565 to
+prove the harness is not comparing a thing against itself). Remaining: **(3)**
+decide Scheme A vs B from the measured horizontal error (6.165 bytes — the number
+that decision turns on); **(4)** camera-following re-centring, currently a static
+origin, so at the default `VolumeDim=64` only 36 of ~1,950 resident bricks are
+inside the volume; **(5)** retire baked GI on the pooled path, which is the
+actual prize — a dig would then update lighting by texel upload instead of
+re-meshing. Design and staging in `docs/gpu-gi-volume-design.md`. Also untested:
+the X-run upload merge on a dig's contiguous neighbourhood (measured at 1.4
+bricks/run in steady state, but the dig case is what it was built for), and
+zero-on-revoxelize / zero-on-evict, which are correct by construction only.
+
+**Per-chunk debug tints — the last G4 item, and the only one that still needs the
+material asset.** Storage is already solved (`ChunkParams.w` is free). The route
+is a `float4` `TexCoords` interpolant with the tint packed in `.zw`. **The
+decision that makes it safe:** encode identity as ZERO, not white — the component
+path supplies only a `float2` texture coordinate, so `TexCoord0.zw` arrives as
+zero there regardless of the graph, and a naive unpack treating 0 as black would
+render every component-path chunk black the moment the material is regenerated.
+Debug-only, so its absence costs nothing in play.
+
+**`voxel.Stream.AdmissionBandSkip` is off, and should stay off** until two things
+are checked: its edit veto uses `EditedFootprintMinZ` where the dispatch site
+uses `ChunkHasEditedBrick`, and the argument that they agree is reasoning rather
+than measurement; and frame rate collapsed with it on (279 -> 89 ticks/5 s) for
+reasons never explained. It reaches ~4% of the waste it was aimed at anyway (89
+skips against 2,186), so there is little to gain.
+
+**R0 to 128 m is now unblocked** — `RingPresets` became a runtime accessor
+(`GetRingPresets()`), overridable via `-VoxelRingInnerMeters=` /
+`-VoxelRingOuterMeters=`. Moving R0 itself is still an open call, and the
+`+9.2%` resident-chunk cost of the seam-padding fix is the thing to weigh it
+against.
+
+**Ring cross-fade: do not build it for the pooled path.** Re-tested after the
+seam fix gave the annuli their overlap band, and it still produces see-through
+patches at ring boundaries. The G0 checklist listed it first; it is the one item
+on that list that should not be built. Reasoning and the likely root cause (both
+rings fading simultaneously across the shared band rather than crossing over) in
+`docs/gpu-g4-parity-plan.md`.
+
+---
+
 ## 7. Measured and CLOSED — do not re-litigate
 
 Recorded so these are not re-attempted. Each was measured, not argued.
