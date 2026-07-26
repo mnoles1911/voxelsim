@@ -139,6 +139,49 @@ does not separate main-view gathers from shadow gathers. Therefore:
 > **The predicted 4.7 ms at the horizon is an upper bound on what main-view
 > compaction can recover, not an estimate of it.**
 
+### The instrument that produced those numbers is structurally blind to shadow gathers
+
+**Found before asking for box time, in Wave A's own retained logs.** Across the
+five sessions in `ue-project/Saved/Logs` that contain cull lines there are **112
+`cull: runs=` samples and every single one says `shadowGather=0`.**
+
+That is not evidence the pool has no shadow gathers. **It is an aliasing
+artifact, and the arithmetic is exact.**
+
+`BuildCulledRanges` logs on `CullLogCounter.Increment() % 600 == 1`.
+`FThreadSafeCounter::Increment()` returns the **post**-increment value
+(`ThreadSafeCounter.h:52-55`), so samples land at counter values 1, 601,
+1201, … — that is, at gather ordinals 0, 600, 1200, …. With a constant `G`
+gathers per frame (main view plus shadow cascades), the sampled gather's index
+within its frame is `(600k) mod G`, which is **0 for every k whenever `G`
+divides 600**. And 600 = 2³·3·5², so every plausible value of `G`
+(1, 2, 3, 4, 5, 6, 8, 10, 12…) divides it.
+
+**The periodic log has been sampling gather index 0 — and only gather index 0 —
+in every leg ever run.** The corroborating tell was there all along and read as
+stability: `visibleQuads=164534` is identical *to the digit* across many samples
+and across both straight-down legs. A rotating sample could not do that; an
+aliased one must.
+
+Two consequences, pulling in opposite directions:
+
+- **Good for the ratios.** Wave A's 2.72× and 1.62× over-draw figures describe
+  the main view specifically, which is exactly the quantity compaction targets.
+  They are not a blend of main and shadow.
+- **Bad for the slope.** The ~1.19 µs / 1000 quads model divided a **whole-frame**
+  Δp50 by a **main-view-only** Δ`drawnQuads`. If shadow gathers also draw the
+  pool — and they do go through the same proxy — the true Δquads between uncull
+  and cull is larger than the logged one, so the **true slope is smaller than
+  1.19** and the saving compaction can recover is correspondingly less. The two
+  poses agreeing to 1.1% does not rescue this: both were measured with the same
+  aliased instrument, so a shared bias cancels in the cross-validation and
+  survives into the estimate.
+
+**The fix is one character of period, not a new harness.** Make the log period
+coprime with any plausible `G` — 601 is prime — or, better, accumulate
+per-gather-type totals across a frame and log those, which answers the question
+directly instead of by sampling.
+
 ### The first experiment, and it can fail
 
 Split the existing `drawnQuads` / `visibleQuads` counters by gather type — the
@@ -217,6 +260,13 @@ falsifiable, and the early ones deliberately have a known-exact correct output.
 
 ### G0 — the gather split (no code on the draw path)
 Per §3. Counts only. Decides whether the wave's stated value is real.
+
+Two edits, both inside `BuildCulledRanges`'s logging and neither on the draw
+path: break the 600-aliasing, and accumulate `visibleQuads` / `drawnQuads` per
+gather type rather than sampling one gather. **Both are in
+`VoxelGpuPoolComponent.cpp`, which Wave G is holding off until D1 merges** — so
+G0 is written and ready but cannot land first, which is the one place the file
+ownership order and the experiment order disagree.
 
 ### G1 — an indirect draw that reproduces the current full draw, bit for bit
 The minimum machinery that can prove the draw mechanism:
