@@ -7283,3 +7283,73 @@ and each job's measured wall time absorbs more pool contention.
 Streaming totals identical across every run on both sides: `loaded=9822
 quads=8828367 tracked=16417`, anchor `(-8448000, 5376000, 55054)` first sample
 to last.
+
+## Streaming under motion: what the coarse fast path fixed, and what it did not (2026-07-26)
+
+The coarse flat-grid change (PR #116) is measured at **-39.3% meshing work under
+sustained motion**. This entry records what that did and did not move
+end-to-end, because the two are not the same and the difference redirects the
+next piece of work.
+
+### Meshing work, 20 m/s scripted flight, per 5 s window
+
+| ring | p50 before | p50 after |
+|---|---|---|
+| R0 | 2.45 ms | 2.97 ms |
+| R1 | **9.32 ms** | **2.63 ms** |
+| R2 | 8.58 ms | 3.31 ms |
+| R3-R5 | 9.9-10.6 ms | 3.0-3.5 ms |
+| **total work/window** | **24,385 ms** | **14,813 ms** |
+
+R0 rising is contention, not regression: level-0 code is untouched, the cascade
+now fills in less wall time, and more concurrent jobs means each job's measured
+wall time absorbs more pool contention.
+
+**This flips the priority.** Motion meshing work was R0 33% / R1 46%; it is now
+**R0 65% / R1 24%**. Level 0 is the dominant cost, so GPU meshing (level-0 only)
+now targets the majority of what remains rather than a quarter of it.
+
+### But the backlog barely moved, and that is the interesting part
+
+R0 pending fell from ~158 to ~116 on average. **R1 pending did not move at all**
+— 297-369 before, 297-369 after — despite R1 meshing getting 3.5x cheaper.
+
+The reason: `kRingCapShare` (`VoxelWorldSubsystem.cpp:2000`) gives R1
+`0.18 x 2048 = 369` queue slots. **R1's backlog was pinned at its policy cap the
+whole time, not meshing-bound.** Dispatch rates barely changed either (R0
+3326->3228, R1 1199->1345/window) — the system requests the same chunks; it just
+spends less CPU producing them.
+
+So the -39% is real headroom (less contention, more CPU for everything else) but
+it is NOT, on its own, the fix for "terrain lags behind movement". What limits
+catch-up at speed is the admission/dispatch policy.
+
+### The obvious next move is wrong, and was tested
+
+Raising `-VoxelPendingJobCap` from 2048 to 8192 looks like free throughput now
+that meshing is cheap. It is not:
+
+| | R0 loaded | R0 pending | R1 loaded | R1 dispatch/win |
+|---|---|---|---|---|
+| cap 2048 | 2,422 | 132 | 1,062 | 1,345 |
+| cap 8192 | 2,670 | 1,547 | **324** | **112** |
+
+R0's queue grows without bound, the nearest-first dispatch keeps choosing R0, and
+**R1 is starved** — its dispatch rate collapses 12x and its resident count drops
+to a third. That is coarse terrain going missing behind the near field, i.e. the
+LOD-boundary symptom this whole programme exists to remove.
+
+**The caps are load-bearing: they enforce ring fairness, not a throughput
+ceiling.** Anything that touches them has to keep the per-ring share balanced, and
+`kRingCapShare` is the thing to reason about, not the total.
+
+### What this means for the next stage
+
+Two separate levers, and they are not interchangeable:
+
+1. **CPU cost per chunk** — the coarse fast path took 39%. Level-0 GPU meshing is
+   the next chunk of it, and is now worth more than it was (65% of the remainder).
+2. **Time-to-visible under motion** — governed by admission and per-ring dispatch
+   policy. Not yet investigated, and it is the one that matches the reported
+   symptom most directly. The measurement to take first is per-chunk latency from
+   admission to applied, per ring, at speed.
