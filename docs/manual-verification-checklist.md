@@ -13,11 +13,11 @@ Current defaults, so you know what you are looking at without setting anything:
 
 | cvar / switch | default | meaning |
 |---|---|---|
-| `voxel.Stream.GPU` | **0** | terrain renders on the per-chunk component path |
-| `voxel.Stream.GPUCull` | **0** | pooled frustum cull is off (it still drops geometry) |
+| `voxel.Stream.GPU` | **0** | terrain renders on the per-chunk component path. The reason has changed: not "it drops geometry" (fixed) but that the pooled path costs ~0.15 ms **more** than the component path at a down-facing pose. The fix is compaction, which is not built. |
+| `voxel.Stream.GPUCull` | **1** | pooled frustum cull is **on**, and its output is verified pixel-identical to the single full draw. The pool's cost now tracks what is on screen. |
 | `voxel.Water.GPU` | 0 | water on the per-chunk path |
-| `voxel.GI.Enabled` | 0 | voxel GI off |
-| `voxel.GI.Volume` | 0 | GPU GI volume off (and it only has a consumer under `voxel.Stream.GPU 1` — see §6) |
+| `voxel.GI.Enabled` | **0** | voxel GI off. Measured cost of turning it on: free at the median (+0.6% p50) but **3.2× the hitches and +14.9% p95**, neither overlapping the off-baseline. |
+| `voxel.GI.Volume` | 0 | GPU GI volume off. Additionally it has **no consumer** under `voxel.Stream.GPU 0` — only the pooled vertex factory samples it, so with the default above it changes nothing at all. See §6. |
 | `-VoxelCoarseGrid` | on | coarse chunks use the flat-grid fast path |
 | `-VoxelL0BrickSkip` | on | level-0 skips provably-empty bricks |
 
@@ -82,9 +82,24 @@ Holding the pose fixed is the whole trick — it is what my headless harness cou
 not do, and without it the run-to-run spread swamps the difference. Two identical
 runs at an unpinned pose gave me 43 fps and 103 fps on the same settled scene.
 
-Expect the pooled path to be **slower** here (~23% at p50, more when little is on
-screen) because it has no per-chunk culling yet. That is known, measured, and why
-it is not the default.
+**SUPERSEDED — do not test against the old expectation.** This used to say to
+expect the pooled path to be *"~23% slower at p50, more when little is on
+screen, because it has no per-chunk culling yet"*. The cull now exists, is on by
+default, and is verified pixel-identical to the single full draw. **If you
+measure against the old text you will conclude the cull did not work.**
+
+What to expect now: the pooled path is **level with the component path at the
+horizon**, and **~0.17 ms behind at a down-facing pose**. That remaining gap is
+why `voxel.Stream.GPU` is still 0; the fix is draw compaction, which is not
+built. So the interesting reading here is no longer "how much slower" but
+**whether the two are close enough that you would not notice** — and, at a
+down-facing pose, whether the pool still costs anything when almost nothing is
+on screen.
+
+If you also want to see the GI cost from §6, note it is **not** visible in a
+still-camera `stat unit` reading: it is free at the median and lives entirely in
+the tail (3.2× hitches, +14.9% p95). Watch for intermittent stutter over a
+minute rather than a worse steady number.
 
 ## 4. Water (optional)
 
