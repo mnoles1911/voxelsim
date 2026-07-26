@@ -118,6 +118,7 @@ uint ceilSqrtU(uint v)
 // Mirrors VoxelStreaming::ColumnSurfaceTopVoxel.
 int64_t columnSurfaceTopVoxel(int surfaceMm)
 {
+    // lint-shader-ub: allow SIGNED_DIVISION - both operands are positive compile-time constants (kVoxelSizeMm is 100), so this folds to 50 and no sign is involved; worldgen.ush writes the identical expression and lints clean there, where the constant is declared in-file
     return floorDiv((int64_t)surfaceMm - (int64_t)kVoxelSizeMm / 2, (int64_t)kVoxelSizeMm);
 }
 
@@ -153,6 +154,7 @@ int64_t columnDeepestAirVoxel(GpuColumnSample col, GpuCaveColumn cave, GpuCavern
         if (maxCaveDepthMm > kBandI64Min)
         {
             carveMin = min(carveMin,
+    // lint-shader-ub: allow SIGNED_DIVISION - both operands are positive compile-time constants (kVoxelSizeMm is 100), so this folds to 50 and no sign is involved; worldgen.ush writes the identical expression and lints clean there, where the constant is declared in-file
                            floorDiv((int64_t)col.surfaceMm - maxCaveDepthMm - (int64_t)kVoxelSizeMm / 2,
                                     (int64_t)kVoxelSizeMm));
         }
@@ -173,6 +175,7 @@ int64_t columnDeepestAirVoxel(GpuColumnSample col, GpuCaveColumn cave, GpuCavern
             minZAbsMm = max(minZAbsMm,
                             (int64_t)col.surfaceMm - (int64_t)col.bedrockDepthMm + kCaveBedrockMarginMm);
             carveMin = min(carveMin,
+    // lint-shader-ub: allow SIGNED_DIVISION - both operands are positive compile-time constants (kVoxelSizeMm is 100), so this folds to 50 and no sign is involved; worldgen.ush writes the identical expression and lints clean there, where the constant is declared in-file
                            floorDiv(minZAbsMm - (int64_t)kVoxelSizeMm / 2, (int64_t)kVoxelSizeMm));
         }
     }
@@ -246,7 +249,9 @@ void BandReduceMain(uint3 gtid : SV_GroupThreadID)
     {
         // Raw voxel z. The CPU applies the +1/-1 widening and the clamp -- see
         // the comment on OutBand.
+        // lint-shader-ub: allow UNGUARDED_WRITE - literal indices into a buffer the host creates with exactly 2 elements (AddRegionPasses: CreateStructuredDesc(sizeof(int32), 2)); there is no index to bound
         OutBand[0] = (int)gsTop[0];
+        // lint-shader-ub: allow UNGUARDED_WRITE - same 2-element buffer, literal index 1
         OutBand[1] = (int)gsAir[0];
     }
 }
