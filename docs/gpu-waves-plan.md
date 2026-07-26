@@ -2187,6 +2187,116 @@ footprint's column or a tile of neighbours and slice the quad stream by
 `meshBrickIndex`. Cap: `MaskCount ≤ 65,536` (single-workgroup scan) ⇒ ≤1,365
 interior bricks per dispatch.
 
+#### D4 counters — settled 2026-07-26, from the code. **DESIGN ONLY, nothing built.**
+
+The plan decided `LevelJobsInFlight[]` means *completed* and left `JobsInFlightCounter`
+implied. Both are settled here, with the consequences the decision actually has.
+
+**What the two counters mean TODAY — they already differ, which the plan did not say.**
+
+| counter | inc | dec | thread | what it gates |
+|---|---|---|---|---|
+| `JobsInFlightCounter` | `DispatchJobs`, game | **worker**, immediately after `ResultsQueue.Enqueue` | atomic, mixed | the dispatch loop itself: `while (JobsInFlightCounter.GetValue() < MaxJobsInFlight)` |
+| `LevelJobsInFlight[]` | `DispatchJobs`, game | `DrainResults`, game, **before** the stale `continue` | game only | the per-ring slot floor |
+
+So `JobsInFlightCounter` already means *"work outstanding"* and `LevelJobsInFlight[]`
+means *"results outstanding"*, and today's gap between them is one `DrainResults`
+pass. **Neither has ever meant "dispatched".**
+
+**The ruling: COMPLETED, for both, and the GPU sites are the exact analogues.**
+
+- `JobsInFlightCounter.Decrement()` → the manager's `OnJobComplete`, at the moment
+  the result is pushed to `ResultsQueue`. That is precisely what the worker does
+  today, one line apart. `OnJobComplete` fires on the **game thread** from inside
+  `FVoxelGpuMeshJobManager::Tick()`, where the worker's decrement is off-thread —
+  `FThreadSafeCounter` covers both, so no change is needed, and the GPU path is if
+  anything *tighter* because both decrements can land in the same frame.
+- `LevelJobsInFlight[]` — untouched. It already decrements in `DrainResults` before
+  the stale `continue`, which is what "completed" requires and what the quoted
+  invariant protects.
+
+**Why not "dispatched", stated as the thing it costs rather than as a preference.**
+A GPU job's lifetime spans the manager's queue wait, the dispatch, TWO readback
+phases and the poll quantisation (one game-thread tick each). Under "dispatched"
+the dispatch loop would free its slot immediately and a ring could re-admit the
+same columns repeatedly before the first result landed. Under "completed" the
+`MaxJobsInFlight` cap has to absorb GPU latency as well as work, so the cap
+sizes against *latency × rate* rather than against worker count. That is the
+real cost of this ruling and it is the number to watch first.
+
+**Consequence 1 — TWO CAPS IN SERIES, and that is one knob too many.**
+`FVoxelGpuMeshJobManager` has its own `MaxInFlight` (default 8) and `Submit`
+queues rather than rejects beyond it. So a GPU job is gated twice: by
+`JobsInFlightCounter < MaxJobsInFlight` at dispatch, and by the manager's cap
+after it. With both binding, a throughput number cannot be attributed to either.
+**The manager's cap must be set so it never binds** (≥ `MaxJobsInFlight`), leaving
+`JobsInFlightCounter` the single throttle. This is the plan's own "one knob at a
+time" rule, and the recorded catastrophe behind it — floors `{0,2,3,4,4}`
+reserving 13 of 24 slots and collapsing throughput from 49,179 chunks to 558 — is
+what a second invisible constraint looks like.
+
+**Consequence 2 — `MaxJobsInFlight` does not bound the result queue, and never did.**
+`DrainResults` has a budget (`kMinAppliesPerFrame` / `ApplyBudgetSeconds`) and
+breaks out with results still queued. `JobsInFlightCounter` has already decremented
+for those, so the dispatch loop keeps launching while the drain backlog grows.
+True on the CPU path today; GPU latency does not change the mechanism, only the
+depth. Recorded so it is not "discovered" as a GPU regression.
+
+**Consequence 3 — `StaleResultsDiscarded` rises, and it is throughput, not correctness.**
+The window is `GenerationId` snapshotted at dispatch against `Rec->GenerationId`
+at drain, bumped by `MarkChunkDirtyForRemesh`. A longer job lifetime widens it
+roughly proportionally, so the GPU fork's stale rate should exceed the CPU
+fork's. Three things bound the damage:
+
+- **D4 is level 0 and NON-EDITED chunks only.** `NeedsOverlayAwarePath` already
+  routes edited chunks to the game thread, so the exposed population is exactly
+  the one nobody is digging in. The residual is an edit *arriving* on a chunk that
+  had no overlay at dispatch.
+- A stale result costs **one wasted GPU job**, not a slot: the `LevelJobsInFlight[]`
+  decrement happens *before* the `continue`. That ordering is the whole invariant
+  and must survive the fork verbatim.
+- It is directly measurable as `StaleResultsDiscarded` per dispatched job, CPU
+  fork vs GPU fork, **in one run** under `voxel.Stream.GPUMaxLevel`. That is a
+  control that can fail: if the GPU fork's rate is not higher, the latency model
+  is wrong.
+
+**Consequence 4 — the cold-band throttle's backstop starts firing without a bug.
+This is the sharpest one and it degrades a zero-tolerance signal.**
+`kBlindJobMarkTimeoutSeconds = 5.0`, justified in the code as *"generous next to a
+worker job (measured p50 well under 100 ms)"*. `ColdBandMarkTimeoutsSinceLog` is
+documented as *"Should be ZERO on a healthy run — any non-zero value means a
+launch path produced no result, which is the bug this backstop exists to survive,
+and is worth chasing."*
+
+A GPU job's `SubmitToDeliverMs` is **unmeasured**, and the one datapoint in hand is
+adverse: the D2/D3 run recorded `dispatch->ready` **max 921 ms** on its warmup leg
+— phase 1 of two, before shader-compile and PSO warmup had settled. If delivery
+ever crosses 5 s the mark ages out *while the job is legitimately in flight*, a
+second blind job launches for that footprint, and a counter whose documented
+meaning is "there is a bug" fires when there is none.
+
+Note the existing ordering, which is now load-bearing: the manager's own
+`TimeoutSeconds` is **10.0**, twice `kBlindJobMarkTimeoutSeconds`. So a genuinely
+hung GPU job always ages out the mark before the manager gives up on it — the
+throttle recovers first, which is the right way round, but it also means the
+5 s mark can never be the thing that catches a hung job.
+
+**Recommendation: do NOT raise the timeout.** Raising it slows recovery from a
+genuine strand, and the throttle *"exists to save work, not for correctness"* —
+an extra blind job is cheap, a stranded column is not. Instead **split the
+counter** so "mark aged out while a GPU job was still in flight" is countable
+separately from "a launch path produced no result". Otherwise the fork silently
+destroys the only diagnostic for the bug that has already been fixed twice here.
+
+**Consequence 5 — shutdown has no `UE::Tasks::TTask` to wait on.**
+`Deinitialize` calls `WaitForInFlightTasks()` over `InFlightTasks`, and a GPU job
+adds nothing to that array. The manager's `CancelAll()` delivers `Cancelled` for
+every outstanding job — i.e. it *enqueues results* — so it must run **before** the
+structures those results touch are torn down, and the raw `Impl`-owned pointers a
+CPU job captures have no GPU analogue holding them alive. Unresolved and flagged:
+this is the one place where "exactly one outcome" and teardown ordering interact,
+and it is not covered by any existing test.
+
 ### D6 — move the footprint band to the GPU — **costed and APPROVED 2026-07-26, not yet built**
 
 Costed *before* wiring, deliberately, so the answer could shape the build. It
@@ -2425,6 +2535,67 @@ Approach:
 
 **Falsified if:** any level cannot be made bit-exact against the CPU. Stop at the
 last level that passes and ship that as `GPUMaxLevel`; do not relax the gate.
+
+#### D5.3 — the ring skirt, scoped 2026-07-26. **READING ONLY, nothing started.**
+
+*"Mirror `RingSkirtMask` into the kernel as a uniform" is not wrong, but it is
+not sufficient, and the reason is D4's batching.*
+
+**Where the CPU actually applies it.** Not at the mask and not in the generator —
+in the **sampler** `meshBrick` calls. `MeshChunkBricks` wraps `MaterialAt` in a
+lambda that returns `MAT_AIR` when the sample is outside the **render chunk** on a
+flagged axis, tested in **chunk-relative** coordinates
+(`Xc = ChunkBaseX + X; Xc < 0 || Xc >= ChunkVox`). Only reads *outside* the chunk
+are affected, which is exactly why within-ring chunks stay byte-identical.
+
+**Why a uniform on `VoxelizeMain` is the wrong place.** The GPU splits what the
+CPU fuses: `VoxelizeMain` writes a **cell grid** for the whole region, and
+`MeshCountMain`/`MeshEmitMain` read it. Forcing halo cells to `MAT_AIR` in that
+grid is safe **only while a region contains exactly one chunk**. The moment D4
+batches — which the section above explicitly wants, to kill the 3.4× halo waste —
+a cell in the shared interior is **one chunk's interior and the neighbour's
+apron**, and a single override is necessarily wrong for one of them. It would
+corrupt real geometry, not merely fail to add a wall.
+
+**So the skirt belongs in the mesher kernel, at the neighbour read**, keyed on the
+interior brick's own chunk and the face being crossed. That mirrors the CPU
+exactly (same place, same chunk-relative test) and it composes with batching,
+because the decision is per-*reading*-chunk rather than per-cell.
+
+**D2 already built half of it.** The mesher needs "which chunk is this interior
+brick in, and where in it" — which is precisely what `VXC_MESH_CHUNK_LOCAL`'s
+`maskChunkLocalOrigin` computes, `% kBricksPerChunkEdge` and all. The skirt needs
+that same brick→chunk decomposition plus a 4-bit mask per chunk. It is not new
+machinery; it is a second consumer of D2's.
+
+**What the API needs, and it is not a scalar.** `ComputeRingSkirtMask` is a pure
+function of the chunk key, the live **anchor** and `RingPresets`, computed on the
+game thread and baked per job. For a batched region of N chunks that is **N masks
+— a small buffer indexed by chunk**, not a `SHADER_PARAMETER(uint32, …)`. Sizing
+it is the API change; deriving it in-kernel is not an option, since the anchor is
+not something the kernel knows.
+
+**The determinism consequence, which is the part worth having read this for.**
+The skirt makes a chunk's mesh a function of the **camera anchor**, which is not
+part of the world seed. So the digest gate structurally **cannot** cover it — the
+fixtures have no anchor, and a mesh that changes as the player moves is not a
+digest-able quantity.
+
+That splits D5's gating in two, and both halves are cheap:
+
+1. **Per-level bit-exactness runs with `RingSkirtMask = 0`** — the existing gate,
+   unchanged, extended by a level parameter as D5.2 says.
+2. **The skirt gets its own exhaustive test**: one chunk, all **16** mask values,
+   GPU vs `MeshChunkBricks` called with the same mask. Sixteen comparisons covers
+   the entire input domain of the feature, which is a rare luxury — take it rather
+   than sampling. `VoxelStreamAdmission::RingSkirtEnabled()` already provides the
+   off control.
+
+**Sequencing note that falls out of the above:** `ComputeRingSkirtMask` returns 0
+for level 0, so the skirt cannot be exercised at all until D5.1 has given
+`worldgen.ush` a level parameter. It is strictly downstream of D5's larger
+problem, and building it first would produce a feature with no way to run it —
+ground rule 13, in advance this time.
 
 ### What stays on the CPU
 
