@@ -96,7 +96,6 @@ boilerplate.
     edit a `.ush` in a checkout an in-flight editor was launched from"*, and the
     safe habit is to do all `.ush` work in your own worktree. **Wave D5 changes
     `worldgen.ush` unconditionally and will hit this.**
-
 10. **Frame times are CLAMPED at 400 ms, and a slow enough scene reports a clean
     null.** *(Mechanism found by Wave E; the survival test below added by
     Wave B.)* `AWorldSettings::MaxUndilatedFrameTime = 0.4`
@@ -140,6 +139,35 @@ boilerplate.
    and moves under every PR. Anchor on symbol names — `DispatchJobs`,
    `DrainResults`, `MeshChunkBricks`, `EnsureVolumeOrigin` — and treat the numbers
    as hints. Several quoted here were already stale when this plan was written.
+13. **A code path with no recorded executions is untested, however green
+    everything around it is.** Two waves hit this from opposite directions on the
+    same day, which is why it is a rule rather than an anecdote.
+
+    - **Wave G, the runtime shape.** The pool's shadow-level cap added an
+      "everything was capped, draw nothing" branch. It is the one branch whose
+      failure costs 13M quads a frame *and* looks exactly like the feature
+      working. Across both measured legs it executed **zero times** — no scene
+      naturally produces it. Forced with `voxel.Stream.GPUShadowMaxLevel -1`, it
+      immediately exposed a defect: `FMeshElementCollector::AllocateMesh()` hands
+      back a **recycled** `FMeshBatch`, so reading `Elements[0].NumPrimitives`
+      before populating it returned a *previous gather's* value. The census
+      reported 185,612,113 quads against a 13,088,897-quad pool.
+    - **Wave D, the build-time shape.** A new `.usf` missing its
+      `Platform.ush` include **links clean and reports a successful build**,
+      because `IMPLEMENT_GLOBAL_SHADER` records only a path and an entry point.
+      Nothing verifies the file compiles until something dispatches it.
+
+    Both are the same failure: *the surrounding system is green because it never
+    asked the question.* The habit that closes it is to **force every branch you
+    add at least once, deliberately, and check its output is what you predicted**
+    — a cvar set to an absurd value, a fixture that produces the degenerate case.
+    A branch that has never run is a branch you have not written yet.
+
+    **And note what actually caught the Wave G defect**, because the magnitude
+    did not: the same run measured **3.5× faster** than the un-capped config while
+    apparently drawing **14× more**. Two numbers that cannot both be true, one of
+    which is the instrument. **When an instrument and a wall-clock disagree, the
+    instrument is the suspect** — the draw was correct the entire time.
 
 ## How to use this document
 

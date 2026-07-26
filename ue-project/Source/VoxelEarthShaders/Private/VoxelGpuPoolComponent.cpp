@@ -8,6 +8,9 @@
 #include "MeshBatch.h"
 #include "SceneManagement.h"
 #include "RHIResourceUtils.h"
+#include "Misc/ScopeExit.h"
+
+#include <atomic>
 
 // Draws every chunk in the pool with a single mesh batch.
 namespace VoxelGpuPoolCull
@@ -102,6 +105,89 @@ namespace VoxelGpuPoolCull
 		ECVF_RenderThreadSafe);
 
 	inline bool IsEnabled() { return GEnabled != 0; }
+
+	// HOW MANY LEVELS OF THE CASCADE CAST DYNAMIC SHADOWS.
+	//
+	// Measured 2026-07-26 (Wave G / G0): the four shadow cascades collectively see
+	// 90.6% of the pool, against 7.4% for the camera at the same pose, and shadow
+	// gathers submit 92.6% of all quads. That is not merge waste -- it is geometry
+	// genuinely inside some cascade's frustum, so it is a floor that survives even
+	// perfect compaction. The cause is that every resident chunk out to 2 km casts
+	// a dynamic shadow, including the coarse outer rings whose shadow subtends
+	// almost no screen area.
+	//
+	// This caps that by LEVEL, which maps directly to distance under
+	// kDefaultRingPresets: L0 0-64 m, L1 64-128, L2 128-256, L3 256-512,
+	// L4 512-1024, L5 1024-2048.
+	//
+	// THE DEFAULT IS THE CONSERVATIVE END ON PURPOSE. 4 drops only level 5 --
+	// terrain beyond 1 km -- worth roughly 1.5M quads a frame off an 11.85M floor,
+	// which is comparable to the ENTIRE camera-view over-draw the pool's frustum
+	// cull was built to remove. The more aggressive settings are worth
+	// substantially more (~3.3M at 3, ~5.3M at 2) and they are a QUALITY
+	// judgement, not a performance one: distant terrain stops casting and, more
+	// noticeably, stops SELF-shadowing, so far relief flattens and reads bright.
+	// No harness in this project can score that -- it needs eyes on a low-sun
+	// scene, which is why it is a live cvar and why the aggressive values are on
+	// the manual checklist rather than in this default.
+	static int32 GShadowMaxLevel = 4;
+	static FAutoConsoleVariableRef CVarShadowMaxLevel(
+		TEXT("voxel.Stream.GPUShadowMaxLevel"), GShadowMaxLevel,
+		TEXT("Highest cascade level whose pool chunks cast dynamic shadows. Levels above this are culled "
+		     "from shadow gathers only; the camera still draws every level it can see. Default 4 (terrain "
+		     "beyond ~1 km stops casting). Lower saves more and costs distant self-shadowing. 5+ = no cap."),
+		ECVF_RenderThreadSafe);
+
+	// A chunk's level, recovered from the chunk table. AddChunk stores
+	// Scale = float(1 << Level) in .w for the vertex factory's mip scale, so the
+	// level is already resident and needs no new per-chunk data.
+	inline int32 LevelFromScale(float Scale)
+	{
+		return Scale >= 1.0f ? int32(FMath::FloorLog2(uint32(Scale))) : 0;
+	}
+
+	// THE GATHER CENSUS (Wave G / G0). How many quads this proxy actually asks
+	// the GPU to draw per frame, split by whether the gather was the camera or a
+	// shadow cascade.
+	//
+	// WHY A NEW COUNTER RATHER THAN READING THE CULL LOG, which prints exactly
+	// these numbers already: THE CULL LOG HAS BEEN REPORTING ONE GATHER, AND
+	// ALWAYS THE SAME ONE, IN EVERY LEG EVER RUN.
+	//
+	// It fires on `CullLogCounter.Increment() % 600 == 1`.
+	// FThreadSafeCounter::Increment returns the POST-increment value
+	// (ThreadSafeCounter.h:52-55), so the samples land at gather ordinals
+	// 0, 600, 1200, .... GetDynamicMeshElements is called once per view AND once
+	// per shadow cascade, so with G gathers per frame the sampled gather's index
+	// within its own frame is (600k) mod G -- which is 0 for every k whenever G
+	// divides 600. And 600 = 2^3 * 3 * 5^2, so every plausible G (1..6, 8, 10,
+	// 12, ...) divides it.
+	//
+	// The evidence it was aliased was already on the record, and was read as a
+	// virtue: across the five recorded sessions there are 112 `cull: runs=`
+	// samples, every one of them `shadowGather=0`, and `visibleQuads=164534`
+	// repeats IDENTICALLY TO THE DIGIT across many samples and both
+	// straight-down legs. A rotating sample cannot do that. An aliased one must.
+	//
+	// This is not a tidiness fix. Wave A's cost model -- ~1.19 us per 1000 quads
+	// drawn, cross-validated to 1.1% across two poses -- divided a WHOLE-FRAME
+	// delta-p50 by a MAIN-VIEW-ONLY delta-drawnQuads. If shadow gathers draw the
+	// pool too then the true denominator is larger, the true slope is smaller,
+	// and the saving compaction can recover is smaller with it. The 1.1%
+	// agreement does not rescue it: both poses were measured through the same
+	// aliased instrument, so a shared bias cancels in the cross-validation and
+	// survives into the estimate.
+	//
+	// So this counter does not sample. It ACCUMULATES every gather, at the point
+	// of submission, on the cull and uncull branches alike -- what it reports is
+	// what the proxy asked the GPU for, not what one gather in six hundred did.
+	static int32 GStatsPeriod = 0;
+	static FAutoConsoleVariableRef CVarStatsPeriod(
+		TEXT("voxel.Stream.GPUCullStatsPeriod"), GStatsPeriod,
+		TEXT("Frames between gather-census reports. Counts every gather (camera and shadow) and reports "
+		     "quads submitted per frame split by gather type. 0 = off (default). This is a COUNT, so it is "
+		     "immune to the frame-time clamp and to GPU contention."),
+		ECVF_RenderThreadSafe);
 }
 
 class FVoxelGpuPoolSceneProxy final : public FPrimitiveSceneProxy
@@ -372,10 +458,31 @@ public:
 			// the whole under-selection. It also crashed -- reassigning the array
 			// while another thread iterated it asserted in the D3D12 RHI.
 			TArray<FQuadRange> Ranges;
+			// Threaded out of the cull rather than recomputed, so the census
+			// reports the same number the cull acted on. Stays 0 on the uncull
+			// control, where nothing measures visibility at all -- which the
+			// census report must not present as "zero quads were visible".
+			uint32 VisibleQuadsThisGather = 0;
+			ECullOutcome Outcome = ECullOutcome::Ranges;
 			const bool bCull = VoxelGpuPoolCull::IsEnabled() && Runs.Num() > 0 && NumQuads > 0;
 			if (bCull)
 			{
-				BuildCulledRanges(*Views[ViewIndex], Ranges);
+				BuildCulledRanges(*Views[ViewIndex], Ranges, VisibleQuadsThisGather, Outcome);
+			}
+
+			// EVERYTHING THIS GATHER COULD SEE IS ABOVE THE SHADOW CAP. Draw
+			// nothing and submit nothing -- do NOT fall through to the full-pool
+			// draw below, which is the conservative answer to a DIFFERENT question
+			// (see ECullOutcome). The census still records the gather, at zero
+			// quads, so a capped-out cascade is visible in the counts as a real
+			// measured zero rather than as a gather that never happened.
+			if (bCull && Outcome == ECullOutcome::AllCapped)
+			{
+				// Explicitly ZERO. Nothing is submitted on this path, and the
+				// batch is deliberately left unpopulated -- so it must not be
+				// asked how much work it represents. See RecordGather.
+				RecordGather(*Views[ViewIndex], /*SubmittedQuads=*/0, VisibleQuadsThisGather);
+				continue;
 			}
 
 			if (!bCull || Ranges.Num() == 0)
@@ -452,6 +559,11 @@ public:
 					Element.UserData = &RangeData;
 				}
 			}
+
+			// AFTER the elements are built and BEFORE they are handed over, so
+			// what is counted is exactly what is submitted -- including both
+			// fallback paths, which is the half the cull's own log cannot see.
+			RecordGather(*Views[ViewIndex], CountSubmittedQuads(Mesh), VisibleQuadsThisGather);
 
 			Collector.AddMesh(ViewIndex, Mesh);
 		}
@@ -580,6 +692,29 @@ private:
 
 	struct FQuadRange { uint32 First = 0; uint32 Count = 0; };
 
+	// WHY AN EMPTY RANGE LIST IS NOT ONE SITUATION.
+	//
+	// Before the shadow cap existed, "no ranges" had exactly one meaning -- the
+	// cull selected nothing -- and exactly one safe response: draw the whole pool.
+	// A cull that wrongly hides the world is the failure this pool is worst at
+	// diagnosing, so the conservative branch is the one that draws.
+	//
+	// THE SHADOW CAP INVERTS THAT, and it is the single most dangerous thing about
+	// building it. A distant cascade whose entire visible set sits above
+	// GPUShadowMaxLevel legitimately has nothing to draw. Routed through the old
+	// fallback it would draw 13.09M quads instead of 0 -- turning the largest
+	// saving on the board into the largest regression on the board, silently, and
+	// looking exactly like the feature working.
+	//
+	// So the empty case carries WHICH empty it is, and the two are handled
+	// oppositely. Logged when it fires, because neither is visible in a picture.
+	enum class ECullOutcome : uint8
+	{
+		Ranges,          // normal: draw what came back
+		NothingVisible,  // nothing passed the frustum -> draw everything (conservative, unchanged)
+		AllCapped,       // everything visible was above the shadow cap -> draw NOTHING (correct)
+	};
+
 	// Frustum-test every run, then merge the survivors back into as few pool
 	// ranges as possible. Runs arrive sorted by pool offset, so the merge is a
 	// single linear pass.
@@ -590,10 +725,15 @@ private:
 	// mutable members "reused across frames so the per-frame cull allocates
 	// nothing", which is a sound instinct for a method called once per frame and
 	// wrong for one called once per frame PER VIEW, in parallel.
-	void BuildCulledRanges(const FSceneView& View, TArray<FQuadRange>& CulledRanges) const
+	void BuildCulledRanges(const FSceneView& View, TArray<FQuadRange>& CulledRanges,
+	                       uint32& OutVisibleQuads, ECullOutcome& OutOutcome) const
 	{
 		const FMatrix& LocalToWorldMatrix = GetLocalToWorld();
 		uint32 VisibleQuads = 0;
+		OutOutcome = ECullOutcome::Ranges;
+		// Assigned on every return path below via this reference, so a caller
+		// cannot read a stale or uninitialised count from an early exit.
+		ON_SCOPE_EXIT { OutVisibleQuads = VisibleQuads; };
 
 		// N EQUAL RANGES OVER THE WHOLE POOL, no frustum test. See GDebugSplit.
 		// Capped at the batch-element limit for the same reason GetMaxRanges() is:
@@ -618,7 +758,8 @@ private:
 			// Deliberately NOT merged: adjacent ranges have a zero gap, so the
 			// merge below would collapse them straight back to one draw and the
 			// experiment would test nothing.
-			if (CullLogCounter.Increment() % 600 == 1)
+			// Prime, for the reason spelled out at the main cull log below.
+			if (CullLogCounter.Increment() % 601 == 1)
 			{
 				UE_LOG(LogTemp, Log, TEXT("%s cull: DEBUG SPLIT into %d ranges covering %d quads"),
 				       *PoolName, CulledRanges.Num(), NumQuads);
@@ -657,7 +798,28 @@ private:
 		// silently dropping most of the pool is indistinguishable in the picture
 		// from a cull that aims wrongly.
 		int32 SkippedEmpty = 0, SkippedBadId = 0, SkippedAboveWatermark = 0, SkippedHidden = 0, SkippedFrustum = 0;
+		// Chunks that PASSED the frustum test and were then removed by the shadow
+		// level cap. See the cap's own comment for why the ordering matters.
+		int32 SkippedShadowLevel = 0;
+		uint32 CappedQuads = 0;
 		uint32 RunQuads = 0;
+
+		// PER-LEVEL BREAKDOWN, to replace the one estimate in the shadow-cap
+		// costing with a measurement.
+		//
+		// That costing priced each cap setting by assuming quads-per-chunk is
+		// roughly uniform across levels -- plausible, because the clipmap holds
+		// every chunk at 32^3 voxels whatever its level, and probably conservative,
+		// because coarse terrain is smoother and should mesh to FEWER quads. But
+		// "probably conservative" is how estimates have gone wrong in both
+		// directions in this programme, and the pool knows the real answer.
+		//
+		// Pool[] is view-independent (every run, regardless of frustum) and is what
+		// validates or refutes the uniformity assumption. Visible[] is per gather
+		// and is what a cap would actually remove from THIS cascade.
+		static constexpr int32 kMaxLevels = 8;
+		uint32 PoolQuadsByLevel[kMaxLevels] = {};
+		uint32 VisibleQuadsByLevel[kMaxLevels] = {};
 
 		for (const UVoxelGpuPoolComponent::FChunkRun& Run : Runs)
 		{
@@ -682,6 +844,12 @@ private:
 				++SkippedHidden;
 				continue; // hidden entry: collapsed to a point, nothing to draw
 			}
+
+			// Already resident -- AddChunk stores float(1 << Level) here for the
+			// vertex factory's mip scale, so the cap needs no new per-chunk data.
+			const int32 ChunkLevel = VoxelGpuPoolCull::LevelFromScale(Scale);
+			const int32 LevelSlot = FMath::Clamp(ChunkLevel, 0, kMaxLevels - 1);
+			PoolQuadsByLevel[LevelSlot] += Run.NumQuads;
 
 			// Same extent AddChunk grows LocalBounds by, so the cull can never be
 			// tighter than the bounds the scene already culled the whole
@@ -718,6 +886,34 @@ private:
 				continue;
 			}
 
+			// THE SHADOW-LEVEL CAP, AND IT IS DELIBERATELY *AFTER* THE FRUSTUM
+			// TEST rather than before it.
+			//
+			// Testing first would be marginally cheaper and would make this
+			// counter a lie: it would then count chunks the frustum was going to
+			// reject anyway, and the empty-case decision below turns on exactly
+			// this number meaning "geometry this cascade WOULD have drawn, which
+			// only the cap removed". A counter that decides a branch has to mean
+			// what the branch assumes it means. The frustum test is a handful of
+			// dot products; correctness wins.
+			//
+			// Shadow gathers only. The camera must still draw every level it can
+			// see, or the cap would delete visible terrain rather than its
+			// shadow.
+			// Counted BEFORE the cap, so it answers "what would this gather draw if
+			// nothing were capped" -- which is the quantity a cap setting is chosen
+			// against. Counting it after would make every level above the cap read
+			// as zero and the breakdown would only ever confirm the cap already in
+			// force.
+			VisibleQuadsByLevel[LevelSlot] += Run.NumQuads;
+
+			if (bShadowGather && ChunkLevel > VoxelGpuPoolCull::GShadowMaxLevel)
+			{
+				++SkippedShadowLevel;
+				CappedQuads += Run.NumQuads;
+				continue;
+			}
+
 			VisibleQuads += Run.NumQuads;
 			CulledRanges.Add(FQuadRange{ Run.FirstQuad, Run.NumQuads });
 		}
@@ -726,13 +922,78 @@ private:
 		// merging (which only ever ADDS quads) would destroy the experiment.
 		if (VoxelGpuPoolCull::GDebugInvert != 0)
 		{
-			if (CullLogCounter.Increment() % 600 == 1)
+			// Prime, for the reason spelled out at the main cull log below.
+			if (CullLogCounter.Increment() % 601 == 1)
 			{
 				UE_LOG(LogTemp, Log,
 				       TEXT("%s cull: DEBUG INVERT drawing the REJECTED set: ranges=%d quads=%u/%d"),
 				       *PoolName, CulledRanges.Num(), VisibleQuads, NumQuads);
 			}
 			return;
+		}
+
+		// THE RANGE-BUDGET CURVE. What would a bigger element budget buy?
+		//
+		// Computed from the UNMERGED survivors, before either merge pass, because
+		// that is the only point at which the full gap structure still exists.
+		//
+		// The arithmetic is exact rather than a simulation. Merging a set of gaps
+		// adds exactly those gaps to the drawn total, and PASS 2 below merges the
+		// smallest gaps first -- which is optimal for "fewest redrawn quads subject
+		// to at most K ranges". So for R surviving runs,
+		//
+		//     drawn(K) = visible + (sum of the R-K smallest gaps),  K < R
+		//     drawn(K) = visible,                                   K >= R
+		//
+		// Two things follow, and both matter more than the numbers.
+		//
+		// FIRST: the drawn total this cull already achieves at K=64 IS drawn(64).
+		// The over-draw at the cap is not slack in the implementation to be tuned
+		// away -- it is the provable floor for a 64-range budget. Nothing that
+		// keeps the range shape can beat it.
+		//
+		// SECOND: drawn(infinity) = visible is exactly what compaction delivers,
+		// because a compacted id list has no range structure to merge. So this one
+		// line prices the entire compaction argument against the cheap alternative
+		// of simply spending more batch elements, per gather, from counts alone --
+		// with no indirect draw, no view extension and no shader change built to
+		// find out.
+		if (VoxelGpuPoolCull::GStatsPeriod > 0 && CulledRanges.Num() > 1)
+		{
+			TArray<uint32> Gaps;
+			Gaps.Reserve(CulledRanges.Num() - 1);
+			for (int32 I = 1; I < CulledRanges.Num(); ++I)
+			{
+				const uint32 PrevEnd = CulledRanges[I - 1].First + CulledRanges[I - 1].Count;
+				Gaps.Add(CulledRanges[I].First >= PrevEnd ? CulledRanges[I].First - PrevEnd : 0u);
+			}
+			Gaps.Sort();
+
+			const int32 R = CulledRanges.Num();
+			auto DrawnAt = [&Gaps, R, VisibleQuads](int32 K) -> uint64
+			{
+				if (K >= R)
+				{
+					return VisibleQuads;
+				}
+				uint64 Extra = 0;
+				const int32 Merges = R - K;
+				for (int32 I = 0; I < Merges && I < Gaps.Num(); ++I)
+				{
+					Extra += Gaps[I];
+				}
+				return uint64(VisibleQuads) + Extra;
+			};
+
+			if (CullLogCounter.GetValue() % 601 == 0)
+			{
+				UE_LOG(LogTemp, Log,
+				       TEXT("%s budget: shadowGather=%d runs=%d visible=%u | drawn(64)=%llu drawn(128)=%llu "
+				            "drawn(256)=%llu drawn(1024)=%llu drawn(4096)=%llu drawn(inf)=%u"),
+				       *PoolName, bShadowGather ? 1 : 0, R, VisibleQuads,
+				       DrawnAt(64), DrawnAt(128), DrawnAt(256), DrawnAt(1024), DrawnAt(4096),
+				       VisibleQuads);
+			}
 		}
 
 		// PASS 1: MERGE ON THE TOLERATED GAP (voxel.Stream.GPUCullMergeGap).
@@ -837,9 +1098,35 @@ private:
 		// worst at diagnosing, so the conservative branch is the one that draws.
 		// The range cap no longer needs a bail-out: the merge above satisfies it
 		// by construction.
+		// THE THREE-STATE EMPTY CASE. See ECullOutcome for why this is not one
+		// situation, and why getting it wrong is the largest regression available
+		// rather than a missing optimisation.
 		if (VisibleQuads == 0)
 		{
 			CulledRanges.Reset();
+
+			// Did the cap remove geometry this gather would otherwise have drawn?
+			// SkippedShadowLevel counts only runs that PASSED the frustum test, so
+			// a non-zero value means exactly that -- this cascade has real
+			// geometry in it and every last quad of it is above the cap. Drawing
+			// nothing is then the correct answer and drawing everything is the
+			// catastrophic one.
+			OutOutcome = SkippedShadowLevel > 0 ? ECullOutcome::AllCapped
+			                                    : ECullOutcome::NothingVisible;
+
+			// Logged unconditionally, not on the periodic sample. Both states are
+			// invisible in a picture and one of them is a 13M-quad mistake, so
+			// neither may depend on winning a 1-in-601 lottery to be seen. They
+			// are also rare by construction, so this cannot spam.
+			UE_LOG(LogTemp, Log,
+			       TEXT("%s cull: EMPTY (%s) shadowGather=%d cappedRuns=%d cappedQuads=%u frustumSkipped=%d "
+			            "-- %s"),
+			       *PoolName,
+			       OutOutcome == ECullOutcome::AllCapped ? TEXT("all capped") : TEXT("nothing visible"),
+			       bShadowGather ? 1 : 0, SkippedShadowLevel, CappedQuads, SkippedFrustum,
+			       OutOutcome == ECullOutcome::AllCapped
+			           ? TEXT("drawing NOTHING, which is correct: every visible chunk is above GPUShadowMaxLevel")
+			           : TEXT("falling back to the FULL POOL draw, which is the conservative answer"));
 		}
 
 		// What the merged ranges actually submit, as against VisibleQuads which is
@@ -860,19 +1147,74 @@ private:
 		// rejecting everything. That ambiguity hid a broken cull for a whole
 		// verification cycle -- and because the empty case falls back to the full
 		// draw, the picture was correct either way and proved nothing.
-		if (CullLogCounter.Increment() % 600 == 1)
+		//
+		// THE PERIOD IS PRIME, AND THAT IS THE ENTIRE POINT OF IT.
+		//
+		// It was 600, and 600 = 2^3 * 3 * 5^2. Increment() returns the
+		// POST-increment value, so the samples fell on gather ordinals
+		// 0, 600, 1200, ...; this method runs once per view AND once per shadow
+		// cascade, so with G gathers per frame the sampled gather's index within
+		// its frame was (600k) mod G -- identically 0 for every plausible G,
+		// because every plausible G divides 600.
+		//
+		// So this line reported gather index 0, and only gather index 0, in
+		// every leg ever run: 112 samples across five recorded sessions, all
+		// `shadowGather=0`, which was read as "the pool sees no shadow gathers".
+		// The tell was on the record and looked like a virtue -- the same
+		// `visibleQuads=164534` to the digit across many samples and both
+		// straight-down legs, which a rotating sample cannot produce and an
+		// aliased one must.
+		//
+		// 601 is prime, so it shares no factor with any gathers-per-frame count
+		// and the sample walks every gather instead of pinning one. EXPECT THIS
+		// LINE TO LOOK NOISIER THAN IT USED TO. That is the fix working: the
+		// stability it had was the aliasing. `gather=` is printed so the rotation
+		// is visible rather than inferred, and the totals -- which is what any
+		// quantitative claim should now be read from -- come from the census
+		// (voxel.Stream.GPUCullStatsPeriod), which accumulates instead of
+		// sampling.
+		//
+		// DO NOT "FIX" THE NOISE BY ROUNDING THIS BACK TO 600, OR TO ANY OTHER
+		// NUMBER WITH SMALL FACTORS. A round period is exactly the bug. If a
+		// steadier line is wanted, read the census, which averages over every
+		// gather in a window instead of showing you one.
+		const int32 GatherOrdinal = CullLogCounter.Increment();
+		if (GatherOrdinal % 601 == 1)
 		{
 			UE_LOG(LogTemp, Log,
-			       TEXT("%s cull: runs=%d runQuads=%u/%d visibleQuads=%u (%.1f%%) ranges=%d drawnQuads=%u (%.1f%%) "
+			       TEXT("%s cull: gather=%d runs=%d runQuads=%u/%d visibleQuads=%u (%.1f%%) ranges=%d drawnQuads=%u (%.1f%%) "
 			            "| mergeGap=%u maxRanges=%d | skipped empty=%d badId=%d aboveHWM=%d hidden=%d frustum=%d "
 			            "| shadowGather=%d"),
-			       *PoolName, Runs.Num(), RunQuads, NumQuads, VisibleQuads,
+			       *PoolName, GatherOrdinal - 1, Runs.Num(), RunQuads, NumQuads, VisibleQuads,
 			       NumQuads > 0 ? 100.0 * double(VisibleQuads) / double(NumQuads) : 0.0,
 			       CulledRanges.Num(), DrawnQuads,
 			       NumQuads > 0 ? 100.0 * double(DrawnQuads) / double(NumQuads) : 0.0,
 			       MergeGap, MaxRanges,
 			       SkippedEmpty, SkippedBadId, SkippedAboveWatermark, SkippedHidden, SkippedFrustum,
 			       bShadowGather ? 1 : 0);
+
+			// PER-LEVEL, on its own line so it stays readable at six levels.
+			//
+			// `pool` is the pool's composition and is view-independent, so it is
+			// the same on every gather and is what settles the quads-per-chunk
+			// uniformity question. `visible` is pre-cap and per gather, so summing
+			// it above a candidate cap gives exactly what that cap would remove
+			// from THIS cascade -- no estimate, no uniformity assumption.
+			FString PoolByLevel, VisByLevel;
+			for (int32 L = 0; L < kMaxLevels; ++L)
+			{
+				if (PoolQuadsByLevel[L] == 0 && VisibleQuadsByLevel[L] == 0)
+				{
+					continue;
+				}
+				PoolByLevel += FString::Printf(TEXT(" L%d=%u"), L, PoolQuadsByLevel[L]);
+				VisByLevel += FString::Printf(TEXT(" L%d=%u"), L, VisibleQuadsByLevel[L]);
+			}
+			UE_LOG(LogTemp, Log,
+			       TEXT("%s levels: shadowGather=%d shadowMaxLevel=%d cappedRuns=%d cappedQuads=%u "
+			            "| pool:%s | visiblePreCap:%s"),
+			       *PoolName, bShadowGather ? 1 : 0, VoxelGpuPoolCull::GShadowMaxLevel,
+			       SkippedShadowLevel, CappedQuads, *PoolByLevel, *VisByLevel);
 		}
 	}
 
@@ -882,6 +1224,179 @@ private:
 	// miss or duplicate its slot.
 	mutable FThreadSafeCounter CullLogCounter;
 	mutable FThreadSafeCounter CullSpaceLogged;
+
+	// --- the gather census (Wave G / G0) ---------------------------------
+	//
+	// See VoxelGpuPoolCull::GStatsPeriod for what this is for and why the
+	// existing cull log could not answer it.
+	//
+	// CUMULATIVE since this proxy was created, deliberately. The question is a
+	// RATIO -- shadow quads against camera quads -- and a ratio taken over
+	// cumulative totals does not care where a reporting window happens to fall,
+	// which a per-window average does. A render-state rebuild constructs a new
+	// proxy and so resets these; the report says which proxy it came from and
+	// how many gathers are behind it, so a reader can see a reset rather than
+	// silently averaging across one.
+	struct FGatherCensus
+	{
+		std::atomic<uint64> Gathers{ 0 };
+		std::atomic<uint64> SubmittedQuads{ 0 };
+		std::atomic<uint64> VisibleQuads{ 0 };
+
+		// Relaxed is correct here and not a shortcut: these counters order
+		// nothing and guard nothing, they are only ever read for their own
+		// value, and the report is explicitly a snapshot of a live count.
+		void Accumulate(uint64 InSubmitted, uint64 InVisible) const
+		{
+			const_cast<FGatherCensus*>(this)->Gathers.fetch_add(1, std::memory_order_relaxed);
+			const_cast<FGatherCensus*>(this)->SubmittedQuads.fetch_add(InSubmitted, std::memory_order_relaxed);
+			const_cast<FGatherCensus*>(this)->VisibleQuads.fetch_add(InVisible, std::memory_order_relaxed);
+		}
+	};
+	mutable FGatherCensus CameraCensus;
+	mutable FGatherCensus ShadowCensus;
+
+	// Counts what the batch actually asks for, on BOTH branches, rather than
+	// re-deriving it from the cull -- the uncull control never runs the cull at
+	// all, and it is precisely the config the cost model's other endpoint came
+	// from. Reading the submitted elements is the one expression that is true of
+	// every path through GetDynamicMeshElements, including the fallbacks.
+	static uint64 CountSubmittedQuads(const FMeshBatch& Mesh)
+	{
+		uint64 Total = 0;
+		for (const FMeshBatchElement& Element : Mesh.Elements)
+		{
+			Total += uint64(Element.NumPrimitives) / 2u;
+		}
+		return Total;
+	}
+
+	// Takes the submitted count EXPLICITLY rather than reading it off an FMeshBatch.
+	//
+	// It used to take the batch and count its elements, which is correct only
+	// AFTER the batch has been populated -- and the all-capped path records a
+	// gather that deliberately populates nothing. Collector.AllocateMesh() hands
+	// back a RECYCLED FMeshBatch, so Elements[0].NumPrimitives still held a
+	// previous gather's value and the census read it as real work.
+	//
+	// It reported 185,612,113 quads per camera gather against a 13,088,897-quad
+	// pool -- impossible on its face, but only because the pool size happened to
+	// be in front of me. What killed it was the frame time: the same run measured
+	// p50 5.85 ms against 20.73 ms for the un-capped config, i.e. three and a half
+	// times FASTER while apparently drawing fourteen times more. The draw was
+	// right the whole time; the instrument was reading a stale field.
+	//
+	// Found only because the all-capped path was deliberately forced with
+	// GPUShadowMaxLevel -1, having never once executed in a normal run. Passing
+	// the number in removes the ordering requirement rather than documenting it.
+	void RecordGather(const FSceneView& View, uint64 InSubmittedQuads, uint32 InVisibleQuads) const
+	{
+		const int32 Period = VoxelGpuPoolCull::GStatsPeriod;
+		if (Period <= 0)
+		{
+			return;
+		}
+
+		const bool bShadowGather = View.GetDynamicMeshElementsShadowCullFrustum() != nullptr;
+		(bShadowGather ? ShadowCensus : CameraCensus).Accumulate(InSubmittedQuads, InVisibleQuads);
+
+		if (bShadowGather)
+		{
+			return;   // report on a camera gather, so the denominator is one frame
+		}
+
+		// Reported every Period CAMERA gathers rather than every Period frames.
+		// There is no frame counter on this path, and a camera gather is the
+		// thing a per-frame figure should be divided by anyway -- so the
+		// denominator is stated outright instead of inferred from a frame number
+		// this method never sees.
+		const uint64 CameraGathers = CameraCensus.Gathers.load(std::memory_order_relaxed);
+		if (CameraGathers == 0 || (CameraGathers % uint64(Period)) != 0)
+		{
+			return;
+		}
+
+		const uint64 CamQuads = CameraCensus.SubmittedQuads.load(std::memory_order_relaxed);
+		const uint64 ShadowGathers = ShadowCensus.Gathers.load(std::memory_order_relaxed);
+		const uint64 ShadowQuads = ShadowCensus.SubmittedQuads.load(std::memory_order_relaxed);
+		const uint64 CamVisible = CameraCensus.VisibleQuads.load(std::memory_order_relaxed);
+
+		// WINDOWED AS WELL AS CUMULATIVE, and the window is the number to read.
+		//
+		// The cumulative figures start at proxy creation, which is BEFORE the
+		// cascade has streamed in -- so they average a nearly-empty pool together
+		// with a settled one and understate both quad counts. That dilution is
+		// not identical between two configs, because their streaming trajectories
+		// are not identical, so it does not cancel in the delta the experiment is
+		// built on. The last window of a settled leg contains no fill-in frames at
+		// all, which is what the pre-registered rule is written against.
+		const uint64 WinCamGathers = CameraGathers - LastCamGathers.exchange(CameraGathers, std::memory_order_relaxed);
+		const uint64 WinCamQuads = CamQuads - LastCamQuads.exchange(CamQuads, std::memory_order_relaxed);
+		const uint64 WinShadowGathers = ShadowGathers - LastShadowGathers.exchange(ShadowGathers, std::memory_order_relaxed);
+		const uint64 WinShadowQuads = ShadowQuads - LastShadowQuads.exchange(ShadowQuads, std::memory_order_relaxed);
+		const uint64 WinCamVisible = CamVisible - LastCamVisible.exchange(CamVisible, std::memory_order_relaxed);
+
+		if (WinCamGathers == 0)
+		{
+			return;
+		}
+
+		const uint64 WinTotalQuads = WinCamQuads + WinShadowQuads;
+
+		// A MEASURED ZERO, SAID OUT LOUD.
+		//
+		// shadowGathers == 0 is this experiment's best case -- it makes S_delta
+		// exactly 1, which leaves Wave A's cost model standing unmodified. But an
+		// absent count and a zero count look identical in a log, and that is
+		// precisely how the original aliasing hid: 112 samples all reading
+		// shadowGather=0 were taken as "no shadow gathers happen" when they were
+		// really "this instrument cannot see them". So the zero is asserted on its
+		// own line, by a counter that increments on every gather of either kind,
+		// rather than being inferred from lines that are not there.
+		if (WinShadowGathers == 0)
+		{
+			UE_LOG(LogTemp, Log,
+			       TEXT("%s census[window]: shadowGathers=0 MEASURED (not absent) over %llu camera gathers "
+			            "-- this proxy submitted no shadow-cascade draws in this window, so S_delta = 1 "
+			            "and a camera-only quad count is the whole frame's quad count"),
+			       *PoolName, WinCamGathers);
+		}
+
+		// S is the whole point of the experiment: the factor by which a
+		// main-view-only quad count understates what the frame actually drew.
+		// Wave A's ~1.19 us/1000 quads was a whole-frame delta-p50 over a
+		// main-view-only delta-quads, so the true slope is 1.19 / S and the
+		// saving compaction can recover on the camera view scales the same way.
+		//
+		// NOTE this is S at ONE config. The quantity the rule is written against
+		// is S_delta, formed from the DIFFERENCE between uncull and cull at a
+		// pose -- computed off two legs, not read off one line. S here is the
+		// per-config ingredient and a sanity check, not the verdict.
+		const double S = WinCamQuads > 0 ? double(WinTotalQuads) / double(WinCamQuads) : 0.0;
+
+		UE_LOG(LogTemp, Log,
+		       TEXT("%s census[window]: cameraGathers=%llu shadowGathers=%llu (%.2f per camera gather) | "
+		            "quads/cameraGather: camera=%.0f shadow=%.0f total=%.0f | S=%.3f | "
+		            "visible/cameraGather camera=%.0f | poolQuads=%d cull=%d "
+		            "| cumulative: camGathers=%llu shadowGathers=%llu camQuads=%llu shadowQuads=%llu"),
+		       *PoolName, WinCamGathers, WinShadowGathers,
+		       double(WinShadowGathers) / double(WinCamGathers),
+		       double(WinCamQuads) / double(WinCamGathers),
+		       double(WinShadowQuads) / double(WinCamGathers),
+		       double(WinTotalQuads) / double(WinCamGathers),
+		       S,
+		       double(WinCamVisible) / double(WinCamGathers),
+		       NumQuads, VoxelGpuPoolCull::IsEnabled() ? 1 : 0,
+		       CameraGathers, ShadowGathers, CamQuads, ShadowQuads);
+	}
+
+	// Previous report's cumulative values, so each report can state its own
+	// window. Only ever touched on a reporting camera gather.
+	mutable std::atomic<uint64> LastCamGathers{ 0 };
+	mutable std::atomic<uint64> LastCamQuads{ 0 };
+	mutable std::atomic<uint64> LastShadowGathers{ 0 };
+	mutable std::atomic<uint64> LastShadowQuads{ 0 };
+	mutable std::atomic<uint64> LastCamVisible{ 0 };
 
 
 
