@@ -26,11 +26,43 @@
 // no chunk-z anywhere. So this needs ColumnMain's output plus cave/cavern, and
 // does not touch VoxelizeMain or the cell grid.
 
+// Platform.ush MUST come first, and must be present at all: Unreal's shader
+// preprocessor rejects any shader that does not include it ("Shader is required
+// to include /Engine/Public/Platform.ush"), and it is what defines the
+// per-platform intrinsics and type plumbing worldgen.ush is compiled against.
+// Every other .usf in this project opens the same way -- VoxelWorldGen.usf,
+// VoxelQuadScan.usf, VoxelQuadDecodeTest.usf.
+//
+// Its absence is invisible to a C++ build: IMPLEMENT_GLOBAL_SHADER only records
+// (path, entry), so the shader itself is not compiled until the editor asks for
+// it at runtime. "It compiles" about a new .usf therefore means the module
+// linked, not that the kernel exists.
+#include "/Engine/Public/Platform.ush"
 #include "/VoxelCore/worldgen.ush"
+
+// INT64_MAX / INT64_MIN as named constants rather than inline literals.
+//
+// Not style. `-0x8000000000000000` is a unary minus applied to a hex literal
+// that does not fit a signed 64-bit int, so its type is decided by the
+// compiler before the minus is applied -- exactly the kind of
+// compiler-determined typing this file's determinism history says not to leave
+// lying around. Deriving the min from the max keeps both provably in range.
+static const int64_t kBandI64Max = 0x7fffffffffffffffL;
+static const int64_t kBandI64Min = -kBandI64Max - (int64_t)1;
 
 // Dispatch-column index of the band grid's (0,0), and the grid edge (34 for a
 // 32-voxel chunk plus its one-column apron). Passed in rather than derived so
 // this kernel does not need to know what a render chunk is.
+//
+// ONE scalar for both axes, not two. The production grid is symmetric (a
+// 48-column chunk dispatch has an 8-brick halo and a 1-column apron, so the
+// band starts at column 7 on both axes), and the window is square, so a max/min
+// reduction over it is transposition-invariant: an x/y index swap in the loop
+// below could not change the answer even if it existed. Two origins would add
+// API surface to test for a bug class that cannot exist here.
+//
+// ValidateRegionRequest rejects BandOriginI + BandEdge > DispatchColumns rather
+// than letting the bounds guard below silently reduce over a partial window.
 uint BandOriginI;
 uint BandEdge;
 
@@ -95,30 +127,30 @@ int64_t columnSurfaceTopVoxel(int surfaceMm)
 int64_t columnDeepestAirVoxel(GpuColumnSample col, GpuCaveColumn cave, GpuCavernColumn cavern)
 {
     const int64_t surfaceTop = columnSurfaceTopVoxel(col.surfaceMm);
-    int64_t carveMin = 0x7fffffffffffffffL;
+    int64_t carveMin = kBandI64Max;
 
     const bool carveEligible = col.surfaceMm >= kCaveMinSurfaceMm;
 
     if (carveEligible && (cave.segCount > 0 || cave.shaftMarginSq > 0))
     {
-        int64_t maxCaveDepthMm = -0x8000000000000000L;
+        int64_t maxCaveDepthMm = kBandI64Min;
         if (cave.shaftMarginSq > 0)
         {
             maxCaveDepthMm = max(maxCaveDepthMm, (int64_t)cave.shaftDepthMaxMm);
         }
-        int64_t segDepthMm = -0x8000000000000000L;
+        int64_t segDepthMm = kBandI64Min;
         for (int s = 0; s < cave.segCount; ++s)
         {
             segDepthMm = max(segDepthMm,
                              (int64_t)cave.segDepthMm[s] + (int64_t)ceilSqrtU((uint)cave.segMarginSq[s]));
         }
-        if (segDepthMm > -0x8000000000000000L)
+        if (segDepthMm > kBandI64Min)
         {
             // caveCarveAt refuses once depthMm + kCaveBedrockMarginMm >= bedrockDepthMm.
             segDepthMm = min(segDepthMm, (int64_t)col.bedrockDepthMm - kCaveBedrockMarginMm);
             maxCaveDepthMm = max(maxCaveDepthMm, segDepthMm);
         }
-        if (maxCaveDepthMm > -0x8000000000000000L)
+        if (maxCaveDepthMm > kBandI64Min)
         {
             carveMin = min(carveMin,
                            floorDiv((int64_t)col.surfaceMm - maxCaveDepthMm - (int64_t)kVoxelSizeMm / 2,
@@ -128,14 +160,14 @@ int64_t columnDeepestAirVoxel(GpuColumnSample col, GpuCaveColumn cave, GpuCavern
 
     if (carveEligible && cavern.count > 0)
     {
-        int64_t minZAbsMm = 0x7fffffffffffffffL;
+        int64_t minZAbsMm = kBandI64Max;
         for (int s = 0; s < cavern.count; ++s)
         {
             minZAbsMm = min(minZAbsMm,
                             max((int64_t)cavern.zFloorMm[s],
                                 (int64_t)cavern.zCenterMm[s] - (int64_t)ceilSqrtU((uint)cavern.marginSq[s])));
         }
-        if (minZAbsMm < 0x7fffffffffffffffL)
+        if (minZAbsMm < kBandI64Max)
         {
             // cavernCarveAt refuses once depthMm + kCaveBedrockMarginMm >= bedrockDepthMm.
             minZAbsMm = max(minZAbsMm,
@@ -145,7 +177,7 @@ int64_t columnDeepestAirVoxel(GpuColumnSample col, GpuCaveColumn cave, GpuCavern
         }
     }
 
-    if (carveMin != 0x7fffffffffffffffL)
+    if (carveMin != kBandI64Max)
     {
         carveMin = max(carveMin, kCaveMinVoxelZ);   // no carving at or below sea level
     }
@@ -162,8 +194,8 @@ void BandReduceMain(uint3 gtid : SV_GroupThreadID)
     const uint lane = gtid.x;
     const uint cells = BandEdge * BandEdge;
 
-    int64_t localTop = -0x8000000000000000L;
-    int64_t localAir = 0x7fffffffffffffffL;
+    int64_t localTop = kBandI64Min;
+    int64_t localAir = kBandI64Max;
 
     const uint64_t caveSeed = ((uint64_t)SeedHi << 32) | (uint64_t)SeedLo;
 

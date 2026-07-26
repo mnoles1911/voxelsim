@@ -147,6 +147,20 @@ struct FVoxelGpuRegionResult
 	// Quads is sized to the upper bound (32 per mask); this is how many the
 	// scan says are actually live. Only the first NumQuads entries are output.
 	uint32 NumQuads = 0;
+
+	// --- Wave D / D6: the footprint band ------------------------------------
+	//
+	// RAW voxel z, exactly as BandReduceMain wrote them: the max of
+	// ColumnSurfaceTopVoxel and the min of ColumnDeepestAirVoxel over the band
+	// window. NOT an FFootprintBand -- the +1/-1 widening and the int32 clamp
+	// that turn these into one live in VoxelStreaming::MakeFootprintBand, on the
+	// CPU, because every constant mirrored into HLSL is a determinism liability.
+	//
+	// bBandValid is false whenever the request did not ask for a band
+	// (BandEdge 0), and the two values are then meaningless rather than zero.
+	bool bBandValid = false;
+	int32 BandMaxSurfaceTopVoxel = 0;
+	int32 BandMinDeepestAirVoxel = 0;
 };
 
 namespace VoxelGpuWorldGen
