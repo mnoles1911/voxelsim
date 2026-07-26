@@ -42,6 +42,19 @@ namespace VoxelGpuPoolCull
 		TEXT("If the cull cannot get below this many draw ranges, fall back to one draw over the whole pool."),
 		ECVF_RenderThreadSafe);
 
+	// Control experiment: run the whole range/merge/multi-draw path but treat
+	// EVERY chunk as visible. If the picture is correct with this on and wrong
+	// with it off, the frustum test is selecting the wrong chunks; if it is wrong
+	// both ways, the fault is in emitting many draw elements per batch. One cvar
+	// separates two hypotheses that produce the identical symptom.
+	static int32 GDebugAllVisible = 0;
+	static FAutoConsoleVariableRef CVarDebugAllVisible(
+		TEXT("voxel.Stream.GPUCullDebugAllVisible"), GDebugAllVisible,
+		TEXT("1 = skip the frustum test and treat every chunk as visible, while still going through the "
+		     "range merge and multi-element draw path. Isolates 'the cull picks the wrong chunks' from "
+		     "'many draw elements per batch is broken'."),
+		ECVF_RenderThreadSafe);
+
 	inline bool IsEnabled() { return GEnabled != 0; }
 }
 
@@ -454,24 +467,85 @@ private:
 			const FBox LocalBox(Min, Min + FVector(EdgeUU));
 			const FBox WorldBox = LocalBox.TransformBy(LocalToWorldMatrix);
 
-			if (!View.ViewFrustum.IntersectBox(WorldBox.GetCenter(), WorldBox.GetExtent()))
+			// One-shot: the actual numbers the frustum test is fed, against the
+			// view it is tested with. A cull that selects the wrong chunks and a
+			// cull that selects none look identical from the outside, and both
+			// read as "the pool is broken"; this prints the operands instead of
+			// inferring them.
+			if (!bLoggedCullSpace)
+			{
+				bLoggedCullSpace = true;
+				UE_LOG(LogTemp, Warning,
+				       TEXT("%s cullspace: chunk0 local=(%.0f,%.0f,%.0f) edge=%.0f -> worldCentre=(%.0f,%.0f,%.0f) ext=(%.0f,%.0f,%.0f) | viewOrigin=(%.0f,%.0f,%.0f) | l2wTrans=(%.0f,%.0f,%.0f)"),
+				       *PoolName, Entry.X, Entry.Y, Entry.Z, EdgeUU,
+				       WorldBox.GetCenter().X, WorldBox.GetCenter().Y, WorldBox.GetCenter().Z,
+				       WorldBox.GetExtent().X, WorldBox.GetExtent().Y, WorldBox.GetExtent().Z,
+				       View.ViewMatrices.GetViewOrigin().X, View.ViewMatrices.GetViewOrigin().Y,
+				       View.ViewMatrices.GetViewOrigin().Z,
+				       LocalToWorldMatrix.GetOrigin().X, LocalToWorldMatrix.GetOrigin().Y,
+				       LocalToWorldMatrix.GetOrigin().Z);
+			}
+
+			if (VoxelGpuPoolCull::GDebugAllVisible == 0 &&
+			    !View.ViewFrustum.IntersectBox(WorldBox.GetCenter(), WorldBox.GetExtent()))
 			{
 				continue;
 			}
 
 			VisibleQuads += Run.NumQuads;
-			if (CulledRanges.Num() > 0)
+			CulledRanges.Add(FQuadRange{ Run.FirstQuad, Run.NumQuads });
+		}
+
+		// MERGE TO A DRAW-CALL BUDGET, CHEAPEST GAPS FIRST.
+		//
+		// The first version merged on a fixed gap threshold and then discarded
+		// the whole result if it still exceeded the range cap. That is the wrong
+		// shape twice over: the threshold is a magic constant with no relation to
+		// what a draw costs, and the discard meant a scene the cull had correctly
+		// reduced to 25% visible was drawn in full anyway -- measured
+		// visibleQuads=2205034/8808161 with ranges=0, i.e. all the work and none
+		// of the benefit.
+		//
+		// The real objective is: no more than N draws, with as few redrawn
+		// off-screen quads as possible. So sort the GAPS between adjacent visible
+		// runs, and merge the smallest ones until the range count fits. Merging
+		// the smallest gap first is optimal for this objective -- each merge
+		// removes exactly one draw and costs exactly that gap in redrawn quads.
+		const int32 MaxRanges = FMath::Max(1, VoxelGpuPoolCull::GMaxRanges);
+		if (CulledRanges.Num() > MaxRanges)
+		{
+			GapScratch.Reset();
+			GapScratch.Reserve(CulledRanges.Num() - 1);
+			for (int32 I = 1; I < CulledRanges.Num(); ++I)
 			{
-				FQuadRange& Last = CulledRanges.Last();
+				const uint32 PrevEnd = CulledRanges[I - 1].First + CulledRanges[I - 1].Count;
+				GapScratch.Add(CulledRanges[I].First >= PrevEnd ? CulledRanges[I].First - PrevEnd : 0u);
+			}
+			// The (n - MaxRanges)th smallest gap is the threshold that leaves
+			// exactly MaxRanges ranges. Sorting is O(n log n) on a few thousand
+			// entries, once per view per frame.
+			TArray<uint32> Sorted = GapScratch;
+			Sorted.Sort();
+			const int32 MergesNeeded = CulledRanges.Num() - MaxRanges;
+			const uint32 GapThreshold = Sorted[FMath::Clamp(MergesNeeded - 1, 0, Sorted.Num() - 1)];
+
+			MergeScratch.Reset();
+			MergeScratch.Add(CulledRanges[0]);
+			for (int32 I = 1; I < CulledRanges.Num(); ++I)
+			{
+				FQuadRange& Last = MergeScratch.Last();
 				const uint32 LastEnd = Last.First + Last.Count;
-				if (Run.FirstQuad >= LastEnd &&
-				    Run.FirstQuad - LastEnd <= uint32(FMath::Max(0, VoxelGpuPoolCull::GMergeGapQuads)))
+				const uint32 Gap = CulledRanges[I].First >= LastEnd ? CulledRanges[I].First - LastEnd : 0u;
+				if (Gap <= GapThreshold)
 				{
-					Last.Count = (Run.FirstQuad + Run.NumQuads) - Last.First;
-					continue;
+					Last.Count = (CulledRanges[I].First + CulledRanges[I].Count) - Last.First;
+				}
+				else
+				{
+					MergeScratch.Add(CulledRanges[I]);
 				}
 			}
-			CulledRanges.Add(FQuadRange{ Run.FirstQuad, Run.NumQuads });
+			CulledRanges = MergeScratch;
 		}
 
 		// Too fragmented to be worth it, or nothing visible at all -- either way
@@ -479,22 +553,49 @@ private:
 		// deliberately NOT treated as "draw nothing": a wrong cull that hides the
 		// world is the failure mode this pool is worst at diagnosing, so the
 		// conservative branch is the one that draws.
-		if (CulledRanges.Num() > FMath::Max(1, VoxelGpuPoolCull::GMaxRanges) || VisibleQuads == 0)
+		// Nothing visible -> fall back to the full draw rather than drawing
+		// nothing. A wrong cull that hides the world is the failure this pool is
+		// worst at diagnosing, so the conservative branch is the one that draws.
+		// The range cap no longer needs a bail-out: the merge above satisfies it
+		// by construction.
+		if (VisibleQuads == 0)
 		{
 			CulledRanges.Reset();
 		}
 
-		if (!bLoggedCull)
+		// What the merged ranges actually submit, as against VisibleQuads which is
+		// the pre-merge total. The gap between the two is the cost of merging --
+		// quads redrawn because they sit inside a tolerated gap. Both numbers are
+		// needed to tune GPUCullMergeGap; one alone cannot say whether merging is
+		// paying for itself.
+		uint32 DrawnQuads = 0;
+		for (const FQuadRange& R : CulledRanges)
 		{
-			bLoggedCull = true;
+			DrawnQuads += R.Count;
+		}
+
+		// Logged PERIODICALLY, not once. The first version logged on the first
+		// frame only, which is useless for this diagnostic: at t=0 the pool holds
+		// a handful of chunks and the camera may legitimately see none of them,
+		// so "visibleQuads=0" reads identically whether the cull is working or
+		// rejecting everything. That ambiguity hid a broken cull for a whole
+		// verification cycle -- and because the empty case falls back to the full
+		// draw, the picture was correct either way and proved nothing.
+		if (++CullLogCounter % 600 == 1)
+		{
 			UE_LOG(LogTemp, Log,
-			       TEXT("%s cull: runs=%d visibleQuads=%u/%d ranges=%d (merge gap %d, max ranges %d)"),
-			       *PoolName, Runs.Num(), VisibleQuads, NumQuads, CulledRanges.Num(),
-			       VoxelGpuPoolCull::GMergeGapQuads, VoxelGpuPoolCull::GMaxRanges);
+			       TEXT("%s cull: runs=%d visibleQuads=%u/%d (%.1f%%) ranges=%d drawnQuads=%u (merge gap %d)"),
+			       *PoolName, Runs.Num(), VisibleQuads, NumQuads,
+			       NumQuads > 0 ? 100.0 * double(VisibleQuads) / double(NumQuads) : 0.0,
+			       CulledRanges.Num(), DrawnQuads, VoxelGpuPoolCull::GMergeGapQuads);
 		}
 	}
 
-	mutable bool bLoggedCull = false;
+	mutable uint32 CullLogCounter = 0;
+	mutable bool bLoggedCullSpace = false;
+	// Reused across frames so the per-frame cull allocates nothing.
+	mutable TArray<uint32> GapScratch;
+	mutable TArray<FQuadRange> MergeScratch;
 
 
 
