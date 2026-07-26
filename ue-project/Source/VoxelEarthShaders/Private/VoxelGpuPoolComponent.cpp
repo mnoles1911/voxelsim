@@ -478,7 +478,10 @@ public:
 			// measured zero rather than as a gather that never happened.
 			if (bCull && Outcome == ECullOutcome::AllCapped)
 			{
-				RecordGather(*Views[ViewIndex], Mesh, VisibleQuadsThisGather);
+				// Explicitly ZERO. Nothing is submitted on this path, and the
+				// batch is deliberately left unpopulated -- so it must not be
+				// asked how much work it represents. See RecordGather.
+				RecordGather(*Views[ViewIndex], /*SubmittedQuads=*/0, VisibleQuadsThisGather);
 				continue;
 			}
 
@@ -560,7 +563,7 @@ public:
 			// AFTER the elements are built and BEFORE they are handed over, so
 			// what is counted is exactly what is submitted -- including both
 			// fallback paths, which is the half the cull's own log cannot see.
-			RecordGather(*Views[ViewIndex], Mesh, VisibleQuadsThisGather);
+			RecordGather(*Views[ViewIndex], CountSubmittedQuads(Mesh), VisibleQuadsThisGather);
 
 			Collector.AddMesh(ViewIndex, Mesh);
 		}
@@ -1268,7 +1271,25 @@ private:
 		return Total;
 	}
 
-	void RecordGather(const FSceneView& View, const FMeshBatch& Mesh, uint32 InVisibleQuads) const
+	// Takes the submitted count EXPLICITLY rather than reading it off an FMeshBatch.
+	//
+	// It used to take the batch and count its elements, which is correct only
+	// AFTER the batch has been populated -- and the all-capped path records a
+	// gather that deliberately populates nothing. Collector.AllocateMesh() hands
+	// back a RECYCLED FMeshBatch, so Elements[0].NumPrimitives still held a
+	// previous gather's value and the census read it as real work.
+	//
+	// It reported 185,612,113 quads per camera gather against a 13,088,897-quad
+	// pool -- impossible on its face, but only because the pool size happened to
+	// be in front of me. What killed it was the frame time: the same run measured
+	// p50 5.85 ms against 20.73 ms for the un-capped config, i.e. three and a half
+	// times FASTER while apparently drawing fourteen times more. The draw was
+	// right the whole time; the instrument was reading a stale field.
+	//
+	// Found only because the all-capped path was deliberately forced with
+	// GPUShadowMaxLevel -1, having never once executed in a normal run. Passing
+	// the number in removes the ordering requirement rather than documenting it.
+	void RecordGather(const FSceneView& View, uint64 InSubmittedQuads, uint32 InVisibleQuads) const
 	{
 		const int32 Period = VoxelGpuPoolCull::GStatsPeriod;
 		if (Period <= 0)
@@ -1277,8 +1298,7 @@ private:
 		}
 
 		const bool bShadowGather = View.GetDynamicMeshElementsShadowCullFrustum() != nullptr;
-		const uint64 Submitted = CountSubmittedQuads(Mesh);
-		(bShadowGather ? ShadowCensus : CameraCensus).Accumulate(Submitted, InVisibleQuads);
+		(bShadowGather ? ShadowCensus : CameraCensus).Accumulate(InSubmittedQuads, InVisibleQuads);
 
 		if (bShadowGather)
 		{
