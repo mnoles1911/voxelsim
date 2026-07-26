@@ -1050,30 +1050,64 @@ private:
 		const uint64 ShadowGathers = ShadowCensus.Gathers.load(std::memory_order_relaxed);
 		const uint64 ShadowQuads = ShadowCensus.SubmittedQuads.load(std::memory_order_relaxed);
 		const uint64 CamVisible = CameraCensus.VisibleQuads.load(std::memory_order_relaxed);
-		const uint64 ShadowVisible = ShadowCensus.VisibleQuads.load(std::memory_order_relaxed);
-		const uint64 TotalQuads = CamQuads + ShadowQuads;
+
+		// WINDOWED AS WELL AS CUMULATIVE, and the window is the number to read.
+		//
+		// The cumulative figures start at proxy creation, which is BEFORE the
+		// cascade has streamed in -- so they average a nearly-empty pool together
+		// with a settled one and understate both quad counts. That dilution is
+		// not identical between two configs, because their streaming trajectories
+		// are not identical, so it does not cancel in the delta the experiment is
+		// built on. The last window of a settled leg contains no fill-in frames at
+		// all, which is what the pre-registered rule is written against.
+		const uint64 WinCamGathers = CameraGathers - LastCamGathers.exchange(CameraGathers, std::memory_order_relaxed);
+		const uint64 WinCamQuads = CamQuads - LastCamQuads.exchange(CamQuads, std::memory_order_relaxed);
+		const uint64 WinShadowGathers = ShadowGathers - LastShadowGathers.exchange(ShadowGathers, std::memory_order_relaxed);
+		const uint64 WinShadowQuads = ShadowQuads - LastShadowQuads.exchange(ShadowQuads, std::memory_order_relaxed);
+		const uint64 WinCamVisible = CamVisible - LastCamVisible.exchange(CamVisible, std::memory_order_relaxed);
+
+		if (WinCamGathers == 0)
+		{
+			return;
+		}
+
+		const uint64 WinTotalQuads = WinCamQuads + WinShadowQuads;
 
 		// S is the whole point of the experiment: the factor by which a
 		// main-view-only quad count understates what the frame actually drew.
 		// Wave A's ~1.19 us/1000 quads was a whole-frame delta-p50 over a
 		// main-view-only delta-quads, so the true slope is 1.19 / S and the
 		// saving compaction can recover on the camera view scales the same way.
-		const double S = CamQuads > 0 ? double(TotalQuads) / double(CamQuads) : 0.0;
+		//
+		// NOTE this is S at ONE config. The quantity the rule is written against
+		// is S_delta, formed from the DIFFERENCE between uncull and cull at a
+		// pose -- computed off two legs, not read off one line. S here is the
+		// per-config ingredient and a sanity check, not the verdict.
+		const double S = WinCamQuads > 0 ? double(WinTotalQuads) / double(WinCamQuads) : 0.0;
 
 		UE_LOG(LogTemp, Log,
-		       TEXT("%s census: cameraGathers=%llu shadowGathers=%llu (%.2f per camera gather) | "
+		       TEXT("%s census[window]: cameraGathers=%llu shadowGathers=%llu (%.2f per camera gather) | "
 		            "quads/cameraGather: camera=%.0f shadow=%.0f total=%.0f | S=%.3f | "
-		            "visible/cameraGather: camera=%.0f shadow=%.0f | poolQuads=%d cull=%d"),
-		       *PoolName, CameraGathers, ShadowGathers,
-		       double(ShadowGathers) / double(CameraGathers),
-		       double(CamQuads) / double(CameraGathers),
-		       double(ShadowQuads) / double(CameraGathers),
-		       double(TotalQuads) / double(CameraGathers),
+		            "visible/cameraGather camera=%.0f | poolQuads=%d cull=%d "
+		            "| cumulative: camGathers=%llu shadowGathers=%llu camQuads=%llu shadowQuads=%llu"),
+		       *PoolName, WinCamGathers, WinShadowGathers,
+		       double(WinShadowGathers) / double(WinCamGathers),
+		       double(WinCamQuads) / double(WinCamGathers),
+		       double(WinShadowQuads) / double(WinCamGathers),
+		       double(WinTotalQuads) / double(WinCamGathers),
 		       S,
-		       double(CamVisible) / double(CameraGathers),
-		       double(ShadowVisible) / double(CameraGathers),
-		       NumQuads, VoxelGpuPoolCull::IsEnabled() ? 1 : 0);
+		       double(WinCamVisible) / double(WinCamGathers),
+		       NumQuads, VoxelGpuPoolCull::IsEnabled() ? 1 : 0,
+		       CameraGathers, ShadowGathers, CamQuads, ShadowQuads);
 	}
+
+	// Previous report's cumulative values, so each report can state its own
+	// window. Only ever touched on a reporting camera gather.
+	mutable std::atomic<uint64> LastCamGathers{ 0 };
+	mutable std::atomic<uint64> LastCamQuads{ 0 };
+	mutable std::atomic<uint64> LastShadowGathers{ 0 };
+	mutable std::atomic<uint64> LastShadowQuads{ 0 };
+	mutable std::atomic<uint64> LastCamVisible{ 0 };
 
 
 
