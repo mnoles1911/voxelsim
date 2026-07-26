@@ -170,6 +170,47 @@ is why the asset edit should not be attempted without it: a naive unpack that
 treats 0 as black would render every component-path chunk black the moment the
 material is regenerated.
 
+> ### CORRECTED 2026-07-26 (Wave E) — the two paragraphs above are inverted
+>
+> Kept rather than overwritten, the same way correction 3 below keeps its
+> superseded verdict visible. **The design decision was right in spirit and wrong
+> in fact, and the fact is the load-bearing half.**
+>
+> A material asking for texture coordinate 1 does **not** receive zero on the
+> component path. It receives **texture coordinate 0**:
+>
+> - `FLocalVertexFactory` is fed by
+>   `FStaticMeshVertexBuffers::InitFromDynamicVertex(&VertexFactory, Vertices)`
+>   (`VoxelChunkComponent.cpp:634`), whose `NumTexCoords` parameter **defaults to
+>   1** (`StaticMeshResources.h:347`); `BuildChunkVertexData` writes only
+>   `Vert.TextureCoordinate[0]` (`:437`).
+> - `LocalVertexFactory.ush` **clamps** a material's request to the mesh's UV
+>   count, and clamping duplicates rather than zeroes —
+>   `min(CoordinateIndex, NumFetchTexCoords-1)` at `:729-730` under manual vertex
+>   fetch, and the same thing spelled out as a ternary at `:737` otherwise. Both
+>   branches agree.
+> - Those UVs are world-planar metres wrapped to 32 m (`WrapWorldToUV`,
+>   `VoxelChunkComponent.cpp:136-141`), so the value is position-varying in
+>   (−32, 32).
+>
+> The renderer that really does deliver zero is the **pooled** one
+> (`VoxelQuadVertexFactory.ush:437-439` sets only `TexCoords[0]`;
+> `MakeInitializedMaterialPixelParameters` zero-fills).
+>
+> So the failure mode this section was written to prevent was mis-identified.
+> Identity-as-zero would not have blacked out the component path; it would have
+> multiplied the **default renderer's** BaseColor by ±32 of position-dependent
+> garbage, which is harder to spot because it reads as a shading bug.
+>
+> **Measured** with a probe material (`Tools/probe_texcoord1.py`) that adds
+> `EmissiveColor = abs(TexCoord1) * 0.05` and nothing else: component-path
+> terrain is repainted in red/green sawtooth bands resetting on a 32 m grid,
+> **30.91%** of pixels differing at >8/255 against a **3.58%** same-run floor,
+> while the identical material leaves the pooled path alone. Images and the
+> corrected encoding — a sentinel range, valid because *no* texture coordinate
+> this project can produce leaves (−32, 32) — are in `docs/gpu-waves-plan.md`
+> under "E1 — what was actually found".
+
 Regenerate with:
 
 ```

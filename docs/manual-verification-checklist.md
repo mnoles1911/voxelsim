@@ -93,6 +93,40 @@ ocean plane the pool does not touch. `-VoxelFloodTest=70` sets one up. Look for
 translucent water at the right waterline with the cavern floor visible through
 it.
 
+### 4a. Water frame cost — the number automation could not take (added Wave E)
+
+Same shape as item 3, same reason, and it is now the *only* thing blocking a
+verdict on the water pool. Headless legs were held rather than run: up to four UE
+sessions were live on the box at once, and a contended frame-time number is worse
+than no number because it looks like a result.
+
+If you have the machine to yourself, this takes ten minutes and settles it:
+
+1. Launch with `-VoxelFloodTest=70` once and note the pose it prints
+   (`VoxelFloodTest [lake/static] camera: ACTUAL (...)`). At the reference seed it
+   is `(42030, 21000, 96062) rot(pitch −25, yaw 0)`.
+2. `voxel.Water.GPU 0`, get to that pose, hold **completely still**, let it
+   settle, read `stat unit` — Frame / Draw / GPU.
+3. Quit, `voxel.Water.GPU 1`, same pose, settle, read again.
+4. Twice each, alternating, and treat the two same-config readings as the noise
+   floor. If they straddle the difference, there is no difference to report.
+
+The pooled path's whole claim is ~2,200 water primitives collapsing to **one**,
+so Draw is the number to watch, not Frame.
+
+### 4b. Water translucency — one sort key for the whole world (added Wave E)
+
+The pool draws all water as one primitive, so there is one translucent sort key
+for every water surface in the world, and triangles blend in pool-allocation
+order. The argument that this is invisible is narrow and worth an eye: it holds
+only because base colour and opacity are constant and there is no refraction.
+
+At the cavern lake, with something in view where **two water surfaces overlap in
+depth** (looking along the lake at a shallow angle, or across a lower pool
+through the near shore), A/B `voxel.Water.GPU 0` and `1`. They should be
+indistinguishable. If they are not, the pool needs per-region sort keys before
+any of W5's fill-fraction shading, foam, caustics or refraction can land.
+
 ## 5. Digging (optional but valuable)
 
 - Dig straight down more than ~40 m. The shaft should stay solid all the way; a
@@ -100,6 +134,20 @@ it.
   there matters.
 - Save, quit, reload, and look at the same shaft. Saved worlds used to lose
   structures above the sky-band trim.
+
+## 6. Per-chunk debug tints, when they land (added Wave E)
+
+Not built — it needs a vertex-factory change this wave did not own. When it does
+land, the thing to check is **the renderer that is not being demoed**: the tint
+rides a second texture coordinate, and the component path does not supply one, so
+it receives a *duplicate of texture coordinate 0* rather than zero (measured, see
+`docs/gpu-waves-plan.md` Wave E). A wrong encoding shows up as component-path
+terrain repainted in red/green bands that reset every 32 m — the same signature
+the probe produced deliberately.
+
+So: with debug tints **off**, `voxel.Stream.GPU 0` terrain must look exactly as
+it does today. That is the regression to watch, not whether the tint itself
+works.
 
 ---
 

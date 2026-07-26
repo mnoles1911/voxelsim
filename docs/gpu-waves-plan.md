@@ -739,6 +739,11 @@ negate the throughput gain.
   arrives as zero there regardless of the graph, and a naive unpack treating 0 as
   black would render every component-path chunk black the moment the material is
   regenerated. Debug-only in play.
+
+  > **CORRECTED 2026-07-26 — the sentence in bold is the wrong way round, and it
+  > is the sentence the whole item was resting on.** Kept above rather than
+  > overwritten, the way `backlog.md` §6a keeps its superseded diagnosis visible.
+  > Full write-up below under "E1 — what was actually found".
 - **E2 — water pool parity number.** `voxel.Water.GPU` is landed and renders
   correctly (2,231 cavern bricks / 28,862 quads in one primitive) but its comparison
   is honestly missing: same-path repeats differed 20–88%. Needs a scene whose only
@@ -749,6 +754,190 @@ negate the throughput gain.
 - **E3 — ring cross-fade: CLOSED, do not build.** Re-tested after the seam fix gave
   the annuli their overlap band; it still produces see-through patches at ring
   boundaries. It is the one item on the G0 checklist that should not be built.
+
+### E1 — what was actually found (2026-07-26)
+
+**Nothing shipped, and `M_VoxelTerrain.uasset` is unmodified on this branch.**
+What landed instead is the reason the planned implementation would have broken
+the default renderer.
+
+#### The premise is inverted
+
+A material that asks for texture coordinate 1 does **not** get zero on the
+component path. It gets **texture coordinate 0**.
+
+1. The component path is `FLocalVertexFactory` fed by
+   `FStaticMeshVertexBuffers::InitFromDynamicVertex(&VertexFactory, Vertices)`
+   (`ue-project/Source/VoxelEarth/VoxelChunkComponent.cpp:634`). That overload's
+   `NumTexCoords` parameter **defaults to 1**
+   (`Engine/Source/Runtime/Engine/Public/StaticMeshResources.h:347`), and
+   `BuildChunkVertexData` writes only `Vert.TextureCoordinate[0]` (`:437`).
+2. `LocalVertexFactory.ush` **clamps** the material's request to what the mesh
+   has, and clamping *duplicates* rather than zeroes. Manual vertex fetch — the
+   SM5+/D3D12 path — does it at `:729-730`:
+
+   ```hlsl
+   // Clamp coordinates to mesh's maximum as materials can request more than are available
+   uint ClampedCoordinateIndex = min(CoordinateIndex, NumFetchTexCoords-1);
+   ```
+
+   and the non-manual-fetch branch does the same explicitly at `:737`
+   (`Result.TexCoords[1] = NumFetchTexCoords > 1 ? Input.TexCoords0.zw : Result.TexCoords[0];`).
+   Both branches agree, so the answer does not depend on which one compiles.
+3. Those UVs are world-planar metres wrapped to a 32 m period (`WrapWorldToUV`,
+   `VoxelChunkComponent.cpp:136-141`), so component-path `TexCoord1` is a
+   **position-varying value in (−32, 32)** — not 0, not 1.
+
+The renderer that genuinely delivers zero is the **pooled** one:
+`VoxelQuadVertexFactory.ush`'s `GetMaterialPixelParameters` writes only
+`Result.TexCoords[0]` (`:437-439`), and `MakeInitializedMaterialPixelParameters`
+zero-fills the struct (`MaterialTemplate.ush:664-671`).
+
+So identity-as-zero would not have blacked out the component path. It would have
+multiplied the **default renderer's** BaseColor by ±32 of position-dependent
+garbage — which is worse than black, because it reads as a shading bug rather
+than an obviously broken build.
+
+#### Measured, on both renderers
+
+Reasoning about the graph is not admissible here (the parity doc says as much),
+so this was put on screen. `ue-project/Tools/probe_texcoord1.py` edits
+`M_VoxelTerrain` to add **`EmissiveColor = abs(TexCoord1) * 0.05`** and nothing
+else. BaseColor is untouched, so the term is purely additive: if `TexCoord1` is
+zero the frame is unchanged; if it is anything else the frame lights up.
+
+Same anchor (default spawn), same `-VoxelScreenshotAfter=50`, same build; the
+only variable is the material, and then the renderer.
+
+Four runs: {shipped, probe} × {component, pooled}. Each run captures at +51 s and
++53 s, so **each run carries its own same-path noise floor** — the two shots are
+2 s of streaming and TSR apart, with nothing else different.
+
+| renderer | probe vs its own control | that run's own noise floor | verdict |
+|---|---|---|---|
+| **component** | **30.91%** (shot 0), **71.21%** (shot 1) | 3.58% / 3.63% | **8.5–20× the floor** |
+| **pooled** | 3.68% (shot 0), 2.48% (shot 1) | 4.25% / 4.90% | **inside the floor** |
+
+Same material, same anchor, same build, same settle. One renderer moves an order
+of magnitude past its own floor; the other does not move at all.
+
+The component-path probe frame is not subtle: the snowfield is repainted in red
+and green sawtooth bands that reset on a 32 m grid — exactly `(|U|, |V|, 0)`
+with `U`, `V` the world-planar UV, wrapping where `fmod` returns to zero. Red is
+`|U|`, green is `|V|`, blue stays 0 because the probe appends a zero.
+
+Images: `docs/images/e1-texcoord/{01-component-control, 02-component-probe,
+03-pooled-probe, 04-pooled-control}.png`.
+
+**A bonus control nobody designed.** The pooled frame is not 100% pooled — at the
+capture the pool held 1,039 of 1,055 chunks (998,294 of 1,010,693 quads, 98.5%),
+and the handful that were not pooled are drawn by `UVoxelChunkComponent` in the
+same frame. Those are the *only* geometry in `03-pooled-probe.png` that lights
+up: one small floating formation, glowing exactly as it does in
+`02-component-probe.png`, against pooled terrain that does not. Both renderers,
+one frame, one material, and the boundary is visible. (What routes those chunks
+to components under `voxel.Stream.GPU 1` is not established here and is worth a
+separate look; it is not this finding.)
+
+**Settle state, stated because the rule requires it:** these captures are **not**
+settled — `loaded≈2000` of ~10,000 chunks, `jobsInFlight≈20`, `pendingJobs≈1400`
+at the capture, because three other agents' UE sessions were running on the box
+and streaming fell to ~14 chunks/s against ~220 chunks/s uncontended. That is
+acceptable *for this specific question and no other*: the signal is a per-pixel
+shading term on whatever terrain is drawn, not a difference in which terrain is
+drawn, and the control and probe runs tracked each other to within 1% chunk for
+chunk at the capture frame (2006 vs 1987 loaded). It would not be acceptable for
+a frame-time or a geometry-coverage claim.
+
+#### The corrected encoding
+
+Both renderers wrap UVs to a 32 m period with `fmod`, so **no texture coordinate
+this project can produce ever leaves (−32, 32)**. That makes a sentinel range
+free, and it is correct on both paths with one graph, no switch node, no
+permutation and no component-path cost:
+
+```
+tinted   ->  store (tint * k) + 1000
+identity ->  anything below ~100   (covers BOTH the component path's
+                                    duplicated UV and the pooled path's zero)
+```
+
+The alternative — make the component path supply a real second UV set
+(`InitFromDynamicVertex(..., /*NumTexCoords=*/2)` plus
+`TextureCoordinate[1] = (0,0)`) — also works and restores identity-as-zero
+honestly, but costs 8 bytes per vertex on the renderer that is currently the
+default, for a debug-only feature. Prefer the sentinel.
+
+#### What is left, and why this wave did not do it
+
+Finishing E1 needs two things this wave does not own:
+
+- `ue-project/Shaders/VoxelQuadVertexFactory.ush` — widen `TexCoords` to
+  `float4` and set `Result.TexCoords[1]` (Wave A owns `VoxelQuadVertexFactory.*`).
+- the pooled-path writer that packs the tint into `ChunkParams.w`
+  (`VoxelGpuPoolComponent`, also Wave A).
+
+And `docs/gpu-g4-parity-plan.md` correction 1 says in terms that regenerating the
+binary asset the shipping renderer draws with is not on the critical path for
+anything and should not be done "while we're here". Regenerating it for a feature
+that cannot be exercised in this wave, under an encoding that would then have to
+change again, is exactly that. The asset was edited only by the probe and
+restored with `git checkout --`.
+
+### E2 — HELD, not run (2026-07-26)
+
+Not attempted, deliberately, and this is a decision rather than an omission.
+
+The measurement needs the box to itself. During this session there were up to
+**four concurrent UE instances** (Wave A, Wave B, Wave C and this one) plus
+concurrent UBT builds; one editor launch blocked ~3 minutes on the UBT mutex, and
+streaming throughput fell to ~14 chunks/s against ~220 chunks/s uncontended.
+Interleaving the legs cancels *drift* in machine load but not *step changes* when
+another agent's run starts or ends mid-sequence, and a contended frame-time
+number is worse than no number because it looks like a result. That is the same
+failure mode as the retracted G5 numbers.
+
+**The fixture is built and ready**, and one piece of it was missing until now:
+
+- `-VoxelPerfFlight=static` pins the pose the pawn *spawned* at, and
+  `RestartPlayer` always spawns on a **surface** column — it grounds the pawn on
+  the highest solid voxel with air above it, and `-VoxelCameraHigh` only moves it
+  further up (it rejects values ≤ 0). So the fixture could not be aimed at the
+  only voxel water this world has, which is underground; and the two fixtures
+  that *do* go there (`-VoxelFloodTest`, `-VoxelCavernShot`) move the camera on
+  their own timers, which static mode then overwrites on the next tick.
+  **`-VoxelPerfStaticAt=X,Y,Z` (UU)** closes that, and takes UU rather than
+  metres so the pose `-VoxelFloodTest` prints can be copied verbatim.
+  **Status: compiles; its abort-on-malformed branch is confirmed working in a
+  live run; the pin itself is NOT yet exercised end to end.** The abort fired for
+  real on the first attempt — `FParse::Value`'s default terminator set includes
+  `,`, so `-VoxelPerfStaticAt=42030,21000,96062` was read as `42030`, exactly the
+  trap `ParseSpawnColumnUU` documents for `-VoxelSpawnAt`
+  (`VoxelEarthGameMode.cpp:37-41`). Fixed with `bShouldStopOnSeparator=false`.
+  Without the abort the fixture would have silently pinned at the surface spawn
+  and produced a perfectly plausible "cavern lake" measurement of a mountaintop.
+  Re-run the pin before trusting any leg.
+- The scene: `-VoxelFloodTest=70` locates the flooded cavern at lake surface
+  `(42000, 21000, 95848)` UU and reports its shore pose as
+  `(42030, 21000, 96062) rot(pitch −25, yaw 0)` — reproduced this session, with
+  `59970 candidate brick(s)` in the implicit pass and the lake filling most of
+  the frame. Pinning there directly gives the **static** implicit lake with no CA
+  activity and no carve, so the water geometry is identical between legs.
+- Plan: `-VoxelPerfRun=150 -VoxelPerfFlight=static -VoxelPerfStaticAt=42030,21000,96062
+  -VoxelPerfYaw=0 -VoxelPerfPitch=-25`, legs interleaved `0,1,0,1,0,1` on
+  `voxel.Water.GPU`, three per config, noise floor taken as the worst
+  within-config spread, and **no number published if the ranges overlap**.
+  Scene identity checked per leg from the implicit candidate-brick count and the
+  terrain `loaded=`/`quads=` at settle, not assumed.
+
+**The constraint to record regardless of the number** (asked for while planning,
+and already stated at length in `docs/gpu-water-pool-design.md:46-82`): one pooled
+primitive means **one translucent sort key for all water in the world**. It is
+harmless for the current material only because base colour and opacity are
+constant and there is no refraction, so a stack of N surfaces transmits
+`(1−0.55)^N` in any order. W5's fill-fraction shading, foam, caustics or
+refraction would each break that, as would a second translucent material
+intersecting the water volume. Do not add them and assume the pool still holds.
 
 ---
 

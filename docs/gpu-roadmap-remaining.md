@@ -171,6 +171,29 @@ regardless of the graph, and a naive unpack treating 0 as black would render
 every component-path chunk black the moment the material is regenerated.
 *In-game effect: debug-only. Invisible in normal play.* Low priority.
 
+> **CORRECTED 2026-07-26 (Wave E). The paragraph above is exactly backwards, and
+> the wrong half is the safety argument.** A material asking for texture
+> coordinate 1 does **not** receive zero on the component path. It receives
+> **texture coordinate 0** — the world-planar UV, wrapped to a 32 m period, so a
+> position-varying value in (−32, 32). `FLocalVertexFactory` *clamps* a
+> material's texcoord request to the number of UV sets the mesh actually has, and
+> clamping duplicates rather than zeroes
+> (`LocalVertexFactory.ush:729-730`, and again explicitly at `:737`); the mesh
+> has one, because `VoxelChunkComponent.cpp:634` takes
+> `InitFromDynamicVertex`'s default `NumTexCoords = 1`. The renderer that really
+> does deliver zero is the **pooled** one.
+>
+> So identity-as-zero would not have blacked out the component path. It would
+> have multiplied its BaseColor by ±32 of position-dependent garbage — worse,
+> because it reads as a shading bug rather than an obviously broken build.
+> **Measured, not argued:** a probe material with
+> `EmissiveColor = abs(TexCoord1) * 0.05` repaints component-path terrain in red
+> and green sawtooth bands at the 32 m UV wrap, 30.9% of pixels differing at
+> >8/255 against a 3.6% same-run floor, while the identical material leaves the
+> pooled path untouched. See `docs/gpu-waves-plan.md` Wave E for the images and
+> the corrected encoding (a sentinel range, which works because *no* texture
+> coordinate this project can produce leaves (−32, 32)).
+
 **E2 — Water pool.** Landed, `voxel.Water.GPU 0`. Renders correctly (2,231 cavern
 bricks / 28,862 quads in one primitive). **Its parity number is honestly missing**
 — same-path repeat runs differed 20–88%, so the comparison said nothing. Needs a
