@@ -1,4 +1,4 @@
-#include "VoxelGpuPoolComponent.h"
+﻿#include "VoxelGpuPoolComponent.h"
 
 #include "VoxelQuadVertexFactory.h"
 #include "PrimitiveSceneProxy.h"
@@ -191,7 +191,7 @@ public:
 		VertexFactory.InitResource(RHICmdList);
 
 		UE_LOG(LogTemp, Log,
-		       TEXT("%s: %d chunks, %d quads, %d triangles — ONE primitive, ONE draw"),
+		       TEXT("%s: %d chunks, %d quads, %d triangles â€” ONE primitive, ONE draw"),
 		       *PoolName, NumChunks, NumQuads, NumQuads * 2);
 
 	}
@@ -231,9 +231,8 @@ public:
 			// Silence is ambiguous: a pool that draws nothing looks identical
 			// whether the renderer never asked or the batch was rejected. Say
 			// which.
-			if (!bLoggedElements)
+			if (ElementsLogged.Increment() == 1)
 			{
-				bLoggedElements = true;
 				UE_LOG(LogTemp, Warning,
 				       TEXT("%s draw SKIPPED: numQuads=%d srv=%d materialProxy=%d"),
 				       *PoolName, NumQuads, QuadBufferSRV.IsValid() ? 1 : 0, MaterialProxy != nullptr ? 1 : 0);
@@ -241,9 +240,8 @@ public:
 			return;
 		}
 
-		if (!bLoggedElements)
+		if (ElementsLogged.Increment() == 1)
 		{
-			bLoggedElements = true;
 			UE_LOG(LogTemp, Log,
 			       TEXT("%s draw SUBMITTED: numQuads=%d views=%d visMap=0x%x"),
 			       *PoolName, NumQuads, Views.Num(), VisibilityMap);
@@ -301,14 +299,23 @@ public:
 			// nothing here touches FScene -- and trades "one draw" for "one draw
 			// per visible run", which is the trade the measurement says is worth
 			// making.
+			// LOCAL, not a member. GetDynamicMeshElements is called CONCURRENTLY --
+			// bSupportsParallelGDME defaults to true, so the renderer gathers the
+			// main view and every shadow cascade on parallel tasks, all through this
+			// one const method on this one proxy. Holding the cull's working set in
+			// mutable members therefore had several views writing the same array at
+			// once, and what got drawn was a mixture of their answers: a plausible
+			// count of quads, spatially unrelated to any one view's frustum. That is
+			// the whole under-selection. It also crashed -- reassigning the array
+			// while another thread iterated it asserted in the D3D12 RHI.
+			TArray<FQuadRange> Ranges;
 			const bool bCull = VoxelGpuPoolCull::IsEnabled() && Runs.Num() > 0 && NumQuads > 0;
-			CulledRanges.Reset();
 			if (bCull)
 			{
-				BuildCulledRanges(*Views[ViewIndex]);
+				BuildCulledRanges(*Views[ViewIndex], Ranges);
 			}
 
-			if (!bCull || CulledRanges.Num() == 0)
+			if (!bCull || Ranges.Num() == 0)
 			{
 				// Not culling, or the cull produced nothing usable -- draw
 				// everything, which is always correct and never worse than
@@ -335,7 +342,7 @@ public:
 				// screenshot rather than trusting: getting it wrong draws the
 				// wrong geometry rather than none.
 				Mesh.Elements.Reset();
-				for (const FQuadRange& Range : CulledRanges)
+				for (const FQuadRange& Range : Ranges)
 				{
 					FMeshBatchElement& Element = Mesh.Elements.AddDefaulted_GetRef();
 					Element.IndexBuffer = nullptr;
@@ -456,14 +463,18 @@ private:
 	int32 ChunkEdgeVoxels = 32;
 
 	struct FQuadRange { uint32 First = 0; uint32 Count = 0; };
-	// Rebuilt every frame per view. mutable because GetDynamicMeshElements is
-	// const; the renderer calls it once per view per frame on the render thread.
-	mutable TArray<FQuadRange> CulledRanges;
 
 	// Frustum-test every run, then merge the survivors back into as few pool
 	// ranges as possible. Runs arrive sorted by pool offset, so the merge is a
 	// single linear pass.
-	void BuildCulledRanges(const FSceneView& View) const
+	//
+	// RE-ENTRANT BY CONSTRUCTION. Everything this touches is either read-only
+	// proxy state or a local -- see the note in GetDynamicMeshElements about
+	// bSupportsParallelGDME. The earlier version kept the working arrays as
+	// mutable members "reused across frames so the per-frame cull allocates
+	// nothing", which is a sound instinct for a method called once per frame and
+	// wrong for one called once per frame PER VIEW, in parallel.
+	void BuildCulledRanges(const FSceneView& View, TArray<FQuadRange>& CulledRanges) const
 	{
 		const FMatrix& LocalToWorldMatrix = GetLocalToWorld();
 		uint32 VisibleQuads = 0;
@@ -488,7 +499,7 @@ private:
 			// Deliberately NOT merged: adjacent ranges have a zero gap, so the
 			// merge below would collapse them straight back to one draw and the
 			// experiment would test nothing.
-			if (++CullLogCounter % 600 == 1)
+			if (CullLogCounter.Increment() % 600 == 1)
 			{
 				UE_LOG(LogTemp, Log, TEXT("%s cull: DEBUG SPLIT into %d ranges covering %d quads"),
 				       *PoolName, CulledRanges.Num(), NumQuads);
@@ -506,21 +517,20 @@ private:
 		// pre-shadow-translated world space, so the translation has to come back
 		// out before they can be tested against absolute world boxes. Same
 		// adjustment FHierarchicalStaticMeshSceneProxy makes for foliage.
+		FConvexVolume ShadowFrustumLocal;
 		const FConvexVolume* Frustum = &View.ViewFrustum;
 		const bool bShadowGather = View.GetDynamicMeshElementsShadowCullFrustum() != nullptr;
 		if (bShadowGather)
 		{
 			const FConvexVolume& ShadowFrustum = *View.GetDynamicMeshElementsShadowCullFrustum();
-			ShadowFrustumScratch.Planes.Reset();
-			ShadowFrustumScratch.PermutedPlanes.Reset();
 			for (const FPlane& Src : ShadowFrustum.Planes)
 			{
 				FPlane Norm = Src / Src.Size();
 				Norm.W -= (FVector(Norm) | View.GetPreShadowTranslation());
-				ShadowFrustumScratch.Planes.Add(Norm);
+				ShadowFrustumLocal.Planes.Add(Norm);
 			}
-			ShadowFrustumScratch.Init();
-			Frustum = &ShadowFrustumScratch;
+			ShadowFrustumLocal.Init();
+			Frustum = &ShadowFrustumLocal;
 		}
 
 		// Why each run was dropped. Every one of these paths is a `continue` that
@@ -567,9 +577,8 @@ private:
 			// cull that selects none look identical from the outside, and both
 			// read as "the pool is broken"; this prints the operands instead of
 			// inferring them.
-			if (!bLoggedCullSpace)
+			if (CullSpaceLogged.Increment() == 1)
 			{
-				bLoggedCullSpace = true;
 				UE_LOG(LogTemp, Warning,
 				       TEXT("%s cullspace: chunk0 local=(%.0f,%.0f,%.0f) edge=%.0f -> worldCentre=(%.0f,%.0f,%.0f) ext=(%.0f,%.0f,%.0f) | viewOrigin=(%.0f,%.0f,%.0f) | l2wTrans=(%.0f,%.0f,%.0f)"),
 				       *PoolName, Entry.X, Entry.Y, Entry.Z, EdgeUU,
@@ -598,7 +607,7 @@ private:
 		// merging (which only ever ADDS quads) would destroy the experiment.
 		if (VoxelGpuPoolCull::GDebugInvert != 0)
 		{
-			if (++CullLogCounter % 600 == 1)
+			if (CullLogCounter.Increment() % 600 == 1)
 			{
 				UE_LOG(LogTemp, Log,
 				       TEXT("%s cull: DEBUG INVERT drawing the REJECTED set: ranges=%d quads=%u/%d"),
@@ -625,26 +634,26 @@ private:
 		const int32 MaxRanges = FMath::Max(1, VoxelGpuPoolCull::GMaxRanges);
 		if (CulledRanges.Num() > MaxRanges)
 		{
-			GapScratch.Reset();
-			GapScratch.Reserve(CulledRanges.Num() - 1);
+			TArray<uint32> Sorted;
+			Sorted.Reserve(CulledRanges.Num() - 1);
 			for (int32 I = 1; I < CulledRanges.Num(); ++I)
 			{
 				const uint32 PrevEnd = CulledRanges[I - 1].First + CulledRanges[I - 1].Count;
-				GapScratch.Add(CulledRanges[I].First >= PrevEnd ? CulledRanges[I].First - PrevEnd : 0u);
+				Sorted.Add(CulledRanges[I].First >= PrevEnd ? CulledRanges[I].First - PrevEnd : 0u);
 			}
 			// The (n - MaxRanges)th smallest gap is the threshold that leaves
 			// exactly MaxRanges ranges. Sorting is O(n log n) on a few thousand
 			// entries, once per view per frame.
-			TArray<uint32> Sorted = GapScratch;
 			Sorted.Sort();
 			const int32 MergesNeeded = CulledRanges.Num() - MaxRanges;
 			const uint32 GapThreshold = Sorted[FMath::Clamp(MergesNeeded - 1, 0, Sorted.Num() - 1)];
 
-			MergeScratch.Reset();
-			MergeScratch.Add(CulledRanges[0]);
+			TArray<FQuadRange> Merged;
+			Merged.Reserve(MaxRanges);
+			Merged.Add(CulledRanges[0]);
 			for (int32 I = 1; I < CulledRanges.Num(); ++I)
 			{
-				FQuadRange& Last = MergeScratch.Last();
+				FQuadRange& Last = Merged.Last();
 				const uint32 LastEnd = Last.First + Last.Count;
 				const uint32 Gap = CulledRanges[I].First >= LastEnd ? CulledRanges[I].First - LastEnd : 0u;
 				if (Gap <= GapThreshold)
@@ -653,10 +662,10 @@ private:
 				}
 				else
 				{
-					MergeScratch.Add(CulledRanges[I]);
+					Merged.Add(CulledRanges[I]);
 				}
 			}
-			CulledRanges = MergeScratch;
+			CulledRanges = MoveTemp(Merged);
 		}
 
 		// Too fragmented to be worth it, or nothing visible at all -- either way
@@ -692,7 +701,7 @@ private:
 		// rejecting everything. That ambiguity hid a broken cull for a whole
 		// verification cycle -- and because the empty case falls back to the full
 		// draw, the picture was correct either way and proved nothing.
-		if (++CullLogCounter % 600 == 1)
+		if (CullLogCounter.Increment() % 600 == 1)
 		{
 			UE_LOG(LogTemp, Log,
 			       TEXT("%s cull: runs=%d runQuads=%u/%d visibleQuads=%u (%.1f%%) ranges=%d drawnQuads=%u "
@@ -705,19 +714,19 @@ private:
 		}
 	}
 
-	mutable uint32 CullLogCounter = 0;
-	mutable bool bLoggedCullSpace = false;
-	// Reused across frames so the per-frame cull allocates nothing.
-	mutable TArray<uint32> GapScratch;
-	mutable TArray<FQuadRange> MergeScratch;
-	mutable FConvexVolume ShadowFrustumScratch;
+	// Concurrent, for the same reason the cull's working set had to stop being a
+	// member: several views run this method at once. A racing ++ on a plain int
+	// is undefined behaviour and, more practically, would let the periodic log
+	// miss or duplicate its slot.
+	mutable FThreadSafeCounter CullLogCounter;
+	mutable FThreadSafeCounter CullSpaceLogged;
 
 
 
 	FBufferRHIRef QuadBuffer, ChunkIdBuffer, OriginBuffer, ParamsBuffer;
 	FShaderResourceViewRHIRef QuadBufferSRV, ChunkIdSRV, OriginSRV, ParamsSRV;
 
-	mutable bool bLoggedElements = false;
+	mutable FThreadSafeCounter ElementsLogged;
 	int32 NumQuads = 0;      // drawn
 	int32 BufferQuads = 0;   // allocated
 	int32 NumChunks = 0;
