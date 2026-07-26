@@ -26,6 +26,7 @@
 #include "HAL/IConsoleManager.h"
 #include "VoxelGpuWorldGen.h"
 #include "VoxelGpuRegionBuild.h"
+#include "VoxelMeshTypes.h" // PackVoxelChunkQuad / UnpackVoxelChunkQuad, for the D4 round-trip check
 // The SHIPPING footprint-band reduction, lifted out of VoxelWorldSubsystem.cpp
 // so this gate compares BandReduceMain against it rather than a transcription.
 #include "VoxelFootprintBand.h"
@@ -791,6 +792,49 @@ namespace
 				UE_LOG(LogVoxelGpuVerify, Log,
 				       TEXT("  [%s] quad decode: %d vertices match the CPU reference exactly"),
 				       Region.Name, Gpu.Quads.Num() * 6);
+			}
+
+			// Wave D / D4. UnpackVoxelChunkQuad is what lets a GPU-meshed chunk
+			// feed the GI light field, which takes FVoxelChunkQuad and not the
+			// packed word. Checked HERE, against the real GPU quad stream,
+			// rather than in a unit test over synthetic values: the failure
+			// that matters is a field the packer and unpacker disagree about on
+			// geometry that actually occurs, and this region has 3,000+ of it.
+			// The round trip is lossless by construction, so any mismatch is a
+			// transcription error in one of the two shift tables.
+			{
+				int32 RoundTripMismatches = 0;
+				for (int32 QI = 0; QI < Gpu.Quads.Num(); ++QI)
+				{
+					const uint64 Packed = Gpu.Quads[QI];
+					if (PackVoxelChunkQuad(UnpackVoxelChunkQuad(Packed)) != Packed)
+					{
+						if (RoundTripMismatches < 5)
+						{
+							UE_LOG(LogVoxelGpuVerify, Error,
+							       TEXT("    quad %d: 0x%016llx -> unpack -> repack -> 0x%016llx"),
+							       QI, Packed, PackVoxelChunkQuad(UnpackVoxelChunkQuad(Packed)));
+						}
+						++RoundTripMismatches;
+					}
+				}
+				if (RoundTripMismatches > 0)
+				{
+					UE_LOG(LogVoxelGpuVerify, Error,
+					       TEXT("[D4 quad pack round-trip] FAIL — [%s] %d of %d quads do not survive ")
+					       TEXT("UnpackVoxelChunkQuad -> PackVoxelChunkQuad. A GPU-meshed chunk feeds ")
+					       TEXT("the GI light field through that inverse, so this is silent wrong ")
+					       TEXT("lighting, not a draw fault."),
+					       Region.Name, RoundTripMismatches, Gpu.Quads.Num());
+					bAllOk = false;
+				}
+				else
+				{
+					UE_LOG(LogVoxelGpuVerify, Log,
+					       TEXT("[D4 quad pack round-trip] PASS — [%s] all %d quads survive ")
+					       TEXT("unpack->repack byte-identically"),
+					       Region.Name, Gpu.Quads.Num());
+				}
 			}
 
 			// Wave D / D6. Its own PASS/FAIL lines, like D3's quad-total

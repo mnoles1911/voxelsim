@@ -8,6 +8,8 @@
 #include "VoxelChunkMesher.h"
 #include "VoxelClimateProbe.h"
 #include "VoxelGpuPoolComponent.h"
+#include "VoxelGpuMeshJobManager.h" // Wave D / D4: the async GPU mesh runner, forked into DispatchJobs
+#include "VoxelGpuRegionBuild.h"    // FillRasterWindow -- shared with both GPU verify harnesses
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
@@ -2360,6 +2362,26 @@ struct FVoxelWorldImpl
 	FThreadSafeCounter JobsInFlightCounter;
 	TArray<UE::Tasks::TTask<void>> InFlightTasks; // only for a clean Deinitialize() wait; see WaitForInFlightTasks
 
+	// --- GPU meshing (ADR-0006, Wave D / D4) --------------------------------
+	//
+	// The async runner, owned here so it lives exactly as long as the streaming
+	// state its results feed. Created lazily on the first GPU-forked dispatch
+	// (so a session that never enables the fork never constructs it) and
+	// destroyed in WaitForInFlightTasks, which is also where its outstanding
+	// jobs are cancelled -- see there for the teardown-ordering argument, which
+	// is the one genuinely load-bearing part of this wiring.
+	//
+	// NOT in InFlightTasks: a GPU job has no UE::Tasks::TTask to wait on.
+	TUniquePtr<FVoxelGpuMeshJobManager> GpuMeshJobs;
+	// Cleared before CancelAll at teardown, so cancellations delivered while
+	// Impl is being destroyed are absorbed instead of enqueued onto a
+	// ResultsQueue nothing will ever drain again.
+	bool bAcceptingGpuResults = true;
+	// Counted rather than silent: a delivery arriving after the fork is
+	// disarmed is expected at teardown and would be a bug at any other time, so
+	// the number is worth having in the log rather than inferring from silence.
+	int64 GpuResultsAbsorbedAtTeardown = 0;
+
 	bool bHasRecomputed = false;
 	VoxelCoords::FVoxelChunkKey LastAnchorChunk{}; // level 0 anchor chunk; gates the whole RecomputeDesiredSet call
 	FVector LastAnchorLocation = FVector::ZeroVector;
@@ -2461,15 +2483,42 @@ struct FVoxelWorldImpl
 	// that column -- the throttle exists to save work, not for correctness --
 	// while holding one forever costs the ring.
 	TMap<FIntPoint, double> FootprintBlindJobInFlight;
+	// Which of those marks was seeded by a GPU-meshed job (Wave D / D4). Kept
+	// beside the map rather than folded into its value so the mark's own
+	// lifetime rules stay literally unchanged -- added and removed in exactly
+	// the same two places, and empty whenever the GPU fork is off.
+	//
+	// It exists only to SPLIT the age-out counter below. See there.
+	TSet<FIntPoint> FootprintBlindJobIsGpu;
 	// Generous next to a worker job (measured p50 well under 100 ms) so a healthy
 	// column is never released early, but short enough that a stranded one
 	// recovers in seconds rather than never.
+	//
+	// DELIBERATELY NOT RAISED FOR GPU JOBS (Wave D / D4). A GPU job's
+	// submit->deliver time is longer and, at time of writing, unmeasured -- so
+	// the obvious move is to raise this. That is the wrong trade: raising it
+	// slows recovery from a genuine strand, and this throttle exists to SAVE
+	// WORK, not for correctness. An extra blind job costs one job; a stranded
+	// (X,Y) column costs its whole ring, and has done, twice. The mark stays at
+	// 5 s and the counter is split instead.
 	static constexpr double kBlindJobMarkTimeoutSeconds = 5.0;
 	int64 ColdBandDefersSinceLog = 0; // column-mates held back, per 5s log window
-	// Marks released by the age-out above. Should be ZERO on a healthy run --
-	// any non-zero value means a launch path produced no result, which is the
-	// bug this backstop exists to survive, and is worth chasing.
+	// Marks released by the age-out above WITH NOTHING IN FLIGHT. Should be ZERO
+	// on a healthy run -- any non-zero value means a launch path produced no
+	// result, which is the bug this backstop exists to survive, and is worth
+	// chasing. That sentence is the only diagnostic for a bug this project has
+	// now fixed twice, which is why the GPU case is counted separately below
+	// rather than being allowed to blunt it.
 	int64 ColdBandMarkTimeoutsSinceLog = 0;
+	// Marks released by the age-out while a GPU-meshed job for that footprint
+	// was still legitimately in flight (Wave D / D4). NOT a bug: it means GPU
+	// delivery outran the 5 s mark, and the cost is one redundant blind job for
+	// that column. PRE-EMPTIVE, and recorded as such -- the only datapoint in
+	// hand is a 921 ms dispatch->ready max on a warmup leg, comfortably under
+	// the mark, so this is expected to read zero today. It is here so that if
+	// GPU latency ever does cross 5 s, the fact lands in its own counter
+	// instead of turning the line above into noise.
+	int64 ColdBandGpuLatencyTimeoutsSinceLog = 0;
 	int32 ColdBandHeldThisFrame = 0;  // held on the most recent DispatchJobs pass
 
 	// --- Bounded admission (docs/status.md "Streaming pipeline re-measure +
@@ -3466,6 +3515,50 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 		Task.Wait();
 	}
 	InFlightTasks.Empty();
+
+	// --- GPU-meshed jobs (Wave D / D4) --------------------------------------
+	//
+	// A GPU job adds NOTHING to InFlightTasks -- there is no UE::Tasks::TTask,
+	// only a ref-counted job object inside FVoxelGpuMeshJobManager -- so the
+	// loop above does not cover it and this function's whole guarantee would
+	// have a hole in it exactly the size of the wave.
+	//
+	// WHY CancelAll AND NOT A WAIT. The manager cannot be waited on: its
+	// completion path is a render-thread readback polled from Tick(), and Tick
+	// is not going to run again during teardown. CancelAll() is the manager's
+	// own answer -- it delivers Cancelled for every queued and in-flight job,
+	// which is what satisfies the exactly-one-outcome invariant its header
+	// states. It deliberately does NOT flush the render thread: any render
+	// command still in flight holds its own reference to the job it touches, so
+	// those objects stay alive after this returns and die with the manager.
+	//
+	// WHY THE CALLBACK MUST BE NEUTRALISED FIRST, and this is the subtle half.
+	// CancelAll delivers results, and our delivery callback enqueues onto
+	// ResultsQueue and decrements JobsInFlightCounter -- i.e. it TOUCHES Impl
+	// state, during Impl teardown, for chunks whose records are about to be
+	// destroyed. Nothing would ever drain that queue. So the fork is disarmed
+	// first: bAcceptingGpuResults is cleared, the callback becomes a counted
+	// no-op, and the cancellations are absorbed rather than acted on.
+	//
+	// The invariant is not weakened by that. "Exactly one outcome per job" is a
+	// statement about the MANAGER, and CancelAll still satisfies it for every
+	// job. What changes is only what the subsystem chooses to do with an
+	// outcome that arrives after it has stopped streaming, which is nothing --
+	// the correct action for a world that is being destroyed.
+	bAcceptingGpuResults = false;
+	if (GpuMeshJobs.IsValid())
+	{
+		const int32 Outstanding = GpuMeshJobs->NumQueued() + GpuMeshJobs->NumInFlight();
+		GpuMeshJobs->CancelAll();
+		if (Outstanding > 0)
+		{
+			UE_LOG(LogVoxelStream, Log,
+			       TEXT("WaitForInFlightTasks: cancelled %d outstanding GPU mesh job(s) at teardown "
+			            "(%lld absorbed after the fork was disarmed)"),
+			       Outstanding, (long long)GpuResultsAbsorbedAtTeardown);
+		}
+		GpuMeshJobs.Reset();
+	}
 }
 
 void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
@@ -5656,6 +5749,26 @@ void FVoxelWorldImpl::DispatchJobs()
 	// flight." The multiplier is now voxel.Stream.JobsInFlightPerCore (default
 	// 2, i.e. byte-identical to the old hardcoded form) -- see that cvar's
 	// comment in VoxelDebug.cpp for the dispatch-starvation measurement.
+	//
+	// SIZING THIS AGAINST A GPU JOB IS A DIFFERENT PROBLEM (Wave D / D4), and
+	// the per-core form is the wrong shape for it. JobsInFlightCounter means
+	// "work outstanding" and is decremented when the job's RESULT is produced,
+	// not when it is dispatched -- true on the worker path today (the decrement
+	// sits one line after ResultsQueue.Enqueue) and deliberately kept true on
+	// the GPU path, where the analogous site is the manager's OnJobComplete.
+	//
+	// The consequence is that this cap must absorb GPU LATENCY as well as work.
+	// A worker job's lifetime is its own CPU time; a GPU job's is the manager's
+	// queue wait plus the dispatch plus TWO readback phases plus one
+	// game-thread tick of poll quantisation per phase. So the cap that
+	// saturates the GPU is a function of LATENCY x RATE, not of core count, and
+	// a value tuned for 24 workers will starve a pipeline whose jobs take
+	// frames rather than milliseconds.
+	//
+	// Do NOT retune it and the ring slot floors in the same change. The
+	// recorded catastrophe is exactly that: floors {0,2,3,4,4} reserved 13 of
+	// 24 slots and collapsed throughput from 49,179 chunks to 558, and with two
+	// knobs moving nobody could say which had done it.
 	const int32 MaxJobsInFlight =
 		VoxelDebug::GetStreamJobsInFlightPerCore() * FPlatformMisc::NumberOfCoresIncludingHyperthreads();
 	const bool bRingQuota = VoxelStreamAdmission::GetRingQuotaEnabled();
@@ -5784,8 +5897,21 @@ void FVoxelWorldImpl::DispatchJobs()
 					// Stale: the seeding job never produced a result. Drop the
 					// mark and let this chunk through as the new seed rather
 					// than deferring its column forever.
+					//
+					// Split by which kind of job seeded it. A GPU job that is
+					// simply slower than 5 s is not the bug this backstop
+					// exists for, and counting it in the same bucket would
+					// destroy the "should be ZERO on a healthy run" property
+					// that is the only signal for the real one.
 					FootprintBlindJobInFlight.Remove(Footprint);
-					++ColdBandMarkTimeoutsSinceLog;
+					if (FootprintBlindJobIsGpu.Remove(Footprint) > 0)
+					{
+						++ColdBandGpuLatencyTimeoutsSinceLog;
+					}
+					else
+					{
+						++ColdBandMarkTimeoutsSinceLog;
+					}
 				}
 				else
 				{
@@ -6958,7 +7084,11 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		// behind a mark that nothing ever removes.
 		if (Result.Key.Level == 0)
 		{
-			FootprintBlindJobInFlight.Remove(FIntPoint(Result.Key.Key.X, Result.Key.Key.Y));
+			const FIntPoint DoneFootprint(Result.Key.Key.X, Result.Key.Key.Y);
+			FootprintBlindJobInFlight.Remove(DoneFootprint);
+			// Same site, same condition, so the GPU tag can never outlive the
+			// mark it annotates (Wave D / D4).
+			FootprintBlindJobIsGpu.Remove(DoneFootprint);
 		}
 
 		// -VoxelVerifyBuriedSkip soundness check: this chunk's band verdict
