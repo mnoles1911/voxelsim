@@ -70,6 +70,16 @@ struct FVoxelGpuPoolBuffers
 
 using FVoxelGpuPoolBuffersRef = TSharedPtr<FVoxelGpuPoolBuffers, ESPMode::ThreadSafe>;
 
+// One contiguous run of quads to write into the GPU buffer. First is the
+// destination offset in the pool; SrcOffset indexes the flat staging array the
+// render command carries, since several runs travel in one payload.
+struct FVoxelQuadUploadRun
+{
+	uint32 First = 0;
+	uint32 Count = 0;
+	uint32 SrcOffset = 0;
+};
+
 UCLASS(ClassGroup = Rendering, meta = (BlueprintSpawnableComponent))
 class VOXELEARTHSHADERS_API UVoxelGpuPoolComponent : public UPrimitiveComponent
 {
@@ -256,8 +266,27 @@ private:
 	// Ranges written since the last upload, in quads. Streaming touches a few
 	// chunks per frame out of thousands, so uploading the whole pool for each
 	// change would be absurd -- at cascade scale that is 75 MB per edit.
+	//
+	// A LIST, NOT ONE SPAN (Wave D / D1, path 2). This used to be a single
+	// {First, Last} merged with Min/Max, which meant two chunks written at
+	// distant pool offsets marked EVERYTHING BETWEEN THEM dirty and re-uploaded
+	// it from the CPU shadow. That is a large amount of pointless upload on the
+	// CPU path -- and once the GPU writes quads into the pool directly, it is
+	// silent corruption: any GPU-written range caught in the gap between two
+	// CPU-written chunks gets overwritten with stale shadow content, on every
+	// add or remove.
+	//
+	// The span was always an OVER-APPROXIMATION of what the CPU actually wrote:
+	// every dirty region comes from a write to one chunk's range, and the
+	// Min/Max merge threw that precision away. Keeping the intervals is not
+	// extra bookkeeping, it is declining to discard information already in hand.
+	//
+	// The property that makes this the whole fix for path 2: an interval only
+	// ever covers quads the CPU WROTE, so a GPU-written range is untouchable by
+	// construction -- no GPU-range tracking, nothing to keep in sync, and no way
+	// for the two to drift apart.
 	struct FDirtyRange { uint32 First = 0; uint32 Last = 0; bool bValid = false; };
-	FDirtyRange DirtyQuads;
+	TArray<FDirtyRange> DirtyQuadRanges;
 	bool bChunkTableDirty = false;
 
 	// Set whenever the set of live ALLOCATIONS changes -- which is not the same

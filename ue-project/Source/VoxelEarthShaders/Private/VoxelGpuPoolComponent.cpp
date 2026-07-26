@@ -464,31 +464,44 @@ public:
 	// streaming through a pool viable or not.
 	// NewQuads/NewIds hold ONLY the dirty range, indexed from zero; First is
 	// where it lands in the GPU buffer.
+	// One lock/unlock pair per RUN. NewQuads/NewIds are the flattened payload;
+	// each run says where its slice starts in them and where it lands in the
+	// pool. Several exact runs, not one span covering the untouched geometry
+	// between them -- see UVoxelGpuPoolComponent::DirtyQuadRanges.
 	void UpdateQuadRange_RenderThread(FRHICommandListBase& RHICmdList,
 	                                  const TArray<uint64>& NewQuads,
 	                                  const TArray<uint32>& NewIds,
-	                                  uint32 First, uint32 Count, int32 NewNumQuads)
+	                                  const TArray<FVoxelQuadUploadRun>& UploadRuns,
+	                                  int32 NewNumQuads)
 	{
-		if (!QuadBuffer.IsValid() || Count == 0)
+		if (!QuadBuffer.IsValid() || UploadRuns.Num() == 0)
 		{
 			NumQuads = NewNumQuads;
 			return;
 		}
 
-		const uint32 QuadOffsetBytes = First * sizeof(uint64);
-		const uint32 QuadSizeBytes = Count * sizeof(uint64);
-		if (void* Dst = RHICmdList.LockBuffer(QuadBuffer, QuadOffsetBytes, QuadSizeBytes, RLM_WriteOnly))
+		for (const FVoxelQuadUploadRun& Run : UploadRuns)
 		{
-			FMemory::Memcpy(Dst, NewQuads.GetData(), QuadSizeBytes);
-			RHICmdList.UnlockBuffer(QuadBuffer);
-		}
+			if (Run.Count == 0)
+			{
+				continue;
+			}
 
-		const uint32 IdOffsetBytes = First * sizeof(uint32);
-		const uint32 IdSizeBytes = Count * sizeof(uint32);
-		if (void* Dst = RHICmdList.LockBuffer(ChunkIdBuffer, IdOffsetBytes, IdSizeBytes, RLM_WriteOnly))
-		{
-			FMemory::Memcpy(Dst, NewIds.GetData(), IdSizeBytes);
-			RHICmdList.UnlockBuffer(ChunkIdBuffer);
+			const uint32 QuadSizeBytes = Run.Count * sizeof(uint64);
+			if (void* Dst = RHICmdList.LockBuffer(QuadBuffer, Run.First * sizeof(uint64),
+			                                      QuadSizeBytes, RLM_WriteOnly))
+			{
+				FMemory::Memcpy(Dst, NewQuads.GetData() + Run.SrcOffset, QuadSizeBytes);
+				RHICmdList.UnlockBuffer(QuadBuffer);
+			}
+
+			const uint32 IdSizeBytes = Run.Count * sizeof(uint32);
+			if (void* Dst = RHICmdList.LockBuffer(ChunkIdBuffer, Run.First * sizeof(uint32),
+			                                      IdSizeBytes, RLM_WriteOnly))
+			{
+				FMemory::Memcpy(Dst, NewIds.GetData() + Run.SrcOffset, IdSizeBytes);
+				RHICmdList.UnlockBuffer(ChunkIdBuffer);
+			}
 		}
 
 		NumQuads = NewNumQuads;
@@ -917,7 +930,7 @@ void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 	AllocationChunkIds.Reset();
 	NumLiveChunks = 0;
 	LocalBounds = FBox(ForceInit);
-	DirtyQuads = {};
+	DirtyQuadRanges.Reset();
 	bChunkTableDirty = false;
 	bRunsDirty = false;
 }
@@ -1044,6 +1057,43 @@ void UVoxelGpuPoolComponent::ClearChunks()
 }
 
 
+// How close two dirty runs must be before they are merged into one.
+//
+// The trade is real in both directions: merging uploads quads nobody wrote,
+// while not merging costs an extra LockBuffer/UnlockBuffer per run. The old
+// code sat at one extreme (always merge, one run, unbounded waste).
+//
+// DEFAULT 0 = MERGE ONLY WHAT ACTUALLY TOUCHES. That is the setting that makes
+// the path-2 correctness property hold exactly: a merged run can span quads the
+// CPU did not write, which for a non-zero gap could include a GPU-written
+// range. Raise it only for measured upload-call savings on a CPU-only pool, and
+// never above the smallest GPU-written allocation.
+//
+// This knob is PROVEN LIVE, not assumed: voxel.Stream.PoolUploadStats prints
+// the run count and bytes per update, so changing the gap visibly changes both.
+// That check exists because this project already shipped
+// voxel.Stream.GPUCullMergeGap, which was declared, documented, and never read
+// by anything -- a knob that silently ignores you is worse than no knob.
+static int32 GVoxelPoolDirtyMergeGap = 0;
+static FAutoConsoleVariableRef CVarVoxelPoolDirtyMergeGap(
+	TEXT("voxel.Stream.PoolDirtyMergeGap"),
+	GVoxelPoolDirtyMergeGap,
+	TEXT("Quads of gap tolerated when merging two dirty pool runs into one upload. ")
+	TEXT("0 (default) merges only touching/overlapping runs. Higher trades wasted upload ")
+	TEXT("bytes for fewer buffer locks. Verify with voxel.Stream.PoolUploadStats 1."),
+	ECVF_Default);
+
+// Prints what each incremental upload actually cost. A mechanism count, not a
+// frame time -- it is not vulnerable to contention or to the clamp, so it is
+// safe to quote from a shared box.
+static int32 GVoxelPoolUploadStats = 0;
+static FAutoConsoleVariableRef CVarVoxelPoolUploadStats(
+	TEXT("voxel.Stream.PoolUploadStats"),
+	GVoxelPoolUploadStats,
+	TEXT("1 = log runs and bytes uploaded per incremental pool update. This is how the ")
+	TEXT("dirty-run merge gap is shown to be live rather than decorative."),
+	ECVF_Default);
+
 void UVoxelGpuPoolComponent::MarkQuadsDirty(uint32 First, uint32 Count)
 {
 	if (Count == 0)
@@ -1051,14 +1101,34 @@ void UVoxelGpuPoolComponent::MarkQuadsDirty(uint32 First, uint32 Count)
 		return;
 	}
 	const uint32 Last = First + Count - 1;
-	if (!DirtyQuads.bValid)
+
+	// Insert in ascending First order, then sweep once and coalesce. The list
+	// holds one entry per chunk touched since the last upload, which the apply
+	// budget already bounds to a handful per frame, so linear is right here and
+	// an interval tree would be strictly more code for no measurable gain.
+	int32 Index = 0;
+	while (Index < DirtyQuadRanges.Num() && DirtyQuadRanges[Index].First < First)
 	{
-		DirtyQuads = { First, Last, true };
+		++Index;
 	}
-	else
+	DirtyQuadRanges.Insert(FDirtyRange{ First, Last, true }, Index);
+
+	const uint64 Gap = uint64(FMath::Max(0, GVoxelPoolDirtyMergeGap));
+	for (int32 I = 0; I + 1 < DirtyQuadRanges.Num(); )
 	{
-		DirtyQuads.First = FMath::Min(DirtyQuads.First, First);
-		DirtyQuads.Last = FMath::Max(DirtyQuads.Last, Last);
+		FDirtyRange& A = DirtyQuadRanges[I];
+		const FDirtyRange& B = DirtyQuadRanges[I + 1];
+		// Touching, overlapping, or within the gap. +1 makes [0,3] and [4,7]
+		// adjacent rather than separate at Gap 0.
+		if (uint64(B.First) <= uint64(A.Last) + 1ull + Gap)
+		{
+			A.Last = FMath::Max(A.Last, B.Last);
+			DirtyQuadRanges.RemoveAt(I + 1, EAllowShrinking::No);
+		}
+		else
+		{
+			++I;
+		}
 	}
 }
 
@@ -1069,7 +1139,7 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 	if (LiveProxy == nullptr)
 	{
 		MarkRenderStateDirty();
-		DirtyQuads = {};
+		DirtyQuadRanges.Reset();
 		bChunkTableDirty = false;
 		bRunsDirty = false;
 		return;
@@ -1079,14 +1149,24 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 	if (ChunkOrigins.Num() > LiveProxy->GetMaxChunks())
 	{
 		MarkRenderStateDirty();
-		DirtyQuads = {};
+		DirtyQuadRanges.Reset();
 		bChunkTableDirty = false;
 		bRunsDirty = false;
 		return;
 	}
 
-	const uint32 First = DirtyQuads.bValid ? DirtyQuads.First : 0;
-	const uint32 Count = DirtyQuads.bValid ? (DirtyQuads.Last - DirtyQuads.First + 1) : 0;
+	// Flatten the dirty runs into one staging payload. Several small runs beat
+	// one span covering all the untouched geometry between them -- see
+	// DirtyQuadRanges' comment for why that is both a correctness and a
+	// bandwidth argument.
+	TArray<FVoxelQuadUploadRun> UploadRuns;
+	uint32 TotalQuadsToUpload = 0;
+	for (const FDirtyRange& R : DirtyQuadRanges)
+	{
+		const uint32 RunCount = R.Last - R.First + 1;
+		UploadRuns.Add(FVoxelQuadUploadRun{ R.First, RunCount, TotalQuadsToUpload });
+		TotalQuadsToUpload += RunCount;
+	}
 	const int32 NewNumQuads = int32(Pool.GetHighWaterMark());
 	// The runs travel on the table update, so a run-only change has to send the
 	// table too. It is two small vectors per chunk; the quad buffer, which is the
@@ -1110,10 +1190,27 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 	// pool was built for.
 	TArray<uint64> QuadsSlice;
 	TArray<uint32> IdsSlice;
-	if (Count > 0)
+	QuadsSlice.Reserve(int32(TotalQuadsToUpload));
+	IdsSlice.Reserve(int32(TotalQuadsToUpload));
+	for (const FVoxelQuadUploadRun& Run : UploadRuns)
 	{
-		QuadsSlice.Append(PooledQuads.GetData() + First, int32(Count));
-		IdsSlice.Append(QuadChunkIds.GetData() + First, int32(Count));
+		QuadsSlice.Append(PooledQuads.GetData() + Run.First, int32(Run.Count));
+		IdsSlice.Append(QuadChunkIds.GetData() + Run.First, int32(Run.Count));
+	}
+
+	if (GVoxelPoolUploadStats != 0 && UploadRuns.Num() > 0)
+	{
+		// Span-equivalent cost, for comparison: what the single-span version
+		// would have uploaded for exactly this set of dirty chunks.
+		const uint32 SpanFirst = UploadRuns[0].First;
+		const uint32 SpanLast = UploadRuns.Last().First + UploadRuns.Last().Count - 1;
+		const uint32 SpanQuads = SpanLast - SpanFirst + 1;
+		UE_LOG(LogTemp, Log,
+		       TEXT("%s upload: %d run(s), %u quads (%u KB) — a single span would have been "
+		            "%u quads (%u KB), gap=%d"),
+		       *PoolName, UploadRuns.Num(), TotalQuadsToUpload,
+		       (TotalQuadsToUpload * uint32(sizeof(uint64))) / 1024u,
+		       SpanQuads, (SpanQuads * uint32(sizeof(uint64))) / 1024u, GVoxelPoolDirtyMergeGap);
 	}
 	// The chunk table is two small vectors per chunk, so it stays whole.
 	TArray<FVector4f> OriginsCopy = ChunkOrigins;
@@ -1128,17 +1225,17 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 	ENQUEUE_RENDER_COMMAND(VoxelGpuPoolIncrementalUpdate)(
 		[Proxy, QuadsSlice = MoveTemp(QuadsSlice), IdsSlice = MoveTemp(IdsSlice),
 		 OriginsCopy = MoveTemp(OriginsCopy), ParamsCopy = MoveTemp(ParamsCopy), RunsCopy = MoveTemp(RunsCopy),
-		 First, Count, NewNumQuads, bTableDirty](FRHICommandListImmediate& RHICmdList)
+		 UploadRuns = MoveTemp(UploadRuns), NewNumQuads, bTableDirty](FRHICommandListImmediate& RHICmdList)
 	{
 		if (bTableDirty)
 		{
 			Proxy->UpdateChunkTable_RenderThread(RHICmdList, OriginsCopy, ParamsCopy, RunsCopy);
 		}
 		Proxy->UpdateQuadRange_RenderThread(RHICmdList, QuadsSlice, IdsSlice,
-		                                    First, Count, NewNumQuads);
+		                                    UploadRuns, NewNumQuads);
 	});
 
-	DirtyQuads = {};
+	DirtyQuadRanges.Reset();
 	bChunkTableDirty = false;
 	bRunsDirty = false;
 
