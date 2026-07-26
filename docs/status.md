@@ -7099,6 +7099,40 @@ LUT), and the render side worked around the voxel side rather than fixing it —
 this change does not touch it." Write thresholds in units that say what they
 mean, and measure before reasoning.
 
+### CORRECTION to the table above: those frame-time numbers were noise (2026-07-25, same day)
+
+The p95/worst/hitches deltas in the entry above are **retracted**. They came from
+four legs of the scripted flight. Twelve legs, taken across contended and idle
+machines, show the ranges overlapping almost completely, with the **component**
+path holding the better median on p95 and hitches:
+
+| | component (n=6) | pooled (n=6) |
+|---|---|---|
+| p50 ms | 24.5 (17.2–42.0) | 23.7 (16.7–47.4) |
+| p95 ms | 44.3 (29.2–77.6) | **62.6** (21.8–96.6) |
+| hitches | 448 (35–810) | **627** (6–781) |
+| chunks/s | 486 (322–678) | 519 (271–839) |
+
+Two identical pooled legs on an idle box, same binary, same cvar, back to back:
+p50 **21.0 and 47.4 ms**. A 77% within-path spread, larger than the effect. The
+four legs that produced the retracted table were a coin landing the same way four
+times.
+
+The `-VoxelPerfRun` harness flies a 20 m/s circle and reports percentiles over
+whatever streaming load that path meets; residency, scheduling and GPU boost
+state all vary run to run and swamp a change worth tens of percent. **It cannot
+answer this question as currently built.**
+
+Unaffected, because neither is a wall-clock measurement: the pooled path draws
+9,822 chunks / 8,813,242 quads as ONE primitive and ONE draw call against 9,822
+primitives (verified every run); the visual parity result (17.4% → 4.3% of
+pixels, quoted against a measured 1.1% noise floor); and this file's own earlier
+finding that `renderMs` is 43.12 of a 43.92 ms frame, which is the strongest
+argument for ADR-0006 and which tonight did not re-measure.
+
+Full write-up and the proposed replacement protocol in
+`docs/streaming-handoff.md`, "CORRECTION: the G5 frame-time numbers were noise".
+
 ## erosion-v7 is PARKED, and why it cannot simply be rebased (2026-07-25)
 
 `origin/claude/erosion-v7` carries ~340 lines of dendritic drainage carving

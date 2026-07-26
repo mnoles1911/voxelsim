@@ -404,3 +404,119 @@ falls back to the **synthetic** sampler and every number moves. Junction it in
 before measuring anything (`New-Item -ItemType Junction`). With it in place
 this box reproduces the reference spawn at `loaded=9822 quads=8813242
 tracked=16417` against the recorded `9819 / 8809945 / 16417`.
+
+## The perf numbers are still owed a clean run (2026-07-25, late)
+
+The table above is labelled "direction and rough magnitude, not gate numbers".
+A re-run was attempted to upgrade it and **failed to produce a signal at all**.
+Recording the failure because the shape of it is the useful part.
+
+Four legs, interleaved GPU/CPU/GPU/CPU, 60 s each, one other headless instance
+live on the machine throughout:
+
+| | cpu-a | cpu-b | gpu-a | gpu-b |
+|---|---|---|---|---|
+| p50 ms | 42.02 | 27.00 | 26.42 | 43.21 |
+| p95 ms | 77.59 | 43.98 | 63.88 | 77.63 |
+| hitches | 810 | 524 | 636 | 781 |
+
+**Two identical CPU-path runs gave p50 42.0 and 27.0 ms — a 55% spread on the
+same binary and the same cvar.** The within-path variance exceeds any
+between-path difference, so nothing can be concluded from this, in either
+direction.
+
+Two things follow, and the second one is an open question rather than a finding:
+
+1. **Interleaving does not rescue a contended measurement.** Alternating the
+   legs was supposed to make drift work against the result; it does nothing when
+   the noise is this large relative to the effect. The only fix is an idle
+   machine.
+2. **Absolute frame times here are far worse than the earlier session** (p50
+   27-43 ms against 17-18 ms, chunks/s 320-510 against 540-840) on a `main` that
+   has since gained the escape hatch, the water pool and the GI volume. That is
+   *probably* contention, but it is **not established**, and "probably" is not
+   good enough for a frame-time regression. Worth an explicit before/after across
+   tonight's merges on an idle box.
+
+What is NOT in doubt: streaming counts are contention-independent and identical
+across every run tonight -- `loaded=9822 quads=8813242 tracked=16417`, per-ring
+`R0=1947 R1=1319 R2=1602 R3=1853 R4=1675 R5=1426`. Terrain correctness is fine;
+it is only the timing that is unmeasured.
+
+**Protocol for whoever runs this properly:** no other UE process on the box, one
+warm-up run discarded after the build, then at least two legs per path
+interleaved, and report the within-path spread alongside the between-path delta.
+If the within-path spread is comparable to the delta, the run is void -- say so
+rather than reporting the mean. The min-spec-proxy variant is a separate and
+still-owed measurement on top of this one, and note `gpu-pool-rendering-notes.md`
+warns that A/B-ing this renderer through scalability cvars measures PSO precache
+invalidation instead of the change.
+
+## CORRECTION: the G5 frame-time numbers were noise (2026-07-25, late)
+
+**Retracting the perf table above.** It was measured, it was reported in good
+faith, and it does not survive replication. Anyone reading this file should treat
+the earlier "p95 -43%, worst frame -65%, hitches -96%" as **withdrawn**.
+
+Twelve 60 s legs of the same scripted flight were taken across the evening --
+four under heavy contention, four under light contention, four on a genuinely
+idle machine. Pooling all of them by path:
+
+| | component (n=6) | | pooled (n=6) | |
+|---|---|---|---|---|
+| | median | range | median | range |
+| p50 ms | 24.5 | 17.2 - 42.0 | 23.7 | 16.7 - 47.4 |
+| p95 ms | 44.3 | 29.2 - 77.6 | **62.6** | 21.8 - 96.6 |
+| hitches | 448 | 35 - 810 | **627** | 6 - 781 |
+| chunks/s | 486 | 322 - 678 | 519 | 271 - 839 |
+
+The ranges overlap almost completely on every metric, and on p95 and hitches the
+**component path has the better median**. The first four legs happened to favour
+the pool on every metric, which is what produced the retracted table; twelve legs
+show that was a coin landing the same way four times.
+
+Even on an idle box the harness is not stable: two identical pooled legs, same
+binary, same cvar, back to back, gave p50 21.0 and 47.4 ms -- a 77% spread,
+larger than any effect being looked for.
+
+### What is still solid, and what is not
+
+**Solid, and not a timing measurement at all:** the pooled path renders 9,822
+chunks and 8,813,242 quads as **ONE primitive and ONE draw call**, against 9,822
+primitives on the component path. That is a structural property of the design,
+verified from the logs on every run, and it is independent of the machine. So is
+the visual parity work (17.4% -> 4.3% of pixels, against a 1.1% floor), which is
+a large effect measured against its own noise floor.
+
+**Not established:** that this converts into better frame times, at any
+percentile, on this hardware, with this harness. ADR-0006's *prior* basis for the
+thesis -- the earlier measurement that `renderMs` is 43.12 of a 43.92 ms frame
+while voxel work is a rounding error -- is untouched by this and remains the
+strongest argument on the table. It is just not something tonight re-measured.
+
+### Why this harness cannot answer the question
+
+`-VoxelPerfRun` flies a 20 m/s circle for 60 s and reports percentiles over
+whatever streaming load that path happens to encounter. Chunk residency, job
+scheduling and GPU boost state all vary run to run, and the resulting spread
+swamps a change worth tens of percent. Three ways out, cheapest first:
+
+1. **Measure the structural claim instead**, since it is the actual mechanism:
+   primitives in the scene, draw calls, and render-thread time in
+   `FScene::AddPrimitive` specifically. `stat scenerendering` / a targeted
+   counter, not wall-clock percentiles.
+2. **Make the flight deterministic** -- fixed camera path *and* a pre-warmed,
+   settled residency set, so the only variable is the renderer.
+3. If wall-clock percentiles are wanted anyway, **many more legs** and report
+   the within-path spread beside the delta, refusing to quote a mean when the two
+   are comparable.
+
+### The lesson, which is the durable part
+
+`gpu-pool-rendering-notes.md` already says *"prefer a control experiment to a
+bisect"*. This is the same rule one level up: **four runs that agree are not a
+control**. The cheap control here was two consecutive identical runs, and it was
+never taken until the numbers had already been written into a commit message, a
+PR, an ADR and a cvar comment. Take the noise-floor measurement *first*, and
+quote every delta against it -- exactly the discipline the screenshot diffs in
+this same session used, and the timing measurements did not.

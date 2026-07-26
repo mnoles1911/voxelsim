@@ -23,9 +23,12 @@ public:
 	                        const TArray<uint64>& InQuads,
 	                        const TArray<uint32>& InChunkIds,
 	                        const TArray<FVector4f>& InOrigins,
-	                        const TArray<FVector4f>& InParams)
+	                        const TArray<FVector4f>& InParams,
+	                        const FString& InPoolName,
+	                        int32 InChunkTableCapacity)
 		: FPrimitiveSceneProxy(Component)
 		, VertexFactory(GetScene().GetFeatureLevel())
+		, PoolName(InPoolName)
 		, Quads(InQuads)
 		, ChunkIds(InChunkIds)
 		, Origins(InOrigins)
@@ -33,7 +36,7 @@ public:
 		, NumQuads(Component->GetHighWaterMarkQuads())
 		, BufferQuads(InQuads.Num())
 		, NumChunks(InOrigins.Num())
-		, MaxChunks(FMath::Max(InOrigins.Num() * 4, 1024))
+		, MaxChunks(FMath::Max(InOrigins.Num() * 4, InChunkTableCapacity))
 	{
 		UMaterialInterface* Material = Component->GetChunkMaterialOrDefault();
 		MaterialProxy = Material->GetRenderProxy();
@@ -110,8 +113,8 @@ public:
 		VertexFactory.InitResource(RHICmdList);
 
 		UE_LOG(LogTemp, Log,
-		       TEXT("VoxelGpuPool: %d chunks, %d quads, %d triangles — ONE primitive, ONE draw"),
-		       NumChunks, NumQuads, NumQuads * 2);
+		       TEXT("%s: %d chunks, %d quads, %d triangles — ONE primitive, ONE draw"),
+		       *PoolName, NumChunks, NumQuads, NumQuads * 2);
 
 	}
 
@@ -124,6 +127,11 @@ public:
 		Result.bDynamicRelevance = true;
 		Result.bUsesLightingChannels = GetLightingChannelMask() != GetDefaultLightingChannelMask();
 		Result.bRenderCustomDepth = ShouldRenderCustomDepth();
+		// Matches FWaterChunkSceneProxy. Inert for an opaque material, so this
+		// costs terrain nothing; it is what a TRANSLUCENT pool (the water
+		// instance) needs in order to receive translucent self-shadowing the
+		// same way the per-brick water components do.
+		Result.bTranslucentSelfShadow = bCastVolumetricTranslucentShadow;
 		MaterialRelevance.SetPrimitiveViewRelevance(Result);
 		// Must come after SetPrimitiveViewRelevance, which is what fills in
 		// bOpaque. Same expression as FVoxelChunkSceneProxy so the two renderers
@@ -149,8 +157,8 @@ public:
 			{
 				bLoggedElements = true;
 				UE_LOG(LogTemp, Warning,
-				       TEXT("VoxelGpuPool draw SKIPPED: numQuads=%d srv=%d materialProxy=%d"),
-				       NumQuads, QuadBufferSRV.IsValid() ? 1 : 0, MaterialProxy != nullptr ? 1 : 0);
+				       TEXT("%s draw SKIPPED: numQuads=%d srv=%d materialProxy=%d"),
+				       *PoolName, NumQuads, QuadBufferSRV.IsValid() ? 1 : 0, MaterialProxy != nullptr ? 1 : 0);
 			}
 			return;
 		}
@@ -159,8 +167,8 @@ public:
 		{
 			bLoggedElements = true;
 			UE_LOG(LogTemp, Log,
-			       TEXT("VoxelGpuPool draw SUBMITTED: numQuads=%d views=%d visMap=0x%x"),
-			       NumQuads, Views.Num(), VisibilityMap);
+			       TEXT("%s draw SUBMITTED: numQuads=%d views=%d visMap=0x%x"),
+			       *PoolName, NumQuads, Views.Num(), VisibilityMap);
 		}
 
 		// Editor Wireframe view mode, mirroring FVoxelChunkSceneProxy. Without
@@ -279,10 +287,20 @@ public:
 
 	int32 GetMaxChunks() const { return MaxChunks; }
 
+	// Same expression FVoxelChunkSceneProxy and FWaterChunkSceneProxy use. For
+	// an opaque material this is the base class's answer anyway; it is spelled
+	// out because the translucent (water) instance is the case where the two
+	// answers could diverge.
+	bool CanBeOccluded() const override { return !MaterialRelevance.bDisableDepthTest; }
+
 	uint32 GetMemoryFootprint() const override { return sizeof(*this) + GetAllocatedSize(); }
 
 private:
 	mutable FVoxelQuadVertexFactory VertexFactory;
+
+	// Which pool this is, for the log lines below. There is more than one
+	// instance now and they are diagnosed almost entirely from those lines.
+	FString PoolName;
 
 	TArray<uint64> Quads;
 	TArray<uint32> ChunkIds;
@@ -328,8 +346,10 @@ void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 	// Nothing is drawn from this entry (scale 0 collapses it), so the values only
 	// have to be harmless.
 	ChunkParams.Add(FVector4f(0.5f, 0.5f, kNoSurfaceGate, 0.0f));
+	FreeChunkIds.Reset();
 
 	Allocations.Reset();
+	AllocationChunkIds.Reset();
 	NumLiveChunks = 0;
 	LocalBounds = FBox(ForceInit);
 }
@@ -346,15 +366,28 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 		// Out of CONTIGUOUS room, which is not the same as out of space --
 		// see FVoxelGpuGeometryPool. The caller decides whether to compact.
 		UE_LOG(LogTemp, Warning,
-		       TEXT("VoxelGpuPool: no room for %d quads (%u free, largest run %u)"),
-		       InQuads.Num(), Pool.GetFreeQuads(), Pool.GetLargestFreeRun());
+		       TEXT("%s: no room for %d quads (%u free, largest run %u)"),
+		       *PoolName, InQuads.Num(), Pool.GetFreeQuads(), Pool.GetLargestFreeRun());
 		return INDEX_NONE;
 	}
 
-	const uint32 ChunkId = uint32(ChunkOrigins.Num());
 	const float Scale = float(1 << Level);
-	ChunkOrigins.Add(FVector4f(OriginUU.X, OriginUU.Y, OriginUU.Z, Scale));
-	ChunkParams.Add(Params);
+	// Re-use a table entry a removed chunk gave back before appending a new one.
+	// See FreeChunkIds for why the append-only version was a cliff rather than a
+	// slow leak on any pool with real churn.
+	uint32 ChunkId;
+	if (FreeChunkIds.Num() > 0)
+	{
+		ChunkId = FreeChunkIds.Pop(EAllowShrinking::No);
+		ChunkOrigins[int32(ChunkId)] = FVector4f(OriginUU.X, OriginUU.Y, OriginUU.Z, Scale);
+		ChunkParams[int32(ChunkId)] = Params;
+	}
+	else
+	{
+		ChunkId = uint32(ChunkOrigins.Num());
+		ChunkOrigins.Add(FVector4f(OriginUU.X, OriginUU.Y, OriginUU.Z, Scale));
+		ChunkParams.Add(Params);
+	}
 
 	for (int32 I = 0; I < InQuads.Num(); ++I)
 	{
@@ -363,11 +396,14 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 	}
 
 	const int32 Handle = Allocations.Add(Alloc);
+	AllocationChunkIds.Add(ChunkId);
+	check(AllocationChunkIds.Num() == Allocations.Num());
 	++NumLiveChunks;
 
 	// Grow the bounds by this chunk's extent. A chunk's quads never leave its
-	// own 32-voxel cube, scaled by the mip level.
-	const float EdgeUU = 320.0f * Scale;
+	// own ChunkEdgeVoxels cube, scaled by the mip level (32 voxels for a terrain
+	// render chunk, 8 for a vxc::WaterBrick8).
+	const float EdgeUU = float(ChunkEdgeVoxels) * 10.0f * Scale;
 	LocalBounds += FBox(
 		FVector(OriginUU.X, OriginUU.Y, OriginUU.Z),
 		FVector(OriginUU.X + EdgeUU, OriginUU.Y + EdgeUU, OriginUU.Z + EdgeUU));
@@ -381,6 +417,11 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 
 void UVoxelGpuPoolComponent::RemoveChunk(int32 Handle)
 {
+	RemoveChunkInternal(Handle, /*bRecycleChunkId=*/true);
+}
+
+void UVoxelGpuPoolComponent::RemoveChunkInternal(int32 Handle, bool bRecycleChunkId)
+{
 	if (!Allocations.IsValidIndex(Handle) || !Allocations[Handle].IsValid())
 	{
 		return;
@@ -393,6 +434,22 @@ void UVoxelGpuPoolComponent::RemoveChunk(int32 Handle)
 	for (uint32 I = 0; I < Alloc.NumQuads; ++I)
 	{
 		QuadChunkIds[int32(Alloc.Offset + I)] = kHiddenChunkId;
+	}
+
+	// Only now is the table entry unreferenced by any quad, which is what makes
+	// handing it back safe.
+	if (bRecycleChunkId && AllocationChunkIds.IsValidIndex(Handle))
+	{
+		const uint32 ChunkId = AllocationChunkIds[Handle];
+		if (ChunkId != kHiddenChunkId)
+		{
+			// Neutralise the entry as well as freeing it: if anything ever does
+			// reach it before it is re-issued, scale 0 collapses it rather than
+			// drawing a stale origin.
+			ChunkOrigins[int32(ChunkId)] = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+			FreeChunkIds.Add(ChunkId);
+			bChunkTableDirty = true;
+		}
 	}
 
 	Pool.Free(Alloc);
@@ -538,7 +595,7 @@ int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& In
 	// barely moves, so free+realloc would churn the allocator for nothing.
 	if (uint32(InQuads.Num()) <= Existing.NumQuads)
 	{
-		const uint32 ChunkId = QuadChunkIds[int32(Existing.Offset)];
+		const uint32 ChunkId = AllocationChunkIds[Handle];
 		for (int32 I = 0; I < InQuads.Num(); ++I)
 		{
 			PooledQuads[int32(Existing.Offset) + I] = InQuads[I];
@@ -556,16 +613,27 @@ int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& In
 	}
 
 	// Outgrew its slot. Reallocate, reusing the chunk's existing table entry so
-	// the table does not grow on every edit.
-	const uint32 ChunkId = QuadChunkIds[int32(Existing.Offset)];
-	const FVector4f Origin = ChunkOrigins[int32(ChunkId)];
-	const FVector4f Params = ChunkParams[int32(ChunkId)];
+	// the table does not grow on every edit -- which is why this removal passes
+	// bRecycleChunkId=false: the entry is not free, it is about to be re-pointed
+	// at the same chunk's new range. Handing it to FreeChunkIds here and then
+	// writing quads that reference it would let a LATER AddChunk issue the same
+	// id to a different chunk, and two chunks sharing a table entry means one of
+	// them silently draws at the other's origin.
+	const uint32 ChunkId = AllocationChunkIds[Handle];
 
-	RemoveChunk(Handle);
+	RemoveChunkInternal(Handle, /*bRecycleChunkId=*/false);
 
 	const FVoxelGpuPoolAllocation Alloc = Pool.Alloc(uint32(InQuads.Num()));
 	if (!Alloc.IsValid())
 	{
+		// The chunk is gone and its entry is now referenced by nothing, so give
+		// it back rather than stranding it.
+		if (ChunkId != kHiddenChunkId)
+		{
+			ChunkOrigins[int32(ChunkId)] = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);
+			FreeChunkIds.Add(ChunkId);
+			bChunkTableDirty = true;
+		}
 		return INDEX_NONE;
 	}
 	for (int32 I = 0; I < InQuads.Num(); ++I)
@@ -574,6 +642,7 @@ int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& In
 		QuadChunkIds[int32(Alloc.Offset) + I] = ChunkId;
 	}
 	Allocations[Handle] = Alloc;
+	AllocationChunkIds[Handle] = ChunkId;
 	++NumLiveChunks;
 
 	MarkQuadsDirty(Alloc.Offset, Alloc.NumQuads);
@@ -626,9 +695,9 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 			MaxIdSeen = FMath::Max(MaxIdSeen, Id);
 		}
 		UE_LOG(LogTemp, Log,
-		       TEXT("VoxelGpuPool upload: drawn=%d hidden=%d outOfRange=%d maxId=%u "
-		            "tableEntries=%d hiddenEntry=(%.1f,%.1f,%.1f,scale=%.3f)"),
-		       Drawn, HiddenQuads, OutOfRangeQuads, MaxIdSeen, ChunkOrigins.Num(),
+		       TEXT("%s upload: drawn=%d hidden=%d outOfRange=%d maxId=%u "
+		            "tableEntries=%d (%d free) hiddenEntry=(%.1f,%.1f,%.1f,scale=%.3f)"),
+		       *PoolName, Drawn, HiddenQuads, OutOfRangeQuads, MaxIdSeen, ChunkOrigins.Num(), FreeChunkIds.Num(),
 		       ChunkOrigins[0].X, ChunkOrigins[0].Y, ChunkOrigins[0].Z, ChunkOrigins[0].W);
 
 		// Where the geometry actually is, versus where the renderer will look
@@ -636,9 +705,9 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 		// these two disagreeing.
 		const FBoxSphereBounds WorldBounds = CalcBounds(GetComponentTransform());
 		UE_LOG(LogTemp, Log,
-		       TEXT("VoxelGpuPool placement: comp@(%.0f,%.0f,%.0f) firstChunk=(%.0f,%.0f,%.0f,scale=%.1f) "
+		       TEXT("%s placement: comp@(%.0f,%.0f,%.0f) firstChunk=(%.0f,%.0f,%.0f,scale=%.1f) "
 		            "boundsOrigin=(%.0f,%.0f,%.0f) boundsExtent=(%.0f,%.0f,%.0f)"),
-		       GetComponentLocation().X, GetComponentLocation().Y, GetComponentLocation().Z,
+		       *PoolName, GetComponentLocation().X, GetComponentLocation().Y, GetComponentLocation().Z,
 		       ChunkOrigins.Num() > 1 ? ChunkOrigins[1].X : 0.f,
 		       ChunkOrigins.Num() > 1 ? ChunkOrigins[1].Y : 0.f,
 		       ChunkOrigins.Num() > 1 ? ChunkOrigins[1].Z : 0.f,
@@ -648,7 +717,8 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 	}
 
 	FVoxelGpuPoolSceneProxy* Proxy =
-		new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, ChunkOrigins, ChunkParams);
+		new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, ChunkOrigins, ChunkParams,
+		                            PoolName, ChunkTableCapacity);
 	LiveProxy = Proxy;
 	return Proxy;
 }

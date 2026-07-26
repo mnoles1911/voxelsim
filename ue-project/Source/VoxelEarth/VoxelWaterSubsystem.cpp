@@ -6,6 +6,11 @@
 #include "VoxelWaterChunkComponent.h"
 #include "VoxelWorldSubsystem.h"
 
+// ADR-0006 water pool (voxel.Water.GPU): a SECOND INSTANCE of the terrain
+// geometry pool, not a copy of it. See GetOrCreateWaterPool below for what had
+// to be parameterised and what did not.
+#include "VoxelGpuPoolComponent.h"
+
 // voxel-core is UE-header-free C++20; safe to include directly from a UE
 // module .cpp (same doctrine note as VoxelWorldSubsystem.cpp).
 #include "voxelcore/amplifier.h"
@@ -29,6 +34,7 @@
 #include "Misc/CommandLine.h"
 #include "Misc/FileHelper.h" // ADR-0005 water persistence: FFileHelper (blob read/write)
 #include "Misc/Paths.h"      // ADR-0005 water persistence: FPaths::ProjectSavedDir (mirror the .vxlog path)
+#include "TimerManager.h"    // voxel.Water.SpawnIn's deferred pour
 #include "UObject/UObjectGlobals.h"
 
 #include <vector>
@@ -221,6 +227,37 @@ struct FVoxelWaterImpl
 	// BrickKey (carried as VoxelCoords::FVoxelCoord -- brick-grid
 	// coordinates; see the file-scope ToCoord/ToBrickKey doc comment).
 	TMap<VoxelCoords::FVoxelCoord, TObjectPtr<UWaterChunkComponent>> ChunkComponents;
+
+	// --- ADR-0006 water pool (voxel.Water.GPU) ------------------------------
+	//
+	// The pooled alternative to the two component maps above: ONE primitive,
+	// ONE draw, and a brick's geometry is a range in a shared quad buffer
+	// rather than a scene primitive of its own.
+	//
+	// Created lazily on the first brick that wants it, on its OWN actor as that
+	// actor's ROOT component -- attached as a child of ChunkRoot the primitive
+	// never enters the visible set at all (docs/gpu-pool-rendering-notes.md
+	// invariant 1).
+	TWeakObjectPtr<UVoxelGpuPoolComponent> Pool;
+
+	// The pool's float32 chunk table cannot hold this world's ~8.4M UU
+	// coordinates (invariant 4), so the component carries the offset in its
+	// double-precision transform and the table stores brick origins relative to
+	// it. Set once, from the first pooled brick, and never moved.
+	FVector PoolRebase = FVector::ZeroVector;
+
+	// Pool handles, keyed exactly like the component maps they replace. Two
+	// maps for the same reason there are two component maps: the implicit
+	// (worldgen) and CA (simulated) halves own disjoint bricks and hand over
+	// between themselves, and MarkMobilizedBricksDirty has to be able to drop
+	// one without touching the other.
+	TMap<VoxelCoords::FVoxelCoord, int32> PoolSlots;
+	TMap<VoxelCoords::FVoxelCoord, int32> ImplicitPoolSlots;
+
+	// 1 Hz status line for the pooled path. Budgeted before it was needed: one
+	// primitive drawing thousands of bricks has no per-brick state to inspect,
+	// so "what does the pool hold" has to come from a log line or from nowhere.
+	float PoolLogAccumSeconds = 0.f;
 
 	// Bricks touched since the last re-mesh pass (task item 4): unioned from
 	// vxc::WaterCA::activeBricks() after every fixed step, PLUS any brick an
@@ -417,6 +454,189 @@ void UVoxelWaterSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 namespace
 {
+// --- ADR-0006 water pool (voxel.Water.GPU) ---------------------------------
+//
+// WHY A SECOND INSTANCE OF UVoxelGpuPoolComponent RATHER THAN A WATER-SPECIFIC
+// COPY. The pool is generic in everything water needed it to be:
+//
+//   * The quad packing is shared already. PackVoxelChunkQuad's fields are all
+//     <= 8 bits and a water brick is 8 voxels on an edge, so brick-local
+//     coordinates fit the same encoding terrain's 32-voxel chunk-local ones do
+//     -- with 2 bits to spare rather than 3. No second decode path.
+//   * The vertex factory writes exactly the one channel M_WaterVoxel reads.
+//     That material's only input from the geometry is VertexColor.G (AO), and
+//     VoxelQuadVertexFactory.ush writes AO into .G. Channels R/B/A carry
+//     terrain-specific biome-tint and climate values, which this material does
+//     not sample -- so they are inert here, not wrong.
+//   * Translucency is a MATERIAL property, and the proxy already derives its
+//     view relevance from FMaterialRelevance. Nothing in the draw path had to
+//     learn about blend modes.
+//
+// Three things did have to be parameterised, and all three are one-line
+// setters on the shared component rather than forks of it: the log prefix
+// (two pools printing the same line is worse than no line), the per-entry edge
+// length used to grow bounds (8 voxels, not 32), and the chunk-table floor.
+//
+// The one genuine BEHAVIOURAL fix the water instance forced is in the pool
+// itself, not here: chunk-table entries were never recycled. See
+// UVoxelGpuPoolComponent::FreeChunkIds.
+UVoxelGpuPoolComponent* GetOrCreateWaterPool(FVoxelWaterImpl& Impl, AActor* ChunkOwner,
+                                             UMaterialInterface* Material,
+                                             const FVector& FirstBrickOriginUU)
+{
+	if (UVoxelGpuPoolComponent* Existing = Impl.Pool.Get())
+	{
+		return Existing;
+	}
+	UWorld* World = ChunkOwner ? ChunkOwner->GetWorld() : nullptr;
+	if (World == nullptr)
+	{
+		return nullptr;
+	}
+
+	// ITS OWN ACTOR, WITH THE POOL AS ROOT. Not attached under ChunkRoot beside
+	// the per-brick components: as a child the primitive never enters the
+	// visible set -- GetDynamicMeshElements is never called, with a live proxy,
+	// valid bounds and no warning anywhere (gpu-pool-rendering-notes.md
+	// invariant 1). The terrain pool learned this the expensive way; there was
+	// no reason to learn it twice.
+	FActorSpawnParameters PoolSpawnParams;
+	PoolSpawnParams.ObjectFlags |= RF_Transient;
+	PoolSpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	AActor* PoolOwner = World->SpawnActor<AActor>(
+		AActor::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, PoolSpawnParams);
+	if (PoolOwner == nullptr)
+	{
+		return nullptr;
+	}
+#if WITH_EDITOR
+	PoolOwner->SetActorLabel(TEXT("VoxelWaterPoolOwner"));
+#endif
+
+	UVoxelGpuPoolComponent* Pool = NewObject<UVoxelGpuPoolComponent>(PoolOwner);
+	Pool->SetPoolName(TEXT("VoxelWaterPool"));
+	// vxc::WaterBrick8::kEdge. Terrain's 32 would still be CORRECT here (a
+	// larger bounds box is a looser cull, never a lost draw), but 8 is what the
+	// geometry actually spans and this pool's bricks are 1/64th the volume.
+	Pool->SetChunkEdgeVoxels(vxc::WaterBrick8::kEdge);
+	// Above the implicit-water disc's plausible resident-brick count, so an
+	// ordinary camera move does not oscillate across the table capacity and pay
+	// a full render-state rebuild -- and a full re-upload of the quad buffer --
+	// each time it does.
+	Pool->SetChunkTableCapacity(16384);
+	// M_WaterVoxel. Without it the proxy silently falls back to the engine
+	// default material, which is opaque -- water would render as grey boxes and
+	// look like a geometry bug rather than a material one.
+	Pool->SetChunkMaterial(Material);
+	PoolOwner->SetRootComponent(Pool);
+	Pool->RegisterComponent();
+
+	// SetWorldLocation AFTER RegisterComponent, never SetRelativeLocation
+	// before: SetRootComponent on a freshly NewObject'd component installs an
+	// identity transform and redefines the actor's location as the world
+	// origin, 84 km from anything worth drawing (invariant 2).
+	Impl.PoolRebase = FirstBrickOriginUU;
+	Pool->SetWorldLocation(Impl.PoolRebase);
+
+	// Sized for the implicit-cavern-lake shell, which is the larger of the two
+	// producers by a wide margin: the CA's active set is budgeted at 4096 bricks
+	// (voxel.Water.MaxActiveBricks) and most of those are interior and emit
+	// nothing, whereas RefreshImplicitWater sweeps a 65x65x33 brick disc every
+	// time the camera crosses a brick. A brick's greedy mesh cannot exceed
+	// 6*64 = 384 quads, so this covers ~10k bricks even at the theoretical
+	// worst case and far more in practice. 32 MB.
+	constexpr uint32 kWaterPoolCapacityQuads = 4u * 1000u * 1000u;
+	Pool->InitPool(kWaterPoolCapacityQuads);
+
+	Impl.Pool = Pool;
+	UE_LOG(LogVoxelWater, Log,
+	       TEXT("voxel.Water.GPU: water pool up, %u quad capacity (%.0f MB), rebase (%.0f,%.0f,%.0f). "
+	            "Water bricks now draw as ranges in ONE primitive."),
+	       kWaterPoolCapacityQuads, double(kWaterPoolCapacityQuads) * 8.0 / (1024.0 * 1024.0),
+	       Impl.PoolRebase.X, Impl.PoolRebase.Y, Impl.PoolRebase.Z);
+	return Pool;
+}
+
+// The pooled equivalent of "destroy this brick's component". Safe to call for a
+// brick that was never pooled.
+void ReleaseWaterBrickPooled(FVoxelWaterImpl& Impl, TMap<VoxelCoords::FVoxelCoord, int32>& Slots,
+                             const VoxelCoords::FVoxelCoord& BrickCoord)
+{
+	int32 Slot = INDEX_NONE;
+	if (!Slots.RemoveAndCopyValue(BrickCoord, Slot) || Slot == INDEX_NONE)
+	{
+		return;
+	}
+	if (UVoxelGpuPoolComponent* Pool = Impl.Pool.Get())
+	{
+		Pool->RemoveChunk(Slot);
+	}
+}
+
+// Puts one brick's quads into the pool, adding or re-meshing in place.
+//
+// Returns false if the pool refused the geometry, in which case the brick is
+// left undrawn rather than half-drawn -- and the caller must NOT then fall back
+// to a component for it, because a brick drawn twice is worse than a brick
+// drawn once.
+bool ApplyWaterBrickPooled(FVoxelWaterImpl& Impl, AActor* ChunkOwner, UMaterialInterface* Material,
+                           TMap<VoxelCoords::FVoxelCoord, int32>& Slots,
+                           const VoxelCoords::FVoxelCoord& BrickCoord,
+                           const FVector& BrickOriginUU,
+                           const TArray<FVoxelChunkQuad>& Quads)
+{
+	UVoxelGpuPoolComponent* Pool = GetOrCreateWaterPool(Impl, ChunkOwner, Material, BrickOriginUU);
+	if (Pool == nullptr)
+	{
+		return false;
+	}
+
+	// The CPU mesher's quads in the 8 bytes the pool stores. Water bricks are
+	// already 0..7 on every axis, so unlike terrain there is no brick-to-chunk
+	// rebase to bake in first -- brick-local IS entry-local here.
+	TArray<uint64> Packed;
+	Packed.SetNumUninitialized(Quads.Num());
+	for (int32 I = 0; I < Quads.Num(); ++I)
+	{
+		Packed[I] = PackVoxelChunkQuad(Quads[I]);
+	}
+
+	int32* ExistingSlot = Slots.Find(BrickCoord);
+	int32 NewSlot;
+	if (ExistingSlot && *ExistingSlot != INDEX_NONE)
+	{
+		// Re-mesh in place. This is water's COMMON case, not its rare one: every
+		// active brick re-meshes at the 10 Hz CA cadence, so free+realloc on each
+		// tick would fragment the pool far faster than terrain digging does.
+		NewSlot = Pool->UpdateChunk(*ExistingSlot, Packed);
+	}
+	else
+	{
+		// Params: water's material samples none of these. Climate is held at the
+		// neutral midpoint and the surface gate at kNoSurfaceGate ("everything
+		// counts as surface"), which is the same well-defined fallback the pool
+		// gives its own hidden entry -- these feed vertex colour R/B/A, and
+		// M_WaterVoxel reads only G.
+		NewSlot = Pool->AddChunk(
+			Packed, FVector3f(BrickOriginUU - Impl.PoolRebase), /*Level=*/0,
+			FVector4f(0.5f, 0.5f, UVoxelGpuPoolComponent::kNoSurfaceGate, 0.0f));
+	}
+
+	if (NewSlot == INDEX_NONE)
+	{
+		// Out of contiguous room. Drop the mapping so the brick is honestly
+		// undrawn rather than pointing at a range that is no longer its own.
+		Slots.Remove(BrickCoord);
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("voxel.Water.GPU: no room for %d quads (%u free, largest run %u). Brick left undrawn."),
+		       Packed.Num(), Pool->GetFreeQuads(), Pool->GetLargestFreeRun());
+		return false;
+	}
+
+	Slots.Add(BrickCoord, NewSlot);
+	return true;
+}
+
 // Doctrine SS2.5 ("everything expensive is budgeted, never demand-driven"):
 // per-brick vxc::meshBrick<8> (re-mesh of an existing component OR meshing
 // for a brand-new one -- both cost the same greedy-mesh pass) is the
@@ -479,6 +699,10 @@ void RemeshDirtyBricks(FVoxelWaterImpl& Impl, AActor* ChunkOwner, USceneComponen
 				}
 				Impl.ChunkComponents.Remove(BrickCoord);
 			}
+			// Dispatch on what the brick HOLDS, not on the cvar: a brick drawn
+			// before a mid-session voxel.Water.GPU flip must unload the way it
+			// loaded. Both calls are no-ops for a brick the other path owns.
+			ReleaseWaterBrickPooled(Impl, Impl.PoolSlots, BrickCoord);
 			continue;
 		}
 
@@ -565,6 +789,23 @@ void RemeshDirtyBricks(FVoxelWaterImpl& Impl, AActor* ChunkOwner, USceneComponen
 				}
 				Impl.ChunkComponents.Remove(BrickCoord);
 			}
+			ReleaseWaterBrickPooled(Impl, Impl.PoolSlots, BrickCoord);
+			continue;
+		}
+
+		const FVector BrickOriginUU(double(Key.x) * double(vxc::WaterBrick8::kEdge) * VoxelCoords::VoxelSizeUU,
+		                            double(Key.y) * double(vxc::WaterBrick8::kEdge) * VoxelCoords::VoxelSizeUU,
+		                            double(Key.z) * double(vxc::WaterBrick8::kEdge) * VoxelCoords::VoxelSizeUU);
+
+		// A brick already holding a component keeps the component path even if
+		// the cvar flipped underneath it, and vice versa: mixing representations
+		// for ONE brick would draw it twice. New bricks take whichever path is
+		// current. Same rule ApplyMeshResult uses for terrain.
+		const bool bAlreadyPooled = Impl.PoolSlots.Contains(BrickCoord);
+		const bool bAlreadyComponent = Impl.ChunkComponents.Contains(BrickCoord);
+		if (bAlreadyPooled || (!bAlreadyComponent && VoxelDebug::GetWaterGpu()))
+		{
+			ApplyWaterBrickPooled(Impl, ChunkOwner, Material, Impl.PoolSlots, BrickCoord, BrickOriginUU, Quads);
 			continue;
 		}
 
@@ -578,10 +819,9 @@ void RemeshDirtyBricks(FVoxelWaterImpl& Impl, AActor* ChunkOwner, USceneComponen
 			// separate cap needed here.
 			Comp = NewObject<UWaterChunkComponent>(ChunkOwner);
 			Comp->SetupAttachment(ChunkRoot);
-			const FVector RelLoc(double(Key.x) * double(vxc::WaterBrick8::kEdge) * VoxelCoords::VoxelSizeUU,
-			                      double(Key.y) * double(vxc::WaterBrick8::kEdge) * VoxelCoords::VoxelSizeUU,
-			                      double(Key.z) * double(vxc::WaterBrick8::kEdge) * VoxelCoords::VoxelSizeUU);
-			Comp->SetRelativeLocation(RelLoc);
+			// ChunkRoot sits at the world origin, so the brick's world origin is
+			// also its relative location.
+			Comp->SetRelativeLocation(BrickOriginUU);
 			Comp->SetMaterial(0, Material);
 			Comp->RegisterComponent();
 			Impl.ChunkComponents.Add(BrickCoord, Comp);
@@ -617,6 +857,10 @@ void MarkMobilizedBricksDirty(FVoxelWaterImpl& Impl)
 			}
 			Impl.ImplicitChunkComponents.Remove(C);
 		}
+		// Same handover under voxel.Water.GPU: the implicit range must stop
+		// drawing in the SAME frame the CA's starts, or the two briefly draw the
+		// same water and a translucent surface doubled on itself is obvious.
+		ReleaseWaterBrickPooled(Impl, Impl.ImplicitPoolSlots, C);
 	}
 }
 
@@ -897,6 +1141,7 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 				}
 				Impl.ImplicitChunkComponents.Remove(BrickCoord);
 			}
+			ReleaseWaterBrickPooled(Impl, Impl.ImplicitPoolSlots, BrickCoord);
 			continue;
 		}
 
@@ -917,14 +1162,26 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 			Quads.Add(CQ);
 		}
 
+		const FVector BrickOriginUU(double(Ox) * VoxelCoords::VoxelSizeUU, double(Oy) * VoxelCoords::VoxelSizeUU,
+		                            double(Oz) * VoxelCoords::VoxelSizeUU);
+
+		// Same "dispatch on what the brick holds" rule as the CA path above.
+		const bool bAlreadyPooled = Impl.ImplicitPoolSlots.Contains(BrickCoord);
+		const bool bAlreadyComponent = Impl.ImplicitChunkComponents.Contains(BrickCoord);
+		if (bAlreadyPooled || (!bAlreadyComponent && VoxelDebug::GetWaterGpu()))
+		{
+			ApplyWaterBrickPooled(Impl, ChunkOwner, Material, Impl.ImplicitPoolSlots, BrickCoord, BrickOriginUU, Quads);
+			++Built;
+			continue;
+		}
+
 		TObjectPtr<UWaterChunkComponent>* ExistingPtr = Impl.ImplicitChunkComponents.Find(BrickCoord);
 		UWaterChunkComponent* Comp = ExistingPtr ? ExistingPtr->Get() : nullptr;
 		if (!Comp)
 		{
 			Comp = NewObject<UWaterChunkComponent>(ChunkOwner);
 			Comp->SetupAttachment(ChunkRoot);
-			Comp->SetRelativeLocation(FVector(double(Ox) * VoxelCoords::VoxelSizeUU, double(Oy) * VoxelCoords::VoxelSizeUU,
-			                                   double(Oz) * VoxelCoords::VoxelSizeUU));
+			Comp->SetRelativeLocation(BrickOriginUU);
 			Comp->SetMaterial(0, Material);
 			Comp->RegisterComponent();
 			Impl.ImplicitChunkComponents.Add(BrickCoord, Comp);
@@ -1116,6 +1373,35 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 			FRotator UnusedRot = FRotator::ZeroRotator;
 			PC->GetPlayerViewPoint(CameraUU, UnusedRot);
 			RefreshImplicitWater(*Impl, CameraUU, ChunkOwner, ChunkRoot, WaterMaterial);
+		}
+	}
+
+	// --- voxel.Water.GPU pool status, 1Hz -----------------------------------
+	//
+	// Budgeted before it was needed. ONE primitive drawing thousands of bricks
+	// has no component to select, no per-brick proxy to break on, and no
+	// per-brick state of any kind -- so if the pooled water renders wrong or not
+	// at all, this line and the pool's own "VoxelWaterPool draw
+	// SUBMITTED/SKIPPED" are the entire first rung of the diagnostic ladder.
+	// Deliberately mirrors the terrain pool's shape (live entries, quads,
+	// free-vs-largest-run, which is the number that tells "genuinely full" from
+	// "merely fragmented").
+	Impl->PoolLogAccumSeconds += DeltaTime;
+	if (Impl->PoolLogAccumSeconds >= 1.0f)
+	{
+		Impl->PoolLogAccumSeconds = 0.f;
+		if (const UVoxelGpuPoolComponent* Pool = Impl->Pool.Get())
+		{
+			// GetNumQuads() is the pool's CAPACITY, not its occupancy -- the
+			// whole buffer is allocated up front because incremental writes
+			// address absolute offsets. Occupancy is capacity minus free.
+			const uint32 UsedQuads = uint32(Pool->GetNumQuads()) - Pool->GetFreeQuads();
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("VoxelWaterPool: %d live entries (%d CA + %d implicit), %u quads used, "
+			            "%u free, largest run %u, %d free runs, high water %u"),
+			       Pool->GetNumChunks(), Impl->PoolSlots.Num(), Impl->ImplicitPoolSlots.Num(),
+			       UsedQuads, Pool->GetFreeQuads(), Pool->GetLargestFreeRun(),
+			       Pool->GetFreeRunCount(), Pool->GetHighWaterMarkQuads());
 		}
 	}
 
@@ -1777,6 +2063,39 @@ FAutoConsoleCommandWithWorld CVarVoxelSaveWater(
 			}
 		}));
 
+// Dumps water at the local player's crosshair. Shared by voxel.SpawnWater and
+// voxel.Water.SpawnIn.
+void SpawnWaterAtCrosshair(UWorld* World, uint32 Amount, const TCHAR* Caller)
+{
+	UVoxelWaterSubsystem* WaterSubsystem = World ? World->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+	UVoxelWorldSubsystem* Terrain = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (!WaterSubsystem || !Terrain || !PC || !PC->PlayerCameraManager)
+	{
+		UE_LOG(LogVoxelWater, Warning, TEXT("%s: missing subsystem/camera; nothing spawned."), Caller);
+		return;
+	}
+
+	const FVector CamLoc = PC->PlayerCameraManager->GetCameraLocation();
+	const FVector CamDir = PC->PlayerCameraManager->GetCameraRotation().Vector();
+
+	FVector HitVoxelCenterUU, PrevVoxelCenterUU;
+	constexpr double MaxDistUU = 6400.0; // 64m, generous crosshair reach
+	FVector TargetUU;
+	if (Terrain->RaycastVoxelWorld(CamLoc, CamDir, MaxDistUU, HitVoxelCenterUU, PrevVoxelCenterUU))
+	{
+		TargetUU = PrevVoxelCenterUU; // last empty voxel before the hit surface -- mirrors TryPlace's aim
+	}
+	else
+	{
+		TargetUU = CamLoc + CamDir * 500.0; // no hit: 5m in front of the camera
+	}
+
+	const uint32 Placed = WaterSubsystem->SpawnWaterAt(TargetUU, Amount);
+	UE_LOG(LogVoxelWater, Log, TEXT("%s: requested %u, placed %u at (%.0f,%.0f,%.0f)"), Caller, Amount, Placed,
+	       TargetUU.X, TargetUU.Y, TargetUU.Z);
+}
+
 FAutoConsoleCommandWithWorldAndArgs CVarVoxelSpawnWater(
 	TEXT("voxel.SpawnWater"),
 	TEXT("voxel.SpawnWater <amount> -- dev tool: dumps <amount> water fill units at the local player's crosshair (W2)."),
@@ -1792,34 +2111,89 @@ FAutoConsoleCommandWithWorldAndArgs CVarVoxelSpawnWater(
 				UE_LOG(LogVoxelWater, Warning, TEXT("voxel.SpawnWater <amount> -- missing amount argument."));
 				return;
 			}
-			const uint32 Amount = uint32(FMath::Max(0, FCString::Atoi(*Args[0])));
+			SpawnWaterAtCrosshair(World, uint32(FMath::Max(0, FCString::Atoi(*Args[0]))), TEXT("voxel.SpawnWater"));
+		}));
 
-			UVoxelWaterSubsystem* WaterSubsystem = World->GetSubsystem<UVoxelWaterSubsystem>();
-			UVoxelWorldSubsystem* Terrain = World->GetSubsystem<UVoxelWorldSubsystem>();
-			APlayerController* PC = World->GetFirstPlayerController();
-			if (!WaterSubsystem || !Terrain || !PC || !PC->PlayerCameraManager)
+// The headless-verification form of voxel.SpawnWater.
+//
+// A water A/B screenshot needs water actually in frame, and at a surface anchor
+// there may be none: UWaterChunkComponent geometry comes only from the CA
+// (player-poured or breached) and from implicit CAVERN lakes, which are
+// underground. AVoxelOceanActor's plane is a different primitive with a
+// different material and is unaffected by voxel.Water.GPU either way -- so
+// screenshotting an anchor that merely has the OCEAN in it would compare two
+// images in which no water-brick geometry appears at all, and pass regardless
+// of whether the pool works.
+//
+// -ExecCmds fires at startup, when there is no pawn, no camera and no streamed
+// terrain to raycast against, so the spawn has to be deferred. Pairs with
+// voxel.Debug.ShotIn: "voxel.Water.GPU 1, voxel.Water.SpawnIn 20 400000,
+// voxel.Debug.ShotIn 30" pours at 20 s and shoots at 30 s, by which time the
+// cascade has filled and the CA has settled the pour.
+FAutoConsoleCommandWithWorldAndArgs CVarVoxelWaterSpawnIn(
+	TEXT("voxel.Water.SpawnIn"),
+	TEXT("voxel.Water.SpawnIn <seconds> <amount> -- run voxel.SpawnWater <amount> N seconds from now. Headless ")
+	TEXT("verification aid: -ExecCmds runs before any pawn or streamed terrain exists, so an immediate pour has ")
+	TEXT("nothing to aim at."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+		[](const TArray<FString>& Args, UWorld* World)
+		{
+			if (!World)
 			{
-				UE_LOG(LogVoxelWater, Warning, TEXT("voxel.SpawnWater: missing subsystem/camera; nothing spawned."));
 				return;
 			}
+			const float Delay = (Args.Num() > 0) ? FMath::Max(0.1f, FCString::Atof(*Args[0])) : 20.0f;
+			const uint32 Amount = (Args.Num() > 1) ? uint32(FMath::Max(0, FCString::Atoi(*Args[1]))) : 400000u;
 
-			const FVector CamLoc = PC->PlayerCameraManager->GetCameraLocation();
-			const FVector CamDir = PC->PlayerCameraManager->GetCameraRotation().Vector();
-
-			FVector HitVoxelCenterUU, PrevVoxelCenterUU;
-			constexpr double MaxDistUU = 6400.0; // 64m, generous crosshair reach
-			FVector TargetUU;
-			if (Terrain->RaycastVoxelWorld(CamLoc, CamDir, MaxDistUU, HitVoxelCenterUU, PrevVoxelCenterUU))
+			TWeakObjectPtr<UWorld> WeakWorld(World);
+			FTimerHandle Handle;
+			World->GetTimerManager().SetTimer(Handle, FTimerDelegate::CreateLambda([WeakWorld, Amount]()
 			{
-				TargetUU = PrevVoxelCenterUU; // last empty voxel before the hit surface -- mirrors TryPlace's aim
-			}
-			else
-			{
-				TargetUU = CamLoc + CamDir * 500.0; // no hit: 5m in front of the camera
-			}
+				UWorld* W = WeakWorld.Get();
+				UVoxelWaterSubsystem* WaterSubsystem = W ? W->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+				UVoxelWorldSubsystem* Terrain = W ? W->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+				APlayerController* PC = W ? W->GetFirstPlayerController() : nullptr;
+				if (!WaterSubsystem || !Terrain || !PC || !PC->PlayerCameraManager)
+				{
+					UE_LOG(LogVoxelWater, Warning, TEXT("voxel.Water.SpawnIn: missing subsystem/camera; nothing spawned."));
+					return;
+				}
 
-			const uint32 Placed = WaterSubsystem->SpawnWaterAt(TargetUU, Amount);
-			UE_LOG(LogVoxelWater, Log, TEXT("voxel.SpawnWater: requested %u, placed %u at (%.0f,%.0f,%.0f)"), Amount, Placed,
-			       TargetUU.X, TargetUU.Y, TargetUU.Z);
+				// Aim at the GROUND, not at the crosshair.
+				//
+				// voxel.SpawnWater's crosshair raycast is the right tool in
+				// play and the wrong one here. The default spawn pose is +5m
+				// above the surface looking horizontally (VoxelEarthGameMode's
+				// RestartPlayer), and at a summit anchor like
+				// -VoxelSpawnAt=-84480,53760 that aims at the horizon: the
+				// 64 m raycast hits nothing, the pour lands in mid-air, and
+				// the water falls out of the bottom of the frame while the
+				// screenshot photographs empty sky. Sampling the surface
+				// height a fixed distance ahead puts the pour on solid ground
+				// every time regardless of terrain, and pointing the camera
+				// at it makes the A/B frame the water rather than the horizon.
+				const FVector CamLoc = PC->PlayerCameraManager->GetCameraLocation();
+				const FRotator CamRot = PC->PlayerCameraManager->GetCameraRotation();
+				FVector Ahead = CamRot.Vector();
+				Ahead.Z = 0.0;
+				Ahead = Ahead.GetSafeNormal();
+				if (Ahead.IsNearlyZero())
+				{
+					Ahead = FVector(1, 0, 0);
+				}
+
+				constexpr double AheadUU = 1200.0;   // 12 m: clear of the pawn, well inside the near ring
+				constexpr double AboveUU = 300.0;    // pour from 3 m up so it lands rather than clipping into rock
+				const FVector GroundXY = CamLoc + Ahead * AheadUU;
+				const double SurfaceZUU = Terrain->GetSurfaceHeightUU(GroundXY.X, GroundXY.Y);
+				const FVector TargetUU(GroundXY.X, GroundXY.Y, SurfaceZUU + AboveUU);
+
+				const uint32 Placed = WaterSubsystem->SpawnWaterAt(TargetUU, Amount);
+				PC->SetControlRotation((TargetUU - CamLoc).Rotation());
+				UE_LOG(LogVoxelWater, Log,
+				       TEXT("voxel.Water.SpawnIn: requested %u, placed %u at (%.0f,%.0f,%.0f); camera now looks at it"),
+				       Amount, Placed, TargetUU.X, TargetUU.Y, TargetUU.Z);
+			}), Delay, false);
+			UE_LOG(LogVoxelWater, Log, TEXT("voxel.Water.SpawnIn: %u fill units scheduled in %.1f s"), Amount, Delay);
 		}));
 } // namespace

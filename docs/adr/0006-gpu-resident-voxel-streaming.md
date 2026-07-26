@@ -211,3 +211,36 @@ wrong for the two that mattered: the pooled vertex factory owns both ends of the
 vertex-colour pipe, so anything expressible as a vertex colour channel is already
 an interpolant the material graph reads. The asset has not been modified, and
 nothing on the critical path required it. Only the debug tints still do.
+
+### CORRECTION to the table above (2026-07-25, same day)
+
+**The frame-time row of the "Delivered" table is retracted.** Twelve 60 s legs
+of the scripted flight, taken across contended and idle machines, show the
+component and pooled ranges overlapping almost completely, with the component
+path holding the better *median* on p95 and hitches. Two identical pooled legs on
+an idle box gave p50 21.0 and 47.4 ms — a 77% spread, larger than the effect
+being measured. The four legs that produced the table were a coin landing the
+same way four times.
+
+Full write-up in `docs/streaming-handoff.md`, "CORRECTION: the G5 frame-time
+numbers were noise".
+
+This does **not** disturb the ADR's own empirical basis, which is a different and
+earlier measurement: `renderMs` is 43.12 of a 43.92 ms frame while voxel work is
+a rounding error, and a same-binary A/B showed the streaming throttles buying
+2.84x fill for 2.58x frame time. That argument stands. What tonight failed to do
+is confirm it end-to-end on this hardware with this harness.
+
+What *is* verified, and is structural rather than statistical: the pooled path
+draws 9,822 chunks / 8,813,242 quads as **one primitive and one draw call**
+against 9,822 primitives, on every run, independent of the machine. That is the
+mechanism the ADR predicted. Whether it converts into frame time here is
+unmeasured, and the way to settle it is to measure the mechanism — primitive
+count, draw calls, render-thread time in `FScene::AddPrimitive` — rather than
+wall-clock percentiles over a flight whose run-to-run spread swamps the effect.
+
+**Method note worth carrying into the next ADR.** The cheap control was two
+consecutive identical runs. It was not taken until after the numbers had been
+written into a commit message, a PR, this file and a cvar comment. The screenshot
+work in the same session did quote every delta against a measured same-path noise
+floor and was correct as a result; the timing work did not and was not.

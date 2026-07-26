@@ -78,6 +78,24 @@ TAutoConsoleVariable<int32> CVarVoxelWaterMaxActiveBricks(
 	TEXT("UVoxelWaterSubsystem::TickWater."),
 	ECVF_Default);
 
+// The water half of ADR-0006. Deliberately a SEPARATE cvar from
+// voxel.Stream.GPU rather than a rider on it: water and terrain are different
+// primitives with different materials, and the water one is TRANSLUCENT. That
+// makes their failure modes different enough that being able to run pooled
+// terrain against per-brick water (or the reverse) is the bisection this needed
+// -- exactly the argument voxel.Stream.GPUMaxLevel makes for mip rings.
+//
+// Read once per brick handoff, so like voxel.Stream.GPU it must be set before
+// the water it should affect meshes; bricks already drawn keep the
+// representation they were built with, and unload the way they loaded.
+TAutoConsoleVariable<bool> CVarVoxelWaterGpu(
+	TEXT("voxel.Water.GPU"),
+	false,
+	TEXT("Route active + implicit water surface geometry through its own ADR-0006 GPU pool (ONE primitive, ONE ")
+	TEXT("draw) instead of one UWaterChunkComponent per vxc::WaterBrick8. Default false. Independent of ")
+	TEXT("voxel.Stream.GPU -- water is a separate pool with a separate, translucent material."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxAppliesPerFrame(
 	TEXT("voxel.Stream.MaxAppliesPerFrame"),
 	64,
@@ -181,36 +199,39 @@ TAutoConsoleVariable<int32> CVarVoxelStreamGpuMaxChunks(
 	TEXT("quads through the pool are wrong' from 'the pool does not like a multi-million-quad draw'."),
 	ECVF_Default);
 
-// G5. Default TRUE as of 2026-07-25, on measurement rather than on the
-// programme plan saying so.
+// G5. Default TRUE as of 2026-07-25.
 //
-// 60 s scripted surface flight at 20 m/s, same spawn, post-warmup, this cvar the
-// only difference. Two pairs, the second run in reverse order so drift in
-// background load works against the result rather than for it:
+// THE PERF JUSTIFICATION ORIGINALLY WRITTEN HERE HAS BEEN RETRACTED. It quoted
+// p95 -43%, worst frame -65% and hitches -96% from four legs of the scripted
+// flight. Twelve legs later the ranges overlap almost completely and the
+// component path has the BETTER median on p95 and hitches. Two identical pooled
+// legs on an idle box, same binary, same cvar, back to back, gave p50 21.0 and
+// 47.4 ms -- a 77% spread, larger than the effect being looked for. The first
+// four legs were a coin landing the same way four times. See
+// docs/streaming-handoff.md, "CORRECTION: the G5 frame-time numbers were noise".
 //
-//                p50      p95     worst   hitches   chunks/s
-//   component  17.50    40.50    221.4     204        608     (mean of 2)
-//   pool       17.16    23.05     76.6       9        818     (mean of 2)
+// What actually stands behind this default:
+//   * STRUCTURAL, and not a timing measurement at all -- the pooled path draws
+//     9,822 chunks / 8,813,242 quads as ONE primitive and ONE draw call, against
+//     9,822 primitives. Verified from the logs on every run, independent of the
+//     machine.
+//   * VISUAL PARITY, measured against its own noise floor: 17.4% -> 4.3% of
+//     pixels differing by more than 8/255, floor 1.1%.
+//   * ADR-0006's prior basis, which tonight did not re-measure and did not
+//     disturb: renderMs is 43.12 of a 43.92 ms frame while voxel work is a
+//     rounding error.
 //
-// The median frame barely moves and never was the point. ADR-0006 removes an
-// FScene::AddPrimitive per chunk from the streaming path; that cost lands in the
-// TAIL, and the tail is what moved -- p95 -43%, worst frame -65%, hitches -96%,
-// streaming throughput +35%.
-//
-// Direction and rough magnitude, not gate numbers: all four legs ran with other
-// headless instances live on the same machine, and most of the spread between
-// the two component runs is that contention. What survives the noise is that the
-// pool wins on p95, worst frame, hitch count and throughput in EVERY one of the
-// four runs.
+// What is NOT established is that any of that converts into better frame times
+// on this hardware with this harness. If that matters before shipping, measure
+// the mechanism (primitive count, draw calls, render-thread time in
+// FScene::AddPrimitive) rather than wall-clock percentiles over a 60 s flight
+// whose run-to-run spread swamps the effect.
 //
 // The component path is deliberately KEPT, not retired. It still carries voxel
 // GI, the debug tints, the ring cross-fade A/B, several mesh-time diagnostics,
 // and -- most importantly -- it is the fallback that voxel.Stream.GPUMaxLevel and
 // GPUMaxChunks bisect against, which are the two sharpest debugging tools this
 // renderer has. Setting this to 0 is a complete revert.
-//
-// See docs/streaming-handoff.md for the measured parity evidence behind the
-// flip, and docs/gpu-g4-parity-plan.md for what is still component-path-only.
 TAutoConsoleVariable<bool> CVarVoxelStreamGpu(
 	TEXT("voxel.Stream.GPU"),
 	true,
@@ -560,6 +581,11 @@ bool VoxelDebug::GetRenderCastShadow()
 bool VoxelDebug::GetStreamGpu()
 {
 	return CVarVoxelStreamGpu.GetValueOnGameThread();
+}
+
+bool VoxelDebug::GetWaterGpu()
+{
+	return CVarVoxelWaterGpu.GetValueOnGameThread();
 }
 
 int32 VoxelDebug::GetStreamJobsInFlightPerCore()

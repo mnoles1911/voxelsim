@@ -492,6 +492,52 @@ bool FVoxelLightField::SampleIrradianceAtProbe(const FVector& P, const float (&D
 	return true;
 }
 
+// --- GPU volume encode -----------------------------------------------------
+
+bool FVoxelLightField::EncodeBrickTexels(const FIntVector& Key, uint8* OutRGBA) const
+{
+	FRWScopeLock ScopeLock(Lock, SLT_ReadOnly);
+	return EncodeBrickTexelsUnlocked(Key, OutRGBA);
+}
+
+bool FVoxelLightField::EncodeBrickTexelsUnlocked(const FIntVector& Key, uint8* OutRGBA) const
+{
+	check(OutRGBA);
+
+	const FVoxelLFBrick* Brick = FindBrick(Key);
+	// bSolved is checked as well as presence because VoxelizeChunk clears it,
+	// so a brick that has been re-voxelized and not yet re-solved encodes as
+	// "no data" rather than as its pre-edit lighting. Its Vis is already zeroed
+	// there, so this is belt and braces -- but it is the branch that documents
+	// the intent, and the eviction path relies on the same all-zero output.
+	if (!Brick || !Brick->bSolved)
+	{
+		FMemory::Memzero(OutRGBA, BrickTexelBytes);
+		return false;
+	}
+
+	for (int32 Idx = 0; Idx < VoxelLF::BrickCells; ++Idx)
+	{
+		uint8* Texel = OutRGBA + Idx * 4;
+		if (!Brick->SolvedCells[Idx])
+		{
+			// A = 0, and RGB = 0 BECAUSE they are premultiplied by it. Any other
+			// RGB here would leak into a neighbouring texel's trilinear tap with
+			// zero weight in the denominator -- i.e. energy from nowhere.
+			Texel[0] = 0; Texel[1] = 0; Texel[2] = 0; Texel[3] = 0;
+			continue;
+		}
+
+		const uint8* Vis = Brick->Vis + Idx * VoxelLF::NumDirs;
+		// DirTable order: +X -X +Y -Y +Z -Z.
+		Texel[0] = Vis[4];                                                  // +Z
+		Texel[1] = Vis[5];                                                  // -Z
+		Texel[2] = uint8((uint32(Vis[0]) + Vis[1] + Vis[2] + Vis[3] + 2) / 4); // mean(+-X, +-Y)
+		Texel[3] = 255;                                                     // validity
+	}
+	return true;
+}
+
 void FVoxelLightField::SeedIrradiance(uint8 Value)
 {
 	FRWScopeLock ScopeLock(Lock, SLT_Write);
