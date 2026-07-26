@@ -31,6 +31,22 @@ private:
 	// dig site actually re-mesh through the overlay-aware path.
 	FTimerHandle HeadlessDigTestTimerHandle;
 
+	// Downward escape hatch proof (docs/streaming-handoff.md "Deep-column
+	// waste"): -VoxelDigDownTest[=<delaySeconds>] sinks a shaft from the spawn
+	// column straight down PAST the depth skirt's floor -- deeper than any
+	// worldgen-only rule admits -- and logs the whole column's
+	// tracked/component/quads state before and after. Without the
+	// EditedFootprintMinZ widening of ChunkZMin the bottom of that shaft is
+	// outside the desired set and reads as a see-through hole; with it, the
+	// chunks fill in. The pawn stays ABOVE ground throughout, deliberately, so
+	// the anchor-relative deep box (which only exists once the anchor is
+	// underground) cannot cover for the hatch and make a broken hatch look
+	// healthy.
+	FTimerHandle DigDownTestDigTimerHandle;
+	FTimerHandle DigDownTestReportTimerHandle;
+	FTimerHandle DigDownTestQuitTimerHandle;
+	void LogDigDownColumn(class UVoxelWorldSubsystem& Subsystem, double ColumnXUU, double ColumnYUU, const TCHAR* Phase) const;
+
 	// M3 wave 1 gate verification (docs/m3-plan.md "two clients dig the same
 	// hole"): -VoxelDumpDigestAfter=<s> logs THIS process's (the server's)
 	// seed + World::editedDigest() -- see AVoxelEarthPlayerController's

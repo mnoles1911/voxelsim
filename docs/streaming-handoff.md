@@ -245,12 +245,14 @@ suspecting the pool.
 ## Open, not blocking
 
 - **Deep-column waste:** 44.6% of R0 worker time meshes buried chunks emitting
-  zero quads. Measured ceiling **+34.8%** useful throughput. Safe path is moving
-  the exact band skip from dispatch-time to admission-time; needs a downward
-  escape hatch (`EditedFootprintMinZ` → widen `ChunkZMin`) first, or digging down
-  leaves a hole that never fills.
-- **R0 target 128 m:** `RingPresets` (`VoxelWorldSubsystem.h:86`) is
-  `static constexpr` and must become a runtime accessor first.
+  zero quads. The proposed fix -- move the band skip from dispatch-time to
+  admission-time -- was built, measured, and **does not reach it**; see the
+  section below. Left default-off with its census in. The downward escape hatch
+  it was supposed to need shipped anyway, because the hole it closes turned out
+  to be a live bug rather than a prerequisite.
+- **R0 target 128 m:** unblocked -- `RingPresets` is now a runtime accessor
+  (`GetRingPresets()`), overridable with `-VoxelRingInnerMeters=` /
+  `-VoxelRingOuterMeters=`. Moving R0 itself is still an open decision.
 - **GI light field as a GPU volume:** the largest remaining GPU piece and the
   only one that is worth more than parity — it decouples lighting from
   re-meshing, which a dig currently forces. Full design in
@@ -262,3 +264,143 @@ suspecting the pool.
   read an interpolant instead of a named parameter.
 - **Min-spec-proxy M1 gate re-run** still owed; `status.md`'s determinism row is
   stale (goldens predate worldgen v6); NVIDIA CI leg for the G1 gate.
+
+## The admission-time band skip: built, measured, left off (2026-07-25)
+
+The "deep-column waste" item above proposed moving the buried-chunk band skip
+from dispatch-time to admission-time. It is built, it is correct, and it is
+**default-off** (`voxel.Stream.AdmissionBandSkip`, 0/1/2) because measurement
+says it cannot reach the waste it was aimed at. The escape hatch it needed is
+ON, and is the part that mattered.
+
+### Why it cannot reach the waste
+
+The band is derived from a level-0 job's own 34x34 column grid and lands in
+`FootprintBandCache` in `DrainResults`. So it **does not exist until some
+level-0 job in that footprint has completed AND drained.** Admission runs
+before that, and `AddCandidate` admits a footprint's ENTIRE
+`ChunkZMin..ChunkZMax` column in the single pass that first scans the
+footprint. By the time the band arrives, every chunk it could refuse is
+already a record, and `AddCandidate`'s `ChunkRecords.Contains` guard means it
+is never reconsidered.
+
+Mode 2 (compute the verdict, admit anyway) over one full stationary fill at
+`-VoxelSpawnAt=-84480,53760`:
+
+```
+Voxel band skip at admission:  warm=7325 cold=8131 skipped=89
+Voxel buried skip (dispatch, same run):        skipped=2186
+```
+
+**89 against 2186** -- ~4% of the opportunity. The `warm` scans are almost all
+re-scans of footprints whose chunks are already records, so they have nothing
+to refuse. Running mode 1 for real removes 61 records (`tracked` 16417 ->
+16356) and **zero quads**.
+
+**That 4% is a property of the stationary fill, not of the lever, and reading
+it as the general case would be wrong.** On `-VoxelPerfFlight=surface` the
+same census reads `warm=46258 cold=0 skipped=5443` per 5 s window against the
+dispatch-time skip's `skipped=5359` in the same window -- essentially **1:1**.
+A moving anchor evicts footprints behind it and re-enters them later, and
+`FootprintBandCache` is pruned only at twice level 0's unload ring, so a
+re-entering footprint arrives with its band already warm. `cold` collapses to
+0 about 40 s into the flight. So the predicate IS available under movement,
+which is the case the 44.6% figure came from. What follows is why that still
+did not turn into throughput.
+
+And the 61 it does remove cost no worker time to begin with: the dispatch-time
+skip already refuses to mesh them. Moving the same predicate earlier saves a
+record, a queue slot and an admission slot -- not a job. The 44.6% of R0
+worker time in the item above is the chunks the band *declines* to skip (`R0
+total=3396 zq=1449`, 42.7% zero-quad on this spawn), and evaluating the same
+predicate one stage earlier cannot skip more of them.
+
+### Throughput A/B: it measured as a large REGRESSION, unexplained
+
+Interleaved, one binary, `-VoxelPerfRun=60 -VoxelPerfFlight=surface`, all four
+runs shown, first-after-build discarded:
+
+| run | chunks/s | postWarmup p50 | hitches |
+|---|---|---|---|
+| off 1 | 595.7 | 21.01 | 129 |
+| on 1 | **309.3** | 33.85 | 745 |
+| off 2 | 695.9 | 16.45 | 11 |
+| on 2 | **374.3** | 25.62 | 558 |
+
+Both on-runs lose to both off-runs with no overlap. **-46% chunks/s.**
+
+Inside the subsystem the change does exactly what it was designed to do:
+`tracked` 15,003 -> 5,256 (**-65%**), streaming tick 4.03% -> 1.51% of wall,
+exit scan 1.13 -> 0.54 ms. The cost is somewhere else entirely -- ticks per
+5 s window fall **279 -> 89** (~56 fps -> ~18 fps), and everything else on the
+streaming side follows from that: with a third of the passes covering the same
+20 m/s flight, each pass sees far more ground, `candidatesRejected` goes
+31,872 -> 78,138, and the outer rings starve (R1 loaded 878 -> 59, R2 221 ->
+32, R3 339 -> 78).
+
+**I could not isolate what makes the frame slower, and I am not going to guess
+at it.** The two off-runs differ from each other by 100 chunks/s and 11 vs 129
+hitches, which is the signature of external CPU contention -- this box was
+shared with two other agents running editors throughout. Two pairs is not
+enough to separate "the skip does this" from "the machine was busy", and the
+one causal story that fits (fewer tracked records -> `ReplacementCovered`
+releases retained stand-ins sooner -> more re-meshing) was not tested.
+
+What is certain either way: the lever's whole claimed benefit was worker time,
+it demonstrably saves none, and enabling it measured 46% worse. Default 0.
+Anyone re-opening this needs a quiet box and at least three pairs.
+
+### What would actually reach it
+
+Not this. The residual waste is (a) blind seeds on cold footprints and (b)
+chunks the band is not tight enough to prove empty. Neither is an admission
+problem. The shape that WOULD work is to defer the sub-surface part of a cold
+footprint's column by one pass so the band is warm when it is scanned -- i.e.
+move the **cold-band throttle** to admission, not the skip. That is a
+different mechanism with a real latency risk and it was not attempted here.
+
+### The downward escape hatch, which shipped
+
+Intended as a prerequisite; turned out to close a live hole. `ChunkZMin` is
+worldgen's floor (lowest corner surface, -1 chunk, minus the 12-chunk depth
+skirt = ~41.6 m at level 0 near band). A player digging past it leaves the
+bottom of the shaft outside the desired set, and the anchor-relative deep box
+cannot cover for it because that box only exists once the anchor is itself
+underground. `-VoxelDigDownTest`, 60 m shaft, pawn stationary on the surface:
+
+| | tracked | deepestTracked | deepestGeometry |
+|---|---|---|---|
+| `-VoxelNoEditFloorHatch` | 13/25 | 41.6 m | 41.6 m |
+| hatch on | 19/25 | **60.8 m** | **60.8 m** |
+
+**Two things the one-line description of this fix does not cover, and both
+were found by running it, not by reading it:**
+
+1. **The widening alone does nothing.** `RecomputeDesiredSet`'s entry scan is
+   gated on the anchor having crossed a level-L chunk. A player standing still
+   and digging down widens `EditedFootprintMinZ` and no scan ever reads it --
+   the first build of this fix produced a result byte-identical to no fix at
+   all. `PropagateEditToMips` now clears `bHasRecomputedLevel[Level]` when a
+   footprint's recorded edit range actually changes (at most once per 3.2 m of
+   new depth per footprint; measured 152 clears for a whole 60 m shaft).
+2. **A saved world came back with the hatch dead.** `World::replay` writes the
+   overlay directly, so `EditedFootprintMinZ/MaxZ` and `EditedAncestorChunks`
+   were all empty after a load and the hole returned on reload -- which also
+   means the pre-existing **sky-band** hatch has been losing saved structures
+   above the trimmed band. `RebuildEditedFootprintsFromOverlay()` rebuilds all
+   three from the restored bricks at load. Verified: a fresh process loading
+   the saved shaft streams it to 60.8 m.
+
+### Correctness
+
+Stationary spawn, fully settled (`jobsInFlight=0 pendingJobs=0`), skip off vs
+on: `loaded=9822 quads=8813242` **both sides**, per-ring loaded identical at
+every level. Only `tracked` moves (16417 -> 16364).
+
+### Trap for whoever runs this next
+
+A git worktree of this repo has no `tile-cache/`, so the amplifier silently
+falls back to the **synthetic** sampler and every number moves. Junction it in
+before measuring anything (`New-Item -ItemType Junction`). With it in place
+this box reproduces the reference spawn at `loaded=9822 quads=8813242
+tracked=16417` against the recorded `9819 / 8809945 / 16417`.
