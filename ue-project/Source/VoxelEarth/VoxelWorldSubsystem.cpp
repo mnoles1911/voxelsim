@@ -1998,6 +1998,12 @@ static_assert(UE_ARRAY_COUNT(kRingSlotFloorDefault) == VoxelCoords::kNumLevels,
               "kRingSlotFloorDefault must have one entry per level (a short list zero-fills silently, starving the tail rings)");
 
 // Overridable for tuning/measurement: `-VoxelRingFloors=0,1,1,1,1`.
+//
+// bShouldStopOnSeparator=false: FParse::Value's default terminator set is
+// ",) \r\n\t" (Parse.cpp:299), so the default overload truncates a comma list
+// at the FIRST comma and hands back one entry. This call site shipped without
+// the flag and so only ever applied Floors[0] -- see the long note on
+// GetRingPresets below, which had the same defect and where it was caught.
 const int32* GetRingSlotFloors()
 {
 	static int32 Floors[VoxelCoords::kNumLevels];
@@ -2005,7 +2011,8 @@ const int32* GetRingSlotFloors()
 	{
 		FMemory::Memcpy(Floors, kRingSlotFloorDefault, sizeof(Floors));
 		FString Spec;
-		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelRingFloors="), Spec))
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelRingFloors="), Spec,
+		                  /*bShouldStopOnSeparator=*/false))
 		{
 			TArray<FString> Parts;
 			Spec.ParseIntoArray(Parts, TEXT(","), true);
@@ -2013,6 +2020,16 @@ const int32* GetRingSlotFloors()
 			{
 				Floors[I] = FMath::Max(0, FCString::Atoi(*Parts[I]));
 			}
+			// Log the RESOLVED floors, not the requested string: the whole
+			// point of the bug above is that those two can differ silently,
+			// and a tuning sweep whose legs were all secretly the default
+			// reads as "the knob does nothing" rather than as a parse fault.
+			FString Resolved;
+			for (int32 I = 0; I < VoxelCoords::kNumLevels; ++I)
+			{
+				Resolved += FString::Printf(TEXT("%s%d"), I ? TEXT(",") : TEXT(""), Floors[I]);
+			}
+			UE_LOG(LogVoxelEarth, Log, TEXT("RingSlotFloors = {%s} (requested '%s')"), *Resolved, *Spec);
 		}
 		return true;
 	}();
@@ -2200,13 +2217,39 @@ const UVoxelWorldSubsystem::FRingPreset* UVoxelWorldSubsystem::GetRingPresets()
 	static const bool bInit = []
 	{
 		FMemory::Memcpy(Presets, kDefaultRingPresets, sizeof(Presets));
+		bool bOverrideRequested = false;
 
 		// -VoxelRingInnerMeters=<L0>,<L1>,... : overrides InnerMeters for as
 		// many leading levels as values are given; trailing levels keep the
 		// default. Same comma-list convention as -VoxelRingFloors
 		// (VoxelStreamAdmission::GetRingSlotFloors, above).
+		//
+		// bShouldStopOnSeparator=false, AND THIS IS THE WHOLE SWITCH.
+		// FParse::Value's FString overload defaults that flag to true, and its
+		// terminator set is then ",) \r\n\t" (Parse.cpp:299) -- so the default
+		// overload truncates the value at the FIRST COMMA. Every comma list in
+		// this file was read as its first entry alone.
+		//
+		// Measured, not reasoned: Wave E ran
+		//   -VoxelRingInnerMeters=0,32,64,128,256,512
+		//   -VoxelRingOuterMeters=32,64,128,256,512,1024
+		// -- a full six-entry cascade -- and the log below printed
+		//   RingPresets[0] = [0.0, 32.0) m [OVERRIDDEN]
+		//   RingPresets[1] = [64.0, 128.0) m        <- default, NOT overridden
+		//   ... levels 2-5 likewise default.
+		// Only OuterSpec="32" survived the parse. The result was a cascade with
+		// 32-64 m covered by NO ring at all, which still runs, still renders and
+		// still produces a plausible number.
+		//
+		// Wave E's write-up concluded the switch "appears to require all six
+		// entries". It does not -- six entries fail identically. The arity was
+		// never the variable; the comma was. Their OTHER leg passed four entries
+		// beginning 0,64.../64,128... whose first entries equal the defaults, so
+		// nothing changed at all and the run matched the full cascade frame for
+		// frame, which is what made it look like an arity rule.
 		FString InnerSpec;
-		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelRingInnerMeters="), InnerSpec))
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelRingInnerMeters="), InnerSpec,
+		                  /*bShouldStopOnSeparator=*/false))
 		{
 			TArray<FString> Parts;
 			InnerSpec.ParseIntoArray(Parts, TEXT(","), true);
@@ -2214,13 +2257,15 @@ const UVoxelWorldSubsystem::FRingPreset* UVoxelWorldSubsystem::GetRingPresets()
 			{
 				Presets[I].InnerMeters = FCString::Atod(*Parts[I]);
 			}
+			bOverrideRequested = true;
 		}
 
 		// -VoxelRingOuterMeters=<L0>,<L1>,... : same shape, for OuterMeters.
 		// This is the switch the verification for the runtime-accessor change
 		// uses to shrink R0 (e.g. -VoxelRingOuterMeters=16).
 		FString OuterSpec;
-		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelRingOuterMeters="), OuterSpec))
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelRingOuterMeters="), OuterSpec,
+		                  /*bShouldStopOnSeparator=*/false))
 		{
 			TArray<FString> Parts;
 			OuterSpec.ParseIntoArray(Parts, TEXT(","), true);
@@ -2228,6 +2273,7 @@ const UVoxelWorldSubsystem::FRingPreset* UVoxelWorldSubsystem::GetRingPresets()
 			{
 				Presets[I].OuterMeters = FCString::Atod(*Parts[I]);
 			}
+			bOverrideRequested = true;
 		}
 
 		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
@@ -2238,6 +2284,66 @@ const UVoxelWorldSubsystem::FRingPreset* UVoxelWorldSubsystem::GetRingPresets()
 			        Presets[Level].OuterMeters != kDefaultRingPresets[Level].OuterMeters)
 			           ? TEXT(" [OVERRIDDEN]")
 			           : TEXT(""));
+		}
+
+		// Validate the cascade the run is ACTUALLY going to use, and refuse to
+		// start on a malformed one. Only reachable when an override switch was
+		// supplied, so a default run cannot trip it.
+		//
+		// Abort rather than fall back to defaults, for the reason
+		// VoxelPerfRunSubsystem's -VoxelPerfStaticAt branch spells out: a
+		// silent fallback yields a perfectly plausible measurement of a scene
+		// nobody asked for. That is not hypothetical here -- it is exactly what
+		// the truncation bug above did to Wave E, and the cost was a whole
+		// session's legs plus a wrong published explanation.
+		//
+		// The invariants are the ones the rest of the file already assumes:
+		// RecomputeDesiredSet's ring-seam padding is derived from annuli that
+		// ABUT (Outer[L] == Inner[L+1], zero overlap), and AVoxelClipmapActor
+		// derives its entire vertex spacing from the outermost OuterMeters, so
+		// a degenerate annulus there collapses the 30 km heightmap.
+		if (bOverrideRequested)
+		{
+			// Tolerance, not equality: these are doubles round-tripped through
+			// text. 1 micron is far below any radius anyone would type and far
+			// above any parse error.
+			constexpr double kAbutToleranceMeters = 1e-6;
+			FString Faults;
+			if (Presets[0].InnerMeters > kAbutToleranceMeters)
+			{
+				Faults += FString::Printf(
+				    TEXT("\n  R0 inner is %.3f m, not 0 -- that leaves a hole centred on the player."),
+				    Presets[0].InnerMeters);
+			}
+			for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+			{
+				if (Presets[Level].OuterMeters <= Presets[Level].InnerMeters)
+				{
+					Faults += FString::Printf(
+					    TEXT("\n  R%d = [%.3f, %.3f) is empty or inverted -- that ring admits no chunks."),
+					    Level, Presets[Level].InnerMeters, Presets[Level].OuterMeters);
+				}
+				if (Level + 1 < VoxelCoords::kNumLevels &&
+				    FMath::Abs(Presets[Level].OuterMeters - Presets[Level + 1].InnerMeters) > kAbutToleranceMeters)
+				{
+					Faults += FString::Printf(
+					    TEXT("\n  R%d outer (%.3f m) != R%d inner (%.3f m) -- the annuli must abut exactly; "
+					         "%s is covered by no ring."),
+					    Level, Presets[Level].OuterMeters, Level + 1, Presets[Level + 1].InnerMeters,
+					    Presets[Level].OuterMeters < Presets[Level + 1].InnerMeters
+					        ? TEXT("the band between them")
+					        : TEXT("the overlap is double-resident and"));
+				}
+			}
+			if (!Faults.IsEmpty())
+			{
+				UE_LOG(LogVoxelEarth, Fatal,
+				       TEXT("Ring cascade override is malformed and the run would measure a world nobody asked for.%s"
+				            "\nRequested: -VoxelRingInnerMeters=%s -VoxelRingOuterMeters=%s"
+				            "\nBoth switches take ONE ENTRY PER LEVEL (%d), inner[L+1] == outer[L]."),
+				       *Faults, InnerSpec.IsEmpty() ? TEXT("<absent>") : *InnerSpec,
+				       OuterSpec.IsEmpty() ? TEXT("<absent>") : *OuterSpec, VoxelCoords::kNumLevels);
+			}
 		}
 		return true;
 	}();
@@ -3624,8 +3730,27 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 
 void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 {
+	// Cadence is 5 s by default and overridable with -VoxelPerfLogInterval=<sec>.
+	//
+	// The override exists because this line is the ONLY instrument for cold-fill
+	// time, and 5 s quantisation is the same order as the quantity being measured
+	// (a 64 m cascade settles in ~10-30 s). Wave F compares fill time between two
+	// cascades, so the quantisation error would land squarely on the difference.
+	// Scalar parse, no comma -- see GetRingPresets for why that distinction is
+	// load-bearing in this file.
+	//
+	// Clamped below at 0.25 s: this does an O(tracked) scan over ChunkRecords,
+	// which is ~16,600 entries at R0 = 128 m, so an unclamped small value would
+	// make the instrument a significant share of the thing it measures.
+	static const float LogIntervalSeconds = []
+	{
+		float Value = 5.0f;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfLogInterval="), Value);
+		return FMath::Max(0.25f, Value);
+	}();
+
 	LogTimerAccumSeconds += DeltaTime;
-	if (LogTimerAccumSeconds < 5.0f)
+	if (LogTimerAccumSeconds < LogIntervalSeconds)
 	{
 		return;
 	}
@@ -3669,11 +3794,20 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// start failing, which is the whole point of watching them.
 	if (const UVoxelGpuPoolComponent* Pool = GpuPool.Get())
 	{
+		// allocFail is on this line rather than only in a warning because it is
+		// the one number that invalidates every other number on it: a non-zero
+		// count means liveChunks/highWater describe a WORLD WITH HOLES IN IT, and
+		// a smaller, cheaper, faster-settling run is exactly what that looks like
+		// from the outside. capacityPct is beside it so the approach to the cliff
+		// is visible before the cliff.
+		const uint32 CapacityQuads = Pool->GetHighWaterMarkQuads() + Pool->GetFreeQuads();
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel GPU pool: liveChunks=%d highWater=%u free=%u largestRun=%u freeRuns=%d "
-		            "-- ONE primitive, ONE draw"),
+		            "capacityPct=%.1f allocFail=%lld allocFailQuads=%lld -- ONE primitive, ONE draw"),
 		       Pool->GetNumChunks(), Pool->GetHighWaterMarkQuads(), Pool->GetFreeQuads(),
-		       Pool->GetLargestFreeRun(), Pool->GetFreeRunCount());
+		       Pool->GetLargestFreeRun(), Pool->GetFreeRunCount(),
+		       CapacityQuads > 0 ? 100.0 * double(Pool->GetHighWaterMarkQuads()) / double(CapacityQuads) : 0.0,
+		       (long long)Pool->GetAllocFailureCount(), (long long)Pool->GetAllocFailureQuads());
 	}
 
 	// M2 item 1: "Per-level loaded/pending counters into the perf snapshot/
