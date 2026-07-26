@@ -271,12 +271,19 @@ private:
 
 	// --- staged re-centre (docs/gpu-gi-volume-design.md §4) -----------------
 	//
-	// Brick-row bounds still to be restaged, in BRICK rows (8 texels each), taken
-	// from BOTH ENDS INWARD. That order is the point: the camera sits near the
-	// volume centre, so the rows that are wrong for longest are the ones furthest
-	// from it -- the ones the distance fade is already attenuating -- and the
-	// camera's own neighbourhood is only disturbed on the last frame or two
-	// before the origin swap makes everything correct at once.
+	// Brick-row bounds still to be restaged, in BRICK rows (8 texels each). Each
+	// step takes from whichever END IS FURTHER FROM THE CAMERA'S OWN ROW, so the
+	// last row standing is always the camera's.
+	//
+	// That is the whole mitigation, and it is narrower than it first looks.
+	// Staging over ~8 frames means most of the volume is stale by the penultimate
+	// frame regardless -- measured at 69.3% of occupied texels -- so ordering
+	// cannot reduce HOW MUCH is wrong, only WHERE. What it buys is that the wrong
+	// region is the far field, which the distance fade is already attenuating,
+	// rather than the ground under the player. An earlier version took two rows
+	// off the low end and one off the high end, which drifted the meeting point
+	// off the camera and put a stale row under it for one frame
+	// (nearestStaleRowToCamera = 0 UU).
 	bool bVolumeRecentring = false;
 	int32 RecentreLoRow = 0;
 	int32 RecentreHiRow = 0;

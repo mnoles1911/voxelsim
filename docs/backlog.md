@@ -301,7 +301,7 @@ harness is not comparing a thing against itself). Steps 3-5 are now done; the
 full write-up with every number and how it was measured is the Wave B section of
 `docs/gpu-waves-plan.md`. The three things worth carrying here:
 
-- **(3) Scheme A, not Scheme B - the recorded bar was never passed.**
+- **(3) Scheme A is BUILT and measured - the recorded bar was never passed.**
   `gpu-gi-volume-design.md:100-103` asks for an **RMS** under ~8/255. The figures
   on record (5.950, 6.165) are **mean-abs** compared against an RMS threshold.
   Measured RMS at the settled field is **20.4-21.1**, i.e. Scheme B misses the
@@ -320,8 +320,12 @@ full write-up with every number and how it was measured is the Wave B section of
   settles it is missing from the sizing table: **Scheme A at N=192 is 56.6 MB,
   less VRAM and less RAM than Scheme B at N=256 (67.1 MB), which the design
   already recommends** - exact walls everywhere, at the price of 13 m of reach.
-  Owed before this is final: a screenshot of the wall+roof fixture, which is the
-  geometry the error concentrates on.
+  **Measured after the switch**, same harness/scene/sample count: horizontal
+  mean, RMS, p95, p99 and max all **0.000**, fraction over the bar **0.0000**,
+  with the negative control still at 1.525 mean / 58.8 max so the zeros are
+  load-bearing rather than a harness comparing a thing against itself. Memory
+  54.0 MiB at Dim 192 - the design table's "56.6 MB" is the same quantity in
+  decimal, not a discrepancy.
 - **(5) The retirable cost does not exist, and this is the third statement of
   this item.** The roadmap said "stop re-meshing to refresh lighting on the
   pooled path"; `gpu-waves-plan.md` corrected that to "the component path's 5×5×5
@@ -334,9 +338,33 @@ full write-up with every number and how it was measured is the Wave B section of
   capability, not a saving** — on the pooled renderer, baked per-vertex GI does
   not exist at all.
 - **`voxel.GI.Volume 1` has no consumer under `voxel.Stream.GPU 0`,** which is
-  the default. Only the pooled vertex factory samples the volume. So shipping the
-  GI volume on by default is **coupled to Wave A's outcome**, not independent of
-  it.
+  the default. Only the pooled vertex factory samples the volume, so shipping the
+  volume on is **coupled to Wave A's outcome**, not independent of it - the
+  execution plan lists A and B as disjoint, which is true of their FILES and not
+  of their shipping. The useful consequence: **GI can ship today without either**
+  - the component path's CPU bake already works, so `voxel.GI.Enabled 1` with
+  `voxel.GI.Volume 0` is a shipping configuration now, and that is what Wave B
+  recommends. The volume is correct-and-off, waiting on a renderer default.
+  Making the COMPONENT path sample the volume was considered and REJECTED: it
+  needs a material-graph change (the one thing the design was built to avoid), a
+  UVolumeTexture wrapper, per-chunk custom primitive data rewritten on every
+  re-centre, and it would make the material graph a THIRD copy of a shade formula
+  whose existing two copies had already drifted in four places.
+
+- **NEW AND NOT ROOT-CAUSED: the light field is effectively empty under motion.**
+  2,212 resident bricks settled and stationary; **0-12** for the whole of a 90 s
+  `-VoxelPerfFlight=surface` run at ~20 m/s, with `pendingVox=0(+0 pooled)`
+  throughout while streaming loaded normally around it (R0 loaded=3131). A player
+  is moving most of the time, so if this holds, voxel GI is largely absent in
+  play and every screenshot of the feature - all settled and stationary by house
+  style - has measured the one case where it works. It also blocks verifying the
+  volume's re-centring on the scripted flight, which is how it was found.
+  Candidates not yet separated: the build-radius rejection in the voxelize drain,
+  eviction outrunning the 16-chunk-per-frame budget, or the ingest hook not
+  firing for most pooled applies. **The two cheap legs that split it:** brick
+  count during the flight, and ~5 s after coming to rest. Recovering on stop
+  means throughput/priority; not recovering means bricks are never requested -
+  the same fork as the owner's ring-gap symptom.
 
 Closed by the same wave: the X-run merge on a dig's contiguous neighbourhood and
 zero-on-revoxelize / zero-on-evict now have a harness rather than an argument

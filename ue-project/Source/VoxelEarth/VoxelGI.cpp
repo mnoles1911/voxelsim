@@ -822,20 +822,43 @@ void UVoxelGISubsystem::StepVolumeRecentre()
 	RecentreNearestBeforeLastUU = RecentreStepNearestUU;
 	const int64 OccupiedBeforeThisFrame = RecentreOccupiedBeforeLast;
 
-	// From both ends inward: half the budget off each end. See the member's
-	// comment for why that order, not "front to back".
+	// FURTHEST FROM THE CAMERA FIRST, camera's own row LAST.
+	//
+	// This was "two rows off the low end, one off the high end" and that is a
+	// measured defect, not a stylistic choice: taking an uneven number from each
+	// end drifts the meeting point toward the high end instead of leaving it on
+	// the camera, so the camera's own row was restaged in frame 7 of 8 and read
+	// with the stale origin for a frame. Measured at
+	// nearestStaleRowToCamera = 0 UU, which is exactly the artifact the ordering
+	// exists to prevent.
+	//
+	// Picking the end by distance from the camera's row instead makes "the
+	// camera's row is last" true by construction rather than by arithmetic
+	// accident, and it stays true when the camera is off-centre in Z -- which it
+	// usually is, because the dead zone lets it sit anywhere inside the box.
+	const int32 CameraRow = FMath::Clamp(
+		int32(FMath::FloorToDouble((FieldCentreUU.Z - VolumeOriginWorldUU.Z)
+		                           / (double(VoxelLF::CellSizeUU) * double(E)))),
+		0, Rows - 1);
+
 	int32 Remaining = RowsThisFrame;
 	while (Remaining > 0 && RecentreLoRow < RecentreHiRow)
 	{
-		RestageVolumeZRange(RecentreLoRow * E, (RecentreLoRow + 1) * E);
-		++RecentreLoRow;
-		--Remaining;
-		if (Remaining > 0 && RecentreLoRow < RecentreHiRow)
+		// Whichever end is further from the camera goes now. The last row left
+		// standing is therefore always the camera's own.
+		const int32 LoDist = FMath::Abs(RecentreLoRow - CameraRow);
+		const int32 HiDist = FMath::Abs((RecentreHiRow - 1) - CameraRow);
+		if (LoDist >= HiDist)
+		{
+			RestageVolumeZRange(RecentreLoRow * E, (RecentreLoRow + 1) * E);
+			++RecentreLoRow;
+		}
+		else
 		{
 			RestageVolumeZRange((RecentreHiRow - 1) * E, RecentreHiRow * E);
 			--RecentreHiRow;
-			--Remaining;
 		}
+		--Remaining;
 	}
 	++RecentreFrames;
 

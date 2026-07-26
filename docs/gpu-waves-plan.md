@@ -73,7 +73,20 @@ boilerplate.
    unverified. This programme has now retracted one set of numbers and corrected
    **two** root-cause diagnoses (the determinism gate twice); all three would have
    been caught by this rule.
-9. **Line numbers in this plan drift.** `VoxelWorldSubsystem.cpp` is ~10,600 lines
+9. **Shader source is RUNTIME-LOADED. Never edit a `.ush` while runs are in
+   flight.** `ue-project/Shaders/*.ush` is read from disk when the engine
+   compiles a permutation, **not** compiled into the module DLL. So editing one
+   mid-batch does not take effect at the next build — it takes effect at the next
+   *run*, including runs that are already queued against the old C++. If the
+   shader references a uniform-buffer member the built C++ does not declare yet,
+   every subsequent leg dies at
+   `ShaderCompiler.cpp:2298 Fatal error` with no mention of your file. Measured
+   the hard way in Wave B: seven legs of a measurement batch were lost this way
+   and the crash reads as a GPU or driver fault, not as an edit. **Finish the
+   batch, then edit.** The corollary is that a `.ush` edit and its matching
+   `.h`/`.cpp` edit must land in the same build before any run, because the two
+   halves are versioned independently by the filesystem.
+10. **Line numbers in this plan drift.** `VoxelWorldSubsystem.cpp` is ~10,600 lines
    and moves under every PR. Anchor on symbol names — `DispatchJobs`,
    `DrainResults`, `MeshChunkBricks`, `EnsureVolumeOrigin` — and treat the numbers
    as hints. Several quoted here were already stale when this plan was written.
@@ -288,10 +301,22 @@ interpolant folded into vertex colour `.g` in `GetMaterialPixelParameters`, and
 the ±Z encode matches the CPU sampler at **0.000 mean error** against a half-cell
 shifted control.
 
-> **RESULT (2026-07-26).** B1–B6 landed. B7 did not, and the reason is not a cost
-> number — see B7. All measurements below are from `.claude/worktrees/wave-b-gi`,
-> `-VoxelSpawnAt=-84480,53760`, settled (`jobsInFlight=0 pendingJobs=0`), 2,212
-> resident bricks.
+> **RESULT (2026-07-26).** All measurements below are from
+> `.claude/worktrees/wave-b-gi`, `-VoxelSpawnAt=-84480,53760`, settled
+> (`jobsInFlight=0 pendingJobs=0`), 2,212 resident bricks, unless stated.
+>
+> - **B1 — closed, by reversing the expected answer.** Scheme B never passed the
+>   design's own bar (an **RMS**, fed a mean-abs for three transcripts running);
+>   Scheme A is built and measures **0.000 on every direction class**.
+> - **B3, B4, B5, B6 — landed.**
+> - **B2 — one claim retracted and re-measured**; the transient is real
+>   (69.3% of occupied texels, reaching the camera's own row). Ships only on the
+>   corrected claim, or defaults off.
+> - **B7 — target changed** to `voxel.GI.Enabled 1` / `voxel.GI.Volume 0`, once
+>   the coupling to Wave A was found. The volume is correct-and-off.
+> - **B-M — a new finding, not root-caused**: the light field is effectively
+>   **empty under motion** (0–12 bricks against 2,212 settled). It qualifies the
+>   B7 recommendation and is recorded rather than fixed.
 
 ### The correction this wave owes the plan (and the plan owed the roadmap)
 
@@ -417,6 +442,35 @@ side face under a roof, which is exactly the geometry the error concentrates on,
 and is the capture that settles whether this reads as wrong lighting or as
 nothing.
 
+**Scheme A is built and measured.** Same harness, same scene, same 20,000
+samples, Dim 192, settled at 2,212 resident bricks / 933 in volume:
+
+| statistic | Scheme B (2 legs) | **Scheme A** |
+|---|---|---|
+| ±Z mean / RMS / max | 0.000 / 0.000 / 0.000 | 0.000 / 0.000 / 0.000 |
+| horizontal mean | 9.629 / 9.463 | **0.000** |
+| horizontal RMS | 21.051 / 20.405 | **0.000** |
+| horizontal p50 / p90 / p95 / p99 | 0.013 / 37.4 / 53.0 / 91.6 | **0 / 0 / 0 / 0** |
+| horizontal max | 105.0 | **0.000** |
+| fraction over the 8/255 bar | 27.68% / 27.69% | **0.0000** |
+| control (half-cell X shift) | 1.576 / 1.662 | 1.525 (max 58.8) |
+| verdict | PASS (±Z only) | **PASS (both classes)** |
+
+**The control is what makes the zeros load-bearing.** A harness comparing a thing
+against itself also reports 0.000; this one still reports 1.525 mean and 58.8 max
+on the deliberately mis-addressed probe, so it is still measuring something.
+
+**Measured memory: 54.0 MiB** for both volumes at Dim 192. The design doc's table
+says 56.6 MB for Scheme A at N=192 — **these are the same quantity**, 56.6 × 10⁶
+bytes = 54.0 × 2²⁰ bytes. Flagged because a future reader comparing the log line
+against the table will otherwise go looking for a 5% discrepancy that does not
+exist.
+
+**Implementation note that is the whole reason this was affordable:** a face picks
+the volume by the **sign** of its normal and the channel by the **axis** — one
+sample, one channel. The second volume is never read.
+
+
 ### B2 (step 4) — camera-following re-centring
 
 `EnsureVolumeOrigin` latched on `bVolumeOriginSet` and never re-entered, so the
@@ -449,7 +503,50 @@ Two things bound it, both deliberate:
 occupied-texel count and how close the nearest stale row got to the camera, so
 this is a number rather than an argument.
 
-RESULT_B2_PLACEHOLDER
+> **RETRACTED (2026-07-26), original left visible above.** The two bullets above
+> claimed the transient "is bounded" by the both-ends-inward ordering, and
+> specifically that *"the camera's own row is restaged in the committing frame,
+> whose upload and origin swap are enqueued into the same render frame"*. **The
+> first claim holds. The second is false.** Both are now measured rather than
+> argued.
+
+**MEASURED.** A forced re-centre over a *populated* field
+(`voxel.GI.VolumeRecentreTest`, 163 bricks restaged, shift 176×48×−160 cells,
+Dim 192, `voxel.GI.Debug 2`):
+
+```
+VOLUMERECENTRE transient: peakStaleTexels=14645 of 21122 occupied (69.3%),
+                          nearestStaleRowToCamera=0 UU
+```
+
+Two things wrong with what was written:
+
+1. **69.3% of occupied texels are misaddressed in the frame before the swap.**
+   That is inherent to staging over ~8 frames — by the penultimate frame 7/8 of
+   the volume has been rewritten — and **no ordering can reduce it**. Ordering
+   controls *where* the stale region is, not *how much* of it there is. The
+   original wording implied the quantity was small. It is most of the volume.
+2. **`nearestStaleRowToCamera = 0 UU`: the stale region reached the camera's own
+   row one frame before the commit**, so there is a potential one-frame artifact
+   in exactly the place the original claim said there could not be one. Cause:
+   the step loop takes **two** rows off the low end and **one** off the high end
+   per frame, so the meeting point drifts toward the high end instead of staying
+   on the camera. The camera's row lands in frame 7 of 8, not frame 8.
+
+**Why the scripted flight did not catch it, and why that is its own finding.**
+The first B2 verification ran the 20 m/s scripted flight and reported seven
+re-centres, each exactly 8 frames with a one-frame origin commit — and every one
+of them reported `0 of 0 occupied`. The transient measurement was vacuous because
+**the field was empty**. See finding B-M below; it is a bigger problem than this
+one.
+
+**Status: the ordering fix (order rows by descending distance from the camera's
+row) is owed, followed by a re-measurement.** B2 ships only on whichever of these
+the re-measurement supports:
+
+- *"A transient exists, bounded to ≤8 frames, confined to the far field, camera's
+  row last"* — ship with exactly that claim, not rounded up to "cannot pop"; or
+- re-centring **defaults off** and is recorded as not ready.
 
 ### B3 (step 5) — see "the correction this wave owes the plan" above
 
@@ -526,7 +623,99 @@ first upload covers that texel).
 
 ### B7 — ship it on
 
-RESULT_B7_PLACEHOLDER
+**Target, as it now stands: `voxel.GI.Enabled 1` and `voxel.GI.Volume 0`.**
+
+The original wording was "Wave B is complete when `voxel.GI.Enabled 1` **and**
+`voxel.GI.Volume 1` are the defaults". That conflated two things, and the
+conflation only became visible once the coupling below was found.
+
+**The coupling the plan missed: `voxel.GI.Volume 1` has no consumer under
+`voxel.Stream.GPU 0`, which is the default.** Only the pooled vertex factory
+samples the volume; the per-chunk component path bakes GI into vertex colours
+and never reads the texture. So shipping the volume on by default is not a Wave B
+decision at all — it is gated on Wave A's `voxel.Stream.GPU` flip, which Wave A
+has measured as not ready. The plan's "Order of execution" treats A and B as
+independent and disjoint. They are disjoint in *files*; they are not independent
+in *shipping*.
+
+**What that leaves is better, not worse: GI can ship today, on the renderer that
+is actually the default, with no new work.** The component path's CPU-baked
+per-vertex GI already works. `voxel.GI.Enabled 1` with `voxel.GI.Volume 0` is a
+shipping configuration right now, and it satisfies the owner's actual request —
+"ship GI on by default" — rather than the narrower reading.
+
+**The volume is correct-and-off, not unfinished.** Its encoding is exact
+(B1: 0.000 on every direction class, against a live control), its shade formula
+matches the CPU's term for term (B4), its parameters are live (B6), and its
+uploads are measured (B5). What it lacks is a renderer that reads it.
+
+RESULT_B7_COST_PLACEHOLDER
+
+### Considered and rejected: making the COMPONENT path sample the volume
+
+The obvious way to decouple B7 from Wave A. **Do not build it.** Recorded with
+reasons so it is not reached for again:
+
+- It needs a **material-graph change** to `M_VoxelTerrain` — the single thing
+  §0 of the design doc establishes this whole feature does *not* need, and the
+  reason the vertex-colour fold was chosen in the first place.
+- The volume is a raw `FRHITexture` in a global uniform buffer that nothing binds
+  for component draws. Reaching it from a material needs either a
+  `UVolumeTexture` wrapper set on a material instance, or a custom vertex factory
+  for the component path. Material Parameter Collections cannot carry textures.
+- The UVW cannot be computed from world position in the material without hitting
+  §6's precision rule (float32 ULP is 1.0 UU at 8.4 M UU against a 40 UU cell).
+  The workable route is per-chunk **custom primitive data** carrying
+  `ChunkOrigin − VolumeOrigin` — which then has to be **rewritten on every one of
+  ~2,000 components at every re-centre**, i.e. roughly the per-component touch
+  the volume exists to delete.
+- Worst: it would make the material graph a **third** copy of the shade formula.
+  B4 found the existing **two** copies had silently diverged in **four** places.
+  A third copy, in a graph where a divergence cannot be grepped for, is the wrong
+  direction.
+
+### B-M — **the light field is effectively empty under motion. NOT ROOT-CAUSED.**
+
+Found while trying to verify B2, and it is a bigger question than B2: it asks
+whether voxel GI works at all in play, as opposed to in a stationary capture.
+
+**Measured**, same build, same seed, same spawn (`-VoxelSpawnAt=-84480,53760`):
+
+| scene | resident light-field bricks |
+|---|---|
+| settled, camera stationary | **2,212** |
+| during `-VoxelPerfFlight=surface` (~20 m/s), whole 90 s run | **0–12** |
+
+Throughout the flight the GI tick reports `pendingVox=0(+0 pooled)` — the ingest
+queue is not backed up, it is **empty** — while the streaming system is loading
+normally around it (`R0 loaded=3131`, `loaded=53855` cumulative, pool active).
+So chunks are being meshed and pooled, but almost none of them are reaching
+`NotifyPooledChunkMeshUpdated` → `PendingPooledVoxelize` → `VoxelizeChunk`, or
+they are being dropped immediately after.
+
+**Why it matters, and where it lands.** A player is moving most of the time. If
+GI is present only when standing still, then `voxel.GI.Enabled 1` as a default
+buys much less than the cost legs suggest, and every screenshot ever taken of
+this feature — all of which are settled, stationary scenes by house style — has
+been measuring the one case where it works. It also means the B2 re-centring
+verification cannot be done on the scripted flight at all, which is how this was
+found.
+
+**Explicitly not root-caused.** Candidates not yet separated: the build-radius
+test in the voxelize drain (`Dist(Origin, FieldCentreUU) > voxel.GI.RadiusUU`)
+rejecting chunks whose camera moved on between enqueue and drain;
+`EvictFarBricks` at twice a second outrunning a 16-chunk-per-frame voxelize
+budget; or the ingest hook not firing for most pooled applies. These have very
+different fixes and the evidence so far does not choose between them.
+
+**The two cheap legs that would split it** (owed, not run): field brick count
+during the flight, and again ~5 s after coming to rest. Recovering on stop means
+a throughput/priority problem; not recovering means bricks are never requested —
+the same fork that splits the owner's ring-gap symptom in
+`docs/manual-verification-checklist.md` §1, which makes it interesting beyond GI.
+
+**Deliberately not chased in this wave.** Recorded so it survives, and carried as
+a caveat on the B7 recommendation rather than fixed under it.
 
 ## Wave C — the determinism gate (blocks Wave D on correctness)
 
