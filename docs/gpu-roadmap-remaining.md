@@ -294,7 +294,15 @@ down pose, and that residual is a *rendering* problem with a *rendering* fix
 
 ---
 
-## Wave E — Remaining G4 parity items
+## Wave E — Remaining G4 parity items — **PARTIALLY LANDED 2026-07-26 (PRs #125, #129)**
+
+> **Read the per-item status before picking this up; "Wave E landed" is false as a
+> whole sentence.** E1 is **designed and corrected but NOT built** — the material
+> asset was never edited, and `manual-verification-checklist.md` item 7 is still
+> written as "when they land". E2's *feature* landed but **its parity number did
+> not**, and that number is the entire verdict. E3 is **closed as do-not-build**.
+> What PRs #125 and #129 actually delivered was the measurement that inverted E1's
+> safety argument, plus the water pool's shipped-but-unmeasured state.
 
 **E1 — Per-chunk debug tints.** The last G4 item, and the **only** one that still
 needs `M_VoxelTerrain.uasset` edited. Storage is solved (`ChunkParams.w` is free);
@@ -346,10 +354,27 @@ porting a defect.
 
 ## Wave F — Adjacent streaming items
 
-**R0 to 128 m** — now unblocked (`RingPresets` became a runtime accessor,
-overridable via `-VoxelRingInnerMeters=` / `-VoxelRingOuterMeters=`). Moving it is
-still an open call, and the `+9.2%` resident-chunk cost of the seam-padding fix is
-what to weigh it against. *This is also the decision that would revive Wave D.*
+> **NAMING COLLISION — this is not the same "Wave F" as the execution plan's.**
+> `docs/gpu-waves-plan.md` uses **Wave F** to mean *one* thing: **R0 = 128 m**,
+> decided and in progress. This section uses it as a grab-bag of adjacent
+> streaming items, only the first of which is that. When a session says "Wave F",
+> it means the plan's. The other two items below have **no owner and are not part
+> of the A–F programme**; they are parked here because this is where they were
+> found.
+
+**R0 to 128 m — DECIDED, NOT AN OPEN CALL.** The text below said "moving it is
+still an open call". **That is wrong and has been wrong since `gpu-g0-sizing.md`
+recorded the owner's decision** (2026-07-24: *"target R0 = 128 m"*), which the
+founding request for this programme then reaffirmed. The dependency also runs the
+opposite way from what was written here: R0 = 128 m is not the decision that
+*revives* Wave D — Wave D is the work that makes R0 = 128 m **affordable**, which
+is why the plan runs A→F in order and moves R0 **last**. Moving it first would
+quadruple the near field on a CPU path that already cannot keep up.
+
+Now unblocked mechanically (`RingPresets` became a runtime accessor, overridable
+via `-VoxelRingInnerMeters=` / `-VoxelRingOuterMeters=`), so **no code change is
+needed to prototype it**. The `+9.2%` resident-chunk cost of the seam-padding fix
+is still a real input to sizing the pool, just not to the go/no-go.
 
 **`voxel.Stream.AdmissionBandSkip` — off, and should stay off.** It reaches ~4% of
 the waste it was aimed at (89 skips against 2,186), its edit veto differs from the
@@ -365,11 +390,26 @@ moving.
 
 ---
 
-## Suggested order
+## Suggested order — **SUPERSEDED 2026-07-26. Do not plan from this list.**
 
-1. **C1** — the determinism gate is red; that is the project's core invariant.
-2. **The ring gaps** — the actual reported symptom, still unexplained.
-3. **Wave A** — makes the pooled renderer a win instead of a regression.
-4. **Wave B** — the clearest remaining value, and player-visible.
-5. **E1/E2** — small, low priority.
-6. **Wave D** — only if R0 = 128 m goes ahead.
+The order below was written before the A–F programme existed and is now wrong in
+both its sequencing and its facts. **`docs/gpu-waves-plan.md` is the live plan**;
+this list is kept only so a reader who remembers it can see it was retired
+deliberately rather than silently dropped.
+
+Where it is wrong: item 1 (C1) is **green and landed**. Item 3 (Wave A) is
+**landed**. Item 4 (Wave B) is **landed**, with GI deliberately shipped **off**.
+Item 6 gets the dependency backwards — Wave D is not conditional on R0 = 128 m
+going ahead; it is what **makes** R0 = 128 m affordable, and R0 = 128 m was
+already decided. Only item 2 (the ring gaps) survives unchanged, and it is
+explicitly **out of scope** for this programme: the owner is investigating it
+manually via `manual-verification-checklist.md` item 1, because it is a
+movement-induced symptom and every capture the harness can take is of a settled,
+stationary scene.
+
+~~1. **C1** — the determinism gate is red; that is the project's core invariant.~~
+~~2. **The ring gaps** — the actual reported symptom, still unexplained.~~
+~~3. **Wave A** — makes the pooled renderer a win instead of a regression.~~
+~~4. **Wave B** — the clearest remaining value, and player-visible.~~
+~~5. **E1/E2** — small, low priority.~~
+~~6. **Wave D** — only if R0 = 128 m goes ahead.~~
