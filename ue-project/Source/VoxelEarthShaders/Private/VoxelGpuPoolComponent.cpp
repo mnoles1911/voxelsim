@@ -8,6 +8,9 @@
 #include "MeshBatch.h"
 #include "SceneManagement.h"
 #include "RHIResourceUtils.h"
+#include "Misc/ScopeExit.h"
+
+#include <atomic>
 
 // Draws every chunk in the pool with a single mesh batch.
 namespace VoxelGpuPoolCull
@@ -102,6 +105,49 @@ namespace VoxelGpuPoolCull
 		ECVF_RenderThreadSafe);
 
 	inline bool IsEnabled() { return GEnabled != 0; }
+
+	// THE GATHER CENSUS (Wave G / G0). How many quads this proxy actually asks
+	// the GPU to draw per frame, split by whether the gather was the camera or a
+	// shadow cascade.
+	//
+	// WHY A NEW COUNTER RATHER THAN READING THE CULL LOG, which prints exactly
+	// these numbers already: THE CULL LOG HAS BEEN REPORTING ONE GATHER, AND
+	// ALWAYS THE SAME ONE, IN EVERY LEG EVER RUN.
+	//
+	// It fires on `CullLogCounter.Increment() % 600 == 1`.
+	// FThreadSafeCounter::Increment returns the POST-increment value
+	// (ThreadSafeCounter.h:52-55), so the samples land at gather ordinals
+	// 0, 600, 1200, .... GetDynamicMeshElements is called once per view AND once
+	// per shadow cascade, so with G gathers per frame the sampled gather's index
+	// within its own frame is (600k) mod G -- which is 0 for every k whenever G
+	// divides 600. And 600 = 2^3 * 3 * 5^2, so every plausible G (1..6, 8, 10,
+	// 12, ...) divides it.
+	//
+	// The evidence it was aliased was already on the record, and was read as a
+	// virtue: across the five recorded sessions there are 112 `cull: runs=`
+	// samples, every one of them `shadowGather=0`, and `visibleQuads=164534`
+	// repeats IDENTICALLY TO THE DIGIT across many samples and both
+	// straight-down legs. A rotating sample cannot do that. An aliased one must.
+	//
+	// This is not a tidiness fix. Wave A's cost model -- ~1.19 us per 1000 quads
+	// drawn, cross-validated to 1.1% across two poses -- divided a WHOLE-FRAME
+	// delta-p50 by a MAIN-VIEW-ONLY delta-drawnQuads. If shadow gathers draw the
+	// pool too then the true denominator is larger, the true slope is smaller,
+	// and the saving compaction can recover is smaller with it. The 1.1%
+	// agreement does not rescue it: both poses were measured through the same
+	// aliased instrument, so a shared bias cancels in the cross-validation and
+	// survives into the estimate.
+	//
+	// So this counter does not sample. It ACCUMULATES every gather, at the point
+	// of submission, on the cull and uncull branches alike -- what it reports is
+	// what the proxy asked the GPU for, not what one gather in six hundred did.
+	static int32 GStatsPeriod = 0;
+	static FAutoConsoleVariableRef CVarStatsPeriod(
+		TEXT("voxel.Stream.GPUCullStatsPeriod"), GStatsPeriod,
+		TEXT("Frames between gather-census reports. Counts every gather (camera and shadow) and reports "
+		     "quads submitted per frame split by gather type. 0 = off (default). This is a COUNT, so it is "
+		     "immune to the frame-time clamp and to GPU contention."),
+		ECVF_RenderThreadSafe);
 }
 
 class FVoxelGpuPoolSceneProxy final : public FPrimitiveSceneProxy
@@ -372,10 +418,15 @@ public:
 			// the whole under-selection. It also crashed -- reassigning the array
 			// while another thread iterated it asserted in the D3D12 RHI.
 			TArray<FQuadRange> Ranges;
+			// Threaded out of the cull rather than recomputed, so the census
+			// reports the same number the cull acted on. Stays 0 on the uncull
+			// control, where nothing measures visibility at all -- which the
+			// census report must not present as "zero quads were visible".
+			uint32 VisibleQuadsThisGather = 0;
 			const bool bCull = VoxelGpuPoolCull::IsEnabled() && Runs.Num() > 0 && NumQuads > 0;
 			if (bCull)
 			{
-				BuildCulledRanges(*Views[ViewIndex], Ranges);
+				BuildCulledRanges(*Views[ViewIndex], Ranges, VisibleQuadsThisGather);
 			}
 
 			if (!bCull || Ranges.Num() == 0)
@@ -452,6 +503,11 @@ public:
 					Element.UserData = &RangeData;
 				}
 			}
+
+			// AFTER the elements are built and BEFORE they are handed over, so
+			// what is counted is exactly what is submitted -- including both
+			// fallback paths, which is the half the cull's own log cannot see.
+			RecordGather(*Views[ViewIndex], Mesh, VisibleQuadsThisGather);
 
 			Collector.AddMesh(ViewIndex, Mesh);
 		}
@@ -590,10 +646,14 @@ private:
 	// mutable members "reused across frames so the per-frame cull allocates
 	// nothing", which is a sound instinct for a method called once per frame and
 	// wrong for one called once per frame PER VIEW, in parallel.
-	void BuildCulledRanges(const FSceneView& View, TArray<FQuadRange>& CulledRanges) const
+	void BuildCulledRanges(const FSceneView& View, TArray<FQuadRange>& CulledRanges,
+	                       uint32& OutVisibleQuads) const
 	{
 		const FMatrix& LocalToWorldMatrix = GetLocalToWorld();
 		uint32 VisibleQuads = 0;
+		// Assigned on every return path below via this reference, so a caller
+		// cannot read a stale or uninitialised count from an early exit.
+		ON_SCOPE_EXIT { OutVisibleQuads = VisibleQuads; };
 
 		// N EQUAL RANGES OVER THE WHOLE POOL, no frustum test. See GDebugSplit.
 		// Capped at the batch-element limit for the same reason GetMaxRanges() is:
@@ -618,7 +678,8 @@ private:
 			// Deliberately NOT merged: adjacent ranges have a zero gap, so the
 			// merge below would collapse them straight back to one draw and the
 			// experiment would test nothing.
-			if (CullLogCounter.Increment() % 600 == 1)
+			// Prime, for the reason spelled out at the main cull log below.
+			if (CullLogCounter.Increment() % 601 == 1)
 			{
 				UE_LOG(LogTemp, Log, TEXT("%s cull: DEBUG SPLIT into %d ranges covering %d quads"),
 				       *PoolName, CulledRanges.Num(), NumQuads);
@@ -726,7 +787,8 @@ private:
 		// merging (which only ever ADDS quads) would destroy the experiment.
 		if (VoxelGpuPoolCull::GDebugInvert != 0)
 		{
-			if (CullLogCounter.Increment() % 600 == 1)
+			// Prime, for the reason spelled out at the main cull log below.
+			if (CullLogCounter.Increment() % 601 == 1)
 			{
 				UE_LOG(LogTemp, Log,
 				       TEXT("%s cull: DEBUG INVERT drawing the REJECTED set: ranges=%d quads=%u/%d"),
@@ -860,13 +922,40 @@ private:
 		// rejecting everything. That ambiguity hid a broken cull for a whole
 		// verification cycle -- and because the empty case falls back to the full
 		// draw, the picture was correct either way and proved nothing.
-		if (CullLogCounter.Increment() % 600 == 1)
+		//
+		// THE PERIOD IS PRIME, AND THAT IS THE ENTIRE POINT OF IT.
+		//
+		// It was 600, and 600 = 2^3 * 3 * 5^2. Increment() returns the
+		// POST-increment value, so the samples fell on gather ordinals
+		// 0, 600, 1200, ...; this method runs once per view AND once per shadow
+		// cascade, so with G gathers per frame the sampled gather's index within
+		// its frame was (600k) mod G -- identically 0 for every plausible G,
+		// because every plausible G divides 600.
+		//
+		// So this line reported gather index 0, and only gather index 0, in
+		// every leg ever run: 112 samples across five recorded sessions, all
+		// `shadowGather=0`, which was read as "the pool sees no shadow gathers".
+		// The tell was on the record and looked like a virtue -- the same
+		// `visibleQuads=164534` to the digit across many samples and both
+		// straight-down legs, which a rotating sample cannot produce and an
+		// aliased one must.
+		//
+		// 601 is prime, so it shares no factor with any gathers-per-frame count
+		// and the sample walks every gather instead of pinning one. EXPECT THIS
+		// LINE TO LOOK NOISIER THAN IT USED TO. That is the fix working: the
+		// stability it had was the aliasing. `gather=` is printed so the rotation
+		// is visible rather than inferred, and the totals -- which is what any
+		// quantitative claim should now be read from -- come from the census
+		// (voxel.Stream.GPUCullStatsPeriod), which accumulates instead of
+		// sampling.
+		const int32 GatherOrdinal = CullLogCounter.Increment();
+		if (GatherOrdinal % 601 == 1)
 		{
 			UE_LOG(LogTemp, Log,
-			       TEXT("%s cull: runs=%d runQuads=%u/%d visibleQuads=%u (%.1f%%) ranges=%d drawnQuads=%u (%.1f%%) "
+			       TEXT("%s cull: gather=%d runs=%d runQuads=%u/%d visibleQuads=%u (%.1f%%) ranges=%d drawnQuads=%u (%.1f%%) "
 			            "| mergeGap=%u maxRanges=%d | skipped empty=%d badId=%d aboveHWM=%d hidden=%d frustum=%d "
 			            "| shadowGather=%d"),
-			       *PoolName, Runs.Num(), RunQuads, NumQuads, VisibleQuads,
+			       *PoolName, GatherOrdinal - 1, Runs.Num(), RunQuads, NumQuads, VisibleQuads,
 			       NumQuads > 0 ? 100.0 * double(VisibleQuads) / double(NumQuads) : 0.0,
 			       CulledRanges.Num(), DrawnQuads,
 			       NumQuads > 0 ? 100.0 * double(DrawnQuads) / double(NumQuads) : 0.0,
@@ -882,6 +971,109 @@ private:
 	// miss or duplicate its slot.
 	mutable FThreadSafeCounter CullLogCounter;
 	mutable FThreadSafeCounter CullSpaceLogged;
+
+	// --- the gather census (Wave G / G0) ---------------------------------
+	//
+	// See VoxelGpuPoolCull::GStatsPeriod for what this is for and why the
+	// existing cull log could not answer it.
+	//
+	// CUMULATIVE since this proxy was created, deliberately. The question is a
+	// RATIO -- shadow quads against camera quads -- and a ratio taken over
+	// cumulative totals does not care where a reporting window happens to fall,
+	// which a per-window average does. A render-state rebuild constructs a new
+	// proxy and so resets these; the report says which proxy it came from and
+	// how many gathers are behind it, so a reader can see a reset rather than
+	// silently averaging across one.
+	struct FGatherCensus
+	{
+		std::atomic<uint64> Gathers{ 0 };
+		std::atomic<uint64> SubmittedQuads{ 0 };
+		std::atomic<uint64> VisibleQuads{ 0 };
+
+		// Relaxed is correct here and not a shortcut: these counters order
+		// nothing and guard nothing, they are only ever read for their own
+		// value, and the report is explicitly a snapshot of a live count.
+		void Accumulate(uint64 InSubmitted, uint64 InVisible) const
+		{
+			const_cast<FGatherCensus*>(this)->Gathers.fetch_add(1, std::memory_order_relaxed);
+			const_cast<FGatherCensus*>(this)->SubmittedQuads.fetch_add(InSubmitted, std::memory_order_relaxed);
+			const_cast<FGatherCensus*>(this)->VisibleQuads.fetch_add(InVisible, std::memory_order_relaxed);
+		}
+	};
+	mutable FGatherCensus CameraCensus;
+	mutable FGatherCensus ShadowCensus;
+
+	// Counts what the batch actually asks for, on BOTH branches, rather than
+	// re-deriving it from the cull -- the uncull control never runs the cull at
+	// all, and it is precisely the config the cost model's other endpoint came
+	// from. Reading the submitted elements is the one expression that is true of
+	// every path through GetDynamicMeshElements, including the fallbacks.
+	static uint64 CountSubmittedQuads(const FMeshBatch& Mesh)
+	{
+		uint64 Total = 0;
+		for (const FMeshBatchElement& Element : Mesh.Elements)
+		{
+			Total += uint64(Element.NumPrimitives) / 2u;
+		}
+		return Total;
+	}
+
+	void RecordGather(const FSceneView& View, const FMeshBatch& Mesh, uint32 InVisibleQuads) const
+	{
+		const int32 Period = VoxelGpuPoolCull::GStatsPeriod;
+		if (Period <= 0)
+		{
+			return;
+		}
+
+		const bool bShadowGather = View.GetDynamicMeshElementsShadowCullFrustum() != nullptr;
+		const uint64 Submitted = CountSubmittedQuads(Mesh);
+		(bShadowGather ? ShadowCensus : CameraCensus).Accumulate(Submitted, InVisibleQuads);
+
+		if (bShadowGather)
+		{
+			return;   // report on a camera gather, so the denominator is one frame
+		}
+
+		// Reported every Period CAMERA gathers rather than every Period frames.
+		// There is no frame counter on this path, and a camera gather is the
+		// thing a per-frame figure should be divided by anyway -- so the
+		// denominator is stated outright instead of inferred from a frame number
+		// this method never sees.
+		const uint64 CameraGathers = CameraCensus.Gathers.load(std::memory_order_relaxed);
+		if (CameraGathers == 0 || (CameraGathers % uint64(Period)) != 0)
+		{
+			return;
+		}
+
+		const uint64 CamQuads = CameraCensus.SubmittedQuads.load(std::memory_order_relaxed);
+		const uint64 ShadowGathers = ShadowCensus.Gathers.load(std::memory_order_relaxed);
+		const uint64 ShadowQuads = ShadowCensus.SubmittedQuads.load(std::memory_order_relaxed);
+		const uint64 CamVisible = CameraCensus.VisibleQuads.load(std::memory_order_relaxed);
+		const uint64 ShadowVisible = ShadowCensus.VisibleQuads.load(std::memory_order_relaxed);
+		const uint64 TotalQuads = CamQuads + ShadowQuads;
+
+		// S is the whole point of the experiment: the factor by which a
+		// main-view-only quad count understates what the frame actually drew.
+		// Wave A's ~1.19 us/1000 quads was a whole-frame delta-p50 over a
+		// main-view-only delta-quads, so the true slope is 1.19 / S and the
+		// saving compaction can recover on the camera view scales the same way.
+		const double S = CamQuads > 0 ? double(TotalQuads) / double(CamQuads) : 0.0;
+
+		UE_LOG(LogTemp, Log,
+		       TEXT("%s census: cameraGathers=%llu shadowGathers=%llu (%.2f per camera gather) | "
+		            "quads/cameraGather: camera=%.0f shadow=%.0f total=%.0f | S=%.3f | "
+		            "visible/cameraGather: camera=%.0f shadow=%.0f | poolQuads=%d cull=%d"),
+		       *PoolName, CameraGathers, ShadowGathers,
+		       double(ShadowGathers) / double(CameraGathers),
+		       double(CamQuads) / double(CameraGathers),
+		       double(ShadowQuads) / double(CameraGathers),
+		       double(TotalQuads) / double(CameraGathers),
+		       S,
+		       double(CamVisible) / double(CameraGathers),
+		       double(ShadowVisible) / double(CameraGathers),
+		       NumQuads, VoxelGpuPoolCull::IsEnabled() ? 1 : 0);
+	}
 
 
 

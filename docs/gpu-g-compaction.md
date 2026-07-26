@@ -182,6 +182,70 @@ coprime with any plausible `G` — 601 is prime — or, better, accumulate
 per-gather-type totals across a frame and log those, which answers the question
 directly instead of by sampling.
 
+### G0 as built, and the rule that reads it — written before the legs run
+
+`voxel.Stream.GPUCullStatsPeriod N` turns on a **census**, not a sample. Every
+gather is accumulated at the point of submission — after the elements are built,
+before `Collector.AddMesh` — so it counts what the proxy actually asked the GPU
+for, on the cull and uncull branches alike. The uncull control is half the cost
+model's evidence and the cull's own log never runs on it at all.
+
+The aliased sampling log is fixed in the same change: period 600 → **601, which
+is prime**, so it shares no factor with any gathers-per-frame count and walks
+every gather instead of pinning one. It now prints `gather=` so the rotation is
+visible rather than inferred. **Expect that line to look noisier than it used to;
+that is the fix working.** Its former stability was the aliasing.
+
+#### The quantity that decides it
+
+Between `uncull` and `cull` at one pose, write `Δcam` and `Δshadow` for the drop
+in quads submitted by camera and shadow gathers. Wave A divided the whole-frame
+`Δp50` by `Δcam` alone. Define
+
+> **`S_Δ = (Δcam + Δshadow) / Δcam`**
+
+The true slope is then `1.19 / S_Δ` µs per 1000 quads, and since compaction
+scheduled the Landscape way reaches only the camera view, the saving it can
+recover is the camera over-draw priced at that true slope:
+
+| pose | camera over-draw (Wave A) | predicted saving |
+|---|---|---|
+| horizon | 6,221,534 − 2,285,770 = **3,935,764** | **4.68 / `S_Δ` ms** |
+| straight down | 266,656 − 164,534 = **102,122** | **0.122 / `S_Δ` ms** |
+
+#### Pre-registered verdicts
+
+The decision this feeds is whether compaction can close the straight-down
+residual that kept `voxel.Stream.GPU` at 0 — Wave A measured that residual at
+**0.17 / 0.13 ms**, against its resolution `R` = 0.114 ms and a direct control
+spread of 0.05 ms.
+
+- **`S_Δ ≤ 1.15`** — down saving ≥ 0.106 ms, horizon ≥ 4.07 ms. The model stands
+  essentially as recorded. **Wave proceeds as briefed.**
+- **`1.15 < S_Δ < 2.0`** — down saving 0.061–0.106 ms, i.e. **below Wave A's own
+  `R`** and within sight of the 0.05 ms control spread. Horizon still 2.3–4.1 ms.
+  **Wave proceeds, but the headline changes** from "puts the pooled path ahead"
+  to "large horizon win; the default flip is not established by compaction
+  alone". Recorded here so that restatement is not a post-hoc rescue.
+- **`S_Δ ≥ 2.0`** — down saving ≤ 0.061 ms, at or under the direct control
+  spread. **Camera-only compaction cannot deliver the wave's stated purpose.**
+  The honest responses are to extend compaction to shadow gathers — which needs a
+  different scheduling story, since shadow frusta do not exist at
+  `PreInitViews_RenderThread` — or to stop and say so.
+
+**The cheapest good outcome is binary:** if `shadowGathers == 0`, then
+`S_Δ = 1` exactly, Wave A's numbers stand unmodified, and the aliasing was a real
+bug in the instrument that happened not to bite. One leg settles it.
+
+#### The control that makes the census falsifiable
+
+The census must **reproduce the aliased log's camera figures**. Straight down with
+the cull on, camera quads per gather should land on 266,656 and camera visible on
+164,534. If the census disagrees with the old log *on a camera gather*, the census
+is wrong and not the log — because the one thing the old log was definitely doing
+is reporting a camera gather. An instrument whose first output cannot be checked
+against a known number is not an instrument yet.
+
 ### The first experiment, and it can fail
 
 Split the existing `drawnQuads` / `visibleQuads` counters by gather type — the
