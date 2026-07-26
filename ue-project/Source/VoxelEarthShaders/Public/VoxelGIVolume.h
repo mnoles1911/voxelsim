@@ -103,6 +103,24 @@ public:
 	// shading instead means the buffer reaches the VS but not the PS.
 	void FillCheckerboard_RenderThread(FRHICommandListBase& RHICmdList);
 
+	// Uploads one axis-aligned box of RGBA8 texels. SrcRGBA is tightly packed:
+	// row pitch Size.X*4, depth pitch Size.X*Size.Y*4.
+	//
+	// RENDER THREAD ONLY -- BeginUpdateTexture3D_Internal asserts
+	// IsInParallelRenderingThread(), and the SOURCE BYTES must already have been
+	// copied out of the light field on the game thread under a read scope. The
+	// one-shot UpdateTexture3D is used deliberately over the Begin/End pair:
+	// EndUpdateTexture3D_Internal asserts the two land in the same render-thread
+	// frame, and there is no reason to take on that hazard here.
+	//
+	// The caller is expected to have merged bricks into wide X-runs first. D3D12
+	// stages at Align(Width*4, 256), so an 8-texel-wide brick moves 2 KB of
+	// payload through 16 KB of staging plus a barrier; a 40-texel run of 5
+	// bricks costs one call and one barrier for the same bytes.
+	void UpdateTexels_RenderThread(FRHICommandListBase& RHICmdList,
+	                               const FIntVector& DestMin, const FIntVector& Size,
+	                               const uint8* SrcRGBA);
+
 	int32 GetDimTexels() const { return DimTexels; }
 
 private:

@@ -42,7 +42,13 @@ namespace VoxelGIVolume
 	{
 		// Clamped rather than trusted: this sizes an allocation, and N^3 grows
 		// fast enough that a typo'd 1024 is 4 GB.
-		return FMath::Clamp(CVarGIVolumeDim.GetValueOnAnyThread(), 16, 256);
+		//
+		// Rounded DOWN to a multiple of 8 as well, so the volume is a whole
+		// number of light-field bricks on every axis. Otherwise the brick at the
+		// far face is partially outside the texture and every upload path needs
+		// a clip case that would only ever execute for someone who typed 100.
+		const int32 Clamped = FMath::Clamp(CVarGIVolumeDim.GetValueOnAnyThread(), 16, 256);
+		return Clamped & ~7;
 	}
 
 	bool IsEnabled()
@@ -164,6 +170,40 @@ void FVoxelGIVolume::FillCheckerboard_RenderThread(FRHICommandListBase& RHICmdLi
 	UE_LOG(LogTemp, Log,
 	       TEXT("VoxelGI volume: checkerboard uploaded (%d slabs of %dx%d, %d bricks per axis)"),
 	       DimTexels, DimTexels, DimTexels, DimTexels / kCellsPerBrick);
+}
+
+void FVoxelGIVolume::UpdateTexels_RenderThread(FRHICommandListBase& RHICmdList,
+                                               const FIntVector& DestMin, const FIntVector& Size,
+                                               const uint8* SrcRGBA)
+{
+	if (!Volume.IsValid() || DimTexels <= 0 || !SrcRGBA)
+	{
+		return;
+	}
+	if (Size.X <= 0 || Size.Y <= 0 || Size.Z <= 0)
+	{
+		return;
+	}
+	// Silently clipping would hide an addressing bug behind a plausible image,
+	// which is the failure mode this whole module is organised around. The
+	// driver never produces an out-of-range box, so this is an assert with a
+	// log rather than a fixup.
+	if (DestMin.X < 0 || DestMin.Y < 0 || DestMin.Z < 0 ||
+	    DestMin.X + Size.X > DimTexels || DestMin.Y + Size.Y > DimTexels || DestMin.Z + Size.Z > DimTexels)
+	{
+		UE_LOG(LogTemp, Warning,
+		       TEXT("VoxelGI volume: rejected out-of-range upload min=(%d,%d,%d) size=(%d,%d,%d) dim=%d"),
+		       DestMin.X, DestMin.Y, DestMin.Z, Size.X, Size.Y, Size.Z, DimTexels);
+		return;
+	}
+
+	const FUpdateTextureRegion3D Region(uint32(DestMin.X), uint32(DestMin.Y), uint32(DestMin.Z),
+	                                    0, 0, 0,
+	                                    uint32(Size.X), uint32(Size.Y), uint32(Size.Z));
+	RHICmdList.UpdateTexture3D(Volume, /*MipIndex*/ 0, Region,
+	                           /*SourceRowPitch*/ uint32(Size.X) * 4,
+	                           /*SourceDepthPitch*/ uint32(Size.X) * uint32(Size.Y) * 4,
+	                           SrcRGBA);
 }
 
 namespace

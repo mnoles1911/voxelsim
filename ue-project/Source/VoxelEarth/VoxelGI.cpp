@@ -4,6 +4,12 @@
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
 #include "VoxelLightField.h"
+// VoxelEarth -> VoxelEarthShaders, never the reverse (see VoxelEarth.Build.cs).
+// So the encoder and its driver live HERE, in the module that owns the light
+// field, and call into the VOXELEARTHSHADERS_API volume rather than having the
+// renderer module reach back for the field.
+#include "VoxelGIVolume.h"
+#include "VoxelGpuPoolComponent.h"
 
 #include "Camera/PlayerCameraManager.h"
 #include "Engine/Engine.h"
@@ -13,6 +19,8 @@
 #include "HAL/PlatformMisc.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
+#include "RenderingThread.h"
+#include "UObject/UObjectIterator.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelGI, Log, All);
 
@@ -153,8 +161,73 @@ namespace
 		TEXT("capture from a single build."),
 		ECVF_Default);
 
+	TAutoConsoleVariable<int32> CVarGIMaxBrickUploadsPerFrame(
+		TEXT("voxel.GI.MaxBrickUploadsPerFrame"), 64,
+		TEXT("Light field bricks whose texels are pushed into the GPU GI volume per frame. This is ")
+		TEXT("the pooled path's replacement for voxel.GI.MaxChunkRefreshesPerFrame -- a pooled chunk ")
+		TEXT("has no component and no vertex colours to re-shade, so lighting updates are texel ")
+		TEXT("uploads instead. Bricks are merged into X-runs before uploading, so this bounds ")
+		TEXT("BYTES, not draw-call count."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<int32> CVarGIVolumeCheck(
+		TEXT("voxel.GI.VolumeCheck"), 0,
+		TEXT("Numeric field-vs-volume equivalence harness. Non-zero arms it; the value is the number ")
+		TEXT("of random solved cells to sample (1 = the default 4096). Runs ONCE, after the field has ")
+		TEXT("settled, and logs VOLUMECHECK: cells=.. meanAbsErr=.. maxAbsErr=.. in irradiance bytes. ")
+		TEXT("Set back to 0 to re-arm."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<float> CVarGIVolumeCheckSettle(
+		TEXT("voxel.GI.VolumeCheckSettleSeconds"), 20.f,
+		TEXT("Seconds after the first texel upload before voxel.GI.VolumeCheck runs. Measuring a ")
+		TEXT("field that has barely streamed in reports a tiny sample count and proves nothing."),
+		ECVF_Default);
+
 	constexpr int32 kMaxPendingVoxelize = 1024;
 	constexpr int32 kCoarseRebuildIntervalFrames = 30;
+
+	// Bricks of gap tolerated when coalescing an X-run. A run that skips two
+	// clean bricks still beats a second UpdateTexture3D and its barrier, and a
+	// dig dirties a contiguous 5x5x5 neighbourhood where the gaps are rare
+	// anyway.
+	constexpr int32 kVolumeRunGapBricks = 2;
+
+	constexpr int32 kVolumeCheckDefaultSamples = 4096;
+
+	// One brick-run staged for the render thread. Owns its bytes: the light
+	// field is read on the GAME thread under FReadScope and the payload crosses
+	// in the ENQUEUE_RENDER_COMMAND, never the other way round.
+	struct FVoxelGIVolumeRun
+	{
+		FIntVector Min = FIntVector::ZeroValue;
+		FIntVector Size = FIntVector::ZeroValue;
+		TArray<uint8> Texels;
+	};
+
+	// The pool component's world location IS pool-primitive space's origin --
+	// the component carries the world's big offset in its double-precision
+	// transform and everything the shader sees is relative to it
+	// (docs/gpu-gi-volume-design.md §6). Read off the live component rather than
+	// recomputed from the streaming subsystem's rebase so there is exactly one
+	// definition of the space.
+	bool FindPoolWorldLocation(const UWorld* World, FVector& OutLocation)
+	{
+		if (!World)
+		{
+			return false;
+		}
+		for (TObjectIterator<UVoxelGpuPoolComponent> It; It; ++It)
+		{
+			UVoxelGpuPoolComponent* Pool = *It;
+			if (Pool && !Pool->IsTemplate() && Pool->IsRegistered() && Pool->GetWorld() == World)
+			{
+				OutLocation = Pool->GetComponentLocation();
+				return true;
+			}
+		}
+		return false;
+	}
 }
 
 namespace VoxelGI
@@ -278,6 +351,12 @@ void UVoxelGISubsystem::ClearAllState()
 	BrickComponents.Reset();
 	RefreshRotation.Reset();
 	RefreshCursor = 0;
+	VolumeUploadQueue.Reset();
+	VolumeUploadSet.Reset();
+	// The shadow and the origin deliberately SURVIVE a toggle-off: the GPU
+	// texture still holds those bytes, and throwing the mirror away would leave
+	// the harness comparing against nothing while the volume kept rendering.
+	// The origin is set once for the session anyway (step 4 owns re-centring).
 	bCoarseDirty = false;
 	bHasState = false;
 }
@@ -379,6 +458,489 @@ FVector UVoxelGISubsystem::ResolveViewOriginUU() const
 	return FieldCentreUU;
 }
 
+// --- GPU volume driver (docs/gpu-gi-volume-design.md §3) --------------------
+
+void UVoxelGISubsystem::PushVolumeUpload(const FIntVector& Key)
+{
+	// Gated on the cvar rather than queued unconditionally: with the volume off
+	// nothing drains, and the dedupe set is keyed by ABSOLUTE brick coord, so a
+	// moving camera would grow it without bound. Toggling the volume on
+	// mid-session starts from an empty queue and is refilled by the round-robin
+	// re-solve (voxel.GI.RefreshBricksPerFrame) within a few seconds.
+	if (!VoxelGIVolume::IsEnabled())
+	{
+		return;
+	}
+	bool bAlready = false;
+	VolumeUploadSet.Add(Key, &bAlready);
+	if (!bAlready)
+	{
+		VolumeUploadQueue.Add(Key);
+	}
+}
+
+bool UVoxelGISubsystem::EnsureVolumeOrigin()
+{
+	if (bVolumeOriginSet)
+	{
+		return true;
+	}
+
+	// STEP 2 SCOPE: the origin is set ONCE, from the field centre at the moment
+	// of the first upload, and then never moves. Camera-following re-centring is
+	// step 4 (dead zone + staged re-upload + a one-frame origin swap) and is
+	// deliberately not attempted here -- a half-done re-centre is the failure
+	// mode that produces a plausible image with a moving artifact plane.
+	FVector PoolWorldUU;
+	if (!FindPoolWorldLocation(GetWorld(), PoolWorldUU))
+	{
+		// No pooled primitive means nothing samples the volume: the per-chunk
+		// renderer reads the field directly at proxy build. Not an error.
+		if (!bLoggedNoPool)
+		{
+			bLoggedNoPool = true;
+			UE_LOG(LogVoxelGI, Log,
+			       TEXT("VoxelGI volume: no GPU pool component yet -- texel uploads deferred. ")
+			       TEXT("(voxel.Stream.GPU 0 never creates one, and the volume has no consumer there.)"));
+		}
+		return false;
+	}
+
+	VolumeDim = VoxelGIVolume::GetDim();
+	if (VolumeDim <= 0)
+	{
+		return false;
+	}
+
+	// Brick-snap, in DOUBLE (§4). Everything downstream leans on texel i being
+	// world Origin + (i+0.5)*40 with the same lattice the field uses: get this
+	// wrong and every sample is shifted half a cell, which reads as a soft
+	// lighting offset rather than as a bug.
+	const double HalfExtentUU = 0.5 * double(VolumeDim) * double(VoxelLF::CellSizeUU);
+	auto SnapDownToBrick = [](double V) -> double
+	{
+		return FMath::FloorToDouble(V / double(VoxelLF::BrickEdgeUU)) * double(VoxelLF::BrickEdgeUU);
+	};
+	VolumeOriginWorldUU = FVector(SnapDownToBrick(FieldCentreUU.X - HalfExtentUU),
+	                              SnapDownToBrick(FieldCentreUU.Y - HalfExtentUU),
+	                              SnapDownToBrick(FieldCentreUU.Z - HalfExtentUU));
+	VolumeCellOrigin = FIntVector(int32(VolumeOriginWorldUU.X / VoxelLF::CellSizeUU),
+	                              int32(VolumeOriginWorldUU.Y / VoxelLF::CellSizeUU),
+	                              int32(VolumeOriginWorldUU.Z / VoxelLF::CellSizeUU));
+
+	// POOL-PRIMITIVE SPACE, subtracted in double and narrowed exactly once
+	// (§6). Passing the world-space origin as an FVector3f is explicitly
+	// prohibited: at ~8.4M UU float32's ULP is 1.0 UU against a 40 UU cell.
+	const FVector3f OriginPoolUU = FVector3f(VolumeOriginWorldUU - PoolWorldUU);
+
+	VolumeShadow.Empty();
+	VolumeShadow.SetNumZeroed(int64(VolumeDim) * VolumeDim * VolumeDim * 4);
+	bVolumeOriginSet = true;
+
+	UE_LOG(LogVoxelGI, Log,
+	       TEXT("VoxelGI volume: origin set dim=%d fieldCentre=(%.0f,%.0f,%.0f) originWorld=(%.0f,%.0f,%.0f) ")
+	       TEXT("poolWorld=(%.0f,%.0f,%.0f) originPool=(%.1f,%.1f,%.1f) coverage=+/-%.0f UU shadow=%.1f MB"),
+	       VolumeDim, FieldCentreUU.X, FieldCentreUU.Y, FieldCentreUU.Z,
+	       VolumeOriginWorldUU.X, VolumeOriginWorldUU.Y, VolumeOriginWorldUU.Z,
+	       PoolWorldUU.X, PoolWorldUU.Y, PoolWorldUU.Z,
+	       OriginPoolUU.X, OriginPoolUU.Y, OriginPoolUU.Z,
+	       HalfExtentUU, double(VolumeShadow.Num()) / (1024.0 * 1024.0));
+
+	ENQUEUE_RENDER_COMMAND(VoxelGIVolumeSetOrigin)(
+		[OriginPoolUU](FRHICommandListImmediate&)
+	{
+		GVoxelGIVolume.UpdateParameters_RenderThread(OriginPoolUU);
+	});
+	return true;
+}
+
+int32 UVoxelGISubsystem::DrainVolumeUploads(int32 Budget)
+{
+	if (!Field || !VoxelGIVolume::IsEnabled())
+	{
+		return 0;
+	}
+	if (VolumeUploadQueue.Num() == 0 || !EnsureVolumeOrigin())
+	{
+		return 0;
+	}
+
+	// 1) Pop the frame's work list. A brick outside the volume's extent is
+	//    dropped here rather than left in the queue: the volume covers
+	//    +/-Dim*20 UU and the field's build radius is larger, so most of the
+	//    field is legitimately off-volume and re-queuing it forever would turn
+	//    the queue into a treadmill.
+	TArray<FIntVector> Batch;
+	TArray<FIntVector> TexelBase; // per Batch entry, texel coords of the brick's (0,0,0) cell
+	while ((Budget < 0 || Batch.Num() < Budget) && VolumeUploadQueue.Num() > 0)
+	{
+		const FIntVector Key = VolumeUploadQueue[0];
+		VolumeUploadQueue.RemoveAt(0, 1, EAllowShrinking::No);
+		VolumeUploadSet.Remove(Key);
+
+		const FIntVector Base(Key.X * VoxelLF::BrickEdgeCells - VolumeCellOrigin.X,
+		                      Key.Y * VoxelLF::BrickEdgeCells - VolumeCellOrigin.Y,
+		                      Key.Z * VoxelLF::BrickEdgeCells - VolumeCellOrigin.Z);
+		const int32 E = VoxelLF::BrickEdgeCells;
+		if (Base.X < 0 || Base.Y < 0 || Base.Z < 0 ||
+		    Base.X + E > VolumeDim || Base.Y + E > VolumeDim || Base.Z + E > VolumeDim)
+		{
+			continue;
+		}
+		Batch.Add(Key);
+		TexelBase.Add(Base);
+	}
+	if (Batch.Num() == 0)
+	{
+		return 0;
+	}
+
+	// 2) Encode into the CPU shadow, under ONE read scope, on the GAME thread.
+	//    §1: anything that reads the field to build texel data must be here, not
+	//    on the render thread.
+	{
+		const FVoxelLightField::FReadScope Read(*Field);
+		uint8 BrickTexels[FVoxelLightField::BrickTexelBytes];
+		for (int32 I = 0; I < Batch.Num(); ++I)
+		{
+			// Returns false (and all-zero bytes) for a brick that is absent
+			// (evicted) or re-voxelized-but-not-yet-solved. Both of those MUST
+			// reach the volume, or a dug tunnel keeps its pre-dig lighting --
+			// which is exactly why this path does not skip on false.
+			Read.EncodeBrick(Batch[I], BrickTexels);
+
+			const FIntVector& Base = TexelBase[I];
+			for (int32 Z = 0; Z < VoxelLF::BrickEdgeCells; ++Z)
+			for (int32 Y = 0; Y < VoxelLF::BrickEdgeCells; ++Y)
+			{
+				const int64 DstOffset = ((int64(Base.Z + Z) * VolumeDim + (Base.Y + Y)) * VolumeDim + Base.X) * 4;
+				const int32 SrcOffset = (Z * VoxelLF::BrickEdgeCells + Y) * VoxelLF::BrickEdgeCells * 4;
+				FMemory::Memcpy(VolumeShadow.GetData() + DstOffset, BrickTexels + SrcOffset,
+				                VoxelLF::BrickEdgeCells * 4);
+			}
+		}
+	}
+
+	// 3) Merge into X-runs. THE reason this exists: the D3D12 staging row pitch
+	//    is Align(Width*4, 256), so an 8-texel-wide brick stages 16 KB to move
+	//    2 KB. Grouping by (texelY, texelZ) and coalescing along X turns a dig's
+	//    125 per-brick calls into 25 wide ones with no waste.
+	TArray<int32> Order;
+	Order.SetNumUninitialized(TexelBase.Num());
+	for (int32 I = 0; I < Order.Num(); ++I) { Order[I] = I; }
+	Order.Sort([&TexelBase](int32 A, int32 B)
+	{
+		const FIntVector& VA = TexelBase[A];
+		const FIntVector& VB = TexelBase[B];
+		if (VA.Z != VB.Z) { return VA.Z < VB.Z; }
+		if (VA.Y != VB.Y) { return VA.Y < VB.Y; }
+		return VA.X < VB.X;
+	});
+
+	TArray<FVoxelGIVolumeRun> Runs;
+	const int32 E = VoxelLF::BrickEdgeCells;
+	int32 I = 0;
+	while (I < Order.Num())
+	{
+		const FIntVector& Start = TexelBase[Order[I]];
+		int32 EndX = Start.X + E; // exclusive
+		int32 J = I + 1;
+		while (J < Order.Num())
+		{
+			const FIntVector& Next = TexelBase[Order[J]];
+			if (Next.Y != Start.Y || Next.Z != Start.Z)
+			{
+				break;
+			}
+			if (Next.X > EndX + kVolumeRunGapBricks * E)
+			{
+				break;
+			}
+			EndX = FMath::Max(EndX, Next.X + E);
+			++J;
+		}
+
+		FVoxelGIVolumeRun& Run = Runs.AddDefaulted_GetRef();
+		Run.Min = FIntVector(Start.X, Start.Y, Start.Z);
+		Run.Size = FIntVector(EndX - Start.X, E, E);
+		Run.Texels.SetNumUninitialized(int64(Run.Size.X) * Run.Size.Y * Run.Size.Z * 4);
+		// Compact the run out of the shadow. The shadow is the source of truth
+		// for what is on the GPU, so a run always carries the LATEST bytes for
+		// every brick it spans -- including bricks that were not in this frame's
+		// batch but happen to sit inside a coalesced gap.
+		for (int32 Z = 0; Z < Run.Size.Z; ++Z)
+		for (int32 Y = 0; Y < Run.Size.Y; ++Y)
+		{
+			const int64 Src = ((int64(Run.Min.Z + Z) * VolumeDim + (Run.Min.Y + Y)) * VolumeDim + Run.Min.X) * 4;
+			const int64 Dst = (int64(Z) * Run.Size.Y + Y) * Run.Size.X * 4;
+			FMemory::Memcpy(Run.Texels.GetData() + Dst, VolumeShadow.GetData() + Src,
+			                int64(Run.Size.X) * 4);
+		}
+		I = J;
+	}
+
+	VolumeBricksUploaded += Batch.Num();
+	VolumeRunsUploaded += Runs.Num();
+	if (FirstVolumeUploadSeconds == 0.0)
+	{
+		FirstVolumeUploadSeconds = FPlatformTime::Seconds();
+	}
+
+	// 4) One render command for the whole frame's runs -- BeginUpdateTexture3D
+	//    asserts IsInParallelRenderingThread(), and the payload is owned by the
+	//    lambda so nothing on the game thread can mutate it mid-upload.
+	ENQUEUE_RENDER_COMMAND(VoxelGIVolumeUpload)(
+		[Payload = MoveTemp(Runs)](FRHICommandListImmediate& RHICmdList)
+	{
+		for (const FVoxelGIVolumeRun& Run : Payload)
+		{
+			GVoxelGIVolume.UpdateTexels_RenderThread(RHICmdList, Run.Min, Run.Size, Run.Texels.GetData());
+		}
+	});
+
+	return Batch.Num();
+}
+
+// --- voxel.GI.VolumeCheck ---------------------------------------------------
+//
+// THE DELIVERABLE FOR STEP 2. "The volume matches the field" is otherwise only
+// checkable by looking at two screenshots of a cave, which is slow, subjective,
+// and cannot distinguish a half-cell addressing shift from a fade retune. This
+// turns it into a grep.
+//
+// Method: pick random SOLVED cells, jitter the probe point off the cell centre
+// (a cell centre lands exactly on a texel and would make trilinear degenerate
+// to a single tap -- a test that cannot fail), then compute both sides at the
+// SAME point:
+//
+//   * the shader side, evaluated in software from VolumeShadow -- the actual
+//     staged bytes, so an addressing or run-merge bug shows up here and a
+//     re-encode would have hidden it;
+//   * FVoxelLightField::SampleIrradiance at the surface point that puts its
+//     FIRST probe offset (0.6 cells, the one the vertex shader uses) exactly on
+//     that probe point.
+//
+// Errors are reported in irradiance BYTES (0..255), the units the field is
+// stored in. Scheme B is exact for +-Z normals by construction, so the pass bar
+// there is mean < 2/255; the +-X/+-Y classes carry the horizontal mean and are
+// reported separately as the number step 3 will decide Scheme A vs B on.
+void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
+{
+	bVolumeCheckDone = true;
+
+	if (!Field || !bVolumeOriginSet || VolumeShadow.Num() == 0)
+	{
+		UE_LOG(LogVoxelGI, Warning,
+		       TEXT("VOLUMECHECK: nothing staged (originSet=%d shadow=%d) -- needs voxel.GI.Volume 1, ")
+		       TEXT("voxel.Stream.GPU 1 and a settled field."),
+		       bVolumeOriginSet ? 1 : 0, VolumeShadow.Num());
+		return;
+	}
+
+	// Flush the whole upload queue first, ignoring the per-frame budget. A
+	// diagnostic that measures a volume which is merely BEHIND the field
+	// measures the queue, not the encoding.
+	const int32 Flushed = DrainVolumeUploads(-1);
+
+	TArray<FIntVector> Keys;
+	Field->GetResidentKeys(Keys);
+
+	// Only bricks fully inside the volume can be compared: outside it the
+	// sampler clamps to the edge texel, which is the sampler doing what it was
+	// asked and not a mismatch.
+	TArray<FIntVector> InVolume;
+	InVolume.Reserve(Keys.Num());
+	const int32 E = VoxelLF::BrickEdgeCells;
+	for (const FIntVector& Key : Keys)
+	{
+		const FIntVector Base(Key.X * E - VolumeCellOrigin.X,
+		                      Key.Y * E - VolumeCellOrigin.Y,
+		                      Key.Z * E - VolumeCellOrigin.Z);
+		// One cell of margin on every side, so all 8 trilinear taps of any
+		// probe inside the brick are real texels rather than clamped ones.
+		if (Base.X >= 1 && Base.Y >= 1 && Base.Z >= 1 &&
+		    Base.X + E + 1 <= VolumeDim && Base.Y + E + 1 <= VolumeDim && Base.Z + E + 1 <= VolumeDim)
+		{
+			InVolume.Add(Key);
+		}
+	}
+
+	if (InVolume.Num() == 0)
+	{
+		UE_LOG(LogVoxelGI, Warning,
+		       TEXT("VOLUMECHECK: cells=0 -- %d resident bricks but none inside the volume ")
+		       TEXT("(dim=%d covers +/-%.0f UU around (%.0f,%.0f,%.0f)). Raise voxel.GI.VolumeDim."),
+		       Keys.Num(), VolumeDim, 0.5 * VolumeDim * VoxelLF::CellSizeUU,
+		       VolumeOriginWorldUU.X + 0.5 * VolumeDim * VoxelLF::CellSizeUU,
+		       VolumeOriginWorldUU.Y + 0.5 * VolumeDim * VoxelLF::CellSizeUU,
+		       VolumeOriginWorldUU.Z + 0.5 * VolumeDim * VoxelLF::CellSizeUU);
+		return;
+	}
+
+	// Software trilinear over the staged bytes, term for term what
+	// Texture3DSampleLevel + the divide in VoxelQuadVertexFactory.ush does.
+	// UVW = (P - Origin) * InvSize, so the texel coordinate is
+	// UVW*Dim - 0.5 == (P - Origin)/40 - 0.5, which is the CPU sampler's own
+	// convention -- no half-texel fixup, because the origin is brick-snapped.
+	const uint8* Shadow = VolumeShadow.GetData();
+	auto SampleShadow = [this, Shadow](const FVector& P, int32 Slot, float& OutIrr) -> bool
+	{
+		const double TX = (P.X - VolumeOriginWorldUU.X) / double(VoxelLF::CellSizeUU) - 0.5;
+		const double TY = (P.Y - VolumeOriginWorldUU.Y) / double(VoxelLF::CellSizeUU) - 0.5;
+		const double TZ = (P.Z - VolumeOriginWorldUU.Z) / double(VoxelLF::CellSizeUU) - 0.5;
+		const int32 BX = int32(FMath::FloorToDouble(TX));
+		const int32 BY = int32(FMath::FloorToDouble(TY));
+		const int32 BZ = int32(FMath::FloorToDouble(TZ));
+		const float FX = float(TX - double(BX));
+		const float FY = float(TY - double(BY));
+		const float FZ = float(TZ - double(BZ));
+
+		float AccumRGB = 0.f;
+		float AccumA = 0.f;
+		for (int32 T = 0; T < 8; ++T)
+		{
+			const int32 OX = T & 1, OY = (T >> 1) & 1, OZ = (T >> 2) & 1;
+			const float W = (OX ? FX : 1.f - FX) * (OY ? FY : 1.f - FY) * (OZ ? FZ : 1.f - FZ);
+			if (W <= 0.f)
+			{
+				continue;
+			}
+			// AM_Clamp on all three axes, matching the sampler state.
+			const int32 CX = FMath::Clamp(BX + OX, 0, VolumeDim - 1);
+			const int32 CY = FMath::Clamp(BY + OY, 0, VolumeDim - 1);
+			const int32 CZ = FMath::Clamp(BZ + OZ, 0, VolumeDim - 1);
+			const uint8* Texel = Shadow + ((int64(CZ) * VolumeDim + CY) * VolumeDim + CX) * 4;
+			AccumRGB += W * float(Texel[Slot]) * (1.f / 255.f);
+			AccumA += W * float(Texel[3]) * (1.f / 255.f);
+		}
+		if (AccumA <= 1.e-4f)
+		{
+			return false; // the shader's "W ~= 0 -> plain AO" branch
+		}
+		OutIrr = AccumRGB / AccumA;
+		return true;
+	};
+
+	// Same offset the vertex shader pushes the probe out by (kGIProbeOffsetUU
+	// = 0.6 * 40), which is also SampleIrradiance's FIRST probe offset. Feeding
+	// the CPU side a surface point P - N*24 makes its first probe land exactly
+	// on P, so both sides read the same 8 taps. Samples where that first probe
+	// misses are counted, not silently averaged in: the CPU would have walked
+	// on to 1.25 and 2.0 cells and the two sides would no longer be comparing
+	// the same point.
+	constexpr float kProbeOffsetUU = 0.6f * float(VoxelLF::CellSizeUU);
+
+	struct FClassStats
+	{
+		int32 Count = 0;
+		double SumAbsErr = 0.0;
+		double MaxAbsErr = 0.0;
+		void Add(double ErrBytes)
+		{
+			++Count;
+			SumAbsErr += ErrBytes;
+			MaxAbsErr = FMath::Max(MaxAbsErr, ErrBytes);
+		}
+		double Mean() const { return Count > 0 ? SumAbsErr / Count : 0.0; }
+	};
+	FClassStats StatsZ;   // +-Z normals: Scheme B is exact here
+	FClassStats StatsXY;  // +-X/+-Y normals: the horizontal mean
+	int32 CpuMiss = 0;    // volume had data, field's first probe did not
+	int32 VolMiss = 0;    // field had data, volume did not (upload lag or a hole)
+	int32 Attempts = 0;
+	int32 Unsolved = 0;
+
+	// Deterministic stream, so two runs of the same build compare like for like.
+	FRandomStream Rand(0x5EED0002);
+	const int32 Target = FMath::Clamp(NumSamples, 1, 1 << 20);
+	const int32 MaxAttempts = Target * 32;
+
+	{
+		const FVoxelLightField::FReadScope Read(*Field);
+		while (StatsZ.Count + StatsXY.Count < Target && Attempts < MaxAttempts)
+		{
+			++Attempts;
+			const FIntVector Key = InVolume[Rand.RandHelper(InVolume.Num())];
+			const FVoxelLFBrick* Brick = Read.FindBrick(Key);
+			if (!Brick || !Brick->bSolved)
+			{
+				continue;
+			}
+			const int32 CX = Rand.RandHelper(E);
+			const int32 CY = Rand.RandHelper(E);
+			const int32 CZ = Rand.RandHelper(E);
+			if (!Brick->SolvedCells[VoxelLF::CellIndex(CX, CY, CZ)])
+			{
+				++Unsolved;
+				continue;
+			}
+
+			// Cell centre, jittered inside the cell so trilinear is actually
+			// exercised. On a centre exactly, the frac terms are 0 and the
+			// filter collapses to one tap.
+			const FVector Probe(
+				(double(Key.X * E + CX) + 0.5 + (Rand.GetFraction() - 0.5)) * VoxelLF::CellSizeUU,
+				(double(Key.Y * E + CY) + 0.5 + (Rand.GetFraction() - 0.5)) * VoxelLF::CellSizeUU,
+				(double(Key.Z * E + CZ) + 0.5 + (Rand.GetFraction() - 0.5)) * VoxelLF::CellSizeUU);
+
+			// 0..5 in DirTable order: +X -X +Y -Y +Z -Z. The shader's slot
+			// selection is on the world normal's z, so +-Z map to R/G and the
+			// four horizontals all map to B.
+			const int32 Dir = Rand.RandHelper(VoxelLF::NumDirs);
+			const FVector3f Normal = VoxelLF::DirTable[Dir];
+			const int32 Slot = (Dir == 4) ? 0 : ((Dir == 5) ? 1 : 2);
+
+			float VolIrr = 0.f;
+			const bool bVolOk = SampleShadow(Probe, Slot, VolIrr);
+
+			const FVector Surface = Probe - FVector(Normal) * double(kProbeOffsetUU);
+			float FieldIrr = 0.f;
+			const bool bFieldOk = Read.Sample(Surface, Normal, FieldIrr);
+
+			if (!bVolOk && !bFieldOk)
+			{
+				continue; // both fall back to plain AO -- agreement, but no signal
+			}
+			if (!bVolOk)
+			{
+				++VolMiss;
+				continue;
+			}
+			if (!bFieldOk)
+			{
+				++CpuMiss;
+				continue;
+			}
+
+			const double ErrBytes = FMath::Abs(double(FieldIrr) - double(VolIrr)) * 255.0;
+			if (Dir >= 4) { StatsZ.Add(ErrBytes); } else { StatsXY.Add(ErrBytes); }
+		}
+	}
+
+	// THE grep line. Headline is the +-Z class, because that is the one Scheme B
+	// claims to reproduce exactly and therefore the one that can falsify the
+	// encoding, the addressing, the origin snap and the run merge in one number.
+	UE_LOG(LogVoxelGI, Log,
+	       TEXT("VOLUMECHECK: cells=%d meanAbsErr=%.3f maxAbsErr=%.3f"),
+	       StatsZ.Count, StatsZ.Mean(), StatsZ.MaxAbsErr);
+	UE_LOG(LogVoxelGI, Log,
+	       TEXT("VOLUMECHECK horizontal (+-X/+-Y, Scheme B mean channel): cells=%d meanAbsErr=%.3f maxAbsErr=%.3f"),
+	       StatsXY.Count, StatsXY.Mean(), StatsXY.MaxAbsErr);
+	// Pass bar, in irradiance bytes: Scheme B is EXACT on +-Z normals, so
+	// anything above a byte of mean error is an addressing, origin or staging
+	// bug rather than an encoding tradeoff.
+	constexpr double kPassMeanBytes = 2.0;
+	UE_LOG(LogVoxelGI, Log,
+	       TEXT("VOLUMECHECK detail: verdict=%s (bar: +-Z mean < %.1f bytes) | dim=%d bricksResident=%d bricksInVolume=%d ")
+	       TEXT("flushedNow=%d uploadedTotal=%d runsTotal=%d queueLeft=%d | attempts=%d unsolvedCell=%d ")
+	       TEXT("volumeMiss=%d fieldFirstProbeMiss=%d | originWorld=(%.0f,%.0f,%.0f)"),
+	       (StatsZ.Count > 0 && StatsZ.Mean() < kPassMeanBytes) ? TEXT("PASS") : TEXT("FAIL"),
+	       kPassMeanBytes, VolumeDim, Keys.Num(), InVolume.Num(),
+	       Flushed, VolumeBricksUploaded, VolumeRunsUploaded, VolumeUploadQueue.Num(),
+	       Attempts, Unsolved, VolMiss, CpuMiss,
+	       VolumeOriginWorldUU.X, VolumeOriginWorldUU.Y, VolumeOriginWorldUU.Z);
+}
+
 // --- tick ------------------------------------------------------------------
 
 void UVoxelGISubsystem::Tick(float DeltaSeconds)
@@ -434,6 +996,11 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		Field->VoxelizeChunk(BrickCoord, OriginUU, Comp->GetChunkQuads());
 		BrickComponents.Add(BrickCoord, WeakComp);
 		MarkBrickNeighbourhoodDirty(BrickCoord, EditRadius);
+		// §3.3 row 2: re-voxelized and not yet solved has to ZERO the texels.
+		// VoxelizeChunk has just cleared Vis/SolvedCells, so the encode produces
+		// all-zero bytes; skipping this would leave a dug tunnel lit with its
+		// pre-dig irradiance until the solve landed several frames later.
+		PushVolumeUpload(BrickCoord);
 		bCoarseDirty = true;
 		++Voxelized;
 	}
@@ -470,6 +1037,7 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		// via a mid-session voxel.Stream.GPU flip, but free to get right.
 		BrickComponents.Remove(BrickCoord);
 		MarkBrickNeighbourhoodDirty(BrickCoord, EditRadius);
+		PushVolumeUpload(BrickCoord); // zero-on-revoxelize, as above
 		bCoarseDirty = true;
 		++Voxelized;
 	}
@@ -541,6 +1109,9 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 			{
 				RefreshQueue.Add(Key);
 			}
+			// §3.3 row 1: brick solved -> write Vis*v, v. Same work list as the
+			// component path's re-shade, separate cursor (see the member decl).
+			PushVolumeUpload(Key);
 		}
 	}
 
@@ -635,6 +1206,19 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		}
 	}
 
+	// 4b) GPU volume texel uploads -- the pooled path's replacement for (4).
+	//
+	//     A pooled chunk has no component and no per-chunk colour buffer, so
+	//     baked per-vertex GI simply does not exist there; its lighting comes
+	//     from this volume instead. The two drains run side by side rather than
+	//     one replacing the other because voxel.Stream.GPUMaxLevel can put both
+	//     renderers in one frame.
+	//
+	//     Costs nothing with voxel.GI.Volume 0: both PushVolumeUpload and this
+	//     drain return on the cvar read before touching the queue.
+	const int32 VolumeUploaded = DrainVolumeUploads(
+		FMath::Max(0, CVarGIMaxBrickUploadsPerFrame.GetValueOnGameThread()));
+
 	// 5) Eviction, at most twice a second. Distance-based rather than
 	//    hooked to chunk unload: UVoxelChunkComponent has no unload callback
 	//    this module is permitted to add, and level-0 chunks only ever unload
@@ -647,6 +1231,10 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		for (const FIntVector& Key : Evicted)
 		{
 			BrickComponents.Remove(Key);
+			// §3.3 row 3: evicted -> zero it. Safe precisely because of the
+			// validity channel: A = 0 reads as "no data" and falls back to plain
+			// AO, never to black.
+			PushVolumeUpload(Key);
 		}
 		if (NumEvicted > 0)
 		{
@@ -676,6 +1264,24 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		UE_LOG(LogVoxelGI, Log, TEXT("GI probe (normal -Z, column above view origin): %s"), *Line);
 	}
 
+	// 6a) voxel.GI.VolumeCheck -- the field-vs-volume equivalence harness.
+	//     Armed by a non-zero cvar, run ONCE, and re-armable by setting it back
+	//     to 0. Deferred by VolumeCheckSettleSeconds after the first upload for
+	//     the same reason the convergence harness has a settle: a field that has
+	//     barely streamed in reports a handful of cells and proves nothing.
+	{
+		const int32 CheckArm = CVarGIVolumeCheck.GetValueOnGameThread();
+		if (CheckArm == 0)
+		{
+			bVolumeCheckDone = false;
+		}
+		else if (!bVolumeCheckDone && FirstVolumeUploadSeconds > 0.0 &&
+		         Now - FirstVolumeUploadSeconds >= double(CVarGIVolumeCheckSettle.GetValueOnGameThread()))
+		{
+			RunVolumeCheck(CheckArm > 1 ? CheckArm : kVolumeCheckDefaultSamples);
+		}
+	}
+
 	// 6) Convergence harness. Last thing in the tick so the field is in its
 	//    normal steady state when it runs.
 	if (ConvergePasses > 0 && !bConvergeDone)
@@ -695,10 +1301,11 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		LastStatSeconds = Now;
 		UE_LOG(LogVoxelGI, Log,
 		       TEXT("GI: bricks=%d (%.1f MB) pendingVox=%d(+%d pooled) dirty=%d refresh=%d | solved %d bricks/%d cells in %.2fms, ")
-		       TEXT("reshaded %d chunks (%d dupes skipped), tick %.2fms"),
+		       TEXT("reshaded %d chunks (%d dupes skipped), volumeUp %d bricks (queue %d, total %d bricks/%d runs), tick %.2fms"),
 		       Field->NumBricks(), double(Field->EstimatedBytes()) / (1024.0 * 1024.0),
 		       PendingVoxelize.Num(), PendingPooledVoxelize.Num(), DirtyQueue.Num(), RefreshQueue.Num(),
 		       ToSolve.Num(), CellsSolved, SolveMs, Refreshed, DedupeSkips,
+		       VolumeUploaded, VolumeUploadQueue.Num(), VolumeBricksUploaded, VolumeRunsUploaded,
 		       (FPlatformTime::Seconds() - TickStart) * 1000.0);
 	}
 }
