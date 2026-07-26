@@ -213,21 +213,34 @@ should be in the **middle distance**, never underfoot. `voxel.GI.Debug 2` prints
 `VOLUMERECENTRE transient:` with how many occupied texels were stale at the worst
 moment and how close the nearest one got to the camera.
 
-### 6c. Scheme B's horizontal error — worth one look in a cave
+### 6c. Cave-wall directional GI — **no longer owed, Scheme A shipped**
 
-Measured, not suspected: the volume stores ±Z irradiance exactly and the four
-horizontal directions as their **mean**. The error is bimodal — half the samples
-are essentially exact, but p95 is ~52/255 and the worst is ~105/255, and it
-concentrates on **side faces near vertical occluders**, which is most of a cave
-wall. See the Wave B section of `docs/gpu-waves-plan.md` for the numbers.
+**SUPERSEDED. Do not run this test; there is nothing left for an eye to decide.**
+This section used to describe Scheme B — ±Z stored exactly, the four horizontal
+directions stored as their **mean** — and asked you to judge in a cave whether the
+resulting error was acceptable, because it concentrated on side faces near
+vertical occluders and peaked at ~105/255.
 
-Nothing automated can decide whether that is acceptable, because it is a
-question about appearance. Go underground, look at a wall lit from one side, and
-compare `voxel.GI.Volume 1` against `voxel.GI.Volume 0` with `voxel.GI.Enabled 1`
-on the component path (`voxel.Stream.GPU 0`, restart) — the component path
-evaluates the full ambient cube and is the reference. If the volume's cave walls
-read flat or wrongly-lit next to it, Scheme A is worth its 2× memory and the
-Wave B section records what that would cost.
+**Scheme A landed instead**, and the measurement is why: horizontal mean, RMS,
+p95, p99 and max all read **0.000** against Scheme B's 9.63 mean / 21.05 RMS /
+105.0 max, with 27.7% of samples over the 8/255 bar falling to 0.0000. The
+half-cell-shifted control held at 1.5 with a max of 58.8, which is what makes the
+zeros load-bearing — the harness is still measuring something, not comparing a
+thing against itself.
+
+It is exact rather than approximate for a reason worth recording: two RGBA8
+volumes, (+X,+Y,+Z,v) and (−X,−Y,−Z,v); a face picks the volume by the **sign** of
+its normal and the channel by the **axis**, so it is one sample, one channel,
+exact. The design doc costs Scheme A at *two* samples, but that is the price for a
+general normal and this mesh never produces one — every greedy-mesh normal is
+axis-aligned, so the second volume is never read. **Scheme A costs memory and
+nothing else**, which was the only per-frame objection to it. 54.0 MiB at
+Dim 192; the design doc's "56.6 MB" is the same quantity in decimal MB, noted so
+nobody chases a phantom discrepancy.
+
+If you are underground anyway, cave walls lit from one side are still the most
+informative thing to look at — but as a check that GI is working at all, not as a
+judgement you are being asked to make.
 
 ### 6d. A dig should relight without re-meshing
 
@@ -253,6 +266,47 @@ the probe produced deliberately.
 So: with debug tints **off**, `voxel.Stream.GPU 0` terrain must look exactly as
 it does today. That is the regression to watch, not whether the tint itself
 works.
+
+## 8. The shadow cap — its own author says his screenshots cannot score it (added Wave G)
+
+`voxel.Stream.GPUShadowMaxLevel` (default **4**) stops the coarsest cascade level
+from being submitted to the shadow depth passes. Its **counts are measured and
+clean**: `cappedQuads=837688` on the one cascade holding level-5 geometry and 0 on
+the other three — predicted from an earlier leg and then confirmed **exact to the
+quad**; 1,457,710 submitted shadow quads removed per frame (*more* than the visible
+removal, because dropping 756 far runs collapses spans the merge was covering);
+camera-visible geometry identical at 962,859 both ways; 58 EMPTY gather events
+before the cap and 58 after, so it introduced no new empty cases.
+
+**What is not measured is whether it looks the same**, and the author said so
+rather than claiming otherwise. Four screenshots came in ~0.05pp above a 0.13%
+same-config floor — consistent in direction, but the anchor was a **coastal
+vista**: ocean, sky, distant snow islands, high sun. There is almost no distant
+terrain casting long shadows there and little middle-distance relief to lose
+self-shadowing on. That is very close to the empty-sky case that cannot fail.
+
+So this needs an eye, at an anchor the harness did not have:
+
+1. **Inland, with middle-distance relief** — a valley or ridgeline, terrain
+   receding a kilometre or more. Not a shoreline.
+2. **Low sun.** Long shadows are the entire point; a high sun hides the effect
+   being tested.
+3. A/B `voxel.Stream.GPUShadowMaxLevel 5` (uncapped) against the default `4`, same
+   pose, settled both times.
+
+You are looking for **distant terrain that stops casting** — a mountain whose
+shadow vanishes, or a far hillside that flattens because it lost its own
+self-shadowing. If the two are indistinguishable at a low-sun inland anchor, the
+cap is visually free and its counts stand on their own.
+
+**A warning about the instrument, not the feature.** The census behind these counts
+*lied once already*, reporting 185,612,113 shadow quads against a 13-million-quad
+pool. `Collector.AllocateMesh()` hands back a **recycled** `FMeshBatch`, and the
+census read `Elements[0].NumPrimitives` before it was populated — so it reported a
+previous gather's value. The draw had been correct the whole time. It was caught
+because the frame got 3.5× *faster* while apparently drawing 14× more. If any
+number here disagrees with another number in the same run, that disagreement is
+the finding.
 
 ---
 
