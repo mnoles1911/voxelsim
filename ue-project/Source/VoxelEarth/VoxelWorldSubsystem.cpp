@@ -1413,6 +1413,26 @@ int32 GetPendingJobCap()
 	return Cap;
 }
 
+// Wave D / D4: fork level-0, unedited chunk meshing off the worker pool and
+// onto FVoxelGpuMeshJobManager.
+//
+// Command line rather than a cvar, for the same reason -VoxelPendingJobCap and
+// -VoxelCoarseMinLevel are: -ExecCmds lands after streaming has already begun,
+// so a cvar would fork a run half way through and make its cold-fill number a
+// blend of two producers. This has to be decided before the first dispatch or
+// the A/B it exists to serve cannot be taken.
+//
+// OFF BY DEFAULT and it stays that way until the byte-equality gate
+// (voxel.GPU.VerifyAsyncMesh) and a motion measurement both pass. The pooled
+// renderer is a separate switch (voxel.Stream.GPU) and is also off; this fork
+// changes only WHO PRODUCES the quads, not who draws them, so the two are
+// independent and either can be measured alone.
+bool GpuMeshEnabled()
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelGpuMesh"));
+	return bEnabled;
+}
+
 // Lowest chunk level that generates via the DIRECT COARSE path
 // (MakeCoarseLevelSampler / vxc::GeneratedWorld::makeCoarseBrick) instead of the
 // 8^L mip recursion (MakeLevelSampler). Levels below this keep the mip path;
@@ -2488,6 +2508,41 @@ struct FVoxelWorldImpl
 	// the number is worth having in the log rather than inferring from silence.
 	int64 GpuResultsAbsorbedAtTeardown = 0;
 
+	// Per-log-window fork telemetry. dispatched vs delivered is the pair that
+	// says whether the fork is keeping up; the status breakdown exists because
+	// every non-Success outcome still produces a chunk with zero quads, which is
+	// indistinguishable on screen from terrain that is genuinely empty.
+	int64 GpuMeshJobsDispatchedSinceLog = 0;
+	int64 GpuMeshJobsDeliveredSinceLog = 0;
+	int64 GpuMeshJobsFailedSinceLog = 0;
+	double GpuMeshSubmitToDeliverMsSinceLog = 0.0;
+	double GpuMeshSubmitToDeliverMaxMs = 0.0;
+
+	// What the fork needs back when a job lands, keyed by the runner's job id.
+	//
+	// Kept here rather than packed into FVoxelGpuMeshJobResult::UserTag because
+	// a level chunk key plus a generation id does not fit in one uint64, and a
+	// lossy pack is precisely how a result gets applied to the wrong chunk. The
+	// map is erased on delivery, and the runner guarantees exactly one delivery
+	// per submitted job, so it cannot leak.
+	struct FGpuPendingJob
+	{
+		VoxelCoords::FVoxelLevelChunkKey Key;
+		uint64 GenerationId = 0;
+	};
+	TMap<uint64, FGpuPendingJob> GpuJobsPending;
+
+	// Creates the runner on first use and returns it. Null only if the RHI
+	// cannot support it, which is checked once.
+	FVoxelGpuMeshJobManager* EnsureGpuMeshJobs();
+	// Builds the region request for one level-0 chunk and hands it to the
+	// runner. Returns false if the fork could not take the chunk, in which case
+	// the caller MUST fall through to the CPU path -- the counters have already
+	// been incremented and something owes a result.
+	bool SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId);
+	// Delivery callback. Game thread, from inside Tick().
+	void OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult);
+
 	bool bHasRecomputed = false;
 	VoxelCoords::FVoxelChunkKey LastAnchorChunk{}; // level 0 anchor chunk; gates the whole RecomputeDesiredSet call
 	FVector LastAnchorLocation = FVector::ZeroVector;
@@ -3459,6 +3514,22 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	{
 		const double T0 = FPlatformTime::Seconds();
 		DispatchJobs();
+		// Poll the GPU runner BETWEEN dispatch and drain (Wave D / D4).
+		//
+		// Order matters and this is the only correct slot. Tick() is what calls
+		// OnGpuMeshJobComplete, which enqueues onto ResultsQueue -- so running
+		// it here means a job that finished during the frame is drained in the
+		// SAME frame, exactly as a worker job that finished mid-frame is.
+		// Ticking after DrainResults would add a guaranteed one-frame delay to
+		// every GPU chunk and would show up as the fork being slower than it is.
+		//
+		// Cheap and safe with nothing outstanding, and the pointer is null until
+		// the first forked dispatch, so a run without -VoxelGpuMesh pays a null
+		// check per frame.
+		if (GpuMeshJobs.IsValid())
+		{
+			GpuMeshJobs->Tick();
+		}
 		const double T1 = FPlatformTime::Seconds();
 		DrainResults(Owner, Root, Material);
 		const double T2 = FPlatformTime::Seconds();
@@ -3984,13 +4055,56 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       (long long)BuriedSkipsSinceLog, (long long)BuriedSkipAirSinceLog, (long long)BuriedSkipSolidSinceLog,
 	       (long long)BuriedSkipsByLevelSinceLog[0], FootprintBandCache.Num(), (long long)BuriedVerifyCheckedSinceLog,
 	       (long long)BuriedVerifyCheckedTotal, (long long)BuriedVerifyViolations);
+	// markTimeouts keeps its exact former meaning -- CPU-seeded marks only -- so
+	// "should be ZERO on a healthy run" still reads true, and the GPU fork cannot
+	// quietly turn the project's only signal for a stranded column into noise.
+	// gpuLatencyTimeouts is the fork's own bucket: non-zero there means GPU jobs
+	// are exceeding kBlindJobMarkTimeoutSeconds, which costs throughput (an extra
+	// blind job) and is NOT the bug the backstop exists for. blindGpu is how many
+	// of the currently-outstanding marks are GPU-seeded, so a rising
+	// gpuLatencyTimeouts can be read against how much of the population is even
+	// eligible to produce one.
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel cold-band throttle (5s window): defers=%lld heldLastPass=%d bandCache=%d blindInFlight=%d "
-	            "markTimeouts=%lld"),
+	            "(gpu=%d) markTimeouts=%lld gpuLatencyTimeouts=%lld"),
 	       (long long)ColdBandDefersSinceLog, ColdBandHeldThisFrame, FootprintBandCache.Num(),
-	       FootprintBlindJobInFlight.Num(), (long long)ColdBandMarkTimeoutsSinceLog);
+	       FootprintBlindJobInFlight.Num(), FootprintBlindJobIsGpu.Num(),
+	       (long long)ColdBandMarkTimeoutsSinceLog, (long long)ColdBandGpuLatencyTimeoutsSinceLog);
 	ColdBandDefersSinceLog = 0;
 	ColdBandMarkTimeoutsSinceLog = 0;
+	ColdBandGpuLatencyTimeoutsSinceLog = 0;
+
+	// The GPU mesh fork. Printed only when it is on, so an unforked run's log is
+	// byte-comparable with every log taken before this wave.
+	//
+	// failed>0 is the line to watch and the reason this is not just a rate:
+	// every non-Success outcome delivers an EMPTY chunk, which on screen is
+	// indistinguishable from terrain that is genuinely empty. The fork can
+	// therefore be quietly deleting geometry while every aggregate here looks
+	// healthy -- fewer quads, faster frames, no errors. Same shape as the pool
+	// allocation failures Wave F had to instrument for the same reason.
+	if (VoxelStreamAdmission::GpuMeshEnabled())
+	{
+		const double MeanDeliverMs = GpuMeshJobsDeliveredSinceLog > 0
+			? GpuMeshSubmitToDeliverMsSinceLog / double(GpuMeshJobsDeliveredSinceLog)
+			: 0.0;
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel GPU mesh fork (5s window): dispatched=%lld delivered=%lld failed=%lld "
+		            "pending=%d queued=%d inFlight=%d | submitToDeliver mean=%.1f ms max=%.1f ms"),
+		       (long long)GpuMeshJobsDispatchedSinceLog, (long long)GpuMeshJobsDeliveredSinceLog,
+		       (long long)GpuMeshJobsFailedSinceLog, GpuJobsPending.Num(),
+		       GpuMeshJobs.IsValid() ? GpuMeshJobs->NumQueued() : 0,
+		       GpuMeshJobs.IsValid() ? GpuMeshJobs->NumInFlight() : 0,
+		       MeanDeliverMs, GpuMeshSubmitToDeliverMaxMs);
+		GpuMeshJobsDispatchedSinceLog = 0;
+		GpuMeshJobsDeliveredSinceLog = 0;
+		GpuMeshJobsFailedSinceLog = 0;
+		GpuMeshSubmitToDeliverMsSinceLog = 0.0;
+		// Max is NOT reset: it is a run-high-water mark, and it is the number
+		// that says whether kBlindJobMarkTimeoutSeconds (5 s) is anywhere near
+		// being crossed. Resetting it every window would hide the one spike
+		// that matters.
+	}
 
 	BuriedSkipsSinceLog = BuriedSkipAirSinceLog = BuriedSkipSolidSinceLog = BuriedVerifyCheckedSinceLog = 0;
 
@@ -5877,6 +5991,127 @@ bool ReplacementCovered(const TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStream
 
 // --- budgeted drains ----------------------------------------------------
 
+FVoxelGpuMeshJobManager* FVoxelWorldImpl::EnsureGpuMeshJobs()
+{
+	if (GpuMeshJobs.IsValid())
+	{
+		return GpuMeshJobs.Get();
+	}
+	if (!bAcceptingGpuResults)
+	{
+		// Teardown has already disarmed the fork. Do not resurrect it.
+		return nullptr;
+	}
+
+	// MaxInFlight is set deliberately high, and the reason is a measurement
+	// hazard rather than a performance preference. The manager has its own
+	// in-flight cap and QUEUES beyond it rather than rejecting, so with both it
+	// and MaxJobsInFlight binding, a throughput number cannot be attributed to
+	// either -- the same shape as the ring floor sweep that collapsed
+	// throughput from 49,179 to 558 chunks and took a while to pin on the
+	// floors. The subsystem's own MaxJobsInFlight is the one knob that should
+	// bind; this one must not.
+	GpuMeshJobs = MakeUnique<FVoxelGpuMeshJobManager>(
+		FVoxelGpuMeshJobComplete::CreateRaw(this, &FVoxelWorldImpl::OnGpuMeshJobComplete),
+		/*InMaxInFlight*/ 256);
+	UE_LOG(LogVoxelStream, Log,
+	       TEXT("VoxelGpuMesh: GPU mesh fork ENABLED (level 0, unedited, band-known chunks only). "
+	            "maxInFlight=%d"),
+	       GpuMeshJobs->GetMaxInFlight());
+	return GpuMeshJobs.Get();
+}
+
+bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId)
+{
+	FVoxelGpuMeshJobManager* Manager = EnsureGpuMeshJobs();
+	if (Manager == nullptr)
+	{
+		return false;
+	}
+
+	FVoxelGpuRegionRequest Req;
+	VoxelGpuChunkRegion::SetChunkFootprint(Req, LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z);
+	Req.Seed = Voxels.amplifier().seed();
+	// The one place the raster-window arithmetic may live -- see
+	// VoxelGpuRegionBuild's header. Undersizing it does not fault; the kernel
+	// clamps to the window edge and silently produces different terrain.
+	VoxelGpuRegionBuild::FillRasterWindow(Req, *Tiles);
+
+	const uint64 JobId = Manager->Submit(MoveTemp(Req));
+	GpuJobsPending.Add(JobId, FGpuPendingJob{ LevelKey, GenId });
+	return true;
+}
+
+void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
+{
+	// Teardown absorbs rather than acts. See WaitForInFlightTasks for why this
+	// has to come before anything that touches Impl state.
+	if (!bAcceptingGpuResults)
+	{
+		++GpuResultsAbsorbedAtTeardown;
+		GpuJobsPending.Remove(GpuResult.JobId);
+		return;
+	}
+
+	FGpuPendingJob Pending;
+	if (!GpuJobsPending.RemoveAndCopyValue(GpuResult.JobId, Pending))
+	{
+		// Cannot happen: the runner delivers exactly once per Submit and every
+		// Submit inserts here. Logged as an Error rather than checked, because
+		// the consequence is a LEAKED SLOT -- the counters below never
+		// decrement, MaxJobsInFlight fills with ghosts and the whole ring stops
+		// dispatching. That is a hang, and a silent one, so it must be loud.
+		UE_LOG(LogVoxelStream, Error,
+		       TEXT("VoxelGpuMesh: delivery for unknown job id %llu (status=%s). A dispatch slot has leaked."),
+		       (unsigned long long)GpuResult.JobId, LexToString(GpuResult.Status));
+		return;
+	}
+
+	++GpuMeshJobsDeliveredSinceLog;
+	GpuMeshSubmitToDeliverMsSinceLog += GpuResult.SubmitToDeliverMs;
+	GpuMeshSubmitToDeliverMaxMs = FMath::Max(GpuMeshSubmitToDeliverMaxMs, GpuResult.SubmitToDeliverMs);
+
+	VoxelStreaming::FJobResult Result;
+	Result.Key = Pending.Key;
+	Result.GenerationId = Pending.GenerationId;
+	Result.JobMs = float(GpuResult.SubmitToDeliverMs);
+	// bBandValid stays FALSE. The GPU has no verified band reduction yet (D6 is
+	// written, not built), and DrainResults declines to cache a band from a
+	// result that does not claim one. The fork only takes chunks whose band is
+	// already known, so nothing is waiting on this.
+	Result.bBandValid = false;
+
+	if (GpuResult.IsOk())
+	{
+		Result.Quads.Reserve(GpuResult.Quads.Num());
+		for (const uint64 Packed : GpuResult.Quads)
+		{
+			Result.Quads.Add(UnpackVoxelChunkQuad(Packed));
+		}
+	}
+	else
+	{
+		++GpuMeshJobsFailedSinceLog;
+		// A failed job still owes exactly one result, and it delivers an EMPTY
+		// one. That is the honest outcome -- but it is also indistinguishable
+		// on screen from terrain that is genuinely empty, which is why it is
+		// counted and logged rather than merely returned.
+		UE_LOG(LogVoxelStream, Warning,
+		       TEXT("VoxelGpuMesh: job %llu for chunk (%d, %d, %d) L%d ended %s -- delivering an EMPTY chunk. %s"),
+		       (unsigned long long)GpuResult.JobId,
+		       Pending.Key.Key.X, Pending.Key.Key.Y, Pending.Key.Key.Z, Pending.Key.Level,
+		       LexToString(GpuResult.Status), *GpuResult.Error);
+	}
+
+	// The matching half of the fork's contract: exactly one FJobResult on the
+	// queue and exactly one decrement, in the same order the worker thread does
+	// them. LevelJobsInFlight[] is NOT touched here -- it is decremented in
+	// DrainResults for both producers alike, which is what keeps the GPU path
+	// an exact analogue rather than a second set of rules.
+	ResultsQueue.Enqueue(MoveTemp(Result));
+	JobsInFlightCounter.Decrement();
+}
+
 void FVoxelWorldImpl::DispatchJobs()
 {
 	// docs/m1-plan.md Stage 2 decisions table: "<=2xLogicalCores jobs in
@@ -6242,6 +6477,63 @@ void FVoxelWorldImpl::DispatchJobs()
 		// Ring-boundary skirt mask -- computed here on the game thread where the
 		// anchor and RingPresets are live, then baked into this job's mesh.
 		const uint8 RingSkirtMask = ComputeRingSkirtMask(LevelKey, LastAnchorLocation);
+
+		// --- The GPU fork (Wave D / D4) -------------------------------------
+		//
+		// Everything above this point has already happened for this chunk: the
+		// record is marked in flight, both counters are incremented, and the
+		// dispatch tallies are bumped. So the fork chooses only WHO MESHES IT,
+		// and both branches owe exactly one FJobResult on ResultsQueue plus one
+		// JobsInFlightCounter decrement. That symmetry is the whole safety
+		// argument -- see the invariant quoted in DrainResults.
+		//
+		// WHY THIS EXCLUDES THE BAND SEED, which is the one condition here that
+		// is not obvious. A level-0 worker job also reduces the footprint's
+		// FFootprintBand out of the column grid it already built, and that band
+		// feeds two admission skips AND the cold-band throttle. The GPU has no
+		// verified band of its own yet: D6's reduction kernel exists but has
+		// never been executed, so by ground rule 13 it is written, not built.
+		// A GPU job therefore returns bBandValid = false, and DrainResults
+		// correctly declines to cache a band from it.
+		//
+		// If such a job were allowed to SEED a cold footprint, the column would
+		// wait out kBlindJobMarkTimeoutSeconds and then re-dispatch -- not a
+		// correctness bug (the backstop catches it) but a throughput one, on
+		// every cold column, forever. So the fork only takes chunks whose
+		// footprint band is ALREADY known, or runs where nothing consults a band
+		// at all. In a settled cascade that is the large majority of level-0
+		// work, because a footprint column is many chunks deep and only its
+		// first job seeds.
+		const bool bBandAlreadyKnown =
+			!bComputeBand || FootprintBandCache.Contains(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y));
+		const bool bUseGpuMesh =
+			VoxelStreamAdmission::GpuMeshEnabled()
+			&& LevelKey.Level == 0        // D5 owns coarse levels; worldgen.ush has no level parameter
+			&& RingSkirtMask == 0         // no GPU equivalent yet -- see D5's skirt analysis
+			&& !bPredictedEmpty           // the band already says this meshes to nothing; do not pay a dispatch
+			&& bBandAlreadyKnown;
+
+		if (bUseGpuMesh && SubmitGpuMeshJob(LevelKey, GenId))
+		{
+			++GpuMeshJobsDispatchedSinceLog;
+			// Deliberately NOT added to InFlightTasks: a GPU job has no
+			// UE::Tasks::TTask. WaitForInFlightTasks covers it separately, and
+			// says why at length.
+			//
+			// The cold-band mark below still applies -- a GPU job is in flight
+			// for this footprint exactly as a worker job would be -- so fall
+			// through to it rather than continuing the loop.
+			if (LevelKey.Level == 0 && bBandSkipActive)
+			{
+				const FIntPoint SeedFootprint(LevelKey.Key.X, LevelKey.Key.Y);
+				if (!FootprintBandCache.Contains(SeedFootprint))
+				{
+					FootprintBlindJobInFlight.Add(SeedFootprint, ElapsedSeconds);
+					FootprintBlindJobIsGpu.Add(SeedFootprint);
+				}
+			}
+			continue;
+		}
 
 		UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
 			TEXT("VoxelChunkMeshJob"),
