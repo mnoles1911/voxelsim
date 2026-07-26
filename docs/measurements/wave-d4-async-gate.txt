@@ -1,0 +1,11 @@
+LogVoxelGpuAsync: voxel.GPU.VerifyAsyncMesh queued: 16 chunks, 4 in flight, starting in 8 s (so the measurement is not taken while the world is still loading).
+LogVoxelGpuAsync: voxel.GPU.VerifyAsyncMesh: 16 chunks, 4 in flight, seed 20260719, emit=GPU chunk-local (voxel.GPU.MeshChunkLocal 1). CPU reference: 22339 quads in 17.8 ms (1.11 ms/chunk).
+LogVoxelGpuAsync:   delivered 16/16 jobs in 24 ticks (0.249 s wall)
+LogVoxelGpuAsync:   quads: gpu 22339, cpu 22339
+LogVoxelGpuAsync:   dispatch->ready latency ms: min 20.25  p50 22.75  p95 24.72  max 24.73
+LogVoxelGpuAsync: Warning:     ^ DO NOT COMPARE ACROSS D3; QUOTE submit->deliver. Since D3 this is when the 4-BYTE TOTAL landed (GPU work done). It used to be when the whole ~810 KB readback landed, so it WILL be lower for a reason that has nothing to do with the GPU being faster.
+LogVoxelGpuAsync:   submit->deliver latency ms: min 55.49  p50 183.96  p95 249.07  max 249.08
+LogVoxelGpuAsync:     ^ the honest end-to-end number: covers both D3 phases.
+LogVoxelGpuAsync:   throughput: 64.2 chunks/s at an in-flight cap of 4 (cpu reference meshed 898.0 chunks/s single-threaded)
+LogVoxelGpuAsync: Warning:     ^ D3 IS A TRADE, quote it with this number: bandwidth down ~70-100x (786 KB -> ~7-12 KB per chunk), latency-to-delivery roughly DOUBLED (two round trips instead of one). Also: the cpu reference is SINGLE-THREADED and the shipping path uses ~24 workers, so it is a per-chunk cost comparison, NOT a throughput ratio.
+LogVoxelGpuAsync: PASS: all 16 chunks meshed through the async GPU path are BYTE-IDENTICAL to MeshChunkBricks + PackVoxelChunkQuad.

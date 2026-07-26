@@ -1,0 +1,20 @@
+LogVoxelStream: VoxelGpuMesh: GPU mesh fork ENABLED (level 0, unedited, band-known chunks only). maxInFlight=256
+LogVoxelPerf: Voxel cold-band throttle (5s window): defers=3144 heldLastPass=0 bandCache=1288 blindInFlight=0 (gpu=0) markTimeouts=0 gpuLatencyTimeouts=0
+LogVoxelPerf: Voxel GPU mesh fork (5s window): dispatched=842 delivered=842 failed=0 pending=0 queued=0 inFlight=0 | submitToDeliver mean=28.4 ms max=90.9 ms
+LogVoxelPerf: Voxel cold-band throttle (5s window): defers=0 heldLastPass=0 bandCache=1288 blindInFlight=0 (gpu=0) markTimeouts=0 gpuLatencyTimeouts=0
+LogVoxelPerf: Voxel GPU mesh fork (5s window): dispatched=0 delivered=0 failed=0 pending=0 queued=0 inFlight=0 | submitToDeliver mean=0.0 ms max=90.9 ms
+LogVoxelPerf: Voxel cold-band throttle (5s window): defers=0 heldLastPass=0 bandCache=1288 blindInFlight=0 (gpu=0) markTimeouts=0 gpuLatencyTimeouts=0
+LogVoxelPerf: Voxel GPU mesh fork (5s window): dispatched=0 delivered=0 failed=0 pending=0 queued=0 inFlight=0 | submitToDeliver mean=0.0 ms max=90.9 ms
+LogVoxelPerf: Voxel cold-band throttle (5s window): defers=0 heldLastPass=0 bandCache=1288 blindInFlight=0 (gpu=0) markTimeouts=0 gpuLatencyTimeouts=0
+LogVoxelPerf: Voxel GPU mesh fork (5s window): dispatched=0 delivered=0 failed=0 pending=0 queued=0 inFlight=0 | submitToDeliver mean=0.0 ms max=90.9 ms
+LogVoxelPerf: Voxel cold-band throttle (5s window): defers=0 heldLastPass=0 bandCache=1288 blindInFlight=0 (gpu=0) markTimeouts=0 gpuLatencyTimeouts=0
+LogVoxelPerf: Voxel GPU mesh fork (5s window): dispatched=0 delivered=0 failed=0 pending=0 queued=0 inFlight=0 | submitToDeliver mean=0.0 ms max=90.9 ms
+LogVoxelPerf: Voxel cold-band throttle (5s window): defers=0 heldLastPass=0 bandCache=1288 blindInFlight=0 (gpu=0) markTimeouts=0 gpuLatencyTimeouts=0
+LogVoxelPerf: Voxel GPU mesh fork (5s window): dispatched=0 delivered=0 failed=0 pending=0 queued=0 inFlight=0 | submitToDeliver mean=0.0 ms max=90.9 ms
+LogVoxelPerf: Voxel cold-band throttle (5s window): defers=0 heldLastPass=0 bandCache=1288 blindInFlight=0 (gpu=0) markTimeouts=0 gpuLatencyTimeouts=0
+LogVoxelPerf: Voxel GPU mesh fork (5s window): dispatched=0 delivered=0 failed=0 pending=0 queued=0 inFlight=0 | submitToDeliver mean=0.0 ms max=90.9 ms
+LogVoxelPerf: Voxel cold-band throttle (5s window): defers=0 heldLastPass=0 bandCache=1288 blindInFlight=0 (gpu=0) markTimeouts=0 gpuLatencyTimeouts=0
+LogVoxelPerf: Voxel GPU mesh fork (5s window): dispatched=0 delivered=0 failed=0 pending=0 queued=0 inFlight=0 | submitToDeliver mean=0.0 ms max=90.9 ms
+LogVoxelPerf: Voxel cold-band throttle (5s window): defers=0 heldLastPass=0 bandCache=1288 blindInFlight=0 (gpu=0) markTimeouts=0 gpuLatencyTimeouts=0
+LogVoxelPerf: Voxel GPU mesh fork (5s window): dispatched=0 delivered=0 failed=0 pending=0 queued=0 inFlight=0 | submitToDeliver mean=0.0 ms max=90.9 ms
+LogVoxelPerf: Voxel cold-band throttle (5s window): defers=0 heldLastPass=0 bandCache=1288 blindInFlight=0 (gpu=0) markTimeouts=0 gpuLatencyTimeouts=0
