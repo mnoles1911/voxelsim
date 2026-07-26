@@ -199,47 +199,57 @@ TAutoConsoleVariable<int32> CVarVoxelStreamGpuMaxChunks(
 	TEXT("quads through the pool are wrong' from 'the pool does not like a multi-million-quad draw'."),
 	ECVF_Default);
 
-// G5. Default TRUE as of 2026-07-25.
+// G5 was flipped to TRUE on 2026-07-25 and is flipped BACK to false the same
+// day, on a measurement that finally worked.
 //
-// THE PERF JUSTIFICATION ORIGINALLY WRITTEN HERE HAS BEEN RETRACTED. It quoted
-// p95 -43%, worst frame -65% and hitches -96% from four legs of the scripted
-// flight. Twelve legs later the ranges overlap almost completely and the
-// component path has the BETTER median on p95 and hitches. Two identical pooled
-// legs on an idle box, same binary, same cvar, back to back, gave p50 21.0 and
-// 47.4 ms -- a 77% spread, larger than the effect being looked for. The first
-// four legs were a coin landing the same way four times. See
-// docs/streaming-handoff.md, "CORRECTION: the G5 frame-time numbers were noise".
+// THE POOL HAS NO PER-CHUNK FRUSTUM CULLING, AND THAT COSTS MORE THAN THE
+// PRIMITIVE COUNT SAVES -- at least once the world has settled.
 //
-// What actually stands behind this default:
-//   * STRUCTURAL, and not a timing measurement at all -- the pooled path draws
-//     9,822 chunks / 8,813,242 quads as ONE primitive and ONE draw call, against
-//     9,822 primitives. Verified from the logs on every run, independent of the
-//     machine.
-//   * VISUAL PARITY, measured against its own noise floor: 17.4% -> 4.3% of
-//     pixels differing by more than 8/255, floor 1.1%.
-//   * ADR-0006's prior basis, which tonight did not re-measure and did not
-//     disturb: renderMs is 43.12 of a 43.92 ms frame while voxel work is a
-//     rounding error.
+// The component path hands the scene 9,822 separate primitives and lets it cull
+// each one. The pool submits ONE draw covering its entire contents every frame,
+// so it pays for all 8,813,242 quads no matter where the camera looks. Measured
+// with -VoxelPerfFlight=static (position AND rotation pinned, pose logged),
+// settled scene, identical geometry on both paths, three legs each:
 //
-// What is NOT established is that any of that converts into better frame times
-// on this hardware with this harness. If that matters before shipping, measure
-// the mechanism (primitive count, draw calls, render-thread time in
-// FScene::AddPrimitive) rather than wall-clock percentiles over a 60 s flight
-// whose run-to-run spread swamps the effect.
+//   camera at the horizon (pitch -20):
+//     p50  component 15.12 ms [10.4-15.5]   pooled 18.58 ms [18.2-19.5]   +23%
+//     p95  component 20.75 ms [17.0-22.5]   pooled 24.59 ms [24.4-25.5]   +19%
 //
-// The component path is deliberately KEPT, not retired. It still carries voxel
-// GI, the debug tints, the ring cross-fade A/B, several mesh-time diagnostics,
-// and -- most importantly -- it is the fallback that voxel.Stream.GPUMaxLevel and
-// GPUMaxChunks bisect against, which are the two sharpest debugging tools this
-// renderer has. Setting this to 0 is a complete revert.
+//   camera straight down (pitch -89), very little in frustum:
+//     p50  component  5.39 ms [ 4.6- 6.2]   pooled 19.05 ms [18.6-19.5]  +253%
+//
+// Non-overlapping ranges in both configurations. The control is the second row:
+// pointing the camera at almost nothing makes the component path 64% cheaper
+// (15.12 -> 5.39 ms) and leaves the pool UNCHANGED (18.58 -> 19.05 ms, +3%).
+// A renderer whose cost does not depend on what is on screen is a renderer that
+// is not culling, and that is the whole finding.
+//
+// This does NOT refute ADR-0006, and the distinction matters. The ADR targets
+// the per-chunk FScene::AddPrimitive cost paid while STREAMING; these runs have
+// zero streaming in them by construction, so they measure the drawing side,
+// where the pool traded culling away for one draw call. The two effects pull in
+// opposite directions, which is exactly why every moving-flight measurement in
+// this session was ambiguous -- a flight mixes both regimes.
+//
+// WHAT WOULD MAKE THE POOL WIN OUTRIGHT: GPU-driven culling. A compute pass over
+// the chunk table emitting an indirect draw (or per-chunk draw ranges) restores
+// per-chunk visibility rejection while keeping one primitive and one draw call.
+// That is the natural completion of ADR-0006 rather than a departure from it,
+// and until it exists the pool should not be the default.
+//
+// Still true, and still worth having: the pooled path is at visual parity
+// (17.4% -> 4.3% of pixels differing, against a measured 1.1% noise floor), it
+// draws 9,822 chunks as one primitive and one draw, and voxel.Stream.GPU 1 turns
+// it on for anyone measuring the streaming side. See docs/streaming-handoff.md.
 TAutoConsoleVariable<bool> CVarVoxelStreamGpu(
 	TEXT("voxel.Stream.GPU"),
-	true,
+	false,
 	TEXT("Route chunk geometry through the ADR-0006 GPU pool (ONE primitive, ONE draw) instead of one scene ")
-	TEXT("component per chunk. Default TRUE. Set 0 to fall back to the per-chunk component renderer, which is ")
-	TEXT("still fully supported and is what voxel.GI.*, the debug tints and -VoxelRingCrossFade require. Set ")
-	TEXT("before the world streams in; toggling mid-flight leaves already-resident chunks on whichever path ")
-	TEXT("loaded them."),
+	TEXT("component per chunk. Default FALSE: the pool has no per-chunk frustum culling, so it pays for every ")
+	TEXT("resident quad regardless of where the camera looks, and measures 23%% slower at p50 on a settled ")
+	TEXT("scene (253%% when little is in frustum). Set 1 to enable it -- it is at visual parity and is the ")
+	TEXT("right path for measuring the streaming side. Set before the world streams in; toggling mid-flight ")
+	TEXT("leaves already-resident chunks on whichever path loaded them."),
 	ECVF_Default);
 
 // Worker slots in flight, as a multiple of logical cores (docs/m1-plan.md Stage

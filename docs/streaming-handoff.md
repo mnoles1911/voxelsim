@@ -577,3 +577,85 @@ made in either direction — including a negative one.
 What remains verified without any timing at all: 9,822 chunks and 8,813,242
 quads as ONE primitive and ONE draw call, against 9,822 primitives. That is the
 mechanism the ADR predicted, and it is a count, not a measurement.
+
+## RESOLVED: the pool has no frustum culling, and G5 is reverted (2026-07-25, final)
+
+The measurement finally worked, and the answer is not the one the earlier
+retracted table claimed, nor the "unknowable" the two failures before it
+suggested.
+
+### The missing variable was the camera pose
+
+Every earlier attempt left the pawn's yaw and pitch uncontrolled. The flights
+move (so streaming load varies); standing still without pinning the pose leaves
+the camera pointing anywhere. `-VoxelPerfFlight=static` was added for this: it
+pins position **and** rotation every frame, re-asserting them rather than merely
+not moving (an unattended pawn does drift -- one run this session travelled 254 m
+unprompted), and writes the pose into the JSON summary so two runs at different
+poses can never be silently compared.
+
+### The result
+
+Settled scene, zero streaming, identical geometry on both paths
+(`loaded=9822 quads=8813242`), three legs each, ~2,000+ post-warmup frames per
+leg:
+
+| camera | metric | component | pooled | delta | overlap |
+|---|---|---|---|---|---|
+| horizon (pitch -20) | p50 | 15.12 [10.4-15.5] | 18.58 [18.2-19.5] | **+23%** | NO |
+| horizon | p95 | 20.75 [17.0-22.5] | 24.59 [24.4-25.5] | **+19%** | NO |
+| straight down (pitch -89) | p50 | 5.39 [4.6-6.2] | 19.05 [18.6-19.5] | **+253%** | NO |
+
+### The control, which is the actual finding
+
+Pointing the camera at almost nothing:
+
+```
+component   15.12 -> 5.39 ms   (-64%)   scales with visibility
+pooled      18.58 -> 19.05 ms  (+3%)    INVARIANT
+```
+
+**A renderer whose cost does not depend on what is on screen is a renderer that
+is not culling.** The component path hands the scene 9,822 separate primitives
+and lets it reject each one; the pool submits ONE draw over its entire contents
+every frame and pays for all 8.8M quads regardless of view. That is the price of
+one draw call, and it is larger than the primitive-count saving once the world
+has settled.
+
+### This does not refute ADR-0006, and the distinction matters
+
+The ADR targets the per-chunk `FScene::AddPrimitive` cost paid **while
+streaming**. These runs contain zero streaming by construction. They measure the
+**drawing** side, where the pool traded culling away. The two effects pull in
+opposite directions -- which is precisely why every moving-flight measurement in
+this session came out ambiguous, and why four legs once agreed by chance. A
+flight mixes both regimes and cannot separate them.
+
+What remains true: one primitive and one draw for 9,822 chunks; visual parity
+measured against its own noise floor; and the ADR's own earlier finding that
+`renderMs` dominates the frame. None of that is disturbed.
+
+### What makes the pool win outright
+
+**GPU-driven culling.** A compute pass over the chunk table emitting an indirect
+draw -- or per-chunk draw ranges -- restores per-chunk visibility rejection while
+keeping one primitive and one draw call. The chunk table already holds each
+chunk's origin and mip scale, which is everything a cull needs, and the pooled
+draw is already a single range that could become an indirect one. This is the
+natural completion of ADR-0006 rather than a departure from it, and it is the
+single highest-value piece of remaining GPU work.
+
+Until it exists, `voxel.Stream.GPU` defaults to **false**. Setting it to 1 still
+gives a visually-correct pooled renderer and is the right configuration for
+measuring the streaming side.
+
+### Method note, and the reason this took four attempts
+
+Three measurements failed before this one, each for a different uncontrolled
+variable: streaming load (the flights), then the camera pose (standing still),
+then nothing at all -- the retracted table was four coin flips landing the same
+way. What finally worked was **building the control into the harness** rather
+than hoping conditions were stable: pin the variable, log it, and include a
+configuration whose outcome would falsify the explanation. The straight-down leg
+exists only to be able to be wrong, and it is what turned "probably culling" into
+a finding.

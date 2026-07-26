@@ -48,6 +48,15 @@ void UVoxelPerfRunSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 			{
 				Flight = EVoxelPerfFlight::Underground;
 			}
+			else if (FlightName.Equals(TEXT("static"), ESearchCase::IgnoreCase))
+			{
+				Flight = EVoxelPerfFlight::Static;
+				// Overridable so the pose can be aimed at a dense view rather
+				// than whatever the spawn happens to face -- the measurement is
+				// only as good as the amount of world in frame.
+				FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfYaw="), StaticYawDeg);
+				FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfPitch="), StaticPitchDeg);
+			}
 			else if (!FlightName.Equals(TEXT("surface"), ESearchCase::IgnoreCase))
 			{
 				// Refuse rather than silently flying the default path: a typo'd
@@ -55,7 +64,7 @@ void UVoxelPerfRunSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 				// a perfectly plausible JSON summary labelled as the run you
 				// thought you asked for.
 				UE_LOG(LogVoxelPerf, Error,
-				       TEXT("VoxelPerfRun: unknown -VoxelPerfFlight=%s (expected 'surface' or 'underground'). Aborting run."),
+				       TEXT("VoxelPerfRun: unknown -VoxelPerfFlight=%s (expected 'surface', 'underground' or 'static'). Aborting run."),
 				       *FlightName);
 				bRequested = false;
 				return;
@@ -179,6 +188,36 @@ void UVoxelPerfRunSubsystem::StepFlightPath(float DeltaTime)
 	APawn* Pawn = PC ? PC->GetPawn() : nullptr;
 	if (!Pawn)
 	{
+		return;
+	}
+
+	if (Flight == EVoxelPerfFlight::Static)
+	{
+		// Capture the pose ONCE, then re-assert it every tick.
+		//
+		// Re-asserting rather than simply not moving is the point: an
+		// unattended pawn does drift -- one run in this session travelled 254 m
+		// and climbed 66 m unprompted -- and a run that quietly moved would
+		// report a plausible number for a different scene. Holding it makes
+		// that impossible instead of unlikely.
+		if (!bStaticPoseCaptured)
+		{
+			bStaticPoseCaptured = true;
+			StaticLocationUU = Pawn->GetActorLocation();
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("VoxelPerfRun: STATIC pose pinned at (%.0f, %.0f, %.0f) yaw=%.1f pitch=%.1f -- "
+			            "position AND rotation held for the whole run, so the renderer is the only variable."),
+			       StaticLocationUU.X, StaticLocationUU.Y, StaticLocationUU.Z, StaticYawDeg, StaticPitchDeg);
+		}
+
+		const FRotator StaticRotation(StaticPitchDeg, StaticYawDeg, 0.f);
+		Pawn->SetActorLocationAndRotation(StaticLocationUU, StaticRotation,
+		                                  /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics);
+		if (PC)
+		{
+			PC->SetControlRotation(StaticRotation);
+		}
+		++TotalPathFrames;
 		return;
 	}
 
@@ -330,12 +369,18 @@ void UVoxelPerfRunSubsystem::FinishRun()
 		TEXT("  \"flight\": \"%s\",\n")
 		TEXT("  \"flightDepthM\": %.1f,\n")
 		TEXT("  \"flightSpeedMPerSec\": %.1f,\n")
+		// Recorded so a static run's numbers can never be read without the pose
+		// they were taken at. Two static runs at different poses are not
+		// comparable, and that is exactly the mistake this mode exists to stop.
+		TEXT("  \"staticYawDeg\": %.1f,\n")
+		TEXT("  \"staticPitchDeg\": %.1f,\n")
 		TEXT("  \"undergroundFrameFraction\": %.4f\n")
 		TEXT("}\n"),
 		DurationSeconds, N, P50, P95, Max, HitchCount, HitchThresholdMs, (long long)ChunksLoaded, AvgChunksPerSec,
 		AvgBudgetSaturationPct, WarmupExcludeSeconds, PostWarmupN, PostWarmupP50, PostWarmupP95, PostWarmupMax, PostWarmupHitchCount,
-		Flight == EVoxelPerfFlight::Underground ? TEXT("underground") : TEXT("surface"), DepthUU / 100.0,
-		LinearSpeedUUPerSecOverride / 100.0, UndergroundFraction);
+		Flight == EVoxelPerfFlight::Underground ? TEXT("underground")
+		    : (Flight == EVoxelPerfFlight::Static ? TEXT("static") : TEXT("surface")), DepthUU / 100.0,
+		LinearSpeedUUPerSecOverride / 100.0, StaticYawDeg, StaticPitchDeg, UndergroundFraction);
 
 	FFileHelper::SaveStringToFile(Json, *OutPath);
 
