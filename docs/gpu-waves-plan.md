@@ -294,6 +294,80 @@ discarded whole rather than reasoned around. The box is now held by one agent at
 time by explicit handover rather than by checking for a running process; a process
 check cannot distinguish "finished" from "between legs".
 
+**Second process note, from this wave's one wrong turn.** The straight-down
+residual was attributed, in an earlier draft of this document, to the cull's own
+per-frame render-thread work. The mechanism was plausible and the code reading
+behind it was correct — `BuildCulledRanges` really is called inside the per-view
+loop and really does handle shadow frustums, so it really does run several times
+per frame, each O(runs) over ~9,800 chunks plus a sort. It costs **0.06 ms**. Two
+lessons worth more than the corrected paragraph:
+
+- **A structural confirmation is not a cost confirmation.** "This runs N times per
+  frame over M elements" and "this is where the time goes" are different claims,
+  and the first was allowed to stand in for the second by everyone who looked at
+  it, author and reviewer alike.
+- **The evidence for the hypothesis came from a run we had already agreed was
+  contaminated.** A `p95` of 9.91 ms against a `p50` of 2.44 was read as
+  "occasional expensive frames", which fits a periodic CPU cost. On a quiet box the
+  same config measures p95 **3.12** ms. The signature was contention. Theorising on
+  a number already ruled inadmissible is the actual error here; the fix is that a
+  discarded run is discarded for *all* purposes, including as the motivation for a
+  hypothesis, not just as a source of headline figures.
+
+The probe was still worth building. It converted a plausible story into a measured
+0.06 ms for the cost of one leg, and a null result that kills a wrong explanation
+is a better return on a leg than a confirmation would have been.
+
+#### Decision rule for `voxel.Stream.GPU`, fixed before the deciding legs landed
+
+The straight-down residual (pass 1: pooled-cull 2.42 vs component 2.25,
+**D₁ = +0.17 ms**) is the same size as this harness's plausible resolution, so the
+flip decision must not be made by looking at pass 2 and deciding what it means.
+The rule below was written and committed **before `down-component-L2` and
+`down-cull-L2` were observed**.
+
+Let `D_i = down-cull-L_i − down-component-L_i`, paired **within** a pass, since the
+two legs of a pass share a box state and the drift being controlled for is drift
+*between* passes.
+
+Let the resolution be
+
+> `R = max( |down-component-L2 − down-component-L1| , 0.050 × mean(down-component) )`
+
+The first term is the direct yardstick: the untouched control, same pose, same
+config, differing by nothing but time. The second is a **floor**, and it is why
+this is not simply the obvious rule — with n = 2 a spread can come out near zero by
+luck, which would make the test arbitrarily strict and let a single lucky pair
+manufacture a "significant" 0.17 ms. The floor is the fractional spread already
+measured on the horizon control pair (9.42 → 9.89 ms, **5.0%**), the only estimate
+of this harness's repeatability in hand that was not taken at the pose under test.
+It puts R at **≥ 0.11 ms** whatever pass 2 does.
+
+- **Flip justified** — `D₁ ≤ R` and `D₂ ≤ R`, *and* pooled-cull ≤ component at the
+  horizon on both legs. The pool would then be at parity where it was worst and
+  ahead where it was already fine.
+- **Flip waits** — `D₁ > R` and `D₂ > R`. A consistent regression at the pose the
+  wave exists to fix, however small in absolute terms.
+- **Inconclusive** — the two legs straddle R. Then the verdict is *inconclusive* and
+  the recommendation is more legs. Not "pick the leg that agrees with the
+  conclusion I prefer".
+
+**Burden of proof sits on the flip**, because enabling a default is the action with
+a blast radius and leaving it disabled costs only that this wave's win goes
+unbanked for another wave. So a marginal pass resolves to *waits* or *inconclusive*,
+never to *justified*.
+
+`D₁ = 0.17` is already on the board, so the flip requires `R ≥ 0.17 ms` — a control
+spread of 7.6% at the down pose, against the 5.0% measured at the horizon.
+**Stated in advance: I expect "waits", marginally.** If pass 2 says otherwise, the
+rule decides, not the expectation.
+
+**Not contingent on any of this:** `voxel.Stream.GPUCull` → 1. It rests on the
+pixel-identity gate and the scaling result (+1.0% → −74%), both of which are
+already established and neither of which is a near-noise comparison. The only
+precondition is that the controls agree across passes; if they do not, the pass is
+struck and nothing here is read at all.
+
 ### The fixed per-frame pooled cost — the finding that outlives this wave
 
 The cull's own numbers, logged per frame:
