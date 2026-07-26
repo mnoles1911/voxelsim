@@ -1,5 +1,20 @@
 # Wave G — GPU-driven compaction for the voxel pool
 
+> **STATUS 2026-07-26: G0 measured. The wave's premise did not survive it, and
+> nothing past G0 was built.**
+>
+> Camera-only compaction reaches **7.3%** of this pool's over-draw. The other
+> 92.6% is in four shadow cascades, which the ADR's own scheduling precedent
+> cannot serve because shadow frusta do not exist at
+> `PreInitViews_RenderThread`. `S_Δ` = 6.34 / 3.42 against a pre-registered
+> stop-threshold of 2.0, so the saving straight down is **0.036 ms** against a
+> residual of 0.13–0.17 ms — short by a factor of four.
+>
+> **`voxel.Stream.GPU` cannot be flipped by this route.** Wave A's diagnosis that
+> the residual is over-draw rather than overhead survives intact; what changed is
+> whose over-draw. Details in §4b–§4e. Shadow-targeted compaction is costed in
+> §4c and is **not authorised** — the owner holds that decision.
+
 Written 2026-07-26 **from the 5.8 engine source and the current tree**, before any
 code was changed, because `docs/gpu-waves-plan.md`'s ground rule "cost before
 build" has caught four wrong premises in Wave D alone.
@@ -301,6 +316,176 @@ in the file, which is the property that matters; it is not one line.
   constant and its reasoning stay.
 
 ---
+
+## 4b. G0 RESULT — measured 2026-07-26. The wave was aimed at 7.3% of its own target.
+
+Five legs, one box state, **every leg settled identically** —
+`loaded=13190 quads=13,088,897 jobsInFlight=0 pendingJobs=0` — so scene
+equivalence is observed rather than assumed. `LogInit: Command Line:` verified per
+leg. Raw evidence in `docs/measurements/wave-g-g0-census.txt`.
+
+| pose | config | camera quads/frame | shadow quads/frame | shadow gathers | S |
+|---|---|---|---|---|---|
+| horizon | cull | 7,251,008 | 21,206,739 | **4.00** | 3.93 |
+| horizon | uncull | 13,088,897 | 52,355,588 | **4.00** | 5.000 |
+| down | cull | 2,053,329 | 25,618,715 | **4.00** | 13.48 |
+| down | uncull | 13,088,897 | 52,355,588 | **4.00** | 5.000 |
+
+**`S_Δ` = 6.34 at the horizon, 3.42 straight down. Both fire the pre-registered
+`S_Δ ≥ 2.0` branch.** Applying the corrected slope `1.19 / S_Δ` to Wave A's own
+scene and residual: straight down **0.036 ms** against a 0.13–0.17 ms residual and
+a 0.114 ms resolution floor — short by a factor of four, not marginally. Horizon
+**0.74 ms**, not 4.7 ms.
+
+**Camera-only compaction cannot flip `voxel.Stream.GPU`.** Reported as it landed,
+under a rule written when the expected answer was `S_Δ = 1`.
+
+### The instrument earned the right to overturn the old one
+
+Three independent checks, all passed:
+
+1. **It reproduces the old log exactly where the old log was valid.** Leg 1's
+   camera gather (`gather=9015, shadowGather=0`) reports
+   `drawnQuads=7251008 visibleQuads=1931679` — identical to the census. Wave A's
+   266,656 / 164,534 could not serve as the planned control because the scene has
+   grown since (13,190 chunks against 9,822), so a same-session check replaced it,
+   which is stronger.
+2. **Both uncull legs land on `S = 5.000` and `camera = 13,088,897` exactly** —
+   precisely the full pool on all five gathers, which is the arithmetic the uncull
+   path is defined by.
+3. **The prime period visibly rotates.** Four of six samples read
+   `shadowGather=1`; the old period never showed one in 112 samples across five
+   sessions.
+
+### Where the geometry actually is
+
+Straight down, cull on, per frame:
+
+| gather | visible | drawn | over-draw |
+|---|---|---|---|
+| camera | 962,859 | 2,053,329 | 1,090,470 |
+| 4 shadow cascades | ~11,853,770 | 25,618,715 | **13,764,945** |
+
+**Shadow gathers are 92.6% of submitted quads and 92.7% of the removable
+over-draw.** The camera view — the only thing a Landscape-shaped pass can reach —
+is 7.3% of the prize. Three of four cascades sit pinned at `ranges=64`, so the
+element cap binds hardest exactly where the geometry is.
+
+**Wave A's diagnosis survives completely: the residual is over-draw, not
+overhead.** What changed is *whose*. Only a gather-split census could tell the
+difference, and nothing else in the programme would have found it.
+
+## 4c. The two cheap levers, priced — one ruled out on paper, one measured
+
+### Merge gap: ruled out analytically, and raising it is strictly harmful
+
+No legs needed; this falls out of the two merge passes as written.
+
+Pass 1 merges every gap ≤ `MergeGap`. Pass 2, if more than `MaxRanges` remain,
+merges the smallest gaps first up to a threshold `T`. **When the cap binds, every
+gap surviving pass 1 exceeds `MergeGap`, so `T > MergeGap` and the final merged
+set is `{gaps ≤ T}` either way — the same result `MergeGap = 0` would give.**
+
+So:
+
+- **Cap-bound (three of four cascades, and the camera): the knob is inert.** It
+  cannot help, at any value.
+- **Not cap-bound: `MergeGap = 0` is strictly better**, because pass 2 still
+  guarantees the element limit and produces the optimal cover. The one
+  non-cap-bound cascade measured (`ranges=35`, 492,838 drawn / 363,312 visible)
+  offers at most 129,526 quads — **under 1% of the 14.9M total over-draw.**
+- **Raising it is strictly wrong in both regimes.**
+
+`voxel.Stream.GPUCullMergeGap 0` is therefore weakly better than any positive
+value, everywhere, and worth almost nothing. **Do not spend legs on this knob.**
+
+### Range budget: real, bounded, and it buys over-draw with draw calls
+
+`voxel.Stream.GPUCullStatsPeriod` now also logs the exact **range-budget curve**,
+computed from the unmerged survivors before either merge pass. It is arithmetic,
+not a simulation: pass 2 merges smallest-gaps-first, which is optimal for "fewest
+redrawn quads subject to ≤ K ranges", so for R survivors
+`drawn(K) = visible + (sum of the R−K smallest gaps)`.
+
+Measured, straight down, settled (leg 5):
+
+| gather | runs | visible | drawn(64) | drawn(256) | drawn(1024) | drawn(∞) |
+|---|---|---|---|---|---|---|
+| camera | 1,008 | 962,859 | 1,985,064 | 1,204,913 | **962,859** | 962,859 |
+| shadow A | 4,693 | 4,449,054 | 9,074,719 | 7,820,773 | 5,591,580 | 4,449,054 |
+| shadow B | 3,330 | 3,152,813 | 5,298,190 | 4,397,682 | 3,165,143 | 3,152,813 |
+| shadow D | 373 | 363,312 | 454,271 | 363,312 | 363,312 | 363,312 |
+| **total** | | **8,928,038** | **16,812,244** | **13,786,680** | **10,082,894** | **8,928,038** |
+
+Over-draw removed against the K=64 baseline: **18% at K=128, 38% at K=256, 85% at
+K=1024, 100% at K=∞.**
+
+**Two findings, and the second is the one that matters.**
+
+**The 64-range over-draw is a floor, not slack.** Because pass 2 is already
+optimal for its budget, `drawn(64)` *is* the best any range-based cull can do with
+64 elements. There is no tuning left in the current shape.
+
+**Compaction is not 15% better than a large range budget — it is off the curve
+entirely.** A K-range draw costs K draw calls. Reaching zero over-draw by
+budget alone needs K ≈ 4,693 *per gather*, and at 5 gathers that is ~23,000 draw
+calls a frame — **more than the ~9,800 per-chunk draws of the component path this
+whole architecture exists to replace.** Compaction is **one** draw call *and*
+zero over-draw. The range approach can have one or the other.
+
+*This reframes the redirect rather than softening it.* The case for compaction was
+never really the 4.7 ms; it is that every alternative trades over-draw against
+draw count and compaction does not. But that case is now attached to the **shadow**
+gathers, which hold 92.6% of the quads — and that is the part with no scheduling
+story, because shadow frusta do not exist at `PreInitViews_RenderThread`.
+
+*Worth recording precisely because it is convenient for the camera path:* the
+camera gather converges at **K = 1,024 exactly** (runs = 1,008), so for the camera
+view a larger element budget is compaction-equivalent, at 1,024 draws. It is the
+cascades at 3,330 and 4,693 runs that do not converge anywhere affordable.
+
+## 4d. Does shadow over-draw scale with cascade count? — yes, and it opens a lever outside this wave
+
+Asked directly, so answered directly. **No, each cascade does not draw close to
+the full pool** — the four cascades' *visible* sets are 34.0%, 29.7%, 24.1% and
+2.8% of it. They are nested annuli, and they largely partition rather than
+duplicate.
+
+But two things follow anyway:
+
+- **Over-draw scales with cascade count**, because each cascade independently pays
+  its own merge tax against its own 64-element budget — 1.36×, 1.66×, 2.04× and
+  2.78× respectively. Four cascades means four merge taxes, not one.
+- **Collectively the cascades' visible geometry is ~90.6% of the pool** — against
+  **7.4%** for the camera at the same pose. The sun sees essentially the whole
+  resident world; the camera sees almost none of it.
+
+That second number is the lever, and it is nobody's current work. **Even perfect
+compaction still draws the 11.85M quads that are genuinely visible to some
+cascade.** That floor is set by every resident chunk out to 2 km casting a
+dynamic shadow, including the coarse outer rings whose shadow contribution at that
+distance is negligible. Capping shadow casting by ring or level attacks the floor
+itself rather than the merge tax on top of it — and it is a relevance change, not
+a rendering-architecture change.
+
+**Not costed here and not this wave's to take.** Recorded because it is cheaper
+than either compaction route and, on these numbers, plausibly larger than both.
+
+## 4e. Keep the census and the prime regardless of what this wave becomes
+
+Stated plainly because it is easy to lose when a wave is rescoped. Neither of
+these is Wave G scaffolding:
+
+- **The gather census** converted an unmeasured assumption into a number, and it
+  is what any future claim about this renderer's cost has to be read against.
+  Every quantitative statement Wave A made about drawn quads was main-view-only
+  without knowing it.
+- **The prime period** stops the next person inheriting the same blind spot. A
+  round period aliases against gathers-per-frame; that is not a quirk of 600, it
+  is a property of round numbers.
+
+They cost nothing when `voxel.Stream.GPUCullStatsPeriod` is 0, which is the
+default.
 
 ## 5. Why compaction, and not "indirect draw plus a base"
 

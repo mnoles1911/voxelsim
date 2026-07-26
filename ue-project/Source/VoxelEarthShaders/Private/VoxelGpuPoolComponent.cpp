@@ -797,6 +797,70 @@ private:
 			return;
 		}
 
+		// THE RANGE-BUDGET CURVE. What would a bigger element budget buy?
+		//
+		// Computed from the UNMERGED survivors, before either merge pass, because
+		// that is the only point at which the full gap structure still exists.
+		//
+		// The arithmetic is exact rather than a simulation. Merging a set of gaps
+		// adds exactly those gaps to the drawn total, and PASS 2 below merges the
+		// smallest gaps first -- which is optimal for "fewest redrawn quads subject
+		// to at most K ranges". So for R surviving runs,
+		//
+		//     drawn(K) = visible + (sum of the R-K smallest gaps),  K < R
+		//     drawn(K) = visible,                                   K >= R
+		//
+		// Two things follow, and both matter more than the numbers.
+		//
+		// FIRST: the drawn total this cull already achieves at K=64 IS drawn(64).
+		// The over-draw at the cap is not slack in the implementation to be tuned
+		// away -- it is the provable floor for a 64-range budget. Nothing that
+		// keeps the range shape can beat it.
+		//
+		// SECOND: drawn(infinity) = visible is exactly what compaction delivers,
+		// because a compacted id list has no range structure to merge. So this one
+		// line prices the entire compaction argument against the cheap alternative
+		// of simply spending more batch elements, per gather, from counts alone --
+		// with no indirect draw, no view extension and no shader change built to
+		// find out.
+		if (VoxelGpuPoolCull::GStatsPeriod > 0 && CulledRanges.Num() > 1)
+		{
+			TArray<uint32> Gaps;
+			Gaps.Reserve(CulledRanges.Num() - 1);
+			for (int32 I = 1; I < CulledRanges.Num(); ++I)
+			{
+				const uint32 PrevEnd = CulledRanges[I - 1].First + CulledRanges[I - 1].Count;
+				Gaps.Add(CulledRanges[I].First >= PrevEnd ? CulledRanges[I].First - PrevEnd : 0u);
+			}
+			Gaps.Sort();
+
+			const int32 R = CulledRanges.Num();
+			auto DrawnAt = [&Gaps, R, VisibleQuads](int32 K) -> uint64
+			{
+				if (K >= R)
+				{
+					return VisibleQuads;
+				}
+				uint64 Extra = 0;
+				const int32 Merges = R - K;
+				for (int32 I = 0; I < Merges && I < Gaps.Num(); ++I)
+				{
+					Extra += Gaps[I];
+				}
+				return uint64(VisibleQuads) + Extra;
+			};
+
+			if (CullLogCounter.GetValue() % 601 == 0)
+			{
+				UE_LOG(LogTemp, Log,
+				       TEXT("%s budget: shadowGather=%d runs=%d visible=%u | drawn(64)=%llu drawn(128)=%llu "
+				            "drawn(256)=%llu drawn(1024)=%llu drawn(4096)=%llu drawn(inf)=%u"),
+				       *PoolName, bShadowGather ? 1 : 0, R, VisibleQuads,
+				       DrawnAt(64), DrawnAt(128), DrawnAt(256), DrawnAt(1024), DrawnAt(4096),
+				       VisibleQuads);
+			}
+		}
+
 		// PASS 1: MERGE ON THE TOLERATED GAP (voxel.Stream.GPUCullMergeGap).
 		//
 		// This is what that cvar always claimed to do and never did. Its own
