@@ -118,6 +118,38 @@ struct FVoxelGpuMeshJobResult
 	// 0; the contract on this field is the same either way.
 	TArray<uint64> Quads;
 
+	// --- Wave D / D6: the footprint band ------------------------------------
+	//
+	// RAW voxel z as BandReduceMain wrote them: the max of
+	// ColumnSurfaceTopVoxel and the min of ColumnDeepestAirVoxel over the band
+	// window. VoxelStreaming::MakeFootprintBand turns them into an
+	// FFootprintBand; the widening constants stay on the VoxelEarth side
+	// because every constant mirrored into HLSL is a determinism liability, and
+	// this module does not link voxel-core anyway.
+	//
+	// ON THE SAME RESULT OBJECT ON PURPOSE, AND THIS IS THE LOAD-BEARING PART.
+	// The band could have been its own async stream. It must not be: that would
+	// give a job TWO things to deliver exactly once, and make "delivered quads
+	// but no band" representable. Doubling the exactly-one-outcome surface is
+	// the class of change that produced the stranded-(X,Y)-column bug this
+	// project has already fixed once. Riding the existing result means
+	// DrainResults keeps doing FootprintBandCache.Add,
+	// FootprintBlindJobInFlight.Remove and --LevelJobsInFlight in one pass over
+	// one result, unchanged.
+	//
+	// The two readbacks are enqueued in the SAME graph as the quad total and
+	// harvested ALL-OR-NONE in phase 1 — the same rule the brick-local control
+	// path's Counts/Offsets already follow — so there is still exactly one
+	// completion event, not two.
+	//
+	// bBandValid is false when the request did not ask for a band (BandEdge 0),
+	// which is every job but the first in an (X,Y) footprint. False means "this
+	// job carries no band", never "the band is zero" — a band of zeroes claims
+	// the world is empty.
+	bool bBandValid = false;
+	int32 BandMaxSurfaceTopVoxel = 0;
+	int32 BandMinDeepestAirVoxel = 0;
+
 	// Wall-clock, all measured from the game thread's point of view except
 	// DispatchToReadyMs.
 	//

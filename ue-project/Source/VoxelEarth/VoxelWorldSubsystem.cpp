@@ -8,9 +8,12 @@
 #include "VoxelChunkMesher.h"
 #include "VoxelClimateProbe.h"
 #include "VoxelGpuPoolComponent.h"
+#include "VoxelGpuMeshJobManager.h" // Wave D / D4: the async GPU mesh runner, forked into DispatchJobs
+#include "VoxelGpuRegionBuild.h"    // FillRasterWindow -- shared with both GPU verify harnesses
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
+#include "VoxelFootprintBand.h" // FFootprintBand + the two per-column reductions (lifted so the GPU gate can call them)
 #include "VoxelGI.h" // pooled-path light field ingest (the component path reaches it via SetChunkQuads)
 #include "VoxelMeshTypes.h"
 // M3 wave 1 (docs/m3-plan.md): role split needs the relay actor (broadcast
@@ -1128,70 +1131,13 @@ struct FChunkRecord
 
 // --- Buried-chunk pre-dispatch skip -----------------------------------------
 //
-// docs/status.md "Buried-chunk pre-dispatch skip". Measured on this build:
-// ~76-79% of level-0 worker output meshes to ZERO quads, and those jobs are
-// 71-75% of level-0 worker wall time (the mesher's uniform-brick early-outs
-// save little, because the dominant cost is upstream of the mesher -- the
-// (32+2)^2 Amplifier::column grid alone is ~42% of a level-0 job). Roughly
-// 70% of the zero-quad level-0 chunks are fully-buried solid and ~30% are
-// entirely above the terrain.
-//
-// A FOOTPRINT BAND is a pair of level-0 voxel z values summarising everything
-// the whole (X,Y) footprint can contain, derived from the SAME 34x34 column
-// grid a level-0 job already builds. Every level-0 chunk in a given (X,Y)
-// shares that grid's XY extent exactly -- the mesher's 1-voxel apron makes a
-// chunk read columns [32X-1, 32X+32], which is precisely the grid -- so one
-// job's band answers the "can this chunk contain geometry" question for every
-// chunk stacked above and below it, for free. That is the whole trick: the
-// band costs one reduction over columns that were paid for anyway, and it is
-// then reused by the ~10-20 other chunks in the same footprint.
-//
-// WHICH WAY IT ERRS. Every bound below is an OUTER bound of the corresponding
-// voxel-core predicate, taken over a SUPERSET of the columns a chunk reads
-// (the apron-inclusive grid), with an extra one-voxel margin on each side. So
-// the band can only ever claim LESS emptiness than really exists: it may fail
-// to skip a chunk that is in fact featureless (pure lost opportunity, the
-// chunk meshes as before and still produces nothing), and it cannot claim
-// "definitely empty" for a chunk that has geometry. False "might have
-// geometry" is free; false "definitely empty" would be a rendering bug.
-struct FFootprintBand
-{
-	// Highest level-0 voxel z that is solid in ANY column of the footprint
-	// (apron included). Strictly above this every column is air, so a chunk
-	// whose interior starts above it has an all-air interior and hits
-	// meshBrick's early-out 1 in every one of its 64 bricks.
-	int32 MaxSurfaceTopVoxel = 0;
-	// Lowest level-0 voxel z at which air can exist in ANY column of the
-	// footprint. Strictly below this every column is solid, so a chunk whose
-	// apron-inclusive top is below it contains no AIR at all -- and
-	// voxelcore/mesher.h emits a face only where a solid voxel has an AIR
-	// neighbour, so it meshes to zero quads whatever materials it holds.
-	int32 SolidBelowVoxel = 0;
-};
-
-// The band verdict for one level-0 chunk Z, in ONE place. Two call sites now
-// ask it -- the pre-dispatch skip in DispatchJobs and the admission skip in
-// RecomputeDesiredSet -- and they must not be able to drift apart: an
-// admission site that skipped one chunk more than the dispatch site would
-// delete geometry the verify harness has never checked.
-//
-// Pure in (Band, ChunkZ). The band itself is a pure function of the level-0
-// footprint (X,Y) and the amplifier, so this verdict is too -- that is what
-// makes it legal to evaluate at admission time at all.
-inline bool BandProvesChunkEmpty(const FFootprintBand& Band, int32 ChunkZ, bool& bOutAllAir)
-{
-	constexpr int64 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
-	const int64 InteriorZMin = int64(ChunkZ) * ChunkVox;
-	const int64 ApronZMax = InteriorZMin + ChunkVox; // interior top is +31; the mesher's apron reads +32
-	// All air: the whole interior sits above every column's topmost solid
-	// voxel, so every one of the 64 bricks hits meshBrick's early-out 1.
-	const bool bAllAir = InteriorZMin > int64(Band.MaxSurfaceTopVoxel);
-	// All solid: chunk AND apron sit below the lowest z at which any column
-	// can hold air, so no face has an AIR neighbour.
-	const bool bAllSolid = ApronZMax < int64(Band.SolidBelowVoxel);
-	bOutAllAir = bAllAir;
-	return bAllAir || bAllSolid;
-}
+// FFootprintBand, BandProvesChunkEmpty, MakeFootprintBand and the two
+// per-column reductions the band is a max/min of now live in
+// VoxelFootprintBand.h, included above. They were lifted out of this file for
+// the same reason MeshChunkBricks was: voxel.GPU.VerifyRegion gates
+// BandReduceMain (Wave D / D6) against the SHIPPING reduction rather than a
+// transcription of it, and it cannot do that while the reduction is buried in
+// a .cpp. See that header for the full commentary.
 
 struct FJobResult
 {
@@ -1260,104 +1206,6 @@ struct FJobResult
 	bool bPredictedEmpty = false;
 };
 
-// Smallest integer >= sqrt(v), for v >= 0. The carve predicates all test
-// `dz*dz < marginSq`, i.e. |dz| < sqrt(marginSq); rounding the radius UP is
-// what keeps every bound below an outer bound.
-inline int64 CeilSqrtI64(int64 V)
-{
-	if (V <= 0)
-	{
-		return 0;
-	}
-	int64 R = int64(FMath::CeilToDouble(FMath::Sqrt(double(V))));
-	while (R * R < V) { ++R; }   // never under-estimate, whatever the FP rounding did
-	while (R > 0 && (R - 1) * (R - 1) >= V) { --R; }
-	return R;
-}
-
-// Topmost level-0 voxel z whose material is not AIR by stratigraphy alone.
-// Mirrors Amplifier::stratigraphyAt: a voxel's centre is vz*100+50 mm and it
-// is air iff surfaceMm - centre < 0. Caves and caverns only ever REMOVE solid,
-// never add it, so nothing above this can be solid.
-inline int64 ColumnSurfaceTopVoxel(const vxc::ColumnSample& Col)
-{
-	return vxc::floorDiv(int64(Col.surfaceMm) - vxc::kVoxelSizeMm / 2, int64(vxc::kVoxelSizeMm));
-}
-
-// Lowest level-0 voxel z at which this column can hold AIR. A conservative
-// OUTER bound (i.e. possibly lower than the truth, never higher) on the three
-// independent sources of air, mirroring voxelcore/amplifier.cpp's materialAt:
-//
-//  1. Everything strictly above the surface (always present).
-//  2. caveCarveAt (voxelcore/caves.h): air needs `depthMm < segs[s].depthMm +
-//     sqrt(marginSq)` for some segment, or `depthMm <= shaftDepthMaxMm` for a
-//     sinkhole shaft. The shaft term is taken OUTSIDE the bedrock clamp
-//     because caveCarveAt tests the shaft BEFORE its roof and bedrock guards.
-//  3. cavernCarveAt (voxelcore/caverns.h): air needs absolute
-//     `zAbs >= zFloorMm` and `zAbs > zCenterMm - sqrt(marginSq)`.
-//
-// Both carve passes independently refuse `vz < kCaveMinVoxelZ` (sea level:
-// the implicit ocean owns everything below z=0, so a void there is water, not
-// a cave) and refuse a column whose surface is below kCaveMinSurfaceMm -- both
-// are used to tighten the bound, but only against the CARVE terms, never
-// against source 1: terrain whose surface is itself below sea level has air
-// above it and must not be claimed solid.
-inline int64 ColumnDeepestAirVoxel(const vxc::ColumnSample& Col)
-{
-	const int64 SurfaceTop = ColumnSurfaceTopVoxel(Col);
-	int64 CarveMin = INT64_MAX;
-
-	const bool bCarveEligible = Col.surfaceMm >= vxc::kCaveMinSurfaceMm;
-	if (bCarveEligible && (Col.cave.count > 0 || Col.cave.shaftMarginSq > 0))
-	{
-		int64 MaxCaveDepthMm = INT64_MIN;
-		if (Col.cave.shaftMarginSq > 0)
-		{
-			MaxCaveDepthMm = FMath::Max(MaxCaveDepthMm, int64(Col.cave.shaftDepthMaxMm));
-		}
-		int64 SegDepthMm = INT64_MIN;
-		for (int32 S = 0; S < Col.cave.count; ++S)
-		{
-			SegDepthMm = FMath::Max(SegDepthMm, int64(Col.cave.segs[S].depthMm) + CeilSqrtI64(int64(Col.cave.segs[S].marginSq)));
-		}
-		if (SegDepthMm > INT64_MIN)
-		{
-			// caveCarveAt refuses once depthMm + kCaveBedrockMarginMm >= bedrockDepthMm.
-			SegDepthMm = FMath::Min(SegDepthMm, int64(Col.bedrockDepthMm) - vxc::kCaveBedrockMarginMm);
-			MaxCaveDepthMm = FMath::Max(MaxCaveDepthMm, SegDepthMm);
-		}
-		if (MaxCaveDepthMm > INT64_MIN)
-		{
-			// depthMm < MaxCaveDepthMm  <=>  vz*100+50 > surfaceMm - MaxCaveDepthMm.
-			CarveMin = FMath::Min(CarveMin, vxc::floorDiv(int64(Col.surfaceMm) - MaxCaveDepthMm - vxc::kVoxelSizeMm / 2,
-			                                             int64(vxc::kVoxelSizeMm)));
-		}
-	}
-
-	if (bCarveEligible && Col.cavern.count > 0)
-	{
-		int64 MinZAbsMm = INT64_MAX;
-		for (int32 S = 0; S < Col.cavern.count; ++S)
-		{
-			const vxc::CavernSeg& Sg = Col.cavern.segs[S];
-			MinZAbsMm = FMath::Min(MinZAbsMm, FMath::Max(int64(Sg.zFloorMm),
-			                                             int64(Sg.zCenterMm) - CeilSqrtI64(int64(Sg.marginSq))));
-		}
-		if (MinZAbsMm < INT64_MAX)
-		{
-			// cavernCarveAt refuses once depthMm + kCaveBedrockMarginMm >= bedrockDepthMm.
-			MinZAbsMm = FMath::Max(MinZAbsMm, int64(Col.surfaceMm) - int64(Col.bedrockDepthMm) + vxc::kCaveBedrockMarginMm);
-			CarveMin = FMath::Min(CarveMin, vxc::floorDiv(MinZAbsMm - vxc::kVoxelSizeMm / 2, int64(vxc::kVoxelSizeMm)));
-		}
-	}
-
-	if (CarveMin != INT64_MAX)
-	{
-		CarveMin = FMath::Max(CarveMin, int64(vxc::kCaveMinVoxelZ)); // no carving at or below sea level
-	}
-	// Source 1 is unconditional and must NOT be clamped to sea level.
-	return FMath::Min(CarveMin, SurfaceTop + 1);
-}
 } // namespace VoxelStreaming
 
 // M3 wave 1 (docs/m3-plan.md "Transport"): the wire format AVoxelEditRelay's
@@ -2514,6 +2362,26 @@ struct FVoxelWorldImpl
 	FThreadSafeCounter JobsInFlightCounter;
 	TArray<UE::Tasks::TTask<void>> InFlightTasks; // only for a clean Deinitialize() wait; see WaitForInFlightTasks
 
+	// --- GPU meshing (ADR-0006, Wave D / D4) --------------------------------
+	//
+	// The async runner, owned here so it lives exactly as long as the streaming
+	// state its results feed. Created lazily on the first GPU-forked dispatch
+	// (so a session that never enables the fork never constructs it) and
+	// destroyed in WaitForInFlightTasks, which is also where its outstanding
+	// jobs are cancelled -- see there for the teardown-ordering argument, which
+	// is the one genuinely load-bearing part of this wiring.
+	//
+	// NOT in InFlightTasks: a GPU job has no UE::Tasks::TTask to wait on.
+	TUniquePtr<FVoxelGpuMeshJobManager> GpuMeshJobs;
+	// Cleared before CancelAll at teardown, so cancellations delivered while
+	// Impl is being destroyed are absorbed instead of enqueued onto a
+	// ResultsQueue nothing will ever drain again.
+	bool bAcceptingGpuResults = true;
+	// Counted rather than silent: a delivery arriving after the fork is
+	// disarmed is expected at teardown and would be a bug at any other time, so
+	// the number is worth having in the log rather than inferring from silence.
+	int64 GpuResultsAbsorbedAtTeardown = 0;
+
 	bool bHasRecomputed = false;
 	VoxelCoords::FVoxelChunkKey LastAnchorChunk{}; // level 0 anchor chunk; gates the whole RecomputeDesiredSet call
 	FVector LastAnchorLocation = FVector::ZeroVector;
@@ -2615,15 +2483,42 @@ struct FVoxelWorldImpl
 	// that column -- the throttle exists to save work, not for correctness --
 	// while holding one forever costs the ring.
 	TMap<FIntPoint, double> FootprintBlindJobInFlight;
+	// Which of those marks was seeded by a GPU-meshed job (Wave D / D4). Kept
+	// beside the map rather than folded into its value so the mark's own
+	// lifetime rules stay literally unchanged -- added and removed in exactly
+	// the same two places, and empty whenever the GPU fork is off.
+	//
+	// It exists only to SPLIT the age-out counter below. See there.
+	TSet<FIntPoint> FootprintBlindJobIsGpu;
 	// Generous next to a worker job (measured p50 well under 100 ms) so a healthy
 	// column is never released early, but short enough that a stranded one
 	// recovers in seconds rather than never.
+	//
+	// DELIBERATELY NOT RAISED FOR GPU JOBS (Wave D / D4). A GPU job's
+	// submit->deliver time is longer and, at time of writing, unmeasured -- so
+	// the obvious move is to raise this. That is the wrong trade: raising it
+	// slows recovery from a genuine strand, and this throttle exists to SAVE
+	// WORK, not for correctness. An extra blind job costs one job; a stranded
+	// (X,Y) column costs its whole ring, and has done, twice. The mark stays at
+	// 5 s and the counter is split instead.
 	static constexpr double kBlindJobMarkTimeoutSeconds = 5.0;
 	int64 ColdBandDefersSinceLog = 0; // column-mates held back, per 5s log window
-	// Marks released by the age-out above. Should be ZERO on a healthy run --
-	// any non-zero value means a launch path produced no result, which is the
-	// bug this backstop exists to survive, and is worth chasing.
+	// Marks released by the age-out above WITH NOTHING IN FLIGHT. Should be ZERO
+	// on a healthy run -- any non-zero value means a launch path produced no
+	// result, which is the bug this backstop exists to survive, and is worth
+	// chasing. That sentence is the only diagnostic for a bug this project has
+	// now fixed twice, which is why the GPU case is counted separately below
+	// rather than being allowed to blunt it.
 	int64 ColdBandMarkTimeoutsSinceLog = 0;
+	// Marks released by the age-out while a GPU-meshed job for that footprint
+	// was still legitimately in flight (Wave D / D4). NOT a bug: it means GPU
+	// delivery outran the 5 s mark, and the cost is one redundant blind job for
+	// that column. PRE-EMPTIVE, and recorded as such -- the only datapoint in
+	// hand is a 921 ms dispatch->ready max on a warmup leg, comfortably under
+	// the mark, so this is expected to read zero today. It is here so that if
+	// GPU latency ever does cross 5 s, the fact lands in its own counter
+	// instead of turning the line above into noise.
+	int64 ColdBandGpuLatencyTimeoutsSinceLog = 0;
 	int32 ColdBandHeldThisFrame = 0;  // held on the most recent DispatchJobs pass
 
 	// --- Bounded admission (docs/status.md "Streaming pipeline re-measure +
@@ -3620,6 +3515,50 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 		Task.Wait();
 	}
 	InFlightTasks.Empty();
+
+	// --- GPU-meshed jobs (Wave D / D4) --------------------------------------
+	//
+	// A GPU job adds NOTHING to InFlightTasks -- there is no UE::Tasks::TTask,
+	// only a ref-counted job object inside FVoxelGpuMeshJobManager -- so the
+	// loop above does not cover it and this function's whole guarantee would
+	// have a hole in it exactly the size of the wave.
+	//
+	// WHY CancelAll AND NOT A WAIT. The manager cannot be waited on: its
+	// completion path is a render-thread readback polled from Tick(), and Tick
+	// is not going to run again during teardown. CancelAll() is the manager's
+	// own answer -- it delivers Cancelled for every queued and in-flight job,
+	// which is what satisfies the exactly-one-outcome invariant its header
+	// states. It deliberately does NOT flush the render thread: any render
+	// command still in flight holds its own reference to the job it touches, so
+	// those objects stay alive after this returns and die with the manager.
+	//
+	// WHY THE CALLBACK MUST BE NEUTRALISED FIRST, and this is the subtle half.
+	// CancelAll delivers results, and our delivery callback enqueues onto
+	// ResultsQueue and decrements JobsInFlightCounter -- i.e. it TOUCHES Impl
+	// state, during Impl teardown, for chunks whose records are about to be
+	// destroyed. Nothing would ever drain that queue. So the fork is disarmed
+	// first: bAcceptingGpuResults is cleared, the callback becomes a counted
+	// no-op, and the cancellations are absorbed rather than acted on.
+	//
+	// The invariant is not weakened by that. "Exactly one outcome per job" is a
+	// statement about the MANAGER, and CancelAll still satisfies it for every
+	// job. What changes is only what the subsystem chooses to do with an
+	// outcome that arrives after it has stopped streaming, which is nothing --
+	// the correct action for a world that is being destroyed.
+	bAcceptingGpuResults = false;
+	if (GpuMeshJobs.IsValid())
+	{
+		const int32 Outstanding = GpuMeshJobs->NumQueued() + GpuMeshJobs->NumInFlight();
+		GpuMeshJobs->CancelAll();
+		if (Outstanding > 0)
+		{
+			UE_LOG(LogVoxelStream, Log,
+			       TEXT("WaitForInFlightTasks: cancelled %d outstanding GPU mesh job(s) at teardown "
+			            "(%lld absorbed after the fork was disarmed)"),
+			       Outstanding, (long long)GpuResultsAbsorbedAtTeardown);
+		}
+		GpuMeshJobs.Reset();
+	}
 }
 
 void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
@@ -5810,6 +5749,26 @@ void FVoxelWorldImpl::DispatchJobs()
 	// flight." The multiplier is now voxel.Stream.JobsInFlightPerCore (default
 	// 2, i.e. byte-identical to the old hardcoded form) -- see that cvar's
 	// comment in VoxelDebug.cpp for the dispatch-starvation measurement.
+	//
+	// SIZING THIS AGAINST A GPU JOB IS A DIFFERENT PROBLEM (Wave D / D4), and
+	// the per-core form is the wrong shape for it. JobsInFlightCounter means
+	// "work outstanding" and is decremented when the job's RESULT is produced,
+	// not when it is dispatched -- true on the worker path today (the decrement
+	// sits one line after ResultsQueue.Enqueue) and deliberately kept true on
+	// the GPU path, where the analogous site is the manager's OnJobComplete.
+	//
+	// The consequence is that this cap must absorb GPU LATENCY as well as work.
+	// A worker job's lifetime is its own CPU time; a GPU job's is the manager's
+	// queue wait plus the dispatch plus TWO readback phases plus one
+	// game-thread tick of poll quantisation per phase. So the cap that
+	// saturates the GPU is a function of LATENCY x RATE, not of core count, and
+	// a value tuned for 24 workers will starve a pipeline whose jobs take
+	// frames rather than milliseconds.
+	//
+	// Do NOT retune it and the ring slot floors in the same change. The
+	// recorded catastrophe is exactly that: floors {0,2,3,4,4} reserved 13 of
+	// 24 slots and collapsed throughput from 49,179 chunks to 558, and with two
+	// knobs moving nobody could say which had done it.
 	const int32 MaxJobsInFlight =
 		VoxelDebug::GetStreamJobsInFlightPerCore() * FPlatformMisc::NumberOfCoresIncludingHyperthreads();
 	const bool bRingQuota = VoxelStreamAdmission::GetRingQuotaEnabled();
@@ -5938,8 +5897,21 @@ void FVoxelWorldImpl::DispatchJobs()
 					// Stale: the seeding job never produced a result. Drop the
 					// mark and let this chunk through as the new seed rather
 					// than deferring its column forever.
+					//
+					// Split by which kind of job seeded it. A GPU job that is
+					// simply slower than 5 s is not the bug this backstop
+					// exists for, and counting it in the same bucket would
+					// destroy the "should be ZERO on a healthy run" property
+					// that is the only signal for the real one.
 					FootprintBlindJobInFlight.Remove(Footprint);
-					++ColdBandMarkTimeoutsSinceLog;
+					if (FootprintBlindJobIsGpu.Remove(Footprint) > 0)
+					{
+						++ColdBandGpuLatencyTimeoutsSinceLog;
+					}
+					else
+					{
+						++ColdBandMarkTimeoutsSinceLog;
+					}
 				}
 				else
 				{
@@ -6325,8 +6297,10 @@ void FVoxelWorldImpl::DispatchJobs()
 							MaxTop = FMath::Max(MaxTop, ScratchTopSolid[I]);
 							MinAir = FMath::Min(MinAir, ScratchDeepestAir[I]);
 						}
-						Result.Band.MaxSurfaceTopVoxel = int32(FMath::Clamp<int64>(MaxTop + 1, INT32_MIN, INT32_MAX));
-						Result.Band.SolidBelowVoxel = int32(FMath::Clamp<int64>(MinAir - 1, INT32_MIN, INT32_MAX));
+						// Shared with voxel.GPU.VerifyRegion's band gate and with
+						// BandReduceMain's readback path, so the widening cannot
+						// drift between the three producers of a band.
+						Result.Band = VoxelStreaming::MakeFootprintBand(MaxTop, MinAir);
 						Result.bBandValid = true;
 					}
 					const auto GridSampler = [Columns, BaseVX, BaseVY](int64 X, int64 Y, int64 Z)
@@ -7110,7 +7084,11 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		// behind a mark that nothing ever removes.
 		if (Result.Key.Level == 0)
 		{
-			FootprintBlindJobInFlight.Remove(FIntPoint(Result.Key.Key.X, Result.Key.Key.Y));
+			const FIntPoint DoneFootprint(Result.Key.Key.X, Result.Key.Key.Y);
+			FootprintBlindJobInFlight.Remove(DoneFootprint);
+			// Same site, same condition, so the GPU tag can never outlive the
+			// mark it annotates (Wave D / D4).
+			FootprintBlindJobIsGpu.Remove(DoneFootprint);
 		}
 
 		// -VoxelVerifyBuriedSkip soundness check: this chunk's band verdict
