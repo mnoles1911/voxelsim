@@ -804,6 +804,103 @@ std::function<vxc::MaterialId(int64, int64, int64)> MakeCoarseLevelSampler(const
 	};
 }
 
+// COARSE flat-grid sampler -- MakeCoarseLevelSampler's output with the
+// indirection removed. Same rule, same numbers, ~3x cheaper per chunk.
+//
+// Unfold what the sampler above actually computes for absolute level-L voxel
+// (X, Y, Z). Its brick key is (floorDiv(X,B), floorDiv(Y,B), floorDiv(Z,B)) and
+// its local index is (floorMod(X,B), ...), so key*B + local == X on every axis.
+// coarseColumns(L, bx, by) fills grid.at(lx,ly) with
+// amp.column(coarseRep(bx*B+lx, L), coarseRep(by*B+ly, L)); makeCoarseBrick
+// writes cell (lx,ly,lz) = Amplifier::materialAt(grid.at(lx,ly),
+// coarseRep(bz*B+lz, L)) (generator.h:117-142), and Brick::set/get round-trip a
+// MaterialId exactly (palette lookup, no quantization -- brick.h:56-76).
+// Substituting: the sampler is EXACTLY
+//
+//     materialAt(amp.column(coarseRep(X,L), coarseRep(Y,L)), coarseRep(Z,L))
+//
+// with no dependence on brick boundaries at all. So the whole Brick<8> layer is
+// a cache of a function that is cheaper to call than to cache: one (32+2)^2
+// column grid covers a render chunk plus its mesher apron, and every voxel query
+// is then an array index and one materialAt. What this deletes per chunk is the
+// std::function dispatch, three floorDiv + three floorMod, an unordered_map
+// probe per voxel, and the eager 512-cell fill + palette + tryCollapse of up to
+// ~216 bricks (~2,300 amplifier columns) -- which is why coarse jobs cost
+// 4.4-5.3 ms while a level-0 job doing the same amount of GENERATION costs 1.55.
+//
+// Not a std::function: this is passed to MeshChunkBricks by reference as a
+// concrete functor, so the per-voxel call inlines the way the level-0 lambda
+// does. -VoxelCoarseGridVerify meshes both ways and compares the quads.
+struct FCoarseChunkGridSampler
+{
+	using GenT = vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>;
+	static constexpr int32 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
+	static constexpr int32 GridEdge = ChunkVox + 2; // +1 apron each side (mesher's [-1,B] contract)
+
+	FCoarseChunkGridSampler(const GenT& Gen, int32 InLevel, const VoxelCoords::FVoxelChunkKey& Key,
+	                        vxc::Counters* PerfCounters)
+		: Level(InLevel)
+		, BaseVX(int64(Key.X) * ChunkVox)
+		, BaseVY(int64(Key.Y) * ChunkVox)
+	{
+		Columns.SetNumUninitialized(GridEdge * GridEdge);
+		const vxc::Amplifier& Amp = Gen.amplifier();
+		for (int32 LY = 0; LY < GridEdge; ++LY)
+		{
+			const int64 CY = GenT::coarseRep(BaseVY + LY - 1, Level);
+			for (int32 LX = 0; LX < GridEdge; ++LX)
+			{
+				Columns[LX + GridEdge * LY] = Amp.column(GenT::coarseRep(BaseVX + LX - 1, Level), CY);
+			}
+		}
+		// Same unit the level-0 job and FJobColumnGridCache report: explicit
+		// Amplifier::column() calls made by this job.
+		if (PerfCounters)
+		{
+			PerfCounters->incColumnEvals(uint64_t(GridEdge) * GridEdge);
+		}
+	}
+
+	vxc::MaterialId operator()(int64 X, int64 Y, int64 Z) const
+	{
+		const int32 LX = int32(X - BaseVX) + 1;
+		const int32 LY = int32(Y - BaseVY) + 1;
+		checkSlow(LX >= 0 && LX < GridEdge && LY >= 0 && LY < GridEdge);
+		return vxc::Amplifier::materialAt(Columns[LX + GridEdge * LY], GenT::coarseRep(Z, Level));
+	}
+
+	int32 Level;
+	int64 BaseVX;
+	int64 BaseVY;
+	TArray<vxc::ColumnSample> Columns;
+};
+
+// Field-by-field quad equality for -VoxelCoarseGridVerify. Compares the emitted
+// arrays in ORDER: both paths run the identical MeshChunkBricks traversal, so a
+// pure refactor must reproduce the same quads in the same sequence, not merely
+// the same set.
+bool VoxelChunkQuadsIdentical(const TArray<FVoxelChunkQuad>& A, const TArray<FVoxelChunkQuad>& Bq, int32& OutFirstDiff)
+{
+	OutFirstDiff = -1;
+	if (A.Num() != Bq.Num())
+	{
+		OutFirstDiff = FMath::Min(A.Num(), Bq.Num());
+		return false;
+	}
+	for (int32 I = 0; I < A.Num(); ++I)
+	{
+		const FVoxelChunkQuad& P = A[I];
+		const FVoxelChunkQuad& Q = Bq[I];
+		if (P.Axis != Q.Axis || P.Positive != Q.Positive || P.Slice != Q.Slice || P.U0 != Q.U0 || P.V0 != Q.V0 ||
+		    P.W != Q.W || P.H != Q.H || P.Ao != Q.Ao || P.Mat != Q.Mat)
+		{
+			OutFirstDiff = I;
+			return false;
+		}
+	}
+	return true;
+}
+
 // M2 wave 2 item 2 ("Distant-edit mip propagation", docs/m2-plan.md): the
 // game-thread, overlay-aware counterpart to MakeLevelSampler -- sources
 // level-0 bricks from World::brickAt (edited version if present, else
@@ -1557,6 +1654,62 @@ int32 GetCoarseMinLevel()
 	}();
 	return MinLevel;
 }
+
+// Flat per-chunk column grid for the COARSE path (default ON), the coarse
+// counterpart of the level-0 fast path in DispatchJobs.
+//
+// The coarse SAMPLING RULE was designed to cost what level 0 costs at any level
+// (generator.h: B*B amplifier columns per brick footprint, B^3 materialAt calls,
+// independent of L), and docs/gpu-g0-sizing.md measures the generator itself
+// flat at ~2.6-3.0 ms across levels. The shipped coarse chunks nevertheless cost
+// 4.4-5.3 ms against level 0's 1.55 ms. That gap is PLUMBING, not generation:
+// MakeCoarseLevelSampler answers each of the ~64k per-chunk voxel queries
+// through a std::function, three floorDiv/floorMod pairs and an unordered_map
+// lookup, and it eagerly materializes a whole Brick<8> (512 materialAt calls,
+// palette writes, tryCollapse) per brick key touched -- up to ~216 bricks for a
+// chunk's 4x4x4 interior plus apron, i.e. ~2,300 amplifier columns against level
+// 0's 1,156.
+//
+// makeCoarseBrick(L, key, coarseColumns(L, key.x, key.y)) stores exactly
+// materialAt(amp.column(coarseRep(vx,L), coarseRep(vy,L)), coarseRep(vz,L)) at
+// each cell (generator.h:117-142; Brick::set/get round-trips a MaterialId
+// exactly through its palette), so building the chunk's (32+2)^2 coarse columns
+// once and sampling that composition directly is the SAME function with the
+// indirection and the eager brick materialization removed -- byte-identical
+// output by construction, which -VoxelCoarseGridVerify below exists to hold to.
+//
+// `-VoxelCoarseGrid=0` restores the MakeCoarseLevelSampler path as the A/B
+// control. Command-line, not a cvar, for the reason documented on
+// -VoxelCoarseMinLevel above: -ExecCmds lands after streaming has begun.
+bool CoarseGridEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelCoarseGrid="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+// Equivalence harness for the switch above: every coarse chunk is meshed TWICE,
+// once through the flat grid and once through MakeCoarseLevelSampler, and the
+// two quad arrays are compared field-by-field. The claim "pure refactor" is only
+// worth anything as a count of chunks that agreed, so this converts it into one
+// -- a mismatch would be terrain that silently changed shape in the outer rings,
+// which is exactly the class of bug nobody notices until it ships.
+//
+// Measurement switch: it roughly doubles coarse job cost, so never on in a
+// throughput run.
+bool CoarseGridVerifyEnabled()
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelCoarseGridVerify"));
+	return bEnabled;
+}
+
+// Verify tallies (worker threads write, the 1 Hz perf log reads).
+std::atomic<int64> GCoarseGridVerifyChecked{0};
+std::atomic<int64> GCoarseGridVerifyMismatches{0};
 
 // Ring-boundary skirt (see MeshChunkBricks' ERingSkirtFace comment): default ON.
 // -VoxelNoRingSkirt is the A/B control that reverts to the pre-fix open-edge
@@ -3529,6 +3682,16 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       *JoinPerLevel([&](int32 L)
 	       { return FString::Printf(TEXT("R%d p50=%.2f p95=%.2f"), L, Snap.LevelWorkerMsP50[L], Snap.LevelWorkerMsP95[L]); }),
 	       (long long)Snap.MipCacheBrickCount, (long long)Snap.MipCacheBytes, (long long)Snap.MipCacheEvictions);
+
+	// -VoxelCoarseGridVerify running total: coarse chunks meshed BOTH ways and
+	// compared quad-for-quad. The flat coarse grid is only a legitimate change
+	// if MISMATCHES stays 0 -- see VoxelStreamAdmission::CoarseGridVerifyEnabled.
+	if (VoxelStreamAdmission::CoarseGridVerifyEnabled())
+	{
+		UE_LOG(LogVoxelPerf, Log, TEXT("VoxelCoarseGridVerify: coarse chunks checked=%lld MISMATCHES=%lld"),
+		       (long long)VoxelStreamAdmission::GCoarseGridVerifyChecked.load(std::memory_order_relaxed),
+		       (long long)VoxelStreamAdmission::GCoarseGridVerifyMismatches.load(std::memory_order_relaxed));
+	}
 
 	// M1 steady-state-hitch wave: worst RecomputeDesiredSet cost seen since the
 	// last periodic log, per level. Independent of the hitch log (a burst that
@@ -5977,14 +6140,61 @@ void FVoxelWorldImpl::DispatchJobs()
 					// [-1,B]^3-across-borders contract MeshChunkBricks wants, so
 					// this is a straight substitution of the brick RULE, nothing
 					// else in the job changes.
-					const auto LevelSampler =
-						(LevelKey.Level >= VoxelStreamAdmission::GetCoarseMinLevel())
-							? MakeCoarseLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr)
-							: MakeLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot);
-					MeshChunkBricks(Key, LevelSampler, Result.Quads, PerfCountersPtr, RingSkirtMask);
-					if (bMeasureEmpty && Result.Quads.Num() == 0)
+					//
+					// A coarse chunk goes one step further and skips the brick
+					// LAYER too: FCoarseChunkGridSampler builds the chunk's
+					// (32+2)^2 coarse columns once and evaluates the coarse
+					// rule directly, which is the same composition
+					// makeCoarseBrick stores (see that struct's derivation) --
+					// so this is a plumbing change, not a generation change.
+					// -VoxelCoarseGrid=0 takes the brick-cache path instead,
+					// as the A/B control.
+					const bool bCoarseLevel = LevelKey.Level >= VoxelStreamAdmission::GetCoarseMinLevel();
+					if (bCoarseLevel && VoxelStreamAdmission::CoarseGridEnabled())
 					{
-						Result.EmptyClass = ClassifyEmpty(LevelSampler, Key);
+						// Timed like the level-0 grid build for the same
+						// reason: it is the only amplifier work a coarse job
+						// does, so it bounds what any pre-dispatch skip could
+						// ever reclaim from one.
+						const double GridStartSeconds = FPlatformTime::Seconds();
+						const FCoarseChunkGridSampler CoarseSampler(*GenPtr, LevelKey.Level, Key, PerfCountersPtr);
+						Result.GridMs = float((FPlatformTime::Seconds() - GridStartSeconds) * 1000.0);
+						MeshChunkBricks(Key, CoarseSampler, Result.Quads, PerfCountersPtr, RingSkirtMask);
+						if (bMeasureEmpty && Result.Quads.Num() == 0)
+						{
+							Result.EmptyClass = ClassifyEmpty(CoarseSampler, Key);
+						}
+						// Equivalence harness: mesh the SAME chunk through the
+						// old brick-cache sampler and compare quad-for-quad.
+						// Logs the chunk key on any mismatch -- a mismatch here
+						// is terrain that changed shape, not a tuning result.
+						if (VoxelStreamAdmission::CoarseGridVerifyEnabled())
+						{
+							TArray<FVoxelChunkQuad> RefQuads;
+							const auto RefSampler = MakeCoarseLevelSampler(*GenPtr, LevelKey.Level, /*PerfCounters*/ nullptr);
+							MeshChunkBricks(Key, RefSampler, RefQuads, /*PerfCounters*/ nullptr, RingSkirtMask);
+							int32 FirstDiff = -1;
+							VoxelStreamAdmission::GCoarseGridVerifyChecked.fetch_add(1, std::memory_order_relaxed);
+							if (!VoxelChunkQuadsIdentical(Result.Quads, RefQuads, FirstDiff))
+							{
+								VoxelStreamAdmission::GCoarseGridVerifyMismatches.fetch_add(1, std::memory_order_relaxed);
+								UE_LOG(LogVoxelPerf, Error,
+								       TEXT("VoxelCoarseGridVerify MISMATCH: L%d chunk (%d, %d, %d) grid=%d quads ref=%d quads firstDiff=%d"),
+								       LevelKey.Level, Key.X, Key.Y, Key.Z, Result.Quads.Num(), RefQuads.Num(), FirstDiff);
+							}
+						}
+					}
+					else
+					{
+						const auto LevelSampler =
+							bCoarseLevel
+								? MakeCoarseLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr)
+								: MakeLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot);
+						MeshChunkBricks(Key, LevelSampler, Result.Quads, PerfCountersPtr, RingSkirtMask);
+						if (bMeasureEmpty && Result.Quads.Num() == 0)
+						{
+							Result.EmptyClass = ClassifyEmpty(LevelSampler, Key);
+						}
 					}
 				}
 
