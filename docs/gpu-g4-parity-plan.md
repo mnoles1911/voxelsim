@@ -214,8 +214,32 @@ one thing on the list that should not be built.
 
 ### 4. Water surface pool
 
-A separate, near-identical instance of the terrain pool. Deliberately out of
-scope until terrain parity is closed.
+**Built, behind `voxel.Water.GPU` (default off). Full write-up in
+`docs/gpu-water-pool-design.md`.**
+
+"Near-identical" held, and by more than expected: the vertex factory, the quad
+packing and the decode are shared **unchanged**, because `M_WaterVoxel`'s only
+geometry input is `VertexColor.G` (AO) and the factory already writes it there.
+So this is a second *instance* of `UVoxelGpuPoolComponent` parameterised by
+three setters, not a parallel copy.
+
+Two corrections to the one-line framing above:
+
+- **Translucent sorting is a real regression, currently invisible.** One
+  primitive means one sort key for all water. It does not show *for this
+  material* — constant colour, constant opacity, no refraction, so a stack of N
+  water surfaces transmits `(1-0.55)^N` whatever order they blend in. Fill-
+  fraction shading, foam, caustics or refraction (all W5) would each break that.
+  Do not add them and assume the pool still holds.
+- **It exposed a bug in the shared pool.** Chunk-table entries were never
+  recycled, so the table counted chunks ever added rather than chunks resident.
+  Slow churn hid it on terrain; water's 10 Hz re-mesh crosses the proxy's
+  headroom and turns every crossing into a full render-state rebuild plus a
+  whole-buffer re-upload. Fixed for both paths.
+
+Not established: a parity *number*. The cavern-lake harness's same-path
+repeat-run noise floor is 20–88% of pixels, swamping any path difference — see
+the design doc for why and what a tighter measurement would need.
 
 ## What G5 needs
 
