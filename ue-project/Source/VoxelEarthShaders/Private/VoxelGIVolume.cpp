@@ -94,7 +94,7 @@ void FVoxelGIVolume::InitRHI(FRHICommandListBase& RHICmdList)
 
 void FVoxelGIVolume::EnsureAllocated_RenderThread(FRHICommandListBase& RHICmdList)
 {
-	if (Volume.IsValid())
+	if (VolumePos.IsValid())
 	{
 		return;
 	}
@@ -108,18 +108,24 @@ void FVoxelGIVolume::EnsureAllocated_RenderThread(FRHICommandListBase& RHICmdLis
 	// it is avoided by construction as long as every write goes through
 	// UpdateTexture3D -- which, unlike the buffer lock path, does honour its
 	// destination offsets (verified in D3D12Texture.cpp).
-	const FRHITextureCreateDesc Desc =
-		FRHITextureCreateDesc::Create3D(TEXT("VoxelGI.Irradiance"),
+	const FRHITextureCreateDesc DescPos =
+		FRHITextureCreateDesc::Create3D(TEXT("VoxelGI.IrradiancePos"),
+		                                DimTexels, DimTexels, DimTexels,
+		                                PF_R8G8B8A8)
+			.SetFlags(ETextureCreateFlags::ShaderResource);
+	const FRHITextureCreateDesc DescNeg =
+		FRHITextureCreateDesc::Create3D(TEXT("VoxelGI.IrradianceNeg"),
 		                                DimTexels, DimTexels, DimTexels,
 		                                PF_R8G8B8A8)
 			.SetFlags(ETextureCreateFlags::ShaderResource);
 
-	Volume = RHICmdList.CreateTexture(Desc);
+	VolumePos = RHICmdList.CreateTexture(DescPos);
+	VolumeNeg = RHICmdList.CreateTexture(DescNeg);
 
 	UE_LOG(LogTemp, Log,
-	       TEXT("VoxelGI volume: allocated dims=%dx%dx%d fmt=RGBA8 MB=%.1f coverage=+/-%.0f UU"),
+	       TEXT("VoxelGI volume: allocated 2x dims=%dx%dx%d fmt=RGBA8 (Scheme A) MB=%.1f coverage=+/-%.0f UU"),
 	       DimTexels, DimTexels, DimTexels,
-	       double(DimTexels) * DimTexels * DimTexels * 4.0 / (1024.0 * 1024.0),
+	       2.0 * double(DimTexels) * DimTexels * DimTexels * 4.0 / (1024.0 * 1024.0),
 	       0.5 * DimTexels * VoxelGIVolume::kCellSizeUU);
 
 	// A freshly created texture's contents are undefined, and undefined bytes in
@@ -129,11 +135,13 @@ void FVoxelGIVolume::EnsureAllocated_RenderThread(FRHICommandListBase& RHICmdLis
 	{
 		TArray<uint8> ZeroSlab;
 		ZeroSlab.SetNumZeroed(int64(DimTexels) * DimTexels * 4);
-		const FUpdateTextureRegion3D Region(0, 0, 0, 0, 0, 0, DimTexels, DimTexels, 1);
 		for (int32 Z = 0; Z < DimTexels; ++Z)
 		{
 			const FUpdateTextureRegion3D Slab(0, 0, Z, 0, 0, 0, DimTexels, DimTexels, 1);
-			RHICmdList.UpdateTexture3D(Volume, 0, Slab,
+			RHICmdList.UpdateTexture3D(VolumePos, 0, Slab,
+			                           uint32(DimTexels) * 4, uint32(DimTexels) * DimTexels * 4,
+			                           ZeroSlab.GetData());
+			RHICmdList.UpdateTexture3D(VolumeNeg, 0, Slab,
 			                           uint32(DimTexels) * 4, uint32(DimTexels) * DimTexels * 4,
 			                           ZeroSlab.GetData());
 		}
@@ -146,7 +154,8 @@ void FVoxelGIVolume::EnsureAllocated_RenderThread(FRHICommandListBase& RHICmdLis
 void FVoxelGIVolume::ReleaseRHI()
 {
 	UniformBuffer.SafeRelease();
-	Volume.SafeRelease();
+	VolumePos.SafeRelease();
+	VolumeNeg.SafeRelease();
 	DimTexels = 0;
 }
 
@@ -154,14 +163,15 @@ void FVoxelGIVolume::UpdateParameters_RenderThread(const FVoxelGIVolumeSettings&
 {
 	Settings = InSettings;
 
-	const bool bEnabled = Settings.bEnabled && Volume.IsValid();
+	const bool bEnabled = Settings.bEnabled && VolumePos.IsValid() && VolumeNeg.IsValid();
 	const float ExtentUU = FMath::Max(1.0f, float(DimTexels) * VoxelGIVolume::kCellSizeUU);
 
 	FVoxelGIVolumeParameters Parameters;
 	// Never null even when off -- an unbound member of a uniform buffer is a
 	// validation failure, not a tolerated no-op (the factory's own buffer
 	// documents the same rule for its SRVs).
-	Parameters.Volume = bEnabled ? Volume.GetReference() : GBlackVolumeTexture->TextureRHI.GetReference();
+	Parameters.VolumePos = bEnabled ? VolumePos.GetReference() : GBlackVolumeTexture->TextureRHI.GetReference();
+	Parameters.VolumeNeg = bEnabled ? VolumeNeg.GetReference() : GBlackVolumeTexture->TextureRHI.GetReference();
 	Parameters.VolumeSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 	Parameters.OriginPoolUU = Settings.OriginPoolUU;
 	Parameters.InvSizeUU = FVector3f(1.0f / ExtentUU);
@@ -189,7 +199,7 @@ void FVoxelGIVolume::UpdateParameters_RenderThread(const FVoxelGIVolumeSettings&
 
 void FVoxelGIVolume::FillCheckerboard_RenderThread(FRHICommandListBase& RHICmdList)
 {
-	if (!Volume.IsValid() || DimTexels <= 0)
+	if (!VolumePos.IsValid() || DimTexels <= 0)
 	{
 		return;
 	}
@@ -224,7 +234,11 @@ void FVoxelGIVolume::FillCheckerboard_RenderThread(FRHICommandListBase& RHICmdLi
 		}
 
 		const FUpdateTextureRegion3D Region(0, 0, Z, 0, 0, 0, DimTexels, DimTexels, 1);
-		RHICmdList.UpdateTexture3D(Volume, /*MipIndex*/ 0, Region,
+		RHICmdList.UpdateTexture3D(VolumePos, /*MipIndex*/ 0, Region,
+		                           /*SourceRowPitch*/ uint32(DimTexels) * 4,
+		                           /*SourceDepthPitch*/ uint32(DimTexels) * DimTexels * 4,
+		                           Slab.GetData());
+		RHICmdList.UpdateTexture3D(VolumeNeg, /*MipIndex*/ 0, Region,
 		                           /*SourceRowPitch*/ uint32(DimTexels) * 4,
 		                           /*SourceDepthPitch*/ uint32(DimTexels) * DimTexels * 4,
 		                           Slab.GetData());
@@ -237,9 +251,9 @@ void FVoxelGIVolume::FillCheckerboard_RenderThread(FRHICommandListBase& RHICmdLi
 
 void FVoxelGIVolume::UpdateTexels_RenderThread(FRHICommandListBase& RHICmdList,
                                                const FIntVector& DestMin, const FIntVector& Size,
-                                               const uint8* SrcRGBA)
+                                               const uint8* SrcPos, const uint8* SrcNeg)
 {
-	if (!Volume.IsValid() || DimTexels <= 0 || !SrcRGBA)
+	if (!VolumePos.IsValid() || !VolumeNeg.IsValid() || DimTexels <= 0 || !SrcPos || !SrcNeg)
 	{
 		return;
 	}
@@ -263,10 +277,14 @@ void FVoxelGIVolume::UpdateTexels_RenderThread(FRHICommandListBase& RHICmdList,
 	const FUpdateTextureRegion3D Region(uint32(DestMin.X), uint32(DestMin.Y), uint32(DestMin.Z),
 	                                    0, 0, 0,
 	                                    uint32(Size.X), uint32(Size.Y), uint32(Size.Z));
-	RHICmdList.UpdateTexture3D(Volume, /*MipIndex*/ 0, Region,
+	RHICmdList.UpdateTexture3D(VolumePos, /*MipIndex*/ 0, Region,
 	                           /*SourceRowPitch*/ uint32(Size.X) * 4,
 	                           /*SourceDepthPitch*/ uint32(Size.X) * uint32(Size.Y) * 4,
-	                           SrcRGBA);
+	                           SrcPos);
+	RHICmdList.UpdateTexture3D(VolumeNeg, /*MipIndex*/ 0, Region,
+	                           /*SourceRowPitch*/ uint32(Size.X) * 4,
+	                           /*SourceDepthPitch*/ uint32(Size.X) * uint32(Size.Y) * 4,
+	                           SrcNeg);
 }
 
 namespace

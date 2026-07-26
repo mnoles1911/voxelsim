@@ -419,19 +419,44 @@ FMaterialPixelParameters GetMaterialPixelParameters(
 		// step along the world normal, which the pool's pure-translation transform
 		// makes usable directly. Costs nothing on a hit -- the later samples only
 		// execute where the first one missed, which is a small minority of pixels.
-		const float3 StepUVW = float3(Interpolants.TangentToWorld2.xyz)
-		                     * VoxelGIVol.CellSizeUU * VoxelGIVol.InvSizeUU;
+		const float3 N = float3(Interpolants.TangentToWorld2.xyz);
+		const float3 StepUVW = N * VoxelGIVol.CellSizeUU * VoxelGIVol.InvSizeUU;
+
+		// SCHEME A slot selection. VolumePos holds (Vis[+X], Vis[+Y], Vis[+Z], v)
+		// and VolumeNeg holds (Vis[-X], Vis[-Y], Vis[-Z], v), so the face's own
+		// direction picks the volume by SIGN and the component by AXIS -- one
+		// sample, one channel, exact.
+		//
+		// This is what makes Scheme A cost memory and nothing else. The design
+		// doc lists it as "two samples", but that is the cost for a general
+		// normal; every greedy-mesh normal is axis-aligned, so exactly one
+		// ambient-cube slot is ever selected and the other volume is never read.
+		// Scheme B collapsed the four horizontals to their mean to save the
+		// second texture, and measured 2.6x over the doc's own RMS bar, worst on
+		// side faces beside vertical occluders -- most of a cave wall.
+		const float3 AbsN = abs(N);
+		const bool bAxisX = AbsN.x > 0.5f;
+		const bool bAxisY = !bAxisX && AbsN.y > 0.5f;
+		const float NAxis = bAxisX ? N.x : (bAxisY ? N.y : N.z);
+		const bool bPositive = NAxis > 0.0f;
+
 		float3 ProbeUVW = Interpolants.GIUVW;
-		float4 T = Texture3DSampleLevel(VoxelGIVol.Volume, VoxelGIVol.VolumeSampler, ProbeUVW, 0);
+		float4 T = bPositive
+			? Texture3DSampleLevel(VoxelGIVol.VolumePos, VoxelGIVol.VolumeSampler, ProbeUVW, 0)
+			: Texture3DSampleLevel(VoxelGIVol.VolumeNeg, VoxelGIVol.VolumeSampler, ProbeUVW, 0);
 		if (T.a <= 1.0e-3f)
 		{
 			ProbeUVW = Interpolants.GIUVW + StepUVW * 0.65f;   // 1.25 cells total
-			T = Texture3DSampleLevel(VoxelGIVol.Volume, VoxelGIVol.VolumeSampler, ProbeUVW, 0);
+			T = bPositive
+				? Texture3DSampleLevel(VoxelGIVol.VolumePos, VoxelGIVol.VolumeSampler, ProbeUVW, 0)
+				: Texture3DSampleLevel(VoxelGIVol.VolumeNeg, VoxelGIVol.VolumeSampler, ProbeUVW, 0);
 		}
 		if (T.a <= 1.0e-3f)
 		{
 			ProbeUVW = Interpolants.GIUVW + StepUVW * 1.4f;    // 2.0 cells total
-			T = Texture3DSampleLevel(VoxelGIVol.Volume, VoxelGIVol.VolumeSampler, ProbeUVW, 0);
+			T = bPositive
+				? Texture3DSampleLevel(VoxelGIVol.VolumePos, VoxelGIVol.VolumeSampler, ProbeUVW, 0)
+				: Texture3DSampleLevel(VoxelGIVol.VolumeNeg, VoxelGIVol.VolumeSampler, ProbeUVW, 0);
 		}
 
 		// A is the validity weight, and dividing by it is what makes hardware
@@ -442,11 +467,11 @@ FMaterialPixelParameters GetMaterialPixelParameters(
 		const float W = T.a;
 		if (W > 1.0e-3f)
 		{
-			// Ambient-cube slot from the face normal. Every greedy-mesh normal is
-			// axis-aligned, so exactly one slot is selected and the floor/ceiling
-			// distinction the light field exists for is preserved.
-			const float Nz = Interpolants.TangentToWorld2.z;
-			const float Irr = ((Nz > 0.5f) ? T.r : ((Nz < -0.5f) ? T.g : T.b)) / W;
+			// The volume was already chosen by the normal's sign above, so all that
+			// is left is the axis: X -> r, Y -> g, Z -> b. Every direction is
+			// stored exactly, so unlike Scheme B there is no "and the four
+			// horizontals share a channel" caveat here.
+			const float Irr = (bAxisX ? T.r : (bAxisY ? T.g : T.b)) / W;
 
 			// Distance from this pixel to the CAMERA, which is what the CPU shade
 			// measures (Dist(WorldPos, GICentreUU)). NOT the distance to the

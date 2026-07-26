@@ -97,6 +97,11 @@ public:
 	// through the subsystem; see StepDigTest for what it measures and why.
 	void StartDigTest(double RadiusUU);
 
+	// voxel.GI.VolumeRecentreTest. Forces a staged re-centre of N bricks on the
+	// currently resident field; see the definition for why the scripted flight
+	// cannot verify re-centring on its own.
+	void ForceVolumeRecentre(int32 ShiftBricks);
+
 	// Read access for the scene proxy. Never null once Initialize has run.
 	const FVoxelLightField& GetField() const { return *Field; }
 
@@ -216,12 +221,14 @@ private:
 	TArray<FIntVector> VolumeUploadQueue;
 	TSet<FIntVector> VolumeUploadSet;
 
-	// CPU mirror of exactly the bytes staged to the volume, Dim^3 * 4. This is
+	// CPU mirror of exactly the bytes staged to the volume, Dim^3 * 4 PER
+	// VOLUME -- Scheme A has two, split by the sign of the face normal. This is
 	// what voxel.GI.VolumeCheck compares the field against -- "what would the
 	// shader return" has to be answered from the bytes that were actually
 	// uploaded, not from a re-encode, or the harness cannot catch an addressing
 	// or run-merging bug. 1 MB at the default Dim=64, 67 MB at 256.
-	TArray<uint8> VolumeShadow;
+	TArray<uint8> VolumeShadow;    // (+X,+Y,+Z,v)
+	TArray<uint8> VolumeShadowNeg; // (-X,-Y,-Z,v)
 
 	// World UU of texel (0,0,0)'s CELL ORIGIN (not its centre), snapped to a
 	// whole 320 UU brick so the texel lattice coincides with the field's cell

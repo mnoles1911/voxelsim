@@ -206,7 +206,8 @@ namespace
 	{
 		FIntVector Min = FIntVector::ZeroValue;
 		FIntVector Size = FIntVector::ZeroValue;
-		TArray<uint8> Texels;
+		TArray<uint8> TexelsPos;
+		TArray<uint8> TexelsNeg;
 	};
 
 	// The pool component's world location IS pool-primitive space's origin --
@@ -542,6 +543,8 @@ bool UVoxelGISubsystem::EnsureVolumeOrigin()
 
 	VolumeShadow.Empty();
 	VolumeShadow.SetNumZeroed(int64(VolumeDim) * VolumeDim * VolumeDim * 4);
+	VolumeShadowNeg.Empty();
+	VolumeShadowNeg.SetNumZeroed(int64(VolumeDim) * VolumeDim * VolumeDim * 4);
 	bVolumeOriginSet = true;
 
 	UE_LOG(LogVoxelGI, Log,
@@ -551,7 +554,7 @@ bool UVoxelGISubsystem::EnsureVolumeOrigin()
 	       VolumeOriginWorldUU.X, VolumeOriginWorldUU.Y, VolumeOriginWorldUU.Z,
 	       PoolWorldUU.X, PoolWorldUU.Y, PoolWorldUU.Z,
 	       OriginPoolUU.X, OriginPoolUU.Y, OriginPoolUU.Z,
-	       HalfExtentUU, double(VolumeShadow.Num()) / (1024.0 * 1024.0));
+	       HalfExtentUU, 2.0 * double(VolumeShadow.Num()) / (1024.0 * 1024.0));
 
 	// The uniform buffer is published by PushVolumeParamsIfChanged, which runs
 	// straight after this in TickVolume and now owns every input to it.
@@ -715,13 +718,16 @@ void UVoxelGISubsystem::RestageVolumeZRange(int32 Z0, int32 Z1)
 	//    from somewhere else entirely.
 	FMemory::Memzero(VolumeShadow.GetData() + int64(Z0) * SliceBytes,
 	                 int64(Z1 - Z0) * SliceBytes);
+	FMemory::Memzero(VolumeShadowNeg.GetData() + int64(Z0) * SliceBytes,
+	                 int64(Z1 - Z0) * SliceBytes);
 
 	// 2) Re-encode the resident bricks whose rows fall in this range, under ONE
 	//    read scope on the GAME thread (§1: never read the field from the render
 	//    thread).
 	{
 		const FVoxelLightField::FReadScope Read(*Field);
-		uint8 BrickTexels[FVoxelLightField::BrickTexelBytes];
+		uint8 BrickPos[FVoxelLightField::BrickTexelBytes];
+		uint8 BrickNeg[FVoxelLightField::BrickTexelBytes];
 		for (int32 Row = Z0 / E; Row < Z1 / E; ++Row)
 		{
 			if (!RecentreRowBricks.IsValidIndex(Row))
@@ -730,7 +736,7 @@ void UVoxelGISubsystem::RestageVolumeZRange(int32 Z0, int32 Z1)
 			}
 			for (const FIntVector& Key : RecentreRowBricks[Row])
 			{
-				Read.EncodeBrick(Key, BrickTexels);
+				Read.EncodeBrick(Key, BrickPos, BrickNeg);
 				const FIntVector Base(Key.X * E - VolumeCellOrigin.X,
 				                      Key.Y * E - VolumeCellOrigin.Y,
 				                      Key.Z * E - VolumeCellOrigin.Z);
@@ -739,7 +745,8 @@ void UVoxelGISubsystem::RestageVolumeZRange(int32 Z0, int32 Z1)
 				{
 					const int64 DstOffset = ((int64(Base.Z + Z) * VolumeDim + (Base.Y + Y)) * VolumeDim + Base.X) * 4;
 					const int32 SrcOffset = (Z * E + Y) * E * 4;
-					FMemory::Memcpy(VolumeShadow.GetData() + DstOffset, BrickTexels + SrcOffset, E * 4);
+					FMemory::Memcpy(VolumeShadow.GetData() + DstOffset, BrickPos + SrcOffset, E * 4);
+					FMemory::Memcpy(VolumeShadowNeg.GetData() + DstOffset, BrickNeg + SrcOffset, E * 4);
 				}
 			}
 		}
@@ -748,9 +755,13 @@ void UVoxelGISubsystem::RestageVolumeZRange(int32 Z0, int32 Z1)
 	// 3) One whole-XY-slab upload for the range. Full-width rows have zero
 	//    staging waste (§0's 256-byte row pitch), and a contiguous Z range is
 	//    contiguous in the shadow, so this is one UpdateTexture3D for the lot.
-	TArray<uint8> Payload;
-	Payload.SetNumUninitialized(int64(Z1 - Z0) * SliceBytes);
-	FMemory::Memcpy(Payload.GetData(), VolumeShadow.GetData() + int64(Z0) * SliceBytes,
+	TArray<uint8> PayloadPos;
+	TArray<uint8> PayloadNeg;
+	PayloadPos.SetNumUninitialized(int64(Z1 - Z0) * SliceBytes);
+	PayloadNeg.SetNumUninitialized(int64(Z1 - Z0) * SliceBytes);
+	FMemory::Memcpy(PayloadPos.GetData(), VolumeShadow.GetData() + int64(Z0) * SliceBytes,
+	                int64(Z1 - Z0) * SliceBytes);
+	FMemory::Memcpy(PayloadNeg.GetData(), VolumeShadowNeg.GetData() + int64(Z0) * SliceBytes,
 	                int64(Z1 - Z0) * SliceBytes);
 
 	// TRANSIENT ACCOUNTING (voxel.GI.Debug >= 2). This is what turns "no lighting
@@ -782,9 +793,11 @@ void UVoxelGISubsystem::RestageVolumeZRange(int32 Z0, int32 Z1)
 	const FIntVector Min(0, 0, Z0);
 	const FIntVector Size(VolumeDim, VolumeDim, Z1 - Z0);
 	ENQUEUE_RENDER_COMMAND(VoxelGIVolumeRestage)(
-		[Min, Size, Bytes = MoveTemp(Payload)](FRHICommandListImmediate& RHICmdList)
+		[Min, Size, BytesPos = MoveTemp(PayloadPos), BytesNeg = MoveTemp(PayloadNeg)]
+		(FRHICommandListImmediate& RHICmdList)
 	{
-		GVoxelGIVolume.UpdateTexels_RenderThread(RHICmdList, Min, Size, Bytes.GetData());
+		GVoxelGIVolume.UpdateTexels_RenderThread(RHICmdList, Min, Size,
+		                                         BytesPos.GetData(), BytesNeg.GetData());
 	});
 	++VolumeRunsUploaded;
 }
@@ -1031,14 +1044,15 @@ int32 UVoxelGISubsystem::DrainVolumeUploads(int32 Budget)
 	//    on the render thread.
 	{
 		const FVoxelLightField::FReadScope Read(*Field);
-		uint8 BrickTexels[FVoxelLightField::BrickTexelBytes];
+		uint8 BrickPos[FVoxelLightField::BrickTexelBytes];
+		uint8 BrickNeg[FVoxelLightField::BrickTexelBytes];
 		for (int32 I = 0; I < Batch.Num(); ++I)
 		{
 			// Returns false (and all-zero bytes) for a brick that is absent
 			// (evicted) or re-voxelized-but-not-yet-solved. Both of those MUST
 			// reach the volume, or a dug tunnel keeps its pre-dig lighting --
 			// which is exactly why this path does not skip on false.
-			Read.EncodeBrick(Batch[I], BrickTexels);
+			Read.EncodeBrick(Batch[I], BrickPos, BrickNeg);
 
 			const FIntVector& Base = TexelBase[I];
 			for (int32 Z = 0; Z < VoxelLF::BrickEdgeCells; ++Z)
@@ -1046,7 +1060,9 @@ int32 UVoxelGISubsystem::DrainVolumeUploads(int32 Budget)
 			{
 				const int64 DstOffset = ((int64(Base.Z + Z) * VolumeDim + (Base.Y + Y)) * VolumeDim + Base.X) * 4;
 				const int32 SrcOffset = (Z * VoxelLF::BrickEdgeCells + Y) * VoxelLF::BrickEdgeCells * 4;
-				FMemory::Memcpy(VolumeShadow.GetData() + DstOffset, BrickTexels + SrcOffset,
+				FMemory::Memcpy(VolumeShadow.GetData() + DstOffset, BrickPos + SrcOffset,
+				                VoxelLF::BrickEdgeCells * 4);
+				FMemory::Memcpy(VolumeShadowNeg.GetData() + DstOffset, BrickNeg + SrcOffset,
 				                VoxelLF::BrickEdgeCells * 4);
 			}
 		}
@@ -1094,7 +1110,8 @@ int32 UVoxelGISubsystem::DrainVolumeUploads(int32 Budget)
 		FVoxelGIVolumeRun& Run = Runs.AddDefaulted_GetRef();
 		Run.Min = FIntVector(Start.X, Start.Y, Start.Z);
 		Run.Size = FIntVector(EndX - Start.X, E, E);
-		Run.Texels.SetNumUninitialized(int64(Run.Size.X) * Run.Size.Y * Run.Size.Z * 4);
+		Run.TexelsPos.SetNumUninitialized(int64(Run.Size.X) * Run.Size.Y * Run.Size.Z * 4);
+		Run.TexelsNeg.SetNumUninitialized(int64(Run.Size.X) * Run.Size.Y * Run.Size.Z * 4);
 		// Compact the run out of the shadow. The shadow is the source of truth
 		// for what is on the GPU, so a run always carries the LATEST bytes for
 		// every brick it spans -- including bricks that were not in this frame's
@@ -1104,7 +1121,9 @@ int32 UVoxelGISubsystem::DrainVolumeUploads(int32 Budget)
 		{
 			const int64 Src = ((int64(Run.Min.Z + Z) * VolumeDim + (Run.Min.Y + Y)) * VolumeDim + Run.Min.X) * 4;
 			const int64 Dst = (int64(Z) * Run.Size.Y + Y) * Run.Size.X * 4;
-			FMemory::Memcpy(Run.Texels.GetData() + Dst, VolumeShadow.GetData() + Src,
+			FMemory::Memcpy(Run.TexelsPos.GetData() + Dst, VolumeShadow.GetData() + Src,
+			                int64(Run.Size.X) * 4);
+			FMemory::Memcpy(Run.TexelsNeg.GetData() + Dst, VolumeShadowNeg.GetData() + Src,
 			                int64(Run.Size.X) * 4);
 		}
 		I = J;
@@ -1126,7 +1145,8 @@ int32 UVoxelGISubsystem::DrainVolumeUploads(int32 Budget)
 	{
 		for (const FVoxelGIVolumeRun& Run : Payload)
 		{
-			GVoxelGIVolume.UpdateTexels_RenderThread(RHICmdList, Run.Min, Run.Size, Run.Texels.GetData());
+			GVoxelGIVolume.UpdateTexels_RenderThread(RHICmdList, Run.Min, Run.Size,
+			                                         Run.TexelsPos.GetData(), Run.TexelsNeg.GetData());
 		}
 	});
 
@@ -1153,9 +1173,10 @@ int32 UVoxelGISubsystem::DrainVolumeUploads(int32 Budget)
 //     that probe point.
 //
 // Errors are reported in irradiance BYTES (0..255), the units the field is
-// stored in. Scheme B is exact for +-Z normals by construction, so the pass bar
-// there is mean < 2/255; the +-X/+-Y classes carry the horizontal mean and are
-// reported separately as the number step 3 will decide Scheme A vs B on.
+// stored in. Under Scheme A every direction is stored exactly, so BOTH classes
+// must come out at 0.000 and the pass bar covers both. (Under the Scheme B this
+// replaced, the +-X/+-Y classes carried a mean of ~9.5 and an RMS of ~21,
+// because four directions shared one averaged channel.)
 void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 {
 	bVolumeCheckDone = true;
@@ -1216,8 +1237,11 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 	// UVW = (P - Origin) * InvSize, so the texel coordinate is
 	// UVW*Dim - 0.5 == (P - Origin)/40 - 0.5, which is the CPU sampler's own
 	// convention -- no half-texel fixup, because the origin is brick-snapped.
-	const uint8* Shadow = VolumeShadow.GetData();
-	auto SampleShadow = [this, Shadow](const FVector& P, int32 Slot, float& OutIrr) -> bool
+	const uint8* ShadowPos = VolumeShadow.GetData();
+	const uint8* ShadowNeg = VolumeShadowNeg.GetData();
+	// Slot is now (volume, channel): DirTable index >> 1 is the AXIS and the low
+	// bit is the SIGN, matching the +X -X +Y -Y +Z -Z storage order.
+	auto SampleShadow = [this, ShadowPos, ShadowNeg](const FVector& P, int32 Dir, float& OutIrr) -> bool
 	{
 		const double TX = (P.X - VolumeOriginWorldUU.X) / double(VoxelLF::CellSizeUU) - 0.5;
 		const double TY = (P.Y - VolumeOriginWorldUU.Y) / double(VoxelLF::CellSizeUU) - 0.5;
@@ -1228,6 +1252,9 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 		const float FX = float(TX - double(BX));
 		const float FY = float(TY - double(BY));
 		const float FZ = float(TZ - double(BZ));
+
+		const uint8* Shadow = ((Dir & 1) == 0) ? ShadowPos : ShadowNeg;
+		const int32 Channel = Dir >> 1;
 
 		float AccumRGB = 0.f;
 		float AccumA = 0.f;
@@ -1244,7 +1271,7 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 			const int32 CY = FMath::Clamp(BY + OY, 0, VolumeDim - 1);
 			const int32 CZ = FMath::Clamp(BZ + OZ, 0, VolumeDim - 1);
 			const uint8* Texel = Shadow + ((int64(CZ) * VolumeDim + CY) * VolumeDim + CX) * 4;
-			AccumRGB += W * float(Texel[Slot]) * (1.f / 255.f);
+			AccumRGB += W * float(Texel[Channel]) * (1.f / 255.f);
 			AccumA += W * float(Texel[3]) * (1.f / 255.f);
 		}
 		if (AccumA <= 1.e-4f)
@@ -1305,8 +1332,13 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 			return double(N) / double(Count);
 		}
 	};
-	FClassStats StatsZ;   // +-Z normals: Scheme B is exact here
-	FClassStats StatsXY;  // +-X/+-Y normals: the horizontal mean
+	// Under Scheme A BOTH classes are exact by construction, so both must read
+	// 0.000. They are still reported separately because that is what makes the
+	// switch from Scheme B legible: the horizontal line is the one that used to
+	// carry a mean of ~9.5 and an RMS of ~21, and seeing it go to zero is the
+	// measurement that the encoding actually changed.
+	FClassStats StatsZ;   // +-Z normals
+	FClassStats StatsXY;  // +-X/+-Y normals
 	// NEGATIVE CONTROL. Scheme B is exact on +-Z by construction, so a correct
 	// implementation reports 0.000 -- and a harness that reports 0.000 because
 	// it is comparing a thing against itself reports exactly the same number.
@@ -1366,10 +1398,9 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 			// four horizontals all map to B.
 			const int32 Dir = Rand.RandHelper(VoxelLF::NumDirs);
 			const FVector3f Normal = VoxelLF::DirTable[Dir];
-			const int32 Slot = (Dir == 4) ? 0 : ((Dir == 5) ? 1 : 2);
 
 			float VolIrr = 0.f;
-			const bool bVolOk = SampleShadow(Probe, Slot, VolIrr);
+			const bool bVolOk = SampleShadow(Probe, Dir, VolIrr);
 
 			const FVector Surface = Probe - FVector(Normal) * double(kProbeOffsetUU);
 			float FieldIrr = 0.f;
@@ -1399,7 +1430,7 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 				SignalMin = FMath::Min(SignalMin, double(FieldIrr));
 
 				float ShiftedIrr = 0.f;
-				if (SampleShadow(Probe + FVector(0.5 * VoxelLF::CellSizeUU, 0, 0), Slot, ShiftedIrr))
+				if (SampleShadow(Probe + FVector(0.5 * VoxelLF::CellSizeUU, 0, 0), Dir, ShiftedIrr))
 				{
 					StatsControl.Add(FMath::Abs(double(FieldIrr) - double(ShiftedIrr)) * 255.0);
 				}
@@ -1418,7 +1449,7 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 	       TEXT("VOLUMECHECK: cells=%d meanAbsErr=%.3f rms=%.3f maxAbsErr=%.3f"),
 	       StatsZ.Count, StatsZ.Mean(), StatsZ.Rms(), StatsZ.MaxAbsErr);
 	UE_LOG(LogVoxelGI, Log,
-	       TEXT("VOLUMECHECK horizontal (+-X/+-Y, Scheme B mean channel): cells=%d meanAbsErr=%.3f rms=%.3f ")
+	       TEXT("VOLUMECHECK horizontal (+-X/+-Y, Scheme A exact channel): cells=%d meanAbsErr=%.3f rms=%.3f ")
 	       TEXT("p50=%.3f p90=%.3f p95=%.3f p99=%.3f maxAbsErr=%.3f frac>8/255=%.4f"),
 	       StatsXY.Count, StatsXY.Mean(), StatsXY.Rms(),
 	       StatsXY.Percentile(0.50), StatsXY.Percentile(0.90), StatsXY.Percentile(0.95),
@@ -1436,15 +1467,24 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 		       TEXT("mean=%.1f sd=%.1f min=%.1f bytes"),
 		       SigMean * 255.0, FMath::Sqrt(SigVar) * 255.0, SignalMin * 255.0);
 	}
-	// Pass bar, in irradiance bytes: Scheme B is EXACT on +-Z normals, so
-	// anything above a byte of mean error is an addressing, origin or staging
-	// bug rather than an encoding tradeoff.
+	// Pass bar, in irradiance bytes. Under Scheme A EVERY direction is stored
+	// exactly, so the bar now covers both classes -- there is no longer a class
+	// that is allowed to be approximate, and anything above a byte of mean error
+	// on either is an addressing, origin or staging bug.
+	//
+	// The bar is a MEAN here and that is deliberate, unlike the design doc's
+	// Scheme A-vs-B bar which asked for an RMS and was fed a mean-abs for three
+	// transcripts running. This one is checking "is the pipeline exact", where a
+	// mean of zero and an RMS of zero are the same statement; the RMS is logged
+	// beside it anyway so the two can never drift apart unnoticed again.
 	constexpr double kPassMeanBytes = 2.0;
+	const bool bPass = StatsZ.Count > 0 && StatsZ.Mean() < kPassMeanBytes
+	                && StatsXY.Count > 0 && StatsXY.Mean() < kPassMeanBytes;
 	UE_LOG(LogVoxelGI, Log,
-	       TEXT("VOLUMECHECK detail: verdict=%s (bar: +-Z mean < %.1f bytes) | dim=%d bricksResident=%d bricksInVolume=%d ")
+	       TEXT("VOLUMECHECK detail: verdict=%s (bar: BOTH classes mean < %.1f bytes) | dim=%d bricksResident=%d bricksInVolume=%d ")
 	       TEXT("flushedNow=%d uploadedTotal=%d runsTotal=%d queueLeft=%d | attempts=%d unsolvedCell=%d ")
 	       TEXT("volumeMiss=%d fieldFirstProbeMiss=%d | originWorld=(%.0f,%.0f,%.0f)"),
-	       (StatsZ.Count > 0 && StatsZ.Mean() < kPassMeanBytes) ? TEXT("PASS") : TEXT("FAIL"),
+	       bPass ? TEXT("PASS") : TEXT("FAIL"),
 	       kPassMeanBytes, VolumeDim, Keys.Num(), InVolume.Num(),
 	       Flushed, VolumeBricksUploaded, VolumeRunsUploaded, VolumeUploadQueue.Num(),
 	       Attempts, Unsolved, VolMiss, CpuMiss,
@@ -1501,7 +1541,7 @@ void UVoxelGISubsystem::StepDigTest()
 		for (int32 X = 0; X < E; ++X)
 		{
 			const int64 Off = ((int64(Base.Z + Z) * VolumeDim + (Base.Y + Y)) * VolumeDim + (Base.X + X)) * 4;
-			if (VolumeShadow[Off + 3] != 0) { return false; }
+			if (VolumeShadow[Off + 3] != 0 || VolumeShadowNeg[Off + 3] != 0) { return false; }
 		}
 		return true;
 	};
@@ -1651,8 +1691,58 @@ void UVoxelGISubsystem::StartDigTest(double RadiusUU)
 	       Removed, CentreUU.X, CentreUU.Y, CentreUU.Z, RadiusUU, DigTestBricks.Num());
 }
 
+// Forces a re-centre by the given number of BRICKS, on whatever field is
+// resident right now.
+//
+// WHY THIS EXISTS. The obvious verification -- fly the scripted flight and watch
+// for a pop -- does not work, and the run that showed that is worth recording:
+// under `-VoxelPerfFlight=surface` the light field holds **0-12 bricks** against
+// 2,212 when settled, with `pendingVox=0(+0 pooled)` throughout. Re-centres fire
+// correctly (7 of them, each exactly 8 frames, one-frame origin commit) but every
+// one restages an EMPTY volume, so the transient accounting reads 0 of 0 occupied
+// texels and proves nothing about a pop. A settled field that is then forced to
+// re-centre is the only way to put real data through the staged path.
+void UVoxelGISubsystem::ForceVolumeRecentre(int32 ShiftBricks)
+{
+	if (!Field || !bVolumeOriginSet || VolumeDim <= 0 || bVolumeRecentring)
+	{
+		UE_LOG(LogVoxelGI, Warning,
+		       TEXT("VOLUMERECENTRE: not ready (originSet=%d dim=%d inFlight=%d)"),
+		       bVolumeOriginSet ? 1 : 0, VolumeDim, bVolumeRecentring ? 1 : 0);
+		return;
+	}
+	// Pretend the camera sits ShiftBricks further along +X than it does. Nothing
+	// else about the path is faked: BeginVolumeRecentre re-snaps, re-buckets and
+	// restages exactly as a real camera move would.
+	const FVector Saved = FieldCentreUU;
+	FieldCentreUU.X += double(ShiftBricks) * double(VoxelLF::BrickEdgeUU);
+	BeginVolumeRecentre();
+	FieldCentreUU = Saved;
+	UE_LOG(LogVoxelGI, Log,
+	       TEXT("VOLUMERECENTRE: forced a %d-brick (%.0f UU) shift over a field of %d bricks"),
+	       ShiftBricks, double(ShiftBricks) * VoxelLF::BrickEdgeUU, Field->NumBricks());
+}
+
 namespace
 {
+	FAutoConsoleCommandWithWorldAndArgs GVoxelGIVolumeRecentreTestCmd(
+		TEXT("voxel.GI.VolumeRecentreTest"),
+		TEXT("Force a staged volume re-centre of N bricks (default 8 = 2560 UU, the default dead zone) ")
+		TEXT("on the CURRENTLY RESIDENT field, and report the transient. Exists because the scripted ")
+		TEXT("flight cannot verify this: under motion the light field holds single-digit bricks, so its ")
+		TEXT("re-centres restage an empty volume and cannot show a pop. Needs voxel.GI.Debug 2 for the ")
+		TEXT("transient line."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+			[](const TArray<FString>& Args, UWorld* World)
+	{
+		if (!World) { return; }
+		if (UVoxelGISubsystem* GI = World->GetSubsystem<UVoxelGISubsystem>())
+		{
+			const int32 Bricks = Args.Num() > 0 ? FMath::Clamp(FCString::Atoi(*Args[0]), 1, 64) : 8;
+			GI->ForceVolumeRecentre(Bricks);
+		}
+	}));
+
 	FAutoConsoleCommandWithWorldAndArgs GVoxelGIVolumeDigTestCmd(
 		TEXT("voxel.GI.VolumeDigTest"),
 		TEXT("Carve a sphere below the camera and measure the three GPU-volume behaviours that were ")

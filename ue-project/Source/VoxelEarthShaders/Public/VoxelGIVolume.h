@@ -31,7 +31,14 @@
 // declaration compiles perfectly and then reads zeros forever, because it is a
 // different, unbound symbol. Same trap the factory's own header documents.
 BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelGIVolumeParameters, VOXELEARTHSHADERS_API)
-	SHADER_PARAMETER_TEXTURE(Texture3D, Volume)
+	// TWO volumes, Scheme A: VolumePos is (Vis[+X], Vis[+Y], Vis[+Z], v) and
+	// VolumeNeg is (Vis[-X], Vis[-Y], Vis[-Z], v). A face reads exactly ONE of
+	// them -- chosen by the sign of its normal -- and takes ONE component, so
+	// this is two textures but still one sample. See VoxelLightField.h for why
+	// the single-texture Scheme B was dropped (it missed the design's own RMS
+	// bar by 2.6x, worst on exactly the cave walls the feature exists for).
+	SHADER_PARAMETER_TEXTURE(Texture3D, VolumePos)
+	SHADER_PARAMETER_TEXTURE(Texture3D, VolumeNeg)
 	SHADER_PARAMETER_SAMPLER(SamplerState, VolumeSampler)
 	// Volume origin in POOL-PRIMITIVE space, and 1/(N*CellSizeUU) per axis.
 	//
@@ -189,12 +196,13 @@ public:
 	// bricks costs one call and one barrier for the same bytes.
 	void UpdateTexels_RenderThread(FRHICommandListBase& RHICmdList,
 	                               const FIntVector& DestMin, const FIntVector& Size,
-	                               const uint8* SrcRGBA);
+	                               const uint8* SrcPos, const uint8* SrcNeg);
 
 	int32 GetDimTexels() const { return DimTexels; }
 
 private:
-	FTextureRHIRef Volume;
+	FTextureRHIRef VolumePos;
+	FTextureRHIRef VolumeNeg;
 	TUniformBufferRef<FVoxelGIVolumeParameters> UniformBuffer;
 	FVoxelGIVolumeSettings Settings;
 	int32 DimTexels = 0;
