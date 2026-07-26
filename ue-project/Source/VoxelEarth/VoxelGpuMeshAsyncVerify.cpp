@@ -106,6 +106,62 @@ namespace
 		return VoxelCoords::FVoxelChunkKey{ Cx, Cy, int32(vxc::floorDiv(Top, int64(ChunkVox))) };
 	}
 
+	// Builds the region request for one chunk. Shared by the async harness and
+	// the blocking control below, so the control is genuinely the SAME request.
+	FVoxelGpuRegionRequest BuildChunkRequest(vxc::SyntheticTileSampler& Tiles,
+	                                         const VoxelCoords::FVoxelChunkKey& Key)
+	{
+		FVoxelGpuRegionRequest Req;
+		VoxelGpuChunkRegion::SetChunkFootprint(Req, Key.X, Key.Y, Key.Z);
+		Req.Seed = kSeed;
+		// Sized from the dispatch footprint just set, by the same code the
+		// blocking digest gate uses.
+		VoxelGpuRegionBuild::FillRasterWindow(Req, Tiles);
+		return Req;
+	}
+
+	// The rebase the manager does internally, duplicated here ONLY so the
+	// blocking control can be compared on equal terms. Not used by the async path.
+	TArray<uint64> RebaseToChunkLocal(const FVoxelGpuRegionResult& Gpu, uint32 InteriorX, uint32 InteriorY)
+	{
+		TArray<uint64> Rebased;
+		Rebased.Reserve(Gpu.Quads.Num());
+		for (int32 MaskIndex = 0; MaskIndex < Gpu.QuadCounts.Num(); ++MaskIndex)
+		{
+			const uint32 Count = Gpu.QuadCounts[MaskIndex];
+			if (Count == 0)
+			{
+				continue;
+			}
+			const uint32 Start = Gpu.QuadOffsets[MaskIndex];
+			const uint32 MeshBrickIndex = uint32(MaskIndex) / 48u;
+			const uint32 Ix = MeshBrickIndex % InteriorX;
+			const uint32 Iy = (MeshBrickIndex / InteriorX) % InteriorY;
+			const uint32 Iz = MeshBrickIndex / (InteriorX * InteriorY);
+			const uint32 BrickOrigin[3] = { Ix * 8u, Iy * 8u, Iz * 8u };
+
+			for (uint32 Q = 0; Q < Count; ++Q)
+			{
+				const uint64 Packed = Gpu.Quads[int32(Start + Q)];
+				const uint32 W0 = uint32(Packed & 0xffffffffull);
+				const uint32 W1 = uint32(Packed >> 32);
+				const uint32 Axis  =  W0        & 0xfu;
+				const uint32 Dir   = (W0 >>  4) & 0xfu;
+				const uint32 Slice = (W0 >>  8) & 0xffu;
+				const uint32 U0    = (W0 >> 16) & 0xffu;
+				const uint32 V0    = (W0 >> 24) & 0xffu;
+				const uint32 U = (Axis + 1u) % 3u;
+				const uint32 V = (Axis + 2u) % 3u;
+				const uint32 NewW0 = Axis | (Dir << 4)
+				                   | ((Slice + BrickOrigin[Axis]) << 8)
+				                   | ((U0 + BrickOrigin[U]) << 16)
+				                   | ((V0 + BrickOrigin[V]) << 24);
+				Rebased.Add(uint64(NewW0) | (uint64(W1) << 32));
+			}
+		}
+		return Rebased;
+	}
+
 	double Percentile(TArray<double> Values, double Fraction)
 	{
 		if (Values.IsEmpty())
@@ -134,12 +190,13 @@ namespace
 			bool bDelivered = false;
 		};
 
-		explicit FAsyncMeshVerifyRun(int32 InNumChunks, int32 InMaxInFlight)
+		explicit FAsyncMeshVerifyRun(int32 InNumChunks, int32 InMaxInFlight, double InStartDelay)
 			: Tiles(kSeed)
 			, CpuTiles(kSeed)
 			, CpuAmp(kSeed, CpuTiles)
 			, NumChunks(InNumChunks)
 			, MaxInFlight(InMaxInFlight)
+			, StartDelaySeconds(InStartDelay)
 			, Manager(FVoxelGpuMeshJobComplete::CreateRaw(this, &FAsyncMeshVerifyRun::OnJobComplete),
 			          InMaxInFlight)
 		{
@@ -174,15 +231,7 @@ namespace
 			FirstSubmitSeconds = FPlatformTime::Seconds();
 			for (int32 I = 0; I < NumChunks; ++I)
 			{
-				FVoxelGpuRegionRequest Req;
-				VoxelGpuChunkRegion::SetChunkFootprint(Req, Chunks[I].Key.X, Chunks[I].Key.Y,
-				                                       Chunks[I].Key.Z);
-				Req.Seed = kSeed;
-				// Sized from the dispatch footprint that was just set, by the same
-				// code the blocking digest gate uses.
-				VoxelGpuRegionBuild::FillRasterWindow(Req, Tiles);
-
-				Manager.Submit(MoveTemp(Req), uint64(I));
+				Manager.Submit(BuildChunkRequest(Tiles, Chunks[I].Key), uint64(I));
 			}
 		}
 
@@ -281,8 +330,26 @@ namespace
 		}
 
 		// Returns false to unregister the ticker.
-		bool Tick(float)
+		bool Tick(float DeltaSeconds)
 		{
+			// DO NOT MEASURE DURING STARTUP. The first run of this measured a
+			// 15.6 s "dispatch to ready" latency and timed out 13 of 16 jobs --
+			// not because the GPU was slow, but because -ExecCmds fires on frame
+			// zero and the game thread then spends 15 s loading the world and
+			// precaching PSOs without ticking. Every number that comes out of
+			// that is meaningless, and it reads exactly like a broken runner.
+			if (!bStarted)
+			{
+				ElapsedBeforeStart += double(DeltaSeconds);
+				if (ElapsedBeforeStart < StartDelaySeconds)
+				{
+					return true;
+				}
+				bStarted = true;
+				Start();
+				return true;
+			}
+
 			Manager.Tick();
 
 			++NumTicks;
@@ -362,6 +429,9 @@ namespace
 
 		int32 NumChunks = 0;
 		int32 MaxInFlight = 0;
+		double StartDelaySeconds = 0.0;
+		double ElapsedBeforeStart = 0.0;
+		bool bStarted = false;
 		TArray<FChunkUnderTest> Chunks;
 
 		int32 NumDelivered = 0;
@@ -398,10 +468,17 @@ namespace
 
 		const int32 NumChunks = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), 1, 4096) : 16;
 		const int32 MaxInFlight = (Args.Num() > 1) ? FMath::Clamp(FCString::Atoi(*Args[1]), 1, 256) : 4;
+		// See FAsyncMeshVerifyRun::Tick for why this is not optional under
+		// -ExecCmds.
+		const double StartDelay = (Args.Num() > 2) ? FMath::Max(0.0, FCString::Atod(*Args[2])) : 25.0;
 
-		TSharedPtr<FAsyncMeshVerifyRun> Run = MakeShared<FAsyncMeshVerifyRun>(NumChunks, MaxInFlight);
+		TSharedPtr<FAsyncMeshVerifyRun> Run =
+			MakeShared<FAsyncMeshVerifyRun>(NumChunks, MaxInFlight, StartDelay);
 		GActiveRuns.Add(Run);
-		Run->Start();
+		UE_LOG(LogVoxelGpuAsync, Log,
+		       TEXT("voxel.GPU.VerifyAsyncMesh queued: %d chunks, %d in flight, starting in %.0f s "
+		            "(so the measurement is not taken while the world is still loading)."),
+		       NumChunks, MaxInFlight, StartDelay);
 
 		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
 			[Run](float DeltaTime)
@@ -414,6 +491,141 @@ namespace
 			return false;
 		}), 0.0f);
 	}
+
+	// THE CONTROL EXPERIMENT (docs/gpu-pool-rendering-notes.md: "prefer a control
+	// experiment to a bisect").
+	//
+	// Runs the IDENTICAL chunk region request through RunRegionBlocking -- the
+	// path the digest gate already proves -- and compares it to the same CPU
+	// reference the async harness uses. That splits the space in one run:
+	//
+	//   control fails too  -> the chunk region setup is wrong (footprint, raster
+	//                         window, z-range), and the async runner is innocent.
+	//   control passes     -> the async runner is what differs.
+	//
+	// It also dumps the first few differing COLUMN fields, because a stratigraphy
+	// mismatch with byte-identical geometry can only come from the column stage.
+	void RunControl(int32 NumChunks)
+	{
+		vxc::SyntheticTileSampler Tiles(kSeed);
+		vxc::SyntheticTileSampler CpuTiles(kSeed);
+		vxc::Amplifier CpuAmp(kSeed, CpuTiles);
+
+		constexpr int32 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
+		const int32 Side = FMath::CeilToInt(FMath::Sqrt(double(NumChunks)));
+		int32 NumMatched = 0;
+
+		for (int32 I = 0; I < NumChunks; ++I)
+		{
+			const VoxelCoords::FVoxelChunkKey Key =
+				SurfaceChunkKey(CpuAmp, (I % Side) - Side / 2, (I / Side) - Side / 2);
+
+			const FVoxelGpuRegionRequest Req = BuildChunkRequest(Tiles, Key);
+			const double Start = FPlatformTime::Seconds();
+			const FVoxelGpuRegionResult Gpu = VoxelGpuWorldGen::RunRegionBlocking(Req);
+			const double Ms = (FPlatformTime::Seconds() - Start) * 1000.0;
+
+			if (!Gpu.bOk)
+			{
+				UE_LOG(LogVoxelGpuAsync, Error, TEXT("  [control] chunk (%d,%d,%d) dispatch FAILED: %s"),
+				       Key.X, Key.Y, Key.Z, *Gpu.Error);
+				continue;
+			}
+
+			// --- column stage --------------------------------------------------
+			// Dispatch column (8+x, 8+y) is chunk-local (x,y): the footprint has a
+			// one-brick halo on the negative side.
+			int32 ColumnMismatches = 0;
+			for (int32 Y = 0; Y < ChunkVox && ColumnMismatches < 4; ++Y)
+			{
+				for (int32 X = 0; X < ChunkVox && ColumnMismatches < 4; ++X)
+				{
+					const int32 Idx = (8 + X) + (8 + Y) * int32(VoxelGpuChunkRegion::kColumns);
+					const FVoxelGpuColumnSample& G = Gpu.Columns[Idx];
+					const vxc::ColumnSample C =
+						CpuAmp.column(int64(Key.X) * ChunkVox + X, int64(Key.Y) * ChunkVox + Y);
+
+					if (G.SurfaceMm == C.surfaceMm && G.TopsoilMm == C.topsoilMm &&
+					    G.SubsoilMm == C.subsoilMm && G.BedrockDepthMm == C.bedrockDepthMm &&
+					    G.SurfaceMat == uint32(C.surfaceMat))
+					{
+						continue;
+					}
+					++ColumnMismatches;
+					UE_LOG(LogVoxelGpuAsync, Error,
+					       TEXT("  [control] chunk (%d,%d,%d) column (%d,%d): "
+					            "surface cpu %d gpu %d | topsoil cpu %d gpu %d | subsoil cpu %d gpu %d | "
+					            "bedrock cpu %d gpu %d | mat cpu %u gpu %u"),
+					       Key.X, Key.Y, Key.Z, X, Y,
+					       C.surfaceMm, G.SurfaceMm, C.topsoilMm, G.TopsoilMm,
+					       C.subsoilMm, G.SubsoilMm, C.bedrockDepthMm, G.BedrockDepthMm,
+					       uint32(C.surfaceMat), G.SurfaceMat);
+				}
+			}
+
+			// --- quad stage ----------------------------------------------------
+			const TArray<uint64> Rebased = RebaseToChunkLocal(
+				Gpu, VoxelGpuChunkRegion::kInteriorBricks, VoxelGpuChunkRegion::kInteriorBricks);
+			const TArray<uint64> CpuQuads = CpuMeshChunkPacked(CpuAmp, Key);
+
+			const bool bSameCount = Rebased.Num() == CpuQuads.Num();
+			const bool bSameBytes = bSameCount &&
+				(Rebased.IsEmpty() || FMemory::Memcmp(Rebased.GetData(), CpuQuads.GetData(),
+				                                      SIZE_T(Rebased.Num() * sizeof(uint64))) == 0);
+
+			UE_LOG(LogVoxelGpuAsync, Log,
+			       TEXT("  [control] chunk (%d,%d,%d): blocking gpu %d quads, cpu %d quads, "
+			            "columns differing (first 4 shown) %d, bytes %s, %.1f ms"),
+			       Key.X, Key.Y, Key.Z, Rebased.Num(), CpuQuads.Num(), ColumnMismatches,
+			       bSameBytes ? TEXT("IDENTICAL") : TEXT("DIFFER"), Ms);
+
+			if (bSameBytes)
+			{
+				++NumMatched;
+			}
+		}
+
+		UE_LOG(LogVoxelGpuAsync, Log, TEXT("[control] %d of %d chunks byte-identical through "
+		                                   "RunRegionBlocking"), NumMatched, NumChunks);
+	}
+
+	void VerifyAsyncMeshControlCommand(const TArray<FString>& Args)
+	{
+		if (!VoxelGpuWorldGen::IsSupportedOnCurrentRHI())
+		{
+			UE_LOG(LogVoxelGpuAsync, Error, TEXT("Needs SM6. Relaunch with -sm6."));
+			return;
+		}
+
+		const int32 NumChunks = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), 1, 64) : 2;
+		// Deferred for the same reason the async run is, but harder: this path
+		// calls FlushRenderingCommands, and running that from -ExecCmds on frame
+		// zero wedges the process outright (observed: no output, no crash, CPU
+		// spinning). It must not run until the world is up.
+		const double Delay = (Args.Num() > 1) ? FMath::Max(0.0, FCString::Atod(*Args[1])) : 25.0;
+
+		TSharedPtr<double> Elapsed = MakeShared<double>(0.0);
+		UE_LOG(LogVoxelGpuAsync, Log, TEXT("[control] queued: %d chunks, starting in %.0f s"),
+		       NumChunks, Delay);
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Elapsed, NumChunks, Delay](float DeltaTime)
+		{
+			*Elapsed += double(DeltaTime);
+			if (*Elapsed < Delay)
+			{
+				return true;
+			}
+			RunControl(NumChunks);
+			return false;
+		}), 0.0f);
+	}
+
+	FAutoConsoleCommand GVoxelGpuVerifyAsyncMeshControlCmd(
+		TEXT("voxel.GPU.VerifyAsyncMesh.Control"),
+		TEXT("Control experiment: mesh the SAME chunk regions through the blocking "
+		     "RunRegionBlocking path and compare against the CPU mesher. If this fails too, the "
+		     "region setup is wrong, not the async runner. Usage: [K=2] [delaySeconds=25]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&VerifyAsyncMeshControlCommand));
 
 	FAutoConsoleCommand GVoxelGpuVerifyAsyncMeshCmd(
 		TEXT("voxel.GPU.VerifyAsyncMesh"),
