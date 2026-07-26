@@ -8,6 +8,15 @@ Each wave below says what it changes **in the game**, not just in the code, and
 carries an honest value verdict. Two waves are marked questionable; one item is
 closed as "do not build".
 
+> **This document was written from summaries. `docs/gpu-waves-plan.md` was written
+> from the code, and it corrects four things below.** Read that one before
+> starting work; it is the execution plan. The corrections are marked inline as
+> **CORRECTED** and the reasoning is in the plan.
+>
+> Two scope decisions have also been taken since (Matt, 2026-07-26): **Wave D is
+> in scope including coarse levels**, and **Wave B ships GI on by default** —
+> which changes the verdicts recorded below for both.
+
 ---
 
 ## Wave A — Make the pooled renderer worth having (frustum culling)
@@ -28,8 +37,8 @@ on screen is not culling.
 |---|---|
 | **In-game effect** | Frame cost stops scaling with *resident* geometry and starts scaling with *visible* geometry. This is what makes `voxel.Stream.GPU` shippable as a default at all. |
 | **Status** | CPU-side cull written; the parallel-`GetDynamicMeshElements` race that corrupted its working set is **fixed** (that also fixed a crash). It still drops geometry, so it stays `voxel.Stream.GPUCull 0`. |
-| **Next lead** | The zero-stride vertex stream. The factory binds one zero-stride element at `GNullColorVertexBuffer`; a draw whose `StartVertexLocation` is millions of vertices into a 4-byte buffer may simply not rasterise. Fits the evidence: ranges near 0 draw, ranges far in do not. |
-| **Real fix if confirmed** | Pass each range's base quad as **per-element shader data** instead of via `SV_VertexID`, so every draw starts at vertex 0 and the shader computes `QuadIndex = BaseQuad + VertexId/6`. The factory already has a `GetElementShaderBindings` hook. |
+| **Next lead** | ~~The zero-stride vertex stream.~~ **CORRECTED** — `GNullColorVertexBuffer` is 16 bytes at **stride 0**, so the fetch address is `Base + StartVertexLocation * 0` and is always in bounds. The real lead is `RHISupportsAbsoluteVertexID`, which returns **false on D3D12**: `SV_VertexID` may not include the draw's base vertex, so every range would draw quads `[0, Count)`. See `gpu-waves-plan.md` Wave A2. |
+| **Real fix if confirmed** | Pass each range's base quad down so every draw starts at vertex 0 and the shader computes `QuadIndex = BaseQuad + VertexId/6`. **CORRECTED** — this must go through a **uniform buffer**, not a loose per-element `FShaderParameter`: those are measured **not to bind** in this project (`gpu-g2-draw-path.md`), and `ShaderBindings.Add()` on an unbound parameter is a **silent** no-op. |
 | **End state** | GPU-driven culling — a compute pass over the chunk table emitting an **indirect draw**, which keeps *one* draw call rather than one per visible run. This is the ADR's own design (`gpu-g2-draw-path.md`), and the docs state twice that the pool must compact into one contiguous range per frame. |
 | **Verdict** | **Worth doing.** Without it the pool is a measured regression and cannot be the default. With it, one draw call for the whole world is a genuine architectural win. |
 
@@ -38,9 +47,17 @@ on screen is not culling.
 ## Wave B — Voxel GI as a GPU volume (steps 3–5)
 
 **The point is not throughput.** Today GI is baked into vertex colours at mesh
-time, so **a dig re-meshes a chunk partly just to refresh its lighting**. Sampling
-a volume texture by world position decouples the two: lighting updates become
-texel uploads, geometry updates stay geometry updates.
+time, so a dig re-shades a chunk partly just to refresh its lighting. Sampling a
+volume texture by world position decouples the two: lighting updates become texel
+uploads, geometry updates stay geometry updates.
+
+> **CORRECTED.** An earlier version of this section said the re-mesh being retired
+> was on the **pooled** path. It is not: `BrickComponents` has no entry for pooled
+> bricks (`VoxelGI.h:154-161`), so pooled chunks are never re-shaded at all, and
+> `CollectDirtyChunks` already expands an edit only to the 1-voxel mesher apron,
+> never to a lighting radius. The 5×5×5 re-shade that is genuinely retirable is on
+> the **component** path, and the larger cost is the `voxel.GI.MaxQuadSpanVoxels`
+> quad subdivision. See `gpu-waves-plan.md` Wave B.
 
 Steps 0–2 are landed and verified: the pooled path feeds the light field (it
 previously never did — `voxel.GI.Enabled 1` was a silent no-op under
@@ -76,10 +93,21 @@ Same HLSL, same GPU, same CPU reference: the standalone bench passes bit-exact
 (`046b4a9f9c5e49b7`). The two toolchains disagree with each other — exactly the
 fault class a two-leg gate exists to catch. Localised: columns match, quad decode
 matches exactly, **cells differ on material ids only** and in a consistent
-direction (the DXIL build's soil column sits one layer shallower). Prime suspect
-is floating-point contraction flipping a `<` by one ULP at a layer boundary,
-where one ULP becomes a whole different material. **Fix the compilation flags, not
-the kernel maths** — changing the maths would break the bench leg that passes.
+direction (the DXIL build's soil column sits one layer shallower).
+
+> **CORRECTED — the floating-point contraction theory is impossible.**
+> `worldgen.ush` contains **no floating-point arithmetic at all**; every operand
+> from raster to material id is `int64_t`/`uint64_t`, which the file's own header
+> states. There is no `<` for an FMA to flip by one ULP because there is no float
+> to hold a ULP. And the proposed fix cannot be written: on UE 5.8's D3D12 path
+> `CFLAG_NoFastMath` is never translated (`TranslateCompilerFlagD3D11` maps three
+> flags and returns 0 for the rest), and there is no `-Gis` equivalent.
+>
+> The real compile deltas are **`cs_6_0` vs `cs_6_6`/`cs_6_8`** and **`cbuffer` vs
+> loose `$Globals` binding**. A `$Globals` packing mismatch on `BrickZMin` would
+> produce exactly this signature — columns match, cells shift vertically by one
+> layer. This is the *second* wrong diagnosis on this one failure; both are kept
+> visible. Hypotheses and the cheapest test: `gpu-waves-plan.md` Wave C.
 
 **C2 — NVIDIA determinism leg.** Never run. The cross-vendor claim rests on one
 vendor (AMD RX 7800 XT). ~$5 and ~20 minutes on a rented box. Cannot be
