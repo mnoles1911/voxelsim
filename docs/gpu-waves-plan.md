@@ -649,6 +649,27 @@ shipping configuration right now, and it satisfies the owner's actual request �
 matches the CPU's term for term (B4), its parameters are live (B6), and its
 uploads are measured (B5). What it lacks is a renderer that reads it.
 
+**And it is gated on something with a known fix, not on a mystery — which is a
+materially different thing to tell the owner.** Wave A confirmed
+`voxel.Stream.GPU` stays 0 (both legs put the pooled path above the component
+path straight down, 0.17 and 0.13 ms against a pre-registered 0.114 ms
+threshold), so the gate is real. But Wave A also retracted its own "the residual
+is not geometry" claim and landed a **linear cost model**: pooled cost is a ~2 ms
+floor plus **~1.19 µs per 1000 quads drawn**, holding to **1.1%** across two
+poses that differ 4× in frame time. Under that model compaction is worth ~4.7 ms
+at the horizon, which would plausibly put the pooled path ahead outright. So the
+honest framing is **"correct-and-off, waiting on a known fix"**, not
+"correct-and-off, indefinitely" — the day `voxel.Stream.GPU` flips, the volume is
+already exact, already matched to the CPU shade term for term, and already
+measured.
+
+**Noise floor, pre-registered.** Wave A measured **four of five control pairs
+repeating to under 0.5%** on a quiet box, on the same pinned-pose harness. That
+is a sharper prior than this programme had before, and it is used here as a
+*rejection* criterion, not a comfort: a spread much wider than 0.5% between
+identical configs means something is wrong with the leg and it gets re-run, it
+does not get reported as noise.
+
 RESULT_B7_COST_PLACEHOLDER
 
 ### Considered and rejected: making the COMPONENT path sample the volume
