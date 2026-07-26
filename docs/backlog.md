@@ -192,6 +192,66 @@ which is not needed to run inference. Invoke the module function directly —
 
 ---
 
+## 6a. LIVE REGRESSION: the cross-toolchain determinism gate is FAILING on main
+
+**`voxel.GPU.VerifyRegion` fails as of 2026-07-26.** The GPU worldgen kernels and
+the CPU amplifier disagree on voxel MATERIAL assignment. This is the gate that
+backs ADR-0001's cross-vendor determinism posture, and it is currently red.
+
+Evidence, from the origin fixture region (`voxel.GPU.VerifyRegion 0`):
+
+```
+[origin] 4096 columns, 196608 cells, 3424 quads (cpu 3422)
+[origin] quad decode: 20544 vertices match the CPU reference exactly
+First 21 mismatch(es):
+    cell(-64,-64,vz=11648): cpu=2 gpu=5
+    cell(-64,-64,vz=11654): cpu=5 gpu=12
+    ...
+    quad count: cpu=3422 gpu=3424
+```
+
+**Localised, and the localisation is the useful part:**
+
+- **Columns match.** All 4,096. `ColumnMain` and `Amplifier::column` agree, so
+  the stratigraphy/climate column stage is fine.
+- **Cells differ** — material ids only, in a consistent pattern (`2 -> 5`,
+  `5 -> 12`). So the break is in **voxelization**: `VoxelizeMain` in
+  `voxel-core/shaders/worldgen.ush` against the CPU material rules in
+  `voxel-core/src/amplifier.cpp`.
+- **The mesher is innocent.** Quad decode matches the CPU reference exactly, and
+  the 2-quad count difference is downstream of the cell mismatch.
+
+**Not a stale-library artifact.** `build/voxel-core-msvc/voxelcore.lib` *was*
+stale (built 15:37 against `amplifier.cpp` modified 19:40), which is its own
+problem — see the `VoxelEarth.Build.cs` hardcoded-lib item below. But rebuilding
+voxel-core from scratch and relinking reproduces the identical failure, so the
+disagreement is real and not a build artifact.
+
+**Cause, most likely:** the worldgen v8 climate wave changed CPU material
+assignment without mirroring the change into the HLSL. `docs/terrain-amplification-reconciliation.md`
+already states the rule that any change to the generation kernels must be
+mirrored bit-for-bit; this is that rule being broken in practice.
+
+**Consequences while it is red:**
+
+- The digest recorded in four places is stale. `docs/gpu-streaming-plan.md:63-64`,
+  `docs/streaming-handoff.md:12,120`, `docs/gpu-g2-draw-path.md:115` and
+  `voxel-core/shaders/prebuilt/README.md:378` all say `f3c48a4df3e20e9a`. The
+  current GPU-side digest is `046b4a9f9c5e49b7` for the two-region default and
+  `391439595abbbcc1` for region 0 alone. **Do not simply update the numbers** --
+  they should not be re-baselined until the CPU/GPU disagreement is resolved, or
+  the gate is re-baselined around a known-broken state.
+- Any future GPU-meshed terrain would differ from CPU-meshed terrain, so this
+  blocks the GPU meshing programme (6b) on correctness, independently of its
+  performance question.
+- The NVIDIA leg below cannot be meaningfully run until this is green.
+
+**Next step:** diff the worldgen v8 changes to `amplifier.cpp`'s material
+assignment against `worldgen.ush`'s `VoxelizeMain`, and mirror them. The
+mismatching ids (2, 5, 12) name the specific rules to look at.
+
+---
+
 ## 6b. GPU streaming (ADR-0006), after G0-G5 landed
 
 **Does the pool actually make frames faster? Unmeasured, and the harness cannot
