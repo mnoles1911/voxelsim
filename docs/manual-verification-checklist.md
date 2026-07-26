@@ -95,10 +95,11 @@ it.
 
 ### 4a. Water frame cost — the number automation could not take (added Wave E)
 
-Same shape as item 3, same reason, and it is now the *only* thing blocking a
-verdict on the water pool. Headless legs were held rather than run: up to four UE
-sessions were live on the box at once, and a contended frame-time number is worse
-than no number because it looks like a result.
+Same shape as item 3, and it is now the *only* thing blocking a verdict on the
+water pool. This was attempted headlessly on an idle box and **the harness cannot
+do it** — not "the effect was inside the noise", but the instrument returns a
+constant at this anchor (see below). A human reading `stat unit` is the
+measurement, not a fallback.
 
 If you have the machine to yourself, this takes ten minutes and settles it:
 
@@ -113,6 +114,14 @@ If you have the machine to yourself, this takes ten minutes and settles it:
 
 The pooled path's whole claim is ~2,200 water primitives collapsing to **one**,
 so Draw is the number to watch, not Frame.
+
+**Your `stat unit` reading is better than the harness's here, not just easier.**
+`-VoxelPerfRun` samples the *world* delta, which the engine clamps at 400 ms
+(`MaxUndilatedFrameTime`, 2.5 fps), and this cavern anchor runs below that on the
+full cascade — so every automated sample reads exactly 400.00 and two different
+configurations come back identical. `stat unit` reads the real frame time and is
+not clamped. See the delta-clamp ground rule in
+`docs/gpu-waves-plan.md`.
 
 ### 4b. Water translucency — one sort key for the whole world (added Wave E)
 
