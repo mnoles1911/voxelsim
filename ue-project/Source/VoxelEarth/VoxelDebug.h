@@ -254,6 +254,18 @@ namespace VoxelDebug
 	// output and has no place in a perf run.
 	VOXELEARTH_API bool GetStreamLogRetention();
 
+	// voxel.Stream.ApplyStageStats (Wave S0, docs/speculative-generation-plan.md
+	// §4): split the per-apply cost into quad pack / SampleChunkParamsForPool /
+	// pool add, reported per 5s window. Default 0.
+	//
+	// It gates the CLOCKS ONLY. The DrainResults exit-reason counters beside them
+	// are unconditional, because they are what decide whether the apply loop
+	// exits on an empty queue or on its 6 ms wall clock -- the question the
+	// published "apply budget only 8.5% saturated, results are not ARRIVING"
+	// reading answers by assumption. Pair with voxel.Stream.PoolPushStats
+	// (VoxelEarthShaders), which splits the pool-add bucket across both threads.
+	VOXELEARTH_API int32 GetStreamApplyStageStats();
+
 	// voxel.Stream.CoverageVerify (ring-gap wave): once per periodic perf-log
 	// window, count the XY footprints inside a ring's core annulus that NO level
 	// is visibly covering -- i.e. the see-through holes, as a number rather than

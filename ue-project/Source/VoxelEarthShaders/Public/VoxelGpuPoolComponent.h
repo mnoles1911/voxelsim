@@ -19,6 +19,9 @@
 
 #include "CoreMinimal.h"
 #include "Components/PrimitiveComponent.h"
+// FThreadSafeCounter64 (FVoxelGpuPoolBuffers::RunBoundsCycles). Explicit because
+// CoreMinimal.h pulls in the 32-bit FThreadSafeCounter but not this one.
+#include "HAL/ThreadSafeCounter64.h"
 #include "RHIResources.h"
 #include "VoxelGpuGeometryPool.h"
 #include "VoxelGpuQuadPayload.h"
@@ -113,6 +116,25 @@ struct FVoxelGpuPoolBuffers
 	// outlive its storage. See UVoxelGpuPoolComponent::GetGpuDirectWritesDropped
 	// for why a dropped write must be counted rather than only logged.
 	FThreadSafeCounter DroppedWrites;
+
+	// Render-thread cycles spent in FVoxelGpuPoolSceneProxy::RebuildRunBounds,
+	// and the number of times it ran. Wave S0 (docs/speculative-generation-plan.md
+	// §4): the deep review prices this at 45-90 ns per run over every resident
+	// chunk, per applied chunk -- ~2-4 ms of render-thread CPU each -- and that
+	// estimate is the entire case for batching publication. It has never been
+	// measured. This is the measurement.
+	//
+	// HERE FOR THE SAME REASON AS DroppedWrites: RebuildRunBounds runs on the
+	// render thread inside a command that captured this holder by shared
+	// reference, and the component is a UObject that may already be gone. Drained
+	// from the game thread by UVoxelGpuPoolComponent::GetAndResetPushStats.
+	//
+	// Cycles rather than milliseconds so the accumulate side is one
+	// FPlatformTime::Cycles64() pair and no floating-point work runs inside the
+	// gather-adjacent path being measured.
+	FThreadSafeCounter64 RunBoundsCycles;
+	FThreadSafeCounter64 RunBoundsCalls;
+	FThreadSafeCounter64 RunBoundsRunsWalked;
 
 	bool IsValid() const { return QuadBuffer.IsValid() && ChunkIdBuffer.IsValid(); }
 };
@@ -246,6 +268,45 @@ public:
 	{
 		return PoolBuffers.IsValid() ? PoolBuffers->DroppedWrites.GetValue() : 0;
 	}
+
+	// What one window's worth of publication actually cost, on BOTH threads.
+	//
+	// Wave S0 (docs/speculative-generation-plan.md §4, executing T0-1). Every
+	// AddChunk / AddChunkFromGpu / UpdateChunk / RemoveChunk ends in its own
+	// PushUpdatesToProxy, and each of those copies the whole chunk table, runs
+	// BuildChunkRuns (a walk plus a sort), enqueues a render command, and has the
+	// render thread rebuild every run's bounds. The deep review's §1a says that is
+	// the ~600 chunks/s plateau. Nothing has ever measured it, so the batching
+	// wave would otherwise be built on an estimate.
+	//
+	// RunsBuilt is deliberately separate from Pushes: a push with neither
+	// bChunkTableDirty nor bRunsDirty set skips BuildChunkRuns entirely, and the
+	// ratio is how you tell "publication is frequent" from "publication is
+	// expensive".
+	//
+	// AllocationsWalked is the term that does NOT scale with residency:
+	// BuildChunkRuns reserves and walks Allocations, which is append-only, so it
+	// grows with chunks ever added. If this climbs across a leg while
+	// GetNumChunks() is flat, that is the finding.
+	//
+	// Render-thread figures come from the shared buffer holder and are therefore
+	// whatever had landed by the time the game thread asked -- they lag the
+	// game-thread figures by a frame or two and are not exactly co-windowed. That
+	// is fine for a 5 s census and wrong for anything finer; do not quote them
+	// per-frame.
+	struct FPoolPushStats
+	{
+		int64 Pushes = 0;               // PushUpdatesToProxy calls that reached the render command
+		int64 RunsBuilt = 0;            // ...of which ran BuildChunkRuns
+		int64 AllocationsWalked = 0;    // total Allocations entries walked by those builds
+		int64 RunsEmitted = 0;          // total live runs those builds produced
+		double TableCopyMs = 0.0;       // game thread: OriginsCopy + ParamsCopy
+		double BuildRunsMs = 0.0;       // game thread: BuildChunkRuns (walk + sort)
+		double RunBoundsMs = 0.0;       // RENDER thread: RebuildRunBounds
+		int64 RunBoundsCalls = 0;       // RENDER thread
+		int64 RunBoundsRunsWalked = 0;  // RENDER thread
+	};
+	FPoolPushStats GetAndResetPushStats();
 
 	// Releases a chunk's range back to the pool.
 	//
@@ -480,6 +541,14 @@ private:
 	// See GetGpuDirectWrites. The DROPPED half lives on FVoxelGpuPoolBuffers,
 	// which outlives this component from a render command's point of view.
 	int64 GpuDirectWrites = 0;
+
+	// Game-thread half of GetAndResetPushStats. The render-thread half lives on
+	// FVoxelGpuPoolBuffers (RunBoundsCycles) for the usual lifetime reason.
+	// Accumulated in PushUpdatesToProxy; the two FPlatformTime::Seconds pairs are
+	// gated on voxel.Stream.PoolPushStats so the instrument cannot be what is
+	// being measured, but the COUNTS are unconditional -- they are increments on a
+	// path that already does a table copy and a sort.
+	FPoolPushStats PushStats;
 
 	// Enqueues one render command carrying every pending GPU write, for the two
 	// PushUpdatesToProxy branches that return before building their own. Returns

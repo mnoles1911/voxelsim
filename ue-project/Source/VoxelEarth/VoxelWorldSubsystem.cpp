@@ -3211,6 +3211,51 @@ struct FVoxelWorldImpl
 	int64 ResultsDrainedSinceLog = 0;   // DrainResults: results dequeued (live + stale)
 	int64 StaleDiscardsSinceLog = 0;    // ...of which discarded (record gone / superseded)
 	int64 ZeroQuadAppliesSinceLog = 0;  // ...of which meshed to zero quads (buried: real work, no component)
+
+	// WHICH EXIT DrainResults TOOK, per 5s window. Wave S0
+	// (docs/speculative-generation-plan.md §4, executing T0-1).
+	//
+	// This exists because the open P0's headline reading may be an artifact of a
+	// metric. The published claim is "apply budget only 8.5% saturated -- results
+	// are not ARRIVING", and it rests on LastAppliedFrac, which divides Applied by
+	// the COUNT ceiling (MaxApplies) while the loop actually breaks on a 6ms
+	// WALL CLOCK. If the wall-clock exit dominates, the loop is exiting on TIME,
+	// not on an empty queue, and the entire "results are not arriving" diagnosis
+	// inverts -- the consumer is the wall, which is what the whole T4-1
+	// re-sequencing is predicated on.
+	//
+	// Nothing currently logs which exit fired, so both readings are consistent
+	// with every number ever taken. Four unconditional increments settle it.
+	//
+	// A frame that drains the queue completely takes the QueueEmpty exit, so in
+	// steady state that SHOULD dominate; the question is what happens during the
+	// cascade fill and under flight.
+	int64 DrainExitQueueEmptySinceLog = 0;  // Dequeue returned false -- nothing left to apply
+	int64 DrainExitWallClockSinceLog = 0;   // ApplyBudgetMs elapsed (past the kMinAppliesPerFrame floor)
+	int64 DrainExitCountCapSinceLog = 0;    // Applied hit MaxAppliesPerFrame
+	int64 DrainExitDrainCapSinceLog = 0;    // Drains hit kMaxResultDrainsPerFrame (stale backlog)
+
+	// WHERE PER-APPLY TIME GOES, per 5s window. §1a prices the table push as the
+	// dominant term and the batching wave is built on that, but the split has
+	// never been measured. Milliseconds accumulated across the window; divide by
+	// AppliesTimedSinceLog for a per-apply figure.
+	//
+	// POOLED BRANCH ONLY -- the component branch is the control arm and is not
+	// split; see the note at the top of it in ApplyMeshResult. The fourth stage
+	// §1a names, the table push, is not here either: it happens inside the pool
+	// add, and splitting it needs the pool's own clocks. That is
+	// UVoxelGpuPoolComponent::GetAndResetPushStats, and poolAdd below is its
+	// total, so the two lines add up.
+	//
+	// Gated on voxel.Stream.ApplyStageStats -- these are FPlatformTime::Seconds
+	// pairs on the hot apply path, which is exactly the kind of instrument that
+	// can become what it measures. AppliesTimedSinceLog counts only applies that
+	// were actually timed, so the per-apply divide stays honest when the gate is
+	// flipped mid-run.
+	double ApplyStagePackMs = 0.0;     // CPU-form quad repack (skipped entirely for GPU-resident chunks)
+	double ApplyStageParamsMs = 0.0;   // SampleChunkParamsForPool: a full Amplifier::column on the game thread
+	double ApplyStagePoolAddMs = 0.0;  // Pool->AddChunk / AddChunkFromGpu / UpdateChunk, INCLUDING their PushUpdatesToProxy
+	int64 AppliesTimedSinceLog = 0;
 	int64 RecordsAddedSinceLog = 0;     // RecomputeDesiredSet: ChunkRecords.Add calls (admission)
 	int64 RecordsEvictedSinceLog = 0;   // DrainUnloads: records erased (component-less + parked)
 	int64 CandidatesRejectedSinceLog = 0; // bounded admission: in-annulus candidates NOT admitted (never became records)
@@ -4520,6 +4565,59 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       WidestAdmissionCutoffM(),
 	       (long long)CandidatesRejectedSinceLog, (long long)RecordsDroppedSinceLog);
 
+	// Wave S0 (docs/speculative-generation-plan.md §4, executing T0-1). Two
+	// questions in one line, both of which the open P0 currently answers by
+	// assumption:
+	//
+	// EXIT: which of the four DrainResults exits fired. "Apply budget only 8.5%
+	// saturated -- results are not ARRIVING" is derived from LastAppliedFrac,
+	// which divides by the COUNT ceiling while the loop breaks on a 6 ms WALL
+	// CLOCK. wallClock dominating means the loop is exiting on time, not on an
+	// empty queue, and the consumer is the wall. Unconditional counters, so this
+	// half is readable on any leg. The four should sum to the frame count; short
+	// means an exit path nobody has accounted for.
+	//
+	// STAGES: where per-apply time goes. Gated -- zeroes when
+	// voxel.Stream.ApplyStageStats is off, which is the default.
+	{
+		const double TimedApplies = double(FMath::Max<int64>(1, AppliesTimedSinceLog));
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel apply stages (5s window): exit queueEmpty=%lld wallClock=%lld countCap=%lld drainCap=%lld ")
+		       TEXT("| timedApplies=%lld pack=%.2fms params=%.2fms poolAdd=%.2fms ")
+		       TEXT("| per-apply pack=%.3f params=%.3f poolAdd=%.3f"),
+		       (long long)DrainExitQueueEmptySinceLog, (long long)DrainExitWallClockSinceLog,
+		       (long long)DrainExitCountCapSinceLog, (long long)DrainExitDrainCapSinceLog,
+		       (long long)AppliesTimedSinceLog,
+		       ApplyStagePackMs, ApplyStageParamsMs, ApplyStagePoolAddMs,
+		       ApplyStagePackMs / TimedApplies, ApplyStageParamsMs / TimedApplies,
+		       ApplyStagePoolAddMs / TimedApplies);
+	}
+
+	// The pool's own half of the same question, drained from the component so the
+	// render-thread accumulator is reset in step with the game-thread one.
+	//
+	// pushes vs applies is the ratio the batching wave attacks directly: today
+	// this should read roughly applies + unloads, and after T1-1 it should read
+	// roughly ticks. allocsWalked/runsEmitted is the OTHER finding -- BuildChunkRuns
+	// walks an append-only array, so if allocsWalked climbs across a leg while
+	// runsEmitted stays flat, per-apply cost is growing with chunks ever added
+	// rather than with residency, and that is a second mechanism behind the
+	// plateau nobody has been looking for.
+	if (UVoxelGpuPoolComponent* Pool = GpuPool.Get())
+	{
+		const UVoxelGpuPoolComponent::FPoolPushStats Push = Pool->GetAndResetPushStats();
+		const double PerBuild = double(FMath::Max<int64>(1, Push.RunsBuilt));
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel pool publish (5s window): pushes=%lld runsBuilt=%lld allocsWalked=%lld runsEmitted=%lld ")
+		       TEXT("(mean walk=%.0f emit=%.0f) | game tableCopy=%.2fms buildRuns=%.2fms ")
+		       TEXT("| render runBounds=%.2fms calls=%lld runsWalked=%lld"),
+		       (long long)Push.Pushes, (long long)Push.RunsBuilt,
+		       (long long)Push.AllocationsWalked, (long long)Push.RunsEmitted,
+		       double(Push.AllocationsWalked) / PerBuild, double(Push.RunsEmitted) / PerBuild,
+		       Push.TableCopyMs, Push.BuildRunsMs,
+		       Push.RunBoundsMs, (long long)Push.RunBoundsCalls, (long long)Push.RunBoundsRunsWalked);
+	}
+
 	{
 		// added / dropped / evicted per ring. A ring whose adds far exceed its
 		// residency, with drops and evictions to match, is churning rather than
@@ -4852,6 +4950,14 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	AccumTicks = 0;
 	JobsDispatchedSinceLog = ResultsDrainedSinceLog = StaleDiscardsSinceLog = ZeroQuadAppliesSinceLog = 0;
 	RecordsAddedSinceLog = RecordsEvictedSinceLog = CandidatesRejectedSinceLog = RecordsDroppedSinceLog = 0;
+	// Wave S0. The pool's own push stats are drained and reset by
+	// GetAndResetPushStats where the line is emitted, not here -- they live on the
+	// component, and resetting them from two places is how the render-thread half
+	// would start double-counting.
+	DrainExitQueueEmptySinceLog = DrainExitWallClockSinceLog = 0;
+	DrainExitCountCapSinceLog = DrainExitDrainCapSinceLog = 0;
+	ApplyStagePackMs = ApplyStageParamsMs = ApplyStagePoolAddMs = 0.0;
+	AppliesTimedSinceLog = 0;
 	FMemory::Memzero(LevelRecordsAdded);
 	FMemory::Memzero(LevelRecordsDropped);
 	FMemory::Memzero(LevelRecordsEvicted);
@@ -8745,6 +8851,14 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			return false;
 		}
 
+		// Wave S0 stage timing (docs/speculative-generation-plan.md §4, executing
+		// T0-1), gated on voxel.Stream.ApplyStageStats: these are
+		// FPlatformTime::Seconds pairs on a path that runs up to 64 times a frame,
+		// which is exactly the kind of instrument that becomes what it measures.
+		// A leg with the gate OFF, matching a leg with it ON, is part of closing
+		// this wave rather than optional.
+		const bool bStageStats = VoxelDebug::GetStreamApplyStageStats() != 0;
+
 		// The CPU mesher's quads, packed into the same 8 bytes the GPU mesher
 		// emits (see PackVoxelChunkQuad -- the layout is a contract with
 		// VoxelQuadDecode.ush). This is the whole bridge: the pooled renderer
@@ -8754,6 +8868,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		// the exact layout this loop produces, in GPU memory, and packing them
 		// here would mean having read them back first. That round trip -- unpack
 		// in OnGpuMeshJobComplete, repack here -- is what D1 deletes.
+		const double PackStart = bStageStats ? FPlatformTime::Seconds() : 0.0;
 		TArray<uint64> Packed;
 		if (!bGpuResident)
 		{
@@ -8762,6 +8877,10 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			{
 				Packed[I] = PackVoxelChunkQuad(Quads[I]);
 			}
+		}
+		if (bStageStats)
+		{
+			ApplyStagePackMs += (FPlatformTime::Seconds() - PackStart) * 1000.0;
 		}
 
 		const FVector OriginRelative = VoxelCoords::ChunkOriginWorldForLevel(Key.Key, Key.Level);
@@ -8810,6 +8929,27 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		// GetOrCreateGpuPool. Climate still samples at the ABSOLUTE position.
 		const FVector OriginInPool = OriginRelative - GpuPoolRebase;
 
+		// HOISTED OUT OF THE TWO CALLS BELOW so it can be timed on its own, and
+		// computed on exactly the branches that used to compute it -- the
+		// UpdateChunk path never sampled params and still must not, or this
+		// instrument would add a full Amplifier::column to every re-mesh.
+		//
+		// §1c is the reason it gets its own bucket: SampleChunkParamsForPool runs
+		// GetSurfaceHeightUU, which is a whole column with the cave lattice and
+		// cavern passes, on the GAME THREAD, once per applied chunk -- for a value
+		// the producing job already computed. If this bucket is large, T1-3's
+		// column cache moves up the queue.
+		const bool bNeedsParams = bGpuResident || bWasFirstLoad;
+		const double ParamsStart = bStageStats ? FPlatformTime::Seconds() : 0.0;
+		const FVector4f PoolParams = bNeedsParams
+			? SampleChunkParamsForPool(Root, OriginRelative, Key.Level)
+			: FVector4f(0.f, 0.f, 0.f, 0.f);
+		if (bStageStats && bNeedsParams)
+		{
+			ApplyStageParamsMs += (FPlatformTime::Seconds() - ParamsStart) * 1000.0;
+		}
+
+		const double PoolAddStart = bStageStats ? FPlatformTime::Seconds() : 0.0;
 		if (bGpuResident)
 		{
 			// ONLY THE FIRST-LOAD SHAPE EXISTS ON THIS PATH, and it is not an
@@ -8829,14 +8969,12 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 				return false;
 			}
 			Rec.PoolSlot = Pool->AddChunkFromGpu(
-				GpuQuads, uint32(NumQuads), FVector3f(OriginInPool), Key.Level,
-				SampleChunkParamsForPool(Root, OriginRelative, Key.Level));
+				GpuQuads, uint32(NumQuads), FVector3f(OriginInPool), Key.Level, PoolParams);
 		}
 		else if (bWasFirstLoad)
 		{
 			Rec.PoolSlot = Pool->AddChunk(
-				Packed, FVector3f(OriginInPool), Key.Level,
-				SampleChunkParamsForPool(Root, OriginRelative, Key.Level));
+				Packed, FVector3f(OriginInPool), Key.Level, PoolParams);
 		}
 		else
 		{
@@ -8845,6 +8983,15 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			// free+realloc would fragment the pool hardest on exactly the
 			// chunks that re-mesh most often.
 			Rec.PoolSlot = Pool->UpdateChunk(Rec.PoolSlot, Packed);
+		}
+		if (bStageStats)
+		{
+			// Includes the PushUpdatesToProxy each of those three ends in -- which
+			// is the point. The pool's own GetAndResetPushStats splits that cost
+			// into its table-copy and BuildChunkRuns halves; this is the total the
+			// apply loop's 6ms wall-clock budget actually sees.
+			ApplyStagePoolAddMs += (FPlatformTime::Seconds() - PoolAddStart) * 1000.0;
+			++AppliesTimedSinceLog;
 		}
 
 		if (Rec.PoolSlot == INDEX_NONE)
@@ -8925,6 +9072,13 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		return bWasFirstLoad;
 	}
 
+	// NOT TIMED, deliberately. The component-renderer branch is the CONTROL arm,
+	// and S0's question is entirely about the pooled path -- §1a's claim is that
+	// the POOLED apply carries an O(resident) tax the component apply does not.
+	// The comparison that answers it is already the head-to-head's avgChunks/s;
+	// a stage split here would need its own timed-apply counter and a scope guard
+	// to survive this branch's early returns, for a number nothing in the wave
+	// reads. Add it if and only if a leg raises a question about this arm.
 	UVoxelChunkComponent* Comp = Rec.Component.Get();
 	const bool bWasFirstLoad = (Comp == nullptr);
 	if (!Comp)
@@ -9024,6 +9178,12 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 	int32 Applied = 0; // render-thread-facing applies (live results) this frame -- gated by MaxApplies
 	int32 Drains = 0;  // total results dequeued incl. stale discards (game-thread-cheap) -- gated by kMaxResultDrainsPerFrame
 	int32 ProxiesCreated = 0;
+	// Wave S0: which of the four exits this frame took (see the DrainExit*
+	// counters). Set by the two `break`s; left as None if the loop fell out of
+	// its own condition, which is then attributed after the loop. There is no
+	// fifth exit -- the loop body's only other jump is a `continue`.
+	enum class EDrainExit : uint8 { None, QueueEmpty, WallClock };
+	EDrainExit ExitReason = EDrainExit::None;
 	VoxelStreaming::FJobResult Result;
 	while (Applied < MaxApplies && Drains < kMaxResultDrainsPerFrame)
 	{
@@ -9054,10 +9214,12 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		if (Applied >= kMinAppliesPerFrame &&
 		    (FPlatformTime::Seconds() - ApplyLoopStart) >= ApplyBudgetSeconds)
 		{
+			ExitReason = EDrainExit::WallClock;
 			break;
 		}
 		if (!ResultsQueue.Dequeue(Result))
 		{
+			ExitReason = EDrainExit::QueueEmpty;
 			break;
 		}
 		++Drains;
@@ -9244,6 +9406,26 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			++ProxiesCreated;
 		}
 	}
+	// Wave S0 exit attribution. The two breaks named themselves; falling out of
+	// the loop condition means one of the two caps bound, and Applied is checked
+	// first because it is the render-facing one -- if both are at their ceiling in
+	// the same frame, the count cap is the one that matters.
+	switch (ExitReason)
+	{
+	case EDrainExit::QueueEmpty: ++DrainExitQueueEmptySinceLog; break;
+	case EDrainExit::WallClock:  ++DrainExitWallClockSinceLog;  break;
+	default:
+		// No trailing `else`, on purpose. Falling out of the loop with NEITHER cap
+		// at its ceiling is impossible -- the body's only exits are the two breaks
+		// above and a `continue` -- and charging an impossible case to one of the
+		// four real buckets would make this census quietly wrong instead of
+		// visibly short. The four counters summing to less than the frame count IS
+		// the tell that an exit path exists that nobody has accounted for.
+		if (Applied >= MaxApplies)                   { ++DrainExitCountCapSinceLog; }
+		else if (Drains >= kMaxResultDrainsPerFrame) { ++DrainExitDrainCapSinceLog; }
+		break;
+	}
+
 	LastAppliedFrac = MaxApplies > 0 ? float(Applied) / float(MaxApplies) : 0.f;
 	ThisFrameAppliesFromWorker = Applied;
 	ThisFrameProxiesCreated += ProxiesCreated;

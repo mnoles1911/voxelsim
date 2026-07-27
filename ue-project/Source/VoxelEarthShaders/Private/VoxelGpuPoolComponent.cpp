@@ -21,6 +21,29 @@
 FVoxelGpuPoolBuffers::FVoxelGpuPoolBuffers() = default;
 FVoxelGpuPoolBuffers::~FVoxelGpuPoolBuffers() = default;
 
+// Wave S0 (docs/speculative-generation-plan.md §4, executing T0-1): time what
+// publication costs, on both threads.
+//
+// GATES THE CLOCKS, NOT THE COUNTS. The counters below are increments on a path
+// that already copies the whole chunk table and runs a sort; the
+// FPlatformTime pairs are the part that could plausibly perturb what they
+// measure, and RebuildRunBounds' pair sits next to the render thread's gather
+// path, so it is the one that most needs to be absent when not asked for.
+// Off by default; a leg turns it on, and one leg with it OFF is what proves the
+// instrument is not the perturbation.
+//
+// File scope rather than inside VoxelGpuPoolCull because both use sites need it
+// and RebuildRunBounds precedes that namespace's consumers.
+static int32 GVoxelPoolPushStats = 0;
+static FAutoConsoleVariableRef CVarVoxelPoolPushStats(
+	TEXT("voxel.Stream.PoolPushStats"),
+	GVoxelPoolPushStats,
+	TEXT("1 = time PushUpdatesToProxy's chunk-table copy and BuildChunkRuns on the game thread, ")
+	TEXT("and RebuildRunBounds on the render thread, reported by the streaming subsystem's 5s log. ")
+	TEXT("Default 0. The deep review prices RebuildRunBounds at ~2-4ms of render-thread CPU PER ")
+	TEXT("APPLIED CHUNK and rests the whole batching wave on that estimate; this is what measures it."),
+	ECVF_Default);
+
 // Draws every chunk in the pool with a single mesh batch.
 namespace VoxelGpuPoolCull
 {
@@ -1059,6 +1082,14 @@ private:
 	// already had this property.
 	void RebuildRunBounds()
 	{
+		// Wave S0 census. Cycles, not milliseconds: the conversion is a
+		// floating-point multiply and this is the render thread's own path, so it
+		// is done once at drain time on the game thread instead of once per call
+		// here. Counters are unconditional (three atomic adds); the clock pair is
+		// gated -- see GVoxelPoolPushStats.
+		const bool bTime = GVoxelPoolPushStats != 0;
+		const uint64 StartCycles = bTime ? FPlatformTime::Cycles64() : 0;
+
 		RunBoundsLocalToWorld = GetLocalToWorld();
 		RunBounds.Reset(Runs.Num());
 		for (const UVoxelGpuPoolComponent::FChunkRun& Run : Runs)
@@ -1066,6 +1097,16 @@ private:
 			RunBounds.Add(ComputeRunBounds(Run, RunBoundsLocalToWorld));
 		}
 		bRunBoundsValid = true;
+
+		if (SharedBuffers.IsValid())
+		{
+			SharedBuffers->RunBoundsCalls.Add(1);
+			SharedBuffers->RunBoundsRunsWalked.Add(int64(Runs.Num()));
+			if (bTime)
+			{
+				SharedBuffers->RunBoundsCycles.Add(int64(FPlatformTime::Cycles64() - StartCycles));
+			}
+		}
 	}
 
 	// WHY AN EMPTY RANGE LIST IS NOT ONE SITUATION.
@@ -2301,6 +2342,30 @@ TArray<UVoxelGpuPoolComponent::FPendingGpuWrite> UVoxelGpuPoolComponent::TakePen
 	return Writes;
 }
 
+UVoxelGpuPoolComponent::FPoolPushStats UVoxelGpuPoolComponent::GetAndResetPushStats()
+{
+	FPoolPushStats Out = PushStats;
+	PushStats = FPoolPushStats{};
+
+	// The render-thread half. Reset() on FThreadSafeCounter64 returns the old
+	// value and zeroes atomically, so a RebuildRunBounds landing mid-drain is
+	// counted in exactly one window rather than lost or double-counted.
+	//
+	// These lag the game-thread figures: they report whatever the render thread
+	// had finished by the time this ran, which is a frame or two behind the
+	// publications that caused them. Fine for a 5 s census, wrong for anything
+	// finer -- see FPoolPushStats.
+	if (PoolBuffers.IsValid())
+	{
+		const int64 Cycles = PoolBuffers->RunBoundsCycles.Reset();
+		Out.RunBoundsCalls = PoolBuffers->RunBoundsCalls.Reset();
+		Out.RunBoundsRunsWalked = PoolBuffers->RunBoundsRunsWalked.Reset();
+		// Cycles -> ms once, here, rather than per call on the render thread.
+		Out.RunBoundsMs = FPlatformTime::ToMilliseconds64(uint64(Cycles));
+	}
+	return Out;
+}
+
 void UVoxelGpuPoolComponent::FlushGpuWritesStandalone(TArray<FPendingGpuWrite>&& Writes)
 {
 	if (Writes.Num() == 0)
@@ -2409,15 +2474,43 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 		       (TotalQuadsToUpload * uint32(sizeof(uint64))) / 1024u,
 		       SpanQuads, (SpanQuads * uint32(sizeof(uint64))) / 1024u, GVoxelPoolDirtyMergeGap);
 	}
+	// Wave S0 census: this function runs once per applied chunk AND once per
+	// unload, so what follows is the per-item cost the batching wave exists to
+	// amortise. Clocks gated (GVoxelPoolPushStats), counts unconditional.
+	const bool bPushStats = GVoxelPoolPushStats != 0;
+	++PushStats.Pushes;
+
+	const double TableCopyStart = bPushStats ? FPlatformTime::Seconds() : 0.0;
 	// The chunk table is two small vectors per chunk, so it stays whole.
 	TArray<FVector4f> OriginsCopy = ChunkOrigins;
 	TArray<FVector4f> ParamsCopy = ChunkParams;
+	if (bPushStats)
+	{
+		PushStats.TableCopyMs += (FPlatformTime::Seconds() - TableCopyStart) * 1000.0;
+	}
+
 	// Runs travel with the table because they describe the same thing: which
 	// chunk owns which quads. Rebuilt whenever the ALLOCATION set changed, not
 	// whenever the table did -- see bRunsDirty. Still not per frame: residency
 	// changes a handful of times a second, the camera moves every frame, and only
 	// the second of those needs re-culling.
+	const double BuildRunsStart = bPushStats ? FPlatformTime::Seconds() : 0.0;
 	TArray<FChunkRun> RunsCopy = bTableDirty ? BuildChunkRuns() : TArray<FChunkRun>();
+	if (bTableDirty)
+	{
+		++PushStats.RunsBuilt;
+		// The two terms BuildChunkRuns actually costs, kept apart on purpose.
+		// AllocationsWalked is what it RESERVES and WALKS -- Allocations is
+		// append-only, so this grows with chunks ever added and does not come back
+		// down. RunsEmitted is the live set it produces. The gap between them is
+		// the finding, if there is one.
+		PushStats.AllocationsWalked += int64(Allocations.Num());
+		PushStats.RunsEmitted += int64(RunsCopy.Num());
+		if (bPushStats)
+		{
+			PushStats.BuildRunsMs += (FPlatformTime::Seconds() - BuildRunsStart) * 1000.0;
+		}
+	}
 
 	ENQUEUE_RENDER_COMMAND(VoxelGpuPoolIncrementalUpdate)(
 		[Proxy, QuadsSlice = MoveTemp(QuadsSlice), IdsSlice = MoveTemp(IdsSlice),

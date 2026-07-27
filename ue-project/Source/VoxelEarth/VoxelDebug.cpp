@@ -197,6 +197,26 @@ TAutoConsoleVariable<int32> CVarVoxelStreamLogAdmission(
 	TEXT("armed. Those four decide whether a ring keeps filling, and no existing counter shows them together."),
 	ECVF_Default);
 
+// Wave S0 (docs/speculative-generation-plan.md §4, executing T0-1): split the
+// per-apply cost into pack / params / pool-add so the deep review's §1a can be
+// confirmed or killed in one leg instead of being built on.
+//
+// GATES THE CLOCKS, NOT THE COUNTS. The DrainResults exit-reason counters are
+// unconditional -- four increments per frame, and they are what settle whether
+// the apply loop exits on an empty queue or on its 6 ms wall clock, which the
+// published "results are not ARRIVING" reading assumes without ever having
+// measured. The FPlatformTime::Seconds pairs guarded by this are the part that
+// could plausibly become what it measures, on a path that runs up to 64 times a
+// frame. A leg with this OFF, showing avgChunks/s within noise of a leg with it
+// ON, is part of closing the wave -- not optional.
+TAutoConsoleVariable<int32> CVarVoxelStreamApplyStageStats(
+	TEXT("voxel.Stream.ApplyStageStats"),
+	0,
+	TEXT("1 = time each apply's quad pack, SampleChunkParamsForPool and pool add (including the ")
+	TEXT("PushUpdatesToProxy each ends in), reported per 5s window. Default 0. Pair it with ")
+	TEXT("voxel.Stream.PoolPushStats, which splits the pool-add bucket across both threads."),
+	ECVF_Default);
+
 // Ring-gap wave (docs/status.md "ring gap"). The 5s retention census says HOW
 // MANY stand-ins were released and why; it cannot say WHICH ones, and the
 // hypothesis under test is positional -- coarse chunks released at the INNER
@@ -664,6 +684,11 @@ float VoxelDebug::GetStreamLodRetentionMs()
 bool VoxelDebug::GetStreamLogRetention()
 {
 	return CVarVoxelStreamLogRetention.GetValueOnGameThread() != 0;
+}
+
+int32 VoxelDebug::GetStreamApplyStageStats()
+{
+	return CVarVoxelStreamApplyStageStats.GetValueOnGameThread();
 }
 
 bool VoxelDebug::GetStreamCoverageVerify()
