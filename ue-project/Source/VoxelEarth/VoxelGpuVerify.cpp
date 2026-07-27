@@ -84,6 +84,32 @@ namespace
 	//
 	// OutCpuColumns is filled as a side effect because deriving the z-range
 	// requires every column anyway, and the comparison needs them again later.
+	// BAND-ONLY FIXTURES. These do NOT contribute to the digest.
+	//
+	// WHY THEY HAD TO EXIST AT ALL, and it is a fixture bug rather than a kernel
+	// one. The two digest fixtures above are 64 columns square -- 6.4 m of world.
+	// The cave lattice is kCaveLatticeMm = 25.6 m, so a 6.4 m patch usually
+	// contains NO lattice node, and neither of them contains one: the D6 sweep
+	// reported "0 cave / 0 shaft / 0 cavern" on every probe, across all 4,096
+	// columns of BOTH fixtures once BandOriginJ let it search off the diagonal.
+	// The cave-segment loop, the shaft term, the two bedrock clamps and
+	// ceilSqrtU were therefore passing vacuously -- and that is precisely the
+	// code the INT64 sentinel defect lived in.
+	//
+	// 320 columns is 32 m, which spans more than one full lattice period on both
+	// axes and straddles the node at world (0,0), so it contains cave sites by
+	// construction rather than by luck. Deliberately anchored to include voxel 0:
+	// the "origin" fixture runs -64..-1 and stops one voxel short of it.
+	//
+	// SEPARATE FROM kRegions BECAUSE THE DIGEST IS PINNED. 6e893ab3679a8c81 is
+	// compared against the bench, and adding a region to the digest loop would
+	// change it -- turning a loud cross-toolchain gate into a re-baselining
+	// exercise. These run bMeshChain = false (the band is a pure function of the
+	// columns) so they cost columns and one reduction, not a mesh chain.
+	const FRegionSpec kBandOnlyRegions[] = {
+		{ TEXT("cave-bearing"), -64, -64, 320, 320 },
+	};
+
 	FVoxelGpuRegionRequest BuildRequest(const FRegionSpec& Region,
 	                                    const vxc::Amplifier& CpuAmp,
 	                                    vxc::SyntheticTileSampler& Tiles,
@@ -378,6 +404,7 @@ namespace
 	struct FBandProbe
 	{
 		uint32 OriginI;
+		uint32 OriginJ;
 		uint32 Edge;
 		FString Why;
 	};
@@ -394,6 +421,7 @@ namespace
 		// enough to be worth having.
 		Req.bMeshChain = false;
 		Req.BandOriginI = Probe.OriginI;
+		Req.BandOriginJ = Probe.OriginJ;
 		Req.BandEdge = Probe.Edge;
 
 		const FVoxelGpuRegionResult Gpu = VoxelGpuWorldGen::RunRegionBlocking(Req);
@@ -425,7 +453,7 @@ namespace
 			for (uint32 I = 0; I < Probe.Edge; ++I)
 			{
 				const uint32 Dx = Probe.OriginI + I;
-				const uint32 Dy = Probe.OriginI + J;
+				const uint32 Dy = Probe.OriginJ + J;
 				const vxc::ColumnSample& Col = CpuColumns[int32(Dx + Dy * Region.Width)];
 				CpuMaxTop = FMath::Max(CpuMaxTop, VoxelStreaming::ColumnSurfaceTopVoxel(Col));
 				CpuMinAir = FMath::Min(CpuMinAir, VoxelStreaming::ColumnDeepestAirVoxel(Col));
@@ -450,11 +478,11 @@ namespace
 		if (!bMatch)
 		{
 			UE_LOG(LogVoxelGpuVerify, Error,
-			       TEXT("[D6 band cross-check] FAIL — [%s] %s (origin=%u edge=%u): ")
+			       TEXT("[D6 band cross-check] FAIL — [%s] %s (origin=%u,%u edge=%u): ")
 			       TEXT("maxSurfaceTop gpu %d vs cpu %lld, minDeepestAir gpu %d vs cpu %lld. ")
 			       TEXT("Band would be {max %d, solidBelow %d} instead of {max %d, solidBelow %d}. ")
 			       TEXT("%d cave / %d shaft / %d cavern column(s) in this window."),
-			       Region.Name, *Probe.Why, Probe.OriginI, Probe.Edge,
+			       Region.Name, *Probe.Why, Probe.OriginI, Probe.OriginJ, Probe.Edge,
 			       Gpu.BandMaxSurfaceTopVoxel, CpuMaxTop, Gpu.BandMinDeepestAirVoxel, CpuMinAir,
 			       GpuBand.MaxSurfaceTopVoxel, GpuBand.SolidBelowVoxel,
 			       CpuBand.MaxSurfaceTopVoxel, CpuBand.SolidBelowVoxel,
@@ -484,10 +512,10 @@ namespace
 		}
 
 		UE_LOG(LogVoxelGpuVerify, Log,
-		       TEXT("[D6 band cross-check] PASS — [%s] %s (origin=%u edge=%u, %u columns): ")
+		       TEXT("[D6 band cross-check] PASS — [%s] %s (origin=%u,%u edge=%u, %u columns): ")
 		       TEXT("maxSurfaceTop %lld, minDeepestAir %lld, band {max %d, solidBelow %d}; ")
 		       TEXT("%d cave / %d shaft / %d cavern column(s) exercised"),
-		       Region.Name, *Probe.Why, Probe.OriginI, Probe.Edge, Probe.Edge * Probe.Edge,
+		       Region.Name, *Probe.Why, Probe.OriginI, Probe.OriginJ, Probe.Edge, Probe.Edge * Probe.Edge,
 		       CpuMaxTop, CpuMinAir, CpuBand.MaxSurfaceTopVoxel, CpuBand.SolidBelowVoxel,
 		       CaveCols, ShaftCols, CavernCols);
 		return true;
@@ -503,9 +531,15 @@ namespace
 		constexpr uint32 kProdEdge = 32 + 2;
 
 		TArray<FBandProbe> Probes;
-		Probes.Add({ 0, kProdEdge, TEXT("production-shaped window at origin") });
-		Probes.Add({ Region.Width - kProdEdge, kProdEdge, TEXT("production-shaped window, offset") });
-		Probes.Add({ 17, 8, TEXT("small offset window") });
+		Probes.Add({ 0, 0, kProdEdge, TEXT("production-shaped window at origin") });
+		Probes.Add({ Region.Width - kProdEdge, Region.Width - kProdEdge, kProdEdge,
+		             TEXT("production-shaped window, offset") });
+		Probes.Add({ 17, 17, 8, TEXT("small offset window") });
+		// Asymmetric window. Only reachable since BandOriginJ existed, and it is
+		// the one probe that can catch an x/y mix-up in the kernel's indexing --
+		// every window above is square AND diagonal, so a swap of dx and dy is
+		// invisible to all of them.
+		Probes.Add({ 5, 23, 16, TEXT("asymmetric window (x!=y origin)") });
 
 		// Single-column probes. A featureless column tests only
 		// `surfaceTop + 1`; these are what test the cave-segment loop, the
@@ -520,12 +554,15 @@ namespace
 		//     the real vxc::ColumnSample the CPU reference already built for
 		//     this region, scores every candidate, and takes the top three. It
 		//     is not a guess that features cluster anywhere in particular.
-		//   * The candidates are the DIAGONAL ONLY -- 64 of this fixture's 4,096
-		//     columns. BandOriginI is one scalar for both axes, so a
-		//     single-column window can only sit at (k, k). "The three richest
-		//     columns available to a single-column probe" is the true claim;
-		//     "the three richest columns in the region" is not, and is not
-		//     claimed anywhere.
+		//   * The candidates are now EVERY column in the fixture -- all 4,096,
+		//     not the 64 on the diagonal. That changed when BandOriginJ was
+		//     added: a 1x1 window used to be pinned to (k, k), and the first
+		//     real run of this sweep reported the cost of that in its own words
+		//     -- no cave or cavern column anywhere on either fixture's diagonal,
+		//     so the strongest probes exercised only `surfaceTop + 1` and left
+		//     the cave-segment loop, the shaft term, the bedrock clamps and
+		//     ceilSqrt uncovered. "The three richest columns in the region" is
+		//     now the true claim.
 		//   * The three window probes above cover all 4,096 columns between
 		//     them. What they cannot do is localise a per-column error, which is
 		//     what these three are for.
@@ -535,43 +572,56 @@ namespace
 		// is said out loud below rather than left to be inferred from three
 		// "0 cave / 0 shaft / 0 cavern" PASS lines.
 		{
-			struct FScored { uint32 K; int32 Score; };
+			struct FScored { uint32 I; uint32 J; int32 Score; };
 			TArray<FScored> Scored;
-			for (uint32 K = 0; K < Region.Width; ++K)
+			Scored.Reserve(int32(Region.Width) * int32(Region.Height));
+			for (uint32 J = 0; J < Region.Height; ++J)
 			{
-				const vxc::ColumnSample& Col = CpuColumns[int32(K + K * Region.Width)];
-				const int32 Score = Col.cave.count * 2
-				                  + ((Col.cave.shaftMarginSq > 0) ? 5 : 0)
-				                  + Col.cavern.count * 3;
-				Scored.Add({ K, Score });
+				for (uint32 I = 0; I < Region.Width; ++I)
+				{
+					const vxc::ColumnSample& Col = CpuColumns[int32(I + J * Region.Width)];
+					const int32 Score = Col.cave.count * 2
+					                  + ((Col.cave.shaftMarginSq > 0) ? 5 : 0)
+					                  + Col.cavern.count * 3;
+					Scored.Add({ I, J, Score });
+				}
 			}
 			// Ties broken by K so the gate probes the SAME columns every run.
 			// TArray::Sort is introsort and is not stable; without this, two
 			// runs of the same binary on the same fixture could report coverage
 			// from different columns, and a gate whose scope moves between runs
 			// is not a gate.
+			// Ties broken by (J, I) so the gate probes the SAME columns every
+			// run. TArray::Sort is introsort and is not stable; without this,
+			// two runs of the same binary on the same fixture could report
+			// coverage from different columns, and a gate whose scope moves
+			// between runs is not a gate.
 			Scored.Sort([](const FScored& A, const FScored& B)
 			{
-				return (A.Score != B.Score) ? (A.Score > B.Score) : (A.K < B.K);
+				if (A.Score != B.Score) { return A.Score > B.Score; }
+				if (A.J != B.J)         { return A.J < B.J; }
+				return A.I < B.I;
 			});
 
 			if (Scored.Num() > 0 && Scored[0].Score == 0)
 			{
 				UE_LOG(LogVoxelGpuVerify, Warning,
-				       TEXT("[D6 band cross-check] [%s] NO cave or cavern column anywhere on the ")
-				       TEXT("diagonal, so the single-column probes below exercise only ")
+				       TEXT("[D6 band cross-check] [%s] NO cave or cavern column ANYWHERE in this ")
+				       TEXT("region's %u columns, so the single-column probes below exercise only ")
 				       TEXT("`surfaceTop + 1`. The cave-segment loop, the shaft term, the bedrock ")
 				       TEXT("clamps and ceilSqrt are NOT covered by this region's probes -- read ")
-				       TEXT("their PASS lines accordingly."),
-				       Region.Name);
+				       TEXT("their PASS lines accordingly. (Before BandOriginJ this warning could ")
+				       TEXT("fire merely because the DIAGONAL was featureless; now it means the ")
+				       TEXT("whole fixture is.)"),
+				       Region.Name, Region.Width * Region.Height);
 			}
 
 			for (int32 N = 0; N < 3 && N < Scored.Num(); ++N)
 			{
-				Probes.Add({ Scored[N].K, 1,
-				             FString::Printf(TEXT("single column (%d,%d), richest-on-diagonal rank %d, score %d"),
-				                             Region.OriginVx + int32(Scored[N].K),
-				                             Region.OriginVy + int32(Scored[N].K),
+				Probes.Add({ Scored[N].I, Scored[N].J, 1,
+				             FString::Printf(TEXT("single column (%d,%d), richest-in-region rank %d, score %d"),
+				                             Region.OriginVx + int32(Scored[N].I),
+				                             Region.OriginVy + int32(Scored[N].J),
 				                             N + 1, Scored[N].Score) });
 			}
 		}
@@ -843,6 +893,40 @@ namespace
 			// the geometry is right and the decision to SKIP producing it is
 			// wrong.
 			bAllOk &= VerifyBandForRegion(Region, Req, CpuColumns);
+		}
+
+		// Band-only fixtures, AFTER the digest loop and outside it.
+		//
+		// Nothing here touches Digest or CpuDigest, which is the point: the
+		// pinned 6e893ab3679a8c81 is a cross-toolchain gate against the bench,
+		// and widening its fixture set would silently re-baseline it. These
+		// exist because the two digest fixtures are 6.4 m across against a
+		// 25.6 m cave lattice and contain no cave sites at all, so the band
+		// kernel's cave path was passing vacuously.
+		//
+		// Skipped when a single region was requested by index, since the
+		// argument selects from kRegions.
+		if (Only < 0)
+		{
+			for (const FRegionSpec& BandRegion : kBandOnlyRegions)
+			{
+				TArray<vxc::ColumnSample> BandCpuColumns;
+				FVoxelGpuRegionRequest BandReq =
+					BuildRequest(BandRegion, CpuAmp, Tiles, BandCpuColumns);
+				// The band is a pure function of the columns, so the mesh chain
+				// is dead weight here -- and at 320x320 it would be expensive
+				// dead weight.
+				BandReq.bMeshChain = false;
+
+				UE_LOG(LogVoxelGpuVerify, Log,
+				       TEXT("  [%s] band-only fixture, origin (%d,%d) %ux%u columns "
+				            "(%u total) -- does NOT contribute to the digest"),
+				       BandRegion.Name, BandRegion.OriginVx, BandRegion.OriginVy,
+				       BandRegion.Width, BandRegion.Height,
+				       BandRegion.Width * BandRegion.Height);
+
+				bAllOk &= VerifyBandForRegion(BandRegion, BandReq, BandCpuColumns);
+			}
 		}
 
 		// vxc::Digest exposes its FNV-1a accumulator directly as `h`.

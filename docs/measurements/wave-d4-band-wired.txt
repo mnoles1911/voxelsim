@@ -1,0 +1,42 @@
+D4 with the band wired -- fork uptake, band delivery, and what is NOT claimed.
+
+GATE (voxel.GPU.VerifyRegion), after adding BandOriginJ and the cave fixture:
+  digest 6e893ab3679a8c81  -- UNCHANGED. The band-only fixture runs outside the
+                              digest loop, which is why the pinned cross-toolchain
+                              value still holds.
+  [cave-bearing] production-shaped window, offset (origin=286,286 edge=34):
+      PASS -- 1133 cave / 0 shaft / 0 cavern column(s) exercised
+  [cave-bearing] single column (215,226) rank 1, score 10:  PASS -- 1 cave column
+  [cave-bearing] single column (214,227) rank 2, score 10:  PASS -- 1 cave column
+  [cave-bearing] single column (215,227) rank 3, score 10:  PASS -- 1 cave column
+  [origin]/[far-negative] asymmetric window (origin=5,23 edge=16): PASS
+
+  STILL UNCOVERED: 0 shaft and 0 cavern columns anywhere. The sinkhole shaft term
+  and the cavern loop remain untested; only the cave-segment path, the bedrock
+  clamps and ceilSqrtU are now exercised.
+
+FORK UPTAKE, R0 = 128 m cold fill, per run:
+  before (band-seed excluded):     842 chunks dispatched
+  after  (fork seeds its own band): 9,199 and 9,202 chunks   -- 11x
+
+  bandCache = 5088 at settle. That is the end-to-end proof the GPU band lands in
+  FootprintBandCache: with the exclusion in place the fork never produced one.
+
+FORK HEALTH over 34 and 40 five-second windows:
+  failed=0 in every window
+  markTimeouts=0  gpuLatencyTimeouts=0  blindInFlight=0 (gpu=0)
+  steady ~1,300 dispatched / ~1,300 delivered per window
+  in-flight settles at 19-20 against a cap of 256, so the fork is LATENCY-bound,
+  not cap-bound.
+  submitToDeliver mean 25-36 ms; max 429 ms (leg 1) and 4,448 ms (leg 2).
+
+  THE 4,448 ms OUTLIER IS WORTH WATCHING. kBlindJobMarkTimeoutSeconds is 5.0 s,
+  so that single job came within 12% of tripping the cold-band backstop. It did
+  not (gpuLatencyTimeouts=0), and the counter split exists precisely so that if
+  it ever does, it lands in its own bucket instead of destroying the
+  "markTimeouts should be ZERO on a healthy run" signal.
+
+NOT CLAIMED: any cold-fill improvement. The timing legs this session did not
+reach a common final residency (41,427 / 41,550 / 42,382 / 43,328 chunks), so
+they are not comparable and no settle-time delta is reported from them. The
+uptake and health numbers above do not depend on timing.

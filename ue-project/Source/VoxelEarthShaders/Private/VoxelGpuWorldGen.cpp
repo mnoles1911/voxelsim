@@ -261,6 +261,7 @@ namespace
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
 			SHADER_PARAMETER(uint32, BandOriginI)
+			SHADER_PARAMETER(uint32, BandOriginJ)
 			SHADER_PARAMETER(uint32, BandEdge)
 			// cavernColumnFor evaluates terrain height at a cave site's own xy,
 			// so the raster is live here for the same reason it is in
@@ -360,14 +361,20 @@ bool VoxelGpuWorldGen::ValidateRegionRequest(const FVoxelGpuRegionRequest& Req, 
 	// there, and the kernel's guard stays as unreachable defence.
 	if (Req.BandEdge > 0)
 	{
+		// PER AXIS, not one origin against both. With a single origin the old
+		// form was equivalent; with BandOriginJ it is not, and the failure it
+		// would let through is the exact one this check exists to stop -- a
+		// window that overhangs in Y only still reduces over a partial grid and
+		// returns a band that is not an outer bound, in the unsafe direction.
 		const uint64 EndI = uint64(Req.BandOriginI) + uint64(Req.BandEdge);
-		if (EndI > uint64(Cx) || EndI > uint64(Cy))
+		const uint64 EndJ = uint64(Req.BandOriginJ) + uint64(Req.BandEdge);
+		if (EndI > uint64(Cx) || EndJ > uint64(Cy))
 		{
 			OutError = FString::Printf(
-				TEXT("Band window [%u, %llu) does not fit inside DispatchColumns (%u, %u) — the ")
-				TEXT("reduction would silently run over a partial window and return a band that ")
-				TEXT("is not an outer bound of the columns asked about"),
-				Req.BandOriginI, EndI, Cx, Cy);
+				TEXT("Band window x[%u, %llu) y[%u, %llu) does not fit inside DispatchColumns ")
+				TEXT("(%u, %u) — the reduction would silently run over a partial window and ")
+				TEXT("return a band that is not an outer bound of the columns asked about"),
+				Req.BandOriginI, EndI, Req.BandOriginJ, EndJ, Cx, Cy);
 			return false;
 		}
 	}
@@ -521,6 +528,7 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 		FVoxelBandReduceCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelBandReduceCS::FParameters>();
 		FillLooseParameters(*Params, Request);
 		Params->BandOriginI = Request.BandOriginI;
+		Params->BandOriginJ = Request.BandOriginJ;
 		Params->BandEdge = Request.BandEdge;
 		Params->ElevationMm = GraphBuilder.CreateSRV(ElevationBuffer);
 		Params->InColumns = GraphBuilder.CreateSRV(Out.Columns);

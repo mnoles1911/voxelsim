@@ -73,16 +73,32 @@ static const int64_t kBandI64Min = -kBandI64Max - (int64_t)1;
 // 32-voxel chunk plus its one-column apron). Passed in rather than derived so
 // this kernel does not need to know what a render chunk is.
 //
-// ONE scalar for both axes, not two. The production grid is symmetric (a
-// 48-column chunk dispatch has an 8-brick halo and a 1-column apron, so the
-// band starts at column 7 on both axes), and the window is square, so a max/min
-// reduction over it is transposition-invariant: an x/y index swap in the loop
-// below could not change the answer even if it existed. Two origins would add
-// API surface to test for a bug class that cannot exist here.
+// TWO origins, and the reason is TEST REACH rather than production need.
 //
-// ValidateRegionRequest rejects BandOriginI + BandEdge > DispatchColumns rather
-// than letting the bounds guard below silently reduce over a partial window.
+// The original single scalar was correctly argued: the production grid is
+// symmetric (a 48-column chunk dispatch has an 8-brick halo and a 1-column
+// apron, so the band starts at column 7 on BOTH axes), the window is square,
+// and a max/min reduction over it is transposition-invariant -- an x/y index
+// swap could not change the answer. For production that argument still holds
+// and BandOriginJ is simply set equal to BandOriginI.
+//
+// What it also did, though, was pin every SINGLE-COLUMN probe to the diagonal,
+// because a 1x1 window can only sit at (k, k). That is 64 of a 64x64 fixture's
+// 4,096 columns, and the D6 sweep's first real run reported the consequence in
+// its own words: "NO cave or cavern column anywhere on the diagonal, so the
+// single-column probes exercise only surfaceTop + 1" -- leaving the cave-segment
+// loop, the shaft term, the bedrock clamps and ceilSqrt uncovered. That is
+// exactly the code the INT64 sentinel bug above lived in.
+//
+// So the second origin exists to let a probe reach ANY column. Production
+// symmetry is unaffected; the gate gets 64x the reachable population.
+//
+// ValidateRegionRequest rejects either origin + BandEdge > DispatchColumns
+// rather than letting the bounds guard below silently reduce over a PARTIAL
+// window -- a band that is not an outer bound of the columns asked about, in
+// the unsafe direction.
 uint BandOriginI;
+uint BandOriginJ;
 uint BandEdge;
 
 // Two ints: the max of ColumnSurfaceTopVoxel and the min of
@@ -230,7 +246,7 @@ void BandReduceMain(uint3 gtid : SV_GroupThreadID)
         const uint bi = c % BandEdge;
         const uint bj = c / BandEdge;
         const uint dx = BandOriginI + bi;
-        const uint dy = BandOriginI + bj;
+        const uint dy = BandOriginJ + bj;
         if (dx >= DispatchColumns.x || dy >= DispatchColumns.y)
         {
             continue;   // the caller sized the dispatch wrong; skip rather than read out of bounds

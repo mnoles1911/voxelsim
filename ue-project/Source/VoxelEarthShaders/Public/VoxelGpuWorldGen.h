@@ -103,6 +103,10 @@ struct FVoxelGpuRegionRequest
 	// Only one chunk per (X,Y) footprint needs to ask for it, which is why it
 	// is opt-in per request rather than implied by bMeshChain.
 	uint32 BandOriginI = 0;
+	// Y origin of the band window. Production sets it equal to BandOriginI (the
+	// window is symmetric); it exists so a single-column PROBE can sit anywhere
+	// in the dispatch instead of only on the diagonal. See VoxelBandReduce.usf.
+	uint32 BandOriginJ = 0;
 	uint32 BandEdge = 0;
 };
 

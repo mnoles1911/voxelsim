@@ -6032,6 +6032,31 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	FVoxelGpuRegionRequest Req;
 	VoxelGpuChunkRegion::SetChunkFootprint(Req, LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z);
 	Req.Seed = Voxels.amplifier().seed();
+
+	// Ask for the band (D6), which is what lets the fork take a chunk whose
+	// footprint has not been seen before instead of leaving every cold column to
+	// the CPU.
+	//
+	// THE WINDOW, DERIVED RATHER THAN GUESSED. The worker job reduces over a
+	// 34x34 grid starting at (ChunkX*32 - 1, ChunkY*32 - 1) -- the chunk plus a
+	// one-column apron. SetChunkFootprint puts the dispatch origin at
+	// ChunkX*32 - 8, one brick of halo. So the band window begins 7 columns into
+	// the dispatch on both axes, and 7 + 34 = 41 <= 48, which is why
+	// ValidateRegionRequest accepts it.
+	//
+	// Getting this offset wrong would not fault: the kernel would reduce over a
+	// DIFFERENT 34x34 patch of real terrain and return a band that is plausible,
+	// self-consistent, and wrong for this footprint -- and wrong in whichever
+	// direction the neighbouring terrain happens to lie. The gate's
+	// "production-shaped window" probes exist for exactly this arithmetic.
+	static constexpr uint32 kBandApronOffset =
+		VoxelGpuChunkRegion::kBrickEdge - 1;                          // 8 - 1 = 7
+	static constexpr uint32 kBandGridEdge = VoxelCoords::ChunkEdgeVoxels + 2;  // 34
+	static_assert(kBandApronOffset + kBandGridEdge <= VoxelGpuChunkRegion::kColumns,
+	              "band window must fit inside the chunk dispatch");
+	Req.BandOriginI = kBandApronOffset;
+	Req.BandOriginJ = kBandApronOffset;
+	Req.BandEdge = kBandGridEdge;
 	// The one place the raster-window arithmetic may live -- see
 	// VoxelGpuRegionBuild's header. Undersizing it does not fault; the kernel
 	// clamps to the window edge and silently produces different terrain.
@@ -6075,11 +6100,24 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	Result.Key = Pending.Key;
 	Result.GenerationId = Pending.GenerationId;
 	Result.JobMs = float(GpuResult.SubmitToDeliverMs);
-	// bBandValid stays FALSE. The GPU has no verified band reduction yet (D6 is
-	// written, not built), and DrainResults declines to cache a band from a
-	// result that does not claim one. The fork only takes chunks whose band is
-	// already known, so nothing is waiting on this.
-	Result.bBandValid = false;
+
+	// The band, when the GPU produced one (D6). This is what lets the fork seed
+	// a cold footprint rather than leaving every cold column to the CPU.
+	//
+	// MakeFootprintBand is the SAME function the worker job calls, deliberately:
+	// the +1/-1 widening and the clamp stay on this side, so the GPU supplies
+	// two raw extrema and nothing about how a band is formed is mirrored into
+	// HLSL. Three producers now share it (worker job, this, and the gate), and
+	// that is exactly the drift this arrangement prevents.
+	//
+	// bBandValid is false rather than {0,0} when absent, because a zero band
+	// claims the footprint is EMPTY -- the unsafe direction.
+	Result.bBandValid = GpuResult.bBandValid;
+	if (GpuResult.bBandValid)
+	{
+		Result.Band = VoxelStreaming::MakeFootprintBand(GpuResult.BandMaxSurfaceTopVoxel,
+		                                               GpuResult.BandMinDeepestAirVoxel);
+	}
 
 	if (GpuResult.IsOk())
 	{
@@ -6487,31 +6525,34 @@ void FVoxelWorldImpl::DispatchJobs()
 		// JobsInFlightCounter decrement. That symmetry is the whole safety
 		// argument -- see the invariant quoted in DrainResults.
 		//
-		// WHY THIS EXCLUDES THE BAND SEED, which is the one condition here that
-		// is not obvious. A level-0 worker job also reduces the footprint's
-		// FFootprintBand out of the column grid it already built, and that band
-		// feeds two admission skips AND the cold-band throttle. The GPU has no
-		// verified band of its own yet: D6's reduction kernel exists but has
-		// never been executed, so by ground rule 13 it is written, not built.
-		// A GPU job therefore returns bBandValid = false, and DrainResults
-		// correctly declines to cache a band from it.
+		// THE BAND SEED USED TO BE EXCLUDED HERE, AND IS NOT ANY MORE.
 		//
-		// If such a job were allowed to SEED a cold footprint, the column would
-		// wait out kBlindJobMarkTimeoutSeconds and then re-dispatch -- not a
-		// correctness bug (the backstop catches it) but a throughput one, on
-		// every cold column, forever. So the fork only takes chunks whose
-		// footprint band is ALREADY known, or runs where nothing consults a band
-		// at all. In a settled cascade that is the large majority of level-0
-		// work, because a footprint column is many chunks deep and only its
-		// first job seeds.
-		const bool bBandAlreadyKnown =
-			!bComputeBand || FootprintBandCache.Contains(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y));
+		// A level-0 worker job also reduces the footprint's FFootprintBand out
+		// of the column grid it already built, and that band feeds two admission
+		// skips AND the cold-band throttle. When the fork could not produce one,
+		// it had to leave every cold footprint to the CPU -- and Wave F measured
+		// what that cost: at cold fill almost every level-0 chunk IS a seed, so
+		// the fork excluded precisely the population that dominates the number
+		// it was meant to improve, and 128 m cold fill was unchanged (60.4 s
+		// against 58.4 s, one log window at a 2 s sampling interval).
+		//
+		// D6's reduction kernel has now EXECUTED and passes its sweep, so
+		// SubmitGpuMeshJob asks for a band and OnGpuMeshJobComplete hands it to
+		// DrainResults through the same MakeFootprintBand the worker job uses.
+		// The fork can therefore seed a cold column, and this condition is gone.
+		//
+		// WHAT IS STILL TRUE AND STILL LIMITS IT: the gate's cave coverage. The
+		// sweep now searches all 4,096 columns of each fixture rather than the
+		// 64 on its diagonal, which is what makes the cave-segment loop, the
+		// shaft term, the bedrock clamps and ceilSqrt reachable at all. If a
+		// fixture reports no cave column anywhere, the sweep says so out loud
+		// and the band's cave path is untested on that terrain -- read the PASS
+		// lines accordingly before trusting this in production.
 		const bool bUseGpuMesh =
 			VoxelStreamAdmission::GpuMeshEnabled()
 			&& LevelKey.Level == 0        // D5 owns coarse levels; worldgen.ush has no level parameter
 			&& RingSkirtMask == 0         // no GPU equivalent yet -- see D5's skirt analysis
-			&& !bPredictedEmpty           // the band already says this meshes to nothing; do not pay a dispatch
-			&& bBandAlreadyKnown;
+			&& !bPredictedEmpty;          // the band already says this meshes to nothing; do not pay a dispatch
 
 		if (bUseGpuMesh && SubmitGpuMeshJob(LevelKey, GenId))
 		{
