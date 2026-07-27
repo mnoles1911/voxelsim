@@ -4998,16 +4998,35 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// shaders-side gate.
 	if (VoxelDebug::GetStreamLatencyStats())
 	{
+		// SAY SO IN THE LINE, not only in the comment above. Three of the five
+		// stage columns are zero rather than absent when the shaders-side gate is
+		// off, and "queued/dispatchToReady/readyToDeliver all read 0.0" is a
+		// publishable-looking result that would be an artifact of a cvar. This
+		// programme has already retracted one set of numbers and corrected two
+		// root-cause diagnoses; a reader of the log should not have to know which
+		// module owns which gate to avoid being the third.
+		//
+		// FindConsoleVariable rather than a VoxelDebug accessor because the cvar
+		// lives in VoxelEarthShaders, which has no VoxelDebug dependency -- same
+		// idiom ApplyMeshResult uses for voxel.Stream.GPUMaxChunks.
+		static const auto* CVarMeshLatencyStats =
+			IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.GPU.MeshLatencyStats"));
+		const bool bGpuStagesMeasured = CVarMeshLatencyStats && CVarMeshLatencyStats->GetInt() != 0;
+
 		const FMsPercentiles GpuQueued = ComputeMsPercentiles(GpuQueuedMsWindow, GpuQueuedMsWindowCount);
 		const FMsPercentiles GpuDispatchToReady = ComputeMsPercentiles(GpuDispatchToReadyMsWindow, GpuDispatchToReadyMsWindowCount);
 		const FMsPercentiles GpuReadyToDeliver = ComputeMsPercentiles(GpuReadyToDeliverMsWindow, GpuReadyToDeliverMsWindowCount);
 		const FMsPercentiles GpuSubmitToDeliver = ComputeMsPercentiles(GpuSubmitToDeliverMsWindow, GpuSubmitToDeliverMsWindowCount);
 		const FMsPercentiles GpuDeliverToApply = ComputeMsPercentiles(GpuDeliverToApplyMsWindow, GpuDeliverToApplyMsWindowCount);
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel GPU latency stages (5s window, n=%d): queued p50=%.1f p95=%.1f max=%.1f | ")
+		       TEXT("Voxel GPU latency stages (5s window, n=%d)%s: queued p50=%.1f p95=%.1f max=%.1f | ")
 		       TEXT("dispatchToReady p50=%.1f p95=%.1f max=%.1f | readyToDeliver p50=%.1f p95=%.1f max=%.1f | ")
 		       TEXT("submitToDeliver p50=%.1f p95=%.1f max=%.1f | deliverToApply p50=%.1f p95=%.1f max=%.1f (n=%d)"),
 		       GpuSubmitToDeliverMsWindowCount,
+		       bGpuStagesMeasured
+		           ? TEXT("")
+		           : TEXT(" [queued/dispatchToReady/readyToDeliver NOT MEASURED -- set voxel.GPU.MeshLatencyStats 1; "
+		                  "the zeros below are the gate, not the pipeline]"),
 		       GpuQueued.P50, GpuQueued.P95, GpuQueued.Max,
 		       GpuDispatchToReady.P50, GpuDispatchToReady.P95, GpuDispatchToReady.Max,
 		       GpuReadyToDeliver.P50, GpuReadyToDeliver.P95, GpuReadyToDeliver.Max,
