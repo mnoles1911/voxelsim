@@ -4133,10 +4133,49 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			GpuMeshJobs->Tick();
 		}
 		const double T1 = FPlatformTime::Seconds();
-		DrainResults(Owner, Root, Material);
-		const double T2 = FPlatformTime::Seconds();
-		DrainGameThreadMesh(Owner, Root, Material);
-		const double T3 = FPlatformTime::Seconds();
+
+		// S1-1 (docs/speculative-generation-plan.md Wave S1): ONE pool
+		// publication for this whole tick instead of one per mutated chunk.
+		//
+		// SCOPE BOUNDS ARE THE DESIGN. It opens here, before DrainResults, and
+		// closes after DrainUnloads -- so every add this tick makes and every
+		// remove it makes ride the same render command. It deliberately does NOT
+		// wrap the first DispatchJobs (above, at T0): that submits jobs and
+		// touches no pool state, so including it would widen the scope for
+		// nothing. The SECOND DispatchJobs falls inside these bounds by position
+		// and that is harmless for the same reason.
+		//
+		// It also deliberately does not wrap the whole tick. ApplyMeshResult is
+		// reachable from the edit path (ApplyGroupedEdits -> the game-thread
+		// re-mesh), which must keep publishing on its own -- an edit is a
+		// user-visible single event, not part of a streaming batch.
+		//
+		// Null pool is fine and is the ordinary case on the first frames: the
+		// pool is created lazily inside ApplyMeshResult, so a scope opened before
+		// it exists simply does not engage and those applies publish per-chunk,
+		// exactly as they did before. FScopedBatch holds a weak pointer.
+		//
+		// WITH THE GATE OFF this costs one increment, one decrement and one bool
+		// test per tick, and every mutator flushes exactly as it always has.
+		//
+		// COST ATTRIBUTION, so the tick-budget line is not read wrongly: the
+		// flush runs at the close, so with batching ON the tick's single
+		// publication lands in ThisFrameUnloadMs rather than being spread across
+		// ApplyMs. The publication's real cost, split across both threads, is the
+		// `Voxel pool publish` line from S0-1 -- read that, not the unload bucket.
+		// Declared out here, assigned inside: the scope has to close before T4 so
+		// the flush is inside the measured tick, but these are read by the
+		// attribution below it.
+		double T2 = T1;
+		double T3 = T1;
+		double T3b = T1;
+		{
+			UVoxelGpuPoolComponent::FScopedBatch PoolBatch(GpuPool.Get());
+
+			DrainResults(Owner, Root, Material);
+			T2 = FPlatformTime::Seconds();
+			DrainGameThreadMesh(Owner, Root, Material);
+			T3 = FPlatformTime::Seconds();
 
 		// Second DispatchJobs() pass (voxel.Stream.DispatchAfterDrain, default
 		// 1) -- refills the slots DrainResults just freed IN THIS FRAME rather
@@ -4169,14 +4208,15 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		// delta) when the cvar is off or the gate skips, so UnloadMs stays
 		// exactly (T4 - T3) in that case -- byte-identical to the old
 		// single-dispatch behaviour.
-		double T3b = T3;
-		if (VoxelDebug::GetStreamDispatchAfterDrain() != 0 && PendingJobNum() > 0)
-		{
-			DispatchJobs();
-			T3b = FPlatformTime::Seconds();
-		}
+			T3b = T3;
+			if (VoxelDebug::GetStreamDispatchAfterDrain() != 0 && PendingJobNum() > 0)
+			{
+				DispatchJobs();
+				T3b = FPlatformTime::Seconds();
+			}
 
-		DrainUnloads();
+			DrainUnloads();
+		} // PoolBatch closes here -- the tick's single publication happens now.
 		const double T4 = FPlatformTime::Seconds();
 
 		// Hitch attribution timing (docs/status.md "Perf-run hitches"
@@ -4779,6 +4819,26 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       double(Push.AllocationsWalked) / PerBuild, double(Push.RunsEmitted) / PerBuild,
 		       Push.TableCopyMs, Push.BuildRunsMs,
 		       Push.RunBoundsMs, (long long)Push.RunBoundsCalls, (long long)Push.RunBoundsRunsWalked);
+
+		// S1-1's hazard counter. Cumulative, not per-window, because what matters
+		// is "did this EVER fire on this run" -- see UnmarkQuadsDirty. Non-zero
+		// proves the same-frame free-then-GPU-write race is real AND handled;
+		// zero across a full flight means either it cannot occur or the subtract
+		// is not wired, and those two must not be read as the same thing.
+		// The gate lives in VoxelEarthShaders (no VoxelDebug dependency), so it is
+		// read the same way ApplyMeshResult reads voxel.Stream.GPUMaxChunks.
+		// Echoed on the line because "dirtyOverlapsResolved=0" means two entirely
+		// different things depending on whether batching was even on.
+		static const auto* CVarBatchPublish =
+			IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.Stream.PoolBatchPublish"));
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel pool batch: batchPublish=%d dirtyOverlapsResolved=%lld (%lld quads, cumulative) ")
+		       TEXT("gpuDirectWritesDropped=%d allocFail=%lld"),
+		       CVarBatchPublish ? CVarBatchPublish->GetInt() : -1,
+		       (long long)Pool->GetDirtyOverlapsResolved(),
+		       (long long)Pool->GetDirtyOverlapQuadsResolved(),
+		       Pool->GetGpuDirectWritesDropped(),
+		       (long long)Pool->GetAllocFailureCount());
 	}
 
 	{

@@ -680,6 +680,30 @@ void RemeshDirtyBricks(FVoxelWaterImpl& Impl, AActor* ChunkOwner, USceneComponen
 	int32 MeshesThisTick = 0;
 	int32 DeferredCount = 0;
 
+	// S1-1: the water pool is batched too, and this is a DELIBERATE decision
+	// rather than an inherited one (docs/speculative-generation-plan.md asks for
+	// it to be stated either way).
+	//
+	// BATCHED, for the same reason terrain is: this loop calls AddChunk /
+	// UpdateChunk / RemoveChunk once per dirty brick, each of which ends in its
+	// own PushUpdatesToProxy, and water re-meshes at 10 Hz with bricks appearing
+	// and vanishing continuously -- the churn that made FreeChunkIds necessary in
+	// the first place. Per-brick publication is exactly the tax S0 measured on
+	// the terrain side.
+	//
+	// AND IT IS STRICTLY SAFER HERE. The whole hazard batching introduces is the
+	// same-frame free-then-GPU-write race that UnmarkQuadsDirty exists to close,
+	// and it needs a PENDING GPU WRITE to occur at all. Water only ever reaches
+	// the pool through AddChunk/UpdateChunk -- the CPU path, which writes the
+	// shadow and marks it dirty. Nothing in this subsystem calls AddChunkFromGpu,
+	// so PendingGpuWrites is always empty for this instance and the race has no
+	// way to happen. If that ever changes, this scope inherits the terrain fix
+	// automatically, because the subtract lives in AddChunkFromGpu itself.
+	//
+	// The component path below (the non-pooled arm) is untouched by this: it owns
+	// UWaterChunkComponents, not pool ranges.
+	UVoxelGpuPoolComponent::FScopedBatch WaterPoolBatch(Impl.Pool.Get());
+
 	for (const VoxelCoords::FVoxelCoord& BrickCoord : ToProcess)
 	{
 		const vxc::BrickKey Key = ToBrickKey(BrickCoord);

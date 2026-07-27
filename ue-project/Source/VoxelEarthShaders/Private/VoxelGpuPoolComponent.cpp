@@ -44,6 +44,34 @@ static FAutoConsoleVariableRef CVarVoxelPoolPushStats(
 	TEXT("APPLIED CHUNK and rests the whole batching wave on that estimate; this is what measures it."),
 	ECVF_Default);
 
+// S1-1 (docs/speculative-generation-plan.md Wave S1): publish once per frame
+// instead of once per mutated chunk.
+//
+// DEFAULT 0 = BYTE-IDENTICAL TO TODAY. Every mutator still calls
+// PushUpdatesToProxy and, with this off, PushUpdatesToProxy still flushes
+// immediately, so the flag off is not "batching with depth 0" -- it is the old
+// code path, reachable without an FScopedBatch anywhere in it.
+//
+// What it is worth, measured before it was built
+// (docs/measurements/s0-apply-census-2026-07-27.txt): the publication is 98-99%
+// of per-apply cost and runs 0.275 ms early in a fill, 2.108 ms under flight,
+// once per applied chunk AND once per unload. Batching divides that by
+// applies-per-frame.
+//
+// READ UnmarkQuadsDirty BEFORE FLIPPING THIS. Batching inverts an ordering that
+// per-chunk flushes were providing for free, and the failure mode is invisible
+// terrain that reports as loaded.
+static int32 GVoxelPoolBatchPublish = 0;
+static FAutoConsoleVariableRef CVarVoxelPoolBatchPublish(
+	TEXT("voxel.Stream.PoolBatchPublish"),
+	GVoxelPoolBatchPublish,
+	TEXT("1 = accumulate pool adds/removes across a streaming tick and publish ONCE at the end of it, ")
+	TEXT("instead of once per mutated chunk. Default 0 (byte-identical to the per-chunk path). ")
+	TEXT("S0 measured the publication at 98-99% of per-apply cost, rising to 2.1ms per apply under ")
+	TEXT("flight; this is the lever that amortises it. Requires the UnmarkQuadsDirty subtract to be ")
+	TEXT("correct -- see its comment for the same-frame free-then-GPU-write race batching creates."),
+	ECVF_Default);
+
 // Draws every chunk in the pool with a single mesh batch.
 namespace VoxelGpuPoolCull
 {
@@ -2122,6 +2150,22 @@ int32 UVoxelGpuPoolComponent::AddChunkFromGpu(const FVoxelGpuQuadPayloadRef& Src
 	// dirty would upload the shadow's ZEROS straight over the geometry that pass
 	// is about to write. See PooledQuads for why leaving the shadow zeroed is the
 	// safe direction rather than merely the cheap one.
+	//
+	// S1-1: AND IT MUST ACTIVELY UN-MARK THE RANGE, not merely decline to mark it.
+	// Not marking is sufficient only while every mutation publishes on its own.
+	// Batched, a RemoveChunk earlier in the same tick may already have marked this
+	// exact range dirty (it stamps hidden ids over the quads it frees), and that
+	// interval would ride the same command as this write -- landing AFTER it,
+	// because the copy passes are recorded first. The freed range's stale ids
+	// would be written over geometry the compute pass just produced, and the
+	// result is terrain that is invisible and reports as loaded.
+	//
+	// Unconditional, not gated on GVoxelPoolBatchPublish: with batching off the
+	// list cannot contain an overlap at this point, so this is a no-op that costs
+	// one length check -- and a subtract that only runs when a flag is set is a
+	// subtract that is untested every time the flag is off.
+	UnmarkQuadsDirty(Alloc.Offset, NumQuads);
+
 	const int32 Handle = Allocations.Add(Alloc);
 	AllocationChunkIds.Add(ChunkId);
 	check(AllocationChunkIds.Num() == Allocations.Num());
@@ -2279,6 +2323,67 @@ void UVoxelGpuPoolComponent::MarkQuadsDirty(uint32 First, uint32 Count)
 	}
 }
 
+// The subtract. See the declaration for WHY this exists -- it is what makes
+// S1-1's batching safe, and without it batching silently corrupts geometry.
+void UVoxelGpuPoolComponent::UnmarkQuadsDirty(uint32 First, uint32 Count)
+{
+	if (Count == 0 || DirtyQuadRanges.Num() == 0)
+	{
+		return;
+	}
+	const uint32 Last = First + Count - 1;
+
+	bool bTouchedAnything = false;
+	// Walk backwards: the two-interval split case inserts, and inserting behind
+	// the cursor is what keeps this a single pass. Same linear-is-right argument
+	// as MarkQuadsDirty -- the list holds one entry per CPU-written chunk since
+	// the last flush.
+	for (int32 I = DirtyQuadRanges.Num() - 1; I >= 0; --I)
+	{
+		FDirtyRange& R = DirtyQuadRanges[I];
+		if (R.Last < First || R.First > Last)
+		{
+			continue; // disjoint
+		}
+
+		// Quads actually reclaimed from the upload, for the counter. Computed
+		// before the interval is mutated.
+		const uint32 OverlapFirst = FMath::Max(R.First, First);
+		const uint32 OverlapLast = FMath::Min(R.Last, Last);
+		DirtyOverlapQuadsResolved += int64(OverlapLast - OverlapFirst + 1);
+		bTouchedAnything = true;
+
+		const bool bKeepHead = R.First < First;   // [R.First, First-1] survives
+		const bool bKeepTail = R.Last > Last;     // [Last+1, R.Last]   survives
+
+		if (bKeepHead && bKeepTail)
+		{
+			// The removed range is strictly inside this one: split in two.
+			const FDirtyRange Tail{ Last + 1, R.Last, true };
+			R.Last = First - 1;
+			DirtyQuadRanges.Insert(Tail, I + 1);
+		}
+		else if (bKeepHead)
+		{
+			R.Last = First - 1;
+		}
+		else if (bKeepTail)
+		{
+			R.First = Last + 1;
+		}
+		else
+		{
+			// Fully covered.
+			DirtyQuadRanges.RemoveAt(I, EAllowShrinking::No);
+		}
+	}
+
+	if (bTouchedAnything)
+	{
+		++DirtyOverlapsResolved;
+	}
+}
+
 // Records every pending write's copy pass into GraphBuilder. RENDER THREAD.
 //
 // Shared by the two places a flush can happen -- folded into the incremental
@@ -2386,7 +2491,56 @@ void UVoxelGpuPoolComponent::FlushGpuWritesStandalone(TArray<FPendingGpuWrite>&&
 	});
 }
 
+UVoxelGpuPoolComponent::FScopedBatch::FScopedBatch(UVoxelGpuPoolComponent* InPool)
+	: Pool(InPool)
+{
+	if (UVoxelGpuPoolComponent* P = Pool.Get())
+	{
+		++P->BatchDepth;
+	}
+}
+
+UVoxelGpuPoolComponent::FScopedBatch::~FScopedBatch()
+{
+	UVoxelGpuPoolComponent* P = Pool.Get();
+	if (P == nullptr)
+	{
+		// The component was collected inside the scope. Nothing to flush into,
+		// and nothing to leak -- the pending writes died with it.
+		return;
+	}
+
+	P->BatchDepth = FMath::Max(0, P->BatchDepth - 1);
+	if (P->BatchDepth > 0)
+	{
+		return; // inner scope; the outermost one publishes
+	}
+
+	// FLUSH ON THE OUTERMOST CLOSE, AND ONLY IF SOMETHING ASKED FOR ONE.
+	// bFlushPending is what makes an idle tick free: a scope opened around a
+	// drain that applied nothing costs one increment, one decrement and one bool
+	// test, not a publication of an unchanged table.
+	if (P->bFlushPending)
+	{
+		P->bFlushPending = false;
+		P->FlushUpdatesToProxy();
+	}
+}
+
+// THE DEFER POINT. Every mutator still calls this and none of them know about
+// batching; whether it publishes now or records that a publication is owed is
+// decided here and nowhere else.
 void UVoxelGpuPoolComponent::PushUpdatesToProxy()
+{
+	if (GVoxelPoolBatchPublish != 0 && BatchDepth > 0)
+	{
+		bFlushPending = true;
+		return;
+	}
+	FlushUpdatesToProxy();
+}
+
+void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 {
 	// Taken FIRST, on every path out of this function. A pending write that
 	// survived a call to PushUpdatesToProxy would be flushed against a later

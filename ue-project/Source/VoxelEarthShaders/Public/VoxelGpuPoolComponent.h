@@ -364,6 +364,48 @@ public:
 	// runs once per publication.
 	int32 GetNumAllocationsEver() const { return Allocations.Num(); }
 
+	// S1-1's hazard counter -- see UnmarkQuadsDirty. Non-zero on the first
+	// batched leg proves the free-then-reallocate-in-one-frame race is REAL and
+	// is being handled; zero across a full flight means either it cannot occur or
+	// the call is not wired, and those must not be confused with each other.
+	int64 GetDirtyOverlapsResolved() const { return DirtyOverlapsResolved; }
+	int64 GetDirtyOverlapQuadsResolved() const { return DirtyOverlapQuadsResolved; }
+
+	// Hold one of these across a run of adds/removes and they publish ONCE, at
+	// the outermost close, instead of once each (S1-1,
+	// docs/speculative-generation-plan.md; measured in
+	// docs/measurements/s0-apply-census-2026-07-27.txt).
+	//
+	// WHY THIS IS THE WAVE. Every AddChunk / AddChunkFromGpu / UpdateChunk /
+	// RemoveChunk ends in its own PushUpdatesToProxy, and S0 measured what one of
+	// those costs: 0.275 ms early in a fill, 2.108 ms under flight, of which
+	// 98-99% is this publication. The dirty-range machinery already accumulates
+	// correctly across several mutations -- DirtyQuadRanges coalesces,
+	// bChunkTableDirty and bRunsDirty are latches -- so the ONLY thing forcing
+	// per-chunk cost is the eager flush at the bottom of each mutator. This
+	// removes that, and nothing else.
+	//
+	// Re-entrant by depth, because ApplyMeshResult is reachable from the edit
+	// path as well as the streaming tick and must keep its existing flush
+	// semantics when it is not inside a scope.
+	//
+	// GATED: with voxel.Stream.PoolBatchPublish 0 (the default) this is inert and
+	// every mutator flushes exactly as it did before.
+	class VOXELEARTHSHADERS_API FScopedBatch
+	{
+	public:
+		explicit FScopedBatch(UVoxelGpuPoolComponent* InPool);
+		~FScopedBatch();
+
+		// Non-copyable, non-movable: the depth counter is the whole mechanism and
+		// a stray copy would decrement it twice.
+		FScopedBatch(const FScopedBatch&) = delete;
+		FScopedBatch& operator=(const FScopedBatch&) = delete;
+
+	private:
+		TWeakObjectPtr<UVoxelGpuPoolComponent> Pool;
+	};
+
 	void SetChunkMaterial(UMaterialInterface* InMaterial);
 	UMaterialInterface* GetChunkMaterialOrDefault() const;
 
@@ -563,6 +605,55 @@ private:
 	// the writes so the main branch can fold them into ITS command instead.
 	TArray<FPendingGpuWrite> TakePendingGpuWrites();
 	void FlushGpuWritesStandalone(TArray<FPendingGpuWrite>&& Writes);
+
+	// --- S1-1 batched publication ------------------------------------------
+	//
+	// The real body of what PushUpdatesToProxy used to do. PushUpdatesToProxy is
+	// now the DEFER POINT and this is the DO IT point; FScopedBatch is what sits
+	// between them. Split this way round so every existing mutator keeps calling
+	// PushUpdatesToProxy and none of them had to learn about batching.
+	void FlushUpdatesToProxy();
+
+	// Open scopes. >0 means a mutator's PushUpdatesToProxy only records that a
+	// flush is owed. Depth rather than a bool because ApplyMeshResult is reachable
+	// from the edit path as well as the streaming tick.
+	// (FScopedBatch is a nested class, so it already has access to these -- no
+	// friend declaration, which would name a DIFFERENT class at namespace scope.)
+	int32 BatchDepth = 0;
+	bool bFlushPending = false;
+
+	// The interval SUBTRACT, and the reason the batching above is not simply a
+	// deferral. THIS IS THE ONE GENUINELY DANGEROUS PART OF S1-1.
+	//
+	// Unbatched, every add and remove flushes its own render command, so a free's
+	// hidden-id upload always lands in an EARLIER command than a later add's GPU
+	// write. Batched into one command that ordering inverts: within a single
+	// command VoxelGpuPoolAddWritePasses runs FIRST (that is D1's whole
+	// correctness argument -- see FPendingGpuWrite) and the merged
+	// DirtyQuadRanges upload runs AFTER it. So a range that was freed and then
+	// re-issued to a GPU-meshed chunk IN THE SAME FRAME would have the freed
+	// range's stale hidden ids written straight over the geometry the compute
+	// pass just wrote.
+	//
+	// The symptom is the worst kind this pool produces: INVISIBLE TERRAIN THAT
+	// REPORTS AS LOADED. No counter moves, the chunk is resident, the run is
+	// valid, and the quads decode to a degenerate point.
+	//
+	// The fix is to subtract, not to reorder. For a range the GPU is about to
+	// write, the authoritative content is that pending write; any dirty interval
+	// still covering it is stale CPU shadow by definition. So AddChunkFromGpu
+	// removes its allocated range from DirtyQuadRanges immediately after a
+	// successful Pool.Alloc, splitting any interval that straddles it. Mirrors
+	// MarkQuadsDirty's insert-and-coalesce.
+	//
+	// Counted, because a hazard that never fires and a fix that is not wired up
+	// look identical from the outside: PoolDirtyOverlapsResolved non-zero on the
+	// first leg proves the race is real AND handled; zero across a full flight
+	// means either it cannot occur or this is not being called, and both are
+	// worth knowing before the gate is flipped.
+	void UnmarkQuadsDirty(uint32 First, uint32 Count);
+	int64 DirtyOverlapsResolved = 0;
+	int64 DirtyOverlapQuadsResolved = 0;
 
 	// Set whenever the set of live ALLOCATIONS changes -- which is not the same
 	// event as the chunk table changing, and conflating the two is what made the
