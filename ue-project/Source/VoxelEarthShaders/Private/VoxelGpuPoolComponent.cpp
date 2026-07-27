@@ -72,6 +72,35 @@ static FAutoConsoleVariableRef CVarVoxelPoolBatchPublish(
 	TEXT("correct -- see its comment for the same-frame free-then-GPU-write race batching creates."),
 	ECVF_Default);
 
+// S1-2 (docs/speculative-generation-plan.md Wave S1, §2.2): let a removed
+// chunk's Allocations slot be REUSED by the next add, instead of Allocations
+// only ever growing.
+//
+// DEFAULT 0 = BYTE-IDENTICAL TO TODAY. Gates the PUSH side only (see
+// FreeHandles): with this off, RemoveChunkInternal never pushes a handle, so
+// the free list stays empty forever and AddChunk/AddChunkFromGpu always
+// append, exactly as before this cvar existed.
+//
+// What it is worth, measured before it was built
+// (docs/measurements/s0-apply-census-2026-07-27.txt, "NEW FINDING 1"):
+// Allocations is append-only today, so BuildChunkRuns's Reserve()-and-walk
+// tracks chunks EVER ADDED, not resident, and its cost is unbounded in session
+// length. Over one 120s flight leg mean allocations walked climbed 28,042 ->
+// 68,416 while live runs emitted FELL 28,042 -> 18,389 -- a 3.72x and rising
+// ratio of wasted walk on every publication. GetFreeHandleCount() is logged
+// alongside allocsEver on the "Voxel GPU pool:" line so this is visible as it
+// works.
+static int32 GVoxelPoolRecycleHandles = 0;
+static FAutoConsoleVariableRef CVarVoxelPoolRecycleHandles(
+	TEXT("voxel.Stream.PoolRecycleHandles"),
+	GVoxelPoolRecycleHandles,
+	TEXT("1 = RemoveChunkInternal pushes its freed Allocations handle onto a LIFO free list, ")
+	TEXT("and AddChunk/AddChunkFromGpu pop from it before appending a new one. Default 0 ")
+	TEXT("(byte-identical to before this existed: the free list stays empty and every add ")
+	TEXT("appends). Fixes BuildChunkRuns walking chunks-ever-added instead of chunks-resident -- ")
+	TEXT("see NEW FINDING 1 in docs/measurements/s0-apply-census-2026-07-27.txt."),
+	ECVF_Default);
+
 // Draws every chunk in the pool with a single mesh batch.
 namespace VoxelGpuPoolCull
 {
@@ -1946,6 +1975,7 @@ void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 
 	Allocations.Reset();
 	AllocationChunkIds.Reset();
+	FreeHandles.Reset();
 	NumLiveChunks = 0;
 	LocalBounds = FBox(ForceInit);
 	DirtyQuadRanges.Reset();
@@ -1992,6 +2022,25 @@ void UVoxelGpuPoolComponent::MaybeLogSaturation(bool bAllocFailed)
 	       TEXT("fail to appear; resize with -VoxelPoolCapacityQuads or shrink the cascade."),
 	       *PoolName, Capacity, Resident, Pct,
 	       bAllocFailed ? TEXT(" -- an allocation just failed") : TEXT(" -- crossed the 95% watch line"));
+}
+
+// S1-2. The single acquire path AddChunk and AddChunkFromGpu both call --
+// see FreeHandles for why there must be only one of these rather than each
+// caller re-implementing "pop if available, else append".
+int32 UVoxelGpuPoolComponent::AcquireAllocationHandle(const FVoxelGpuPoolAllocation& Alloc, uint32 ChunkId)
+{
+	if (FreeHandles.Num() > 0)
+	{
+		const int32 Handle = FreeHandles.Pop(EAllowShrinking::No);
+		Allocations[Handle] = Alloc;
+		AllocationChunkIds[Handle] = ChunkId;
+		check(AllocationChunkIds.Num() == Allocations.Num());
+		return Handle;
+	}
+	const int32 Handle = Allocations.Add(Alloc);
+	AllocationChunkIds.Add(ChunkId);
+	check(AllocationChunkIds.Num() == Allocations.Num());
+	return Handle;
 }
 
 int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
@@ -2059,9 +2108,7 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 		QuadChunkIds[int32(Alloc.Offset) + I] = ChunkId;
 	}
 
-	const int32 Handle = Allocations.Add(Alloc);
-	AllocationChunkIds.Add(ChunkId);
-	check(AllocationChunkIds.Num() == Allocations.Num());
+	const int32 Handle = AcquireAllocationHandle(Alloc, ChunkId);
 	++NumLiveChunks;
 
 	// Grow the bounds by this chunk's extent. A chunk's quads never leave its
@@ -2166,9 +2213,7 @@ int32 UVoxelGpuPoolComponent::AddChunkFromGpu(const FVoxelGpuQuadPayloadRef& Src
 	// subtract that is untested every time the flag is off.
 	UnmarkQuadsDirty(Alloc.Offset, NumQuads);
 
-	const int32 Handle = Allocations.Add(Alloc);
-	AllocationChunkIds.Add(ChunkId);
-	check(AllocationChunkIds.Num() == Allocations.Num());
+	const int32 Handle = AcquireAllocationHandle(Alloc, ChunkId);
 	++NumLiveChunks;
 
 	const float EdgeUU = float(ChunkEdgeVoxels) * 10.0f * Scale;
@@ -2228,6 +2273,22 @@ void UVoxelGpuPoolComponent::RemoveChunkInternal(int32 Handle, bool bRecycleChun
 	Pool.Free(Alloc);
 	Allocations[Handle] = FVoxelGpuPoolAllocation{};
 	--NumLiveChunks;
+
+	// S1-2: hand the slot back for AcquireAllocationHandle to reuse -- see
+	// FreeHandles. Gated on bRecycleChunkId for the SAME reason the ChunkId
+	// recycling just above is: UpdateChunk's realloc branch calls this with
+	// bRecycleChunkId=false because it is not really removing this chunk, it is
+	// about to write Allocations[Handle] itself a few lines later, reusing this
+	// EXACT handle. Pushing it here would let AcquireAllocationHandle hand the
+	// same index to an unrelated chunk before that write lands -- nothing
+	// currently runs between RemoveChunkInternal returning and that write inside
+	// UpdateChunk's single synchronous call, but recycling the handle anyway
+	// would be a landmine for the next person who inserts something in between,
+	// and the failure is two live chunks silently aliasing one pool slot.
+	if (bRecycleChunkId && GVoxelPoolRecycleHandles != 0)
+	{
+		FreeHandles.Add(Handle);
+	}
 
 	// The allocation set changed even when the table entry did not (the realloc
 	// caller keeps its entry), so the runs are stale either way.
