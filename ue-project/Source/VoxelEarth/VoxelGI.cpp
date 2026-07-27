@@ -441,6 +441,39 @@ void UVoxelGISubsystem::NotifyPooledChunkMeshUpdated(const FVector& ChunkOriginU
 	bHasState = true;
 }
 
+bool UVoxelGISubsystem::WantsChunkQuads(const FVector& ChunkOriginUU, int32 ChunkLevel) const
+{
+	// Same first two tests as NotifyPooledChunkMeshUpdated, in the same order.
+	if (!VoxelGI::IsEnabled())
+	{
+		return false;
+	}
+	if (ChunkLevel != 0)
+	{
+		return false;
+	}
+
+	// The radius test the voxelize drain applies (VoxRejectedRadius), widened.
+	//
+	// FieldCentreUU is last tick's view origin, which is the right thing to
+	// compare against and is why the margin is here: at 20 m/s the camera moves
+	// ~4.5 m across the fork's measured ~225 ms submit->deliver, against 17.5 m
+	// of slack at the default 7000 UU radius.
+	//
+	// WHAT THIS ACTUALLY COVERS TODAY, stated because it is easy to assume
+	// otherwise: voxel.GI.RadiusUU defaults to 7000 UU, which was deliberately
+	// larger than the OLD 64 m R0 ring (6400 UU). Since 2026-07-27 the shipped
+	// R0 is 128 m (12,800 UU), so with GI on the radius covers only the inner
+	// ~half of level 0: near-field level-0 chunks stay on the readback path for
+	// GI ingest, and outer-R0 -- including the leading edge under motion, the
+	// coverage-hole population -- goes direct along with levels 1-5. If
+	// voxel.GI.RadiusUU is ever raised toward the new R0 edge, GI ingest volume
+	// and readback traffic both grow with it. Both configurations are correct;
+	// the gate just tracks the configuration instead of assuming one.
+	const double RadiusUU = double(CVarGIRadiusUU.GetValueOnGameThread()) * 1.25;
+	return FVector::Dist(ChunkOriginUU, FieldCentreUU) <= RadiusUU;
+}
+
 void UVoxelGISubsystem::PushDirty(const FIntVector& Key)
 {
 	bool bAlready = false;

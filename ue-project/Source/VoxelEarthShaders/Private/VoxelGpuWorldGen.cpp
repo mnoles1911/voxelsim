@@ -248,6 +248,59 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutQuadTotal)
 		END_SHADER_PARAMETER_STRUCT()
 	};
+	// --- QuadCompactMain / QuadPoolWriteMain: the D1 copies ----------------
+	//
+	// Same reasoning as FVoxelQuadTotalCS above, one step further: these are not
+	// worldgen kernels, they do not #include worldgen.ush, and they have no
+	// business inside the version lock or the determinism digest. They also do
+	// not need SM6 -- copying a uint2 is not 64-bit integer maths -- so they gate
+	// on SM5 and say so, rather than inheriting a requirement they do not have.
+	//
+	// They live in THIS translation unit, next to the other kernel declarations,
+	// because IMPLEMENT_GLOBAL_SHADER must appear exactly once per class. Their
+	// callers are elsewhere and reach them through the two AddQuad*Pass functions
+	// declared in VoxelGpuWorldGenGraph.h.
+	class FVoxelQuadCompactCS : public FGlobalShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelQuadCompactCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelQuadCompactCS, FGlobalShader);
+
+		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+		{
+			return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+		}
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, SrcFirst)
+			SHADER_PARAMETER(uint32, NumQuads)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InQuads)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, OutQuads)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelQuadPoolWriteCS : public FGlobalShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelQuadPoolWriteCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelQuadPoolWriteCS, FGlobalShader);
+
+		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+		{
+			return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+		}
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, SrcFirst)
+			SHADER_PARAMETER(uint32, DstFirst)
+			SHADER_PARAMETER(uint32, NumQuads)
+			SHADER_PARAMETER(uint32, ChunkId)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InQuads)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, OutQuads)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkIds)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
 	// --- BandReduceMain: the footprint band (Wave D / D6) ------------------
 	//
 	// Derives from FVoxelWorldGenShader, unlike the quad-total kernel, because
@@ -281,6 +334,11 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelBandReduceCS, VOXEL_BAND_REDUCE_USF, "BandReduceMa
 #define VOXEL_QUAD_SCAN_USF "/VoxelEarth/VoxelQuadScan.usf"
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelQuadTotalCS,  VOXEL_QUAD_SCAN_USF, "QuadTotalMain",  SF_Compute);
+
+#define VOXEL_QUAD_POOL_WRITE_USF "/VoxelEarth/VoxelQuadPoolWrite.usf"
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelQuadCompactCS,   VOXEL_QUAD_POOL_WRITE_USF, "QuadCompactMain",   SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelQuadPoolWriteCS, VOXEL_QUAD_POOL_WRITE_USF, "QuadPoolWriteMain", SF_Compute);
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelColumnCS,     VOXEL_WORLDGEN_USF, "ColumnMain",     SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelVoxelizeCS,   VOXEL_WORLDGEN_USF, "VoxelizeMain",   SF_Compute);
@@ -702,6 +760,61 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	}
 
 	return Out;
+}
+
+// --- Wave D / D1: the two GPU-side quad copies -----------------------------
+//
+// Both dispatch one thread per LIVE quad, which is the only bound either kernel
+// has. The group size (64) is restated in the shader as an `i >= NumQuads`
+// early-out because the dispatch rounds up, so the tail threads of the last
+// group are real.
+
+void VoxelGpuWorldGen::AddQuadCompactPass(FRDGBuilder& GraphBuilder, FRDGBufferRef Dst, FRDGBufferRef Src,
+                                          uint32 SrcFirst, uint32 NumQuads)
+{
+	if (NumQuads == 0 || Dst == nullptr || Src == nullptr)
+	{
+		// A zero-quad chunk never reaches here -- the manager short-circuits it
+		// a phase earlier -- but a pass that dispatches nothing is worse than no
+		// pass, because it looks like work in a capture.
+		return;
+	}
+
+	FVoxelQuadCompactCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelQuadCompactCS::FParameters>();
+	Params->SrcFirst = SrcFirst;
+	Params->NumQuads = NumQuads;
+	Params->InQuads = GraphBuilder.CreateSRV(Src);
+	Params->OutQuads = GraphBuilder.CreateUAV(Dst);
+
+	TShaderMapRef<FVoxelQuadCompactCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(
+		GraphBuilder, RDG_EVENT_NAME("Voxel.QuadCompact(%u quads)", NumQuads), Shader, Params,
+		FIntVector(FMath::DivideAndRoundUp(NumQuads, 64u), 1, 1));
+}
+
+void VoxelGpuWorldGen::AddQuadPoolWritePass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstQuads, FRDGBufferRef DstIds,
+                                            FRDGBufferRef Src, uint32 SrcFirst, uint32 DstFirst,
+                                            uint32 NumQuads, uint32 ChunkId)
+{
+	if (NumQuads == 0 || DstQuads == nullptr || DstIds == nullptr || Src == nullptr)
+	{
+		return;
+	}
+
+	FVoxelQuadPoolWriteCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelQuadPoolWriteCS::FParameters>();
+	Params->SrcFirst = SrcFirst;
+	Params->DstFirst = DstFirst;
+	Params->NumQuads = NumQuads;
+	Params->ChunkId = ChunkId;
+	Params->InQuads = GraphBuilder.CreateSRV(Src);
+	Params->OutQuads = GraphBuilder.CreateUAV(DstQuads);
+	Params->OutChunkIds = GraphBuilder.CreateUAV(DstIds);
+
+	TShaderMapRef<FVoxelQuadPoolWriteCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(
+		GraphBuilder, RDG_EVENT_NAME("Voxel.QuadPoolWrite(chunk %u, %u quads @ %u)", ChunkId, NumQuads, DstFirst),
+		Shader, Params,
+		FIntVector(FMath::DivideAndRoundUp(NumQuads, 64u), 1, 1));
 }
 
 bool VoxelGpuWorldGen::IsSupportedOnCurrentRHI()

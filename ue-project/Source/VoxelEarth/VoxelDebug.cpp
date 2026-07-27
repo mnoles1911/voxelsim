@@ -329,6 +329,41 @@ TAutoConsoleVariable<int32> CVarVoxelStreamJobsInFlightPerCore(
 	TEXT("ever being dispatched. Raise to keep the task graph fed across frames. Watch stale%% in the job-flow census."),
 	ECVF_Default);
 
+// DispatchJobs tops the worker queue to MaxJobsInFlight once per TickStreaming
+// call, at the top of the budget block; DrainResults then runs and frees
+// slots as JobsInFlightCounter decrements. Those freed slots sit idle until
+// NEXT frame's dispatch -- the same once-per-frame refill cadence that the
+// JobsInFlightPerCore comment above measured at ~9% worker utilisation (24
+// slots x 1.32ms R0 jobs against a ~15ms frame, ~1,540 jobs/s dispatched
+// against an ~18,000/s slot capacity). Raising JobsInFlightPerCore 2->8
+// widens the buffer so starvation takes longer to bite, but does not touch
+// the cadence itself -- a wider queue still only gets topped up once a frame.
+//
+// This cvar adds a second DispatchJobs() call after DrainResults and
+// DrainGameThreadMesh (see TickStreaming), so slots freed earlier in THIS
+// frame get refilled in the SAME frame instead of sitting idle until the
+// next one. Gated on queue pressure (PendingJobNum() > 0 at the point of the
+// second call) so an idle frame -- nothing pending, workers caught up -- pays
+// only the PendingJobNum() scan and nothing else.
+//
+// Default OFF, AND THAT IS A MEASUREMENT (2026-07-27 cadence A/B, real-terrain
+// 20 m/s line flight, JobsInFlightPerCore already at 8): ON bought +0.2% chunks
+// on the CPU arm (92,249 vs 92,080 -- inside the same-config noise floor) and
+// nothing at all on the GPU arm (89,666 vs 89,588 the previous leg), while
+// COSTING 22 vs 8 hitches on the CPU arm. With a 96-job in-flight buffer the
+// once-per-frame top-up no longer starves anyone; the second call just lands
+// extra dispatch work inside already-busy frames. Kept as a lever because the
+// cold-fill case (queue perpetually saturated) was NOT part of that A/B and is
+// where a second top-up could still pay -- measure there before flipping.
+TAutoConsoleVariable<int32> CVarVoxelStreamDispatchAfterDrain(
+	TEXT("voxel.Stream.DispatchAfterDrain"),
+	0,
+	TEXT("Run a second DispatchJobs() pass after DrainResults/DrainGameThreadMesh, so slots freed earlier this frame ")
+	TEXT("are refilled same-frame instead of idling until next frame's dispatch. Default 0: with ")
+	TEXT("JobsInFlightPerCore=8 the motion A/B measured no throughput gain and +14 hitches (2026-07-27). ")
+	TEXT("Skipped cheaply when nothing is pending. A/B lever for cold-fill work."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxRemeshesPerFrame(
 	TEXT("voxel.Stream.MaxRemeshesPerFrame"),
 	8,
@@ -670,6 +705,11 @@ int32 VoxelDebug::GetStreamJobsInFlightPerCore()
 	const int32 Requested =
 		CommandLineOverride > 0 ? CommandLineOverride : CVarVoxelStreamJobsInFlightPerCore.GetValueOnGameThread();
 	return FMath::Clamp(Requested, 1, 64);
+}
+
+int32 VoxelDebug::GetStreamDispatchAfterDrain()
+{
+	return CVarVoxelStreamDispatchAfterDrain.GetValueOnGameThread();
 }
 
 int32 VoxelDebug::GetStreamMaxRemeshesPerFrame()

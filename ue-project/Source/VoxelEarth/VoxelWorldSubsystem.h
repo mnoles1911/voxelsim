@@ -89,13 +89,21 @@ public:
 	// (-VoxelRingInnerMeters=/-VoxelRingOuterMeters=) must be visible to every
 	// reader of ring radii, and GetRingPresets() is the only place that knows
 	// both the defaults and the override switches.
+	// ADOPTED 2026-07-27 (owner decision): R0 = 128 m, full cascade to 4 km --
+	// the Wave F configuration, promoted from override to default. Measured on
+	// real terrain the same day (docs/measurements/gpu-throughput-wave-2026-07-27
+	// .txt): settles at 39,020 chunks / 35,205,733 resident quads, identically
+	// on both meshers across four legs, in 80-86 s cold. The pool default in
+	// GetOrCreateGpuPool was resized from the same measurement. The annuli must
+	// still abut exactly (Outer[L] == Inner[L+1]) -- GetRingPresets() enforces
+	// it for overrides; for these defaults it holds by construction.
 	static constexpr FRingPreset kDefaultRingPresets[VoxelCoords::kNumLevels] = {
-		{0.0, 64.0},
-		{64.0, 128.0},
+		{0.0, 128.0},
 		{128.0, 256.0},
 		{256.0, 512.0},
 		{512.0, 1024.0},
-		{1024.0, 2048.0}, // R5: the 2 km cascade edge
+		{1024.0, 2048.0},
+		{2048.0, 4096.0}, // R5: the 4 km cascade edge
 	};
 	// A short initializer list here is silently zero-filled by C++, and the
 	// consequences are runtime-silent rather than loud: a {0,0} annulus admits no

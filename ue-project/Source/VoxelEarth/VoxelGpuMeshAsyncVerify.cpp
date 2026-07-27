@@ -35,9 +35,18 @@
 #include "VoxelChunkMesher.h"
 #include "VoxelCoords.h"
 #include "VoxelGpuMeshJobManager.h"
+#include "VoxelGpuPoolComponent.h"
 #include "VoxelGpuRegionBuild.h"
 #include "VoxelGpuWorldGen.h"
 #include "VoxelMeshTypes.h"
+
+#include "Engine/Engine.h"
+#include "Engine/World.h"
+#include "GameFramework/Actor.h"
+#include "RenderGraphBuilder.h"
+#include "RenderGraphUtils.h"
+#include "RenderingThread.h"
+#include "RHIGPUReadback.h"
 
 #include "voxelcore/amplifier.h"
 #include "voxelcore/core.h"
@@ -791,6 +800,562 @@ namespace VoxelGpuMeshAsyncVerify
 			       TEXT("[D5.3 skirt] FAIL — %d of 16 mask values disagree."), Failures);
 		}
 	}
+
+	// =====================================================================
+	// voxel.GPU.VerifyPoolWrite — the gate on D1 (no-readback GPU meshing)
+	// =====================================================================
+	//
+	// WHAT THIS PROVES THAT NOTHING ELSE CAN. voxel.GPU.VerifyAsyncMesh compares
+	// the quads the manager DELIVERS against MeshChunkBricks, and under
+	// voxel.GPU.MeshDirectToPool the manager delivers no quads at all -- so it
+	// goes quiet on exactly the path D1 adds. Everything the CPU still knows
+	// about a direct write (the allocation, the chunk-table entry, the run, the
+	// count) would be identical if the compute pass had written nothing, or
+	// written to the wrong offset, or written someone else's quads. The only
+	// honest check is to read the POOL BUFFER back and look.
+	//
+	// So this meshes K chunks through the manager in direct mode, applies each
+	// through UVoxelGpuPoolComponent::AddChunkFromGpu, then reads back the used
+	// prefix of both pool buffers and checks THREE things per chunk:
+	//
+	//   1. the quads at its allocated range are byte-identical to
+	//      MeshChunkBricks + PackVoxelChunkQuad -- the same CPU reference
+	//      voxel.GPU.VerifyAsyncMesh uses, and the shipping mesher rather than a
+	//      transcription of it;
+	//   2. every chunk id across that range is the id the pool issued -- a quad
+	//      with the wrong id draws at another chunk's origin, which is the
+	//      failure a picture is worst at showing;
+	//   3. the quads immediately OUTSIDE the range are untouched. Writing past
+	//      the end is the one new failure this design can produce and the only
+	//      one of the three that a per-chunk comparison would miss entirely.
+	//
+	// Run it with voxel.GPU.MeshDirectToPool 0 as well: the readback path must
+	// produce the same bytes through AddChunk. A gate with no control says
+	// nothing about either path.
+	struct FPoolWriteVerifyRun : public TSharedFromThis<FPoolWriteVerifyRun>
+	{
+		struct FChunkUnderTest
+		{
+			VoxelCoords::FVoxelChunkKey Key;
+			TArray<uint64> CpuQuads;
+			int32 PoolHandle = INDEX_NONE;
+			uint32 PoolFirst = 0;
+			uint32 PoolCount = 0;
+			uint32 ChunkId = 0;
+			bool bDelivered = false;
+			bool bApplied = false;
+			bool bWasDirect = false;
+		};
+
+		explicit FPoolWriteVerifyRun(int32 InNumChunks, int32 InMaxInFlight, double InStartDelay)
+			: Tiles(kSeed)
+			, CpuTiles(kSeed)
+			, CpuAmp(kSeed, CpuTiles)
+			, NumChunks(InNumChunks)
+			, MaxInFlight(InMaxInFlight)
+			, StartDelaySeconds(InStartDelay)
+			, Manager(FVoxelGpuMeshJobComplete::CreateRaw(this, &FPoolWriteVerifyRun::OnJobComplete),
+			          InMaxInFlight)
+		{
+		}
+
+		~FPoolWriteVerifyRun()
+		{
+			if (PoolOwner.IsValid())
+			{
+				PoolOwner->Destroy();
+			}
+		}
+
+		bool CreatePool()
+		{
+			UWorld* World = nullptr;
+			if (GEngine != nullptr)
+			{
+				for (const FWorldContext& Context : GEngine->GetWorldContexts())
+				{
+					if (Context.World() != nullptr && Context.World()->IsGameWorld())
+					{
+						World = Context.World();
+						break;
+					}
+				}
+			}
+			if (World == nullptr)
+			{
+				UE_LOG(LogVoxelGpuAsync, Error,
+				       TEXT("voxel.GPU.VerifyPoolWrite: no game world. This gate needs a live world — the "
+				            "pool's buffers are created by its first SCENE PROXY, which needs a registered "
+				            "component in a ticking world. Run it in PIE or with -game."));
+				return false;
+			}
+
+			FActorSpawnParameters Params;
+			Params.ObjectFlags |= RF_Transient;
+			AActor* Owner = World->SpawnActor<AActor>(AActor::StaticClass(), FVector::ZeroVector,
+			                                          FRotator::ZeroRotator, Params);
+			if (Owner == nullptr)
+			{
+				UE_LOG(LogVoxelGpuAsync, Error, TEXT("voxel.GPU.VerifyPoolWrite: could not spawn a pool actor"));
+				return false;
+			}
+			PoolOwner = Owner;
+
+			Pool = NewObject<UVoxelGpuPoolComponent>(Owner);
+			Pool->SetPoolName(TEXT("VoxelGpuPool.VerifyPoolWrite"));
+			Pool->SetChunkTableCapacity(FMath::Max(64, NumChunks * 4));
+			Owner->SetRootComponent(Pool.Get());
+			Pool->RegisterComponent();
+			// Generous: the whole point is that no chunk is refused for space, so
+			// an alloc failure here is unambiguously a bug rather than capacity.
+			Pool->InitPool(uint32(NumChunks + 1) * 98304u / 8u + 65536u);
+
+			// THE SEED CHUNK, and it is not padding. A pool's persistent buffers
+			// are created by its first scene proxy, and CreateSceneProxy returns
+			// null until something is in the pool -- so a direct write has nowhere
+			// to land until at least one chunk has arrived by the CPU path. That
+			// is the same bootstrap the streaming path has, exercised here on
+			// purpose rather than papered over: it is also the guard band the
+			// out-of-range check below reads.
+			TArray<uint64> Seed;
+			Seed.SetNumZeroed(kSeedQuads);
+			for (int32 I = 0; I < kSeedQuads; ++I)
+			{
+				Seed[I] = kGuardPattern ^ uint64(I);
+			}
+			SeedHandle = Pool->AddChunk(Seed, FVector3f::ZeroVector, 0);
+			return SeedHandle != INDEX_NONE;
+		}
+
+		void Start()
+		{
+			Chunks.SetNum(NumChunks);
+			const int32 Side = FMath::CeilToInt(FMath::Sqrt(double(NumChunks)));
+			for (int32 I = 0; I < NumChunks; ++I)
+			{
+				const int32 Cx = (I % Side) - Side / 2;
+				const int32 Cy = (I / Side) - Side / 2;
+				Chunks[I].Key = SurfaceChunkKey(CpuAmp, Cx, Cy);
+				Chunks[I].CpuQuads = CpuMeshChunkPacked(CpuAmp, Chunks[I].Key);
+			}
+
+			const IConsoleVariable* DirectCVar =
+				IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.GPU.MeshDirectToPool"));
+			const IConsoleVariable* ChunkLocalCVar =
+				IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.GPU.MeshChunkLocal"));
+			UE_LOG(LogVoxelGpuAsync, Log,
+			       TEXT("voxel.GPU.VerifyPoolWrite: %d chunks, %d in flight, seed %llu, "
+			            "MeshDirectToPool=%d MeshChunkLocal=%d, pool GPU-writable=%d. "
+			            "A PASS that does not say which path it tested is not evidence about either."),
+			       NumChunks, MaxInFlight, kSeed,
+			       DirectCVar ? DirectCVar->GetInt() : -1,
+			       ChunkLocalCVar ? ChunkLocalCVar->GetInt() : -1,
+			       Pool.IsValid() && Pool->IsGpuWritable() ? 1 : 0);
+
+			FirstSubmitSeconds = FPlatformTime::Seconds();
+			for (int32 I = 0; I < NumChunks; ++I)
+			{
+				Manager.Submit(BuildChunkRequest(Tiles, Chunks[I].Key), uint64(I),
+				               /*bRequestGpuResidentQuads*/ true);
+			}
+		}
+
+		void OnJobComplete(FVoxelGpuMeshJobResult&& Result)
+		{
+			const int32 Index = int32(Result.UserTag);
+			if (!Chunks.IsValidIndex(Index))
+			{
+				++NumDelivered;
+				return;
+			}
+			FChunkUnderTest& Chunk = Chunks[Index];
+			if (Chunk.bDelivered)
+			{
+				UE_LOG(LogVoxelGpuAsync, Error,
+				       TEXT("  chunk %d (%d,%d,%d) delivered TWICE"), Index, Chunk.Key.X, Chunk.Key.Y, Chunk.Key.Z);
+				++NumDoubleDelivered;
+				return;
+			}
+			Chunk.bDelivered = true;
+			++NumDelivered;
+
+			if (!Result.IsOk())
+			{
+				UE_LOG(LogVoxelGpuAsync, Error, TEXT("  chunk %d FAILED: %s — %s"),
+				       Index, LexToString(Result.Status), *Result.Error);
+				++NumFailed;
+				return;
+			}
+
+			// The count must agree BEFORE anything is allocated from it: a wrong
+			// count would size the pool range and the comparison alike, and the
+			// two errors would cancel into a PASS.
+			if (Result.NumQuads != uint32(Chunk.CpuQuads.Num()))
+			{
+				UE_LOG(LogVoxelGpuAsync, Error,
+				       TEXT("  chunk %d (%d,%d,%d): quad COUNT differs — gpu %u, cpu %d"),
+				       Index, Chunk.Key.X, Chunk.Key.Y, Chunk.Key.Z, Result.NumQuads, Chunk.CpuQuads.Num());
+				++NumMismatched;
+				return;
+			}
+			if (Result.NumQuads == 0)
+			{
+				// SurfaceChunkKey picks chunks that contain the surface, so this
+				// should not happen -- and a run of empty chunks would pass every
+				// check below vacuously, which is the failure mode this whole
+				// harness is written to avoid.
+				UE_LOG(LogVoxelGpuAsync, Warning,
+				       TEXT("  chunk %d (%d,%d,%d) meshed to ZERO quads — nothing to verify here"),
+				       Index, Chunk.Key.X, Chunk.Key.Y, Chunk.Key.Z);
+				return;
+			}
+
+			Chunk.bWasDirect = Result.GpuQuads.IsValid();
+			if (!Chunk.bWasDirect)
+			{
+				// The control path (voxel.GPU.MeshDirectToPool 0, or the manager
+				// refusing the request). Apply it the way the streaming path does
+				// so the SAME pool-content check below covers both.
+				Chunk.PoolHandle = Pool->AddChunk(Result.Quads, FVector3f::ZeroVector, 0);
+			}
+			else
+			{
+				++NumDirect;
+				Chunk.PoolHandle = Pool->AddChunkFromGpu(Result.GpuQuads, Result.NumQuads,
+				                                         FVector3f::ZeroVector, 0);
+			}
+
+			if (Chunk.PoolHandle == INDEX_NONE)
+			{
+				UE_LOG(LogVoxelGpuAsync, Error,
+				       TEXT("  chunk %d: the pool refused %u quads (free %u, largest run %u, gpuWritable=%d)"),
+				       Index, Result.NumQuads, Pool->GetFreeQuads(), Pool->GetLargestFreeRun(),
+				       Pool->IsGpuWritable() ? 1 : 0);
+				++NumFailed;
+				return;
+			}
+			Chunk.bApplied = true;
+			Chunk.PoolCount = Result.NumQuads;
+			// Recovered from the runs the pool publishes rather than guessed: the
+			// run list is exactly what the renderer culls and draws from, so
+			// checking the bytes at the run's offset is checking what will be
+			// drawn.
+			for (const UVoxelGpuPoolComponent::FChunkRun& Run : Pool->DebugGetChunkRuns())
+			{
+				if (Run.NumQuads == Chunk.PoolCount && !UsedOffsets.Contains(Run.FirstQuad))
+				{
+					Chunk.PoolFirst = Run.FirstQuad;
+					Chunk.ChunkId = Run.ChunkId;
+					UsedOffsets.Add(Run.FirstQuad);
+					break;
+				}
+			}
+		}
+
+		// Reads the whole used prefix of both pool buffers back, once.
+		void BeginReadback()
+		{
+			const FVoxelGpuPoolBuffersRef Buffers = Pool->DebugGetPoolBuffers();
+			HighWater = Pool->GetHighWaterMarkQuads();
+			if (!Buffers.IsValid() || !Buffers->QuadPooled.IsValid() || HighWater == 0)
+			{
+				UE_LOG(LogVoxelGpuAsync, Error,
+				       TEXT("voxel.GPU.VerifyPoolWrite: the pool has no GPU buffers to read back "
+				            "(highWater=%u). Nothing was written."), HighWater);
+				bReadbackFailed = true;
+				return;
+			}
+
+			TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> QuadRb =
+				MakeShared<FRHIGPUBufferReadback, ESPMode::ThreadSafe>(TEXT("Voxel.VerifyPool.Quads"));
+			TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> IdRb =
+				MakeShared<FRHIGPUBufferReadback, ESPMode::ThreadSafe>(TEXT("Voxel.VerifyPool.Ids"));
+			QuadReadback = QuadRb;
+			IdReadback = IdRb;
+
+			const uint32 Quads = HighWater;
+			ENQUEUE_RENDER_COMMAND(VoxelVerifyPoolReadback)(
+				[Buffers, QuadRb, IdRb, Quads](FRHICommandListImmediate& RHICmdList)
+			{
+				FRDGBuilder GraphBuilder(RHICmdList);
+				FRDGBufferRef Q = GraphBuilder.RegisterExternalBuffer(Buffers->QuadPooled, TEXT("VerifyPool.Quads"));
+				FRDGBufferRef I = GraphBuilder.RegisterExternalBuffer(Buffers->ChunkIdPooled, TEXT("VerifyPool.Ids"));
+				AddEnqueueCopyPass(GraphBuilder, QuadRb.Get(), Q, Quads * uint32(sizeof(uint64)));
+				AddEnqueueCopyPass(GraphBuilder, IdRb.Get(), I, Quads * uint32(sizeof(uint32)));
+				GraphBuilder.Execute();
+			});
+		}
+
+		bool HarvestReadback()
+		{
+			if (!QuadReadback.IsValid() || !IdReadback.IsValid())
+			{
+				return false;
+			}
+			bool bReady = false;
+			// IsReady is render-thread state; the flush is acceptable here because
+			// this is a verification tool and nothing about the measurement depends
+			// on not blocking (unlike the runner itself, which must never flush).
+			ENQUEUE_RENDER_COMMAND(VoxelVerifyPoolPoll)(
+				[Q = QuadReadback, I = IdReadback, &bReady](FRHICommandListImmediate&)
+			{
+				bReady = Q->IsReady() && I->IsReady();
+			});
+			FlushRenderingCommands();
+			if (!bReady)
+			{
+				return false;
+			}
+
+			PoolQuads.SetNumUninitialized(int32(HighWater));
+			PoolIds.SetNumUninitialized(int32(HighWater));
+			ENQUEUE_RENDER_COMMAND(VoxelVerifyPoolCopy)(
+				[Q = QuadReadback, I = IdReadback, QuadsOut = PoolQuads.GetData(),
+				 IdsOut = PoolIds.GetData(), Count = HighWater](FRHICommandListImmediate&)
+			{
+				if (const void* Src = Q->Lock(Count * uint32(sizeof(uint64))))
+				{
+					FMemory::Memcpy(QuadsOut, Src, SIZE_T(Count) * sizeof(uint64));
+					Q->Unlock();
+				}
+				if (const void* Src = I->Lock(Count * uint32(sizeof(uint32))))
+				{
+					FMemory::Memcpy(IdsOut, Src, SIZE_T(Count) * sizeof(uint32));
+					I->Unlock();
+				}
+			});
+			FlushRenderingCommands();
+			return true;
+		}
+
+		void Compare()
+		{
+			int32 Checked = 0, QuadFail = 0, IdFail = 0, GuardFail = 0;
+
+			for (int32 I = 0; I < Chunks.Num(); ++I)
+			{
+				const FChunkUnderTest& C = Chunks[I];
+				if (!C.bApplied || C.PoolCount == 0)
+				{
+					continue;
+				}
+				if (uint64(C.PoolFirst) + C.PoolCount > uint64(HighWater))
+				{
+					UE_LOG(LogVoxelGpuAsync, Error,
+					       TEXT("  chunk %d: range [%u, %u) is outside the drawn prefix (%u)"),
+					       I, C.PoolFirst, C.PoolFirst + C.PoolCount, HighWater);
+					++QuadFail;
+					continue;
+				}
+				++Checked;
+
+				// (1) the bytes.
+				for (uint32 Q = 0; Q < C.PoolCount; ++Q)
+				{
+					if (PoolQuads[int32(C.PoolFirst + Q)] == C.CpuQuads[int32(Q)])
+					{
+						continue;
+					}
+					++QuadFail;
+					UE_LOG(LogVoxelGpuAsync, Error,
+					       TEXT("  chunk %d (%d,%d,%d): pool quad [%u] of %u differs — pool %016llx vs cpu %016llx "
+					            "(pool offset %u)"),
+					       I, C.Key.X, C.Key.Y, C.Key.Z, Q, C.PoolCount,
+					       PoolQuads[int32(C.PoolFirst + Q)], C.CpuQuads[int32(Q)], C.PoolFirst);
+					break;
+				}
+
+				// (2) the ids. A quad with the wrong id draws at another chunk's
+				// origin, which looks like a mesher bug and is not one.
+				for (uint32 Q = 0; Q < C.PoolCount; ++Q)
+				{
+					if (PoolIds[int32(C.PoolFirst + Q)] == C.ChunkId)
+					{
+						continue;
+					}
+					++IdFail;
+					UE_LOG(LogVoxelGpuAsync, Error,
+					       TEXT("  chunk %d: chunk id at pool quad [%u] is %u, expected %u"),
+					       I, C.PoolFirst + Q, PoolIds[int32(C.PoolFirst + Q)], C.ChunkId);
+					break;
+				}
+			}
+
+			// (3) the guard band. The seed chunk sits at pool offset 0 and holds a
+			// known pattern that nothing under test should ever write. A pass that
+			// only compared each chunk's own range would be blind to a write that
+			// ran past the end of a neighbour's.
+			for (int32 Q = 0; Q < kSeedQuads && Q < int32(HighWater); ++Q)
+			{
+				if (PoolQuads[Q] != (kGuardPattern ^ uint64(Q)))
+				{
+					++GuardFail;
+					UE_LOG(LogVoxelGpuAsync, Error,
+					       TEXT("  GUARD BAND CORRUPTED at pool quad %d: %016llx, expected %016llx. "
+					            "Something wrote outside its allocation."),
+					       Q, PoolQuads[Q], kGuardPattern ^ uint64(Q));
+					break;
+				}
+			}
+
+			const bool bPass = (QuadFail == 0 && IdFail == 0 && GuardFail == 0 && NumFailed == 0
+			                    && NumMismatched == 0 && NumDoubleDelivered == 0 && Checked > 0);
+			const FString Summary = FString::Printf(
+				TEXT("voxel.GPU.VerifyPoolWrite: %s — %d/%d chunks checked in the pool buffer "
+				     "(%d written GPU-side, %d via the readback control), quadFail=%d idFail=%d "
+				     "guardFail=%d failed=%d countMismatch=%d doubleDelivered=%d, "
+				     "poolDirectWrites=%lld dropped=%d"),
+				bPass ? TEXT("PASS — pool contents are byte-identical to MeshChunkBricks") : TEXT("FAIL"),
+				Checked, NumChunks, NumDirect, Checked - NumDirect,
+				QuadFail, IdFail, GuardFail, NumFailed, NumMismatched, NumDoubleDelivered,
+				(long long)Pool->GetGpuDirectWrites(), Pool->GetGpuDirectWritesDropped());
+			// Verbosity is a compile-time argument to UE_LOG, so the branch is on
+			// the call rather than inside it.
+			if (bPass)
+			{
+				UE_LOG(LogVoxelGpuAsync, Log, TEXT("%s"), *Summary);
+			}
+			else
+			{
+				UE_LOG(LogVoxelGpuAsync, Error, TEXT("%s"), *Summary);
+			}
+
+			if (Checked > 0 && NumDirect == 0)
+			{
+				UE_LOG(LogVoxelGpuAsync, Warning,
+				       TEXT("  NOT ONE chunk took the direct path. This run says nothing about D1 — check "
+				            "voxel.GPU.MeshDirectToPool and voxel.GPU.MeshChunkLocal are both 1."));
+			}
+		}
+
+		bool Tick(float DeltaSeconds)
+		{
+			if (!bStarted)
+			{
+				ElapsedBeforeStart += double(DeltaSeconds);
+				if (ElapsedBeforeStart < StartDelaySeconds)
+				{
+					return true;
+				}
+				if (!CreatePool())
+				{
+					return false;
+				}
+				bStarted = true;
+				return true;   // one frame for the proxy (and its buffers) to exist
+			}
+			if (!bSubmitted)
+			{
+				if (!Pool->IsGpuWritable())
+				{
+					// The proxy has not been created yet. Wait rather than submit,
+					// or every job would silently take the readback path and the run
+					// would test nothing.
+					if (++SettleTicks > 120)
+					{
+						UE_LOG(LogVoxelGpuAsync, Error,
+						       TEXT("voxel.GPU.VerifyPoolWrite: the pool never became GPU-writable — its scene "
+						            "proxy was never created. Nothing to test."));
+						return false;
+					}
+					return true;
+				}
+				bSubmitted = true;
+				Start();
+				return true;
+			}
+
+			Manager.Tick();
+
+			if (NumDelivered < NumChunks)
+			{
+				if (FPlatformTime::Seconds() - FirstSubmitSeconds > 120.0)
+				{
+					UE_LOG(LogVoxelGpuAsync, Error,
+					       TEXT("ABANDONING: %d of %d jobs never reported back."), NumChunks - NumDelivered, NumChunks);
+					return false;
+				}
+				return true;
+			}
+
+			// Everything is delivered and applied. The writes are render commands
+			// that may not have run yet, so let a couple of frames pass before
+			// reading -- and read through the same command stream, which orders
+			// the readback behind them.
+			if (!bReadbackStarted)
+			{
+				if (++DrainTicks < 3)
+				{
+					return true;
+				}
+				bReadbackStarted = true;
+				BeginReadback();
+				return !bReadbackFailed;
+			}
+			if (!HarvestReadback())
+			{
+				if (++HarvestTicks > 600)
+				{
+					UE_LOG(LogVoxelGpuAsync, Error, TEXT("voxel.GPU.VerifyPoolWrite: the readback never landed"));
+					return false;
+				}
+				return true;
+			}
+
+			Compare();
+			return false;
+		}
+
+		static constexpr int32 kSeedQuads = 256;
+		static constexpr uint64 kGuardPattern = 0x5645524946594242ull;   // "VERIFYBB"
+
+		vxc::SyntheticTileSampler Tiles;
+		vxc::SyntheticTileSampler CpuTiles;
+		vxc::Amplifier CpuAmp;
+
+		TArray<FChunkUnderTest> Chunks;
+		TSet<uint32> UsedOffsets;
+		TWeakObjectPtr<AActor> PoolOwner;
+		TWeakObjectPtr<UVoxelGpuPoolComponent> Pool;
+		int32 SeedHandle = INDEX_NONE;
+
+		TArray<uint64> PoolQuads;
+		TArray<uint32> PoolIds;
+		TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> QuadReadback;
+		TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> IdReadback;
+		uint32 HighWater = 0;
+
+		int32 NumChunks = 0;
+		int32 MaxInFlight = 4;
+		double StartDelaySeconds = 25.0;
+		double ElapsedBeforeStart = 0.0;
+		double FirstSubmitSeconds = 0.0;
+		int32 NumDelivered = 0, NumFailed = 0, NumMismatched = 0, NumDoubleDelivered = 0, NumDirect = 0;
+		int32 SettleTicks = 0, DrainTicks = 0, HarvestTicks = 0;
+		bool bStarted = false, bSubmitted = false, bReadbackStarted = false, bReadbackFailed = false;
+
+		FVoxelGpuMeshJobManager Manager;
+	};
+
+	void VerifyPoolWriteCommand(const TArray<FString>& Args)
+	{
+		const int32 NumChunks = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), 1, 512) : 16;
+		const int32 InFlight = (Args.Num() > 1) ? FMath::Clamp(FCString::Atoi(*Args[1]), 1, 256) : 4;
+		const double Delay = (Args.Num() > 2) ? FMath::Max(0.0, FCString::Atod(*Args[2])) : 25.0;
+
+		TSharedPtr<FPoolWriteVerifyRun> Run = MakeShared<FPoolWriteVerifyRun>(NumChunks, InFlight, Delay);
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Run](float Dt) -> bool { return Run->Tick(Dt); }), 0.0f);
+	}
+
+	FAutoConsoleCommand GVoxelGpuVerifyPoolWriteCmd(
+		TEXT("voxel.GPU.VerifyPoolWrite"),
+		TEXT("D1 gate: mesh K chunks through FVoxelGpuMeshJobManager with the quads left in GPU memory, "
+		     "write them into a real UVoxelGpuPoolComponent with no readback, then read the POOL BUFFER "
+		     "back and byte-compare it against MeshChunkBricks. Also checks every chunk id in the range "
+		     "and a guard band against out-of-range writes. Run with voxel.GPU.MeshDirectToPool 0 for the "
+		     "control. Needs a live game world. Usage: [K=16] [InFlight=4] [delaySeconds=25]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&VerifyPoolWriteCommand));
 
 	FAutoConsoleCommand GVoxelGpuVerifyRingSkirtCmd(
 		TEXT("voxel.GPU.VerifyRingSkirt"),

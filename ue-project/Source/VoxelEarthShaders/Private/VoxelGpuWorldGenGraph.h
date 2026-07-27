@@ -103,4 +103,42 @@ namespace VoxelGpuWorldGen
 	// (CreateStructuredBuffer with the default ERDGInitialDataFlags copies), and
 	// the loose parameters are plain scalars written into the parameter struct.
 	FRegionGraphResources AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegionRequest& Request);
+
+	// --- Wave D / D1: the two GPU-side quad copies --------------------------
+	//
+	// Declared here rather than in each caller because the shader classes they
+	// dispatch live in VoxelGpuWorldGen.cpp next to FVoxelQuadTotalCS (one
+	// IMPLEMENT_GLOBAL_SHADER per class, in one translation unit) while the
+	// callers are two OTHER translation units -- FVoxelGpuMeshJobManager for the
+	// compaction and UVoxelGpuPoolComponent for the pool write. This header is
+	// already the private seam between the graph and its callers, and exposing a
+	// PASS rather than a shader class keeps the parameter struct where its
+	// kernel is.
+	//
+	// Both are RENDER THREAD ONLY and take FRDGBufferRefs, which is exactly why
+	// this header stays private. See ue-project/Shaders/VoxelQuadPoolWrite.usf
+	// for what the kernels do and why they are compute passes rather than
+	// AddCopyBufferPass.
+
+	// Copies [SrcFirst, SrcFirst + NumQuads) of Src into Dst[0, NumQuads).
+	// Dst must hold at least NumQuads elements of 8 bytes.
+	//
+	// This is phase 2 of a mesh job under voxel.GPU.MeshDirectToPool: it moves a
+	// chunk's quads out of the emit pass's static upper-bound buffer (~786 KB)
+	// into one sized to what actually exists (~10 KB), so a delivered chunk
+	// waiting on the streaming apply budget does not pin the bound. Nothing
+	// waits for it and correctness does not depend on it -- see
+	// FVoxelGpuQuadPayload.
+	void AddQuadCompactPass(FRDGBuilder& GraphBuilder, FRDGBufferRef Dst, FRDGBufferRef Src,
+	                        uint32 SrcFirst, uint32 NumQuads);
+
+	// Copies [SrcFirst, SrcFirst + NumQuads) of Src into DstQuads at DstFirst,
+	// and writes ChunkId across the matching DstIds range in the SAME pass.
+	//
+	// This is the write that replaces UpdateQuadRange_RenderThread's two
+	// Lock/Memcpy/Unlock pairs for a GPU-meshed chunk. Quads and ids move
+	// together so the pool never holds geometry belonging to nobody.
+	void AddQuadPoolWritePass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstQuads, FRDGBufferRef DstIds,
+	                          FRDGBufferRef Src, uint32 SrcFirst, uint32 DstFirst,
+	                          uint32 NumQuads, uint32 ChunkId);
 }

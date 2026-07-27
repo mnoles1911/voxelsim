@@ -93,6 +93,30 @@ public:
 	void NotifyPooledChunkMeshUpdated(const FVector& ChunkOriginUU, int32 ChunkLevel,
 	                                  TArray<FVoxelChunkQuad>&& Quads);
 
+	// Would NotifyPooledChunkMeshUpdated actually INGEST this chunk?
+	//
+	// WHY THIS EXISTS, AND IT IS NOT AN OPTIMISATION (Wave D / D1). GI is the
+	// only consumer left anywhere that reads a chunk's quad CONTENTS on the CPU
+	// -- everything else wants a count or the packed bytes, which the geometry
+	// pool now receives without the CPU touching them. So "does GI want this
+	// chunk" is exactly the question that decides whether a mesh job may leave
+	// its quads on the GPU, and asking it in the wrong direction is silent both
+	// ways: too permissive and GPU-meshed chunks stop contributing to the light
+	// field (the defect VoxelMeshTypes.h's UnpackVoxelChunkQuad comment exists to
+	// prevent, arrived at through a different door); too restrictive and the
+	// no-readback path simply never runs.
+	//
+	// Mirrors the two conditions NotifyPooledChunkMeshUpdated and the voxelize
+	// drain actually apply -- level 0 only, and inside voxel.GI.RadiusUU of the
+	// field centre -- with a margin on the radius, because this is asked at
+	// DISPATCH and the answer is used at apply, some hundreds of milliseconds of
+	// camera motion later. Same 1.25 factor EvictFarBricks uses, for consistency
+	// rather than by separate derivation.
+	//
+	// Conservative by construction: it returns true whenever it is unsure, and
+	// true costs a readback rather than a missing brick.
+	bool WantsChunkQuads(const FVector& ChunkOriginUU, int32 ChunkLevel) const;
+
 	// voxel.GI.VolumeDigTest. Public because the console command reaches it
 	// through the subsystem; see StepDigTest for what it measures and why.
 	void StartDigTest(double RadiusUU);

@@ -1258,9 +1258,37 @@ struct FJobResult
 
 	// -VoxelVerifyBuriedSkip: this chunk's band verdict said "provably no
 	// geometry", but it was dispatched anyway so the verdict can be checked
-	// against the real mesh. Any result with bPredictedEmpty && Quads.Num()>0
+	// against the real mesh. Any result with bPredictedEmpty && QuadCount()>0
 	// is a soundness violation -- geometry the skip would have deleted.
 	bool bPredictedEmpty = false;
+
+	// --- Wave D / D1: quads that never came to the CPU ----------------------
+	//
+	// Non-null when the GPU fork left this chunk's geometry in GPU memory. Quads
+	// is then EMPTY and this handle is what ApplyMeshResult passes to
+	// UVoxelGpuPoolComponent::AddChunkFromGpu. Always null on the worker path.
+	//
+	// Dropping it is always safe: a stale result, a full pool or a teardown
+	// simply destroys it, which releases the GPU memory on the render thread.
+	FVoxelGpuQuadPayloadRef GpuQuads;
+	uint32 GpuQuadCount = 0;
+
+	// HOW MUCH GEOMETRY THIS CHUNK MESHED TO. Use this, not Quads.Num(), for
+	// every question that is about the AMOUNT of geometry rather than the
+	// geometry itself -- the zero-quad census, the buried/solid/sky skip
+	// soundness checks, ResidentQuads, LastQuadCount.
+	//
+	// The reason is a silent one. On the direct path Quads is empty for a chunk
+	// that meshed to thousands of quads, so every one of those sites would read
+	// it as an EMPTY chunk: the census would report the fork producing nothing,
+	// the skip verifiers would stop being able to catch an unsound skip (they
+	// only fire on a non-zero count), and LastQuadCount/ResidentQuads would
+	// under-report residency while the terrain drew correctly. All
+	// self-consistent, all wrong, and none of it visible on screen.
+	int32 QuadCount() const
+	{
+		return GpuQuads.IsValid() ? int32(GpuQuadCount) : Quads.Num();
+	}
 };
 
 } // namespace VoxelStreaming
@@ -1514,6 +1542,18 @@ bool GpuMeshEnabled()
 // the same trap the ring floor sweep fell into.
 int32 GpuMeshInFlight()
 {
+	// 256, TESTED AND KEPT (2026-07-27). The depth hypothesis -- fork
+	// throughput = in-flight depth / round-trip latency, so 1024 should lift
+	// ~600 chunks/s toward ~2,400 -- was tried at the adopted 128 m / 4 km
+	// cascade and FALSIFIED: 590 chunks/s at 1024 (vs 602 at 256), with the
+	// fork idling at ~11 in flight (never depth-bound at all) and the
+	// submit->deliver MAX ballooning to 13,146 ms -- past the 10 s retention
+	// cap, i.e. a correctness hazard, not just waste. Whatever pins the
+	// new-stack loading rate at ~600/s at that cascade (the old
+	// component-renderer arm reaches ~1,080/s), it is not this knob, not
+	// MeshBatchCap (4/8 vs 16/32 moved 0.0), and not the mesher choice
+	// (-VoxelNoGpuMesh arm also ~593/s). That plateau is the open P0 in
+	// docs/measurements/gpu-throughput-wave-2026-07-27.txt.
 	static const int32 N = []
 	{
 		int32 Value = 256;
@@ -2714,6 +2754,20 @@ struct FVoxelWorldImpl
 	int64 GpuMeshSlowDeliveriesSinceLog = 0;
 	int64 GpuMeshSlowDeliveriesTotal = 0;
 
+	// Stage-0 measure-first census for the chunk-tile GPU-batching design
+	// (docs/measurements/gpu-throughput-wave-2026-07-27.txt): tallies, per 5s
+	// log window, how many GPU-fork-bound dispatches would have landed in
+	// each cell of the proposed fixed world-aligned 4x4 lattice (tile key =
+	// Level, ChunkX>>2, ChunkY>>2 -- Z is deliberately NOT split, since a
+	// tile may span multiple chunk-Z and the design accepts that union).
+	// Only chunks that actually take the GPU fork branch in DispatchJobs are
+	// counted (never the CPU-worker path, never the game-thread path), so
+	// this cannot overcount what a real tile could combine. Read and reset
+	// alongside the other GpuMesh...SinceLog counters in MaybeLogCounters.
+	// This map and its logging are expected to be REMOVED or gated once tile
+	// batching ships and is measured by its own real occupancy counters.
+	TMap<FIntVector, int32> TileCensusSinceLog;
+
 	// What the fork needs back when a job lands, keyed by the runner's job id.
 	//
 	// Kept here rather than packed into FVoxelGpuMeshJobResult::UserTag because
@@ -3448,9 +3502,16 @@ private:
 	// RE-create via MarkRenderStateDirty, but without the RegisterComponent/
 	// scene-attach overhead). Hitch-attribution callers (DrainResults,
 	// DrainGameThreadMesh) sum this into ThisFrameProxiesCreated.
+	// GpuQuads (Wave D / D1) is the alternative to Quads: a handle to geometry
+	// that is already in GPU memory, with GpuQuadCount describing it. Exactly one
+	// of the two is ever populated; passing a payload FORCES the pooled branch,
+	// because that is the only renderer that can consume it. Defaulted so every
+	// CPU caller is unchanged.
 	bool ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
 	                      const VoxelCoords::FVoxelLevelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec, TArray<FVoxelChunkQuad>&& Quads,
-	                      bool bIsGameThreadMesh);
+	                      bool bIsGameThreadMesh,
+	                      const FVoxelGpuQuadPayloadRef& GpuQuads = FVoxelGpuQuadPayloadRef(),
+	                      int32 GpuQuadCount = 0);
 	// M1 hitch-gap wave (component pooling): returns a pooled component
 	// (popped + counted as a reuse) if ComponentPool is non-empty, else falls
 	// back to the pre-pooling NewObject+SetupAttachment+RegisterComponent
@@ -3482,6 +3543,17 @@ private:
 	// Origin the pooled chunk table is expressed relative to. See
 	// GetOrCreateGpuPool for why this exists at all.
 	FVector GpuPoolRebase = FVector::ZeroVector;
+
+	// The chunk root the pool was created against (Wave D / D1).
+	//
+	// SubmitGpuMeshJob needs a chunk's WORLD origin to ask GI whether it wants
+	// that chunk's quads, and it must compose it the SAME way ApplyMeshResult
+	// does -- Root.GetComponentLocation() + ChunkOriginWorldForLevel(...) -- or
+	// the two would disagree about which chunks are inside the GI radius, which
+	// is silent in both directions. DispatchJobs has no Root parameter, so it is
+	// captured here at pool creation instead of re-derived. Only ever read on the
+	// direct-to-pool path, which already requires the pool to exist.
+	TWeakObjectPtr<USceneComponent> GpuPoolRoot;
 
 	// Gives back whatever geometry a record is holding, on either path, and
 	// leaves the record geometry-less.
@@ -3748,7 +3820,25 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 				// independent -- the stranded mark is fixed separately -- but this
 				// is what stops the NEXT stuck entry doing the same thing.
 				const int32 Undispatchable = (Level == 0) ? ColdBandHeldThisFrame : 0;
-				if (PendingJobKeysByLevel[Level].Num() <= Undispatchable)
+				// GENUINE-ROOM GUARD (2026-07-27, the R0 churn loop). The discount
+				// above has a degenerate case: when the cold-band throttle holds
+				// R0's ENTIRE queue, Num() <= ColdBandHeldThisFrame is an identity
+				// (DrainUnloads re-appends the held entries to the same queue), so
+				// this trigger fired EVERY TICK of a 110 s flight -- each refill
+				// re-enumerated the annulus, admitted Cap/4 = 512, and the
+				// truncation pass threw ~500 straight back out because the queue
+				// was already AT its ring-share cap. Measured on the B1 leg:
+				// ~237,600 rejections/s, ~30,000 record adds + erases/s sustained,
+				// and R0 residency collapsing 2,024 -> 92 during the burst. A
+				// refill into a queue with no room is pure churn: require genuine
+				// room below the ring's own truncation cap before firing. The
+				// legitimate case this trigger exists for (a drained-but-for-
+				// undispatchables queue) still fires: a drained queue is far
+				// below its cap by definition.
+				const int32 LevelCap = FMath::Max(
+				    1, FMath::RoundToInt(double(AdmissionCap) * VoxelStreamAdmission::kRingCapShare[Level]));
+				if (PendingJobKeysByLevel[Level].Num() <= Undispatchable &&
+				    PendingJobKeysByLevel[Level].Num() < LevelCap)
 				{
 					bLevelWantsRefill[Level] = true;
 					bAdmissionRefill = true;
@@ -3908,6 +3998,45 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		const double T2 = FPlatformTime::Seconds();
 		DrainGameThreadMesh(Owner, Root, Material);
 		const double T3 = FPlatformTime::Seconds();
+
+		// Second DispatchJobs() pass (voxel.Stream.DispatchAfterDrain, default
+		// 1) -- refills the slots DrainResults just freed IN THIS FRAME rather
+		// than leaving them idle until next frame's single dispatch. See
+		// CVarVoxelStreamDispatchAfterDrain's comment in VoxelDebug.cpp for the
+		// ~9% worker-utilisation measurement this addresses and how it
+		// complements JobsInFlightPerCore=8 (which widens the buffer but does
+		// not touch the once-per-frame cadence).
+		//
+		// SLOT CHOICE: after DrainGameThreadMesh, before DrainUnloads -- not
+		// straight after DrainResults. Two reasons. First, DrainResults is what
+		// decrements LevelJobsInFlight (see its ring-quota bookkeeping), so the
+		// ring-quota pass inside a second DispatchJobs only sees accurate
+		// per-ring deficits once DrainResults has actually run; parking it here
+		// keeps that ordering trivially satisfied regardless of exactly where
+		// in [after DrainResults, before DrainUnloads] it lands. Second, and
+		// decisively, DispatchJobs has always run BEFORE DrainUnloads within a
+		// tick (dispatch against this frame's desired set, then prune it) --
+		// this preserves that same invariant for the second pass instead of
+		// having a same-frame dispatch race a same-frame unload.
+		//
+		// GATED ON QUEUE PRESSURE: PendingJobNum() sums every per-level queue
+		// (see its doc comment), so this is the "nothing pending" case called
+		// out above -- if the first dispatch already drained every ring dry,
+		// a second pass has nothing to do and costs only this scan.
+		//
+		// TIMING: folded into ThisFrameDispatchMs/AccumDispatchMs (not
+		// RemeshMs or UnloadMs) so the tick-budget line still attributes all
+		// dispatch cost to the dispatch bucket. T3b collapses to T3 (zero
+		// delta) when the cvar is off or the gate skips, so UnloadMs stays
+		// exactly (T4 - T3) in that case -- byte-identical to the old
+		// single-dispatch behaviour.
+		double T3b = T3;
+		if (VoxelDebug::GetStreamDispatchAfterDrain() != 0 && PendingJobNum() > 0)
+		{
+			DispatchJobs();
+			T3b = FPlatformTime::Seconds();
+		}
+
 		DrainUnloads();
 		const double T4 = FPlatformTime::Seconds();
 
@@ -3916,18 +4045,18 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		// established practice in this function -- see TickStartSeconds
 		// above), always collected so the per-frame log below has real
 		// numbers the instant a hitch happens, not just from the next frame.
-		ThisFrameDispatchMs = float((T1 - T0) * 1000.0);
+		ThisFrameDispatchMs = float((T1 - T0) * 1000.0 + (T3b - T3) * 1000.0);
 		ThisFrameApplyMs = float((T2 - T1) * 1000.0);
 		ThisFrameRemeshMs = float((T3 - T2) * 1000.0);
-		ThisFrameUnloadMs = float((T4 - T3) * 1000.0);
+		ThisFrameUnloadMs = float((T4 - T3b) * 1000.0);
 
 		// Streaming re-measure: same four samples, also summed into the 5s
 		// window so the periodic log can report where tick time goes on runs
 		// that never cross the hitch threshold at all.
-		AccumDispatchMs += (T1 - T0) * 1000.0;
+		AccumDispatchMs += (T1 - T0) * 1000.0 + (T3b - T3) * 1000.0;
 		AccumApplyMs += (T2 - T1) * 1000.0;
 		AccumRemeshMs += (T3 - T2) * 1000.0;
-		AccumUnloadMs += (T4 - T3) * 1000.0;
+		AccumUnloadMs += (T4 - T3b) * 1000.0;
 		AccumRecomputeMs += ThisFrameRecomputeMs;
 		++AccumTicks;
 	}
@@ -4550,6 +4679,34 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       (long long)GpuMeshDispatchedByLevel[2], (long long)GpuMeshDispatchedByLevel[3],
 		       (long long)GpuMeshDispatchedByLevel[4], (long long)GpuMeshDispatchedByLevel[5],
 		       VoxelStreamAdmission::GpuMeshMaxLevel());
+
+		// Stage-0 tile-batching census (see TileCensusSinceLog doc comment):
+		// occupancy each proposed 4x4-lattice tile would have had this window,
+		// bucketed so the "how many chunks would a real tile dispatch have
+		// combined" question can be read off directly, without waiting on the
+		// batching implementation to answer it.
+		{
+			int32 TileDispatches = 0;
+			int32 Occ1 = 0, Occ2to3 = 0, Occ4to7 = 0, Occ8to15 = 0, Occ16Plus = 0;
+			for (const auto& TilePair : TileCensusSinceLog)
+			{
+				const int32 Count = FMath::Clamp(TilePair.Value, 1, 16);
+				TileDispatches += TilePair.Value;
+				if (Count == 1)        { ++Occ1; }
+				else if (Count <= 3)   { ++Occ2to3; }
+				else if (Count <= 7)   { ++Occ4to7; }
+				else if (Count <= 15)  { ++Occ8to15; }
+				else                   { ++Occ16Plus; }
+			}
+			const int32 TileCount = TileCensusSinceLog.Num();
+			const double MeanOcc = TileCount > 0 ? double(TileDispatches) / double(TileCount) : 0.0;
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel tile census (5s window): dispatches=%d tiles=%d meanOcc=%.1f | "
+			            "occ 1:%d 2-3:%d 4-7:%d 8-15:%d 16+:%d"),
+			       TileDispatches, TileCount, MeanOcc, Occ1, Occ2to3, Occ4to7, Occ8to15, Occ16Plus);
+			TileCensusSinceLog.Reset();
+		}
+
 		for (int64& N : GpuMeshDispatchedByLevel) { N = 0; }
 		GpuMeshJobsDispatchedSinceLog = 0;
 		GpuMeshJobsDeliveredSinceLog = 0;
@@ -6387,6 +6544,7 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 	// so every level's queue is sorted farthest-first with its distances current.
 	const int32 Cap = VoxelStreamAdmission::GetPendingJobCap();
 	bool bHeldBack = false;
+	bool bLevelHeldBackThisCall[VoxelCoords::kNumLevels] = {}; // per-ring attribution for the clear below
 
 	if (Cap <= 0)
 	{
@@ -6412,6 +6570,7 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 				// This ring, and only this ring, still has candidates it could
 				// not take -- so only this ring's refill trigger stays armed.
 				bHeldBack = true;
+				bLevelHeldBackThisCall[Level] = true;
 				bAdmissionDeferredWork[Level] = true;
 			}
 		}
@@ -6474,19 +6633,36 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 		}
 	}
 
-	if (bHeldBack)
+	// THE ONE-WAY-LATCH BUG (2026-07-27, the R4/R5 refill oscillation). This
+	// used to be `if (bHeldBack) return;` -- a GLOBAL early-return gating a
+	// PER-LEVEL clear. bHeldBack is an OR across all six rings, and R0
+	// overflows its share on essentially every call of a flight, so while R0
+	// was held back NO ring's deferral flag could ever clear -- the invariant
+	// stated at the DropFarthestOverCap call ("this ring, and only this ring,
+	// stays armed") held for the SET and not for the CLEAR. Result, measured
+	// on the B1 leg: R4/R5's flags latched once at t~101s and their refill
+	// triggers then free-ran at frame rate whenever their queues emptied --
+	// 428/421 full-annulus rescans in a 14 s burst for ~1.7 admitted chunks
+	// per scan. With ring quota ON the attribution is genuinely per ring, so
+	// the clear must be too: skip only the levels THIS call held back.
+	//
+	// (-VoxelRingQuota=0 keeps the global return below: one shared cap has no
+	// per-ring attribution to make, exactly as its arming comment says.)
+	if (bHeldBack && !VoxelStreamAdmission::GetRingQuotaEnabled())
 	{
-		return; // the per-level flags were set by whichever ring held work back
+		return; // global cap, global attribution: every flag was armed above
 	}
-	// Nothing was held back by THIS call. Only clear the deferral flag if every
-	// level actually re-enumerated on this call (a movement-triggered call scans
-	// only the levels whose own chunk the anchor crossed, so a level gated out of
-	// it may still have candidates waiting -- clearing then would lose the refill
-	// trigger for them). A refill call always satisfies this, since it clears the
+	// Clear the deferral flag only for levels that actually re-enumerated on
+	// this call with zero rejections AND were not held back by the truncation
+	// above (a movement-triggered call scans only the levels whose own chunk
+	// the anchor crossed, so a level gated out of it may still have candidates
+	// waiting -- clearing then would lose the refill trigger for them). A
+	// refill call always satisfies the scanned condition, since it clears the
 	// per-level gate first.
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
-		if (bLevelScannedThisCall[Level] && LevelCandidatesRejectedThisCall[Level] == 0)
+		if (bLevelScannedThisCall[Level] && LevelCandidatesRejectedThisCall[Level] == 0 &&
+		    !bLevelHeldBackThisCall[Level])
 		{
 			bAdmissionDeferredWork[Level] = false;
 		}
@@ -7030,9 +7206,16 @@ FVoxelGpuMeshJobManager* FVoxelWorldImpl::EnsureGpuMeshJobs()
 	// throughput from 49,179 to 558 chunks and took a while to pin on the
 	// floors. The subsystem's own MaxJobsInFlight is the one knob that should
 	// bind; this one must not.
+	// Pass the SAME resolved value the fork decision uses (-VoxelGpuMeshInFlight,
+	// default in GpuMeshInFlight()), not a second literal: the two caps used to
+	// both be 256 so "neither binds before the other" held by coincidence, and
+	// raising the switch past the literal silently did nothing -- the exact
+	// unattributable-throughput trap the comment above warns about, measured on
+	// 2026-07-27 when a caps sweep moved chunks/s by 0.0 because THIS constant
+	// was the binding one. One knob, both consumers.
 	GpuMeshJobs = MakeUnique<FVoxelGpuMeshJobManager>(
 		FVoxelGpuMeshJobComplete::CreateRaw(this, &FVoxelWorldImpl::OnGpuMeshJobComplete),
-		/*InMaxInFlight*/ 256);
+		/*InMaxInFlight*/ VoxelStreamAdmission::GpuMeshInFlight());
 	// The conditions, stated as they ACTUALLY are. This line used to say
 	// "level 0, unedited, band-known chunks only", which was true when it was
 	// written and stopped being true twice: D6 removed the band-known
@@ -7113,7 +7296,72 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// clamps to the window edge and silently produces different terrain.
 	VoxelGpuRegionBuild::FillRasterWindow(Req, *Tiles);
 
-	const uint64 JobId = Manager->Submit(MoveTemp(Req));
+	// --- Wave D / D1: may this chunk's quads stay on the GPU? ----------------
+	//
+	// DECIDED HERE, AT DISPATCH, AND LATCHED. The alternative -- deciding at
+	// delivery -- would let the answer change under a job in flight, and the two
+	// forms are not interchangeable: a direct result carries no quads, so a path
+	// that expected them would read the chunk as empty rather than as an error.
+	// Same reasoning as the manager latching voxel.GPU.MeshChunkLocal.
+	//
+	// Three conditions, and each one is a place the quads would be needed on the
+	// CPU:
+	//
+	//  1. THE POOL MUST BE THE DESTINATION. voxel.Stream.GPU picks the renderer
+	//     and voxel.Stream.GPUMaxLevel picks which rings it takes; the component
+	//     path calls SetChunkQuads, which needs the geometry itself. The pool
+	//     must also already be GPU-writable -- its persistent buffers are created
+	//     by the FIRST scene proxy, so the opening chunks of a session
+	//     necessarily arrive by readback and everything after them goes direct.
+	//     That bootstrap is self-healing and deliberately has no special case.
+	//
+	//  2. THE RECORD MUST NOT ALREADY HOLD A COMPONENT. A chunk always unloads
+	//     the way it loaded, so a record on the component path stays there.
+	//
+	//  3. GI MUST NOT WANT IT. UVoxelGISubsystem::NotifyPooledChunkMeshUpdated is
+	//     the last consumer anywhere that reads quad CONTENTS on the CPU. See
+	//     WantsChunkQuads for why asking it is a correctness condition rather
+	//     than an optimisation.
+	//
+	// Every one of them is conservative in the same direction: unsure means
+	// readback, which costs bandwidth and latency, never geometry.
+	bool bDirectToPool = false;
+	{
+		static const auto* CVarGpuMaxLevel =
+			IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.Stream.GPUMaxLevel"));
+		const int32 GpuMaxLevel = CVarGpuMaxLevel ? CVarGpuMaxLevel->GetInt() : -1;
+		const bool bLevelPoolable = (GpuMaxLevel < 0) || (LevelKey.Level <= GpuMaxLevel);
+
+		const UVoxelGpuPoolComponent* Pool = GpuPool.Get();
+		const VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(LevelKey);
+
+		bDirectToPool =
+			VoxelDebug::GetStreamGpu()
+			&& bLevelPoolable
+			&& Pool != nullptr
+			&& Pool->IsGpuWritable()
+			&& (Rec == nullptr || !Rec->Component.IsValid());
+
+		// The GI test is last because it is the only one that costs a distance
+		// computation, and because it needs the chunk's world origin -- composed
+		// exactly the way ApplyMeshResult composes it, from the same root. With
+		// GI off this is one cvar read and nothing else.
+		const USceneComponent* PoolRoot = GpuPoolRoot.Get();
+		if (bDirectToPool && PoolRoot != nullptr && VoxelGI::IsEnabled())
+		{
+			if (const UWorld* World = PoolRoot->GetWorld())
+			{
+				if (const UVoxelGISubsystem* GI = World->GetSubsystem<UVoxelGISubsystem>())
+				{
+					const FVector OriginWorld = PoolRoot->GetComponentLocation()
+						+ VoxelCoords::ChunkOriginWorldForLevel(LevelKey.Key, LevelKey.Level);
+					bDirectToPool = !GI->WantsChunkQuads(OriginWorld, LevelKey.Level);
+				}
+			}
+		}
+	}
+
+	const uint64 JobId = Manager->Submit(MoveTemp(Req), /*UserTag*/ 0, bDirectToPool);
 	GpuJobsPending.Add(JobId, FGpuPendingJob{ LevelKey, GenId });
 	return true;
 }
@@ -7190,10 +7438,25 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 
 	if (GpuResult.IsOk())
 	{
-		Result.Quads.Reserve(GpuResult.Quads.Num());
-		for (const uint64 Packed : GpuResult.Quads)
+		if (GpuResult.GpuQuads.IsValid())
 		{
-			Result.Quads.Add(UnpackVoxelChunkQuad(Packed));
+			// Wave D / D1. The quads never left the GPU, so there is nothing to
+			// unpack -- which is the point: this loop and ApplyMeshResult's
+			// matching PackVoxelChunkQuad loop were a provably lossless round
+			// trip (VoxelGpuVerify.cpp asserts Pack(Unpack(P)) == P) that existed
+			// only because two APIs disagreed on a type. ~1,300 iterations and
+			// two ~10 KB allocations per chunk, on the game thread, to arrive at
+			// the bytes we started with.
+			Result.GpuQuads = MoveTemp(GpuResult.GpuQuads);
+			Result.GpuQuadCount = GpuResult.NumQuads;
+		}
+		else
+		{
+			Result.Quads.Reserve(GpuResult.Quads.Num());
+			for (const uint64 Packed : GpuResult.Quads)
+			{
+				Result.Quads.Add(UnpackVoxelChunkQuad(Packed));
+			}
 		}
 	}
 	else
@@ -7668,6 +7931,12 @@ void FVoxelWorldImpl::DispatchJobs()
 		{
 			++GpuMeshJobsDispatchedSinceLog;
 			++GpuMeshDispatchedByLevel[FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1)];
+			// Stage-0 tile-batching census (see TileCensusSinceLog doc comment):
+			// this dispatch just took the GPU fork branch, so tally it under the
+			// 4x4-lattice tile it would join if DispatchJobs batched by tile.
+			// Measurement only -- does not change which branch this chunk took.
+			++TileCensusSinceLog.FindOrAdd(
+				FIntVector(LevelKey.Level, LevelKey.Key.X >> 2, LevelKey.Key.Y >> 2));
 			// Deliberately NOT added to InFlightTasks: a GPU job has no
 			// UE::Tasks::TTask. WaitForInFlightTasks covers it separately, and
 			// says why at length.
@@ -8248,6 +8517,9 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	// in this world is 84 km from anything worth drawing.
 	GpuPoolRebase = FirstChunkOrigin;
 	Pool->SetWorldLocation(GpuPoolRebase);
+	// See the member: SubmitGpuMeshJob composes a chunk's world origin from this
+	// exactly as ApplyMeshResult does.
+	GpuPoolRoot = &Root;
 
 	// Sized once, up front, and never grown. The live 2 km cascade measured
 	// 9,441,170 quads (docs/gpu-g0-sizing.md); the headroom above that pays for
@@ -8287,14 +8559,38 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	// against GetFreeQuads() says whether this is genuinely full or merely
 	// fragmented -- very different problems, and only the second wants a
 	// compaction pass.
-	constexpr uint32 kPoolCapacityQuads = 26u * 1000u * 1000u;   // 208 MB at 8 B/quad
-	Pool->InitPool(kPoolCapacityQuads);
+	// 2026-07-27 addendum: 26 M is NOT ENOUGH for the 128 m cascade on REAL
+	// terrain either -- the ring-gap night's cold-fill legs settled with
+	// residentQuads pegged at exactly this capacity (docs/measurements/
+	// ring-gap-2026-07-27.txt), i.e. silently saturated. -VoxelPoolCapacityQuads
+	// overrides it for that work (latched, like the ring switches: the pool is
+	// sized once before any cvar could land); the pool component now also logs
+	// a latched Error the first time it saturates or refuses an allocation, so
+	// the silent-success failure shape above cannot recur unnoticed.
+	// RESIZED 26M -> 44M for the adopted 128 m / 4 km cascade (2026-07-27):
+	// measured demand at settle is 35,205,733 quads (39,020 chunks, identical
+	// across four legs and both meshers, real terrain, pool overridden to 60M so
+	// nothing saturated the measurement). 44M = 35.2M + ~13% motion stand-in
+	// double-allocation (the ring-gap night's measured retention overhead) +
+	// ~10% first-fit fragmentation -- the same headroom methodology as the 26M
+	// sizing below, re-derived from the new cascade's numbers. 352 MB at 8 B/quad.
+	constexpr uint32 kPoolCapacityQuads = 44u * 1000u * 1000u;   // 352 MB at 8 B/quad
+	uint32 PoolCapacityQuads = kPoolCapacityQuads;
+	{
+		uint32 Override = 0;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPoolCapacityQuads="), Override) && Override > 0)
+		{
+			PoolCapacityQuads = FMath::Clamp<uint32>(Override, 1u * 1000u * 1000u, 200u * 1000u * 1000u);
+		}
+	}
+	Pool->InitPool(PoolCapacityQuads);
 
 	GpuPool = Pool;
 	UE_LOG(LogVoxelStream, Log,
-	       TEXT("voxel.Stream.GPU: geometry pool up, %u quad capacity (%.0f MB), chunk table floor %d. "
+	       TEXT("voxel.Stream.GPU: geometry pool up, %u quad capacity (%.0f MB)%s, chunk table floor %d. "
 	            "Chunks now stream as ranges in ONE primitive."),
-	       kPoolCapacityQuads, double(kPoolCapacityQuads) * 8.0 / (1024.0 * 1024.0), 49152);
+	       PoolCapacityQuads, double(PoolCapacityQuads) * 8.0 / (1024.0 * 1024.0),
+	       PoolCapacityQuads != kPoolCapacityQuads ? TEXT(" [OVERRIDDEN]") : TEXT(""), 49152);
 	return Pool;
 }
 
@@ -8371,8 +8667,24 @@ void FVoxelWorldImpl::ReleaseChunkGeometry(VoxelStreaming::FChunkRecord& Rec)
 
 bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
                                        const VoxelCoords::FVoxelLevelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec,
-                                       TArray<FVoxelChunkQuad>&& Quads, bool bIsGameThreadMesh)
+                                       TArray<FVoxelChunkQuad>&& Quads, bool bIsGameThreadMesh,
+                                       const FVoxelGpuQuadPayloadRef& GpuQuads, int32 GpuQuadCount)
 {
+	// WAVE D / D1: TWO WAYS TO BE HANDED A CHUNK'S GEOMETRY.
+	//
+	// Quads is the CPU form and is what every caller but one passes. GpuQuads is
+	// a handle to quads that are already in GPU memory, and when it is set Quads
+	// is EMPTY while GpuQuadCount describes the chunk. NumQuads below is the one
+	// count both forms answer to; nothing past this line may ask Quads.Num().
+	//
+	// A GPU payload is proof the chunk was admitted as poolable at dispatch
+	// (SubmitGpuMeshJob checks the renderer, the level, the record and GI before
+	// asking for one), so the pooled branch below is taken UNCONDITIONALLY for
+	// it -- a mid-flight voxel.Stream.GPU flip must not strand a chunk whose
+	// geometry only exists somewhere the component path cannot read.
+	const bool bGpuResident = GpuQuads.IsValid();
+	const int32 NumQuads = bGpuResident ? GpuQuadCount : Quads.Num();
+
 	// docs/debug-tooling-plan.md P1 "Memory" row: ResidentQuads tracks
 	// currently-loaded quads (not the cumulative TotalQuadsLoaded below), so
 	// it must be decremented by whatever this record held before, regardless
@@ -8380,7 +8692,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	ResidentQuads -= Rec.LastQuadCount;
 	Rec.LastQuadCount = 0;
 
-	if (Quads.Num() == 0)
+	if (NumQuads == 0)
 	{
 		// No visible geometry (fully buried chunk, or an edit carved away
 		// the last exposed faces): park (not destroy) any stale component --
@@ -8409,19 +8721,47 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	const int32 GpuMaxLevel = CVarGpuMaxLevel ? CVarGpuMaxLevel->GetInt() : -1;
 	const bool bLevelPoolable = (GpuMaxLevel < 0) || (Key.Level <= GpuMaxLevel);
 
-	if (VoxelDebug::GetStreamGpu() && bLevelPoolable && !Rec.Component.IsValid())
+	// bGpuResident FORCES this branch, and that is not a shortcut. A payload
+	// exists only because SubmitGpuMeshJob already checked the renderer, the
+	// level, the record and GI at dispatch; the quads live nowhere the component
+	// path can read, so falling through to it would silently lose a chunk that
+	// the fork has already counted as delivered.
+	if (bGpuResident || (VoxelDebug::GetStreamGpu() && bLevelPoolable && !Rec.Component.IsValid()))
 	{
 		const bool bWasFirstLoad = (Rec.PoolSlot == INDEX_NONE);
+
+		if (bGpuResident && Rec.Component.IsValid())
+		{
+			// The one condition SubmitGpuMeshJob checked that can genuinely have
+			// changed in flight. Mixing representations for one chunk is the
+			// thing that would actually break, so this refuses rather than
+			// improvises -- loudly, and leaving the record UNSETTLED so it cannot
+			// release a retained stand-in on the strength of geometry that was
+			// dropped.
+			UE_LOG(LogVoxelStream, Error,
+			       TEXT("voxel.GPU.MeshDirectToPool: chunk L%d (%d,%d,%d) acquired a component while its GPU "
+			            "mesh was in flight — %d quads DROPPED rather than draw the same chunk twice."),
+			       Key.Level, Key.Key.X, Key.Key.Y, Key.Key.Z, NumQuads);
+			return false;
+		}
 
 		// The CPU mesher's quads, packed into the same 8 bytes the GPU mesher
 		// emits (see PackVoxelChunkQuad -- the layout is a contract with
 		// VoxelQuadDecode.ush). This is the whole bridge: the pooled renderer
 		// does not care which mesher produced the geometry.
+		//
+		// SKIPPED ENTIRELY for a GPU-resident chunk: those bytes are already in
+		// the exact layout this loop produces, in GPU memory, and packing them
+		// here would mean having read them back first. That round trip -- unpack
+		// in OnGpuMeshJobComplete, repack here -- is what D1 deletes.
 		TArray<uint64> Packed;
-		Packed.SetNumUninitialized(Quads.Num());
-		for (int32 I = 0; I < Quads.Num(); ++I)
+		if (!bGpuResident)
 		{
-			Packed[I] = PackVoxelChunkQuad(Quads[I]);
+			Packed.SetNumUninitialized(Quads.Num());
+			for (int32 I = 0; I < Quads.Num(); ++I)
+			{
+				Packed[I] = PackVoxelChunkQuad(Quads[I]);
+			}
 		}
 
 		const FVector OriginRelative = VoxelCoords::ChunkOriginWorldForLevel(Key.Key, Key.Level);
@@ -8438,8 +8778,11 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		}
 
 		static bool bLoggedFirstPooledChunk = false;
-		if (!bLoggedFirstPooledChunk && Quads.Num() > 0)
+		if (!bLoggedFirstPooledChunk && !Quads.IsEmpty())
 		{
+			// CPU-form chunks only -- it prints a decoded quad, and there is no
+			// decoded quad on the direct path. The first DIRECT chunk gets its own
+			// line below rather than a version of this one that says nothing.
 			bLoggedFirstPooledChunk = true;
 			const FVoxelChunkQuad& Q = Quads[0];
 			UE_LOG(LogVoxelStream, Log,
@@ -8449,11 +8792,47 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			       Q.Axis, Q.Positive, Q.Slice, Q.U0, Q.V0, Q.W, Q.H, Q.Ao, Q.Mat,
 			       (unsigned long long)PackVoxelChunkQuad(Q));
 		}
+
+		static bool bLoggedFirstDirectChunk = false;
+		if (bGpuResident && !bLoggedFirstDirectChunk)
+		{
+			// The line that says the no-readback path is actually running. Without
+			// it, "D1 is on" and "D1 silently fell back to readback for every
+			// chunk" look identical in a log -- and the second reads as a
+			// successful run with disappointing numbers.
+			bLoggedFirstDirectChunk = true;
+			UE_LOG(LogVoxelStream, Log,
+			       TEXT("voxel.GPU.MeshDirectToPool: first chunk written GPU-side — level=%d chunk=(%d,%d,%d) "
+			            "quads=%d, no readback, no CPU staging, no re-upload."),
+			       Key.Level, Key.Key.X, Key.Key.Y, Key.Key.Z, NumQuads);
+		}
 		// Relative to the pool's own rebase origin, not the world -- see
 		// GetOrCreateGpuPool. Climate still samples at the ABSOLUTE position.
 		const FVector OriginInPool = OriginRelative - GpuPoolRebase;
 
-		if (bWasFirstLoad)
+		if (bGpuResident)
+		{
+			// ONLY THE FIRST-LOAD SHAPE EXISTS ON THIS PATH, and it is not an
+			// omission. The fork takes unedited chunks only; a re-mesh is an edit
+			// and goes through the overlay-aware game-thread path, which produces
+			// CPU quads. So a payload always arrives at a record with no pool
+			// slot, and UpdateChunkFromGpu would be code with no caller -- which
+			// is how it would rot. The check below is what says so if that ever
+			// stops being true.
+			if (!bWasFirstLoad)
+			{
+				UE_LOG(LogVoxelStream, Error,
+				       TEXT("voxel.GPU.MeshDirectToPool: chunk L%d (%d,%d,%d) already holds pool slot %d — the "
+				            "direct path has no in-place update, so %d quads were DROPPED. A re-mesh reached "
+				            "the fork, which is supposed to be impossible."),
+				       Key.Level, Key.Key.X, Key.Key.Y, Key.Key.Z, Rec.PoolSlot, NumQuads);
+				return false;
+			}
+			Rec.PoolSlot = Pool->AddChunkFromGpu(
+				GpuQuads, uint32(NumQuads), FVector3f(OriginInPool), Key.Level,
+				SampleChunkParamsForPool(Root, OriginRelative, Key.Level));
+		}
+		else if (bWasFirstLoad)
 		{
 			Rec.PoolSlot = Pool->AddChunk(
 				Packed, FVector3f(OriginInPool), Key.Level,
@@ -8479,10 +8858,18 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			// Free vs largest-run is the diagnosis: close together means the
 			// pool is genuinely full and wants more capacity; far apart means
 			// it is fragmented and wants compaction. Very different fixes.
+			//
+			// Identical for a GPU-resident chunk, deliberately: a full pool drops
+			// geometry the same way whichever mesher produced it, and the payload
+			// simply goes out of scope, releasing its GPU memory. The one
+			// difference is that AddChunkFromGpu also returns INDEX_NONE when the
+			// pool is not yet GPU-writable, which is the session's first few
+			// chunks and is self-correcting.
 			UE_LOG(LogVoxelStream, Warning,
-			       TEXT("voxel.Stream.GPU: no room for %d quads at level %d (%u free, largest run %u). "
+			       TEXT("voxel.Stream.GPU: no room for %d quads at level %d (%u free, largest run %u)%s. "
 			            "Chunk left undrawn."),
-			       Packed.Num(), Key.Level, Pool->GetFreeQuads(), Pool->GetLargestFreeRun());
+			       NumQuads, Key.Level, Pool->GetFreeQuads(), Pool->GetLargestFreeRun(),
+			       bGpuResident ? TEXT(" [GPU-resident]") : TEXT(""));
 			return false;
 		}
 
@@ -8497,8 +8884,8 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			Rec.RemeshedAtSeconds = ElapsedSeconds;
 		}
 
-		TotalQuadsLoaded += Quads.Num();
-		Rec.LastQuadCount = Quads.Num();
+		TotalQuadsLoaded += NumQuads;
+		Rec.LastQuadCount = NumQuads;
 		ResidentQuads += Rec.LastQuadCount;
 		Rec.bMeshSettled = true;
 		Rec.bHasOverlayBricks =
@@ -8519,6 +8906,14 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		// composed the same way SampleChunkParamsForPool composes it.
 		// With voxel.GI.Enabled 0 this is one cvar read and an immediate
 		// return, before the move.
+		//
+		// A GPU-RESIDENT CHUNK NEVER REACHES HERE WITH GEOMETRY GI WANTED, and
+		// that is arranged at dispatch rather than defended here: SubmitGpuMeshJob
+		// asks UVoxelGISubsystem::WantsChunkQuads before requesting a payload, so
+		// any chunk GI would ingest came back through the readback path with real
+		// Quads. If it did somehow arrive direct, Quads is empty and
+		// NotifyPooledChunkMeshUpdated's own `Quads.Num() == 0` test drops it --
+		// the safe direction, and the reason that test is worth having twice.
 		if (UWorld* World = VoxelGI::IsEnabled() ? Owner.GetWorld() : nullptr)
 		{
 			if (UVoxelGISubsystem* GI = World->GetSubsystem<UVoxelGISubsystem>())
@@ -8558,8 +8953,11 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		++TotalChunksLoaded;
 		++LevelChunksLoadedTotal[FMath::Clamp(Key.Level, 0, VoxelCoords::kNumLevels - 1)];
 	}
-	TotalQuadsLoaded += Quads.Num();
-	Rec.LastQuadCount = Quads.Num();
+	// NumQuads rather than Quads.Num(): identical on this path (a GPU-resident
+	// chunk can never reach it -- bGpuResident forces the pooled branch above)
+	// and one fewer place that would need changing if that ever stopped holding.
+	TotalQuadsLoaded += NumQuads;
+	Rec.LastQuadCount = NumQuads;
 	ResidentQuads += Rec.LastQuadCount;
 	Rec.bMeshSettled = true; // geometry final: may release a retained finer/coarser stand-in
 	Comp->SetChunkQuads(MoveTemp(Quads), VoxelCoords::ChunkEdgeVoxels);
@@ -8712,15 +9110,23 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		// have deleted visible geometry. Logged as an Error with the full key
 		// so it is impossible to miss in a headless run's log, and counted so
 		// the run can report a hard zero.
+		//
+		// QuadCount(), NOT Quads.Num(), HERE AND EVERYWHERE BELOW (Wave D / D1).
+		// A GPU-meshed chunk's quads never come to the CPU, so Quads is empty for
+		// a chunk that meshed to thousands. Reading it would make every skip
+		// verifier below incapable of ever firing -- they only trip on a NON-ZERO
+		// count -- so an unsound skip would stop being detected at exactly the
+		// moment the fork became the producer. Silent, and it would read as the
+		// verifiers passing.
 		if (Result.bPredictedEmpty)
 		{
 			++BuriedVerifyCheckedSinceLog;
-			if (Result.Quads.Num() > 0)
+			if (Result.QuadCount() > 0)
 			{
 				++BuriedVerifyViolations;
 				UE_LOG(LogVoxelPerf, Error,
 				       TEXT("Voxel buried skip UNSOUND: chunk L%d (%d,%d,%d) was predicted empty but meshed %d quads"),
-				       Result.Key.Level, Result.Key.Key.X, Result.Key.Key.Y, Result.Key.Key.Z, Result.Quads.Num());
+				       Result.Key.Level, Result.Key.Key.X, Result.Key.Key.Y, Result.Key.Key.Z, Result.QuadCount());
 			}
 		}
 
@@ -8733,13 +9139,13 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		if (SolidSkipVerifyKeys.Remove(Result.Key) > 0)
 		{
 			++SolidVerifyCheckedSinceLog;
-			if (Result.Quads.Num() > 0)
+			if (Result.QuadCount() > 0)
 			{
 				++SolidVerifyViolations;
 				UE_LOG(LogVoxelPerf, Error,
 				       TEXT("Voxel solid skip UNSOUND: chunk L%d (%d,%d,%d) was predicted all-solid at admission ")
 				       TEXT("but meshed %d quads"),
-				       Result.Key.Level, Result.Key.Key.X, Result.Key.Key.Y, Result.Key.Key.Z, Result.Quads.Num());
+				       Result.Key.Level, Result.Key.Key.X, Result.Key.Key.Y, Result.Key.Key.Z, Result.QuadCount());
 			}
 		}
 
@@ -8751,8 +9157,9 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		{
 			const int32 Lvl = FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1);
 			++LevelResultsSinceLog[Lvl];
-			(Result.Quads.Num() == 0 ? LevelZeroQuadMsSinceLog[Lvl] : LevelQuadMsSinceLog[Lvl]) += Result.JobMs;
-			if (Result.Quads.Num() == 0)
+			const int32 ResultQuads = Result.QuadCount();
+			(ResultQuads == 0 ? LevelZeroQuadMsSinceLog[Lvl] : LevelQuadMsSinceLog[Lvl]) += Result.JobMs;
+			if (ResultQuads == 0)
 			{
 				++LevelZeroQuadSinceLog[Lvl];
 				switch (Result.EmptyClass)
@@ -8809,24 +9216,30 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			{
 				++VerifyAirPredictions;
 				++VerifyAirPredictionsByLevel[VLvl];
-				if (Result.Quads.Num() != 0)
+				if (Result.QuadCount() != 0)
 				{
 					++VerifyAirViolations;
 					UE_LOG(LogVoxelPerf, Error,
 					       TEXT("VoxelVerifySkyBand VIOLATION: level=%d chunk=(%d,%d,%d) was predicted all-air but meshed %d quads"),
-					       Result.Key.Level, Result.Key.Key.X, Result.Key.Key.Y, Result.Key.Key.Z, Result.Quads.Num());
+					       Result.Key.Level, Result.Key.Key.X, Result.Key.Key.Y, Result.Key.Key.Z, Result.QuadCount());
 				}
 			}
 		}
 
 		Rec->bJobInFlight = false;
-		ZeroQuadAppliesSinceLog += (Result.Quads.Num() == 0) ? 1 : 0;
-		if (Result.Quads.Num() == 0)
+		const int32 AppliedQuads = Result.QuadCount();
+		ZeroQuadAppliesSinceLog += (AppliedQuads == 0) ? 1 : 0;
+		if (AppliedQuads == 0)
 		{
 			++LevelZeroQuadTotal[FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
 		}
 		++Applied; // a live result: this IS a render-thread-facing apply
-		if (ApplyMeshResult(Owner, Root, Material, Result.Key, *Rec, MoveTemp(Result.Quads), /*bIsGameThreadMesh*/ false))
+		// Both forms are handed over: exactly one of them is populated, and
+		// ApplyMeshResult picks its branch on which. The payload is passed by
+		// const reference and its refcount released when Result goes out of
+		// scope at the top of the next iteration.
+		if (ApplyMeshResult(Owner, Root, Material, Result.Key, *Rec, MoveTemp(Result.Quads),
+		                    /*bIsGameThreadMesh*/ false, Result.GpuQuads, int32(Result.GpuQuadCount)))
 		{
 			++ProxiesCreated;
 		}

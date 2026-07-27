@@ -105,6 +105,26 @@ void AVoxelEarthGameMode::BeginPlay()
 			{
 				SunComp->SetIntensity(8.f);
 				SunComp->SetAtmosphereSunLight(true);
+				// -VoxelShadowCascades=<N>: the HONEST control for the shadow-
+				// gather cost. The 2026-07-27 draw-path diagnosis measured the
+				// shadow gathers at ~4 per camera gather, each submitting against
+				// the whole pool; the confirmation leg that tried to vary this
+				// with `r.Shadow.CSM.MaxCascades 1` via -ExecCmds moved NOTHING
+				// (the gather census stayed at 5/frame) -- the per-light property
+				// below is what actually governs, so the sweep has to set it
+				// here, at the light, before the first shadow setup. Latched;
+				// absent = engine default (unchanged behaviour).
+				{
+					int32 Cascades = 0;
+					if (FParse::Value(FCommandLine::Get(), TEXT("VoxelShadowCascades="), Cascades) && Cascades >= 0)
+					{
+						SunComp->DynamicShadowCascades = FMath::Clamp(Cascades, 0, 10);
+						SunComp->MarkRenderStateDirty();
+						UE_LOG(LogVoxelStream, Log,
+						       TEXT("VoxelShadowCascades override: sun DynamicShadowCascades=%d"),
+						       SunComp->DynamicShadowCascades);
+					}
+				}
 			}
 		}
 		if (ASkyLight* Sky = World->SpawnActor<ASkyLight>())
