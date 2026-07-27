@@ -60,6 +60,37 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadVertexFactoryParameters, )
 	// entries the extra 8 bytes per chunk is noise against the quad pool.
 	SHADER_PARAMETER_SRV(StructuredBuffer<float4>, ChunkParams)
 	SHADER_PARAMETER(uint32, PoolMode)
+
+	// WATER MODE: this pool draws vxc::WaterBrick8 fill, not terrain.
+	//
+	// It changes two vertex-colour channels and nothing else:
+	//
+	//   R -- terrain packs a BINARY sky-facing biome flag, derived from face
+	//        direction and the chunk's surface height, and deliberately NOT the
+	//        material id (see the long comment at the R assignment in
+	//        VoxelQuadVertexFactory.ush: a categorical id does not survive the
+	//        FColor->shader transform). Water has no biome and no surface-height
+	//        gate; what it needs is the CA fill fraction 0..255, which the water
+	//        mesher's sampler puts in the quad's `mat` byte precisely so it
+	//        rides the existing encoding.
+	//   B -- terrain packs per-chunk climate; water packs
+	//        FVoxelQuadVertex::TopBoundary, which says whether this VERTEX sits
+	//        on the +Z boundary of its own voxel.
+	//
+	// M_WaterVoxel's World Position Offset consumes both: it lowers the
+	// top-boundary vertices by (1 - fill) of a voxel. Per-vertex rather than
+	// per-face, so a partial cell's side walls shorten with its surface instead
+	// of ringing every pool with a one-voxel bathtub rim.
+	//
+	// THE COMPONENT PATH NEEDS NO EQUIVALENT: FWaterChunkSceneProxy writes both
+	// channels directly (VoxelWaterChunkComponent.cpp). This flag exists only to
+	// make the pooled path agree with the path that is currently the default.
+	//
+	// NOTE this falsifies docs/gpu-water-pool-design.md's "the vertex factory
+	// needed no change" row, which was true for a constant-colour water material
+	// and stops being true the moment fill drives anything. That doc is corrected
+	// in the same change that adds this.
+	SHADER_PARAMETER(uint32, WaterMode)
 END_GLOBAL_SHADER_PARAMETER_STRUCT()
 
 // WHERE THIS DRAW STARTS IN THE POOL, in quads. Bound PER BATCH ELEMENT.
@@ -144,6 +175,11 @@ public:
 		bPoolMode = true;
 	}
 
+	// Marks this factory as drawing water fill rather than terrain. See
+	// FVoxelQuadVertexFactoryParameters::WaterMode. Must be set BEFORE InitRHI,
+	// like every other setter here -- the uniform buffer is built there.
+	void SetWaterMode(bool bInWaterMode) { bWaterMode = bInWaterMode; }
+
 	FRHIUniformBuffer* GetUniformBuffer() const { return UniformBuffer.GetReference(); }
 
 	// BaseQuad = 0, built once. Bound for any element that carries no range of
@@ -164,6 +200,7 @@ private:
 	FShaderResourceViewRHIRef QuadChunkIdsSRV;
 	FShaderResourceViewRHIRef ChunkParamsSRV;
 	bool bPoolMode = false;
+	bool bWaterMode = false;
 	TUniformBufferRef<FVoxelQuadVertexFactoryParameters> UniformBuffer;
 	TUniformBufferRef<FVoxelQuadRangeParameters> ZeroRangeUniformBuffer;
 };

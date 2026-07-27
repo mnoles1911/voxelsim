@@ -90,6 +90,43 @@ public:
 			const uint8 Ao11 = (Q.Ao >> 6) & 0x3;
 			const uint8 AoAtVert[4] = {Ao00, Ao01, Ao11, Ao10};
 
+			// Which of this quad's four corners sit on the TOP (+Z) boundary of
+			// the voxel the face belongs to. M_WaterVoxel's World Position
+			// Offset lowers exactly those, by (1 - fill) of a voxel, which is
+			// what turns a partially-filled cell into a real surface.
+			//
+			// It has to be per-VERTEX, not per-face: gating on the face normal
+			// would lower only +Z faces and leave a partial cell's side walls
+			// at full height, ringing every pool with a one-voxel bathtub rim.
+			// A side face has two top corners and two bottom ones, so moving
+			// only the top pair makes it a trapezoid that meets the surface.
+			//
+			// For a Z-normal face the whole quad is in one plane, so the test
+			// is just Positive. Otherwise the quad spans a Z range and the top
+			// corners are the ones at its maximum Z -- read straight off the
+			// corner positions rather than re-deriving which of U/V carries Z.
+			// Mirrors DecodeVoxelQuadVertex's TopBoundary in VoxelQuadDecode.ush;
+			// the two must agree or the pooled and component paths draw
+			// different geometry for the same water.
+			bool bTopCorner[4] = {false, false, false, false};
+			if (Axis == 2)
+			{
+				const bool bPositiveFace = (Q.Positive != 0);
+				bTopCorner[0] = bTopCorner[1] = bTopCorner[2] = bTopCorner[3] = bPositiveFace;
+			}
+			else
+			{
+				float MaxZ = Pos[0].Z;
+				for (int32 I = 1; I < 4; ++I)
+				{
+					MaxZ = FMath::Max(MaxZ, Pos[I].Z);
+				}
+				for (int32 I = 0; I < 4; ++I)
+				{
+					bTopCorner[I] = Pos[I].Z > MaxZ - 0.5f * VoxelSizeUU;
+				}
+			}
+
 			const FVector3f Normal = AxisDir[Axis] * (Q.Positive ? 1.f : -1.f);
 			const FVector3f TangentX = AxisDir[U];
 			const FVector3f TangentY = AxisDir[V];
@@ -105,13 +142,19 @@ public:
 				const float WorldV = WrapWorldToUV(ComponentWorldOrigin[V], double(Pos[CornerIdx][V]));
 				Vert.TextureCoordinate[0] = FVector2f(WorldU, WorldV);
 
-				// R = material id (always a fixed nonzero placeholder for
-				// water, see UVoxelWaterSubsystem.cpp's meshing sampler), G =
-				// AO (2-bit -> 0/85/170/255), B unused, A = 255 -- same
-				// vertex-color convention as terrain's proxy, so the water
-				// material can reuse the same AO-shading approach if wanted.
+				// R = CA fill fraction 0..255 for this face's cell (the water
+				// mesher's sampler puts it in Q.Mat -- see
+				// UVoxelWaterSubsystem.cpp; it was a fixed placeholder before
+				// fill-fraction surfaces), G = AO (2-bit -> 0/85/170/255),
+				// B = top-boundary flag (see bTopCorner above), A = 255.
+				//
+				// R and B together are what M_WaterVoxel's World Position
+				// Offset consumes. Terrain's proxy uses R and B for a biome
+				// tint and climate instead, so this convention is now water's
+				// own rather than shared -- the pooled path reproduces THIS
+				// one under FVoxelQuadVertexFactoryParameters::WaterMode.
 				const uint8 AoByte = uint8(AoAtVert[CornerIdx] * 85);
-				Vert.Color = FColor(Q.Mat, AoByte, 0, 255);
+				Vert.Color = FColor(Q.Mat, AoByte, bTopCorner[CornerIdx] ? 255 : 0, 255);
 
 				Vertices.Add(Vert);
 			}

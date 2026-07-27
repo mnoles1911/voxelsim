@@ -218,6 +218,7 @@ public:
 		, Params(InParams)
 		, Runs(InRuns)
 		, ChunkEdgeVoxels(Component->GetChunkEdgeVoxels())
+		, bWaterMode(Component->IsWaterMode())
 		, NumQuads(Component->GetHighWaterMarkQuads())
 		, BufferQuads(InQuads.Num())
 		, NumChunks(InOrigins.Num())
@@ -337,6 +338,9 @@ public:
 
 		VertexFactory.SetQuadBufferSRV(QuadBufferSRV);
 		VertexFactory.SetPoolBuffers(OriginSRV, ChunkIdSRV, ParamsSRV);
+		// Before InitResource: the uniform buffer is built in InitRHI, so a
+		// setter called after this line would be silently ignored.
+		VertexFactory.SetWaterMode(bWaterMode);
 		VertexFactory.InitResource(RHICmdList);
 
 		UE_LOG(LogTemp, Log,
@@ -689,6 +693,7 @@ private:
 	// derive this itself.
 	TArray<UVoxelGpuPoolComponent::FChunkRun> Runs;
 	int32 ChunkEdgeVoxels = 32;
+	bool bWaterMode = false;
 
 	struct FQuadRange { uint32 First = 0; uint32 Count = 0; };
 

@@ -232,10 +232,36 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	const float FaceTint = (Axis == 2u) ? ((QPositive != 0u) ? 1.0f : 0.0f)
 	                                    : (140.0f / 255.0f);
 
+	// WATER MODE overrides R entirely, and only R.
+	//
+	// Everything above this line is terrain's biome plumbing, which water has no
+	// use for: there is no biome, and the surface-height gate is meaningless for
+	// a water brick. What water needs in R is the CA fill fraction 0..255, which
+	// the water mesher's occupancy sampler writes into the quad's `mat` byte
+	// (UVoxelWaterSubsystem.cpp) precisely so it rides this existing encoding
+	// with no second decode path.
+	//
+	// This is what M_WaterVoxel's World Position Offset reads to seat each
+	// surface cell's top face at its own fill height. Without this branch the
+	// pooled path would hand it the biome flag -- 1.0 for every +Z face -- and
+	// every water surface would draw at full height, silently agreeing with the
+	// old >=128 behaviour while the component path showed the stepped surface.
+	//
+	// The component path needs no equivalent: FWaterChunkSceneProxy already
+	// writes FColor(Q.Mat, ...) into R directly.
+	// B likewise: terrain carries per-chunk climate there, water carries the
+	// per-vertex top-boundary flag the World Position Offset needs to lower a
+	// partial cell's surface without shearing its side walls. See
+	// FVoxelQuadVertex::TopBoundary.
+	const bool bWater = (VoxelVF.WaterMode != 0u);
+	const float TerrainTintR = bNearSurface ? FaceTint : 0.0f;
+	const float ColorR = bWater ? (float(Decoded.MaterialId) * (1.0f / 255.0f)) : TerrainTintR;
+	const float ColorB = bWater ? Decoded.TopBoundary : ChunkClimate.x;
+
 	Intermediates.Color = half4(
-		bNearSurface ? (half)FaceTint : 0.0h,
+		(half)ColorR,
 		(half)Decoded.AmbientOcclusion,
-		(half)ChunkClimate.x,
+		(half)ColorB,
 		(half)ChunkClimate.y);
 
 	// World-planar UVs on the face's two in-plane axes, matching the CPU

@@ -13,8 +13,8 @@ the deliverable as much as the code was.
 | Blend mode | opaque/masked | **translucent**, two-sided, opacity 0.55 | material only |
 | Quad packing | `PackVoxelChunkQuad` | same | **yes, unchanged** |
 | Decode | `VoxelQuadDecode.ush` | same | **yes, unchanged** |
-| Vertex factory | `VoxelQuadVertexFactory.ush` | same | **yes, unchanged** |
-| Vertex colour used | R biome tint, G AO, B/A climate | **G only** | inert, not wrong |
+| Vertex factory | `VoxelQuadVertexFactory.ush` | same + a water branch | **CORRECTED — see below** |
+| Vertex colour used | R biome tint, G AO, B/A climate | **R fill, G AO, B top-boundary** | **CORRECTED — see below** |
 | Per-chunk material params | ring cross-fade, debug tint | **none** | n/a |
 | Entry size | 32-voxel chunk | 8-voxel `vxc::WaterBrick8` | per-instance setter |
 | Mip levels | 0..5 | always 0 | n/a |
@@ -30,6 +30,45 @@ and the factory already writes AO into `.G`. The other three channels carry
 terrain's sky-facing biome flag and its per-chunk climate; water never samples
 them, so they are inert rather than wrong. Nothing in `.ush` had to learn what
 water is.
+
+> **CORRECTED. This held exactly as long as water's material was constant, and
+> stopped holding the moment fill drove anything.** The claim was true, and its
+> reasoning was sound, but its premise was load-bearing in a way this document
+> did not flag: "water never samples R/B" is a statement about *this* material,
+> not about water.
+>
+> Stepped fill-fraction surfaces need two per-vertex quantities the geometry
+> already has and the factory was discarding:
+>
+> - **R — the CA fill fraction.** `Decoded.MaterialId` was decoded and then
+>   thrown away, because terrain deliberately computes R as a *binary*
+>   sky-facing biome flag from face direction and surface height rather than
+>   from the material id (`:198` — thresholding a categorical id through the
+>   `FColor`→shader transform proved unreliable). Water's mesher puts fill in
+>   the `mat` byte precisely so it rides the existing 8-bit encoding, so the
+>   factory has to stop discarding it.
+> - **B — a top-boundary flag.** Whether this *vertex* sits on the +Z boundary
+>   of its own voxel. Terrain uses B for per-chunk climate.
+>
+> Both are switched on `FVoxelQuadVertexFactoryParameters::WaterMode`, a uniform
+> buffer member (not a loose `FShaderParameter` — those are measured not to bind
+> in this project, and `ShaderBindings.Add()` on an unbound one is a *silent*
+> no-op, `gpu-g2-draw-path.md`).
+>
+> **What survives the correction is the part that mattered.** The quad packing,
+> the decode, and the pool machinery are still shared unchanged; this is one
+> branch on one channel pair, not a second decode path, so the pool is still one
+> class parameterised rather than two maintained. But the general claim — "the
+> renderer never had to learn what water is" — is now false, and the honest
+> version is narrower: *the geometry encoding never had to.*
+>
+> The per-vertex-ness of B is the non-obvious half and was found by reasoning
+> through the geometry, not by a test. Gating the offset on the face normal
+> instead — the obvious implementation — lowers only `+Z` faces and leaves a
+> partially-filled cell's side walls at full height, ringing every pool with a
+> one-voxel bathtub rim standing proud of its own surface. A side face has two
+> top vertices and two bottom ones; moving only the top pair makes it a
+> trapezoid that meets the lowered surface.
 
 **The quad packing already fits.** `PackVoxelChunkQuad`'s fields are each 8
 bits and a water brick is 8 voxels on an edge, so brick-local coordinates fit
@@ -66,6 +105,15 @@ That does not produce a visible error **for this material specifically**:
   correctly hidden whether it is one primitive or three thousand.
 - The per-brick path was already unsorted *within* a brick, so this widens an
   existing approximation rather than introducing a new class of error.
+
+> **Still true after stepped fill-fraction surfaces landed, and worth being
+> explicit about because it is easy to muddle.** That change makes fill drive
+> **geometry** — where a surface vertex sits — and nothing else. Base colour and
+> opacity are still constant, there is still no refraction and no scene-colour
+> read, so two water fragments *still* differ between orderings only by their
+> lighting, and a stack of N surfaces still transmits `(1-0.55)^N` in any order.
+> Moving a vertex does not change transmittance. **The single sort key survives
+> this change; it does not survive the next one.**
 
 **What would break it**, and each is on the W5 polish list:
 
@@ -161,3 +209,24 @@ settled first, which removes the underground residency variable entirely;
 `voxel.Water.SpawnIn` exists for that and aims at the ground rather than the
 crosshair for the reason recorded in its own comment. It was not run to
 conclusion here.
+
+> **That anchor now exists: `-VoxelWaterParityTest[=<delaySeconds>]`**
+> (`VoxelEarthGameMode.cpp`). It poses on the surface above the spawn column,
+> **waits for terrain streaming to go quiet before any water exists**, pours a
+> fixed 30,000 units, waits for the CA to reach zero active bricks, re-asserts
+> the identical pose and captures `VoxelWaterParity`. The settle wait is the
+> instrument, not a convenience — a capture taken mid-stream measures streaming,
+> and the fixture logs a loud warning if it hits its poll cap without going
+> quiet, so a contaminated run cannot be mistaken for a clean one.
+>
+> Protocol: run it twice at one `voxel.Water.GPU` value to get the noise floor,
+> then twice at the other. If the same-config pair straddles the cross-config
+> difference, there is no difference to report — say so rather than reporting
+> the difference.
+>
+> **The frame-cost half still cannot be automated, and the reason is recorded in
+> `manual-verification-checklist.md` 4a**: `-VoxelPerfRun` samples the world
+> delta, which the engine clamps at `MaxUndilatedFrameTime` (400 ms), and these
+> anchors run below that on the full cascade — so every automated sample reads
+> exactly 400.00 and two configurations come back identical. A human reading
+> `stat unit` is the instrument. **Draw is the number to watch, not Frame.**

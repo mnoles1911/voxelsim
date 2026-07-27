@@ -1586,6 +1586,228 @@ void AVoxelEarthGameMode::BeginPlay()
 			SpawnWaterTestDelaySeconds, false);
 	}
 
+	// --- Water pool parity anchor -------------------------------------------
+	//
+	// -VoxelWaterParityTest[=<delaySeconds>] (default 25s). Poses on the
+	// surface above the spawn column, WAITS FOR TERRAIN STREAMING TO GO QUIET
+	// BEFORE ANY WATER EXISTS, pours a fixed volume, waits for the CA to settle
+	// to zero active bricks, re-asserts the identical pose, and captures.
+	//
+	// Run it twice with the same `voxel.Water.GPU` value to get the noise
+	// floor, then twice more with the other value. If the two same-config
+	// readings straddle the cross-config difference, there is no difference to
+	// report -- which is exactly what happened at the -VoxelFloodTest anchor
+	// and is why this fixture exists (see the header comment).
+	//
+	// The frame-cost half of the measurement is NOT automatable here and must
+	// not be faked: -VoxelPerfRun samples the world delta, which the engine
+	// clamps at MaxUndilatedFrameTime (400 ms), and these anchors run below
+	// that on the full cascade, so every automated sample reads exactly 400.00
+	// and two configurations come back identical. A human reading `stat unit`
+	// is the instrument for that number -- see manual-verification-checklist.md
+	// item 4a. This fixture's job is to make the SCENE reproducible so that
+	// reading means something; Draw is the number to watch, not Frame.
+	float WaterParityDelaySeconds = 25.f;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterParityTest="), WaterParityDelaySeconds) ||
+	    FParse::Param(FCommandLine::Get(), TEXT("VoxelWaterParityTest")))
+	{
+		// Poll cadence and caps. The caps exist so a run on a slow box still
+		// terminates and still captures SOMETHING -- but a capped-out run logs
+		// loudly that it did, because a capture taken while streaming is still
+		// churning is precisely the useless measurement this fixture replaces.
+		constexpr float PollIntervalSeconds = 2.f;
+		constexpr int32 MaxTerrainPolls = 30; // 60s
+		constexpr int32 MaxWaterPolls = 20;   // 40s
+
+		// Same 30,000 units as -VoxelSpawnWaterTest, and for the same reason
+		// recorded there: a smaller pour spreads thin enough over an open
+		// surface that it settles below the meshing floor and is invisible.
+		constexpr uint32 ParityPourAmount = 30000;
+
+		auto PoseOnAnchor = [this]()
+		{
+			UWorld* PWorld = GetWorld();
+			APlayerController* Ctrl = PWorld ? PWorld->GetFirstPlayerController() : nullptr;
+			if (!Ctrl)
+			{
+				return;
+			}
+			if (APawn* P = Ctrl->GetPawn())
+			{
+				P->SetActorLocation(WaterParityCameraUU, false, nullptr, ETeleportType::TeleportPhysics);
+				P->SetActorRotation(WaterParityCameraRot);
+				Ctrl->SetViewTarget(P);
+			}
+			Ctrl->SetControlRotation(WaterParityCameraRot);
+		};
+
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelWaterParityTest: posing on the surface anchor in %.1fs, then settling terrain BEFORE any water exists."),
+		       WaterParityDelaySeconds);
+
+		GetWorldTimerManager().SetTimer(
+			WaterParityPoseTimerHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this, PoseOnAnchor, PollIntervalSeconds, MaxTerrainPolls, MaxWaterPolls, ParityPourAmount]()
+				{
+					UWorld* PWorld = GetWorld();
+					UVoxelWorldSubsystem* Terrain = PWorld ? PWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+					if (!Terrain)
+					{
+						UE_LOG(LogVoxelEarth, Warning, TEXT("VoxelWaterParityTest: terrain subsystem not ready, skipping."));
+						return;
+					}
+
+					// Stand back from and above the pour column, pitched down
+					// far enough that the pool fills the lower frame and the
+					// horizon stays out of it. Aiming at the horizon would put
+					// the distant cascade -- the most residency-sensitive thing
+					// in the scene -- into the very frame we are trying to hold
+					// constant.
+					const double SurfaceUU = Terrain->GetSurfaceHeightUU(0.0, 0.0);
+					WaterParityCameraUU = FVector(-900.0, 0.0, SurfaceUU + 700.0);
+					WaterParityCameraRot = FRotator(-38.0, 0.0, 0.0); // look +X, down at the pour column
+					PoseOnAnchor();
+
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelWaterParityTest: anchor posed at (%.0f,%.0f,%.0f) rot(pitch %.1f yaw %.1f); surface at %.0f. ")
+					       TEXT("Waiting for terrain residency to settle (poll %.0fs, cap %d)."),
+					       WaterParityCameraUU.X, WaterParityCameraUU.Y, WaterParityCameraUU.Z,
+					       WaterParityCameraRot.Pitch, WaterParityCameraRot.Yaw, SurfaceUU,
+					       PollIntervalSeconds, MaxTerrainPolls);
+
+					// --- Phase 1: terrain quiet, with NO water in the world ---
+					WaterParityTerrainPollDelegate = FTimerDelegate::CreateWeakLambda(this,
+						[this, PoseOnAnchor, PollIntervalSeconds, MaxTerrainPolls, MaxWaterPolls, ParityPourAmount]()
+						{
+							UWorld* TWorld = GetWorld();
+							UVoxelWorldSubsystem* T = TWorld ? TWorld->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+							UVoxelWaterSubsystem* W = TWorld ? TWorld->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+							if (!T || !W)
+							{
+								return;
+							}
+							++WaterParityTerrainPolls;
+
+							// Hold the pose every poll: the teleport above
+							// kicks a large streaming footprint and the pawn
+							// must not drift while it fills.
+							PoseOnAnchor();
+
+							const FVoxelPerfSnapshot Snap = T->GetPerfSnapshot();
+							const bool bQuiet = Snap.JobsInFlight == 0 && Snap.PendingJobQueueDepth == 0 &&
+							                    Snap.PendingGameThreadQueueDepth == 0 && Snap.PendingUnloadQueueDepth == 0 &&
+							                    Snap.ChunksLoadedPerSec <= 0.f;
+
+							UE_LOG(LogVoxelEarth, Log,
+							       TEXT("VoxelWaterParityTest terrain-poll %d/%d: inFlight=%d pendingJob=%d pendingGT=%d ")
+							       TEXT("pendingUnload=%d loaded/s=%.1f -> %s"),
+							       WaterParityTerrainPolls, MaxTerrainPolls, Snap.JobsInFlight, Snap.PendingJobQueueDepth,
+							       Snap.PendingGameThreadQueueDepth, Snap.PendingUnloadQueueDepth, Snap.ChunksLoadedPerSec,
+							       bQuiet ? TEXT("QUIET") : TEXT("still streaming"));
+
+							if (!bQuiet && WaterParityTerrainPolls < MaxTerrainPolls)
+							{
+								return; // repeating timer, poll again
+							}
+							GetWorldTimerManager().ClearTimer(WaterParityTerrainPollTimerHandle);
+
+							if (!bQuiet)
+							{
+								UE_LOG(LogVoxelEarth, Warning,
+								       TEXT("VoxelWaterParityTest: terrain did NOT go quiet within %d polls. The capture below ")
+								       TEXT("is contaminated by streaming and MUST NOT be used as a parity number -- raise the ")
+								       TEXT("cap or the delay and re-run."),
+								       MaxTerrainPolls);
+							}
+
+							// --- Phase 2: pour, now that the scene is still ---
+							const double PourSurfaceUU = T->GetSurfaceHeightUU(0.0, 0.0);
+							const FVector PourLoc(0.0, 0.0, PourSurfaceUU + 500.0);
+							const uint32 Placed = W->SpawnWaterAt(PourLoc, ParityPourAmount);
+							UE_LOG(LogVoxelEarth, Log,
+							       TEXT("VoxelWaterParityTest: terrain settled; poured %u/%u fill units at (0,0,%.0f). ")
+							       TEXT("Waiting for the CA to settle (poll %.0fs, cap %d)."),
+							       Placed, ParityPourAmount, PourLoc.Z, PollIntervalSeconds, MaxWaterPolls);
+
+							// --- Phase 3: water quiet ---
+							WaterParityWaterPollDelegate = FTimerDelegate::CreateWeakLambda(this,
+								[this, PoseOnAnchor, MaxWaterPolls]()
+								{
+									UWorld* WWorld = GetWorld();
+									UVoxelWaterSubsystem* WW = WWorld ? WWorld->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+									if (!WW)
+									{
+										return;
+									}
+									++WaterParityWaterPolls;
+									PoseOnAnchor();
+
+									const FVoxelWaterPerfSnapshot WSnap = WW->GetPerfSnapshot();
+									const bool bSettled = WSnap.ActiveBricks == 0;
+
+									UE_LOG(LogVoxelEarth, Log,
+									       TEXT("VoxelWaterParityTest water-poll %d/%d: activeBricks=%lld storedBricks=%lld ")
+									       TEXT("volume=%llu maxFill=%d -> %s"),
+									       WaterParityWaterPolls, MaxWaterPolls, WSnap.ActiveBricks, WSnap.StoredBricks,
+									       (unsigned long long)WSnap.TotalVolume, WW->GetMaxStoredFill(),
+									       bSettled ? TEXT("SETTLED") : TEXT("still moving"));
+
+									if (!bSettled && WaterParityWaterPolls < MaxWaterPolls)
+									{
+										return;
+									}
+									GetWorldTimerManager().ClearTimer(WaterParityWaterPollTimerHandle);
+
+									if (!bSettled)
+									{
+										UE_LOG(LogVoxelEarth, Warning,
+										       TEXT("VoxelWaterParityTest: water still active after %d polls -- the capture will ")
+										       TEXT("catch a moving surface and is not comparable across runs."),
+										       MaxWaterPolls);
+									}
+
+									// --- Phase 4: hold the pose, then shoot ---
+									// One more beat between the last pose
+									// assertion and the shutter, so the frame
+									// captured is the settled one.
+									GetWorldTimerManager().SetTimer(
+										WaterParityShotTimerHandle,
+										FTimerDelegate::CreateWeakLambda(this,
+											[this, PoseOnAnchor]()
+											{
+												UWorld* SWorld = GetWorld();
+												UVoxelWaterSubsystem* SW =
+													SWorld ? SWorld->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+												PoseOnAnchor();
+												if (SW)
+												{
+													const FVoxelWaterPerfSnapshot Final = SW->GetPerfSnapshot();
+													UE_LOG(LogVoxelEarth, Log,
+													       TEXT("VoxelWaterParityTest CAPTURE: pose (%.0f,%.0f,%.0f) ")
+													       TEXT("rot(pitch %.1f yaw %.1f) | activeBricks=%lld ")
+													       TEXT("storedBricks=%lld volume=%llu maxFill=%d ")
+													       TEXT("digest=0x%016llX"),
+													       WaterParityCameraUU.X, WaterParityCameraUU.Y,
+													       WaterParityCameraUU.Z, WaterParityCameraRot.Pitch,
+													       WaterParityCameraRot.Yaw, Final.ActiveBricks,
+													       Final.StoredBricks, (unsigned long long)Final.TotalVolume,
+													       SW->GetMaxStoredFill(),
+													       (unsigned long long)SW->GetWaterDigest());
+												}
+												FScreenshotRequest::RequestScreenshot(TEXT("VoxelWaterParity"), false, true);
+											}),
+										2.f, false);
+								});
+							GetWorldTimerManager().SetTimer(WaterParityWaterPollTimerHandle, WaterParityWaterPollDelegate,
+							                                PollIntervalSeconds, true);
+						});
+					GetWorldTimerManager().SetTimer(WaterParityTerrainPollTimerHandle, WaterParityTerrainPollDelegate,
+					                                PollIntervalSeconds, true);
+				}),
+			WaterParityDelaySeconds, false);
+	}
+
 	// ADR-0005 water persistence verification (docs/adr/0005-water-persistence.md):
 	// -VoxelWaterPersistTest[=<delaySeconds>] (default 12s) pours a pool at the
 	// spawn column and, best-effort, drains a flooded cavern near spawn (so the

@@ -27,6 +27,17 @@ struct FVoxelQuadVertex
 	float3 Normal;
 	float  AmbientOcclusion;  // 0 = fully occluded, 1 = open
 	uint   MaterialId;
+	// 1 if this vertex sits on the TOP (+Z) boundary of the voxel its face
+	// belongs to, 0 otherwise. Terrain ignores it; water uses it to lower a
+	// partially-filled cell's surface to its fill height.
+	//
+	// WHY PER-VERTEX AND NOT PER-FACE. Gating on the face normal alone would
+	// lower only +Z faces, leaving a partially-filled cell's SIDE faces at full
+	// height -- so every pool would be ringed by a one-voxel bathtub rim
+	// standing proud of its own surface. A side face has two vertices on the
+	// cell's top boundary and two on its bottom; moving only the top pair turns
+	// the quad into a trapezoid whose upper edge meets the lowered surface.
+	float  TopBoundary;
 };
 
 // Decodes one corner of one quad.
@@ -88,7 +99,30 @@ FVoxelQuadVertex DecodeVoxelQuadVertex(uint2 PackedQuad, uint CornerIndex, float
 	const uint AoShiftForCorner[4] = { 0u, 4u, 6u, 2u };
 	const uint AoRaw = (Ao >> AoShiftForCorner[Corner]) & 0x3u;
 
+	// Top-boundary test, in voxel units, before the scale is applied.
+	//
+	// For a Z-normal face the whole quad lies in one plane, so the answer is
+	// simply whether that plane is the voxel's top (positive) or bottom face.
+	// For a side face the quad spans a Z range, and Z is carried by whichever
+	// of the two in-plane axes happens to be axis 2: for Axis==0 that is V, for
+	// Axis==1 it is U. The vertex is on the top boundary when it sits at the
+	// larger end of that range.
+	float TopBoundary;
+	if (Axis == 2u)
+	{
+		TopBoundary = (Positive != 0u) ? 1.0f : 0.0f;
+	}
+	else
+	{
+		const float QuadMaxZVox = (U == 2u) ? float(U0 + W) : float(V0 + H);
+		// Exact equality is safe here -- both sides are small integers held
+		// exactly in float -- but the 0.5 slack costs nothing and documents
+		// that this is a "which end" test, not a distance test.
+		TopBoundary = (PositionVox[2] > QuadMaxZVox - 0.5f) ? 1.0f : 0.0f;
+	}
+
 	FVoxelQuadVertex Out;
+	Out.TopBoundary = TopBoundary;
 	Out.PositionUU = PositionVox * (VOXEL_SIZE_UU * LevelScale);
 	Out.Normal = Normal;
 	// 0..3 -> 0..1. The CPU path scales by 85/255, which is the same ratio;

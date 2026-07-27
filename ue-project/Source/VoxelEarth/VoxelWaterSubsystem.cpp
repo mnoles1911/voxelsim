@@ -524,6 +524,19 @@ UVoxelGpuPoolComponent* GetOrCreateWaterPool(FVoxelWaterImpl& Impl, AActor* Chun
 	// a full render-state rebuild -- and a full re-upload of the quad buffer --
 	// each time it does.
 	Pool->SetChunkTableCapacity(16384);
+	// Makes the pooled path reproduce water's vertex-colour convention rather
+	// than terrain's: R = the CA fill fraction this subsystem's meshing sampler
+	// puts in the quad's `mat` byte (terrain puts a binary sky-facing biome
+	// flag there), B = the per-vertex top-boundary flag (terrain puts per-chunk
+	// climate there). M_WaterVoxel's World Position Offset consumes both to
+	// lower a partial cell's surface to its fill height.
+	//
+	// WITHOUT this the pooled path would hand the material terrain's biome flag
+	// and climate, drawing every water surface at full height -- silently
+	// agreeing with the old >=128 behaviour while the component path, which is
+	// the default, showed the stepped surface. Must precede proxy creation
+	// (RegisterComponent below); the proxy takes a copy.
+	Pool->SetWaterMode(true);
 	// M_WaterVoxel. Without it the proxy silently falls back to the engine
 	// default material, which is opaque -- water would render as grey boxes and
 	// look like a geometry bug rather than a material one.
@@ -658,6 +671,31 @@ bool ApplyWaterBrickPooled(FVoxelWaterImpl& Impl, AActor* ChunkOwner, UMaterialI
 // one extra tick at most) instead of spiking one of them.
 constexpr int32 kMaxBrickMeshesPerTick = 8;
 
+// The smallest CA fill a cell must hold before it is meshed at all.
+//
+// The meshing sampler returns the fill fraction itself as the vxc::MaterialId
+// (see the Sampler lambda below), and vxc::MAT_AIR is 0, so ANY nonzero fill
+// would otherwise produce geometry. At the extreme that means a cell holding
+// 1/255 units emits a full quad whose top face M_WaterVoxel then pushes down
+// to 0.4 mm above the floor -- six vertices and a translucent draw for
+// something thinner than the mesher's own coordinate resolution.
+//
+// This is a RENDERING floor only. The CA still simulates, conserves and
+// replicates those units exactly as before; they are simply not drawn until
+// there is enough to see. That distinction matters because the alternative --
+// clamping the fill itself -- would destroy volume, which is the one thing
+// waterca.h's ledger is built to make impossible.
+//
+// 8/255 is ~3% of a voxel, i.e. ~3 mm at kVoxelSizeMm = 100 -- below what a
+// player can notice missing, above the sliver regime described here.
+//
+// ONE THING TO REVISIT IF THE SWE COUPLER IS EVER ENABLED (ADR-0004): a
+// settled SWE surface is flat only to its derived +/-16-unit deadband, so a
+// cell sitting near this floor could cross it repeatedly and flicker in and
+// out of the mesh. Hysteresis (or a floor below the deadband) would be the fix.
+// The CA alone settles to +/-1 unit, so the problem does not arise today.
+constexpr uint8_t kMinVisibleFill = 8;
+
 // Rebuilds (or destroys) the render component for every brick in
 // Impl.DirtyBricks, then clears that set (except for any budget-deferred
 // entries, left in place for the next call). Shared by the authority tick
@@ -720,13 +758,43 @@ void RemeshDirtyBricks(FVoxelWaterImpl& Impl, AActor* ChunkOwner, USceneComponen
 		}
 		++MeshesThisTick;
 
-		// Task item 4: "mesh active water cells (fill>0) via vxc::meshBrick
-		// over a water-occupancy sampler (fill>=128 solid for meshing v0;
-		// surface cells with partial fill render at full cube v0 --
-		// partial-height mesh is W5 polish)". The material id written into
-		// the sampler's output is an arbitrary fixed nonzero placeholder
-		// (MAT_ROCK) -- water's translucent material doesn't branch on it,
-		// unlike terrain's per-material vertex-color tint.
+		// STEPPED FILL-FRACTION SURFACES (was: "fill>=128 solid for meshing
+		// v0; surface cells with partial fill render at full cube v0 --
+		// partial-height mesh is W5 polish").
+		//
+		// The sampler now returns THE FILL FRACTION ITSELF as the
+		// vxc::MaterialId, which does three things at once:
+		//
+		//   1. OCCUPANCY. vxc::MAT_AIR is 0, so any cell at or above
+		//      kMinVisibleFill is solid to the mesher and anything below it is
+		//      air. This replaces the old >=128 threshold, under which a cell
+		//      less than half full was invisible and a brick sitting at a
+		//      uniform 100 fill meshed to zero quads and had its component
+		//      destroyed outright (the "Fully solid or fully empty" branch
+		//      below). Water popped in and out at the 50% mark.
+		//   2. HEIGHT. The value rides the quad's `mat` byte through
+		//      PackVoxelChunkQuad into VertexColor.R -- directly on the
+		//      component path (FWaterChunkSceneProxy writes FColor(Q.Mat, ...)),
+		//      and via FVoxelQuadVertexFactoryParameters::WaterMode on the
+		//      pooled one. M_WaterVoxel's World Position Offset reads R and
+		//      seats each surface cell's top face at its own fill height. The
+		//      packing itself cannot carry a fractional height: the decode
+		//      computes FaceCoordVox = Slice + (Positive ? 1 : 0) in integers
+		//      (VoxelQuadDecode.ush), so WPO is the mechanism.
+		//   3. MERGE CORRECTNESS, FOR FREE. vxc::meshBrick's greedy mask key is
+		//      `material | ao<<8 | visible<<16`, so two faces merge only when
+		//      their materials match. Putting fill in the material slot
+		//      therefore makes the mesher refuse to merge cells of DIFFERENT
+		//      fill automatically -- no new merge predicate, no mesher change.
+		//      Interior and side faces (all at 255) keep merging exactly as
+		//      before; only the surface layer fragments, which is precisely
+		//      where the extra quads buy the stepped waterline.
+		//
+		// The old placeholder was MAT_ROCK, chosen because "water's translucent
+		// material doesn't branch on it". That is still true -- M_WaterVoxel
+		// reads R as a scalar height, never as a categorical id -- but the byte
+		// is no longer arbitrary, so it must not be repurposed again without
+		// updating the material.
 		// Perf: meshBrick<8> samples a padded [-1,8] range per axis, but the
 		// overwhelming majority of those samples land INSIDE this brick
 		// (0..7 on every axis) -- for those, index straight into the
@@ -753,7 +821,7 @@ void RemeshDirtyBricks(FVoxelWaterImpl& Impl, AActor* ChunkOwner, USceneComponen
 				const int64_t Vz = int64_t(Key.z) * vxc::WaterBrick8::kEdge + z;
 				Fill = Impl.CA.fillAt(Vx, Vy, Vz);
 			}
-			return Fill >= 128 ? vxc::MAT_ROCK : vxc::MAT_AIR;
+			return Fill >= kMinVisibleFill ? vxc::MaterialId(Fill) : vxc::MAT_AIR;
 		};
 		vxc::meshBrick<vxc::WaterBrick8::kEdge>(Sampler, RawQuads);
 
@@ -776,11 +844,19 @@ void RemeshDirtyBricks(FVoxelWaterImpl& Impl, AActor* ChunkOwner, USceneComponen
 
 		if (Quads.Num() == 0)
 		{
-			// Fully solid or fully empty per the >=128 threshold, but the
-			// brick itself is still stored (e.g. all cells sit at exactly
-			// 100 fill, below the meshing threshold, but nonzero) -- no
-			// faces to draw; drop any stale component rather than register
-			// a proxy-less one.
+			// No visible faces: the brick is fully enclosed by other water
+			// (an interior brick of a large body emits nothing, which is
+			// exactly what keeps a big lake affordable) or every cell sits
+			// below kMinVisibleFill. Drop any stale component rather than
+			// register a proxy-less one.
+			//
+			// This branch used to fire far more often, and wrongly: under the
+			// old >=128 occupancy rule a brick whose cells all sat at, say,
+			// 100 fill meshed to zero quads and had its component destroyed,
+			// so genuinely-present water rendered as nothing at all. That is
+			// the case the fill-fraction sampler above fixes, and a brick held
+			// at uniform sub-half fill now rendering is the cheapest single
+			// proof this change works.
 			if (TObjectPtr<UWaterChunkComponent>* Existing = Impl.ChunkComponents.Find(BrickCoord))
 			{
 				if (*Existing)
@@ -1123,9 +1199,23 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 		// converted brick simply meshes to nothing here and the CA's own
 		// component takes over — the ownership partition does the bookkeeping.
 		std::vector<vxc::Quad> RawQuads;
+		// Carries the fill fraction as the material id, exactly like the CA
+		// sampler in RemeshDirtyBricks -- see the long comment there for what
+		// the three uses of that byte are.
+		//
+		// THIS ONE IS NOT OPTIONAL, and it is not merely for consistency. The
+		// byte now drives M_WaterVoxel's World Position Offset via
+		// VertexColor.R, so returning the old fixed MAT_ROCK placeholder (= 2)
+		// would hand the material R = 2/255 and push the top face of every
+		// implicit cavern lake down by ~99% of a voxel -- collapsing every
+		// static underground lake in the world to a sub-millimetre film. The
+		// implicit field is a static flood level, so in practice this returns
+		// 255 below floodZ and 0 above it, which the material reads as full
+		// height. Same kMinVisibleFill floor for the same reason.
 		const auto Sampler = [&Impl, Ox, Oy, Oz](int x, int y, int z) -> vxc::MaterialId
 		{
-			return Impl.Mob.implicitFillAt(Ox + x, Oy + y, Oz + z) >= 128 ? vxc::MAT_ROCK : vxc::MAT_AIR;
+			const uint8_t Fill = Impl.Mob.implicitFillAt(Ox + x, Oy + y, Oz + z);
+			return Fill >= kMinVisibleFill ? vxc::MaterialId(Fill) : vxc::MAT_AIR;
 		};
 		vxc::meshBrick<vxc::WaterBrick8::kEdge>(Sampler, RawQuads);
 

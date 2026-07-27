@@ -207,6 +207,15 @@ public:
 	// floor above its own steady state. Must be set before the proxy is created.
 	void SetChunkTableCapacity(int32 InEntries) { ChunkTableCapacity = FMath::Max(1, InEntries); }
 
+	// Marks this pool instance as drawing water fill rather than terrain, which
+	// routes the quad's `mat` byte (the CA fill fraction) into VertexColor.R
+	// instead of terrain's biome flag. See
+	// FVoxelQuadVertexFactoryParameters::WaterMode for the full reasoning.
+	// Must be set BEFORE the proxy is created; the proxy takes a copy, exactly
+	// like SetPoolName and SetChunkEdgeVoxels.
+	void SetWaterMode(bool bInWaterMode) { bWaterMode = bInWaterMode; }
+	bool IsWaterMode() const { return bWaterMode; }
+
 	//~ UPrimitiveComponent
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
@@ -344,6 +353,7 @@ private:
 	FString PoolName = TEXT("VoxelGpuPool");
 	int32 ChunkEdgeVoxels = 32;
 	int32 ChunkTableCapacity = 1024;
+	bool bWaterMode = false;
 
 	UPROPERTY()
 	TObjectPtr<UMaterialInterface> ChunkMaterial = nullptr;
