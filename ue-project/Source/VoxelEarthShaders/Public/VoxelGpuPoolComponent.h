@@ -380,6 +380,33 @@ public:
 	// runs over one 120s flight leg).
 	int32 GetFreeHandleCount() const { return FreeHandles.Num(); }
 
+	// Dirty-range algebra, exposed for automation tests ONLY (same precedent as
+	// DebugGetChunkRuns).
+	//
+	// WHY THIS IS EXPOSED AT ALL. S1-1's UnmarkQuadsDirty guards a race that the
+	// tick ordering makes rare -- it did not fire once across four full flight
+	// legs (docs/measurements/s1-1-batch-publish-2026-07-27.txt). Ground rule 13
+	// says a path with no recorded executions is untested however green
+	// everything around it is, and the failure mode if the interval algebra is
+	// wrong is INVISIBLE TERRAIN THAT REPORTS AS LOADED. So the algebra gets
+	// direct coverage instead of waiting for a leg to happen to exercise it.
+	//
+	// Pure list manipulation: no pool, no proxy, no GPU, no InitPool required.
+	void DebugMarkQuadsDirty(uint32 First, uint32 Count) { MarkQuadsDirty(First, Count); }
+	void DebugUnmarkQuadsDirty(uint32 First, uint32 Count) { UnmarkQuadsDirty(First, Count); }
+	// (First, Last) inclusive, in ascending order. Copied out rather than
+	// exposing FDirtyRange, which stays private.
+	TArray<TPair<uint32, uint32>> DebugGetDirtyRanges() const
+	{
+		TArray<TPair<uint32, uint32>> Out;
+		Out.Reserve(DirtyQuadRanges.Num());
+		for (const FDirtyRange& R : DirtyQuadRanges)
+		{
+			Out.Emplace(R.First, R.Last);
+		}
+		return Out;
+	}
+
 	// S1-1's hazard counter -- see UnmarkQuadsDirty. Non-zero on the first
 	// batched leg proves the free-then-reallocate-in-one-frame race is REAL and
 	// is being handled; zero across a full flight means either it cannot occur or

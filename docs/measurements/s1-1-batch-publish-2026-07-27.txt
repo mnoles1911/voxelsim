@@ -1,0 +1,143 @@
+================================================================================
+S1-1 -- BATCH POOL PUBLICATION: +123% THROUGHPUT, HOLES 15,032 -> 993
+================================================================================
+
+docs/speculative-generation-plan.md Wave S1, item S1-1 (= T1-1). Executes the
+lever S0 identified: docs/measurements/s0-apply-census-2026-07-27.txt.
+
+Measured 2026-07-27, AMD Radeon RX 7800 XT, seed 20260719, adopted 128 m / 4 km
+cascade, real terrain, edit log cleared per leg. Four flight legs on ONE binary,
+alternated on/off/on/off (ground rule 1). GPU fork arm throughout.
+
+  UnrealEditor-Cmd.exe <uproject> -game -nosplash -unattended -sm6 -dx12
+    -VoxelSpawnAt=-84480,53760 -VoxelPerfRun=120 -VoxelPerfFlight=line
+    -VoxelPerfPreflightSec=90 -VoxelPerfLingerSec=60 -VoxelPerfLogInterval=2
+    -ExecCmds="voxel.Stream.PoolBatchPublish <0|1>, voxel.Stream.CoverageVerify 1,
+               voxel.Stream.ApplyStageStats 1, voxel.Stream.PoolPushStats 1"
+
+  NOT driven through tools/voxel-run-leg.ps1 -- see the harness section of the S0
+  file. That script is a cold-fill driver and truncates flight legs.
+
+--------------------------------------------------------------------------------
+RESULT
+--------------------------------------------------------------------------------
+
+  leg          batchPublish   meanChunks/s   holes(converged)
+  s11-off-1    0              260.1          15,032
+  s11-off-2    0              261.8          14,622
+  s11-on-1     1              579.1             993
+  s11-on-2     1              583.5             939
+
+  throughput  260.9 -> 581.3  = +123%
+  holes       14,827 ->   966  = 15.3x fewer
+
+Within-config spread: 0.65% (off pair), 0.76% (on pair). The effect is two
+orders of magnitude above the noise floor. Target for this item was >= 900
+chunks/s; 581 does NOT reach it, see WHAT THIS DOES NOT CLOSE below.
+
+--------------------------------------------------------------------------------
+THE MECHANISM, AND IT COMPOUNDS
+--------------------------------------------------------------------------------
+
+  per leg                    off        on
+  pool publications      118,762      7,205     16.5x fewer
+  applies completed       70,106    233,477      3.3x more
+  mean stale fraction         42%         0%
+
+This is the chain S0 predicted from the queue-backlog finding, confirmed end to
+end:
+
+  publication amortised over a tick instead of per chunk
+    -> per-apply cost collapses
+    -> 3.3x more applies fit in the same 6 ms budget
+    -> the ResultsQueue stops backing up
+    -> results are applied while their records are still live
+    -> the stale fraction goes 42% -> 0%
+    -> none of the GPU's output is thrown away
+    -> coverage converges: 14,827 holes -> 966
+
+The stale collapse is the half that was not obvious from the design. Batching
+was justified as an amortisation of a per-item cost; most of the delivered win
+is that the pipeline stops discarding 42% of the work it had already paid the
+GPU to do. Throughput and waste were the same problem.
+
+--------------------------------------------------------------------------------
+CORRECTNESS
+--------------------------------------------------------------------------------
+
+voxel.GPU.VerifyPoolWrite 16 4, three ways on this binary, all PASS byte-identical
+against MeshChunkBricks -- quadFail=0 idFail=0 guardFail=0 countMismatch=0
+doubleDelivered=0 dropped=0:
+
+  batching ON,  MeshDirectToPool 1   16/16 written GPU-side
+  batching OFF, MeshDirectToPool 1   16/16 written GPU-side
+  batching ON,  MeshDirectToPool 0   16/16 via the readback control
+
+Across the four flight legs: gpuDirectWritesDropped=0, allocFail=0, and holes
+FELL rather than rose. None of the revert conditions fired.
+
+--------------------------------------------------------------------------------
+WHAT IS NOT VERIFIED, AND IT IS THE DANGEROUS PART
+--------------------------------------------------------------------------------
+
+  dirtyOverlapsResolved = 0 on both batched legs.
+
+The free-then-reallocate-within-one-frame guard (UnmarkQuadsDirty) NEVER FIRED.
+Ground rule 13: a code path with no recorded executions is untested, however
+green everything around it is.
+
+Why it is nearly unreachable, from reading the tick: within one FScopedBatch the
+order is DrainResults -> DrainGameThreadMesh -> DrainUnloads. GPU allocations
+happen only in DrainResults (ApplyMeshResult -> AddChunkFromGpu); most frees
+happen after it. So frees mostly follow allocs and cannot be re-allocated in the
+same batch.
+
+Why it is NOT unreachable: ApplyMeshResult's zero-quad branch calls
+ReleaseChunkGeometry INSIDE DrainResults, freeing a range and marking it dirty,
+and a later result in the same drain loop can AddChunkFromGpu. It needs the
+first-fit allocator to hand back that specific run, which did not happen in four
+legs.
+
+So the guard is load-bearing for a case that did not occur. That is the worst
+state to ship in: if the subtract is wrong, nothing here would have caught it,
+and the failure mode is INVISIBLE TERRAIN THAT REPORTS AS LOADED.
+
+  ACTION TAKEN: the interval algebra is covered by automation tests instead of
+  by hope -- all five cases (disjoint, fully covered, keep head, keep tail, and
+  the split-in-two case that is the one that silently corrupts). See
+  VoxelEarth.GpuPool in VoxelGpuGeometryPoolTests.cpp. Pure interval logic, no
+  GPU, so it runs in CI-shaped conditions rather than needing a leg.
+
+Also not run: voxel.Stream.PoolClobberTest. It cannot execute from -ExecCmds --
+it fires at frame 0, before the pool component exists, and logs exactly that.
+The live PoolClobberSession variant (settle delay, screenshot noise-floor pair,
+clobber, third shot) is the one that can run against a streamed world.
+
+--------------------------------------------------------------------------------
+WHAT THIS DOES NOT CLOSE
+--------------------------------------------------------------------------------
+
+581 chunks/s is short of the >= 900 this item targeted and well short of the
+1,082 the Wave S1 close requires against the component arm. Batching removed the
+per-CHUNK term; two things S0 measured are still standing:
+
+  * BuildChunkRuns still walks an append-only Allocations array, so its cost
+    tracks chunks EVER ADDED (3.72x waste by end of flight). Batching divides how
+    OFTEN that walk happens, not how big it is. That is S1-2.
+  * RebuildRunBounds is still a full O(live runs) rebuild per publication on the
+    render thread. That is S1-4, still conditional on the post-S1-1 number.
+
+Re-read the per-apply and pool-publish lines on these legs before starting S1-4:
+the S0 census was taken at ~1,700 publications/second and the shape at 60/second
+may be different.
+
+--------------------------------------------------------------------------------
+DEFAULT FLIPPED
+--------------------------------------------------------------------------------
+
+voxel.Stream.PoolBatchPublish 0 -> 1, in its own commit carrying these numbers,
+per the programme's rule that a default is a measurement.
+
+Raw logs are NOT committed (/Saved/ is gitignored): s11-on-1.log, s11-on-2.log,
+s11-off-1.log, s11-off-2.log, s11-verify-batch-on.log, s11-verify-batch-off.log,
+s11-verify-readback.log on the measuring box.
