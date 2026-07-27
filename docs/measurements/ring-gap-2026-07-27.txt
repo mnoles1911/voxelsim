@@ -1,0 +1,231 @@
+Ring gap -- root-caused and fixed. Baseline, two regressions-and-fixes, and the
+resurrection/fork-cap sweep that shipped, all on REAL terrain.
+
+Anchor: -VoxelSpawnAt=-84480,53760 (tile-coverage centre -- see
+docs/ring-gap-handoff.md for why origin spawns were flat-plane and worthless).
+Flight: -VoxelPerfFlight=line (new) -- 90 s preflight pinned at spawn while the
+cascade warms, 120 s flight at 20 m/s heading +X, 60 s linger pinned. Edit log
+cleared before every COLD-FILL leg (ground rule 11); flight legs ran with no
+edits in-session, so there was nothing to clear.
+
+"residue" = the converged `Voxel coverage holes=` count read during the linger
+phase, i.e. after the cascade has had 60 s stationary to catch up -- this is the
+PERMANENT hole count, not the transient in-flight one. "hitches" / "chunks" /
+p50 / p95 are the VoxelPerfRun complete line. GPU = mesh fork default-on; CPU =
+-VoxelNoGpuMesh. voxel.Stream.CoverageVerify=1 (new) drives the holes count.
+
+================================================================================
+BASELINE (pre-fix build, retention 5000 ms), alternated GPU/CPU
+================================================================================
+
+  leg      hitches   chunks    p50     p95    residue
+  GPU A1       568    67193   15.46   27.69       78
+  GPU A2       560    68891   15.31   27.72       81
+  GPU A3       558    69355   15.36   26.94    n.m.
+  CPU B1         8    93190   14.24   22.86       63
+  CPU B2         8    92529   14.24   23.15        -
+  CPU B3         8    92680   14.21   23.04        -
+
+(residue only read on B1; B2/B3 not measured -- "n.m." on A3 likewise.)
+
+Verdict evidence:
+
+  * Flight-phase eviction bursts, new evictions/level line: R1 ~650 per 5 s
+    window, R2 ~300, R3 ~140.
+  * capRel (the 5 s retention-cap release) dominates flight-phase retention
+    releases in every other leg, BUT the C1 leg (LodRetentionMs=20000) had
+    capRel=0 in flight while holes were UNCHANGED. The cap is not the visible
+    driver.
+  * covRelAbsent (the absent-record release) = 6-19k per flight.
+  * recordsAdded 2.3-3.4M against 110-125k dispatched per flight: two orders of
+    magnitude of admission churn for every chunk actually sent to a mesher.
+  * Residue is DETERMINISTIC: byte-identical hole coordinates across 4
+    independent runs, at r=65 m and r=124-128 m (both R1).
+
+Also on record from these legs:
+
+  * CPU beat GPU under motion in every axis measured (hitches, p95, residue).
+  * Hitch attribution: GPU hitch frames are render-thread-BUSY dominated
+    (median renderMs 75 ms vs 3 ms CPU; RHI flat 1.7 ms both configs). That is
+    fork BOOKKEEPING -- 2 RDG graphs/frame, an O(256) poll walk, ~18 release
+    commands/frame -- not GPU execution time.
+
+================================================================================
+FIX rev A -- 0cf37dd (REGRESSED, not shipped)
+================================================================================
+
+ReplacementCovered treats absent replacement records as covered + Z-mask;
+stale-scan refill; park-time counters; retention 5000 -> 20000.
+
+  leg    hitches   chunks    residue
+  VA1       1459    63856        51
+  VA2       1490    62736        57
+  VB1         16    84706         4
+
+Diagnosis: +12.9% resident quads (from the 20 s retention) made every frame
+~12% heavier -- the hitch-count tripling was largely threshold-crossing, not a
+new failure mode: median hitch severity roughly HALVED alongside it. Separately,
+the stale-scan refill fired on EVERY flight sample (R1-R5 scans running at 3.9x
+the expected edge/4 rate), feeding straight back into admission churn: coarse
+fork dispatches +17% (L3 alone +271%), CPU stale-record drains +143%, and R0
+residency got crowded out, 864 -> 653. Two independent regressions stacked in
+one commit.
+
+================================================================================
+FIX rev B -- e225d50
+================================================================================
+
+Quiescent-anchor gate (0.5 s) on the stale-scan refill; retention 20000 ->
+10000; verifier switched to an ancestor-walk (catches holes the flat check
+missed).
+
+  leg    hitches   chunks    residue
+  WA1        598    64526        68
+  WA2        578    64398        56
+  WB1          8    88855         0
+
+CPU residue is fixed (0). GPU residue survives rev A and rev B both -- traced to
+a NEW root cause, distinct from ReplacementCovered: pending-unload records
+BLOCKING re-admission when a footprint re-enters its annulus (a scan-before-park
+race). Deterministic R3 patch at r=322-492 m, traced via the new per-chunk
+retention-release lines: the retention-release cap fired on that chunk 9 s
+before the pin that exposed the hole.
+
+================================================================================
+RESURRECTION -- 508a2fa + fork caps 32/64 -- f029b13 (SHIPPED)
+================================================================================
+
+Resurrect pending-unload chunks the entry pass re-desires (kills the
+scan-before-park race directly), plus bounding the GPU mesh fork's
+per-frame render-thread cost with MeshBatchCap/MeshHarvestCap.
+
+  leg              hitches   chunks    residue
+  GPU XA1 (32/64)      367    77179         0
+  GPU XA2 (32/64)      362    76487         0
+  GPU XA0 (caps off)   551    73993         0
+  CPU XB1                7    91747         0
+
+Residue is 0 on BOTH meshers, every leg, converged. Resurrections/leg range
+1803-7125 (= re-meshes avoided by reusing a chunk that was already in the
+unload-pending state rather than re-dispatching it).
+
+Flight-PHASE transient holes (the honest ancestor-walk verifier, sampled
+in-flight rather than at the linger convergence point) did not go to zero:
+CPU median 55 (was 921 pre-resurrection -- a >16x cut), GPU median 854-907
+(fork delivery latency lags the leading edge under motion, consistent with the
+render-thread-BUSY attribution above). This is the expected residual: the fix
+kills the PERMANENT ring, not the seconds-of-latency gap at the leading edge
+while a chunk is queued and in flight to a mesher. It converges to 0 by the
+time the linger phase reads it. Closing THAT gap is a throughput problem --
+see the cold-fill sections below for where the throughput levers are.
+
+--------------------------------------------------------------------------------
+FORK CAPS SWEEP (flight profile, resurrection base)
+--------------------------------------------------------------------------------
+
+  caps (batch/harvest)   hitches   chunks    p95
+  32 / 64                    367    77179      -
+  16 / 32                      8    78459      -
+   8 / 16                      8    86546   22.95
+
+Tighter caps trade GPU throughput ceiling for hitch count and win decisively
+between 32/64 and 16/32 -- an order-of-magnitude drop in hitches for roughly the
+same chunk count. 8/16 holds the hitch win and adds more chunks besides.
+
+Repeats and the 4/8 probe (same night, later batch):
+
+   caps (batch/harvest)   hitches   chunks   p50     p95
+   8 / 16  (repeat)             7    86437   16.69   22.96
+   4 / 8                        8    89411   15.90   22.96
+   4 / 8   (repeat)             8    89588   15.88   22.90
+
+8/16 reproduces (86,546 vs 86,437 -- 0.13% spread) and 4/8 reproduces (89,411
+vs 89,588 -- 0.20%). 4/8 is +3.4% chunks over 8/16 at the same hitch floor and
+a better p50. The trend is monotone all the way down from 32/64 -- smaller
+per-frame fork batches cost NOTHING in throughput on this box and buy
+everything in frame pacing, because the render thread, not the GPU, was the
+bottleneck. SHIPPED as the defaults: voxel.GPU.MeshBatchCap=4,
+voxel.GPU.MeshHarvestCap=8.
+
+JobsInFlightPerCore=8 under MOTION (CPU, flight profile, confirmation leg):
+93,734 chunks / 8 hitches / p50 14.34 / p95 23.41 / holes=0 -- the highest
+chunk count of any leg tonight, with no hitch or coverage cost. SHIPPED:
+voxel.Stream.JobsInFlightPerCore default 2 -> 8.
+
+================================================================================
+COLD FILL, 64 m default cascade (settle-based, not flight)
+================================================================================
+
+vxlog cleared, alternated x2, all legs settled at loaded=9822 quads=8828367.
+
+  config                              settle (leg1 / leg2)
+  GPU (default fork)                        6 s / 6 s
+  CPU                                       4 s / 4 s
+  CPU + JobsInFlightPerCore=8               2 s / 2 s
+
+Caveat: all three numbers are at or below the 3 s poll resolution used for this
+sweep -- read this as an ORDERING signal (fork slower to settle than CPU,
+CPU-with-more-inflight-budget fastest) and not as a magnitude. Consistent with
+wave-f-coldfill.txt's retraction: do not trust a settle time inside one sample
+quantum as anything more than direction.
+
+--------------------------------------------------------------------------------
+COLD FILL, 128 m cascade, REAL TERRAIN (settle-based, vxlog cleared, alternated)
+--------------------------------------------------------------------------------
+
+RingPresets overridden to Inner=0,128,256,512,1024,2048 / Outer=128,...,4096 and
+confirmed from the [OVERRIDDEN] log line each leg. ~29.6k chunks at settle.
+
+   config                              settle (2 legs)
+   fork ON, caps 4/8-era (8/16)        48 s / 48 s
+   CPU (-VoxelNoGpuMesh)               51 s / 50 s
+   CPU + JobsInFlightPerCore=8         41 s / 35 s
+
+Two findings, one warning:
+1. The fork's flat-terrain cold-fill advantage (36.3/38.3 s vs 58.4/60.4 s in
+   wave-d5-budget-fix.txt, ~38%) COLLAPSES on real tiles: 48 s vs 50.5 s, ~5%.
+   Every pre-2026-07-27 fork-vs-CPU number was taken on the flat fallback and
+   does not transfer.
+2. The cheapest lever in the whole programme is voxel.Stream.JobsInFlightPerCore
+   2 -> 8: CPU cold fill drops ~25% (50.5 -> 38 s avg) with NO code change,
+   consistent with the documented once-per-frame dispatch top-up starvation
+   (~9% worker utilization, VoxelDebug.cpp:255-287). Spread on the jif8 pair is
+   wide (41/35 s) -- treat the magnitude as +/-10%.
+WARNING: residentQuads settled at exactly 26,000,000 = kPoolCapacityQuads on
+every 128 m leg -- the pool is SATURATED at this cascade on real terrain. Any
+128 m work needs the pool resized or allocFail watched before trusting anything.
+
+================================================================================
+What changed in the code
+================================================================================
+
+Commits (in order):
+
+  0c2c253  Ring-gap instrumentation: eviction causes, retention release split,
+           coverage verifier, line flight
+  32f5b18  Add -VoxelPerfPreflightSec: pin at spawn while the cascade warms,
+           then fly
+  0cf37dd  Ring-gap fix rev A: honest ReplacementCovered, stale-scan refill,
+           park-time counters, 20s retention -- REGRESSED, superseded below
+  e225d50  Rev B: quiescent-anchor gate on stale-scan refill, 10s retention,
+           ancestor-walk verifier -- fixed CPU residue, GPU residue persisted
+  508a2fa  Resurrect pending-unload chunks the entry pass re-desires -- kills
+           the scan-before-park race, GPU residue -> 0
+  f029b13  Bound the GPU mesh fork render-thread cost per frame -- fork caps
+
+New switches / cvars:
+
+  -VoxelPerfFlight=line          scripted straight-line flight profile (was
+                                  static/surface only)
+  -VoxelPerfHeading               flight heading in degrees
+  -VoxelPerfLingerSec             stationary settle window after flight, used
+                                  to read converged residue
+  -VoxelPerfPreflightSec          pin-at-spawn warmup before flight starts
+  voxel.Stream.CoverageVerify     enable the ancestor-walk hole verifier
+  voxel.Stream.LogRetention       log per-chunk retention-release lines
+  voxel.GPU.MeshBatchCap          fork per-frame batch cap
+  voxel.GPU.MeshHarvestCap        fork per-frame harvest cap
+  LodRetentionMs default          5000 -> 10000
+
+See docs/ring-gap-handoff.md for the narrative (superseded lead, confirmed
+causes, closing status) and the reproduction recipe with these switches.

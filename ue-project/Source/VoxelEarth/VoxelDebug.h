@@ -246,6 +246,22 @@ namespace VoxelDebug
 	// without a hole. Default 1000; 0 disables.
 	VOXELEARTH_API float GetStreamLodRetentionMs();
 
+	// voxel.Stream.LogRetention (ring-gap wave): per-chunk drill-down on the
+	// retention mechanism. The 5s `Voxel LOD retention` census counts releases;
+	// this names them -- level, chunk key, radius from the anchor, and for a
+	// covered-ABSENT release how many of the replacement columns consulted were
+	// absent rather than settled. Default 0. Diagnostic only: it is per-chunk
+	// output and has no place in a perf run.
+	VOXELEARTH_API bool GetStreamLogRetention();
+
+	// voxel.Stream.CoverageVerify (ring-gap wave): once per periodic perf-log
+	// window, count the XY footprints inside a ring's core annulus that NO level
+	// is visibly covering -- i.e. the see-through holes, as a number rather than
+	// a screenshot. Default 0; read-only (changes no streaming decision) and
+	// entirely inside the enable check, so a default run pays one cvar read.
+	// See the coverage block in FVoxelWorldImpl::MaybeLogCounters.
+	VOXELEARTH_API bool GetStreamCoverageVerify();
+
 	// voxel.Render.CastShadow: do terrain chunks render into the directional
 	// light's shadow-depth pass (PR #95)? Default true. Exists to A/B the
 	// render-thread cost of terrain shadows on ONE primitive flag -- see the

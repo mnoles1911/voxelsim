@@ -122,14 +122,20 @@ TAutoConsoleVariable<float> CVarVoxelStreamApplyBudgetMs(
 
 TAutoConsoleVariable<float> CVarVoxelStreamLodRetentionMs(
 	TEXT("voxel.Stream.LodRetentionMs"),
-	5000.0f,
+	10000.0f,
 	TEXT("Load-before-unload SAFETY CAP (2026-07-24 streaming-speed pass). When a VISIBLE chunk is evicted because a ")
 	TEXT("different LOD ring took over its footprint (toward -> finer, away -> coarser), it is kept drawn as a stand-in ")
 	TEXT("until its replacement LOD is actually on screen -- COVERAGE-based release (ReplacementCovered vs ChunkRecords), ")
 	TEXT("not a fixed timer, so there is no rolling ring of holes where a timer would expire mid-transition. This value ")
 	TEXT("is only the backstop: a footprint that never gets covered (e.g. a coastal quarter that is all ocean) is parked ")
 	TEXT("after this many ms so resident chunks cannot grow unbounded. Cost: brief coarse+fine double-draw at the ")
-	TEXT("boundary until coverage (minor shimmer, no hole). 0 disables retention entirely (immediate unload = holes)."),
+	TEXT("boundary until coverage (minor shimmer, no hole). 0 disables retention entirely (immediate unload = holes). ")
+	TEXT("RETUNED 5000 -> 20000 -> 10000 on 2026-07-27: instrumented 20 m/s line flights showed 5000 was too short for ")
+	TEXT("the backstop to be a backstop -- stand-ins hit the cap and parked while their replacements were still ")
+	TEXT("mid-pipeline, which is a hole. 20000 logged ZERO flight-phase cap releases but held +1,355 extra resident ")
+	TEXT("chunks (+12.9% quads, pool 44.2% vs 39.4%), making every frame ~12% heavier on the render thread and tripling ")
+	TEXT("the over-33.3ms frame count on the GPU-fork legs. 10000 is the balance point pending the fork's render-thread ")
+	TEXT("overhead fix; allocFail=0 at every setting tried."),
 	ECVF_Default);
 
 // Terrain sun-shadow casting (PR #95, "the sun should not light a sealed cave").
@@ -189,6 +195,39 @@ TAutoConsoleVariable<int32> CVarVoxelStreamLogAdmission(
 	TEXT("Log the per-level admission loop state on every RecomputeDesiredSet call: did the ring re-enumerate, ")
 	TEXT("how many candidates it turned away, its pending queue depth, and whether its refill trigger is still ")
 	TEXT("armed. Those four decide whether a ring keeps filling, and no existing counter shows them together."),
+	ECVF_Default);
+
+// Ring-gap wave (docs/status.md "ring gap"). The 5s retention census says HOW
+// MANY stand-ins were released and why; it cannot say WHICH ones, and the
+// hypothesis under test is positional -- coarse chunks released at the INNER
+// ring edge, where the finer ring has not arrived. One line per release, with
+// the chunk key and its radius from the anchor, is what makes a logged number
+// comparable against a screenshot of the hole.
+//
+// Per-chunk and therefore OFF by default and never suitable for a perf run:
+// the census line above is the always-on instrument, this is the drill-down.
+TAutoConsoleVariable<int32> CVarVoxelStreamLogRetention(
+	TEXT("voxel.Stream.LogRetention"),
+	0,
+	TEXT("Log one line per load-before-unload stand-in release that was NOT a clean settled cover: every ")
+	TEXT("covered-ABSENT release (the covered verdict rested on a child/parent record that does not exist, which ")
+	TEXT("is only sound if that record was genuinely undesired) and every safety-cap release. Level, chunk key, ")
+	TEXT("radius from the anchor in metres, and the absent/settled split of the replacement columns consulted. ")
+	TEXT("Per-chunk output -- diagnostic only, never a perf-run setting."),
+	ECVF_Default);
+
+// Ring-gap wave: turn the visual symptom into a number. See the coverage-verify
+// block in MaybeLogCounters for what it scans and the two prior failure modes
+// its coverage test is built to dodge. O(tracked) plus one annulus enumeration
+// per level, ONCE per log window, and entirely inside the enable check -- a
+// default run pays a single cvar read.
+TAutoConsoleVariable<int32> CVarVoxelStreamCoverageVerify(
+	TEXT("voxel.Stream.CoverageVerify"),
+	0,
+	TEXT("Once per periodic perf-log window, enumerate every XY footprint whose centre lies in a ring's core ")
+	TEXT("annulus and count the ones no level is visibly covering -- the see-through holes, as a number, with a ")
+	TEXT("few examples and their radius. READ-ONLY: it changes no streaming decision. Off by default because it ")
+	TEXT("re-walks every ring's annulus."),
 	ECVF_Default);
 
 TAutoConsoleVariable<int32> CVarVoxelStreamGpuMaxChunks(
@@ -270,17 +309,21 @@ TAutoConsoleVariable<bool> CVarVoxelStreamGpu(
 // capacity of ~18,000/s -- about 9% worker utilisation. Raising the multiplier
 // keeps the task graph fed ACROSS frames instead of re-starving every frame.
 //
-// Default 2 deliberately preserves the pre-change behaviour exactly, so this
-// ships inert and the A/B runs on one binary.
+// RAISED 2 -> 8 on 2026-07-27, measured on real terrain (docs/measurements/
+// ring-gap-2026-07-27.txt): 128 m-cascade cold fill 50.5 s -> 38 s avg (~25%
+// faster, wide spread 41/35 s so call it +/-10%), 64 m cold fill 4 s -> 2 s
+// twice, and a 20 m/s motion leg at 8 loaded MORE chunks than any other leg
+// that night (93,734) with the same 8 hitches, holes=0, p95 within noise.
 //
-// Costs to watch when raising it: more in-flight jobs means more results landing
-// per frame (bounded by voxel.Stream.MaxAppliesPerFrame / ApplyBudgetMs), more
-// peak memory in flight, and more STALE results (a chunk evicted while its job
-// runs is discarded -- currently 0.0%, watch the "job flow" census).
+// Costs to watch when raising it further: more in-flight jobs means more
+// results landing per frame (bounded by voxel.Stream.MaxAppliesPerFrame /
+// ApplyBudgetMs), more peak memory in flight, and more STALE results (a chunk
+// evicted while its job runs is discarded -- watch the "job flow" census).
 TAutoConsoleVariable<int32> CVarVoxelStreamJobsInFlightPerCore(
 	TEXT("voxel.Stream.JobsInFlightPerCore"),
-	2,
-	TEXT("Worker jobs allowed in flight, as a multiple of logical cores (24 at the default 2 on a 12-thread box). ")
+	8,
+	TEXT("Worker jobs allowed in flight, as a multiple of logical cores (96 at the default 8 on a 12-thread box; ")
+	TEXT("raised from 2 on 2026-07-27, ~25% faster real-terrain cold fill, no hitch or coverage cost on record). ")
 	TEXT("DispatchJobs refills to this cap once per frame, so with short jobs (R0 p50 ~1.3ms) and a ~15ms frame the ")
 	TEXT("slots idle most of the frame -- measured ~9% worker utilisation and ~6,800 chunks per 5s evicted before ")
 	TEXT("ever being dispatched. Raise to keep the task graph fed across frames. Watch stale%% in the job-flow census."),
@@ -581,6 +624,16 @@ float VoxelDebug::GetStreamApplyBudgetMs()
 float VoxelDebug::GetStreamLodRetentionMs()
 {
 	return FMath::Max(0.f, CVarVoxelStreamLodRetentionMs.GetValueOnGameThread());
+}
+
+bool VoxelDebug::GetStreamLogRetention()
+{
+	return CVarVoxelStreamLogRetention.GetValueOnGameThread() != 0;
+}
+
+bool VoxelDebug::GetStreamCoverageVerify()
+{
+	return CVarVoxelStreamCoverageVerify.GetValueOnGameThread() != 0;
 }
 
 bool VoxelDebug::GetRenderCastShadow()

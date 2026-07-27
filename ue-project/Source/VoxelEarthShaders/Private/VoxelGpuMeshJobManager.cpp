@@ -29,6 +29,49 @@ static FAutoConsoleVariableRef CVarVoxelGpuMeshChunkLocal(
 	TEXT("Default 1. Read once per Submit, so it takes effect on the next job."),
 	ECVF_Default);
 
+// --- render-thread cost caps (2026-07-27 line-flight instrumentation) -------
+//
+// THE MEASUREMENT THESE EXIST FOR. Six instrumented 20 m/s line-flight legs on
+// real terrain: with this fork ON, 10.1% of flight frames hitched (>33.3 ms)
+// against 0.028% with it OFF. The hitch frames are render-thread-BUSY dominated
+// — median renderMs 75 ms on fork-on legs vs 3 ms on fork-off, with RHI flat at
+// 1.7 ms in BOTH arms and identical game-thread cost (GPU legs 40 fps, CPU legs
+// 59 fps). Hitches appear if and only if the fork is delivering: pearson 0.88
+// against per-window deliveries, and 63 fork-idle windows had zero hitches.
+//
+// So the cost is render-thread CPU spent in this file's own bookkeeping — RDG
+// pass setup, readback Lock/memcpy/Unlock, and render-command overhead — not
+// GPU execution and not the game thread. Both caps below bound how much of that
+// work any ONE render command may do, spreading it over frames instead of
+// letting a burst land in a single one. Neither drops work: what does not fit
+// stays queued / stays in flight and is picked up by the next tick.
+//
+// Both are A/B-able: <= 0 restores the previous unbounded behaviour exactly, so
+// the fix can be measured against itself on one binary the same way
+// voxel.GPU.MeshChunkLocal is.
+static int32 GVoxelGpuMeshBatchCap = 4;
+static FAutoConsoleVariableRef CVarVoxelGpuMeshBatchCap(
+	TEXT("voxel.GPU.MeshBatchCap"),
+	GVoxelGpuMeshBatchCap,
+	TEXT("Max queued jobs one DispatchBatch may promote into a single FRDGBuilder. ")
+	TEXT("Default 4 -- the caps sweep was monotone: 32/64 -> 367 hitches / 77.2k chunks, 8/16 -> 8 / 86.5k, ")
+	TEXT("4/8 -> 8 / 89.4-89.6k over two legs, so the smallest batch measured is also the fastest. ")
+	TEXT("<= 0 means unlimited (pre-cap behaviour). ")
+	TEXT("Each job adds ~7 compute passes + 3-4 copy passes, so an uncapped burst ")
+	TEXT("frame built graphs of 100+ passes on the render thread."),
+	ECVF_Default);
+
+static int32 GVoxelGpuMeshHarvestCap = 8;
+static FAutoConsoleVariableRef CVarVoxelGpuMeshHarvestCap(
+	TEXT("voxel.GPU.MeshHarvestCap"),
+	GVoxelGpuMeshHarvestCap,
+	TEXT("Max ready jobs one poll may HARVEST (readback Lock/memcpy/Unlock). ")
+	TEXT("Default 8, swept together with voxel.GPU.MeshBatchCap (see its comment). ")
+	TEXT("<= 0 means unlimited (pre-cap behaviour). ")
+	TEXT("IsReady() checks stay unbounded — they are cheap; it is the copies that ")
+	TEXT("cost, and with 150-256 jobs in flight one poll could do all of them."),
+	ECVF_Default);
+
 const TCHAR* LexToString(EVoxelGpuMeshJobStatus Status)
 {
 	switch (Status)
@@ -197,26 +240,46 @@ namespace
 		return true;
 	}
 
-	// Releases a job's readbacks on the render thread. Capturing the job by
-	// shared pointer is what keeps it alive until the command runs -- the
-	// manager may well have forgotten about it by then.
-	void ReleaseReadbacksOnRenderThread(FJobPtr Job)
+	// Releases a BATCH of jobs' readbacks on the render thread. Capturing the
+	// jobs by shared pointer is what keeps them alive until the command runs --
+	// the manager may well have forgotten about them by then.
+	//
+	// ONE COMMAND FOR THE WHOLE TICK, not one per job. This used to be called
+	// per delivered job, which at the observed steady-state delivery rate
+	// (~18 jobs/frame) was ~18 ENQUEUE_RENDER_COMMANDs per frame whose bodies do
+	// almost nothing: the command overhead and the render thread's per-command
+	// dispatch dominated the actual resets. The work done is byte-for-byte the
+	// same, and so is its position in the render-command stream — the batch is
+	// enqueued at exactly the point the last per-job command used to be, i.e.
+	// after this tick's poll command, which is the only ordering that matters
+	// (a poll must never see readbacks a later-enqueued release has already
+	// reset).
+	void ReleaseReadbacksOnRenderThread(TArray<FJobPtr>&& Jobs)
 	{
-		if (!Job.IsValid())
+		if (Jobs.Num() == 0)
 		{
 			return;
 		}
 		ENQUEUE_RENDER_COMMAND(VoxelGpuMeshReleaseReadbacks)(
-			[Job](FRHICommandListImmediate&)
+			[Batch = MoveTemp(Jobs)](FRHICommandListImmediate&)
 		{
-			Job->TotalReadback.Reset();
-			Job->CountsReadback.Reset();
-			Job->OffsetsReadback.Reset();
-			Job->QuadsReadback.Reset();
-			// Frees the persistent quad buffer back to RDG's pool. Deliberately
-			// on the render thread with everything else: this is an RHI resource
-			// reference and it is the last thing holding it.
-			Job->QuadBuffer.SafeRelease();
+			for (const FJobPtr& Job : Batch)
+			{
+				if (!Job.IsValid())
+				{
+					continue;
+				}
+				Job->TotalReadback.Reset();
+				Job->BandReadback.Reset();
+				Job->CountsReadback.Reset();
+				Job->OffsetsReadback.Reset();
+				Job->QuadsReadback.Reset();
+				// Frees the persistent quad buffer back to RDG's pool.
+				// Deliberately on the render thread with everything else: this
+				// is an RHI resource reference and it is the last thing holding
+				// it.
+				Job->QuadBuffer.SafeRelease();
+			}
 		});
 	}
 
@@ -374,9 +437,26 @@ void FVoxelGpuMeshJobManager::Tick()
 	//
 	// Rejections are collected rather than delivered inline, for the same
 	// reentrancy reason as the harvest below.
+	//
+	// CAPPED PER TICK (2026-07-27). MaxInFlight alone is not a per-frame bound:
+	// with the streaming path's in-flight cap, 150-256 jobs were observed
+	// outstanding, so a frame that drains a backlog could promote a hundred-plus
+	// jobs into ONE FRDGBuilder — ~7 compute passes + 3-4 copy passes each, all
+	// of it render-thread CPU in pass setup, which is what the hitch profile
+	// points at. The cap does not reduce throughput, it flattens bursts: 32 jobs
+	// per tick at the measured 40-60 fps sustains 1,280-1,920 dispatches/s
+	// against an observed peak demand of ~850/s, so steady state never touches
+	// it. Anything over the cap simply stays at the head of Queued and goes out
+	// next tick, in order.
+	//
+	// The cap counts PROMOTED jobs, not loop iterations: a rejected job never
+	// reaches the graph and costs no pass setup, so draining a run of rejects in
+	// one tick is both free and desirable (it gets them delivered sooner).
+	const int32 BatchCap = GVoxelGpuMeshBatchCap > 0 ? GVoxelGpuMeshBatchCap : MAX_int32;
+
 	TArray<FJobPtr> Batch;
 	TArray<TPair<FJobPtr, FString>> Rejected;
-	while (Queued.Num() > 0 && InFlight.Num() + Batch.Num() < MaxInFlight)
+	while (Queued.Num() > 0 && InFlight.Num() + Batch.Num() < MaxInFlight && Batch.Num() < BatchCap)
 	{
 		FJobPtr Job = Queued[0];
 		Queued.RemoveAt(0, EAllowShrinking::No);
@@ -587,9 +667,37 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 
 	if (ToPoll.Num() > 0)
 	{
+		// Latched here rather than read on the render thread, for the same
+		// reason Submit latches MeshChunkLocal: one poll should behave like one
+		// poll, not change budget halfway through.
+		const int32 HarvestCap = GVoxelGpuMeshHarvestCap;
+
 		ENQUEUE_RENDER_COMMAND(VoxelGpuMeshPoll)(
-			[Jobs = MoveTemp(ToPoll)](FRHICommandListImmediate&)
+			[Jobs = MoveTemp(ToPoll), HarvestCap](FRHICommandListImmediate&)
 		{
+			// HOW MUCH COPYING THIS ONE COMMAND MAY DO (2026-07-27).
+			//
+			// The walk itself and every IsReady() stay unbounded: they are a
+			// load and a compare, and skipping them would only delay noticing.
+			// What is bounded is the HARVEST — Lock / memcpy / Unlock across up
+			// to four or five staging buffers per job, and on phase 2 a memcpy
+			// of the whole live quad stream. With 150-256 jobs in flight a
+			// single poll could do every one of those in one render command,
+			// which is a render-thread stall of exactly the shape the hitch
+			// legs show.
+			//
+			// Jobs over budget are LEFT UNTOUCHED in Dispatched /
+			// QuadsDispatched with their readbacks still ready; PollPending is
+			// still cleared for them on the way out, so the next tick re-polls
+			// them and harvests them then. Nothing is dropped and no state
+			// moves, so this cannot interact with the timeout, the all-or-none
+			// rule, or delivery.
+			//
+			// It also transitively bounds phase 2: at most one job reaches
+			// TotalDone per phase-1 harvest, so the next tick's
+			// DispatchQuadFetch graph is bounded by this cap too.
+			int32 HarvestBudget = HarvestCap > 0 ? HarvestCap : MAX_int32;
+
 			for (const FJobPtr& Job : Jobs)
 			{
 				ON_SCOPE_EXIT { Job->PollPending.store(0, std::memory_order_release); };
@@ -629,10 +737,33 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 						continue;
 					}
 
+					// Stamped on FIRST OBSERVED READY, before the budget check,
+					// not on harvest. DispatchToReadyMs is documented as "the
+					// moment a poll first saw IsReady() true"; deferring the
+					// copies must not silently re-point that at a later poll,
+					// which would inflate the one number that describes the GPU
+					// by however long this fix spread the CPU work over. Guarded
+					// because a deferred job is re-polled and would otherwise
+					// restamp.
+					if (Job->ReadySeconds <= 0.0)
+					{
+						Job->ReadySeconds = FPlatformTime::Seconds();
+					}
+
+					// Over budget: leave the job exactly as it is — still
+					// Dispatched, readbacks still ready — and let the next poll
+					// harvest it. Placed AFTER the all-or-none readiness gate so
+					// the budget is only ever spent on a job that will actually
+					// copy, and BEFORE the first Lock so a job is never half
+					// harvested.
+					if (HarvestBudget <= 0)
+					{
+						continue;
+					}
+					--HarvestBudget;
+
 					// The GPU number. This is what D3 exists to fetch, and it
 					// is 4 bytes.
-					Job->ReadySeconds = FPlatformTime::Seconds();
-
 					FString Error;
 					bool bOk = CopyReadback(*Job->TotalReadback, &Job->NumQuads,
 					                        sizeof(uint32), TEXT("QuadTotal"), Error);
@@ -678,6 +809,15 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 					{
 						continue;
 					}
+
+					// Same budget as phase 1, and phase 2 is the expensive half
+					// — this memcpy is the whole live quad stream, ~7-12 KB per
+					// chunk, where phase 1's is four bytes.
+					if (HarvestBudget <= 0)
+					{
+						continue;
+					}
+					--HarvestBudget;
 
 					const uint32 Elements = Job->Sizes.QuadWriteBase + Job->NumQuads;
 					Job->RawQuads.SetNumUninitialized(int32(Elements));
@@ -806,11 +946,25 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 		}
 	}
 
+	// Deliver first, release once. The releases are collected across the whole
+	// delivery loop and flushed as a single render command — see
+	// ReleaseReadbacksOnRenderThread. Collecting them does NOT extend any job's
+	// lifetime past this function: these jobs are already detached from InFlight
+	// and the command holds its own reference either way.
+	//
+	// A callback that reenters (Submit, CancelAll, destroying the manager) is
+	// still safe: it can only touch jobs still in Queued/InFlight, and every job
+	// in Finished was removed from InFlight before this loop started, so the two
+	// sets are disjoint and a reentrant CancelAll's own release command simply
+	// lands ahead of this one.
+	TArray<FJobPtr> ToRelease;
+	ToRelease.Reserve(Finished.Num());
 	for (const FPending& P : Finished)
 	{
 		Deliver(P.Job, P.Status, P.Error);
-		ReleaseReadbacksOnRenderThread(P.Job);
+		ToRelease.Add(P.Job);
 	}
+	ReleaseReadbacksOnRenderThread(MoveTemp(ToRelease));
 }
 
 void FVoxelGpuMeshJobManager::CancelAll()
@@ -825,6 +979,10 @@ void FVoxelGpuMeshJobManager::CancelAll()
 	{
 		Job->Abandoned.store(1, std::memory_order_release);
 		Deliver(Job, EVoxelGpuMeshJobStatus::Cancelled, TEXT("manager shut down"));
-		ReleaseReadbacksOnRenderThread(Job);
 	}
+
+	// One command for all of them, same as the steady-state path. Queued and
+	// InFlight were reset before delivery, so this is still idempotent: a
+	// reentrant CancelAll finds nothing outstanding and enqueues nothing.
+	ReleaseReadbacksOnRenderThread(MoveTemp(Outstanding));
 }

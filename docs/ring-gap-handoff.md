@@ -8,6 +8,69 @@ Everything below is evidence, not theory, except where it says otherwise.
 
 ---
 
+## CLOSED: root-caused and fixed, 2026-07-27 (night)
+
+Everything below this section is the ORIGINAL handoff, from earlier the same
+day. It is kept as-is for the record, with inline notes marking where it was
+superseded — do not rewrite the historical content itself.
+
+The ring gap is **root-caused and fixed**. Full data, every leg, every commit:
+`docs/measurements/ring-gap-2026-07-27.txt`.
+
+Three stacked causes, each confirmed by an instrumented leg, not inferred:
+
+1. **`ReplacementCovered` treated an absent replacement record as covered.**
+   The handoff's inner-hysteresis lead below was the right NEIGHBOURHOOD — the
+   retention mechanism it points at already existed — but the actual hole was
+   narrower than "no hysteresis on the inner edge": a chunk with no replacement
+   record at all was being scored as already-covered and evicted anyway. Fixed
+   in `0cf37dd` / refined in `e225d50`.
+2. **Entry-scan / refill staleness** left deterministic, PERMANENT no-record
+   rings at annulus edges once the anchor pinned — not just a transient
+   in-flight gap, a hole that never filled in. Fixed by the quiescent-anchor
+   gate on the stale-scan refill in `e225d50`.
+3. **Pending-unload records blocked re-admission** when a footprint re-entered
+   its annulus (a scan-before-park race): the chunk was mid-eviction, the
+   camera receded, and the entry pass SKIPPED the re-desired key as
+   "already tracked" because the dying record still existed — then the record
+   parked and vanished after the level's last scan, leaving no trigger to
+   re-admit it. Fixed by resurrecting pending-unload chunks the entry pass
+   re-desires (the unload is cancelled and the still-resident geometry reused),
+   `508a2fa`, with the GPU fork's per-frame cost bounded alongside it in
+   `f029b13`.
+
+Converged coverage holes (`voxel.Stream.CoverageVerify=1`, read after a 60 s
+stationary linger) are now **0 on both meshers**, across repeated instrumented
+legs, real terrain, under motion. See the RESURRECTION table in the measurement
+file.
+
+**The retention-cap lead in this handoff was tested and was NOT the visible
+driver.** Leg C1 ran with `LodRetentionMs=20000` — capRel (the cap-driven
+release) was 0 throughout the flight phase, and the holes were UNCHANGED. The
+cap can release a chunk, but it was not the thing producing the gap.
+
+**The headless repro problem is closed.** "Why this was never reproduced
+headlessly" below correctly diagnosed the flat-terrain spawn bug and proposed
+`-VoxelSpawnAt=-84480,53760` as the fix to try. That worked. The gap is now a
+**one-command scripted flight**, no manual flying required:
+
+```powershell
+& 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor.exe' 'D:\voxelsim\ue-project\VoxelEarth.uproject' `
+    -dx12 -sm6 -log '-VoxelSpawnAt=-84480,53760' `
+    -VoxelPerfFlight=line -VoxelPerfHeading=0 -VoxelPerfPreflightSec=90 `
+    -VoxelPerfRun=120 -VoxelPerfSpeed=20 -VoxelPerfLingerSec=60 `
+    -VoxelPerfLogInterval=2 -ExecCmds="voxel.Stream.CoverageVerify 1" `
+    -abslog="D:\voxelsim\ue-project\Saved\Logs\ringgap.log"
+```
+
+90 s pinned at spawn while the cascade warms, 120 s flying at 20 m/s along
++X, 60 s pinned again — read the converged `Voxel coverage holes=` line from
+the linger phase. Add `-VoxelNoGpuMesh` for the CPU mesher. See the new-switches
+list at the bottom of `docs/measurements/ring-gap-2026-07-27.txt` for what each
+flag does.
+
+---
+
 ## What the owner sees
 
 Concentric gaps at LOD ring boundaries while flying. Present before this
@@ -81,6 +144,12 @@ This predicts every observed property:
 
 **Status: STRONG HYPOTHESIS, NOT CONFIRMED.** Nobody has instrumented it.
 
+> **SUPERSEDED 2026-07-27 (night):** confirmed as the right neighbourhood, wrong
+> exact mechanism. It was not a missing hysteresis band on the inner edge; it
+> was `ReplacementCovered` scoring an absent replacement record as covered.
+> Two further causes stacked on top (entry-scan staleness, a scan-before-park
+> race). See the closed-out section at the top of this file.
+
 ### How to confirm or kill it in one run
 
 Log, per frame, every chunk that leaves the desired set via `bInsideInner`, with
@@ -131,9 +200,18 @@ with roughly half the geometry (5.4 M resident quads vs 10.4 M on real tiles).
 convert this from a manual-only symptom into a headless one — and everything
 gets easier from there.
 
+> **CONFIRMED 2026-07-27 (night):** it reproduced. See the one-command recipe
+> in the closed-out section at the top of this file, and
+> `docs/measurements/ring-gap-2026-07-27.txt` for every leg.
+
 ---
 
-## Reproduction recipe
+## Reproduction recipe (manual)
+
+> Superseded for reproduction purposes by the scripted one-command flight in
+> the closed-out section at the top of this file, which also reads the
+> converged hole count for you instead of requiring an eyeball "stop moving"
+> check. This manual recipe is kept for hands-on investigation.
 
 ```powershell
 & 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor.exe' 'D:\voxelsim\ue-project\VoxelEarth.uproject' `
