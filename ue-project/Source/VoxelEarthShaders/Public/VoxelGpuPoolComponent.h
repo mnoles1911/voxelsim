@@ -479,6 +479,10 @@ public:
 	// count oscillates around the floor would pay that repeatedly, so it wants a
 	// floor above its own steady state. Must be set before the proxy is created.
 	void SetChunkTableCapacity(int32 InEntries) { ChunkTableCapacity = FMath::Max(1, InEntries); }
+	// So callers can LOG the floor instead of repeating the literal they passed.
+	// The startup line did exactly that and went stale within one commit of the
+	// floor moving.
+	int32 GetChunkTableCapacity() const { return ChunkTableCapacity; }
 
 	//~ UPrimitiveComponent
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;

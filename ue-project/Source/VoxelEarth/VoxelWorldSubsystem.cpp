@@ -8977,7 +8977,16 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	// render-state rebuild, which re-uploads the ENTIRE quad buffer; terrain
 	// crosses it while the cascade fills and then stops, so a floor above the
 	// measured steady state turns a handful of whole-pool re-uploads into none.
-	Pool->SetChunkTableCapacity(49152);
+	//
+	// RAISED 49,152 -> 81,920 for S1-1 (2026-07-27). The old floor was one step
+	// above the 43,328-chunk settle, which was ample while the pipeline applied
+	// ~260 chunks/s. Batching publication doubles that and transient residency
+	// with it: the first batched legs peaked at 49,349 live chunks, i.e. THROUGH
+	// this floor. Crossing it is the branch above -- MarkRenderStateDirty, whose
+	// rebuild per D4-R1 invalidates every GPU-written range, so at 580 chunks/s
+	// that is not "a handful of whole-pool re-uploads", it is a repeating one.
+	// See docs/measurements/s1-1-batch-publish-2026-07-27.txt.
+	Pool->SetChunkTableCapacity(81920);
 	PoolOwner->SetRootComponent(Pool);
 	Pool->RegisterComponent();
 
@@ -9059,7 +9068,31 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	// double-allocation (the ring-gap night's measured retention overhead) +
 	// ~10% first-fit fragmentation -- the same headroom methodology as the 26M
 	// sizing below, re-derived from the new cascade's numbers. 352 MB at 8 B/quad.
-	constexpr uint32 kPoolCapacityQuads = 44u * 1000u * 1000u;   // 352 MB at 8 B/quad
+	// RESIZED 44M -> 64M for S1-1 (2026-07-27, same day as the 26M -> 44M above).
+	//
+	// 44M was sized from a settle of 35,205,733 quads at 39,020 chunks -- measured
+	// when the pipeline could only apply ~260 chunks/s. Batching publication
+	// (voxel.Stream.PoolBatchPublish) takes that to ~580, and TRANSIENT residency
+	// with it: the first batched legs peaked at 49,349 live chunks and
+	// capacityPct=98.5, then refused 77,290 allocations (96.9M quads) while the
+	// free list shattered into 16,903 runs with a largest run of 68,326. Full
+	// data: docs/measurements/s1-1-batch-publish-2026-07-27.txt.
+	//
+	// So this is not the cascade getting bigger. It is the pipeline getting fast
+	// enough to hold more chunks IN FLIGHT between admission and unload, and the
+	// old number was derived from a pipeline that could not do that.
+	//
+	// 64M = 49,349 peak chunks x ~902 quads/chunk (44.5M) + ~44% headroom for the
+	// fragmentation first-fit produces under this churn. 512 MB at 8 B/quad, plus
+	// the same again in the chunk-id buffer and 12 B/quad of CPU shadow -- see
+	// docs/speculative-generation-plan.md §2.6 for the full memory arithmetic and
+	// why the shadow is what makes further raises expensive.
+	//
+	// WHETHER THIS IS ENOUGH IS AN OPEN QUESTION, not a settled one: a 72x
+	// collapse in largest-free-run at equal total free is more than headroom
+	// alone explains, so first-fit may need the idle defrag (T3-6) regardless of
+	// capacity. The leg that flips PoolBatchPublish must show allocFail=0.
+	constexpr uint32 kPoolCapacityQuads = 64u * 1000u * 1000u;   // 512 MB at 8 B/quad
 	uint32 PoolCapacityQuads = kPoolCapacityQuads;
 	{
 		uint32 Override = 0;
@@ -9075,7 +9108,12 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	       TEXT("voxel.Stream.GPU: geometry pool up, %u quad capacity (%.0f MB)%s, chunk table floor %d. "
 	            "Chunks now stream as ranges in ONE primitive."),
 	       PoolCapacityQuads, double(PoolCapacityQuads) * 8.0 / (1024.0 * 1024.0),
-	       PoolCapacityQuads != kPoolCapacityQuads ? TEXT(" [OVERRIDDEN]") : TEXT(""), 49152);
+	       // Read back from the component rather than repeating the literal: this
+	       // line said 49152 for one commit after the floor moved to 81920, which
+	       // is the exact shape of "stale comments about defaults are landmines"
+	       // (docs/lessons-2026-07-27-gpu-sessions.md, lesson 3).
+	       PoolCapacityQuads != kPoolCapacityQuads ? TEXT(" [OVERRIDDEN]") : TEXT(""),
+	       Pool->GetChunkTableCapacity());
 	return Pool;
 }
 
