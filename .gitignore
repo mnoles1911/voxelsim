@@ -26,6 +26,10 @@ ue-project/Binaries/
 ue-project/DerivedDataCache/
 ue-project/Intermediate/
 ue-project/Saved/
+# Repo-root scratch for headless leg logs (-abslog=). Raw UE logs run ~3 MB
+# each and a leg set is tens of MB; the distilled numbers live in
+# docs/measurements/ instead, which is what anything should cite.
+/Saved/
 ue-project/.vs/
 ue-project/*.sln
 ue-project/.vsconfig

@@ -243,6 +243,8 @@ WHAT THIS CHANGES IN THE PLAN
              with holes(final)=0, and the live GPU dispatch ceiling still has to
              be measured before any speculative budget is sized.
 
-Raw logs: Saved/s0-gpu-1.log, s0-gpu-2.log, s0-cpu-1.log, s0-cpu-2.log,
-s0-gpu-statsoff.log. Perf JSON: ue-project/Saved/PerfRuns/perf_20260727_181746.json
-and siblings.
+Raw logs are NOT COMMITTED -- ~3 MB each, /Saved/ is gitignored. They were
+written to Saved/s0-gpu-1.log, s0-gpu-2.log, s0-cpu-1.log, s0-cpu-2.log,
+s0-gpu-statsoff.log on the measuring box, with perf JSON in
+ue-project/Saved/PerfRuns/perf_20260727_181746.json and siblings. This file is
+the citable record; re-run the leg command at the top to regenerate the logs.
