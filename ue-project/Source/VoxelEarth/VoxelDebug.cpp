@@ -309,17 +309,21 @@ TAutoConsoleVariable<bool> CVarVoxelStreamGpu(
 // capacity of ~18,000/s -- about 9% worker utilisation. Raising the multiplier
 // keeps the task graph fed ACROSS frames instead of re-starving every frame.
 //
-// Default 2 deliberately preserves the pre-change behaviour exactly, so this
-// ships inert and the A/B runs on one binary.
+// RAISED 2 -> 8 on 2026-07-27, measured on real terrain (docs/measurements/
+// ring-gap-2026-07-27.txt): 128 m-cascade cold fill 50.5 s -> 38 s avg (~25%
+// faster, wide spread 41/35 s so call it +/-10%), 64 m cold fill 4 s -> 2 s
+// twice, and a 20 m/s motion leg at 8 loaded MORE chunks than any other leg
+// that night (93,734) with the same 8 hitches, holes=0, p95 within noise.
 //
-// Costs to watch when raising it: more in-flight jobs means more results landing
-// per frame (bounded by voxel.Stream.MaxAppliesPerFrame / ApplyBudgetMs), more
-// peak memory in flight, and more STALE results (a chunk evicted while its job
-// runs is discarded -- currently 0.0%, watch the "job flow" census).
+// Costs to watch when raising it further: more in-flight jobs means more
+// results landing per frame (bounded by voxel.Stream.MaxAppliesPerFrame /
+// ApplyBudgetMs), more peak memory in flight, and more STALE results (a chunk
+// evicted while its job runs is discarded -- watch the "job flow" census).
 TAutoConsoleVariable<int32> CVarVoxelStreamJobsInFlightPerCore(
 	TEXT("voxel.Stream.JobsInFlightPerCore"),
-	2,
-	TEXT("Worker jobs allowed in flight, as a multiple of logical cores (24 at the default 2 on a 12-thread box). ")
+	8,
+	TEXT("Worker jobs allowed in flight, as a multiple of logical cores (96 at the default 8 on a 12-thread box; ")
+	TEXT("raised from 2 on 2026-07-27, ~25% faster real-terrain cold fill, no hitch or coverage cost on record). ")
 	TEXT("DispatchJobs refills to this cap once per frame, so with short jobs (R0 p50 ~1.3ms) and a ~15ms frame the ")
 	TEXT("slots idle most of the frame -- measured ~9% worker utilisation and ~6,800 chunks per 5s evicted before ")
 	TEXT("ever being dispatched. Raise to keep the task graph fed across frames. Watch stale%% in the job-flow census."),

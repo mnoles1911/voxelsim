@@ -49,22 +49,25 @@ static FAutoConsoleVariableRef CVarVoxelGpuMeshChunkLocal(
 // Both are A/B-able: <= 0 restores the previous unbounded behaviour exactly, so
 // the fix can be measured against itself on one binary the same way
 // voxel.GPU.MeshChunkLocal is.
-static int32 GVoxelGpuMeshBatchCap = 32;
+static int32 GVoxelGpuMeshBatchCap = 4;
 static FAutoConsoleVariableRef CVarVoxelGpuMeshBatchCap(
 	TEXT("voxel.GPU.MeshBatchCap"),
 	GVoxelGpuMeshBatchCap,
 	TEXT("Max queued jobs one DispatchBatch may promote into a single FRDGBuilder. ")
-	TEXT("Default 32; <= 0 means unlimited (pre-cap behaviour). ")
+	TEXT("Default 4 -- the caps sweep was monotone: 32/64 -> 367 hitches / 77.2k chunks, 8/16 -> 8 / 86.5k, ")
+	TEXT("4/8 -> 8 / 89.4-89.6k over two legs, so the smallest batch measured is also the fastest. ")
+	TEXT("<= 0 means unlimited (pre-cap behaviour). ")
 	TEXT("Each job adds ~7 compute passes + 3-4 copy passes, so an uncapped burst ")
 	TEXT("frame built graphs of 100+ passes on the render thread."),
 	ECVF_Default);
 
-static int32 GVoxelGpuMeshHarvestCap = 64;
+static int32 GVoxelGpuMeshHarvestCap = 8;
 static FAutoConsoleVariableRef CVarVoxelGpuMeshHarvestCap(
 	TEXT("voxel.GPU.MeshHarvestCap"),
 	GVoxelGpuMeshHarvestCap,
 	TEXT("Max ready jobs one poll may HARVEST (readback Lock/memcpy/Unlock). ")
-	TEXT("Default 64; <= 0 means unlimited (pre-cap behaviour). ")
+	TEXT("Default 8, swept together with voxel.GPU.MeshBatchCap (see its comment). ")
+	TEXT("<= 0 means unlimited (pre-cap behaviour). ")
 	TEXT("IsReady() checks stay unbounded — they are cheap; it is the copies that ")
 	TEXT("cost, and with 150-256 jobs in flight one poll could do all of them."),
 	ECVF_Default);
