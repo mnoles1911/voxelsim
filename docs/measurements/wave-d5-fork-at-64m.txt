@@ -1,0 +1,44 @@
+The GPU fork at the SHIPPED 64 m cascade -- the measurement the shipping
+decision actually needs. Every earlier fork number was taken at R0 = 128 m.
+
+Default spawn, -VoxelPerfFlight=static, edit log cleared per leg, 2 legs each,
+-VoxelPerfLogInterval=1 (see the resolution note below).
+
+  settle-to-peak (11,010 chunks):
+    64 m, CPU               6.0 s / 6.0 s
+    64 m, fork L0-L4        6.0 s / 6.1 s        8,528-8,555 chunks forked
+
+SETTLE TIME CANNOT DISTINGUISH THEM AT THIS SCALE, and saying "identical" would
+be reading the instrument rather than the world. The whole cascade fills in ~6 s
+and the log interval is 1 s, so there are six samples; both configurations
+finish inside the same bucket. THE FILL CURVE resolves what settle cannot:
+
+  t(s)      CPU leg1 / leg2      fork leg1 / leg2      separation
+   0        1121 / 1060          1095 / 1045           --
+   1        3102 / 3051          3239 / 3164           +4%
+   2        5067 / 5052          5459 / 5388           +7%
+   3        7004 / 7001          7644 / 7617           +9%
+   4        8696 / 8638          9764 / 9694          +12%
+   5       10052 / 10000        10884 / 10811          +8%
+   6       11010 / 11010        11010 / 11010          done
+
+The fork is strictly AHEAD at every sample from t=1. The separation at t=4 is
+~1,060 chunks against a within-config spread of ~60, so it is an order of
+magnitude outside the noise floor -- unlike the settle number, which is inside a
+single quantum.
+
+WHAT THIS SETTLES: the fork is NOT A REGRESSION at the cascade that actually
+ships, which was the open risk. A ~28 ms GPU round trip could plausibly have
+failed to amortise over 11,010 chunks and made the common case worse. It does
+not; it fills faster throughout and simply runs out of world before the
+advantage can show up in a completion time.
+
+WHAT IT DOES NOT SETTLE: cold fill is not the criterion the plan sets for Wave
+D. That is per-ring dispatch rate x p50 UNDER MOTION, and nothing here moves the
+camera. Stale results are also expected to rise with multi-frame latency and are
+unmeasured. Edited chunks are carved out by NeedsOverlayAwarePath and a dig has
+not been tried against the fork.
+
+For the record, the same fork at R0 = 128 m: 36.3 / 38.3 s against a CPU
+58.4 / 60.4 s, i.e. ~38% faster, where the fill is long enough for settle time
+to resolve it.
