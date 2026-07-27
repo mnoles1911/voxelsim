@@ -1,0 +1,63 @@
+The voxel.GI.MaxChunkRefreshesPerFrame sweep that Wave B owed.
+
+WHAT IT WAS FOR. Wave B declined to ship GI on: p50 moved +0.6% (inside noise)
+but p95 rose 14.9% and the hitch count TRIPLED, 23.3 -> 74.0. The budget bounds
+the re-shade drain that tail comes from, so lowering it was the candidate fix --
+and B7 required the sweep to also report the edit-to-relight latency it buys
+back, "so the choice is between two named things".
+
+--- HALF ONE: RELIGHT LATENCY. Decisive, and it kills the candidate fix. -------
+
+-VoxelGIRelightAfter=30 (carve at a settled field, time until BOTH the solve
+queue and the re-shade queue have drained -- i.e. until the dig is actually
+fully relit on screen). One leg per budget, 108 edit bricks each:
+
+  budget   editToFullyRelitMs   peakRefreshQueue
+     1     TIMEOUT >30 s (51 of 108 bricks still outstanding)
+     2               5,273              711
+     4 (default)       240               40
+     8                 147               12
+
+STRONGLY NON-LINEAR, AND THE DEFAULT SITS ON THE KNEE. Going 4 -> 2 costs 22x
+the relight latency; 4 -> 1 never finishes inside 30 s. A 5.3-second delay
+between digging and the hole lighting correctly is not a subtle regression, it
+is the kind a player narrates. Going 4 -> 8 buys only 1.6x (240 -> 147 ms).
+
+So the fix Wave B hoped for -- lower the budget, lose the hitches -- is not
+available at any price worth paying.
+
+--- HALF TWO: HITCHES. The effect does not reproduce at this anchor. ----------
+
+-VoxelPerfRun=60 -VoxelPerfFlight=static, post-warmup percentiles, 2 legs each:
+
+  config     p50 legs        p95 legs      hitches
+  off      12.97 / 13.53   15.55 / 15.80    0 / 0
+  on  @4   13.59 / 13.69   15.87 / 16.12    0 / 2
+  on  @8   13.20 / 13.62   15.77 / 16.18    0 / 0
+  on  @16  13.20           15.85            1
+
+  off same-config spread: p50 0.56 ms, p95 0.25 ms
+
+Every difference BETWEEN budgets is smaller than the spread WITHIN the off
+config. More importantly, Wave B's finding is absent: hitches are 0-2 here
+against its 23.3 off / 74.0 on, and p50 is 12.97 against its 23.25.
+
+THAT GAP IS THE POINT, NOT A CONTRADICTION. A p50 of 12.97 ms against 23.25 ms
+means this is a much cheaper view than the one Wave B measured -- roughly half
+the frame cost -- so the re-shade drain never gets deep enough to hitch. The
+sweep therefore CANNOT select a budget on hitches at this anchor: the mechanism
+it is meant to tune is not present to be tuned.
+
+--- VERDICT -------------------------------------------------------------------
+
+The budget STAYS AT 4, and the sweep does not rescue GI's default.
+
+  * Lowering it is ruled out on evidence, not caution: 22x relight latency at 2,
+    no completion at 1.
+  * Raising it is unmotivated: 1.6x latency gain, and no hitch improvement
+    because there are no hitches here to improve.
+  * The tail that justified shipping GI off is anchor-dependent and needs Wave
+    B's denser view to reproduce. That is a manual measurement, and it belongs
+    with the other frame-cost items a 400 ms-clamped harness cannot take.
+
+voxel.GI.Enabled stays 0.
