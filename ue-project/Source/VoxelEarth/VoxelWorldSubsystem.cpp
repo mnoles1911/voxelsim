@@ -2586,6 +2586,10 @@ struct FVoxelWorldImpl
 	int64 GpuMeshJobsFailedSinceLog = 0;
 	double GpuMeshSubmitToDeliverMsSinceLog = 0.0;
 	double GpuMeshSubmitToDeliverMaxMs = 0.0;
+	// Deliveries that took at least kBlindJobMarkTimeoutSeconds. See
+	// OnGpuMeshJobComplete for why gpuLatencyTimeouts cannot stand in for this.
+	int64 GpuMeshSlowDeliveriesSinceLog = 0;
+	int64 GpuMeshSlowDeliveriesTotal = 0;
 
 	// What the fork needs back when a job lands, keyed by the runner's job id.
 	//
@@ -4160,12 +4164,15 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			: 0.0;
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel GPU mesh fork (5s window): dispatched=%lld delivered=%lld failed=%lld "
-		            "pending=%d queued=%d inFlight=%d | submitToDeliver mean=%.1f ms max=%.1f ms"),
+		            "pending=%d queued=%d inFlight=%d | submitToDeliver mean=%.1f ms max=%.1f ms "
+		            "slow(>=%.0fs)=%lld (total %lld)"),
 		       (long long)GpuMeshJobsDispatchedSinceLog, (long long)GpuMeshJobsDeliveredSinceLog,
 		       (long long)GpuMeshJobsFailedSinceLog, GpuJobsPending.Num(),
 		       GpuMeshJobs.IsValid() ? GpuMeshJobs->NumQueued() : 0,
 		       GpuMeshJobs.IsValid() ? GpuMeshJobs->NumInFlight() : 0,
-		       MeanDeliverMs, GpuMeshSubmitToDeliverMaxMs);
+		       MeanDeliverMs, GpuMeshSubmitToDeliverMaxMs,
+		       kBlindJobMarkTimeoutSeconds,
+		       (long long)GpuMeshSlowDeliveriesSinceLog, (long long)GpuMeshSlowDeliveriesTotal);
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel GPU mesh fork by level (5s window): L0=%lld L1=%lld L2=%lld L3=%lld "
 		            "L4=%lld L5=%lld (cap L%d)"),
@@ -4178,6 +4185,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		GpuMeshJobsDeliveredSinceLog = 0;
 		GpuMeshJobsFailedSinceLog = 0;
 		GpuMeshSubmitToDeliverMsSinceLog = 0.0;
+		GpuMeshSlowDeliveriesTotal += GpuMeshSlowDeliveriesSinceLog;
+		GpuMeshSlowDeliveriesSinceLog = 0;
 		// Max is NOT reset: it is a run-high-water mark, and it is the number
 		// that says whether kBlindJobMarkTimeoutSeconds (5 s) is anywhere near
 		// being crossed. Resetting it every window would hide the one spike
@@ -6205,6 +6214,24 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	++GpuMeshJobsDeliveredSinceLog;
 	GpuMeshSubmitToDeliverMsSinceLog += GpuResult.SubmitToDeliverMs;
 	GpuMeshSubmitToDeliverMaxMs = FMath::Max(GpuMeshSubmitToDeliverMaxMs, GpuResult.SubmitToDeliverMs);
+
+	// DELIVERIES SLOWER THAN THE COLD-BAND BACKSTOP, counted directly.
+	//
+	// gpuLatencyTimeouts cannot see these, and that is not a bug in it so much
+	// as a limit nobody had stated. It increments when a cold-band MARK ages
+	// out, and a mark only exists for a footprint whose band was not already
+	// cached. Once FootprintBandCache is warm -- 5,088 entries in the 128 m runs
+	// -- almost no footprint carries a mark, so an arbitrarily slow delivery
+	// passes without touching that counter at all.
+	//
+	// Which is exactly what happened: a 7,395 ms submit->deliver was measured on
+	// a run whose gpuLatencyTimeouts read 0 for its entire length. "The fork is
+	// healthy" then rests on a number that was never in a position to disagree.
+	// This one is.
+	if (GpuResult.SubmitToDeliverMs >= kBlindJobMarkTimeoutSeconds * 1000.0)
+	{
+		++GpuMeshSlowDeliveriesSinceLog;
+	}
 
 	VoxelStreaming::FJobResult Result;
 	Result.Key = Pending.Key;
