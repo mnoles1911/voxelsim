@@ -30,8 +30,13 @@ void AVoxelEarthPlayerController::SetupInputComponent()
 	InputComponent->BindKey(EKeys::RightMouseButton, IE_Pressed, this, &AVoxelEarthPlayerController::OnPlace);
 
 	// Dig/place size selection (m1-plan.md "Dig sizes" row).
-	InputComponent->BindKey(EKeys::MouseScrollUp, IE_Pressed, this, &AVoxelEarthPlayerController::CycleDigSizeUp);
-	InputComponent->BindKey(EKeys::MouseScrollDown, IE_Pressed, this, &AVoxelEarthPlayerController::CycleDigSizeDown);
+	//
+	// The mouse WHEEL no longer cycles dig size: it became the movement speed
+	// dial (AVoxelEarthFlyPawn -- the walk-mode gait tier and the fly-mode speed
+	// step), which needs the fluid one-handed control far more than a
+	// three-value selector does. Dig size keeps the 1/2/3 shortcuts it always
+	// had, plus CycleDigSizeUp/Down below stay callable from the debug overlay,
+	// so nothing here actually lost a control surface.
 	InputComponent->BindKey(EKeys::One, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize1);
 	InputComponent->BindKey(EKeys::Two, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize2);
 	InputComponent->BindKey(EKeys::Three, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize4);
