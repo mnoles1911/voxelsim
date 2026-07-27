@@ -232,3 +232,52 @@ Consequence: the tile-batching stage 1 is RESEQUENCED behind the draw-path
 work -- meshing throughput is irrelevant while the renderer holds every
 frame at 46 ms. Diagnosis of the per-frame render-thread work at 39k chunks
 is the next entry in this file.
+
+================================================================================
+DRAW-PATH FIXES, K SWEEP, AND THE FINAL HEAD-TO-HEAD
+================================================================================
+
+Draw-path work (cull default-on + AABB hoist + multi-batch, commit 911e7cd)
+took the adopted-cascade flight from p50 45.9 ms / 5,881 hitches to p50 22.4 ms
+/ ~1,950. K sweep (flight): K=64 -> 30.6 ms / 4,480; K=256 -> 26.5 / 1,921;
+K=1024 -> 22.4 / 1,968. K=1024 SHIPPED. The 181-421 ms transients during churn
+are the per-range single-frame uniform buffers (known cost, needs the
+vertex-factory indirection to remove).
+
+Two falsified levers, recorded so nobody re-tries them blind:
+  MeshBatchCap 4/8 -> 16/32: chunks/s moved 0.0 (602.3 vs 602.0).
+  GpuMeshInFlight 256 -> 1024: 590/s, fork idling at ~11 in flight, and the
+  submit->deliver MAX ballooned to 13,146 ms (past the 10 s retention cap --
+  a correctness hazard). REVERTED to 256; the manager now receives the same
+  resolved value as the fork gate so the knob is real at any setting.
+
+HEAD-TO-HEAD: the pre-GPU-programme method (component renderer, CPU mesher,
+JobsInFlightPerCore=2) vs the full shipped stack, standard flight legs.
+
+At the ADOPTED cascade (128 m / 4 km, 39k chunks):
+   arm    p50      p95     hitches   avgChunks/s   holes(final)   coldFill
+   old    24.67    40.56   2222      1082          0              46 s
+   new    22.44    44.71   1968       602          15,328         47 s
+
+At the OLD-WORLD scale (64 m rings -- what existed before the programme):
+   arm    p50      p95     hitches   avgChunks/s   holes(final)
+   old    9.42     24.43     48       908          0
+   new    8.75     21.76      8       704          0
+
+READING IT HONESTLY. At the old scale the new stack wins every frame-pacing
+metric (6x fewer hitches, p50 -7%, p95 -11%) and both arms keep the world
+complete. At the adopted scale the new stack holds a 2x-better frame time than
+its own pre-draw-work state and edges the component renderer on p50 -- but the
+POOLED ARMS PLATEAU AT ~600 chunks/s regardless of mesher (fork on: 602;
+fork off: 593; caps/depth: no effect) while the component arm posts ~1,080/s
+and converges. Cumulative-load churn inflates the component number somewhat
+(ComponentPoolMax recycling), but its holes=0 against the pooled arms'
+~15k-at-plateau is not churn: at 4 km the pooled apply/streaming side is
+genuinely rate-limited by something none of the swept knobs touch (apply
+budget only 8.5% saturated -- results are not ARRIVING). THE ~600/s POOLED
+PLATEAU AT THE ADOPTED CASCADE IS THE OPEN P0. Candidate suspects for the
+next session: per-chunk PushUpdatesToProxy cost coupling into the drain,
+SampleChunkParamsForPool, the chunk-table update path, or dispatch-side
+routing -- none yet measured. Tile batching (designed, occupancy census
+recorded above) multiplies the fork ceiling but will not move this plateau if
+the limit is the apply/table path; diagnose FIRST.

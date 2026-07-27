@@ -1542,6 +1542,18 @@ bool GpuMeshEnabled()
 // the same trap the ring floor sweep fell into.
 int32 GpuMeshInFlight()
 {
+	// 256, TESTED AND KEPT (2026-07-27). The depth hypothesis -- fork
+	// throughput = in-flight depth / round-trip latency, so 1024 should lift
+	// ~600 chunks/s toward ~2,400 -- was tried at the adopted 128 m / 4 km
+	// cascade and FALSIFIED: 590 chunks/s at 1024 (vs 602 at 256), with the
+	// fork idling at ~11 in flight (never depth-bound at all) and the
+	// submit->deliver MAX ballooning to 13,146 ms -- past the 10 s retention
+	// cap, i.e. a correctness hazard, not just waste. Whatever pins the
+	// new-stack loading rate at ~600/s at that cascade (the old
+	// component-renderer arm reaches ~1,080/s), it is not this knob, not
+	// MeshBatchCap (4/8 vs 16/32 moved 0.0), and not the mesher choice
+	// (-VoxelNoGpuMesh arm also ~593/s). That plateau is the open P0 in
+	// docs/measurements/gpu-throughput-wave-2026-07-27.txt.
 	static const int32 N = []
 	{
 		int32 Value = 256;
@@ -7194,9 +7206,16 @@ FVoxelGpuMeshJobManager* FVoxelWorldImpl::EnsureGpuMeshJobs()
 	// throughput from 49,179 to 558 chunks and took a while to pin on the
 	// floors. The subsystem's own MaxJobsInFlight is the one knob that should
 	// bind; this one must not.
+	// Pass the SAME resolved value the fork decision uses (-VoxelGpuMeshInFlight,
+	// default in GpuMeshInFlight()), not a second literal: the two caps used to
+	// both be 256 so "neither binds before the other" held by coincidence, and
+	// raising the switch past the literal silently did nothing -- the exact
+	// unattributable-throughput trap the comment above warns about, measured on
+	// 2026-07-27 when a caps sweep moved chunks/s by 0.0 because THIS constant
+	// was the binding one. One knob, both consumers.
 	GpuMeshJobs = MakeUnique<FVoxelGpuMeshJobManager>(
 		FVoxelGpuMeshJobComplete::CreateRaw(this, &FVoxelWorldImpl::OnGpuMeshJobComplete),
-		/*InMaxInFlight*/ 256);
+		/*InMaxInFlight*/ VoxelStreamAdmission::GpuMeshInFlight());
 	// The conditions, stated as they ACTUALLY are. This line used to say
 	// "level 0, unedited, band-known chunks only", which was true when it was
 	// written and stopped being true twice: D6 removed the band-known
