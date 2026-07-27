@@ -346,18 +346,22 @@ TAutoConsoleVariable<int32> CVarVoxelStreamJobsInFlightPerCore(
 // second call) so an idle frame -- nothing pending, workers caught up -- pays
 // only the PendingJobNum() scan and nothing else.
 //
-// Default ON: complements JobsInFlightPerCore=8 rather than substituting for
-// it -- the wider cap gives more slots to refill, and the second dispatch is
-// what actually refills them same-frame. Set 0 for the old single-dispatch
-// behaviour (the A/B control for this change).
+// Default OFF, AND THAT IS A MEASUREMENT (2026-07-27 cadence A/B, real-terrain
+// 20 m/s line flight, JobsInFlightPerCore already at 8): ON bought +0.2% chunks
+// on the CPU arm (92,249 vs 92,080 -- inside the same-config noise floor) and
+// nothing at all on the GPU arm (89,666 vs 89,588 the previous leg), while
+// COSTING 22 vs 8 hitches on the CPU arm. With a 96-job in-flight buffer the
+// once-per-frame top-up no longer starves anyone; the second call just lands
+// extra dispatch work inside already-busy frames. Kept as a lever because the
+// cold-fill case (queue perpetually saturated) was NOT part of that A/B and is
+// where a second top-up could still pay -- measure there before flipping.
 TAutoConsoleVariable<int32> CVarVoxelStreamDispatchAfterDrain(
 	TEXT("voxel.Stream.DispatchAfterDrain"),
-	1,
+	0,
 	TEXT("Run a second DispatchJobs() pass after DrainResults/DrainGameThreadMesh, so slots freed earlier this frame ")
-	TEXT("are refilled same-frame instead of idling until next frame's dispatch (measured ~9%% worker utilisation ")
-	TEXT("at the old JobsInFlightPerCore default from this once-per-frame cadence alone). Skipped cheaply when ")
-	TEXT("nothing is pending. Complements JobsInFlightPerCore=8, which widens the buffer but does not change the ")
-	TEXT("cadence. Set 0 for the old single-dispatch-per-frame behaviour (A/B control)."),
+	TEXT("are refilled same-frame instead of idling until next frame's dispatch. Default 0: with ")
+	TEXT("JobsInFlightPerCore=8 the motion A/B measured no throughput gain and +14 hitches (2026-07-27). ")
+	TEXT("Skipped cheaply when nothing is pending. A/B lever for cold-fill work."),
 	ECVF_Default);
 
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxRemeshesPerFrame(

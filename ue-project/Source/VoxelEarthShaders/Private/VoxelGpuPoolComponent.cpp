@@ -1,16 +1,25 @@
 ﻿#include "VoxelGpuPoolComponent.h"
 
+#include "VoxelGpuWorldGenGraph.h"
 #include "VoxelQuadVertexFactory.h"
 #include "PrimitiveSceneProxy.h"
 #include "MaterialDomain.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialRenderProxy.h"
 #include "MeshBatch.h"
+#include "RenderGraphBuilder.h"
+#include "RenderGraphResources.h"
 #include "SceneManagement.h"
 #include "RHIResourceUtils.h"
 #include "Misc/ScopeExit.h"
 
 #include <atomic>
+
+// Out of line because FVoxelGpuPoolBuffers holds two FRDGPooledBuffer
+// references through a forward declaration -- this is the one translation unit
+// with the complete type, so it is the one place they may be destroyed.
+FVoxelGpuPoolBuffers::FVoxelGpuPoolBuffers() = default;
+FVoxelGpuPoolBuffers::~FVoxelGpuPoolBuffers() = default;
 
 // Draws every chunk in the pool with a single mesh batch.
 namespace VoxelGpuPoolCull
@@ -274,6 +283,23 @@ public:
 			// First proxy, or the pool outgrew the allocation. The latter means
 			// the GPU-resident contents are genuinely gone, so re-uploading from
 			// the CPU shadow is the correct and only thing to do.
+
+			// REQUIREMENT D4-R1, made audible. A rebuild (as opposed to a first
+			// creation) destroys the buffer every GPU-written range lives in, and
+			// the CPU shadow holds zeros for those ranges -- so they come back
+			// EMPTY, and nothing here re-dispatches them. Capacity is allocated
+			// once from kPoolCapacityQuads and never grows in practice, so this
+			// should be unreachable; "rare and silent" is the combination this
+			// wave has repeatedly been caught by, so it is loud instead.
+			if (SharedBuffers->CapacityQuads > 0)
+			{
+				UE_LOG(LogTemp, Error,
+				       TEXT("%s: pool buffers REBUILT (capacity %d -> %d quads). Every GPU-written range is "
+				            "now empty and nothing re-meshes them — see requirement D4-R1. Expect missing "
+				            "terrain until those chunks are re-dispatched."),
+				       *PoolName, SharedBuffers->CapacityQuads, Quads.Num());
+			}
+			SharedBuffers->GpuWritable.Set(0);
 			SharedBuffers->QuadBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
 				RHICmdList, TEXT("VoxelGpuPool.Quads"),
 				EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource
@@ -300,7 +326,35 @@ public:
 
 			SharedBuffers->CapacityQuads = Quads.Num();
 
-			UE_LOG(LogTemp, Log, TEXT("%s: created persistent pool buffers, capacity %d quads"),
+			// The RDG half (Wave D / D1). Same two buffers, wrapped so a compute
+			// pass can write them: RegisterExternalBuffer brings them into a
+			// graph, RDG emits the UAVCompute transition, and the default
+			// epilogue access (SRVMask) hands them back in the state the draw
+			// wants. No manual barrier anywhere, and the SRVs the vertex factory
+			// baked into its uniform buffer keep working untouched -- a
+			// transition applies to the RESOURCE, not the view.
+			//
+			// The descs must match how the buffers were actually created, above.
+			// CreateStructuredDesc's default usage is
+			// Static|UnorderedAccess|ShaderResource|StructuredBuffer, which is
+			// exactly the flag set used there.
+			SharedBuffers->QuadPooled = new FRDGPooledBuffer(
+				RHICmdList, SharedBuffers->QuadBuffer,
+				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint64), uint32(SharedBuffers->CapacityQuads)),
+				uint32(SharedBuffers->CapacityQuads), TEXT("VoxelGpuPool.Quads"));
+			SharedBuffers->ChunkIdPooled = new FRDGPooledBuffer(
+				RHICmdList, SharedBuffers->ChunkIdBuffer,
+				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), uint32(SharedBuffers->CapacityQuads)),
+				uint32(SharedBuffers->CapacityQuads), TEXT("VoxelGpuPool.ChunkIds"));
+
+			// LAST, after everything a direct write needs exists. The game thread
+			// reads this to decide whether to dispatch a mesh job direct-to-pool,
+			// and the only ordering that matters is that it cannot see 1 before
+			// the buffers are there.
+			SharedBuffers->GpuWritable.Set(1);
+
+			UE_LOG(LogTemp, Log,
+			       TEXT("%s: created persistent pool buffers, capacity %d quads — GPU-writable"),
 			       *PoolName, SharedBuffers->CapacityQuads);
 		}
 		else
@@ -1446,6 +1500,12 @@ void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 	NumLiveChunks = 0;
 	LocalBounds = FBox(ForceInit);
 	DirtyQuadRanges.Reset();
+	// Every allocation this pool knew about is gone, so a pending write would
+	// target an offset that now belongs to nobody. Dropped with the rest of the
+	// state, which also releases the payloads' GPU memory. GpuDirectWrites is
+	// NOT reset, for the same reason AllocFailureCount is not: it answers "what
+	// did this RUN do", not "what is happening right now".
+	PendingGpuWrites.Reset();
 	bChunkTableDirty = false;
 	bRunsDirty = false;
 }
@@ -1566,6 +1626,98 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 	MarkQuadsDirty(Alloc.Offset, Alloc.NumQuads);
 	bChunkTableDirty = true;
 	bRunsDirty = true;
+	PushUpdatesToProxy();
+	UpdateBounds();
+	return Handle;
+}
+
+bool UVoxelGpuPoolComponent::IsGpuWritable() const
+{
+	return PoolBuffers.IsValid() && PoolBuffers->GpuWritable.GetValue() != 0;
+}
+
+int32 UVoxelGpuPoolComponent::AddChunkFromGpu(const FVoxelGpuQuadPayloadRef& Src, uint32 NumQuads,
+                                              const FVector3f& OriginUU, int32 Level,
+                                              const FVector4f& Params)
+{
+	check(Pool.GetCapacityQuads() > 0);   // InitPool first
+
+	if (!Src.IsValid() || NumQuads == 0)
+	{
+		// A zero-quad chunk allocates nothing and has no payload -- the mesh job
+		// short-circuits it a phase earlier. Reaching here with one is a caller
+		// bug, not a pool state, so it fails visibly rather than silently
+		// allocating an empty range.
+		return INDEX_NONE;
+	}
+	if (!IsGpuWritable())
+	{
+		// The buffers do not exist yet, so a write would have nowhere to land.
+		// Refuse BEFORE allocating: an allocation whose write is dropped leaves a
+		// live chunk-table entry naming a range full of zeros, which draws as
+		// nothing and reports as success.
+		return INDEX_NONE;
+	}
+
+	const FVoxelGpuPoolAllocation Alloc = Pool.Alloc(NumQuads);
+	if (!Alloc.IsValid())
+	{
+		// Byte-for-byte the AddChunk failure path, counted in the same counters.
+		// A full pool drops geometry identically whichever mesher produced it,
+		// and splitting the accounting would make GetAllocFailureCount stop
+		// answering "did this run ever drop geometry".
+		++AllocFailureCount;
+		AllocFailureQuads += int64(NumQuads);
+		if (FMath::IsPowerOfTwo(AllocFailureCount) || AllocFailureCount == 1)
+		{
+			UE_LOG(LogTemp, Warning,
+			       TEXT("%s: no room for %u GPU-meshed quads (%u free, largest run %u) -- "
+			            "GEOMETRY DROPPED, failure %lld of this run (%lld quads total)"),
+			       *PoolName, NumQuads, Pool.GetFreeQuads(), Pool.GetLargestFreeRun(),
+			       (long long)AllocFailureCount, (long long)AllocFailureQuads);
+		}
+		return INDEX_NONE;
+	}
+
+	const float Scale = float(1 << Level);
+	uint32 ChunkId;
+	if (FreeChunkIds.Num() > 0)
+	{
+		ChunkId = FreeChunkIds.Pop(EAllowShrinking::No);
+		ChunkOrigins[int32(ChunkId)] = FVector4f(OriginUU.X, OriginUU.Y, OriginUU.Z, Scale);
+		ChunkParams[int32(ChunkId)] = Params;
+	}
+	else
+	{
+		ChunkId = uint32(ChunkOrigins.Num());
+		ChunkOrigins.Add(FVector4f(OriginUU.X, OriginUU.Y, OriginUU.Z, Scale));
+		ChunkParams.Add(Params);
+	}
+
+	// THE ONE THING THIS DOES NOT DO. AddChunk writes PooledQuads and
+	// QuadChunkIds here and then calls MarkQuadsDirty, which is what schedules
+	// the upload. Neither happens: the quads are already on the GPU, the ids are
+	// written by the same compute pass that copies them, and marking the range
+	// dirty would upload the shadow's ZEROS straight over the geometry that pass
+	// is about to write. See PooledQuads for why leaving the shadow zeroed is the
+	// safe direction rather than merely the cheap one.
+	const int32 Handle = Allocations.Add(Alloc);
+	AllocationChunkIds.Add(ChunkId);
+	check(AllocationChunkIds.Num() == Allocations.Num());
+	++NumLiveChunks;
+
+	const float EdgeUU = float(ChunkEdgeVoxels) * 10.0f * Scale;
+	LocalBounds += FBox(
+		FVector(OriginUU.X, OriginUU.Y, OriginUU.Z),
+		FVector(OriginUU.X + EdgeUU, OriginUU.Y + EdgeUU, OriginUU.Z + EdgeUU));
+
+	PendingGpuWrites.Add(FPendingGpuWrite{ Src, Alloc.Offset, NumQuads, ChunkId });
+	++GpuDirectWrites;
+
+	bChunkTableDirty = true;
+	bRunsDirty = true;
+	// Drains PendingGpuWrites into the SAME render command as the table update,
+	// with the copy passes recorded first -- see FPendingGpuWrite.
 	PushUpdatesToProxy();
 	UpdateBounds();
 	return Handle;
@@ -1706,12 +1858,102 @@ void UVoxelGpuPoolComponent::MarkQuadsDirty(uint32 First, uint32 Count)
 	}
 }
 
+// Records every pending write's copy pass into GraphBuilder. RENDER THREAD.
+//
+// Shared by the two places a flush can happen -- folded into the incremental
+// update's command, or standalone when PushUpdatesToProxy returns before
+// building one -- so the two cannot drift on the thing that matters: what the
+// pass is given and in what order.
+//
+// The render-thread re-check of the buffers is not belt-and-braces for the
+// game-thread IsGpuWritable() gate. It is the only check that CANNOT be stale,
+// and it is where a dropped write is detectable at all.
+static void VoxelGpuPoolAddWritePasses(FRDGBuilder& GraphBuilder,
+                                       const FVoxelGpuPoolBuffersRef& Buffers,
+                                       const TArray<UVoxelGpuPoolComponent::FPendingGpuWrite>& Writes,
+                                       const TCHAR* PoolName)
+{
+	if (!Buffers.IsValid())
+	{
+		// Cannot happen -- GetOrCreatePoolBuffers always returns a holder and the
+		// command captured it by shared reference -- but a null here would be a
+		// silent total loss of geometry, so it is stated rather than assumed.
+		UE_LOG(LogTemp, Error, TEXT("%s: direct GPU writes DROPPED — no buffer holder"), PoolName);
+		return;
+	}
+	if (!Buffers->QuadPooled.IsValid() || !Buffers->ChunkIdPooled.IsValid())
+	{
+		Buffers->DroppedWrites.Add(Writes.Num());
+		UE_LOG(LogTemp, Error,
+		       TEXT("%s: %d direct GPU write(s) DROPPED — the pool buffers are not there. Those chunks hold "
+		            "an allocated range and a live table entry with no geometry in it, i.e. terrain that is "
+		            "missing and reports as loaded."),
+		       PoolName, Writes.Num());
+		return;
+	}
+
+	FRDGBufferRef DstQuads = GraphBuilder.RegisterExternalBuffer(Buffers->QuadPooled, TEXT("VoxelGpuPool.Quads"));
+	FRDGBufferRef DstIds = GraphBuilder.RegisterExternalBuffer(Buffers->ChunkIdPooled, TEXT("VoxelGpuPool.ChunkIds"));
+
+	for (const UVoxelGpuPoolComponent::FPendingGpuWrite& Write : Writes)
+	{
+		if (!Write.Src.IsValid() || !Write.Src->Quads.IsValid() || Write.NumQuads == 0)
+		{
+			Buffers->DroppedWrites.Increment();
+			UE_LOG(LogTemp, Error,
+			       TEXT("%s: direct GPU write for chunk %u DROPPED — payload has no buffer. %u quads at pool "
+			            "offset %u are allocated and empty."),
+			       PoolName, Write.ChunkId, Write.NumQuads, Write.DstFirst);
+			continue;
+		}
+
+		FRDGBufferRef Src = GraphBuilder.RegisterExternalBuffer(Write.Src->Quads, TEXT("VoxelGpuPool.SrcQuads"));
+		VoxelGpuWorldGen::AddQuadPoolWritePass(GraphBuilder, DstQuads, DstIds, Src,
+		                                       Write.Src->SrcFirst, Write.DstFirst,
+		                                       Write.NumQuads, Write.ChunkId);
+	}
+}
+
+TArray<UVoxelGpuPoolComponent::FPendingGpuWrite> UVoxelGpuPoolComponent::TakePendingGpuWrites()
+{
+	TArray<FPendingGpuWrite> Writes = MoveTemp(PendingGpuWrites);
+	PendingGpuWrites.Reset();
+	return Writes;
+}
+
+void UVoxelGpuPoolComponent::FlushGpuWritesStandalone(TArray<FPendingGpuWrite>&& Writes)
+{
+	if (Writes.Num() == 0)
+	{
+		return;
+	}
+	// For the PushUpdatesToProxy branches that return before building their own
+	// command. Those branches call MarkRenderStateDirty, whose render-state
+	// rebuild is enqueued later (end of frame), so this command still lands
+	// first -- which is the order the drawable-after-written rule needs.
+	ENQUEUE_RENDER_COMMAND(VoxelGpuPoolDirectWrite)(
+		[Buffers = GetOrCreatePoolBuffers(), Writes = MoveTemp(Writes),
+		 Name = PoolName](FRHICommandListImmediate& RHICmdList)
+	{
+		FRDGBuilder GraphBuilder(RHICmdList);
+		VoxelGpuPoolAddWritePasses(GraphBuilder, Buffers, Writes, *Name);
+		GraphBuilder.Execute();
+	});
+}
+
 void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 {
+	// Taken FIRST, on every path out of this function. A pending write that
+	// survived a call to PushUpdatesToProxy would be flushed against a later
+	// frame's state, after the range it targets had already been published as
+	// drawable.
+	TArray<FPendingGpuWrite> GpuWrites = TakePendingGpuWrites();
+
 	// No live proxy yet: the CPU arrays are the source of truth and the proxy
 	// will pick them up whole when it is created.
 	if (LiveProxy == nullptr)
 	{
+		FlushGpuWritesStandalone(MoveTemp(GpuWrites));
 		MarkRenderStateDirty();
 		DirtyQuadRanges.Reset();
 		bChunkTableDirty = false;
@@ -1722,6 +1964,7 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 	// The chunk table outgrew its headroom -- rebuild rather than overrun it.
 	if (ChunkOrigins.Num() > LiveProxy->GetMaxChunks())
 	{
+		FlushGpuWritesStandalone(MoveTemp(GpuWrites));
 		MarkRenderStateDirty();
 		DirtyQuadRanges.Reset();
 		bChunkTableDirty = false;
@@ -1799,8 +2042,24 @@ void UVoxelGpuPoolComponent::PushUpdatesToProxy()
 	ENQUEUE_RENDER_COMMAND(VoxelGpuPoolIncrementalUpdate)(
 		[Proxy, QuadsSlice = MoveTemp(QuadsSlice), IdsSlice = MoveTemp(IdsSlice),
 		 OriginsCopy = MoveTemp(OriginsCopy), ParamsCopy = MoveTemp(ParamsCopy), RunsCopy = MoveTemp(RunsCopy),
-		 UploadRuns = MoveTemp(UploadRuns), NewNumQuads, bTableDirty](FRHICommandListImmediate& RHICmdList)
+		 UploadRuns = MoveTemp(UploadRuns), NewNumQuads, bTableDirty,
+		 GpuWrites = MoveTemp(GpuWrites), Buffers = GetOrCreatePoolBuffers(),
+		 Name = PoolName](FRHICommandListImmediate& RHICmdList)
 	{
+		// FIRST, BEFORE THE TWO UPDATES BELOW, AND THAT IS THE ORDERING RULE
+		// D1 RESTS ON (Wave D / D1). Those updates are what publish a range as
+		// drawable -- UpdateChunkTable_RenderThread hands the cull its runs and
+		// UpdateQuadRange_RenderThread advances NumQuads past the high-water
+		// mark. Recording the copy passes here means the GPU cannot reach a draw
+		// covering a range it has not yet written. Same command, so nothing can
+		// get between them.
+		if (GpuWrites.Num() > 0)
+		{
+			FRDGBuilder GraphBuilder(RHICmdList);
+			VoxelGpuPoolAddWritePasses(GraphBuilder, Buffers, GpuWrites, *Name);
+			GraphBuilder.Execute();
+		}
+
 		if (bTableDirty)
 		{
 			Proxy->UpdateChunkTable_RenderThread(RHICmdList, OriginsCopy, ParamsCopy, RunsCopy);

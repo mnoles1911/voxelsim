@@ -61,6 +61,36 @@ static FAutoConsoleVariableRef CVarVoxelGpuMeshBatchCap(
 	TEXT("frame built graphs of 100+ passes on the render thread."),
 	ECVF_Default);
 
+// Wave D / D1. Whether a job's quads stay on the GPU or come back through
+// system memory.
+//
+// AT 1 (default) phase 2 is a GPU->GPU compaction and the result carries an
+// FVoxelGpuQuadPayload; the pool component copies it into the chunk's allocated
+// range with a compute pass, and no quad byte is ever touched by a CPU. AT 0
+// the D3 two-phase readback runs exactly as it did before D1: fetch the live
+// quads, memcpy them out on the render thread, unpack, repack, upload.
+//
+// The same shape as voxel.GPU.MeshChunkLocal, and for the same reason: this is
+// an A/B runnable in one session on one binary, and voxel.GPU.VerifyPoolWrite
+// compares BOTH against MeshChunkBricks. A path that has no control is a path
+// whose PASS says nothing about the other one.
+//
+// Read once per Submit and LATCHED on the job. A flip between dispatch and
+// delivery would otherwise hand the streaming path a result of a shape it did
+// not ask for -- an empty Quads array where it expected geometry, which reads
+// as an all-air chunk rather than as an error.
+static int32 GVoxelGpuMeshDirectToPool = 1;
+static FAutoConsoleVariableRef CVarVoxelGpuMeshDirectToPool(
+	TEXT("voxel.GPU.MeshDirectToPool"),
+	GVoxelGpuMeshDirectToPool,
+	TEXT("1 = a mesh job's quads stay in GPU memory and are copied straight into the geometry pool ")
+	TEXT("(no quad readback, no CPU staging, no re-upload; only the 4-byte total crosses PCIe). ")
+	TEXT("0 = the D3 two-phase readback, which is the control. Default 1. ")
+	TEXT("Requires voxel.GPU.MeshChunkLocal 1 -- brick-local quads need a CPU rebase this path does ")
+	TEXT("not have, and the requirement is enforced in Submit rather than assumed. ")
+	TEXT("Read once per Submit, so it takes effect on the next job."),
+	ECVF_Default);
+
 static int32 GVoxelGpuMeshHarvestCap = 8;
 static FAutoConsoleVariableRef CVarVoxelGpuMeshHarvestCap(
 	TEXT("voxel.GPU.MeshHarvestCap"),
@@ -71,6 +101,31 @@ static FAutoConsoleVariableRef CVarVoxelGpuMeshHarvestCap(
 	TEXT("IsReady() checks stay unbounded — they are cheap; it is the copies that ")
 	TEXT("cost, and with 150-256 jobs in flight one poll could do all of them."),
 	ECVF_Default);
+
+// Defined here rather than in a file of its own because this is the only place
+// that CREATES one, and because the release it performs is the mirror of
+// ReleaseReadbacksOnRenderThread below -- the two should be read together.
+FVoxelGpuQuadPayload::FVoxelGpuQuadPayload() = default;
+
+FVoxelGpuQuadPayload::~FVoxelGpuQuadPayload()
+{
+	if (!Quads.IsValid())
+	{
+		return;
+	}
+	// The last reference to an RHI resource, dropped in RENDER-THREAD ORDER
+	// behind every command that could still be reading it. A payload dies on
+	// whichever thread happened to hold the last handle -- the game thread for a
+	// stale result or a full pool, the render thread for one that was consumed --
+	// and the game-thread case is exactly the one that fails as a crash on exit
+	// rather than as anything a compiler or a test would catch. Same reasoning,
+	// same shape, as UVoxelGpuPoolComponent::BeginDestroy.
+	ENQUEUE_RENDER_COMMAND(VoxelGpuQuadPayloadRelease)(
+		[Buffer = MoveTemp(Quads)](FRHICommandListImmediate&) mutable
+	{
+		Buffer.SafeRelease();
+	});
+}
 
 const TCHAR* LexToString(EVoxelGpuMeshJobStatus Status)
 {
@@ -129,13 +184,19 @@ namespace
 	// transitional either way: once the pool's buffers are UAV-writable and
 	// RDG-registered (D1), phase 2 becomes a GPU->GPU copy into the allocated
 	// range and reads back NOTHING.
+	//
+	// WAVE D / D1 SPLIT PHASE 2 IN TWO, AND ONLY ONE HALF READS ANYTHING BACK.
+	// Under voxel.GPU.MeshDirectToPool the quads never come to the CPU: phase 2
+	// is a compaction pass into a right-sized GPU buffer, nothing waits for it,
+	// and the job goes STRAIGHT from TotalDone to ReadbackDone in the same tick.
+	// QuadsDispatched is therefore reached only on the readback control path.
 	enum class EJobState : int32
 	{
 		Queued = 0,      // game thread owns it
 		Dispatched,      // graph executed; the 4-byte total readback is pending
 		TotalDone,       // total has landed; the game thread must start phase 2
 		QuadsDispatched, // phase 2 enqueued; the sized quad readback is pending
-		ReadbackDone,    // render thread has copied everything out
+		ReadbackDone,    // everything this job owed has been copied out (or left on the GPU)
 		Failed,          // render thread gave up; Error says why
 	};
 }
@@ -178,6 +239,17 @@ struct FVoxelGpuMeshJobManager::FJob
 	// the reference that makes that true, and dropping it is what frees the
 	// memory.
 	TRefCountPtr<FRDGPooledBuffer> QuadBuffer;
+
+	// Wave D / D1. Set at Submit and never read from the render thread, so it
+	// needs no synchronisation: it selects which phase 2 the GAME thread starts.
+	// Latched rather than re-read at delivery -- see the cvar's comment.
+	bool bDirectToPool = false;
+
+	// Wave D / D1. Non-null once the direct path has taken this job's quads.
+	// Constructed on the game thread holding QuadBuffer (so the payload is
+	// correct even if the compaction never runs), then owned by the render
+	// thread. Delivered in place of RawQuads.
+	FVoxelGpuQuadPayloadRef Payload;
 
 	// Staged by the render thread, consumed by the game thread after State goes
 	// to ReadbackDone.
@@ -278,6 +350,13 @@ namespace
 				// Deliberately on the render thread with everything else: this
 				// is an RHI resource reference and it is the last thing holding
 				// it.
+				//
+				// NOT ALWAYS THE LAST, since D1: on the direct path the delivered
+				// payload holds its own reference to this same buffer (until the
+				// compaction swaps it for a small one), so this drops the
+				// MANAGER's claim and the geometry survives. That is the intended
+				// behaviour and it is why the payload is reference-counted rather
+				// than a raw handle.
 				Job->QuadBuffer.SafeRelease();
 			}
 		});
@@ -375,7 +454,8 @@ FVoxelGpuMeshJobManager::~FVoxelGpuMeshJobManager()
 	CancelAll();
 }
 
-uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 UserTag)
+uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 UserTag,
+                                       bool bRequestGpuResidentQuads)
 {
 	check(IsInGameThread());
 
@@ -387,6 +467,21 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 	// dispatch and readback would otherwise rebase quads that were already
 	// rebased on the GPU, which is silent and looks like a mesher bug.
 	Job->Region.bChunkLocalQuads = GVoxelGpuMeshChunkLocal != 0;
+
+	// Wave D / D1. THE bChunkLocalQuads TERM IS THE POINT OF ANDING THIS HERE
+	// RATHER THAN TRUSTING THE CALLER. The direct path hands the pool the bytes
+	// the emit pass wrote, and only the chunk-local permutation writes bytes the
+	// pool can use -- brick-local quads need RebaseQuadsToChunkLocal, a CPU pass
+	// over a stream this path never brings to the CPU. Without the term,
+	// voxel.GPU.MeshChunkLocal 0 plus the default MeshDirectToPool 1 would pile
+	// every brick's geometry into the same 8-voxel cube at the chunk origin: not
+	// a crash, not an error, just terrain that is wrong in a way that looks like
+	// a mesher bug. Same refusal ValidateRegionRequest already makes about
+	// QuadWriteBase, for the same reason.
+	Job->bDirectToPool = bRequestGpuResidentQuads
+		&& GVoxelGpuMeshDirectToPool != 0
+		&& Job->Region.bChunkLocalQuads;
+
 	Job->SubmitSeconds = FPlatformTime::Seconds();
 
 	Queued.Add(Job);
@@ -408,14 +503,34 @@ void FVoxelGpuMeshJobManager::Deliver(const FJobPtr& Job, EVoxelGpuMeshJobStatus
 
 	if (Status == EVoxelGpuMeshJobStatus::Success)
 	{
-		// Under the D2 permutation the shader has already baked each brick's
-		// chunk-local origin into the quad positions, so the stream is
-		// pool-ready and the CPU rebase would double-apply the offset. The
-		// brick-local branch below is kept, not vestigial: it is the control
-		// voxel.GPU.MeshChunkLocal 0 selects, and the two must agree.
-		Result.Quads = Job->Region.bChunkLocalQuads
-			? MoveTemp(Job->RawQuads)
-			: RebaseQuadsToChunkLocal(*Job);
+		if (Job->Payload.IsValid())
+		{
+			// Wave D / D1. The quads are in GPU memory and Result.Quads stays
+			// EMPTY. NumQuads is then the only description of the geometry the
+			// CPU gets, and it is the same number phase 1 read back and sized
+			// the compaction from.
+			Result.NumQuads = Job->Payload->NumQuads;
+			Result.GpuQuads = MoveTemp(Job->Payload);
+		}
+		else
+		{
+			// Under the D2 permutation the shader has already baked each brick's
+			// chunk-local origin into the quad positions, so the stream is
+			// pool-ready and the CPU rebase would double-apply the offset. The
+			// brick-local branch below is kept, not vestigial: it is the control
+			// voxel.GPU.MeshChunkLocal 0 selects, and the two must agree.
+			Result.Quads = Job->Region.bChunkLocalQuads
+				? MoveTemp(Job->RawQuads)
+				: RebaseQuadsToChunkLocal(*Job);
+
+			// Derived from the ARRAY, not from Job->NumQuads, so the readback
+			// path's invariant NumQuads == Quads.Num() holds by construction
+			// rather than by agreement. RebaseQuadsToChunkLocal bails early on a
+			// corrupt scan, and a count that disagreed with the array it
+			// describes is exactly the kind of thing that surfaces later as a
+			// pool range sized for quads that are not there.
+			Result.NumQuads = uint32(Result.Quads.Num());
+		}
 
 		// Wave D / D6. Only on Success, and only from a job that actually
 		// harvested one — phase 1 is all-or-none, so a successful job that
@@ -645,6 +760,73 @@ void FVoxelGpuMeshJobManager::DispatchQuadFetch(TArray<FJobPtr>&& Batch)
 	});
 }
 
+// PHASE 2, DIRECT PATH (Wave D / D1). The total has landed, so move exactly
+// that many quads out of the emit pass's upper-bound buffer into one sized to
+// them -- and read back NOTHING.
+//
+// THE JOB IS ALREADY DELIVERABLE WHEN THIS IS ENQUEUED. That is the whole
+// latency argument for D1 and it is worth stating plainly: nothing on the CPU
+// reads this pass's output, so there is no readback to poll, no second poll
+// quantum, and no reason for the game thread to wait. The caller sets
+// ReadbackDone in the same tick it calls this.
+//
+// CORRECTNESS DOES NOT DEPEND ON THIS PASS RUNNING. The payload was built on
+// the game thread already pointing at the phase-1 quad buffer at QuadWriteBase,
+// so if this command were dropped the pool write would still copy the right
+// quads -- just out of a buffer 60-100x larger than it needs to be. What this
+// buys is MEMORY: a delivered chunk waiting on the streaming apply budget pins
+// ~10 KB instead of the 786 KB static bound, and that queue is not bounded by
+// the fork's in-flight cap (a delivered job has already left it) while
+// deliveries have been measured outrunning applies under load.
+// TAKES THE PAYLOADS, NOT THE JOBS, AND THAT IS NOT TIDINESS. Deliver() moves
+// Job->Payload out on the GAME thread in this same Tick, so a render command
+// that reached for it through the job would find it null -- or, worse, find it
+// mid-move. The payload is self-contained and reference-counted, so capturing it
+// directly makes this command independent of the job's lifetime entirely: it
+// cannot see a half-torn-down job and does not need the Abandoned check every
+// other render command here has, because there is no job state left to protect.
+void FVoxelGpuMeshJobManager::DispatchQuadCompact(TArray<FVoxelGpuQuadPayloadRef>&& Batch)
+{
+	ENQUEUE_RENDER_COMMAND(VoxelGpuMeshCompactQuads)(
+		[Payloads = MoveTemp(Batch)](FRHICommandListImmediate& RHICmdList)
+	{
+		FRDGBuilder GraphBuilder(RHICmdList);
+
+		for (const FVoxelGpuQuadPayloadRef& Payload : Payloads)
+		{
+			if (!Payload.IsValid() || !Payload->Quads.IsValid() || Payload->NumQuads == 0)
+			{
+				continue;
+			}
+
+			FRDGBufferRef Src = GraphBuilder.RegisterExternalBuffer(
+				Payload->Quads, TEXT("Voxel.Async.QuadsPersistent"));
+
+			FRDGBufferRef Compacted = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32) * 2, Payload->NumQuads),
+				TEXT("Voxel.Async.QuadsCompact"));
+
+			VoxelGpuWorldGen::AddQuadCompactPass(GraphBuilder, Compacted, Src,
+			                                     Payload->SrcFirst, Payload->NumQuads);
+
+			// Swap the payload onto the small buffer. Both fields are
+			// render-thread-owned (see FVoxelGpuQuadPayload) and the only later
+			// reader is the pool component's write pass, in a render command the
+			// game thread enqueues strictly after this one.
+			//
+			// The old reference is dropped by the assignment, AFTER
+			// ConvertToExternalBuffer and after the pass reading it is recorded.
+			// RDG holds its own reference to a registered external buffer for the
+			// duration of the graph, so the source cannot go away underneath the
+			// pass this graph is about to execute.
+			Payload->Quads = GraphBuilder.ConvertToExternalBuffer(Compacted);
+			Payload->SrcFirst = 0;
+		}
+
+		GraphBuilder.Execute();
+	});
+}
+
 void FVoxelGpuMeshJobManager::PollInFlight()
 {
 	const double Now = FPlatformTime::Seconds();
@@ -841,8 +1023,15 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 	// Game thread, because it is the thread that owns the decision and because
 	// it is where the "is this count even sane" check belongs. Batched into one
 	// render command for the same reason phase 1 is.
+	//
+	// TWO PHASE TWOS (Wave D / D1), chosen by the flag latched at Submit. The
+	// range check and the zero-quad short-circuit below are SHARED, deliberately:
+	// they are statements about the total the GPU reported, not about what is
+	// done with it, and duplicating them into each branch is how the two paths
+	// would drift.
 	{
 		TArray<FJobPtr> ToFetch;
+		TArray<FVoxelGpuQuadPayloadRef> ToCompact;
 		for (const FJobPtr& Job : InFlight)
 		{
 			if (Job->GetState() != EJobState::TotalDone)
@@ -873,8 +1062,39 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 				// phase 2 entirely and delivers a frame earlier — which is not
 				// an edge case at level 0, where most of the vertical stack is
 				// one or the other.
+				//
+				// The direct path takes this branch UNCHANGED and publishes no
+				// payload: a zero-quad chunk allocates no pool range, exactly as
+				// it creates no component on the CPU path. ApplyMeshResult's
+				// Quads.Num() == 0 branch is what handles it either way.
 				Job->RawQuads.Reset();
 				Job->SetState(EJobState::ReadbackDone);
+				continue;
+			}
+
+			if (Job->bDirectToPool)
+			{
+				// Wave D / D1. Build the payload HERE, on the game thread,
+				// already pointing at the phase-1 buffer -- so it is valid
+				// whether or not the compaction command below ever runs, and the
+				// job can be delivered without waiting for anything.
+				//
+				// QuadWriteBase is 0 on every path today; it is carried rather
+				// than assumed because a copy that starts at the wrong offset
+				// produces geometry that is plausible and somebody else's.
+				Job->Payload = MakeShared<FVoxelGpuQuadPayload, ESPMode::ThreadSafe>();
+				Job->Payload->Quads = Job->QuadBuffer;
+				Job->Payload->SrcFirst = Job->Sizes.QuadWriteBase;
+				Job->Payload->NumQuads = Job->NumQuads;
+
+				// Deliverable NOW. There is no readback to poll, so the job goes
+				// straight to ReadbackDone and the harvest loop below picks it up
+				// in this same Tick -- a whole round trip and a whole poll
+				// quantum earlier than the readback path.
+				Job->SetState(EJobState::ReadbackDone);
+				// A COPY of the handle, not the job. Deliver() moves the job's
+				// own reference away later in this same Tick.
+				ToCompact.Add(Job->Payload);
 				continue;
 			}
 
@@ -884,6 +1104,14 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 		if (ToFetch.Num() > 0)
 		{
 			DispatchQuadFetch(MoveTemp(ToFetch));
+		}
+		// AFTER the fetch dispatch, so that on a mixed tick the two commands go
+		// out in the order their jobs were promoted. Nothing depends on it
+		// today -- the two sets are disjoint by construction -- but the ordering
+		// is free and the alternative is an ordering nobody chose.
+		if (ToCompact.Num() > 0)
+		{
+			DispatchQuadCompact(MoveTemp(ToCompact));
 		}
 	}
 

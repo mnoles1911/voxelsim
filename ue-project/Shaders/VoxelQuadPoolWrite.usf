@@ -1,0 +1,113 @@
+// The two GPU-side quad copies that replace the readback (ADR-0006, Wave D / D1).
+//
+// WHY THIS FILE EXISTS AT ALL. D3 got the per-chunk readback down from ~810 KB
+// to 4 bytes, but the quads themselves still came back: phase 2 copied the live
+// stream to system memory, the game thread unpacked and repacked it, and
+// PushUpdatesToProxy uploaded the identical bytes to the pool buffer. Roughly
+// 10 KB up plus 16 KB down per chunk, plus a memcpy on the game thread and
+// another on the render thread, to move bytes the GPU already had into a buffer
+// the GPU already owned. The 2026-07-27 line-flight legs put the cost of that
+// bookkeeping at 10.1% of flight frames hitching against 0.028% with the fork
+// off, render-thread-BUSY dominated with the RHI flat in both arms.
+//
+// These two kernels do the same two moves without leaving the GPU.
+//
+//   QuadCompactMain   phase 2. Copies the live prefix out of the emit pass's
+//                     UPPER-BOUND buffer (MaskCount 3,072 x 32 quads = 786 KB)
+//                     into one sized to the quads that actually exist (~10 KB).
+//                     Nothing waits for it -- it exists so a delivered-but-not-
+//                     yet-applied chunk pins its real size instead of the bound.
+//
+//   QuadPoolWriteMain the apply. Copies a chunk's quads into its allocated pool
+//                     range AND fills the parallel chunk-id range in the same
+//                     pass. The ids are what make one draw span the pool
+//                     (UVoxelGpuPoolComponent), and writing them here rather
+//                     than through a lock is what lets the CPU stop touching
+//                     the geometry entirely.
+//
+// WHY BOTH ARE COMPUTE PASSES AND NOT AddCopyBufferPass. Two reasons, and the
+// second is the one that would have cost a day:
+//
+//   1. The pool write has to fill OutChunkIds as well. A constant store in a
+//      pass that is already running is free; a second mechanism for it is not,
+//      and a CPU-side id upload would put the render-thread lock back.
+//   2. FD3D12CommandContext::RHICopyBufferRegion asserts
+//      `pSourceResource != pDestResource` (D3D12Buffer.cpp:970). Two small
+//      RDG-pooled buffers can legitimately be suballocated from ONE D3D12
+//      resource, so the compaction copy could trip that assert in a checked
+//      build depending on nothing more than pool state. A compute pass has no
+//      such hazard.
+//
+// WHY IT IS NOT IN worldgen.ush. Same two reasons as VoxelQuadScan.usf, which
+// is the precedent this file follows: the determinism digest compiles
+// worldgen.ush two ways and pins a hash over the result, and neither of these
+// kernels has any business inside that contract -- so living here means they
+// cannot move the digest, cannot require a SPIR-V respin, and cannot fail the
+// shader lint for reasons unrelated to world generation. worldgen.ush is also
+// the file ground rule 10 is about: it is shared with the main checkout that
+// other waves run editors out of.
+//
+// QUAD FORMAT. A quad is a uint2 and is COPIED, never interpreted. The layout
+// is PackVoxelChunkQuad's (VoxelMeshTypes.h) and is a contract with
+// DecodeVoxelQuadVertex in VoxelQuadDecode.ush; voxel.GPU.VerifyAsyncMesh has
+// measured the emit pass byte-identical to MeshChunkBricks +
+// PackVoxelChunkQuad. Nothing here needs to know any of that, and deliberately
+// does not: a copy that understood the format could get it wrong.
+
+#include "/Engine/Public/Platform.ush"
+
+StructuredBuffer<uint2>   InQuads;
+RWStructuredBuffer<uint2> OutQuads;
+RWStructuredBuffer<uint>  OutChunkIds;
+
+// First source element belonging to this chunk. The emit pass writes at
+// QuadWriteBase, which is 0 on every path today, and QuadCompactMain rebases to
+// 0 -- so this is 0 in practice both times. It is threaded through anyway
+// rather than assumed, because the failure mode of assuming it is a copy that
+// starts at the wrong offset and produces geometry that is plausible, self-
+// consistent, and somebody else's.
+uint SrcFirst;
+// First slot of the chunk's pool allocation. Unused by QuadCompactMain, which
+// always writes a fresh buffer from 0.
+uint DstFirst;
+// How many quads are live. Both kernels dispatch exactly this many threads;
+// the bound is restated in the shader because a dispatch size is not a
+// guarantee (the group size rounds up).
+uint NumQuads;
+// The chunk-table entry these quads belong to. Pool-write only.
+uint ChunkId;
+
+// One thread per live quad. 64 to match the wave-agnostic group size every
+// other kernel in this project uses -- nothing here reads a lane index or a
+// wave width, so the choice is arbitrary and must stay that way.
+[numthreads(64, 1, 1)]
+void QuadCompactMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint i = tid.x;
+	// The group size rounds up, so the tail threads of the last group are real
+	// and must not write. This is also the bound UNGUARDED_WRITE wants to see.
+	if (i >= NumQuads)
+	{
+		return;
+	}
+	OutQuads[i] = InQuads[SrcFirst + i];
+}
+
+[numthreads(64, 1, 1)]
+void QuadPoolWriteMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint i = tid.x;
+	if (i >= NumQuads)
+	{
+		return;
+	}
+	// The two writes are the whole point of one pass rather than two: a quad
+	// and the id naming its owning chunk are written together, so there is no
+	// window in which the pool holds geometry that belongs to nobody. The
+	// allocation is exactly NumQuads slots (UVoxelGpuPoolComponent::AddChunkFromGpu
+	// calls Pool.Alloc with this count), so there is no tail to hide here --
+	// unlike the CPU UpdateChunk path, which reuses an oversized slot and points
+	// the leftovers at the hidden chunk.
+	OutQuads   [DstFirst + i] = InQuads[SrcFirst + i];
+	OutChunkIds[DstFirst + i] = ChunkId;
+}

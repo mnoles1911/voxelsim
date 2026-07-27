@@ -441,6 +441,37 @@ void UVoxelGISubsystem::NotifyPooledChunkMeshUpdated(const FVector& ChunkOriginU
 	bHasState = true;
 }
 
+bool UVoxelGISubsystem::WantsChunkQuads(const FVector& ChunkOriginUU, int32 ChunkLevel) const
+{
+	// Same first two tests as NotifyPooledChunkMeshUpdated, in the same order.
+	if (!VoxelGI::IsEnabled())
+	{
+		return false;
+	}
+	if (ChunkLevel != 0)
+	{
+		return false;
+	}
+
+	// The radius test the voxelize drain applies (VoxRejectedRadius), widened.
+	//
+	// FieldCentreUU is last tick's view origin, which is the right thing to
+	// compare against and is why the margin is here: at 20 m/s the camera moves
+	// ~4.5 m across the fork's measured ~225 ms submit->deliver, against 17.5 m
+	// of slack at the default 7000 UU radius.
+	//
+	// WHAT THIS ACTUALLY COVERS TODAY, stated because it is easy to assume
+	// otherwise: voxel.GI.RadiusUU defaults to 7000 UU and is documented as
+	// deliberately larger than the R0 ring at 6400 UU -- so with GI on and the
+	// SHIPPED ring sizes, every level-0 chunk is inside it and level 0 stays on
+	// the readback path entirely. The direct path then covers levels 1-5, which
+	// is ~80% of resident chunks. At the 128 m R0 that Wave D and Wave F measure
+	// in, most of level 0 falls outside and goes direct too. Both are correct;
+	// the gate just tracks the configuration instead of assuming one.
+	const double RadiusUU = double(CVarGIRadiusUU.GetValueOnGameThread()) * 1.25;
+	return FVector::Dist(ChunkOriginUU, FieldCentreUU) <= RadiusUU;
+}
+
 void UVoxelGISubsystem::PushDirty(const FIntVector& Key)
 {
 	bool bAlready = false;

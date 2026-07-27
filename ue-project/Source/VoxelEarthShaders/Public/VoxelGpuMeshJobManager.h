@@ -39,16 +39,38 @@
 // voxel.GPU.VerifyAsyncMesh byte-compares both against MeshChunkBricks, so the
 // two paths agreeing is what makes the permutation trustworthy.
 //
-// The readbacks themselves are still here. Removing them needs the pool's
-// buffers to be UAV-writable and RDG-registered (D1) and an allocation scheme
-// that does not need the quad stream on the CPU at all (D3); until then this
-// stages quads through system memory, which is correct but is NOT the
-// throughput story Wave D exists for.
+// WAVE D / D1 UPDATE. THE QUAD READBACK IS GONE ON THE DEFAULT PATH.
+//
+// Under voxel.GPU.MeshDirectToPool (default 1) a job never stages its quads
+// through system memory at all. Phase 1 still reads the 4-byte total -- that is
+// the only thing the CPU needs in order to allocate a pool range, and it is the
+// completion event the exactly-one-outcome contract hangs on. Phase 2 stops
+// being a readback and becomes a GPU->GPU COMPACTION into a buffer sized to the
+// quads that actually exist; the result then carries an FVoxelGpuQuadPayload
+// (a handle to GPU memory) instead of a TArray<uint64>, and
+// UVoxelGpuPoolComponent::AddChunkFromGpu copies it into the chunk's allocated
+// pool range with a compute pass. Per chunk that removes ~10 KB of readback,
+// ~16 KB of re-upload, an unpack, a repack, and two Lock/Memcpy/Unlock pairs on
+// the render thread -- to end with the same bytes in the same buffer.
+//
+// It also removes a WHOLE ROUND TRIP from delivery latency: there is no second
+// readback to wait for and no second poll quantum, because nothing on the CPU
+// reads the compaction's output.
+//
+// Setting voxel.GPU.MeshDirectToPool 0 restores the D3 two-phase readback
+// exactly, on the same binary, and it is a genuine control rather than a
+// fallback -- voxel.GPU.VerifyPoolWrite compares BOTH against MeshChunkBricks.
+//
+// The direct path REQUIRES bChunkLocalQuads, and that requirement is ANDed in
+// here rather than trusted to the caller: brick-local quads need
+// RebaseQuadsToChunkLocal, which is a CPU pass over a stream the direct path
+// never has. See Submit.
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Delegates/Delegate.h"
+#include "VoxelGpuQuadPayload.h"
 #include "VoxelGpuWorldGen.h"
 
 // Geometry of the region that meshes exactly one 32^3 render chunk.
@@ -116,7 +138,32 @@ struct FVoxelGpuMeshJobResult
 	// UVoxelGpuPoolComponent::AddChunk consumes. Produced chunk-local by the
 	// GPU under voxel.GPU.MeshChunkLocal 1, or rebased on the CPU in Tick under
 	// 0; the contract on this field is the same either way.
+	//
+	// EMPTY WHEN GpuQuads IS SET (Wave D / D1). The quads then never came to the
+	// CPU at all, and NumQuads below is the only thing that describes them.
 	TArray<uint64> Quads;
+
+	// How many quads this chunk meshed to. VALID ON BOTH PATHS -- equal to
+	// Quads.Num() on the readback path, and the only quad count that exists on
+	// the direct path.
+	//
+	// Every consumer that only wanted a COUNT should read this rather than
+	// Quads.Num(): the streaming path's zero-quad census, the buried/solid/sky
+	// skip soundness checks, ResidentQuads and LastQuadCount all ask "how much
+	// geometry", not "give me the geometry". Reading Quads.Num() instead makes
+	// every GPU-meshed chunk look like an empty one -- plausible,
+	// self-consistent, and wrong in the direction that hides missing terrain.
+	uint32 NumQuads = 0;
+
+	// Wave D / D1. Non-null when the quads were left in GPU memory: a handle to
+	// the buffer holding exactly NumQuads packed quads, to be handed to
+	// UVoxelGpuPoolComponent::AddChunkFromGpu. Null on the readback path and on
+	// every non-Success outcome.
+	//
+	// The game thread MOVES THIS AROUND AND NOTHING ELSE -- see the threading
+	// note on FVoxelGpuQuadPayload. Dropping it (a stale result, a full pool) is
+	// safe and releases the GPU memory on the render thread.
+	FVoxelGpuQuadPayloadRef GpuQuads;
 
 	// --- Wave D / D6: the footprint band ------------------------------------
 	//
@@ -206,7 +253,17 @@ public:
 	// id WILL be reported to OnComplete exactly once -- a request that cannot
 	// possibly run is reported as Rejected on the next Tick rather than refused
 	// here. Game thread only.
-	uint64 Submit(FVoxelGpuRegionRequest&& Region, uint64 UserTag = 0);
+	//
+	// bRequestGpuResidentQuads (Wave D / D1) asks for the quads to be left in GPU
+	// memory and delivered as an FVoxelGpuQuadPayload instead of a TArray. It is
+	// a REQUEST, not an instruction: the manager ANDs it with
+	// voxel.GPU.MeshDirectToPool and with Region.bChunkLocalQuads, and a caller
+	// must therefore check FVoxelGpuMeshJobResult::GpuQuads rather than assume
+	// which form it will get back. Callers that cannot consume GPU-resident
+	// quads -- anything needing the quad CONTENTS on the CPU, which today is the
+	// voxel GI ingest -- pass false and get the readback path.
+	uint64 Submit(FVoxelGpuRegionRequest&& Region, uint64 UserTag = 0,
+	              bool bRequestGpuResidentQuads = false);
 
 	// Promotes queued jobs, polls readbacks, delivers finished ones. Game thread
 	// only. Cheap and safe to call every frame with nothing outstanding.
@@ -228,9 +285,17 @@ public:
 
 private:
 	void DispatchBatch(TArray<TSharedPtr<FJob, ESPMode::ThreadSafe>>&& Batch);
-	// D3 phase 2: fetch exactly the quads the 4-byte total said exist. Becomes
-	// a GPU->GPU copy into a pool range, with no readback, once D1 lands.
+	// D3 phase 2: fetch exactly the quads the 4-byte total said exist. This is
+	// now the voxel.GPU.MeshDirectToPool 0 control path -- kept honest rather
+	// than vestigial, because it is what the direct path is compared against.
 	void DispatchQuadFetch(TArray<TSharedPtr<FJob, ESPMode::ThreadSafe>>&& Batch);
+	// D1 phase 2: right-size the payload on the GPU and read back NOTHING. The
+	// job is deliverable the moment this is ENQUEUED, not when it lands.
+	//
+	// Takes PAYLOADS rather than jobs on purpose -- Deliver() moves a job's
+	// payload away on the game thread in the same Tick this is called from, so a
+	// render command reaching through the job would race it. See the definition.
+	void DispatchQuadCompact(TArray<FVoxelGpuQuadPayloadRef>&& Batch);
 	void PollInFlight();
 	void Deliver(const TSharedPtr<FJob, ESPMode::ThreadSafe>& Job,
 	             EVoxelGpuMeshJobStatus Status, const FString& Error);
