@@ -2608,7 +2608,8 @@ struct FVoxelWorldImpl
 	// runner. Returns false if the fork could not take the chunk, in which case
 	// the caller MUST fall through to the CPU path -- the counters have already
 	// been incremented and something owes a result.
-	bool SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId);
+	bool SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
+	                      uint8 RingSkirtMask);
 	// Delivery callback. Game thread, from inside Tick().
 	void OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult);
 
@@ -6099,15 +6100,15 @@ FVoxelGpuMeshJobManager* FVoxelWorldImpl::EnsureGpuMeshJobs()
 	// of the code.
 	UE_LOG(LogVoxelStream, Log,
 	       TEXT("VoxelGpuMesh: GPU mesh fork ENABLED. Takes levels 0..%d, unedited chunks only "
-	            "(NeedsOverlayAwarePath routes edits to the game thread), no ring skirt "
-	            "(ComputeRingSkirtMask must be 0 -- boundary chunks stay on the CPU), and not "
-	            "already predicted empty. maxInFlight=%d (GPU), separate from the CPU worker "
-	            "budget."),
+	            "(NeedsOverlayAwarePath routes edits to the game thread), ring-boundary chunks "
+	            "INCLUDED (the skirt is mirrored in regionCellMat), and not already predicted "
+	            "empty. maxInFlight=%d (GPU), separate from the CPU worker budget."),
 	       VoxelStreamAdmission::GpuMeshMaxLevel(), GpuMeshJobs->GetMaxInFlight());
 	return GpuMeshJobs.Get();
 }
 
-bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId)
+bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
+                                       uint8 RingSkirtMask)
 {
 	FVoxelGpuMeshJobManager* Manager = EnsureGpuMeshJobs();
 	if (Manager == nullptr)
@@ -6130,6 +6131,9 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// to the edge -- different terrain, no error. Assigning this afterwards is a
 	// no-op that looks like a fix; it cost the D5 gate a full run.
 	Req.CoarseLevel = LevelKey.Level;
+	// D5.3. Computed on the game thread where the anchor and RingPresets are
+	// live, exactly as the worker job's is, and baked into this dispatch.
+	Req.RingSkirtMask = RingSkirtMask;
 
 	// Ask for the band (D6), which is what lets the fork take a chunk whose
 	// footprint has not been seen before instead of leaving every cold column to
@@ -6688,30 +6692,20 @@ void FVoxelWorldImpl::DispatchJobs()
 		const bool bUseGpuMesh =
 			VoxelStreamAdmission::GpuMeshEnabled()
 			&& LevelKey.Level <= VoxelStreamAdmission::GpuMeshMaxLevel()
-			// THE SKIRT IS STILL CPU-ONLY, and this condition is what keeps that
-			// safe rather than merely likely. ComputeRingSkirtMask returns 0 for
-			// level 0 and for any coarse chunk that is not on an inward ring
-			// boundary, so the fork takes ring INTERIORS -- the large majority --
-			// and leaves boundary chunks, which need the retaining wall, to the
-			// CPU. A coarse chunk meshed without its skirt would reopen the
-			// cascade seam as see-through edges.
+			// THE SKIRT IS NOW ON THE GPU (D5.3), so boundary chunks are no
+			// longer excluded. regionCellMat applies the same mask the CPU
+			// sampler does, against the same chunk interior, and
+			// ValidateRegionRequest refuses a mask on any region that is not
+			// exactly one chunk -- which is what makes a scalar sound rather
+			// than sound-until-batching.
 			//
-			// Why not just implement it: the mask has to be applied at the
-			// mesher's NEIGHBOUR READ keyed on the reading chunk, and as N masks
-			// in a buffer rather than one uniform -- a scalar is unsound the
-			// moment a region batches more than one chunk, because a shared
-			// interior cell is one chunk's interior AND its neighbour's apron.
-			// D4 does not batch yet, so a scalar would be sound today and become
-			// silently wrong the day batching lands. Excluding is honest; a
-			// scalar would be a trap.
-			&& RingSkirtMask == 0
 			&& !bPredictedEmpty           // the band already says this meshes to nothing; do not pay a dispatch
 			// The fork's own bound. Applied HERE rather than in the loop
 			// condition so a chunk arriving when the GPU is full falls back to
 			// the CPU instead of stalling the whole dispatch loop.
 			&& GpuJobsPending.Num() < GpuMaxInFlight;
 
-		if (bUseGpuMesh && SubmitGpuMeshJob(LevelKey, GenId))
+		if (bUseGpuMesh && SubmitGpuMeshJob(LevelKey, GenId, RingSkirtMask))
 		{
 			++GpuMeshJobsDispatchedSinceLog;
 			++GpuMeshDispatchedByLevel[FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1)];

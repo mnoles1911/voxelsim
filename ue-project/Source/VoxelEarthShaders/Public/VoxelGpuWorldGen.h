@@ -109,6 +109,12 @@ struct FVoxelGpuRegionRequest
 	// kernel maps each to its representative level-0 coordinate.
 	int32 CoarseLevel = 0;
 
+	// D5.3: ring-boundary skirt, bit per lateral face (1=-X 2=+X 4=-Y 8=+Y),
+	// mirroring ComputeRingSkirtMask. Non-zero is REJECTED on any region that is
+	// not exactly one chunk -- see regionCellMat in worldgen.ush for why that
+	// refusal is what makes a single mask sound rather than sound-for-now.
+	uint32 RingSkirtMask = 0;
+
 	uint32 BandOriginI = 0;
 	// Y origin of the band window. Production sets it equal to BandOriginI (the
 	// window is symmetric); it exists so a single-column PROBE can sit anywhere

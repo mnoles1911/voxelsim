@@ -58,7 +58,8 @@ namespace
 		SHADER_PARAMETER(int32,        BrickZMin) \
 		SHADER_PARAMETER(uint32,       BricksZ) \
 		SHADER_PARAMETER(uint32,       ScanCount) \
-		SHADER_PARAMETER(uint32,       CoarseScale)
+		SHADER_PARAMETER(uint32,       CoarseScale) \
+		SHADER_PARAMETER(uint32,       RingSkirtMask)
 
 	// Shared compile policy for all seven kernels.
 	//
@@ -313,6 +314,7 @@ namespace
 		// the identity in coarseRep(), so a request that never sets CoarseLevel
 		// is byte-for-byte the pre-D5 dispatch.
 		Out.CoarseScale     = 1u << static_cast<uint32>(FMath::Clamp(Req.CoarseLevel, 0, 5));
+		Out.RingSkirtMask   = Req.RingSkirtMask & 0xfu;
 	}
 
 }
@@ -366,6 +368,43 @@ bool VoxelGpuWorldGen::ValidateRegionRequest(const FVoxelGpuRegionRequest& Req, 
 	// direction skips chunks that should have been meshed, i.e. holes in the
 	// world. So the mis-sizing is rejected here instead of being absorbed
 	// there, and the kernel's guard stays as unreachable defence.
+	// D5.3. A NON-ZERO SKIRT MASK IS ONLY MEANINGFUL FOR A SINGLE-CHUNK REGION,
+	// and this refuses rather than trusting the caller.
+	//
+	// regionCellMat applies the mask against the fixed chunk interior [8, 40) on
+	// both lateral axes, which is where a 6-brick chunk dispatch puts its 4
+	// interior bricks. Batch two chunks into one region and that is no longer
+	// the interior of anything: a shared interior cell is one chunk's interior
+	// AND its neighbour's apron, so a single mask would rewrite real geometry to
+	// AIR instead of merely failing to add a retaining wall. Holes in the world,
+	// from a feature whose whole purpose is to close them.
+	//
+	// The correct batched form is N masks in a buffer, keyed on the reading
+	// chunk. Until that exists this rejection is what keeps the scalar SOUND
+	// rather than sound-for-now -- the difference between a constraint and an
+	// assumption is whether anything checks it.
+	if (Req.RingSkirtMask != 0)
+	{
+		constexpr uint32 kChunkDispatchColumns = 48;   // 32 interior + 2 * 8 halo
+		if (Cx != kChunkDispatchColumns || Cy != kChunkDispatchColumns)
+		{
+			OutError = FString::Printf(
+				TEXT("RingSkirtMask %u on a %ux%u-column region — the skirt is applied against a ")
+				TEXT("single chunk's interior [8, 40) and is only meaningful for a %ux%u chunk ")
+				TEXT("dispatch. A batched region needs per-chunk masks in a buffer; a scalar here ")
+				TEXT("would rewrite a neighbour's interior geometry to AIR."),
+				Req.RingSkirtMask, Cx, Cy, kChunkDispatchColumns, kChunkDispatchColumns);
+			return false;
+		}
+		if ((Req.RingSkirtMask & ~0xfu) != 0)
+		{
+			OutError = FString::Printf(
+				TEXT("RingSkirtMask %u has bits outside the four lateral faces (1=-X 2=+X 4=-Y ")
+				TEXT("8=+Y)"), Req.RingSkirtMask);
+			return false;
+		}
+	}
+
 	if (Req.BandEdge > 0)
 	{
 		// PER AXIS, not one origin against both. With a single origin the old
