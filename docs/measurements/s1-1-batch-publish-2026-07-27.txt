@@ -1,6 +1,22 @@
 ================================================================================
-S1-1 -- BATCH POOL PUBLICATION: +123% THROUGHPUT, HOLES 15,032 -> 993
+S1-1 -- BATCH POOL PUBLICATION: +123% THROUGHPUT, AND IT FRAGMENTS THE POOL
 ================================================================================
+
+*** CORRECTED 2026-07-27, AFTER THIS FILE WAS FIRST WRITTEN. ***
+
+The first version of this file stated "gpuDirectWritesDropped=0, allocFail=0
+across the four flight legs". THE allocFail CLAIM WAS FALSE AND WAS NEVER READ:
+the field was truncated out of the extraction that produced it, and the zero was
+asserted rather than measured. Ground rule 8 exists for exactly this.
+
+MEASURED: allocFail = 77,290 (96,933,454 quads) with batching ON, and 0 with it
+OFF, on the same binary over the same route. That is this item's own stated
+revert condition. The default flip that rested on the false claim has been
+REVERTED; voxel.Stream.PoolBatchPublish is back to 0.
+
+The throughput and hole numbers below are real and reproduce. The wave does not
+close on them, because they were obtained while the pool was refusing
+allocations. See POOL FRAGMENTATION below.
 
 docs/speculative-generation-plan.md Wave S1, item S1-1 (= T1-1). Executes the
 lever S0 identified: docs/measurements/s0-apply-census-2026-07-27.txt.
@@ -62,7 +78,54 @@ is that the pipeline stops discarding 42% of the work it had already paid the
 GPU to do. Throughput and waste were the same problem.
 
 --------------------------------------------------------------------------------
-CORRECTNESS
+POOL FRAGMENTATION -- THE REVERT CONDITION, AND IT FIRED
+--------------------------------------------------------------------------------
+
+  leg          batchPublish   allocFail   allocFailQuads
+  s11-off-1    0                      0                0
+  s11-on-1     1                 77,290       96,933,454
+  s11-on-2     1                 75,382       94,853,610
+
+Batching refuses ~76,000 allocations per leg. Unbatched, on the same binary over
+the same route, it refuses none.
+
+IT IS FRAGMENTATION, NOT EXHAUSTION, and the pool's own early-warning counters
+say so exactly. GetFreeRunCount's doc comment: "1 means unfragmented. Rising
+while GetFreeQuads() stays healthy is the early warning that allocations are
+about to start failing on a pool that still looks half empty." End of leg:
+
+                         batching ON     batching OFF
+    free quads            27,872,095       24,751,830
+    largestRun                68,326        4,904,120
+    freeRuns                  16,903            8,407
+    capacityPct                 61.2             61.2
+    liveChunks                28,613           21,437
+
+Same total free, a 72x smaller largest contiguous run.
+
+THE CHAIN. First refusal happens at liveChunks=49,349, capacityPct=98.5,
+largestRun=1,941, freeRuns=6,640 -- i.e. the pool genuinely filled first. 3.3x
+apply throughput drives transient residency far above the 39,020 the pool was
+sized from; first-fit then refuses; the free list shatters; and refusals keep
+coming after residency falls back to 28,613 and the pool reads 61% free.
+
+49,349 live chunks ALSO crosses the 49,152 chunk-table floor, which takes
+PushUpdatesToProxy's MarkRenderStateDirty branch -- and per D4-R1 that
+invalidates every GPU-written range. Both ceilings were sized from the old,
+slower throughput.
+
+So S1-1 is the right change with the wrong sizing around it. It is not a
+batching bug; it is batching outrunning two numbers derived from a pipeline that
+could not go this fast.
+
+Why holes still FELL (14,827 -> 966) while geometry was being refused: coverage
+verify counts footprints nothing visibly covers, and at 2.2x the throughput far
+more footprints get covered even with refusals. The two are not in conflict, and
+neither excuses the other -- 96.9 M quads of refused allocation is missing
+geometry whatever the coverage number says.
+
+--------------------------------------------------------------------------------
+CORRECTNESS (the gates that DID pass)
 --------------------------------------------------------------------------------
 
 voxel.GPU.VerifyPoolWrite 16 4, three ways on this binary, all PASS byte-identical
@@ -73,8 +136,11 @@ doubleDelivered=0 dropped=0:
   batching OFF, MeshDirectToPool 1   16/16 written GPU-side
   batching ON,  MeshDirectToPool 0   16/16 via the readback control
 
-Across the four flight legs: gpuDirectWritesDropped=0, allocFail=0, and holes
-FELL rather than rose. None of the revert conditions fired.
+gpuDirectWritesDropped = 0 on all four flight legs (this one WAS read), and
+holes fell rather than rose.
+
+VoxelEarth.GpuPool automation suite -- Basic, Coalesce, DirtyRanges, Soak -- all
+Success, covering the interval algebra the free-then-GPU-write guard rests on.
 
 --------------------------------------------------------------------------------
 WHAT IS NOT VERIFIED, AND IT IS THE DANGEROUS PART
@@ -132,11 +198,28 @@ the S0 census was taken at ~1,700 publications/second and the shape at 60/second
 may be different.
 
 --------------------------------------------------------------------------------
-DEFAULT FLIPPED
+DEFAULT: STILL 0. FLIPPED IN ERROR, THEN REVERTED.
 --------------------------------------------------------------------------------
 
-voxel.Stream.PoolBatchPublish 0 -> 1, in its own commit carrying these numbers,
-per the programme's rule that a default is a measurement.
+voxel.Stream.PoolBatchPublish was flipped 0 -> 1 on the strength of the
+throughput and hole numbers plus an allocFail=0 claim that had never been read.
+allocFail was 77,290. The flip was reverted the moment the field was actually
+extracted.
+
+WHAT HAS TO BE TRUE BEFORE IT FLIPS AGAIN: a leg with batching on showing
+allocFail = 0. The expected enabler is the capacity raise (S2-4 in
+docs/speculative-generation-plan.md: 44M -> 64M quads, chunk table 49,152 ->
+81,920), which should be brought FORWARD ahead of parking, because batching is
+what needs it. Whether first-fit also needs the idle defrag (T3-6, currently
+deferred) is genuinely open: a 72x collapse in largest-run at equal total free
+is more than headroom alone explains, and a bigger pool may only delay it.
+
+LESSON, recorded because it is the second time this session a number meant
+something other than it looked like: an extraction that drops a field will
+report a zero that was never in the log. Both this and the earlier "every gated
+timing reads 0.00ms" incident (see the S0 file) produced a healthy-looking
+result from an artefact of how the log was read, not from the run. Read the raw
+line before quoting a field, especially a field that is a revert condition.
 
 Raw logs are NOT committed (/Saved/ is gitignored): s11-on-1.log, s11-on-2.log,
 s11-off-1.log, s11-off-2.log, s11-verify-batch-on.log, s11-verify-batch-off.log,
