@@ -285,8 +285,14 @@ struct WorldGenParamsCB {
     int32_t BrickZMin;
     uint32_t BricksZ;
     uint32_t ScanCount;
+    // D5 coarse-level sampling: the coarse cell size in level-0 voxels, i.e.
+    // 1 << level, computed HOST-side so worldgen.ush contains no variable shift
+    // distance. ONE is level 0, which coarseRep() makes the exact identity, so
+    // every bench fixture behaves as it did before this field existed -- and
+    // the digest is what proves that rather than the claim.
+    uint32_t CoarseScale;
 };
-static_assert(sizeof(WorldGenParamsCB) == 56, "WorldGenParamsCB must match the HLSL cbuffer layout");
+static_assert(sizeof(WorldGenParamsCB) == 60, "WorldGenParamsCB must match the HLSL cbuffer layout");
 
 // Host half of the 2026-07 cross-vendor UB hardening pass. worldgen.ush now
 // guards these in-shader (it returns without writing rather than executing an

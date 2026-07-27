@@ -439,6 +439,7 @@ int OriginVy;
 int BrickZMin;
 uint BricksZ;
 uint ScanCount;
+uint CoarseScale;
 #else
 cbuffer WorldGenParams : register(b0)
 {
@@ -454,6 +455,12 @@ cbuffer WorldGenParams : register(b0)
                              // covers voxel z in [BrickZMin*8, (BrickZMin+BricksZ)*8)
     uint BricksZ;           // (VoxelizeMain) number of bricks in the vertical stack
     uint ScanCount;         // (Scan*Main) number of mask entries to scan
+    uint CoarseScale;       // (D5) coarse cell size in level-0 voxels, i.e.
+                            // 1 << level. ONE is level 0, and level 0 is
+                            // EXACTLY the pre-D5 behaviour -- see coarseRep
+                            // below for why that is arithmetic rather than a
+                            // promise. The HOST computes 1 << level so this
+                            // file contains no variable shift; see coarseRep.
 };
 #endif
 
@@ -600,6 +607,41 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     return s;
 }
 
+// Representative level-0 voxel coordinate for coarse cell `c` (ADR D5).
+//
+// EXACT MIRROR of vxc::GeneratedWorld::coarseRep in voxel-core/generator.h:
+//
+//     static constexpr int64_t coarseRep(int64_t c, int32_t level) {
+//         const int64_t s = int64_t(1) << level;
+//         return c * s + s / 2;
+//     }
+//
+// AT CoarseShift == 0 THIS IS THE IDENTITY, and by arithmetic rather than by a
+// special case: s == 1, so c * 1 + 0 == c. That is what makes level 0 provably
+// byte-identical to every dispatch taken before D5 existed, and it is why the
+// determinism digest is the gate for this change -- if level 0 moved at all,
+// 6e893ab3679a8c81 would stop matching.
+//
+// TWO SHIFTS WERE REMOVED HERE, BOTH DELIBERATELY.
+//
+// `c << level` would fold to the same value for positive c, but c is a world
+// voxel coordinate and is routinely NEGATIVE -- the digest's own far-negative
+// fixture sits at -100,000. Left-shifting a negative signed value is exactly
+// the class of construct this file's cross-vendor UB pass exists to keep out.
+// The CPU writes `c * s`; so does this.
+//
+// And `s` ITSELF is passed in rather than computed as `1 << level`, because
+// that is a VARIABLE shift distance -- undefined if it ever exceeded the width,
+// with vendors differing on whether the distance is masked. lint-shader-ub
+// flagged it, correctly, and the honest fix is to delete the construct rather
+// than annotate it: the host computes 1 << level in C++ where the level is
+// already validated, and this file never shifts by a non-literal at all.
+int64_t coarseRep(int64_t c, uint scale)
+{
+    const int64_t s = (int64_t)scale;        // 1 at level 0; host-computed 1 << level
+    return c * s + (s >> 1);                 // literal shift distance: lint-clean
+}
+
 // --- ColumnMain: bit-exact mirror of vxc::Amplifier::column ----------------
 
 [numthreads(8, 8, 1)]
@@ -621,8 +663,10 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
         return;
 
     const uint64_t seed = ((uint64_t)SeedHi << 32) | (uint64_t)SeedLo;
-    const int64_t vx = (int64_t)OriginVx + (int64_t)tid.x;
-    const int64_t vy = (int64_t)OriginVy + (int64_t)tid.y;
+    // D5: OriginVx/OriginVy are in COARSE cell units at CoarseShift > 0, exactly
+    // as vxc::coarseColumns takes bx*B + x in level-L cells. Identity at level 0.
+    const int64_t vx = coarseRep((int64_t)OriginVx + (int64_t)tid.x, CoarseScale);
+    const int64_t vy = coarseRep((int64_t)OriginVy + (int64_t)tid.y, CoarseScale);
 
     const SurfaceEval se = evalSurface(seed, vx, vy);
     const int64_t px = se.px;
@@ -1320,8 +1364,10 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
     // Cave pass: one reduction per column, reused down the whole brick stack —
     // the same split vxc::ColumnSample::cave makes on the CPU.
     const uint64_t caveSeed = ((uint64_t)SeedHi << 32) | (uint64_t)SeedLo;
-    const int64_t colVx = (int64_t)OriginVx + (int64_t)tid.x;
-    const int64_t colVy = (int64_t)OriginVy + (int64_t)tid.y;
+    // D5: same coarse mapping ColumnMain used, so the cave and cavern passes
+    // sample at the representative column rather than the coarse index.
+    const int64_t colVx = coarseRep((int64_t)OriginVx + (int64_t)tid.x, CoarseScale);
+    const int64_t colVy = coarseRep((int64_t)OriginVy + (int64_t)tid.y, CoarseScale);
     const GpuCaveColumn cave = caveColumnFor(caveSeed, colVx, colVy, col.surfaceMm);
 
     // Cavern pass, wired in exactly as the cave pass above: one reduction per
@@ -1340,7 +1386,9 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
         [unroll]
         for (uint z = 0; z < 8u; ++z)
         {
-            const int64_t vz = brickZ * (int64_t)8 + (int64_t)z;
+            // D5: mirrors makeCoarseBrick's
+            // materialAt(col, coarseRep(key.z * B + z, level)). Identity at 0.
+            const int64_t vz = coarseRep(brickZ * (int64_t)8 + (int64_t)z, CoarseScale);
             // lint-shader-ub: allow UNGUARDED_WRITE - index is bounded by construction: the entry guard caps tid below DispatchColumns, so footprintIndex < bricksX*bricksY and brickIndex < bricksX*bricksY*BricksZ, while lx/ly/z are all < 8; the host sizes OutCells to exactly bricksX*bricksY*BricksZ*512 (contract mirrored in gpu_harness.cpp, asserted there)
             OutCells[brickIndex * 512u + cellIndexInBrick(lx, ly, z)] =
                 materialAt(col, cave, cavern, vz);
