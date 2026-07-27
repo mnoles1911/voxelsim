@@ -156,6 +156,17 @@ void UVoxelPerfRunSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 			LinearSpeedUUPerSecOverride = double(SpeedMPerSec) * 100.0;
 		}
 
+		// -VoxelPerfPreflightSec=<seconds>. Same guarded-scalar shape as
+		// -VoxelPerfSpeed/-VoxelPerfDepth above -- 0 or a malformed value both
+		// mean "no preflight", which is already the member's default, so
+		// there is nothing to abort over. See PreflightSec's doc comment for
+		// what this switch is for and its frame-metrics caveat.
+		float PreflightSecValue = 0.f;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfPreflightSec="), PreflightSecValue) && PreflightSecValue > 0.f)
+		{
+			PreflightSec = PreflightSecValue;
+		}
+
 		// -VoxelPerfLingerSec=<seconds>. Same guarded-scalar shape as
 		// -VoxelPerfSpeed/-VoxelPerfDepth above (parse into a local, only
 		// overwrite the member if present AND positive) -- 0 or a malformed
@@ -174,13 +185,14 @@ void UVoxelPerfRunSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		// already got this right) -- fixed in passing while adding line's own
 		// label rather than perpetuating the same gap for a third mode.
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("VoxelPerfRun: scripted %.1fs flight requested (flight=%s, depth=%.0fm, speed=%.0fm/s, linger=%.1fs)."),
+		       TEXT("VoxelPerfRun: scripted %.1fs flight requested (flight=%s, depth=%.0fm, speed=%.0fm/s, ")
+		       TEXT("preflight=%.1fs, linger=%.1fs)."),
 		       DurationSeconds,
 		       Flight == EVoxelPerfFlight::Underground ? TEXT("underground")
 		           : Flight == EVoxelPerfFlight::Static ? TEXT("static")
 		           : Flight == EVoxelPerfFlight::Line   ? TEXT("line")
 		                                                 : TEXT("surface"),
-		       DepthUU / 100.0, LinearSpeedUUPerSecOverride / 100.0, LingerSec);
+		       DepthUU / 100.0, LinearSpeedUUPerSecOverride / 100.0, PreflightSec, LingerSec);
 	}
 }
 
@@ -239,6 +251,17 @@ void UVoxelPerfRunSubsystem::Tick(float DeltaTime)
 		// already matches "surface at the origin + clearance" -- otherwise
 		// the very first tick would ramp up from 0 instead of starting level.
 		LineLastZUU = FixedHeightUU;
+
+		// Preflight's pinned pose, captured HERE -- the same frame, and from
+		// the same Pawn, as CircleCenterUU above -- rather than lazily inside
+		// StepFlightPath's preflight branch. That is deliberate: it is what
+		// guarantees nothing ever re-captures a pose when the flight begins,
+		// so a preflight-then-line run still starts its traverse from the
+		// true spawn rather than from wherever the pawn happened to be sitting
+		// at the moment preflight ended.
+		PreflightLocationUU = CircleCenterUU;
+		PreflightRotation = Pawn->GetActorRotation();
+
 		bPathInitialized = true;
 		UE_LOG(LogVoxelPerf, Log, TEXT("VoxelPerfRun: path centered at (%.0f, %.0f), height %.0f UU."),
 		       CircleCenterUU.X, CircleCenterUU.Y, FixedHeightUU);
@@ -275,13 +298,15 @@ void UVoxelPerfRunSubsystem::Tick(float DeltaTime)
 	}
 
 	ElapsedSeconds += DeltaTime;
-	// Deferred by LingerSec (default 0, i.e. no change from before): the
-	// flight itself stops advancing at ElapsedSeconds >= DurationSeconds (see
-	// StepFlightPath's linger-pin branch), but FinishRun/RequestExit wait
-	// until the linger window has elapsed too, so a fly-then-stop leg gets a
+	// Bracketed by PreflightSec and LingerSec (both default 0, i.e. no change
+	// from before): the flight only advances for ElapsedSeconds in
+	// [PreflightSec, PreflightSec + DurationSeconds) (see StepFlightPath's
+	// preflight- and linger-pin branches), but FinishRun/RequestExit wait
+	// until PreflightSec + DurationSeconds + LingerSec, so a warmup-then-fly-
+	// then-stop leg gets both a pre-motion cascade-warm window and a
 	// post-motion observation window instead of the process exiting the
-	// instant motion ends.
-	if (ElapsedSeconds >= DurationSeconds + LingerSec)
+	// instant the flight itself starts or stops.
+	if (ElapsedSeconds >= PreflightSec + DurationSeconds + LingerSec)
 	{
 		FinishRun();
 	}
@@ -297,14 +322,48 @@ void UVoxelPerfRunSubsystem::StepFlightPath(float DeltaTime)
 		return;
 	}
 
-	if (LingerSec > 0.f && ElapsedSeconds >= DurationSeconds)
+	if (PreflightSec > 0.f && ElapsedSeconds < PreflightSec)
 	{
-		// Flight has ended (t >= DurationSeconds); hold this pose for the
-		// configured linger window instead of advancing further, so the world
-		// keeps streaming (and logging) around a STOPPED pawn -- see
-		// LingerSec's doc comment. Checked ahead of the per-flight branches
-		// below so it applies uniformly regardless of which flight was
-		// running; for EVoxelPerfFlight::Static this is a no-op in effect
+		// Cold-cascade warmup window, before the flight path clock starts at
+		// all -- hold at the pose captured in Tick's path-init block
+		// (PreflightLocationUU/PreflightRotation, set once, the SAME frame as
+		// CircleCenterUU/FixedHeightUU -- not re-captured here) instead of
+		// advancing any flight path, so the first streaming observation isn't
+		// confounded with plain cold-fill. See PreflightSec's doc comment.
+		// Checked ahead of the per-flight branches below (and ahead of the
+		// linger gate, since the two windows are time-disjoint by
+		// construction) so it applies uniformly regardless of which flight
+		// was requested.
+		if (!bPreflightLogged)
+		{
+			bPreflightLogged = true;
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("VoxelPerfRun: preflight warmup for %.1fs at spawn pose (%.0f, %.0f, %.0f) yaw=%.1f -- ")
+			       TEXT("world ticking/streaming, flight path clock starts at zero once this ends."),
+			       PreflightSec, PreflightLocationUU.X, PreflightLocationUU.Y, PreflightLocationUU.Z,
+			       PreflightRotation.Yaw);
+		}
+
+		Pawn->SetActorLocationAndRotation(PreflightLocationUU, PreflightRotation,
+		                                  /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics);
+		if (PC)
+		{
+			PC->SetControlRotation(PreflightRotation);
+		}
+		// Deliberately NOT folded into TotalPathFrames/UndergroundFrames, same
+		// reasoning as the linger window below: these counters describe the
+		// FLOWN path, and a parked warmup window isn't part of it.
+		return;
+	}
+
+	if (LingerSec > 0.f && ElapsedSeconds >= PreflightSec + DurationSeconds)
+	{
+		// Flight has ended (t >= PreflightSec + DurationSeconds); hold this
+		// pose for the configured linger window instead of advancing further,
+		// so the world keeps streaming (and logging) around a STOPPED pawn --
+		// see LingerSec's doc comment. Checked ahead of the per-flight
+		// branches below so it applies uniformly regardless of which flight
+		// was running; for EVoxelPerfFlight::Static this is a no-op in effect
 		// (already pinned) but harmless to fall into.
 		//
 		// Same re-assert-every-tick pin pattern as Static mode, just captured
@@ -335,6 +394,16 @@ void UVoxelPerfRunSubsystem::StepFlightPath(float DeltaTime)
 		// had already stopped moving.
 		return;
 	}
+
+	// Path-local time: zero at the moment the flight itself starts, not at
+	// the moment this subsystem started ticking. Both preflight-gate branches
+	// above return before reaching here, so by construction ElapsedSeconds >=
+	// PreflightSec whenever this line runs (PreflightSec defaults to 0, so
+	// this is a no-op subtraction for every existing invocation). Used
+	// instead of ElapsedSeconds below so e.g. a line flight's start point is
+	// still exactly the captured origin -- not partway down its heading --
+	// regardless of how long preflight ran.
+	const float FlightSeconds = ElapsedSeconds - PreflightSec;
 
 	if (Flight == EVoxelPerfFlight::Static)
 	{
@@ -377,7 +446,7 @@ void UVoxelPerfRunSubsystem::StepFlightPath(float DeltaTime)
 		// whole run instead of looping back over ground already streamed in.
 		const double HeadingRad = FMath::DegreesToRadians(double(HeadingDeg));
 		const FVector Dir(FMath::Cos(HeadingRad), FMath::Sin(HeadingRad), 0.0);
-		const double DistanceUU = LinearSpeedUUPerSecOverride * double(ElapsedSeconds);
+		const double DistanceUU = LinearSpeedUUPerSecOverride * double(FlightSeconds);
 
 		FVector NewLocation = CircleCenterUU + Dir * DistanceUU;
 
@@ -420,14 +489,14 @@ void UVoxelPerfRunSubsystem::StepFlightPath(float DeltaTime)
 	// docs/debug-tooling-plan.md P1: "circle radius 100m around spawn at
 	// 20 m/s at surface+30m, constant yaw sweep."
 	const double AngularSpeedRadPerSec = LinearSpeedUUPerSecOverride / CircleRadiusUU;
-	const double Angle = double(ElapsedSeconds) * AngularSpeedRadPerSec;
+	const double Angle = double(FlightSeconds) * AngularSpeedRadPerSec;
 
 	FVector NewLocation = CircleCenterUU;
 	NewLocation.X += CircleRadiusUU * FMath::Cos(Angle);
 	NewLocation.Y += CircleRadiusUU * FMath::Sin(Angle);
 	NewLocation.Z = FixedHeightUU;
 
-	const float Yaw = FMath::Fmod(ElapsedSeconds * float(YawSweepDegPerSec), 360.f);
+	const float Yaw = FMath::Fmod(FlightSeconds * float(YawSweepDegPerSec), 360.f);
 	FRotator NewRotation(-10.f, Yaw, 0.f);
 
 	if (Flight == EVoxelPerfFlight::Underground)
@@ -570,9 +639,11 @@ void UVoxelPerfRunSubsystem::FinishRun()
 		// at -- same reasoning as the static pose fields: two line runs at
 		// different headings over real (non-flat) terrain are not comparable.
 		TEXT("  \"flightHeadingDeg\": %.1f,\n")
-		// LingerSec's own doc comment: recorded so anyone reading frame-time
-		// metrics off this JSON can tell a linger-inflated run apart from one
-		// with LingerSec=0, rather than silently comparing the two.
+		// PreflightSec/LingerSec's own doc comments: recorded so anyone
+		// reading frame-time metrics off this JSON can tell a
+		// preflight/linger-inflated run apart from one with both at 0, rather
+		// than silently comparing the two.
+		TEXT("  \"preflightSec\": %.1f,\n")
 		TEXT("  \"lingerSec\": %.1f,\n")
 		// Recorded so a static run's numbers can never be read without the pose
 		// they were taken at. Two static runs at different poses are not
@@ -587,7 +658,8 @@ void UVoxelPerfRunSubsystem::FinishRun()
 		    : Flight == EVoxelPerfFlight::Static ? TEXT("static")
 		    : Flight == EVoxelPerfFlight::Line   ? TEXT("line")
 		                                          : TEXT("surface"),
-		DepthUU / 100.0, LinearSpeedUUPerSecOverride / 100.0, HeadingDeg, LingerSec, StaticYawDeg, StaticPitchDeg, UndergroundFraction);
+		DepthUU / 100.0, LinearSpeedUUPerSecOverride / 100.0, HeadingDeg, PreflightSec, LingerSec, StaticYawDeg, StaticPitchDeg,
+		UndergroundFraction);
 
 	FFileHelper::SaveStringToFile(Json, *OutPath);
 

@@ -182,9 +182,42 @@ private:
 	// path init, so frame 1 does not itself pop.
 	double LineLastZUU = 0.0;
 
+	// -VoxelPerfPreflightSec=<seconds>, default 0 (no change from prior
+	// behaviour: the flight starts advancing on the very first tick a pawn
+	// exists). The smoke run showed the flight starting on a completely COLD
+	// world, which confounds the thing being investigated (streaming-lag
+	// holes) with plain cold-fill for the first ~40s -- there was no way to
+	// let the cascade warm up around a stationary pawn before the flight
+	// itself starts moving and generating fresh crossings. PreflightSec>0
+	// holds the pawn at its captured spawn pose (PreflightLocationUU/
+	// PreflightRotation below) for that many seconds before the flight path
+	// clock starts.
+	//
+	// The path clock genuinely starts at zero when preflight ends -- Step-
+	// FlightPath computes path position from (ElapsedSeconds - PreflightSec),
+	// not from ElapsedSeconds directly -- so e.g. a line flight's start point
+	// is still exactly the captured origin, not partway down its heading.
+	//
+	// Same frame-time-samples caveat as LingerSec: preflight frames are still
+	// folded into FrameMsSamples/PostWarmupFrameMsSamples (the world is
+	// ticking, so frame time is still frame time), so two legs compared on
+	// frame-time metrics must use the same PreflightSec or the comparison is
+	// contaminated by however much warmup got averaged in on one side.
+	float PreflightSec = 0.f;
+
+	// One-time "entering preflight" log guard -- see StepFlightPath. Position/
+	// rotation themselves are NOT captured lazily like this: they are set
+	// once in Tick's path-init block, in the exact same frame CircleCenterUU/
+	// FixedHeightUU are, specifically so nothing re-captures a pose when the
+	// flight begins and the traverse still starts from the true spawn.
+	bool bPreflightLogged = false;
+	FVector PreflightLocationUU = FVector::ZeroVector;
+	FRotator PreflightRotation = FRotator::ZeroRotator;
+
 	// -VoxelPerfLingerSec=<seconds>, default 0 (no change from prior
 	// behaviour: FinishRun fires the instant ElapsedSeconds reaches
-	// DurationSeconds). The ring-gap investigation's signature is "holes
+	// PreflightSec + DurationSeconds, i.e. as soon as the flight itself ends).
+	// The ring-gap investigation's signature is "holes
 	// appear while moving, fill in once you stop", and with LingerSec==0
 	// there is no way to observe that: RequestExit fires the moment the
 	// flight itself stops. LingerSec>0 keeps the process alive (StepFlightPath
