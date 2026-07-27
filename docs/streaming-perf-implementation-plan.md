@@ -1,7 +1,32 @@
 # Streaming-perf implementation plan — executing the 2026-07-27 deep review
 
-**Status:** written 2026-07-27, not yet started. Execution brief for a fresh
-session.
+**Status:** written 2026-07-27. **Its WAVE ORDER is superseded by
+`docs/speculative-generation-plan.md`** (owner decision, 2026-07-27: T4-1 is the
+target, so the programme is re-sequenced to build only what T4-1 needs, in
+dependency order). **Every item's content below still stands and is still the
+reference** — the new plan cites T0-1, T1-1, T2-4 and the rest without restating
+them. Read that document for the order, this one for the detail.
+
+That plan also records six code findings that change what gets built, four of
+which contradict something written here. In brief, so this document is not
+silently wrong where it is read on its own:
+
+- **T2-4 does not depend on T1-4.** Parking never recycles the chunk id, so it
+  never enters the id-stamp path T1-4 targets. Park is `ChunkOrigins[id].W = 0`
+  plus a table-dirty flag — no quad traffic, and not even `bRunsDirty`.
+- **T2-1's `Pawn->GetVelocity()` reads ~zero on the standard leg.**
+  `-VoxelPerfFlight=line` teleports the pawn, bypassing the movement component.
+  Velocity must be finite-differenced from `LastAnchorLocation` instead.
+- **T1-1 is worth more than stated.** `BuildChunkRuns()` walks `Allocations`,
+  which is append-only, so its cost scales with chunks ever added (~150k–200k
+  by the end of a leg) rather than with residency (~39k). A `FreeHandles` LIFO
+  is a new prerequisite.
+- **T4-1's 92,000 chunks/s headroom figure does not transfer.** It is a raw
+  Vulkan level-0 bench with a 14×14-brick tile interior; the shipping path pays
+  a 3.4× halo per chunk through RDG. The live ceiling is unmeasured and must be
+  measured before the speculative budget is sized.
+
+Execution brief for a fresh session.
 
 ## How to use this document
 
