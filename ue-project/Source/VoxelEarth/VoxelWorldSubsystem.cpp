@@ -1289,6 +1289,30 @@ struct FJobResult
 	{
 		return GpuQuads.IsValid() ? int32(GpuQuadCount) : Quads.Num();
 	}
+
+	// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2): DELIVER time --
+	// the moment this result was handed to ResultsQueue by whichever producer
+	// made it (OnGpuMeshJobComplete for the fork, the worker task body for the
+	// CPU arm, both right before their ResultsQueue.Enqueue). DrainResults reads it once
+	// it has decided to apply this result, right after the ApplyMeshResult()
+	// call, to get DeliverToApplyMs: how long a finished result sat on
+	// ResultsQueue before DrainResults's own per-frame budget let it through.
+	// Deliberately NOT read inside ApplyMeshResult -- that function is being
+	// edited concurrently elsewhere in this wave. 0.0 unless
+	// voxel.Stream.LatencyStats is on (both producers gate the
+	// FPlatformTime::Seconds() call that fills this), in which case it stays
+	// "not measured" rather than a false zero -- same convention as
+	// FVoxelGpuMeshJobResult::QueuedMs.
+	double DeliverSeconds = 0.0;
+
+	// S0-3: true when this result came from the GPU fork (OnGpuMeshJobComplete)
+	// rather than the CPU worker task body. The two arms' latency windows are
+	// kept separate (VoxelWorldSubsystem.cpp's GpuSubmitToDeliverMsWindow vs
+	// CpuWorkerEndToEndMsWindow etc.) because JobMs means something different
+	// on each arm -- the fork's SubmitToDeliverMs vs the worker's own task-body
+	// wall time -- and the pre-existing WorkerJobMsWindow already mixes both
+	// with no way to tell them apart after the fact.
+	bool bFromGpuMesh = false;
 };
 
 } // namespace VoxelStreaming
@@ -2487,6 +2511,17 @@ struct FVoxelWorldImpl
 		{
 			LevelWorkerJobMsWindow[Level].Init(0.f, WorkerJobMsWindowSize);
 		}
+
+		// S0-3: same treatment, one window per (producer, stage). Sized
+		// unconditionally -- cheap (7 * 256 floats) -- even though nothing
+		// writes into them unless voxel.Stream.LatencyStats is on.
+		GpuQueuedMsWindow.Init(0.f, WorkerJobMsWindowSize);
+		GpuDispatchToReadyMsWindow.Init(0.f, WorkerJobMsWindowSize);
+		GpuReadyToDeliverMsWindow.Init(0.f, WorkerJobMsWindowSize);
+		GpuSubmitToDeliverMsWindow.Init(0.f, WorkerJobMsWindowSize);
+		GpuDeliverToApplyMsWindow.Init(0.f, WorkerJobMsWindowSize);
+		CpuWorkerEndToEndMsWindow.Init(0.f, WorkerJobMsWindowSize);
+		CpuDeliverToApplyMsWindow.Init(0.f, WorkerJobMsWindowSize);
 	}
 
 	// Track B2: bUsingTileGrid MUST be declared (and default-constructed via
@@ -3128,6 +3163,60 @@ struct FVoxelWorldImpl
 	TArray<float> LevelWorkerJobMsWindow[VoxelCoords::kNumLevels];
 	int32 LevelWorkerJobMsWindowNext[VoxelCoords::kNumLevels] = {};
 	int32 LevelWorkerJobMsWindowCount[VoxelCoords::kNumLevels] = {};
+
+	// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2): per-producer,
+	// per-stage submit->apply latency, same fixed-size-ring-buffer idiom as
+	// WorkerJobMsWindow above (sized with WorkerJobMsWindowSize -- not a second
+	// window size, the same one). Filled only under voxel.Stream.LatencyStats
+	// (VoxelDebug::GetStreamLatencyStats) -- see OnGpuMeshJobComplete and
+	// DrainResults for the write sites, MaybeLogCounters for where these are
+	// read back as p50/p95/max.
+	//
+	// GPU fork arm, written in OnGpuMeshJobComplete straight from
+	// FVoxelGpuMeshJobResult's own fields:
+	TArray<float> GpuQueuedMsWindow;
+	int32 GpuQueuedMsWindowNext = 0;
+	int32 GpuQueuedMsWindowCount = 0;
+	TArray<float> GpuDispatchToReadyMsWindow;
+	int32 GpuDispatchToReadyMsWindowNext = 0;
+	int32 GpuDispatchToReadyMsWindowCount = 0;
+	TArray<float> GpuReadyToDeliverMsWindow;
+	int32 GpuReadyToDeliverMsWindowNext = 0;
+	int32 GpuReadyToDeliverMsWindowCount = 0;
+	TArray<float> GpuSubmitToDeliverMsWindow;
+	int32 GpuSubmitToDeliverMsWindowNext = 0;
+	int32 GpuSubmitToDeliverMsWindowCount = 0;
+	// Deliver (ResultsQueue.Enqueue) to ApplyMeshResult, written in DrainResults
+	// from FJobResult::DeliverSeconds -- the ONE stage that is a property of
+	// the CONSUMER (DrainResults's own per-frame apply budget), not either
+	// producer, which is why it exists on both arms below as well as this one.
+	TArray<float> GpuDeliverToApplyMsWindow;
+	int32 GpuDeliverToApplyMsWindowNext = 0;
+	int32 GpuDeliverToApplyMsWindowCount = 0;
+
+	// CPU worker arm. One end-to-end figure -- the worker task has no separate
+	// queue/dispatch/ready stages the way the GPU fork does, so this mirrors
+	// FJobResult::JobMs (already stamped JobStartSeconds..enqueue in the task
+	// body; nothing new added there) rather than inventing a stage split that
+	// does not exist. Isolates the CPU-only population that WorkerJobMsWindow
+	// above mixes with the GPU arm's SubmitToDeliverMs.
+	TArray<float> CpuWorkerEndToEndMsWindow;
+	int32 CpuWorkerEndToEndMsWindowNext = 0;
+	int32 CpuWorkerEndToEndMsWindowCount = 0;
+	TArray<float> CpuDeliverToApplyMsWindow;
+	int32 CpuDeliverToApplyMsWindowNext = 0;
+	int32 CpuDeliverToApplyMsWindowCount = 0;
+
+	// Per-level (0..5) quad-count-per-delivered-chunk distribution (S0-3's
+	// other half -- "free here", filled alongside the census just above it in
+	// DrainResults). Mean is SumQuads/Count; the bucket histogram is read in
+	// MaybeLogCounters. Buckets: see the bucket boundary comment at the log
+	// site -- chosen against a measured mean of ~902 quads/chunk and the hard
+	// per-chunk bound of 98,304 quads.
+	static constexpr int32 kNumQuadHistBuckets = 6; // 0, 1-255, 256-1023, 1024-4095, 4096-16383, 16384+
+	int64 LevelQuadHistSinceLog[VoxelCoords::kNumLevels][kNumQuadHistBuckets] = {};
+	int64 LevelQuadCountSinceLog[VoxelCoords::kNumLevels] = {};
+	int64 LevelQuadSumSinceLog[VoxelCoords::kNumLevels] = {};
 
 	// This-tick budget-saturation fractions (P1 "budget saturation (% of
 	// per-frame apply/unload/re-mesh budgets used)"), set by the three Drain*
@@ -4240,6 +4329,52 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 	}
 }
 
+namespace
+{
+// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2). Same idiom as the
+// pre-existing WorkerJobMsWindow percentile computation in UpdatePerfSnapshot
+// (sort a small copy of the ring buffer, index by rank) -- factored out here
+// because S0-3 adds seven of these windows (one per producer per stage) and
+// this is the read side for all of them. Window may hold more slots than
+// Count (ring not yet full after startup); only the first Count entries were
+// ever written by PushLatencyMsSample below.
+struct FMsPercentiles
+{
+	float P50 = 0.f;
+	float P95 = 0.f;
+	float Max = 0.f;
+};
+
+FMsPercentiles ComputeMsPercentiles(const TArray<float>& Window, int32 Count)
+{
+	FMsPercentiles Out;
+	if (Count <= 0)
+	{
+		return Out;
+	}
+	TArray<float> Sorted;
+	Sorted.Append(Window.GetData(), Count);
+	Sorted.Sort();
+	const int32 P50Index = FMath::Clamp(int32(Sorted.Num() * 0.50f), 0, Sorted.Num() - 1);
+	const int32 P95Index = FMath::Clamp(int32(Sorted.Num() * 0.95f), 0, Sorted.Num() - 1);
+	Out.P50 = Sorted[P50Index];
+	Out.P95 = Sorted[P95Index];
+	Out.Max = Sorted.Last();
+	return Out;
+}
+
+// The write side: same overwrite-and-wrap ring buffer WorkerJobMsWindow itself
+// uses inline in DrainResults, pulled into one place because S0-3's writes
+// happen at three different call sites (OnGpuMeshJobComplete, the CPU worker
+// task body, DrainResults) rather than DrainResults alone.
+void PushLatencyMsSample(TArray<float>& Window, int32& Next, int32& Count, float ValueMs)
+{
+	Window[Next] = ValueMs;
+	Next = (Next + 1) % Window.Num();
+	Count = FMath::Min(Count + 1, Window.Num());
+}
+} // namespace
+
 void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 {
 	// Cadence is 5 s by default and overridable with -VoxelPerfLogInterval=<sec>.
@@ -4718,6 +4853,88 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		// that says whether kBlindJobMarkTimeoutSeconds (5 s) is anywhere near
 		// being crossed. Resetting it every window would hide the one spike
 		// that matters.
+	}
+
+	// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2). Independent of
+	// VoxelStreamAdmission::GpuMeshEnabled() above -- the CPU worker arm's
+	// windows are worth reading on a CPU-only run too, and a run with the fork
+	// on wants both printed together. Gated entirely on voxel.Stream.LatencyStats
+	// (VoxelDebug::GetStreamLatencyStats), which is also what gates the window
+	// writes themselves (OnGpuMeshJobComplete, the CPU worker task body,
+	// DrainResults) -- see that cvar's source comment.
+	//
+	// CAVEAT on the GPU line below: queued/dispatchToReady/readyToDeliver read
+	// as a real 0.0, not "unmeasured", whenever voxel.GPU.MeshLatencyStats (the
+	// VoxelEarthShaders-module gate FJob::PromotedSeconds needs -- that module
+	// has no VoxelDebug dependency, hence the separate cvar) is off even though
+	// this cvar is on. Both must be set for those three columns to mean
+	// anything; submitToDeliver and deliverToApply do not depend on the
+	// shaders-side gate.
+	if (VoxelDebug::GetStreamLatencyStats())
+	{
+		const FMsPercentiles GpuQueued = ComputeMsPercentiles(GpuQueuedMsWindow, GpuQueuedMsWindowCount);
+		const FMsPercentiles GpuDispatchToReady = ComputeMsPercentiles(GpuDispatchToReadyMsWindow, GpuDispatchToReadyMsWindowCount);
+		const FMsPercentiles GpuReadyToDeliver = ComputeMsPercentiles(GpuReadyToDeliverMsWindow, GpuReadyToDeliverMsWindowCount);
+		const FMsPercentiles GpuSubmitToDeliver = ComputeMsPercentiles(GpuSubmitToDeliverMsWindow, GpuSubmitToDeliverMsWindowCount);
+		const FMsPercentiles GpuDeliverToApply = ComputeMsPercentiles(GpuDeliverToApplyMsWindow, GpuDeliverToApplyMsWindowCount);
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel GPU latency stages (5s window, n=%d): queued p50=%.1f p95=%.1f max=%.1f | ")
+		       TEXT("dispatchToReady p50=%.1f p95=%.1f max=%.1f | readyToDeliver p50=%.1f p95=%.1f max=%.1f | ")
+		       TEXT("submitToDeliver p50=%.1f p95=%.1f max=%.1f | deliverToApply p50=%.1f p95=%.1f max=%.1f (n=%d)"),
+		       GpuSubmitToDeliverMsWindowCount,
+		       GpuQueued.P50, GpuQueued.P95, GpuQueued.Max,
+		       GpuDispatchToReady.P50, GpuDispatchToReady.P95, GpuDispatchToReady.Max,
+		       GpuReadyToDeliver.P50, GpuReadyToDeliver.P95, GpuReadyToDeliver.Max,
+		       GpuSubmitToDeliver.P50, GpuSubmitToDeliver.P95, GpuSubmitToDeliver.Max,
+		       GpuDeliverToApply.P50, GpuDeliverToApply.P95, GpuDeliverToApply.Max,
+		       GpuDeliverToApplyMsWindowCount);
+
+		const FMsPercentiles CpuEndToEnd = ComputeMsPercentiles(CpuWorkerEndToEndMsWindow, CpuWorkerEndToEndMsWindowCount);
+		const FMsPercentiles CpuDeliverToApply = ComputeMsPercentiles(CpuDeliverToApplyMsWindow, CpuDeliverToApplyMsWindowCount);
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel CPU worker latency (5s window): endToEnd p50=%.1f p95=%.1f max=%.1f (n=%d) | ")
+		       TEXT("deliverToApply p50=%.1f p95=%.1f max=%.1f (n=%d)"),
+		       CpuEndToEnd.P50, CpuEndToEnd.P95, CpuEndToEnd.Max, CpuWorkerEndToEndMsWindowCount,
+		       CpuDeliverToApply.P50, CpuDeliverToApply.P95, CpuDeliverToApply.Max, CpuDeliverToApplyMsWindowCount);
+
+		// Per-level (0..5) quad-count-per-delivered-chunk distribution -- the
+		// input a speculative pool reserve is sized from (T4-1 needs this
+		// before it can be costed at all). Buckets chosen against a measured
+		// mean of ~902 quads/chunk (35,205,733 quads over 39,020 chunks) and
+		// the hard per-chunk bound of 98,304 quads: 0 isolates the buried/
+		// all-air/all-solid population the buried-skip census elsewhere in
+		// this function already shows is a large fraction of deliveries, and
+		// 1-255/256-1023/1024-4095/4096-16383 each roughly quadruple the last
+		// so the mean lands inside the distribution's body rather than in the
+		// first or last bucket, leaving the tail bucket (16384+) genuine
+		// headroom below the hard bound instead of being where every dense
+		// surface chunk piles up.
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			const int64 LevelChunks = LevelQuadCountSinceLog[Level];
+			if (LevelChunks == 0)
+			{
+				continue;
+			}
+			const double MeanQuads = double(LevelQuadSumSinceLog[Level]) / double(LevelChunks);
+			const int64* Hist = LevelQuadHistSinceLog[Level];
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel quad census L%d (5s window): chunks=%lld mean=%.1f | ")
+			       TEXT("0:%lld 1-255:%lld 256-1023:%lld 1024-4095:%lld 4096-16383:%lld 16384+:%lld"),
+			       Level, (long long)LevelChunks, MeanQuads,
+			       (long long)Hist[0], (long long)Hist[1], (long long)Hist[2],
+			       (long long)Hist[3], (long long)Hist[4], (long long)Hist[5]);
+		}
+
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			LevelQuadCountSinceLog[Level] = 0;
+			LevelQuadSumSinceLog[Level] = 0;
+			for (int32 Bucket = 0; Bucket < kNumQuadHistBuckets; ++Bucket)
+			{
+				LevelQuadHistSinceLog[Level][Bucket] = 0;
+			}
+		}
 	}
 
 	BuriedSkipsSinceLog = BuriedSkipAirSinceLog = BuriedSkipSolidSinceLog = BuriedVerifyCheckedSinceLog = 0;
@@ -7395,6 +7612,24 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	GpuMeshSubmitToDeliverMsSinceLog += GpuResult.SubmitToDeliverMs;
 	GpuMeshSubmitToDeliverMaxMs = FMath::Max(GpuMeshSubmitToDeliverMaxMs, GpuResult.SubmitToDeliverMs);
 
+	// S0-3: the per-stage split. QueuedMs/ReadyToDeliverMs are 0.0 unless
+	// voxel.GPU.MeshLatencyStats is also on (see FVoxelGpuMeshJobResult's doc
+	// comment) -- pushing a real 0.0 into the window in that case would read as
+	// "this stage is free" rather than "not measured", so this is gated on the
+	// SAME cvar the streaming side uses and skips entirely when off, rather
+	// than pushing zeroes.
+	if (VoxelDebug::GetStreamLatencyStats())
+	{
+		PushLatencyMsSample(GpuQueuedMsWindow, GpuQueuedMsWindowNext, GpuQueuedMsWindowCount,
+		                    float(GpuResult.QueuedMs));
+		PushLatencyMsSample(GpuDispatchToReadyMsWindow, GpuDispatchToReadyMsWindowNext, GpuDispatchToReadyMsWindowCount,
+		                    float(GpuResult.DispatchToReadyMs));
+		PushLatencyMsSample(GpuReadyToDeliverMsWindow, GpuReadyToDeliverMsWindowNext, GpuReadyToDeliverMsWindowCount,
+		                    float(GpuResult.ReadyToDeliverMs));
+		PushLatencyMsSample(GpuSubmitToDeliverMsWindow, GpuSubmitToDeliverMsWindowNext, GpuSubmitToDeliverMsWindowCount,
+		                    float(GpuResult.SubmitToDeliverMs));
+	}
+
 	// DELIVERIES SLOWER THAN THE COLD-BAND BACKSTOP, counted directly.
 	//
 	// gpuLatencyTimeouts cannot see these, and that is not a bug in it so much
@@ -7417,6 +7652,15 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	Result.Key = Pending.Key;
 	Result.GenerationId = Pending.GenerationId;
 	Result.JobMs = float(GpuResult.SubmitToDeliverMs);
+	Result.bFromGpuMesh = true;
+	// S0-3: DELIVER time, i.e. now -- the moment this result is about to go on
+	// ResultsQueue. Gated with the rest of S0-3's bookkeeping; see
+	// FJobResult::DeliverSeconds for why a stats-off run must leave this at
+	// 0.0 rather than paying the call for a number nobody reads.
+	if (VoxelDebug::GetStreamLatencyStats())
+	{
+		Result.DeliverSeconds = FPlatformTime::Seconds();
+	}
 
 	// The band, when the GPU produced one (D6). This is what lets the fork seed
 	// a cold footprint rather than leaving every cold column to the CPU.
@@ -7956,10 +8200,19 @@ void FVoxelWorldImpl::DispatchJobs()
 			continue;
 		}
 
+		// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2): read on the
+		// GAME THREAD, same as bComputeBand above, and captured BY VALUE into
+		// the task -- the worker body below runs on a background task thread,
+		// and VoxelDebug's cvar accessors are GetValueOnGameThread(), not safe
+		// to call from there. This is the established pattern in this loop for
+		// getting a gate's value into the task body (bPredictedEmpty,
+		// bComputeBand are the same shape).
+		const bool bLatencyStatsEnabled = VoxelDebug::GetStreamLatencyStats();
+
 		UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
 			TEXT("VoxelChunkMeshJob"),
 			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
-			 bPredictedEmpty, bComputeBand, RingSkirtMask]()
+			 bPredictedEmpty, bComputeBand, bLatencyStatsEnabled, RingSkirtMask]()
 			{
 				SCOPE_CYCLE_COUNTER(STAT_VoxelWorkerJob);
 				const double JobStartSeconds = FPlatformTime::Seconds();
@@ -8352,6 +8605,16 @@ void FVoxelWorldImpl::DispatchJobs()
 
 				Result.JobCycles = VoxelThreadCycles() - JobStartCycles;
 				Result.JobMs = float((FPlatformTime::Seconds() - JobStartSeconds) * 1000.0);
+				// S0-3. Result.bFromGpuMesh stays false (its default) -- this IS
+				// the CPU worker arm. bLatencyStatsEnabled was read on the game
+				// thread before this task launched (see the capture-list comment
+				// above); gating this new FPlatformTime::Seconds() call on it
+				// here, on the worker thread, is why it had to be captured by
+				// value rather than read straight from the cvar.
+				if (bLatencyStatsEnabled)
+				{
+					Result.DeliverSeconds = FPlatformTime::Seconds();
+				}
 				QueuePtr->Enqueue(MoveTemp(Result));
 				CounterPtr->Decrement();
 			},
@@ -9080,6 +9343,15 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			LevelWorkerJobMsWindowCount[Lvl] = FMath::Min(LevelWorkerJobMsWindowCount[Lvl] + 1, WorkerJobMsWindowSize);
 		}
 
+		// S0-3: WorkerJobMsWindow above mixes both producers (OnGpuMeshJobComplete
+		// sets Result.JobMs = SubmitToDeliverMs too). This isolates the CPU-only
+		// population, gated with the rest of S0-3's bookkeeping.
+		if (VoxelDebug::GetStreamLatencyStats() && !Result.bFromGpuMesh)
+		{
+			PushLatencyMsSample(CpuWorkerEndToEndMsWindow, CpuWorkerEndToEndMsWindowNext,
+			                    CpuWorkerEndToEndMsWindowCount, Result.JobMs);
+		}
+
 		// Buried-chunk pre-dispatch skip: record this footprint's band. Done
 		// BEFORE the stale-result discard below, because the band is a pure
 		// function of (X,Y) and the amplifier -- it is equally true whether or
@@ -9159,6 +9431,27 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			++LevelResultsSinceLog[Lvl];
 			const int32 ResultQuads = Result.QuadCount();
 			(ResultQuads == 0 ? LevelZeroQuadMsSinceLog[Lvl] : LevelQuadMsSinceLog[Lvl]) += Result.JobMs;
+
+			// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2): the
+			// per-level quad-count distribution -- free here, ResultQuads and Lvl
+			// are already computed for the census above. Sizes the speculative
+			// pool reserve a later wave needs; see the bucket-boundary reasoning
+			// at the log site in MaybeLogCounters. Every delivered result counts,
+			// live or stale, for the same reason the census above does: a result
+			// later discarded as stale still meshed to a real quad count.
+			if (VoxelDebug::GetStreamLatencyStats())
+			{
+				++LevelQuadCountSinceLog[Lvl];
+				LevelQuadSumSinceLog[Lvl] += ResultQuads;
+				int32 Bucket;
+				if (ResultQuads == 0)             { Bucket = 0; }
+				else if (ResultQuads <= 255)      { Bucket = 1; }
+				else if (ResultQuads <= 1023)     { Bucket = 2; }
+				else if (ResultQuads <= 4095)     { Bucket = 3; }
+				else if (ResultQuads <= 16383)    { Bucket = 4; }
+				else                              { Bucket = 5; }
+				++LevelQuadHistSinceLog[Lvl][Bucket];
+			}
 			if (ResultQuads == 0)
 			{
 				++LevelZeroQuadSinceLog[Lvl];
@@ -9242,6 +9535,29 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		                    /*bIsGameThreadMesh*/ false, Result.GpuQuads, int32(Result.GpuQuadCount)))
 		{
 			++ProxiesCreated;
+		}
+
+		// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2):
+		// DeliverToApplyMs, immediately AFTER the apply rather than inside
+		// ApplyMeshResult itself -- that function is being edited concurrently
+		// elsewhere in this wave. Result.DeliverSeconds is 0.0 unless
+		// voxel.Stream.LatencyStats was ALSO on back when this result was made
+		// (see FJobResult::DeliverSeconds -- both producers gate that stamp on
+		// the same cvar this line checks), so this only measures a result that
+		// was actually stamped, never a false "instant apply".
+		if (VoxelDebug::GetStreamLatencyStats() && Result.DeliverSeconds > 0.0)
+		{
+			const float DeliverToApplyMs = float((FPlatformTime::Seconds() - Result.DeliverSeconds) * 1000.0);
+			if (Result.bFromGpuMesh)
+			{
+				PushLatencyMsSample(GpuDeliverToApplyMsWindow, GpuDeliverToApplyMsWindowNext,
+				                    GpuDeliverToApplyMsWindowCount, DeliverToApplyMs);
+			}
+			else
+			{
+				PushLatencyMsSample(CpuDeliverToApplyMsWindow, CpuDeliverToApplyMsWindowNext,
+				                    CpuDeliverToApplyMsWindowCount, DeliverToApplyMs);
+			}
 		}
 	}
 	LastAppliedFrac = MaxApplies > 0 ? float(Applied) / float(MaxApplies) : 0.f;
