@@ -1,0 +1,40 @@
+D6 band cross-check -- coverage, before and after.
+
+BEFORE (as first run, 2026-07-26):
+  12 probes, all PASS, and every one reported  0 cave / 0 shaft / 0 cavern.
+  The kernel's cave-segment loop, sinkhole shaft term, cavern loop, both
+  bedrock clamps and ceilSqrtU were passing VACUOUSLY -- which is the code the
+  INT64 sentinel defect lived in.
+
+  Two independent causes, the second hidden behind the first:
+    1. BandOriginI was one scalar for both axes, so a single-column probe could
+       only sit at (k, k): 64 of 4,096 columns.
+    2. Widened to all 4,096, both digest fixtures STILL had no cave anywhere.
+       They are 64 columns = 6.4 m across; the cave lattice is 25.6 m. Neither
+       contains a node. The fixtures were the bug.
+
+  Then five HAND-ALIGNED 320-column anchors (512,000 columns) found caves but
+  still zero shafts and zero caverns. That is what the constants predict:
+  shaft nodes are 1024 voxels apart and only 1 in 4 opens, so a 320-column
+  window contains an open shaft about 2% of the time. Guessing is not a method.
+
+AFTER -- fixtures placed by voxel.GPU.FindBandFixture (CPU-only search, seed
+20260719; found shaft at voxel (-896,-16336), cavern at (-4240,-16384)):
+
+  [cave-bearing]   offset window            PASS   1133 cave /    0 shaft /    0 cavern
+  [shaft-bearing]  single column rank 1     PASS      1 cave /    1 shaft /    0 cavern   score 17
+  [shaft-bearing]  single column rank 2     PASS      1 cave /    1 shaft /    0 cavern   score 17
+  [shaft-bearing]  single column rank 3     PASS      1 cave /    1 shaft /    0 cavern   score 15
+  [cavern-bearing] offset window            PASS    316 cave /    0 shaft / 1156 cavern
+  [cavern-bearing] single column rank 1-3   PASS      1 cave /    0 shaft /    1 cavern   score 16
+  [all fixtures]   asymmetric window (5,23) PASS   -- catches a dx/dy swap, which every
+                                                      square-and-diagonal window is blind to
+
+  digest 6e893ab3679a8c81 -- UNCHANGED. Band-only fixtures run outside the
+  digest loop with bMeshChain=false, so the pinned cross-toolchain gate against
+  bench/vxc_gpu.exe is untouched.
+
+STALENESS TRIPWIRE: the fixture origins are seed-dependent. If the seed moves
+they go stale QUIETLY -- the sweep keeps passing and simply reports 0 shaft /
+0 cavern again. That warning line is the tripwire; re-run
+voxel.GPU.FindBandFixture when it fires.

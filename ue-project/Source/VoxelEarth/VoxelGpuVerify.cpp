@@ -106,8 +106,41 @@ namespace
 	// change it -- turning a loud cross-toolchain gate into a re-baselining
 	// exercise. These run bMeshChain = false (the band is a pure function of the
 	// columns) so they cost columns and one reduction, not a mesh chain.
+	// Each is 320 columns (32 m) anchored so that it STRADDLES a lattice node of
+	// the feature it is named for, rather than hoping one falls inside:
+	//
+	//   cave   nodes every kCaveLatticeMm            = 25.6 m  =   256 voxels
+	//   shaft  nodes every 4 cave nodes              = 102.4 m =  1024 voxels
+	//          (kCaveShaftNodeMask 3), and only 1 IN 4 of those opens
+	//          (kCaveShaftGateMask 3) -- so a single node is a 25% chance and
+	//          two candidates are carried
+	//   cavern nodes every kCavernCoarseLatticeRatio = 204.8 m =  2048 voxels
+	//
+	// A fixture that reports zero of its feature is not a failure; the sweep
+	// says so out loud and the probes below it are then vacuous for that path.
+	// That is the whole reason these exist -- the original two fixtures were
+	// 6.4 m across against a 25.6 m lattice and reported 0/0/0 for months.
+	// EVERY ONE OF THESE ORIGINS WAS FOUND BY SEARCH, NOT CHOSEN BY EYE, and the
+	// difference is the whole point. Five hand-aligned anchors covering 512,000
+	// columns previously found zero shafts and zero caverns -- which is exactly
+	// what the constants predict, since shaft nodes are 1024 voxels apart and
+	// only 1 in 4 opens, so a 320-column window contains one about 2% of the
+	// time. voxel.GPU.FindBandFixture walks vxc::ColumnSample directly and
+	// reports coordinates; these came out of it at seed 20260719:
+	//
+	//   shaft  column at voxel (-896, -16336)
+	//   cavern column at voxel (-4240, -16384)
+	//
+	// Each fixture is 320 columns (32 m) CENTRED on its find, so the feature is
+	// interior rather than clipped by an edge.
+	//
+	// IF THE SEED CHANGES THESE GO STALE, and they go stale QUIETLY -- the sweep
+	// keeps passing, it just reports 0 shaft / 0 cavern again. That warning line
+	// is the tripwire; re-run FindBandFixture when it fires.
 	const FRegionSpec kBandOnlyRegions[] = {
-		{ TEXT("cave-bearing"), -64, -64, 320, 320 },
+		{ TEXT("cave-bearing"),    -64,    -64, 320, 320 },
+		{ TEXT("shaft-bearing"), -1056, -16496, 320, 320 },
+		{ TEXT("cavern-bearing"),-4400, -16544, 320, 320 },
 	};
 
 	FVoxelGpuRegionRequest BuildRequest(const FRegionSpec& Region,
@@ -1042,6 +1075,93 @@ namespace
 			       TEXT("the digests must match exactly."));
 		}
 	}
+
+	// Finds a band fixture that actually contains the feature you need.
+	//
+	// WHY THIS EXISTS RATHER THAN A HAND-PICKED COORDINATE. Choosing fixtures by
+	// eye is how the D6 sweep spent its whole life reporting "0 cave / 0 shaft /
+	// 0 cavern": the two digest fixtures are 6.4 m across against a 25.6 m cave
+	// lattice. Widening them to 32 m fixed CAVES, and then five hand-aligned
+	// anchors covering 512,000 columns still found ZERO shafts and ZERO caverns
+	// -- which is exactly what the constants predict. Shaft nodes sit 1024
+	// voxels apart and only 1 IN 4 opens (kCaveShaftNodeMask 3,
+	// kCaveShaftGateMask 3), so a 320-column window contains an open shaft about
+	// 2% of the time. Guessing is not a method; this searches.
+	//
+	// CPU only -- no dispatch, no RHI. It walks vxc::ColumnSample directly, so
+	// it is cheap enough to sweep kilometres and can run on any machine.
+	void FindBandFixtureCommand(const TArray<FString>& Args)
+	{
+		const int32 HalfSpanVoxels = (Args.Num() > 0) ? FMath::Max(512, FCString::Atoi(*Args[0])) : 8192;
+		const int32 Step = (Args.Num() > 1) ? FMath::Max(1, FCString::Atoi(*Args[1])) : 64;
+
+		vxc::SyntheticTileSampler Tiles(kSeed);
+		vxc::Amplifier Amp(kSeed, Tiles);
+
+		int64 BestShaftX = 0, BestShaftY = 0; bool bFoundShaft = false;
+		int64 BestCavernX = 0, BestCavernY = 0; bool bFoundCavern = false;
+		int64 Sampled = 0;
+
+		for (int64 Y = -HalfSpanVoxels; Y <= HalfSpanVoxels && !(bFoundShaft && bFoundCavern); Y += Step)
+		{
+			for (int64 X = -HalfSpanVoxels; X <= HalfSpanVoxels; X += Step)
+			{
+				const vxc::ColumnSample C = Amp.column(X, Y);
+				++Sampled;
+				if (!bFoundShaft && C.cave.shaftMarginSq > 0)
+				{
+					BestShaftX = X; BestShaftY = Y; bFoundShaft = true;
+				}
+				if (!bFoundCavern && C.cavern.count > 0)
+				{
+					BestCavernX = X; BestCavernY = Y; bFoundCavern = true;
+				}
+				if (bFoundShaft && bFoundCavern) { break; }
+			}
+		}
+
+		UE_LOG(LogVoxelGpuVerify, Log,
+		       TEXT("[FindBandFixture] sampled %lld columns on a %d-voxel grid over +/-%d voxels, seed %llu"),
+		       Sampled, Step, HalfSpanVoxels, kSeed);
+
+		// A COARSE GRID CAN MISS. Step is 64 voxels by default and a shaft is
+		// ~1.4 m (14 voxels) wide, so a miss is not proof of absence -- it is
+		// proof this sweep did not land on one. Said out loud so a "not found"
+		// is never read as "does not exist".
+		if (bFoundShaft)
+		{
+			UE_LOG(LogVoxelGpuVerify, Log,
+			       TEXT("[FindBandFixture] SHAFT column at voxel (%lld, %lld) -- a 320-wide fixture ")
+			       TEXT("centred there has origin (%lld, %lld)"),
+			       BestShaftX, BestShaftY, BestShaftX - 160, BestShaftY - 160);
+		}
+		else
+		{
+			UE_LOG(LogVoxelGpuVerify, Warning,
+			       TEXT("[FindBandFixture] no shaft column found. The grid step (%d voxels) is wider ")
+			       TEXT("than a shaft (~14 voxels), so this is a MISS, not an absence -- re-run with ")
+			       TEXT("a smaller step or a larger span."), Step);
+		}
+		if (bFoundCavern)
+		{
+			UE_LOG(LogVoxelGpuVerify, Log,
+			       TEXT("[FindBandFixture] CAVERN column at voxel (%lld, %lld) -- a 320-wide fixture ")
+			       TEXT("centred there has origin (%lld, %lld)"),
+			       BestCavernX, BestCavernY, BestCavernX - 160, BestCavernY - 160);
+		}
+		else
+		{
+			UE_LOG(LogVoxelGpuVerify, Warning,
+			       TEXT("[FindBandFixture] no cavern column found in the span searched."));
+		}
+	}
+
+	FAutoConsoleCommand GVoxelGpuFindBandFixtureCmd(
+		TEXT("voxel.GPU.FindBandFixture"),
+		TEXT("CPU-only scan for a column containing a sinkhole shaft and one containing a cavern, ")
+		TEXT("so a D6 band fixture can be placed where the feature actually is instead of guessed. ")
+		TEXT("Usage: [halfSpanVoxels=8192] [stepVoxels=64]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&FindBandFixtureCommand));
 
 	FAutoConsoleCommand GVoxelGpuVerifyRegionCmd(
 		TEXT("voxel.GPU.VerifyRegion"),
