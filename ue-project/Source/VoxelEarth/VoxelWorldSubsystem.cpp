@@ -1467,6 +1467,24 @@ bool GpuMeshEnabled()
 // is refused, the fixture having collapsed to 2 coarse bricks of z. Raising it
 // means demonstrating L5 on a fixture with more vertical relief, not editing a
 // number here.
+// How many GPU mesh jobs may be outstanding at once, budgeted separately from
+// the CPU worker cap. See the HasDispatchBudget comment in DispatchJobs for why
+// this is a different quantity from JobsInFlightPerCore and not a bigger one.
+//
+// 256 matches the manager's own cap, so neither binds before the other -- two
+// caps in series make a throughput number unattributable to either, which is
+// the same trap the ring floor sweep fell into.
+int32 GpuMeshInFlight()
+{
+	static const int32 N = []
+	{
+		int32 Value = 256;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuMeshInFlight="), Value);
+		return FMath::Clamp(Value, 1, 4096);
+	}();
+	return N;
+}
+
 int32 GpuMeshMaxLevel()
 {
 	static const int32 MaxLevel = []
@@ -6266,7 +6284,38 @@ void FVoxelWorldImpl::DispatchJobs()
 		VoxelStreamAdmission::ColdBandThrottleEnabled();
 	TArray<FSortEntry> DeferredColdBand;
 
-	while (JobsInFlightCounter.GetValue() < MaxJobsInFlight)
+	// THE GPU FORK GETS ITS OWN IN-FLIGHT BUDGET, AND THIS IS THE FIX FOR THE
+	// 3.4x COLD-FILL REGRESSION D5.3a MEASURED.
+	//
+	// MaxJobsInFlight is JobsInFlightPerCore * logical cores -- 24 on this box.
+	// That number sizes a pool of WORKERS: 24 threads each finishing a chunk in
+	// about a millisecond is ~24,000 chunks/s of capacity. It is the wrong unit
+	// for the fork. A GPU job is not a thread, it is a round trip, and at the
+	// measured ~28 ms mean a budget of 24 caps the fork near ~860 chunks/s no
+	// matter how idle the GPU is. Wave D's design pass said this in advance --
+	// "MaxJobsInFlight must now absorb latency as well as work, so it sizes
+	// against latency x rate, not worker count" -- and D5.3a then measured the
+	// fork sitting at 19-20 in flight against a manager cap of 256, waiting
+	// rather than saturated, with cold fill going 58.4 s to 205.4 s.
+	//
+	// SO GPU JOBS DO NOT CONSUME THE CPU BUDGET AT ALL. The loop condition
+	// counts only CPU-outstanding work, which leaves the CPU baseline EXACTLY
+	// what it was -- one knob at a time -- and lets the loop keep feeding the
+	// fork while worker slots are busy.
+	//
+	// The fork's own bound is applied at the fork decision instead of here, so
+	// that a chunk arriving when the GPU is full falls back to the CPU rather
+	// than stalling the loop. Both bounds are therefore explicit and neither
+	// hides the other: two caps in series make a throughput number
+	// unattributable to either, which is the trap the ring floor sweep fell
+	// into.
+	const int32 GpuMaxInFlight = VoxelStreamAdmission::GpuMeshInFlight();
+	const auto CpuJobsOutstanding = [&]() -> int32
+	{
+		return FMath::Max(0, JobsInFlightCounter.GetValue() - GpuJobsPending.Num());
+	};
+
+	while (CpuJobsOutstanding() < MaxJobsInFlight)
 	{
 		// Which ring gets this worker slot.
 		//
@@ -6647,7 +6696,11 @@ void FVoxelWorldImpl::DispatchJobs()
 			// silently wrong the day batching lands. Excluding is honest; a
 			// scalar would be a trap.
 			&& RingSkirtMask == 0
-			&& !bPredictedEmpty;          // the band already says this meshes to nothing; do not pay a dispatch
+			&& !bPredictedEmpty           // the band already says this meshes to nothing; do not pay a dispatch
+			// The fork's own bound. Applied HERE rather than in the loop
+			// condition so a chunk arriving when the GPU is full falls back to
+			// the CPU instead of stalling the whole dispatch loop.
+			&& GpuJobsPending.Num() < GpuMaxInFlight;
 
 		if (bUseGpuMesh && SubmitGpuMeshJob(LevelKey, GenId))
 		{
