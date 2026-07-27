@@ -1,0 +1,54 @@
+D5.3 -- the ring skirt on the GPU, verified over its ENTIRE input domain.
+
+WHY EXHAUSTIVE AND NOT SAMPLED. The skirt makes a chunk's mesh a function of the
+CAMERA ANCHOR -- ComputeRingSkirtMask asks which neighbours belong to a finer
+ring -- and the anchor is not part of the world seed. So the determinism digest
+STRUCTURALLY cannot cover this feature; there is no fixed expected output to
+pin. The only available gate is a direct comparison against MeshChunkBricks
+called with the same mask.
+
+The saving grace is that the domain is 16 values: four lateral faces, each on or
+off. Sixteen comparisons is not a sample of the input space, it IS the input
+space.
+
+voxel.GPU.VerifyRingSkirt 7 -3   (chunk 7,-3, surface chunk at that column)
+
+  mask  0 ()            1707 quads   PASS   [control: skirt block must be dead]
+  mask  1 (-X)          1729 quads   PASS   changed
+  mask  2 (+X)          1704 quads   PASS   changed
+  mask  3 (-X +X)       1726 quads   PASS   changed
+  ... all 16 ...
+  => all 16 byte-identical to MeshChunkBricks; 15 of 15 non-zero masks CHANGED
+     the geometry, so no case passed vacuously.
+
+At the default chunk (0,0) the same sweep passes 16/16 but only 14 of 15 masks
+change anything -- +X alone is inert there because that face's apron holds no
+solid voxels. The harness SAYS SO per mask rather than counting it as coverage,
+which is the lesson from the D6 band sweep passing twelve probes over terrain
+with no caves in it.
+
+THE GATE'S FIRST RUN FAILED ALL 16, INCLUDING MASK 0, AND THAT IS WHAT MADE IT
+DIAGNOSTIC. Quad COUNTS matched exactly for every mask while the bytes differed
+from the very first quad. Mask 0 failing is the tell: the skirt block is
+provably dead at mask 0, so the fault could not be the skirt. It was the
+harness -- RunRegionBlocking defaults to the BRICK-local emit permutation
+(Slice/U0/V0 in 0..7) while PackVoxelChunkQuad and MeshChunkBricks are
+CHUNK-local (0..31). Setting Req.bChunkLocalQuads = true fixed it. A gate whose
+control case fails is telling you about itself.
+
+SOUNDNESS OF THE SCALAR MASK. regionCellMat applies the mask against the fixed
+chunk interior [8, 40) on both lateral axes, which is where a 6-brick chunk
+dispatch puts its 4 interior bricks. That is a single-chunk assumption and it is
+NOT left as one: ValidateRegionRequest REJECTS a non-zero RingSkirtMask on any
+region that is not exactly 48x48 columns. Under batching a shared interior cell
+is one chunk's interior AND its neighbour's apron, so a single mask would
+rewrite real geometry to AIR rather than merely fail to add a wall -- holes in
+the world, from the feature whose purpose is closing them. The refusal is what
+makes the scalar sound rather than sound-for-now.
+
+CONSEQUENCE: the fork no longer excludes ring-boundary chunks. That carve-out
+was the last one apart from edits, which are routed to the game thread by
+NeedsOverlayAwarePath and are byte-identical either way (see wave-d5-dig.txt).
+
+The determinism digest is unchanged: RingSkirtMask is 0 on every bench fixture
+and 0 makes the whole block in regionCellMat dead.

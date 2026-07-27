@@ -60,7 +60,8 @@ namespace VoxelGpuMeshAsyncVerify
 	// streaming job produces it (VoxelWorldSubsystem.cpp DispatchJobs): a
 	// (32+2)^2 column grid, a sampler over it, MeshChunkBricks, no ring skirt.
 	TArray<uint64> CpuMeshChunkPacked(const vxc::Amplifier& Amp,
-	                                  const VoxelCoords::FVoxelChunkKey& Key)
+	                                  const VoxelCoords::FVoxelChunkKey& Key,
+	                                  uint8 RingSkirtMask = 0)
 	{
 		constexpr int32 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
 		constexpr int32 GridEdge = ChunkVox + 2;
@@ -86,7 +87,7 @@ namespace VoxelGpuMeshAsyncVerify
 		};
 
 		TArray<FVoxelChunkQuad> Quads;
-		MeshChunkBricks(Key, GridSampler, Quads);
+		MeshChunkBricks(Key, GridSampler, Quads, /*PerfCounters*/ nullptr, RingSkirtMask);
 
 		TArray<uint64> Packed;
 		Packed.Reserve(Quads.Num());
@@ -114,11 +115,13 @@ namespace VoxelGpuMeshAsyncVerify
 	// Builds the region request for one chunk. Shared by the async harness and
 	// the blocking control below, so the control is genuinely the SAME request.
 	FVoxelGpuRegionRequest BuildChunkRequest(vxc::SyntheticTileSampler& Tiles,
-	                                         const VoxelCoords::FVoxelChunkKey& Key)
+	                                         const VoxelCoords::FVoxelChunkKey& Key,
+	                                         uint8 RingSkirtMask = 0)
 	{
 		FVoxelGpuRegionRequest Req;
 		VoxelGpuChunkRegion::SetChunkFootprint(Req, Key.X, Key.Y, Key.Z);
 		Req.Seed = kSeed;
+		Req.RingSkirtMask = RingSkirtMask;
 		// Sized from the dispatch footprint just set, by the same code the
 		// blocking digest gate uses.
 		VoxelGpuRegionBuild::FillRasterWindow(Req, Tiles);
@@ -653,6 +656,148 @@ namespace VoxelGpuMeshAsyncVerify
 			return false;
 		}), 0.0f);
 	}
+
+	// D5.3: the ring skirt, over its ENTIRE input domain.
+	//
+	// WHY EXHAUSTIVE RATHER THAN SAMPLED, and it is not thoroughness for its own
+	// sake. The skirt makes a chunk's mesh a function of the CAMERA ANCHOR --
+	// ComputeRingSkirtMask asks which neighbours belong to a finer ring -- and
+	// the anchor is not part of the world seed. So the determinism digest
+	// STRUCTURALLY cannot cover this feature: there is no fixed expected output
+	// to pin. The only gate available is a direct comparison against
+	// MeshChunkBricks called with the same mask.
+	//
+	// The saving grace is that the domain is 16 values. Four lateral faces, each
+	// on or off. Sixteen comparisons is not a sample of the input space, it IS
+	// the input space, and that is a rare enough luxury to take rather than
+	// spend on picking a representative subset.
+	//
+	// Mask 0 is included and is the control: it must reproduce the unskirted
+	// mesh exactly, which is what proves the skirt block is genuinely dead when
+	// no face is flagged rather than merely usually harmless.
+	void VerifyRingSkirtCommand(const TArray<FString>& Args)
+	{
+		if (!VoxelGpuWorldGen::IsSupportedOnCurrentRHI())
+		{
+			UE_LOG(LogVoxelGpuAsync, Error, TEXT("GPU worldgen needs SM6. Relaunch with -sm6."));
+			return;
+		}
+
+		vxc::SyntheticTileSampler Tiles(kSeed);
+		vxc::SyntheticTileSampler CpuTiles(kSeed);
+		vxc::Amplifier CpuAmp(kSeed, CpuTiles);
+
+		const int32 Cx = (Args.Num() > 0) ? FCString::Atoi(*Args[0]) : 0;
+		const int32 Cy = (Args.Num() > 1) ? FCString::Atoi(*Args[1]) : 0;
+		const VoxelCoords::FVoxelChunkKey Key = SurfaceChunkKey(CpuAmp, Cx, Cy);
+
+		UE_LOG(LogVoxelGpuAsync, Log,
+		       TEXT("voxel.GPU.VerifyRingSkirt: chunk (%d, %d, %d), all 16 mask values against "
+		            "MeshChunkBricks with the same mask. The digest cannot cover this -- the skirt "
+		            "is a function of the camera anchor, which is not part of the seed."),
+		       Key.X, Key.Y, Key.Z);
+
+		int32 Failures = 0;
+		int32 MasksThatChangedGeometry = 0;
+		for (uint8 Mask = 0; Mask < 16; ++Mask)
+		{
+			const TArray<uint64> Cpu = CpuMeshChunkPacked(CpuAmp, Key, Mask);
+			const TArray<uint64> CpuUnskirted = (Mask == 0) ? Cpu : CpuMeshChunkPacked(CpuAmp, Key, 0);
+
+			FVoxelGpuRegionRequest Req = BuildChunkRequest(Tiles, Key, Mask);
+			// CHUNK-LOCAL, because the CPU reference is. PackVoxelChunkQuad's
+			// Slice/U0/V0 are chunk-local (0..31); the DEFAULT emit permutation
+			// writes them BRICK-local (0..7). Comparing the two gives byte
+			// mismatches from the very first quad while the counts agree
+			// exactly -- which is what this gate reported on its first run, for
+			// every mask INCLUDING zero. Mask 0 failing is what identified it as
+			// a harness fault rather than a skirt one: the skirt block is
+			// provably dead at mask 0.
+			Req.bChunkLocalQuads = true;
+			const FVoxelGpuRegionResult Gpu = VoxelGpuWorldGen::RunRegionBlocking(Req);
+			if (!Gpu.bOk)
+			{
+				UE_LOG(LogVoxelGpuAsync, Error,
+				       TEXT("[D5.3 skirt] FAIL — mask %u: dispatch failed: %s"), Mask, *Gpu.Error);
+				++Failures;
+				continue;
+			}
+
+			// The GPU emits chunk-local under voxel.GPU.MeshChunkLocal, which is
+			// the same form PackVoxelChunkQuad produces, so this is a direct
+			// byte comparison of two quad streams in the same order.
+			bool bMatch = (Gpu.Quads.Num() == Cpu.Num());
+			int32 FirstDiff = -1;
+			if (bMatch)
+			{
+				for (int32 I = 0; I < Cpu.Num(); ++I)
+				{
+					if (Gpu.Quads[I] != Cpu[I]) { bMatch = false; FirstDiff = I; break; }
+				}
+			}
+
+			// Did this mask actually DO anything? A gate where every case is
+			// vacuously equal to the control proves nothing, and the D6 sweep
+			// spent its whole life in exactly that state.
+			const bool bChanged = (Mask != 0) && (Cpu != CpuUnskirted);
+			if (bChanged) { ++MasksThatChangedGeometry; }
+
+			if (bMatch)
+			{
+				UE_LOG(LogVoxelGpuAsync, Log,
+				       TEXT("[D5.3 skirt] PASS — mask %2u (%s): %d quads, byte-identical to "
+				            "MeshChunkBricks%s"),
+				       Mask,
+				       *FString::Printf(TEXT("%s%s%s%s"),
+				                        (Mask & 1) ? TEXT("-X ") : TEXT(""),
+				                        (Mask & 2) ? TEXT("+X ") : TEXT(""),
+				                        (Mask & 4) ? TEXT("-Y ") : TEXT(""),
+				                        (Mask & 8) ? TEXT("+Y") : TEXT("")),
+				       Cpu.Num(),
+				       (Mask == 0) ? TEXT(" [control: skirt block must be dead]")
+				                   : (bChanged ? TEXT(" [changed geometry vs mask 0]")
+				                               : TEXT(" [WARNING: identical to mask 0 -- this face "
+				                                      "had no apron to rewrite, so the case is "
+				                                      "vacuous here]")));
+			}
+			else
+			{
+				UE_LOG(LogVoxelGpuAsync, Error,
+				       TEXT("[D5.3 skirt] FAIL — mask %u: gpu %d quads vs cpu %d, first differing "
+				            "quad %d"),
+				       Mask, Gpu.Quads.Num(), Cpu.Num(), FirstDiff);
+				++Failures;
+			}
+		}
+
+		if (Failures == 0 && MasksThatChangedGeometry == 0)
+		{
+			UE_LOG(LogVoxelGpuAsync, Warning,
+			       TEXT("[D5.3 skirt] all 16 masks matched, but NOT ONE changed the geometry at "
+			            "this chunk -- every non-zero case was vacuously equal to mask 0. Pick a "
+			            "chunk whose lateral aprons actually contain solid voxels: "
+			            "voxel.GPU.VerifyRingSkirt <cx> <cy>."));
+		}
+		else if (Failures == 0)
+		{
+			UE_LOG(LogVoxelGpuAsync, Log,
+			       TEXT("[D5.3 skirt] PASS — all 16 mask values byte-identical to MeshChunkBricks; "
+			            "%d of 15 non-zero masks changed the geometry."),
+			       MasksThatChangedGeometry);
+		}
+		else
+		{
+			UE_LOG(LogVoxelGpuAsync, Error,
+			       TEXT("[D5.3 skirt] FAIL — %d of 16 mask values disagree."), Failures);
+		}
+	}
+
+	FAutoConsoleCommand GVoxelGpuVerifyRingSkirtCmd(
+		TEXT("voxel.GPU.VerifyRingSkirt"),
+		TEXT("D5.3: byte-compare the GPU ring skirt against MeshChunkBricks for ALL 16 mask "
+		     "values -- the feature's entire input domain, which the determinism digest cannot "
+		     "cover because the skirt depends on the camera anchor. Usage: [chunkX=0] [chunkY=0]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&VerifyRingSkirtCommand));
 
 	FAutoConsoleCommand GVoxelGpuVerifyAsyncMeshControlCmd(
 		TEXT("voxel.GPU.VerifyAsyncMesh.Control"),

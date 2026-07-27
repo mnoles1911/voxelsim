@@ -440,6 +440,7 @@ int BrickZMin;
 uint BricksZ;
 uint ScanCount;
 uint CoarseScale;
+uint RingSkirtMask;
 #else
 cbuffer WorldGenParams : register(b0)
 {
@@ -461,6 +462,10 @@ cbuffer WorldGenParams : register(b0)
                             // below for why that is arithmetic rather than a
                             // promise. The HOST computes 1 << level so this
                             // file contains no variable shift; see coarseRep.
+    uint RingSkirtMask;     // (D5.3) ring-boundary skirt, bit per lateral face:
+                            // 1=-X 2=+X 4=-Y 8=+Y. ZERO for every dispatch that
+                            // is not an inward ring boundary, which is nearly
+                            // all of them. See regionCellMat.
 };
 #endif
 
@@ -1510,6 +1515,38 @@ uint3 maskChunkLocalOrigin(uint maskIndex)
 // halo brick).
 uint regionCellMat(int3 rv)
 {
+    // RING-BOUNDARY SKIRT (D5.3). Mirrors the CPU sampler in
+    // VoxelChunkMesher.h: when a lateral face of THIS render chunk is a ring
+    // boundary, report the apron beyond it as AIR so the mesher emits the
+    // retaining wall that closes the cascade seam. Without it a coarse ring's
+    // inward edge is see-through.
+    //
+    // Only reads OUTSIDE the chunk are affected -- interior cells and internal
+    // brick borders are untouched -- so a chunk with no flagged face is
+    // byte-for-byte what it was before this existed. RingSkirtMask is 0 for
+    // every dispatch that is not an inward ring boundary, which is nearly all
+    // of them, and 0 makes this whole block dead.
+    //
+    // THE CHUNK INTERIOR IS CELLS [8, 40) ON BOTH LATERAL AXES: a chunk
+    // dispatch is 6 bricks per axis with one brick of halo, so the 4 interior
+    // bricks start at cell 8 and span 32. That is a SINGLE-CHUNK assumption and
+    // it is not left as one -- ValidateRegionRequest REJECTS a non-zero
+    // RingSkirtMask on any region that is not exactly one chunk. The reason is
+    // that under batching a shared interior cell is one chunk's interior AND
+    // its neighbour's apron, so a single mask would corrupt real geometry
+    // rather than merely fail to add a wall. Refusing is what makes the scalar
+    // sound instead of merely sound-for-now.
+    if (RingSkirtMask != 0u)
+    {
+        if (((RingSkirtMask & 1u) && rv.x <  8) ||
+            ((RingSkirtMask & 2u) && rv.x >= 40) ||
+            ((RingSkirtMask & 4u) && rv.y <  8) ||
+            ((RingSkirtMask & 8u) && rv.y >= 40))
+        {
+            return 0u;   // MAT_AIR
+        }
+    }
+
     const uint bx = (uint)(rv.x >> 3), by = (uint)(rv.y >> 3), bz = (uint)(rv.z >> 3);
     const uint lx = (uint)(rv.x & 7), ly = (uint)(rv.y & 7), lz = (uint)(rv.z & 7);
     const uint bricksX = DispatchColumns.x / 8u;

@@ -291,8 +291,11 @@ struct WorldGenParamsCB {
     // every bench fixture behaves as it did before this field existed -- and
     // the digest is what proves that rather than the claim.
     uint32_t CoarseScale;
+    // D5.3 ring-boundary skirt; 0 for every bench fixture, and 0 makes the
+    // whole block in regionCellMat dead, so the digest is unaffected.
+    uint32_t RingSkirtMask;
 };
-static_assert(sizeof(WorldGenParamsCB) == 60, "WorldGenParamsCB must match the HLSL cbuffer layout");
+static_assert(sizeof(WorldGenParamsCB) == 64, "WorldGenParamsCB must match the HLSL cbuffer layout");
 
 // Host half of the 2026-07 cross-vendor UB hardening pass. worldgen.ush now
 // guards these in-shader (it returns without writing rather than executing an
