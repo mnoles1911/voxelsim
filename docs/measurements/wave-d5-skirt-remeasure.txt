@@ -19,14 +19,28 @@ AND at peak residency.
 
   fork is ~32% faster (42.4 vs 62.5), spread 0.1 s within BOTH configs.
 
-TWO THINGS I AM NOT GLOSSING.
+RETRACTED: "ONE LEG IN FOUR DID NOT FINISH". That was MY HARNESS, not the fork,
+and the time series says so plainly. fork 2 was still filling when it died --
+loaded went 41,968 -> 42,625 in its final two seconds, with pending RISING from
+78 to 174. Nothing was stalled.
 
-1. ONE LEG IN FOUR DID NOT FINISH. fork 2 reached 42,625 of 43,328 -- 98.4% --
-   inside a 300 s budget and stopped there. Three of four reached full peak in
-   42.3-42.4 s, so this is a tail rather than the typical case, but it is a real
-   tail and it did not appear in the pre-skirt runs.
+The inline PowerShell loop used for these runs breaks on the first
+"jobsInFlight=0 pendingJobs=0" it sees. At t=30.3 s that was true as a TRANSIENT
+LULL mid-fill (loaded=39,328 of 43,328), so the loop slept 8 s and killed the
+process at t=38.4 s while the cascade was still building.
 
-2. A 7,395 ms SUBMIT->DELIVER OUTLIER, which is ABOVE kBlindJobMarkTimeoutSeconds
+This is the SAME artefact already found and fixed once in tools/wave-f-coldfill.ps1
+-- "a lull is not a finish line" -- and it came back because these runs were
+driven by a fresh ad-hoc loop rather than that script. The fix exists; it was not
+used. fork 3 shows what a real completion looks like: pending reaches 0 at
+t=42.3 s with loaded=43,328 and the run continues to 54.5 s.
+
+So: FOUR of four legs were fine, three measured (42.4 / 42.3 / 42.4 s) and one
+void. There is no residency tail.
+
+ONE THING THAT IS STILL REAL AND NOT RETRACTED.
+
+A 7,395 ms SUBMIT->DELIVER OUTLIER, which is ABOVE kBlindJobMarkTimeoutSeconds
    (5.0 s). gpuLatencyTimeouts stayed 0 -- that counter only fires for a
    footprint whose band mark is outstanding, and a footprint with a cached band
    has no mark to time out -- so the backstop was not tripped, but the latency
