@@ -90,7 +90,7 @@ TAutoConsoleVariable<int32> CVarVoxelWaterMaxActiveBricks(
 // representation they were built with, and unload the way they loaded.
 TAutoConsoleVariable<bool> CVarVoxelWaterGpu(
 	TEXT("voxel.Water.GPU"),
-	false,
+	true,   // 2026-07-27: ON for the manual PIE evaluation. See voxel.Stream.GPU.
 	TEXT("Route active + implicit water surface geometry through its own ADR-0006 GPU pool (ONE primitive, ONE ")
 	TEXT("draw) instead of one UWaterChunkComponent per vxc::WaterBrick8. Default false. Independent of ")
 	TEXT("voxel.Stream.GPU -- water is a separate pool with a separate, translucent material."),
@@ -243,7 +243,7 @@ TAutoConsoleVariable<int32> CVarVoxelStreamGpuMaxChunks(
 // it on for anyone measuring the streaming side. See docs/streaming-handoff.md.
 TAutoConsoleVariable<bool> CVarVoxelStreamGpu(
 	TEXT("voxel.Stream.GPU"),
-	false,
+	true,   // 2026-07-27: ON for the manual PIE evaluation. See the note below.
 	TEXT("Route chunk geometry through the ADR-0006 GPU pool (ONE primitive, ONE draw) instead of one scene ")
 	TEXT("component per chunk. Default FALSE: the pool has no per-chunk frustum culling, so it pays for every ")
 	TEXT("resident quad regardless of where the camera looks, and measures 23%% slower at p50 on a settled ")
