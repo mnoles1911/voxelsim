@@ -1,0 +1,50 @@
+D5.2 -- GPU coarse generation against vxc::coarseColumns + makeCoarseBrick.
+voxel.GPU.VerifyCoarse 5, seed 20260719. Columns, cells AND quads compared.
+
+  L0 [origin]        PASS  4096 columns, 3424 quads, 6 bricks deep
+  L0 [far-negative]  PASS  4096 columns, 3244 quads, 6 bricks deep
+  L1 [origin]        PASS  4096 columns, 3354 quads, 5 bricks deep
+  L1 [far-negative]  PASS  4096 columns, 3411 quads, 6 bricks deep
+  L2 [origin]        PASS  4096 columns, 3383 quads, 6 bricks deep
+  L2 [far-negative]  PASS  4096 columns, 2690 quads, 5 bricks deep
+  L3 [origin]        PASS  4096 columns, 3384 quads, 5 bricks deep
+  L3 [far-negative]  PASS  4096 columns, 5302 quads, 7 bricks deep
+  L4 [origin]        PASS  4096 columns, 4089 quads, 6 bricks deep
+  L4 [far-negative]  PASS  4096 columns, 3063 quads, 5 bricks deep
+  L5 [origin]        PASS  4096 columns, 2420 quads, 4 bricks deep
+  L5 [far-negative]  DISPATCH REFUSED -- "Mesh chain needs >= 3 bricks per axis
+                     (have 8, 8, 2)". The fixture's terrain collapses to 2 coarse
+                     bricks of z at this scale and the halo leaves no interior
+                     brick. That is the FIXTURE degenerating, not the coarse path
+                     failing: L5 [origin] passed on the same build.
+
+  => levels 0-4 bit-exact on both fixtures. Level 5 is demonstrated on one
+     fixture and NOT demonstrated on the other, so it is UNPROVEN rather than
+     broken, and voxel.Stream.GPUMaxLevel should not exceed 4 until a fixture
+     with more vertical relief shows it.
+
+TWO BUGS THIS GATE FOUND ON ITS FIRST RUNS, both in the harness/plumbing rather
+than in the kernel, and both silent:
+
+1. RASTER WINDOW SIZED IN LEVEL-0 VOXELS. At level L a dispatch samples over a
+   span 2^L wider than its column count, so the window was far too narrow and
+   the kernel CLAMPED reads to its edge -- exactly the failure
+   VoxelGpuRegionBuild.h's own header warns about, and it does not fault, it
+   just silently produces different terrain.
+     signature: [origin] passed columns AND cells at L1 (small coordinates, the
+     margin still covered it) while [far-negative] reported 12,288 column and
+     108,470 cell mismatches. A bug in coarseRep itself would have failed both.
+
+2. Req.CoarseLevel WAS SET AFTER FillRasterWindow READ IT. The fix above was a
+   no-op for one whole run and the numbers did not move at all -- which looked
+   like the hypothesis being wrong rather than the fix not having been applied.
+   Same ordering class as SetChunkTableCapacity-after-RegisterComponent.
+
+3. CPU QUAD REFERENCE SAMPLED AT LEVEL-0 z. Once columns and cells were exact,
+   the quad comparison read "cpu=0 gpu=3354", which at a glance reads as the GPU
+   inventing geometry. It was the reference not being asked for any: at coarse z
+   every sample came back solid, no face had an air neighbour, so meshBrick
+   emitted nothing.
+
+The pinned level-0 digest 6e893ab3679a8c81 is untouched throughout -- this
+command builds its own throwaway digests and compares GPU against CPU directly.
