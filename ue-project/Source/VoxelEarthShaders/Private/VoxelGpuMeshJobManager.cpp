@@ -102,6 +102,25 @@ static FAutoConsoleVariableRef CVarVoxelGpuMeshHarvestCap(
 	TEXT("cost, and with 150-256 jobs in flight one poll could do all of them."),
 	ECVF_Default);
 
+// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2): gates the one NEW
+// FPlatformTime::Seconds() call this item adds (FJob::PromotedSeconds, stamped
+// in Tick's promote loop) -- the instrument must not be able to become what is
+// being measured. This module has no VoxelDebug dependency (that is a
+// VoxelEarth-module type), so it uses this file's own G.../CVarRef idiom
+// instead of a VoxelDebug:: accessor. Off by default; the streaming-side
+// voxel.Stream.LatencyStats is the one meant to be flipped for a leg -- this
+// one exists to be flipped alongside it if the mesh-job manager is ever
+// exercised standalone (e.g. a future bench harness) without the streaming
+// module above it.
+static int32 GVoxelGpuMeshLatencyStats = 0;
+static FAutoConsoleVariableRef CVarVoxelGpuMeshLatencyStats(
+	TEXT("voxel.GPU.MeshLatencyStats"),
+	GVoxelGpuMeshLatencyStats,
+	TEXT("Stamp FJob::PromotedSeconds (Submit -> promoted out of Queued in Tick), which feeds ")
+	TEXT("FVoxelGpuMeshJobResult::QueuedMs. Default 0. Game thread only (Tick() already requires it), ")
+	TEXT("so no thread-safety concern reading this cvar directly where it is checked."),
+	ECVF_Default);
+
 // Defined here rather than in a file of its own because this is the only place
 // that CREATES one, and because the release it performs is the mirror of
 // ReleaseReadbacksOnRenderThread below -- the two should be read together.
@@ -283,6 +302,12 @@ struct FVoxelGpuMeshJobManager::FJob
 	double SubmitSeconds = 0.0;
 	double DispatchSeconds = 0.0;
 	double ReadySeconds = 0.0;
+	// S0-3: Submit() to the moment this job left the Queued array in Tick's
+	// promote loop -- i.e. how long it waited behind MaxInFlight before a slot
+	// opened. Stamped only under voxel.GPU.MeshLatencyStats (see that cvar);
+	// 0.0 otherwise, which Deliver()'s existing non-zero guard already treats
+	// as "not measured" the same way it does for DispatchSeconds/ReadySeconds.
+	double PromotedSeconds = 0.0;
 
 	void SetState(EJobState New) { State.store(int32(New), std::memory_order_release); }
 	EJobState GetState() const { return EJobState(State.load(std::memory_order_acquire)); }
@@ -495,10 +520,23 @@ void FVoxelGpuMeshJobManager::Deliver(const FJobPtr& Job, EVoxelGpuMeshJobStatus
 	Result.UserTag = Job->UserTag;
 	Result.Status = Status;
 	Result.Error = Error;
-	Result.SubmitToDeliverMs = (FPlatformTime::Seconds() - Job->SubmitSeconds) * 1000.0;
+	const double DeliverSeconds = FPlatformTime::Seconds();
+	Result.SubmitToDeliverMs = (DeliverSeconds - Job->SubmitSeconds) * 1000.0;
 	if (Job->ReadySeconds > 0.0 && Job->DispatchSeconds > 0.0)
 	{
 		Result.DispatchToReadyMs = (Job->ReadySeconds - Job->DispatchSeconds) * 1000.0;
+	}
+	// S0-3. Both computed from timestamps that already exist by the time this
+	// runs (or are 0.0 under voxel.GPU.MeshLatencyStats off, in which case the
+	// guard below leaves the result at its 0.0 default -- same "not measured"
+	// convention as DispatchToReadyMs above).
+	if (Job->PromotedSeconds > 0.0 && Job->SubmitSeconds > 0.0)
+	{
+		Result.QueuedMs = (Job->PromotedSeconds - Job->SubmitSeconds) * 1000.0;
+	}
+	if (Job->ReadySeconds > 0.0)
+	{
+		Result.ReadyToDeliverMs = (DeliverSeconds - Job->ReadySeconds) * 1000.0;
 	}
 
 	if (Status == EVoxelGpuMeshJobStatus::Success)
@@ -575,6 +613,16 @@ void FVoxelGpuMeshJobManager::Tick()
 	{
 		FJobPtr Job = Queued[0];
 		Queued.RemoveAt(0, EAllowShrinking::No);
+
+		// S0-3: this IS "promoted out of Queued", whichever way the job goes
+		// from here -- into the batch below or straight to Rejected. Stamping
+		// before the validation checks means a rejected job's QueuedMs still
+		// describes real queueing time, not a zero from a job that was never
+		// actually going to run.
+		if (GVoxelGpuMeshLatencyStats != 0)
+		{
+			Job->PromotedSeconds = FPlatformTime::Seconds();
+		}
 
 		FString ValidationError;
 		if (!VoxelGpuWorldGen::IsSupportedOnCurrentRHI())

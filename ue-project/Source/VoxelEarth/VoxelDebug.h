@@ -274,6 +274,18 @@ namespace VoxelDebug
 	// See the coverage block in FVoxelWorldImpl::MaybeLogCounters.
 	VOXELEARTH_API bool GetStreamCoverageVerify();
 
+	// voxel.Stream.LatencyStats (S0-3, docs/speculative-generation-plan.md Wave
+	// S0 / docs/streaming-perf-implementation-plan.md T0-2): per-producer,
+	// per-stage submit->apply latency windows (QueuedMs, DispatchToReadyMs,
+	// ReadyToDeliverMs, SubmitToDeliverMs, DeliverToApplyMs for the GPU fork;
+	// the worker-arm equivalent end-to-end figure and its own DeliverToApplyMs
+	// for the CPU path) plus the per-level quad-count distribution. Default 0.
+	// Gates the window bookkeeping and the new log lines only -- see the cvar's
+	// source comment for why. Exists to tell a genuine per-job GPU cost apart
+	// from Little's-law queue depth (deep-review-streaming-perf-2026-07-27.md
+	// S1d) before believing either explanation.
+	VOXELEARTH_API bool GetStreamLatencyStats();
+
 	// voxel.Render.CastShadow: do terrain chunks render into the directional
 	// light's shadow-depth pass (PR #95)? Default true. Exists to A/B the
 	// render-thread cost of terrain shadows on ONE primitive flag -- see the

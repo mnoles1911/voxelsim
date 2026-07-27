@@ -223,6 +223,32 @@ struct FVoxelGpuMeshJobResult
 	// cap, the render thread being a frame behind, and the poll quantisation.
 	double SubmitToDeliverMs = 0.0;
 
+	// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2): the two stage
+	// splits that tell a genuine per-job GPU cost apart from Little's-law
+	// queueing (deep-review-streaming-perf-2026-07-27.md S1d) -- SubmitToDeliverMs
+	// alone cannot distinguish "this job is slow" from "this job waited behind a
+	// deep queue". Both are 0.0 unless voxel.GPU.MeshLatencyStats is on: the
+	// manager's own timestamps this relies on (FJob::PromotedSeconds) are only
+	// stamped under that cvar, so a stats-off run reports these as unmeasured
+	// rather than as a false zero.
+	//
+	// Submit() to the moment this job was promoted out of the manager's Queued
+	// array in Tick(). This is QUEUE WAIT ONLY -- time spent behind MaxInFlight
+	// with no GPU work happening yet. It does NOT mean "this job is cheap to
+	// run"; a QueuedMs-dominated SubmitToDeliverMs means the fork is depth-bound
+	// at the current MaxInFlight/throughput ratio, not that any one job costs
+	// little.
+	double QueuedMs = 0.0;
+	// First observed IsReady()==true (FJob::ReadySeconds, stamped in
+	// PollInFlight phase 1 -- see that stamp's own comment for why it is BEFORE
+	// the harvest budget check) to this Deliver() call. This is POLL
+	// QUANTISATION PLUS HARVEST-BUDGET DEFERRAL, not GPU work -- the GPU
+	// finished before ReadySeconds was even stamped. It does NOT mean the
+	// harvest copy itself is slow; a job deferred by voxel.GPU.MeshHarvestCap
+	// sits here, ready and waiting, for however many ticks the budget stays
+	// exhausted.
+	double ReadyToDeliverMs = 0.0;
+
 	bool IsOk() const { return Status == EVoxelGpuMeshJobStatus::Success; }
 };
 

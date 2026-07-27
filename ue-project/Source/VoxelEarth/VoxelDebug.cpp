@@ -250,6 +250,23 @@ TAutoConsoleVariable<int32> CVarVoxelStreamCoverageVerify(
 	TEXT("re-walks every ring's annulus."),
 	ECVF_Default);
 
+// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2). Off by default:
+// the window bookkeeping this gates adds new FPlatformTime::Seconds() calls
+// (FJobResult::DeliverSeconds on both producer arms) on top of timestamps that
+// already exist elsewhere, and the instrument must not be able to become part
+// of what it measures. Flip on for one leg per arm when comparing QueuedMs
+// against DispatchToReadyMs/ReadyToDeliverMs -- see MaybeLogCounters for the
+// log line shape.
+TAutoConsoleVariable<int32> CVarVoxelStreamLatencyStats(
+	TEXT("voxel.Stream.LatencyStats"),
+	0,
+	TEXT("Per-producer, per-stage submit->apply latency windows (p50/p95/max over a 256-sample ring, same ")
+	TEXT("idiom as the existing worker-ms window) plus the per-level quad-count distribution. GPU arm: ")
+	TEXT("QueuedMs, DispatchToReadyMs, ReadyToDeliverMs, SubmitToDeliverMs, DeliverToApplyMs. CPU worker arm: ")
+	TEXT("its existing end-to-end JobMs isolated from the GPU population, plus its own DeliverToApplyMs. ")
+	TEXT("Default 0. Diagnostic only -- one standard leg per arm with this on is what Wave S0 closes on."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarVoxelStreamGpuMaxChunks(
 	TEXT("voxel.Stream.GPUMaxChunks"),
 	0,
@@ -694,6 +711,11 @@ int32 VoxelDebug::GetStreamApplyStageStats()
 bool VoxelDebug::GetStreamCoverageVerify()
 {
 	return CVarVoxelStreamCoverageVerify.GetValueOnGameThread() != 0;
+}
+
+bool VoxelDebug::GetStreamLatencyStats()
+{
+	return CVarVoxelStreamLatencyStats.GetValueOnGameThread() != 0;
 }
 
 bool VoxelDebug::GetRenderCastShadow()
