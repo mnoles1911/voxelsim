@@ -86,6 +86,7 @@ FVoxelQuadVertex DecodeVoxelQuadVertex(uint2 PackedQuad, uint CornerIndex, float
 	//   position corner 2 (u1,v1) -> ao bits 6-7
 	//   position corner 3 (u1,v0) -> ao bits 2-3
 	const uint AoShiftForCorner[4] = { 0u, 4u, 6u, 2u };
+	// lint-shader-ub: allow VARIABLE_SHIFT - Corner is 0..3 by construction (winding tables above) and the shift table holds only 0/4/6/2, all < 32
 	const uint AoRaw = (Ao >> AoShiftForCorner[Corner]) & 0x3u;
 
 	FVoxelQuadVertex Out;

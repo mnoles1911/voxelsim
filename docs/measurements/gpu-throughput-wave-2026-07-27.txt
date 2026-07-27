@@ -1,0 +1,187 @@
+GPU throughput wave -- day-after the ring-gap night. Dispatch-cadence A/B
+(negative), two refill-oscillation defects found and fixed, and D1 (no-readback
+GPU meshing) shipped, all on REAL terrain.
+
+Anchor: -VoxelSpawnAt=-84480,53760 (same tile-coverage centre as the ring-gap
+night -- see docs/measurements/ring-gap-2026-07-27.txt for why origin spawns
+are flat-plane and worthless).
+Flight: -VoxelPerfFlight=line, 90 s preflight pinned at spawn while the
+cascade warms, 120 s flight at 20 m/s heading +X, 60 s linger pinned. This is
+the STANDARD LEG for everything below unless a section says otherwise; it is
+not restated per table.
+
+GPU = mesh fork default-on (caps 4/8, JobsInFlightPerCore=8, both carried
+from the ring-gap night's shipped defaults); CPU = -VoxelNoGpuMesh. hitches /
+chunks / p50 / p95 are the VoxelPerfRun complete line.
+
+================================================================================
+1. Dispatch cadence A/B (voxel.Stream.DispatchAfterDrain) -- NEGATIVE
+================================================================================
+
+With JobsInFlightPerCore already at 8 (shipped last night), does a second
+same-frame dispatch after the drain step buy anything on top of the 8-deep
+in-flight buffer?
+
+  leg                               hitches   chunks    p95
+  CPU DispatchAfterDrain=1               22    92249   23.86
+  CPU DispatchAfterDrain=0 (control)      8    92080   23.69
+  GPU DispatchAfterDrain=1                7    89666       -
+  GPU, prior leg w/o the feature          8    89588       -
+
+(GPU comparator is the ring-gap night's 4/8-repeat leg, same profile, same
+fork caps, feature not yet built.)
+
+Verdict: +0.2% chunks on CPU (inside noise) for +14 hitches -- a net loss. GPU
+arm is indistinguishable from the night before the feature existed (89,666 vs
+89,588, 7 vs 8 hitches). The 8-deep in-flight buffer already absorbs the
+intra-frame drain; a second same-frame dispatch just lands more work inside
+frames that are already busy, which is where the extra CPU hitches come from.
+
+SHIPPED DEFAULT: voxel.Stream.DispatchAfterDrain=0. Kept in the tree as a
+lever for cold-fill work, where the queue sits perpetually saturated rather
+than draining and refilling once a frame -- that regime is NOT covered by
+this A/B and remains untested.
+
+================================================================================
+2. The refill oscillation -- two defects found, both fixed
+================================================================================
+
+Neither defect showed up in a perf-run summary line. Both were found by
+reading the B1 baseline log line-by-line for ring-level refill triggers after
+the numbers looked fine on paper.
+
+--------------------------------------------------------------------------------
+2a. One-way latch on TruncatePendingJobQueue
+--------------------------------------------------------------------------------
+
+`if (bHeldBack) return;` was a GLOBAL early-return gating what should have
+been a PER-LEVEL flag clear. R0 overflows its ring share on essentially every
+flight call, so the global flag never went false, which meant no ring's
+bAdmissionDeferredWork could ever clear -- not just R0's. R4 and R5 latched
+once, around t~101s, and then their refill triggers free-ran every time their
+own queues emptied, unrelated to whether they had anything to gain from it:
+428 and 421 full-annulus rescans respectively in a 14 s burst, for a combined
+~1.7 admitted chunks per scan.
+
+FIX: per-ring held-back attribution. The global early-return survives only
+under -VoxelRingQuota=0, where per-ring attribution genuinely does not exist
+(there are no ring shares to overflow individually).
+
+--------------------------------------------------------------------------------
+2b. The bigger one: the cold-band discount was an identity
+--------------------------------------------------------------------------------
+
+The drained-queue refill has a cold-band discount, `Num() <= ColdBandHeldThisFrame`,
+meant to skip refilling a queue that's only "empty" because this frame's
+cold-band throttle is holding it back -- not because it has genuine room.
+But when the throttle holds R0's WHOLE queue, DrainUnloads re-appends the
+held entries to that same queue, which makes the discount comparison an
+identity (Num() == ColdBandHeldThisFrame, always). Guard never fires. R0
+refilled EVERY TICK for 110 seconds straight: measured ~237,600 candidate
+rejections/s, ~30,000 record adds+erases/s, and R0 residency collapsing from
+2,024 chunks to 92 mid-flight.
+
+FIX: a genuine-room guard -- no refill when the queue already sits at its
+ring-share cap, since a refill into an already-capped queue is pure
+truncation churn regardless of what put the entries there.
+
+Churn validation (from the D1 matrix legs below, whole-run candidatesRejected
+sums vs the pre-fix build's FLIGHT-ONLY sums of 18-27M -- so the real
+improvement is larger than the ratio reads):
+
+   arm        whole-run rejected   pre-fix flight-only
+   GPU        16.0M / 15.9M        19.9M (A1)
+   CPU        14.2M                27.3M (B1)
+
+CPU roughly halved even against the smaller flight-only baseline window; the
+free-running per-tick R0 refill is gone. Rejections that remain come from the
+ordinary crossing-gate scans against the ring-share cap -- structural to the
+bounded-admission design, not a loop.
+
+================================================================================
+3. D1 -- no-readback GPU meshing (voxel.GPU.MeshDirectToPool, default 1)
+================================================================================
+
+Quads never leave the GPU. Phase 2 of a completed mesh job used to be a
+readback into a CPU array; it is now a GPU->GPU compaction instead -- the
+pool component copies quads and chunk-ids straight into the allocated pool
+range with a compute pass recorded at the head of the same render command
+that publishes the range as drawable. The only thing that still crosses PCIe
+is the 4-byte quad total.
+
+Eliminated per chunk: ~26 KB of PCIe transfer, two thread-local memcpys, one
+full CPU round trip, and two poll quanta off the ~225 ms median
+submit->deliver latency.
+
+GI is the one CPU consumer of quad bytes and keeps the readback path via a
+level-0-in-radius gate (WantsChunkQuads). With shipped ring sizes and GI on,
+level 0 stays on readback and the direct path covers levels 1-5 -- roughly
+80% of resident chunks by count.
+
+Correctness gate: voxel.GPU.VerifyPoolWrite K N -- meshes K chunks direct,
+reads the POOL buffer back, byte-compares it against MeshChunkBricks, checks
+chunk ids and a guard band, control leg run on the same binary.
+
+Gates (all three run this wave, same binary):
+
+   voxel.GPU.VerifyPoolWrite 16 4 (direct):  PASS -- 16/16 byte-identical to
+       MeshChunkBricks in the POOL buffer, 16 written GPU-side / 0 readback,
+       quadFail=0 idFail=0 guardFail=0 dropped=0
+   voxel.GPU.VerifyPoolWrite 16 4 (control, MeshDirectToPool 0):  PASS --
+       16/16 byte-identical, 0 GPU-side / 16 readback (the harness itself
+       warns the control says nothing about D1 -- correct)
+   voxel.GPU.VerifyAsyncMesh 64 8 (regression, MeshDirectToPool 0):  PASS --
+       64/64 byte-identical, quads gpu 88,860 == cpu 88,860
+
+D1 matrix (standard leg, GI on, shipped 64 m rings -- so level 0 is on the
+readback path via the GI gate and the direct path is carrying levels 1-5):
+
+   arm                     hitches   chunks   p50     p95    holes(converged)
+   GPU direct (default)          9    89253   14.96   23.94   0
+   GPU direct (repeat)           8    89346   14.97   23.80   0
+   GPU readback (control)        8    89288   15.05   23.83   0
+   CPU (-VoxelNoGpuMesh)         7    92763   13.99   23.57   0
+
+THROUGHPUT-NEUTRAL ON THIS PROFILE, AND THAT IS THE EXPECTED SHAPE, not a
+disappointment to bury: the fork caps already removed the render-thread
+bottleneck this leg can see, and with GI on at 64 m rings the quad-heavy
+level-0 stream still takes the readback path. What D1 removed -- ~26 KB of
+PCIe + two thread-local memcpys per level-1-5 chunk, one full GPU round trip
+and two poll quanta of delivery latency -- shows up on this profile as parity
+at lower bus traffic, and is positioned to show up as TIME at the 128 m
+cascade, with GI off, or on narrower PCIe than this box. Those are the legs
+to run when one of those configs matters.
+
+================================================================================
+4. Also shipped
+================================================================================
+
+  * -VoxelPoolCapacityQuads: latched override for the mesh-quad pool
+    capacity, plus a latched Error log on first pool saturation or alloc
+    failure. Previously silent -- the 128 m real-terrain saturation from the
+    ring-gap night (residentQuads pinned at exactly kPoolCapacityQuads) threw
+    no diagnostic at all; it had to be noticed by reading the number.
+  * Fork caps (MeshBatchCap=4 / MeshHarvestCap=8) and JobsInFlightPerCore=8
+    carried forward from the ring-gap night as the baseline for every leg in
+    this wave -- not re-swept here.
+  * MSVC note, worth a line so it isn't rediscovered: an in-class `= default`
+    constructor on a struct holding a TRefCountPtr<T> where T is only
+    forward-declared instantiates the member destructor in every including
+    translation unit, because the compiler needs T's destructor to be
+    complete at the point it synthesizes the special members. Both special
+    members (constructor and destructor) have to move out of line, into a
+    .cpp where T is complete, or every TU that includes the header pays the
+    instantiation and (with T incomplete) fails to compile.
+
+================================================================================
+Commits
+================================================================================
+
+  9be142b  Dispatch after drain, pool saturation Error, -VoxelPoolCapacityQuads
+  58779af  D1: no-readback GPU meshing -- quads never leave the GPU
+           (also carries the section 2 refill-loop fixes: per-level
+           held-back clear, genuine-room guard on the drained-queue refill)
+
+See docs/measurements/ring-gap-2026-07-27.txt for the night this wave sits on
+top of -- shipped fork caps, JobsInFlightPerCore default, and the resurrection
+fix that this wave's standard leg inherits without re-measuring.
