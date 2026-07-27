@@ -3069,6 +3069,11 @@ struct FVoxelWorldImpl
 	int64 TotalChunksUnloaded = 0;
 	int64 TotalQuadsLoaded = 0;
 	float LogTimerAccumSeconds = 0.f;
+	// S0-2: TotalChunksLoaded as of the previous MaybeLogCounters window, so
+	// the periodic log can report a per-window rate (apply rate decaying
+	// across a leg is the §2.2 prediction this counter tests) rather than
+	// only the leg-long mean TotalChunksLoaded already gives.
+	int64 ChunksLoadedAtLastLog = 0;
 
 	// --- Debug-tooling instrumentation (docs/debug-tooling-plan.md P1) -------
 
@@ -4311,6 +4316,11 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	{
 		return;
 	}
+	// The actual elapsed window (>= LogIntervalSeconds by at most one frame,
+	// per the "Voxel tick budget" comment below) -- captured before the reset
+	// so the S0-2 chunks/s figure divides by what really elapsed, not the
+	// nominal interval.
+	const float ThisLogWindowSeconds = LogTimerAccumSeconds;
 	LogTimerAccumSeconds = 0.f;
 
 	// docs/debug-tooling-plan.md P1 "Log split": periodic counter line moved
@@ -4402,13 +4412,19 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		// from the outside. capacityPct is beside it so the approach to the cliff
 		// is visible before the cliff.
 		const uint32 CapacityQuads = Pool->GetHighWaterMarkQuads() + Pool->GetFreeQuads();
+		// S0-2: allocsEver tests §2.2 -- Allocations is append-only (see
+		// GetNumAllocationsEver), so this is chunks-ever-added, not resident
+		// (liveChunks is resident). Watch it against liveChunks over a leg: if
+		// it grows while liveChunks plateaus, BuildChunkRuns's per-publication
+		// walk is paying an ever-larger tax for no more live geometry.
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel GPU pool: liveChunks=%d highWater=%u free=%u largestRun=%u freeRuns=%d "
-		            "capacityPct=%.1f allocFail=%lld allocFailQuads=%lld -- ONE primitive, ONE draw"),
+		       TEXT("Voxel GPU pool: liveChunks=%d highWater=%u free=%u largestRun=%u freeRuns=%d ")
+		       TEXT("capacityPct=%.1f allocFail=%lld allocFailQuads=%lld allocsEver=%d -- ONE primitive, ONE draw"),
 		       Pool->GetNumChunks(), Pool->GetHighWaterMarkQuads(), Pool->GetFreeQuads(),
 		       Pool->GetLargestFreeRun(), Pool->GetFreeRunCount(),
 		       CapacityQuads > 0 ? 100.0 * double(Pool->GetHighWaterMarkQuads()) / double(CapacityQuads) : 0.0,
-		       (long long)Pool->GetAllocFailureCount(), (long long)Pool->GetAllocFailureQuads());
+		       (long long)Pool->GetAllocFailureCount(), (long long)Pool->GetAllocFailureQuads(),
+		       Pool->GetNumAllocationsEver());
 	}
 
 	// M2 item 1: "Per-level loaded/pending counters into the perf snapshot/
@@ -4553,13 +4569,25 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       AccumTicks, AccumTickMs, WindowMs > 0.0 ? 100.0 * AccumTickMs / WindowMs : 0.0, AccumRecomputeMs, AccumDispatchMs,
 	       AccumApplyMs, AccumRemeshMs, AccumUnloadMs, AccumTicks > 0 ? AccumTickMs / AccumTicks : 0.0,
 	       AccumTicks > 0 ? AccumRecomputeMs / AccumTicks : 0.0);
+	// S0-2: apply throughput for THIS window, alongside the leg-long mean
+	// TotalChunksLoaded already gives on the "Voxel streaming" line above.
+	// §2.2's testable prediction is that this decays monotonically across a
+	// leg as Allocations.Num() (see GetNumAllocationsEver) grows -- this is
+	// the number that decay would show up in. Divides by the actual elapsed
+	// window (ThisLogWindowSeconds), not the nominal LogIntervalSeconds, so a
+	// run with -VoxelPerfLogInterval= set to something other than 5s, or a
+	// window that overran by a frame, still reports the true rate.
+	const int64 ChunksLoadedThisWindow = TotalChunksLoaded - ChunksLoadedAtLastLog;
+	const double ChunksPerSecThisWindow =
+		ThisLogWindowSeconds > 0.f ? double(ChunksLoadedThisWindow) / double(ThisLogWindowSeconds) : 0.0;
+	ChunksLoadedAtLastLog = TotalChunksLoaded;
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel job flow (5s window): dispatched=%lld drained=%lld stale=%lld (%.1f%%) zeroQuad=%lld ")
-	       TEXT("recordsAdded=%lld recordsEvicted=%lld candidatesRejected=%lld"),
+	       TEXT("recordsAdded=%lld recordsEvicted=%lld candidatesRejected=%lld chunksPerSec=%.1f"),
 	       (long long)JobsDispatchedSinceLog, (long long)ResultsDrainedSinceLog, (long long)StaleDiscardsSinceLog,
 	       ResultsDrainedSinceLog > 0 ? 100.0 * double(StaleDiscardsSinceLog) / double(ResultsDrainedSinceLog) : 0.0,
 	       (long long)ZeroQuadAppliesSinceLog, (long long)RecordsAddedSinceLog, (long long)RecordsEvictedSinceLog,
-	       (long long)CandidatesRejectedSinceLog);
+	       (long long)CandidatesRejectedSinceLog, ChunksPerSecThisWindow);
 	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel admission (5s window): cap=%d cutoffM=%.0f rejected=%lld dropped=%lld"),
 	       VoxelStreamAdmission::GetPendingJobCap(),
 	       WidestAdmissionCutoffM(),
@@ -4825,10 +4853,13 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	//   capRel       -- stand-ins parked because voxel.Stream.LodRetentionMs ran
 	//                   out before the replacement arrived. Every one of those is
 	//                   a hole the player could have seen, and the cause is
-	//                   THROUGHPUT. With LodRetentionMs at its 20000 default this
-	//                   measured ZERO through the flight phase at 20 m/s
-	//                   (2026-07-27), so any non-zero flight-phase capRel is a
-	//                   regression worth chasing.
+	//                   THROUGHPUT. The SHIPPED default is 10000 (retuned
+	//                   5000 -> 20000 -> 10000 on 2026-07-27, see
+	//                   CVarVoxelStreamLodRetentionMs). The ZERO flight-phase
+	//                   capRel measured at 20 m/s (2026-07-27) was taken at
+	//                   LodRetentionMs=20000, NOT at the shipped 10000 default --
+	//                   it is not a prediction for the shipped setting, and a
+	//                   leg run at the default has not yet re-measured this.
 	//
 	// covRelAbsent WAS the second headline, back when ReplacementCovered treated
 	// every absent replacement record as coverage and the counter could not tell

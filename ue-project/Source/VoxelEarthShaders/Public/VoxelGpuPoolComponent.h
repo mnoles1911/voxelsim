@@ -356,6 +356,14 @@ public:
 	int64 GetAllocFailureCount() const { return AllocFailureCount; }
 	int64 GetAllocFailureQuads() const { return AllocFailureQuads; }
 
+	// Allocations is APPEND-ONLY: AddChunk and AddChunkFromGpu both
+	// Allocations.Add(...), freed slots are zeroed in place and never reused,
+	// and Reset() only happens in InitPool. So this is a count of chunks EVER
+	// ADDED over the pool's lifetime, not resident chunks -- GetNumChunks() is
+	// that. It is the growth term in BuildChunkRuns's Reserve()-and-walk, which
+	// runs once per publication.
+	int32 GetNumAllocationsEver() const { return Allocations.Num(); }
+
 	void SetChunkMaterial(UMaterialInterface* InMaterial);
 	UMaterialInterface* GetChunkMaterialOrDefault() const;
 
