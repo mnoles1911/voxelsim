@@ -1,8 +1,35 @@
 # Speculative generation (T4-1): the re-sequenced path, and why this order
 
-**Status:** written 2026-07-27. Wave S0 in progress. This supersedes the wave
+**Status:** written 2026-07-27. **Wave S0 is CLOSED — §1a confirmed, Wave S1
+proceeds.** Results and the full verdict:
+`docs/measurements/s0-apply-census-2026-07-27.txt`. This supersedes the wave
 ORDER in `docs/streaming-perf-implementation-plan.md` for the T4-1 path only —
 that document's per-item content still stands and is referenced throughout.
+
+**What S0 changed, in one block** (details in the measurements file):
+
+- **§1a confirmed.** The apply loop never exits on an empty queue while
+  streaming (wallClock beats queueEmpty 5.5:1); `poolAdd` is 98–99% of per-apply
+  cost and grows **0.275 → 2.108 ms within a single leg**. The published
+  "results are not ARRIVING" reading is falsified — results arrive faster than
+  the consumer applies them.
+- **T1-3 is STRUCK from the critical path.** `params` measured 0.002–0.004 ms,
+  0.2% of an apply. Multiplying 0.2% by a speculative lead factor is still 0.2%.
+  One item removed before it was built, which is what the wave was for.
+- **S1-2 handle recycling is RAISED.** §2.2's prediction held: `BuildChunkRuns`
+  walks 68,416 allocations to emit 18,389 runs by the end of a flight — 3.7×
+  waste, climbing, unbounded in session length. Batching does **not** fix it.
+- **New: the result queue backs up and the backlog rots.** The producer runs ~3×
+  the consumer under flight; deliver-to-apply reaches tens of seconds; a mean
+  **40%** of drained results (peak 92.8% in a window) are discarded as stale.
+  This makes T1-1 compound rather than linear — cutting apply cost shortens the
+  queue, which cuts the stale fraction, which recovers throughput again.
+- **Correction to the review:** it prices `RebuildRunBounds` at 2–4 ms per
+  applied chunk; measured 0.247–0.714 ms. Still co-dominant with
+  `BuildChunkRuns`; the number itself should not be requoted.
+- **Harness:** `tools/voxel-run-leg.ps1` is a **cold-fill driver** and silently
+  truncates flight legs at the end of preflight. Flight legs must launch the
+  editor directly and let `UVoxelPerfRunSubsystem` exit on its own clock.
 
 ## Why this document exists
 
@@ -46,7 +73,7 @@ Three are existing plan items; two are new.
 |---|---|---|
 | 1 | A consumer that can absorb extra applies — speculation *raises* apply volume, and against a per-apply O(N) tax it makes things strictly worse | **T1-1** batch publication |
 | 2 | An allocation path that does not degrade as chunks churn | **NEW: handle recycling** (§2.2) |
-| 3 | A per-chunk param source that does not cost a full `Amplifier::column` — speculation multiplies that call count | **T1-3(a)** column params cache |
+| 3 | ~~A per-chunk param source that does not cost a full `Amplifier::column`~~ | ~~**T1-3(a)**~~ — **STRUCK by S0**: params is 0.2% of an apply |
 | 4 | A place to put geometry nothing has asked for yet | **T2-4** parking (cheaper than the plan assumes — §2.3) |
 | 5 | A direction to speculate in | **T2-1's velocity source only**, not its admission rewiring (§2.4) |
 
@@ -263,15 +290,18 @@ place. `AllocationChunkIds` stays parallel. Removes the cumulative term from
 `Allocations.Num()` plateaus at ≈ live chunks; per-window `avgChunks/s` stops
 decaying. *Falsified if* S0-2 showed no decay.
 
-**S1-3 — T1-3(a), column-keyed params cache.** `SampleChunkParamsForPool` is a
-pure function of `(Level, Key.X, Key.Y)`. Cache `{Temp, Precip, SurfaceZAbsUU}`
-by level+XY, derive relative Z per chunk: one `GetSurfaceHeightUU` per **column**
-instead of per **chunk**. Prune in `PruneFootprintZRangeCache` alongside the
-three caches it already prunes. *On this path because speculation multiplies this
-call count* — it is the one apply-side cost that scales with speculative volume.
-*Gate:* `voxel.Stream.ParamsColumnCache` (0). Correctness is a **settled
-pinned-pose screenshot diff** against a same-run floor, not a count. Skip
-T1-3(b).
+**S1-3 — ~~T1-3(a), column-keyed params cache~~. STRUCK BY S0. DO NOT BUILD.**
+The argument for putting it here was that speculation multiplies the
+`SampleChunkParamsForPool` call count. Measured across five legs, `params` is
+**0.002–0.004 ms per apply — 0.2%**, at every point in fill and flight. A cache
+would remove nothing, and 0.2% multiplied by a lead factor is still 0.2%.
+`pack` (0.003–0.005 ms) is the same story. Recorded in the measurements file
+under FALSIFIED so it is not re-proposed.
+
+*Kept from the attempt:* the hoist of `SampleChunkParamsForPool` out of its two
+call sites in `ApplyMeshResult`. It is behaviour-identical — still computed on
+exactly the branches that computed it before, never on the `UpdateChunk` path —
+and it is what makes the number readable at all.
 
 **S1-4 — T1-2(a) + T1-2(c), conditional.** Build only if S0-1's render-thread
 accumulator shows `RebuildRunBounds` still costing >1 ms/frame after S1-1 and
