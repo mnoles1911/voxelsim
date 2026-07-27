@@ -191,6 +191,39 @@ TAutoConsoleVariable<int32> CVarVoxelStreamLogAdmission(
 	TEXT("armed. Those four decide whether a ring keeps filling, and no existing counter shows them together."),
 	ECVF_Default);
 
+// Ring-gap wave (docs/status.md "ring gap"). The 5s retention census says HOW
+// MANY stand-ins were released and why; it cannot say WHICH ones, and the
+// hypothesis under test is positional -- coarse chunks released at the INNER
+// ring edge, where the finer ring has not arrived. One line per release, with
+// the chunk key and its radius from the anchor, is what makes a logged number
+// comparable against a screenshot of the hole.
+//
+// Per-chunk and therefore OFF by default and never suitable for a perf run:
+// the census line above is the always-on instrument, this is the drill-down.
+TAutoConsoleVariable<int32> CVarVoxelStreamLogRetention(
+	TEXT("voxel.Stream.LogRetention"),
+	0,
+	TEXT("Log one line per load-before-unload stand-in release that was NOT a clean settled cover: every ")
+	TEXT("covered-ABSENT release (the covered verdict rested on a child/parent record that does not exist, which ")
+	TEXT("is only sound if that record was genuinely undesired) and every safety-cap release. Level, chunk key, ")
+	TEXT("radius from the anchor in metres, and the absent/settled split of the replacement columns consulted. ")
+	TEXT("Per-chunk output -- diagnostic only, never a perf-run setting."),
+	ECVF_Default);
+
+// Ring-gap wave: turn the visual symptom into a number. See the coverage-verify
+// block in MaybeLogCounters for what it scans and the two prior failure modes
+// its coverage test is built to dodge. O(tracked) plus one annulus enumeration
+// per level, ONCE per log window, and entirely inside the enable check -- a
+// default run pays a single cvar read.
+TAutoConsoleVariable<int32> CVarVoxelStreamCoverageVerify(
+	TEXT("voxel.Stream.CoverageVerify"),
+	0,
+	TEXT("Once per periodic perf-log window, enumerate every XY footprint whose centre lies in a ring's core ")
+	TEXT("annulus and count the ones no level is visibly covering -- the see-through holes, as a number, with a ")
+	TEXT("few examples and their radius. READ-ONLY: it changes no streaming decision. Off by default because it ")
+	TEXT("re-walks every ring's annulus."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarVoxelStreamGpuMaxChunks(
 	TEXT("voxel.Stream.GPUMaxChunks"),
 	0,
@@ -581,6 +614,16 @@ float VoxelDebug::GetStreamApplyBudgetMs()
 float VoxelDebug::GetStreamLodRetentionMs()
 {
 	return FMath::Max(0.f, CVarVoxelStreamLodRetentionMs.GetValueOnGameThread());
+}
+
+bool VoxelDebug::GetStreamLogRetention()
+{
+	return CVarVoxelStreamLogRetention.GetValueOnGameThread() != 0;
+}
+
+bool VoxelDebug::GetStreamCoverageVerify()
+{
+	return CVarVoxelStreamCoverageVerify.GetValueOnGameThread() != 0;
 }
 
 bool VoxelDebug::GetRenderCastShadow()

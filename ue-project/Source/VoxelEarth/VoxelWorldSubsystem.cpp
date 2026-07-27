@@ -1446,11 +1446,18 @@ int32 GetPendingJobCap()
 // blend of two producers. This has to be decided before the first dispatch or
 // the A/B it exists to serve cannot be taken.
 //
-// OFF BY DEFAULT and it stays that way until the byte-equality gate
-// (voxel.GPU.VerifyAsyncMesh) and a motion measurement both pass. The pooled
-// renderer is a separate switch (voxel.Stream.GPU) and is also off; this fork
-// changes only WHO PRODUCES the quads, not who draws them, so the two are
-// independent and either can be measured alone.
+// ON BY DEFAULT since 2026-07-27, which is why the switch below is the NEGATIVE
+// -VoxelNoGpuMesh rather than an opt-in. It was off, "until the byte-equality
+// gate and a motion measurement both pass"; both have since passed.
+// voxel.GPU.VerifyCoarse proves the fork bit-exact against vxc::coarseColumns +
+// makeCoarseBrick on columns, cells AND quads at every level it takes, and the
+// D5.3b budget fix turned the whole cascade from 3.4x WORSE than the CPU path
+// into ~32-38% faster -- see GpuMeshMaxLevel below for those numbers and the
+// retraction that came with them.
+//
+// The pooled RENDERER is still a separate switch (voxel.Stream.GPU) and must
+// stay one: this fork changes only WHO PRODUCES the quads, not who draws them,
+// so the two are independent and either can be measured alone.
 bool GpuMeshEnabled()
 {
 	// 2026-07-27: DEFAULT ON, and inverted to -VoxelNoGpuMesh so a PIE session
@@ -1462,44 +1469,12 @@ bool GpuMeshEnabled()
 	return !bDisabled;
 }
 
-// Highest chunk level the fork may take (D5).
-//
-// ZERO BY DEFAULT, AND THAT IS A MEASUREMENT, NOT CAUTION.
-//
-// Correctness is not the limit: voxel.GPU.VerifyCoarse proves levels 0-4
-// bit-exact against vxc::coarseColumns + makeCoarseBrick on columns, cells AND
-// quads, and a coarse run reports failed=0 across 105 log windows with no
-// stranded columns. THROUGHPUT is the limit. Measured at R0 = 128 m, same
-// anchor, same harness:
-//
-//     128 m, CPU producer            58.4 s / 60.4 s to settle
-//     128 m, fork at L0 only         60.4 s          (51,720 -> 9,200 chunks)
-//     128 m, fork at L0-L4          205.4 s, and a second leg never settled
-//
-// 3.4x WORSE, with the fork taking 51,720 chunks spread properly across the
-// levels (L0 9201, L1 10280, L2 10464, L3 10892, L4 10883). It is latency, not
-// error: submit->deliver max went from 90 ms at level 0 to 4,025 ms, and the
-// fork sits at 19-20 in flight against a cap of 256 -- it is waiting, not
-// saturated.
-//
-// The cause is the one the plan named and D4 never built: BATCHING. A region
-// dispatch is a brick-aligned slab with a one-brick halo, so meshing a single
-// 32^3 chunk dispatches 48^3 voxels -- 3.4x waste -- and D3's split readback
-// adds a second round trip per chunk. Against ~24 CPU workers each finishing a
-// chunk in ~1 ms, one queue of ~28 ms round trips loses badly no matter how
-// exact it is.
-//
-// So the levels stay AVAILABLE and OFF: -VoxelGpuMeshMaxLevel=4 opts in for
-// measurement, and nothing gets 3.4x slower merely by passing -VoxelGpuMesh.
-// The cap for a future default is now 5: level 5 WAS unproven, and no longer is.
-// It passes bit-exact on [origin] and on the [high-relief] fixture found by
-// voxel.GPU.FindBandFixture (2,025 voxels / 202 m of surface spread, against the
-// 768 three coarse bricks of z require). [far-negative] still cannot express it
-// and is reported as SKIP rather than FAIL, because a fixture too thin to hold
-// the level is not the coarse path disagreeing.
 // How many GPU mesh jobs may be outstanding at once, budgeted separately from
 // the CPU worker cap. See the HasDispatchBudget comment in DispatchJobs for why
-// this is a different quantity from JobsInFlightPerCore and not a bigger one.
+// this is a different quantity from JobsInFlightPerCore and not a bigger one,
+// and GpuMeshMaxLevel below for the measurement that made the separation the
+// difference between the fork being 3.4x slower than the CPU path and ~38%
+// faster.
 //
 // 256 matches the manager's own cap, so neither binds before the other -- two
 // caps in series make a throughput number unattributable to either, which is
@@ -1515,14 +1490,79 @@ int32 GpuMeshInFlight()
 	return N;
 }
 
+// Highest chunk level the fork may take (D5).
+//
+// FIVE BY DEFAULT -- THE WHOLE CASCADE -- AND THAT IS A MEASUREMENT, NOT
+// CONFIDENCE. It was ZERO, on a measurement, and the history is kept here
+// because the number that overturned it is small and easy to lose.
+//
+// Correctness was never the limit at any point: voxel.GPU.VerifyCoarse proves
+// the coarse path bit-exact against vxc::coarseColumns + makeCoarseBrick on
+// columns, cells AND quads -- levels 0-4 first, then L5 on [origin] and on the
+// [high-relief] fixture found by voxel.GPU.FindBandFixture (2,025 voxels / 202 m
+// of surface spread, against the three coarse bricks of z 768 require).
+// [far-negative] cannot express L5 and is reported as SKIP rather than FAIL,
+// because a fixture too thin to hold the level is not the coarse path
+// disagreeing. A coarse run reports failed=0 across 105 log windows with no
+// stranded columns. THROUGHPUT was the limit, and it has moved.
+//
+// WHAT WAS MEASURED (R0 = 128 m, same anchor, same harness, static pose,
+// docs/measurements/wave-d5-budget-fix.txt):
+//
+//     128 m, CPU producer                      60.4 / 58.4 s to settle
+//     128 m, fork L0-L4, SHARED job budget    205.4 s, second leg never settled
+//     128 m, fork L0 only, separate budget     58.5 / 62.4 s  (~7,370 forked)
+//     128 m, fork L0-L4,  separate budget      36.3 / 38.3 s  (~34,365 forked)
+//
+// 3.4x WORSE on the middle row, with the fork taking 51,720 chunks spread
+// properly across the levels (L0 9201, L1 10280, L2 10464, L3 10892, L4 10883).
+// It was latency, not error: submit->deliver max went from 90 ms at level 0 to
+// 4,025 ms, and the fork sat at 19-20 in flight against a cap of 256 -- waiting,
+// not saturated.
+//
+// THE CAUSE WAS A UNIT ERROR IN THE BUDGET, AND THE BATCHING DIAGNOSIS IS
+// RETRACTED. The earlier text on this comment blamed BATCHING: a region dispatch
+// is a brick-aligned slab with a one-brick halo, so meshing a single 32^3 chunk
+// dispatches 48^3 voxels -- 3.4x waste -- and D3's split readback adds a second
+// round trip. That waste is real and batching may still help, but it was not the
+// blocker. MaxJobsInFlight is JobsInFlightPerCore x logical cores (24 on that
+// box) and that number sizes a pool of WORKERS; a GPU job is not a thread, it is
+// a round trip, so the queue has to be sized against latency x rate. Giving the
+// fork its own budget (D5.3b) cost one line.
+//
+// BOTH CHANGES WERE REQUIRED AND NEITHER WORKS ALONE, which is what makes this a
+// result rather than a coincidence: coarse levels without the budget fix is
+// 205 s; the budget fix without coarse levels is 58.5/62.4 s against a CPU
+// baseline of 58.4/60.4 s, i.e. no change at all. Levels 1-5 are ~80% of
+// resident chunks, so a level-0-only fork cannot move the number however much
+// budget it is given.
+//
+// RE-MEASURED AFTER THE RING-BOUNDARY SKIRT (D5.3) REMOVED THE BOUNDARY-CHUNK
+// CARVE-OUT, i.e. with the fork taking strictly MORE work than the numbers above
+// describe (docs/measurements/wave-d5-skirt-remeasure.txt):
+//
+//     128 m, CPU producer     62.5 / 62.4 s
+//     128 m, fork L0-L5       42.4 / 42.3 / 42.4 s, then 40.4 / 42.4 s
+//
+// ~32% faster, spread 0.1 s within both configs. Compare WITHIN a session only:
+// the CPU baseline itself moved between the two runs, so the honest statement is
+// the ratio (0.62 pre-skirt, 0.68 post-skirt) -- still clearly ahead while doing
+// more work.
+//
+// STILL OPEN: one 7,395 ms submit->deliver outlier, above the 5 s
+// kBlindJobMarkTimeoutSeconds, seen once and not since across four further legs.
+// A level-4 dispatch covers 16x the world area of a level-0 one, so the coarse
+// chunks the skirt newly admits are the plausible source. The `slow(>=5s)`
+// counter on the GPU-fork perf line now exists precisely to say so if it
+// returns; it reads 0.
+//
+// -VoxelGpuMeshMaxLevel=<n> still lowers the cap for measurement (0 restores the
+// level-0-only fork, and the clamp's upper bound is the highest level
+// VerifyCoarse has proven).
 int32 GpuMeshMaxLevel()
 {
 	static const int32 MaxLevel = []
 	{
-		// 2026-07-27: 5, the whole cascade. voxel.GPU.VerifyCoarse proves every
-		// level bit-exact against coarseColumns + makeCoarseBrick on columns,
-		// cells and quads -- L5 on [origin] and [high-relief], with
-		// [far-negative] skipped because that fixture cannot express the level.
 		int32 Value = 5;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuMeshMaxLevel="), Value);
 		return FMath::Clamp(Value, 0, 5);
@@ -2937,8 +2977,26 @@ struct FVoxelWorldImpl
 	// Load-before-unload retention telemetry (see the counter block in
 	// DrainUnloads for how to read these). Game-thread only.
 	int32 RetainHeldThisFrame = 0;             // stand-ins still held at the end of the last DrainUnloads
-	int64 RetainCoveredReleasesSinceLog = 0;   // parked because the replacement arrived
-	int64 RetainCapReleasesSinceLog = 0;       // parked because LodRetentionMs expired first
+	// The covered releases, SPLIT BY WHAT THE COVERED VERDICT RESTED ON (ring-gap
+	// wave). ReplacementCovered treats an ABSENT replacement record as covered,
+	// on the argument that a key with no record was never desired -- and that
+	// argument only holds when absence means "the replacing ring's own footprint
+	// trim declined it". Absence has four OTHER causes on this path (the
+	// per-level admission budget, the per-level distance cutoff, the pending-
+	// queue drop, and the entry-scan gate that skips a level entirely while the
+	// anchor has not left its level-L chunk), and under any of them the stand-in
+	// is released over ground nothing is drawing yet. Two counters, because a
+	// single covRel number cannot distinguish the sound case from the unsound
+	// one, and the unsound one is the ring-gap hypothesis.
+	int64 RetainCoveredSettledReleasesSinceLog = 0; // every replacement record consulted existed AND had settled
+	int64 RetainCoveredAbsentReleasesSinceLog = 0;  // at least one consulted replacement record did not exist
+	int64 RetainCapReleasesSinceLog = 0;            // parked because LodRetentionMs expired first
+	// Per-level breakouts of the two suspicious releases. Which RING releases on
+	// an absent replacement is the whole question -- a coarse ring released at its
+	// inner edge leaves a hole the finer ring has not filled, and that is a
+	// different bug from a fine ring released at its outer edge.
+	int64 LevelRetainCoveredAbsent[VoxelCoords::kNumLevels] = {};
+	int64 LevelRetainCapReleases[VoxelCoords::kNumLevels] = {};
 
 	int64 ResidentQuads = 0;         // sum of FChunkRecord::LastQuadCount across every tracked record with a live component
 	int64 StaleResultsDiscarded = 0; // cumulative worker results dropped (chunk left the desired set, or superseded by an edit)
@@ -3054,6 +3112,24 @@ struct FVoxelWorldImpl
 	int64 LevelRecordsAdded[VoxelCoords::kNumLevels] = {};
 	int64 LevelRecordsDropped[VoxelCoords::kNumLevels] = {};
 	int64 LevelRecordsEvicted[VoxelCoords::kNumLevels] = {};
+
+	// WHICH exit test evicted, per level (ring-gap wave). LevelRecordsEvicted
+	// above counts removals and every exit path lands in the same number, but
+	// the three tests mean entirely different things: `out` is the ring's outer
+	// hysteresis edge (normal, the world moving away), `in` is the INNER edge --
+	// a finer ring claiming the footprint, which is the eviction the
+	// load-before-unload stand-in exists for and the one the ring-gap hypothesis
+	// is about -- and `vert` is the underground deep box's vertical keep-test,
+	// which has no replacement at all.
+	//
+	// Counted in the same in/out/vert priority the eviction condition reads, one
+	// bucket per evicted chunk, so the three sum to that level's exit-pass
+	// evictions rather than double-counting a chunk that fails two tests.
+	// Filled in RecomputeDesiredSet's exit pass, the only place all three are
+	// known; reset with the rest of the 5s window in MaybeLogCounters.
+	int64 LevelEvictInner[VoxelCoords::kNumLevels] = {};
+	int64 LevelEvictOuter[VoxelCoords::kNumLevels] = {};
+	int64 LevelEvictVertical[VoxelCoords::kNumLevels] = {};
 
 	// --- Buried-chunk pre-dispatch skip, step 1 census (docs/status.md).
 	// Per RING LEVEL, over the same 5s window as everything above: results
@@ -3390,6 +3466,15 @@ private:
 	bool ChunkOwnsEditedBrick(const VoxelCoords::FVoxelChunkKey& ChunkKey) const;
 	vxc::RaycastHit CastFromCamera(const FVector& CameraLoc, const FVector& Dir) const;
 	void MaybeLogCounters(float DeltaTime);
+
+	// voxel.Stream.CoverageVerify (ring-gap wave): turn "I can see holes" into a
+	// logged number. Called once per periodic-log window from MaybeLogCounters,
+	// and READ-ONLY -- it inspects ChunkRecords and re-derives ring geometry, and
+	// changes no streaming state whatsoever. Its own function rather than a block
+	// inside MaybeLogCounters because it must be defined below namespace
+	// VoxelUnderground, whose depth-skirt rule it mirrors. See its definition for
+	// what "visibly covered" means and why.
+	void LogCoverageVerify();
 
 	// Shared tail of TryDig/TryPlace/CarveSphere (edit-log authority path):
 	// applies every brick's grouped edits, marks every dirty chunk for
@@ -4157,6 +4242,33 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		}
 		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel records/level (5s window): %s"), *Line);
 	}
+	{
+		// WHICH exit test did the evicting, per ring (see LevelEvictInner). The
+		// `ev` column on the line above is the total and cannot separate "the
+		// world moved away from this chunk" (out) from "a finer ring claimed this
+		// chunk's footprint" (in) -- and only the second one hands the footprint
+		// to another ring, i.e. only the second one can leave a gap if that ring
+		// is not ready. `vert` is the underground deep box's vertical keep-test,
+		// which has no replacement at all and is deliberately never retained.
+		//
+		// A SEPARATE LINE rather than extra columns on the records/level one:
+		// that format is parsed outside this file and must not move.
+		//
+		// Only levels with something to say are printed, so a settled run's line
+		// is short and a churning ring is conspicuous.
+		FString Line;
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			if (LevelEvictInner[Level] == 0 && LevelEvictOuter[Level] == 0 && LevelEvictVertical[Level] == 0)
+			{
+				continue;
+			}
+			Line += FString::Printf(TEXT("R%d[in=%lld out=%lld vert=%lld] "), Level, (long long)LevelEvictInner[Level],
+			                        (long long)LevelEvictOuter[Level], (long long)LevelEvictVertical[Level]);
+		}
+		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel evictions/level (5s window): %s"),
+		       Line.IsEmpty() ? TEXT("(none)") : *Line);
+	}
 	// Buried-chunk pre-dispatch skip, step 1 census. One line per ring level:
 	// results/zeroQuad is the fraction of that ring's worker output that
 	// produced no geometry at all, and air/solid/mixed says what those chunks
@@ -4289,18 +4401,71 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 
 	BuriedSkipsSinceLog = BuriedSkipAirSinceLog = BuriedSkipSolidSinceLog = BuriedVerifyCheckedSinceLog = 0;
 
-	// Load-before-unload retention census. capRel is the headline: it counts
-	// stand-ins that had to be parked because voxel.Stream.LodRetentionMs ran out
-	// before the replacement arrived -- i.e. every one of those is a hole the
-	// player could have seen. covRel are the clean releases. See DrainUnloads.
-	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel LOD retention (5s window): held=%d covRel=%lld capRel=%lld (capRel %.1f%% of releases) | retentionMs=%.0f"),
-	       RetainHeldThisFrame, (long long)RetainCoveredReleasesSinceLog, (long long)RetainCapReleasesSinceLog,
-	       (RetainCoveredReleasesSinceLog + RetainCapReleasesSinceLog) > 0
-	           ? 100.0 * double(RetainCapReleasesSinceLog) / double(RetainCoveredReleasesSinceLog + RetainCapReleasesSinceLog)
-	           : 0.0,
-	       VoxelDebug::GetStreamLodRetentionMs());
-	RetainCoveredReleasesSinceLog = RetainCapReleasesSinceLog = 0;
+	// Load-before-unload retention census. TWO headline numbers now:
+	//
+	//   capRel       -- stand-ins parked because voxel.Stream.LodRetentionMs ran
+	//                   out before the replacement arrived. Every one of those is
+	//                   a hole the player could have seen, and the cause is
+	//                   THROUGHPUT.
+	//   covRelAbsent -- stand-ins parked because ReplacementCovered found the
+	//                   replacement records ABSENT and calls that covered. Every
+	//                   one of those is a hole the player could have seen IF the
+	//                   absence was an admission/scheduling artefact rather than
+	//                   the replacing ring genuinely declining the footprint --
+	//                   which is the ring-gap hypothesis. The cause is a
+	//                   PREDICATE, not throughput, so a faster machine does not
+	//                   make it go away.
+	//
+	// covRelSettled is the sound release and needs no interpretation. See the
+	// counter block in DrainUnloads and ReplacementCovered's doc comment.
+	{
+		const int64 TotalReleases =
+			RetainCoveredSettledReleasesSinceLog + RetainCoveredAbsentReleasesSinceLog + RetainCapReleasesSinceLog;
+		// Per-level breakouts appended only when non-zero, so a healthy run's
+		// line stays one line and a suspicious one names the ring immediately.
+		FString AbsentPerLevel;
+		FString CapPerLevel;
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			if (LevelRetainCoveredAbsent[Level] > 0)
+			{
+				AbsentPerLevel += FString::Printf(TEXT("R%d=%lld "), Level, (long long)LevelRetainCoveredAbsent[Level]);
+			}
+			if (LevelRetainCapReleases[Level] > 0)
+			{
+				CapPerLevel += FString::Printf(TEXT("R%d=%lld "), Level, (long long)LevelRetainCapReleases[Level]);
+			}
+		}
+		FString Suffix;
+		if (!AbsentPerLevel.IsEmpty())
+		{
+			Suffix += FString::Printf(TEXT(" | absent/level: %s"), *AbsentPerLevel);
+		}
+		if (!CapPerLevel.IsEmpty())
+		{
+			Suffix += FString::Printf(TEXT(" | cap/level: %s"), *CapPerLevel);
+		}
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel LOD retention (5s window): held=%d covRelSettled=%lld covRelAbsent=%lld capRel=%lld ")
+		       TEXT("(capRel %.1f%% of releases, covRelAbsent %.1f%%) | retentionMs=%.0f%s"),
+		       RetainHeldThisFrame, (long long)RetainCoveredSettledReleasesSinceLog,
+		       (long long)RetainCoveredAbsentReleasesSinceLog, (long long)RetainCapReleasesSinceLog,
+		       TotalReleases > 0 ? 100.0 * double(RetainCapReleasesSinceLog) / double(TotalReleases) : 0.0,
+		       TotalReleases > 0 ? 100.0 * double(RetainCoveredAbsentReleasesSinceLog) / double(TotalReleases) : 0.0,
+		       VoxelDebug::GetStreamLodRetentionMs(), *Suffix);
+	}
+	RetainCoveredSettledReleasesSinceLog = RetainCoveredAbsentReleasesSinceLog = RetainCapReleasesSinceLog = 0;
+	FMemory::Memzero(LevelRetainCoveredAbsent);
+	FMemory::Memzero(LevelRetainCapReleases);
+
+	// The counters above say how retention BEHAVED; this says whether the world
+	// currently has holes in it. Deliberately adjacent: covRelAbsent is a
+	// suspicion and holes>0 is the confirmation, and reading them from the same
+	// log window is the whole point. Default-off, one cvar read when off.
+	if (VoxelDebug::GetStreamCoverageVerify())
+	{
+		LogCoverageVerify();
+	}
 
 	// All-solid ADMISSION skip census. Deliberately its own line rather than
 	// folded into the buried-skip one above: they measure different things and
@@ -4363,6 +4528,9 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	FMemory::Memzero(LevelRecordsAdded);
 	FMemory::Memzero(LevelRecordsDropped);
 	FMemory::Memzero(LevelRecordsEvicted);
+	FMemory::Memzero(LevelEvictInner);
+	FMemory::Memzero(LevelEvictOuter);
+	FMemory::Memzero(LevelEvictVertical);
 
 	MaxRecomputeMs = 0.f;
 	MaxExitScanMs = 0.f;
@@ -5359,6 +5527,26 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					Rec.RetainReplaceDir = bInsideInner ? RetainDir_Finer : RetainDir_Coarser;
 				}
 			}
+			// Eviction-cause split (see LevelEvictInner's doc comment). This is
+			// the only point in the program where the three tests are all in
+			// hand, and `in` -- a finer ring taking the footprint -- is the one
+			// the retention stand-in exists to bridge. Priority order matches the
+			// condition above, so the buckets partition the evictions.
+			{
+				const int32 EvictLevelIdx = FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1);
+				if (bInsideInner)
+				{
+					++LevelEvictInner[EvictLevelIdx];
+				}
+				else if (bBeyondOuter)
+				{
+					++LevelEvictOuter[EvictLevelIdx];
+				}
+				else
+				{
+					++LevelEvictVertical[EvictLevelIdx];
+				}
+			}
 			PendingUnloadKeys.Add(LevelKey);
 			PendingUnloadSet.Add(LevelKey);
 			EvictedThisCall.Add(LevelKey);
@@ -6128,10 +6316,35 @@ namespace
 // Z-range trim decided that) and therefore cannot block: only a record that is
 // admitted but not yet settled holds the stand-in. Edge levels have no finer or
 // coarser neighbour and report covered immediately, as before.
+//
+// THAT ABSENCE ARGUMENT IS THE THING UNDER TEST (ring-gap wave), which is why
+// the out-params exist. "Absent == not desired" is only true when the replacing
+// ring actually LOOKED at the footprint and declined it. It also reads absent
+// when the ring wanted the chunk and could not have it: the per-level admission
+// budget turned it away (AdmissionsThisLevel), the per-level distance cutoff
+// did (LevelAdmissionCutoffDistSq), TruncatePendingJobQueue dropped it before it
+// meshed, or the ENTRY-SCAN GATE skipped that level entirely this call because
+// the anchor has not left its level-L chunk yet -- at level 4 that is a 51.2 m
+// crossing, so a coarse ring can be several seconds behind the eviction that is
+// consulting it. Under any of those the verdict is "covered" over ground nothing
+// is drawing.
+//
+// This function does NOT change its verdict -- that would be a behaviour change,
+// and the point of this wave is to measure first. It reports, on a covered
+// verdict, whether the verdict consulted any absent record and how the consulted
+// keys split, so DrainUnloads can count the two cases apart.
+//
+// The counts are meaningful ONLY on a `true` return: the loop short-circuits on
+// the first blocking record, so a `false` verdict leaves them partial.
 bool ReplacementCovered(const TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStreaming::FChunkRecord>& Records,
-                        const VoxelCoords::FVoxelLevelChunkKey& Key, uint8 Dir)
+                        const VoxelCoords::FVoxelLevelChunkKey& Key, uint8 Dir, bool* bOutAnyAbsent = nullptr,
+                        int32* OutAbsentCount = nullptr, int32* OutSettledCount = nullptr)
 {
-	const auto Settled = [&Records](int32 L, int32 X, int32 Y, int32 Z)
+	if (bOutAnyAbsent) *bOutAnyAbsent = false;
+	if (OutAbsentCount) *OutAbsentCount = 0;
+	if (OutSettledCount) *OutSettledCount = 0;
+
+	const auto Settled = [&Records, bOutAnyAbsent, OutAbsentCount, OutSettledCount](int32 L, int32 X, int32 Y, int32 Z)
 	{
 		VoxelCoords::FVoxelLevelChunkKey K;
 		K.Level = L;
@@ -6139,7 +6352,18 @@ bool ReplacementCovered(const TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStream
 		K.Key.Y = Y;
 		K.Key.Z = Z;
 		const VoxelStreaming::FChunkRecord* R = Records.Find(K);
-		return R == nullptr || R->bMeshSettled; // absent == not desired == not blocking
+		if (R == nullptr)
+		{
+			// absent == not desired == not blocking -- see the caveat above.
+			if (bOutAnyAbsent) *bOutAnyAbsent = true;
+			if (OutAbsentCount) ++*OutAbsentCount;
+			return true;
+		}
+		if (R->bMeshSettled && OutSettledCount)
+		{
+			++*OutSettledCount;
+		}
+		return R->bMeshSettled;
 	};
 
 	const int32 L = Key.Level, X = Key.Key.X, Y = Key.Key.Y, Z = Key.Key.Z;
@@ -6169,6 +6393,226 @@ bool ReplacementCovered(const TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStream
 	return true;
 }
 } // namespace
+
+// --- coverage verifier (voxel.Stream.CoverageVerify) --------------------
+//
+// THE PROBLEM THIS SOLVES. Every counter in this file measures the streaming
+// PIPELINE -- what was admitted, dispatched, drained, retained, released. None
+// of them measures the OUTPUT, which is the only thing the player sees: is there
+// ground under every footprint the cascade claims to own? "Concentric rings of
+// holes" has now been diagnosed twice from screenshots and source reading (the
+// ring-seam gap, and the load-before-unload first cut), because no number
+// disagreed with a healthy-looking log. This is that number.
+//
+// WHAT IT DOES. One O(tracked) pass over ChunkRecords collapses every record
+// into its COLUMN (Level, X, Y) with four flags, then each ring's core annulus
+// is re-enumerated with the entry pass's own centre-distance test and every
+// footprint is asked whether anything is visibly drawing it.
+//
+// THE TWO PRIOR FAILURE MODES THIS COVERAGE TEST IS BUILT TO DODGE -- both are
+// documented in full in the ColumnGeomCount post-mortem above ReplacementCovered,
+// and both were bugs in a coverage index that looked exactly like this one:
+//
+//  1. DEEP CHUNKS VOUCHING FOR SURFACE. Collapsing Z means an underground chunk
+//     (bDeepAnchorRelative, ~38 m down, invisible from above) would otherwise
+//     answer "this column has geometry" for a surface chunk that never arrived.
+//     Excluded: bAnySettledNonDeep / bAnyGeomNonDeep both skip
+//     bDeepAnchorRelative records, so only the surface band + skirt can vouch.
+//     (bAnyRecord deliberately does NOT skip them -- it answers "does this
+//     column exist in the desired set at all", which is the cause split.)
+//  2. ZERO-QUAD LEGITIMATE EMPTINESS. A footprint that correctly meshes to no
+//     quads -- all air above a valley floor, an all-ocean quarter -- has no
+//     geometry and is not a hole. Keying coverage on geometry would report the
+//     entire sky as missing. Primary test is therefore bMeshSettled ("this
+//     chunk's mesh is FINAL"), with geometry only as an additional way to be
+//     covered, never the requirement.
+//
+// WHAT "VISIBLY COVERED" MEANS. Any of:
+//   (a) this column itself has a settled or drawing non-deep record;
+//   (b) the PARENT column (L+1) is drawing -- a retained coarse stand-in still
+//       on screen covers this ground even though this level owns it on paper.
+//       Geometry, not settled: a parent that has left the desired set but is
+//       still drawn is exactly the stand-in case, and a settled-but-parked
+//       parent covers nothing;
+//   (c) all four CHILD columns (L-1) have settled -- the finer ring has taken
+//       over ahead of this level's own admission, which is the normal shape of
+//       an inward LOD transition and is not a hole.
+//
+// ON THE Z QUESTION (asked explicitly by this wave's spec, answered from the
+// code): CAN AN IN-ANNULUS FOOTPRINT BE LEGITIMATELY DESIRED WITH ZERO CHUNKS?
+// From the Z math, NO. ComputeFootprintChunkZRange ends with
+// `OutChunkZMax = FMath::Max(OutChunkZMax, OutChunkZMin)` -- the sky-band trim
+// may never invert the range -- and the entry pass's `for (Cz = ChunkZMin; Cz <=
+// ChunkZMax; ++Cz)` therefore always runs at least once. The sky-band and
+// edit-floor hatches only ever WIDEN it. So no footprint is ever "trimmed to
+// nothing", and a column with zero records is never explained by the Z rule.
+// There is exactly ONE legitimate zero-record path: the level-0 ADMISSION BAND
+// SKIP (-VoxelAdmissionBandSkip=1 / voxel.Stream.AdmissionBandSkip, DEFAULT OFF),
+// which drops chunks a cached band proves empty and can in principle take a
+// whole short column. That case is mirrored below and counted as covered.
+void FVoxelWorldImpl::LogCoverageVerify()
+{
+	using namespace VoxelCoords;
+
+	// --- pass 1: collapse ChunkRecords into columns ------------------------
+	struct FColumnFlags
+	{
+		bool bAnyRecord = false;         // the column is in the desired set at all (deep or not)
+		bool bAnySettledNonDeep = false; // a surface-band/skirt record whose mesh is FINAL
+		bool bAnyGeomNonDeep = false;    // ...and is actually drawing geometry right now
+		bool bAnyUnsettled = false;      // a record exists but is still waiting on a mesh
+	};
+	TMap<FIntVector, FColumnFlags> Columns;
+	Columns.Reserve(ChunkRecords.Num());
+	for (const auto& Pair : ChunkRecords)
+	{
+		FColumnFlags& Flags = Columns.FindOrAdd(FIntVector(Pair.Key.Level, Pair.Key.Key.X, Pair.Key.Key.Y));
+		Flags.bAnyRecord = true;
+		if (!Pair.Value.bMeshSettled)
+		{
+			Flags.bAnyUnsettled = true;
+		}
+		if (!Pair.Value.bDeepAnchorRelative) // failure mode 1: only surface records may vouch
+		{
+			Flags.bAnySettledNonDeep |= Pair.Value.bMeshSettled;
+			Flags.bAnyGeomNonDeep |= Pair.Value.HoldsGeometry();
+		}
+	}
+
+	const auto FindColumn = [&Columns](int32 L, int32 X, int32 Y) -> const FColumnFlags*
+	{ return Columns.Find(FIntVector(L, X, Y)); };
+
+	// --- pass 2: enumerate each ring's CORE annulus -------------------------
+	const FVector& Anchor = LastAnchorLocation;
+	const int32 MaxRingLevel = UVoxelWorldSubsystem::GetMaxRingLevel();
+	// Mirrored from the entry pass's AddCandidate side (see the Z question
+	// above). Hoisted: it is a command-line/cvar read, not a per-footprint one.
+	const bool bBandSkipArmed = VoxelStreamAdmission::AdmissionBandSkipMode() == 1;
+
+	int32 Holes = 0;
+	int32 Scanned = 0;
+	TArray<FString> Examples;
+	static constexpr int32 kMaxExamples = 8;
+
+	for (int32 Level = 0; Level <= MaxRingLevel; ++Level)
+	{
+		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::GetRingPresets()[Level];
+		const double InnerUU = Preset.InnerMeters * 100.0;
+		const double OuterUU = Preset.OuterMeters * 100.0;
+		const double ChunkEdge = ChunkEdgeUUForLevel(Level);
+		const FVoxelChunkKey AnchorChunk = ChunkKeyForVoxel(WorldToVoxelForLevel(Anchor, Level));
+		// Span from the CORE outer radius, not the seam-padded AdmitOuterUU: the
+		// padding band is admitted only where the parent is absent, so a footprint
+		// out there having no records is the padding rule working, not a hole.
+		// Verifying the core annulus alone keeps every reported hole unambiguous.
+		const int32 ChunkSpan = FMath::CeilToInt32(OuterUU / ChunkEdge) + 1;
+
+		for (int32 Cy = AnchorChunk.Y - ChunkSpan; Cy <= AnchorChunk.Y + ChunkSpan; ++Cy)
+		{
+			for (int32 Cx = AnchorChunk.X - ChunkSpan; Cx <= AnchorChunk.X + ChunkSpan; ++Cx)
+			{
+				// Identical centre math to the entry pass (RecomputeDesiredSet),
+				// including the `Level > 0` inner skip -- level 0's annulus starts
+				// at 0 and has no hole.
+				const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
+				const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
+				const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
+				if (Level > 0 && DistSq < FMath::Square(InnerUU))
+				{
+					continue; // a finer ring owns this footprint
+				}
+				if (DistSq >= FMath::Square(OuterUU))
+				{
+					continue; // outside the core annulus (seam padding band -- see above)
+				}
+				++Scanned;
+
+				const FColumnFlags* Self = FindColumn(Level, Cx, Cy);
+				bool bCovered = Self != nullptr && (Self->bAnySettledNonDeep || Self->bAnyGeomNonDeep);
+				if (!bCovered && Level + 1 < VoxelCoords::kNumLevels)
+				{
+					// (b) a coarser stand-in still on screen. Geometry, not settled.
+					const FColumnFlags* Parent = FindColumn(Level + 1, Cx >> 1, Cy >> 1);
+					bCovered = Parent != nullptr && Parent->bAnyGeomNonDeep;
+				}
+				if (!bCovered && Level > 0)
+				{
+					// (c) the finer ring has already taken the whole footprint.
+					bool bAllChildren = true;
+					for (int32 dx = 0; dx < 2 && bAllChildren; ++dx)
+					{
+						for (int32 dy = 0; dy < 2 && bAllChildren; ++dy)
+						{
+							const FColumnFlags* Child = FindColumn(Level - 1, Cx * 2 + dx, Cy * 2 + dy);
+							bAllChildren = Child != nullptr && Child->bAnySettledNonDeep;
+						}
+					}
+					bCovered = bAllChildren;
+				}
+				if (bCovered)
+				{
+					continue;
+				}
+
+				// The one legitimate zero-record path (see the Z question above):
+				// every chunk this footprint would have contained was dropped at
+				// admission because a cached band proved it empty. Deliberately
+				// re-derives the range through ComputeFootprintChunkZRange rather
+				// than FootprintChunkZRangeCached: the cached form populates the
+				// memo, and a verifier must not write to a structure the streaming
+				// path reads. Skirt included -- the entry pass widens ChunkZMin by
+				// it before the admission loop, so the mirror must too.
+				if (bBandSkipArmed && Level == 0)
+				{
+					if (const VoxelStreaming::FFootprintBand* Band = FootprintBandCache.Find(FIntPoint(Cx, Cy)))
+					{
+						int32 ZMin = 0, ZMax = 0, ZMaxUntrimmed = 0;
+						ComputeFootprintChunkZRange(Cx, Cy, 0, ZMin, ZMax, ZMaxUntrimmed);
+						ZMin -= VoxelUnderground::SkirtDepthChunks(0, DistSq);
+						bool bWholeColumnProvenEmpty = true;
+						for (int32 Cz = ZMin; Cz <= ZMax && bWholeColumnProvenEmpty; ++Cz)
+						{
+							bool bAllAir = false;
+							bWholeColumnProvenEmpty = VoxelStreaming::BandProvesChunkEmpty(*Band, Cz, bAllAir);
+						}
+						if (bWholeColumnProvenEmpty)
+						{
+							continue; // nothing was ever supposed to be drawn here
+						}
+					}
+				}
+
+				++Holes;
+				if (Examples.Num() < kMaxExamples)
+				{
+					// no-record        -- the column was never admitted (admission
+					//                     budget, distance cutoff, queue drop, or the
+					//                     entry-scan gate has not reached this level
+					//                     yet). A DESIRED-SET hole.
+					// unsettled        -- it WAS admitted and is still waiting on a
+					//                     mesh. A THROUGHPUT/latency hole.
+					// settled-deep-only-- records exist and have all settled, but every
+					//                     one of them is bDeepAnchorRelative, so
+					//                     nothing above ground is vouching. Rare, and
+					//                     it is neither of the other two, so it gets
+					//                     its own name rather than being filed under a
+					//                     label that would be false.
+					const TCHAR* Cause = (Self == nullptr || !Self->bAnyRecord)
+						? TEXT("no-record")
+						: (Self->bAnyUnsettled ? TEXT("unsettled") : TEXT("settled-deep-only"));
+					Examples.Add(FString::Printf(TEXT("hole R%d (%d,%d) r=%.0fm cause=%s"), Level, Cx, Cy,
+					                             FMath::Sqrt(DistSq) / 100.0, Cause));
+				}
+			}
+		}
+	}
+
+	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel coverage (window): holes=%d scanned=%d"), Holes, Scanned);
+	for (const FString& Example : Examples)
+	{
+		UE_LOG(LogVoxelPerf, Log, TEXT("  %s"), *Example);
+	}
+}
 
 // --- budgeted drains ----------------------------------------------------
 
@@ -8084,6 +8528,36 @@ void FVoxelWorldImpl::DrainUnloads()
 	int32 ComponentUnloads = 0; // render-thread-facing pool-parks this frame -- gated by MaxUnloads
 	int32 Pops = 0;             // total queue pops incl. free component-less evictions -- gated by kMaxUnloadPopsPerFrame
 	TArray<VoxelCoords::FVoxelLevelChunkKey> Deferred; // component-bearing unloads beyond MaxUnloads this frame
+
+	// voxel.Stream.LogRetention (ring-gap wave): name the releases the census
+	// line can only count. Radius from the anchor is the point of it -- the
+	// hypothesis is that covered-absent releases cluster at a ring's INNER edge,
+	// and that is a claim about a distance, not a total. Absent/Settled are -1
+	// for a cap release (no coverage query was made). The cvar read is hoisted
+	// out of the loop: this runs per popped unload and the loop pops up to 1024.
+	const bool bLogRetention = VoxelDebug::GetStreamLogRetention();
+	const auto LogRetentionRelease = [this, bLogRetention](const VoxelCoords::FVoxelLevelChunkKey& K, const TCHAR* Why,
+	                                                       uint8 Dir, int32 Absent, int32 SettledCount)
+	{
+		if (!bLogRetention)
+		{
+			return;
+		}
+		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(K.Level);
+		const double CenterX = (double(K.Key.X) + 0.5) * ChunkEdge;
+		const double CenterY = (double(K.Key.Y) + 0.5) * ChunkEdge;
+		const double RadiusM =
+			FMath::Sqrt(FMath::Square(CenterX - LastAnchorLocation.X) + FMath::Square(CenterY - LastAnchorLocation.Y)) /
+			100.0;
+		// `dir` is which side the replacement is on, and it is what says whether
+		// the absent keys below are 8 children or 1 parent.
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("  retention release %s R%d (%d,%d,%d) r=%.0fm dir=%s absent=%d settled=%d"),
+		       Why, K.Level, K.Key.X, K.Key.Y, K.Key.Z, RadiusM,
+		       Dir == RetainDir_Finer ? TEXT("finer") : (Dir == RetainDir_Coarser ? TEXT("coarser") : TEXT("none")),
+		       Absent, SettledCount);
+	};
+
 	while (Pops < kMaxUnloadPopsPerFrame && PendingUnloadKeys.Num() > 0)
 	{
 		const VoxelCoords::FVoxelLevelChunkKey Key = PendingUnloadKeys.Pop(EAllowShrinking::No);
@@ -8113,33 +8587,61 @@ void FVoxelWorldImpl::DrainUnloads()
 			// never retained have RetainUntilSeconds far in the past, so they park
 			// immediately as before.
 			//
-			// The three counters below are the whole diagnostic for this
-			// mechanism (there was none before, which is why the first cut's
-			// two bugs could only be found by reading source). Read them as:
-			//   held   -- stand-ins currently drawn waiting on a replacement
-			//   covrel -- released because the replacement actually arrived
-			//   caprel -- released because the SAFETY CAP expired first
-			// caprel is the one that matters. Near zero => retention is doing its
-			// job and replacements arrive in time. Large => the replacement is
-			// genuinely not streaming in inside LodRetentionMs, which is a
-			// THROUGHPUT problem (the ADR-0006 funnel), not a retention bug, and
-			// no coverage logic can fix it -- retention can only delay a hole,
-			// never manufacture a chunk.
+			// The counters below are the whole diagnostic for this mechanism
+			// (there was none before, which is why the first cut's two bugs could
+			// only be found by reading source). Read them as:
+			//   held         -- stand-ins currently drawn waiting on a replacement
+			//   covRelSettled-- released because the replacement RECORDS EXISTED
+			//                   and had all settled: the clean, sound release
+			//   covRelAbsent -- released because the replacement records were
+			//                   ABSENT, which ReplacementCovered treats as covered
+			//   capRel       -- released because the SAFETY CAP expired first
+			//
+			// capRel large => the replacement is genuinely not streaming in inside
+			// LodRetentionMs, which is a THROUGHPUT problem (the ADR-0006 funnel),
+			// not a retention bug: retention can only delay a hole, never
+			// manufacture a chunk.
+			//
+			// covRelAbsent is the ring-gap wave's number, and it is a hole
+			// SUSPICION, not a hole: absence is sound when the replacing ring
+			// genuinely declined the footprint and unsound when it merely has not
+			// been asked yet (admission budget, distance cutoff, queue drop, or
+			// the per-level entry-scan gate). See ReplacementCovered's comment.
+			// Split per level, because "R4 releasing on absent children at its
+			// inner edge" and "R0 releasing on an absent parent" are different
+			// bugs that a single total cannot tell apart.
 			if (Rec->RetainReplaceDir != RetainDir_None)
 			{
+				const int32 RetLevel = FMath::Clamp(Key.Level, 0, VoxelCoords::kNumLevels - 1);
 				if (ElapsedSeconds >= Rec->RetainUntilSeconds)
 				{
 					++RetainCapReleasesSinceLog;
-				}
-				else if (!ReplacementCovered(ChunkRecords, Key, Rec->RetainReplaceDir))
-				{
-					++RetainHeldThisFrame;
-					Deferred.Add(Key); // stays tracked + visible, retried next frame
-					continue;
+					++LevelRetainCapReleases[RetLevel];
+					LogRetentionRelease(Key, TEXT("cap"), Rec->RetainReplaceDir, /*Absent*/ -1, /*Settled*/ -1);
 				}
 				else
 				{
-					++RetainCoveredReleasesSinceLog;
+					bool bAnyAbsent = false;
+					int32 AbsentCount = 0;
+					int32 SettledCount = 0;
+					if (!ReplacementCovered(ChunkRecords, Key, Rec->RetainReplaceDir, &bAnyAbsent, &AbsentCount,
+					                        &SettledCount))
+					{
+						++RetainHeldThisFrame;
+						Deferred.Add(Key); // stays tracked + visible, retried next frame
+						continue;
+					}
+					if (bAnyAbsent)
+					{
+						++RetainCoveredAbsentReleasesSinceLog;
+						++LevelRetainCoveredAbsent[RetLevel];
+						LogRetentionRelease(Key, TEXT("covered-absent"), Rec->RetainReplaceDir, AbsentCount,
+						                    SettledCount);
+					}
+					else
+					{
+						++RetainCoveredSettledReleasesSinceLog;
+					}
 				}
 			}
 			if (ComponentUnloads >= MaxUnloads)

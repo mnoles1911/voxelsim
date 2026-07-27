@@ -53,6 +53,15 @@ enum class EVoxelPerfFlight : uint8
 	// assumption is checkable rather than assumed. That makes the renderer the
 	// only variable between two runs, which is the whole point.
 	Static,
+	// Straight-line traverse, not a loop. Surface (and underground) walk a
+	// closed 100 m circle, so after one lap every column the flight visits is
+	// already loaded -- neither can reproduce a bug that only shows up on
+	// CONTINUOUS entry into virgin terrain (a chunk boundary crossed once,
+	// streamed in, and never crossed again). Line exists for exactly that: fly
+	// a straight heading from the captured origin for the whole run, so the
+	// desired set keeps admitting new chunks instead of eventually re-treading
+	// ground the streamer already holds resident.
+	Line,
 };
 
 UCLASS()
@@ -147,6 +156,63 @@ private:
 	double LastSurfaceZUU = 0.0;
 	int32 UndergroundFrames = 0;
 	int32 TotalPathFrames = 0;
+
+	// -VoxelPerfHeading=<degrees>, line flight only. 0 = +X, 90 = +Y -- the
+	// ordinary FRotator::Yaw convention, so the pawn's facing (yaw = this
+	// value, see StepFlightPath) and its direction of travel agree by
+	// construction rather than needing to be kept in sync by hand. Defaults to
+	// +X: an arbitrary but stable choice that needs no per-world knowledge
+	// (unlike e.g. "toward the nearest unexplored region").
+	float HeadingDeg = 0.f;
+
+	// Line flight only: rate-limits how fast the ground-following Z target
+	// (see StepFlightPath) is allowed to move the pawn, expressed as a
+	// multiple of horizontal speed rather than an absolute m/s figure so the
+	// steepest "slope" the fixture can track scales with -VoxelPerfSpeed
+	// instead of going stale relative to it. Without this a cliff or a chunk
+	// seam's height discontinuity would teleport the pawn's Z in one frame --
+	// exactly the kind of frame the p95/hitch stats would then (wrongly)
+	// blame on streaming rather than on the fixture's own path math.
+	static constexpr double LineMaxZSpeedMultiplier = 2.0;
+
+	// Line flight only: the Z the pawn was actually placed at last tick, so
+	// this tick's ground-following target can be approached at the
+	// LineMaxZSpeedMultiplier-clamped rate instead of jumping straight to it.
+	// Seeded from FixedHeightUU (surface-at-origin + HeightAboveSurfaceUU) on
+	// path init, so frame 1 does not itself pop.
+	double LineLastZUU = 0.0;
+
+	// -VoxelPerfLingerSec=<seconds>, default 0 (no change from prior
+	// behaviour: FinishRun fires the instant ElapsedSeconds reaches
+	// DurationSeconds). The ring-gap investigation's signature is "holes
+	// appear while moving, fill in once you stop", and with LingerSec==0
+	// there is no way to observe that: RequestExit fires the moment the
+	// flight itself stops. LingerSec>0 keeps the process alive (StepFlightPath
+	// pins the pose, re-asserted every tick like EVoxelPerfFlight::Static)
+	// for that many extra seconds AFTER the flight ends, so the periodic
+	// LogVoxelPerf streaming lines -- which come from
+	// FVoxelWorldImpl::TickStreaming, not this subsystem, and keep flowing
+	// regardless of what this subsystem does -- are on the record across the
+	// fly-then-stop transition.
+	//
+	// CAVEAT, applies to whoever next reuses this switch: linger frames are
+	// still sampled into FrameMsSamples/PostWarmupFrameMsSamples same as any
+	// other frame (see Tick) -- the pawn isn't moving, but the world is still
+	// ticking and frame time is still frame time. Two legs being compared on
+	// FRAME-TIME metrics (p50/p95/hitchCount/...) must use the same
+	// LingerSec or the comparison is contaminated by how much quiescent-pinned
+	// time got averaged in on one side and not the other. The ring-gap legs
+	// this switch was built for only read the periodic streaming log lines,
+	// not this summary's frame stats, so they don't care -- the next use
+	// might.
+	float LingerSec = 0.f;
+
+	// Linger-phase pinned pose -- same re-assert-every-tick pattern as
+	// EVoxelPerfFlight::Static's StaticLocationUU/bStaticPoseCaptured, just
+	// captured once at the moment the flight ENDS rather than at run start.
+	bool bLingerPoseCaptured = false;
+	FVector LingerLocationUU = FVector::ZeroVector;
+	FRotator LingerRotation = FRotator::ZeroRotator;
 
 	// Shared with FVoxelWorldImpl::TickStreaming's per-frame hitch-attribution
 	// log (VoxelDebug.h) so both never disagree about which frames count as a
