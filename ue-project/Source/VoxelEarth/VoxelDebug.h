@@ -66,6 +66,25 @@ namespace VoxelDebug
 	// (see FVoxelWorldImpl::TickStreaming).
 	VOXELEARTH_API bool IsRingsEnabled();
 
+	// voxel.Debug.PlayerBox: the player's collision-volume wireframe,
+	// eye-height marker and ground-probe voxel cells
+	// (UVoxelCharacterMovementComponent::DebugDrawVolume), drawn in walk mode.
+	//
+	// THE ODD ONE OUT, deliberately: it does NOT fold in the mode>=2 gate the
+	// three layers above do, and it defaults ON. It is not a diagnostic layer
+	// but a scale reference for ordinary play-testing -- with 10 cm voxels and a
+	// kilometres-wide world there is otherwise nothing in frame to judge size
+	// against -- so requiring two F3 presses to see it would defeat it. The
+	// cvar exists so a capture can turn it OFF; suppression for unattended
+	// fixture runs is automatic (IsUnattendedFixtureRun, checked by the drawing
+	// code) so this never lands in a verification screenshot.
+	//
+	// Because there is no gate to hide, this getter IS the raw cvar value, so
+	// unlike Bounds/ChunkStates/Rings there is no separate Get*CVar companion
+	// for the overlay to call.
+	VOXELEARTH_API bool IsPlayerBoxEnabled();
+	VOXELEARTH_API void SetPlayerBoxEnabled(bool bEnabled);
+
 	// Programmatic setter (ECVF_SetByCode, mirrors SetDebugMode) -- used by
 	// the -VoxelDebugRings command-line switch (AVoxelEarthGameMode::BeginPlay)
 	// to force voxel.Debug=2 + voxel.Debug.Rings=1 for headless verification

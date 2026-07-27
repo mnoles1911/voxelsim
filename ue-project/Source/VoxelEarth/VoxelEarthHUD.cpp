@@ -241,6 +241,11 @@ void AVoxelEarthHUD::AdjustOverlaySelection(int32 Delta)
 		}
 		break;
 
+	case EOverlayRow::PlayerBox:
+		// No mode>=2 gate to work around, so this reads the same value it sets.
+		VoxelDebug::SetPlayerBoxEnabled(!VoxelDebug::IsPlayerBoxEnabled());
+		break;
+
 	case EOverlayRow::DebugMode:
 		// 0 -> 1 -> 2 -> 0, the same cycle F3 drives; Left steps backwards so
 		// the row behaves like every other value row.
@@ -324,8 +329,11 @@ void AVoxelEarthHUD::DrawDebugOverlay()
 	// wide) or the dig/place text block (bottom-left).
 	const float PanelX = FMath::Max(OverlayMarginPx, Canvas->SizeX - OverlayPanelWidthPx - OverlayMarginPx);
 	// Row budget with a little slack: an over-estimate is invisible, an
-	// under-estimate clips text outside the panel.
-	const float PanelHeight = OverlayLineHeightPx * 28.f + 12.f;
+	// under-estimate clips text outside the panel. Raised 28 -> 29 when the
+	// Player volume row was added; the worst-case path (real tiles + bounding
+	// box known, debug mode >= 1) now emits 28 lines plus 16px of spacers, which
+	// the old budget was 4px short of covering.
+	const float PanelHeight = OverlayLineHeightPx * 29.f + 12.f;
 	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.70f), PanelX, OverlayMarginPx, OverlayPanelWidthPx, PanelHeight);
 
 	float Y = OverlayMarginPx + 5.f;
@@ -517,6 +525,12 @@ void AVoxelEarthHUD::DrawDebugOverlay()
 		}
 	}
 	DrawOverlayRow(EOverlayRow::FlySpeed, SpeedLabel, SpeedValue, PanelX, Y);
+
+	// Deliberately carries NO "(needs voxel.Debug 2)" suffix -- unlike the three
+	// layer rows below, this one is live at any debug mode and defaults on.
+	DrawOverlayRow(EOverlayRow::PlayerBox, TEXT("Player volume  (walk)"),
+	               FString::Printf(TEXT("%s  box + eye line + ground cells"), *OnOff(VoxelDebug::IsPlayerBoxEnabled())),
+	               PanelX, Y);
 
 	DrawOverlayRow(EOverlayRow::DebugMode, TEXT("voxel.Debug    (F3)"),
 	               FString::Printf(TEXT("%d  (0 off, 1 perf HUD, 2 +layers)"), VoxelDebug::GetDebugMode()), PanelX, Y);

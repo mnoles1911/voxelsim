@@ -7,9 +7,9 @@
 #include "GameFramework/FloatingPawnMovement.h"
 #include "GameFramework/PlayerInput.h"
 #include "InputCoreTypes.h"
-// VoxelCoords.h / VoxelDebug.h are deliberately gone: the voxel lattice maths
-// they provided moved out with the mover (VoxelCharacterMovement.cpp), and this
-// file now only needs the subsystem for the third-person boom's DDA raycast.
+// VoxelCoords.h is deliberately absent: the voxel lattice maths it provided
+// moved out with the mover (VoxelCharacterMovement.cpp), and this file now only
+// needs the subsystem for the third-person boom's DDA raycast.
 #include "VoxelCharacterMovement.h"
 #include "VoxelMovementTuning.h"
 #include "VoxelProxyBody.h"
@@ -490,6 +490,17 @@ void AVoxelEarthFlyPawn::Tick(float DeltaTime)
 	}
 
 	UpdateCameraSmoothing(DeltaTime);
+
+	// Player scale reference (voxel.Debug.PlayerBox, default ON). Walk mode
+	// only -- fly mode has no collision volume to describe, so drawing one
+	// there would be fiction. Issued AFTER UpdateCameraSmoothing so the eye
+	// height passed in is this frame's blended value rather than last frame's;
+	// the marker is meant to show the crouch ease and step-smoothing lag, which
+	// a frame-stale value would misreport by exactly the amount of interest.
+	if (bWalkMode && WalkMovement)
+	{
+		WalkMovement->DebugDrawVolume(GetHeadWorldLocation().Z);
+	}
 
 	if (ProxyBody)
 	{

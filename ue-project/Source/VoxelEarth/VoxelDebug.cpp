@@ -43,6 +43,17 @@ TAutoConsoleVariable<bool> CVarVoxelDebugBounds(
 	TEXT("Chunk AABB bounds wireframe for the nearest ~200 tracked chunks. Live under voxel.Debug 2."),
 	ECVF_Default);
 
+// NOTE: this is the ONE layer that is deliberately NOT gated behind
+// voxel.Debug 2 -- see VoxelDebug.h. It is a play-testing scale reference, on in
+// normal play by design; the cvar exists so screenshots can turn it off, not so
+// it has to be turned on.
+TAutoConsoleVariable<bool> CVarVoxelDebugPlayerBox(
+	TEXT("voxel.Debug.PlayerBox"),
+	true,
+	TEXT("Player collision-volume wireframe, eye-height marker and ground-probe voxel cells, drawn in walk mode. ")
+	TEXT("Unlike the other layers this is live at ANY voxel.Debug mode (default on); set 0 for a clean capture."),
+	ECVF_Default);
+
 TAutoConsoleVariable<bool> CVarVoxelDebugRings(
 	TEXT("voxel.Debug.Rings"),
 	false,
@@ -525,6 +536,21 @@ bool VoxelDebug::IsBoundsEnabled()
 bool VoxelDebug::IsRingsEnabled()
 {
 	return GetDebugMode() >= 2 && CVarVoxelDebugRings.GetValueOnAnyThread();
+}
+
+bool VoxelDebug::IsPlayerBoxEnabled()
+{
+	// NO mode>=2 gate, unlike every other Is*Enabled above. That is the whole
+	// point: the player volume is a scale reference for ordinary play-testing,
+	// so it must not require two F3 presses to appear. Because the gate is
+	// absent, this doubles as the raw cvar read and there is no separate
+	// Get*CVar companion for the overlay to call.
+	return CVarVoxelDebugPlayerBox.GetValueOnAnyThread();
+}
+
+void VoxelDebug::SetPlayerBoxEnabled(bool bEnabled)
+{
+	CVarVoxelDebugPlayerBox->Set(bEnabled, ECVF_SetByCode);
 }
 
 void VoxelDebug::SetRingsEnabled(bool bEnabled)

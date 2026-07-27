@@ -1,8 +1,10 @@
 #include "VoxelCharacterMovement.h"
 
+#include "DrawDebugHelpers.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "VoxelCoords.h"
+#include "VoxelDebug.h"
 #include "VoxelWorldSubsystem.h"
 
 namespace
@@ -397,6 +399,84 @@ bool UVoxelCharacterMovementComponent::IsTerrainReadyAt(const FVector& Pos) cons
 		return false;
 	}
 	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Debug visualization
+// ---------------------------------------------------------------------------
+
+void UVoxelCharacterMovementComponent::DebugDrawVolume(double EyeWorldZ) const
+{
+	// Self-gating, mirroring FVoxelWorldImpl::DrawDebugBoundsLayer. The cvar is
+	// an OFF switch (it defaults on -- see VoxelDebug.h), and the fixture check
+	// is what keeps an always-on layer out of verification captures: walk mode
+	// is reachable in unattended runs via -VoxelWalkModeAfter=, so without it
+	// every such screenshot would gain a wireframe box.
+	if (!VoxelDebug::IsPlayerBoxEnabled() || VoxelDebug::IsUnattendedFixtureRun())
+	{
+		return;
+	}
+
+	const AActor* Owner = GetOwner();
+	UWorld* World = GetWorld();
+	if (!Owner || !World)
+	{
+		return;
+	}
+
+	const FVector Center = Owner->GetActorLocation();
+	const double HalfZ = GetHalfExtentZ();
+
+	// THE COLLISION BOX. Drawn with the UN-ROTATED DrawDebugBox overload, and it
+	// must stay that way: SweepAxis resolves collision along WORLD axes and
+	// never consults the actor's rotation, so a box drawn with the actor's yaw
+	// would be a lie that grows worse the further you turn from north. The
+	// DrawDebugBox overload taking an FQuat is the wrong one here.
+	const FColor BoxColor = bCrouched ? FColor(255, 140, 0) : FColor::Yellow;
+	DrawDebugBox(World, Center, FVector(BoxHalfExtentXY, BoxHalfExtentXY, HalfZ), BoxColor,
+	             /*bPersistent*/ false, /*LifeTime*/ -1.f, /*DepthPriority*/ 0, DebugBoxThickness);
+
+	// EYE HEIGHT. A flat square across the footprint at the caller's real camera
+	// height -- so it shows the crouch blend easing and the step-smoothing lag
+	// as they happen, which a marker at the nominal offset could not.
+	DrawDebugBox(World, FVector(Center.X, Center.Y, EyeWorldZ),
+	             FVector(BoxHalfExtentXY, BoxHalfExtentXY, DebugFlatHalfThicknessUU), FColor::White,
+	             /*bPersistent*/ false, /*LifeTime*/ -1.f, /*DepthPriority*/ 0, DebugMarkerThickness);
+
+	// GROUND PROBE CELLS. Exactly the cells IsGroundedAt iterates -- same
+	// AxisVoxelRange, same ProbeVZ -- coloured by the same IsSolidAtVoxel answer
+	// it acts on. This is the useful part: it shows directly why the crouched
+	// ledge-stop fires and what the step-up is reasoning about, instead of
+	// leaving both to be inferred from the character's behaviour.
+	UVoxelWorldSubsystem* Subsystem = GetVoxelWorldSubsystem();
+	if (!Subsystem)
+	{
+		return;
+	}
+
+	const double BottomZ = Center.Z - HalfZ;
+	const int64 ProbeVZ = (int64)FMath::FloorToDouble(BottomZ / VoxelCoords::VoxelSizeUU) - 1;
+
+	int64 VXMin, VXMax, VYMin, VYMax;
+	AxisVoxelRange(Center.X - BoxHalfExtentXY, Center.X + BoxHalfExtentXY, VXMin, VXMax);
+	AxisVoxelRange(Center.Y - BoxHalfExtentXY, Center.Y + BoxHalfExtentXY, VYMin, VYMax);
+
+	// Top face of the probed layer -- the surface actually being stood on.
+	const double CellTopZ = double(ProbeVZ + 1) * VoxelCoords::VoxelSizeUU + DebugGroundCellLiftUU;
+	const double HalfCell = VoxelCoords::VoxelSizeUU * 0.5;
+
+	for (int64 VX = VXMin; VX <= VXMax; ++VX)
+	{
+		for (int64 VY = VYMin; VY <= VYMax; ++VY)
+		{
+			const bool bSolid = Subsystem->IsSolidAtVoxel(VX, VY, ProbeVZ);
+			const FVector CellCenter((double(VX) + 0.5) * VoxelCoords::VoxelSizeUU,
+			                          (double(VY) + 0.5) * VoxelCoords::VoxelSizeUU, CellTopZ);
+			DrawDebugBox(World, CellCenter, FVector(HalfCell, HalfCell, DebugFlatHalfThicknessUU),
+			             bSolid ? FColor::Green : FColor::Red,
+			             /*bPersistent*/ false, /*LifeTime*/ -1.f, /*DepthPriority*/ 0, DebugMarkerThickness);
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

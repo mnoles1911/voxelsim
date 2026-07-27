@@ -47,6 +47,11 @@ private:
 	{
 		MovementMode = 0,
 		FlySpeed,
+		// Sits with the movement rows, not with the mode-2 layers below, because
+		// voxel.Debug.PlayerBox is deliberately NOT gated on voxel.Debug >= 2
+		// (see VoxelDebug.h) -- grouping it with them would imply a gate it does
+		// not have.
+		PlayerBox,
 		DebugMode,
 		ChunkStates,
 		Bounds,

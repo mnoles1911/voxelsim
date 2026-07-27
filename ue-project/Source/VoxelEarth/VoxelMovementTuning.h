@@ -200,6 +200,24 @@ namespace VoxelMovementTuning
 	// in both stances instead of merely suggesting a crouch.
 	inline constexpr double ProxyCrouchScaleZ = CrouchHalfExtentZ / StandHalfExtentZ; // 2/3
 
+	// --- Player volume debug draw -------------------------------------------
+	//
+	// A scale reference for play-testing (voxel.Debug.PlayerBox, default ON in
+	// walk mode). Colours deliberately avoid CYAN, which the chunk-bounds layer
+	// already owns (FVoxelWorldImpl::DrawDebugBoundsLayer) -- with both layers
+	// up, two wireframe boxes in the same colour would be unreadable.
+
+	inline constexpr float DebugBoxThickness = 2.0f;
+	inline constexpr float DebugMarkerThickness = 1.5f;
+
+	// Flat markers are drawn as boxes with a near-zero extent on one axis.
+	inline constexpr double DebugFlatHalfThicknessUU = 0.5;
+
+	// Ground-probe cells are drawn on the TOP face of the probed voxel layer --
+	// i.e. the surface being stood on -- lifted by this much so they do not
+	// z-fight with the terrain they sit on.
+	inline constexpr double DebugGroundCellLiftUU = 0.5;
+
 	// --- Helpers ------------------------------------------------------------
 
 	inline constexpr int32 ClampTierIndex(int32 Index)
