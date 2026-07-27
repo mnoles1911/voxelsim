@@ -2779,6 +2779,13 @@ struct FVoxelWorldImpl
 	// r=124-128 m across four independent instrumented legs).
 	FVector2D LastEntryScanAnchorXY[VoxelCoords::kNumLevels] = {};
 
+	// Quiescence detector for the stale-scan refill (rev B): the trigger above
+	// only fires once the anchor has been effectively still for half a second,
+	// because firing it while MOVING fed re-admission churn without buying any
+	// coverage (see the trigger's comment for the measured numbers).
+	FVector2D LastQuiescenceAnchorXY = FVector2D(DBL_MAX, DBL_MAX);
+	float AnchorStillSeconds = 0.f;
+
 	// ComputeFootprintChunkZRange memo (docs/status.md "R3/R4 recompute
 	// amortization"). That function is a PURE function of (Level, ChunkX,
 	// ChunkY) and the amplifier -- and the amplifier is a pure function of the
@@ -3789,22 +3796,40 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// both of those A/B the admission-budget mechanism, and neither of the two
 	// paths above has anything to do with the admission budget.
 	//
-	// COST, AND WHERE TO LOOK IF IT SHOWS UP. Self-quiescing covers the PINNED
-	// anchor, not a slowly MOVING one: a level whose ring has fully converged
-	// (queue empty) while the anchor creeps re-scans on every tick that moves it
-	// more than 1 UU, instead of once per level-L chunk crossing. That is the
-	// same shape as the ~3 ms p95 regression the deferred path's "EMPTY, not a
-	// quarter-share" note above describes, and R0's entry scan is the 1.6-2.4 ms
-	// one. It did not appear on the 2026-07-27 legs (a flight keeps every ring's
-	// queue fed, so the empty-queue precondition is false throughout), but WALKING
-	// on already-loaded ground is the case that was never measured. If p95 climbs
-	// on a slow-movement profile, this trigger is the first suspect. The
-	// threshold is therefore scaled to the level's chunk edge (edge/4) rather
-	// than an absolute distance: a converged ring re-scans at worst 4x as often
-	// as its own crossing gate while drifting over loaded ground, and the
-	// residual pin staleness (<= edge/4) stays well under the seam padding
-	// (edge/sqrt(2)), so defect (2) stays closed.
-	if (bHasRecomputed)
+	// QUIESCENT-ANCHOR GATE (rev B, same day). The first cut fired this trigger
+	// whenever a level's queue drained, and the prediction two paragraphs up --
+	// that a flight keeps every ring's queue fed -- was measured WRONG the same
+	// night: R1-R5 queues empty routinely mid-flight, so the trigger fired at
+	// exactly the edge/4 rate all flight long (R1-R5 entry scans x3.9, matched
+	// to <2%). The scans themselves were cheap (+0.1% recompute on the GPU leg)
+	// but the RE-ADMISSION CHURN they fed was not: coarse fork dispatches +17%
+	// (L3 +271%), CPU stale drains +143%, R0 mean residency crowded from 864
+	// down to 653, and it seeded the pre-existing R4 deferred-refill oscillation
+	// on 83% of flight ticks (10.3x its baseline). None of that bought coverage
+	// -- the residue this trigger exists to heal is a PINNED-anchor defect, and
+	// while moving, the crossing gates already rescan every level.
+	//
+	// So the trigger now requires the anchor to have been QUIESCENT for
+	// kStaleRescanStillSeconds first: the deterministic residue heals within a
+	// second of stopping (the trigger then fires each stale level exactly once
+	// and goes quiet), and a moving anchor gets byte-identical behavior to the
+	// pre-trigger build. A slow CREEP (below the quiescence threshold per tick
+	// but never still) keeps the crossing gates as its only rescan source --
+	// acceptable, because creep also keeps firing them.
+	{
+		const FVector2D AnchorXY(Anchor.X, Anchor.Y);
+		const double kStillEpsilonUU = 1.0; // float noise, not movement
+		if (FVector2D::DistSquared(AnchorXY, LastQuiescenceAnchorXY) > FMath::Square(kStillEpsilonUU))
+		{
+			LastQuiescenceAnchorXY = AnchorXY;
+			AnchorStillSeconds = 0.f;
+		}
+		else
+		{
+			AnchorStillSeconds += DeltaTime;
+		}
+	}
+	if (bHasRecomputed && AnchorStillSeconds >= 0.5f /*kStaleRescanStillSeconds*/)
 	{
 		const FVector2D AnchorXY(Anchor.X, Anchor.Y);
 		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
@@ -6859,11 +6884,22 @@ void FVoxelWorldImpl::LogCoverageVerify()
 
 				const FColumnFlags* Self = FindColumn(Level, Cx, Cy);
 				bool bCovered = Self != nullptr && (Self->bAnySettledNonDeep || Self->bAnyGeomNonDeep);
-				if (!bCovered && Level + 1 < VoxelCoords::kNumLevels)
+				if (!bCovered)
 				{
 					// (b) a coarser stand-in still on screen. Geometry, not settled.
-					const FColumnFlags* Parent = FindColumn(Level + 1, Cx >> 1, Cy >> 1);
-					bCovered = Parent != nullptr && Parent->bAnyGeomNonDeep;
+					// Walk EVERY coarser level, not just the parent: under motion
+					// the leading-edge cascade legitimately runs two levels behind
+					// (an R2 stand-in held while R1 is still meshing and R0 has
+					// not started), and footprints nest exactly, so a drawn
+					// ancestor at any remove genuinely covers this column. The
+					// first cut checked only L+1 and misread every such bridged
+					// column as a hole (~1600 per window during the 2026-07-27
+					// verification flights), burying the real signal.
+					for (int32 Up = Level + 1; Up < VoxelCoords::kNumLevels && !bCovered; ++Up)
+					{
+						const FColumnFlags* Ancestor = FindColumn(Up, Cx >> (Up - Level), Cy >> (Up - Level));
+						bCovered = Ancestor != nullptr && Ancestor->bAnyGeomNonDeep;
+					}
 				}
 				if (!bCovered && Level > 0)
 				{
