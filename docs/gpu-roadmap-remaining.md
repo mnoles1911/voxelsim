@@ -214,7 +214,47 @@ red determinism gate is the project's most important invariant failing quietly.
 
 ---
 
-## Wave D — GPU meshing in the streaming path — **IN PROGRESS**
+## Wave D — GPU meshing in the streaming path — **BUILT, GATED, MEASURED; OFF BY DEFAULT**
+
+> **This is the wave ADR-0006 recorded as complete and never made.** Until
+> 2026-07-26 `FVoxelGpuMeshJobManager` was referenced from exactly one file — a
+> test harness — while `MeshChunkBricks` ran from seven sites in the streaming
+> path. The producer is now switched.
+>
+> | | |
+> |---|---|
+> | bit-exact vs `MeshChunkBricks` | 16/16 chunks byte-identical |
+> | coarse L0–L4 vs `coarseColumns` + `makeCoarseBrick` | bit-exact: columns, cells **and** quads |
+> | determinism digest | `6e893ab3679a8c81` unchanged throughout |
+> | cold fill, R0 = 128 m | **36.3 / 38.3 s** vs CPU 58.4 / 60.4 s |
+> | cold fill, shipped 64 m | no regression; ~10% ahead through the fill |
+> | under motion, 20 m/s | pending backlog **−85%**, resident **+6%** |
+> | a dig | edit propagation byte-identical to CPU |
+> | health | `failed=0`, `markTimeouts=0`, `gpuLatencyTimeouts=0` |
+>
+> **Two changes were required and neither works alone**, which is the finding
+> rather than a detail: coarse levels *without* a separate GPU in-flight budget
+> were **3.4× worse** (205 s), and the budget *without* coarse levels changed
+> nothing. Levels 1–5 are ~80% of resident chunks, and a GPU round trip is
+> ~28 ms against a worker’s ~1 ms, so the fork only pays once enough work is in
+> flight to hide the latency.
+>
+> **The blocker was a unit error.** `MaxJobsInFlight` sizes a pool of *threads*
+> (2 × cores = 24). A GPU job is a *round trip*. The fork sat at 19–20 in flight
+> against a cap of 256 — waiting, not saturated. Wave D’s own design pass wrote
+> that down in advance and it was noted and not acted on.
+>
+> **Corrected on the record:** "batching is the headline fix" was published and
+> is **retracted**. Batching may still help (one 32³ chunk dispatches 48³ voxels,
+> 3.4× waste) but it was not the blocker, and the fix cost one line.
+>
+> **Why it is still off:** frame cost is unmeasured, and *cannot* be measured by
+> this harness — `-VoxelPerfRun` samples a world delta the engine clamps at
+> 400 ms. Residency and frame cost are different claims, and voxel GI is the
+> precedent for the difference mattering (p50 +0.6%, hitches ×3.2). See
+> `manual-verification-checklist.md` §9. **Still owed besides that:** the ring
+> skirt on the GPU (boundary chunks stay on the CPU today), level 5 unproven on
+> a second fixture, and the dig’s *visual* half.
 
 This is the never-built headline of ADR-0006 invariant 1: *"a compute pipeline …
 replaces the CPU worker mesh + per-chunk vertex upload for streaming."*

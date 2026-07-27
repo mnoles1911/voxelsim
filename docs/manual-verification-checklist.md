@@ -365,6 +365,54 @@ you move, that is a **stale shadow-map cache** (cached whole-scene shadows or a
 virtual-shadow-map page holding geometry that has stopped casting). That is a real
 defect and worth reporting; it is not the quality trade above and it would make
 the cap look correct in every measurement while being wrong on screen.
+## 9. GPU meshing — the one number that decides whether it ships (added Wave D5)
+
+**Everything else about this is measured and good. This is the gap.**
+
+`-VoxelGpuMesh -VoxelGpuMeshMaxLevel=4` moves chunk meshing off the ~24 CPU
+worker threads and onto the GPU. It is **off by default**, and the reason is not
+doubt about correctness:
+
+| what | result |
+|---|---|
+| bit-exactness vs `MeshChunkBricks` | 16/16 chunks byte-identical |
+| coarse levels vs `coarseColumns` + `makeCoarseBrick` | bit-exact L0–L4, columns + cells + quads |
+| cold fill, R0 = 128 m | **36.3 / 38.3 s** vs CPU 58.4 / 60.4 s |
+| cold fill, shipped 64 m | no regression; ~10% ahead through the fill |
+| under motion (20 m/s) | pending backlog **−85%**, resident **+6%** |
+| a dig | edit propagation **byte-identical** to CPU |
+| failures / strands | `failed=0`, `markTimeouts=0`, `gpuLatencyTimeouts=0` |
+
+**What is missing is frame cost, and it is missing for a structural reason.**
+`-VoxelPerfRun` samples the world delta, which the engine clamps at 400 ms
+(`MaxUndilatedFrameTime`), so the automated harness *cannot* measure frame time
+here at all — the same trap that made two water configurations read identically
+at exactly 400.00 ms. A human reading `stat unit` is the measurement, not a
+fallback.
+
+So, ten minutes with the machine to yourself:
+
+1. Launch normally, get to a dense view, hold **completely still**, settle, read
+   `stat unit` — Frame / Draw / GPU.
+2. Quit. Relaunch with `-VoxelGpuMesh -VoxelGpuMeshMaxLevel=4`, return to the
+   **same spot and view direction**, settle, read again.
+3. Twice each, alternating, and treat the two same-config readings as the noise
+   floor.
+
+**What would make this a no.** The fork keeps residency ahead of the camera —
+that is what the motion numbers say — but residency and frame cost are different
+claims. If frames get *worse* while chunks arrive sooner, that is a bad trade and
+the default stays off. Watch for **intermittent stutter over a minute** rather
+than a worse steady number: a GPU round trip is ~28 ms against a worker's ~1 ms,
+so if this costs anything it will cost it in the tail, exactly as voxel GI did
+(§6, where p50 moved 0.6% and the hitch count tripled).
+
+Also worth one look while you are there: **fly, then stop**. The fork's whole
+claim is that terrain arrives sooner under motion. If it does not *look* that
+way, the log and the eye disagree and the eye wins.
+
+---
+
 
 ## Why this file exists
 
