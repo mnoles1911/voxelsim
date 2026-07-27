@@ -1,0 +1,42 @@
+Re-measuring the fork now that RING-BOUNDARY CHUNKS ARE INCLUDED (D5.3).
+
+WHY THIS RE-RUN EXISTS. Every earlier fork number -- 128 m 36.3/38.3 s, the 64 m
+fill curve, the -85% motion backlog -- was taken while boundary chunks were
+EXCLUDED and meshed on the CPU. The skirt landing removed that carve-out, so the
+fork now takes strictly more work than any configuration those numbers describe.
+Carrying them forward unchanged would have been quoting a different build.
+
+R0 = 128 m, default spawn, static pose, edit log cleared per leg, settle = idle
+AND at peak residency.
+
+  leg                  settle      peak    forked   maxDeliverMs
+  CPU 1                 62.5 s   43,328         0             --
+  CPU 2                 62.4 s   43,328         0             --
+  fork 1                42.4 s   43,328    34,029        7,395.4
+  fork 2            NO SETTLE     42,625    33,991          519.1
+  fork 3                42.3 s   43,328    34,001          580.9
+  fork 4                42.4 s   43,328    34,104          514.6
+
+  fork is ~32% faster (42.4 vs 62.5), spread 0.1 s within BOTH configs.
+
+TWO THINGS I AM NOT GLOSSING.
+
+1. ONE LEG IN FOUR DID NOT FINISH. fork 2 reached 42,625 of 43,328 -- 98.4% --
+   inside a 300 s budget and stopped there. Three of four reached full peak in
+   42.3-42.4 s, so this is a tail rather than the typical case, but it is a real
+   tail and it did not appear in the pre-skirt runs.
+
+2. A 7,395 ms SUBMIT->DELIVER OUTLIER, which is ABOVE kBlindJobMarkTimeoutSeconds
+   (5.0 s). gpuLatencyTimeouts stayed 0 -- that counter only fires for a
+   footprint whose band mark is outstanding, and a footprint with a cached band
+   has no mark to time out -- so the backstop was not tripped, but the latency
+   that would trip it now occurs. Boundary chunks are the coarse ones, and a
+   level-4 dispatch covers 16x the world area of a level-0 one.
+
+DO NOT COMPARE THESE TO THE PRE-SKIRT NUMBERS ACROSS SESSIONS. The CPU baseline
+itself moved from 58.4/60.4 s to 62.4/62.5 s between the two runs, which means
+the box is not in the same state -- so the honest comparison is within-session
+ratio: pre-skirt fork/CPU 36.3/58.4 = 0.62, post-skirt 42.4/62.5 = 0.68. The
+fork is still clearly ahead and is doing MORE work than before; the ratio moving
+the way it did is what you would expect from adding the coarsest chunks, not a
+sign of a defect.
