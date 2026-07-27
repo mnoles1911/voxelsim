@@ -1,0 +1,39 @@
+D5.3a -- coarse levels through D4's fork. A NEGATIVE result, recorded as one.
+
+R0 = 128 m, default spawn, -VoxelPerfFlight=static, edit log cleared per leg,
+settle = idle AND at peak residency.
+
+  config                         settle      peak    fork chunks
+  64 m,  CPU                       6.0 s    11,010            0
+  128 m, CPU                      58.4 s    43,328            0
+  128 m, CPU                      60.4 s    43,328            0
+  128 m, fork L0 only             60.4 s    43,328        9,200
+  128 m, fork L0-L4              205.4 s    43,328       51,720
+  128 m, fork L0-L4           NO SETTLE     39,810       51,573   (420 s budget)
+
+Per-level dispatch, coarse leg:  L0 9201  L1 10280  L2 10464  L3 10892
+                                 L4 10883  L5 0 (capped)
+
+So the fork took 5.6x the chunks and spread them across the levels exactly as
+intended -- and cold fill got 3.4x WORSE.
+
+IT IS NOT CORRECTNESS. failed=0 across 105 and 102 five-second windows,
+markTimeouts=0, gpuLatencyTimeouts=0, blindInFlight=0, bandCache=5088, and
+voxel.GPU.VerifyCoarse proves L0-L4 bit-exact against coarseColumns +
+makeCoarseBrick on columns, cells AND quads.
+
+IT IS LATENCY. submit->deliver max went 90.9 ms (L0 only) -> 4,025.5 ms (L0-L4),
+and the fork sits at 19-20 in flight against a cap of 256 -- waiting, not
+saturated.
+
+THE CAUSE IS THE ONE THE PLAN NAMED AND D4 NEVER BUILT: batching. A region
+dispatch is a brick-aligned slab with a one-brick halo, so meshing a single 32^3
+chunk dispatches 48^3 voxels -- 3.4x waste -- and D3's split readback adds a
+second round trip per chunk. Against ~24 CPU workers each finishing a chunk in
+~1 ms, one queue of ~28 ms round trips loses however exact it is.
+
+CONSEQUENCE: voxel.Stream.GPUMeshMaxLevel defaults to 0. The levels are
+available (-VoxelGpuMeshMaxLevel=4) for measurement, and nothing becomes 3.4x
+slower merely by passing -VoxelGpuMesh. The cap for any future default is 4, not
+5: L5 passes on [origin] and its [far-negative] dispatch is refused because that
+fixture collapses to 2 coarse bricks of z, so L5 is UNPROVEN rather than broken.
