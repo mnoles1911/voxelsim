@@ -12,7 +12,7 @@ TGlobalResource<FVoxelGIVolume> GVoxelGIVolume;
 namespace
 {
 	TAutoConsoleVariable<int32> CVarGIVolume(
-		TEXT("voxel.GI.Volume"), 0,
+		TEXT("voxel.GI.Volume"), 1,   // 2026-07-27: ON for the manual PIE evaluation.
 		TEXT("Sample the voxel GI light field from a GPU volume texture instead of reading it off ")
 		TEXT("baked vertex colours. 0 = off (default) and genuinely zero-cost: the vertex factory ")
 		TEXT("skips the sample, the texture is not even allocated, and the emitted vertex colours ")
@@ -36,7 +36,7 @@ namespace
 		ECVF_Default);
 
 	TAutoConsoleVariable<int32> CVarGIVolumeDim(
-		TEXT("voxel.GI.VolumeDim"), 64,
+		TEXT("voxel.GI.VolumeDim"), 192,  // 2026-07-27: 64 covers only +/-12.8 m (~36 of ~1,950 resident bricks) -- not enough to judge by eye. 192 is the size Wave B measured Scheme A at.
 		TEXT("Per-axis texel count of the GI volume. Covers +/-(N*20) unreal units at 40 UU per cell, ")
 		TEXT("and costs N^3 * 4 bytes: 64 -> 12.8 m, 1 MB; 256 -> 51.2 m, 67 MB. STARTUP ONLY -- the ")
 		TEXT("texture is allocated once."),

@@ -13,13 +13,22 @@ Current defaults, so you know what you are looking at without setting anything:
 
 | cvar / switch | default | meaning |
 |---|---|---|
-| `voxel.Stream.GPU` | **0** | terrain renders on the per-chunk component path. The reason has changed: not "it drops geometry" (fixed) but that the pooled path costs ~0.15 ms **more** than the component path at a down-facing pose. The fix is compaction, which is not built. |
-| `voxel.Stream.GPUCull` | **1** | pooled frustum cull is **on**, and its output is verified pixel-identical to the single full draw. The pool's cost now tracks what is on screen. |
-| `voxel.Water.GPU` | 0 | water on the per-chunk path |
-| `voxel.GI.Enabled` | **0** | voxel GI off. Measured cost of turning it on: free at the median (+0.6% p50) but **3.2× the hitches and +14.9% p95**, neither overlapping the off-baseline. |
-| `voxel.GI.Volume` | 0 | GPU GI volume off. Additionally it has **no consumer** under `voxel.Stream.GPU 0` — only the pooled vertex factory samples it, so with the default above it changes nothing at all. See §6. |
+| `voxel.Stream.GPU` | **1** | **CHANGED 2026-07-27.** Terrain renders through the GPU pool: one primitive, one draw. Was 0. |
+| `voxel.Stream.GPUCull` | **1** | pooled frustum cull, verified pixel-identical to the full draw. Only does anything now that the pool is on. |
+| `-VoxelGpuMesh` | **on** | **CHANGED 2026-07-27.** Chunks are meshed on the GPU, levels 0-5. Disable with `-VoxelNoGpuMesh`. |
+| `voxel.Water.GPU` | **1** | **CHANGED 2026-07-27.** Water surfaces through their own pool. |
+| `voxel.GI.Enabled` | **1** | **CHANGED 2026-07-27.** Voxel GI on. Known cost: hitches x3.2 at a dense anchor. |
+| `voxel.GI.Volume` | **1** | **CHANGED 2026-07-27.** GI sampled from a GPU volume, Scheme A. |
+| `voxel.GI.VolumeDim` | **192** | **CHANGED** from 64. 64 covered +/-12.8 m - about 36 of ~1,950 resident bricks, too little to judge. 192 covers +/-38.4 m and costs 2x54 MB. |
 | `-VoxelCoarseGrid` | on | coarse chunks use the flat-grid fast path |
 | `-VoxelL0BrickSkip` | on | level-0 skips provably-empty bricks |
+
+> **EVERYTHING IS ON. This is a deliberate evaluation build, not a shipping
+> configuration.** Two days of work went in behind cvars that were all off; this
+> flips them together so one session can look at the lot. That means a problem
+> you see is not automatically attributable - the bisect order is in section 10.6.
+>
+> **Extra VRAM: ~306 MB** (198 MB quad pool + 108 MB GI volumes).
 
 **Give the world time to settle.** The full 2 km cascade takes roughly 10–30 s
 from spawn depending on machine. `voxel.Debug 1` shows a HUD; the world is
@@ -413,6 +422,107 @@ way, the log and the eye disagree and the eye wins.
 
 ---
 
+
+## 10. FIRST HANDS-ON SESSION - start here (added 2026-07-27)
+
+Your first manual test since this programme started. Everything above is now on
+by default, so this is the run that decides what ships.
+
+**Work down in order.** Each step is cheap and rules something out, and the later
+ones are only meaningful if the earlier ones passed.
+
+### 1. Does it come up at all (30 s)
+
+Enter PIE. Type `voxel.Debug 1`. Wait for `pending` 0 on every ring and `jobs` 0
+-- **10-30 s**; do not judge anything before that. A dark or empty world in the
+first seconds is terrain streaming, not a bug.
+
+Then just look. Terrain present, roughly the shape you remember, no obvious
+holes. If this fails, stop and go to 10.6 - nothing below is worth reading.
+
+### 2. The number that decides the GPU mesher (5 min)
+
+**This is the single most valuable thing you can do.** It is the only measurement
+blocking a shipping decision, and no harness here can take it: `-VoxelPerfRun`
+samples a world delta the engine clamps at 400 ms.
+
+1. Find a **dense view** - lots of terrain on screen, not sky.
+2. Hold **completely still**. Read `stat unit`: Frame / Draw / GPU.
+3. Add `-VoxelNoGpuMesh` to the command line, relaunch, **same spot and heading**,
+   settle, read again.
+4. Twice each, alternating. The two same-config readings ARE your noise floor.
+
+**Watch the tail, not the average.** A GPU job is a ~28 ms round trip against a
+worker thread's ~1 ms, so if this costs anything it costs it as *intermittent
+stutter over a minute*, not a worse steady number. That is exactly how voxel GI
+behaved: p50 moved 0.6% while hitches tripled.
+
+### 3. Fly. This is what the work was for. (5 min)
+
+The mesher's measured claim is **85% less pending backlog under motion** - terrain
+should arrive sooner as you move.
+
+Fly the way you normally do, at the speed that used to show problems. Then:
+
+- **The ring gaps - section 1, still unexplained and the reason this file exists.**
+  If you see one, **stop moving and hold still**, and note whether it fills in.
+  Fills in -> throughput. Does not -> an admission bug, a completely different
+  fix. Grab the log either way.
+- Does terrain keep up better than you remember? That is the subjective half of
+  the backlog number, and your memory of two days ago is a real datum.
+
+### 4. Dig (2 min)
+
+Edits are the one thing deliberately kept **off** the GPU - `NeedsOverlayAwarePath`
+routes them to the game thread. Verified byte-identical headlessly; never looked at.
+
+- Dig straight down **more than ~40 m**. The shaft must stay solid all the way.
+- Watch the hole **light up**. Measured at 240 ms; if it takes seconds, say so.
+- Save, quit, reload, look at the same shaft.
+
+### 5. The two things most likely to look wrong, and why
+
+**A lighting ring.** GI fades out at **19-35 m** because the fade radii come from
+the volume extent, not from the cvars (which ask for 48-64 m). This is a known,
+recorded defect - Wave B risk 8 - and at `VolumeDim 192` you may see a soft
+circular boundary on the ground that moves with you. **Expected. Report if ugly.**
+
+**Shadows stopping too close.** `voxel.Stream.GPUShadowMaxLevel 4` stops terrain
+beyond ~1 km casting. Best seen at **low sun, inland, with middle-distance relief**.
+The tell is not a missing shadow - it is distant terrain looking *flat or hazy*
+because it lost its own self-shadowing. Try 5 (uncapped) against 4. See section 8.
+
+### 6. If something looks wrong - bisect in this order
+
+Everything went on at once, so a fault is not attributable until you split it.
+Turn ONE off, relaunch, look again:
+
+| suspect | turn off | what it would explain |
+|---|---|---|
+| terrain wrong SHAPE, holes, wrong materials | `-VoxelNoGpuMesh` | the mesher - the only thing that changes geometry |
+| terrain wrong COLOUR / tint / missing chunks on screen | `voxel.Stream.GPU 0` | the renderer, not the geometry |
+| lighting bands, rings, dark or blown-out surfaces | `voxel.GI.Enabled 0` | GI |
+| water invisible, wrong waterline, z-fighting | `voxel.Water.GPU 0` | the water pool |
+| stutter / hitching | `voxel.GI.Enabled 0` **first** | GI is the known x3.2 hitch source |
+
+The mesher and the renderer are **independent**: the mesher decides what the quads
+ARE, the renderer decides how they are drawn. Wrong shape is the mesher; wrong
+colour, or absent-but-otherwise-correct geometry, is the renderer.
+
+### 7. What to bring back
+
+- `ue-project/Saved/Logs/VoxelEarth.log` - the whole file.
+- Your `stat unit` numbers from 10.2, all four readings.
+- Anything from the profiler you captured.
+- Plain words for anything that looked off. "The far hills went flat" is more
+  useful than a guess at which subsystem did it.
+
+The log carries the counters that matter: `GPU mesh fork` (dispatched /
+delivered / **failed** / slow), `cold-band throttle` (markTimeouts should be
+**0**), `Voxel rings:` residency, and the pool's `capacityPct` and allocation
+failure counts.
+
+---
 
 ## Why this file exists
 

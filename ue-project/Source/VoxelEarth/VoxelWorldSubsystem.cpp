@@ -1429,8 +1429,13 @@ int32 GetPendingJobCap()
 // independent and either can be measured alone.
 bool GpuMeshEnabled()
 {
-	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelGpuMesh"));
-	return bEnabled;
+	// 2026-07-27: DEFAULT ON, and inverted to -VoxelNoGpuMesh so a PIE session
+	// gets it. A PIE run launched from the editor has no command line of its
+	// own, so an opt-IN FParse::Param switch can never reach it -- the fork
+	// would have been unreachable in exactly the session that is meant to
+	// evaluate it. Same idiom as -VoxelNoRingSkirt and -VoxelNoUnderground.
+	static const bool bDisabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelNoGpuMesh"));
+	return !bDisabled;
 }
 
 // Highest chunk level the fork may take (D5).
@@ -1490,7 +1495,11 @@ int32 GpuMeshMaxLevel()
 {
 	static const int32 MaxLevel = []
 	{
-		int32 Value = 0;
+		// 2026-07-27: 5, the whole cascade. voxel.GPU.VerifyCoarse proves every
+		// level bit-exact against coarseColumns + makeCoarseBrick on columns,
+		// cells and quads -- L5 on [origin] and [high-relief], with
+		// [far-negative] skipped because that fixture cannot express the level.
+		int32 Value = 5;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuMeshMaxLevel="), Value);
 		return FMath::Clamp(Value, 0, 5);
 	}();

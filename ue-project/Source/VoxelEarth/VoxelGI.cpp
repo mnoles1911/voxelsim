@@ -37,7 +37,7 @@ DEFINE_LOG_CATEGORY_STATIC(LogVoxelGI, Log, All);
 namespace
 {
 	TAutoConsoleVariable<int32> CVarGIEnabled(
-		TEXT("voxel.GI.Enabled"), 0,
+		TEXT("voxel.GI.Enabled"), 1,   // 2026-07-27: ON for the manual PIE evaluation.
 		TEXT("Voxel light field + cone-traced GI (M4). 0 = off (default, and genuinely zero-cost: ")
 		TEXT("the subsystem does not tick and the scene proxy emits byte-identical vertex colours). ")
 		TEXT("1 = on. CLIENT-SIDE RENDERING ONLY -- outside the determinism boundary."),
