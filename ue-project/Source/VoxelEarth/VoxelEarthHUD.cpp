@@ -235,7 +235,9 @@ void AVoxelEarthHUD::AdjustOverlaySelection(int32 Delta)
 	case EOverlayRow::FlySpeed:
 		if (AVoxelEarthFlyPawn* Pawn = GetVoxelPawn())
 		{
-			Pawn->AdjustFlySpeed(Delta >= 0 ? +1 : -1);
+			// Mode-aware, matching what this row displays: the walk gait tier
+			// or the fly speed step.
+			Pawn->AdjustSpeedDial(Delta >= 0 ? +1 : -1);
 		}
 		break;
 
@@ -454,14 +456,32 @@ void AVoxelEarthHUD::DrawDebugOverlay()
 			            : Pawn->IsSwimmingNow()     ? TEXT("swimming")
 			            : Pawn->IsGroundedNow()     ? TEXT("grounded")
 			                                        : TEXT("airborne");
+			if (Pawn->IsCrouched())
+			{
+				// A crouch that outlives the key is not a stuck input -- it is
+				// the auto-stand waiting for headroom. Say which, or the player
+				// reasonably concludes the key stopped working.
+				StateText += Pawn->IsCrouchBlocked() ? TEXT("  + CROUCHED (no room to stand)") : TEXT("  + crouched");
+			}
+			if (Pawn->IsSprintEngaged())
+			{
+				StateText += TEXT("  + sprinting");
+			}
 		}
 		else
 		{
 			StateText = TEXT("flying (no collision: clips terrain, water, debris)");
 		}
 		DrawOverlayInfo(FString::Printf(TEXT("State   %s"), *StateText),
-		                Pawn->IsWaitingForTerrain() ? kOverlayWarn : kOverlayInfo, PanelX, Y);
-		DrawOverlayInfo(FString::Printf(TEXT("Camera  %s"), Pawn->IsThirdPerson() ? TEXT("third person") : TEXT("first person")),
+		                Pawn->IsWaitingForTerrain() ? kOverlayWarn
+		                : Pawn->IsCrouchBlocked()   ? kOverlayWarn
+		                                            : kOverlayInfo,
+		                PanelX, Y);
+		DrawOverlayInfo(FString::Printf(TEXT("Camera  %s%s"),
+		                                Pawn->IsThirdPerson() ? TEXT("third person") : TEXT("first person"),
+		                                Pawn->IsThirdPerson() ? (Pawn->IsRightShoulder() ? TEXT(" (right shoulder)")
+		                                                                                 : TEXT(" (left shoulder)"))
+		                                                      : TEXT("")),
 		                kOverlayInfo, PanelX, Y);
 	}
 
@@ -473,14 +493,30 @@ void AVoxelEarthHUD::DrawDebugOverlay()
 	DrawOverlayRow(EOverlayRow::MovementMode, TEXT("Movement mode  (G)"),
 	               Pawn ? (Pawn->IsWalkMode() ? TEXT("WALK") : TEXT("FLY")) : TEXT("(no pawn)"), PanelX, Y);
 
+	// One row, whichever speed control the current mode owns -- the mouse wheel
+	// drives both, so showing the inactive one would be actively misleading.
 	FString SpeedValue = TEXT("(no pawn)");
+	FString SpeedLabel = TEXT("Fly speed      (wheel)");
 	if (Pawn)
 	{
-		SpeedValue = FString::Printf(TEXT("step %d/%d  %.2f m/s%s"), Pawn->GetFlySpeedIndex() + 1,
-		                              AVoxelEarthFlyPawn::GetFlySpeedStepCount(), Pawn->GetEffectiveFlySpeedUU() / 100.0,
-		                              Pawn->IsSprintHeld() ? TEXT(" (boost)") : TEXT(""));
+		if (Pawn->IsWalkMode())
+		{
+			SpeedLabel = TEXT("Gait           (wheel)");
+			SpeedValue = FString::Printf(TEXT("%s  %d/%d  %.1f m/s%s"), Pawn->GetSpeedTierName(),
+			                              Pawn->GetSpeedTierIndex() + 1, AVoxelEarthFlyPawn::GetSpeedTierCount(),
+			                              Pawn->GetEffectiveWalkSpeedUU() / 100.0,
+			                              Pawn->IsSprintEngaged()  ? TEXT("  (sprint)")
+			                              : Pawn->IsCrouched()     ? TEXT("  (crouch capped)")
+			                                                       : TEXT(""));
+		}
+		else
+		{
+			SpeedValue = FString::Printf(TEXT("step %d/%d  %.2f m/s%s"), Pawn->GetFlySpeedIndex() + 1,
+			                              AVoxelEarthFlyPawn::GetFlySpeedStepCount(), Pawn->GetEffectiveFlySpeedUU() / 100.0,
+			                              Pawn->IsFlyBoostActive() ? TEXT(" (boost)") : TEXT(""));
+		}
 	}
-	DrawOverlayRow(EOverlayRow::FlySpeed, TEXT("Fly speed      ( / )"), SpeedValue, PanelX, Y);
+	DrawOverlayRow(EOverlayRow::FlySpeed, SpeedLabel, SpeedValue, PanelX, Y);
 
 	DrawOverlayRow(EOverlayRow::DebugMode, TEXT("voxel.Debug    (F3)"),
 	               FString::Printf(TEXT("%d  (0 off, 1 perf HUD, 2 +layers)"), VoxelDebug::GetDebugMode()), PanelX, Y);
@@ -499,9 +535,9 @@ void AVoxelEarthHUD::DrawDebugOverlay()
 	DrawOverlayRow(EOverlayRow::Wireframe, TEXT("Wireframe"), OnOff(bWireframeRequested), PanelX, Y);
 
 	Y += 6.f;
-	DrawOverlayInfo(TEXT("WASD move   Space/Ctrl up-down   Shift boost   Alt slow"), kOverlayInfo, PanelX, Y);
-	DrawOverlayInfo(TEXT("G walk/fly   C camera   LMB dig   RMB place   T material"), kOverlayInfo, PanelX, Y);
-	DrawOverlayInfo(TEXT("1/2/3 or wheel dig size   F hold-throw   F3 debug mode"), kOverlayInfo, PanelX, Y);
+	DrawOverlayInfo(TEXT("WASD move   Space jump/up   Wheel speed   Shift sprint   Alt slow"), kOverlayInfo, PanelX, Y);
+	DrawOverlayInfo(TEXT("G walk/fly   C crouch   V camera   Q shoulder   T material"), kOverlayInfo, PanelX, Y);
+	DrawOverlayInfo(TEXT("LMB dig   RMB place   1/2/3 dig size   F hold-throw   F3 debug"), kOverlayInfo, PanelX, Y);
 }
 
 void AVoxelEarthHUD::DrawModeLine()
@@ -529,16 +565,27 @@ void AVoxelEarthHUD::DrawModeLine()
 			Text = TEXT("WALK - waiting for terrain");
 			Color = kOverlayWarn;
 		}
+		else if (Pawn->IsSwimmingNow())
+		{
+			Text = TEXT("WALK - swimming");
+			Color = kOverlayOn;
+		}
 		else
 		{
-			Text = Pawn->IsSwimmingNow() ? TEXT("WALK - swimming") : TEXT("WALK");
+			// The gait tier is the thing the wheel just changed, so it belongs
+			// on the always-on line rather than only in the F1 overlay.
+			Text = FString::Printf(TEXT("WALK - %s %.1f m/s%s"), Pawn->GetSpeedTierName(),
+			                        Pawn->GetEffectiveWalkSpeedUU() / 100.0,
+			                        Pawn->IsCrouched()      ? TEXT(" crouched")
+			                        : Pawn->IsSprintEngaged() ? TEXT(" sprint")
+			                                                  : TEXT(""));
 			Color = kOverlayOn;
 		}
 	}
 	else
 	{
 		Text = FString::Printf(TEXT("FLY - %.1f m/s%s"), Pawn->GetEffectiveFlySpeedUU() / 100.0,
-		                        Pawn->IsSprintHeld() ? TEXT(" boost") : TEXT(""));
+		                        Pawn->IsFlyBoostActive() ? TEXT(" boost") : TEXT(""));
 		Color = kOverlayHeader;
 	}
 	if (!bOverlayVisible)

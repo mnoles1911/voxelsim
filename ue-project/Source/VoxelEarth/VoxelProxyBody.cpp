@@ -22,8 +22,8 @@ UVoxelProxyBodyComponent::UVoxelProxyBodyComponent()
 
 	// 2-3 tint colors (Player experience decisions table: "MID-tinted 2-3
 	// colors"). Layout (UU, relative to this component's origin, which sits
-	// at the pawn's walk-mode collision-box center -- see
-	// AVoxelEarthFlyPawn::WalkBoxHalfExtentZ = 90): legs span Z -90..-10,
+	// at the pawn's walk-mode collision-box center --
+	// VoxelMovementTuning::StandHalfExtentZ = 90): legs span Z -90..-10,
 	// torso -10..60, head 60..90 -- feet land on the box's bottom face.
 	const FLinearColor TorsoColor(0.20f, 0.35f, 0.55f, 1.f);
 	const FLinearColor LimbColor(0.55f, 0.30f, 0.15f, 1.f);
@@ -87,18 +87,19 @@ UStaticMeshComponent* UVoxelProxyBodyComponent::MakeBoxPart(FName Name, USceneCo
 	return Mesh;
 }
 
-void UVoxelProxyBodyComponent::UpdateAnimation(float DeltaTime, double HorizontalSpeedUU)
+void UVoxelProxyBodyComponent::UpdateAnimation(float DeltaTime, double HorizontalSpeedUU, float GaitPhase, float CrouchAlpha)
 {
+	using namespace VoxelMovementTuning;
+
 	const double Speed = FMath::Abs(HorizontalSpeedUU);
 
-	// Walk cycle: phase advances with distance traveled (not just time), so
-	// faster movement swings the limbs faster -- "speed-proportional rate"
-	// per the Player experience decisions table.
-	GaitPhase += (float)(Speed * DeltaTime) * (2.f * PI / StrideLengthUU);
-	GaitPhase = FMath::Fmod(GaitPhase, 2.f * PI);
-
-	const float SwingScale = (float)FMath::Clamp(Speed / RefWalkSpeedUU, 0.0, 1.0);
-	const float SwingAngle = FMath::Sin(GaitPhase) * MaxSwingDegrees * SwingScale;
+	// The walk-cycle PHASE now arrives from the movement component, which
+	// advances it with distance travelled and shares it with the first-person
+	// camera bob. Only the AMPLITUDE is derived here, from current speed, so
+	// the swing still grows with pace ("speed-proportional rate" per the Player
+	// experience decisions table) across the full 8-tier speed dial.
+	const float SwingScale = (float)FMath::Clamp(Speed / ProxyRefSpeedUU, 0.0, 1.0);
+	const float SwingAngle = FMath::Sin(GaitPhase) * ProxyMaxSwingDegrees * SwingScale;
 
 	// FRotator(Pitch, Yaw, Roll): Pitch swings a vertically-hanging limb
 	// forward/back about its pivot -- exactly the walk-cycle motion wanted
@@ -111,8 +112,25 @@ void UVoxelProxyBodyComponent::UpdateAnimation(float DeltaTime, double Horizonta
 
 	// Idle breathing bob: a slow vertical sine offset on the whole body that
 	// fades out as the walk cycle takes over (SwingScale -> 1).
-	BobPhase += DeltaTime * BobFrequencyHz * 2.f * PI;
+	BobPhase += DeltaTime * ProxyBobFrequencyHz * 2.f * PI;
 	BobPhase = FMath::Fmod(BobPhase, 2.f * PI);
-	const float BobOffset = FMath::Sin(BobPhase) * (float)BobAmplitudeUU * (1.f - SwingScale);
+	const float BobOffset = FMath::Sin(BobPhase) * (float)ProxyBobAmplitudeUU * (1.f - SwingScale);
+
+	// Crouch squash. The collision box resizes instantly (there is no half-way
+	// box to collide against), but the VISUAL blend is eased so the body sinks
+	// rather than popping.
+	const float BlendAlpha = 1.f - FMath::Exp(-CrouchBlendRatePerSec * DeltaTime);
+	CrouchBlend = FMath::Lerp(CrouchBlend, FMath::Clamp(CrouchAlpha, 0.f, 1.f), BlendAlpha);
+
+	// Scaling about this component's origin -- the box CENTRE -- maps the body's
+	// -90..+90 UU span onto the crouched box's -60..+60 exactly, so the feet
+	// stay on the box's bottom face without any compensating offset.
+	const float ScaleZ = FMath::Lerp(1.f, (float)ProxyCrouchScaleZ, CrouchBlend);
+	SetRelativeScale3D(FVector(1.0, 1.0, ScaleZ));
+
+	// A component's own scale applies to its children, not to its own relative
+	// location (which lives in PARENT space, and the parent is the unscaled
+	// pawn root) -- so the bob stays the same physical size in both stances
+	// with no compensation needed.
 	SetRelativeLocation(FVector(0.0, 0.0, BobOffset));
 }
