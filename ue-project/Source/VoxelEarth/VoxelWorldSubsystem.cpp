@@ -6091,10 +6091,19 @@ FVoxelGpuMeshJobManager* FVoxelWorldImpl::EnsureGpuMeshJobs()
 	GpuMeshJobs = MakeUnique<FVoxelGpuMeshJobManager>(
 		FVoxelGpuMeshJobComplete::CreateRaw(this, &FVoxelWorldImpl::OnGpuMeshJobComplete),
 		/*InMaxInFlight*/ 256);
+	// The conditions, stated as they ACTUALLY are. This line used to say
+	// "level 0, unedited, band-known chunks only", which was true when it was
+	// written and stopped being true twice: D6 removed the band-known
+	// restriction, D5 raised the level cap. A log line describing a filter that
+	// no longer exists is worse than no line -- it is what someone reads instead
+	// of the code.
 	UE_LOG(LogVoxelStream, Log,
-	       TEXT("VoxelGpuMesh: GPU mesh fork ENABLED (level 0, unedited, band-known chunks only). "
-	            "maxInFlight=%d"),
-	       GpuMeshJobs->GetMaxInFlight());
+	       TEXT("VoxelGpuMesh: GPU mesh fork ENABLED. Takes levels 0..%d, unedited chunks only "
+	            "(NeedsOverlayAwarePath routes edits to the game thread), no ring skirt "
+	            "(ComputeRingSkirtMask must be 0 -- boundary chunks stay on the CPU), and not "
+	            "already predicted empty. maxInFlight=%d (GPU), separate from the CPU worker "
+	            "budget."),
+	       VoxelStreamAdmission::GpuMeshMaxLevel(), GpuMeshJobs->GetMaxInFlight());
 	return GpuMeshJobs.Get();
 }
 
