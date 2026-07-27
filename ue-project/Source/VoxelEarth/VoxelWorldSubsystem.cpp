@@ -3048,6 +3048,7 @@ struct FVoxelWorldImpl
 	int64 RetainCoveredSettledReleasesSinceLog = 0; // every replacement record consulted existed AND had settled
 	int64 RetainCoveredAbsentReleasesSinceLog = 0;  // some consulted record was absent and provably not desired
 	int64 RetainCapReleasesSinceLog = 0;            // parked because LodRetentionMs expired first
+	int64 ResurrectionsSinceLog = 0;                // pending unloads cancelled because the footprint re-entered the desired set
 	// Per-level breakouts of the two suspicious releases. Which RING releases on
 	// an absent replacement is the whole question -- a coarse ring released at its
 	// inner edge leaves a hole the finer ring has not filled, and that is a
@@ -4614,14 +4615,16 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		}
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel LOD retention (5s window): held=%d covRelSettled=%lld covRelAbsent=%lld capRel=%lld ")
-		       TEXT("(capRel %.1f%% of releases, covRelAbsent %.1f%%) | retentionMs=%.0f%s"),
+		       TEXT("resurrected=%lld (capRel %.1f%% of releases, covRelAbsent %.1f%%) | retentionMs=%.0f%s"),
 		       RetainHeldThisFrame, (long long)RetainCoveredSettledReleasesSinceLog,
 		       (long long)RetainCoveredAbsentReleasesSinceLog, (long long)RetainCapReleasesSinceLog,
+		       (long long)ResurrectionsSinceLog,
 		       TotalReleases > 0 ? 100.0 * double(RetainCapReleasesSinceLog) / double(TotalReleases) : 0.0,
 		       TotalReleases > 0 ? 100.0 * double(RetainCoveredAbsentReleasesSinceLog) / double(TotalReleases) : 0.0,
 		       VoxelDebug::GetStreamLodRetentionMs(), *Suffix);
 	}
 	RetainCoveredSettledReleasesSinceLog = RetainCoveredAbsentReleasesSinceLog = RetainCapReleasesSinceLog = 0;
+	ResurrectionsSinceLog = 0;
 	FMemory::Memzero(LevelRetainCoveredAbsent);
 	FMemory::Memzero(LevelRetainCapReleases);
 
@@ -6074,8 +6077,33 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				const auto AddCandidate = [this, ChunkEdge, CenterX, CenterY, &Anchor](const FVoxelLevelChunkKey& LevelKey,
 				                                                                     bool bDeepAnchorRelative)
 				{
-					if (ChunkRecords.Contains(LevelKey))
+					// RESURRECTION (2026-07-27, the last of the ring-gap residue). A
+					// record can exist and yet be PENDING UNLOAD: the footprint
+					// dipped inside this level's inner edge as the anchor passed
+					// (bInsideInner eviction, stand-in retained), then re-entered
+					// the annulus as the anchor receded. Skipping it as "already
+					// tracked" while the unload was still queued stranded the
+					// column permanently: the stand-in eventually parked (cap or
+					// coverage), the record vanished, and no scan trigger remained
+					// to re-admit it -- measured as a deterministic patch of R3
+					// no-record holes at r=322-492 m surviving a full 60 s linger,
+					// GPU legs only (slower R2 settling leaves more R3 stand-ins
+					// alive at cap when the anchor pins). The chunk is desired
+					// again and still holds its geometry, so CANCEL the unload
+					// instead of letting it park and re-meshing later: pull it
+					// from PendingUnloadSet (the pop side treats a set-absent key
+					// as resurrected and skips it -- the stale PendingUnloadKeys
+					// entry is inert) and clear the retention stamp so a future
+					// eviction re-stamps fresh.
+					if (VoxelStreaming::FChunkRecord* Existing = ChunkRecords.Find(LevelKey))
 					{
+						if (PendingUnloadSet.Contains(LevelKey))
+						{
+							PendingUnloadSet.Remove(LevelKey);
+							Existing->RetainReplaceDir = RetainDir_None;
+							Existing->RetainUntilSeconds = 0.0;
+							++ResurrectionsSinceLog;
+						}
 						return;
 					}
 
@@ -8945,6 +8973,13 @@ void FVoxelWorldImpl::DrainUnloads()
 		if (!Rec)
 		{
 			PendingUnloadSet.Remove(Key); // already gone (raced with a re-add/remesh); nothing to do
+			continue;
+		}
+		if (!PendingUnloadSet.Contains(Key))
+		{
+			// Resurrected: the entry pass re-desired this footprint while the
+			// unload was queued and cancelled it (see AddCandidate). The record
+			// lives on as an ordinary tracked chunk; this queue entry is inert.
 			continue;
 		}
 
