@@ -49,12 +49,33 @@ namespace VoxelGpuRegionBuild
 		const int64 Width = int64(Req.DispatchColumns.X);
 		const int64 Height = int64(Req.DispatchColumns.Y);
 
-		const int64 XMmMin = int64(Req.OriginVx) * vxc::kVoxelSizeMm - kRasterCavernMarginMm;
-		const int64 XMmMax = (int64(Req.OriginVx) + Width - 1) * vxc::kVoxelSizeMm
-		                   + kRasterCavernMarginMm;
-		const int64 YMmMin = int64(Req.OriginVy) * vxc::kVoxelSizeMm - kRasterCavernMarginMm;
-		const int64 YMmMax = (int64(Req.OriginVy) + Height - 1) * vxc::kVoxelSizeMm
-		                   + kRasterCavernMarginMm;
+		// D5. AT LEVEL L THE DISPATCH INDICES ARE COARSE CELLS, AND THE KERNEL
+		// SAMPLES AT THEIR REPRESENTATIVE LEVEL-0 COORDINATE -- so the window a
+		// level-L dispatch touches is 2^L times wider than its column count
+		// suggests. Sizing it in level-0 voxels, as this did, produced a window
+		// that was correct at level 0 and far too narrow at every level above.
+		//
+		// AND IT FAILED EXACTLY THE WAY THE HEADER ABOVE SAYS IT WOULD: not a
+		// fault, not an error, but reads clamped to the window edge -- silently
+		// different terrain from the CPU. The D5 per-level gate caught it on its
+		// first run, and the signature is worth recording because it is what
+		// distinguishes this from a coarse-arithmetic bug: the [origin] fixture
+		// passed columns AND cells at level 1 (small coordinates, so the margin
+		// still covered the span) while [far-negative] reported 12,288 column
+		// and 108,470 cell mismatches. A bug in coarseRep itself would have
+		// failed both equally.
+		const int64 CoarseScale = int64(1) << FMath::Clamp(Req.CoarseLevel, 0, 5);
+		const auto CoarseRepMm = [CoarseScale](int64 Cell)
+		{
+			// Same two operations as vxc::coarseRep and worldgen.ush's, then to
+			// millimetres. Identity at level 0.
+			return (Cell * CoarseScale + CoarseScale / 2) * vxc::kVoxelSizeMm;
+		};
+
+		const int64 XMmMin = CoarseRepMm(int64(Req.OriginVx)) - kRasterCavernMarginMm;
+		const int64 XMmMax = CoarseRepMm(int64(Req.OriginVx) + Width - 1) + kRasterCavernMarginMm;
+		const int64 YMmMin = CoarseRepMm(int64(Req.OriginVy)) - kRasterCavernMarginMm;
+		const int64 YMmMax = CoarseRepMm(int64(Req.OriginVy) + Height - 1) + kRasterCavernMarginMm;
 
 		const int64 PxMin = vxc::floorDiv(XMmMin, PixelSizeMm);
 		const int64 PxMax = vxc::floorDiv(XMmMax, PixelSizeMm) + 1;  // +1: second bilinear tap

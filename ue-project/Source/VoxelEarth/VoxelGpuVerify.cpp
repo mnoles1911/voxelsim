@@ -69,7 +69,23 @@ namespace
 		int32 OriginVy;
 		uint32 Width;
 		uint32 Height;
+		// D5. 0 for every digest fixture, and that is load-bearing: the pinned
+		// 6e893ab3679a8c81 is a LEVEL-0 statement about the bench, so a coarse
+		// run must never fold into it. voxel.GPU.VerifyCoarse builds its own
+		// specs and its own digests.
+		int32 CoarseLevel = 0;
 	};
+
+	// Mirror of vxc::GeneratedWorld::coarseRep and of worldgen.ush's coarseRep.
+	// Three copies now, which is two more than anyone wants -- but the CPU one
+	// is constexpr inside voxel-core, the HLSL one cannot call it, and this one
+	// is the reference the other two are checked against. They agree by being
+	// the same two operations, not by being shared.
+	constexpr int64 CoarseRep(int64 C, int32 Level)
+	{
+		const int64 S = int64(1) << Level;
+		return C * S + S / 2;
+	}
 
 	const FRegionSpec kRegions[] = {
 		{ TEXT("origin"),        -64,     -64, 64, 64 },
@@ -153,6 +169,12 @@ namespace
 		Req.OriginVx = Region.OriginVx;
 		Req.OriginVy = Region.OriginVy;
 		Req.Seed = kSeed;
+		// BEFORE FillRasterWindow, which now READS it: at level L the window a
+		// dispatch touches is 2^L wider than its column count, so a window sized
+		// with CoarseLevel still 0 is silently too narrow and the kernel clamps.
+		// Setting it afterwards is a no-op that looks like a fix -- which is
+		// exactly what it was for one run of the D5 gate.
+		Req.CoarseLevel = Region.CoarseLevel;
 
 		VoxelGpuRegionBuild::FillRasterWindow(Req, Tiles);
 
@@ -167,14 +189,21 @@ namespace
 		{
 			for (uint32 X = 0; X < Region.Width; ++X)
 			{
-				const int64 Vx = int64(Region.OriginVx) + X;
-				const int64 Vy = int64(Region.OriginVy) + Y;
+				// D5: at level L the dispatch's OriginVx/tid are LEVEL-L cell
+				// indices and the column is sampled at the cell's representative
+				// level-0 coordinate -- exactly vxc::coarseColumns. Identity at 0.
+				const int64 Vx = CoarseRep(int64(Region.OriginVx) + X, Region.CoarseLevel);
+				const int64 Vy = CoarseRep(int64(Region.OriginVy) + Y, Region.CoarseLevel);
 				const vxc::ColumnSample C = CpuAmp.column(Vx, Vy);
 				OutCpuColumns[int32(X + Y * Region.Width)] = C;
 
 				// Topmost solid voxel: its centre (vz*100 + 50) <= surfaceMm.
-				const int64 Top = vxc::floorDiv(int64(C.surfaceMm) - vxc::kVoxelSizeMm / 2,
-				                                vxc::kVoxelSizeMm);
+				const int64 Top0 = vxc::floorDiv(int64(C.surfaceMm) - vxc::kVoxelSizeMm / 2,
+				                                 vxc::kVoxelSizeMm);
+				// ...then to the LEVEL-L cell holding it, mirroring
+				// vxc::coarseSurfaceBrickRange. Identity at level 0.
+				const int64 S = int64(1) << Region.CoarseLevel;
+				const int64 Top = vxc::floorDiv(Top0 - S / 2, S);
 				VzMin = FMath::Min(VzMin, Top);
 				VzMax = FMath::Max(VzMax, Top);
 			}
@@ -289,7 +318,9 @@ namespace
 					const int64 BrickZ = int64(Req.BrickZMin) + int64(Bz);
 					for (uint32 ZLocal = 0; ZLocal < 8u; ++ZLocal)
 					{
-						const int64 Vz = BrickZ * 8 + ZLocal;
+						// D5: mirrors makeCoarseBrick's
+						// materialAt(col, coarseRep(key.z * B + z, level)).
+						const int64 Vz = CoarseRep(BrickZ * 8 + ZLocal, Region.CoarseLevel);
 						const uint32 CellIdx = BrickIndex * 512 + CellIndexInBrick(Lx, Ly, ZLocal);
 						const uint8 CpuMat = static_cast<uint8>(vxc::Amplifier::materialAt(C, Vz));
 						const uint8 GpuMat = static_cast<uint8>(Gpu.Cells[CellIdx] & 0xffu);
@@ -336,7 +367,20 @@ namespace
 					{
 						const int64 Rvx = Ox + Sx;
 						const int64 Rvy = Oy + Sy;
-						const int64 Vz = int64(Req.BrickZMin) * 8 + Oz + Sz;
+						// D5: the SAME coarse z mapping the cell loop above uses,
+						// and the same one makeCoarseBrick applies. Identity at
+						// level 0.
+						//
+						// Leaving this at level-0 z while the columns were coarse
+						// did not produce WRONG quads, it produced NONE: at level
+						// 1 the coarse brick range maps to z values far below the
+						// surface, every sample came back solid, no face had an
+						// air neighbour, and the CPU reference was empty. The gate
+						// reported "quad count: cpu=0 gpu=3354" -- which reads at a
+						// glance like the GPU inventing geometry, and is in fact
+						// the reference not being asked for any.
+						const int64 Vz = CoarseRep(int64(Req.BrickZMin) * 8 + Oz + Sz,
+						                           Region.CoarseLevel);
 						const vxc::ColumnSample& C =
 							CpuColumns[int32(Rvx + Rvy * int64(Region.Width))];
 						return vxc::Amplifier::materialAt(C, Vz);
@@ -1155,6 +1199,135 @@ namespace
 			       TEXT("[FindBandFixture] no cavern column found in the span searched."));
 		}
 	}
+
+	// D5.2: the per-level gate. Bit-exactness of a COARSE level against
+	// vxc::coarseColumns + makeCoarseBrick, one level at a time.
+	//
+	// WHY IT IS A SEPARATE COMMAND WITH ITS OWN DIGESTS, and this is the part
+	// that must not be "simplified" later. 6e893ab3679a8c81 is a LEVEL-0
+	// statement: it is what the DXC->SPIR-V->Vulkan bench produces and what the
+	// UE->DXIL->D3D12 path must reproduce. Folding a coarse run into it would
+	// change the value and turn a loud cross-toolchain gate into a
+	// re-baselining exercise -- the exact failure the roadmap already records a
+	// standing instruction against. So this compares GPU against CPU directly
+	// and pins nothing.
+	//
+	// SHIP LEVEL BY LEVEL. A level that fails here is not enabled, and the
+	// correct response is to stop at the last level that passes rather than
+	// relax the comparison.
+	void VerifyCoarseCommand(const TArray<FString>& Args)
+	{
+		if (!VoxelGpuWorldGen::IsSupportedOnCurrentRHI())
+		{
+			UE_LOG(LogVoxelGpuVerify, Error, TEXT("GPU worldgen needs SM6. Relaunch with -sm6."));
+			return;
+		}
+
+		const int32 MaxLevel = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), 0, 5) : 5;
+
+		vxc::SyntheticTileSampler Tiles(kSeed);
+		vxc::SyntheticTileSampler CpuTiles(kSeed);
+		vxc::Amplifier CpuAmp(kSeed, CpuTiles);
+
+		UE_LOG(LogVoxelGpuVerify, Log,
+		       TEXT("voxel.GPU.VerifyCoarse: levels 0..%d against vxc::coarseColumns + ")
+		       TEXT("makeCoarseBrick, seed %llu. Level 0 is included deliberately -- it is the ")
+		       TEXT("control, and coarseRep makes it the identity, so a failure THERE means the ")
+		       TEXT("harness is wrong rather than the coarse path."),
+		       MaxLevel, kSeed);
+
+		int32 LastGoodLevel = -1;
+		for (int32 Level = 0; Level <= MaxLevel; ++Level)
+		{
+			bool bLevelOk = true;
+			for (int32 R = 0; R < UE_ARRAY_COUNT(kRegions); ++R)
+			{
+				FRegionSpec Region = kRegions[R];
+				Region.CoarseLevel = Level;
+
+				TArray<vxc::ColumnSample> CpuColumns;
+				const FVoxelGpuRegionRequest Req = BuildRequest(Region, CpuAmp, Tiles, CpuColumns);
+				const FVoxelGpuRegionResult Gpu = VoxelGpuWorldGen::RunRegionBlocking(Req);
+				if (!Gpu.bOk)
+				{
+					UE_LOG(LogVoxelGpuVerify, Error,
+					       TEXT("[D5 coarse] L%d [%s] dispatch FAILED: %s"),
+					       Level, Region.Name, *Gpu.Error);
+					bLevelOk = false;
+					continue;
+				}
+
+				// Local digests, deliberately discarded -- CompareRegion needs
+				// somewhere to fold bytes and the pinned value must not see them.
+				vxc::Digest ScratchGpu, ScratchCpu;
+				FTally Tally;
+				TArray<FMismatch> Mismatches;
+				const bool bOk = CompareRegion(Region, Req, Gpu, CpuColumns,
+				                               ScratchGpu, ScratchCpu, Tally, Mismatches);
+				bLevelOk &= bOk;
+
+				if (bOk)
+				{
+					UE_LOG(LogVoxelGpuVerify, Log,
+					       TEXT("[D5 coarse] PASS — L%d [%s]: %u columns, %d quads, cell stack ")
+					       TEXT("%u bricks deep — bit-exact with coarseColumns + makeCoarseBrick"),
+					       Level, Region.Name, Region.Width * Region.Height,
+					       Gpu.Quads.Num(), Req.BricksZ);
+				}
+				else
+				{
+					// WHICH STAGE disagreed is the whole diagnostic. Columns
+					// wrong means the xy mapping (coarseColumns); cells-only
+					// wrong means the z mapping (makeCoarseBrick); quads-only
+					// means the mesher read a grid it agreed with and still
+					// produced different geometry.
+					UE_LOG(LogVoxelGpuVerify, Error,
+					       TEXT("[D5 coarse] FAIL — L%d [%s]: %lld column, %lld cell, %lld quad ")
+					       TEXT("mismatch(es). Columns wrong => the xy mapping; cells only => the ")
+					       TEXT("z mapping; quads only => the mesher."),
+					       Level, Region.Name, Tally.Columns, Tally.Cells, Tally.Quads);
+					for (int32 M = 0; M < FMath::Min(Mismatches.Num(), 10); ++M)
+					{
+						UE_LOG(LogVoxelGpuVerify, Error, TEXT("    %s: cpu=%lld gpu=%lld"),
+						       *Mismatches[M].Where, Mismatches[M].Cpu, Mismatches[M].Gpu);
+					}
+				}
+			}
+
+			if (bLevelOk)
+			{
+				LastGoodLevel = Level;
+			}
+			else
+			{
+				UE_LOG(LogVoxelGpuVerify, Error,
+				       TEXT("[D5 coarse] level %d FAILED — stopping. Ship voxel.Stream.GPUMaxLevel ")
+				       TEXT("at %d, and do NOT relax this gate to get past it."),
+				       Level, LastGoodLevel);
+				break;
+			}
+		}
+
+		if (LastGoodLevel < 0)
+		{
+			UE_LOG(LogVoxelGpuVerify, Error,
+			       TEXT("[D5 coarse] NO level passed, not even 0. Level 0 is the identity in "
+			            "coarseRep, so this is the harness, not the coarse path."));
+		}
+		else
+		{
+			UE_LOG(LogVoxelGpuVerify, Log,
+			       TEXT("[D5 coarse] highest bit-exact level: %d (of %d requested)"),
+			       LastGoodLevel, MaxLevel);
+		}
+	}
+
+	FAutoConsoleCommand GVoxelGpuVerifyCoarseCmd(
+		TEXT("voxel.GPU.VerifyCoarse"),
+		TEXT("D5: byte-compare GPU coarse generation against vxc::coarseColumns + makeCoarseBrick, ")
+		TEXT("level by level, stopping at the first failure. Does NOT touch the pinned level-0 ")
+		TEXT("digest. Usage: [maxLevel=5]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&VerifyCoarseCommand));
 
 	FAutoConsoleCommand GVoxelGpuFindBandFixtureCmd(
 		TEXT("voxel.GPU.FindBandFixture"),
