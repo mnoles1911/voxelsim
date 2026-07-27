@@ -356,13 +356,29 @@ public:
 	int64 GetAllocFailureCount() const { return AllocFailureCount; }
 	int64 GetAllocFailureQuads() const { return AllocFailureQuads; }
 
-	// Allocations is APPEND-ONLY: AddChunk and AddChunkFromGpu both
-	// Allocations.Add(...), freed slots are zeroed in place and never reused,
-	// and Reset() only happens in InitPool. So this is a count of chunks EVER
-	// ADDED over the pool's lifetime, not resident chunks -- GetNumChunks() is
-	// that. It is the growth term in BuildChunkRuns's Reserve()-and-walk, which
-	// runs once per publication.
+	// Allocations is APPEND-ONLY by default: AddChunk and AddChunkFromGpu both
+	// Allocations.Add(...), freed slots are zeroed in place, and Reset() only
+	// happens in InitPool. So this is a count of chunks EVER ADDED over the
+	// pool's lifetime, not resident chunks -- GetNumChunks() is that. It is the
+	// growth term in BuildChunkRuns's Reserve()-and-walk, which runs once per
+	// publication.
+	//
+	// S1-2: under voxel.Stream.PoolRecycleHandles this still counts every append
+	// ever made -- FreeHandles lets a freed slot be REUSED rather than growing
+	// the array, so with the gate on this stops climbing once the pool reaches
+	// steady state instead of tracking chunks ever added. See GetFreeHandleCount.
 	int32 GetNumAllocationsEver() const { return Allocations.Num(); }
+
+	// S1-2 (docs/speculative-generation-plan.md §2.2). Handles sitting in
+	// FreeHandles, available for the next AddChunk/AddChunkFromGpu instead of a
+	// fresh append. Appended to the "Voxel GPU pool:" log line alongside
+	// allocsEver so the recycling is visible as it works: with
+	// voxel.Stream.PoolRecycleHandles on, allocsEver should plateau near
+	// liveChunks once churn saturates the free list, instead of climbing for the
+	// whole session (measured in docs/measurements/s0-apply-census-2026-07-27.txt,
+	// "NEW FINDING 1": 28,042 -> 68,416 allocsEver against 28,042 -> 18,389 live
+	// runs over one 120s flight leg).
+	int32 GetFreeHandleCount() const { return FreeHandles.Num(); }
 
 	// S1-1's hazard counter -- see UnmarkQuadsDirty. Non-zero on the first
 	// batched leg proves the free-then-reallocate-in-one-frame race is REAL and
@@ -538,6 +554,49 @@ private:
 	// freeing the entry does not depend on the allocation still being non-empty.
 	TArray<uint32> AllocationChunkIds;
 	int32 NumLiveChunks = 0;
+
+	// Allocations-array handles a removal gave back, available for the next
+	// AddChunk/AddChunkFromGpu instead of a fresh Allocations.Add(...).
+	//
+	// Without this Allocations only ever GREW: both add paths appended and
+	// RemoveChunkInternal zeroed a freed slot in place but never handed it back,
+	// so BuildChunkRuns's Reserve()-and-walk tracked chunks EVER ADDED, not
+	// resident, and its cost was unbounded in SESSION LENGTH rather than world
+	// size. Measured over a 120s flight leg (§2.2,
+	// docs/measurements/s0-apply-census-2026-07-27.txt "NEW FINDING 1"): mean
+	// allocations walked climbed 28,042 -> 68,416 while live runs emitted FELL
+	// 28,042 -> 18,389 -- a 3.72x and rising ratio of wasted walk, on every
+	// publication.
+	//
+	// Recycling a handle is safe because by the time RemoveChunkInternal pushes
+	// it, every quad in its range has already been repointed at kHiddenChunkId
+	// and its Allocations entry has already been zeroed -- so nothing in the pool
+	// buffer, and no live FChunkRun, still names it.
+	//
+	// GATED on voxel.Stream.PoolRecycleHandles (default 0): with the gate off
+	// RemoveChunkInternal never pushes here, so this stays permanently empty and
+	// AddChunk/AddChunkFromGpu always append -- byte-identical to before this
+	// existed. The gate lives on the PUSH side only, not the pop side (see
+	// AcquireAllocationHandle): flipping it on mid-session must not retroactively
+	// hand out handles that were freed while it was off, but once it is on there
+	// is no reason to refuse a handle that is legitimately sitting here.
+	//
+	// NOT pushed at all when RemoveChunkInternal is called with
+	// bRecycleChunkId=false -- UpdateChunk's realloc branch, which writes
+	// Allocations[Handle] itself a few lines later, reusing that EXACT handle
+	// deliberately. Handing the same index to a concurrent AddChunk in between
+	// would let two live chunks alias one pool slot; see RemoveChunkInternal.
+	TArray<int32> FreeHandles;
+
+	// Acquires an Allocations/AllocationChunkIds slot for a new chunk: pops and
+	// reuses a handle FreeHandles holds, or appends a fresh one when the list is
+	// empty (always true with voxel.Stream.PoolRecycleHandles off, since nothing
+	// pushes then). AddChunk and AddChunkFromGpu both call this instead of
+	// Allocations.Add(...) directly -- one acquire path so the two do not drift
+	// apart (docs/backlog.md's "two copies of one calibration" failure mode).
+	// UpdateChunk's realloc branch does NOT call this: it already owns a handle
+	// and writes Allocations[Handle] in place, on purpose (see FreeHandles).
+	int32 AcquireAllocationHandle(const FVoxelGpuPoolAllocation& Alloc, uint32 ChunkId);
 
 	// See GetAllocFailureCount. Cumulative for the pool's lifetime; never reset
 	// by ClearChunks, because the question these answer is "did this RUN ever

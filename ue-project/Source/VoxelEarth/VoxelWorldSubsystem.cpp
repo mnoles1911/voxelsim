@@ -4587,19 +4587,25 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		// from the outside. capacityPct is beside it so the approach to the cliff
 		// is visible before the cliff.
 		const uint32 CapacityQuads = Pool->GetHighWaterMarkQuads() + Pool->GetFreeQuads();
-		// S0-2: allocsEver tests §2.2 -- Allocations is append-only (see
-		// GetNumAllocationsEver), so this is chunks-ever-added, not resident
+		// S0-2: allocsEver tests §2.2 -- Allocations is append-only by default
+		// (see GetNumAllocationsEver), so this is chunks-ever-added, not resident
 		// (liveChunks is resident). Watch it against liveChunks over a leg: if
 		// it grows while liveChunks plateaus, BuildChunkRuns's per-publication
 		// walk is paying an ever-larger tax for no more live geometry.
+		//
+		// S1-2: freeHandles is GetFreeHandleCount() -- with
+		// voxel.Stream.PoolRecycleHandles on, this is the fix in flight: allocsEver
+		// should stop climbing (steady state reuses freeHandles instead of
+		// appending) once churn saturates the free list.
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel GPU pool: liveChunks=%d highWater=%u free=%u largestRun=%u freeRuns=%d ")
-		       TEXT("capacityPct=%.1f allocFail=%lld allocFailQuads=%lld allocsEver=%d -- ONE primitive, ONE draw"),
+		       TEXT("capacityPct=%.1f allocFail=%lld allocFailQuads=%lld allocsEver=%d freeHandles=%d -- ")
+		       TEXT("ONE primitive, ONE draw"),
 		       Pool->GetNumChunks(), Pool->GetHighWaterMarkQuads(), Pool->GetFreeQuads(),
 		       Pool->GetLargestFreeRun(), Pool->GetFreeRunCount(),
 		       CapacityQuads > 0 ? 100.0 * double(Pool->GetHighWaterMarkQuads()) / double(CapacityQuads) : 0.0,
 		       (long long)Pool->GetAllocFailureCount(), (long long)Pool->GetAllocFailureQuads(),
-		       Pool->GetNumAllocationsEver());
+		       Pool->GetNumAllocationsEver(), Pool->GetFreeHandleCount());
 	}
 
 	// M2 item 1: "Per-level loaded/pending counters into the perf snapshot/
