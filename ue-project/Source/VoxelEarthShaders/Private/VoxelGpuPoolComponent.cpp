@@ -24,19 +24,58 @@ FVoxelGpuPoolBuffers::~FVoxelGpuPoolBuffers() = default;
 // Draws every chunk in the pool with a single mesh batch.
 namespace VoxelGpuPoolCull
 {
-	// HARD CEILING ON DRAW RANGES, and it is a correctness limit rather than a
-	// taste one. The renderer selects batch elements with
-	// `(1ull << BatchElementIndex) & BatchElementMask` (FMeshBatch), which is
-	// undefined for any index >= 64. GPUCullMaxRanges used to default to 256, so
-	// a sufficiently fragmented view was one shift away from undefined
+	// HARD CEILING ON DRAW RANGES *WITHIN ONE MESH BATCH*, and it is a correctness
+	// limit rather than a taste one. The renderer selects batch elements with
+	// `(1ull << BatchElementIndex) & BatchElementMask` (MeshPassProcessor.inl:167,
+	// against a mask of ~0ull for dynamic elements -- MeshDrawCommands.cpp:644),
+	// which is undefined for any index >= 64. GPUCullMaxRanges used to default to
+	// 256, so a sufficiently fragmented view was one shift away from undefined
 	// behaviour that would have presented as random missing terrain.
+	//
+	// IT IS NO LONGER A CEILING ON THE CULL'S RANGE BUDGET. The mask is per
+	// FMeshBatch and every batch indexes its own elements from 0, so
+	// GetDynamicMeshElements emits ceil(NumRanges / 64) batches and no batch is
+	// ever asked about bit 64. See kMaxRanges for why the budget had to grow past
+	// this number, and why it could not before.
 	static constexpr int32 kMaxBatchElements = 64;
 
-	static int32 GEnabled = 0;
+	// THE CULL'S ACTUAL RANGE BUDGET, now that the element mask is a per-batch
+	// limit rather than a per-gather one.
+	//
+	// WHY 64 WAS EXPENSIVE, MEASURED AT 13,190 CHUNKS. The range-cap merge below
+	// is optimal for "fewest redrawn quads subject to at most K ranges", so what
+	// it draws at K=64 is the provable floor for a 64-range budget -- not slack to
+	// be tuned away. That floor was 2.06x the visible quads. K=256 removed 38% of
+	// that over-draw; K=1024 removed 85% and made the CAMERA gather converge to
+	// exactly the visible set.
+	//
+	// At the adopted 128 m / 4 km cascade the pool holds ~39,020 chunks / 35.2M
+	// quads, where full convergence needs ~10-14k ranges -- so 1024 is not the end
+	// of the curve, it is where the remaining over-draw stops dominating. Read the
+	// `budget:` log line (GPUCullStatsPeriod) for drawn(K) at the live pose rather
+	// than assuming these numbers carry to a bigger cascade.
+	//
+	// WHAT RAISING IT COSTS: one extra FMeshBatch and one extra draw command per
+	// 64 ranges -- 16 batches per gather at 1024, against ~39,020 draws if the
+	// pool were drawn per chunk. Two orders of magnitude cheaper than the thing
+	// this whole design exists to avoid. The one non-obvious cost is that every
+	// range still allocates a single-frame uniform buffer for its BaseQuad
+	// (FVoxelQuadRangeParameters), so the per-gather count of those scales with
+	// this and not with the batch count.
+	static constexpr int32 kMaxRanges = 1024;
+
+	// DEFAULT ON since 2026-07-27 (was 0 -- and docs/gpu-roadmap-remaining.md
+	// claiming otherwise is what let three baseline legs at the adopted 128 m /
+	// 4 km cascade run uncull unnoticed at 45 ms/frame). Measured at the pinned
+	// settle, 39,020 chunks / 35.2 M quads: cull off 44.5 ms, cull on 35.7 ms
+	// at the OLD 64-range budget with drawn still 79% of the pool from merge
+	// over-draw -- which is what the kMaxRanges=1024 budget above now attacks.
+	static int32 GEnabled = 1;
 	static FAutoConsoleVariableRef CVarEnabled(
 		TEXT("voxel.Stream.GPUCull"), GEnabled,
-		TEXT("Frustum-cull the GPU pool per chunk and draw only the surviving pool ranges. 1 = on, 0 = off ")
-		TEXT("(default). 0 is one draw over the whole pool, which is the pre-cull behaviour and pays for ")
+		TEXT("Frustum-cull the GPU pool per chunk and draw only the surviving pool ranges. 1 = on (default ")
+		TEXT("since 2026-07-27; measured -8.8ms at the 4km-cascade settle even at the old 64-range budget). ")
+		TEXT("0 is one draw over the whole pool, which is the pre-cull behaviour and pays for ")
 		TEXT("every resident quad regardless of where the camera looks."),
 		ECVF_RenderThreadSafe);
 
@@ -61,17 +100,25 @@ namespace VoxelGpuPoolCull
 		TEXT("pass, leaving only the range-cap merge."),
 		ECVF_RenderThreadSafe);
 
-	// The draw-range budget the merge works down to. Clamped to
-	// kMaxBatchElements wherever it is read -- see that constant.
-	static int32 GMaxRanges = kMaxBatchElements;
+	// The draw-range budget the merge works down to. Clamped to kMaxRanges
+	// wherever it is read -- see that constant.
+	//
+	// DEFAULTS TO THE CAP, DELIBERATELY. Leaving this at the old 64 while the
+	// ceiling moved would keep the measured 2.06x merge over-draw and make the
+	// multi-batch emit a no-op that costs a comparison -- the ceiling moved
+	// BECAUSE 64 ranges cannot describe what is visible at 39k chunks. Set it back
+	// to 64 to reproduce the pre-multi-batch draw shape exactly; that is the
+	// control this default should be read against.
+	static int32 GMaxRanges = kMaxRanges;
 	static FAutoConsoleVariableRef CVarMaxRanges(
 		TEXT("voxel.Stream.GPUCullMaxRanges"), GMaxRanges,
-		TEXT("Draw-range budget for the cull. The merge always reaches it by construction. CLAMPED TO 64: ")
-		TEXT("the renderer's batch-element mask is a uint64 and index >= 64 is undefined."),
+		TEXT("Draw-range budget for the cull. The merge always reaches it by construction. Clamped to 1024. ")
+		TEXT("Ranges are split across ceil(N/64) mesh batches: the renderer's batch-element mask is a uint64, ")
+		TEXT("so index >= 64 is undefined WITHIN ONE BATCH, which is the only place it is a limit."),
 		ECVF_RenderThreadSafe);
 
-	// The budget actually used, never above the element-mask limit.
-	inline int32 GetMaxRanges() { return FMath::Clamp(GMaxRanges, 1, kMaxBatchElements); }
+	// The budget actually used, never above the cap.
+	inline int32 GetMaxRanges() { return FMath::Clamp(GMaxRanges, 1, kMaxRanges); }
 
 	// Control experiment: run the whole range/merge/multi-draw path but treat
 	// EVERY chunk as visible. If the picture is correct with this on and wrong
@@ -252,6 +299,20 @@ public:
 
 	void CreateRenderThreadResources(FRHICommandListBase& RHICmdList) override
 	{
+		// FIRST, AND NOT IN THE CONSTRUCTOR. The bounds are world-space, so they
+		// need GetLocalToWorld() -- and FPrimitiveSceneProxy::LocalToWorld is a
+		// private member with no default initialiser that is only ever assigned by
+		// SetTransform (PrimitiveSceneProxy.cpp:907), so in the constructor it is
+		// uninitialised memory. FScene::AddPrimitive enqueues SetTransform and this
+		// method as ONE render command in that order, explicitly so that resources
+		// may depend on the transform (RendererScene.cpp:1506-1514), which makes
+		// this the earliest point the bounds can be built at all.
+		//
+		// Above the early return below: a proxy holding runs but no quads still
+		// gets gathered, and the cull would otherwise run its whole first life on
+		// the uncached fallback.
+		RebuildRunBounds();
+
 		if (BufferQuads == 0 || NumChunks == 0)
 		{
 			return;
@@ -445,9 +506,17 @@ public:
 
 		if (ElementsLogged.Increment() == 1)
 		{
+			// The budget and the per-batch element limit are printed because a
+			// gather no longer submits exactly one FMeshBatch: with the cull on it
+			// submits ceil(ranges / elementsPerBatch) of them, and a reader
+			// counting draw commands against this line needs to know that before
+			// concluding the pool is drawing more than it should.
 			UE_LOG(LogTemp, Log,
-			       TEXT("%s draw SUBMITTED: numQuads=%d views=%d visMap=0x%x"),
-			       *PoolName, NumQuads, Views.Num(), VisibilityMap);
+			       TEXT("%s draw SUBMITTED: numQuads=%d views=%d visMap=0x%x cull=%d maxRanges=%d "
+			            "elementsPerBatch=%d"),
+			       *PoolName, NumQuads, Views.Num(), VisibilityMap,
+			       VoxelGpuPoolCull::IsEnabled() ? 1 : 0, VoxelGpuPoolCull::GetMaxRanges(),
+			       VoxelGpuPoolCull::kMaxBatchElements);
 		}
 
 		// Editor Wireframe view mode, mirroring FVoxelChunkSceneProxy. Without
@@ -473,15 +542,6 @@ public:
 			{
 				continue;
 			}
-
-			FMeshBatch& Mesh = Collector.AllocateMesh();
-			Mesh.VertexFactory = &VertexFactory;
-			Mesh.MaterialRenderProxy = BatchMaterialProxy;
-			Mesh.bWireframe = bWireframe;
-			Mesh.Type = PT_TriangleList;
-			Mesh.DepthPriorityGroup = SDPG_World;
-			Mesh.bCanApplyViewModeOverrides = false;
-			Mesh.CastShadow = IsShadowCast(Views[ViewIndex]);
 
 			// ONE element covering EVERY chunk, unless culling is on.
 			//
@@ -532,15 +592,28 @@ public:
 			// measured zero rather than as a gather that never happened.
 			if (bCull && Outcome == ECullOutcome::AllCapped)
 			{
-				// Explicitly ZERO. Nothing is submitted on this path, and the
-				// batch is deliberately left unpopulated -- so it must not be
-				// asked how much work it represents. See RecordGather.
+				// Explicitly ZERO. Nothing is submitted on this path, and NO batch
+				// is allocated at all -- so nothing can be asked how much work it
+				// represents. See RecordGather for what an abandoned, recycled
+				// FMeshBatch reported back when this path did allocate one.
 				RecordGather(*Views[ViewIndex], /*SubmittedQuads=*/0, VisibleQuadsThisGather);
 				continue;
 			}
 
+			// Per view, not per batch: the cull path emits several batches and
+			// every one of them must answer this question identically.
+			const bool bBatchCastShadow = IsShadowCast(Views[ViewIndex]);
+
 			if (!bCull || Ranges.Num() == 0)
 			{
+				// THE FALLBACK IS DELIBERATELY STILL ONE BATCH WITH ONE ELEMENT,
+				// byte-identical to what it was before multi-batching existed. It
+				// is the control every cull measurement is read against, so it must
+				// not acquire a batch-splitting loop it can never take (one range
+				// can never exceed the 64-element limit).
+				FMeshBatch& Mesh = Collector.AllocateMesh();
+				InitMeshBatch(Mesh, BatchMaterialProxy, bWireframe, bBatchCastShadow);
+
 				// Not culling, or the cull produced nothing usable -- draw
 				// everything, which is always correct and never worse than
 				// before this option existed.
@@ -550,7 +623,21 @@ public:
 				// the identical expression to before BaseQuad existed. This path
 				// is unchanged, not merely equivalent, and that is deliberate:
 				// it is the control every cull measurement is read against.
-				FMeshBatchElement& Element = Mesh.Elements[0];
+				//
+				// RESET-AND-ADD RATHER THAN Elements[0], which is the one line of
+				// this branch that is not what it was. AllocateMesh does not
+				// construct: TChunkedArray::Add(1) (ChunkedArray.h:254) only bumps
+				// a count, so the slot holds whatever the last gather left in it --
+				// which, now that a cull gather populates up to 64 elements per
+				// batch and 16 batches per gather, is very often a fully populated
+				// element list whose UserData points at LAST frame's one-frame
+				// resources. Writing Elements[0] and submitting left the other 63
+				// in place. This makes the element list exactly one default element
+				// (which is what a freshly constructed FMeshBatch carries,
+				// MeshBatch.h:556) before it is filled, so the draw shape is the
+				// one this path has always meant: one element, whole pool.
+				Mesh.Elements.Reset();
+				FMeshBatchElement& Element = Mesh.Elements.AddDefaulted_GetRef();
 				Element.IndexBuffer = nullptr;
 				Element.FirstIndex = 0;
 				// Up to the high-water mark only: everything above it has never
@@ -560,6 +647,13 @@ public:
 				Element.MaxVertexIndex = uint32(NumQuads) * 6 - 1;
 				Element.NumInstances = 1;
 				Element.PrimitiveUniformBuffer = GetUniformBuffer();
+
+				// AFTER the elements are built and BEFORE they are handed over, so
+				// what is counted is exactly what is submitted -- including both
+				// fallback paths, which is the half the cull's own log cannot see.
+				RecordGather(*Views[ViewIndex], CountSubmittedQuads(Mesh), VisibleQuadsThisGather);
+
+				Collector.AddMesh(ViewIndex, Mesh);
 			}
 			else
 			{
@@ -586,41 +680,115 @@ public:
 				// FVoxelQuadRangeParameters. Correct whether or not the platform
 				// includes the base vertex, because VertexId now unambiguously
 				// runs [0, Count*6) for every range.
-				Mesh.Elements.Reset();
-				for (const FQuadRange& Range : Ranges)
+				//
+				// SEVERAL BATCHES, NOT ONE, AND THAT IS WHAT LETS THE BUDGET EXCEED
+				// 64 (Wave G). The element mask is per FMeshBatch and every batch
+				// indexes its own elements from 0, so ceil(R / 64) batches carry R
+				// ranges with no index ever reaching bit 64. See
+				// VoxelGpuPoolCull::kMaxRanges for the measurement that says the
+				// old 64-range budget was drawing 2.06x the visible quads at 13,190
+				// chunks, and what each extra batch costs.
+				const int32 NumBatches =
+					FMath::DivideAndRoundUp(Ranges.Num(), VoxelGpuPoolCull::kMaxBatchElements);
+				// Summed across the batches and reported as ONE gather: the census
+				// counts gathers, not draws, and a gather that suddenly reported
+				// itself 16 times would divide every per-gather figure by 16.
+				uint64 SubmittedQuadsThisGather = 0;
+
+				for (int32 BatchIndex = 0; BatchIndex < NumBatches; ++BatchIndex)
 				{
-					// ONE FRAME RESOURCE, not a local and not a proxy member.
-					// GetDynamicMeshElements only gathers; the bindings are read
-					// later when the draw commands are built, by which time a
-					// stack local is gone. The collector owns this until the
-					// frame ends.
-					FVoxelQuadRangeUserData& RangeData =
-						Collector.AllocateOneFrameResource<FVoxelQuadRangeUserData>();
-					FVoxelQuadRangeParameters RangeParams;
-					RangeParams.BaseQuad = Range.First;
-					RangeData.RangeUniformBuffer =
-						TUniformBufferRef<FVoxelQuadRangeParameters>::CreateUniformBufferImmediate(
-							RangeParams, UniformBuffer_SingleFrame);
+					const int32 FirstRange = BatchIndex * VoxelGpuPoolCull::kMaxBatchElements;
+					const int32 EndRange = FMath::Min(FirstRange + VoxelGpuPoolCull::kMaxBatchElements,
+					                                  Ranges.Num());
 
-					FMeshBatchElement& Element = Mesh.Elements.AddDefaulted_GetRef();
-					Element.IndexBuffer = nullptr;
-					Element.FirstIndex = 0;
-					Element.NumPrimitives = Range.Count * 2;
-					Element.MinVertexIndex = 0;
-					Element.MaxVertexIndex = Range.Count * 6 - 1;
-					Element.NumInstances = 1;
-					Element.PrimitiveUniformBuffer = GetUniformBuffer();
-					Element.UserData = &RangeData;
+					FMeshBatch& Mesh = Collector.AllocateMesh();
+					// Through the shared helper rather than a second copy of the
+					// setup: every batch of a gather must carry the identical vertex
+					// factory, material, type and shadow flag, and two copies of
+					// that is how one of them quietly stops matching.
+					InitMeshBatch(Mesh, BatchMaterialProxy, bWireframe, bBatchCastShadow);
+
+					// Reset FIRST. A batch arrives carrying one default element
+					// (MeshBatch.h:556) and, on a recycled slot, whatever the last
+					// gather left in it -- see RecordGather for what reading a
+					// recycled element reported. Reset makes the element count
+					// exactly the number of ranges added below, which is what the
+					// mask ~0ull is then intersected against.
+					Mesh.Elements.Reset();
+					Mesh.Elements.Reserve(EndRange - FirstRange);
+
+					for (int32 RangeIndex = FirstRange; RangeIndex < EndRange; ++RangeIndex)
+					{
+						const FQuadRange& Range = Ranges[RangeIndex];
+
+						// ONE FRAME RESOURCE, not a local and not a proxy member.
+						// GetDynamicMeshElements only gathers; the bindings are read
+						// later when the draw commands are built, by which time a
+						// stack local is gone. The collector owns this until the
+						// frame ends.
+						FVoxelQuadRangeUserData& RangeData =
+							Collector.AllocateOneFrameResource<FVoxelQuadRangeUserData>();
+						FVoxelQuadRangeParameters RangeParams;
+						RangeParams.BaseQuad = Range.First;
+						RangeData.RangeUniformBuffer =
+							TUniformBufferRef<FVoxelQuadRangeParameters>::CreateUniformBufferImmediate(
+								RangeParams, UniformBuffer_SingleFrame);
+
+						// PER-BATCH ELEMENT INDEXING, STARTING AT 0. Nothing here
+						// carries the global range index: the element's position in
+						// THIS batch is what the mask bit refers to, and its start
+						// in the pool travels in the uniform buffer above. That
+						// separation is the whole reason splitting is free.
+						FMeshBatchElement& Element = Mesh.Elements.AddDefaulted_GetRef();
+						Element.IndexBuffer = nullptr;
+						Element.FirstIndex = 0;
+						Element.NumPrimitives = Range.Count * 2;
+						Element.MinVertexIndex = 0;
+						Element.MaxVertexIndex = Range.Count * 6 - 1;
+						Element.NumInstances = 1;
+						Element.PrimitiveUniformBuffer = GetUniformBuffer();
+						Element.UserData = &RangeData;
+					}
+
+					// Counted BEFORE the batch is handed over, per batch, so the
+					// gather total is the sum of what was actually submitted rather
+					// than a re-derivation from the range list.
+					SubmittedQuadsThisGather += CountSubmittedQuads(Mesh);
+					Collector.AddMesh(ViewIndex, Mesh);
 				}
+
+				// ONCE PER PROXY. The draw-command count per gather stopped being 1
+				// and this is the line that says so; without it a reader seeing 16
+				// commands where the design promises "ONE draw" has no way to tell
+				// the split from a regression.
+				if (BatchesLogged.Increment() == 1)
+				{
+					UE_LOG(LogTemp, Log,
+					       TEXT("%s draw MULTI-BATCH: ranges=%d -> batches=%d (<=%d elements each), "
+					            "maxRanges=%d -- one primitive still, ceil(ranges/%d) draw commands"),
+					       *PoolName, Ranges.Num(), NumBatches, VoxelGpuPoolCull::kMaxBatchElements,
+					       VoxelGpuPoolCull::GetMaxRanges(), VoxelGpuPoolCull::kMaxBatchElements);
+				}
+
+				RecordGather(*Views[ViewIndex], SubmittedQuadsThisGather, VisibleQuadsThisGather);
 			}
-
-			// AFTER the elements are built and BEFORE they are handed over, so
-			// what is counted is exactly what is submitted -- including both
-			// fallback paths, which is the half the cull's own log cannot see.
-			RecordGather(*Views[ViewIndex], CountSubmittedQuads(Mesh), VisibleQuadsThisGather);
-
-			Collector.AddMesh(ViewIndex, Mesh);
 		}
+	}
+
+	// One mesh batch's shared setup, factored out because a cull gather now emits
+	// SEVERAL batches and the fallback emits one -- and every one of them has to
+	// carry identical state. Duplicating seven assignments is how two batches of
+	// the same gather end up disagreeing about, say, CastShadow.
+	void InitMeshBatch(FMeshBatch& Mesh, const FMaterialRenderProxy* InMaterialProxy,
+	                   bool bInWireframe, bool bInCastShadow) const
+	{
+		Mesh.VertexFactory = &VertexFactory;
+		Mesh.MaterialRenderProxy = InMaterialProxy;
+		Mesh.bWireframe = bInWireframe;
+		Mesh.Type = PT_TriangleList;
+		Mesh.DepthPriorityGroup = SDPG_World;
+		Mesh.bCanApplyViewModeOverrides = false;
+		Mesh.CastShadow = bInCastShadow;
 	}
 
 	// --- incremental update, render thread -------------------------------
@@ -692,6 +860,21 @@ public:
 		// quads that no longer belong to anyone.
 		Runs = NewRuns;
 
+		// THE ONE WRITER OF THE CULL'S PRECOMPUTED BOUNDS, and it is here rather
+		// than anywhere else because Runs and Origins -- the only two inputs those
+		// bounds are derived from -- are replaced wholesale on this line and the
+		// one above it. No new invalidation logic exists or is needed: the caller's
+		// existing bRunsDirty/bChunkTableDirty flags already gate every arrival of
+		// a new run list, so anything that can change the bounds must come through
+		// here. See RebuildRunBounds for the concurrency argument.
+		//
+		// BEFORE the early return below. That return means "the table outgrew its
+		// GPU allocation, the caller will rebuild the render state" -- but Runs and
+		// Origins have already been taken, the cull will read them on the next
+		// gather, and it must not read them against bounds built from the previous
+		// pair.
+		RebuildRunBounds();
+
 		if (!OriginBuffer.IsValid() || NewOrigins.Num() > MaxChunks)
 		{
 			return;   // outgrew the table; the caller rebuilds the render state
@@ -746,6 +929,145 @@ private:
 
 	struct FQuadRange { uint32 First = 0; uint32 Count = 0; };
 
+	// --- the cull's precomputed, view-independent half (Wave G) -------------
+	//
+	// EVERYTHING THE PER-RUN CULL BODY DID BEFORE IntersectBox, HOISTED OUT OF THE
+	// PER-GATHER LOOP. That body used to do, per run per gather:
+	// Origins[Run.ChunkId] (a random gather into a 39,020-entry array; chunk ids
+	// are recycled LIFO and therefore uncorrelated with pool order, so it is a
+	// near-guaranteed cache miss), LevelFromScale, an FBox construct, a
+	// TransformBy(FMatrix) in LWC doubles, then GetCenter/GetExtent. Only the
+	// IntersectBox that follows depends on the VIEW.
+	//
+	// WHAT THAT COST, at the adopted 128 m / 4 km cascade: ~39,020 runs tested per
+	// gather across the camera and ~4 shadow gathers -- ~195,000 tests a frame at
+	// 45-90 ns each, ~11.7 ms of render-thread CPU (~3-8 ms wall once the gathers
+	// parallelise), of which 60-75% was everything above rather than the frustum
+	// test itself.
+	//
+	// The SKIP REASONS are carried here rather than recomputed because they come
+	// from the same two loads the gather was for: "is this a valid table index"
+	// and "is its scale zero".
+	enum class ERunBoundsState : uint8
+	{
+		Ok,       // drawable: Center/Extent/Level are meaningful
+		BadId,    // the run names a chunk id the table does not describe
+		Hidden,   // the table entry's scale is 0 -- collapsed to a point
+	};
+
+	// ~56 bytes per run, so ~2.2 MB at 39,020 runs. Read strictly sequentially,
+	// in step with Runs, which is the entire point: one prefetchable stream
+	// instead of 39,020 dependent random loads.
+	//
+	// DOUBLES, not floats. The world runs at ~8.4M UU from the origin so the
+	// centre needs the range, and the extent is kept in the same precision so the
+	// pair is bit-for-bit what FBox::TransformBy/GetCenter/GetExtent produced
+	// before -- no razor-edge frustum result can flip on a rounding change, and
+	// the census counts stay comparable across the change.
+	struct FVoxelRunBounds
+	{
+		FVector Center = FVector::ZeroVector;
+		FVector Extent = FVector::ZeroVector;
+		int32 Level = 0;
+		ERunBoundsState State = ERunBoundsState::BadId;
+	};
+
+	// Parallel to Runs, same index. Written ONLY by RebuildRunBounds.
+	TArray<FVoxelRunBounds> RunBounds;
+
+	// The transform the bounds above were built with, and the flag that says they
+	// were built at all.
+	//
+	// WHY THE TRANSFORM IS CHECKED RATHER THAN ASSUMED CONSTANT. The bounds are
+	// world-space, so they are view-independent only for a FIXED LocalToWorld --
+	// and this component's is not fixed forever. The pool is re-based once, by
+	// SetWorldLocation AFTER RegisterComponent (FVoxelWorldImpl::GetOrCreateGpuPool
+	// -- the chunk table is float32 and the world is 8.4M UU out, so the big
+	// offset has to live in the component transform), which reaches the live proxy
+	// as a SetTransform. FPrimitiveSceneProxy::ApplyWorldOffset is a second such
+	// path. Either would leave these boxes describing where the chunks used to be,
+	// and a frustum test on a stale box is the "a perfectly correct cull selects
+	// the wrong geometry" failure this file has already been bitten by once.
+	//
+	// So the gather compares and falls back rather than trusting. One
+	// FMatrix::Equals per gather, not per run.
+	FMatrix RunBoundsLocalToWorld = FMatrix::Identity;
+	bool bRunBoundsValid = false;
+
+	// One Warning, ever, if a gather has to take the uncached path. That path is
+	// exactly as fast as this code was before the hoist, so it is not a
+	// correctness problem -- but a proxy stuck on it permanently (a transform that
+	// changed, and a chunk table that then never updated again) silently gives
+	// back the whole ~11.7 ms, which is precisely the "rare, silent, looks like it
+	// works" shape the rest of this file is written against.
+	mutable FThreadSafeCounter RunBoundsStaleLogged;
+
+	// The view-independent half of the old per-run cull body, in ONE place so the
+	// writer and the uncached fallback cannot drift apart -- two copies of this
+	// arithmetic is how a cached box and a recomputed box end up disagreeing about
+	// which chunks are on screen.
+	FVoxelRunBounds ComputeRunBounds(const UVoxelGpuPoolComponent::FChunkRun& Run,
+	                                 const FMatrix& LocalToWorldMatrix) const
+	{
+		FVoxelRunBounds Out;
+		if (!Origins.IsValidIndex(int32(Run.ChunkId)))
+		{
+			Out.State = ERunBoundsState::BadId;
+			return Out;
+		}
+
+		const FVector4f& Entry = Origins[int32(Run.ChunkId)];
+		const float Scale = Entry.W;
+		if (Scale <= 0.f)
+		{
+			Out.State = ERunBoundsState::Hidden;   // collapsed to a point, nothing to draw
+			return Out;
+		}
+
+		// Already resident -- AddChunk stores float(1 << Level) here for the
+		// vertex factory's mip scale, so the shadow cap needs no new per-chunk
+		// data and neither does this.
+		Out.Level = VoxelGpuPoolCull::LevelFromScale(Scale);
+
+		// Same extent AddChunk grows LocalBounds by, so the cull can never be
+		// tighter than the bounds the scene already culled the whole primitive
+		// against.
+		const float EdgeUU = float(ChunkEdgeVoxels) * 10.0f * Scale;
+		const FVector Min(Entry.X, Entry.Y, Entry.Z);
+		const FBox LocalBox(Min, Min + FVector(EdgeUU));
+		const FBox WorldBox = LocalBox.TransformBy(LocalToWorldMatrix);
+		Out.Center = WorldBox.GetCenter();
+		Out.Extent = WorldBox.GetExtent();
+		Out.State = ERunBoundsState::Ok;
+		return Out;
+	}
+
+	// THE SINGLE WRITER, AND THE CONST/CONCURRENCY CONTRACT IT SATISFIES.
+	//
+	// GetDynamicMeshElements is const and is called CONCURRENTLY -- once for the
+	// camera and once per shadow cascade, on parallel tasks, through this one
+	// proxy (see the note in that method about what happened when the cull's
+	// working set was a member). Anything it reads must therefore be written only
+	// OUTSIDE a gather.
+	//
+	// RunBounds / RunBoundsLocalToWorld / bRunBoundsValid are written only here,
+	// and this runs only on the render thread from CreateRenderThreadResources and
+	// UpdateChunkTable_RenderThread -- neither of which can overlap a gather. That
+	// is exactly the contract Runs and Origins already live under, from the same
+	// two call sites, which is why no new synchronisation appears with this array:
+	// it is not a new kind of state, it is a precomputed function of state that
+	// already had this property.
+	void RebuildRunBounds()
+	{
+		RunBoundsLocalToWorld = GetLocalToWorld();
+		RunBounds.Reset(Runs.Num());
+		for (const UVoxelGpuPoolComponent::FChunkRun& Run : Runs)
+		{
+			RunBounds.Add(ComputeRunBounds(Run, RunBoundsLocalToWorld));
+		}
+		bRunBoundsValid = true;
+	}
+
 	// WHY AN EMPTY RANGE LIST IS NOT ONE SITUATION.
 	//
 	// Before the shadow cap existed, "no ranges" had exactly one meaning -- the
@@ -790,10 +1112,13 @@ private:
 		ON_SCOPE_EXIT { OutVisibleQuads = VisibleQuads; };
 
 		// N EQUAL RANGES OVER THE WHOLE POOL, no frustum test. See GDebugSplit.
-		// Capped at the batch-element limit for the same reason GetMaxRanges() is:
-		// asking for 256 parts would index a uint64 mask past bit 63.
+		// Capped at the same budget GetMaxRanges() is, and for the same reason it
+		// is no longer 64: the parts are split across ceil(N/64) mesh batches, so
+		// the uint64 element mask is never indexed past bit 63 whatever N is. Below
+		// 64 this path is unchanged, which matters because its published results
+		// (N = 2, 8, 64) are what proved the FirstIndex encoding wrong.
 		const int32 SplitCount = FMath::Min(VoxelGpuPoolCull::GDebugSplit,
-		                                    VoxelGpuPoolCull::kMaxBatchElements);
+		                                    VoxelGpuPoolCull::kMaxRanges);
 		if (SplitCount > 1 && NumQuads > 0)
 		{
 			const uint32 Total = uint32(NumQuads);
@@ -875,51 +1200,97 @@ private:
 		uint32 PoolQuadsByLevel[kMaxLevels] = {};
 		uint32 VisibleQuadsByLevel[kMaxLevels] = {};
 
-		for (const UVoxelGpuPoolComponent::FChunkRun& Run : Runs)
+		// THE HOIST, AND THE ONE CONDITION IT DEPENDS ON. See RunBounds for what
+		// the per-run body used to do and what it cost. The bounds are world-space,
+		// so they are only usable while the transform they were built with is still
+		// the transform in force -- checked ONCE here rather than assumed, because
+		// the pool is re-based after registration and ApplyWorldOffset exists.
+		//
+		// The uncached path is not a failure path, it is the OLD path: it recomputes
+		// exactly what RebuildRunBounds would have, per run, with no allocation, so
+		// the picture is identical either way and only the cost differs. It is
+		// logged once so a proxy that never leaves it cannot do so silently.
+		const bool bUseCachedBounds = bRunBoundsValid
+		                              && RunBounds.Num() == Runs.Num()
+		                              && RunBoundsLocalToWorld.Equals(LocalToWorldMatrix);
+		if (!bUseCachedBounds && RunBoundsStaleLogged.Increment() == 1)
 		{
+			UE_LOG(LogTemp, Warning,
+			       TEXT("%s cull: run bounds NOT CACHED (valid=%d bounds=%d runs=%d transformMatches=%d) -- "
+			            "falling back to the per-run recompute, which is correct but is the whole pre-hoist "
+			            "cost (~11.7 ms of render-thread CPU at cascade scale). Expect this to clear on the "
+			            "next chunk-table update; if it does not, the transform changed and nothing has "
+			            "pushed a table update since."),
+			       *PoolName, bRunBoundsValid ? 1 : 0, RunBounds.Num(), Runs.Num(),
+			       RunBoundsLocalToWorld.Equals(LocalToWorldMatrix) ? 1 : 0);
+		}
+
+		// Declared out of the loop so the cached path never touches it: on that
+		// path this is dead storage and the reference below binds straight into
+		// RunBounds.
+		FVoxelRunBounds ScratchBounds;
+
+		for (int32 RunIndex = 0; RunIndex < Runs.Num(); ++RunIndex)
+		{
+			const UVoxelGpuPoolComponent::FChunkRun& Run = Runs[RunIndex];
+			// Named RunB, not Bounds: FPrimitiveSceneProxy::Bounds is a class
+			// member and C4458 (declaration hides member) is warning-as-error.
+			const FVoxelRunBounds& RunB =
+				bUseCachedBounds ? RunBounds[RunIndex]
+				                 : (ScratchBounds = ComputeRunBounds(Run, LocalToWorldMatrix));
+
 			RunQuads += Run.NumQuads;
-			if (Run.NumQuads == 0 || !Origins.IsValidIndex(int32(Run.ChunkId)))
+			if (Run.NumQuads == 0 || RunB.State == ERunBoundsState::BadId)
 			{
 				++(Run.NumQuads == 0 ? SkippedEmpty : SkippedBadId);
 				continue;
 			}
 			// Ranges above the high-water mark hold nothing that was ever
 			// written; drawing them would be reading uninitialised pool.
+			//
+			// STAYS IN THE LOOP, deliberately, while everything else moved out:
+			// NumQuads is advanced by UpdateQuadRange_RenderThread, which runs
+			// WITHOUT a table update whenever only quads changed, so this is the
+			// one test here that is not a function of Runs and Origins alone.
 			if (Run.FirstQuad + Run.NumQuads > uint32(NumQuads))
 			{
 				++SkippedAboveWatermark;
 				continue;
 			}
 
-			const FVector4f& Entry = Origins[int32(Run.ChunkId)];
-			const float Scale = Entry.W;
-			if (Scale <= 0.f)
+			if (RunB.State == ERunBoundsState::Hidden)
 			{
 				++SkippedHidden;
 				continue; // hidden entry: collapsed to a point, nothing to draw
 			}
 
-			// Already resident -- AddChunk stores float(1 << Level) here for the
-			// vertex factory's mip scale, so the cap needs no new per-chunk data.
-			const int32 ChunkLevel = VoxelGpuPoolCull::LevelFromScale(Scale);
+			const int32 ChunkLevel = RunB.Level;
 			const int32 LevelSlot = FMath::Clamp(ChunkLevel, 0, kMaxLevels - 1);
 			PoolQuadsByLevel[LevelSlot] += Run.NumQuads;
-
-			// Same extent AddChunk grows LocalBounds by, so the cull can never be
-			// tighter than the bounds the scene already culled the whole
-			// primitive against.
-			const float EdgeUU = float(ChunkEdgeVoxels) * 10.0f * Scale;
-			const FVector Min(Entry.X, Entry.Y, Entry.Z);
-			const FBox LocalBox(Min, Min + FVector(EdgeUU));
-			const FBox WorldBox = LocalBox.TransformBy(LocalToWorldMatrix);
 
 			// One-shot: the actual numbers the frustum test is fed, against the
 			// view it is tested with. A cull that selects the wrong chunks and a
 			// cull that selects none look identical from the outside, and both
 			// read as "the pool is broken"; this prints the operands instead of
 			// inferring them.
-			if (CullSpaceLogged.Increment() == 1)
+			//
+			// THE GetValue() SHORT-CIRCUIT IS NOT COSMETIC. Increment() alone is an
+			// atomic read-modify-write, and it sat in the per-run body: ~39,020 of
+			// them per gather, from ~5 gathers running in parallel, all on the one
+			// cache line -- a contended RMW that costs more than the frustum test it
+			// guards and scales with the cascade. The load in front of it is a
+			// shared read of a clean line after the first gather, and the semantics
+			// are unchanged: two threads that both read 0 still race to Increment
+			// and exactly one of them gets 1.
+			if (CullSpaceLogged.GetValue() == 0 && CullSpaceLogged.Increment() == 1)
 			{
+				// Re-read the table entry HERE rather than carrying it through the
+				// loop. This block runs once in the life of the proxy, so the gather
+				// it costs is free; keeping Entry/EdgeUU live for every run in order
+				// to print them once is exactly the cost this hoist removed.
+				const FVector4f& Entry = Origins[int32(Run.ChunkId)];
+				const float EdgeUU = float(ChunkEdgeVoxels) * 10.0f * Entry.W;
+				const FBox WorldBox(RunB.Center - RunB.Extent, RunB.Center + RunB.Extent);
 				UE_LOG(LogTemp, Warning,
 				       TEXT("%s cullspace: chunk0 local=(%.0f,%.0f,%.0f) edge=%.0f -> worldCentre=(%.0f,%.0f,%.0f) ext=(%.0f,%.0f,%.0f) | viewOrigin=(%.0f,%.0f,%.0f) | l2wTrans=(%.0f,%.0f,%.0f)"),
 				       *PoolName, Entry.X, Entry.Y, Entry.Z, EdgeUU,
@@ -931,8 +1302,12 @@ private:
 				       LocalToWorldMatrix.GetOrigin().Z);
 			}
 
+			// THE ONLY VIEW-DEPENDENT LINE IN THE BODY, which is the whole point of
+			// the hoist. Centre and extent arrive already computed and already in
+			// world space, so this is a handful of dot products against a
+			// sequentially-streamed struct -- no gather, no matrix, no FBox.
 			const bool bInFrustum = VoxelGpuPoolCull::GDebugAllVisible != 0 ||
-			                        Frustum->IntersectBox(WorldBox.GetCenter(), WorldBox.GetExtent());
+			                        Frustum->IntersectBox(RunB.Center, RunB.Extent);
 			const bool bKeep = VoxelGpuPoolCull::GDebugInvert != 0 ? !bInFrustum : bInFrustum;
 			if (!bKeep)
 			{
@@ -1458,6 +1833,11 @@ private:
 	FShaderResourceViewRHIRef QuadBufferSRV, ChunkIdSRV, OriginSRV, ParamsSRV;
 
 	mutable FThreadSafeCounter ElementsLogged;
+	// Latches the one MULTI-BATCH line. Separate from ElementsLogged because that
+	// one fires on the FIRST gather, which may well be an uncull or an empty one
+	// -- the batch split is only observable on a gather that actually produced
+	// ranges, so it needs its own latch or the line never prints.
+	mutable FThreadSafeCounter BatchesLogged;
 	int32 NumQuads = 0;      // drawn
 	int32 BufferQuads = 0;   // allocated
 	int32 NumChunks = 0;
