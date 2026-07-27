@@ -461,12 +461,14 @@ bool UVoxelGISubsystem::WantsChunkQuads(const FVector& ChunkOriginUU, int32 Chun
 	// of slack at the default 7000 UU radius.
 	//
 	// WHAT THIS ACTUALLY COVERS TODAY, stated because it is easy to assume
-	// otherwise: voxel.GI.RadiusUU defaults to 7000 UU and is documented as
-	// deliberately larger than the R0 ring at 6400 UU -- so with GI on and the
-	// SHIPPED ring sizes, every level-0 chunk is inside it and level 0 stays on
-	// the readback path entirely. The direct path then covers levels 1-5, which
-	// is ~80% of resident chunks. At the 128 m R0 that Wave D and Wave F measure
-	// in, most of level 0 falls outside and goes direct too. Both are correct;
+	// otherwise: voxel.GI.RadiusUU defaults to 7000 UU, which was deliberately
+	// larger than the OLD 64 m R0 ring (6400 UU). Since 2026-07-27 the shipped
+	// R0 is 128 m (12,800 UU), so with GI on the radius covers only the inner
+	// ~half of level 0: near-field level-0 chunks stay on the readback path for
+	// GI ingest, and outer-R0 -- including the leading edge under motion, the
+	// coverage-hole population -- goes direct along with levels 1-5. If
+	// voxel.GI.RadiusUU is ever raised toward the new R0 edge, GI ingest volume
+	// and readback traffic both grow with it. Both configurations are correct;
 	// the gate just tracks the configuration instead of assuming one.
 	const double RadiusUU = double(CVarGIRadiusUU.GetValueOnGameThread()) * 1.25;
 	return FVector::Dist(ChunkOriginUU, FieldCentreUU) <= RadiusUU;

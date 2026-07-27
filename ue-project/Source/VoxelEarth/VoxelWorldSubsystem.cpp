@@ -8500,7 +8500,14 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	// sized once before any cvar could land); the pool component now also logs
 	// a latched Error the first time it saturates or refuses an allocation, so
 	// the silent-success failure shape above cannot recur unnoticed.
-	constexpr uint32 kPoolCapacityQuads = 26u * 1000u * 1000u;   // 208 MB at 8 B/quad
+	// RESIZED 26M -> 44M for the adopted 128 m / 4 km cascade (2026-07-27):
+	// measured demand at settle is 35,205,733 quads (39,020 chunks, identical
+	// across four legs and both meshers, real terrain, pool overridden to 60M so
+	// nothing saturated the measurement). 44M = 35.2M + ~13% motion stand-in
+	// double-allocation (the ring-gap night's measured retention overhead) +
+	// ~10% first-fit fragmentation -- the same headroom methodology as the 26M
+	// sizing below, re-derived from the new cascade's numbers. 352 MB at 8 B/quad.
+	constexpr uint32 kPoolCapacityQuads = 44u * 1000u * 1000u;   // 352 MB at 8 B/quad
 	uint32 PoolCapacityQuads = kPoolCapacityQuads;
 	{
 		uint32 Override = 0;
