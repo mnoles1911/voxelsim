@@ -54,3 +54,27 @@ ratio: pre-skirt fork/CPU 36.3/58.4 = 0.62, post-skirt 42.4/62.5 = 0.68. The
 fork is still clearly ahead and is doing MORE work than before; the ratio moving
 the way it did is what you would expect from adding the coarsest chunks, not a
 sign of a defect.
+
+--- FOLLOW-UP: the slow-delivery counter, and two clean legs -------------------
+
+Re-run through tools/voxel-run-leg.ps1 (the safe stop condition), with the new
+direct counter for deliveries at or above kBlindJobMarkTimeoutSeconds:
+
+  slow-gpu-1  settle 40.4 s  peak 43,328  forked 33,957  max 814.6 ms  slow(>=5s)=0
+  slow-gpu-2  settle 42.4 s  peak 43,328  forked 34,135  max 572.4 ms  slow(>=5s)=0
+
+Both settled genuinely -- loaded unchanged for three consecutive samples with
+nothing in flight and nothing pending -- rather than on a lull. 40.4 / 42.4 s
+against the same session's CPU baseline of 62.4 / 62.5 s.
+
+So the 7,395 ms outlier did NOT recur across two further legs, and the counter
+that would have caught it now exists and reads zero. That is a better position
+than the earlier run, where the only evidence of health was a counter
+structurally incapable of disagreeing: gpuLatencyTimeouts fires when a cold-band
+MARK ages out, and a mark exists only for a footprint whose band was not already
+cached. With bandCache warm at 5,088 entries, almost nothing carries a mark, so
+arbitrarily slow deliveries passed it untouched.
+
+The outlier is not explained, only unobserved since. A level-4 dispatch covers
+16x the world area of a level-0 one, so the coarse chunks the skirt newly admits
+are the plausible source; if it returns, slow(>=5s) is now the line that says so.
