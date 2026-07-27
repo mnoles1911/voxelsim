@@ -1,5 +1,57 @@
 # Build GPU waves A–F, then push R0 to 128 m
 
+## WHERE THIS ENDED (2026-07-27)
+
+Read this before the plan below. The plan is what was *intended*; this is what
+happened, and several sections below were overtaken by measurement.
+
+| wave | state |
+|---|---|
+| **A** culling | landed, on by default, verified pixel-identical to the full draw |
+| **B** GI | landed; **GI ships OFF** — p50 free, hitches ×3.2. The refresh sweep that might have rescued it is done and did not (see below) |
+| **C** determinism gate | green; `6e893ab3679a8c81` held across every edit in this programme, including two to `worldgen.ush` |
+| **D** GPU meshing | **built, gated, measured, OFF by default** — the producer is switched |
+| **E** parity | partial: E1 designed-not-built, E2 shipped-unmeasured, E3 closed |
+| **F** R0 = 128 m | runs correctly (43,328 chunks, 21.2 M quads) but costs 6.0 s → 42 s of cold fill. **R0 stays at 64 m** |
+| **G** compaction | **not built** — its own pre-registered `S_Δ ≥ 2.0` branch fired at both poses. Shadow cap landed instead |
+
+**The headline: GPU meshing is bit-exact and faster than the CPU path.**
+Byte-identical to `MeshChunkBricks` (16/16 chunks), bit-exact at coarse levels
+0–4 against `coarseColumns`/`makeCoarseBrick` on columns, cells *and* quads, the
+ring skirt verified over all 16 mask values. At R0 = 128 m it settles in ~42 s
+against the CPU's ~62 s; at the shipped 64 m it is ~10% ahead through the fill;
+under motion it cuts the pending backlog ~85%. A dig behaves byte-identically.
+
+**It is still off, and the reason is not doubt about correctness.** Frame cost is
+unmeasured and *cannot* be measured by this harness — `-VoxelPerfRun` samples a
+world delta the engine clamps at 400 ms. Residency and frame cost are different
+claims, and voxel GI is the standing precedent for the difference mattering.
+See `manual-verification-checklist.md` §9.
+
+### Two findings that outlived their waves
+
+**The in-flight budget was a unit error.** `MaxJobsInFlight` sizes a pool of
+*threads* (2 × cores). A GPU job is a *round trip*. The fork sat at 19–20 in
+flight against a cap of 256 — waiting, not saturated — and coarse levels were
+**3.4× worse** than CPU until it was fixed. Neither coarse levels nor the budget
+works alone; together they are the win. One line.
+
+**Gates kept catching the gates.** D5.2 found three silent harness bugs (a raster
+window sized in level-0 voxels, a field assigned after its reader ran, a CPU
+reference sampled at the wrong z). D5.3 failed all 16 skirt masks *including the
+control*, which is what identified it as a harness fault. D6 passed twelve probes
+over terrain containing no caves. In every case the stage split — columns / cells
+/ quads, or control / non-control — is what made the failure readable.
+
+### Retracted in this programme, kept visible
+
+- "batching is the headline fix" — it was a queue depth in the wrong unit
+- a 12% fork speedup — the settle rule scored it at 94% of the work
+- "one leg in four stalls at 98%" — the harness killed a leg that was still filling
+- "all 4,096 columns match" — an inference from a truncated log, which caused three wrong root causes
+
+---
+
 ## Context
 
 ADR-0006 recorded G0–G5 complete. They are not. G2/G3 built the **destination** — a
