@@ -57,7 +57,8 @@ namespace
 		SHADER_PARAMETER(int32,        OriginVy) \
 		SHADER_PARAMETER(int32,        BrickZMin) \
 		SHADER_PARAMETER(uint32,       BricksZ) \
-		SHADER_PARAMETER(uint32,       ScanCount)
+		SHADER_PARAMETER(uint32,       ScanCount) \
+		SHADER_PARAMETER(uint32,       CoarseScale)
 
 	// Shared compile policy for all seven kernels.
 	//
@@ -306,6 +307,12 @@ namespace
 		Out.BrickZMin       = Req.BrickZMin;
 		Out.BricksZ         = Req.BricksZ;
 		Out.ScanCount       = 0;
+		// D5. The SCALE, not the level: worldgen.ush must contain no variable
+		// shift distance (lint-shader-ub VARIABLE_SHIFT), so 1 << level is
+		// computed here where the level is already range-checked. Scale 1 is
+		// the identity in coarseRep(), so a request that never sets CoarseLevel
+		// is byte-for-byte the pre-D5 dispatch.
+		Out.CoarseScale     = 1u << static_cast<uint32>(FMath::Clamp(Req.CoarseLevel, 0, 5));
 	}
 
 }

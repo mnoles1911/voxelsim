@@ -102,6 +102,13 @@ struct FVoxelGpuRegionRequest
 	//
 	// Only one chunk per (X,Y) footprint needs to ask for it, which is why it
 	// is opt-in per request rather than implied by bMeshChain.
+	// D5: coarse level. 0 = level 0 and is the identity in the kernel's
+	// coarseRep(), so an unset request is byte-for-byte the pre-D5 dispatch.
+	// At level L > 0, OriginVx/OriginVy and BrickZMin are in LEVEL-L cell units
+	// -- exactly as vxc::coarseColumns and makeCoarseBrick take them -- and the
+	// kernel maps each to its representative level-0 coordinate.
+	int32 CoarseLevel = 0;
+
 	uint32 BandOriginI = 0;
 	// Y origin of the band window. Production sets it equal to BandOriginI (the
 	// window is symmetric); it exists so a single-column PROBE can sit anywhere
