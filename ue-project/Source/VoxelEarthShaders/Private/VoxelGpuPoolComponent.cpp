@@ -61,15 +61,26 @@ static FAutoConsoleVariableRef CVarVoxelPoolPushStats(
 // READ UnmarkQuadsDirty BEFORE FLIPPING THIS. Batching inverts an ordering that
 // per-chunk flushes were providing for free, and the failure mode is invisible
 // terrain that reports as loaded.
-static int32 GVoxelPoolBatchPublish = 0;
+// DEFAULT 1 SINCE 2026-07-27, AND THAT IS A MEASUREMENT
+// (docs/measurements/s1-1-batch-publish-2026-07-27.txt). Four flight legs on one
+// binary, alternated: +123% throughput (260.9 -> 581.3 chunks/s) and converged
+// holes 14,827 -> 966, against a within-config spread of 0.65-0.76%.
+//
+// Most of that is NOT the amortisation it was designed for. Publications fell
+// 16.5x and applies rose 3.3x, which stopped the ResultsQueue backing up, which
+// took the mean stale fraction from 42% to 0% -- the pipeline had been throwing
+// away nearly half the geometry the GPU had already produced. Throughput and
+// waste were the same problem.
+static int32 GVoxelPoolBatchPublish = 1;
 static FAutoConsoleVariableRef CVarVoxelPoolBatchPublish(
 	TEXT("voxel.Stream.PoolBatchPublish"),
 	GVoxelPoolBatchPublish,
 	TEXT("1 = accumulate pool adds/removes across a streaming tick and publish ONCE at the end of it, ")
-	TEXT("instead of once per mutated chunk. Default 0 (byte-identical to the per-chunk path). ")
-	TEXT("S0 measured the publication at 98-99% of per-apply cost, rising to 2.1ms per apply under ")
-	TEXT("flight; this is the lever that amortises it. Requires the UnmarkQuadsDirty subtract to be ")
-	TEXT("correct -- see its comment for the same-frame free-then-GPU-write race batching creates."),
+	TEXT("instead of once per mutated chunk. DEFAULT 1 since 2026-07-27: measured +123% chunks/s and ")
+	TEXT("holes 14,827 -> 966 over four alternated flight legs, with the stale-result fraction going ")
+	TEXT("42% -> 0%. 0 restores the per-chunk path as the A/B control. Requires the UnmarkQuadsDirty ")
+	TEXT("subtract to be correct -- see its comment for the same-frame free-then-GPU-write race ")
+	TEXT("batching creates, and VoxelEarth.GpuPool.DirtyRanges for its coverage."),
 	ECVF_Default);
 
 // S1-2 (docs/speculative-generation-plan.md Wave S1, §2.2): let a removed
