@@ -1,0 +1,19 @@
+Does a DIG still behave with the fork on?
+
+The fork carves edited chunks out via NeedsOverlayAwarePath, which routes them
+to the game-thread path so the GPU never sees them. That carve-out had never
+been exercised: every fork measurement so far is an unedited world.
+
+-VoxelHeadlessDigTest=15 -VoxelPerfFlight=static, 64 m cascade, one leg each.
+
+  CPU   87 "Distant-edit mip propagation" lines
+  fork  87 "Distant-edit mip propagation" lines
+  diff  IDENTICAL, byte for byte, including chunk keys and levels
+
+So an edit propagates to exactly the same mip ancestors with the fork on as with
+it off. The carve-out holds: edits never reach the GPU, and the fork does not
+perturb the edit path around it.
+
+NOT COVERED HERE: the visual half. This says the same chunks were marked and
+re-meshed, not that the resulting hole looks right. A dig-and-look is on
+docs/manual-verification-checklist.md and needs an eye.
