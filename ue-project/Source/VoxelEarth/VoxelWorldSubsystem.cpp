@@ -7063,6 +7063,15 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	// Same terrain material the per-chunk components use. Without it the
 	// proxy falls back to the engine default and the biome LUT never runs.
 	Pool->SetChunkMaterial(Material);
+	// BEFORE RegisterComponent, which creates the proxy -- the proxy takes a
+	// COPY of this and a later setter is a silent no-op. The terrain pool never
+	// set it at all, so it relied on MaxChunks = Max(InOrigins.Num() * 4, 1024).
+	// At R0 = 128 m the settled cascade holds 43,328 chunks (measured). Crossing
+	// whatever the proxy was built with is not an error but it IS a full
+	// render-state rebuild, which re-uploads the ENTIRE quad buffer; terrain
+	// crosses it while the cascade fills and then stops, so a floor above the
+	// measured steady state turns a handful of whole-pool re-uploads into none.
+	Pool->SetChunkTableCapacity(49152);
 	PoolOwner->SetRootComponent(Pool);
 	Pool->RegisterComponent();
 
@@ -7098,14 +7107,42 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	// refusing, GetLargestFreeRun() against GetFreeQuads() is the number that
 	// says whether this is genuinely full or merely fragmented -- they are very
 	// different problems and only the second one wants a compaction pass.
-	constexpr uint32 kPoolCapacityQuads = 14u * 1000u * 1000u;   // 112 MB at 8 B/quad
+	// WAVE F RESIZE. 14,000,000 was sized for the 64 m cascade and IS NOT ENOUGH
+	// for R0 = 128 m. Measured, not estimated: the shifted cascade settled
+	// (jobsInFlight=0, pendingJobs=0, every ring pending=0) at
+	//
+	//     loaded = 43,328 chunks     residentQuads = 21,240,815
+	//     rings  = 7520 / 6515 / 7188 / 7597 / 7655 / 6853
+	//
+	// so the old capacity was short by 52% and every quad past 14 M would have
+	// failed to allocate. That failure is the dangerous kind: a chunk that
+	// cannot allocate is simply absent, so liveChunks, highWater and resident
+	// quads all stay self-consistently smaller and the run reads as CHEAPER AND
+	// FASTER -- i.e. as a success. Worse, UpdateChunk's realloc path removes the
+	// chunk BEFORE reallocating, so on a full pool an ordinary re-mesh deletes
+	// resident terrain. Wave F's allocation-failure counters exist to make that
+	// visible; this constant exists so they do not have to fire.
+	//
+	// 26 M is the measured 21.24 M plus ~22%. The headroom is not padding -- it
+	// pays for the same two things the old comment names, both of which scale
+	// with the cascade rather than being fixed: load-before-unload retention
+	// double-allocates a footprint mid-LOD-transition, and first-fit fragments
+	// (the allocator soak refuses ~10% of allocations at small capacity while
+	// still reporting plenty free).
+	//
+	// AND IT IS ONE ANCHOR. 21.24 M was measured at the default spawn; a denser
+	// anchor will differ. If AddChunk starts refusing, GetLargestFreeRun()
+	// against GetFreeQuads() says whether this is genuinely full or merely
+	// fragmented -- very different problems, and only the second wants a
+	// compaction pass.
+	constexpr uint32 kPoolCapacityQuads = 26u * 1000u * 1000u;   // 208 MB at 8 B/quad
 	Pool->InitPool(kPoolCapacityQuads);
 
 	GpuPool = Pool;
 	UE_LOG(LogVoxelStream, Log,
-	       TEXT("voxel.Stream.GPU: geometry pool up, %u quad capacity (%.0f MB). Chunks now stream "
-	            "as ranges in ONE primitive."),
-	       kPoolCapacityQuads, double(kPoolCapacityQuads) * 8.0 / (1024.0 * 1024.0));
+	       TEXT("voxel.Stream.GPU: geometry pool up, %u quad capacity (%.0f MB), chunk table floor %d. "
+	            "Chunks now stream as ranges in ONE primitive."),
+	       kPoolCapacityQuads, double(kPoolCapacityQuads) * 8.0 / (1024.0 * 1024.0), 49152);
 	return Pool;
 }
 

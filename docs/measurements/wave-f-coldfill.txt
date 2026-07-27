@@ -1,0 +1,33 @@
+Wave F cold-fill A/B/C -- settle = IDLE **AND** AT PEAK RESIDENCY
+Anchor: default spawn, -VoxelPerfFlight=static, -VoxelPerfLogInterval=2
+Edit log (Saved/VoxelWorlds/*.vxlog) cleared before every leg (ground rule 11).
+Every leg verified twice: the switch present on the command line, AND the
+resolved RingPresets[0] matching the requested cascade.
+
+leg                settleSec    peak   final       quads
+f-cold-64-1              6.0   11010   11010     5406735
+f-cold-128-1            58.4   43328   43328    21240815
+f-cold-128gpu-1         60.4   43328   43328    21240815
+f-cold-64-2              6.0   11010   11010     5406735
+f-cold-128-2            58.4   43328   43328    21240815
+f-cold-128gpu-2         60.4   43328   43328    21240815
+
+Same-config spread: 0.0 s in all three configs. Sampling resolution 2 s, so
+the 128m-vs-fork gap of 2.0 s is exactly ONE window and is at the instrument's
+resolution limit -- read it as "no measurable improvement", not as a slowdown.
+
+RETRACTED: an earlier run of this same harness reported the fork settling in
+53.4 s against 60.5 s, a ~12% win. That was an ARTEFACT of the settle rule.
+The first version took the first line with jobsInFlight=0 pendingJobs=0, which
+on the CPU producer coincides with full residency but with the fork does not --
+the fork produces genuine momentary lulls mid-fill:
+
+  128 m CPU     settle line loaded=43328, final loaded=43328   (really settled)
+  128 m + fork  settle line loaded=40615, final loaded=42100   (never finished)
+  128 m + fork  settle line loaded=41229, final loaded=43328
+
+The fork was being scored at 94% of the work. A lull is not a finish line.
+
+Settled cascade at R0 = 128 m:
+  rings   R0 7520 | R1 6515 | R2 7188 | R3 7597 | R4 7655 | R5 6853
+  chunks  43,328        resident quads  21,240,815
