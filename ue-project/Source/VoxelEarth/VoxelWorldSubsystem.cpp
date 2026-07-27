@@ -903,9 +903,11 @@ std::function<vxc::MaterialId(int64, int64, int64)> MakeOverlayAwareLevelSampler
 // flat world on a bad path would be confusing and hard to diagnose, so this
 // case is rejected loudly (UE_LOG Error) and falls back to the synthetic
 // sampler instead, exactly like the invalid-TileScale case below.
-std::unique_ptr<vxc::ITileSampler> MakeTileSampler(uint64 Seed, const FString& TileDir, int32 TileScale, bool& bOutUsingTileGrid)
+std::unique_ptr<vxc::ITileSampler> MakeTileSampler(uint64 Seed, const FString& TileDir, int32 TileScale,
+                                                  bool& bOutUsingTileGrid, FBox2D& bOutCoverageUU)
 {
 	bOutUsingTileGrid = false;
+	bOutCoverageUU = FBox2D(ForceInit);
 
 	if (TileDir.IsEmpty())
 	{
@@ -1005,6 +1007,28 @@ std::unique_ptr<vxc::ITileSampler> MakeTileSampler(uint64 Seed, const FString& T
 	}
 
 	UE_LOG(LogVoxelEarth, Log, TEXT("Voxel tile grid: loaded tile coords bounding box x=[%d,%d] y=[%d,%d]"), MinTx, MaxTx, MinTy, MaxTy);
+
+	// WHERE THE REAL TERRAIN ACTUALLY IS, in world UU.
+	//
+	// The bounding box above was already logged in TILE coordinates, which is
+	// unreadable next to a spawn position and is why nobody noticed that the
+	// default spawn sits outside it. A tile is kTileSize pixels and a pixel is
+	// tilePixelSizeMm at this scale, so the conversion is exact.
+	{
+		const double TilePx = double(vxc::TileData::kTileSize);
+		const double PxUU = double(vxc::tilePixelSizeMm((uint8)TileScale)) / 10.0;  // mm -> UU (1 UU = 1 cm)
+		bOutCoverageUU = FBox2D(
+			FVector2D(double(MinTx) * TilePx * PxUU, double(MinTy) * TilePx * PxUU),
+			FVector2D(double(MaxTx + 1) * TilePx * PxUU, double(MaxTy + 1) * TilePx * PxUU));
+		const FVector2D CentreUU = bOutCoverageUU.GetCenter();
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("Voxel tile grid: real terrain covers world X [%.0f, %.0f] m, Y [%.0f, %.0f] m "
+		            "-- centre (%.0f, %.0f) m. Outside this box every elevation query returns the "
+		            "missing-tile sea-level default."),
+		       bOutCoverageUU.Min.X / 100.0, bOutCoverageUU.Max.X / 100.0,
+		       bOutCoverageUU.Min.Y / 100.0, bOutCoverageUU.Max.Y / 100.0,
+		       CentreUU.X / 100.0, CentreUU.Y / 100.0);
+	}
 
 	bOutUsingTileGrid = true;
 	return Grid;
@@ -2313,7 +2337,7 @@ struct FVoxelWorldImpl
 	// above for the full policy) -- TileDir empty is the pre-Track-B2 default
 	// (SyntheticTileSampler, byte-identical to before).
 	explicit FVoxelWorldImpl(uint64 Seed, const FString& TileDir, int32 TileScale)
-		: Tiles(MakeTileSampler(Seed, TileDir, TileScale, bUsingTileGrid))
+		: Tiles(MakeTileSampler(Seed, TileDir, TileScale, bUsingTileGrid, TileCoverageUU))
 		, Voxels(Seed, *Tiles)
 	{
 		// bUsingTileGrid (declared, and thus constructed via its NSDMI, BEFORE
@@ -2357,6 +2381,22 @@ struct FVoxelWorldImpl
 	// comment. Tiles itself must be declared before Voxels: Voxels holds a
 	// live ITileSampler& into whatever Tiles owns, so Tiles has to already be
 	// a fully-formed object by the time Voxels' own constructor runs.
+	// World-UU box the loaded tiles actually cover; empty under the synthetic
+	// sampler. DECLARED HERE, BEFORE Tiles, AND THAT IS LOAD-BEARING: members
+	// initialise in DECLARATION order, so a declaration after Tiles would have
+	// its FBox2D(ForceInit) run AFTER MakeTileSampler wrote through the
+	// out-param and silently erase the answer. Same hazard the Tiles/Voxels
+	// ordering comment above documents.
+	//
+	// It exists because the DEFAULT SPAWN IS (0,0) and the tiles need not
+	// contain it. When they do not, every elevation query returns the
+	// missing-tile sea-level default and the world looks FLAT AND GENERIC
+	// rather than broken -- which is exactly how it presented.
+	FBox2D TileCoverageUU = FBox2D(ForceInit);
+	// One-shot latch for the spawn-vs-coverage check below. Once, not per log
+	// window: an Error repeated every 5 s trains people to ignore it.
+	bool bTileCoverageChecked = false;
+
 	bool bUsingTileGrid = false;
 	std::unique_ptr<vxc::ITileSampler> Tiles;
 	// Non-owning view of Tiles when bUsingTileGrid (set in the ctor body,
@@ -3881,6 +3921,50 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// differs between two runs this is the first thing to compare.
 	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel anchor: (%.0f, %.0f, %.0f)"),
 	       LastAnchorLocation.X, LastAnchorLocation.Y, LastAnchorLocation.Z);
+
+	// IS THE PLAYER STANDING ON THE TERRAIN THAT WAS ACTUALLY GENERATED?
+	//
+	// This has to be checked, out loud, because the failure is INVISIBLE. The
+	// default spawn is (0,0). The tiles are wherever the terrain service put
+	// them -- and if those disagree, TileGridSampler answers every elevation
+	// query with the missing-tile default. The result is not an error or a hole:
+	// it is a smooth, plausible, entirely fake sea-level world, with a far vista
+	// that reads as stock UE terrain. No crash, no warning, nothing in the log
+	// that a person would connect to "the shape is wrong".
+	//
+	// It presented exactly that way on the first hands-on test of this project,
+	// after two days of headless work that had all been measuring the same fake
+	// terrain. The tile-coordinate bounding box was already being logged -- in
+	// TILE coordinates, which nobody can compare to a spawn position by eye.
+	//
+	// Logged ONCE, as an Error, naming the coordinate that fixes it.
+	if (!bTileCoverageChecked && TileCoverageUU.bIsValid)
+	{
+		bTileCoverageChecked = true;
+		const FVector2D AnchorXY(LastAnchorLocation.X, LastAnchorLocation.Y);
+		if (!TileCoverageUU.IsInside(AnchorXY))
+		{
+			const FVector2D CentreUU = TileCoverageUU.GetCenter();
+			UE_LOG(LogVoxelEarth, Error,
+			       TEXT("SPAWN IS OUTSIDE THE GENERATED TERRAIN. Anchor (%.0f, %.0f) m is not inside "
+			            "the loaded tiles, which cover X [%.0f, %.0f] m, Y [%.0f, %.0f] m. Every "
+			            "elevation query here returns the missing-tile SEA-LEVEL DEFAULT, so the "
+			            "world is flat and generic and the far vista looks like stock UE terrain -- "
+			            "it is NOT the terrain the tiles describe. Relaunch with "
+			            "-VoxelSpawnAt=%.0f,%.0f (metres) to stand on real data."),
+			       AnchorXY.X / 100.0, AnchorXY.Y / 100.0,
+			       TileCoverageUU.Min.X / 100.0, TileCoverageUU.Max.X / 100.0,
+			       TileCoverageUU.Min.Y / 100.0, TileCoverageUU.Max.Y / 100.0,
+			       CentreUU.X / 100.0, CentreUU.Y / 100.0);
+		}
+		else
+		{
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Voxel tile grid: anchor (%.0f, %.0f) m is INSIDE the loaded tile coverage -- "
+			            "this is real generated terrain."),
+			       AnchorXY.X / 100.0, AnchorXY.Y / 100.0);
+		}
+	}
 
 	// ADR-0006 G3. Only logged when the pool is actually in use, so the
 	// existing log shape is untouched on the shipping path. Free vs largest
