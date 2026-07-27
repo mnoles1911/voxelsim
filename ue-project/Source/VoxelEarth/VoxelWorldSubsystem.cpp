@@ -2742,6 +2742,20 @@ struct FVoxelWorldImpl
 	int64 GpuMeshSlowDeliveriesSinceLog = 0;
 	int64 GpuMeshSlowDeliveriesTotal = 0;
 
+	// Stage-0 measure-first census for the chunk-tile GPU-batching design
+	// (docs/measurements/gpu-throughput-wave-2026-07-27.txt): tallies, per 5s
+	// log window, how many GPU-fork-bound dispatches would have landed in
+	// each cell of the proposed fixed world-aligned 4x4 lattice (tile key =
+	// Level, ChunkX>>2, ChunkY>>2 -- Z is deliberately NOT split, since a
+	// tile may span multiple chunk-Z and the design accepts that union).
+	// Only chunks that actually take the GPU fork branch in DispatchJobs are
+	// counted (never the CPU-worker path, never the game-thread path), so
+	// this cannot overcount what a real tile could combine. Read and reset
+	// alongside the other GpuMesh...SinceLog counters in MaybeLogCounters.
+	// This map and its logging are expected to be REMOVED or gated once tile
+	// batching ships and is measured by its own real occupancy counters.
+	TMap<FIntVector, int32> TileCensusSinceLog;
+
 	// What the fork needs back when a job lands, keyed by the runner's job id.
 	//
 	// Kept here rather than packed into FVoxelGpuMeshJobResult::UserTag because
@@ -4653,6 +4667,34 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       (long long)GpuMeshDispatchedByLevel[2], (long long)GpuMeshDispatchedByLevel[3],
 		       (long long)GpuMeshDispatchedByLevel[4], (long long)GpuMeshDispatchedByLevel[5],
 		       VoxelStreamAdmission::GpuMeshMaxLevel());
+
+		// Stage-0 tile-batching census (see TileCensusSinceLog doc comment):
+		// occupancy each proposed 4x4-lattice tile would have had this window,
+		// bucketed so the "how many chunks would a real tile dispatch have
+		// combined" question can be read off directly, without waiting on the
+		// batching implementation to answer it.
+		{
+			int32 TileDispatches = 0;
+			int32 Occ1 = 0, Occ2to3 = 0, Occ4to7 = 0, Occ8to15 = 0, Occ16Plus = 0;
+			for (const auto& TilePair : TileCensusSinceLog)
+			{
+				const int32 Count = FMath::Clamp(TilePair.Value, 1, 16);
+				TileDispatches += TilePair.Value;
+				if (Count == 1)        { ++Occ1; }
+				else if (Count <= 3)   { ++Occ2to3; }
+				else if (Count <= 7)   { ++Occ4to7; }
+				else if (Count <= 15)  { ++Occ8to15; }
+				else                   { ++Occ16Plus; }
+			}
+			const int32 TileCount = TileCensusSinceLog.Num();
+			const double MeanOcc = TileCount > 0 ? double(TileDispatches) / double(TileCount) : 0.0;
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel tile census (5s window): dispatches=%d tiles=%d meanOcc=%.1f | "
+			            "occ 1:%d 2-3:%d 4-7:%d 8-15:%d 16+:%d"),
+			       TileDispatches, TileCount, MeanOcc, Occ1, Occ2to3, Occ4to7, Occ8to15, Occ16Plus);
+			TileCensusSinceLog.Reset();
+		}
+
 		for (int64& N : GpuMeshDispatchedByLevel) { N = 0; }
 		GpuMeshJobsDispatchedSinceLog = 0;
 		GpuMeshJobsDeliveredSinceLog = 0;
@@ -7870,6 +7912,12 @@ void FVoxelWorldImpl::DispatchJobs()
 		{
 			++GpuMeshJobsDispatchedSinceLog;
 			++GpuMeshDispatchedByLevel[FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1)];
+			// Stage-0 tile-batching census (see TileCensusSinceLog doc comment):
+			// this dispatch just took the GPU fork branch, so tally it under the
+			// 4x4-lattice tile it would join if DispatchJobs batched by tile.
+			// Measurement only -- does not change which branch this chunk took.
+			++TileCensusSinceLog.FindOrAdd(
+				FIntVector(LevelKey.Level, LevelKey.Key.X >> 2, LevelKey.Key.Y >> 2));
 			// Deliberately NOT added to InFlightTasks: a GPU job has no
 			// UE::Tasks::TTask. WaitForInFlightTasks covers it separately, and
 			// says why at length.
