@@ -133,6 +133,26 @@ public:
 	// the value and clears it. Drives the first-person landing view punch.
 	double ConsumeLandingImpactUU();
 
+	// --- Debug visualization ------------------------------------------------
+
+	// Draws the player's scale reference: the collision box wireframe, a marker
+	// at the current eye height, and the voxel cells IsGroundedAt is probing
+	// (green where solid, red where not). Non-persistent, so the caller must
+	// re-issue it every frame -- same contract as
+	// FVoxelWorldImpl::DrawDebugBoundsLayer.
+	//
+	// Lives HERE rather than on the pawn because it needs this file's private
+	// AxisVoxelRange, subsystem handle and live half-extents. Drawing it from
+	// the pawn would mean a second copy of the probe maths, which is exactly how
+	// a debug view drifts out of sync with the logic it exists to explain. NPCs
+	// sharing this mover simply never call it.
+	//
+	// EyeWorldZ is the caller's actual camera height (world Z), so the marker
+	// reflects crouch blending and step smoothing rather than a nominal
+	// constant. Self-gating: checks voxel.Debug.PlayerBox and suppresses itself
+	// in unattended fixture runs.
+	void DebugDrawVolume(double EyeWorldZ) const;
+
 private:
 	// --- Voxel collision primitives (moved verbatim from the pawn) ---------
 
