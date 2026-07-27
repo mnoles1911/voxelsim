@@ -1,0 +1,40 @@
+The fork UNDER MOTION -- the criterion the plan actually sets for Wave D.
+
+Every other fork measurement is cold fill. The plan's Wave D verdict is
+"per-ring dispatch rate x per-ring p50 under motion", and residency under motion
+is the thing the ring-gap symptom is about.
+
+-VoxelPerfRun=60 -VoxelPerfFlight=surface -VoxelPerfSpeed=20, 64 m cascade,
+2 legs per config, first two samples dropped so this is motion and not startup.
+
+  config      meanPending   meanLoaded   staleResults   markTO   gpuLatencyTO
+  CPU leg 1        373.3      13,669.7              0        0              0
+  CPU leg 2        390.8      13,631.2              0        0              0
+  fork leg 1        64.3      14,444.6              4        0              0
+  fork leg 2        53.2      14,444.4              9        0              0
+
+  pending backlog  -85%      (382 mean -> 59 mean)
+  resident chunks  +6%       (13,650 mean -> 14,444 mean)
+
+Within-config spreads are 17.5 (CPU) and 11.1 (fork) against a separation of
+~320, so this is an order of magnitude outside the noise floor.
+
+Final ring snapshot, one leg each:
+  CPU   R0 2193 p0 | R1 2403 p89 | R2 2568 p149 | R3 2625 p110 | R4 2443 p57 | R5 1843 p132
+  fork  R0 2134 p0 | R1 2459 p0  | R2 2752 p2   | R3 2706 p94  | R4 2473 p57 | R5 1895 p82
+
+THE PREDICTED COST SHOWED UP AND IS NEGLIGIBLE. Wave D's design pass said stale
+results would rise, because GenerationId is snapshotted at dispatch and compared
+at drain, and multi-frame latency widens that window. It did: 4 and 9 against
+the CPU's 0. Against ~59,500 chunks forked per leg that is 0.015%, and a stale
+result costs a job rather than a slot -- LevelJobsInFlight[] is decremented
+before the stale `continue`.
+
+markTimeouts=0 and gpuLatencyTimeouts=0 on every leg, so nothing stranded.
+submitToDeliver max 571 ms and 546 ms, well under kBlindJobMarkTimeoutSeconds.
+
+WHAT IS STILL NOT MEASURED: frame time under motion. -VoxelPerfRun samples the
+world delta, which the engine clamps at 400 ms, so it cannot be trusted here
+(ground rule 10) -- that number needs a human reading stat unit, and it is on
+the manual checklist. Nothing here says the fork makes FRAMES better; it says it
+keeps residency ahead of the camera, which is a different and prior claim.
