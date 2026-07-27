@@ -185,3 +185,50 @@ Commits
 See docs/measurements/ring-gap-2026-07-27.txt for the night this wave sits on
 top of -- shipped fork caps, JobsInFlightPerCore default, and the resurrection
 fix that this wave's standard leg inherits without re-measuring.
+
+================================================================================
+CASCADE ADOPTION (R0 = 128 m, edge 4 km) -- demand, defaults, and THE WALL
+================================================================================
+
+Owner decision, same day: the Wave F cascade is the shipped default
+(kDefaultRingPresets doubled per level; the 30 km clipmap self-adjusts off
+RingPresets[5].Outer).
+
+Demand, measured before the default flipped (pool overridden to 60M so nothing
+could saturate the measurement; four legs, alternated meshers):
+
+   config   settle       loaded    residentQuads   poolPctMax(of 60M)
+   GPU x2   86 s / 82 s  39,020    35,205,733      58.7
+   CPU x2   83 s / 80 s  39,020    35,205,733      58.7
+
+Byte-identical residency across all four legs and both meshers. Pool default
+resized 26M -> 44M from this number (+13% motion stand-ins, +10% fragmentation
+-- the 26M sizing methodology re-derived).
+
+--------------------------------------------------------------------------------
+B3 BASELINE AT THE ADOPTED DEFAULTS: FAIL -- THE DRAW PATH IS THE WALL
+--------------------------------------------------------------------------------
+
+Standard leg, 120 s preflight, shipped defaults, no overrides:
+
+   leg      p50      p95      hitches   chunksLoaded   holes(final)  poolPct  allocFail
+   GPU A1   45.87    49.50    5881      57,619         17,077        80.9     0
+   CPU B1   44.79    47.12    5972      58,296         16,955        80.8     0
+   GPU A2   46.18    49.68    5809      57,488         17,091        81.2     0
+
+~22 fps, mesher-INDEPENDENT, and the cost is FLAT: hitch attribution shows
+renderMs (render-thread BUSY) 39-45 ms on every frame with rhiMs flat at
+1.5-1.8 ms and the game thread waiting 34-39 ms -- including during the
+LINGER, pawn pinned, nothing streaming. The render thread redoes ~40 ms of
+work per frame for a STATIC scene at 39k chunks / 35.2M quads. The holes
+figure is fill-starvation downstream of the frame rate (tick-bound fill could
+not finish inside the leg), not a new streaming defect: allocFail=0, pool
+sized right, both meshers identical.
+
+This is the roadmap's named, unowned debt landing exactly where it said it
+would (gpu-roadmap-remaining.md: compute compaction -- "UNOWNED WORK ON THE
+CRITICAL PATH... Wave F's payoff is gated behind a step with no owner").
+Consequence: the tile-batching stage 1 is RESEQUENCED behind the draw-path
+work -- meshing throughput is irrelevant while the renderer holds every
+frame at 46 ms. Diagnosis of the per-frame render-thread work at 39k chunks
+is the next entry in this file.
