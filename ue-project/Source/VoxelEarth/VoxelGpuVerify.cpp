@@ -153,6 +153,29 @@ namespace
 	// IF THE SEED CHANGES THESE GO STALE, and they go stale QUIETLY -- the sweep
 	// keeps passing, it just reports 0 shaft / 0 cavern again. That warning line
 	// is the tripwire; re-run FindBandFixture when it fires.
+	// EXTRA FIXTURES FOR THE COARSE SWEEP ONLY -- never for the digest loop.
+	//
+	// D5.2 could not prove level 5. Both digest fixtures pass L0-L4 and then L5's
+	// [far-negative] dispatch is REFUSED with "Mesh chain needs >= 3 bricks per
+	// axis (have 8, 8, 2)". At level 5 a coarse cell is 32 level-0 voxels, so a
+	// 64-cell region spans 204.8 m and that fixture's entire terrain range
+	// collapses into 2 coarse bricks of z; the halo then leaves no interior brick
+	// to mesh. The FIXTURE ran out of vertical relief -- the coarse path never
+	// disagreed.
+	//
+	// Three coarse bricks of z needs 3 * 8 * 32 = 768 level-0 voxels of surface
+	// spread inside that window. voxel.GPU.FindBandFixture now searches for the
+	// most mountainous such window rather than leaving anyone to guess at
+	// alpine-looking coordinates; at seed 20260719 it reports 2,025 voxels
+	// (202 m) at voxel (5120, -40960), which is 2.6x what L5 needs.
+	//
+	// SEPARATE FROM kRegions BECAUSE 6e893ab3679a8c81 IS PINNED. Adding a third
+	// region to the digest loop would change the value and turn a loud
+	// cross-toolchain gate into a re-baselining exercise.
+	const FRegionSpec kCoarseExtraRegions[] = {
+		{ TEXT("high-relief"), 5120, -40960, 64, 64 },
+	};
+
 	const FRegionSpec kBandOnlyRegions[] = {
 		{ TEXT("cave-bearing"),    -64,    -64, 320, 320 },
 		{ TEXT("shaft-bearing"), -1056, -16496, 320, 320 },
@@ -1186,6 +1209,60 @@ namespace
 			       TEXT("than a shaft (~14 voxels), so this is a MISS, not an absence -- re-run with ")
 			       TEXT("a smaller step or a larger span."), Step);
 		}
+		// D5.2 LEFT LEVEL 5 UNPROVEN, AND THIS IS WHY IT COULD NOT BE PROVEN.
+		//
+		// voxel.GPU.VerifyCoarse passes L0-L4 on both digest fixtures and then
+		// L5's [far-negative] dispatch is REFUSED: "Mesh chain needs >= 3 bricks
+		// per axis (have 8, 8, 2)". At level 5 a coarse cell is 32 level-0
+		// voxels, so a 64-cell region spans 204.8 m laterally and the whole
+		// terrain range inside it collapses into 2 coarse bricks of z. The halo
+		// then leaves no interior brick to mesh. That is the FIXTURE running out
+		// of vertical relief, not the coarse path failing.
+		//
+		// Three bricks of coarse z needs 3 * 8 * 32 = 768 level-0 voxels of
+		// surface spread -- 76.8 m -- inside a 204.8 m window. So: find the
+		// most mountainous 64-cell-at-L5 window in the search span and report
+		// its origin, rather than guessing at coordinates that "look alpine".
+		int64 BestReliefX = 0, BestReliefY = 0, BestRelief = -1;
+		{
+			// Sample the window corners-and-centre grid coarsely: full coverage
+			// of every candidate window would be O(span^2 * window^2), and the
+			// point is to LOCATE relief, not to measure it exactly. The gate
+			// itself is what decides whether the found fixture works.
+			constexpr int64 kL5CellVoxels = 32;
+			constexpr int64 kWindowCells = 64;
+			const int64 WindowVoxels = kL5CellVoxels * kWindowCells;      // 2048
+			const int64 WindowStep = WindowVoxels / 2;
+			for (int64 Y = -HalfSpanVoxels; Y + WindowVoxels <= HalfSpanVoxels; Y += WindowStep)
+			{
+				for (int64 X = -HalfSpanVoxels; X + WindowVoxels <= HalfSpanVoxels; X += WindowStep)
+				{
+					int64 Lo = MAX_int64, Hi = MIN_int64;
+					for (int64 J = 0; J <= kWindowCells; J += 8)
+					{
+						for (int64 I = 0; I <= kWindowCells; I += 8)
+						{
+							const vxc::ColumnSample C =
+								Amp.column(X + I * kL5CellVoxels, Y + J * kL5CellVoxels);
+							Lo = FMath::Min<int64>(Lo, C.surfaceMm);
+							Hi = FMath::Max<int64>(Hi, C.surfaceMm);
+						}
+					}
+					const int64 ReliefVoxels = (Hi - Lo) / vxc::kVoxelSizeMm;
+					if (ReliefVoxels > BestRelief)
+					{
+						BestRelief = ReliefVoxels; BestReliefX = X; BestReliefY = Y;
+					}
+				}
+			}
+		}
+		UE_LOG(LogVoxelGpuVerify, Log,
+		       TEXT("[FindBandFixture] most vertical relief in a 64-cell L5 window: %lld voxels "
+		            "(%.0f m) at origin voxel (%lld, %lld). L5 needs >= 768 voxels (76.8 m) for "
+		            "three coarse bricks of z; below that the mesh chain refuses the dispatch and "
+		            "the level is UNPROVEN rather than broken."),
+		       BestRelief, double(BestRelief) * 0.1, BestReliefX, BestReliefY);
+
 		if (bFoundCavern)
 		{
 			UE_LOG(LogVoxelGpuVerify, Log,
@@ -1240,9 +1317,19 @@ namespace
 		for (int32 Level = 0; Level <= MaxLevel; ++Level)
 		{
 			bool bLevelOk = true;
-			for (int32 R = 0; R < UE_ARRAY_COUNT(kRegions); ++R)
+			// A level is only proven if a fixture actually EXERCISED it. Without
+			// this, a level every fixture skipped would pass vacuously -- the
+			// same shape as the D6 band sweep passing twelve probes over terrain
+			// containing no caves.
+			bool bAnyFixturePassed = false;
+			// The two digest fixtures, then the coarse-only extras. The extras
+			// are what make level 5 reachable at all -- see kCoarseExtraRegions.
+			const int32 NumRegions = UE_ARRAY_COUNT(kRegions) + UE_ARRAY_COUNT(kCoarseExtraRegions);
+			for (int32 R = 0; R < NumRegions; ++R)
 			{
-				FRegionSpec Region = kRegions[R];
+				FRegionSpec Region = (R < UE_ARRAY_COUNT(kRegions))
+					? kRegions[R]
+					: kCoarseExtraRegions[R - UE_ARRAY_COUNT(kRegions)];
 				Region.CoarseLevel = Level;
 
 				TArray<vxc::ColumnSample> CpuColumns;
@@ -1250,6 +1337,28 @@ namespace
 				const FVoxelGpuRegionResult Gpu = VoxelGpuWorldGen::RunRegionBlocking(Req);
 				if (!Gpu.bOk)
 				{
+					// A FIXTURE TOO THIN TO EXPRESS THIS LEVEL IS NOT A LEVEL
+					// FAILURE, and conflating the two cost level 5 its verdict
+					// once already.
+					//
+					// At level L a coarse cell is 2^L level-0 voxels, so a
+					// 64-cell region spans 64 * 2^L and the terrain range inside
+					// it collapses as L rises. Below three coarse bricks of z the
+					// halo leaves no interior brick and the mesh chain REFUSES
+					// the dispatch. That is the fixture running out of vertical
+					// relief; the coarse path never got to disagree about
+					// anything. Reported as SKIPPED, and the level still has to
+					// be proven by at least one fixture that CAN express it --
+					// see bAnyFixturePassed.
+					if (Gpu.Error.Contains(TEXT("Mesh chain needs")))
+					{
+						UE_LOG(LogVoxelGpuVerify, Warning,
+						       TEXT("[D5 coarse] SKIP — L%d [%s]: fixture cannot express this level "
+						            "(%s). Not a failure of the coarse path; find a fixture with more "
+						            "vertical relief via voxel.GPU.FindBandFixture."),
+						       Level, Region.Name, *Gpu.Error);
+						continue;
+					}
 					UE_LOG(LogVoxelGpuVerify, Error,
 					       TEXT("[D5 coarse] L%d [%s] dispatch FAILED: %s"),
 					       Level, Region.Name, *Gpu.Error);
@@ -1268,6 +1377,7 @@ namespace
 
 				if (bOk)
 				{
+					bAnyFixturePassed = true;
 					UE_LOG(LogVoxelGpuVerify, Log,
 					       TEXT("[D5 coarse] PASS — L%d [%s]: %u columns, %d quads, cell stack ")
 					       TEXT("%u bricks deep — bit-exact with coarseColumns + makeCoarseBrick"),
@@ -1292,6 +1402,14 @@ namespace
 						       *Mismatches[M].Where, Mismatches[M].Cpu, Mismatches[M].Gpu);
 					}
 				}
+			}
+
+			if (bLevelOk && !bAnyFixturePassed)
+			{
+				UE_LOG(LogVoxelGpuVerify, Error,
+				       TEXT("[D5 coarse] L%d: EVERY fixture skipped it, so nothing was compared. "
+				            "The level is UNPROVEN, not passing."), Level);
+				bLevelOk = false;
 			}
 
 			if (bLevelOk)
