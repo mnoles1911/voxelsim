@@ -1139,6 +1139,39 @@ struct FChunkRecord
 	// Seconds above is now a SAFETY CAP; the primary release is coverage-based.
 	uint8 RetainReplaceDir = 0;
 
+	// Load-before-unload coverage, Z-DESIREDNESS of the replacement keys
+	// (ring-gap fix, 2026-07-27). Which of the replacement chunks
+	// ReplacementCovered consults are actually WANTED in Z, decided ONCE here at
+	// retention-stamp time and never re-derived per frame.
+	//
+	// WHY IT HAS TO BE PRE-COMPUTED. The fix makes an ABSENT replacement record
+	// BLOCK the stand-in's release (see ReplacementCovered) -- but only when the
+	// absent chunk was genuinely desired. Desiredness splits in two, and the two
+	// halves have opposite cost profiles:
+	//   Z   -- a pure function of the TERRAIN (ComputeFootprintChunkZRange), so
+	//          it is anchor-INDEPENDENT and can be stamped once per eviction.
+	//          It is also the expensive half (amplifier corner samples).
+	//   XY  -- a function of the ANCHOR, which moves every frame, so it must be
+	//          live. It is pure arithmetic, so that is affordable.
+	// Stamping Z here and evaluating XY live in ReplacementCovered keeps the
+	// amplifier off the per-frame DrainUnloads path entirely.
+	//
+	// LAYOUT. RetainDir_Finer: bit (dx + dy*2 + dz*4) is set iff child chunk
+	// (2X+dx, 2Y+dy, 2Z+dz) at level L-1 lies inside that child FOOTPRINT's
+	// desired chunk-Z range. RetainDir_Coarser: bit 0 only, for the single L+1
+	// parent (X>>1, Y>>1, Z>>1).
+	//
+	// DEFAULTS TO ALL BITS SET, not 0, and the distinction is load-bearing.
+	// "Never stamped" must read as "block on any absence" (the conservative
+	// answer), while a genuine stamp of 0 -- every consulted chunk provably out
+	// of Z range -- must read as "nothing to wait for" and release. A 0 default
+	// would collide those two, and the collision is reachable: the coarser
+	// direction consults exactly one key, so its honest mask is one bit. Making
+	// the DEFAULT the conservative value leaves 0 free to mean what it says.
+	// (Every retention stamp overwrites this unconditionally, in both
+	// directions, so a re-evicted record never reuses a stale mask.)
+	uint8 RetainChildZMask = 0xFF;
+
 	// Load-before-unload coverage (ReplacementCovered). True once this chunk's
 	// geometry is FINAL for its current generation: either ApplyMeshResult ran
 	// (with or without quads), or a pre-dispatch skip proved it empty and it
@@ -1853,7 +1886,7 @@ static int32 GPerLevelRefill = 1;
 static FAutoConsoleVariableRef CVarPerLevelRefill(
 	TEXT("voxel.Stream.PerLevelRefill"),
 	GPerLevelRefill,
-	TEXT("1 (default): a ring's admission refill triggers on ITS OWN queue draining below its share of the cap. 0: the pre-change form, one threshold over the summed queue depth -- which let R4's multi-second jobs hold R0's refill hostage."),
+	TEXT("1 (default): a ring's admission refill triggers on ITS OWN queue draining below its share of the cap. 0: the pre-change form, one threshold over the summed queue depth -- which let R4's multi-second jobs hold R0's refill hostage. A/Bs the ADMISSION-DEFERRED refill only; the stale-scan refill added by the 2026-07-27 ring-gap fix is a separate trigger and runs either way."),
 	ECVF_Default);
 
 bool GetPerLevelRefillEnabled()
@@ -2731,6 +2764,20 @@ struct FVoxelWorldImpl
 	// ChunkRecords, no candidate generation) still runs every call.
 	bool bHasRecomputedLevel[VoxelCoords::kNumLevels] = {};
 	VoxelCoords::FVoxelChunkKey LastAnchorChunkPerLevel[VoxelCoords::kNumLevels] = {};
+	// STALE-SCAN REFILL (ring-gap fix, 2026-07-27). The exact anchor position the
+	// last entry scan for this level actually ran at -- not quantized to the
+	// level's chunk lattice the way LastAnchorChunkPerLevel is. That quantization
+	// is the whole point: a level-L scan decides admission with the anchor at one
+	// POINT, and everything it skipped on distance (the `Level > 0` inner test,
+	// the seam-padding parent test) was skipped against THAT point. Once the
+	// anchor stops moving, nothing re-asks -- the movement gates are quantized
+	// coarser than the seam padding and the admission-deferred flag is only set by
+	// budget/cutoff rejections, so distance-skipped columns are never revisited.
+	// TickStreaming's refill block uses this to re-arm a drained level whose
+	// anchor has moved at all since its last scan. See that block's comment for
+	// the measurement (63-123 byte-identical permanent holes at r=65 m and
+	// r=124-128 m across four independent instrumented legs).
+	FVector2D LastEntryScanAnchorXY[VoxelCoords::kNumLevels] = {};
 
 	// ComputeFootprintChunkZRange memo (docs/status.md "R3/R4 recompute
 	// amortization"). That function is a PURE function of (Level, ChunkX,
@@ -2978,18 +3025,21 @@ struct FVoxelWorldImpl
 	// DrainUnloads for how to read these). Game-thread only.
 	int32 RetainHeldThisFrame = 0;             // stand-ins still held at the end of the last DrainUnloads
 	// The covered releases, SPLIT BY WHAT THE COVERED VERDICT RESTED ON (ring-gap
-	// wave). ReplacementCovered treats an ABSENT replacement record as covered,
-	// on the argument that a key with no record was never desired -- and that
-	// argument only holds when absence means "the replacing ring's own footprint
-	// trim declined it". Absence has four OTHER causes on this path (the
-	// per-level admission budget, the per-level distance cutoff, the pending-
-	// queue drop, and the entry-scan gate that skips a level entirely while the
-	// anchor has not left its level-L chunk), and under any of them the stand-in
-	// is released over ground nothing is drawing yet. Two counters, because a
-	// single covRel number cannot distinguish the sound case from the unsound
-	// one, and the unsound one is the ring-gap hypothesis.
+	// wave). ReplacementCovered USED to treat an ABSENT replacement record as
+	// covered, on the argument that a key with no record was never desired -- an
+	// argument that only holds when absence means "the replacing ring's own
+	// footprint trim declined it". Absence has four OTHER causes on this path
+	// (the per-level admission budget, the per-level distance cutoff, the
+	// pending-queue drop, and the entry-scan gate that skips a level entirely
+	// while the anchor has not left its level-L chunk), and under any of them the
+	// stand-in was released over ground nothing was drawing yet -- the ring-gap
+	// defect, measured at ~1700 uncovered columns in flight.
+	//
+	// Since the 2026-07-27 fix an absent-but-desired replacement BLOCKS, so the
+	// split now separates "all present and settled" from "some absent and proven
+	// undesired". Both are sound; the unsound population moved to RetainHeldThisFrame.
 	int64 RetainCoveredSettledReleasesSinceLog = 0; // every replacement record consulted existed AND had settled
-	int64 RetainCoveredAbsentReleasesSinceLog = 0;  // at least one consulted replacement record did not exist
+	int64 RetainCoveredAbsentReleasesSinceLog = 0;  // some consulted record was absent and provably not desired
 	int64 RetainCapReleasesSinceLog = 0;            // parked because LodRetentionMs expired first
 	// Per-level breakouts of the two suspicious releases. Which RING releases on
 	// an absent replacement is the whole question -- a coarse ring released at its
@@ -3368,6 +3418,13 @@ private:
 	void FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax,
 	                                 int32& OutChunkZMaxUntrimmed) const;
 	void PruneFootprintZRangeCache(const FVector& Anchor);
+	// Load-before-unload, ring-gap fix: the Z half of "is the replacement chunk
+	// this stand-in is waiting on actually DESIRED" -- see
+	// FChunkRecord::RetainChildZMask for the bit layout and why Z is stamped once
+	// while XY is re-evaluated live. Called only from RecomputeDesiredSet's exit
+	// pass, at most once per LOD-transition eviction.
+	uint8 ComputeRetainReplacementZMask(const VoxelCoords::FVoxelLevelChunkKey& Key, uint8 Dir,
+	                                     const FVector& Anchor) const;
 	void SortPendingQueues(const FVector& Anchor);
 	// Drops the farthest entries of an ALREADY-SORTED (farthest-first) queue
 	// until it fits EntryCap, removing their chunk records too, and writes the
@@ -3691,6 +3748,84 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			}
 		}
 	}
+
+	// STALE-SCAN REFILL (ring-gap fix, 2026-07-27) -- a SECOND, independent
+	// per-level trigger, OR'd with the admission-deferred one above.
+	//
+	// THE DEFECT. Every refill trigger that existed before this one is gated on
+	// bAdmissionDeferredWork, which is set in exactly two places: the per-level
+	// admission budget rejecting a candidate, and the per-level distance cutoff
+	// rejecting one. Those are the ways a level KNOWS it left work behind. There
+	// are two ways it does not:
+	//
+	//  1. A column skipped by a DISTANCE test at a stale anchor. The entry pass's
+	//     `Level > 0` inner skip and its seam-padding parent test both decide
+	//     against the anchor position of the scan that ran; neither records that
+	//     it declined anything. Move the anchor a few metres and the answer
+	//     changes -- but nothing re-asks.
+	//  2. A column missed because the SCAN GATE quantizes coarser than the seam
+	//     padding. Level L only rescans once the anchor leaves its level-L chunk
+	//     (51.2 m at L4), while the padded admit radius moves continuously with
+	//     the anchor. The band between the two is never enumerated.
+	//
+	// Neither path sets bAdmissionDeferredWork, so when the anchor STOPS, the
+	// residue is permanent. Measured on the 2026-07-27 instrumented line flights:
+	// 63-123 uncovered columns at r=65 m and r=124-128 m -- the R0/R1 and R1/R2
+	// seams -- surviving indefinitely, at BYTE-IDENTICAL coordinates across four
+	// independent runs. Deterministic, which is what says it is a predicate bug
+	// and not a throughput one: no amount of waiting or worker headroom fills it.
+	//
+	// THE TRIGGER. A level wants a rescan when its queue holds nothing it can
+	// dispatch (same expression the deferred path uses -- there is no point
+	// re-enumerating a ring whose workers are still busy) AND the anchor has
+	// moved at all since that level's entry pass last actually ran. 1 UU is
+	// "moved at all"; the threshold exists only to keep float noise on a
+	// perfectly-still anchor from re-arming it. It is self-quiescing: the rescan
+	// updates LastEntryScanAnchorXY to the current anchor, so a pinned anchor
+	// fires each level exactly once and then goes quiet -- which is the whole
+	// point, since the pinned anchor is the case that was broken.
+	//
+	// Deliberately NOT gated on AdmissionCap or on voxel.Stream.PerLevelRefill:
+	// both of those A/B the admission-budget mechanism, and neither of the two
+	// paths above has anything to do with the admission budget.
+	//
+	// COST, AND WHERE TO LOOK IF IT SHOWS UP. Self-quiescing covers the PINNED
+	// anchor, not a slowly MOVING one: a level whose ring has fully converged
+	// (queue empty) while the anchor creeps re-scans on every tick that moves it
+	// more than 1 UU, instead of once per level-L chunk crossing. That is the
+	// same shape as the ~3 ms p95 regression the deferred path's "EMPTY, not a
+	// quarter-share" note above describes, and R0's entry scan is the 1.6-2.4 ms
+	// one. It did not appear on the 2026-07-27 legs (a flight keeps every ring's
+	// queue fed, so the empty-queue precondition is false throughout), but WALKING
+	// on already-loaded ground is the case that was never measured. If p95 climbs
+	// on a slow-movement profile, this trigger is the first suspect. The
+	// threshold is therefore scaled to the level's chunk edge (edge/4) rather
+	// than an absolute distance: a converged ring re-scans at worst 4x as often
+	// as its own crossing gate while drifting over loaded ground, and the
+	// residual pin staleness (<= edge/4) stays well under the seam padding
+	// (edge/sqrt(2)), so defect (2) stays closed.
+	if (bHasRecomputed)
+	{
+		const FVector2D AnchorXY(Anchor.X, Anchor.Y);
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			if (bLevelWantsRefill[Level] || !bHasRecomputedLevel[Level])
+			{
+				continue; // already re-arming, or has never scanned (no stale anchor to compare)
+			}
+			const int32 Undispatchable = (Level == 0) ? ColdBandHeldThisFrame : 0;
+			if (PendingJobKeysByLevel[Level].Num() > Undispatchable)
+			{
+				continue; // this ring still has work in hand
+			}
+			const double RescanThresholdUU = ChunkEdgeUUForLevel(Level) * 0.25;
+			if (FVector2D::DistSquared(AnchorXY, LastEntryScanAnchorXY[Level]) > FMath::Square(RescanThresholdUU))
+			{
+				bLevelWantsRefill[Level] = true;
+				bAdmissionRefill = true;
+			}
+		}
+	}
 	if (!bHasRecomputed || AnchorChunk.X != LastAnchorChunk.X || AnchorChunk.Y != LastAnchorChunk.Y ||
 	    bUndergroundChanged || (bAnchorUnderground && AnchorChunk.Z != LastAnchorChunk.Z) || bAdmissionRefill)
 	{
@@ -3699,7 +3834,10 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			// Only the drained levels re-enumerate. Clearing the gate for all
 			// five would make a refill for R0 drag R3 and R4 through a full
 			// candidate scan they have no room for, which is the cost the
-			// per-level gate exists to avoid in the first place.
+			// per-level gate exists to avoid in the first place. This property
+			// is what lets the stale-scan trigger above simply OR into
+			// bLevelWantsRefill: a level re-arming for a stale anchor cannot
+			// drag its neighbours through a scan they did not ask for.
 			for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 			{
 				if (bLevelWantsRefill[Level])
@@ -4401,20 +4539,24 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 
 	BuriedSkipsSinceLog = BuriedSkipAirSinceLog = BuriedSkipSolidSinceLog = BuriedVerifyCheckedSinceLog = 0;
 
-	// Load-before-unload retention census. TWO headline numbers now:
+	// Load-before-unload retention census. ONE headline number now:
 	//
 	//   capRel       -- stand-ins parked because voxel.Stream.LodRetentionMs ran
 	//                   out before the replacement arrived. Every one of those is
 	//                   a hole the player could have seen, and the cause is
-	//                   THROUGHPUT.
-	//   covRelAbsent -- stand-ins parked because ReplacementCovered found the
-	//                   replacement records ABSENT and calls that covered. Every
-	//                   one of those is a hole the player could have seen IF the
-	//                   absence was an admission/scheduling artefact rather than
-	//                   the replacing ring genuinely declining the footprint --
-	//                   which is the ring-gap hypothesis. The cause is a
-	//                   PREDICATE, not throughput, so a faster machine does not
-	//                   make it go away.
+	//                   THROUGHPUT. With LodRetentionMs at its 20000 default this
+	//                   measured ZERO through the flight phase at 20 m/s
+	//                   (2026-07-27), so any non-zero flight-phase capRel is a
+	//                   regression worth chasing.
+	//
+	// covRelAbsent WAS the second headline, back when ReplacementCovered treated
+	// every absent replacement record as coverage and the counter could not tell
+	// a sound absence from a ring-gap hole. Since the 2026-07-27 fix an
+	// absent-but-DESIRED replacement blocks the release instead, so that
+	// population shows up in `held` and covRelAbsent counts only absences proven
+	// legitimate. It is now a sanity number, not a suspicion: it should be
+	// non-trivial (footprint Z trims and ring annuli genuinely decline chunks)
+	// and it no longer implies anything about holes.
 	//
 	// covRelSettled is the sound release and needs no interpretation. See the
 	// counter block in DrainUnloads and ReplacementCovered's doc comment.
@@ -5424,6 +5566,107 @@ bool FVoxelWorldImpl::EvaluateAnchorUnderground(const FVector& Anchor) const
 // and DrainUnloads (gates on it) all see it unqualified.
 enum : uint8 { RetainDir_None = 0, RetainDir_Finer = 1, RetainDir_Coarser = 2 };
 
+uint8 FVoxelWorldImpl::ComputeRetainReplacementZMask(const VoxelCoords::FVoxelLevelChunkKey& Key, uint8 Dir,
+                                                     const FVector& Anchor) const
+{
+	using namespace VoxelCoords;
+
+	// The desired chunk-Z SPAN the entry pass would grant one footprint. Mirrors
+	// RecomputeDesiredSet's Z loop step for step -- memoized base range, sky-band
+	// edit hatch, depth skirt, edit-floor hatch -- because a mask that is
+	// narrower than what the entry pass admits would mark a genuinely-desired
+	// chunk "not wanted in Z" and let the stand-in release over it, which is the
+	// exact bug this whole mask exists to close.
+	//
+	// TWO DELIBERATE OVER-APPROXIMATIONS, both in the safe direction (a WIDER
+	// span means more bits set means more blocking):
+	//  - The anchor-relative deep box is a separate set of chunks, not a
+	//    contiguous extension of the surface band; folding it in with min/max
+	//    yields a superset of (band UNION box). Underground only.
+	//  - The level-0 admission band skip (BandProvesChunkEmpty) can drop chunks
+	//    from INSIDE this span. Not mirrored: it would need the band cache per
+	//    child chunk, and omitting it only ever holds a stand-in longer.
+	const auto DesiredZSpan = [this, &Anchor](int32 Level, int32 Cx, int32 Cy, int32& OutZMin, int32& OutZMax)
+	{
+		int32 ZMaxUntrimmed = 0;
+		FootprintChunkZRangeCached(Cx, Cy, Level, OutZMin, OutZMax, ZMaxUntrimmed);
+		if (ZMaxUntrimmed > OutZMax)
+		{
+			if (const int32* EditedMaxZ = EditedFootprintMaxZ[Level].Find(FIntPoint(Cx, Cy)))
+			{
+				OutZMax = FMath::Max(OutZMax, FMath::Min(ZMaxUntrimmed, *EditedMaxZ));
+			}
+		}
+
+		const double ChunkEdge = ChunkEdgeUUForLevel(Level);
+		const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
+		const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
+		const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
+		OutZMin -= VoxelUnderground::SkirtDepthChunks(Level, DistSq);
+
+		if (EditedFootprintMinZ[Level].Num() > 0 && VoxelStreamAdmission::EditFloorHatchEnabled())
+		{
+			if (const int32* EditedMinZ = EditedFootprintMinZ[Level].Find(FIntPoint(Cx, Cy)))
+			{
+				OutZMin = FMath::Min(OutZMin, *EditedMinZ);
+			}
+		}
+
+		int32 BoxRadius = 0;
+		if (bAnchorUnderground && VoxelUnderground::BoxRadiusChunks(Level, DistSq, BoxRadius))
+		{
+			const FVoxelChunkKey AnchorChunk = ChunkKeyForVoxel(WorldToVoxelForLevel(Anchor, Level));
+			OutZMin = FMath::Min(OutZMin, AnchorChunk.Z - BoxRadius);
+			OutZMax = FMath::Max(OutZMax, AnchorChunk.Z + BoxRadius);
+		}
+	};
+
+	const int32 L = Key.Level, X = Key.Key.X, Y = Key.Key.Y, Z = Key.Key.Z;
+	if (Dir == RetainDir_Finer)
+	{
+		if (L == 0)
+		{
+			return 0xFF; // no finer level exists; ReplacementCovered returns before it reads this
+		}
+		uint8 Mask = 0;
+		// Four ComputeFootprintChunkZRange-backed lookups per eviction, and the
+		// memo absorbs most of them (the entry pass has almost always just
+		// visited these same child footprints). This runs per LOD-transition
+		// eviction -- hundreds per 5 s window under 20 m/s motion -- NOT per
+		// frame, which is precisely why the Z half lives here and not in
+		// ReplacementCovered.
+		for (int32 dy = 0; dy < 2; ++dy)
+		{
+			for (int32 dx = 0; dx < 2; ++dx)
+			{
+				int32 ZMin = 0, ZMax = 0;
+				DesiredZSpan(L - 1, X * 2 + dx, Y * 2 + dy, ZMin, ZMax);
+				for (int32 dz = 0; dz < 2; ++dz)
+				{
+					const int32 ChildZ = Z * 2 + dz;
+					if (ChildZ >= ZMin && ChildZ <= ZMax)
+					{
+						Mask |= uint8(1u << (dx + dy * 2 + dz * 4));
+					}
+				}
+			}
+		}
+		return Mask;
+	}
+	if (Dir == RetainDir_Coarser)
+	{
+		if (L + 1 >= kNumLevels)
+		{
+			return 0xFF; // outermost: nothing coarser, and ReplacementCovered returns before it reads this
+		}
+		int32 ZMin = 0, ZMax = 0;
+		DesiredZSpan(L + 1, X >> 1, Y >> 1, ZMin, ZMax); // >> floors for negatives too
+		const int32 ParentZ = Z >> 1;
+		return (ParentZ >= ZMin && ParentZ <= ZMax) ? uint8(1) : uint8(0);
+	}
+	return 0;
+}
+
 void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 {
 	using namespace VoxelCoords;
@@ -5525,6 +5768,13 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					// L+1 parent). ReplacementCovered uses this to release the
 					// stand-in the instant its replacement is on screen.
 					Rec.RetainReplaceDir = bInsideInner ? RetainDir_Finer : RetainDir_Coarser;
+					// ...and WHICH of those replacement keys are wanted in Z, which
+					// is a pure function of the terrain and therefore knowable once,
+					// here, rather than per frame in DrainUnloads. Stamped
+					// unconditionally on both directions so a record that is evicted,
+					// re-admitted and evicted again can never consult a stale mask.
+					// See FChunkRecord::RetainChildZMask.
+					Rec.RetainChildZMask = ComputeRetainReplacementZMask(LevelKey, Rec.RetainReplaceDir, Anchor);
 				}
 			}
 			// Eviction-cause split (see LevelEvictInner's doc comment). This is
@@ -5622,6 +5872,13 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 			continue; // nothing new can have entered this level's annulus
 		}
 		LastAnchorChunkPerLevel[Level] = AnchorChunk;
+		// Stale-scan refill (see LastEntryScanAnchorXY): the UNQUANTIZED anchor
+		// this scan is about to make its distance decisions against. Written here,
+		// past the gate, so it records only scans that actually ran -- which is
+		// what makes TickStreaming's "anchor moved since this level was scanned"
+		// trigger self-quiescing: the rescan it provokes sets this to the current
+		// anchor, so a pinned anchor fires the trigger at most once per level.
+		LastEntryScanAnchorXY[Level] = FVector2D(Anchor.X, Anchor.Y);
 		bHasRecomputedLevel[Level] = true;
 		++LevelEntryScans[Level];
 		++LevelsScannedThisCall;
@@ -6310,41 +6567,81 @@ namespace
 {
 // Is the retained chunk's footprint now covered by the LOD that replaced it?
 // Finer took over -> the eight child chunks at L-1 (2x2 in XY, 2 in Z -- Z
-// matters, see above). Coarser -> the single parent chunk at L+1.
+// matters, see above). Coarser -> the single parent chunk at L+1. Edge levels
+// have no finer or coarser neighbour and report covered immediately, as before.
 //
-// A key with NO record is not DESIRED (the replacing ring's own footprint
-// Z-range trim decided that) and therefore cannot block: only a record that is
-// admitted but not yet settled holds the stand-in. Edge levels have no finer or
-// coarser neighbour and report covered immediately, as before.
+// --- THE ABSENCE BUG, AND THE FIX (ring-gap wave, 2026-07-27) --------------
 //
-// THAT ABSENCE ARGUMENT IS THE THING UNDER TEST (ring-gap wave), which is why
-// the out-params exist. "Absent == not desired" is only true when the replacing
-// ring actually LOOKED at the footprint and declined it. It also reads absent
-// when the ring wanted the chunk and could not have it: the per-level admission
-// budget turned it away (AdmissionsThisLevel), the per-level distance cutoff
-// did (LevelAdmissionCutoffDistSq), TruncatePendingJobQueue dropped it before it
-// meshed, or the ENTRY-SCAN GATE skipped that level entirely this call because
-// the anchor has not left its level-L chunk yet -- at level 4 that is a 51.2 m
-// crossing, so a coarse ring can be several seconds behind the eviction that is
-// consulting it. Under any of those the verdict is "covered" over ground nothing
-// is drawing.
+// Until this change the rule was "a key with NO record is not DESIRED (the
+// replacing ring's own footprint Z-range trim decided that) and therefore cannot
+// block". That argument only holds when the replacing ring actually LOOKED at
+// the footprint and declined it. A record also reads absent when the ring WANTED
+// the chunk and could not have it: the per-level admission budget turned it away
+// (AdmissionsThisLevel), the per-level distance cutoff did
+// (LevelAdmissionCutoffDistSq), TruncatePendingJobQueue dropped it before it
+// meshed, or the ENTRY-SCAN GATE skipped that level entirely because the anchor
+// has not left its level-L chunk yet -- at level 4 a 51.2 m crossing, so a
+// coarse ring can be seconds behind the eviction consulting it. Under any of
+// those the old verdict was "covered" over ground nothing was drawing.
 //
-// This function does NOT change its verdict -- that would be a behaviour change,
-// and the point of this wave is to measure first. It reports, on a covered
-// verdict, whether the verdict consulted any absent record and how the consulted
-// keys split, so DrainUnloads can count the two cases apart.
+// The instrumented flights settled it. During 20 m/s motion a coarse chunk
+// evicted at its INNER edge (bInsideInner, RecomputeDesiredSet's exit pass) had
+// its stand-in released while the finer children that were supposed to replace
+// it had been budget-rejected or queue-truncated and had NO records at all --
+// median ~1700 uncovered columns in flight, dominantly R0 no-record at
+// r=58-64 m, with covRelAbsent running 6-19k per 120 s leg. Standing holes at
+// the ring boundary, exactly where retention exists to prevent them.
+//
+// SO: AN ABSENT REPLACEMENT NOW BLOCKS, unless the absent chunk is PROVABLY not
+// desired. Desiredness has two independent halves and they are answered in
+// different places, because they have opposite costs:
+//
+//   Z   -- anchor-INDEPENDENT (a pure function of terrain, via
+//          ComputeFootprintChunkZRange) and expensive. Stamped ONCE per eviction
+//          into FChunkRecord::RetainChildZMask; see
+//          ComputeRetainReplacementZMask. A masked-OUT key is legitimately not
+//          desired in Z and never blocks.
+//   XY  -- anchor-DEPENDENT and therefore necessarily live, but pure arithmetic:
+//          the replacement's own annulus test, INCLUDING the seam padding, run
+//          against the current anchor right here. No sampling, no map lookups.
+//
+// WHY THE SEAM PADDING APPLIES TO THE XY HALF. The entry pass admits a chunk out
+// to Outer + chunk-half-diagonal, but only where the PARENT covering the same
+// ground is not itself admitted. For a child of an evicted stand-in that
+// condition is satisfied by construction: the parent IS the stand-in, and once
+// released it is not admitted. So the padded radius is the right radius here.
+//
+// The four verdicts per consulted key:
+//   present && settled                    -> covered, does not block
+//   present && !settled                   -> BLOCKS (unchanged)
+//   absent  && (Z-masked-out || XY-undesired) -> legitimately absent, does not block
+//   absent  && Z-desired && XY-desired    -> BLOCKS  <- this is the fix
+//
+// bOutAnyAbsent / OutAbsentCount therefore now mean "released while at least one
+// consulted record was absent-but-UNDESIRED", i.e. the legitimate case.
+// covRelAbsent stops being the ring-gap suspicion number and becomes a count of
+// sound absences; the unsound case now shows up as `held` instead. See the
+// counter block in DrainUnloads.
 //
 // The counts are meaningful ONLY on a `true` return: the loop short-circuits on
 // the first blocking record, so a `false` verdict leaves them partial.
 bool ReplacementCovered(const TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStreaming::FChunkRecord>& Records,
-                        const VoxelCoords::FVoxelLevelChunkKey& Key, uint8 Dir, bool* bOutAnyAbsent = nullptr,
-                        int32* OutAbsentCount = nullptr, int32* OutSettledCount = nullptr)
+                        const VoxelCoords::FVoxelLevelChunkKey& Key, uint8 Dir, uint8 RetainChildZMask,
+                        const FVector& Anchor, bool* bOutAnyAbsent = nullptr, int32* OutAbsentCount = nullptr,
+                        int32* OutSettledCount = nullptr)
 {
 	if (bOutAnyAbsent) *bOutAnyAbsent = false;
 	if (OutAbsentCount) *OutAbsentCount = 0;
 	if (OutSettledCount) *OutSettledCount = 0;
 
-	const auto Settled = [&Records, bOutAnyAbsent, OutAbsentCount, OutSettledCount](int32 L, int32 X, int32 Y, int32 Z)
+	// bDesiredIfAbsent is the caller's answer to "would the replacing ring have
+	// admitted this key, had nothing got in the way": Z from the stamped mask, XY
+	// from the live test below. It decides ONLY what an absent record means; a
+	// record that exists is judged on bMeshSettled exactly as before, since a
+	// chunk that is admitted and mid-pipeline is worth waiting for whatever the
+	// predicates now say about it.
+	const auto Consult = [&Records, bOutAnyAbsent, OutAbsentCount, OutSettledCount](int32 L, int32 X, int32 Y, int32 Z,
+	                                                                               bool bDesiredIfAbsent)
 	{
 		VoxelCoords::FVoxelLevelChunkKey K;
 		K.Level = L;
@@ -6354,7 +6651,10 @@ bool ReplacementCovered(const TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStream
 		const VoxelStreaming::FChunkRecord* R = Records.Find(K);
 		if (R == nullptr)
 		{
-			// absent == not desired == not blocking -- see the caveat above.
+			if (bDesiredIfAbsent)
+			{
+				return false; // wanted, missing, nothing drawing it -- hold the stand-in
+			}
 			if (bOutAnyAbsent) *bOutAnyAbsent = true;
 			if (OutAbsentCount) ++*OutAbsentCount;
 			return true;
@@ -6366,6 +6666,28 @@ bool ReplacementCovered(const TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStream
 		return R->bMeshSettled;
 	};
 
+	// The XY half of desiredness, at level `L` for the chunk footprint (Cx, Cy):
+	// this level's own annulus, outer edge padded by the chunk half-diagonal --
+	// the same constant and the same reasoning as the entry pass's AdmitOuterUU
+	// (see RecomputeDesiredSet's RING SEAM COVERAGE comment). The `L > 0` inner
+	// skip mirrors the entry pass too: a footprint inside level L's inner edge
+	// belongs to an even finer ring, so level L declining it is correct and its
+	// absence there is sound.
+	const auto XYDesired = [&Anchor](int32 L, int32 Cx, int32 Cy)
+	{
+		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::GetRingPresets()[L];
+		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(L);
+		const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
+		const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
+		const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
+		if (L > 0 && DistSq < FMath::Square(Preset.InnerMeters * 100.0))
+		{
+			return false;
+		}
+		const double AdmitOuterUU = Preset.OuterMeters * 100.0 + ChunkEdge * 0.70710678118654752440;
+		return DistSq < FMath::Square(AdmitOuterUU);
+	};
+
 	const int32 L = Key.Level, X = Key.Key.X, Y = Key.Key.Y, Z = Key.Key.Z;
 	if (Dir == RetainDir_Finer)
 	{
@@ -6374,9 +6696,12 @@ bool ReplacementCovered(const TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStream
 		{
 			for (int32 dy = 0; dy < 2; ++dy)
 			{
+				// Hoisted out of the dz loop: both children of a column share it.
+				const bool bChildXYDesired = XYDesired(L - 1, X * 2 + dx, Y * 2 + dy);
 				for (int32 dz = 0; dz < 2; ++dz)
 				{
-					if (!Settled(L - 1, X * 2 + dx, Y * 2 + dy, Z * 2 + dz))
+					const bool bChildZDesired = (RetainChildZMask & uint8(1u << (dx + dy * 2 + dz * 4))) != 0;
+					if (!Consult(L - 1, X * 2 + dx, Y * 2 + dy, Z * 2 + dz, bChildZDesired && bChildXYDesired))
 					{
 						return false;
 					}
@@ -6388,7 +6713,12 @@ bool ReplacementCovered(const TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStream
 	if (Dir == RetainDir_Coarser)
 	{
 		if (L >= VoxelCoords::kNumLevels - 1) return true; // outermost: nothing coarser
-		return Settled(L + 1, X >> 1, Y >> 1, Z >> 1);     // >> floors for negatives too
+		// The parent of an outward-evicted chunk sits well inside its own annulus
+		// in practice, so the plain padded-annulus test is what applies; a parent
+		// that falls outside it is genuinely somebody else's ground.
+		const bool bParentDesired =
+			(RetainChildZMask & 1u) != 0 && XYDesired(L + 1, X >> 1, Y >> 1);
+		return Consult(L + 1, X >> 1, Y >> 1, Z >> 1, bParentDesired); // >> floors for negatives too
 	}
 	return true;
 }
@@ -8558,6 +8888,18 @@ void FVoxelWorldImpl::DrainUnloads()
 		       Absent, SettledCount);
 	};
 
+	// Which retention verdict a popped chunk got, carried from where it is
+	// DECIDED (before the unload budget) to where the chunk actually PARKS (after
+	// it) so a budget-deferred chunk cannot re-count its release every frame. See
+	// the counter block below.
+	enum class ERetentionVerdict : uint8
+	{
+		NotRetained,    // no RetainReplaceDir: an ordinary eviction, nothing to report
+		Cap,            // LodRetentionMs elapsed with the replacement still not covering
+		CoveredSettled, // every consulted replacement record existed and had settled
+		CoveredAbsent,  // some consulted record was absent AND provably not desired
+	};
+
 	while (Pops < kMaxUnloadPopsPerFrame && PendingUnloadKeys.Num() > 0)
 	{
 		const VoxelCoords::FVoxelLevelChunkKey Key = PendingUnloadKeys.Pop(EAllowShrinking::No);
@@ -8593,8 +8935,10 @@ void FVoxelWorldImpl::DrainUnloads()
 			//   held         -- stand-ins currently drawn waiting on a replacement
 			//   covRelSettled-- released because the replacement RECORDS EXISTED
 			//                   and had all settled: the clean, sound release
-			//   covRelAbsent -- released because the replacement records were
-			//                   ABSENT, which ReplacementCovered treats as covered
+			//   covRelAbsent -- released because the consulted replacement records
+			//                   were absent AND provably not desired (out of the
+			//                   replacement footprint's Z range, or outside its
+			//                   ring's padded annulus at the current anchor)
 			//   capRel       -- released because the SAFETY CAP expired first
 			//
 			// capRel large => the replacement is genuinely not streaming in inside
@@ -8602,52 +8946,84 @@ void FVoxelWorldImpl::DrainUnloads()
 			// not a retention bug: retention can only delay a hole, never
 			// manufacture a chunk.
 			//
-			// covRelAbsent is the ring-gap wave's number, and it is a hole
-			// SUSPICION, not a hole: absence is sound when the replacing ring
-			// genuinely declined the footprint and unsound when it merely has not
-			// been asked yet (admission budget, distance cutoff, queue drop, or
-			// the per-level entry-scan gate). See ReplacementCovered's comment.
-			// Split per level, because "R4 releasing on absent children at its
-			// inner edge" and "R0 releasing on an absent parent" are different
-			// bugs that a single total cannot tell apart.
+			// WHAT TO WATCH CHANGED WITH THE 2026-07-27 RING-GAP FIX. covRelAbsent
+			// used to be this wave's headline: absence was treated as coverage
+			// unconditionally, so the counter mixed sound absences in with the
+			// ring-gap holes and a large value was a hole SUSPICION. It no longer
+			// is. ReplacementCovered now BLOCKS on an absent-but-desired
+			// replacement, so that population moved into `held`, and covRelAbsent
+			// counts only absences it could prove legitimate. The two numbers to
+			// watch are now:
+			//   held   -- if this climbs and stays up, replacements are not
+			//             arriving; the stand-ins are doing their job but the
+			//             funnel behind them is the problem.
+			//   capRel -- a stand-in that reached the safety cap still holding is
+			//             the case where a hole CAN still appear. Zero flight-phase
+			//             capRel was the acceptance bar for LodRetentionMs=20000.
+			// Still split per level: "R4 releasing at its inner edge" and "R0
+			// releasing on an absent parent" are different bugs a single total
+			// cannot tell apart.
+			//
+			// COUNTED AT THE PARK, NOT AT THE VERDICT (2026-07-27). The verdict is
+			// decided here, but the release counters fire below, past the
+			// MaxUnloads budget check. They used to fire here -- so a chunk whose
+			// park was deferred by the unload budget re-counted its release on
+			// every frame until the budget let it through, which is how one 5 s
+			// window reported capRel=65,478 against held~1,010. The verdict rides
+			// down in a local instead. `held` is unaffected: it is recounted from
+			// scratch each frame and is a level, not a rate.
+			ERetentionVerdict Verdict = ERetentionVerdict::NotRetained;
+			int32 VerdictAbsentCount = 0;
+			int32 VerdictSettledCount = 0;
 			if (Rec->RetainReplaceDir != RetainDir_None)
 			{
-				const int32 RetLevel = FMath::Clamp(Key.Level, 0, VoxelCoords::kNumLevels - 1);
 				if (ElapsedSeconds >= Rec->RetainUntilSeconds)
 				{
-					++RetainCapReleasesSinceLog;
-					++LevelRetainCapReleases[RetLevel];
-					LogRetentionRelease(Key, TEXT("cap"), Rec->RetainReplaceDir, /*Absent*/ -1, /*Settled*/ -1);
+					Verdict = ERetentionVerdict::Cap;
 				}
 				else
 				{
 					bool bAnyAbsent = false;
-					int32 AbsentCount = 0;
-					int32 SettledCount = 0;
-					if (!ReplacementCovered(ChunkRecords, Key, Rec->RetainReplaceDir, &bAnyAbsent, &AbsentCount,
-					                        &SettledCount))
+					if (!ReplacementCovered(ChunkRecords, Key, Rec->RetainReplaceDir, Rec->RetainChildZMask,
+					                        LastAnchorLocation, &bAnyAbsent, &VerdictAbsentCount, &VerdictSettledCount))
 					{
 						++RetainHeldThisFrame;
 						Deferred.Add(Key); // stays tracked + visible, retried next frame
 						continue;
 					}
-					if (bAnyAbsent)
-					{
-						++RetainCoveredAbsentReleasesSinceLog;
-						++LevelRetainCoveredAbsent[RetLevel];
-						LogRetentionRelease(Key, TEXT("covered-absent"), Rec->RetainReplaceDir, AbsentCount,
-						                    SettledCount);
-					}
-					else
-					{
-						++RetainCoveredSettledReleasesSinceLog;
-					}
+					Verdict = bAnyAbsent ? ERetentionVerdict::CoveredAbsent : ERetentionVerdict::CoveredSettled;
 				}
 			}
+			// The retention gate stays AHEAD of the budget check: a HELD chunk must
+			// not consume an unload slot it is not going to use, or the real
+			// unloads starve behind stand-ins that are still waiting.
 			if (ComponentUnloads >= MaxUnloads)
 			{
 				Deferred.Add(Key); // stays in PendingUnloadSet, re-added below
 				continue;
+			}
+			// Past every deferral: this chunk parks THIS frame, exactly once.
+			{
+				const int32 RetLevel = FMath::Clamp(Key.Level, 0, VoxelCoords::kNumLevels - 1);
+				switch (Verdict)
+				{
+				case ERetentionVerdict::Cap:
+					++RetainCapReleasesSinceLog;
+					++LevelRetainCapReleases[RetLevel];
+					LogRetentionRelease(Key, TEXT("cap"), Rec->RetainReplaceDir, /*Absent*/ -1, /*Settled*/ -1);
+					break;
+				case ERetentionVerdict::CoveredAbsent:
+					++RetainCoveredAbsentReleasesSinceLog;
+					++LevelRetainCoveredAbsent[RetLevel];
+					LogRetentionRelease(Key, TEXT("covered-absent"), Rec->RetainReplaceDir, VerdictAbsentCount,
+					                    VerdictSettledCount);
+					break;
+				case ERetentionVerdict::CoveredSettled:
+					++RetainCoveredSettledReleasesSinceLog;
+					break;
+				default:
+					break; // never retained: nothing to report
+				}
 			}
 			// Any worker job still in flight for this key keeps running to
 			// completion (it can't be cancelled); when its result arrives,

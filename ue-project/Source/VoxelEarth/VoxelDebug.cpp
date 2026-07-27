@@ -122,14 +122,19 @@ TAutoConsoleVariable<float> CVarVoxelStreamApplyBudgetMs(
 
 TAutoConsoleVariable<float> CVarVoxelStreamLodRetentionMs(
 	TEXT("voxel.Stream.LodRetentionMs"),
-	5000.0f,
+	20000.0f,
 	TEXT("Load-before-unload SAFETY CAP (2026-07-24 streaming-speed pass). When a VISIBLE chunk is evicted because a ")
 	TEXT("different LOD ring took over its footprint (toward -> finer, away -> coarser), it is kept drawn as a stand-in ")
 	TEXT("until its replacement LOD is actually on screen -- COVERAGE-based release (ReplacementCovered vs ChunkRecords), ")
 	TEXT("not a fixed timer, so there is no rolling ring of holes where a timer would expire mid-transition. This value ")
 	TEXT("is only the backstop: a footprint that never gets covered (e.g. a coastal quarter that is all ocean) is parked ")
 	TEXT("after this many ms so resident chunks cannot grow unbounded. Cost: brief coarse+fine double-draw at the ")
-	TEXT("boundary until coverage (minor shimmer, no hole). 0 disables retention entirely (immediate unload = holes)."),
+	TEXT("boundary until coverage (minor shimmer, no hole). 0 disables retention entirely (immediate unload = holes). ")
+	TEXT("RAISED 5000 -> 20000 on 2026-07-27: instrumented 20 m/s line flights showed 5000 was simply too short for the ")
+	TEXT("backstop to be a backstop -- stand-ins hit the cap and parked while their replacements were still mid-pipeline, ")
+	TEXT("which is a hole, and the counter that should have flagged it (capRel) was inflated by a separate double-count ")
+	TEXT("bug. At 20000 the same flights logged ZERO flight-phase cap releases; the pool cost of holding stand-ins 4x ")
+	TEXT("longer was capacityPct peaking at 50.7% (vs 41.8% at 5000) with allocFail=0, i.e. comfortably inside the pool."),
 	ECVF_Default);
 
 // Terrain sun-shadow casting (PR #95, "the sun should not light a sealed cave").
