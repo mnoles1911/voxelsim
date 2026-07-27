@@ -3908,6 +3908,45 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		const double T2 = FPlatformTime::Seconds();
 		DrainGameThreadMesh(Owner, Root, Material);
 		const double T3 = FPlatformTime::Seconds();
+
+		// Second DispatchJobs() pass (voxel.Stream.DispatchAfterDrain, default
+		// 1) -- refills the slots DrainResults just freed IN THIS FRAME rather
+		// than leaving them idle until next frame's single dispatch. See
+		// CVarVoxelStreamDispatchAfterDrain's comment in VoxelDebug.cpp for the
+		// ~9% worker-utilisation measurement this addresses and how it
+		// complements JobsInFlightPerCore=8 (which widens the buffer but does
+		// not touch the once-per-frame cadence).
+		//
+		// SLOT CHOICE: after DrainGameThreadMesh, before DrainUnloads -- not
+		// straight after DrainResults. Two reasons. First, DrainResults is what
+		// decrements LevelJobsInFlight (see its ring-quota bookkeeping), so the
+		// ring-quota pass inside a second DispatchJobs only sees accurate
+		// per-ring deficits once DrainResults has actually run; parking it here
+		// keeps that ordering trivially satisfied regardless of exactly where
+		// in [after DrainResults, before DrainUnloads] it lands. Second, and
+		// decisively, DispatchJobs has always run BEFORE DrainUnloads within a
+		// tick (dispatch against this frame's desired set, then prune it) --
+		// this preserves that same invariant for the second pass instead of
+		// having a same-frame dispatch race a same-frame unload.
+		//
+		// GATED ON QUEUE PRESSURE: PendingJobNum() sums every per-level queue
+		// (see its doc comment), so this is the "nothing pending" case called
+		// out above -- if the first dispatch already drained every ring dry,
+		// a second pass has nothing to do and costs only this scan.
+		//
+		// TIMING: folded into ThisFrameDispatchMs/AccumDispatchMs (not
+		// RemeshMs or UnloadMs) so the tick-budget line still attributes all
+		// dispatch cost to the dispatch bucket. T3b collapses to T3 (zero
+		// delta) when the cvar is off or the gate skips, so UnloadMs stays
+		// exactly (T4 - T3) in that case -- byte-identical to the old
+		// single-dispatch behaviour.
+		double T3b = T3;
+		if (VoxelDebug::GetStreamDispatchAfterDrain() != 0 && PendingJobNum() > 0)
+		{
+			DispatchJobs();
+			T3b = FPlatformTime::Seconds();
+		}
+
 		DrainUnloads();
 		const double T4 = FPlatformTime::Seconds();
 
@@ -3916,18 +3955,18 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		// established practice in this function -- see TickStartSeconds
 		// above), always collected so the per-frame log below has real
 		// numbers the instant a hitch happens, not just from the next frame.
-		ThisFrameDispatchMs = float((T1 - T0) * 1000.0);
+		ThisFrameDispatchMs = float((T1 - T0) * 1000.0 + (T3b - T3) * 1000.0);
 		ThisFrameApplyMs = float((T2 - T1) * 1000.0);
 		ThisFrameRemeshMs = float((T3 - T2) * 1000.0);
-		ThisFrameUnloadMs = float((T4 - T3) * 1000.0);
+		ThisFrameUnloadMs = float((T4 - T3b) * 1000.0);
 
 		// Streaming re-measure: same four samples, also summed into the 5s
 		// window so the periodic log can report where tick time goes on runs
 		// that never cross the hitch threshold at all.
-		AccumDispatchMs += (T1 - T0) * 1000.0;
+		AccumDispatchMs += (T1 - T0) * 1000.0 + (T3b - T3) * 1000.0;
 		AccumApplyMs += (T2 - T1) * 1000.0;
 		AccumRemeshMs += (T3 - T2) * 1000.0;
-		AccumUnloadMs += (T4 - T3) * 1000.0;
+		AccumUnloadMs += (T4 - T3b) * 1000.0;
 		AccumRecomputeMs += ThisFrameRecomputeMs;
 		++AccumTicks;
 	}
@@ -8287,14 +8326,31 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	// against GetFreeQuads() says whether this is genuinely full or merely
 	// fragmented -- very different problems, and only the second wants a
 	// compaction pass.
+	// 2026-07-27 addendum: 26 M is NOT ENOUGH for the 128 m cascade on REAL
+	// terrain either -- the ring-gap night's cold-fill legs settled with
+	// residentQuads pegged at exactly this capacity (docs/measurements/
+	// ring-gap-2026-07-27.txt), i.e. silently saturated. -VoxelPoolCapacityQuads
+	// overrides it for that work (latched, like the ring switches: the pool is
+	// sized once before any cvar could land); the pool component now also logs
+	// a latched Error the first time it saturates or refuses an allocation, so
+	// the silent-success failure shape above cannot recur unnoticed.
 	constexpr uint32 kPoolCapacityQuads = 26u * 1000u * 1000u;   // 208 MB at 8 B/quad
-	Pool->InitPool(kPoolCapacityQuads);
+	uint32 PoolCapacityQuads = kPoolCapacityQuads;
+	{
+		uint32 Override = 0;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPoolCapacityQuads="), Override) && Override > 0)
+		{
+			PoolCapacityQuads = FMath::Clamp<uint32>(Override, 1u * 1000u * 1000u, 200u * 1000u * 1000u);
+		}
+	}
+	Pool->InitPool(PoolCapacityQuads);
 
 	GpuPool = Pool;
 	UE_LOG(LogVoxelStream, Log,
-	       TEXT("voxel.Stream.GPU: geometry pool up, %u quad capacity (%.0f MB), chunk table floor %d. "
+	       TEXT("voxel.Stream.GPU: geometry pool up, %u quad capacity (%.0f MB)%s, chunk table floor %d. "
 	            "Chunks now stream as ranges in ONE primitive."),
-	       kPoolCapacityQuads, double(kPoolCapacityQuads) * 8.0 / (1024.0 * 1024.0), 49152);
+	       PoolCapacityQuads, double(PoolCapacityQuads) * 8.0 / (1024.0 * 1024.0),
+	       PoolCapacityQuads != kPoolCapacityQuads ? TEXT(" [OVERRIDDEN]") : TEXT(""), 49152);
 	return Pool;
 }
 

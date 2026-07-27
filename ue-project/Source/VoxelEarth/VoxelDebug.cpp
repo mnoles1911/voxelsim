@@ -329,6 +329,37 @@ TAutoConsoleVariable<int32> CVarVoxelStreamJobsInFlightPerCore(
 	TEXT("ever being dispatched. Raise to keep the task graph fed across frames. Watch stale%% in the job-flow census."),
 	ECVF_Default);
 
+// DispatchJobs tops the worker queue to MaxJobsInFlight once per TickStreaming
+// call, at the top of the budget block; DrainResults then runs and frees
+// slots as JobsInFlightCounter decrements. Those freed slots sit idle until
+// NEXT frame's dispatch -- the same once-per-frame refill cadence that the
+// JobsInFlightPerCore comment above measured at ~9% worker utilisation (24
+// slots x 1.32ms R0 jobs against a ~15ms frame, ~1,540 jobs/s dispatched
+// against an ~18,000/s slot capacity). Raising JobsInFlightPerCore 2->8
+// widens the buffer so starvation takes longer to bite, but does not touch
+// the cadence itself -- a wider queue still only gets topped up once a frame.
+//
+// This cvar adds a second DispatchJobs() call after DrainResults and
+// DrainGameThreadMesh (see TickStreaming), so slots freed earlier in THIS
+// frame get refilled in the SAME frame instead of sitting idle until the
+// next one. Gated on queue pressure (PendingJobNum() > 0 at the point of the
+// second call) so an idle frame -- nothing pending, workers caught up -- pays
+// only the PendingJobNum() scan and nothing else.
+//
+// Default ON: complements JobsInFlightPerCore=8 rather than substituting for
+// it -- the wider cap gives more slots to refill, and the second dispatch is
+// what actually refills them same-frame. Set 0 for the old single-dispatch
+// behaviour (the A/B control for this change).
+TAutoConsoleVariable<int32> CVarVoxelStreamDispatchAfterDrain(
+	TEXT("voxel.Stream.DispatchAfterDrain"),
+	1,
+	TEXT("Run a second DispatchJobs() pass after DrainResults/DrainGameThreadMesh, so slots freed earlier this frame ")
+	TEXT("are refilled same-frame instead of idling until next frame's dispatch (measured ~9%% worker utilisation ")
+	TEXT("at the old JobsInFlightPerCore default from this once-per-frame cadence alone). Skipped cheaply when ")
+	TEXT("nothing is pending. Complements JobsInFlightPerCore=8, which widens the buffer but does not change the ")
+	TEXT("cadence. Set 0 for the old single-dispatch-per-frame behaviour (A/B control)."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxRemeshesPerFrame(
 	TEXT("voxel.Stream.MaxRemeshesPerFrame"),
 	8,
@@ -670,6 +701,11 @@ int32 VoxelDebug::GetStreamJobsInFlightPerCore()
 	const int32 Requested =
 		CommandLineOverride > 0 ? CommandLineOverride : CVarVoxelStreamJobsInFlightPerCore.GetValueOnGameThread();
 	return FMath::Clamp(Requested, 1, 64);
+}
+
+int32 VoxelDebug::GetStreamDispatchAfterDrain()
+{
+	return CVarVoxelStreamDispatchAfterDrain.GetValueOnGameThread();
 }
 
 int32 VoxelDebug::GetStreamMaxRemeshesPerFrame()

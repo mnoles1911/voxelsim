@@ -281,6 +281,14 @@ namespace VoxelDebug
 	// made this tunable.
 	VOXELEARTH_API int32 GetStreamJobsInFlightPerCore();
 
+	// voxel.Stream.DispatchAfterDrain: run a second DispatchJobs() pass after
+	// DrainGameThreadMesh (i.e. once slots freed by this frame's DrainResults
+	// are visible), instead of refilling only once per frame. Default 1. See
+	// the cvar's source comment for the ~9% worker-utilisation measurement
+	// this complements (voxel.Stream.JobsInFlightPerCore=8 widens the buffer;
+	// this shortens the once-per-frame refill cadence that starves it).
+	VOXELEARTH_API int32 GetStreamDispatchAfterDrain();
+
 	// voxel.Stream.MaxRemeshesPerFrame: max game-thread overlay-aware edit
 	// re-meshes (DrainGameThreadMesh -- first load of an edited chunk, or a
 	// post-edit dirty re-mesh) applied per frame. Default 8 (2026-07-24 pass).

@@ -283,6 +283,20 @@ private:
 	int64 AllocFailureCount = 0;
 	int64 AllocFailureQuads = 0;
 
+	// Latches MaybeLogSaturation's one Error-level line for the pool's
+	// lifetime. Never reset by ClearChunks, for the same reason
+	// AllocFailureCount is not: the question is "did this run ever get this
+	// close", not "is it this close right now".
+	bool bSaturationErrorLogged = false;
+
+	// Fires the pool's ONE loud, latched saturation signal -- Error level,
+	// not the throttled Warning cadence AllocFailureCount's own log uses --
+	// the first time EITHER an allocation fails or resident quads cross 95%
+	// of capacity, whichever happens first. Safe (and meant) to call on
+	// every allocation, success or failure: it is a no-op once latched.
+	// bAllocFailed only changes the log text, both triggers share one latch.
+	void MaybeLogSaturation(bool bAllocFailed);
+
 	// Ranges written since the last upload, in quads. Streaming touches a few
 	// chunks per frame out of thousands, so uploading the whole pool for each
 	// change would be absurd -- at cascade scale that is 75 MB per edit.

@@ -1450,6 +1450,41 @@ void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 	bRunsDirty = false;
 }
 
+// See the declaration for why this is safe to call unconditionally: it
+// costs one bool check once latched, and it is latched the first time either
+// trigger fires so this is the only place a saturated pool ever logs loud.
+//
+// 95% RATHER THAN 100%, because 100% is too late to be a warning -- by the
+// time capacity is exactly exhausted, chunks have already started silently
+// failing to allocate (that is the OTHER trigger, below), and the whole
+// point of a percentage trip is to fire while there is still time to resize
+// before the run reaches it. Resident is Capacity - GetFreeQuads() rather
+// than a running total kept alongside NumLiveChunks, because the allocator
+// is the one source of truth for it and a second counter can only drift
+// from that one.
+void UVoxelGpuPoolComponent::MaybeLogSaturation(bool bAllocFailed)
+{
+	if (bSaturationErrorLogged)
+	{
+		return;
+	}
+
+	const uint32 Capacity = Pool.GetCapacityQuads();
+	const uint32 Resident = Capacity - Pool.GetFreeQuads();
+	if (!bAllocFailed && (Capacity == 0 || uint64(Resident) * 100 < uint64(Capacity) * 95))
+	{
+		return;   // neither trigger has fired yet
+	}
+
+	bSaturationErrorLogged = true;
+	const double Pct = Capacity > 0 ? 100.0 * double(Resident) / double(Capacity) : 0.0;
+	UE_LOG(LogTemp, Error,
+	       TEXT("%s: POOL SATURATION -- capacity %u quads, %u resident (%.1f%%)%s. Chunks will silently ")
+	       TEXT("fail to appear; resize with -VoxelPoolCapacityQuads or shrink the cascade."),
+	       *PoolName, Capacity, Resident, Pct,
+	       bAllocFailed ? TEXT(" -- an allocation just failed") : TEXT(" -- crossed the 95% watch line"));
+}
+
 int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
                                        const FVector3f& OriginUU, int32 Level,
                                        const FVector4f& Params)
@@ -1468,6 +1503,9 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 		// is not enough on its own.
 		++AllocFailureCount;
 		AllocFailureQuads += InQuads.Num();
+		// The one loud signal -- see MaybeLogSaturation. Fires once, ever, for
+		// this pool; every call after the first is a no-op.
+		MaybeLogSaturation(/*bAllocFailed=*/true);
 		// Warn on the first, then at powers of ten: a pool that has genuinely run
 		// out fails on nearly every subsequent chunk, and a per-chunk warning at
 		// that rate buries the streaming log it would be diagnosed from.
@@ -1481,6 +1519,12 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 		}
 		return INDEX_NONE;
 	}
+
+	// Resident quads just grew; check the OTHER trigger for the loud signal --
+	// a pool can coast up to and across the 95% line without a single
+	// allocation ever failing, if nothing has fragmented it. No-op once
+	// latched, same as the call in the failure branch above.
+	MaybeLogSaturation(/*bAllocFailed=*/false);
 
 	const float Scale = float(1 << Level);
 	// Re-use a table entry a removed chunk gave back before appending a new one.
@@ -1853,6 +1897,10 @@ int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& In
 		// and it does so with no other trace. This path had no log at all.
 		++AllocFailureCount;
 		AllocFailureQuads += InQuads.Num();
+		// The one loud signal -- see MaybeLogSaturation. Fires once, ever, for
+		// this pool; every call after the first is a no-op. Doubly worth
+		// having here: this is the DESTRUCTIVE failure, not merely a missed add.
+		MaybeLogSaturation(/*bAllocFailed=*/true);
 		UE_LOG(LogTemp, Warning,
 		       TEXT("%s: re-mesh outgrew its slot and the pool is full (%d quads wanted, %u free, "
 		            "largest run %u) -- RESIDENT GEOMETRY DROPPED, failure %lld of this run"),
@@ -1868,6 +1916,10 @@ int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& In
 	Allocations[Handle] = Alloc;
 	AllocationChunkIds[Handle] = ChunkId;
 	++NumLiveChunks;
+
+	// Resident quads just grew via a realloc; check the 95% trigger the same
+	// way AddChunk does. See the comment there -- no-op once latched.
+	MaybeLogSaturation(/*bAllocFailed=*/false);
 
 	// The chunk moved. Its table entry is unchanged -- that is the whole point of
 	// reusing it -- but the run that names its quads is now wrong, and a stale run
