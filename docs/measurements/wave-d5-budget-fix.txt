@@ -1,0 +1,55 @@
+D5.3b -- the GPU fork gets its own in-flight budget. THE FIRST CONFIGURATION IN
+THIS PROGRAMME THAT BEATS THE CPU PATH.
+
+R0 = 128 m, default spawn, -VoxelPerfFlight=static, edit log cleared per leg,
+settle = idle AND at peak residency (43,328 chunks in every leg below).
+
+  config                                  settle          forked
+  128 m, CPU producer                60.4 / 58.4 s             0
+  128 m, fork L0 only  + budget fix  58.5 / 62.4 s        ~7,370
+  128 m, fork L0-L4    + budget fix  36.3 / 38.3 s       ~34,365
+  (for reference, before the budget fix)
+  128 m, fork L0-L4    shared budget  205.4 s / never       51,720
+
+BOTH CHANGES ARE REQUIRED AND NEITHER WORKS ALONE. That is what makes this a
+result rather than a coincidence:
+
+  * coarse levels WITHOUT the budget fix  -> 205 s, 3.4x WORSE than CPU
+  * the budget fix WITHOUT coarse levels  -> 58.5 / 62.4 s, i.e. no change at
+    all against a CPU baseline of 58.4 / 60.4 s
+  * both together                         -> 36.3 / 38.3 s, ~38% FASTER
+
+The mechanism is consistent with the split. Levels 1-5 are ~80% of resident
+chunks, so a level-0-only fork cannot move the number however much budget it is
+given. And a GPU round trip is ~28 ms against a CPU worker's ~1 ms, so the fork
+only pays once enough work is in flight to hide that latency -- which the old
+budget forbade.
+
+THE OLD BUDGET WAS A UNIT ERROR, NOT A TUNING MISS. MaxJobsInFlight is
+JobsInFlightPerCore * logical cores = 24 here, and that number sizes a pool of
+WORKERS. A GPU job is not a thread, it is a round trip. Wave D's own design pass
+wrote it down in advance -- "MaxJobsInFlight must now absorb latency as well as
+work, so it sizes against latency x rate, not worker count" -- and it was noted
+and not acted on. D5.3a then measured the fork sitting at 19-20 in flight
+against a manager cap of 256: waiting, not saturated.
+
+Fix: GPU jobs no longer consume the CPU budget at all. The loop condition counts
+CPU-outstanding work only, so the CPU baseline is untouched (one knob at a
+time), and the fork's own bound is applied at the fork decision so a chunk
+arriving when the GPU is full falls back to the CPU instead of stalling the
+loop. In-flight now reaches 256, the cap, rather than 19-20.
+
+HEALTH: failed=0 across 25 and 23 five-second windows, markTimeouts=0,
+gpuLatencyTimeouts=0, blindInFlight=0, bandCache=5088, peak residency 43,328 in
+every leg. submitToDeliver max 1,577 ms and 525 ms -- still under the 5 s
+cold-band mark timeout.
+
+WHAT THIS DOES NOT SAY. R0 = 128 m still costs far more than the shipped 64 m
+cascade (6.0 s), so Wave F's criterion -- "worse than today's" -- is still not
+met and R0 stays at 64 m. What has changed is that Wave D now demonstrably pays
+for a large part of the difference instead of none of it.
+
+I ALSO RETRACT "BATCHING IS THE HEADLINE FIX", published one commit earlier.
+Batching may still help -- one 32^3 chunk dispatches 48^3 voxels, 3.4x waste --
+but it was not the blocker. The blocker was a queue depth sized in the wrong
+unit, and it cost one line.
