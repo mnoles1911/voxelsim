@@ -1462,11 +1462,12 @@ bool GpuMeshEnabled()
 //
 // So the levels stay AVAILABLE and OFF: -VoxelGpuMeshMaxLevel=4 opts in for
 // measurement, and nothing gets 3.4x slower merely by passing -VoxelGpuMesh.
-// The cap for a future default is 4 rather than 5, because level 5 is UNPROVEN
-// rather than broken -- it passes on [origin] and its [far-negative] dispatch
-// is refused, the fixture having collapsed to 2 coarse bricks of z. Raising it
-// means demonstrating L5 on a fixture with more vertical relief, not editing a
-// number here.
+// The cap for a future default is now 5: level 5 WAS unproven, and no longer is.
+// It passes bit-exact on [origin] and on the [high-relief] fixture found by
+// voxel.GPU.FindBandFixture (2,025 voxels / 202 m of surface spread, against the
+// 768 three coarse bricks of z require). [far-negative] still cannot express it
+// and is reported as SKIP rather than FAIL, because a fixture too thin to hold
+// the level is not the coarse path disagreeing.
 // How many GPU mesh jobs may be outstanding at once, budgeted separately from
 // the CPU worker cap. See the HasDispatchBudget comment in DispatchJobs for why
 // this is a different quantity from JobsInFlightPerCore and not a bigger one.

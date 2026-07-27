@@ -1,0 +1,46 @@
+Level 5: from UNPROVEN to bit-exact, by fixing the FIXTURE and the VERDICT.
+
+D5.2 reported "highest bit-exact level: 4". That was never a statement about the
+coarse path. Both digest fixtures pass L0-L4 and then L5's [far-negative]
+dispatch is REFUSED:
+
+    Mesh chain needs >= 3 bricks per axis (have 8, 8, 2)
+
+At level 5 a coarse cell is 32 level-0 voxels, so a 64-cell region spans 204.8 m
+and that fixture's whole terrain range collapses into 2 coarse bricks of z. The
+one-brick halo then leaves no interior brick to mesh. The fixture ran out of
+VERTICAL RELIEF; the kernel never got to disagree about anything.
+
+TWO SEPARATE FAULTS, and both had to be fixed.
+
+1. NO FIXTURE COULD EXPRESS THE LEVEL. Three coarse bricks of z needs
+   3 * 8 * 32 = 768 level-0 voxels of surface spread inside a 204.8 m window --
+   76.8 m of relief. voxel.GPU.FindBandFixture now searches for the most
+   mountainous such window instead of leaving anyone to guess at alpine-looking
+   coordinates. At seed 20260719: 2,025 voxels (202 m) at voxel (5120, -40960),
+   2.6x what L5 needs. Added as kCoarseExtraRegions -- SEPARATE from kRegions,
+   because adding a third region to the digest loop would change the pinned
+   6e893ab3679a8c81.
+
+2. THE VERDICT CONFLATED "FIXTURE TOO THIN" WITH "LEVEL BROKEN". A refused
+   dispatch counted as a level failure and stopped the sweep, so even after the
+   high-relief fixture passed L5 the summary still said 4. A refusal on
+   geometric grounds is now SKIP, and -- so the cure is not worse than the
+   disease -- a level additionally has to be EXERCISED by at least one fixture
+   to count as passing. A level every fixture skipped would otherwise pass
+   vacuously, which is exactly how the D6 band sweep passed twelve probes over
+   terrain with no caves in it.
+
+RESULT:
+
+  [D5 coarse] PASS — L5 [origin]:      4096 columns, 2420 quads, 4 bricks deep
+  [D5 coarse] SKIP — L5 [far-negative]: fixture cannot express this level
+  [D5 coarse] PASS — L5 [high-relief]: 4096 columns, 2436 quads, 4 bricks deep
+  [D5 coarse] highest bit-exact level: 5 (of 5 requested)
+
+  digest 6e893ab3679a8c81 -- unchanged.
+
+Coarse GPU generation is therefore bit-exact against vxc::coarseColumns +
+makeCoarseBrick at EVERY level the cascade uses, on columns, cells and quads.
+GpuMeshMaxLevel's ceiling moves 4 -> 5; its DEFAULT is still 0 and -VoxelGpuMesh
+is still off.
