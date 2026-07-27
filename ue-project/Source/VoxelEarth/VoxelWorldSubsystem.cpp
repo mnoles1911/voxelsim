@@ -1433,6 +1433,51 @@ bool GpuMeshEnabled()
 	return bEnabled;
 }
 
+// Highest chunk level the fork may take (D5).
+//
+// ZERO BY DEFAULT, AND THAT IS A MEASUREMENT, NOT CAUTION.
+//
+// Correctness is not the limit: voxel.GPU.VerifyCoarse proves levels 0-4
+// bit-exact against vxc::coarseColumns + makeCoarseBrick on columns, cells AND
+// quads, and a coarse run reports failed=0 across 105 log windows with no
+// stranded columns. THROUGHPUT is the limit. Measured at R0 = 128 m, same
+// anchor, same harness:
+//
+//     128 m, CPU producer            58.4 s / 60.4 s to settle
+//     128 m, fork at L0 only         60.4 s          (51,720 -> 9,200 chunks)
+//     128 m, fork at L0-L4          205.4 s, and a second leg never settled
+//
+// 3.4x WORSE, with the fork taking 51,720 chunks spread properly across the
+// levels (L0 9201, L1 10280, L2 10464, L3 10892, L4 10883). It is latency, not
+// error: submit->deliver max went from 90 ms at level 0 to 4,025 ms, and the
+// fork sits at 19-20 in flight against a cap of 256 -- it is waiting, not
+// saturated.
+//
+// The cause is the one the plan named and D4 never built: BATCHING. A region
+// dispatch is a brick-aligned slab with a one-brick halo, so meshing a single
+// 32^3 chunk dispatches 48^3 voxels -- 3.4x waste -- and D3's split readback
+// adds a second round trip per chunk. Against ~24 CPU workers each finishing a
+// chunk in ~1 ms, one queue of ~28 ms round trips loses badly no matter how
+// exact it is.
+//
+// So the levels stay AVAILABLE and OFF: -VoxelGpuMeshMaxLevel=4 opts in for
+// measurement, and nothing gets 3.4x slower merely by passing -VoxelGpuMesh.
+// The cap for a future default is 4 rather than 5, because level 5 is UNPROVEN
+// rather than broken -- it passes on [origin] and its [far-negative] dispatch
+// is refused, the fixture having collapsed to 2 coarse bricks of z. Raising it
+// means demonstrating L5 on a fixture with more vertical relief, not editing a
+// number here.
+int32 GpuMeshMaxLevel()
+{
+	static const int32 MaxLevel = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuMeshMaxLevel="), Value);
+		return FMath::Clamp(Value, 0, 5);
+	}();
+	return MaxLevel;
+}
+
 // Lowest chunk level that generates via the DIRECT COARSE path
 // (MakeCoarseLevelSampler / vxc::GeneratedWorld::makeCoarseBrick) instead of the
 // 8^L mip recursion (MakeLevelSampler). Levels below this keep the mip path;
@@ -2513,6 +2558,12 @@ struct FVoxelWorldImpl
 	// every non-Success outcome still produces a chunk with zero quads, which is
 	// indistinguishable on screen from terrain that is genuinely empty.
 	int64 GpuMeshJobsDispatchedSinceLog = 0;
+	// Per level, because "the fork is running" and "the fork is running where it
+	// matters" are different claims. Wave F measured a level-0-only fork
+	// changing cold fill by nothing, and the reason was that levels 1-5 are ~80%
+	// of resident chunks -- so the split is the number that says whether D5
+	// actually moved the population, not the total.
+	int64 GpuMeshDispatchedByLevel[VoxelCoords::kNumLevels] = {};
 	int64 GpuMeshJobsDeliveredSinceLog = 0;
 	int64 GpuMeshJobsFailedSinceLog = 0;
 	double GpuMeshSubmitToDeliverMsSinceLog = 0.0;
@@ -4096,6 +4147,14 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       GpuMeshJobs.IsValid() ? GpuMeshJobs->NumQueued() : 0,
 		       GpuMeshJobs.IsValid() ? GpuMeshJobs->NumInFlight() : 0,
 		       MeanDeliverMs, GpuMeshSubmitToDeliverMaxMs);
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel GPU mesh fork by level (5s window): L0=%lld L1=%lld L2=%lld L3=%lld "
+		            "L4=%lld L5=%lld (cap L%d)"),
+		       (long long)GpuMeshDispatchedByLevel[0], (long long)GpuMeshDispatchedByLevel[1],
+		       (long long)GpuMeshDispatchedByLevel[2], (long long)GpuMeshDispatchedByLevel[3],
+		       (long long)GpuMeshDispatchedByLevel[4], (long long)GpuMeshDispatchedByLevel[5],
+		       VoxelStreamAdmission::GpuMeshMaxLevel());
+		for (int64& N : GpuMeshDispatchedByLevel) { N = 0; }
 		GpuMeshJobsDispatchedSinceLog = 0;
 		GpuMeshJobsDeliveredSinceLog = 0;
 		GpuMeshJobsFailedSinceLog = 0;
@@ -6030,8 +6089,20 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	}
 
 	FVoxelGpuRegionRequest Req;
+	// The chunk footprint is LEVEL-AGNOSTIC and that is not a coincidence: the
+	// coarse grid is self-similar, so a level-L chunk is still 4x4x4 bricks of
+	// 8 level-L cells with a one-brick halo. SetChunkFootprint's arithmetic is
+	// identical; only the UNITS of the result change, from level-0 voxels to
+	// level-L cells, which is exactly what CoarseLevel tells the kernel.
 	VoxelGpuChunkRegion::SetChunkFootprint(Req, LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z);
 	Req.Seed = Voxels.amplifier().seed();
+
+	// BEFORE FillRasterWindow, WHICH READS IT. At level L the dispatch samples
+	// over a span 2^L wider than its column count, so a window sized with
+	// CoarseLevel still 0 is silently too narrow and the kernel clamps its reads
+	// to the edge -- different terrain, no error. Assigning this afterwards is a
+	// no-op that looks like a fix; it cost the D5 gate a full run.
+	Req.CoarseLevel = LevelKey.Level;
 
 	// Ask for the band (D6), which is what lets the fork take a chunk whose
 	// footprint has not been seen before instead of leaving every cold column to
@@ -6054,9 +6125,17 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	static constexpr uint32 kBandGridEdge = VoxelCoords::ChunkEdgeVoxels + 2;  // 34
 	static_assert(kBandApronOffset + kBandGridEdge <= VoxelGpuChunkRegion::kColumns,
 	              "band window must fit inside the chunk dispatch");
-	Req.BandOriginI = kBandApronOffset;
-	Req.BandOriginJ = kBandApronOffset;
-	Req.BandEdge = kBandGridEdge;
+	// LEVEL 0 ONLY. FootprintBandCache is a level-0 structure -- the cold-band
+	// throttle and both admission skips are keyed on a level-0 footprint -- and
+	// DrainResults only consults a band for level-0 results. Asking a coarse
+	// dispatch for one would reduce over level-L cells and produce a band in the
+	// wrong units, which is worse than not having one.
+	if (LevelKey.Level == 0)
+	{
+		Req.BandOriginI = kBandApronOffset;
+		Req.BandOriginJ = kBandApronOffset;
+		Req.BandEdge = kBandGridEdge;
+	}
 	// The one place the raster-window arithmetic may live -- see
 	// VoxelGpuRegionBuild's header. Undersizing it does not fault; the kernel
 	// clamps to the window edge and silently produces different terrain.
@@ -6550,13 +6629,30 @@ void FVoxelWorldImpl::DispatchJobs()
 		// lines accordingly before trusting this in production.
 		const bool bUseGpuMesh =
 			VoxelStreamAdmission::GpuMeshEnabled()
-			&& LevelKey.Level == 0        // D5 owns coarse levels; worldgen.ush has no level parameter
-			&& RingSkirtMask == 0         // no GPU equivalent yet -- see D5's skirt analysis
+			&& LevelKey.Level <= VoxelStreamAdmission::GpuMeshMaxLevel()
+			// THE SKIRT IS STILL CPU-ONLY, and this condition is what keeps that
+			// safe rather than merely likely. ComputeRingSkirtMask returns 0 for
+			// level 0 and for any coarse chunk that is not on an inward ring
+			// boundary, so the fork takes ring INTERIORS -- the large majority --
+			// and leaves boundary chunks, which need the retaining wall, to the
+			// CPU. A coarse chunk meshed without its skirt would reopen the
+			// cascade seam as see-through edges.
+			//
+			// Why not just implement it: the mask has to be applied at the
+			// mesher's NEIGHBOUR READ keyed on the reading chunk, and as N masks
+			// in a buffer rather than one uniform -- a scalar is unsound the
+			// moment a region batches more than one chunk, because a shared
+			// interior cell is one chunk's interior AND its neighbour's apron.
+			// D4 does not batch yet, so a scalar would be sound today and become
+			// silently wrong the day batching lands. Excluding is honest; a
+			// scalar would be a trap.
+			&& RingSkirtMask == 0
 			&& !bPredictedEmpty;          // the band already says this meshes to nothing; do not pay a dispatch
 
 		if (bUseGpuMesh && SubmitGpuMeshJob(LevelKey, GenId))
 		{
 			++GpuMeshJobsDispatchedSinceLog;
+			++GpuMeshDispatchedByLevel[FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1)];
 			// Deliberately NOT added to InFlightTasks: a GPU job has no
 			// UE::Tasks::TTask. WaitForInFlightTasks covers it separately, and
 			// says why at length.
