@@ -1068,19 +1068,32 @@ public:
 	void UpdateChunkTable_RenderThread(FRHICommandListBase& RHICmdList,
 	                                   const TArray<FVector4f>& NewOrigins,
 	                                   const TArray<FVector4f>& NewParams,
-	                                   const TArray<UVoxelGpuPoolComponent::FChunkRun>& NewRuns)
+	                                   const TArray<UVoxelGpuPoolComponent::FChunkRun>& NewRuns,
+	                                   bool bRunsIncluded)
 	{
 		// Origins and Runs are the cull's two inputs and must not disagree: a run
 		// naming a chunk id the table no longer describes would be culled against
 		// a stale box. They are updated together, from the same game-thread
 		// snapshot, for that reason.
 		Origins = NewOrigins;
-		// Assigned unconditionally. This is only ever called with a fresh
-		// game-thread snapshot of both, so an EMPTY run list means the pool
-		// genuinely holds no live chunks -- the previous "keep the old runs if the
-		// new list is empty" guard turned that state into stale runs pointing at
-		// quads that no longer belong to anyone.
-		Runs = NewRuns;
+		// A FLAG, NOT EMPTINESS, decides whether the runs are being replaced.
+		//
+		// This used to assign unconditionally, with the comment that an empty run
+		// list means the pool genuinely holds no live chunks -- and that reasoning
+		// is still exactly right, which is why "skip the assignment when the array
+		// is empty" is NOT the optimisation here. An earlier version of this code
+		// did that and turned the no-chunks state into stale runs pointing at
+		// quads that no longer belonged to anyone.
+		//
+		// What changed is that the CALLER can now say "the allocation set did not
+		// move, do not rebuild". A table-only update -- which is what parking is,
+		// 44,727 times on a standard leg -- kept paying a full BuildChunkRuns:
+		// 2.94 ms on the game thread to walk ~53,800 allocations and sort ~53,600
+		// runs into the same order they were already in.
+		if (bRunsIncluded)
+		{
+			Runs = NewRuns;
+		}
 
 		// THE ONE WRITER OF THE CULL'S PRECOMPUTED BOUNDS, and it is here rather
 		// than anywhere else because Runs and Origins -- the only two inputs those
@@ -1095,7 +1108,17 @@ public:
 		// Origins have already been taken, the cull will read them on the next
 		// gather, and it must not read them against bounds built from the previous
 		// pair.
-		RebuildRunBounds();
+		//
+		// Skipped when the runs did not change: bounds are derived from Runs and
+		// Origins, and a table-only update moves origins for PARKED chunks, whose
+		// entries carry scale 0. ComputeRunBounds already returns Hidden for those
+		// (Entry.W <= 0), so their bounds are not consulted, and the unparked
+		// entries in the same push are unchanged. If either of those stops being
+		// true, this needs to run again.
+		if (bRunsIncluded)
+		{
+			RebuildRunBounds();
+		}
 
 		if (!OriginBuffer.IsValid() || NewOrigins.Num() > MaxChunks)
 		{
@@ -3046,8 +3069,14 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 	// changes a handful of times a second, the camera moves every frame, and only
 	// the second of those needs re-culling.
 	const double BuildRunsStart = bPushStats ? FPlatformTime::Seconds() : 0.0;
-	TArray<FChunkRun> RunsCopy = bTableDirty ? BuildChunkRuns() : TArray<FChunkRun>();
-	if (bTableDirty)
+	// bRunsDirty, NOT bTableDirty. The comment above always said runs are rebuilt
+	// "whenever the ALLOCATION set changed, not whenever the table did" -- the
+	// code said bTableDirty, which is (bChunkTableDirty || bRunsDirty), so every
+	// table-only push rebuilt them too. Parking is a table-only push and there are
+	// tens of thousands of them per leg.
+	const bool bBuildRuns = bRunsDirty;
+	TArray<FChunkRun> RunsCopy = bBuildRuns ? BuildChunkRuns() : TArray<FChunkRun>();
+	if (bBuildRuns)
 	{
 		++PushStats.RunsBuilt;
 		// The two terms BuildChunkRuns actually costs, kept apart on purpose.
@@ -3066,6 +3095,7 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 	ENQUEUE_RENDER_COMMAND(VoxelGpuPoolIncrementalUpdate)(
 		[Proxy, QuadsSlice = MoveTemp(QuadsSlice), IdsSlice = MoveTemp(IdsSlice),
 		 OriginsCopy = MoveTemp(OriginsCopy), ParamsCopy = MoveTemp(ParamsCopy), RunsCopy = MoveTemp(RunsCopy),
+		 bBuildRuns,
 		 UploadRuns = MoveTemp(UploadRuns), NewNumQuads, bTableDirty,
 		 GpuWrites = MoveTemp(GpuWrites), GpuHides = MoveTemp(GpuHides),
 		 Buffers = GetOrCreatePoolBuffers(),
@@ -3087,7 +3117,7 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 
 		if (bTableDirty)
 		{
-			Proxy->UpdateChunkTable_RenderThread(RHICmdList, OriginsCopy, ParamsCopy, RunsCopy);
+			Proxy->UpdateChunkTable_RenderThread(RHICmdList, OriginsCopy, ParamsCopy, RunsCopy, bBuildRuns);
 		}
 		Proxy->UpdateQuadRange_RenderThread(RHICmdList, QuadsSlice, IdsSlice,
 		                                    UploadRuns, NewNumQuads);
