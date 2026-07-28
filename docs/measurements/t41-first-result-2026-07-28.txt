@@ -298,16 +298,26 @@ unchanged -- AddChunkFromGpu still does the UnmarkQuadsDirty interval subtract
 that guards the free-then-reallocate-within-one-frame race, which is what makes
 widening this scope safe.
 
-RESULT (t41-batchfix vs t41-cost2, mid-flight windows):
+RESULT (mid-flight windows; the fix is replicated on two legs):
 
                        tickMs   % of wall   perTick   dispatch
   speculation OFF       485.0      9.70%      7.133      10.4
   ON, before fix        742.0     14.84%     10.600     343.9
   ON, after fix         469.5      9.39%      7.335      10.0
+  ON, after fix (leg 2) 459.4      9.19%      7.178      10.4
 
-T4-1's game-thread cost is now INSIDE THE NOISE of having it switched off.
-Nothing else moved: chunks/s 1070.3 vs 1070.9, flight holes med 57 vs 56,
-poolPct 86.8 both, allocFail 0, park hit 89% both.
+T4-1's game-thread cost is now INSIDE THE NOISE of having it switched off --
+9.19-9.39% of wall against 9.70% with the feature off. specPark reads 0.9 ms on
+both legs.
+
+Nothing else moved. Both batch-fix legs against the lead-2.0 sweep leg:
+
+  leg              chunks/s  flight holes med (p90)  poolPct  park hit  spec
+  t41s-lead2-1       1070.9        56 (94)             86.8      89%    46%
+  t41-batchfix       1070.3        57 (92)             86.8      89%    46%
+  t41-batchfix-2     1070.4        58 (102)            86.7      89%    46%
+
+allocFail=0 and holes(final)=0 on all three.
 
 PARKING WAS NOT ZEROED. Worth stating explicitly, because task #17 records that
 wrapping RecomputeDesiredSet in an FScopedBatch took parking from 28,117 to
