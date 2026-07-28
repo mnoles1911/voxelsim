@@ -2645,6 +2645,20 @@ struct FVoxelWorldImpl
 	TSet<VoxelCoords::FVoxelLevelChunkKey> SpeculativeInFlight;
 
 	int64 SpecDispatchedSinceLog = 0;
+	// One unconditional sample per frame. ~28 B each; the cap bounds a long
+	// session at ~1.1 MB and a standard leg produces ~16,000.
+	struct FFrameSample
+	{
+		float FrameMs = 0.f;
+		float VoxelTickMs = 0.f;
+		float RenderMs = 0.f;
+		float RenderWaitMs = 0.f;
+		float RHIMs = 0.f;
+		float GameWaitMs = 0.f;
+	};
+	static constexpr int32 kMaxFrameSamples = 40000;
+	TArray<FFrameSample> FrameSamples;
+
 	int64 SpecParkedSinceLog = 0;
 	// Why a DEMAND eviction did not park. Sums with ChunksParkedSinceLog to the
 	// number of evictions that reached ParkChunkGeometry, so a shortfall in the
@@ -4552,6 +4566,45 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// a real hitch in normal play is exactly when this diagnostic is most
 	// wanted, and the cost when there is no hitch is one float compare.
 	const float FrameMs = DeltaTime * 1000.f;
+
+	// --- FRAME ATTRIBUTION (voxel.Stream.FrameAttribution) ------------------
+	//
+	// SAMPLED ON EVERY FRAME, WHICH IS THE ENTIRE POINT. The hitch block below
+	// captures the same per-thread timers, but only above 33.3 ms -- so it can
+	// describe the tail and can say nothing at all about a typical frame. That
+	// asymmetry produced a whole wrong analysis on 2026-07-28 (lesson 17: every
+	// frame-time figure grepped out of the Hitch line was a median of frames
+	// that had ALREADY exceeded the threshold), and then a second wrong one: the
+	// frame tail was attributed to the streaming tick because perTick happened to
+	// match the p50-to-p95 gap, a third of the tick was removed, and p50/p95 did
+	// not move.
+	//
+	// So this collects the unconditional series and the periodic report below
+	// splits it into FAST frames and SLOW frames and prints the per-component
+	// delta. The component that differs most between those two buckets IS the
+	// tail, measured rather than inferred.
+	if (VoxelDebug::GetStreamFrameAttribution() != 0)
+	{
+		const double CyToMs = FPlatformTime::GetSecondsPerCycle() * 1000.0;
+		FFrameSample Sample;
+		Sample.FrameMs      = FrameMs;
+		Sample.VoxelTickMs  = TickMsSoFar;
+		Sample.RenderMs     = float(GRenderThreadTime * CyToMs);
+		Sample.RenderWaitMs = float(GRenderThreadWaitTime * CyToMs);
+		Sample.RHIMs        = float(GRHIThreadTime * CyToMs);
+		Sample.GameWaitMs   = float(GGameThreadWaitTime * CyToMs);
+		// NO DIRECT GPU TIME. It needs FRHIGPUFrameTimeHistory, a pull-based API
+		// with its own state, which is more plumbing than this pass warrants --
+		// and it is not needed to answer the question: a GPU-bound frame shows up
+		// here as the CPU WAITING for it, i.e. renderWait or gameWait rising. If
+		// those dominate the slow-frame delta, the answer is "GPU", and only then
+		// is it worth wiring the real counter to find out which pass.
+		if (FrameSamples.Num() < kMaxFrameSamples)
+		{
+			FrameSamples.Add(Sample);
+		}
+	}
+
 	if (FrameMs > 16.6f) // the actual 60fps gate bar (see TotalFramesOver60FpsBar)
 	{
 		++TotalFramesOver60FpsBar;
@@ -4868,6 +4921,23 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		// voxel.Stream.PoolRecycleHandles on, this is the fix in flight: allocsEver
 		// should stop climbing (steady state reuses freeHandles instead of
 		// appending) once churn saturates the free list.
+		{
+			// GATHER TIMING. The render thread is the frame (13.49 ms of a 13.41 ms
+			// frame, game thread waiting 10 ms of it), so this is the breakdown
+			// that decides what to optimise for frame rate.
+			const UVoxelGpuPoolComponent::FCullTiming CT =
+				UVoxelGpuPoolComponent::GetAndResetCullTiming();
+			if (CT.Gathers > 0)
+			{
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("Voxel cull timing (5s window): gathers=%d | walk=%.1f ms (%.3f ms/gather, "
+				            "%lld runs seen) | emit=%.1f ms (%.3f ms/gather, %d ranges) | walk+emit=%.1f ms"),
+				       CT.Gathers, CT.WalkUs / 1000.0, CT.WalkUs / 1000.0 / double(CT.Gathers),
+				       (long long)CT.RunsSeen,
+				       CT.EmitUs / 1000.0, CT.EmitUs / 1000.0 / double(CT.Gathers), CT.Ranges,
+				       (CT.WalkUs + CT.EmitUs) / 1000.0);
+			}
+		}
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel GPU pool: liveChunks=%d highWater=%u free=%u largestRun=%u freeRuns=%d ")
 		       TEXT("capacityPct=%.1f allocFail=%lld allocFailQuads=%lld allocsEver=%d freeHandles=%d -- ")
@@ -5113,6 +5183,72 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       ChunksParkedTotal > 0
 		           ? 100.0 * double(ChunksAdoptedTotal - SpecAdoptedTotal) / double(ChunksParkedTotal)
 		           : 0.0);
+	}
+
+	// --- FRAME ATTRIBUTION REPORT ------------------------------------------
+	//
+	// Answers two questions the percentile summary cannot:
+	//   1. WHAT IS IN A TYPICAL FRAME -- the ~8.7 ms that a frame costs before
+	//      any terrain geometry is drawn. Fitting p50 against drawn quads across
+	//      the draw-path sweep gives T ~= 8.7 ms + 0.66 ms per million quads, and
+	//      nobody has ever broken that constant down.
+	//   2. WHAT MAKES A SLOW FRAME SLOW. Comparing the mean of each component
+	//      over the FASTEST half against the SLOWEST 5% names the difference
+	//      instead of inferring it. The component with the largest delta is the
+	//      tail.
+	//
+	// Sorted copies, not in-place: FrameSamples must stay in capture order in
+	// case a future reader wants the time series rather than the distribution.
+	if (VoxelDebug::GetStreamFrameAttribution() != 0 && FrameSamples.Num() >= 200)
+	{
+		TArray<float> Frames;
+		Frames.Reserve(FrameSamples.Num());
+		for (const FFrameSample& F : FrameSamples) { Frames.Add(F.FrameMs); }
+		Frames.Sort();
+		const float P50 = Frames[Frames.Num() / 2];
+		const float P95 = Frames[int32(Frames.Num() * 0.95f)];
+
+		// Buckets by FRAME time, then average every component within each --
+		// that is what makes the deltas attributable.
+		struct FAccum
+		{
+			double Tick = 0, Render = 0, RenderWait = 0, RHI = 0, GameWait = 0, Frame = 0;
+			int32 N = 0;
+			void Add(const FFrameSample& F)
+			{
+				Tick += F.VoxelTickMs; Render += F.RenderMs; RenderWait += F.RenderWaitMs;
+				RHI += F.RHIMs; GameWait += F.GameWaitMs; Frame += F.FrameMs; ++N;
+			}
+			double M(double V) const { return N > 0 ? V / double(N) : 0.0; }
+		};
+		FAccum Fast, Slow;
+		for (const FFrameSample& F : FrameSamples)
+		{
+			if (F.FrameMs <= P50) { Fast.Add(F); }
+			else if (F.FrameMs >= P95) { Slow.Add(F); }
+		}
+
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel frame attribution (%d frames): p50=%.2f p95=%.2f | "
+		            "FAST(n=%d) frame=%.2f tick=%.2f render=%.2f renderWait=%.2f rhi=%.2f gameWait=%.2f"),
+		       FrameSamples.Num(), P50, P95, Fast.N, Fast.M(Fast.Frame), Fast.M(Fast.Tick),
+		       Fast.M(Fast.Render), Fast.M(Fast.RenderWait), Fast.M(Fast.RHI), Fast.M(Fast.GameWait));
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel frame attribution SLOW(n=%d) frame=%.2f tick=%.2f render=%.2f renderWait=%.2f "
+		            "rhi=%.2f gameWait=%.2f"),
+		       Slow.N, Slow.M(Slow.Frame), Slow.M(Slow.Tick), Slow.M(Slow.Render),
+		       Slow.M(Slow.RenderWait), Slow.M(Slow.RHI), Slow.M(Slow.GameWait));
+		// The deciding line: which component actually differs. A component whose
+		// delta is a small fraction of the frame delta is NOT the tail, however
+		// large it is in absolute terms -- that mistake has already been made
+		// once here with the streaming tick.
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel frame attribution DELTA (slow-fast): frame=%+.2f | tick=%+.2f render=%+.2f "
+		            "renderWait=%+.2f rhi=%+.2f gameWait=%+.2f"),
+		       Slow.M(Slow.Frame) - Fast.M(Fast.Frame), Slow.M(Slow.Tick) - Fast.M(Fast.Tick),
+		       Slow.M(Slow.Render) - Fast.M(Fast.Render),
+		       Slow.M(Slow.RenderWait) - Fast.M(Fast.RenderWait),
+		       Slow.M(Slow.RHI) - Fast.M(Fast.RHI), Slow.M(Slow.GameWait) - Fast.M(Fast.GameWait));
 	}
 
 	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel admission (5s window): cap=%d cutoffM=%.0f rejected=%lld dropped=%lld"),
@@ -9949,7 +10085,35 @@ void FVoxelWorldImpl::EnumerateSpeculativeCandidates()
 				continue; // no surface band here
 			}
 
-			for (int32 Cz = ChunkZMin; Cz <= ChunkZMax && Queued < QueueBudget; ++Cz)
+			// TRIM THE BAND ENDS (voxel.Stream.SpeculativeZTrim).
+			//
+			// 49% of speculative dispatches return zero quads, and the empties
+			// sit at BOTH ends of the surface band and never in the middle
+			// (measured top=62-73, mid=0, bot=111-129). "Zero quads" covers
+			// all-solid as well as all-air -- a fully buried chunk has no visible
+			// faces -- which is exactly the shape of a band whose ends overshoot
+			// the geometry.
+			//
+			// SAFE TO BE AGGRESSIVE, and that is the whole reason this is a blunt
+			// trim rather than an analytic test. Speculation is OPTIONAL by
+			// construction: a candidate it skips is still loaded by demand through
+			// the normal path, so an over-trim costs HIT RATE and cannot cost a
+			// hole. Contrast the demand-side buried skip, where being wrong means
+			// missing terrain.
+			//
+			// The GPU capture is why this is worth doing at all: meshing is
+			// 3.6-5.1 ms, 21-28% of the GPU frame, so a dispatch that produces
+			// nothing is real GPU on the critical path -- not the "spare capacity
+			// that was idle anyway" it was written off as.
+			const int32 ZTrim = VoxelDebug::GetStreamSpeculativeZTrim();
+			const int32 SpecZMin = ChunkZMin + ZTrim;
+			const int32 SpecZMax = ChunkZMax - ZTrim;
+			if (SpecZMax < SpecZMin)
+			{
+				continue; // trimmed away entirely; demand will handle this column
+			}
+
+			for (int32 Cz = SpecZMin; Cz <= SpecZMax && Queued < QueueBudget; ++Cz)
 			{
 				const FVoxelLevelChunkKey Key{ Level, FVoxelChunkKey{ ColumnKey.X, ColumnKey.Y, Cz } };
 				if (ChunkRecords.Contains(Key) || ParkedGeometry.Contains(Key) || SpeculativeInFlight.Contains(Key))

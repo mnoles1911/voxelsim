@@ -1,0 +1,109 @@
+PREPASS TEST: THE THEORY WAS WRONG, THE DEPTH PREPASS CANNOT BE REMOVED
+2026-07-28
+
+THE THEORY. The GPU capture showed terrain drawn TWICE -- PrePass 5.5-6.2 ms and
+BasePass 5.87-5.97 ms for the identical 17.8M primitives, 62% of an 18.4 ms GPU
+frame -- with the prepass labelled "Forced by Nanite" while the voxel pool is not
+Nanite geometry. That was called out as the cheapest item on the backlog and as
+smelling like a configuration problem rather than an optimisation problem, worth
+~5.6 ms.
+
+IT IS NEITHER CHEAP NOR AVAILABLE.
+
+Four arms, one leg each, 2560x1440, each capturing BOTH the frame distribution
+and a mid-flight ProfileGPU so the pass split and the p50 come from the same run:
+
+  arm                      gpuFrame   PrePass                    BasePass   p50
+  baseline                  17.25 ms  5.918 (Forced by Nanite)    6.053    16.69
+  r.EarlyZPass 0            18.18 ms  5.715 (Forced by Nanite)    5.919    16.96
+  r.Nanite 0                17.25 ms  5.778 (Forced by DBuffer)   5.909    16.83
+  r.Nanite 0 + EarlyZPass 0 17.08 ms  5.708 (Forced by DBuffer)   5.907    15.34
+
+============================================================================
+1. THE PREPASS SURVIVES EVERY ATTEMPT TO REMOVE IT
+============================================================================
+
+- r.EarlyZPass 0 is IGNORED. The pass is still there and still says "Forced by
+  Nanite". The cvar does not win against a subsystem that requires the pass.
+- Turning Nanite off does not free it either -- the forcing simply HANDS OVER TO
+  DBUFFER (decal rendering). The label changes, the pass does not.
+- With both off it is still 5.708 ms.
+
+Two independent subsystems each require a full depth prepass. This is not a
+setting somebody left wrong; it is a structural requirement of the renderer
+configuration this project uses.
+
+============================================================================
+2. THE SECONDARY HYPOTHESIS DIES TOO
+============================================================================
+
+The fallback reasoning was that even if the prepass could not be removed, it
+might not be earning its cost -- i.e. it was not saving enough base-pass overdraw
+to justify 5.6 ms.
+
+BasePass never moved: 6.053 / 5.919 / 5.909 / 5.907 across all four arms, a 2.5%
+spread. Base-pass cost is independent of the prepass configuration here, so there
+is no trade to exploit in either direction.
+
+GPU frame time likewise: 17.25 / 18.18 / 17.25 / 17.08 ms. Nothing on offer.
+
+============================================================================
+3. ONE NUMBER THAT LOOKS LIKE A WIN AND IS NOT BEING CLAIMED
+============================================================================
+
+pp-both reports p50 15.34 ms against the baseline's 16.69. That is not being
+called a result:
+
+  - its p95 is 28.55 ms, and the baseline's is 30.87 -- BOTH far above the ~21 ms
+    these legs normally show, so both arms had unusual tails
+  - gpuFrame moved 17.25 -> 17.08, i.e. not at all
+  - no individual pass moved
+
+A p50 improvement with no pass to attribute it to, on a leg whose p95 is 35%
+above normal, is leg weather. One run is not a result (ground rule 1) and this
+one does not even have a mechanism. If someone wants it, run it twice more.
+
+============================================================================
+4. WHAT THIS MEANS FOR 100 fps
+============================================================================
+
+The largest single item on the 100 fps path is struck. Revised:
+
+  - prepass                STRUCK. Not removable, and not wasteful.
+  - fewer mesh dispatches   ~1-1.5 ms, still good (WorldTick is 3.5-5.1 ms and
+                            roughly half the speculative half of it produces
+                            nothing)
+  - indirect drawing        ~1-2 ms GPU plus ~3.2 ms render thread
+  - occlusion culling       ~2.5-3 ms, and now the largest remaining item
+
+Without the prepass, the realistic floor from the remaining items is roughly
+12-13 ms, i.e. ~80 fps rather than 100. Getting to 10 ms needs the primitive
+count itself to come down -- 17.8M per pass, drawn twice -- which points back at
+the structural question: L3-L5 are 53% of pool quads and sit 512 m to 4 km away
+where voxels are sub-pixel. Rendering distant rings as heightfield rather than
+voxel geometry attacks the number every other item is dividing.
+
+============================================================================
+5. HYPOTHESIS SCORECARD FOR THE DAY
+============================================================================
+
+Five predictions about where frame time goes, all made with a number behind
+them, all wrong:
+
+  1. the streaming tick causes the frame tail        -- removed a third of it,
+                                                        p50/p95 unmoved
+  2. shadow cascades re-gather the pool 4-5x/frame   -- shadowGather=0
+  3. the cull walk costs ~4.4 ms                     -- 0.95 ms, wrong by 4x
+  4. the streaming tick is a passenger               -- true on CPU, false on GPU
+                                                        (meshing is 21-28%)
+  5. the prepass is a removable misconfiguration     -- this document
+
+The common failure is reasoning about where time goes instead of measuring it.
+The instrumentation now exists (voxel.Stream.FrameAttribution,
+voxel.Stream.GPUCullTiming, voxel.DeferExec, tools/voxel-run-gpu-arm.ps1), and
+the rule this earns is: no item goes on the plan with a predicted saving until
+something has measured that saving is there.
+
+CONTAMINATION: all four arms audited clean (tools/voxel-audit-leg-overlap.ps1).
+A second editor session started on the box at 21:33:20 UTC, 33 seconds after the
+last arm ended at 21:32:47 -- these numbers predate it.

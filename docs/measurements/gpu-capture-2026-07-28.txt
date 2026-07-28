@@ -1,0 +1,145 @@
+GPU CAPTURE: WHERE THE 18.4 ms GPU FRAME GOES
+2026-07-28
+
+ProfileGPU taken MID-FLIGHT (frame 9685) at 2560x1440 with T4-1 on, via the new
+voxel.DeferExec so it captures a streamed world rather than frame 1.
+
+  GPU Frame Time: 18.422 ms | 14,291 draws | 35,380,670 primitives |
+                             106,026,798 vertices
+
+  pass                                    ms      % of GPU frame
+  WorldTick (voxel MESHING compute)     5.136          27.9
+    RenderGraphExecute                  4.967          27.0
+  SceneRender - ViewFamilies           13.261          72.0
+    PrePass DDM_AllOpaqueNoVelocity     5.601          30.4   7,131 draws
+                                                              17,689,546 prims
+    BasePass                            5.873          31.9   7,131 draws
+                                                              17,689,546 prims
+    PostProcessing                      1.404           7.6
+      TemporalSuperResolution           1.249           6.8
+
+============================================================================
+1. THE GPU IS THE BOTTLENECK, WHICH CLOSES THE TAIL QUESTION
+============================================================================
+
+18.42 ms of GPU against a ~13.7 ms render thread. The CPU is waiting on the GPU,
+which is exactly what the frame attribution said from the other side: renderWait
+dominates the slow-frame delta (+12.3 / +10.1 ms).
+
+  ⇒ Frame rate is a GPU problem now. Render-thread and game-thread work buy
+    headroom; only GPU work buys fps.
+
+============================================================================
+2. THE POOL ISSUES ~7,131 DRAWS PER PASS, NOT ONE
+============================================================================
+
+ADR-0006 exists to make the pool "ONE primitive, ONE draw call", and the census
+line still says so. The capture says otherwise:
+
+  pool census at capture time : ranges=7,872   drawnQuads=9,422,743
+  GPU PrePass                 : 7,131 draws    17,689,546 primitives
+  GPU BasePass                : 7,131 draws    17,689,546 primitives
+
+17,689,546 primitives is 8.84M quads, against a census drawnQuads of 9.42M --
+the same geometry. And 7,131 draws tracks 7,872 ranges. Each FMeshBatchElement
+becomes its own draw call; the ceil(ranges/64) BATCH split reduces FMeshBatch
+count, not draw count.
+
+ONE PRIMITIVE, YES. ONE DRAW, NO -- roughly one draw PER RANGE, and the whole
+lot is submitted TWICE per frame (depth prepass then base pass), so ~14,262
+draws.
+
+THIS IS A CONSEQUENCE OF TODAY'S OWN DRAW-PATH WIN, and it should be read that
+way rather than as a defect. Raising GPUCullMaxRanges 1024 -> 16384 and dropping
+GPUCullMergeGap 4096 -> 64 took over-draw from 3.4x to 1.001x and p50 from
+30.59 ms to 15.15 ms -- a large, replicated, correctly-measured win. It also took
+ranges from ~1,023 to ~7,872, and therefore draws with it. The sweep measured
+TOTAL frame time and picked the right point; nothing in it is wrong. But the
+trade it made is now visible, and it is what limits further movement along that
+axis: fewer ranges means more over-draw, more ranges means more draws.
+
+  ⇒ Breaking that trade needs INDIRECT drawing: one draw with per-range data in
+    a structured buffer, instead of N mesh-batch elements. That is the same fix
+    already identified for the render-thread emit cost (one uniform buffer per
+    range, ~3.2 ms) -- one change addresses both sides.
+
+============================================================================
+3. VOXEL MESHING IS 5.1 ms OF GPU -- 28% OF THE FRAME
+============================================================================
+
+WorldTick's 5.136 ms is the streaming fork's compute passes: Voxel.ColumnMain,
+VoxelizeMain, BandReduceMain, MeshCountMain, the three Scan passes,
+MeshEmitMain(chunk-local), QuadTotalMain -- repeated per chunk in flight, at
+~0.25 ms each for MeshCount and MeshEmit.
+
+So a THIRD of the GPU frame is generating terrain, not drawing it.
+
+THIS PARTLY REVERSES AN EARLIER CONCLUSION. The frame-attribution write-up called
+the streaming tick "a passenger" on slow frames, because removing a third of the
+CPU tick moved nothing. That remains true of the CPU tick. But the GPU side of
+streaming is 5.1 ms and it IS on the critical path: a frame where more terrain
+arrives has more of these dispatches, a longer GPU frame, and therefore more
+renderWait. The tail is streaming after all -- on the GPU, not the game thread.
+
+  ⇒ Anything that reduces DISPATCH COUNT reduces frame time directly. That
+    revalues the speculation-waste item (P4): ~187 of ~363 speculative dispatches
+    per window return zero quads, and each one costs real GPU here rather than
+    "spare capacity that was idle anyway", which is how it was written up.
+
+============================================================================
+4. TERRAIN IS DRAWN TWICE, AND THE PREPASS IS FORCED
+============================================================================
+
+PrePass is "DDM_AllOpaqueNoVelocity (Forced by Nanite)" at 5.601 ms, and BasePass
+re-draws the identical 17,689,546 primitives at 5.873 ms. Together 11.47 ms --
+62% of the GPU frame -- for one set of geometry.
+
+The prepass earns its keep when it saves more in base-pass overdraw than it
+costs, and that is a measurable question nobody here has asked. It is FORCED BY
+NANITE, and the voxel pool is not Nanite geometry, so it is worth establishing
+whether the project needs Nanite enabled at all -- and if it does, whether the
+pool can opt out of the prepass.
+
+Do not just switch it off and read p50: check base-pass cost moves the way the
+theory says, or the result is unattributable.
+
+============================================================================
+5. "2K" IS UPSCALED, WHICH QUALIFIES AN EARLIER CLAIM
+============================================================================
+
+  TemporalSuperResolution(sg.AntiAliasingQuality=3) 1552x873 -> 2560x1440
+
+The scene renders at 1552x873 and TSR upscales to 2560x1440. So every "at 2K"
+figure in this project's measurements means "internally ~1552x873, upscaled",
+not native 2K.
+
+The earlier finding that resolution is free (30.61 ms at 1600x900 output against
+30.59 ms at 2560x1440 output) is not overturned by this -- screen percentage is
+proportional, so the internal pixel count did rise between those runs -- but it
+was never verified at the internal resolution, and it should be. If someone later
+sets screen percentage to 100, the geometry-bound conclusion may not survive, and
+every 900p sweep in these measurements is built on it.
+
+============================================================================
+6. WHAT THIS MEANS FOR 100 fps (10 ms)
+============================================================================
+
+The GPU frame is 18.4 ms and must reach ~10 ms. Ranked by evidence:
+
+  1. INDIRECT DRAWING for the pool. Collapses ~7,131 draws/pass to ~1 and
+     removes the ~3.2 ms render-thread emit at the same time. Also breaks the
+     ranges-vs-over-draw trade so the cull can be finer for free.
+  2. FEWER MESH DISPATCHES. 5.1 ms of GPU is terrain generation; ~half of the
+     speculative half of it produces nothing. Cheapest first: the analytic empty
+     test (P4), which was deprioritised on the belief that this capacity was
+     idle. It is not.
+  3. SETTLE THE PREPASS QUESTION. 5.6 ms for a depth pass forced by a Nanite
+     setting the pool does not use.
+  4. Occlusion culling. Still the only lever that cuts BOTH passes' primitive
+     counts without touching visual quality -- but now clearly behind the three
+     above, all of which are cheaper.
+
+CAVEAT: this is ONE frame, mid-flight, on one machine. ProfileGPU is a single
+capture, not a distribution -- the percentages are sound for the frame captured
+and should be re-taken at a different pose before anything large is built on
+them.

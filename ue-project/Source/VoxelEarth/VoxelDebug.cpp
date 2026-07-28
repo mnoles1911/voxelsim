@@ -528,9 +528,124 @@ TAutoConsoleVariable<int32> CVarVoxelStreamBatchRecompute(
 	     "configuration that zeroed parking (task #17). Read the park census refusal counters with it on."),
 	ECVF_Default);
 
+// DEFAULT 2.0 SINCE 2026-07-28 (owner decision). T4-1 speculative generation is
+// ON.
+//
+// Measured across a 10-leg alternated sweep at 2560x1440: median flight-phase
+// transient holes ~822 with it off against ~57 with it on -- a 93% reduction --
+// at identical throughput (chunks/s spans 1061.5-1070.9 across every arm
+// INCLUDING the controls), identical pool pressure (86.2% -> 86.8%), and, after
+// the batch scope was widened over GpuMeshJobs->Tick(), identical game-thread
+// tick cost. holes(final)=0 and allocFail=0 on all ten.
+//
+// WHY 2.0 AND NOT MORE. The effect SATURATES at 1 s: 1/2/4/8 s all land inside a
+// single arm's pass-to-pass spread. The plan swept lead precisely because it
+// assumed more lead buys more coverage; it does not, and the binding constraint
+// beyond ~1 s is SpeculativeMaxInFlight rather than how far ahead the cone
+// reaches. So the cheapest setting is also the best one, and anything that
+// scales with lead should be sized for ~2 s rather than 8.
+// Detail: docs/measurements/t41-first-result-2026-07-28.txt
+// Chunks trimmed from EACH END of the speculative surface band. 0 = off.
+// See the call site: the empties cluster at both ends and never the middle, and
+// an over-trim costs hit rate rather than holes because demand still loads
+// anything speculation skips.
+// DEFAULT 1, SET BY THE SWEEP OF 2026-07-28.
+//
+//   trim   dispatched  adopted   dropEmpty (top/mid/bot)   flightHoles med
+//     0      19,724      9,133   183 (64/0/119)                 42
+//     1      18,839     14,765     3 ( 0/3/  0)                 38
+//     2           0          0     0                            46
+//
+// 1 removes 98% of the zero-quad dispatches and raises adopted-per-dispatch from
+// 46% to 78%. 2 switches speculation OFF entirely -- the surface band is only
+// 2-3 chunks tall, so trimming two from each end leaves nothing -- and its
+// flight holes are the worst of the three, which is the control confirming
+// speculation is doing something.
+//
+// WHAT IT DID NOT DO, stated because it was predicted to: frame time did not
+// move (p50 15.47 -> 15.41). Dispatches fell only 4%, because speculation is
+// bounded by SpeculativeMaxInFlight rather than by candidate supply -- the freed
+// budget refilled with USEFUL work instead of disappearing. So this is a
+// productivity change, not a saving. Converting it into GPU time means lowering
+// the in-flight cap now that each dispatch is worth more.
+TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeZTrim(
+	TEXT("voxel.Stream.SpeculativeZTrim"),
+	1,
+	TEXT("Chunks trimmed from each end of the speculative Z band. Cuts zero-quad speculative dispatches, "
+	     "which cost real GPU (meshing is 21-28% of the GPU frame). Cannot cause holes -- demand still "
+	     "loads whatever speculation skips."),
+	ECVF_Default);
+
+// DEFERRED CONSOLE EXEC, because -ExecCmds fires before the world exists.
+//
+// This is the third time that ordering has cost a run. voxel.Stream.PoolClobberTest
+// logs "no live pool component" and exits 0; voxel.Stream.PoolGpuHideProbe did the
+// same until it grew its own settle; and ProfileGPU issued via -ExecCmds captures
+// FRAME 1 -- an empty world -- and reports it as a successful capture. In every
+// case the command ran, produced output, and said nothing about the thing being
+// measured.
+//
+// One general fix rather than a settle timer per command:
+//   voxel.DeferExec <seconds> <command with args>
+static void VoxelDeferExec(const TArray<FString>& Args)
+{
+	if (Args.Num() < 2)
+	{
+		UE_LOG(LogVoxelPerf, Error, TEXT("voxel.DeferExec: usage: voxel.DeferExec <seconds> <command...>"));
+		return;
+	}
+	const float Delay = FMath::Max(0.f, float(FCString::Atof(*Args[0])));
+	TArray<FString> Rest = Args;
+	Rest.RemoveAt(0);
+	const FString Command = FString::Join(Rest, TEXT(" "));
+
+	UE_LOG(LogVoxelPerf, Warning, TEXT("voxel.DeferExec: will run in %.0f s: %s"), Delay, *Command);
+
+	double Elapsed = 0.0;
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		[Delay, Command, Elapsed](float Dt) mutable -> bool
+	{
+		Elapsed += double(Dt);
+		if (Elapsed < double(Delay))
+		{
+			return true;
+		}
+		UE_LOG(LogVoxelPerf, Warning, TEXT("voxel.DeferExec: running now: %s"), *Command);
+		// GEngine->Exec against the first world -- the same route the console
+		// takes, so a deferred command behaves exactly like a typed one.
+		UWorld* World = nullptr;
+		if (GEngine != nullptr)
+		{
+			for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+			{
+				if (Ctx.World() != nullptr) { World = Ctx.World(); break; }
+			}
+			GEngine->Exec(World, *Command);
+		}
+		return false;
+	}), 0.0f);
+}
+
+static FAutoConsoleCommand GVoxelDeferExecCmd(
+	TEXT("voxel.DeferExec"),
+	TEXT("Run a console command after N seconds. For anything that needs a streamed world -- ProfileGPU, "
+	     "stat dumpframe -- because -ExecCmds fires at startup and captures an empty one. "
+	     "Usage: voxel.DeferExec <seconds> <command...>"),
+	FConsoleCommandWithArgsDelegate::CreateStatic(&VoxelDeferExec));
+
+// Per-frame timing capture + the fast-vs-slow attribution report. Off by
+// default: it is a diagnostic, and it holds one 28-byte sample per frame.
+TAutoConsoleVariable<int32> CVarVoxelStreamFrameAttribution(
+	TEXT("voxel.Stream.FrameAttribution"),
+	0,
+	TEXT("1 = sample frame/thread timings EVERY frame and report the fast-vs-slow component breakdown in "
+	     "the 5s census. Unlike the Hitch frame line this can describe a TYPICAL frame, which is what "
+	     "naming the frame-time floor and the tail both require."),
+	ECVF_Default);
+
 TAutoConsoleVariable<float> CVarVoxelStreamVelocityLeadSec(
 	TEXT("voxel.Stream.VelocityLeadSec"),
-	0.0f,
+	2.0f,
 	TEXT("Seconds of travel ahead of the anchor that speculative generation aims at. 0 = off. Applied to a ")
 	TEXT("0.25s-EMA velocity vector and clamped by voxel.Stream.VelocityLeadMaxUU. Feeds speculation ONLY -- ")
 	TEXT("admission, eviction and retention stay on the true anchor by design."),
@@ -569,9 +684,24 @@ TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeMaxParked(
 // sit in the manager's strict-FIFO queue ahead of the next tick's demand jobs.
 // Small depth plus submit-last is what makes starvation structurally impossible
 // rather than merely unlikely.
+// 16 SINCE 2026-07-28, swept with SpeculativeZTrim 1:
+//
+//   cap   dispatched   adopted        p50      flightHoles med
+//    32     18,834     14,948 (79%)  15.31          36
+//    16     17,540     14,979 (85%)  15.34          38
+//     8     10,136      9,501 (94%)  15.23          46
+//
+// 16 is free: identical adopted geometry to 32 for 7% fewer dispatches, because
+// the trim made each dispatch more productive. 8 is too far -- 37% less adopted
+// and holes visibly worse.
+//
+// AND THE FRAME DID NOT MOVE. Cutting dispatches 46% (32 -> 8) moved p50 by
+// 0.08 ms. See the note at CVarVoxelStreamSpeculativeZTrim: reducing GPU MESHING
+// work does not reduce frame time on this renderer, which is why 16 is taken for
+// the free efficiency rather than as a performance fix.
 TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeMaxInFlight(
 	TEXT("voxel.Stream.SpeculativeMaxInFlight"),
-	32,
+	16,
 	TEXT("Max speculative mesh jobs in flight, carved out of voxel.Stream.GpuMeshInFlight (256). Small by ")
 	TEXT("design: the job manager's queue is strict FIFO, so speculative depth delays the NEXT tick's demand ")
 	TEXT("work even though demand is submitted first."),
@@ -991,6 +1121,16 @@ int32 VoxelDebug::GetStreamAdmissionRecordCap()
 int32 VoxelDebug::GetStreamBatchRecompute()
 {
 	return CVarVoxelStreamBatchRecompute.GetValueOnGameThread();
+}
+
+int32 VoxelDebug::GetStreamSpeculativeZTrim()
+{
+	return FMath::Max(0, CVarVoxelStreamSpeculativeZTrim.GetValueOnGameThread());
+}
+
+int32 VoxelDebug::GetStreamFrameAttribution()
+{
+	return CVarVoxelStreamFrameAttribution.GetValueOnGameThread();
 }
 
 float VoxelDebug::GetStreamVelocityLeadSec()

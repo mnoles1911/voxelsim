@@ -1,0 +1,181 @@
+FRAME ATTRIBUTION: WHERE THE 15 ms GOES, AND WHAT MAKES A SLOW FRAME SLOW
+2026-07-28
+
+Two legs, standard flight profile, 2560x1440, T4-1 on (VelocityLeadSec 2.0).
+voxel.Stream.FrameAttribution 1 samples every frame's per-thread timers and the
+5 s census reports the FAST half against the SLOWEST 5%.
+
+  leg      frames   p50     p95
+  attr-1   16,623   15.16   20.94
+  attr-2   16,658   15.19   21.02
+
+                     FAST (n~8,300)        SLOW (n~830)        DELTA
+  frame               13.41 / 13.60        29.90 / 26.90      +16.5 / +13.3
+  voxel tick           0.47 /  0.51         5.61 /  5.92       +5.1 / +5.4
+  render              13.49 / 13.63        20.52 / 20.66       +7.0 / +7.0
+  renderWait           0.54 /  0.39        12.82 / 10.52      +12.3 / +10.1
+  rhi                  2.87 /  2.87         4.42 /  4.23       +1.6 / +1.4
+  gameWait            10.07 / 10.14        13.63 / 12.04       +3.6 / +1.9
+
+============================================================================
+1. THE TYPICAL FRAME IS RENDER-THREAD BOUND, AND THE GAME THREAD IS IDLE
+============================================================================
+
+On a fast frame: render = 13.49 ms against a frame of 13.41 ms, and the GAME
+thread spends 10.07 ms of that WAITING.
+
+So the render thread IS the frame. The game thread -- which is where every
+streaming optimisation of the last two waves landed -- is already idle for 75%
+of the frame and cannot be the constraint. The voxel tick contributes 0.47 ms to
+a typical frame.
+
+THIS RETROSPECTIVELY EXPLAINS THE FALSIFIED RESULT. Incremental pool runs cut
+game-thread publication from 2.94 ms to 0.055 ms and moved neither p50 nor p95.
+Of course it did not: the game thread had 10 ms of slack to absorb it.
+
+  ⇒ Further game-thread work buys HEADROOM (real, and worth having when gameplay
+    systems land) but cannot buy FRAME RATE. Any change aimed at fps has to
+    reduce render-thread work.
+
+============================================================================
+2. THE TAIL IS THE GPU, NOT THE STREAMING TICK
+============================================================================
+
+The largest slow-frame delta by a wide margin is renderWait: +12.28 / +10.13 ms,
+against a frame delta of +16.5 / +13.3. renderWait is the render thread BLOCKED,
+overwhelmingly on the GPU.
+
+The voxel tick does rise on slow frames (+5.1 / +5.4 ms) and that is precisely
+why it looked causal. It is a PASSENGER: a frame where a lot of new terrain
+arrives is a frame with more streaming work AND more GPU work, and only the
+second one is on the critical path. Removing a third of the tick already proved
+this by moving nothing.
+
+  ⇒ The p95 tail is GPU spikes. Attacking it means less GPU work per frame, not
+    less CPU work.
+
+============================================================================
+3. WHAT THE RENDER THREAD IS DOING: 62,657 BOX TESTS, EVERY FRAME
+============================================================================
+
+  VoxelGpuPool cull: gather=16227 runs=62657
+  shadowGather=0 on all 70 census samples
+  ~16,200 gathers over ~15,700 frames = ~1.03 gathers per frame
+
+Two things fall out:
+
+**Shadow cascades are NOT the cause.** shadowGather is zero throughout, and
+there is roughly one gather per frame. The hypothesis that the pool was being
+re-gathered 4-5 times per frame for shadows is dead. (Raised, tested, dropped --
+before anything was built on it.)
+
+**The cull walks the WHOLE pool every frame.** 62,657 runs frustum-tested per
+gather.
+
+  *** THE 4.4 ms ESTIMATE THAT ONCE STOOD HERE WAS WRONG BY 4x. *** It came from
+  multiplying 62,657 by the 45-90 ns per test recorded at Wave G. Measured
+  directly with voxel.Stream.GPUCullTiming the walk is 0.95-1.00 ms per gather,
+  about 17 ns per test -- the Wave G hoist works considerably better than its own
+  comment claims. Section 6 has the real split.
+
+That cost scales with RESIDENT chunks, not with visible ones. Only ~10,300
+survive the frustum; the other ~52,000 are tested and rejected individually,
+every frame.
+
+============================================================================
+4. WHAT THIS MEANS FOR 100 fps
+============================================================================
+
+The earlier two-point fit (T ~= 8.7 ms + 0.66 ms per million drawn quads) is
+consistent with this and now has a mechanism: the constant is render-thread work
+that does not depend on how much geometry survives the cull, and ~4.4 ms of it
+is the cull walk itself.
+
+Ranked by what the evidence supports:
+
+  1. HIERARCHICAL CULL -- stop testing 62,657 boxes individually. Runs are sorted
+     by pool offset and streaming fills the pool in roughly spatial order, so a
+     coarse grouping (every N consecutive runs into one bound) lets one test
+     reject thousands. Worth up to ~4 ms of the ~13 ms render thread, costs no
+     visual quality, and is contained to the cull. This is the single best-
+     supported item now measured.
+  2. LESS GPU WORK -- occlusion culling, and/or drawing distant rings as
+     heightfield rather than voxel geometry. This is what the p95 tail needs
+     (renderWait), and it also cuts the 0.66 ms/million term.
+  3. Everything game-thread. Buys headroom for gameplay, not fps.
+
+============================================================================
+5. CAVEATS
+============================================================================
+
+- No direct GPU timer. GGPUFrameTime needs FRHIGPUFrameTimeHistory, a pull-based
+  API not wired here. renderWait is being read as "blocked on GPU", which is the
+  standard reading but is an inference. If item 2 is taken, wire the real counter
+  first so the before/after is not measured through a proxy.
+- attr-1 recorded max=400.00 ms, which is the harness clamp and therefore
+  censored data (ground rule: treat exactly 400.000 as censored). It does not
+  affect p50/p95 or the bucket means.
+- The 45-90 ns per box test is the figure recorded in the code at Wave G, not
+  something re-measured here. The ~4.4 ms follows from it and should be confirmed
+  with a direct timer before sizing work against it. *(Done -- section 6. It was
+  wrong by 4x, which is why that caveat was written.)*
+
+============================================================================
+6. THE REAL SPLIT, MEASURED (voxel.Stream.GPUCullTiming)
+============================================================================
+
+Same leg, two mid-flight windows:
+
+  gathers=103 | walk=97.4 ms (0.945 ms/gather, 5,521,556 runs seen)
+              | emit=324.6 ms (3.151 ms/gather, 640,181 ranges)
+  gathers=104 | walk=103.6 ms (0.996 ms/gather, 5,884,549 runs seen)
+              | emit=353.5 ms (3.399 ms/gather, 691,806 ranges)
+
+At ~1.03 gathers per frame that is per-frame cost, so the render thread's
+13.72 ms breaks down as:
+
+  ~1.0 ms   cull WALK    62,657 box tests, scales with RESIDENT chunks
+  ~3.2 ms   range EMIT   ~6,215 ranges/gather, each one
+                         CreateUniformBufferImmediate, scales with SURVIVING
+                         ranges
+  ~9.5 ms   NOT THE VOXEL POOL AT ALL
+
+TWO CONCLUSIONS, AND BOTH CHANGE THE PLAN.
+
+**A hierarchical cull is no longer the best item.** It attacks the walk, which is
+~1 ms rather than the 4.4 ms claimed. Still real and still free of visual cost,
+but it is a ~1 ms item and should be ranked as one.
+
+**The emit is the pool's real render-thread cost, at 3.2 ms.** Its shape is one
+single-frame uniform buffer per range -- precisely the cost the kMaxRanges
+comment warned about ("the per-gather count of those scales with this and not
+with the batch count"). The fix is NOT fewer ranges, which trades straight back
+into over-draw, but a cheaper per-range binding: one structured buffer of
+BaseQuad values indexed by the element, instead of ~6,215 individual uniform
+buffers.
+
+NOTE THE INTERACTION THIS CREATES. The draw-path retune took ranges from 1,023 to
+~6,215 to eliminate over-draw, and that was a large net win (p50 30.59 ->
+15.15 ms) -- but it also bought ~2.7 ms of emit cost. The gap/ranges sweep
+measured the TOTAL and found the current point best, so nothing there is wrong.
+If the per-range cost falls, the optimum moves and that sweep should be re-run.
+
+============================================================================
+7. WHAT IS THE OTHER ~9.5 ms?
+============================================================================
+
+STILL UNKNOWN, and now the largest single unexplained block in the frame.
+
+The voxel pool accounts for ~4.2 ms of a 13.7 ms render thread. The rest is
+everything else in the scene: AVoxelClipmapActor (the 30 km heightfield mesh),
+the water subsystem and its own pool, sky, and the base pass and post chain for
+all of it.
+
+Already ruled out: anything PIXEL-proportional. Resolution is free here (2.56x
+the pixels for zero cost), so post-processing, shading and fill cannot be a large
+share of it.
+
+Do not size further work against this number until it is broken down. The obvious
+next step is UE's own render-thread stats or a ProfileGPU capture. Worth stating
+plainly: this block is larger than everything the streaming programme has
+optimised put together.

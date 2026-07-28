@@ -47,7 +47,124 @@ Full detail: `docs/measurements/session-summary-2026-07-28.txt`.
 
 ---
 
-### 0.1 P0 — Find what actually causes the frame tail
+### 0.1 P0 — ANSWERED 2026-07-28: the frame is render-thread bound, the tail is GPU
+
+Measured with `voxel.Stream.FrameAttribution 1` over two legs (~16,600 frames
+each). Full numbers: `docs/measurements/frame-attribution-2026-07-28.txt`.
+
+**A typical frame is the render thread.** render 13.49 ms against a 13.41 ms
+frame, while the GAME thread spends 10.07 ms of it **waiting**. The voxel tick
+contributes 0.47 ms. That retrospectively explains why cutting game-thread
+publication from 2.94 ms to 0.055 ms moved nothing — the game thread had 10 ms
+of slack to absorb it.
+
+⇒ **Game-thread work buys headroom, never frame rate.** Anything aimed at fps
+must reduce render-thread work.
+
+**The tail is GPU.** The largest slow-frame delta is `renderWait` (+12.3 / +10.1
+ms against a frame delta of +16.5 / +13.3) — the render thread blocked.
+
+*The CPU voxel tick rises on slow frames (+5.1 ms) and was called "a passenger"
+here. **The GPU capture partly reversed that:** the CPU tick is indeed a
+passenger, but the GPU side of streaming — `WorldTick`, the meshing compute
+passes — is **3.6–5.1 ms, 21–28% of the GPU frame**, and it IS on the critical
+path. A frame with more terrain arriving has a longer GPU frame and therefore
+more `renderWait`. See `docs/measurements/gpu-capture-2026-07-28.txt`.*
+
+**Shadow cascades are not involved.** `shadowGather=0` throughout and ~1.03
+gathers per frame — the "pool re-gathered 4–5× for shadows" hypothesis is dead.
+
+**The cull walks the whole pool every frame:** 62,657 runs frustum-tested per
+gather, of which only ~10,300 survive — and it scales with *resident* chunks, not
+visible ones. *(An estimate of ~4.4 ms once stood here, derived from the 45–90 ns
+per test recorded at Wave G. Measured, it is ~1.0 ms — see 0.1a. Do not use the
+Wave G figure.)*
+
+### 0.1a NEW P0 — Cheaper per-range binding (the emit, not the walk)
+
+**Measured with `voxel.Stream.GPUCullTiming`.** The render thread's 13.72 ms:
+
+| | per gather (~1/frame) |
+|---|---|
+| cull **walk** — 62,657 box tests | **~1.0 ms** |
+| range **emit** — ~6,215 ranges | **~3.2 ms** |
+| **not the voxel pool at all** | **~9.5 ms** |
+
+**The ~4.4 ms walk estimate was wrong by 4×** — it multiplied 62,657 by the
+45–90 ns/test recorded at Wave G; measured, it is ~17 ns. That hoist works far
+better than its own comment claims.
+
+So **the emit is the pool's real cost**, and its shape is one
+`CreateUniformBufferImmediate` per range — exactly what the `kMaxRanges` comment
+warned about.
+
+**THE OBVIOUS FIX IS ALREADY FALSIFIED — read this before starting.** The
+appealing version is to drop the per-range uniform buffer entirely by putting the
+range's start in `FMeshBatchElement::BaseVertexIndex` and letting the shader
+derive the quad from `SV_VertexID` alone. `VoxelQuadVertexFactory.ush` records
+that this was tried and MEASURED:
+
+> *SV_VertexID does not include the draw's base vertex on D3D12
+> (`RHISupportsAbsoluteVertexID` is Vulkan-only), so a draw that starts at pool
+> quad F still sees VertexId running from 0 … tiling the pool into N exact
+> contiguous ranges drew only the first 1/N of it at N = 2, 8 and 64 while still
+> paying for every quad.*
+
+So every draw genuinely must be told its base explicitly on this RHI. The
+remaining routes, neither cheap:
+
+  - **per-instance vertex stream.** One entry per range holding `BaseQuad`, with
+    each draw's `StartInstanceLocation` selecting its entry. Instance *fetch*
+    honours the start location even though `SV_InstanceID` (like `SV_VertexID`)
+    does not, which is the standard workaround. Needs vertex-factory stream work.
+  - **cached multi-frame uniform buffers.** Keep a persistent ring sized to
+    `kMaxRanges` and `RHIUpdateUniformBuffer` instead of creating ~6,215 per
+    frame. Cheaper per range, but the single-frame lifetime exists precisely so a
+    buffer is not rewritten while an in-flight draw still references it — the ring
+    depth is the correctness argument and must be reasoned about, not guessed.
+
+Either way this is vertex-factory work, not a call-site change, and it should be
+planned as such.
+
+*Interaction to remember:* the draw-path retune took ranges 1,023 → ~6,215 to
+kill over-draw. Large net win (p50 30.59 → 15.15 ms), but it bought ~2.7 ms of
+emit. If the per-range cost falls, the gap/ranges optimum moves and that sweep
+should be re-run.
+
+**Hierarchical cull is demoted** — it attacks the ~1 ms walk, not 4 ms. Real, no
+visual cost, but rank it accordingly.
+
+### 0.1c STRUCK — the depth prepass is not removable
+
+Tested 2026-07-28, four arms: `docs/measurements/prepass-test-2026-07-28.txt`.
+It was flagged as the largest and cheapest item on the 100 fps path. It is
+neither.
+
+`r.EarlyZPass 0` is ignored (still "Forced by Nanite"). `r.Nanite 0` does not
+free it either — the forcing **hands over to DBuffer**. With both off it is still
+5.708 ms. Two independent subsystems require a full depth prepass.
+
+The fallback hypothesis — that the prepass was not earning its cost — dies too:
+BasePass is 5.907–6.053 ms across all four arms, a 2.5% spread, so base-pass cost
+is independent of it. GPU frame 17.25 → 17.08 ms. Nothing on offer.
+
+⇒ **Realistic floor from the remaining items is ~12–13 ms (~80 fps), not 10.**
+Reaching 10 ms needs the primitive count itself down — 17.8M per pass, drawn
+twice — which points back at rendering distant rings as heightfield rather than
+voxel geometry.
+
+### 0.1b NEW P0 — What is the other ~9.5 ms?
+
+The largest single unexplained block in the frame, and **bigger than everything
+the streaming programme has optimised put together.** The voxel pool is only
+~4.2 ms of the 13.7 ms render thread; the rest is `AVoxelClipmapActor` (the 30 km
+heightfield), the water subsystem and its pool, sky, and the base/post chain.
+
+Already ruled out: anything pixel-proportional (resolution is free). Break it
+down with UE's render-thread stats or a ProfileGPU capture **before** sizing any
+work against it.
+
+<details><summary>Superseded framing (kept — this is the hypothesis that was falsified)</summary>
 
 **Open, and the obvious hypothesis is already falsified.**
 
@@ -71,6 +188,8 @@ The cause is unknown. The next attempt must find it rather than assume:
 **Worth:** the difference between "60 fps median" and "60 fps floor", which is
 the difference between the stated goal being met and not.
 
+</details>
+
 ---
 
 ### 0.2 P1 — Occlusion culling
@@ -79,7 +198,9 @@ the difference between the stated goal being met and not.
 visual quality.**
 
 The cull is frustum-only. It already rejects 68% of chunks (41,946 of 62,119),
-but at ~7.8 triangles per pixel at 2K most survivors are behind something.
+but most survivors are behind something: the GPU capture shows 17.8M primitives
+submitted per pass, TWICE per frame, into an internal render target of 1552x873
+(TSR upscales to 2560x1440) — roughly 11 triangles per rendered pixel.
 Terrain occludes itself heavily — a ground-level camera sees a few hundred metres
 of surface and nothing past the first ridge.
 
@@ -134,9 +255,10 @@ Prerequisites and hazards:
   and a converged `CoverageVerify`, and add a debug mode that draws what
   occlusion rejected — the sibling of `GPUCullDebugAllVisible`.
 
-**Worth:** unmeasured, but the ceiling is high. If half the in-frustum geometry
-is occluded, drawn quads roughly halve, and the draw path responds to geometry
-volume at ~0.4 ms per million quads.
+**Worth:** unmeasured, but with the prepass struck (0.1c) this is now the
+LARGEST remaining item — and uniquely, it cuts BOTH passes, since PrePass and
+BasePass each submit the same 17.8M primitives. If half the in-frustum geometry
+is occluded, both passes shrink together.
 
 ---
 
@@ -183,6 +305,24 @@ correct. (Proposed and withdrawn 2026-07-28.)
 
 ### 0.5 P4 — Speculation refinements (small)
 
+- **DONE 2026-07-28 — `SpeculativeZTrim 1` and `SpeculativeMaxInFlight 16`.**
+  Trimming one chunk from each end of the speculative band removes 98% of the
+  zero-quad dispatches (183 → 3 per window) and lifts adopted-per-dispatch from
+  46% to 85%. Both shipped as defaults.
+
+  **But it bought no frame time, and that is the important part.** Cutting
+  dispatches by 46% moved p50 by 0.08 ms. **Reducing GPU meshing work does not
+  reduce frame time on this renderer** — the meshing compute evidently overlaps
+  with rendering rather than sitting on the critical path, so removing it lets
+  the GPU idle rather than shortening the frame.
+
+  ⇒ This strikes "fewer mesh dispatches" from the 100 fps path, and it puts a
+  question mark over **how much of the 18.4 ms GPU frame is serial at all**.
+  Anything aimed at 100 fps has to establish that first, because the same
+  overlap argument may apply to other GPU items on the list.
+
+<details><summary>Original framing (kept — the reasoning that led here)</summary>
+
 - **~187 speculative dispatches per window still return zero quads.**
   `dropOvertaken=0` and `dropPoolFull=0`, so it is all zero-quad results — and
   "zero quads" covers all-**solid** as well as all-air, which is why they cluster
@@ -192,10 +332,19 @@ correct. (Proposed and withdrawn 2026-07-28.)
   `SpeculativeMaxInFlight` rather than by candidate supply. Further reduction
   needs an **analytic** empty test at enumeration time. Bounded cost if never
   done: an air or buried chunk parks nothing, holds no pool range, evicts nothing.
-- **`voxel.Stream.VelocityLeadSec` still defaults to 0.** T4-1 is confirmed (93%
+</details>
+
+- ~~**`voxel.Stream.VelocityLeadSec` still defaults to 0.**~~ **DONE** — default
+  is now 2.0; T4-1 is on.
+
+  <details><summary>original</summary>
+
+  **`voxel.Stream.VelocityLeadSec` still defaults to 0.** T4-1 is confirmed (93%
   fewer flight-phase holes, no throughput/memory/game-thread cost) but ships off
   pending an owner call. Recommended default **2.0** — the effect saturates at
   1 s, so the cheapest setting is also the best.
+
+  </details>
 
 ---
 
