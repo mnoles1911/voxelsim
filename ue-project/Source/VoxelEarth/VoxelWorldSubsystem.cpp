@@ -2610,6 +2610,22 @@ struct FVoxelWorldImpl
 	};
 	TMap<VoxelCoords::FVoxelLevelChunkKey, FParkedGeometry> ParkedGeometry;
 
+	// Insertion order, for O(1) oldest-first eviction.
+	//
+	// THE FIRST VERSION SCANNED THE WHOLE MAP FOR THE OLDEST ENTRY ON EVERY PARK,
+	// and the comment justifying it -- "linear is fine, the overshoot is one
+	// entry in the steady state" -- was true about how MANY entries get evicted
+	// and silently wrong about what it costs to FIND each one. At 58,676 parks
+	// against a 12,000-entry cap that is ~700 million comparisons per leg, and it
+	// was roughly half of parking's remaining cost after the publication fix.
+	//
+	// ParkedAtSeconds is ElapsedSeconds, which only increases, so insertion order
+	// IS age order and a queue is exact rather than approximate. Entries adopted
+	// out of the map leave stale keys behind here; the evictor skips any key the
+	// map no longer holds, which is why this is a plain array and not a second
+	// source of truth.
+	TArray<VoxelCoords::FVoxelLevelChunkKey> ParkedInsertionOrder;
+
 	// Park bookkeeping for the 5 s line and the eviction policy.
 	int64 ChunksParkedSinceLog = 0;
 	int64 ChunksAdoptedSinceLog = 0;
@@ -9466,6 +9482,7 @@ bool FVoxelWorldImpl::ParkChunkGeometry(const VoxelCoords::FVoxelLevelChunkKey& 
 
 	Pool->ParkChunk(Rec.PoolSlot);
 	ParkedGeometry.Add(Key, Parked);
+	ParkedInsertionOrder.Add(Key);
 	++ChunksParkedSinceLog;
 	++ChunksParkedTotal;
 
@@ -9500,28 +9517,31 @@ void FVoxelWorldImpl::EvictParkedOverCap(int32 Cap)
 	{
 		return;
 	}
-	// Oldest first. Linear rather than a heap: this runs only when the cap is
-	// already exceeded, and the overshoot is one entry in the steady state
-	// because ParkChunkGeometry calls it on every park.
-	while (ParkedGeometry.Num() > Cap)
+	// Oldest first, from the front of the insertion queue. See
+	// ParkedInsertionOrder for why this is not a scan.
+	int32 Front = 0;
+	while (ParkedGeometry.Num() > Cap && Front < ParkedInsertionOrder.Num())
 	{
-		const VoxelCoords::FVoxelLevelChunkKey* OldestKey = nullptr;
-		float OldestAt = TNumericLimits<float>::Max();
-		for (const auto& Pair : ParkedGeometry)
+		const VoxelCoords::FVoxelLevelChunkKey Key = ParkedInsertionOrder[Front++];
+		// Adopted (or edit-evicted) out from under us -- its queue slot is stale.
+		if (!ParkedGeometry.Contains(Key))
 		{
-			if (Pair.Value.ParkedAtSeconds < OldestAt)
-			{
-				OldestAt = Pair.Value.ParkedAtSeconds;
-				OldestKey = &Pair.Key;
-			}
+			continue;
 		}
-		if (!OldestKey)
-		{
-			break;
-		}
-		const VoxelCoords::FVoxelLevelChunkKey Key = *OldestKey; // copy before the erase
 		EvictParkedKey(Key);
 		++ParkEvictedCapSinceLog;
+	}
+	// Drop the consumed prefix in one move rather than RemoveAt-ing per entry.
+	if (Front > 0)
+	{
+		ParkedInsertionOrder.RemoveAt(0, Front, EAllowShrinking::No);
+	}
+	// The queue accumulates stale keys for entries adopted out of the map. Compact
+	// when they dominate, so it cannot grow without bound on a long session.
+	if (ParkedInsertionOrder.Num() > 4 * FMath::Max(1, ParkedGeometry.Num()))
+	{
+		ParkedInsertionOrder.RemoveAll(
+			[this](const VoxelCoords::FVoxelLevelChunkKey& K) { return !ParkedGeometry.Contains(K); });
 	}
 }
 

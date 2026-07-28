@@ -450,6 +450,29 @@ public:
 	// depend on a scene component the eviction path does not have.
 	void ParkChunk(int32 Handle);
 	void UnparkChunk(int32 Handle, const FVector3f& OriginUU, int32 Level);
+
+	// Mark the chunk table dirty and record that a flush is OWED, without
+	// forcing one. Park/unpark use this instead of PushUpdatesToProxy.
+	//
+	// THIS IS THE DIFFERENCE BETWEEN PARKING PAYING AND COSTING. Measured with
+	// park/unpark publishing eagerly: on the circle profile 89% of parked
+	// geometry was adopted and throughput still fell 33%, because every adopt
+	// traded one meshing round trip for one FULL POOL PUBLICATION -- 41,726
+	// adopts, 41,726 publications. After S1-1 the publication IS the expensive
+	// thing, so a cache that publishes once per hit cannot win
+	// (docs/measurements/s1-close-2026-07-27.txt).
+	//
+	// Why not wrap the caller in an FScopedBatch instead: tried, and it took
+	// parking from 28,117 parks at 84% hit to ZERO parks with throughput halved.
+	// Confirmed as cause rather than variance, and NOT diagnosed. This is the
+	// smaller change -- it needs no scope around anything, and the adopt path is
+	// inside RecomputeDesiredSet where no scope exists.
+	//
+	// Safe because the table entry is the whole payload: no quads move, no run
+	// changes. Worst case is one frame of a chunk staying visible after park, or
+	// staying hidden after adopt. The streaming tick's own FScopedBatch closes
+	// every tick and flushes anything owed, so nothing can sit indefinitely.
+	void MarkChunkTableDirtyDeferred();
 	// Parked chunks are still live allocations; this is how many of GetNumChunks()
 	// are currently hidden.
 	int32 GetNumParkedChunks() const { return NumParkedChunks; }

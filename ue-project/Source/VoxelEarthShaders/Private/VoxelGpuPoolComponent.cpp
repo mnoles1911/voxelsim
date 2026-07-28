@@ -2443,6 +2443,16 @@ void UVoxelGpuPoolComponent::MarkQuadsDirty(uint32 First, uint32 Count)
 	}
 }
 
+// S2-3. See the declaration for why park/unpark defer rather than publish.
+void UVoxelGpuPoolComponent::MarkChunkTableDirtyDeferred()
+{
+	bChunkTableDirty = true;
+	// Record the debt even when no scope is open. PushUpdatesToProxy only sets
+	// this while batching; without it a table change made outside a scope would
+	// wait for some unrelated mutation to notice.
+	bFlushPending = true;
+}
+
 // S2-3. Park: hide the chunk, keep everything else. See the declaration.
 void UVoxelGpuPoolComponent::ParkChunk(int32 Handle)
 {
@@ -2471,8 +2481,10 @@ void UVoxelGpuPoolComponent::ParkChunk(int32 Handle)
 	++NumParkedChunks;
 	// Table only. The run still describes the same quads at the same offset, so
 	// bRunsDirty stays where it is -- see the declaration.
-	bChunkTableDirty = true;
-	PushUpdatesToProxy();
+	//
+	// DEFERRED, NOT PUBLISHED. See MarkChunkTableDirtyDeferred: publishing per
+	// park/adopt is what made an 89%-effective cache 33% slower.
+	MarkChunkTableDirtyDeferred();
 }
 
 void UVoxelGpuPoolComponent::UnparkChunk(int32 Handle, const FVector3f& OriginUU, int32 Level)
@@ -2498,8 +2510,7 @@ void UVoxelGpuPoolComponent::UnparkChunk(int32 Handle, const FVector3f& OriginUU
 	Entry = FVector4f(OriginUU.X, OriginUU.Y, OriginUU.Z, Scale);
 	// ChunkParams is deliberately untouched -- ParkChunk never cleared it.
 	NumParkedChunks = FMath::Max(0, NumParkedChunks - 1);
-	bChunkTableDirty = true;
-	PushUpdatesToProxy();
+	MarkChunkTableDirtyDeferred();
 
 	// The pool's bounds may have been shrunk past this chunk while it was parked
 	// -- LocalBounds only ever grows, so this is cheap insurance rather than a
