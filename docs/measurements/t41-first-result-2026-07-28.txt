@@ -1,9 +1,46 @@
 T4-1 SPECULATIVE GENERATION -- FIRST WORKING RESULT
 2026-07-28
 
-STATUS: one leg per arm. NOT a conclusion yet (ground rule 1). The confirming
-sweep -- SpeculativeLeadSec 0/1/2/4/8, two passes, alternated -- is running via
-tools/voxel-t41-lead-sweep.ps1 and this file will be updated with it.
+STATUS: CONFIRMED. The 10-leg alternated sweep (lead 0/1/2/4/8, two passes, via
+tools/voxel-t41-lead-sweep.ps1) is complete and replicates the first pair
+closely. Full table in section 0 below; sections 1-7 are the original single-pair
+analysis and their numbers are the probe leg's.
+
+============================================================================
+0. THE SWEEP: 10 LEGS, ALTERNATED, lead 0/1/2/4/8 x2
+============================================================================
+
+  lead   chunks/s          flight holes med (p90)      poolPct   park hit
+  0.0    1065.0 / 1064.5   838 (2310) / 807 (2372)       86.2       78%
+  1.0    1062.6 / 1069.5    64 (126)  /  63 (100)        86.7       89%
+  2.0    1070.9 / 1069.4    56 (94)   /  52 (100)        86.8       89%
+  4.0    1069.4 / 1069.6    54 (98)   /  62 (108)        86.8       89%
+  8.0    1068.9 / 1061.5    56 (113)  /  54 (104)        86.9       89%
+
+holes(final)=0, allocFail=0 on all ten. chunks/s spans 1061.5-1070.9 across
+every arm including the controls -- a 0.9% total spread, i.e. speculation has
+NO measurable throughput cost and no measurable throughput benefit.
+
+Median flight holes: ~822 off, ~57 on. A 93% reduction, replicated on both
+passes at every lead value.
+
+THE LEAD TIME IS NOT A TUNING KNOB. 1 s already captures the entire effect and
+8 s is no better; the differences between 1, 2, 4 and 8 are inside the pass-to-
+pass spread of a single arm. This was not the expected shape -- the plan sweeps
+lead precisely because it assumed more lead would buy more coverage -- and it
+matters practically, because the cheapest setting is also the best one. Anything
+that scales with lead (candidates enumerated, in-flight population, parked
+residency) should be sized for ~1-2 s, not for 8.
+
+Why it saturates, most likely: the speculative queue is bounded by
+SpeculativeMaxInFlight*4 and the in-flight population by SpeculativeMaxInFlight
+(32), so beyond a second of lead the binding constraint stops being how far
+ahead the cone reaches and becomes how much work is allowed outstanding. That is
+a hypothesis; the sweep does not test it.
+
+Recommended default if the feature is switched on: voxel.Stream.VelocityLeadSec
+2.0. Not 1.0 (the p90 is slightly worse and it sits at the edge of where the
+effect appears), not 4.0+ (no benefit, strictly more work in flight).
 
 Binary: S1 + S2 shipped stack. voxel.Stream.PoolBatchPublish 1,
 PoolRecycleHandles 1, MaxUnloadsPerFrame 256, MaxAppliesPerFrame 192,

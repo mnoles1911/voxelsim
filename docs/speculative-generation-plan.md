@@ -1,8 +1,7 @@
 # Speculative generation (T4-1): the re-sequenced path, and why this order
 
 **Status:** written 2026-07-27. **S0 CLOSED**, **S1 CLOSED**, **S2 SHIPPED**,
-**S3 SHIPPED**, **S4 (T4-1) WORKING — first result 2026-07-28, confirming sweep
-running.** Data: `docs/measurements/s0-apply-census-2026-07-27.txt`,
+**S3 SHIPPED**, **S4 (T4-1) WORKING AND CONFIRMED — 10-leg sweep, 2026-07-28.** Data: `docs/measurements/s0-apply-census-2026-07-27.txt`,
 `docs/measurements/s1-close-2026-07-27.txt`,
 `docs/measurements/t41-first-result-2026-07-28.txt`.
 
@@ -12,10 +11,16 @@ running.** Data: `docs/measurements/s0-apply-census-2026-07-27.txt`,
     S4 T4-1 (lead 4.0s)                       1,069.5                0
 
 **T4-1's result is not in that table, and that is the point.** Throughput is
-unchanged (+1.2%, inside variance). What moved is the metric the table does not
-carry — **transient holes during the flight: median 840 → 64, p90 2164 → 114, a
-92% reduction**, against Wave S4's stated close criterion of "toward the CPU
-arm's 55."
+unchanged — chunks/s spans 1061.5–1070.9 across all ten sweep legs *including
+the controls*, a 0.9% total spread. What moved is the metric the table does not
+carry — **median transient holes during the flight: ~822 → ~57, a 93%
+reduction**, replicated on both passes at every lead value, against Wave S4's
+close criterion of "toward the CPU arm's 55."
+
+**The lead time is not a tuning knob.** 1 s captures the entire effect; 8 s is no
+better. The plan sweeps lead because it assumed more lead buys more coverage —
+it does not, and the cheapest setting is the best one. Size anything that scales
+with lead for ~2 s. Recommended default if switched on: `VelocityLeadSec 2.0`.
 
 Mechanism, from the fork census: GPU in-flight **19 → 63** (the idle capacity
 this whole re-sequencing was aimed at), demand queue depth **234 → 188** because
