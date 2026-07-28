@@ -504,6 +504,26 @@ void AVoxelEarthFlyPawn::Tick(float DeltaTime)
 
 	if (ProxyBody)
 	{
+		// KEEP THE BODY UPRIGHT. This pawn pitches its ROOT with the controller
+		// (bUseControllerRotationPitch, set in the constructor) because fly mode
+		// steers along GetActorForwardVector and the third-person boom needs the
+		// pitched view basis. The proxy body is attached to that same root, so
+		// without this it pitched too: looking down tipped the character forward
+		// and a full -90 degrees laid it flat on its face. First person hides the
+		// body, which is why this survived unnoticed -- it is only ever visible
+		// in third person.
+		//
+		// Yaw-only in WORLD space, so the body turns with you (which is correct
+		// and expected) and nothing else. This also fixes the crouch squash,
+		// which is applied along the component's local Z and was therefore
+		// leaning with the pitch instead of compressing straight down.
+		//
+		// Not fixed by dropping the root pitch instead: fly mode genuinely needs
+		// the actor to pitch, and walk mode already re-derives its own yaw-only
+		// basis in the mover, so the root's pitch is load-bearing for exactly one
+		// consumer and wrong for exactly one other.
+		ProxyBody->SetWorldRotation(FRotator(0.0, GetActorRotation().Yaw, 0.0));
+
 		const double HorizSpeedUU = bWalkMode && WalkMovement ? WalkMovement->GetHorizontalSpeedUU() : GetVelocity().Size();
 		const float GaitPhase = WalkMovement ? WalkMovement->GetGaitPhase() : 0.f;
 		const float CrouchAlpha = IsCrouched() ? 1.f : 0.f;

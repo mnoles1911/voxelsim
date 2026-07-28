@@ -46,12 +46,22 @@ namespace VoxelMovementTuning
 
 	// --- Eye height ---------------------------------------------------------
 	//
-	// Offsets from the box CENTER, not the feet. Standing: 90 + 70 = 1.6 m eye
-	// height. Crouched: 60 + 40 = 1.0 m. Both sit 20 UU below the box top, so
-	// the view never pokes through a ceiling the box is cleared against.
-
-	inline constexpr double StandEyeOffsetUU = 70.0;   // 1.6 m above the feet
-	inline constexpr double CrouchEyeOffsetUU = 40.0;  // 1.0 m above the feet
+	// Offsets from the box CENTER, not the feet. Standing: 90 + 77 = 1.67 m eye
+	// height. Crouched: 60 + 51 = 1.11 m.
+	//
+	// RAISED from 70/40 (1.60 / 1.00 m) on 2026-07-28. 1.60 m was ~7 cm below
+	// anthropometric eye height for a 1.80 m person (~1.67 m), and measured
+	// against the proxy body it was worse than that sounds: the head mesh spans
+	// 1.52-1.80 m, so the view was coming from 29% up the head -- roughly jaw
+	// level on the body you can see in third person. 1.67 m lands at 54% up the
+	// head, where eyes actually sit. The crouched value keeps the same
+	// eye-height-to-stature ratio (0.928) rather than being picked separately.
+	//
+	// Both still sit below the box top (13 UU standing, 9 UU crouched), which is
+	// the property that matters: any ceiling the box clears, the view clears
+	// too, so the camera can never poke through geometry the collision passed.
+	inline constexpr double StandEyeOffsetUU = 77.0;   // 1.67 m above the feet
+	inline constexpr double CrouchEyeOffsetUU = 51.0;  // 1.11 m above the feet
 
 	// --- Speed dial (8 tiers, mouse wheel) ----------------------------------
 	//
