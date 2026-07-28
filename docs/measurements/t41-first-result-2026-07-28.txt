@@ -1,0 +1,164 @@
+T4-1 SPECULATIVE GENERATION -- FIRST WORKING RESULT
+2026-07-28
+
+STATUS: one leg per arm. NOT a conclusion yet (ground rule 1). The confirming
+sweep -- SpeculativeLeadSec 0/1/2/4/8, two passes, alternated -- is running via
+tools/voxel-t41-lead-sweep.ps1 and this file will be updated with it.
+
+Binary: S1 + S2 shipped stack. voxel.Stream.PoolBatchPublish 1,
+PoolRecycleHandles 1, MaxUnloadsPerFrame 256, MaxAppliesPerFrame 192,
+PoolParkMax 12000, pool 64M quads / table 81,920.
+Legs: -VoxelSpawnAt=-84480,53760 -VoxelPerfFlight=line, 90/120/60, 2s windows.
+  t41-ctrl-1  VelocityLeadSec 0.0  (speculation off)
+  t41-probe   VelocityLeadSec 4.0
+
+============================================================================
+1. THE HEADLINE: FLIGHT-PHASE HOLES FELL 92%
+============================================================================
+
+Transient holes during the 120s flight (windows 46-105, n=60 each):
+
+  arm            median   p90    max   mean
+  lead 0.0 (off)    840  2164   2548    934
+  lead 4.0           64   114    189     67
+
+Wave S4's stated close criterion was "flight-phase transient holes on the GPU
+arm fall from the 854-907 median toward the CPU arm's 55." The measured median
+is 64. That is the criterion met, on the first working leg.
+
+THIS IS THE DELIVERABLE, AND IT IS NOT A THROUGHPUT NUMBER. See section 3.
+
+============================================================================
+2. THROUGHPUT IS A WASH -- AND THAT IS THE EXPECTED RESULT, NOT A MISS
+============================================================================
+
+  arm         chunks/s   holes(final)  allocFail  poolPct  park hit
+  lead 0.0      1057.0             0          0     86.2       78%
+  lead 4.0      1069.5             0          0     86.8       89%
+
++1.2% chunks/s is inside leg-to-leg variance and should be read as "no change".
+
+An earlier version of this programme would have called that a null result. It
+is not. Speculation does not make the pipeline faster -- it makes the terrain
+ARRIVE BEFORE IT IS NEEDED, which is a latency property that chunks/s cannot
+express. A metric that only counts throughput scores a 92% reduction in visible
+holes as a tie. (Same failure family as the four denominator errors in
+docs/lessons-2026-07-27-s0-s1.md: the number was right and the question was
+wrong.)
+
+holes(final) is 0 on BOTH arms, so it cannot decide this either -- the 60s
+linger fills everything in regardless. tools/voxel-leg-summary.ps1 now reports
+the flight-phase distribution as its own column for exactly this reason.
+
+============================================================================
+3. THE MECHANISM, FROM THE FORK CENSUS (mid-flight window, both legs)
+============================================================================
+
+  arm       dispatched delivered pending queued gpuInFlight submitToDeliver
+  lead 0.0         270       269     253    234          19       1863.9 ms
+  lead 4.0         257       449     251    188          63       1110.5 ms
+
+Three things, in the order they cause each other:
+
+  a. gpuInFlight 19 -> 63. The GPU is doing work it was previously idle for.
+     This is what the whole wave was for and it is the first leg on which it
+     actually happened.
+
+  b. The demand queue SHRANK, 234 -> 188. Speculation satisfies chunks before
+     admission asks for them, so fewer demand jobs are ever queued.
+
+  c. Demand latency HALVED, 1863.9 ms -> 1110.5 ms submit-to-deliver. This
+     falls out of (b): a shorter queue is a shorter wait. It is a demand-path
+     improvement produced by adding non-demand work, which is counterintuitive
+     enough to be worth stating plainly.
+
+Delivered per window 269 -> 449 (+67%) while dispatched stayed flat, because
+"delivered" now includes speculative results.
+
+============================================================================
+4. COST: ESSENTIALLY NONE, AND CAPACITY STEP 2 IS NOT JUSTIFIED
+============================================================================
+
+poolPct 86.2 -> 86.8. Peak SPECULATIVE parked population was 172 against a
+SpeculativeMaxParked of 4000 -- the cap is nowhere near binding, because parked
+speculative chunks are adopted almost as fast as they arrive (~86 parked and
+~88 adopted per 5s window, in equilibrium). evictedUnused was 0 for the entire
+leg: not one speculative chunk was meshed, parked, and then thrown away.
+
+CONSEQUENCE FOR THE OWNER'S 104M DECISION. The plan's capacity step 2 (64M ->
+104M quads, table 81,920 -> 131,072) was sized on the assumption that
+speculation would hold a large parked population. It holds ~172 chunks. NOTHING
+MEASURED SO FAR JUSTIFIES THE SECOND CAPACITY STEP. It should not be taken on
+this evidence.
+
+What IS worth watching: poolPct is 86.2% with speculation OFF. That is the S2-3
+abort threshold (~90%) getting close on its own, and it is a pre-existing
+condition of the shipped parking cap, not something T4-1 caused. Flagged, not
+fixed here.
+
+============================================================================
+5. THE HONEST DENOMINATOR: 46%, NOT 96%
+============================================================================
+
+The in-log "hit %" is adopted/parked and read 96%. Against DISPATCHED it is
+4,678 / 10,093 = 46%. Both are true and they answer different questions:
+
+  96% -- of the speculative chunks we kept, almost all got used. The velocity
+         cone is aimed correctly. This is the number Wave S4 called specHitRate
+         and set a >50% bar for.
+  46% -- of the GPU work speculation SPENT, this much reached the screen. This
+         is the cost number, and it is the one to improve.
+
+Roughly half of speculative dispatches never became a park. Three silent early
+returns in ParkSpeculativeResult could each account for it (all-air column,
+demand overtook the job in flight, pool refused). They were uncounted, so the
+split was unknown; drop-reason counters (dropOvertaken / dropEmpty /
+dropPoolFull) are now in the 5s speculation line and the sweep will attribute
+it.
+
+The suspected dominant cause is "demand overtook it": nothing consults
+SpeculativeInFlight in AddCandidate, so if admission reaches a key whose
+speculative job is still in flight, demand queues a SECOND job for the same
+chunk and the GPU meshes it twice. If the counters confirm this, the fix is to
+route the speculative result to ApplyMeshResult on arrival instead of dropping
+it -- turning the largest waste bucket into delivered work. NOT BUILT YET: the
+measurement comes first.
+
+============================================================================
+6. CORRECTION TO AN EARLIER READING IN THIS SESSION
+============================================================================
+
+The first read of this leg reported "inFlight 155 -- the GPU is now running 155
+concurrent jobs." That was wrong. It read the speculation census's inFlight
+field, which is SpeculativeInFlight.Num() -- the enumerated-but-unresolved set,
+including ~125 keys still queued and never dispatched. True speculative
+outstanding is capped at 32 and the GPU's real concurrency is the fork census's
+gpuInFlight, which is 63.
+
+The field is now labelled tracked= and a separate gpuInFlight= prints the real
+count. Same class of mistake as the phase-blind window sampling in
+tools/voxel-leg-summary.ps1's footer: a plausible number read off the wrong
+counter, with no error to signal it.
+
+============================================================================
+7. IMPLEMENTATION NOTE -- THE PART THAT WAS WRONG TWICE
+============================================================================
+
+Speculation only works because the manager gained a SECOND queue with its OWN
+per-tick promotion allowance (voxel.GPU.MeshSpeculativeBatchCap, default 4), on
+top of demand's voxel.GPU.MeshBatchCap.
+
+The two designs that came first both made speculation a dead path, and both
+looked like prudence:
+
+  - dispatch floor "GpuJobsPending.Num() >= GpuCap - SpecCap" -- pipeline
+    OCCUPANCY, ~252 of a 256 cap in steady state, true on every tick.
+  - promote low-priority "only when the demand queue is empty" -- the demand
+    queue carries ~236 jobs for the whole flight, so also true on every tick.
+
+Both measured how BUSY the pipeline was and called it full. MeshBatchCap is a
+per-tick burst limiter protecting render-thread pass setup; the actual capacity
+bound is MaxInFlight, and the GPU sat at 19 of 256. Demand is protected
+STRUCTURALLY -- speculative jobs live in their own queue and promote only after
+demand has taken its full allowance -- so no second, weaker copy of that
+guarantee is needed at the submission site.

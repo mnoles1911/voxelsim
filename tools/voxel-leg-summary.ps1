@@ -53,8 +53,28 @@ foreach ($name in $LogName) {
              ForEach-Object { $_.Matches } | ForEach-Object { [double]$_.Groups[1].Value })
     $meanCps = if ($cps.Count) { [math]::Round(($cps | Measure-Object -Average).Average, 1) } else { $null }
 
-    $holes = @($lines | Select-String -Pattern 'holes=([0-9]+)' -AllMatches |
-               ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value }) | Select-Object -Last 1
+    $holeSeries = @($lines | Select-String -Pattern 'holes=([0-9]+)' -AllMatches |
+                    ForEach-Object { $_.Matches } | ForEach-Object { [int]$_.Groups[1].Value })
+    $holes = $holeSeries | Select-Object -Last 1
+
+    # FLIGHT-PHASE holes, which is a different question from the final converged
+    # count and the more important one for T4-1.
+    #
+    # holes(final) asks "did the world end up complete" -- it is 0 on every
+    # healthy arm, including arms with severe pop-in, because the linger phase
+    # fills everything in. The transient count DURING the flight is what a player
+    # would actually see as terrain arriving late, and it is where speculation
+    # shows up: 840 median with it off against 64 with lead 4.0s on the first
+    # pair, at identical chunks/s. A summary reporting only holes(final) would
+    # have called that pair a tie.
+    #
+    # Windows 46-105 of a 90/120/60 leg at 2s intervals: the 90s preflight is the
+    # first 45, the 120s flight the next 60. Phase boundaries are approximate by
+    # one window, which does not matter for a median over 60 samples.
+    $flight = @($holeSeries | Select-Object -Skip 45 -First 60 | Sort-Object)
+    $flightHoles = if ($flight.Count -ge 30) {
+        "med=$($flight[[int]($flight.Count/2)]) p90=$($flight[[int]($flight.Count*0.9)]) max=$($flight[-1])"
+    } else { 'n/a' }
 
     $poolLine = @($lines | Select-String -SimpleMatch 'Voxel GPU pool:') | Select-Object -Last 1
     $allocFail = if ($poolLine -and $poolLine.Line -match 'allocFail=([0-9]+)') { $Matches[1] } else { 'n/a' }
@@ -64,9 +84,32 @@ foreach ($name in $LogName) {
         "parked=$($Matches[1]) adopted=$($Matches[2]) hit=$($Matches[3])%"
     } else { 'parking off' }
 
+    # Pool pressure. T4-1 parks geometry nobody has asked for yet, so this is the
+    # column that says whether the feature is affordable: S2-3's abort condition
+    # is capacityPct crossing ~90, because UpdateChunk's realloc path DELETES
+    # resident terrain on a full pool.
+    $poolPct = if ($poolLine -and $poolLine.Line -match 'capacityPct=([0-9.]+)') { $Matches[1] } else { 'n/a' }
+
+    # T4-1. Reported against DISPATCHED, not against parked.
+    #
+    # The in-log "hit %" is adopted/parked, which answers "of the chunks we kept,
+    # how many got used" -- 96% on the first T4-1 leg. The cost question is
+    # adopted/DISPATCHED, because a dispatch that never parked still spent GPU:
+    # the same leg was 46% on that denominator. Four denominator mistakes in this
+    # programme have each been arithmetically true and directionally wrong
+    # (docs/lessons-2026-07-27-s0-s1.md, appendix), so both are printed.
+    $specLine = @($lines | Select-String -SimpleMatch 'Voxel speculation (5s window)') | Select-Object -Last 1
+    $spec = 'spec off'
+    if ($specLine -and $specLine.Line -match 'cumulative dispatched=([0-9]+) adopted=([0-9]+)') {
+        $d = [double]$Matches[1]; $a = [double]$Matches[2]
+        $pct = if ($d -gt 0) { [math]::Round(100 * $a / $d) } else { 0 }
+        $spec = "disp=$($Matches[1]) adopted=$($Matches[2]) (${pct}% of dispatched)"
+    }
+
     $rows += [pscustomobject]@{
         Leg = $name; Windows = $windows; ChunksPerSec = $meanCps
-        Holes = $holes; AllocFail = $allocFail; Park = $park
+        Holes = $holes; FlightHoles = $flightHoles; AllocFail = $allocFail
+        PoolPct = $poolPct; Park = $park; Spec = $spec
     }
 }
 

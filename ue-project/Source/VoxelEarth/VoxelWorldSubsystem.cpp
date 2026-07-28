@@ -2646,6 +2646,11 @@ struct FVoxelWorldImpl
 
 	int64 SpecDispatchedSinceLog = 0;
 	int64 SpecParkedSinceLog = 0;
+	// Why a speculative dispatch did not become a park. These three plus
+	// SpecParkedSinceLog account for every delivered speculative result.
+	int64 SpecDroppedEmptySinceLog = 0;
+	int64 SpecDroppedOvertakenSinceLog = 0;
+	int64 SpecDroppedPoolFullSinceLog = 0;
 	int64 SpecAdoptedSinceLog = 0;
 	int64 SpecEvictedUnusedSinceLog = 0;
 	int64 SpecDispatchedTotal = 0;
@@ -4973,13 +4978,30 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// which is a different question.
 	if (VoxelDebug::GetStreamVelocityLeadSec() > 0.f || SpecDispatchedTotal > 0)
 	{
+		// NOT SpeculativeInFlight.Num(). That set is "enumerated and not yet
+		// resolved" -- it includes everything still sitting in SpeculativeKeys
+		// waiting to be dispatched, so it read 153 on the first T4-1 leg while
+		// the true outstanding count was capped at 32 and the GPU was running 63.
+		// It was briefly reported as "the GPU is running 155 concurrent jobs",
+		// which it was not. Count the jobs that are actually outstanding.
+		int32 SpecOutstandingNow = 0;
+		for (const auto& Pair : GpuJobsPending)
+		{
+			if (Pair.Value.bSpeculative)
+			{
+				++SpecOutstandingNow;
+			}
+		}
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel speculation (5s window): dispatched=%lld parked=%lld adopted=%lld evictedUnused=%lld ")
-		       TEXT("| queued=%d inFlight=%d parkedNow=%d leadSec=%.2f speed=%.1f m/s ")
+		       TEXT("| dropOvertaken=%lld dropEmpty=%lld dropPoolFull=%lld ")
+		       TEXT("| queued=%d tracked=%d gpuInFlight=%d parkedNow=%d leadSec=%.2f speed=%.1f m/s ")
 		       TEXT("| cumulative dispatched=%lld adopted=%lld (hit %.0f%%)"),
 		       (long long)SpecDispatchedSinceLog, (long long)SpecParkedSinceLog,
 		       (long long)SpecAdoptedSinceLog, (long long)SpecEvictedUnusedSinceLog,
-		       SpeculativeKeys.Num(), SpeculativeInFlight.Num(), SpecParkedNow,
+		       (long long)SpecDroppedOvertakenSinceLog, (long long)SpecDroppedEmptySinceLog,
+		       (long long)SpecDroppedPoolFullSinceLog,
+		       SpeculativeKeys.Num(), SpeculativeInFlight.Num(), SpecOutstandingNow, SpecParkedNow,
 		       VoxelDebug::GetStreamVelocityLeadSec(), SmoothedAnchorSpeedUUPerSec / 100.0,
 		       (long long)SpecDispatchedTotal, (long long)SpecAdoptedTotal,
 		       SpecParkedTotal > 0 ? 100.0 * double(SpecAdoptedTotal) / double(SpecParkedTotal) : 0.0);
@@ -5521,6 +5543,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// component, and resetting them from two places is how the render-thread half
 	// would start double-counting.
 	SpecDispatchedSinceLog = SpecParkedSinceLog = SpecAdoptedSinceLog = SpecEvictedUnusedSinceLog = 0;
+	SpecDroppedEmptySinceLog = SpecDroppedOvertakenSinceLog = SpecDroppedPoolFullSinceLog = 0;
 	ChunksParkedSinceLog = ChunksAdoptedSinceLog = 0;
 	ParkEvictedStaleSinceLog = ParkEvictedCapSinceLog = 0;
 	DrainExitQueueEmptySinceLog = DrainExitWallClockSinceLog = 0;
@@ -8140,7 +8163,8 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 		}
 	}
 
-	const uint64 JobId = Manager->Submit(MoveTemp(Req), /*UserTag*/ 0, bDirectToPool);
+	const uint64 JobId = Manager->Submit(MoveTemp(Req), /*UserTag*/ 0, bDirectToPool,
+	                                     /*bLowPriority*/ bSpeculative);
 	GpuJobsPending.Add(JobId, FGpuPendingJob{ LevelKey, GenId, bSpeculative });
 	return true;
 }
@@ -9781,8 +9805,12 @@ void FVoxelWorldImpl::DispatchSpeculativeJobs()
 		return;
 	}
 
+	FVoxelGpuMeshJobManager* Manager = EnsureGpuMeshJobs();
+	if (Manager == nullptr)
+	{
+		return;
+	}
 	const int32 SpecCap = VoxelDebug::GetStreamSpeculativeMaxInFlight();
-	const int32 GpuCap = VoxelStreamAdmission::GpuMeshInFlight();
 	int32 SpecOutstanding = 0;
 	for (const auto& Pair : GpuJobsPending)
 	{
@@ -9794,9 +9822,25 @@ void FVoxelWorldImpl::DispatchSpeculativeJobs()
 
 	while (SpeculativeKeys.Num() > 0 && SpecOutstanding < SpecCap)
 	{
-		// Hard floor for demand: never let speculation take the last slots of the
-		// shared fork budget, whatever its own cap says.
-		if (GpuJobsPending.Num() >= GpuCap - SpecCap)
+		// DO NOT GATE ON DEMAND-QUEUE DEPTH HERE. Two predicates have already been
+		// wrong in this exact spot, both because they measured how BUSY the
+		// pipeline is rather than whether it has ROOM:
+		//
+		//   GpuJobsPending.Num() >= GpuCap - SpecCap  -- pipeline occupancy,
+		//     ~252 of a 256 cap in steady state, true every tick.
+		//   Manager->NumQueuedDemand() > 0            -- demand queue depth, which
+		//     carries ~236 jobs for the entire flight, so also true every tick.
+		//
+		// Both make speculation a dead path while looking like prudence. Demand is
+		// protected in the MANAGER, structurally: speculative jobs sit in their own
+		// queue and are promoted only after demand has taken its full per-tick
+		// allowance. That is the guarantee, and it does not need a second, weaker
+		// copy of itself here.
+		//
+		// What this loop must bound is the SPECULATIVE queue's own depth -- a
+		// backlog that outlives the prediction it was built from is stale work, not
+		// lead time. SpecCap does that, and it is the only bound needed.
+		if (Manager->NumQueuedLowPriority() >= SpecCap)
 		{
 			break;
 		}
@@ -9841,11 +9885,20 @@ void FVoxelWorldImpl::ParkSpeculativeResult(const VoxelCoords::FVoxelLevelChunkK
 	}
 	if (!GpuResult.GpuQuads.IsValid() || GpuResult.NumQuads == 0)
 	{
+		++SpecDroppedEmptySinceLog;
 		return; // all-air column; nothing to park
 	}
 	// Demand may have overtaken it while it was in flight.
+	//
+	// COUNTED, because dispatched-minus-parked was 52% of all speculative work on
+	// the first T4-1 leg and four silent returns could each have been the cause.
+	// This one is the expensive kind: if demand admitted the key while the
+	// speculative job was in flight, demand ALSO queued its own job for it, so
+	// the GPU meshed the same chunk twice. That is the number that says whether
+	// the lead time is too long for the pipeline's own latency.
 	if (ChunkRecords.Contains(Key) || ParkedGeometry.Contains(Key))
 	{
+		++SpecDroppedOvertakenSinceLog;
 		return;
 	}
 
@@ -9863,6 +9916,7 @@ void FVoxelWorldImpl::ParkSpeculativeResult(const VoxelCoords::FVoxelLevelChunkK
 		// Pool refused. Speculation NEVER retries and never logs loudly for this:
 		// a refused speculative allocation is the system correctly declining to
 		// spend capacity demand might need. T1-7's retry path is for demand.
+		++SpecDroppedPoolFullSinceLog;
 		return;
 	}
 

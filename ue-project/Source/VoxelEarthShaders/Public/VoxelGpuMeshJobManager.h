@@ -28,6 +28,27 @@
 //    shutdown. Callers cannot drop a job by forgetting to check a return value,
 //    because there is no return value to forget.
 //
+// TWO QUEUES, NOT A PRIORITY FIELD (T4-1, 2026-07-28). Submit takes a
+// bLowPriority flag that routes a job to QueuedLowPriority instead of Queued.
+// Demand drains first every tick, up to voxel.GPU.MeshBatchCap; low-priority
+// work then drains up to voxel.GPU.MeshSpeculativeBatchCap ON TOP of that,
+// bounded by MaxInFlight. With nothing low-priority queued the behaviour is
+// byte-identical to before.
+//
+// The subtle part, and the version that was built first and was wrong: giving
+// low-priority the LEFTOVER of MeshBatchCap makes it a dead path. The demand
+// queue carries ~236 jobs for an entire flight leg, so "promote low-priority
+// only when Queued is empty" never fires once. MeshBatchCap is a per-tick BURST
+// limiter protecting render-thread pass setup, not a capacity limit -- the
+// capacity limit is MaxInFlight, and the GPU was measured running 16 jobs in
+// flight at cap 4 against 179 at cap 32. Speculation exists to use that gap, so
+// it needs an allowance of its own rather than a share of somebody else's.
+//
+// Invariant 2 still holds across both queues: CancelAll drains BOTH into the
+// cancelled set. Resetting QueuedLowPriority without delivering it would strand
+// every speculative chunk silently, which is precisely the failure invariant 2
+// exists to make impossible.
+//
 // SCOPE. Stage 1 is the runner only. Nothing here is wired into DispatchJobs or
 // the streaming path yet.
 //
@@ -288,8 +309,23 @@ public:
 	// which form it will get back. Callers that cannot consume GPU-resident
 	// quads -- anything needing the quad CONTENTS on the CPU, which today is the
 	// voxel GI ingest -- pass false and get the readback path.
+	// bLowPriority: promoted ONLY when no demand job is waiting.
+	//
+	// WHY THIS EXISTS RATHER THAN "SUBMIT IT LAST". T4-1 originally relied on
+	// submitting speculative work at the end of the tick, on the reasoning that
+	// demand would already have taken what it wanted. That controls WHEN a job
+	// enters the queue and does nothing about what happens after: this queue is
+	// strict FIFO, so a speculative job sits AHEAD of every demand job submitted
+	// on later ticks. Measured with ~235 jobs queued at the shipped
+	// MeshBatchCap, speculation would not have filled idle GPU -- it would have
+	// inserted latency into the demand path
+	// (docs/measurements/t41-premise-2026-07-28.txt).
+	//
+	// Low-priority jobs are otherwise identical: same states, same delivery, same
+	// exactly-once contract. They are never starved into a different OUTCOME,
+	// only a later one, and the caller is expected to treat them as droppable.
 	uint64 Submit(FVoxelGpuRegionRequest&& Region, uint64 UserTag = 0,
-	              bool bRequestGpuResidentQuads = false);
+	              bool bRequestGpuResidentQuads = false, bool bLowPriority = false);
 
 	// Promotes queued jobs, polls readbacks, delivers finished ones. Game thread
 	// only. Cheap and safe to call every frame with nothing outstanding.
@@ -298,7 +334,12 @@ public:
 	// Delivers Cancelled for every queued and in-flight job. Idempotent.
 	void CancelAll();
 
-	int32 NumQueued() const { return Queued.Num(); }
+	int32 NumQueued() const { return Queued.Num() + QueuedLowPriority.Num(); }
+	// Demand only. This is the number that decides whether the GPU has room a
+	// LOW-PRIORITY job could use without delaying anything -- NumQueued() lumps
+	// both and would always look busy.
+	int32 NumQueuedDemand() const { return Queued.Num(); }
+	int32 NumQueuedLowPriority() const { return QueuedLowPriority.Num(); }
 	int32 NumInFlight() const { return InFlight.Num(); }
 	bool HasWork() const { return NumQueued() > 0 || NumInFlight() > 0; }
 
@@ -332,5 +373,9 @@ private:
 	uint64 NextJobId = 1;
 
 	TArray<TSharedPtr<FJob, ESPMode::ThreadSafe>> Queued;
+	// Drained only when Queued is empty. See Submit's bLowPriority: this is what
+	// lets speculative work use spare GPU without delaying demand, which
+	// submit-last ordering alone cannot do against a FIFO queue.
+	TArray<TSharedPtr<FJob, ESPMode::ThreadSafe>> QueuedLowPriority;
 	TArray<TSharedPtr<FJob, ESPMode::ThreadSafe>> InFlight;
 };

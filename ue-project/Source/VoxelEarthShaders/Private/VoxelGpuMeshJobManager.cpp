@@ -61,6 +61,18 @@ static FAutoConsoleVariableRef CVarVoxelGpuMeshBatchCap(
 	TEXT("frame built graphs of 100+ passes on the render thread."),
 	ECVF_Default);
 
+
+// How many SPECULATIVE (low-priority) jobs may promote per tick, on top of
+// MeshBatchCap's demand allowance. 0 disables speculative promotion entirely
+// while leaving submission intact, which is the clean A/B for T4-1: the
+// speculative queue still fills, so its depth is observable with the feature's
+// GPU effect switched off.
+static int32 GVoxelGpuMeshSpeculativeBatchCap = 4;
+static FAutoConsoleVariableRef CVarVoxelGpuMeshSpeculativeBatchCap(
+	TEXT("voxel.GPU.MeshSpeculativeBatchCap"),
+	GVoxelGpuMeshSpeculativeBatchCap,
+	TEXT("Speculative GPU mesh jobs promoted per tick, on top of voxel.GPU.MeshBatchCap. 0 = never promote speculative work."),
+	ECVF_Default);
 // Wave D / D1. Whether a job's quads stay on the GPU or come back through
 // system memory.
 //
@@ -480,7 +492,7 @@ FVoxelGpuMeshJobManager::~FVoxelGpuMeshJobManager()
 }
 
 uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 UserTag,
-                                       bool bRequestGpuResidentQuads)
+                                       bool bRequestGpuResidentQuads, bool bLowPriority)
 {
 	check(IsInGameThread());
 
@@ -509,7 +521,17 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 
 	Job->SubmitSeconds = FPlatformTime::Seconds();
 
-	Queued.Add(Job);
+	// Low-priority work goes to its own queue and is promoted only when the
+	// demand queue is empty -- see Submit's declaration for why submit-last
+	// ordering is not sufficient against a FIFO drain.
+	if (bLowPriority)
+	{
+		QueuedLowPriority.Add(Job);
+	}
+	else
+	{
+		Queued.Add(Job);
+	}
 	return Job->JobId;
 }
 
@@ -607,12 +629,47 @@ void FVoxelGpuMeshJobManager::Tick()
 	// one tick is both free and desirable (it gets them delivered sooner).
 	const int32 BatchCap = GVoxelGpuMeshBatchCap > 0 ? GVoxelGpuMeshBatchCap : MAX_int32;
 
+	// LOW PRIORITY GETS ITS OWN PER-TICK ALLOWANCE, NOT A SHARE OF BatchCap.
+	//
+	// This is the whole mechanism, and the obvious design is wrong. "Promote
+	// low-priority only when Queued is empty" sounds like the safe reading of
+	// strict priority, but it makes speculation a dead code path: at the shipped
+	// MeshBatchCap 4 the demand queue carries ~236 jobs for the whole flight
+	// (docs/measurements/t41-premise-2026-07-28.txt), so Queued is never empty,
+	// demand takes all 4 slots every tick, and a low-priority job would wait
+	// forever behind it.
+	//
+	// BatchCap is NOT a capacity limit -- it is a per-tick burst limiter that
+	// exists to keep one FRDGBuilder from taking a hundred-plus jobs of pass
+	// setup on the render thread (see its comment above). The real capacity limit
+	// is MaxInFlight, and the GPU sits far below it: 16 in flight at cap 4, while
+	// the same GPU ran 179 concurrently at cap 32. THAT GAP IS THE IDLE CAPACITY
+	// T4-1 exists to use.
+	//
+	// So: demand promotes up to BatchCap as it always did -- byte-identical when
+	// nothing low-priority is queued -- and low-priority promotes up to its own
+	// separate SpecBatchCap on top, still bounded by MaxInFlight and still taken
+	// only after demand has had its fill this tick. Demand's throughput and
+	// ordering are untouched; speculation rides in the slack.
+	const int32 SpecBatchCap = FMath::Max(0, GVoxelGpuMeshSpeculativeBatchCap);
+
 	TArray<FJobPtr> Batch;
 	TArray<TPair<FJobPtr, FString>> Rejected;
-	while (Queued.Num() > 0 && InFlight.Num() + Batch.Num() < MaxInFlight && Batch.Num() < BatchCap)
+	int32 DemandPromoted = 0;
+	int32 LowPriorityPromoted = 0;
+	while (InFlight.Num() + Batch.Num() < MaxInFlight)
 	{
-		FJobPtr Job = Queued[0];
-		Queued.RemoveAt(0, EAllowShrinking::No);
+		// Demand first, always, while it has both work and allowance.
+		const bool bDemandCanRun = Queued.Num() > 0 && DemandPromoted < BatchCap;
+		const bool bLowCanRun = QueuedLowPriority.Num() > 0 && LowPriorityPromoted < SpecBatchCap;
+		if (!bDemandCanRun && !bLowCanRun)
+		{
+			break;
+		}
+		const bool bTakeLowPriority = !bDemandCanRun;
+		TArray<FJobPtr>& Source = bTakeLowPriority ? QueuedLowPriority : Queued;
+		FJobPtr Job = Source[0];
+		Source.RemoveAt(0, EAllowShrinking::No);
 
 		// S0-3: this IS "promoted out of Queued", whichever way the job goes
 		// from here -- into the batch below or straight to Rejected. Stamping
@@ -646,6 +703,10 @@ void FVoxelGpuMeshJobManager::Tick()
 		Job->InteriorY = Job->Sizes.BricksY - 2;
 		Job->InteriorZ = Job->Sizes.BricksZ - 2;
 
+		// Counted here, not at the take, so a REJECTED job still costs no
+		// allowance -- preserving BatchCap's documented "counts promoted jobs,
+		// not loop iterations" behaviour for demand exactly as before.
+		if (bTakeLowPriority) { ++LowPriorityPromoted; } else { ++DemandPromoted; }
 		Batch.Add(MoveTemp(Job));
 	}
 
@@ -1247,8 +1308,16 @@ void FVoxelGpuMeshJobManager::CancelAll()
 {
 	TArray<FJobPtr> Outstanding;
 	Outstanding.Append(Queued);
+	// LOW-PRIORITY JOBS ARE CANCELLED LIKE ANY OTHER. Resetting the queue without
+	// appending it here would drop them silently, and invariant #2 at the top of
+	// this header is that every job id submitted is delivered to OnJobComplete
+	// EXACTLY ONCE. A dropped one leaks its GpuJobsPending entry on the streaming
+	// side, which logs an Error about a leaked dispatch slot -- a long way from
+	// the cause.
+	Outstanding.Append(QueuedLowPriority);
 	Outstanding.Append(InFlight);
 	Queued.Reset();
+	QueuedLowPriority.Reset();
 	InFlight.Reset();
 
 	for (const FJobPtr& Job : Outstanding)
