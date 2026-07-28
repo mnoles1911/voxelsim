@@ -1,0 +1,119 @@
+SESSION SUMMARY, 2026-07-28
+Branch: claude/s1-1-batch-pool-publication
+
+FINAL VERIFIED STATE, shipped defaults, standard flight leg at 2560x1440:
+
+  frames=15,896  p50=15.21 ms (65.7 fps)  p95=20.89 ms  max=41.40 ms
+  hitches=11     holes(final)=0           allocFail=0   capacityPct=70.1
+  chunks/s=1073.9
+
+Against the state at the start of the day (same leg, same resolution):
+
+  p50 30.59 ms (32.7 fps)   p95 44.87 ms   hitches 3,747
+  median flight-phase holes ~822
+
+============================================================================
+WHAT SHIPPED
+============================================================================
+
+1. T4-1 SPECULATIVE GENERATION (Wave S4 closed)
+   Median transient holes during flight ~822 -> ~57, a 93% reduction,
+   replicated across a 10-leg alternated sweep. No throughput cost, no memory
+   cost, and after the batch-scope fix no game-thread cost either.
+   Detail: docs/measurements/t41-first-result-2026-07-28.txt
+
+   The lead time is NOT a tuning knob: 1 s captures the whole effect and 8 s is
+   no better. Default recommended at VelocityLeadSec 2.0; still gated OFF
+   pending the owner's call.
+
+2. DRAW PATH: 32.7 -> 65.7 fps AT 2K
+   GPUCullMergeGap 4096 -> 64 and GPUCullMaxRanges 1024 -> 16384. Over-draw
+   3.4x -> 1.001x (drawn 33.1M -> 9.72M against 9.71M visible). Hitch frames
+   3,747 -> ~11.
+   Detail: docs/measurements/drawpath-2k-2026-07-28.txt
+
+   RESOLUTION IS FREE: baseline is 30.61 ms at 900p and 30.59 ms at 2K, 2.56x
+   the pixels for zero cost. The renderer is geometry/submission-bound. Re-check
+   this after any change; the moment something becomes pixel-bound the 900p
+   sweeps stop transferring.
+
+   THE TWO KNOBS ARE INSEPARABLE. Swept alone, MaxRanges 16384 measured WORSE
+   than 4096 and would have been rejected. A coarse gap merges away the ranges a
+   large budget exists to keep; a fine gap produces them and the budget keeps
+   them. One-at-a-time sweeps measure each knob at the other's wrong value.
+
+3. POOL CAPACITY 64M -> 80M quads, table 81,920 -> 98,304
+   Sized from a measured plateau (highWater 59.24M on a 330 s traverse), not
+   from the plan's 104M guess -- that was justified by a large speculative
+   parked population which does not exist (peak 172 chunks against a 4,000 cap).
+   Buys CONTIGUITY: largest free run 6.8M -> 22.4M.
+
+4. SMALLER FIXES
+   - Manager two-queue priority so speculation uses idle GPU without delaying
+     demand (voxel.GPU.MeshSpeculativeBatchCap).
+   - Pool batch scope widened over GpuMeshJobs->Tick(): speculative parks were
+     republishing the whole chunk table individually, 97% of T4-1's cost.
+   - Speculative results now store their D6 band, so the buried skip can fire on
+     virgin terrain at all (bandSkipped 0 -> 51/window).
+   - Run rebuilds gated on bRunsDirty rather than bTableDirty.
+   - Park census hit rate no longer divides all adoptions by demand-only parks
+     (it printed "hit 102%").
+   - tools/voxel-audit-leg-overlap.ps1: proves from log timestamps that no two
+     legs shared the box, including legs the runner's guard never saw.
+
+============================================================================
+WHAT DID NOT SHIP, AND WHY
+============================================================================
+
+S2-1 GPU HIDE PASS -- built, gated OFF (voxel.Stream.PoolGpuHide 0), UNVERIFIED.
+  Its forced probe has been through five rounds of harness bugs and still does
+  not produce a trustworthy verdict. One intermediate result was reported as
+  "the probe caught a real bug" and is RETRACTED: the control, against the
+  shipped CPU-shadow path, fails identically.
+  Detail: docs/measurements/s21-gpu-hide-probe-2026-07-28.txt
+
+S2-5 DROP THE CPU SHADOW -- blocked on S2-1, correctly. Worth ~960 MB of system
+  RAM plus a 960 MB memcpy on render-state rebuild at the new capacity.
+
+60 FPS AS A FLOOR -- p50 clears 60 at 2K; p95 (20.9 ms, ~48 fps) does not. The
+  gap is the streaming tick: 5.995 ms per tick landing on ~32% of frames, of
+  which the pool publication is over half (buildRuns 2.94 ms, runBounds 1.28 ms
+  per push, walking ~53,800 allocations). Eliminating buildRuns ENTIRELY would
+  still leave p95 around 18.3 ms, so a floor needs the streaming tick off the
+  frame's critical path -- time-slicing or a worker thread. That is a design
+  decision, not a tuning change.
+
+============================================================================
+LESSONS ADDED (docs/lessons-2026-07-27-s0-s1.md)
+============================================================================
+
+13. A guard that measures BUSY when it means FULL disables what it guards.
+14. Priority is not ordering: strict priority over a SHARED allowance starves
+    the low tier whenever the high tier saturates.
+15. A throughput metric cannot see a latency feature.
+16. Read the counter's definition, not its label.
+17. frameMs/renderMs in this log are HITCH fields, not frame fields -- they
+    appear only on "Hitch frame:" lines above a 33.3 ms threshold. Every
+    frame-time figure taken by grepping them describes the tail, not the body.
+    The true metric is the VoxelPerfRun post-warmup line.
+
+The recurring shape across all five, and worth stating once: every one was a
+number that was arithmetically correct and answered a different question than
+the one being asked. The defence is to name the population a number was sampled
+from before quoting it.
+
+============================================================================
+VERIFICATION
+============================================================================
+
+  ctest voxel-core                    2/2 PASS
+  VoxelEarth.GpuPool automation       4/4 PASS
+  voxel.GPU.VerifyPoolWrite 16 4      PASS, byte-identical, dropped=0
+  CoverageVerify                      green on every leg, holes(final)=0
+  GetGpuDirectWritesDropped           0 on every window of every leg
+  leg overlap audit                   CLEAN across all legs run today
+
+  voxel.Stream.PoolClobberSession     runs, no effect detected, but its noise
+                                      floor is mean 45/255 and does not shrink
+                                      with settle time -- power against gross
+                                      corruption only. Do not cite it as clean.

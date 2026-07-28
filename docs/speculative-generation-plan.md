@@ -1,7 +1,21 @@
 # Speculative generation (T4-1): the re-sequenced path, and why this order
 
-**Status:** written 2026-07-27. **S0 CLOSED**, **S1 CLOSED**, **S2 SHIPPED**,
-**S3 SHIPPED**, **S4 (T4-1) WORKING AND CONFIRMED — 10-leg sweep, 2026-07-28.** Data: `docs/measurements/s0-apply-census-2026-07-27.txt`,
+**Status:** written 2026-07-27. **S0 CLOSED**, **S1 CLOSED**, **S2 SHIPPED**
+(except S2-1/S2-5 — see below), **S3 SHIPPED**, **S4 (T4-1) CLOSED — confirmed
+by a 10-leg sweep, 2026-07-28.**
+
+**This plan's goal is met and the programme has moved on.** The constraint is no
+longer streaming: it is the draw path and the frame-time tail. Session summary,
+including what did not ship and why:
+`docs/measurements/session-summary-2026-07-28.txt`.
+
+**Still open from this plan:** S2-1 (GPU hide pass) is built but UNVERIFIED and
+ships gated off — its forced probe does not yet give a trustworthy verdict
+(`docs/measurements/s21-gpu-hide-probe-2026-07-28.txt`). S2-5 (drop the CPU
+shadow) is blocked on it, and is worth ~960 MB of system RAM at the new pool
+capacity. Capacity step 2 was taken as **80M, not the planned 104M** — the 104M
+figure was sized for a speculative parked population that measurement shows does
+not exist (peak 172 chunks against a 4,000 cap). Data: `docs/measurements/s0-apply-census-2026-07-27.txt`,
 `docs/measurements/s1-close-2026-07-27.txt`,
 `docs/measurements/t41-first-result-2026-07-28.txt`.
 
