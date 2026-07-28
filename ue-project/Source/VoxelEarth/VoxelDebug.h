@@ -316,6 +316,14 @@ namespace VoxelDebug
 	// voxel.Stream.MaxRemeshesPerFrame: max game-thread overlay-aware edit
 	// re-meshes (DrainGameThreadMesh -- first load of an edited chunk, or a
 	// post-edit dirty re-mesh) applied per frame. Default 8 (2026-07-24 pass).
+	// voxel.Stream.AdmissionRecordCap (S2-0): stop relaxing the per-level
+	// admission cutoff once ChunkRecords reaches this many entries. 0 = off.
+	// The existing relaxation gates on the pending JOB queue being short, which
+	// was a proxy for spare downstream capacity that only held while the queue
+	// was short from STARVATION -- Wave S1 made it permanently short by making
+	// the consumer fast. See the cvar's source comment.
+	VOXELEARTH_API int32 GetStreamAdmissionRecordCap();
+
 	VOXELEARTH_API int32 GetStreamMaxRemeshesPerFrame();
 
 	// voxel.Stream.MaxUnloadsPerFrame: max chunk-component unload events
@@ -416,6 +424,33 @@ struct FVoxelPerfSnapshot
 
 	// --- Frame ---------------------------------------------------------------
 	float SubsystemTickMs = 0.f;
+
+	// --- Where the streaming anchor is, and how fast it is moving -----------
+	//
+	// The anchor is the pawn location TickStreaming was called with -- the same
+	// point every ring radius, admission cutoff and retention decision is
+	// measured from -- so this is the position that explains the rest of the
+	// panel, not merely the camera's.
+	//
+	// SPEED IS FINITE-DIFFERENCED FROM THE ANCHOR, NOT READ FROM
+	// Pawn->GetVelocity(). That matters specifically for the runs anyone wants
+	// to watch: -VoxelPerfFlight=line drives the pawn with
+	// SetActorLocationAndRotation(..., TeleportPhysics) every tick, bypassing
+	// AddMovementInput and UFloatingPawnMovement entirely, so the movement
+	// component's Velocity stays at zero for the whole flight. A speed row fed
+	// from GetVelocity() would read 0.0 m/s across every perf leg while the
+	// world visibly streams past. (Wave S3 needs this same signal for the
+	// velocity-lead work -- see docs/speculative-generation-plan.md §2.4.)
+	//
+	// Metres, and metres/second: 1 voxel = 10 UU = 0.1 m, and every speed this
+	// project quotes -- the 20 m/s flight, the movement tuning table -- is in
+	// m/s. Converting once here keeps the HUD honest against those numbers.
+	double AnchorXMeters = 0.0;
+	double AnchorYMeters = 0.0;
+	double AnchorZMeters = 0.0;
+	// EMA-smoothed over ~0.25 s. Raw frame-to-frame delta is unreadable at
+	// 60+ fps and jitters hard on any frame the pawn is repositioned.
+	float AnchorSpeedMetersPerSec = 0.f;
 
 	// --- Raw counters (vxc::Counters totals, plain mirror) ------------------
 	uint64 BricksGenerated = 0;

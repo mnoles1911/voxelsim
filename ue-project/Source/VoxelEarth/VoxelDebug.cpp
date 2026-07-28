@@ -96,9 +96,25 @@ TAutoConsoleVariable<bool> CVarVoxelWaterGpu(
 	TEXT("voxel.Stream.GPU -- water is a separate pool with a separate, translucent material."),
 	ECVF_Default);
 
+// 64 -> 192 (2026-07-27, S1 close): 794 -> 1,040 chunks/s with converged holes
+// 6-14 -> 0, two clean legs each, 1.4% spread. 384 measured 1,044 -- inside
+// noise of 192 -- so 192 is the knee and there is nothing above it.
+//
+// This ceiling only started binding once batched publication made an apply
+// cheap enough that DrainResults could hit 64 before spending its 6 ms
+// ApplyBudgetMs. Before that it was unreachable and therefore invisible.
+//
+// AND IT WAS BRIEFLY RECORDED AS "REJECTED, MEASURED WORSE", WHICH WAS WRONG.
+// That leg (749 chunks/s, 179 holes) shared the box with a second editor for 86
+// seconds. Re-run alone on the same binary it gave 1,033. A contended leg looks
+// exactly like a slow configuration, and a plausible mechanism had already been
+// written to explain it -- which is how a 30% win nearly went into the
+// do-not-re-litigate list permanently. tools/voxel-run-flight-leg.ps1 now
+// refuses to start while another editor is alive.
+// docs/measurements/s1-close-2026-07-27.txt.
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxAppliesPerFrame(
 	TEXT("voxel.Stream.MaxAppliesPerFrame"),
-	64,
+	192,
 	TEXT("Streaming throughput: HARD CEILING on worker-mesh-result chunk-component applies ")
 	TEXT("(FVoxelWorldImpl::DrainResults) per frame. As of the 2026-07-24 streaming-speed pass this is a safety ")
 	TEXT("ceiling, not the steady-state throttle -- the loop drains until voxel.Stream.ApplyBudgetMs of wall-clock ")
@@ -401,6 +417,33 @@ TAutoConsoleVariable<int32> CVarVoxelStreamDispatchAfterDrain(
 	TEXT("Skipped cheaply when nothing is pending. A/B lever for cold-fill work."),
 	ECVF_Default);
 
+// S2-0 (2026-07-27). Bounded admission had a second failure mode that only
+// appeared once the consumer got fast.
+//
+// RecomputeDesiredSet relaxes every LevelAdmissionCutoffDistSq to DBL_MAX when
+// the pending job queue has drained below 3/4 of voxel.Stream.PendingJobCap.
+// That test is a proxy for "there is spare capacity downstream" -- and it was
+// only ever a correct proxy because the queue was short for exactly one reason:
+// the consumer could not keep up. Wave S1 removed that reason. The queue is now
+// short because applies are fast, so the cutoff relaxes on essentially every
+// call and bounded admission is off in practice.
+//
+// Measured at the S1 config: 22,300 records/s admitted against ~800 chunks/s
+// loading, ChunkRecords at 86,077 against a 39,020 settle, and
+// RecomputeDesiredSet at 66% of the streaming tick paying an O(tracked) exit
+// scan for records that will never be reached.
+//
+// This bounds what is actually growing. 0 = off (the pre-S2-0 behaviour). Size
+// it above peak flight residency (~50,900 measured) and far below 86,077.
+TAutoConsoleVariable<int32> CVarVoxelStreamAdmissionRecordCap(
+	TEXT("voxel.Stream.AdmissionRecordCap"),
+	0,
+	TEXT("Stop relaxing the per-level admission cutoff once ChunkRecords reaches this many entries. 0 = off ")
+	TEXT("(pre-2026-07-27 behaviour: the cutoff relaxes whenever the pending JOB queue is short, which stopped ")
+	TEXT("meaning 'there is spare capacity' the moment the consumer got fast). Bounds the O(tracked) exit scan, ")
+	TEXT("which measured 66% of the streaming tick with records at 86,077 against a 39,020 settle."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxRemeshesPerFrame(
 	TEXT("voxel.Stream.MaxRemeshesPerFrame"),
 	8,
@@ -409,13 +452,36 @@ TAutoConsoleVariable<int32> CVarVoxelStreamMaxRemeshesPerFrame(
 	TEXT("so edited-chunk loads keep pace with the faster clean-chunk apply path)."),
 	ECVF_Default);
 
+// 24 -> 256 (2026-07-27, S1). THE MOST EXPENSIVE-TO-DIAGNOSE NUMBER IN THIS FILE
+// SO FAR, and the lesson generalises to every other budget here.
+//
+// Its own doc already said unloads must keep pace with the apply rate. When
+// batched publication took the apply rate from ~260 to ~630 chunks/s, 24 stopped
+// keeping pace -- ~684 unloads/s against ~630 loads/s is marginally under water,
+// so the unload queue grew without bound (pendingUnload peaked at 75,925) and
+// residency with it (80,716 live chunks against an 81,920 table floor).
+//
+// It did not present as an unload problem. It presented as ALLOCATOR
+// FRAGMENTATION: 26,763-77,290 refused allocations, 16,903 free runs, and a 72x
+// collapse in largest-free-run at equal total free -- textbook first-fit
+// pathology, and the obvious response was to build a compacting defragmenter
+// (T3-6). A chronically over-full pool fragments; the allocator was the
+// messenger. Raising this took allocFail to 0 and converged holes 257 -> 0.
+//
+// SO: EVERY PER-FRAME BUDGET IN THIS SUBSYSTEM ENCODES AN ASSUMPTION ABOUT
+// THROUGHPUT. MaxAppliesPerFrame, MaxRemeshesPerFrame, kMaxResultDrainsPerFrame,
+// kMaxUnloadPopsPerFrame, GpuMeshInFlight, MeshBatchCap, MeshHarvestCap -- any
+// change that moves throughput must re-sweep the ones downstream of it, and a
+// saturated budget can surface as a bug in something else entirely.
+// docs/measurements/s1-close-2026-07-27.txt.
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxUnloadsPerFrame(
 	TEXT("voxel.Stream.MaxUnloadsPerFrame"),
-	24,
+	256,
 	TEXT("Max chunk-component unload events (FVoxelWorldImpl::DrainUnloads -- pool-park, or DestroyComponent once the ")
 	TEXT("pool is at voxel.Stream.ComponentPoolMax) per frame. History: constant 4 -> 2 (hitch isolation) -> 24 ")
-	TEXT("(2026-07-24 streaming-speed pass): unloads must keep pace with the raised apply rate or superseded coarse ")
-	TEXT("chunks pile up resident (measured R0 bloating ~4x its desired size, which itself loads the render thread)."),
+	TEXT("(2026-07-24 streaming-speed pass) -> 256 (2026-07-27, S1): at the batched apply rate 24 could not keep pace, ")
+	TEXT("so residency ballooned to 80,716 chunks and the pool began REFUSING allocations -- which looked exactly like ")
+	TEXT("allocator fragmentation. 256 takes allocFail to 0 and converged holes to 0. See the source comment."),
 	ECVF_Default);
 
 TAutoConsoleVariable<int32> CVarVoxelStreamComponentPoolMax(
@@ -757,6 +823,11 @@ int32 VoxelDebug::GetStreamJobsInFlightPerCore()
 int32 VoxelDebug::GetStreamDispatchAfterDrain()
 {
 	return CVarVoxelStreamDispatchAfterDrain.GetValueOnGameThread();
+}
+
+int32 VoxelDebug::GetStreamAdmissionRecordCap()
+{
+	return FMath::Max(0, CVarVoxelStreamAdmissionRecordCap.GetValueOnGameThread());
 }
 
 int32 VoxelDebug::GetStreamMaxRemeshesPerFrame()

@@ -61,50 +61,44 @@ static FAutoConsoleVariableRef CVarVoxelPoolPushStats(
 // READ UnmarkQuadsDirty BEFORE FLIPPING THIS. Batching inverts an ordering that
 // per-chunk flushes were providing for free, and the failure mode is invisible
 // terrain that reports as loaded.
-// DEFAULT 0, AND IT WAS BRIEFLY 1 IN ERROR. READ THIS BEFORE FLIPPING IT AGAIN.
+// DEFAULT 1 SINCE 2026-07-27, AND THAT IS A MEASUREMENT
+// (docs/measurements/s1-close-2026-07-27.txt).
 //
-// What it buys is real and large: +123% throughput (260.9 -> 581.3 chunks/s) and
-// converged holes 14,827 -> 966 over four alternated flight legs. Most of that
-// is not the amortisation it was designed for -- publications fell 16.5x and
-// applies rose 3.3x, which stopped the ResultsQueue backing up and took the
-// stale-result fraction from 42% to 0%.
+// It is the single largest lever this programme has found: the pooled arm went
+// from ~260 chunks/s with 15,032 converged holes to ~795 with holes in single
+// digits, and the P0 that framed the whole streaming-perf effort closed with it.
 //
-// WHAT IT ALSO DOES, WHICH THE FIRST FLIP MISSED: it fragments the pool until
-// allocations fail. allocFail was 77,290 (96.9 M quads) with this ON and 0 with
-// it OFF, on the same binary and the same route. That is this item's own stated
-// revert condition and it was published as "allocFail=0" without being read.
+// Most of the win is NOT the amortisation it was designed for. Publications fell
+// 16.5x and applies rose 3.3x, which stopped the ResultsQueue backing up, which
+// took the stale-result fraction from 42% to 0%. The pipeline had been
+// discarding nearly half the geometry the GPU had already produced; throughput
+// and waste turned out to be one problem.
 //
-// It is FRAGMENTATION, not exhaustion, and the pool's own early-warning counters
-// name it exactly (see GetFreeRunCount): at the end of a batched leg, free =
-// 27.9 M quads but largestRun = 68,326 across 16,903 free runs, against
-// largestRun = 4,904,120 across 8,407 runs on the unbatched control -- the same
-// total free, a 72x smaller largest run.
+// IT WAS FLIPPED ONCE PREMATURELY AND REVERTED, AND THAT IS WORTH KNOWING.
+// Batching alone drove allocFail to 77,290 (96.9 M quads) -- this item's own
+// revert condition -- which was published as "allocFail=0" without ever being
+// read. It looked like first-fit fragmentation: 16,903 free runs, largest run
+// 68,326 against 4,904,120 on the unbatched control at equal total free.
 //
-// The chain: 3.3x apply throughput -> transient residency spikes to 49,349
-// chunks at 98.5% pool (also past the 49,152 chunk-table floor, which trips the
-// MarkRenderStateDirty rebuild that invalidates every GPU-written range) ->
-// first-fit begins refusing -> the free list shatters -> refusals continue even
-// after residency falls back to 28,613 and the pool reads 61% free.
+// IT WAS NOT AN ALLOCATOR PROBLEM. 3.3x apply throughput drove transient
+// residency to 80,716 chunks because voxel.Stream.MaxUnloadsPerFrame was still
+// 24 -- a value sized for a ~260 chunks/s pipeline -- so the unload queue grew
+// without bound and a chronically over-full pool fragmented. Raising the unload
+// budget took allocFail to 0 and holes to 0. No defrag was needed.
 //
-// So the change is right and the SIZING is wrong: kPoolCapacityQuads (44 M) and
-// the 49,152 table floor were both derived from the OLD, slower throughput
-// (35,205,733 quads at 39,020 chunks). Batching outruns them.
-//
-// DO NOT FLIP THIS until a leg shows allocFail = 0 with it on. The capacity
-// raise that is expected to allow it is S2-4 in
-// docs/speculative-generation-plan.md; whether first-fit also needs the idle
-// defrag (T3-6, deferred) is open, because a 72x collapse in largest-run is more
-// than headroom alone explains.
-static int32 GVoxelPoolBatchPublish = 0;
+// So this default depends on TWO other numbers being right for the throughput it
+// unlocks: MaxUnloadsPerFrame, and the 64M pool / 81,920 table floor. If any of
+// them is lowered, re-measure allocFail here before assuming this is still safe.
+static int32 GVoxelPoolBatchPublish = 1;
 static FAutoConsoleVariableRef CVarVoxelPoolBatchPublish(
 	TEXT("voxel.Stream.PoolBatchPublish"),
 	GVoxelPoolBatchPublish,
 	TEXT("1 = accumulate pool adds/removes across a streaming tick and publish ONCE at the end of it, ")
-	TEXT("instead of once per mutated chunk. DEFAULT 0. Measured +123% chunks/s and holes 14,827 -> 966 ")
-	TEXT("over four alternated flight legs -- AND allocFail 0 -> 77,290 (96.9M quads) from pool ")
-	TEXT("fragmentation, which is this item's own revert condition. The throughput it unlocks outruns ")
-	TEXT("a 44M pool and a 49,152 chunk-table floor that were both sized from the older, slower ")
-	TEXT("throughput. Do not flip until a leg shows allocFail=0 with it on."),
+	TEXT("instead of once per mutated chunk. DEFAULT 1 since 2026-07-27: took the pooled arm from ")
+	TEXT("~260 chunks/s / 15,032 holes to ~795 / single digits, closing the streaming-perf P0. Most of ")
+	TEXT("that is the stale-result fraction going 42% -> 0% as the result queue stopped backing up. ")
+	TEXT("0 restores the per-chunk path as the A/B control. NOTE it depends on MaxUnloadsPerFrame and ")
+	TEXT("the pool/table sizing being right for the throughput it unlocks -- see the source comment."),
 	ECVF_Default);
 
 // S1-2 (docs/speculative-generation-plan.md Wave S1, §2.2): let a removed
@@ -125,7 +119,22 @@ static FAutoConsoleVariableRef CVarVoxelPoolBatchPublish(
 // ratio of wasted walk on every publication. GetFreeHandleCount() is logged
 // alongside allocsEver on the "Voxel GPU pool:" line so this is visible as it
 // works.
-static int32 GVoxelPoolRecycleHandles = 0;
+// DEFAULT 1 SINCE 2026-07-27, and it is an UNBOUNDEDNESS fix rather than a
+// speed-up -- do not expect chunks/s from it, and do not remove it for failing
+// to deliver any. Measured A/B over four alternated flight legs: allocsEver
+// 155,241 -> 62,299 (-60%), throughput 575.2 -> 579.3 which is INSIDE the
+// 0.8-0.9% noise floor, and BuildChunkRuns total ms down only 6.2%.
+//
+// Why it does not speed anything up, which is worth recording because the
+// opposite was predicted: BuildChunkRuns' cost tracks the runs it EMITS, not
+// the array it walks. At matched emit, cutting the walk 45% moved cost 2% --
+// the sort over ~50k live runs dominates, not the walk over Allocations.
+//
+// What it does fix is real: without it Allocations grows with chunks EVER ADDED
+// for the lifetime of the process, so BuildChunkRuns' walk is unbounded in
+// SESSION LENGTH rather than world size. That does not show up in a 5-minute
+// leg and would show up in a long play session.
+static int32 GVoxelPoolRecycleHandles = 1;
 static FAutoConsoleVariableRef CVarVoxelPoolRecycleHandles(
 	TEXT("voxel.Stream.PoolRecycleHandles"),
 	GVoxelPoolRecycleHandles,

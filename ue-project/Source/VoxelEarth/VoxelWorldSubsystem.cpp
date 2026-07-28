@@ -3281,6 +3281,26 @@ struct FVoxelWorldImpl
 	// accumulate every tick and are reported (then reset) by the 5s periodic
 	// log. All are plain counter adds on a path that already calls
 	// FPlatformTime::Seconds four times per tick; nothing new is timed.
+	// --- Anchor motion (HUD row now; Wave S3's velocity source) -------------
+	//
+	// FINITE-DIFFERENCED FROM THE ANCHOR, DELIBERATELY, NOT Pawn->GetVelocity().
+	// -VoxelPerfFlight=line repositions the pawn with
+	// SetActorLocationAndRotation(..., TeleportPhysics) every tick, which never
+	// touches UFloatingPawnMovement, so the movement component's Velocity is
+	// zero for the entire flight. Anything reading GetVelocity() reports a
+	// stationary camera while the world streams past at 20 m/s -- and it reports
+	// it on exactly the runs this is meant to explain
+	// (docs/speculative-generation-plan.md §2.4).
+	//
+	// The anchor is also the RIGHT point to measure: it is what every ring
+	// radius, admission cutoff and retention decision is computed against, so
+	// its motion is what the streaming numbers are responding to.
+	FVector PrevAnchorLocation = FVector::ZeroVector;
+	bool bHasPrevAnchor = false;
+	// EMA over ~0.25 s. Raw per-tick delta is unreadable at 60+ fps, and a
+	// single repositioning frame would spike it into nonsense.
+	double SmoothedAnchorSpeedUUPerSec = 0.0;
+
 	double AccumDispatchMs = 0.0;
 	double AccumApplyMs = 0.0;
 	double AccumRemeshMs = 0.0;
@@ -3822,6 +3842,20 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	const double TickStartSeconds = FPlatformTime::Seconds();
 
 	using namespace VoxelCoords;
+
+	// Anchor motion, before LastAnchorLocation is overwritten below. See the
+	// PrevAnchorLocation declaration for why this is finite-differenced rather
+	// than read from the pawn's movement component.
+	if (bHasPrevAnchor && DeltaTime > SMALL_NUMBER)
+	{
+		const double InstantUUPerSec = (Anchor - PrevAnchorLocation).Size() / double(DeltaTime);
+		// EMA with a ~0.25 s time constant, frame-rate independent.
+		constexpr double kSpeedTauSeconds = 0.25;
+		const double Alpha = FMath::Clamp(double(DeltaTime) / kSpeedTauSeconds, 0.0, 1.0);
+		SmoothedAnchorSpeedUUPerSec += (InstantUUPerSec - SmoothedAnchorSpeedUUPerSec) * Alpha;
+	}
+	PrevAnchorLocation = Anchor;
+	bHasPrevAnchor = true;
 
 	LastAnchorLocation = Anchor;
 	ElapsedSeconds += DeltaTime;
@@ -6318,9 +6352,41 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// scans. Below 3/4 the queue genuinely has room (cold start, a teleport, or
 	// a throughput burst) and should refill without waiting for the anchor to
 	// move.
+	//
+	// S2-0 (2026-07-27): AND THE QUEUE-DEPTH TEST ABOVE STOPPED MEANING WHAT IT
+	// WAS WRITTEN TO MEAN, so it now carries a second condition.
+	//
+	// "The queue has drained below 3/4 cap" was a proxy for "there is spare
+	// capacity downstream, so admitting more is safe". That proxy was only ever
+	// correct because the queue was short for ONE reason: the consumer could not
+	// keep up, so a short queue genuinely meant starvation. Wave S1 removed that
+	// -- batched publication took applies from ~260 to ~800 chunks/s and the drain
+	// loop now routinely empties the queue -- so the queue is short ALL THE TIME,
+	// the cutoff relaxes on essentially every call, and bounded admission is
+	// effectively off.
+	//
+	// Measured at the S1 config: 22,300 records admitted per second against ~800
+	// chunks/s actually loading, ChunkRecords at 86,077 against a 39,020 settle,
+	// and RecomputeDesiredSet at 66% of the streaming tick -- the O(tracked) exit
+	// scan being paid for records that will never be reached.
+	// docs/measurements/s1-close-2026-07-27.txt.
+	//
+	// So bound the thing that is actually growing. The pending JOB queue is
+	// bounded and healthy; ChunkRecords is not, and it is what the exit scan
+	// walks. A record cap is a direct statement of the invariant the queue depth
+	// was standing in for.
+	//
+	// Default 0 = off = exactly the old behaviour, because this changes which
+	// chunks get admitted and that has to be measured, not assumed. Sized from
+	// measurement when it is: settle is 39,020 chunks and peak residency under
+	// flight is ~50,900, so a useful cap sits above the latter and far below
+	// 86,077.
 	{
 		const int32 Cap = VoxelStreamAdmission::GetPendingJobCap();
-		if (Cap <= 0 || PendingJobNum() * 4 < Cap * 3)
+		const int32 RecordCap = VoxelDebug::GetStreamAdmissionRecordCap();
+		const bool bQueueHasRoom = (Cap <= 0 || PendingJobNum() * 4 < Cap * 3);
+		const bool bRecordsHaveRoom = (RecordCap <= 0 || ChunkRecords.Num() < RecordCap);
+		if (bRecordsHaveRoom && bQueueHasRoom)
 		{
 			for (double& Cutoff : LevelAdmissionCutoffDistSq)
 			{
@@ -10993,6 +11059,15 @@ void FVoxelWorldImpl::UpdatePerfSnapshot(float DeltaTime, float TickMs)
 
 	PerfRefreshAccumSeconds += DeltaTime;
 	LastPerfSnapshot.SubsystemTickMs = TickMs; // always fresh; cheap, no reason to gate behind 1Hz
+
+	// Anchor position and speed, also always fresh rather than 1Hz-gated: these
+	// are two doubles and a float, and a position row that lags a second behind
+	// the world is worse than useless when you are trying to see WHERE the leg
+	// is. 1 voxel = 10 UU = 0.1 m, so UU -> m is /100 and UU/s -> m/s likewise.
+	LastPerfSnapshot.AnchorXMeters = LastAnchorLocation.X / 100.0;
+	LastPerfSnapshot.AnchorYMeters = LastAnchorLocation.Y / 100.0;
+	LastPerfSnapshot.AnchorZMeters = LastAnchorLocation.Z / 100.0;
+	LastPerfSnapshot.AnchorSpeedMetersPerSec = float(SmoothedAnchorSpeedUUPerSec / 100.0);
 
 	if (PerfRefreshAccumSeconds < 1.0f)
 	{

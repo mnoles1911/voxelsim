@@ -146,6 +146,17 @@ void AVoxelEarthHUD::DrawPerfHUD()
 
 		CachedPerfHUDText = FString::Printf(
 			TEXT("voxel.Debug %d -- F3 to cycle\n")
+			// Where the streaming anchor is and how fast it is moving. The
+			// anchor, not the camera: it is the point every ring radius,
+			// admission cutoff and retention decision is measured from, so it
+			// is what the rest of this panel is responding to.
+			//
+			// Speed is finite-differenced from the anchor rather than read
+			// from the pawn's movement component, which is what makes it
+			// non-zero during -VoxelPerfFlight legs -- those teleport the pawn
+			// each tick and never update UFloatingPawnMovement::Velocity. See
+			// FVoxelPerfSnapshot::AnchorSpeedMetersPerSec.
+			TEXT("Anchor: X %.1f m  Y %.1f m  Z %.1f m   speed %.1f m/s\n")
 			TEXT("Streaming: loaded %lld (%.1f/s)  unloaded %lld (%.1f/s)\n")
 			TEXT("  jobs %d/%d  queues job=%d gt=%d unload=%d\n")
 			TEXT("  budget sat %.0f%%  stale discards %lld\n")
@@ -158,6 +169,7 @@ void AVoxelEarthHUD::DrawPerfHUD()
 			TEXT("Frame: subsystem tick %.2fms  frame %.2fms\n")
 			TEXT("Counters: bricks %llu  cells %llu  quads %llu  edits %llu  columns %llu"),
 			VoxelDebug::GetDebugMode(),
+			Snap.AnchorXMeters, Snap.AnchorYMeters, Snap.AnchorZMeters, Snap.AnchorSpeedMetersPerSec,
 			(long long)Snap.TotalChunksLoaded, Snap.ChunksLoadedPerSec, (long long)Snap.TotalChunksUnloaded, Snap.ChunksUnloadedPerSec,
 			Snap.JobsInFlight, Snap.JobsInFlightCap, Snap.PendingJobQueueDepth, Snap.PendingGameThreadQueueDepth, Snap.PendingUnloadQueueDepth,
 			Snap.BudgetSaturationPct, (long long)Snap.StaleResultsDiscarded,
