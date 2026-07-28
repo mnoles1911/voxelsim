@@ -460,16 +460,48 @@ TAutoConsoleVariable<int32> CVarVoxelStreamAdmissionRecordCap(
 // (docs/measurements/s1-close-2026-07-27.txt). Parked geometry has weaker back
 // pressure than resident geometry -- nothing is asking for it.
 //
-// 0 = off (default) until a leg sizes it. Peak flight residency is ~50,900
-// chunks against a 64M-quad pool and an 81,920 chunk-table floor, so the room
-// available for parked entries is what is left of BOTH.
+// DEFAULT 12,000 SINCE 2026-07-28, AND THAT IS A MEASUREMENT.
+//
+//   profile   parking off      parking 12,000        hit
+//   circle       893.7            906.5  (+1.4%)     90%
+//   line        1040.6           1064.9  (+2.3%)     78%
+//
+// holes 0 and allocFail 0 on every leg, and the streaming tick does ~6% LESS
+// work with it on (tickMs 26,890 vs 28,517 summed over a circle leg). Roughly
+// 78-90% of adoptions skip a GPU mesh dispatch entirely -- work that appears in
+// none of those numbers.
+//
+// TWO THINGS HAD TO BE FIXED BEFORE IT PAID, and both are worth knowing:
+//
+//   1. Park/unpark published eagerly, so every adopt traded one meshing round
+//      trip for one FULL POOL PUBLICATION. After S1-1 the publication is the
+//      expensive thing. That alone cost ~17%. They now defer
+//      (MarkChunkTableDirtyDeferred) and the streaming tick's own batch carries
+//      it.
+//   2. Parking EVERY eviction scored an 8% hit rate and cost allocFail
+//      0 -> 45,633 and holes 0 -> 1,804. On a traverse everything evicted by the
+//      outer edge is behind the camera and never returns. Restricting to
+//      RetainDir_Finer -- inner-boundary oscillation, the only eviction cause
+//      that comes back -- took the hit rate to 78-90% with no other change.
+//      WHERE you cache matters more than HOW MUCH.
+//
+// And it read as a 21% REGRESSION until chunksPerSec was fixed to count adopted
+// chunks as loaded, because the adopt path never incremented TotalChunksLoaded.
+// A metric that cannot see half a feature's output will reject the feature.
+// docs/measurements/s1-close-2026-07-27.txt.
+//
+// Sizing: peak flight residency is ~50,900 chunks, so 12,000 parked sits inside
+// both the 64M-quad pool and the 81,920 chunk-table floor with room to spare --
+// verified by allocFail 0 on every leg. Parked chunks consume BOTH, so raising
+// this is bounded by what demand residency leaves free.
 TAutoConsoleVariable<int32> CVarVoxelStreamPoolParkMax(
 	TEXT("voxel.Stream.PoolParkMax"),
-	0,
+	12000,
 	TEXT("Max chunks kept as hidden-but-allocated pool ranges after eviction, so re-admission is a table ")
-	TEXT("write rather than a re-mesh. 0 = off (evict frees immediately, pre-S2-3 behaviour). Parked chunks ")
-	TEXT("still consume pool quads AND chunk-table entries, so this is bounded by what demand residency ")
-	TEXT("leaves free -- see the source comment."),
+	TEXT("write rather than a re-mesh. DEFAULT 12,000 since 2026-07-28: +1.4% (circle) / +2.3% (line) ")
+	TEXT("placed-chunks/s with holes 0, allocFail 0, a 78-90% adoption hit rate and ~6% less tick work. ")
+	TEXT("0 = off (evict frees immediately) as the A/B control. Parked chunks consume pool quads AND ")
+	TEXT("chunk-table entries, so raising this is bounded by what demand residency leaves free."),
 	ECVF_Default);
 
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxRemeshesPerFrame(

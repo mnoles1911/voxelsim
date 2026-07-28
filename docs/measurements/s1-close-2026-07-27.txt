@@ -287,10 +287,15 @@ scope does not reach.
   reproduce 847.6-855.3 at 83-84%. The scope is the cause; the mechanism is not
   understood. See the note at the RecomputeDesiredSet call site.
 
-VERDICT: parking is throughput-neutral, does ~6% less tick work, and avoids a
-GPU mesh dispatch on ~90% of adoptions. 89-90% hit, zero allocFail, zero holes,
-frame time flat at ~22.5 ms p50. Default to be flipped on the re-measured legs
-with adopts counted.
+VERDICT: parking SHIPS ON. Re-measured with adopted chunks counted as placed:
+
+    profile   parking off   parking 12,000     hit
+    circle         893.7        906.5 (+1.4%)  90%
+    line          1040.6       1064.9 (+2.3%)  78%
+
+holes 0 and allocFail 0 on every leg, ~6% less tick work, and 78-90% of
+adoptions skip a GPU mesh dispatch entirely. voxel.Stream.PoolParkMax default
+0 -> 12,000.
 
   The earlier "stays 0" verdict was an artefact of the metric, not a property of
   the feature.
