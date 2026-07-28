@@ -90,13 +90,29 @@ one draw call. The renderer sees a single world-sized object and can only answer
 
 Two approaches:
 
-**(a) Horizon culling — cheaper, terrain-specific.** For a camera near the
-ground, a chunk is occluded if its top lies below the sightline grazing the
-nearest ridge on that bearing. The surface heights are already on hand
-(`FootprintBandCache`, the clipmap heightfield). Build a coarse per-bearing
-horizon-angle array once per frame from the near rings; reject chunks whose
-angular extent falls entirely below it. No GPU readback, no frame of latency.
-Weak when looking down from height.
+**(a) Horizon culling — cheaper, terrain-specific, and NOT SOUND FROM CHUNK
+BOUNDS.** The appealing version is: build a per-bearing horizon-angle array from
+the near chunks' `RunBounds` (which the cull already has on the render thread),
+then reject any chunk whose angular extent falls entirely below it. Two passes
+over ~10k in-frustum runs, no GPU readback, no frame of latency.
+
+**It is wrong, and this was worked through on 2026-07-28 rather than discovered
+in a screenshot.** A chunk's bounding box is not solid. Voxel terrain has caves,
+arches, overhangs and thin spires, so a *near* chunk whose box reaches high does
+not occlude anything — you can see straight past a spire, and straight through a
+cave mouth. Occlusion derived from bounds is therefore not conservative: it hides
+terrain the player can see, and a pooled primitive fails silently (ground rule 4),
+so the symptom is missing landscape with nothing in any log.
+
+To make it sound the horizon must come from something that is actually opaque —
+the clipmap **heightfield** (`FootprintBandCache` / the surface-height columns),
+not chunk bounds — and even then caves below the surface line break it. That
+restricts it to "reject chunks entirely below the surface horizon", which is
+close to what the buried skip already does at admission.
+
+⇒ **Prefer (b).** Approach (a) is recorded here so it is not re-proposed as the
+cheap option; its cheapness comes from using data that cannot answer the
+question.
 
 **(b) HZB occlusion — general, the real answer.** A compute pass tests each
 chunk's bounds against the previous frame's hierarchical depth buffer and writes
