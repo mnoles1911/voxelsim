@@ -548,6 +548,13 @@ because `MaxUnloadsPerFrame` was still 24, a value sized for a 260 chunks/s
 pipeline. Raising it took `allocFail` 26,763 → 0 and holes 257 → 0. (Defrag may
 still be wanted for other reasons; it is not the fix for this.)
 
+**`MaxAppliesPerFrame` at 192 as a regression.** WRONG, and recorded here
+because it was nearly entered as fact. A leg measuring 749 chunks/s / 179 holes
+had shared the box with a second editor for 86 s; re-run alone on the same
+binary it gave 1,033-1,048 with holes 0, a +30% win over 794. The default is now
+192. A contended leg looks exactly like a slow configuration, and a plausible
+mechanism had already been written to explain it.
+
 **Handle recycling as a THROUGHPUT lever.** `Allocations` is append-only and
 `BuildChunkRuns` walks it, giving a 3.72× walk:emit ratio by end of flight — but
 cost tracks `emit`, not `walk`. Cutting the walk 45% bought 2%; `BuildChunkRuns`

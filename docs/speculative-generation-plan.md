@@ -18,25 +18,32 @@ queue to `queueEmpty` dominant with a 0% stale fraction. The consumer is no
 longer the wall — which was the entire premise of this re-sequencing. And
 `holes = 0` at the adopted cascade for the first time.
 
-**THE CONSTRAINT IS NOW ADMISSION, AND S1 CREATED THAT.** At the winning config
-`RecomputeDesiredSet` is 66% of the streaming tick. The cause is a feedback loop:
-`RecomputeDesiredSet` relaxes every `LevelAdmissionCutoffDistSq` to `DBL_MAX`
-when `PendingJobNum() * 4 < Cap * 3` — i.e. whenever the pending queue is short.
-S1 made the queue permanently short, so the admission cutoff is permanently
-disabled: 22,300 records/s admitted against ~800 chunks/s actually loading,
-`tracked` at 92,875, and an O(tracked) exit scan to pay for it.
+**ADMISSION IS NOW THE LARGEST SHARE OF THE TICK — BUT THE TICK IS SMALL.**
+*(Corrected 2026-07-27: the first version of this section said "66% of the tick"
+and treated it as the new bottleneck. That number is a PEAK WINDOW's share of
+the streaming tick, and the tick is only ~16% of wall time. Measured across a
+full leg, `RecomputeDesiredSet` totals 10.2 s of ~285 s — **~3.6% of wall**.
+Real, worth fixing, and nowhere near the constraint it was described as. This is
+the same error that produced the original P0: a true ratio quoted against the
+wrong denominator.)*
 
-**This is the single most important input to T4-1 and it was not in the original
-plan.** Speculation *adds admission-side work* — S4-1 enumerates candidates the
-demand path has not asked for yet. Adding that on top of a path that is already
-the bottleneck, and that already floods because its cap stopped working, is the
-same mistake as building a producer multiplier while the consumer was the wall.
+At the winning config `RecomputeDesiredSet` is the biggest single item inside
+the streaming tick. The mechanism is real even though the magnitude was
+overstated: `RecomputeDesiredSet` relaxes every `LevelAdmissionCutoffDistSq` to
+`DBL_MAX` when `PendingJobNum() * 4 < Cap * 3` — whenever the pending queue is
+short. S1 made the queue permanently short, so the cutoff is permanently
+disabled: ~22,300 records/s admitted against ~800 chunks/s actually loading, and
+`tracked` peaking near 96,000 against a 39,020 settle.
 
-  ⇒ **T4-2 (GPU-resident residency) moves from "radical bet, decide later" to a
-  likely PREREQUISITE for T4-1**, or at minimum the admission cutoff has to be
-  made to work at the new throughput before any speculative enumerator is built.
-  Re-decide this at the hard stop; do not carry the old ordering forward
-  unexamined.
+Speculation *adds admission-side work* — S4-1 enumerates candidates the demand
+path has not asked for — so this still shapes S4's design even at 3.6% of wall.
+It is a design constraint on the enumerator, not a blocker to be cleared first.
+
+  ⇒ T4-2 stays a **bet, not a prerequisite** — at 3.6% of wall the exit scan is
+  not what stands between here and T4-1. What DOES matter for T4-1 is unchanged:
+  speculation adds admission-side work, so the enumerator must be cheap and must
+  not share `PendingJobKeysByLevel`. Re-check the share once speculation is
+  actually adding load.
 
 ### Items measurement removed or demoted (do not rebuild without new evidence)
 
@@ -45,8 +52,8 @@ same mistake as building a producer multiplier while the consumer was the wall.
 | **T1-3** params cache | on T4-1's critical path | `params` is 0.002–0.004 ms — **0.2% of an apply**. STRUCK. |
 | **S1-2** handle recycling | "3.72× reduction in the dominant term" | Works (`allocsEver` −60%) but throughput moved **inside noise**. `BuildChunkRuns` is dominated by `Runs.Sort()` over live runs, not the walk. Keep as an unboundedness fix; it is not a speed-up. |
 | **T3-6** idle defrag | implied by 16,903 free runs / 72× largest-run collapse | The fragmentation was a SYMPTOM of residency ballooning on a too-small unload budget. Fixed by a cvar. **Not needed.** |
-| **T1-2(b)**, **S1-4** | next levers after S1-1 | Real costs (`Runs.Sort` ~3.3 ms, `RebuildRunBounds` ~1.34 ms per publication) but at ~28 publications/s that is ~10% of the tick against `RecomputeDesiredSet`'s 66%. **Deprioritised, not cancelled.** |
-| **MaxAppliesPerFrame** | "rejected at 192" | That leg was CONTENDED and is void. **Undecided.** |
+| **T1-2(b)**, **S1-4** | next levers after S1-1 | Real costs (`Runs.Sort` ~3.3 ms, `RebuildRunBounds` ~1.34 ms per publication), but the whole streaming tick is ~16% of wall and these are a slice of it. **Deprioritised, not cancelled.** |
+| **MaxAppliesPerFrame** | "rejected at 192" | That leg was CONTENDED. Re-run clean: **1,033–1,048 chunks/s vs 794, holes 0** — a +30% WIN, not a regression. Default now 192. |
 
 ### Sizing, which T4-1's budget depends on
 
@@ -102,6 +109,12 @@ defers the rest. Nothing is cancelled; the deferred items keep their numbering.
 **Owner decisions taken with it:** pool capacity target **104M quads**, reached
 in two steps; **hard stop to re-decide after the plateau closes** (end of Wave
 S1).
+
+*Update after S1: only the first step (64M) was needed, and it was taken early
+because batching — not parking — required it. Peak residency with the unload
+budget fixed is ~50,900 chunks (~46M quads), so the second step to 104M is NOT
+justified by anything measured yet. Re-derive it from T4-1's actual speculative
+reserve rather than taking it as given.*
 
 ## How to use this document
 
@@ -399,7 +412,18 @@ tick.
   for. Stacking that on a flooding admission path repeats the exact mistake this
   re-sequencing exists to avoid.
 
-  **S2-0 — make the relaxation condition mean what it was meant to mean.** The
+  **S2-0 — ATTEMPTED AND IT DOES NOT BIND. See the correction below before
+  re-attempting.** `voxel.Stream.AdmissionRecordCap` gates the relaxation at the
+  TOP of `RecomputeDesiredSet`, but `TruncatePendingJobQueue` runs at the END of
+  the same call and `DropFarthestOverCap` sets `OutCutoffDistSq = DBL_MAX`
+  whenever a level's queue is not full — so the cutoff is re-relaxed immediately
+  and the cap is a no-op. Measured: `peakTracked` 96,657 (off) vs 96,287 (cap
+  52,000), `recordsAdded` unchanged. A real fix has to gate BOTH sites.
+
+  **And it is low priority**: see the corrected share above. The cvar is left in
+  place, default 0, documented as ineffective rather than quietly removed.
+
+  ~~Make the relaxation condition mean what it was meant to mean.~~ The
   intent is "there is spare capacity downstream", and `PendingJobNum()` was a
   proxy for that which only worked while the consumer was the bottleneck. Candidates:
   gate on `tracked` against a residency target, on the apply loop's *exit reason*
