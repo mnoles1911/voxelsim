@@ -19,10 +19,20 @@ outlive the code.
   quads), demand byte-identical across meshers and legs.
 - **Vs the pre-GPU method at its own scale**: 6x fewer hitches, better
   p50/p95, equal coverage.
-- **Open P0, precisely scoped**: pooled-arm loading plateaus at ~600 chunks/s
-  at the 4 km cascade (component arm: ~1,080). Not the mesher, not the fork
-  caps, not pipeline depth — all falsified. Diagnose the pooled apply/table
+- **~~Open P0, precisely scoped~~ — CLOSED the same day, see
+  `docs/lessons-2026-07-27-s0-s1.md`**: pooled-arm loading plateaus at ~600
+  chunks/s at the 4 km cascade (component arm: ~1,080). Not the mesher, not the
+  fork caps, not pipeline depth — all falsified. Diagnose the pooled apply/table
   path before building tile batching (design + occupancy census on record).
+
+  **Resolved at 797.0 chunks/s with converged holes = 0.** The cause was the
+  per-chunk `PushUpdatesToProxy` (98–99% of per-apply cost), which backed the
+  result queue up until 42% of drained results were stale. The "apply budget only
+  8.5% saturated, results are not ARRIVING" reading that framed this bullet was
+  itself an artefact — `LastAppliedFrac` divides by the count cap while the drain
+  breaks on a wall clock, and `queueEmpty` measured 0 in every streaming window.
+  Results were arriving faster than they could be applied.
+  Ladder: `docs/measurements/s1-close-2026-07-27.txt`.
 
 ## Deprecation decision (owner, 2026-07-27)
 

@@ -521,6 +521,40 @@ rings fading simultaneously across the shared band rather than crossing over) in
 
 Recorded so these are not re-attempted. Each was measured, not argued.
 
+**The ~600 chunks/s pooled plateau (2026-07-27).** CLOSED at 797.0 chunks/s with
+converged **holes = 0** — the first time the pooled arm completed the world at
+the adopted 128 m / 4 km cascade. Cause was the per-chunk `PushUpdatesToProxy`
+(98–99% of per-apply cost, rising to 2.1 ms/apply under flight), which backed up
+the result queue until 42% of drained results were discarded as stale. Fixed by
+batching publication once per tick, plus an unload budget raised from a value
+sized for the old throughput. Full ladder:
+`docs/measurements/s1-close-2026-07-27.txt`.
+
+**"Results are not ARRIVING" as a reading of the plateau.** FALSE, and it was an
+artefact of `LastAppliedFrac` dividing by the count cap while the drain loop
+breaks on a wall clock. `queueEmpty` was 0 in every streaming window measured —
+results arrived faster than they could be applied. Do not re-derive producer-side
+work from that sentence.
+
+**T1-3, the per-apply `Amplifier::column` / column-keyed params cache.** STRUCK.
+`SampleChunkParamsForPool` measures 0.002–0.004 ms per apply — **0.2% of an
+apply** — at every point in every leg, against `poolAdd`'s 98–99%. §1c names it
+as an aggravator and it is not one. Caching it removes nothing.
+
+**T3-6 idle pool defrag, as a response to the batching-era allocation failures.**
+NOT NEEDED. 16,903 free runs and a 72× collapse in largest-free-run at equal
+total free looks exactly like first-fit pathology; it was residency ballooning
+because `MaxUnloadsPerFrame` was still 24, a value sized for a 260 chunks/s
+pipeline. Raising it took `allocFail` 26,763 → 0 and holes 257 → 0. (Defrag may
+still be wanted for other reasons; it is not the fix for this.)
+
+**Handle recycling as a THROUGHPUT lever.** `Allocations` is append-only and
+`BuildChunkRuns` walks it, giving a 3.72× walk:emit ratio by end of flight — but
+cost tracks `emit`, not `walk`. Cutting the walk 45% bought 2%; `BuildChunkRuns`
+is dominated by `Runs.Sort()` over live runs. Keep the recycling as an
+unboundedness fix (`allocsEver` −60%, and it grows all session otherwise); do not
+expect chunks/s from it.
+
 **Sea level as a design lever.** Not a generation input at all: z=0 is inherited
 from ETOPO's datum and hardcoded downstream (tile format, `biome.h`'s coastal
 band, `caves.h`'s implicit ocean, the water system). Lowering it does not help

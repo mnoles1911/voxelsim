@@ -376,6 +376,50 @@ the adopted cascade — and the pooled arm is at or past **1,082 chunks/s** with
 `holes(final) = 0`. Then **stop and report** either way; a negative result is a
 deliverable.
 
+### Wave S2 — RESHAPED BY S1's RESULT. Read this before the item list.
+
+Three things changed under this wave while S1 ran:
+
+**S2-4 already shipped, early and for a different reason.** The pool is at 64M
+and the table at 81,920 — not to make room for parking, but because batching
+outran both and started refusing allocations. Whether 64M is *more* than parking
+needs is now an open control (§Sizing above).
+
+**A NEW ITEM GOES FIRST, AND IT BLOCKS T4-1: fix the admission cutoff.**
+`RecomputeDesiredSet` relaxes every `LevelAdmissionCutoffDistSq` to `DBL_MAX`
+when `PendingJobNum() * 4 < Cap * 3`. That test means "the queue is short, so we
+can afford to admit more" — which was true when the queue was short only because
+the pipeline was starved. Now the queue is short because the consumer is *fast*,
+so the cutoff is permanently off and admission floods: 22,300 records/s against
+~800 chunks/s loading, `tracked` 92,875, and `RecomputeDesiredSet` at 66% of the
+tick.
+
+  This is the whole reason T4-1 cannot simply be built next. Speculation adds
+  admission work by construction — S4-1 enumerates keys demand has not asked
+  for. Stacking that on a flooding admission path repeats the exact mistake this
+  re-sequencing exists to avoid.
+
+  **S2-0 — make the relaxation condition mean what it was meant to mean.** The
+  intent is "there is spare capacity downstream", and `PendingJobNum()` was a
+  proxy for that which only worked while the consumer was the bottleneck. Candidates:
+  gate on `tracked` against a residency target, on the apply loop's *exit reason*
+  (S0-1's counters already distinguish queue-empty from budget-bound), or on
+  admitted-vs-loaded rate. Measure `tracked`, `recordsAdded`, recompute ms and
+  chunks/s; it must cut the flood without starving the leading edge.
+  *Gate:* its own cvar, default = today's behaviour.
+
+**The budget lesson generalises, and T4-1 will trip it again.**
+`MaxUnloadsPerFrame=24` was correct for 260 chunks/s and became the binding
+constraint at 631 — costing 77,290 refused allocations and looking exactly like
+allocator fragmentation. Every per-frame budget in this subsystem was tuned
+against a slower pipeline: `MaxAppliesPerFrame`, `MaxRemeshesPerFrame`,
+`kMaxResultDrainsPerFrame`, `kMaxUnloadPopsPerFrame`, `GpuMeshInFlight`,
+`MeshBatchCap`, `MeshHarvestCap`.
+
+  **Any wave that changes throughput must re-sweep the budgets downstream of it,
+  and a saturated budget can present as a bug in something else entirely.**
+  T4-1 changes throughput by construction. Budget-sweep before diagnosing.
+
 ### Wave S2 — Parking, capacity, and the debt it creates
 
 Ships and is measured **on its own**, before any speculation exists: re-admit
@@ -441,7 +485,49 @@ reproduces the measured refill-churn pathology), and T4-1 does not need it.
 on the correct heading. **If it logs zero, stop** — nothing downstream is
 measurable.
 
-### Wave S4 — T4-1
+### Wave S4 — T4-1. What S1 changed about how to build it.
+
+**The headroom argument is now measured in-engine, and it holds.** S0's latency
+split: the GPU finishes a chunk in ~12 ms (`dispatchToReady` p50) and the job
+waits ~128 ms to be picked up (`queued` p50), with the fork sitting at ~11 jobs
+in flight against a cap of 256. The GPU is idle waiting for the pipeline, not
+the reverse. That is the real basis for T4-1 — **not** the 92,000 chunks/s bench
+figure, which does not transfer (§2.1).
+
+**Four design constraints S1 produced, all of which change S4:**
+
+1. **Enumeration must be cheap, because admission is the bottleneck.** S4-1 was
+   specified as "reuse the existing footprint machinery" for correctness reasons.
+   It is now also a *cost* requirement: `RecomputeDesiredSet` is 66% of the tick
+   before speculation adds anything. If S2-0 does not fix the flood, T4-2 comes
+   first — do not build a speculative enumerator onto a path that is already
+   drowning.
+
+2. **Parked + speculative geometry needs a HARD cap and its own eviction, or it
+   will eat the pool.** Measured: residency expands to fill whatever capacity
+   exists when the drain lags — 80,716 chunks against an 81,920 table floor, with
+   refusals — and it looked like allocator fragmentation. Speculative geometry is
+   *by definition* geometry nothing is asking for, so it has no natural back
+   pressure at all. `SpeculativeMaxParked` is not a tuning knob, it is the thing
+   standing between this feature and a pool that refuses demand allocations.
+
+3. **`specHitRate` is the deciding metric and it must be reported per level.**
+   Unchanged from the original design, and S1 makes it sharper: at 797 chunks/s
+   demand the pipeline is no longer starved, so speculation is spending capacity
+   that has an alternative use. A hit rate under ~50% is not "some waste", it is
+   the feature failing.
+
+4. **Re-sweep the budgets after it lands** (see the Wave S2 note). T4-1 changes
+   throughput; the last two things that did each moved the bottleneck somewhere
+   nobody was looking.
+
+**And the target is now flight-phase holes specifically.** Converged
+`holes = 0` is already achieved without any speculation (S1 close). So T4-1 is
+no longer competing for permanent coverage — it is aimed squarely at the
+transient leading-edge gap under motion, which is what a player actually sees
+and what the ~854–907 flight-phase median measured. Re-measure that median at
+the S1 config first: it may already have moved, and T4-1's win has to be stated
+against the *current* number, not the pre-S1 one.
 
 **S4-1 — Enumeration.** New per-tick hook in `TickStreaming` between the
 recompute gate and `DispatchJobs`; `RecomputeDesiredSet` runs only on a crossing
