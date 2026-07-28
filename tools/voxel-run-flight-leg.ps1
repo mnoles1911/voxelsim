@@ -52,6 +52,11 @@ param(
     [int]$PreflightSec = 90,
     [int]$LingerSec = 60,
     [int]$LogIntervalSec = 2,
+    # 'line' traverses virgin terrain and never revisits; 'surface' is the 100 m
+    # circle, which revisits continuously. They are opposite extremes for
+    # anything that CACHES geometry -- parking scored 84% hit / -18% chunks/s on
+    # line, where there is nothing to revisit. Quote which one a result came from.
+    [ValidateSet('line','surface','underground','static')][string]$Flight = 'line',
     [string]$SpawnAt = '-84480,53760',
     [int]$TimeoutSec = 480,
     [switch]$KeepEditLog,
@@ -86,7 +91,7 @@ $argList = @(
     "-abslog=`"$LogPath`"",
     "-VoxelSpawnAt=$SpawnAt",
     "-VoxelPerfRun=$RunSec",
-    '-VoxelPerfFlight=line',
+    "-VoxelPerfFlight=$Flight",
     "-VoxelPerfPreflightSec=$PreflightSec",
     "-VoxelPerfLingerSec=$LingerSec",
     "-VoxelPerfLogInterval=$LogIntervalSec",

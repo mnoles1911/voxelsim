@@ -187,3 +187,74 @@ STILL NOT DONE
 
 Raw logs are NOT committed (/Saved/ gitignored): s24-cap64-on-1/2, s24-unload96,
 s24-unload256, s24-apply192, s1close-1/2.
+
+================================================================================
+S2-3 PARKING -- MEASURED AND NOT JUSTIFIED AS INTEGRATED (2026-07-27)
+================================================================================
+
+Keep an evicted chunk's pool range, hidden, so re-admission is a chunk-table
+write instead of a re-mesh round trip. Also T4-1's intended substrate.
+
+  profile   config          chunks/s   holes   allocFail   parked/adopted (hit)
+  line      off             1040.6         0           0   --
+  line      off             1040.5         0           0   --
+  line      park 4,000       850.3         0           0   28,185 / 21,428 (76%)
+  line      park 12,000      855.3         2           0   28,117 / 23,709 (84%)
+  line      park 12,000      850.1         0           0   27,577 / 22,971 (83%)
+  line      park 12,000      847.6         0           0   27,377 / 23,118 (84%)
+  circle    off              893.7         0           0   --
+  circle    park 12,000      596.7         0           0   46,866 / 41,726 (89%)
+
+THE CACHE WORKS AND STILL LOSES. On the circle profile -- continuous revisiting,
+parking's BEST case -- 89% of parked geometry is adopted and throughput is 33%
+LOWER. On line it is 83-84% hit and 18% lower. Higher hit rate, bigger loss.
+
+WHY: each adopt calls UnparkChunk, which calls PushUpdatesToProxy, and the adopt
+path lives in RecomputeDesiredSet -- which S1-1's FScopedBatch does NOT cover
+(that scope wraps DrainResults/DrainGameThreadMesh/DrainUnloads). So parking
+trades one meshing round trip for one FULL POOL PUBLICATION, and after S1-1 a
+publication is the expensive thing. 41,726 adopts is 41,726 publications.
+
+This is S1-1's own finding pointing back at itself: the per-item publication cost
+is what made the original plateau, and parking reintroduced it on a path S1-1's
+scope does not reach.
+
+  FIRST ATTEMPT AT THE FIX IS REVERTED AND UNDIAGNOSED. Wrapping
+  RecomputeDesiredSet in an FScopedBatch took parking from 28,117 parks / 84% hit
+  to ZERO parks and chunks/s 1,040 -> 540, with the world still churning at the
+  end of the linger. Confirmed not to be variance: three legs after the revert
+  reproduce 847.6-855.3 at 83-84%. The scope is the cause; the mechanism is not
+  understood. See the note at the RecomputeDesiredSet call site.
+
+VERDICT: voxel.Stream.PoolParkMax stays 0. The mechanism is sound (89% hit, zero
+allocFail, zero holes, frame time flat at ~22.5 ms p50 throughout) and the
+integration is not.
+
+  ALSO AN EARLIER, LARGER FAILURE, kept because it is the more useful finding:
+  parking EVERY eviction scored 8% hit and cost allocFail 0 -> 45,633, holes
+  0 -> 1,804. On a traverse everything evicted by the outer edge is behind the
+  camera and never returns. Restricting to RetainDir_Finer -- inner-boundary
+  oscillation, the only eviction cause that comes back -- took the hit rate
+  8% -> 84% with no other change. WHERE you cache matters far more than HOW MUCH.
+
+--------------------------------------------------------------------------------
+WHAT THIS CHANGES FOR T4-1
+--------------------------------------------------------------------------------
+
+T4-1's adopt path IS THIS PATH: AddCandidate finds parked geometry and unparks
+it. Speculation would inherit the same per-adopt publication, at higher volume,
+and would lose for the same reason -- while looking like a hit-rate success.
+
+So, promoted onto T4-1's critical path:
+
+  1. BATCH THE ADOPT PATH. Not an optimisation any more. Requires first
+     diagnosing why FScopedBatch around RecomputeDesiredSet zeroed parking.
+  2. specHitRate IS NOT SUFFICIENT as T4-1's deciding metric. Parking scored 89%
+     and lost. The metric has to be throughput and holes AT a given hit rate,
+     because a cache can be almost perfectly effective and still cost more than
+     it saves.
+
+That second point is the one worth carrying: the original plan named specHitRate
+as the number that decides T4-1, and this measurement shows a 89%-effective
+cache losing 33% throughput. Hit rate measures whether the PREDICTION was right.
+It says nothing about whether the mechanism is cheap enough to be worth using.
