@@ -1,10 +1,62 @@
 # Speculative generation (T4-1): the re-sequenced path, and why this order
 
-**Status:** written 2026-07-27. **Wave S0 is CLOSED — §1a confirmed, Wave S1
-proceeds.** Results and the full verdict:
-`docs/measurements/s0-apply-census-2026-07-27.txt`. This supersedes the wave
-ORDER in `docs/streaming-perf-implementation-plan.md` for the T4-1 path only —
-that document's per-item content still stands and is referenced throughout.
+**Status:** written 2026-07-27. **Wave S0 CLOSED** (§1a confirmed —
+`docs/measurements/s0-apply-census-2026-07-27.txt`). **Wave S1 CLOSED** —
+`docs/measurements/s1-close-2026-07-27.txt`. This supersedes the wave ORDER in
+`docs/streaming-perf-implementation-plan.md` for the T4-1 path only — that
+document's per-item content still stands and is referenced throughout.
+
+## Wave S1 outcome, and what it did to the rest of this plan
+
+    baseline                                260.9 chunks/s   15,032 holes
+    + batch publication (S1-1)              581.3               966
+    + pool 64M / table 81,920               631.6               257
+    + unload budget 24 -> 256               797.0                 0
+
+**§1a is discharged.** The apply loop went from never once reaching an empty
+queue to `queueEmpty` dominant with a 0% stale fraction. The consumer is no
+longer the wall — which was the entire premise of this re-sequencing. And
+`holes = 0` at the adopted cascade for the first time.
+
+**THE CONSTRAINT IS NOW ADMISSION, AND S1 CREATED THAT.** At the winning config
+`RecomputeDesiredSet` is 66% of the streaming tick. The cause is a feedback loop:
+`RecomputeDesiredSet` relaxes every `LevelAdmissionCutoffDistSq` to `DBL_MAX`
+when `PendingJobNum() * 4 < Cap * 3` — i.e. whenever the pending queue is short.
+S1 made the queue permanently short, so the admission cutoff is permanently
+disabled: 22,300 records/s admitted against ~800 chunks/s actually loading,
+`tracked` at 92,875, and an O(tracked) exit scan to pay for it.
+
+**This is the single most important input to T4-1 and it was not in the original
+plan.** Speculation *adds admission-side work* — S4-1 enumerates candidates the
+demand path has not asked for yet. Adding that on top of a path that is already
+the bottleneck, and that already floods because its cap stopped working, is the
+same mistake as building a producer multiplier while the consumer was the wall.
+
+  ⇒ **T4-2 (GPU-resident residency) moves from "radical bet, decide later" to a
+  likely PREREQUISITE for T4-1**, or at minimum the admission cutoff has to be
+  made to work at the new throughput before any speculative enumerator is built.
+  Re-decide this at the hard stop; do not carry the old ordering forward
+  unexamined.
+
+### Items measurement removed or demoted (do not rebuild without new evidence)
+
+| item | was | measured |
+|---|---|---|
+| **T1-3** params cache | on T4-1's critical path | `params` is 0.002–0.004 ms — **0.2% of an apply**. STRUCK. |
+| **S1-2** handle recycling | "3.72× reduction in the dominant term" | Works (`allocsEver` −60%) but throughput moved **inside noise**. `BuildChunkRuns` is dominated by `Runs.Sort()` over live runs, not the walk. Keep as an unboundedness fix; it is not a speed-up. |
+| **T3-6** idle defrag | implied by 16,903 free runs / 72× largest-run collapse | The fragmentation was a SYMPTOM of residency ballooning on a too-small unload budget. Fixed by a cvar. **Not needed.** |
+| **T1-2(b)**, **S1-4** | next levers after S1-1 | Real costs (`Runs.Sort` ~3.3 ms, `RebuildRunBounds` ~1.34 ms per publication) but at ~28 publications/s that is ~10% of the tick against `RecomputeDesiredSet`'s 66%. **Deprioritised, not cancelled.** |
+| **MaxAppliesPerFrame** | "rejected at 192" | That leg was CONTENDED and is void. **Undecided.** |
+
+### Sizing, which T4-1's budget depends on
+
+The pool went 44M → 64M quads and the table 49,152 → 81,920 to stop batching
+refusing allocations. With the unload budget fixed, peak residency settles at
+~50,900 chunks (~46M quads) — so the table raise is genuinely required (the peak
+went through the old floor) but **64M may be more than needed**. That matters
+here specifically: §2.6's memory arithmetic and T4-1's speculative reserve are
+both sized from what is left over. Run a control at 48M before treating the
+extra as necessary.
 
 **What S0 changed, in one block** (details in the measurements file):
 
