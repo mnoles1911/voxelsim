@@ -7,6 +7,7 @@
 #include "Materials/Material.h"
 #include "Materials/MaterialRenderProxy.h"
 #include "MeshBatch.h"
+#include "Algo/BinarySearch.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "RHIGPUReadback.h"
@@ -247,6 +248,17 @@ namespace VoxelGpuPoolCull
 	// failure mode (a partially re-allocated freed block leaving a tail of quads
 	// naming a recycled id) cannot occur naturally, so a clean leg is not
 	// evidence about it -- ground rule 13.
+	// Rebuild the run list from scratch every publication and byte-compare it
+	// against the incrementally maintained one, logging the first divergence.
+	// The -VoxelCoarseGridVerify pattern: a parallel structure maintained by
+	// mutation is only trustworthy with a checker that can be switched on.
+	static int32 GRunsVerify = 0;
+	static FAutoConsoleVariableRef CVarRunsVerify(
+		TEXT("voxel.Stream.PoolRunsVerify"), GRunsVerify,
+		TEXT("1 = rebuild the chunk-run list from scratch each publication and compare it against the "
+		     "incremental one. Logs the first divergence and latches. Expensive; diagnosis only."),
+		ECVF_Default);
+
 	static int32 GGpuHide = 0;
 	static FAutoConsoleVariableRef CVarGpuHide(
 		TEXT("voxel.Stream.PoolGpuHide"), GGpuHide,
@@ -2151,6 +2163,7 @@ void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 	// did this RUN do", not "what is happening right now".
 	PendingGpuWrites.Reset();
 	PendingGpuHides.Reset();
+	LiveRunsSorted.Reset();
 	bChunkTableDirty = false;
 	bRunsDirty = false;
 }
@@ -2292,6 +2305,7 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 	MarkQuadsDirty(Alloc.Offset, Alloc.NumQuads);
 	bChunkTableDirty = true;
 	bRunsDirty = true;
+	InsertLiveRun(ChunkId, Alloc.Offset, Alloc.NumQuads);
 	PushUpdatesToProxy();
 	UpdateBounds();
 	return Handle;
@@ -2398,6 +2412,7 @@ int32 UVoxelGpuPoolComponent::AddChunkFromGpu(const FVoxelGpuQuadPayloadRef& Src
 
 	bChunkTableDirty = true;
 	bRunsDirty = true;
+	InsertLiveRun(ChunkId, Alloc.Offset, Alloc.NumQuads);
 	// Drains PendingGpuWrites into the SAME render command as the table update,
 	// with the copy passes recorded first -- see FPendingGpuWrite.
 	PushUpdatesToProxy();
@@ -2496,6 +2511,7 @@ void UVoxelGpuPoolComponent::RemoveChunkInternal(int32 Handle, bool bRecycleChun
 	// The allocation set changed even when the table entry did not (the realloc
 	// caller keeps its entry), so the runs are stale either way.
 	bRunsDirty = true;
+	RemoveLiveRun(Alloc.Offset);
 
 	MarkQuadsDirty(Alloc.Offset, Alloc.NumQuads);
 	PushUpdatesToProxy();
@@ -3234,6 +3250,7 @@ int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& In
 	Allocations[Handle] = Alloc;
 	AllocationChunkIds[Handle] = ChunkId;
 	++NumLiveChunks;
+	InsertLiveRun(ChunkId, Alloc.Offset, Alloc.NumQuads);
 
 	// Resident quads just grew via a realloc; check the 95% trigger the same
 	// way AddChunk does. See the comment there -- no-op once latched.
@@ -3250,8 +3267,50 @@ int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& In
 	return Handle;
 }
 
+// Sorted insert. Runs never overlap -- a pool offset belongs to exactly one
+// allocation -- so FirstQuad is a unique key and a lower-bound search finds the
+// one position that keeps the array ordered.
+void UVoxelGpuPoolComponent::InsertLiveRun(uint32 ChunkId, uint32 FirstQuad, uint32 NumQuads)
+{
+	if (NumQuads == 0 || ChunkId == kHiddenChunkId)
+	{
+		// Same filter BuildChunkRuns applies. A zero-quad or hidden allocation is
+		// not a run, and inserting one would make the two disagree.
+		return;
+	}
+	const int32 Index = Algo::LowerBoundBy(LiveRunsSorted, FirstQuad,
+	                                       [](const FChunkRun& R) { return R.FirstQuad; });
+	LiveRunsSorted.Insert(FChunkRun{ ChunkId, FirstQuad, NumQuads }, Index);
+}
+
+void UVoxelGpuPoolComponent::RemoveLiveRun(uint32 FirstQuad)
+{
+	const int32 Index = Algo::LowerBoundBy(LiveRunsSorted, FirstQuad,
+	                                       [](const FChunkRun& R) { return R.FirstQuad; });
+	if (LiveRunsSorted.IsValidIndex(Index) && LiveRunsSorted[Index].FirstQuad == FirstQuad)
+	{
+		LiveRunsSorted.RemoveAt(Index, EAllowShrinking::No);
+	}
+}
+
 TArray<UVoxelGpuPoolComponent::FChunkRun> UVoxelGpuPoolComponent::BuildChunkRuns() const
 {
+	// FAST PATH: hand back the incrementally maintained list.
+	//
+	// LiveRunsSorted is updated by InsertLiveRun/RemoveLiveRun at every point the
+	// allocation set moves, so it already holds exactly what the walk-and-sort
+	// below would produce. That walk measured 2.94 ms per publication (~53,800
+	// allocations walked, ~53,600 runs sorted) on the game thread, and
+	// publications land on ~32% of frames -- most of the p50-to-p95 gap.
+	//
+	// The slow path is kept, not deleted: it is the definition of correct, it is
+	// what voxel.Stream.PoolRunsVerify compares against, and it is the fallback
+	// if the incremental list is ever found wrong in the field.
+	if (VoxelGpuPoolCull::GRunsVerify == 0)
+	{
+		return LiveRunsSorted;
+	}
+
 	// One entry per LIVE allocation. A freed handle has NumQuads == 0 and its
 	// quads already point at the hidden entry, so skipping it here is the same
 	// statement the renderer already makes about it -- there is nothing there.
@@ -3277,6 +3336,42 @@ TArray<UVoxelGpuPoolComponent::FChunkRun> UVoxelGpuPoolComponent::BuildChunkRuns
 	// in roughly spatial order, so neighbours in the pool are usually neighbours
 	// in the world.
 	Runs.Sort([](const FChunkRun& A, const FChunkRun& B) { return A.FirstQuad < B.FirstQuad; });
+
+	// VERIFY MODE. Compare the authoritative rebuild against the incremental
+	// list and report the FIRST divergence with enough context to act on --
+	// index, and both runs -- then latch so a broken invariant does not produce
+	// one line per publication for the rest of the session.
+	static bool bDivergenceReported = false;
+	if (!bDivergenceReported)
+	{
+		if (LiveRunsSorted.Num() != Runs.Num())
+		{
+			bDivergenceReported = true;
+			UE_LOG(LogTemp, Error,
+			       TEXT("%s PoolRunsVerify: COUNT DIVERGED — incremental %d, rebuilt %d. The incremental "
+			            "list is missing or holding runs; a stale run does not merely fail to draw its "
+			            "chunk, it points the cull at somebody else's quads."),
+			       *PoolName, LiveRunsSorted.Num(), Runs.Num());
+		}
+		else
+		{
+			for (int32 I = 0; I < Runs.Num(); ++I)
+			{
+				const FChunkRun& A = LiveRunsSorted[I];
+				const FChunkRun& B = Runs[I];
+				if (A.ChunkId != B.ChunkId || A.FirstQuad != B.FirstQuad || A.NumQuads != B.NumQuads)
+				{
+					bDivergenceReported = true;
+					UE_LOG(LogTemp, Error,
+					       TEXT("%s PoolRunsVerify: DIVERGED at %d — incremental {id=%u first=%u num=%u} "
+					            "vs rebuilt {id=%u first=%u num=%u}"),
+					       *PoolName, I, A.ChunkId, A.FirstQuad, A.NumQuads,
+					       B.ChunkId, B.FirstQuad, B.NumQuads);
+					break;
+				}
+			}
+		}
+	}
 	return Runs;
 }
 

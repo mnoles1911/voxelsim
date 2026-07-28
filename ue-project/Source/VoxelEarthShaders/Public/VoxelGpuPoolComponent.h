@@ -761,6 +761,22 @@ private:
 	// Drained alongside PendingGpuWrites, into the SAME command. See S2-1.
 	TArray<FPendingGpuHide> PendingGpuHides;
 
+	// INCREMENTALLY MAINTAINED, SORTED BY FirstQuad. The same content
+	// BuildChunkRuns() produces, kept up to date as allocations change instead of
+	// being walked and re-sorted on every publication.
+	//
+	// WHY: BuildChunkRuns measured 2.94 ms per publication on the game thread --
+	// walking ~53,800 allocations and sorting ~53,600 runs -- and publications
+	// land on ~32% of frames, which is most of the p50-to-p95 frame-time gap.
+	// The array is almost entirely unchanged between publications; only the
+	// handful of chunks that moved need touching.
+	//
+	// Maintained by InsertLiveRun / RemoveLiveRun, which are the ONLY writers.
+	// voxel.Stream.PoolRunsVerify rebuilds from scratch and byte-compares.
+	TArray<FChunkRun> LiveRunsSorted;
+	void InsertLiveRun(uint32 ChunkId, uint32 FirstQuad, uint32 NumQuads);
+	void RemoveLiveRun(uint32 FirstQuad);
+
 	// See GetGpuDirectWrites. The DROPPED half lives on FVoxelGpuPoolBuffers,
 	// which outlives this component from a render command's point of view.
 	int64 GpuDirectWrites = 0;
