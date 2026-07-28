@@ -1,0 +1,95 @@
+================================================================================
+T4-1 -- THE PREMISE IS INVALIDATED BY S1's OWN SUCCESS
+================================================================================
+
+Measured 2026-07-28 on the S1 configuration (batched publication, unload budget
+256, applies 192, pool 64M, parking 12,000). Adopted 128 m / 4 km cascade, real
+terrain, -VoxelPerfFlight=line at 20 m/s.
+
+--------------------------------------------------------------------------------
+THE CLAIM T4-1 WAS BUILT ON
+--------------------------------------------------------------------------------
+
+docs/deep-review-streaming-perf-2026-07-27.md, T4-1:
+
+  "Once T1 frees the consumer side, the GPU is essentially always idle from
+   streaming's perspective. Spend it."
+
+Supported by S0's own measurement: the fork sat at ~11 jobs in flight against a
+cap of 256, finishing a chunk in ~12 ms and then waiting ~128 ms to be picked up
+(docs/measurements/s0-apply-census-2026-07-27.txt).
+
+That measurement was taken WHILE THE CONSUMER WAS THE WALL. It described a
+starved producer, and it was read as spare capacity.
+
+--------------------------------------------------------------------------------
+WHAT THE FORK LOOKS LIKE AFTER S1
+--------------------------------------------------------------------------------
+
+Flight-phase windows, GPU mesh fork census:
+
+    dispatched=242  delivered=243  failed=0  pending=251  queued=235  inFlight=16
+    dispatched=232  delivered=231  failed=0  pending=254  queued=236  inFlight=18
+    dispatched=221  delivered=221  failed=0  pending=252  queued=233  inFlight=19
+
+  pending  = submitted, not yet delivered  (GpuJobsPending)   ~252 of a 256 cap
+  queued   = sitting in the manager's queue                    ~235
+  inFlight = actually executing on the GPU                     ~16
+
+THE SUBMISSION PIPELINE IS FULL OF DEMAND WORK. 235 demand jobs are already
+queued and cannot get through. Speculation has nothing to scavenge: a
+speculative job submitted here does not use idle GPU, it queues behind 235
+demand jobs and is stale before it runs.
+
+S1 did not reveal idle capacity. It CONSUMED the idle capacity, by removing the
+consumer bottleneck that was starving the producer.
+
+--------------------------------------------------------------------------------
+AND inFlight=16 IS NOT THE GPU BEING BUSY
+--------------------------------------------------------------------------------
+
+16 concurrent against a 256 cap, with 235 waiting, is a PROMOTION limit:
+FVoxelGpuMeshJobManager::Tick promotes at most voxel.GPU.MeshBatchCap (4) jobs
+per tick into one FRDGBuilder.
+
+So the GPU is underutilised because of a per-tick promotion cap, not for lack of
+work -- and raising that cap helps DEMAND directly, with no speculation, no
+cache, no hit rate and no new correctness surface.
+
+  MeshBatchCap 4 / MeshHarvestCap 8 were measured on 2026-07-27 and the sweep
+  that set them was monotone: 32/64 -> 367 hitches, 8/16 -> 8, 4/8 -> 8 with the
+  best chunks/s. But those hitches were RENDER-THREAD cost from per-chunk
+  publication, which S1-1 removed. The number was correct for a pipeline that no
+  longer exists. Being re-swept.
+
+--------------------------------------------------------------------------------
+STATUS OF T4-1
+--------------------------------------------------------------------------------
+
+BUILT, gated off (voxel.Stream.VelocityLeadSec 0), and CORRECTLY BLOCKED. Not
+cancelled -- blocked on a precondition that is now measurable rather than
+assumed: there must be GPU capacity demand cannot use.
+
+Two bugs were found and fixed getting to this point, both of which made
+speculation silently inert while looking configured:
+
+  1. DispatchSpeculativeJobs() was inside DispatchJobs' cold-band re-queue
+     branch, so it only ran on ticks with cold-band deferrals.
+  2. The demand-protection floor (GpuJobsPending >= 256 - 32) breaks on every
+     tick once demand saturates the fork -- which is now always.
+
+Both are worth keeping. The second is the feature correctly declining to
+compete with demand; it is only a problem because there is no slack at all.
+
+WHAT WOULD MAKE T4-1 LIVE AGAIN, in order of directness:
+
+  * Raise the promotion cap so the GPU runs more than 16 jobs at once. If demand
+    then stops saturating the pipeline, the slack T4-1 wants is real.
+  * Tile batching (T3-1), which multiplies chunks-per-dispatch rather than
+    dispatches-per-tick. The occupancy census that sizes it already ships.
+  * Any configuration where demand throughput is bounded by something OTHER than
+    the fork -- e.g. a slower camera, or a settled world where speculation is the
+    only work available.
+
+Do NOT re-enable speculation on the strength of the original "GPU is idle"
+sentence. That sentence was true of a starved producer and is not true now.
