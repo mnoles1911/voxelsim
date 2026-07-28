@@ -2646,6 +2646,13 @@ struct FVoxelWorldImpl
 
 	int64 SpecDispatchedSinceLog = 0;
 	int64 SpecParkedSinceLog = 0;
+	// Why a DEMAND eviction did not park. Sums with ChunksParkedSinceLog to the
+	// number of evictions that reached ParkChunkGeometry, so a shortfall in the
+	// total says the function is not being called rather than refusing.
+	int64 ParkRefusedNoPoolGeomSinceLog = 0;
+	int64 ParkRefusedUnsettledSinceLog = 0;
+	int64 ParkRefusedNotFinerSinceLog = 0;
+	int64 ParkRefusedEditedSinceLog = 0;
 	// Why a speculative dispatch did not become a park. These three plus
 	// SpecParkedSinceLog account for every delivered speculative result.
 	int64 SpecDroppedEmptySinceLog = 0;
@@ -5016,9 +5023,12 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		const UVoxelGpuPoolComponent* Pool = GpuPool.Get();
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel park (5s window): parked=%lld adopted=%lld evictedStale=%lld evictedCap=%lld | ")
+		       TEXT("refused: noGeom=%lld unsettled=%lld notFiner=%lld edited=%lld | ")
 		       TEXT("held=%d poolParked=%d | cumulative parked=%lld adopted=%lld (hit %.0f%%)"),
 		       (long long)ChunksParkedSinceLog, (long long)ChunksAdoptedSinceLog,
 		       (long long)ParkEvictedStaleSinceLog, (long long)ParkEvictedCapSinceLog,
+		       (long long)ParkRefusedNoPoolGeomSinceLog, (long long)ParkRefusedUnsettledSinceLog,
+		       (long long)ParkRefusedNotFinerSinceLog, (long long)ParkRefusedEditedSinceLog,
 		       ParkedGeometry.Num(), Pool ? Pool->GetNumParkedChunks() : -1,
 		       (long long)ChunksParkedTotal, (long long)ChunksAdoptedTotal,
 		       ChunksParkedTotal > 0 ? 100.0 * double(ChunksAdoptedTotal) / double(ChunksParkedTotal) : 0.0);
@@ -5544,6 +5554,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// would start double-counting.
 	SpecDispatchedSinceLog = SpecParkedSinceLog = SpecAdoptedSinceLog = SpecEvictedUnusedSinceLog = 0;
 	SpecDroppedEmptySinceLog = SpecDroppedOvertakenSinceLog = SpecDroppedPoolFullSinceLog = 0;
+	ParkRefusedNoPoolGeomSinceLog = ParkRefusedUnsettledSinceLog = 0;
+	ParkRefusedNotFinerSinceLog = ParkRefusedEditedSinceLog = 0;
 	ChunksParkedSinceLog = ChunksAdoptedSinceLog = 0;
 	ParkEvictedStaleSinceLog = ParkEvictedCapSinceLog = 0;
 	DrainExitQueueEmptySinceLog = DrainExitWallClockSinceLog = 0;
@@ -9597,6 +9609,7 @@ bool FVoxelWorldImpl::ParkChunkGeometry(const VoxelCoords::FVoxelLevelChunkKey& 
 	// (ReturnChunkComponentToPool) and nothing here to keep.
 	if (Rec.PoolSlot == INDEX_NONE || Rec.Component.IsValid())
 	{
+		++ParkRefusedNoPoolGeomSinceLog;
 		return false;
 	}
 	UVoxelGpuPoolComponent* Pool = GpuPool.Get();
@@ -9608,6 +9621,7 @@ bool FVoxelWorldImpl::ParkChunkGeometry(const VoxelCoords::FVoxelLevelChunkKey& 
 	// shape that was still being replaced.
 	if (!Rec.bMeshSettled || Rec.LastQuadCount <= 0)
 	{
+		++ParkRefusedUnsettledSinceLog;
 		return false;
 	}
 
@@ -9632,6 +9646,15 @@ bool FVoxelWorldImpl::ParkChunkGeometry(const VoxelCoords::FVoxelLevelChunkKey& 
 	// so it will not route through here and must not inherit this test.
 	if (Rec.RetainReplaceDir != RetainDir_Finer)
 	{
+		// THIS IS THE COUNTER TO READ FOR TASK #17. Wrapping RecomputeDesiredSet
+		// in an FScopedBatch took parking from 28,117 parks (84% hit) to exactly
+		// ZERO, reproducibly, and was reverted undiagnosed. "Exactly zero" means
+		// either this function stopped being called or one of its refusals became
+		// universal -- and RetainReplaceDir is the only one stamped by
+		// RecomputeDesiredSet itself, which makes it the prime suspect. If the
+		// experiment is repeated, this number distinguishes the two cases in one
+		// leg instead of a reasoning session.
+		++ParkRefusedNotFinerSinceLog;
 		return false;
 	}
 	// Edited chunks are never parked. NeedsOverlayAwarePath is the same test
@@ -9639,6 +9662,7 @@ bool FVoxelWorldImpl::ParkChunkGeometry(const VoxelCoords::FVoxelLevelChunkKey& 
 	// is a function of the edit log rather than of worldgen alone.
 	if (NeedsOverlayAwarePath(Key))
 	{
+		++ParkRefusedEditedSinceLog;
 		return false;
 	}
 

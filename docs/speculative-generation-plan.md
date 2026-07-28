@@ -1,13 +1,32 @@
 # Speculative generation (T4-1): the re-sequenced path, and why this order
 
 **Status:** written 2026-07-27. **S0 CLOSED**, **S1 CLOSED**, **S2 SHIPPED**,
-**S3 SHIPPED**, **S4 (T4-1) BUILT AND GATED OFF, MEASUREMENT PENDING.**
-Data: `docs/measurements/s0-apply-census-2026-07-27.txt`,
-`docs/measurements/s1-close-2026-07-27.txt`.
+**S3 SHIPPED**, **S4 (T4-1) WORKING — first result 2026-07-28, confirming sweep
+running.** Data: `docs/measurements/s0-apply-census-2026-07-27.txt`,
+`docs/measurements/s1-close-2026-07-27.txt`,
+`docs/measurements/t41-first-result-2026-07-28.txt`.
 
     baseline                                    260.9 chunks/s   15,032 holes
     S1 (batch publish, budgets, capacity)     ~1,040.5                0
     S2-3 parking (line / circle)          1,064.9 / 906.5            0
+    S4 T4-1 (lead 4.0s)                       1,069.5                0
+
+**T4-1's result is not in that table, and that is the point.** Throughput is
+unchanged (+1.2%, inside variance). What moved is the metric the table does not
+carry — **transient holes during the flight: median 840 → 64, p90 2164 → 114, a
+92% reduction**, against Wave S4's stated close criterion of "toward the CPU
+arm's 55."
+
+Mechanism, from the fork census: GPU in-flight **19 → 63** (the idle capacity
+this whole re-sequencing was aimed at), demand queue depth **234 → 188** because
+speculation answers chunks before admission asks for them, and demand
+submit-to-deliver latency **1864 ms → 1110 ms** as a consequence. Adding
+non-demand work made the demand path faster.
+
+**Read this before judging any future wave on chunks/s alone.** A throughput
+metric scores the above as a tie. `tools/voxel-leg-summary.ps1` now reports the
+flight-phase hole distribution as its own column so this cannot happen silently
+again; `holes(final)` is 0 on both arms and can never decide a latency question.
 
 **T4-1 is built.** Speculative enumeration ahead of the predicted anchor,
 its own queue and sub-budget, submitted last, parked on arrival, and adopted by
