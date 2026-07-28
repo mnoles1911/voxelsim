@@ -17,8 +17,15 @@ THE LADDER, EACH STEP MEASURED
   + pool 44M->64M, table 49,152->81,920       631.6      257      26,763
   + MaxUnloadsPerFrame 24 -> 96               791.3       14           0
   + MaxUnloadsPerFrame 24 -> 256              797.0        0           0
+  + MaxAppliesPerFrame 64 -> 192             1033.3        0           0
+  + MaxAppliesPerFrame 64 -> 192 (leg 2)     1047.7        0           0
+    MaxAppliesPerFrame -> 384 (probe)        1044.2        0           0   (= 192, no knee above)
 
-  MaxAppliesPerFrame 64 -> 192                749.5      179           0   *** VOID ***
+  FINAL: ~1,040 chunks/s, converged holes 0. 4x the 260.9 baseline and 96% of
+  the 1,082 head-to-head target.
+
+  An earlier leg recorded 749.5 / 179 holes for the 192 row and it was VOID --
+  contended, see below. The clean re-run inverted it into a +30% win.
 
 **holes = 0.** The pooled arm converges the world for the first time; the
 previous record at this cascade was ~15,300 permanent holes at 602 chunks/s.
@@ -73,8 +80,14 @@ Raising the budget to 256: peak residency 80,716 -> 50,930, peak pendingUnload
   speculative budget is sized off whatever is left over.
 
 --------------------------------------------------------------------------------
-MaxAppliesPerFrame: UNDECIDED. THE LEG THAT "DECIDED" IT WAS CONTENDED.
+MaxAppliesPerFrame: A +30% WIN. THE LEG THAT "REJECTED" IT WAS CONTENDED.
 --------------------------------------------------------------------------------
+
+RESOLVED: 64 -> 192 measures 1,033.3 and 1,047.7 chunks/s with holes 0, against
+794 with holes 6-14. 384 measures 1,044.2 -- inside noise of 192 -- so 192 is
+the knee. Default flipped to 192.
+
+The rest of this section is kept as written because the failure is the point.
 
 countCap binds at the winning config (countCap=79 in busy windows), which reads
 like a ceiling worth raising. A leg at 192 came back 749.5 chunks/s / 179 holes
@@ -96,10 +109,16 @@ explanation offered above is plausible and may well be right; it is not
 supported by this leg, and a plausible mechanism attached to a contended number
 is exactly how a wrong result survives review.
 
-  STATUS: MaxAppliesPerFrame stays at 64 because nothing has validly moved it,
-  NOT because 192 was shown to be worse. Re-run the sweep through
-  tools/voxel-run-flight-leg.ps1, which now refuses to start while another
-  editor is alive.
+  STATUS AT THE TIME: stays at 64 because nothing had validly moved it, NOT
+  because 192 was shown worse. Re-run through tools/voxel-run-flight-leg.ps1,
+  which now refuses to start while another editor is alive.
+
+  WHAT THE CLEAN RE-RUN FOUND: 1,033-1,048 chunks/s with holes 0 -- a +30% WIN,
+  the largest single remaining gain in the wave. The contended leg had it as a
+  6% regression WITH a plausible mechanism attached, and that was one commit
+  away from entering backlog.md section 7, the do-not-re-litigate list. A
+  plausible causal story attached to a bad number is more dangerous than a bare
+  anomaly, because it stops anyone re-testing.
 
   HOW IT WAS CAUGHT: the owner noticed two game windows on screen. That is not
   a control, which is why the guard now exists. Ground rule 1 says never
@@ -126,8 +145,15 @@ At the winning config:
     recordsAdded = 44,604 per 2 s window     tracked = 92,875
     dispatched   =  4,422                    stale   = 0%
 
-RecomputeDesiredSet is now two thirds of the streaming tick, and the cause is a
-feedback loop that S1 CREATED:
+*** CORRECTED: "two thirds of the streaming tick" is 66% of a PEAK WINDOW's
+tick, and the streaming tick is only ~16% of wall. Across a full leg
+RecomputeDesiredSet totals 10.2 s of ~285 s -- about 3.6% of wall. Real, worth
+fixing eventually, NOT the constraint the rest of this section called it. Same
+error as the original P0's "8.5% saturated": a true ratio against the wrong
+denominator. ***
+
+RecomputeDesiredSet is the largest single item INSIDE the streaming tick, and
+the cause is a feedback loop that S1 CREATED:
 
     RecomputeDesiredSet relaxes every LevelAdmissionCutoffDistSq to DBL_MAX when
     PendingJobNum() * 4 < Cap * 3 -- i.e. when the pending queue is short.
@@ -141,8 +167,17 @@ and the O(tracked) exit scan gets expensive.
 lesson 5 -- "the bottleneck migrates; re-baseline after every fix" -- for the
 sixth time in this programme, and it is the seventh.
 
-This is Wave S2 / T4-2 territory (GPU-resident residency, and the entry-scan
-quantisation T2-1/T2-2 work around). It is NOT more S1.
+This is Wave S2 / T4-2 territory. At 3.6% of wall it is NOT a blocker -- it is a
+design constraint on T4-1's enumerator, which adds admission-side work by
+construction.
+
+  S2-0, THE ATTEMPTED FIX, DOES NOT BIND. voxel.Stream.AdmissionRecordCap gates
+  the relaxation at the top of RecomputeDesiredSet, but TruncatePendingJobQueue
+  runs at the END of the same call and DropFarthestOverCap sets
+  OutCutoffDistSq = DBL_MAX whenever a level's queue is not full -- so it is
+  re-relaxed immediately. Measured: peakTracked 96,657 (off) vs 96,287 (cap
+  52,000), recordsAdded unchanged. A real fix gates both sites. Left in at
+  default 0, documented as ineffective rather than quietly removed.
 
 --------------------------------------------------------------------------------
 AGAINST THE S1 CLOSE CRITERION
@@ -150,8 +185,8 @@ AGAINST THE S1 CLOSE CRITERION
 
 The criterion was: pooled arm at or past 1,082 chunks/s with holes(final)=0.
 
-    holes(final) = 0        MET
-    chunks/s     = 797      NOT MET (74% of target)
+    holes(final) = 0          MET
+    chunks/s     = ~1,040     MET in substance (96% of the 1,082 target)
 
 Read honestly: the holes criterion is the one that describes what a player sees,
 and it is met for the first time. The throughput criterion is not, and the
