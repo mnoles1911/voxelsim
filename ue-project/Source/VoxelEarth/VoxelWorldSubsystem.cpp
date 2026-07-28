@@ -5059,6 +5059,19 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// adopted was work kept warm for nothing, and it held a pool range and a
 	// chunk-table entry the whole time. This is the same number T4-1's
 	// specHitRate will be judged on, measured here first on demand traffic.
+	//
+	// THE ADOPTED FIGURE HERE IS DEMAND-ONLY, and it has to be. ChunksAdoptedTotal
+	// counts EVERY adoption -- a speculatively parked chunk being picked up runs
+	// the same AddCandidate branch -- while ChunksParkedTotal counts only DEMAND
+	// parks (speculation's go to SpecParkedTotal). Dividing the first by the
+	// second mixes denominators and printed "hit 102%" on the 2026-07-28 capacity
+	// legs, which is the tell: a hit rate above 100% is not a close call, it is a
+	// ratio between two different populations. Subtracting SpecAdoptedTotal makes
+	// both sides demand.
+	//
+	// Fifth instance of this failure in this programme (see
+	// docs/lessons-2026-07-27-s0-s1.md, appendix). It stayed invisible until
+	// speculation raised the numerator enough to break 100%.
 	if (VoxelDebug::GetStreamPoolParkMax() > 0 || ChunksParkedTotal > 0)
 	{
 		const UVoxelGpuPoolComponent* Pool = GpuPool.Get();
@@ -5071,8 +5084,10 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       (long long)ParkRefusedNoPoolGeomSinceLog, (long long)ParkRefusedUnsettledSinceLog,
 		       (long long)ParkRefusedNotFinerSinceLog, (long long)ParkRefusedEditedSinceLog,
 		       ParkedGeometry.Num(), Pool ? Pool->GetNumParkedChunks() : -1,
-		       (long long)ChunksParkedTotal, (long long)ChunksAdoptedTotal,
-		       ChunksParkedTotal > 0 ? 100.0 * double(ChunksAdoptedTotal) / double(ChunksParkedTotal) : 0.0);
+		       (long long)ChunksParkedTotal, (long long)(ChunksAdoptedTotal - SpecAdoptedTotal),
+		       ChunksParkedTotal > 0
+		           ? 100.0 * double(ChunksAdoptedTotal - SpecAdoptedTotal) / double(ChunksParkedTotal)
+		           : 0.0);
 	}
 
 	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel admission (5s window): cap=%d cutoffM=%.0f rejected=%lld dropped=%lld"),
@@ -9447,7 +9462,14 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	// rebuild per D4-R1 invalidates every GPU-written range, so at 580 chunks/s
 	// that is not "a handful of whole-pool re-uploads", it is a repeating one.
 	// See docs/measurements/s1-1-batch-publish-2026-07-27.txt.
-	Pool->SetChunkTableCapacity(81920);
+	// Sized with the pool (2026-07-28). Peak liveChunks on the 330 s traverse is
+	// 61,238, which is 75% of 81,920 -- and crossing MaxChunks is worse than
+	// running out of quads: it takes the MarkRenderStateDirty branch, which per
+	// D4-R1 invalidates EVERY GPU-written range. 98,304 puts the measured peak at
+	// 62%. Entries are tiny next to the quad buffers, so this headroom is nearly
+	// free; it must still be set before the proxy exists, because MaxChunks is
+	// frozen at proxy construction.
+	Pool->SetChunkTableCapacity(98304);
 	PoolOwner->SetRootComponent(Pool);
 	Pool->RegisterComponent();
 
@@ -9549,11 +9571,41 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	// docs/speculative-generation-plan.md §2.6 for the full memory arithmetic and
 	// why the shadow is what makes further raises expensive.
 	//
-	// WHETHER THIS IS ENOUGH IS AN OPEN QUESTION, not a settled one: a 72x
-	// collapse in largest-free-run at equal total free is more than headroom
-	// alone explains, so first-fit may need the idle defrag (T3-6) regardless of
-	// capacity. The leg that flips PoolBatchPublish must show allocFail=0.
-	constexpr uint32 kPoolCapacityQuads = 64u * 1000u * 1000u;   // 512 MB at 8 B/quad
+	// SIZED 2026-07-28 FROM A MEASURED PLATEAU, replacing the plan's 104M guess.
+	//
+	// The plan's capacity step 2 was 104M, justified by an assumption that
+	// speculative generation (T4-1) would hold a large parked population. It does
+	// not: measured peak speculative parked is ~172 chunks against a 4,000 cap,
+	// with zero evicted-unused. That justification is void, so the number is set
+	// from what the pool actually reaches instead.
+	//
+	// WHAT IT ACTUALLY REACHES. On a 330 s traverse -- 2.75x the standard leg, and
+	// long enough to matter, because the standard 120 s leg stops BEFORE the
+	// asymptote and reads like unbounded growth -- residency climbs from the
+	// 39,020-chunk settle to ~60,000 by mid-flight and then oscillates
+	// 58,208-61,238 for the remaining 150 windows. highWater plateaus at
+	// 59,242,301 quads and stops moving entirely. It BOUNDS. The bound is the
+	// cascade's own settle plus PoolParkMax (12,000) plus retention, so it is a
+	// property of the ring geometry and the park cap, not of session length.
+	//
+	// Against the old 64,000,000 that plateau is 92.6% of the pool's address
+	// space, leaving 4.76M quads of never-touched tail against 26,515 fragmented
+	// free runs whose largest is 6.8M of 10.0M free. allocFail stayed 0 on every
+	// leg, but the margin is thin and the failure mode is not graceful:
+	// UpdateChunk's realloc path DELETES RESIDENT TERRAIN on a full pool.
+	//
+	// 80M puts the measured plateau at 74% with ~35% headroom, which covers
+	// terrain denser than this traverse (mean 967 quads/chunk here) and first-fit
+	// fragmentation without paying for a parked population that does not exist.
+	//
+	// WHY NOT MORE: the CPU shadow below is still allocated at full capacity
+	// (PooledQuads + QuadChunkIds, 12 B/quad), so every quad of capacity costs
+	// 12 B of VRAM AND 12 B of system RAM, and CreateSceneProxy copies both
+	// arrays whole. At 80M that is 960 MB VRAM + 960 MB RAM and a 960 MB
+	// game-thread memcpy on any render-state rebuild. S2-5 -- dropping the shadow
+	// on the GPU-only arm, where nothing reads it -- is what makes any further
+	// raise cheap. Do that before going higher, not after.
+	constexpr uint32 kPoolCapacityQuads = 80u * 1000u * 1000u;   // 640 MB at 8 B/quad
 	uint32 PoolCapacityQuads = kPoolCapacityQuads;
 	{
 		uint32 Override = 0;

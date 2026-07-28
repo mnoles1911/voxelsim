@@ -364,3 +364,94 @@ NOTE ON A FIRST ATTEMPT: voxel.Stream.PoolClobberTest issued via -ExecCmds at
 startup logs "no live pool component -- nothing to test" and exits 0. A gate
 that no-ops and returns success is the exact shape ground rule 13 warns about;
 it must be run via PoolClobberSession, which settles first.
+
+============================================================================
+10. CAPACITY STEP 2, SIZED FROM MEASUREMENT: 80M, NOT THE PLAN'S 104M
+============================================================================
+
+THE PLAN'S JUSTIFICATION FOR 104M IS VOID. It sized the raise for a large
+speculative parked population. Measured peak speculative parked is ~172 chunks
+against a 4,000 cap, with evictedUnused=0 on every leg. So the number is set
+from what the pool actually reaches.
+
+WHAT IT REACHES, and why the standard leg cannot tell you. On the 120 s flight
+liveChunks climbs 39,020 -> 62,119 and never comes back down, which reads
+exactly like an unbounded leak. It is not: the leg simply STOPS BEFORE THE
+ASYMPTOTE. On a 330 s traverse residency reaches ~60,000 by mid-flight and then
+oscillates 58,208-61,238 for the remaining 150 windows, with highWater flat at
+59,242,301 from w151 onward. The bound is the cascade settle plus PoolParkMax
+(12,000) plus retention -- a property of ring geometry and the park cap, not of
+session length.
+
+  ANY question about growth needs a leg longer than the growth's own time
+  constant. Add this to the harness rules: a 120 s flight can distinguish
+  "fast" from "slow" but cannot distinguish "bounded" from "leaking".
+
+Against the old 64,000,000 that plateau is 92.6% of the pool's address space.
+allocFail was 0, but the margin was 4.76M quads of untouched tail against 26,515
+fragmented free runs whose largest was 6.8M of 10.0M free -- and the failure mode
+is UpdateChunk's realloc DELETING RESIDENT TERRAIN.
+
+MEASURED EFFECT OF THE RAISE (330 s traverse, both arms):
+
+  capacity   capacityPct  free      largestRun  chunks/s  flightHoles med(p90)
+  64,000,000    85.5      10.0M       6.80M      1588.1      60 (132)
+  80,000,000    69.5      26.1M      22.38M      1587.0      58 (106)
+
+allocFail=0 and holes(final)=0 on both. Throughput identical. What the raise
+actually buys is CONTIGUITY -- largest free run 3.3x -- which is the thing
+first-fit needs and the thing no defrag exists to recover (T3-6 is deferred).
+
+Chunk table 81,920 -> 98,304 alongside it: peak liveChunks 61,238 was 75% of the
+old table, and crossing MaxChunks is worse than exhausting quads (it takes the
+MarkRenderStateDirty branch, which per D4-R1 invalidates every GPU-written
+range). Entries are tiny next to the quad buffers.
+
+WHY NOT HIGHER. The CPU shadow is still allocated at full capacity -- InitPool
+does PooledQuads.SetNumZeroed(CapacityQuads) and QuadChunkIds.SetNumZeroed(
+CapacityQuads) unconditionally, and CreateSceneProxy copies both arrays whole.
+So capacity costs 12 B/quad of VRAM AND 12 B/quad of system RAM: 960 MB + 960 MB
+at 80M, plus a 960 MB game-thread memcpy on any render-state rebuild. S2-5
+(dropping the shadow on the GPU-only arm, where nothing reads it) is what makes
+any further raise cheap. Do that BEFORE going higher.
+
+============================================================================
+11. WHERE THE FRAME TIME ACTUALLY GOES -- THE NEXT FRONTIER, MEASURED
+============================================================================
+
+Streaming is no longer the constraint. Flight-phase frameMs median is 34.5 ms
+(~29 fps) and renderMs is 31.2 ms of it -- roughly 90% of the frame is the draw
+path. No further streaming work moves that number.
+
+THE CULL IS DRAWING 3.4x WHAT IS VISIBLE:
+
+  visibleQuads=9,710,941 (16.8%)   drawnQuads=33,358,452   ranges=1024
+
+ranges EQUALS maxRanges, so the cap is binding: the merge cannot describe the
+visible set in 1024 ranges, merges coarsely, and sweeps in geometry nothing can
+see. GMaxRanges already defaults to the kMaxRanges ceiling, so there is no cvar
+sweep available -- raising it is a rebuild.
+
+This is the same failure one step earlier in its own history: the ceiling was
+raised from 64 "BECAUSE 64 ranges cannot describe what is visible at 39k chunks",
+measuring 2.06x over-draw at the time. At 62k chunks, 1024 fails the same way at
+3.4x. The cap needs to scale with resident chunk count, or it will be re-hit.
+
+HOW MUCH IS IT WORTH? Measured with voxel.Stream.GPUCullDebugAllVisible 1:
+
+  arm            drawnQuads    renderMs (flight median)
+  normal         33,358,452       31.2
+  all-visible    49,322,257       38.0
+
++47.8% drawn quads costs +21.8% render time -- 0.426 ms per million quads, with
+a ~17.0 ms fixed cost extrapolated at zero quads.
+
+  Removing the over-draw entirely (33.36M -> 9.71M) is worth ~10.1 ms:
+  renderMs 31.2 -> ~21, frameMs 34.5 -> ~24, about 29 fps -> 41 fps.
+
+STATED PLAINLY SO IT IS NOT OVERSOLD: that is a large win and it does NOT reach
+60 fps. The ~17 ms floor does not depend on geometry volume at all and is a
+separate investigation. And because the slope is SUB-linear, submission cost is
+already material -- so sweep kMaxRanges (1024 -> 2048 -> 4096) and watch for
+renderMs turning back up, rather than assuming more ranges is monotonically
+better. Ranges split across ceil(N/64) draw commands.
