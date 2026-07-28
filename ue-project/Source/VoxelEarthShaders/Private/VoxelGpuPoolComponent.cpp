@@ -186,7 +186,31 @@ namespace VoxelGpuPoolCull
 	// range still allocates a single-frame uniform buffer for its BaseQuad
 	// (FVoxelQuadRangeParameters), so the per-gather count of those scales with
 	// this and not with the batch count.
-	static constexpr int32 kMaxRanges = 1024;
+	//
+	// RAISED 1024 -> 16384 ON 2026-07-28, and the measurement that forced it is
+	// the `budget:` line this comment already told you to read. At the live flight
+	// pose (runs=10,280, visible=9,707,266 quads):
+	//
+	//     drawn(64)   = 52,159,884     5.4x visible
+	//     drawn(256)  = 45,508,047     4.7x
+	//     drawn(1024) = 32,984,674     3.4x   <- what we shipped
+	//     drawn(4096) = 14,386,813     1.48x
+	//     drawn(inf)  =  9,707,266     1.0x
+	//
+	// The prediction written above -- "full convergence needs ~10-14k ranges, so
+	// 1024 is not the end of the curve" -- was right, and the cascade has since
+	// grown from 39,020 chunks to ~62,000, so 1024 is further from the knee than
+	// when it was chosen. 16384 clears runs=10,280 with margin, which is what
+	// full convergence requires.
+	//
+	// THIS IS A CEILING, NOT A DEFAULT. GMaxRanges below stays at 1024 until the
+	// sweep says otherwise: raising the budget is not free (see WHAT RAISING IT
+	// COSTS above -- one FMeshBatch and one draw command per 64 ranges, and one
+	// single-frame uniform buffer PER RANGE), and the render-time slope measured
+	// on 2026-07-28 is SUB-linear in drawn quads (+47.8% quads cost +21.8% render
+	// time), which is exactly the signature of submission cost that is already
+	// material. The curve can turn back up. Measure it.
+	static constexpr int32 kMaxRanges = 16384;
 
 	// DEFAULT ON since 2026-07-27 (was 0 -- and docs/gpu-roadmap-remaining.md
 	// claiming otherwise is what let three baseline legs at the adopted 128 m /
@@ -233,7 +257,36 @@ namespace VoxelGpuPoolCull
 	// BECAUSE 64 ranges cannot describe what is visible at 39k chunks. Set it back
 	// to 64 to reproduce the pre-multi-batch draw shape exactly; that is the
 	// control this default should be read against.
-	static int32 GMaxRanges = kMaxRanges;
+	// 4096, SET BY THE SWEEP OF 2026-07-28, and the number that moved was hitches.
+	//
+	// Five legs, flight profile, post-warmup frame stats (p50/p95/max over ALL
+	// frames -- NOT the Hitch-frame log line, which only fires above 33.3 ms and
+	// therefore cannot describe a typical frame):
+	//
+	//   K       p50      p95      max      hitches   drawnQuads
+	//   1024   30.61    45.02    50.58      3756     33,065,957
+	//   2048   28.61    34.80    45.79      1111     23,927,794
+	//   4096   24.11    28.89    35.04         3     17,187,169
+	//   8192   24.06    28.87    34.85         4     17,108,401
+	//  16384   24.35    28.82    48.95         7     17,414,438
+	//
+	// 46% of frames were hitching at 1024. At 4096 it is three frames in ten
+	// thousand. p50 falls 30.61 -> 24.11 ms and p95 falls 45.02 -> 28.89, so this
+	// is not a tail-only fix -- but the tail is where it is spectacular.
+	//
+	// IT SATURATES AT 4096 AND 16384 IS WORSE. The merge only ever produces ~3,283
+	// ranges at this cascade, so a budget above that cannot bind and the extra
+	// ceiling buys nothing while still paying per-range costs (one single-frame
+	// uniform buffer each, one FMeshBatch per 64). 16384's max frame and hitch
+	// count are both slightly worse than 4096's, which is that cost showing up.
+	// Do not raise this "to be safe".
+	//
+	// WHAT NOW BINDS IS THE GAP MERGE, NOT THIS. ranges plateaus at ~3,283 well
+	// under the cap because voxel.Stream.GPUCullMergeGap (4096 quads) coalesces
+	// first. drawn stalls at 17.2M against a visible set of 9.7M, so ~7.5M quads
+	// of over-draw remain and this cvar can no longer reach them. That is the next
+	// knob, not this one.
+	static int32 GMaxRanges = 4096;
 	static FAutoConsoleVariableRef CVarMaxRanges(
 		TEXT("voxel.Stream.GPUCullMaxRanges"), GMaxRanges,
 		TEXT("Draw-range budget for the cull. The merge always reaches it by construction. Clamped to 1024. ")
