@@ -545,6 +545,63 @@ TAutoConsoleVariable<int32> CVarVoxelStreamBatchRecompute(
 // reaches. So the cheapest setting is also the best one, and anything that
 // scales with lead should be sized for ~2 s rather than 8.
 // Detail: docs/measurements/t41-first-result-2026-07-28.txt
+// DEFERRED CONSOLE EXEC, because -ExecCmds fires before the world exists.
+//
+// This is the third time that ordering has cost a run. voxel.Stream.PoolClobberTest
+// logs "no live pool component" and exits 0; voxel.Stream.PoolGpuHideProbe did the
+// same until it grew its own settle; and ProfileGPU issued via -ExecCmds captures
+// FRAME 1 -- an empty world -- and reports it as a successful capture. In every
+// case the command ran, produced output, and said nothing about the thing being
+// measured.
+//
+// One general fix rather than a settle timer per command:
+//   voxel.DeferExec <seconds> <command with args>
+static void VoxelDeferExec(const TArray<FString>& Args)
+{
+	if (Args.Num() < 2)
+	{
+		UE_LOG(LogVoxelPerf, Error, TEXT("voxel.DeferExec: usage: voxel.DeferExec <seconds> <command...>"));
+		return;
+	}
+	const float Delay = FMath::Max(0.f, float(FCString::Atof(*Args[0])));
+	TArray<FString> Rest = Args;
+	Rest.RemoveAt(0);
+	const FString Command = FString::Join(Rest, TEXT(" "));
+
+	UE_LOG(LogVoxelPerf, Warning, TEXT("voxel.DeferExec: will run in %.0f s: %s"), Delay, *Command);
+
+	double Elapsed = 0.0;
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		[Delay, Command, Elapsed](float Dt) mutable -> bool
+	{
+		Elapsed += double(Dt);
+		if (Elapsed < double(Delay))
+		{
+			return true;
+		}
+		UE_LOG(LogVoxelPerf, Warning, TEXT("voxel.DeferExec: running now: %s"), *Command);
+		// GEngine->Exec against the first world -- the same route the console
+		// takes, so a deferred command behaves exactly like a typed one.
+		UWorld* World = nullptr;
+		if (GEngine != nullptr)
+		{
+			for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+			{
+				if (Ctx.World() != nullptr) { World = Ctx.World(); break; }
+			}
+			GEngine->Exec(World, *Command);
+		}
+		return false;
+	}), 0.0f);
+}
+
+static FAutoConsoleCommand GVoxelDeferExecCmd(
+	TEXT("voxel.DeferExec"),
+	TEXT("Run a console command after N seconds. For anything that needs a streamed world -- ProfileGPU, "
+	     "stat dumpframe -- because -ExecCmds fires at startup and captures an empty one. "
+	     "Usage: voxel.DeferExec <seconds> <command...>"),
+	FConsoleCommandWithArgsDelegate::CreateStatic(&VoxelDeferExec));
+
 // Per-frame timing capture + the fast-vs-slow attribution report. Off by
 // default: it is a diagnostic, and it holds one 28-byte sample per frame.
 TAutoConsoleVariable<int32> CVarVoxelStreamFrameAttribution(
