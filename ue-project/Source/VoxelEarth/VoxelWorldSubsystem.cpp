@@ -2656,6 +2656,12 @@ struct FVoxelWorldImpl
 	// Why a speculative dispatch did not become a park. These three plus
 	// SpecParkedSinceLog account for every delivered speculative result.
 	int64 SpecDroppedEmptySinceLog = 0;
+	// Where in the surface band an empty speculative chunk sat. See task #19.
+	int64 SpecEmptyTopSinceLog = 0;
+	int64 SpecEmptyMidSinceLog = 0;
+	int64 SpecEmptyBotSinceLog = 0;
+	// Candidates the shared buried skip removed before dispatch.
+	int64 SpecBandSkippedSinceLog = 0;
 	int64 SpecDroppedOvertakenSinceLog = 0;
 	int64 SpecDroppedPoolFullSinceLog = 0;
 	int64 SpecAdoptedSinceLog = 0;
@@ -5042,13 +5048,15 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		}
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel speculation (5s window): dispatched=%lld parked=%lld adopted=%lld evictedUnused=%lld ")
-		       TEXT("| dropOvertaken=%lld dropEmpty=%lld dropPoolFull=%lld ")
+		       TEXT("| bandSkipped=%lld dropOvertaken=%lld dropEmpty=%lld (top=%lld mid=%lld bot=%lld) dropPoolFull=%lld ")
 		       TEXT("| queued=%d tracked=%d gpuInFlight=%d parkedNow=%d leadSec=%.2f speed=%.1f m/s ")
 		       TEXT("| cumulative dispatched=%lld adopted=%lld (hit %.0f%%)"),
 		       (long long)SpecDispatchedSinceLog, (long long)SpecParkedSinceLog,
 		       (long long)SpecAdoptedSinceLog, (long long)SpecEvictedUnusedSinceLog,
+		       (long long)SpecBandSkippedSinceLog,
 		       (long long)SpecDroppedOvertakenSinceLog, (long long)SpecDroppedEmptySinceLog,
-		       (long long)SpecDroppedPoolFullSinceLog,
+		       (long long)SpecEmptyTopSinceLog, (long long)SpecEmptyMidSinceLog,
+		       (long long)SpecEmptyBotSinceLog, (long long)SpecDroppedPoolFullSinceLog,
 		       SpeculativeKeys.Num(), SpeculativeInFlight.Num(), SpecOutstandingNow, SpecParkedNow,
 		       VoxelDebug::GetStreamVelocityLeadSec(), SmoothedAnchorSpeedUUPerSec / 100.0,
 		       (long long)SpecDispatchedTotal, (long long)SpecAdoptedTotal,
@@ -5611,6 +5619,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// would start double-counting.
 	SpecDispatchedSinceLog = SpecParkedSinceLog = SpecAdoptedSinceLog = SpecEvictedUnusedSinceLog = 0;
 	SpecDroppedEmptySinceLog = SpecDroppedOvertakenSinceLog = SpecDroppedPoolFullSinceLog = 0;
+	SpecEmptyTopSinceLog = SpecEmptyMidSinceLog = SpecEmptyBotSinceLog = SpecBandSkippedSinceLog = 0;
 	ParkRefusedNoPoolGeomSinceLog = ParkRefusedUnsettledSinceLog = 0;
 	ParkRefusedNotFinerSinceLog = ParkRefusedEditedSinceLog = 0;
 	ChunksParkedSinceLog = ChunksAdoptedSinceLog = 0;
@@ -8310,6 +8319,26 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	if (Pending.bSpeculative)
 	{
 		SpeculativeInFlight.Remove(Pending.Key);
+		// KEEP THE BAND EVEN THOUGH THE GEOMETRY MAY BE DISCARDED.
+		//
+		// The GPU computes a per-COLUMN band (D6) alongside the mesh, and
+		// speculation was throwing it away -- it returned straight to
+		// ParkSpeculativeResult, which never touches FootprintBandCache. That is
+		// why applying admission's buried skip to the speculative enumerator
+		// measured bandSkipped=0: the skip consults a cache that speculation
+		// consumes GPU to produce and then drops on the floor.
+		//
+		// One band covers the whole Z stack of its column, so storing it here
+		// lets the NEXT tick's enumeration skip every remaining buried or air
+		// slot in that column instead of dispatching each one. This is also the
+		// only way the skip can ever fire on virgin terrain, which is precisely
+		// what speculation looks at.
+		if (Pending.Key.Level == 0)
+		{
+			FootprintBandCache.Add(FIntPoint(Pending.Key.Key.X, Pending.Key.Key.Y),
+			                       VoxelStreaming::MakeFootprintBand(GpuResult.BandMaxSurfaceTopVoxel,
+			                                                         GpuResult.BandMinDeepestAirVoxel));
+		}
 		// TIMED. This runs inside Manager->Tick(), which the tick-budget line
 		// attributes to dispatch= -- so unlike a demand result (which only gets
 		// enqueued here and is applied later under apply=), speculation does its
@@ -9849,6 +9878,9 @@ void FVoxelWorldImpl::EnumerateSpeculativeCandidates()
 	// far more ground per chunk and are correspondingly less likely to be the
 	// thing a player sees pop in.
 	constexpr int32 Level = 0;
+	// Loop-invariant; checked once rather than per candidate.
+	const bool bSpecBandSkip = VoxelStreamAdmission::BuriedSkipEnabled()
+	                        && !VoxelStreamAdmission::VerifyBuriedSkipEnabled();
 	const double ChunkEdge = ChunkEdgeUUForLevel(Level);
 	const double OuterUU = UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0;
 
@@ -9912,6 +9944,37 @@ void FVoxelWorldImpl::EnumerateSpeculativeCandidates()
 				if (NeedsOverlayAwarePath(Key))
 				{
 					continue;
+				}
+				// THE SAME BURIED SKIP ADMISSION USES, and speculation was the only
+				// path not applying it. Measured: 49% of speculative dispatches
+				// returned zero quads, and the Z distribution of those empties was
+				// top=73 mid=0 bot=128 -- clustered at BOTH ends of the surface
+				// band and absent from the middle. "Zero quads" covers all-solid as
+				// well as all-air (a fully buried chunk has no visible faces), which
+				// is exactly the pair BandProvesChunkEmpty distinguishes, and demand
+				// sees almost none of them: its census reads skipped=4064 with
+				// air=4 solid=4060.
+				//
+				// REUSED, NOT REIMPLEMENTED. Two copies of one calibration drifting
+				// apart is this repo's documented recurring failure.
+				//
+				// The band only exists for columns something has already meshed, so
+				// this cannot fire on genuinely virgin terrain -- and that is fine:
+				// the speculative cone re-enumerates the same columns for several
+				// ticks as the anchor approaches, so the band is usually present by
+				// the second or third look.
+				if (bSpecBandSkip)
+				{
+					if (const VoxelStreaming::FFootprintBand* Band =
+					        FootprintBandCache.Find(FIntPoint(Key.Key.X, Key.Key.Y)))
+					{
+						bool bAllAir = false;
+						if (VoxelStreaming::BandProvesChunkEmpty(*Band, Key.Key.Z, bAllAir))
+						{
+							++SpecBandSkippedSinceLog;
+							continue;
+						}
+					}
 				}
 				SpeculativeKeys.Add(Key);
 				SpeculativeInFlight.Add(Key);
@@ -10023,6 +10086,27 @@ void FVoxelWorldImpl::ParkSpeculativeResult(const VoxelCoords::FVoxelLevelChunkK
 	if (!GpuResult.GpuQuads.IsValid() || GpuResult.NumQuads == 0)
 	{
 		++SpecDroppedEmptySinceLog;
+		// WHERE IN THE Z STACK, because that decides whether a filter is even
+		// possible. If the empties cluster at the TOP of the band, they are
+		// surface-height padding and an analytic test can drop them before
+		// dispatch. If they are scattered through it, they are caves and
+		// overhangs, and nothing short of meshing knows they are empty -- in
+		// which case the honest answer is to accept the cost, since an air column
+		// parks nothing and evicts nothing.
+		{
+			int32 ZMin = 0, ZMax = 0, ZMaxUntrimmed = 0;
+			FootprintChunkZRangeCached(Key.Key.X, Key.Key.Y, Key.Level, ZMin, ZMax, ZMaxUntrimmed);
+			if (ZMax >= ZMin)
+			{
+				const int32 Span = ZMax - ZMin;
+				// 0 = bottom of the band, 100 = top. Bucketed so one counter
+				// answers "top-heavy or scattered" without a histogram.
+				const int32 Pct = Span > 0 ? ((Key.Key.Z - ZMin) * 100) / Span : 100;
+				if (Pct >= 67)      { ++SpecEmptyTopSinceLog; }
+				else if (Pct >= 34) { ++SpecEmptyMidSinceLog; }
+				else                { ++SpecEmptyBotSinceLog; }
+			}
+		}
 		return; // all-air column; nothing to park
 	}
 	// Demand may have overtaken it while it was in flight.
