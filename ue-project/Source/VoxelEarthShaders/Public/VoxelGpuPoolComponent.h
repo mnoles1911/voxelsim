@@ -414,6 +414,46 @@ public:
 	int64 GetDirtyOverlapsResolved() const { return DirtyOverlapsResolved; }
 	int64 GetDirtyOverlapQuadsResolved() const { return DirtyOverlapQuadsResolved; }
 
+	// --- S2-3: PARKING. Hide a chunk without giving up its geometry. ---------
+	//
+	// This is the mechanism T4-1 is built on (docs/speculative-generation-plan.md
+	// Wave S4): speculatively generated terrain has to sit somewhere the renderer
+	// ignores until admission asks for it, and re-admitting it has to be free.
+	// It also pays for itself before any speculation exists -- ring oscillation
+	// under motion currently re-meshes ground that was resident seconds ago.
+	//
+	// IT IS FAR CHEAPER THAN THE ORIGINAL DESIGN ASSUMED, and the reason is in
+	// the shader. VoxelQuadVertexFactory.ush reads ChunkOrigins[ChunkId].w as the
+	// chunk's SCALE and multiplies every decoded corner by it, so w == 0
+	// collapses that chunk's quads to a degenerate point WHATEVER the per-quad id
+	// buffer holds. ComputeRunBounds already returns Hidden on Entry.W <= 0 and
+	// BuildCulledRanges already skips it.
+	//
+	// So park = write one float and set bChunkTableDirty. No quad traffic in
+	// either direction, no Pool.Free, and no per-quad id stamp -- which means
+	// parking never enters the id-recycling path at all, and does NOT depend on
+	// the GPU hide pass (T1-4) the plan originally sequenced it behind.
+	//
+	// The run is untouched too: ChunkId, FirstQuad and NumQuads are all
+	// unchanged, so bRunsDirty is deliberately NOT set. Only the table entry
+	// moves, and RebuildRunBounds re-derives Hidden from it.
+	//
+	// LIFETIME: the caller keeps the handle. A parked chunk still owns its pool
+	// range, its Allocations slot and its chunk-table entry, so it still counts
+	// against GetNumChunks(), the pool capacity and the chunk-table floor. That
+	// is the whole risk surface -- see the subsystem-side park registry for why
+	// its cap is a correctness boundary rather than a tuning knob.
+	// Unpark takes no params, and that is deliberate: ParkChunk only zeroes the
+	// SCALE in ChunkOrigins, so ChunkParams[ChunkId] -- climate and surface gate
+	// -- is never disturbed and there is nothing to restore. Re-deriving it here
+	// would mean recomputing a value that was never lost, and would make unpark
+	// depend on a scene component the eviction path does not have.
+	void ParkChunk(int32 Handle);
+	void UnparkChunk(int32 Handle, const FVector3f& OriginUU, int32 Level);
+	// Parked chunks are still live allocations; this is how many of GetNumChunks()
+	// are currently hidden.
+	int32 GetNumParkedChunks() const { return NumParkedChunks; }
+
 	// Hold one of these across a run of adds/removes and they publish ONCE, at
 	// the outermost close, instead of once each (S1-1,
 	// docs/speculative-generation-plan.md; measured in
@@ -744,6 +784,10 @@ private:
 	void UnmarkQuadsDirty(uint32 First, uint32 Count);
 	int64 DirtyOverlapsResolved = 0;
 	int64 DirtyOverlapQuadsResolved = 0;
+
+	// S2-3. Chunks currently hidden by ParkChunk -- still allocated, still
+	// holding a table entry, just drawing nothing.
+	int32 NumParkedChunks = 0;
 
 	// Set whenever the set of live ALLOCATIONS changes -- which is not the same
 	// event as the chunk table changing, and conflating the two is what made the

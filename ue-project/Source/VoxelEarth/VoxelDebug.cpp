@@ -444,6 +444,34 @@ TAutoConsoleVariable<int32> CVarVoxelStreamAdmissionRecordCap(
 	TEXT("which measured 66% of the streaming tick with records at 86,077 against a 39,020 settle."),
 	ECVF_Default);
 
+// S2-3 (docs/speculative-generation-plan.md Wave S2): keep an evicted chunk's
+// POOL RANGE, hidden, so re-admitting it is a chunk-table write instead of a
+// full re-mesh round trip. Under motion the ring boundaries oscillate and the
+// same ground is re-meshed seconds after it was evicted.
+//
+// It is also the mechanism T4-1 parks speculatively generated terrain in.
+//
+// THE CAP IS A CORRECTNESS BOUNDARY, NOT A TUNING KNOB. A parked chunk still
+// owns its pool range, its Allocations slot and its chunk-table entry, so it
+// counts against pool capacity and the chunk-table floor exactly as a drawn
+// chunk does. S1 measured what happens when residency is free to expand into
+// available capacity: it does, all of it, and the pool then starts refusing
+// DEMAND allocations while reading 61% free
+// (docs/measurements/s1-close-2026-07-27.txt). Parked geometry has weaker back
+// pressure than resident geometry -- nothing is asking for it.
+//
+// 0 = off (default) until a leg sizes it. Peak flight residency is ~50,900
+// chunks against a 64M-quad pool and an 81,920 chunk-table floor, so the room
+// available for parked entries is what is left of BOTH.
+TAutoConsoleVariable<int32> CVarVoxelStreamPoolParkMax(
+	TEXT("voxel.Stream.PoolParkMax"),
+	0,
+	TEXT("Max chunks kept as hidden-but-allocated pool ranges after eviction, so re-admission is a table ")
+	TEXT("write rather than a re-mesh. 0 = off (evict frees immediately, pre-S2-3 behaviour). Parked chunks ")
+	TEXT("still consume pool quads AND chunk-table entries, so this is bounded by what demand residency ")
+	TEXT("leaves free -- see the source comment."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxRemeshesPerFrame(
 	TEXT("voxel.Stream.MaxRemeshesPerFrame"),
 	8,
@@ -828,6 +856,11 @@ int32 VoxelDebug::GetStreamDispatchAfterDrain()
 int32 VoxelDebug::GetStreamAdmissionRecordCap()
 {
 	return FMath::Max(0, CVarVoxelStreamAdmissionRecordCap.GetValueOnGameThread());
+}
+
+int32 VoxelDebug::GetStreamPoolParkMax()
+{
+	return FMath::Max(0, CVarVoxelStreamPoolParkMax.GetValueOnGameThread());
 }
 
 int32 VoxelDebug::GetStreamMaxRemeshesPerFrame()

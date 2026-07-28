@@ -324,6 +324,13 @@ namespace VoxelDebug
 	// the consumer fast. See the cvar's source comment.
 	VOXELEARTH_API int32 GetStreamAdmissionRecordCap();
 
+	// voxel.Stream.PoolParkMax (S2-3): max chunks kept as hidden-but-allocated
+	// pool ranges after eviction, so re-admission is a chunk-table write rather
+	// than a re-mesh. 0 = off. Parked chunks still consume pool quads and
+	// chunk-table entries, so this cap bounds real capacity -- see the cvar's
+	// source comment.
+	VOXELEARTH_API int32 GetStreamPoolParkMax();
+
 	VOXELEARTH_API int32 GetStreamMaxRemeshesPerFrame();
 
 	// voxel.Stream.MaxUnloadsPerFrame: max chunk-component unload events

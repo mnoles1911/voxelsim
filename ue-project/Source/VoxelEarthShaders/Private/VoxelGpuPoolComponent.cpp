@@ -2291,6 +2291,21 @@ void UVoxelGpuPoolComponent::RemoveChunkInternal(int32 Handle, bool bRecycleChun
 
 	const FVoxelGpuPoolAllocation Alloc = Allocations[Handle];
 
+	// S2-3: a PARKED chunk being removed for real still owes its park counter.
+	// Without this NumParkedChunks only ever grows -- it read 124,841 against a
+	// registry holding 20,000 on the first parking leg, which is how the leak was
+	// found. Checked against the table entry rather than a flag so there is one
+	// source of truth for "is this parked".
+	if (AllocationChunkIds.IsValidIndex(Handle))
+	{
+		const uint32 ParkedId = AllocationChunkIds[Handle];
+		if (ParkedId != kHiddenChunkId && ChunkOrigins.IsValidIndex(int32(ParkedId))
+		    && ChunkOrigins[int32(ParkedId)].W <= 0.0f)
+		{
+			NumParkedChunks = FMath::Max(0, NumParkedChunks - 1);
+		}
+	}
+
 	// Point the freed quads at the hidden chunk (scale 0) so they collapse to
 	// a degenerate point rather than continuing to draw stale geometry.
 	for (uint32 I = 0; I < Alloc.NumQuads; ++I)
@@ -2426,6 +2441,74 @@ void UVoxelGpuPoolComponent::MarkQuadsDirty(uint32 First, uint32 Count)
 			++I;
 		}
 	}
+}
+
+// S2-3. Park: hide the chunk, keep everything else. See the declaration.
+void UVoxelGpuPoolComponent::ParkChunk(int32 Handle)
+{
+	if (!Allocations.IsValidIndex(Handle) || !Allocations[Handle].IsValid())
+	{
+		return;
+	}
+	const uint32 ChunkId = AllocationChunkIds[Handle];
+	// The hidden chunk (id 0) is not a real entry and must never be rewritten --
+	// everything freed points at it, and giving it a scale would make every freed
+	// range in the pool draw at the origin.
+	if (ChunkId == kHiddenChunkId || !ChunkOrigins.IsValidIndex(int32(ChunkId)))
+	{
+		return;
+	}
+	FVector4f& Entry = ChunkOrigins[int32(ChunkId)];
+	if (Entry.W <= 0.0f)
+	{
+		return; // already parked; do not double-count
+	}
+	// Scale 0 is the whole mechanism: the vertex factory multiplies every decoded
+	// corner by this, so the chunk collapses to a point. The ORIGIN is left
+	// intact deliberately -- UnparkChunk overwrites it anyway, and leaving it
+	// makes a parked entry readable in a capture rather than a row of zeros.
+	Entry.W = 0.0f;
+	++NumParkedChunks;
+	// Table only. The run still describes the same quads at the same offset, so
+	// bRunsDirty stays where it is -- see the declaration.
+	bChunkTableDirty = true;
+	PushUpdatesToProxy();
+}
+
+void UVoxelGpuPoolComponent::UnparkChunk(int32 Handle, const FVector3f& OriginUU, int32 Level)
+{
+	if (!Allocations.IsValidIndex(Handle) || !Allocations[Handle].IsValid())
+	{
+		return;
+	}
+	const uint32 ChunkId = AllocationChunkIds[Handle];
+	if (ChunkId == kHiddenChunkId || !ChunkOrigins.IsValidIndex(int32(ChunkId)))
+	{
+		return;
+	}
+	FVector4f& Entry = ChunkOrigins[int32(ChunkId)];
+	if (Entry.W > 0.0f)
+	{
+		return; // not parked
+	}
+	// Re-stamped rather than restored from a saved copy: the caller knows the
+	// chunk's origin and level, and re-deriving here means a parked entry carries
+	// no state that could go stale against the record that owns it.
+	const float Scale = float(1 << FMath::Clamp(Level, 0, 15));
+	Entry = FVector4f(OriginUU.X, OriginUU.Y, OriginUU.Z, Scale);
+	// ChunkParams is deliberately untouched -- ParkChunk never cleared it.
+	NumParkedChunks = FMath::Max(0, NumParkedChunks - 1);
+	bChunkTableDirty = true;
+	PushUpdatesToProxy();
+
+	// The pool's bounds may have been shrunk past this chunk while it was parked
+	// -- LocalBounds only ever grows, so this is cheap insurance rather than a
+	// recompute.
+	const float EdgeUU = float(ChunkEdgeVoxels) * 10.0f * Scale;
+	LocalBounds += FBox(
+		FVector(OriginUU.X, OriginUU.Y, OriginUU.Z),
+		FVector(OriginUU.X + EdgeUU, OriginUU.Y + EdgeUU, OriginUU.Z + EdgeUU));
+	UpdateBounds();
 }
 
 // The subtract. See the declaration for WHY this exists -- it is what makes

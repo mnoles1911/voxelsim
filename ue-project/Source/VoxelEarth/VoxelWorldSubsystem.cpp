@@ -2575,6 +2575,67 @@ struct FVoxelWorldImpl
 
 	TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStreaming::FChunkRecord> ChunkRecords;
 
+	// --- S2-3: parked geometry (docs/speculative-generation-plan.md Wave S2) --
+	//
+	// Chunks whose records are gone but whose POOL RANGE is kept, hidden, so a
+	// re-admit is a table write instead of a full re-mesh round trip. Under
+	// motion the ring boundaries oscillate and the same ground is re-meshed
+	// seconds after it was evicted; this is what stops that. It is also the
+	// mechanism T4-1 parks speculatively generated terrain in.
+	//
+	// A SEPARATE MAP, NOT A FIELD ON FChunkRecord, and that is forced rather
+	// than stylistic: DrainUnloads does ChunkRecords.Remove(Key) unconditionally
+	// once the geometry is released, so anything living on the record is gone at
+	// exactly the moment parking needs to remember something. A speculative chunk
+	// (Wave S4) has no record at all yet, so the same map serves both.
+	struct FParkedGeometry
+	{
+		int32 PoolHandle = INDEX_NONE;
+		// Everything UnparkChunk needs to re-stamp the table entry. Held here
+		// rather than re-derived so unpark cannot disagree with what was parked.
+		FVector3f OriginInPool = FVector3f::ZeroVector;
+		FVector4f Params = FVector4f(0.f, 0.f, 0.f, 0.f);
+		int32 Level = 0;
+		int32 QuadCount = 0;
+		// INVALIDATION. GenerationId is bumped by MarkChunkDirtyForRemesh and
+		// EditEpoch by PropagateEditToMips; either moving means this geometry
+		// describes a world that no longer exists. Checked on adopt, because a
+		// parked chunk has no record for the normal staleness path to catch --
+		// MarkChunkDirtyForRemesh does not release geometry, it only bumps and
+		// re-queues, so without this an edited chunk would silently un-park with
+		// its pre-edit shape.
+		uint64 GenerationId = 0;
+		uint64 EditEpoch = 0;
+		float ParkedAtSeconds = 0.f;
+	};
+	TMap<VoxelCoords::FVoxelLevelChunkKey, FParkedGeometry> ParkedGeometry;
+
+	// Park bookkeeping for the 5 s line and the eviction policy.
+	int64 ChunksParkedSinceLog = 0;
+	int64 ChunksAdoptedSinceLog = 0;
+	int64 ParkEvictedStaleSinceLog = 0;   // generation/edit-epoch mismatch on adopt
+	int64 ParkEvictedCapSinceLog = 0;     // pushed out by the cap, oldest first
+	int64 ChunksParkedTotal = 0;
+	int64 ChunksAdoptedTotal = 0;
+
+	// Park the oldest entries until the map is within Cap. LRU by ParkedAtSeconds.
+	//
+	// THE CAP IS A CORRECTNESS BOUNDARY, NOT A TUNING KNOB. A parked chunk still
+	// owns its pool range, its Allocations slot and its chunk-table entry, so it
+	// counts against pool capacity and the chunk-table floor exactly as a drawn
+	// chunk does. S1 measured what happens when residency is allowed to expand
+	// into available capacity: it does, all of it, and then the pool starts
+	// refusing DEMAND allocations while looking half empty
+	// (docs/measurements/s1-close-2026-07-27.txt). Parked geometry has weaker
+	// back pressure than resident geometry, and speculative geometry (Wave S4)
+	// has none at all.
+	// Returns true if the geometry was PARKED rather than freed. A true return
+	// means the record no longer holds geometry, exactly as ReleaseChunkGeometry
+	// does -- callers must not treat it as "nothing happened".
+	bool ParkChunkGeometry(const VoxelCoords::FVoxelLevelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec);
+	void EvictParkedOverCap(int32 Cap);
+	void EvictParkedKey(const VoxelCoords::FVoxelLevelChunkKey& Key);
+
 	// M1 hitch-gap wave (component pooling, docs/status.md M1 gate row): a
 	// component that leaves the desired set (DrainUnloads) or goes empty on
 	// re-mesh (ApplyMeshResult's zero-quads branch) is hidden + parked here
@@ -4135,6 +4196,14 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 				}
 			}
 		}
+		// NOTE: batching the recompute pass was tried and REVERTED. The idea was
+		// sound -- adoption unparks, UnparkChunk publishes, and S1-1's scope
+		// covers the drains rather than the recompute, so ~23,700 adopts were
+		// each paying a full publication. But wrapping this call in an
+		// FScopedBatch took parking from 28,117 parks/84% hit to ZERO parks and
+		// chunks/s 1,040 -> 540, and the world was still churning at the end of
+		// the linger. Cause not established; the scope is the only delta between
+		// the two legs. Do not re-apply without diagnosing that first.
 		RecomputeDesiredSet(Anchor);
 		LastAnchorChunk = AnchorChunk;
 		bHasRecomputed = true;
@@ -4803,6 +4872,23 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       ResultsDrainedSinceLog > 0 ? 100.0 * double(StaleDiscardsSinceLog) / double(ResultsDrainedSinceLog) : 0.0,
 	       (long long)ZeroQuadAppliesSinceLog, (long long)RecordsAddedSinceLog, (long long)RecordsEvictedSinceLog,
 	       (long long)CandidatesRejectedSinceLog, ChunksPerSecThisWindow);
+	// S2-3 park census. adopted/parked is the hit rate: a park that is never
+	// adopted was work kept warm for nothing, and it held a pool range and a
+	// chunk-table entry the whole time. This is the same number T4-1's
+	// specHitRate will be judged on, measured here first on demand traffic.
+	if (VoxelDebug::GetStreamPoolParkMax() > 0 || ChunksParkedTotal > 0)
+	{
+		const UVoxelGpuPoolComponent* Pool = GpuPool.Get();
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel park (5s window): parked=%lld adopted=%lld evictedStale=%lld evictedCap=%lld | ")
+		       TEXT("held=%d poolParked=%d | cumulative parked=%lld adopted=%lld (hit %.0f%%)"),
+		       (long long)ChunksParkedSinceLog, (long long)ChunksAdoptedSinceLog,
+		       (long long)ParkEvictedStaleSinceLog, (long long)ParkEvictedCapSinceLog,
+		       ParkedGeometry.Num(), Pool ? Pool->GetNumParkedChunks() : -1,
+		       (long long)ChunksParkedTotal, (long long)ChunksAdoptedTotal,
+		       ChunksParkedTotal > 0 ? 100.0 * double(ChunksAdoptedTotal) / double(ChunksParkedTotal) : 0.0);
+	}
+
 	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel admission (5s window): cap=%d cutoffM=%.0f rejected=%lld dropped=%lld"),
 	       VoxelStreamAdmission::GetPendingJobCap(),
 	       WidestAdmissionCutoffM(),
@@ -5321,6 +5407,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// GetAndResetPushStats where the line is emitted, not here -- they live on the
 	// component, and resetting them from two places is how the render-thread half
 	// would start double-counting.
+	ChunksParkedSinceLog = ChunksAdoptedSinceLog = 0;
+	ParkEvictedStaleSinceLog = ParkEvictedCapSinceLog = 0;
 	DrainExitQueueEmptySinceLog = DrainExitWallClockSinceLog = 0;
 	DrainExitCountCapSinceLog = DrainExitDrainCapSinceLog = 0;
 	ApplyStagePackMs = ApplyStageParamsMs = ApplyStagePoolAddMs = 0.0;
@@ -6767,6 +6855,57 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 							++ResurrectionsSinceLog;
 						}
 						return;
+					}
+
+					// S2-3 ADOPTION. No record, but the geometry may still be in
+					// the pool, hidden, from a recent eviction. Re-admitting it is
+					// a table write; re-meshing it is a full round trip through
+					// the GPU and the apply path.
+					//
+					// This is also the seam T4-1 lands on (Wave S4): speculatively
+					// generated terrain arrives already parked, and admission
+					// FINDS it here instead of commissioning it.
+					if (FParkedGeometry* Parked = ParkedGeometry.Find(LevelKey))
+					{
+						// Staleness first. A parked chunk has no record, so this
+						// is the only place its generation can be checked -- and
+						// MarkChunkDirtyForRemesh already drops parked entries on
+						// edit, so this catches the world-version case rather than
+						// the edit case.
+						const uint64 NowEpoch = EditEpoch.load(std::memory_order_relaxed);
+						if (Parked->EditEpoch != NowEpoch)
+						{
+							EvictParkedKey(LevelKey);
+							++ParkEvictedStaleSinceLog;
+							// Fall through and admit it normally.
+						}
+						else
+						{
+							VoxelStreaming::FChunkRecord& Adopted = ChunkRecords.Add(LevelKey);
+							Adopted.PoolSlot = Parked->PoolHandle;
+							Adopted.GenerationId = Parked->GenerationId;
+							Adopted.LastQuadCount = Parked->QuadCount;
+							Adopted.bDeepAnchorRelative = bDeepAnchorRelative;
+							// SETTLED, and that is the point: the geometry is
+							// final and on screen the moment the table entry is
+							// restored, so this record can immediately release a
+							// retained stand-in above or below it.
+							Adopted.bMeshSettled = true;
+							Adopted.LoadedAtSeconds = ElapsedSeconds;
+
+							if (UVoxelGpuPoolComponent* Pool = GpuPool.Get())
+							{
+								Pool->UnparkChunk(Parked->PoolHandle, Parked->OriginInPool, Parked->Level);
+							}
+							ResidentQuads += Parked->QuadCount;
+							ParkedGeometry.Remove(LevelKey);
+							++ChunksAdoptedSinceLog;
+							++ChunksAdoptedTotal;
+							++RecordsAddedSinceLog;
+							++LevelRecordsAdded[FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1)];
+							// NO JOB IS QUEUED. That is the whole win.
+							return;
+						}
 					}
 
 					// Bounded admission gate (a): while the WORKER queue is at
@@ -9254,6 +9393,138 @@ void FVoxelWorldImpl::ReleaseChunkGeometry(VoxelStreaming::FChunkRecord& Rec)
 	}
 }
 
+// S2-3. ReleaseChunkGeometry's alternative: keep the range, hide it, remember it.
+//
+// Returns true if the geometry was parked (and therefore NOT freed). Callers
+// must treat a true return exactly as they treat ReleaseChunkGeometry -- the
+// record no longer holds geometry either way.
+bool FVoxelWorldImpl::ParkChunkGeometry(const VoxelCoords::FVoxelLevelChunkKey& Key,
+                                        VoxelStreaming::FChunkRecord& Rec)
+{
+	const int32 Cap = VoxelDebug::GetStreamPoolParkMax();
+	if (Cap <= 0)
+	{
+		return false; // parking off -- the default
+	}
+	// Pool geometry only. A component-path chunk has its own pooling
+	// (ReturnChunkComponentToPool) and nothing here to keep.
+	if (Rec.PoolSlot == INDEX_NONE || Rec.Component.IsValid())
+	{
+		return false;
+	}
+	UVoxelGpuPoolComponent* Pool = GpuPool.Get();
+	if (!Pool)
+	{
+		return false;
+	}
+	// An unsettled chunk's geometry is not final -- parking it would cache a
+	// shape that was still being replaced.
+	if (!Rec.bMeshSettled || Rec.LastQuadCount <= 0)
+	{
+		return false;
+	}
+
+	// PARK ONLY LOD TRANSITIONS TOWARD FINER, AND THAT RESTRICTION IS THE WHOLE
+	// DIFFERENCE BETWEEN THIS PAYING AND COSTING.
+	//
+	// Measured parking every eviction on a straight-line flight: 135,260 parks
+	// against 10,419 adopts -- an 8% hit rate -- while the 92% that were never
+	// reused held pool ranges and chunk-table entries until the cap pushed them
+	// out. That took allocFail 0 -> 45,633, holes 0 -> 1,804 and chunks/s
+	// 1,040 -> 936. Parking geometry is only free if it is reused.
+	//
+	// The reason is geometric: on a traverse, everything evicted by bBeyondOuter
+	// is BEHIND the camera and never comes back, so caching it is pure cost. What
+	// does come back is the ring-boundary oscillation -- a footprint that dipped
+	// inside this level's inner edge as the anchor passed and will re-enter the
+	// annulus as it recedes. RetainDir_Finer is exactly that eviction cause
+	// (bInsideInner), already stamped by RecomputeDesiredSet.
+	//
+	// Wave S4 note: speculative geometry is the mirror image of this -- generated
+	// AHEAD of the camera, where the hit rate should be high by construction --
+	// so it will not route through here and must not inherit this test.
+	if (Rec.RetainReplaceDir != RetainDir_Finer)
+	{
+		return false;
+	}
+	// Edited chunks are never parked. NeedsOverlayAwarePath is the same test
+	// admission uses to route them to the game-thread mesher, and their geometry
+	// is a function of the edit log rather than of worldgen alone.
+	if (NeedsOverlayAwarePath(Key))
+	{
+		return false;
+	}
+
+	FParkedGeometry Parked;
+	Parked.PoolHandle = Rec.PoolSlot;
+	Parked.OriginInPool = FVector3f(VoxelCoords::ChunkOriginWorldForLevel(Key.Key, Key.Level) - GpuPoolRebase);
+	Parked.Level = Key.Level;
+	Parked.QuadCount = Rec.LastQuadCount;
+	Parked.GenerationId = Rec.GenerationId;
+	Parked.EditEpoch = EditEpoch.load(std::memory_order_relaxed);
+	Parked.ParkedAtSeconds = ElapsedSeconds;
+
+	Pool->ParkChunk(Rec.PoolSlot);
+	ParkedGeometry.Add(Key, Parked);
+	++ChunksParkedSinceLog;
+	++ChunksParkedTotal;
+
+	// The record is handing the geometry over, not keeping it.
+	Rec.PoolSlot = INDEX_NONE;
+
+	EvictParkedOverCap(Cap);
+	return true;
+}
+
+// Free one parked entry for real. Used by the cap, and by the edit paths.
+void FVoxelWorldImpl::EvictParkedKey(const VoxelCoords::FVoxelLevelChunkKey& Key)
+{
+	FParkedGeometry Parked;
+	if (!ParkedGeometry.RemoveAndCopyValue(Key, Parked))
+	{
+		return;
+	}
+	if (UVoxelGpuPoolComponent* Pool = GpuPool.Get())
+	{
+		// RemoveChunk on a PARKED handle is correct and is why parking did not
+		// need the GPU hide pass: the range is still allocated and the handle
+		// still valid, so this is the ordinary free path. The table entry it
+		// neutralises is already neutral.
+		Pool->RemoveChunk(Parked.PoolHandle);
+	}
+}
+
+void FVoxelWorldImpl::EvictParkedOverCap(int32 Cap)
+{
+	if (Cap <= 0 || ParkedGeometry.Num() <= Cap)
+	{
+		return;
+	}
+	// Oldest first. Linear rather than a heap: this runs only when the cap is
+	// already exceeded, and the overshoot is one entry in the steady state
+	// because ParkChunkGeometry calls it on every park.
+	while (ParkedGeometry.Num() > Cap)
+	{
+		const VoxelCoords::FVoxelLevelChunkKey* OldestKey = nullptr;
+		float OldestAt = TNumericLimits<float>::Max();
+		for (const auto& Pair : ParkedGeometry)
+		{
+			if (Pair.Value.ParkedAtSeconds < OldestAt)
+			{
+				OldestAt = Pair.Value.ParkedAtSeconds;
+				OldestKey = &Pair.Key;
+			}
+		}
+		if (!OldestKey)
+		{
+			break;
+		}
+		const VoxelCoords::FVoxelLevelChunkKey Key = *OldestKey; // copy before the erase
+		EvictParkedKey(Key);
+		++ParkEvictedCapSinceLog;
+	}
+}
+
 bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material,
                                        const VoxelCoords::FVoxelLevelChunkKey& Key, VoxelStreaming::FChunkRecord& Rec,
                                        TArray<FVoxelChunkQuad>&& Quads, bool bIsGameThreadMesh,
@@ -10232,7 +10503,18 @@ void FVoxelWorldImpl::DrainUnloads()
 			// DrainResults finds no record for the key and discards it.
 			// M1 hitch-gap wave: park (not destroy) -- see
 			// ReturnChunkComponentToPool / docs/status.md M1 gate row.
-			ReleaseChunkGeometry(*Rec);
+			//
+			// S2-3: try to keep the POOL RANGE first. Under motion the ring
+			// boundaries oscillate and this same footprint is very often
+			// re-admitted seconds later; parking makes that a table write
+			// instead of a full mesh round trip. ParkChunkGeometry returns
+			// false (and geometry is freed normally) when parking is off, when
+			// the chunk is unsettled or edited, or when it is a component-path
+			// chunk. Either way the record stops holding geometry here.
+			if (!ParkChunkGeometry(Key, *Rec))
+			{
+				ReleaseChunkGeometry(*Rec);
+			}
 			++ComponentUnloads;
 		}
 
@@ -10328,6 +10610,15 @@ void FVoxelWorldImpl::MarkChunkDirtyForRemesh(const VoxelCoords::FVoxelLevelChun
 	// level -- see the doc comment on the declaration. Level-0 callers
 	// (ApplyGroupedEdits, below) and level>=1 callers (PropagateEditToMips)
 	// share this identical bump/requeue logic.
+	//
+	// S2-3 FIRST, AND UNCONDITIONALLY: a parked chunk has no record, so every
+	// staleness path below is blind to it. This function does not release
+	// geometry -- it bumps GenerationId and re-queues -- so without dropping the
+	// parked copy here, an edited chunk would later un-park with its PRE-EDIT
+	// shape and nothing in the system would report it. Cheap when parking is off
+	// (one empty-map lookup).
+	EvictParkedKey(LevelKey);
+
 	VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(LevelKey);
 	if (!Rec)
 	{
