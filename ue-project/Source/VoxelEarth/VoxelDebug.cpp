@@ -528,9 +528,36 @@ TAutoConsoleVariable<int32> CVarVoxelStreamBatchRecompute(
 	     "configuration that zeroed parking (task #17). Read the park census refusal counters with it on."),
 	ECVF_Default);
 
+// DEFAULT 2.0 SINCE 2026-07-28 (owner decision). T4-1 speculative generation is
+// ON.
+//
+// Measured across a 10-leg alternated sweep at 2560x1440: median flight-phase
+// transient holes ~822 with it off against ~57 with it on -- a 93% reduction --
+// at identical throughput (chunks/s spans 1061.5-1070.9 across every arm
+// INCLUDING the controls), identical pool pressure (86.2% -> 86.8%), and, after
+// the batch scope was widened over GpuMeshJobs->Tick(), identical game-thread
+// tick cost. holes(final)=0 and allocFail=0 on all ten.
+//
+// WHY 2.0 AND NOT MORE. The effect SATURATES at 1 s: 1/2/4/8 s all land inside a
+// single arm's pass-to-pass spread. The plan swept lead precisely because it
+// assumed more lead buys more coverage; it does not, and the binding constraint
+// beyond ~1 s is SpeculativeMaxInFlight rather than how far ahead the cone
+// reaches. So the cheapest setting is also the best one, and anything that
+// scales with lead should be sized for ~2 s rather than 8.
+// Detail: docs/measurements/t41-first-result-2026-07-28.txt
+// Per-frame timing capture + the fast-vs-slow attribution report. Off by
+// default: it is a diagnostic, and it holds one 28-byte sample per frame.
+TAutoConsoleVariable<int32> CVarVoxelStreamFrameAttribution(
+	TEXT("voxel.Stream.FrameAttribution"),
+	0,
+	TEXT("1 = sample frame/thread timings EVERY frame and report the fast-vs-slow component breakdown in "
+	     "the 5s census. Unlike the Hitch frame line this can describe a TYPICAL frame, which is what "
+	     "naming the frame-time floor and the tail both require."),
+	ECVF_Default);
+
 TAutoConsoleVariable<float> CVarVoxelStreamVelocityLeadSec(
 	TEXT("voxel.Stream.VelocityLeadSec"),
-	0.0f,
+	2.0f,
 	TEXT("Seconds of travel ahead of the anchor that speculative generation aims at. 0 = off. Applied to a ")
 	TEXT("0.25s-EMA velocity vector and clamped by voxel.Stream.VelocityLeadMaxUU. Feeds speculation ONLY -- ")
 	TEXT("admission, eviction and retention stay on the true anchor by design."),
@@ -991,6 +1018,11 @@ int32 VoxelDebug::GetStreamAdmissionRecordCap()
 int32 VoxelDebug::GetStreamBatchRecompute()
 {
 	return CVarVoxelStreamBatchRecompute.GetValueOnGameThread();
+}
+
+int32 VoxelDebug::GetStreamFrameAttribution()
+{
+	return CVarVoxelStreamFrameAttribution.GetValueOnGameThread();
 }
 
 float VoxelDebug::GetStreamVelocityLeadSec()

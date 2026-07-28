@@ -47,7 +47,47 @@ Full detail: `docs/measurements/session-summary-2026-07-28.txt`.
 
 ---
 
-### 0.1 P0 — Find what actually causes the frame tail
+### 0.1 P0 — ANSWERED 2026-07-28: the frame is render-thread bound, the tail is GPU
+
+Measured with `voxel.Stream.FrameAttribution 1` over two legs (~16,600 frames
+each). Full numbers: `docs/measurements/frame-attribution-2026-07-28.txt`.
+
+**A typical frame is the render thread.** render 13.49 ms against a 13.41 ms
+frame, while the GAME thread spends 10.07 ms of it **waiting**. The voxel tick
+contributes 0.47 ms. That retrospectively explains why cutting game-thread
+publication from 2.94 ms to 0.055 ms moved nothing — the game thread had 10 ms
+of slack to absorb it.
+
+⇒ **Game-thread work buys headroom, never frame rate.** Anything aimed at fps
+must reduce render-thread work.
+
+**The tail is GPU.** The largest slow-frame delta is `renderWait` (+12.3 / +10.1
+ms against a frame delta of +16.5 / +13.3) — the render thread blocked. The voxel
+tick does rise on slow frames (+5.1 ms), which is exactly why it looked causal;
+it is a passenger, because a frame where lots of terrain arrives has more
+streaming work *and* more GPU work, and only the second is on the critical path.
+
+**Shadow cascades are not involved.** `shadowGather=0` throughout and ~1.03
+gathers per frame — the "pool re-gathered 4–5× for shadows" hypothesis is dead.
+
+**The cull walks the whole pool every frame:** 62,657 runs frustum-tested per
+gather, of which only ~10,300 survive. At the 45–90 ns per test recorded at
+Wave G that is ~4.4 ms — roughly a third of the render thread — and it scales
+with *resident* chunks, not visible ones. **This is now the best-supported single
+item on the list** (see 0.1a).
+
+### 0.1a NEW P0 — Hierarchical cull
+
+Stop testing 62,657 boxes individually. Runs are sorted by pool offset and
+streaming fills the pool in roughly spatial order, so grouping every N
+consecutive runs under one bound lets a single test reject thousands. Worth up
+to ~4 ms of a ~13 ms render thread, costs **no visual quality**, and is contained
+entirely within the cull.
+
+Confirm the ~4.4 ms with a direct timer first — it is derived from a per-test
+figure recorded at Wave G, not re-measured.
+
+<details><summary>Superseded framing (kept — this is the hypothesis that was falsified)</summary>
 
 **Open, and the obvious hypothesis is already falsified.**
 
@@ -70,6 +110,8 @@ The cause is unknown. The next attempt must find it rather than assume:
 
 **Worth:** the difference between "60 fps median" and "60 fps floor", which is
 the difference between the stated goal being met and not.
+
+</details>
 
 ---
 
