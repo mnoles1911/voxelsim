@@ -1,7 +1,8 @@
 # Backlog
 
-One place for everything known-and-not-done. Written 2026-07-25, after the
-worldgen v8 climate wave.
+One place for everything known-and-not-done. Written 2026-07-25 after the
+worldgen v8 climate wave; **section 0 added 2026-07-28** after the streaming and
+draw-path programme merged (PR #165).
 
 Each item says what it is, why it matters, what it costs, and what unblocks it.
 Items are grouped by **what kind of decision they need**, not by subsystem —
@@ -11,6 +12,199 @@ because the thing that stalls work here is usually "whose call is this", not
 `docs/status.md` remains the chronological record of what happened. This file is
 the forward-looking list. When an item lands, delete it here and write the result
 there.
+
+---
+
+## 0. ENGINE PERFORMANCE — the current front
+
+**Read this section first.** Everything below it predates the streaming
+programme; §6b in particular is stale and now says so.
+
+### Where the engine is (2026-07-28)
+
+Standard flight leg, shipped defaults, **2560x1440**:
+
+| | value |
+|---|---|
+| p50 frame | 15.27 ms (**65.5 fps**) |
+| p95 frame | 21.02 ms (47.6 fps) |
+| max frame | 42.8 ms |
+| hitch frames | 11–25 of ~16,000 |
+| flight-phase holes (median) | ~57 |
+| holes(final) / allocFail | 0 / 0 |
+| chunks/s | ~1,074 |
+| pool | 70% of 80M quads |
+
+**Streaming is solved and is no longer the constraint.** 260.9 → ~1,074 chunks/s
+across Waves S1–S4, zero permanent holes, and terrain now arrives ahead of the
+camera (T4-1). Nothing in this section is a streaming item.
+
+**The constraint is frame time, specifically its tail.** The median clears
+60 fps; the 95th percentile does not, and there is ~1.5 ms of headroom against
+the 16.7 ms budget before any gameplay system is added.
+
+Full detail: `docs/measurements/session-summary-2026-07-28.txt`.
+
+---
+
+### 0.1 P0 — Find what actually causes the frame tail
+
+**Open, and the obvious hypothesis is already falsified.**
+
+p50 15.27 ms against p95 21.02 ms is a ~5.7 ms spread. The streaming tick was
+blamed because `perTick` (5.995 ms, on ~32% of frames) matched that gap almost
+exactly. Incremental pool runs then removed a third of the tick — `buildRuns`
+2.94 → 0.055 ms per publication, tick 11.73% → 7.75% of wall — and **p50/p95 did
+not move at all**. The match was a coincidence.
+
+The cause is unknown. The next attempt must find it rather than assume:
+
+1. Capture a per-frame time series, not percentiles, and correlate slow frames
+   against what else happened on them (publication? unload burst? GPU harvest?
+   shadow cascade?). The `Hitch frame:` line already carries a
+   subsystem/elsewhere split — extend that to ALL frames, not just >33.3 ms ones.
+2. Establish whether slow frames are game-thread, render-thread or GPU bound.
+   `renderMs` cannot answer this today: it is a HITCH field (lesson 17) and only
+   exists above the threshold.
+3. Only then pick a fix.
+
+**Worth:** the difference between "60 fps median" and "60 fps floor", which is
+the difference between the stated goal being met and not.
+
+---
+
+### 0.2 P1 — Occlusion culling
+
+**Designed, not started. The largest remaining frame-time lever that costs no
+visual quality.**
+
+The cull is frustum-only. It already rejects 68% of chunks (41,946 of 62,119),
+but at ~7.8 triangles per pixel at 2K most survivors are behind something.
+Terrain occludes itself heavily — a ground-level camera sees a few hundred metres
+of surface and nothing past the first ridge.
+
+**UE's built-in occlusion cannot help.** Hardware occlusion queries are
+per-PRIMITIVE, and ADR-0006 deliberately makes the whole pool one primitive with
+one draw call. The renderer sees a single world-sized object and can only answer
+"is the pool visible", which it always is.
+
+Two approaches:
+
+**(a) Horizon culling — cheaper, terrain-specific.** For a camera near the
+ground, a chunk is occluded if its top lies below the sightline grazing the
+nearest ridge on that bearing. The surface heights are already on hand
+(`FootprintBandCache`, the clipmap heightfield). Build a coarse per-bearing
+horizon-angle array once per frame from the near rings; reject chunks whose
+angular extent falls entirely below it. No GPU readback, no frame of latency.
+Weak when looking down from height.
+
+**(b) HZB occlusion — general, the real answer.** A compute pass tests each
+chunk's bounds against the previous frame's hierarchical depth buffer and writes
+a per-chunk visibility bit that `BuildCulledRanges` reads alongside the frustum
+result. How UE's own GPU scene culling works; handles every camera pose. Costs
+one frame of latency (standard, invisible at these rates) plus reprojection care.
+
+Prerequisites and hazards:
+
+- `ComputeRunBounds`/`RunBounds` already provide per-chunk world bounds on the
+  render thread, so the input either approach needs exists.
+- `RunBounds` is read by `GetDynamicMeshElements`, which runs **concurrently**
+  across the camera view and every shadow cascade. A per-frame visibility buffer
+  must not be written while a gather reads it — see the concurrency argument at
+  `RebuildRunBounds`.
+- **Shadow cascades must not use camera occlusion.** A chunk invisible to the
+  camera can still cast a visible shadow. Gate on `bShadowGather`.
+- Ground rule 4: a pooled primitive fails silently. Verify with a screenshot diff
+  and a converged `CoverageVerify`, and add a debug mode that draws what
+  occlusion rejected — the sibling of `GPUCullDebugAllVisible`.
+
+**Worth:** unmeasured, but the ceiling is high. If half the in-frustum geometry
+is occluded, drawn quads roughly halve, and the draw path responds to geometry
+volume at ~0.4 ms per million quads.
+
+---
+
+### 0.3 P2 — Deferred by owner decision (2026-07-28)
+
+**S2-1 GPU hide pass — built, gated OFF, UNVERIFIED.**
+`voxel.Stream.PoolGpuHide 0`; the pass, the pending-hide plumbing and
+`UnmarkGpuHide` all ship and are inert at the default. Its forced probe went
+through five rounds of harness bugs and still gives no trustworthy verdict. One
+intermediate result was reported as "the probe caught a real bug" and is
+**retracted** — the control, against the shipped CPU-shadow path, fails
+identically. **Before trusting any verdict from that probe, verify it against a
+known answer:** allocate one chunk, publish, read it back, assert the ids equal
+that chunk's id. Full history:
+`docs/measurements/s21-gpu-hide-probe-2026-07-28.txt`.
+
+**S2-5 drop the CPU shadow — blocked on S2-1.** `InitPool` allocates
+`PooledQuads` + `QuadChunkIds` at full capacity (12 B/quad) and
+`CreateSceneProxy` copies both **whole** — at the current 80M capacity, ~960 MB
+of system RAM plus a 960 MB game-thread memcpy on any render-state rebuild.
+Blocked because the shadow's last writer on the GPU-only path is
+`RemoveChunkInternal`'s per-quad id stamp, which IS the mechanism that hides
+freed geometry. Also gates any pool growth beyond 80M.
+
+---
+
+### 0.4 P3 — Geometry levers that cost visual quality
+
+Take these only if 0.2 is exhausted and frame time is still short.
+
+| item | saving | cost |
+|---|---|---|
+| **Per-chunk greedy meshing** — merging is per-brick (8³) not per-chunk (32³), so a flat 32×32 face becomes 16 quads instead of 1 | up to 16× on flat terrain in theory; far less in practice, since the merge key includes 4-corner AO | GPU mesher must match the CPU reference **bit-exactly** (`mesher.h`), gated by `VerifyAsyncMesh` and worldgen digest `6e893ab3679a8c81`. Both implementations change in lockstep, digest re-baselined. |
+| **Cascade 6 rings → 5** (4 km → 2 km) | ~1/6 of resident chunks, ~7.8M quads | Draw distance. Not one line: `AVoxelClipmapActor` derives its entire vertex spacing from `RingPresets[kNumLevels-1].OuterMeters`. |
+| **Coarser far rings** (32³ → 16³ at L4/L5) | halves far-ring quads, keeps draw distance | Distant detail. Biggest structural win, most work. |
+| **Trim far-ring Z extent** | distant columns rarely need their full underground stack | Underground pop-in when descending at range. |
+
+**Do not re-propose reducing per-ring quad counts as a bug fix.** Ring radii
+double and chunk footprints double with them, so chunks-per-ring is constant **by
+construction** — that is what a clipmap is. The flat L0–L5 distribution is
+correct. (Proposed and withdrawn 2026-07-28.)
+
+---
+
+### 0.5 P4 — Speculation refinements (small)
+
+- **~187 speculative dispatches per window still return zero quads.**
+  `dropOvertaken=0` and `dropPoolFull=0`, so it is all zero-quad results — and
+  "zero quads" covers all-**solid** as well as all-air, which is why they cluster
+  at both ends of the surface band and never the middle. Feeding the D6 band back
+  from speculative results made the shared buried skip fire at all (0 → 51 per
+  window) but end-to-end effect was small, because speculation is bounded by
+  `SpeculativeMaxInFlight` rather than by candidate supply. Further reduction
+  needs an **analytic** empty test at enumeration time. Bounded cost if never
+  done: an air or buried chunk parks nothing, holds no pool range, evicts nothing.
+- **`voxel.Stream.VelocityLeadSec` still defaults to 0.** T4-1 is confirmed (93%
+  fewer flight-phase holes, no throughput/memory/game-thread cost) but ships off
+  pending an owner call. Recommended default **2.0** — the effect saturates at
+  1 s, so the cheapest setting is also the best.
+
+---
+
+### 0.6 Standing rules for this area
+
+1. **Read `docs/lessons-2026-07-27-s0-s1.md` first.** Seventeen lessons, most of
+   them measurement failures where the number was arithmetically correct and
+   answered a different question than the one asked.
+2. **`frameMs`/`renderMs` are HITCH fields**, emitted only above a 33.3 ms
+   threshold. Use the `VoxelPerfRun post-warmup` line for frame time.
+3. **Run legs through `tools/voxel-run-flight-leg.ps1`**, summarise with
+   `voxel-leg-summary.ps1` (refuses partial legs), audit with
+   `voxel-audit-leg-overlap.ps1` (two legs sharing the box read exactly like a
+   slow configuration).
+4. **State the resolution.** The harness defaults to 1600x900; the target is 2K.
+   Resolution is currently free because the renderer is geometry-bound — re-check
+   after any change, because the moment something becomes pixel-bound every 900p
+   measurement stops transferring.
+5. **Never tune `GPUCullMergeGap` and `GPUCullMaxRanges` separately.** Swept
+   alone, the winning value of each measures *worse* than the loser.
+6. **Do not re-propose the falsified levers:** fork caps 16/32,
+   `GpuMeshInFlight` 1024, `DispatchAfterDrain`, `AdmissionBandSkip`, ring
+   cross-fade, slot-floor sweeps, ring-major dispatch, idle defrag (T3-6).
+7. **A gate that no-ops and exits 0 is not a pass.** Several verification
+   commands do exactly that when issued via `-ExecCmds` at startup.
 
 ---
 
@@ -55,8 +249,9 @@ output then equals `main` byte-for-byte, so no golden moves and no
 `kWorldGenVersion` bump is needed at all; (b) port flow accumulation to a GPU
 compute pass, which pairs naturally with the harness widening below.
 
-**GPU harness cannot see real tiles.** `gpu_harness.cpp` and
-`VoxelGpuVerify.cpp` take a concrete `SyntheticTileSampler&`, not
+**GPU harness cannot see real tiles.** *(Still open, confirmed 2026-07-28:
+`gpu_harness.cpp:1869` still takes `SyntheticTileSampler&`.)* `gpu_harness.cpp`
+and `VoxelGpuVerify.cpp` take a concrete `SyntheticTileSampler&`, not
 `ITileSampler&`, so `vxc_gpu` can only ever exercise synthetic climate — never
 the real-tile regime where v8's miscalibration actually lived. Mitigated for now
 because v8 made the synthetic emission span every threshold, but that is a
@@ -84,16 +279,20 @@ that is 3750. The comment now says so. Adding a real 3750 environment is a new
 environment plus a re-pin of a golden that is explicitly not worldgen output, so
 it is a deliberate small change rather than a free rider.
 
+*Still open, confirmed 2026-07-28:* `test_amplifier.cpp` mentions 3750 only in
+those two comments — no 3750 environment exists yet.
+
 **Re-run `-VoxelMatHistogram` in engine.** v8's fix is verified by the CPU-side
 top-voxel census (surface materials 12.4% → 100.00%), not by the quad census
 that produced the original `MAT_ROCK 15% / MAT_SUBSOIL 85%` measurement in
 `VoxelClimateProbe.h`. Re-run the switch and update that comment with real quad
 numbers before anyone builds an id-keyed appearance rule on it.
 
-**`VoxelEarth.Build.cs` hardcodes `build/voxel-core-msvc/voxelcore.lib`** while
-multi-config VS generators emit `Release/voxelcore.lib`, so every fresh worktree
-needs a manual copy. Known since Track B2 and hit again during v8's UE build.
-One line.
+~~**`VoxelEarth.Build.cs` hardcodes `build/voxel-core-msvc/voxelcore.lib`**~~
+**DONE — verified stale 2026-07-28.** The module now probes
+`Debug`/`RelWithDebInfo`/`Release`/`""` under `build/voxel-core-msvc` in a
+deliberate order and errors with the full search list if none match, so
+multi-config generators work without a manual copy.
 
 **Shared `TileGridSampler` between `VoxelWorldSubsystem` and
 `VoxelClimateProbe`.** Already flagged in `VoxelClimateProbe.h`. The two loaders
@@ -375,6 +574,14 @@ never by argument.
 ---
 
 ## 6b. GPU streaming (ADR-0006), after G0-G5 landed
+
+> **SUPERSEDED 2026-07-28 — see section 0.** Written before Waves S0-S4 and the
+> draw-path work. Its central open question ("does the pool make frames faster?
+> unmeasured") is now answered: p50 30.59 -> 15.2 ms at 2K and hitch frames
+> 3,747 -> ~11 (`docs/measurements/drawpath-2k-2026-07-28.txt`). The fixed-camera
+> harness it asks for was also built: `tools/voxel-run-flight-leg.ps1` plus the
+> `VoxelPerfRun post-warmup` line give p50/p95/max over ALL frames. Kept below
+> for the historical reasoning.
 
 **Does the pool actually make frames faster? Unmeasured, and the harness cannot
 currently say.** G5 flipped `voxel.Stream.GPU` on by default. The parity case is
