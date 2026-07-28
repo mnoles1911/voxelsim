@@ -76,7 +76,51 @@ Delivered per window 269 -> 449 (+67%) while dispatched stayed flat, because
 "delivered" now includes speculative results.
 
 ============================================================================
-4. COST: ESSENTIALLY NONE, AND CAPACITY STEP 2 IS NOT JUSTIFIED
+4a. THE REAL COST IS GAME-THREAD TICK, NOT MEMORY (+45%)
+============================================================================
+
+Tick budget, mid-flight window, both legs:
+
+  arm       tickMs/5s  % of wall  recompute  dispatch  apply  unload  perTick
+  lead 0.0      485.0      9.70%      133.0      10.3   56.6   271.3    7.133
+  lead 4.0      703.2     14.06%      131.6     274.6   51.0   242.6   11.162
+
+The dispatch phase went from 10.3 ms to 274.6 ms per 5 s window -- a 27x
+increase, and essentially all of T4-1's cost. Voxel tick work is 45% more of
+wall clock (9.70% -> 14.06%) and the per-tick figure rose 7.13 ms -> 11.16 ms.
+
+WHERE IT IS *NOT*: EnumerateSpeculativeCandidates() is called BEFORE T0, so the
+annulus walk is outside the dispatch timer entirely. It lands in tickMs without
+a bucket of its own. The first guess written here was that enumeration explained
+the +264 ms; the timer boundaries rule that out.
+
+So the whole increase is inside DispatchJobs, where DispatchSpeculativeJobs()
+runs. The arithmetic there does not obviously add up either:
+
+  lead 0.0:  270 jobs dispatched,  10.3 ms  =  0.038 ms/job
+  lead 4.0:  257 demand + ~185 spec = ~442 jobs, 274.6 ms = 0.62 ms/job
+
+A speculative submit calls the SAME SubmitGpuMeshJob as a demand submit, so a
+16x per-job cost difference is not explicable by the submit itself. Something in
+the speculative path costs per TICK rather than per job -- candidates are the
+linear scan of GpuJobsPending (~252 entries) counting SpecOutstanding on every
+call, and whatever EnsureGpuMeshJobs does per call -- but this is a hypothesis
+with no measurement behind it and it should not be repeated as a finding.
+
+The timer cannot answer it: dispatch= is one bucket covering demand dispatch,
+speculative dispatch and the second post-drain pass. Splitting it is task #21
+and is the prerequisite for any optimisation here, not an optional refinement.
+
+NOT AN ABORT, BUT NOT FREE EITHER. renderMs is unchanged (flight median 30.1 ->
+29.2, max 33.8 -> 35.0), so the doubled per-tick promotion budget did not cost
+render-thread pass setup, which was the risk of giving speculation its own
+allowance on top of MeshBatchCap. chunks/s is unchanged. The bill is paid on the
+game thread, and it is the obvious next optimisation: split the dispatch timer,
+then either cache the annulus walk across ticks or run it on a crossing rather
+than every tick, the way RecomputeDesiredSet already does.
+
+============================================================================
+4b. MEMORY COST: ESSENTIALLY NONE, AND CAPACITY STEP 2 IS NOT JUSTIFIED
 ============================================================================
 
 poolPct 86.2 -> 86.8. Peak SPECULATIVE parked population was 172 against a
@@ -116,13 +160,35 @@ split was unknown; drop-reason counters (dropOvertaken / dropEmpty /
 dropPoolFull) are now in the 5s speculation line and the sweep will attribute
 it.
 
-The suspected dominant cause is "demand overtook it": nothing consults
-SpeculativeInFlight in AddCandidate, so if admission reaches a key whose
-speculative job is still in flight, demand queues a SECOND job for the same
-chunk and the GPU meshes it twice. If the counters confirm this, the fix is to
-route the speculative result to ApplyMeshResult on arrival instead of dropping
-it -- turning the largest waste bucket into delivered work. NOT BUILT YET: the
-measurement comes first.
+ATTRIBUTED 2026-07-28 FROM THE SWEEP, AND THE HYPOTHESIS WAS WRONG.
+
+Mid-flight windows, sweep legs t41s-lead1-1 and t41s-lead2-1:
+
+  dropOvertaken=0   dropEmpty=100   dropPoolFull=0    (lead 1.0)
+  dropOvertaken=0   dropEmpty=90    dropPoolFull=0    (lead 2.0)
+
+Every non-parking dispatch is an ALL-AIR COLUMN. Not one was overtaken by
+demand, and the pool never refused one.
+
+The suspected cause written here first was "demand overtook it" -- nothing
+consults SpeculativeInFlight in AddCandidate, so admission reaching a key with a
+speculative job in flight would queue a SECOND job and mesh the same chunk
+twice. That is a real gap in the code and it is measurably NOT HAPPENING: by the
+time demand arrives, speculation has already parked the chunk and the adopt path
+takes it. The fix that was designed for it -- routing speculative results to
+ApplyMeshResult on arrival -- would have optimised an empty bucket.
+
+WHAT THE REAL FINDING IS: roughly half of all speculative GPU work meshes air.
+The speculative enumerator is not applying the predicted-empty and buried-skip
+filters that admission applies (the fork's own enable log advertises "not
+already predicted empty" as a condition of the demand path). Fixing that is
+worth ~50% of speculation's GPU cost AND a proportional share of its
+game-thread dispatch cost, since each one is a submit that need not happen.
+
+Note this is not waste in the damaging sense -- an air column parks nothing,
+holds no pool range, and evicts nothing (evictedUnused=0 on every leg). It is
+spent capacity, not corruption. But it is the single largest lever on T4-1's
+cost and it is cheap to take.
 
 ============================================================================
 6. CORRECTION TO AN EARLIER READING IN THIS SESSION
