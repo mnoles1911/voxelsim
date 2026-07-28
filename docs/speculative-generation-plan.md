@@ -1,8 +1,25 @@
 # Speculative generation (T4-1): the re-sequenced path, and why this order
 
-**Status:** written 2026-07-27. **Wave S0 CLOSED** (§1a confirmed —
-`docs/measurements/s0-apply-census-2026-07-27.txt`). **Wave S1 CLOSED** —
-`docs/measurements/s1-close-2026-07-27.txt`. This supersedes the wave ORDER in
+**Status:** written 2026-07-27. **S0 CLOSED**, **S1 CLOSED**, **S2 SHIPPED**,
+**S3 SHIPPED**, **S4 (T4-1) BUILT AND GATED OFF, MEASUREMENT PENDING.**
+Data: `docs/measurements/s0-apply-census-2026-07-27.txt`,
+`docs/measurements/s1-close-2026-07-27.txt`.
+
+    baseline                                    260.9 chunks/s   15,032 holes
+    S1 (batch publish, budgets, capacity)     ~1,040.5                0
+    S2-3 parking (line / circle)          1,064.9 / 906.5            0
+
+**T4-1 is built.** Speculative enumeration ahead of the predicted anchor,
+its own queue and sub-budget, submitted last, parked on arrival, and adopted by
+the admission path that S2-3 already measured. Everything off behind
+`voxel.Stream.VelocityLeadSec 0`.
+
+**How much of S4 turned out to be free**, because S2-3 built it first: adoption
+is *unchanged code*. `AddCandidate` finds a parked entry and unparks it, and it
+does not care whether that entry got there by eviction or by speculation. The
+whole of S4-3 is one branch in the completion handler that parks instead of
+applying. Sequencing S2 before S4 was the single highest-leverage decision in
+this plan. This supersedes the wave ORDER in
 `docs/streaming-perf-implementation-plan.md` for the T4-1 path only — that
 document's per-item content still stands and is referenced throughout.
 
@@ -527,19 +544,28 @@ figure, which does not transfer (§2.1).
    first — do not build a speculative enumerator onto a path that is already
    drowning.
 
-2. **Parked + speculative geometry needs a HARD cap and its own eviction, or it
-   will eat the pool.** Measured: residency expands to fill whatever capacity
+2. **Parked + speculative geometry needs a hard cap AND SEPARATE caps.** Built
+   that way: `SpeculativeMaxParked` is distinct from `PoolParkMax` because demand
+   parking caches geometry that *was* wanted and speculation caches geometry that
+   *might* be. A shared cap would let speculation starve the demand cache it
+   depends on. Measured: residency expands to fill whatever capacity
    exists when the drain lags — 80,716 chunks against an 81,920 table floor, with
    refusals — and it looked like allocator fragmentation. Speculative geometry is
    *by definition* geometry nothing is asking for, so it has no natural back
    pressure at all. `SpeculativeMaxParked` is not a tuning knob, it is the thing
    standing between this feature and a pool that refuses demand allocations.
 
-3. **`specHitRate` is the deciding metric and it must be reported per level.**
-   Unchanged from the original design, and S1 makes it sharper: at 797 chunks/s
-   demand the pipeline is no longer starved, so speculation is spending capacity
-   that has an alternative use. A hit rate under ~50% is not "some waste", it is
-   the feature failing.
+3. **`specHitRate` is NOT the deciding metric. This was wrong in the original
+   plan and S2-3 proved it wrong.** Parking scored an **89% hit rate and read as
+   a 33% throughput regression** — and the regression was an artefact of
+   `chunksPerSec` not counting adopted chunks, so the true answer was "slightly
+   better than baseline". A cache can be almost perfectly effective and still
+   cost more than it saves, AND it can be cheap and still look expensive if the
+   metric cannot see its output.
+
+   **The decision metric is placed-chunks/s (meshed + adopted) and flight-phase
+   holes.** Hit rate says whether the cone was aimed correctly, which is a
+   genuinely useful diagnostic and a different question.
 
 4. **Re-sweep the budgets after it lands** (see the Wave S2 note). T4-1 changes
    throughput; the last two things that did each moved the bottleneck somewhere
