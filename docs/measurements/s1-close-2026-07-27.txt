@@ -224,8 +224,33 @@ Raw logs are NOT committed (/Saved/ gitignored): s24-cap64-on-1/2, s24-unload96,
 s24-unload256, s24-apply192, s1close-1/2.
 
 ================================================================================
-S2-3 PARKING -- MEASURED AND NOT JUSTIFIED AS INTEGRATED (2026-07-27)
+S2-3 PARKING -- THROUGHPUT-NEUTRAL AND CHEAPER (2026-07-27)
 ================================================================================
+
+*** THIS SECTION WAS FIRST WRITTEN AS "MEASURED AND NOT JUSTIFIED". THAT
+    VERDICT WAS WRONG, AND THE REASON IS THE MOST USEFUL THING IN IT. ***
+
+chunksPerSec derives from TotalChunksLoaded, and the adopt path never
+incremented it -- so every chunk parking placed by ADOPTION was invisible to the
+only metric parking was being judged by. Parking reads as a 21% throughput
+regression when it is throughput-neutral:
+
+    circle, parking off      893.7 chunks/s
+    circle, parking on       708.3 meshed + 186 adopted/s = 894.3 placed
+
+    ...and the tick budget, summed over the leg, is LOWER with parking on:
+       off      tickMs 28,517   recompute 8,918   apply 3,452   unload 14,941
+       parking  tickMs 26,890   recompute 8,928   apply 2,704   unload 14,130
+
+Same placement rate, ~6% less tick work, and ~90% of those placements skipped a
+GPU mesh dispatch entirely -- work that does not appear in any of these numbers.
+
+A metric that cannot see half a feature's output will reject the feature. Two
+speculative fixes were spent hunting a residual cost that did not exist, and the
+"mechanism sound, integration not" verdict was committed with a confident causal
+story attached before the metric was checked.
+
+The corrected reading of the same legs follows.
 
 Keep an evicted chunk's pool range, hidden, so re-admission is a chunk-table
 write instead of a re-mesh round trip. Also T4-1's intended substrate.
@@ -240,9 +265,10 @@ write instead of a re-mesh round trip. Also T4-1's intended substrate.
   circle    off              893.7         0           0   --
   circle    park 12,000      596.7         0           0   46,866 / 41,726 (89%)
 
-THE CACHE WORKS AND STILL LOSES. On the circle profile -- continuous revisiting,
-parking's BEST case -- 89% of parked geometry is adopted and throughput is 33%
-LOWER. On line it is 83-84% hit and 18% lower. Higher hit rate, bigger loss.
+WHAT THE ROWS ABOVE ACTUALLY SAY, once adopted chunks are counted as placed:
+the EAGER-publication rows are a genuine loss (596.7 + 146 adopted = 743 placed
+against 893.7), and the DEFERRED rows are neutral (708.3 + 186 = 894.3). So
+publishing per adopt cost ~17% and deferring recovered all of it.
 
 WHY: each adopt calls UnparkChunk, which calls PushUpdatesToProxy, and the adopt
 path lives in RecomputeDesiredSet -- which S1-1's FScopedBatch does NOT cover
@@ -261,9 +287,13 @@ scope does not reach.
   reproduce 847.6-855.3 at 83-84%. The scope is the cause; the mechanism is not
   understood. See the note at the RecomputeDesiredSet call site.
 
-VERDICT: voxel.Stream.PoolParkMax stays 0. The mechanism is sound (89% hit, zero
-allocFail, zero holes, frame time flat at ~22.5 ms p50 throughout) and the
-integration is not.
+VERDICT: parking is throughput-neutral, does ~6% less tick work, and avoids a
+GPU mesh dispatch on ~90% of adoptions. 89-90% hit, zero allocFail, zero holes,
+frame time flat at ~22.5 ms p50. Default to be flipped on the re-measured legs
+with adopts counted.
+
+  The earlier "stays 0" verdict was an artefact of the metric, not a property of
+  the feature.
 
   ALSO AN EARLIER, LARGER FAILURE, kept because it is the more useful finding:
   parking EVERY eviction scored 8% hit and cost allocFail 0 -> 45,633, holes
@@ -284,12 +314,11 @@ So, promoted onto T4-1's critical path:
 
   1. BATCH THE ADOPT PATH. Not an optimisation any more. Requires first
      diagnosing why FScopedBatch around RecomputeDesiredSet zeroed parking.
-  2. specHitRate IS NOT SUFFICIENT as T4-1's deciding metric. Parking scored 89%
-     and lost. The metric has to be throughput and holes AT a given hit rate,
-     because a cache can be almost perfectly effective and still cost more than
-     it saves.
+  2. COUNT WHAT THE FEATURE PRODUCES. T4-1 places chunks by adoption, exactly as
+     parking does. If specDispatched/specAdopted are not folded into the
+     throughput metric the same way, speculation will read as a regression for
+     the same reason parking did -- and the hit rate will look fine while it
+     happens, which is what makes it convincing.
 
-That second point is the one worth carrying: the original plan named specHitRate
-as the number that decides T4-1, and this measurement shows a 89%-effective
-cache losing 33% throughput. Hit rate measures whether the PREDICTION was right.
-It says nothing about whether the mechanism is cheap enough to be worth using.
+     The decision metric is placed-chunks/s and holes, where placed = meshed +
+     adopted. Not chunksPerSec as it was defined before this.
