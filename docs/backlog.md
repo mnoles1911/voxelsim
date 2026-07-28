@@ -305,6 +305,24 @@ correct. (Proposed and withdrawn 2026-07-28.)
 
 ### 0.5 P4 — Speculation refinements (small)
 
+- **DONE 2026-07-28 — `SpeculativeZTrim 1` and `SpeculativeMaxInFlight 16`.**
+  Trimming one chunk from each end of the speculative band removes 98% of the
+  zero-quad dispatches (183 → 3 per window) and lifts adopted-per-dispatch from
+  46% to 85%. Both shipped as defaults.
+
+  **But it bought no frame time, and that is the important part.** Cutting
+  dispatches by 46% moved p50 by 0.08 ms. **Reducing GPU meshing work does not
+  reduce frame time on this renderer** — the meshing compute evidently overlaps
+  with rendering rather than sitting on the critical path, so removing it lets
+  the GPU idle rather than shortening the frame.
+
+  ⇒ This strikes "fewer mesh dispatches" from the 100 fps path, and it puts a
+  question mark over **how much of the 18.4 ms GPU frame is serial at all**.
+  Anything aimed at 100 fps has to establish that first, because the same
+  overlap argument may apply to other GPU items on the list.
+
+<details><summary>Original framing (kept — the reasoning that led here)</summary>
+
 - **~187 speculative dispatches per window still return zero quads.**
   `dropOvertaken=0` and `dropPoolFull=0`, so it is all zero-quad results — and
   "zero quads" covers all-**solid** as well as all-air, which is why they cluster
@@ -314,10 +332,19 @@ correct. (Proposed and withdrawn 2026-07-28.)
   `SpeculativeMaxInFlight` rather than by candidate supply. Further reduction
   needs an **analytic** empty test at enumeration time. Bounded cost if never
   done: an air or buried chunk parks nothing, holds no pool range, evicts nothing.
-- **`voxel.Stream.VelocityLeadSec` still defaults to 0.** T4-1 is confirmed (93%
+</details>
+
+- ~~**`voxel.Stream.VelocityLeadSec` still defaults to 0.**~~ **DONE** — default
+  is now 2.0; T4-1 is on.
+
+  <details><summary>original</summary>
+
+  **`voxel.Stream.VelocityLeadSec` still defaults to 0.** T4-1 is confirmed (93%
   fewer flight-phase holes, no throughput/memory/game-thread cost) but ships off
   pending an owner call. Recommended default **2.0** — the effect saturates at
   1 s, so the cheapest setting is also the best.
+
+  </details>
 
 ---
 
