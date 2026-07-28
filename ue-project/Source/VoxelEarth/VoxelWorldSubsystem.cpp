@@ -2607,6 +2607,13 @@ struct FVoxelWorldImpl
 		uint64 GenerationId = 0;
 		uint64 EditEpoch = 0;
 		float ParkedAtSeconds = 0.f;
+		// T4-1: was this geometry SPECULATED, or parked from a real eviction?
+		// They share the map and the adopt path deliberately -- an adopt is an
+		// adopt -- but they are capped separately and counted separately,
+		// because demand parking caches geometry that WAS wanted and speculation
+		// caches geometry that MIGHT be. Conflating their hit rates would hide
+		// exactly the number that decides whether speculation is worth running.
+		bool bSpeculative = false;
 	};
 	TMap<VoxelCoords::FVoxelLevelChunkKey, FParkedGeometry> ParkedGeometry;
 
@@ -2625,6 +2632,38 @@ struct FVoxelWorldImpl
 	// map no longer holds, which is why this is a plain array and not a second
 	// source of truth.
 	TArray<VoxelCoords::FVoxelLevelChunkKey> ParkedInsertionOrder;
+
+	// --- T4-1 speculative generation (Wave S4) ------------------------------
+	//
+	// Keys enumerated ahead of the anchor that nothing has asked for yet. Its OWN
+	// queue, deliberately not PendingJobKeysByLevel: sharing that queue would put
+	// speculative work under the admission cap and the ring quotas, where it
+	// would either be starved by demand or -- worse -- displace it. The
+	// "genuine-room guard" comment on the refill trigger documents a churn loop
+	// that cost ~237,600 rejections/s when admission and dispatch shared state.
+	TArray<VoxelCoords::FVoxelLevelChunkKey> SpeculativeKeys;
+	TSet<VoxelCoords::FVoxelLevelChunkKey> SpeculativeInFlight;
+
+	int64 SpecDispatchedSinceLog = 0;
+	int64 SpecParkedSinceLog = 0;
+	int64 SpecAdoptedSinceLog = 0;
+	int64 SpecEvictedUnusedSinceLog = 0;
+	int64 SpecDispatchedTotal = 0;
+	int64 SpecParkedTotal = 0;
+	int64 SpecAdoptedTotal = 0;
+	int64 SpecEvictedUnusedTotal = 0;
+	int32 SpecParkedNow = 0;
+
+	// Enumerate the leading-edge annulus from the PREDICTED anchor and queue what
+	// demand has not asked for. Per tick, cheap, and bounded.
+	void EnumerateSpeculativeCandidates();
+	// Submit from SpeculativeKeys into whatever fork budget demand left. Called
+	// at the END of DispatchJobs.
+	void DispatchSpeculativeJobs();
+	// Put a speculative mesh into the pool HIDDEN, and register it for adoption.
+	void ParkSpeculativeResult(const VoxelCoords::FVoxelLevelChunkKey& Key,
+	                           const FVoxelGpuMeshJobResult& GpuResult);
+	void EvictOldestSpeculative();
 
 	// Park bookkeeping for the 5 s line and the eviction policy.
 	int64 ChunksParkedSinceLog = 0;
@@ -2677,6 +2716,10 @@ struct FVoxelWorldImpl
 	// registered it is owned by ChunkOwner's component list. Null until the
 	// first chunk loads under voxel.Stream.GPU.
 	TWeakObjectPtr<UVoxelGpuPoolComponent> GpuPool;
+	// Set alongside GpuPool. Raw because it is the streaming root, which outlives
+	// every path that reads it, and a weak pointer here would imply a lifetime
+	// question that does not exist.
+	USceneComponent* GpuPoolRootComponent = nullptr;
 
 	// Nearest-first-within-level, lower-level-wins-ties priority queues
 	// (docs/m2-plan.md item 1: "Budgets shared across levels, nearest-first
@@ -2891,6 +2934,9 @@ struct FVoxelWorldImpl
 	{
 		VoxelCoords::FVoxelLevelChunkKey Key;
 		uint64 GenerationId = 0;
+		// T4-1: a speculative result is PARKED on arrival, not applied -- nothing
+		// has asked for it, so it must not create a record or become visible.
+		bool bSpeculative = false;
 	};
 	TMap<uint64, FGpuPendingJob> GpuJobsPending;
 
@@ -2902,7 +2948,7 @@ struct FVoxelWorldImpl
 	// the caller MUST fall through to the CPU path -- the counters have already
 	// been incremented and something owes a result.
 	bool SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
-	                      uint8 RingSkirtMask);
+	                      uint8 RingSkirtMask, bool bSpeculative = false);
 	// Delivery callback. Game thread, from inside Tick().
 	void OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult);
 
@@ -3377,6 +3423,19 @@ struct FVoxelWorldImpl
 	// EMA over ~0.25 s. Raw per-tick delta is unreadable at 60+ fps, and a
 	// single repositioning frame would spike it into nonsense.
 	double SmoothedAnchorSpeedUUPerSec = 0.0;
+	// The DIRECTION half, smoothed the same way. T4-1 needs a cone, not a speed:
+	// speculation is only worth anything if it is aimed where the camera is
+	// going. Kept as a velocity rather than a normalised heading so a stationary
+	// anchor produces a zero vector and the lead collapses to nothing on its own,
+	// with no special case.
+	FVector SmoothedAnchorVelocity = FVector::ZeroVector;
+
+	// Where the anchor will be in VelocityLeadSec, clamped. This is what
+	// speculative enumeration measures its annulus from -- NOT what admission,
+	// eviction or retention use, which all stay on the true anchor. Evicting
+	// against a forward-shifted centre would delete ground behind the camera that
+	// is still on screen (docs/speculative-generation-plan.md Wave S3).
+	FVector PredictedAnchorLocation = FVector::ZeroVector;
 
 	double AccumDispatchMs = 0.0;
 	double AccumApplyMs = 0.0;
@@ -3925,11 +3984,25 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// than read from the pawn's movement component.
 	if (bHasPrevAnchor && DeltaTime > SMALL_NUMBER)
 	{
-		const double InstantUUPerSec = (Anchor - PrevAnchorLocation).Size() / double(DeltaTime);
-		// EMA with a ~0.25 s time constant, frame-rate independent.
+		const FVector InstantVelocity = (Anchor - PrevAnchorLocation) / double(DeltaTime);
+		// EMA with a ~0.25 s time constant, frame-rate independent. Smoothing the
+		// VECTOR rather than speed-and-heading separately means a direction change
+		// shortens the lead while it settles, which is the conservative direction:
+		// speculation aimed at where the camera WAS is waste, and a shorter lead
+		// while turning is exactly what should happen.
 		constexpr double kSpeedTauSeconds = 0.25;
 		const double Alpha = FMath::Clamp(double(DeltaTime) / kSpeedTauSeconds, 0.0, 1.0);
-		SmoothedAnchorSpeedUUPerSec += (InstantUUPerSec - SmoothedAnchorSpeedUUPerSec) * Alpha;
+		SmoothedAnchorVelocity += (InstantVelocity - SmoothedAnchorVelocity) * Alpha;
+		SmoothedAnchorSpeedUUPerSec = SmoothedAnchorVelocity.Size();
+	}
+
+	// Recomputed every tick so it tracks a cvar change without a restart.
+	{
+		const double LeadSec = double(VoxelDebug::GetStreamVelocityLeadSec());
+		const double MaxLeadUU = double(VoxelDebug::GetStreamVelocityLeadMaxUU());
+		const FVector Lead = SmoothedAnchorVelocity * LeadSec;
+		PredictedAnchorLocation =
+			Anchor + (Lead.SizeSquared() > MaxLeadUU * MaxLeadUU ? Lead.GetSafeNormal() * MaxLeadUU : Lead);
 	}
 	PrevAnchorLocation = Anchor;
 	bHasPrevAnchor = true;
@@ -4233,6 +4306,11 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// tightening is based on). Edit re-meshes also cover first load of an
 	// edited chunk -- see PendingGameThreadKeys comment above.
 	{
+		// T4-1: enumerate the leading edge BEFORE dispatch, so anything queued
+		// this tick can be submitted this tick into whatever budget demand
+		// leaves. Cheap and a no-op while voxel.Stream.VelocityLeadSec is 0.
+		EnumerateSpeculativeCandidates();
+
 		const double T0 = FPlatformTime::Seconds();
 		DispatchJobs();
 		// Poll the GPU runner BETWEEN dispatch and drain (Wave D / D4).
@@ -4888,6 +4966,25 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       ResultsDrainedSinceLog > 0 ? 100.0 * double(StaleDiscardsSinceLog) / double(ResultsDrainedSinceLog) : 0.0,
 	       (long long)ZeroQuadAppliesSinceLog, (long long)RecordsAddedSinceLog, (long long)RecordsEvictedSinceLog,
 	       (long long)CandidatesRejectedSinceLog, ChunksPerSecThisWindow);
+	// T4-1 speculation census. specHitRate is reported but is NOT the deciding
+	// number -- parking scored 89% and still looked like a loss until the
+	// throughput metric was fixed to count adopted chunks. The decision is
+	// placed-chunks/s and holes; this says whether the CONE was aimed correctly,
+	// which is a different question.
+	if (VoxelDebug::GetStreamVelocityLeadSec() > 0.f || SpecDispatchedTotal > 0)
+	{
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel speculation (5s window): dispatched=%lld parked=%lld adopted=%lld evictedUnused=%lld ")
+		       TEXT("| queued=%d inFlight=%d parkedNow=%d leadSec=%.2f speed=%.1f m/s ")
+		       TEXT("| cumulative dispatched=%lld adopted=%lld (hit %.0f%%)"),
+		       (long long)SpecDispatchedSinceLog, (long long)SpecParkedSinceLog,
+		       (long long)SpecAdoptedSinceLog, (long long)SpecEvictedUnusedSinceLog,
+		       SpeculativeKeys.Num(), SpeculativeInFlight.Num(), SpecParkedNow,
+		       VoxelDebug::GetStreamVelocityLeadSec(), SmoothedAnchorSpeedUUPerSec / 100.0,
+		       (long long)SpecDispatchedTotal, (long long)SpecAdoptedTotal,
+		       SpecParkedTotal > 0 ? 100.0 * double(SpecAdoptedTotal) / double(SpecParkedTotal) : 0.0);
+	}
+
 	// S2-3 park census. adopted/parked is the hit rate: a park that is never
 	// adopted was work kept warm for nothing, and it held a pool range and a
 	// chunk-table entry the whole time. This is the same number T4-1's
@@ -5423,6 +5520,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// GetAndResetPushStats where the line is emitted, not here -- they live on the
 	// component, and resetting them from two places is how the render-thread half
 	// would start double-counting.
+	SpecDispatchedSinceLog = SpecParkedSinceLog = SpecAdoptedSinceLog = SpecEvictedUnusedSinceLog = 0;
 	ChunksParkedSinceLog = ChunksAdoptedSinceLog = 0;
 	ParkEvictedStaleSinceLog = ParkEvictedCapSinceLog = 0;
 	DrainExitQueueEmptySinceLog = DrainExitWallClockSinceLog = 0;
@@ -6928,6 +7026,16 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 							ParkedGeometry.Remove(LevelKey);
 							++ChunksAdoptedSinceLog;
 							++ChunksAdoptedTotal;
+							// T4-1's deciding number. Counted apart from demand
+							// parking because the two answer different questions:
+							// demand parking asks "did evicted ground come back",
+							// speculation asks "was the cone aimed right".
+							if (Parked->bSpeculative)
+							{
+								SpecParkedNow = FMath::Max(0, SpecParkedNow - 1);
+								++SpecAdoptedSinceLog;
+								++SpecAdoptedTotal;
+							}
 							++RecordsAddedSinceLog;
 							++LevelRecordsAdded[FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1)];
 							// NO JOB IS QUEUED. That is the whole win.
@@ -7903,7 +8011,7 @@ FVoxelGpuMeshJobManager* FVoxelWorldImpl::EnsureGpuMeshJobs()
 }
 
 bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
-                                       uint8 RingSkirtMask)
+                                       uint8 RingSkirtMask, bool bSpeculative)
 {
 	FVoxelGpuMeshJobManager* Manager = EnsureGpuMeshJobs();
 	if (Manager == nullptr)
@@ -8033,7 +8141,7 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	}
 
 	const uint64 JobId = Manager->Submit(MoveTemp(Req), /*UserTag*/ 0, bDirectToPool);
-	GpuJobsPending.Add(JobId, FGpuPendingJob{ LevelKey, GenId });
+	GpuJobsPending.Add(JobId, FGpuPendingJob{ LevelKey, GenId, bSpeculative });
 	return true;
 }
 
@@ -8100,6 +8208,17 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	if (GpuResult.SubmitToDeliverMs >= kBlindJobMarkTimeoutSeconds * 1000.0)
 	{
 		++GpuMeshSlowDeliveriesSinceLog;
+	}
+
+	// T4-1: a SPECULATIVE result never enters the results queue. Nothing asked
+	// for this chunk, so it must not create a record, must not become visible,
+	// and must not consume the apply budget demand work is competing for. It
+	// goes straight into the pool, hidden, and waits for admission to find it.
+	if (Pending.bSpeculative)
+	{
+		SpeculativeInFlight.Remove(Pending.Key);
+		ParkSpeculativeResult(Pending.Key, GpuResult);
+		return;
 	}
 
 	VoxelStreaming::FJobResult Result;
@@ -9096,7 +9215,13 @@ void FVoxelWorldImpl::DispatchJobs()
 	// job has usually drained and the band can answer for the whole column.
 	if (DeferredColdBand.Num() > 0)
 	{
-		PendingJobKeysByLevel[0].Append(DeferredColdBand);
+		// T4-1: demand has now taken everything it wants from this tick's budget.
+	// Speculation gets the remainder, and only the remainder -- submitting here
+	// rather than anywhere earlier is what makes starvation structurally
+	// impossible rather than a matter of tuning.
+	DispatchSpeculativeJobs();
+
+	PendingJobKeysByLevel[0].Append(DeferredColdBand);
 		ColdBandHeldThisFrame = DeferredColdBand.Num();
 	}
 	else
@@ -9336,6 +9461,10 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	Pool->InitPool(PoolCapacityQuads);
 
 	GpuPool = Pool;
+	// T4-1 parks results outside ApplyMeshResult, which is where Root is normally
+	// threaded from. SampleChunkParamsForPool needs it, so the pool's root is
+	// captured once here rather than plumbed through the completion path.
+	GpuPoolRootComponent = &Root;
 	UE_LOG(LogVoxelStream, Log,
 	       TEXT("voxel.Stream.GPU: geometry pool up, %u quad capacity (%.0f MB)%s, chunk table floor %d. "
 	            "Chunks now stream as ranges in ONE primitive."),
@@ -9504,6 +9633,282 @@ bool FVoxelWorldImpl::ParkChunkGeometry(const VoxelCoords::FVoxelLevelChunkKey& 
 	return true;
 }
 
+// T4-1. Enumerate the leading edge ahead of the PREDICTED anchor and queue what
+// demand has not asked for yet.
+//
+// The whole feature rests on one measured fact: the GPU finishes a chunk in
+// ~12 ms and then waits ~128 ms to be picked up, sitting at ~11 jobs in flight
+// against a cap of 256 (docs/measurements/s0-apply-census-2026-07-27.txt). That
+// idle capacity is real. Spending it early turns streaming from something the
+// player watches arrive into something already there.
+//
+// CHEAP BY CONSTRUCTION, because admission is the largest item in the streaming
+// tick before this adds anything. Level 0 only, one ring of chunks at the
+// leading edge, and it early-outs to nothing when the anchor is not moving.
+void FVoxelWorldImpl::EnumerateSpeculativeCandidates()
+{
+	using namespace VoxelCoords;
+
+	const float LeadSec = VoxelDebug::GetStreamVelocityLeadSec();
+	if (LeadSec <= 0.f)
+	{
+		return; // feature off
+	}
+	const int32 MaxParked = VoxelDebug::GetStreamSpeculativeMaxParked();
+	if (MaxParked <= 0 || SpecParkedNow >= MaxParked)
+	{
+		return;
+	}
+	// Stationary means nothing to lead. The velocity EMA collapses to zero on its
+	// own, so this is the same test as "is the predicted anchor the true anchor".
+	const FVector Lead = PredictedAnchorLocation - LastAnchorLocation;
+	if (Lead.SizeSquared() < FMath::Square(ChunkEdgeUU))
+	{
+		return;
+	}
+
+	// Keep the queue shallow. A deep speculative queue is stale by the time it
+	// drains -- the anchor has moved and the cone points somewhere else -- and it
+	// competes for the fork budget it is supposed to be scavenging.
+	const int32 QueueBudget = FMath::Max(0, VoxelDebug::GetStreamSpeculativeMaxInFlight() * 4 - SpeculativeKeys.Num());
+	if (QueueBudget <= 0)
+	{
+		return;
+	}
+
+	// LEVEL 0 ONLY. It is where the leading-edge lag is visible, where the fork
+	// already runs, and where the D6 band request is wired. Coarser rings cover
+	// far more ground per chunk and are correspondingly less likely to be the
+	// thing a player sees pop in.
+	constexpr int32 Level = 0;
+	const double ChunkEdge = ChunkEdgeUUForLevel(Level);
+	const double OuterUU = UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0;
+
+	// The band between the current R0 edge and where it will be. Walking the
+	// predicted disc and skipping what is already desired would enumerate the
+	// whole ring every tick; this walks only the sliver that is new.
+	const FVector Dir = Lead.GetSafeNormal();
+	const double LeadLen = Lead.Size();
+	const int32 Span = FMath::Clamp(FMath::CeilToInt32(LeadLen / ChunkEdge) + 1, 1, 64);
+	const int32 HalfWidth = FMath::Clamp(FMath::CeilToInt32(OuterUU / ChunkEdge), 1, 96);
+
+	int32 Queued = 0;
+	// March out along the velocity vector, and across the ring's width at each
+	// step. Perpendicular in XY only -- the cascade is a horizontal annulus.
+	const FVector Perp(-Dir.Y, Dir.X, 0.0);
+	for (int32 Step = 0; Step <= Span && Queued < QueueBudget; ++Step)
+	{
+		const FVector Along = LastAnchorLocation + Dir * (OuterUU + double(Step) * ChunkEdge);
+		for (int32 W = -HalfWidth; W <= HalfWidth && Queued < QueueBudget; ++W)
+		{
+			const FVector Probe = Along + Perp * (double(W) * ChunkEdge);
+
+			// Must be inside the ring AT THE PREDICTED anchor and outside it at
+			// the TRUE one -- i.e. exactly the ground admission is about to want
+			// and does not yet. Anything already desired is demand's job.
+			const double PredDistSq = FVector2D::DistSquared(
+				FVector2D(Probe.X, Probe.Y), FVector2D(PredictedAnchorLocation.X, PredictedAnchorLocation.Y));
+			if (PredDistSq >= FMath::Square(OuterUU))
+			{
+				continue;
+			}
+			const double TrueDistSq = FVector2D::DistSquared(
+				FVector2D(Probe.X, Probe.Y), FVector2D(LastAnchorLocation.X, LastAnchorLocation.Y));
+			if (TrueDistSq < FMath::Square(OuterUU))
+			{
+				continue; // already in the desired set; not speculation
+			}
+
+			const FVoxelChunkKey ColumnKey = ChunkKeyForVoxel(WorldToVoxel(Probe));
+
+			// Z comes from the same footprint memo the entry pass uses. Reusing it
+			// rather than deriving a second surface estimate is deliberate: two
+			// copies of one calibration drifting apart is this repo's documented
+			// recurring failure mode.
+			int32 ChunkZMin = 0, ChunkZMax = 0, ChunkZMaxUntrimmed = 0;
+			FootprintChunkZRangeCached(ColumnKey.X, ColumnKey.Y, Level, ChunkZMin, ChunkZMax, ChunkZMaxUntrimmed);
+			if (ChunkZMax < ChunkZMin)
+			{
+				continue; // no surface band here
+			}
+
+			for (int32 Cz = ChunkZMin; Cz <= ChunkZMax && Queued < QueueBudget; ++Cz)
+			{
+				const FVoxelLevelChunkKey Key{ Level, FVoxelChunkKey{ ColumnKey.X, ColumnKey.Y, Cz } };
+				if (ChunkRecords.Contains(Key) || ParkedGeometry.Contains(Key) || SpeculativeInFlight.Contains(Key))
+				{
+					continue;
+				}
+				// Edited chunks are worldgen plus an overlay; speculation only
+				// knows worldgen.
+				if (NeedsOverlayAwarePath(Key))
+				{
+					continue;
+				}
+				SpeculativeKeys.Add(Key);
+				SpeculativeInFlight.Add(Key);
+				++Queued;
+			}
+		}
+	}
+}
+
+// T4-1. Submit speculative work into whatever the demand path left behind.
+//
+// Called at the END of DispatchJobs, after demand has taken what it wants. That
+// ordering plus a small in-flight cap is what makes starvation structurally
+// impossible rather than merely unlikely: the job manager's queue is strict
+// FIFO, so anything submitted here sits ahead of the NEXT tick's demand jobs.
+void FVoxelWorldImpl::DispatchSpeculativeJobs()
+{
+	if (SpeculativeKeys.Num() == 0 || VoxelDebug::GetStreamVelocityLeadSec() <= 0.f)
+	{
+		return;
+	}
+	if (!VoxelStreamAdmission::GpuMeshEnabled() || !GpuMeshJobs.IsValid())
+	{
+		// Speculation is GPU-fork only. The CPU worker arm is the deprecated
+		// control path and its budget is the one demand actually needs.
+		SpeculativeKeys.Reset();
+		SpeculativeInFlight.Reset();
+		return;
+	}
+
+	const int32 SpecCap = VoxelDebug::GetStreamSpeculativeMaxInFlight();
+	const int32 GpuCap = VoxelStreamAdmission::GpuMeshInFlight();
+	int32 SpecOutstanding = 0;
+	for (const auto& Pair : GpuJobsPending)
+	{
+		if (Pair.Value.bSpeculative)
+		{
+			++SpecOutstanding;
+		}
+	}
+
+	while (SpeculativeKeys.Num() > 0 && SpecOutstanding < SpecCap)
+	{
+		// Hard floor for demand: never let speculation take the last slots of the
+		// shared fork budget, whatever its own cap says.
+		if (GpuJobsPending.Num() >= GpuCap - SpecCap)
+		{
+			break;
+		}
+		const VoxelCoords::FVoxelLevelChunkKey Key = SpeculativeKeys.Pop(EAllowShrinking::No);
+
+		// Re-check: demand may have admitted this key since it was enumerated,
+		// in which case speculating it is duplicate work.
+		if (ChunkRecords.Contains(Key) || ParkedGeometry.Contains(Key))
+		{
+			SpeculativeInFlight.Remove(Key);
+			continue;
+		}
+		if (!SubmitGpuMeshJob(Key, /*GenId*/ 0, /*RingSkirtMask*/ 0, /*bSpeculative*/ true))
+		{
+			SpeculativeInFlight.Remove(Key);
+			break; // fork refused (budget) -- stop, do not spin
+		}
+		++SpecOutstanding;
+		++SpecDispatchedSinceLog;
+		++SpecDispatchedTotal;
+	}
+}
+
+// T4-1. A speculative mesh has arrived. Put it in the pool hidden and register
+// it, so admission ADOPTS it instead of commissioning the same work later.
+//
+// This is the whole payoff: the adopt path already exists and is measured
+// (S2-3), so speculation only has to deliver geometry into it. No FChunkRecord
+// is created -- the record is what admission owns, and nothing has admitted this.
+void FVoxelWorldImpl::ParkSpeculativeResult(const VoxelCoords::FVoxelLevelChunkKey& Key,
+                                            const FVoxelGpuMeshJobResult& GpuResult)
+{
+	const int32 MaxParked = VoxelDebug::GetStreamSpeculativeMaxParked();
+	UVoxelGpuPoolComponent* Pool = GpuPool.Get();
+
+	// Every early-out drops the geometry, which is correct: it was never wanted,
+	// and dropping speculation is always safe. The payload releases its GPU
+	// memory when GpuResult goes out of scope.
+	if (!Pool || MaxParked <= 0 || SpecParkedNow >= MaxParked)
+	{
+		return;
+	}
+	if (!GpuResult.GpuQuads.IsValid() || GpuResult.NumQuads == 0)
+	{
+		return; // all-air column; nothing to park
+	}
+	// Demand may have overtaken it while it was in flight.
+	if (ChunkRecords.Contains(Key) || ParkedGeometry.Contains(Key))
+	{
+		return;
+	}
+
+	const FVector OriginRelative = VoxelCoords::ChunkOriginWorldForLevel(Key.Key, Key.Level);
+	const FVector3f OriginInPool = FVector3f(OriginRelative - GpuPoolRebase);
+
+	// Params must be sampled HERE, while the pool entry is being written --
+	// ParkChunk only zeroes the scale, so ChunkParams is never cleared and
+	// UnparkChunk has nothing to restore. Getting it right once, now, is what
+	// lets adoption be a single float write later.
+	const int32 Slot = Pool->AddChunkFromGpu(GpuResult.GpuQuads, GpuResult.NumQuads, OriginInPool, Key.Level,
+	                                         SampleChunkParamsForPool(*GpuPoolRootComponent, OriginRelative, Key.Level));
+	if (Slot == INDEX_NONE)
+	{
+		// Pool refused. Speculation NEVER retries and never logs loudly for this:
+		// a refused speculative allocation is the system correctly declining to
+		// spend capacity demand might need. T1-7's retry path is for demand.
+		return;
+	}
+
+	// Hidden immediately. Between AddChunkFromGpu and here the chunk is
+	// technically drawable, but both run inside one game-thread call and the
+	// publication is deferred, so no frame can observe it visible.
+	Pool->ParkChunk(Slot);
+
+	FParkedGeometry Parked;
+	Parked.PoolHandle = Slot;
+	Parked.OriginInPool = OriginInPool;
+	Parked.Level = Key.Level;
+	Parked.QuadCount = int32(GpuResult.NumQuads);
+	// Speculation is worldgen-only, so its generation is the base one. The edit
+	// epoch is what actually invalidates it, and MarkChunkDirtyForRemesh evicts
+	// parked entries directly on edit.
+	Parked.GenerationId = 1;
+	Parked.EditEpoch = EditEpoch.load(std::memory_order_relaxed);
+	Parked.ParkedAtSeconds = ElapsedSeconds;
+	Parked.bSpeculative = true;
+
+	ParkedGeometry.Add(Key, Parked);
+	ParkedInsertionOrder.Add(Key);
+	++SpecParkedNow;
+	++SpecParkedSinceLog;
+	++SpecParkedTotal;
+
+	// Speculative entries are capped SEPARATELY from demand parking, so a
+	// speculative flood cannot evict the demand cache it depends on.
+	if (SpecParkedNow > MaxParked)
+	{
+		EvictOldestSpeculative();
+	}
+}
+
+// Evict the oldest speculative entry. Separate from EvictParkedOverCap so the
+// two caps cannot cannibalise each other.
+void FVoxelWorldImpl::EvictOldestSpeculative()
+{
+	for (int32 I = 0; I < ParkedInsertionOrder.Num(); ++I)
+	{
+		const VoxelCoords::FVoxelLevelChunkKey Key = ParkedInsertionOrder[I];
+		const FParkedGeometry* Entry = ParkedGeometry.Find(Key);
+		if (Entry && Entry->bSpeculative)
+		{
+			EvictParkedKey(Key);
+			++SpecEvictedUnusedSinceLog;
+			++SpecEvictedUnusedTotal;
+			return;
+		}
+	}
+}
+
 // Free one parked entry for real. Used by the cap, and by the edit paths.
 void FVoxelWorldImpl::EvictParkedKey(const VoxelCoords::FVoxelLevelChunkKey& Key)
 {
@@ -9511,6 +9916,10 @@ void FVoxelWorldImpl::EvictParkedKey(const VoxelCoords::FVoxelLevelChunkKey& Key
 	if (!ParkedGeometry.RemoveAndCopyValue(Key, Parked))
 	{
 		return;
+	}
+	if (Parked.bSpeculative)
+	{
+		SpecParkedNow = FMath::Max(0, SpecParkedNow - 1);
 	}
 	if (UVoxelGpuPoolComponent* Pool = GpuPool.Get())
 	{

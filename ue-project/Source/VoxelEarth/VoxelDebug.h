@@ -329,6 +329,14 @@ namespace VoxelDebug
 	// than a re-mesh. 0 = off. Parked chunks still consume pool quads and
 	// chunk-table entries, so this cap bounds real capacity -- see the cvar's
 	// source comment.
+	// T4-1 speculative generation. VelocityLeadSec 0 = off (the whole feature).
+	// The lead feeds speculative enumeration ONLY -- admission, eviction and
+	// retention stay on the true anchor. See the cvars' source comments.
+	VOXELEARTH_API float GetStreamVelocityLeadSec();
+	VOXELEARTH_API float GetStreamVelocityLeadMaxUU();
+	VOXELEARTH_API int32 GetStreamSpeculativeMaxParked();
+	VOXELEARTH_API int32 GetStreamSpeculativeMaxInFlight();
+
 	VOXELEARTH_API int32 GetStreamPoolParkMax();
 
 	VOXELEARTH_API int32 GetStreamMaxRemeshesPerFrame();

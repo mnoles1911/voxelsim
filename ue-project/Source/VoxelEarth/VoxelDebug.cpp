@@ -494,6 +494,68 @@ TAutoConsoleVariable<int32> CVarVoxelStreamAdmissionRecordCap(
 // both the 64M-quad pool and the 81,920 chunk-table floor with room to spare --
 // verified by allocFail 0 on every leg. Parked chunks consume BOTH, so raising
 // this is bounded by what demand residency leaves free.
+// --- T4-1 speculative generation (Wave S3/S4) -------------------------------
+//
+// How far AHEAD of the anchor speculation aims, in seconds of travel. 0 = the
+// predicted anchor collapses onto the true anchor and speculation is off.
+//
+// The lead is applied to a SMOOTHED VELOCITY VECTOR, not a heading, so a
+// stationary anchor produces zero lead with no special case and a turning one
+// produces a shorter lead while the EMA settles -- which is the conservative
+// direction, since speculation aimed at where the camera WAS is pure waste.
+//
+// It feeds ONLY speculative enumeration. Admission, eviction and retention all
+// stay on the true anchor: evicting against a forward-shifted centre would
+// delete ground behind the camera that is still on screen.
+TAutoConsoleVariable<float> CVarVoxelStreamVelocityLeadSec(
+	TEXT("voxel.Stream.VelocityLeadSec"),
+	0.0f,
+	TEXT("Seconds of travel ahead of the anchor that speculative generation aims at. 0 = off. Applied to a ")
+	TEXT("0.25s-EMA velocity vector and clamped by voxel.Stream.VelocityLeadMaxUU. Feeds speculation ONLY -- ")
+	TEXT("admission, eviction and retention stay on the true anchor by design."),
+	ECVF_Default);
+
+TAutoConsoleVariable<float> CVarVoxelStreamVelocityLeadMaxUU(
+	TEXT("voxel.Stream.VelocityLeadMaxUU"),
+	6000.0f,
+	TEXT("Hard clamp on the predicted-anchor lead distance (UU). 6000 = 60 m, ~3s at the 20 m/s flight ")
+	TEXT("profile. Stops a speed spike throwing the speculative cone somewhere the camera will never reach."),
+	ECVF_Default);
+
+// Chunks speculation may hold parked-but-unasked-for. SEPARATE from
+// PoolParkMax, and that separation is deliberate: demand parking caches geometry
+// that WAS wanted, speculation caches geometry that MIGHT be. They have
+// different hit rates and different justifications, and sharing a cap would let
+// speculation starve the demand cache it depends on.
+//
+// A parked speculative chunk holds a pool range AND a chunk-table entry, exactly
+// like a resident one. S1 measured what happens when residency is free to expand
+// into spare capacity -- it does, all of it, and the pool then refuses DEMAND
+// allocations while reading half empty. Speculative geometry has no natural back
+// pressure at all, so this cap is a correctness boundary.
+TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeMaxParked(
+	TEXT("voxel.Stream.SpeculativeMaxParked"),
+	4000,
+	TEXT("Max chunks held parked from SPECULATIVE generation, separate from voxel.Stream.PoolParkMax. ")
+	TEXT("Speculative geometry has no back pressure -- nothing asked for it -- so this bounds real pool and ")
+	TEXT("chunk-table capacity. Only takes effect while voxel.Stream.VelocityLeadSec > 0."),
+	ECVF_Default);
+
+// Speculative jobs in flight, carved out of the fork's 256-slot budget.
+//
+// Kept small on purpose. Demand work is submitted FIRST every tick and
+// speculation only gets what is left, but a large speculative depth would still
+// sit in the manager's strict-FIFO queue ahead of the next tick's demand jobs.
+// Small depth plus submit-last is what makes starvation structurally impossible
+// rather than merely unlikely.
+TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeMaxInFlight(
+	TEXT("voxel.Stream.SpeculativeMaxInFlight"),
+	32,
+	TEXT("Max speculative mesh jobs in flight, carved out of voxel.Stream.GpuMeshInFlight (256). Small by ")
+	TEXT("design: the job manager's queue is strict FIFO, so speculative depth delays the NEXT tick's demand ")
+	TEXT("work even though demand is submitted first."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarVoxelStreamPoolParkMax(
 	TEXT("voxel.Stream.PoolParkMax"),
 	12000,
@@ -888,6 +950,26 @@ int32 VoxelDebug::GetStreamDispatchAfterDrain()
 int32 VoxelDebug::GetStreamAdmissionRecordCap()
 {
 	return FMath::Max(0, CVarVoxelStreamAdmissionRecordCap.GetValueOnGameThread());
+}
+
+float VoxelDebug::GetStreamVelocityLeadSec()
+{
+	return FMath::Max(0.f, CVarVoxelStreamVelocityLeadSec.GetValueOnGameThread());
+}
+
+float VoxelDebug::GetStreamVelocityLeadMaxUU()
+{
+	return FMath::Max(0.f, CVarVoxelStreamVelocityLeadMaxUU.GetValueOnGameThread());
+}
+
+int32 VoxelDebug::GetStreamSpeculativeMaxParked()
+{
+	return FMath::Max(0, CVarVoxelStreamSpeculativeMaxParked.GetValueOnGameThread());
+}
+
+int32 VoxelDebug::GetStreamSpeculativeMaxInFlight()
+{
+	return FMath::Max(0, CVarVoxelStreamSpeculativeMaxInFlight.GetValueOnGameThread());
 }
 
 int32 VoxelDebug::GetStreamPoolParkMax()
