@@ -195,6 +195,20 @@ public:
 	// FIRST, in the same command, and nothing can reorder the two.
 	//
 	// Public only so the file-local pass builder can name it.
+	// S2-1. A freed range whose ids must be repointed at the hidden chunk on the
+	// GPU instead of through the CPU shadow. Same lifetime and same drain point
+	// as FPendingGpuWrite -- see TakePendingGpuHides.
+	struct FPendingGpuHide
+	{
+		uint32 DstFirst = 0;
+		uint32 NumQuads = 0;
+		// Carried rather than read from kHiddenChunkId at the pass, for the same
+		// reason FPendingGpuWrite carries ChunkId: the pass is a free function on
+		// the render thread and the constant is private to this class. Stamped at
+		// enqueue, where it is in scope.
+		uint32 HiddenId = 0;
+	};
+
 	struct FPendingGpuWrite
 	{
 		FVoxelGpuQuadPayloadRef Src;
@@ -740,6 +754,8 @@ private:
 
 	// Drained by PushUpdatesToProxy -- see FPendingGpuWrite.
 	TArray<FPendingGpuWrite> PendingGpuWrites;
+	// Drained alongside PendingGpuWrites, into the SAME command. See S2-1.
+	TArray<FPendingGpuHide> PendingGpuHides;
 
 	// See GetGpuDirectWrites. The DROPPED half lives on FVoxelGpuPoolBuffers,
 	// which outlives this component from a render command's point of view.
@@ -757,7 +773,9 @@ private:
 	// PushUpdatesToProxy branches that return before building their own. Returns
 	// the writes so the main branch can fold them into ITS command instead.
 	TArray<FPendingGpuWrite> TakePendingGpuWrites();
-	void FlushGpuWritesStandalone(TArray<FPendingGpuWrite>&& Writes);
+
+	TArray<FPendingGpuHide> TakePendingGpuHides();
+	void FlushGpuWritesStandalone(TArray<FPendingGpuWrite>&& Writes, TArray<FPendingGpuHide>&& Hides);
 
 	// --- S1-1 batched publication ------------------------------------------
 	//

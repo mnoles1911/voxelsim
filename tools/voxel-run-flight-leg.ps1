@@ -58,6 +58,14 @@ param(
     # line, where there is nothing to revisit. Quote which one a result came from.
     [ValidateSet('line','surface','underground','static')][string]$Flight = 'line',
     [string]$SpawnAt = '-84480,53760',
+    # RENDER RESOLUTION, and it is not cosmetic. The harness defaulted to
+    # 1600x900 (systemresolution.resx in the log), while the owner's frame-rate
+    # target is 2560x1440 -- 3.686M pixels against 1.44M, a 2.56x difference in
+    # anything pixel-bound. A frame-rate result that does not state its
+    # resolution is not a result. Pass -Width/-Height and say which in whatever
+    # you write.
+    [int]$Width = 1600,
+    [int]$Height = 900,
     [int]$TimeoutSec = 480,
     [switch]$KeepEditLog,
     [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe'
@@ -89,6 +97,7 @@ if (-not $KeepEditLog) {
 $argList = @(
     "`"$Project`"", '-game', '-nosplash', '-unattended', '-sm6', '-dx12',
     "-abslog=`"$LogPath`"",
+    "-ResX=$Width", "-ResY=$Height", '-WinX=0', '-WinY=0',
     "-VoxelSpawnAt=$SpawnAt",
     "-VoxelPerfRun=$RunSec",
     "-VoxelPerfFlight=$Flight",
@@ -118,5 +127,5 @@ if ($elapsed -lt ($expected * 0.9)) {
     return $false
 }
 
-Write-Host "  ${LogName}: ok (${elapsed}s)" -ForegroundColor Green
+Write-Host "  ${LogName}: ok (${elapsed}s) at ${Width}x${Height}" -ForegroundColor Green
 return $true

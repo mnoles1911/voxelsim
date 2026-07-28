@@ -240,7 +240,30 @@ namespace VoxelGpuPoolCull
 	// "tuned merge gap" measurement would have been measuring the default. It is
 	// now the FIRST merge pass, with the range-cap merge below it as the backstop
 	// that guarantees the element limit.
-	static int32 GMergeGapQuads = 4096;
+	// S2-1. 1 = repoint freed quad ids with a GPU pass; 0 = the per-quad CPU
+	// shadow loop this replaces. Default 0 until the forced probe is green: the
+	// failure mode (a partially re-allocated freed block leaving a tail of quads
+	// naming a recycled id) cannot occur naturally, so a clean leg is not
+	// evidence about it -- ground rule 13.
+	static int32 GGpuHide = 0;
+	static FAutoConsoleVariableRef CVarGpuHide(
+		TEXT("voxel.Stream.PoolGpuHide"), GGpuHide,
+		TEXT("1 = repoint freed pool ranges at the hidden chunk with a GPU compute pass instead of "
+		     "writing the CPU shadow. Prerequisite for dropping the shadow entirely (S2-5)."),
+		ECVF_Default);
+
+	// 64, SET BY THE JOINT SWEEP OF 2026-07-28 -- see GMaxRanges for the surface.
+	//
+	// This is the knob that actually reaches the over-draw. It coalesces ranges
+	// separated by fewer than this many quads, and at 4096 it was merging away
+	// the very ranges the budget existed to keep: drawn stalled at 17.2M against
+	// 9.7M visible no matter how high GPUCullMaxRanges went.
+	//
+	// 64 vs 256 is within noise (15.15/20.87 against 15.26/20.95 at 2K) and both
+	// are ~1.00x over-draw, so this is at the floor rather than at a knee. 64 is
+	// taken for the marginally better tail. Below this there is nothing to gain --
+	// the merge cannot do better than the visible set.
+	static int32 GMergeGapQuads = 64;
 	static FAutoConsoleVariableRef CVarMergeGap(
 		TEXT("voxel.Stream.GPUCullMergeGap"), GMergeGapQuads,
 		TEXT("Quads. Surviving pool ranges closer together than this are merged into one draw, re-drawing ")
@@ -286,7 +309,27 @@ namespace VoxelGpuPoolCull
 	// first. drawn stalls at 17.2M against a visible set of 9.7M, so ~7.5M quads
 	// of over-draw remain and this cvar can no longer reach them. That is the next
 	// knob, not this one.
-	static int32 GMaxRanges = 4096;
+	// 16384 AS OF THE JOINT SWEEP -- and 4096 was only right while the merge gap
+	// was still 4096. THE TWO KNOBS INTERACT AND NEITHER CAN BE TUNED ALONE.
+	//
+	// Measured alone (gap at its old 4096), 16384 was WORSE than 4096: 24.35 ms
+	// against 24.11, with a worse max frame. A large budget cannot bind while a
+	// coarse gap has already merged the ranges away. Paired with a fine gap it is
+	// the best point on the surface, because a fine gap PRODUCES many small ranges
+	// and this is what stops them being merged back:
+	//
+	//   gap    K       p50 (2K)   p95      drawn
+	//   4096   1024      30.59    44.87    33.1M      <- shipped before this
+	//   1024   4096      20.51    24.75    14.5M
+	//   1024   8192      16.12    21.57
+	//    256  16384      15.26    20.95     9.83M
+	//     64  16384      15.15    20.87     9.72M     <- adopted
+	//
+	// drawn is now 9.72M against a visible set of 9.71M: over-draw is GONE
+	// (1.001x, was 3.4x). There is nothing left for this knob to recover, and
+	// ranges settles at ~8,002 -- under the ceiling, so the gap sets the shape now
+	// and the ceiling is only there to not be the binding constraint.
+	static int32 GMaxRanges = 16384;
 	static FAutoConsoleVariableRef CVarMaxRanges(
 		TEXT("voxel.Stream.GPUCullMaxRanges"), GMaxRanges,
 		TEXT("Draw-range budget for the cull. The merge always reaches it by construction. Clamped to 1024. ")
@@ -2082,6 +2125,7 @@ void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 	// NOT reset, for the same reason AllocFailureCount is not: it answers "what
 	// did this RUN do", not "what is happening right now".
 	PendingGpuWrites.Reset();
+	PendingGpuHides.Reset();
 	bChunkTableDirty = false;
 	bRunsDirty = false;
 }
@@ -2361,9 +2405,25 @@ void UVoxelGpuPoolComponent::RemoveChunkInternal(int32 Handle, bool bRecycleChun
 
 	// Point the freed quads at the hidden chunk (scale 0) so they collapse to
 	// a degenerate point rather than continuing to draw stale geometry.
-	for (uint32 I = 0; I < Alloc.NumQuads; ++I)
+	//
+	// S2-1: on the GPU path this is a compute pass rather than a shadow write.
+	// The shadow loop below is the LAST writer of PooledQuads/QuadChunkIds on a
+	// GPU-only run, so which branch runs decides whether the shadow can be
+	// dropped at all (S2-5) -- 12 B/quad of system RAM plus a whole-array copy in
+	// CreateSceneProxy.
+	if (VoxelGpuPoolCull::GGpuHide != 0 && IsGpuWritable())
 	{
-		QuadChunkIds[int32(Alloc.Offset + I)] = kHiddenChunkId;
+		PendingGpuHides.Add(FPendingGpuHide{ Alloc.Offset, Alloc.NumQuads, kHiddenChunkId });
+		// NO MarkQuadsDirty. The whole point is that this range never rides the
+		// shadow upload -- marking it would re-upload stale shadow contents over
+		// the pass's own writes, which is the D1 ordering hazard in reverse.
+	}
+	else
+	{
+		for (uint32 I = 0; I < Alloc.NumQuads; ++I)
+		{
+			QuadChunkIds[int32(Alloc.Offset + I)] = kHiddenChunkId;
+		}
 	}
 
 	// Only now is the table entry unreferenced by any quad, which is what makes
@@ -2649,8 +2709,13 @@ void UVoxelGpuPoolComponent::UnmarkQuadsDirty(uint32 First, uint32 Count)
 static void VoxelGpuPoolAddWritePasses(FRDGBuilder& GraphBuilder,
                                        const FVoxelGpuPoolBuffersRef& Buffers,
                                        const TArray<UVoxelGpuPoolComponent::FPendingGpuWrite>& Writes,
+                                       const TArray<UVoxelGpuPoolComponent::FPendingGpuHide>& Hides,
                                        const TCHAR* PoolName)
 {
+	if (Writes.Num() == 0 && Hides.Num() == 0)
+	{
+		return;
+	}
 	if (!Buffers.IsValid())
 	{
 		// Cannot happen -- GetOrCreatePoolBuffers always returns a holder and the
@@ -2690,6 +2755,28 @@ static void VoxelGpuPoolAddWritePasses(FRDGBuilder& GraphBuilder,
 		                                       Write.Src->SrcFirst, Write.DstFirst,
 		                                       Write.NumQuads, Write.ChunkId);
 	}
+
+	// S2-1 hides, AFTER the writes and in the same graph.
+	//
+	// ORDER MATTERS AND THIS IS THE SAFE ONE. A range can be freed and
+	// re-allocated to a GPU-meshed chunk within a single batched frame (that is
+	// what S1-1's batching created, and what UnmarkQuadsDirty guards on the
+	// shadow path). If the hide ran after such a write it would blank ids the
+	// write had just set, producing invisible terrain that reports as loaded.
+	// Running writes first means the last writer to any contested slot is the
+	// one that owns it now.
+	for (const UVoxelGpuPoolComponent::FPendingGpuHide& Hide : Hides)
+	{
+		VoxelGpuWorldGen::AddQuadPoolHidePass(GraphBuilder, DstIds, Hide.DstFirst, Hide.NumQuads,
+		                                      Hide.HiddenId);
+	}
+}
+
+TArray<UVoxelGpuPoolComponent::FPendingGpuHide> UVoxelGpuPoolComponent::TakePendingGpuHides()
+{
+	TArray<FPendingGpuHide> Hides = MoveTemp(PendingGpuHides);
+	PendingGpuHides.Reset();
+	return Hides;
 }
 
 TArray<UVoxelGpuPoolComponent::FPendingGpuWrite> UVoxelGpuPoolComponent::TakePendingGpuWrites()
@@ -2723,9 +2810,10 @@ UVoxelGpuPoolComponent::FPoolPushStats UVoxelGpuPoolComponent::GetAndResetPushSt
 	return Out;
 }
 
-void UVoxelGpuPoolComponent::FlushGpuWritesStandalone(TArray<FPendingGpuWrite>&& Writes)
+void UVoxelGpuPoolComponent::FlushGpuWritesStandalone(TArray<FPendingGpuWrite>&& Writes,
+                                                      TArray<FPendingGpuHide>&& Hides)
 {
-	if (Writes.Num() == 0)
+	if (Writes.Num() == 0 && Hides.Num() == 0)
 	{
 		return;
 	}
@@ -2734,11 +2822,11 @@ void UVoxelGpuPoolComponent::FlushGpuWritesStandalone(TArray<FPendingGpuWrite>&&
 	// rebuild is enqueued later (end of frame), so this command still lands
 	// first -- which is the order the drawable-after-written rule needs.
 	ENQUEUE_RENDER_COMMAND(VoxelGpuPoolDirectWrite)(
-		[Buffers = GetOrCreatePoolBuffers(), Writes = MoveTemp(Writes),
+		[Buffers = GetOrCreatePoolBuffers(), Writes = MoveTemp(Writes), Hides = MoveTemp(Hides),
 		 Name = PoolName](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
-		VoxelGpuPoolAddWritePasses(GraphBuilder, Buffers, Writes, *Name);
+		VoxelGpuPoolAddWritePasses(GraphBuilder, Buffers, Writes, Hides, *Name);
 		GraphBuilder.Execute();
 	});
 }
@@ -2799,12 +2887,13 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 	// frame's state, after the range it targets had already been published as
 	// drawable.
 	TArray<FPendingGpuWrite> GpuWrites = TakePendingGpuWrites();
+	TArray<FPendingGpuHide> GpuHides = TakePendingGpuHides();
 
 	// No live proxy yet: the CPU arrays are the source of truth and the proxy
 	// will pick them up whole when it is created.
 	if (LiveProxy == nullptr)
 	{
-		FlushGpuWritesStandalone(MoveTemp(GpuWrites));
+		FlushGpuWritesStandalone(MoveTemp(GpuWrites), MoveTemp(GpuHides));
 		MarkRenderStateDirty();
 		DirtyQuadRanges.Reset();
 		bChunkTableDirty = false;
@@ -2815,7 +2904,7 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 	// The chunk table outgrew its headroom -- rebuild rather than overrun it.
 	if (ChunkOrigins.Num() > LiveProxy->GetMaxChunks())
 	{
-		FlushGpuWritesStandalone(MoveTemp(GpuWrites));
+		FlushGpuWritesStandalone(MoveTemp(GpuWrites), MoveTemp(GpuHides));
 		MarkRenderStateDirty();
 		DirtyQuadRanges.Reset();
 		bChunkTableDirty = false;
@@ -2922,7 +3011,8 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 		[Proxy, QuadsSlice = MoveTemp(QuadsSlice), IdsSlice = MoveTemp(IdsSlice),
 		 OriginsCopy = MoveTemp(OriginsCopy), ParamsCopy = MoveTemp(ParamsCopy), RunsCopy = MoveTemp(RunsCopy),
 		 UploadRuns = MoveTemp(UploadRuns), NewNumQuads, bTableDirty,
-		 GpuWrites = MoveTemp(GpuWrites), Buffers = GetOrCreatePoolBuffers(),
+		 GpuWrites = MoveTemp(GpuWrites), GpuHides = MoveTemp(GpuHides),
+		 Buffers = GetOrCreatePoolBuffers(),
 		 Name = PoolName](FRHICommandListImmediate& RHICmdList)
 	{
 		// FIRST, BEFORE THE TWO UPDATES BELOW, AND THAT IS THE ORDERING RULE
@@ -2935,7 +3025,7 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 		if (GpuWrites.Num() > 0)
 		{
 			FRDGBuilder GraphBuilder(RHICmdList);
-			VoxelGpuPoolAddWritePasses(GraphBuilder, Buffers, GpuWrites, *Name);
+			VoxelGpuPoolAddWritePasses(GraphBuilder, Buffers, GpuWrites, GpuHides, *Name);
 			GraphBuilder.Execute();
 		}
 
