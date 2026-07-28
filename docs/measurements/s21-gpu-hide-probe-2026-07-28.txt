@@ -107,11 +107,34 @@ Its whole premise is that the free, the re-allocation and the hide are published
 TOGETHER, which is the batched frame the hazard lives in. It cannot arrange that
 by calling pool methods from a ticker while the world streams around it.
 
-WHAT A WORKING PROBE NEEDS: the three mutations inside one
-UVoxelGpuPoolComponent::FScopedBatch, so they share a publication, with the
-readback after the scope closes. That is a small change to the probe and it is
-the next thing to do -- but it is a change to the HARNESS, and S2-1 remains
-unverified until it is made and passes.
+FIXED, AND STILL NOT PASSING. Two further harness bugs were found and fixed:
+
+  * the three mutations now run inside one FScopedBatch, so they share a
+    publication (the batched frame the hazard needs).
+  * the readback now reads a 4,096-quad WINDOW straddling the head/tail boundary
+    instead of A's whole range. The deterministic sizing makes A the largest free
+    run -- ~30.7 MILLION quads on a settled pool -- so "read back A's range" was
+    asking for a 123 MB readback, and that is why every previous round came back
+    all zeros. The 64 MB version before it failed identically for the same
+    reason.
+
+After both fixes the readback returns REAL DATA rather than zeros, which is
+progress, but the values are impossible: ids like 50,399,760 and 168,755,730
+against a chunk table of 98,304 entries. So the staging copy is still landing at
+the wrong place -- AddCopyBufferPass offsets against a structured buffer are the
+obvious next suspect -- and the head/tail denominators printed in the verdict are
+also now stale (they still use Half rather than the window bounds).
+
+STOPPED HERE, DELIBERATELY. Five rounds of harness bugs, each revealing another,
+on a verification tool for a feature that ships INERT. The engineering call is
+that further effort here displaces work that ships. S2-1 stays at
+voxel.Stream.PoolGpuHide 0 and S2-5 stays blocked, which is the correct and
+honest state: an unverified pass must not be switched on.
+
+WHAT THE NEXT PERSON SHOULD DO FIRST: verify the probe against a KNOWN answer
+before trusting any verdict from it. Allocate one chunk, publish, read it back,
+and assert the ids equal that chunk's id. If that does not pass, nothing built on
+top of it means anything -- which is the lesson this whole sequence teaches.
 
 DO NOT read the accumulated FAIL results as evidence about the pass. Three of
 them were produced by a probe that could not have passed regardless of whether

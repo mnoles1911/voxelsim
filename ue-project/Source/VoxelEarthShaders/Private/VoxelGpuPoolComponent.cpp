@@ -3583,6 +3583,26 @@ void UVoxelGpuPoolComponent::DebugGpuHideProbe(uint32 NumQuads)
 	const FVector3f Origin(0.f, 0.f, 0.f);
 	const FVector4f Params(0.f, 0.f, 0.f, 0.f);
 
+	// ALL THREE MUTATIONS INSIDE ONE BATCH, which is the whole point and was
+	// missing from the first four attempts.
+	//
+	// Outside a batch scope every AddChunk and RemoveChunk publishes on its own,
+	// so the free, the re-allocation and the hide went out as three SEPARATE
+	// publications and the probe's pre-publish state read dirtyRanges=0
+	// pendingHides=0 -- everything already flushed before it could look. The
+	// hazard being probed only exists when they share ONE publication, which is
+	// the batched frame S1-1 introduced, so a probe that cannot arrange that
+	// cannot pass whatever the code does.
+	//
+	// The scope closes before the readback; that close is the publication.
+	uint32 Offset = 0;
+	uint32 IdA = 0;
+	uint32 IdB = 0;
+	uint32 Half = 0;
+	int32 HandleB = INDEX_NONE;
+	{
+	FScopedBatch ProbeBatch(this);
+
 	// 1. Allocate A.
 	const int32 HandleA = AddChunk(Quads, Origin, /*Level*/ 0, Params);
 	if (HandleA == INDEX_NONE)
@@ -3590,12 +3610,12 @@ void UVoxelGpuPoolComponent::DebugGpuHideProbe(uint32 NumQuads)
 		UE_LOG(LogTemp, Error, TEXT("%s GpuHideProbe: allocation A failed (pool full?)."), *PoolName);
 		return;
 	}
-	const uint32 Offset = Allocations[HandleA].Offset;
-	const uint32 IdA = AllocationChunkIds[HandleA];
+	Offset = Allocations[HandleA].Offset;
+	IdA = AllocationChunkIds[HandleA];
 
 	// Step 2: with A held, every remaining free block is <= this.
 	const uint32 L2 = GetLargestFreeRun();
-	const uint32 Half = L2 + 1u;
+	Half = L2 + 1u;
 	if (Half >= NumQuadsA)
 	{
 		UE_LOG(LogTemp, Warning,
@@ -3614,14 +3634,14 @@ void UVoxelGpuPoolComponent::DebugGpuHideProbe(uint32 NumQuads)
 	// 3. Re-allocate HALF inside the freed block. First-fit should place it at
 	//    Offset; if it does not, the probe cannot manufacture the overlap and
 	//    says so rather than passing vacuously.
-	const int32 HandleB = AddChunk(HalfQuads, Origin, /*Level*/ 0, Params);
+	HandleB = AddChunk(HalfQuads, Origin, /*Level*/ 0, Params);
 	if (HandleB == INDEX_NONE)
 	{
 		UE_LOG(LogTemp, Error, TEXT("%s GpuHideProbe: allocation B failed."), *PoolName);
 		return;
 	}
 	const uint32 OffsetB = Allocations[HandleB].Offset;
-	const uint32 IdB = AllocationChunkIds[HandleB];
+	IdB = AllocationChunkIds[HandleB];
 	if (OffsetB != Offset)
 	{
 		UE_LOG(LogTemp, Warning,
@@ -3632,6 +3652,8 @@ void UVoxelGpuPoolComponent::DebugGpuHideProbe(uint32 NumQuads)
 		RemoveChunk(HandleB);
 		return;
 	}
+
+	} // ProbeBatch closes here -- ONE publication carrying all three mutations.
 
 	// Publish: this is what drains PendingGpuWrites and PendingGpuHides into one
 	// command, in the order the fix depends on.
@@ -3655,8 +3677,22 @@ void UVoxelGpuPoolComponent::DebugGpuHideProbe(uint32 NumQuads)
 	TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> Rb =
 		MakeShared<FRHIGPUBufferReadback, ESPMode::ThreadSafe>(TEXT("Voxel.GpuHideProbe.Ids"));
 	const FVoxelGpuPoolBuffersRef Buffers = GetOrCreatePoolBuffers();
-	const uint32 First = Offset;
-	const uint32 Count = NumQuadsA;
+	// READ A WINDOW AROUND THE BOUNDARY, NOT THE WHOLE RANGE.
+	//
+	// The deterministic sizing makes A the largest free run, which on a settled
+	// pool is ~30.7 MILLION quads -- so reading "A's whole original range" asked
+	// for a 123 MB readback and came back zeros, which is what produced the last
+	// round of FAILs on both arms. The 64 MB version before it failed the same
+	// way for the same reason; capping the range is the fix, not a smaller pool.
+	//
+	// Everything the probe asserts lives at the head/tail boundary anyway: the
+	// last quads of B and the first quads that must still be hidden. A window
+	// straddling Offset+Half covers both.
+	constexpr uint32 kWindowHalf = 2048;
+	const uint32 Boundary = Offset + Half;
+	const uint32 First = Boundary > kWindowHalf ? Boundary - kWindowHalf : Offset;
+	const uint32 WindowEnd = FMath::Min(Boundary + kWindowHalf, Offset + NumQuadsA);
+	const uint32 Count = WindowEnd - First;
 	ENQUEUE_RENDER_COMMAND(VoxelGpuHideProbeReadback)(
 		[Buffers, Rb, First, Count](FRHICommandListImmediate& RHICmdList)
 	{
@@ -3694,7 +3730,7 @@ void UVoxelGpuPoolComponent::DebugGpuHideProbe(uint32 NumQuads)
 	bool bLocked = false;
 	const uint32 HiddenId = kHiddenChunkId;
 	ENQUEUE_RENDER_COMMAND(VoxelGpuHideProbeCompare)(
-		[Rb, First, Count, Half, IdB, HiddenId,
+		[Rb, First, Count, Boundary, IdB, HiddenId,
 		 &HeadWrong, &TailWrong, &FirstBadIndex, &FirstBadValue, &bLocked](FRHICommandListImmediate&)
 	{
 		const uint32* Data = static_cast<const uint32*>(Rb->Lock(Count * sizeof(uint32)));
@@ -3705,11 +3741,12 @@ void UVoxelGpuPoolComponent::DebugGpuHideProbe(uint32 NumQuads)
 		bLocked = true;
 		for (uint32 I = 0; I < Count; ++I)
 		{
-			const uint32 Got = Data[I];   // staging buffer starts AT First
-			const uint32 Want = (I < Half) ? IdB : HiddenId;
+			const uint32 Got = Data[I];              // staging starts AT First
+			const uint32 Abs = First + I;            // absolute pool offset
+			const uint32 Want = (Abs < Boundary) ? IdB : HiddenId;
 			if (Got != Want)
 			{
-				if (I < Half) { ++HeadWrong; } else { ++TailWrong; }
+				if (Abs < Boundary) { ++HeadWrong; } else { ++TailWrong; }
 				if (FirstBadIndex == 0xffffffffu) { FirstBadIndex = I; FirstBadValue = Got; }
 			}
 		}
