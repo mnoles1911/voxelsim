@@ -1,0 +1,189 @@
+================================================================================
+WAVE S1 CLOSE -- holes 15,032 -> 0, chunks/s 260 -> 797, and the bottleneck moved
+================================================================================
+
+docs/speculative-generation-plan.md Wave S1. Measured 2026-07-27, AMD Radeon
+RX 7800 XT, seed 20260719, adopted 128 m / 4 km cascade, real terrain, edit log
+cleared per leg, flight legs launched directly (voxel-run-leg.ps1 is a cold-fill
+driver -- see the S0 file).
+
+--------------------------------------------------------------------------------
+THE LADDER, EACH STEP MEASURED
+--------------------------------------------------------------------------------
+
+  config                                   chunks/s   holes    allocFail
+  baseline (S0, per-chunk publication)        260.9   15,032           0
+  + PoolBatchPublish                          581.3      966      77,290
+  + pool 44M->64M, table 49,152->81,920       631.6      257      26,763
+  + MaxUnloadsPerFrame 24 -> 96               791.3       14           0
+  + MaxUnloadsPerFrame 24 -> 256              797.0        0           0
+
+  MaxAppliesPerFrame 64 -> 192                749.5      179           0   *** VOID ***
+
+**holes = 0.** The pooled arm converges the world for the first time; the
+previous record at this cascade was ~15,300 permanent holes at 602 chunks/s.
+
+--------------------------------------------------------------------------------
+SECTION 1a IS CLOSED
+--------------------------------------------------------------------------------
+
+The premise of the whole T4-1 re-sequencing was that the CONSUMER is the wall.
+S0 measured the apply loop exiting on its 6 ms wall clock in every window and
+NEVER on an empty queue. After S1-1:
+
+    exit queueEmpty=88  wallClock=0  countCap=0
+    stale=0 (0.0%)
+
+The drain now empties the queue, and the stale-result fraction that was 42% is
+zero. The consumer is no longer the wall. That is the S1 goal, discharged.
+
+--------------------------------------------------------------------------------
+WHAT ACTUALLY FIXED THE FRAGMENTATION -- NOT WHAT IT LOOKED LIKE
+--------------------------------------------------------------------------------
+
+Batching alone refused 77,290 allocations (96.9 M quads) while the free list
+shattered: 16,903 free runs, largest run 68,326, against 8,407 / 4,904,120 on
+the unbatched control at the same total free. That reads exactly like first-fit
+pathology, and the obvious response is the idle defrag (T3-6).
+
+IT WAS NOT FRAGMENTATION-AS-A-CAUSE. It was residency ballooning:
+
+    unload=212.8 ms of a 219.6 ms tick        pendingUnload = 20,926
+    peak live chunks = 80,716                 tracked = 92,875
+
+voxel.Stream.MaxUnloadsPerFrame defaults to 24, tuned when the pipeline applied
+~260 chunks/s. At 631/s with ~28 ticks/s that is ~684 unloads/s against ~630
+loads/s -- marginally under water, so the unload queue grew without bound and
+residency with it. A pool held chronically over-full fragments; first-fit was
+the messenger.
+
+Raising the budget to 256: peak residency 80,716 -> 50,930, peak pendingUnload
+75,925 -> 19,873, allocFail 26,763 -> 0, holes 257 -> 0.
+
+  NO IDLE DEFRAG IS NEEDED. T3-6 stays deferred. One leg's worth of diagnosis
+  separated "build a compacting allocator" from "raise a cvar that was sized for
+  a slower pipeline".
+
+  AND THE CAPACITY RAISE IS PARTLY REDUNDANT. It is NOT free to keep: 64M costs
+  512 MB VRAM in quads, the same again in chunk ids, and 12 B/quad of CPU shadow
+  (docs/speculative-generation-plan.md §2.6). Peak residency with the unload fix
+  is ~50,900 chunks ~= 46M quads, so 44M would still be marginal and the 49,152
+  table floor is genuinely too low -- but 64M may be more than required. OPEN:
+  run a control at 48M before treating that memory as necessary, because T4-1's
+  speculative budget is sized off whatever is left over.
+
+--------------------------------------------------------------------------------
+MaxAppliesPerFrame: UNDECIDED. THE LEG THAT "DECIDED" IT WAS CONTENDED.
+--------------------------------------------------------------------------------
+
+countCap binds at the winning config (countCap=79 in busy windows), which reads
+like a ceiling worth raising. A leg at 192 came back 749.5 chunks/s / 179 holes
+against 797.0 / 0, and that was written up here as REJECTED with a mechanical
+explanation attached (the drain breaks on a 6 ms wall clock, so a higher count
+cap only lets each frame do more work against the same budget and lengthens
+frames).
+
+THAT LEG WAS CONTAMINATED AND IS VOID. Its last 86 seconds -- the flight tail,
+where the numbers are made -- ran concurrently with another editor, because a
+confirmation sweep was launched before the apply sweep's loop had finished:
+
+    s24-apply192   00:19:29 -> 00:24:13
+    s1close-1      00:22:47 -> 00:27:20      <-- 86 s of overlap
+    s24-apply512   00:24:19 -> 00:27:20      <-- never completed
+
+A second process on the GPU produces "this setting made it worse" for free. The
+explanation offered above is plausible and may well be right; it is not
+supported by this leg, and a plausible mechanism attached to a contended number
+is exactly how a wrong result survives review.
+
+  STATUS: MaxAppliesPerFrame stays at 64 because nothing has validly moved it,
+  NOT because 192 was shown to be worse. Re-run the sweep through
+  tools/voxel-run-flight-leg.ps1, which now refuses to start while another
+  editor is alive.
+
+  HOW IT WAS CAUGHT: the owner noticed two game windows on screen. That is not
+  a control, which is why the guard now exists. Ground rule 1 says never
+  conclude from a single run; its sibling is never conclude from a run that was
+  sharing the box.
+
+CLEAN, VERIFIED NON-OVERLAPPING (every leg's span checked end-to-end):
+  all S0 legs, all S1-1 legs, all S1-2 legs, both cap64 legs, and BOTH unload
+  legs -- i.e. every number the ladder above rests on except the apply row.
+
+--------------------------------------------------------------------------------
+THE BOTTLENECK MOVED, AND IT MOVED OUT OF WAVE S1
+--------------------------------------------------------------------------------
+
+At the winning config:
+
+    tickMs=806.5 over 79 ticks (10.2 ms/tick)
+      recompute = 530.5 ms   (66%)
+      unload    = 223.4 ms   (28%, and most of that is the batch flush -- the
+                              scope closes before T4, so the tick's single
+                              publication is attributed to the unload bucket)
+      apply     =  42.5 ms   (5%)
+
+    recordsAdded = 44,604 per 2 s window     tracked = 92,875
+    dispatched   =  4,422                    stale   = 0%
+
+RecomputeDesiredSet is now two thirds of the streaming tick, and the cause is a
+feedback loop that S1 CREATED:
+
+    RecomputeDesiredSet relaxes every LevelAdmissionCutoffDistSq to DBL_MAX when
+    PendingJobNum() * 4 < Cap * 3 -- i.e. when the pending queue is short.
+
+The queue is now always short, because the consumer stopped being the wall. So
+the admission cutoff is permanently disabled, admission floods (22,300
+records/s against ~800 chunks/s actually loading), tracked balloons to 92,875,
+and the O(tracked) exit scan gets expensive.
+
+**Making the consumer fast made the admission cap stop working.** That is
+lesson 5 -- "the bottleneck migrates; re-baseline after every fix" -- for the
+sixth time in this programme, and it is the seventh.
+
+This is Wave S2 / T4-2 territory (GPU-resident residency, and the entry-scan
+quantisation T2-1/T2-2 work around). It is NOT more S1.
+
+--------------------------------------------------------------------------------
+AGAINST THE S1 CLOSE CRITERION
+--------------------------------------------------------------------------------
+
+The criterion was: pooled arm at or past 1,082 chunks/s with holes(final)=0.
+
+    holes(final) = 0        MET
+    chunks/s     = 797      NOT MET (74% of target)
+
+Read honestly: the holes criterion is the one that describes what a player sees,
+and it is met for the first time. The throughput criterion is not, and the
+reason is no longer anything S1 was aimed at -- the apply path is no longer the
+constraint by any measure taken here.
+
+The 1,082 figure is also the COMPONENT arm's number, and that arm was never
+converging holes at this cascade (it posted 1,082 with holes=0 at the OLD
+scale). A pooled arm at 797 with holes=0 and a component arm at 1,082 with
+holes=0 are not the same world; the head-to-head at the adopted cascade has to
+be re-run before the comparison means anything.
+
+  DECISION OWED (the plan's hard stop): whether to keep pushing throughput --
+  which now means the admission/recompute path, i.e. T4-2 -- or to accept
+  holes=0 at 797 and move to Wave S2 (parking) on the way to T4-1. The plan
+  says stop and re-decide here, and the ground for that decision has changed:
+  the item that would raise throughput further is no longer a Wave S1 item.
+
+--------------------------------------------------------------------------------
+STILL NOT DONE
+--------------------------------------------------------------------------------
+
+  * voxel.Stream.PoolClobberTest has never run in this wave. It cannot execute
+    from -ExecCmds (fires at frame 0, before the pool component exists). The live
+    PoolClobberSession variant is the one that can.
+  * MaxUnloadsPerFrame 96 vs 256 is one leg each and nearly a tie (791.3/14 vs
+    797.0/0). 256 is the default flipped to, on the strength of holes=0, but the
+    margin is inside what two legs would resolve.
+  * T1-2(b) incremental Runs and S1-4 incremental RunBounds are both still
+    standing costs (Runs.Sort ~3.3 ms and RebuildRunBounds ~1.34 ms per
+    publication) but at ~28 publications/s they are ~10% of the tick against
+    recompute's 66%. Do not build either against the old census.
+
+Raw logs are NOT committed (/Saved/ gitignored): s24-cap64-on-1/2, s24-unload96,
+s24-unload256, s24-apply192, s1close-1/2.
