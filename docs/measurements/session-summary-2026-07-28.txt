@@ -117,3 +117,89 @@ VERIFICATION
                                       floor is mean 45/255 and does not shrink
                                       with settle time -- power against gross
                                       corruption only. Do not cite it as clean.
+
+============================================================================
+ADDENDUM: THE AFTERNOON, AND THE BOTTOM LINE
+============================================================================
+
+Everything above was written before the frame attribution and GPU capture work.
+Those changed what the remaining problem IS, so read this part second.
+
+FINAL SHIPPED STATE, standard leg, 2560x1440:
+
+  p50 15.40 ms (64.9 fps)  p95 21.40  hitches 11  holes(final) 0  allocFail 0
+
+  defaults now on: VelocityLeadSec 2.0 (T4-1 ON), SpeculativeZTrim 1,
+  SpeculativeMaxInFlight 16, GPUCullMergeGap 64, GPUCullMaxRanges 16384,
+  pool 80M quads / table 98,304.
+
+---------------------------------------------------------------------------
+WHERE THE FRAME ACTUALLY GOES (measured, replicated)
+---------------------------------------------------------------------------
+
+  render thread   13.5-13.7 ms   <- this IS the frame
+  game thread      3.0-3.6 ms working, 10.1-10.7 ms WAITING
+  voxel tick       0.4-0.5 ms on a typical frame
+  GPU frame       16.8-18.4 ms   <- the actual bottleneck
+
+  GPU split: meshing compute 21-28% | PrePass ~5.6 | BasePass ~5.9 (+/-1%)
+             | post ~1.4 (TSR 1552x873 -> 2560x1440, so "2K" is UPSCALED)
+
+  render-thread split: cull walk ~1.0 | range emit ~3.2 | NOT the pool ~9.5
+
+THE TWO FACTS THAT DECIDE EVERYTHING ELSE:
+
+1. THE GAME THREAD IS IDLE 75% OF THE FRAME. Gameplay systems -- AI, physics,
+   inventory, networking -- are game-thread work and have enormous headroom.
+   What is full is the render thread and the GPU, which is where VISUAL
+   additions land. Every streaming optimisation in this programme landed on the
+   thread that was already idle.
+
+2. WORK REMOVED FROM A SUBSYSTEM DOES NOT RELIABLY BECOME FRAME TIME. Cutting
+   game-thread publication 2.94 -> 0.055 ms: p50 unmoved. Cutting speculative
+   GPU dispatches by 46%: p50 moved 0.08 ms. The GPU meshing evidently overlaps
+   with rendering rather than sitting on the critical path.
+
+---------------------------------------------------------------------------
+SEVEN FALSIFIED PREDICTIONS, AND THE RULE THEY EARN
+---------------------------------------------------------------------------
+
+  1. the streaming tick causes the frame tail   removed 1/3 of it, p50/p95 flat
+  2. shadow cascades re-gather the pool 4-5x    shadowGather=0
+  3. the cull walk costs ~4.4 ms                measured 1.0 ms, wrong by 4x
+  4. the streaming tick is "a passenger"        true on CPU, false on GPU
+  5. the prepass is a removable misconfig       Nanite hands off to DBuffer;
+                                                BasePass unmoved across 4 arms
+  6. cutting mesh dispatches buys ~1-1.5 ms     bought 0.08 ms
+  7. BaseVertexIndex can replace BaseQuad       already falsified in the .ush
+                                                (caught by READING, not building)
+
+Each had a number behind it. The rule: NO ITEM GOES ON THE PLAN WITH A PREDICTED
+SAVING UNTIL AN EXPERIMENT HAS REMOVED THAT WORK AND MEASURED THE FRAME. On this
+renderer the mapping from subsystem cost to frame time is not additive, and
+guessing it has been wrong seven times out of seven.
+
+---------------------------------------------------------------------------
+WHAT IS LEFT, AND WHY IT IS NOT OBVIOUSLY WORTH DOING
+---------------------------------------------------------------------------
+
+Realistic ceiling from remaining items is ~12-13 ms (~80 fps), NOT 10. And both
+of the largest are blocked on a question nobody has answered:
+
+  HOW MUCH OF THE 18.4 ms GPU FRAME IS SERIAL AT ALL?
+
+Finding 2 above showed one large GPU component (meshing, 21-28%) that is NOT on
+the critical path. Occlusion culling and indirect drawing may hit the same wall.
+Establish serial-vs-overlapped before building either.
+
+100 fps needs the primitive count down -- 17.8M per pass, submitted TWICE, into a
+1552x873 internal target, about 11 triangles per rendered pixel. That means
+drawing distant rings (L3-L5, 53% of pool quads, 512 m to 4 km, sub-pixel voxels)
+as heightfield rather than voxel geometry. AVoxelClipmapActor already exists.
+That is a FEATURE, not an optimisation.
+
+RECOMMENDATION AT SESSION END: build gameplay. The renderer holds ~65 fps at 2K
+with zero holes, the game thread has 10 ms free for exactly the systems that come
+next, and real content will reshape the profile anyway. The instrumentation to
+watch it move is now in the tree (FrameAttribution, GPUCullTiming, DeferExec,
+voxel-run-gpu-arm.ps1, voxel-audit-leg-overlap.ps1).
