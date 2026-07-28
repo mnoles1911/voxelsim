@@ -104,6 +104,25 @@ should be re-run.
 **Hierarchical cull is demoted** — it attacks the ~1 ms walk, not 4 ms. Real, no
 visual cost, but rank it accordingly.
 
+### 0.1c STRUCK — the depth prepass is not removable
+
+Tested 2026-07-28, four arms: `docs/measurements/prepass-test-2026-07-28.txt`.
+It was flagged as the largest and cheapest item on the 100 fps path. It is
+neither.
+
+`r.EarlyZPass 0` is ignored (still "Forced by Nanite"). `r.Nanite 0` does not
+free it either — the forcing **hands over to DBuffer**. With both off it is still
+5.708 ms. Two independent subsystems require a full depth prepass.
+
+The fallback hypothesis — that the prepass was not earning its cost — dies too:
+BasePass is 5.907–6.053 ms across all four arms, a 2.5% spread, so base-pass cost
+is independent of it. GPU frame 17.25 → 17.08 ms. Nothing on offer.
+
+⇒ **Realistic floor from the remaining items is ~12–13 ms (~80 fps), not 10.**
+Reaching 10 ms needs the primitive count itself down — 17.8M per pass, drawn
+twice — which points back at rendering distant rings as heightfield rather than
+voxel geometry.
+
 ### 0.1b NEW P0 — What is the other ~9.5 ms?
 
 The largest single unexplained block in the frame, and **bigger than everything
