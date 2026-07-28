@@ -86,12 +86,36 @@ FRDGPooledBuffer wrapping the SAME RHI buffer as the proxy's ChunkIdBuffer (the
 SharedBuffers block in VoxelGpuPoolComponent.cpp), so reading one while the
 upload writes the other is not the problem.
 
-REMAINING HYPOTHESIS, untested: the probe calls PushUpdatesToProxy() and then
-FlushRenderingCommands(), but if that call takes a branch which defers the
-upload to a render-state rebuild (MarkRenderStateDirty enqueues at end of
-frame), the flush does not cover it and the readback races an upload that has
-not happened. Next step is to log which branch PushUpdatesToProxy takes during
-the probe, before touching the pass again.
+ELIMINATED: the readback size. The first version enqueued the readback straight
+off the pool buffer with a byte count of (First + Count) -- ~64 MB to inspect a
+few thousand ids. Replaced with a staging copy of exactly the range wanted. The
+control still failed identically, so that was not it either.
+
+THE ACTUAL PROBLEM, from the pre-publish diagnostic:
+
+  liveProxy=1 batchDepth=0 dirtyRanges=0 tableDirty=0 runsDirty=0
+  chunkOrigins=57723 pendingHides=0
+
+dirtyRanges=0 AND pendingHides=0 at the moment the probe publishes. Everything
+it did has ALREADY been flushed. Outside a batch scope each AddChunk and
+RemoveChunk publishes on its own -- that is the pre-S1-1 behaviour and still the
+default -- so the probe's three mutations went out as three separate
+publications before it ever called PushUpdatesToProxy.
+
+That makes the probe structurally unable to test what it was written to test.
+Its whole premise is that the free, the re-allocation and the hide are published
+TOGETHER, which is the batched frame the hazard lives in. It cannot arrange that
+by calling pool methods from a ticker while the world streams around it.
+
+WHAT A WORKING PROBE NEEDS: the three mutations inside one
+UVoxelGpuPoolComponent::FScopedBatch, so they share a publication, with the
+readback after the scope closes. That is a small change to the probe and it is
+the next thing to do -- but it is a change to the HARNESS, and S2-1 remains
+unverified until it is made and passes.
+
+DO NOT read the accumulated FAIL results as evidence about the pass. Three of
+them were produced by a probe that could not have passed regardless of whether
+the code under test was correct.
 
 ============================================================================
 4. WHAT SHIPS

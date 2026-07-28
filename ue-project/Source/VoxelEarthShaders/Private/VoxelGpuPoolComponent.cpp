@@ -3635,6 +3635,19 @@ void UVoxelGpuPoolComponent::DebugGpuHideProbe(uint32 NumQuads)
 
 	// Publish: this is what drains PendingGpuWrites and PendingGpuHides into one
 	// command, in the order the fix depends on.
+	//
+	// DIAGNOSTIC, because the probe has failed on the CPU-shadow CONTROL three
+	// times and the cause is still unidentified. If LiveProxy is null or the
+	// table has outgrown MaxChunks, PushUpdatesToProxy takes a bail-out branch
+	// that resets the dirty state and defers everything to a render-state
+	// rebuild -- which is enqueued at end of frame and is NOT covered by the
+	// flush below, so the readback would race an upload that has not happened.
+	UE_LOG(LogTemp, Warning,
+	       TEXT("%s GpuHideProbe: pre-publish state -- liveProxy=%d batchDepth=%d dirtyRanges=%d "
+	            "tableDirty=%d runsDirty=%d chunkOrigins=%d pendingHides=%d"),
+	       *PoolName, LiveProxy != nullptr ? 1 : 0, BatchDepth, DirtyQuadRanges.Num(),
+	       bChunkTableDirty ? 1 : 0, bRunsDirty ? 1 : 0, ChunkOrigins.Num(), PendingGpuHides.Num());
+
 	PushUpdatesToProxy();
 	FlushRenderingCommands();
 
@@ -3653,9 +3666,19 @@ void UVoxelGpuPoolComponent::DebugGpuHideProbe(uint32 NumQuads)
 		}
 		FRDGBuilder GraphBuilder(RHICmdList);
 		FRDGBufferRef I = GraphBuilder.RegisterExternalBuffer(Buffers->ChunkIdPooled, TEXT("GpuHideProbe.Ids"));
-		// Copy from element 0 -- AddEnqueueCopyPass takes a byte count from the
-		// buffer start, so the range of interest is indexed after the harvest.
-		AddEnqueueCopyPass(GraphBuilder, Rb.Get(), I, (First + Count) * uint32(sizeof(uint32)));
+		// COPY THE SUB-RANGE INTO A SMALL BUFFER FIRST, then read THAT back.
+		//
+		// The first version enqueued the readback straight off the pool buffer
+		// with a byte count of (First + Count) -- i.e. from element 0 through the
+		// range of interest. First is around 16 million on a settled pool, so that
+		// asked for a ~64 MB readback to inspect a few thousand ids, and the
+		// probe then read zeros for everything. A staging copy of exactly the
+		// range wanted is both correct and three orders of magnitude smaller.
+		FRDGBufferRef Staging = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Count), TEXT("GpuHideProbe.Staging"));
+		AddCopyBufferPass(GraphBuilder, Staging, 0, I, uint64(First) * sizeof(uint32),
+		                  uint64(Count) * sizeof(uint32));
+		AddEnqueueCopyPass(GraphBuilder, Rb.Get(), Staging, Count * uint32(sizeof(uint32)));
 		GraphBuilder.Execute();
 	});
 	FlushRenderingCommands();
@@ -3674,7 +3697,7 @@ void UVoxelGpuPoolComponent::DebugGpuHideProbe(uint32 NumQuads)
 		[Rb, First, Count, Half, IdB, HiddenId,
 		 &HeadWrong, &TailWrong, &FirstBadIndex, &FirstBadValue, &bLocked](FRHICommandListImmediate&)
 	{
-		const uint32* Data = static_cast<const uint32*>(Rb->Lock((First + Count) * sizeof(uint32)));
+		const uint32* Data = static_cast<const uint32*>(Rb->Lock(Count * sizeof(uint32)));
 		if (Data == nullptr)
 		{
 			return;
@@ -3682,7 +3705,7 @@ void UVoxelGpuPoolComponent::DebugGpuHideProbe(uint32 NumQuads)
 		bLocked = true;
 		for (uint32 I = 0; I < Count; ++I)
 		{
-			const uint32 Got = Data[First + I];
+			const uint32 Got = Data[I];   // staging buffer starts AT First
 			const uint32 Want = (I < Half) ? IdB : HiddenId;
 			if (Got != Want)
 			{
