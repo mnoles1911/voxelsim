@@ -3450,6 +3450,14 @@ struct FVoxelWorldImpl
 	FVector PredictedAnchorLocation = FVector::ZeroVector;
 
 	double AccumDispatchMs = 0.0;
+	// Sub-total of AccumDispatchMs: the speculative half only. See task #21.
+	double AccumSpecDispatchMs = 0.0;
+	// Enumeration runs BEFORE the dispatch timer's T0, so it has never had a
+	// bucket at all -- it lands in tickMs and nowhere else. Counted here so the
+	// annulus walk can be ruled in or out rather than guessed at.
+	double AccumSpecEnumerateMs = 0.0;
+	// Speculative park work, done inline in the completion callback.
+	double AccumSpecParkMs = 0.0;
 	double AccumApplyMs = 0.0;
 	double AccumRemeshMs = 0.0;
 	double AccumUnloadMs = 0.0;
@@ -4321,9 +4329,42 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		// T4-1: enumerate the leading edge BEFORE dispatch, so anything queued
 		// this tick can be submitted this tick into whatever budget demand
 		// leaves. Cheap and a no-op while voxel.Stream.VelocityLeadSec is 0.
+		const double SpecEnumT0 = FPlatformTime::Seconds();
 		EnumerateSpeculativeCandidates();
+		AccumSpecEnumerateMs += (FPlatformTime::Seconds() - SpecEnumT0) * 1000.0;
 
-		const double T0 = FPlatformTime::Seconds();
+		// T0/T1 are declared out here and assigned inside the batch block for the
+		// same reason T2/T3/T3b already are: the scope has to CLOSE before T4 so
+		// the flush is inside the measured tick, but these are read by the
+		// attribution below it.
+		double T0 = 0.0;
+		double T1 = 0.0;
+		double T2 = 0.0;
+		double T3 = 0.0;
+		double T3b = 0.0;
+		{
+		T0 = FPlatformTime::Seconds();
+		// THE BATCH SCOPE STARTS HERE, NOT BELOW, AND T4-1 IS WHY.
+		//
+		// The comment on the scope below used to say it deliberately excluded
+		// this DispatchJobs because "that submits jobs and touches no pool
+		// state". That was true when it was written and T4-1 made it false:
+		// GpuMeshJobs->Tick() calls OnGpuMeshJobComplete, and a SPECULATIVE
+		// completion runs ParkSpeculativeResult inline -- AddChunkFromGpu plus
+		// ParkChunk, both pool mutations, on this side of the old scope.
+		//
+		// Outside the batch, each one published the whole chunk table on its own.
+		// Measured: specPark was 334.7 ms of a 343.9 ms dispatch bucket -- 97% of
+		// T4-1's entire game-thread cost, and precisely the per-mutation
+		// publication S1-1 removed for demand. Speculation was paying the bill
+		// S1-1 had already settled, because it entered the pool through a door
+		// the scope did not cover.
+		//
+		// The hazard argument is unchanged: AddChunkFromGpu still does the
+		// UnmarkQuadsDirty interval subtract that guards the
+		// free-then-reallocate-within-one-frame race, which is what makes any
+		// widening of this scope safe.
+		UVoxelGpuPoolComponent::FScopedBatch PoolBatch(GpuPool.Get());
 		DispatchJobs();
 		// Poll the GPU runner BETWEEN dispatch and drain (Wave D / D4).
 		//
@@ -4341,7 +4382,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		{
 			GpuMeshJobs->Tick();
 		}
-		const double T1 = FPlatformTime::Seconds();
+		T1 = FPlatformTime::Seconds();
 
 		// S1-1 (docs/speculative-generation-plan.md Wave S1): ONE pool
 		// publication for this whole tick instead of one per mutated chunk.
@@ -4372,15 +4413,12 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		// publication lands in ThisFrameUnloadMs rather than being spread across
 		// ApplyMs. The publication's real cost, split across both threads, is the
 		// `Voxel pool publish` line from S0-1 -- read that, not the unload bucket.
-		// Declared out here, assigned inside: the scope has to close before T4 so
-		// the flush is inside the measured tick, but these are read by the
-		// attribution below it.
-		double T2 = T1;
-		double T3 = T1;
-		double T3b = T1;
+		T2 = T1;
+		T3 = T1;
+		T3b = T1;
 		{
-			UVoxelGpuPoolComponent::FScopedBatch PoolBatch(GpuPool.Get());
-
+			// The batch is already open (see T0 above); this block keeps its
+			// original bounds for readability and for the T2/T3 timing points.
 			DrainResults(Owner, Root, Material);
 			T2 = FPlatformTime::Seconds();
 			DrainGameThreadMesh(Owner, Root, Material);
@@ -4425,6 +4463,7 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			}
 
 			DrainUnloads();
+		}
 		} // PoolBatch closes here -- the tick's single publication happens now.
 		const double T4 = FPlatformTime::Seconds();
 
@@ -4955,9 +4994,11 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	constexpr double WindowMs = 5000.0;
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel tick budget (5s window): ticks=%d tickMs=%.1f (%.2f%% of wall) | recompute=%.1f dispatch=%.1f ")
-	       TEXT("apply=%.1f remesh=%.1f unload=%.1f | perTick tick=%.3f recompute=%.3f"),
+	       TEXT("apply=%.1f remesh=%.1f unload=%.1f | specEnum=%.1f specDispatch=%.1f specPark=%.1f (of dispatch) ")
+	       TEXT("| perTick tick=%.3f recompute=%.3f"),
 	       AccumTicks, AccumTickMs, WindowMs > 0.0 ? 100.0 * AccumTickMs / WindowMs : 0.0, AccumRecomputeMs, AccumDispatchMs,
-	       AccumApplyMs, AccumRemeshMs, AccumUnloadMs, AccumTicks > 0 ? AccumTickMs / AccumTicks : 0.0,
+	       AccumApplyMs, AccumRemeshMs, AccumUnloadMs, AccumSpecEnumerateMs, AccumSpecDispatchMs, AccumSpecParkMs,
+	       AccumTicks > 0 ? AccumTickMs / AccumTicks : 0.0,
 	       AccumTicks > 0 ? AccumRecomputeMs / AccumTicks : 0.0);
 	// S0-2: apply throughput for THIS window, alongside the leg-long mean
 	// TotalChunksLoaded already gives on the "Voxel streaming" line above.
@@ -5545,6 +5586,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	AccumLevel0BricksSkippedAir = AccumLevel0BricksSkippedSolid = 0;
 
 	AccumDispatchMs = AccumApplyMs = AccumRemeshMs = AccumUnloadMs = AccumRecomputeMs = AccumTickMs = 0.0;
+	AccumSpecDispatchMs = AccumSpecEnumerateMs = AccumSpecParkMs = 0.0;
 	AccumTicks = 0;
 	JobsDispatchedSinceLog = ResultsDrainedSinceLog = StaleDiscardsSinceLog = ZeroQuadAppliesSinceLog = 0;
 	RecordsAddedSinceLog = RecordsEvictedSinceLog = CandidatesRejectedSinceLog = RecordsDroppedSinceLog = 0;
@@ -8253,7 +8295,16 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	if (Pending.bSpeculative)
 	{
 		SpeculativeInFlight.Remove(Pending.Key);
+		// TIMED. This runs inside Manager->Tick(), which the tick-budget line
+		// attributes to dispatch= -- so unlike a demand result (which only gets
+		// enqueued here and is applied later under apply=), speculation does its
+		// POOL WORK synchronously in the completion callback. That asymmetry is
+		// the leading explanation for T4-1's +260 ms/window: speculation's own
+		// enumerate and submit measured 0.7 ms and 0.6 ms, so the cost is not
+		// where it was first looked for.
+		const double ParkT0 = FPlatformTime::Seconds();
 		ParkSpeculativeResult(Pending.Key, GpuResult);
+		AccumSpecParkMs += (FPlatformTime::Seconds() - ParkT0) * 1000.0;
 		return;
 	}
 
@@ -9270,7 +9321,17 @@ void FVoxelWorldImpl::DispatchJobs()
 	// "queued=128 inFlight=128 dispatched=0" for a whole leg -- enumeration
 	// working, submission never running -- which looks exactly like a budget
 	// refusing speculation rather than a call site in the wrong scope.
+	// TIMED SEPARATELY (task #21). dispatch= in the tick-budget line covers
+	// demand dispatch, this call, and the post-drain second pass in one bucket,
+	// which is why T4-1's +264 ms/window could not be attributed: per job the
+	// speculative path costs 16x the demand path through the SAME
+	// SubmitGpuMeshJob, so the cost is per-tick overhead somewhere in here
+	// rather than per-submit. Still summed INTO AccumDispatchMs by the caller,
+	// so the existing bucket keeps its meaning; this is a sub-total, not a
+	// fifth phase.
+	const double SpecT0 = FPlatformTime::Seconds();
 	DispatchSpeculativeJobs();
+	AccumSpecDispatchMs += (FPlatformTime::Seconds() - SpecT0) * 1000.0;
 }
 
 UVoxelChunkComponent& FVoxelWorldImpl::AcquireChunkComponent(AActor& Owner, USceneComponent& Root)

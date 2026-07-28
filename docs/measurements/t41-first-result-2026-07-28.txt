@@ -265,3 +265,92 @@ bound is MaxInFlight, and the GPU sat at 19 of 256. Demand is protected
 STRUCTURALLY -- speculative jobs live in their own queue and promote only after
 demand has taken its full allowance -- so no second, weaker copy of that
 guarantee is needed at the submission site.
+
+============================================================================
+8. THE GAME-THREAD COST WAS 97% ONE THING, AND IT IS GONE
+============================================================================
+
+Section 4a recorded a +45% game-thread tick cost and refused to name a cause
+without a measurement. The split timer named it in one leg.
+
+  window                dispatch   specEnum  specDispatch  specPark
+  before (t41-cost2)      343.9        0.8        0.6         334.7
+  after  (t41-batchfix)    10.2        0.8        0.7           0.9
+
+specPark was 97% of the dispatch bucket. Speculation's OWN code -- enumerating
+the cone, submitting the jobs -- costs 1.4 ms per 5 s window combined, which is
+nothing. The cost was ParkSpeculativeResult.
+
+WHY. GpuMeshJobs->Tick() calls OnGpuMeshJobComplete, and a speculative
+completion runs ParkSpeculativeResult INLINE: AddChunkFromGpu plus ParkChunk,
+both pool mutations. That call sits at T0..T1, and S1-1's FScopedBatch did not
+open until after T1. Its comment said the scope deliberately excluded the first
+DispatchJobs because that "submits jobs and touches no pool state" -- true when
+written, and made false by T4-1.
+
+So every speculative park published the whole chunk table on its own. That is
+precisely the per-mutation publication S1-1 removed for demand, and speculation
+was paying it ~185 times per window because it entered the pool through a door
+the scope did not cover. Not a new cost: an old one, re-incurred.
+
+FIX: open the batch before GpuMeshJobs->Tick(). The hazard argument is
+unchanged -- AddChunkFromGpu still does the UnmarkQuadsDirty interval subtract
+that guards the free-then-reallocate-within-one-frame race, which is what makes
+widening this scope safe.
+
+RESULT (t41-batchfix vs t41-cost2, mid-flight windows):
+
+                       tickMs   % of wall   perTick   dispatch
+  speculation OFF       485.0      9.70%      7.133      10.4
+  ON, before fix        742.0     14.84%     10.600     343.9
+  ON, after fix         469.5      9.39%      7.335      10.0
+
+T4-1's game-thread cost is now INSIDE THE NOISE of having it switched off.
+Nothing else moved: chunks/s 1070.3 vs 1070.9, flight holes med 57 vs 56,
+poolPct 86.8 both, allocFail 0, park hit 89% both.
+
+PARKING WAS NOT ZEROED. Worth stating explicitly, because task #17 records that
+wrapping RecomputeDesiredSet in an FScopedBatch took parking from 28,117 to
+exactly zero and was reverted undiagnosed. Widening the scope over the manager
+tick does NOT reproduce that: parked=44,727 adopted=39,727 hit=89%, identical to
+the unwidened leg. Whatever #17 is, it is specific to RecomputeDesiredSet.
+
+============================================================================
+9. S4-3 CORRECTNESS GATES
+============================================================================
+
+  voxel.GPU.VerifyPoolWrite 16 4     PASS. Byte-identical to MeshChunkBricks,
+                                     16/16 chunks in the pool buffer, quadFail=0
+                                     idFail=0 guardFail=0 countMismatch=0
+                                     doubleDelivered=0, poolDirectWrites=16
+                                     dropped=0.
+  VoxelEarth.GpuPool automation      4/4 PASS (Basic, Coalesce, DirtyRanges,
+                                     Soak), 0 failures.
+  ctest voxel-core                   2/2 PASS.
+  CoverageVerify                     green on all 16 legs; holes(final)=0.
+  GetGpuDirectWritesDropped          0 on every window of every leg.
+
+  voxel.Stream.PoolClobberSession    RAN, NO EFFECT DETECTED -- WITH A CAVEAT
+                                     THAT SHOULD BE READ.
+
+The clobber session's verdict is a screenshot triple: A/B is the same-session
+noise floor, B/C is the effect, and B/C ~ A/B means the buffers were rebound.
+
+  settle 45 s:   A/B mean=41.68   B/C mean=23.24
+  settle 130 s:  A/B mean=45.30   B/C mean=32.81
+
+B/C is BELOW the floor on both runs, so by the test's own criterion it passes.
+But a noise floor of mean 45/255 is enormous, and it did not shrink when the
+settle was nearly tripled -- the scene never goes static (water animation and
+temporal accumulation keep every frame different from the last). So this gate
+has power against GROSS corruption only, and calling it a clean pass would
+overstate it.
+
+That is a property of the harness, not of T4-1, and it predates this wave. The
+direct evidence that speculation's pool writes are correct is VerifyPoolWrite's
+byte-identical PASS, not this.
+
+NOTE ON A FIRST ATTEMPT: voxel.Stream.PoolClobberTest issued via -ExecCmds at
+startup logs "no live pool component -- nothing to test" and exits 0. A gate
+that no-ops and returns success is the exact shape ground rule 13 warns about;
+it must be run via PoolClobberSession, which settles first.
