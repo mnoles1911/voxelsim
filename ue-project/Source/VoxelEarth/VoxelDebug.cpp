@@ -507,6 +507,16 @@ TAutoConsoleVariable<int32> CVarVoxelStreamAdmissionRecordCap(
 // It feeds ONLY speculative enumeration. Admission, eviction and retention all
 // stay on the true anchor: evicting against a forward-shifted centre would
 // delete ground behind the camera that is still on screen.
+// TASK #17 REPRODUCER. 1 = wrap RecomputeDesiredSet in a pool FScopedBatch.
+// Known to take parking to exactly zero; kept only so the park-refusal counters
+// can say WHY. Never ship at 1.
+TAutoConsoleVariable<int32> CVarVoxelStreamBatchRecompute(
+	TEXT("voxel.Stream.BatchRecompute"),
+	0,
+	TEXT("1 = open a pool batch scope around RecomputeDesiredSet. EXPERIMENT ONLY: this is the "
+	     "configuration that zeroed parking (task #17). Read the park census refusal counters with it on."),
+	ECVF_Default);
+
 TAutoConsoleVariable<float> CVarVoxelStreamVelocityLeadSec(
 	TEXT("voxel.Stream.VelocityLeadSec"),
 	0.0f,
@@ -950,6 +960,11 @@ int32 VoxelDebug::GetStreamDispatchAfterDrain()
 int32 VoxelDebug::GetStreamAdmissionRecordCap()
 {
 	return FMath::Max(0, CVarVoxelStreamAdmissionRecordCap.GetValueOnGameThread());
+}
+
+int32 VoxelDebug::GetStreamBatchRecompute()
+{
+	return CVarVoxelStreamBatchRecompute.GetValueOnGameThread();
 }
 
 float VoxelDebug::GetStreamVelocityLeadSec()

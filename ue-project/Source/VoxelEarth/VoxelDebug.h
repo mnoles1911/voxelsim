@@ -332,6 +332,7 @@ namespace VoxelDebug
 	// T4-1 speculative generation. VelocityLeadSec 0 = off (the whole feature).
 	// The lead feeds speculative enumeration ONLY -- admission, eviction and
 	// retention stay on the true anchor. See the cvars' source comments.
+	VOXELEARTH_API int32 GetStreamBatchRecompute();
 	VOXELEARTH_API float GetStreamVelocityLeadSec();
 	VOXELEARTH_API float GetStreamVelocityLeadMaxUU();
 	VOXELEARTH_API int32 GetStreamSpeculativeMaxParked();

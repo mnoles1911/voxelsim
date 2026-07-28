@@ -4319,7 +4319,24 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		// chunks/s 1,040 -> 540, and the world was still churning at the end of
 		// the linger. Cause not established; the scope is the only delta between
 		// the two legs. Do not re-apply without diagnosing that first.
-		RecomputeDesiredSet(Anchor);
+		// TASK #17, BEHIND A GATE. Wrapping this call in an FScopedBatch took
+		// parking from 28,117 parks (84% hit) to EXACTLY ZERO, reproducibly, and
+		// was reverted undiagnosed. "Exactly zero" means either ParkChunkGeometry
+		// stopped being called or one of its refusals became universal, and the
+		// park census now counts all four refusals separately, so one leg with
+		// this on distinguishes them.
+		//
+		// Default 0. This is an experiment, not a feature: it made things
+		// measurably worse and nothing here claims to have fixed that.
+		if (VoxelDebug::GetStreamBatchRecompute() != 0)
+		{
+			UVoxelGpuPoolComponent::FScopedBatch RecomputeBatch(GpuPool.Get());
+			RecomputeDesiredSet(Anchor);
+		}
+		else
+		{
+			RecomputeDesiredSet(Anchor);
+		}
 		LastAnchorChunk = AnchorChunk;
 		bHasRecomputed = true;
 	}
