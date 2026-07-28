@@ -71,3 +71,23 @@ foreach ($name in $LogName) {
 }
 
 if ($rows.Count) { $rows | Format-Table -AutoSize | Out-String -Width 200 | Write-Host }
+
+# ---------------------------------------------------------------------------
+# A NOTE ON READING THESE LOGS, learned expensively on 2026-07-27/28.
+#
+# This script deliberately reports LEG-WIDE aggregates, never a sampled window.
+# Every phase-sampling shortcut tried during that session produced a confident
+# wrong reading:
+#
+#   * `sed -n '30p;50p'` on the GPU fork census landed in preflight/linger and
+#     read "L0=0 ... L5=0" -- which looks exactly like the GPU mesher being off.
+#     It had dispatched 18,308 jobs on that leg.
+#   * `tail -1` on the tick budget compared one leg's idle linger against
+#     another leg's mid-flight churn and made them look wildly different.
+#   * Reading any log before it reached ~130 windows read a partial flight as a
+#     slow configuration, three separate times.
+#
+# The flight profile has three phases with completely different characteristics
+# (90 s preflight fill, 120 s flight, 60 s linger). Any single window is a
+# statement about a phase, not about a configuration. If a per-phase number is
+# genuinely needed, say which phase it came from in whatever you write.
