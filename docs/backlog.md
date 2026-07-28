@@ -62,19 +62,23 @@ of slack to absorb it.
 must reduce render-thread work.
 
 **The tail is GPU.** The largest slow-frame delta is `renderWait` (+12.3 / +10.1
-ms against a frame delta of +16.5 / +13.3) — the render thread blocked. The voxel
-tick does rise on slow frames (+5.1 ms), which is exactly why it looked causal;
-it is a passenger, because a frame where lots of terrain arrives has more
-streaming work *and* more GPU work, and only the second is on the critical path.
+ms against a frame delta of +16.5 / +13.3) — the render thread blocked.
+
+*The CPU voxel tick rises on slow frames (+5.1 ms) and was called "a passenger"
+here. **The GPU capture partly reversed that:** the CPU tick is indeed a
+passenger, but the GPU side of streaming — `WorldTick`, the meshing compute
+passes — is **3.6–5.1 ms, 21–28% of the GPU frame**, and it IS on the critical
+path. A frame with more terrain arriving has a longer GPU frame and therefore
+more `renderWait`. See `docs/measurements/gpu-capture-2026-07-28.txt`.*
 
 **Shadow cascades are not involved.** `shadowGather=0` throughout and ~1.03
 gathers per frame — the "pool re-gathered 4–5× for shadows" hypothesis is dead.
 
 **The cull walks the whole pool every frame:** 62,657 runs frustum-tested per
-gather, of which only ~10,300 survive. At the 45–90 ns per test recorded at
-Wave G that is ~4.4 ms — roughly a third of the render thread — and it scales
-with *resident* chunks, not visible ones. **This is now the best-supported single
-item on the list** (see 0.1a).
+gather, of which only ~10,300 survive — and it scales with *resident* chunks, not
+visible ones. *(An estimate of ~4.4 ms once stood here, derived from the 45–90 ns
+per test recorded at Wave G. Measured, it is ~1.0 ms — see 0.1a. Do not use the
+Wave G figure.)*
 
 ### 0.1a NEW P0 — Cheaper per-range binding (the emit, not the walk)
 
@@ -168,7 +172,9 @@ the difference between the stated goal being met and not.
 visual quality.**
 
 The cull is frustum-only. It already rejects 68% of chunks (41,946 of 62,119),
-but at ~7.8 triangles per pixel at 2K most survivors are behind something.
+but most survivors are behind something: the GPU capture shows 17.8M primitives
+submitted per pass, TWICE per frame, into an internal render target of 1552x873
+(TSR upscales to 2560x1440) — roughly 11 triangles per rendered pixel.
 Terrain occludes itself heavily — a ground-level camera sees a few hundred metres
 of surface and nothing past the first ridge.
 
@@ -223,9 +229,10 @@ Prerequisites and hazards:
   and a converged `CoverageVerify`, and add a debug mode that draws what
   occlusion rejected — the sibling of `GPUCullDebugAllVisible`.
 
-**Worth:** unmeasured, but the ceiling is high. If half the in-frustum geometry
-is occluded, drawn quads roughly halve, and the draw path responds to geometry
-volume at ~0.4 ms per million quads.
+**Worth:** unmeasured, but with the prepass struck (0.1c) this is now the
+LARGEST remaining item — and uniquely, it cuts BOTH passes, since PrePass and
+BasePass each submit the same 17.8M primitives. If half the in-frustum geometry
+is occluded, both passes shrink together.
 
 ---
 
