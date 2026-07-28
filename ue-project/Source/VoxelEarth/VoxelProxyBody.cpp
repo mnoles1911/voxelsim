@@ -161,5 +161,12 @@ void UVoxelProxyBodyComponent::UpdateAnimation(float DeltaTime, double Horizonta
 	// location (which lives in PARENT space, and the parent is the unscaled
 	// pawn root) -- so the bob stays the same physical size in both stances
 	// with no compensation needed.
+	//
+	// Parent space is also PITCHED (the pawn pitches its root with the
+	// controller; AVoxelEarthFlyPawn::Tick counter-rotates this component to
+	// yaw-only, but that fixes its ROTATION, not the frame this offset is
+	// expressed in). So at extreme pitch the idle bob leans by up to
+	// ProxyBobAmplitudeUU * sin(pitch) ~= 1 UU. Left alone deliberately: that is
+	// 1 cm on a breathing animation that fades out entirely as soon as you move.
 	SetRelativeLocation(FVector(0.0, 0.0, BobOffset));
 }
