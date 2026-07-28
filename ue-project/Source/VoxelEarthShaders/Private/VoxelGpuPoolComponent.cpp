@@ -252,6 +252,23 @@ namespace VoxelGpuPoolCull
 	// against the incrementally maintained one, logging the first divergence.
 	// The -VoxelCoarseGridVerify pattern: a parallel structure maintained by
 	// mutation is only trustworthy with a checker that can be switched on.
+	// --- GATHER TIMING (voxel.Stream.GPUCullTiming) -------------------------
+	//
+	// Microseconds, thread-safe counters, reported and reset by the pool census.
+	// Split WALK from EMIT because they scale with different things and have
+	// different fixes -- see the call site.
+	static FThreadSafeCounter64 GWalkCycles;
+	static FThreadSafeCounter64 GEmitCycles;
+	static FThreadSafeCounter64 GWalkRuns;
+	static FThreadSafeCounter GWalkGathers;
+	static FThreadSafeCounter GEmitRanges;
+	static int32 GTimingEnabled = 0;
+	static FAutoConsoleVariableRef CVarTimingEnabled(
+		TEXT("voxel.Stream.GPUCullTiming"), GTimingEnabled,
+		TEXT("1 = time the cull WALK (scales with resident chunks) and the range EMIT (scales with "
+		     "surviving ranges, one uniform buffer each) separately, and report both in the pool census."),
+		ECVF_RenderThreadSafe);
+
 	static int32 GRunsVerify = 0;
 	static FAutoConsoleVariableRef CVarRunsVerify(
 		TEXT("voxel.Stream.PoolRunsVerify"), GRunsVerify,
@@ -813,10 +830,27 @@ public:
 			uint32 VisibleQuadsThisGather = 0;
 			ECullOutcome Outcome = ECullOutcome::Ranges;
 			const bool bCull = VoxelGpuPoolCull::IsEnabled() && Runs.Num() > 0 && NumQuads > 0;
+			// GATHER TIMING (voxel.Stream.GPUCullTiming). The render thread IS the
+			// frame -- 13.49 ms of a 13.41 ms frame, with the game thread waiting
+			// 10 ms of it -- so this is where frame rate is decided, and the two
+			// halves of it have completely different fixes. The WALK scales with
+			// resident chunks (62,657 box tests whatever survives); the EMIT scales
+			// with surviving ranges (~8,000 CreateUniformBufferImmediate calls).
+			// Sizing either fix against a single combined number would repeat the
+			// mistake that produced the streaming-tick null result.
+			const bool bTiming = VoxelGpuPoolCull::GTimingEnabled != 0;
+			const double WalkStart = bTiming ? FPlatformTime::Seconds() : 0.0;
 			if (bCull)
 			{
 				BuildCulledRanges(*Views[ViewIndex], Ranges, VisibleQuadsThisGather, Outcome);
 			}
+			if (bTiming)
+			{
+				VoxelGpuPoolCull::GWalkCycles.Add(int64((FPlatformTime::Seconds() - WalkStart) * 1e6));
+				VoxelGpuPoolCull::GWalkRuns.Add(Runs.Num());
+				VoxelGpuPoolCull::GWalkGathers.Increment();
+			}
+			const double EmitStart = bTiming ? FPlatformTime::Seconds() : 0.0;
 
 			// EVERYTHING THIS GATHER COULD SEE IS ABOVE THE SHADOW CAP. Draw
 			// nothing and submit nothing -- do NOT fall through to the full-pool
@@ -982,6 +1016,7 @@ public:
 						Element.NumInstances = 1;
 						Element.PrimitiveUniformBuffer = GetUniformBuffer();
 						Element.UserData = &RangeData;
+						if (bTiming) { VoxelGpuPoolCull::GEmitRanges.Increment(); }
 					}
 
 					// Counted BEFORE the batch is handed over, per batch, so the
@@ -1005,6 +1040,12 @@ public:
 				}
 
 				RecordGather(*Views[ViewIndex], SubmittedQuadsThisGather, VisibleQuadsThisGather);
+			}
+			if (bTiming)
+			{
+				// Everything after the walk: range/batch emission, the per-range
+				// uniform buffer, and Collector.AddMesh.
+				VoxelGpuPoolCull::GEmitCycles.Add(int64((FPlatformTime::Seconds() - EmitStart) * 1e6));
 			}
 		}
 	}
@@ -3270,6 +3311,24 @@ int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& In
 // Sorted insert. Runs never overlap -- a pool offset belongs to exactly one
 // allocation -- so FirstQuad is a unique key and a lower-bound search finds the
 // one position that keeps the array ordered.
+// Drains the gather timers. Reported by the streaming census so walk and emit
+// sit next to the run counts they scale with.
+UVoxelGpuPoolComponent::FCullTiming UVoxelGpuPoolComponent::GetAndResetCullTiming()
+{
+	FCullTiming Out;
+	Out.WalkUs   = VoxelGpuPoolCull::GWalkCycles.GetValue();
+	Out.EmitUs   = VoxelGpuPoolCull::GEmitCycles.GetValue();
+	Out.RunsSeen = VoxelGpuPoolCull::GWalkRuns.GetValue();
+	Out.Gathers  = VoxelGpuPoolCull::GWalkGathers.GetValue();
+	Out.Ranges   = VoxelGpuPoolCull::GEmitRanges.GetValue();
+	VoxelGpuPoolCull::GWalkCycles.Reset();
+	VoxelGpuPoolCull::GEmitCycles.Reset();
+	VoxelGpuPoolCull::GWalkRuns.Reset();
+	VoxelGpuPoolCull::GWalkGathers.Reset();
+	VoxelGpuPoolCull::GEmitRanges.Reset();
+	return Out;
+}
+
 void UVoxelGpuPoolComponent::InsertLiveRun(uint32 ChunkId, uint32 FirstQuad, uint32 NumQuads)
 {
 	if (NumQuads == 0 || ChunkId == kHiddenChunkId)

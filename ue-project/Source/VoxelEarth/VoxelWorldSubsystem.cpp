@@ -4921,6 +4921,23 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		// voxel.Stream.PoolRecycleHandles on, this is the fix in flight: allocsEver
 		// should stop climbing (steady state reuses freeHandles instead of
 		// appending) once churn saturates the free list.
+		{
+			// GATHER TIMING. The render thread is the frame (13.49 ms of a 13.41 ms
+			// frame, game thread waiting 10 ms of it), so this is the breakdown
+			// that decides what to optimise for frame rate.
+			const UVoxelGpuPoolComponent::FCullTiming CT =
+				UVoxelGpuPoolComponent::GetAndResetCullTiming();
+			if (CT.Gathers > 0)
+			{
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("Voxel cull timing (5s window): gathers=%d | walk=%.1f ms (%.3f ms/gather, "
+				            "%lld runs seen) | emit=%.1f ms (%.3f ms/gather, %d ranges) | walk+emit=%.1f ms"),
+				       CT.Gathers, CT.WalkUs / 1000.0, CT.WalkUs / 1000.0 / double(CT.Gathers),
+				       (long long)CT.RunsSeen,
+				       CT.EmitUs / 1000.0, CT.EmitUs / 1000.0 / double(CT.Gathers), CT.Ranges,
+				       (CT.WalkUs + CT.EmitUs) / 1000.0);
+			}
+		}
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel GPU pool: liveChunks=%d highWater=%u free=%u largestRun=%u freeRuns=%d ")
 		       TEXT("capacityPct=%.1f allocFail=%lld allocFailQuads=%lld allocsEver=%d freeHandles=%d -- ")

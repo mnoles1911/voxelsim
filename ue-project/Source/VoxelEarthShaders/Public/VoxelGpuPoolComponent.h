@@ -775,6 +775,21 @@ private:
 	// voxel.Stream.PoolRunsVerify rebuilds from scratch and byte-compares.
 	TArray<FChunkRun> LiveRunsSorted;
 	void InsertLiveRun(uint32 ChunkId, uint32 FirstQuad, uint32 NumQuads);
+
+public:
+	// voxel.Stream.GPUCullTiming. Microseconds since the last drain, plus the
+	// counts each half scales with.
+	struct FCullTiming
+	{
+		int64 WalkUs = 0;
+		int64 EmitUs = 0;
+		int64 RunsSeen = 0;
+		int32 Gathers = 0;
+		int32 Ranges = 0;
+	};
+	static FCullTiming GetAndResetCullTiming();
+
+private:
 	void RemoveLiveRun(uint32 FirstQuad);
 
 	// See GetGpuDirectWrites. The DROPPED half lives on FVoxelGpuPoolBuffers,

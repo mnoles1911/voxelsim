@@ -76,16 +76,44 @@ Wave G that is ~4.4 ms — roughly a third of the render thread — and it scale
 with *resident* chunks, not visible ones. **This is now the best-supported single
 item on the list** (see 0.1a).
 
-### 0.1a NEW P0 — Hierarchical cull
+### 0.1a NEW P0 — Cheaper per-range binding (the emit, not the walk)
 
-Stop testing 62,657 boxes individually. Runs are sorted by pool offset and
-streaming fills the pool in roughly spatial order, so grouping every N
-consecutive runs under one bound lets a single test reject thousands. Worth up
-to ~4 ms of a ~13 ms render thread, costs **no visual quality**, and is contained
-entirely within the cull.
+**Measured with `voxel.Stream.GPUCullTiming`.** The render thread's 13.72 ms:
 
-Confirm the ~4.4 ms with a direct timer first — it is derived from a per-test
-figure recorded at Wave G, not re-measured.
+| | per gather (~1/frame) |
+|---|---|
+| cull **walk** — 62,657 box tests | **~1.0 ms** |
+| range **emit** — ~6,215 ranges | **~3.2 ms** |
+| **not the voxel pool at all** | **~9.5 ms** |
+
+**The ~4.4 ms walk estimate was wrong by 4×** — it multiplied 62,657 by the
+45–90 ns/test recorded at Wave G; measured, it is ~17 ns. That hoist works far
+better than its own comment claims.
+
+So **the emit is the pool's real cost**, and its shape is one
+`CreateUniformBufferImmediate` per range — exactly what the `kMaxRanges` comment
+warned about. The fix is *not* fewer ranges (that trades straight back into
+over-draw) but a cheaper binding: **one structured buffer of `BaseQuad` values
+indexed by the element**, instead of ~6,215 individual uniform buffers.
+
+*Interaction to remember:* the draw-path retune took ranges 1,023 → ~6,215 to
+kill over-draw. Large net win (p50 30.59 → 15.15 ms), but it bought ~2.7 ms of
+emit. If the per-range cost falls, the gap/ranges optimum moves and that sweep
+should be re-run.
+
+**Hierarchical cull is demoted** — it attacks the ~1 ms walk, not 4 ms. Real, no
+visual cost, but rank it accordingly.
+
+### 0.1b NEW P0 — What is the other ~9.5 ms?
+
+The largest single unexplained block in the frame, and **bigger than everything
+the streaming programme has optimised put together.** The voxel pool is only
+~4.2 ms of the 13.7 ms render thread; the rest is `AVoxelClipmapActor` (the 30 km
+heightfield), the water subsystem and its pool, sky, and the base/post chain.
+
+Already ruled out: anything pixel-proportional (resolution is free). Break it
+down with UE's render-thread stats or a ProfileGPU capture **before** sizing any
+work against it.
 
 <details><summary>Superseded framing (kept — this is the hypothesis that was falsified)</summary>
 

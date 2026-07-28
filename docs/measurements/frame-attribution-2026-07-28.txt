@@ -70,9 +70,13 @@ re-gathered 4-5 times per frame for shadows is dead. (Raised, tested, dropped --
 before anything was built on it.)
 
 **The cull walks the WHOLE pool every frame.** 62,657 runs frustum-tested per
-gather. The code's own note puts each test at 45-90 ns after the Wave G hoist,
-so 62,657 x ~70 ns is roughly 4.4 ms -- about a third of the 13.5 ms render
-thread, spent deciding what to draw rather than drawing it.
+gather.
+
+  *** THE 4.4 ms ESTIMATE THAT ONCE STOOD HERE WAS WRONG BY 4x. *** It came from
+  multiplying 62,657 by the 45-90 ns per test recorded at Wave G. Measured
+  directly with voxel.Stream.GPUCullTiming the walk is 0.95-1.00 ms per gather,
+  about 17 ns per test -- the Wave G hoist works considerably better than its own
+  comment claims. Section 6 has the real split.
 
 That cost scales with RESIDENT chunks, not with visible ones. Only ~10,300
 survive the frustum; the other ~52,000 are tested and rejected individually,
@@ -113,4 +117,65 @@ Ranked by what the evidence supports:
   affect p50/p95 or the bucket means.
 - The 45-90 ns per box test is the figure recorded in the code at Wave G, not
   something re-measured here. The ~4.4 ms follows from it and should be confirmed
-  with a direct timer before sizing work against it.
+  with a direct timer before sizing work against it. *(Done -- section 6. It was
+  wrong by 4x, which is why that caveat was written.)*
+
+============================================================================
+6. THE REAL SPLIT, MEASURED (voxel.Stream.GPUCullTiming)
+============================================================================
+
+Same leg, two mid-flight windows:
+
+  gathers=103 | walk=97.4 ms (0.945 ms/gather, 5,521,556 runs seen)
+              | emit=324.6 ms (3.151 ms/gather, 640,181 ranges)
+  gathers=104 | walk=103.6 ms (0.996 ms/gather, 5,884,549 runs seen)
+              | emit=353.5 ms (3.399 ms/gather, 691,806 ranges)
+
+At ~1.03 gathers per frame that is per-frame cost, so the render thread's
+13.72 ms breaks down as:
+
+  ~1.0 ms   cull WALK    62,657 box tests, scales with RESIDENT chunks
+  ~3.2 ms   range EMIT   ~6,215 ranges/gather, each one
+                         CreateUniformBufferImmediate, scales with SURVIVING
+                         ranges
+  ~9.5 ms   NOT THE VOXEL POOL AT ALL
+
+TWO CONCLUSIONS, AND BOTH CHANGE THE PLAN.
+
+**A hierarchical cull is no longer the best item.** It attacks the walk, which is
+~1 ms rather than the 4.4 ms claimed. Still real and still free of visual cost,
+but it is a ~1 ms item and should be ranked as one.
+
+**The emit is the pool's real render-thread cost, at 3.2 ms.** Its shape is one
+single-frame uniform buffer per range -- precisely the cost the kMaxRanges
+comment warned about ("the per-gather count of those scales with this and not
+with the batch count"). The fix is NOT fewer ranges, which trades straight back
+into over-draw, but a cheaper per-range binding: one structured buffer of
+BaseQuad values indexed by the element, instead of ~6,215 individual uniform
+buffers.
+
+NOTE THE INTERACTION THIS CREATES. The draw-path retune took ranges from 1,023 to
+~6,215 to eliminate over-draw, and that was a large net win (p50 30.59 ->
+15.15 ms) -- but it also bought ~2.7 ms of emit cost. The gap/ranges sweep
+measured the TOTAL and found the current point best, so nothing there is wrong.
+If the per-range cost falls, the optimum moves and that sweep should be re-run.
+
+============================================================================
+7. WHAT IS THE OTHER ~9.5 ms?
+============================================================================
+
+STILL UNKNOWN, and now the largest single unexplained block in the frame.
+
+The voxel pool accounts for ~4.2 ms of a 13.7 ms render thread. The rest is
+everything else in the scene: AVoxelClipmapActor (the 30 km heightfield mesh),
+the water subsystem and its own pool, sky, and the base pass and post chain for
+all of it.
+
+Already ruled out: anything PIXEL-proportional. Resolution is free here (2.56x
+the pixels for zero cost), so post-processing, shading and fill cannot be a large
+share of it.
+
+Do not size further work against this number until it is broken down. The obvious
+next step is UE's own render-thread stats or a ProfileGPU capture. Worth stating
+plainly: this block is larger than everything the streaming programme has
+optimised put together.
