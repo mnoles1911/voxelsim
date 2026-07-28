@@ -545,6 +545,18 @@ TAutoConsoleVariable<int32> CVarVoxelStreamBatchRecompute(
 // reaches. So the cheapest setting is also the best one, and anything that
 // scales with lead should be sized for ~2 s rather than 8.
 // Detail: docs/measurements/t41-first-result-2026-07-28.txt
+// Chunks trimmed from EACH END of the speculative surface band. 0 = off.
+// See the call site: the empties cluster at both ends and never the middle, and
+// an over-trim costs hit rate rather than holes because demand still loads
+// anything speculation skips.
+TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeZTrim(
+	TEXT("voxel.Stream.SpeculativeZTrim"),
+	0,
+	TEXT("Chunks trimmed from each end of the speculative Z band. Cuts zero-quad speculative dispatches, "
+	     "which cost real GPU (meshing is 21-28% of the GPU frame). Cannot cause holes -- demand still "
+	     "loads whatever speculation skips."),
+	ECVF_Default);
+
 // DEFERRED CONSOLE EXEC, because -ExecCmds fires before the world exists.
 //
 // This is the third time that ordering has cost a run. voxel.Stream.PoolClobberTest
@@ -1075,6 +1087,11 @@ int32 VoxelDebug::GetStreamAdmissionRecordCap()
 int32 VoxelDebug::GetStreamBatchRecompute()
 {
 	return CVarVoxelStreamBatchRecompute.GetValueOnGameThread();
+}
+
+int32 VoxelDebug::GetStreamSpeculativeZTrim()
+{
+	return FMath::Max(0, CVarVoxelStreamSpeculativeZTrim.GetValueOnGameThread());
 }
 
 int32 VoxelDebug::GetStreamFrameAttribution()

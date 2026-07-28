@@ -96,9 +96,35 @@ better than its own comment claims.
 
 So **the emit is the pool's real cost**, and its shape is one
 `CreateUniformBufferImmediate` per range — exactly what the `kMaxRanges` comment
-warned about. The fix is *not* fewer ranges (that trades straight back into
-over-draw) but a cheaper binding: **one structured buffer of `BaseQuad` values
-indexed by the element**, instead of ~6,215 individual uniform buffers.
+warned about.
+
+**THE OBVIOUS FIX IS ALREADY FALSIFIED — read this before starting.** The
+appealing version is to drop the per-range uniform buffer entirely by putting the
+range's start in `FMeshBatchElement::BaseVertexIndex` and letting the shader
+derive the quad from `SV_VertexID` alone. `VoxelQuadVertexFactory.ush` records
+that this was tried and MEASURED:
+
+> *SV_VertexID does not include the draw's base vertex on D3D12
+> (`RHISupportsAbsoluteVertexID` is Vulkan-only), so a draw that starts at pool
+> quad F still sees VertexId running from 0 … tiling the pool into N exact
+> contiguous ranges drew only the first 1/N of it at N = 2, 8 and 64 while still
+> paying for every quad.*
+
+So every draw genuinely must be told its base explicitly on this RHI. The
+remaining routes, neither cheap:
+
+  - **per-instance vertex stream.** One entry per range holding `BaseQuad`, with
+    each draw's `StartInstanceLocation` selecting its entry. Instance *fetch*
+    honours the start location even though `SV_InstanceID` (like `SV_VertexID`)
+    does not, which is the standard workaround. Needs vertex-factory stream work.
+  - **cached multi-frame uniform buffers.** Keep a persistent ring sized to
+    `kMaxRanges` and `RHIUpdateUniformBuffer` instead of creating ~6,215 per
+    frame. Cheaper per range, but the single-frame lifetime exists precisely so a
+    buffer is not rewritten while an in-flight draw still references it — the ring
+    depth is the correctness argument and must be reasoned about, not guessed.
+
+Either way this is vertex-factory work, not a call-site change, and it should be
+planned as such.
 
 *Interaction to remember:* the draw-path retune took ranges 1,023 → ~6,215 to
 kill over-draw. Large net win (p50 30.59 → 15.15 ms), but it bought ~2.7 ms of

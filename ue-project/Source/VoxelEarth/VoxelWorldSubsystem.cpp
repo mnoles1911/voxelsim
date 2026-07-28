@@ -10085,7 +10085,35 @@ void FVoxelWorldImpl::EnumerateSpeculativeCandidates()
 				continue; // no surface band here
 			}
 
-			for (int32 Cz = ChunkZMin; Cz <= ChunkZMax && Queued < QueueBudget; ++Cz)
+			// TRIM THE BAND ENDS (voxel.Stream.SpeculativeZTrim).
+			//
+			// 49% of speculative dispatches return zero quads, and the empties
+			// sit at BOTH ends of the surface band and never in the middle
+			// (measured top=62-73, mid=0, bot=111-129). "Zero quads" covers
+			// all-solid as well as all-air -- a fully buried chunk has no visible
+			// faces -- which is exactly the shape of a band whose ends overshoot
+			// the geometry.
+			//
+			// SAFE TO BE AGGRESSIVE, and that is the whole reason this is a blunt
+			// trim rather than an analytic test. Speculation is OPTIONAL by
+			// construction: a candidate it skips is still loaded by demand through
+			// the normal path, so an over-trim costs HIT RATE and cannot cost a
+			// hole. Contrast the demand-side buried skip, where being wrong means
+			// missing terrain.
+			//
+			// The GPU capture is why this is worth doing at all: meshing is
+			// 3.6-5.1 ms, 21-28% of the GPU frame, so a dispatch that produces
+			// nothing is real GPU on the critical path -- not the "spare capacity
+			// that was idle anyway" it was written off as.
+			const int32 ZTrim = VoxelDebug::GetStreamSpeculativeZTrim();
+			const int32 SpecZMin = ChunkZMin + ZTrim;
+			const int32 SpecZMax = ChunkZMax - ZTrim;
+			if (SpecZMax < SpecZMin)
+			{
+				continue; // trimmed away entirely; demand will handle this column
+			}
+
+			for (int32 Cz = SpecZMin; Cz <= SpecZMax && Queued < QueueBudget; ++Cz)
 			{
 				const FVoxelLevelChunkKey Key{ Level, FVoxelChunkKey{ ColumnKey.X, ColumnKey.Y, Cz } };
 				if (ChunkRecords.Contains(Key) || ParkedGeometry.Contains(Key) || SpeculativeInFlight.Contains(Key))
