@@ -1,0 +1,109 @@
+S2-1 GPU HIDE PASS: BUILT, GATED OFF, AND *NOT* VERIFIED
+2026-07-28
+
+STATUS: voxel.Stream.PoolGpuHide ships at 0. The pass is written and builds, but
+its forced probe does not yet produce a trustworthy verdict, so nothing here
+should be read as evidence that the pass is correct. S2-5 (dropping the CPU
+shadow) stays blocked on this.
+
+============================================================================
+1. A RETRACTION, RECORDED BECAUSE IT WAS NEARLY PUBLISHED AS A FINDING
+============================================================================
+
+The probe's first verdict was:
+
+  FAIL - 3084 of 3084 HEAD quads do not name the new chunk 45173 (read 0).
+  The hide ran AFTER the write and blanked live geometry.
+
+That was reported as "the forced probe caught a real bug", and a fix was built
+on it: UnmarkGpuHide, an interval subtract removing a re-allocated range from
+any pending hide (the mirror of UnmarkQuadsDirty, and the thing plan S2-1
+actually specified, rather than the pass ordering that was implemented first).
+
+Then the CONTROL was run -- the same probe with voxel.Stream.PoolGpuHide 0, i.e.
+against the shipped CPU-shadow path that has been correct for weeks:
+
+  FAIL - 3119 of 3119 HEAD quads do not name the new chunk 25655 (read 0).
+
+IDENTICAL FAILURE ON A PATH THAT IS KNOWN GOOD. So the probe is wrong, not
+S2-1, and the "real bug caught" claim is withdrawn.
+
+WHY IT WAS BELIEVABLE, and the trap to remember: kHiddenChunkId is 0 and an
+untouched buffer is also 0. "Head reads 0" therefore means EITHER "the hide
+blanked live geometry" OR "the new chunk's ids never reached the GPU at all",
+and the probe as written cannot distinguish them. It was built with a hard
+refusal to run when PoolGpuHide was 0 -- which felt like rigour and was the
+opposite: it removed the only control that could have caught this, and made the
+probe unfalsifiable.
+
+UnmarkGpuHide is KEPT. It is what the plan specified, the reasoning behind it
+stands on its own (a CPU re-allocation reaches the GPU through the
+DirtyQuadRanges shadow upload, a direct RHI write, while the hide is an RDG pass
+executed at GraphBuilder.Execute() -- pass order does not sequence them), and it
+makes the two disjoint by construction. But it is now an UNVERIFIED fix for an
+UNCONFIRMED bug, and it must be described that way until the probe works.
+
+============================================================================
+2. WHAT THE PROBE DOES, AND THE THREE SIZING ATTEMPTS THAT FAILED
+============================================================================
+
+The failure S2-1 must not have cannot occur naturally: a freed block must be
+only PARTIALLY re-allocated, leaving a tail of quads still naming a recycled
+chunk id. In a streaming run that is rare and its symptom is a few stray quads
+in a 4 km view. Ground rule 13 -- a code path with no recorded executions is
+untested -- so the probe manufactures it:
+
+  1. allocate A, 2. free A (hide covers it), 3. allocate B smaller INSIDE A's
+  block, 4. read back ids over A's whole original range.
+  Expect head == B's id, tail == kHiddenChunkId.
+
+First-fit takes the lowest block that fits, so forcing B into A's block took
+three attempts:
+
+  * fixed 512/256 on a settled pool -- B landed in an unrelated hole (476,785
+    against A's 616,148). Correctly reported INCONCLUSIVE.
+  * A sized ABOVE the largest free run, to come from an "untouched tail" --
+    there is no untouched tail; the tail IS a free run and usually the largest,
+    so the allocation simply failed.
+  * running at an 8 s settle to catch a pool with no holes -- it already had
+    them (B at 7,693,279 against A at 16,758,078). Fragmentation starts at once.
+
+The working sizing: A = GetLargestFreeRun(), so every block below A is strictly
+smaller; then re-read the largest free run with A held (L2); then B = L2 + 1,
+which fits in no remaining block, so once A is freed first-fit must place B
+there. That part now works -- the probe reaches step 4 and the INCONCLUSIVE
+guard stops firing.
+
+============================================================================
+3. WHAT IS STILL WRONG, AND WHAT HAS BEEN ELIMINATED
+============================================================================
+
+Head reads 0 on BOTH arms, so B's ids are not reaching the buffer the probe
+reads, by either path.
+
+ELIMINATED: the readback target. ChunkIdPooled is constructed as an
+FRDGPooledBuffer wrapping the SAME RHI buffer as the proxy's ChunkIdBuffer (the
+SharedBuffers block in VoxelGpuPoolComponent.cpp), so reading one while the
+upload writes the other is not the problem.
+
+REMAINING HYPOTHESIS, untested: the probe calls PushUpdatesToProxy() and then
+FlushRenderingCommands(), but if that call takes a branch which defers the
+upload to a render-state rebuild (MarkRenderStateDirty enqueues at end of
+frame), the flush does not cover it and the readback races an upload that has
+not happened. Next step is to log which branch PushUpdatesToProxy takes during
+the probe, before touching the pass again.
+
+============================================================================
+4. WHAT SHIPS
+============================================================================
+
+  - The hide shader entry point, FVoxelQuadPoolHideCS, AddQuadPoolHidePass.
+  - PendingGpuHides, drained into the same command as PendingGpuWrites, through
+    both the batched path and both PushUpdatesToProxy bail-out branches.
+  - UnmarkGpuHide, called from every allocation site.
+  - voxel.Stream.PoolGpuHide, DEFAULT 0. With it off, RemoveChunkInternal takes
+    the original per-quad shadow loop and the whole feature is inert.
+  - voxel.Stream.PoolGpuHideProbe [quads] [settleSeconds], which now RUNS as a
+    control when the feature is off instead of refusing.
+
+Correctness of the shipped default is unaffected: at 0 nothing above executes.

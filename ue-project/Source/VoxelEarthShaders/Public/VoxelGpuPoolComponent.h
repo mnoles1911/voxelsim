@@ -596,6 +596,10 @@ public:
 	// "re-uploaded" predict different pictures instead of being indistinguishable.
 	void DebugClobberShadowAndRecreate(int32 NumQuadsToClobber);
 
+	// S2-1 forced probe -- see VoxelGpuPoolGpuHideProbe for what it manufactures
+	// and why a normal leg cannot.
+	void DebugGpuHideProbe(uint32 NumQuads);
+
 private:
 	// See FVoxelGpuPoolBuffers. The holder is allocated on demand; the buffers
 	// inside it are created on the render thread by the FIRST proxy and reused
@@ -823,6 +827,12 @@ private:
 	// means either it cannot occur or this is not being called, and both are
 	// worth knowing before the gate is flipped.
 	void UnmarkQuadsDirty(uint32 First, uint32 Count);
+
+	// S2-1 mirror of UnmarkQuadsDirty, for pending GPU hides. Called on every
+	// successful allocation so a re-allocated range can never be hidden by a
+	// hide queued earlier in the same frame. See its definition for why pass
+	// ordering alone does not achieve this.
+	void UnmarkGpuHide(uint32 First, uint32 Count);
 	int64 DirtyOverlapsResolved = 0;
 	int64 DirtyOverlapQuadsResolved = 0;
 

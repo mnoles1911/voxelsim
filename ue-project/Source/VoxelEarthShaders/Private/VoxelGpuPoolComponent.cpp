@@ -8,6 +8,8 @@
 #include "Materials/MaterialRenderProxy.h"
 #include "MeshBatch.h"
 #include "RenderGraphBuilder.h"
+#include "RenderGraphUtils.h"
+#include "RHIGPUReadback.h"
 #include "RenderGraphResources.h"
 #include "SceneManagement.h"
 #include "RHIResourceUtils.h"
@@ -2243,6 +2245,10 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 		ChunkParams.Add(Params);
 	}
 
+	// S2-1: a hide queued earlier this frame may cover this range. Drop it before
+	// writing, or the pass will blank geometry the shadow upload is about to
+	// publish -- the failure the forced probe caught.
+	UnmarkGpuHide(Alloc.Offset, uint32(InQuads.Num()));
 	for (int32 I = 0; I < InQuads.Num(); ++I)
 	{
 		PooledQuads[int32(Alloc.Offset) + I] = InQuads[I];
@@ -2353,6 +2359,8 @@ int32 UVoxelGpuPoolComponent::AddChunkFromGpu(const FVoxelGpuQuadPayloadRef& Src
 	// one length check -- and a subtract that only runs when a flag is set is a
 	// subtract that is untested every time the flag is off.
 	UnmarkQuadsDirty(Alloc.Offset, NumQuads);
+	// S2-1: and the same for pending hides -- this range is live again.
+	UnmarkGpuHide(Alloc.Offset, NumQuads);
 
 	const int32 Handle = AcquireAllocationHandle(Alloc, ChunkId);
 	++NumLiveChunks;
@@ -2637,6 +2645,54 @@ void UVoxelGpuPoolComponent::UnparkChunk(int32 Handle, const FVector3f& OriginUU
 
 // The subtract. See the declaration for WHY this exists -- it is what makes
 // S1-1's batching safe, and without it batching silently corrupts geometry.
+// S2-1. Remove [First, First+Count) from any pending hide, because that range
+// has just been RE-ALLOCATED and is about to hold live geometry.
+//
+// WHY ORDERING THE PASSES IS NOT ENOUGH, learned from the forced probe. The
+// first version of S2-1 recorded hides after writes in the RDG graph and assumed
+// that made the last writer correct. The probe read HEAD quads as hidden anyway:
+// 3084 of 3084 naming chunk 0 instead of the new chunk. The reason is that a
+// CPU-path re-allocation does not go through the graph at all -- its ids reach
+// the GPU through the DirtyQuadRanges shadow upload, which is a direct RHI
+// write, while the hide is an RDG pass executed at GraphBuilder.Execute(). The
+// two are not ordered relative to each other by pass order, so the hide landed
+// last and blanked geometry that had just been written.
+//
+// Subtracting is what makes them disjoint by CONSTRUCTION rather than by
+// sequence, which is the same argument UnmarkQuadsDirty makes for the mirror
+// case. This is a plain interval subtract: a hide may be split in two if the
+// re-allocation lands inside it, which is exactly the partial-reuse case.
+void UVoxelGpuPoolComponent::UnmarkGpuHide(uint32 First, uint32 Count)
+{
+	if (Count == 0 || PendingGpuHides.Num() == 0)
+	{
+		return;
+	}
+	const uint32 Last = First + Count - 1;
+
+	TArray<FPendingGpuHide> Out;
+	Out.Reserve(PendingGpuHides.Num() + 1);
+	for (const FPendingGpuHide& H : PendingGpuHides)
+	{
+		const uint32 HFirst = H.DstFirst;
+		const uint32 HLast = H.DstFirst + H.NumQuads - 1;
+		if (H.NumQuads == 0 || HLast < First || HFirst > Last)
+		{
+			Out.Add(H);            // disjoint
+			continue;
+		}
+		if (HFirst < First)        // head survives
+		{
+			Out.Add(FPendingGpuHide{ HFirst, First - HFirst, H.HiddenId });
+		}
+		if (HLast > Last)          // tail survives -- the partial-reuse case
+		{
+			Out.Add(FPendingGpuHide{ Last + 1u, HLast - Last, H.HiddenId });
+		}
+	}
+	PendingGpuHides = MoveTemp(Out);
+}
+
 void UVoxelGpuPoolComponent::UnmarkQuadsDirty(uint32 First, uint32 Count)
 {
 	if (Count == 0 || DirtyQuadRanges.Num() == 0)
@@ -3136,6 +3192,10 @@ int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& In
 		       (long long)AllocFailureCount);
 		return INDEX_NONE;
 	}
+	// S2-1: a hide queued earlier this frame may cover this range. Drop it before
+	// writing, or the pass will blank geometry the shadow upload is about to
+	// publish -- the failure the forced probe caught.
+	UnmarkGpuHide(Alloc.Offset, uint32(InQuads.Num()));
 	for (int32 I = 0; I < InQuads.Num(); ++I)
 	{
 		PooledQuads[int32(Alloc.Offset) + I] = InQuads[I];
@@ -3229,6 +3289,95 @@ void UVoxelGpuPoolComponent::GetUsedMaterials(TArray<UMaterialInterface*>& OutMa
 // DESTRUCTIVE AND DEBUG-ONLY. It leaves the CPU shadow wrong on purpose, so the
 // session it runs in is spent — any later edit to a clobbered chunk will write
 // from the corrupted shadow. Never leave this in a measurement run.
+// S2-1 FORCED PROBE, and it exists because the failure it looks for CANNOT
+// HAPPEN NATURALLY (ground rule 13: a code path with no recorded executions is
+// untested, and a clean leg is not evidence about a path that never ran).
+//
+// THE FAILURE. RemoveChunkInternal repoints a freed range's quad ids at the
+// hidden chunk. With voxel.Stream.PoolGpuHide 1 that is a compute pass rather
+// than a CPU shadow write. If a freed block is then only PARTIALLY re-allocated,
+// the tail beyond the new allocation must still read kHiddenChunkId -- otherwise
+// those quads keep naming a chunk id that has since been recycled, and they draw
+// at some other chunk's origin. In a streaming run the allocator rarely produces
+// a partial reuse of a just-freed block, and when it does the result is a few
+// stray quads somewhere in a 4 km view. Nothing would report it.
+//
+// So the probe manufactures it:
+//   1. allocate A (N quads), write ids
+//   2. free A            -> hide pass covers [off, off+N)
+//   3. allocate B (N/2)  -> first-fit puts it at off, write pass covers [off, off+N/2)
+//   4. read back ids over the WHOLE original range
+//
+// Expected: [off, off+N/2) == B's id, [off+N/2, off+N) == kHiddenChunkId.
+//
+// The two ways it can fail are distinguishable, which is the point of reading
+// the whole range rather than just the tail:
+//   tail reads A's old id  -> the hide never ran (or was dropped on a bail-out)
+//   HEAD reads hidden      -> the hide ran AFTER the write and blanked live
+//                             geometry: invisible terrain reporting as loaded
+static void VoxelGpuPoolGpuHideProbeNow(uint32 N)
+{
+	UVoxelGpuPoolComponent* Pool = nullptr;
+	for (TObjectIterator<UVoxelGpuPoolComponent> It; It; ++It)
+	{
+		UVoxelGpuPoolComponent* Comp = *It;
+		if (Comp == nullptr || Comp->IsTemplate() || !IsValid(Comp))
+		{
+			continue;
+		}
+		Pool = Comp;
+		break;
+	}
+	if (Pool == nullptr)
+	{
+		UE_LOG(LogTemp, Error,
+		       TEXT("voxel.Stream.PoolGpuHideProbe: no live pool component. Run this after the world has "
+		            "streamed, with voxel.Stream.GPU on."));
+		return;
+	}
+	if (VoxelGpuPoolCull::GGpuHide == 0)
+	{
+		// RUN IT ANYWAY, AS THE CONTROL. This was a hard refusal, which made the
+		// probe unfalsifiable: kHiddenChunkId is 0 and so is an untouched buffer,
+		// so "head reads 0" means EITHER the hide blanked live geometry OR the
+		// new chunk's ids never reached the GPU at all. Without a shadow-path
+		// control there is no way to tell those apart, and the first reading
+		// blames S2-1 for what might be a bug in the probe.
+		UE_LOG(LogTemp, Warning,
+		       TEXT("voxel.Stream.PoolGpuHideProbe: PoolGpuHide is 0 -- running as the CPU-shadow CONTROL. "
+		            "A FAIL here is a probe bug, not an S2-1 bug."));
+	}
+	Pool->DebugGpuHideProbe(N);
+}
+
+// DEFERRED BY DEFAULT, and that is not convenience -- it is the difference
+// between a gate and a no-op. Issued through -ExecCmds this command runs at
+// startup, before any pool exists, logs "no live pool component" and the process
+// still exits 0. That is exactly the shape ground rule 13 warns about: a check
+// that reports success without executing. voxel.Stream.PoolClobberTest has the
+// same trap, which is why PoolClobberSession exists.
+static void VoxelGpuPoolGpuHideProbe(const TArray<FString>& Args)
+{
+	const uint32 N = (Args.Num() > 0) ? uint32(FMath::Max(2, FCString::Atoi(*Args[0]))) : 512u;
+	const float Delay = (Args.Num() > 1) ? FMath::Max(0.f, float(FCString::Atof(*Args[1]))) : 45.f;
+
+	UE_LOG(LogTemp, Warning,
+	       TEXT("voxel.Stream.PoolGpuHideProbe queued: %u quads after a %.0f s settle."), N, Delay);
+
+	double Elapsed = 0.0;
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		[N, Delay, Elapsed](float Dt) mutable -> bool
+	{
+		Elapsed += double(Dt);
+		if (Elapsed < double(Delay))
+		{
+			return true;
+		}
+		VoxelGpuPoolGpuHideProbeNow(N);
+		return false;
+	}), 0.0f);
+}
+
 static void VoxelGpuPoolClobberTest(const TArray<FString>& Args)
 {
 	const int32 NumToClobber = (Args.Num() > 0) ? FMath::Max(1, FCString::Atoi(*Args[0])) : 200000;
@@ -3339,12 +3488,217 @@ static void VoxelGpuPoolClobberSession(const TArray<FString>& Args)
 	}), 0.0f);
 }
 
+static FAutoConsoleCommand GVoxelGpuPoolGpuHideProbeCmd(
+	TEXT("voxel.Stream.PoolGpuHideProbe"),
+	TEXT("S2-1 forced probe: allocate N quads, free them, re-allocate N/2 inside the freed block, and "
+	     "read back the ids. The tail must be kHiddenChunkId and the head must be the new chunk. "
+	     "Requires voxel.Stream.PoolGpuHide 1. Runs after a settle because at startup there is no pool "
+	     "and it would report success without testing anything. Usage: [quads=512] [settleSeconds=45]"),
+	FConsoleCommandWithArgsDelegate::CreateStatic(&VoxelGpuPoolGpuHideProbe));
+
 static FAutoConsoleCommand GVoxelGpuPoolClobberSessionCmd(
 	TEXT("voxel.Stream.PoolClobberSession"),
 	TEXT("Runs the whole path-1 clobber experiment in one session: settle, two baseline shots "
 	     "(their diff is the same-session noise floor), clobber the CPU shadow, force recreation, "
 	     "third shot. Usage: [settleSeconds=45] [quads=200000]"),
 	FConsoleCommandWithArgsDelegate::CreateStatic(&VoxelGpuPoolClobberSession));
+
+void UVoxelGpuPoolComponent::DebugGpuHideProbe(uint32 NumQuads)
+{
+	if (!IsGpuWritable())
+	{
+		UE_LOG(LogTemp, Error, TEXT("%s GpuHideProbe: pool is not GPU-writable; nothing to probe."), *PoolName);
+		return;
+	}
+	// FORCING THE OVERLAP DETERMINISTICALLY, after three attempts that did not.
+	//
+	// First-fit takes the LOWEST free block that fits, so B only lands in A's
+	// freed block if it fits NOWHERE BELOW IT. What failed:
+	//
+	//   * fixed 512/256 on a settled pool -- B landed in an unrelated hole
+	//     (476,785 vs A's 616,148). INCONCLUSIVE, nothing tested.
+	//   * sizing A above the largest free run to get an "untouched tail" -- there
+	//     is no such thing: the tail IS a free run and usually the largest, so
+	//     the allocation simply failed.
+	//   * running at 8 s to catch a pool with no holes -- it already had them
+	//     (B at 7,693,279 vs A at 16,758,078). Fragmentation starts immediately.
+	//
+	// What works, using only the largest-free-run query the pool already exposes:
+	//
+	//   1. A = GetLargestFreeRun(). First-fit therefore places A in the first
+	//      block that large, and EVERY block below A is strictly smaller.
+	//   2. Re-read the largest free run AFTER A is allocated -- call it L2. Every
+	//      remaining block, above or below, is <= L2.
+	//   3. B = L2 + 1. It cannot fit in any of them, so once A is freed, A's
+	//      block is the only candidate and first-fit must take it.
+	//   4. B < A is required for a tail to exist, i.e. L2 + 1 < A.
+	//
+	// The INCONCLUSIVE guard below stays as a backstop: if any of that reasoning
+	// is wrong on some future allocator, the probe says so rather than passing.
+	const uint32 AQuads = GetLargestFreeRun();
+	if (AQuads < 4)
+	{
+		UE_LOG(LogTemp, Error,
+		       TEXT("%s GpuHideProbe: largest free run is %u quads -- too small to probe."), *PoolName, AQuads);
+		return;
+	}
+	const uint32 NumQuadsA = AQuads;
+	(void)NumQuads;   // the argument is now only a floor for readability
+
+	// Synthetic geometry. The payload is irrelevant -- the probe reads IDS -- but
+	// it must be non-zero so a zeroed buffer cannot masquerade as a pass.
+	TArray<uint64> Quads;
+	Quads.Init(0xA5A5A5A5A5A5A5A5ull, int32(NumQuadsA));
+
+	const FVector3f Origin(0.f, 0.f, 0.f);
+	const FVector4f Params(0.f, 0.f, 0.f, 0.f);
+
+	// 1. Allocate A.
+	const int32 HandleA = AddChunk(Quads, Origin, /*Level*/ 0, Params);
+	if (HandleA == INDEX_NONE)
+	{
+		UE_LOG(LogTemp, Error, TEXT("%s GpuHideProbe: allocation A failed (pool full?)."), *PoolName);
+		return;
+	}
+	const uint32 Offset = Allocations[HandleA].Offset;
+	const uint32 IdA = AllocationChunkIds[HandleA];
+
+	// Step 2: with A held, every remaining free block is <= this.
+	const uint32 L2 = GetLargestFreeRun();
+	const uint32 Half = L2 + 1u;
+	if (Half >= NumQuadsA)
+	{
+		UE_LOG(LogTemp, Warning,
+		       TEXT("%s GpuHideProbe: INCONCLUSIVE — the second-largest free run (%u) leaves no room for a "
+		            "tail inside A (%u). Nothing was tested."),
+		       *PoolName, L2, NumQuadsA);
+		RemoveChunk(HandleA);
+		return;
+	}
+	TArray<uint64> HalfQuads;
+	HalfQuads.Init(0xA5A5A5A5A5A5A5A5ull, int32(Half));
+
+	// Free A. With PoolGpuHide on this enqueues a hide over [Offset, +NumQuadsA).
+	RemoveChunk(HandleA);
+
+	// 3. Re-allocate HALF inside the freed block. First-fit should place it at
+	//    Offset; if it does not, the probe cannot manufacture the overlap and
+	//    says so rather than passing vacuously.
+	const int32 HandleB = AddChunk(HalfQuads, Origin, /*Level*/ 0, Params);
+	if (HandleB == INDEX_NONE)
+	{
+		UE_LOG(LogTemp, Error, TEXT("%s GpuHideProbe: allocation B failed."), *PoolName);
+		return;
+	}
+	const uint32 OffsetB = Allocations[HandleB].Offset;
+	const uint32 IdB = AllocationChunkIds[HandleB];
+	if (OffsetB != Offset)
+	{
+		UE_LOG(LogTemp, Warning,
+		       TEXT("%s GpuHideProbe: INCONCLUSIVE — B landed at %u, not in A's freed block at %u, so no "
+		            "partial reuse was created. Nothing was tested. (Free list shape depends on run "
+		            "history; try again on a fresh pool or with a different quad count.)"),
+		       *PoolName, OffsetB, Offset);
+		RemoveChunk(HandleB);
+		return;
+	}
+
+	// Publish: this is what drains PendingGpuWrites and PendingGpuHides into one
+	// command, in the order the fix depends on.
+	PushUpdatesToProxy();
+	FlushRenderingCommands();
+
+	// 4. Read back ids over the WHOLE original range.
+	TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> Rb =
+		MakeShared<FRHIGPUBufferReadback, ESPMode::ThreadSafe>(TEXT("Voxel.GpuHideProbe.Ids"));
+	const FVoxelGpuPoolBuffersRef Buffers = GetOrCreatePoolBuffers();
+	const uint32 First = Offset;
+	const uint32 Count = NumQuadsA;
+	ENQUEUE_RENDER_COMMAND(VoxelGpuHideProbeReadback)(
+		[Buffers, Rb, First, Count](FRHICommandListImmediate& RHICmdList)
+	{
+		if (!Buffers.IsValid() || !Buffers->ChunkIdPooled.IsValid())
+		{
+			return;
+		}
+		FRDGBuilder GraphBuilder(RHICmdList);
+		FRDGBufferRef I = GraphBuilder.RegisterExternalBuffer(Buffers->ChunkIdPooled, TEXT("GpuHideProbe.Ids"));
+		// Copy from element 0 -- AddEnqueueCopyPass takes a byte count from the
+		// buffer start, so the range of interest is indexed after the harvest.
+		AddEnqueueCopyPass(GraphBuilder, Rb.Get(), I, (First + Count) * uint32(sizeof(uint32)));
+		GraphBuilder.Execute();
+	});
+	FlushRenderingCommands();
+
+	uint32 HeadWrong = 0;
+	uint32 TailWrong = 0;
+	uint32 FirstBadIndex = 0xffffffffu;
+	uint32 FirstBadValue = 0;
+	// LOCK ON THE RENDER THREAD. FRHIGPUBufferReadback::Lock asserts
+	// IsInRenderingThread(); calling it from here crashed the first probe run.
+	// The comparison rides along rather than copying the buffer out, because the
+	// only thing wanted from it is four counters.
+	bool bLocked = false;
+	const uint32 HiddenId = kHiddenChunkId;
+	ENQUEUE_RENDER_COMMAND(VoxelGpuHideProbeCompare)(
+		[Rb, First, Count, Half, IdB, HiddenId,
+		 &HeadWrong, &TailWrong, &FirstBadIndex, &FirstBadValue, &bLocked](FRHICommandListImmediate&)
+	{
+		const uint32* Data = static_cast<const uint32*>(Rb->Lock((First + Count) * sizeof(uint32)));
+		if (Data == nullptr)
+		{
+			return;
+		}
+		bLocked = true;
+		for (uint32 I = 0; I < Count; ++I)
+		{
+			const uint32 Got = Data[First + I];
+			const uint32 Want = (I < Half) ? IdB : HiddenId;
+			if (Got != Want)
+			{
+				if (I < Half) { ++HeadWrong; } else { ++TailWrong; }
+				if (FirstBadIndex == 0xffffffffu) { FirstBadIndex = I; FirstBadValue = Got; }
+			}
+		}
+		Rb->Unlock();
+	});
+	FlushRenderingCommands();
+	if (!bLocked)
+	{
+		UE_LOG(LogTemp, Error, TEXT("%s GpuHideProbe: readback lock failed."), *PoolName);
+		RemoveChunk(HandleB);
+		return;
+	}
+
+	RemoveChunk(HandleB);
+
+	if (HeadWrong == 0 && TailWrong == 0)
+	{
+		UE_LOG(LogTemp, Log,
+		       TEXT("%s GpuHideProbe: PASS — %u quads at %u, re-allocated %u. Head reads chunk %u, tail reads "
+		            "hidden (%u). A partially reused freed block leaves no quad naming the recycled id."),
+		       *PoolName, Count, First, Half, IdB, kHiddenChunkId);
+		return;
+	}
+
+	// Say WHICH failure, because the two mean opposite things.
+	if (HeadWrong > 0)
+	{
+		UE_LOG(LogTemp, Error,
+		       TEXT("%s GpuHideProbe: FAIL — %u of %u HEAD quads do not name the new chunk %u (first bad at "
+		            "+%u, read %u). The hide ran AFTER the write and blanked live geometry: this is invisible "
+		            "terrain that reports as loaded. Check pass order in VoxelGpuPoolAddWritePasses."),
+		       *PoolName, HeadWrong, Half, IdB, FirstBadIndex, FirstBadValue);
+	}
+	if (TailWrong > 0)
+	{
+		UE_LOG(LogTemp, Error,
+		       TEXT("%s GpuHideProbe: FAIL — %u of %u TAIL quads are not hidden (old id was %u). The hide did "
+		            "not run, or was dropped on a PushUpdatesToProxy bail-out branch. Those quads draw at a "
+		            "recycled chunk's origin."),
+		       *PoolName, TailWrong, Count - Half, IdA);
+	}
+}
 
 void UVoxelGpuPoolComponent::DebugClobberShadowAndRecreate(int32 NumQuadsToClobber)
 {
