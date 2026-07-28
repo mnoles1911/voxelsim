@@ -107,9 +107,25 @@ TAutoConsoleVariable<bool> CVarVoxelWaterGpu(
 	TEXT("voxel.Stream.GPU -- water is a separate pool with a separate, translucent material."),
 	ECVF_Default);
 
+// 64 -> 192 (2026-07-27, S1 close): 794 -> 1,040 chunks/s with converged holes
+// 6-14 -> 0, two clean legs each, 1.4% spread. 384 measured 1,044 -- inside
+// noise of 192 -- so 192 is the knee and there is nothing above it.
+//
+// This ceiling only started binding once batched publication made an apply
+// cheap enough that DrainResults could hit 64 before spending its 6 ms
+// ApplyBudgetMs. Before that it was unreachable and therefore invisible.
+//
+// AND IT WAS BRIEFLY RECORDED AS "REJECTED, MEASURED WORSE", WHICH WAS WRONG.
+// That leg (749 chunks/s, 179 holes) shared the box with a second editor for 86
+// seconds. Re-run alone on the same binary it gave 1,033. A contended leg looks
+// exactly like a slow configuration, and a plausible mechanism had already been
+// written to explain it -- which is how a 30% win nearly went into the
+// do-not-re-litigate list permanently. tools/voxel-run-flight-leg.ps1 now
+// refuses to start while another editor is alive.
+// docs/measurements/s1-close-2026-07-27.txt.
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxAppliesPerFrame(
 	TEXT("voxel.Stream.MaxAppliesPerFrame"),
-	64,
+	192,
 	TEXT("Streaming throughput: HARD CEILING on worker-mesh-result chunk-component applies ")
 	TEXT("(FVoxelWorldImpl::DrainResults) per frame. As of the 2026-07-24 streaming-speed pass this is a safety ")
 	TEXT("ceiling, not the steady-state throttle -- the loop drains until voxel.Stream.ApplyBudgetMs of wall-clock ")
@@ -208,6 +224,26 @@ TAutoConsoleVariable<int32> CVarVoxelStreamLogAdmission(
 	TEXT("armed. Those four decide whether a ring keeps filling, and no existing counter shows them together."),
 	ECVF_Default);
 
+// Wave S0 (docs/speculative-generation-plan.md §4, executing T0-1): split the
+// per-apply cost into pack / params / pool-add so the deep review's §1a can be
+// confirmed or killed in one leg instead of being built on.
+//
+// GATES THE CLOCKS, NOT THE COUNTS. The DrainResults exit-reason counters are
+// unconditional -- four increments per frame, and they are what settle whether
+// the apply loop exits on an empty queue or on its 6 ms wall clock, which the
+// published "results are not ARRIVING" reading assumes without ever having
+// measured. The FPlatformTime::Seconds pairs guarded by this are the part that
+// could plausibly become what it measures, on a path that runs up to 64 times a
+// frame. A leg with this OFF, showing avgChunks/s within noise of a leg with it
+// ON, is part of closing the wave -- not optional.
+TAutoConsoleVariable<int32> CVarVoxelStreamApplyStageStats(
+	TEXT("voxel.Stream.ApplyStageStats"),
+	0,
+	TEXT("1 = time each apply's quad pack, SampleChunkParamsForPool and pool add (including the ")
+	TEXT("PushUpdatesToProxy each ends in), reported per 5s window. Default 0. Pair it with ")
+	TEXT("voxel.Stream.PoolPushStats, which splits the pool-add bucket across both threads."),
+	ECVF_Default);
+
 // Ring-gap wave (docs/status.md "ring gap"). The 5s retention census says HOW
 // MANY stand-ins were released and why; it cannot say WHICH ones, and the
 // hypothesis under test is positional -- coarse chunks released at the INNER
@@ -239,6 +275,23 @@ TAutoConsoleVariable<int32> CVarVoxelStreamCoverageVerify(
 	TEXT("annulus and count the ones no level is visibly covering -- the see-through holes, as a number, with a ")
 	TEXT("few examples and their radius. READ-ONLY: it changes no streaming decision. Off by default because it ")
 	TEXT("re-walks every ring's annulus."),
+	ECVF_Default);
+
+// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2). Off by default:
+// the window bookkeeping this gates adds new FPlatformTime::Seconds() calls
+// (FJobResult::DeliverSeconds on both producer arms) on top of timestamps that
+// already exist elsewhere, and the instrument must not be able to become part
+// of what it measures. Flip on for one leg per arm when comparing QueuedMs
+// against DispatchToReadyMs/ReadyToDeliverMs -- see MaybeLogCounters for the
+// log line shape.
+TAutoConsoleVariable<int32> CVarVoxelStreamLatencyStats(
+	TEXT("voxel.Stream.LatencyStats"),
+	0,
+	TEXT("Per-producer, per-stage submit->apply latency windows (p50/p95/max over a 256-sample ring, same ")
+	TEXT("idiom as the existing worker-ms window) plus the per-level quad-count distribution. GPU arm: ")
+	TEXT("QueuedMs, DispatchToReadyMs, ReadyToDeliverMs, SubmitToDeliverMs, DeliverToApplyMs. CPU worker arm: ")
+	TEXT("its existing end-to-end JobMs isolated from the GPU population, plus its own DeliverToApplyMs. ")
+	TEXT("Default 0. Diagnostic only -- one standard leg per arm with this on is what Wave S0 closes on."),
 	ECVF_Default);
 
 TAutoConsoleVariable<int32> CVarVoxelStreamGpuMaxChunks(
@@ -375,6 +428,165 @@ TAutoConsoleVariable<int32> CVarVoxelStreamDispatchAfterDrain(
 	TEXT("Skipped cheaply when nothing is pending. A/B lever for cold-fill work."),
 	ECVF_Default);
 
+// S2-0 (2026-07-27). Bounded admission had a second failure mode that only
+// appeared once the consumer got fast.
+//
+// RecomputeDesiredSet relaxes every LevelAdmissionCutoffDistSq to DBL_MAX when
+// the pending job queue has drained below 3/4 of voxel.Stream.PendingJobCap.
+// That test is a proxy for "there is spare capacity downstream" -- and it was
+// only ever a correct proxy because the queue was short for exactly one reason:
+// the consumer could not keep up. Wave S1 removed that reason. The queue is now
+// short because applies are fast, so the cutoff relaxes on essentially every
+// call and bounded admission is off in practice.
+//
+// Measured at the S1 config: 22,300 records/s admitted against ~800 chunks/s
+// loading, ChunkRecords at 86,077 against a 39,020 settle, and
+// RecomputeDesiredSet at 66% of the streaming tick paying an O(tracked) exit
+// scan for records that will never be reached.
+//
+// This bounds what is actually growing. 0 = off (the pre-S2-0 behaviour). Size
+// it above peak flight residency (~50,900 measured) and far below 86,077.
+TAutoConsoleVariable<int32> CVarVoxelStreamAdmissionRecordCap(
+	TEXT("voxel.Stream.AdmissionRecordCap"),
+	0,
+	TEXT("Stop relaxing the per-level admission cutoff once ChunkRecords reaches this many entries. 0 = off ")
+	TEXT("(pre-2026-07-27 behaviour: the cutoff relaxes whenever the pending JOB queue is short, which stopped ")
+	TEXT("meaning 'there is spare capacity' the moment the consumer got fast). Bounds the O(tracked) exit scan, ")
+	TEXT("which measured 66% of the streaming tick with records at 86,077 against a 39,020 settle."),
+	ECVF_Default);
+
+// S2-3 (docs/speculative-generation-plan.md Wave S2): keep an evicted chunk's
+// POOL RANGE, hidden, so re-admitting it is a chunk-table write instead of a
+// full re-mesh round trip. Under motion the ring boundaries oscillate and the
+// same ground is re-meshed seconds after it was evicted.
+//
+// It is also the mechanism T4-1 parks speculatively generated terrain in.
+//
+// THE CAP IS A CORRECTNESS BOUNDARY, NOT A TUNING KNOB. A parked chunk still
+// owns its pool range, its Allocations slot and its chunk-table entry, so it
+// counts against pool capacity and the chunk-table floor exactly as a drawn
+// chunk does. S1 measured what happens when residency is free to expand into
+// available capacity: it does, all of it, and the pool then starts refusing
+// DEMAND allocations while reading 61% free
+// (docs/measurements/s1-close-2026-07-27.txt). Parked geometry has weaker back
+// pressure than resident geometry -- nothing is asking for it.
+//
+// DEFAULT 12,000 SINCE 2026-07-28, AND THAT IS A MEASUREMENT.
+//
+//   profile   parking off      parking 12,000        hit
+//   circle       893.7            906.5  (+1.4%)     90%
+//   line        1040.6           1064.9  (+2.3%)     78%
+//
+// holes 0 and allocFail 0 on every leg, and the streaming tick does ~6% LESS
+// work with it on (tickMs 26,890 vs 28,517 summed over a circle leg). Roughly
+// 78-90% of adoptions skip a GPU mesh dispatch entirely -- work that appears in
+// none of those numbers.
+//
+// TWO THINGS HAD TO BE FIXED BEFORE IT PAID, and both are worth knowing:
+//
+//   1. Park/unpark published eagerly, so every adopt traded one meshing round
+//      trip for one FULL POOL PUBLICATION. After S1-1 the publication is the
+//      expensive thing. That alone cost ~17%. They now defer
+//      (MarkChunkTableDirtyDeferred) and the streaming tick's own batch carries
+//      it.
+//   2. Parking EVERY eviction scored an 8% hit rate and cost allocFail
+//      0 -> 45,633 and holes 0 -> 1,804. On a traverse everything evicted by the
+//      outer edge is behind the camera and never returns. Restricting to
+//      RetainDir_Finer -- inner-boundary oscillation, the only eviction cause
+//      that comes back -- took the hit rate to 78-90% with no other change.
+//      WHERE you cache matters more than HOW MUCH.
+//
+// And it read as a 21% REGRESSION until chunksPerSec was fixed to count adopted
+// chunks as loaded, because the adopt path never incremented TotalChunksLoaded.
+// A metric that cannot see half a feature's output will reject the feature.
+// docs/measurements/s1-close-2026-07-27.txt.
+//
+// Sizing: peak flight residency is ~50,900 chunks, so 12,000 parked sits inside
+// both the 64M-quad pool and the 81,920 chunk-table floor with room to spare --
+// verified by allocFail 0 on every leg. Parked chunks consume BOTH, so raising
+// this is bounded by what demand residency leaves free.
+// --- T4-1 speculative generation (Wave S3/S4) -------------------------------
+//
+// How far AHEAD of the anchor speculation aims, in seconds of travel. 0 = the
+// predicted anchor collapses onto the true anchor and speculation is off.
+//
+// The lead is applied to a SMOOTHED VELOCITY VECTOR, not a heading, so a
+// stationary anchor produces zero lead with no special case and a turning one
+// produces a shorter lead while the EMA settles -- which is the conservative
+// direction, since speculation aimed at where the camera WAS is pure waste.
+//
+// It feeds ONLY speculative enumeration. Admission, eviction and retention all
+// stay on the true anchor: evicting against a forward-shifted centre would
+// delete ground behind the camera that is still on screen.
+// TASK #17 REPRODUCER. 1 = wrap RecomputeDesiredSet in a pool FScopedBatch.
+// Known to take parking to exactly zero; kept only so the park-refusal counters
+// can say WHY. Never ship at 1.
+TAutoConsoleVariable<int32> CVarVoxelStreamBatchRecompute(
+	TEXT("voxel.Stream.BatchRecompute"),
+	0,
+	TEXT("1 = open a pool batch scope around RecomputeDesiredSet. EXPERIMENT ONLY: this is the "
+	     "configuration that zeroed parking (task #17). Read the park census refusal counters with it on."),
+	ECVF_Default);
+
+TAutoConsoleVariable<float> CVarVoxelStreamVelocityLeadSec(
+	TEXT("voxel.Stream.VelocityLeadSec"),
+	0.0f,
+	TEXT("Seconds of travel ahead of the anchor that speculative generation aims at. 0 = off. Applied to a ")
+	TEXT("0.25s-EMA velocity vector and clamped by voxel.Stream.VelocityLeadMaxUU. Feeds speculation ONLY -- ")
+	TEXT("admission, eviction and retention stay on the true anchor by design."),
+	ECVF_Default);
+
+TAutoConsoleVariable<float> CVarVoxelStreamVelocityLeadMaxUU(
+	TEXT("voxel.Stream.VelocityLeadMaxUU"),
+	6000.0f,
+	TEXT("Hard clamp on the predicted-anchor lead distance (UU). 6000 = 60 m, ~3s at the 20 m/s flight ")
+	TEXT("profile. Stops a speed spike throwing the speculative cone somewhere the camera will never reach."),
+	ECVF_Default);
+
+// Chunks speculation may hold parked-but-unasked-for. SEPARATE from
+// PoolParkMax, and that separation is deliberate: demand parking caches geometry
+// that WAS wanted, speculation caches geometry that MIGHT be. They have
+// different hit rates and different justifications, and sharing a cap would let
+// speculation starve the demand cache it depends on.
+//
+// A parked speculative chunk holds a pool range AND a chunk-table entry, exactly
+// like a resident one. S1 measured what happens when residency is free to expand
+// into spare capacity -- it does, all of it, and the pool then refuses DEMAND
+// allocations while reading half empty. Speculative geometry has no natural back
+// pressure at all, so this cap is a correctness boundary.
+TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeMaxParked(
+	TEXT("voxel.Stream.SpeculativeMaxParked"),
+	4000,
+	TEXT("Max chunks held parked from SPECULATIVE generation, separate from voxel.Stream.PoolParkMax. ")
+	TEXT("Speculative geometry has no back pressure -- nothing asked for it -- so this bounds real pool and ")
+	TEXT("chunk-table capacity. Only takes effect while voxel.Stream.VelocityLeadSec > 0."),
+	ECVF_Default);
+
+// Speculative jobs in flight, carved out of the fork's 256-slot budget.
+//
+// Kept small on purpose. Demand work is submitted FIRST every tick and
+// speculation only gets what is left, but a large speculative depth would still
+// sit in the manager's strict-FIFO queue ahead of the next tick's demand jobs.
+// Small depth plus submit-last is what makes starvation structurally impossible
+// rather than merely unlikely.
+TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeMaxInFlight(
+	TEXT("voxel.Stream.SpeculativeMaxInFlight"),
+	32,
+	TEXT("Max speculative mesh jobs in flight, carved out of voxel.Stream.GpuMeshInFlight (256). Small by ")
+	TEXT("design: the job manager's queue is strict FIFO, so speculative depth delays the NEXT tick's demand ")
+	TEXT("work even though demand is submitted first."),
+	ECVF_Default);
+
+TAutoConsoleVariable<int32> CVarVoxelStreamPoolParkMax(
+	TEXT("voxel.Stream.PoolParkMax"),
+	12000,
+	TEXT("Max chunks kept as hidden-but-allocated pool ranges after eviction, so re-admission is a table ")
+	TEXT("write rather than a re-mesh. DEFAULT 12,000 since 2026-07-28: +1.4% (circle) / +2.3% (line) ")
+	TEXT("placed-chunks/s with holes 0, allocFail 0, a 78-90% adoption hit rate and ~6% less tick work. ")
+	TEXT("0 = off (evict frees immediately) as the A/B control. Parked chunks consume pool quads AND ")
+	TEXT("chunk-table entries, so raising this is bounded by what demand residency leaves free."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxRemeshesPerFrame(
 	TEXT("voxel.Stream.MaxRemeshesPerFrame"),
 	8,
@@ -383,13 +595,36 @@ TAutoConsoleVariable<int32> CVarVoxelStreamMaxRemeshesPerFrame(
 	TEXT("so edited-chunk loads keep pace with the faster clean-chunk apply path)."),
 	ECVF_Default);
 
+// 24 -> 256 (2026-07-27, S1). THE MOST EXPENSIVE-TO-DIAGNOSE NUMBER IN THIS FILE
+// SO FAR, and the lesson generalises to every other budget here.
+//
+// Its own doc already said unloads must keep pace with the apply rate. When
+// batched publication took the apply rate from ~260 to ~630 chunks/s, 24 stopped
+// keeping pace -- ~684 unloads/s against ~630 loads/s is marginally under water,
+// so the unload queue grew without bound (pendingUnload peaked at 75,925) and
+// residency with it (80,716 live chunks against an 81,920 table floor).
+//
+// It did not present as an unload problem. It presented as ALLOCATOR
+// FRAGMENTATION: 26,763-77,290 refused allocations, 16,903 free runs, and a 72x
+// collapse in largest-free-run at equal total free -- textbook first-fit
+// pathology, and the obvious response was to build a compacting defragmenter
+// (T3-6). A chronically over-full pool fragments; the allocator was the
+// messenger. Raising this took allocFail to 0 and converged holes 257 -> 0.
+//
+// SO: EVERY PER-FRAME BUDGET IN THIS SUBSYSTEM ENCODES AN ASSUMPTION ABOUT
+// THROUGHPUT. MaxAppliesPerFrame, MaxRemeshesPerFrame, kMaxResultDrainsPerFrame,
+// kMaxUnloadPopsPerFrame, GpuMeshInFlight, MeshBatchCap, MeshHarvestCap -- any
+// change that moves throughput must re-sweep the ones downstream of it, and a
+// saturated budget can surface as a bug in something else entirely.
+// docs/measurements/s1-close-2026-07-27.txt.
 TAutoConsoleVariable<int32> CVarVoxelStreamMaxUnloadsPerFrame(
 	TEXT("voxel.Stream.MaxUnloadsPerFrame"),
-	24,
+	256,
 	TEXT("Max chunk-component unload events (FVoxelWorldImpl::DrainUnloads -- pool-park, or DestroyComponent once the ")
 	TEXT("pool is at voxel.Stream.ComponentPoolMax) per frame. History: constant 4 -> 2 (hitch isolation) -> 24 ")
-	TEXT("(2026-07-24 streaming-speed pass): unloads must keep pace with the raised apply rate or superseded coarse ")
-	TEXT("chunks pile up resident (measured R0 bloating ~4x its desired size, which itself loads the render thread)."),
+	TEXT("(2026-07-24 streaming-speed pass) -> 256 (2026-07-27, S1): at the batched apply rate 24 could not keep pace, ")
+	TEXT("so residency ballooned to 80,716 chunks and the pool began REFUSING allocations -- which looked exactly like ")
+	TEXT("allocator fragmentation. 256 takes allocFail to 0 and converged holes to 0. See the source comment."),
 	ECVF_Default);
 
 TAutoConsoleVariable<int32> CVarVoxelStreamComponentPoolMax(
@@ -692,9 +927,19 @@ bool VoxelDebug::GetStreamLogRetention()
 	return CVarVoxelStreamLogRetention.GetValueOnGameThread() != 0;
 }
 
+int32 VoxelDebug::GetStreamApplyStageStats()
+{
+	return CVarVoxelStreamApplyStageStats.GetValueOnGameThread();
+}
+
 bool VoxelDebug::GetStreamCoverageVerify()
 {
 	return CVarVoxelStreamCoverageVerify.GetValueOnGameThread() != 0;
+}
+
+bool VoxelDebug::GetStreamLatencyStats()
+{
+	return CVarVoxelStreamLatencyStats.GetValueOnGameThread() != 0;
 }
 
 bool VoxelDebug::GetRenderCastShadow()
@@ -736,6 +981,41 @@ int32 VoxelDebug::GetStreamJobsInFlightPerCore()
 int32 VoxelDebug::GetStreamDispatchAfterDrain()
 {
 	return CVarVoxelStreamDispatchAfterDrain.GetValueOnGameThread();
+}
+
+int32 VoxelDebug::GetStreamAdmissionRecordCap()
+{
+	return FMath::Max(0, CVarVoxelStreamAdmissionRecordCap.GetValueOnGameThread());
+}
+
+int32 VoxelDebug::GetStreamBatchRecompute()
+{
+	return CVarVoxelStreamBatchRecompute.GetValueOnGameThread();
+}
+
+float VoxelDebug::GetStreamVelocityLeadSec()
+{
+	return FMath::Max(0.f, CVarVoxelStreamVelocityLeadSec.GetValueOnGameThread());
+}
+
+float VoxelDebug::GetStreamVelocityLeadMaxUU()
+{
+	return FMath::Max(0.f, CVarVoxelStreamVelocityLeadMaxUU.GetValueOnGameThread());
+}
+
+int32 VoxelDebug::GetStreamSpeculativeMaxParked()
+{
+	return FMath::Max(0, CVarVoxelStreamSpeculativeMaxParked.GetValueOnGameThread());
+}
+
+int32 VoxelDebug::GetStreamSpeculativeMaxInFlight()
+{
+	return FMath::Max(0, CVarVoxelStreamSpeculativeMaxInFlight.GetValueOnGameThread());
+}
+
+int32 VoxelDebug::GetStreamPoolParkMax()
+{
+	return FMath::Max(0, CVarVoxelStreamPoolParkMax.GetValueOnGameThread());
 }
 
 int32 VoxelDebug::GetStreamMaxRemeshesPerFrame()

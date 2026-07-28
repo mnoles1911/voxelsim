@@ -11,6 +11,7 @@
 //     -ExecCmds="Automation RunTests VoxelEarth.GpuPool; Quit"
 
 #include "VoxelGpuGeometryPool.h"
+#include "VoxelGpuPoolComponent.h" // S1-1 dirty-range algebra (DebugMark/UnmarkQuadsDirty)
 #include "Misc/AutomationTest.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -199,6 +200,171 @@ bool FVoxelGpuPoolSoakTest::RunTest(const FString& Parameters)
 
 	AddInfo(FString::Printf(TEXT("soak: %d allocations, %d refusals from fragmentation"),
 	                        AllocCount, FailCount));
+	return true;
+}
+
+// ============================================================================
+// S1-1: the dirty-range interval algebra.
+//
+// WHY THIS EXISTS RATHER THAN A LEG. UnmarkQuadsDirty guards the
+// free-then-reallocate-within-one-frame race that batching publication creates
+// (see its declaration). Across four full flight legs it fired ZERO times --
+// the tick ordering puts most frees after allocs, so the case is rare but NOT
+// unreachable: ApplyMeshResult's zero-quad branch frees inside DrainResults and
+// a later result in the same drain loop can AddChunkFromGpu over that range.
+//
+// So the guard is load-bearing for a case that has never been observed, which
+// is the worst state to ship in -- ground rule 13. If the subtract is wrong the
+// symptom is stale hidden ids written over fresh GPU geometry: INVISIBLE
+// TERRAIN THAT REPORTS AS LOADED, with no counter moving and nothing in a
+// screenshot to see.
+//
+// The algebra is pure list manipulation, so it is tested directly instead of
+// waiting for a leg to happen to hit it. The SPLIT case is the one that matters
+// most: getting it wrong leaves either a gap that fails to upload real CPU
+// content, or an interval that survives over GPU-written quads.
+// ============================================================================
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelGpuPoolDirtyRangeTest,
+	"VoxelEarth.GpuPool.DirtyRanges", kTestFlags)
+
+bool FVoxelGpuPoolDirtyRangeTest::RunTest(const FString& Parameters)
+{
+	using FRanges = TArray<TPair<uint32, uint32>>;
+
+	// Transient, never registered, InitPool never called: these two methods only
+	// touch DirtyQuadRanges.
+	UVoxelGpuPoolComponent* Pool = NewObject<UVoxelGpuPoolComponent>();
+	if (!TestNotNull(TEXT("component constructed"), Pool))
+	{
+		return false;
+	}
+
+	const auto Reset = [Pool]()
+	{
+		// Subtracting everything is the only public way back to empty, and it
+		// doubles as a check that a full-cover subtract really does clear.
+		Pool->DebugUnmarkQuadsDirty(0, TNumericLimits<uint32>::Max());
+	};
+
+	const auto Expect = [this, Pool](const TCHAR* What, const FRanges& Want)
+	{
+		const FRanges Got = Pool->DebugGetDirtyRanges();
+		if (!TestEqual(*FString::Printf(TEXT("%s: range count"), What), Got.Num(), Want.Num()))
+		{
+			return;
+		}
+		for (int32 I = 0; I < Want.Num(); ++I)
+		{
+			TestEqual(*FString::Printf(TEXT("%s: [%d].First"), What, I), Got[I].Key, Want[I].Key);
+			TestEqual(*FString::Printf(TEXT("%s: [%d].Last"), What, I), Got[I].Value, Want[I].Value);
+		}
+	};
+
+	// --- the five cases the subtract has to get right ----------------------
+
+	// 1. Disjoint -- must not touch anything.
+	Reset();
+	Pool->DebugMarkQuadsDirty(100, 50);                 // [100,149]
+	Pool->DebugUnmarkQuadsDirty(200, 10);               // [200,209]
+	Expect(TEXT("disjoint above"), FRanges{ {100, 149} });
+	Pool->DebugUnmarkQuadsDirty(10, 10);                // [10,19]
+	Expect(TEXT("disjoint below"), FRanges{ {100, 149} });
+
+	// 2. Fully covered -- the interval disappears entirely.
+	Reset();
+	Pool->DebugMarkQuadsDirty(100, 50);
+	Pool->DebugUnmarkQuadsDirty(100, 50);
+	Expect(TEXT("exact cover"), FRanges{});
+
+	Reset();
+	Pool->DebugMarkQuadsDirty(100, 50);
+	Pool->DebugUnmarkQuadsDirty(90, 100);               // [90,189] strictly wider
+	Expect(TEXT("wider cover"), FRanges{});
+
+	// 3. Head survives -- overlap runs off the top.
+	Reset();
+	Pool->DebugMarkQuadsDirty(100, 50);                 // [100,149]
+	Pool->DebugUnmarkQuadsDirty(120, 100);              // [120,219]
+	Expect(TEXT("keep head"), FRanges{ {100, 119} });
+
+	// 4. Tail survives -- overlap runs off the bottom.
+	Reset();
+	Pool->DebugMarkQuadsDirty(100, 50);                 // [100,149]
+	Pool->DebugUnmarkQuadsDirty(50, 71);                // [50,120]
+	Expect(TEXT("keep tail"), FRanges{ {121, 149} });
+
+	// 5. THE SPLIT. Removed range strictly inside: two intervals must come out,
+	// in ascending order, with the removed quads in neither.
+	Reset();
+	Pool->DebugMarkQuadsDirty(100, 50);                 // [100,149]
+	Pool->DebugUnmarkQuadsDirty(120, 10);               // [120,129]
+	Expect(TEXT("split"), FRanges{ {100, 119}, {130, 149} });
+
+	// A single-quad hole is still a split -- the off-by-one that would merge it
+	// away or drop a neighbour is exactly what this catches.
+	Reset();
+	Pool->DebugMarkQuadsDirty(100, 50);
+	Pool->DebugUnmarkQuadsDirty(125, 1);                // [125,125]
+	Expect(TEXT("single-quad split"), FRanges{ {100, 124}, {126, 149} });
+
+	// Boundary quads: removing exactly the first or last quad must not split.
+	Reset();
+	Pool->DebugMarkQuadsDirty(100, 50);
+	Pool->DebugUnmarkQuadsDirty(100, 1);
+	Expect(TEXT("first quad only"), FRanges{ {101, 149} });
+
+	Reset();
+	Pool->DebugMarkQuadsDirty(100, 50);
+	Pool->DebugUnmarkQuadsDirty(149, 1);
+	Expect(TEXT("last quad only"), FRanges{ {100, 148} });
+
+	// --- across several intervals, which is the real shape ------------------
+	//
+	// A batched tick holds one interval per CPU-written chunk, and a GPU
+	// allocation can land across any of them. Gap 0 means these stay separate
+	// (see GVoxelPoolDirtyMergeGap -- that default is load-bearing for D1).
+	Reset();
+	Pool->DebugMarkQuadsDirty(100, 20);                 // [100,119]
+	Pool->DebugMarkQuadsDirty(200, 20);                 // [200,219]
+	Pool->DebugMarkQuadsDirty(300, 20);                 // [300,319]
+	Expect(TEXT("three separate"), FRanges{ {100, 119}, {200, 219}, {300, 319} });
+
+	// Spanning the middle one entirely and clipping both neighbours.
+	Pool->DebugUnmarkQuadsDirty(110, 200);              // [110,309]
+	Expect(TEXT("span middle, clip both"), FRanges{ {100, 109}, {310, 319} });
+
+	// Count of zero is a no-op, not a degenerate range. (Count 0 would compute
+	// Last = First - 1 and underflow if it were not handled up front.)
+	Reset();
+	Pool->DebugMarkQuadsDirty(100, 50);
+	Pool->DebugUnmarkQuadsDirty(120, 0);
+	Expect(TEXT("zero count is a no-op"), FRanges{ {100, 149} });
+
+	// Subtracting from an empty list must not touch anything either.
+	Reset();
+	Pool->DebugUnmarkQuadsDirty(100, 50);
+	Expect(TEXT("subtract from empty"), FRanges{});
+
+	// --- the actual hazard, in the order it would occur ---------------------
+	//
+	// RemoveChunk frees a range and stamps hidden ids over it (MarkQuadsDirty),
+	// then AddChunkFromGpu is handed that same range back by the first-fit
+	// allocator in the same batch and subtracts it. What must remain is the
+	// OTHER chunks' dirty content and nothing covering the GPU-written range.
+	Reset();
+	Pool->DebugMarkQuadsDirty(0, 100);                  // another chunk, CPU-written
+	Pool->DebugMarkQuadsDirty(100, 50);                 // the chunk being freed
+	Pool->DebugMarkQuadsDirty(200, 100);                // another chunk, CPU-written
+	Pool->DebugUnmarkQuadsDirty(100, 50);               // re-issued to a GPU-meshed chunk
+	Expect(TEXT("hazard: GPU range excluded, neighbours intact"),
+	       FRanges{ {0, 99}, {200, 299} });
+
+	// And the counter must have moved, or the fix is not wired to anything.
+	TestTrue(TEXT("dirtyOverlapsResolved recorded the subtracts"),
+	         Pool->GetDirtyOverlapsResolved() > 0);
+	TestTrue(TEXT("dirtyOverlapQuadsResolved recorded the quads"),
+	         Pool->GetDirtyOverlapQuadsResolved() > 0);
+
 	return true;
 }
 

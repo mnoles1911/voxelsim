@@ -111,3 +111,30 @@ void QuadPoolWriteMain(uint3 tid : SV_DispatchThreadID)
 	OutQuads   [DstFirst + i] = InQuads[SrcFirst + i];
 	OutChunkIds[DstFirst + i] = ChunkId;
 }
+
+// --- S2-1: the hide pass -----------------------------------------------------
+//
+// Points a freed pool range at the hidden chunk WITHOUT touching the CPU shadow.
+//
+// This is the GPU half of what RemoveChunkInternal used to do with a per-quad
+// loop over QuadChunkIds followed by MarkQuadsDirty. That loop was the last
+// writer of the CPU shadow on the GPU-only path, and therefore the last thing
+// standing between the pool and dropping the shadow entirely (S2-5): at the
+// shipped capacity the shadow is 12 B/quad of system RAM plus a whole-array copy
+// in CreateSceneProxy.
+//
+// ONLY THE IDS ARE WRITTEN. The quads themselves are left as they are, exactly as
+// the CPU path left them: a quad naming kHiddenChunkId reads scale 0 from the
+// chunk table (VoxelQuadVertexFactory.ush) and collapses to a degenerate point,
+// so it costs vertex invocations and no pixels. Zeroing the quads too would be
+// twice the bandwidth for no visual difference.
+[numthreads(64, 1, 1)]
+void QuadPoolHideMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint i = tid.x;
+	if (i >= NumQuads)
+	{
+		return;
+	}
+	OutChunkIds[DstFirst + i] = ChunkId;
+}

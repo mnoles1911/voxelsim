@@ -1,0 +1,147 @@
+================================================================================
+T4-1 -- BLOCKED BY THE JOB QUEUE'S SHAPE, NOT BY A LACK OF GPU CAPACITY
+================================================================================
+
+*** CORRECTED, SAME DAY. The first version of this file concluded "the premise
+    is invalidated -- the pipeline is demand-saturated and there is no idle
+    capacity to scavenge", from pending=252 against a 256 cap.
+
+    THAT WAS WRONG. pending is jobs IN THE PIPELINE (queued + in flight), i.e.
+    latency x rate -- not work the GPU cannot do. A MeshBatchCap sweep settles
+    it:
+
+        MeshBatchCap   chunks/s   pending  queued  inFlight
+             4          1065.2      252      236      16
+            16          1050.6      237      148      89
+            32          1032.1      232       53     179
+
+    The GPU runs 179 jobs concurrently when promotion allows it. It runs 16 at
+    the shipped cap. So there IS spare GPU capacity, and I mistook pipeline
+    latency for saturation.
+
+    The corrected blocker is below. The rest of this file's reasoning about
+    inFlight=16 being a PROMOTION limit was right. ***
+
+
+Measured 2026-07-28 on the S1 configuration (batched publication, unload budget
+256, applies 192, pool 64M, parking 12,000). Adopted 128 m / 4 km cascade, real
+terrain, -VoxelPerfFlight=line at 20 m/s.
+
+--------------------------------------------------------------------------------
+THE CLAIM T4-1 WAS BUILT ON
+--------------------------------------------------------------------------------
+
+docs/deep-review-streaming-perf-2026-07-27.md, T4-1:
+
+  "Once T1 frees the consumer side, the GPU is essentially always idle from
+   streaming's perspective. Spend it."
+
+Supported by S0's own measurement: the fork sat at ~11 jobs in flight against a
+cap of 256, finishing a chunk in ~12 ms and then waiting ~128 ms to be picked up
+(docs/measurements/s0-apply-census-2026-07-27.txt).
+
+That measurement was taken WHILE THE CONSUMER WAS THE WALL. It described a
+starved producer, and it was read as spare capacity.
+
+--------------------------------------------------------------------------------
+WHAT THE FORK LOOKS LIKE AFTER S1
+--------------------------------------------------------------------------------
+
+Flight-phase windows, GPU mesh fork census:
+
+    dispatched=242  delivered=243  failed=0  pending=251  queued=235  inFlight=16
+    dispatched=232  delivered=231  failed=0  pending=254  queued=236  inFlight=18
+    dispatched=221  delivered=221  failed=0  pending=252  queued=233  inFlight=19
+
+  pending  = submitted, not yet delivered  (GpuJobsPending)   ~252 of a 256 cap
+  queued   = sitting in the manager's queue                    ~235
+  inFlight = actually executing on the GPU                     ~16
+
+THE SUBMISSION PIPELINE IS FULL OF DEMAND WORK. 235 demand jobs are already
+queued and cannot get through. Speculation has nothing to scavenge: a
+speculative job submitted here does not use idle GPU, it queues behind 235
+demand jobs and is stale before it runs.
+
+S1 did not reveal idle capacity. It CONSUMED the idle capacity, by removing the
+consumer bottleneck that was starving the producer.
+
+--------------------------------------------------------------------------------
+AND inFlight=16 IS NOT THE GPU BEING BUSY
+--------------------------------------------------------------------------------
+
+16 concurrent against a 256 cap, with 235 waiting, is a PROMOTION limit:
+FVoxelGpuMeshJobManager::Tick promotes at most voxel.GPU.MeshBatchCap (4) jobs
+per tick into one FRDGBuilder.
+
+So the GPU is underutilised because of a per-tick promotion cap, not for lack of
+work -- and raising that cap helps DEMAND directly, with no speculation, no
+cache, no hit rate and no new correctness surface.
+
+  MeshBatchCap 4 / MeshHarvestCap 8 were measured on 2026-07-27 and the sweep
+  that set them was monotone: 32/64 -> 367 hitches, 8/16 -> 8, 4/8 -> 8 with the
+  best chunks/s. But those hitches were RENDER-THREAD cost from per-chunk
+  publication, which S1-1 removed. The number was correct for a pipeline that no
+  longer exists. Being re-swept.
+
+--------------------------------------------------------------------------------
+THE REAL BLOCKER: THE MANAGER'S QUEUE IS STRICT FIFO
+--------------------------------------------------------------------------------
+
+Throughput does not rise with GPU concurrency -- 16 -> 179 in flight moves
+chunks/s 1065 -> 1032, i.e. slightly DOWN. So delivery is bounded by how much
+demand asks for, not by fork capacity. The fork keeps up: dispatched=242 against
+delivered=243 per window.
+
+That is good news for T4-1 and bad news for how it submits. FVoxelGpuMeshJobManager
+drains Queued[0] strictly FIFO, so a speculative job submitted now sits AHEAD of
+every demand job queued after it. With ~235 jobs already in the queue at the
+shipped cap, speculation does not fill idle GPU -- it inserts latency into the
+demand path that S1 just spent a whole wave removing.
+
+  So T4-1 needs one of:
+    * job PRIORITY in the manager, or a second queue drained after the first;
+    * or a configuration where the queue is short enough that FIFO ordering does
+      not matter (MeshBatchCap 32 leaves queued=53, which is close).
+
+  The plan explicitly deferred priority -- "deliberately not doing: per-job
+  cancellation and priority in the manager" -- on the grounds that submit-last
+  plus a small sub-budget was equivalent. It is not. Submit-last controls WHEN a
+  job enters the queue; it does nothing about the queue being FIFO once it is in.
+
+MY DEMAND-PROTECTION FLOOR IS ALSO MEASURING THE WRONG THING.
+GpuJobsPending >= (256 - 32) tests pipeline OCCUPANCY, which is latency-driven
+and effectively always true. It should test whether the GPU can accept more work
+-- the manager's in-flight count against what promotion allows.
+
+--------------------------------------------------------------------------------
+STATUS OF T4-1
+--------------------------------------------------------------------------------
+
+BUILT, gated off (voxel.Stream.VelocityLeadSec 0), and CORRECTLY BLOCKED. Not
+cancelled -- blocked on a precondition that is now measurable rather than
+assumed: there must be GPU capacity demand cannot use.
+
+Two bugs were found and fixed getting to this point, both of which made
+speculation silently inert while looking configured:
+
+  1. DispatchSpeculativeJobs() was inside DispatchJobs' cold-band re-queue
+     branch, so it only ran on ticks with cold-band deferrals.
+  2. The demand-protection floor (GpuJobsPending >= 256 - 32) breaks on every
+     tick once demand saturates the fork -- which is now always.
+
+Both are worth keeping. The second is the feature correctly declining to
+compete with demand; it is only a problem because there is no slack at all.
+
+WHAT WOULD MAKE T4-1 LIVE, in order of directness:
+
+  * PRIORITY OR A SECOND QUEUE in FVoxelGpuMeshJobManager, so speculative jobs
+    are promoted only when no demand job is waiting. This is the real fix and the
+    plan was wrong to defer it as equivalent to submit-last.
+  * Fix the demand-protection floor to test GPU acceptance rather than pipeline
+    occupancy.
+  * Tile batching (T3-1), which multiplies chunks-per-dispatch instead of
+    dispatches-per-tick. Its occupancy census already ships.
+
+Do NOT re-enable speculation on the strength of the original "GPU is idle"
+sentence. It is true that the GPU has spare capacity; it is NOT true that
+speculation can currently reach it without delaying demand.

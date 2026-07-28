@@ -1,0 +1,457 @@
+T4-1 SPECULATIVE GENERATION -- FIRST WORKING RESULT
+2026-07-28
+
+STATUS: CONFIRMED. The 10-leg alternated sweep (lead 0/1/2/4/8, two passes, via
+tools/voxel-t41-lead-sweep.ps1) is complete and replicates the first pair
+closely. Full table in section 0 below; sections 1-7 are the original single-pair
+analysis and their numbers are the probe leg's.
+
+============================================================================
+0. THE SWEEP: 10 LEGS, ALTERNATED, lead 0/1/2/4/8 x2
+============================================================================
+
+  lead   chunks/s          flight holes med (p90)      poolPct   park hit
+  0.0    1065.0 / 1064.5   838 (2310) / 807 (2372)       86.2       78%
+  1.0    1062.6 / 1069.5    64 (126)  /  63 (100)        86.7       89%
+  2.0    1070.9 / 1069.4    56 (94)   /  52 (100)        86.8       89%
+  4.0    1069.4 / 1069.6    54 (98)   /  62 (108)        86.8       89%
+  8.0    1068.9 / 1061.5    56 (113)  /  54 (104)        86.9       89%
+
+holes(final)=0, allocFail=0 on all ten. chunks/s spans 1061.5-1070.9 across
+every arm including the controls -- a 0.9% total spread, i.e. speculation has
+NO measurable throughput cost and no measurable throughput benefit.
+
+Median flight holes: ~822 off, ~57 on. A 93% reduction, replicated on both
+passes at every lead value.
+
+THE LEAD TIME IS NOT A TUNING KNOB. 1 s already captures the entire effect and
+8 s is no better; the differences between 1, 2, 4 and 8 are inside the pass-to-
+pass spread of a single arm. This was not the expected shape -- the plan sweeps
+lead precisely because it assumed more lead would buy more coverage -- and it
+matters practically, because the cheapest setting is also the best one. Anything
+that scales with lead (candidates enumerated, in-flight population, parked
+residency) should be sized for ~1-2 s, not for 8.
+
+Why it saturates, most likely: the speculative queue is bounded by
+SpeculativeMaxInFlight*4 and the in-flight population by SpeculativeMaxInFlight
+(32), so beyond a second of lead the binding constraint stops being how far
+ahead the cone reaches and becomes how much work is allowed outstanding. That is
+a hypothesis; the sweep does not test it.
+
+Recommended default if the feature is switched on: voxel.Stream.VelocityLeadSec
+2.0. Not 1.0 (the p90 is slightly worse and it sits at the edge of where the
+effect appears), not 4.0+ (no benefit, strictly more work in flight).
+
+Binary: S1 + S2 shipped stack. voxel.Stream.PoolBatchPublish 1,
+PoolRecycleHandles 1, MaxUnloadsPerFrame 256, MaxAppliesPerFrame 192,
+PoolParkMax 12000, pool 64M quads / table 81,920.
+Legs: -VoxelSpawnAt=-84480,53760 -VoxelPerfFlight=line, 90/120/60, 2s windows.
+  t41-ctrl-1  VelocityLeadSec 0.0  (speculation off)
+  t41-probe   VelocityLeadSec 4.0
+
+============================================================================
+1. THE HEADLINE: FLIGHT-PHASE HOLES FELL 92%
+============================================================================
+
+Transient holes during the 120s flight (windows 46-105, n=60 each):
+
+  arm            median   p90    max   mean
+  lead 0.0 (off)    840  2164   2548    934
+  lead 4.0           64   114    189     67
+
+Wave S4's stated close criterion was "flight-phase transient holes on the GPU
+arm fall from the 854-907 median toward the CPU arm's 55." The measured median
+is 64. That is the criterion met, on the first working leg.
+
+THIS IS THE DELIVERABLE, AND IT IS NOT A THROUGHPUT NUMBER. See section 3.
+
+============================================================================
+2. THROUGHPUT IS A WASH -- AND THAT IS THE EXPECTED RESULT, NOT A MISS
+============================================================================
+
+  arm         chunks/s   holes(final)  allocFail  poolPct  park hit
+  lead 0.0      1057.0             0          0     86.2       78%
+  lead 4.0      1069.5             0          0     86.8       89%
+
++1.2% chunks/s is inside leg-to-leg variance and should be read as "no change".
+
+An earlier version of this programme would have called that a null result. It
+is not. Speculation does not make the pipeline faster -- it makes the terrain
+ARRIVE BEFORE IT IS NEEDED, which is a latency property that chunks/s cannot
+express. A metric that only counts throughput scores a 92% reduction in visible
+holes as a tie. (Same failure family as the four denominator errors in
+docs/lessons-2026-07-27-s0-s1.md: the number was right and the question was
+wrong.)
+
+holes(final) is 0 on BOTH arms, so it cannot decide this either -- the 60s
+linger fills everything in regardless. tools/voxel-leg-summary.ps1 now reports
+the flight-phase distribution as its own column for exactly this reason.
+
+============================================================================
+3. THE MECHANISM, FROM THE FORK CENSUS (mid-flight window, both legs)
+============================================================================
+
+  arm       dispatched delivered pending queued gpuInFlight submitToDeliver
+  lead 0.0         270       269     253    234          19       1863.9 ms
+  lead 4.0         257       449     251    188          63       1110.5 ms
+
+Three things, in the order they cause each other:
+
+  a. gpuInFlight 19 -> 63. The GPU is doing work it was previously idle for.
+     This is what the whole wave was for and it is the first leg on which it
+     actually happened.
+
+  b. The demand queue SHRANK, 234 -> 188. Speculation satisfies chunks before
+     admission asks for them, so fewer demand jobs are ever queued.
+
+  c. Demand latency HALVED, 1863.9 ms -> 1110.5 ms submit-to-deliver. This
+     falls out of (b): a shorter queue is a shorter wait. It is a demand-path
+     improvement produced by adding non-demand work, which is counterintuitive
+     enough to be worth stating plainly.
+
+Delivered per window 269 -> 449 (+67%) while dispatched stayed flat, because
+"delivered" now includes speculative results.
+
+============================================================================
+4a. THE REAL COST IS GAME-THREAD TICK, NOT MEMORY (+45%)
+============================================================================
+
+Tick budget, mid-flight window, both legs:
+
+  arm       tickMs/5s  % of wall  recompute  dispatch  apply  unload  perTick
+  lead 0.0      485.0      9.70%      133.0      10.3   56.6   271.3    7.133
+  lead 4.0      703.2     14.06%      131.6     274.6   51.0   242.6   11.162
+
+The dispatch phase went from 10.3 ms to 274.6 ms per 5 s window -- a 27x
+increase, and essentially all of T4-1's cost. Voxel tick work is 45% more of
+wall clock (9.70% -> 14.06%) and the per-tick figure rose 7.13 ms -> 11.16 ms.
+
+WHERE IT IS *NOT*: EnumerateSpeculativeCandidates() is called BEFORE T0, so the
+annulus walk is outside the dispatch timer entirely. It lands in tickMs without
+a bucket of its own. The first guess written here was that enumeration explained
+the +264 ms; the timer boundaries rule that out.
+
+So the whole increase is inside DispatchJobs, where DispatchSpeculativeJobs()
+runs. The arithmetic there does not obviously add up either:
+
+  lead 0.0:  270 jobs dispatched,  10.3 ms  =  0.038 ms/job
+  lead 4.0:  257 demand + ~185 spec = ~442 jobs, 274.6 ms = 0.62 ms/job
+
+A speculative submit calls the SAME SubmitGpuMeshJob as a demand submit, so a
+16x per-job cost difference is not explicable by the submit itself. Something in
+the speculative path costs per TICK rather than per job -- candidates are the
+linear scan of GpuJobsPending (~252 entries) counting SpecOutstanding on every
+call, and whatever EnsureGpuMeshJobs does per call -- but this is a hypothesis
+with no measurement behind it and it should not be repeated as a finding.
+
+The timer cannot answer it: dispatch= is one bucket covering demand dispatch,
+speculative dispatch and the second post-drain pass. Splitting it is task #21
+and is the prerequisite for any optimisation here, not an optional refinement.
+
+NOT AN ABORT, BUT NOT FREE EITHER. renderMs is unchanged (flight median 30.1 ->
+29.2, max 33.8 -> 35.0), so the doubled per-tick promotion budget did not cost
+render-thread pass setup, which was the risk of giving speculation its own
+allowance on top of MeshBatchCap. chunks/s is unchanged. The bill is paid on the
+game thread, and it is the obvious next optimisation: split the dispatch timer,
+then either cache the annulus walk across ticks or run it on a crossing rather
+than every tick, the way RecomputeDesiredSet already does.
+
+============================================================================
+4b. MEMORY COST: ESSENTIALLY NONE, AND CAPACITY STEP 2 IS NOT JUSTIFIED
+============================================================================
+
+poolPct 86.2 -> 86.8. Peak SPECULATIVE parked population was 172 against a
+SpeculativeMaxParked of 4000 -- the cap is nowhere near binding, because parked
+speculative chunks are adopted almost as fast as they arrive (~86 parked and
+~88 adopted per 5s window, in equilibrium). evictedUnused was 0 for the entire
+leg: not one speculative chunk was meshed, parked, and then thrown away.
+
+CONSEQUENCE FOR THE OWNER'S 104M DECISION. The plan's capacity step 2 (64M ->
+104M quads, table 81,920 -> 131,072) was sized on the assumption that
+speculation would hold a large parked population. It holds ~172 chunks. NOTHING
+MEASURED SO FAR JUSTIFIES THE SECOND CAPACITY STEP. It should not be taken on
+this evidence.
+
+What IS worth watching: poolPct is 86.2% with speculation OFF. That is the S2-3
+abort threshold (~90%) getting close on its own, and it is a pre-existing
+condition of the shipped parking cap, not something T4-1 caused. Flagged, not
+fixed here.
+
+============================================================================
+5. THE HONEST DENOMINATOR: 46%, NOT 96%
+============================================================================
+
+The in-log "hit %" is adopted/parked and read 96%. Against DISPATCHED it is
+4,678 / 10,093 = 46%. Both are true and they answer different questions:
+
+  96% -- of the speculative chunks we kept, almost all got used. The velocity
+         cone is aimed correctly. This is the number Wave S4 called specHitRate
+         and set a >50% bar for.
+  46% -- of the GPU work speculation SPENT, this much reached the screen. This
+         is the cost number, and it is the one to improve.
+
+Roughly half of speculative dispatches never became a park. Three silent early
+returns in ParkSpeculativeResult could each account for it (all-air column,
+demand overtook the job in flight, pool refused). They were uncounted, so the
+split was unknown; drop-reason counters (dropOvertaken / dropEmpty /
+dropPoolFull) are now in the 5s speculation line and the sweep will attribute
+it.
+
+ATTRIBUTED 2026-07-28 FROM THE SWEEP, AND THE HYPOTHESIS WAS WRONG.
+
+Mid-flight windows, sweep legs t41s-lead1-1 and t41s-lead2-1:
+
+  dropOvertaken=0   dropEmpty=100   dropPoolFull=0    (lead 1.0)
+  dropOvertaken=0   dropEmpty=90    dropPoolFull=0    (lead 2.0)
+
+Every non-parking dispatch is an ALL-AIR COLUMN. Not one was overtaken by
+demand, and the pool never refused one.
+
+The suspected cause written here first was "demand overtook it" -- nothing
+consults SpeculativeInFlight in AddCandidate, so admission reaching a key with a
+speculative job in flight would queue a SECOND job and mesh the same chunk
+twice. That is a real gap in the code and it is measurably NOT HAPPENING: by the
+time demand arrives, speculation has already parked the chunk and the adopt path
+takes it. The fix that was designed for it -- routing speculative results to
+ApplyMeshResult on arrival -- would have optimised an empty bucket.
+
+WHAT THE REAL FINDING IS: roughly half of all speculative GPU work meshes air.
+The speculative enumerator is not applying the predicted-empty and buried-skip
+filters that admission applies (the fork's own enable log advertises "not
+already predicted empty" as a condition of the demand path). Fixing that is
+worth ~50% of speculation's GPU cost AND a proportional share of its
+game-thread dispatch cost, since each one is a submit that need not happen.
+
+Note this is not waste in the damaging sense -- an air column parks nothing,
+holds no pool range, and evicts nothing (evictedUnused=0 on every leg). It is
+spent capacity, not corruption. But it is the single largest lever on T4-1's
+cost and it is cheap to take.
+
+============================================================================
+6. CORRECTION TO AN EARLIER READING IN THIS SESSION
+============================================================================
+
+The first read of this leg reported "inFlight 155 -- the GPU is now running 155
+concurrent jobs." That was wrong. It read the speculation census's inFlight
+field, which is SpeculativeInFlight.Num() -- the enumerated-but-unresolved set,
+including ~125 keys still queued and never dispatched. True speculative
+outstanding is capped at 32 and the GPU's real concurrency is the fork census's
+gpuInFlight, which is 63.
+
+The field is now labelled tracked= and a separate gpuInFlight= prints the real
+count. Same class of mistake as the phase-blind window sampling in
+tools/voxel-leg-summary.ps1's footer: a plausible number read off the wrong
+counter, with no error to signal it.
+
+============================================================================
+7. IMPLEMENTATION NOTE -- THE PART THAT WAS WRONG TWICE
+============================================================================
+
+Speculation only works because the manager gained a SECOND queue with its OWN
+per-tick promotion allowance (voxel.GPU.MeshSpeculativeBatchCap, default 4), on
+top of demand's voxel.GPU.MeshBatchCap.
+
+The two designs that came first both made speculation a dead path, and both
+looked like prudence:
+
+  - dispatch floor "GpuJobsPending.Num() >= GpuCap - SpecCap" -- pipeline
+    OCCUPANCY, ~252 of a 256 cap in steady state, true on every tick.
+  - promote low-priority "only when the demand queue is empty" -- the demand
+    queue carries ~236 jobs for the whole flight, so also true on every tick.
+
+Both measured how BUSY the pipeline was and called it full. MeshBatchCap is a
+per-tick burst limiter protecting render-thread pass setup; the actual capacity
+bound is MaxInFlight, and the GPU sat at 19 of 256. Demand is protected
+STRUCTURALLY -- speculative jobs live in their own queue and promote only after
+demand has taken its full allowance -- so no second, weaker copy of that
+guarantee is needed at the submission site.
+
+============================================================================
+8. THE GAME-THREAD COST WAS 97% ONE THING, AND IT IS GONE
+============================================================================
+
+Section 4a recorded a +45% game-thread tick cost and refused to name a cause
+without a measurement. The split timer named it in one leg.
+
+  window                dispatch   specEnum  specDispatch  specPark
+  before (t41-cost2)      343.9        0.8        0.6         334.7
+  after  (t41-batchfix)    10.2        0.8        0.7           0.9
+
+specPark was 97% of the dispatch bucket. Speculation's OWN code -- enumerating
+the cone, submitting the jobs -- costs 1.4 ms per 5 s window combined, which is
+nothing. The cost was ParkSpeculativeResult.
+
+WHY. GpuMeshJobs->Tick() calls OnGpuMeshJobComplete, and a speculative
+completion runs ParkSpeculativeResult INLINE: AddChunkFromGpu plus ParkChunk,
+both pool mutations. That call sits at T0..T1, and S1-1's FScopedBatch did not
+open until after T1. Its comment said the scope deliberately excluded the first
+DispatchJobs because that "submits jobs and touches no pool state" -- true when
+written, and made false by T4-1.
+
+So every speculative park published the whole chunk table on its own. That is
+precisely the per-mutation publication S1-1 removed for demand, and speculation
+was paying it ~185 times per window because it entered the pool through a door
+the scope did not cover. Not a new cost: an old one, re-incurred.
+
+FIX: open the batch before GpuMeshJobs->Tick(). The hazard argument is
+unchanged -- AddChunkFromGpu still does the UnmarkQuadsDirty interval subtract
+that guards the free-then-reallocate-within-one-frame race, which is what makes
+widening this scope safe.
+
+RESULT (mid-flight windows; the fix is replicated on two legs):
+
+                       tickMs   % of wall   perTick   dispatch
+  speculation OFF       485.0      9.70%      7.133      10.4
+  ON, before fix        742.0     14.84%     10.600     343.9
+  ON, after fix         469.5      9.39%      7.335      10.0
+  ON, after fix (leg 2) 459.4      9.19%      7.178      10.4
+
+T4-1's game-thread cost is now INSIDE THE NOISE of having it switched off --
+9.19-9.39% of wall against 9.70% with the feature off. specPark reads 0.9 ms on
+both legs.
+
+Nothing else moved. Both batch-fix legs against the lead-2.0 sweep leg:
+
+  leg              chunks/s  flight holes med (p90)  poolPct  park hit  spec
+  t41s-lead2-1       1070.9        56 (94)             86.8      89%    46%
+  t41-batchfix       1070.3        57 (92)             86.8      89%    46%
+  t41-batchfix-2     1070.4        58 (102)            86.7      89%    46%
+
+allocFail=0 and holes(final)=0 on all three.
+
+PARKING WAS NOT ZEROED. Worth stating explicitly, because task #17 records that
+wrapping RecomputeDesiredSet in an FScopedBatch took parking from 28,117 to
+exactly zero and was reverted undiagnosed. Widening the scope over the manager
+tick does NOT reproduce that: parked=44,727 adopted=39,727 hit=89%, identical to
+the unwidened leg. Whatever #17 is, it is specific to RecomputeDesiredSet.
+
+============================================================================
+9. S4-3 CORRECTNESS GATES
+============================================================================
+
+  voxel.GPU.VerifyPoolWrite 16 4     PASS. Byte-identical to MeshChunkBricks,
+                                     16/16 chunks in the pool buffer, quadFail=0
+                                     idFail=0 guardFail=0 countMismatch=0
+                                     doubleDelivered=0, poolDirectWrites=16
+                                     dropped=0.
+  VoxelEarth.GpuPool automation      4/4 PASS (Basic, Coalesce, DirtyRanges,
+                                     Soak), 0 failures.
+  ctest voxel-core                   2/2 PASS.
+  CoverageVerify                     green on all 16 legs; holes(final)=0.
+  GetGpuDirectWritesDropped          0 on every window of every leg.
+
+  voxel.Stream.PoolClobberSession    RAN, NO EFFECT DETECTED -- WITH A CAVEAT
+                                     THAT SHOULD BE READ.
+
+The clobber session's verdict is a screenshot triple: A/B is the same-session
+noise floor, B/C is the effect, and B/C ~ A/B means the buffers were rebound.
+
+  settle 45 s:   A/B mean=41.68   B/C mean=23.24
+  settle 130 s:  A/B mean=45.30   B/C mean=32.81
+
+B/C is BELOW the floor on both runs, so by the test's own criterion it passes.
+But a noise floor of mean 45/255 is enormous, and it did not shrink when the
+settle was nearly tripled -- the scene never goes static (water animation and
+temporal accumulation keep every frame different from the last). So this gate
+has power against GROSS corruption only, and calling it a clean pass would
+overstate it.
+
+That is a property of the harness, not of T4-1, and it predates this wave. The
+direct evidence that speculation's pool writes are correct is VerifyPoolWrite's
+byte-identical PASS, not this.
+
+NOTE ON A FIRST ATTEMPT: voxel.Stream.PoolClobberTest issued via -ExecCmds at
+startup logs "no live pool component -- nothing to test" and exits 0. A gate
+that no-ops and returns success is the exact shape ground rule 13 warns about;
+it must be run via PoolClobberSession, which settles first.
+
+============================================================================
+10. CAPACITY STEP 2, SIZED FROM MEASUREMENT: 80M, NOT THE PLAN'S 104M
+============================================================================
+
+THE PLAN'S JUSTIFICATION FOR 104M IS VOID. It sized the raise for a large
+speculative parked population. Measured peak speculative parked is ~172 chunks
+against a 4,000 cap, with evictedUnused=0 on every leg. So the number is set
+from what the pool actually reaches.
+
+WHAT IT REACHES, and why the standard leg cannot tell you. On the 120 s flight
+liveChunks climbs 39,020 -> 62,119 and never comes back down, which reads
+exactly like an unbounded leak. It is not: the leg simply STOPS BEFORE THE
+ASYMPTOTE. On a 330 s traverse residency reaches ~60,000 by mid-flight and then
+oscillates 58,208-61,238 for the remaining 150 windows, with highWater flat at
+59,242,301 from w151 onward. The bound is the cascade settle plus PoolParkMax
+(12,000) plus retention -- a property of ring geometry and the park cap, not of
+session length.
+
+  ANY question about growth needs a leg longer than the growth's own time
+  constant. Add this to the harness rules: a 120 s flight can distinguish
+  "fast" from "slow" but cannot distinguish "bounded" from "leaking".
+
+Against the old 64,000,000 that plateau is 92.6% of the pool's address space.
+allocFail was 0, but the margin was 4.76M quads of untouched tail against 26,515
+fragmented free runs whose largest was 6.8M of 10.0M free -- and the failure mode
+is UpdateChunk's realloc DELETING RESIDENT TERRAIN.
+
+MEASURED EFFECT OF THE RAISE (330 s traverse, both arms):
+
+  capacity   capacityPct  free      largestRun  chunks/s  flightHoles med(p90)
+  64,000,000    85.5      10.0M       6.80M      1588.1      60 (132)
+  80,000,000    69.5      26.1M      22.38M      1587.0      58 (106)
+
+allocFail=0 and holes(final)=0 on both. Throughput identical. What the raise
+actually buys is CONTIGUITY -- largest free run 3.3x -- which is the thing
+first-fit needs and the thing no defrag exists to recover (T3-6 is deferred).
+
+Chunk table 81,920 -> 98,304 alongside it: peak liveChunks 61,238 was 75% of the
+old table, and crossing MaxChunks is worse than exhausting quads (it takes the
+MarkRenderStateDirty branch, which per D4-R1 invalidates every GPU-written
+range). Entries are tiny next to the quad buffers.
+
+WHY NOT HIGHER. The CPU shadow is still allocated at full capacity -- InitPool
+does PooledQuads.SetNumZeroed(CapacityQuads) and QuadChunkIds.SetNumZeroed(
+CapacityQuads) unconditionally, and CreateSceneProxy copies both arrays whole.
+So capacity costs 12 B/quad of VRAM AND 12 B/quad of system RAM: 960 MB + 960 MB
+at 80M, plus a 960 MB game-thread memcpy on any render-state rebuild. S2-5
+(dropping the shadow on the GPU-only arm, where nothing reads it) is what makes
+any further raise cheap. Do that BEFORE going higher.
+
+============================================================================
+11. WHERE THE FRAME TIME ACTUALLY GOES -- THE NEXT FRONTIER, MEASURED
+============================================================================
+
+Streaming is no longer the constraint. Flight-phase frameMs median is 34.5 ms
+(~29 fps) and renderMs is 31.2 ms of it -- roughly 90% of the frame is the draw
+path. No further streaming work moves that number.
+
+THE CULL IS DRAWING 3.4x WHAT IS VISIBLE:
+
+  visibleQuads=9,710,941 (16.8%)   drawnQuads=33,358,452   ranges=1024
+
+ranges EQUALS maxRanges, so the cap is binding: the merge cannot describe the
+visible set in 1024 ranges, merges coarsely, and sweeps in geometry nothing can
+see. GMaxRanges already defaults to the kMaxRanges ceiling, so there is no cvar
+sweep available -- raising it is a rebuild.
+
+This is the same failure one step earlier in its own history: the ceiling was
+raised from 64 "BECAUSE 64 ranges cannot describe what is visible at 39k chunks",
+measuring 2.06x over-draw at the time. At 62k chunks, 1024 fails the same way at
+3.4x. The cap needs to scale with resident chunk count, or it will be re-hit.
+
+HOW MUCH IS IT WORTH? Measured with voxel.Stream.GPUCullDebugAllVisible 1:
+
+  arm            drawnQuads    renderMs (flight median)
+  normal         33,358,452       31.2
+  all-visible    49,322,257       38.0
+
++47.8% drawn quads costs +21.8% render time -- 0.426 ms per million quads, with
+a ~17.0 ms fixed cost extrapolated at zero quads.
+
+  Removing the over-draw entirely (33.36M -> 9.71M) is worth ~10.1 ms:
+  renderMs 31.2 -> ~21, frameMs 34.5 -> ~24, about 29 fps -> 41 fps.
+
+STATED PLAINLY SO IT IS NOT OVERSOLD: that is a large win and it does NOT reach
+60 fps. The ~17 ms floor does not depend on geometry volume at all and is a
+separate investigation. And because the slope is SUB-linear, submission cost is
+already material -- so sweep kMaxRanges (1024 -> 2048 -> 4096) and watch for
+renderMs turning back up, rather than assuming more ranges is monotonically
+better. Ranges split across ceil(N/64) draw commands.

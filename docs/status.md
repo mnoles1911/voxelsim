@@ -1,5 +1,41 @@
 # Milestone gate status
 
+## 2026-07-27/28 — the streaming-perf P0 is CLOSED, and T4-1 is built
+
+The pooled-arm plateau that framed the whole streaming-perf effort is resolved.
+At the adopted 128 m / 4 km cascade, on real terrain:
+
+    baseline                          260.9 chunks/s   15,032 converged holes
+    after S1                        ~1,040.5 chunks/s        0 holes
+    with S2-3 parking (line)         1,064.9 chunks/s        0 holes
+
+~4x throughput and the world completing for the first time on the pooled arm.
+Full ladder and every falsified step: `docs/measurements/s1-close-2026-07-27.txt`
+and `docs/measurements/s0-apply-census-2026-07-27.txt`.
+
+**What actually did it.** Per-chunk `PushUpdatesToProxy` was 98–99% of per-apply
+cost, which backed the result queue up until 42% of drained results were
+discarded as stale. Batching publication once per tick fixed both at once —
+throughput and waste were one problem. Then three budgets sized for the OLD
+throughput had to move with it (`MaxUnloadsPerFrame` 24→256,
+`MaxAppliesPerFrame` 64→192, pool 44M→64M quads, chunk table 49,152→81,920).
+
+**What was measured and NOT built**, each argued convincingly from code first:
+T1-3's params cache (0.2% of an apply), T3-6 idle defrag (the fragmentation was
+residency ballooning on a stale unload budget — a cvar, not a compacting
+allocator), and handle recycling as a throughput lever (it is an unboundedness
+fix; cost tracks `Runs.Sort`, not the walk).
+
+**T4-1 (speculative generation) is BUILT and gated off**, pending measurement.
+Most of it was free because S2-3 shipped first: adoption is unchanged code, so
+speculation only had to deliver geometry into a path that was already measured.
+
+**Harness.** Three guards added, each for a failure that produced a plausible
+number rather than an error: legs sharing the box, flight legs truncated at
+preflight, and reading a log mid-run. See `docs/lessons-2026-07-27-s0-s1.md`,
+including the appendix on four denominator failures in one session.
+
+
 Updated whenever gate-relevant work lands. See the implementation plan §4 for
 gate definitions.
 

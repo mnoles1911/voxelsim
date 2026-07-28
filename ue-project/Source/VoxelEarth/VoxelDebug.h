@@ -273,6 +273,18 @@ namespace VoxelDebug
 	// output and has no place in a perf run.
 	VOXELEARTH_API bool GetStreamLogRetention();
 
+	// voxel.Stream.ApplyStageStats (Wave S0, docs/speculative-generation-plan.md
+	// §4): split the per-apply cost into quad pack / SampleChunkParamsForPool /
+	// pool add, reported per 5s window. Default 0.
+	//
+	// It gates the CLOCKS ONLY. The DrainResults exit-reason counters beside them
+	// are unconditional, because they are what decide whether the apply loop
+	// exits on an empty queue or on its 6 ms wall clock -- the question the
+	// published "apply budget only 8.5% saturated, results are not ARRIVING"
+	// reading answers by assumption. Pair with voxel.Stream.PoolPushStats
+	// (VoxelEarthShaders), which splits the pool-add bucket across both threads.
+	VOXELEARTH_API int32 GetStreamApplyStageStats();
+
 	// voxel.Stream.CoverageVerify (ring-gap wave): once per periodic perf-log
 	// window, count the XY footprints inside a ring's core annulus that NO level
 	// is visibly covering -- i.e. the see-through holes, as a number rather than
@@ -280,6 +292,18 @@ namespace VoxelDebug
 	// entirely inside the enable check, so a default run pays one cvar read.
 	// See the coverage block in FVoxelWorldImpl::MaybeLogCounters.
 	VOXELEARTH_API bool GetStreamCoverageVerify();
+
+	// voxel.Stream.LatencyStats (S0-3, docs/speculative-generation-plan.md Wave
+	// S0 / docs/streaming-perf-implementation-plan.md T0-2): per-producer,
+	// per-stage submit->apply latency windows (QueuedMs, DispatchToReadyMs,
+	// ReadyToDeliverMs, SubmitToDeliverMs, DeliverToApplyMs for the GPU fork;
+	// the worker-arm equivalent end-to-end figure and its own DeliverToApplyMs
+	// for the CPU path) plus the per-level quad-count distribution. Default 0.
+	// Gates the window bookkeeping and the new log lines only -- see the cvar's
+	// source comment for why. Exists to tell a genuine per-job GPU cost apart
+	// from Little's-law queue depth (deep-review-streaming-perf-2026-07-27.md
+	// S1d) before believing either explanation.
+	VOXELEARTH_API bool GetStreamLatencyStats();
 
 	// voxel.Render.CastShadow: do terrain chunks render into the directional
 	// light's shadow-depth pass (PR #95)? Default true. Exists to A/B the
@@ -311,6 +335,30 @@ namespace VoxelDebug
 	// voxel.Stream.MaxRemeshesPerFrame: max game-thread overlay-aware edit
 	// re-meshes (DrainGameThreadMesh -- first load of an edited chunk, or a
 	// post-edit dirty re-mesh) applied per frame. Default 8 (2026-07-24 pass).
+	// voxel.Stream.AdmissionRecordCap (S2-0): stop relaxing the per-level
+	// admission cutoff once ChunkRecords reaches this many entries. 0 = off.
+	// The existing relaxation gates on the pending JOB queue being short, which
+	// was a proxy for spare downstream capacity that only held while the queue
+	// was short from STARVATION -- Wave S1 made it permanently short by making
+	// the consumer fast. See the cvar's source comment.
+	VOXELEARTH_API int32 GetStreamAdmissionRecordCap();
+
+	// voxel.Stream.PoolParkMax (S2-3): max chunks kept as hidden-but-allocated
+	// pool ranges after eviction, so re-admission is a chunk-table write rather
+	// than a re-mesh. 0 = off. Parked chunks still consume pool quads and
+	// chunk-table entries, so this cap bounds real capacity -- see the cvar's
+	// source comment.
+	// T4-1 speculative generation. VelocityLeadSec 0 = off (the whole feature).
+	// The lead feeds speculative enumeration ONLY -- admission, eviction and
+	// retention stay on the true anchor. See the cvars' source comments.
+	VOXELEARTH_API int32 GetStreamBatchRecompute();
+	VOXELEARTH_API float GetStreamVelocityLeadSec();
+	VOXELEARTH_API float GetStreamVelocityLeadMaxUU();
+	VOXELEARTH_API int32 GetStreamSpeculativeMaxParked();
+	VOXELEARTH_API int32 GetStreamSpeculativeMaxInFlight();
+
+	VOXELEARTH_API int32 GetStreamPoolParkMax();
+
 	VOXELEARTH_API int32 GetStreamMaxRemeshesPerFrame();
 
 	// voxel.Stream.MaxUnloadsPerFrame: max chunk-component unload events
@@ -411,6 +459,33 @@ struct FVoxelPerfSnapshot
 
 	// --- Frame ---------------------------------------------------------------
 	float SubsystemTickMs = 0.f;
+
+	// --- Where the streaming anchor is, and how fast it is moving -----------
+	//
+	// The anchor is the pawn location TickStreaming was called with -- the same
+	// point every ring radius, admission cutoff and retention decision is
+	// measured from -- so this is the position that explains the rest of the
+	// panel, not merely the camera's.
+	//
+	// SPEED IS FINITE-DIFFERENCED FROM THE ANCHOR, NOT READ FROM
+	// Pawn->GetVelocity(). That matters specifically for the runs anyone wants
+	// to watch: -VoxelPerfFlight=line drives the pawn with
+	// SetActorLocationAndRotation(..., TeleportPhysics) every tick, bypassing
+	// AddMovementInput and UFloatingPawnMovement entirely, so the movement
+	// component's Velocity stays at zero for the whole flight. A speed row fed
+	// from GetVelocity() would read 0.0 m/s across every perf leg while the
+	// world visibly streams past. (Wave S3 needs this same signal for the
+	// velocity-lead work -- see docs/speculative-generation-plan.md §2.4.)
+	//
+	// Metres, and metres/second: 1 voxel = 10 UU = 0.1 m, and every speed this
+	// project quotes -- the 20 m/s flight, the movement tuning table -- is in
+	// m/s. Converting once here keeps the HUD honest against those numbers.
+	double AnchorXMeters = 0.0;
+	double AnchorYMeters = 0.0;
+	double AnchorZMeters = 0.0;
+	// EMA-smoothed over ~0.25 s. Raw frame-to-frame delta is unreadable at
+	// 60+ fps and jitters hard on any frame the pawn is repositioned.
+	float AnchorSpeedMetersPerSec = 0.f;
 
 	// --- Raw counters (vxc::Counters totals, plain mirror) ------------------
 	uint64 BricksGenerated = 0;

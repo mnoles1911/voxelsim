@@ -1,0 +1,99 @@
+DRAW PATH: 32.7 -> 66.3 fps AT 2560x1440, AND WHY EITHER KNOB ALONE FINDS A FLOOR
+2026-07-28
+
+GOAL (owner): >60 fps while the player is MOVING, at 2K, with headroom for
+gameplay systems not yet built.
+
+RESULT: p50 15.08 ms = 66.3 fps at 2560x1440, replicated on two legs, with
+holes(final)=0 and allocFail=0. Hitch frames 3747 -> 8-17.
+
+  at 2560x1440        p50      fps    p95      max     hitches
+  shipped baseline   30.59    32.7   44.87    49.50      3747
+  new defaults       15.08    66.3   20.75    46.77        17
+  new defaults (2)   15.08    66.3   20.72    46.48         8
+
+============================================================================
+1. RESOLUTION IS FREE, WHICH IS THE FINDING THAT MADE THE TARGET REACHABLE
+============================================================================
+
+  baseline @ 1600x900   p50 30.61   p95 45.02   hitches 3756
+  baseline @ 2560x1440  p50 30.59   p95 44.87   hitches 3747
+
+2.56x the pixels (1.44M -> 3.69M) for ZERO cost, at identical settings. The
+renderer is entirely geometry- and submission-bound; nothing in the frame scales
+with pixel count at these densities.
+
+That is why the 900p sweeps were worth running at all, and it should be
+re-checked rather than assumed after any future change: the moment something
+becomes pixel-bound, every 900p result in this file stops transferring.
+
+Density, for context: 29M triangles into 3.69M pixels is 7.8 tri/pixel at 2K
+(20 at 900p). A balanced renderer sits nearer 1-2.
+
+============================================================================
+2. THE TWO KNOBS ARE INSEPARABLE -- SWEEPING EITHER ALONE FINDS A FALSE FLOOR
+============================================================================
+
+voxel.Stream.GPUCullMaxRanges is the draw-range BUDGET. voxel.Stream.
+GPUCullMergeGap coalesces ranges separated by fewer than N quads. Swept alone,
+each one stalls and says "done":
+
+  GPUCullMaxRanges alone, gap left at its old 4096:
+     K=1024  p50 30.61   K=4096  24.11   K=8192  24.06   K=16384  24.35
+     -> 16384 is WORSE than 4096. On this evidence alone it would be rejected.
+
+  GPUCullMergeGap alone, K left at 4096:
+     gap 4096  23.92   gap 1024  20.49   gap 256  20.64   gap 64  20.59
+     -> saturates at 1024, and `ranges` pins at the 4096 cap.
+
+Joint, at 2K:
+
+  gap    K       p50      p95     drawn        ranges
+  4096   1024   30.59    44.87    33.1M         1023
+  1024   4096   20.51    24.75    14.5M         4095   (cap binding)
+  1024   8192   16.12    21.57
+   256  16384   15.26    20.95     9.83M        7338
+    64  16384   15.15    20.87     9.72M        8002   <- adopted
+
+THE MECHANISM: a coarse gap merges away the very ranges a large budget exists to
+keep, so the budget cannot bind and reads as useless. A fine gap PRODUCES many
+small ranges, and then the budget is what stops them being merged back. Each
+knob is the other's precondition.
+
+GENERAL LESSON, worth carrying: when two parameters gate the same resource, a
+one-at-a-time sweep measures each one's effect AT THE OTHER'S WRONG VALUE. The
+16384 rejection was a real measurement and a wrong conclusion.
+
+============================================================================
+3. OVER-DRAW IS GONE, SO THIS LEVER IS SPENT
+============================================================================
+
+  drawnQuads 33,065,957 -> 9,722,222   against visibleQuads 9,710,941
+
+3.4x over-draw -> 1.001x. The cull now submits essentially exactly what is
+visible. `ranges` settles at ~8,002, comfortably under the 16384 ceiling, so the
+ceiling is no longer the binding constraint -- it is only there so as not to be
+one.
+
+There is nothing further for GPUCullMaxRanges or GPUCullMergeGap to recover.
+Any further frame-time win must come from LESS GEOMETRY, not from better
+selection of the same geometry: occlusion culling (the cull is frustum-only and
+frustum already rejects 68% of chunks, but at 7.8 tri/pixel most survivors are
+behind something), per-chunk greedy meshing, or cascade reduction.
+
+============================================================================
+4. WHAT IS NOT DONE: THE TAIL
+============================================================================
+
+p50 clears 60 fps comfortably. p95 is 20.7-20.9 ms = ~48 fps, and max frame is
+still 43-47 ms. So 60 fps is the MEDIAN, not the floor, and the worst 5% of
+frames miss it.
+
+State this precisely rather than reporting "66 fps": a player feels the tail.
+The remaining problem is a different one from the one solved here -- over-draw
+is eliminated, so the tail is now about VARIANCE (what makes an occasional frame
+3x the median) rather than about volume. Hitch count is already down 3747 -> 8-17
+of ~16,000 frames, so whatever remains is rare.
+
+Correctness on both adopted-default legs: holes(final)=0, allocFail=0,
+allocFailQuads=0, CoverageVerify green.

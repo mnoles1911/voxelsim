@@ -1,0 +1,131 @@
+# Run ONE headless FLIGHT leg, and refuse to start if anything else is running.
+#
+# WHY THIS EXISTS SEPARATELY FROM voxel-run-leg.ps1. That script stops the editor
+# when the world has been settled for N samples, which is right for a COLD-FILL
+# leg and silently wrong for a flight leg: the world settles during the preflight,
+# its settle rule fires, and it kills the editor BEFORE THE FLIGHT STARTS while
+# returning success (found in Wave S0 --
+# docs/measurements/s0-apply-census-2026-07-27.txt). It now refuses
+# -VoxelPerfFlight= outright and points here.
+#
+# A flight leg does not need a settle rule. UVoxelPerfRunSubsystem calls
+# RequestExit itself at PreflightSec + VoxelPerfRun + LingerSec, so the run's own
+# clock decides when it is done and there is no lull to mistake for a finish.
+#
+# ============================================================================
+# THE ONE-EDITOR RULE, AND WHY IT IS ENFORCED RATHER THAN REMEMBERED
+# ============================================================================
+#
+# 2026-07-27: two legs ran CONCURRENTLY for 86 seconds because a new sweep was
+# launched while the previous sweep's loop was still going. Both were real runs
+# writing real logs; nothing errored; the numbers were simply contended. The
+# contaminated leg then went into a measurements file as a REJECTED result with
+# a confident mechanical explanation attached to it.
+#
+# That is worse than a crash. A crashed leg is obviously void; a contended leg
+# looks exactly like a slow configuration, and "this setting made it worse" is
+# precisely the shape of conclusion that a second process on the GPU produces
+# for free.
+#
+# It was caught by a human noticing two game windows on screen, which is not a
+# control. So: this script refuses to start while any UnrealEditor process is
+# alive, and prints what it found.
+#
+# Ground rule 1 says never conclude from a single run. This is its sibling:
+# never conclude from a run that was sharing the box.
+#
+# Usage:
+#   tools\voxel-run-flight-leg.ps1 -LogName s1close-1 `
+#       -Cvars "voxel.Stream.PoolBatchPublish 1, voxel.Stream.CoverageVerify 1"
+#
+# Note -ExecCmds is assembled and quoted HERE. Start-Process -ArgumentList does
+# not re-quote an argument containing spaces, so a hand-built '-ExecCmds=a 1, b 1'
+# reaches UE as '-ExecCmds=a' and every cvar after the first space is dropped --
+# which in Wave S0 presented as every gated timing reading 0.00ms, i.e. "the
+# apply path costs nothing", in an otherwise healthy-looking log.
+
+param(
+    [Parameter(Mandatory=$true)][string]$LogName,
+    [string]$Cvars = 'voxel.Stream.CoverageVerify 1',
+    [string[]]$ExtraArgs = @(),
+    [int]$RunSec = 120,
+    [int]$PreflightSec = 90,
+    [int]$LingerSec = 60,
+    [int]$LogIntervalSec = 2,
+    # 'line' traverses virgin terrain and never revisits; 'surface' is the 100 m
+    # circle, which revisits continuously. They are opposite extremes for
+    # anything that CACHES geometry -- parking scored 84% hit / -18% chunks/s on
+    # line, where there is nothing to revisit. Quote which one a result came from.
+    [ValidateSet('line','surface','underground','static')][string]$Flight = 'line',
+    [string]$SpawnAt = '-84480,53760',
+    # RENDER RESOLUTION, and it is not cosmetic. The harness defaulted to
+    # 1600x900 (systemresolution.resx in the log), while the owner's frame-rate
+    # target is 2560x1440 -- 3.686M pixels against 1.44M, a 2.56x difference in
+    # anything pixel-bound. A frame-rate result that does not state its
+    # resolution is not a result. Pass -Width/-Height and say which in whatever
+    # you write.
+    [int]$Width = 1600,
+    [int]$Height = 900,
+    [int]$TimeoutSec = 480,
+    [switch]$KeepEditLog,
+    [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe'
+)
+
+$ErrorActionPreference = 'Stop'
+$Project = (Resolve-Path "$PSScriptRoot\..\ue-project\VoxelEarth.uproject").Path
+$LogPath = Join-Path (Resolve-Path "$PSScriptRoot\..").Path "Saved\$LogName.log"
+
+# THE GUARD. See the header.
+$running = @(Get-Process UnrealEditor-Cmd, UnrealEditor -ErrorAction SilentlyContinue)
+if ($running.Count -gt 0) {
+    $detail = ($running | ForEach-Object { "PID $($_.Id) ($($_.ProcessName))" }) -join ', '
+    throw ("REFUSING TO START: $($running.Count) editor process(es) already running -- $detail. " +
+           "Two legs sharing the box produce contended numbers that look exactly like a slow " +
+           "configuration, and nothing in the log says so. Wait for the other run, or stop it. " +
+           "See the header of this script and docs/measurements/s1-close-2026-07-27.txt.")
+}
+
+# The edit log persists across runs and replays on load, so a leg measured
+# without clearing it is not cold (ground rule 11).
+if (-not $KeepEditLog) {
+    $dir = Join-Path (Split-Path $Project) 'Saved\VoxelWorlds'
+    if (Test-Path $dir) {
+        Get-ChildItem $dir -Filter *.vxlog -ErrorAction SilentlyContinue | Remove-Item -Force
+    }
+}
+
+$argList = @(
+    "`"$Project`"", '-game', '-nosplash', '-unattended', '-sm6', '-dx12',
+    "-abslog=`"$LogPath`"",
+    "-ResX=$Width", "-ResY=$Height", '-WinX=0', '-WinY=0',
+    "-VoxelSpawnAt=$SpawnAt",
+    "-VoxelPerfRun=$RunSec",
+    "-VoxelPerfFlight=$Flight",
+    "-VoxelPerfPreflightSec=$PreflightSec",
+    "-VoxelPerfLingerSec=$LingerSec",
+    "-VoxelPerfLogInterval=$LogIntervalSec",
+    "-ExecCmds=`"$Cvars`""
+) + $ExtraArgs
+
+$started = Get-Date
+$p = Start-Process -FilePath $Editor -PassThru -WindowStyle Hidden -ArgumentList $argList
+$p.WaitForExit($TimeoutSec * 1000) | Out-Null
+
+if (-not $p.HasExited) {
+    Stop-Process -Id $p.Id -Force
+    Write-Host "  ${LogName}: KILLED at ${TimeoutSec}s -- treat as VOID, not as a slow result." -ForegroundColor Yellow
+    return $false
+}
+
+# A flight leg's own clock is ~PreflightSec + RunSec + LingerSec. Much shorter
+# than that means it died rather than finished, and a short log is not a fast run.
+$elapsed = [int]((Get-Date) - $started).TotalSeconds
+$expected = $PreflightSec + $RunSec + $LingerSec
+if ($elapsed -lt ($expected * 0.9)) {
+    Write-Host ("  ${LogName}: exited after ${elapsed}s but the run's own clock is ~${expected}s -- " +
+                "VOID (it did not complete its flight).") -ForegroundColor Yellow
+    return $false
+}
+
+Write-Host "  ${LogName}: ok (${elapsed}s) at ${Width}x${Height}" -ForegroundColor Green
+return $true

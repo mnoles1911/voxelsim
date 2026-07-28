@@ -301,6 +301,28 @@ namespace
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
+	// S2-1: id-only write over a freed range. Shares FVoxelQuadPoolWriteCS's
+	// parameter struct shape minus the source buffer -- InQuads/OutQuads are not
+	// bound because the hide never reads or writes quad payload.
+	class FVoxelQuadPoolHideCS : public FGlobalShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelQuadPoolHideCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelQuadPoolHideCS, FGlobalShader);
+
+		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+		{
+			return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+		}
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, DstFirst)
+			SHADER_PARAMETER(uint32, NumQuads)
+			SHADER_PARAMETER(uint32, ChunkId)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkIds)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
 	// --- BandReduceMain: the footprint band (Wave D / D6) ------------------
 	//
 	// Derives from FVoxelWorldGenShader, unlike the quad-total kernel, because
@@ -339,6 +361,7 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelQuadTotalCS,  VOXEL_QUAD_SCAN_USF, "QuadTotalMain"
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelQuadCompactCS,   VOXEL_QUAD_POOL_WRITE_USF, "QuadCompactMain",   SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelQuadPoolWriteCS, VOXEL_QUAD_POOL_WRITE_USF, "QuadPoolWriteMain", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelQuadPoolHideCS,  VOXEL_QUAD_POOL_WRITE_USF, "QuadPoolHideMain",  SF_Compute);
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelColumnCS,     VOXEL_WORLDGEN_USF, "ColumnMain",     SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelVoxelizeCS,   VOXEL_WORLDGEN_USF, "VoxelizeMain",   SF_Compute);
@@ -813,6 +836,27 @@ void VoxelGpuWorldGen::AddQuadPoolWritePass(FRDGBuilder& GraphBuilder, FRDGBuffe
 	TShaderMapRef<FVoxelQuadPoolWriteCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 	FComputeShaderUtils::AddPass(
 		GraphBuilder, RDG_EVENT_NAME("Voxel.QuadPoolWrite(chunk %u, %u quads @ %u)", ChunkId, NumQuads, DstFirst),
+		Shader, Params,
+		FIntVector(FMath::DivideAndRoundUp(NumQuads, 64u), 1, 1));
+}
+
+void VoxelGpuWorldGen::AddQuadPoolHidePass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstIds,
+                                           uint32 DstFirst, uint32 NumQuads, uint32 HiddenChunkId)
+{
+	if (NumQuads == 0 || DstIds == nullptr)
+	{
+		return;
+	}
+
+	FVoxelQuadPoolHideCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelQuadPoolHideCS::FParameters>();
+	Params->DstFirst = DstFirst;
+	Params->NumQuads = NumQuads;
+	Params->ChunkId = HiddenChunkId;
+	Params->OutChunkIds = GraphBuilder.CreateUAV(DstIds);
+
+	TShaderMapRef<FVoxelQuadPoolHideCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(
+		GraphBuilder, RDG_EVENT_NAME("Voxel.QuadPoolHide(%u quads @ %u)", NumQuads, DstFirst),
 		Shader, Params,
 		FIntVector(FMath::DivideAndRoundUp(NumQuads, 64u), 1, 1));
 }

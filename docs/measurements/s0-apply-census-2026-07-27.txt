@@ -1,0 +1,250 @@
+================================================================================
+WAVE S0 -- APPLY-PATH CENSUS, AND THE VERDICT ON THE DEEP REVIEW'S SECTION 1a
+================================================================================
+
+Executes docs/speculative-generation-plan.md Wave S0 (= T0-1..T0-3 of
+docs/streaming-perf-implementation-plan.md). Instrumentation only; no behaviour
+change. Measured 2026-07-27, AMD Radeon RX 7800 XT, seed 20260719, adopted
+128 m / 4 km cascade, real terrain (25 tiles, spawn INSIDE coverage).
+
+Standard leg, five of them, edit log cleared before each:
+  UnrealEditor-Cmd.exe <uproject> -game -nosplash -unattended -sm6 -dx12
+    -VoxelSpawnAt=-84480,53760 -VoxelPerfRun=120 -VoxelPerfFlight=line
+    -VoxelPerfPreflightSec=90 -VoxelPerfLingerSec=60 -VoxelPerfLogInterval=2
+    -ExecCmds="voxel.Stream.CoverageVerify 1, voxel.Stream.ApplyStageStats 1,
+               voxel.Stream.PoolPushStats 1, voxel.Stream.LatencyStats 1,
+               voxel.GPU.MeshLatencyStats 1"
+
+  s0-gpu-1, s0-gpu-2          GPU fork, stats on
+  s0-cpu-1, s0-cpu-2          -VoxelNoGpuMesh, stats on
+  s0-gpu-statsoff             GPU fork, ONLY CoverageVerify on
+
+A sixth leg ran first and is discarded (cold PSO, ground rule 1).
+
+--------------------------------------------------------------------------------
+GATE 0: THE INSTRUMENT IS NOT THE PERTURBATION
+--------------------------------------------------------------------------------
+
+  leg                loaded   meanChunks/s   queueEmptyExits   wallClockExits
+  s0-gpu-1           71,620   265.8          1,879             10,281
+  s0-gpu-2           71,572   265.6          1,847             10,240
+  s0-cpu-1           69,988   259.6          1,958             10,146
+  s0-cpu-2           70,899   262.6          1,979             10,365
+  s0-gpu-statsoff    70,086   261.8          1,857             10,013
+
+Stats-off 261.8 against stats-on 265.8 / 265.6 = -1.5%, INSIDE the within-config
+spread (gpu-1 vs gpu-2 differ by 0.08%; cpu-1 vs cpu-2 by 1.2%). The timing pairs
+do not move what they measure. Everything below is quotable.
+
+(meanChunks/s is averaged over every 5 s window including the linger, where it is
+0 by construction. It is a leg-to-leg COMPARISON figure, not the fill rate --
+in-flight rates are in the decay table below.)
+
+--------------------------------------------------------------------------------
+VERDICT ON SECTION 1a: CONFIRMED, and the mechanism is worse than described
+--------------------------------------------------------------------------------
+
+1. THE APPLY LOOP NEVER EXITS ON AN EMPTY QUEUE WHILE STREAMING.
+
+   Every 5 s window during fill and flight, on all five legs:
+     exit queueEmpty=0  wallClock=148 / 130 / 103 / 86 ...
+   Aggregated over a leg, wallClock beats queueEmpty 5.5:1 (10,281 vs 1,879),
+   and every queueEmpty exit is in the linger phase where nothing streams.
+
+   THIS FALSIFIES THE PUBLISHED READING OF THE OPEN P0. That reading -- "apply
+   budget only 8.5% saturated, results are not ARRIVING" -- came from
+   LastAppliedFrac, which divides by the COUNT ceiling while DrainResults breaks
+   on a 6 ms WALL CLOCK. Results arrive faster than the consumer applies them.
+   The consumer is the wall.
+
+2. THE APPLY IS ~99% POOL PUBLICATION, AND IT GROWS 7.6x WITHIN ONE LEG.
+
+   Per-apply, GPU arm, s0-gpu-1 (identical shape on all four stats-on legs):
+
+     phase                    pack      params    poolAdd
+     early fill               0.004 ms  0.002 ms  0.275 ms
+     mid fill                 0.003     0.002     0.409
+     late fill                0.003     0.002     0.578
+     settle                   0.003     0.002     0.717
+     flight                   0.003     0.003     1.347
+     flight                   0.004     0.003     2.009
+     flight (peak)            0.004     0.004     2.108
+
+   poolAdd -- Pool->AddChunk / AddChunkFromGpu / UpdateChunk, INCLUDING the
+   PushUpdatesToProxy each ends in -- is 98-99% of per-apply cost at every point
+   in the run, and rises 0.275 -> 2.108 ms as the world fills and then flies.
+   At 2.1 ms against a 6 ms budget that is ~3 applies per frame.
+
+3. INSIDE THE PUBLICATION, THE TABLE COPY IS THE SMALLEST TERM.
+
+   Per push, s0-gpu-1, early fill -> settle:
+     tableCopy    0.013 -> 0.057 ms      (game thread)
+     BuildRuns    0.254 -> 0.654 ms      (game thread)
+     RunBounds    0.247 -> 0.714 ms      (render thread)
+
+   Section 1a leads with "1.2-1.5 MB of memcpy per applied chunk". That memcpy is
+   real but it is the CHEAPEST of the three. BuildChunkRuns (walk + sort) and
+   RebuildRunBounds are co-dominant and each ~11x the table copy at settle.
+
+   CORRECTION TO THE REVIEW: it prices RebuildRunBounds at "~2-4 ms of
+   render-thread CPU per applied chunk". Measured: 0.247-0.714 ms. The estimate
+   is 4-6x too high. The conclusion it supports is unaffected -- RebuildRunBounds
+   is still one of the two dominant terms -- but the number should not be requoted.
+
+--------------------------------------------------------------------------------
+NEW FINDING 1: BuildChunkRuns WALKS AN APPEND-ONLY ARRAY (3.7x WASTE BY END OF FLIGHT)
+--------------------------------------------------------------------------------
+
+UVoxelGpuPoolComponent::Allocations is append-only -- Add in AddChunk and
+AddChunkFromGpu, Reset only in InitPool, freed slots zeroed in place and never
+reused. BuildChunkRuns reserves and walks all of it, and runs once per
+publication. So its cost tracks chunks EVER ADDED, not residency.
+
+  s0-gpu-1, mean per build:
+    phase          allocsWalked   runsEmitted   ratio
+    fill           28,042         28,042        1.00
+    fill           38,400         38,400        1.00
+    flight         40,102         39,117        1.03
+    flight         45,712         41,085        1.11
+    flight         51,018         43,192        1.18
+    flight         55,234         43,271        1.28
+    flight         59,390         43,163        1.38
+    flight         62,724         40,587        1.55
+    flight         64,931         30,329        2.14
+    flight (end)   68,416         18,389        3.72
+
+The walk climbs monotonically while the live set it produces FALLS. By the end of
+a 120 s flight the pool walks 68,416 allocations to emit 18,389 runs. This is
+unbounded in session length, not in world size, and no existing counter showed it.
+
+It also means the measured per-apply growth in section 2 above has TWO components:
+residency (expected, and what batching amortises) and cumulative loads (this,
+which batching does NOT fix -- it needs handle recycling).
+
+--------------------------------------------------------------------------------
+NEW FINDING 2: THE RESULT QUEUE BACKS UP, AND THE BACKLOG ROTS
+--------------------------------------------------------------------------------
+
+Producer against consumer, per 2 s window during flight (s0-gpu-1):
+
+    dispatched=3321  drained=1116  stale=643   (57.6%)
+    dispatched=3448  drained=1925  stale=1574  (81.8%)
+    dispatched=3333  drained=407   stale=37    ( 9.1%)
+    dispatched=2350  drained=3262  stale=3026  (92.8%)
+
+Mean stale fraction over the whole leg: 40% (40/42/40/40 across the four stats-on
+legs). Deliver-to-apply latency, measured by S0-3, grows with the backlog:
+
+    deliverToApply p50   0.8 s -> 2.7 s -> 7.5 s -> 21 s -> 37 s -> 90 s
+
+That is not a per-item cost, it is queue residence time. A result that waits tens
+of seconds is usually superseded or its record evicted by the time it is drained,
+so it is discarded -- the GPU generated it, the queue held it, and nobody drew it.
+
+  CAUTION, and it is why this entry exists: the 90 s figure was initially read as
+  an instrumentation bug because it is absurd as a latency. It is not a bug. Both
+  the stamp (OnGpuMeshJobComplete / the CPU worker task body) and the read
+  (DrainResults) use FPlatformTime::Seconds(). It is measuring a real backlog.
+
+CONSEQUENCE FOR THE PLAN: this makes T1-1 worth more than a linear win. Cutting
+apply cost shortens the queue, which cuts the stale fraction, which recovers
+throughput a second time. The two compound. Nothing in the programme had a number
+for the stale fraction under flight before this.
+
+--------------------------------------------------------------------------------
+LATENCY SPLIT: THE GPU IS NOT THE LIMITER (supports section 1d, and T4-1)
+--------------------------------------------------------------------------------
+
+s0-gpu-1, final window, n=256:
+    queued           p50 127.7   p95 1145.2   max 1234.2 ms
+    dispatchToReady  p50  12.1   p95   18.0   max   21.2 ms
+    readyToDeliver   p50  11.9   p95   33.0   max   41.8 ms
+    submitToDeliver  p50 157.0   p95 1161.7   max 1263.5 ms
+
+The GPU finishes a chunk in ~12 ms and the job then waits ~128 ms to have been
+picked up in the first place. Queue depth over throughput, exactly section 1d.
+
+This is the first in-engine evidence for T4-1's premise that spare GPU capacity
+exists. It does NOT license the 92,000 chunks/s bench figure -- see
+docs/speculative-generation-plan.md section 2.1 for why that number does not
+transfer. The live dispatch ceiling is still unmeasured and Wave S1 must measure it.
+
+--------------------------------------------------------------------------------
+MESHER INDEPENDENCE HOLDS
+--------------------------------------------------------------------------------
+
+GPU arm mean 265.7 chunks/s, CPU arm mean 261.1 -- a 1.8% difference against a
+1.2% within-config spread. The per-apply poolAdd curve is the same shape on both.
+Consistent with the previously recorded "plateau regardless of mesher" (602 vs
+593) and confirms the limiter is downstream of the producer.
+
+Converged holes: 15,108 / 14,761 (GPU), 15,386 / 15,349 (CPU), 15,534
+(stats-off). Unchanged from the recorded ~15.3k, on both arms.
+
+--------------------------------------------------------------------------------
+FALSIFIED: T1-3, THE PER-APPLY Amplifier::column
+--------------------------------------------------------------------------------
+
+Section 1c names SampleChunkParamsForPool as an aggravator, and
+docs/speculative-generation-plan.md put T1-3(a) on T4-1's critical path on the
+grounds that speculation multiplies the call count.
+
+MEASURED: params is 0.002-0.004 ms per apply, 0.2% of the apply, at every point
+in every leg. pack is 0.003-0.005 ms. Neither is worth a wave, and multiplying
+0.2% by a speculative lead factor is still 0.2%.
+
+  T1-3 IS STRUCK FROM THE CRITICAL PATH. Do not build the column-keyed params
+  cache for throughput. (The hoist of SampleChunkParamsForPool out of the two
+  call sites, made to time it, is kept -- it is behaviour-identical and it is
+  what makes the number readable.)
+
+This is the wave paying for itself: one item removed before it was built, on a
+measurement, for the cost of one leg set.
+
+--------------------------------------------------------------------------------
+HARNESS DEFECT FOUND: voxel-run-leg.ps1 SILENTLY TRUNCATES FLIGHT LEGS
+--------------------------------------------------------------------------------
+
+tools/voxel-run-leg.ps1 stops the editor when the world has been settled for N
+consecutive samples. On a FLIGHT leg the world settles during the 90 s preflight,
+so the script killed the editor 32 s BEFORE the flight began -- and reported
+success. The first attempt at this census produced a cold-fill-only log that
+looked like a complete leg.
+
+The script is a COLD-FILL driver. Flight legs must not use it:
+UVoxelPerfRunSubsystem calls RequestExit itself at
+PreflightSec + DurationSeconds + LingerSec, so the correct driver is to launch
+the editor directly and wait for it to exit (306 s observed for a 90/120/60 leg).
+
+The ground rule this seems to contradict -- "drive legs through
+voxel-run-leg.ps1, not a hand-written wait loop" -- exists because a hand-written
+loop mistook a mid-fill LULL for a finish. That hazard is specific to cold-fill
+legs, where the harness decides when the run is done. On a flight leg the run's
+own clock decides and there is no lull to mistake.
+
+SECOND HARNESS TRAP, same session: -ExecCmds passed through Start-Process
+-ArgumentList is not re-quoted, so UE parsed only up to the first space and every
+cvar after "voxel.Stream.CoverageVerify" was dropped. The symptom was every gated
+timing reading 0.00ms -- i.e. "the apply path costs nothing", the exact opposite
+of the truth, presented as data. Embed the quotes inside the argument.
+
+--------------------------------------------------------------------------------
+WHAT THIS CHANGES IN THE PLAN
+--------------------------------------------------------------------------------
+
+  CONFIRMED  Wave S1 proceeds. Section 1a holds; the consumer is the wall.
+  RAISED     S1-2 handle recycling -- from a tidy-up to a 3.7x reduction in the
+             dominant game-thread term by end of flight, and unbounded in session
+             length. It is NOT subsumed by batching.
+  RAISED     T1-1's expected payoff -- apply cost and the stale fraction compound.
+  STRUCK     T1-3 params cache (see above).
+  UNCHANGED  T1-2(a)/(c) still conditional on the post-S1-1 render-thread number.
+  UNCHANGED  The S1 close still requires the head-to-head at >= 1,082 chunks/s
+             with holes(final)=0, and the live GPU dispatch ceiling still has to
+             be measured before any speculative budget is sized.
+
+Raw logs are NOT COMMITTED -- ~3 MB each, /Saved/ is gitignored. They were
+written to Saved/s0-gpu-1.log, s0-gpu-2.log, s0-cpu-1.log, s0-cpu-2.log,
+s0-gpu-statsoff.log on the measuring box, with perf JSON in
+ue-project/Saved/PerfRuns/perf_20260727_181746.json and siblings. This file is
+the citable record; re-run the leg command at the top to regenerate the logs.

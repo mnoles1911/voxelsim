@@ -1,0 +1,329 @@
+================================================================================
+WAVE S1 CLOSE -- holes 15,032 -> 0, chunks/s 260 -> 797, and the bottleneck moved
+================================================================================
+
+docs/speculative-generation-plan.md Wave S1. Measured 2026-07-27, AMD Radeon
+RX 7800 XT, seed 20260719, adopted 128 m / 4 km cascade, real terrain, edit log
+cleared per leg, flight legs launched directly (voxel-run-leg.ps1 is a cold-fill
+driver -- see the S0 file).
+
+--------------------------------------------------------------------------------
+THE LADDER, EACH STEP MEASURED
+--------------------------------------------------------------------------------
+
+  config                                   chunks/s   holes    allocFail
+  baseline (S0, per-chunk publication)        260.9   15,032           0
+  + PoolBatchPublish                          581.3      966      77,290
+  + pool 44M->64M, table 49,152->81,920       631.6      257      26,763
+  + MaxUnloadsPerFrame 24 -> 96               791.3       14           0
+  + MaxUnloadsPerFrame 24 -> 256              797.0        0           0
+  + MaxAppliesPerFrame 64 -> 192             1033.3        0           0
+  + MaxAppliesPerFrame 64 -> 192 (leg 2)     1047.7        0           0
+    MaxAppliesPerFrame -> 384 (probe)        1044.2        0           0   (= 192, no knee above)
+
+  FINAL: ~1,040 chunks/s, converged holes 0. 4x the 260.9 baseline and 96% of
+  the 1,082 head-to-head target.
+
+  An earlier leg recorded 749.5 / 179 holes for the 192 row and it was VOID --
+  contended, see below. The clean re-run inverted it into a +30% win.
+
+**holes = 0.** The pooled arm converges the world for the first time; the
+previous record at this cascade was ~15,300 permanent holes at 602 chunks/s.
+
+--------------------------------------------------------------------------------
+SECTION 1a IS CLOSED
+--------------------------------------------------------------------------------
+
+The premise of the whole T4-1 re-sequencing was that the CONSUMER is the wall.
+S0 measured the apply loop exiting on its 6 ms wall clock in every window and
+NEVER on an empty queue. After S1-1:
+
+    exit queueEmpty=88  wallClock=0  countCap=0
+    stale=0 (0.0%)
+
+The drain now empties the queue, and the stale-result fraction that was 42% is
+zero. The consumer is no longer the wall. That is the S1 goal, discharged.
+
+--------------------------------------------------------------------------------
+WHAT ACTUALLY FIXED THE FRAGMENTATION -- NOT WHAT IT LOOKED LIKE
+--------------------------------------------------------------------------------
+
+Batching alone refused 77,290 allocations (96.9 M quads) while the free list
+shattered: 16,903 free runs, largest run 68,326, against 8,407 / 4,904,120 on
+the unbatched control at the same total free. That reads exactly like first-fit
+pathology, and the obvious response is the idle defrag (T3-6).
+
+IT WAS NOT FRAGMENTATION-AS-A-CAUSE. It was residency ballooning:
+
+    unload=212.8 ms of a 219.6 ms tick        pendingUnload = 20,926
+    peak live chunks = 80,716                 tracked = 92,875
+
+voxel.Stream.MaxUnloadsPerFrame defaults to 24, tuned when the pipeline applied
+~260 chunks/s. At 631/s with ~28 ticks/s that is ~684 unloads/s against ~630
+loads/s -- marginally under water, so the unload queue grew without bound and
+residency with it. A pool held chronically over-full fragments; first-fit was
+the messenger.
+
+Raising the budget to 256: peak residency 80,716 -> 50,930, peak pendingUnload
+75,925 -> 19,873, allocFail 26,763 -> 0, holes 257 -> 0.
+
+  NO IDLE DEFRAG IS NEEDED. T3-6 stays deferred. One leg's worth of diagnosis
+  separated "build a compacting allocator" from "raise a cvar that was sized for
+  a slower pipeline".
+
+  AND THE CAPACITY RAISE IS PARTLY REDUNDANT. It is NOT free to keep: 64M costs
+  512 MB VRAM in quads, the same again in chunk ids, and 12 B/quad of CPU shadow
+  (docs/speculative-generation-plan.md §2.6). Peak residency with the unload fix
+  is ~50,900 chunks ~= 46M quads, so 44M would still be marginal and the 49,152
+  table floor is genuinely too low -- but 64M may be more than required. OPEN:
+  run a control at 48M before treating that memory as necessary, because T4-1's
+  speculative budget is sized off whatever is left over.
+
+--------------------------------------------------------------------------------
+MaxAppliesPerFrame: A +30% WIN. THE LEG THAT "REJECTED" IT WAS CONTENDED.
+--------------------------------------------------------------------------------
+
+RESOLVED: 64 -> 192 measures 1,033.3 and 1,047.7 chunks/s with holes 0, against
+794 with holes 6-14. 384 measures 1,044.2 -- inside noise of 192 -- so 192 is
+the knee. Default flipped to 192.
+
+The rest of this section is kept as written because the failure is the point.
+
+countCap binds at the winning config (countCap=79 in busy windows), which reads
+like a ceiling worth raising. A leg at 192 came back 749.5 chunks/s / 179 holes
+against 797.0 / 0, and that was written up here as REJECTED with a mechanical
+explanation attached (the drain breaks on a 6 ms wall clock, so a higher count
+cap only lets each frame do more work against the same budget and lengthens
+frames).
+
+THAT LEG WAS CONTAMINATED AND IS VOID. Its last 86 seconds -- the flight tail,
+where the numbers are made -- ran concurrently with another editor, because a
+confirmation sweep was launched before the apply sweep's loop had finished:
+
+    s24-apply192   00:19:29 -> 00:24:13
+    s1close-1      00:22:47 -> 00:27:20      <-- 86 s of overlap
+    s24-apply512   00:24:19 -> 00:27:20      <-- never completed
+
+A second process on the GPU produces "this setting made it worse" for free. The
+explanation offered above is plausible and may well be right; it is not
+supported by this leg, and a plausible mechanism attached to a contended number
+is exactly how a wrong result survives review.
+
+  STATUS AT THE TIME: stays at 64 because nothing had validly moved it, NOT
+  because 192 was shown worse. Re-run through tools/voxel-run-flight-leg.ps1,
+  which now refuses to start while another editor is alive.
+
+  WHAT THE CLEAN RE-RUN FOUND: 1,033-1,048 chunks/s with holes 0 -- a +30% WIN,
+  the largest single remaining gain in the wave. The contended leg had it as a
+  6% regression WITH a plausible mechanism attached, and that was one commit
+  away from entering backlog.md section 7, the do-not-re-litigate list. A
+  plausible causal story attached to a bad number is more dangerous than a bare
+  anomaly, because it stops anyone re-testing.
+
+  HOW IT WAS CAUGHT: the owner noticed two game windows on screen. That is not
+  a control, which is why the guard now exists. Ground rule 1 says never
+  conclude from a single run; its sibling is never conclude from a run that was
+  sharing the box.
+
+CLEAN, VERIFIED NON-OVERLAPPING (every leg's span checked end-to-end):
+  all S0 legs, all S1-1 legs, all S1-2 legs, both cap64 legs, and BOTH unload
+  legs -- i.e. every number the ladder above rests on except the apply row.
+
+--------------------------------------------------------------------------------
+THE BOTTLENECK MOVED, AND IT MOVED OUT OF WAVE S1
+--------------------------------------------------------------------------------
+
+At the winning config:
+
+    tickMs=806.5 over 79 ticks (10.2 ms/tick)
+      recompute = 530.5 ms   (66%)
+      unload    = 223.4 ms   (28%, and most of that is the batch flush -- the
+                              scope closes before T4, so the tick's single
+                              publication is attributed to the unload bucket)
+      apply     =  42.5 ms   (5%)
+
+    recordsAdded = 44,604 per 2 s window     tracked = 92,875
+    dispatched   =  4,422                    stale   = 0%
+
+*** CORRECTED: "two thirds of the streaming tick" is 66% of a PEAK WINDOW's
+tick, and the streaming tick is only ~16% of wall. Across a full leg
+RecomputeDesiredSet totals 10.2 s of ~285 s -- about 3.6% of wall. Real, worth
+fixing eventually, NOT the constraint the rest of this section called it. Same
+error as the original P0's "8.5% saturated": a true ratio against the wrong
+denominator. ***
+
+RecomputeDesiredSet is the largest single item INSIDE the streaming tick, and
+the cause is a feedback loop that S1 CREATED:
+
+    RecomputeDesiredSet relaxes every LevelAdmissionCutoffDistSq to DBL_MAX when
+    PendingJobNum() * 4 < Cap * 3 -- i.e. when the pending queue is short.
+
+The queue is now always short, because the consumer stopped being the wall. So
+the admission cutoff is permanently disabled, admission floods (22,300
+records/s against ~800 chunks/s actually loading), tracked balloons to 92,875,
+and the O(tracked) exit scan gets expensive.
+
+**Making the consumer fast made the admission cap stop working.** That is
+lesson 5 -- "the bottleneck migrates; re-baseline after every fix" -- for the
+sixth time in this programme, and it is the seventh.
+
+This is Wave S2 / T4-2 territory. At 3.6% of wall it is NOT a blocker -- it is a
+design constraint on T4-1's enumerator, which adds admission-side work by
+construction.
+
+  S2-0, THE ATTEMPTED FIX, DOES NOT BIND. voxel.Stream.AdmissionRecordCap gates
+  the relaxation at the top of RecomputeDesiredSet, but TruncatePendingJobQueue
+  runs at the END of the same call and DropFarthestOverCap sets
+  OutCutoffDistSq = DBL_MAX whenever a level's queue is not full -- so it is
+  re-relaxed immediately. Measured: peakTracked 96,657 (off) vs 96,287 (cap
+  52,000), recordsAdded unchanged. A real fix gates both sites. Left in at
+  default 0, documented as ineffective rather than quietly removed.
+
+--------------------------------------------------------------------------------
+AGAINST THE S1 CLOSE CRITERION
+--------------------------------------------------------------------------------
+
+The criterion was: pooled arm at or past 1,082 chunks/s with holes(final)=0.
+
+    holes(final) = 0          MET
+    chunks/s     = ~1,040     MET in substance (96% of the 1,082 target)
+
+Read honestly: the holes criterion is the one that describes what a player sees,
+and it is met for the first time. The throughput criterion is not, and the
+reason is no longer anything S1 was aimed at -- the apply path is no longer the
+constraint by any measure taken here.
+
+The 1,082 figure is also the COMPONENT arm's number, and that arm was never
+converging holes at this cascade (it posted 1,082 with holes=0 at the OLD
+scale). A pooled arm at 797 with holes=0 and a component arm at 1,082 with
+holes=0 are not the same world; the head-to-head at the adopted cascade has to
+be re-run before the comparison means anything.
+
+  DECISION OWED (the plan's hard stop): whether to keep pushing throughput --
+  which now means the admission/recompute path, i.e. T4-2 -- or to accept
+  holes=0 at 797 and move to Wave S2 (parking) on the way to T4-1. The plan
+  says stop and re-decide here, and the ground for that decision has changed:
+  the item that would raise throughput further is no longer a Wave S1 item.
+
+--------------------------------------------------------------------------------
+STILL NOT DONE
+--------------------------------------------------------------------------------
+
+  * voxel.Stream.PoolClobberTest has never run in this wave. It cannot execute
+    from -ExecCmds (fires at frame 0, before the pool component exists). The live
+    PoolClobberSession variant is the one that can.
+  * MaxUnloadsPerFrame 96 vs 256 is one leg each and nearly a tie (791.3/14 vs
+    797.0/0). 256 is the default flipped to, on the strength of holes=0, but the
+    margin is inside what two legs would resolve.
+  * T1-2(b) incremental Runs and S1-4 incremental RunBounds are both still
+    standing costs (Runs.Sort ~3.3 ms and RebuildRunBounds ~1.34 ms per
+    publication) but at ~28 publications/s they are ~10% of the tick against
+    recompute's 66%. Do not build either against the old census.
+
+Raw logs are NOT committed (/Saved/ gitignored): s24-cap64-on-1/2, s24-unload96,
+s24-unload256, s24-apply192, s1close-1/2.
+
+================================================================================
+S2-3 PARKING -- THROUGHPUT-NEUTRAL AND CHEAPER (2026-07-27)
+================================================================================
+
+*** THIS SECTION WAS FIRST WRITTEN AS "MEASURED AND NOT JUSTIFIED". THAT
+    VERDICT WAS WRONG, AND THE REASON IS THE MOST USEFUL THING IN IT. ***
+
+chunksPerSec derives from TotalChunksLoaded, and the adopt path never
+incremented it -- so every chunk parking placed by ADOPTION was invisible to the
+only metric parking was being judged by. Parking reads as a 21% throughput
+regression when it is throughput-neutral:
+
+    circle, parking off      893.7 chunks/s
+    circle, parking on       708.3 meshed + 186 adopted/s = 894.3 placed
+
+    ...and the tick budget, summed over the leg, is LOWER with parking on:
+       off      tickMs 28,517   recompute 8,918   apply 3,452   unload 14,941
+       parking  tickMs 26,890   recompute 8,928   apply 2,704   unload 14,130
+
+Same placement rate, ~6% less tick work, and ~90% of those placements skipped a
+GPU mesh dispatch entirely -- work that does not appear in any of these numbers.
+
+A metric that cannot see half a feature's output will reject the feature. Two
+speculative fixes were spent hunting a residual cost that did not exist, and the
+"mechanism sound, integration not" verdict was committed with a confident causal
+story attached before the metric was checked.
+
+The corrected reading of the same legs follows.
+
+Keep an evicted chunk's pool range, hidden, so re-admission is a chunk-table
+write instead of a re-mesh round trip. Also T4-1's intended substrate.
+
+  profile   config          chunks/s   holes   allocFail   parked/adopted (hit)
+  line      off             1040.6         0           0   --
+  line      off             1040.5         0           0   --
+  line      park 4,000       850.3         0           0   28,185 / 21,428 (76%)
+  line      park 12,000      855.3         2           0   28,117 / 23,709 (84%)
+  line      park 12,000      850.1         0           0   27,577 / 22,971 (83%)
+  line      park 12,000      847.6         0           0   27,377 / 23,118 (84%)
+  circle    off              893.7         0           0   --
+  circle    park 12,000      596.7         0           0   46,866 / 41,726 (89%)
+
+WHAT THE ROWS ABOVE ACTUALLY SAY, once adopted chunks are counted as placed:
+the EAGER-publication rows are a genuine loss (596.7 + 146 adopted = 743 placed
+against 893.7), and the DEFERRED rows are neutral (708.3 + 186 = 894.3). So
+publishing per adopt cost ~17% and deferring recovered all of it.
+
+WHY: each adopt calls UnparkChunk, which calls PushUpdatesToProxy, and the adopt
+path lives in RecomputeDesiredSet -- which S1-1's FScopedBatch does NOT cover
+(that scope wraps DrainResults/DrainGameThreadMesh/DrainUnloads). So parking
+trades one meshing round trip for one FULL POOL PUBLICATION, and after S1-1 a
+publication is the expensive thing. 41,726 adopts is 41,726 publications.
+
+This is S1-1's own finding pointing back at itself: the per-item publication cost
+is what made the original plateau, and parking reintroduced it on a path S1-1's
+scope does not reach.
+
+  FIRST ATTEMPT AT THE FIX IS REVERTED AND UNDIAGNOSED. Wrapping
+  RecomputeDesiredSet in an FScopedBatch took parking from 28,117 parks / 84% hit
+  to ZERO parks and chunks/s 1,040 -> 540, with the world still churning at the
+  end of the linger. Confirmed not to be variance: three legs after the revert
+  reproduce 847.6-855.3 at 83-84%. The scope is the cause; the mechanism is not
+  understood. See the note at the RecomputeDesiredSet call site.
+
+VERDICT: parking SHIPS ON. Re-measured with adopted chunks counted as placed:
+
+    profile   parking off   parking 12,000     hit
+    circle         893.7        906.5 (+1.4%)  90%
+    line          1040.6       1064.9 (+2.3%)  78%
+
+holes 0 and allocFail 0 on every leg, ~6% less tick work, and 78-90% of
+adoptions skip a GPU mesh dispatch entirely. voxel.Stream.PoolParkMax default
+0 -> 12,000.
+
+  The earlier "stays 0" verdict was an artefact of the metric, not a property of
+  the feature.
+
+  ALSO AN EARLIER, LARGER FAILURE, kept because it is the more useful finding:
+  parking EVERY eviction scored 8% hit and cost allocFail 0 -> 45,633, holes
+  0 -> 1,804. On a traverse everything evicted by the outer edge is behind the
+  camera and never returns. Restricting to RetainDir_Finer -- inner-boundary
+  oscillation, the only eviction cause that comes back -- took the hit rate
+  8% -> 84% with no other change. WHERE you cache matters far more than HOW MUCH.
+
+--------------------------------------------------------------------------------
+WHAT THIS CHANGES FOR T4-1
+--------------------------------------------------------------------------------
+
+T4-1's adopt path IS THIS PATH: AddCandidate finds parked geometry and unparks
+it. Speculation would inherit the same per-adopt publication, at higher volume,
+and would lose for the same reason -- while looking like a hit-rate success.
+
+So, promoted onto T4-1's critical path:
+
+  1. BATCH THE ADOPT PATH. Not an optimisation any more. Requires first
+     diagnosing why FScopedBatch around RecomputeDesiredSet zeroed parking.
+  2. COUNT WHAT THE FEATURE PRODUCES. T4-1 places chunks by adoption, exactly as
+     parking does. If specDispatched/specAdopted are not folded into the
+     throughput metric the same way, speculation will read as a regression for
+     the same reason parking did -- and the hit rate will look fine while it
+     happens, which is what makes it convincing.
+
+     The decision metric is placed-chunks/s and holes, where placed = meshed +
+     adopted. Not chunksPerSec as it was defined before this.

@@ -19,6 +19,9 @@
 
 #include "CoreMinimal.h"
 #include "Components/PrimitiveComponent.h"
+// FThreadSafeCounter64 (FVoxelGpuPoolBuffers::RunBoundsCycles). Explicit because
+// CoreMinimal.h pulls in the 32-bit FThreadSafeCounter but not this one.
+#include "HAL/ThreadSafeCounter64.h"
 #include "RHIResources.h"
 #include "VoxelGpuGeometryPool.h"
 #include "VoxelGpuQuadPayload.h"
@@ -114,6 +117,25 @@ struct FVoxelGpuPoolBuffers
 	// for why a dropped write must be counted rather than only logged.
 	FThreadSafeCounter DroppedWrites;
 
+	// Render-thread cycles spent in FVoxelGpuPoolSceneProxy::RebuildRunBounds,
+	// and the number of times it ran. Wave S0 (docs/speculative-generation-plan.md
+	// §4): the deep review prices this at 45-90 ns per run over every resident
+	// chunk, per applied chunk -- ~2-4 ms of render-thread CPU each -- and that
+	// estimate is the entire case for batching publication. It has never been
+	// measured. This is the measurement.
+	//
+	// HERE FOR THE SAME REASON AS DroppedWrites: RebuildRunBounds runs on the
+	// render thread inside a command that captured this holder by shared
+	// reference, and the component is a UObject that may already be gone. Drained
+	// from the game thread by UVoxelGpuPoolComponent::GetAndResetPushStats.
+	//
+	// Cycles rather than milliseconds so the accumulate side is one
+	// FPlatformTime::Cycles64() pair and no floating-point work runs inside the
+	// gather-adjacent path being measured.
+	FThreadSafeCounter64 RunBoundsCycles;
+	FThreadSafeCounter64 RunBoundsCalls;
+	FThreadSafeCounter64 RunBoundsRunsWalked;
+
 	bool IsValid() const { return QuadBuffer.IsValid() && ChunkIdBuffer.IsValid(); }
 };
 
@@ -173,6 +195,20 @@ public:
 	// FIRST, in the same command, and nothing can reorder the two.
 	//
 	// Public only so the file-local pass builder can name it.
+	// S2-1. A freed range whose ids must be repointed at the hidden chunk on the
+	// GPU instead of through the CPU shadow. Same lifetime and same drain point
+	// as FPendingGpuWrite -- see TakePendingGpuHides.
+	struct FPendingGpuHide
+	{
+		uint32 DstFirst = 0;
+		uint32 NumQuads = 0;
+		// Carried rather than read from kHiddenChunkId at the pass, for the same
+		// reason FPendingGpuWrite carries ChunkId: the pass is a free function on
+		// the render thread and the constant is private to this class. Stamped at
+		// enqueue, where it is in scope.
+		uint32 HiddenId = 0;
+	};
+
 	struct FPendingGpuWrite
 	{
 		FVoxelGpuQuadPayloadRef Src;
@@ -247,6 +283,45 @@ public:
 		return PoolBuffers.IsValid() ? PoolBuffers->DroppedWrites.GetValue() : 0;
 	}
 
+	// What one window's worth of publication actually cost, on BOTH threads.
+	//
+	// Wave S0 (docs/speculative-generation-plan.md §4, executing T0-1). Every
+	// AddChunk / AddChunkFromGpu / UpdateChunk / RemoveChunk ends in its own
+	// PushUpdatesToProxy, and each of those copies the whole chunk table, runs
+	// BuildChunkRuns (a walk plus a sort), enqueues a render command, and has the
+	// render thread rebuild every run's bounds. The deep review's §1a says that is
+	// the ~600 chunks/s plateau. Nothing has ever measured it, so the batching
+	// wave would otherwise be built on an estimate.
+	//
+	// RunsBuilt is deliberately separate from Pushes: a push with neither
+	// bChunkTableDirty nor bRunsDirty set skips BuildChunkRuns entirely, and the
+	// ratio is how you tell "publication is frequent" from "publication is
+	// expensive".
+	//
+	// AllocationsWalked is the term that does NOT scale with residency:
+	// BuildChunkRuns reserves and walks Allocations, which is append-only, so it
+	// grows with chunks ever added. If this climbs across a leg while
+	// GetNumChunks() is flat, that is the finding.
+	//
+	// Render-thread figures come from the shared buffer holder and are therefore
+	// whatever had landed by the time the game thread asked -- they lag the
+	// game-thread figures by a frame or two and are not exactly co-windowed. That
+	// is fine for a 5 s census and wrong for anything finer; do not quote them
+	// per-frame.
+	struct FPoolPushStats
+	{
+		int64 Pushes = 0;               // PushUpdatesToProxy calls that reached the render command
+		int64 RunsBuilt = 0;            // ...of which ran BuildChunkRuns
+		int64 AllocationsWalked = 0;    // total Allocations entries walked by those builds
+		int64 RunsEmitted = 0;          // total live runs those builds produced
+		double TableCopyMs = 0.0;       // game thread: OriginsCopy + ParamsCopy
+		double BuildRunsMs = 0.0;       // game thread: BuildChunkRuns (walk + sort)
+		double RunBoundsMs = 0.0;       // RENDER thread: RebuildRunBounds
+		int64 RunBoundsCalls = 0;       // RENDER thread
+		int64 RunBoundsRunsWalked = 0;  // RENDER thread
+	};
+	FPoolPushStats GetAndResetPushStats();
+
 	// Releases a chunk's range back to the pool.
 	//
 	// The quads are NOT removed from the buffer -- one draw covers the whole
@@ -295,6 +370,162 @@ public:
 	int64 GetAllocFailureCount() const { return AllocFailureCount; }
 	int64 GetAllocFailureQuads() const { return AllocFailureQuads; }
 
+	// Allocations is APPEND-ONLY by default: AddChunk and AddChunkFromGpu both
+	// Allocations.Add(...), freed slots are zeroed in place, and Reset() only
+	// happens in InitPool. So this is a count of chunks EVER ADDED over the
+	// pool's lifetime, not resident chunks -- GetNumChunks() is that. It is the
+	// growth term in BuildChunkRuns's Reserve()-and-walk, which runs once per
+	// publication.
+	//
+	// S1-2: under voxel.Stream.PoolRecycleHandles this still counts every append
+	// ever made -- FreeHandles lets a freed slot be REUSED rather than growing
+	// the array, so with the gate on this stops climbing once the pool reaches
+	// steady state instead of tracking chunks ever added. See GetFreeHandleCount.
+	int32 GetNumAllocationsEver() const { return Allocations.Num(); }
+
+	// S1-2 (docs/speculative-generation-plan.md §2.2). Handles sitting in
+	// FreeHandles, available for the next AddChunk/AddChunkFromGpu instead of a
+	// fresh append. Appended to the "Voxel GPU pool:" log line alongside
+	// allocsEver so the recycling is visible as it works: with
+	// voxel.Stream.PoolRecycleHandles on, allocsEver should plateau near
+	// liveChunks once churn saturates the free list, instead of climbing for the
+	// whole session (measured in docs/measurements/s0-apply-census-2026-07-27.txt,
+	// "NEW FINDING 1": 28,042 -> 68,416 allocsEver against 28,042 -> 18,389 live
+	// runs over one 120s flight leg).
+	int32 GetFreeHandleCount() const { return FreeHandles.Num(); }
+
+	// Dirty-range algebra, exposed for automation tests ONLY (same precedent as
+	// DebugGetChunkRuns).
+	//
+	// WHY THIS IS EXPOSED AT ALL. S1-1's UnmarkQuadsDirty guards a race that the
+	// tick ordering makes rare -- it did not fire once across four full flight
+	// legs (docs/measurements/s1-1-batch-publish-2026-07-27.txt). Ground rule 13
+	// says a path with no recorded executions is untested however green
+	// everything around it is, and the failure mode if the interval algebra is
+	// wrong is INVISIBLE TERRAIN THAT REPORTS AS LOADED. So the algebra gets
+	// direct coverage instead of waiting for a leg to happen to exercise it.
+	//
+	// Pure list manipulation: no pool, no proxy, no GPU, no InitPool required.
+	void DebugMarkQuadsDirty(uint32 First, uint32 Count) { MarkQuadsDirty(First, Count); }
+	void DebugUnmarkQuadsDirty(uint32 First, uint32 Count) { UnmarkQuadsDirty(First, Count); }
+	// (First, Last) inclusive, in ascending order. Copied out rather than
+	// exposing FDirtyRange, which stays private.
+	TArray<TPair<uint32, uint32>> DebugGetDirtyRanges() const
+	{
+		TArray<TPair<uint32, uint32>> Out;
+		Out.Reserve(DirtyQuadRanges.Num());
+		for (const FDirtyRange& R : DirtyQuadRanges)
+		{
+			Out.Emplace(R.First, R.Last);
+		}
+		return Out;
+	}
+
+	// S1-1's hazard counter -- see UnmarkQuadsDirty. Non-zero on the first
+	// batched leg proves the free-then-reallocate-in-one-frame race is REAL and
+	// is being handled; zero across a full flight means either it cannot occur or
+	// the call is not wired, and those must not be confused with each other.
+	int64 GetDirtyOverlapsResolved() const { return DirtyOverlapsResolved; }
+	int64 GetDirtyOverlapQuadsResolved() const { return DirtyOverlapQuadsResolved; }
+
+	// --- S2-3: PARKING. Hide a chunk without giving up its geometry. ---------
+	//
+	// This is the mechanism T4-1 is built on (docs/speculative-generation-plan.md
+	// Wave S4): speculatively generated terrain has to sit somewhere the renderer
+	// ignores until admission asks for it, and re-admitting it has to be free.
+	// It also pays for itself before any speculation exists -- ring oscillation
+	// under motion currently re-meshes ground that was resident seconds ago.
+	//
+	// IT IS FAR CHEAPER THAN THE ORIGINAL DESIGN ASSUMED, and the reason is in
+	// the shader. VoxelQuadVertexFactory.ush reads ChunkOrigins[ChunkId].w as the
+	// chunk's SCALE and multiplies every decoded corner by it, so w == 0
+	// collapses that chunk's quads to a degenerate point WHATEVER the per-quad id
+	// buffer holds. ComputeRunBounds already returns Hidden on Entry.W <= 0 and
+	// BuildCulledRanges already skips it.
+	//
+	// So park = write one float and set bChunkTableDirty. No quad traffic in
+	// either direction, no Pool.Free, and no per-quad id stamp -- which means
+	// parking never enters the id-recycling path at all, and does NOT depend on
+	// the GPU hide pass (T1-4) the plan originally sequenced it behind.
+	//
+	// The run is untouched too: ChunkId, FirstQuad and NumQuads are all
+	// unchanged, so bRunsDirty is deliberately NOT set. Only the table entry
+	// moves, and RebuildRunBounds re-derives Hidden from it.
+	//
+	// LIFETIME: the caller keeps the handle. A parked chunk still owns its pool
+	// range, its Allocations slot and its chunk-table entry, so it still counts
+	// against GetNumChunks(), the pool capacity and the chunk-table floor. That
+	// is the whole risk surface -- see the subsystem-side park registry for why
+	// its cap is a correctness boundary rather than a tuning knob.
+	// Unpark takes no params, and that is deliberate: ParkChunk only zeroes the
+	// SCALE in ChunkOrigins, so ChunkParams[ChunkId] -- climate and surface gate
+	// -- is never disturbed and there is nothing to restore. Re-deriving it here
+	// would mean recomputing a value that was never lost, and would make unpark
+	// depend on a scene component the eviction path does not have.
+	void ParkChunk(int32 Handle);
+	void UnparkChunk(int32 Handle, const FVector3f& OriginUU, int32 Level);
+
+	// Mark the chunk table dirty and record that a flush is OWED, without
+	// forcing one. Park/unpark use this instead of PushUpdatesToProxy.
+	//
+	// THIS IS THE DIFFERENCE BETWEEN PARKING PAYING AND COSTING. Measured with
+	// park/unpark publishing eagerly: on the circle profile 89% of parked
+	// geometry was adopted and throughput still fell 33%, because every adopt
+	// traded one meshing round trip for one FULL POOL PUBLICATION -- 41,726
+	// adopts, 41,726 publications. After S1-1 the publication IS the expensive
+	// thing, so a cache that publishes once per hit cannot win
+	// (docs/measurements/s1-close-2026-07-27.txt).
+	//
+	// Why not wrap the caller in an FScopedBatch instead: tried, and it took
+	// parking from 28,117 parks at 84% hit to ZERO parks with throughput halved.
+	// Confirmed as cause rather than variance, and NOT diagnosed. This is the
+	// smaller change -- it needs no scope around anything, and the adopt path is
+	// inside RecomputeDesiredSet where no scope exists.
+	//
+	// Safe because the table entry is the whole payload: no quads move, no run
+	// changes. Worst case is one frame of a chunk staying visible after park, or
+	// staying hidden after adopt. The streaming tick's own FScopedBatch closes
+	// every tick and flushes anything owed, so nothing can sit indefinitely.
+	void MarkChunkTableDirtyDeferred();
+	// Parked chunks are still live allocations; this is how many of GetNumChunks()
+	// are currently hidden.
+	int32 GetNumParkedChunks() const { return NumParkedChunks; }
+
+	// Hold one of these across a run of adds/removes and they publish ONCE, at
+	// the outermost close, instead of once each (S1-1,
+	// docs/speculative-generation-plan.md; measured in
+	// docs/measurements/s0-apply-census-2026-07-27.txt).
+	//
+	// WHY THIS IS THE WAVE. Every AddChunk / AddChunkFromGpu / UpdateChunk /
+	// RemoveChunk ends in its own PushUpdatesToProxy, and S0 measured what one of
+	// those costs: 0.275 ms early in a fill, 2.108 ms under flight, of which
+	// 98-99% is this publication. The dirty-range machinery already accumulates
+	// correctly across several mutations -- DirtyQuadRanges coalesces,
+	// bChunkTableDirty and bRunsDirty are latches -- so the ONLY thing forcing
+	// per-chunk cost is the eager flush at the bottom of each mutator. This
+	// removes that, and nothing else.
+	//
+	// Re-entrant by depth, because ApplyMeshResult is reachable from the edit
+	// path as well as the streaming tick and must keep its existing flush
+	// semantics when it is not inside a scope.
+	//
+	// GATED: with voxel.Stream.PoolBatchPublish 0 (the default) this is inert and
+	// every mutator flushes exactly as it did before.
+	class VOXELEARTHSHADERS_API FScopedBatch
+	{
+	public:
+		explicit FScopedBatch(UVoxelGpuPoolComponent* InPool);
+		~FScopedBatch();
+
+		// Non-copyable, non-movable: the depth counter is the whole mechanism and
+		// a stray copy would decrement it twice.
+		FScopedBatch(const FScopedBatch&) = delete;
+		FScopedBatch& operator=(const FScopedBatch&) = delete;
+
+	private:
+		TWeakObjectPtr<UVoxelGpuPoolComponent> Pool;
+	};
+
 	void SetChunkMaterial(UMaterialInterface* InMaterial);
 	UMaterialInterface* GetChunkMaterialOrDefault() const;
 
@@ -325,6 +556,10 @@ public:
 	// count oscillates around the floor would pay that repeatedly, so it wants a
 	// floor above its own steady state. Must be set before the proxy is created.
 	void SetChunkTableCapacity(int32 InEntries) { ChunkTableCapacity = FMath::Max(1, InEntries); }
+	// So callers can LOG the floor instead of repeating the literal they passed.
+	// The startup line did exactly that and went stale within one commit of the
+	// floor moving.
+	int32 GetChunkTableCapacity() const { return ChunkTableCapacity; }
 
 	//~ UPrimitiveComponent
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
@@ -360,6 +595,10 @@ public:
 	// quads of the CPU shadow and forces proxy recreation, so that "rebound" and
 	// "re-uploaded" predict different pictures instead of being indistinguishable.
 	void DebugClobberShadowAndRecreate(int32 NumQuadsToClobber);
+
+	// S2-1 forced probe -- see VoxelGpuPoolGpuHideProbe for what it manufactures
+	// and why a normal leg cannot.
+	void DebugGpuHideProbe(uint32 NumQuads);
 
 private:
 	// See FVoxelGpuPoolBuffers. The holder is allocated on demand; the buffers
@@ -428,6 +667,49 @@ private:
 	TArray<uint32> AllocationChunkIds;
 	int32 NumLiveChunks = 0;
 
+	// Allocations-array handles a removal gave back, available for the next
+	// AddChunk/AddChunkFromGpu instead of a fresh Allocations.Add(...).
+	//
+	// Without this Allocations only ever GREW: both add paths appended and
+	// RemoveChunkInternal zeroed a freed slot in place but never handed it back,
+	// so BuildChunkRuns's Reserve()-and-walk tracked chunks EVER ADDED, not
+	// resident, and its cost was unbounded in SESSION LENGTH rather than world
+	// size. Measured over a 120s flight leg (§2.2,
+	// docs/measurements/s0-apply-census-2026-07-27.txt "NEW FINDING 1"): mean
+	// allocations walked climbed 28,042 -> 68,416 while live runs emitted FELL
+	// 28,042 -> 18,389 -- a 3.72x and rising ratio of wasted walk, on every
+	// publication.
+	//
+	// Recycling a handle is safe because by the time RemoveChunkInternal pushes
+	// it, every quad in its range has already been repointed at kHiddenChunkId
+	// and its Allocations entry has already been zeroed -- so nothing in the pool
+	// buffer, and no live FChunkRun, still names it.
+	//
+	// GATED on voxel.Stream.PoolRecycleHandles (default 0): with the gate off
+	// RemoveChunkInternal never pushes here, so this stays permanently empty and
+	// AddChunk/AddChunkFromGpu always append -- byte-identical to before this
+	// existed. The gate lives on the PUSH side only, not the pop side (see
+	// AcquireAllocationHandle): flipping it on mid-session must not retroactively
+	// hand out handles that were freed while it was off, but once it is on there
+	// is no reason to refuse a handle that is legitimately sitting here.
+	//
+	// NOT pushed at all when RemoveChunkInternal is called with
+	// bRecycleChunkId=false -- UpdateChunk's realloc branch, which writes
+	// Allocations[Handle] itself a few lines later, reusing that EXACT handle
+	// deliberately. Handing the same index to a concurrent AddChunk in between
+	// would let two live chunks alias one pool slot; see RemoveChunkInternal.
+	TArray<int32> FreeHandles;
+
+	// Acquires an Allocations/AllocationChunkIds slot for a new chunk: pops and
+	// reuses a handle FreeHandles holds, or appends a fresh one when the list is
+	// empty (always true with voxel.Stream.PoolRecycleHandles off, since nothing
+	// pushes then). AddChunk and AddChunkFromGpu both call this instead of
+	// Allocations.Add(...) directly -- one acquire path so the two do not drift
+	// apart (docs/backlog.md's "two copies of one calibration" failure mode).
+	// UpdateChunk's realloc branch does NOT call this: it already owns a handle
+	// and writes Allocations[Handle] in place, on purpose (see FreeHandles).
+	int32 AcquireAllocationHandle(const FVoxelGpuPoolAllocation& Alloc, uint32 ChunkId);
+
 	// See GetAllocFailureCount. Cumulative for the pool's lifetime; never reset
 	// by ClearChunks, because the question these answer is "did this RUN ever
 	// drop geometry", not "is it dropping geometry right now".
@@ -476,16 +758,87 @@ private:
 
 	// Drained by PushUpdatesToProxy -- see FPendingGpuWrite.
 	TArray<FPendingGpuWrite> PendingGpuWrites;
+	// Drained alongside PendingGpuWrites, into the SAME command. See S2-1.
+	TArray<FPendingGpuHide> PendingGpuHides;
 
 	// See GetGpuDirectWrites. The DROPPED half lives on FVoxelGpuPoolBuffers,
 	// which outlives this component from a render command's point of view.
 	int64 GpuDirectWrites = 0;
 
+	// Game-thread half of GetAndResetPushStats. The render-thread half lives on
+	// FVoxelGpuPoolBuffers (RunBoundsCycles) for the usual lifetime reason.
+	// Accumulated in PushUpdatesToProxy; the two FPlatformTime::Seconds pairs are
+	// gated on voxel.Stream.PoolPushStats so the instrument cannot be what is
+	// being measured, but the COUNTS are unconditional -- they are increments on a
+	// path that already does a table copy and a sort.
+	FPoolPushStats PushStats;
+
 	// Enqueues one render command carrying every pending GPU write, for the two
 	// PushUpdatesToProxy branches that return before building their own. Returns
 	// the writes so the main branch can fold them into ITS command instead.
 	TArray<FPendingGpuWrite> TakePendingGpuWrites();
-	void FlushGpuWritesStandalone(TArray<FPendingGpuWrite>&& Writes);
+
+	TArray<FPendingGpuHide> TakePendingGpuHides();
+	void FlushGpuWritesStandalone(TArray<FPendingGpuWrite>&& Writes, TArray<FPendingGpuHide>&& Hides);
+
+	// --- S1-1 batched publication ------------------------------------------
+	//
+	// The real body of what PushUpdatesToProxy used to do. PushUpdatesToProxy is
+	// now the DEFER POINT and this is the DO IT point; FScopedBatch is what sits
+	// between them. Split this way round so every existing mutator keeps calling
+	// PushUpdatesToProxy and none of them had to learn about batching.
+	void FlushUpdatesToProxy();
+
+	// Open scopes. >0 means a mutator's PushUpdatesToProxy only records that a
+	// flush is owed. Depth rather than a bool because ApplyMeshResult is reachable
+	// from the edit path as well as the streaming tick.
+	// (FScopedBatch is a nested class, so it already has access to these -- no
+	// friend declaration, which would name a DIFFERENT class at namespace scope.)
+	int32 BatchDepth = 0;
+	bool bFlushPending = false;
+
+	// The interval SUBTRACT, and the reason the batching above is not simply a
+	// deferral. THIS IS THE ONE GENUINELY DANGEROUS PART OF S1-1.
+	//
+	// Unbatched, every add and remove flushes its own render command, so a free's
+	// hidden-id upload always lands in an EARLIER command than a later add's GPU
+	// write. Batched into one command that ordering inverts: within a single
+	// command VoxelGpuPoolAddWritePasses runs FIRST (that is D1's whole
+	// correctness argument -- see FPendingGpuWrite) and the merged
+	// DirtyQuadRanges upload runs AFTER it. So a range that was freed and then
+	// re-issued to a GPU-meshed chunk IN THE SAME FRAME would have the freed
+	// range's stale hidden ids written straight over the geometry the compute
+	// pass just wrote.
+	//
+	// The symptom is the worst kind this pool produces: INVISIBLE TERRAIN THAT
+	// REPORTS AS LOADED. No counter moves, the chunk is resident, the run is
+	// valid, and the quads decode to a degenerate point.
+	//
+	// The fix is to subtract, not to reorder. For a range the GPU is about to
+	// write, the authoritative content is that pending write; any dirty interval
+	// still covering it is stale CPU shadow by definition. So AddChunkFromGpu
+	// removes its allocated range from DirtyQuadRanges immediately after a
+	// successful Pool.Alloc, splitting any interval that straddles it. Mirrors
+	// MarkQuadsDirty's insert-and-coalesce.
+	//
+	// Counted, because a hazard that never fires and a fix that is not wired up
+	// look identical from the outside: PoolDirtyOverlapsResolved non-zero on the
+	// first leg proves the race is real AND handled; zero across a full flight
+	// means either it cannot occur or this is not being called, and both are
+	// worth knowing before the gate is flipped.
+	void UnmarkQuadsDirty(uint32 First, uint32 Count);
+
+	// S2-1 mirror of UnmarkQuadsDirty, for pending GPU hides. Called on every
+	// successful allocation so a re-allocated range can never be hidden by a
+	// hide queued earlier in the same frame. See its definition for why pass
+	// ordering alone does not achieve this.
+	void UnmarkGpuHide(uint32 First, uint32 Count);
+	int64 DirtyOverlapsResolved = 0;
+	int64 DirtyOverlapQuadsResolved = 0;
+
+	// S2-3. Chunks currently hidden by ParkChunk -- still allocated, still
+	// holding a table entry, just drawing nothing.
+	int32 NumParkedChunks = 0;
 
 	// Set whenever the set of live ALLOCATIONS changes -- which is not the same
 	// event as the chunk table changing, and conflating the two is what made the

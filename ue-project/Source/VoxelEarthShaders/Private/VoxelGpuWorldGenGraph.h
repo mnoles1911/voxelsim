@@ -141,4 +141,21 @@ namespace VoxelGpuWorldGen
 	void AddQuadPoolWritePass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstQuads, FRDGBufferRef DstIds,
 	                          FRDGBufferRef Src, uint32 SrcFirst, uint32 DstFirst,
 	                          uint32 NumQuads, uint32 ChunkId);
+
+	// S2-1: writes HiddenChunkId across [DstFirst, DstFirst + NumQuads) of DstIds
+	// and touches nothing else.
+	//
+	// Replaces the per-quad CPU loop in RemoveChunkInternal that stamped
+	// QuadChunkIds and rode MarkQuadsDirty to the GPU. That loop was the LAST
+	// writer of the CPU shadow on the GPU-only path, so removing it is what makes
+	// dropping the shadow possible (S2-5) -- 12 B/quad of system RAM plus a
+	// whole-array copy in CreateSceneProxy.
+	//
+	// ORDERING: recorded in the same graph and command as the write passes, and
+	// BEFORE the chunk-table update, under the rule FPendingGpuWrite documents.
+	// Where a hide and a same-frame GPU write cover the same range the hide is
+	// subtracted first, so the two are disjoint by construction rather than by
+	// pass order.
+	void AddQuadPoolHidePass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstIds,
+	                         uint32 DstFirst, uint32 NumQuads, uint32 HiddenChunkId);
 }

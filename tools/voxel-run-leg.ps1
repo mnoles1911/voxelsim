@@ -20,6 +20,34 @@
 # Use this instead of writing another inline wait loop. The inline loop is how
 # the fix got bypassed the second time: the correct logic already existed in
 # tools/wave-f-coldfill.ps1 and was simply not called.
+#
+# ============================================================================
+# THIS IS A COLD-FILL DRIVER. DO NOT USE IT FOR FLIGHT LEGS.
+# ============================================================================
+#
+# Found in Wave S0 (docs/measurements/s0-apply-census-2026-07-27.txt): passing
+# -VoxelPerfFlight=line through this script SILENTLY TRUNCATES THE LEG. The
+# world settles during the 90 s preflight, the settle rule below fires, and the
+# editor is killed BEFORE THE FLIGHT EVER STARTS -- 32 s before, as measured --
+# and the script returns $true. The resulting log is a complete-looking
+# cold-fill run with no flight phase in it at all.
+#
+# It aborts on that combination now rather than trusting the caller to remember.
+#
+# A flight leg does not need this script, because it does not have this
+# script's hazard. UVoxelPerfRunSubsystem calls RequestExit itself at
+# PreflightSec + DurationSeconds + LingerSec, so the run's own clock decides
+# when it is finished and there is no lull to mistake for a finish line. Launch
+# the editor directly and wait for it to exit (306 s observed for a 90/120/60
+# leg); kill it past a generous deadline and treat that as VOID.
+#
+# AND QUOTE -ExecCmds PROPERLY, whichever driver you use. Start-Process
+# -ArgumentList does NOT re-quote an argument containing spaces, so
+# '-ExecCmds=cvar 1, cvar2 1' reaches UE as -ExecCmds=cvar and everything after
+# the first space is dropped. In Wave S0 that presented as every gated timing
+# reading 0.00ms -- i.e. "the apply path costs nothing", the exact opposite of
+# the truth, in a log that otherwise looked healthy. Embed the quotes:
+#   '-ExecCmds="cvar 1, cvar2 1"'
 
 param(
     [Parameter(Mandatory=$true)][string]$LogPath,
@@ -36,6 +64,18 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Project = (Resolve-Path "$PSScriptRoot\..\ue-project\VoxelEarth.uproject").Path
+
+# Refuse the combination that silently truncates (see the header). A flight leg
+# driven through the settle rule is not a slow result or a noisy one -- it is a
+# leg that stopped before the phase being measured began, and it reports success.
+$flightArg = $ExtraArgs | Where-Object { $_ -match '^-VoxelPerfFlight=(.+)$' } | Select-Object -First 1
+if ($flightArg -and $flightArg -notmatch '^-VoxelPerfFlight=static$') {
+    throw ("voxel-run-leg.ps1 is a COLD-FILL driver and $flightArg would be truncated: " +
+           "the world settles during the preflight, this script's settle rule fires, and the editor is " +
+           "killed before the flight starts -- returning success. Launch the editor directly for flight " +
+           "legs and wait for UVoxelPerfRunSubsystem to exit on its own clock " +
+           "(PreflightSec + VoxelPerfRun + LingerSec). See docs/measurements/s0-apply-census-2026-07-27.txt.")
+}
 
 # The edit log persists across runs and replays on load, so a "cold" fill
 # measured without clearing it is not cold (ground rule 11).
