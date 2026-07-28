@@ -9215,19 +9215,26 @@ void FVoxelWorldImpl::DispatchJobs()
 	// job has usually drained and the band can answer for the whole column.
 	if (DeferredColdBand.Num() > 0)
 	{
-		// T4-1: demand has now taken everything it wants from this tick's budget.
-	// Speculation gets the remainder, and only the remainder -- submitting here
-	// rather than anywhere earlier is what makes starvation structurally
-	// impossible rather than a matter of tuning.
-	DispatchSpeculativeJobs();
-
-	PendingJobKeysByLevel[0].Append(DeferredColdBand);
+		PendingJobKeysByLevel[0].Append(DeferredColdBand);
 		ColdBandHeldThisFrame = DeferredColdBand.Num();
 	}
 	else
 	{
 		ColdBandHeldThisFrame = 0;
 	}
+
+	// T4-1: demand has now taken everything it wants from this tick's budget.
+	// Speculation gets the remainder, and only the remainder -- submitting here
+	// rather than anywhere earlier is what makes starvation structurally
+	// impossible rather than a matter of tuning.
+	//
+	// UNCONDITIONAL, and it was briefly not: this call was first written inside
+	// the cold-band re-queue branch above, so speculation only dispatched on
+	// ticks that happened to have cold-band deferrals. The census read
+	// "queued=128 inFlight=128 dispatched=0" for a whole leg -- enumeration
+	// working, submission never running -- which looks exactly like a budget
+	// refusing speculation rather than a call site in the wrong scope.
+	DispatchSpeculativeJobs();
 }
 
 UVoxelChunkComponent& FVoxelWorldImpl::AcquireChunkComponent(AActor& Owner, USceneComponent& Root)
