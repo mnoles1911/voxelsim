@@ -549,9 +549,28 @@ TAutoConsoleVariable<int32> CVarVoxelStreamBatchRecompute(
 // See the call site: the empties cluster at both ends and never the middle, and
 // an over-trim costs hit rate rather than holes because demand still loads
 // anything speculation skips.
+// DEFAULT 1, SET BY THE SWEEP OF 2026-07-28.
+//
+//   trim   dispatched  adopted   dropEmpty (top/mid/bot)   flightHoles med
+//     0      19,724      9,133   183 (64/0/119)                 42
+//     1      18,839     14,765     3 ( 0/3/  0)                 38
+//     2           0          0     0                            46
+//
+// 1 removes 98% of the zero-quad dispatches and raises adopted-per-dispatch from
+// 46% to 78%. 2 switches speculation OFF entirely -- the surface band is only
+// 2-3 chunks tall, so trimming two from each end leaves nothing -- and its
+// flight holes are the worst of the three, which is the control confirming
+// speculation is doing something.
+//
+// WHAT IT DID NOT DO, stated because it was predicted to: frame time did not
+// move (p50 15.47 -> 15.41). Dispatches fell only 4%, because speculation is
+// bounded by SpeculativeMaxInFlight rather than by candidate supply -- the freed
+// budget refilled with USEFUL work instead of disappearing. So this is a
+// productivity change, not a saving. Converting it into GPU time means lowering
+// the in-flight cap now that each dispatch is worth more.
 TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeZTrim(
 	TEXT("voxel.Stream.SpeculativeZTrim"),
-	0,
+	1,
 	TEXT("Chunks trimmed from each end of the speculative Z band. Cuts zero-quad speculative dispatches, "
 	     "which cost real GPU (meshing is 21-28% of the GPU frame). Cannot cause holes -- demand still "
 	     "loads whatever speculation skips."),
@@ -665,9 +684,24 @@ TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeMaxParked(
 // sit in the manager's strict-FIFO queue ahead of the next tick's demand jobs.
 // Small depth plus submit-last is what makes starvation structurally impossible
 // rather than merely unlikely.
+// 16 SINCE 2026-07-28, swept with SpeculativeZTrim 1:
+//
+//   cap   dispatched   adopted        p50      flightHoles med
+//    32     18,834     14,948 (79%)  15.31          36
+//    16     17,540     14,979 (85%)  15.34          38
+//     8     10,136      9,501 (94%)  15.23          46
+//
+// 16 is free: identical adopted geometry to 32 for 7% fewer dispatches, because
+// the trim made each dispatch more productive. 8 is too far -- 37% less adopted
+// and holes visibly worse.
+//
+// AND THE FRAME DID NOT MOVE. Cutting dispatches 46% (32 -> 8) moved p50 by
+// 0.08 ms. See the note at CVarVoxelStreamSpeculativeZTrim: reducing GPU MESHING
+// work does not reduce frame time on this renderer, which is why 16 is taken for
+// the free efficiency rather than as a performance fix.
 TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeMaxInFlight(
 	TEXT("voxel.Stream.SpeculativeMaxInFlight"),
-	32,
+	16,
 	TEXT("Max speculative mesh jobs in flight, carved out of voxel.Stream.GpuMeshInFlight (256). Small by ")
 	TEXT("design: the job manager's queue is strict FIFO, so speculative depth delays the NEXT tick's demand ")
 	TEXT("work even though demand is submitted first."),
