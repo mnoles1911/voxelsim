@@ -87,11 +87,20 @@ void FVoxelQuadVertexFactory::InitRHI(FRHICommandListBase& RHICmdList)
 		Parameters.ChunkOriginUU = ChunkOriginUU;
 		Parameters.LevelScale = LevelScale;
 		Parameters.PoolMode = bPoolMode ? 1u : 0u;
+		Parameters.WaterMode = bWaterMode ? 1u : 0u;
 		// Both SRVs must be non-null even in single-chunk mode: an unbound SRV
 		// in a uniform buffer is a validation failure, not a tolerated no-op.
 		Parameters.ChunkOrigins = ChunkOriginsSRV.IsValid() ? ChunkOriginsSRV : QuadBufferSRV;
 		Parameters.QuadChunkIds = QuadChunkIdsSRV.IsValid() ? QuadChunkIdsSRV : QuadBufferSRV;
 		Parameters.ChunkParams = ChunkParamsSRV.IsValid() ? ChunkParamsSRV : QuadBufferSRV;
+		// Terrain never sets this (the buffer is not even allocated for a terrain
+		// pool, deliberately -- see the parameter's own comment), so it takes the
+		// same dummy the SRVs above take. The shader reads it only under
+		// WaterMode, so the dummy is bound and never sampled; it exists because an
+		// unbound SRV member fails uniform-buffer validation outright.
+		Parameters.QuadCornerHeights = CornerHeightSRV.IsValid()
+			? CornerHeightSRV
+			: (QuadChunkIdsSRV.IsValid() ? QuadChunkIdsSRV : QuadBufferSRV);
 		UniformBuffer = TUniformBufferRef<FVoxelQuadVertexFactoryParameters>::CreateUniformBufferImmediate(
 			Parameters, UniformBuffer_MultiFrame);
 	}
@@ -102,6 +111,7 @@ void FVoxelQuadVertexFactory::ReleaseRHI()
 	UniformBuffer.SafeRelease();
 	ZeroRangeUniformBuffer.SafeRelease();
 	QuadBufferSRV.SafeRelease();
+	CornerHeightSRV.SafeRelease();
 	FVertexFactory::ReleaseRHI();
 }
 

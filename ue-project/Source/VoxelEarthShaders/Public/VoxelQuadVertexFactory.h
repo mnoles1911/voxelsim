@@ -60,6 +60,59 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadVertexFactoryParameters, )
 	// entries the extra 8 bytes per chunk is noise against the quad pool.
 	SHADER_PARAMETER_SRV(StructuredBuffer<float4>, ChunkParams)
 	SHADER_PARAMETER(uint32, PoolMode)
+
+	// WATER MODE: this pool draws vxc::WaterBrick8 fill, not terrain.
+	//
+	// It changes two vertex-colour channels and nothing else:
+	//
+	//   R -- terrain packs a BINARY sky-facing biome flag, derived from face
+	//        direction and the chunk's surface height, and deliberately NOT the
+	//        material id (see the long comment at the R assignment in
+	//        VoxelQuadVertexFactory.ush: a categorical id does not survive the
+	//        FColor->shader transform). Water has no biome and no surface-height
+	//        gate; what it needs is the CA fill fraction 0..255, which the water
+	//        mesher's sampler puts in the quad's `mat` byte precisely so it
+	//        rides the existing encoding.
+	//   B -- terrain packs per-chunk climate; water packs
+	//        FVoxelQuadVertex::TopBoundary, which says whether this VERTEX sits
+	//        on the +Z boundary of its own voxel.
+	//
+	// M_WaterVoxel's World Position Offset consumes both: it lowers the
+	// top-boundary vertices by (1 - fill) of a voxel. Per-vertex rather than
+	// per-face, so a partial cell's side walls shorten with its surface instead
+	// of ringing every pool with a one-voxel bathtub rim.
+	//
+	// THE COMPONENT PATH NEEDS NO EQUIVALENT: FWaterChunkSceneProxy writes both
+	// channels directly (VoxelWaterChunkComponent.cpp). This flag exists only to
+	// make the pooled path agree with the path that is currently the default.
+	//
+	// NOTE this falsifies docs/gpu-water-pool-design.md's "the vertex factory
+	// needed no change" row, which was true for a constant-colour water material
+	// and stops being true the moment fill drives anything. That doc is corrected
+	// in the same change that adds this.
+	SHADER_PARAMETER(uint32, WaterMode)
+
+	// FOUR PER-CORNER WATER SURFACE HEIGHTS PER QUAD, one byte each, parallel to
+	// QuadBuffer and indexed by the same quad index.
+	//
+	// WHY A SECOND BUFFER RATHER THAN MORE BITS IN THE QUAD. The 8-byte quad is
+	// full: word0 = axis | positive<<4 | slice<<8 | u0<<16 | v0<<24, word1 = w |
+	// h<<8 | ao<<16 | mat<<24, and that layout is a contract with the GPU mesher,
+	// the CPU packer (PackVoxelChunkQuad) and the terrain renderer. Widening it
+	// would cost every terrain quad in a 100M-quad pool 4 bytes for a field
+	// terrain never reads.
+	//
+	// ONLY ALLOCATED IN WATER MODE, for the same reason: at the water pool's 4M
+	// quads it is 16 MB, at terrain's capacity it would be hundreds. A terrain
+	// pool binds a same-typed dummy here, because an unbound SRV member is a
+	// validation failure rather than a tolerated no-op, and the shader gates its
+	// read on WaterMode so the dummy is never sampled.
+	//
+	// A UNIFORM-BUFFER MEMBER, like everything else this factory binds. A loose
+	// StructuredBuffer<uint> declared in the .ush would compile, bind to nothing,
+	// read zeros forever and drop every water surface to the floor of its cell --
+	// see this struct's own NOTE ON NAMING, and docs/gpu-g2-draw-path.md.
+	SHADER_PARAMETER_SRV(StructuredBuffer<uint>, QuadCornerHeights)
 END_GLOBAL_SHADER_PARAMETER_STRUCT()
 
 // WHERE THIS DRAW STARTS IN THE POOL, in quads. Bound PER BATCH ELEMENT.
@@ -144,6 +197,18 @@ public:
 		bPoolMode = true;
 	}
 
+	// Marks this factory as drawing water fill rather than terrain. See
+	// FVoxelQuadVertexFactoryParameters::WaterMode. Must be set BEFORE InitRHI,
+	// like every other setter here -- the uniform buffer is built there.
+	void SetWaterMode(bool bInWaterMode) { bWaterMode = bInWaterMode; }
+
+	// The per-quad corner-height buffer -- see
+	// FVoxelQuadVertexFactoryParameters::QuadCornerHeights. Only ever set by a
+	// water pool; leaving it unset makes InitRHI bind the same-typed dummy the
+	// other pool SRVs already use for their unset case. Before InitRHI, like the
+	// rest.
+	void SetCornerHeightSRV(FShaderResourceViewRHIRef InSRV) { CornerHeightSRV = MoveTemp(InSRV); }
+
 	FRHIUniformBuffer* GetUniformBuffer() const { return UniformBuffer.GetReference(); }
 
 	// BaseQuad = 0, built once. Bound for any element that carries no range of
@@ -163,7 +228,9 @@ private:
 	FShaderResourceViewRHIRef ChunkOriginsSRV;
 	FShaderResourceViewRHIRef QuadChunkIdsSRV;
 	FShaderResourceViewRHIRef ChunkParamsSRV;
+	FShaderResourceViewRHIRef CornerHeightSRV;
 	bool bPoolMode = false;
+	bool bWaterMode = false;
 	TUniformBufferRef<FVoxelQuadVertexFactoryParameters> UniformBuffer;
 	TUniformBufferRef<FVoxelQuadRangeParameters> ZeroRangeUniformBuffer;
 };

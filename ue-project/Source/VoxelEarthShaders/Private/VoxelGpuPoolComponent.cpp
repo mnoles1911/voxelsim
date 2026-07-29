@@ -509,6 +509,7 @@ public:
 	FVoxelGpuPoolSceneProxy(UVoxelGpuPoolComponent* Component,
 	                        const TArray<uint64>& InQuads,
 	                        const TArray<uint32>& InChunkIds,
+	                        const TArray<uint32>& InCornerHeights,
 	                        const TArray<FVector4f>& InOrigins,
 	                        const TArray<FVector4f>& InParams,
 	                        const TArray<UVoxelGpuPoolComponent::FChunkRun>& InRuns,
@@ -521,10 +522,12 @@ public:
 		, SharedBuffers(MoveTemp(InSharedBuffers))
 		, Quads(InQuads)
 		, ChunkIds(InChunkIds)
+		, CornerHeights(InCornerHeights)
 		, Origins(InOrigins)
 		, Params(InParams)
 		, Runs(InRuns)
 		, ChunkEdgeVoxels(Component->GetChunkEdgeVoxels())
+		, bWaterMode(Component->IsWaterMode())
 		, NumQuads(Component->GetHighWaterMarkQuads())
 		, BufferQuads(InQuads.Num())
 		, NumChunks(InOrigins.Num())
@@ -701,8 +704,34 @@ public:
 		ParamsSRV = RHICmdList.CreateShaderResourceView(
 			ParamsBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(ParamsBuffer));
 
+		// PER-QUAD CORNER HEIGHTS, water pools only.
+		//
+		// Rebuilt from the CPU shadow on every proxy creation, unlike the quad and
+		// chunk-id buffers beside it -- see the CornerBuffer member for why that
+		// difference is correct rather than an oversight (nothing GPU-meshes
+		// water, so the shadow is always the authority here).
+		if (CornerHeights.Num() > 0)
+		{
+			CornerBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
+				RHICmdList, TEXT("VoxelGpuPool.QuadCornerHeights"),
+				EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
+				MakeConstArrayView(CornerHeights));
+			CornerSRV = RHICmdList.CreateShaderResourceView(
+				CornerBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(CornerBuffer));
+			UE_LOG(LogTemp, Log,
+			       TEXT("%s: per-quad corner heights up, %d entries (%.1f MB) — water surfaces are bilinear"),
+			       *PoolName, CornerHeights.Num(), double(CornerHeights.Num()) * 4.0 / (1024.0 * 1024.0));
+		}
+
 		VertexFactory.SetQuadBufferSRV(QuadBufferSRV);
 		VertexFactory.SetPoolBuffers(OriginSRV, ChunkIdSRV, ParamsSRV);
+		// Before InitResource: the uniform buffer is built in InitRHI, so a
+		// setter called after this line would be silently ignored. That applies to
+		// the corner SRV too -- and leaving it unset is exactly what a terrain
+		// pool wants, which is why this is not conditional on bWaterMode but on
+		// the buffer actually existing.
+		VertexFactory.SetCornerHeightSRV(CornerSRV);
+		VertexFactory.SetWaterMode(bWaterMode);
 		VertexFactory.InitResource(RHICmdList);
 
 		UE_LOG(LogTemp, Log,
@@ -1077,9 +1106,15 @@ public:
 	// each run says where its slice starts in them and where it lands in the
 	// pool. Several exact runs, not one span covering the untouched geometry
 	// between them -- see UVoxelGpuPoolComponent::DirtyQuadRanges.
+	// NewCorners is the water path's third parallel slice and is EMPTY for a
+	// terrain pool -- see UVoxelGpuPoolComponent::QuadCornerHeights. It rides the
+	// same runs as the quads deliberately: a quad reaching the GPU a frame before
+	// its own corner heights would draw one frame of water at the previous
+	// surface height, which on a 10 Hz re-mesh is a visible shimmer.
 	void UpdateQuadRange_RenderThread(FRHICommandListBase& RHICmdList,
 	                                  const TArray<uint64>& NewQuads,
 	                                  const TArray<uint32>& NewIds,
+	                                  const TArray<uint32>& NewCorners,
 	                                  const TArray<FVoxelQuadUploadRun>& UploadRuns,
 	                                  int32 NewNumQuads)
 	{
@@ -1088,6 +1123,8 @@ public:
 			NumQuads = NewNumQuads;
 			return;
 		}
+
+		const bool bUploadCorners = CornerBuffer.IsValid() && NewCorners.Num() == NewQuads.Num();
 
 		for (const FVoxelQuadUploadRun& Run : UploadRuns)
 		{
@@ -1110,6 +1147,16 @@ public:
 			{
 				FMemory::Memcpy(Dst, NewIds.GetData() + Run.SrcOffset, IdSizeBytes);
 				RHICmdList.UnlockBuffer(ChunkIdBuffer);
+			}
+
+			if (bUploadCorners)
+			{
+				if (void* Dst = RHICmdList.LockBuffer(CornerBuffer, Run.First * sizeof(uint32),
+				                                      IdSizeBytes, RLM_WriteOnly))
+				{
+					FMemory::Memcpy(Dst, NewCorners.GetData() + Run.SrcOffset, IdSizeBytes);
+					RHICmdList.UnlockBuffer(CornerBuffer);
+				}
 			}
 		}
 
@@ -1217,6 +1264,8 @@ private:
 
 	TArray<uint64> Quads;
 	TArray<uint32> ChunkIds;
+	// Empty on a terrain pool -- see UVoxelGpuPoolComponent::QuadCornerHeights.
+	TArray<uint32> CornerHeights;
 	TArray<FVector4f> Origins;
 	TArray<FVector4f> Params;
 	// Which quads belong to which chunk, sorted by pool offset. The cull's
@@ -1224,6 +1273,7 @@ private:
 	// derive this itself.
 	TArray<UVoxelGpuPoolComponent::FChunkRun> Runs;
 	int32 ChunkEdgeVoxels = 32;
+	bool bWaterMode = false;
 
 	struct FQuadRange { uint32 First = 0; uint32 Count = 0; };
 
@@ -2148,6 +2198,16 @@ private:
 	FBufferRHIRef QuadBuffer, ChunkIdBuffer, OriginBuffer, ParamsBuffer;
 	FShaderResourceViewRHIRef QuadBufferSRV, ChunkIdSRV, OriginSRV, ParamsSRV;
 
+	// Water pools only, and NOT held in FVoxelGpuPoolBuffers with the quad and
+	// chunk-id buffers. Those live there because the GPU mesher writes them
+	// directly and a proxy rebuild must not re-upload a stale CPU shadow over
+	// GPU-authored geometry (see FVoxelGpuPoolBuffers' own comment). Nothing GPU-
+	// meshes water: the corner heights are CPU-authored without exception, so the
+	// shadow is always the authority and rebuilding this buffer from it on proxy
+	// recreation is not merely safe, it is the correct thing to do.
+	FBufferRHIRef CornerBuffer;
+	FShaderResourceViewRHIRef CornerSRV;
+
 	mutable FThreadSafeCounter ElementsLogged;
 	// Latches the one MULTI-BATCH line. Separate from ElementsLogged because that
 	// one fires on the FIRST gather, which may well be an uncull or an empty one
@@ -2178,6 +2238,19 @@ void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 	Pool.Init(CapacityQuads);
 	PooledQuads.SetNumZeroed(int32(CapacityQuads));
 	QuadChunkIds.SetNumZeroed(int32(CapacityQuads));
+	// WATER ONLY, and sized here rather than lazily so the buffer exists before
+	// the first proxy is built. 4 bytes per quad: 16 MB at the water pool's 4M,
+	// which is why a terrain pool -- whose capacity is measured in tens of
+	// millions of quads for a field it never reads -- gets nothing at all. See
+	// QuadCornerHeights; this is also why SetWaterMode must precede InitPool.
+	if (bWaterMode)
+	{
+		QuadCornerHeights.SetNumZeroed(int32(CapacityQuads));
+	}
+	else
+	{
+		QuadCornerHeights.Reset();
+	}
 
 	// Reserve the hidden chunk at index 0. Everything freed points here.
 	ChunkOrigins.Reset();
@@ -2263,9 +2336,46 @@ int32 UVoxelGpuPoolComponent::AcquireAllocationHandle(const FVoxelGpuPoolAllocat
 	return Handle;
 }
 
+// See the declaration. Every write of a pool range goes through here so the
+// three parallel shadows can never disagree about what a slot holds.
+void UVoxelGpuPoolComponent::WriteQuadRange(uint32 Offset, uint32 ChunkId, const TArray<uint64>& InQuads,
+                                            const TArray<uint32>* InCornerHeights)
+{
+	// A caller that HAS corner heights but a pool with no shadow to put them in
+	// is a wiring mistake, not a state: it means SetWaterMode was not set before
+	// InitPool, and the whole surface would silently draw at whatever the vertex
+	// factory's dummy binding happens to hold. Loud, once, rather than a subtly
+	// wrong waterline nobody attributes to this.
+	const bool bWriteCorners = InCornerHeights != nullptr && QuadCornerHeights.Num() > 0;
+	if (InCornerHeights != nullptr && QuadCornerHeights.Num() == 0)
+	{
+		static bool bLoggedMissingCornerShadow = false;
+		if (!bLoggedMissingCornerShadow)
+		{
+			bLoggedMissingCornerShadow = true;
+			UE_LOG(LogTemp, Error,
+			       TEXT("%s: per-quad corner heights supplied but the pool has no corner shadow -- "
+			            "SetWaterMode(true) must precede InitPool. Water will draw with flat tops."),
+			       *PoolName);
+		}
+	}
+	checkSlow(!bWriteCorners || InCornerHeights->Num() == InQuads.Num());
+
+	for (int32 I = 0; I < InQuads.Num(); ++I)
+	{
+		PooledQuads[int32(Offset) + I] = InQuads[I];
+		QuadChunkIds[int32(Offset) + I] = ChunkId;
+		if (bWriteCorners)
+		{
+			QuadCornerHeights[int32(Offset) + I] = (*InCornerHeights)[I];
+		}
+	}
+}
+
 int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
                                        const FVector3f& OriginUU, int32 Level,
-                                       const FVector4f& Params)
+                                       const FVector4f& Params,
+                                       const TArray<uint32>* InCornerHeights)
 {
 	check(Pool.GetCapacityQuads() > 0);   // InitPool first
 
@@ -2326,11 +2436,7 @@ int32 UVoxelGpuPoolComponent::AddChunk(const TArray<uint64>& InQuads,
 	// writing, or the pass will blank geometry the shadow upload is about to
 	// publish -- the failure the forced probe caught.
 	UnmarkGpuHide(Alloc.Offset, uint32(InQuads.Num()));
-	for (int32 I = 0; I < InQuads.Num(); ++I)
-	{
-		PooledQuads[int32(Alloc.Offset) + I] = InQuads[I];
-		QuadChunkIds[int32(Alloc.Offset) + I] = ChunkId;
-	}
+	WriteQuadRange(Alloc.Offset, ChunkId, InQuads, InCornerHeights);
 
 	const int32 Handle = AcquireAllocationHandle(Alloc, ChunkId);
 	++NumLiveChunks;
@@ -3083,12 +3189,26 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 	// pool was built for.
 	TArray<uint64> QuadsSlice;
 	TArray<uint32> IdsSlice;
+	// Empty on a terrain pool -- there is no corner shadow to slice, and the
+	// render thread skips the third lock when it arrives empty. On a water pool
+	// it rides the SAME runs as the quads, which is the point: a quad and its
+	// corner heights are published by one command or by neither.
+	TArray<uint32> CornersSlice;
+	const bool bHasCornerShadow = QuadCornerHeights.Num() > 0;
 	QuadsSlice.Reserve(int32(TotalQuadsToUpload));
 	IdsSlice.Reserve(int32(TotalQuadsToUpload));
+	if (bHasCornerShadow)
+	{
+		CornersSlice.Reserve(int32(TotalQuadsToUpload));
+	}
 	for (const FVoxelQuadUploadRun& Run : UploadRuns)
 	{
 		QuadsSlice.Append(PooledQuads.GetData() + Run.First, int32(Run.Count));
 		IdsSlice.Append(QuadChunkIds.GetData() + Run.First, int32(Run.Count));
+		if (bHasCornerShadow)
+		{
+			CornersSlice.Append(QuadCornerHeights.GetData() + Run.First, int32(Run.Count));
+		}
 	}
 
 	if (GVoxelPoolUploadStats != 0 && UploadRuns.Num() > 0)
@@ -3151,6 +3271,7 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 
 	ENQUEUE_RENDER_COMMAND(VoxelGpuPoolIncrementalUpdate)(
 		[Proxy, QuadsSlice = MoveTemp(QuadsSlice), IdsSlice = MoveTemp(IdsSlice),
+		 CornersSlice = MoveTemp(CornersSlice),
 		 OriginsCopy = MoveTemp(OriginsCopy), ParamsCopy = MoveTemp(ParamsCopy), RunsCopy = MoveTemp(RunsCopy),
 		 bBuildRuns,
 		 UploadRuns = MoveTemp(UploadRuns), NewNumQuads, bTableDirty,
@@ -3176,7 +3297,7 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 		{
 			Proxy->UpdateChunkTable_RenderThread(RHICmdList, OriginsCopy, ParamsCopy, RunsCopy, bBuildRuns);
 		}
-		Proxy->UpdateQuadRange_RenderThread(RHICmdList, QuadsSlice, IdsSlice,
+		Proxy->UpdateQuadRange_RenderThread(RHICmdList, QuadsSlice, IdsSlice, CornersSlice,
 		                                    UploadRuns, NewNumQuads);
 	});
 
@@ -3210,6 +3331,19 @@ void UVoxelGpuPoolComponent::DestroyRenderState_Concurrent()
 
 int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& InQuads)
 {
+	return UpdateChunkInternal(Handle, InQuads, /*InCornerHeights=*/nullptr);
+}
+
+int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& InQuads,
+                                          const TArray<uint32>& InCornerHeights)
+{
+	check(InCornerHeights.Num() == InQuads.Num());
+	return UpdateChunkInternal(Handle, InQuads, &InCornerHeights);
+}
+
+int32 UVoxelGpuPoolComponent::UpdateChunkInternal(int32 Handle, const TArray<uint64>& InQuads,
+                                                  const TArray<uint32>* InCornerHeights)
+{
 	if (!Allocations.IsValidIndex(Handle) || !Allocations[Handle].IsValid())
 	{
 		return INDEX_NONE;
@@ -3223,13 +3357,12 @@ int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& In
 	if (uint32(InQuads.Num()) <= Existing.NumQuads)
 	{
 		const uint32 ChunkId = AllocationChunkIds[Handle];
-		for (int32 I = 0; I < InQuads.Num(); ++I)
-		{
-			PooledQuads[int32(Existing.Offset) + I] = InQuads[I];
-			QuadChunkIds[int32(Existing.Offset) + I] = ChunkId;
-		}
+		WriteQuadRange(Existing.Offset, ChunkId, InQuads, InCornerHeights);
 		// Any tail the chunk no longer needs is hidden rather than left drawing
-		// its previous contents.
+		// its previous contents. The stale corner heights in that tail are left
+		// as they are on purpose: the hidden chunk's scale-0 table entry collapses
+		// those quads to a point, so nothing reads them, and writing them would be
+		// pure traffic on water's hottest path.
 		for (uint32 I = uint32(InQuads.Num()); I < Existing.NumQuads; ++I)
 		{
 			QuadChunkIds[int32(Existing.Offset + I)] = kHiddenChunkId;
@@ -3283,11 +3416,7 @@ int32 UVoxelGpuPoolComponent::UpdateChunk(int32 Handle, const TArray<uint64>& In
 	// writing, or the pass will blank geometry the shadow upload is about to
 	// publish -- the failure the forced probe caught.
 	UnmarkGpuHide(Alloc.Offset, uint32(InQuads.Num()));
-	for (int32 I = 0; I < InQuads.Num(); ++I)
-	{
-		PooledQuads[int32(Alloc.Offset) + I] = InQuads[I];
-		QuadChunkIds[int32(Alloc.Offset) + I] = ChunkId;
-	}
+	WriteQuadRange(Alloc.Offset, ChunkId, InQuads, InCornerHeights);
 	Allocations[Handle] = Alloc;
 	AllocationChunkIds[Handle] = ChunkId;
 	++NumLiveChunks;
@@ -4023,6 +4152,9 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 	// from the start. Only [0, HighWaterMark) is ever drawn.
 	TArray<uint64> UsedQuads = PooledQuads;
 	TArray<uint32> UsedIds = QuadChunkIds;
+	// Empty for a terrain pool, capacity-sized for a water one, for the same
+	// absolute-offset reason as the two above.
+	TArray<uint32> UsedCorners = QuadCornerHeights;
 
 	// What is actually about to be drawn, in terms the eye cannot check. A
 	// pooled draw has no per-chunk state, so when it renders wrong the only
@@ -4062,8 +4194,8 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 	}
 
 	FVoxelGpuPoolSceneProxy* Proxy =
-		new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, ChunkOrigins, ChunkParams, BuildChunkRuns(),
-		                            PoolName, ChunkTableCapacity, GetOrCreatePoolBuffers());
+		new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, UsedCorners, ChunkOrigins, ChunkParams,
+		                            BuildChunkRuns(), PoolName, ChunkTableCapacity, GetOrCreatePoolBuffers());
 	LiveProxy = Proxy;
 	return Proxy;
 }

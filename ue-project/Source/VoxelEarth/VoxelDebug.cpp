@@ -107,6 +107,44 @@ TAutoConsoleVariable<bool> CVarVoxelWaterGpu(
 	TEXT("voxel.Stream.GPU -- water is a separate pool with a separate, translucent material."),
 	ECVF_Default);
 
+// W4: arm the shallow-water layer (docs/adr/0004-swe-fixed-point-coupling.md).
+//
+// DEFAULT 0, AND THAT IS LOAD-BEARING, not caution. voxelcore/swe.h shipped
+// INERT -- `SweCoupleConfig::enabled` defaults false and nothing constructs an
+// `SweGrid` -- and the argument that let it merge without sign-off was
+// precisely that an untouched world stays byte-identical: no golden moved, no
+// version bumped, float-ban clean. Arming is opt-in per run so that argument
+// survives intact; a world nobody typed this cvar into runs exactly the code it
+// ran before W4 existed, down to the branch.
+//
+// NM_STANDALONE ONLY, ENFORCED AT THE POINT OF USE, NOT HERE. ADR-0004's item 3
+// is ACCEPTED with enablement DEFERRED to "M3 networked water", because the
+// coupler is a second simulation whose membership/dwell/sheet-depth state "must
+// replicate or be derived identically on every client ... it is not yet wired
+// into the replication path at all. Enabling it before that is a guaranteed
+// desync." That is a statement about a world that has a client in it. In
+// NM_Standalone there is no mirror to disagree with and no wire to be late on,
+// so the deferral has nothing to bite on -- and refusing every other net mode is
+// how the deferral is KEPT rather than quietly overridden. The refusal lives in
+// UVoxelWaterSubsystem::MaybeArmSwe (which is where the net mode is known and
+// where a clear one-shot log line citing the ADR can be emitted); this cvar is
+// only the raw request.
+//
+// Read every fixed step, same "no relaunch needed" pattern as
+// voxel.Water.SolidCacheEnabled: flipping to 0 flushes the sheet back into the
+// CA through the ledgered demotion channel and tears the grid down, so the
+// switch is genuinely reversible in both directions mid-session.
+TAutoConsoleVariable<bool> CVarVoxelWaterSwe(
+	TEXT("voxel.Water.SWE"),
+	false,
+	TEXT("W4 (ADR-0004): arm the shallow-water sheet + CA<->SWE coupler on the water subsystem's fixed 10Hz step, ")
+	TEXT("giving open water actual momentum instead of Phase C's static equilibrium level. Default 0. REFUSED on ")
+	TEXT("any net mode except NM_Standalone -- ADR-0004 item 3 defers enablement until the coupler's membership/dwell/")
+	TEXT("depth state is replicated, and a standalone world is the one case that deferral does not cover. ")
+	TEXT("NOTE: the renderer does not yet draw sheet depth (ADR-0004 'Renderer'), so promoted water is currently ")
+	TEXT("SIMULATED BUT INVISIBLE."),
+	ECVF_Default);
+
 // 64 -> 192 (2026-07-27, S1 close): 794 -> 1,040 chunks/s with converged holes
 // 6-14 -> 0, two clean legs each, 1.4% spread. 384 measured 1,044 -- inside
 // noise of 192 -- so 192 is the knee and there is nothing above it.
@@ -1085,6 +1123,11 @@ bool VoxelDebug::GetStreamGpu()
 bool VoxelDebug::GetWaterGpu()
 {
 	return CVarVoxelWaterGpu.GetValueOnGameThread();
+}
+
+bool VoxelDebug::GetWaterSwe()
+{
+	return CVarVoxelWaterSwe.GetValueOnGameThread();
 }
 
 int32 VoxelDebug::GetStreamJobsInFlightPerCore()

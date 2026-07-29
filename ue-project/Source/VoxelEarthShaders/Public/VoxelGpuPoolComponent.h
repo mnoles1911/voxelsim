@@ -231,8 +231,15 @@ public:
 	// room for -- climate in xy, surface height in z, one spare in w. See
 	// FVoxelQuadVertexFactoryParameters::ChunkParams for the exact layout and
 	// the reason z is chunk-relative.
+	//
+	// InCornerHeights is the PER-QUAD half of the same problem, for water only:
+	// four 8-bit surface heights per quad, one entry per InQuads entry, in the
+	// corner order VoxelQuadDecode.ush decodes. Null (the terrain case) leaves
+	// the shadow untouched, and a terrain pool has no shadow to touch -- the
+	// array is only allocated under SetWaterMode. See QuadCornerHeights.
 	int32 AddChunk(const TArray<uint64>& InQuads, const FVector3f& OriginUU, int32 Level,
-	               const FVector4f& Params = FVector4f(0.5f, 0.5f, kNoSurfaceGate, 0.0f));
+	               const FVector4f& Params = FVector4f(0.5f, 0.5f, kNoSurfaceGate, 0.0f),
+	               const TArray<uint32>* InCornerHeights = nullptr);
 
 	// Adds one chunk whose quads are ALREADY IN GPU MEMORY (Wave D / D1).
 	//
@@ -342,6 +349,18 @@ public:
 	// Returns the handle (possibly a new one if it had to reallocate), or
 	// INDEX_NONE if there was no room.
 	int32 UpdateChunk(int32 Handle, const TArray<uint64>& InQuads);
+
+	// The same, carrying per-quad corner heights -- see AddChunk's
+	// InCornerHeights and QuadCornerHeights.
+	//
+	// AN OVERLOAD RATHER THAN A DEFAULTED PARAMETER, unlike AddChunk. This is
+	// water's HOT path: every active brick re-meshes at the CA's 10 Hz cadence
+	// and lands here, so "the corner heights were silently omitted" would be a
+	// per-tick defect on every visible surface rather than a one-off at spawn.
+	// A distinct signature makes the water caller name what it is passing, and
+	// leaves the terrain caller (VoxelWorldSubsystem's edit re-mesh) reaching the
+	// unchanged two-argument form with no ambiguity about which it meant.
+	int32 UpdateChunk(int32 Handle, const TArray<uint64>& InQuads, const TArray<uint32>& InCornerHeights);
 
 	// Drops every chunk.
 	void ClearChunks();
@@ -561,6 +580,15 @@ public:
 	// floor moving.
 	int32 GetChunkTableCapacity() const { return ChunkTableCapacity; }
 
+	// Marks this pool instance as drawing water fill rather than terrain, which
+	// routes the quad's `mat` byte (the CA fill fraction) into VertexColor.R
+	// instead of terrain's biome flag. See
+	// FVoxelQuadVertexFactoryParameters::WaterMode for the full reasoning.
+	// Must be set BEFORE the proxy is created; the proxy takes a copy, exactly
+	// like SetPoolName and SetChunkEdgeVoxels.
+	void SetWaterMode(bool bInWaterMode) { bWaterMode = bInWaterMode; }
+	bool IsWaterMode() const { return bWaterMode; }
+
 	//~ UPrimitiveComponent
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
@@ -630,6 +658,27 @@ private:
 	// Parallel to PooledQuads: which chunk each quad belongs to. This is what
 	// removes per-draw state and lets one draw span the pool.
 	TArray<uint32> QuadChunkIds;
+
+	// Parallel to PooledQuads: four 8-bit water surface heights per quad, one
+	// per corner, in the order VoxelQuadDecode.ush decodes them.
+	//
+	// EMPTY UNLESS THIS POOL DRAWS WATER, and that is the whole reason it is a
+	// separate buffer rather than a wider quad. The 8-byte quad is a contract
+	// with the GPU mesher and the terrain renderer AND it is full; widening it
+	// would cost 4 bytes on every quad of a 100M-quad terrain pool for a field
+	// terrain never reads. Allocated in InitPool, gated on bWaterMode, which is
+	// why SetWaterMode has to precede InitPool (the water subsystem's pool
+	// creation does exactly that, in that order).
+	//
+	// It rides the SAME dirty-range machinery as the quads: every place that
+	// writes PooledQuads[i] writes this too, and every upload run copies the
+	// matching slice. Keeping them on one set of intervals is what makes it
+	// impossible for a quad and its corners to be published a frame apart.
+	//
+	// NOT written by AddChunkFromGpu, and nothing needs it to be: no GPU mesher
+	// produces water. If one ever does, this array is the thing that has to grow
+	// a GPU write path with it -- see PooledQuads for the shape that takes.
+	TArray<uint32> QuadCornerHeights;
 
 	// xyz = chunk origin in component space (unreal units), w = mip scale.
 	TArray<FVector4f> ChunkOrigins;
@@ -890,6 +939,21 @@ private:
 	void MarkQuadsDirty(uint32 First, uint32 Count);
 	void PushUpdatesToProxy();
 
+	// UpdateChunk's body, shared by both overloads so the in-place and realloc
+	// branches cannot drift apart between the corner-carrying and the plain
+	// caller (docs/backlog.md's "two copies of one calibration" failure mode).
+	int32 UpdateChunkInternal(int32 Handle, const TArray<uint64>& InQuads,
+	                          const TArray<uint32>* InCornerHeights);
+
+	// The ONE writer of a pool range's three parallel CPU shadows -- quads, chunk
+	// ids and, on a water pool, corner heights. Add and both update branches all
+	// go through it, because a range whose quads were written from one array and
+	// whose corners were written from another (or not at all) is the failure
+	// this pool specialises in: perfectly consistent counters, geometry that
+	// draws at the wrong height, and nothing to grep for.
+	void WriteQuadRange(uint32 Offset, uint32 ChunkId, const TArray<uint64>& InQuads,
+	                    const TArray<uint32>* InCornerHeights);
+
 	// RemoveChunk's body. bRecycleChunkId is false for the one caller that means
 	// to keep the table entry alive across the removal -- UpdateChunk's realloc
 	// branch, which re-uses the same entry for the chunk's new range so that an
@@ -906,6 +970,7 @@ private:
 	FString PoolName = TEXT("VoxelGpuPool");
 	int32 ChunkEdgeVoxels = 32;
 	int32 ChunkTableCapacity = 1024;
+	bool bWaterMode = false;
 
 	UPROPERTY()
 	TObjectPtr<UMaterialInterface> ChunkMaterial = nullptr;

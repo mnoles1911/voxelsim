@@ -33,7 +33,16 @@ public:
 	// responsible for destroying the component entirely once the CA no
 	// longer stores this brick at all (WaterCA::findBrick returns null) --
 	// this method alone never does that.
-	void SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads);
+	//
+	// InCornerHeights is PARALLEL to InQuads, one packed word per quad, four
+	// 8-bit surface heights in the corner order the scene proxy and
+	// VoxelQuadDecode.ush share (0=(u0,v0) 1=(u0,v1) 2=(u1,v1) 3=(u1,v0)).
+	// UVoxelWaterSubsystem::EmitWaterQuads is the one producer and it fills both
+	// arrays in lockstep -- see there for why the heights ride alongside the
+	// quads instead of inside FVoxelChunkQuad (that struct and its 8-byte packed
+	// form are a contract shared with the GPU mesher, and the packed word is
+	// full).
+	void SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, TArray<uint32>&& InCornerHeights);
 
 	//~ Begin UPrimitiveComponent Interface
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
@@ -49,6 +58,12 @@ public:
 
 private:
 	TArray<FVoxelChunkQuad> ChunkQuads;
+
+	// Parallel to ChunkQuads -- see SetChunkQuads. Always the same length; the
+	// proxy indexes the two together and a mismatch would shift every corner
+	// height by the difference, so SetChunkQuads checks it rather than trusting
+	// the caller.
+	TArray<uint32> ChunkCornerHeights;
 
 	// vxc::WaterBrick8::kEdge (8), duplicated as a plain int32 rather than
 	// pulling in a voxel-core header (doctrine: this UHT-parsed header stays

@@ -125,6 +125,35 @@ private:
 	FTimerHandle SpawnWaterTestTimerHandle;
 	FTimerHandle SpawnWaterTestSettleTimerHandle;
 
+	// --- Water pool parity anchor -------------------------------------------
+	// -VoxelWaterParityTest[=<delaySeconds>]: a SURFACE pour at a flat anchor,
+	// posed and captured identically every run, so that `voxel.Water.GPU` 0 vs
+	// 1 can be A/B'd against a same-path noise floor.
+	//
+	// WHY THIS EXISTS RATHER THAN REUSING -VoxelFloodTest. That anchor cannot
+	// support the comparison: same-path repeat runs there differ by 20.4-87.7%
+	// of pixels at >8/255, against a pooled-vs-component difference of
+	// 28.6-79.2% -- the ranges overlap completely, in both directions, so the
+	// instrument says nothing (docs/gpu-water-pool-design.md, "What was NOT
+	// established"). The variance is UNDERGROUND TERRAIN-CHUNK RESIDENCY, not
+	// the water (docs/status.md C7/C8 gotchas 3 and 4).
+	//
+	// So the whole design of this fixture is removing that one variable:
+	// pose on the surface, then WAIT FOR TERRAIN RESIDENCY TO GO QUIET BEFORE
+	// ANY WATER EXISTS, and only then pour. The settle wait is not a
+	// convenience, it IS the instrument -- a run that captures while chunks are
+	// still streaming is measuring streaming, not water.
+	FTimerHandle WaterParityPoseTimerHandle;
+	FTimerHandle WaterParityTerrainPollTimerHandle;
+	FTimerHandle WaterParityWaterPollTimerHandle;
+	FTimerHandle WaterParityShotTimerHandle;
+	FTimerDelegate WaterParityTerrainPollDelegate;
+	FTimerDelegate WaterParityWaterPollDelegate;
+	int32 WaterParityTerrainPolls = 0;
+	int32 WaterParityWaterPolls = 0;
+	FVector WaterParityCameraUU = FVector::ZeroVector;
+	FRotator WaterParityCameraRot = FRotator::ZeroRotator;
+
 	// ADR-0005 water persistence verification (docs/adr/0005-water-persistence.md):
 	// -VoxelWaterPersistTest[=<delaySeconds>] pours a pool (and best-effort drains
 	// a flooded cavern) near spawn, lets it settle, then SaveWaterState()s the
