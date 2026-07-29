@@ -19,6 +19,7 @@ add_executable(vxc_tests
   test_connectivity.cpp
   test_collapse.cpp
   test_rivernet.cpp
+  test_rivercouple.cpp
   test_pathfind.cpp
   test_regiongraph.cpp
   test_caves.cpp
@@ -28,6 +29,7 @@ add_executable(vxc_tests
   test_detail_rill.cpp
   test_detail_bedding.cpp
   test_density3.cpp
+  test_channel.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(vxc_tests PRIVATE voxelcore Threads::Threads)

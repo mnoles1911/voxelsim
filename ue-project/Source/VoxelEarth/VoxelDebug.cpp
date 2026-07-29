@@ -153,6 +153,30 @@ TAutoConsoleVariable<bool> CVarVoxelWaterSwe(
 	TEXT("SIMULATED BUT INVISIBLE."),
 	ECVF_Default);
 
+// W3 (plan S3.7 Layer R): the coarse river-network sim and its coupling to the
+// water CA. Default 0 for the same reason every other new simulation layer in
+// this file defaults off -- a layer does not get to start changing a live world
+// because it was linked in.
+//
+// REFUSED on NM_Client only, NOT narrowed to NM_Standalone the way
+// voxel.Water.SWE is, and the difference is worth stating because it looks like
+// an inconsistency. ADR-0004 item 3 gates the SWE coupler because SWE holds
+// SIMULATION STATE A CLIENT MUST SEE (sheet depth is water the renderer draws)
+// and none of it replicates. The river coupler holds no such state: its only
+// observable output is WaterCA fill, which already replicates through the
+// existing water-diff channel, and the graph itself is server-side bookkeeping
+// a client never reads. So a listen/dedicated server may run it and its clients
+// mirror the resulting water exactly as they mirror a pour.
+TAutoConsoleVariable<bool> CVarVoxelWaterRivers(
+	TEXT("voxel.Water.Rivers"),
+	false,
+	TEXT("W3 (plan S3.7 Layer R): build the coarse river-network graph around the player and couple it to the water ")
+	TEXT("CA -- segment discharge tops up real voxel water along each reach, the ocean (voxel z=0) is the sink, and ")
+	TEXT("sustained CA flux down a fresh channel promotes it to a new segment. Default 0. Refused on NM_Client ")
+	TEXT("(rivers tick server-side; clients mirror the resulting water diffs). The graph is built ONCE around the ")
+	TEXT("arming anchor and is not yet persisted, so promotions do not survive a reload."),
+	ECVF_Default);
+
 // 64 -> 192 (2026-07-27, S1 close): 794 -> 1,040 chunks/s with converged holes
 // 6-14 -> 0, two clean legs each, 1.4% spread. 384 measured 1,044 -- inside
 // noise of 192 -- so 192 is the knee and there is nothing above it.
@@ -1141,6 +1165,11 @@ bool VoxelDebug::GetWaterGpu()
 bool VoxelDebug::GetWaterSwe()
 {
 	return CVarVoxelWaterSwe.GetValueOnGameThread();
+}
+
+bool VoxelDebug::GetWaterRivers()
+{
+	return CVarVoxelWaterRivers.GetValueOnGameThread();
 }
 
 int32 VoxelDebug::GetStreamJobsInFlightPerCore()

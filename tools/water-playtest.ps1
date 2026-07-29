@@ -103,7 +103,15 @@ $args = @(
 # out of frame -- so any water you see is water YOU poured.
 if (-not $Origin) { $args += '-VoxelSpawnAt=-84480,53760' }
 
-if ($Swe) { $args += '-ExecCmds=voxel.Water.SWE 1' }
+# W3 rivers (plan S3.7 Layer R). Unlike -Swe, arming late is harmless: the
+# graph is built on whatever Tick the cvar first reads as 1, so if -ExecCmds
+# lands after the world has loaded (it usually does), the only consequence is
+# that the river starts a second later. Typing `voxel.Water.Rivers 1` in the
+# console does exactly the same thing and is the reliable path.
+$exec = @()
+if ($Swe)    { $exec += 'voxel.Water.SWE 1' }
+if ($Rivers) { $exec += 'voxel.Water.Rivers 1' }
+if ($exec.Count -gt 0) { $args += ('-ExecCmds=' + ($exec -join '|')) }
 
 Write-Host ''
 Write-Host 'Launching. Once you are in:' -ForegroundColor Cyan
@@ -115,6 +123,14 @@ Write-Host '                        ...pours AT YOUR CROSSHAIR, so aim first.'
 Write-Host ''
 Write-Host '  voxel.Water.GPU 0 / 1      component vs pooled render path (A/B)'
 Write-Host '  voxel.Water.SWE 0 / 1      momentum layer off / on'
+Write-Host ''
+Write-Host '  voxel.Water.Rivers 1       W3: build the river graph HERE and start it flowing.'
+Write-Host '                        Watch LogVoxelWater: an arm line naming the node/segment'
+Write-Host '                        count, then a RiverPerf: heartbeat every 5 s. Water appears'
+Write-Host '                        at each reach outlet within a second or two and runs downhill.'
+Write-Host '                        Dig a ditch out of a reach and keep it flowing for ~30 s to'
+Write-Host '                        see a PROMOTED line -- the CA-to-graph half.'
+Write-Host '                        The graph is built ONCE, around where you were standing.'
 Write-Host '  stat unit                  read DRAW, not Frame'
 Write-Host '  G  walk/fly    V  1st/3rd person    F1  overlay    F3  debug'
 Write-Host ''

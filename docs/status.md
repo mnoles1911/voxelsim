@@ -1,5 +1,63 @@
 # Milestone gate status
 
+## 2026-07-29 — W3: the river network is coupled to the water CA, and armable
+
+`rivernet.h` shipped as "groundwork only": a coarse ~1 Hz segment graph whose
+`kDivertChannel` diff was, in its own words, "a documented no-op stub" because
+"promoting a channel means synthesizing a brand-new node/segment from live CA
+flux data this graph-only layer does not have access to". That access now
+exists. `voxelcore/rivercouple.h` is the one file in voxel-core that includes
+both `rivernet.h` and `waterca.h`, and `voxel.Water.Rivers` arms it in-engine.
+
+**Two channels, and only one of them moves water.** Graph -> CA is a TOP-UP at
+each reach's downstream node (not a pour): the coupler withdraws only the
+shortfall between a discharge-derived target depth and what is actually there,
+which self-limits into a flux match — a channel the CA is draining is fed
+continuously, a blocked one back-pressures and stages up instead. CA -> graph
+(promotion) moves **zero units**; it is a topology edit informed by the CA.
+That asymmetry is why this coupling cannot leak the way ADR-0004's two-way
+CA<->SWE coupler had to be argued into not leaking: there is no second
+direction to get wrong.
+
+**Conservation** is a four-term integer identity, asserted every tick in-suite
+and every 5 s in-engine:
+`totalStorage + totalOutflowToOutlets + totalWithdrawnToCoupler == totalInjected`,
+with `withdrawn == toCA + toOcean` and `toCA == fillDelivered * graphUnitsPerFill`.
+Only whole multiples of the unit-conversion rate are ever withdrawn, so the
+conversion has no remainder; whatever the CA refuses is refunded to the reach
+it came from in the same call.
+
+**The ocean is the sink.** A reach whose downstream node — or whose resolved
+outfall floor — is at or below voxel z=0 receives no injection and is emptied
+into a ledgered ocean term every tick. Proved directly: a stem entirely below
+sea level ends a 200-tick run with `ca.totalVolume() == 0` and its whole
+throughput accounted for in `graphUnitsToOcean()`.
+
+**What promotes a channel**: five conjuncts, all of which must hold on 30
+consecutive ticks (~30 s) — it leaves a wet river node, it reaches an existing
+node or the sea, it descends strictly at tile scale, it is at least 2 pixels
+(60 m) long, and every pixel of it is wet AND something along it is still in
+the CA's active set. One failing tick discards the candidate rather than
+decrementing it. Five negative controls are in-suite (a film, a flicker, a
+dead end, a short course, and one not connected to a river) precisely because
+a false promotion is permanent and a missed one costs nothing.
+
+**Versions and goldens.** `kRiverNetVersion` 2 -> 3 — LOUDLY, and not because
+any rule changed: the rivernet golden `0xEC84E0B592821C38` is byte-identical
+and the new outflow-split arithmetic sits behind an `extraOutgoing_.empty()`
+test that is true for every graph generation can produce. It is bumped for the
+reason `kWaterCAVersion` went to 4 with no tick rule changed — a live world can
+now grow topology, so a recorded session from before this is not reproducible
+against it. `kWaterCAVersion` stays at **4** and both water goldens
+(`0x3D2224BE4A253404`, `0x56BC18914355A205`) are unmoved: not one line of this
+runs inside `WaterCA::step()`, so the tick's recent 4.7x is untouched and no
+re-bench was owed. Suite 324 -> **335 PASS / 0 FAIL**; float-ban clean.
+
+**Not done, and known.** The graph is built once around the arming anchor and
+is not re-centred as the player walks; the graph-diff log is produced but not
+persisted, so promotions are lost on reload; and nothing in-engine has been
+verified with a running editor (no editor session was taken).
+
 ## 2026-07-27/28 — the streaming-perf P0 is CLOSED, and T4-1 is built
 
 The pooled-arm plateau that framed the whole streaming-perf effort is resolved.
