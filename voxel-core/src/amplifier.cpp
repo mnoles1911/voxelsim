@@ -35,6 +35,26 @@ namespace {
 constexpr uint32_t kElevSlots = 256;   // ~6 KB/thread
 constexpr uint32_t kClimateSlots = 64; // ~2 KB/thread
 
+// --- opt-in memo instrumentation (VXC_MEMO_STATS) ---------------------------
+//
+// WHY COUNTS AND NOT A CLOCK. The claim the block memos exist to support is
+// "16 per-column probes become 1", which is a COUNT. Counts are deterministic
+// and completely immune to whatever else is running on the box; wall-clock is
+// neither, and a contended run reads exactly like a slow configuration
+// (docs/measurements/s1-close-2026-07-27.txt). Timing still decides whether the
+// saving is worth anything, but the mechanism should be proved by counting it.
+//
+// Plain thread_local, not atomics: this is per-thread by construction, and an
+// atomic in the hottest read in worldgen would be measuring the instrument.
+// Compiled out entirely unless VXC_MEMO_STATS is defined, so the shipping path
+// is untouched.
+#ifdef VXC_MEMO_STATS
+thread_local MemoStats tlMemoStats{};
+#define VXC_MEMO_COUNT(field) (++tlMemoStats.field)
+#else
+#define VXC_MEMO_COUNT(field) ((void)0)
+#endif
+
 struct ElevSlot {
     uint64_t amp = 0; // owning Amplifier id; 0 == empty (ids start at 1)
     int64_t px = 0, py = 0;
@@ -58,8 +78,10 @@ constexpr uint32_t slotIndex(uint64_t amp, int64_t px, int64_t py, uint32_t slot
 
 int32_t cachedElevationMm(uint64_t amp, ITileSampler& tiles, int64_t px, int64_t py) {
     static thread_local ElevSlot slots[kElevSlots];
+    VXC_MEMO_COUNT(elevProbes);
     ElevSlot& s = slots[slotIndex(amp, px, py, kElevSlots)];
     if (s.amp == amp && s.px == px && s.py == py) return s.value;
+    VXC_MEMO_COUNT(elevMisses);
     const int32_t v = tiles.elevationMm(px, py);
     s.amp = amp;
     s.px = px;
@@ -97,8 +119,10 @@ struct StencilSlot {
 
 const int64_t* cachedStencil(uint64_t amp, ITileSampler& tiles, int64_t px, int64_t py) {
     static thread_local StencilSlot slots[kStencilSlots];
+    VXC_MEMO_COUNT(stencilProbes);
     StencilSlot& s = slots[slotIndex(amp, px, py, kStencilSlots)];
     if (s.amp == amp && s.px == px && s.py == py) return s.cp;
+    VXC_MEMO_COUNT(stencilMisses);
     for (int j = 0; j < 4; ++j)
         for (int i = 0; i < 4; ++i)
             s.cp[i + 4 * j] = cachedElevationMm(amp, tiles, px - 1 + i, py - 1 + j);
@@ -1538,5 +1562,10 @@ MaterialId Amplifier::materialAt(const ColumnSample& col, int64_t vz) {
         return static_cast<MaterialId>(MAT_AIR);
     return m;
 }
+
+#ifdef VXC_MEMO_STATS
+MemoStats& memoStats() { return tlMemoStats; }
+void resetMemoStats() { tlMemoStats = MemoStats{}; }
+#endif
 
 } // namespace vxc

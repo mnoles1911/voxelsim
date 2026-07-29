@@ -680,6 +680,25 @@ the column; everything else differs by ≤4 columns in 147,456, i.e. 0.003%).
   > *direction* (16 per-point memo probes per column cost more than one block probe) is
   > near-certain. The magnitudes are not. Re-run on a quiet box before quoting them.
 
+  **The mechanism is proved by COUNTING instead, which contention cannot touch.** Wall-clock was
+  the wrong instrument for the claim in the first place: the block memos exist to turn 16
+  per-column tile probes into 1, and that is a count. Build with `-DVXC_MEMO_STATS=ON` (off by
+  default — it adds a `thread_local` increment to the hottest read in worldgen, and the point is to
+  measure the code rather than the instrument) and `vxc_bench` reports:
+
+  | brick | columns | stencil hit rate | elev probes/col | vs 16/col before |
+  |---|---|---|---|---|
+  | 8³ | 10,240,000 | **99.979%** | 0.0034 | **4,745×** fewer |
+  | 16³ | 18,534,400 | **99.982%** | 0.0029 | **5,589×** fewer |
+
+  The counterfactual is exact rather than estimated: before the block memo, `evalSurface` called
+  `cachedElevationMm` sixteen times per column, by construction. A 3.2 m chunk sits inside one 30 m
+  cell, so essentially every column in it wants the same sixteen control points — hence the ~99.98%
+  hit rate. The digest is unchanged under instrumentation, so the counters do not perturb worldgen.
+
+  This settles *whether the mechanism works*. It does not settle *whether the saving is worth
+  anything in time* — that still needs a quiet box.
+
   **Phase 1 measured (radius 128, brick 8³, A/B against a v8 worktree):**
 
   | | v8 | v9 naive | v9 shipped |

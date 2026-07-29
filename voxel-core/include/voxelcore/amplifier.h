@@ -42,6 +42,25 @@ struct ColumnSample {
     CavernColumn cavern;
 };
 
+// --- opt-in memo instrumentation (VXC_MEMO_STATS) ---------------------------
+//
+// Counts, not clocks. The block memos in amplifier.cpp exist to turn 16
+// per-column tile probes into 1, and that is a COUNT -- deterministic, and
+// immune to whatever else happens to be running on the machine. Wall-clock is
+// neither. Build with -DVXC_MEMO_STATS=ON to get these; the shipping path
+// compiles them out entirely.
+#ifdef VXC_MEMO_STATS
+struct MemoStats {
+    uint64_t elevProbes = 0;    // cachedElevationMm calls
+    uint64_t elevMisses = 0;    // ... that reached the sampler
+    uint64_t stencilProbes = 0; // cachedStencil calls (one per column)
+    uint64_t stencilMisses = 0; // ... that had to gather 16 control points
+};
+// Per-thread by construction; read it from the thread that did the work.
+MemoStats& memoStats();
+void resetMemoStats();
+#endif
+
 // --- surface upper bound (the sky-band trim's proof obligation) -------------
 //
 // Amplifier::surfaceUpperBoundMm returns this when it declines to bound. It is
