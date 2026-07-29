@@ -125,7 +125,7 @@ VXC_TEST(amplifier_golden_digest) {
     // the rework had not taken effect.
     // (was 0xA29A7A767DC1543B at v5, 0x81785278E4DFCF67 at v3/v4,
     //  0x73B43CAE621CA286 at v2)
-    CHECK_EQ(d.h, 0x98139AD5707E2DDBull);
+    CHECK_EQ(d.h, 0x834B4DC6B7EEE6B8ull);
 }
 
 // --- C4: the cavern pass is actually wired into the amplifier ---------------
@@ -238,7 +238,7 @@ VXC_TEST(amplifier_deep_column_golden_digest) {
     // layer), which are pinned against a constant surface and did NOT move);
     // what moved is where that unchanged geometry sits relative to the ground.
     // (was 0xF88B88DB9D9341AA at v5)
-    CHECK_EQ(d.h, 0x0A010660B19480BCull);
+    CHECK_EQ(d.h, 0xB192F462553A1753ull);
 }
 
 VXC_TEST(generated_brick_matches_pointwise_queries) {
@@ -685,7 +685,7 @@ VXC_TEST(amplifier_surface_bound_golden_digest) {
     // over 880 before the 3750 and 1875 environments were added; the digest
     // itself is unchanged by that, see above).
     // (was 0x5588EBCD842ECE3D at v5)
-    CHECK_EQ(d.h, 0x2D0C62D887A962E3ull);
+    CHECK_EQ(d.h, 0x2C7458A8E3E6AEB1ull);
 }
 
 // ---------------------------------------------------------------------------
@@ -881,6 +881,6 @@ VXC_TEST(amplifier_solid_below_bound_golden_digest) {
     // amplifier_solid_below_bound_has_no_air_beneath_it, which passes with
     // AIR BELOW FLOOR = 0 over 150031809 voxels.
     // (was 0xE9D395DF74D61495 at v5)
-    CHECK_EQ(d.h, 0xC4093E11E527EAE1ull);
+    CHECK_EQ(d.h, 0x5756F41DB7F3499Cull);
 }
 

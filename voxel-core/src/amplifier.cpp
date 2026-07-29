@@ -777,8 +777,8 @@ constexpr int64_t detailAllowanceMm(int64_t landformMax, int64_t microMax) {
 constexpr int64_t kDetailMaxAtMaxSlopeMm = detailAllowanceMm(kLandformMaxMm, kMicroMaxMm);
 constexpr int64_t kFineDetailMaxAtMaxSlopeMm =
     detailAllowanceMm(kFineLandformMaxMm, kFineMicroMaxMm);
-static_assert(kDetailMaxAtMaxSlopeMm == 27788, "detail allowance moved");
-static_assert(kFineDetailMaxAtMaxSlopeMm == 8195, "fine-tier detail allowance moved");
+static_assert(kDetailMaxAtMaxSlopeMm == 27588, "detail allowance moved");
+static_assert(kFineDetailMaxAtMaxSlopeMm == 7995, "fine-tier detail allowance moved");
 // The plan's claim was that the net detail envelope drops from ~15.7 m to ~3.0 m
 // on a fine world and that the bound therefore TIGHTENS. It does tighten, by
 // 3.8x -- but not to 3.0 m, because the allowance is the worst case at MAXIMUM

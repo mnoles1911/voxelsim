@@ -630,7 +630,9 @@ static const int64_t kCurvatureScaleMaxQ10 = 1792; // 1.75x on crests   [PROVISI
 // little over half way to saturation. The first cut was 2048, seven times the
 // mean, and the gate was wired in, bounded, proved, MIRRORED -- and doing
 // nothing. Do not round it back to a tidier number.        [PROVISIONAL]
-static const int64_t kCurvatureKneeQ10 = kCurveQ10One / 2;
+// MIRROR: carrier.h kCurvatureKneeQ10. Re-calibrated -- 0.5 left 70-96% of real
+// samples saturated, i.e. a two-valued step rather than a ramp.
+static const int64_t kCurvatureKneeQ10 = kCurveQ10One;
 
 // The curvature UNIT is scale-invariant; the curvature terrain EXHIBITS is not.
 // Curvature is a second derivative, so on a self-affine surface its magnitude
@@ -829,7 +831,9 @@ static const int64_t kBeddingWarpLatticeMul = 3;
 static const int64_t kBeddingWarpAmpQ10 = 384;
 static const int64_t kBeddingPeakFracMinQ10 = 307;
 static const int64_t kBeddingPeakFracMaxQ10 = 717;
-static const int64_t kBeddingAmpMm = 320; // PROVISIONAL, see detail_bedding.h
+// MIRROR: detail_bedding.h kBeddingAmpMm. 320 -> 120: at 320 this term alone was
+// 4.66x the whole detail S2 budget at the 0.4 m lag.        PROVISIONAL
+static const int64_t kBeddingAmpMm = 120;
 
 // The 16 strike directions. Entries 8..15 are the EXACT 90-degree rotation
 // (-dy, dx) of entries 0..7, which is an integer identity with no rounding, so

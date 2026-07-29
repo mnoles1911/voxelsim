@@ -290,9 +290,22 @@ VXC_TEST(bedding_component_is_in_phase_with_2d_banding) {
                 (long long)samples);
 
     // (d) THE COMPOSED, GATED D AT THE SURFACE still follows the 2D banding
-    // wherever bedding dominates the pocket term. |b2| >= 140 implies
-    // |b3| >= 200 = the pocket's entire allocation, so the sum's sign is the
-    // bedding's sign and this is an exact claim, not a statistical one.
+    // wherever bedding dominates the pocket term. The threshold is DERIVED, not
+    // written down: b3 is b2 rescaled from kBeddingAmpMm to kBedding3AmpMm, so
+    // |b2| > kDensity3PocketAmpMm * kBeddingAmpMm / kBedding3AmpMm implies
+    // |b3| > the pocket's entire allocation, and the sum's sign is the bedding's
+    // sign. That makes this an exact claim rather than a statistical one.
+    //
+    // It was a literal 140, chosen when kBeddingAmpMm was 320. Re-calibrating
+    // that constant to 120 made the threshold unreachable and the subset empty --
+    // caught only by the `dominant > 1000` guard below, which is precisely what
+    // that guard is for. Deriving it means the next amplitude change cannot
+    // silently hollow the test out.
+    constexpr int64_t kDominanceThresholdMm =
+        kDensity3PocketAmpMm * kBeddingAmpMm / kBedding3AmpMm + 1;
+    static_assert(kDominanceThresholdMm < kBeddingAmpMm,
+                  "the dominance threshold must be reachable by the 2D term, or the "
+                  "subset is empty and the test proves nothing");
     SplitMixRng rng2(8);
     int64_t dominant = 0, agree = 0;
     for (int i = 0; i < 200000; ++i) {
@@ -300,7 +313,7 @@ VXC_TEST(bedding_component_is_in_phase_with_2d_banding) {
         const int64_t y = rng2.nextSigned(2'000'000'000);
         const int64_t s = rng2.nextSigned(1'000'000);
         const int64_t b2 = beddingMm(kSeed, x, y, s);
-        if (iabs(b2) < 140) continue;
+        if (iabs(b2) < kDominanceThresholdMm) continue;
         ++dominant;
         const int64_t d = openD(x, y, s, s); // at the surface, both gates open
         if ((b2 > 0 && d > 0) || (b2 < 0 && d < 0)) ++agree;
