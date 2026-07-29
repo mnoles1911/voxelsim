@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 8
+#define VXC_WORLDGEN_VERSION_USH 9
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -98,6 +98,8 @@ static const int kVoxelSizeMm = 100;
 static const uint CH_DETAIL_OCTAVE_BASE = 0;
 static const uint CH_TOPSOIL_JITTER = 16;
 static const uint CH_BEDROCK_JITTER = 17;
+static const uint CH_ECOTONE_TEMP = 18;   // v9 biome-boundary dither
+static const uint CH_ECOTONE_PRECIP = 19; // v9 biome-boundary dither
 
 // Material ids (core.h) — append only, never renumber.
 static const uint MAT_AIR = 0;
@@ -141,7 +143,7 @@ static const uint BIOME_BARE_ROCK = 9;   // appended at worldgen v8
 // `vxc_dump_biome_constants` (voxel-core/bench) and paste its output: it prints
 // them from the very headers the CPU path compiles against, which is the only
 // way this mirror cannot drift by arithmetic slip.
-static const int64_t kBiomeCliffSlopeMmPerPx = 21000; // 70% grade over a 30 m px, ~35 deg
+static const int64_t kBiomeCliffSlopeMmPerM = 700; // 70% grade, ~35 deg (v9: mm per METRE)
 static const int kBiomeBeachLowerMm = -3000;
 static const int kBiomeBeachUpperMm = 4000;
 static const int kBiomeTreelineBaseMm = 900000;       // 900 m at 0 C (TUNED, not derived)
@@ -328,11 +330,121 @@ int64_t valueNoise2Fade(uint64_t seed, int64_t xMm, int64_t yMm, int64_t lattice
                     latticeMm * latticeMm);
 }
 
-int64_t slopeScaleQ10(int64_t slopeMmPerPx)
+// --- the C2 carrier (v9) ----------------------------------------------------
+// Bit-exact mirror of the carrier block in amplifier.cpp. Read that file for
+// WHY the base is a uniform cubic B-spline rather than bilinear, why B-spline
+// rather than Catmull-Rom, and why the evaluation is two-stage separable
+// (short version: the exact tensor form overflows int64 by ten orders of
+// magnitude at a 30 m pixel). Every division here is truncDiv, mirroring C++
+// `/`; NOT floorDiv, because the bound lemma is stated against truncation.
+static const int64_t kCarrierT = 1024;
+static const int64_t kCarrierValueDen = (int64_t)6 * 1024 * 1024 * 1024; // 6*1024^3
+static const int64_t kCarrierSlopeDen = (int64_t)2 * 1024 * 1024;       // 2*1024^2
+
+struct CarrierW4 { int64_t w0, w1, w2, w3; };
+struct CarrierW3 { int64_t w0, w1, w2; };
+
+CarrierW4 carrierValueW(int64_t tq)
 {
-    // slopeMmPerPx is a sum of absolute values (>= 0), so both roundings agree
+    const int64_t u = kCarrierT - tq;
+    const int64_t T = kCarrierT;
+    CarrierW4 r;
+    r.w0 = u * u * u;
+    r.w1 = 3 * tq * tq * tq - 6 * tq * tq * T + 4 * T * T * T;
+    r.w2 = -3 * tq * tq * tq + 3 * tq * tq * T + 3 * tq * T * T + T * T * T;
+    r.w3 = tq * tq * tq;
+    return r;
+}
+
+CarrierW3 carrierSlopeW(int64_t tq)
+{
+    const int64_t u = kCarrierT - tq;
+    const int64_t T = kCarrierT;
+    CarrierW3 r;
+    r.w0 = u * u;
+    r.w1 = -2 * tq * tq + 2 * T * tq + T * T;
+    r.w2 = tq * tq;
+    return r;
+}
+
+struct CarrierEval
+{
+    int64_t heightMm;
+    int64_t sxMmPerPx; // signed
+    int64_t syMmPerPx; // signed
+};
+
+CarrierEval evalCarrier(int64_t cp[16], int64_t fx, int64_t fy, int64_t pxMm)
+{
+    // fx, fy are in [0, pxMm) by floorDiv's contract, so both numerators are
+    // non-negative and tq lands in [0, 1023].
+    const int64_t tx = truncDiv(fx * kCarrierT, pxMm);
+    const int64_t ty = truncDiv(fy * kCarrierT, pxMm);
+    const CarrierW4 wx = carrierValueW(tx);
+    const CarrierW4 wy = carrierValueW(ty);
+    const CarrierW3 dx = carrierSlopeW(tx);
+    const CarrierW3 dy = carrierSlopeW(ty);
+
+    // Stage 1: collapse x for each of the four control rows.
+    int64_t rowVal[4];
+    int64_t rowDx[4];
+    [unroll]
+    for (int j = 0; j < 4; ++j)
+    {
+        const int64_t r0 = cp[4 * j + 0];
+        const int64_t r1 = cp[4 * j + 1];
+        const int64_t r2 = cp[4 * j + 2];
+        const int64_t r3 = cp[4 * j + 3];
+        const int64_t v = r0 * wx.w0 + r1 * wx.w1 + r2 * wx.w2 + r3 * wx.w3;
+        const int64_t d = (r1 - r0) * dx.w0 + (r2 - r1) * dx.w1 + (r3 - r2) * dx.w2;
+        rowVal[j] = truncDiv(v, kCarrierValueDen);
+        rowDx[j] = truncDiv(d, kCarrierSlopeDen);
+    }
+
+    // Stage 2: collapse y. The y-derivative is the quadratic basis over the
+    // first differences of the already-collapsed rows -- the tensor product
+    // commutes, so this is the same value as collapsing y first.
+    const int64_t h = rowVal[0] * wy.w0 + rowVal[1] * wy.w1 + rowVal[2] * wy.w2 +
+                      rowVal[3] * wy.w3;
+    const int64_t sx = rowDx[0] * wy.w0 + rowDx[1] * wy.w1 + rowDx[2] * wy.w2 +
+                       rowDx[3] * wy.w3;
+    const int64_t sy = (rowVal[1] - rowVal[0]) * dy.w0 + (rowVal[2] - rowVal[1]) * dy.w1 +
+                       (rowVal[3] - rowVal[2]) * dy.w2;
+
+    CarrierEval e;
+    e.heightMm = truncDiv(h, kCarrierValueDen);
+    e.sxMmPerPx = truncDiv(sx, kCarrierValueDen);
+    e.syMmPerPx = truncDiv(sy, kCarrierSlopeDen);
+    return e;
+}
+
+// Faded-bilinear blend of four u8 corners -- one channel of vxc::blendClimate
+// (amplifier.cpp), bit-for-bit. Every input is a u8 and both weights are
+// non-negative, so the result cannot leave [0, 255] and needs no clamp.
+int64_t blendU8(int64_t v00, int64_t v10, int64_t v01, int64_t v11,
+                int64_t gx, int64_t fx, int64_t gy, int64_t fy, int64_t den)
+{
+    return truncDiv((v00 * gx + v10 * fx) * gy + (v01 * gx + v11 * fx) * fy, den);
+}
+
+// The slope currency, MM PER METRE. L1, keeping the shape of the v8
+// tileSlopeMmPerPx so the recalibrated gates below are a pure unit conversion.
+int64_t carrierSlopeMmPerM(CarrierEval c, int64_t pxMm)
+{
+    const int64_t ax = c.sxMmPerPx < 0 ? -c.sxMmPerPx : c.sxMmPerPx;
+    const int64_t ay = c.syMmPerPx < 0 ? -c.syMmPerPx : c.syMmPerPx;
+    return truncDiv((ax + ay) * 1000, pxMm);
+}
+
+// v9: argument is MM PER METRE. The coefficient is a pure unit conversion of
+// v8's `+ truncDiv(slopeMmPerPx, 24)` at the scale-1 pixel -- 30000/24 mm per
+// pixel is 5/4 per mm per metre -- so tuned v8 behaviour is preserved exactly
+// at scale 1 and now means the same GRADE at every scale.
+int64_t slopeScaleQ10(int64_t slopeMmPerM)
+{
+    // slopeMmPerM is a sum of absolute values (>= 0), so both roundings agree
     // today; truncDiv keeps that from becoming load-bearing.
-    return clamp64(512 + truncDiv(slopeMmPerPx, 24), 256, 4096);
+    return clamp64(512 + truncDiv(slopeMmPerM * 5, 4), 256, 4096);
 }
 
 // vxc::microScaleQ10 (amplifier.cpp) bit-for-bit. The microrelief band's
@@ -342,9 +454,11 @@ int64_t slopeScaleQ10(int64_t slopeMmPerPx)
 // almost slope-FLAT by design (divisor 256, ceiling 1.25): amplifying the
 // fine band on steep ground turned a mountainside into rubble in-engine.
 // See amplifier.cpp for that measurement.
-int64_t microScaleQ10(int64_t slopeMmPerPx)
+// v9: MM PER METRE, same pure unit conversion -- v8's divisor 256 at a 30 m
+// pixel is 15/128 per mm per metre.
+int64_t microScaleQ10(int64_t slopeMmPerM)
 {
-    return clamp64(768 + truncDiv(slopeMmPerPx, 256), 768, 1280);
+    return clamp64(768 + truncDiv(slopeMmPerM * 15, 128), 768, 1280);
 }
 
 // --- biome classification (voxelcore/biome.h) -------------------------------
@@ -360,14 +474,14 @@ int biomeTreelineMm(int tempU8)
 }
 
 uint classifyBiome(int tempU8, int precipU8, int seasonalityU8, int surfaceMm,
-                    int64_t slopeMmPerPx)
+                    int64_t slopeMmPerM)
 {
     // SEA LEVEL FIRST (v8). The slope gate used to run ahead of these, so steep
     // SEAFLOOR classified as TUNDRA_ALPINE -- measured at 17.8% of the real
     // 25-tile world. Nothing below sea level can be alpine.
     if (surfaceMm < kBiomeBeachLowerMm) return BIOME_OCEAN;
     if (surfaceMm <= kBiomeBeachUpperMm) return BIOME_BEACH;
-    if (slopeMmPerPx > kBiomeCliffSlopeMmPerPx) return BIOME_BARE_ROCK;
+    if (slopeMmPerM > kBiomeCliffSlopeMmPerM) return BIOME_BARE_ROCK;
     if (surfaceMm > biomeTreelineMm(tempU8)) return BIOME_TUNDRA_ALPINE;
 
     if (tempU8 < kBiomeTempColdU8) return BIOME_TAIGA;
@@ -552,8 +666,8 @@ uint rasterClimate(int64_t px, int64_t py)
 // have the raster bound and must have already refused PixelSizeMm == 0.
 struct SurfaceEval
 {
-    int64_t px, py;          // tile pixel of the bilinear base tap
-    int64_t slopeMmPerPx;    // tile-level slope, conditions detail + soil depth
+    int64_t px, py;        // tile pixel the column falls in
+    int64_t slopeMmPerM;   // v9: carrier's analytic gradient, mm per METRE
     int surfaceMm;
 };
 
@@ -563,30 +677,46 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     const int64_t yMm = vy * kVoxelSizeMm;
     const int64_t pxMm = (int64_t)PixelSizeMm;
 
-    // Bilinear base elevation (exact integer math).
+    // C2 carrier over the tile raster (exact integer math). The control stencil
+    // for this cell is px-1..px+2 on each axis -- four control points per axis
+    // rather than bilinear's two, which is what buys gradient continuity across
+    // the cell boundary.
+    //
+    // RASTER WINDOW CONTRACT: this reaches ONE pixel further on the low side and
+    // TWO further on the high side than v8 did. rasterElevationMm CLAMPS to the
+    // bound window, so a window that is not dilated to match would silently
+    // return an edge value where the CPU reads the real tile -- a divergence
+    // that no bounds check would catch. The host pass and gpu_harness both
+    // dilate; see kCarrierStencilLo / kCarrierStencilHi below.
     const int64_t px = floorDiv(xMm, pxMm);
     const int64_t py = floorDiv(yMm, pxMm);
     const int64_t fx = xMm - px * pxMm;
     const int64_t fy = yMm - py * pxMm;
-    const int64_t e00 = (int64_t)rasterElevationMm(px, py);
-    const int64_t e10 = (int64_t)rasterElevationMm(px + 1, py);
-    const int64_t e01 = (int64_t)rasterElevationMm(px, py + 1);
-    const int64_t e11 = (int64_t)rasterElevationMm(px + 1, py + 1);
-    const int64_t gx = pxMm - fx;
-    const int64_t gy = pxMm - fy;
-    // Elevations go negative (oceans) — truncDiv, not `/`.
-    const int64_t baseMm = truncDiv(
-        (e00 * gx + e10 * fx) * gy + (e01 * gx + e11 * fx) * fy, pxMm * pxMm);
 
-    const int64_t slopeMmPerPx =
-        (e10 > e00 ? e10 - e00 : e00 - e10) + (e01 > e00 ? e01 - e00 : e00 - e01);
+    int64_t cp[16];
+    [unroll]
+    for (int j = 0; j < 4; ++j)
+    {
+        [unroll]
+        for (int i = 0; i < 4; ++i)
+            cp[i + 4 * j] = (int64_t)rasterElevationMm(px - 1 + i, py - 1 + j);
+    }
+
+    const CarrierEval carrier = evalCarrier(cp, fx, fy, pxMm);
+    const int64_t baseMm = carrier.heightMm;
+
+    // The carrier's ANALYTIC gradient, mm per metre. v8 used a per-cell forward
+    // difference that was constant across a whole pixel, so the detail gain
+    // stepped at every pixel line; the spline derivative is continuous, so that
+    // step is structurally impossible rather than merely small.
+    const int64_t slopeMmPerM = carrierSlopeMmPerM(carrier, pxMm);
 
     // Two bands, accumulated separately because they take different scales,
     // and each scaled ONCE — mirroring Amplifier::evalSurface exactly,
     // including WHERE the truncations happen. Moving a truncation is a
     // divergence even when the arithmetic is otherwise identical.
-    const int64_t sScale = slopeScaleQ10(slopeMmPerPx);
-    const int64_t mScale = microScaleQ10(slopeMmPerPx);
+    const int64_t sScale = slopeScaleQ10(slopeMmPerM);
+    const int64_t mScale = microScaleQ10(slopeMmPerM);
     int64_t landformMm = 0;
     int64_t microMm = 0;
     [unroll]
@@ -607,7 +737,7 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     SurfaceEval s;
     s.px = px;
     s.py = py;
-    s.slopeMmPerPx = slopeMmPerPx;
+    s.slopeMmPerM = slopeMmPerM;
     s.surfaceMm = (int)clamp64(baseMm + detailMm, -8000000, 9000000);
     return s;
 }
@@ -676,12 +806,65 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
     const SurfaceEval se = evalSurface(seed, vx, vy);
     const int64_t px = se.px;
     const int64_t py = se.py;
-    const int64_t slopeMmPerPx = se.slopeMmPerPx;
+    const int64_t slopeMmPerM = se.slopeMmPerM;
 
-    const uint cl = rasterClimate(px, py);
-    const uint clTemperature = cl & 0xff;
-    const uint clSeasonality = (cl >> 8) & 0xff;
-    const uint clPrecipitation = (cl >> 16) & 0xff;
+    // CLIMATE, FADED-BILINEAR RATHER THAN NEAREST-PIXEL (v9). Mirror of
+    // Amplifier::column's blendClimate. v8 read the single pixel the column fell
+    // in, so classifyBiome's inputs were piecewise constant on the 30 m grid and
+    // surfaceMat changed in hard 30 m squares. Measured with vxc_terrainprobe's
+    // material-boundary-alignment instrument on the synthetic sampler: v8 put
+    // 89.1% of material changes within one voxel of a pixel boundary against
+    // 1.0% by chance; v9 puts 0%.
+    //
+    // Blends the CHANNELS, not the classification: the gates stay hard, which is
+    // correct for a treeline or a shoreline, but they now sit on smooth
+    // iso-curves instead of pixel edges.
+    const int64_t xMmC = vx * kVoxelSizeMm;
+    const int64_t yMmC = vy * kVoxelSizeMm;
+    const int64_t pxMmC = (int64_t)PixelSizeMm;
+    const int64_t cfx = fadeFractionMm(xMmC - px * pxMmC, pxMmC);
+    const int64_t cfy = fadeFractionMm(yMmC - py * pxMmC, pxMmC);
+    const int64_t cgx = pxMmC - cfx;
+    const int64_t cgy = pxMmC - cfy;
+    const int64_t cden = pxMmC * pxMmC;
+    const uint cl00 = rasterClimate(px, py);
+    const uint cl10 = rasterClimate(px + 1, py);
+    const uint cl01 = rasterClimate(px, py + 1);
+    const uint cl11 = rasterClimate(px + 1, py + 1);
+    // LITERAL shift distances, one channel at a time.
+    //
+    // This was a macro taking the shift as a parameter, and tools/lint-shader-ub.py
+    // rejected it as a VARIABLE_SHIFT -- correctly. The linter is textual and
+    // cannot see that every expansion is a constant, and a non-literal shift
+    // distance is undefined when out of range with vendors differing on whether
+    // they mask it. That is exactly the class of construct this file exists to
+    // keep out, so the honest fix is to spell the three channels out rather than
+    // to annotate the macro away. Costs nothing.
+    const uint clTemperature =
+        (uint)blendU8((int64_t)(cl00 & 0xff), (int64_t)(cl10 & 0xff),
+                      (int64_t)(cl01 & 0xff), (int64_t)(cl11 & 0xff),
+                      cgx, cfx, cgy, cfy, cden);
+    const uint clSeasonality =
+        (uint)blendU8((int64_t)((cl00 >> 8) & 0xff), (int64_t)((cl10 >> 8) & 0xff),
+                      (int64_t)((cl01 >> 8) & 0xff), (int64_t)((cl11 >> 8) & 0xff),
+                      cgx, cfx, cgy, cfy, cden);
+    const uint clPrecipitation =
+        (uint)blendU8((int64_t)((cl00 >> 16) & 0xff), (int64_t)((cl10 >> 16) & 0xff),
+                      (int64_t)((cl01 >> 16) & 0xff), (int64_t)((cl11 >> 16) & 0xff),
+                      cgx, cfx, cgy, cfy, cden);
+
+    // ECOTONE DITHER. Interpolation turns 30 m stair-steps into smooth curves,
+    // but a smooth curve through a hard threshold is still a clean line, and a
+    // real biome boundary is a ragged few-metre transition. +/-2 u8 units on a
+    // 1.6 m lattice, applied to the two decision channels only.
+    const int64_t ecoT =
+        truncDiv((int64_t)hashToSigned16(hash2(seed, floorDiv(vx, 16), floorDiv(vy, 16), CH_ECOTONE_TEMP)) * 2,
+                 32768);
+    const int64_t ecoP =
+        truncDiv((int64_t)hashToSigned16(hash2(seed, floorDiv(vx, 16), floorDiv(vy, 16), CH_ECOTONE_PRECIP)) * 2,
+                 32768);
+    const int clTempDithered = (int)clamp64((int64_t)clTemperature + ecoT, 0, 255);
+    const int clPrecipDithered = (int)clamp64((int64_t)clPrecipitation + ecoP, 0, 255);
 
     GpuColumnSample outCol;
     outCol.surfaceMm = se.surfaceMm;
@@ -696,11 +879,11 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
     const int64_t topsoilBaseMm =
         kTopsoilBaseMm + truncDiv(rainMmPerYr * kTopsoilMmPerMetreOfRain, 1000);
     const int64_t retainQ10 =
-        clamp64(1024 - truncDiv(slopeMmPerPx * 1024, kBiomeCliffSlopeMmPerPx),
+        clamp64(1024 - truncDiv(slopeMmPerM * 1024, kBiomeCliffSlopeMmPerM),
                 kTopsoilSlopeRetentionMinQ10, 1024);
     int64_t topsoil = truncDiv(topsoilBaseMm * retainQ10, 1024);
     const int64_t tj =
-        (int64_t)hashToSigned16(hash2(seed, vx >> 4, vy >> 4, CH_TOPSOIL_JITTER));
+        (int64_t)hashToSigned16(hash2(seed, floorDiv(vx, 16), floorDiv(vy, 16), CH_TOPSOIL_JITTER));
     topsoil += truncDiv(topsoil * tj, 4 * 32768); // tj is signed — truncDiv.
     // Clamp AFTER the jitter: kTopsoilMinMm is what guarantees at least one
     // visible biome-coloured voxel on every column, and clamping first would
@@ -716,14 +899,17 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
     // why 200 m is the band's MEAN, not its floor). Same deterministic shape
     // as before, one 16-bit hash field linearly mapped onto [base, base+span);
     // only the two constants moved.
-    const uint64_t bj = hash2(seed, vx >> 6, vy >> 6, CH_BEDROCK_JITTER);
+    const uint64_t bj = hash2(seed, floorDiv(vx, 64), floorDiv(vy, 64), CH_BEDROCK_JITTER);
     outCol.bedrockDepthMm = (int)(180000 + ((bj >> 48) * 40000) / 65536);
 
     // Surface material from biome classification (M4) — morphology gates
     // then Whittaker climate lookup, bit-exact mirror of
     // vxc::Amplifier::column's classifyBiome/biomeSurfaceMaterial call.
-    const uint biome = classifyBiome((int)clTemperature, (int)clPrecipitation,
-                                     (int)clSeasonality, outCol.surfaceMm, slopeMmPerPx);
+    // Dithered temperature/precipitation, undithered seasonality -- and the
+    // topsoil depth above deliberately uses the UNDITHERED rainfall, because it
+    // is a depth model rather than a boundary. Mirrors Amplifier::column.
+    const uint biome = classifyBiome(clTempDithered, clPrecipDithered,
+                                     (int)clSeasonality, outCol.surfaceMm, slopeMmPerM);
     outCol.surfaceMat = biomeSurfaceMaterial(biome, outCol.surfaceMm);
 
     OutColumns[tid.x + tid.y * DispatchColumns.x] = outCol;

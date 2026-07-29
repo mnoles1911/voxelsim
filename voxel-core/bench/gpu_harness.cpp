@@ -316,6 +316,17 @@ void validateWorldGenParams(const WorldGenParamsCB& p, const char* where) {
     if (p.RasterSizeX == 0 || p.RasterSizeY == 0)
         fail(std::string(where) + ": RasterSize has a zero extent (" +
              std::to_string(p.RasterSizeX) + "x" + std::to_string(p.RasterSizeY) + ")");
+    // CoarseScale is a MULTIPLIER on the column coordinate (coarseRep), not a
+    // level. Zero -- which is what a value-initialised WorldGenParamsCB leaves
+    // here -- makes every column in the dispatch evaluate at world origin
+    // (0,0), and it does so SILENTLY: rasterElevationMm clamps to each region's
+    // own window, so the resulting terrain still varies from region to region
+    // and looks plausible in a digest. This gate shipped in that state, so the
+    // check is not hypothetical.
+    if (p.CoarseScale == 0)
+        fail(std::string(where) + ": CoarseScale is 0 - it multiplies the column coordinate in "
+                                  "coarseRep, so 0 collapses every column to world origin. "
+                                  "Level 0 is CoarseScale = 1, not 0.");
     // VoxelizeMain's brick indexing assumes a brick-aligned footprint.
     if (p.DispatchColumnsX % 8 != 0 || p.DispatchColumnsY % 8 != 0)
         fail(std::string(where) + ": DispatchColumns must be brick-aligned (multiples of 8), got " +
@@ -1141,10 +1152,10 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
     const int64_t yMmMin = int64_t(region.originVy) * kVoxelSizeMm - kRasterCavernMarginMm;
     const int64_t yMmMax =
         int64_t(region.originVy + int32_t(region.height) - 1) * kVoxelSizeMm + kRasterCavernMarginMm;
-    const int64_t pxMin = floorDiv(xMmMin, pixelSizeMm);
-    const int64_t pxMax = floorDiv(xMmMax, pixelSizeMm) + 1;
-    const int64_t pyMin = floorDiv(yMmMin, pixelSizeMm);
-    const int64_t pyMax = floorDiv(yMmMax, pixelSizeMm) + 1;
+    const int64_t pxMin = floorDiv(xMmMin, pixelSizeMm) + kCarrierStencilLo;
+    const int64_t pxMax = floorDiv(xMmMax, pixelSizeMm) + kCarrierStencilHi;
+    const int64_t pyMin = floorDiv(yMmMin, pixelSizeMm) + kCarrierStencilLo;
+    const int64_t pyMax = floorDiv(yMmMax, pixelSizeMm) + kCarrierStencilHi;
     const uint32_t rasterW = static_cast<uint32_t>(pxMax - pxMin + 1);
     const uint32_t rasterH = static_cast<uint32_t>(pyMax - pyMin + 1);
 
@@ -1220,6 +1231,16 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
     }
 
     WorldGenParamsCB params{};
+    // D5: coarse cell size in level-0 voxels (1 << level). MUST be 1 for the
+    // level-0 fixtures -- coarseRep multiplies by it, so the zero a
+    // value-initialised struct leaves here collapses EVERY column to world
+    // origin (0,0). That is exactly what it did: the gate compared a CPU
+    // reference walking real coordinates against a GPU that evaluated (0,0)
+    // for all 4096 columns, and it stayed hidden because rasterElevationMm
+    // clamps to each region's own window, so the wrong answer still varied
+    // per region and looked plausible.
+    params.CoarseScale = 1;
+    params.RingSkirtMask = 0;
     params.DispatchColumnsX = region.width;
     params.DispatchColumnsY = region.height;
     params.RasterOriginPxX = static_cast<int32_t>(pxMin);
@@ -1881,10 +1902,10 @@ void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t 
     const int64_t xMmMax = int64_t(tile.originVx + W - 1) * kVoxelSizeMm + kRasterCavernMarginMm;
     const int64_t yMmMin = int64_t(tile.originVy) * kVoxelSizeMm - kRasterCavernMarginMm;
     const int64_t yMmMax = int64_t(tile.originVy + H - 1) * kVoxelSizeMm + kRasterCavernMarginMm;
-    const int64_t pxMin = floorDiv(xMmMin, pixelSizeMm);
-    const int64_t pxMax = floorDiv(xMmMax, pixelSizeMm) + 1;
-    const int64_t pyMin = floorDiv(yMmMin, pixelSizeMm);
-    const int64_t pyMax = floorDiv(yMmMax, pixelSizeMm) + 1;
+    const int64_t pxMin = floorDiv(xMmMin, pixelSizeMm) + kCarrierStencilLo;
+    const int64_t pxMax = floorDiv(xMmMax, pixelSizeMm) + kCarrierStencilHi;
+    const int64_t pyMin = floorDiv(yMmMin, pixelSizeMm) + kCarrierStencilLo;
+    const int64_t pyMax = floorDiv(yMmMax, pixelSizeMm) + kCarrierStencilHi;
     const uint32_t rasterW = static_cast<uint32_t>(pxMax - pxMin + 1);
     const uint32_t rasterH = static_cast<uint32_t>(pyMax - pyMin + 1);
 
@@ -1986,6 +2007,10 @@ void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t 
     params.OriginVy = tile.originVy;
     params.BrickZMin = s.brickZMin;
     params.BricksZ = s.bricksZ;
+    // See the note at the other params site: CoarseScale is a MULTIPLIER, so
+    // leaving the value-initialised 0 collapses every column to world origin.
+    params.CoarseScale = 1;
+    params.RingSkirtMask = 0;
     validateWorldGenParams(params, "prepTileCpu");
 
     if (!s.colVoxDescriptorsWritten || elevGrew || climGrew || cellsGrew) {
@@ -2723,14 +2748,37 @@ int main(int argc, char** argv) {
     // needs > 37 interior layers (~30 m of relief inside a 6.4 m footprint)
     // — unreachable for surface terrain. Gate mode still exercises the full
     // 128x128 dispatch shape (with z-slab splitting, see ZWindow).
+    // BOTH ORIGINAL REGIONS SIT AT NEGATIVE vx, and that turned out to matter.
+    // Every hash in worldgen takes lattice/pixel indices derived from world
+    // coordinates, so at negative coordinates it is fed negative arguments --
+    // and a vendor that treats `>>` on a signed 64-bit value as a LOGICAL shift,
+    // or that floors differently, diverges there and NOWHERE ELSE. With no
+    // all-positive region in the gate, a divergence of that shape looks like
+    // "everything is broken" and gives no way to localise it.
+    //
+    // "positive" is the control: same size, same code path, no negative
+    // coordinate anywhere in it. If it passes while the other two fail, the
+    // fault is coordinate-sign-dependent; if all three fail, it is not.
     const RegionSpec regions[] = {
         {"origin", -64, -64, 64, 64},
         {"far-negative", -100000, 250000, 64, 64},
+        {"positive", 100064, 250064, 64, 64},
     };
 
     Digest gpuDigest;
     std::vector<Mismatch> mismatches;
     constexpr size_t kMaxMismatchesPrinted = 20;
+    // COUNT EVERY MISMATCH, print only the first few.
+    //
+    // The printed list is capped, and the cap used to be the only number
+    // reported -- so a run whose first column disagreed filled the list with
+    // that one column's fields and cells and reported "20 mismatch(es)"
+    // whether the true count was 20 or 20,000. That is not a rounding error in
+    // the diagnosis, it is the difference between "one bad corner" and "the
+    // whole dispatch is wrong", and it cost real time to see through. Totals
+    // are cheap; keep them separate from the sample.
+    size_t totalMismatches = 0;
+    size_t mismatchedColumns = 0;
     size_t totalColumns = 0;
     size_t totalCells = 0;
     size_t totalMeshedBricks = 0;
@@ -2742,6 +2790,7 @@ int main(int argc, char** argv) {
     double totalMeshEmitMs = 0;
 
     for (const RegionSpec& region : regions) {
+        const size_t regionMismatchesBefore = totalMismatches;
         const RegionResult gpu = runRegion(ctx, region, seed);
         totalColumnDispatchMs += gpu.columnDispatchMs;
         totalVoxelizeDispatchMs += gpu.voxelizeDispatchMs;
@@ -2769,8 +2818,12 @@ int main(int argc, char** argv) {
                 gpuDigest.u32(static_cast<uint32_t>(g.bedrockDepthMm));
                 gpuDigest.u8(static_cast<uint8_t>(g.surfaceMat));
 
+                size_t colMismatches = 0;
                 auto record = [&](const char* field, int64_t cpuVal, int64_t gpuVal) {
-                    if (cpuVal != gpuVal && mismatches.size() < kMaxMismatchesPrinted)
+                    if (cpuVal == gpuVal) return;
+                    ++totalMismatches;
+                    ++colMismatches;
+                    if (mismatches.size() < kMaxMismatchesPrinted)
                         mismatches.push_back({vx, vy, field, cpuVal, gpuVal});
                 };
                 record("surfaceMm", c.surfaceMm, g.surfaceMm);
@@ -2778,6 +2831,7 @@ int main(int argc, char** argv) {
                 record("subsoilMm", c.subsoilMm, g.subsoilMm);
                 record("bedrockDepthMm", c.bedrockDepthMm, g.bedrockDepthMm);
                 record("surfaceMat", c.surfaceMat, g.surfaceMat);
+                if (colMismatches > 0) ++mismatchedColumns;
 
                 // --- VoxelizeMain cell comparison for this column's brick
                 // stack (mirrors GeneratedWorld<8>::makeBrick's per-cell
@@ -2886,6 +2940,22 @@ int main(int argc, char** argv) {
                                        int64_t(gpu.quads.size())});
             }
         }
+
+        // PER-REGION verdict. A single global total cannot distinguish "one
+        // region is broken" from "everything is", and that distinction is the
+        // whole reason the positive-coordinate control region exists.
+        std::printf("[%s] mismatches in this region: %zu\n", region.name,
+                    totalMismatches - regionMismatchesBefore);
+        // First column of the region, field by field. A per-region sample is
+        // what distinguishes "the same wrong constant everywhere" (a hash fed
+        // the wrong coordinates) from "wrong by a little, differently each
+        // time" (an arithmetic divergence).
+        std::printf("[%s]   col0 vx=%lld vy=%lld  surfaceMm cpu=%d gpu=%d  "
+                    "bedrock cpu=%d gpu=%d  mat cpu=%d gpu=%d\n",
+                    region.name, (long long)region.originVx, (long long)region.originVy,
+                    gpu.cpuCols[0].surfaceMm, gpu.samples[0].surfaceMm,
+                    gpu.cpuCols[0].bedrockDepthMm, gpu.samples[0].bedrockDepthMm,
+                    (int)gpu.cpuCols[0].surfaceMat, (int)gpu.samples[0].surfaceMat);
     }
 
     const std::string deviceName = ctx.deviceName;
@@ -2911,7 +2981,11 @@ int main(int argc, char** argv) {
                 (unsigned long long)gpuDigest.h);
 
     if (!mismatches.empty()) {
-        std::printf("\nFAIL: %zu mismatch(es) (showing up to %zu):\n", mismatches.size(),
+        std::printf("\nFAIL: %zu column-field mismatch(es) over %zu of %zu columns "
+                    "(%.2f%%); showing the first %zu of all kinds:\n",
+                    totalMismatches, mismatchedColumns, totalColumns,
+                    totalColumns > 0 ? 100.0 * double(mismatchedColumns) / double(totalColumns)
+                                     : 0.0,
                     kMaxMismatchesPrinted);
         for (const Mismatch& m : mismatches) {
             std::printf("  (vx=%lld, vy=%lld) %s: cpu=%lld gpu=%lld\n", (long long)m.vx,

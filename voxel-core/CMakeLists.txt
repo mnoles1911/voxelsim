@@ -17,6 +17,16 @@ add_library(voxelcore STATIC
   src/swe.cpp
 )
 target_include_directories(voxelcore PUBLIC include)
+
+# Opt-in memo instrumentation. OFF by default: it adds a thread_local increment
+# to the hottest read in worldgen, and the point of the counters is to measure
+# the code, not the instrument. PUBLIC so consumers (vxc_bench) see the same
+# declarations the library was built with -- getting that wrong gives an ODR
+# mismatch rather than a compile error.
+option(VXC_MEMO_STATS "Count amplifier tile-memo probes/misses (diagnostic)" OFF)
+if(VXC_MEMO_STATS)
+  target_compile_definitions(voxelcore PUBLIC VXC_MEMO_STATS)
+endif()
 if(MSVC)
   target_compile_options(voxelcore PRIVATE /W4 /WX)
 else()

@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "voxelcore/amplifier.h"
 #include "voxelcore/mesher.h"
 #include "voxelcore/mips.h"
 #include "voxelcore/world.h"
@@ -138,7 +139,26 @@ void report(const char* label, const BenchResult& r) {
     if (totalMs > 0)
         std::printf("throughput: %.0f bricks/s, %.0f Mvoxel/s (solid)\n",
                     r.bricks / totalMs * 1000.0, r.solidVoxels / totalMs / 1000.0);
-    std::printf("digest %016llx\n\n", static_cast<unsigned long long>(r.digest));
+    std::printf("digest %016llx\n", static_cast<unsigned long long>(r.digest));
+#ifdef VXC_MEMO_STATS
+    // COUNTS, not clocks. These are deterministic and unaffected by anything
+    // else running on the machine, which the ms figures above emphatically are
+    // not. Per column is the number that matters: the block memos exist to turn
+    // ~16 per-column tile probes into ~1.
+    const vxc::MemoStats& m = vxc::memoStats();
+    // stencilProbes IS the column count: evalSurface makes exactly one per
+    // column. The counterfactual is exact rather than estimated -- before the
+    // block memo, evalSurface called cachedElevationMm 16 times per column, by
+    // construction.
+    const double cols = m.stencilProbes ? double(m.stencilProbes) : 1.0;
+    std::printf("memo: columns %llu | stencil hit %.3f%% | elev probes %llu = %.4f/col "
+                "(was 16/col before the block memo, a %.0fx reduction)\n",
+                (unsigned long long)m.stencilProbes,
+                100.0 * (1.0 - double(m.stencilMisses) / cols),
+                (unsigned long long)m.elevProbes, double(m.elevProbes) / cols,
+                m.elevProbes ? 16.0 * cols / double(m.elevProbes) : 0.0);
+#endif
+    std::printf("\n");
 }
 
 void printGoldens(const Options& opt) {

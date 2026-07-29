@@ -77,10 +77,17 @@ namespace VoxelGpuRegionBuild
 		const int64 YMmMin = CoarseRepMm(int64(Req.OriginVy)) - kRasterCavernMarginMm;
 		const int64 YMmMax = CoarseRepMm(int64(Req.OriginVy) + Height - 1) + kRasterCavernMarginMm;
 
-		const int64 PxMin = vxc::floorDiv(XMmMin, PixelSizeMm);
-		const int64 PxMax = vxc::floorDiv(XMmMax, PixelSizeMm) + 1;  // +1: second bilinear tap
-		const int64 PyMin = vxc::floorDiv(YMmMin, PixelSizeMm);
-		const int64 PyMax = vxc::floorDiv(YMmMax, PixelSizeMm) + 1;
+		// v9: the carrier is a cubic B-spline, so a column in cell px reads
+		// control points px-1..px+2 rather than bilinear's px..px+1. The margins
+		// come from vxc::kCarrierStencilLo/Hi rather than literals precisely
+		// because getting this wrong does not fault -- rasterElevationMm clamps
+		// to the window, so an under-sized window silently produces different
+		// terrain on the GPU than on the CPU. That is the same failure the D5
+		// note above records.
+		const int64 PxMin = vxc::floorDiv(XMmMin, PixelSizeMm) + vxc::kCarrierStencilLo;
+		const int64 PxMax = vxc::floorDiv(XMmMax, PixelSizeMm) + vxc::kCarrierStencilHi;
+		const int64 PyMin = vxc::floorDiv(YMmMin, PixelSizeMm) + vxc::kCarrierStencilLo;
+		const int64 PyMax = vxc::floorDiv(YMmMax, PixelSizeMm) + vxc::kCarrierStencilHi;
 
 		const uint32 RasterW = static_cast<uint32>(PxMax - PxMin + 1);
 		const uint32 RasterH = static_cast<uint32>(PyMax - PyMin + 1);

@@ -2215,9 +2215,15 @@ namespace VoxelSkyBand
 // FOLLOW-UP (reported upstream): this belongs in voxel-core as a
 // `Amplifier::surfaceUpperBoundMm(vx0, vy0, vx1, vy1)` next to the constants it
 // depends on, so a change to kDetailOctaves cannot silently invalidate it.
-constexpr int64 kDetailAmplitudeSumMm = 1800 + 700 + 260 + 100;
-constexpr int64 kMaxSlopeScaleQ10 = 4096;
-constexpr int64 kMaxDetailMm = kDetailAmplitudeSumMm * kMaxSlopeScaleQ10 / 1024; // 11'440 mm
+// REMOVED (worldgen v9). kDetailAmplitudeSumMm / kMaxSlopeScaleQ10 /
+// kMaxDetailMm mirrored the amplifier's octave table by hand, and the FOLLOW-UP
+// above is what happened to them: kDetailOctaves changed at v6 and silently
+// invalidated the copy, which sat at the v1 amplitudes (1800+700+260+100)
+// against a real table of 2600+1100+500+190+60 for three worldgen versions.
+//
+// The allowance now comes from vxc::Amplifier::surfaceUpperBoundMm, which
+// DERIVES it from the live table inside voxel-core and static_asserts the
+// couplings the derivation needs. Do not reintroduce a local copy.
 
 // Defensive cap on tile-corner reads per footprint. At level 4 (51.2 m
 // footprint) a 30 mm-class pixel needs 4x4 and the 11.25 m scale-8 pixel 6x6;
@@ -6126,123 +6132,36 @@ int64 FVoxelWorldImpl::FootprintSurfaceUpperBoundMm(int32 Level, int32 ChunkX, i
 {
 	using namespace VoxelCoords;
 
-	const int64 PxMm = Tiles ? int64(Tiles->pixelSizeMm()) : 0;
-	if (PxMm <= 0)
-	{
-		return INT64_MAX; // no tile raster to bound against
-	}
-
-	// Footprint in millimetres, level-0 datum (the amplifier's only unit).
-	const int64 LevelScale = int64(1) << Level;
-	const int64 SpanMm = int64(ChunkEdgeVoxels) * LevelScale * vxc::kVoxelSizeMm;
-	const int64 X0Mm = (int64(ChunkX) * ChunkEdgeVoxels) * LevelScale * vxc::kVoxelSizeMm;
-	const int64 Y0Mm = (int64(ChunkY) * ChunkEdgeVoxels) * LevelScale * vxc::kVoxelSizeMm;
-	const int64 X1Mm = X0Mm + SpanMm - 1;
-	const int64 Y1Mm = Y0Mm + SpanMm - 1;
-
-	// Every tile-pixel CORNER of every pixel cell the footprint touches. The
-	// bilinear base over a cell is a convex combination of that cell's four
-	// corners, so the largest corner elevation over this set bounds the base
-	// term exactly -- no sampling density argument required, and no dependence
-	// on where inside a pixel the footprint happens to fall. This is precisely
-	// the "interior extremes between the corners" term that the 4-corner column
-	// sampling below cannot see.
-	const int64 Px0 = vxc::floorDiv(X0Mm, PxMm);
-	const int64 Px1 = vxc::floorDiv(X1Mm, PxMm) + 1;
-	const int64 Py0 = vxc::floorDiv(Y0Mm, PxMm);
-	const int64 Py1 = vxc::floorDiv(Y1Mm, PxMm) + 1;
-	if ((Px1 - Px0 + 1) > VoxelSkyBand::kMaxPixelCornersPerAxis ||
-	    (Py1 - Py0 + 1) > VoxelSkyBand::kMaxPixelCornersPerAxis)
-	{
-		return INT64_MAX; // decline rather than pay an unbounded read count
-	}
-
-	// Read the corner elevations once. Everything below is derived from this
-	// grid -- no further sampler traffic, and the grid is at most 16x16.
-	const int32 NX = int32(Px1 - Px0 + 1);
-	const int32 NY = int32(Py1 - Py0 + 1);
-	int64 Elev[VoxelSkyBand::kMaxPixelCornersPerAxis * VoxelSkyBand::kMaxPixelCornersPerAxis];
-	for (int32 Iy = 0; Iy < NY; ++Iy)
-	{
-		for (int32 Ix = 0; Ix < NX; ++Ix)
-		{
-			Elev[Ix + NX * Iy] = Tiles->elevationMm(Px0 + Ix, Py0 + Iy);
-		}
-	}
-
-	// (a) EXACT maximum of the bilinear base over the footprint.
+	// DELEGATES to vxc::Amplifier::surfaceUpperBoundMm rather than reimplementing
+	// the bound. This function used to carry its own copy, and that copy went
+	// wrong twice, both times silently:
 	//
-	// Taking the largest corner elevation would be a valid bound but a badly
-	// loose one whenever the footprint is small relative to a 30 m tile pixel
-	// (levels 0-3), because the nearest pixel corner can be 30 m of relief away
-	// from any ground the footprint actually contains. Instead: the base
-	// restricted to one pixel cell is bilinear, and a bilinear patch is LINEAR
-	// along each axis with the other fixed, so its maximum over any axis-aligned
-	// sub-rectangle is attained at a CORNER of that sub-rectangle. Clip the
-	// footprint to each pixel cell it touches and evaluate the cell's own
-	// bilinear form at the four clipped corners -- exact, and at most 4x4 cells.
+	//   * at worldgen v6 the detail allowance stopped matching. It was derived
+	//     from kDetailAmplitudeSumMm = 1800+700+260+100, the v1 octave table,
+	//     while the real table became 2600+1100+500+190+60. The bound was
+	//     therefore allowing LESS detail than the amplifier can produce.
+	//   * at worldgen v9 the base term stopped matching. It computed a BILINEAR
+	//     maximum, while the carrier is now a cubic B-spline -- which is not
+	//     bounded by the bilinear value, since near a local minimum it sits
+	//     above it.
 	//
-	// (b) Bound on the detail term using this footprint's OWN slope.
+	// Either way the failure mode is the same and it is not a lost optimisation:
+	// IsChunkProvablyAllAir feeds the streaming skip, so an under-stated upper
+	// bound means a chunk containing terrain is never generated. A hole in the
+	// world.
 	//
-	// slopeScaleQ10 clamps to [256, 4096] q10, and the absolute worst case
-	// (4096, i.e. 11.44 m of detail) needs ~86 m of relief across a single 30 m
-	// pixel -- a cliff. slopeMmPerPx is |e10-e00| + |e01-e00| at the pixel the
-	// column falls in, and every such pixel is in the grid just read, so the
-	// maximum over the footprint is available exactly. On ordinary terrain this
-	// takes the detail allowance from 11.44 m to 1-3 m, which is the difference
-	// between the bound binding at level 4 and not.
-	int64 MaxBaseMm = INT64_MIN;
-	int64 MaxSlopeMmPerPx = 0;
-	for (int32 Iy = 0; Iy + 1 < NY; ++Iy)
-	{
-		for (int32 Ix = 0; Ix + 1 < NX; ++Ix)
-		{
-			const int64 E00 = Elev[Ix + NX * Iy];
-			const int64 E10 = Elev[(Ix + 1) + NX * Iy];
-			const int64 E01 = Elev[Ix + NX * (Iy + 1)];
-			const int64 E11 = Elev[(Ix + 1) + NX * (Iy + 1)];
-
-			// Amplifier::evalSurface's slope term for this pixel, verbatim.
-			MaxSlopeMmPerPx = FMath::Max(MaxSlopeMmPerPx,
-			                             FMath::Abs(E10 - E00) + FMath::Abs(E01 - E00));
-
-			// Footprint clipped to this cell, in cell-local mm [0, PxMm].
-			const int64 CellX0Mm = (Px0 + Ix) * PxMm;
-			const int64 CellY0Mm = (Py0 + Iy) * PxMm;
-			const int64 Lx0 = FMath::Max<int64>(0, X0Mm - CellX0Mm);
-			const int64 Lx1 = FMath::Min<int64>(PxMm, X1Mm - CellX0Mm);
-			const int64 Ly0 = FMath::Max<int64>(0, Y0Mm - CellY0Mm);
-			const int64 Ly1 = FMath::Min<int64>(PxMm, Y1Mm - CellY0Mm);
-			if (Lx0 > Lx1 || Ly0 > Ly1)
-			{
-				continue; // footprint does not reach this cell
-			}
-
-			const int64 Fxs[2] = {Lx0, Lx1};
-			const int64 Fys[2] = {Ly0, Ly1};
-			for (int64 Fx : Fxs)
-			{
-				for (int64 Fy : Fys)
-				{
-					// evalSurface's bilinear form, same integer math. Its
-					// division truncates toward zero, so +1 covers the one-mm
-					// the truncation can move the value upward for a negative
-					// numerator -- keeping this an upper bound unconditionally.
-					const int64 Gx = PxMm - Fx, Gy = PxMm - Fy;
-					const int64 BaseMm = ((E00 * Gx + E10 * Fx) * Gy + (E01 * Gx + E11 * Fx) * Fy) / (PxMm * PxMm) + 1;
-					MaxBaseMm = FMath::Max(MaxBaseMm, BaseMm);
-				}
-			}
-		}
-	}
-	if (MaxBaseMm == INT64_MIN)
-	{
-		return INT64_MAX; // degenerate grid (single corner): decline to bound
-	}
-
-	const int64 SlopeScaleQ10 = FMath::Clamp<int64>(512 + MaxSlopeMmPerPx / 24, 256, VoxelSkyBand::kMaxSlopeScaleQ10);
-	const int64 MaxDetailMm = VoxelSkyBand::kDetailAmplitudeSumMm * SlopeScaleQ10 / 1024;
-	return MaxBaseMm + MaxDetailMm;
+	// The comment on the old constants block predicted this exactly -- "this
+	// belongs in voxel-core ... so a change to kDetailOctaves cannot silently
+	// invalidate it". Amplifier::surfaceUpperBoundMm is that follow-up, and
+	// solidBelowBoundMm below already delegated to its sibling; this copy was
+	// simply left behind. Deleting it, rather than re-mirroring it, is the point.
+	//
+	// Both sides use INT64_MAX to decline (vxc::kSurfaceBoundDeclined), so every
+	// caller is unchanged.
+	const int64 SpanVox = int64(ChunkEdgeVoxels) * (int64(1) << Level);
+	const int64 Vx0 = int64(ChunkX) * SpanVox;
+	const int64 Vy0 = int64(ChunkY) * SpanVox;
+	return Voxels.amplifier().surfaceUpperBoundMm(Vx0, Vy0, Vx0 + SpanVox - 1, Vy0 + SpanVox - 1);
 }
 
 bool FVoxelWorldImpl::IsChunkProvablyAllAir(const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const
