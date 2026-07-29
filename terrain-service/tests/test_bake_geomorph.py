@@ -296,6 +296,84 @@ def test_roughness_rejects_bad_arguments():
         noise.roughness(np.zeros(16), CELL_M, np.zeros(16), 1)
     with pytest.raises(ValueError):
         noise.roughness(z, 0.0, np.zeros((16, 16)), 1)
+    s = np.zeros((16, 16), dtype=np.float32)
+    with pytest.raises(ValueError):
+        noise.roughness(z, CELL_M, s, 1, constructional_amp=-0.5)
+    with pytest.raises(ValueError):
+        noise.roughness(z, CELL_M, s, 1, constructional_amp=1.0,
+                        constructional_slope_lo=0.3, constructional_slope_hi=0.3)
+
+
+# ======================================================================================
+# B1 constructional term (crest-up folded octaves, gentle ground only)
+# ======================================================================================
+
+def test_constructional_off_is_bit_identical():
+    """amp = 0 must reproduce the prior surface EXACTLY, not approximately.
+
+    The term ships default-off; every already-baked tile's identity depends on
+    the off-path being the identical arithmetic.
+    """
+    a = _roughness()
+    b = _roughness(constructional_amp=0.0)
+    assert np.array_equal(a, b)
+
+
+def test_constructional_adds_crest_up_asymmetry_on_gentle_ground():
+    """The whole point of the fold: fBm is symmetric and cannot make crests.
+
+    On gentle ground the folded term must skew the field toward sharp HIGHS —
+    measured as mean(z) < median-symmetric expectation... concretely, the
+    field's skewness of -z (valleys) vs +z (crests): the fold puts its sharp
+    tail on the crest side, so the upper tail of the LAPLACIAN's magnitude
+    concentrates at crest lines. Assert the cheap version: the field with the
+    term is negatively skewed relative to without (sharp narrow highs, broad
+    lows -> mean pulled below... no: crest-up fold = sharp highs at the fold
+    lines, smooth deep lows at the Gaussian tails, i.e. NEGATIVE skew of the
+    field's own distribution).
+    """
+    base = _roughness(slope=0.03)
+    with_c = _roughness(slope=0.03, constructional_amp=1.6)
+    added = with_c - base
+
+    def skew(x):
+        x = x - x.mean()
+        return float((x ** 3).mean() / (x ** 2).mean() ** 1.5)
+
+    # Crest-up fold: sharp connected highs at the fold lines, smooth deep lows
+    # at the Gaussian tails -> the added field is negatively skewed, and by a
+    # margin no isotropic-fBm realisation approaches.
+    assert skew(added) < -0.5, skew(added)
+    assert abs(skew(base)) < 0.25, "control: substrate fBm should be near-symmetric"
+    # And it is not a relabelling of the substrate: independent lattices.
+    c = float(np.corrcoef(base.ravel(), added.ravel())[0, 1])
+    assert abs(c) < 0.1, c
+
+
+def test_constructional_is_gated_off_on_steep_ground():
+    """Steep ground is erosional; folded noise there measured as crumpled paper
+    with drainage-uncorrelated ridges (placement ratio ~1.0). The gate must
+    take the term to exactly zero at/above slope_hi."""
+    steep_off = _roughness(slope=0.5)
+    steep_on = _roughness(slope=0.5, constructional_amp=4.0)
+    assert np.array_equal(steep_off, steep_on)
+    # ...and to full strength at/below slope_lo.
+    lo_on = _roughness(slope=0.05, constructional_amp=1.0)
+    lo_base = _roughness(slope=0.05)
+    assert np.abs(lo_on - lo_base).max() > 0.05
+    # Fade is monotone in between.
+    mid_on = _roughness(slope=0.2, constructional_amp=1.0)
+    mid_base = _roughness(slope=0.2)
+    assert 0.0 < np.abs(mid_on - mid_base).std() < np.abs(lo_on - lo_base).std()
+
+
+def test_constructional_is_world_anchored():
+    """Same contract as the substrate: a pure function of world position."""
+    kw = dict(constructional_amp=1.6, slope=0.05)
+    big = _roughness(shape=(192, 192), origin_cells=(-64, -64), **kw)
+    win = _roughness(shape=(96, 96), origin_cells=(-13, 29), **kw)
+    y0, x0 = -13 - (-64), 29 - (-64)
+    assert np.array_equal(big[y0:y0 + 96, x0:x0 + 96], win)
 
 
 # ======================================================================================
@@ -542,6 +620,34 @@ def test_profile_incision_regional_scale_is_the_uplift_standin():
     d_half = (z - half.astype(np.float64)).sum()
     d_full = (z - unscaled.astype(np.float64)).sum()
     assert 0.0 < d_half < d_full, "intermediate regional slope erodes partially"
+
+
+def test_profile_incision_regional_p_sharpens_the_gentle_side_only():
+    """regional_p: 0 falls back to n exactly; p > n suppresses GENTLE ground
+    harder while leaving ground at/above s_ref untouched. This is the knob
+    that lets a dense channel network (low a_crit) corrugate a mountain
+    without trenching a till plain."""
+    z, rec, acc = _channel_strip()
+    gentle = np.full_like(z, 0.05)
+    steep = np.full_like(z, 0.5)
+    default = incise.profile_incision(z, rec, acc, 1.875, K_dt=1.5,
+                                      regional_slope=gentle)
+    p_as_n = incise.profile_incision(z, rec, acc, 1.875, K_dt=1.5,
+                                     regional_slope=gentle, regional_p=0.8)
+    np.testing.assert_array_equal(default, p_as_n)
+    sharp = incise.profile_incision(z, rec, acc, 1.875, K_dt=1.5,
+                                    regional_slope=gentle, regional_p=2.0)
+    d_default = (z - default.astype(np.float64)).sum()
+    d_sharp = (z - sharp.astype(np.float64)).sum()
+    assert 0.0 <= d_sharp < d_default, "p=2 must carve gentle ground less"
+    steep_n = incise.profile_incision(z, rec, acc, 1.875, K_dt=1.5,
+                                      regional_slope=steep)
+    steep_p = incise.profile_incision(z, rec, acc, 1.875, K_dt=1.5,
+                                      regional_slope=steep, regional_p=2.0)
+    np.testing.assert_array_equal(steep_n, steep_p)
+    with pytest.raises(ValueError):
+        incise.profile_incision(z, rec, acc, 1.875, K_dt=1.5,
+                                regional_slope=gentle, regional_p=-1.0)
 
 
 def test_profile_incision_respects_gate_taper_and_validation():

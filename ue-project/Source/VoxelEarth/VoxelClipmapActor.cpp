@@ -360,8 +360,91 @@ void AVoxelClipmapActor::EnsureCaveRig()
 	// because the gate is "is the camera under rock", which is a property of
 	// the camera and not of a region a designer could author.
 	CaveExposurePP->bUnbound = true;
-	// Above every default-priority volume, but the project ships none, so
-	// this is future-proofing rather than a fight anyone is having today.
+
+	// =======================================================================
+	// EXPOSURE OWNERSHIP RULE -- READ THIS BEFORE ADDING A THIRD VOLUME.
+	// (The same rule is written into VoxelSkySubsystem.cpp beside the other
+	// volume. If you change one copy, change both; they exist in duplicate
+	// precisely because whoever next touches either file will only read that
+	// one. The comment above this one used to say "the project ships none, so
+	// this is future-proofing rather than a fight anyone is having today" --
+	// that stopped being true when W5 landed, and this block replaces it.)
+	//
+	// Two UNBOUND post-process volumes that both override auto-exposure do not
+	// blend. For any setting BOTH override, the higher Priority wins outright
+	// and the loser's value vanishes -- no warning, no log line, no visual clue
+	// except that one of them stopped working. There are exactly two:
+	//
+	//   AVoxelClipmapActor::CaveExposurePP   Priority 100   conditional
+	//   UVoxelSkySubsystem::SkyExposurePP    Priority  10   always-on base
+	//
+	// THE RULE: the SKY volume is the BASE LAYER (it holds the day/night EV
+	// curve for the whole world, which is what makes a night frame render dark
+	// instead of being lifted to 18% grey by histogram adaptation -- the same
+	// mechanism this rig was built to defeat underground). THIS volume is a
+	// strictly MORE SPECIFIC override and therefore wins where it applies:
+	// under rock the sun's altitude is not an input to anything, because no
+	// daylight reaches the camera, so the sky curve has nothing to say and the
+	// +10 EV100 below is the only exposure number in this project backed by an
+	// actual A/B against a reference frame.
+	//
+	// WHY PRIORITY ORDERING AND NOT "THE SKY SUBSYSTEM OWNS BOTH". That was the
+	// alternative and it was rejected for two concrete reasons. (1) LIFETIME:
+	// this actor is suppressible (-VoxelNoClipmap) and its rig is built lazily
+	// on the first underground transition, so the sky must not depend on it and
+	// it must not depend on a subsystem that may be disabled. (2) PROVENANCE:
+	// folding +10 into the sky's curve would re-derive by taste a number
+	// arrived at by measurement (see CaveExposureEV100's declaration).
+	//
+	// THE INVARIANT A THIRD VOLUME MUST HOLD: override the SAME exposure fields
+	// these two do (AutoExposureMethod AND AutoExposureBias), or it will win the
+	// fields it overrides and silently inherit the rest from a lower-priority
+	// volume, producing a hybrid exposure matching neither. And declare its
+	// priority band in both of these comments.
+	//
+	// (The sky volume's clamped-auto mode additionally overrides the min/max
+	// brightness clamps, which this one does not. That is safe and not an
+	// exception: this volume wins AutoExposureMethod with AEM_Manual, and manual
+	// exposure ignores those clamps entirely.)
+	//
+	// WHAT THE EXPOSURE RETUNES DID TO THE STEP BETWEEN THE TWO VOLUMES, and this
+	// volume is on the other side of that step. Nothing about the ownership rule
+	// changed, but the SIZE of the jump at a cave mouth did, three times now. The
+	// sky's curve used to run +7.0 (day) to +12.0 (night); the W6 retune made it
+	// +8.7 to +15.6; the deep-night ramp (DeepNightDropForSunAltitude) then gave
+	// 2.0 stops back below -18 deg; and the measured retune (see
+	// ExposureBiasForSunAltitude, whose anchors are now fitted to two full capture
+	// ladders rather than to an illuminance table) then moved the cap's ONSET from
+	// -2 deg to -6 deg, which is what changed the sunset case below out of all
+	// recognition. CaveExposureEV100 below was deliberately NOT moved with any of
+	// it -- +10 is the only exposure number in this project backed by an A/B
+	// against a reference frame, and re-deriving it by taste to tidy up a step
+	// would spend that measurement for nothing. The four cases that now exist:
+	//
+	//   into a cave at NOON               +8.8  -> +10.0   1.2 stops BRIGHTER
+	//   into a cave at SUNSET  (0 deg)    +10.9 -> +10.0   0.9 stops DARKER
+	//   into a cave in TWILIGHT (<= -6)   +15.6 -> +10.0   5.6 stops DARKER
+	//   into a cave in DEEP NIGHT (<=-18) +13.6 -> +10.0   3.6 stops DARKER
+	//
+	// Twilight is the worst case and it is unchanged. Deep night, the one a player
+	// actually meets most often, improved by the full 2.0 stops. And SUNSET --
+	// which used to be a 4.1-stop DROP, because the old sky table had already
+	// reached the +15.6 moon cap by 0 deg -- is now very nearly seamless. That is
+	// a side effect of fixing the sky's DAY curve, not something anyone tuned for,
+	// and it is the one case worth re-checking by eye rather than by arithmetic.
+	//
+	// So a cave is still markedly darker than the moonlit surface outside it,
+	// where it used to be marginally brighter. If that reads wrong, the fix is
+	// HERE -- re-measure CaveExposureEV100 against a night reference frame the way
+	// it was originally measured against a day one, and note both numbers -- not
+	// in flattening the sky's night end, which is holding a full moon at a legible
+	// brightness and would take the whole night down with it.
+	//
+	// BOTH COPIES OF THIS COMMENT NOW AGREE. The sky-side copy used to carry a
+	// note that this one was deliberately stale at the two-case W6 version, to be
+	// pasted over the next time this file was open. It has been, and that pointer
+	// is gone. The rule stands: if you change one, change both.
+	// =======================================================================
 	CaveExposurePP->Priority = 100.f;
 
 	// EXACTLY TWO overrides. Everything else -- bloom, colour grading, DOF,
@@ -529,6 +612,20 @@ double AVoxelClipmapActor::SpacingUUForLevel(int32 LevelIndex)
 		UVoxelWorldSubsystem::GetRingPresets()[UVoxelWorldSubsystem::GetMaxRingLevel()].OuterMeters * 100.0;
 	static const double Spacing0UU = RingEdgeUU / double(HoleHalfIndex);
 	return Spacing0UU * double(int64(1) << LevelIndex);
+}
+
+double AVoxelClipmapActor::OuterHalfExtentUU()
+{
+	// The outermost level's grid runs +-HalfIndex vertices from the shared
+	// origin at that level's spacing (RebuildLevel pass 1 lays out LocalX as
+	// (i - HalfIndex) * Spacing). Derived rather than written down so it cannot
+	// drift from the geometry: at the shipped defaults this is 32 * 8 *
+	// (409600/16) = 6,553,600 UU, and it moves whenever the ring cascade's outer
+	// radius does.
+	//
+	// The outer SKIRT hangs downward from this perimeter and adds no horizontal
+	// extent, so this really is the farthest this actor draws along an axis.
+	return double(HalfIndex) * SpacingUUForLevel(NumLevels - 1);
 }
 
 void AVoxelClipmapActor::BuildSharedTopology()

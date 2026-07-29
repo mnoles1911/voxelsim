@@ -106,14 +106,63 @@ foreach ($name in $LogName) {
         $spec = "disp=$($Matches[1]) adopted=$($Matches[2]) (${pct}% of dispatched)"
     }
 
+    # THE SUN, AS A FIRST->LAST SWEEP RATHER THAN A SINGLE POSE.
+    #
+    # UVoxelPerfRunSubsystem emits one "Voxel sky (Ns window)" line per
+    # -VoxelPerfLogInterval, on the same cadence as the chunksPerSec= line
+    # above. The FIRST and LAST of them is what belongs in a summary, because
+    # the question this column answers is not "what was the sun" but "DID THE
+    # SUN MOVE" -- and a single sample cannot answer that. A leg that swept 40
+    # degrees of altitude and a leg that never moved can end at the same angle.
+    #
+    # Why it is here at all: a movable directional light that has not rotated
+    # since spawn lets the renderer keep its cached whole-scene shadow setup, so
+    # a moving sun is a real and unmeasured cost on this draw path. Every perf
+    # baseline in docs/status.md and docs/backlog.md §0 was taken before the
+    # day/night clock existed, i.e. frozen. Comparing a moving-sun leg against
+    # any of them, or against a frozen leg at a different hour, is the same
+    # class of mistake as comparing two static legs at different camera poses --
+    # which is exactly why VoxelPerfRunSubsystem.cpp records staticYawDeg. This
+    # column is that check, in the place people actually read.
+    #
+    # 'no sky log' means the leg predates the instrument, NOT that the sun was
+    # frozen. Those are different states and this must never conflate them.
+    $skyLines = @($lines | Select-String -SimpleMatch 'Voxel sky (')
+    $sun = 'no sky log'
+    if ($skyLines.Count -gt 0) {
+        $first = $skyLines[0].Line
+        $last  = $skyLines[-1].Line
+        $todA  = if ($first -match 'tod=([0-9]{2}:[0-9]{2})')    { $Matches[1] } else { '??:??' }
+        $todB  = if ($last  -match 'tod=([0-9]{2}:[0-9]{2})')    { $Matches[1] } else { '??:??' }
+        $altA  = if ($first -match 'sunAlt=(-?[0-9.]+)')         { [double]$Matches[1] } else { $null }
+        $altB  = if ($last  -match 'sunAlt=(-?[0-9.]+)')         { [double]$Matches[1] } else { $null }
+        $ts    = if ($last  -match 'timeScale=(-?[0-9.]+)')      { [double]$Matches[1] } else { $null }
+        $drift = if ($null -ne $altA -and $null -ne $altB) { [math]::Round([math]::Abs($altB - $altA), 2) } else { 'n/a' }
+        # Flagged on the MEASURED drift, not on timeScale alone: a nonzero scale
+        # whose light updates never landed, and a zero scale, are both a still
+        # sun, and the frame times only know about the sun that moved.
+        if ($drift -is [double] -and $drift -lt 0.01) {
+            # Frozen: one pose says everything, and the pose still has to be
+            # printed -- two FROZEN legs at different hours are no more
+            # comparable than a frozen and a moving one.
+            $sun = "FROZEN tod=$todA alt=$altA ts=$ts"
+        } else {
+            $sun = "MOVED tod=$todA->$todB alt=$altA->$altB d=$drift ts=$ts"
+        }
+    }
+
     $rows += [pscustomobject]@{
         Leg = $name; Windows = $windows; ChunksPerSec = $meanCps
         Holes = $holes; FlightHoles = $flightHoles; AllocFail = $allocFail
-        PoolPct = $poolPct; Park = $park; Spec = $spec
+        PoolPct = $poolPct; Park = $park; Spec = $spec; Sun = $sun
     }
 }
 
-if ($rows.Count) { $rows | Format-Table -AutoSize | Out-String -Width 200 | Write-Host }
+# Width raised from 200 with the Sun column: Out-String TRUNCATES at the width
+# it is given, and the column it would have dropped is the rightmost one --
+# i.e. the sun, i.e. precisely the qualifier that decides whether the row to its
+# left may be compared with anything.
+if ($rows.Count) { $rows | Format-Table -AutoSize | Out-String -Width 260 | Write-Host }
 
 # ---------------------------------------------------------------------------
 # A NOTE ON READING THESE LOGS, learned expensively on 2026-07-27/28.

@@ -173,12 +173,17 @@ const StencilSlot& cachedStencilSlot(uint64_t amp, ITileSampler& tiles, int64_t 
     return s;
 }
 
-const int64_t* cachedStencil(uint64_t amp, ITileSampler& tiles, int64_t px, int64_t py) {
-    return cachedStencilSlot(amp, tiles, px, py).cp;
-}
+// cachedStencil() lived here: a thin wrapper returning cachedStencilSlot().cp.
+// v13 gave the slot a second field the callers need (reliefMm, computed from the
+// RAW raster rather than the prefiltered control points), so every call site
+// moved to cachedStencilSlot directly -- see the one at the column solve below.
+// That left the .cp-only wrapper with no callers, and -Werror=unused-function
+// turned it into a hard build failure on gcc and clang. Deleted rather than
+// silenced: it is superseded, not merely unreferenced, and git holds it if the
+// prefilter path ever wants a .cp-only accessor again.
 
 // The climate 2x2 blend block, memoized as a block for the same reason and
-// with the same bit-identity argument as cachedStencil above: v9's faded
+// with the same bit-identity argument as cachedStencilSlot above: v9's faded
 // bilinear reads four corners per column where v8's nearest-pixel read one.
 struct ClimateQuadSlot {
     uint64_t amp = 0;

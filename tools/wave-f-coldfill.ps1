@@ -20,11 +20,26 @@
 # Ground rule 1: >=2 legs per config, alternated, and the two same-config
 # readings ARE the noise floor. If the configs differ by less than that spread,
 # there is no difference to report.
+#
+# THE SKY PIN. This script's number IS a time-to-settle comparison across
+# three sequential leg types (64 m, 128 m, 128 m + GPU fork), each of which can
+# run for minutes. Left at the engine's default TimeScale 1, the sun keeps
+# moving the whole time, so whichever config happens to be mid-fill when the
+# sun crosses a shadow-cascade boundary picks up extra rebuild work that has
+# nothing to do with ring size or the fork -- the same "quoting the input"
+# trap the settle-vs-lull section below is about, arriving from the render
+# side instead of the streaming side. Freeze it so 64 m, 128 m and
+# 128 m + fork are all measured under the same static sun.
 
 param(
     [int]$Legs = 2,
     [int]$BudgetSec = 300,
-    [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe'
+    [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe',
+    # THE SKY PINS. See the header. Same three defaults as
+    # tools/voxel-run-flight-leg.ps1.
+    [string]$TimeOfDay = '12:00',
+    [string]$Date = '03-20',
+    [double]$TimeScale = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,8 +62,12 @@ function Invoke-ColdFill {
     if (Test-Path $EditLog) { Remove-Item "$EditLog\*.vxlog" -Force -ErrorAction SilentlyContinue }
 
     $log = Join-Path $LogDir "$Name.log"
+    # InvariantCulture on the scale -- see tools/voxel-run-flight-leg.ps1's note
+    # on why a comma-decimal machine silently truncates this otherwise.
     $args = @("`"$Project`"", '-game', '-nosplash', '-unattended', '-sm6',
-              '-VoxelPerfFlight=static', '-VoxelPerfLogInterval=2', "-abslog=`"$log`"")
+              '-VoxelPerfFlight=static', '-VoxelPerfLogInterval=2', "-abslog=`"$log`"",
+              "-VoxelTimeOfDay=$TimeOfDay", "-VoxelDate=$Date",
+              "-VoxelTimeScale=$($TimeScale.ToString([cultureinfo]::InvariantCulture))")
     if ($R0At128) {
         $args += '"-VoxelRingInnerMeters=0,128,256,512,1024,2048"'
         $args += '"-VoxelRingOuterMeters=128,256,512,1024,2048,4096"'

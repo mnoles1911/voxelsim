@@ -13,10 +13,25 @@
 # indistinguishable from terrain that is genuinely empty.
 #
 # Run A/B: with the fork and without, same anchor, same duration.
+#
+# THE SKY PIN. This leg's decisive number is dispatched=N from the CONTROL leg
+# and the FORK leg, run one after the other -- and the fork already has four
+# silent-exclusion conditions, so a false "fork never fired" has to be trusted
+# from the log alone. Left at the engine's default TimeScale 1, the sun keeps
+# moving across the gap between the two legs, so control and fork are no
+# longer the same anchor at the same pose -- a difference in dispatched=N
+# could then be the fork, or it could be the sun having rotated into a
+# different set of dirty chunks. Freeze it so -VoxelGpuMesh is the only
+# variable between the two legs.
 
 param(
     [int]$RunSeconds = 70,
-    [string]$Pose = '-VoxelPerfFlight=static'
+    [string]$Pose = '-VoxelPerfFlight=static',
+    # THE SKY PINS. See the header. Same three defaults as
+    # tools/voxel-run-flight-leg.ps1.
+    [string]$TimeOfDay = '12:00',
+    [string]$Date = '03-20',
+    [double]$TimeScale = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,7 +43,11 @@ function Invoke-Leg {
     param([string]$Name, [bool]$Fork)
 
     $log = Join-Path $LogDir "d4-fork-$Name.log"
+    # InvariantCulture on the scale -- see tools/voxel-run-flight-leg.ps1's note
+    # on why a comma-decimal machine silently truncates this otherwise.
     $args = @("`"$Project`"", '-game', '-nosplash', '-unattended', '-sm6', $Pose,
+              "-VoxelTimeOfDay=$TimeOfDay", "-VoxelDate=$Date",
+              "-VoxelTimeScale=$($TimeScale.ToString([cultureinfo]::InvariantCulture))",
               '-VoxelPerfLogInterval=5', "-abslog=`"$log`"")
     if ($Fork) { $args += '-VoxelGpuMesh' }
 
