@@ -363,6 +363,40 @@ namespace VoxelSky
 	{
 		return (double)CVarSkyStarRotationOffsetTurns.GetValueOnAnyThread();
 	}
+
+	// --- the calendar ---------------------------------------------------------
+	//
+	// Days elapsed before the first of each month, and days in each month, in the
+	// ephemeris's REFERENCE YEAR 2000. LEAP YEAR -- February has 29 days -- which
+	// is the whole reason these are written out rather than computed from a
+	// 365-day constant, and the reason day-of-year 79 is 20 March and not 21
+	// (VoxelEphemeris.h:150-153).
+	//
+	// MOVED OUT OF THIS FILE'S ANONYMOUS NAMESPACE (where they used to live beside
+	// the tuning constants) so that MonthDayFromDayOfYear below can be exported.
+	// It had already been copied once -- kPerfDaysBeforeMonth/kPerfDaysInMonth in
+	// VoxelPerfRunSubsystem.cpp, whose comment recorded the copy as debt and named
+	// this exact accessor as the fix -- and the F1 overlay's calendar readout was
+	// about to be the third copy. See VoxelSkySubsystem.h's declaration for why a
+	// third copy is the specific failure VoxelClimateProbe.h documents.
+	constexpr int32 kDaysBeforeMonth[12] = {0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335};
+	constexpr int32 kDaysInMonth[12] = {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+
+	void MonthDayFromDayOfYear(int32 DayOfYear, int32& OutMonth, int32& OutDay)
+	{
+		const int32 Doy = FMath::Clamp(DayOfYear, 0, 365);
+		OutMonth = 12;
+		for (int32 M = 0; M < 12; ++M)
+		{
+			if (Doy < kDaysBeforeMonth[M] + kDaysInMonth[M])
+			{
+				OutMonth = M + 1;
+				OutDay = Doy - kDaysBeforeMonth[M] + 1;
+				return;
+			}
+		}
+		OutDay = Doy - kDaysBeforeMonth[11] + 1;
+	}
 } // namespace VoxelSky
 
 // --- tuning constants ------------------------------------------------------
@@ -541,11 +575,10 @@ namespace
 	constexpr int32 kDefaultDateMonth = 3;
 	constexpr int32 kDefaultDateDay = 20;
 
-	// Days elapsed before the first of each month in the reference year 2000.
-	// LEAP YEAR -- February has 29 days -- which is the whole reason this table
-	// is written out rather than computed from a 365-day constant.
-	constexpr int32 kDaysBeforeMonth[12] = {0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335};
-	constexpr int32 kDaysInMonth[12] = {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+	// (The month tables that used to live here, and MonthDayFromDayOfYear with
+	// them, moved UP into namespace VoxelSky so they could be exported -- see the
+	// comment above VoxelSky::kDaysBeforeMonth. DayOfYearFromMonthDay below is the
+	// only consumer left in this file that is not exported, so it qualifies.)
 
 	// The tropical year the seasonal clock is stretched across; must match
 	// VoxelEphemeris.cpp's own constant or the resolved date logged here and the
@@ -567,24 +600,8 @@ namespace
 	int32 DayOfYearFromMonthDay(int32 Month, int32 Day)
 	{
 		const int32 M = FMath::Clamp(Month, 1, 12);
-		const int32 D = FMath::Clamp(Day, 1, kDaysInMonth[M - 1]);
-		return kDaysBeforeMonth[M - 1] + (D - 1);
-	}
-
-	void MonthDayFromDayOfYear(int32 DayOfYear, int32& OutMonth, int32& OutDay)
-	{
-		const int32 Doy = FMath::Clamp(DayOfYear, 0, 365);
-		OutMonth = 12;
-		for (int32 M = 0; M < 12; ++M)
-		{
-			if (Doy < kDaysBeforeMonth[M] + kDaysInMonth[M])
-			{
-				OutMonth = M + 1;
-				OutDay = Doy - kDaysBeforeMonth[M] + 1;
-				return;
-			}
-		}
-		OutDay = Doy - kDaysBeforeMonth[11] + 1;
+		const int32 D = FMath::Clamp(Day, 1, VoxelSky::kDaysInMonth[M - 1]);
+		return VoxelSky::kDaysBeforeMonth[M - 1] + (D - 1);
 	}
 
 	// Solve for the world epoch that puts the clock at a given local hour AND as
@@ -1264,7 +1281,7 @@ void UVoxelSkySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 			{
 				const int32 Month = FCString::Atoi(*MonthStr);
 				const int32 Day = FCString::Atoi(*DayStr);
-				if (Month < 1 || Month > 12 || Day < 1 || Day > kDaysInMonth[Month - 1])
+				if (Month < 1 || Month > 12 || Day < 1 || Day > VoxelSky::kDaysInMonth[Month - 1])
 				{
 					UE_LOG(LogVoxelSky, Warning,
 					       TEXT("-VoxelDate=%s out of range (expected 01-01..12-31, reference year 2000 is a LEAP ")
@@ -1305,9 +1322,9 @@ void UVoxelSkySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		const double ResolvedDayFraction = FMath::Frac(Impl->EpochSeconds / DayLength);
 		const double ResolvedHours = ResolvedDayFraction * 24.0;
 		int32 ResolvedMonth = 1, ResolvedDay = 1;
-		MonthDayFromDayOfYear(ResolvedDayOfYear, ResolvedMonth, ResolvedDay);
+		VoxelSky::MonthDayFromDayOfYear(ResolvedDayOfYear, ResolvedMonth, ResolvedDay);
 		int32 RequestedMonth = 1, RequestedDay = 1;
-		MonthDayFromDayOfYear(TargetDayOfYear, RequestedMonth, RequestedDay);
+		VoxelSky::MonthDayFromDayOfYear(TargetDayOfYear, RequestedMonth, RequestedDay);
 
 		UE_LOG(LogVoxelSky, Log,
 		       TEXT("VoxelSky clock RESOLVED: %02d:%02d on %02d-%02d (day-of-year %d) at epoch %.3f s. ")

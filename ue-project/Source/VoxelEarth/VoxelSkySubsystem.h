@@ -270,6 +270,23 @@ namespace VoxelSky
 	VOXELEARTH_API void SetTimeScale(float NewScale); // ECVF_SetByCode; -VoxelTimeScale= uses it
 	VOXELEARTH_API double GetDayLengthSeconds();
 	VOXELEARTH_API double GetDaysPerYear();
+
+	// FVoxelSkyState::DayOfYear (0..365) -> calendar month (1..12) and day (1..31)
+	// in the ephemeris's REFERENCE YEAR 2000, which is a LEAP year -- February has
+	// 29 days and day-of-year 79 is 20 March, not 21 (VoxelEphemeris.h:150-153).
+	// The output pair is deliberately the same MM-DD form -VoxelDate= takes, so a
+	// recorded leg can be replayed by pasting its own numbers back.
+	//
+	// EXPORTED RATHER THAN COPIED, and that is the point of it being here. This
+	// derivation had two independent copies -- the anonymous-namespace original in
+	// VoxelSkySubsystem.cpp and kPerfDaysBeforeMonth/kPerfDaysInMonth in
+	// VoxelPerfRunSubsystem.cpp, whose own comment recorded the copy as debt and
+	// named this accessor as the correct end state. The F1 overlay was the third
+	// consumer, and a third copy is how VoxelClimateProbe.h's disaster happens:
+	// four independent climate calibrations drifting apart is what made the whole
+	// world classify as desert. One table, one definition, one answer.
+	VOXELEARTH_API void MonthDayFromDayOfYear(int32 DayOfYear, int32& OutMonth, int32& OutDay);
+
 	VOXELEARTH_API double GetOriginLatitudeDeg();
 	VOXELEARTH_API double GetOriginLongitudeDeg();
 	VOXELEARTH_API bool IsMoonEnabled();
