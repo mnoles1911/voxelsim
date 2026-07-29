@@ -129,16 +129,45 @@ if (Test-Path $ShotDir) {
 # photograph of an empty world; print the numbers next to the file so that is
 # decidable without opening the image.
 if (Test-Path $LogPath) {
-    $loaded = Select-String -Path $LogPath -Pattern 'loaded=(\d+)' -AllMatches |
+    # ANCHOR THIS TO THE STREAMING LINE. A bare 'loaded=(\d+)' also matches
+    # `unloaded=` (the substring is right there) and the fine-tier line's own
+    # `loaded=1`, so on the first fine-tier capture ever run it reported
+    # "peak loaded=195548, final=1" -- the peak was the UNLOADED count and the
+    # final was resident fine TILES. The world had 139,532 chunks and 64.4M
+    # resident quads at the time, i.e. the two numbers that were supposed to
+    # decide "did this stream in" both came from somewhere else. A harness that
+    # reports a result it did not obtain is the failure this file exists to
+    # prevent, so match the counter by its own line.
+    $rx = 'Voxel streaming: loaded=(\d+)'
+    $loaded = Select-String -Path $LogPath -Pattern $rx -AllMatches |
         ForEach-Object { $_.Matches } | ForEach-Object { [int]$_.Groups[1].Value }
     $peak = if ($loaded) { ($loaded | Measure-Object -Maximum).Maximum } else { 0 }
     $final = if ($loaded) { $loaded[-1] } else { 0 }
     Write-Host ("  streaming: peak loaded={0}, final={1}, samples={2}" -f
                 $peak, $final, $loaded.Count)
-    if ($peak -lt 1000) {
+    if (-not $loaded) {
+        Write-Warning ("no 'Voxel streaming: loaded=' line in the log -- the streaming counters " +
+                       "could not be read at all, so this capture has NO evidence either way " +
+                       "about whether terrain was resident. Do not treat it as settled.")
+    }
+    elseif ($peak -lt 1000) {
         Write-Warning ("peak loaded=$peak is LOW -- this is very likely a photograph of " +
                        "terrain that had not streamed in. Raise -SettleSec, or check the " +
                        "spawn is inside the generated tile set, before believing the image.")
+    }
+    # CHUNKS THE GPU POOL REFUSED, which is a different failure from "not
+    # streamed yet" and looks identical in the image: black gaps in otherwise
+    # finished terrain. The fine tier is where this first showed up, because its
+    # quad density is far higher -- the allocator reported 1,385,893 quads free
+    # but a largest contiguous run of 642 against a 1,633-quad chunk, so the
+    # pool was fragmented rather than full. Surfaced here because reading it out
+    # of the log by hand is exactly what does not happen.
+    $undrawn = @(Select-String -Path $LogPath -Pattern 'Chunk left undrawn' -AllMatches).Count
+    if ($undrawn -gt 0) {
+        Write-Warning ("$undrawn chunk(s) were left UNDRAWN by the GPU pool (search the log for " +
+                       "'no room for'). Black gaps in this image are that, not missing terrain " +
+                       "and not a mesher bug -- check the reported largest contiguous run before " +
+                       "blaming pool size.")
     }
     # THE SUN THE FRAME WAS ACTUALLY TAKEN AT, read back rather than echoed from
     # the switches: the calendar quantises -Date to reachable days (7.6 real days
