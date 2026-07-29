@@ -24,9 +24,34 @@
 struct FVoxelQuadVertex
 {
 	float3 PositionUU;   // chunk-local, in unreal units
+	// The GEOMETRIC face normal, always one of the six axis directions. Used for
+	// anything that depends on which way the face POINTS -- the GI probe
+	// push-out in particular, which steps into the air cell in front of the face.
 	float3 Normal;
+	// What LIGHTING should use. Identical to Normal everywhere except the top of
+	// a water surface quad, where the four corner heights tilt it -- see the
+	// corner block in the decode below. Lighting-only: no vertex moves because of
+	// it, and nothing about the translucent sort key depends on it.
+	float3 ShadingNormal;
 	float  AmbientOcclusion;  // 0 = fully occluded, 1 = open
 	uint   MaterialId;
+	// This CORNER's water surface height, 0..1 within the cell the face belongs
+	// to. Terrain has no such thing and gets MaterialId/255 here, which is
+	// exactly the value the water path used to put in vertex colour R for every
+	// vertex of a face -- so a decode with no corner data is byte-identical to
+	// the flat-topped build.
+	float  CornerHeight;
+	// 1 if this vertex sits on the TOP (+Z) boundary of the voxel its face
+	// belongs to, 0 otherwise. Terrain ignores it; water uses it to lower a
+	// partially-filled cell's surface to its fill height.
+	//
+	// WHY PER-VERTEX AND NOT PER-FACE. Gating on the face normal alone would
+	// lower only +Z faces, leaving a partially-filled cell's SIDE faces at full
+	// height -- so every pool would be ringed by a one-voxel bathtub rim
+	// standing proud of its own surface. A side face has two vertices on the
+	// cell's top boundary and two on its bottom; moving only the top pair turns
+	// the quad into a trapezoid whose upper edge meets the lowered surface.
+	float  TopBoundary;
 };
 
 // Decodes one corner of one quad.
@@ -35,7 +60,13 @@ struct FVoxelQuadVertex
 // order the CPU path's index buffer emits them, so the winding matches.
 // LevelScale is (1 << chunkLevel): mip rings keep quads in level-relative
 // voxel units and scale at decode time, exactly as the CPU path does.
-FVoxelQuadVertex DecodeVoxelQuadVertex(uint2 PackedQuad, uint CornerIndex, float LevelScale)
+//
+// PackedCorners carries the water path's four per-corner surface heights, one
+// byte per corner, and bHasCorners says whether it means anything. Terrain
+// passes (0, false) through the three-argument wrapper below and is unaffected
+// in every field.
+FVoxelQuadVertex DecodeVoxelQuadVertexCore(uint2 PackedQuad, uint CornerIndex, float LevelScale,
+                                           uint PackedCorners, bool bHasCorners)
 {
 	const uint Axis     =  PackedQuad.x        & 0xfu;
 	const uint Positive = (PackedQuad.x >>  4) & 0xfu;
@@ -89,14 +120,98 @@ FVoxelQuadVertex DecodeVoxelQuadVertex(uint2 PackedQuad, uint CornerIndex, float
 	// lint-shader-ub: allow VARIABLE_SHIFT - Corner is 0..3 by construction (winding tables above) and the shift table holds only 0/4/6/2, all < 32
 	const uint AoRaw = (Ao >> AoShiftForCorner[Corner]) & 0x3u;
 
+	// Top-boundary test, in voxel units, before the scale is applied.
+	//
+	// For a Z-normal face the whole quad lies in one plane, so the answer is
+	// simply whether that plane is the voxel's top (positive) or bottom face.
+	// For a side face the quad spans a Z range, and Z is carried by whichever
+	// of the two in-plane axes happens to be axis 2: for Axis==0 that is V, for
+	// Axis==1 it is U. The vertex is on the top boundary when it sits at the
+	// larger end of that range.
+	float TopBoundary;
+	if (Axis == 2u)
+	{
+		TopBoundary = (Positive != 0u) ? 1.0f : 0.0f;
+	}
+	else
+	{
+		const float QuadMaxZVox = (U == 2u) ? float(U0 + W) : float(V0 + H);
+		// Exact equality is safe here -- both sides are small integers held
+		// exactly in float -- but the 0.5 slack costs nothing and documents
+		// that this is a "which end" test, not a distance test.
+		TopBoundary = (PositionVox[2] > QuadMaxZVox - 0.5f) ? 1.0f : 0.0f;
+	}
+
+	// --- per-corner water surface height ------------------------------------
+	//
+	// Four bytes, one per corner, in the POSITION order used above (0=(u0,v0)
+	// 1=(u0,v1) 2=(u1,v1) 3=(u1,v0)) — so the shift is Corner*8 with no remap
+	// table. Contrast AoShiftForCorner just above, which needs one precisely
+	// because vxc::detail::aoCorner packs a DIFFERENT order; picking position
+	// order for this field is what avoids a second table to keep in sync.
+	//
+	// UVoxelWaterSubsystem's EmitWaterQuads is the producer, and it puts the
+	// quad's own `mat` byte in any corner that is not on the cell's top boundary
+	// — the value R held for every vertex before per-corner heights existed. So
+	// there is no "is this corner a surface corner" branch to get wrong here:
+	// the byte is always the right thing for its corner.
+	//
+	// lint-shader-ub: allow VARIABLE_SHIFT - Corner is 0..3 by construction (winding tables above), so the shift is 0/8/16/24, all < 32
+	const uint CornerHeightByte = (PackedCorners >> (Corner * 8u)) & 0xffu;
+
+	// TILTED SHADING NORMAL, on the water surface only.
+	//
+	// The top of a surface quad is no longer flat — the material's World Position
+	// Offset drops each top-boundary corner by (1 - its own height) of a voxel —
+	// so a hard (0,0,1) normal describes geometry that is not on screen. At
+	// M_WaterVoxel's roughness of 0.1 that is the difference between water and
+	// blue glass tiles: the highlight lands where the normal says.
+	//
+	// THE FOUR CORNERS ARE ALL THERE IS TO WORK WITH, and that is structural
+	// rather than a shortcut: this factory reconstructs every vertex from
+	// SV_VertexID and has no neighbourhood to difference against. The CPU proxy
+	// (VoxelWaterChunkComponent.cpp) computes the identical expression from the
+	// same four bytes for exactly that reason — the two paths must not shade the
+	// same water differently, and the one that could do better is not the one
+	// that will end up drawing most of it.
+	//
+	// LevelScale cancels: the height is a fraction of a cell and the span is a
+	// count of cells, so both sides scale together. Water is level 0 regardless.
+	float3 ShadingNormal = Normal;
+	if (bHasCorners && Axis == 2u && Positive != 0u)
+	{
+		const float H00 = float( PackedCorners        & 0xffu);   // (u0,v0)
+		const float H01 = float((PackedCorners >>  8) & 0xffu);   // (u0,v1)
+		const float H11 = float((PackedCorners >> 16) & 0xffu);   // (u1,v1)
+		const float H10 = float((PackedCorners >> 24) & 0xffu);   // (u1,v0)
+		// Heights are 0..255 within ONE voxel while u/v are whole voxels, so the
+		// 255 is the unit conversion, not a normalisation.
+		const float dHdU = ((H11 + H10) - (H00 + H01)) / (2.0f * 255.0f * float(W));
+		const float dHdV = ((H01 + H11) - (H00 + H10)) / (2.0f * 255.0f * float(H));
+		// Axis 2 means u = x and v = y, so this is already in world-axis order.
+		ShadingNormal = normalize(float3(-dHdU, -dHdV, 1.0f));
+	}
+
 	FVoxelQuadVertex Out;
+	Out.TopBoundary = TopBoundary;
 	Out.PositionUU = PositionVox * (VOXEL_SIZE_UU * LevelScale);
 	Out.Normal = Normal;
+	Out.ShadingNormal = ShadingNormal;
 	// 0..3 -> 0..1. The CPU path scales by 85/255, which is the same ratio;
 	// spelled as a divide by 3 here because that is what it means.
 	Out.AmbientOcclusion = float(AoRaw) * (1.0f / 3.0f);
 	Out.MaterialId = Mat;
+	Out.CornerHeight = bHasCorners ? (float(CornerHeightByte) * (1.0f / 255.0f))
+	                               : (float(Mat) * (1.0f / 255.0f));
 	return Out;
+}
+
+// The three-argument form every caller that has no corner data uses — the
+// decode verification shader (VoxelQuadDecodeTest.usf) and terrain. Kept as a
+// wrapper rather than a second copy so there is one decode, not two.
+FVoxelQuadVertex DecodeVoxelQuadVertex(uint2 PackedQuad, uint CornerIndex, float LevelScale)
+{
+	return DecodeVoxelQuadVertexCore(PackedQuad, CornerIndex, LevelScale, 0u, false);
 }
 
 // Vertices per quad, for sizing a draw: two triangles, no index buffer.

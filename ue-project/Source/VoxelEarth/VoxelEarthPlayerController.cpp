@@ -14,6 +14,7 @@
 #include "VoxelEarthFlyPawn.h"
 #include "VoxelEarthHUD.h"
 #include "VoxelExplosive.h"
+#include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
 
 void AVoxelEarthPlayerController::SetupInputComponent()
@@ -37,9 +38,17 @@ void AVoxelEarthPlayerController::SetupInputComponent()
 	// three-value selector does. Dig size keeps the 1/2/3 shortcuts it always
 	// had, plus CycleDigSizeUp/Down below stay callable from the debug overlay,
 	// so nothing here actually lost a control surface.
-	InputComponent->BindKey(EKeys::One, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize1);
-	InputComponent->BindKey(EKeys::Two, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize2);
-	InputComponent->BindKey(EKeys::Three, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize4);
+	// `1` is the BUCKET, not dig size 1 (Matt, 2026-07-29): pouring water on
+	// demand from wherever you are standing is the fastest way to get a feel
+	// for pooling and flow, and it wants a key you can hit without thinking.
+	//
+	// The three dig sizes shifted up one rather than losing 1x1x1 -- the small
+	// dig is the one you actually use for detail work, so dropping it would
+	// have been the wrong trade. 2/3/4 now select 1/2/4 voxels.
+	InputComponent->BindKey(EKeys::One, IE_Pressed, this, &AVoxelEarthPlayerController::PourWaterBucket);
+	InputComponent->BindKey(EKeys::Two, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize1);
+	InputComponent->BindKey(EKeys::Three, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize2);
+	InputComponent->BindKey(EKeys::Four, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize4);
 
 	// Creative placement palette cycle (m1-plan.md "Place" row).
 	InputComponent->BindKey(EKeys::T, IE_Pressed, this, &AVoxelEarthPlayerController::CyclePaletteMaterial);
@@ -567,6 +576,41 @@ void AVoxelEarthPlayerController::CycleDigSizeUp()
 void AVoxelEarthPlayerController::CycleDigSizeDown()
 {
 	DigSizeVoxels = (DigSizeVoxels <= 1) ? 4 : DigSizeVoxels / 2;
+}
+
+// `1`: a bucket of water, at the player, on demand.
+//
+// AT THE PLAYER, not at the crosshair like voxel.SpawnWater. The two are
+// genuinely different tools: the crosshair form is for aiming at a specific
+// column (which is what the headless fixtures want), and this one is for
+// walking somewhere, looking at it, and dumping water on your own feet to see
+// where it goes. Standing on a ridge and pouring is how you find out whether
+// the flow reads right, and that is awkward if you must also aim.
+//
+// Poured one metre ABOVE the pawn's centre so it falls rather than appearing
+// pre-settled -- the fall and spread is most of what there is to look at, and
+// spawning it inside the collision box would just resolve instantly.
+void AVoxelEarthPlayerController::PourWaterBucket()
+{
+	UWorld* World = GetWorld();
+	APawn* P = World ? GetPawn() : nullptr;
+	if (!World || !P)
+	{
+		return;
+	}
+	UVoxelWaterSubsystem* Water = World->GetSubsystem<UVoxelWaterSubsystem>();
+	if (!Water)
+	{
+		return;
+	}
+
+	const int32 Amount = FMath::Max(0, VoxelDebug::GetWaterBucketFill());
+	const FVector PourAt = P->GetActorLocation() + FVector(0.0, 0.0, 100.0);
+	const uint32 Placed = Water->SpawnWaterAt(PourAt, uint32(Amount));
+
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("Bucket: poured %u/%d fill units at (%.0f,%.0f,%.0f) -- voxel.Water.BucketFill to change the size."),
+	       Placed, Amount, PourAt.X, PourAt.Y, PourAt.Z);
 }
 
 void AVoxelEarthPlayerController::SelectDigSize1() { DigSizeVoxels = 1; }

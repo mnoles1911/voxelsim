@@ -43,6 +43,14 @@ public:
 		constexpr float VoxelSizeUU = float(VoxelCoords::VoxelSizeUU);
 
 		const int32 NumQuads = Component->ChunkQuads.Num();
+		// SetChunkQuads check()s this, so a mismatch is a caller bug and not a
+		// state -- but check() is compiled out of Shipping and the consequence
+		// there would be an out-of-bounds read on the render path rather than a
+		// wrong picture. The fallback is exactly what R held before per-corner
+		// heights existed (the quad's own `mat` byte on all four corners), so a
+		// build that somehow lost the array draws the old flat-topped water
+		// instead of crashing.
+		const bool bHasCornerHeights = Component->ChunkCornerHeights.Num() == NumQuads;
 		TArray<FDynamicMeshVertex> Vertices;
 		Vertices.Reserve(NumQuads * 4);
 		IndexBuffer.Indices.Reserve(NumQuads * 6);
@@ -61,8 +69,9 @@ public:
 			return float(FMath::Fmod(WorldM, UVTilePeriodM));
 		};
 
-		for (const FVoxelChunkQuad& Q : Component->ChunkQuads)
+		for (int32 QuadIdx = 0; QuadIdx < NumQuads; ++QuadIdx)
 		{
+			const FVoxelChunkQuad& Q = Component->ChunkQuads[QuadIdx];
 			const int32 Axis = Q.Axis;
 			const int32 U = (Axis + 1) % 3;
 			const int32 V = (Axis + 2) % 3;
@@ -90,9 +99,109 @@ public:
 			const uint8 Ao11 = (Q.Ao >> 6) & 0x3;
 			const uint8 AoAtVert[4] = {Ao00, Ao01, Ao11, Ao10};
 
-			const FVector3f Normal = AxisDir[Axis] * (Q.Positive ? 1.f : -1.f);
-			const FVector3f TangentX = AxisDir[U];
-			const FVector3f TangentY = AxisDir[V];
+			// Which of this quad's four corners sit on the TOP (+Z) boundary of
+			// the voxel the face belongs to. M_WaterVoxel's World Position
+			// Offset lowers exactly those, by (1 - fill) of a voxel, which is
+			// what turns a partially-filled cell into a real surface.
+			//
+			// It has to be per-VERTEX, not per-face: gating on the face normal
+			// would lower only +Z faces and leave a partial cell's side walls
+			// at full height, ringing every pool with a one-voxel bathtub rim.
+			// A side face has two top corners and two bottom ones, so moving
+			// only the top pair makes it a trapezoid that meets the surface.
+			//
+			// For a Z-normal face the whole quad is in one plane, so the test
+			// is just Positive. Otherwise the quad spans a Z range and the top
+			// corners are the ones at its maximum Z -- read straight off the
+			// corner positions rather than re-deriving which of U/V carries Z.
+			// Mirrors DecodeVoxelQuadVertex's TopBoundary in VoxelQuadDecode.ush;
+			// the two must agree or the pooled and component paths draw
+			// different geometry for the same water.
+			bool bTopCorner[4] = {false, false, false, false};
+			if (Axis == 2)
+			{
+				const bool bPositiveFace = (Q.Positive != 0);
+				bTopCorner[0] = bTopCorner[1] = bTopCorner[2] = bTopCorner[3] = bPositiveFace;
+			}
+			else
+			{
+				float MaxZ = Pos[0].Z;
+				for (int32 I = 1; I < 4; ++I)
+				{
+					MaxZ = FMath::Max(MaxZ, Pos[I].Z);
+				}
+				for (int32 I = 0; I < 4; ++I)
+				{
+					bTopCorner[I] = Pos[I].Z > MaxZ - 0.5f * VoxelSizeUU;
+				}
+			}
+
+			// The four per-corner surface heights this quad carries, in the same
+			// position order as Pos[] above. See UWaterChunkComponent::
+			// SetChunkQuads and UVoxelWaterSubsystem's EmitWaterQuads: a corner on
+			// the cell's top boundary holds its bilinear surface height, and every
+			// other corner holds the quad's own `mat` byte -- which is exactly what
+			// R held for EVERY vertex before per-corner heights existed, so nothing
+			// off the water surface changed value.
+			const uint32 PackedCorners = bHasCornerHeights
+				? Component->ChunkCornerHeights[QuadIdx]
+				: (uint32(Q.Mat) * 0x01010101u);
+			const uint8 CornerHeight[4] = {
+				uint8( PackedCorners        & 0xffu),
+				uint8((PackedCorners >>  8) & 0xffu),
+				uint8((PackedCorners >> 16) & 0xffu),
+				uint8((PackedCorners >> 24) & 0xffu)};
+
+			// SHADING NORMAL FROM THE CORNER HEIGHTS, on the water surface only.
+			//
+			// The top of a +Z face is no longer flat -- the four corners sit at
+			// four different heights and the material's World Position Offset moves
+			// them there -- so a hard (0,0,1) normal now describes geometry that is
+			// not on screen. At roughness 0.1 that is the difference between a
+			// surface that reads as water and one that reads as blue glass tiles:
+			// the specular highlight is where the normal says it is, not where the
+			// silhouette is.
+			//
+			// Derived from the quad's own four corners, NOT from a wider stencil of
+			// the corner field, and that is a deliberate constraint rather than an
+			// approximation of choice: the pooled path has ONLY these four bytes to
+			// work with (it reconstructs every vertex from SV_VertexID and one
+			// packed word), and the two paths must not shade the same water
+			// differently. A true per-vertex normal would need central differences
+			// across the brick boundary, i.e. a 2-voxel apron and a second round of
+			// vxc::WaterCA::fillAt lookups in the loop this module has already had
+			// to make cheap twice. VoxelQuadDecode.ush computes the identical
+			// expression; if one moves, both move.
+			//
+			// Side and bottom faces keep their exact axis normal -- a wall is still
+			// a wall, and only its top EDGE moves.
+			FVector3f Normal = AxisDir[Axis] * (Q.Positive ? 1.f : -1.f);
+			if (Axis == 2 && Q.Positive != 0)
+			{
+				// Heights are 0..255 within one voxel, so a unit of height is
+				// 1/255 of a voxel and a unit of u/v is one whole voxel: the 255
+				// below is the conversion, not a normalisation.
+				const float dHdU = float((int32(CornerHeight[2]) + int32(CornerHeight[3]))
+				                       - (int32(CornerHeight[0]) + int32(CornerHeight[1])))
+				                 / (2.f * 255.f * float(Q.W));
+				const float dHdV = float((int32(CornerHeight[1]) + int32(CornerHeight[2]))
+				                       - (int32(CornerHeight[0]) + int32(CornerHeight[3])))
+				                 / (2.f * 255.f * float(Q.H));
+				// Axis 2 means u = x and v = y, so this is already world-axis order.
+				Normal = FVector3f(-dHdU, -dHdV, 1.f).GetSafeNormal();
+			}
+
+			// Gram-Schmidt each in-plane axis against the (possibly tilted) normal,
+			// rather than rebuilding the frame from a cross product. Both dot
+			// products are exactly zero for an axis-aligned normal, so every face
+			// that did not tilt gets back the unit axis vector it had before, bit
+			// for bit -- including the HANDEDNESS of the pair, which a
+			// cross(Normal, TangentX) would silently invert on negative faces and
+			// which FDynamicMeshVertex::SetTangents encodes as the basis sign.
+			FVector3f TangentX = AxisDir[U] - Normal * FVector3f::DotProduct(Normal, AxisDir[U]);
+			FVector3f TangentY = AxisDir[V] - Normal * FVector3f::DotProduct(Normal, AxisDir[V]);
+			TangentX = TangentX.GetSafeNormal(KINDA_SMALL_NUMBER, AxisDir[U]);
+			TangentY = TangentY.GetSafeNormal(KINDA_SMALL_NUMBER, AxisDir[V]);
 
 			const int32 BaseVertex = Vertices.Num();
 			for (int32 CornerIdx = 0; CornerIdx < 4; ++CornerIdx)
@@ -105,13 +214,24 @@ public:
 				const float WorldV = WrapWorldToUV(ComponentWorldOrigin[V], double(Pos[CornerIdx][V]));
 				Vert.TextureCoordinate[0] = FVector2f(WorldU, WorldV);
 
-				// R = material id (always a fixed nonzero placeholder for
-				// water, see UVoxelWaterSubsystem.cpp's meshing sampler), G =
-				// AO (2-bit -> 0/85/170/255), B unused, A = 255 -- same
-				// vertex-color convention as terrain's proxy, so the water
-				// material can reuse the same AO-shading approach if wanted.
+				// R = THIS CORNER's water surface height, 0..255 within the cell
+				// the face belongs to (was: the whole face's CA fill fraction,
+				// which is why a settled pool read as a field of 10 cm plateaus
+				// with open slits between cells of differing fill -- see
+				// UVoxelWaterSubsystem.cpp's corner-field comment). G = AO
+				// (2-bit -> 0/85/170/255), B = top-boundary flag (see bTopCorner
+				// above), A = 255.
+				//
+				// R and B together are what M_WaterVoxel's World Position
+				// Offset consumes, and the formula is UNCHANGED by per-corner R:
+				// it lowers a top-boundary vertex by (1 - R) of a voxel, which
+				// simply now varies across the quad instead of being constant on
+				// it. Terrain's proxy uses R and B for a biome tint and climate
+				// instead, so this convention is water's own rather than shared --
+				// the pooled path reproduces THIS one under
+				// FVoxelQuadVertexFactoryParameters::WaterMode.
 				const uint8 AoByte = uint8(AoAtVert[CornerIdx] * 85);
-				Vert.Color = FColor(Q.Mat, AoByte, 0, 255);
+				Vert.Color = FColor(CornerHeight[CornerIdx], AoByte, bTopCorner[CornerIdx] ? 255 : 0, 255);
 
 				Vertices.Add(Vert);
 			}
@@ -309,9 +429,15 @@ UWaterChunkComponent::UWaterChunkComponent(const FObjectInitializer& ObjectIniti
 	SetGenerateOverlapEvents(false);
 }
 
-void UWaterChunkComponent::SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads)
+void UWaterChunkComponent::SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, TArray<uint32>&& InCornerHeights)
 {
+	// The proxy indexes both arrays with one loop counter. A short corner array
+	// would be an out-of-bounds read on the very first frame the mismatch
+	// happened; a long one would silently misalign every height. Checked here
+	// rather than defended in the proxy so the failure names its producer.
+	check(InCornerHeights.Num() == InQuads.Num());
 	ChunkQuads = MoveTemp(InQuads);
+	ChunkCornerHeights = MoveTemp(InCornerHeights);
 	MarkRenderStateDirty();
 	UpdateBounds();
 }

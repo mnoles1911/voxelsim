@@ -452,13 +452,17 @@ void AVoxelEarthHUD::DrawDebugOverlay()
 
 		// Per-position residency -- the same query walk mode's terrain-ready
 		// gate uses, so "why am I hovering" is answerable from the overlay.
-		bool bTracked = false, bHasComponent = false;
+		bool bTracked = false, bHasComponent = false, bSettled = false;
 		int32 Quads = 0;
-		const bool bFound = Subsystem->DebugChunkStatusAt(Pos, bTracked, bHasComponent, Quads);
-		DrawOverlayInfo(FString::Printf(TEXT("Here    %s  tracked=%s  component=%s  quads=%d"),
+		const bool bFound = Subsystem->DebugChunkStatusAt(Pos, bTracked, bHasComponent, Quads, bSettled);
+		// settled= is what makes this row answer "why am I hovering": tracked
+		// with no component reads alarming, but settled=y means the chunk meshed
+		// to nothing and is FINAL (all air), which is not a reason to wait. Only
+		// the unsettled case gates movement, so only it is warn-coloured.
+		DrawOverlayInfo(FString::Printf(TEXT("Here    %s  tracked=%s  component=%s  quads=%d  settled=%s"),
 		                                 bFound ? TEXT("chunk") : TEXT("none"), bTracked ? TEXT("y") : TEXT("n"),
-		                                 bHasComponent ? TEXT("y") : TEXT("n"), Quads),
-		                (bTracked && !bHasComponent) ? kOverlayWarn : kOverlayInfo, PanelX, Y);
+		                                 bHasComponent ? TEXT("y") : TEXT("n"), Quads, bSettled ? TEXT("y") : TEXT("n")),
+		                (bTracked && !bHasComponent && !bSettled) ? kOverlayWarn : kOverlayInfo, PanelX, Y);
 	}
 
 	DrawOverlayInfo(FString::Printf(TEXT("Veil    %s (run switch -VoxelUndergroundVeil)"),
