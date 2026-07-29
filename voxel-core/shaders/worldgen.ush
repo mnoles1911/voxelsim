@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 11
+#define VXC_WORLDGEN_VERSION_USH 12
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -967,6 +967,192 @@ int64_t beddingMm(uint64_t seed, int64_t xMm, int64_t yMm, int64_t surfaceMm)
     return floorDiv(kBeddingAmpMm * beddingRawAt(seed, xMm, yMm, surfaceMm), kBeddingRawScale);
 }
 
+// --- bounded 3D density band (v12, voxelcore/density3.h) --------------------
+// Bit-exact mirror. Read that header for the design; what matters HERE is the
+// three things that make this mirror different from every other block in this
+// file:
+//
+//   1. IT HASHES PER VOXEL, not per column. Every other worldgen term in this
+//      file is a function of (x, y) and is evaluated once per thread; this one
+//      runs inside VoxelizeMain's z loop. That is why vxc_gpu comparing the
+//      full CELL buffer (rather than only the column buffer) is load-bearing
+//      for this change in a way it was not for the ones before it -- a column
+//      comparison cannot see this term at all.
+//
+//   2. THE CPU SIDE IS HOISTED AND THIS IS NOT. voxelcore/density3.h caches the
+//      structural-domain hash and the pocket's eight lattice corners per column
+//      (Density3Column); this file recomputes both per voxel. That is
+//      DELIBERATE and it is safe for exactly one reason: hash2 and hash3 are
+//      pure, so a hoisted evaluation and a fresh one are the same integer, and
+//      test_density3.cpp pins that equality directly. Mirroring the cache here
+//      would mean mirroring a mutable per-thread object across a language
+//      boundary for no arithmetic gain.
+//
+//   3. EVERY DIVISION IS floorDiv. density3.h's own comment is explicit that a
+//      bare `/` on a negative operand is what diverged AMD vs NVIDIA once
+//      already, and the numerators here are routinely negative -- the noise is
+//      signed, the bedding value is signed, and the displacement is signed.
+static const uint CH_POCKET = 29;
+
+static const int64_t kDensity3MaxAbsMm = 700;
+static const int64_t kDensity3BandHalfMm = 700; // forced equal to the envelope
+static const int64_t kDensity3GateQ = 4096;     // == kRillGateQ
+static const int64_t kDensity3SlopeStartMmPerM = 600;
+static const int64_t kDensity3SlopeFullMmPerM = 800;
+static const int64_t kDensity3SlopeWidthMmPerM = 200;
+static const int64_t kDensity3BandCoreMm = 400;
+static const int64_t kDensity3BandRampMm = 300;
+static const int64_t kDensity3RockSoilFullMm = 200;
+static const int64_t kDensity3RockSoilZeroMm = 800;
+static const int64_t kDensity3RockSoilWidthMm = 600;
+static const int64_t kDensity3NoiseAbs = 32768;
+static const int64_t kBedding3AmpMm = 500;
+static const int64_t kBedding3MaxAbsMm = 500;
+static const int64_t kDensity3PocketAmpMm = 200; // == kDensity3MaxAbsMm - kBedding3MaxAbsMm
+static const int64_t kDensity3PocketLatXYMm = 1600;
+static const int64_t kDensity3PocketLatZMm = 6400; // 4:1 vertical -- joints are near-vertical
+
+// The slope gate, taking a slope MAGNITUDE in mm per metre. Zero at or below
+// 60% grade, full at or above 80%, Perlin quintic between, so it is C2 at both
+// ends: a step here would be a seam following an iso-slope contour.
+int64_t density3SlopeGateQFromMag(int64_t slopeMmPerM)
+{
+    if (slopeMmPerM <= kDensity3SlopeStartMmPerM) return 0;
+    if (slopeMmPerM >= kDensity3SlopeFullMmPerM) return kDensity3GateQ;
+    const int64_t t = floorDiv((slopeMmPerM - kDensity3SlopeStartMmPerM) * kDensity3GateQ,
+                               kDensity3SlopeWidthMmPerM);
+    return rillQuinticQ(t);
+}
+
+// The band's taper: full strength within +/-400 mm, quintic to exactly 0 at
+// +/-700 mm. Exactly zero at and beyond the band edge is what makes the skip an
+// identity rather than an approximation.
+int64_t density3BandTaperQ(int64_t zMm, int64_t surfaceMm)
+{
+    const int64_t d0 = zMm - surfaceMm;
+    const int64_t d = d0 < 0 ? -d0 : d0;
+    if (d >= kDensity3BandHalfMm) return 0;
+    if (d <= kDensity3BandCoreMm) return kDensity3GateQ;
+    const int64_t t = floorDiv((d - kDensity3BandCoreMm) * kDensity3GateQ, kDensity3BandRampMm);
+    return kDensity3GateQ - rillQuinticQ(t);
+}
+
+// The pocket term's lithology gate, on the column's depth of soil above rock.
+int64_t density3RockGateQ(int64_t soilDepthMm)
+{
+    if (soilDepthMm <= kDensity3RockSoilFullMm) return kDensity3GateQ;
+    if (soilDepthMm >= kDensity3RockSoilZeroMm) return 0;
+    const int64_t t = floorDiv((soilDepthMm - kDensity3RockSoilFullMm) * kDensity3GateQ,
+                               kDensity3RockSoilWidthMm);
+    return kDensity3GateQ - rillQuinticQ(t);
+}
+
+// 3D value noise with hash.h's quintic fade on all three axes, two lattices
+// (4:1 vertical). hash.h has no valueNoise3, so density3.h implements one and
+// this mirrors it; both are a straight trilinear extension of valueNoise2Fade
+// over hash3, reusing fadeFractionMm verbatim.
+//
+// The final divide's numerator is routinely negative (the corner values are
+// signed) and (gx+fx)(gy+fy)(gz+fz) == latXY^2 * latZ exactly, so this is a
+// convex combination of eight values in [-32768, 32767] -- floorDiv, matching
+// density3.h, NOT truncDiv.
+int64_t density3ValueNoise3Fade(uint64_t seed, int64_t xMm, int64_t yMm, int64_t zMm,
+                                int64_t latXYMm, int64_t latZMm, uint channel)
+{
+    const int64_t x0 = floorDiv(xMm, latXYMm);
+    const int64_t y0 = floorDiv(yMm, latXYMm);
+    const int64_t z0 = floorDiv(zMm, latZMm);
+    const int64_t fx = fadeFractionMm(xMm - x0 * latXYMm, latXYMm);
+    const int64_t fy = fadeFractionMm(yMm - y0 * latXYMm, latXYMm);
+    const int64_t fz = fadeFractionMm(zMm - z0 * latZMm, latZMm);
+    const int64_t gx = latXYMm - fx;
+    const int64_t gy = latXYMm - fy;
+    const int64_t gz = latZMm - fz;
+
+    const int64_t v000 = (int64_t)hashToSigned16(hash3(seed, x0, y0, z0, channel));
+    const int64_t v100 = (int64_t)hashToSigned16(hash3(seed, x0 + 1, y0, z0, channel));
+    const int64_t v010 = (int64_t)hashToSigned16(hash3(seed, x0, y0 + 1, z0, channel));
+    const int64_t v110 = (int64_t)hashToSigned16(hash3(seed, x0 + 1, y0 + 1, z0, channel));
+    const int64_t v001 = (int64_t)hashToSigned16(hash3(seed, x0, y0, z0 + 1, channel));
+    const int64_t v101 = (int64_t)hashToSigned16(hash3(seed, x0 + 1, y0, z0 + 1, channel));
+    const int64_t v011 = (int64_t)hashToSigned16(hash3(seed, x0, y0 + 1, z0 + 1, channel));
+    const int64_t v111 = (int64_t)hashToSigned16(hash3(seed, x0 + 1, y0 + 1, z0 + 1, channel));
+
+    const int64_t lo = (v000 * gx + v100 * fx) * gy + (v010 * gx + v110 * fx) * fy;
+    const int64_t hi = (v001 * gx + v101 * fx) * gy + (v011 * gx + v111 * fx) * fy;
+    return floorDiv(lo * gz + hi * fz, latXYMm * latXYMm * latZMm);
+}
+
+int64_t density3PocketScaleMm(int64_t noise, int64_t rockGateQ)
+{
+    return floorDiv(noise * kDensity3PocketAmpMm * rockGateQ,
+                    kDensity3NoiseAbs * kDensity3GateQ);
+}
+
+int64_t density3PocketMm(uint64_t seed, int64_t xMm, int64_t yMm, int64_t zMm, int64_t rockGateQ)
+{
+    if (rockGateQ == 0) return 0; // exact early out, not an approximation
+    const int64_t n = density3ValueNoise3Fade(seed, xMm, yMm, zMm, kDensity3PocketLatXYMm,
+                                              kDensity3PocketLatZMm, CH_POCKET);
+    return density3PocketScaleMm(n, rockGateQ);
+}
+
+// Perlin's quintic on [0, T] -> [0, T] for an arbitrary domain T -- rillQuinticQ
+// generalised off its hardwired q12 domain. FACTORED for the same overflow
+// reason rillQuinticQ is: t^3 * inner never exceeds T^5, and the only caller
+// here uses T = 1000, so the widest product is 1e15 against 9.2e18. Do not
+// expand it.
+int64_t density3QuinticOn(int64_t t, int64_t T)
+{
+    const int64_t inner = 6 * t * t - 15 * t * T + 10 * T * T;
+    return floorDiv(t * t * t * inner, T * T * T * T);
+}
+
+// The monotone odd contrast curve. This is what makes the term produce
+// overhangs at all: the bedding tent alone reaches dD/dz > 1 on 0.29% of
+// samples and yields overhangs on 0.098% of gated columns -- bounded,
+// continuous, gated and geometrically inert. TWO passes, unrolled explicitly
+// (density3.h static_asserts that its own pass count still matches this body).
+// It fixes 0 and both endpoints EXACTLY in integers, which is what preserves
+// the phase of the banding.
+int64_t density3SharpenMm(int64_t rMm, int64_t ampMm)
+{
+    const int64_t T = 2 * ampMm;
+    int64_t t = rMm + ampMm; // [0, T]
+    t = density3QuinticOn(t, T);
+    t = density3QuinticOn(t, T);
+    return t - ampMm;
+}
+
+// The bedding half: the SAME beddingRawAt the 2D banding uses -- same regional
+// strike/dip field, same 819.2 m structural lattice, same warp, same bed index,
+// same hardness -- at a 500 mm amplitude and through the contrast curve. Sharing
+// the field is the whole design: an independently hashed 3D term would put the
+// undercuts at heights unrelated to the bands on the face above them.
+int64_t density3BeddingMm(uint64_t seed, int64_t xMm, int64_t yMm, int64_t zMm)
+{
+    return density3SharpenMm(
+        floorDiv(kBedding3AmpMm * beddingRawAt(seed, xMm, yMm, zMm), kBeddingRawScale),
+        kBedding3MaxAbsMm);
+}
+
+int64_t density3ScaleMm(int64_t sumMm, int64_t slopeGateQ, int64_t bandTaperQ)
+{
+    return floorDiv(sumMm * slopeGateQ * bandTaperQ, kDensity3GateQ * kDensity3GateQ);
+}
+
+// D itself, with both column gates supplied. |D| <= kDensity3MaxAbsMm always.
+int64_t density3DisplacementGatedMm(uint64_t seed, int64_t xMm, int64_t yMm, int64_t zMm,
+                                    int64_t surfaceMm, int64_t slopeGateQ, int64_t rockGateQ)
+{
+    if (slopeGateQ == 0) return 0;
+    const int64_t taperQ = density3BandTaperQ(zMm, surfaceMm);
+    if (taperQ == 0) return 0; // outside the band: exactly zero
+    const int64_t sumMm = density3BeddingMm(seed, xMm, yMm, zMm) +
+                          density3PocketMm(seed, xMm, yMm, zMm, rockGateQ);
+    return density3ScaleMm(sumMm, slopeGateQ, taperQ);
+}
+
 // --- biome classification (voxelcore/biome.h) -------------------------------
 // Bit-exact mirror of vxc::classifyBiome / vxc::biomeTreelineMm /
 // vxc::biomeSurfaceMaterial. See biome.h for the doc comments explaining the
@@ -1318,6 +1504,46 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     return s;
 }
 
+// The CARRIER-ONLY half of evalSurface's slope, for VoxelizeMain's 3D density
+// band (v12). Returns exactly evalSurface(seed, vx, vy).slopeMmPerM.
+//
+// WHY THIS IS A SEPARATE FUNCTION RATHER THAN A CALL TO evalSurface. The slope
+// depends on the carrier alone -- carrierSlopeMmPerM reads only CarrierEval --
+// so the detail ladder, the curvature gate, the rill term and the bedding term
+// that make up the rest of evalSurface contribute nothing to it and would cost
+// VoxelizeMain a full column evaluation per thread for a number it discards.
+//
+// WHY IT IS BIT-IDENTICAL AND NOT MERELY EQUIVALENT: it is the same four lines
+// of evalSurface, calling the same evalCarrier on the same 4x4 stencil read
+// through the same rasterElevationMm, then the same carrierSlopeMmPerM. There
+// is no re-derivation to drift. If it ever did drift, vxc_gpu's cell comparison
+// fails immediately -- the band changes the material of every voxel within
+// 700 mm of the surface on a gated column.
+//
+// CALLER CONTRACT, same as evalSurface's: this reads ElevationMm, so the raster
+// window must be dilated by the carrier stencil and PixelSizeMm must already
+// have been refused if zero.
+int64_t columnCarrierSlopeMmPerM(int64_t vx, int64_t vy)
+{
+    const int64_t xMm = vx * kVoxelSizeMm;
+    const int64_t yMm = vy * kVoxelSizeMm;
+    const int64_t pxMm = (int64_t)PixelSizeMm;
+    const int64_t px = floorDiv(xMm, pxMm);
+    const int64_t py = floorDiv(yMm, pxMm);
+    const int64_t fx = xMm - px * pxMm;
+    const int64_t fy = yMm - py * pxMm;
+
+    int64_t cp[16];
+    [unroll]
+    for (int j = 0; j < 4; ++j)
+    {
+        [unroll]
+        for (int i = 0; i < 4; ++i)
+            cp[i + 4 * j] = (int64_t)rasterElevationMm(px - 1 + i, py - 1 + j);
+    }
+    return carrierSlopeMmPerM(evalCarrier(cp, fx, fy, pxMm), pxMm);
+}
+
 // Representative level-0 voxel coordinate for coarse cell `c` (ADR D5).
 //
 // EXACT MIRROR of vxc::GeneratedWorld::coarseRep in voxel-core/generator.h:
@@ -1518,12 +1744,40 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
 
 uint cellIndexInBrick(uint x, uint y, uint z) { return x + 8u * (y + 8u * z); }
 
+// The lithology gate's argument, mirroring amplifier.cpp's soilAboveRockMm: the
+// depth of soil above rock, which under a BARE_ROCK surface is the topsoil band
+// alone, because stratigraphyAt below reads MAT_ROCK straight through the
+// subsoil there. The two must move together -- if that case ever changes, this
+// is wrong and nothing else in either file would say so.
+int64_t density3SoilAboveRockMm(GpuColumnSample col)
+{
+    if (col.surfaceMat == MAT_ROCK) return (int64_t)col.topsoilMm;
+    return (int64_t)col.topsoilMm + (int64_t)col.subsoilMm;
+}
+
 // vxc::Amplifier::stratigraphyAt bit-for-bit (the layer model, cave pass NOT
 // applied â€” materialAt below is the full function).
-uint stratigraphyAt(GpuColumnSample col, int64_t vz)
+//
+// v12 GAINS THE 3D DENSITY BAND. The test was `centre <= surfaceMm`; it is now
+// `centre <= surfaceMm + D`. `slopeGateQ` and `rockGateQ` are this column's two
+// gates, reduced ONCE per thread in VoxelizeMain and passed down the z loop --
+// the same split vxc::ColumnSample::d3 makes on the CPU. They are passed rather
+// than carried on GpuColumnSample on purpose: that struct is a cross-module
+// contract (FVoxelGpuColumnSample in the UE module static_asserts its 20-byte
+// layout, and ue-project/Shaders/VoxelBandReduce.usf reads the same buffer), and
+// widening it would be a silent stride mismatch outside this repository. The
+// same reasoning caves.h's mirror records for recomputing the cave column here.
+//
+// D DISPLACES THE WHOLE PROFILE, not just the air test, exactly as on the CPU:
+// depthMm is measured from the displaced surface so topsoil, subsoil and the
+// bedrock boundary hang below it rather than below a ghost surface 700 mm away.
+uint stratigraphyAt(GpuColumnSample col, int64_t vz, uint64_t seed, int64_t xMm, int64_t yMm,
+                    int64_t slopeGateQ, int64_t rockGateQ)
 {
     const int64_t centreMm = vz * (int64_t)kVoxelSizeMm + (int64_t)kVoxelSizeMm / 2;
-    const int64_t depthMm = (int64_t)col.surfaceMm - centreMm;
+    const int64_t displacementMm = density3DisplacementGatedMm(
+        seed, xMm, yMm, centreMm, (int64_t)col.surfaceMm, slopeGateQ, rockGateQ);
+    const int64_t depthMm = (int64_t)col.surfaceMm + displacementMm - centreMm;
     if (depthMm < 0) return MAT_AIR;
     if (depthMm < (int64_t)col.topsoilMm) return col.surfaceMat;
     if (depthMm < (int64_t)col.topsoilMm + (int64_t)col.subsoilMm)
@@ -2100,9 +2354,10 @@ bool cavernCarveAt(GpuCavernColumn cv, int surfaceMm, int bedrockDepthMm, int64_
 // caverns â€” caverns ordered last purely because a cavern column is far rarer,
 // so the common case never reaches that call: cavernCarveAt's first test is
 // `count == 0`).
-uint materialAt(GpuColumnSample col, GpuCaveColumn cc, GpuCavernColumn cv, int64_t vz)
+uint materialAt(GpuColumnSample col, GpuCaveColumn cc, GpuCavernColumn cv, int64_t vz,
+                uint64_t seed, int64_t xMm, int64_t yMm, int64_t slopeGateQ, int64_t rockGateQ)
 {
-    const uint m = stratigraphyAt(col, vz);
+    const uint m = stratigraphyAt(col, vz, seed, xMm, yMm, slopeGateQ, rockGateQ);
     if (m == MAT_AIR || m == MAT_BEDROCK) return m;
     if (caveCarveAt(cc, col.surfaceMm, col.bedrockDepthMm, vz)) return MAT_AIR;
     if (cavernCarveAt(cv, col.surfaceMm, col.bedrockDepthMm, vz)) return MAT_AIR;
@@ -2146,6 +2401,30 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
     // there is no column entry to carry its surface on.
     const GpuCavernColumn cavern = cavernColumnFor(caveSeed, colVx, colVy, col.surfaceMm);
 
+    // v12 3D density band (voxelcore/density3.h): the column-invariant half,
+    // reduced once here and reused down the whole brick stack, exactly as the
+    // cave and cavern passes above are.
+    //
+    // THE SLOPE IS RECOMPUTED FROM THE CARRIER, and that is the one place this
+    // kernel pays a real price for not widening GpuColumnSample. ColumnMain
+    // already computed this exact number inside evalSurface and threw it away;
+    // columnCarrierSlopeMmPerM below re-reads the 4x4 control stencil and
+    // re-evaluates the spline to get it back. It is bit-identical BY
+    // CONSTRUCTION -- it calls the very same evalCarrier and carrierSlopeMmPerM
+    // on the very same inputs -- and it is ~16 raster loads plus one spline per
+    // THREAD, not per voxel. The alternative was a 24-byte GpuColumnSample,
+    // which the UE module's FVoxelGpuColumnSample static_asserts against and
+    // ue-project/Shaders/VoxelBandReduce.usf reads with the old stride.
+    const int64_t d3xMm = colVx * (int64_t)kVoxelSizeMm;
+    const int64_t d3yMm = colVy * (int64_t)kVoxelSizeMm;
+    const int64_t d3SlopeGateQ =
+        density3SlopeGateQFromMag(columnCarrierSlopeMmPerM(colVx, colVy));
+    // Skipped entirely on a column below the slope gate, which is most of them:
+    // density3DisplacementGatedMm returns 0 on slopeGateQ == 0 before it looks
+    // at anything else, so rockGateQ is only needed where the gate is open.
+    const int64_t d3RockGateQ =
+        d3SlopeGateQ == 0 ? 0 : density3RockGateQ(density3SoilAboveRockMm(col));
+
     for (uint bz = 0; bz < BricksZ; ++bz)
     {
         const uint brickIndex = footprintIndex * BricksZ + bz;
@@ -2158,7 +2437,8 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
             const int64_t vz = coarseRep(brickZ * (int64_t)8 + (int64_t)z, CoarseScale);
             // lint-shader-ub: allow UNGUARDED_WRITE - index is bounded by construction: the entry guard caps tid below DispatchColumns, so footprintIndex < bricksX*bricksY and brickIndex < bricksX*bricksY*BricksZ, while lx/ly/z are all < 8; the host sizes OutCells to exactly bricksX*bricksY*BricksZ*512 (contract mirrored in gpu_harness.cpp, asserted there)
             OutCells[brickIndex * 512u + cellIndexInBrick(lx, ly, z)] =
-                materialAt(col, cave, cavern, vz);
+                materialAt(col, cave, cavern, vz, caveSeed, d3xMm, d3yMm, d3SlopeGateQ,
+                           d3RockGateQ);
         }
     }
 }

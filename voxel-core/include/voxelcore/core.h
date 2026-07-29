@@ -73,7 +73,26 @@ namespace vxc {
 //
 // The surface bound is re-derived for all of it and TIGHTENS by 3.5x on a fine
 // world (7846 mm against 27439 mm at maximum slope and curvature).
-inline constexpr uint32_t kWorldGenVersion = 11;
+// v12 (docs/terrain-amplification-plan.md Phase 3d/4): the bounded 3D density
+// band. `Amplifier::stratigraphyAt` stops testing `voxel centre <= surface` and
+// tests `centre <= surface + D(x, y, z)` instead, with a compile-time envelope
+// |D| <= 700 mm (voxelcore/density3.h). This is the first time in this
+// codebase's history that the solid set is not the region under a graph: a
+// column can read air with solid above it, i.e. the world can have overhangs.
+//
+// D is the SAME regional strike/dip bedding field the 2D banding already uses,
+// seen volumetrically and put through a monotone odd contrast curve (the tent
+// profile alone produced overhangs on 0.098% of gated columns -- bounded,
+// continuous, gated and geometrically inert), plus a rock-gated 3D pocket term.
+// Both gates are cheap and hoisted per column, and outside the +/-700 mm band D
+// cannot flip the test, so the skip is EXACT rather than approximate -- which
+// is the only reason a per-voxel hashing pass is affordable at all.
+//
+// Everything derived from the surface widens by that one constant:
+// surfaceUpperBoundMm, surfaceLowerBoundMm and (through it) solidBelowBoundMm,
+// plus GeneratedWorld's surface brick range by 7 voxels either side. The
+// air-reason enumeration in amplifier.h gains its fourth reason.
+inline constexpr uint32_t kWorldGenVersion = 12;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 

@@ -4,6 +4,7 @@
 
 #include "voxelcore/amplifier.h"
 #include "voxelcore/biome.h"
+#include "voxelcore/detail_bedding.h" // v12: the overhang/banding phase test
 #include "voxelcore/generator.h"
 #include <cstdio>
 
@@ -14,7 +15,36 @@ using namespace vxc;
 
 namespace {
 constexpr uint64_t kSeed = 20260719;
+
+// --- kWorldGenVersion 12: "the top voxel" needs a definition now -------------
+//
+// Up to v11 the topmost solid voxel of a column was floorDiv(surfaceMm - 50,
+// 100) BY DEFINITION -- stratigraphyAt tested `centre <= surfaceMm`, so the
+// solid set was the region under a graph and the top voxel was arithmetic.
+// With the 3D density band it is not: the test is `centre <= surfaceMm + D`
+// with |D| <= kDensity3MaxAbsMm, so the top voxel sits anywhere in
+// [nominal - 7, nominal + 7] and has to be FOUND.
+//
+// Searching downward from the top of the band rather than upward from the
+// nominal voxel is deliberate: on an overhung column there are several
+// disconnected solid runs, and the highest one is what "the topmost solid
+// voxel" means. (The overhang DETECTION loops below run the other way, upward,
+// for the mirror-image reason -- see them.)
+constexpr int64_t kBandVox = kDensity3MaxAbsMm / kVoxelSizeMm; // 7
+
+int64_t nominalTopVz(const ColumnSample& col) {
+    return floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
 }
+
+int64_t topSolidVz(const ColumnSample& col) {
+    const int64_t nominal = nominalTopVz(col);
+    for (int64_t vz = nominal + kBandVox; vz > nominal - kBandVox; --vz)
+        if (Amplifier::stratigraphyAt(col, vz) != MAT_AIR) return vz;
+    // Unreachable: D >= -kDensity3MaxAbsMm makes every voxel at or below
+    // nominal - kBandVox solid, so the loop above always returns.
+    return nominal - kBandVox;
+}
+} // namespace
 
 VXC_TEST(amplifier_is_deterministic) {
     SyntheticTileSampler tilesA(kSeed), tilesB(kSeed);
@@ -46,15 +76,57 @@ VXC_TEST(amplifier_top_voxel_is_surface_material) {
     // kTopsoilMinMm >= kVoxelSizeMm is what makes this hold everywhere, and
     // that floor is applied after the jitter precisely so this cannot fail on
     // an unlucky draw.
+    //
+    // kWorldGenVersion 12 QUALIFIES THE GUARANTEE, AND THE EXCEPTION IS
+    // MEASURED RATHER THAN WAVED THROUGH.
+    //
+    // The topmost solid voxel is now searched for rather than computed (see
+    // topSolidVz), and where the 3D density band is cutting steeply downward it
+    // is not the top of an intact soil profile: it is a face cut ACROSS the
+    // profile. The arithmetic is exact -- the top voxel is solid and the one
+    // above it is air, so its depth below its own displaced surface is bounded
+    // by D(z) - D(z + 100) + 100, which the 700 mm envelope caps at 1.5 m. That
+    // is past kTopsoilMinMm and into the subsoil band whenever D falls fast
+    // enough, WITHOUT the column needing to be overhung.
+    //
+    // That is the term working, not a bug: an undercut face on a soil-mantled
+    // 60-70% slope really does expose the layer under the turf, and only rock
+    // faces (where stratigraphyAt reads MAT_ROCK straight down) are immune. But
+    // it IS a weakening of the v8 guarantee this test exists to defend, so the
+    // exception is (a) allowed only where the band can produce it, checked on
+    // the mechanism itself, and (b) counted and printed with a ceiling, so a
+    // change that turns a rarity into the common case fails here.
     SyntheticTileSampler tiles(kSeed);
     Amplifier amp(kSeed, tiles);
+    int64_t columns = 0, overhungExceptions = 0;
     for (int64_t x = -3000; x <= 3000; x += 271)
         for (int64_t y = -3000; y <= 3000; y += 337) {
             const ColumnSample col = amp.column(x, y);
-            const int64_t topVz = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
-            CHECK_EQ(Amplifier::stratigraphyAt(col, topVz), col.surfaceMat);
+            const int64_t topVz = topSolidVz(col);
+            ++columns;
             CHECK(col.topsoilMm >= kVoxelSizeMm);
+            if (Amplifier::stratigraphyAt(col, topVz) == col.surfaceMat) continue;
+            // THE ONLY LICENSED EXCEPTION, and it is licensed on its MECHANISM
+            // rather than on "some mismatch happened". The top voxel is deep
+            // enough to leave the topsoil band only if D FELL between it and the
+            // voxel above -- depth(top) < D(z) - D(z+100) + 100 -- which cannot
+            // happen at all unless this column's slope gate is open. So the
+            // exception is impossible on 93% of ground by construction, and on
+            // the rest it is the term cutting a face across the profile.
+            CHECK(col.d3.slopeGateQ != 0);
+            const int64_t zTop = topVz * kVoxelSizeMm + kVoxelSizeMm / 2;
+            CHECK(density3ColumnDisplacementMm(col.d3, zTop, col.surfaceMm) >
+                  density3ColumnDisplacementMm(col.d3, zTop + kVoxelSizeMm, col.surfaceMm));
+            ++overhungExceptions;
         }
+    std::printf("    [amplifier] top-voxel material: %lld/%lld columns cut a face across the "
+                "soil profile and expose the layer below (%.2f%%)\n",
+                (long long)overhungExceptions, (long long)columns,
+                100.0 * static_cast<double>(overhungExceptions) /
+                    static_cast<double>(columns));
+    // A ceiling, not a pin: this is a rare consequence of a gated term, and if
+    // it ever reaches a few percent of ALL ground the gate has stopped gating.
+    CHECK(overhungExceptions * 100 < columns);
 }
 
 VXC_TEST(amplifier_stratigraphy_ordering) {
@@ -74,14 +146,23 @@ VXC_TEST(amplifier_stratigraphy_ordering) {
                   col.surfaceMat == MAT_PERMAFROST || col.surfaceMat == MAT_MUD ||
                   col.surfaceMat == MAT_ROCK);
 
-            // Walking down the column: air above surface, then the layer
-            // sequence, never air below the surface. This is the STRATIGRAPHY
+            // Walking down the column: air above the top solid voxel, then the
+            // layer sequence. This is the STRATIGRAPHY
             // (Amplifier::stratigraphyAt) â€” since the M4 cave pass,
             // materialAt() also carves tunnels out of it, so "no air below the
             // surface" is no longer true of the full material function and
             // holds only of the layer model this test is about. The cave
             // pass's own invariants live in test_caves.cpp.
-            const int64_t topVz = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
+            //
+            // v12 SPLITS THIS INVARIANT IN TWO, AND THE SPLIT IS THE POINT.
+            // Inside the +/-700 mm density band the layer model follows the
+            // DISPLACED surface, so depth is not monotone in z (an overhang is
+            // exactly dD/dz > 1, i.e. depth going the wrong way), air below a
+            // solid voxel is legal, and the top layer can legitimately reappear.
+            // Below the band D is identically zero, and everything this test
+            // used to assert over the whole column still holds exactly.
+            const int64_t topVz = topSolidVz(col);
+            const int64_t bandFloorVz = nominalTopVz(col) - kBandVox;
             CHECK_EQ(Amplifier::stratigraphyAt(col, topVz + 1), MAT_AIR);
             CHECK(Amplifier::stratigraphyAt(col, topVz) != MAT_AIR);
             // The surface shell itself is never carved (roof clamp).
@@ -89,12 +170,18 @@ VXC_TEST(amplifier_stratigraphy_ordering) {
             bool leftTopLayer = false;
             for (int64_t vz = topVz; vz > topVz - 1200; vz -= 7) {
                 const MaterialId m = Amplifier::stratigraphyAt(col, vz);
+                if (vz > bandFloorVz) continue; // inside the band: see above
                 CHECK(m != MAT_AIR);
                 if (m != col.surfaceMat) leftTopLayer = true;
                 // materialAt is depth-ordered: once below the top layer, the
                 // surface material never reappears.
                 if (leftTopLayer) CHECK(m != col.surfaceMat);
             }
+            // The band is bounded, so a voxel a whole band below the nominal
+            // surface is unconditionally solid. Asserted directly rather than
+            // inferred from the loop above, because it is the property every
+            // widened bound in amplifier.cpp rests on.
+            CHECK(Amplifier::stratigraphyAt(col, bandFloorVz) != MAT_AIR);
             // 120m below any surface must be bedrock or rock.
             const MaterialId deep = Amplifier::materialAt(col, topVz - 1200);
             CHECK(deep == MAT_ROCK || deep == MAT_BEDROCK);
@@ -205,6 +292,153 @@ VXC_TEST(amplifier_folds_caverns_into_materialAt) {
     CHECK(deepestCavernVoxelMm > 60000);
 }
 
+// ---------------------------------------------------------------------------
+// kWorldGenVersion 12: the world is no longer a heightfield.
+//
+// test_density3.cpp proves the TERM produces overhangs when both gates are
+// forced open. These two tests prove the WORLD does -- through the real
+// amplifier, on real classified columns, with the gates deciding for themselves
+// which ground qualifies. That is a different claim, and it is the one that can
+// fail silently: a term that is correct and a pipeline that never opens its
+// gate would leave every test in test_density3.cpp green and the world flat.
+// ---------------------------------------------------------------------------
+
+VXC_TEST(amplifier_produces_overhangs_on_real_columns) {
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+
+    int64_t columns = 0, gated = 0, overhung = 0, overhungSpanMm = 0;
+    int64_t bestX = 0, bestY = 0, bestSpan = 0;
+    for (int64_t x = -20000; x <= 20000; x += 97)
+        for (int64_t y = -20000; y <= 20000; y += 89) {
+            const ColumnSample col = amp.column(x, y);
+            ++columns;
+            if (col.d3.slopeGateQ == 0) continue;
+            ++gated;
+            // Walk the band BOTTOM-UP. The bottom of the band is
+            // unconditionally solid (|D| <= 700 mm) and the top is
+            // unconditionally air, so "air then solid" going UP is an overhang
+            // and "solid then air" going up is just the ground -- which is why
+            // the direction of this loop is load-bearing rather than a style
+            // choice. Asserted on the material function itself, not inferred
+            // from the sign of D.
+            const int64_t nominal = nominalTopVz(col);
+            bool sawAir = false;
+            int64_t span = 0;
+            for (int64_t vz = nominal - kBandVox; vz <= nominal + kBandVox; ++vz) {
+                const bool solid = Amplifier::stratigraphyAt(col, vz) != MAT_AIR;
+                if (!solid) {
+                    sawAir = true;
+                } else if (sawAir) {
+                    span += kVoxelSizeMm;
+                }
+            }
+            if (span > 0) {
+                ++overhung;
+                overhungSpanMm += span;
+                if (span > bestSpan) {
+                    bestSpan = span;
+                    bestX = x;
+                    bestY = y;
+                }
+            }
+        }
+
+    std::printf("    [amplifier] slope gate open on %lld/%lld columns (%.2f%%); "
+                "%lld overhung (%.2f%% of gated), mean overhung span %lld mm, max %lld mm "
+                "at (%lld,%lld)\n",
+                (long long)gated, (long long)columns,
+                100.0 * static_cast<double>(gated) / static_cast<double>(columns),
+                (long long)overhung,
+                gated ? 100.0 * static_cast<double>(overhung) / static_cast<double>(gated) : 0.0,
+                (long long)(overhung ? overhungSpanMm / overhung : 0), (long long)bestSpan,
+                (long long)bestX, (long long)bestY);
+
+    // The gate must actually open somewhere, and overhangs must actually form.
+    // Both are FLOORS rather than pins: the header measures 2.9% of gated
+    // columns on idealised ground and the rate here is a property of the
+    // sampler's slope distribution, which is not a calibrated quantity. What
+    // this catches is the failure that matters -- a term wired in and inert.
+    CHECK(gated > 0);
+    CHECK(overhung > 0);
+
+    // And the witness spelled out, so the claim is a demonstrated object rather
+    // than a counter: air with solid above it, at a named column, which the
+    // undisplaced heightfield cannot produce at all.
+    CHECK(bestSpan >= 2 * kVoxelSizeMm);
+    {
+        const ColumnSample col = amp.column(bestX, bestY);
+        const int64_t nominal = nominalTopVz(col);
+        bool sawAir = false, solidAboveAir = false, baselineOverhang = false, baselineAir = false;
+        for (int64_t vz = nominal - kBandVox; vz <= nominal + kBandVox; ++vz) {
+            if (Amplifier::stratigraphyAt(col, vz) == MAT_AIR)
+                sawAir = true;
+            else if (sawAir)
+                solidAboveAir = true;
+            // The same column with the band switched off is a graph, so
+            // solid-above-air is unreachable on it. This is what makes the
+            // witness a consequence of D rather than of the sampling.
+            const int64_t centre = vz * kVoxelSizeMm + kVoxelSizeMm / 2;
+            const bool flatSolid = centre <= int64_t(col.surfaceMm);
+            if (!flatSolid)
+                baselineAir = true;
+            else if (baselineAir)
+                baselineOverhang = true;
+        }
+        CHECK(solidAboveAir);
+        CHECK(!baselineOverhang);
+    }
+}
+
+VXC_TEST(amplifier_overhangs_line_up_with_the_bedding_on_the_face) {
+    // The header's load-bearing design claim: the volumetric recesses are the
+    // SAME structure as the 2D banding on the face above them, not a second
+    // pattern superimposed. If they were hashed independently the undercuts
+    // would sit at unrelated heights, which the header argues is worse than no
+    // undercuts at all.
+    //
+    // Tested through the amplifier rather than through density3.h so that it
+    // covers the WIRING: the displacement the world actually applies must still
+    // be in phase with the bedding term evalSurface actually adds. A wiring
+    // that fed the wrong z, the wrong seed or a per-brick coordinate would pass
+    // every test in test_density3.cpp and fail here.
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+
+    // Restricted to columns where the BEDDING dominates the pocket term, so the
+    // sign comparison is an exact claim rather than a statistical one -- the
+    // same derivation test_density3.cpp uses, transplanted onto real columns.
+    // |b2| over this threshold implies the rescaled 3D bedding exceeds the
+    // pocket's entire 200 mm allocation, so the sum takes the bedding's sign.
+    constexpr int64_t kDominanceThresholdMm =
+        kDensity3PocketAmpMm * kBeddingAmpMm / kBedding3AmpMm + 1;
+    static_assert(kDominanceThresholdMm < kBeddingAmpMm,
+                  "the dominance threshold must be reachable by the 2D term");
+
+    int64_t dominant = 0, agree = 0;
+    for (int64_t x = -20000; x <= 20000; x += 97)
+        for (int64_t y = -20000; y <= 20000; y += 89) {
+            const ColumnSample col = amp.column(x, y);
+            if (col.d3.slopeGateQ == 0) continue;
+            const int64_t xMm = x * kVoxelSizeMm, yMm = y * kVoxelSizeMm;
+            // At the surface itself, where the band is fully open and where the
+            // face the player sees is.
+            const int64_t s = col.surfaceMm;
+            const int64_t b2 = beddingMm(kSeed, xMm, yMm, s);
+            if (b2 < kDominanceThresholdMm && b2 > -kDominanceThresholdMm) continue;
+            const int64_t d = density3ColumnDisplacementMm(col.d3, s, s);
+            if (d == 0) continue; // a partly-closed gate can round it to zero
+            ++dominant;
+            if ((b2 > 0) == (d > 0)) ++agree;
+        }
+
+    std::printf("    [amplifier] bedding-dominated gated columns: %lld, displacement sign "
+                "agrees with the 2D banding on %lld\n",
+                (long long)dominant, (long long)agree);
+    CHECK(dominant > 100); // the subset must be populated or the test is empty
+    CHECK_EQ(agree, dominant);
+}
+
 VXC_TEST(amplifier_deep_column_golden_digest) {
     // GOLDEN(amplifier_deep_materials) â€” new at kWorldGenVersion 5. Digests
     // Amplifier::materialAt down 260 m over a 800 m-wide sparse grid, so unlike
@@ -237,8 +471,14 @@ VXC_TEST(amplifier_deep_column_golden_digest) {
     // cavern GEOMETRY is unchanged (see GOLDEN(cave_layer) / GOLDEN(cavern_
     // layer), which are pinned against a constant surface and did NOT move);
     // what moved is where that unchanged geometry sits relative to the ground.
-    // (was 0xF88B88DB9D9341AA at v5)
-    CHECK_EQ(d.h, 0x3384824A6CF22450ull);
+    // kWorldGenVersion 12: moves again, and this is the golden that SHOULD move
+    // most. It walks materialAt down each column from the surface, and the 3D
+    // density band changes the material of every voxel within 700 mm of the
+    // surface on a gated column -- including turning some of them to air, which
+    // no previous version of this digest has ever covered. The cave, cavern and
+    // bedrock geometry is untouched; what moved is the surface shell itself.
+    // (was 0xF88B88DB9D9341AA at v5, 0x3384824A6CF22450 at v6..v11)
+    CHECK_EQ(d.h, 0xB125856533E5C174ull);
 }
 
 VXC_TEST(generated_brick_matches_pointwise_queries) {
@@ -684,8 +924,18 @@ VXC_TEST(amplifier_surface_bound_golden_digest) {
     // VIOLATIONS=0 over 1775101 dense samples across 1320 footprints (1189980
     // over 880 before the 3750 and 1875 environments were added; the digest
     // itself is unchanged by that, see above).
-    // (was 0x5588EBCD842ECE3D at v5)
-    CHECK_EQ(d.h, 0xBD833B557B0EC0AEull);
+    // kWorldGenVersion 12: this golden moves for a reason the comment above
+    // says it should NOT -- so read this before assuming the rule broke. The
+    // bound is still a derived query and kWorldGenVersion still does not cover
+    // it; what changed is the QUANTITY it bounds. Up to v11 it bounded
+    // surfaceMm; from v12 it bounds surfaceMm + D, because that is what
+    // stratigraphyAt tests and therefore what every caller means by "everything
+    // above here is air". Every entry is exactly kDensity3MaxAbsMm = 700 mm
+    // higher; nothing else in the derivation moved. Soundness is re-established
+    // by amplifier_surface_bound_adversarial (VIOLATIONS=0 over 1775101 dense
+    // samples) and by the real-tile sweep in vxc_terrainprobe.
+    // (was 0x5588EBCD842ECE3D at v5, 0xBD833B557B0EC0AE at v6..v11)
+    CHECK_EQ(d.h, 0x204D392F1832901Dull);
 }
 
 // ---------------------------------------------------------------------------
@@ -880,7 +1130,17 @@ VXC_TEST(amplifier_solid_below_bound_golden_digest) {
     // moved. Soundness is re-established by
     // amplifier_solid_below_bound_has_no_air_beneath_it, which passes with
     // AIR BELOW FLOOR = 0 over 150031809 voxels.
-    // (was 0xE9D395DF74D61495 at v5)
-    CHECK_EQ(d.h, 0x6E19AE5BC47B4E45ull);
+    // kWorldGenVersion 12: the mirror of the surface-bound move above, and it
+    // moves by the same single constant. surfaceLowerBoundMm now bounds the
+    // DISPLACED surface, so it is 700 mm lower, and solidBelowBoundMm is
+    // derived from it, so the all-solid floor drops by exactly 700 mm too. The
+    // carve envelope it subtracts is unchanged -- the density band is not a
+    // carve pass and needs no term of its own; see the note above
+    // Amplifier::solidBelowBoundMm. Soundness is re-established by
+    // amplifier_solid_below_bound_has_no_air_beneath_it, which passes with
+    // AIR BELOW FLOOR = 0 over 150032623 voxels -- a check that now has real
+    // work to do, since the band genuinely puts air below surfaceMm.
+    // (was 0xE9D395DF74D61495 at v5, 0x6E19AE5BC47B4E45 at v6..v11)
+    CHECK_EQ(d.h, 0x0D7299E132748450ull);
 }
 

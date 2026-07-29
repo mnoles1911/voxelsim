@@ -706,3 +706,129 @@ VXC_TEST(skipping_outside_the_band_is_exact_not_approximate) {
         CHECK_EQ(density3IsSolid(z, s, d), density3IsSolid(z, s, 0));
     }
 }
+
+// ---------------------------------------------------------------------------
+// 8. THE TWO HOISTS (kWorldGenVersion 12).
+// ---------------------------------------------------------------------------
+//
+// Both are optimisations with NO correctness surface -- each must return the
+// integer the unhoisted form returns, for every input, or the CPU and the GPU
+// (whose mirror computes the UNHOISTED form) diverge. That makes these the
+// load-bearing tests for the whole wiring: if one fails, vxc_gpu fails, and
+// vxc_gpu failing is a desync in a shipped world rather than a visual defect.
+
+VXC_TEST(bedding_domain_hoist_is_value_identical) {
+    // detail_bedding.h's beddingRawAt called beddingDomainHash three times, for
+    // one hash that is constant over an 819.2 m structural domain.
+    // beddingRawFromDomain takes it already computed. Same integer, always --
+    // hash2 is pure, so this is a rearrangement and not an approximation.
+    SplitMixRng rng(21);
+    for (int i = 0; i < 100000; ++i) {
+        const int64_t x = rng.nextSigned(2'000'000'000);
+        const int64_t y = rng.nextSigned(2'000'000'000);
+        const int64_t z = rng.nextSigned(1'000'000);
+        const uint64_t dh = beddingDomainHash(kSeed, x, y);
+        CHECK_EQ(beddingRawFromDomain(kSeed, dh, x, y, z), beddingRawAt(kSeed, x, y, z));
+        CHECK_EQ(beddingDisplacement3FromDomain(kSeed, dh, x, y, z),
+                 beddingDisplacement3Mm(kSeed, x, y, z));
+        CHECK_EQ(density3BeddingFromDomainMm(kSeed, dh, x, y, z),
+                 density3BeddingMm(kSeed, x, y, z));
+    }
+}
+
+VXC_TEST(pocket_cache_is_value_identical) {
+    // The eight hash3 corners are cached for ONE z lattice cell. The 78% of
+    // columns whose whole band sits inside that cell hit it; the other 22% must
+    // fall THROUGH to a fresh evaluation rather than be served the wrong
+    // corners. Both branches are exercised deliberately -- the sweep spans two
+    // full z lattice periods either side of the cache's own cell -- because a
+    // cache that silently served stale corners would be a divergence that only
+    // showed up as a hole in someone's world.
+    SplitMixRng rng(22);
+    int64_t hits = 0, misses = 0;
+    for (int i = 0; i < 4000; ++i) {
+        const int64_t x = rng.nextSigned(2'000'000'000);
+        const int64_t y = rng.nextSigned(2'000'000'000);
+        const int64_t s = rng.nextSigned(1'000'000);
+        const Density3PocketCorners c = density3PocketCornersAt(kSeed, x, y, s);
+        for (int64_t dz = -2 * kDensity3PocketLatZMm; dz <= 2 * kDensity3PocketLatZMm;
+             dz += 977) {
+            const int64_t z = s + dz;
+            if (floorDiv(z, kDensity3PocketLatZMm) == c.z0)
+                ++hits;
+            else
+                ++misses;
+            CHECK_EQ(density3PocketCachedMm(c, kSeed, x, y, z, kQ),
+                     density3PocketMm(kSeed, x, y, z, kQ));
+            CHECK_EQ(density3PocketCachedMm(c, kSeed, x, y, z, 0),
+                     density3PocketMm(kSeed, x, y, z, 0));
+        }
+    }
+    CHECK(hits > 0);   // not vacuous: both branches must actually have run
+    CHECK(misses > 0);
+    std::printf("    [density3] pocket cache exercised: %lld hits, %lld misses\n",
+                (long long)hits, (long long)misses);
+}
+
+VXC_TEST(column_state_matches_the_reference_displacement) {
+    // Density3Column is the object Amplifier::stratigraphyAt actually consults.
+    // It must agree with the reference form that computes both gates itself, at
+    // every z, or the amplifier and this file's own tests are testing two
+    // different terms.
+    //
+    // The slopes and soil depths swept below straddle both gate ramps, so the
+    // PARTIALLY open cases -- where a q12 gate scales the displacement down, and
+    // where a rounding difference would hide -- are covered, not just the two
+    // saturated ends.
+    SplitMixRng rng(23);
+    int64_t nonZero = 0, samples = 0;
+    for (int i = 0; i < 3000; ++i) {
+        const int64_t x = rng.nextSigned(2'000'000'000);
+        const int64_t y = rng.nextSigned(2'000'000'000);
+        const int64_t s = rng.nextSigned(1'000'000);
+        const int64_t slope = 400 + static_cast<int64_t>(rng.next() % 800); // 400..1199 mm/m
+        const int64_t soil = static_cast<int64_t>(rng.next() % 1200);       // 0..1199 mm
+        const Density3Column col = density3ColumnFor(kSeed, x, y, s, slope, soil);
+        for (int64_t dz = -1000; dz <= 1000; dz += 37) {
+            const int64_t z = s + dz;
+            const int64_t got = density3ColumnDisplacementMm(col, z, s);
+            const int64_t want = density3DisplacementGatedMm(
+                kSeed, x, y, z, s, density3SlopeGateQFromMag(slope), density3RockGateQ(soil));
+            CHECK_EQ(got, want);
+            ++samples;
+            if (got != 0) {
+                ++nonZero;
+                // The cheap predicate must never say "closed" where D is not.
+                CHECK(density3ColumnCanDisplace(col, z, s));
+            }
+        }
+    }
+    CHECK(nonZero > 0); // the sweep must reach the term, or it proves nothing
+    std::printf("    [density3] column-state agreement over %lld samples, %lld non-zero\n",
+                (long long)samples, (long long)nonZero);
+}
+
+VXC_TEST(closed_slope_gate_computes_no_hash_state) {
+    // The cost argument for the whole wiring is that a column below the slope
+    // gate costs one compare and nothing else. Checked STRUCTURALLY rather than
+    // by timing: on such a column Density3Column carries no domain hash and no
+    // corner cache, so there is nothing it could have computed.
+    const Density3Column shut = density3ColumnFor(kSeed, kAnchorX, kAnchorY, 1000,
+                                                  kDensity3SlopeStartMmPerM, 0);
+    CHECK_EQ(shut.slopeGateQ, 0);
+    CHECK_EQ(shut.domainHash, 0ull);
+    CHECK_EQ(shut.pocket.z0, 0);
+    for (int i = 0; i < 8; ++i) CHECK_EQ(shut.pocket.v[i], 0);
+    for (int64_t dz = -800; dz <= 800; dz += 13)
+        CHECK_EQ(density3ColumnDisplacementMm(shut, 1000 + dz, 1000), 0);
+
+    // And a closed LITHOLOGY gate skips the pocket corners while still
+    // computing the bedding half -- the two gates are independent, and a
+    // shortcut that skipped both together would quietly delete the bedding
+    // overhangs on soil-choked benches, which are the ones this term is for.
+    const Density3Column noPocket = density3ColumnFor(kSeed, kAnchorX, kAnchorY, 1000,
+                                                      kSteepMmPerM, kDensity3RockSoilZeroMm);
+    CHECK_EQ(noPocket.rockGateQ, 0);
+    for (int i = 0; i < 8; ++i) CHECK_EQ(noPocket.pocket.v[i], 0);
+    CHECK(noPocket.domainHash != 0ull);
+}

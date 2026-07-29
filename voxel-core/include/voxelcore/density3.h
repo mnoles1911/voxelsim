@@ -15,11 +15,14 @@
 // header supplies a displacement D(x, y, z) so the test becomes
 // `z <= surface + D`, with a compile-time-provable envelope |D| <= 700 mm.
 //
-// NOT WIRED IN. These are functions and constants only; nothing here is called
-// from evalSurface or stratigraphyAt (task instruction -- the integrator
-// composes). Wiring it in is a world-breaking change: bump kWorldGenVersion,
-// regenerate goldens, widen amplifier.h's air-reason enumeration and the brick
-// range bounds by the constant kDensity3MaxAbsMm.
+// WIRED IN AT kWorldGenVersion 12 (Wave C). `Amplifier::stratigraphyAt` now
+// tests `centre <= surface + D`, with the column-invariant half of D hoisted
+// into `ColumnSample::d3` (see Density3Column at the bottom of this file) the
+// same way the cave and cavern passes hoist theirs. That bump carried the
+// bound widening this header's section 0 asks for -- surfaceUpperBoundMm,
+// surfaceLowerBoundMm and solidBelowBoundMm all moved by kDensity3MaxAbsMm,
+// GeneratedWorld's surface brick range widened by 7 voxels either side, and
+// amplifier.h's air-reason enumeration gained its fourth reason.
 //
 // Header-only, integer-only (CI float ban), C++20, UE-header-free. Every
 // expression is a plain free function of int64_t/uint64_t -- no templates, no
@@ -167,9 +170,16 @@ static_assert(kDensity3GateQ == 4096,
 //      about 21 ns.
 //
 // Together those take ~100 ns to ~46 ns, i.e. voxelize +50% rather than +107%
-// world-average. Both live at the integration boundary (one needs a column
-// cache, the other needs detail_bedding.h to expose a precomputed domain), so
-// they are recorded here rather than done here.
+// world-average.
+//
+// BOTH ARE DONE, at kWorldGenVersion 12. detail_bedding.h grew
+// beddingRawFromDomain (hoist 2) and this file grew Density3PocketCorners
+// (hoist 1) plus the Density3Column that carries both; the numbers each
+// actually bought on the integrated path are in the Wave C notes rather than
+// here, because they are properties of the caller's loop shape, not of this
+// file. Both are VALUE-IDENTICAL rearrangements -- hash2/hash3 are pure, so a
+// hoisted evaluation and a fresh one return the same integer, which is what
+// lets worldgen.ush mirror the UNHOISTED form and still be bit-exact.
 
 // --- gate (b): slope ---------------------------------------------------------
 //
@@ -452,6 +462,82 @@ constexpr int64_t density3PocketMm(uint64_t seed, int64_t xMm, int64_t yMm, int6
     return density3PocketScaleMm(n, rockGateQ);
 }
 
+// --- HOIST 1: the eight corners, cached per column ---------------------------
+//
+// The pocket's z lattice is 6400 mm and the band is 1400 mm, so
+// floorDiv(z, 6400) is the SAME index for every voxel of the band on
+// 1 - 1400/6400 = 78.1% of columns. On those columns all eight hash3 corners
+// are the same eight for the whole column, and eight hashes is nearly the whole
+// cost of the pocket term.
+//
+// Cached as the eight hashToSigned16 VALUES, not as the hashes: they are in
+// [-32768, 32767] so int32_t holds them exactly, and 8 x 4 bytes is what this
+// costs a ColumnSample. The cache carries its own z0 so the 21.9% of columns
+// whose band straddles a lattice plane are detected rather than mis-served --
+// density3PocketCachedMm falls back to a fresh evaluation there, so the answer
+// is the SAME integer either way and the cache is an optimisation with no
+// correctness surface at all. That is the property worldgen.ush's mirror leans
+// on: it does not cache, and it is still bit-exact.
+struct Density3PocketCorners {
+    int64_t z0 = 0;    // the z lattice index these eight corners belong to
+    int32_t v[8] = {}; // (x0,y0,z0) (x0+1,..) (..y0+1..) ... in the order below
+};
+
+constexpr Density3PocketCorners density3PocketCornersAt(uint64_t seed, int64_t xMm, int64_t yMm,
+                                                        int64_t zMm) {
+    const int64_t x0 = floorDiv(xMm, kDensity3PocketLatXYMm);
+    const int64_t y0 = floorDiv(yMm, kDensity3PocketLatXYMm);
+    const int64_t z0 = floorDiv(zMm, kDensity3PocketLatZMm);
+    Density3PocketCorners c;
+    c.z0 = z0;
+    c.v[0] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0, y0, z0, CH_POCKET)));
+    c.v[1] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0 + 1, y0, z0, CH_POCKET)));
+    c.v[2] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0, y0 + 1, z0, CH_POCKET)));
+    c.v[3] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0 + 1, y0 + 1, z0, CH_POCKET)));
+    c.v[4] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0, y0, z0 + 1, CH_POCKET)));
+    c.v[5] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0 + 1, y0, z0 + 1, CH_POCKET)));
+    c.v[6] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0, y0 + 1, z0 + 1, CH_POCKET)));
+    c.v[7] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0 + 1, y0 + 1, z0 + 1, CH_POCKET)));
+    return c;
+}
+
+// density3ValueNoise3Fade's interpolation with the eight corner hashes already
+// in hand. Character-for-character the same arithmetic in the same order --
+// only the eight `hashToSigned16(hash3(...))` calls are replaced by the cached
+// values they would have produced.
+constexpr int64_t density3PocketNoiseFrom(const Density3PocketCorners& c, int64_t xMm,
+                                          int64_t yMm, int64_t zMm) {
+    const int64_t latXYMm = kDensity3PocketLatXYMm;
+    const int64_t latZMm = kDensity3PocketLatZMm;
+    const int64_t x0 = floorDiv(xMm, latXYMm);
+    const int64_t y0 = floorDiv(yMm, latXYMm);
+    const int64_t z0 = floorDiv(zMm, latZMm);
+    const int64_t fx = fadeFractionMm(xMm - x0 * latXYMm, latXYMm);
+    const int64_t fy = fadeFractionMm(yMm - y0 * latXYMm, latXYMm);
+    const int64_t fz = fadeFractionMm(zMm - z0 * latZMm, latZMm);
+    const int64_t gx = latXYMm - fx, gy = latXYMm - fy, gz = latZMm - fz;
+
+    const int64_t lo = (int64_t{c.v[0]} * gx + int64_t{c.v[1]} * fx) * gy +
+                       (int64_t{c.v[2]} * gx + int64_t{c.v[3]} * fx) * fy;
+    const int64_t hi = (int64_t{c.v[4]} * gx + int64_t{c.v[5]} * fx) * gy +
+                       (int64_t{c.v[6]} * gx + int64_t{c.v[7]} * fx) * fy;
+    return floorDiv(lo * gz + hi * fz, latXYMm * latXYMm * latZMm);
+}
+
+// density3PocketMm with the corner cache consulted. EXACTLY equal to
+// density3PocketMm for every input, whether the cache hits or misses; pinned by
+// test_density3.cpp's `pocket_cache_is_value_identical`.
+constexpr int64_t density3PocketCachedMm(const Density3PocketCorners& c, uint64_t seed,
+                                         int64_t xMm, int64_t yMm, int64_t zMm,
+                                         int64_t rockGateQ) {
+    if (rockGateQ == 0) return 0;
+    const int64_t n = (floorDiv(zMm, kDensity3PocketLatZMm) == c.z0)
+                          ? density3PocketNoiseFrom(c, xMm, yMm, zMm)
+                          : density3ValueNoise3Fade(seed, xMm, yMm, zMm, kDensity3PocketLatXYMm,
+                                                    kDensity3PocketLatZMm, CH_POCKET);
+    return density3PocketScaleMm(n, rockGateQ);
+}
+
 // =============================================================================
 // 3. THE BEDDING TERM -- THE SAME STRUCTURE, SEEN VOLUMETRICALLY
 // =============================================================================
@@ -463,8 +549,15 @@ constexpr int64_t density3PocketMm(uint64_t seed, int64_t xMm, int64_t yMm, int6
 // nothing else -- the SAME regional strike/dip field hashed off the same
 // 819.2 m structural lattice, the same domain warp, the same bed index, the
 // same per-bed hardness and asymmetry that produce the 2D banding on the face.
-// Only the amplitude differs (500 mm here against 320 mm for the 2D term), and
+// Only the amplitude differs (500 mm here against kBeddingAmpMm for the 2D
+// term -- 120 mm since that constant was re-measured against the detail S2
+// budget, not the 320 mm this comment was first written against), and
 // both are floorDiv scalings of the identical beddingRawAt(seed, x, y, z).
+// NOTHING in this file is derived from kBeddingAmpMm: the 500 mm allocation
+// comes out of kDensity3MaxAbsMm via kBedding3MaxAbsMm, so the 2D amplitude can
+// move again without touching the envelope arithmetic below. The one place the
+// two are coupled is a TEST -- test_density3.cpp's dominance threshold, which
+// derives itself from both constants for exactly this reason.
 //
 // WHY NOT AN INDEPENDENT 3D FIELD. Because then the overhangs would not line
 // up with the bands. A face already shows quasi-periodic banding from the 2D
@@ -607,6 +700,15 @@ constexpr int64_t density3BeddingMm(uint64_t seed, int64_t xMm, int64_t yMm, int
     return density3SharpenMm(beddingDisplacement3Mm(seed, xMm, yMm, zMm), kBedding3MaxAbsMm);
 }
 
+// HOIST 2: the same term with detail_bedding.h's structural-domain hash already
+// computed. Equal to density3BeddingMm whenever
+// `domainHash == beddingDomainHash(seed, xMm, yMm)`.
+constexpr int64_t density3BeddingFromDomainMm(uint64_t seed, uint64_t domainHash, int64_t xMm,
+                                              int64_t yMm, int64_t zMm) {
+    return density3SharpenMm(beddingDisplacement3FromDomain(seed, domainHash, xMm, yMm, zMm),
+                             kBedding3MaxAbsMm);
+}
+
 // =============================================================================
 // 4. COMPOSITION AND THE BOUND
 // =============================================================================
@@ -721,6 +823,110 @@ constexpr int64_t density3DisplacementMm(uint64_t seed, int64_t xMm, int64_t yMm
 // exactly as the undisplaced test reads today.
 constexpr bool density3IsSolid(int64_t zMm, int64_t surfaceMm, int64_t displacementMm) {
     return zMm <= surfaceMm + displacementMm;
+}
+
+// =============================================================================
+// THE COLUMN STATE -- the integration boundary, and both hoists in one object
+// =============================================================================
+//
+// Everything in D that does not depend on z, reduced once per column and
+// carried on the ColumnSample exactly the way caves.h's CaveColumn and
+// caverns.h's CavernColumn are. That is not a convention borrowed for
+// tidiness: Amplifier::stratigraphyAt is a STATIC function of (ColumnSample,
+// vz) called by GeneratedWorld, by the UE subsystem and by collapse.h, so
+// anything the per-voxel test needs and cannot derive from vz has to arrive on
+// the sample. Widening the signature instead would be an API break across four
+// consumers, one of them out of this repository.
+//
+// EVERY FIELD IS BEHIND THE SLOPE GATE. On a column that fails it, this struct
+// is left zeroed and NOT ONE hash is computed -- not the domain hash, not the
+// eight corners. That is the whole cost argument: ~93% of columns pay two
+// compares and a divide (density3SlopeGateQFromMag) and nothing else, and the
+// skip is exact because slopeGateQ == 0 forces D == 0 identically.
+struct Density3Column {
+    uint64_t seed = 0;       // needed by the warp/hardness hashes, which are per-BED
+    uint64_t domainHash = 0; // beddingDomainHash(seed, xMm, yMm)   -- hoist 2
+    Density3PocketCorners pocket{};                        //       -- hoist 1
+    int64_t xMm = 0, yMm = 0;
+    int32_t slopeGateQ = 0; // 0 == this column can never displace; see above
+    int32_t rockGateQ = 0;
+};
+
+// Reduce a column. `slopeMmPerM` is the carrier's analytic gradient MAGNITUDE
+// (Amplifier::SurfaceEval::slopeMmPerM); `soilDepthMm` is the depth of soil
+// above rock -- see density3RockGateQ's comment for which of topsoil /
+// topsoil+subsoil that is. `surfaceMm` picks the z lattice cell the corner
+// cache is built for, and is the band's own centre.
+constexpr Density3Column density3ColumnFor(uint64_t seed, int64_t xMm, int64_t yMm,
+                                           int64_t surfaceMm, int64_t slopeMmPerM,
+                                           int64_t soilDepthMm) {
+    Density3Column c;
+    c.seed = seed;
+    c.xMm = xMm;
+    c.yMm = yMm;
+    const int64_t slopeQ = density3SlopeGateQFromMag(slopeMmPerM);
+    if (slopeQ == 0) return c; // exact skip -- no hash is computed on this column
+    c.slopeGateQ = static_cast<int32_t>(slopeQ);
+    c.rockGateQ = static_cast<int32_t>(density3RockGateQ(soilDepthMm));
+    c.domainHash = beddingDomainHash(seed, xMm, yMm);
+    // The pocket's eight corners are only worth caching if the pocket can be
+    // non-zero at all; a closed lithology gate zeroes it exactly.
+    if (c.rockGateQ != 0) c.pocket = density3PocketCornersAt(seed, xMm, yMm, surfaceMm);
+    return c;
+}
+
+// The per-voxel query. `zMm` is the VOXEL CENTRE in world millimetres and
+// `surfaceMm` the column's undisplaced surface. Equal, for every input, to
+// density3DisplacementGatedMm(c.seed, c.xMm, c.yMm, zMm, surfaceMm,
+// c.slopeGateQ, c.rockGateQ) -- pinned by test_density3.cpp.
+constexpr int64_t density3ColumnDisplacementMm(const Density3Column& c, int64_t zMm,
+                                               int64_t surfaceMm) {
+#ifdef VXC_DENSITY3_NO_HOIST
+    // MEASUREMENT BUILD ONLY, and safe to have: this is the same answer with
+    // both hoists switched off, so what the hoists are worth can be measured on
+    // one machine and one compiler instead of argued from a cost model. It is
+    // also EXACTLY what worldgen.ush computes, which makes it a second, cruder
+    // check on the mirror -- vxc_bench --digest must be identical between a
+    // hoisted and an unhoisted build, and if it is not, the CPU and the GPU
+    // disagree too.
+    //
+    // Deliberately the only ablation switch in this file. A switch that turned
+    // the TERM off would produce v11 geometry under a v12 version stamp, which
+    // is a desync waiting for someone to leave a flag set; this one cannot
+    // change an output at all.
+    return density3DisplacementGatedMm(c.seed, c.xMm, c.yMm, zMm, surfaceMm, c.slopeGateQ,
+                                       c.rockGateQ);
+#else
+    if (c.slopeGateQ == 0) return 0;
+    const int64_t taperQ = density3BandTaperQ(zMm, surfaceMm);
+    if (taperQ == 0) return 0; // outside the band: exactly zero, see section 0
+    const int64_t sumMm =
+        density3BeddingFromDomainMm(c.seed, c.domainHash, c.xMm, c.yMm, zMm) +
+        density3PocketCachedMm(c.pocket, c.seed, c.xMm, c.yMm, zMm, c.rockGateQ);
+    return density3ScaleMm(sumMm, c.slopeGateQ, taperQ);
+#endif
+}
+
+// How far, in VOXELS, this column's top solid voxel can move, and equivalently
+// how far below its nominal top the bricks can stop being homogeneous. Zero on a
+// column whose slope gate is shut, which is the point: a brick-range widening
+// applied unconditionally is sound but is paid by flat ground that can never use
+// it. Callers: GeneratedWorld::surfaceBrickRange and its coarse sibling, and the
+// gpu_harness mirror of the same rule.
+constexpr int64_t density3BandVoxels(const Density3Column& c) {
+    static_assert(kDensity3MaxAbsMm % kVoxelSizeMm == 0,
+                  "the envelope must be a whole number of voxels, or every consumer of this "
+                  "needs a rounding argument it does not currently have");
+    return c.slopeGateQ == 0 ? 0 : kDensity3MaxAbsMm / kVoxelSizeMm;
+}
+
+// The cheap per-voxel predicate a caller should apply BEFORE
+// density3ColumnDisplacementMm: true iff this voxel could possibly be
+// displaced. Two compares on a column that failed the slope gate, which is
+// most of them.
+constexpr bool density3ColumnCanDisplace(const Density3Column& c, int64_t zMm,
+                                         int64_t surfaceMm) {
+    return c.slopeGateQ != 0 && density3BandGateOpen(zMm, surfaceMm);
 }
 
 } // namespace vxc

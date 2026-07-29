@@ -149,10 +149,19 @@ VXC_TEST(coarsegen_surface_range_formula) {
     GeneratedWorld<B> gen(amp);
 
     // For every column: the topmost solid coarse cell under the
-    // representative-sample rule sits inside [bzMin, bzMax], the cell above
+    // representative-sample rule sits inside [bzMin, bzMax], and the cell above
     // it is air. Checked against stratigraphyAt (surface rule without the
     // cave carve, which coarseSurfaceBrickRange â€” like surfaceBrickRange â€”
     // deliberately ignores).
+    //
+    // kWorldGenVersion 12: the topmost solid cell is now SEARCHED FOR rather
+    // than computed from the surface, and the range it must lie inside is the
+    // column's own band. Before the 3D density band, `floorDiv(top0 - s/2, s)`
+    // WAS the top solid cell by definition; with it, the cell at that index can
+    // be air and a cell above it solid. This test happened to pass unchanged on
+    // this seed and this 8x8 grid, which is precisely why it is being rewritten:
+    // an invariant about where terrain stops must not be true by luck when the
+    // consequence of it being false is a chunk that never generates.
     for (int32_t level = 1; level <= 4; ++level) {
         const int64_t s = int64_t(1) << level;
         const auto grid = gen.coarseColumns(level, 0, 0);
@@ -162,7 +171,22 @@ VXC_TEST(coarsegen_surface_range_formula) {
         for (int i = 0; i < B * B; ++i) {
             const ColumnSample& col = grid.cols[i];
             const int64_t top0 = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
-            const int64_t top = floorDiv(top0 - s / 2, s);
+            const int64_t nominal = floorDiv(top0 - s / 2, s);
+            // The band in LEVEL-0 voxels, mapped to coarse cells the same way
+            // coarseSurfaceBrickRange maps it. Zero on an ungated column, so on
+            // 80%+ of ground this is bit-identical to the pre-v12 assertion.
+            const int64_t band = density3BandVoxels(col.d3);
+            const int64_t lo = floorDiv(top0 - band - s / 2, s);
+            const int64_t hi = floorDiv(top0 + band - s / 2, s);
+            int64_t top = lo;
+            for (int64_t c = hi; c >= lo; --c)
+                if (Amplifier::stratigraphyAt(col, GeneratedWorld<B>::coarseRep(c, level)) !=
+                    MAT_AIR) {
+                    top = c;
+                    break;
+                }
+            CHECK(top >= lo && top <= hi);
+            CHECK(lo <= nominal && nominal <= hi); // the search bracket must contain it
             CHECK(Amplifier::stratigraphyAt(col, GeneratedWorld<B>::coarseRep(top, level)) !=
                   MAT_AIR);
             CHECK_EQ(Amplifier::stratigraphyAt(
@@ -187,8 +211,22 @@ VXC_TEST(coarsegen_golden_digest) {
     // tests (coarsegen_level0_identity, coarsegen_matches_pointwise_queries,
     // coarsegen_surface_range_formula, coarsegen_fidelity_vs_true_mip) all
     // still pass, and the fidelity mismatch ceilings were not relaxed.
-    // (was 0x85B3E79EF8D01AFC at v5)
-    CHECK_EQ(d, 0xFCE6D8509799236Dull);
+    // kWorldGenVersion 12: moves for the same reason -- the fine surface it
+    // samples moved, this time because stratigraphyAt tests against
+    // surfaceMm + D rather than surfaceMm. The coarse rule is again unchanged,
+    // and level 0 is still bit-identical to the fine path (coarsegen_level0_
+    // identity), which is the property that would break if the band had been
+    // wired in per-brick or per-dispatch rather than per world coordinate.
+    // kWorldGenVersion 12: moves for the same reason -- the fine surface it
+    // samples moved, this time because stratigraphyAt tests against
+    // surfaceMm + D rather than surfaceMm -- AND because this digest folds in
+    // bzMin/bzMax, which coarseSurfaceBrickRange now widens by the band on the
+    // columns that pass the slope gate. The coarse rule is again unchanged, and
+    // level 0 is still bit-identical to the fine path (coarsegen_level0_
+    // identity), which is the property that would break if the band had been
+    // wired in per-brick or per-dispatch rather than per world coordinate.
+    // (was 0x85B3E79EF8D01AFC at v5, 0xFCE6D8509799236D at v6..v11)
+    CHECK_EQ(d, 0xB812048EB08AA281ull);
 }
 
 VXC_TEST(coarsegen_seed_sensitivity) {

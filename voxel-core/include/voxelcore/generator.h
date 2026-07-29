@@ -56,13 +56,48 @@ public:
 
     // Brick-z range intersecting the surface shell for footprint (bx, by):
     // every brick containing some column's topmost solid voxel.
+    //
+    // WIDENED BY THE 3D DENSITY ENVELOPE (kWorldGenVersion 12), and by more
+    // than "the top voxel can be 700 mm higher". Two separate things changed:
+    //
+    //   * the topmost solid voxel of a column now lies anywhere in
+    //     [top - 7, top + 7], because `centre <= surfaceMm + D` with
+    //     |D| <= kDensity3MaxAbsMm = 700 mm = 7 voxels exactly; and
+    //   * more importantly, a brick BELOW the topmost solid voxel is no longer
+    //     necessarily full. That is the whole point of the term: inside the
+    //     band a column can read air with solid above it, so the bricks holding
+    //     the band's lower half stop being homogeneous and have to be
+    //     materialised. A range that only tracked the top voxel would leave an
+    //     overhang's underside as implicit-solid rock and the recess would
+    //     never be meshed.
+    //
+    // Both are covered by taking the range over the whole band rather than over
+    // the top voxel: 7 voxels below the lowest column's top and 7 above the
+    // highest column's. Outside that the answer is unchanged from v11 (density3.h
+    // section 0: the skip is exact, not approximate), so this is the tight
+    // widening and not a safety margin.
+    //
+    // AND IT IS WIDENED PER COLUMN, NOT PER FOOTPRINT. Applying the 7 voxels
+    // unconditionally is sound and was the first cut, and it is a real cost paid
+    // by ground that can never use it: the range grows by up to 2 bricks on
+    // EVERY footprint, flat ones included, which measured as +38% cells over the
+    // vxc_gpu region set. But D is identically zero on a column whose slope gate
+    // is shut -- `slopeGateQ == 0` returns 0 before anything else is looked at --
+    // so those columns cannot displace their top voxel and cannot hollow the
+    // brick below it. Widening only the columns that pass the gate is therefore
+    // EXACT, not a heuristic, and it makes the whole brick-range cost of this
+    // term proportional to the gate rate instead of unconditional. On real
+    // diffusion tiles that gate opens on ~12% of columns.
     void surfaceBrickRange(const ColumnGrid& grid, int32_t& bzMin, int32_t& bzMax) const {
+        static_assert(kDensity3MaxAbsMm % kVoxelSizeMm == 0,
+                      "the envelope must be a whole number of voxels or this needs rounding");
         int64_t vzMin = INT64_MAX, vzMax = INT64_MIN;
         for (int i = 0; i < B * B; ++i) {
-            // Topmost solid voxel: centre (vz*100+50) <= surfaceMm.
+            // Topmost solid voxel of the UNDISPLACED column: centre <= surfaceMm.
             const int64_t top = floorDiv(grid.cols[i].surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
-            vzMin = top < vzMin ? top : vzMin;
-            vzMax = top > vzMax ? top : vzMax;
+            const int64_t band = density3BandVoxels(grid.cols[i].d3);
+            vzMin = top - band < vzMin ? top - band : vzMin;
+            vzMax = top + band > vzMax ? top + band : vzMax;
         }
         bzMin = static_cast<int32_t>(floorDiv(vzMin, B));
         bzMax = static_cast<int32_t>(floorDiv(vzMax, B));
@@ -150,6 +185,16 @@ public:
     // coarse cell under the representative-sample rule (cell vz solid iff
     // the centre of voxel coarseRep(vz) is at or below the surface).
     // Reduces to surfaceBrickRange at level 0.
+    //
+    // v12: the same +/-7 LEVEL-0 voxel band as surfaceBrickRange, mapped through
+    // the same coarse-cell formula rather than through a separate one. At level
+    // 0 the two expressions are identical by arithmetic (s == 1), which is what
+    // keeps makeCoarseBrick(0, ...) == makeBrick(...) and its pinned test true.
+    // At higher levels the band collapses to a cell or two, which is correct:
+    // the representative-sample rule asks which coarse cell the top LEVEL-0
+    // voxel falls in, so the band has to be widened in level-0 units first and
+    // reduced afterwards -- widening by 7 COARSE cells instead would over-cover
+    // by a factor of 2^L for nothing.
     void coarseSurfaceBrickRange(int32_t level, const ColumnGrid& grid, int32_t& bzMin,
                                  int32_t& bzMax) const {
         const int64_t s = int64_t(1) << level;
@@ -157,9 +202,11 @@ public:
         for (int i = 0; i < B * B; ++i) {
             const int64_t top0 =
                 floorDiv(grid.cols[i].surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
-            const int64_t top = floorDiv(top0 - s / 2, s);
-            vzMin = top < vzMin ? top : vzMin;
-            vzMax = top > vzMax ? top : vzMax;
+            const int64_t band = density3BandVoxels(grid.cols[i].d3);
+            const int64_t lo = floorDiv(top0 - band - s / 2, s);
+            const int64_t hi = floorDiv(top0 + band - s / 2, s);
+            vzMin = lo < vzMin ? lo : vzMin;
+            vzMax = hi > vzMax ? hi : vzMax;
         }
         bzMin = static_cast<int32_t>(floorDiv(vzMin, B));
         bzMax = static_cast<int32_t>(floorDiv(vzMax, B));

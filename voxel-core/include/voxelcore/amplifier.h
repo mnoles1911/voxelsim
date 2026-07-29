@@ -10,6 +10,7 @@
 
 #include "voxelcore/caverns.h"
 #include "voxelcore/caves.h"
+#include "voxelcore/density3.h"
 #include "voxelcore/hash_channel_registry.h" // compile-time HashChannel id uniqueness guard
 #include "voxelcore/tiles.h"
 
@@ -41,6 +42,19 @@ struct ColumnSample {
     // mirror recomputes it inside VoxelizeMain rather than widening
     // GpuColumnSample (docs/cavern-design.md §3.5).
     CavernColumn cavern;
+
+    // Phase 4 bounded 3D density (voxelcore/density3.h), carried here for the
+    // third time and for the third identical reason: stratigraphyAt is a static
+    // function of (ColumnSample, vz), so anything the per-voxel test needs and
+    // cannot derive from vz has to arrive on the sample.
+    //
+    // Unlike `cave` and `cavern`, this one is mostly EMPTY. It is populated only
+    // on columns that pass the ~60% grade slope gate; on the other ~93% every
+    // field is zero, `slopeGateQ == 0`, and the per-voxel query returns exactly
+    // 0 without touching a hash. That is not an approximation -- see density3.h
+    // section 0 for why skipping outside the gates is bit-exact rather than
+    // "close enough".
+    Density3Column d3;
 };
 
 // --- opt-in memo instrumentation (VXC_MEMO_STATS) ---------------------------
@@ -177,19 +191,28 @@ public:
     // height without needing materials.
     int32_t surfaceMm(int64_t vx, int64_t vy) const;
 
-    // A PROVABLE UPPER BOUND on surfaceMm(vx, vy) over every column in the
+    // A PROVABLE UPPER BOUND on the DISPLACED surface over every column in the
     // inclusive voxel-index rectangle [vx0, vx1] x [vy0, vy1] — i.e.
     //
-    //     surfaceUpperBoundMm(...) >= surfaceMm(vx, vy)   for all such columns
+    //     surfaceUpperBoundMm(...) >= surfaceMm(vx, vy) + D(vx, vy, z)
     //
-    // and returns kSurfaceBoundDeclined if it will not bound this footprint.
+    // for all such columns and all z, and returns kSurfaceBoundDeclined if it
+    // will not bound this footprint.
+    //
+    // v12 WIDENED THIS BY kDensity3MaxAbsMm AND REDEFINED IT ONTO THE DISPLACED
+    // SURFACE, deliberately, rather than leaving it a bound on surfaceMm and
+    // asking every caller to add 700 mm. Callers use this as "everything above
+    // here is air", which was the same statement before Phase 4 and is not now;
+    // a bound whose contract silently stopped matching its only use would be a
+    // hole in the world one refactor away. It costs 700 mm of slack against
+    // typical footprint slack of 8.5 m and upward, i.e. under 10%.
     //
     // WHY IT IS THE ONLY QUERY A SKY-BAND TRIM NEEDS. materialAt is
-    // unconditionally MAT_AIR above surfaceMm (stratigraphyAt's `depthMm < 0`
-    // test), and the cave and cavern passes only ever CARVE — no pass in the
-    // amplifier can turn air into solid. So a chunk whose lowest voxel centre
-    // sits above this bound is provably all air, and skipping it can never hide
-    // geometry.
+    // unconditionally MAT_AIR above the displaced surface (stratigraphyAt's
+    // `depthMm < 0` test, now measured from surfaceMm + D), and the cave and
+    // cavern passes only ever CARVE — no pass in the amplifier can turn air into
+    // solid. So a chunk whose lowest voxel centre sits above this bound is
+    // provably all air, and skipping it can never hide geometry.
     //
     // This is a BOUND, not the maximum: it is sound but conservative, and the
     // conservatism is deliberate. It lives here, next to kDetailOctaves and
@@ -204,10 +227,11 @@ public:
     // it never evaluates a single detail octave. Cheaper than ONE column.
     int64_t surfaceUpperBoundMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t vy1) const;
 
-    // A PROVABLE LOWER BOUND on surfaceMm(vx, vy) over the same inclusive
-    // rectangle — the exact mirror of surfaceUpperBoundMm:
+    // A PROVABLE LOWER BOUND on the DISPLACED surface over the same inclusive
+    // rectangle — the exact mirror of surfaceUpperBoundMm, and widened by the
+    // same kDensity3MaxAbsMm for the same reason:
     //
-    //     surfaceLowerBoundMm(...) <= surfaceMm(vx, vy)   for all such columns
+    //     surfaceLowerBoundMm(...) <= surfaceMm(vx, vy) + D(vx, vy, z)
     //
     // and returns kSurfaceLowerBoundDeclined if it will not bound this
     // footprint. Same cost, same corner budget, same decline conditions; it
@@ -237,13 +261,25 @@ public:
     // THE DERIVATION (the static_asserts that pin every constant it uses live
     // in amplifier.cpp, in the same coupling block surfaceUpperBoundMm uses):
     //
-    //   materialAt returns air below the surface for exactly three reasons, and
+    //   materialAt returns air below the surface for exactly four reasons, and
     //   this enumeration is closed — there is no MAT_WATER, and every non-air
     //   material is solid:
     //
-    //   1. Nothing: below every column's own surface, stratigraphyAt is solid
-    //      at every depth (MAT_ROCK, then the unbounded MAT_BEDROCK floor).
-    //      Handled by taking a LOWER bound on the surface over the footprint.
+    //   1. Nothing: below every column's own DISPLACED surface, stratigraphyAt
+    //      is solid at every depth (MAT_ROCK, then the unbounded MAT_BEDROCK
+    //      floor). Handled by taking a LOWER bound on the surface over the
+    //      footprint.
+    //
+    //   1b. THE FOURTH REASON, new at kWorldGenVersion 12: the bounded 3D
+    //      density band (voxelcore/density3.h). stratigraphyAt now tests
+    //      `centre <= surface + D` with |D| <= kDensity3MaxAbsMm, so a voxel up
+    //      to 700 mm BELOW a column's own surfaceMm can be air where it was
+    //      solid before. It needs no term of its own here because
+    //      surfaceLowerBoundMm has already been widened by that constant and is
+    //      therefore a bound on the DISPLACED surface — which is exactly the
+    //      surface reason 1 is stated against. This is the cheapest of the four
+    //      to bound and the only one whose envelope is a single compile-time
+    //      constant with no geometry behind it.
     //
     //   2. caveCarveAt — tunnels, crevices and sinkhole shafts. Every one of
     //      these is bounded in the QUERYING COLUMN'S OWN depth space by
@@ -275,8 +311,10 @@ public:
     int64_t solidBelowBoundMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t vy1) const;
 
     // Material of voxel (vx, vy, vz) given its precomputed column. A voxel is
-    // solid iff its centre (vz*100+50 mm) is at or below the surface, MINUS
-    // whatever the M4 cave pass carves out of it (voxelcore/caves.h). Defined
+    // solid iff its centre (vz*100+50 mm) is at or below the DISPLACED surface
+    // — surfaceMm plus the bounded 3D density band D (voxelcore/density3.h), so
+    // this is the one solidity test in the amplifier that is not a heightfield —
+    // MINUS whatever the M4 cave pass carves out of it (voxelcore/caves.h). Defined
     // to unbounded depth (implicit-solid underground, doctrine §3.1 step 4) —
     // note that underground is no longer UNIFORMLY solid: caves are the one
     // source of air below the surface shell.

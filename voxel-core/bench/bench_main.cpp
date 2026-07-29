@@ -46,6 +46,16 @@ struct BenchResult {
     size_t footprints = 0, bricks = 0, nonEmptyBricks = 0, homogeneousBricks = 0;
     size_t solidVoxels = 0, quads = 0;
     double amplifyMs = 0, voxelizeMs = 0, meshMs = 0;
+    // kWorldGenVersion 12 (voxelcore/density3.h). The 3D density band is the
+    // first per-VOXEL hashing pass in the amplifier, and its cost is entirely
+    // decided by two counts rather than by a wall clock: how many columns open
+    // the slope gate, and how many of the voxels voxelize visits fall inside
+    // those columns' +/-700 mm band. Reported next to the ms figures because
+    // "voxelize got slower" is only actionable with the denominator -- a
+    // per-gated-voxel cost is comparable across machines and regions, and a
+    // total is not. Counted OUTSIDE the timed sections.
+    size_t columns = 0, gatedColumns = 0;
+    size_t voxelsVisited = 0, gatedVoxels = 0;
 };
 
 template <int B>
@@ -76,18 +86,41 @@ BenchResult run(const Options& opt) {
                         amp.column(int64_t(bx) * B + x, int64_t(by) * B + y);
             r.amplifyMs += msSince(tAmp);
 
-            // Surface shell: bricks containing any column's topmost voxel.
+            // Surface shell: bricks containing any column's topmost voxel,
+            // widened per column by the v12 3D density band -- the same rule
+            // GeneratedWorld<B>::surfaceBrickRange applies, restated here only
+            // because this loop works off the aproned `ext` grid rather than a
+            // ColumnGrid. If the two ever disagree, this benchmark stops
+            // measuring the workload the streaming path actually has.
             int64_t vzMin = INT64_MAX, vzMax = INT64_MIN;
             for (int y = 0; y < B; ++y)
                 for (int x = 0; x < B; ++x) {
                     const ColumnSample& c = ext[(x + 1) + (B + 2) * (y + 1)];
                     const int64_t top =
                         floorDiv(c.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
-                    vzMin = top < vzMin ? top : vzMin;
-                    vzMax = top > vzMax ? top : vzMax;
+                    const int64_t band = density3BandVoxels(c.d3);
+                    vzMin = top - band < vzMin ? top - band : vzMin;
+                    vzMax = top + band > vzMax ? top + band : vzMax;
                 }
             const int32_t bzMin = static_cast<int32_t>(floorDiv(vzMin, B));
             const int32_t bzMax = static_cast<int32_t>(floorDiv(vzMax, B));
+
+            // Density-band census for this footprint (untimed; see BenchResult).
+            for (int y = 0; y < B; ++y)
+                for (int x = 0; x < B; ++x) {
+                    const ColumnSample& c = ext[(x + 1) + (B + 2) * (y + 1)];
+                    ++r.columns;
+                    r.voxelsVisited += size_t(bzMax - bzMin + 1) * B;
+                    if (c.d3.slopeGateQ == 0) continue;
+                    ++r.gatedColumns;
+                    for (int32_t bz = bzMin; bz <= bzMax; ++bz)
+                        for (int z = 0; z < B; ++z) {
+                            const int64_t centre =
+                                (int64_t(bz) * B + z) * kVoxelSizeMm + kVoxelSizeMm / 2;
+                            if (density3ColumnCanDisplace(c.d3, centre, c.surfaceMm))
+                                ++r.gatedVoxels;
+                        }
+                }
 
             for (int32_t bz = bzMin; bz <= bzMax; ++bz) {
                 ++r.bricks;
@@ -140,6 +173,19 @@ void report(const char* label, const BenchResult& r) {
         std::printf("throughput: %.0f bricks/s, %.0f Mvoxel/s (solid)\n",
                     r.bricks / totalMs * 1000.0, r.solidVoxels / totalMs / 1000.0);
     std::printf("digest %016llx\n", static_cast<unsigned long long>(r.digest));
+    // The 3D density band's denominators. `voxelize ns/gated voxel` is the
+    // number to compare against voxelcore/density3.h's cost note; the whole-pass
+    // ns/voxel next to it is what actually decides whether the term is
+    // affordable, and the two differ by the gated fraction.
+    if (r.columns > 0 && r.voxelsVisited > 0)
+        std::printf("density3: slope gate open on %zu/%zu columns (%.2f%%); %zu/%zu visited "
+                    "voxels inside an open band (%.2f%%); voxelize %.2f ns/voxel, %.1f "
+                    "ns/gated voxel\n",
+                    r.gatedColumns, r.columns,
+                    100.0 * double(r.gatedColumns) / double(r.columns), r.gatedVoxels,
+                    r.voxelsVisited, 100.0 * double(r.gatedVoxels) / double(r.voxelsVisited),
+                    r.voxelizeMs * 1e6 / double(r.voxelsVisited),
+                    r.gatedVoxels ? r.voxelizeMs * 1e6 / double(r.gatedVoxels) : 0.0);
 #ifdef VXC_MEMO_STATS
     // COUNTS, not clocks. These are deterministic and unaffected by anything
     // else running on the machine, which the ms figures above emphatically are

@@ -258,10 +258,25 @@ constexpr int64_t beddingPeakFracQ10At(uint64_t seed, int64_t bedIdx) {
 // (5,000,000 km) so that perpRaw and dipQ10*perpRaw stay inside int64 with
 // wide margin -- see the overflow arithmetic in the comment block above
 // kBeddingMaxAbsMm below. test_detail_bedding.cpp fuzzes up to +/-2e9 mm.
-constexpr int64_t beddingRawAt(uint64_t seed, int64_t xMm, int64_t yMm, int64_t zMm) {
-    const uint32_t strikeIdx = beddingStrikeIndexAt(seed, xMm, yMm);
-    const int64_t dipQ10 = beddingDipQ10At(seed, xMm, yMm);
-    const int64_t thicknessMm = beddingThicknessMmAt(seed, xMm, yMm);
+// beddingRawAt's body, with the structural-domain hash SUPPLIED rather than
+// recomputed. The three accessors above each call beddingDomainHash, so
+// beddingRawAt paid for one hash three times -- and that hash is a function of
+// the 819.2 m domain cell alone, i.e. constant over a whole column and over
+// 819.2 m of ground either side of it. A caller evaluating a column's worth of
+// z samples (Phase 4's density3.h band) hoists it out and calls this.
+//
+// This is a HOIST, not a variant: beddingRawAt below is literally this function
+// applied to beddingDomainHash(seed, xMm, yMm), so the two cannot produce
+// different numbers. hash2 is pure, so the hoist is value-identical and moves no
+// worldgen output. worldgen.ush's mirror has always been written this way (one
+// `dh`), so this also removes a shape difference between the two.
+constexpr int64_t beddingRawFromDomain(uint64_t seed, uint64_t domainHash, int64_t xMm,
+                                       int64_t yMm, int64_t zMm) {
+    const uint32_t strikeIdx = static_cast<uint32_t>(domainHash >> 60) & 0xFu;
+    const int64_t dipQ10 =
+        beddingHashField16(domainHash, 32, -kBeddingDipMaxQ10, kBeddingDipMaxQ10);
+    const int64_t thicknessMm =
+        beddingHashField16(domainHash, 16, kBeddingThicknessMinMm, kBeddingThicknessMaxMm);
 
     const BeddingDirection strike = kBeddingStrikeTable[strikeIdx];
     const BeddingDirection dipDir{-strike.dy, strike.dx}; // exact 90-degree rotation
@@ -308,6 +323,10 @@ constexpr int64_t beddingRawAt(uint64_t seed, int64_t xMm, int64_t yMm, int64_t 
 
     const int64_t hardness = beddingHardnessAt(seed, bedIdx);
     return shapeQ10 * hardness;
+}
+
+constexpr int64_t beddingRawAt(uint64_t seed, int64_t xMm, int64_t yMm, int64_t zMm) {
+    return beddingRawFromDomain(seed, beddingDomainHash(seed, xMm, yMm), xMm, yMm, zMm);
 }
 
 // =============================================================================
@@ -401,6 +420,16 @@ constexpr int64_t beddingMm(uint64_t seed, int64_t xMm, int64_t yMm, int64_t sur
 // test). |result| <= kBedding3MaxAbsMm, proved above.
 constexpr int64_t beddingDisplacement3Mm(uint64_t seed, int64_t xMm, int64_t yMm, int64_t zMm) {
     return floorDiv(kBedding3AmpMm * beddingRawAt(seed, xMm, yMm, zMm), kBeddingRawScale);
+}
+
+// The same displacement with the structural-domain hash hoisted out -- see
+// beddingRawFromDomain. Identical value to beddingDisplacement3Mm when
+// `domainHash == beddingDomainHash(seed, xMm, yMm)`, which is the only way any
+// caller is allowed to produce it.
+constexpr int64_t beddingDisplacement3FromDomain(uint64_t seed, uint64_t domainHash, int64_t xMm,
+                                                 int64_t yMm, int64_t zMm) {
+    return floorDiv(kBedding3AmpMm * beddingRawFromDomain(seed, domainHash, xMm, yMm, zMm),
+                    kBeddingRawScale);
 }
 
 } // namespace vxc

@@ -310,6 +310,14 @@ int main(int argc, char** argv) {
     int64_t liveMat[kMaterialCount] = {0};
     int64_t zeroTopsoil = 0, thinTopsoil = 0, landColumns = 0, gateMismatch = 0;
     int64_t subseaAlpine = 0, subseaColumns = 0, surfaceMatTop = 0;
+    // kWorldGenVersion 12: the 3D density band's own census (voxelcore/
+    // density3.h). This tool is the only one in the tree that walks a whole
+    // REAL tile set column by column, which makes it the only place the band's
+    // gate rate can be measured on the terrain that actually ships -- and the
+    // gate rate is the entire cost model. density3.h's own estimate was taken
+    // on SyntheticTileSampler, whose slope distribution is nothing like a
+    // diffusion tile's, and it is the number its cost note says to distrust.
+    int64_t d3SlopeOpen = 0, d3BothOpen = 0, d3Overhung = 0, d3OverhungSpanMm = 0;
 
     for (int64_t j = 0; j < nAxis; ++j) {
         const int64_t py = py0 + (py1 - py0) * j / (nAxis - 1);
@@ -370,6 +378,28 @@ int main(int argc, char** argv) {
             stratMat[ms]++;
             liveMat[ml]++;
             if (isSurfaceMaterial(ms)) ++surfaceMatTop;
+
+            // 3D density band census. Walked BOTTOM-UP over the +/-700 mm band:
+            // its floor is unconditionally solid and its ceiling unconditionally
+            // air, so "air then solid" going up is an overhang and the reverse
+            // is just the ground.
+            if (col.d3.slopeGateQ != 0) {
+                ++d3SlopeOpen;
+                if (col.d3.rockGateQ != 0) ++d3BothOpen;
+                const int64_t band = kDensity3MaxAbsMm / kVoxelSizeMm;
+                bool sawAir = false;
+                int64_t span = 0;
+                for (int64_t vz = topVz - band; vz <= topVz + band; ++vz) {
+                    if (Amplifier::stratigraphyAt(col, vz) == MAT_AIR)
+                        sawAir = true;
+                    else if (sawAir)
+                        span += kVoxelSizeMm;
+                }
+                if (span > 0) {
+                    ++d3Overhung;
+                    d3OverhungSpanMm += span;
+                }
+            }
         }
     }
 
@@ -389,6 +419,18 @@ int main(int argc, char** argv) {
                     (long long)kBiomeCliffSlopeMmPerM, (long long)pctl(s, 50),
                     kBiomeCliffSlopeMmPerM < pctl(s, 50) ? "BELOW" : "above");
     }
+
+    std::printf("\n=== 3D DENSITY BAND (kWorldGenVersion 12, voxelcore/density3.h) ===\n");
+    std::printf("  slope gate open      %10lld  %6.2f%%   (>%lld mm/m; this rate IS the cost)\n",
+                (long long)d3SlopeOpen, pct(d3SlopeOpen, total),
+                (long long)kDensity3SlopeStartMmPerM);
+    std::printf("  slope AND rock gate  %10lld  %6.2f%%\n", (long long)d3BothOpen,
+                pct(d3BothOpen, total));
+    std::printf("  overhung columns     %10lld  %6.2f%% of all, %6.2f%% of gated; mean span "
+                "%lld mm\n",
+                (long long)d3Overhung, pct(d3Overhung, total),
+                d3SlopeOpen ? 100.0 * double(d3Overhung) / double(d3SlopeOpen) : 0.0,
+                (long long)(d3Overhung ? d3OverhungSpanMm / d3Overhung : 0));
 
     std::printf("\n=== BIOME CENSUS ===\n");
     for (int b = 0; b < kBiomeCount; ++b)
