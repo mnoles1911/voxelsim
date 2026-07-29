@@ -60,6 +60,13 @@ struct FVoxelSweProbe
 	int32 LastPunctured = 0;  // columns the last coupler step found punctured (bed no longer solid)
 	int64 TransferredToCA = 0;   // coupler ledger, cumulative fill units SWE -> CA
 	int64 TransferredToSWE = 0;  // coupler ledger, cumulative fill units CA -> SWE
+	// Beds re-seated after a terrain edit took the ground out from under a sheet
+	// column, and how many such columns are still waiting for swe.h S5(a) to
+	// finish metering them out. Both are diagnostics for the breach fixture:
+	// a carve inside the sheet that moves NEITHER of these is a carve the sheet
+	// has not noticed, which is the failure mode that produced punctured=0.
+	int64 BedsReseated = 0;
+	int32 PendingBedReseats = 0;
 	int64 OriginVx = 0, OriginVy = 0; // sheet's inclusive voxel-column origin
 	int32 SizeX = 0, SizeY = 0;       // sheet extent in columns
 	int32 SheetScanVoxels = 0;        // SweCoupleConfig::sheetScanVoxels

@@ -415,6 +415,21 @@ struct FVoxelWaterImpl
 	// to the 0.364 ms/tick the sheet step itself costs.
 	std::vector<int32_t> SweLastDepth;
 
+	// Sheet COLUMN INDICES (cx + sizeX*cy, the coupler's own scan order) whose
+	// seated bed a terrain edit has invalidated, waiting to be re-seated by
+	// ReseatEditedSweBeds in the coupled window. See that function for why the
+	// queue exists at all; see NotifyTerrainRegionEdited for who fills it.
+	//
+	// A SET, drained in sorted index order, so the pass is deterministic
+	// regardless of the order edits arrive in. Bounded by the sheet itself
+	// (16,384 entries), because an index can only be present once and a column
+	// leaves the queue for good the first tick it is CA-owned.
+	//
+	// Indices are meaningful only against the grid origin they were computed
+	// from, so MaybeArmSwe clears this on every arm and disarm.
+	TSet<int32> SwePendingBedReseat;
+	int64 SweBedsReseated = 0;
+
 	// One-shot latches so a refused arm request (wrong net mode, nothing to
 	// centre on) says so once rather than once per frame for the whole session.
 	bool bSweRefusalLogged = false;
@@ -2595,6 +2610,123 @@ int32 SeatSweBedZ(const vxc::WaterCA::SolidFn& Solid, int64 Vx, int64 Vy, int64 
 	return int32(TopZ - (kSweBedScanVoxels + kSweBedScanAboveVoxels));
 }
 
+// Re-seats the bed of every sheet column a terrain edit has left resting on a
+// voxel that is no longer there. Returns how many beds moved this call.
+//
+// THE OTHER HALF OF swe.h S5(a)'s CONTRACT, and the bug this exists to fix.
+//
+// The sheet's beds are seated exactly ONCE, by MaybeArmSwe, and swe.h S5(a)
+// deliberately never moves one: "The bed is deliberately NOT re-seated downward
+// to follow the hole. Doing so was the first design and it is WRONG: it would
+// move the ownership boundary down over voxels the CA is at that moment
+// carrying water through." That is correct, and it is correct about the case it
+// is written for -- a hole dug in the FLOOR of an SWE lake, where the column
+// still holds sheet depth and the metered inrush is the whole design.
+//
+// It is silent about what happens AFTERWARDS, and nothing enforced the rest.
+// Once S5(a) has metered the column out and demoteDwellTicks has elapsed, the
+// column is CA-owned with a bed pointing at air -- and SweCaCoupler::eligible()
+// tests solidAt(bed) FIRST. So it can never promote again, for the rest of the
+// session, no matter what the ground under it actually looks like. Every
+// CA-owned column is also an INACTIVE HARD WALL in the sheet numerics
+// (swe.h setColumnActive), so what a carve leaves behind is not a gap in the
+// sheet: it is a permanent wall exactly where the ground was removed.
+//
+// MEASURED, on 2026-07-29, by -VoxelSweBreachTest=25 -VoxelSweBreachSwe=1: a
+// notch cut through a full basin's rim, from three voxels below the waterline
+// up past the rim, produced punctured=0, basinDrawdown=0, frontArrived=0 and
+// ca=8 -- a breach that did nothing at all, with every conservation check
+// green, because the ~50 columns the carve touched were from that moment
+// structurally incapable of ever being punctured, promoted, or flowed through.
+// The fixture's own post-breach line calls those stale beds CORRECT, citing
+// S5(a). Reproduced in voxel-core at the fixture's exact geometry, and pinned
+// by swe_coupler_a_carved_bed_is_lost_to_the_sheet_until_the_caller_reseats_it.
+//
+// THE RULE, and why this shape:
+//
+//   * ONLY CA-OWNED COLUMNS ARE RE-SEATED. A column the sheet still owns is
+//     either being metered into the CA by S5(a) right now or is inside its
+//     demote dwell, and S5(a)'s objection applies to it in full. Deferring is
+//     free: eligible() rejects a dead bed, so a punctured column can only ever
+//     demote, never re-promote, and it is therefore guaranteed to reach this
+//     pass -- at most demoteDwellTicks later. This ordering is why the metered
+//     inrush is completely unchanged by this fix.
+//   * MOVING THE BED OF A CA-OWNED COLUMN TRANSFERS NOTHING. The column holds
+//     no sheet depth (demote is all-or-nothing) and is walled out of the sheet,
+//     so this pass cannot strand a fill unit, cannot put a cell in two domains,
+//     and cannot move the ADR-0004 ledger. It is run INSIDE the coupled window
+//     anyway, so if that ever stops being true the per-tick invariant says so
+//     on the very next line instead of a lake going quietly shallow.
+//   * THE COUPLER'S OWN HYSTERESIS TAKES IT FROM THERE. A re-seated column
+//     promotes promoteDwellTicks (8 ticks = 0.8 s) later if it is eligible at
+//     its NEW bed, absorbing whatever CA fill is sitting over it through the
+//     ordinary ledgered channel -- exactly the self-healing FlushSweIntoCA
+//     already relies on after a save.
+//
+// WHAT THIS DOES NOT FIX, stated here because the fixture will still say so:
+// re-seating lets a breached column rejoin the sheet, but it does not by itself
+// empty a basin. swe.h S5 has no SWE->CA channel at a LATERAL boundary -- an
+// SWE-owned pool cannot spill into a CA-owned neighbour however much lower that
+// neighbour's bed is -- and the floor of a breach notch is a narrow channel,
+// which S5's minOpenNeighbours excludes from the sheet on purpose. Closing that
+// needs a fourth exchange channel in swe.h S5, which is a kSweVersion bump and
+// a re-pin of the SWE golden, and it is NOT done here. See the commit message.
+int32 ReseatEditedSweBeds(FVoxelWaterImpl& Impl)
+{
+	if (!Impl.SweSheet || !Impl.SweCoupler || Impl.SwePendingBedReseat.Num() == 0)
+	{
+		return 0;
+	}
+
+	vxc::SweGrid& Grid = *Impl.SweSheet;
+	// THE SAME wrapped callback the arm path seated with and the coupler tests
+	// against, for the reason SeatSweBedZ's comment gives: a bed seated through
+	// the bare terrain query would sit under water the implicit field still owns.
+	const vxc::WaterCA::SolidFn Solid = Impl.Mob.makeSolidFn();
+	const int32 SizeX = Grid.sizeX();
+
+	TArray<int32> Pending = Impl.SwePendingBedReseat.Array();
+	Pending.Sort();
+	Impl.SwePendingBedReseat.Reset();
+
+	int32 Reseated = 0;
+	for (const int32 ColumnIndex : Pending)
+	{
+		const int64 Vx = Grid.originVx() + int64(ColumnIndex % SizeX);
+		const int64 Vy = Grid.originVy() + int64(ColumnIndex / SizeX);
+
+		if (Solid(Vx, Vy, Grid.bedAt(Vx, Vy)) != vxc::MAT_AIR)
+		{
+			continue; // the bed is real (re-filled, or never went): nothing owed
+		}
+		if (Impl.SweCoupler->isSweColumn(Vx, Vy))
+		{
+			// swe.h S5(a) is metering this column right now. Requeue; it is
+			// guaranteed to be CA-owned within demoteDwellTicks.
+			Impl.SwePendingBedReseat.Add(ColumnIndex);
+			continue;
+		}
+
+		const double SurfaceZUU = Impl.Terrain.GetSurfaceHeightUU(double(Vx) * VoxelCoords::VoxelSizeUU,
+		                                                          double(Vy) * VoxelCoords::VoxelSizeUU);
+		const int64 SurfaceVz = int64(FMath::FloorToDouble(SurfaceZUU / VoxelCoords::VoxelSizeUU));
+		bool bFound = false;
+		// bFound == false is handled exactly as the arm loop handles it: the
+		// column keeps a non-solid bed, fails eligibility forever, and stays
+		// CA-owned. "Less sheet", never "wrong sheet".
+		const int32 NewBed = SeatSweBedZ(Solid, Vx, Vy, SurfaceVz, bFound);
+		if (NewBed == Grid.bedAt(Vx, Vy))
+		{
+			continue;
+		}
+		Grid.setBed(Vx, Vy, NewBed);
+		++Reseated;
+	}
+
+	Impl.SweBedsReseated += Reseated;
+	return Reseated;
+}
+
 // Flushes every SWE-owned column's sheet depth back into the CA through the
 // coupler's ledgered demotion channel, leaving the grid empty and every column
 // CA-owned.
@@ -2771,6 +2903,9 @@ void MaybeArmSwe(FVoxelWaterImpl& Impl, UWorld* World)
 			FlushSweIntoCA(Impl, TEXT("voxel.Water.SWE 0"));
 			Impl.SweCoupler.reset();
 			Impl.SweSheet.reset();
+			// Queued column indices only mean anything against the grid origin
+			// they were computed from, and that grid is gone.
+			Impl.SwePendingBedReseat.Empty();
 			UE_LOG(LogVoxelWater, Log, TEXT("voxel.Water.SWE 0: shallow-water sheet disarmed; water is pure WaterCA again."));
 		}
 		return;
@@ -2859,6 +2994,10 @@ void MaybeArmSwe(FVoxelWaterImpl& Impl, UWorld* World)
 	const int64 OriginVx = AnchorVx - kSweSheetColumns / 2;
 	const int64 OriginVy = AnchorVy - kSweSheetColumns / 2;
 	Impl.SweSheet = std::make_unique<vxc::SweGrid>(OriginVx, OriginVy, kSweSheetColumns, kSweSheetColumns, SheetCfg);
+	// A fresh grid means a fresh origin, so any column index left over from a
+	// previous arming would now name a different column (see the member's
+	// comment). The beds below are seated against the live world anyway.
+	Impl.SwePendingBedReseat.Empty();
 
 	// The wrapped solidity callback, built ONCE and shared by the bed seating
 	// below and by the coupler itself, so the two can never disagree about what
@@ -3312,6 +3451,14 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 		// about THIS tick's three calls and nothing else.
 		Impl.SweInjected += Before - Impl.SweLastCoupledTotal;
 
+		// INSIDE the window, and first: a column whose ground a terrain edit
+		// removed has to get its bed back before the coupler decides ownership
+		// against it, or the edit costs the sheet that column permanently (see
+		// ReseatEditedSweBeds). It moves no water, which is precisely why it is
+		// safe to run here -- and running it here is what makes the invariant
+		// below prove that, every tick, instead of taking it on trust.
+		ReseatEditedSweBeds(Impl);
+
 		Impl.SweCoupler->step();
 		Impl.SweSheet->step();
 
@@ -3376,11 +3523,12 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 				Impl.SweSheet->originVy() + Impl.SweSheet->sizeY() / 2);
 			UE_LOG(LogVoxelWater, Log,
 			       TEXT("SwePerf: sweColumns=%d sheetVolume=%lld caVolume=%llu punctured=%d toCA=%lld toSWE=%lld ")
-			       TEXT("centreVel=(%d,%d) mm/s conservationFailures=%lld (sheet volume IS drawn -- ADR-0004 ")
-			       TEXT("'Renderer' union is wired; see UnionSweFill)"),
+			       TEXT("bedsReseated=%lld pendingReseats=%d centreVel=(%d,%d) mm/s conservationFailures=%lld ")
+			       TEXT("(sheet volume IS drawn -- ADR-0004 'Renderer' union is wired; see UnionSweFill)"),
 			       Impl.SweCoupler->sweColumnCount(), (long long)Impl.SweSheet->totalVolume(),
 			       (unsigned long long)Impl.CA.totalVolume(), Impl.SweCoupler->lastPuncturedCount(),
 			       (long long)Impl.SweCoupler->transferredToCA(), (long long)Impl.SweCoupler->transferredToSWE(),
+			       (long long)Impl.SweBedsReseated, Impl.SwePendingBedReseat.Num(),
 			       V.xMmPerSec, V.yMmPerSec, (long long)Impl.SweConservationFailures);
 		}
 	}
@@ -3774,6 +3922,37 @@ void UVoxelWaterSubsystem::NotifyTerrainRegionEdited(const VoxelCoords::FVoxelCo
 	Impl->CA.invalidateSolidRegion(MinVoxelIncl.X, MinVoxelIncl.Y, MinVoxelIncl.Z, MaxVoxelIncl.X, MaxVoxelIncl.Y,
 	                               MaxVoxelIncl.Z);
 
+	// W4 (ADR-0004): the CA's memo is not the only thing an edit invalidates.
+	// The sheet's beds were seated once, when the cvar armed, and swe.h S5(a)
+	// deliberately never moves one -- so an edit that takes the ground out from
+	// under a sheet column leaves it resting on air, which eligible() rejects
+	// forever. Queue the columns in this edit's own footprint whose bed has
+	// actually gone; ReseatEditedSweBeds drains the queue inside the coupled
+	// window, and its comment carries the whole argument. Costs one solidity
+	// query per edited column, on the edit, and nothing at all when the sheet is
+	// not armed -- which is every run that has not set voxel.Water.SWE.
+	if (Impl->SweSheet && Impl->SweCoupler)
+	{
+		const vxc::SweGrid& Grid = *Impl->SweSheet;
+		const vxc::WaterCA::SolidFn Solid = Impl->Mob.makeSolidFn();
+		const int64 X0 = FMath::Max<int64>(MinVoxelIncl.X, Grid.originVx());
+		const int64 X1 = FMath::Min<int64>(MaxVoxelIncl.X, Grid.originVx() + Grid.sizeX() - 1);
+		const int64 Y0 = FMath::Max<int64>(MinVoxelIncl.Y, Grid.originVy());
+		const int64 Y1 = FMath::Min<int64>(MaxVoxelIncl.Y, Grid.originVy() + Grid.sizeY() - 1);
+		for (int64 Vy = Y0; Vy <= Y1; ++Vy)
+		{
+			for (int64 Vx = X0; Vx <= X1; ++Vx)
+			{
+				if (Solid(Vx, Vy, Grid.bedAt(Vx, Vy)) != vxc::MAT_AIR)
+				{
+					continue;
+				}
+				Impl->SwePendingBedReseat.Add(
+					int32((Vx - Grid.originVx()) + int64(Grid.sizeX()) * (Vy - Grid.originVy())));
+			}
+		}
+	}
+
 	// ...and then actually WAKE the water this edit can affect. The memo
 	// invalidation above only fixes what the CA believes about terrain; without
 	// this call a settled body never ticks again and simply ignores the edit
@@ -3902,6 +4081,8 @@ bool UVoxelWaterSubsystem::GetSweProbe(FVoxelSweProbe& Out) const
 	Out.LastPunctured = Impl->SweCoupler->lastPuncturedCount();
 	Out.TransferredToCA = Impl->SweCoupler->transferredToCA();
 	Out.TransferredToSWE = Impl->SweCoupler->transferredToSWE();
+	Out.BedsReseated = Impl->SweBedsReseated;
+	Out.PendingBedReseats = Impl->SwePendingBedReseat.Num();
 	Out.OriginVx = Grid.originVx();
 	Out.OriginVy = Grid.originVy();
 	Out.SizeX = Grid.sizeX();

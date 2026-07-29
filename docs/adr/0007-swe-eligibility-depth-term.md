@@ -114,12 +114,53 @@ mode is why the tuning was not simply applied when it was asked for.
   is the wrong axis. It would also disqualify genuinely deep water under a low
   ceiling, which is exactly the confined-flow case the coupler handles well.
 
+## Prerequisite run, 2026-07-29 — result: step 2 passed, step 3 is BLOCKED
+
+`-VoxelSweBreachTest=25 -VoxelSweBreachSwe=1` was run. Recording it here
+because this ADR is explicitly gated on it.
+
+- **Step 2 passed.** `pre-breach: columns=16384 seated=16384 sweOwned=12193
+  mismatched=0 sweOwnedMismatched=0 maxAbsDelta=0`. Hypothesis (b), mis-seated
+  beds, is **refuted**: every bed agreed with the live terrain before anything
+  was dug. The film is not a seating defect.
+- **Step 3 could not be reached.** The breach carved real terrain (up to 14
+  voxels removed across ~50 columns) and *nothing happened*: `punctured=0`,
+  no basin drawdown, no downstream front, `ca=8`. The fixture printed
+  `TUNING: WITHHELD`.
+
+The cause was a separate bug, now fixed engine-side (see
+`UVoxelWaterSubsystem::ReseatEditedSweBeds` and
+`swe_coupler_a_carved_bed_is_lost_to_the_sheet_until_the_caller_reseats_it`):
+the sheet's beds were seated once at arm time and never re-seated, so every
+column the carve touched was left resting on air, which `eligible()` rejects
+forever — a permanent hard wall exactly where the ground was removed.
+
+**That fix is necessary but not sufficient, and this ADR stays blocked.**
+Re-seating lets a breached column rejoin the sheet; it does not empty a basin.
+`swe.h` §5 has no SWE→CA channel at a **lateral** boundary — an SWE-owned pool
+cannot spill into a CA-owned neighbour however much lower that neighbour's bed
+is — and the floor of a breach notch is a narrow channel, which §5's
+`minOpenNeighbours` excludes from the sheet on purpose. Reproduced in
+voxel-core at this fixture's geometry: a notch cut three voxels below the
+waterline drains **0.5% of the pool over 200 ticks**, with or without the
+re-seat. Until an SWE-owned body can lose water through a breach, the fixture
+cannot show directed momentum, and the depth term cannot be sized against it.
+
+Closing that gap is a **fourth exchange channel in §5**, i.e. `kSweVersion`
+1 → 2 and a re-pin of the SWE golden `0x61523E585CF7B782` — the same costs this
+ADR already lists, which is an argument for deciding both together rather than
+paying them twice.
+
 ## Decision
 
 **Pending Matt's sign-off.** Nothing implemented. Recommended sequence:
 
 1. Run `-VoxelSweBreachTest=25` with `-VoxelSweBreachSwe=1` and `0`.
+   — done 2026-07-29, see above.
 2. If `sweOwnedMismatched > 0` — stop, fix bed seating, and discard this ADR.
+   — passed; beds are clean.
 3. If the beds are clean and the surge is directed, implement the depth term,
    size the threshold against the fixture, re-pin the SWE golden, bump
    `kSweVersion`.
+   — **blocked**: there is no surge to read yet. Decide the lateral spill
+   channel first, or together with this.
