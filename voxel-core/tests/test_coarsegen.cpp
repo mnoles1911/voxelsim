@@ -188,7 +188,7 @@ VXC_TEST(coarsegen_golden_digest) {
     // coarsegen_surface_range_formula, coarsegen_fidelity_vs_true_mip) all
     // still pass, and the fidelity mismatch ceilings were not relaxed.
     // (was 0x85B3E79EF8D01AFC at v5)
-    CHECK_EQ(d, 0x439BC6D07FCE5D3Aull);
+    CHECK_EQ(d, 0x743BC64E0FFC1C03ull);
 }
 
 VXC_TEST(coarsegen_seed_sensitivity) {

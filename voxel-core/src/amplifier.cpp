@@ -760,15 +760,25 @@ static_assert(microScaleQ10(0) >= 768,
 // compile-time envelope proved in its own header. Written in the same order and
 // the same integer form as evalSurface computes it, so the bound tracks the code
 // rather than paraphrasing it.
+// The microrelief band's half-excursion gate ceiling, DERIVED from the shaping
+// band's rather than written down, so the two cannot drift apart. evalSurface
+// computes `1024 + (cScale - 1024) / 2`, which is maximised at cScale's own
+// maximum; the truncating divide only ever lowers it, so this is an upper bound
+// at every input.
+constexpr int64_t kCurvatureScaleMicroMaxQ10 =
+    1024 + (kCurvatureScaleMaxQ10 - 1024) / 2;
+static_assert(kCurvatureScaleMicroMaxQ10 == 1408, "micro curvature ceiling moved");
+
 constexpr int64_t detailAllowanceMm(int64_t landformMax, int64_t microMax) {
     return landformMax * kSlopeScaleMaxQ10 / 1024 * kCurvatureScaleMaxQ10 / 1024 +
-           microMax * kMicroScaleMaxQ10 / 1024 + kRillMaxAbsMm + kBeddingMaxAbsMm;
+           microMax * kMicroScaleMaxQ10 / 1024 * kCurvatureScaleMicroMaxQ10 / 1024 +
+           kRillMaxAbsMm + kBeddingMaxAbsMm;
 }
 constexpr int64_t kDetailMaxAtMaxSlopeMm = detailAllowanceMm(kLandformMaxMm, kMicroMaxMm);
 constexpr int64_t kFineDetailMaxAtMaxSlopeMm =
     detailAllowanceMm(kFineLandformMaxMm, kFineMicroMaxMm);
-static_assert(kDetailMaxAtMaxSlopeMm == 27439, "detail allowance moved");
-static_assert(kFineDetailMaxAtMaxSlopeMm == 7846, "fine-tier detail allowance moved");
+static_assert(kDetailMaxAtMaxSlopeMm == 27788, "detail allowance moved");
+static_assert(kFineDetailMaxAtMaxSlopeMm == 8195, "fine-tier detail allowance moved");
 // The plan's claim was that the net detail envelope drops from ~15.7 m to ~3.0 m
 // on a fine world and that the bound therefore TIGHTENS. It does tighten, by
 // 3.8x -- but not to 3.0 m, because the allowance is the worst case at MAXIMUM
@@ -1012,8 +1022,14 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     // reason microScaleQ10 has a floor: decimetre roughness is a property of the
     // material, not of the local geometry. A hollow collects colluvium and its
     // METRE-scale shape smooths; its clods and stones do not disappear.
-    const int64_t curveQ10 = carrierCurvatureMmPerM2Q10(
-        evalCarrierCurvature(cachedStencil(id_, *tiles_, px, py), fx, fy, pxMm), pxMm);
+    // Normalised to the 30 m reference tier before gating -- see the derivation
+    // above kCurvatureKneeQ10. Without this the gate is a no-op at 30 m and
+    // hard-clipped at 1.875 m, which is not two settings of one gate, it is two
+    // different failures.
+    const int64_t curveQ10 = carrierCurvatureTierNormQ10(
+        carrierCurvatureMmPerM2Q10(
+            evalCarrierCurvature(cachedStencil(id_, *tiles_, px, py), fx, fy, pxMm), pxMm),
+        pxMm);
     const int64_t cScale = curvatureScaleQ10(curveQ10);
 
     const bool fine = isFineTier(pxMm);
@@ -1043,8 +1059,32 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
         else
             microMm += term;
     }
-    int64_t detailMm =
-        landformMm * sScale / 1024 * cScale / 1024 + microMm * mScale / 1024;
+    // The microrelief band takes HALF the curvature gate's excursion.
+    //
+    // The first cut gated only the shaping band, and the probe reported a
+    // convex/concave detail ratio of 0.99 at every lag from 0.1 m to 1.6 m --
+    // apparently no effect. The gate was in fact working perfectly; the METRIC
+    // could not see it. The shaping band is 25.6 m and 6.4 m octaves, whose
+    // second difference over a 0.1 m lag is ~1e-5 of their amplitude, so
+    // everything the probe measures at those lags is microrelief. This is the
+    // same trap recorded at the top of this file for the v8 gain step, which
+    // also hid inside a band the estimator was not looking at.
+    //
+    // Fixing the metric alone would have been the wrong answer, because the
+    // plan's intent -- ground that reads as SHAPED rather than TEXTURED -- is
+    // about what the eye sees underfoot, which is exactly the metre-and-below
+    // band. So the gate has to reach it.
+    //
+    // HALF, not all, and for a physical reason rather than as a hedge: a hollow
+    // genuinely does smooth at decimetre scale, because it collects colluvium
+    // and fine sediment, but the material's own texture -- clods, stones -- does
+    // not disappear with the local geometry the way metre-scale shape does. Half
+    // the excursion keeps the [0.75, 1.375] range comfortably above the floor
+    // that microScaleQ10 exists to defend, so hollows cannot go quiet enough to
+    // bring back the terrace runs that floor was added to break up.
+    const int64_t cScaleMicro = 1024 + (cScale - 1024) / 2;
+    int64_t detailMm = landformMm * sScale / 1024 * cScale / 1024 +
+                       microMm * mScale / 1024 * cScaleMicro / 1024;
 
     // Two ADDITIVE structured terms, each with its own gate and its own proved
     // envelope. They are added after the band scaling rather than folded into a
@@ -1273,7 +1313,8 @@ bool Amplifier::surfaceBoundsMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t v
     const int64_t micrAbs = fineTier ? kFineMicroAbsMaxMm : kMicroAbsMaxMm;
     const int64_t maxDetailMm =
         landMax * slopeQ10 / 1024 * kCurvatureScaleMaxQ10 / 1024 +
-        micrMax * microQ10 / 1024 + kRillMaxAbsMm + kBeddingMaxAbsMm;
+        micrMax * microQ10 / 1024 * kCurvatureScaleMicroMaxQ10 / 1024 +
+        kRillMaxAbsMm + kBeddingMaxAbsMm;
     // The negative side uses the symmetric envelope (coupling (7)), and takes
     // one further millimetre PER BAND for the truncation in each q10 divide,
     // which rounds toward zero and so would otherwise shave the magnitude.
@@ -1287,7 +1328,8 @@ bool Amplifier::surfaceBoundsMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t v
     // -- once per q10 divide, and it has two of them.
     const int64_t minDetailMm =
         landAbs * slopeQ10 / 1024 * kCurvatureScaleMaxQ10 / 1024 +
-        micrAbs * microQ10 / 1024 + kRillMaxAbsMm + kBeddingMaxAbsMm + 3;
+        micrAbs * microQ10 / 1024 * kCurvatureScaleMicroMaxQ10 / 1024 +
+        kRillMaxAbsMm + kBeddingMaxAbsMm + 4;
 
     outUpperMm = clampi64(maxBaseMm + maxDetailMm, kSurfaceClampMinMm, kSurfaceClampMaxMm);
     outLowerMm = clampi64(minBaseMm - minDetailMm, kSurfaceClampMinMm, kSurfaceClampMaxMm);

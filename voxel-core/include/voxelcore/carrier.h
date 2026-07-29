@@ -470,9 +470,57 @@ inline int64_t carrierCurvatureMmPerM2Q10(const CarrierCurvature& c, int64_t pxM
 inline constexpr int64_t kCurvatureScaleOneQ10 = 1024; // 1.0x, at zero curvature
 inline constexpr int64_t kCurvatureScaleMinQ10 = 512;  // 0.5x  in hollows  [PROVISIONAL]
 inline constexpr int64_t kCurvatureScaleMaxQ10 = 1792; // 1.75x on crests   [PROVISIONAL]
-// 2.0 mm per metre per metre, in the q10 currency of
-// carrierCurvatureMmPerM2Q10.                                    [PROVISIONAL]
-inline constexpr int64_t kCurvatureKneeQ10 = 2 * kCurveQ10One;
+// The knee, in the q10 currency of carrierCurvatureMmPerM2Q10, AT THE 30 m
+// REFERENCE TIER. Feed it through carrierCurvatureTierNormQ10 first.
+//
+// 0.5 mm/m^2. This is a MEASURED anchor, not a round number: the mean
+// |Laplacian| on a realistic 30 m raster is 288 q10 (0.28 mm/m^2), so a knee at
+// 512 puts typical ground a little over half way to saturation and leaves a
+// genuinely convex crest at the clamp. The first cut of this was 2 * kCurveQ10One
+// = 2048, i.e. seven times the mean, and the probe showed the consequence
+// bluntly: convex/concave detail ratio 0.99 at every lag from 0.1 m to 1.6 m --
+// the gate was wired in, bounded, proved, mirrored, and doing NOTHING. A gate
+// whose knee sits far outside the data's range is indistinguishable from no gate,
+// and nothing but an end-to-end measurement catches that.                [PROVISIONAL]
+inline constexpr int64_t kCurvatureKneeQ10 = kCurveQ10One / 2;
+
+// --- WHY THE KNEE NEEDS A TIER NORMALISATION -------------------------------
+//
+// The curvature UNIT (mm per metre per metre) is scale-invariant. The curvature
+// a landscape EXHIBITS is not: curvature is a second derivative, and on a
+// self-affine surface its magnitude grows as you resolve finer scales. Measured
+// on the same realistic raster: mean |Laplacian| 288 q10 at a 30 m pixel and
+// 74,182 q10 at 1.875 m. That ratio is 257.6 against a pixel ratio of 16, i.e.
+// almost exactly 16^2 -- curvature scales as pxMm^-2, which is what the second
+// derivative of a self-affine field must do.
+//
+// So a single knee cannot serve both tiers. At 2048 it saturated 0% of samples
+// at 30 m and 98% at 1.875 m: no-op on one world, hard-clipped on the other,
+// and in both cases carrying no information. Normalising by (pxMm/30000)^2
+// before gating makes the gate ask "how curved is this RELATIVE TO THE SCALE WE
+// RESOLVE", which is the question "crest or hollow" actually means, and makes
+// one knee correct on every tier.
+//
+// The exponent is empirical, from the 257.6-vs-256 agreement above, not assumed
+// from theory -- if a future tier disagrees with pxMm^-2, re-measure rather than
+// trusting this line.
+inline constexpr int64_t kCurvatureRefPixelMm = 30000;
+constexpr int64_t carrierCurvatureTierNormQ10(int64_t curveMmPerM2Q10, int64_t pxMm) {
+    // Overflow: |curve| is bounded well under 1e10 in practice and pxMm <= 30000,
+    // so the product stays under 9e18 against int64's 9.22e18. The assert below
+    // pins the pixel side; the curvature side is bounded by the carrier's own
+    // control-point range.
+    return floorDiv(curveMmPerM2Q10 * pxMm * pxMm,
+                    kCurvatureRefPixelMm * kCurvatureRefPixelMm);
+}
+static_assert(carrierCurvatureTierNormQ10(1000, kCurvatureRefPixelMm) == 1000,
+              "the reference tier must be the identity, or the knee means something "
+              "different from the number it was measured against");
+static_assert(carrierCurvatureTierNormQ10(2560, 1875) == 10,
+              "a 16x finer pixel must divide curvature by 16^2 = 256");
+static_assert(carrierCurvatureTierNormQ10(-2560, 1875) == -10,
+              "and it must be symmetric -- floorDiv, not truncation, so a crest and "
+              "a hollow of equal magnitude gate equally");
 
 static_assert(kCurvatureScaleMinQ10 < kCurvatureScaleOneQ10 &&
                   kCurvatureScaleOneQ10 < kCurvatureScaleMaxQ10,
