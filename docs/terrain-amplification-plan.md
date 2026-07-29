@@ -171,8 +171,26 @@ Result: a real dendritic network — branching, tributaries joining, no lattice 
 into the surface as valleys with sharp interfluves between them (max accumulation 78 km²; 15,773
 cells above 1 km²).
 
+> ⚠️ **THE DRAINAGE FIGURES AND THE K TABLE BELOW ARE MEASURED ON A MIS-ROUTED FIELD.** The
+> prototype's priority-flood was a plain fill, so every filled pit became a **level lake** — and on
+> a level lake no cell has a lower neighbour, so MFD terminates. On the same tile that produced the
+> numbers below: **341,368 inland dead-ends and 69.2% of land area stranded**, never reaching the
+> sea. Barnes' ε variant (every newly discovered cell raised to at least `spill + 2 ULP`) fixes it,
+> and is the default in `bake/flow.py`. Isolated cleanly: with `flat_eps=0` the production module
+> reproduces the prototype's numbers exactly, so ε is the only difference.
+>
+> | | prototype | corrected |
+> |---|---|---|
+> | inland dead-ends | 341,368 | **0** |
+> | max catchment | 69.6 km² | **203.1 km²** |
+> | cells > 1 km² | 13,256 | **107,496** |
+>
+> **K must be re-calibrated, not scaled.** With ~2.9× the catchment area, `A^0.45` is ~1.6× deeper
+> on trunk channels, so the K=0.15 below will over-carve. And judge it on a hillshade — no summary
+> statistic in this document distinguished a good K from a bad one.
+
 **Erodibility K matters more than anything else for whether it reads as terrain**, and the
-plausible-looking first value was far too small:
+plausible-looking first value was far too small (values below are on the mis-routed field):
 
 | K | incision mean | p99 | reads as |
 |---|---|---|---|
@@ -240,6 +258,35 @@ The constructive reading for Phase 2: B1's roughness is **substrate for erosion,
 texture**. Keep it modest, and let the fine-scale spectrum be filled by *process* — finer rills,
 more incision detail — rather than by amplitude. If H is still too high after that, the answer is
 more geomorphology, not more noise.
+
+**Six more defects found when the prototype was rewritten as production modules.** Recorded
+because three of them revise things written here as settled:
+
+- **Thermal lost mass at the border.** Both passes ran `1..h-2`, so material shed *towards* the
+  edge row was subtracted from the donor and gathered by nobody. Small in magnitude, but it made
+  the conservation invariant untestable — which is presumably why the 128 m cliff-stripping bug
+  above was caught by eye rather than by an assertion.
+- **One repose limit for cardinal and diagonal neighbours.** `tan(36°)·cell_m` across a √2 longer
+  run is a **41% gentler** limit on the diagonals — the classic eight-neighbour artifact, and it
+  produces octagonal talus cones. Scale the drop by pair distance.
+- **`band /= band.std()` breaks seams independently of the RNG.** The normaliser is measured over
+  the domain, so the same world location gets a different amplitude in two overlapping bakes *even
+  if the noise itself were world-anchored*. This is a **second, separate** blocker to the apron
+  argument, and the seam test's "inject a shared pre-computed field" workaround masked it. The
+  apron conclusion still stands — isolating apron adequacy is exactly what the injection was for —
+  but "world-anchor the noise" was two problems, not one. Compute the normaliser analytically.
+- **The steepest-pair rule bounds what a cell GIVES, not what it RECEIVES.** An isolated one-cell
+  pit is filled by all eight neighbours in the same step, each correctly shedding its whole budget
+  into it, so max slope can *rise* before converging (measured 128 → 164 in a single step, then
+  2.16 by 48 iterations and 0.88 by 800). It converges at `rate=0.4` with mass exact throughout,
+  but it is the sharp edge of the scheme, and it bites hardest here because a 25 m incision cap at
+  1.875 m/px produces narrow pit-like channels. `relax()` now rejects `rate > 0.5`.
+- The prototype's default roughness path ignored the source-Nyquist rule that the
+  spectrum-fitted path implements — it started at whole-domain wavelengths and layered noise
+  across the entire band the diffusion model owns.
+- The carrier accumulated in float32 with float32 weights. At `tq=0` the weights are `(1,4,1,0)/6`
+  and the prefilter's whole job is to make that reproduce the sample, so float32 accumulation
+  spends part of the prefilter's accuracy before erosion even starts.
 
 **Three prototype bugs, each of which validated a choice in this plan by violating it:**
 
