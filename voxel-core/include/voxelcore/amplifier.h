@@ -42,25 +42,6 @@ struct ColumnSample {
     CavernColumn cavern;
 };
 
-// --- the carrier's control stencil (v9) -------------------------------------
-//
-// A column in tile-pixel cell px reads control points
-// px + kCarrierStencilLo .. px + kCarrierStencilHi on each axis. v8's bilinear
-// base read px..px+1; the cubic B-spline reads one further out on the low side
-// and two on the high side.
-//
-// THIS IS A CONTRACT, NOT AN IMPLEMENTATION DETAIL, and it is stated here
-// because two independent hosts have to honour it. Both the UE RDG pass
-// (VoxelGpuRegionBuild.h) and the headless harness (bench/gpu_harness.cpp) copy
-// a WINDOW of the tile raster to the GPU and the shader CLAMPS reads to that
-// window. A window that is not dilated to match does not fault and does not
-// error -- it silently returns an edge value where the CPU reads the real tile,
-// i.e. different terrain on the two paths. That exact failure has already
-// happened once here (see the D5 note in VoxelGpuRegionBuild.h), so the numbers
-// live in one place and both hosts derive their margins from them.
-inline constexpr int64_t kCarrierStencilLo = -1;
-inline constexpr int64_t kCarrierStencilHi = 2;
-
 // --- surface upper bound (the sky-band trim's proof obligation) -------------
 //
 // Amplifier::surfaceUpperBoundMm returns this when it declines to bound. It is

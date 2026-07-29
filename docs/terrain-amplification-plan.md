@@ -406,6 +406,20 @@ Run: `vxc_terrainprobe <tiledir> 20260719 -84480 53760 2000`
 | `S2` local H @0.1–0.2 m | 1.404 | unchanged (Phase 3 owns this) | H ∈ [0.6, 1.0] per decade |
 | Terrace runs | mean 2.71 vox, 0.5% in runs ≥20 | mean 2.76, 0.1% | no regression |
 
+**Multi-site confirmation (v9, five sites, 2 km transects).** Both fixed mechanisms hold across
+the whole grade range the shipped tile set offers, not just at the spawn point:
+
+| Site (m) | grade | seam ratio @0.1 / 0.2 / 0.4 m | gain step median / max |
+|---|---|---|---|
+| −110000, 85000 | 5.6% | 1.05 / 0.97 / 0.93 | 0 mm / 7 mm |
+| −84480, 53760 | 7.7% | 1.09 / 1.03 / 1.00 | 0 mm / 14 mm |
+| −95000, 70000 | 15.1% | 1.05 / 1.04 / 1.04 | 0 mm / 7 mm |
+| −70000, 25000 | 64.6% | 1.10 / 1.13 / 1.11 | 4 mm / 18 mm |
+| −65000, 60000 | 116.6% | 0.92 / 0.90 / 0.93 | 0 mm / 14 mm |
+
+Worst seam ratio anywhere is 1.13 against a bar of 1.2; worst gain step is 18 mm against v8's
+median of 150–310 mm and max of 2302 mm.
+
 The carrier-only residual of ~1.2 at 1.6–12.8 m lags is **not** a crease: it is flat in lag,
 whereas a slope discontinuity grows linearly with lag (v8 went 8→950 by doubling). It is the
 C² spline's own curvature variation near knots, and the amplified surface — what is actually
@@ -454,6 +468,26 @@ the column; everything else differs by ≤4 columns in 147,456, i.e. 0.003%).
   `voxel-leg-summary.ps1`, spawn `-84480,53760`, `line` flight) after Phases 2 and 4, watching
   flight-phase hole distribution — not `holes(final)`, which cannot decide a latency question.
 - **Perf:** `vxc_bench` amplify-stage regression against the +5–10% world-average budget in Phase 4.
+
+  **Phase 1 measured (radius 128, brick 8³, A/B against a v8 worktree):**
+
+  | | v8 | v9 naive | v9 shipped |
+  |---|---|---|---|
+  | amplify | 3321 ms | 6616 ms (**2.00×**) | **3892 ms (1.17×)** |
+  | total | 6126 ms | 9365 ms (1.53×) | **6627 ms (1.08×)** |
+
+  The naive column reads 16 control points per column through the per-point elevation memo where
+  v8's bilinear read 4, and sixteen hash-and-compare probes per column is what the 2× cost me.
+  The reads were nearly all memo *hits* — the probing was the cost, not the sampling. Fixed by
+  memoizing the 4×4 stencil as a **block** keyed on the cell (`cachedStencil`), plus the same
+  treatment for the climate 2×2 (`cachedClimateQuad`): a 3.2 m chunk sits inside one 30 m cell,
+  so every column in it wants the same sixteen control points. Both are bit-identical by
+  construction and the bench digest (`ad1c1e8e8b5ba749`) is unchanged across all three variants,
+  which is what proves it.
+
+  The residual +17% is the honest cost of a 4×4 cubic evaluation plus an analytic gradient over a
+  2×2 bilinear. Note this is the *CPU* amplifier, which under ADR-0006 serves sparse queries
+  (raycast, dig, collision) rather than streaming generation.
 
 ---
 

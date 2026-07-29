@@ -68,6 +68,58 @@ int32_t cachedElevationMm(uint64_t amp, ITileSampler& tiles, int64_t px, int64_t
     return v;
 }
 
+// The carrier's 4x4 control stencil, memoized as a BLOCK rather than as
+// sixteen separate elevation probes.
+//
+// WHY THIS EXISTS, MEASURED. v9's cubic carrier reads 16 control points per
+// column where v8's bilinear read 4. Going through cachedElevationMm sixteen
+// times costs sixteen hash-and-compare probes per column, and the bench said
+// exactly what that is worth: the amplify stage went 3321 ms -> 6616 ms at
+// radius 128, a 2.0x regression, with total time up 1.53x. The reads
+// themselves were nearly all memo HITS -- the cost was the probing, not the
+// sampling.
+//
+// A whole level-0 chunk is 3.2 m across and a scale-1 tile pixel is 30 m, so
+// every column in a chunk almost always falls in the SAME cell and wants the
+// SAME sixteen control points. Caching the block keyed on the cell collapses
+// those sixteen probes to one.
+//
+// Bit-identical by construction: it returns the same values cachedElevationMm
+// would have, just fetched once. Eight slots because a chunk footprint touches
+// at most 2x2 cells (4), with headroom for the bound's wider walk.
+constexpr uint32_t kStencilSlots = 8;
+
+struct StencilSlot {
+    uint64_t amp = 0;
+    int64_t px = 0, py = 0;
+    int64_t cp[16] = {};
+};
+
+const int64_t* cachedStencil(uint64_t amp, ITileSampler& tiles, int64_t px, int64_t py) {
+    static thread_local StencilSlot slots[kStencilSlots];
+    StencilSlot& s = slots[slotIndex(amp, px, py, kStencilSlots)];
+    if (s.amp == amp && s.px == px && s.py == py) return s.cp;
+    for (int j = 0; j < 4; ++j)
+        for (int i = 0; i < 4; ++i)
+            s.cp[i + 4 * j] = cachedElevationMm(amp, tiles, px - 1 + i, py - 1 + j);
+    s.amp = amp;
+    s.px = px;
+    s.py = py;
+    return s.cp;
+}
+
+// The climate 2x2 blend block, memoized as a block for the same reason and
+// with the same bit-identity argument as cachedStencil above: v9's faded
+// bilinear reads four corners per column where v8's nearest-pixel read one.
+struct ClimateQuadSlot {
+    uint64_t amp = 0;
+    int64_t px = 0, py = 0;
+    ClimateSample c[4]{}; // (0,0) (1,0) (0,1) (1,1)
+};
+
+const ClimateSample* cachedClimateQuad(uint64_t amp, ITileSampler& tiles, int64_t px,
+                                       int64_t py);
+
 ClimateSample cachedClimate(uint64_t amp, ITileSampler& tiles, int64_t px, int64_t py) {
     static thread_local ClimateSlot slots[kClimateSlots];
     ClimateSlot& s = slots[slotIndex(amp, px, py, kClimateSlots)];
@@ -78,6 +130,21 @@ ClimateSample cachedClimate(uint64_t amp, ITileSampler& tiles, int64_t px, int64
     s.py = py;
     s.value = v;
     return v;
+}
+
+const ClimateSample* cachedClimateQuad(uint64_t amp, ITileSampler& tiles, int64_t px,
+                                       int64_t py) {
+    static thread_local ClimateQuadSlot slots[kStencilSlots];
+    ClimateQuadSlot& s = slots[slotIndex(amp, px, py, kStencilSlots)];
+    if (s.amp == amp && s.px == px && s.py == py) return s.c;
+    s.c[0] = cachedClimate(amp, tiles, px, py);
+    s.c[1] = cachedClimate(amp, tiles, px + 1, py);
+    s.c[2] = cachedClimate(amp, tiles, px, py + 1);
+    s.c[3] = cachedClimate(amp, tiles, px + 1, py + 1);
+    s.amp = amp;
+    s.px = px;
+    s.py = py;
+    return s.c;
 }
 
 // Faded-bilinear blend of four climate corner samples (v9).
@@ -914,11 +981,8 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     // gradient continuity across the cell boundary.
     const int64_t px = floorDiv(xMm, pxMm), py = floorDiv(yMm, pxMm);
     const int64_t fx = xMm - px * pxMm, fy = yMm - py * pxMm;
-    int64_t cp[16];
-    for (int j = 0; j < 4; ++j)
-        for (int i = 0; i < 4; ++i)
-            cp[i + 4 * j] = cachedElevationMm(id_, *tiles_, px - 1 + i, py - 1 + j);
-    const CarrierEval carrier = evalCarrier(cp, fx, fy, pxMm);
+    const CarrierEval carrier =
+        evalCarrier(cachedStencil(id_, *tiles_, px, py), fx, fy, pxMm);
     const int64_t baseMm = carrier.heightMm;
 
     // The carrier's ANALYTIC gradient, in mm per metre, conditions both detail
@@ -1299,11 +1363,8 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // exactly the boundaries this is meant to curve.
     const int64_t cfx = fadeFractionMm(xMmC - px * pxMmC, pxMmC);
     const int64_t cfy = fadeFractionMm(yMmC - py * pxMmC, pxMmC);
-    const ClimateSample cl =
-        blendClimate(cachedClimate(id_, *tiles_, px, py),
-                     cachedClimate(id_, *tiles_, px + 1, py),
-                     cachedClimate(id_, *tiles_, px, py + 1),
-                     cachedClimate(id_, *tiles_, px + 1, py + 1), cfx, cfy, pxMmC);
+    const ClimateSample* cq = cachedClimateQuad(id_, *tiles_, px, py);
+    const ClimateSample cl = blendClimate(cq[0], cq[1], cq[2], cq[3], cfx, cfy, pxMmC);
 
     // ECOTONE DITHER. Interpolation alone turns 30 m stair-steps into smooth
     // curves, but a smooth curve through a hard threshold is still a clean line

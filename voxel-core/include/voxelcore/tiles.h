@@ -48,6 +48,27 @@ public:
 
 // --- SyntheticTileSampler's climate span -----------------------------------
 //
+// --- the carrier's control stencil (v9) -------------------------------------
+//
+// A column in tile-pixel cell px reads control points
+// px + kCarrierStencilLo .. px + kCarrierStencilHi on each axis. v8's bilinear
+// base read px..px+1; the cubic B-spline carrier reads one further out on the
+// low side and two on the high side.
+//
+// THIS IS A CONTRACT, NOT AN IMPLEMENTATION DETAIL, and it lives in tiles.h --
+// next to ITileSampler, rather than in amplifier.h -- because the hosts that
+// must honour it consume the tile interface and not the amplifier. Both the UE
+// RDG pass (VoxelGpuRegionBuild.h) and the headless harness
+// (bench/gpu_harness.cpp) copy a WINDOW of the tile raster to the GPU, and the
+// shader CLAMPS reads to that window. A window that is not dilated to match
+// does not fault and does not error -- it silently returns an edge value where
+// the CPU reads the real tile, i.e. different terrain on the two paths. That
+// exact failure has already happened here once (the D5 note in
+// VoxelGpuRegionBuild.h), so the numbers live in one place and every host
+// derives its margin from them.
+inline constexpr int64_t kCarrierStencilLo = -1;
+inline constexpr int64_t kCarrierStencilHi = 2;
+
 // The physical range each synthetic climate channel sweeps. These are worldgen
 // contract constants (they decide tile-derived bytes) -- tune only on a
 // deliberate kWorldGenVersion bump.
