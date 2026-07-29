@@ -189,6 +189,17 @@ One `uint8` per fine pixel, same block structure, same predictor:
 Mostly zeros; ~5–10 KB compressed. Consumers: client alluvium/cut-bank materials, and later the
 flow-conditioned rill synthesis and bank undercuts.
 
+**Element width differs from the elevation plane, and the modes inherit that:**
+
+- **`RAW`** on the flow plane is **one `uint8` per pixel**, not two. A block is exactly
+  `(1 << block_log2)²` bytes.
+- **`CONSTANT`** stores the flow byte in `const_cp` as an **unsigned 0–255** quantity, even though
+  the field is `i16` on the wire. `0xFF` reads back as `255`, never sign-extended to `-1`. Valid
+  flow bytes never reach the negative half of the field, so no sign-extension bug is reachable from
+  *valid* data — but a **corrupt** file claiming an out-of-range `const_cp` must be **rejected**,
+  not truncated into the target element type. That is the one place an all-or-nothing parser can
+  otherwise let corruption through as plausible data.
+
 ## 7. Decode is a pure integer function of the bytes
 
 Non-negotiable, because these bytes are the multiplayer authority:
