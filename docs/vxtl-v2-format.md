@@ -1,4 +1,4 @@
-# `.vxtl` v2 — the baked fine-tier wire format (FROZEN CONTRACT)
+﻿# `.vxtl` v2 — the baked fine-tier wire format (FROZEN CONTRACT)
 
 **Status:** frozen 2026-07-29. This is the shared contract between the Python encoder
 (`terrain-service/terrain_service/tile_codec.py`) and the C++ decoder
@@ -16,12 +16,34 @@ normative bit-level spec.
 v1 (unchanged, still shipped): one 512×512 tile at 30 m/px — `int16` elevation in **whole metres**
 plus 4 × `uint8` climate planes.
 
-v2 **redefines the scale-8 slot** to hold one *fine tier* per coarse tile coordinate: the same
-15.36 km footprint at **3.75 m/px, i.e. 4096×4096**. Safe to redefine because nothing was ever
-generated at scale 8 (`tile_codec.py:41`, `tilestore.h:66`); the addressing change rolls
+v2 adds a **scale-16 slot** holding one *fine tier* per coarse tile coordinate: the same 15.36 km
+footprint at **1.875 m/px, i.e. 8192×8192**. `tilePixelSizeMm` gains `16 → 1875`
+(`tilestore.h:67-69`, mirrored in `tile_codec.py:43` and `tiles.h`). The addressing change rolls
 `provider_id` through `_tile_format_fingerprint`, exactly as that mechanism is designed to.
 
 The s1 tile stays **byte-identical** — no golden churn, no C++ parser risk.
+
+**1.875 m was chosen over 3.75 m deliberately (Matt, 2026-07-29).** It buys the 3.75–7.5 m band —
+small stream channels, gullies you can climb into, cut banks, terrace risers — which is the band a
+1.8 m player physically occupies, and it is the difference between watercourses that *drain* and
+watercourses that are decoration. Costs, measured rather than assumed, so nobody rediscovers them:
+**~21–25 MB/tile** compressed (4× the pixels but ~1 bit/px cheaper, since halving post spacing
+halves the per-step gradient) and **~165 CPU-s/tile** to bake. At ~106 KB/km² a 1 M km² explored
+world is ~106 GB server-side, and an 8–16 GB client cache holds ~500 tiles.
+
+**Three consequences that are easy to miss:**
+
+1. **`kSurfaceBoundMaxCornersPerAxis` must rise 34 → 64.** v9 set 34 for a 3.75 m pixel. At
+   1.875 m a level-5 footprint (108.8 m incl. apron) spans ~58 cells and needs ~61 control points,
+   so the bound would silently **decline** from level 5 up — safe, but exactly the performance
+   cliff v9 removed. 64² × int64 = 32 KB of stack, up from 9.2 KB.
+2. **A two-tier residual ladder is now worth revisiting**, though this spec does NOT do it. Most of
+   a 1.875 m tier is derivable from a 3.75 m one by the same B-spline, so residuals would be near
+   zero — and a coarser fine tier would let the streaming layer feed the mid rings without pulling
+   1.875 m everywhere. `parent_scale` is reserved in the header for exactly that; leave it 0.
+3. **The bake stops being free.** At ~20–40 s/tile in production, advancing the frontier by one
+   tile (3 bakes) becomes comparable to its 5 coarse tiles at 22.5 s. Prefetch ring sizing should
+   be re-derived rather than inherited.
 
 ## 2. The fine plane is a CONTROL LATTICE, not samples
 
@@ -58,17 +80,19 @@ positionally identical to v1 so a v1 parser fails on `version`, not on garbage.
 | `version` | `u16` | **2** |
 | `seed` | `u64` | |
 | `x`, `y` | `i32` | **COARSE** tile coords; footprint = s1 tile (x,y) |
-| `scale` | `u8` | 8 |
-| `size` | `u16` | 4096 (fine grid edge) |
+| `scale` | `u8` | 16 |
+| `size` | `u16` | 8192 (fine grid edge) |
 | — v2 extension — | | |
-| `block_log2` | `u8` | 8 → 256×256 fine px per block, 16×16 = 256 blocks |
+| `block_log2` | `u8` | 8 -> 256x256 fine px per block (480 m), 32x32 = 1024 blocks |
 | `predictor` | `u8` | 1 = `PRED_MED` (§5) |
 | `quant` | `u8` | 1 = 100 mm/LSB, 2 = 250 mm/LSB |
 | `codec` | `u8` | 0 = `CODEC_RAW`, 1 = `CODEC_ZSTD` |
 | `bake_ver` | `u16` | bake algorithm + constants version |
 | `flags` | `u16` | bit0 = flow plane present |
 | `base_offset_mm` | `i32` | per-tile elevation datum |
-| `reserved` | `u32` | must be 0 |
+| `parent_scale` | `u8` | 0 = absolute (this spec). Reserved for a future residual ladder. |
+| `reserved` | `u8[3]` | must be 0 |
+eserved | u8[3] | must be 0 |
 | `n_sections` | `u16` | |
 | section table | `n_sections × {u32 id, u64 offset, u64 length}` | offsets are from file start |
 
@@ -92,8 +116,8 @@ format. Do not gate the decoder's correctness tests on having zstd.
 | `pad` | `u8[4]` | must be 0 |
 
 Blocks are **independent** — one frame each, no shared dictionary, no cross-block prediction. That
-is what buys per-block random access: the client decodes only the ~0.92 km² blocks it needs, not
-33.5 MB.
+is what buys per-block random access: the client decodes only the ~0.23 km² blocks it needs, not
+134 MB. A decoded block is 128 KB.
 
 `CONSTANT` blocks cost zero bytes and are common (ocean, flat basin).
 
