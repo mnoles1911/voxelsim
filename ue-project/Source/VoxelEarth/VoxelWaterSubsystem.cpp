@@ -238,29 +238,86 @@ struct FVoxelWaterImpl
 
 	// --- ADR-0006 water pool (voxel.Water.GPU) ------------------------------
 	//
-	// The pooled alternative to the two component maps above: ONE primitive,
-	// ONE draw, and a brick's geometry is a range in a shared quad buffer
-	// rather than a scene primitive of its own.
+	// The pooled alternative to the two component maps above: a brick's geometry
+	// is a RANGE in a shared quad buffer rather than a scene primitive of its
+	// own.
 	//
-	// Created lazily on the first brick that wants it, on its OWN actor as that
-	// actor's ROOT component -- attached as a child of ChunkRoot the primitive
-	// never enters the visible set at all (docs/gpu-pool-rendering-notes.md
-	// invariant 1).
-	TWeakObjectPtr<UVoxelGpuPoolComponent> Pool;
+	// W5: A HANDFUL OF PRIMITIVES, BUCKETED SPATIALLY, NOT ONE.
+	//
+	// This used to be one pool component and therefore one primitive, and
+	// docs/gpu-water-pool-design.md argued at length why that was sound: the
+	// renderer sorts translucent geometry per PRIMITIVE, so pooled water had one
+	// sort key for the whole world -- but with a constant base colour, a constant
+	// 0.55 opacity and no scene read, two water fragments differed only in their
+	// lighting and a stack of N surfaces transmitted (1-0.55)^N in ANY order.
+	// The doc also named exactly what would end that: "per-fill shading, foam or
+	// caustics", and named the fallback: "per-region sort keys (several
+	// primitives, one per spatial bucket)".
+	//
+	// Depth-tinted absorption and foam land in this same wave, so this is that
+	// fallback, built FIRST and deliberately so -- a tint applied over a broken
+	// sort makes a sorting artefact and a shading artefact indistinguishable.
+	//
+	// Each pool is created lazily on the first brick that wants it, on its OWN
+	// actor as that actor's ROOT component -- attached as a child of ChunkRoot
+	// the primitive never enters the visible set at all
+	// (docs/gpu-pool-rendering-notes.md invariant 1).
+	struct FPoolBucket
+	{
+		// Bucket coordinate = floorDiv(brick coordinate, kWaterPoolBucketBricks).
+		VoxelCoords::FVoxelCoord Key{0, 0, 0};
+		TWeakObjectPtr<UVoxelGpuPoolComponent> Pool;
+		// The pool's float32 chunk table cannot hold this world's ~8.4M UU
+		// coordinates (invariant 4), so the component carries the offset in its
+		// double-precision transform and the table stores brick origins relative
+		// to it. DERIVED FROM Key, not from the first brick that happened to
+		// arrive: a bucket's rebase is then a pure function of where it is, which
+		// is what makes re-homing an emptied bucket (below) a one-line move
+		// rather than a migration.
+		FVector Rebase = FVector::ZeroVector;
+	};
+	TArray<FPoolBucket> PoolBuckets;
+	TMap<VoxelCoords::FVoxelCoord, int32> PoolBucketIndex;
 
-	// The pool's float32 chunk table cannot hold this world's ~8.4M UU
-	// coordinates (invariant 4), so the component carries the offset in its
-	// double-precision transform and the table stores brick origins relative to
-	// it. Set once, from the first pooled brick, and never moved.
-	FVector PoolRebase = FVector::ZeroVector;
+	// Set while a batched re-mesh loop is running, so a bucket created MID-LOOP
+	// can be folded into the same publication scope as the buckets that existed
+	// when the loop started. Without it the first tick that reaches a new region
+	// would publish once per brick on the new bucket -- the exact per-brick
+	// publication tax S1-1 exists to remove, arriving precisely when a burst of
+	// bricks is landing.
+	struct FVoxelWaterPoolBatch* ActiveBatch = nullptr;
 
 	// Pool handles, keyed exactly like the component maps they replace. Two
 	// maps for the same reason there are two component maps: the implicit
 	// (worldgen) and CA (simulated) halves own disjoint bricks and hand over
 	// between themselves, and MarkMobilizedBricksDirty has to be able to drop
 	// one without touching the other.
-	TMap<VoxelCoords::FVoxelCoord, int32> PoolSlots;
-	TMap<VoxelCoords::FVoxelCoord, int32> ImplicitPoolSlots;
+	//
+	// The value is (bucket, handle) rather than a bare handle now: a pool handle
+	// is only meaningful against the pool that issued it, and there are several.
+	// Storing the bucket beside it -- rather than re-deriving it from the brick
+	// coordinate at release time -- is what makes a brick releasable even after
+	// its bucket has been re-homed to a different region, which is the one
+	// ordering this scheme has to survive.
+	struct FPooledBrick
+	{
+		int32 Bucket = INDEX_NONE;
+		int32 Handle = INDEX_NONE;
+	};
+	TMap<VoxelCoords::FVoxelCoord, FPooledBrick> PoolSlots;
+	TMap<VoxelCoords::FVoxelCoord, FPooledBrick> ImplicitPoolSlots;
+
+	// W5 foam input: the bricks vxc::WaterCA reported ACTIVE at the end of the
+	// last fixed step. Read at mesh time and written into vertex colour A (via
+	// ChunkParams.y on the pooled path, directly on the component path), where
+	// M_WaterVoxel turns it into foam.
+	//
+	// A MEMBER RATHER THAN A LIVE CA QUERY because it is also what drives the
+	// SETTLE EDGE: a brick that stops being active is, by definition, no longer
+	// marked dirty, so without a record of what WAS active nothing would ever
+	// re-mesh it to turn its foam back off. StepFixed diffs this against the new
+	// active set and marks the difference dirty exactly once.
+	TSet<VoxelCoords::FVoxelCoord> ActiveBricks;
 
 	// 1 Hz status line for the pooled path. Budgeted before it was needed: one
 	// primitive drawing thousands of bricks has no per-brick state to inspect,
@@ -571,14 +628,117 @@ namespace
 // The one genuine BEHAVIOURAL fix the water instance forced is in the pool
 // itself, not here: chunk-table entries were never recycled. See
 // UVoxelGpuPoolComponent::FreeChunkIds.
-UVoxelGpuPoolComponent* GetOrCreateWaterPool(FVoxelWaterImpl& Impl, AActor* ChunkOwner,
-                                             UMaterialInterface* Material,
-                                             const FVector& FirstBrickOriginUU)
+//
+// --- W5: SEVERAL INSTANCES, BUCKETED BY WORLD SPACE ------------------------
+//
+// WHY THE COUNT CHANGED. UE sorts translucent draw commands by a key whose
+// distance field is filled from `PrimitiveBounds[PrimitiveIndex]
+// .BoxSphereBounds.Origin` (UpdateTranslucentMeshSortKeys, MeshDrawCommands.cpp)
+// -- the PRIMITIVE's bounds centre, one value for every command the primitive
+// emits. Within a primitive the remaining tie-break is the 16-bit
+// MeshIdInPrimitive, which is a STABLE id and not a per-view depth order. So a
+// single water primitive genuinely cannot sort its own contents against itself
+// or against anything else at better than whole-pool granularity, however many
+// mesh batches it emits. Splitting the primitive is the only lever the renderer
+// offers short of an OIT path.
+//
+// WHY 64 BRICKS (51.2 m) ON A SIDE. Sized from the largest water body this
+// system actually produces, which is the implicit cavern-lake shell:
+// RefreshImplicitWater sweeps a 65 x 65 x 33 BRICK disc, i.e. 52 x 52 x 26 m.
+// A bucket larger than that disc gives back nothing at all -- the whole lake
+// would land in one bucket and we would be exactly where we started. 64 makes
+// the disc span 2 x 2 buckets horizontally and 1-2 vertically, so a typical
+// scene draws 4-8 water primitives instead of 1. That is the "handful" this is
+// aiming at, and it is three orders of magnitude below the per-brick component
+// path's 2,231 primitives at the same anchor (docs/gpu-water-pool-design.md).
+//
+// REJECTED, AND WHY:
+//
+//   * 16 bricks (12.8 m). Sorts better, and the implicit disc alone would then
+//     want up to 5x5x3 = 75 primitives. Not fatal -- still far below the
+//     component path -- but it re-opens the FScene::AddPrimitive funnel ADR-0006
+//     exists to close, in exchange for a granularity that STILL does not fix the
+//     dominant artefact (see the next point). Bad trade.
+//   * Trying to fix the artefact properly with buckets at all. Water surfaces
+//     stack most often at ONE-BRICK range: the near side wall, the surface and
+//     the far side wall of a single stepped pool. No bucket size above a brick
+//     orders those, and a bucket per brick is the per-brick component path with
+//     extra steps. What bucketing DOES fix is long-range compositing -- one lake
+//     seen through another, water above a cavern lake, and water against a
+//     foreign translucent primitive -- and that is the honest claim.
+//   * Bucketing only in XY, with Z unbounded. Cheaper (fewer buckets), and
+//     wrong for the case this project has most of: a surface lake directly above
+//     a cavern lake is the textbook water-over-water stack, and a Z-unbounded
+//     column puts both in one bucket.
+//   * Keeping one component and ranking its FMeshBatches with MeshIdInPrimitive
+//     per view. It would order water against water for free, with no extra
+//     primitive -- but MeshIdInPrimitive sits BELOW Distance in the sort key, so
+//     it can only break ties WITHIN one primitive. Foreign translucent geometry
+//     would still sort against the whole pool as one unit, which is the third
+//     break condition gpu-water-pool-design.md names. Kept in reserve as an
+//     intra-bucket refinement.
+//
+// WHAT A BUCKET COSTS. Its own quad buffer (kWaterBucketCapacityQuads, 4 MB),
+// its own chunk table, its own proxy and its own cull walk. That is why buckets
+// are RECYCLED rather than accumulated: water follows the camera, so buckets
+// empty out behind it, and an emptied bucket is re-homed to a new region
+// instead of allocating a new one. The rebase is a pure function of the bucket
+// key, so re-homing is a SetWorldLocation and nothing else.
+
+// Edge length of one sort bucket, in water bricks. See the essay above.
+constexpr int32 kWaterPoolBucketBricks = 64;
+
+// Ceiling on live bucket primitives. Not a tuning knob: past this, bricks are
+// routed to their NEAREST live bucket, which draws them in the right place with
+// the wrong sort key -- i.e. it degrades to exactly the pre-W5 behaviour for
+// the overflow rather than dropping geometry. 12 is ~1.5x the 4-8 a typical
+// scene wants, so reaching it at all means something unusual is on screen.
+constexpr int32 kMaxWaterPoolBuckets = 12;
+
+// Per-bucket quad capacity. 4 MB each; 12 buckets is a 48 MB ceiling against
+// the single pool's 32 MB, and the typical 4-8 live buckets sit at 16-32 MB,
+// i.e. at or below where this started.
+//
+// SIZED AGAINST THE WHOLE WORLD'S WATER, NOT A BUCKET'S SHARE, deliberately.
+// The measured peak is 28,862 quads across 2,231 implicit bricks (~13 quads per
+// brick). Even if EVERY implicit brick and the CA's entire 4,096-brick budget
+// landed in ONE bucket at a pessimistic 80 quads each, that is ~500k quads. A
+// per-bucket pool cannot borrow from its neighbours the way one big pool could,
+// so the headroom has to cover the degenerate distribution rather than the
+// expected one.
+constexpr uint32 kWaterBucketCapacityQuads = 512u * 1024u;
+
+// Per-bucket chunk-table floor. Crossing it is not an error but it IS a full
+// render-state rebuild and a full quad re-upload, so it wants to sit above the
+// bucket's steady-state entry count rather than near it. 8,192 is ~3.7x the
+// 2,231 implicit bricks measured for a whole scene.
+constexpr int32 kWaterBucketTableCapacity = 8192;
+
+// Which bucket a brick belongs to. floorDiv, not integer division: brick
+// coordinates go negative and C++ truncates toward zero, which would fold
+// bricks at -1 and +1 into the same bucket and put a sort-bucket seam through
+// the world origin.
+VoxelCoords::FVoxelCoord WaterPoolBucketKey(const VoxelCoords::FVoxelCoord& BrickCoord)
 {
-	if (UVoxelGpuPoolComponent* Existing = Impl.Pool.Get())
-	{
-		return Existing;
-	}
+	return VoxelCoords::FVoxelCoord{
+		int64(vxc::floorDiv(int64_t(BrickCoord.X), int64_t(kWaterPoolBucketBricks))),
+		int64(vxc::floorDiv(int64_t(BrickCoord.Y), int64_t(kWaterPoolBucketBricks))),
+		int64(vxc::floorDiv(int64_t(BrickCoord.Z), int64_t(kWaterPoolBucketBricks)))};
+}
+
+// A bucket's rebase: the world-space corner of the bucket itself. Derived, not
+// remembered -- see FPoolBucket::Rebase.
+FVector WaterPoolBucketRebase(const VoxelCoords::FVoxelCoord& BucketKey)
+{
+	constexpr double kBucketUU =
+		double(kWaterPoolBucketBricks) * double(vxc::WaterBrick8::kEdge) * VoxelCoords::VoxelSizeUU;
+	return FVector(double(BucketKey.X) * kBucketUU, double(BucketKey.Y) * kBucketUU,
+	               double(BucketKey.Z) * kBucketUU);
+}
+
+UVoxelGpuPoolComponent* SpawnWaterPoolPrimitive(AActor* ChunkOwner, UMaterialInterface* Material,
+                                                const VoxelCoords::FVoxelCoord& BucketKey)
+{
 	UWorld* World = ChunkOwner ? ChunkOwner->GetWorld() : nullptr;
 	if (World == nullptr)
 	{
@@ -601,20 +761,27 @@ UVoxelGpuPoolComponent* GetOrCreateWaterPool(FVoxelWaterImpl& Impl, AActor* Chun
 		return nullptr;
 	}
 #if WITH_EDITOR
-	PoolOwner->SetActorLabel(TEXT("VoxelWaterPoolOwner"));
+	PoolOwner->SetActorLabel(FString::Printf(TEXT("VoxelWaterPoolOwner_%lld_%lld_%lld"), (long long)BucketKey.X,
+	                                         (long long)BucketKey.Y, (long long)BucketKey.Z));
 #endif
 
 	UVoxelGpuPoolComponent* Pool = NewObject<UVoxelGpuPoolComponent>(PoolOwner);
-	Pool->SetPoolName(TEXT("VoxelWaterPool"));
+	// NAMED PER BUCKET. Every pool diagnostic in this project is a log line
+	// keyed on the pool name (the pool has no per-brick state to inspect), and
+	// several buckets all printing "VoxelWaterPool draw SUBMITTED" would make
+	// the one number that matters unattributable -- which is the same reason
+	// the water pool got a name distinct from terrain's in the first place.
+	Pool->SetPoolName(FString::Printf(TEXT("VoxelWaterPool[%lld,%lld,%lld]"), (long long)BucketKey.X,
+	                                  (long long)BucketKey.Y, (long long)BucketKey.Z));
 	// vxc::WaterBrick8::kEdge. Terrain's 32 would still be CORRECT here (a
 	// larger bounds box is a looser cull, never a lost draw), but 8 is what the
 	// geometry actually spans and this pool's bricks are 1/64th the volume.
 	Pool->SetChunkEdgeVoxels(vxc::WaterBrick8::kEdge);
-	// Above the implicit-water disc's plausible resident-brick count, so an
-	// ordinary camera move does not oscillate across the table capacity and pay
-	// a full render-state rebuild -- and a full re-upload of the quad buffer --
-	// each time it does.
-	Pool->SetChunkTableCapacity(16384);
+	// Above this BUCKET's plausible resident-brick count, so an ordinary camera
+	// move does not oscillate across the table capacity and pay a full
+	// render-state rebuild -- and a full re-upload of the quad buffer -- each
+	// time it does. See kWaterBucketTableCapacity.
+	Pool->SetChunkTableCapacity(kWaterBucketTableCapacity);
 	// Makes the pooled path reproduce water's vertex-colour convention rather
 	// than terrain's: R = the CA fill fraction this subsystem's meshing sampler
 	// puts in the quad's `mat` byte (terrain puts a binary sky-facing biome
@@ -639,41 +806,213 @@ UVoxelGpuPoolComponent* GetOrCreateWaterPool(FVoxelWaterImpl& Impl, AActor* Chun
 	// before: SetRootComponent on a freshly NewObject'd component installs an
 	// identity transform and redefines the actor's location as the world
 	// origin, 84 km from anything worth drawing (invariant 2).
-	Impl.PoolRebase = FirstBrickOriginUU;
-	Pool->SetWorldLocation(Impl.PoolRebase);
+	//
+	// THE REBASE IS THE BUCKET'S OWN CORNER, not the first brick that arrived.
+	// That is what makes it derivable rather than remembered, and therefore what
+	// makes an emptied bucket re-homable by moving the component and nothing
+	// else. It also bounds every chunk-table origin to [0, 5120) UU on each
+	// axis -- a bucket edge -- which is a far tighter float32 range than the
+	// old first-brick rebase gave, since that one could be anywhere in the world
+	// relative to the water that later joined it.
+	Pool->SetWorldLocation(WaterPoolBucketRebase(BucketKey));
 
-	// Sized for the implicit-cavern-lake shell, which is the larger of the two
-	// producers by a wide margin: the CA's active set is budgeted at 4096 bricks
-	// (voxel.Water.MaxActiveBricks) and most of those are interior and emit
-	// nothing, whereas RefreshImplicitWater sweeps a 65x65x33 brick disc every
-	// time the camera crosses a brick. A brick's greedy mesh cannot exceed
-	// 6*64 = 384 quads, so this covers ~10k bricks even at the theoretical
-	// worst case and far more in practice. 32 MB.
-	constexpr uint32 kWaterPoolCapacityQuads = 4u * 1000u * 1000u;
-	Pool->InitPool(kWaterPoolCapacityQuads);
-
-	Impl.Pool = Pool;
-	UE_LOG(LogVoxelWater, Log,
-	       TEXT("voxel.Water.GPU: water pool up, %u quad capacity (%.0f MB), rebase (%.0f,%.0f,%.0f). "
-	            "Water bricks now draw as ranges in ONE primitive."),
-	       kWaterPoolCapacityQuads, double(kWaterPoolCapacityQuads) * 8.0 / (1024.0 * 1024.0),
-	       Impl.PoolRebase.X, Impl.PoolRebase.Y, Impl.PoolRebase.Z);
+	Pool->InitPool(kWaterBucketCapacityQuads);
 	return Pool;
+}
+
+UVoxelGpuPoolComponent* GetBucketPool(FVoxelWaterImpl& Impl, int32 BucketIndex)
+{
+	return Impl.PoolBuckets.IsValidIndex(BucketIndex) ? Impl.PoolBuckets[BucketIndex].Pool.Get() : nullptr;
+}
+
+} // namespace
+
+// AT GLOBAL SCOPE, NOT IN THE ANONYMOUS NAMESPACE ABOVE, and that is forced
+// rather than stylistic: FVoxelWaterImpl declares `struct FVoxelWaterPoolBatch*
+// ActiveBatch`, and an elaborated type specifier inside a class declares the
+// name in the nearest ENCLOSING namespace -- the global one, since
+// FVoxelWaterImpl is a global-scope struct. Defining it in the anonymous
+// namespace instead would create a second, unrelated type with the same
+// spelling, and the assignment in the constructor would not compile.
+//
+// Opens one publication scope per live bucket, and keeps accepting new buckets
+// for as long as it is alive. See FVoxelWaterImpl::ActiveBatch for why the
+// second half matters.
+//
+// The scopes are held by pointer in an array purely because
+// UVoxelGpuPoolComponent::FScopedBatch is deliberately non-copyable and
+// non-movable (its depth counter is the whole mechanism), so it cannot live in
+// a TArray by value.
+struct FVoxelWaterPoolBatch
+{
+	explicit FVoxelWaterPoolBatch(FVoxelWaterImpl& InImpl)
+		: Impl(InImpl)
+	{
+		for (const FVoxelWaterImpl::FPoolBucket& Bucket : Impl.PoolBuckets)
+		{
+			if (UVoxelGpuPoolComponent* Pool = Bucket.Pool.Get())
+			{
+				Scopes.Emplace(MakeUnique<UVoxelGpuPoolComponent::FScopedBatch>(Pool));
+			}
+		}
+		// LAST, so a bucket created by anything above cannot be adopted twice.
+		Impl.ActiveBatch = this;
+	}
+
+	~FVoxelWaterPoolBatch()
+	{
+		// Cleared BEFORE the scopes close: ~FScopedBatch flushes, a flush can in
+		// principle reach code that creates geometry, and adopting a bucket into
+		// a batch that is already unwinding would open a scope nothing closes.
+		Impl.ActiveBatch = nullptr;
+		Scopes.Empty();
+	}
+
+	FVoxelWaterPoolBatch(const FVoxelWaterPoolBatch&) = delete;
+	FVoxelWaterPoolBatch& operator=(const FVoxelWaterPoolBatch&) = delete;
+
+	void Adopt(UVoxelGpuPoolComponent* Pool)
+	{
+		if (Pool != nullptr)
+		{
+			Scopes.Emplace(MakeUnique<UVoxelGpuPoolComponent::FScopedBatch>(Pool));
+		}
+	}
+
+	FVoxelWaterImpl& Impl;
+	TArray<TUniquePtr<UVoxelGpuPoolComponent::FScopedBatch>> Scopes;
+};
+
+namespace
+{
+
+// Routes a brick to its sort bucket, creating or re-homing a pool primitive if
+// it needs one. Returns INDEX_NONE only if no primitive could be produced at
+// all, which the caller treats exactly like a full pool: the brick goes
+// undrawn rather than half-drawn.
+int32 GetOrCreateWaterPoolBucket(FVoxelWaterImpl& Impl, AActor* ChunkOwner, UMaterialInterface* Material,
+                                 const VoxelCoords::FVoxelCoord& BrickCoord)
+{
+	const VoxelCoords::FVoxelCoord BucketKey = WaterPoolBucketKey(BrickCoord);
+	if (const int32* Existing = Impl.PoolBucketIndex.Find(BucketKey))
+	{
+		if (GetBucketPool(Impl, *Existing) != nullptr)
+		{
+			return *Existing;
+		}
+		// The component was garbage collected out from under us (world teardown
+		// races, an editor PIE stop). Drop the mapping and fall through to make a
+		// new one rather than handing back an index whose pool is gone.
+		Impl.PoolBucketIndex.Remove(BucketKey);
+	}
+
+	// RE-HOME AN EMPTY BUCKET BEFORE ALLOCATING A NEW ONE. Water follows the
+	// camera; buckets behind it drain to zero live entries and would otherwise
+	// sit there holding 4 MB and a scene primitive for the rest of the session.
+	// An empty pool has no chunk-table entry, no run and no live quad naming its
+	// old rebase, so moving it is a transform change and nothing else.
+	for (int32 I = 0; I < Impl.PoolBuckets.Num(); ++I)
+	{
+		UVoxelGpuPoolComponent* Pool = Impl.PoolBuckets[I].Pool.Get();
+		if (Pool == nullptr || Pool->GetNumChunks() != 0)
+		{
+			continue;
+		}
+		Impl.PoolBucketIndex.Remove(Impl.PoolBuckets[I].Key);
+		Impl.PoolBuckets[I].Key = BucketKey;
+		Impl.PoolBuckets[I].Rebase = WaterPoolBucketRebase(BucketKey);
+		Pool->SetWorldLocation(Impl.PoolBuckets[I].Rebase);
+		Impl.PoolBucketIndex.Add(BucketKey, I);
+		UE_LOG(LogVoxelWater, Verbose,
+		       TEXT("voxel.Water.GPU: re-homed empty water bucket %d to (%lld,%lld,%lld)"),
+		       I, (long long)BucketKey.X, (long long)BucketKey.Y, (long long)BucketKey.Z);
+		return I;
+	}
+
+	if (Impl.PoolBuckets.Num() < kMaxWaterPoolBuckets)
+	{
+		UVoxelGpuPoolComponent* Pool = SpawnWaterPoolPrimitive(ChunkOwner, Material, BucketKey);
+		if (Pool == nullptr)
+		{
+			return INDEX_NONE;
+		}
+		FVoxelWaterImpl::FPoolBucket Bucket;
+		Bucket.Key = BucketKey;
+		Bucket.Pool = Pool;
+		Bucket.Rebase = WaterPoolBucketRebase(BucketKey);
+		const int32 Index = Impl.PoolBuckets.Add(Bucket);
+		Impl.PoolBucketIndex.Add(BucketKey, Index);
+		// A bucket born mid-loop joins the loop's publication scope. Without
+		// this, the first tick that reaches a new region publishes once per
+		// brick on it -- see FVoxelWaterImpl::ActiveBatch.
+		if (Impl.ActiveBatch != nullptr)
+		{
+			Impl.ActiveBatch->Adopt(Pool);
+		}
+		UE_LOG(LogVoxelWater, Log,
+		       TEXT("voxel.Water.GPU: water bucket %d up at (%lld,%lld,%lld), %u quad capacity (%.1f MB), "
+		            "rebase (%.0f,%.0f,%.0f). %d/%d buckets live."),
+		       Index, (long long)BucketKey.X, (long long)BucketKey.Y, (long long)BucketKey.Z,
+		       kWaterBucketCapacityQuads, double(kWaterBucketCapacityQuads) * 8.0 / (1024.0 * 1024.0),
+		       Bucket.Rebase.X, Bucket.Rebase.Y, Bucket.Rebase.Z, Impl.PoolBuckets.Num(), kMaxWaterPoolBuckets);
+		return Index;
+	}
+
+	// AT THE CAP. Fall back to the NEAREST live bucket rather than dropping the
+	// brick. It draws in the right place with the wrong sort key, which is
+	// precisely the pre-W5 behaviour for that brick and no worse.
+	//
+	// The chunk-table origin is then relative to a FOREIGN bucket's rebase, so
+	// this does spend float32 precision it would not otherwise: nearest-bucket
+	// keeps that offset as small as the live set allows, but after a teleport it
+	// could be kilometres, where float32 resolves to ~centimetres rather than the
+	// sub-millimetre a same-bucket brick enjoys. That is a visible-at-nothing
+	// error on 10 cm voxels and is accepted; it is also self-correcting, since
+	// the buckets behind the camera drain and the next brick re-homes one.
+	int32 Best = INDEX_NONE;
+	int64 BestDistSq = MAX_int64;
+	for (int32 I = 0; I < Impl.PoolBuckets.Num(); ++I)
+	{
+		if (Impl.PoolBuckets[I].Pool.Get() == nullptr)
+		{
+			continue;
+		}
+		const int64 Dx = int64(Impl.PoolBuckets[I].Key.X) - int64(BucketKey.X);
+		const int64 Dy = int64(Impl.PoolBuckets[I].Key.Y) - int64(BucketKey.Y);
+		const int64 Dz = int64(Impl.PoolBuckets[I].Key.Z) - int64(BucketKey.Z);
+		const int64 DistSq = Dx * Dx + Dy * Dy + Dz * Dz;
+		if (DistSq < BestDistSq)
+		{
+			BestDistSq = DistSq;
+			Best = I;
+		}
+	}
+	UE_LOG(LogVoxelWater, Warning,
+	       TEXT("voxel.Water.GPU: %d water sort buckets live (cap %d); brick bucket (%lld,%lld,%lld) folded into "
+	            "bucket %d. Translucent sorting degrades to pre-W5 for that region -- geometry is unaffected."),
+	       Impl.PoolBuckets.Num(), kMaxWaterPoolBuckets, (long long)BucketKey.X, (long long)BucketKey.Y,
+	       (long long)BucketKey.Z, Best);
+	return Best;
 }
 
 // The pooled equivalent of "destroy this brick's component". Safe to call for a
 // brick that was never pooled.
-void ReleaseWaterBrickPooled(FVoxelWaterImpl& Impl, TMap<VoxelCoords::FVoxelCoord, int32>& Slots,
+void ReleaseWaterBrickPooled(FVoxelWaterImpl& Impl,
+                             TMap<VoxelCoords::FVoxelCoord, FVoxelWaterImpl::FPooledBrick>& Slots,
                              const VoxelCoords::FVoxelCoord& BrickCoord)
 {
-	int32 Slot = INDEX_NONE;
-	if (!Slots.RemoveAndCopyValue(BrickCoord, Slot) || Slot == INDEX_NONE)
+	FVoxelWaterImpl::FPooledBrick Slot;
+	if (!Slots.RemoveAndCopyValue(BrickCoord, Slot) || Slot.Handle == INDEX_NONE)
 	{
 		return;
 	}
-	if (UVoxelGpuPoolComponent* Pool = Impl.Pool.Get())
+	// Released through the bucket the handle was ISSUED BY, which the record
+	// carries. Re-deriving it from BrickCoord would be wrong the moment a bucket
+	// is re-homed: the brick's key would name a bucket that is now somewhere
+	// else, and RemoveChunk would free a stranger's range.
+	if (UVoxelGpuPoolComponent* Pool = GetBucketPool(Impl, Slot.Bucket))
 	{
-		Pool->RemoveChunk(Slot);
+		Pool->RemoveChunk(Slot.Handle);
 	}
 }
 
@@ -684,11 +1023,12 @@ void ReleaseWaterBrickPooled(FVoxelWaterImpl& Impl, TMap<VoxelCoords::FVoxelCoor
 // to a component for it, because a brick drawn twice is worse than a brick
 // drawn once.
 bool ApplyWaterBrickPooled(FVoxelWaterImpl& Impl, AActor* ChunkOwner, UMaterialInterface* Material,
-                           TMap<VoxelCoords::FVoxelCoord, int32>& Slots,
+                           TMap<VoxelCoords::FVoxelCoord, FVoxelWaterImpl::FPooledBrick>& Slots,
                            const VoxelCoords::FVoxelCoord& BrickCoord,
                            const FVector& BrickOriginUU,
                            const TArray<FVoxelChunkQuad>& Quads,
-                           const TArray<uint32>& CornerHeights)
+                           const TArray<uint32>& CornerHeights,
+                           float Activity)
 {
 	// One packed corner word per quad, always -- EmitWaterQuads fills both arrays
 	// in lockstep, including on the split path. The pool indexes them by the same
@@ -696,7 +1036,19 @@ bool ApplyWaterBrickPooled(FVoxelWaterImpl& Impl, AActor* ChunkOwner, UMaterialI
 	// by however many quads had been dropped.
 	check(CornerHeights.Num() == Quads.Num());
 
-	UVoxelGpuPoolComponent* Pool = GetOrCreateWaterPool(Impl, ChunkOwner, Material, BrickOriginUU);
+	// A RESIDENT BRICK STAYS IN THE BUCKET THAT ISSUED ITS HANDLE, even if that
+	// bucket has since been re-homed elsewhere. Moving it would mean a free in
+	// one pool and an alloc in another with the geometry visible in neither for
+	// a frame, to fix a sort key -- and a brick only ends up in a foreign bucket
+	// via the at-cap fallback, which is a degraded case by construction.
+	FVoxelWaterImpl::FPooledBrick* ExistingSlot = Slots.Find(BrickCoord);
+	const bool bResident = ExistingSlot != nullptr && ExistingSlot->Handle != INDEX_NONE
+		&& GetBucketPool(Impl, ExistingSlot->Bucket) != nullptr;
+
+	const int32 BucketIndex = bResident
+		? ExistingSlot->Bucket
+		: GetOrCreateWaterPoolBucket(Impl, ChunkOwner, Material, BrickCoord);
+	UVoxelGpuPoolComponent* Pool = GetBucketPool(Impl, BucketIndex);
 	if (Pool == nullptr)
 	{
 		return false;
@@ -712,25 +1064,39 @@ bool ApplyWaterBrickPooled(FVoxelWaterImpl& Impl, AActor* ChunkOwner, UMaterialI
 		Packed[I] = PackVoxelChunkQuad(Quads[I]);
 	}
 
-	int32* ExistingSlot = Slots.Find(BrickCoord);
+	// Params: xy = terrain's climate pair, z = terrain's surface gate, w spare.
+	// Water uses exactly ONE of them.
+	//
+	// .y IS THE FOAM ACTIVITY (W5). The vertex factory writes ChunkParams.y
+	// straight into vertex colour A under every mode
+	// (VoxelQuadVertexFactory.ush: `Intermediates.Color = half4(..., ChunkClimate.y)`),
+	// so this reaches M_WaterVoxel with ZERO shader plumbing -- no new uniform
+	// member, and therefore no exposure to the loose-FShaderParameter trap that
+	// silently no-ops in this vertex factory (docs/gpu-g2-draw-path.md).
+	// .x stays at terrain's neutral midpoint and .z at kNoSurfaceGate
+	// ("everything counts as surface"), which is the same well-defined fallback
+	// the pool gives its own hidden entry; neither reaches this material.
+	const FVector4f Params(0.5f, FMath::Clamp(Activity, 0.0f, 1.0f),
+	                       UVoxelGpuPoolComponent::kNoSurfaceGate, 0.0f);
+
 	int32 NewSlot;
-	if (ExistingSlot && *ExistingSlot != INDEX_NONE)
+	if (bResident)
 	{
+		// PARAMS FIRST, THEN THE RE-MESH. SetChunkParams only marks the chunk
+		// table dirty and defers; UpdateChunk's own PushUpdatesToProxy then
+		// carries the new row in the same publication. The other order would
+		// leave activity trailing the geometry by one flush -- which, for a
+		// brick that just went still, means one tick of foam on settled water.
+		Pool->SetChunkParams(ExistingSlot->Handle, Params);
 		// Re-mesh in place. This is water's COMMON case, not its rare one: every
 		// active brick re-meshes at the 10 Hz CA cadence, so free+realloc on each
 		// tick would fragment the pool far faster than terrain digging does.
-		NewSlot = Pool->UpdateChunk(*ExistingSlot, Packed, CornerHeights);
+		NewSlot = Pool->UpdateChunk(ExistingSlot->Handle, Packed, CornerHeights);
 	}
 	else
 	{
-		// Params: water's material samples none of these. Climate is held at the
-		// neutral midpoint and the surface gate at kNoSurfaceGate ("everything
-		// counts as surface"), which is the same well-defined fallback the pool
-		// gives its own hidden entry -- these feed vertex colour R/B/A, and
-		// M_WaterVoxel reads only G.
 		NewSlot = Pool->AddChunk(
-			Packed, FVector3f(BrickOriginUU - Impl.PoolRebase), /*Level=*/0,
-			FVector4f(0.5f, 0.5f, UVoxelGpuPoolComponent::kNoSurfaceGate, 0.0f),
+			Packed, FVector3f(BrickOriginUU - Impl.PoolBuckets[BucketIndex].Rebase), /*Level=*/0, Params,
 			&CornerHeights);
 	}
 
@@ -740,12 +1106,13 @@ bool ApplyWaterBrickPooled(FVoxelWaterImpl& Impl, AActor* ChunkOwner, UMaterialI
 		// undrawn rather than pointing at a range that is no longer its own.
 		Slots.Remove(BrickCoord);
 		UE_LOG(LogVoxelWater, Warning,
-		       TEXT("voxel.Water.GPU: no room for %d quads (%u free, largest run %u). Brick left undrawn."),
-		       Packed.Num(), Pool->GetFreeQuads(), Pool->GetLargestFreeRun());
+		       TEXT("voxel.Water.GPU: no room for %d quads in bucket %d (%u free, largest run %u). "
+		            "Brick left undrawn."),
+		       Packed.Num(), BucketIndex, Pool->GetFreeQuads(), Pool->GetLargestFreeRun());
 		return false;
 	}
 
-	Slots.Add(BrickCoord, NewSlot);
+	Slots.Add(BrickCoord, FVoxelWaterImpl::FPooledBrick{BucketIndex, NewSlot});
 	return true;
 }
 
@@ -1445,7 +1812,13 @@ void RemeshDirtyBricks(FVoxelWaterImpl& Impl, AActor* ChunkOwner, USceneComponen
 	//
 	// The component path below (the non-pooled arm) is untouched by this: it owns
 	// UWaterChunkComponents, not pool ranges.
-	UVoxelGpuPoolComponent::FScopedBatch WaterPoolBatch(Impl.Pool.Get());
+	//
+	// W5: ONE SCOPE PER BUCKET, and one that adopts buckets created inside the
+	// loop. Splitting the pool into several primitives split the publication
+	// with it, so a single scope over a single pool would silently have stopped
+	// batching most of the work -- the failure mode being a perf regression with
+	// no counter moving, since every brick would still land correctly.
+	FVoxelWaterPoolBatch WaterPoolBatch(Impl);
 
 	for (const VoxelCoords::FVoxelCoord& BrickCoord : ToProcess)
 	{
@@ -1621,6 +1994,13 @@ void RemeshDirtyBricks(FVoxelWaterImpl& Impl, AActor* ChunkOwner, USceneComponen
 		                            double(Key.y) * double(vxc::WaterBrick8::kEdge) * VoxelCoords::VoxelSizeUU,
 		                            double(Key.z) * double(vxc::WaterBrick8::kEdge) * VoxelCoords::VoxelSizeUU);
 
+		// W5 FOAM ACTIVITY, and the ONE place both render paths read it, so they
+		// cannot drift. 1 while vxc::WaterCA still calls this brick active,
+		// 0 the moment it settles -- and the settle transition reaches here at
+		// all only because StepFixed marks the bricks that LEFT the active set
+		// dirty exactly once. See FVoxelWaterImpl::ActiveBricks.
+		const float Activity = Impl.ActiveBricks.Contains(BrickCoord) ? 1.0f : 0.0f;
+
 		// A brick already holding a component keeps the component path even if
 		// the cvar flipped underneath it, and vice versa: mixing representations
 		// for ONE brick would draw it twice. New bricks take whichever path is
@@ -1630,7 +2010,7 @@ void RemeshDirtyBricks(FVoxelWaterImpl& Impl, AActor* ChunkOwner, USceneComponen
 		if (bAlreadyPooled || (!bAlreadyComponent && VoxelDebug::GetWaterGpu()))
 		{
 			ApplyWaterBrickPooled(Impl, ChunkOwner, Material, Impl.PoolSlots, BrickCoord, BrickOriginUU, Quads,
-			                      CornerHeights);
+			                      CornerHeights, Activity);
 			continue;
 		}
 
@@ -1651,7 +2031,7 @@ void RemeshDirtyBricks(FVoxelWaterImpl& Impl, AActor* ChunkOwner, USceneComponen
 			Comp->RegisterComponent();
 			Impl.ChunkComponents.Add(BrickCoord, Comp);
 		}
-		Comp->SetChunkQuads(MoveTemp(Quads), MoveTemp(CornerHeights));
+		Comp->SetChunkQuads(MoveTemp(Quads), MoveTemp(CornerHeights), Activity);
 	}
 
 	if (DeferredCount > 0)
@@ -2022,12 +2402,20 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 		                            double(Oz) * VoxelCoords::VoxelSizeUU);
 
 		// Same "dispatch on what the brick holds" rule as the CA path above.
+		//
+		// ACTIVITY IS ZERO HERE AND ALWAYS WILL BE, and that is a statement about
+		// what implicit water IS rather than a placeholder: the implicit field is
+		// a static worldgen flood level, so no implicit brick is ever in the CA's
+		// active set. A brick that starts moving is MOBILIZED, which hands it to
+		// the CA half and destroys the implicit range in the same frame
+		// (MarkMobilizedBricksDirty) -- so foam appears exactly at the handover
+		// and never on a still cavern lake.
 		const bool bAlreadyPooled = Impl.ImplicitPoolSlots.Contains(BrickCoord);
 		const bool bAlreadyComponent = Impl.ImplicitChunkComponents.Contains(BrickCoord);
 		if (bAlreadyPooled || (!bAlreadyComponent && VoxelDebug::GetWaterGpu()))
 		{
 			ApplyWaterBrickPooled(Impl, ChunkOwner, Material, Impl.ImplicitPoolSlots, BrickCoord, BrickOriginUU, Quads,
-			                      CornerHeights);
+			                      CornerHeights, /*Activity=*/0.0f);
 			++Built;
 			continue;
 		}
@@ -2043,7 +2431,7 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 			Comp->RegisterComponent();
 			Impl.ImplicitChunkComponents.Add(BrickCoord, Comp);
 		}
-		Comp->SetChunkQuads(MoveTemp(Quads), MoveTemp(CornerHeights));
+		Comp->SetChunkQuads(MoveTemp(Quads), MoveTemp(CornerHeights), /*Activity=*/0.0f);
 		++Built;
 	}
 
@@ -2669,12 +3057,38 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 		}
 	}
 
+	// W5: the active set is now a RENDER input as well as a re-mesh trigger --
+	// it is the foam signal, written into vertex colour A by both paths (see
+	// FVoxelWaterImpl::ActiveBricks and ApplyWaterBrickPooled's Params).
+	//
+	// THE SETTLE EDGE IS THE WHOLE REASON THIS IS A DIFF AND NOT A LOOP. A brick
+	// that stops being active stops being marked dirty, so it stops being
+	// re-meshed -- and its last re-mesh was one where it WAS active. Foam would
+	// therefore switch on correctly and then never switch off, freezing whitewater
+	// onto water that has been perfectly still for minutes. Marking the bricks
+	// that LEFT the set dirty costs exactly one extra re-mesh per brick per
+	// activity episode, and it is the cheapest possible fix: the alternative is a
+	// per-brick decay timer that has to re-publish on a schedule of its own.
+	//
+	// Deliberately NOT added to DirtySinceLastBroadcast: a settle carries no fill
+	// change, so replicating it would spend bandwidth on a diff that is empty.
+	TSet<VoxelCoords::FVoxelCoord> NowActive;
+	NowActive.Reserve(int32(Impl.CA.activeBricks().size()));
 	for (const vxc::BrickKey& K : Impl.CA.activeBricks())
 	{
 		const VoxelCoords::FVoxelCoord C = ToCoord(K);
+		NowActive.Add(C);
 		Impl.DirtyBricks.Add(C);
 		Impl.DirtySinceLastBroadcast.Add(C);
 	}
+	for (const VoxelCoords::FVoxelCoord& C : Impl.ActiveBricks)
+	{
+		if (!NowActive.Contains(C))
+		{
+			Impl.DirtyBricks.Add(C);
+		}
+	}
+	Impl.ActiveBricks = MoveTemp(NowActive);
 
 	// Task item 3: "if steppedBrickCount exceeds a cvar cap ... log-throttle
 	// warning (do not explode)". The CA's tick contract (waterca.h) is
@@ -2816,11 +3230,17 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 
 	// --- voxel.Water.GPU pool status, 1Hz -----------------------------------
 	//
-	// Budgeted before it was needed. ONE primitive drawing thousands of bricks
-	// has no component to select, no per-brick proxy to break on, and no
+	// Budgeted before it was needed. A pooled primitive drawing thousands of
+	// bricks has no component to select, no per-brick proxy to break on, and no
 	// per-brick state of any kind -- so if the pooled water renders wrong or not
-	// at all, this line and the pool's own "VoxelWaterPool draw
+	// at all, this line and the pool's own "VoxelWaterPool[x,y,z] draw
 	// SUBMITTED/SKIPPED" are the entire first rung of the diagnostic ladder.
+	//
+	// W5 ADDS THE BUCKET CENSUS, and it is the line to read first when the sort
+	// A/B looks wrong. `buckets=1` means every water surface in the world is
+	// still sharing one sort key and the split did not take effect -- which is
+	// the pre-W5 picture exactly, and would otherwise be indistinguishable from
+	// "the split worked and the sort was never the problem".
 	// Deliberately mirrors the terrain pool's shape (live entries, quads,
 	// free-vs-largest-run, which is the number that tells "genuinely full" from
 	// "merely fragmented").
@@ -2828,18 +3248,42 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 	if (Impl->PoolLogAccumSeconds >= 1.0f)
 	{
 		Impl->PoolLogAccumSeconds = 0.f;
-		if (const UVoxelGpuPoolComponent* Pool = Impl->Pool.Get())
+		int32 LiveBuckets = 0;
+		int32 DrawingBuckets = 0;
+		int32 LiveEntries = 0;
+		uint32 UsedQuads = 0;
+		uint32 FreeQuads = 0;
+		uint32 SmallestLargestRun = MAX_uint32;
+		int32 MaxFreeRuns = 0;
+		for (const FVoxelWaterImpl::FPoolBucket& Bucket : Impl->PoolBuckets)
 		{
+			const UVoxelGpuPoolComponent* Pool = Bucket.Pool.Get();
+			if (Pool == nullptr)
+			{
+				continue;
+			}
+			++LiveBuckets;
+			DrawingBuckets += (Pool->GetNumChunks() > 0) ? 1 : 0;
+			LiveEntries += Pool->GetNumChunks();
 			// GetNumQuads() is the pool's CAPACITY, not its occupancy -- the
 			// whole buffer is allocated up front because incremental writes
 			// address absolute offsets. Occupancy is capacity minus free.
-			const uint32 UsedQuads = uint32(Pool->GetNumQuads()) - Pool->GetFreeQuads();
+			UsedQuads += uint32(Pool->GetNumQuads()) - Pool->GetFreeQuads();
+			FreeQuads += Pool->GetFreeQuads();
+			// The WORST bucket's largest free run, not the sum: fragmentation is
+			// a per-allocator property and summing it across pools would report a
+			// comfortable number for a set in which one pool is about to start
+			// refusing geometry. Same argument for taking the max free-run count.
+			SmallestLargestRun = FMath::Min(SmallestLargestRun, Pool->GetLargestFreeRun());
+			MaxFreeRuns = FMath::Max(MaxFreeRuns, Pool->GetFreeRunCount());
+		}
+		if (LiveBuckets > 0)
+		{
 			UE_LOG(LogVoxelWater, Log,
-			       TEXT("VoxelWaterPool: %d live entries (%d CA + %d implicit), %u quads used, "
-			            "%u free, largest run %u, %d free runs, high water %u"),
-			       Pool->GetNumChunks(), Impl->PoolSlots.Num(), Impl->ImplicitPoolSlots.Num(),
-			       UsedQuads, Pool->GetFreeQuads(), Pool->GetLargestFreeRun(),
-			       Pool->GetFreeRunCount(), Pool->GetHighWaterMarkQuads());
+			       TEXT("VoxelWaterPool: %d buckets (%d drawing, cap %d), %d live entries (%d CA + %d implicit), "
+			            "%u quads used, %u free, worst largest run %u, worst free runs %d"),
+			       LiveBuckets, DrawingBuckets, kMaxWaterPoolBuckets, LiveEntries, Impl->PoolSlots.Num(),
+			       Impl->ImplicitPoolSlots.Num(), UsedQuads, FreeQuads, SmallestLargestRun, MaxFreeRuns);
 		}
 	}
 
@@ -3093,6 +3537,187 @@ uint8 UVoxelWaterSubsystem::GetMaxStoredFill() const
 				for (int x = 0; x < vxc::WaterBrick8::kEdge; ++x) Max = FMath::Max(Max, B.get(x, y, z));
 	}
 	return Max;
+}
+
+// --- W4 SWE diagnostics (VoxelWaterSubsystem.h's three PODs) -----------------
+//
+// Read-only, added for -VoxelSweBreachTest. See the header for why they exist
+// at all; the short version is that the sheet lives inside FVoxelWaterImpl and
+// the difference between "spreading correctly" and "seated wrong" is a
+// per-column comparison, not a total.
+
+bool UVoxelWaterSubsystem::GetSweProbe(FVoxelSweProbe& Out) const
+{
+	Out = FVoxelSweProbe{};
+	if (!Impl)
+	{
+		return false;
+	}
+	// CA volume is reported whether or not the sheet is armed -- a CA-only run
+	// of the fixture needs exactly this number to compare against.
+	Out.CaVolume = int64(Impl->CA.totalVolume());
+	if (!Impl->SweSheet || !Impl->SweCoupler)
+	{
+		return false;
+	}
+
+	const vxc::SweGrid& Grid = *Impl->SweSheet;
+	Out.bArmed = true;
+	Out.SheetVolume = Grid.totalVolume();
+	Out.Injected = Impl->SweInjected;
+	Out.ConservationFailures = Impl->SweConservationFailures;
+	Out.SweColumns = Impl->SweCoupler->sweColumnCount();
+	Out.LastPunctured = Impl->SweCoupler->lastPuncturedCount();
+	Out.TransferredToCA = Impl->SweCoupler->transferredToCA();
+	Out.TransferredToSWE = Impl->SweCoupler->transferredToSWE();
+	Out.OriginVx = Grid.originVx();
+	Out.OriginVy = Grid.originVy();
+	Out.SizeX = Grid.sizeX();
+	Out.SizeY = Grid.sizeY();
+	Out.SheetScanVoxels = Impl->SweCoupler->config().sheetScanVoxels;
+	Out.SettleToleranceFill = vxc::sweSettleTolerance(Grid.config());
+	return true;
+}
+
+bool UVoxelWaterSubsystem::GetWaterColumnProbe(int64 Vx, int64 Vy, int64 ScanFromVz, int32 ScanVoxels,
+                                                FVoxelWaterColumnProbe& Out) const
+{
+	Out = FVoxelWaterColumnProbe{};
+	Out.Vx = Vx;
+	Out.Vy = Vy;
+	if (!Impl)
+	{
+		return false;
+	}
+	ScanVoxels = FMath::Max(ScanVoxels, 1);
+
+	// CA side and terrain side in ONE downward walk, so the two answers are
+	// read from the same instant and the same window.
+	for (int32 K = 0; K < ScanVoxels; ++K)
+	{
+		const int64 Vz = ScanFromVz - K;
+		const uint8 Fill = Impl->CA.fillAt(Vx, Vy, Vz);
+		if (Fill != 0)
+		{
+			Out.CaColumnFill += int32(Fill);
+			if (Out.CaTopFill == 0)
+			{
+				Out.CaTopFill = Fill;
+				Out.CaTopVz = Vz;
+			}
+		}
+		if (!Out.bTerrainTopFound && Impl->Terrain.IsSolidAtVoxel(Vx, Vy, Vz))
+		{
+			Out.bTerrainTopFound = true;
+			Out.TerrainTopSolidVz = Vz;
+		}
+	}
+
+	if (!Impl->SweSheet || !Impl->SweCoupler)
+	{
+		return true;
+	}
+	const vxc::SweGrid& Grid = *Impl->SweSheet;
+	Out.bSweArmed = true;
+	if (!Grid.inBounds(Vx, Vy))
+	{
+		return true;
+	}
+	Out.bInSheet = true;
+	Out.bSweOwned = Impl->SweCoupler->isSweColumn(Vx, Vy);
+	Out.Bed = Grid.bedAt(Vx, Vy);
+	Out.Depth = Grid.depthAt(Vx, Vy);
+	const vxc::SweVelocity V = Grid.velocityAt(Vx, Vy);
+	Out.VelXMmPerSec = V.xMmPerSec;
+	Out.VelYMmPerSec = V.yMmPerSec;
+	Out.FluxXFillPerTick = Grid.faceFluxX(Vx, Vy);
+	Out.FluxYFillPerTick = Grid.faceFluxY(Vx, Vy);
+	return true;
+}
+
+bool UVoxelWaterSubsystem::AuditSweBedSeating(FVoxelSweBedAudit& Out) const
+{
+	Out = FVoxelSweBedAudit{};
+	if (!Impl || !Impl->SweSheet || !Impl->SweCoupler)
+	{
+		return false;
+	}
+	Out.bArmed = true;
+
+	const vxc::SweGrid& Grid = *Impl->SweSheet;
+
+	// THE SAME callback the arming path built and handed to both SeatSweBedZ
+	// and the coupler. Re-deriving it here (rather than using the bare terrain
+	// query) is the whole point: the audit must ask the question the seating
+	// code asked, or a "mismatch" would just be the mobilizer wrapper.
+	vxc::WaterCA::SolidFn Solid = Impl->Mob.makeSolidFn();
+
+	for (int32 Cy = 0; Cy < Grid.sizeY(); ++Cy)
+	{
+		for (int32 Cx = 0; Cx < Grid.sizeX(); ++Cx)
+		{
+			const int64 Vx = Grid.originVx() + Cx;
+			const int64 Vy = Grid.originVy() + Cy;
+			++Out.Columns;
+
+			const int32 StoredBed = Grid.bedAt(Vx, Vy);
+			const bool bSweOwned = Impl->SweCoupler->isSweColumn(Vx, Vy);
+			if (bSweOwned)
+			{
+				++Out.SweOwned;
+			}
+			if (Solid(Vx, Vy, StoredBed) != vxc::MAT_AIR)
+			{
+				++Out.Seated;
+			}
+
+			// (a) Re-seat with the identical function and the live world.
+			const double SurfaceZUU = Impl->Terrain.GetSurfaceHeightUU(double(Vx) * VoxelCoords::VoxelSizeUU,
+			                                                           double(Vy) * VoxelCoords::VoxelSizeUU);
+			const int64 SurfaceVz = int64(FMath::FloorToDouble(SurfaceZUU / VoxelCoords::VoxelSizeUU));
+			bool bFound = false;
+			const int32 Reseated = SeatSweBedZ(Solid, Vx, Vy, SurfaceVz, bFound);
+			if (bFound && Reseated != StoredBed)
+			{
+				++Out.Mismatched;
+				if (bSweOwned)
+				{
+					++Out.SweOwnedMismatched;
+				}
+				const int32 AbsDelta = FMath::Abs(Reseated - StoredBed);
+				Out.SumAbsDeltaVoxels += AbsDelta;
+				if (AbsDelta > Out.MaxAbsDeltaVoxels)
+				{
+					Out.MaxAbsDeltaVoxels = AbsDelta;
+					Out.WorstVx = Vx;
+					Out.WorstVy = Vy;
+					Out.WorstStoredBed = StoredBed;
+					Out.WorstReseatedBed = Reseated;
+				}
+			}
+
+			// (b) The bare-terrain cross-check, over the same window, with no
+			// mobilizer wrapper. Differences here are EXPECTED over implicit
+			// cavern water and are reported separately for that reason.
+			const int64 TopZ = SurfaceVz + kSweBedScanAboveVoxels;
+			bool bTerrainFound = false;
+			int64 TerrainTop = 0;
+			for (int32 K = 0; K < kSweBedScanVoxels + kSweBedScanAboveVoxels; ++K)
+			{
+				if (Impl->Terrain.IsSolidAtVoxel(Vx, Vy, TopZ - K))
+				{
+					bTerrainFound = true;
+					TerrainTop = TopZ - K;
+					break;
+				}
+			}
+			if (bTerrainFound && TerrainTop != int64(StoredBed))
+			{
+				++Out.MismatchedVsTerrain;
+			}
+		}
+	}
+	return true;
 }
 
 // --- C7/C8 underground water ------------------------------------------------

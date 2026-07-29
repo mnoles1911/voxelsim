@@ -10,16 +10,17 @@ the deliverable as much as the code was.
 | | terrain pool | water pool | shared? |
 |---|---|---|---|
 | Material | `M_VoxelTerrain` | `M_WaterVoxel` | per-instance setter |
-| Blend mode | opaque/masked | **translucent**, two-sided, opacity 0.55 | material only |
+| Blend mode | opaque/masked | **translucent**, two-sided, opacity 0.18–0.95 by depth/foam (W5; was a constant 0.55) | material only |
 | Quad packing | `PackVoxelChunkQuad` | same | **yes, unchanged** |
 | Decode | `VoxelQuadDecode.ush` | same | **yes, unchanged** |
 | Vertex factory | `VoxelQuadVertexFactory.ush` | same + a water branch | **CORRECTED — see below** |
-| Vertex colour used | R biome tint, G AO, B/A climate | **R fill, G AO, B top-boundary** | **CORRECTED — see below** |
-| Per-chunk material params | ring cross-fade, debug tint | **none** | n/a |
+| Vertex colour used | R biome tint, G AO, B/A climate | **R fill, G AO, B top-boundary, A activity** | **CORRECTED — see below** |
+| Per-chunk material params | ring cross-fade, debug tint | **`.y` = foam activity** (W5) | n/a |
 | Entry size | 32-voxel chunk | 8-voxel `vxc::WaterBrick8` | per-instance setter |
 | Mip levels | 0..5 | always 0 | n/a |
 | Shadows | `CastShadow` true | `CastShadow` true | same |
 | Proxy relevance | — | `bTranslucentSelfShadow`, `CanBeOccluded` | added to both |
+| Instances | one | **4–8 spatial sort buckets** (W5; was one) | per-instance setter |
 
 Two rows carry the whole result.
 
@@ -128,6 +129,63 @@ If any of those land, the pool needs either per-region sort keys (several
 primitives, one per spatial bucket, giving back most of the win) or an
 order-independent-transparency path. **Do not add them and assume the pool
 still holds.**
+
+> **SUPERSEDED (W5). Two of the three landed, and the fallback this paragraph
+> named was built first.** Depth-tinted absorption and foam both make two water
+> fragments differ in colour AND opacity, not merely in lighting, so the
+> `(1-0.55)^N`-in-any-order argument above no longer applies to anything. The
+> single sort key is gone with it.
+>
+> **The water pool is now several primitives, bucketed at 64 water bricks
+> (51.2 m) of world space** — see `GetOrCreateWaterPoolBucket` in
+> `VoxelWaterSubsystem.cpp`. A typical scene draws 4–8 of them.
+>
+> **The mechanism, checked rather than assumed.** UE fills a translucent draw
+> command's sort distance from `PrimitiveBounds[PrimitiveIndex]
+> .BoxSphereBounds.Origin` (`UpdateTranslucentMeshSortKeys`,
+> `MeshDrawCommands.cpp`) — the PRIMITIVE's bounds centre, one value for every
+> command that primitive emits. The remaining tie-break, `MeshIdInPrimitive`, is
+> a stable id and sits *below* `Distance` in the key, so it can only order
+> batches *within* one primitive and never against a foreign one. Splitting the
+> primitive is therefore the only lever short of OIT, and emitting more mesh
+> batches from one primitive would have changed nothing.
+>
+> **64 bricks came from the implicit disc, not from taste.**
+> `RefreshImplicitWater` sweeps a 65×65×33 brick disc — 52×52×26 m — and that is
+> the largest single water body this system produces. A bucket bigger than the
+> disc would put the whole lake back into one primitive and give back nothing;
+> 64 makes it span 2×2 horizontally and 1–2 vertically. Rejected alternatives
+> (16-brick buckets, XY-only bucketing, per-view `MeshIdInPrimitive` ranking) are
+> argued at the constant's definition site.
+>
+> **What this does NOT fix, stated plainly because the bucket count makes it
+> tempting to assume otherwise.** Water surfaces stack most often at *one-brick*
+> range — the near side wall, the surface and the far side wall of a single
+> stepped pool — and no bucket size above a brick orders those. What bucketing
+> fixes is *long-range* compositing: one lake seen through another, water above a
+> cavern lake, and water against a foreign translucent primitive. Intra-bucket
+> order is still allocation order, exactly as it was.
+>
+> **The third break condition is still live and still forbidden.** Refraction or
+> any scene-*colour* read makes the composite order-dependent outright, which
+> bucketing does not help with at any granularity. Note that the depth tint's
+> scene-*depth* read is not that: depth comes from the opaque pass and is fixed
+> before any translucency draws, so every water fragment computes its own
+> thickness identically whatever order the stack is composed in.
+>
+> **Cost.** Each bucket owns a 4 MB quad buffer (512 k quads), its own chunk
+> table, its own proxy and its own cull walk. Buckets are recycled rather than
+> accumulated — water follows the camera, so a bucket that drains to zero live
+> entries is re-homed to a new region instead of a new one being allocated, which
+> is a `SetWorldLocation` and nothing else because the rebase is a pure function
+> of the bucket key. The cap is 12; past it, bricks fold into their nearest live
+> bucket, which draws them in the right place with the wrong sort key — i.e. the
+> overflow degrades to the pre-W5 behaviour rather than dropping geometry.
+>
+> **Read `buckets=` in the 1 Hz `VoxelWaterPool:` line before drawing any
+> conclusion from a sort A/B.** `buckets=1` means every water surface in the
+> world is still sharing one key and the split did not take effect, which is
+> pixel-identical to "the split worked and sorting was never the problem".
 
 ## The pool bug water exposed
 

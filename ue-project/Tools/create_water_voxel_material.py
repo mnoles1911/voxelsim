@@ -19,19 +19,41 @@ Vertex-color convention, which now DIFFERS from M_VoxelTerrain's in R:
   B = 1 if this vertex sits on the +Z boundary of its own voxel, else 0. The
       WPO moves only those, so a partial cell's side walls shorten with its
       surface instead of standing proud of it.
-  A = 255, unused.
+  A = per-brick FOAM ACTIVITY 0..1 (W5; was a fixed 255, unused). 1 while
+      vxc::WaterCA still calls this brick active, 0 once it settles and 0 for
+      every implicit (worldgen) brick. The pooled path reaches it via
+      ChunkParams.y, which the vertex factory already copies into colour A in
+      every mode -- no new uniform-buffer member, and therefore no exposure to
+      the loose-FShaderParameter trap that silently no-ops in this factory.
 
 Terrain packs a binary sky-facing biome flag in R and per-chunk climate in B,
 so this is water's OWN convention, not a shared one. The component path writes
 it directly (VoxelWaterChunkComponent.cpp) and the pooled path reproduces it
 under FVoxelQuadVertexFactoryParameters::WaterMode.
 
-Still deliberately basic on COLOUR: constant tint, constant 0.55 opacity, no
-refraction. That is load-bearing rather than lazy -- docs/gpu-water-pool-design.md
-shows the water pool is safe as ONE primitive with ONE translucent sort key only
-while those hold, since N surfaces then transmit (1-0.55)^N in any blend order.
-Depth-tinted absorption, foam and caustics each break that and want the sort-key
-work first; they are a separate, sequenced item.
+W5 COLOUR (this update): the constant tint and constant 0.55 opacity are GONE,
+replaced by depth-tinted absorption and foam. Read this before touching either.
+
+That constancy was load-bearing rather than lazy: docs/gpu-water-pool-design.md
+shows the water pool was safe as ONE primitive with ONE translucent sort key
+only while it held, since N identical surfaces transmit (1-0.55)^N in any blend
+order. Both terms below make two water fragments differ in COLOUR and OPACITY,
+not merely in lighting, so `over` composition stops being order-independent and
+the single sort key stops being sound.
+
+THE SORT WORK LANDED FIRST, IN THE SAME WAVE AND DELIBERATELY BEFORE THIS: the
+water pool is now several primitives bucketed at 64 bricks (51.2 m) of world
+space -- see GetOrCreateWaterPoolBucket in VoxelWaterSubsystem.cpp for why that
+size and what it does and does not fix. The ordering was the point: a tint
+applied over a broken sort makes a sorting artefact and a shading artefact
+indistinguishable, and there is no way back from that except reverting one.
+
+WHAT IS STILL NOT DONE, and is still a sort-key hazard if added: REFRACTION or
+any scene-COLOUR read. Reading scene DEPTH (below) is not the same thing --
+depth is written by the opaque pass and is invariant to translucent draw order,
+so each fragment computes its own thickness identically however the stack is
+composed. A scene-colour read is not, because the value it reads IS the
+partially composed stack.
 
 W3 "Rendering v0" MATERIAL MOTION (this update): makes the surface look like it
 is moving, material graph only, still without touching colour/opacity/refraction
@@ -110,21 +132,277 @@ def main():
 
     mel = unreal.MaterialEditingLibrary
 
-    base_tint = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -500, -300)
-    base_tint.set_editor_property("constant", unreal.LinearColor(0.05, 0.25, 0.55, 1.0))  # translucent blue
-
     vertex_color = mel.create_material_expression(material, unreal.MaterialExpressionVertexColor, -500, -100)
 
-    ao_multiply = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -200, -200)
-    if not mel.connect_material_expressions(base_tint, "", ao_multiply, "A"):
-        raise RuntimeError("connect base_tint -> ao_multiply.A failed")
+    # --- W5 (1/3): DEPTH-TINTED ABSORPTION ---------------------------------
+    #
+    # "Colour by depth through the surface, so shallow water reads pale and
+    # deep water reads deep." The quantity that means is the length of the
+    # VIEW RAY inside the water, and the renderer already knows it: for a
+    # translucent fragment, SceneDepth is the depth of the nearest OPAQUE
+    # surface behind it (translucency does not write depth), and PixelDepth is
+    # this fragment's own. Their difference is the along-ray thickness in
+    # unreal units.
+    #
+    # WHY NOT VertexColor.R, which is right here and already carries fill.
+    # Because it is the fill fraction of ONE CELL, not a depth: a brim-full
+    # cell is 1.0 whether it is the top of a 10 m lake or a 10 cm puddle, so
+    # tinting by it would colour by "how full is this voxel" and leave a
+    # puddle and an ocean identical. R drives geometry (the WPO below); it
+    # cannot drive absorption.
+    #
+    # WHY NOT A PER-BRICK COLUMN DEPTH pushed through ChunkParams. It would be
+    # order-independent and cheap, but a water brick is 80 cm on a side, so the
+    # tint would step in 80 cm blocks across a shoreline -- exactly the banding
+    # the per-corner heights were introduced to remove from the geometry. The
+    # view-ray thickness is continuous and, at a shallow grazing angle, is what
+    # actually makes a beach read as a beach.
+    #
+    # THE ORDER-DEPENDENCE THIS INTRODUCES IS REAL AND IS THE REASON THE SORT
+    # BUCKETS LANDED FIRST -- but note what it is NOT. Reading scene DEPTH does
+    # not make one water fragment's colour depend on another's: depth comes from
+    # the opaque pass and is fixed before any translucency draws. What changes
+    # is that two water fragments no longer have the SAME colour and opacity, so
+    # compositing them in the wrong order now shows. See the module docstring.
+    #
+    # KNOWN LIMITATION, worth stating rather than discovering: where nothing
+    # opaque is behind the water (a surface pool seen against the sky at a
+    # grazing angle), SceneDepth is the far plane and the water reads at maximum
+    # depth tint. Underground -- where all of this project's water currently is
+    # -- there is always a cavern wall or floor behind, so it does not arise;
+    # a sky-facing pour is the case to watch for.
+    scene_depth = mel.create_material_expression(material, unreal.MaterialExpressionSceneDepth, -1300, -700)
+    pixel_depth = mel.create_material_expression(material, unreal.MaterialExpressionPixelDepth, -1300, -600)
+
+    thickness_raw = mel.create_material_expression(material, unreal.MaterialExpressionSubtract, -1120, -650)
+    if not mel.connect_material_expressions(scene_depth, "", thickness_raw, "A"):
+        raise RuntimeError("connect scene_depth -> thickness_raw.A failed")
+    if not mel.connect_material_expressions(pixel_depth, "", thickness_raw, "B"):
+        raise RuntimeError("connect pixel_depth -> thickness_raw.B failed")
+
+    # Clamped at zero. The difference is negative wherever the water fragment
+    # is BEHIND the opaque depth it is being compared against, which happens on
+    # the frame a chunk streams in and, transiently, wherever the WPO ripple
+    # pushes a vertex past a wall. Feeding a negative into the exponential below
+    # would produce a transmittance ABOVE 1 and light the water up rather than
+    # darkening it -- a bright flash, which is far more visible than the
+    # sub-pixel geometry error that caused it.
+    thickness_zero = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -1120, -560)
+    thickness_zero.set_editor_property("r", 0.0)
+    thickness = mel.create_material_expression(material, unreal.MaterialExpressionMax, -960, -650)
+    if not mel.connect_material_expressions(thickness_raw, "", thickness, "A"):
+        raise RuntimeError("connect thickness_raw -> thickness.A failed")
+    if not mel.connect_material_expressions(thickness_zero, "", thickness, "B"):
+        raise RuntimeError("connect thickness_zero -> thickness.B failed")
+
+    # Beer-Lambert, one channel: depth01 = 1 - exp(-thickness / D).
+    #
+    # D = 250 UU (2.5 m) -- so 2.5 m of water is ~63% of the way to the deep
+    # colour, 5 m is ~86%, and 10 m is ~98%. Chosen against the SCENE this
+    # renders, not against real water: cavern lakes here are metres deep, not
+    # tens, and a real optical depth for clear water (order 10 m per channel)
+    # would leave every body in the game reading as the pale shallow colour and
+    # make the whole term invisible. A single scalar rather than a per-channel
+    # extinction vector for the same reason the AO multiply is one node: the
+    # per-channel version is a strictly better model that costs three
+    # exponentials, and the two-colour lerp below already puts the red loss in
+    # the right place by construction.
+    absorb_rate = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -960, -560)
+    absorb_rate.set_editor_property("r", -1.0 / 250.0)
+    absorb_exponent = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -800, -650)
+    if not mel.connect_material_expressions(thickness, "", absorb_exponent, "A"):
+        raise RuntimeError("connect thickness -> absorb_exponent.A failed")
+    if not mel.connect_material_expressions(absorb_rate, "", absorb_exponent, "B"):
+        raise RuntimeError("connect absorb_rate -> absorb_exponent.B failed")
+
+    transmittance = mel.create_material_expression(material, unreal.MaterialExpressionExponential, -650, -650)
+    if not mel.connect_material_expressions(absorb_exponent, "", transmittance, ""):
+        raise RuntimeError("connect absorb_exponent -> transmittance failed")
+
+    depth01 = mel.create_material_expression(material, unreal.MaterialExpressionOneMinus, -500, -650)
+    if not mel.connect_material_expressions(transmittance, "", depth01, ""):
+        raise RuntimeError("connect transmittance -> depth01 failed")
+
+    # Shallow: pale green-cyan, the colour of a few centimetres of water over
+    # rock. Deep: near-black blue. Neither is the old constant (0.05,0.25,0.55);
+    # that value sat between them and is what a ~2 m column now lands on, which
+    # is roughly where the previous look was calibrated.
+    shallow_tint = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -500, -480)
+    # NEUTRALISED PENDING CALIBRATION (2026-07-29). The authored value was
+    # (0.38, 0.66, 0.68) -- a pale cyan -- and in engine the pool washed out to
+    # near-WHITE, brighter than the terrain around it. Isolated by setting the
+    # foam activity gain to 0 and re-capturing: still white, so the depth tint
+    # is the cause and foam is exonerated.
+    #
+    # The graph, the buckets and the depth term all work; only these four
+    # constants are wrong, and they were shipped explicitly "reasoned but
+    # uncalibrated". Calibrating a water colour from screenshots at 3am is how
+    # you get a second wrong value, so both ends are pinned to the pre-W5 look
+    # -- LinearColor(0.05, 0.25, 0.55) at 0.55 opacity -- which renders exactly
+    # as the shipped water did. Re-enabling the effect is these four numbers,
+    # with a human looking at it.
+    shallow_tint.set_editor_property("constant", unreal.LinearColor(0.05, 0.25, 0.55, 1.0))
+    deep_tint = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -500, -400)
+    deep_tint.set_editor_property("constant", unreal.LinearColor(0.05, 0.25, 0.55, 1.0))  # neutralised, see shallow_tint
+
+    water_tint = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -320, -450)
+    if not mel.connect_material_expressions(shallow_tint, "", water_tint, "A"):
+        raise RuntimeError("connect shallow_tint -> water_tint.A failed")
+    if not mel.connect_material_expressions(deep_tint, "", water_tint, "B"):
+        raise RuntimeError("connect deep_tint -> water_tint.B failed")
+    if not mel.connect_material_expressions(depth01, "", water_tint, "Alpha"):
+        raise RuntimeError("connect depth01 -> water_tint.Alpha failed")
+
+    # Opacity varies with depth too, and that is the half that makes shallow
+    # water read as shallow rather than merely pale: a 5 cm film over a cavern
+    # floor should show the floor almost undimmed, which a fixed 0.55 cannot do
+    # at any tint. 0.18 -> 0.86 brackets the old 0.55 so a mid-depth body sits
+    # close to where this material has always sat.
+    shallow_opacity = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -500, -330)
+    shallow_opacity.set_editor_property("r", 0.55)  # neutralised, see shallow_tint
+    deep_opacity = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -500, -270)
+    deep_opacity.set_editor_property("r", 0.55)  # neutralised, see shallow_tint
+    depth_opacity = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -320, -300)
+    if not mel.connect_material_expressions(shallow_opacity, "", depth_opacity, "A"):
+        raise RuntimeError("connect shallow_opacity -> depth_opacity.A failed")
+    if not mel.connect_material_expressions(deep_opacity, "", depth_opacity, "B"):
+        raise RuntimeError("connect deep_opacity -> depth_opacity.B failed")
+    if not mel.connect_material_expressions(depth01, "", depth_opacity, "Alpha"):
+        raise RuntimeError("connect depth01 -> depth_opacity.Alpha failed")
+
+    # --- W5 (2/3): FOAM ----------------------------------------------------
+    #
+    # Two signals, both of which already exist -- no new geometry, no new
+    # texture, and (crucially) no new vertex-factory uniform member.
+    #
+    # SIGNAL 1, SLOPE. The water surface is a bilinear patch over four per-cell
+    # corner heights, and the vertex factory builds its shading normal from that
+    # patch (Decoded.ShadingNormal; the CPU path computes the identical
+    # -dH/du,-dH/dv,1 in VoxelWaterChunkComponent.cpp). So VertexNormalWS.z is
+    # already a slope reading, for free, and it is large wherever fill changes
+    # fast across a cell: a spilling front, a step between fill levels, water
+    # running down a slope. A settled pool has every corner equal, normal
+    # straight up, and no foam anywhere -- which is the behaviour that matters,
+    # because "foam everywhere all the time" is the standard way this effect
+    # goes wrong.
+    #
+    # SIGNAL 2, ACTIVITY. VertexColor.A, 1 while vxc::WaterCA still calls the
+    # brick active. This catches the case slope cannot: a brick churning
+    # violently but momentarily flat.
+    #
+    # SIDE WALLS ARE EXCLUDED BY THE NORMAL, NOT BY VertexColor.B. B is the
+    # top-BOUNDARY flag and is 1 on a side wall's upper pair of vertices, so
+    # masking with it would ring every water body with a foam stripe along the
+    # top of its side walls. A side face's shading normal has z == 0 exactly
+    # (only the top face's normal is replaced by the corner-height gradient), so
+    # saturate(N.z * 4) is 0 there and 1 on any top face that is not nearly
+    # vertical -- and it also excludes bottom faces, whose z is -1.
+    vertex_normal = mel.create_material_expression(material, unreal.MaterialExpressionVertexNormalWS, -1300, -200)
+    surface_normal_z = mel.create_material_expression(material, unreal.MaterialExpressionComponentMask, -1120, -200)
+    surface_normal_z.set_editor_property("r", False)
+    surface_normal_z.set_editor_property("g", False)
+    surface_normal_z.set_editor_property("b", True)
+    surface_normal_z.set_editor_property("a", False)
+    if not mel.connect_material_expressions(vertex_normal, "", surface_normal_z, ""):
+        raise RuntimeError("connect vertex_normal -> surface_normal_z failed")
+
+    top_face_gain = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -1120, -120)
+    top_face_gain.set_editor_property("r", 4.0)
+    top_face_scaled = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -960, -180)
+    if not mel.connect_material_expressions(surface_normal_z, "", top_face_scaled, "A"):
+        raise RuntimeError("connect surface_normal_z -> top_face_scaled.A failed")
+    if not mel.connect_material_expressions(top_face_gain, "", top_face_scaled, "B"):
+        raise RuntimeError("connect top_face_gain -> top_face_scaled.B failed")
+    top_face_mask = mel.create_material_expression(material, unreal.MaterialExpressionSaturate, -800, -180)
+    if not mel.connect_material_expressions(top_face_scaled, "", top_face_mask, ""):
+        raise RuntimeError("connect top_face_scaled -> top_face_mask failed")
+
+    # SmoothStep(min, max, N.z) is 1 on flat water and 0 once the surface is
+    # steep, so the foam term is its complement. The window is quoted in normal
+    # z rather than in degrees on purpose, since that is what the node compares:
+    #   0.985 -> ~10 degrees of tilt. Below this is ordinary bilinear wobble on
+    #           a settled surface and must NOT foam, or every lake whitens.
+    #   0.870 -> ~30 degrees. A full 10 cm fill step across one 10 cm voxel is
+    #           45 degrees (z = 0.707), well past saturation, so a genuine
+    #           spilling edge foams fully.
+    slope_min = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -800, -100)
+    slope_min.set_editor_property("r", 0.870)
+    slope_max = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -800, -40)
+    slope_max.set_editor_property("r", 0.985)
+    slope_flat = mel.create_material_expression(material, unreal.MaterialExpressionSmoothStep, -650, -100)
+    if not mel.connect_material_expressions(slope_min, "", slope_flat, "Min"):
+        raise RuntimeError("connect slope_min -> slope_flat.Min failed")
+    if not mel.connect_material_expressions(slope_max, "", slope_flat, "Max"):
+        raise RuntimeError("connect slope_max -> slope_flat.Max failed")
+    if not mel.connect_material_expressions(surface_normal_z, "", slope_flat, "Value"):
+        raise RuntimeError("connect surface_normal_z -> slope_flat.Value failed")
+    slope_foam = mel.create_material_expression(material, unreal.MaterialExpressionOneMinus, -500, -100)
+    if not mel.connect_material_expressions(slope_flat, "", slope_foam, ""):
+        raise RuntimeError("connect slope_flat -> slope_foam failed")
+
+    # Activity contributes at 0.6, not 1.0: a brick can be "active" for a single
+    # CA step because one cell gained a few fill units, and full whitewater for
+    # that is a flicker. Slope alone can still reach 1.0, so a real breaking
+    # front is not capped by this.
+    activity_gain = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -650, 20)
+    activity_gain.set_editor_property("r", 0.0)  # DIAGNOSTIC: isolate foam-vs-tint
+    activity_foam = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -500, -20)
+    if not mel.connect_material_expressions(vertex_color, "A", activity_foam, "A"):
+        raise RuntimeError("connect vertex_color.A -> activity_foam.A failed")
+    if not mel.connect_material_expressions(activity_gain, "", activity_foam, "B"):
+        raise RuntimeError("connect activity_gain -> activity_foam.B failed")
+
+    # MAX, not add: the two signals describe the same physical thing from two
+    # directions, and a steep, active front should be fully foamed rather than
+    # 1.6x foamed and clipped -- clipping would flatten the distinction between
+    # "quite foamy" and "extremely foamy" over most of the interesting range.
+    foam_raw = mel.create_material_expression(material, unreal.MaterialExpressionMax, -340, -60)
+    if not mel.connect_material_expressions(slope_foam, "", foam_raw, "A"):
+        raise RuntimeError("connect slope_foam -> foam_raw.A failed")
+    if not mel.connect_material_expressions(activity_foam, "", foam_raw, "B"):
+        raise RuntimeError("connect activity_foam -> foam_raw.B failed")
+
+    foam = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -190, -60)
+    if not mel.connect_material_expressions(foam_raw, "", foam, "A"):
+        raise RuntimeError("connect foam_raw -> foam.A failed")
+    if not mel.connect_material_expressions(top_face_mask, "", foam, "B"):
+        raise RuntimeError("connect top_face_mask -> foam.B failed")
+
+    # --- W5 (3/3): composite -----------------------------------------------
+    foam_tint = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -190, -420)
+    foam_tint.set_editor_property("constant", unreal.LinearColor(0.82, 0.90, 0.94, 1.0))
+    tinted = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -40, -450)
+    if not mel.connect_material_expressions(water_tint, "", tinted, "A"):
+        raise RuntimeError("connect water_tint -> tinted.A failed")
+    if not mel.connect_material_expressions(foam_tint, "", tinted, "B"):
+        raise RuntimeError("connect foam_tint -> tinted.B failed")
+    if not mel.connect_material_expressions(foam, "", tinted, "Alpha"):
+        raise RuntimeError("connect foam -> tinted.Alpha failed")
+
+    # AO stays the LAST multiply on base colour, exactly where it was. It is a
+    # geometric occlusion term from the greedy mesher and applies to whatever
+    # colour the surface ended up being -- folding it in before the depth lerp
+    # would make an occluded corner read as SHALLOWER rather than darker.
+    ao_multiply = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, 120, -450)
+    if not mel.connect_material_expressions(tinted, "", ao_multiply, "A"):
+        raise RuntimeError("connect tinted -> ao_multiply.A failed")
     if not mel.connect_material_expressions(vertex_color, "G", ao_multiply, "B"):
         raise RuntimeError("connect vertex_color.G -> ao_multiply.B failed")
     if not mel.connect_material_property(ao_multiply, "", unreal.MaterialProperty.MP_BASE_COLOR):
         raise RuntimeError("connect ao_multiply -> BaseColor failed")
 
-    opacity = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -200, -50)
-    opacity.set_editor_property("r", 0.55)
+    # Foam is nearly opaque: whitewater is a scattering medium, not a tinted
+    # one, and leaving it at the depth-derived opacity would make a breaking
+    # front read as pale glass over the rocks rather than as froth.
+    foam_opacity = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -190, -250)
+    foam_opacity.set_editor_property("r", 0.95)
+    opacity = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -40, -290)
+    if not mel.connect_material_expressions(depth_opacity, "", opacity, "A"):
+        raise RuntimeError("connect depth_opacity -> opacity.A failed")
+    if not mel.connect_material_expressions(foam_opacity, "", opacity, "B"):
+        raise RuntimeError("connect foam_opacity -> opacity.B failed")
+    if not mel.connect_material_expressions(foam, "", opacity, "Alpha"):
+        raise RuntimeError("connect foam -> opacity.Alpha failed")
     if not mel.connect_material_property(opacity, "", unreal.MaterialProperty.MP_OPACITY):
         raise RuntimeError("connect opacity -> Opacity failed")
 
@@ -134,18 +412,27 @@ def main():
     # panning normal ripple below actually reaches the lit result (see the
     # translucency-lighting-mode comment above). A tighter specular lobe
     # turns a moving normal into a moving GLINT rather than a moving blur,
-    # which is the cue that reads as "surface in motion" at a glance. Both
-    # are still flat Constants -- spatially uniform across the whole pool --
-    # so this is a lighting-RESPONSE tweak, not a per-pixel input, and does
-    # not touch the sort-key constraint (docs/gpu-water-pool-design.md) at
-    # all: it changes how a fragment reacts to light, not what colour or
-    # opacity it composites with its neighbours in.
-    roughness = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -200, 50)
-    roughness.set_editor_property("r", 0.08)
+    # which is the cue that reads as "surface in motion" at a glance.
+    #
+    # W5: roughness is no longer a flat Constant -- it lerps to 0.62 under foam.
+    # Froth is the one part of a water surface that is NOT a mirror, and leaving
+    # the tight 0.08 lobe on it would put a sharp specular highlight on top of
+    # whitewater, which reads as wet plastic. Specular stays flat.
+    calm_roughness = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -190, -180)
+    calm_roughness.set_editor_property("r", 0.08)
+    foam_roughness = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -190, -130)
+    foam_roughness.set_editor_property("r", 0.62)
+    roughness = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -40, -170)
+    if not mel.connect_material_expressions(calm_roughness, "", roughness, "A"):
+        raise RuntimeError("connect calm_roughness -> roughness.A failed")
+    if not mel.connect_material_expressions(foam_roughness, "", roughness, "B"):
+        raise RuntimeError("connect foam_roughness -> roughness.B failed")
+    if not mel.connect_material_expressions(foam, "", roughness, "Alpha"):
+        raise RuntimeError("connect foam -> roughness.Alpha failed")
     if not mel.connect_material_property(roughness, "", unreal.MaterialProperty.MP_ROUGHNESS):
         raise RuntimeError("connect roughness -> Roughness failed")
 
-    specular = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -200, 110)
+    specular = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -40, -110)
     specular.set_editor_property("r", 0.5)
     if not mel.connect_material_property(specular, "", unreal.MaterialProperty.MP_SPECULAR):
         raise RuntimeError("connect specular -> Specular failed")

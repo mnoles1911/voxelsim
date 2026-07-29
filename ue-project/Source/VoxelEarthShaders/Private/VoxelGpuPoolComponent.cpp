@@ -2760,6 +2760,36 @@ void UVoxelGpuPoolComponent::MarkChunkTableDirtyDeferred()
 	bFlushPending = true;
 }
 
+// W5. Table-only rewrite of one chunk's shading params. See the declaration.
+void UVoxelGpuPoolComponent::SetChunkParams(int32 Handle, const FVector4f& Params)
+{
+	if (!Allocations.IsValidIndex(Handle) || !Allocations[Handle].IsValid())
+	{
+		return;
+	}
+	const uint32 ChunkId = AllocationChunkIds[Handle];
+	// Same guard, same reason as ParkChunk's: chunk id 0 is the hidden entry that
+	// every freed quad points at. Giving it shading params would be harmless (its
+	// scale is 0, so it rasterises nothing) but writing it at all is a sign the
+	// caller is holding a stale handle, and silently accepting that is how a
+	// handle bug becomes a rendering bug two waves later.
+	if (ChunkId == kHiddenChunkId || !ChunkParams.IsValidIndex(int32(ChunkId)))
+	{
+		return;
+	}
+	FVector4f& Entry = ChunkParams[int32(ChunkId)];
+	if (Entry.Equals(Params, 0.0f))
+	{
+		// Bit-identical: skip. Water calls this on EVERY brick of EVERY re-mesh,
+		// and the overwhelmingly common case is "still 1.0, still 1.0". Setting
+		// bChunkTableDirty for that would copy the whole chunk table to the render
+		// thread once per tick for a row that did not move.
+		return;
+	}
+	Entry = Params;
+	MarkChunkTableDirtyDeferred();
+}
+
 // S2-3. Park: hide the chunk, keep everything else. See the declaration.
 void UVoxelGpuPoolComponent::ParkChunk(int32 Handle)
 {
