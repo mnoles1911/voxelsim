@@ -2783,10 +2783,13 @@ VXC_TEST(vxtl_v2_zstd_real_production_tile_equivalence) {
     // Not committed — a real tile is ~20 MB compressed and ~140 MB raw — so it
     // is driven by two paths in the environment, and skips when they are
     // absent. Produce the pair with:
-    //   python terrain-service/tools/bake_real_tile.py --tiles-dir ... \
-    //       --tile -5 2 --out-dir DIR
-    //   python terrain-service/tools/vxtl_recodec.py DIR/-5_2.vxtl \
-    //       --out DIR/-5_2.zstd.vxtl
+    // (written without shell line-continuations: a "//" comment whose last
+    // character is a backslash is a multi-line comment to g++, and CI builds
+    // with -Werror=comment)
+    //   python terrain-service/tools/bake_real_tile.py --tiles-dir ...
+    //     --tile -5 2 --out-dir DIR
+    //   python terrain-service/tools/vxtl_recodec.py DIR/-5_2.vxtl
+    //     --out DIR/-5_2.zstd.vxtl
     // then set VXC_FINE_TILE_RAW and VXC_FINE_TILE_ZSTD to the two files.
     // The recodec is a container operation, so the two files hold the same
     // payload bytes by construction and any difference here is this decoder's.
