@@ -484,6 +484,29 @@ public:
 	void ParkChunk(int32 Handle);
 	void UnparkChunk(int32 Handle, const FVector3f& OriginUU, int32 Level);
 
+	// Rewrites a RESIDENT chunk's ChunkParams entry without touching a single
+	// quad. The table-only sibling of ParkChunk, and safe for exactly the same
+	// reason: ChunkParams is indexed by chunk id, the id is unchanged, no run
+	// moves, and RebuildRunBounds derives nothing from it.
+	//
+	// WHY THIS HAD TO EXIST. AddChunk is the only other way ChunkParams is ever
+	// written, so a per-chunk shading input could previously only change by
+	// removing the chunk and adding it back. That is fine for terrain, whose
+	// params (climate, surface height) are properties of the WORLD and never
+	// move under a resident chunk. It is wrong for water: W5 puts per-brick
+	// ACTIVITY in .y, which is a property of the SIMULATION and changes every
+	// 10 Hz step on exactly the bricks that re-mesh in place via UpdateChunk --
+	// the path that deliberately keeps its table entry. Without this, foam would
+	// be stamped once at spawn and then lie for the rest of the brick's life.
+	//
+	// DEFERRED PUBLICATION, like park/unpark: the caller is expected to be inside
+	// an FScopedBatch (water's re-mesh loop is), and a params write that forced a
+	// full publication per brick would cost more than the thing it is describing.
+	// Call it BEFORE the UpdateChunk that accompanies it, so the mutation's own
+	// push carries the new row; on its own it waits for the next flush, which for
+	// water is at most one 10 Hz tick away.
+	void SetChunkParams(int32 Handle, const FVector4f& Params);
+
 	// Mark the chunk table dirty and record that a flush is OWED, without
 	// forcing one. Park/unpark use this instead of PushUpdatesToProxy.
 	//

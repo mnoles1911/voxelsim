@@ -220,7 +220,15 @@ public:
 				// with open slits between cells of differing fill -- see
 				// UVoxelWaterSubsystem.cpp's corner-field comment). G = AO
 				// (2-bit -> 0/85/170/255), B = top-boundary flag (see bTopCorner
-				// above), A = 255.
+				// above), A = per-brick foam ACTIVITY (W5, was a fixed 255).
+				//
+				// A IS PER BRICK, NOT PER VERTEX, and it is the one channel here
+				// that the pooled path reaches by a completely different route:
+				// there it rides ChunkParams.y, which the vertex factory already
+				// copies into colour A for every mode
+				// (VoxelQuadVertexFactory.ush). Same value, same 8-bit
+				// quantisation, two mechanisms -- so this is the channel to check
+				// first if the two paths ever foam differently.
 				//
 				// R and B together are what M_WaterVoxel's World Position
 				// Offset consumes, and the formula is UNCHANGED by per-corner R:
@@ -231,7 +239,8 @@ public:
 				// the pooled path reproduces THIS one under
 				// FVoxelQuadVertexFactoryParameters::WaterMode.
 				const uint8 AoByte = uint8(AoAtVert[CornerIdx] * 85);
-				Vert.Color = FColor(CornerHeight[CornerIdx], AoByte, bTopCorner[CornerIdx] ? 255 : 0, 255);
+				Vert.Color = FColor(CornerHeight[CornerIdx], AoByte, bTopCorner[CornerIdx] ? 255 : 0,
+				                    Component->ChunkActivity);
 
 				Vertices.Add(Vert);
 			}
@@ -429,7 +438,8 @@ UWaterChunkComponent::UWaterChunkComponent(const FObjectInitializer& ObjectIniti
 	SetGenerateOverlapEvents(false);
 }
 
-void UWaterChunkComponent::SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, TArray<uint32>&& InCornerHeights)
+void UWaterChunkComponent::SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, TArray<uint32>&& InCornerHeights,
+                                         float InActivity)
 {
 	// The proxy indexes both arrays with one loop counter. A short corner array
 	// would be an out-of-bounds read on the very first frame the mismatch
@@ -438,6 +448,10 @@ void UWaterChunkComponent::SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, TArr
 	check(InCornerHeights.Num() == InQuads.Num());
 	ChunkQuads = MoveTemp(InQuads);
 	ChunkCornerHeights = MoveTemp(InCornerHeights);
+	// 255, not 256: an FColor byte round-trips to 1.0 in the shader only at 255,
+	// and foam at full activity should reach the material's full-foam end of the
+	// lerp exactly rather than 255/256ths of it.
+	ChunkActivity = uint8(FMath::Clamp(InActivity, 0.0f, 1.0f) * 255.0f + 0.5f);
 	MarkRenderStateDirty();
 	UpdateBounds();
 }

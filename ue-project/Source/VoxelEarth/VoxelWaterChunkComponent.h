@@ -42,7 +42,21 @@ public:
 	// quads instead of inside FVoxelChunkQuad (that struct and its 8-byte packed
 	// form are a contract shared with the GPU mesher, and the packed word is
 	// full).
-	void SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, TArray<uint32>&& InCornerHeights);
+	//
+	// InActivity (W5) is this brick's foam signal, 0..1: 1 while vxc::WaterCA
+	// still calls the brick active, 0 once it settles and 0 for every implicit
+	// (worldgen) brick. It is written into every vertex's colour A, which
+	// M_WaterVoxel reads.
+	//
+	// A PARAMETER ON THIS CALL RATHER THAN A SETTER OF ITS OWN, deliberately.
+	// Activity only ever changes on a tick that also re-meshes the brick -- the
+	// CA marks a brick dirty precisely when it is active, and the subsystem
+	// marks it dirty once more on the step it stops being active -- so a
+	// separate setter would be a second way to reach the same vertex buffer
+	// rebuild, with the standing risk of the two drifting apart. The pooled
+	// path's equivalent (UVoxelGpuPoolComponent::SetChunkParams) IS separate,
+	// because there the table row and the quads are genuinely different uploads.
+	void SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, TArray<uint32>&& InCornerHeights, float InActivity);
 
 	//~ Begin UPrimitiveComponent Interface
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
@@ -64,6 +78,20 @@ private:
 	// height by the difference, so SetChunkQuads checks it rather than trusting
 	// the caller.
 	TArray<uint32> ChunkCornerHeights;
+
+	// W5 foam signal, 0..255, written into every vertex's colour A. See
+	// SetChunkQuads. Quantised to a byte HERE rather than at the vertex write so
+	// that this member holds exactly what the vertex buffer will hold.
+	//
+	// THE TWO PATHS QUANTISE DIFFERENTLY AND IT DOES NOT MATTER TODAY, which is
+	// worth writing down before it does. This path stores an FColor, so activity
+	// is 8-bit. The pooled path never touches an FColor -- the vertex factory
+	// assigns ChunkParams.y straight into a half4 -- so it is half-float. The
+	// signal is currently exactly 0 or 1, and both encodings represent both
+	// exactly. Anything that makes activity CONTINUOUS (a decay ramp is the
+	// obvious candidate) inherits a real 1/255 quantisation here that the pooled
+	// path does not have, and the two would then differ by up to half a step.
+	uint8 ChunkActivity = 0;
 
 	// vxc::WaterBrick8::kEdge (8), duplicated as a plain int32 rather than
 	// pulling in a voxel-core header (doctrine: this UHT-parsed header stays
