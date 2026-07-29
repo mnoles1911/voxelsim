@@ -94,13 +94,25 @@ own surface well inside the 100 mm quantum in every case -- mean |e| 14.96 mm
 (plains), 12.21 (third), 12.79 (alpine); max 50.48, 50.43, 50.48. So the fine
 tier is not a source of error in anything above.
 
-Size is consistently over the plan's model, which settles its open risk 2:
+CORRECTED 2026-07-29, and the correction matters more than the number. I first
+compared these against the plan's 29/44/61 KB/km2 table, which is the SUPERSEDED
+3.75 m/px tier, and reported 2.5-4x over. That was wrong. The plan retired that
+number with the resolution decision and records ~21-25 MB/tile for the shipped
+1.875 m/px tier (docs/vxtl-v2-format.md, quoted at plan risk 2), which over
+235.9 km2 is ~89-106 KB/km2. Against the right baseline:
 
-  class     measured zstd   plan's model   over
-  plains     74.0 KB/km2     29 KB/km2     2.6x
-  third     180.4 KB/km2     44 KB/km2     4.1x   (plan's "rolling/dissected")
-  alpine    153.3 KB/km2     61 KB/km2     2.5x
+  class     measured zstd    measured/tile   plan 1.875 m tier   vs plan
+  plains     74.0 KB/km2      17.87 MB        21-25 MB           15-30% UNDER
+  alpine    153.3 KB/km2      37.04 MB        21-25 MB           1.48x over
+  third     180.4 KB/km2      43.58 MB        21-25 MB           1.74x over
 
-At ~200 MB CODEC_RAW per tile before compression, and 37-44 MB compressed against
-the 8 MB planning number, the storage and prefetch arithmetic in the plan's
-production section needs redoing before it is quoted again.
+So the plan's range holds for gentle terrain and is low by up to ~1.75x for
+dissected and steep terrain -- a real overshoot on the classes that matter for
+worst-case budgeting, and nothing like the 2.5-4x I first claimed. Plan risk 2's
+live concern is unchanged and is the right one: what costs bytes is uncorrelated
+per-pixel noise, and BAKE_VERSION 4's dissection raises exactly that on steep
+tiles (68% of the alpine window above a_crit).
+
+At ~200 MB CODEC_RAW before compression the wire format is fine, but a worst-case
+tile is ~44 MB rather than ~25, so the plan's prefetch-ring and client-RAM
+arithmetic should be re-run at the upper bound before it is quoted again.
