@@ -302,7 +302,8 @@ def thermal_step(z, max_drop, rate):
 
 
 # ---------------------------------------------------------------------- the bake
-def run_bake(coarse, iters=48, verbose=True, seed=20260719, noise=None):
+def run_bake(coarse, iters=48, verbose=True, seed=20260719, noise=None,
+             K=1.2e-2, cap=8.0, rough=1.5):
     """B0-B3 over whatever coarse array is handed in, including any apron.
 
     Takes the coarse array rather than a path so the seam test can bake a
@@ -328,7 +329,7 @@ def run_bake(coarse, iters=48, verbose=True, seed=20260719, noise=None):
     # the seam test isolates apron adequacy from this prototype's own limitation.
     nz = conditioned_fbm(fine.shape, slope0, seed=seed) if noise is None else noise * np.clip(
         slope0 / 0.3, 0.25, 2.0).astype(np.float32)
-    fine = fine + nz * 1.5
+    fine = fine + nz * rough
     tick("B1 conditioned fBm roughness", t0)
 
     t0 = time.perf_counter(); filled = priority_flood(fine); tick("B2a priority-flood fill", t0)
@@ -344,9 +345,9 @@ def run_bake(coarse, iters=48, verbose=True, seed=20260719, noise=None):
     # A = 10 km2 and a 10% slope, A^0.45 * S^0.8 ~ 220, so K of order 1e-2 gives
     # ~2 m. The first pass used 4e-4 and produced a p99 of 0.01 m -- a drainage
     # network that existed in the flow field and nowhere in the terrain.
-    K, m, n = 1.2e-2, 0.45, 0.8
+    m, n = 0.45, 0.8
     incision = K * np.power(acc, m, dtype=np.float32) * np.power(slope + 1e-6, n, dtype=np.float32)
-    incision = np.minimum(incision, 8.0)
+    incision = np.minimum(incision, cap)
     eroded = filled - incision
     tick("B2e stream-power incision", t0)
 
@@ -372,11 +373,15 @@ def main():
     ap.add_argument("--crop", type=int, default=1024)
     ap.add_argument("--cx", type=int, default=None)
     ap.add_argument("--cy", type=int, default=None)
+    ap.add_argument("--K", type=float, default=1.2e-2, help="stream-power erodibility")
+    ap.add_argument("--cap", type=float, default=8.0, help="max incision (m)")
+    ap.add_argument("--rough", type=float, default=1.5, help="B1 roughness scale (m)")
+    ap.add_argument("--npy", help="also dump the baked surface here (67 MB; off by default)")
     a = ap.parse_args()
 
     print(f"tile {a.tile}   -> {FINE}x{FINE} @ {PIXEL_M} m/px")
     coarse = decode_vxtl(a.tile)
-    r = run_bake(coarse, iters=a.iters)
+    r = run_bake(coarse, iters=a.iters, K=a.K, cap=a.cap, rough=a.rough)
     fine, z, acc, incision = r["fine"], r["z"], r["acc"], r["incision"]
 
     resid = z - fine
@@ -387,8 +392,12 @@ def main():
     print(f"  net change vs B1 surface: mean {resid.mean():+.2f} m, "
           f"sd {resid.std():.2f} m, min {resid.min():+.1f} m, max {resid.max():+.1f} m")
 
-    np.save("bake_out.npy", z.astype(np.float32))
-    print("  wrote bake_out.npy")
+    # Only on request. This used to write bake_out.npy into the CWD
+    # unconditionally, and a `git add -A` from the tools directory duly
+    # committed 67 MB of float32 into the repo.
+    if a.npy:
+        np.save(a.npy, z.astype(np.float32))
+        print(f"  wrote {a.npy}")
 
     if a.png:
         hillshade_png(a.png, fine, z, acc, crop=a.crop, x0=a.cx, y0=a.cy)

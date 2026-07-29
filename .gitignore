@@ -45,3 +45,7 @@ tools/vulkan-headers/
 
 # Tile-cache archives. Regenerated from the seed, and large.
 tile-cache-*.tar.gz
+
+# Bake/probe artifacts: large float32 dumps, never committed (see bake_prototype.py --npy)
+*.npy
+bake_out.npy

@@ -157,9 +157,21 @@ the on-demand argument is unaffected because coarse diffusion (22.5 s/tile, and 
 of the frontier against 3 bakes) dominates it either way.
 
 Result: a real dendritic network — branching, tributaries joining, no lattice faceting — carved
-into the surface as incised hollows with sharpened spurs between (max accumulation 78 km²; 15,773
-cells above 1 km²). Incision currently reads gentle (mean 0.13 m, p99 0.63 m, max 6.3 m); that is
-a K calibration knob, and over-carving is its own failure mode.
+into the surface as valleys with sharp interfluves between them (max accumulation 78 km²; 15,773
+cells above 1 km²).
+
+**Erodibility K matters more than anything else for whether it reads as terrain**, and the
+plausible-looking first value was far too small:
+
+| K | incision mean | p99 | reads as |
+|---|---|---|---|
+| 0.0004 | 0.00 m | 0.01 m | network exists in the flow field and nowhere in the ground |
+| 0.012 | 0.13 m | 0.63 m | gentle modulation; visible but not landform |
+| 0.05 | 0.56 m | 2.61 m | valleys emerging |
+| **0.15** | **1.66 m** | **7.84 m** | **properly dissected hillslope** |
+
+K is the first thing to calibrate in Phase 2 proper, against real DEM drainage density rather than
+by eye, and over-carving is its own failure mode — the sub-threshold depth cap exists for that.
 
 **Three prototype bugs, each of which validated a choice in this plan by violating it:**
 
