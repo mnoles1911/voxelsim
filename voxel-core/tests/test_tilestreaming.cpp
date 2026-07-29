@@ -90,15 +90,19 @@ VXC_TEST(dilate_single_column_matches_stencil_constants) {
     CHECK_EQ(dilated.py1, 20 + kCarrierStencilHi);
     // Pin the literal numbers too: a silent change to kCarrierStencilLo/Hi
     // in tiles.h should fail THIS test loudly, not just look different.
-    CHECK_EQ(dilated.px0, 9);
-    CHECK_EQ(dilated.px1, 12);
+    // v13 widened them from (-1, +2) to (-16, +16): the coarse tier's control
+    // points are now a 9-tap prefilter of the raster (carrier.h) and the detail
+    // gate reads the raster's relief at a 30 m physical baseline, which is
+    // +/-16 pixels on the 1.875 m fine tier.
+    CHECK_EQ(dilated.px0, -6);
+    CHECK_EQ(dilated.px1, 26);
 }
 
 VXC_TEST(dilate_negative_footprint) {
     const PixelRect footprint{-5, -5, -5, -5};
     const PixelRect dilated = dilateForCarrierStencil(footprint);
-    CHECK_EQ(dilated.px0, -6);
-    CHECK_EQ(dilated.px1, -3);
+    CHECK_EQ(dilated.px0, -21);
+    CHECK_EQ(dilated.px1, 11);
 }
 
 // --- fineReadPixelRect ------------------------------------------------------
@@ -231,13 +235,15 @@ VXC_TEST(blocks_degenerate_params_are_empty) {
 }
 
 VXC_TEST(dilated_block_coverage_composes_dilation_then_coverage) {
-    // A single-column footprint at a block boundary (px=256): dilated range
-    // is [255, 258] (Lo=-1, Hi=2), which straddles blocks 0 and 1.
+    // A single-column footprint at a block boundary (px=256): dilated range is
+    // [240, 272] at v13's (Lo=-16, Hi=+16), which straddles blocks 0 and 1 on
+    // x. y=10 dilates to [-6, 26], which straddles the tile boundary on y, so
+    // the coverage is four blocks across two tiles rather than v12's two.
     const auto blocks = dilatedBlockCoverage(PixelRect{256, 10, 256, 10}, 512, 256);
-    CHECK_EQ(blocks.size(), size_t(2));
+    CHECK_EQ(blocks.size(), size_t(4));
     bool saw0 = false, saw1 = false;
     for (const BlockCoord& b : blocks) {
-        CHECK(b.tile == (TileCoord{0, 0}));
+        CHECK(b.tile.x == 0);
         if (b.blockX == 0) saw0 = true;
         if (b.blockX == 1) saw1 = true;
     }

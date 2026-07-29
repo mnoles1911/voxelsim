@@ -4,6 +4,11 @@
 // server-side by the diffusion model, cached and distributed. Everything the
 // amplifier derives from them must be bit-deterministic.
 
+// carrier.h, for kCarrierPrefilterLo/Hi and carrierReliefLagPx: the
+// control-stencil contract below is DERIVED from them (v13) rather than
+// restated, so a host's raster window cannot drift from what the carrier reads.
+// carrier.h depends on core.h alone, so this is acyclic.
+#include "voxelcore/carrier.h"
 #include "voxelcore/climate.h"
 #include "voxelcore/core.h"
 #include "voxelcore/hash.h"
@@ -74,8 +79,42 @@ public:
 // exact failure has already happened here once (the D5 note in
 // VoxelGpuRegionBuild.h), so the numbers live in one place and every host
 // derives its margin from them.
-inline constexpr int64_t kCarrierStencilLo = -1;
-inline constexpr int64_t kCarrierStencilHi = 2;
+//
+// v13 WIDENS IT TWICE, for two independent reasons, and the constants below are
+// the MAXIMUM over both so that one number serves every tier (a host sizes its
+// window once, before it knows which cell a column will land in):
+//
+//   * THE PREFILTER (carrier.h, kCarrierPrefilterLo/Hi = -5..+6). On a tier
+//     that ships raster SAMPLES rather than control points -- i.e. the 30 m s1
+//     raster -- each of the four control points per axis is now a 9-tap
+//     convolution of the samples around it. Not applied on the baked fine tier,
+//     which already ships control points.
+//   * THE RELIEF GATE (carrier.h, carrierReliefLagPx). Detail amplitude is
+//     conditioned on the raster's own second difference at a fixed 30 m
+//     PHYSICAL baseline, which is +/-1 pixel at 30 m/px and +/-16 pixels at the
+//     1.875 m fine tier. That is four extra reads per cell, but they sit
+//     16 pixels out, and the window has to contain them or the shader clamps
+//     and silently disagrees with the CPU -- the exact failure this comment
+//     block already exists to prevent.
+//
+// Both are DERIVED from the carrier's own constants below rather than typed, so
+// that a change to the prefilter radius or the relief baseline moves every
+// host's window with it instead of leaving one of them silently clamping.
+// Costing it out: at 30 m/px a level-0 chunk's window goes from 7x7 to 37x37
+// int32 (5.5 KB), and the streaming residency dilates by 510 m at 30 m and 32 m
+// at 1.875 m -- well inside one 15.36 km tile in both cases.
+inline constexpr int64_t kCarrierMaxReliefLagPx = carrierReliefLagPx(1875);
+static_assert(kCarrierMaxReliefLagPx == 16,
+              "the shipped fine tier's relief lag; if a finer tier ever ships, this is the "
+              "line that has to grow with it");
+inline constexpr int64_t kCarrierStencilLo =
+    kCarrierPrefilterLo < -kCarrierMaxReliefLagPx ? kCarrierPrefilterLo : -kCarrierMaxReliefLagPx;
+inline constexpr int64_t kCarrierStencilHi =
+    kCarrierPrefilterHi > kCarrierMaxReliefLagPx ? kCarrierPrefilterHi : kCarrierMaxReliefLagPx;
+static_assert(kCarrierStencilLo == -16 && kCarrierStencilHi == 16,
+              "the control-stencil contract moved; every host that copies a raster window to "
+              "the GPU derives its margin from these two numbers, and a window that is not "
+              "dilated to match does not fault -- it silently generates different terrain.");
 
 // The physical range each synthetic climate channel sweeps. These are worldgen
 // contract constants (they decide tile-derived bytes) -- tune only on a

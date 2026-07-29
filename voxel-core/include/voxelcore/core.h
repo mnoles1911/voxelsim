@@ -102,7 +102,29 @@ namespace vxc {
 // amplitude and was the dominant cost), the contrast curve goes to three passes
 // to recover the rate the smaller amplitude cost, and the lithology gate is
 // promoted to the whole displacement so the term is live on bare rock only.
-inline constexpr uint32_t kWorldGenVersion = 12;
+// --- v13: the client stopped destroying the bake on gentle ground -----------
+//
+// Two changes, both in the coarse-to-fine amplification path, both driven by
+// docs/terrain-validation-2026-07.md rather than by taste.
+//
+//   1. THE COARSE CARRIER PREFILTERS ITS CONTROL LATTICE (carrier.h). A cubic
+//      B-spline approximates its control points, so feeding 30 m raster SAMPLES
+//      in as control points low-passed the diffusion model's own output by
+//      815 mm on plains and 3222 mm on alpine before any amplification ran. The
+//      baked fine tier ships prefiltered control points and never had this; the
+//      30 m tier had no such step until now.
+//
+//   2. DETAIL AMPLITUDE IS CONDITIONED ON LANDFORM RELIEF, NOT ON GRADIENT
+//      (carrier.h reliefScaleQ10, replacing slopeScaleQ10 and microScaleQ10).
+//      The old gates spanned 1.9x and 1.06x between a plain and a mountain that
+//      differ 25x in relief, so the detail pass laid down the same ~0.3-0.6 m of
+//      roughness on both: +207% of a plain's 1.875 m mean slope against +3.3% of
+//      alpine's. The finished plain measured SIX TIMES more ridged than the
+//      finished mountain (frac_ridge_peak 0.352 against 0.061, real plains
+//      0.054-0.073). Relief is a second difference of the raster at a fixed 30 m
+//      baseline: exactly zero on a plane at any grade, and a direct measurement
+//      of what the tier carries rather than an assumption about it.
+inline constexpr uint32_t kWorldGenVersion = 13;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 
