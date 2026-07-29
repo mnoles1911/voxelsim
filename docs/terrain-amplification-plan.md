@@ -171,8 +171,26 @@ Result: a real dendritic network — branching, tributaries joining, no lattice 
 into the surface as valleys with sharp interfluves between them (max accumulation 78 km²; 15,773
 cells above 1 km²).
 
+> ⚠️ **THE DRAINAGE FIGURES AND THE K TABLE BELOW ARE MEASURED ON A MIS-ROUTED FIELD.** The
+> prototype's priority-flood was a plain fill, so every filled pit became a **level lake** — and on
+> a level lake no cell has a lower neighbour, so MFD terminates. On the same tile that produced the
+> numbers below: **341,368 inland dead-ends and 69.2% of land area stranded**, never reaching the
+> sea. Barnes' ε variant (every newly discovered cell raised to at least `spill + 2 ULP`) fixes it,
+> and is the default in `bake/flow.py`. Isolated cleanly: with `flat_eps=0` the production module
+> reproduces the prototype's numbers exactly, so ε is the only difference.
+>
+> | | prototype | corrected |
+> |---|---|---|
+> | inland dead-ends | 341,368 | **0** |
+> | max catchment | 69.6 km² | **203.1 km²** |
+> | cells > 1 km² | 13,256 | **107,496** |
+>
+> **K must be re-calibrated, not scaled.** With ~2.9× the catchment area, `A^0.45` is ~1.6× deeper
+> on trunk channels, so the K=0.15 below will over-carve. And judge it on a hillshade — no summary
+> statistic in this document distinguished a good K from a bad one.
+
 **Erodibility K matters more than anything else for whether it reads as terrain**, and the
-plausible-looking first value was far too small:
+plausible-looking first value was far too small (values below are on the mis-routed field):
 
 | K | incision mean | p99 | reads as |
 |---|---|---|---|
