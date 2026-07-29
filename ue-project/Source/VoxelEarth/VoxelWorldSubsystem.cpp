@@ -13,6 +13,7 @@
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
+#include "VoxelFineTileStreamer.h" // Phase 2 fine-tier residency/prefetch/eviction gate (-VoxelFineTileDir=)
 #include "VoxelFootprintBand.h" // FFootprintBand + the two per-column reductions (lifted so the GPU gate can call them)
 #include "VoxelGI.h" // pooled-path light field ingest (the component path reaches it via SetChunkQuads)
 #include "VoxelMeshTypes.h"
@@ -2479,7 +2480,17 @@ struct FVoxelWorldImpl
 	// Track B2: TileDir/TileScale select the tile source (see MakeTileSampler
 	// above for the full policy) -- TileDir empty is the pre-Track-B2 default
 	// (SyntheticTileSampler, byte-identical to before).
-	explicit FVoxelWorldImpl(uint64 Seed, const FString& TileDir, int32 TileScale)
+	//
+	// Phase 2 fine-tier streaming (docs/terrain-amplification-plan.md,
+	// VoxelFineTileStreamer.h): FineTileDir empty (the default -- no
+	// -VoxelFineTileDir on the command line) leaves FineStreamer null and
+	// every fine-tier gate below a no-op, so behavior is byte-identical to
+	// pre-Phase-2 unless the switch is explicitly passed. Same opt-in shape
+	// as TileDir/MakeTileSampler above, deliberately: this is new,
+	// unverified-in-engine glue (see the task report), and the existing
+	// -VoxelTileDir precedent is exactly the risk profile it should match.
+	explicit FVoxelWorldImpl(uint64 Seed, const FString& TileDir, int32 TileScale, const FString& FineTileDir,
+	                         const FString& FineProviderId, uint64 FineBudgetBytes)
 		: Tiles(MakeTileSampler(Seed, TileDir, TileScale, bUsingTileGrid, TileCoverageUU))
 		, Voxels(Seed, *Tiles)
 	{
@@ -2495,6 +2506,19 @@ struct FVoxelWorldImpl
 			// bUsingTileGrid being true is exactly MakeTileSampler's own
 			// guarantee that Tiles.get() really does point at a TileGridSampler.
 			GridTiles = static_cast<vxc::TileGridSampler*>(Tiles.get());
+		}
+
+		// Phase 2: construct the fine-tier streamer only when a directory was
+		// actually given. No directory-existence check here (unlike
+		// MakeTileSampler's TileDir): FVoxelFineTileStreamer's own
+		// EnsureTileResident already treats "file not found" as an ordinary,
+		// expected "not resident yet" outcome (a frontier tile the bake
+		// hasn't produced), never an error to fall back from -- see its
+		// class-level doc comment on "block until ready".
+		if (!FineTileDir.IsEmpty())
+		{
+			FineStreamer = MakeUnique<FVoxelFineTileStreamer>(
+				FineTileDir, FineProviderId, Seed, FineBudgetBytes != 0 ? FineBudgetBytes : FVoxelFineTileStreamer::kDefaultBudgetBytes);
 		}
 
 		// "Admit everything at this level" sentinel. Set by loop rather than by a
@@ -2570,6 +2594,15 @@ struct FVoxelWorldImpl
 	// today's plain uint64_t or the incoming std::atomic<uint64_t>.
 	vxc::TileGridSampler* GridTiles = nullptr;
 	vxc::World<VoxelCoords::BrickEdgeVoxels> Voxels;
+
+	// Phase 2 fine-tier residency/prefetch/eviction gate (VoxelFineTileStreamer.h);
+	// null unless -VoxelFineTileDir was passed, in which case every fine-tier
+	// gate this file adds (RecomputeDesiredSet's AddCandidate check, and the
+	// per-call TickResidencyAndEviction below) is a no-op and behavior is
+	// unchanged from before this feature existed. Independent of Tiles/Voxels
+	// above by design -- see VoxelFineTileStreamer.h's "SCOPE NOTE": it does
+	// NOT replace Tiles as the Amplifier's live sampler in this pass.
+	TUniquePtr<FVoxelFineTileStreamer> FineStreamer;
 
 	// MaybeLogCounters' missing-tile delta tracking (bUsingTileGrid only).
 	uint64 LastMissingTileQueries = 0;
@@ -6717,6 +6750,22 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		LevelCandidatesRejectedThisCall[Level] = 0;
 	}
 
+	// Phase 2 fine-tier streaming (VoxelFineTileStreamer.h): pin the prefetch
+	// ring around the anchor, best-effort load whatever in it is missing, and
+	// evict whatever the LRU budget disallows outside that ring. A no-op
+	// (FineStreamer null) unless -VoxelFineTileDir was passed. Placed once per
+	// call, not per candidate: this is a budget/ring decision over the WHOLE
+	// desired set, the same granularity RecomputeDesiredSet itself runs at
+	// (anchor movement), not a per-chunk one -- AddCandidate's own gate below
+	// is the per-footprint query against whatever residency this call leaves
+	// in place.
+	if (FineStreamer)
+	{
+		const int64 AnchorMmX = WorldToMm(Anchor.X);
+		const int64 AnchorMmY = WorldToMm(Anchor.Y);
+		FineStreamer->TickResidencyAndEviction(FVoxelFineTileStreamer::CoarseTileForWorldMm(AnchorMmX, AnchorMmY));
+	}
+
 	// Bounded admission: the cutoff was computed at the end of the PREVIOUS
 	// call, when the queue was at cap; workers have been draining it since.
 	// Relax it only once the queue has drained MEANINGFULLY (below 3/4 cap),
@@ -7249,6 +7298,46 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 						++LevelCandidatesRejectedThisCall[QueueLevel];
 						bAdmissionDeferredWork[QueueLevel] = true;
 						return;
+					}
+
+					// Phase 2 fine-tier residency gate ("block-until-ready" --
+					// docs/terrain-amplification-plan.md: a missing fine tile is
+					// a DESYNC, never a procedural fallback, because collision
+					// and edits must agree on every client). No-op when
+					// FineStreamer is null (-VoxelFineTileDir not passed).
+					// Applies to EVERY candidate reaching this point, including
+					// the overlay-aware (edit-driven) path above: an edit is
+					// always near the player, so it is virtually always inside
+					// the already-resident prefetch ring, but there is no
+					// edit-path exception in the product rule and none is added
+					// here. IsFootprintResident is a pure, no-I/O check (cheap,
+					// the common case); RequestFootprint is the one call that
+					// can synchronously touch disk, and only runs when the
+					// footprint is not already resident.
+					if (FineStreamer)
+					{
+						const double HalfEdge = ChunkEdge * 0.5;
+						const int64 FineX0Mm = WorldToMm(CenterX - HalfEdge);
+						const int64 FineX1Mm = WorldToMm(CenterX + HalfEdge);
+						const int64 FineY0Mm = WorldToMm(CenterY - HalfEdge);
+						const int64 FineY1Mm = WorldToMm(CenterY + HalfEdge);
+						if (!FineStreamer->IsFootprintResident(FineX0Mm, FineY0Mm, FineX1Mm, FineY1Mm) &&
+						    !FineStreamer->RequestFootprint(FineX0Mm, FineY0Mm, FineX1Mm, FineY1Mm))
+						{
+							// Still not resident (missing on disk, or failed
+							// validation -- see VoxelFineTileStreamer.cpp's
+							// EnsureTileResident logging). Do NOT admit; this
+							// candidate is re-scanned on every future call
+							// (RecomputeDesiredSet re-evaluates every
+							// un-admitted candidate on anchor movement), so it
+							// is retried, not dropped, once the fine tier
+							// catches up.
+							++CandidatesRejectedSinceLog;
+							++CandidatesRejectedThisCall;
+							++LevelCandidatesRejectedThisCall[QueueLevel];
+							bAdmissionDeferredWork[QueueLevel] = true;
+							return;
+						}
 					}
 
 					VoxelStreaming::FChunkRecord& NewRecord = ChunkRecords.Add(LevelKey);
@@ -13117,7 +13206,39 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	int32 TileScale = 1;
 	FParse::Value(FCommandLine::Get(), TEXT("VoxelTileScale="), TileScale);
 
-	Impl = MakeUnique<FVoxelWorldImpl>(Seed, TileDir, TileScale);
+	// Phase 2 fine-tier streaming (docs/terrain-amplification-plan.md;
+	// VoxelFineTileStreamer.h). Command-line only, no ini fallback, unlike
+	// -VoxelTileDir above: this is new, NOT verified against a running
+	// engine (see the task report that introduced it), so it deliberately
+	// stays opt-in-per-launch rather than becoming a standing project
+	// default the way -VoxelTileDir did once it was trusted.
+	//
+	//   -VoxelFineTileDir=<path>   local directory mirroring terrain-service's
+	//                              cache.py layout (<root>/<provider_id>/
+	//                              <seed:016x>/s16/<x>_<y>.vxtl). Empty (the
+	//                              default) => FineStreamer stays null and
+	//                              every fine-tier gate is a no-op.
+	//   -VoxelFineTileProviderId=<id>  the content-addressed provider_id this
+	//                              run's fine tiles are stamped with; MUST
+	//                              match the encoder's provider_id or every
+	//                              tile fails FVoxelFineTileStreamer's
+	//                              identity validation and is refused as a
+	//                              mismatch (by design -- "validate, never
+	//                              trust"). Defaults to empty, which will
+	//                              correctly refuse every real tile -- pass
+	//                              this whenever -VoxelFineTileDir is used.
+	//   -VoxelFineTileCacheBudgetGB=<N>  LRU cache budget in GiB (plan
+	//                              default 8-16); 0 or unset falls back to
+	//                              FVoxelFineTileStreamer::kDefaultBudgetBytes.
+	FString FineTileDir;
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileDir="), FineTileDir);
+	FString FineProviderId;
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileProviderId="), FineProviderId);
+	double FineBudgetGB = 0.0;
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileCacheBudgetGB="), FineBudgetGB);
+	const uint64 FineBudgetBytes = FineBudgetGB > 0.0 ? uint64(FineBudgetGB * 1024.0 * 1024.0 * 1024.0) : 0;
+
+	Impl = MakeUnique<FVoxelWorldImpl>(Seed, TileDir, TileScale, FineTileDir, FineProviderId, FineBudgetBytes);
 }
 
 void UVoxelWorldSubsystem::Deinitialize()

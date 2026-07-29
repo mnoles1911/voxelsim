@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 9
+#define VXC_WORLDGEN_VERSION_USH 10
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -100,6 +100,14 @@ static const uint CH_TOPSOIL_JITTER = 16;
 static const uint CH_BEDROCK_JITTER = 17;
 static const uint CH_ECOTONE_TEMP = 18;   // v9 biome-boundary dither
 static const uint CH_ECOTONE_PRECIP = 19; // v9 biome-boundary dither
+// v10 structured-detail channels. detail_rill.h owns 26; detail_bedding.h owns
+// 27 and 28. Both headers carry the same warning as hash.h: 18/19 are currently
+// DOUBLE-ALLOCATED between hash.h's ecotone pair and caves.h's node/edge pair.
+// This mirror inherits that collision rather than resolving it -- resolving it
+// on one side only would BE the divergence this file exists to prevent.
+static const uint CH_RILL = 26;
+static const uint CH_BEDDING_STRIKE = 27;
+static const uint CH_BEDDING = 28;
 
 // Material ids (core.h) — append only, never renumber.
 static const uint MAT_AIR = 0;
@@ -177,6 +185,29 @@ static const int kOctaveCount = 5;
 static const int kLandformOctaveCount = 2;
 static const int kOctaveLatticeMm[kOctaveCount] = {25600, 6400, 1600, 400, 200};
 static const int kOctaveAmplitudeMm[kOctaveCount] = {2600, 1100, 500, 190, 60};
+
+// v10 BAND OWNERSHIP (amplifier.cpp kFineDetailOctaves). On a world whose tile
+// raster carries the baked fine tier, the 25.6 m and 6.4 m landform octaves are
+// DELETED and the ladder continues from 3.2 m -- synthesising them over measured
+// landform fights the bake with hash noise. Read the band-ownership comment in
+// amplifier.cpp before touching either table; in particular, it records WHY it
+// is safe to branch worldgen on the sampler pitch (pitch is a property of the
+// world, pinned by provider_id, and the residency gate BLOCKS rather than
+// falling back -- weaken that gate and this branch becomes a desync).
+//
+// THE TWO TIERS DO NOT SHARE NOISE FIELDS OCTAVE-FOR-OCTAVE. The channel is
+// CH_DETAIL_OCTAVE_BASE + i where i indexes the octave's position in ITS OWN
+// table, so fine octave 0 (3.2 m) draws the same channel as coarse octave 0
+// (25.6 m). That is deliberate on the CPU side and mirrored exactly here: they
+// are different worlds, never two renderings of one world.
+static const int kFineOctaveCount = 4;
+static const int kFineLandformOctaveCount = 1;
+static const int kFineOctaveLatticeMm[kFineOctaveCount] = {3200, 1600, 400, 200};
+static const int kFineOctaveAmplitudeMm[kFineOctaveCount] = {900, 500, 190, 60};
+
+// vxc::isFineTier -- a tile raster at or below this pitch carries baked sub-30 m
+// landform. 3750 is scale 8, 1875 is scale 16; both select the fine ladder.
+static const int64_t kFineTierMaxPixelMm = 3750;
 
 // --- primitives mirrored from core.h / hash.h ------------------------------
 
@@ -418,6 +449,119 @@ CarrierEval evalCarrier(int64_t cp[16], int64_t fx, int64_t fy, int64_t pxMm)
     return e;
 }
 
+// --- analytic curvature (v10) ----------------------------------------------
+// Bit-exact mirror of voxelcore/carrier.h's evalCarrierCurvature /
+// carrierCurvatureMmPerM2Q10. Read that header for the sign convention (crest
+// NEGATIVE -- these are the plain second derivatives of height, not the
+// geomorphological profile-curvature convention) and for why the currency is
+// q10 mm per metre per metre rather than whole mm/m^2.
+//
+// The SECOND derivative of a uniform cubic B-spline is a LINEAR B-spline over
+// the second differences of the control points, so the basis is {T - tq, tq}
+// over ONE factor of the q10 one -- not three (the cubic value basis) or two
+// (the quadratic slope basis).
+static const int64_t kCarrierCurveDen = 1024; // == kCarrierT, deliberately named apart
+static const int64_t kCurveQ10One = 1024;
+static const int64_t kMmPerMSquared = 1000000;
+
+struct CarrierW2 { int64_t w0, w1; };
+
+CarrierW2 carrierCurveW(int64_t tq)
+{
+    CarrierW2 r;
+    r.w0 = kCarrierT - tq;
+    r.w1 = tq;
+    return r;
+}
+
+struct CarrierCurvature
+{
+    int64_t cxxMmPerPx2; // signed
+    int64_t cyyMmPerPx2; // signed
+};
+
+// OVERFLOW ANALYSIS, RE-CHECKED IN THIS FILE'S ARITHMETIC (carrier.h works the
+// same numbers for the CPU; the shader uses the identical int64 types and the
+// identical two-stage order, so the chain and its margins carry over term for
+// term -- but it is re-stated here because "the CPU's bound carries" is exactly
+// the assumption that would hide a widened intermediate).
+//
+// C = 9e6 mm, the elevation clamp. A second difference of four control points
+// is |D| <= 4C = 3.6e7. int64 tops out at 9.22e18.
+//   stage 1: |sum| <= 4C * kCarrierCurveDen  = 3.69e10   (2.5e8x margin)
+//   stage 2: |sum| <= 4C * kCarrierValueDen  = 2.32e17   (40x margin)  <-- tightest
+//   unit conversion: 8C * kCurveQ10One * kMmPerMSquared = 7.4e16 (125x margin)
+//   the divisor pxMm * pxMm <= 9e8 at a 30 m pixel, nowhere near the limit.
+// The ONE-STAGE q10 form overflows by 26x and is tempting because
+// kCarrierCurveDen happens to equal the q10 one so the divide LOOKS free. It is
+// not. Do not fold the stage-1 divide away here any more than on the CPU.
+//
+// EXACTLY ZERO ON A PLANAR CONTROL FIELD, which is the property the whole gate
+// rests on: both axes difference FIRST and interpolate SECOND, so on a plane
+// every second difference is 0 before any division happens and truncation has
+// nothing to truncate. Collapsing with the cubic basis first and differencing
+// the truncated row values afterwards would report spurious curvature on a
+// tilted plane whose row values straddle zero. Keep the order.
+CarrierCurvature evalCarrierCurvature(int64_t cp[16], int64_t fx, int64_t fy, int64_t pxMm)
+{
+    // Same q10 cell fraction as evalCarrier. fx, fy are in [0, pxMm) by
+    // floorDiv's contract, so both numerators are non-negative and tq lands in
+    // [0, 1023]; truncDiv agrees with the CPU's `/` there.
+    const int64_t tx = truncDiv(fx * kCarrierT, pxMm);
+    const int64_t ty = truncDiv(fy * kCarrierT, pxMm);
+    const CarrierW4 wx = carrierValueW(tx);
+    const CarrierW4 wy = carrierValueW(ty);
+    const CarrierW2 gx = carrierCurveW(tx);
+    const CarrierW2 gy = carrierCurveW(ty);
+
+    // d2/dx2: stage 1 differences ALONG X within each control row (exact, no
+    // division), stage 2 collapses Y with the cubic value basis.
+    // d2/dy2: the mirror image -- stage 1 differences ALONG Y within each
+    // control column (stride 4), stage 2 collapses X.
+    //
+    // Both stage-1 numerators are routinely NEGATIVE (a crest gives negative
+    // second differences), so these are truncDiv and NOT a bare `/`.
+    int64_t rowD2[4];
+    int64_t colD2[4];
+    [unroll]
+    for (int k = 0; k < 4; ++k)
+    {
+        const int64_t r0 = cp[4 * k + 0];
+        const int64_t r1 = cp[4 * k + 1];
+        const int64_t r2 = cp[4 * k + 2];
+        const int64_t r3 = cp[4 * k + 3];
+        const int64_t c0 = cp[k + 4 * 0];
+        const int64_t c1 = cp[k + 4 * 1];
+        const int64_t c2 = cp[k + 4 * 2];
+        const int64_t c3 = cp[k + 4 * 3];
+        const int64_t dxx = (r2 - 2 * r1 + r0) * gx.w0 + (r3 - 2 * r2 + r1) * gx.w1;
+        const int64_t dyy = (c2 - 2 * c1 + c0) * gy.w0 + (c3 - 2 * c2 + c1) * gy.w1;
+        rowD2[k] = truncDiv(dxx, kCarrierCurveDen);
+        colD2[k] = truncDiv(dyy, kCarrierCurveDen);
+    }
+
+    const int64_t cxx = rowD2[0] * wy.w0 + rowD2[1] * wy.w1 + rowD2[2] * wy.w2 +
+                        rowD2[3] * wy.w3;
+    const int64_t cyy = colD2[0] * wx.w0 + colD2[1] * wx.w1 + colD2[2] * wx.w2 +
+                        colD2[3] * wx.w3;
+
+    CarrierCurvature c;
+    // Also routinely negative -- truncDiv.
+    c.cxxMmPerPx2 = truncDiv(cxx, kCarrierValueDen);
+    c.cyyMmPerPx2 = truncDiv(cyy, kCarrierValueDen);
+    return c;
+}
+
+// The curvature currency: the LAPLACIAN, in q10 mm per metre per metre. Signed;
+// crest negative. Truncating division on a routinely-negative numerator, so
+// truncDiv -- truncation toward zero is symmetric and preserves the
+// antisymmetry curvature(-h) == -curvature(h) that the CPU tests assert.
+int64_t carrierCurvatureMmPerM2Q10(CarrierCurvature c, int64_t pxMm)
+{
+    const int64_t perPx2 = c.cxxMmPerPx2 + c.cyyMmPerPx2; // mm per pixel^2
+    return truncDiv(perPx2 * kCurveQ10One * kMmPerMSquared, pxMm * pxMm);
+}
+
 // Faded-bilinear blend of four u8 corners -- one channel of vxc::blendClimate
 // (amplifier.cpp), bit-for-bit. Every input is a u8 and both weights are
 // non-negative, so the result cannot leave [0, 255] and needs no clamp.
@@ -459,6 +603,344 @@ int64_t slopeScaleQ10(int64_t slopeMmPerM)
 int64_t microScaleQ10(int64_t slopeMmPerM)
 {
     return clamp64(768 + truncDiv(slopeMmPerM * 15, 128), 768, 1280);
+}
+
+// vxc::curvatureScaleQ10 (voxelcore/carrier.h) bit-for-bit. Convex crests
+// roughen toward 1.75x, concave hollows smooth toward 0.5x as colluvium fills
+// them. Gates the SHAPING band only, never the microrelief band -- for the same
+// reason microScaleQ10 has a floor: decimetre roughness is a property of the
+// material, not of the local geometry.
+//
+// ALL FOUR CONSTANTS ARE PROVISIONAL AND UNCALIBRATED on the CPU side and are
+// mirrored here as-is. The knee especially is per-tier and will NOT transfer to
+// the fine tier (curvature magnitude is spectral); carrier.h says so at length.
+// Do not "improve" them here -- they are worldgen contract, and changing one on
+// this side alone is a desync, not a tweak.
+//
+// The clamp is the FIRST operation, which is what makes carrier.h's exhaustive
+// compile-time sweep over [-knee, +knee] exhaustive over all of int64. Keep it
+// first. Both divisions have a non-negative numerator by construction (the
+// magnitude is taken first), so truncDiv matches the CPU's `/`.
+static const int64_t kCurvatureScaleOneQ10 = 1024; // 1.0x at zero curvature
+static const int64_t kCurvatureScaleMinQ10 = 512;  // 0.5x  in hollows  [PROVISIONAL]
+static const int64_t kCurvatureScaleMaxQ10 = 1792; // 1.75x on crests   [PROVISIONAL]
+// 0.5 mm/m^2 AT THE 30 m REFERENCE TIER -- feed the argument through
+// carrierCurvatureTierNormQ10 first. A MEASURED anchor: mean |Laplacian| on a
+// realistic 30 m raster is 288 q10, so a knee at 512 puts typical ground a
+// little over half way to saturation. The first cut was 2048, seven times the
+// mean, and the gate was wired in, bounded, proved, MIRRORED -- and doing
+// nothing. Do not round it back to a tidier number.        [PROVISIONAL]
+// MIRROR: carrier.h kCurvatureKneeQ10. Re-calibrated -- 0.5 left 70-96% of real
+// samples saturated, i.e. a two-valued step rather than a ramp.
+static const int64_t kCurvatureKneeQ10 = kCurveQ10One;
+
+// The curvature UNIT is scale-invariant; the curvature terrain EXHIBITS is not.
+// Curvature is a second derivative, so on a self-affine surface its magnitude
+// grows as finer scales are resolved -- measured 288 q10 at a 30 m pixel against
+// 74,182 at 1.875 m, a ratio of 257.6 against a pixel ratio of 16, i.e. almost
+// exactly pxMm^-2. One knee therefore cannot serve both tiers: at 2048 it
+// saturated 0% of samples at 30 m and 98% at 1.875 m.
+//
+// floorDiv, NOT truncDiv, and this one is not interchangeable even though it
+// sits between two functions that both use truncDiv. Flooring is what makes a
+// crest and a hollow of EQUAL MAGNITUDE gate equally; truncation toward zero
+// would break that symmetry across zero. carrier.h pins it with static_asserts
+// on carrierCurvatureTierNormQ10(+/-2560, 1875) == +/-10.
+//
+// OVERFLOW, in this file's arithmetic. The product re-forms exactly the quantity
+// carrierCurvatureMmPerM2Q10 divided down, so its bound does NOT grow with a
+// finer pitch: |curve| <= 8C * kCurveQ10One * kMmPerMSquared / pxMm^2, hence
+// |curve * pxMm * pxMm| <= 8C * 1024 * 1e6 = 7.4e16 at ANY pitch -- 125x margin
+// against int64's 9.22e18, the same 125x as the unit conversion it undoes.
+// Evaluation is left to right, so the intermediate `curve * pxMm` is smaller
+// still (2.5e12 at 30000, 3.9e13 at 1875). The divisor is 9e8, a constant.
+static const int64_t kCurvatureRefPixelMm = 30000;
+
+int64_t carrierCurvatureTierNormQ10(int64_t curveMmPerM2Q10, int64_t pxMm)
+{
+    return floorDiv(curveMmPerM2Q10 * pxMm * pxMm,
+                    kCurvatureRefPixelMm * kCurvatureRefPixelMm);
+}
+
+int64_t curvatureScaleQ10(int64_t curveMmPerM2Q10)
+{
+    const int64_t c = clamp64(curveMmPerM2Q10, -kCurvatureKneeQ10, kCurvatureKneeQ10);
+    if (c < 0) // crest: roughen
+    {
+        return kCurvatureScaleOneQ10 +
+               truncDiv((-c) * (kCurvatureScaleMaxQ10 - kCurvatureScaleOneQ10),
+                        kCurvatureKneeQ10);
+    }
+    // hollow: smooth
+    return kCurvatureScaleOneQ10 -
+           truncDiv(c * (kCurvatureScaleOneQ10 - kCurvatureScaleMinQ10), kCurvatureKneeQ10);
+}
+
+// --- rill / flute term (v10, voxelcore/detail_rill.h) -----------------------
+// Bit-exact mirror. Water does not cut isotropic hollows; this is a value-noise
+// field ~1.6 m across-slope and ~12.8 m along-slope, oriented by the carrier's
+// local gradient and gated off on ground too flat for a rill to exist.
+//
+// WHY THE ROTATION IS QUANTISED TO A TABLE, which is the one thing here that
+// looks like it could be "simplified" back into the plan's literal text and
+// must not be. Rotating world position by the LOCAL gradient makes the noise
+// phase a p-dependent transform of the global coordinate, whose derivative
+// carries a term proportional to distance from the world origin -- measured 61x
+// excess roughness at 54 km, while staying mathematically continuous the whole
+// way, so a continuity test would never have caught it. Each of the 16 table
+// directions is a COMPILE-TIME CONSTANT linear map and therefore has zero lever
+// arm; only the blend weights depend on the gradient, and they enter
+// multiplicatively and boundedly.
+//
+// EVERY division in this block is floorDiv, matching detail_rill.h, which uses
+// floorDiv throughout rather than truncDiv. That is not interchangeable: the
+// two disagree on negative numerators, and `dx * yMm - dy * xMm` in
+// rillFieldAtDir is negative over half the world.
+static const int64_t kRillAcrossMm = 1600;
+static const int64_t kRillElongation = 8;
+static const int64_t kRillAlongMm = 12800; // kRillAcrossMm * kRillElongation
+static const int64_t kRillAmplitudeMm = 300;  // PROVISIONAL, see detail_rill.h
+static const int64_t kRillGateStartMmPerM = 100; // 10% grade
+static const int64_t kRillGateFullMmPerM = 200;  // 20% grade
+static const int64_t kRillGateWidthMmPerM = 100; // Full - Start
+static const int64_t kRillDirQ = 4096;
+static const int64_t kRillGateQ = 4096;
+static const int64_t kRillSectors = 16;
+static const int64_t kRillNoiseAbs = 32768;
+
+// 11.25-degree steps over 180 degrees, q12. A rill axis is a LINE, so a half
+// turn is the whole table and index 16 wraps to 0.
+static const int kRillDirCosQ[16] = {
+    4096, 4017, 3783, 3406, 2896, 2276, 1567, 799,
+    0, -799, -1567, -2276, -2896, -3406, -3783, -4017,
+};
+static const int kRillDirSinQ[16] = {
+    0, 799, 1567, 2276, 2896, 3406, 3783, 4017,
+    4096, 4017, 3783, 3406, 2896, 2276, 1567, 799,
+};
+
+// Octagonal norm: sqrt-free magnitude estimate, used ONLY for the gate's grade
+// test. Overestimates true length by 0..+6.07% by direction.
+int64_t rillOctNorm(int64_t x, int64_t y)
+{
+    const int64_t ax = x < 0 ? -x : x;
+    const int64_t ay = y < 0 ? -y : y;
+    const int64_t hi = ax > ay ? ax : ay;
+    const int64_t lo = ax > ay ? ay : ax;
+    return hi + floorDiv(lo, 2);
+}
+
+// Perlin's quintic on [0, kRillGateQ] -> [0, kRillGateQ], FACTORED rather than
+// expanded: the expanded numerator needs 15*T^5 = 1.7e19 and blows int64, while
+// this form's product is the quintic (in [0,1]) times T^5 = 1.15e18, an 8x
+// margin against 9.22e18. That margin is the reason for the factoring and it is
+// the same in HLSL as in C++ -- do not expand it here.
+int64_t rillQuinticQ(int64_t t)
+{
+    const int64_t T = kRillGateQ;
+    const int64_t inner = 6 * t * t - 15 * t * T + 10 * T * T;
+    return floorDiv(t * t * t * inner, T * T * T * T);
+}
+
+int64_t rillGateQ(int64_t gradMagMmPerM)
+{
+    if (gradMagMmPerM <= kRillGateStartMmPerM) return 0;
+    if (gradMagMmPerM >= kRillGateFullMmPerM) return kRillGateQ;
+    const int64_t t =
+        floorDiv((gradMagMmPerM - kRillGateStartMmPerM) * kRillGateQ, kRillGateWidthMmPerM);
+    return rillQuinticQ(t);
+}
+
+// Aspect -> position in the direction table, in [0, kRillSectors*kRillDirQ].
+// The "diamond angle" (L1 angle): continuous, strictly monotone in the true
+// angle, one divide, no atan2. The gradient is folded into the upper half plane
+// first because the rill axis is a line; the fold is seamless because a=0 and
+// a=2 both land on entry 0.
+int64_t rillSectorQ(int64_t gradXMmPerM, int64_t gradYMmPerM)
+{
+    int64_t gx = gradXMmPerM;
+    int64_t gy = gradYMmPerM;
+    if (gy < 0 || (gy == 0 && gx < 0)) { gx = -gx; gy = -gy; }
+    const int64_t l1 = (gx < 0 ? -gx : gx) + gy; // > 0: the caller gates |g| == 0 away
+    return floorDiv((l1 - gx) * (kRillSectors * kRillDirQ), 2 * l1);
+}
+
+// One anisotropic field: rotate the world point into table direction k, scale
+// the across-slope axis by kRillElongation, sample the quintic-FADED value noise
+// on that warped domain. Faded and not raw: under an 8:1 warp, valueNoise2's
+// lattice creases would run dead straight down the fall line -- an artifact
+// indistinguishable at a glance from the feature being created.
+int64_t rillFieldAtDir(uint64_t seed, int64_t xMm, int64_t yMm, int64_t k)
+{
+    const int64_t dx = (int64_t)kRillDirCosQ[k];
+    const int64_t dy = (int64_t)kRillDirSinQ[k];
+    const int64_t along = floorDiv(dx * xMm + dy * yMm, kRillDirQ);
+    const int64_t across = floorDiv(dx * yMm - dy * xMm, kRillDirQ);
+    return valueNoise2Fade(seed, along, across * kRillElongation, kRillAlongMm, CH_RILL);
+}
+
+int64_t rillScaleMm(int64_t noise, int64_t gateQ)
+{
+    return floorDiv(noise * kRillAmplitudeMm * gateQ, kRillNoiseAbs * kRillGateQ);
+}
+
+int64_t rillMm(uint64_t seed, int64_t xMm, int64_t yMm, int64_t gradXMmPerM,
+               int64_t gradYMmPerM)
+{
+    const int64_t gate = rillGateQ(rillOctNorm(gradXMmPerM, gradYMmPerM));
+    // Early out on flats. EXACT, not an approximation: the gate is identically
+    // zero here. It also keeps rillSectorQ's divide by |g| from being evaluated
+    // where the aspect is undefined.
+    if (gate == 0) return 0;
+
+    const int64_t sQ = rillSectorQ(gradXMmPerM, gradYMmPerM);
+    const int64_t k0 = clamp64(floorDiv(sQ, kRillDirQ), 0, kRillSectors - 1);
+    const int64_t k1 = (k0 + 1 == kRillSectors) ? 0 : k0 + 1;
+    const int64_t f = sQ - k0 * kRillDirQ; // [0, kRillDirQ]
+
+    const int64_t n0 = rillFieldAtDir(seed, xMm, yMm, k0);
+    const int64_t n1 = rillFieldAtDir(seed, xMm, yMm, k1);
+    // Convex combination: weights non-negative and summing to kRillDirQ, so the
+    // range is unchanged and |rillMm| <= kRillAmplitudeMm exactly.
+    const int64_t blend = floorDiv(n0 * (kRillDirQ - f) + n1 * f, kRillDirQ);
+
+    return rillScaleMm(blend, gate);
+}
+
+// --- bedding term (v10, voxelcore/detail_bedding.h) -------------------------
+// Bit-exact mirror. A regional 819.2 m strike/dip/thickness field, plus the
+// quasi-periodic banding the ground surface makes where it cuts the tilted bed
+// planes -- so layered rock reads as layered across a whole hillside rather than
+// per-point.
+//
+// THE RAW (UNDIVIDED) PROJECTION IS CARRIED AS FAR AS POSSIBLE AND DIVIDED DOWN
+// ONCE, LATE. Reducing perpRaw to true mm immediately would staircase it --
+// perpRaw changes by only ~kBeddingDirScale per millimetre of x, so a floorDiv
+// by 64 sits still for ~64 steps then jumps a whole unit, which through the
+// steep per-bed profile becomes a visible step recurring every ~64 mm. That is a
+// seam artifact WITHIN a structural domain, exactly the class this project
+// exists to remove. Every stage below divides only by something large relative
+// to its numerator's per-millimetre delta. Do not "simplify" the scaling.
+static const int64_t kBeddingDomainMm = 819200; // 819.2 m
+static const int64_t kBeddingDirScale = 64;
+static const int64_t kBeddingDipMaxQ10 = 3072; // ~71.6 degrees, finite by construction
+static const int64_t kBeddingThicknessMinMm = 800;
+static const int64_t kBeddingThicknessMaxMm = 3200;
+static const int64_t kBeddingRawScale = (int64_t)1024 * 32768; // shapeQ10 * hardness den
+static const int64_t kBeddingWarpLatticeMul = 3;
+static const int64_t kBeddingWarpAmpQ10 = 384;
+static const int64_t kBeddingPeakFracMinQ10 = 307;
+static const int64_t kBeddingPeakFracMaxQ10 = 717;
+// MIRROR: detail_bedding.h kBeddingAmpMm. 320 -> 120: at 320 this term alone was
+// 4.66x the whole detail S2 budget at the 0.4 m lag.        PROVISIONAL
+static const int64_t kBeddingAmpMm = 120;
+
+// The 16 strike directions. Entries 8..15 are the EXACT 90-degree rotation
+// (-dy, dx) of entries 0..7, which is an integer identity with no rounding, so
+// strike and its perpendicular (the dip direction) are exactly orthogonal for
+// every entry. That exactness is load-bearing for along-strike invariance.
+static const int kBeddingStrikeDx[16] = {
+    64, 63, 59, 53, 45, 36, 24, 12, 0, -12, -24, -36, -45, -53, -59, -63,
+};
+static const int kBeddingStrikeDy[16] = {
+    0, 12, 24, 36, 45, 53, 59, 63, 64, 63, 59, 53, 45, 36, 24, 12,
+};
+
+// vxc::beddingHashField16, SPLIT so the shift distance is always a bare literal
+// at the call site.
+//
+// The C++ original takes `shift` as a parameter. Mirrored literally -- as a
+// macro or as a helper that shifts by its own argument -- that is a variable
+// shift distance, which lint-shader-ub rejects as VARIABLE_SHIFT and rightly so:
+// an out-of-range shift is undefined and vendors differ on whether the distance
+// is masked. The same construct was already deleted once from this file (see
+// coarseRep's note on `1 << level`). So the helper takes the ALREADY-EXTRACTED
+// 16 bits and every caller does its own `>> <literal>` — same arithmetic, no
+// variable shift anywhere.
+int64_t beddingRangeFrom16(int64_t bits, int64_t lo, int64_t hi)
+{
+    return lo + floorDiv(bits * (hi - lo), 65535);
+}
+
+// shapeQ10 * hardness, in [-kBeddingRawScale, kBeddingRawScale] exactly.
+//
+// The CPU calls beddingDomainHash three times (once each for strike, dip and
+// thickness) and this hoists it to one `dh`. hash2 is a pure function of its
+// arguments, so that is value-identical, not merely equivalent -- and it is the
+// same single hash the C++ comment says it intends ("a single hash2, sliced into
+// disjoint bit ranges").
+int64_t beddingRawAt(uint64_t seed, int64_t xMm, int64_t yMm, int64_t zMm)
+{
+    const uint64_t dh = hash2(seed, floorDiv(xMm, kBeddingDomainMm),
+                              floorDiv(yMm, kBeddingDomainMm), CH_BEDDING_STRIKE);
+    const uint strikeIdx = (uint)(dh >> 60) & 0xFu;                          // top 4 bits
+    const int64_t dipQ10 = beddingRangeFrom16((int64_t)((dh >> 32) & 0xFFFFULL),
+                                              -kBeddingDipMaxQ10, kBeddingDipMaxQ10);
+    const int64_t thicknessMm = beddingRangeFrom16((int64_t)((dh >> 16) & 0xFFFFULL),
+                                                   kBeddingThicknessMinMm,
+                                                   kBeddingThicknessMaxMm);
+
+    const int64_t strikeDx = (int64_t)kBeddingStrikeDx[strikeIdx];
+    const int64_t strikeDy = (int64_t)kBeddingStrikeDy[strikeIdx];
+    const int64_t dipDirX = -strikeDy; // exact 90-degree rotation
+    const int64_t dipDirY = strikeDx;
+
+    const int64_t perpRaw = xMm * dipDirX + yMm * dipDirY;
+
+    const int64_t drawZ = zMm * kBeddingDirScale;
+    const int64_t drawDip = floorDiv(dipQ10 * perpRaw, 1024);
+    const int64_t dRaw = drawZ - drawDip;
+
+    // Domain warp: a smooth 1D hashed field over dRaw, giving locally variable
+    // bed thickness without ever summing more than the two nearest lattice
+    // corners.
+    const int64_t thicknessRaw = thicknessMm * kBeddingDirScale;
+    const int64_t warpLatticeRaw = thicknessRaw * kBeddingWarpLatticeMul;
+    const int64_t wi0 = floorDiv(dRaw, warpLatticeRaw);
+    const int64_t wf = dRaw - wi0 * warpLatticeRaw; // [0, warpLatticeRaw)
+    const int64_t wv0 = (int64_t)hashToSigned16(hash2(seed, wi0, 0, CH_BEDDING));
+    const int64_t wv1 = (int64_t)hashToSigned16(hash2(seed, wi0 + 1, 0, CH_BEDDING));
+    const int64_t warpAmpRaw = floorDiv(thicknessRaw * kBeddingWarpAmpQ10, 1024);
+    const int64_t warpRaw = floorDiv((wv0 * (warpLatticeRaw - wf) + wv1 * wf) * warpAmpRaw,
+                                     32768 * warpLatticeRaw);
+    const int64_t dwRaw = dRaw + warpRaw;
+
+    const int64_t bedIdx = floorDiv(dwRaw, thicknessRaw);
+    const int64_t fracRaw = dwRaw - bedIdx * thicknessRaw; // [0, thicknessRaw)
+
+    const int64_t pfQ10 = beddingRangeFrom16(
+        (int64_t)(hash2(seed, bedIdx, 2, CH_BEDDING) & 0xFFFFULL), kBeddingPeakFracMinQ10,
+        kBeddingPeakFracMaxQ10);
+    const int64_t pfRaw = floorDiv(pfQ10 * thicknessRaw, 1024);
+
+    // Asymmetric tent: 0 at bed boundaries, 1024 at the hashed peak. The `> 0`
+    // guards are defensive only (pfQ10 in [307,717] and thicknessRaw > 0 already
+    // give 0 < pfRaw < thicknessRaw) and are mirrored because the whole point of
+    // the source file is not to trust an unchecked division.
+    int64_t shapeQ10;
+    if (fracRaw <= pfRaw)
+    {
+        shapeQ10 = pfRaw > 0 ? floorDiv(fracRaw * 1024, pfRaw) : 1024;
+    }
+    else
+    {
+        const int64_t span = thicknessRaw - pfRaw;
+        shapeQ10 = span > 0 ? floorDiv((thicknessRaw - fracRaw) * 1024, span) : 0;
+    }
+
+    const int64_t hardness = (int64_t)hashToSigned16(hash2(seed, bedIdx, 1, CH_BEDDING));
+    return shapeQ10 * hardness;
+}
+
+// 2D bedding displacement, mm. |result| <= kBeddingAmpMm, proved in
+// detail_bedding.h.
+//
+// THE z ARGUMENT IS THE CARRIER HEIGHT BEFORE DETAIL, not the final surface --
+// see the call in evalSurface. Beds sit at fixed ABSOLUTE elevations and the
+// ground cuts through them, so feeding the wrong z slides the whole stack.
+int64_t beddingMm(uint64_t seed, int64_t xMm, int64_t yMm, int64_t surfaceMm)
+{
+    return floorDiv(kBeddingAmpMm * beddingRawAt(seed, xMm, yMm, surfaceMm), kBeddingRawScale);
 }
 
 // --- biome classification (voxelcore/biome.h) -------------------------------
@@ -715,24 +1197,94 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     // and each scaled ONCE — mirroring Amplifier::evalSurface exactly,
     // including WHERE the truncations happen. Moving a truncation is a
     // divergence even when the arithmetic is otherwise identical.
+    //
+    // v10: the SHAPING band also takes a CURVATURE gate. Convex crests roughen,
+    // concave hollows smooth toward colluvial fill. The microrelief band is NOT
+    // gated -- decimetre roughness is a property of the material, not of the
+    // local geometry.
+    //
+    // Normalised to the 30 m reference tier BEFORE gating. Without it the gate
+    // is a no-op at 30 m and hard-clipped at 1.875 m -- not two settings of one
+    // gate, two different failures.
+    const int64_t curveQ10 = carrierCurvatureTierNormQ10(
+        carrierCurvatureMmPerM2Q10(evalCarrierCurvature(cp, fx, fy, pxMm), pxMm), pxMm);
+    const int64_t cScale = curvatureScaleQ10(curveQ10);
+
     const int64_t sScale = slopeScaleQ10(slopeMmPerM);
     const int64_t mScale = microScaleQ10(slopeMmPerM);
     int64_t landformMm = 0;
     int64_t microMm = 0;
-    [unroll]
-    for (int i = 0; i < kOctaveCount; ++i)
+    // v10 TIER BRANCH (vxc::isFineTier). Two tables, two lengths, two band
+    // splits, and the noise channel indexed by the octave's position in ITS OWN
+    // table -- so the loops are written out separately rather than parameterised
+    // over a table pointer HLSL does not have. Both bodies are otherwise
+    // character-identical, and both are identical to the CPU's single loop.
+    if (pxMm <= kFineTierMaxPixelMm)
     {
-        const int64_t term = truncDiv(valueNoise2Fade(seed, xMm, yMm,
-                                                      (int64_t)kOctaveLatticeMm[i],
-                                                      CH_DETAIL_OCTAVE_BASE + (uint)i) *
-                                          (int64_t)kOctaveAmplitudeMm[i],
-                                      32768);
-        if (i < kLandformOctaveCount)
-            landformMm += term;
-        else
-            microMm += term;
+        [unroll]
+        for (int i = 0; i < kFineOctaveCount; ++i)
+        {
+            const int64_t term = truncDiv(valueNoise2Fade(seed, xMm, yMm,
+                                                          (int64_t)kFineOctaveLatticeMm[i],
+                                                          CH_DETAIL_OCTAVE_BASE + (uint)i) *
+                                              (int64_t)kFineOctaveAmplitudeMm[i],
+                                          32768);
+            if (i < kFineLandformOctaveCount)
+                landformMm += term;
+            else
+                microMm += term;
+        }
     }
-    const int64_t detailMm = truncDiv(landformMm * sScale, 1024) + truncDiv(microMm * mScale, 1024);
+    else
+    {
+        [unroll]
+        for (int i = 0; i < kOctaveCount; ++i)
+        {
+            const int64_t term = truncDiv(valueNoise2Fade(seed, xMm, yMm,
+                                                          (int64_t)kOctaveLatticeMm[i],
+                                                          CH_DETAIL_OCTAVE_BASE + (uint)i) *
+                                              (int64_t)kOctaveAmplitudeMm[i],
+                                          32768);
+            if (i < kLandformOctaveCount)
+                landformMm += term;
+            else
+                microMm += term;
+        }
+    }
+    // The microrelief band takes HALF the curvature gate's excursion (range
+    // 0.75..1.375). Gating only the shaping band put the whole effect in the
+    // 25.6 m and 6.4 m octaves, whose second difference over a 0.1 m lag is
+    // ~1e-5 of amplitude -- invisible at every scale a player actually sees.
+    // Half rather than all because a hollow genuinely smooths at decimetre scale
+    // (it collects colluvium) while the material's own texture does not vanish
+    // with the local geometry, and half keeps the range clear of the floor
+    // microScaleQ10 exists to defend.
+    //
+    // `cScale - 1024` is in [-512, +768] and is ROUTINELY NEGATIVE AND ODD (a
+    // hollow gives exactly -c for c in [0, 512]), so the CPU's `/ 2` is a
+    // truncating divide on a negative numerator: truncDiv, never floorDiv. They
+    // differ by one whole q10 step on every odd hollow.
+    const int64_t cScaleMicro = 1024 + truncDiv(cScale - 1024, 2);
+    // TWO SUCCESSIVE q10 DIVIDES ON EACH BAND now, each truncating, in this
+    // order: `landformMm * sScale / 1024 * cScale / 1024` and
+    // `microMm * mScale / 1024 * cScaleMicro / 1024`. Folding either pair into a
+    // single divide by 1024*1024 is NOT the same number and is a divergence.
+    int64_t detailMm = truncDiv(truncDiv(landformMm * sScale, 1024) * cScale, 1024) +
+                       truncDiv(truncDiv(microMm * mScale, 1024) * cScaleMicro, 1024);
+
+    // Two ADDITIVE structured terms, added AFTER the band scaling because
+    // neither is an fBm octave and each already carries its own gate --
+    // multiplying them by slopeScaleQ10 as well would double-count.
+    //
+    // The rill gradient is the carrier's analytic gradient converted to mm per
+    // METRE. `sxMmPerPx` is SIGNED, so the CPU's bare `/` is a truncating divide
+    // on a routinely-negative numerator: truncDiv here, never floorDiv.
+    //
+    // beddingMm takes baseMm -- the carrier height BEFORE detail is added, not
+    // the final surface.
+    detailMm += rillMm(seed, xMm, yMm, truncDiv(carrier.sxMmPerPx * 1000, pxMm),
+                       truncDiv(carrier.syMmPerPx * 1000, pxMm));
+    detailMm += beddingMm(seed, xMm, yMm, baseMm);
 
     SurfaceEval s;
     s.px = px;

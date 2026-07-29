@@ -23,6 +23,7 @@ Wire format (little-endian throughout):
 from __future__ import annotations
 
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -328,26 +329,76 @@ def _unpack_residuals(buf: bytes, n: int, resid_bits: int) -> np.ndarray:
 
 # ------------------------------------------------------------------ codec (§3)
 
-def _compress(payload: bytes, codec: int) -> bytes:
+#: A CODEC_ZSTD frame compressor: plain block payload in, one frame out.
+#: Blocks are independent (§4) — no dictionary, no shared context, no state
+#: across calls — so this is called once per block and must be stateless.
+Compressor = Callable[[bytes], bytes]
+
+#: A CODEC_ZSTD frame decompressor: (frame, expected_plain_len) -> plain bytes.
+#: `expected_plain_len` is derived from the HEADER (block pixels x element or
+#: residual width), never from `comp_len`, and returning anything other than
+#: exactly that many bytes is an error. This mirrors voxel-core's injected
+#: FineDecompressor byte for byte (voxelcore/tilestore.h), deliberately: the
+#: two halves are built independently against docs/vxtl-v2-format.md, so the
+#: closer the two boundaries look, the fewer ways they have to disagree.
+Decompressor = Callable[[bytes, int], bytes]
+
+
+def _compress(payload: bytes, codec: int, compressor: Compressor | None = None) -> bytes:
     if codec == CODEC_RAW:
+        # CODEC_RAW must never depend on a compression library, injected or
+        # otherwise (§3) — an injected compressor is simply ignored here.
         return payload
     if codec == CODEC_ZSTD:
+        if compressor is not None:
+            return compressor(payload)
         if not HAVE_ZSTD:
             raise RuntimeError(
-                "zstandard is not installed; encode with codec=CODEC_RAW instead"
+                "zstandard is not installed and no compressor was injected; "
+                "encode with codec=CODEC_RAW instead"
             )
         return zstandard.ZstdCompressor().compress(payload)
     raise ValueError(f"unsupported codec {codec}")
 
 
-def _decompress(payload: bytes, codec: int) -> bytes:
+def _decompress(
+    payload: bytes,
+    codec: int,
+    expected_len: int,
+    decompressor: Decompressor | None = None,
+) -> bytes:
+    """Expand one block's stored bytes to exactly `expected_len` bytes.
+
+    The length check is the point, and it is the ONLY length check that
+    survives compression: under CODEC_ZSTD `comp_len` is the compressed size
+    and says nothing about the contents, so a truncated, padded or simply
+    wrong frame is caught here or not at all.
+    """
     if codec == CODEC_RAW:
-        return payload
-    if codec == CODEC_ZSTD:
-        if not HAVE_ZSTD:
-            raise RuntimeError("zstandard is not installed; cannot decode CODEC_ZSTD")
-        return zstandard.ZstdDecompressor().decompress(payload)
-    raise ValueError(f"unsupported codec {codec}")
+        out = payload
+    elif codec == CODEC_ZSTD:
+        if not payload:
+            # A block that owns zero data bytes is CONSTANT by definition;
+            # an empty frame cannot expand to anything.
+            raise ValueError("empty CODEC_ZSTD frame")
+        if decompressor is not None:
+            out = decompressor(payload, expected_len)
+        elif HAVE_ZSTD:
+            out = zstandard.ZstdDecompressor().decompress(
+                payload, max_output_size=expected_len
+            )
+        else:
+            raise RuntimeError(
+                "zstandard is not installed and no decompressor was injected; "
+                "cannot decode CODEC_ZSTD"
+            )
+    else:
+        raise ValueError(f"unsupported codec {codec}")
+    if len(out) != expected_len:
+        raise ValueError(
+            f"block payload expanded to {len(out)} bytes, header implies {expected_len}"
+        )
+    return out
 
 
 # ------------------------------------------------------------- block plane (§4)
@@ -359,6 +410,7 @@ def _encode_plane(
     codec: int,
     elem_dtype: str,
     force_raw_blocks: set[tuple[int, int]] | None = None,
+    compressor: Compressor | None = None,
 ) -> tuple[bytes, bytes]:
     """Encode one plane (elevation or flow) into (index_bytes, data_bytes).
 
@@ -368,13 +420,24 @@ def _encode_plane(
     block boundary.
 
     `force_raw_blocks` is a set of (bx, by) block coordinates to force to
-    MODE_RAW regardless of size. This reference encoder does NOT pick RAW on
-    its own: under CODEC_RAW, RAW is only ever byte-cheaper than CODED when
-    CODED needed resid_bits=32 (both cost 2 bytes/px at resid_bits=16, a
-    tie broken to CODED), so a size-minimising auto-selector would make
-    resid_bits=32 unreachable through the public encoder — exactly the code
-    path the spec says must be tested (§5, §9 item 1). RAW is kept in the
-    format and reachable via this explicit opt-in instead.
+    MODE_RAW regardless of size.
+
+    RAW IS AUTO-SELECTED FOR 1-BYTE PLANES ONLY, i.e. the §6 flow plane, and
+    only when it is actually smaller. The argument for never auto-selecting it
+    was written about the ELEVATION plane and is correct there: an i2 element
+    ties CODED at resid_bits=16 and only beats it at resid_bits=32, so a
+    size-minimising selector would make resid_bits=32 unreachable through the
+    public encoder — exactly the code path the spec says must be tested (§5,
+    §9 item 1). None of that transfers to a u1 element, where a MED residual is
+    zigzagged into TWO bytes per pixel against RAW's one and resid_bits can
+    never be 32 (a uint8 difference fits int16 with room to spare). Measured on
+    the real baked flow plane of tile (-40,24): 2.10 -> 1.05 MB uncoded, and
+    0.144 -> 0.108 MB after zstd-19, i.e. CODED was costing 33% of the flow
+    plane's compressed size for nothing.
+
+    The choice is made on the FINAL payload lengths, after `codec`, so it stays
+    correct for CODEC_ZSTD as well as CODEC_RAW; ties go to CODED so a plane
+    that gains nothing keeps the predicted form.
     """
     size = values.shape[0]
     bs = 1 << block_log2
@@ -382,6 +445,9 @@ def _encode_plane(
     assert size % bs == 0
     nb = size // bs
     force_raw_blocks = force_raw_blocks or set()
+    # See the docstring: only a 1-byte element can be smaller RAW than CODED
+    # without taking resid_bits=32 out of the encoder's reach.
+    auto_raw = np.dtype(elem_dtype).itemsize == 1
 
     entries = []
     chunks = []
@@ -395,17 +461,31 @@ def _encode_plane(
                 entries.append((0, 0, MODE_CONSTANT, int(const_val), 0, _ZERO_PAD4))
                 continue
             if (bx, by) in force_raw_blocks:
-                payload = _compress(blk.astype(elem_dtype).tobytes(), codec)
+                payload = _compress(blk.astype(elem_dtype).tobytes(), codec, compressor)
                 entries.append((data_offset, len(payload), MODE_RAW, 0, 0, _ZERO_PAD4))
             else:
                 resid = _med_residual(blk)
                 # resid_bits is REQUIRED, not an optimisation (§5): a single
                 # steep step forces this, not just pathological input.
                 resid_bits = 16 if (resid.min() >= -32768 and resid.max() <= 32767) else 32
-                payload = _compress(_pack_residuals(resid, resid_bits), codec)
-                entries.append(
-                    (data_offset, len(payload), MODE_CODED, 0, resid_bits, _ZERO_PAD4)
+                # Both branches take the injected compressor: the auto-RAW choice
+                # is decided on COMPRESSED lengths, so comparing a compressed
+                # residual against an uncompressed literal would pick RAW almost
+                # never, and the flow plane's 26% saving would silently vanish.
+                payload = _compress(_pack_residuals(resid, resid_bits), codec, compressor)
+                raw_payload = (
+                    _compress(blk.astype(elem_dtype).tobytes(), codec, compressor)
+                    if auto_raw else None
                 )
+                if raw_payload is not None and len(raw_payload) < len(payload):
+                    payload = raw_payload
+                    entries.append(
+                        (data_offset, len(payload), MODE_RAW, 0, 0, _ZERO_PAD4)
+                    )
+                else:
+                    entries.append(
+                        (data_offset, len(payload), MODE_CODED, 0, resid_bits, _ZERO_PAD4)
+                    )
             chunks.append(payload)
             data_offset += len(payload)
 
@@ -422,6 +502,7 @@ def _decode_plane(
     codec: int,
     elem_dtype: str,
     out_dtype,
+    decompressor: Decompressor | None = None,
 ) -> np.ndarray:
     bs = 1 << block_log2
     if size % bs != 0:
@@ -459,26 +540,36 @@ def _decode_plane(
 
         if offset + comp_len > len(data_bytes):
             raise ValueError("block payload extends past end of data section")
-        raw = _decompress(data_bytes[offset:offset + comp_len], codec)
 
+        # The expected PLAIN length comes from the header (mode, resid_bits,
+        # element width) and never from comp_len — under CODEC_ZSTD comp_len
+        # is the compressed size, so it constrains nothing. _decompress
+        # enforces the expansion is exactly this many bytes.
+        n = bs * bs
         if mode == MODE_CODED:
             if resid_bits not in (16, 32):
                 raise ValueError(f"bad resid_bits {resid_bits}")
-            n = bs * bs
             expected = n * (2 if resid_bits == 16 else 4)
-            if len(raw) != expected:
-                raise ValueError("residual payload has the wrong length")
+        elif mode == MODE_RAW:
+            expected = n * elem_size
+        else:
+            raise ValueError(f"bad block mode {mode}")
+
+        raw = _decompress(
+            data_bytes[offset:offset + comp_len], codec, expected, decompressor
+        )
+
+        if mode == MODE_CODED:
             resid = _unpack_residuals(raw, n, resid_bits).reshape(bs, bs)
             out[y0:y0 + bs, x0:x0 + bs] = _med_reconstruct(resid).astype(out_dtype)
-        elif mode == MODE_RAW:
-            n = bs * bs
-            if len(raw) != n * elem_size:
-                raise ValueError("RAW payload has the wrong length")
+        else:
+            # MODE_RAW. Note this branch is chosen by `mode` and by nothing
+            # else: at resid_bits=16 a RAW int16 plane and a CODED residual
+            # plane have IDENTICAL lengths (§4), so `expected` above matching
+            # is not evidence the payload was read as the right thing.
             out[y0:y0 + bs, x0:x0 + bs] = np.frombuffer(
                 raw, dtype=elem_dtype, count=n
             ).reshape(bs, bs)
-        else:
-            raise ValueError(f"bad block mode {mode}")
     return out
 
 
@@ -489,6 +580,7 @@ def encode_v2(
     *,
     raw_blocks: set[tuple[int, int]] | None = None,
     flow_raw_blocks: set[tuple[int, int]] | None = None,
+    compressor: Compressor | None = None,
 ) -> bytes:
     """Encode a v2 fine tile (docs/vxtl-v2-format.md §3-§6).
 
@@ -497,6 +589,14 @@ def encode_v2(
     an explicit opt-in rather than a size-minimising heuristic. They are
     independent: forcing an elevation block RAW says nothing about the flow
     block at the same coordinate, and vice versa.
+
+    `compressor` replaces the default zstandard frame compressor for
+    CODEC_ZSTD. It exists for the same reason the C++ decoder takes an
+    injected decompressor (§3, and voxelcore/tilestore.h): compression lives
+    at the boundary, not in the codec. §7 also licenses it — "the ENCODER
+    need not be deterministic", any conformant zstd frame will do — which is
+    what lets the committed conformance fixture be built without the optional
+    zstandard dependency, since CI deliberately does not install it.
     """
     flags = FLAG_FLOW_PRESENT if tile.flow is not None else 0
 
@@ -506,6 +606,7 @@ def encode_v2(
         codec=tile.codec,
         elem_dtype="<i2",
         force_raw_blocks=raw_blocks,
+        compressor=compressor,
     )
     sections = [(SECTION_ELEV_INDEX, elev_index), (SECTION_ELEV_DATA, elev_data)]
 
@@ -516,6 +617,7 @@ def encode_v2(
             codec=tile.codec,
             elem_dtype="u1",
             force_raw_blocks=flow_raw_blocks,
+            compressor=compressor,
         )
         sections += [(SECTION_FLOW_INDEX, flow_index), (SECTION_FLOW_DATA, flow_data)]
 
@@ -545,10 +647,14 @@ def encode_v2(
     return header + ext + bytes(table) + b"".join(s for _, s in sections)
 
 
-def decode_v2(data: bytes) -> TileV2:
+def decode_v2(data: bytes, *, decompressor: Decompressor | None = None) -> TileV2:
     """Decode a v2 fine tile. Raises ValueError on any truncation, magic/
     version/field mismatch, or internal inconsistency — never lets a raw
-    struct.error or an out-of-bounds slice through silently (§9 item 4)."""
+    struct.error or an out-of-bounds slice through silently (§9 item 4).
+
+    `decompressor` is the injected CODEC_ZSTD reader; None falls back to
+    zstandard when it is importable and raises a clear RuntimeError when it
+    is not. CODEC_RAW never consults it."""
     if len(data) < _HEADER.size:
         raise ValueError("truncated header")
     magic, version, seed, x, y, scale, size = _HEADER.unpack_from(data, 0)
@@ -613,7 +719,7 @@ def decode_v2(data: bytes) -> TileV2:
     elevation_cp = _decode_plane(
         sections[SECTION_ELEV_INDEX], sections[SECTION_ELEV_DATA],
         size=size, block_log2=block_log2, codec=codec,
-        elem_dtype="<i2", out_dtype=np.int16,
+        elem_dtype="<i2", out_dtype=np.int16, decompressor=decompressor,
     )
 
     flow = None
@@ -623,7 +729,7 @@ def decode_v2(data: bytes) -> TileV2:
         flow = _decode_plane(
             sections[SECTION_FLOW_INDEX], sections[SECTION_FLOW_DATA],
             size=size, block_log2=block_log2, codec=codec,
-            elem_dtype="u1", out_dtype=np.uint8,
+            elem_dtype="u1", out_dtype=np.uint8, decompressor=decompressor,
         )
 
     return TileV2(
@@ -633,4 +739,148 @@ def decode_v2(data: bytes) -> TileV2:
         quant=quant, codec=codec, bake_ver=bake_ver,
         block_log2=block_log2, flow=flow,
         scale=scale, predictor=predictor, parent_scale=parent_scale,
+    )
+
+
+# --------------------------------------------------- bake surface -> v2 bytes
+#
+# `encode_v2` above takes a `TileV2`, i.e. it starts from control points that
+# someone else already produced. The bake does NOT produce control points: a
+# `BakeResult.elevation_m` is a field of SAMPLES (bake/pipeline.py's own
+# docstring on that field says so, and points here for the prefilter). Between
+# the two sits the step this function is:
+#
+#     samples (float m)  ->  prefilter  ->  cp (float m)  ->  datum + quantise
+#                        ->  int16 cp   ->  encode_v2
+#
+# Without it there is no path at all from a bake to shippable bytes --
+# `pregen._encode_fine` probes for exactly this name first, finds `encode_v2`
+# instead, and dies because it cannot synthesise a `TileV2` argument. That is
+# why no fine tile existed end-to-end before 2026-07-29.
+#
+# Skipping the prefilter and writing the samples straight into the cp plane is
+# the one tempting shortcut and it is wrong in a way no round-trip test would
+# catch: the file still decodes, but the client's spline then evaluates a
+# LOW-PASSED version of the bake (docs/vxtl-v2-format.md §2: detrended H
+# degrades 0.83 -> 1.47), quietly throwing away the fine band the whole bake
+# exists to create.
+
+#: Elevation datum granularity, mm. `base_offset_mm` is snapped to a multiple
+#: of this so that a tile's datum is a legible round number in a hex dump and
+#: two neighbouring tiles of similar relief usually share one, which costs
+#: nothing (the int16 range is 3.2 km either way at 100 mm) and makes a
+#: mis-set datum obvious rather than plausible.
+DATUM_STEP_MM = 100_000  # 100 m
+
+
+def choose_datum(cp_mm_min: int, cp_mm_max: int) -> tuple[int, int]:
+    """Pick `(base_offset_mm, quant)` covering [cp_mm_min, cp_mm_max].
+
+    Prefers `QUANT_100MM` (one voxel per LSB, the format's intent) and falls
+    back to `QUANT_250MM` only when the tile's control-point range genuinely
+    exceeds the int16 span at 100 mm -- 6553.4 m, which real terrain reaches
+    only where an alpine tile also contains deep bathymetry. Raises ValueError
+    if even 250 mm cannot hold it, rather than silently clipping mountains.
+    """
+    mid = (int(cp_mm_min) + int(cp_mm_max)) // 2
+    base = int(round(mid / DATUM_STEP_MM)) * DATUM_STEP_MM
+    for quant in (QUANT_100MM, QUANT_250MM):
+        q = QUANT_MM[quant]
+        lo = (int(cp_mm_min) - base) / q
+        hi = (int(cp_mm_max) - base) / q
+        if lo >= -32768 and hi <= 32767:
+            return base, quant
+    raise ValueError(
+        f"control-point range [{cp_mm_min / 1000:.1f}, {cp_mm_max / 1000:.1f}] m "
+        f"({(cp_mm_max - cp_mm_min) / 1000:.1f} m of relief) does not fit int16 at "
+        "either quant; the format cannot represent this tile"
+    )
+
+
+def elevation_control_points(
+    elevation_m: np.ndarray,
+    *,
+    base_offset_mm: int | None = None,
+    quant: int | None = None,
+) -> tuple[np.ndarray, int, int]:
+    """Sample field in metres -> `(int16 cp, base_offset_mm, quant)`.
+
+    Runs the §2 prefilter (`bake.noise.prefilter`, the same operator the B0
+    carrier uses, imported lazily because it needs scipy and this module must
+    import on a bare CI box), then picks a datum and quantises.
+
+    `base_offset_mm` / `quant` may be pinned by the caller -- a seam test wants
+    two tiles on ONE datum so their cp planes are directly comparable -- and are
+    otherwise chosen per tile by `choose_datum`.
+    """
+    from .bake.noise import prefilter  # scipy; lazy on purpose
+
+    z = np.asarray(elevation_m)
+    if z.ndim != 2 or z.shape[0] != z.shape[1]:
+        raise ValueError(f"elevation_m must be a square 2-D array, got {z.shape}")
+
+    cp_mm = np.rint(prefilter(z) * 1000.0)
+    lo, hi = int(cp_mm.min()), int(cp_mm.max())
+    if base_offset_mm is None or quant is None:
+        auto_base, auto_quant = choose_datum(lo, hi)
+        base_offset_mm = auto_base if base_offset_mm is None else int(base_offset_mm)
+        quant = auto_quant if quant is None else int(quant)
+    cp = mm_to_control_points(cp_mm.astype(np.int64), int(base_offset_mm), int(quant))
+    return cp, int(base_offset_mm), int(quant)
+
+
+def encode_fine(
+    *,
+    seed: int,
+    x: int,
+    y: int,
+    elevation_m: np.ndarray,
+    flow: np.ndarray | None = None,
+    bake_ver: int | None = None,
+    codec: int = CODEC_RAW,
+    block_log2: int = DEFAULT_BLOCK_LOG2,
+    base_offset_mm: int | None = None,
+    quant: int | None = None,
+) -> bytes:
+    """Encode one baked fine tier straight from the bake's SAMPLE field.
+
+    This is the entry point `pregen._encode_fine` looks for, and the only
+    sanctioned way to turn a `BakeResult` into `.vxtl` v2 bytes.
+
+    `bake_ver=None` stamps `bake.pipeline.BAKE_VERSION`, so a tile carries the
+    identity of the bake that made it without every caller having to remember
+    to pass it; pass an int to override (a fixture generator wants a fixed one).
+    """
+    if bake_ver is None:
+        try:
+            from .bake.pipeline import BAKE_VERSION
+
+            bake_ver = int(BAKE_VERSION)
+        except ImportError:  # pragma: no cover - bake package always ships
+            bake_ver = 0
+
+    cp, base_offset_mm, quant = elevation_control_points(
+        elevation_m, base_offset_mm=base_offset_mm, quant=quant
+    )
+    flow_arr = None
+    if flow is not None:
+        flow_arr = np.ascontiguousarray(flow, dtype=np.uint8)
+        if flow_arr.shape != cp.shape:
+            raise ValueError(
+                f"flow plane {flow_arr.shape} does not match elevation {cp.shape}"
+            )
+    return encode_v2(
+        TileV2(
+            seed=int(seed) & 0xFFFFFFFFFFFFFFFF,
+            x=int(x),
+            y=int(y),
+            size=int(cp.shape[0]),
+            elevation_cp=cp,
+            base_offset_mm=int(base_offset_mm),
+            quant=int(quant),
+            codec=int(codec),
+            bake_ver=int(bake_ver),
+            block_log2=int(block_log2),
+            flow=flow_arr,
+        )
     )

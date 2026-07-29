@@ -143,6 +143,13 @@ std::optional<uint16_t> vxtlVersion(const uint8_t* data, size_t size) {
 //      check -- it is the one place in this format where the encoder and
 //      decoder can differ silently.
 //
+//  (a2) the same is true, and worse, under CODEC_ZSTD: `comp_len` is then the
+//      COMPRESSED length, so it constrains nothing at all about what the frame
+//      holds. Length is therefore never treated as a correctness check here.
+//      The mode selects the reading, and the only length assertion that
+//      survives compression is "the frame must expand to exactly the size the
+//      header implies", which decodeBlockPayload enforces on every frame.
+//
 //  (b) unknown section ids are IGNORED, not rejected. A section table exists
 //      to be extended, and §7 already routes any world-affecting change
 //      through bake_ver -> provider_id -> a new world, so an unknown section
@@ -153,6 +160,13 @@ std::optional<uint16_t> vxtlVersion(const uint8_t* data, size_t size) {
 // ---------------------------------------------------------------------------
 
 namespace {
+
+// Reason codes are an out-param so every early return can stay a one-liner.
+// `false` is the return value in every failing path; this only records why.
+inline bool fail(FineError* err, FineError e) {
+    if (err) *err = e;
+    return false;
+}
 
 // LOCO-I / JPEG-LS median edge predictor (§5), on the three causal
 // neighbours. Callers handle the block-edge cases.
@@ -171,55 +185,107 @@ inline int32_t zigzagDecode(uint32_t u) {
     return static_cast<int32_t>((u >> 1) ^ (~(u & 1u) + 1u));
 }
 
+// Exact PLAIN (post-decompression) payload length a block's mode implies, in
+// bytes. 0 for CONSTANT, which owns no data bytes at all. This is the number
+// the whole CODEC_ZSTD path hangs off: it is derived from the header alone,
+// never from `comp_len`, so a lying comp_len cannot move it.
+template <typename T>
+uint64_t plainPayloadBytes(const FineBlockEntry& e, uint32_t blockPixels) {
+    switch (e.mode) {
+    case kBlockRaw:
+        return static_cast<uint64_t>(blockPixels) * sizeof(T);
+    case kBlockCoded:
+        return static_cast<uint64_t>(blockPixels) * (e.residBits / 8u);
+    default:
+        return 0;
+    }
+}
+
 // One §4 block payload, in raster order (y outer, x inner -- x fastest, the
 // same order the index itself uses). T is int16_t for the elevation lattice
 // and uint8_t for the §6 flow plane; lo/hi are T's representable range, and a
 // reconstruction that leaves it means corrupt bytes, so the whole block is
 // rejected rather than silently wrapped.
+//
+// `compressed` says the stored bytes are a CODEC_ZSTD frame rather than the
+// payload itself. Then, and ONLY then, `dec` is invoked -- on this one block's
+// frame, into a buffer this function sizes from the header (§4: one frame per
+// block, no dictionary, no cross-block state, which is what makes per-block
+// random access work). The callback must fill it exactly; short, long or
+// malformed all come back false and reject the block.
 template <typename T>
 bool decodeBlockPayload(const FineBlockEntry& e, const uint8_t* data, size_t dataLen,
-                        uint32_t dim, int32_t lo, int32_t hi, T* out) {
+                        uint32_t dim, int32_t lo, int32_t hi, const FineDecompressor& dec,
+                        bool compressed, T* out, FineError* err) {
     const uint32_t n = dim * dim;
 
     if (e.mode == kBlockConstant) {
         const int32_t v = e.constCp;
-        if (v < lo || v > hi) return false;
+        if (v < lo || v > hi) return fail(err, FineError::kValueOutOfRange);
         std::fill(out, out + n, static_cast<T>(v));
         return true;
     }
 
+    if (e.mode != kBlockCoded && e.mode != kBlockRaw) return fail(err, FineError::kBadPayload);
+    if (e.mode == kBlockCoded && e.residBits != 16 && e.residBits != 32) {
+        return fail(err, FineError::kBadPayload);
+    }
+
     // Payload window. Re-checked here even though parse() validated it, so
     // decodeBlockPayload is safe on its own terms.
-    if (e.offset > dataLen || e.compLen > dataLen - e.offset) return false;
-    ByteReader r(data + e.offset, e.compLen);
+    if (e.offset > dataLen || e.compLen > dataLen - e.offset) {
+        return fail(err, FineError::kBadPayload);
+    }
+
+    const uint64_t plainLen = plainPayloadBytes<T>(e, n);
+    const uint8_t* payload = data + e.offset;
+    size_t payloadLen = e.compLen;
+    std::vector<uint8_t> inflated;
+
+    if (compressed) {
+        if (!dec.valid()) return fail(err, FineError::kNoDecompressor);
+        // An empty frame cannot expand to anything, and a block that owns no
+        // data bytes is by definition CONSTANT.
+        if (e.compLen == 0) return fail(err, FineError::kBadPayload);
+        inflated.resize(static_cast<size_t>(plainLen));
+        if (!dec(payload, payloadLen, inflated.data(), inflated.size())) {
+            return fail(err, FineError::kDecompressFailed);
+        }
+        payload = inflated.data();
+        payloadLen = inflated.size();
+    } else if (payloadLen != plainLen) {
+        // Under CODEC_RAW the stored length IS the plain length. (parse()
+        // already enforced this; keeping it here is what lets this function
+        // stand on its own.)
+        return fail(err, FineError::kBadPayload);
+    }
+
+    ByteReader r(payload, payloadLen);
 
     if (e.mode == kBlockRaw) {
         for (uint32_t i = 0; i < n; ++i) {
             if constexpr (sizeof(T) == 2) {
                 uint16_t raw;
-                if (!r.u16(raw)) return false;
+                if (!r.u16(raw)) return fail(err, FineError::kBadPayload);
                 out[i] = static_cast<T>(static_cast<int16_t>(raw));
             } else {
                 uint8_t raw;
-                if (!r.u8(raw)) return false;
+                if (!r.u8(raw)) return fail(err, FineError::kBadPayload);
                 out[i] = static_cast<T>(raw);
             }
         }
-        return r.atEnd();
+        return r.atEnd() ? true : fail(err, FineError::kBadPayload);
     }
-
-    if (e.mode != kBlockCoded) return false;
-    if (e.residBits != 16 && e.residBits != 32) return false;
 
     for (uint32_t y = 0; y < dim; ++y) {
         for (uint32_t x = 0; x < dim; ++x) {
             uint32_t word;
             if (e.residBits == 16) {
                 uint16_t w16;
-                if (!r.u16(w16)) return false;
+                if (!r.u16(w16)) return fail(err, FineError::kBadPayload);
                 word = w16;
             } else {
-                if (!r.u32(word)) return false;
+                if (!r.u32(word)) return fail(err, FineError::kBadPayload);
             }
             const int32_t resid = zigzagDecode(word);
 
@@ -240,11 +306,11 @@ bool decodeBlockPayload(const FineBlockEntry& e, const uint8_t* data, size_t dat
             }
 
             const int64_t v = static_cast<int64_t>(pred) + static_cast<int64_t>(resid);
-            if (v < lo || v > hi) return false;
+            if (v < lo || v > hi) return fail(err, FineError::kValueOutOfRange);
             out[y * dim + x] = static_cast<T>(v);
         }
     }
-    return r.atEnd();
+    return r.atEnd() ? true : fail(err, FineError::kBadPayload);
 }
 
 struct SectionRef {
@@ -253,12 +319,25 @@ struct SectionRef {
     bool present = false;
 };
 
-// Reads one §4 index section into `out`, validating every entry against what
-// CODEC_RAW implies. bytesPerSample is 2 for the elevation lattice, 1 for the
-// flow plane.
+// Reads one §4 index section into `out`, validating every entry as far as the
+// codec allows. bytesPerSample is 2 for the elevation lattice, 1 for the flow
+// plane.
+//
+// `compressed` changes what CAN be validated here, and it is worth being
+// explicit about the difference:
+//   CODEC_RAW  -- comp_len is fully determined by mode/resid_bits, so a wrong
+//                 one is caught right here, at parse, before any block decodes.
+//   CODEC_ZSTD -- comp_len is the frame's compressed size. Nothing but "not
+//                 zero, and inside the data section" can be said about it, and
+//                 the real check (the frame expands to exactly the header's
+//                 size) necessarily happens at decode. So a zstd tile can pass
+//                 parse and still have an individually corrupt block; that is
+//                 inherent, not an oversight, and it is why the sampler keeps
+//                 blockDecodeFailures separate from missing tiles.
 bool parseBlockIndex(const uint8_t* file, uint64_t indexOff, uint64_t indexLen,
                      uint32_t blockCount, uint32_t blockPixels, uint64_t dataLen,
-                     uint32_t bytesPerSample, std::vector<FineBlockEntry>& out) {
+                     uint32_t bytesPerSample, bool compressed,
+                     std::vector<FineBlockEntry>& out) {
     if (indexLen != static_cast<uint64_t>(blockCount) * kFineBlockEntryBytes) return false;
     ByteReader r(file + indexOff, static_cast<size_t>(indexLen));
 
@@ -299,12 +378,12 @@ bool parseBlockIndex(const uint8_t* file, uint64_t indexOff, uint64_t indexLen,
             // Under CODEC_RAW the residual stream length is fully determined:
             // one resid_bits-wide word per pixel, no compression to hide it.
             const uint64_t expect = static_cast<uint64_t>(blockPixels) * (e.residBits / 8u);
-            if (e.compLen != expect) return false;
+            if (compressed ? (e.compLen == 0) : (e.compLen != expect)) return false;
             break;
         }
         case kBlockRaw:
             // See (a) at the top of this block: literal samples.
-            if (e.compLen != expectRaw) return false;
+            if (compressed ? (e.compLen == 0) : (e.compLen != expectRaw)) return false;
             break;
         default:
             return false;
@@ -318,66 +397,104 @@ bool parseBlockIndex(const uint8_t* file, uint64_t indexOff, uint64_t indexLen,
 
 } // namespace
 
-std::optional<FineTile> FineTile::parse(const uint8_t* data, size_t size) {
-    return FineTile::parse(std::vector<uint8_t>(data, data + size));
+const char* fineErrorName(FineError e) {
+    switch (e) {
+    case FineError::kNone: return "none";
+    case FineError::kFileUnreadable: return "file-unreadable";
+    case FineError::kNotVxtl: return "not-a-vxtl";
+    case FineError::kWrongVersion: return "wrong-version";
+    case FineError::kBadHeader: return "bad-header";
+    case FineError::kUnknownCodec: return "unknown-codec";
+    case FineError::kNoDecompressor: return "no-decompressor";
+    case FineError::kBadSectionTable: return "bad-section-table";
+    case FineError::kBadBlockIndex: return "bad-block-index";
+    case FineError::kBadBlockCoords: return "bad-block-coords";
+    case FineError::kDecompressFailed: return "decompress-failed";
+    case FineError::kBadPayload: return "bad-payload";
+    case FineError::kValueOutOfRange: return "value-out-of-range";
+    }
+    return "unknown";
 }
 
-std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes) {
+std::optional<FineTile> FineTile::parse(const uint8_t* data, size_t size,
+                                        const FineDecompressor& decompressor, FineError* err) {
+    return FineTile::parse(std::vector<uint8_t>(data, data + size), decompressor, err);
+}
+
+std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
+                                        const FineDecompressor& decompressor, FineError* err) {
+    if (err) *err = FineError::kNone;
+    // Every failing return below funnels through this, so "returned nullopt"
+    // and "recorded a reason" can never drift apart.
+    const auto reject = [err](FineError e) -> std::optional<FineTile> {
+        if (err) *err = e;
+        return std::nullopt;
+    };
+
     const size_t fileSize = bytes.size();
     ByteReader r(bytes.data(), fileSize);
 
     uint8_t m0, m1, m2, m3;
-    if (!r.u8(m0) || !r.u8(m1) || !r.u8(m2) || !r.u8(m3)) return std::nullopt;
-    if (m0 != 'V' || m1 != 'X' || m2 != 'T' || m3 != 'L') return std::nullopt;
+    if (!r.u8(m0) || !r.u8(m1) || !r.u8(m2) || !r.u8(m3)) return reject(FineError::kNotVxtl);
+    if (m0 != 'V' || m1 != 'X' || m2 != 'T' || m3 != 'L') return reject(FineError::kNotVxtl);
 
     uint16_t version;
-    if (!r.u16(version) || version != kFineFormatVersion) return std::nullopt;
+    if (!r.u16(version) || version != kFineFormatVersion) return reject(FineError::kWrongVersion);
 
     FineTileHeader h;
-    if (!r.u64(h.seed)) return std::nullopt;
-    if (!r.i32(h.x) || !r.i32(h.y)) return std::nullopt;
-    if (!r.u8(h.scale) || h.scale != kFineTileScale) return std::nullopt;
-    if (!r.u16(h.size)) return std::nullopt;
+    if (!r.u64(h.seed)) return reject(FineError::kBadHeader);
+    if (!r.i32(h.x) || !r.i32(h.y)) return reject(FineError::kBadHeader);
+    if (!r.u8(h.scale) || h.scale != kFineTileScale) return reject(FineError::kBadHeader);
+    if (!r.u16(h.size)) return reject(FineError::kBadHeader);
     // §3 gives 8192 as the fine grid edge and that is what production bakes,
     // but `size` is a header FIELD and the committed conformance fixture is a
     // deliberately small 512-edge tile. Validating it structurally -- a power
     // of two, no larger than the production edge -- means the fixture goes
     // through exactly the same code path a real tile does, which is the only
     // way it proves anything.
-    if (h.size < 16 || h.size > kFineTileSize) return std::nullopt;
-    if ((h.size & static_cast<uint16_t>(h.size - 1)) != 0) return std::nullopt;
+    if (h.size < 16 || h.size > kFineTileSize) return reject(FineError::kBadHeader);
+    if ((h.size & static_cast<uint16_t>(h.size - 1)) != 0) return reject(FineError::kBadHeader);
 
     // --- v2 extension (the first 25 bytes above are v1-positional) ---
-    if (!r.u8(h.blockLog2)) return std::nullopt;
+    if (!r.u8(h.blockLog2)) return reject(FineError::kBadHeader);
     // §3 documents block_log2 = 8. The field exists so it can vary, so the
     // check is structural rather than a hardcoded 8: the block must tile the
     // grid exactly, and must stay small enough that one decoded block is a
     // sane allocation (a CONSTANT block costs zero file bytes, so without an
     // upper bound a tiny file could ask for an enormous buffer).
-    if (h.blockLog2 < 1 || h.blockLog2 > 12) return std::nullopt;
-    if ((h.size >> h.blockLog2) << h.blockLog2 != h.size) return std::nullopt;
+    if (h.blockLog2 < 1 || h.blockLog2 > 12) return reject(FineError::kBadHeader);
+    if ((h.size >> h.blockLog2) << h.blockLog2 != h.size) return reject(FineError::kBadHeader);
 
-    if (!r.u8(h.predictor) || h.predictor != kPredMed) return std::nullopt;
-    if (!r.u8(h.quant) || fineQuantMm(h.quant) == 0) return std::nullopt;
-    if (!r.u8(h.codec)) return std::nullopt;
-    if (!fineCodecSupported(h.codec)) return std::nullopt; // CODEC_ZSTD: not vendored
-    if (!r.u16(h.bakeVer)) return std::nullopt;
-    if (!r.u16(h.flags)) return std::nullopt;
-    if ((h.flags & ~kFineFlagFlowPresent) != 0) return std::nullopt;
-    if (!r.i32(h.baseOffsetMm)) return std::nullopt;
-    if (!r.u8(h.parentScale) || h.parentScale != 0) return std::nullopt; // §3: absolute only
+    if (!r.u8(h.predictor) || h.predictor != kPredMed) return reject(FineError::kBadHeader);
+    if (!r.u8(h.quant) || fineQuantMm(h.quant) == 0) return reject(FineError::kBadHeader);
+    if (!r.u8(h.codec)) return reject(FineError::kBadHeader);
+    // Two different refusals, deliberately distinguishable (see FineError):
+    // an unknown codec byte is bytes this build does not understand, while
+    // CODEC_ZSTD with nothing injected is a HOST WIRING mistake. Either way the
+    // tile is refused whole -- it is never loaded and left to decode blocks
+    // into zeros, because silently flat terrain under a client that thinks it
+    // has the fine tier is a desync, not a visual glitch.
+    if (!fineCodecKnown(h.codec)) return reject(FineError::kUnknownCodec);
+    const bool compressed = fineCodecNeedsDecompressor(h.codec);
+    if (compressed && !decompressor.valid()) return reject(FineError::kNoDecompressor);
+    if (!r.u16(h.bakeVer)) return reject(FineError::kBadHeader);
+    if (!r.u16(h.flags)) return reject(FineError::kBadHeader);
+    if ((h.flags & ~kFineFlagFlowPresent) != 0) return reject(FineError::kBadHeader);
+    if (!r.i32(h.baseOffsetMm)) return reject(FineError::kBadHeader);
+    // §3: absolute only.
+    if (!r.u8(h.parentScale) || h.parentScale != 0) return reject(FineError::kBadHeader);
     for (int i = 0; i < 3; ++i) {
         uint8_t reserved;
-        if (!r.u8(reserved) || reserved != 0) return std::nullopt;
+        if (!r.u8(reserved) || reserved != 0) return reject(FineError::kBadHeader);
     }
 
     uint16_t nSections;
-    if (!r.u16(nSections)) return std::nullopt;
+    if (!r.u16(nSections)) return reject(FineError::kBadHeader);
 
     const uint64_t tableEnd =
         static_cast<uint64_t>(kFineHeaderBytes) +
         static_cast<uint64_t>(nSections) * kFineSectionEntryBytes;
-    if (tableEnd > fileSize) return std::nullopt;
+    if (tableEnd > fileSize) return reject(FineError::kBadSectionTable);
 
     SectionRef elevIndexSec, elevDataSec, flowIndexSec, flowDataSec;
     struct Extent {
@@ -390,19 +507,23 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes) {
     for (uint16_t i = 0; i < nSections; ++i) {
         uint32_t id;
         uint64_t off, len;
-        if (!r.u32(id) || !r.u64(off) || !r.u64(len)) return std::nullopt;
+        if (!r.u32(id) || !r.u64(off) || !r.u64(len)) return reject(FineError::kBadSectionTable);
 
         // In bounds, no overflow, and never on top of the header/table.
-        if (off > fileSize) return std::nullopt;
-        if (len > fileSize - off) return std::nullopt;
-        if (len > 0 && off < tableEnd) return std::nullopt;
+        if (off > fileSize) return reject(FineError::kBadSectionTable);
+        if (len > fileSize - off) return reject(FineError::kBadSectionTable);
+        if (len > 0 && off < tableEnd) return reject(FineError::kBadSectionTable);
 
-        if (std::find(seenIds.begin(), seenIds.end(), id) != seenIds.end()) return std::nullopt;
+        if (std::find(seenIds.begin(), seenIds.end(), id) != seenIds.end()) {
+            return reject(FineError::kBadSectionTable);
+        }
         seenIds.push_back(id);
 
         if (len > 0) {
             for (const Extent& e : extents) {
-                if (off < e.end && e.begin < off + len) return std::nullopt; // overlap
+                if (off < e.end && e.begin < off + len) { // overlap
+                    return reject(FineError::kBadSectionTable);
+                }
             }
             extents.push_back({off, off + len});
             coveredEnd = std::max(coveredEnd, off + len);
@@ -422,15 +543,20 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes) {
     // "trailing" meaningful here, so: nothing may live past the last section.
     // Interior gaps are allowed (an encoder may align sections), because
     // offsets are explicit and a gap cannot be misread as data.
-    if (coveredEnd != fileSize) return std::nullopt;
+    if (coveredEnd != fileSize) return reject(FineError::kBadSectionTable);
 
-    if (!elevIndexSec.present || !elevDataSec.present) return std::nullopt;
+    if (!elevIndexSec.present || !elevDataSec.present) return reject(FineError::kBadSectionTable);
     const bool wantFlow = (h.flags & kFineFlagFlowPresent) != 0;
-    if (wantFlow != (flowIndexSec.present && flowDataSec.present)) return std::nullopt;
-    if (!wantFlow && (flowIndexSec.present || flowDataSec.present)) return std::nullopt;
+    if (wantFlow != (flowIndexSec.present && flowDataSec.present)) {
+        return reject(FineError::kBadSectionTable);
+    }
+    if (!wantFlow && (flowIndexSec.present || flowDataSec.present)) {
+        return reject(FineError::kBadSectionTable);
+    }
 
     FineTile tile;
     tile.h_ = h;
+    tile.dec_ = decompressor;
     tile.elevDataOff_ = elevDataSec.offset;
     tile.elevDataLen_ = elevDataSec.length;
     tile.flowDataOff_ = flowDataSec.offset;
@@ -442,40 +568,45 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes) {
     const uint32_t blockPixels = dim * dim;
 
     if (!parseBlockIndex(bytes.data(), elevIndexSec.offset, elevIndexSec.length, blocks,
-                         blockPixels, elevDataSec.length, 2, tile.elevIndex_)) {
-        return std::nullopt;
+                         blockPixels, elevDataSec.length, 2, compressed, tile.elevIndex_)) {
+        return reject(FineError::kBadBlockIndex);
     }
     if (wantFlow && !parseBlockIndex(bytes.data(), flowIndexSec.offset, flowIndexSec.length,
-                                     blocks, blockPixels, flowDataSec.length, 1,
+                                     blocks, blockPixels, flowDataSec.length, 1, compressed,
                                      tile.flowIndex_)) {
-        return std::nullopt;
+        return reject(FineError::kBadBlockIndex);
     }
 
     tile.bytes_ = std::move(bytes);
     return tile;
 }
 
-bool FineTile::decodeElevBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& out) const {
+bool FineTile::decodeElevBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& out,
+                               FineError* err) const {
+    if (err) *err = FineError::kNone;
     const uint32_t perAxis = blocksPerAxis();
-    if (bx >= perAxis || by >= perAxis) return false;
+    if (bx >= perAxis || by >= perAxis) return fail(err, FineError::kBadBlockCoords);
     const uint32_t dim = blockDim();
     out.assign(blockPixelCount(), 0);
     return decodeBlockPayload<int16_t>(elevIndex_[by * perAxis + bx],
                                        bytes_.data() + elevDataOff_,
                                        static_cast<size_t>(elevDataLen_), dim, -32768, 32767,
-                                       out.data());
+                                       dec_, fineCodecNeedsDecompressor(h_.codec), out.data(),
+                                       err);
 }
 
-bool FineTile::decodeFlowBlock(uint32_t bx, uint32_t by, std::vector<uint8_t>& out) const {
-    if (!hasFlow()) return false;
+bool FineTile::decodeFlowBlock(uint32_t bx, uint32_t by, std::vector<uint8_t>& out,
+                               FineError* err) const {
+    if (err) *err = FineError::kNone;
+    if (!hasFlow()) return fail(err, FineError::kBadBlockCoords);
     const uint32_t perAxis = blocksPerAxis();
-    if (bx >= perAxis || by >= perAxis) return false;
+    if (bx >= perAxis || by >= perAxis) return fail(err, FineError::kBadBlockCoords);
     const uint32_t dim = blockDim();
     out.assign(blockPixelCount(), 0);
     return decodeBlockPayload<uint8_t>(flowIndex_[by * perAxis + bx],
                                        bytes_.data() + flowDataOff_,
-                                       static_cast<size_t>(flowDataLen_), dim, 0, 255,
-                                       out.data());
+                                       static_cast<size_t>(flowDataLen_), dim, 0, 255, dec_,
+                                       fineCodecNeedsDecompressor(h_.codec), out.data(), err);
 }
 
 bool FineTile::controlPointAt(uint32_t lx, uint32_t ly, int16_t& cp) const {
@@ -498,21 +629,30 @@ bool FineTileSampler::loadTile(FineTile tile) {
     return true;
 }
 
-bool FineTileSampler::loadTile(const std::vector<uint8_t>& bytes) {
-    std::optional<FineTile> parsed = FineTile::parse(bytes.data(), bytes.size());
+bool FineTileSampler::loadTile(const std::vector<uint8_t>& bytes, FineError* err) {
+    std::optional<FineTile> parsed = FineTile::parse(bytes.data(), bytes.size(), dec_, err);
     if (!parsed) return false;
     return loadTile(std::move(*parsed));
 }
 
-bool FineTileSampler::loadTileFile(const std::filesystem::path& path) {
+bool FineTileSampler::loadTileFile(const std::filesystem::path& path, FineError* err) {
+    if (err) *err = FineError::kNone;
     std::optional<std::vector<uint8_t>> bytes = readFileBytes(path);
-    if (!bytes) return false;
-    return loadTile(*bytes);
+    if (!bytes) return fail(err, FineError::kFileUnreadable);
+    return loadTile(*bytes, err);
 }
 
 const FineTile* FineTileSampler::findTile(int32_t tx, int32_t ty) const {
     auto it = tiles_.find(tileKey(tx, ty));
     return it == tiles_.end() ? nullptr : &it->second.tile;
+}
+
+bool FineTileSampler::unloadTile(int32_t tx, int32_t ty) {
+    const bool erased = tiles_.erase(tileKey(tx, ty)) > 0;
+    if (erased && tiles_.empty()) {
+        tileSize_ = 0; // no tile left to justify the stride; see the header comment
+    }
+    return erased;
 }
 
 size_t FineTileSampler::residentBlockCount() const {

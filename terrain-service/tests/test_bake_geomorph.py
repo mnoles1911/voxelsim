@@ -341,6 +341,113 @@ def test_stream_power_handles_degenerate_inputs():
         incise.stream_power(np.zeros((2, 2)), np.zeros((2, 2)), cap_m=0.0)
 
 
+def test_channel_initiation_gate_suppresses_hillslopes_not_channels():
+    """The gate exists because without it EVERY cell is a channel.
+
+    Measured on real tile (-5,3) at 1.875 m/px before the gate existed: 77.6 % of the
+    domain incised by more than one voxel at K = 0.03 and 98.6 % at K = 0.15. Real
+    landscapes have a channel head at a critical contributing area, and that area --
+    not K -- is what sets drainage density.
+    """
+    slope = np.full((1, 1), 0.2)
+    hill = float(incise.stream_power(np.full((1, 1), 10.0), slope)[0, 0])
+    trunk = float(incise.stream_power(np.full((1, 1), 1e7), slope)[0, 0])
+    ungated_hill = float(
+        incise.stream_power(np.full((1, 1), 10.0), slope, a_crit_m2=0.0)[0, 0])
+    ungated_trunk = float(
+        incise.stream_power(np.full((1, 1), 1e7), slope, a_crit_m2=0.0)[0, 0])
+
+    # A single-cell hillslope must be suppressed hard...
+    assert hill < ungated_hill / 1000.0
+    # ...while a trunk channel three decades above A_crit is essentially untouched,
+    # so the gate cannot be smuggling in a global reduction of K.
+    assert trunk == pytest.approx(ungated_trunk, rel=1e-3)
+
+
+def test_channel_initiation_gate_is_continuous_and_monotone():
+    """A HARD cutoff at A_crit would put a step in incision depth along the contour
+    where contributing area crosses it -- a visible seam along a curve, which is the
+    same failure class as the 30 m grid seams this project exists to remove."""
+    area = np.geomspace(1.0, 1e9, 4096)[None, :]
+    slope = np.full_like(area, 0.15)
+    depth = incise.stream_power(area, slope, cap_m=1e6)[0]
+
+    assert np.all(np.diff(depth) >= 0.0), "gate must preserve monotonicity in A"
+    # No step: the largest jump between adjacent log-spaced samples must stay a small
+    # fraction of the full range. A hard cutoff would put ~100 % of the range in one step.
+    span = depth.max() - depth.min()
+    assert np.diff(depth).max() < 0.01 * span
+
+
+def test_channel_initiation_gate_defaults_off_reproduce_prior_behaviour():
+    """a_crit_m2=0 must recover the pre-gate function EXACTLY, so the parameter can be
+    used to reproduce anything measured before it existed."""
+    rng = np.random.default_rng(7)
+    area = rng.uniform(0.0, 1e8, size=(32, 32))
+    slope = rng.uniform(0.0, 1.5, size=(32, 32))
+    gated_off = incise.stream_power(area, slope, a_crit_m2=0.0)
+    manual = np.minimum(
+        np.float32(0.15) * np.power(np.float32(1) * area.astype(np.float32), np.float32(0.45))
+        * np.power(slope.astype(np.float32) + np.float32(1e-6), np.float32(0.8)),
+        np.float32(25.0))
+    assert np.allclose(gated_off, manual, rtol=1e-6, atol=0.0)
+
+    with pytest.raises(ValueError):
+        incise.stream_power(area, slope, a_crit_m2=-1.0)
+    with pytest.raises(ValueError):
+        incise.stream_power(area, slope, gate_q=0.0)
+
+
+def test_sea_level_taper_suppresses_abyssal_erosion_but_not_the_coast():
+    """Nothing gated on depth, so the bake cut river valleys into the seafloor.
+
+    Measured on a 100%-ocean tile: 39.7% of the tile flagged as channel against
+    4.1% on alpine, 0.87 m mean incision against 0.13 m -- subaerial fluvial
+    erosion at three kilometres depth. It made the OCEAN tile the largest of the
+    three baked, 28.35 MB against 22.62, because invented detail still has to be
+    encoded.
+    """
+    # 1e5 m2 and a 10% grade: a real tributary, and well clear of the cap_m
+    # clamp. With 1e7 the clamp binds and every depth reads 25.0, which makes the
+    # taper look absent when it is simply hidden under a ceiling.
+    acc = np.full((1, 5), 1e5)
+    slope = np.full((1, 5), 0.1)
+    # land, sea level, mid-shelf, shelf break, abyssal
+    elev = np.array([[100.0, 0.0, -100.0, -200.0, -3000.0]])
+    d = incise.stream_power(acc, slope, elev_m=elev)[0]
+
+    assert d[0] == pytest.approx(d[1], rel=1e-6), "above sea level must be untouched"
+    assert d[4] == 0.0, "abyssal plain must not be incised at all"
+    assert d[3] == pytest.approx(0.0, abs=1e-6), "the shelf break is the far end"
+    # The shelf keeps SOME erosion -- river mouths, deltas and shelf valleys are
+    # real, and were cut by rivers that did flow there at lower sea level.
+    assert 0.0 < d[2] < d[1]
+
+
+def test_sea_level_taper_is_smooth_not_a_step():
+    """A hard stop at z=0 would put a step in incision along the entire
+    coastline -- a seam on the most scrutinised curve in the world, which is the
+    failure class this project exists to remove. Smoothstep, so the DERIVATIVE is
+    continuous too: the v9 carrier rework happened because a gradient
+    discontinuity is visible under directional light even when the value is not.
+    """
+    z = np.linspace(50.0, -260.0, 2000)[None, :]
+    acc = np.full_like(z, 1e5)  # below the cap; see the note in the test above
+    slope = np.full_like(z, 0.1)
+    d = incise.stream_power(acc, slope, elev_m=z)[0]
+
+    assert np.all(np.diff(d) <= 1e-6), "must be non-increasing with depth"
+    step = np.abs(np.diff(d)).max()
+    assert step < 0.02 * (d.max() - d.min()), "no step: a hard cutoff would be ~100%"
+    # Second difference bounded too -- that is what smoothstep buys over a ramp,
+    # whose derivative jumps at both ends of the transition.
+    assert np.abs(np.diff(d, 2)).max() < 0.001 * (d.max() - d.min())
+
+    off = incise.stream_power(acc, slope, elev_m=z, sea_taper_bottom_m=0.0)[0]
+    assert np.allclose(off, incise.stream_power(acc, slope)[0]), \
+        "an empty taper range must reproduce the ungated result exactly"
+
+
 def test_stream_power_default_K_carves_metres_not_millimetres():
     """LESSON: K is the one knob that decides whether the bake reads as terrain.
 

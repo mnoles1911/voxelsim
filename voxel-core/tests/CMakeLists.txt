@@ -3,6 +3,7 @@ add_executable(vxc_tests
   test_brick.cpp
   test_hash.cpp
   test_amplifier.cpp
+  test_carrier.cpp
   test_biome.cpp
   test_climate.cpp
   test_mesher.cpp
@@ -12,6 +13,7 @@ add_executable(vxc_tests
   test_mips.cpp
   test_raycast.cpp
   test_tilestore.cpp
+  test_tilestreaming.cpp
   test_counters.cpp
   test_waterca.cpp
   test_connectivity.cpp
@@ -23,6 +25,9 @@ add_executable(vxc_tests
   test_caverns.cpp
   test_coarsegen.cpp
   test_swe.cpp
+  test_detail_rill.cpp
+  test_detail_bedding.cpp
+  test_density3.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(vxc_tests PRIVATE voxelcore Threads::Threads)

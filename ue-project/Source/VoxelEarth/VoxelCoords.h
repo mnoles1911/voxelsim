@@ -64,10 +64,12 @@ namespace VoxelCoords
 		return A - FloorDiv(A, B) * B;
 	}
 
-	// UE units (cm) -> millimetres, matching vxc::kVoxelSizeMm's unit (this is
-	// the ONLY place stage 2 (dig/place raycasts) converts to mm; voxelcore/
-	// raycast.h works in mm exclusively). 1 UU = 10 mm since VoxelSizeUU (10
-	// UU/voxel) = kVoxelSizeMm (100 mm/voxel).
+	// UE units (cm) -> millimetres, matching vxc::kVoxelSizeMm's unit (stage 2
+	// dig/place raycasts convert to mm here because voxelcore/raycast.h works
+	// in mm exclusively; Phase 2 fine-tier streaming, VoxelFineTileStreamer.h,
+	// is a second caller -- fine tile pixels and the wire format are also mm-
+	// denominated). 1 UU = 10 mm since VoxelSizeUU (10 UU/voxel) = kVoxelSizeMm
+	// (100 mm/voxel).
 	FORCEINLINE int64 WorldToMm(double WorldUU)
 	{
 		return (int64)FMath::RoundToDouble(WorldUU * 10.0);

@@ -24,7 +24,14 @@ from typing import Tuple
 
 import numpy as np
 
-__all__ = ["carrier", "roughness", "octave_wavelengths", "bspline_weights", "SPLINE_DEN"]
+__all__ = [
+    "carrier",
+    "prefilter",
+    "roughness",
+    "octave_wavelengths",
+    "bspline_weights",
+    "SPLINE_DEN",
+]
 
 # --------------------------------------------------------------------------------------
 # §8 of docs/vxtl-v2-format.md — normative, do not "simplify"
@@ -160,6 +167,25 @@ def carrier(coarse: np.ndarray, scale: int) -> np.ndarray:
     out = np.empty((h * scale, n * scale), dtype=np.float32)
     _upsample_axis1(np.ascontiguousarray(tmp.T), scale, w, out, transposed=True)
     return out
+
+
+def prefilter(samples: np.ndarray) -> np.ndarray:
+    """Control points whose cubic B-spline INTERPOLATES `samples`. float64.
+
+    The public name for the IIR pass `carrier` uses internally, exported so the
+    .vxtl v2 encoder (`tile_codec.encode_fine`) re-prefilters the finished bake
+    surface with *this* implementation rather than a second copy of it. The wire
+    format ships a control lattice (docs/vxtl-v2-format.md §2); the bake's B2/B3
+    passes operate on samples; so exactly one prefilter has to run at each end and
+    both must be the same operator or the client's spline reproduces something
+    other than what the bake computed.
+
+    Needs scipy (`carrier` documents why it is a lazy import).
+    """
+    a = np.asarray(samples)
+    if a.ndim != 2:
+        raise ValueError(f"prefilter expects a 2-D array, got shape {a.shape}")
+    return _prefilter(a.astype(np.float64, copy=False))
 
 
 # --------------------------------------------------------------------------------------

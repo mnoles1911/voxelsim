@@ -1,10 +1,28 @@
 ﻿# Terrain amplification redesign — 30 m diffusion tiles → 10 cm voxels
 
-**Status:** planned and approved (Matt, 2026-07-28). **Phases 0 and 1 are LANDED** on
-`claude/terrain-amplification-redesign` (`0e55c4c`, `cf9aa46`, `e9fb524`) — worldgen is at v9,
-`ctest` is green, and `vxc_gpu` passes bit-exact on AMD. Phases 2–4 are not started.
+**Status, updated 2026-07-29.** **Phase 0 and Phase 1 (v9) are LANDED**, merged as **PR #171**
+(`0e55c4c`, `cf9aa46`, `e9fb524`) — worldgen is at **v9** (`core.h:54`), `ctest` is green, and
+`vxc_gpu` passes bit-exact on AMD. **Phase 2 is LANDED**, merged as **PR #176**: server bake
+(`terrain_service/bake/{flow,noise,incise,thermal,pipeline}.py`), `.vxtl` v2 on both sides, service
+plumbing, `pregen --mode bake`, and — since integrated into `claude/phase3-integration` — the
+client half too (v2 parse + block index in `tilestore.cpp`, `FineTileSampler`, the residency gate
+and prefetch ring in `tilestreaming.h/.cpp` and `VoxelFineTileStreamer`). **Phase 3 (client detail
+rework) is in progress**: the carrier is extracted to `voxelcore/carrier.h` with analytic curvature
+added, `detail_rill.h` and `detail_bedding.h` exist as standalone, tested, bounded functions, but
+**none of the three is wired into `evalSurface` yet** — worldgen output and `kWorldGenVersion` (9)
+are unchanged by any of it so far. **Phase 4 (3D density band) is not started.**
 **Supersedes the park decision** in `docs/terrain-amplification-reconciliation.md` — see
 "How this unparks the 2026-07-24 proposal" below.
+
+**A phasing assumption this status corrects:** the Phasing section below expected Phase 2 to be a
+`kWorldGenVersion` bump to v10. It is not, and that is a design win rather than a slip:
+`FineTileSampler` (`tilestore.h:257-277`) is an `ITileSampler` like the coarse `TileGridSampler`, and
+`Amplifier` was already written against that interface with a carrier that is pixel-size-agnostic
+(`carrier.h:258`, "scale 1, 8 and 16 — deliberate, the direct lesson of v9"). Pointing an `Amplifier`
+at a `FineTileSampler` evaluates the *same* v9 carrier code on the fine lattice; no second spline
+implementation exists to drift, and no version bump is needed to change *which tile source* is
+plugged in. The version bump Phase 3 will need is for wiring the new detail terms into
+`evalSurface`, not for the fine tier's existence.
 
 ## Prerequisite reading (an executing session starts cold — read these first)
 
@@ -13,7 +31,7 @@
 | `docs/terrain-amplification-reconciliation.md` | Why the 2026-07-24 proposal was parked. This plan's central move is the answer to it. |
 | `docs/research/terrain-amplification-design-doc.md` | The original stage-by-stage proposal. Stages §4, §5, §7, §8 are reused nearly as written. |
 | `docs/determinism.md` | The float ban and CPU/GPU mirror contract that constrain every client-side change. |
-| `voxel-core/src/amplifier.cpp:223-500` | The v2 octave table and its rationale comment — a worked example of diagnosing this system with measurements rather than screenshots. |
+| `voxel-core/src/amplifier.cpp:350-419` (was `:223-500` before the carrier's extraction to `carrier.h`) | The v2 octave table and its rationale comment — a worked example of diagnosing this system with measurements rather than screenshots. |
 | `docs/voxel-earth-implementation-plan.md` §2 | Doctrine: determinism boundary, budgets, the "generated once, cached forever" rule this plan leans on. |
 
 ## Critical files
@@ -21,9 +39,23 @@
 - `voxel-core/src/amplifier.cpp` — the height/material synthesis being replaced
 - `voxel-core/shaders/worldgen.ush` — its bit-exact HLSL mirror; every change lands twice
 - `voxel-core/include/voxelcore/{amplifier.h,biome.h,hash.h,tiles.h,tilestore.h}`
-- `voxel-core/bench/terrainprobe.cpp` — the verification instrument (Phase 0, landed)
+- `voxel-core/include/voxelcore/carrier.h` — **new (Phase 3)**: the C² carrier, moved out of
+  `amplifier.cpp` verbatim, plus the analytic curvature added for §3c
+- `voxel-core/include/voxelcore/detail_rill.h`, `detail_bedding.h` — **new (Phase 3)**: the rill and
+  bedding terms, built and tested but not yet wired into `evalSurface`
+- `voxel-core/include/voxelcore/tilestreaming.h` / `voxel-core/src/tilestreaming.cpp` — **new
+  (Phase 2)**: the residency/prefetch-ring policy layer over `FineTileSampler`
+- `voxel-core/bench/terrainprobe.cpp` — the verification instrument (Phase 0, landed; gained the
+  drainage-connectivity/curvature/anisotropy structure metrics referenced under §3c)
 - `terrain-service/terrain_service/{tile_codec.py,providers/diffusion.py,cache.py,pregen.py}`
+- `terrain-service/terrain_service/bake/{flow,noise,incise,thermal,pipeline}.py` — **new (Phase 2)**:
+  the geomorphic bake itself
+- `terrain-service/tools/calibrate_stream_k.py` — the K/channel-initiation calibration procedure
 - `voxel-core/src/tilestore.cpp` — tile parse, gains the v2 fine-tier decode
+- `ue-project/Source/VoxelEarth/VoxelFineTileStreamer.{h,cpp}` — **new (Phase 2)**: UE-side glue for
+  the residency/prefetch manager, gated behind `-VoxelFineTileDir=`
+- `docs/vxtl-v2-format.md` — **frozen, normative** bit-level spec for the fine tier; where it and
+  this plan's wire-format narrative disagree, the frozen spec wins
 
 ---
 
@@ -35,7 +67,13 @@ then **measured** with `vxc_terrainprobe`; neither is a tuning problem.
 
 ### What is actually wrong
 
-`Amplifier::evalSurface` (`amplifier.cpp:672-717`) computes
+> **These next two paragraphs describe the v8 code this plan replaced, kept for the diagnosis's
+> own sake.** `bilinearBaseMm` and `tileSlopeMmPerPx` no longer exist — Phase 1 deleted them and
+> moved the replacement (the C² carrier) to `voxelcore/carrier.h`. The line numbers below are
+> therefore historical citations into code that is gone, not live references; `evalSurface` itself
+> is still in `amplifier.cpp`, now at line 854.
+
+`Amplifier::evalSurface` (`amplifier.cpp:854`, was `672-717` in v8) computed
 `surface = bilinear(4 tile corners) + Σ 5 octaves of isotropic integer value noise`.
 
 **Symptom 1 — "noisy and random."** Terrain below 30 m is organised by *process*: water cuts
@@ -50,9 +88,9 @@ well above 1.
 
 | # | Mechanism | Location | Measured |
 |---|---|---|---|
-| 1 | `bilinearBaseMm` is C⁰ but not C¹ — the surface *gradient* steps at every pixel line. Invisible in the height, glaring under directional light. | `amplifier.cpp:357-361` | Carrier-only seam scan: straddle/interior `S2` ratio **8× at 0.1 m rising to 950× at 12.8 m**, doubling exactly with lag over an interior floor of 0.48 mm. Linear-in-lag growth over a zero floor is the signature of a slope discontinuity. On the amplified surface it survives at **3.28× / 1.61× / 1.23×** for 0.1 / 0.2 / 0.4 m lags and is masked beyond — i.e. visible exactly at voxel scale. |
-| 2 | `tileSlopeMmPerPx` is a forward difference **constant over the whole cell**, driving `slopeScaleQ10` (0.25×…4.0×), which multiplies landform detail amplitude. The same noise field gets a step-discontinuous gain across every 30 m line. | `amplifier.cpp:363-365, 688, 316-318` | Detail envelope steps by a **median of 150–310 mm, p90 770–1075 mm, max 2302 mm** across every boundary (four sites, 5.6%–118% grade). That is 1.5–3 voxels of texture amplitude appearing along a dead-straight 30 m line as the *typical* case. |
-| 3 | Climate is read nearest-pixel, so `classifyBiome`, `surfaceMat` and topsoil depth flip exactly on the 30 m grid — blocky material patches. | `amplifier.cpp:990`, `biome.h:141-194` | Not yet instrumented. |
+| 1 | `bilinearBaseMm` is C⁰ but not C¹ — the surface *gradient* steps at every pixel line. Invisible in the height, glaring under directional light. | *removed in v9, was `amplifier.cpp:357-361`* | Carrier-only seam scan: straddle/interior `S2` ratio **8× at 0.1 m rising to 950× at 12.8 m**, doubling exactly with lag over an interior floor of 0.48 mm. Linear-in-lag growth over a zero floor is the signature of a slope discontinuity. On the amplified surface it survives at **3.28× / 1.61× / 1.23×** for 0.1 / 0.2 / 0.4 m lags and is masked beyond — i.e. visible exactly at voxel scale. |
+| 2 | `tileSlopeMmPerPx` is a forward difference **constant over the whole cell**, driving `slopeScaleQ10` (0.25×…4.0×), which multiplies landform detail amplitude. The same noise field gets a step-discontinuous gain across every 30 m line. | *removed in v9, was `amplifier.cpp:363-365, 688, 316-318`* | Detail envelope steps by a **median of 150–310 mm, p90 770–1075 mm, max 2302 mm** across every boundary (four sites, 5.6%–118% grade). That is 1.5–3 voxels of texture amplitude appearing along a dead-straight 30 m line as the *typical* case. |
+| 3 | Climate is read nearest-pixel, so `classifyBiome`, `surfaceMat` and topsoil depth flip exactly on the 30 m grid — blocky material patches. | `amplifier.cpp:1324` (was `:990`), `biome.h:145-171` | Fixed in v9 — see the Phase 0 baseline table below (material boundaries on the grid: 89.1% → 0.0%). |
 
 No tile-local RNG is involved; the amplifier's noise is a global function of world mm and is
 seamless by construction. **The "tile" you can see is the 30 m pixel cell itself.**
@@ -77,10 +115,10 @@ seamless by construction. **The "tile" you can see is the 30 m pixel cell itself
   bilinear + slope-gated fBm — and reproduces mechanisms 1 and 2 for the same reasons. It is not
   a target to match.
 
-`amplifier.cpp:262-266` states the governing assumption: *"30 m is the end of that cascade and no
-finer model exists. Everything below 30 m is procedural and always will be."* The first clause is
-true. **The second is what this plan overturns** — not by training a finer model, but by
-*simulating* the missing band once, offline, and shipping it as data.
+`amplifier.cpp:384-387` (was `:262-266`) states the governing assumption: *"30 m is the end of that
+cascade and no finer model exists. Everything below 30 m is procedural and always will be."* The
+first clause is true. **The second is what this plan overturns** — not by training a finer model,
+but by *simulating* the missing band once, offline, and shipping it as data.
 
 ## How this unparks the 2026-07-24 proposal
 
@@ -185,9 +223,39 @@ cells above 1 km²).
 > | max catchment | 69.6 km² | **203.1 km²** |
 > | cells > 1 km² | 13,256 | **107,496** |
 >
-> **K must be re-calibrated, not scaled.** With ~2.9× the catchment area, `A^0.45` is ~1.6× deeper
-> on trunk channels, so the K=0.15 below will over-carve. And judge it on a hillshade — no summary
-> statistic in this document distinguished a good K from a bad one.
+> **K must be re-calibrated, not scaled** — and it has been (2026-07-29), on branch
+> `claude/k-calibration-and-channel-init`. With ~2.9× the catchment area, `A^0.45` is ~1.6× deeper
+> on trunk channels, so the expectation was that K would have to fall from 0.15 to ~0.09. **That
+> expectation was wrong.** Judged on a hillshade of real tile (−5, 3) at 1.875 m/px, 0.09 leaves
+> trunk channels legible but tributaries not; **0.15 gives a legible dendritic network at both
+> 7.7 km and 1.4 km zoom**; 0.25 begins showing parallel grooving at the 1.4 km zoom. The 1.6×
+> arithmetic was right about the depth and wrong about the conclusion — the original judgement
+> that motivated it was made on a *different tile at 3.75 m/px*, so there was never a like-for-like
+> appearance to preserve in the first place. **`stream_K = 0.15` stands, now for a measured reason
+> instead of an inherited one** (`terrain_service/bake/incise.py`, `pipeline.py`'s
+> `BakeConstants.stream_K`).
+>
+> **Calibrating it surfaced a second, independent defect: there was no channel-initiation
+> threshold at all.** `depth = K·A^m·S^n` incised *every* cell with any upslope area — on tile
+> (−5, 3), 77.6% of the domain past one voxel at K=0.03, 98.6% at K=0.15. That is not a drainage
+> network; it is a slope-dependent lowering of the whole surface with a network faintly embedded
+> in it. Added: a soft gate `A^q / (A^q + A_crit^q)` at `channel_init_area_m2 = 1e4` (mid-range for
+> the 10³–10⁵ m² channel-initiation areas reported for humid soil-mantled landscapes), `q = 2` so
+> the transition is C^∞ and roughly a decade wide — a hard cutoff would put a *step* in incision
+> depth along the contour where contributing area crosses the threshold, the exact seam class this
+> project exists to remove, just relocated off the 30 m grid. With the gate, the same tile drops to
+> **25.4% incised at p99 depth effectively unchanged (8.66 m → 8.34 m)**: hillslopes released,
+> channels not. This is the knob that sets **drainage density**; without it, K had to set both how
+> deep channels cut and how many there are, which are not the same question.
+>
+> **Two measurement caveats from the calibration run, worth preserving so they are not
+> rediscovered:** the `incision_cap_m` clamp binds at *every* K tested, including 0.03, so `max`
+> incision is censored and **p99 is the only usable tail statistic**; and incision depth alone
+> cannot separate "carved correctly" from "over-carved" (it rises monotonically with K, without a
+> kink), so the judgement also rests on the fraction of the domain left steeper than the angle of
+> repose — measured as a 2D gradient magnitude, which can exceed the repose angle by up to √2 on
+> ridges and corners **without violating the per-axis rule `thermal.relax` actually enforces**.
+> See `terrain-service/tools/calibrate_stream_k.py` and the comments atop `bake/incise.py`.
 
 **Erodibility K matters more than anything else for whether it reads as terrain**, and the
 plausible-looking first value was far too small (values below are on the mis-routed field):
@@ -199,8 +267,12 @@ plausible-looking first value was far too small (values below are on the mis-rou
 | 0.05 | 0.56 m | 2.61 m | valleys emerging |
 | **0.15** | **1.66 m** | **7.84 m** | **properly dissected hillslope** |
 
-K is the first thing to calibrate in Phase 2 proper, against real DEM drainage density rather than
-by eye, and over-carving is its own failure mode — the sub-threshold depth cap exists for that.
+This table's numbers are on the mis-routed field and are kept only to show *why 0.0004 looked
+plausible and was 400× too small* — the actual calibration decision was re-run on correctly-routed
+drainage and is recorded in the warning box above. **`K = 0.15` is confirmed, not merely carried
+over**: it survived re-measurement on a real, correctly-routed tile and a from-scratch hillshade
+judgement, and the channel-initiation gate (also above) is now what separates "how deep" from "how
+many" — over-carving's other failure mode, indiscriminate incision, is what that gate fixes.
 
 **The prototype's output is still too smooth, and the probe says exactly where.** Detrended H of
 the baked surface, per stage (`report_spectrum`, same S2 definition as `vxc_terrainprobe`):
@@ -224,7 +296,7 @@ Two separate findings, both of which the plan already specifies and the prototyp
 2. **B1 must be built to a target SPECTRUM, not a target RMS.** H stays ~1.65 below 30 m at any
    roughness tried, and quadrupling total roughness (1.5 → 6 m) moved S2(7.5 m) only 1.5×, because
    nearly all of the fBm's energy sits at coarse scales. H > 1 is "smoother than linear" — the same
-   signature `amplifier.cpp:242` records as worldgen v1's failure. Extrapolating the coarse
+   signature `amplifier.cpp:350-381` (was `:242`) records as worldgen v1's failure. Extrapolating the coarse
    raster's own H (0.83, measured at 120–240 m) down to 7.5 m gives a target of S2 ≈ 1.06 m against
    the 0.23 m currently produced.
 
@@ -258,6 +330,28 @@ The constructive reading for Phase 2: B1's roughness is **substrate for erosion,
 texture**. Keep it modest, and let the fine-scale spectrum be filled by *process* — finer rills,
 more incision detail — rather than by amplitude. If H is still too high after that, the answer is
 more geomorphology, not more noise.
+
+### The same trap, one layer down: post-fill drainage statistics are not sufficient either
+
+The Barnes ε-fill that makes MFD routing work (see the drainage-figures warning above) has its own
+version of the H problem, measured directly in `vxc_terrainprobe`'s drainage-connectivity metrics
+(`voxel-core/bench/terrainprobe.cpp:829-868`). Priority-flood + epsilon does not merely repair a
+pitted field — it **manufactures a plausible-looking drainage network on any input at all**,
+because it raises every pit until the whole domain has a monotone path to an edge, and D8 then
+traces respectable channels down the ramps the fill just built. On the v9 baseline, the
+**detail-only field** — five octaves of isotropic value noise, no landform whatsoever — scores an
+exceedance slope **β = 0.64 (R² = 0.995)**, 37 channel components and 1,031 junctions/km², every one
+of which reads as "a network" if quoted alone. The same field strands **97.9% of its area in 51,704
+interior pits per km²** before the fill ever touches it.
+
+This is exactly this document's existing "spectrum is not a sufficient acceptance criterion"
+argument, recurring at the routing stage instead of the spectral one: a summary statistic computed
+*after* a repair pass can look textbook-correct on an input the repair pass had to invent structure
+for. **The fix is the same shape, too: read the post-fill `net.*` numbers only next to their
+pre-fill `raw.*` companions** (`raw.interior_sinks_per_km2`, `raw.stranded_area`,
+`raw.mean_path_len`) — the raw pit census, taken before any fill runs, is what actually carries the
+verdict on whether a surface drains. Quoting `net.*` alone is the same class of error as quoting H
+alone.
 
 **Six more defects found when the prototype was rewritten as production modules.** Recorded
 because three of them revise things written here as settled:
@@ -360,16 +454,27 @@ edge — sub-metre, 1–2 px wide, regression-testable via the design doc's §11
 
 ### Layer 2 — wire format (`.vxtl` v2)
 
+> **Superseded by the frozen spec.** This section was written against a scale-8 (3.75 m/px) fine
+> tier. `docs/vxtl-v2-format.md` (frozen 2026-07-29) ships **scale 16 (1.875 m/px)** instead — see
+> "Fine resolution decided: 1.875 m, not 3.75 m" below open risk #4 — and its block geometry is
+> **480 m blocks (256×256 fine px at 1.875 m/px), 32×32 = 1,024 blocks per tile**, not the
+> 960 m / 256-per-tile numbers below. The reasoning in this section (why absolute control points,
+> why independent per-block zstd frames, why MED prediction) is unchanged and still the normative
+> rationale; only the pixel size and the resulting block/tile counts moved. Where the two disagree,
+> **`docs/vxtl-v2-format.md` is authoritative** — it is the frozen bit-level contract between the
+> Python encoder and the C++ decoder, this is design narrative.
+
 Keep the s1 tile byte-identical. **Redefine the s8 slot** to hold one fine container per coarse
 tile coordinate — safe, since nothing was ever generated at scale 8 (`tile_codec.py:41`,
 `tilestore.h:66`). The addressing change rolls `provider_id` through `_tile_format_fingerprint`,
 exactly as that mechanism is designed to.
 
 ```
-Header: extends v1 <4sHQiiBH> with
-  version=2, block_log2=8 (256×256 fine px = 960 m blocks, 16×16 = 256 per tile),
-  predictor, quant, codec, bake_ver, flags, base_offset_mm i32, clamp, n_sections
-Sections: ELEV_INDEX (256 × {offset, comp_len, mode, const}) + ELEV_DATA
+Header (AS SHIPPED — see vxtl-v2-format.md §3): extends v1 <4sHQiiBH> with
+  version=2, scale=16 (1.875 m/px), size=8192,
+  block_log2=8 (256×256 fine px = 480 m blocks, 32×32 = 1,024 blocks per tile),
+  predictor, quant, codec, bake_ver, flags, base_offset_mm i32, parent_scale, reserved, n_sections
+Sections: ELEV_INDEX (1,024 × {offset, comp_len, mode, const_cp, resid_bits, pad}) + ELEV_DATA
           (independent zstd frames per block; CONSTANT mode = 0 bytes)
           optional FLOW_INDEX / FLOW_DATA
 ```
@@ -415,6 +520,14 @@ Three things this changes:
 3. **The floor is 4.0–6.3 MB/tile** across three tiles sampled (smooth upsample, no detail at all),
    16–26 KB/km². Nothing the bake does can go below it.
 
+> **These numbers are all at 3.75 m/px (scale 8).** The shipped tier is **1.875 m/px (scale 16)** —
+> see open risk #4, now resolved as a decision below — which is 4× the pixels. Per
+> `docs/vxtl-v2-format.md`, the measured shipped figure is **~21–25 MB/tile compressed** rather
+> than a naive 4× of the number above, because halving post spacing also halves the per-step
+> gradient MED sees, buying back roughly 1 bit/px. The *reasoning* above (compressed size tracks
+> correlation, not amplitude; σ over-predicts) is unaffected by the pixel size and still governs the
+> finer tier.
+
 **Codec finding:** 73–159 MED errors per tile exceed int16 even at 10 cm quantisation — a 30 m
 cliff across one 3.75 m post will do it. The block format needs an escape: an int32 block mode or
 a per-block residual-width field, not a bare int16 everywhere.
@@ -455,9 +568,14 @@ roughly **5 int64 multiplies per column, cheaper than today's bilinear plus four
 Unhoisted on GPU it is ~34 multiplies against an `evalSurface` already spending ~300 on hashing;
 do not contort the HLSL to hoist.
 
-`kSurfaceBoundMaxCornersPerAxis` (`amplifier.h:87`) must rise **16 → 34** for the dilated stencil
-(34² int64 = 9.2 KB stack). This also discharges the standing warning at `amplifier.h:78-86` that
-the bound silently degrades at level ≥5 on scale-8 tiles.
+`kSurfaceBoundMaxCornersPerAxis` (`amplifier.h:159`, was `:87`) must rise **16 → 34** for the
+dilated stencil (34² int64 = 9.2 KB stack). This also discharges the standing warning that the
+bound silently degrades at level ≥5 on scale-8 tiles. **Superseded again since**: once open risk #4
+resolved in favour of the 1.875 m fine tier (§2 below), 34 was no longer enough either — a level-5
+footprint at 1.875 m needs ~62 control points and would decline at 34, the identical cliff this
+rise was meant to remove, just one tier finer. The constant now stands at **64** (32 KB stack;
+`amplifier.h:128-159` records the full history: 16 at v8 → 34 at v9/3.75 m → 64 for the shipped
+1.875 m tier).
 
 **3b. Continuous modulation — delete `tileSlopeMmPerPx`.**
 
@@ -484,24 +602,67 @@ mechanism 3.
 > **What it buys:** ground that looks shaped instead of textured — ridges crisp, hollows soft,
 > hillsides grooved down the fall line the way real slopes are.
 
+**v9's sub-30 m band has NO drainage connectivity — measured, not assumed, on shipped worldgen.**
+`vxc_terrainprobe`'s drainage-connectivity metrics (added alongside this work,
+`voxel-core/bench/terrainprobe.cpp`), run at seed 20260719, site (−84480, 53760): the **carrier**
+drains fine on its own — 41 sinks/km², 3.8% of area stranded, 166 m mean flow path before
+termination. **Adding v9's five isotropic detail octaves** — exactly the band this subsection
+replaces — turns that into **44,352 sinks/km², 97.3% stranded, 4.3 m mean flow path**. Confirmed at
+0.1 / 1 / 3 m voxel cells, so it is not a sampling artifact of one resolution. The same tool reports
+curvature conditioning at 0.98–1.03 (i.e. conditioned on nothing — a curvature gate should move
+this toward ~3.5) and rill anisotropy at 0.98–1.01 with a 45° control column at 1.00–1.02 (i.e. no
+anisotropy at all, on or off the voxel lattice). This is the same isotropic-fBm diagnosis the plan
+opened with, now quantified on the exact band Phase 3 is about to replace, and it is the number this
+whole subsection exists to fix.
+
 Where the fine tier is present, **delete the 25.6 m and 6.4 m landform octaves**
-(`amplifier.cpp:276-277`); they would fight measured landforms with hash noise. Then:
+(`amplifier.cpp:213-214`, was `:276-277` before the carrier extraction); they would fight measured
+landforms with hash noise. **Not yet done** — as of this revision the octave table is unchanged and
+`kLandformMaxMm`/`kMicroMaxMm` (`amplifier.cpp:540-541`) still reflect the old five-octave table;
+Phase 3 has built the replacement terms alongside the old ones, not yet swapped them in. Then:
 
 - a continuation ladder `{3200, 1600, 400, 200}` mm, amplitudes **set by probe measurement, not
   taste**, placed so `S2(d)` continues at H≈0.8 through 7.5 m;
 - a **curvature gate** — convex crests roughen ~1.75×, concave hollows smooth to ~0.5× (colluvial
-  fill). This is the ridge-sharp/valley-smooth asymmetry that reads as shaped ground;
+  fill). This is the ridge-sharp/valley-smooth asymmetry that reads as shaped ground. **Built**
+  (`carrier.h`'s `curvatureScaleQ10`, analytic Laplacian via `evalCarrierCurvature`), proved
+  monotone and bounded at compile time, **not yet wired into `evalSurface`**, and its constants are
+  explicitly marked provisional pending calibration against the fine tier's measured spectrum;
 - a **rill/flute term** with the domain anisotropically scaled by the local gradient frame,
   ~1.6 m across-slope and ~13 m along-slope. The frame uses an octagonal norm (`max + min/2`, ≤12%
   direction error, which reads as natural wavelength variation) — no sqrt, no trig. Its gate goes
   to zero below ~10% grade, which also neutralises the frame's instability where the gradient
   vanishes. Domain warping cannot change value noise's output *range*, so this costs the bound
-  exactly its gated amplitude;
+  exactly its gated amplitude. **Built** (`voxelcore/detail_rill.h`, `rillMm()`), measured
+  across/along ratio **31.1× at 1 m lag, 14.6× at 2 m, 6.9× at 3 m** at a constant 60% gradient
+  (bar is >1), **not yet wired into `evalSurface`**, amplitude 300 mm provisional (chosen as 0.6×
+  the old isotropic 1600 mm octave, pending calibration against the fine tier's measured `S2`).
+  >
+  > **A specification error found while building this, worth recording as a design lesson.** This
+  > plan's text (above) says to rotate the sample point into the local gradient frame — literally,
+  > one rotation matrix built from the gradient, applied to the *world* position. In an *unbounded*
+  > world that is wrong: the noise phase becomes `R(∇h(p))·p`, whose derivative carries a term
+  > proportional to **distance from the world origin**. On a real hillside, where aspect turns
+  > roughly 1 radian over a few hundred metres, that term reaches ~50 at 10 km out — one metre of
+  > ground motion becomes fifty metres of noise motion, and the 1.6 m rills degenerate into
+  > per-voxel static purely as a function of how far the player is from `x = 0`. It stays
+  > mathematically continuous throughout, so this is a **conditioning failure, not a
+  > discontinuity** — a continuity test would not catch it, and it would have shipped. Measured:
+  > **61× excess roughness at 54 km** from the origin, against a literal implementation of this
+  > plan's text kept as a regression control in `test_detail_rill.cpp`. The fix: quantise the
+  > rotation to a compile-time table of 16 fixed directions and blend the two nearest fields, so
+  > each field is a *fixed* linear map of world position with no lever arm — only the (bounded)
+  > blend weight sees the gradient. Costs ≤4.07° of misorientation and a ≤30% smooth modulation of
+  > rill contrast with aspect, both measured and documented rather than papered over;
 - a **bedding term** with regional strike/dip hashed from an 819.2 m lattice, strike from a
-  compile-time table of 16 integer direction pairs.
+  compile-time table of 16 integer direction pairs. **Built** (`voxelcore/detail_bedding.h`, both
+  the 2D surface displacement and the Phase-4 3D form, sharing one hashed field so they cannot
+  independently drift apart), **not yet wired into `evalSurface`/`stratigraphyAt`**.
 
-Net detail envelope drops from ~15.7 m gated (`amplifier.cpp:497-499`) to ~3.0 m — **the bound
-tightens**, which streaming feels as more effective trims.
+Net detail envelope drops from ~15.7 m gated (`amplifier.cpp:680`, was `:497-499`) to ~3.0 m — **the
+bound tightens**, which streaming feels as more effective trims. **Not yet true of the shipped
+binary**: the envelope is still ~15.7 m today because the old octaves have not been deleted (see
+above); this is the target once the swap lands.
 
 **3d. Bounded 3D density — overhangs.**
 
@@ -516,7 +677,7 @@ soft beds, joint-controlled chimneys, undercut banks. All are functions of surfa
 lithology and drainage, which we have. The 3D pass does not invent information; it expresses
 structure the heightfield already implies.
 
-`stratigraphyAt` (`amplifier.cpp:1101-1119`) gains a displacement `D(x,y,z)` with a compile-time
+`stratigraphyAt` (`amplifier.cpp:1384`, was `:1101-1119`) gains a displacement `D(x,y,z)` with a compile-time
 envelope `|D| ≤ 700 mm`, identically zero unless **both** gates pass: the voxel is within ±700 mm
 of the surface (outside that band `D` cannot flip the test, so skipping is *exact*, not
 approximate), and column slope exceeds ~60% grade. `D` = a 3D bedding term sharing the §3c
@@ -526,7 +687,7 @@ rock-gated `valueNoise3` pocket term.
 Cost: ~**+50–80% `VoxelizeMain` on a cliff-dominated chunk, +5–10% world-average**. Affordable
 *with* both gates and rejected without them — an ungated volumetric term roughly doubles
 voxelisation everywhere. Bounds survive by widening by the constant 700 mm; the three-reason air
-enumeration at `amplifier.h:167-196` gains a fourth reason with a constant bound.
+enumeration at `amplifier.h:239-264` (was `:167-196`) gains a fourth reason with a constant bound.
 
 River-bank undercuts are **deferred** until the flow plane ships — a client-side proxy would need
 non-local flow, precisely the O(1) collision the reconciliation doc rules out. It drops into the
@@ -543,10 +704,19 @@ same `D` band later as a pure additive term.
 | 3D density + microrelief | Client | Per-voxel, integer, identical everywhere, must answer point queries for collision and digging. |
 
 **Latency.** Tile = 15.36 km; coarse generation **22.5 s/tile on a 4090**
-(`terrain-service/docs/diffusion-bringup.md:277`); bake ≈1.5 s/tile (estimate — measure in Phase 1);
-fine bake for tile *T* needs the coarse 3×3 ring. Prefetch **coarse ring radius 2 tiles** (±30.7 km)
-and **fine ring radius 1** (±15.4 km), so bake dependencies are always resident. Moving one tile
-costs 5 coarse (≈112 s) + 3 bakes (≈5 s).
+(`terrain-service/docs/diffusion-bringup.md:277`); bake was estimated at ≈1.5 s/tile — **measured
+since, at the shipped 1.875 m/px scale, ≈165 CPU-s/tile** (`docs/vxtl-v2-format.md` §1; open risk
+#1 above has the attribution). That is a two-order-of-magnitude miss on the original estimate, and
+`docs/vxtl-v2-format.md` §1 point 3 already flags the consequence: **"the bake stops being free"** —
+at 20–40 s/tile in production (the parallel share of the 165 CPU-s on a GPU), advancing the frontier
+by one tile (3 bakes) becomes comparable to its 5 coarse tiles at 22.5 s, not the rounding error the
+numbers below assume. Fine bake for tile *T* needs the coarse 3×3 ring. Prefetch **coarse ring
+radius 2 tiles** (±30.7 km) and **fine ring radius 1** (±15.4 km), so bake dependencies are always
+resident — **ring sizing should be re-derived against the corrected bake cost**, per the frozen
+spec's own note, rather than inherited from the ≈5 s/tile assumption below.
+
+Moving one tile costs 5 coarse (≈112 s) + 3 bakes (≈5 s **assumed here — see the correction above:
+plausibly ≈60–120 s once the bake's real cost is priced in**).
 
 | Player speed | Time to cross a tile | Verdict |
 |---|---|---|
@@ -565,44 +735,73 @@ tiles are cached forever and shared, so cost tracks exploration area and collaps
 set saturates. Mitigations in order: pre-warm spawn regions and corridors; cap speed in
 never-visited territory; batch coarse generation across nearby frontier requests.
 
-**Storage.** Server ~9.5 MB/tile covering 236 km²: 1 M km² ≈ 40 GB, 100 M km² ≈ 3.8 TB — immutable
-content-addressed blobs, so CDN caching is free. Client cache reuses the existing layout
-(`cache.py:20-27`) with three additions: **sub-block granularity** (a 2 km corridor caches ~10
-blocks / 1.3 MB, not 8 MB); **LRU with a configurable budget**, default 8–16 GB ≈ 1,700 tiles ≈
-400,000 km², pinning the active ring; and **validate, never trust** — the server pins the fine
-`provider_id` in the handshake and sends per-tile digests, and `EditLog::checkProvider()` already
-refuses replay on mismatch. Client RAM at 4 km view distance ≈ **40 MB**.
+**Storage.** The ~9.5 MB/tile figure below was sized against the original 3.75 m/8 MB fine tier; at
+the **shipped 1.875 m/px tier** `docs/vxtl-v2-format.md` records **~106 KB/km²** directly (~21–25 MB
+of the ~25 MB/tile total is the fine plane), which over a 236 km² tile is closer to **~25 MB/tile**
+than 9.5. At ~106 KB/km²: 1 M km² ≈ **106 GB**, 100 M km² ≈ **10.6 TB** — roughly 2.6× the numbers
+below, still immutable content-addressed blobs, so CDN caching is still free, just of more of it.
+Client cache reuses the existing layout (`cache.py:20-27`) with three additions: **sub-block
+granularity** (a 2 km corridor caches ~10 blocks, now ~4 MB at 1.875 m/px rather than the 1.3 MB
+figure below); **LRU with a configurable budget**, default 8–16 GB — re-derive the tile count and
+area at the corrected per-tile size rather than reusing 1,700 tiles / 400,000 km² below, which
+assumed the smaller tier; and **validate, never trust** — the server pins the fine `provider_id` in
+the handshake and sends per-tile digests, and `EditLog::checkProvider()` already refuses replay on
+mismatch. Client RAM at 4 km view distance ≈ **40 MB** (this estimate should also be re-checked
+against the larger per-block size).
 
 ---
 
 ## Phasing
 
-Each client phase is one `kWorldGenVersion` bump (`core.h:44`, currently **8**), one
+Each client phase that changes `evalSurface`'s output is one `kWorldGenVersion` bump (`core.h:54`,
+currently **9**, was `:44`/currently 8 in the original draft of this plan), one
 `VXC_WORLDGEN_VERSION_USH` bump, prebuilt SPIR-V respin, golden regeneration, and `vxc_gpu` digest
-parity on both vendors. Saved edit logs invalidate each time — batch aggressively.
+parity on both vendors. Saved edit logs invalidate each time — batch aggressively. **Correction to
+this rule, learned in Phase 2:** *fine-tier ingestion did not need a bump.* `FineTileSampler` is an
+`ITileSampler` like the coarse sampler, and `Amplifier`'s carrier is pixel-size-agnostic by
+construction (`carrier.h:258`), so swapping which tile source an `Amplifier` reads from is not a
+change to `evalSurface`'s code — see the status note at the top of this document. The version bump
+is earned by wiring new *terms* into `evalSurface` (Phase 3), not by changing where the control
+lattice comes from.
 
 **Phase 0 — instrumentation. LANDED (no version bump).** `voxel-core/bench/terrainprobe.cpp` gains
 a carrier-only mode, a **seam scan**, a **direct gain-step** readout off the tile raster, and
 **directional roughness**. Baselines recorded below. *This is the phase that makes every later
 phase verifiable instead of arguable.*
 
-**Phase 1 — v9: C² carrier + continuous conditioning, on the existing 30 m tier.** B-spline
-carrier, analytic slope and curvature, the mm/m renormalisation of
+**Phase 1 — v9: C² carrier + continuous conditioning, on the existing 30 m tier. LANDED, PR #171.**
+B-spline carrier, analytic slope and curvature, the mm/m renormalisation of
 `slopeScaleQ10`/`microScaleQ10`/`classifyBiome`/topsoil, faded climate + ecotone dither, rewritten
-`surfaceBoundsMm`, corner cap 16→34. **Deliberately before the bake:** it de-risks the spline
-fixed-point maths and kills mechanisms 1–3 at their worst scale, so it is also the fastest visible
-win. In parallel, prototype the bake in Python to confirm the ≈1.5 s/tile estimate.
+`surfaceBoundsMm`, corner cap 16→34 (since raised again to 64, see open risk #4). **Deliberately
+before the bake:** it de-risked the spline fixed-point maths and killed mechanisms 1–3 at their
+worst scale, so it was also the fastest visible win. In parallel, the bake was prototyped in Python
+— the ≈1.5 s/tile estimate it was meant to confirm turned out to be off by more than an order of
+magnitude (see open risk #1).
 
-**Phase 2 — v10: bake + `.vxtl` v2 + fine-tier ingestion.** Server: `terrain_service/bake/`
-(`flow.py`, `incise.py`, `thermal.py`, `noise.py`, `pipeline.py`), `tile_codec.py` v2, delete the
-bilinear scale-8 branch, hydrology pyramid in `cache.py`/`pregen.py`. Client: v2 parse + zstd +
-block index in `tilestore.cpp`, fine-plane sampler, streaming residency gate and prefetch ring.
+**Phase 2 — bake + `.vxtl` v2 + fine-tier ingestion. LANDED, PR #176 (server) plus subsequent client
+work merged into `claude/phase3-integration`.** Server: `terrain_service/bake/` (`flow.py`,
+`incise.py`, `thermal.py`, `noise.py`, `pipeline.py`), `tile_codec.py` v2, hydrology pyramid in
+`pipeline.py`/`cache.py`/`pregen.py`. Client: v2 parse + block index in `tilestore.cpp`,
+`FineTileSampler`, the residency gate and prefetch ring in `tilestreaming.h/.cpp` and
+`VoxelFineTileStreamer`. **Did not need a `kWorldGenVersion` bump** — see the correction above; it
+landed without one, and worldgen is still v9. The fine tier shipped at **1.875 m/px (scale 16)**,
+not the 3.75 m recommended in the original draft of this section — see open risk #4, now resolved
+as a decision.
 
-**Phase 3 — v11: detail rework.** Delete landform octaves, add the 3.2 m octave, rill term,
-curvature gate, bedding term; calibrate amplitudes off the fine tier's measured `S2(7.5 m)`.
+**Phase 3 — detail rework. IN PROGRESS, not yet wired.** Delete landform octaves, add the
+continuation-ladder octave, rill term, curvature gate, bedding term; calibrate amplitudes off the
+fine tier's measured `S2(7.5 m)`. As of this revision: the carrier is extracted to `carrier.h` with
+analytic curvature added and tested; `detail_rill.h` and `detail_bedding.h` exist as standalone,
+bounded, tested functions; **none of the three — curvature gate, rill term, bedding term — is wired
+into `evalSurface` yet**, the old landform octaves have not been deleted, and the version has not
+moved past 9. `vxc_terrainprobe`'s new drainage-connectivity/curvature/anisotropy metrics
+(§3c above) already show, on the *shipped* v9 field, exactly the failure this phase exists to fix.
 
-**Phase 4 — v12: 3D density band.** `ColumnSample` widening, displaced-depth `stratigraphyAt`,
-`valueNoise3` both sides, bound and brick-range widening with static_asserts.
+**Phase 4 — 3D density band. NOT STARTED.** `ColumnSample` widening, displaced-depth
+`stratigraphyAt`, `valueNoise3` both sides, bound and brick-range widening with static_asserts.
+`detail_bedding.h`'s 3D form (`beddingDisplacement3Mm`) already exists as a function, built
+alongside the 2D term in the same commit, sharing one hashed field so the two cannot independently
+drift apart — but nothing in `stratigraphyAt` calls it yet.
 
 ---
 
@@ -803,40 +1002,106 @@ priority-flood is best left on CPU); and budgeting the GPU against rendering (as
 when sharing with the renderer).
 
 **The consequence to accept in Tier B:** locally-baked tiles are not reproducible from the seed
-alone, so **the baked cache becomes part of the save** — growing ~9.5 MB per tile visited (~1 GB
-after 100 tiles). Give locally-baked worlds their own `provider_id` namespace, never re-bake an
-existing tile, and design the bake for order-determinism anyway (fixed iteration counts, no
-order-dependent atomics) so cache loss usually reproduces rather than silently changing the world.
+alone, so **the baked cache becomes part of the save** — growing ~25 MB per tile visited at the
+shipped 1.875 m/px tier (was estimated at ~9.5 MB against the smaller 3.75 m tier; ~2.5 GB after
+100 tiles). Give locally-baked worlds their own `provider_id` namespace, never re-bake an existing
+tile, and design the bake for order-determinism anyway (fixed iteration counts, no order-dependent
+atomics) so cache loss usually reproduces rather than silently changing the world.
 
-**Hardware floor is the real limiter on Tier B:** the model plus ~0.5 GB of bake grids wants
-~4–6 GB VRAM beyond the game's own usage, and the CPU path is hours per tile, so there is no
-low-end fallback. On a mid-range GPU on-demand exploration may stop keeping up — which puts you
-back at Tier A with a larger shipped region.
+**Hardware floor, corrected.** The model plus bake grids wants **~3 GB** in flight per tile, not
+the ~0.5 GB this appendix originally assumed (`pipeline.py`'s `estimate_peak_bytes`, open risk #6
+above — a counted figure over the padded 9216² domain, not a timing) — beyond the game's own VRAM
+usage that is a materially higher floor than stated here before.
+
+The **"CPU path is hours per tile"** claim needs separating into what was actually measured and
+what was actually warned about, because they are not the same thing. `terrain-service/docs/
+diffusion-bringup.md:71` warns about **cloud-pod inference silently falling back to CPU** when the
+Vast image's bundled torch build doesn't match the host driver — `torch.cuda.is_available()`
+returns `False` with no error, and diffusion inference runs on CPU "at 4090 prices," i.e. billed
+GPU-hours for CPU work. That is a real, measured failure mode, but it is about a misconfigured
+*rented* GPU box, not a statement about commodity CPU-only hardware.
+
+Separately, and on a genuinely GPU-less dev box (`torch 2.12.1+cpu`, onnxruntime CPU-only, no
+`nvidia-smi`), **CPU diffusion inference was measured at ~179 s/tile** for a 512² native tile — one
+cold tile on roughly 8 threads, 2026-07-29, seed 20260729 at native origin (0,0), reproduce with
+`terrain-service/tools/gen_reference_tile.py --allow-cpu` (which prints the per-tile figure; it must
+be run with cwd `D:\terrain-diffusion`, because `synthetic_map.py` opens `data/global/` by relative
+path). **Treat it as a single cold measurement, not a benchmark** — it is one tile, on one box, on a
+shared machine, and nothing in this repo pins it the way the K-calibration numbers are pinned in
+`incise.py`'s docstring. It is quoted here because it changes a *conclusion*, not because it is a
+precise number: re-measure before costing anything on it. That contradicts "hours per tile" by roughly an order of magnitude
+for the diffusion model itself, though it says nothing about the *bake*, which is a separate CPU
+cost (`pipeline.py`'s measured ~165 CPU-s/tile at production scale, open risk #1) that would stack
+on top of it in an unbounded Tier B. **This directly affects the claim two paragraphs up** ("there
+is no low-end fallback on hardware grounds"): a ~179 s/tile CPU diffusion cost plus a ~165 CPU-s
+bake is slow — several minutes per frontier tile — but it is not the "no fallback at all" situation
+the original "hours" figure implied, and it is worth re-costing Tier B's CPU-only floor properly
+rather than treating it as ruled out. On a mid-range GPU, on-demand exploration may still stop
+keeping up — which puts you back at Tier A with a larger shipped region — but that is now a
+capacity argument to re-measure, not a hardware-impossibility argument to assert.
 
 ---
 
 ## Open risks
 
-1. **Bake cost: measured in CPU-seconds, which contention cannot steal.** **40.6 CPU-s/tile**
-   (19.3 s wall), against the ≈1.5 s originally estimated. ~13.5 CPU-s of that is sequential and
-   ~27 CPU-s parallel (almost all thermal relaxation), so a production bake with the parallel work
-   on GPU plausibly lands at 5–10 s/tile. Wall-clock alone was contaminated; CPU-seconds are not,
-   because a competing process steals wall-clock but not cycles attributed to this process.
-   Residual caveat: cache and memory-bandwidth pressure still inflate CPU-s somewhat, so treat it
-   as a tight upper bound rather than a clean number. Either way the on-demand argument is
-   unaffected — coarse diffusion at 22.5 s/tile dominates, and advancing the frontier one tile
-   needs 5 coarse tiles against 3 bakes.
-2. ~~Compressed tile size is modelled, not measured.~~ **RETIRED** — measured on three real tiles
-   with `terrain-service/tools/measure_fine_tier_size.py`; see the size section. 8 MB/tile stands
-   for correlated detail. The live risk is now narrower and different: **the bake must not
-   introduce uncorrelated per-pixel noise**, because 5 cm of white costs more than 2 m of fBm. Also
-   newly open: the codec needs an int16 escape (73–159 residuals per tile overflow).
-3. **`kWorldGenVersion` collision.** `core.h:42-43` notes v8 was taken to dodge a collision with an
-   unmerged branch; confirm what is in flight before claiming v9–v12.
-4. **Fine resolution may want to be 1.875 m.** 3.75 m is the recommendation; the format leaves
-   `size` and `block_log2` free so scale 16 is a config change, not a redesign — at 4× the bytes.
-   Decide after seeing Phase 3 in-engine.
-5. **Phase 1 changes the world before the bake exists.** Terrain will look *different* — smoother
-   carrier, no crease grid, continuous material boundaries — but the sub-30 m band is still
+1. **Bake cost, re-measured at the shipped 1.875 m/px scale.** The original prototype figure
+   (40.6 CPU-s/tile, 4096² at 3.75 m/px) is superseded: the shipped tier is 8192² (4× the cells),
+   and `docs/vxtl-v2-format.md` records a measured **~165 CPU-s/tile** production figure at that
+   scale. Attributed, not just totalled: `pipeline.py`'s B2 module owner independently measured
+   fill 12.5 + D8 2.2 + accumulate 15.8 ≈ **30 CPU-s** at full 8192² — so B2 (flow routing) is *not*
+   the bottleneck at production scale; thermal relaxation still is, and it is still the stage a GPU
+   eats. The on-demand argument is unaffected either way — coarse diffusion at 22.5 s/tile per the
+   *actually measured* number (`terrain-service/docs/diffusion-bringup.md:277`) still dominates a
+   frontier-tile's cost (5 coarse tiles ≈ 112 s vs 3 bakes ≈ 495 CPU-s, and the bake parallelises).
+2. ~~Compressed tile size is modelled, not measured.~~ **RETIRED**, and the number moved with the
+   resolution decision. Measured at 3.75 m/px on three real tiles with
+   `terrain-service/tools/measure_fine_tier_size.py`, 8 MB/tile stood for correlated detail there;
+   at the **shipped 1.875 m/px tier** `docs/vxtl-v2-format.md` records **~21–25 MB/tile** (4× the
+   pixels, ~1 bit/px cheaper — see the size section above). The live risk is unchanged in kind: the
+   bake must not introduce uncorrelated per-pixel noise, because a few cm of white costs more than
+   metres of fBm. Also still open: the codec needs the int16→int32 escape it now has
+   (`resid_bits`, §5 of the frozen spec) — 73–159 residuals per tile overflow int16 even at 100 mm
+   quantisation.
+3. ~~`kWorldGenVersion` collision.~~ **RESOLVED**, and answered directly in the code rather than
+   left as a question: `core.h:40-43` records that `claude/erosion-v7` (unmerged) already claims 7,
+   this work branched from `main` at v6 and deliberately took 8 so the two land in either order
+   without colliding (the check at `editlog.h` is exact equality, not a range, so the gap is
+   harmless), and v9 is this plan's Phase 1. No collision is in flight.
+4. ~~Fine resolution may want to be 1.875 m.~~ **RESOLVED as a decision, not a risk.** 1.875 m/px
+   (scale 16) was chosen over 3.75 m deliberately (Matt, 2026-07-29) — see `docs/vxtl-v2-format.md`
+   §1 — because it buys the 3.75–7.5 m band a 1.8 m player actually occupies: small stream
+   channels, gullies you can climb into, cut banks, terrace risers. Costs are measured, not
+   assumed: ~21–25 MB/tile compressed and ~165 CPU-s/tile to bake (vs. 8 MB and the original
+   estimate at 3.75 m). `kSurfaceBoundMaxCornersPerAxis` rose again, 34 → 64, as a direct
+   consequence (see 3a above).
+5. **Phase 1 changed the world before the bake existed; the bake has since landed, but Phase 3 has
+   not.** Terrain looks *different* from v8 — smoother carrier, no crease grid, continuous material
+   boundaries — but as of this revision the sub-30 m band is still
    procedural, so it will not yet look *right*. Do not re-tune octaves in Phase 1; Phase 3 owns
-   those numbers.
+   those numbers. This is now measured, not just expected — see "v9's sub-30 m band has NO
+   drainage connectivity" under §3c above.
+6. **NEW — peak bake memory is ~3 GB per tile in flight, not the ~0.5 GB the offline appendix
+   assumed.** `pipeline.py`'s `estimate_peak_bytes` counts 8 float32 grids (carrier, roughness
+   delta, slope, filled, acc, depth, eroded, relaxed) plus one int64 receiver array over the
+   **padded** 9216² domain — the module docstring puts the live set at ~3 GB. This is a *counted*
+   figure (bytes, not timed), so box contention cannot distort it. Size the bake pod accordingly,
+   and the offline-appendix Tier B VRAM budget (below) needs revisiting against it.
+7. **NEW — the ε-flat routing seam bites at ~960 m, i.e. exactly one apron width.** The Barnes
+   epsilon fill's staircase across a flat runs outward from whichever border the flood reached it
+   from first, so a flat **wider than the apron** can be crossed in different directions by two
+   neighbouring tiles' bakes. Heights still agree to sub-ULP (well under the 100 mm wire LSB, so
+   shipped elevation is unaffected), but flow accumulation — and therefore incision — need not.
+   At 1.875 m/px, "wider than the apron" is 512 px: an ordinary lake, floodplain or playa, not a
+   corner case. `pipeline.py`'s `HYDROLOGY_RESIDUALS` #6 names this and `BakeResult` reports
+   `basin_exceeds_apron` per tile so it is at least cheaply detectable; fixing it wants the same
+   shape of answer as the hydrology pyramid (a world-anchored, shared routing decision), which is
+   not wired for this case.
+8. **NEW — exploration order is permanently baked into an on-demand world.** The hydrology
+   pyramid's superblocks are built from whatever coarse tiles exist when the first tile inside them
+   is baked (`HYDROLOGY_RESIDUALS` #1); a river entering from a never-generated region contributes
+   nothing at bake time, and because a shipped tile is never regenerated, later exploration does
+   **not** retroactively correct it. `pregen.py --mode bake` sidesteps this by building every
+   superblock over the requested radius before baking anything, so a pre-generated world is
+   order-independent; a live on-demand frontier is not. This is as much a policy question (do
+   players' arrival order get to matter to the river network they see) as a numerical one, and it
+   is the largest unresolved residual in the hydrology pyramid.

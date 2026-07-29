@@ -51,7 +51,29 @@ namespace vxc {
 // an ecotone dither instead of nearest-pixel, so material boundaries stop
 // snapping to the pixel grid. surfaceBoundsMm is re-derived as a Lipschitz
 // bound around one carrier evaluation.
-inline constexpr uint32_t kWorldGenVersion = 9;
+// v10 (docs/terrain-amplification-plan.md Phase 3): structured detail. The
+// sub-30 m band stops being isotropic fBm draped over a ramp and becomes
+// conditioned on the carrier's own geometry.
+//
+// Four changes, and the reason each exists is a MEASUREMENT on v9, not a taste:
+//   * a curvature gate on the shaping band -- crests roughen, hollows smooth
+//     toward colluvial fill. v9's curvature-conditioned roughness measured
+//     0.98-1.03, i.e. exactly the 1.0 a stationary fBm gives: its detail was
+//     conditioned on nothing at all;
+//   * a rill/flute term, anisotropic in the local gradient frame. v9's
+//     across/along-slope roughness ratio measured 0.98-1.01 against a 45 deg
+//     control at 1.00-1.02, on grades up to 50% -- water cuts downslope, and
+//     nothing in v9 knew which way that was;
+//   * a bedding term on a regional 819.2 m strike/dip field, so layered rock
+//     reads as layered over a whole hillside rather than per-point;
+//   * BAND OWNERSHIP: on a world whose tiles carry the baked 1.875 m fine tier,
+//     the 25.6 m and 6.4 m landform octaves are deleted and the ladder is
+//     continued from 3.2 m instead. Synthesising them over measured landform
+//     does not add detail, it fights the bake with hash noise.
+//
+// The surface bound is re-derived for all of it and TIGHTENS by 3.5x on a fine
+// world (7846 mm against 27439 mm at maximum slope and curvature).
+inline constexpr uint32_t kWorldGenVersion = 10;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 
