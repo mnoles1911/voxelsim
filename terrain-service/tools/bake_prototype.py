@@ -87,6 +87,64 @@ def bspline_upsample(a, scale, prefilter=True):
 
 
 # ----------------------------------------------------------------- B1 roughness
+def measure_S2(z, cell_m, lags_cells):
+    rows = z[::7]
+    out = []
+    for d in lags_cells:
+        a, b, c = rows[:, 2 * d:], rows[:, d:-d], rows[:, :-2 * d]
+        out.append((d * cell_m, float(np.mean(np.abs(a - 2 * b + c)))))
+    return out
+
+
+def spectrum_fitted_fbm(carrier, cell_m, slope, seed=20260719, src_nyquist_m=30.0):
+    """B1 built to a TARGET SPECTRUM rather than a target RMS.
+
+    The RMS formulation does not work and the probe says why: nearly all of an
+    fBm's energy sits in its coarse octaves, so quadrupling the total moved
+    S2(7.5 m) by only 1.5x while H stayed ~1.65 -- 'smoother than linear', the
+    worldgen-v1 signature.
+
+    So fit the CARRIER's own self-affine trend over the band where it still
+    carries real 30 m data (120-240 m), extrapolate it down, and give each
+    octave the amplitude that continues it:  A(L) = C * L^H.
+
+    Only octaves BELOW the source Nyquist are synthesised. Above it the carrier
+    already has the real data and adding noise there would fight the diffusion
+    model rather than extend it -- the same 'replace, do not layer' rule the
+    plan applies to the client's landform octaves."""
+    from scipy.ndimage import zoom
+    pts = measure_S2(carrier, cell_m, [32, 64])          # 120 m and 240 m
+    (d0, s0), (d1, s1) = pts
+    H = float(np.log(s1 / s0) / np.log(d1 / d0))
+    C = float(s1 / d1 ** H)
+    print(f"  B1 target spectrum fitted to the carrier: H={H:.3f} C={C:.4f}  "
+          f"(S2({d1:.0f} m)={s1:.2f} m)")
+
+    rng = np.random.default_rng(seed)
+    out = np.zeros(carrier.shape, dtype=np.float32)
+    n = carrier.shape[0]
+    size = 16
+    while size <= n:
+        L = n * cell_m / size                            # octave wavelength, m
+        size *= 2
+        if L > src_nyquist_m:
+            continue                                     # the carrier owns this band
+        amp = C * L ** H
+        # Grid points across the tile for an octave of wavelength L: one control
+        # point per L, i.e. n*cell_m/L of them. (Inverting this puts LOW
+        # frequency content in with a fine octave's amplitude, which measurably
+        # makes the fine end smoother -- H went 1.65 -> 1.91 before it was fixed.)
+        gsz = max(4, int(round(n * cell_m / L)))
+        g = rng.standard_normal((gsz + 4, gsz + 4)).astype(np.float32)
+        up = zoom(g, n / gsz, order=3, mode="nearest")
+        band = up[:n, :n]
+        band /= max(band.std(), 1e-6)
+        out += amp * band
+        print(f"    octave L={L:7.2f} m  amplitude {amp*1000:8.0f} mm")
+    gain = np.clip(slope / 0.3, 0.25, 2.0).astype(np.float32)
+    return out * gain
+
+
 def conditioned_fbm(shape, slope, seed=20260719):
     """fBm whose amplitude follows local slope. Correlated by construction --
     the size measurement showed uncorrelated noise costs ~2x the bytes.
@@ -343,9 +401,12 @@ def run_bake(coarse, iters=48, verbose=True, seed=20260719, noise=None,
     # work at all). `noise` lets a caller pass a pre-computed field sliced from
     # a shared parent, which is an exact stand-in for world-anchoring and is how
     # the seam test isolates apron adequacy from this prototype's own limitation.
-    nz = conditioned_fbm(fine.shape, slope0, seed=seed) if noise is None else noise * np.clip(
-        slope0 / 0.3, 0.25, 2.0).astype(np.float32)
-    fine = fine + nz * rough
+    if noise is not None:
+        fine = fine + noise * np.clip(slope0 / 0.3, 0.25, 2.0).astype(np.float32) * rough
+    elif rough < 0:                    # negative rough = "fit the spectrum instead"
+        fine = fine + spectrum_fitted_fbm(fine, PIXEL_M, slope0, seed=seed)
+    else:
+        fine = fine + conditioned_fbm(fine.shape, slope0, seed=seed) * rough
     tick("B1 conditioned fBm roughness", t0)
 
     t0 = time.perf_counter(); filled = priority_flood(fine); tick("B2a priority-flood fill", t0)

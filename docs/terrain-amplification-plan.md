@@ -203,6 +203,33 @@ Consequence for Phase 3: **do not calibrate the client's octaves off this protot
 Its H is unphysical, so extrapolating from it would make the client *smoother*, which is
 backwards. `report_spectrum` refuses to emit amplitudes when H > 1.05 for that reason.
 
+### The spectrum is NOT a sufficient acceptance criterion — demonstrated
+
+`--rough -1` builds B1 to the fitted target spectrum instead of a target RMS (`spectrum_fitted_fbm`
+— fit H and C from the carrier's own 120–240 m band, synthesise only octaves *below* the 30 m
+source Nyquist, amplitude `A(L) = C·L^H`). It works, spectrally: **H goes from 1.65 to 0.91 at the
+fine end**, squarely physical.
+
+**And the terrain gets worse.** The hillshade reads as uniform crumpled paper, and the flow field
+— dendritic and connected before — collapses into a confetti of disconnected micro-catchments.
+The 3.19 m of 30 m-wavelength noise required to hit the target spectrum is enough to break up
+drainage organisation entirely: every noise dimple becomes its own sink.
+
+This is this document's own opening argument, now demonstrated instead of asserted: *"That is
+spectrally reasonable and structurally meaningless… The fix is not 'better noise.'"* A surface can
+have a textbook-correct self-affine spectrum and no landform structure whatsoever.
+
+**So the Phase 3 gate "H ∈ [0.6, 1.0] at every lag decade" is necessary but nowhere near
+sufficient, and on its own it is actively misleading** — it is satisfiable by exactly the failure
+mode the project exists to fix. It must be read alongside the directional-anisotropy metric (which
+distinguishes grooved from crumpled) and a hillshade, and no octave retune should be accepted on
+the H number alone.
+
+The constructive reading for Phase 2: B1's roughness is **substrate for erosion, not final
+texture**. Keep it modest, and let the fine-scale spectrum be filled by *process* — finer rills,
+more incision detail — rather than by amplitude. If H is still too high after that, the answer is
+more geomorphology, not more noise.
+
 **Three prototype bugs, each of which validated a choice in this plan by violating it:**
 
 - *Thermal must conserve mass.* Subtracting the over-repose excess without depositing it stripped
