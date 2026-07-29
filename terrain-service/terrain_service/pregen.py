@@ -171,6 +171,7 @@ def _run_bake(args, provider, cache: TileCache) -> int:
         for dy in range(-args.radius, args.radius + 1)
     ]
     generate_coarse = not args.bake_no_coarse_generate
+    verify_superblocks = not args.bake_no_verify_superblocks
     cpu0 = time.process_time()
 
     # -- pass 1: coarse tiles, target square plus the one-tile apron ring.
@@ -211,23 +212,60 @@ def _run_bake(args, provider, cache: TileCache) -> int:
         for lv in range(consts.superblock_max_level, -1, -1)
     ]
     superblocks: dict[tuple[int, int, int], object] = {}
+    stale_superblocks = 0
+    incomplete_superblocks = 0
     for level in levels:
         needed = {bp.superblock_index(x, y, level) for (x, y) in ring}
         for sx, sy in sorted(needed):
+            parent = None
+            if level.level < consts.superblock_max_level:
+                up = bp.FlowLevel(level=level.level + 1, geom=geom, consts=consts)
+                # The parent covering this block's own origin tile.
+                ptx, pty = sx * level.tiles_per_side, sy * level.tiles_per_side
+                parent = superblocks.get((up.level,) + bp.superblock_index(ptx, pty, up))
+            parent_fp = parent.inputs_fingerprint if parent is not None else b""
+
             blob = cache.get_flow(provider.provider_id, args.seed, level.level, sx, sy)
+            sb = None
             if blob is not None:
-                sb, _ = bp.decode_flow_superblock(blob)
-            else:
-                parent = None
-                if level.level < consts.superblock_max_level:
-                    up = bp.FlowLevel(
-                        level=level.level + 1, geom=geom, consts=consts
+                try:
+                    sb, _ = bp.decode_flow_superblock(blob)
+                except ValueError as e:
+                    # A superblock is a DERIVED artifact, unlike a shipped
+                    # tile: an unreadable one is rebuilt rather than fatal.
+                    print(
+                        f"  warning: cached flow superblock L{level.level} "
+                        f"({sx},{sy}) is unreadable ({e}); rebuilding",
+                        file=sys.stderr,
                     )
-                    # The parent covering this block's own origin tile.
-                    ptx, pty = sx * level.tiles_per_side, sy * level.tiles_per_side
-                    parent = superblocks.get(
-                        (up.level,) + bp.superblock_index(ptx, pty, up)
+                    sb = None
+            if sb is not None and verify_superblocks:
+                # THE ORDER-DEPENDENCE CHECK (pipeline.ORDER_DEPENDENCE). A
+                # cached superblock was built from whatever coarse tiles
+                # existed then; recomputing the digest from the tiles that
+                # exist NOW is the only way to see that it froze a smaller
+                # world. Reusing it is still correct -- it is what the tiles
+                # already baked against -- but it must not be silent.
+                now_fp = bp.superblock_inputs_fingerprint(
+                    lambda x, y: fetch(x, y, generate=False),
+                    sx,
+                    sy,
+                    level,
+                    parent_fingerprint=parent_fp,
+                )
+                if now_fp != sb.inputs_fingerprint:
+                    stale_superblocks += 1
+                    print(
+                        f"  warning: flow superblock L{level.level} ({sx},{sy}) "
+                        f"was built against a DIFFERENT coarse world "
+                        f"(stored {sb.fingerprint_hex[:16]}, now "
+                        f"{now_fp.hex()[:16]}). Tiles already baked against it "
+                        "are frozen to the older one and are never "
+                        "regenerated; new tiles here inherit that choice. See "
+                        "pipeline.ORDER_DEPENDENCE.",
+                        file=sys.stderr,
                     )
+            if sb is None:
                 sb = bp.build_flow_superblock(
                     lambda x, y: fetch(x, y, generate=False),
                     sx,
@@ -244,11 +282,27 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                     sy,
                     bp.encode_flow_superblock(sb, args.seed),
                 )
+            if not sb.complete:
+                incomplete_superblocks += 1
+                print(
+                    f"  warning: flow superblock L{level.level} ({sx},{sy}) is "
+                    f"INCOMPLETE ({len(sb.missing_tiles)} of "
+                    f"{level.tiles_per_side ** 2} coarse tiles absent). Rivers "
+                    "entering from those tiles contribute nothing, permanently, "
+                    "to every tile baked against it.",
+                    file=sys.stderr,
+                )
             superblocks[(level.level, sx, sy)] = sb
+        fps = ",".join(
+            sorted(
+                superblocks[(level.level, sx, sy)].fingerprint_hex[:12]
+                for sx, sy in needed
+            )
+        )
         print(
             f"[flow L{level.level}] {len(needed)} superblock(s) "
             f"@ {level.cell_m:.0f} m/px, span {level.span_m / 1000:.0f} km  "
-            f"cpu={time.process_time() - cpu0:.1f}s",
+            f"fp={fps}  cpu={time.process_time() - cpu0:.1f}s",
             file=sys.stderr,
         )
 
@@ -296,6 +350,20 @@ def _run_bake(args, provider, cache: TileCache) -> int:
             )
             failed += 1
             continue
+        if result.stats["superblock_missing_tiles"] != 0.0:
+            n_missing = int(result.stats["superblock_missing_tiles"])
+            print(
+                f"  warning: tile ({x},{y}) baked against "
+                + (
+                    "NO flow superblock at all"
+                    if n_missing < 0
+                    else f"an INCOMPLETE flow superblock ({n_missing} coarse "
+                    "tiles absent)"
+                )
+                + "; its river network is frozen to this exploration order and "
+                "the tile is never regenerated (pipeline.ORDER_DEPENDENCE)",
+                file=sys.stderr,
+            )
         if result.stats["basin_exceeds_apron"]:
             print(
                 f"  warning: tile ({x},{y}) contains a flat/basin "
@@ -328,13 +396,17 @@ def _run_bake(args, provider, cache: TileCache) -> int:
             f"incision_p99={result.stats['incision_p99_m']:.2f}m "
             f"channels={int(result.stats['channel_cells'])} "
             f"injected={result.stats['injected_inflow_km2']:.1f}km2 "
-            f"basin={result.stats['basin_cells_frac']*100:.1f}%",
+            f"basin={result.stats['basin_cells_frac']*100:.1f}%/"
+            f"{result.stats['basin_max_depth_m']:.0f}m "
+            f"hydro={result.superblock_fingerprint[:12] or 'none'}",
             file=sys.stderr,
         )
 
     print(
         f"Bake complete: baked={baked} skipped={skipped} unencoded={failed} "
-        f"total={len(targets)} cpu_seconds={time.process_time() - cpu0:.1f}",
+        f"total={len(targets)} incomplete_superblocks={incomplete_superblocks} "
+        f"stale_superblocks={stale_superblocks} "
+        f"cpu_seconds={time.process_time() - cpu0:.1f}",
         file=sys.stderr,
     )
     return 0 if failed == 0 else 1
@@ -401,6 +473,20 @@ def main() -> int:
             "Bake mode: override BakeConstants.superblock_max_level. Level L "
             "spans 4^(L+1) tiles; the top level receives no inflow at its own "
             "edges, so it is where catchment truncation happens."
+        ),
+    )
+    parser.add_argument(
+        "--bake-no-verify-superblocks",
+        action="store_true",
+        help=(
+            "Bake mode: skip the order-dependence check on CACHED flow "
+            "superblocks. The check recomputes each cached superblock's "
+            "inputs fingerprint from the coarse tiles that exist now and warns "
+            "when it disagrees with the world the superblock was built "
+            "against -- see pipeline.ORDER_DEPENDENCE. It costs one read+hash "
+            "pass over the block's coarse tiles (16 MB at level 0, 256 MB at "
+            "level 1); turn it off only when that I/O is the bottleneck and "
+            "you already know the world is static."
         ),
     )
     parser.add_argument(

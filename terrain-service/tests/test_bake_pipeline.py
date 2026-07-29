@@ -561,6 +561,56 @@ def test_basin_width_detector_flags_flats_wider_than_the_apron():
     assert _bake(world, 0, 0).stats["basin_exceeds_apron"] == 0.0
 
 
+def test_border_detector_separates_a_contained_flat_from_a_spilling_one():
+    """``max_basin_run_m`` measures a LENGTH; the seam depends on a REACH.
+
+    A filled flat that lies wholly inside the padded domain is entered by
+    priority-flood through the terrain, at its own spill point, so its epsilon
+    staircase is a function of the terrain and two neighbouring bakes cannot
+    cross it differently -- however long it is. Only a flat that reaches the
+    padded border is entered FROM the border, which is the one thing a
+    neighbour sees differently. So the two statistics must be able to
+    disagree, and they must disagree in this direction.
+    """
+    world = ramp_world()
+    f = TEST_GEOM.fine_tile_px
+    a = TEST_GEOM.apron_fine_px
+
+    def contained_flat(z, **kw):
+        # A long flat down the middle of the INTERIOR, apron untouched. Its
+        # run is the full tile width, far over the apron.
+        out = np.asarray(z, np.float32).copy()
+        mid = a + f // 2
+        out[mid - 1 : mid + 1, a : a + f] += np.float32(50.0)
+        return out
+
+    r = pipeline.bake_tile(
+        world_seed=1, tile_x=0, tile_y=0,
+        coarse_fetch=lambda x, y: world.get((x, y)),
+        kernels=dataclasses.replace(kernels(), fill_depressions=contained_flat),
+        geom=TEST_GEOM, consts=TEST_CONSTS,
+    )
+    assert r.stats["max_basin_run_m"] > TEST_GEOM.apron_m
+    assert r.stats["basin_exceeds_apron"] == 1.0        # the noisy one fires
+    assert r.stats["basin_reaches_padded_border"] == 0.0  # the sound one does not
+    assert r.stats["padded_border_basin_cells"] == 0.0
+
+    def spilling_flat(z, **kw):
+        return np.asarray(z, np.float32) + np.float32(1.0)
+
+    s = pipeline.bake_tile(
+        world_seed=1, tile_x=0, tile_y=0,
+        coarse_fetch=lambda x, y: world.get((x, y)),
+        kernels=dataclasses.replace(kernels(), fill_depressions=spilling_flat),
+        geom=TEST_GEOM, consts=TEST_CONSTS,
+    )
+    assert s.stats["basin_reaches_padded_border"] == 1.0
+    assert s.stats["padded_border_basin_frac"] == 1.0
+
+    clean = _bake(world, 0, 0)
+    assert clean.stats["basin_reaches_padded_border"] == 0.0
+
+
 def test_bake_writes_only_the_interior():
     world = synth_world()
     r = _bake(world, 0, 0)
@@ -654,6 +704,182 @@ def test_build_flow_superblock_downsamples_by_mean_and_records_gaps():
     # routes flow over an elevation field no real cell has.
     expect = world[(0, 0)][:2, :2].mean()
     assert sb.filled[0, 0] == pytest.approx(expect, rel=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Order dependence: HYDROLOGY_RESIDUALS #1, made visible.
+# ---------------------------------------------------------------------------
+
+
+def test_exploration_order_changes_the_hydrology_and_the_fingerprint_says_so():
+    """The residual itself, demonstrated, then caught.
+
+    A superblock built while one of its coarse tiles is missing routes water
+    differently from the same superblock built once that tile exists -- and
+    because a shipped tile is never regenerated, an on-demand frontier freezes
+    whichever it happened to build. This asserts BOTH halves: that the two
+    superblocks really do differ numerically (otherwise the check would be
+    guarding nothing), and that their input fingerprints differ so the
+    difference is attributable rather than mysterious.
+    """
+    lv = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=TEST_CONSTS)
+    full = synth_world()
+    early = dict(full)
+    early.pop((1, 1))  # the frontier has not reached this tile yet
+
+    sb_early = pipeline.build_flow_superblock(
+        lambda x, y: early.get((x, y)), 0, 0, lv, kernels()
+    )
+    sb_late = pipeline.build_flow_superblock(
+        lambda x, y: full.get((x, y)), 0, 0, lv, kernels()
+    )
+
+    # (a) the hydrology genuinely differs -- this is the residual, not a nit.
+    assert sb_early.missing_tiles == ((1, 1),)
+    assert sb_late.missing_tiles == ()
+    assert not np.array_equal(sb_early.filled, sb_late.filled)
+    assert not sb_early.complete
+    assert sb_late.complete
+
+    # (b) ...and it is now visible without diffing the rasters.
+    assert len(sb_early.inputs_fingerprint) == pipeline.FLOW_FINGERPRINT_BYTES
+    assert sb_early.inputs_fingerprint != sb_late.inputs_fingerprint
+
+
+def test_the_fingerprint_hashes_inputs_not_fetch_order():
+    """A digest that moved with iteration order would flag everything.
+
+    ``coarse_fetch`` is a callback; nothing stops two callers from walking
+    their tiles in different orders. The fingerprint is computed over WORLD
+    coordinates precisely so that cannot matter -- only which tiles exist and
+    what is in them.
+    """
+    lv = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=TEST_CONSTS)
+    world = synth_world()
+    seen: list[tuple[int, int]] = []
+
+    def spy(x, y):
+        seen.append((x, y))
+        return world.get((x, y))
+
+    a = pipeline.superblock_inputs_fingerprint(spy, 0, 0, lv)
+    order_a = list(seen)
+    seen.clear()
+    # Same tiles, reversed delivery order, via a shuffled dict.
+    shuffled = dict(reversed(list(world.items())))
+    b = pipeline.superblock_inputs_fingerprint(
+        lambda x, y: shuffled.get((x, y)), 0, 0, lv
+    )
+    assert a == b
+    assert order_a  # the spy really was called
+    # A different superblock index is a different digest even over the same
+    # world, so the tag identifies a PLACE as well as a content.
+    assert pipeline.superblock_inputs_fingerprint(spy, 1, 0, lv) != a
+
+
+def test_the_fingerprint_chains_the_parent_level():
+    """Level 1 feeds level 0; a change up there must change the tag down here.
+
+    Otherwise a level-0 block could carry a fingerprint that says "unchanged"
+    while the inflow it received came from a parent built against a different
+    world -- exactly the silent case this is for.
+    """
+    lv = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=TEST_CONSTS)
+    world = synth_world()
+    fetch = lambda x, y: world.get((x, y))  # noqa: E731
+    bare = pipeline.superblock_inputs_fingerprint(fetch, 0, 0, lv)
+    with_p = pipeline.superblock_inputs_fingerprint(
+        fetch, 0, 0, lv, parent_fingerprint=b"\x11" * 16
+    )
+    other_p = pipeline.superblock_inputs_fingerprint(
+        fetch, 0, 0, lv, parent_fingerprint=b"\x22" * 16
+    )
+    assert len({bare, with_p, other_p}) == 3
+    # Length-prefixed, so an all-zero parent digest is not "no parent".
+    assert pipeline.superblock_inputs_fingerprint(
+        fetch, 0, 0, lv, parent_fingerprint=b"\x00" * 16
+    ) != bare
+
+
+def test_a_baked_tile_records_which_hydrology_it_used():
+    """Provenance has to reach the BakeResult or it cannot be logged per tile."""
+    lv = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=TEST_CONSTS)
+    world = synth_world()
+    world.pop((1, 1))
+    sb = pipeline.build_flow_superblock(
+        lambda x, y: world.get((x, y)), 0, 0, lv, kernels()
+    )
+    res = pipeline.bake_tile(
+        world_seed=5,
+        tile_x=0,
+        tile_y=0,
+        coarse_fetch=lambda x, y: world.get((x, y)),
+        kernels=kernels(),
+        geom=TEST_GEOM,
+        consts=TEST_CONSTS,
+        inflow_source=sb,
+    )
+    assert res.superblock_fingerprint == sb.fingerprint_hex
+    assert res.stats["superblock_missing_tiles"] == 1.0
+    assert res.stats["superblock_complete"] == 0.0
+
+    # No superblock at all is a STRONGER statement than "an incomplete one",
+    # so it must not read back as zero missing tiles.
+    bare = pipeline.bake_tile(
+        world_seed=5,
+        tile_x=0,
+        tile_y=0,
+        coarse_fetch=lambda x, y: world.get((x, y)),
+        kernels=kernels(),
+        geom=TEST_GEOM,
+        consts=TEST_CONSTS,
+    )
+    assert bare.superblock_fingerprint == ""
+    assert bare.stats["superblock_missing_tiles"] == -1.0
+    assert bare.stats["superblock_complete"] == 0.0
+
+
+def test_a_stale_superblock_is_caught_by_recomputing_the_fingerprint():
+    """The check pregen performs, at the level it performs it.
+
+    Build against an early world, cache it, let the world grow, then ask the
+    question a frontier bake asks: does this cached artifact still describe the
+    world we are in?
+    """
+    lv = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=TEST_CONSTS)
+    full = synth_world()
+    early = dict(full)
+    early.pop((1, 1))
+    cached = pipeline.build_flow_superblock(
+        lambda x, y: early.get((x, y)), 0, 0, lv, kernels()
+    )
+    blob = pipeline.encode_flow_superblock(cached, 99)
+    back, _ = pipeline.decode_flow_superblock(blob)
+    assert back.inputs_fingerprint == cached.inputs_fingerprint
+
+    now = pipeline.superblock_inputs_fingerprint(
+        lambda x, y: full.get((x, y)), 0, 0, lv
+    )
+    assert now != back.inputs_fingerprint  # stale, and detectably so
+    unchanged = pipeline.superblock_inputs_fingerprint(
+        lambda x, y: early.get((x, y)), 0, 0, lv
+    )
+    assert unchanged == back.inputs_fingerprint  # ...and no false positive
+
+
+def test_a_superblock_from_the_old_container_version_is_refused():
+    """A v1 blob has no fingerprint; reading it as zero would read as
+    'provenance unknown' everywhere and silently defeat the check."""
+    sb = pipeline.FlowSuperblock(
+        level=0, sx=0, sy=0, tiles_per_side=4, cell_m=30.0,
+        origin_m=(0.0, 0.0),
+        acc=np.zeros((4, 4), np.float32),
+        filled=np.zeros((4, 4), np.float32),
+    )
+    blob = bytearray(pipeline.encode_flow_superblock(sb, 1))
+    blob[4:6] = (1).to_bytes(2, "little")  # claim version 1
+    with pytest.raises(ValueError, match="unsupported flow superblock version 1"):
+        pipeline.decode_flow_superblock(bytes(blob))
 
 
 def test_inject_edge_inflow_is_conservative_and_finds_the_thalweg():
@@ -763,6 +989,91 @@ def test_flow_plane_clamps_the_log_field():
     acc = np.full((2, 2), 1e30, np.float32)
     p = pipeline.flow_plane(acc, np.zeros((2, 2), np.float32), np.zeros((2, 2), np.float32))
     assert (p & 0x1F).max() == 31
+
+
+def test_the_magnitude_gate_zeroes_hillslopes_and_only_hillslopes():
+    """The plane is 'mostly zeros' only if hillslope accumulation is not in it.
+
+    At 1.875 m/px every land cell has some upslope area, so bits 0-4 were a
+    dense field over the whole tile -- 5.75 MB of it on the alpine tile
+    against the format's '~5-10 KB' (FLOW_PLANE_SIZE). The gate drops the
+    magnitude below the channel-initiation area, and nowhere else: a channel
+    or its bank keeps its magnitude however small its own accumulation is,
+    because that is the number the consumer named in the format actually
+    wants.
+    """
+    c = pipeline.CONSTANTS
+    assert c.flow_mag_min_area_m2 > 0.0
+    # A lone hillslope cell, far from any channel.
+    acc = np.full((7, 7), 100.0, np.float32)
+    zero = np.zeros((7, 7), np.float32)
+    p = pipeline.flow_plane(acc, zero, zero, c)
+    assert (p == 0).all()
+
+    # ...and the same cell once it carries a channel's worth of area.
+    acc[3, 3] = 1e7
+    p = pipeline.flow_plane(acc, zero, zero, c)
+    assert p[3, 3] & 0x20 and (p[3, 3] & 0x1F) == 23  # log2(1e7)
+    assert p[2, 2] & 0x40                             # bank
+    assert (p[2, 2] & 0x1F) != 0                      # ...keeps its magnitude
+    assert p[0, 0] == 0                               # hillslope: still zero
+
+
+def test_disabling_the_magnitude_gate_reproduces_the_dense_field():
+    """0 must be an exact escape hatch, or the constant is not a knob."""
+    off = dataclasses.replace(pipeline.CONSTANTS, flow_mag_min_area_m2=0.0)
+    acc = np.full((5, 5), 100.0, np.float32)
+    zero = np.zeros((5, 5), np.float32)
+    p = pipeline.flow_plane(acc, zero, zero, off)
+    assert (p & 0x1F == 6).all()  # log2(100) = 6.64 -> 6, everywhere
+
+
+def test_the_channel_flag_tapers_with_the_same_smoothstep_as_incision():
+    """A flag the incision disagrees with describes a river not in the ground.
+
+    ``incise.stream_power`` fades incision out between sea level and the shelf
+    break; the flow plane must fade the channel flag over the same interval
+    and with the same curve, or a 3 km-deep seafloor keeps being labelled as
+    dendritic drainage that nothing cut.
+    """
+    incise = pytest.importorskip("terrain_service.bake.incise")
+    c = pipeline.CONSTANTS
+    z = np.linspace(-400.0, 200.0, 61, dtype=np.float32).reshape(1, -1)
+    acc = np.full(z.shape, 1e7, np.float32)
+    slope = np.full(z.shape, 0.2, np.float32)
+
+    ours = pipeline._sea_taper(z, c)
+    # Same taper, read off the real kernel: with the gate saturated and the cap
+    # slack, incision is exactly proportional to the taper.
+    theirs = incise.stream_power(
+        acc, slope, K=c.stream_K, m=c.stream_m, n=c.stream_n,
+        cap_m=1e9, a_crit_m2=0.0, elev_m=z,
+        sea_taper_top_m=c.sea_taper_top_m, sea_taper_bottom_m=c.sea_taper_bottom_m,
+    )
+    ref = incise.stream_power(
+        acc, slope, K=c.stream_K, m=c.stream_m, n=c.stream_n,
+        cap_m=1e9, a_crit_m2=0.0, elev_m=None,
+    )
+    np.testing.assert_allclose(theirs / ref, ours, rtol=1e-5, atol=1e-6)
+
+    # And the flag really does switch off with depth rather than at a step.
+    zero = np.zeros(z.shape, np.float32)
+    p = pipeline.flow_plane(acc, zero, zero, c, elev_m=z)
+    chan = (p & 0x20) != 0
+    assert chan[0, -1]                     # above sea level: a channel
+    assert not chan[0, 0]                  # below the shelf break: not one
+    # Monotone in depth -- no isolated on/off band along the coast.
+    assert (np.diff(chan[0].astype(np.int8)) >= 0).all()
+
+
+def test_the_sea_taper_on_flags_is_off_without_an_elevation_field():
+    """flow_plane must not silently invent a taper from nothing."""
+    c = pipeline.CONSTANTS
+    acc = np.full((4, 4), 1e7, np.float32)
+    zero = np.zeros((4, 4), np.float32)
+    assert ((pipeline.flow_plane(acc, zero, zero, c) & 0x20) != 0).all()
+    deep = np.full((4, 4), -3000.0, np.float32)
+    assert not ((pipeline.flow_plane(acc, zero, zero, c, elev_m=deep) & 0x20) != 0).any()
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +1211,22 @@ def test_pregen_bake_mode_refuses_cleanly_with_nothing_to_bake(tmp_path):
         "bake numerics" in r.stderr  # kernels absent (CI)
         or "no coarse tiles available" in r.stderr  # kernels present
     ), r.stderr
+
+
+def test_pregen_exposes_the_order_dependence_check_and_its_escape_hatch():
+    """The check is ON by default -- a residual you have to opt into seeing is
+    a residual nobody sees. Only the I/O cost is opt-out."""
+    import subprocess
+    import sys
+
+    r = subprocess.run(
+        [sys.executable, "-m", "terrain_service.pregen", "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0
+    assert "--bake-no-verify-superblocks" in r.stdout
+    assert "ORDER_DEPENDENCE" in r.stdout
 
 
 def test_pregen_coarse_mode_is_unchanged_by_the_new_flag(tmp_path):
