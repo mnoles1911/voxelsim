@@ -1,0 +1,69 @@
+WHAT TILES ACTUALLY EXIST, AND WHICH ONES ARE VALID — 2026-07-29
+=================================================================
+
+Written because a directory of 52 tiles was being treated as the validation
+corpus and every one of them is unusable. The tile-cache root is gitignored, so
+this inventory lives here instead.
+
+  provider                                            tiles  bytes each  verdict
+  terrain-diffusion-unlabeled-060b0c927ccc807e           27   1,572,889  VALID
+  terrain-diffusion-unlabeled-3e11cf157a836c70           25   1,572,889  VALID
+  terrain-diffusion-unlabeled-UNPINNED-UNVERIFIEDDATA-
+                                     27ac04bc8c6b7b7d    52     524,313  BROKEN
+
+A valid s1 tile is 1,572,889 bytes: 512x512 int16 over THREE channels
+(elevation + two climate channels) plus a 25-byte header. The 52 tiles in the
+UNPINNED directory are 524,313 bytes -- exactly one third, elevation only. They
+were written by the older `gen_world_tiles.py`, which omitted the climate
+channels. The fault does not surface at write time; it surfaces three steps
+later inside `bake_tile`, which is how a directory full of plausible-looking
+tiles came to exist. A `BROKEN-DO-NOT-USE.txt` marker now sits in that
+directory.
+
+Note what the naming convention did and did not do. `UNPINNED-UNVERIFIEDDATA`
+correctly announced that the identity was never pinned, and that marker worked
+exactly as designed. It says nothing about the bytes being short, because
+short-channel output is a different fault from unpinned provenance. Two
+independent things went wrong and only one of them was self-describing.
+
+THE VALID CORPUS, 52 tiles across two providers and four sites:
+
+  060b0c927ccc807e -- three scouted exemplar 3x3 blocks (a 3x3 ring is what the
+  fine bake's coarse dependency needs, which is why they were scouted in blocks):
+
+    class       tile      spawn (metres)      p50 grade
+    alpine      (-5,15)   -69120,238080       40.6%
+    plains      (-55,20)  -837120,314880       1.7%
+    "rolling"   (15,55)   238080,852480          --
+
+  The third is MISLABELLED. docs/terrain-validation-2026-07.md measured it and
+  it is not rolling country: every geomorphon fraction sits closer to our own
+  alpine tile than to Iowa. Treat it as a third distinct class, not as rolling.
+
+  3e11cf157a836c70 -- the original contiguous 5x5 region, tiles (-8..-4, 1..5).
+  This is the set the default spawn -84480,53760 (tile -6,3) lands in and the
+  one ue-project/Config/DefaultGame.ini points `DefaultTileDir` at.
+
+WHAT IS MISSING AND WHY IT STAYS MISSING FOR NOW. The scout also picked a fourth
+3x3 block at tiles (49..51, -6..-4) and sixteen scattered singles. Those
+coordinates exist only in the broken set, so those classes have no valid data.
+
+Regenerating them is not currently possible on this machine, and the reason is
+worth writing down rather than rediscovering: the only environment with torch is
+`D:\terrain-diffusion\.venv`, which carries torch 2.12.1+**cpu** and does not
+have `terrain_diffusion` installed at all. The GPU in this box is AMD, so the
+CUDA path is not merely unconfigured but unavailable, and ROCm has no Windows
+support. terrain-service/docs/diffusion-bringup.md puts the CPU inference path
+at hours per tile against 22.5 s on a 4090, so 25 tiles is days of wall clock,
+not an afternoon.
+
+Four sites across two providers is enough for the per-class work in flight. If a
+fifth class is ever needed, generate it where a CUDA GPU is available and use
+`tools/gen_world_tiles2.py` -- which writes all three channels and pins both
+`checkpoint_sha256` and `conditioning_digest` -- not the older generator.
+
+IDENTITY HAS ROLLED THREE TIMES, which is why there are three directories rather
+than one. `provider_id` folds in `_tile_format_fingerprint()`, so every change to
+`tile_codec.py` mints a new namespace by design. That is the mechanism working;
+the cost is that older caches strand. BAKE_VERSION 4 (the ridge-deficit
+composite, shipped 2026-07-29) rolls it again on the bake side.
