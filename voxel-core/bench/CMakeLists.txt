@@ -30,6 +30,16 @@ if(NOT MSVC)
   target_compile_options(vxc_climateprobe PRIVATE -Wall -Wextra -Werror)
 endif()
 
+# --- vxc_riverprobe: W3 channel-carving diagnostic. Network census, the
+# headwater-to-mouth long profile, centreline continuity, and the bank
+# containment check -- the numeric readout behind "there is a riverbed for
+# water to flow in". -------------------------------------------------------
+add_executable(vxc_riverprobe riverprobe.cpp)
+target_link_libraries(vxc_riverprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_riverprobe PRIVATE -Wall -Wextra -Werror)
+endif()
+
 # --- vxc_dump_biome_constants: prints biome.h's compile-time-derived
 # thresholds as plain integers, for hand-transcription into worldgen.ush's
 # mirror (HLSL has no climate.h). Hand-arithmetic is how a mirror drifts. -----
