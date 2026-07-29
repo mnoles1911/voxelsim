@@ -202,10 +202,17 @@ private:
 	// only on a transition.
 	void SetCaveRigActive(bool bActive);
 
-	// Unbound (whole-world) post-process whose ONLY overrides are the two
-	// auto-exposure brightness clamps. Setting min == max pins eye adaptation
-	// to a fixed EV100 instead of letting the histogram hunt for 18% grey in a
-	// scene that has no 18% grey in it. See the .cpp for the measurement.
+	// Unbound (whole-world) post-process whose ONLY overrides are the
+	// auto-exposure method and bias, pinning eye adaptation to a fixed stop
+	// instead of letting the histogram hunt for 18% grey in a scene that has no
+	// 18% grey in it. See the .cpp for the measurement.
+	//
+	// IT IS NOT THE ONLY UNBOUND EXPOSURE VOLUME ANY MORE. UVoxelSkySubsystem
+	// owns a second one (the day/night EV curve) and two unbound volumes fight
+	// silently -- highest Priority takes every field both override. The
+	// ownership rule between them is written out in full beside
+	// `CaveExposurePP->Priority = 100.f` in the .cpp, and again in
+	// VoxelSkySubsystem.cpp. Read one of them before touching either volume.
 	UPROPERTY(Transient)
 	TObjectPtr<class UPostProcessComponent> CaveExposurePP;
 

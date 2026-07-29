@@ -1,9 +1,34 @@
 # Voxel GI as a GPU volume texture — design
 
 Written 2026-07-25 from reading the light field, the GI subsystem, the pooled
-vertex factory and the D3D12 RHI. Design only; nothing here is implemented yet.
-`file:line` references were current at the time of writing and are worth
-re-checking before leaning on one.
+vertex factory and the D3D12 RHI. `file:line` references were current at the time
+of writing and are worth re-checking before leaning on one.
+
+> **STATUS, corrected 2026-07-29. This SHIPPED.** The header used to read *"Design
+> only; nothing here is implemented yet"*, which was true on the day it was
+> written and false from the first landed step. `VoxelGIVolume.h/.cpp` exist,
+> `VoxelQuadVertexFactory.ush` carries the `GIUVW` interpolant (`:55`) and samples
+> the volume per pixel with multi-step probe fallback, and `voxel.GI.Volume`
+> defaults to **1**. Steps 0, 1 and 2 of §7 are done and annotated in place.
+>
+> **It shipped as Scheme A, NOT the Scheme B this document recommends.** Two RGBA8
+> volumes, `VolumePos = (Vis[+X], Vis[+Y], Vis[+Z], v)` and `VolumeNeg =
+> (Vis[−X], Vis[−Y], Vis[−Z], v)` — two textures, still one sample per face, since
+> a face reads exactly one of them chosen by the sign of its normal
+> (`VoxelGIVolume.h:34-39`). Step 3 measured the choice and Scheme B lost: it
+> **missed this design's own RMS bar by 2.6×, and was worst on exactly the cave
+> walls the feature exists for**. §2's "Recommended default" for Scheme B is
+> therefore superseded by measurement — which is what §2 asked for. The
+> recommendation was wrong; the method that overturned it was the one this
+> document specified.
+>
+> **And it shipped at Dim 192, not N=256** — see §2's dimensions table, corrected
+> in place.
+>
+> Everything else here — the premultiplied-validity trick, the pool-space
+> precision rule, the row-pitch and upload constraints, the re-centring design,
+> the risks — held up and is still the reference. Read it as a design record with
+> known outcomes, not as a proposal.
 
 The point of this is **not** parity. Today a dig re-meshes a chunk partly just to
 refresh baked GI; the whole re-shade phase exists to push new irradiance into
@@ -89,9 +114,13 @@ feature exists for.
 
 Seven numbers (6 slots + validity) and no 7-channel format, so:
 
-- **Scheme A — 2 × RGBA8, 8 B/cell.** `(+X,+Y,+Z,v)` and `(−X,−Y,−Z,v)`,
-  premultiplied by validity. Bit-exact for any normal. Two samples.
-- **Scheme B — 1 × RGBA8, 4 B/cell. Recommended default.**
+- **Scheme A — 2 × RGBA8, 8 B/cell. ← THIS IS WHAT SHIPPED.** `(+X,+Y,+Z,v)` and
+  `(−X,−Y,−Z,v)`, premultiplied by validity. Bit-exact for any normal. Two
+  samples — and in practice **one**, because a face's normal sign selects exactly
+  one of the two textures (`VoxelGIVolume.h:34-39`), which this bullet
+  underestimated.
+- **Scheme B — 1 × RGBA8, 4 B/cell. ~~Recommended default.~~ Measured and
+  rejected** — 2.6× over the RMS bar below, worst on cave walls.
   `R = Vis[+Z]·v`, `G = Vis[−Z]·v`, `B = mean(±X,±Y)·v`, `A = v`. **Exact** for
   ±Z faces — the classes where directionality visually dominates — and the mean
   for the four horizontal classes. One sample, half the memory.
@@ -123,9 +152,28 @@ Cell = 40 UU, so `N³` covers `±N·20` UU.
 | 320 | ±6400 UU (= `FadeEndUU`) | 131.1 MB | 262.1 MB |
 | 352 | ±7040 UU (≈ `RadiusUU`) | 174.5 MB | 349.0 MB |
 
-**Recommended: N = 256, `PF_R8G8B8A8`, Scheme B → 67.1 MB.** Largest tier under
-the geometry pool's own 112 MB, and ±5120 UU is close enough to the existing
-fade that only a retune is needed (§7). Fallback N = 192 at 28.3 MB.
+**Recommended at the time: N = 256, `PF_R8G8B8A8`, Scheme B → 67.1 MB.** Largest
+tier under the geometry pool's own 112 MB, and ±5120 UU is close enough to the
+existing fade that only a retune is needed (§7). Fallback N = 192 at 28.3 MB.
+
+> **WHAT ACTUALLY SHIPPED: N = 192, Scheme A → 56.6 MB** (the 2×RGBA8 column of
+> the row above). `voxel.GI.VolumeDim` defaults to **192**, `ECVF_ReadOnly`,
+> clamped to [16,256] and rounded **down** to a multiple of 8 so the volume is a
+> whole number of bricks (`VoxelGIVolume.cpp:38-43,66-67`). So the fallback
+> dimension was taken and the recommended encoding was not — the encoding because
+> step 3 measured Scheme B as 2.6× over the RMS bar, the dimension because 192 is
+> where the Wave B Scheme A measurement was made and it covers ±3840 UU, enough
+> to judge by eye.
+>
+> **Two consequences worth carrying forward, because neither is in this table.**
+> First, there is an **equal-size CPU mirror** — `VolumeShadow` and
+> `VolumeShadowNeg` (`VoxelGI.h:254-261`), the bytes `voxel.GI.VolumeCheck`
+> compares against, so the real footprint is ~113 MB, not 56.6. Second, the
+> **usable reach is well under the half-extent**: the fade clamp of risk 8 (which
+> shipped, at `VoxelGI.cpp:970-986`) *slides* the band down to 1920–3520 UU at
+> Dim 192, so GI is at full strength only to 19.2 m and gone by 35.2 m against a
+> nominal ±38.4 m box. Any reach argument must use those numbers. See
+> `docs/lighting-weather-plan.md` §5.2, which derives them.
 
 **Full-coverage parity is not affordable — matching the 7000 UU build radius
 with the exact ambient cube is 349 MB. Say so and do not attempt it.**
@@ -438,10 +486,14 @@ Read `gpu-pool-rendering-notes.md` first. The ones that bite here:
 
 ## 9. Proposed cvars
 
+*Defaults below were the proposal. Two have since moved:* `voxel.GI.Volume` is
+**1** and `voxel.GI.VolumeDim` is **192** (`VoxelGIVolume.cpp:14-43`). The rest
+shipped as written.
+
 | Name | Default | Purpose |
 |---|---|---|
-| `voxel.GI.Volume` | 0 | master switch; prefer a `-VoxelGIVolume` switch for A/B |
-| `voxel.GI.VolumeDim` | 64 | per-axis texels, startup only. Rounded down to a multiple of 8 so the volume is a whole number of bricks. Still 64 from step 1's bring-up rather than the recommended 256; it is read-only, so set it with `-dpcvars=voxel.GI.VolumeDim=192` |
+| `voxel.GI.Volume` | ~~0~~ **1** | master switch; prefer a `-VoxelGIVolume` switch for A/B |
+| `voxel.GI.VolumeDim` | ~~64~~ **192** | per-axis texels, startup only. Clamped to [16,256] and rounded down to a multiple of 8 so the volume is a whole number of bricks. Read-only, so an override needs `-dpcvars=voxel.GI.VolumeDim=<n>` |
 | `voxel.GI.MaxBrickUploadsPerFrame` | 64 | replaces the chunk-refresh budget on the pooled path |
 | `voxel.GI.VolumeRecentreCells` | 64 | dead-zone half-width (step 4, not implemented) |
 | `voxel.GI.VolumeCheck` | 0 | numeric field-vs-volume equivalence harness. Non-zero arms it; the value is the sample count (1 = 4096). Runs once, re-armable by setting it back to 0 |

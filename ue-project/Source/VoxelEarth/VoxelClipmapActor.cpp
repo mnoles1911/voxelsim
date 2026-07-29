@@ -360,8 +360,53 @@ void AVoxelClipmapActor::EnsureCaveRig()
 	// because the gate is "is the camera under rock", which is a property of
 	// the camera and not of a region a designer could author.
 	CaveExposurePP->bUnbound = true;
-	// Above every default-priority volume, but the project ships none, so
-	// this is future-proofing rather than a fight anyone is having today.
+
+	// =======================================================================
+	// EXPOSURE OWNERSHIP RULE -- READ THIS BEFORE ADDING A THIRD VOLUME.
+	// (The same rule is written into VoxelSkySubsystem.cpp beside the other
+	// volume. If you change one copy, change both; they exist in duplicate
+	// precisely because whoever next touches either file will only read that
+	// one. The comment above this one used to say "the project ships none, so
+	// this is future-proofing rather than a fight anyone is having today" --
+	// that stopped being true when W5 landed, and this block replaces it.)
+	//
+	// Two UNBOUND post-process volumes that both override auto-exposure do not
+	// blend. For any setting BOTH override, the higher Priority wins outright
+	// and the loser's value vanishes -- no warning, no log line, no visual clue
+	// except that one of them stopped working. There are exactly two:
+	//
+	//   AVoxelClipmapActor::CaveExposurePP   Priority 100   conditional
+	//   UVoxelSkySubsystem::SkyExposurePP    Priority  10   always-on base
+	//
+	// THE RULE: the SKY volume is the BASE LAYER (it holds the day/night EV
+	// curve for the whole world, which is what makes a night frame render dark
+	// instead of being lifted to 18% grey by histogram adaptation -- the same
+	// mechanism this rig was built to defeat underground). THIS volume is a
+	// strictly MORE SPECIFIC override and therefore wins where it applies:
+	// under rock the sun's altitude is not an input to anything, because no
+	// daylight reaches the camera, so the sky curve has nothing to say and the
+	// +10 EV100 below is the only exposure number in this project backed by an
+	// actual A/B against a reference frame.
+	//
+	// WHY PRIORITY ORDERING AND NOT "THE SKY SUBSYSTEM OWNS BOTH". That was the
+	// alternative and it was rejected for two concrete reasons. (1) LIFETIME:
+	// this actor is suppressible (-VoxelNoClipmap) and its rig is built lazily
+	// on the first underground transition, so the sky must not depend on it and
+	// it must not depend on a subsystem that may be disabled. (2) PROVENANCE:
+	// folding +10 into the sky's curve would re-derive by taste a number
+	// arrived at by measurement (see CaveExposureEV100's declaration).
+	//
+	// THE INVARIANT A THIRD VOLUME MUST HOLD: override the SAME exposure fields
+	// these two do (AutoExposureMethod AND AutoExposureBias), or it will win the
+	// fields it overrides and silently inherit the rest from a lower-priority
+	// volume, producing a hybrid exposure matching neither. And declare its
+	// priority band in both of these comments.
+	//
+	// (The sky volume's clamped-auto mode additionally overrides the min/max
+	// brightness clamps, which this one does not. That is safe and not an
+	// exception: this volume wins AutoExposureMethod with AEM_Manual, and manual
+	// exposure ignores those clamps entirely.)
+	// =======================================================================
 	CaveExposurePP->Priority = 100.f;
 
 	// EXACTLY TWO overrides. Everything else -- bloom, colour grading, DOF,

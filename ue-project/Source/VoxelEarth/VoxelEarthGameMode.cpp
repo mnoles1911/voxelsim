@@ -1,10 +1,8 @@
 #include "VoxelEarthGameMode.h"
 
-#include "Components/DirectionalLightComponent.h"
-#include "Components/SkyAtmosphereComponent.h"
-#include "Components/SkyLightComponent.h"
-#include "Engine/DirectionalLight.h"
-#include "Engine/SkyLight.h"
+// The five light/sky includes that used to be here went with the rig (W4):
+// DirectionalLightComponent, SkyAtmosphereComponent, SkyLightComponent,
+// Engine/DirectionalLight and Engine/SkyLight are now VoxelSkySubsystem.cpp's.
 #include "Engine/World.h"
 #include "GameFramework/Controller.h"
 #include "GameFramework/PlayerController.h"
@@ -28,18 +26,6 @@
 
 namespace
 {
-// -VoxelSpawnAt=X,Y (meters, world): shared by RestartPlayer's pawn spawn
-// column AND BeginPlay's SkyAtmosphere placement (M2 task "SkyAtmosphere
-// origin fix" -- see BeginPlay) so both land on the EXACT same column and
-// can never drift apart. Returns false (Out* left at 0,0 UU) if the switch
-// is absent; true with parsed meters->UU values if present and well-formed.
-// Malformed input logs a warning and returns false (falls back to (0,0)).
-//
-// bShouldStopOnSeparator=false on the FParse::Value call below: its default
-// terminator set includes ',' (meant for stopping at the end of one
-// positional value in a list), which would truncate "X,Y" at the comma and
-// silently drop Y -- this switch's value is the whole "X,Y" pair, so read up
-// to the next whitespace instead.
 // -VoxelWaterWakeTest: runs the SAME basin/pour/dig/place/carve/collapse
 // sequence as -VoxelWaterMemoTest, but with every test-harness "nudge"
 // (SpawnWaterAt after each edit) SUPPRESSED. Those nudges only ever existed
@@ -57,6 +43,30 @@ bool IsWaterWakeTestMode()
 	       FParse::Param(FCommandLine::Get(), TEXT("VoxelWaterWakeTest"));
 }
 
+} // namespace
+
+// Declared in VoxelEarthGameMode.h (see that header for why it is no longer
+// file-local): UVoxelSkySubsystem::SpawnRig has to place the sky actors on the
+// EXACT same column the pawn spawns on, and the only way to guarantee that is
+// for both to call this one function. Definition left here, beside the other
+// command-line parsing, rather than moved to the sky file -- the switch is the
+// game mode's and only its second consumer is new.
+namespace VoxelEarthSpawn
+{
+// -VoxelSpawnAt=X,Y (meters, world): shared by RestartPlayer's pawn spawn
+// column AND UVoxelSkySubsystem::SpawnRig's placement of the SkyAtmosphere and
+// the SkyLight (M2 task "SkyAtmosphere origin fix"), so all of them land on the
+// EXACT same column and can never drift apart. Returns false (Out* left at
+// 0,0 UU) if the switch is absent; true with parsed meters->UU values if
+// present and well-formed. Malformed input logs a warning and returns false
+// (falls back to (0,0)).
+//
+// bShouldStopOnSeparator=false on the FParse::Value call below: its default
+// terminator set includes ',' (meant for stopping at the end of one
+// positional value in a list), which would truncate "X,Y" at the comma and
+// silently drop Y -- this switch's value is the whole "X,Y" pair, so read up
+// to the next whitespace instead. The same trap, with ':' instead of ',',
+// bites -VoxelTimeOfDay=HH:MM; see VoxelSkySubsystem.cpp's Initialize.
 bool ParseSpawnColumnUU(double& OutWorldX, double& OutWorldY)
 {
 	OutWorldX = 0.0;
@@ -79,7 +89,12 @@ bool ParseSpawnColumnUU(double& OutWorldX, double& OutWorldY)
 	OutWorldY = SpawnMetersY * 100.0;
 	return true;
 }
-} // namespace
+} // namespace VoxelEarthSpawn
+
+// Every pre-existing call site in this file says ParseSpawnColumnUU unqualified;
+// this keeps all of them compiling unchanged, so the diff that moved the light
+// rig does not also touch twenty unrelated fixtures.
+using VoxelEarthSpawn::ParseSpawnColumnUU;
 
 AVoxelEarthGameMode::AVoxelEarthGameMode()
 {
@@ -92,82 +107,38 @@ void AVoxelEarthGameMode::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// No authored map yet (Entry is empty): spawn the light rig from code so
-	// the voxel world is actually lit — sun + sky light + atmosphere.
+	// THE LIGHT RIG NO LONGER LIVES HERE (W4, docs/lighting-weather-plan.md).
+	//
+	// The DirectionalLight sun, the SkyLight and the SkyAtmosphere used to be
+	// spawned right here, statically posed at FRotator(-45, 30, 0) and Intensity
+	// 8. All of it MOVED, wholesale, into UVoxelSkySubsystem::SpawnRig, which
+	// also adds a second DirectionalLight for the moon and an exposure
+	// post-process; see VoxelSkySubsystem.h for the whole story.
+	//
+	// MOVED, NOT ADOPTED, and the choice was deliberate. Leaving the spawn here
+	// and having the subsystem find the actors afterwards would have made the
+	// driver's correctness depend on an actor-iteration order, on this BeginPlay
+	// having run first, and on nobody ever placing a second directional light --
+	// three invisible preconditions in exchange for leaving twenty lines where
+	// they were.
+	//
+	// TWO CONSEQUENCES FOR THIS FILE, both intentional. (1) -VoxelShadowCascades=
+	// is now parsed in VoxelSkySubsystem.cpp, unchanged and with its "the cvar
+	// route was tried and moved nothing" note intact -- it still has to be set on
+	// the light COMPONENT before the first shadow setup, never via
+	// r.Shadow.CSM.MaxCascades. (2) The sky rig now spawns on every net role that
+	// has a viewport rather than only on the authority, because a UWorldSubsystem's
+	// OnWorldBeginPlay runs everywhere while a GameMode's BeginPlay does not.
+	// That is a strict improvement (a dedicated-server client used to get no rig
+	// at all) but it is not the same as a REPLICATED sky -- see the scope note in
+	// VoxelSkySubsystem.h.
 	UWorld* World = GetWorld();
 	if (World)
 	{
-		ADirectionalLight* Sun = World->SpawnActor<ADirectionalLight>();
-		if (Sun)
-		{
-			Sun->SetActorRotation(FRotator(-45.f, 30.f, 0.f));
-			if (UDirectionalLightComponent* SunComp =
-			        Cast<UDirectionalLightComponent>(Sun->GetLightComponent()))
-			{
-				SunComp->SetIntensity(8.f);
-				SunComp->SetAtmosphereSunLight(true);
-				// -VoxelShadowCascades=<N>: the HONEST control for the shadow-
-				// gather cost. The 2026-07-27 draw-path diagnosis measured the
-				// shadow gathers at ~4 per camera gather, each submitting against
-				// the whole pool; the confirmation leg that tried to vary this
-				// with `r.Shadow.CSM.MaxCascades 1` via -ExecCmds moved NOTHING
-				// (the gather census stayed at 5/frame) -- the per-light property
-				// below is what actually governs, so the sweep has to set it
-				// here, at the light, before the first shadow setup. Latched;
-				// absent = engine default (unchanged behaviour).
-				{
-					int32 Cascades = 0;
-					if (FParse::Value(FCommandLine::Get(), TEXT("VoxelShadowCascades="), Cascades) && Cascades >= 0)
-					{
-						SunComp->DynamicShadowCascades = FMath::Clamp(Cascades, 0, 10);
-						SunComp->MarkRenderStateDirty();
-						UE_LOG(LogVoxelStream, Log,
-						       TEXT("VoxelShadowCascades override: sun DynamicShadowCascades=%d"),
-						       SunComp->DynamicShadowCascades);
-					}
-				}
-			}
-		}
-		if (ASkyLight* Sky = World->SpawnActor<ASkyLight>())
-		{
-			if (USkyLightComponent* SkyComp = Sky->GetLightComponent())
-			{
-				SkyComp->SetRealTimeCaptureEnabled(true);
-			}
-		}
-		if (AActor* Atmosphere = World->SpawnActor<AActor>())
-		{
-			USkyAtmosphereComponent* AtmosphereComp =
-				NewObject<USkyAtmosphereComponent>(Atmosphere);
-
-			// M2 task "SkyAtmosphere origin fix": the component's default
-			// TransformMode (PlanetTopAtAbsoluteWorldOrigin) hardcodes the
-			// planet's ground level at world (0,0,0). At a far LWC spawn
-			// (e.g. -VoxelSpawnAt=2000000,1500000 -- 20,000km out) the
-			// player is nowhere near that assumed ground level, so the
-			// atmosphere's horizon sphere (computed relative to the
-			// hardcoded origin) renders badly misplaced -- visible as a
-			// horizon-sphere artifact cutting across the sky (see the lwc
-			// verification runs this fix is checked against).
-			// PlanetTopAtComponentTransform instead makes the planet's
-			// ground level follow THIS component's own world transform, so
-			// placing the actor at the pawn's spawn column (below) keeps
-			// the horizon correct at any spawn offset, not just near-origin
-			// ones.
-			AtmosphereComp->TransformMode = ESkyAtmosphereTransformMode::PlanetTopAtComponentTransform;
-
-			AtmosphereComp->RegisterComponent();
-			Atmosphere->SetRootComponent(AtmosphereComp);
-
-			double SpawnColumnXUU = 0.0;
-			double SpawnColumnYUU = 0.0;
-			ParseSpawnColumnUU(SpawnColumnXUU, SpawnColumnYUU); // no-op (stays 0,0) if -VoxelSpawnAt is absent
-			Atmosphere->SetActorLocation(FVector(SpawnColumnXUU, SpawnColumnYUU, 0.0));
-		}
-
 		// Water track W1 (docs/voxel-earth-implementation-plan.md SS3.7 /
-		// SS4): same "no authored map, spawn from code" reasoning as the
-		// light rig above -- the ocean actor is editor-independent.
+		// SS4): same "no authored map (Entry is empty), so spawn from code"
+		// reasoning the light rig used before it moved out of this function --
+		// the ocean actor is editor-independent.
 		World->SpawnActor<AVoxelOceanActor>();
 
 		// M2 Band 3 first slice (docs/m2-plan.md): same "no authored map,
@@ -3913,10 +3884,10 @@ void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 	// overrides the spawn column with the same surface-height-query-plus-5m
 	// logic used for the default (0,0) column above, just evaluated at an
 	// arbitrary far-from-origin column. Default behavior (spawn at 0,0) is
-	// unchanged when the switch is absent. Parsing itself lives in the
-	// file-scope ParseSpawnColumnUU (shared with BeginPlay's SkyAtmosphere
-	// placement, M2 task "SkyAtmosphere origin fix") so the pawn and the
-	// atmosphere actor can never land on different columns.
+	// unchanged when the switch is absent. Parsing itself lives in
+	// VoxelEarthSpawn::ParseSpawnColumnUU (shared with UVoxelSkySubsystem::SpawnRig's
+	// placement of the SkyAtmosphere and SkyLight, M2 task "SkyAtmosphere origin
+	// fix") so the pawn and the sky actors can never land on different columns.
 	double SpawnWorldX = 0.0;
 	double SpawnWorldY = 0.0;
 	if (ParseSpawnColumnUU(SpawnWorldX, SpawnWorldY))

@@ -65,3 +65,9 @@ stage-dumps/
 # URL, window and sha256 needed to reproduce the cache byte-for-byte.
 terrain-service/data/earth_reference/cache/
 
+# NASA SVS sky-dome reference textures (star map + moon), fetched by
+# tools/fetch-sky-assets.ps1. 34-124 MB EXR/TIFF sources; provenance and
+# sha256 are recorded instead in
+# ue-project/Content/Voxel/TextureSource/SKY_ASSET_CREDITS.md.
+tools/sky-assets/
+
