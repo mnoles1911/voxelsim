@@ -751,7 +751,7 @@ VXC_TEST(rivernet_divert_channel_diff_replays_identically) {
     // keeps the default-constructed record a no-op.
     Digest before;
     replay.net.digest(before);
-    replay.net.applyGraphDiff(RiverDiffRecord{RiverDiffKind::kDivertChannel, 0, 0});
+    replay.net.applyGraphDiff(RiverDiffRecord{.kind = RiverDiffKind::kDivertChannel, .segId = 0, .value = 0});
     Digest after;
     replay.net.digest(after);
     CHECK_EQ(before.h, after.h);

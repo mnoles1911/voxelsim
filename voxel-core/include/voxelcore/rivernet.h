@@ -300,7 +300,14 @@ struct RiverDiffRecord {
     // (and therefore inert) divert diff by construction, which is what keeps
     // a default-constructed kDivertChannel record a no-op.
     uint32_t headNode = 0;
-    std::vector<RiverChannelPoint> course;
+    // The `{}` is load-bearing, not decoration. Every other member here has a
+    // default initializer; without one, gcc and clang raise
+    // -Werror=missing-field-initializers at EVERY brace-init that stops short
+    // of `course` -- including designated ones -- while MSVC stays silent, so
+    // the failure only ever appears in CI. Defaulting it here fixes all call
+    // sites at once instead of making each one name a field it does not care
+    // about.
+    std::vector<RiverChannelPoint> course{};
 
     friend bool operator==(const RiverDiffRecord&, const RiverDiffRecord&) = default;
 };
