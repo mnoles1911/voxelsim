@@ -1,4 +1,4 @@
-// Voxel mip chain tests (plan §3.2): index mapping, threshold/majority/
+﻿// Voxel mip chain tests (plan Â§3.2): index mapping, threshold/majority/
 // tie-break semantics, homogeneous fast paths, and a determinism golden over
 // a 2-level chain built from the amplifier (mirrors test_amplifier.cpp's
 // surface-brick lookup pattern).
@@ -174,10 +174,10 @@ VXC_TEST(mips_chain_determinism_golden) {
         d.u64(static_cast<uint32_t>(k.z));
         b->digest(d);
     }
-    // GOLDEN(mips_chain) — kWorldGenVersion 6: the coarse-to-fine detail
+    // GOLDEN(mips_chain) â€” kWorldGenVersion 6: the coarse-to-fine detail
     // rework. This chain is built from generated bricks, so it moves exactly
     // because amplifier_columns moves; the mip RULE itself (threshold,
     // majority, tie-break) is unchanged and its own tests still pass.
     // (was 0xE827A786195B8A73 at v3/v4/v5, 0xE4CF1B376622A38F at v2)
-    CHECK_EQ(d.h, 0xCE814219BEFCEA5Full);
+    CHECK_EQ(d.h, 0xED93807093662CADull);
 }

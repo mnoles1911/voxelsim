@@ -15,6 +15,8 @@
 
 #include "voxelcore/tilestore.h"
 
+#include "voxelcore/detail_bedding.h" // kBeddingMaxAbsMm, for the translation test
+
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
@@ -1208,14 +1210,30 @@ VXC_TEST(amplifier_over_fine_control_lattice_is_deterministic) {
             CHECK(ca.surfaceMm >= 100000 - 2409);
             CHECK(ca.surfaceMm <= 100000 + 2409);
 
-            // The lattice really drives the carrier, and exactly. Raising
-            // every control point by 500 LSB = 50 m moves the carrier by 50 m
-            // and nothing else: the gradient is still zero, so both detail
-            // bands are scaled identically and their world-position hashes are
-            // unchanged. Any interpolation error, unit slip or off-by-one in
-            // the lattice would show up here as a non-50000 difference.
+            // The lattice really drives the carrier. Raising every control
+            // point by 500 LSB = 50 m moves the carrier by exactly 50 m: the
+            // gradient is still zero, so both detail bands are scaled
+            // identically and their world-POSITION hashes are unchanged.
+            //
+            // v10 makes this an interval rather than an equality, and the
+            // reason is a real property of the terrain rather than a slackening
+            // of the test. The bedding term is a function of ABSOLUTE
+            // ELEVATION -- bedding planes are geological, they sit at fixed
+            // heights and the ground cuts through them -- so translating the
+            // whole surface up 50 m genuinely slides it through the beds and
+            // changes the outcrop pattern. That is the term working, not an
+            // error, and a test demanding exact translation invariance would be
+            // demanding that rock strata follow the terrain up and down.
+            //
+            // The residual is therefore bounded by the difference of two
+            // bedding samples, i.e. 2 * kBeddingMaxAbsMm = 640 mm. Everything
+            // else must still translate exactly, so this stays a sharp test of
+            // the lattice: an interpolation error, unit slip or off-by-one
+            // would blow straight through 640 mm.
             const ColumnSample ch = ampHigh.column(vx, vy);
-            CHECK_EQ(ch.surfaceMm - ca.surfaceMm, 50000);
+            const int64_t shift = int64_t(ch.surfaceMm) - int64_t(ca.surfaceMm);
+            CHECK(shift >= 50000 - 2 * kBeddingMaxAbsMm);
+            CHECK(shift <= 50000 + 2 * kBeddingMaxAbsMm);
         }
     }
     CHECK_EQ(digestA.h, digestB.h);
