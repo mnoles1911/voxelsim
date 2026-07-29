@@ -125,11 +125,24 @@ do it** — not "the effect was inside the noise", but the instrument returns a
 constant at this anchor (see below). A human reading `stat unit` is the
 measurement, not a fallback.
 
-If you have the machine to yourself, this takes ten minutes and settles it:
+If you have the machine to yourself, this takes ten minutes and settles it.
 
-1. Launch with `-VoxelFloodTest=70` once and note the pose it prints
-   (`VoxelFloodTest [lake/static] camera: ACTUAL (...)`). At the reference seed it
-   is `(42030, 21000, 96062) rot(pitch −25, yaw 0)`.
+**Use `-VoxelWaterParityTest` for this, not `-VoxelFloodTest`.** The cavern
+anchor cannot support the comparison at all: same-path repeat runs there differ
+by 20.4–87.7% of pixels at >8/255 against a pooled-vs-component 28.6–79.2%, so
+the ranges overlap completely in both directions. The variance is underground
+terrain-chunk residency, not the water (gotchas 3 and 4 below). The parity
+fixture removes that variable by posing on the **surface** and waiting for
+streaming to go quiet **before any water exists**, then pouring.
+
+1. Launch with `-VoxelWaterParityTest=25` once and note the pose it prints
+   (`VoxelWaterParityTest CAPTURE: pose (...)`). Check the terrain-poll lines
+   ended in `QUIET` — if the run warns that terrain never settled, raise the
+   delay and re-run, because that capture is measuring streaming. The run
+   self-quits 5 s after the shutter; if you ever see it linger, that is a
+   regression worth fixing rather than working around — an editor left alive
+   after the capture ran for 2h40m and burned 16,384 s of CPU, which blocks the
+   next fixture run and contaminates any timing taken beside it.
 2. `voxel.Water.GPU 0`, get to that pose, hold **completely still**, let it
    settle, read `stat unit` — Frame / Draw / GPU.
 3. Quit, `voxel.Water.GPU 1`, same pose, settle, read again.
@@ -159,6 +172,30 @@ depth** (looking along the lake at a shallow angle, or across a lower pool
 through the near shore), A/B `voxel.Water.GPU 0` and `1`. They should be
 indistinguishable. If they are not, the pool needs per-region sort keys before
 any of W5's fill-fraction shading, foam, caustics or refraction can land.
+
+**Run this one soon, and before depth tinting.** Stepped fill-fraction surfaces
+made fill drive *geometry only* — constant colour, constant 0.55 opacity, no
+refraction — so the single-sort-key argument still holds and this A/B still has
+a clean answer. Depth-tinted absorption is the change that retires it, and after
+that lands you can no longer tell a sort-key artifact from a shading one. This
+is the last cheap moment to find out whether one sort key was ever visible.
+
+### 4c. Stepped water surfaces (added with fill-fraction meshing)
+
+The visible deliverable of the meshing change. `-VoxelWaterParityTest=25`, or
+any pour via `voxel.SpawnWater`, then look at the pool edge:
+
+- The waterline should read as **discrete 10 cm steps**, not a flat slab that
+  pops in and out. Shallow rim cells sit visibly lower than the middle.
+- **No bathtub rim.** A partially-filled cell's side walls must shorten with its
+  surface. If pools are ringed by a one-voxel wall standing proud of the water,
+  the top-boundary flag (`VertexColor.B`) is not reaching the material — check
+  `WaterMode` is set on the pooled path.
+- A/B `voxel.Water.GPU 0` and `1` on the *same* pour: the two paths compute the
+  flag independently (`VoxelWaterChunkComponent.cpp` and `VoxelQuadDecode.ush`)
+  and must agree. Different geometry between the paths means they have drifted.
+- Water that is present but thin should now be **visible**. Under the old >=128
+  rule a brick at a uniform ~100 fill drew nothing at all.
 
 ## 5. Digging (optional but valuable)
 

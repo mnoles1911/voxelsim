@@ -68,9 +68,18 @@ struct FVertexFactoryIntermediates
 	FSceneDataIntermediates SceneData;
 };
 
-// Builds a tangent frame for an axis-aligned voxel face. The face normal is
-// one of the six axis directions, and the quad's own u/v axes are the other
-// two -- so the frame is exact, not approximated.
+// Builds a tangent frame for a voxel face. The quad's own u/v axes are two of
+// the three world axes, so for an axis-aligned normal the frame is exact rather
+// than approximated.
+//
+// The Gram-Schmidt below is for the ONE case where the normal is not axis
+// aligned: the top of a water surface quad, whose shading normal is tilted by
+// its four corner heights. Both dot products are EXACTLY zero for an
+// axis-aligned normal, so the subtraction is the identity there and every
+// terrain face gets back the frame it had before this existed, bit for bit.
+// Deliberately not re-normalised: the tilt is bounded by half a voxel of height
+// over a voxel of span, so the shortening is under a percent, and normalising
+// would perturb the axis-aligned case through rsqrt.
 half3x3 VoxelBuildTangentFrame(float3 Normal, uint Axis)
 {
 	const uint U = (Axis + 1u) % 3u;
@@ -80,6 +89,8 @@ half3x3 VoxelBuildTangentFrame(float3 Normal, uint Axis)
 	float3 Bitangent = float3(0.0f, 0.0f, 0.0f);
 	Tangent[U] = 1.0f;
 	Bitangent[V] = 1.0f;
+	Tangent -= Normal * dot(Normal, Tangent);
+	Bitangent -= Normal * dot(Normal, Bitangent);
 
 	half3x3 Frame;
 	Frame[0] = (half3)Tangent;
@@ -133,7 +144,22 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 		ChunkSurfaceZRelUU = Params.z;
 	}
 
-	const FVoxelQuadVertex Decoded = DecodeVoxelQuadVertex(Packed, CornerIndex, ChunkScale);
+	// PER-CORNER WATER SURFACE HEIGHTS, water pools only.
+	//
+	// A second SRV parallel to the quad pool, four bytes per quad, allocated only
+	// when this pool draws water (see UVoxelGpuPoolComponent::InitPool -- at
+	// terrain's capacity it would be hundreds of megabytes for a field terrain
+	// never reads). Terrain binds a same-typed dummy so the uniform buffer has no
+	// unbound member, which is a validation failure rather than a tolerated
+	// no-op, and the read is gated so the dummy is never actually touched.
+	uint PackedCorners = 0u;
+	if (VoxelVF.WaterMode != 0u)
+	{
+		PackedCorners = VoxelVF.QuadCornerHeights[QuadIndex];
+	}
+
+	const FVoxelQuadVertex Decoded = DecodeVoxelQuadVertexCore(
+		Packed, CornerIndex, ChunkScale, PackedCorners, VoxelVF.WaterMode != 0u);
 	Intermediates.Position = Decoded.PositionUU + ChunkOrigin;
 
 // TEMPORARY BISECT (VOXEL_VF_DEBUG_QUAD). Replaces all real geometry with one
@@ -177,7 +203,13 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 #endif
 
 	const uint Axis = Packed.x & 0xfu;
-	Intermediates.TangentToLocal = VoxelBuildTangentFrame(Decoded.Normal, Axis);
+	// ShadingNormal, not Normal: identical for terrain and for every water face
+	// except the top of a surface quad, which tilts with its four corner heights.
+	// Decoded.Normal stays the geometric face direction and is what the GI probe
+	// push-out below uses -- that one must step into the AIR CELL in front of the
+	// face, which is a question about which way the face points, not about how
+	// its top is shaded.
+	Intermediates.TangentToLocal = VoxelBuildTangentFrame(Decoded.ShadingNormal, Axis);
 	Intermediates.TangentToWorldSign = 1.0h;
 
 	// Matches the CPU path's vertex colour layout (BuildChunkVertexData):
@@ -232,10 +264,44 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	const float FaceTint = (Axis == 2u) ? ((QPositive != 0u) ? 1.0f : 0.0f)
 	                                    : (140.0f / 255.0f);
 
+	// WATER MODE overrides R entirely, and only R.
+	//
+	// Everything above this line is terrain's biome plumbing, which water has no
+	// use for: there is no biome, and the surface-height gate is meaningless for
+	// a water brick. What water needs in R is the CA fill fraction 0..255, which
+	// the water mesher's occupancy sampler writes into the quad's `mat` byte
+	// (UVoxelWaterSubsystem.cpp) precisely so it rides this existing encoding
+	// with no second decode path.
+	//
+	// This is what M_WaterVoxel's World Position Offset reads to seat each
+	// surface cell's top face at its own fill height. Without this branch the
+	// pooled path would hand it the biome flag -- 1.0 for every +Z face -- and
+	// every water surface would draw at full height, silently agreeing with the
+	// old >=128 behaviour while the component path showed the stepped surface.
+	//
+	// The component path needs no equivalent: FWaterChunkSceneProxy already
+	// writes the same byte into R directly.
+	// B likewise: terrain carries per-chunk climate there, water carries the
+	// per-vertex top-boundary flag the World Position Offset needs to lower a
+	// partial cell's surface without shearing its side walls. See
+	// FVoxelQuadVertex::TopBoundary.
+	//
+	// R IS NOW PER-CORNER, not per-face: Decoded.CornerHeight is this corner's
+	// own surface height within its cell, so a merged surface quad's top is a
+	// bilinear patch rather than a plateau and two neighbouring cells of
+	// different fill meet exactly instead of leaving an open slit between them.
+	// With no corner data the field falls back to MaterialId/255, which is the
+	// value this line read before -- so terrain and the decode test are
+	// unaffected in every path.
+	const bool bWater = (VoxelVF.WaterMode != 0u);
+	const float TerrainTintR = bNearSurface ? FaceTint : 0.0f;
+	const float ColorR = bWater ? Decoded.CornerHeight : TerrainTintR;
+	const float ColorB = bWater ? Decoded.TopBoundary : ChunkClimate.x;
+
 	Intermediates.Color = half4(
-		bNearSurface ? (half)FaceTint : 0.0h,
+		(half)ColorR,
 		(half)Decoded.AmbientOcclusion,
-		(half)ChunkClimate.x,
+		(half)ColorB,
 		(half)ChunkClimate.y);
 
 	// World-planar UVs on the face's two in-plane axes, matching the CPU
