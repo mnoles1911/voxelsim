@@ -128,22 +128,74 @@
 // -----------------------------------------------------------------------
 // RiverDiffRecord is the minimal, real, documented hook for what plan
 // §3.7 calls "hydrology graph = base (from seed) + persistent replicated
-// graph-diff log". v0 implements exactly one REAL diff kind
-// (kSetConveyance -- "a dam placed[, removed, or adjusted]"), which
-// applyGraphDiff() replays through the exact same setConveyance() path a
-// live caller would use, so replaying a log of these diffs against a
-// freshly-built network (same seed/tiles/bounds) reproduces byte-identical
-// state to whatever produced the diff live (see
-// tests/test_rivernet.cpp's replay test). kDivertChannel ("a sustained CA
-// flux promotes a new channel to a segment") is DOCUMENTED but
-// intentionally a no-op stub today: promoting a channel means synthesizing
-// a brand-new node/segment from live CA flux data this graph-only layer
-// does not have access to (that coupling is W3-proper, after waterca.h and
-// this header are wired together). Full network replication (sending
-// these diffs over the wire) is M3-water integration, later still --
-// this is only the local apply-side hook the plan calls for now.
+// graph-diff log". Both diff kinds the plan names are now REAL and
+// replayable through applyGraphDiff():
+//   * kSetConveyance -- "a dam placed[, removed, or adjusted]" -- dispatches
+//     to the exact same setConveyance() path a live caller would use.
+//   * kDivertChannel -- "a sustained CA flux promotes a new channel to a
+//     segment" -- dispatches to promoteChannel() (below). It carries the
+//     take-off node id AND the promoted COURSE (world-voxel positions +
+//     elevations), because the whole point of a diff log is that replay must
+//     not have to re-derive the course from live CA state that no longer
+//     exists. The course IS the decision; re-running the detector is not.
+// Replaying a log of these against a freshly-built network (same
+// seed/tiles/bounds) reproduces byte-identical state to whatever produced
+// the diffs live -- see tests/test_rivernet.cpp's dam replay test and
+// tests/test_rivercouple.cpp's promotion replay test. Full network
+// replication (sending these diffs over the wire) is M3-water integration,
+// later still -- this is only the local apply-side hook the plan calls for.
+// The DETECTOR that decides when to emit a kDivertChannel lives in
+// voxelcore/rivercouple.h (RiverCaCoupler), never here: this header stays
+// waterca-free by doctrine, exactly as it stays terrain-free.
+//
+// -----------------------------------------------------------------------
+// Bifurcation (a node with more than one outgoing segment)
+// -----------------------------------------------------------------------
+// buildFromFlowAccumulation still gives every node AT MOST ONE outgoing
+// segment, so a freshly built graph is the forest described above.
+// promoteChannel() is the ONLY thing that can ever give a node a second
+// outgoing segment, and it does so because that is what a diversion IS: the
+// main stem keeps running and a new channel leaves the same node.
+//
+// step()'s APPLY phase then splits a segment's outflow EVENLY across its
+// downstream node's outgoing segments (integer division; the remainder goes
+// one unit each to the first `outflow % n` targets in a fixed order --
+// primary first, then extras in promotion order, so the sum is exactly the
+// outflow and the split is order-independent). Evenly, NOT
+// conveyance-weighted, and that choice is load-bearing rather than lazy: a
+// dammed reach (conveyance 0) must keep RECEIVING inflow or the reservoir
+// behind the dam never fills and the "upstream stage rises" behaviour
+// documented above silently dies. Conveyance gates a reach's OUTflow only.
+// A cross-section-weighted split is the physically right answer and is
+// deferred until the coarse graph carries a channel width at all.
+//
+// The split is behind `extraOutgoing_.empty()`, so a graph that has never
+// been promoted runs byte-identical arithmetic to the pre-bifurcation
+// version -- which is why the pinned golden did NOT move at
+// kRiverNetVersion 3.
+//
+// -----------------------------------------------------------------------
+// The graph->CA hand-off (withdrawToCoupler / refundFromCoupler)
+// -----------------------------------------------------------------------
+// A river's DISCHARGE is a number; the water a player sees is WaterCA fill.
+// Turning the first into the second means units leaving this ledger, and
+// the only safe way to do that is to make the departure explicit rather
+// than to let a caller reach in and decrement `storage`. So there is a
+// third ledger term, totalWithdrawnToCoupler(), and the exact-integer
+// invariant that holds after ANY sequence of injectInflow/step/withdraw/
+// refund calls is
+//     totalStorage() + totalOutflowToOutlets() + totalWithdrawnToCoupler()
+//         == totalInjected()
+// refundFromCoupler() is the exact inverse of withdrawToCoupler() and
+// exists because the CA is allowed to REFUSE water (a full cell, a solid
+// cell). A coupler that could not give units back would have to either
+// destroy them or invent a private holding tank; giving them back to the
+// segment they came from is both exact and physically right -- a blocked
+// outfall back-pressures the reach, its storage rises, and that is the same
+// "stage rises" mechanism the dam already uses. See rivercouple.h.
 
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 #include "voxelcore/core.h"
@@ -157,7 +209,21 @@ namespace vxc {
 // v2: flow accumulation weights by rainfall in MM/YR rather than the raw
 // climate wire byte, so a river's catchment threshold means a physical
 // quantity instead of an artifact of the u8 encoding. See rivernet.cpp.
-inline constexpr uint32_t kRiverNetVersion = 2;
+//
+// v3 (W3-proper coupling): promoteChannel() can now add nodes/segments to a
+// live graph and give a node a SECOND outgoing segment, and
+// withdrawToCoupler()/refundFromCoupler() move units out of and back into
+// the storage ledger. NO GENERATION RULE AND NO ROUTING RULE CHANGED for a
+// graph that is never promoted and never withdrawn from: the pinned golden
+// (tests/test_rivernet.cpp, 0xEC84E0B592821C38) is BYTE-IDENTICAL to v2, and
+// the split arithmetic is behind an `extraOutgoing_.empty()` test that is
+// true for every graph buildFromFlowAccumulation can produce. This is a
+// version bump for the same reason kWaterCAVersion went to 4 with no tick
+// rule changed (see waterca.h): a LIVE world now evolves differently -- its
+// topology can grow -- so a persisted graph-diff log or a recorded session
+// from before this is no longer reproducible against it. Per
+// docs/determinism.md that divergence is exactly what the constant signals.
+inline constexpr uint32_t kRiverNetVersion = 3;
 
 // Default minimum accumulated rainfall, in mm/yr summed over the upstream
 // catchment, for a pixel to become a river node.
@@ -198,10 +264,29 @@ struct RegionBounds {
     int64_t px0 = 0, py0 = 0, px1 = 0, py1 = 0;
 };
 
+// Sea level in the doctrine's world units: voxel z == 0 (core.h). A node at
+// or below this elevation is AT THE SEA, and the coupler treats it as the
+// network's terminal sink (rivercouple.h). Kept here, next to RiverNode's
+// elevationMm, because "is this node in the ocean" is a graph question.
+inline constexpr int32_t kRiverSeaLevelMm = 0;
+
+// One point on a promoted channel's course: where it is, how high it is, and
+// (for the LAST point only) which existing node it lands on. World VOXEL
+// coords, matching RiverNode -- the detector works in voxels because that is
+// where the CA lives, and the graph must be able to replay the decision
+// without re-deriving it from a tile sampler.
+struct RiverChannelPoint {
+    int64_t vx = 0, vy = 0;
+    int32_t elevationMm = 0;
+    uint32_t existingNode = 0xFFFFFFFFu; // kNoNode unless this point IS an existing node
+
+    friend bool operator==(const RiverChannelPoint&, const RiverChannelPoint&) = default;
+};
+
 // Hydrology graph-diff kinds (see header comment "Hydrology graph-diff").
 enum class RiverDiffKind : uint8_t {
-    kSetConveyance = 0, // dam placed/removed/adjusted: segId + new conveyance value. REAL, replayable.
-    kDivertChannel = 1, // channel diversion promoting CA flux to a new segment. Documented STUB (no-op) today.
+    kSetConveyance = 0, // dam placed/removed/adjusted: segId + new conveyance value.
+    kDivertChannel = 1, // channel diversion: headNode + course. REAL since kRiverNetVersion 3.
 };
 
 struct RiverDiffRecord {
@@ -209,12 +294,21 @@ struct RiverDiffRecord {
     uint32_t segId = 0;
     uint8_t value = 255; // kSetConveyance: the new conveyance factor
 
+    // kDivertChannel only. `course` is empty for every kSetConveyance record,
+    // so the common case costs one empty vector -- the same trade EditLog
+    // makes for its variable-length payloads. An EMPTY course is a rejected
+    // (and therefore inert) divert diff by construction, which is what keeps
+    // a default-constructed kDivertChannel record a no-op.
+    uint32_t headNode = 0;
+    std::vector<RiverChannelPoint> course;
+
     friend bool operator==(const RiverDiffRecord&, const RiverDiffRecord&) = default;
 };
 
 class RiverNetwork {
 public:
     static constexpr uint32_t kNoSegment = 0xFFFFFFFFu;
+    static constexpr uint32_t kNoNode = 0xFFFFFFFFu;
 
     // v0 coarse generation (see header comment). Clears any previously
     // built graph and ledgers. accumThreshold is the minimum accumulated
@@ -246,20 +340,67 @@ public:
     // applyGraphDiff(kSetConveyance).
     void setConveyance(uint32_t segId, uint8_t factor0to255);
 
+    // --- The graph->CA hand-off (see header comment) ----------------------
+    //
+    // Removes up to `amount` units from `segId`'s storage and moves them OUT
+    // of this ledger into totalWithdrawnToCoupler(). Returns the amount
+    // ACTUALLY removed, which is less than `amount` exactly when the segment
+    // held less -- a caller keeping a two-sided ledger must use the return
+    // value, never the request (same contract as WaterCA::addWater).
+    int32_t withdrawToCoupler(uint32_t segId, int32_t amount);
+
+    // The exact inverse: puts `amount` units back into `segId`'s storage and
+    // out of totalWithdrawnToCoupler(). Clamped to what has actually been
+    // withdrawn, so no sequence of calls can invent units. Returns the amount
+    // actually refunded.
+    int32_t refundFromCoupler(uint32_t segId, int32_t amount);
+
+    // --- Channel promotion (kDivertChannel; see header comment) -----------
+    //
+    // Adds a new channel leaving EXISTING node `headNode` and running through
+    // `course` (strictly descending, downstream order). Every course point
+    // except the last must be a fresh position (existingNode == kNoNode); the
+    // last may name an existing node, which is how a diversion REJOINS the
+    // network. A course whose last point is fresh becomes a terminal node --
+    // an outlet, exactly like a basin sink, which is what a channel running
+    // to the sea is.
+    //
+    // Returns the id of the FIRST new segment (the take-off's new outflow),
+    // or kNoSegment if the request was rejected -- in which case NOTHING is
+    // mutated. Rejections, all of them conservative on purpose (a wrong
+    // promotion corrupts routing permanently; a missed one costs nothing):
+    //   * headNode out of range, or an empty course;
+    //   * a course point that is not STRICTLY lower than its predecessor
+    //     (segments are directed downhill by contract, and a flat or uphill
+    //     edge would let step() route water in a cycle);
+    //   * a non-final point naming an existing node, or any point naming an
+    //     out-of-range node;
+    //   * a duplicated position within the course, or a first point that
+    //     duplicates the head's EXISTING downstream node -- i.e. a "diversion"
+    //     that is really just the main stem again.
+    // Replayable via applyGraphDiff(kDivertChannel).
+    uint32_t promoteChannel(uint32_t headNode, const std::vector<RiverChannelPoint>& course);
+
+    // How many outgoing segments node `nodeId` has (1 for an ordinary node,
+    // 0 for an outlet, >1 only where promoteChannel made a bifurcation).
+    uint32_t outgoingSegmentCount(uint32_t nodeId) const;
+
     // One Muskingum-class routing tick over every segment (see header
     // comment "step() -- Muskingum-class storage routing"). dtMillis <= 0
     // is a no-op (every outflow computes to 0).
     void step(int64_t dtMillis);
 
     // Replays a hydrology graph-diff (see header comment). kSetConveyance
-    // is real (dispatches to setConveyance); kDivertChannel is a
-    // documented no-op stub today.
+    // dispatches to setConveyance; kDivertChannel dispatches to
+    // promoteChannel (and is inert for the default-constructed record, whose
+    // course is empty and therefore rejected).
     void applyGraphDiff(const RiverDiffRecord& diff);
 
     // --- Conservation ledger (see header comment) ---
     int64_t totalStorage() const { return totalStorage_; }
     int64_t totalInjected() const { return totalInjected_; }
     int64_t totalOutflowToOutlets() const { return totalOutflowToOutlets_; }
+    int64_t totalWithdrawnToCoupler() const { return totalWithdrawn_; }
     // Independent re-sum of every segment's storage, for cross-checking
     // totalStorage() (tests only; O(segments)).
     int64_t recomputeTotalStorage() const;
@@ -272,12 +413,22 @@ public:
 private:
     std::vector<RiverNode> nodes_;
     std::vector<RiverSegment> segments_;
-    std::vector<uint32_t> outgoingSegmentOfNode_; // nodeId -> segId or kNoSegment
+    std::vector<uint32_t> outgoingSegmentOfNode_; // nodeId -> PRIMARY segId or kNoSegment
+
+    // Outgoing segments BEYOND the primary, for the bifurcations
+    // promoteChannel creates. EMPTY for every graph buildFromFlowAccumulation
+    // can produce, which is what keeps step()'s hot loop (and the golden)
+    // exactly what it was -- see the header's "Bifurcation" note. Looked up
+    // by key only, never iterated, so the unordered_map's own bucket order is
+    // not observable; each value vector is in promotion order.
+    std::unordered_map<uint32_t, std::vector<uint32_t>> extraOutgoing_;
+
     uint64_t seed_ = 0; // stored for provenance / future hash-based generation refinements; the D8+accumulation math itself is purely elevation/precip-driven and needs no hashing today
 
     int64_t totalStorage_ = 0;
     int64_t totalInjected_ = 0;
     int64_t totalOutflowToOutlets_ = 0;
+    int64_t totalWithdrawn_ = 0;
 };
 
 } // namespace vxc

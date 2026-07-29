@@ -24,6 +24,12 @@
 // Nothing in voxel-core changed to make that possible; the header was always
 // callable, it was only ever waiting on ADR-0004 item 3.
 #include "voxelcore/swe.h"
+// W3 river network + its coupling to the CA (plan S3.7 Layer R). Same story
+// swe.h had one milestone ago: rivernet.h/rivercouple.h shipped complete,
+// tested and golden-pinned but unreferenced by the engine, and this file is
+// where that stops being true. Nothing in voxel-core changed to allow it.
+#include "voxelcore/rivercouple.h"
+#include "voxelcore/rivernet.h"
 #include "voxelcore/tiles.h"
 #include "voxelcore/waterca.h"
 
@@ -413,6 +419,51 @@ struct FVoxelWaterImpl
 	// centre on) says so once rather than once per frame for the whole session.
 	bool bSweRefusalLogged = false;
 	double SweLastStatusWorldSeconds = -1000.0;
+
+	// --- W3 rivers (voxel.Water.Rivers, plan S3.7 Layer R) ------------------
+	//
+	// Null unless armed, exactly like the SWE pair above and for exactly the
+	// same reason: an unarmed run allocates nothing and branches once per fixed
+	// step on a null pointer, so rivercouple.h's own "a total no-op when
+	// disabled" claim survives all the way out to the engine.
+	//
+	// DECLARATION ORDER IS LOAD-BEARING a third time: RiverCaCoupler holds
+	// RiverNetwork&, WaterCA& and ITileSampler&, so the network must outlive the
+	// coupler and both must outlive nothing else here. Coupler last == coupler
+	// destroyed first.
+	std::unique_ptr<vxc::RiverNetwork> Rivers;
+	std::unique_ptr<vxc::RiverCaCoupler> RiverCoupler;
+
+	// Per-segment baseflow injected every river tick, captured at BUILD time.
+	//
+	// It has to be captured, not read live: RiverSegment::discharge means the
+	// build-time catchment estimate before the first step() and the routed
+	// outflow after it (rivernet.h says so explicitly), so reading it live
+	// after the first tick would make the rain that falls on a catchment depend
+	// on how much water happens to be in the reach -- a feedback loop, not a
+	// climate.
+	//
+	// Scaled DOWN from the raw catchment accumulation by kRiverBaseflowShift.
+	// The raw value is a sum of mm/yr over every upstream pixel and reaches
+	// tens of millions on a trunk reach; injecting that unscaled would (a)
+	// overflow RiverSegment's int32 storage inside an hour behind a dam and
+	// (b) ask the coupler for orders of magnitude more fill than
+	// maxFillPerSegmentPerTick will ever hand over, so the surplus would just
+	// pile up unspendably. The shift puts a trunk reach at roughly the coupler's
+	// own per-tick ceiling, which is the only rate that can actually be
+	// consumed.
+	std::vector<int32_t> RiverBaseflow;
+
+	// ~1 Hz cadence (plan S3.7: "segment graph ticks ~1Hz server-side"), driven
+	// off world time inside StepFixed rather than off a second accumulator in
+	// Tick -- the same idiom SweLastStatusWorldSeconds already uses, and it puts
+	// the river's CA injection inside the fixed step where the SWE conservation
+	// ledger can see it as an external injection rather than as a leak.
+	static constexpr double RiverStepSeconds = 1.0;
+	double RiverLastTickWorldSeconds = -1000.0;
+	double RiverLastStatusWorldSeconds = -1000.0;
+	int64 RiverPromotions = 0;
+	bool bRiverRefusalLogged = false;
 };
 
 namespace
@@ -2918,6 +2969,188 @@ void MaybeArmSwe(FVoxelWaterImpl& Impl, UWorld* World)
 // One fixed 10Hz step: Reservoir v0 top-up, then vxc::WaterCA::step(),
 // folding the CA's own post-step active set into the dirty-for-remesh /
 // dirty-for-replication sets (task items 2 & 3).
+// --- W3 rivers (voxel.Water.Rivers, plan S3.7 Layer R) ----------------------
+//
+// HOW BIG A REGION, AND WHY IT IS BUILT ONCE. rivernet.h's generation is a D8
+// flow accumulation over an inclusive TILE-PIXEL rectangle, and a pixel is 30 m
+// -- so 48x48 pixels is a 1.44 km square, big enough to hold a whole small
+// catchment and its outlet and cheap enough to build in one frame (2,304 pixel
+// samples plus one sort). It is built ONCE, around the arming anchor, and is
+// not re-centred as the player walks: a rebuild would reset every segment's
+// storage and discard every promotion, which is a far worse artefact than a
+// river that stops at the edge of the region it was built for. Re-centring
+// needs an incremental generation pass and the diff log persisted first; both
+// are follow-ups, and this v0 is the same shape as the SWE sheet's own single
+// dense region.
+//
+// The region edge is not a special case in the graph: rivernet.h's D8 never
+// samples an out-of-bounds neighbour, so a pixel whose true downhill path would
+// leave the region simply becomes a terminal outlet -- the graph drains to the
+// region's low edge with no code for it.
+constexpr int64 kRiverRegionPixels = 48;
+
+// Divides the raw catchment accumulation to get a per-tick baseflow. See
+// FVoxelWaterImpl::RiverBaseflow for why the raw number cannot be used.
+constexpr int64 kRiverBaseflowDivisor = 256;
+constexpr int64 kRiverBaseflowMax = 65536;
+
+// Constructs (or tears down) the river graph + coupler to match
+// voxel.Water.Rivers. Called once per Tick, before the fixed-step loop, for the
+// same reason MaybeArmSwe is: an arm/disarm lands on a clean step boundary.
+void MaybeArmRivers(FVoxelWaterImpl& Impl, UWorld* World)
+{
+	const bool bWant = VoxelDebug::GetWaterRivers();
+	const bool bArmed = Impl.RiverCoupler != nullptr;
+
+	if (!bWant)
+	{
+		Impl.bRiverRefusalLogged = false;
+		if (bArmed)
+		{
+			// DISARM IS A PLAIN DELETE HERE, unlike voxel.Water.SWE's disarm,
+			// which has to flush the sheet back into the CA first. The
+			// difference is the coupling's direction: every unit this coupler
+			// ever took out of the graph is ALREADY in the CA (or ledgered as
+			// gone to sea), and what remains in the graph is segment storage --
+			// a routing state variable at tile scale, not water anybody can see
+			// or swim in. Dropping it destroys no visible water. What it does
+			// destroy is the routing history and any promotions, which is
+			// exactly what "the graph is not persisted yet" already means.
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("voxel.Water.Rivers 0: river graph disarmed (%u segments, %lld promotions, %lld graph units ")
+			       TEXT("delivered to the CA, %lld to the ocean). Water already handed to the CA stays; the graph's ")
+			       TEXT("own routing state does not persist."),
+			       Impl.Rivers ? Impl.Rivers->segmentCount() : 0u, (long long)Impl.RiverPromotions,
+			       (long long)Impl.RiverCoupler->graphUnitsToCA(),
+			       (long long)Impl.RiverCoupler->graphUnitsToOcean());
+			Impl.RiverCoupler.reset();
+			Impl.Rivers.reset();
+			Impl.RiverBaseflow.clear();
+		}
+		return;
+	}
+
+	if (bArmed)
+	{
+		return;
+	}
+
+	// --- the net-mode gate ------------------------------------------------
+	//
+	// NM_Client only, deliberately NOT narrowed to NM_Standalone the way
+	// MaybeArmSwe is. ADR-0004 item 3 refuses the SWE coupler on a networked
+	// world because that coupler holds simulation state a client must SEE
+	// (sheet depth is drawn water) and none of it replicates. This coupler
+	// holds no such state: its only client-visible output is WaterCA fill,
+	// which already replicates through BroadcastWaterDiffs, and the graph is
+	// server-side bookkeeping a client never reads. So a listen or dedicated
+	// server may run it and its clients mirror the resulting water exactly as
+	// they mirror a pour. A client running its own would be simulating on top
+	// of a mirror, which is the thing every other write path here refuses.
+	const ENetMode NetMode = World ? World->GetNetMode() : NM_Standalone;
+	if (NetMode == NM_Client)
+	{
+		if (!Impl.bRiverRefusalLogged)
+		{
+			Impl.bRiverRefusalLogged = true;
+			UE_LOG(LogVoxelWater, Warning,
+			       TEXT("voxel.Water.Rivers REFUSED on NM_Client: rivers tick server-side (plan S3.7 Layer R, ")
+			       TEXT("'segment graph ticks ~1Hz server-side'). A client mirrors the resulting water through the ")
+			       TEXT("existing water-diff channel and must not simulate its own."));
+		}
+		return;
+	}
+
+	// --- where to build it -------------------------------------------------
+	// The player's viewpoint, not the CA's centroid: a river network has to
+	// exist BEFORE there is any water to take a centroid of, which is the
+	// opposite of the SWE sheet's situation.
+	int64 AnchorVx = 0, AnchorVy = 0;
+	bool bHaveAnchor = false;
+	if (APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr)
+	{
+		FVector ViewUU = FVector::ZeroVector;
+		FRotator UnusedRot = FRotator::ZeroRotator;
+		PC->GetPlayerViewPoint(ViewUU, UnusedRot);
+		const VoxelCoords::FVoxelCoord Vc = VoxelCoords::WorldToVoxel(ViewUU);
+		AnchorVx = Vc.X;
+		AnchorVy = Vc.Y;
+		bHaveAnchor = true;
+	}
+	if (!bHaveAnchor)
+	{
+		if (!Impl.bRiverRefusalLogged)
+		{
+			Impl.bRiverRefusalLogged = true;
+			UE_LOG(LogVoxelWater, Warning,
+			       TEXT("voxel.Water.Rivers: no player controller to anchor the graph on yet. Retrying every frame."));
+		}
+		return;
+	}
+
+	const double ArmStartSeconds = FPlatformTime::Seconds();
+
+	const int64 PixelSizeMm = int64(Impl.Tiles.pixelSizeMm());
+	const int64 AnchorPx = vxc::floorDiv(AnchorVx * int64(vxc::kVoxelSizeMm), PixelSizeMm);
+	const int64 AnchorPy = vxc::floorDiv(AnchorVy * int64(vxc::kVoxelSizeMm), PixelSizeMm);
+	vxc::RegionBounds Bounds;
+	Bounds.px0 = AnchorPx - kRiverRegionPixels / 2;
+	Bounds.py0 = AnchorPy - kRiverRegionPixels / 2;
+	Bounds.px1 = Bounds.px0 + kRiverRegionPixels - 1;
+	Bounds.py1 = Bounds.py0 + kRiverRegionPixels - 1;
+
+	Impl.Rivers = std::make_unique<vxc::RiverNetwork>();
+	Impl.Rivers->buildFromFlowAccumulation(Impl.Tiles, Impl.Terrain.GetSeed(), Bounds);
+
+	const uint32 SegCount = Impl.Rivers->segmentCount();
+	if (SegCount == 0)
+	{
+		// A flat or uniformly-dry 1.44 km square genuinely has no river in it.
+		// Say so once and stop retrying every frame against the same terrain,
+		// but leave the graph null so walking somewhere else and re-arming works.
+		Impl.Rivers.reset();
+		if (!Impl.bRiverRefusalLogged)
+		{
+			Impl.bRiverRefusalLogged = true;
+			UE_LOG(LogVoxelWater, Warning,
+			       TEXT("voxel.Water.Rivers: no segments crossed the catchment threshold in the %lldx%lld-pixel ")
+			       TEXT("region around voxel (%lld,%lld) -- this terrain has no river here. Toggle the cvar off and ")
+			       TEXT("on somewhere wetter."),
+			       (long long)kRiverRegionPixels, (long long)kRiverRegionPixels, (long long)AnchorVx,
+			       (long long)AnchorVy);
+		}
+		return;
+	}
+
+	Impl.RiverBaseflow.assign(SegCount, 0);
+	for (uint32 S = 0; S < SegCount; ++S)
+	{
+		const int64 Raw = int64(Impl.Rivers->segments()[S].discharge); // build-time catchment estimate
+		Impl.RiverBaseflow[S] = int32_t(vxc::clampi64(Raw / kRiverBaseflowDivisor, 1, kRiverBaseflowMax));
+	}
+
+	vxc::RiverCoupleConfig Cfg;
+	Cfg.enabled = true;
+	// Everything else stays at rivercouple.h's documented defaults on purpose:
+	// they are derived there against real units (a 30 m pixel, a 10 cm voxel, a
+	// 1 Hz tick), and re-deciding them here would put two sources of truth on
+	// numbers whose derivations are written down in exactly one place.
+	Impl.RiverCoupler = std::make_unique<vxc::RiverCaCoupler>(*Impl.Rivers, Impl.CA, Impl.Tiles,
+	                                                          Impl.Mob.makeSolidFn(), Cfg);
+	Impl.RiverLastTickWorldSeconds = -1000.0;
+	Impl.RiverLastStatusWorldSeconds = -1000.0;
+	Impl.RiverPromotions = 0;
+	Impl.bRiverRefusalLogged = false;
+
+	UE_LOG(LogVoxelWater, Log,
+	       TEXT("voxel.Water.Rivers 1: built a %lldx%lld-pixel (%lld m) river graph around voxel (%lld,%lld): ")
+	       TEXT("%d nodes, %u segments, in %.2f ms. Ticking at 1 Hz; the ocean (voxel z=0) is the sink."),
+	       (long long)kRiverRegionPixels, (long long)kRiverRegionPixels,
+	       (long long)(kRiverRegionPixels * PixelSizeMm / 1000), (long long)AnchorVx, (long long)AnchorVy,
+	       int32(Impl.Rivers->nodes().size()), SegCount,
+	       (FPlatformTime::Seconds() - ArmStartSeconds) * 1000.0);
+}
+
 void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 {
 	// ADR-0003 item 4: re-check the cvar every fixed step (cheap -- a bool
@@ -2950,6 +3183,101 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 	if (Impl.Mob.advanceFront(Impl.CA) > 0)
 	{
 		MarkMobilizedBricksDirty(Impl);
+	}
+
+	// --- W3: the river network's ~1 Hz tick (plan S3.7 Layer R) ------------
+	//
+	// PLACED HERE -- with the reservoir top-up and the mobilizer front, and
+	// BEFORE the coupled SWE window below -- for exactly the reason that
+	// window's own comment gives: every injection into the CA has to happen
+	// OUTSIDE it, or the ADR-0004 ledger cannot tell an injection from a leak.
+	// The river coupler is an injector (discharge becomes fill), so it belongs
+	// on this side of the line, and the `Before - SweLastCoupledTotal` fold-in
+	// below then accounts for it automatically with no river-specific
+	// bookkeeping at all.
+	//
+	// ~1 Hz off world time rather than every fixed step, because that is the
+	// cadence plan S3.7 specifies for Layer R, it is what rivernet.h's
+	// Muskingum travel-time constants were derived against, and it means the
+	// promotion detector's sampling cost (rivercouple.h section 4: a hard
+	// budget of order 10^5 hashed CA probes per pass, independent of how big
+	// the graph is) is paid once a second instead of ten times.
+	if (Impl.RiverCoupler && Impl.Rivers &&
+	    NowWorldSeconds - Impl.RiverLastTickWorldSeconds >= FVoxelWaterImpl::RiverStepSeconds)
+	{
+		Impl.RiverLastTickWorldSeconds = NowWorldSeconds;
+
+		// Baseflow: rain on every reach's own catchment, every tick. Only the
+		// segments that existed at BUILD time are fed this way -- a promoted
+		// channel deliberately gets nothing, because it is fed by the
+		// bifurcation split at its take-off node (rivernet.h "Bifurcation"),
+		// and giving it a catchment of its own as well would invent water.
+		const uint32 FedSegments = FMath::Min(Impl.Rivers->segmentCount(), uint32(Impl.RiverBaseflow.size()));
+		for (uint32 S = 0; S < FedSegments; ++S)
+		{
+			Impl.Rivers->injectInflow(S, Impl.RiverBaseflow[S]);
+		}
+
+		Impl.Rivers->step(int64_t(FVoxelWaterImpl::RiverStepSeconds * 1000.0));
+		Impl.RiverCoupler->step();
+
+		// Re-mesh what the coupler actually wrote. The CA's own changed-brick
+		// diff further down would catch these eventually, but only after the
+		// NEXT ca.step(), which is a frame of visibly absent water at every
+		// outfall once a second -- and the reservoir top-up directly above
+		// already establishes the rule that an injector dirties its own columns.
+		for (const vxc::RiverOutfallWrite& W : Impl.RiverCoupler->lastOutfallWrites())
+		{
+			MarkColumnDirty(Impl, W.vx, W.vy, W.vz, W.placed);
+		}
+
+		// Promotions are TOPOLOGY, not water. The diffs are the persistence /
+		// replication feed rivernet.h's graph-diff log describes; nothing
+		// consumes them on disk yet, so drain and count them rather than let the
+		// queue grow unbounded across a session -- and log each one, because a
+		// promotion permanently re-routes a river and should never be silent.
+		const std::vector<vxc::RiverDiffRecord> Diffs = Impl.RiverCoupler->takePendingDiffs();
+		Impl.RiverPromotions += int64(Diffs.size());
+		for (const vxc::RiverDiffRecord& D : Diffs)
+		{
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("voxel.Water.Rivers: PROMOTED a channel from node %u over %d pixels (kDivertChannel). ")
+			       TEXT("Sustained CA flux down a course that was not a segment is now one; the take-off node ")
+			       TEXT("bifurcates and its inflow splits evenly. NOT PERSISTED -- this is lost on reload."),
+			       D.headNode, int32(D.course.size()));
+		}
+
+		// 0.2 Hz status. Deliberately slower than the river tick itself, so this
+		// is a heartbeat rather than a transcript.
+		if (NowWorldSeconds - Impl.RiverLastStatusWorldSeconds >= 5.0)
+		{
+			Impl.RiverLastStatusWorldSeconds = NowWorldSeconds;
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("RiverPerf: segments=%u storage=%lld outlets=%lld toCA=%lld toOcean=%lld refunded=%lld ")
+			       TEXT("caFill=%lld candidates=%d bestDwell=%d promotions=%lld injected=%lld"),
+			       Impl.Rivers->segmentCount(), (long long)Impl.Rivers->totalStorage(),
+			       (long long)Impl.Rivers->totalOutflowToOutlets(),
+			       (long long)Impl.RiverCoupler->graphUnitsToCA(),
+			       (long long)Impl.RiverCoupler->graphUnitsToOcean(),
+			       (long long)Impl.RiverCoupler->graphUnitsRefunded(),
+			       (long long)Impl.RiverCoupler->fillDeliveredToCA(),
+			       Impl.RiverCoupler->trackedCandidateCount(), Impl.RiverCoupler->bestCandidateDwell(),
+			       (long long)Impl.RiverPromotions, (long long)Impl.Rivers->totalInjected());
+
+			// The graph's own four-way ledger, checked live for the same reason
+			// the SWE one is: rivercouple.h's tests cover the coupler, and
+			// nothing covers the wiring in THIS file that decides what to inject.
+			const int64_t Closed = Impl.Rivers->totalStorage() + Impl.Rivers->totalOutflowToOutlets() +
+			                       Impl.Rivers->totalWithdrawnToCoupler();
+			if (Closed != Impl.Rivers->totalInjected())
+			{
+				UE_LOG(LogVoxelWater, Error,
+				       TEXT("voxel.Water.Rivers ledger FAILED: storage+outlets+withdrawn=%lld, injected=%lld, ")
+				       TEXT("delta=%+lld"),
+				       (long long)Closed, (long long)Impl.Rivers->totalInjected(),
+				       (long long)(Closed - Impl.Rivers->totalInjected()));
+			}
+		}
 	}
 
 	// --- W4: the coupled shallow-water half of the step (ADR-0004) ---------
@@ -3191,6 +3519,10 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 		// break the conservation ledger's before/after pairing for that tick.
 		// Cheap when nothing changed: two bool reads and a pointer compare.
 		MaybeArmSwe(*Impl, World);
+
+		// W3 (plan S3.7 Layer R): same placement, same reason -- an arm or a
+		// disarm must not land between the river tick and the CA step.
+		MaybeArmRivers(*Impl, World);
 
 		Impl->TickAccumSeconds += DeltaTime;
 		const double NowWorldSeconds = World ? World->GetTimeSeconds() : 0.0;

@@ -19,6 +19,7 @@ add_executable(vxc_tests
   test_connectivity.cpp
   test_collapse.cpp
   test_rivernet.cpp
+  test_rivercouple.cpp
   test_pathfind.cpp
   test_regiongraph.cpp
   test_caves.cpp
