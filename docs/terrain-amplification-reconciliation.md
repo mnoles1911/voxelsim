@@ -1,7 +1,16 @@
 # Terrain amplification proposal vs ADR-0006 — reconciliation
 
-**Status:** analysis only. The proposal is **PARKED** behind ADR-0006 by Matt's
-decision (2026-07-24). Nothing here is scheduled work.
+**Status:** analysis only. The proposal was **PARKED** behind ADR-0006 by Matt's
+decision (2026-07-24).
+
+> **SUPERSEDED 2026-07-28 — read `docs/terrain-amplification-plan.md` instead.**
+> That plan unparks this work. All three collisions recorded below (integer
+> mirror cost, O(1) random access, granularity) dissolve once §6's geomorphic
+> passes move off the client and into the **server-side tile bake**: baked bytes
+> need no HLSL mirror, no fixed-point rewrite, and no relaxation at query time.
+> The "Networked constraint" objection is resolved the same way — the baked fine
+> tier becomes a hard dependency, never a progressive enhancement. The analysis
+> below is still accurate and still worth reading; only the verdict changed.
 
 **Source:** `docs/research/terrain-amplification-design-doc.md` (copied into the
 repo so it is not stranded outside it). Section numbers below refer to that doc.
