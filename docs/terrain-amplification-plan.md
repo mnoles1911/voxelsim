@@ -1023,7 +1023,13 @@ GPU-hours for CPU work. That is a real, measured failure mode, but it is about a
 
 Separately, and on a genuinely GPU-less dev box (`torch 2.12.1+cpu`, onnxruntime CPU-only, no
 `nvidia-smi`), **CPU diffusion inference was measured at ~179 s/tile** for a 512² native tile — one
-cold tile on roughly 8 threads. That contradicts "hours per tile" by roughly an order of magnitude
+cold tile on roughly 8 threads, 2026-07-29, seed 20260729 at native origin (0,0), reproduce with
+`terrain-service/tools/gen_reference_tile.py --allow-cpu` (which prints the per-tile figure; it must
+be run with cwd `D:\terrain-diffusion`, because `synthetic_map.py` opens `data/global/` by relative
+path). **Treat it as a single cold measurement, not a benchmark** — it is one tile, on one box, on a
+shared machine, and nothing in this repo pins it the way the K-calibration numbers are pinned in
+`incise.py`'s docstring. It is quoted here because it changes a *conclusion*, not because it is a
+precise number: re-measure before costing anything on it. That contradicts "hours per tile" by roughly an order of magnitude
 for the diffusion model itself, though it says nothing about the *bake*, which is a separate CPU
 cost (`pipeline.py`'s measured ~165 CPU-s/tile at production scale, open risk #1) that would stack
 on top of it in an unbounded Tier B. **This directly affects the claim two paragraphs up** ("there
