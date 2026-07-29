@@ -1148,7 +1148,11 @@ bool Amplifier::surfaceBoundsMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t v
     // THE CONTROL GRID. The cells the columns fall in are cx0..cx1; a cubic
     // B-spline on cell c reads control points c-1..c+2, so the grid the bound
     // must see is dilated by one on the low side and two on the high side. That
-    // dilation is why kSurfaceBoundMaxCornersPerAxis had to grow in v9.
+    // dilation is why kSurfaceBoundMaxCornersPerAxis had to grow in v9; the
+    // PIXEL SIZE is why it had to grow again for the 1.875 m fine tier. Both
+    // derivations live on the constant in amplifier.h -- note that nx/ny below
+    // are bounded by the footprint, not by the cap, so the cap's value costs
+    // nothing until it is the thing that declines.
     const int64_t cx0 = floorDiv(x0Mm, pxMm), cx1 = floorDiv(x1Mm, pxMm);
     const int64_t cy0 = floorDiv(y0Mm, pxMm), cy1 = floorDiv(y1Mm, pxMm);
     const int64_t px0 = cx0 - 1, py0 = cy0 - 1;
