@@ -296,6 +296,22 @@ class BakeConstants:
     #: 0 = ONE field for the whole world, which is the only exactly seamless
     #: choice available through a scalar seed. See ``roughness_seed``.
     noise_anchor_pitch_fine_px: int = 0
+    #: B1 constructional term (``noise.roughness``'s crest-up folded octaves,
+    #: gated to gentle ground). 0 disables and reproduces the prior surface
+    #: bit-for-bit. Units: multiples of the substrate reference amplitude per
+    #: octave. See the ridge-deficit investigation: gentle real landscapes get
+    #: their fine-scale ridge/knoll relief from CONSTRUCTIONAL processes
+    #: (till knolls, hummocky moraine), which fBm cannot supply (symmetric, no
+    #: crests) and which incision must not supply either (a plain's erosion is
+    #: sub-metre by construction).
+    b1_constructional_amp: float = 0.0
+    #: Regional (carrier) slope below which the constructional term is at full
+    #: strength, and at/above which it is zero, with a linear fade between.
+    #: Steep ground is erosional: its ridges must be interfluves left by the
+    #: incision passes, and folded noise there reads as crumpled paper with
+    #: drainage-uncorrelated ridges (measured; see noise.roughness).
+    b1_constructional_slope_lo: float = 0.10
+    b1_constructional_slope_hi: float = 0.30
 
     # -- B2 flow + incision ------------------------------------------------
     #: MFD exponent. D8 for the AREA field gives dead-straight 45-degree
@@ -386,6 +402,14 @@ class BakeConstants:
     #: missing uplift term -- erosion energy follows regional relief -- and it
     #: is what keeps a plain a plain while the mountains re-grade. 0 disables.
     profile_regional_s_ref: float = 0.2
+    #: Exponent of the regional-energy factor. 0 = use ``stream_n`` (the prior
+    #: behaviour). Above ``stream_n`` it sharpens the gentle/steep separation:
+    #: at n = 0.8 a till plain keeps 22% of the erosion energy, which under a
+    #: dense channel network (low ``channel_init_area_m2``) trenches it
+    #: (measured 2.03 -> 3.59 deg mean slope at 1.875 m against a real 2.13);
+    #: at 2.0 it keeps 2.3% and the same network carves sub-metre swales.
+    #: Ground at or above ``profile_regional_s_ref`` is unaffected.
+    profile_regional_p: float = 0.0
     #: Channel-initiation area, m^2. Without it ``K*A^m*S^n`` incises every cell
     #: that has any upslope area, which at 1.875 m/px is every cell in the tile:
     #: measured 77.6% of the domain incised past one voxel at K=0.03 and 98.6%
@@ -488,11 +512,30 @@ class BakeConstants:
                 f"profile_regional_s_ref must be >= 0 (0 disables), got "
                 f"{self.profile_regional_s_ref}"
             )
+        if self.profile_regional_p < 0.0:
+            raise ValueError(
+                f"profile_regional_p must be >= 0 (0 = use stream_n), got "
+                f"{self.profile_regional_p}"
+            )
+        if self.b1_constructional_amp < 0.0:
+            raise ValueError(
+                f"b1_constructional_amp must be >= 0 (0 disables), got "
+                f"{self.b1_constructional_amp}"
+            )
+        if not 0.0 <= self.b1_constructional_slope_lo < self.b1_constructional_slope_hi:
+            raise ValueError(
+                "need 0 <= b1_constructional_slope_lo < "
+                f"b1_constructional_slope_hi, got "
+                f"{self.b1_constructional_slope_lo}, {self.b1_constructional_slope_hi}"
+            )
 
     def as_payload(self) -> dict:
         return {
             "src_nyquist_m": self.src_nyquist_m,
             "noise_anchor_pitch_fine_px": self.noise_anchor_pitch_fine_px,
+            "b1_constructional_amp": self.b1_constructional_amp,
+            "b1_constructional_slope_lo": self.b1_constructional_slope_lo,
+            "b1_constructional_slope_hi": self.b1_constructional_slope_hi,
             "mfd_p": self.mfd_p,
             "flat_eps": self.flat_eps,
             "stream_K": self.stream_K,
@@ -502,6 +545,7 @@ class BakeConstants:
             "incision_mode": self.incision_mode,
             "profile_K_dt": self.profile_K_dt,
             "profile_regional_s_ref": self.profile_regional_s_ref,
+            "profile_regional_p": self.profile_regional_p,
             "channel_init_area_m2": self.channel_init_area_m2,
             "channel_init_q": self.channel_init_q,
             "sea_taper_top_m": self.sea_taper_top_m,
@@ -1876,6 +1920,16 @@ def bake_padded_domain(
     origin_kw = roughness_origin_kwarg(kernels.roughness)
     if origin_kw is None:
         raise RuntimeError(_ROUGHNESS_NO_ORIGIN)
+    # The constructional kwargs are forwarded only when the term is ON, so a
+    # test double written against the plain five-argument form keeps working
+    # and an amp of 0 exercises the identical call the prior bake made.
+    constructional_kwargs = {}
+    if consts.b1_constructional_amp > 0.0:
+        constructional_kwargs = {
+            "constructional_amp": consts.b1_constructional_amp,
+            "constructional_slope_lo": consts.b1_constructional_slope_lo,
+            "constructional_slope_hi": consts.b1_constructional_slope_hi,
+        }
     delta = np.asarray(
         kernels.roughness(
             fine,
@@ -1884,6 +1938,7 @@ def bake_padded_domain(
             seed,
             src_nyquist_m=consts.src_nyquist_m,
             **{origin_kw: origin_cells},
+            **constructional_kwargs,
         ),
         dtype=np.float32,
     )
@@ -1974,6 +2029,12 @@ def bake_padded_domain(
             if rs.shape[1] < w_f:
                 regional[:, rs.shape[1]:] = regional[:, rs.shape[1] - 1: rs.shape[1]]
             del cb, gyc, gxc, rs
+        # regional_p forwarded only when set, for the same test-double reason
+        # as the constructional kwargs above; 0 means "use stream_n".
+        regional_p_kwargs = (
+            {"regional_p": consts.profile_regional_p}
+            if consts.profile_regional_p > 0.0 else {}
+        )
         eroded = np.asarray(
             kernels.profile_incision(
                 filled,
@@ -1990,6 +2051,7 @@ def bake_padded_domain(
                 regional_s_ref=consts.profile_regional_s_ref,
                 sea_taper_top_m=consts.sea_taper_top_m,
                 sea_taper_bottom_m=consts.sea_taper_bottom_m,
+                **regional_p_kwargs,
             ),
             dtype=np.float32,
         )

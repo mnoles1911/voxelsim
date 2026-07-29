@@ -313,6 +313,7 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
                      m: float = 0.45, n: float = 0.8, cap_m: float = 25.0,
                      a_crit_m2: float = A_CRIT_M2, gate_q: float = GATE_Q,
                      regional_slope=None, regional_s_ref: float = 0.2,
+                     regional_p: float = 0.0,
                      sea_taper_top_m: float = SEA_TAPER_TOP_M,
                      sea_taper_bottom_m: float = SEA_TAPER_BOTTOM_M) -> np.ndarray:
     """Eroded surface in **metres** -- the implicit stream-power step.
@@ -333,6 +334,17 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
                 do not: K_dt = 15 uncapped measured 679 m of incision on the
                 alpine exemplar. The structural guarantee z >= z_rcv makes a
                 shaft impossible but not a canyon.
+    `regional_p`  exponent of the regional-energy factor: ``min(1, S_reg /
+                regional_s_ref) ** regional_p``. 0 (the default) falls back to
+                ``n``, which reproduces the prior behaviour exactly. Values
+                above ``n`` SHARPEN the class separation: at n = 0.8 a till
+                plain (S_reg ~ 0.03, s_ref 0.2) keeps 22% of the erosion
+                energy — enough that a dense channel network trenches it and
+                triples its mean slope (measured: a_crit 625 m^2 took the
+                plains exemplar 2.03 -> 3.59 deg at 1.875 m against a real
+                2.13) — while at p = 2 it keeps 2.3%, and the same dense
+                network carves sub-metre swales instead. Steep ground
+                (S_reg >= s_ref) is unaffected at any p.
     `regional_slope` OPTIONAL 30 m-scale slope of the CARRIER (not the
                 per-cell fine slope -- that variant double-counts S and is
                 refuted, see the note below). When given, the erodibility is
@@ -389,14 +401,17 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
     # Working arrays are float32/int32 on purpose -- see _profile_pass.
     af = np.clip(a, 0.0, None)
     kfac = (np.float64(K_dt) * np.power(af, np.float64(m)))
+    if regional_p < 0.0:
+        raise ValueError(f"regional_p must be >= 0 (0 = use n), got {regional_p}")
     if regional_slope is not None:
         sreg = np.asarray(regional_slope, dtype=np.float64)
         if sreg.shape != z.shape:
             raise ValueError(f"regional_slope {sreg.shape} must match filled {z.shape}")
         if regional_s_ref <= 0.0:
             raise ValueError(f"regional_s_ref must be positive, got {regional_s_ref}")
+        p_exp = regional_p if regional_p > 0.0 else n
         kfac *= np.minimum(1.0, np.clip(sreg, 0.0, None) / np.float64(regional_s_ref)
-                           ) ** np.float64(n)
+                           ) ** np.float64(p_exp)
     if a_crit_m2 > 0.0:
         aq = np.power(af, np.float64(gate_q))
         kfac *= aq / (aq + np.float64(a_crit_m2) ** np.float64(gate_q))

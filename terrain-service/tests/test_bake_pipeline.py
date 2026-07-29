@@ -1205,7 +1205,11 @@ def test_every_bake_constant_rolls_the_fingerprint():
     base = pipeline.bake_fingerprint()
     seen = {base}
     # Alternatives that still satisfy BakeConstants' own validation.
-    valid_alt = {"thermal_rate": 0.25, "flat_eps": 1e-6, "incision_mode": "profile"}
+    valid_alt = {"thermal_rate": 0.25, "flat_eps": 1e-6, "incision_mode": "profile",
+                 # +0.5 would put slope_lo above slope_hi, which validation
+                 # (correctly) refuses; use in-range alternatives instead.
+                 "b1_constructional_slope_lo": 0.05,
+                 "b1_constructional_slope_hi": 0.25}
     for fld in dataclasses.fields(BakeConstants):
         cur = getattr(pipeline.CONSTANTS, fld.name)
         if fld.name in valid_alt:
