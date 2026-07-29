@@ -54,3 +54,53 @@ tile repaired by tools/reencode_elevation_only_tiles.py. Elevation is copied
 byte-for-byte so every number above is unaffected, but no material, biome or
 topsoil figure may be quoted off these tiles. The plains row here is tile
 (-56,20), a 90.7%-land neighbour of the (-55,20) exemplar, not the exemplar.
+
+FINE TIER (.vxtl v2, 1.875 m/px, BAKE_VERSION 4), THREE CLASSES
+---------------------------------------------------------------
+Measurable only after terrainprobe's --fine-dir was fixed to bind the whole run
+rather than just the calibration block (58f00e2). `config.pixel_size` reads 1875
+and `band.fine_tier_table` reads 1 in every run below.
+
+  class              carrier sinks/stranded/path      amplified sinks/stranded/path
+  plains   ( 1.7%)   14095 / 89.0% /  19.1 m           9036 / 97.3% /  3.7 m
+  third    (24.6%)      11 / 59.5% / 123.8 m           1620 / 94.2% / 15.9 m
+  alpine   (40.6%)       0 /  0.0% / 216.6 m           1761 / 93.1% / 15.5 m
+
+TWO THINGS HERE CHANGE THE FIX.
+
+1. THE FINE TIER IS THE HARDER CASE, not the easier one. Alpine amplified goes
+   87.9% stranded on the coarse tier to 93.1% here, with the mean flow path
+   halving from 28.9 m to 15.5 m. Deleting the 25.6 m and 6.4 m octaves buys
+   nothing because {3200, 900} restores comparable gradient, and the carrier now
+   carries real 1.875 m structure for the detail to fight at closer wavelengths.
+   Any hope that shipping the fine tier fixes sub-30 m realism on its own is dead.
+
+2. THE FLOOR'S JUSTIFICATION IS TIER-SPECIFIC, which was not visible before.
+   On the coarse tier sampled at 10 cm, a 1.7% plain's carrier is undrainable
+   (99.0% stranded, 4 cm paths) and the detail band IMPROVES it to 97.5% and
+   35 cm -- so a cap with no floor would remove the only thing helping. On the
+   FINE tier the same plain's carrier drains: 19.1 m paths, because
+   BAKE_VERSION 4 carves sub-metre swales on plains (profile_regional_p = 2.0),
+   and the detail band then DEGRADES it to 97.3% and 3.7 m.
+
+   So the detail helps flat ground only where the carrier has nothing at that
+   scale. Where the bake supplies sub-metre structure, the client's job is to
+   stay out of its way. That is the plan's "complement, do not add" principle
+   arriving as a measurement instead of an intention, and it means the cap should
+   bite at every class on a fine world while sparing flat ground on a coarse one.
+
+CODEC AND SIZE, from the same three bakes. Control points reproduce the bake's
+own surface well inside the 100 mm quantum in every case -- mean |e| 14.96 mm
+(plains), 12.21 (third), 12.79 (alpine); max 50.48, 50.43, 50.48. So the fine
+tier is not a source of error in anything above.
+
+Size is consistently over the plan's model, which settles its open risk 2:
+
+  class     measured zstd   plan's model   over
+  plains     74.0 KB/km2     29 KB/km2     2.6x
+  third     180.4 KB/km2     44 KB/km2     4.1x   (plan's "rolling/dissected")
+  alpine    153.3 KB/km2     61 KB/km2     2.5x
+
+At ~200 MB CODEC_RAW per tile before compression, and 37-44 MB compressed against
+the 8 MB planning number, the storage and prefetch arithmetic in the plan's
+production section needs redoing before it is quoted again.
