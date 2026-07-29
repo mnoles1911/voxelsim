@@ -1,0 +1,2236 @@
+{
+  "schema": "voxelsim.earth_reference/1",
+  "generated_utc": "2026-07-29T16:53:25Z",
+  "generator": "terrain-service/tools/earth_reference.py",
+  "purpose": "Reference distributions of real Earth topography, one or more site per geomorphic class our worldgen produces, for statistical validation of 30 m -> 10 cm terrain amplification. Rasters are NOT committed; rebuild with `python tools/earth_reference.py build` (needs rasterio).",
+  "method": {
+    "projection": {
+      "copernicus_primary_grid": "aeqd30",
+      "copernicus_primary_note": "Copernicus tiles are geographic (EPSG:4326) so pixel ground size varies with latitude and is NOT square -- at lat 46 a 1-arcsec post is ~21.5 m east-west by ~30.9 m north-south. Each 20 km analysis window is REPROJECTED into a local azimuthal-equidistant CRS centred on the site at exactly 30.0 m square pixels (bilinear), which is the same pixel geometry as a 30 m game tile. Distances through an AEQD centre are true, so slopes are metric and comparable.",
+      "copernicus_crosscheck_grid": "native_ground",
+      "copernicus_crosscheck_note": "Every site ALSO reports Horn slope computed with no resampling at all, on the native geographic posts, using per-row WGS84 ground distances (dx = dlon * m_per_deg_lon(lat), dy = dlat * m_per_deg_lat(lat)). Two independent routes to a metric slope; a disagreement of more than a few percent means one of them is broken. The ratio is recorded per site.",
+      "usgs_grid": "utm_native",
+      "usgs_note": "3DEP 1 m arrives in NAD83 / UTM metres at 1 m square, so it is used as delivered. UTM scale distortion across a 2 km window is under 0.1%."
+    },
+    "voids_and_water": {
+      "void_floor_m": -100.0,
+      "policy": "Masked BEFORE reprojection so nodata cannot be interpolated into real ground: the file's declared nodata, any non-finite value, and anything at or below -100 m (no site in the corpus has real terrain below sea level). For Copernicus ONLY, elevation exactly 0.0 is also masked -- GLO-30 stores open water that way, and leaving it in turns a sound into a perfectly flat plain and halves every slope statistic. 3DEP does not get the zero rule (NAVD88 land can legitimately be 0.000); its water is hydro-flattened to a constant instead, which `flat_fraction` exposes.",
+      "propagation": "Horn's 3x3 estimator is computed with NaN, so any output cell whose neighbourhood touched a void or an array edge is itself NaN and is excluded from every percentile. A void can therefore never contribute a spurious cliff.",
+      "reported_per_site": [
+        "nodata_fraction",
+        "sea_or_zero_fraction",
+        "masked_fraction",
+        "valid_fraction",
+        "flat_fraction"
+      ]
+    },
+    "statistics": {
+      "slope_estimator": "Horn (1981) 3x3, degrees -- the same estimator gdaldem uses",
+      "relief_m": "both full max-min and the outlier-robust p99-p1",
+      "detrended_rms_m": "RMS residual after removing the best-fit plane; scale-free roughness",
+      "slope_by_scale": "slope recomputed after NaN-aware block-averaging to coarser posts (cop30: 30/60/120/240 m; 3DEP: 1/3/10/30 m). This is the roll-off curve an amplifier has to reproduce: how fast slope decays as you coarsen tells you the roughness spectrum without needing an FFT.",
+      "dsm_vs_dtm_at_30m": "measured, not assumed. Copernicus (DSM) is re-read over the EXACT 2 km footprint of the cached 3DEP window and the 3DEP DTM is block-averaged 30x, so both are the same ground at the same posting; the ratio is canopy and buildings. Do NOT compare the two whole-site blocks directly -- their windows are 20 km and 2 km and the difference between them is mostly landscape, not sensor.",
+      "above_cliff_gate_fraction": "fraction of the site steeper than 35 deg, the kBiomeCliffGradePercent threshold in voxel-core/include/voxelcore/biome.h -- i.e. how much of this real landscape our classifier would call BARE_ROCK",
+      "windows": {
+        "cop30_km": 20.0,
+        "usgs_m": 2048,
+        "note": "Windows are square and centred on the site. 20 km at 30 m is ~445k posts; 2 km at 1 m is ~4.2M posts. Both are cut small enough to hold ONE landform rather than a 1-degree grab bag."
+      }
+    }
+  },
+  "sources": {
+    "cop30": {
+      "name": "Copernicus DEM GLO-30",
+      "model_type": "DSM",
+      "resolution": "1 arc-second (~30 m)",
+      "crs": "EPSG:4326",
+      "coverage": "global",
+      "access": "anonymous HTTPS on S3, no credentials",
+      "url_pattern": "https://copernicus-dem-30m.s3.amazonaws.com/<TILE>/<TILE>.tif  (TILE = Copernicus_DSM_COG_10_{N|S}dd_00_{E|W}ddd_00_DEM)",
+      "fetch": "whole 1x1 deg tile (~40 MB), resumable via HTTP Range, verified against Content-Length and sha256, then the last block is read to catch a truncated-but-openable GeoTIFF",
+      "caveat": "DSM: includes vegetation and buildings, which inflates fine-scale roughness. See cop30_dsm_bias per site."
+    },
+    "usgs_3dep_1m": {
+      "name": "USGS 3DEP 1 m DEM",
+      "model_type": "DTM (bare earth)",
+      "resolution": "1 m",
+      "crs": "NAD83 / UTM (per project)",
+      "coverage": "CONUS only, project by project",
+      "access": "anonymous HTTPS on S3, no credentials -- VERIFIED. Listing, HEAD and GDAL /vsicurl/ range reads all work unauthenticated.",
+      "url_pattern": "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1m/Projects/<PROJECT>/TIFF/USGS_one_meter_x<E/10km>y<N/10km>_<PROJECT>.tif",
+      "project_index": "https://prd-tnm.s3.amazonaws.com/?list-type=2&prefix=StagedProducts/Elevation/1m/Projects/&delimiter=/  (956 projects as of 2026-07)",
+      "fetch": "tiles are 10 km x 10 km (10012^2 float32, 40-500 MB) and are NOT mirrored; a 2 km window is cut with HTTP range reads against the internally-tiled LZW GeoTIFF and the EXTRACT is cached and checksummed. Reproducible from source_key + source_etag + window_origin_xy_m.",
+      "why_it_matters": "the only free reference that reaches below 30 m, which is the band our amplifier invents and therefore the band most likely to be wrong"
+    },
+    "opentopography": {
+      "status": "rejected -- not anonymous",
+      "evidence": "GET https://portal.opentopography.org/API/globaldem?demtype=SRTMGL3&... returns HTTP 401 with body 'Error: API Key required for access. Please register for an API key at www.opentopography.org'",
+      "note": "reachable and healthy, but every dataset behind that API needs a free registered key. Nothing in this corpus depends on it. If a key is ever added it would mainly buy SRTM/ALOS/NASADEM variants at 30 m, which cop30 already covers, plus a handful of hosted lidar DTMs outside CONUS."
+    }
+  },
+  "sites": [
+    {
+      "id": "alps_valais_alpine",
+      "geomorphic_class": "alpine_glaciated",
+      "name": "Pennine Alps, Valais (Zermatt / Mischabel)",
+      "lat": 46.35,
+      "lon": 7.55,
+      "human_description": "Glacially carved high alpine: U-shaped troughs, cirques, aretes and bare rock walls above the treeline, with ice in the hollows.",
+      "why": "The canonical high-relief glaciated landscape and the tile that was verified reachable first. Glacial sculpture is the one process our fluvial-looking amplifier has no term for, so if generated alpine terrain is wrong it will be wrong against THIS distribution: very high mean slope with a long flat tail (glacier surfaces and valley floors), not a uniform steepness.",
+      "cop30_dsm_bias": "negligible",
+      "cop30_dsm_reason": "Almost entirely above the treeline: rock, scree and ice. The only canopy is in the valley floors, a small area fraction.",
+      "no_3dep_reason": "3DEP is CONUS-only; see glacier_np_alpine for the 1 m bare-earth alpine companion.",
+      "cop30": {
+        "product": "Copernicus DEM GLO-30 (COG)",
+        "model_type": "DSM (surface: includes canopy and buildings)",
+        "tile_id": "Copernicus_DSM_COG_10_N46_00_E007_00_DEM",
+        "url": "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N46_00_E007_00_DEM/Copernicus_DSM_COG_10_N46_00_E007_00_DEM.tif",
+        "cache_file": "cop30/Copernicus_DSM_COG_10_N46_00_E007_00_DEM.tif",
+        "size_bytes": 41776750,
+        "sha256": "426e3d1492d94e4f23d444843f852ff5be675da5c4c14e661b5642006864047d",
+        "cache_sha256": "426e3d1492d94e4f23d444843f852ff5be675da5c4c14e661b5642006864047d",
+        "source_etag": "d75ca33280e101b7e83b2fbef81e853b",
+        "window_km": 20.0,
+        "stats": {
+          "pixel_size_m": 30.0,
+          "shape": [
+            667,
+            667
+          ],
+          "n_valid": 444889,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 499.98,
+            "max": 3568.91,
+            "mean": 1763.19,
+            "std": 730.3,
+            "p1": 512.8,
+            "p99": 3080.78
+          },
+          "relief_m": {
+            "full_range": 3068.93,
+            "p1_p99": 2567.99
+          },
+          "slope_deg": {
+            "mean": 24.242,
+            "p50": 24.11,
+            "p95": 47.205,
+            "p99": 57.35,
+            "max": 75.314
+          },
+          "flat_fraction": 0.00095,
+          "above_cliff_gate_fraction": 0.20895,
+          "detrended_rms_m": 542.134,
+          "slope_by_scale": {
+            "30m": {
+              "slope_mean_deg": 24.242,
+              "slope_p95_deg": 47.205
+            },
+            "60m": {
+              "slope_mean_deg": 23.504,
+              "slope_p95_deg": 45.288
+            },
+            "120m": {
+              "slope_mean_deg": 22.322,
+              "slope_p95_deg": 42.275
+            },
+            "240m": {
+              "slope_mean_deg": 20.474,
+              "slope_p95_deg": 38.13
+            }
+          },
+          "grid": "aeqd30",
+          "grid_note": "local azimuthal-equidistant about (46.35, 7.55), 30.0 m square pixels, bilinear; comparable pixel-for-pixel with a 30 m game tile",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          },
+          "native_source_pixel_m": {
+            "east_west": 21.38,
+            "north_south": 30.88
+          },
+          "crosscheck_native_ground": {
+            "note": "no resampling; Horn slope on native 1-arcsec posts with per-row WGS84 ground distances",
+            "slope_mean_deg": 24.565,
+            "slope_p95_deg": 47.803,
+            "mean_slope_ratio_native_over_aeqd30": 1.0133
+          }
+        }
+      }
+    },
+    {
+      "id": "teton_range_alpine",
+      "geomorphic_class": "alpine_glaciated",
+      "name": "Teton Range, Wyoming (Grand Teton / Cascade Canyon)",
+      "lat": 43.74,
+      "lon": -110.8,
+      "human_description": "Fault-block alpine front: cirques and knife-edge aretes in granite and gneiss, hanging valleys, talus cones, and a moraine-dammed outwash flat at the foot of the range.",
+      "why": "The alpine class needs a BARE-EARTH reference in the sub-30 m band and the Alps cannot supply one; the Tetons are the same landform family (Pleistocene alpine glaciation, 2 km of relief, crest well above the treeline) inside 3DEP coverage, so they pin what talus aprons, cirque headwalls and glacial troughs actually look like at 1 m. The site also has the sharpest MOUNTAIN-FRONT step on the list: the range rises 2 km from a flat valley in a few kilometres, with no foothills at all. Amplifiers that ramp detail amplitude with slope tend to smear exactly that transition.",
+      "cop30_dsm_bias": "moderate",
+      "cop30_dsm_reason": "Bare rock, snow and talus along the crest; lodgepole and spruce below about 2700 m, so roughly the lower half of the window carries 20-30 m of canopy over 2 km of relief.",
+      "cop30": {
+        "product": "Copernicus DEM GLO-30 (COG)",
+        "model_type": "DSM (surface: includes canopy and buildings)",
+        "tile_id": "Copernicus_DSM_COG_10_N43_00_W111_00_DEM",
+        "url": "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N43_00_W111_00_DEM/Copernicus_DSM_COG_10_N43_00_W111_00_DEM.tif",
+        "cache_file": "cop30/Copernicus_DSM_COG_10_N43_00_W111_00_DEM.tif",
+        "size_bytes": 39137016,
+        "sha256": "25bb15b793fae0d7435b235526df6678aee8ffcd8dc6c1e4474642861f91e3ef",
+        "cache_sha256": "25bb15b793fae0d7435b235526df6678aee8ffcd8dc6c1e4474642861f91e3ef",
+        "source_etag": "128302e1e90a5a3f558125fb835e13b6",
+        "window_km": 20.0,
+        "stats": {
+          "pixel_size_m": 30.0,
+          "shape": [
+            667,
+            667
+          ],
+          "n_valid": 444889,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 1958.54,
+            "max": 4055.63,
+            "mean": 2580.55,
+            "std": 434.64,
+            "p1": 1973.91,
+            "p99": 3467.64
+          },
+          "relief_m": {
+            "full_range": 2097.08,
+            "p1_p99": 1493.73
+          },
+          "slope_deg": {
+            "mean": 19.138,
+            "p50": 16.862,
+            "p95": 46.435,
+            "p99": 56.224,
+            "max": 74.714
+          },
+          "flat_fraction": 0.00654,
+          "above_cliff_gate_fraction": 0.18543,
+          "detrended_rms_m": 320.852,
+          "slope_by_scale": {
+            "30m": {
+              "slope_mean_deg": 19.138,
+              "slope_p95_deg": 46.435
+            },
+            "60m": {
+              "slope_mean_deg": 18.481,
+              "slope_p95_deg": 44.246
+            },
+            "120m": {
+              "slope_mean_deg": 17.386,
+              "slope_p95_deg": 41.074
+            },
+            "240m": {
+              "slope_mean_deg": 15.371,
+              "slope_p95_deg": 36.261
+            }
+          },
+          "grid": "aeqd30",
+          "grid_note": "local azimuthal-equidistant about (43.74, -110.8), 30.0 m square pixels, bilinear; comparable pixel-for-pixel with a 30 m game tile",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          },
+          "native_source_pixel_m": {
+            "east_west": 22.38,
+            "north_south": 30.86
+          },
+          "crosscheck_native_ground": {
+            "note": "no resampling; Horn slope on native 1-arcsec posts with per-row WGS84 ground distances",
+            "slope_mean_deg": 18.351,
+            "slope_p95_deg": 46.173,
+            "mean_slope_ratio_native_over_aeqd30": 0.9589
+          }
+        }
+      },
+      "usgs_3dep_1m": {
+        "product": "USGS 3DEP 1 m DEM",
+        "model_type": "DTM (bare earth: gridded from classified ground returns)",
+        "project": "WY_GrandTetonNP_D22",
+        "access": "anonymous S3, no credentials; windowed HTTP range read via GDAL /vsicurl/",
+        "source_key": "StagedProducts/Elevation/1m/Projects/WY_GrandTetonNP_D22/TIFF/USGS_1M_12_x51y485_WY_GrandTetonNP_D22.tif",
+        "source_url": "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1m/Projects/WY_GrandTetonNP_D22/TIFF/USGS_1M_12_x51y485_WY_GrandTetonNP_D22.tif",
+        "source_etag": "f63316c7632f7070ef4b423ed3817f34-48",
+        "source_size_bytes": 248794252,
+        "crs": "EPSG:26912",
+        "window_origin_xy_m": [
+          515081.0,
+          4844039.0
+        ],
+        "window_center_xy_m": [
+          516105.0,
+          4843015.0
+        ],
+        "offset_from_site_m": 0.4,
+        "offset_note": "centred on the site",
+        "coverage_fraction": 1.0,
+        "window_px": [
+          2048,
+          2048
+        ],
+        "window_m": 2048,
+        "cache_file": "usgs1m/teton_range_alpine_2048m.tif",
+        "cache_size_bytes": 7880838,
+        "cache_sha256": "173d20cdf29f4c7556d0083ef2754fb25509e62dc9195c6a11c7f1af12f845f7",
+        "stats": {
+          "pixel_size_m": 1.0,
+          "shape": [
+            2048,
+            2048
+          ],
+          "n_valid": 4194304,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 3027.42,
+            "max": 4198.1,
+            "mean": 3484.21,
+            "std": 230.71,
+            "p1": 3092.52,
+            "p99": 4080.68
+          },
+          "relief_m": {
+            "full_range": 1170.68,
+            "p1_p99": 988.16
+          },
+          "slope_deg": {
+            "mean": 44.547,
+            "p50": 41.659,
+            "p95": 76.564,
+            "p99": 83.669,
+            "max": 88.976
+          },
+          "flat_fraction": 0.0,
+          "above_cliff_gate_fraction": 0.67832,
+          "detrended_rms_m": 218.911,
+          "slope_by_scale": {
+            "1m": {
+              "slope_mean_deg": 44.547,
+              "slope_p95_deg": 76.564
+            },
+            "3m": {
+              "slope_mean_deg": 45.008,
+              "slope_p95_deg": 75.21
+            },
+            "10m": {
+              "slope_mean_deg": 45.055,
+              "slope_p95_deg": 72.216
+            },
+            "30m": {
+              "slope_mean_deg": 43.752,
+              "slope_p95_deg": 66.86
+            }
+          },
+          "grid": "utm_native",
+          "grid_note": "EPSG:26912, 1 m square pixels as delivered; no reprojection (UTM scale distortion over a 2 km window is <0.1% and is ignored)",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          }
+        }
+      },
+      "dsm_vs_dtm_at_30m": {
+        "note": "SAME footprint, SAME 30 m posting: Copernicus GLO-30 (DSM) read over the exact 2 km box of the cached 3DEP window, against the 3DEP 1 m DTM block-averaged 30x. The ratio is canopy plus buildings, nothing else.",
+        "footprint_center_lat_lon": [
+          43.74,
+          -110.8
+        ],
+        "footprint_m": 2048.0,
+        "cop30_dsm": {
+          "n": 4356,
+          "slope_mean_deg": 39.476,
+          "slope_p95_deg": 61.283,
+          "detrended_rms_m": 201.375,
+          "relief_p1_p99_m": 898.41
+        },
+        "usgs_dtm_at_30m": {
+          "n": 4356,
+          "slope_mean_deg": 43.752,
+          "slope_p95_deg": 66.86,
+          "detrended_rms_m": 218.705,
+          "relief_p1_p99_m": 980.76
+        },
+        "dsm_over_dtm_mean_slope": 0.902,
+        "dsm_over_dtm_detrended_rms": 0.921
+      }
+    },
+    {
+      "id": "smokies_appalachian",
+      "geomorphic_class": "high_relief_fluvial_mountains",
+      "name": "Great Smoky Mountains, Tennessee (Thunderhead / Defeat Ridge)",
+      "lat": 35.638,
+      "lon": -83.772,
+      "human_description": "Mature soil-mantled fluvial mountains: rounded even-crested ridges, dendritic hollows, uniform side-slopes near the angle of repose.",
+      "why": "The end member our amplifier should be BEST at and is easiest to check: unglaciated, soil-mantled, purely fluvially dissected, with a strikingly narrow slope distribution (most of the landscape sits within a few degrees of a characteristic hillslope angle). A generator that produces the right relief but the wrong slope HISTOGRAM shows up here immediately.",
+      "cop30_dsm_bias": "moderate",
+      "cop30_dsm_reason": "Continuous old-growth and second-growth canopy 20-40 m tall over essentially the whole window, so absolute elevations are tens of metres high. Measured effect on 30 m slope statistics is only +13% (see dsm_vs_dtm_at_30m) because a near-uniform canopy offset cancels in a gradient. Prefer the 3DEP DTM anyway for anything below ~100 m wavelength, where the canopy is not uniform.",
+      "cop30": {
+        "product": "Copernicus DEM GLO-30 (COG)",
+        "model_type": "DSM (surface: includes canopy and buildings)",
+        "tile_id": "Copernicus_DSM_COG_10_N35_00_W084_00_DEM",
+        "url": "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N35_00_W084_00_DEM/Copernicus_DSM_COG_10_N35_00_W084_00_DEM.tif",
+        "cache_file": "cop30/Copernicus_DSM_COG_10_N35_00_W084_00_DEM.tif",
+        "size_bytes": 43905340,
+        "sha256": "1229e1b9de7d6a3ae6864a6350bc3c2d5e85fab3c66951705bc52157d68e609a",
+        "cache_sha256": "1229e1b9de7d6a3ae6864a6350bc3c2d5e85fab3c66951705bc52157d68e609a",
+        "source_etag": "84188cf836f7aa0d99001183915489e1",
+        "window_km": 20.0,
+        "stats": {
+          "pixel_size_m": 30.0,
+          "shape": [
+            667,
+            667
+          ],
+          "n_valid": 444889,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 280.97,
+            "max": 1681.6,
+            "mean": 668.68,
+            "std": 287.7,
+            "p1": 310.92,
+            "p99": 1501.53
+          },
+          "relief_m": {
+            "full_range": 1400.63,
+            "p1_p99": 1190.61
+          },
+          "slope_deg": {
+            "mean": 16.787,
+            "p50": 16.609,
+            "p95": 31.137,
+            "p99": 36.54,
+            "max": 53.519
+          },
+          "flat_fraction": 0.00017,
+          "above_cliff_gate_fraction": 0.0164,
+          "detrended_rms_m": 170.992,
+          "slope_by_scale": {
+            "30m": {
+              "slope_mean_deg": 16.787,
+              "slope_p95_deg": 31.137
+            },
+            "60m": {
+              "slope_mean_deg": 14.782,
+              "slope_p95_deg": 28.163
+            },
+            "120m": {
+              "slope_mean_deg": 11.886,
+              "slope_p95_deg": 23.926
+            },
+            "240m": {
+              "slope_mean_deg": 8.922,
+              "slope_p95_deg": 19.104
+            }
+          },
+          "grid": "aeqd30",
+          "grid_note": "local azimuthal-equidistant about (35.638, -83.772), 30.0 m square pixels, bilinear; comparable pixel-for-pixel with a 30 m game tile",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          },
+          "native_source_pixel_m": {
+            "east_west": 25.16,
+            "north_south": 30.82
+          },
+          "crosscheck_native_ground": {
+            "note": "no resampling; Horn slope on native 1-arcsec posts with per-row WGS84 ground distances",
+            "slope_mean_deg": 17.371,
+            "slope_p95_deg": 31.663,
+            "mean_slope_ratio_native_over_aeqd30": 1.0348
+          }
+        }
+      },
+      "usgs_3dep_1m": {
+        "product": "USGS 3DEP 1 m DEM",
+        "model_type": "DTM (bare earth: gridded from classified ground returns)",
+        "project": "TN_BlountCo_2015",
+        "access": "anonymous S3, no credentials; windowed HTTP range read via GDAL /vsicurl/",
+        "source_key": "StagedProducts/Elevation/1m/Projects/TN_BlountCo_2015/TIFF/USGS_one_meter_x24y396_TN_BlountCo_2015.tif",
+        "source_url": "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1m/Projects/TN_BlountCo_2015/TIFF/USGS_one_meter_x24y396_TN_BlountCo_2015.tif",
+        "source_etag": "ed8371b135c9f5727d30e7fcb5f11090-95",
+        "source_size_bytes": 493032765,
+        "crs": "EPSG:26917",
+        "window_origin_xy_m": [
+          247958.0,
+          3952042.0
+        ],
+        "window_center_xy_m": [
+          248982.0,
+          3951018.0
+        ],
+        "offset_from_site_m": 3680.0,
+        "offset_note": "window slid inside the tile to stay on covered ground; 3DEP flight-line gaps are stored as -999999 inside an otherwise normal 10 km raster",
+        "coverage_fraction": 1.0,
+        "window_px": [
+          2048,
+          2048
+        ],
+        "window_m": 2048,
+        "cache_file": "usgs1m/smokies_appalachian_2048m.tif",
+        "cache_size_bytes": 8168520,
+        "cache_sha256": "a4315f8fc2cbd709b545a0a829563fa82025542abd941692fa31760e6036a46e",
+        "stats": {
+          "pixel_size_m": 1.0,
+          "shape": [
+            2048,
+            2048
+          ],
+          "n_valid": 4194304,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 305.16,
+            "max": 514.17,
+            "mean": 353.01,
+            "std": 37.59,
+            "p1": 309.06,
+            "p99": 482.13
+          },
+          "relief_m": {
+            "full_range": 209.01,
+            "p1_p99": 173.07
+          },
+          "slope_deg": {
+            "mean": 11.991,
+            "p50": 9.732,
+            "p95": 30.583,
+            "p99": 38.413,
+            "max": 72.419
+          },
+          "flat_fraction": 0.00692,
+          "above_cliff_gate_fraction": 0.02177,
+          "detrended_rms_m": 24.253,
+          "slope_by_scale": {
+            "1m": {
+              "slope_mean_deg": 11.991,
+              "slope_p95_deg": 30.583
+            },
+            "3m": {
+              "slope_mean_deg": 11.655,
+              "slope_p95_deg": 29.399
+            },
+            "10m": {
+              "slope_mean_deg": 10.806,
+              "slope_p95_deg": 27.057
+            },
+            "30m": {
+              "slope_mean_deg": 8.861,
+              "slope_p95_deg": 22.925
+            }
+          },
+          "grid": "utm_native",
+          "grid_note": "EPSG:26917, 1 m square pixels as delivered; no reprojection (UTM scale distortion over a 2 km window is <0.1% and is ignored)",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          }
+        }
+      },
+      "dsm_vs_dtm_at_30m": {
+        "note": "SAME footprint, SAME 30 m posting: Copernicus GLO-30 (DSM) read over the exact 2 km box of the cached 3DEP window, against the 3DEP 1 m DTM block-averaged 30x. The ratio is canopy plus buildings, nothing else.",
+        "footprint_center_lat_lon": [
+          35.67114,
+          -83.77332
+        ],
+        "footprint_m": 2048.0,
+        "cop30_dsm": {
+          "n": 4356,
+          "slope_mean_deg": 9.987,
+          "slope_p95_deg": 24.283,
+          "detrended_rms_m": 27.164,
+          "relief_p1_p99_m": 195.3
+        },
+        "usgs_dtm_at_30m": {
+          "n": 4356,
+          "slope_mean_deg": 8.861,
+          "slope_p95_deg": 22.925,
+          "detrended_rms_m": 23.947,
+          "relief_p1_p99_m": 172.39
+        },
+        "dsm_over_dtm_mean_slope": 1.127,
+        "dsm_over_dtm_detrended_rms": 1.134
+      }
+    },
+    {
+      "id": "nepal_midhills",
+      "geomorphic_class": "high_relief_fluvial_mountains",
+      "name": "Nepal Middle Hills, Gandaki (south of Annapurna)",
+      "lat": 28.2,
+      "lon": 84.5,
+      "human_description": "Monsoon-dissected mountain front: very deep narrow gorges, sharp spurs, landslide scars, terraced lower slopes.",
+      "why": "Deliberately the EXTREME of the fluvial-mountain class. The Smokies are a low-uplift, transport-limited landscape; the Himalayan front is high-uplift and detachment-limited, and its slope distribution is pushed hard against the threshold angle with a much heavier upper tail. Having both bounds the class instead of describing one point in it -- which matters because our cliff gate fires at 35 deg (voxel-core/include/voxelcore/biome.h) and the two sites sit on opposite sides of it.",
+      "cop30_dsm_bias": "moderate",
+      "cop30_dsm_reason": "Terraced agriculture and shrub over much of the window with forest on north-facing slopes; canopy is patchy and short relative to the 1000 m+ relief, so the bias is small in proportion.",
+      "no_3dep_reason": "Outside CONUS. No free 1 m bare-earth DEM is published for the Nepal Himalaya.",
+      "cop30": {
+        "product": "Copernicus DEM GLO-30 (COG)",
+        "model_type": "DSM (surface: includes canopy and buildings)",
+        "tile_id": "Copernicus_DSM_COG_10_N28_00_E084_00_DEM",
+        "url": "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N28_00_E084_00_DEM/Copernicus_DSM_COG_10_N28_00_E084_00_DEM.tif",
+        "cache_file": "cop30/Copernicus_DSM_COG_10_N28_00_E084_00_DEM.tif",
+        "size_bytes": 41688284,
+        "sha256": "4df89793d0dc6373deb9c27536a1d7039ec4a9962a699a2312f57c935fbbe6dc",
+        "cache_sha256": "4df89793d0dc6373deb9c27536a1d7039ec4a9962a699a2312f57c935fbbe6dc",
+        "source_etag": "f6f936f5ef1c5d4bbc51c47f1c43becb",
+        "window_km": 20.0,
+        "stats": {
+          "pixel_size_m": 30.0,
+          "shape": [
+            667,
+            667
+          ],
+          "n_valid": 444889,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 482.08,
+            "max": 3982.76,
+            "mean": 1488.43,
+            "std": 641.69,
+            "p1": 569.64,
+            "p99": 3388.31
+          },
+          "relief_m": {
+            "full_range": 3500.67,
+            "p1_p99": 2818.68
+          },
+          "slope_deg": {
+            "mean": 27.447,
+            "p50": 27.687,
+            "p95": 43.462,
+            "p99": 50.069,
+            "max": 67.224
+          },
+          "flat_fraction": 0.00018,
+          "above_cliff_gate_fraction": 0.22771,
+          "detrended_rms_m": 378.342,
+          "slope_by_scale": {
+            "30m": {
+              "slope_mean_deg": 27.447,
+              "slope_p95_deg": 43.462
+            },
+            "60m": {
+              "slope_mean_deg": 26.214,
+              "slope_p95_deg": 40.992
+            },
+            "120m": {
+              "slope_mean_deg": 24.229,
+              "slope_p95_deg": 37.716
+            },
+            "240m": {
+              "slope_mean_deg": 21.348,
+              "slope_p95_deg": 33.63
+            }
+          },
+          "grid": "aeqd30",
+          "grid_note": "local azimuthal-equidistant about (28.2, 84.5), 30.0 m square pixels, bilinear; comparable pixel-for-pixel with a 30 m game tile",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          },
+          "native_source_pixel_m": {
+            "east_west": 27.27,
+            "north_south": 30.78
+          },
+          "crosscheck_native_ground": {
+            "note": "no resampling; Horn slope on native 1-arcsec posts with per-row WGS84 ground distances",
+            "slope_mean_deg": 27.281,
+            "slope_p95_deg": 43.927,
+            "mean_slope_ratio_native_over_aeqd30": 0.994
+          }
+        }
+      }
+    },
+    {
+      "id": "iowa_rolling_hills",
+      "geomorphic_class": "rolling_hills_soil_mantled",
+      "name": "Southern Iowa Drift Plain, Warren/Marion County",
+      "lat": 41.25,
+      "lon": -93.55,
+      "human_description": "Rolling farm country: broad convex divides, long smooth swales, no cliffs anywhere, relief of a few tens of metres per kilometre.",
+      "why": "The class between 'mountains' and 'plains', and the one where a generator most easily produces the wrong THING rather than the wrong amount -- ridged noise instead of smoothly convex divides separated by concave hollows. An old glacial till surface that has been fluvially dissected for ~500 kyr is the textbook case, and it is farmed, so 3DEP's bare earth is genuinely bare.",
+      "cop30_dsm_bias": "moderate",
+      "cop30_dsm_reason": "Row-crop fields (near-zero canopy) cut by wooded riparian strips and shelterbelts, which put 15-20 m walls along every drainage in the DSM. Prefer the 3DEP DTM at this site.",
+      "cop30": {
+        "product": "Copernicus DEM GLO-30 (COG)",
+        "model_type": "DSM (surface: includes canopy and buildings)",
+        "tile_id": "Copernicus_DSM_COG_10_N41_00_W094_00_DEM",
+        "url": "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N41_00_W094_00_DEM/Copernicus_DSM_COG_10_N41_00_W094_00_DEM.tif",
+        "cache_file": "cop30/Copernicus_DSM_COG_10_N41_00_W094_00_DEM.tif",
+        "size_bytes": 41954390,
+        "sha256": "a503d3c68c57d054d4f6bb922c137973b5bf859e3287714e0c6380159a939fbf",
+        "cache_sha256": "a503d3c68c57d054d4f6bb922c137973b5bf859e3287714e0c6380159a939fbf",
+        "source_etag": "fcba0a2c94eb69230001ecdd60b9e78f",
+        "window_km": 20.0,
+        "stats": {
+          "pixel_size_m": 30.0,
+          "shape": [
+            667,
+            667
+          ],
+          "n_valid": 444889,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 231.66,
+            "max": 327.61,
+            "mean": 284.86,
+            "std": 17.95,
+            "p1": 244.49,
+            "p99": 314.59
+          },
+          "relief_m": {
+            "full_range": 95.95,
+            "p1_p99": 70.1
+          },
+          "slope_deg": {
+            "mean": 3.608,
+            "p50": 3.18,
+            "p95": 8.416,
+            "p99": 12.679,
+            "max": 27.752
+          },
+          "flat_fraction": 0.00689,
+          "above_cliff_gate_fraction": 0.0,
+          "detrended_rms_m": 15.647,
+          "slope_by_scale": {
+            "30m": {
+              "slope_mean_deg": 3.608,
+              "slope_p95_deg": 8.416
+            },
+            "60m": {
+              "slope_mean_deg": 2.828,
+              "slope_p95_deg": 6.509
+            },
+            "120m": {
+              "slope_mean_deg": 2.051,
+              "slope_p95_deg": 4.608
+            },
+            "240m": {
+              "slope_mean_deg": 1.378,
+              "slope_p95_deg": 3.011
+            }
+          },
+          "grid": "aeqd30",
+          "grid_note": "local azimuthal-equidistant about (41.25, -93.55), 30.0 m square pixels, bilinear; comparable pixel-for-pixel with a 30 m game tile",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          },
+          "native_source_pixel_m": {
+            "east_west": 23.28,
+            "north_south": 30.85
+          },
+          "crosscheck_native_ground": {
+            "note": "no resampling; Horn slope on native 1-arcsec posts with per-row WGS84 ground distances",
+            "slope_mean_deg": 3.899,
+            "slope_p95_deg": 9.176,
+            "mean_slope_ratio_native_over_aeqd30": 1.0807
+          }
+        }
+      },
+      "usgs_3dep_1m": {
+        "product": "USGS 3DEP 1 m DEM",
+        "model_type": "DTM (bare earth: gridded from classified ground returns)",
+        "project": "IA_SouthCentral_2020_D20",
+        "access": "anonymous S3, no credentials; windowed HTTP range read via GDAL /vsicurl/",
+        "source_key": "StagedProducts/Elevation/1m/Projects/IA_SouthCentral_2020_D20/TIFF/USGS_1M_15_x45y457_IA_SouthCentral_2020_D20.tif",
+        "source_url": "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1m/Projects/IA_SouthCentral_2020_D20/TIFF/USGS_1M_15_x45y457_IA_SouthCentral_2020_D20.tif",
+        "source_etag": "d53422409a09297328222e2d48d0d0b9-59",
+        "source_size_bytes": 308983167,
+        "crs": "EPSG:26915",
+        "window_origin_xy_m": [
+          452895.0,
+          4567680.0
+        ],
+        "window_center_xy_m": [
+          453919.0,
+          4566656.0
+        ],
+        "offset_from_site_m": 0.3,
+        "offset_note": "centred on the site",
+        "coverage_fraction": 1.0,
+        "window_px": [
+          2048,
+          2048
+        ],
+        "window_m": 2048,
+        "cache_file": "usgs1m/iowa_rolling_hills_2048m.tif",
+        "cache_size_bytes": 7253111,
+        "cache_sha256": "ca70742a815bb8e627b71d5e1ff36cd8ab37cba2d30dd84ef1552da94a509360",
+        "stats": {
+          "pixel_size_m": 1.0,
+          "shape": [
+            2048,
+            2048
+          ],
+          "n_valid": 4194304,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 249.16,
+            "max": 303.65,
+            "mean": 274.32,
+            "std": 15.0,
+            "p1": 252.47,
+            "p99": 301.39
+          },
+          "relief_m": {
+            "full_range": 54.49,
+            "p1_p99": 48.92
+          },
+          "slope_deg": {
+            "mean": 5.536,
+            "p50": 4.341,
+            "p95": 15.729,
+            "p99": 32.305,
+            "max": 64.623
+          },
+          "flat_fraction": 0.0062,
+          "above_cliff_gate_fraction": 0.00696,
+          "detrended_rms_m": 6.649,
+          "slope_by_scale": {
+            "1m": {
+              "slope_mean_deg": 5.536,
+              "slope_p95_deg": 15.729
+            },
+            "3m": {
+              "slope_mean_deg": 5.158,
+              "slope_p95_deg": 13.417
+            },
+            "10m": {
+              "slope_mean_deg": 4.438,
+              "slope_p95_deg": 9.574
+            },
+            "30m": {
+              "slope_mean_deg": 3.578,
+              "slope_p95_deg": 7.02
+            }
+          },
+          "grid": "utm_native",
+          "grid_note": "EPSG:26915, 1 m square pixels as delivered; no reprojection (UTM scale distortion over a 2 km window is <0.1% and is ignored)",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          }
+        }
+      },
+      "dsm_vs_dtm_at_30m": {
+        "note": "SAME footprint, SAME 30 m posting: Copernicus GLO-30 (DSM) read over the exact 2 km box of the cached 3DEP window, against the 3DEP 1 m DTM block-averaged 30x. The ratio is canopy plus buildings, nothing else.",
+        "footprint_center_lat_lon": [
+          41.25,
+          -93.55
+        ],
+        "footprint_m": 2048.0,
+        "cop30_dsm": {
+          "n": 4356,
+          "slope_mean_deg": 3.243,
+          "slope_p95_deg": 6.511,
+          "detrended_rms_m": 5.864,
+          "relief_p1_p99_m": 46.8
+        },
+        "usgs_dtm_at_30m": {
+          "n": 4356,
+          "slope_mean_deg": 3.578,
+          "slope_p95_deg": 7.02,
+          "detrended_rms_m": 6.579,
+          "relief_p1_p99_m": 48.1
+        },
+        "dsm_over_dtm_mean_slope": 0.906,
+        "dsm_over_dtm_detrended_rms": 0.891
+      }
+    },
+    {
+      "id": "llano_estacado_plains",
+      "geomorphic_class": "plains_low_relief",
+      "name": "Llano Estacado, Roosevelt/Curry County, New Mexico",
+      "lat": 34.2,
+      "lon": -103.3,
+      "human_description": "One of the flattest large surfaces on Earth: a semi-arid caprock plain, featureless except for shallow circular playa basins.",
+      "why": "THE most important site in the corpus. Our terrain looks worst on gentle ground, and the Llano Estacado is the cleanest possible measurement of what gentle ground actually is: a relict Ogallala surface with essentially no integrated drainage, so the reference slope distribution is a tight spike near zero rather than a scaled -down version of hill country. It is also the best-behaved site for the DSM problem -- short grass and bare soil, no trees at all.",
+      "cop30_dsm_bias": "negligible",
+      "cop30_dsm_reason": "Shortgrass prairie and dryland fields; no canopy and no buildings in the window.",
+      "cop30": {
+        "product": "Copernicus DEM GLO-30 (COG)",
+        "model_type": "DSM (surface: includes canopy and buildings)",
+        "tile_id": "Copernicus_DSM_COG_10_N34_00_W104_00_DEM",
+        "url": "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N34_00_W104_00_DEM/Copernicus_DSM_COG_10_N34_00_W104_00_DEM.tif",
+        "cache_file": "cop30/Copernicus_DSM_COG_10_N34_00_W104_00_DEM.tif",
+        "size_bytes": 34499259,
+        "sha256": "32635f8471b5387525696e841456862908db565ddd9e8c25f1361e73a4708cc0",
+        "cache_sha256": "32635f8471b5387525696e841456862908db565ddd9e8c25f1361e73a4708cc0",
+        "source_etag": "6968414741dfad61df284aea48e24cab",
+        "window_km": 20.0,
+        "stats": {
+          "pixel_size_m": 30.0,
+          "shape": [
+            667,
+            667
+          ],
+          "n_valid": 444889,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 1195.71,
+            "max": 1262.84,
+            "mean": 1230.11,
+            "std": 13.97,
+            "p1": 1200.88,
+            "p99": 1255.34
+          },
+          "relief_m": {
+            "full_range": 67.13,
+            "p1_p99": 54.46
+          },
+          "slope_deg": {
+            "mean": 0.742,
+            "p50": 0.53,
+            "p95": 2.116,
+            "p99": 3.442,
+            "max": 17.168
+          },
+          "flat_fraction": 0.03773,
+          "above_cliff_gate_fraction": 0.0,
+          "detrended_rms_m": 8.084,
+          "slope_by_scale": {
+            "30m": {
+              "slope_mean_deg": 0.742,
+              "slope_p95_deg": 2.116
+            },
+            "60m": {
+              "slope_mean_deg": 0.51,
+              "slope_p95_deg": 1.343
+            },
+            "120m": {
+              "slope_mean_deg": 0.365,
+              "slope_p95_deg": 0.879
+            },
+            "240m": {
+              "slope_mean_deg": 0.286,
+              "slope_p95_deg": 0.625
+            }
+          },
+          "grid": "aeqd30",
+          "grid_note": "local azimuthal-equidistant about (34.2, -103.3), 30.0 m square pixels, bilinear; comparable pixel-for-pixel with a 30 m game tile",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          },
+          "native_source_pixel_m": {
+            "east_west": 25.6,
+            "north_south": 30.81
+          },
+          "crosscheck_native_ground": {
+            "note": "no resampling; Horn slope on native 1-arcsec posts with per-row WGS84 ground distances",
+            "slope_mean_deg": 0.831,
+            "slope_p95_deg": 2.359,
+            "mean_slope_ratio_native_over_aeqd30": 1.1199
+          }
+        }
+      },
+      "usgs_3dep_1m": {
+        "product": "USGS 3DEP 1 m DEM",
+        "model_type": "DTM (bare earth: gridded from classified ground returns)",
+        "project": "NM_Roosevelt_Curry_2015",
+        "access": "anonymous S3, no credentials; windowed HTTP range read via GDAL /vsicurl/",
+        "source_key": "StagedProducts/Elevation/1m/Projects/NM_Roosevelt_Curry_2015/TIFF/USGS_one_meter_x65y379_NM_Roosevelt_Curry_2015.tif",
+        "source_url": "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1m/Projects/NM_Roosevelt_Curry_2015/TIFF/USGS_one_meter_x65y379_NM_Roosevelt_Curry_2015.tif",
+        "source_etag": "c2d59aa2bf9ae6f2add8894279313d06-67",
+        "source_size_bytes": 350275962,
+        "crs": "EPSG:26913",
+        "window_origin_xy_m": [
+          655607.0,
+          3786662.0
+        ],
+        "window_center_xy_m": [
+          656631.0,
+          3785638.0
+        ],
+        "offset_from_site_m": 0.3,
+        "offset_note": "centred on the site",
+        "coverage_fraction": 1.0,
+        "window_px": [
+          2048,
+          2048
+        ],
+        "window_m": 2048,
+        "cache_file": "usgs1m/llano_estacado_plains_2048m.tif",
+        "cache_size_bytes": 6215222,
+        "cache_sha256": "d46182766f10b2065407a1d69a47e70f7e58dded3e26c8cf7add50f73b600d82",
+        "stats": {
+          "pixel_size_m": 1.0,
+          "shape": [
+            2048,
+            2048
+          ],
+          "n_valid": 4194304,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 1220.68,
+            "max": 1236.32,
+            "mean": 1227.52,
+            "std": 3.82,
+            "p1": 1221.32,
+            "p99": 1234.67
+          },
+          "relief_m": {
+            "full_range": 15.63,
+            "p1_p99": 13.34
+          },
+          "slope_deg": {
+            "mean": 1.376,
+            "p50": 0.954,
+            "p95": 3.76,
+            "p99": 8.458,
+            "max": 37.606
+          },
+          "flat_fraction": 0.0096,
+          "above_cliff_gate_fraction": 0.0,
+          "detrended_rms_m": 0.768,
+          "slope_by_scale": {
+            "1m": {
+              "slope_mean_deg": 1.376,
+              "slope_p95_deg": 3.76
+            },
+            "3m": {
+              "slope_mean_deg": 0.747,
+              "slope_p95_deg": 2.299
+            },
+            "10m": {
+              "slope_mean_deg": 0.506,
+              "slope_p95_deg": 1.261
+            },
+            "30m": {
+              "slope_mean_deg": 0.422,
+              "slope_p95_deg": 0.851
+            }
+          },
+          "grid": "utm_native",
+          "grid_note": "EPSG:26913, 1 m square pixels as delivered; no reprojection (UTM scale distortion over a 2 km window is <0.1% and is ignored)",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          }
+        }
+      },
+      "dsm_vs_dtm_at_30m": {
+        "note": "SAME footprint, SAME 30 m posting: Copernicus GLO-30 (DSM) read over the exact 2 km box of the cached 3DEP window, against the 3DEP 1 m DTM block-averaged 30x. The ratio is canopy plus buildings, nothing else.",
+        "footprint_center_lat_lon": [
+          34.2,
+          -103.3
+        ],
+        "footprint_m": 2048.0,
+        "cop30_dsm": {
+          "n": 4356,
+          "slope_mean_deg": 0.573,
+          "slope_p95_deg": 1.324,
+          "detrended_rms_m": 0.942,
+          "relief_p1_p99_m": 14.68
+        },
+        "usgs_dtm_at_30m": {
+          "n": 4356,
+          "slope_mean_deg": 0.422,
+          "slope_p95_deg": 0.851,
+          "detrended_rms_m": 0.758,
+          "relief_p1_p99_m": 13.29
+        },
+        "dsm_over_dtm_mean_slope": 1.358,
+        "dsm_over_dtm_detrended_rms": 1.243
+      }
+    },
+    {
+      "id": "illinois_till_plain",
+      "geomorphic_class": "plains_low_relief",
+      "name": "Bloomington Ridged Plain, Champaign County, Illinois",
+      "lat": 40.15,
+      "lon": -88.3,
+      "human_description": "Young glacial till plain: nearly flat, with very broad low moraine swells and shallow, barely incised streams.",
+      "why": "The second plains site, and a different KIND of flat. The Llano is flat because nothing has eroded it; the Wisconsinan till plain is flat because it was deposited that way 20 kyr ago and drainage has not yet organised. Their slope spikes differ in width and their long-wavelength structure differs completely (playas vs moraine ridges), so together they say what 'plains' may not be collapsed into -- a single flatness number.",
+      "cop30_dsm_bias": "moderate",
+      "cop30_dsm_reason": "Almost entirely maize/soy, so canopy is near zero over most of the window, but farmsteads and windbreaks appear as isolated 10-20 m spikes -- which, on a surface with 10 m of total relief, is a large relative error. The 3DEP DTM is strongly preferred here.",
+      "cop30": {
+        "product": "Copernicus DEM GLO-30 (COG)",
+        "model_type": "DSM (surface: includes canopy and buildings)",
+        "tile_id": "Copernicus_DSM_COG_10_N40_00_W089_00_DEM",
+        "url": "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N40_00_W089_00_DEM/Copernicus_DSM_COG_10_N40_00_W089_00_DEM.tif",
+        "cache_file": "cop30/Copernicus_DSM_COG_10_N40_00_W089_00_DEM.tif",
+        "size_bytes": 40470724,
+        "sha256": "9a177485c5ff87e592974cd4d77a3d7127cbcd471d7fc9f74ae773314f945cf4",
+        "cache_sha256": "9a177485c5ff87e592974cd4d77a3d7127cbcd471d7fc9f74ae773314f945cf4",
+        "source_etag": "144f8707968e71532fe1eb53f2bb6d99",
+        "window_km": 20.0,
+        "stats": {
+          "pixel_size_m": 30.0,
+          "shape": [
+            667,
+            667
+          ],
+          "n_valid": 444889,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 202.6,
+            "max": 260.95,
+            "mean": 224.13,
+            "std": 8.17,
+            "p1": 211.54,
+            "p99": 248.48
+          },
+          "relief_m": {
+            "full_range": 58.35,
+            "p1_p99": 36.94
+          },
+          "slope_deg": {
+            "mean": 1.156,
+            "p50": 0.704,
+            "p95": 3.571,
+            "p99": 7.252,
+            "max": 20.65
+          },
+          "flat_fraction": 0.02783,
+          "above_cliff_gate_fraction": 0.0,
+          "detrended_rms_m": 7.41,
+          "slope_by_scale": {
+            "30m": {
+              "slope_mean_deg": 1.156,
+              "slope_p95_deg": 3.571
+            },
+            "60m": {
+              "slope_mean_deg": 0.789,
+              "slope_p95_deg": 2.173
+            },
+            "120m": {
+              "slope_mean_deg": 0.523,
+              "slope_p95_deg": 1.373
+            },
+            "240m": {
+              "slope_mean_deg": 0.353,
+              "slope_p95_deg": 0.907
+            }
+          },
+          "grid": "aeqd30",
+          "grid_note": "local azimuthal-equidistant about (40.15, -88.3), 30.0 m square pixels, bilinear; comparable pixel-for-pixel with a 30 m game tile",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          },
+          "native_source_pixel_m": {
+            "east_west": 23.67,
+            "north_south": 30.84
+          },
+          "crosscheck_native_ground": {
+            "note": "no resampling; Horn slope on native 1-arcsec posts with per-row WGS84 ground distances",
+            "slope_mean_deg": 1.281,
+            "slope_p95_deg": 4.233,
+            "mean_slope_ratio_native_over_aeqd30": 1.1081
+          }
+        }
+      },
+      "usgs_3dep_1m": {
+        "product": "USGS 3DEP 1 m DEM",
+        "model_type": "DTM (bare earth: gridded from classified ground returns)",
+        "project": "IL_8County_PlusChampaign_2019_B19",
+        "access": "anonymous S3, no credentials; windowed HTTP range read via GDAL /vsicurl/",
+        "source_key": "StagedProducts/Elevation/1m/Projects/IL_8County_PlusChampaign_2019_B19/TIFF/USGS_1M_16_x38y445_IL_8County_PlusChampaign_2019_B19.tif",
+        "source_url": "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1m/Projects/IL_8County_PlusChampaign_2019_B19/TIFF/USGS_1M_16_x38y445_IL_8County_PlusChampaign_2019_B19.tif",
+        "source_etag": "d69a7258e3e49eb84dd89d1230c020bb-58",
+        "source_size_bytes": 301898118,
+        "crs": "EPSG:26916",
+        "window_origin_xy_m": [
+          387958.0,
+          4446240.0
+        ],
+        "window_center_xy_m": [
+          388982.0,
+          4445216.0
+        ],
+        "offset_from_site_m": 292.0,
+        "offset_note": "window slid inside the tile to stay on covered ground; 3DEP flight-line gaps are stored as -999999 inside an otherwise normal 10 km raster",
+        "coverage_fraction": 1.0,
+        "window_px": [
+          2048,
+          2048
+        ],
+        "window_m": 2048,
+        "cache_file": "usgs1m/illinois_till_plain_2048m.tif",
+        "cache_size_bytes": 7566114,
+        "cache_sha256": "0733ba0ef718bde4da1c73b2482799b8c39cc77860192d7a9735eab3539dea9f",
+        "stats": {
+          "pixel_size_m": 1.0,
+          "shape": [
+            2048,
+            2048
+          ],
+          "n_valid": 4194304,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 220.85,
+            "max": 256.17,
+            "mean": 238.01,
+            "std": 6.92,
+            "p1": 223.35,
+            "p99": 250.76
+          },
+          "relief_m": {
+            "full_range": 35.32,
+            "p1_p99": 27.41
+          },
+          "slope_deg": {
+            "mean": 2.293,
+            "p50": 1.646,
+            "p95": 6.626,
+            "p99": 14.912,
+            "max": 46.942
+          },
+          "flat_fraction": 0.00402,
+          "above_cliff_gate_fraction": 1e-05,
+          "detrended_rms_m": 3.452,
+          "slope_by_scale": {
+            "1m": {
+              "slope_mean_deg": 2.293,
+              "slope_p95_deg": 6.626
+            },
+            "3m": {
+              "slope_mean_deg": 2.016,
+              "slope_p95_deg": 5.06
+            },
+            "10m": {
+              "slope_mean_deg": 1.647,
+              "slope_p95_deg": 3.436
+            },
+            "30m": {
+              "slope_mean_deg": 1.314,
+              "slope_p95_deg": 2.552
+            }
+          },
+          "grid": "utm_native",
+          "grid_note": "EPSG:26916, 1 m square pixels as delivered; no reprojection (UTM scale distortion over a 2 km window is <0.1% and is ignored)",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          }
+        }
+      },
+      "dsm_vs_dtm_at_30m": {
+        "note": "SAME footprint, SAME 30 m posting: Copernicus GLO-30 (DSM) read over the exact 2 km box of the cached 3DEP window, against the 3DEP 1 m DTM block-averaged 30x. The ratio is canopy plus buildings, nothing else.",
+        "footprint_center_lat_lon": [
+          40.14996,
+          -88.30343
+        ],
+        "footprint_m": 2048.0,
+        "cop30_dsm": {
+          "n": 4356,
+          "slope_mean_deg": 1.413,
+          "slope_p95_deg": 2.911,
+          "detrended_rms_m": 3.363,
+          "relief_p1_p99_m": 27.91
+        },
+        "usgs_dtm_at_30m": {
+          "n": 4356,
+          "slope_mean_deg": 1.314,
+          "slope_p95_deg": 2.552,
+          "detrended_rms_m": 3.41,
+          "relief_p1_p99_m": 27.36
+        },
+        "dsm_over_dtm_mean_slope": 1.075,
+        "dsm_over_dtm_detrended_rms": 0.986
+      }
+    },
+    {
+      "id": "white_sands_dunes",
+      "geomorphic_class": "desert_aeolian_dunes",
+      "name": "White Sands, Tularosa Basin, New Mexico",
+      "lat": 32.85,
+      "lon": -106.28,
+      "human_description": "An active transverse and barchan dune field: regular parallel crests, gentle stoss slopes and steep slip faces at the angle of repose, on a flat basin floor.",
+      "why": "Dune fields are the one landform with a hard PHYSICAL ceiling on slope -- the ~32-34 deg angle of repose of dry sand -- and a strongly periodic, anisotropic planform. That makes them the sharpest falsification test in the corpus: a generator using isotropic fractal noise cannot reproduce either property, and the failure is visible in one histogram. White Sands is chosen over a larger erg because 3DEP covers it, so we get the slip-face angle measured at 1 m instead of smeared over a 30 m post.",
+      "cop30_dsm_bias": "negligible",
+      "cop30_dsm_reason": "Bare gypsum sand with sparse low shrubs; the DSM is the ground.",
+      "cop30": {
+        "product": "Copernicus DEM GLO-30 (COG)",
+        "model_type": "DSM (surface: includes canopy and buildings)",
+        "tile_id": "Copernicus_DSM_COG_10_N32_00_W107_00_DEM",
+        "url": "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N32_00_W107_00_DEM/Copernicus_DSM_COG_10_N32_00_W107_00_DEM.tif",
+        "cache_file": "cop30/Copernicus_DSM_COG_10_N32_00_W107_00_DEM.tif",
+        "size_bytes": 35985237,
+        "sha256": "03d4e33f38cea565a3a011f4785b3578c3a8e9e8d537578db9b19602e1214fac",
+        "cache_sha256": "03d4e33f38cea565a3a011f4785b3578c3a8e9e8d537578db9b19602e1214fac",
+        "source_etag": "fa7252309724484db1c14833eb924247",
+        "window_km": 20.0,
+        "stats": {
+          "pixel_size_m": 30.0,
+          "shape": [
+            667,
+            667
+          ],
+          "n_valid": 444889,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 1187.07,
+            "max": 1245.12,
+            "mean": 1206.89,
+            "std": 11.84,
+            "p1": 1187.44,
+            "p99": 1230.95
+          },
+          "relief_m": {
+            "full_range": 58.05,
+            "p1_p99": 43.51
+          },
+          "slope_deg": {
+            "mean": 1.009,
+            "p50": 0.546,
+            "p95": 3.392,
+            "p99": 5.048,
+            "max": 11.956
+          },
+          "flat_fraction": 0.08819,
+          "above_cliff_gate_fraction": 0.0,
+          "detrended_rms_m": 4.147,
+          "slope_by_scale": {
+            "30m": {
+              "slope_mean_deg": 1.009,
+              "slope_p95_deg": 3.392
+            },
+            "60m": {
+              "slope_mean_deg": 0.471,
+              "slope_p95_deg": 1.46
+            },
+            "120m": {
+              "slope_mean_deg": 0.233,
+              "slope_p95_deg": 0.725
+            },
+            "240m": {
+              "slope_mean_deg": 0.163,
+              "slope_p95_deg": 0.529
+            }
+          },
+          "grid": "aeqd30",
+          "grid_note": "local azimuthal-equidistant about (32.85, -106.28), 30.0 m square pixels, bilinear; comparable pixel-for-pixel with a 30 m game tile",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          },
+          "native_source_pixel_m": {
+            "east_west": 26.0,
+            "north_south": 30.81
+          },
+          "crosscheck_native_ground": {
+            "note": "no resampling; Horn slope on native 1-arcsec posts with per-row WGS84 ground distances",
+            "slope_mean_deg": 1.16,
+            "slope_p95_deg": 4.041,
+            "mean_slope_ratio_native_over_aeqd30": 1.1497
+          }
+        }
+      },
+      "usgs_3dep_1m": {
+        "product": "USGS 3DEP 1 m DEM",
+        "model_type": "DTM (bare earth: gridded from classified ground returns)",
+        "project": "NM_WhiteSandsNM_2020_D20",
+        "access": "anonymous S3, no credentials; windowed HTTP range read via GDAL /vsicurl/",
+        "source_key": "StagedProducts/Elevation/1m/Projects/NM_WhiteSandsNM_2020_D20/TIFF/USGS_1M_13_x38y364_NM_WhiteSandsNM_2020_D20.tif",
+        "source_url": "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1m/Projects/NM_WhiteSandsNM_2020_D20/TIFF/USGS_1M_13_x38y364_NM_WhiteSandsNM_2020_D20.tif",
+        "source_etag": "0fc6a07dd8980ab7e91133be75a2f690",
+        "source_size_bytes": 63830662,
+        "crs": "EPSG:26913",
+        "window_origin_xy_m": [
+          379994.0,
+          3636408.0
+        ],
+        "window_center_xy_m": [
+          381018.0,
+          3635384.0
+        ],
+        "offset_from_site_m": 796.3,
+        "offset_note": "window slid inside the tile to stay on covered ground; 3DEP flight-line gaps are stored as -999999 inside an otherwise normal 10 km raster",
+        "coverage_fraction": 1.0,
+        "window_px": [
+          2048,
+          2048
+        ],
+        "window_m": 2048,
+        "cache_file": "usgs1m/white_sands_dunes_2048m.tif",
+        "cache_size_bytes": 6256404,
+        "cache_sha256": "cfee5779f1619c5abf903c1333c27aabbffbfbe1859e0460ec85625c705de639",
+        "stats": {
+          "pixel_size_m": 1.0,
+          "shape": [
+            2048,
+            2048
+          ],
+          "n_valid": 4194304,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 1206.69,
+            "max": 1222.4,
+            "mean": 1211.07,
+            "std": 2.67,
+            "p1": 1206.91,
+            "p99": 1217.86
+          },
+          "relief_m": {
+            "full_range": 15.71,
+            "p1_p99": 10.95
+          },
+          "slope_deg": {
+            "mean": 7.244,
+            "p50": 6.117,
+            "p95": 23.51,
+            "p99": 31.75,
+            "max": 48.938
+          },
+          "flat_fraction": 0.00283,
+          "above_cliff_gate_fraction": 1e-05,
+          "detrended_rms_m": 2.316,
+          "slope_by_scale": {
+            "1m": {
+              "slope_mean_deg": 7.244,
+              "slope_p95_deg": 23.51
+            },
+            "3m": {
+              "slope_mean_deg": 6.989,
+              "slope_p95_deg": 20.891
+            },
+            "10m": {
+              "slope_mean_deg": 5.951,
+              "slope_p95_deg": 13.567
+            },
+            "30m": {
+              "slope_mean_deg": 2.709,
+              "slope_p95_deg": 5.218
+            }
+          },
+          "grid": "utm_native",
+          "grid_note": "EPSG:26913, 1 m square pixels as delivered; no reprojection (UTM scale distortion over a 2 km window is <0.1% and is ignored)",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          }
+        }
+      },
+      "dsm_vs_dtm_at_30m": {
+        "note": "SAME footprint, SAME 30 m posting: Copernicus GLO-30 (DSM) read over the exact 2 km box of the cached 3DEP window, against the 3DEP 1 m DTM block-averaged 30x. The ratio is canopy plus buildings, nothing else.",
+        "footprint_center_lat_lon": [
+          32.85009,
+          -106.27149
+        ],
+        "footprint_m": 2048.0,
+        "cop30_dsm": {
+          "n": 4356,
+          "slope_mean_deg": 1.739,
+          "slope_p95_deg": 3.695,
+          "detrended_rms_m": 1.38,
+          "relief_p1_p99_m": 8.24
+        },
+        "usgs_dtm_at_30m": {
+          "n": 4356,
+          "slope_mean_deg": 2.709,
+          "slope_p95_deg": 5.218,
+          "detrended_rms_m": 1.973,
+          "relief_p1_p99_m": 10.13
+        },
+        "dsm_over_dtm_mean_slope": 0.642,
+        "dsm_over_dtm_detrended_rms": 0.699
+      }
+    },
+    {
+      "id": "rub_al_khali_dunes",
+      "geomorphic_class": "desert_aeolian_dunes",
+      "name": "Rub' al Khali, Saudi Arabia (eastern sand sea)",
+      "lat": 20.5,
+      "lon": 52.5,
+      "human_description": "Mega-dune sand sea: linear and star draa hundreds of metres tall and kilometres apart, with flat interdune corridors.",
+      "why": "The same class at a completely different SCALE. White Sands dunes are 10-30 m tall with ~150 m spacing -- inside our amplification band; Rub' al Khali draa are 100-250 m tall with 2-3 km spacing -- in the carrier band the diffusion model is supposed to produce. Together they check that dune structure is right at both ends rather than only where we happened to look.",
+      "cop30_dsm_bias": "negligible",
+      "cop30_dsm_reason": "Hyper-arid sand sea; no vegetation and no structures.",
+      "no_3dep_reason": "Outside CONUS. No free 1 m DEM exists for the Empty Quarter.",
+      "cop30": {
+        "product": "Copernicus DEM GLO-30 (COG)",
+        "model_type": "DSM (surface: includes canopy and buildings)",
+        "tile_id": "Copernicus_DSM_COG_10_N20_00_E052_00_DEM",
+        "url": "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N20_00_E052_00_DEM/Copernicus_DSM_COG_10_N20_00_E052_00_DEM.tif",
+        "cache_file": "cop30/Copernicus_DSM_COG_10_N20_00_E052_00_DEM.tif",
+        "size_bytes": 45931228,
+        "sha256": "b6c0fc66abac1032a53b6702a0b355a14ff65813f435ac6a0106e2620c90807b",
+        "cache_sha256": "b6c0fc66abac1032a53b6702a0b355a14ff65813f435ac6a0106e2620c90807b",
+        "source_etag": "a38641593c358e18d7003e11b77497ba",
+        "window_km": 20.0,
+        "stats": {
+          "pixel_size_m": 30.0,
+          "shape": [
+            667,
+            667
+          ],
+          "n_valid": 444889,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 120.7,
+            "max": 174.44,
+            "mean": 140.25,
+            "std": 6.96,
+            "p1": 126.42,
+            "p99": 158.77
+          },
+          "relief_m": {
+            "full_range": 53.74,
+            "p1_p99": 32.35
+          },
+          "slope_deg": {
+            "mean": 2.736,
+            "p50": 2.141,
+            "p95": 7.124,
+            "p99": 11.289,
+            "max": 21.813
+          },
+          "flat_fraction": 0.00203,
+          "above_cliff_gate_fraction": 0.0,
+          "detrended_rms_m": 6.277,
+          "slope_by_scale": {
+            "30m": {
+              "slope_mean_deg": 2.736,
+              "slope_p95_deg": 7.124
+            },
+            "60m": {
+              "slope_mean_deg": 2.161,
+              "slope_p95_deg": 5.399
+            },
+            "120m": {
+              "slope_mean_deg": 1.524,
+              "slope_p95_deg": 3.459
+            },
+            "240m": {
+              "slope_mean_deg": 0.81,
+              "slope_p95_deg": 1.692
+            }
+          },
+          "grid": "aeqd30",
+          "grid_note": "local azimuthal-equidistant about (20.5, 52.5), 30.0 m square pixels, bilinear; comparable pixel-for-pixel with a 30 m game tile",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          },
+          "native_source_pixel_m": {
+            "east_west": 28.98,
+            "north_south": 30.75
+          },
+          "crosscheck_native_ground": {
+            "note": "no resampling; Horn slope on native 1-arcsec posts with per-row WGS84 ground distances",
+            "slope_mean_deg": 2.869,
+            "slope_p95_deg": 7.505,
+            "mean_slope_ratio_native_over_aeqd30": 1.0486
+          }
+        }
+      }
+    },
+    {
+      "id": "badlands_sd",
+      "geomorphic_class": "badlands_dissected",
+      "name": "Badlands National Park, South Dakota (the Wall)",
+      "lat": 43.8,
+      "lon": -102.3,
+      "human_description": "Badlands: a razor-sharp escarpment shredded into knife ridges, rills and gullies, separating a high prairie table from a lower one.",
+      "why": "The maximum-drainage-density end of the fluvial spectrum. Slopes sit at the threshold angle almost everywhere, drainage texture is an order of magnitude finer than in the Smokies, and -- most usefully -- the window contains BOTH the dissected escarpment and the undissected prairie above it. That bimodality is a strong test: real landscapes put two populations side by side with a sharp boundary, and blended fractal noise cannot.",
+      "cop30_dsm_bias": "negligible",
+      "cop30_dsm_reason": "Bare Brule/Chadron clay and shortgrass prairie; the finest rills are below the 30 m posting, but nothing sits above the ground surface.",
+      "cop30": {
+        "product": "Copernicus DEM GLO-30 (COG)",
+        "model_type": "DSM (surface: includes canopy and buildings)",
+        "tile_id": "Copernicus_DSM_COG_10_N43_00_W103_00_DEM",
+        "url": "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N43_00_W103_00_DEM/Copernicus_DSM_COG_10_N43_00_W103_00_DEM.tif",
+        "cache_file": "cop30/Copernicus_DSM_COG_10_N43_00_W103_00_DEM.tif",
+        "size_bytes": 40289854,
+        "sha256": "49a23ce63a2f18aa43b085b5004b7d0a1c6918b8684292eec1004452ddc4c490",
+        "cache_sha256": "49a23ce63a2f18aa43b085b5004b7d0a1c6918b8684292eec1004452ddc4c490",
+        "source_etag": "19765d3a1203f15f585b83cf76f01b11",
+        "window_km": 20.0,
+        "stats": {
+          "pixel_size_m": 30.0,
+          "shape": [
+            667,
+            667
+          ],
+          "n_valid": 444889,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 737.76,
+            "max": 985.6,
+            "mean": 812.06,
+            "std": 37.88,
+            "p1": 748.86,
+            "p99": 928.0
+          },
+          "relief_m": {
+            "full_range": 247.84,
+            "p1_p99": 179.13
+          },
+          "slope_deg": {
+            "mean": 2.989,
+            "p50": 1.224,
+            "p95": 12.911,
+            "p99": 21.6,
+            "max": 39.799
+          },
+          "flat_fraction": 0.00949,
+          "above_cliff_gate_fraction": 7e-05,
+          "detrended_rms_m": 29.53,
+          "slope_by_scale": {
+            "30m": {
+              "slope_mean_deg": 2.989,
+              "slope_p95_deg": 12.911
+            },
+            "60m": {
+              "slope_mean_deg": 2.244,
+              "slope_p95_deg": 9.377
+            },
+            "120m": {
+              "slope_mean_deg": 1.652,
+              "slope_p95_deg": 6.651
+            },
+            "240m": {
+              "slope_mean_deg": 1.254,
+              "slope_p95_deg": 4.836
+            }
+          },
+          "grid": "aeqd30",
+          "grid_note": "local azimuthal-equidistant about (43.8, -102.3), 30.0 m square pixels, bilinear; comparable pixel-for-pixel with a 30 m game tile",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          },
+          "native_source_pixel_m": {
+            "east_west": 22.35,
+            "north_south": 30.86
+          },
+          "crosscheck_native_ground": {
+            "note": "no resampling; Horn slope on native 1-arcsec posts with per-row WGS84 ground distances",
+            "slope_mean_deg": 3.278,
+            "slope_p95_deg": 13.694,
+            "mean_slope_ratio_native_over_aeqd30": 1.0967
+          }
+        }
+      },
+      "usgs_3dep_1m": {
+        "product": "USGS 3DEP 1 m DEM",
+        "model_type": "DTM (bare earth: gridded from classified ground returns)",
+        "project": "SD_Southwest_NRCS_SD_2018_D18",
+        "access": "anonymous S3, no credentials; windowed HTTP range read via GDAL /vsicurl/",
+        "source_key": "StagedProducts/Elevation/1m/Projects/SD_Southwest_NRCS_SD_2018_D18/TIFF/USGS_1M_13_x71y486_SD_Southwest_NRCS_SD_2018_D18.tif",
+        "source_url": "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1m/Projects/SD_Southwest_NRCS_SD_2018_D18/TIFF/USGS_1M_13_x71y486_SD_Southwest_NRCS_SD_2018_D18.tif",
+        "source_etag": "96a91c197e9220d132bd5404e16de38d-59",
+        "source_size_bytes": 307935822,
+        "crs": "EPSG:26913",
+        "window_origin_xy_m": [
+          716175.0,
+          4854227.0
+        ],
+        "window_center_xy_m": [
+          717199.0,
+          4853203.0
+        ],
+        "offset_from_site_m": 0.4,
+        "offset_note": "centred on the site",
+        "coverage_fraction": 1.0,
+        "window_px": [
+          2048,
+          2048
+        ],
+        "window_m": 2048,
+        "cache_file": "usgs1m/badlands_sd_2048m.tif",
+        "cache_size_bytes": 7519579,
+        "cache_sha256": "fffe38e8f126e93325b895adc8b2c72e0a12e4c4c0130c550d375e2016e92b2a",
+        "stats": {
+          "pixel_size_m": 1.0,
+          "shape": [
+            2048,
+            2048
+          ],
+          "n_valid": 4194304,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 796.69,
+            "max": 909.05,
+            "mean": 826.16,
+            "std": 24.23,
+            "p1": 797.35,
+            "p99": 883.87
+          },
+          "relief_m": {
+            "full_range": 112.36,
+            "p1_p99": 86.52
+          },
+          "slope_deg": {
+            "mean": 16.529,
+            "p50": 2.987,
+            "p95": 53.796,
+            "p99": 62.324,
+            "max": 79.325
+          },
+          "flat_fraction": 0.0045,
+          "above_cliff_gate_fraction": 0.25339,
+          "detrended_rms_m": 15.858,
+          "slope_by_scale": {
+            "1m": {
+              "slope_mean_deg": 16.529,
+              "slope_p95_deg": 53.796
+            },
+            "3m": {
+              "slope_mean_deg": 15.434,
+              "slope_p95_deg": 49.935
+            },
+            "10m": {
+              "slope_mean_deg": 12.355,
+              "slope_p95_deg": 40.888
+            },
+            "30m": {
+              "slope_mean_deg": 7.323,
+              "slope_p95_deg": 24.128
+            }
+          },
+          "grid": "utm_native",
+          "grid_note": "EPSG:26913, 1 m square pixels as delivered; no reprojection (UTM scale distortion over a 2 km window is <0.1% and is ignored)",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          }
+        }
+      },
+      "dsm_vs_dtm_at_30m": {
+        "note": "SAME footprint, SAME 30 m posting: Copernicus GLO-30 (DSM) read over the exact 2 km box of the cached 3DEP window, against the 3DEP 1 m DTM block-averaged 30x. The ratio is canopy plus buildings, nothing else.",
+        "footprint_center_lat_lon": [
+          43.8,
+          -102.30001
+        ],
+        "footprint_m": 2048.0,
+        "cop30_dsm": {
+          "n": 4356,
+          "slope_mean_deg": 6.209,
+          "slope_p95_deg": 19.659,
+          "detrended_rms_m": 14.519,
+          "relief_p1_p99_m": 77.88
+        },
+        "usgs_dtm_at_30m": {
+          "n": 4356,
+          "slope_mean_deg": 7.323,
+          "slope_p95_deg": 24.128,
+          "detrended_rms_m": 15.403,
+          "relief_p1_p99_m": 84.49
+        },
+        "dsm_over_dtm_mean_slope": 0.848,
+        "dsm_over_dtm_detrended_rms": 0.943
+      }
+    },
+    {
+      "id": "nc_coastal_plain",
+      "geomorphic_class": "coastal_plain_shoreline",
+      "name": "Pamlico Sound shore, Hyde County, North Carolina",
+      "lat": 35.4,
+      "lon": -76.25,
+      "human_description": "Outer coastal plain at the water's edge: a flat, near-sea-level surface with peat domes and drainage canals, ending in a low shoreline against a broad sound.",
+      "why": "The only site that exercises the sea-level machinery, and the reason the void policy is written the way it is: GLO-30 stores open water as exactly 0.0, so an unmasked run turns the sound into a vast perfectly flat 'plain' and halves every slope statistic. This site also exercises the beach/ocean gate in biome.h, which owns a 7 m band around sea level -- here that band is most of the land, so it says what land INSIDE that band really looks like.",
+      "cop30_dsm_bias": "severe",
+      "cop30_dsm_reason": "Pocosin shrub bog and loblolly plantations 10-25 m tall on ground with under 10 m of total relief -- the canopy is taller than the landform. Copernicus is unusable for fine structure here; the 3DEP DTM is the reference and cop30 is kept only to quantify the error.",
+      "cop30": {
+        "product": "Copernicus DEM GLO-30 (COG)",
+        "model_type": "DSM (surface: includes canopy and buildings)",
+        "tile_id": "Copernicus_DSM_COG_10_N35_00_W077_00_DEM",
+        "url": "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N35_00_W077_00_DEM/Copernicus_DSM_COG_10_N35_00_W077_00_DEM.tif",
+        "cache_file": "cop30/Copernicus_DSM_COG_10_N35_00_W077_00_DEM.tif",
+        "size_bytes": 37514858,
+        "sha256": "03119603ed42ec8cd6f0c7ba64a155a2f13d62289565cf1efb5e2ca5d41b82b0",
+        "cache_sha256": "03119603ed42ec8cd6f0c7ba64a155a2f13d62289565cf1efb5e2ca5d41b82b0",
+        "source_etag": "09abeb63d265932a0b0ca75d10c534cd",
+        "window_km": 20.0,
+        "stats": {
+          "pixel_size_m": 30.0,
+          "shape": [
+            667,
+            667
+          ],
+          "n_valid": 325645,
+          "valid_fraction": 0.731969,
+          "elevation_m": {
+            "min": -15.18,
+            "max": 26.81,
+            "mean": 1.94,
+            "std": 3.68,
+            "p1": -2.0,
+            "p99": 14.33
+          },
+          "relief_m": {
+            "full_range": 41.99,
+            "p1_p99": 16.33
+          },
+          "slope_deg": {
+            "mean": 1.067,
+            "p50": 0.339,
+            "p95": 4.471,
+            "p99": 7.955,
+            "max": 20.333
+          },
+          "flat_fraction": 0.24984,
+          "above_cliff_gate_fraction": 0.0,
+          "detrended_rms_m": 3.674,
+          "slope_by_scale": {
+            "30m": {
+              "slope_mean_deg": 1.067,
+              "slope_p95_deg": 4.471
+            },
+            "60m": {
+              "slope_mean_deg": 0.715,
+              "slope_p95_deg": 2.929
+            },
+            "120m": {
+              "slope_mean_deg": 0.461,
+              "slope_p95_deg": 1.716
+            },
+            "240m": {
+              "slope_mean_deg": 0.283,
+              "slope_p95_deg": 0.916
+            }
+          },
+          "grid": "aeqd30",
+          "grid_note": "local azimuthal-equidistant about (35.4, -76.25), 30.0 m square pixels, bilinear; comparable pixel-for-pixel with a 30 m game tile",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.30204,
+            "masked_fraction": 0.30204
+          },
+          "native_source_pixel_m": {
+            "east_west": 25.23,
+            "north_south": 30.82
+          },
+          "crosscheck_native_ground": {
+            "note": "no resampling; Horn slope on native 1-arcsec posts with per-row WGS84 ground distances",
+            "slope_mean_deg": 1.159,
+            "slope_p95_deg": 4.939,
+            "mean_slope_ratio_native_over_aeqd30": 1.0862
+          }
+        }
+      },
+      "usgs_3dep_1m": {
+        "product": "USGS 3DEP 1 m DEM",
+        "model_type": "DTM (bare earth: gridded from classified ground returns)",
+        "project": "NC_HurricaneFlorence_2020_D20",
+        "access": "anonymous S3, no credentials; windowed HTTP range read via GDAL /vsicurl/",
+        "source_key": "StagedProducts/Elevation/1m/Projects/NC_HurricaneFlorence_2020_D20/TIFF/USGS_1M_18_x38y392_NC_HurricaneFlorence_2020_D20.tif",
+        "source_url": "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1m/Projects/NC_HurricaneFlorence_2020_D20/TIFF/USGS_1M_18_x38y392_NC_HurricaneFlorence_2020_D20.tif",
+        "source_etag": "30fd5202abe9e265a6f68ff4dcd9a58b-68",
+        "source_size_bytes": 354782756,
+        "crs": "EPSG:26918",
+        "window_origin_xy_m": [
+          385466.0,
+          3919144.0
+        ],
+        "window_center_xy_m": [
+          386490.0,
+          3918120.0
+        ],
+        "offset_from_site_m": 0.5,
+        "offset_note": "centred on the site",
+        "coverage_fraction": 1.0,
+        "window_px": [
+          2048,
+          2048
+        ],
+        "window_m": 2048,
+        "cache_file": "usgs1m/nc_coastal_plain_2048m.tif",
+        "cache_size_bytes": 12437857,
+        "cache_sha256": "9b51573e819ec413fd1d7a783275f359957f0b635217425805bb1910f9c4f5dd",
+        "stats": {
+          "pixel_size_m": 1.0,
+          "shape": [
+            2048,
+            2048
+          ],
+          "n_valid": 4194304,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": -2.44,
+            "max": 2.76,
+            "mean": 0.29,
+            "std": 0.27,
+            "p1": -0.75,
+            "p99": 0.92
+          },
+          "relief_m": {
+            "full_range": 5.2,
+            "p1_p99": 1.67
+          },
+          "slope_deg": {
+            "mean": 2.614,
+            "p50": 1.429,
+            "p95": 8.773,
+            "p99": 16.57,
+            "max": 40.13
+          },
+          "flat_fraction": 0.06695,
+          "above_cliff_gate_fraction": 2e-05,
+          "detrended_rms_m": 0.261,
+          "slope_by_scale": {
+            "1m": {
+              "slope_mean_deg": 2.614,
+              "slope_p95_deg": 8.773
+            },
+            "3m": {
+              "slope_mean_deg": 1.224,
+              "slope_p95_deg": 4.205
+            },
+            "10m": {
+              "slope_mean_deg": 0.428,
+              "slope_p95_deg": 1.415
+            },
+            "30m": {
+              "slope_mean_deg": 0.143,
+              "slope_p95_deg": 0.4
+            }
+          },
+          "grid": "utm_native",
+          "grid_note": "EPSG:26918, 1 m square pixels as delivered; no reprojection (UTM scale distortion over a 2 km window is <0.1% and is ignored)",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          }
+        }
+      },
+      "dsm_vs_dtm_at_30m": {
+        "note": "SAME footprint, SAME 30 m posting: Copernicus GLO-30 (DSM) read over the exact 2 km box of the cached 3DEP window, against the 3DEP 1 m DTM block-averaged 30x. The ratio is canopy plus buildings, nothing else.",
+        "footprint_center_lat_lon": [
+          35.4,
+          -76.25
+        ],
+        "footprint_m": 2048.0,
+        "cop30_dsm": {
+          "n": 4248,
+          "slope_mean_deg": 0.761,
+          "slope_p95_deg": 4.231,
+          "detrended_rms_m": 2.001,
+          "relief_p1_p99_m": 12.71
+        },
+        "usgs_dtm_at_30m": {
+          "n": 4356,
+          "slope_mean_deg": 0.143,
+          "slope_p95_deg": 0.4,
+          "detrended_rms_m": 0.18,
+          "relief_p1_p99_m": 1.06
+        },
+        "dsm_over_dtm_mean_slope": 5.322,
+        "dsm_over_dtm_detrended_rms": 11.117
+      }
+    },
+    {
+      "id": "grand_canyon_plateau",
+      "geomorphic_class": "plateau_incised_canyon",
+      "name": "Grand Canyon, South Rim, Arizona (Bright Angel / Tonto)",
+      "lat": 36.15,
+      "lon": -112.2,
+      "human_description": "A flat plateau surface abruptly cut by a 1500 m canyon with a stepped cliff-and-bench profile from alternating hard and soft beds.",
+      "why": "The class our height-field amplifier is least equipped to produce. It is defined by STRATIGRAPHY: near-vertical risers alternating with near-horizontal treads at elevations that are consistent for tens of kilometres, plus a flat rim that is not merely 'less steep'. The slope histogram is strongly bimodal and elevation shows banding, neither of which any amplitude-tuned noise produces. 3DEP covers the park at 1 m over bare rock, so the bench structure is measurable rather than argued about.",
+      "cop30_dsm_bias": "negligible",
+      "cop30_dsm_reason": "Bare Kaibab/Coconino rock in the canyon; open pinyon-juniper on the rim adds a few metres, which is nothing against 1500 m of relief.",
+      "cop30": {
+        "product": "Copernicus DEM GLO-30 (COG)",
+        "model_type": "DSM (surface: includes canopy and buildings)",
+        "tile_id": "Copernicus_DSM_COG_10_N36_00_W113_00_DEM",
+        "url": "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N36_00_W113_00_DEM/Copernicus_DSM_COG_10_N36_00_W113_00_DEM.tif",
+        "cache_file": "cop30/Copernicus_DSM_COG_10_N36_00_W113_00_DEM.tif",
+        "size_bytes": 40201504,
+        "sha256": "3778b88efb81c8f05aa483d1d5267c07c55e058f34df6603f29be0ac99289e7b",
+        "cache_sha256": "3778b88efb81c8f05aa483d1d5267c07c55e058f34df6603f29be0ac99289e7b",
+        "source_etag": "9303de7b4547880b1351c90cb8c1dd61",
+        "window_km": 20.0,
+        "stats": {
+          "pixel_size_m": 30.0,
+          "shape": [
+            667,
+            667
+          ],
+          "n_valid": 444889,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 677.59,
+            "max": 2570.22,
+            "mean": 1549.29,
+            "std": 479.18,
+            "p1": 743.67,
+            "p99": 2511.77
+          },
+          "relief_m": {
+            "full_range": 1892.63,
+            "p1_p99": 1768.09
+          },
+          "slope_deg": {
+            "mean": 29.181,
+            "p50": 30.025,
+            "p95": 57.631,
+            "p99": 65.588,
+            "max": 73.72
+          },
+          "flat_fraction": 6e-05,
+          "above_cliff_gate_fraction": 0.38756,
+          "detrended_rms_m": 420.818,
+          "slope_by_scale": {
+            "30m": {
+              "slope_mean_deg": 29.181,
+              "slope_p95_deg": 57.631
+            },
+            "60m": {
+              "slope_mean_deg": 28.019,
+              "slope_p95_deg": 54.671
+            },
+            "120m": {
+              "slope_mean_deg": 25.561,
+              "slope_p95_deg": 49.152
+            },
+            "240m": {
+              "slope_mean_deg": 21.26,
+              "slope_p95_deg": 41.35
+            }
+          },
+          "grid": "aeqd30",
+          "grid_note": "local azimuthal-equidistant about (36.15, -112.2), 30.0 m square pixels, bilinear; comparable pixel-for-pixel with a 30 m game tile",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          },
+          "native_source_pixel_m": {
+            "east_west": 25.0,
+            "north_south": 30.82
+          },
+          "crosscheck_native_ground": {
+            "note": "no resampling; Horn slope on native 1-arcsec posts with per-row WGS84 ground distances",
+            "slope_mean_deg": 27.493,
+            "slope_p95_deg": 57.355,
+            "mean_slope_ratio_native_over_aeqd30": 0.9422
+          }
+        }
+      },
+      "usgs_3dep_1m": {
+        "product": "USGS 3DEP 1 m DEM",
+        "model_type": "DTM (bare earth: gridded from classified ground returns)",
+        "project": "AZ_GrandCanyonNP_2019_B19",
+        "access": "anonymous S3, no credentials; windowed HTTP range read via GDAL /vsicurl/",
+        "source_key": "StagedProducts/Elevation/1m/Projects/AZ_GrandCanyonNP_2019_B19/TIFF/USGS_1M_12_x39y400_AZ_GrandCanyonNP_2019_B19.tif",
+        "source_url": "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1m/Projects/AZ_GrandCanyonNP_2019_B19/TIFF/USGS_1M_12_x39y400_AZ_GrandCanyonNP_2019_B19.tif",
+        "source_etag": "adcc7d9dc9adc9c9139470b70b949a68",
+        "source_size_bytes": 107186344,
+        "crs": "EPSG:26912",
+        "window_origin_xy_m": [
+          397958.0,
+          4000006.0
+        ],
+        "window_center_xy_m": [
+          398982.0,
+          3998982.0
+        ],
+        "offset_from_site_m": 7294.8,
+        "offset_note": "window slid inside the tile to stay on covered ground; 3DEP flight-line gaps are stored as -999999 inside an otherwise normal 10 km raster",
+        "coverage_fraction": 1.0,
+        "window_px": [
+          2048,
+          2048
+        ],
+        "window_m": 2048,
+        "cache_file": "usgs1m/grand_canyon_plateau_2048m.tif",
+        "cache_size_bytes": 8149327,
+        "cache_sha256": "cce5a28b5b52f180aa787c47c0f94ad5619a8bb9b55e2047fced545e400de401",
+        "stats": {
+          "pixel_size_m": 1.0,
+          "shape": [
+            2048,
+            2048
+          ],
+          "n_valid": 4194304,
+          "valid_fraction": 1.0,
+          "elevation_m": {
+            "min": 1011.22,
+            "max": 1974.39,
+            "mean": 1333.58,
+            "std": 181.41,
+            "p1": 1047.07,
+            "p99": 1869.17
+          },
+          "relief_m": {
+            "full_range": 963.16,
+            "p1_p99": 822.1
+          },
+          "slope_deg": {
+            "mean": 32.155,
+            "p50": 30.784,
+            "p95": 65.272,
+            "p99": 81.713,
+            "max": 89.193
+          },
+          "flat_fraction": 0.0,
+          "above_cliff_gate_fraction": 0.33383,
+          "detrended_rms_m": 142.802,
+          "slope_by_scale": {
+            "1m": {
+              "slope_mean_deg": 32.155,
+              "slope_p95_deg": 65.272
+            },
+            "3m": {
+              "slope_mean_deg": 32.371,
+              "slope_p95_deg": 64.839
+            },
+            "10m": {
+              "slope_mean_deg": 32.255,
+              "slope_p95_deg": 62.309
+            },
+            "30m": {
+              "slope_mean_deg": 31.23,
+              "slope_p95_deg": 59.03
+            }
+          },
+          "grid": "utm_native",
+          "grid_note": "EPSG:26912, 1 m square pixels as delivered; no reprojection (UTM scale distortion over a 2 km window is <0.1% and is ignored)",
+          "voids": {
+            "nodata_fraction": 0.0,
+            "sea_or_zero_fraction": 0.0,
+            "masked_fraction": 0.0
+          }
+        }
+      },
+      "dsm_vs_dtm_at_30m": {
+        "note": "SAME footprint, SAME 30 m posting: Copernicus GLO-30 (DSM) read over the exact 2 km box of the cached 3DEP window, against the 3DEP 1 m DTM block-averaged 30x. The ratio is canopy plus buildings, nothing else.",
+        "footprint_center_lat_lon": [
+          36.13028,
+          -112.12266
+        ],
+        "footprint_m": 2048.0,
+        "cop30_dsm": {
+          "n": 4356,
+          "slope_mean_deg": 30.414,
+          "slope_p95_deg": 56.024,
+          "detrended_rms_m": 141.948,
+          "relief_p1_p99_m": 797.53
+        },
+        "usgs_dtm_at_30m": {
+          "n": 4356,
+          "slope_mean_deg": 31.23,
+          "slope_p95_deg": 59.03,
+          "detrended_rms_m": 142.08,
+          "relief_p1_p99_m": 818.96
+        },
+        "dsm_over_dtm_mean_slope": 0.974,
+        "dsm_over_dtm_detrended_rms": 0.999
+      }
+    }
+  ],
+  "coverage": {
+    "classes": {
+      "alpine_glaciated": [
+        "alps_valais_alpine",
+        "teton_range_alpine"
+      ],
+      "high_relief_fluvial_mountains": [
+        "smokies_appalachian",
+        "nepal_midhills"
+      ],
+      "rolling_hills_soil_mantled": [
+        "iowa_rolling_hills"
+      ],
+      "plains_low_relief": [
+        "llano_estacado_plains",
+        "illinois_till_plain"
+      ],
+      "desert_aeolian_dunes": [
+        "white_sands_dunes",
+        "rub_al_khali_dunes"
+      ],
+      "badlands_dissected": [
+        "badlands_sd"
+      ],
+      "coastal_plain_shoreline": [
+        "nc_coastal_plain"
+      ],
+      "plateau_incised_canyon": [
+        "grand_canyon_plateau"
+      ]
+    },
+    "gaps": [
+      {
+        "class": "alpine_glaciated (non-CONUS)",
+        "gap": "no free 1 m bare-earth DEM for the Alps or any Himalayan site",
+        "handled": "glacier_np_alpine supplies a 1 m DTM for the same landform family inside 3DEP coverage"
+      },
+      {
+        "class": "desert_aeolian_dunes (mega-dune scale)",
+        "gap": "no free 1 m DEM anywhere in the great ergs (Rub' al Khali, Sahara, Taklamakan)",
+        "handled": "white_sands_dunes supplies 1 m for small dunes; rub_al_khali_dunes is cop30-only, which is acceptable because 100-250 m draa with 2-3 km spacing are fully resolved at 30 m"
+      },
+      {
+        "class": "karst / doline landscapes",
+        "gap": "NOT COVERED. Closed depressions are a distinct landform class with no fluvial analogue, and our height-field amplifier cannot make them at all.",
+        "handled": "deliberately omitted rather than approximated -- worldgen has no karst term, so a reference would only measure a thing we do not attempt"
+      },
+      {
+        "class": "volcanic constructional (cones, lava fields)",
+        "gap": "NOT COVERED by design",
+        "handled": "classifyBiome has no volcanic class; adding a reference would imply a capability worldgen does not have"
+      },
+      {
+        "class": "true continental-shelf / submarine",
+        "gap": "NOT COVERED. Copernicus is a land DSM; below the shoreline it is 0.0, not bathymetry.",
+        "handled": "biome.h OCEAN terrain is generated, not amplified from tiles; if that changes the reference would have to be GEBCO or ETOPO, not this corpus (see tools/fetch_etopo.py)"
+      }
+    ]
+  },
+  "findings": {
+    "cop30_is_smoother_than_the_ground_at_its_own_posting": {
+      "what": "On 6 of the 9 sites with bare-earth data, Copernicus GLO-30 gives a LOWER mean 30 m slope than the 3DEP 1 m DTM block-averaged to the same 30 m posting, over the same footprint. GLO-30 is not a faithful 30 m sample of the ground; it is a smoothed radar product whose effective resolution is coarser than its posting.",
+      "dsm_over_dtm_mean_slope_below_1": {
+        "white_sands_dunes": 0.642,
+        "badlands_sd": 0.848,
+        "teton_range_alpine": 0.902,
+        "iowa_rolling_hills": 0.906,
+        "grand_canyon_plateau": 0.974
+      },
+      "worst_case": "white_sands_dunes at 0.64 -- dune crests with ~150 m spacing and ~10 m amplitude lose over a third of their slope signal",
+      "consequence": "Do NOT calibrate generated 30 m terrain against cop30 alone and conclude it is correct: you would be matching a reference that is already too smooth. Where a site has usgs_3dep_1m, its 30 m rung in slope_by_scale is the better target."
+    },
+    "dsm_bias_shows_up_in_elevation_far_more_than_in_slope": {
+      "what": "Continuous canopy is close to a uniform vertical offset, and an offset cancels in a gradient. The Smokies -- 20-40 m of unbroken forest -- came out at only +13% on 30 m mean slope. The DSM penalty is severe only where the canopy is TALL RELATIVE TO THE LANDFORM and patchy.",
+      "dsm_over_dtm_mean_slope_at_or_above_1": {
+        "nc_coastal_plain": 5.322,
+        "llano_estacado_plains": 1.358,
+        "smokies_appalachian": 1.127,
+        "illinois_till_plain": 1.075
+      },
+      "worst_case": "nc_coastal_plain at 5.3x slope and 11x detrended roughness -- pocosin shrub and pine plantation 10-25 m tall on ground with under 2 m of relief. Copernicus is unusable for low-relief vegetated terrain.",
+      "consequence": "The sites where the DSM caveat actually bites are the LOW-RELIEF ones, which is exactly where our terrain is said to look worst. Use the 3DEP DTM for every plains and coastal comparison."
+    },
+    "projection_crosscheck": {
+      "what": "Mean slope from the un-resampled native geographic grid divided by mean slope from the 30 m local-equidistant reprojection, per site. All within 0.94-1.15, so neither route has a units or cos(lat) error.",
+      "ratios": {
+        "alps_valais_alpine": 1.0133,
+        "teton_range_alpine": 0.9589,
+        "smokies_appalachian": 1.0348,
+        "nepal_midhills": 0.994,
+        "iowa_rolling_hills": 1.0807,
+        "llano_estacado_plains": 1.1199,
+        "illinois_till_plain": 1.1081,
+        "white_sands_dunes": 1.1497,
+        "rub_al_khali_dunes": 1.0486,
+        "badlands_sd": 1.0967,
+        "nc_coastal_plain": 1.0862,
+        "grand_canyon_plateau": 0.9422
+      },
+      "reading": "Ratios above 1 are the bilinear resample gently low-passing fine texture (worst on the finest-textured sites: white_sands 1.15, llano 1.12, badlands 1.10); ratios near 1 are the smooth, large-wavelength sites."
+    }
+  }
+}

@@ -1,4 +1,4 @@
-# build outputs
+﻿# build outputs
 build/
 build-*/
 tile-cache/
@@ -20,7 +20,7 @@ __pycache__/
 .idea/
 .DS_Store
 
-# UE (M1+) — build outputs and generated IDE files (regenerate with
+# UE (M1+) â€” build outputs and generated IDE files (regenerate with
 # Build.bat -projectfiles)
 ue-project/Binaries/
 ue-project/DerivedDataCache/
@@ -55,6 +55,13 @@ bake_out.npy
 # of .npy plus its JSON sidecars, and the cached 8192^2 bake interior alone is
 # 268 MB. The TOOLS are the deliverable; the dumps are regenerated from the seed
 # in minutes. A 67 MB .npy was committed to this repo once already and had to be
-# amended out of history — the sidecars are ignored too so a `git add -A` can
+# amended out of history â€” the sidecars are ignored too so a `git add -A` can
 # never bring half a dump in.
 stage-dumps/
+
+# Earth reference rasters. ~600 MB of Copernicus tiles and USGS 3DEP window
+# extracts, rebuilt on demand by terrain-service/tools/earth_reference.py. The
+# committed artifact is data/earth_reference/manifest.json, which carries every
+# URL, window and sha256 needed to reproduce the cache byte-for-byte.
+terrain-service/data/earth_reference/cache/
+
