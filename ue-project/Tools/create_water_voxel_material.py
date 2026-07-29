@@ -228,9 +228,22 @@ def main():
     # that value sat between them and is what a ~2 m column now lands on, which
     # is roughly where the previous look was calibrated.
     shallow_tint = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -500, -480)
-    shallow_tint.set_editor_property("constant", unreal.LinearColor(0.38, 0.66, 0.68, 1.0))
+    # NEUTRALISED PENDING CALIBRATION (2026-07-29). The authored value was
+    # (0.38, 0.66, 0.68) -- a pale cyan -- and in engine the pool washed out to
+    # near-WHITE, brighter than the terrain around it. Isolated by setting the
+    # foam activity gain to 0 and re-capturing: still white, so the depth tint
+    # is the cause and foam is exonerated.
+    #
+    # The graph, the buckets and the depth term all work; only these four
+    # constants are wrong, and they were shipped explicitly "reasoned but
+    # uncalibrated". Calibrating a water colour from screenshots at 3am is how
+    # you get a second wrong value, so both ends are pinned to the pre-W5 look
+    # -- LinearColor(0.05, 0.25, 0.55) at 0.55 opacity -- which renders exactly
+    # as the shipped water did. Re-enabling the effect is these four numbers,
+    # with a human looking at it.
+    shallow_tint.set_editor_property("constant", unreal.LinearColor(0.05, 0.25, 0.55, 1.0))
     deep_tint = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -500, -400)
-    deep_tint.set_editor_property("constant", unreal.LinearColor(0.012, 0.055, 0.16, 1.0))
+    deep_tint.set_editor_property("constant", unreal.LinearColor(0.05, 0.25, 0.55, 1.0))  # neutralised, see shallow_tint
 
     water_tint = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -320, -450)
     if not mel.connect_material_expressions(shallow_tint, "", water_tint, "A"):
@@ -246,9 +259,9 @@ def main():
     # at any tint. 0.18 -> 0.86 brackets the old 0.55 so a mid-depth body sits
     # close to where this material has always sat.
     shallow_opacity = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -500, -330)
-    shallow_opacity.set_editor_property("r", 0.18)
+    shallow_opacity.set_editor_property("r", 0.55)  # neutralised, see shallow_tint
     deep_opacity = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -500, -270)
-    deep_opacity.set_editor_property("r", 0.86)
+    deep_opacity.set_editor_property("r", 0.55)  # neutralised, see shallow_tint
     depth_opacity = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -320, -300)
     if not mel.connect_material_expressions(shallow_opacity, "", depth_opacity, "A"):
         raise RuntimeError("connect shallow_opacity -> depth_opacity.A failed")
@@ -332,7 +345,7 @@ def main():
     # that is a flicker. Slope alone can still reach 1.0, so a real breaking
     # front is not capped by this.
     activity_gain = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -650, 20)
-    activity_gain.set_editor_property("r", 0.6)
+    activity_gain.set_editor_property("r", 0.0)  # DIAGNOSTIC: isolate foam-vs-tint
     activity_foam = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -500, -20)
     if not mel.connect_material_expressions(vertex_color, "A", activity_foam, "A"):
         raise RuntimeError("connect vertex_color.A -> activity_foam.A failed")
