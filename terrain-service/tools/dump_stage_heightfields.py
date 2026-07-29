@@ -24,6 +24,22 @@ The five stages, and who writes them:
 ``voxel-core/bench/stagedump.cpp`` writes S2-S4 with the SAME sidecar schema
 (``vxc.stagedump.v1``) over the same world rectangle, so all five diff directly.
 
+``--stages`` splits S1 into its own sub-stages, because "the finished bake is
+wrong" has repeatedly been measurable while "which stage made it wrong" was not
+(the geomorph suite localised two defects only as far as "somewhere in the
+server bake" -- terrain-service/docs/geomorph-validation.md):
+
+    S1a  after B0 carrier + B1 roughness   the un-eroded amplified surface
+    S1f  after B2a epsilon fill            measures OUR fill, not the landscape
+    S1b  after B2d stream-power incision   what erosion carved
+    S1   after B3 thermal relaxation       what survives relaxation (= the bake)
+
+All four come from ONE bake_tile run (`pipeline.STAGE_SINK_FIELDS`), same
+schema, same lattice, so "carved then erased" vs "never carved" is a direct
+per-stage diff. The accumulation and incision-depth fields are cached beside
+them as plain .npy (S1acc/S1depth) for diagnosis; they are not surfaces and are
+never dumped as heightfields.
+
 GEOMETRY, WHICH IS THE PART THAT IS EASY TO GET SILENTLY WRONG
 --------------------------------------------------------------
 Every tier in this pipeline uses the same NODE convention: the sample with
@@ -76,7 +92,7 @@ USAGE
         --out DIR --seed 20260719 \
         --tiles-dir <s1 dir> \
         --origin -67920 34800 --span 960 \
-        --bake --bake-cache-dir DIR \
+        --bake --bake-cache-dir DIR [--stages] \
         [--verify-vxtl <s16 dir>] \
         [--cell 30000] [--cell 1875] [--s0-only]
 
@@ -255,18 +271,53 @@ def bake_cache_path(cache_dir: Path, tx: int, ty: int, seed: int) -> Path:
     return cache_dir / f"S1_bake_{tx}_{ty}_seed{seed}.npy"
 
 
-def run_bake(tiles_dir: Path, tx: int, ty: int, seed: int, cache_dir: Path) -> tuple[Path, dict]:
+#: The sub-stages worth a heightfield of their own, keyed by the
+#: ``pipeline.STAGE_SINK_FIELDS`` name that produces each. ``B3.relaxed`` is
+#: S1 itself and is cached under the S1 name; the two non-elevation fields
+#: (accumulation, incision depth) are cached for diagnosis but never dumped as
+#: stage heightfields, because they are not surfaces.
+SUB_STAGES = {
+    "B0B1.carrier_rough": ("S1a", "bake after B0 carrier + B1 roughness, "
+                                  "before any erosion"),
+    "B2a.filled": ("S1f", "bake after B2a epsilon depression fill (measures "
+                          "OUR fill, not the landscape -- see sidecar note)"),
+    "B2d.incised": ("S1b", "bake after B2d stream-power incision, before "
+                           "B3 thermal relaxation"),
+}
+#: Diagnostic (non-surface) fields, cached as .npy only.
+SUB_FIELDS = {
+    "B2c.accumulation_m2": "S1acc",
+    "B2d.incision_depth_m": "S1depth",
+}
+
+
+def stage_cache_path(cache_dir: Path, tag: str, tx: int, ty: int, seed: int) -> Path:
+    return cache_dir / f"{tag}_bake_{tx}_{ty}_seed{seed}.npy"
+
+
+def run_bake(tiles_dir: Path, tx: int, ty: int, seed: int, cache_dir: Path,
+             stages: bool = False) -> tuple[Path, dict]:
     """``bake_tile`` for one coarse tile, cached as the full 8192^2 interior.
 
     This is the same call ``bake_real_tile.py`` makes, superblock included --
     baking without the level-0 hydrology superblock changes the flow
     accumulation, hence the incision, hence the surface, so a no-superblock
     bake is a different S1 than the one the shipped tile came from.
+
+    ``stages=True`` also caches every sub-stage surface the pipeline hands to
+    ``bake_tile``'s ``stage_sink`` (B0+B1, B2a fill, B2d incision, plus the
+    accumulation and incision-depth fields). The bake is deterministic, so a
+    cached S1 without its sub-stages forces a re-bake rather than serving a
+    partial answer.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
     npy = bake_cache_path(cache_dir, tx, ty, seed)
     meta = npy.with_suffix(".json")
-    if npy.exists() and meta.exists():
+    tags = {**{k: v[0] for k, v in SUB_STAGES.items()}, **SUB_FIELDS}
+    stage_npys = {name: stage_cache_path(cache_dir, tag, tx, ty, seed)
+                  for name, tag in tags.items()}
+    have_stages = all(p.exists() for p in stage_npys.values())
+    if npy.exists() and meta.exists() and (not stages or have_stages):
         print(f"  S1: reusing cached bake {npy}")
         return npy, json.loads(meta.read_text())
 
@@ -274,7 +325,8 @@ def run_bake(tiles_dir: Path, tx: int, ty: int, seed: int, cache_dir: Path) -> t
     geom.assert_production()
     consts = bp.CONSTANTS
     print(f"  S1: baking tile ({tx},{ty}) at {geom.fine_pixel_m} m/px, "
-          f"{geom.fine_tile_px}^2 interior + {geom.apron_m:.0f} m apron")
+          f"{geom.fine_tile_px}^2 interior + {geom.apron_m:.0f} m apron"
+          + (" (with sub-stage dumps)" if stages else ""))
     print(f"      estimate_peak_bytes {bp.estimate_peak_bytes(geom)/2**30:.2f} GiB "
           "-- do NOT run two of these at once")
 
@@ -283,9 +335,15 @@ def run_bake(tiles_dir: Path, tx: int, ty: int, seed: int, cache_dir: Path) -> t
     lvl = bp.FlowLevel(0, geom, consts)
     sx, sy = bp.superblock_index(tx, ty, lvl)
     inflow = bp.build_flow_superblock(fetch, sx, sy, lvl, kernels)
+
+    def sink(name: str, interior: np.ndarray) -> None:
+        if name in stage_npys:
+            np.save(stage_npys[name], np.ascontiguousarray(interior, np.float32))
+
     c0 = time.process_time()
     res = bp.bake_tile(world_seed=seed, tile_x=tx, tile_y=ty, coarse_fetch=fetch,
-                       kernels=kernels, geom=geom, consts=consts, inflow_source=inflow)
+                       kernels=kernels, geom=geom, consts=consts, inflow_source=inflow,
+                       stage_sink=sink if stages else None)
     cpu = time.process_time() - c0
     print(f"      bake {cpu:.1f} s cpu, relief {res.stats['relief_m']:.1f} m")
 
@@ -304,6 +362,8 @@ def run_bake(tiles_dir: Path, tx: int, ty: int, seed: int, cache_dir: Path) -> t
         "cpu_seconds_bake": cpu,
         "cpu_stages": res.cpu_seconds,
         "stats": res.stats,
+        "stage_arrays": ({name: str(p) for name, p in stage_npys.items()}
+                         if stages else {}),
     }
     meta.write_text(json.dumps(rec, indent=2))
     return npy, rec
@@ -452,6 +512,12 @@ def main() -> int:
     ap.add_argument("--bake", action="store_true",
                     help="run the bake if it is not already cached (~150 CPU-s, ~5.5 GiB "
                          "peak RSS per tile -- do NOT run two at once)")
+    ap.add_argument("--stages", action="store_true",
+                    help="also cache + dump the bake's SUB-stages -- S1a after B0+B1 "
+                         "(carrier + roughness), S1f after the B2a fill, S1b after B2d "
+                         "incision -- so 'which stage made it wrong' is answerable. "
+                         "Costs 4 extra 268 MB .npy files per tile; a cached bake "
+                         "without them is re-baked.")
     ap.add_argument("--bake-cache-dir", default=None,
                     help="where the full 8192^2 bake interior is cached (default: --out)")
     ap.add_argument("--verify-vxtl", default=None, metavar="S16_DIR",
@@ -538,12 +604,18 @@ def main() -> int:
             "baked one tile at a time, so choose a footprint inside a single tile"
         )
     npy = bake_cache_path(cache_dir, tx0, ty0, a.seed)
-    if not (npy.exists() and npy.with_suffix(".json").exists()) and not a.bake:
+    cached = npy.exists() and npy.with_suffix(".json").exists()
+    if cached and a.stages:
+        tags = list(v[0] for v in SUB_STAGES.values()) + list(SUB_FIELDS.values())
+        cached = all(stage_cache_path(cache_dir, t, tx0, ty0, a.seed).exists()
+                     for t in tags)
+    if not cached and not a.bake:
         raise SystemExit(
-            f"no cached bake at {npy}. Pass --bake to produce it (~150 CPU-s, "
-            "~5.5 GiB peak RSS -- do NOT run two at once), or --s0-only."
+            f"no cached bake (with the requested stages) at {npy}. Pass --bake to "
+            "produce it (~150 CPU-s, ~5.5 GiB peak RSS -- do NOT run two at once), "
+            "or --s0-only."
         )
-    npy, bake_meta = run_bake(tiles_dir, tx0, ty0, a.seed, cache_dir)
+    npy, bake_meta = run_bake(tiles_dir, tx0, ty0, a.seed, cache_dir, stages=a.stages)
 
     verify = {"checked": False, "reason": "--verify-vxtl not given"}
     if a.verify_vxtl:
@@ -562,23 +634,41 @@ def main() -> int:
 
     fine_mm = int(round(bp.PRODUCTION.fine_pixel_m * 1000))
     s1_cells = [c for c in cells if c[0] % fine_mm == 0] or [(fine_mm, None)]
+    # The dumpable stages of this bake, innermost first. S1 (the finished
+    # surface) is always dumped; the sub-stages only with --stages, from the
+    # same cached bake, so every stage in the set describes the same run.
+    stage_list = []
+    if a.stages:
+        for name, (tag, desc) in SUB_STAGES.items():
+            stage_list.append((
+                tag, stage_cache_path(cache_dir, tag, tx0, ty0, a.seed), desc,
+                f"terrain_service.bake.pipeline.bake_tile(..., stage_sink=...) "
+                f"['{name}'] -- SAMPLES, interior only",
+            ))
+    stage_list.append((
+        "S1", npy,
+        "bake output after carrier + roughness + flow + incision + thermal",
+        "terrain_service.bake.pipeline.bake_tile(...).elevation_m -- SAMPLES, "
+        "not the prefiltered control lattice the .vxtl ships",
+    ))
     for cell_mm, own in s1_cells:
         lat = Lattice(cell_mm, origin_mm, span_mm, own if own is None else own * 1000)
-        vals = sample_s1(npy, tx0, ty0, lat)
-        base = f"S1_bake_{cell_mm}mm"
-        manifest["files"].append(write_stage(
-            out, base, vals, lat,
-            stage="S1", tier="bake",
-            name="bake output after carrier + roughness + flow + incision + thermal",
-            seed=a.seed,
-            source="terrain_service.bake.pipeline.bake_tile(...).elevation_m -- SAMPLES, "
-                   "not the prefiltered control lattice the .vxtl ships",
-            provenance={"bake_array": str(npy), "vxtl_reconstruction_check": verify,
-                        "emitted_vxtl": str(emitted) if emitted else "",
-                        **bake_meta},
-        ))
-        print(f"  S1 {base}: {lat.n}^2 @ {cell_mm/1000:g} m, "
-              f"{vals.min():.1f}..{vals.max():.1f} m")
+        for stage, stage_npy, name, source in stage_list:
+            vals = sample_s1(stage_npy, tx0, ty0, lat)
+            base = f"{stage}_bake_{cell_mm}mm"
+            manifest["files"].append(write_stage(
+                out, base, vals, lat,
+                stage=stage, tier="bake",
+                name=name,
+                seed=a.seed,
+                source=source,
+                provenance={"bake_array": str(stage_npy),
+                            "vxtl_reconstruction_check": verify,
+                            "emitted_vxtl": str(emitted) if emitted else "",
+                            **bake_meta},
+            ))
+            print(f"  {stage} {base}: {lat.n}^2 @ {cell_mm/1000:g} m, "
+                  f"{vals.min():.1f}..{vals.max():.1f} m")
 
     (out / "manifest_server.json").write_text(json.dumps(manifest, indent=2))
     print(f"\nwrote {len(manifest['files'])} heightfield(s) + sidecars to {out}")
