@@ -41,7 +41,17 @@ namespace vxc {
 // 7 (drainage carving + a region-fitted precip retune). This work branched from
 // main at v6 and takes 8 so the two can land in either order without colliding.
 // The check at editlog.h is exact equality, not a range, so a gap is harmless.
-inline constexpr uint32_t kWorldGenVersion = 8;
+// v9 (docs/terrain-amplification-plan.md Phase 1): the C2 carrier. The tile
+// base is a uniform cubic B-spline instead of bilinear, killing the gradient
+// step at every tile-pixel boundary that made the 30 m grid visible under
+// directional light; the detail/soil/biome slope currency moves from mm per
+// tile PIXEL to mm per METRE, taken from the carrier's analytic gradient, which
+// both removes the per-cell gain step and fixes the scale-dependence biome.h
+// had recorded as a latent bug; climate is sampled with a faded bilinear plus
+// an ecotone dither instead of nearest-pixel, so material boundaries stop
+// snapping to the pixel grid. surfaceBoundsMm is re-derived as a Lipschitz
+// bound around one carrier evaluation.
+inline constexpr uint32_t kWorldGenVersion = 9;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 

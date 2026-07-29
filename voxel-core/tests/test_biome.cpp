@@ -1,4 +1,4 @@
-// Biome classification v1 (M4 round-1, docs/m4-plan.md): morphology gates
+﻿// Biome classification v1 (M4 round-1, docs/m4-plan.md): morphology gates
 // before the Whittaker climate table. Direct classifyBiome()/
 // biomeSurfaceMaterial() calls with hand-picked climate/morphology inputs
 // (not routed through Amplifier/tiles) so every case is exactly controlled.
@@ -45,7 +45,7 @@ VXC_TEST(biome_steep_slope_overrides_climate) {
     // this returned TUNDRA_ALPINE, i.e. permafrost, on a 25 C rainforest
     // hillside -- and at a "cliff" threshold of 11 degrees.)
     CHECK_EQ(classifyBiome(T(25), P(2500), S(1000), kInlandMm,
-                           kBiomeCliffSlopeMmPerPx + 1),
+                           kBiomeCliffSlopeMmPerM + 1),
              BARE_ROCK);
 }
 
@@ -77,9 +77,9 @@ VXC_TEST(biome_morphology_gate_varying_slope) {
     // Fixed climate that Whittaker-picks TEMPERATE_FOREST at slope 0
     // (10 C is not "warm", 1200 mm/yr is in the moderate band).
     CHECK_EQ(classifyBiome(T(10), P(1200), S(500), kInlandMm, 0), TEMPERATE_FOREST);
-    CHECK_EQ(classifyBiome(T(10), P(1200), S(500), kInlandMm, kBiomeCliffSlopeMmPerPx),
+    CHECK_EQ(classifyBiome(T(10), P(1200), S(500), kInlandMm, kBiomeCliffSlopeMmPerM),
              TEMPERATE_FOREST);
-    CHECK_EQ(classifyBiome(T(10), P(1200), S(500), kInlandMm, kBiomeCliffSlopeMmPerPx + 1),
+    CHECK_EQ(classifyBiome(T(10), P(1200), S(500), kInlandMm, kBiomeCliffSlopeMmPerM + 1),
              BARE_ROCK);
 }
 
@@ -133,7 +133,7 @@ VXC_TEST(biome_every_id_reachable_from_physical_ranges) {
             for (int64_t bio4 : {int64_t(400), int64_t(2200)})
                 for (int32_t elevMm : {kBiomeBeachLowerMm - 1, kBiomeBeachUpperMm,
                                        kInlandMm, 2'000'000, 4'000'000})
-                    for (int64_t slope : {int64_t(0), kBiomeCliffSlopeMmPerPx + 1})
+                    for (int64_t slope : {int64_t(0), kBiomeCliffSlopeMmPerM + 1})
                         seen[classifyBiome(T(degC), P(mm), S(bio4), elevMm, slope)] = true;
     for (int b = 0; b < kBiomeCount; ++b) CHECK(seen[b]);
 }
@@ -163,5 +163,5 @@ VXC_TEST(biome_map_golden_digest) {
                 }
             }
         }
-    CHECK_EQ(d.h, 0xF021DB819E6F9B65ull); // GOLDEN(biome_map)
+    CHECK_EQ(d.h, 0x7D36AFFD6B9DE5C5ull); // GOLDEN(biome_map)
 }

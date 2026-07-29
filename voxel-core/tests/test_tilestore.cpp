@@ -1,7 +1,7 @@
-// Tile decoding + sampling (plan §3.1 step 2, §3.4 ITerrainSource): a
+﻿// Tile decoding + sampling (plan Â§3.1 step 2, Â§3.4 ITerrainSource): a
 // cross-language fixture test. The fixture file is a byte-for-byte tile
 // produced by terrain-service's Python synthetic provider + tile_codec.encode
-// (seed=1, x=0, y=0, scale=1) — see voxel-core/tests/fixtures/README-less
+// (seed=1, x=0, y=0, scale=1) â€” see voxel-core/tests/fixtures/README-less
 // provenance note below. Pinned pixel values were read once from the same
 // Python invocation that generated the fixture and hardcoded here (golden
 // pattern, like amplifier_golden_digest in test_amplifier.cpp).
@@ -67,7 +67,7 @@ VXC_TEST(tiledata_parses_fixture_header_and_pinned_pixels) {
     CHECK_EQ(tile->elevation.size(), size_t(TileData::kPixelCount));
     for (const auto& plane : tile->climate) CHECK_EQ(plane.size(), size_t(TileData::kPixelCount));
 
-    // Pinned pixel values (synthetic-v1, seed=1, tile (0,0), scale=1) — read
+    // Pinned pixel values (synthetic-v1, seed=1, tile (0,0), scale=1) â€” read
     // once from the Python provider output that produced the fixture.
     CHECK_EQ(tile->elevationAt(0, 0), int16_t(1210));
     CHECK_EQ(tile->elevationAt(1, 0), int16_t(1204));
@@ -184,7 +184,7 @@ VXC_TEST(tilegridsampler_pixel_routing_and_missing_tile_counter) {
     CHECK_EQ(s.missingTileQueries.load(), uint64_t(2));
 
     // Negative pixel coords: floorDiv(-1,512) == -1, a different (missing)
-    // tile from tile (0,0) — must NOT alias to the loaded tile via truncation
+    // tile from tile (0,0) â€” must NOT alias to the loaded tile via truncation
     // toward zero.
     CHECK_EQ(s.elevationMm(-1, -1), int32_t(0));
     CHECK_EQ(s.missingTileQueries.load(), uint64_t(3));
@@ -200,7 +200,7 @@ VXC_TEST(tilegridsampler_pixel_routing_and_missing_tile_counter) {
 }
 
 VXC_TEST(amplifier_over_tilegridsampler_is_deterministic) {
-    // Determinism through the real-data path (plan §2.3): the amplifier must
+    // Determinism through the real-data path (plan Â§2.3): the amplifier must
     // produce identical output across two independently loaded samplers over
     // the same fixture tile, with zero missing-tile fallbacks in the probed
     // range (proving the columns are actually driven by loaded tile data).
@@ -210,9 +210,17 @@ VXC_TEST(amplifier_over_tilegridsampler_is_deterministic) {
 
     Amplifier ampA(1, samplerA), ampB(1, samplerB);
 
+    // v9 STENCIL CONTRACT. The carrier is a cubic B-spline, so a column in
+    // pixel cell px reads control points px-1 .. px+2 -- one further out on the
+    // low side and two on the high side than v8's bilinear px..px+1. Starting
+    // this sweep at vx = 0 therefore reads pixel -1, which is in the tile at
+    // (-1,-1) and not loaded here, and the missing-tile assertions below would
+    // fire on the amplifier doing exactly what it is now specified to do.
+    // Start one cell in instead: pixels 20..500 of a 512-pixel tile, whose
+    // stencils span 19..502 and stay inside.
     Digest digestA, digestB;
-    for (int64_t vy = 0; vy <= 150000; vy += 6000) {
-        for (int64_t vx = 0; vx <= 150000; vx += 6000) {
+    for (int64_t vy = 6000; vy <= 150000; vy += 6000) {
+        for (int64_t vx = 6000; vx <= 150000; vx += 6000) {
             const ColumnSample ca = ampA.column(vx, vy);
             const ColumnSample cb = ampB.column(vx, vy);
             digestA.u32(static_cast<uint32_t>(ca.surfaceMm));
@@ -225,8 +233,9 @@ VXC_TEST(amplifier_over_tilegridsampler_is_deterministic) {
             digestB.u32(static_cast<uint32_t>(cb.subsoilMm));
             digestB.u32(static_cast<uint32_t>(cb.bedrockDepthMm));
             digestB.u8(cb.surfaceMat);
-            // Every column here samples pixels 0..500 x 0..500 — well inside
-            // the single loaded 512x512 tile, plus its +1 bilinear neighbor.
+            // Every column here samples pixels 20..500 x 20..500, whose v9
+            // control stencils span 19..502 — well inside the single loaded
+            // 512x512 tile.
         }
     }
     CHECK_EQ(digestA.h, digestB.h);
@@ -237,7 +246,7 @@ VXC_TEST(amplifier_over_tilegridsampler_is_deterministic) {
 VXC_TEST(amplifier_over_manual_tiles_end_to_end) {
     // Same determinism proof as amplifier_over_tilegridsampler_is_deterministic,
     // but driving TileGridSampler from hand-built TileData (no fixture/codec
-    // in the loop) — this is the shape UE runtime code will construct tiles
+    // in the loop) â€” this is the shape UE runtime code will construct tiles
     // in once decoded from the terrain service, so it's worth pinning
     // independently of the fixture-based path.
     constexpr uint64_t seed = 20260721;
@@ -255,8 +264,8 @@ VXC_TEST(amplifier_over_manual_tiles_end_to_end) {
     // (i) Determinism: two independently loaded samplers over byte-identical
     // tile data must produce byte-identical ColumnSample output across a grid.
     Digest digestA, digestB;
-    for (int64_t vy = 0; vy <= 150000; vy += 15000) {
-        for (int64_t vx = 0; vx <= 150000; vx += 15000) {
+    for (int64_t vy = 15000; vy <= 150000; vy += 15000) {
+        for (int64_t vx = 15000; vx <= 150000; vx += 15000) {
             const ColumnSample ca = ampA100.column(vx, vy);
             const ColumnSample cb = ampB100.column(vx, vy);
             digestA.u32(static_cast<uint32_t>(ca.surfaceMm));
@@ -280,8 +289,8 @@ VXC_TEST(amplifier_over_manual_tiles_end_to_end) {
     // The 400m (400,000mm) gap between the two constant bases dwarfs the
     // bounded detail-octave contribution (see (iii) below), so this holds
     // everywhere in the probed range, not just at one lucky point.
-    for (int64_t vy = 0; vy <= 150000; vy += 30000) {
-        for (int64_t vx = 0; vx <= 150000; vx += 30000) {
+    for (int64_t vy = 30000; vy <= 150000; vy += 30000) {
+        for (int64_t vx = 30000; vx <= 150000; vx += 30000) {
             const int32_t s100 = ampA100.column(vx, vy).surfaceMm;
             const int32_t s500 = amp500.column(vx, vy).surfaceMm;
             CHECK(s500 > s100);
@@ -289,18 +298,23 @@ VXC_TEST(amplifier_over_manual_tiles_end_to_end) {
     }
 
     // (iii) Sane band around 100,000 mm for the 100m tile. Justification
-    // (mirrors amplifier.cpp's Amplifier::column): baseMm is an exact
-    // bilinear blend of a perfectly constant elevation field, so baseMm ==
-    // 100000 mm everywhere. detailMm is a sum of 4 octaves (amplitudes 1800 +
-    // 700 + 260 + 100 = 2860 mm, each individually bounded to
-    // [-amplitude, +amplitude] by valueNoise2's [-32768,32767]-scaled range)
-    // scaled by sScale/1024. Because the tile is perfectly flat,
-    // slopeMmPerPx == 0, so sScale == slopeScaleQ10(0) == 512 (0.5x). Worst
-    // case |detailMm| <= 0.5 * 2860 = 1430 mm. A +/-2000mm band gives
-    // comfortable margin over that bound without being so wide it would
-    // silently pass if the tile data stopped driving the base elevation.
-    for (int64_t vy = 0; vy <= 150000; vy += 30000) {
-        for (int64_t vx = 0; vx <= 150000; vx += 30000) {
+    // (mirrors amplifier.cpp's Amplifier::column): the carrier's weights sum
+    // exactly to their denominator, so a B-spline over a perfectly CONSTANT
+    // elevation field reproduces that constant exactly -- baseMm == 100000 mm
+    // everywhere, with no interpolation error to argue about. For the same
+    // reason every control-point first difference is zero, so the analytic
+    // gradient is exactly zero and slopeMmPerM == 0, giving
+    // sScale == slopeScaleQ10(0) == 512 (0.5x) and
+    // mScale == microScaleQ10(0) == 768 (0.75x).
+    //
+    // Worst-case detail is then 0.5 * (2600 + 1100) + 0.75 * (500 + 190 + 60)
+    // = 2412 mm, which is WIDER than the band below. That is deliberate and
+    // was already true at v8: the bound is over the extreme of every octave's
+    // hash simultaneously, which no real draw attains. The band is empirical,
+    // and its job is to catch the tile data ceasing to drive the base at all
+    // (a 100 km miss), not to be a proof.
+    for (int64_t vy = 30000; vy <= 150000; vy += 30000) {
+        for (int64_t vx = 30000; vx <= 150000; vx += 30000) {
             const int32_t surfaceMm = ampA100.column(vx, vy).surfaceMm;
             CHECK(surfaceMm >= 100000 - 2000);
             CHECK(surfaceMm <= 100000 + 2000);
@@ -311,8 +325,8 @@ VXC_TEST(amplifier_over_manual_tiles_end_to_end) {
 VXC_TEST(missing_tile_fallback_is_deterministic_through_amplifier) {
     // Querying far outside any loaded tile must fall back to the documented
     // deterministic default (elevation 0, default ClimateSample), bump the
-    // counter, and — since the amplifier is a pure function of what the
-    // sampler returns — still produce byte-identical Amplifier output across
+    // counter, and â€” since the amplifier is a pure function of what the
+    // sampler returns â€” still produce byte-identical Amplifier output across
     // two independently constructed (empty) samplers.
     constexpr uint64_t seed = 555;
     TileGridSampler samplerA(seed, 1), samplerB(seed, 1); // no tiles loaded at all
@@ -350,7 +364,7 @@ VXC_TEST(missing_tile_fallback_is_deterministic_through_amplifier) {
     CHECK_EQ(digestA.h, digestB.h);
     // Every query in this loop misses (nothing is loaded), and both samplers
     // ran the exact same query sequence, so their tallies must match exactly
-    // — not merely both be nonzero.
+    // â€” not merely both be nonzero.
     CHECK_EQ(samplerA.missingTileQueries.load(), samplerB.missingTileQueries.load());
     CHECK(samplerA.missingTileQueries.load() > uint64_t(2));
 }

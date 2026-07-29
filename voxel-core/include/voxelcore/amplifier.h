@@ -84,7 +84,22 @@ inline constexpr int64_t kSurfaceLowerBoundDeclined = INT64_MIN;
 // paying off above level 4 on scale-8 tiles. Raise this cap, and re-check the
 // 2 KB stack grid, before generating scale-8 tiles or extending the cascade
 // past level 5.
-inline constexpr int64_t kSurfaceBoundMaxCornersPerAxis = 16;
+// v9 RAISED THIS FROM 16 TO 34, and the reason is the carrier's stencil. A
+// cubic B-spline on cell c reads control points c-1..c+2, so the grid the bound
+// must see is the cells the footprint touches DILATED by one on the low side
+// and two on the high side: three more control points per axis than v8's
+// bilinear needed. A level-5 footprint (108.8 m incl. apron) spans ~4 cells at
+// 30 m -> 7 control points, and ~29 cells at the 3.75 m scale-8 pixel -> 32.
+// 34 covers both with headroom; the on-stack grid is 34x34 int64 = 9.2 KB, up
+// from 2 KB.
+//
+// This also discharges the v8 warning that used to live here: at 3.75 m the old
+// cap of 16 would have made the bound DECLINE from level 4 up, so the sky-band
+// and all-solid trims would have quietly stopped paying off on scale-8 tiles.
+// Declining is safe -- it skips nothing -- but it is a silent performance
+// cliff, and the baked fine tier (docs/terrain-amplification-plan.md Phase 2)
+// is about to make scale-8 the normal case.
+inline constexpr int64_t kSurfaceBoundMaxCornersPerAxis = 34;
 
 class Amplifier {
 public:
@@ -238,7 +253,10 @@ private:
     // literally this function instead of a second copy of it.
     struct SurfaceEval {
         int32_t surfaceMm = 0;
-        int64_t slopeMmPerPx = 0;
+        // v9: MM PER METRE, from the carrier's analytic gradient. Was mm per
+        // tile PIXEL from a per-cell forward difference, which both stepped on
+        // the pixel grid and meant a different grade at every tile scale.
+        int64_t slopeMmPerM = 0;
         int64_t px = 0, py = 0; // tile pixel the column falls in
     };
     SurfaceEval evalSurface(int64_t vx, int64_t vy) const;

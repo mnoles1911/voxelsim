@@ -102,26 +102,89 @@ void curvatureFunction(const std::vector<int64_t>& h, const std::vector<int64_t>
     }
 }
 
-// CARRIER-ONLY surface: the bilinear tile base with every detail octave off.
+// CARRIER-ONLY surface: the tile base with every detail octave off.
 //
-// This is a verbatim copy of Amplifier::bilinearBaseMm (amplifier.cpp) rather
-// than a call into it, because the point is to measure the carrier IN
-// ISOLATION and the amplifier has no knob to silence the octaves. Duplicating
-// nine lines here is much cheaper than adding a test-only branch to worldgen
-// and its HLSL mirror. If bilinearBaseMm changes, this must change with it —
-// that is the intended coupling: the probe is how we prove the change worked.
-int64_t carrierMm(ITileSampler& tiles, int64_t vx, int64_t vy) {
-    const int64_t xMm = vx * kVoxelSizeMm;
-    const int64_t yMm = vy * kVoxelSizeMm;
+// This is a copy of the carrier from amplifier.cpp rather than a call into it,
+// because the point is to measure the carrier IN ISOLATION and the amplifier
+// has no knob to silence the octaves. Duplicating it here is much cheaper than
+// adding a test-only branch to worldgen and its HLSL mirror. If the carrier
+// changes, this must change with it — that is the intended coupling: the probe
+// is how we prove the change worked.
+//
+// v9: uniform cubic B-spline over a 4x4 control stencil, replacing bilinear.
+// See amplifier.cpp's carrier block for why, and for the fixed-point rules.
+constexpr int64_t kCarrierT = 1024;
+constexpr int64_t kCarrierValueDen = 6 * kCarrierT * kCarrierT * kCarrierT;
+constexpr int64_t kCarrierSlopeDen = 2 * kCarrierT * kCarrierT;
+
+struct ProbeW4 {
+    int64_t w[4];
+};
+ProbeW4 probeValueW(int64_t tq) {
+    const int64_t u = kCarrierT - tq, T = kCarrierT;
+    return ProbeW4{{u * u * u, 3 * tq * tq * tq - 6 * tq * tq * T + 4 * T * T * T,
+                    -3 * tq * tq * tq + 3 * tq * tq * T + 3 * tq * T * T + T * T * T,
+                    tq * tq * tq}};
+}
+struct ProbeW3 {
+    int64_t w[3];
+};
+ProbeW3 probeSlopeW(int64_t tq) {
+    const int64_t u = kCarrierT - tq, T = kCarrierT;
+    return ProbeW3{{u * u, -2 * tq * tq + 2 * T * tq + T * T, tq * tq}};
+}
+
+struct ProbeCarrier {
+    int64_t heightMm = 0;
+    int64_t sxMmPerPx = 0;
+    int64_t syMmPerPx = 0;
+};
+
+ProbeCarrier evalProbeCarrier(ITileSampler& tiles, int64_t vx, int64_t vy) {
+    const int64_t xMm = vx * kVoxelSizeMm, yMm = vy * kVoxelSizeMm;
     const int64_t pxMm = tiles.pixelSizeMm();
     const int64_t px = floorDiv(xMm, pxMm), py = floorDiv(yMm, pxMm);
     const int64_t fx = xMm - px * pxMm, fy = yMm - py * pxMm;
-    const int64_t e00 = tiles.elevationMm(px, py);
-    const int64_t e10 = tiles.elevationMm(px + 1, py);
-    const int64_t e01 = tiles.elevationMm(px, py + 1);
-    const int64_t e11 = tiles.elevationMm(px + 1, py + 1);
-    const int64_t gx = pxMm - fx, gy = pxMm - fy;
-    return ((e00 * gx + e10 * fx) * gy + (e01 * gx + e11 * fx) * fy) / (pxMm * pxMm);
+    int64_t cp[16];
+    for (int j = 0; j < 4; ++j)
+        for (int i = 0; i < 4; ++i)
+            cp[i + 4 * j] = tiles.elevationMm(px - 1 + i, py - 1 + j);
+
+    const int64_t tx = fx * kCarrierT / pxMm, ty = fy * kCarrierT / pxMm;
+    const ProbeW4 wx = probeValueW(tx), wy = probeValueW(ty);
+    const ProbeW3 dx = probeSlopeW(tx), dy = probeSlopeW(ty);
+
+    int64_t rowVal[4], rowDx[4];
+    for (int j = 0; j < 4; ++j) {
+        const int64_t* r = cp + 4 * j;
+        int64_t v = 0, d = 0;
+        for (int i = 0; i < 4; ++i) v += r[i] * wx.w[i];
+        for (int i = 0; i < 3; ++i) d += (r[i + 1] - r[i]) * dx.w[i];
+        rowVal[j] = v / kCarrierValueDen;
+        rowDx[j] = d / kCarrierSlopeDen;
+    }
+    int64_t h = 0, sx = 0, sy = 0;
+    for (int j = 0; j < 4; ++j) {
+        h += rowVal[j] * wy.w[j];
+        sx += rowDx[j] * wy.w[j];
+    }
+    for (int j = 0; j < 3; ++j) sy += (rowVal[j + 1] - rowVal[j]) * dy.w[j];
+
+    ProbeCarrier c;
+    c.heightMm = h / kCarrierValueDen;
+    c.sxMmPerPx = sx / kCarrierValueDen;
+    c.syMmPerPx = sy / kCarrierSlopeDen;
+    return c;
+}
+
+int64_t carrierMm(ITileSampler& tiles, int64_t vx, int64_t vy) {
+    return evalProbeCarrier(tiles, vx, vy).heightMm;
+}
+
+int64_t probeSlopeMmPerM(const ProbeCarrier& c, int64_t pxMm) {
+    const int64_t ax = c.sxMmPerPx < 0 ? -c.sxMmPerPx : c.sxMmPerPx;
+    const int64_t ay = c.syMmPerPx < 0 ? -c.syMmPerPx : c.syMmPerPx;
+    return (ax + ay) * 1000 / pxMm;
 }
 
 // SEAM SCAN — the direct numeric test for the visible 30 m grid.
@@ -255,62 +318,106 @@ void cellGainStep(const std::vector<int64_t>& h, int64_t vx0, int64_t pxMm, int6
 // adjacent cells. No windowing, no estimator noise — this is the actual size
 // of the discontinuity the shader applies.
 //
-// These four helpers are verbatim copies of amplifier.cpp; same coupling note
-// as carrierMm above.
-int64_t probeTileSlopeMmPerPx(int64_t e00, int64_t e10, int64_t e01) {
-    return (e10 > e00 ? e10 - e00 : e00 - e10) + (e01 > e00 ? e01 - e00 : e00 - e01);
-}
+// The gain curves, copied from amplifier.cpp; same coupling note as carrierMm.
 int64_t probeClamp(int64_t v, int64_t lo, int64_t hi) { return v < lo ? lo : (v > hi ? hi : v); }
-int64_t probeSlopeScaleQ10(int64_t s) { return probeClamp(512 + s / 24, 256, 4096); }
-int64_t probeMicroScaleQ10(int64_t s) { return probeClamp(768 + s / 256, 768, 1280); }
+int64_t probeSlopeScaleQ10(int64_t s) { return probeClamp(512 + s * 5 / 4, 256, 4096); }
+int64_t probeMicroScaleQ10(int64_t s) { return probeClamp(768 + s * 15 / 128, 768, 1280); }
+
+// The detail envelope (mm of amplitude) this column's gains admit.
+double probeEnvelopeMm(ITileSampler& tiles, int64_t vx, int64_t vy) {
+    // Nominal pre-gain amplitude of each band, from the kDetailOctaves table.
+    const double landformNomMm = 2600.0 + 1100.0;
+    const double microNomMm = 500.0 + 190.0 + 60.0;
+    const int64_t s = probeSlopeMmPerM(evalProbeCarrier(tiles, vx, vy), tiles.pixelSizeMm());
+    return landformNomMm * probeSlopeScaleQ10(s) / 1024.0 +
+           microNomMm * probeMicroScaleQ10(s) / 1024.0;
+}
 
 void gainStepDirect(ITileSampler& tiles, int64_t vx0, int64_t vy0, int64_t nCells,
                     const char* label) {
     const int64_t pxMm = tiles.pixelSizeMm();
-    const int64_t px0 = floorDiv(vx0 * kVoxelSizeMm, pxMm);
-    const int64_t py = floorDiv(vy0 * kVoxelSizeMm, pxMm);
+    const int64_t cellVox = pxMm / kVoxelSizeMm;
+    // First cell boundary at or after vx0, in absolute voxel indices.
+    const int64_t b0 = (floorDiv(vx0, cellVox) + 1) * cellVox;
 
-    // Nominal pre-gain amplitude of each band, from the kDetailOctaves table.
-    const double landformNomMm = 2600.0 + 1100.0;
-    const double microNomMm = 500.0 + 190.0 + 60.0;
-
-    std::vector<double> sRatio, envStepMm;
-    int64_t prevS = -1, prevM = -1;
-    for (int64_t k = 0; k < nCells; ++k) {
-        const int64_t px = px0 + k;
-        const int64_t e00 = tiles.elevationMm(px, py);
-        const int64_t e10 = tiles.elevationMm(px + 1, py);
-        const int64_t e01 = tiles.elevationMm(px, py + 1);
-        const int64_t s = probeTileSlopeMmPerPx(e00, e10, e01);
-        const int64_t sQ = probeSlopeScaleQ10(s), mQ = probeMicroScaleQ10(s);
-        if (prevS >= 0) {
-            sRatio.push_back(sQ >= prevS ? static_cast<double>(sQ) / prevS
-                                         : static_cast<double>(prevS) / sQ);
-            // Millimetres of detail envelope that change discontinuously
-            // across this one boundary line.
-            envStepMm.push_back(std::abs(landformNomMm * (sQ - prevS) / 1024.0) +
-                                std::abs(microNomMm * (mQ - prevM) / 1024.0));
-        }
-        prevS = sQ;
-        prevM = mQ;
+    // Sample the envelope two voxels apart, once STRADDLING a cell boundary and
+    // once at the middle of the same cell as a control. Under v8 the gain was a
+    // per-cell constant, so the straddling pair jumped and the control pair was
+    // identically zero; under v9 the gain is continuous and the two should be
+    // the same small number. Reporting both is what makes the result readable
+    // without knowing which version produced it.
+    std::vector<double> across, within;
+    for (int64_t k = 0; k + 1 < nCells; ++k) {
+        const int64_t b = b0 + k * cellVox;
+        across.push_back(std::abs(probeEnvelopeMm(tiles, b + 1, vy0) -
+                                  probeEnvelopeMm(tiles, b - 1, vy0)));
+        const int64_t m = b + cellVox / 2;
+        within.push_back(std::abs(probeEnvelopeMm(tiles, m + 1, vy0) -
+                                  probeEnvelopeMm(tiles, m - 1, vy0)));
     }
-    if (sRatio.empty()) {
-        std::printf("\n%s — DIRECT GAIN STEP: no cells\n", label);
+    if (across.empty()) {
+        std::printf("\n%s — GAIN STEP AT CELL BOUNDARIES: no cells\n", label);
         return;
     }
     auto pct = [](std::vector<double> v, double p) {
         std::sort(v.begin(), v.end());
         return v[std::min(v.size() - 1, static_cast<size_t>(p * static_cast<double>(v.size())))];
     };
-    std::printf("\n%s — DIRECT GAIN STEP across %lld adjacent %lld m cells\n", label,
-                (long long)sRatio.size(), (long long)(pxMm / 1000));
-    std::printf("  slopeScale ratio  median=%.2fx  p90=%.2fx  max=%.2fx\n", pct(sRatio, 0.5),
-                pct(sRatio, 0.90), pct(sRatio, 1.0));
-    std::printf("  detail envelope step  median=%.0f mm  p90=%.0f mm  max=%.0f mm\n",
-                pct(envStepMm, 0.5), pct(envStepMm, 0.90), pct(envStepMm, 1.0));
+    std::printf("\n%s — GAIN STEP AT CELL BOUNDARIES (detail envelope change over 0.2 m)\n",
+                label);
+    std::printf("  straddling a %lld m boundary: median=%.0f mm  p90=%.0f mm  max=%.0f mm\n",
+                (long long)(pxMm / 1000), pct(across, 0.5), pct(across, 0.90), pct(across, 1.0));
+    std::printf("  mid-cell control           : median=%.0f mm  p90=%.0f mm  max=%.0f mm\n",
+                pct(within, 0.5), pct(within, 0.90), pct(within, 1.0));
     std::printf("  (a step of ~100 mm is one voxel of texture amplitude appearing across a "
                 "dead-straight %lld m line)\n",
                 (long long)(pxMm / 1000));
+}
+
+// MATERIAL BOUNDARY ALIGNMENT — does the surface material change ON the grid?
+//
+// The third mechanism behind the visible 30 m squares is not a height artifact
+// at all. Climate was read NEAREST-PIXEL, so classifyBiome's inputs were
+// piecewise constant per tile pixel, and surfaceMat could only change where a
+// column crossed a pixel edge (or where its own elevation crossed the treeline
+// or beach band). The result is material patches with straight edges on a 30 m
+// lattice — visible as colour, not as shading, which is why the seam scan
+// cannot see it.
+//
+// Measure it directly: walk a transect, find every column where surfaceMat
+// differs from its neighbour, and ask what fraction of those changes land
+// within one voxel of a pixel boundary. With cellVox = 300 and a +/-1 voxel
+// window, chance alone puts 3/300 = 1.0% there. A large excess over chance
+// means the material field is keyed to the grid; ~1x means it is not.
+void materialBoundaryAlignment(Amplifier& amp, int64_t vx0, int64_t vy0, int64_t n,
+                               int64_t pxMm, const char* label) {
+    const int64_t cellVox = pxMm / kVoxelSizeMm;
+    int64_t changes = 0, onBoundary = 0;
+    MaterialId prev = amp.column(vx0, vy0).surfaceMat;
+    for (int64_t i = 1; i < n; ++i) {
+        const MaterialId m = amp.column(vx0 + i, vy0).surfaceMat;
+        if (m != prev) {
+            ++changes;
+            // Distance from this column to the nearest cell boundary.
+            const int64_t r = floorMod(vx0 + i, cellVox);
+            const int64_t dist = r < cellVox - r ? r : cellVox - r;
+            if (dist <= 1) ++onBoundary;
+        }
+        prev = m;
+    }
+    const double chancePct = 3.0 * 100.0 / static_cast<double>(cellVox);
+    std::printf("\n%s — MATERIAL BOUNDARY ALIGNMENT over %lld columns\n", label, (long long)n);
+    if (changes == 0) {
+        std::printf("  no material changes on this transect (uniform biome); "
+                    "inconclusive — try a longer or different transect\n");
+        return;
+    }
+    const double obsPct = static_cast<double>(onBoundary) * 100.0 / static_cast<double>(changes);
+    std::printf("  material changes: %lld;  on a %lld m boundary (+/-1 voxel): %lld (%.1f%%)\n",
+                (long long)changes, (long long)(pxMm / 1000), (long long)onBoundary, obsPct);
+    std::printf("  by chance: %.1f%%   excess: %.1fx", chancePct, obsPct / chancePct);
+    if (obsPct / chancePct >= 2.0) std::printf("   <-- MATERIAL KEYED TO THE PIXEL GRID");
+    std::printf("\n");
 }
 
 // DIRECTIONAL ROUGHNESS — does the ground have downslope grain?
@@ -560,6 +667,8 @@ int main(int argc, char** argv) {
     cellGainStep(hAmp, vx0, pxMm, 2, "AMPLIFIED SURFACE");
     gainStepDirect(*tiles, vx0, vy0, std::max<int64_t>(8, n * kVoxelSizeMm / pxMm),
                    "TILE RASTER");
+
+    materialBoundaryAlignment(amp, vx0, vy0, n, pxMm, "AMPLIFIED SURFACE");
 
     directionalRoughness(amp, vx0, vy0, n, {8, 16, 32, 64}, "AMPLIFIED SURFACE");
 

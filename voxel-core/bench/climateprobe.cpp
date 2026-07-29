@@ -1,4 +1,4 @@
-// vxc_climateprobe -- diagnostic for the climate/biome/stratigraphy consumers.
+﻿// vxc_climateprobe -- diagnostic for the climate/biome/stratigraphy consumers.
 //
 // WHY THIS EXISTS. The tile CLIMATE channels carry PHYSICAL WorldClim units
 // quantized over Earth-extreme ranges (terrain-service diffusion.py's
@@ -75,16 +75,25 @@ double physical(const ChannelScale& c, double u8) {
     return c.lo + (u8 / 255.0) * (c.hi - c.lo);
 }
 
-// tileSlopeMmPerPx, reproduced from amplifier.cpp.
+// The amplifier's slope term, reproduced from amplifier.cpp.
 //
 // It lives in that file's anonymous namespace, so it cannot be called from
-// here. This is a THREE-LINE duplicate of a formula that has not changed since
-// the amplifier was written, and the alternative -- widening Amplifier's public
-// surface for a diagnostic -- is worse. If the amplifier's slope definition
-// ever changes, this must follow; the self-check in classify() below is what
-// makes that failure loud rather than silent.
-int64_t probeSlopeMmPerPx(int64_t e00, int64_t e10, int64_t e01) {
-    return (e10 > e00 ? e10 - e00 : e00 - e10) + (e01 > e00 ? e01 - e00 : e00 - e01);
+// here. The alternative -- widening Amplifier's public surface for a diagnostic
+// -- is worse. If the amplifier's slope definition changes, this must follow;
+// the self-check in classify() below is what makes that failure loud rather
+// than silent.
+//
+// v9: the currency is MM PER METRE, and the definition moved from a per-cell
+// forward difference to the carrier's analytic gradient. This probe still uses
+// the FORWARD DIFFERENCE form, converted to mm/m, because it samples the raster
+// rather than the amplifier and only needs a census-grade slope. That makes it
+// an approximation of the real gate input rather than a mirror of it -- fine
+// for "what fraction of the world does the cliff gate claim", which is all this
+// tool asks, and the mismatch counter below stays meaningful because
+// attributeGate is fed the same approximation classify() feeds classifyBiome.
+int64_t probeSlopeMmPerM(int64_t e00, int64_t e10, int64_t e01, int64_t pxMm) {
+    const int64_t d = (e10 > e00 ? e10 - e00 : e00 - e10) + (e01 > e00 ? e01 - e00 : e00 - e01);
+    return d * 1000 / pxMm;
 }
 
 // Which gate in classifyBiome decided this column.
@@ -99,10 +108,10 @@ int64_t probeSlopeMmPerPx(int64_t e00, int64_t e10, int64_t e01) {
 enum Gate { GATE_OCEAN, GATE_BEACH, GATE_CLIFF, GATE_TREELINE, GATE_WHITTAKER, kGateCount };
 const char* kGateName[kGateCount] = {"ocean", "beach", "cliff-slope", "treeline", "whittaker"};
 
-Gate attributeGate(int32_t tempU8, int32_t surfaceMm, int64_t slopeMmPerPx) {
+Gate attributeGate(int32_t tempU8, int32_t surfaceMm, int64_t slopeMmPerM) {
     if (surfaceMm < kBiomeBeachLowerMm) return GATE_OCEAN;
     if (surfaceMm <= kBiomeBeachUpperMm) return GATE_BEACH;
-    if (slopeMmPerPx > kBiomeCliffSlopeMmPerPx) return GATE_CLIFF;
+    if (slopeMmPerM > kBiomeCliffSlopeMmPerM) return GATE_CLIFF;
     if (surfaceMm > biomeTreelineMm(tempU8)) return GATE_TREELINE;
     return GATE_WHITTAKER;
 }
@@ -314,9 +323,9 @@ int main(int argc, char** argv) {
 
             const ColumnSample col = amp.column(vx, vy);
             const ClimateSample cl = tiles->climate(px, py);
-            const int64_t slope = probeSlopeMmPerPx(tiles->elevationMm(px, py),
+            const int64_t slope = probeSlopeMmPerM(tiles->elevationMm(px, py),
                                                     tiles->elevationMm(px + 1, py),
-                                                    tiles->elevationMm(px, py + 1));
+                                                    tiles->elevationMm(px, py + 1), pxMm);
 
             chT.push_back(cl.temperature);
             chS.push_back(cl.seasonality);
@@ -375,10 +384,10 @@ int main(int argc, char** argv) {
     {
         std::vector<int64_t> s = slopes;
         std::sort(s.begin(), s.end());
-        std::printf("  cliff gate is kBiomeCliffSlopeMmPerPx=%lld; median slope is %lld "
+        std::printf("  cliff gate is kBiomeCliffSlopeMmPerM=%lld; median slope is %lld "
                     "(gate is %s the median)\n",
-                    (long long)kBiomeCliffSlopeMmPerPx, (long long)pctl(s, 50),
-                    kBiomeCliffSlopeMmPerPx < pctl(s, 50) ? "BELOW" : "above");
+                    (long long)kBiomeCliffSlopeMmPerM, (long long)pctl(s, 50),
+                    kBiomeCliffSlopeMmPerM < pctl(s, 50) ? "BELOW" : "above");
     }
 
     std::printf("\n=== BIOME CENSUS ===\n");

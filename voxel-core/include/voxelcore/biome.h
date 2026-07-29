@@ -53,17 +53,21 @@ enum BiomeId : uint8_t {
 // not a cliff -- and it sat BELOW the median slope of real 30 m tiles (7000),
 // so it claimed 51% of the world and painted half the map alpine.
 //
-// SCALE-1 ASSUMPTION, stated because the value cannot express it: slopeMmPerPx
-// is proportional to pixelSizeMm, so this constant means a different grade at
-// scale 8 (3.75 m/px) than at scale 1. Only scale 1 has ever been generated.
-// The honest fix is to thread pixelSizeMm through classifyBiome, but
-// slopeScaleQ10/microScaleQ10 in amplifier.cpp have the identical latent bug
-// and would still be unfixed -- a half-fix at full CPU/GPU-mirror risk. Do all
-// three together, before generating scale-8 tiles.
-inline constexpr int64_t kTileNominalPixelSizeMm = 30'000; // scale 1
-inline constexpr int64_t kBiomeCliffGradePercent = 70;     // ~35 degrees
-inline constexpr int64_t kBiomeCliffSlopeMmPerPx =
-    kTileNominalPixelSizeMm * kBiomeCliffGradePercent / 100;
+// FIXED IN v9. This constant used to be stated in mm per tile PIXEL, which is
+// proportional to pixelSizeMm, so it meant a different grade at scale 8
+// (3.75 m/px) than at scale 1. The note here used to say the honest fix was to
+// do this together with slopeScaleQ10/microScaleQ10 in amplifier.cpp, which
+// carried the identical latent bug, and to do all of them before generating
+// scale-8 tiles. That is exactly what v9 did: the currency everywhere is now
+// MM PER METRE, taken from the carrier's analytic gradient
+// (Amplifier::evalSurface), so every threshold means a grade at every scale.
+//
+// The value is unchanged in meaning: 70% grade is ~35 degrees, the angle of
+// repose for soil and scree (33-37), above which loose material does not stay
+// put -- which is the physical reason a cliff is bare.
+inline constexpr int64_t kBiomeCliffGradePercent = 70; // ~35 degrees
+// mm of rise per metre of run: 70% grade == 700 mm/m.
+inline constexpr int64_t kBiomeCliffSlopeMmPerM = kBiomeCliffGradePercent * 1000 / 100;
 
 // Coastal band around sea level (z=0, mm): below is open ocean floor, within
 // (inclusive) is beach.
@@ -139,7 +143,7 @@ constexpr int32_t biomeTreelineMm(int32_t tempU8) {
 // Per-column biome classification. Gate order (m4-plan): slope -> beach/
 // ocean -> temperature-adjusted treeline -> Whittaker climate table.
 constexpr BiomeId classifyBiome(int32_t tempU8, int32_t precipU8, int32_t seasonalityU8,
-                                 int32_t surfaceMm, int64_t slopeMmPerPx) {
+                                 int32_t surfaceMm, int64_t slopeMmPerM) {
     // SEA LEVEL FIRST. Until v8 the slope gate ran ahead of these, so steep
     // SEAFLOOR classified as TUNDRA_ALPINE: measured over the real 25-tile set,
     // 39.8% of everything below sea level -- 17.8% of the whole world -- was
@@ -149,7 +153,7 @@ constexpr BiomeId classifyBiome(int32_t tempU8, int32_t precipU8, int32_t season
     if (surfaceMm <= kBiomeBeachUpperMm) return BEACH;
     // Steep ground inside the beach band now reads BEACH rather than rock.
     // That is correct: the band is 7 m tall, so it is the foot of a sea cliff.
-    if (slopeMmPerPx > kBiomeCliffSlopeMmPerPx) return BARE_ROCK;
+    if (slopeMmPerM > kBiomeCliffSlopeMmPerM) return BARE_ROCK;
     if (surfaceMm > biomeTreelineMm(tempU8)) return TUNDRA_ALPINE;
 
     // Whittaker temperature x precipitation table (gates above already

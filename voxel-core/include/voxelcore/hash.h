@@ -18,6 +18,8 @@ enum HashChannel : uint32_t {
     CH_DETAIL_OCTAVE_BASE = 0, // +octave index, reserve 0..15
     CH_TOPSOIL_JITTER = 16,
     CH_BEDROCK_JITTER = 17,
+    CH_ECOTONE_TEMP = 18,   // v9 biome-boundary dither, temperature side
+    CH_ECOTONE_PRECIP = 19, // v9 biome-boundary dither, precipitation side
     CH_SYNTH_TILE_BASE = 32, // synthetic dev tiles, reserve 32..47
 };
 
