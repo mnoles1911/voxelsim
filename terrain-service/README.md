@@ -68,6 +68,31 @@ curl -s "localhost:8000/tile?seed=42&x=0&y=0&scale=1" | xxd | head
 terrain-diffusion GPU worker (unbuildable without GPU cloud network access
 here — build it on the rented GPU box). See `docs/diffusion-bringup.md`.
 
+## Is the terrain any good? (`terrain_service/geomorph`)
+
+A measurement library for the question screenshots keep answering wrongly: does an
+amplified surface look like Earth? Plain functions over plain float heightfields —
+slope–area concavity, geomorphon landform histograms, slope and curvature
+distributions, variogram/Hurst, hypsometry, drainage density, Hack's law — each taking
+a cell size in metres and returning numbers with stated units.
+
+```sh
+python3 -m pytest tests/test_geomorph.py
+python3 tools/geomorph_validate.py --sweep all --size 1024 --replicates \
+        --markdown docs/geomorph-validation.md
+```
+
+`docs/geomorph-validation.md` is that tool's output: every metric measured on five real
+Copernicus GLO-30 scenes and on four synthetic fakes, with a discrimination table saying
+which ones actually separate the cases and which do not. **Read it before gating on any
+of these numbers** — several metrics that sound decisive (slope statistics, geomorphon
+histograms, hypsometry, drainage density) are blind to a fake that carries a real
+scene's own power spectrum, and the ones that are not are named there.
+
+Resolution is the trap the API is shaped around: slope, curvature, geomorphon histograms
+and pit density all change with cell size, so every function takes it explicitly and
+comparing two different ones raises `ResolutionMismatch` rather than returning a number.
+
 ## Contracts that matter
 
 - Tile bytes for a given (provider_id, seed, x, y, scale) are **immutable
