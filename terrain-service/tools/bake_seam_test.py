@@ -78,21 +78,39 @@ def main():
     sub_f = SUB * bp.SCALE
 
     print("\n[truth] both sub-tiles + apron")
-    truth = bp.run_bake(truth_coarse, iters=a.iters, noise=parent)["z"]
-    truth_i = truth[ap_f:ap_f + sub_f, ap_f:ap_f + 2 * sub_f]   # both interiors
+    tr = bp.run_bake(truth_coarse, iters=a.iters, noise=parent)
+    truth_i = tr["z"][ap_f:ap_f + sub_f, ap_f:ap_f + 2 * sub_f]   # both interiors
+    truth_acc = tr["acc"][ap_f:ap_f + sub_f, ap_f:ap_f + 2 * sub_f]
 
-    results = {}
+    results, accs = {}, {}
     for name, x0c in (("A", truth_x0), ("B", truth_x0 + SUB)):
         dom = strip[truth_y0:truth_y1, x0c:x0c + SUB + 2 * ap_c]
         # slice the SAME parent noise the truth bake used
         nx0 = (x0c - truth_x0) * bp.SCALE
         noise = parent[:dom.shape[0] * bp.SCALE, nx0:nx0 + dom.shape[1] * bp.SCALE]
         print(f"\n[{name}] one sub-tile + apron")
-        z = bp.run_bake(dom, iters=a.iters, noise=noise, verbose=False)["z"]
-        results[name] = z[ap_f:ap_f + sub_f, ap_f:ap_f + sub_f]
+        r = bp.run_bake(dom, iters=a.iters, noise=noise, verbose=False)
+        results[name] = r["z"][ap_f:ap_f + sub_f, ap_f:ap_f + sub_f]
+        accs[name] = r["acc"][ap_f:ap_f + sub_f, ap_f:ap_f + sub_f]
 
     joined = np.concatenate([results["A"], results["B"]], axis=1)
     err = np.abs(joined - truth_i)
+
+    # THE UNBOUNDED DEPENDENCY, probed directly. An apron cannot know about flow
+    # originating further upstream than itself, so a zero height error is only
+    # meaningful if cross-join flow exists here at all. Compare the ACCUMULATION
+    # field, which is where that ignorance would show up first.
+    jacc = np.concatenate([accs["A"], accs["B"]], axis=1)
+    big = truth_acc > 1e5                                   # >= 0.1 km2 catchment
+    ratio = np.where(big, jacc / np.maximum(truth_acc, 1.0), 1.0)
+    print(f"\n=== the unbounded dependency: flow accumulation vs truth ===")
+    print(f"  truth max catchment in the interior: {truth_acc.max()/1e6:.2f} km2")
+    print(f"  cells with catchment >= 0.1 km2: {big.sum()}")
+    if big.sum():
+        print(f"  per-tile / truth accumulation on those cells: "
+              f"median {np.median(ratio[big]):.3f}  p01 {np.percentile(ratio[big],1):.3f}  "
+              f"min {ratio[big].min():.3f}")
+        print(f"  (1.000 = the apron captured everything; << 1 = flow the tile could not see)")
 
     print(f"\n=== apron adequacy: |per-tile bake - truth| ===")
     print(f"  overall   mean {err.mean()*100:7.2f} cm   p99 {np.percentile(err,99)*100:7.2f} cm"

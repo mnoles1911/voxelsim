@@ -212,6 +212,18 @@ can see a bad apron at all: at 30 m it finds ~10 m of error and a 40 cm join ste
 between 120 m and 480 m, so the influence radius is a few hundred metres and 960 m carries real
 margin.
 
+The test also probes the *unbounded* dependency directly, by comparing the accumulation field
+rather than only the height. Across 99,893 cells with a catchment ≥ 0.1 km² (largest 10.55 km²),
+the per-tile/truth accumulation ratio at 960 m is **1.000 at median, p01 and min** — the apron
+captured every catchment present. At 120 m the min falls to 0.082, i.e. a cell seeing 8% of its
+true catchment, which is what produces that row's 6 m height error.
+
+**What this does NOT establish.** The whole test domain is ~15 km across, so the largest catchment
+it can contain is ~10 km². The hydrology pyramid exists for rivers whose catchment spans *many*
+tiles — hundreds of km² — and no apron of any practical size captures those. That regime is
+untested and the pyramid remains justified; what is now established is that everything *below* it
+is handled by the apron alone, exactly.
+
 The one unbounded dependency is flow accumulation. Handle it with a **hydrology pyramid mirroring
 the model's own hierarchy**: accumulate at the coarse-map level (7.7 km/px, where the coarse model
 is tiny and huge areas cost almost nothing), then at 30 m over the local neighbourhood, and inject
