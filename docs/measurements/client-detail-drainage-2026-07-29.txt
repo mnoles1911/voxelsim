@@ -1,0 +1,112 @@
+CLIENT DETAIL DESTROYS THE BAKE'S DRAINAGE — measured 2026-07-29, worldgen v13
+==============================================================================
+
+HOW THIS WAS FOUND, because the route matters more than the number. v13 was
+accepted on mean slope by scale (plains 8.116 -> 2.936 deg against a real
+Illinois till plain's 2.134, alpine preserved at 28.168) and on the geomorphon
+class fractions. Both are AREA statistics: they ask how rough the ground is and
+what shape its cells are. Neither can see whether the ground is CONNECTED, and
+connectivity is what makes terrain read as water-shaped rather than as texture.
+
+An in-engine capture of the alpine exemplar (tile -5,15, spawn -69120,238080,
+1600x900, 150 s settle, visiblePreCap L0-only so these are true 10 cm voxels)
+showed a field of isolated one-voxel pillars rather than a mountainside. The
+metric below is what that picture is, in numbers.
+
+  vxc_terrainprobe <s1 tiledir> 20260719 <x> <y> 512 --baseline
+
+               alpine (-5,15)          plains (-55,20)
+               carrier -> amplified    carrier -> amplified
+  interior sinks       0 -> 1625            98 -> 9525
+  sinks per km2        0 -> 11020          665 -> 64596
+  stranded area      0.0% -> 87.9%       75.2% -> 97.4%
+  mean flow path   223.6 m -> 28.9 m    39.3 m -> 4.3 m
+  path ratio            0.129                0.109
+
+READ THE ALPINE COLUMN FIRST. The carrier -- which is the baked tier, carrying
+routed drainage, incised channels and talus at repose -- has ZERO interior sinks
+and moves water 224 m across the window. After the client's detail band is
+composited on top, 87.9% of a 40.6%-grade mountainside cannot drain and the mean
+flow path is 28.9 m. Water does not pond on a 40% slope. This is not a tuning
+disagreement; it is the surface no longer being a surface water can run down.
+
+The plains column says the same thing with less contrast because its carrier is
+already poorly drained at this scale (75.2%), which is itself expected on a 1.7%
+grade at 10 cm postings and is not the finding here.
+
+WHY EVERY EXISTING GATE PASSED THIS. Mean slope by scale, the geomorphon
+histogram, curvature asymmetry, Hurst and the spectrum-matched surrogate control
+are all computed on the height field's LOCAL statistics. A field of uncorrelated
+decimetre pits has correct local statistics by construction -- that is what fBm
+IS -- so it passes all of them. Only a non-local pass (routing) sees it. This is
+the same lesson as the surrogate result recorded in
+docs/terrain-validation-2026-07.md, where all four realism gates passed a plain
+whose frac_flat was 0.014 against a real 0.48-0.67: internally consistent, and
+the wrong kind of landscape.
+
+THE MECHANISM, and it is arithmetic rather than mysterious. Each octave
+contributes a local gradient of about amplitude/lattice (the amplifier's own v11
+comment states this and used it to cut two octaves). At v13 the coarse table is
+{25600,2600} {6400,1100} {1600,500} {400,90} {200,25}, and the shaping and metre
+bands take the relief gate (up to 2.0x) times a curvature gate (up to 1.75x on
+crests, 1.375x in the halved micro form):
+
+  25.6 m : 2600 x 3.50 = 9100 mm  -> gradient 0.36
+   6.4 m : 1100 x 3.50 = 3850 mm  -> gradient 0.60
+   1.6 m :  500 x 2.75 = 1375 mm  -> gradient 0.86
+   0.4 m :   90 x 1.375 =  124 mm -> gradient 0.31
+   0.2 m :   25 x 1.375 =   34 mm -> gradient 0.17
+                                     ------------
+                                     up to ~2.3
+
+A detail gradient of 2.3 on ground whose own gradient is 0.4 reverses the
+downhill direction almost everywhere, and a reversed downhill direction is a
+closed basin. Note the sign of the coupling: the relief gate scales detail UP
+where relief is high, so it is loudest exactly where the physical argument says
+it must be quietest. v13 fixed WHICH CLASS gets how much amplitude and left the
+gradient unconstrained in all of them.
+
+A NOTE ON THE METRIC I FIRST REACHED FOR, so nobody repeats it. Mean voxel
+terrace run looked like the natural readout and is not usable across classes: on
+a 40.6% grade the carrier alone steps one voxel every 2.5 columns, so the run
+length has a geometric floor set by base slope. Alpine measures 1.81 against a
+gentle site's 2.62 not because it is rougher but because it is steeper. Plateau
+COMPONENT COUNT is slope-sensitive too but far less so, and it did respond to an
+ablation (halving the 6.4 m and 1.6 m amplitudes took alpine from 19,576
+components to 9,572 while barely moving the mean run from 1.81 to 1.92) -- which
+is what pointed at the gradient rather than at any single octave.
+
+THE ACCEPTANCE BAR THIS IMPLIES, stated so it can be checked rather than
+argued. Detail must not reverse the carrier's downhill direction. If the total
+post-gate detail gradient stays strictly below the carrier's own gradient, no
+new closed basin can form, because the sum's downhill direction is the carrier's.
+That is a provable statement about the composite and it is the right shape of
+constraint, because it is scale-free and class-free.
+
+It cannot be applied unconditionally: on flat ground the carrier's gradient is
+~0.017 and requiring detail below that would delete the decimetre roughness that
+exists precisely to break up terrace runs, which is the artifact the microrelief
+band was added for. So the cap has a floor. The proposed form is
+
+  detailGradient <= max(gradFloor, k * carrierGradient)
+
+with k and gradFloor set by measurement against these drainage numbers, applied
+as ONE normalisation over the whole post-gate ladder rather than as per-octave
+retuning. As a scale-DOWN it can only tighten the surface bound, so
+surfaceUpperBoundMm stays sound without re-derivation.
+
+WHAT IS NOT CLAIMED HERE. That some stranding is wrong: real ground has closed
+decimetre depressions (stones, tussocks, hoofprints) and a real 10 cm DTM would
+show a few percent. The finding is 87.9% on a 40% slope against a carrier's 0%,
+and the 100x jump in sinks per km2. Nor is the plains capture called a defect --
+79.3% of its area in flat plateaus of 4 m or more is close to what a 1.7% grade
+voxelised at 10 cm must produce, and its step edges are ragged rather than clean
+contours, which is the microrelief band doing its job.
+
+REPRODUCING. Tiles are the pinned provider
+terrain-diffusion-unlabeled-060b0c927ccc807e, seed 20260719 (000000000135276f).
+The in-engine captures need UE's cache off the system drive -- C: was at 1.7 GB
+free and the editor hung mid-capture with ZenLocal returning 507 Insufficient
+Storage and 5-second RHI frames. Set UE-LocalDataCachePath and TEMP to a drive
+with room; that is an environment fault and not a rendering one, but it looks
+exactly like a rendering one.
