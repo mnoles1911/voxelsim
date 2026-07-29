@@ -38,6 +38,32 @@
 //   --field-stride V      point-metric stride, in voxels       (default 25 = 2.5 m)
 //   --no-structure        skip the structure metrics entirely (legacy report only)
 //
+// CALIBRATION MODES (see the CALIBRATION HARNESS block near the bottom). Both
+// REPLACE the report above rather than adding to it; every pre-existing command
+// line keeps producing byte-identical output because neither is ever implied.
+//   --band-fit            measure S2(d) on the SOURCE RASTER across the
+//                         960 m -> pixel band, fit the local Hurst exponent,
+//                         and print the continuation target down to 0.2 m,
+//                         labelled measured or EXTRAPOLATED per lag.
+//   --calibrate           the above, then SOLVE the `{3200,1600,400,200}` mm
+//                         ladder amplitudes against that target and report what
+//                         the method does and does not constrain for the other
+//                         three Phase 3 terms.
+//   --fine-dir DIR        load .vxtl v2 fine tiles from DIR and calibrate
+//                         against THEM. This is what turns the 7.5 m band edge
+//                         from an extrapolation into a measurement. Refuses to
+//                         fall back silently if DIR holds no v2 tiles.
+//   --include-ocean       disable the land mask (default ON: a sea-level
+//                         stencil contributes S2 = 0 and biases the fit).
+//   --cal-n N             source-raster lattice, pixels per axis  (default 384)
+//   --kern-n N            octave-kernel lattice points per axis   (default 192)
+//   --kern-stride V       octave-kernel stride, in voxels         (default 7)
+//   --band-lo M/--band-hi M  fit window in metres    (default one pixel .. 960)
+//   --target-h H          force the Hurst exponent instead of using the fit
+//   --target-s2 M         force S2 at the 7.5 m band edge, in metres
+//   --curv-ratio R        curvature gate convex/concave target    (default 3.5)
+//   --rill-aniso R        rill across/along target at 1.6 m       (default 1.30)
+//
 // Sampling the drainage raster is the expensive part of a run: cost is
 // O(drain-n^2) amplifier evaluations, twice (amplified and carrier). The
 // defaults are a 384 m domain at 1 m cells, which is a couple of seconds.
@@ -50,6 +76,8 @@
 // exercise the .vxtl v2 fine tier (docs/vxtl-v2-format.md) without baking one.
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -62,6 +90,14 @@
 #include <vector>
 
 #include "voxelcore/amplifier.h"
+// The calibration harness reads the PRODUCTION definitions of everything it is
+// calibrating — the carrier's analytic curvature and its gate, the rill term,
+// the bedding term, and the noise primitive the octave ladder is built from.
+// Re-deriving any of them here would calibrate a lookalike.
+#include "voxelcore/carrier.h"
+#include "voxelcore/detail_bedding.h"
+#include "voxelcore/detail_rill.h"
+#include "voxelcore/hash.h"
 #include "voxelcore/tilestore.h"
 
 using namespace vxc;
@@ -1299,6 +1335,39 @@ void printDrainage(const DrainStats& s, const char* label) {
 // comparison is statistically fair on flat sites and cliff sites alike. The
 // bin edges are printed in physical units so a reader can see what "convex"
 // meant on this run.
+// ---------------------------------------------------------------------------
+// THE CARRIER'S ANALYTIC CURVATURE — the quantity the GATE actually reads.
+//
+// Calls carrier.h's PRODUCTION evalCarrierCurvature rather than re-deriving it
+// the way evalProbeCarrier re-derives the value path. That asymmetry is
+// deliberate: the value path is duplicated so the carrier can be measured with
+// every octave silenced, but a gate calibration is meaningless unless the
+// quantity measured is bit-identical to the quantity the gate will read.
+int64_t probeCurvatureQ10(ITileSampler& tiles, int64_t vx, int64_t vy) {
+    const int64_t xMm = vx * kVoxelSizeMm, yMm = vy * kVoxelSizeMm;
+    const int64_t pxMm = tiles.pixelSizeMm();
+    const int64_t px = floorDiv(xMm, pxMm), py = floorDiv(yMm, pxMm);
+    int64_t cp[16];
+    for (int j = 0; j < 4; ++j)
+        for (int i = 0; i < 4; ++i) cp[i + 4 * j] = tiles.elevationMm(px - 1 + i, py - 1 + j);
+    const CarrierCurvature c =
+        evalCarrierCurvature(cp, xMm - px * pxMm, yMm - py * pxMm, pxMm);
+    return carrierCurvatureMmPerM2Q10(c, pxMm);
+}
+
+// Exactly the argument curvatureScaleQ10 receives in evalSurface: the carrier's
+// analytic Laplacian, normalised to the 30 m reference tier. Both steps come
+// from carrier.h, so there is no second implementation of either to drift.
+int64_t probeGateInputQ10(ITileSampler& tiles, int64_t vx, int64_t vy) {
+    const int64_t pxMm = tiles.pixelSizeMm();
+    return carrierCurvatureTierNormQ10(probeCurvatureQ10(tiles, vx, vy), pxMm);
+}
+
+// The microrelief band's gain, mirroring evalSurface's `1024 + (cScale-1024)/2`:
+// half the shaping band's excursion, on the argument that a hollow's METRE-scale
+// shape smooths as colluvium fills it while its clods and stones do not vanish.
+int64_t probeMicroGateQ10(int64_t cScaleQ10) { return 1024 + (cScaleQ10 - 1024) / 2; }
+
 struct CurvBins {
     int64_t nPts = 0;
     int64_t curvBaseVox = 0;
@@ -1307,14 +1376,41 @@ struct CurvBins {
     std::vector<int64_t> lagsVox;
     // s2[bin][lag], metres
     std::vector<double> s2[3];
+    // Which quantity the bins were cut on. See the block below.
+    bool byCarrier = false;
 };
 
-CurvBins curvatureConditionedRoughness(Amplifier& amp, int64_t vx0, int64_t vy0, int64_t n,
-                                       int64_t strideVox, int64_t curvBaseVox,
+// `carrierTiles` selects WHAT THE BINS ARE CUT ON, and the choice is the whole
+// measurement:
+//
+//   nullptr  — the v9 behaviour, retained byte-for-byte: a finite difference of
+//              the AMPLIFIED surface over `curvBaseVox`. This asks "is roughness
+//              conditioned on the shape of the rendered ground".
+//
+//   non-null — the CARRIER's analytic Laplacian, which is literally the argument
+//              curvatureScaleQ10 receives in evalSurface.
+//
+// THEY ARE NOT THE SAME QUESTION AND ON REAL DATA THEY DISAGREE BY TWO ORDERS OF
+// MAGNITUDE. A 5 m finite difference of the amplified surface has terciles
+// around +/-25 mm/m^2; the carrier's analytic Laplacian on a 30 m raster has a
+// mean magnitude near 0.3 mm/m^2. So the amplified-surface bins are sorting
+// almost entirely by DETAIL NOISE, with the carrier's shape a rounding error
+// inside them — and worse, they are partly self-referential, because a point
+// lands in the "convex" bin largely BECAUSE it is rough there, which is the
+// thing being measured. A gate keyed to the carrier can be working perfectly and
+// still score 1.00 under the amplified-surface binning.
+//
+// Both are reported. The disagreement between them is the finding, not a bug in
+// either: the amplified-surface version answers "does the RENDERED ground read as
+// conditioned", the carrier version answers "is the GATE doing anything".
+CurvBins curvatureConditionedRoughness(Amplifier& amp, ITileSampler* carrierTiles, int64_t vx0,
+                                       int64_t vy0, int64_t n, int64_t strideVox,
+                                       int64_t curvBaseVox,
                                        const std::vector<int64_t>& lagsVox) {
     CurvBins cb;
     cb.curvBaseVox = curvBaseVox;
     cb.lagsVox = lagsVox;
+    cb.byCarrier = carrierTiles != nullptr;
     struct Pt {
         int64_t x, y;
         double kappa;
@@ -1325,6 +1421,20 @@ CurvBins curvatureConditionedRoughness(Amplifier& amp, int64_t vx0, int64_t vy0,
     for (int64_t j = 0; j < n; ++j)
         for (int64_t i = 0; i < n; ++i) {
             const int64_t x = vx0 + i * strideVox, y = vy0 + j * strideVox;
+            if (carrierTiles) {
+                // SIGN: carrier.h's Laplacian and the finite difference below
+                // AGREE — both are negative on a crest, positive in a hollow.
+                // (carrier.h's "opposite convention" note is about the
+                // geomorphological PROFILE curvature, not about this estimator.)
+                // So no flip: bin 0 is convex in both paths. An earlier cut here
+                // negated, on a misreading of that note, and reported the gate
+                // working exactly backwards — which looked like a real and
+                // alarming result rather than a sign error, so it is called out
+                // rather than quietly corrected.
+                const double kq = static_cast<double>(probeGateInputQ10(*carrierTiles, x, y));
+                pts.push_back(Pt{x, y, kq / static_cast<double>(kCurveQ10One)});
+                continue;
+            }
             const double c = static_cast<double>(amp.surfaceMm(x, y));
             const double k = static_cast<double>(amp.surfaceMm(x + curvBaseVox, y)) +
                              static_cast<double>(amp.surfaceMm(x - curvBaseVox, y)) +
@@ -1373,10 +1483,15 @@ CurvBins curvatureConditionedRoughness(Amplifier& amp, int64_t vx0, int64_t vy0,
 }
 
 void printCurvBins(const CurvBins& cb, const char* label) {
-    std::printf("\n%s — CURVATURE-CONDITIONED ROUGHNESS  (%lld points, curvature baseline "
-                "%.1f m)\n",
-                label, (long long)cb.nPts,
-                static_cast<double>(cb.curvBaseVox) * kVoxelSizeMm / 1000.0);
+    if (cb.byCarrier)
+        std::printf("\n%s — CURVATURE-CONDITIONED ROUGHNESS, BINNED ON THE CARRIER'S ANALYTIC\n"
+                    "  LAPLACIAN (%lld points) — the quantity curvatureScaleQ10 actually reads\n",
+                    label, (long long)cb.nPts);
+    else
+        std::printf("\n%s — CURVATURE-CONDITIONED ROUGHNESS  (%lld points, curvature baseline "
+                    "%.1f m)\n",
+                    label, (long long)cb.nPts,
+                    static_cast<double>(cb.curvBaseVox) * kVoxelSizeMm / 1000.0);
     std::printf("  terciles of kappa (mm/m^2, +ve = concave hollow): convex < %.3f <= planar < "
                 "%.3f <= concave\n",
                 cb.edgeLoMmPerM2, cb.edgeHiMmPerM2);
@@ -1392,6 +1507,530 @@ void printCurvBins(const CurvBins& cb, const char* label) {
     }
     std::printf("  (1.00 = roughness is NOT conditioned on shape, i.e. stationary fBm. Phase 3\n"
                 "   target is ~3.5: crests roughened ~1.75x, hollows smoothed to ~0.5x.)\n");
+    if (cb.byCarrier)
+        std::printf("  NB an S2 RATIO CANNOT SEE A GATE ON A COARSE BAND. See the gate census\n"
+                    "  below for the direct question, and the band-share table for which lags\n"
+                    "  the gated band even reaches.\n");
+}
+
+// ---------------------------------------------------------------------------
+// GATE CENSUS — the direct question, which no S2 ratio answers cleanly.
+//
+// "Is the curvature gate doing anything, and how much?" is a question about the
+// DISTRIBUTION OF curvatureScaleQ10 over real terrain, and it can be answered by
+// evaluating that function at every sample point and reporting its quantiles. If
+// the gate sits inside [0.95, 1.05] on real data it is inert regardless of what
+// its clamps say; if it spans [0.5, 1.75] it is working and any metric reporting
+// 1.00 is blind rather than right.
+//
+// This is a strictly better instrument than the conditioned-S2 ratio for the
+// question "is the gate live", because it has no estimator, no binning, and no
+// lag: it is the gain field itself.
+struct GateCensus {
+    int64_t nPts = 0;
+    int64_t pxMm = 0;
+    double kneeMmPerM2 = 0;
+    // Carrier curvature, in mm/m^2 (the gate's own currency, sign as carrier.h
+    // defines it: NEGATIVE on crests).
+    double curveMeanAbs = 0, curveP05 = 0, curveP50 = 0, curveP95 = 0;
+    double curveTierNormMeanAbs = 0; // normalised to the 30 m reference tier
+    double satPct = 0;               // % of points at or past the knee (gate clamped)
+    // The gain itself: the SHAPING band's, and the microrelief band's half of it.
+    double gMin = 0, gP10 = 0, gP50 = 0, gP90 = 0, gMax = 0, gMean = 0, gRms = 0;
+    double mMin = 0, mMax = 0, mRms = 0;
+    double inertPct = 0; // % of points with the shaping gain inside [0.95, 1.05]
+};
+
+GateCensus gateCensus(ITileSampler& tiles, int64_t vx0, int64_t vy0, int64_t n,
+                      int64_t strideVox) {
+    GateCensus g;
+    g.pxMm = tiles.pixelSizeMm();
+    g.kneeMmPerM2 = static_cast<double>(kCurvatureKneeQ10) / static_cast<double>(kCurveQ10One);
+    std::vector<double> curv, gain, mgain;
+    curv.reserve(static_cast<size_t>(n * n));
+    gain.reserve(static_cast<size_t>(n * n));
+    mgain.reserve(static_cast<size_t>(n * n));
+    long double absAcc = 0, normAbsAcc = 0, gAcc = 0, gSq = 0, mSq = 0;
+    int64_t sat = 0, inert = 0;
+    for (int64_t j = 0; j < n; ++j)
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t x = vx0 + i * strideVox, y = vy0 + j * strideVox;
+            const int64_t raw = probeCurvatureQ10(tiles, x, y);
+            // The gate's ACTUAL argument. Reporting the raw Laplacian alongside
+            // matters because the two differ by 256x on the fine tier, and a
+            // knee quoted against the wrong one is the exact bug that made this
+            // gate inert in the first place.
+            const int64_t q = carrierCurvatureTierNormQ10(raw, g.pxMm);
+            const double gg = static_cast<double>(curvatureScaleQ10(q)) / 1024.0;
+            const double mm = static_cast<double>(probeMicroGateQ10(curvatureScaleQ10(q))) / 1024.0;
+            curv.push_back(static_cast<double>(q) / static_cast<double>(kCurveQ10One));
+            gain.push_back(gg);
+            mgain.push_back(mm);
+            absAcc += std::abs(static_cast<double>(raw)) / static_cast<double>(kCurveQ10One);
+            normAbsAcc += std::abs(static_cast<double>(q)) / static_cast<double>(kCurveQ10One);
+            gAcc += gg;
+            gSq += static_cast<long double>(gg) * gg;
+            mSq += static_cast<long double>(mm) * mm;
+            if (q <= -kCurvatureKneeQ10 || q >= kCurvatureKneeQ10) ++sat;
+            if (gg >= 0.95 && gg <= 1.05) ++inert;
+        }
+    g.nPts = static_cast<int64_t>(curv.size());
+    if (!g.nPts) return g;
+    const long double N = static_cast<long double>(g.nPts);
+    g.curveMeanAbs = static_cast<double>(absAcc / N);
+    g.curveTierNormMeanAbs = static_cast<double>(normAbsAcc / N);
+    g.gMean = static_cast<double>(gAcc / N);
+    g.gRms = std::sqrt(static_cast<double>(gSq / N));
+    g.satPct = static_cast<double>(sat) * 100.0 / static_cast<double>(g.nPts);
+    g.inertPct = static_cast<double>(inert) * 100.0 / static_cast<double>(g.nPts);
+    g.mRms = std::sqrt(static_cast<double>(mSq / N));
+    std::sort(curv.begin(), curv.end());
+    std::sort(gain.begin(), gain.end());
+    std::sort(mgain.begin(), mgain.end());
+    auto q = [](const std::vector<double>& v, double p) {
+        return v[std::min(v.size() - 1, static_cast<size_t>(p * static_cast<double>(v.size())))];
+    };
+    g.curveP05 = q(curv, 0.05);
+    g.curveP50 = q(curv, 0.50);
+    g.curveP95 = q(curv, 0.95);
+    g.gMin = gain.front();
+    g.gP10 = q(gain, 0.10);
+    g.gP50 = q(gain, 0.50);
+    g.gP90 = q(gain, 0.90);
+    g.gMax = gain.back();
+    g.mMin = mgain.front();
+    g.mMax = mgain.back();
+    return g;
+}
+
+void printGateCensus(const GateCensus& g) {
+    std::printf("\nCURVATURE GATE CENSUS — curvatureScaleQ10 evaluated at %lld points\n",
+                (long long)g.nPts);
+    std::printf("  carrier Laplacian (mm/m^2, NEGATIVE on crests, carrier.h's own sign):\n");
+    std::printf("    RAW at this tier's %lld mm pixel: mean|kappa| = %.4f\n", (long long)g.pxMm,
+                g.curveMeanAbs);
+    std::printf("    TIER-NORMALISED (the gate's actual argument): mean|kappa| = %.4f\n",
+                g.curveTierNormMeanAbs);
+    std::printf("    quantiles of the gate's argument: p05 = %.4f  median = %.4f  p95 = %.4f\n",
+                g.curveP05, g.curveP50, g.curveP95);
+    std::printf("    gate knee = %.4f mm/m^2  ->  knee / mean|kappa| = %.2f, and %.1f%% of\n"
+                "    points are AT the clamp\n",
+                g.kneeMmPerM2,
+                g.curveTierNormMeanAbs > 0 ? g.kneeMmPerM2 / g.curveTierNormMeanAbs : 0.0,
+                g.satPct);
+    std::printf("  the SHAPING band's gain (1.000 = no effect):\n");
+    std::printf("    min = %.3f   p10 = %.3f   median = %.3f   p90 = %.3f   max = %.3f\n", g.gMin,
+                g.gP10, g.gP50, g.gP90, g.gMax);
+    std::printf("    mean = %.4f   rms = %.4f   inside [0.95, 1.05]: %.1f%% of points\n", g.gMean,
+                g.gRms, g.inertPct);
+    std::printf("  the MICRORELIEF band's gain (half the excursion): min = %.3f  max = %.3f  "
+                "rms = %.4f\n",
+                g.mMin, g.mMax, g.mRms);
+    if (g.inertPct >= 80.0)
+        std::printf("    <-- GATE IS EFFECTIVELY INERT: %.0f%% of the world sees a gain within\n"
+                    "        5%% of 1.0. Whatever the clamps say, this is not conditioning\n"
+                    "        anything. The knee is %.1fx the mean curvature it is asked to\n"
+                    "        respond to.\n",
+                    g.inertPct,
+                    g.curveTierNormMeanAbs > 0 ? g.kneeMmPerM2 / g.curveTierNormMeanAbs : 0.0);
+    else if (g.gP90 / (g.gP10 > 0 ? g.gP10 : 1.0) >= 1.5)
+        std::printf("    <-- GATE IS LIVE: the p10..p90 span is %.2fx, so the shaping band's\n"
+                    "        amplitude genuinely varies with landform shape.\n",
+                    g.gP90 / (g.gP10 > 0 ? g.gP10 : 1.0));
+    else
+        std::printf("    <-- GATE IS WEAK BUT NOT DEAD: p10..p90 spans only %.2fx.\n",
+                    g.gP90 / (g.gP10 > 0 ? g.gP10 : 1.0));
+}
+
+// ---------------------------------------------------------------------------
+// BAND SHARE — WHICH LAGS CAN CARRY THE GATE'S SIGNAL AT ALL.
+//
+// The curvature gate multiplies the SHAPING band only. A value-noise octave of
+// lattice L has a second difference that falls off as (d/L)^2 for d << L, so a
+// 25.6 m octave contributes about (0.1/25.6)^2 ~ 1.5e-5 of its amplitude to
+// S2(0.1 m). Gating that band by 1.75x changes S2 at a 0.1 m lag by a part in
+// ten thousand — invisible to any estimator, however strong the gate.
+//
+// So "the conditioned-S2 ratio is 1.00 at the fine lags" is not evidence that
+// the gate is off; at those lags it is arithmetically guaranteed whether the
+// gate is off or not. This table says, per lag, what fraction of the total
+// detail ENERGY the gated band supplies. Read it before reading any conditioned
+// ratio: a ratio at a lag whose gated share is 1% can move by at most 1%.
+//
+// MIRROR WARNING. The two tables below are copies of amplifier.cpp's
+// kDetailOctaves / kFineDetailOctaves and their band splits. They are copied for
+// the same reason evalProbeCarrier copies the carrier: the probe must be able to
+// weigh the bands SEPARATELY and the amplifier offers no such handle. If the
+// amplifier's tables change, these must change with them — that is the intended
+// coupling, and this comment is the tripwire.
+struct ProbeOctave {
+    int64_t latticeMm;
+    int64_t amplitudeMm;
+};
+constexpr ProbeOctave kProbeCoarseOctaves[] = {
+    {25600, 2600}, {6400, 1100}, {1600, 500}, {400, 190}, {200, 60},
+};
+constexpr int kProbeCoarseGated = 2; // kLandformOctaveCount
+constexpr ProbeOctave kProbeFineOctaves[] = {
+    {3200, 900}, {1600, 500}, {400, 190}, {200, 60},
+};
+constexpr int kProbeFineGated = 1; // kFineLandformOctaveCount
+
+struct BandShare {
+    bool fine = false;
+    int nGated = 0;
+    std::vector<double> lagM, gatedRmsM, flooredRmsM, share, maxChangePct;
+};
+
+BandShare bandShare(uint64_t seed, int64_t pxMm, int64_t vx0, int64_t vy0, int64_t n,
+                    int64_t strideVox, const std::vector<int64_t>& lagsVox) {
+    BandShare out;
+    const bool fine = pxMm <= 3750;
+    out.fine = fine;
+    const ProbeOctave* tab = fine ? kProbeFineOctaves : kProbeCoarseOctaves;
+    const int nOct = fine ? 4 : 5;
+    const int nGated = fine ? kProbeFineGated : kProbeCoarseGated;
+    out.nGated = nGated;
+    for (int64_t d : lagsVox) {
+        double e2g = 0, e2f = 0;
+        for (int i = 0; i < nOct; ++i) {
+            // One octave's unit-amplitude S2 rms, measured on the same lattice
+            // the rest of this block uses.
+            const int64_t L = tab[i].latticeMm;
+            const uint32_t ch = CH_DETAIL_OCTAVE_BASE + static_cast<uint32_t>(i);
+            long double sq = 0;
+            int64_t cnt = 0;
+            for (int64_t j = 0; j < n; ++j)
+                for (int64_t k = 0; k < n; ++k) {
+                    const int64_t x = (vx0 + k * strideVox) * kVoxelSizeMm;
+                    const int64_t y = (vy0 + j * strideVox) * kVoxelSizeMm;
+                    const int64_t dm = d * kVoxelSizeMm;
+                    auto f = [&](int64_t ax, int64_t ay) {
+                        return static_cast<double>(valueNoise2Fade(seed, ax, ay, L, ch)) *
+                               static_cast<double>(tab[i].amplitudeMm) / 32768.0;
+                    };
+                    const double c = f(x, y);
+                    const double sx = f(x + dm, y) - 2 * c + f(x - dm, y);
+                    const double sy = f(x, y + dm) - 2 * c + f(x, y - dm);
+                    sq += sx * sx + sy * sy;
+                    cnt += 2;
+                }
+            const double e = cnt ? static_cast<double>(sq / static_cast<long double>(cnt)) : 0.0;
+            if (i < nGated)
+                e2g += e;
+            else
+                e2f += e;
+        }
+        const double tot = e2g + e2f;
+        const double s = tot > 0 ? e2g / tot : 0.0;
+        out.lagM.push_back(static_cast<double>(d) * kVoxelSizeMm / 1000.0);
+        out.gatedRmsM.push_back(std::sqrt(e2g) / 1000.0);
+        out.flooredRmsM.push_back(std::sqrt(e2f) / 1000.0);
+        out.share.push_back(s);
+        // v10 gates BOTH bands: the shaping band at the full excursion and the
+        // microrelief band at half of it. So the largest possible move in total
+        // rms at this lag is sqrt(gL^2*s + gM^2*(1-s)) - 1 with both gains at
+        // their ceilings — which is what an S2 estimator could see at best.
+        const double gmax = static_cast<double>(kCurvatureScaleMaxQ10) / 1024.0;
+        const double mmax = static_cast<double>(probeMicroGateQ10(kCurvatureScaleMaxQ10)) / 1024.0;
+        out.maxChangePct.push_back(
+            (std::sqrt(gmax * gmax * s + mmax * mmax * (1 - s)) - 1.0) * 100.0);
+    }
+    return out;
+}
+
+void printBandShare(const BandShare& b) {
+    std::printf("\nGATED-BAND SHARE OF DETAIL ENERGY, PER LAG (%s tier table)\n",
+                b.fine ? "FINE" : "coarse");
+    std::printf("  the first %d octave(s) take the FULL curvature gate; the rest take HALF its\n"
+                "  excursion. The last column is what that can move total S2 by, at best.\n",
+                b.nGated);
+    std::printf("  %10s %14s %14s %12s %14s\n", "lag (m)", "gated rms(m)", "floored rms(m)",
+                "gated share", "max S2 change");
+    for (size_t i = 0; i < b.lagM.size(); ++i)
+        std::printf("  %10.2f %14.6f %14.6f %11.2f%% %13.2f%%\n", b.lagM[i], b.gatedRmsM[i],
+                    b.flooredRmsM[i], b.share[i] * 100.0, b.maxChangePct[i]);
+    std::printf("  (last column is the LARGEST possible change in total S2 at that lag from both\n"
+                "   gains reaching their ceilings, %.2fx and %.3fx. Where it is under a few per\n"
+                "   cent, a conditioned-S2 ratio at that lag cannot see the gate no matter what.)\n",
+                static_cast<double>(kCurvatureScaleMaxQ10) / 1024.0,
+                static_cast<double>(probeMicroGateQ10(kCurvatureScaleMaxQ10)) / 1024.0);
+}
+
+// ---------------------------------------------------------------------------
+// RILL ISOLATION — the term alone, the rest alone, and the noise floor.
+//
+// WHY THE COMPOSITE MEASUREMENT WAS NOT ENOUGH. rillAnisotropyByGrade above
+// measures across/along on the RENDERED surface. On v10 that reads 0.99-1.05 at
+// 1-3 m on steep ground, with the 45-degree control at 1.12 — i.e. the control
+// is LARGER than the signal, so the composite measurement is not a measurement
+// at all, it is noise. Two entirely different situations produce that reading:
+//
+//   (a) the rill term is doing nothing, or
+//   (b) the rill term is doing exactly what it was built to do and is BURIED
+//       under an isotropic band an order of magnitude larger.
+//
+// A composite ratio cannot separate them. This does, by measuring three fields
+// on the same points, in the same frames, at the same lags:
+//
+//   RILL ALONE          — rillMm evaluated directly. If this is anisotropic, the
+//                         term works and the question is amplitude.
+//   DETAIL MINUS RILL   — (amplified - carrier) - rill. The isotropic bed the
+//                         rill has to be seen against.
+//   COMPOSITE           — amplified - carrier. What the eye gets.
+//
+// TWO FRAMES, because a frame mismatch and a missing signal look identical:
+//
+//   AMPLIFIED frame — the +/-25 m gradient of the RENDERED surface, which is
+//                     what rillAnisotropyByGrade uses.
+//   CARRIER frame   — the carrier's ANALYTIC gradient at the point, which is
+//                     literally the vector rillMm receives. If the term is
+//                     strong in the carrier frame and weak in the amplified
+//                     one, the metric was pointing the wrong way and no
+//                     amplitude change would have fixed it.
+//
+// AND A NOISE FLOOR, because the 45-degree control is not decoration. The frame
+// is rounded onto the voxel lattice, so a perfectly isotropic field still scores
+// a ratio slightly off 1.0; the control measures exactly that bias on the same
+// points. NOTHING within the control's own excursion of 1.0 is a measurement.
+// The detectability column below states what the ratio would have to reach
+// before it means anything, and the amplitude solve targets THAT, not 1.0.
+struct RillIso {
+    int64_t nPts = 0;
+    double minGradePct = 0;
+    std::vector<double> lagM;
+    // [frame][lag]; frame 0 = amplified +/-25 m gradient, 1 = carrier analytic.
+    std::vector<double> comp[2], rill[2], rest[2], ctrl[2];
+    // rms amplitude of each field, for the dilution arithmetic.
+    std::vector<double> rillRmsM, restRmsM;
+    // THE PAIRED STATISTIC (carrier frame): composite ratio minus rest-alone
+    // ratio, on the SAME points with the SAME frame. Every bias the estimator
+    // has — the voxel-lattice rounding of the frame, the grade selection, the
+    // finite sample — is common to both terms and CANCELS in the difference, so
+    // this is sensitive to the rill at amplitudes where the absolute ratio is
+    // hopelessly buried. `pairedSpread` is a deterministic split-half estimate
+    // of its own sampling error (even-indexed points against odd-indexed), which
+    // is what turns it from a number into a measurement.
+    std::vector<double> paired, pairedSpread;
+};
+
+RillIso rillIsolation(Amplifier& amp, ITileSampler& tiles, uint64_t seed, int64_t vx0, int64_t vy0,
+                      int64_t n, int64_t strideVox, int64_t gradBaseVox,
+                      const std::vector<int64_t>& lagsVox, double minGradePct) {
+    RillIso r;
+    r.minGradePct = minGradePct;
+    const int64_t pxMm = tiles.pixelSizeMm();
+    const size_t nl = lagsVox.size();
+    for (int f = 0; f < 2; ++f) {
+        r.comp[f].assign(nl, 0.0);
+        r.rill[f].assign(nl, 0.0);
+        r.rest[f].assign(nl, 0.0);
+        r.ctrl[f].assign(nl, 0.0);
+    }
+    r.rillRmsM.assign(nl, 0.0);
+    r.restRmsM.assign(nl, 0.0);
+    std::vector<long double> aC[2], cC[2], aR[2], cR[2], aE[2], cE[2], p1[2], p2[2];
+    for (int f = 0; f < 2; ++f) {
+        aC[f].assign(nl, 0.0L);
+        cC[f].assign(nl, 0.0L);
+        aR[f].assign(nl, 0.0L);
+        cR[f].assign(nl, 0.0L);
+        aE[f].assign(nl, 0.0L);
+        cE[f].assign(nl, 0.0L);
+        p1[f].assign(nl, 0.0L);
+        p2[f].assign(nl, 0.0L);
+    }
+    std::vector<long double> rAmp(nl, 0.0L), eAmp(nl, 0.0L);
+    // Split-half accumulators for the carrier frame only: [half][lag].
+    std::vector<long double> hCa[2], hCc[2], hEa[2], hEc[2];
+    for (int h = 0; h < 2; ++h) {
+        hCa[h].assign(nl, 0.0L);
+        hCc[h].assign(nl, 0.0L);
+        hEa[h].assign(nl, 0.0L);
+        hEc[h].assign(nl, 0.0L);
+    }
+    const double invSqrt2 = 1.0 / std::sqrt(2.0);
+    int64_t cnt = 0;
+
+    // The three fields, as point functions. rillAt re-evaluates the CARRIER
+    // GRADIENT at every stencil arm rather than freezing it at the centre: the
+    // shipped term is a function of position and the local gradient, and
+    // freezing it would measure a different field from the one that renders.
+    auto rillAt = [&](int64_t x, int64_t y) {
+        const ProbeCarrier c = evalProbeCarrier(tiles, x, y);
+        return static_cast<double>(rillMm(seed, x * kVoxelSizeMm, y * kVoxelSizeMm,
+                                          c.sxMmPerPx * 1000 / pxMm, c.syMmPerPx * 1000 / pxMm));
+    };
+    auto compAt = [&](int64_t x, int64_t y) {
+        return static_cast<double>(amp.surfaceMm(x, y)) - static_cast<double>(carrierMm(tiles, x, y));
+    };
+    auto restAt = [&](int64_t x, int64_t y) { return compAt(x, y) - rillAt(x, y); };
+
+    for (int64_t j = 0; j < n; ++j)
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t x = vx0 + i * strideVox, y = vy0 + j * strideVox;
+            // Frame 0: the amplified surface's +/-25 m gradient (the existing
+            // metric's frame). Frame 1: the carrier's analytic gradient, i.e.
+            // exactly what rillMm is handed.
+            const double agx = static_cast<double>(amp.surfaceMm(x + gradBaseVox, y) -
+                                                   amp.surfaceMm(x - gradBaseVox, y));
+            const double agy = static_cast<double>(amp.surfaceMm(x, y + gradBaseVox) -
+                                                   amp.surfaceMm(x, y - gradBaseVox));
+            const double agl = std::sqrt(agx * agx + agy * agy);
+            const double gradePct =
+                agl / (2.0 * static_cast<double>(gradBaseVox) * kVoxelSizeMm) * 100.0;
+            if (gradePct < minGradePct) continue;
+            const ProbeCarrier pc = evalProbeCarrier(tiles, x, y);
+            const double cgx = static_cast<double>(pc.sxMmPerPx), cgy = static_cast<double>(pc.syMmPerPx);
+            const double cgl = std::sqrt(cgx * cgx + cgy * cgy);
+            if (agl < 1.0 || cgl < 1.0) continue;
+            ++cnt;
+            const double ux[2] = {agx / agl, cgx / cgl};
+            const double uy[2] = {agy / agl, cgy / cgl};
+            for (int f = 0; f < 2; ++f) {
+                const double vx = -uy[f], vy = ux[f];
+                const double d1x = (ux[f] + vx) * invSqrt2, d1y = (uy[f] + vy) * invSqrt2;
+                const double d2x = (ux[f] - vx) * invSqrt2, d2y = (uy[f] - vy) * invSqrt2;
+                for (size_t li = 0; li < nl; ++li) {
+                    const int64_t d = lagsVox[li];
+                    auto s2 = [&](auto&& fn, double dx, double dy) {
+                        const int64_t ox =
+                            static_cast<int64_t>(std::lround(dx * static_cast<double>(d)));
+                        const int64_t oy =
+                            static_cast<int64_t>(std::lround(dy * static_cast<double>(d)));
+                        const double v = fn(x + ox, y + oy) + fn(x - ox, y - oy) - 2 * fn(x, y);
+                        return v * v;
+                    };
+                    aC[f][li] += s2(compAt, ux[f], uy[f]);
+                    cC[f][li] += s2(compAt, vx, vy);
+                    aR[f][li] += s2(rillAt, ux[f], uy[f]);
+                    cR[f][li] += s2(rillAt, vx, vy);
+                    aE[f][li] += s2(restAt, ux[f], uy[f]);
+                    cE[f][li] += s2(restAt, vx, vy);
+                    p1[f][li] += s2(compAt, d1x, d1y);
+                    p2[f][li] += s2(compAt, d2x, d2y);
+                    if (f == 0) {
+                        rAmp[li] += s2(rillAt, ux[f], uy[f]);
+                        eAmp[li] += s2(restAt, ux[f], uy[f]);
+                    } else {
+                        // Split by the accepted-point index, so the two halves
+                        // are interleaved over the lattice rather than being two
+                        // different pieces of ground.
+                        const int h = static_cast<int>(cnt & 1);
+                        hCa[h][li] += s2(compAt, ux[f], uy[f]);
+                        hCc[h][li] += s2(compAt, vx, vy);
+                        hEa[h][li] += s2(restAt, ux[f], uy[f]);
+                        hEc[h][li] += s2(restAt, vx, vy);
+                    }
+                }
+            }
+        }
+    r.nPts = cnt;
+    for (size_t li = 0; li < nl; ++li) {
+        r.lagM.push_back(static_cast<double>(lagsVox[li]) * kVoxelSizeMm / 1000.0);
+        if (!cnt) continue;
+        const long double N = static_cast<long double>(cnt);
+        auto rat = [&](long double a, long double c) {
+            return a > 0 ? std::sqrt(static_cast<double>(c / a)) : 0.0;
+        };
+        for (int f = 0; f < 2; ++f) {
+            r.comp[f][li] = rat(aC[f][li], cC[f][li]);
+            r.rill[f][li] = rat(aR[f][li], cR[f][li]);
+            r.rest[f][li] = rat(aE[f][li], cE[f][li]);
+            r.ctrl[f][li] = rat(p2[f][li], p1[f][li]);
+        }
+        r.rillRmsM[li] = std::sqrt(static_cast<double>(rAmp[li] / N)) / 1000.0;
+        r.restRmsM[li] = std::sqrt(static_cast<double>(eAmp[li] / N)) / 1000.0;
+        r.paired.push_back(r.comp[1][li] - r.rest[1][li]);
+        const double d0 = rat(hCa[0][li], hCc[0][li]) - rat(hEa[0][li], hEc[0][li]);
+        const double d1 = rat(hCa[1][li], hCc[1][li]) - rat(hEa[1][li], hEc[1][li]);
+        r.pairedSpread.push_back(std::abs(d0 - d1) / 2.0);
+    }
+    return r;
+}
+
+void printRillIso(const RillIso& r) {
+    std::printf("\nRILL ISOLATION — the term alone, the bed it sits in, and the noise floor\n");
+    std::printf("  %lld points at >= %.0f%% grade. Ratios are across/along; 1.00 = isotropic.\n",
+                (long long)r.nPts, r.minGradePct);
+    if (!r.nPts) {
+        std::printf("  no points at this grade on this lattice; try a steeper site\n");
+        return;
+    }
+    for (int f = 0; f < 2; ++f) {
+        std::printf("\n  FRAME: %s\n", f == 0 ? "amplified surface, +/-25 m gradient (the frame "
+                                                "the composite metric uses)"
+                                              : "CARRIER analytic gradient (the vector rillMm is "
+                                                "actually handed)");
+        std::printf("  %8s %11s %11s %11s %11s %13s %13s\n", "lag (m)", "rill alone", "rest alone",
+                    "composite", "45deg ctrl", "rill rms(m)", "rest rms(m)");
+        for (size_t li = 0; li < r.lagM.size(); ++li)
+            std::printf("  %8.2f %11.3f %11.3f %11.3f %11.3f %13.5f %13.5f\n", r.lagM[li],
+                        r.rill[f][li], r.rest[f][li], r.comp[f][li], r.ctrl[f][li], r.rillRmsM[li],
+                        r.restRmsM[li]);
+    }
+    // THE PAIRED TEST. Comparing the composite ratio against an absolute 1.00
+    // throws away the fact that we can measure the SAME surface with the rill
+    // removed. The difference between the two is bias-free by construction — the
+    // frame rounding, the grade selection and the sample are identical — so it
+    // sees the term at amplitudes where the absolute ratio cannot. This is the
+    // statistic to quote for "is the rill doing anything".
+    std::printf("\n  PAIRED TEST (carrier frame): composite ratio minus rest-alone ratio, same\n"
+                "  points, same frame, so every estimator bias cancels. +/- is a split-half\n"
+                "  estimate of this statistic's own sampling error.\n");
+    std::printf("  %8s %14s %14s %12s %14s\n", "lag (m)", "rest alone", "composite", "difference",
+                "significant?");
+    for (size_t li = 0; li < r.lagM.size(); ++li) {
+        char verdict[48];
+        const double s = r.pairedSpread[li];
+        if (s > 0 && std::abs(r.paired[li]) > 3.0 * s)
+            std::snprintf(verdict, sizeof(verdict), "YES, %.1f sigma", std::abs(r.paired[li]) / s);
+        else if (s > 0 && std::abs(r.paired[li]) > s)
+            std::snprintf(verdict, sizeof(verdict), "marginal, %.1f", std::abs(r.paired[li]) / s);
+        else
+            std::snprintf(verdict, sizeof(verdict), "no");
+        std::printf("  %8.2f %14.4f %14.4f %+8.4f+-%.4f %14s\n", r.lagM[li], r.rest[1][li],
+                    r.comp[1][li], r.paired[li], s, verdict);
+    }
+
+    // DETECTABILITY AGAINST AN ABSOLUTE REFERENCE. The control's own departure
+    // from 1.0 is the estimator's bias on these very points, so a composite
+    // ratio inside that band carries no information WHEN QUOTED ALONE. Solving
+    // the dilution for the amplitude that clears it, rather than for a ratio
+    // someone picked, is the difference between a calibration and a preference —
+    // but read it together with the paired test above, which needs no such
+    // amplitude because it has no bias to clear.
+    std::printf("\n  DETECTABILITY AND THE AMPLITUDE THAT WOULD REACH IT (carrier frame):\n");
+    std::printf("  %8s %13s %13s %14s %16s\n", "lag (m)", "floor |ctrl-1|", "composite-1",
+                "detectable?", "amp x N to clear");
+    for (size_t li = 0; li < r.lagM.size(); ++li) {
+        const double floorAbs = std::abs(r.ctrl[1][li] - 1.0);
+        const double sig = r.comp[1][li] - 1.0;
+        // Composite ratio for a rill scaled by k, treating the two fields as
+        // independent and the rest as isotropic:
+        //   R(k)^2 = (E_across + k^2 R_across) / (E_along + k^2 R_along)
+        // Solve R(k) = 1 + 2*floor (a 2-sigma-ish bar), then report k.
+        const double target = 1.0 + 2.0 * floorAbs;
+        const double T2 = target * target;
+        // Recover the four energies from the ratios and the rms amplitudes.
+        const double Ra = r.rillRmsM[li] * r.rillRmsM[li];
+        const double Rc = Ra * r.rill[1][li] * r.rill[1][li];
+        const double Ea = r.restRmsM[li] * r.restRmsM[li];
+        const double Ec = Ea * r.rest[1][li] * r.rest[1][li];
+        const double num = T2 * Ea - Ec, den = Rc - T2 * Ra;
+        const bool detect = sig > floorAbs;
+        if (den <= 0 || num <= 0)
+            std::printf("  %8.2f %13.4f %13.4f %14s %16s\n", r.lagM[li], floorAbs, sig,
+                        detect ? "YES" : "no", den <= 0 ? "unreachable" : "already");
+        else
+            std::printf("  %8.2f %13.4f %13.4f %14s %15.1fx\n", r.lagM[li], floorAbs, sig,
+                        detect ? "YES" : "no", std::sqrt(num / den));
+    }
+    std::printf("  (last column multiplies kRillAmplitudeMm = %lld mm. A term needing a large\n"
+                "   multiplier to become MEASURABLE is not necessarily wrong — it may be\n"
+                "   correctly subtle — but nothing can be verified about it until it clears\n"
+                "   the floor, and shouting it to make a metric move is how a wrong term ships.)\n",
+                (long long)kRillAmplitudeMm);
 }
 
 // ---------------------------------------------------------------------------
@@ -1569,6 +2208,1231 @@ void printDrainRows(const char* prefix, const DrainStats& s) {
     row(K("net.mean_path_to_edge_norm"), s.meanPathToEdgeNorm, "frac_of_domain_edge");
 }
 
+// ===========================================================================
+// CALIBRATION HARNESS — docs/terrain-amplification-plan.md §3c
+// ===========================================================================
+//
+// WHAT PROBLEM THIS SOLVES. Phase 3 adds four detail mechanisms to the client
+// amplifier and EVERY amplitude in all four is currently marked PROVISIONAL and
+// UNCALIBRATED (carrier.h's kCurvatureScale*/kCurvatureKnee*, detail_rill.h's
+// kRillAmplitudeMm, detail_bedding.h's kBeddingAmpMm/kBedding3AmpMm, and the
+// plan's `{3200, 1600, 400, 200}` mm continuation ladder). The plan says they
+// must be "set by probe measurement, not taste", against the fine tier's
+// measured S2. This block is that measurement.
+//
+// THE GOVERNING IDEA. The coarse raster is self-affine: S2(d) ~ C*d^H from
+// 960 m down to 30 m. The client's detail ladder should CONTINUE that structure
+// function through the 7.5 m -> 0.2 m band rather than invent an unrelated
+// spectrum. So: measure (H, C) on real data over the band where data exists,
+// evaluate the continuation C*d^H over the client band, and solve for the
+// octave amplitudes that make the client's own S2 land on it.
+//
+// ---------------------------------------------------------------------------
+// WHY THE SOLVE IS LINEAR, AND WHY IT IS DONE IN RMS RATHER THAN MEAN-ABS.
+//
+// The octaves are independent zero-mean fields (different lattices, different
+// hash channels), so their VARIANCES add and their mean-absolute values do not.
+// Writing k_i(d) for the second-difference RMS of octave i at unit amplitude,
+//
+//     S2_rms(d)^2  =  SUM_i  A_i^2 * k_i(d)^2
+//
+// which is LINEAR in u_i = A_i^2. Four unknowns, eleven lags, one non-negative
+// least squares — no search, no eyeballing, and a unique global optimum found
+// by enumerating all 16 active sets (with 4 variables that enumeration IS the
+// exact NNLS solution, not an approximation to it).
+//
+// Everything downstream is reported in BOTH currencies, because the rest of
+// this tool and the plan's own acceptance text are written in mean-abs S2 and
+// quoting one as the other would be a ~25% silent error (a Gaussian's
+// E|X| = sqrt(2/pi)*sigma = 0.798*sigma).
+//
+// ---------------------------------------------------------------------------
+// THE VERIFICATION PASS IS NOT OPTIONAL. Everything above is a MODEL of the
+// octave sum: it assumes independence, it assumes the kernels are stationary,
+// and it ignores the integer truncation evalSurface actually performs. So after
+// solving, the ladder is SYNTHESISED at the solved integer amplitudes using
+// valueNoise2Fade and the same `noise * amp / 32768` integer arithmetic
+// evalSurface uses, and its S2 is measured directly on the same lattice. The
+// residual table prints the MEASURED result, not the modelled one. If the two
+// disagree, the model is wrong and the measurement wins.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS METHOD CANNOT DO, STATED UP FRONT SO NOBODY QUOTES IT WRONGLY.
+//
+// S2(d) is a scalar per lag. It has exactly as many degrees of freedom as it
+// has lags, it is direction-blind, and it is blind to any conditioning. So:
+//
+//   * The CONTINUATION LADDER is genuinely constrained by it. That is what an
+//     fBm octave ladder IS — a set of amplitudes chosen to place energy per
+//     scale — and S2 measures energy per scale. Take those numbers.
+//
+//   * The RILL term is NOT separately constrained. Its 1.6 m across-slope
+//     wavelength puts its energy in the same band as the 1600 mm octave, and
+//     S2 cannot tell a 1.6 m anisotropic field from a 1.6 m isotropic one:
+//     the two design columns are collinear (this block prints the actual
+//     collinearity, so the claim is measured rather than asserted). What DOES
+//     constrain it is the across/along anisotropy ratio, which is a different
+//     statistic and is solved for separately below.
+//
+//   * The CURVATURE GATE is a RATIO, not an amplitude. It multiplies whatever
+//     detail is there, so S2 constrains only its ROOT-MEAN-SQUARE gain over
+//     the terrain (which is a real constraint: it rescales the whole ladder,
+//     and this block reports the factor). Its SHAPE — the min, max and knee —
+//     is constrained by the curvature-CONDITIONED ratio, which is what
+//     curvatureConditionedRoughness above measures. This block solves the knee
+//     against that target from the measured curvature distribution.
+//
+//   * The BEDDING term is quasi-periodic and keyed on ELEVATION, not on
+//     horizontal position, so its horizontal wavelength is thickness/sin(dip
+//     relative to the ground) and varies with the local slope. It has no fixed
+//     lag. This block measures the S2 it actually produces per lag on real
+//     terrain, so its energy is at least accounted for in the budget — but the
+//     number that says whether it is right is its VISIBILITY as layering, and
+//     S2 cannot see that at all.
+//
+// DETERMINISM. Fixed integer lattices anchored on the transect origin, fixed
+// lag sets, fixed seed, no rand(), no clock, no wall time in any output.
+// ---------------------------------------------------------------------------
+
+// The plan's continuation ladder. Lattice sizes are FIXED by the plan; the
+// amplitudes are what this harness solves for.
+constexpr int kLadderN = 4;
+constexpr int64_t kLadderLatticeMm[kLadderN] = {3200, 1600, 400, 200};
+
+// The kernels are measured at a 1000 mm reference amplitude, so a kernel value
+// expressed in metres is exactly "metres of S2 per metre of octave amplitude" —
+// dimensionless. That is what makes the design matrix unit-free.
+constexpr double kKernelRefAmpMm = 1000.0;
+
+// The client band, in voxels: 0.2 m (two voxels, the finest lattice in the
+// ladder and the finest scale at which value noise is a shape rather than
+// per-voxel static) through 7.5 m (four fine-tier posts — the band edge the
+// plan names).
+const std::vector<int64_t> kCalLagsVox = {2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 75};
+
+struct S2Curve {
+    std::vector<double> lagM, absM, rmsM;
+    std::vector<int64_t> n;
+};
+
+// Structure function of the SOURCE RASTER — the tile control lattice itself,
+// not the amplified surface. This is the trend the client is meant to continue,
+// so it must be read off the data and not off our own output.
+//
+// Both axes at every lag, so the estimator is direction-neutral.
+//
+// THE LAND MASK IS LOAD-BEARING. A tile that is 60% ocean has 60% of its
+// stencils sitting on a dead-flat sea, and those contribute S2 = 0 to the mean,
+// which drags C down and H up by an amount that depends entirely on how much
+// water happened to be in frame. The mask requires the centre AND all four arms
+// to be above sea level; `n` per lag is printed so the shrinkage with lag is
+// visible rather than hidden.
+S2Curve rasterS2(ITileSampler& tiles, int64_t px0, int64_t py0, int64_t nPx,
+                 const std::vector<int64_t>& lagPx, bool landOnly) {
+    const double pxM = static_cast<double>(tiles.pixelSizeMm()) / 1000.0;
+    S2Curve c;
+    for (int64_t d : lagPx) {
+        long double sa = 0, sq = 0;
+        int64_t cnt = 0;
+        for (int64_t j = 0; j < nPx; ++j)
+            for (int64_t i = 0; i < nPx; ++i) {
+                const int64_t x = px0 + i, y = py0 + j;
+                const double h = static_cast<double>(tiles.elevationMm(x, y));
+                if (landOnly && h <= 0) continue;
+                const double xm = static_cast<double>(tiles.elevationMm(x - d, y));
+                const double xp = static_cast<double>(tiles.elevationMm(x + d, y));
+                const double ym = static_cast<double>(tiles.elevationMm(x, y - d));
+                const double yp = static_cast<double>(tiles.elevationMm(x, y + d));
+                if (landOnly && (xm <= 0 || xp <= 0 || ym <= 0 || yp <= 0)) continue;
+                const double sx = xp - 2 * h + xm, sy = yp - 2 * h + ym;
+                sa += std::abs(sx) + std::abs(sy);
+                sq += sx * sx + sy * sy;
+                cnt += 2;
+            }
+        c.lagM.push_back(static_cast<double>(d) * pxM);
+        c.absM.push_back(cnt ? static_cast<double>(sa / cnt) / 1000.0 : 0.0);
+        c.rmsM.push_back(cnt ? std::sqrt(static_cast<double>(sq / cnt)) / 1000.0 : 0.0);
+        c.n.push_back(cnt);
+    }
+    return c;
+}
+
+// A fixed integer sample lattice, anchored on the transect origin.
+struct CalLattice {
+    int64_t vx0 = 0, vy0 = 0, n = 0, strideVox = 0;
+};
+
+// S2 of an arbitrary point function of voxel coordinates, returning millimetres.
+// The stencil arms reach OUTSIDE the lattice by design — every field here is
+// defined everywhere, and letting the arms leave keeps the centre set identical
+// across lags so the curve is a curve rather than eleven different samples.
+template <typename F>
+S2Curve fieldS2(const CalLattice& L, const std::vector<int64_t>& lagVox, F f) {
+    S2Curve c;
+    for (int64_t d : lagVox) {
+        long double sa = 0, sq = 0;
+        int64_t cnt = 0;
+        for (int64_t j = 0; j < L.n; ++j)
+            for (int64_t i = 0; i < L.n; ++i) {
+                const int64_t x = L.vx0 + i * L.strideVox, y = L.vy0 + j * L.strideVox;
+                const double h = f(x, y);
+                const double sx = f(x + d, y) - 2 * h + f(x - d, y);
+                const double sy = f(x, y + d) - 2 * h + f(x, y - d);
+                sa += std::abs(sx) + std::abs(sy);
+                sq += sx * sx + sy * sy;
+                cnt += 2;
+            }
+        c.lagM.push_back(static_cast<double>(d) * kVoxelSizeMm / 1000.0);
+        c.absM.push_back(cnt ? static_cast<double>(sa / cnt) / 1000.0 : 0.0);
+        c.rmsM.push_back(cnt ? std::sqrt(static_cast<double>(sq / cnt)) / 1000.0 : 0.0);
+        c.n.push_back(cnt);
+    }
+    return c;
+}
+
+// Power-law fit log S2 = logC + H log d over a stated lag window. fitLine above
+// supplies the slope and R^2; the intercept comes from the means, because the
+// extrapolation needs C and a slope alone cannot give it.
+struct BandFit {
+    double H = 0, logC = 0, r2 = 0;
+    int64_t nLags = 0;
+    double loM = 0, hiM = 0;
+    bool valid = false;
+    double at(double dM) const { return std::exp(logC + H * std::log(dM)); }
+};
+
+BandFit fitBand(const S2Curve& c, bool useRms, double loM, double hiM) {
+    BandFit f;
+    f.loM = loM;
+    f.hiM = hiM;
+    std::vector<double> x, y;
+    for (size_t i = 0; i < c.lagM.size(); ++i) {
+        const double s = useRms ? c.rmsM[i] : c.absM[i];
+        // The 1e-9 slack absorbs the binary representation of exact decimal lags
+        // (7.5, 960) so a window stated in metres includes its own endpoints.
+        if (s <= 0 || c.lagM[i] < loM * (1 - 1e-9) || c.lagM[i] > hiM * (1 + 1e-9)) continue;
+        x.push_back(std::log(c.lagM[i]));
+        y.push_back(std::log(s));
+    }
+    f.nLags = static_cast<int64_t>(x.size());
+    if (x.size() < 3) return f;
+    const LineFit lf = fitLine(x, y);
+    double mx = 0, my = 0;
+    for (size_t i = 0; i < x.size(); ++i) {
+        mx += x[i];
+        my += y[i];
+    }
+    mx /= static_cast<double>(x.size());
+    my /= static_cast<double>(y.size());
+    f.H = lf.slope;
+    f.r2 = lf.r2;
+    f.logC = my - lf.slope * mx;
+    f.valid = true;
+    return f;
+}
+
+// Gaussian elimination with partial pivoting on a k x k system, k <= 4.
+bool solveDense(double A[kLadderN][kLadderN], double b[kLadderN], int k, double x[kLadderN]) {
+    for (int col = 0; col < k; ++col) {
+        int piv = col;
+        for (int r = col + 1; r < k; ++r)
+            if (std::abs(A[r][col]) > std::abs(A[piv][col])) piv = r;
+        if (std::abs(A[piv][col]) < 1e-300) return false;
+        if (piv != col) {
+            for (int j = 0; j < k; ++j) std::swap(A[col][j], A[piv][j]);
+            std::swap(b[col], b[piv]);
+        }
+        for (int r = col + 1; r < k; ++r) {
+            const double fct = A[r][col] / A[col][col];
+            for (int j = col; j < k; ++j) A[r][j] -= fct * A[col][j];
+            b[r] -= fct * b[col];
+        }
+    }
+    for (int r = k - 1; r >= 0; --r) {
+        double s = b[r];
+        for (int j = r + 1; j < k; ++j) s -= A[r][j] * x[j];
+        x[r] = s / A[r][r];
+    }
+    return true;
+}
+
+// EXACT non-negative least squares for the four-octave design, by enumerating
+// every active set. The constrained optimum has SOME set of octaves pinned at
+// zero and is the unconstrained minimiser over the rest; there are only 16 such
+// sets, so enumerating them and keeping the best feasible one is the global
+// optimum rather than a heuristic. No iteration count, no tolerance, no
+// dependence on a starting point — which also means it is bit-reproducible.
+//
+// Rows are pre-divided by the target, so the objective is RELATIVE error: a
+// 10% miss at the 0.2 m lag counts the same as a 10% miss at 7.5 m, which is
+// what "continue the spectrum" means. An unweighted fit would be dominated
+// entirely by the largest lag and would leave the fine end unconstrained.
+struct LadderSolve {
+    double u[kLadderN] = {0, 0, 0, 0}; // A_i^2 in metres^2 of amplitude
+    double ampMm[kLadderN] = {0, 0, 0, 0};
+    int32_t ampMmInt[kLadderN] = {0, 0, 0, 0};
+    double resid = 0;
+    int64_t nRows = 0;
+    bool ok = false;
+};
+
+// `maxLagM` exists for a reason that is easy to get wrong. A value-noise octave
+// of lattice L is FLAT in d for d > L — its second difference has already
+// decorrelated — so at 7.5 m all four columns of a `{3200,...,200}` ladder are
+// within 2% of each other and the row degenerates to "the sum of the four
+// amplitudes is X". It carries no information about how to SPLIT them, but under
+// relative weighting it carries full weight, and because the ladder physically
+// cannot reach the 7.5 m target it carries a CONTRADICTORY one. Left in, it
+// drags the coarsest octave up and wrecks the fine end. Excluding lags past the
+// coarsest lattice is not tuning the answer; it is declining to fit a parameter
+// with data that cannot constrain it.
+LadderSolve solveLadder(const std::vector<double>& lagM, const std::vector<double>& targetM,
+                        const std::vector<double>& carrierM, const S2Curve kern[kLadderN],
+                        double maxLagM) {
+    // Rows: only lags where the target has headroom left over the carrier. A
+    // lag where the carrier ALREADY exceeds the continuation target has nothing
+    // to ask of the ladder and must not be turned into a negative demand.
+    std::vector<std::array<double, kLadderN>> A;
+    std::vector<double> rhs;
+    for (size_t li = 0; li < lagM.size(); ++li) {
+        if (lagM[li] > maxLagM * (1 + 1e-9)) continue;
+        const double b = targetM[li] * targetM[li] - carrierM[li] * carrierM[li];
+        if (b <= 0) continue;
+        std::array<double, kLadderN> row{};
+        for (int i = 0; i < kLadderN; ++i) {
+            const double k = kern[i].rmsM[li];
+            row[static_cast<size_t>(i)] = k * k / b; // pre-divided: relative residual
+        }
+        A.push_back(row);
+        rhs.push_back(1.0);
+    }
+    LadderSolve out;
+    out.nRows = static_cast<int64_t>(A.size());
+    if (A.size() < 2) return out;
+
+    double best = 0;
+    bool have = false;
+    for (int mask = 1; mask < (1 << kLadderN); ++mask) {
+        int idx[kLadderN], k = 0;
+        for (int i = 0; i < kLadderN; ++i)
+            if (mask & (1 << i)) idx[k++] = i;
+        double N[kLadderN][kLadderN] = {{0}}, g[kLadderN] = {0}, sol[kLadderN] = {0};
+        for (size_t r = 0; r < A.size(); ++r)
+            for (int a = 0; a < k; ++a) {
+                g[a] += A[r][static_cast<size_t>(idx[a])] * rhs[r];
+                for (int b2 = 0; b2 < k; ++b2)
+                    N[a][b2] += A[r][static_cast<size_t>(idx[a])] * A[r][static_cast<size_t>(idx[b2])];
+            }
+        if (!solveDense(N, g, k, sol)) continue;
+        bool feasible = true;
+        for (int a = 0; a < k; ++a)
+            if (sol[a] < 0) feasible = false;
+        if (!feasible) continue;
+        double u[kLadderN] = {0, 0, 0, 0};
+        for (int a = 0; a < k; ++a) u[idx[a]] = sol[a];
+        double res = 0;
+        for (size_t r = 0; r < A.size(); ++r) {
+            double v = 0;
+            for (int i = 0; i < kLadderN; ++i) v += A[r][static_cast<size_t>(i)] * u[i];
+            res += (v - rhs[r]) * (v - rhs[r]);
+        }
+        if (!have || res < best) {
+            best = res;
+            have = true;
+            for (int i = 0; i < kLadderN; ++i) out.u[i] = u[i];
+        }
+    }
+    if (!have) return out;
+    out.resid = std::sqrt(best / static_cast<double>(A.size()));
+    for (int i = 0; i < kLadderN; ++i) {
+        out.ampMm[i] = std::sqrt(out.u[i]) * kKernelRefAmpMm;
+        // Rounded to integer millimetres because that is what the Octave table
+        // holds; the verification pass below then measures the ROUNDED ladder,
+        // so the printed residual is the residual of what would actually ship.
+        out.ampMmInt[i] = static_cast<int32_t>(std::llround(out.ampMm[i]));
+    }
+    out.ok = true;
+    return out;
+}
+
+// The gate, re-parameterised on the knee so the knee can be SOLVED for rather
+// than asserted. Identical in shape to carrier.h's curvatureScaleQ10; that
+// function's own constants are passed in as the defaults at the call site, so
+// this is a generalisation of it and not a second opinion about it.
+double gateGain(int64_t curveQ10, double kneeQ10, double minQ10, double maxQ10) {
+    double c = static_cast<double>(curveQ10);
+    if (c < -kneeQ10) c = -kneeQ10;
+    if (c > kneeQ10) c = kneeQ10;
+    const double g = c < 0 ? 1024.0 + (-c) * (maxQ10 - 1024.0) / kneeQ10
+                           : 1024.0 - c * (1024.0 - minQ10) / kneeQ10;
+    return g / 1024.0;
+}
+
+struct CurvGateCal {
+    int64_t nPts = 0;
+    double baselineM = 0;
+    double terLo = 0, terHi = 0; // tercile edges, mm/m^2
+    double p05 = 0, p95 = 0;
+    double gConvex = 0, gPlanar = 0, gConcave = 0; // mean gain per tercile, current constants
+    double ratioNow = 0;
+    double rmsGain = 0;      // sqrt(E[g^2]) — the factor the ladder must absorb
+    double kneeForTarget = 0;
+    double ratioAtSolvedKnee = 0;
+    double ratioCeiling = 0; // the saturated limit, max/min
+    bool kneeSolved = false;
+    // A sweep, because a single solved knee hides the shape of the trade. The
+    // knee is the one constant the plan does NOT pin (it pins 1.75x and 0.5x),
+    // so what a reader needs is "what does each knee buy", not one number.
+    static const int kSweep = 7;
+    double sweepKnee[kSweep] = {0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0};
+    double sweepRatio[kSweep] = {0, 0, 0, 0, 0, 0, 0};
+    double sweepRmsGain[kSweep] = {0, 0, 0, 0, 0, 0, 0};
+};
+
+CurvGateCal calibrateCurvatureGate(ITileSampler& tiles, const CalLattice& L, double targetRatio) {
+    CurvGateCal g;
+    g.baselineM = static_cast<double>(tiles.pixelSizeMm()) / 1000.0;
+    std::vector<int64_t> k;
+    k.reserve(static_cast<size_t>(L.n * L.n));
+    for (int64_t j = 0; j < L.n; ++j)
+        for (int64_t i = 0; i < L.n; ++i)
+            k.push_back(probeCurvatureQ10(tiles, L.vx0 + i * L.strideVox, L.vy0 + j * L.strideVox));
+    g.nPts = static_cast<int64_t>(k.size());
+    if (k.empty()) return g;
+    std::vector<int64_t> sorted = k;
+    std::sort(sorted.begin(), sorted.end());
+    const size_t nq = sorted.size();
+    auto q = [&](double p) {
+        return static_cast<double>(sorted[std::min(nq - 1, static_cast<size_t>(p * static_cast<double>(nq)))]);
+    };
+    const double loQ = q(1.0 / 3.0), hiQ = q(2.0 / 3.0);
+    g.terLo = loQ / static_cast<double>(kCurveQ10One);
+    g.terHi = hiQ / static_cast<double>(kCurveQ10One);
+    g.p05 = q(0.05) / static_cast<double>(kCurveQ10One);
+    g.p95 = q(0.95) / static_cast<double>(kCurveQ10One);
+
+    // Mean gain per tercile under the constants that are in the tree today.
+    // Terciles, not fixed thresholds, so the comparison matches exactly what
+    // curvatureConditionedRoughness reports and the two can be read together.
+    auto tercileGains = [&](double knee, double& gc, double& gp, double& gk) {
+        double s[3] = {0, 0, 0};
+        int64_t c[3] = {0, 0, 0};
+        for (int64_t v : k) {
+            const int b = static_cast<double>(v) < loQ ? 0 : (static_cast<double>(v) < hiQ ? 1 : 2);
+            s[b] += gateGain(v, knee, static_cast<double>(kCurvatureScaleMinQ10),
+                             static_cast<double>(kCurvatureScaleMaxQ10));
+            ++c[b];
+        }
+        gc = c[0] ? s[0] / static_cast<double>(c[0]) : 0;
+        gp = c[1] ? s[1] / static_cast<double>(c[1]) : 0;
+        gk = c[2] ? s[2] / static_cast<double>(c[2]) : 0;
+    };
+    tercileGains(static_cast<double>(kCurvatureKneeQ10), g.gConvex, g.gPlanar, g.gConcave);
+    g.ratioNow = g.gConcave > 0 ? g.gConvex / g.gConcave : 0;
+    long double sq = 0;
+    for (int64_t v : k) {
+        const double gg = gateGain(v, static_cast<double>(kCurvatureKneeQ10),
+                                   static_cast<double>(kCurvatureScaleMinQ10),
+                                   static_cast<double>(kCurvatureScaleMaxQ10));
+        sq += static_cast<long double>(gg) * gg;
+    }
+    g.rmsGain = std::sqrt(static_cast<double>(sq / static_cast<long double>(k.size())));
+    g.ratioCeiling = static_cast<double>(kCurvatureScaleMaxQ10) /
+                     static_cast<double>(kCurvatureScaleMinQ10);
+
+    // The achieved ratio is monotone DECREASING in the knee (a wider knee means
+    // less of the distribution saturates, so both tercile means move toward
+    // 1.0x). Bisect. If even a knee of one q10 unit — a gate that is a step
+    // function in practice — cannot reach the target, the target is above the
+    // ceiling max/min and no knee exists; say so rather than return the endpoint.
+    double lo = 1.0, hi = 1e9, gc, gp, gk;
+    for (int s = 0; s < CurvGateCal::kSweep; ++s) {
+        const double kn = g.sweepKnee[s] * static_cast<double>(kCurveQ10One);
+        tercileGains(kn, gc, gp, gk);
+        g.sweepRatio[s] = gk > 0 ? gc / gk : 0;
+        long double q2 = 0;
+        for (int64_t v : k) {
+            const double gg = gateGain(v, kn, static_cast<double>(kCurvatureScaleMinQ10),
+                                       static_cast<double>(kCurvatureScaleMaxQ10));
+            q2 += static_cast<long double>(gg) * gg;
+        }
+        g.sweepRmsGain[s] = std::sqrt(static_cast<double>(q2 / static_cast<long double>(k.size())));
+    }
+    tercileGains(lo, gc, gp, gk);
+    const double rAtLo = gk > 0 ? gc / gk : 0;
+    if (rAtLo >= targetRatio) {
+        for (int it = 0; it < 200; ++it) {
+            const double mid = std::sqrt(lo * hi); // geometric bisection: the knee spans decades
+            tercileGains(mid, gc, gp, gk);
+            const double r = gk > 0 ? gc / gk : 0;
+            if (r > targetRatio)
+                lo = mid;
+            else
+                hi = mid;
+        }
+        g.kneeForTarget = std::sqrt(lo * hi) / static_cast<double>(kCurveQ10One);
+        tercileGains(std::sqrt(lo * hi), gc, gp, gk);
+        g.ratioAtSolvedKnee = gk > 0 ? gc / gk : 0;
+        g.kneeSolved = true;
+    }
+    return g;
+}
+
+// Empirical anisotropy of the SOURCE RASTER on steep ground, in pixel lags.
+//
+// This exists so the rill amplitude has a measured anchor rather than a taste
+// call. It is NOT a measurement of rill-scale anisotropy — a 30 m raster cannot
+// resolve a 1.6 m groove — it is the anisotropy real fluvially-dissected
+// terrain shows at the LANDFORM scale, which is the only empirical statement
+// about downslope grain this data can make. Quoting it as a rill target is an
+// assumption (that grain persists in character across two decades of scale) and
+// is labelled as one wherever it is printed.
+struct RasterAniso {
+    std::vector<double> lagM, along, across, ratio;
+    int64_t nPts = 0;
+    double minGradePct = 0;
+};
+
+RasterAniso rasterAnisotropy(ITileSampler& tiles, int64_t px0, int64_t py0, int64_t nPx,
+                             const std::vector<int64_t>& lagPx, double minGradePct) {
+    RasterAniso a;
+    a.minGradePct = minGradePct;
+    const double pxM = static_cast<double>(tiles.pixelSizeMm()) / 1000.0;
+    std::vector<long double> sAl(lagPx.size(), 0.0L), sAc(lagPx.size(), 0.0L);
+    std::vector<int64_t> cnt(lagPx.size(), 0);
+    for (int64_t j = 0; j < nPx; ++j)
+        for (int64_t i = 0; i < nPx; ++i) {
+            const int64_t x = px0 + i, y = py0 + j;
+            const double h = static_cast<double>(tiles.elevationMm(x, y));
+            if (h <= 0) continue;
+            const double gx = static_cast<double>(tiles.elevationMm(x + 1, y) -
+                                                  tiles.elevationMm(x - 1, y));
+            const double gy = static_cast<double>(tiles.elevationMm(x, y + 1) -
+                                                  tiles.elevationMm(x, y - 1));
+            const double gl = std::sqrt(gx * gx + gy * gy);
+            const double gradePct = gl / (2.0 * pxM * 1000.0) * 100.0;
+            if (gradePct < minGradePct) continue;
+            const double ux = gx / gl, uy = gy / gl;
+            const double vx = -uy, vy = ux;
+            ++a.nPts;
+            for (size_t li = 0; li < lagPx.size(); ++li) {
+                const int64_t d = lagPx[li];
+                auto s2 = [&](double dx, double dy) {
+                    const int64_t ox = static_cast<int64_t>(std::lround(dx * static_cast<double>(d)));
+                    const int64_t oy = static_cast<int64_t>(std::lround(dy * static_cast<double>(d)));
+                    const double v = static_cast<double>(tiles.elevationMm(x + ox, y + oy)) +
+                                     static_cast<double>(tiles.elevationMm(x - ox, y - oy)) - 2 * h;
+                    return v * v;
+                };
+                sAl[li] += s2(ux, uy);
+                sAc[li] += s2(vx, vy);
+                ++cnt[li];
+            }
+        }
+    for (size_t li = 0; li < lagPx.size(); ++li) {
+        const double al = cnt[li] ? std::sqrt(static_cast<double>(sAl[li] /
+                                                                 static_cast<long double>(cnt[li]))) /
+                                        1000.0
+                                  : 0.0;
+        const double ac = cnt[li] ? std::sqrt(static_cast<double>(sAc[li] /
+                                                                 static_cast<long double>(cnt[li]))) /
+                                        1000.0
+                                  : 0.0;
+        a.lagM.push_back(static_cast<double>(lagPx[li]) * pxM);
+        a.along.push_back(al);
+        a.across.push_back(ac);
+        a.ratio.push_back(al > 0 ? ac / al : 0.0);
+    }
+    return a;
+}
+
+// ---------------------------------------------------------------------------
+// THE DRIVER. Prints the human report and the greppable rows for both modes;
+// `solve` selects whether it stops after the band fit.
+void runCalibration(uint64_t seed, ITileSampler& tiles, Amplifier& amp, int64_t vx0, int64_t vy0,
+                    int64_t calNPx, const CalLattice& kernL, const CalLattice& fieldL,
+                    bool landOnly, bool solve, double bandLoM, double bandHiM, double forcedH,
+                    double forcedS2, double curvRatioTarget, double rillRatioTarget,
+                    const char* sourceName, const std::atomic<uint64_t>* missingCounter) {
+    // COVERAGE GUARD, and it is here because it cost a whole afternoon of wrong
+    // conclusions. An ITileSampler answers a query for an unloaded tile with a
+    // bland default rather than failing, so a lattice that runs off the edge of
+    // the loaded set reads a 3000 m alpine face against a 0 m plain and reports
+    // a carrier whose sub-metre roughness is a hundred times the truth. Every
+    // number downstream is then garbage that looks perfectly plausible. Count
+    // the misses and say so loudly.
+    const uint64_t missBefore = missingCounter ? missingCounter->load() : 0;
+    const int64_t pxMm = tiles.pixelSizeMm();
+    const double pxM = static_cast<double>(pxMm) / 1000.0;
+    const int64_t px0 = floorDiv(vx0 * kVoxelSizeMm, pxMm);
+    const int64_t py0 = floorDiv(vy0 * kVoxelSizeMm, pxMm);
+
+    // Lags: powers of two in pixels, which at 30 m/px is 30 m .. 960 m (the band
+    // the plan names) and at 1875 mm/px is 1.875 m .. 960 m (the same top end,
+    // reaching four decades further down).
+    std::vector<int64_t> lagPx;
+    for (int64_t d = 1; d * pxM <= bandHiM * 1.0000001; d *= 2) lagPx.push_back(d);
+
+    std::printf("\n=== SOURCE RASTER STRUCTURE FUNCTION =====================================\n");
+    std::printf("source        : %s\n", sourceName);
+    std::printf("pixel size    : %lld mm (%.4f m)\n", (long long)pxMm, pxM);
+    std::printf("lattice       : %lld x %lld pixels anchored at pixel (%lld, %lld) = %.1f km sq\n",
+                (long long)calNPx, (long long)calNPx, (long long)px0, (long long)py0,
+                static_cast<double>(calNPx) * pxM / 1000.0);
+    std::printf("land mask     : %s\n",
+                landOnly ? "ON (centre and all four arms must be above sea level)" : "OFF");
+
+    const S2Curve src = rasterS2(tiles, px0, py0, calNPx, lagPx, landOnly);
+    std::printf("\n  %10s %14s %14s %10s %12s %10s\n", "lag (m)", "S2 mean|.| (m)", "S2 rms (m)",
+                "rms/abs", "stencils", "local H");
+    for (size_t i = 0; i < src.lagM.size(); ++i) {
+        std::printf("  %10.3f %14.5f %14.5f %10.3f %12lld", src.lagM[i], src.absM[i], src.rmsM[i],
+                    src.absM[i] > 0 ? src.rmsM[i] / src.absM[i] : 0.0, (long long)src.n[i]);
+        if (i > 0 && src.absM[i] > 0 && src.absM[i - 1] > 0)
+            std::printf(" %10.3f", (std::log(src.absM[i]) - std::log(src.absM[i - 1])) /
+                                       (std::log(src.lagM[i]) - std::log(src.lagM[i - 1])));
+        std::printf("\n");
+    }
+
+    // --- THE SOURCE'S OWN QUANTISATION FLOOR ------------------------------
+    //
+    // This is not a detail. A .vxtl v1 elevation plane is int16 METRES, so the
+    // raster the whole extrapolation is fitted to has a 1 m quantum. Rounding to
+    // that quantum injects an independent uniform(-q/2, q/2) error at every post;
+    // the second-difference stencil (1, -2, 1) has coefficient-square sum 6, so
+    // it adds a LAG-INDEPENDENT variance of 6 * q^2/12 = q^2/2, i.e. an rms floor
+    // of q/sqrt(2) at EVERY lag.
+    //
+    // Two consequences, both load-bearing for how the fit is read:
+    //   * a flat floor added to a rising power law depresses the measured slope,
+    //     so the true H is at least the fitted H, never less;
+    //   * if the continuation target at the band edge is BELOW this floor, the
+    //     source physically cannot measure the quantity being extrapolated, and
+    //     no amount of lattice or land masking fixes that.
+    //
+    // The quantum is MEASURED, not assumed: the GCD of the raster's own first
+    // differences. That works at either tier (v2 carries a 100 or 250 mm quant)
+    // and cannot go stale if the format changes.
+    int64_t quantMm = 0;
+    for (int64_t j = 0; j < calNPx; ++j)
+        for (int64_t i = 0; i < calNPx; ++i) {
+            int64_t d = tiles.elevationMm(px0 + i + 1, py0 + j) - tiles.elevationMm(px0 + i, py0 + j);
+            if (d < 0) d = -d;
+            while (d) { // binary-free Euclid; the values are small and this runs once per cell
+                const int64_t t = quantMm % d;
+                quantMm = d;
+                d = t;
+            }
+        }
+    const double floorRmsM = static_cast<double>(quantMm) / std::sqrt(2.0) / 1000.0;
+    S2Curve deq = src;
+    for (size_t i = 0; i < deq.rmsM.size(); ++i) {
+        const double v = deq.rmsM[i] * deq.rmsM[i] - floorRmsM * floorRmsM;
+        deq.rmsM[i] = v > 0 ? std::sqrt(v) : 0.0;
+    }
+    const BandFit fitDeq = fitBand(deq, true, bandLoM, bandHiM);
+
+    if (missingCounter) {
+        const uint64_t missed = missingCounter->load() - missBefore;
+        if (missed > 0)
+            std::printf("\n  *** %llu RASTER QUERIES FELL OUTSIDE THE LOADED TILE SET and were\n"
+                        "      answered with the missing-tile default. Every number in this run\n"
+                        "      is contaminated by an artificial cliff at the edge of coverage.\n"
+                        "      Move the site inland of the loaded region or shrink --cal-n. ***\n",
+                        (unsigned long long)missed);
+        else
+            std::printf("\n  coverage: every raster query landed on a loaded tile.\n");
+    }
+
+    const BandFit fitAbs = fitBand(src, false, bandLoM, bandHiM);
+    const BandFit fitRms = fitBand(src, true, bandLoM, bandHiM);
+    // The same fit with the FINEST lag dropped. The finest raster lag is where a
+    // band-limited source rolls off — the diffusion decoder's own smoothing sits
+    // exactly there — so if H moves much between these two fits, the extrapolated
+    // target is being set by the one lag least entitled to set it.
+    const BandFit fitAbsNoFinest = fitBand(src, false, bandLoM * 2.0, bandHiM);
+    const BandFit fitRmsNoFinest = fitBand(src, true, bandLoM * 2.0, bandHiM);
+
+    // A pure-ocean site leaves the land mask with nothing to average, so the fit
+    // has no lags at all. Stop rather than emit a zero-slope "power law" and a
+    // ladder solved against it: an all-zero table would be indistinguishable
+    // from a measured result in a log file.
+    if (!fitRms.valid || !fitAbs.valid) {
+        std::printf("\n  *** NO USABLE LAGS. Only %lld of %zu lags carried any land stencils —\n"
+                    "      this site is (near enough) all ocean, and there is no structure\n"
+                    "      function to fit. Pick a land site, or pass --include-ocean if you\n"
+                    "      genuinely mean to fit a sea surface. ***\n",
+                    (long long)fitRms.nLags, src.lagM.size());
+        return;
+    }
+
+    std::printf("\n  power-law fit over [%.3f, %.1f] m:\n", bandLoM, bandHiM);
+    std::printf("    mean|.|  H = %.4f   C = %.5f   R^2 = %.5f   (%lld lags)\n", fitAbs.H,
+                std::exp(fitAbs.logC), fitAbs.r2, (long long)fitAbs.nLags);
+    std::printf("    rms      H = %.4f   C = %.5f   R^2 = %.5f   (%lld lags)\n", fitRms.H,
+                std::exp(fitRms.logC), fitRms.r2, (long long)fitRms.nLags);
+    std::printf("  same fit with the finest lag dropped ([%.3f, %.1f] m):\n", bandLoM * 2.0,
+                bandHiM);
+    std::printf("    mean|.|  H = %.4f   rms H = %.4f   (delta %+.4f / %+.4f)\n",
+                fitAbsNoFinest.H, fitRmsNoFinest.H, fitAbsNoFinest.H - fitAbs.H,
+                fitRmsNoFinest.H - fitRms.H);
+    std::printf("\n  source elevation quantum (measured, GCD of first differences): %lld mm\n",
+                (long long)quantMm);
+    std::printf("    -> lag-independent S2 rms floor of q/sqrt(2) = %.4f m at EVERY lag\n",
+                floorRmsM);
+    std::printf("    -> fit with that floor removed in quadrature: rms H = %.4f (was %.4f)\n",
+                fitDeq.H, fitRms.H);
+
+    // --- the continuation target ------------------------------------------
+    const double useH = forcedH > 0 ? forcedH : fitRms.H;
+    const bool measuredBandEdge = pxM * 2.0 <= 7.5 * (1 + 1e-9);
+    double logCrms = fitRms.logC;
+    double logCabs = fitAbs.logC;
+    if (forcedH > 0) {
+        // Re-anchor on the band edge so a forced H still passes through the
+        // measured point rather than through the fit's own intercept.
+        const double anchorM = 7.5;
+        const double sAnchor = forcedS2 > 0 ? forcedS2 : fitRms.at(anchorM);
+        logCrms = std::log(sAnchor) - forcedH * std::log(anchorM);
+        logCabs = std::log(forcedS2 > 0 ? forcedS2 * (fitAbs.at(anchorM) / fitRms.at(anchorM))
+                                        : fitAbs.at(anchorM)) -
+                  forcedH * std::log(anchorM);
+    } else if (forcedS2 > 0) {
+        logCrms = std::log(forcedS2) - useH * std::log(7.5);
+        logCabs = std::log(forcedS2 * (fitAbs.at(7.5) / fitRms.at(7.5))) - useH * std::log(7.5);
+    }
+    auto targetRms = [&](double dM) { return std::exp(logCrms + useH * std::log(dM)); };
+    auto targetAbs = [&](double dM) { return std::exp(logCabs + useH * std::log(dM)); };
+
+    std::printf("\n  CONTINUATION TARGET  S2(d) = C * d^H  with H = %.4f%s\n", useH,
+                forcedH > 0 ? "  (FORCED by --target-h)" : "  (measured)");
+    std::printf("  %10s %14s %14s %14s\n", "lag (m)", "target abs (m)", "target rms (m)",
+                "provenance");
+    const double reportLags[] = {30.0, 15.0, 7.5, 3.75, 1.875, 1.6, 0.8, 0.4, 0.2};
+    for (double dM : reportLags)
+        std::printf("  %10.3f %14.5f %14.5f   %s\n", dM, targetAbs(dM), targetRms(dM),
+                    dM >= pxM * 2.0 ? "measured band" : "EXTRAPOLATED");
+    if (targetRms(7.5) < floorRmsM)
+        std::printf("\n  *** THE 7.5 m TARGET (%.4f m rms) IS BELOW THE SOURCE'S OWN\n"
+                    "      QUANTISATION FLOOR (%.4f m rms, from a %lld mm quantum). The raster\n"
+                    "      cannot represent, let alone measure, roughness of that size. The\n"
+                    "      extrapolation is therefore an extrapolation of a fit whose fine end\n"
+                    "      is partly quantisation noise. Treat the amplitudes below as an UPPER\n"
+                    "      BOUND on what the coarse tier can justify, not as a measurement. ***\n",
+                    targetRms(7.5), floorRmsM, (long long)quantMm);
+    if (!measuredBandEdge)
+        std::printf("\n  *** THE BAND EDGE AT 7.5 m IS AN EXTRAPOLATION. The source raster's\n"
+                    "      finest resolved lag is %.3f m (2 x pixel). Everything below that is\n"
+                    "      the fitted power law continued, NOT data. A baked fine tier at\n"
+                    "      1875 mm/px would make 7.5 m a measured number; run with --fine-dir\n"
+                    "      when one exists and re-read this table. ***\n",
+                    pxM * 2.0);
+
+    if (!solve) {
+        std::printf("\n=== VXC_TERRAINPROBE BAND FIT v1 ===\n");
+        rowI("bandfit.pixel_size", (long long)pxMm, "mm");
+        rowI("bandfit.lattice_n", (long long)calNPx, "px_per_axis");
+        rowI("bandfit.land_mask", landOnly ? 1 : 0, "bool");
+        row("bandfit.band_lo", bandLoM, "m");
+        row("bandfit.band_hi", bandHiM, "m");
+        row("bandfit.H_abs", fitAbs.H, "dimensionless");
+        row("bandfit.H_rms", fitRms.H, "dimensionless");
+        row("bandfit.r2_abs", fitAbs.r2, "dimensionless");
+        row("bandfit.r2_rms", fitRms.r2, "dimensionless");
+        row("bandfit.H_abs_drop_finest", fitAbsNoFinest.H, "dimensionless");
+        rowI("bandfit.source_quantum", (long long)quantMm, "mm");
+        row("bandfit.source_s2_floor_rms", floorRmsM, "m");
+        row("bandfit.H_rms_dequantised", fitDeq.H, "dimensionless");
+        row("bandfit.C_abs", std::exp(fitAbs.logC), "m_at_1m");
+        row("bandfit.C_rms", std::exp(fitRms.logC), "m_at_1m");
+        for (size_t i = 0; i < src.lagM.size(); ++i) {
+            char k[96];
+            std::snprintf(k, sizeof(k), "bandfit.s2_abs.lag_%.4gm", src.lagM[i]);
+            row(k, src.absM[i], "m");
+            std::snprintf(k, sizeof(k), "bandfit.s2_rms.lag_%.4gm", src.lagM[i]);
+            row(k, src.rmsM[i], "m");
+        }
+        row("bandfit.target_abs_7m5", targetAbs(7.5), "m");
+        row("bandfit.target_rms_7m5", targetRms(7.5), "m");
+        row("bandfit.target_abs_0m2", targetAbs(0.2), "m");
+        rowI("bandfit.band_edge_measured", measuredBandEdge ? 1 : 0, "bool");
+        std::printf("=== END BAND FIT ===\n");
+        return;
+    }
+
+    // ======================================================================
+    // OCTAVE KERNELS AND THE SOLVE
+    // ======================================================================
+    std::printf("\n=== OCTAVE KERNELS =======================================================\n");
+    std::printf("kernel lattice: %lld x %lld points, stride %lld voxels (%.2f m), domain %.1f m\n",
+                (long long)kernL.n, (long long)kernL.n, (long long)kernL.strideVox,
+                static_cast<double>(kernL.strideVox) * kVoxelSizeMm / 1000.0,
+                static_cast<double>(kernL.n * kernL.strideVox) * kVoxelSizeMm / 1000.0);
+    std::printf("reference amplitude: %.0f mm, so a kernel in metres is metres of S2 per metre\n"
+                "of octave amplitude (dimensionless).\n",
+                kKernelRefAmpMm);
+
+    S2Curve kern[kLadderN];
+    for (int i = 0; i < kLadderN; ++i) {
+        const int64_t L = kLadderLatticeMm[i];
+        const uint32_t ch = CH_DETAIL_OCTAVE_BASE + static_cast<uint32_t>(i);
+        kern[i] = fieldS2(kernL, kCalLagsVox, [&](int64_t vx, int64_t vy) {
+            return static_cast<double>(
+                       valueNoise2Fade(seed, vx * kVoxelSizeMm, vy * kVoxelSizeMm, L, ch)) *
+                   kKernelRefAmpMm / 32768.0;
+        });
+    }
+    // The carrier's own S2 in the client band. Whatever it already supplies is
+    // NOT the ladder's job, so the ladder's demand is the target with this
+    // removed in quadrature.
+    const S2Curve carrier = fieldS2(kernL, kCalLagsVox, [&](int64_t vx, int64_t vy) {
+        return static_cast<double>(carrierMm(tiles, vx, vy));
+    });
+
+    std::printf("\n  %8s %11s %11s %11s %11s %13s\n", "lag (m)", "k[3200]", "k[1600]", "k[400]",
+                "k[200]", "carrier rms(m)");
+    for (size_t li = 0; li < kCalLagsVox.size(); ++li) {
+        std::printf("  %8.2f", kern[0].lagM[li]);
+        for (int i = 0; i < kLadderN; ++i) std::printf(" %11.6f", kern[i].rmsM[li]);
+        std::printf(" %13.6f\n", carrier.rmsM[li]);
+    }
+
+    // COLLINEARITY. The design columns are k_i(d)^2 as functions of d; two
+    // columns that point the same way are indistinguishable to the fit, and the
+    // solve will split energy between them arbitrarily. Printed because the
+    // honest reading of a solved amplitude depends on it.
+    std::printf("\n  design-column cosine similarity (1.000 = indistinguishable to S2):\n");
+    std::printf("  %10s", "");
+    for (int i = 0; i < kLadderN; ++i) std::printf(" %8lld", (long long)kLadderLatticeMm[i]);
+    std::printf("\n");
+    for (int i = 0; i < kLadderN; ++i) {
+        std::printf("  %10lld", (long long)kLadderLatticeMm[i]);
+        for (int j = 0; j < kLadderN; ++j) {
+            double dot = 0, ni = 0, nj = 0;
+            for (size_t li = 0; li < kCalLagsVox.size(); ++li) {
+                const double a = kern[i].rmsM[li] * kern[i].rmsM[li];
+                const double b = kern[j].rmsM[li] * kern[j].rmsM[li];
+                dot += a * b;
+                ni += a * a;
+                nj += b * b;
+            }
+            std::printf(" %8.3f", (ni > 0 && nj > 0) ? dot / std::sqrt(ni * nj) : 0.0);
+        }
+        std::printf("\n");
+    }
+
+    std::vector<double> tgtRms, tgtAbs, carRms;
+    for (size_t li = 0; li < kCalLagsVox.size(); ++li) {
+        tgtRms.push_back(targetRms(kern[0].lagM[li]));
+        tgtAbs.push_back(targetAbs(kern[0].lagM[li]));
+        carRms.push_back(carrier.rmsM[li]);
+    }
+    const double reachM = static_cast<double>(kLadderLatticeMm[0]) / 1000.0;
+    const LadderSolve sol = solveLadder(kern[0].lagM, tgtRms, carRms, kern, reachM);
+    const LadderSolve solAll = solveLadder(kern[0].lagM, tgtRms, carRms, kern, 1e9);
+
+    std::printf("\n=== SOLVED LADDER AMPLITUDES =============================================\n");
+    if (!sol.ok) {
+        std::printf("  SOLVE FAILED: only %lld usable lags.\n", (long long)sol.nRows);
+        return;
+    }
+    std::printf("  non-negative least squares over the %lld lags at or below the coarsest\n"
+                "  lattice (%.2f m), relative-error weighting; RMS relative residual of the\n"
+                "  MODEL = %.4f\n",
+                (long long)sol.nRows, reachM, sol.resid);
+    std::printf("  %10s %14s %14s %18s\n", "lattice mm", "exact mm", "rounded mm",
+                "all-lags variant");
+    for (int i = 0; i < kLadderN; ++i)
+        std::printf("  %10lld %14.2f %14d %18d\n", (long long)kLadderLatticeMm[i], sol.ampMm[i],
+                    sol.ampMmInt[i], solAll.ok ? solAll.ampMmInt[i] : -1);
+    std::printf("  (the all-lags variant includes lags past %.2f m, where every column is flat\n"
+                "   and the row constrains only the total — reported so the difference is\n"
+                "   visible, NOT recommended. See the note above solveLadder.)\n",
+                reachM);
+
+    // VERIFICATION: synthesise the rounded ladder with the SAME integer
+    // arithmetic evalSurface uses and measure it. This is what the residual
+    // table below reports — not the model's prediction of it.
+    int32_t ampInt[kLadderN];
+    for (int i = 0; i < kLadderN; ++i) ampInt[i] = sol.ampMmInt[i];
+    const S2Curve got = fieldS2(kernL, kCalLagsVox, [&](int64_t vx, int64_t vy) {
+        const int64_t xMm = vx * kVoxelSizeMm, yMm = vy * kVoxelSizeMm;
+        int64_t s = 0;
+        for (int i = 0; i < kLadderN; ++i)
+            s += valueNoise2Fade(seed, xMm, yMm, kLadderLatticeMm[i],
+                                 CH_DETAIL_OCTAVE_BASE + static_cast<uint32_t>(i)) *
+                 ampInt[i] / 32768;
+        return static_cast<double>(s);
+    });
+    // Ladder + carrier, which is what the player would stand on.
+    const S2Curve tot = fieldS2(kernL, kCalLagsVox, [&](int64_t vx, int64_t vy) {
+        const int64_t xMm = vx * kVoxelSizeMm, yMm = vy * kVoxelSizeMm;
+        int64_t s = 0;
+        for (int i = 0; i < kLadderN; ++i)
+            s += valueNoise2Fade(seed, xMm, yMm, kLadderLatticeMm[i],
+                                 CH_DETAIL_OCTAVE_BASE + static_cast<uint32_t>(i)) *
+                 ampInt[i] / 32768;
+        return static_cast<double>(s + carrierMm(tiles, vx, vy));
+    });
+
+    std::printf("\n  PER-LAG RESIDUAL — measured on the synthesised integer ladder, not modelled\n");
+    std::printf("  %8s %13s %13s %9s %13s %13s %9s\n", "lag (m)", "target rms", "got rms(+car)",
+                "err %", "target abs", "got abs(+car)", "err %");
+    for (size_t li = 0; li < kCalLagsVox.size(); ++li) {
+        const double tr = tgtRms[li], ta = tgtAbs[li];
+        const double gr = tot.rmsM[li], ga = tot.absM[li];
+        std::printf("  %8.2f %13.5f %13.5f %8.1f%% %13.5f %13.5f %8.1f%%\n", kern[0].lagM[li], tr,
+                    gr, tr > 0 ? (gr / tr - 1.0) * 100.0 : 0.0, ta, ga,
+                    ta > 0 ? (ga / ta - 1.0) * 100.0 : 0.0);
+    }
+    std::printf("  (ladder alone, without the carrier, at 0.2 / 1.6 / 7.5 m rms: "
+                "%.5f / %.5f / %.5f m)\n",
+                got.rmsM[0], got.rmsM[7], got.rmsM.back());
+
+    // THE CURRENCY CHOICE IS WORTH ~30% AND THE PLAN DOES NOT MAKE IT.
+    //
+    // rms/mean|.| is a shape statistic: 1.253 for a Gaussian, higher for a
+    // heavy-tailed distribution. Real terrain's second differences ARE heavy
+    // tailed — mostly smooth ground with occasional cliffs — while a sum of
+    // value-noise octaves is near-Gaussian by the central limit theorem. So the
+    // two distributions cannot be matched in both currencies at once: fitting
+    // rms overshoots mean-abs by exactly this ratio, and fitting mean-abs
+    // undershoots rms by it. Printed rather than silently chosen, because
+    // "match the measured S2" is ambiguous by ~30% until someone picks one.
+    {
+        double srcShape = 0, gotShape = 0;
+        int64_t ns = 0, ng = 0;
+        for (size_t i = 0; i < src.lagM.size(); ++i)
+            if (src.absM[i] > 0) {
+                srcShape += src.rmsM[i] / src.absM[i];
+                ++ns;
+            }
+        for (size_t i = 0; i < got.lagM.size(); ++i)
+            if (got.absM[i] > 0) {
+                gotShape += got.rmsM[i] / got.absM[i];
+                ++ng;
+            }
+        if (ns && ng) {
+            srcShape /= static_cast<double>(ns);
+            gotShape /= static_cast<double>(ng);
+            std::printf("\n  DISTRIBUTION SHAPE (rms / mean|.|; 1.253 = Gaussian):\n");
+            std::printf("    source raster : %.3f   (heavy-tailed: smooth ground plus cliffs)\n",
+                        srcShape);
+            std::printf("    solved ladder : %.3f   (near-Gaussian: a sum of noise octaves)\n",
+                        gotShape);
+            std::printf("    -> the two CANNOT match in both currencies. This fit matched RMS,\n"
+                        "       so mean|.| overshoots by about %.0f%%. Fitting mean|.| instead\n"
+                        "       would scale every amplitude above by %.3f.\n",
+                        (srcShape / gotShape - 1.0) * 100.0, gotShape / srcShape);
+        }
+    }
+
+    double envelope = 0;
+    for (int i = 0; i < kLadderN; ++i)
+        envelope += 32767.0 * static_cast<double>(sol.ampMmInt[i]) / 32768.0;
+    std::printf("\n  // === PASTE INTO amplifier.cpp — fine-tier continuation ladder ===\n");
+    std::printf("  // Solved by vxc_terrainprobe --calibrate against %s.\n", sourceName);
+    std::printf("  // Target: S2(d) = %.5f * d^%.4f (rms, metres), %s.\n", std::exp(logCrms), useH,
+                measuredBandEdge ? "band edge MEASURED" : "band edge EXTRAPOLATED from the "
+                                                          "coarse tier");
+    std::printf("  constexpr Octave kFineDetailOctaves[] = {\n");
+    for (int i = 0; i < kLadderN; ++i)
+        std::printf("      {%4lld, %4d},\n", (long long)kLadderLatticeMm[i], sol.ampMmInt[i]);
+    std::printf("  };\n");
+    std::printf("  // ungated detail envelope from this table: %.0f mm\n", envelope);
+
+    // ======================================================================
+    // CURVATURE GATE — a RATIO, not an amplitude
+    // ======================================================================
+    const CurvGateCal cg = calibrateCurvatureGate(tiles, fieldL, curvRatioTarget);
+    std::printf("\n=== CURVATURE GATE =======================================================\n");
+    std::printf("  measured carrier curvature over %lld points, %.4f m baseline (the source\n"
+                "  raster's own pixel size — the gate reads the carrier, so this IS its input)\n",
+                (long long)cg.nPts, cg.baselineM);
+    std::printf("  distribution (mm/m^2, +ve = concave hollow):  p05=%.4f  tercile_lo=%.4f  "
+                "tercile_hi=%.4f  p95=%.4f\n",
+                cg.p05, cg.terLo, cg.terHi, cg.p95);
+    std::printf("  current constants: min=%.2fx  max=%.2fx  knee=%.3f mm/m^2\n",
+                static_cast<double>(kCurvatureScaleMinQ10) / 1024.0,
+                static_cast<double>(kCurvatureScaleMaxQ10) / 1024.0,
+                static_cast<double>(kCurvatureKneeQ10) / static_cast<double>(kCurveQ10One));
+    std::printf("    mean gain: convex=%.4f  planar=%.4f  concave=%.4f  ->  convex/concave = "
+                "%.3f\n",
+                cg.gConvex, cg.gPlanar, cg.gConcave, cg.ratioNow);
+    std::printf("    saturated ceiling (max/min) = %.3f; a smooth gate can only approach it\n",
+                cg.ratioCeiling);
+    std::printf("  KNEE SWEEP — what each knee buys on this measured distribution:\n");
+    std::printf("    %14s %16s %14s\n", "knee (mm/m^2)", "convex/concave", "rms gain");
+    for (int s = 0; s < CurvGateCal::kSweep; ++s)
+        std::printf("    %14.3f %16.3f %14.4f\n", cg.sweepKnee[s], cg.sweepRatio[s],
+                    cg.sweepRmsGain[s]);
+    if (cg.kneeSolved) {
+        std::printf("    knee that yields convex/concave = %.2f on THIS distribution: %.5f "
+                    "mm/m^2  (achieved %.3f)\n",
+                    curvRatioTarget, cg.kneeForTarget, cg.ratioAtSolvedKnee);
+        // A knee far inside the measured spread is a step function wearing a
+        // ramp's clothes: essentially every sample saturates, so the gain field
+        // becomes two-valued and its edges are the same class of artifact this
+        // project exists to remove. Say so rather than let the number stand.
+        const double spread = cg.terHi - cg.terLo;
+        if (spread > 0 && cg.kneeForTarget < spread * 0.1)
+            std::printf("    *** DEGENERATE: that knee is %.1f%% of the tercile spread (%.4f\n"
+                        "        mm/m^2), so the gate saturates almost everywhere and is a STEP\n"
+                        "        in practice. The target %.2f is not reachable by a gate that is\n"
+                        "        still a ramp. Pick a ratio from the sweep instead. ***\n",
+                        100.0 * cg.kneeForTarget / spread, spread, curvRatioTarget);
+    } else {
+        std::printf("    NO KNEE reaches convex/concave = %.2f on this distribution: the target\n"
+                    "    is at or above the saturated ceiling %.3f, which only a step gate hits.\n",
+                    curvRatioTarget, cg.ratioCeiling);
+    }
+    std::printf("  rms gain over the whole distribution: %.4f\n", cg.rmsGain);
+    std::printf("    -> gating the ladder multiplies its S2 by this, so the amplitudes above\n"
+                "       must be DIVIDED by it to keep global S2 on target:\n");
+    for (int i = 0; i < kLadderN; ++i)
+        std::printf("       {%4lld, %4d}  (was %d)\n", (long long)kLadderLatticeMm[i],
+                    static_cast<int>(std::llround(static_cast<double>(sol.ampMmInt[i]) /
+                                                  (cg.rmsGain > 0 ? cg.rmsGain : 1.0))),
+                    sol.ampMmInt[i]);
+    // Curvature is spectral: kappa ~ S2(b)/b^2 ~ C b^(H-2), so moving the
+    // baseline from the coarse pixel to the fine tier's 1.875 m scales the whole
+    // distribution — and therefore the knee — by that ratio. This is the
+    // quantified form of carrier.h's warning that the knee will not transfer.
+    const double tierScale = std::pow(1.875 / pxM, useH - 2.0);
+    std::printf("  fine-tier (1.875 m baseline) curvature scale factor = (1.875/%.3f)^(H-2) = "
+                "%.2fx\n",
+                pxM, tierScale);
+    if (cg.kneeSolved)
+        std::printf("    -> predicted fine-tier knee ~ %.4f mm/m^2. PREDICTED, not measured;\n"
+                    "       re-run with --fine-dir to measure it.\n",
+                    cg.kneeForTarget * tierScale);
+
+    // ======================================================================
+    // RILL — constrained by anisotropy, NOT by S2
+    // ======================================================================
+    const std::vector<int64_t> anisoLagPx = {1, 2, 4};
+    const RasterAniso ra = rasterAnisotropy(tiles, px0, py0, calNPx, anisoLagPx, 20.0);
+    std::printf("\n=== RILL / FLUTE TERM ====================================================\n");
+    std::printf("  source-raster anisotropy on >=%.0f%% grades (%lld points) — the only\n"
+                "  empirical anchor this data offers, and it is at the LANDFORM scale:\n",
+                ra.minGradePct, (long long)ra.nPts);
+    std::printf("  %10s %13s %13s %10s\n", "lag (m)", "along rms(m)", "across rms(m)", "acr/alo");
+    for (size_t li = 0; li < ra.lagM.size(); ++li)
+        std::printf("  %10.2f %13.5f %13.5f %10.3f\n", ra.lagM[li], ra.along[li], ra.across[li],
+                    ra.ratio[li]);
+
+    // Along/across S2 of the unit rill field and of the solved ladder, on steep
+    // ground only (the gate is shut elsewhere, so measuring elsewhere would
+    // average the signal away with zeros).
+    const std::vector<int64_t> rillLags = {16, 32}; // 1.6 m, 3.2 m
+    double rAlong[2] = {0, 0}, rAcross[2] = {0, 0}, lAlong[2] = {0, 0}, lAcross[2] = {0, 0};
+    int64_t rillPts = 0;
+    {
+        long double ra2[2] = {0, 0}, rc2[2] = {0, 0}, la2[2] = {0, 0}, lc2[2] = {0, 0};
+        int64_t cnt = 0;
+        for (int64_t j = 0; j < fieldL.n; ++j)
+            for (int64_t i = 0; i < fieldL.n; ++i) {
+                const int64_t x = fieldL.vx0 + i * fieldL.strideVox;
+                const int64_t y = fieldL.vy0 + j * fieldL.strideVox;
+                const ProbeCarrier c = evalProbeCarrier(tiles, x, y);
+                const double gx = static_cast<double>(c.sxMmPerPx) * 1000.0 /
+                                  static_cast<double>(pxMm);
+                const double gy = static_cast<double>(c.syMmPerPx) * 1000.0 /
+                                  static_cast<double>(pxMm);
+                const double gl = std::sqrt(gx * gx + gy * gy);
+                if (gl < static_cast<double>(kRillGateFullMmPerM)) continue; // gate not fully open
+                ++cnt;
+                const double ux = gx / gl, uy = gy / gl, vx = -uy, vy = ux;
+                // The rill field must be evaluated with the gradient AT each
+                // sample point, not at the stencil centre: it is a point
+                // function of position and local gradient, and freezing the
+                // gradient would measure a different field from the one that
+                // ships.
+                auto rillAt = [&](int64_t ax, int64_t ay) {
+                    const ProbeCarrier cc = evalProbeCarrier(tiles, ax, ay);
+                    return static_cast<double>(
+                        rillMm(seed, ax * kVoxelSizeMm, ay * kVoxelSizeMm,
+                               cc.sxMmPerPx * 1000 / pxMm, cc.syMmPerPx * 1000 / pxMm));
+                };
+                auto ladderAt = [&](int64_t ax, int64_t ay) {
+                    int64_t s = 0;
+                    for (int q = 0; q < kLadderN; ++q)
+                        s += valueNoise2Fade(seed, ax * kVoxelSizeMm, ay * kVoxelSizeMm,
+                                             kLadderLatticeMm[q],
+                                             CH_DETAIL_OCTAVE_BASE + static_cast<uint32_t>(q)) *
+                             ampInt[q] / 32768;
+                    return static_cast<double>(s);
+                };
+                for (int li = 0; li < 2; ++li) {
+                    const double d = static_cast<double>(rillLags[static_cast<size_t>(li)]);
+                    auto s2 = [&](auto&& f, double dx, double dy) {
+                        const int64_t ox = static_cast<int64_t>(std::lround(dx * d));
+                        const int64_t oy = static_cast<int64_t>(std::lround(dy * d));
+                        const double v = f(x + ox, y + oy) + f(x - ox, y - oy) - 2 * f(x, y);
+                        return v * v;
+                    };
+                    ra2[li] += s2(rillAt, ux, uy);
+                    rc2[li] += s2(rillAt, vx, vy);
+                    la2[li] += s2(ladderAt, ux, uy);
+                    lc2[li] += s2(ladderAt, vx, vy);
+                }
+            }
+        rillPts = cnt;
+        for (int li = 0; li < 2; ++li) {
+            if (!cnt) continue;
+            const long double q = static_cast<long double>(cnt);
+            // Normalised to the reference amplitude so the rill numbers are a
+            // kernel, comparable with the octave kernels above.
+            const double sc = kKernelRefAmpMm / static_cast<double>(kRillAmplitudeMm) / 1000.0;
+            rAlong[li] = std::sqrt(static_cast<double>(ra2[li] / q)) * sc;
+            rAcross[li] = std::sqrt(static_cast<double>(rc2[li] / q)) * sc;
+            lAlong[li] = std::sqrt(static_cast<double>(la2[li] / q)) / 1000.0;
+            lAcross[li] = std::sqrt(static_cast<double>(lc2[li] / q)) / 1000.0;
+        }
+    }
+    std::printf("\n  measured on %lld lattice points with the gate FULLY open (grade >= %lld%%):\n",
+                (long long)rillPts, (long long)(kRillGateFullMmPerM / 10));
+    std::printf("  %8s %13s %13s %9s %13s %13s\n", "lag (m)", "rill k along", "rill k across",
+                "rill acr/alo", "ladder along", "ladder across");
+    for (int li = 0; li < 2; ++li)
+        std::printf("  %8.2f %13.6f %13.6f %9.3f %13.6f %13.6f\n",
+                    static_cast<double>(rillLags[static_cast<size_t>(li)]) * kVoxelSizeMm / 1000.0,
+                    rAlong[li], rAcross[li], rAlong[li] > 0 ? rAcross[li] / rAlong[li] : 0.0,
+                    lAlong[li], lAcross[li]);
+    if (rillPts > 0) {
+        // Composite anisotropy of ladder + rill at amplitude A:
+        //   R^2 = (Lacr^2 + w Racr^2) / (Lalo^2 + w Ralo^2),   w = (A/1000)^2
+        // which inverts in closed form. This is the calibration S2 CANNOT do:
+        // the rill and the 1600 mm octave are the same column to S2, and only
+        // the direction-resolved statistic separates them.
+        auto solveRill = [&](double R, const char* provenance) {
+            const double R2 = R * R;
+            const double num = R2 * lAlong[0] * lAlong[0] - lAcross[0] * lAcross[0];
+            const double den = rAcross[0] * rAcross[0] - R2 * rAlong[0] * rAlong[0];
+            if (den <= 0)
+                std::printf("    target %.3f (%s): UNREACHABLE — the rill term's own anisotropy\n"
+                            "      is %.3f, below the target. Raise kRillElongation or\n"
+                            "      kRillSectors, or lower the target.\n",
+                            R, provenance, rAlong[0] > 0 ? rAcross[0] / rAlong[0] : 0.0);
+            else if (num <= 0)
+                std::printf("    target %.3f (%s): already met at ZERO rill amplitude (the\n"
+                            "      ladder alone reads %.3f).\n",
+                            R, provenance, lAlong[0] > 0 ? lAcross[0] / lAlong[0] : 0.0);
+            else
+                std::printf("    target %.3f (%s): kRillAmplitudeMm = %lld mm\n", R, provenance,
+                            (long long)std::llround(std::sqrt(num / den) * kKernelRefAmpMm));
+        };
+        std::printf("\n  amplitude solved from the ANISOTROPY target at the 1.6 m lag\n"
+                    "  (S2 alone cannot do this — see the collinearity table). Currently "
+                    "%lld mm, PROVISIONAL:\n",
+                    (long long)kRillAmplitudeMm);
+        solveRill(rillRatioTarget, "--rill-aniso, a CHOICE not a measurement");
+        if (!ra.ratio.empty() && ra.ratio[0] > 1.0)
+            solveRill(ra.ratio[0], "the source raster's OWN landform anisotropy, measured");
+    }
+
+    // ======================================================================
+    // BEDDING — quasi-periodic, keyed on elevation, no fixed lag
+    // ======================================================================
+    const S2Curve bed = fieldS2(kernL, kCalLagsVox, [&](int64_t vx, int64_t vy) {
+        return static_cast<double>(beddingMm(seed, vx * kVoxelSizeMm, vy * kVoxelSizeMm,
+                                             amp.surfaceMm(vx, vy)));
+    });
+    std::printf("\n=== BEDDING TERM =========================================================\n");
+    std::printf("  S2 the CURRENT %lld mm amplitude actually produces on this terrain, and what\n"
+                "  fraction of the continuation budget it consumes at each lag:\n",
+                (long long)kBeddingAmpMm);
+    std::printf("  %8s %13s %13s %12s\n", "lag (m)", "bedding rms", "target rms", "share of "
+                                                                                  "budget");
+    for (size_t li = 0; li < kCalLagsVox.size(); ++li) {
+        const double t = tgtRms[li];
+        std::printf("  %8.2f %13.6f %13.6f %11.1f%%\n", bed.lagM[li], bed.rmsM[li], t,
+                    t > 0 ? 100.0 * bed.rmsM[li] * bed.rmsM[li] / (t * t) : 0.0);
+    }
+    std::printf("  (share is in ENERGY, i.e. squared, because that is what adds. A term at 20%%\n"
+                "   of the budget costs the ladder only ~10%% of its amplitude.)\n");
+    // THE ONE THING S2 GENUINELY SAYS ABOUT THIS TERM: an UPPER BOUND. Whatever
+    // else the bedding is for, at no lag may it alone exceed the continuation
+    // budget, because the budget is the total and every other term is additive
+    // on top. That bound is a real constraint and is not a value — a term at
+    // half the bound and a term at a tenth of it are both admissible to S2 and
+    // are told apart only by whether the layering reads.
+    double worstShare = 0;
+    double worstLagM = 0;
+    for (size_t li = 0; li < kCalLagsVox.size(); ++li) {
+        if (tgtRms[li] <= 0) continue;
+        const double sh = bed.rmsM[li] / tgtRms[li];
+        if (sh > worstShare) {
+            worstShare = sh;
+            worstLagM = bed.lagM[li];
+        }
+    }
+    if (worstShare > 0)
+        std::printf("\n  HARD UPPER BOUND from S2 alone: the term peaks at %.2fx the budget at\n"
+                    "  the %.2f m lag, so kBeddingAmpMm <= %lld mm (currently %lld mm) merely to\n"
+                    "  stay inside the total. That is a CEILING, not a calibration: S2 cannot\n"
+                    "  distinguish this term from an isotropic octave of the same energy, and\n"
+                    "  the number that decides whether bedding is right is whether the layering\n"
+                    "  reads as layering.\n",
+                    worstShare, worstLagM,
+                    (long long)std::llround(static_cast<double>(kBeddingAmpMm) / worstShare),
+                    (long long)kBeddingAmpMm);
+
+    // --- greppable rows ---------------------------------------------------
+    std::printf("\n=== VXC_TERRAINPROBE CALIBRATION v1 ===\n");
+    rowI("cal.pixel_size", (long long)pxMm, "mm");
+    rowI("cal.band_edge_measured", measuredBandEdge ? 1 : 0, "bool");
+    row("cal.H_used", useH, "dimensionless");
+    row("cal.H_fit_abs", fitAbs.H, "dimensionless");
+    row("cal.H_fit_rms", fitRms.H, "dimensionless");
+    row("cal.r2_fit_rms", fitRms.r2, "dimensionless");
+    rowI("cal.source_quantum", (long long)quantMm, "mm");
+    row("cal.source_s2_floor_rms", floorRmsM, "m");
+    row("cal.H_fit_rms_dequantised", fitDeq.H, "dimensionless");
+    row("cal.target_rms_7m5", targetRms(7.5), "m");
+    row("cal.target_abs_7m5", targetAbs(7.5), "m");
+    row("cal.solve_model_residual", sol.resid, "rel_rms");
+    rowI("cal.solve_lags", (long long)sol.nRows, "count");
+    for (int i = 0; i < kLadderN; ++i) {
+        char k[96];
+        std::snprintf(k, sizeof(k), "cal.ladder.amp_%lldmm", (long long)kLadderLatticeMm[i]);
+        rowI(k, (long long)sol.ampMmInt[i], "mm");
+        std::snprintf(k, sizeof(k), "cal.ladder.amp_exact_%lldmm", (long long)kLadderLatticeMm[i]);
+        row(k, sol.ampMm[i], "mm");
+    }
+    row("cal.ladder.envelope", envelope, "mm");
+    for (size_t li = 0; li < kCalLagsVox.size(); ++li) {
+        char k[96];
+        std::snprintf(k, sizeof(k), "cal.resid.rel_rms.lag_%.4gm", kern[0].lagM[li]);
+        row(k, tgtRms[li] > 0 ? tot.rmsM[li] / tgtRms[li] - 1.0 : 0.0, "fraction");
+    }
+    rowI("cal.curv.points", (long long)cg.nPts, "count");
+    row("cal.curv.baseline", cg.baselineM, "m");
+    row("cal.curv.tercile_lo", cg.terLo, "mm/m2");
+    row("cal.curv.tercile_hi", cg.terHi, "mm/m2");
+    row("cal.curv.ratio_now", cg.ratioNow, "dimensionless");
+    row("cal.curv.ratio_ceiling", cg.ratioCeiling, "dimensionless");
+    row("cal.curv.knee_for_target", cg.kneeSolved ? cg.kneeForTarget : -1.0, "mm/m2_-1_if_none");
+    row("cal.curv.target_ratio", curvRatioTarget, "dimensionless");
+    row("cal.curv.rms_gain", cg.rmsGain, "dimensionless");
+    row("cal.curv.fine_tier_scale", tierScale, "dimensionless");
+    rowI("cal.rill.points", (long long)rillPts, "count");
+    row("cal.rill.kernel_aniso_1m6", rAlong[0] > 0 ? rAcross[0] / rAlong[0] : 0.0,
+        "dimensionless");
+    row("cal.rill.raster_aniso_landform", ra.ratio.empty() ? 0.0 : ra.ratio[0], "dimensionless");
+    row("cal.bedding.share_1m6", tgtRms[7] > 0 ? bed.rmsM[7] * bed.rmsM[7] /
+                                                     (tgtRms[7] * tgtRms[7])
+                                               : 0.0,
+        "energy_fraction");
+    row("cal.bedding.peak_share", worstShare, "amplitude_ratio");
+    rowI("cal.bedding.upper_bound_amp",
+         worstShare > 0
+             ? (long long)std::llround(static_cast<double>(kBeddingAmpMm) / worstShare)
+             : -1,
+         "mm_ceiling_not_a_value");
+    std::printf("=== END CALIBRATION ===\n");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1576,10 +3440,32 @@ int main(int argc, char** argv) {
     // every pre-existing command line keeps working byte-for-byte.
     bool optBaseline = false, optStructure = true;
     int64_t drainN = 384, drainStride = 10, fieldN = 96, fieldStride = 25;
+    // Calibration mode. Off unless asked for, and when asked for it REPLACES the
+    // legacy report and the structure metrics rather than adding to them: it is
+    // a different question about the same world, and every pre-existing command
+    // line must keep producing byte-identical output.
+    bool optBandFit = false, optCalibrate = false, optIncludeOcean = false;
+    int64_t calNPx = 384, kernN = 192, kernStride = 7;
+    double bandLoM = 0, bandHiM = 960.0;
+    double targetH = 0, targetS2 = 0, curvRatio = 3.5, rillRatio = 1.30;
+    std::string fineDir;
     std::vector<char*> pos;
     pos.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         char* a = argv[i];
+        auto wantD = [&](const char* name, double& dst, double lo, double hi) {
+            if (std::strcmp(a, name) != 0) return false;
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "%s needs a value\n", name);
+                std::exit(2);
+            }
+            dst = std::strtod(argv[++i], nullptr);
+            if (!(dst >= lo && dst <= hi)) {
+                std::fprintf(stderr, "%s %g out of range (%g..%g)\n", name, dst, lo, hi);
+                std::exit(2);
+            }
+            return true;
+        };
         // Lattice sizes need at least a few cells to mean anything; a stride of
         // 1 voxel (10 cm, the voxel itself) is a legitimate finest setting and
         // is how the aliasing objection to a 1 m default gets tested.
@@ -1601,10 +3487,31 @@ int main(int argc, char** argv) {
             optBaseline = true;
         } else if (std::strcmp(a, "--no-structure") == 0) {
             optStructure = false;
+        } else if (std::strcmp(a, "--band-fit") == 0) {
+            optBandFit = true;
+        } else if (std::strcmp(a, "--calibrate") == 0) {
+            optCalibrate = true;
+        } else if (std::strcmp(a, "--include-ocean") == 0) {
+            optIncludeOcean = true;
+        } else if (std::strcmp(a, "--fine-dir") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "--fine-dir needs a value\n");
+                return 2;
+            }
+            fineDir = argv[++i];
         } else if (want("--drain-n", drainN, 8, 8192) ||
                    want("--drain-stride", drainStride, 1, 100000) ||
                    want("--field-n", fieldN, 2, 4096) ||
-                   want("--field-stride", fieldStride, 1, 100000)) {
+                   want("--field-stride", fieldStride, 1, 100000) ||
+                   want("--cal-n", calNPx, 8, 8192) || want("--kern-n", kernN, 8, 4096) ||
+                   want("--kern-stride", kernStride, 1, 10000)) {
+            // consumed
+        } else if (wantD("--target-h", targetH, 0.05, 2.0) ||
+                   wantD("--target-s2", targetS2, 1e-6, 1e4) ||
+                   wantD("--band-lo", bandLoM, 0.001, 1e6) ||
+                   wantD("--band-hi", bandHiM, 0.001, 1e6) ||
+                   wantD("--curv-ratio", curvRatio, 1.0001, 100.0) ||
+                   wantD("--rill-aniso", rillRatio, 1.0001, 100.0)) {
             // consumed
         } else {
             pos.push_back(a);
@@ -1616,6 +3523,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--baseline and --no-structure are contradictory\n");
         return 2;
     }
+    if (optCalibrate) optBandFit = true;
+    if (optBandFit && optBaseline) {
+        std::fprintf(stderr, "--baseline is the structure-metric table; it does not apply to "
+                             "--band-fit/--calibrate\n");
+        return 2;
+    }
 
     if (argc < 5) {
         std::fprintf(
@@ -1623,7 +3536,10 @@ int main(int argc, char** argv) {
             "usage: vxc_terrainprobe <tiledir|--synthetic> <seed> <xM> <yM> [lenM] [pixelMm]\n"
             "       pixelMm is synthetic-only (default 30000; 3750 = scale 8, 1875 = scale 16)\n"
             "       [--baseline] [--drain-n N] [--drain-stride V] [--field-n N]\n"
-            "       [--field-stride V] [--no-structure]\n");
+            "       [--field-stride V] [--no-structure]\n"
+            "       [--band-fit] [--calibrate] [--fine-dir DIR] [--include-ocean]\n"
+            "       [--cal-n N] [--kern-n N] [--kern-stride V] [--band-lo M] [--band-hi M]\n"
+            "       [--target-h H] [--target-s2 M] [--curv-ratio R] [--rill-aniso R]\n");
         return 2;
     }
     const std::string dir = argv[1];
@@ -1679,6 +3595,68 @@ int main(int argc, char** argv) {
     const int64_t vx0 = x0M * 1000 / kVoxelSizeMm;
     const int64_t vy0 = y0M * 1000 / kVoxelSizeMm;
     const int64_t n = lenM * 1000 / kVoxelSizeMm;
+
+    // --- CALIBRATION MODES ---------------------------------------------------
+    //
+    // A baked .vxtl v2 fine tier, when one exists, is the RIGHT source: it makes
+    // the 7.5 m band edge a measured number instead of a two-decade
+    // extrapolation from 30 m posts. It is loaded into its own sampler and its
+    // own Amplifier, so the carrier measured under it is the fine-tier carrier
+    // and not the coarse one. When it is absent the run continues on the coarse
+    // tier and says so in every table that depends on it.
+    if (optBandFit) {
+        FineTileSampler fine(seed, tiles);
+        Amplifier ampFine(seed, fine);
+        ITileSampler* calTiles = tiles;
+        Amplifier* calAmp = &amp;
+        std::string srcName = dir == "--synthetic" ? "synthetic tiles (30 m band)" : "real .vxtl "
+                                                                                    "v1 tiles "
+                                                                                    "(30 m/px "
+                                                                                    "coarse tier)";
+        if (!fineDir.empty()) {
+            int loaded = 0, rejected = 0;
+            if (std::filesystem::exists(fineDir)) {
+                for (auto& e : std::filesystem::directory_iterator(fineDir)) {
+                    if (e.path().extension() != ".vxtl") continue;
+                    if (fine.loadTileFile(e.path()))
+                        ++loaded;
+                    else
+                        ++rejected;
+                }
+            }
+            std::printf("fine tier: dir=%s loaded=%d rejected=%d\n", fineDir.c_str(), loaded,
+                        rejected);
+            if (loaded == 0) {
+                // Refuse rather than silently fall back: the whole point of
+                // naming a fine tier is that the answer changes, and a run that
+                // quietly extrapolated from 30 m while its header said "fine
+                // tier" is exactly the mislabelled measurement this tool exists
+                // to prevent.
+                std::fprintf(stderr, "no v2 fine tiles loaded from %s; refusing to silently "
+                                     "fall back to the coarse tier\n",
+                             fineDir.c_str());
+                return 1;
+            }
+            calTiles = &fine;
+            calAmp = &ampFine;
+            srcName = "real .vxtl v2 FINE tier (1875 mm/px)";
+        }
+        // Default the band's low end to the source's own Nyquist-ish floor: one
+        // pixel. Stated in metres so it reads the same at either tier.
+        const double loM = bandLoM > 0 ? bandLoM
+                                       : static_cast<double>(calTiles->pixelSizeMm()) / 1000.0;
+        const CalLattice kernL{vx0, vy0, kernN, kernStride};
+        const CalLattice fieldL{vx0, vy0, fieldN, fieldStride};
+        runCalibration(seed, *calTiles, *calAmp, vx0, vy0, calNPx, kernL, fieldL, !optIncludeOcean,
+                       optCalibrate, loM, bandHiM, targetH, targetS2, curvRatio, rillRatio,
+                       srcName.c_str(),
+                       // Only TileGridSampler exposes a miss counter; the
+                       // synthetic sampler cannot miss and the fine sampler
+                       // does not carry one, so those runs go unguarded and the
+                       // report says nothing rather than something false.
+                       (calTiles == &grid) ? &grid.missingTileQueries : nullptr);
+        return 0;
+    }
 
     if (!optBaseline) {
     // Amplified surface along +x.
@@ -1798,7 +3776,27 @@ int main(int argc, char** argv) {
     // reported lag, which is what keeps the binning from measuring itself.
     const std::vector<int64_t> curvLags = {1, 2, 4, 8, 16};
     const CurvBins cb =
-        curvatureConditionedRoughness(amp, vx0, vy0, fieldN, fieldStride, 50, curvLags);
+        curvatureConditionedRoughness(amp, nullptr, vx0, vy0, fieldN, fieldStride, 50, curvLags);
+    // The SAME metric binned on the carrier's analytic Laplacian — the quantity
+    // the gate actually reads. Reported alongside rather than instead: the
+    // disagreement between the two is the finding. See the block above
+    // curvatureConditionedRoughness.
+    const CurvBins cbc =
+        curvatureConditionedRoughness(amp, tiles, vx0, vy0, fieldN, fieldStride, 50, curvLags);
+    const GateCensus gc = gateCensus(*tiles, vx0, vy0, fieldN, fieldStride);
+    // Capped at 64 per axis: this is a pure statistic of the noise fields, so a
+    // 4096-point lattice already converges it, and the full field lattice would
+    // pay five octaves x five lags x five evaluations for no extra precision.
+    const BandShare bs = bandShare(seed, tiles->pixelSizeMm(), vx0, vy0,
+                                   std::min<int64_t>(fieldN, 64), fieldStride, curvLags);
+    // Rill isolation on steep ground only: below the term's own grade gate it is
+    // identically zero by construction, so including flats would average the
+    // signal away with exact zeros and report a smaller effect than exists.
+    // Capped at 48 per axis because every point costs three field evaluations
+    // per arm and each of those costs a carrier.
+    const RillIso ri =
+        rillIsolation(amp, *tiles, seed, vx0, vy0, std::min<int64_t>(fieldN, 48), fieldStride, 250,
+                      {10, 20, 30}, 20.0);
 
     // 1, 2 and 3 m: the plan's stated rill band. Gradient baseline 250 voxels
     // (25 m), matching directionalRoughness above so the two are comparable.
@@ -1810,12 +3808,21 @@ int main(int argc, char** argv) {
         printDrainage(dAmp, "AMPLIFIED SURFACE (what is rendered)");
         printDrainage(dDet, "DETAIL ONLY (amplified - carrier; the sub-30 m band)");
         printCurvBins(cb, "AMPLIFIED SURFACE");
+        printCurvBins(cbc, "AMPLIFIED SURFACE");
+        printGateCensus(gc);
+        printBandShare(bs);
         printAnisoBins(ab, "AMPLIFIED SURFACE");
+        printRillIso(ri);
         std::printf("\n");
     }
 
     // --- the compact table -------------------------------------------------
-    std::printf("=== VXC_TERRAINPROBE STRUCTURE BASELINE v1 ===\n");
+    // v2 adds the carrier-binned curvature rows (curvc.*), the gate census
+    // (gate.*) and the gated-band share (band.*). Every v1 field keeps its exact
+    // name, units and value, so a v1 baseline still diffs against a v2 one for
+    // the fields both carry; the version bump is what makes the ADDITIONS
+    // visible rather than a silent widening of the contract.
+    std::printf("=== VXC_TERRAINPROBE STRUCTURE BASELINE v2 ===\n");
     std::printf("%-46s %16s  %s\n", "# field", "value", "unit");
     rowI("config.worldgen_version", (long long)kWorldGenVersion, "int");
     rowI("config.seed", (long long)seed, "int");
@@ -1872,6 +3879,55 @@ int main(int argc, char** argv) {
         row(k, cb.s2[2][li] > 0 ? cb.s2[0][li] / cb.s2[2][li] : 0.0, "dimensionless");
     }
 
+    // v2: the same metric binned on the CARRIER's analytic Laplacian, which is
+    // the quantity curvatureScaleQ10 receives. `curv.*` above bins on a 5 m
+    // finite difference of the AMPLIFIED surface, whose terciles are two orders
+    // of magnitude larger and are cut mostly by detail noise — so `curv.*` can
+    // read 1.00 while the gate is working, and quoting it as evidence the gate
+    // is dead is a mistake this pair exists to prevent.
+    rowI("curvc.points", (long long)cbc.nPts, "count");
+    row("curvc.tercile_lo", cbc.edgeLoMmPerM2, "mm/m2_tiernorm_neg_is_crest");
+    row("curvc.tercile_hi", cbc.edgeHiMmPerM2, "mm/m2_tiernorm_neg_is_crest");
+    for (size_t li = 0; li < cbc.lagsVox.size(); ++li) {
+        char k[96];
+        const double lm = static_cast<double>(cbc.lagsVox[li]) * kVoxelSizeMm / 1000.0;
+        std::snprintf(k, sizeof(k), "curvc.ratio_convex_over_concave.lag_%.1fm", lm);
+        row(k, cbc.s2[2][li] > 0 ? cbc.s2[0][li] / cbc.s2[2][li] : 0.0, "dimensionless");
+    }
+
+    // v2: the gate census. THIS is the direct answer to "is the gate live"; the
+    // two ratio blocks above are indirect and both can be blind.
+    rowI("gate.points", (long long)gc.nPts, "count");
+    row("gate.knee", gc.kneeMmPerM2, "mm/m2");
+    row("gate.carrier_mean_abs_curvature", gc.curveMeanAbs, "mm/m2");
+    row("gate.carrier_mean_abs_curvature_tiernorm", gc.curveTierNormMeanAbs, "mm/m2_at_30m_ref");
+    row("gate.knee_over_mean_curvature", gc.curveMeanAbs > 0 ? gc.kneeMmPerM2 / gc.curveMeanAbs
+                                                             : -1.0,
+        "ratio");
+    row("gate.saturated", gc.satPct, "pct_of_points");
+    row("gate.gain_min", gc.gMin, "x");
+    row("gate.gain_p10", gc.gP10, "x");
+    row("gate.gain_median", gc.gP50, "x");
+    row("gate.gain_p90", gc.gP90, "x");
+    row("gate.gain_max", gc.gMax, "x");
+    row("gate.gain_mean", gc.gMean, "x");
+    row("gate.gain_rms", gc.gRms, "x");
+    row("gate.gain_within_5pct_of_unity", gc.inertPct, "pct_of_points_high_means_inert");
+
+    // v2: which lags can carry the gate's signal at all. A conditioned ratio at
+    // a lag whose gated share is 1% is arithmetically pinned near 1.00 whether
+    // the gate works or not, so this table is a precondition for reading either
+    // ratio block above rather than an extra.
+    rowI("band.gated_octaves", (long long)bs.nGated, "count");
+    rowI("band.fine_tier_table", bs.fine ? 1 : 0, "bool");
+    for (size_t i = 0; i < bs.lagM.size(); ++i) {
+        char k[96];
+        std::snprintf(k, sizeof(k), "band.gated_energy_share.lag_%.1fm", bs.lagM[i]);
+        row(k, bs.share[i], "fraction");
+        std::snprintf(k, sizeof(k), "band.max_s2_change_from_gate.lag_%.1fm", bs.lagM[i]);
+        row(k, bs.maxChangePct[i], "pct");
+    }
+
     rowI("rill.points", (long long)ab.nPts, "count");
     row("rill.gradient_baseline", static_cast<double>(ab.gradBaseVox) * kVoxelSizeMm / 1000.0,
         "m");
@@ -1892,6 +3948,45 @@ int main(int argc, char** argv) {
             std::snprintf(k, sizeof(k), "rill.%s.control_45deg.lag_%.0fm", band, lm);
             row(k, ab.ctrlB[b][li] > 0 ? ab.ctrlA[b][li] / ab.ctrlB[b][li] : 0.0, "dimensionless");
         }
+    }
+
+    // v2: rill isolation. `rill.*` above measures the COMPOSITE surface, where
+    // the term is buried; these rows measure it alone, alongside the bed it is
+    // buried in and the estimator's own noise floor, so "invisible" and "absent"
+    // can be told apart.
+    rowI("rilliso.points", (long long)ri.nPts, "count");
+    row("rilliso.min_grade", ri.minGradePct, "pct");
+    for (size_t li = 0; li < ri.lagM.size(); ++li) {
+        char k[128];
+        const double lm = ri.lagM[li];
+        // Frame 1 is the carrier's analytic gradient — the vector the shipped
+        // term is handed, hence the one a null result can be trusted from.
+        std::snprintf(k, sizeof(k), "rilliso.carrierframe.rill_alone.lag_%.0fm", lm);
+        row(k, ri.rill[1][li], "across_over_along");
+        std::snprintf(k, sizeof(k), "rilliso.carrierframe.rest_alone.lag_%.0fm", lm);
+        row(k, ri.rest[1][li], "across_over_along");
+        std::snprintf(k, sizeof(k), "rilliso.carrierframe.composite.lag_%.0fm", lm);
+        row(k, ri.comp[1][li], "across_over_along");
+        std::snprintf(k, sizeof(k), "rilliso.carrierframe.control_45deg.lag_%.0fm", lm);
+        row(k, ri.ctrl[1][li], "noise_floor");
+        std::snprintf(k, sizeof(k), "rilliso.ampframe.composite.lag_%.0fm", lm);
+        row(k, ri.comp[0][li], "across_over_along");
+        std::snprintf(k, sizeof(k), "rilliso.rill_rms.lag_%.0fm", lm);
+        row(k, ri.rillRmsM[li], "m");
+        std::snprintf(k, sizeof(k), "rilliso.rest_rms.lag_%.0fm", lm);
+        row(k, ri.restRmsM[li], "m");
+        std::snprintf(k, sizeof(k), "rilliso.dilution.lag_%.0fm", lm);
+        row(k, ri.rillRmsM[li] > 0 ? ri.restRmsM[li] / ri.rillRmsM[li] : -1.0,
+            "rest_over_rill_amplitude");
+        // The bias-cancelling statistic and its own error bar. THIS is the row
+        // to quote for "is the rill term doing anything on real terrain".
+        std::snprintf(k, sizeof(k), "rilliso.paired_delta.lag_%.0fm", lm);
+        row(k, ri.paired[li], "ratio_points");
+        std::snprintf(k, sizeof(k), "rilliso.paired_delta_err.lag_%.0fm", lm);
+        row(k, ri.pairedSpread[li], "ratio_points_split_half");
+        std::snprintf(k, sizeof(k), "rilliso.paired_sigma.lag_%.0fm", lm);
+        row(k, ri.pairedSpread[li] > 0 ? std::abs(ri.paired[li]) / ri.pairedSpread[li] : -1.0,
+            "sigma");
     }
     std::printf("=== END STRUCTURE BASELINE ===\n");
     return 0;
