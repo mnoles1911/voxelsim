@@ -27,6 +27,7 @@ add_executable(vxc_tests
   test_swe.cpp
   test_detail_rill.cpp
   test_detail_bedding.cpp
+  test_density3.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(vxc_tests PRIVATE voxelcore Threads::Threads)
