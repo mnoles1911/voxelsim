@@ -28,9 +28,18 @@
 // UnrealBuildTool/AutomationTool, and a handful of zstd .tps/LICENSE records
 // belonging to other prebuilt third-party libraries. A from-source engine
 // build, or a plugin that brings zstd, may well have one -- but nothing may
-// assume it.
+// assume it. There IS no engine-provided C zstd to borrow here today.
 //
-// That does not weaken the injection design; it strengthens the reason for it.
+// The ODR half of the argument, though, checked out exactly -- and not
+// hypothetically. Scanning all 3,672 engine binaries over 200 KB for the
+// symbol `ZSTD_decompress` finds it statically linked into
+//   Engine/Source/ThirdParty/Blosc/Deploy/c-blosc-1.21.0/VS2015/x64/lib/libblosc.lib
+// (c-blosc bundles zstd), alongside the managed ZstdSharp.dll copies. So a
+// zstd vendored into voxel-core would land in a binary that can already
+// contain another zstd's C symbols, at a version nobody chose. That is the
+// concrete form of the hazard, and it is why the decision is made here.
+//
+// None of this weakens the injection design; it is the reason for it.
 // voxel-core stays out of the argument entirely, and WHICH zstd this binary
 // uses is a decision made here, in one place, at the boundary:
 //

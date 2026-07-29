@@ -67,6 +67,13 @@ public class VoxelEarth : ModuleRules
 		// A from-source engine build, or a plugin, may provide one. Nothing
 		// here may assume it, so this probes and reports rather than requiring.
 		//
+		// The collision half of the argument did check out, though: scanning
+		// every engine binary over 200 KB for the symbol ZSTD_decompress finds
+		// it statically linked inside ThirdParty/Blosc's libblosc.lib, which
+		// bundles zstd. A zstd vendored into voxel-core would therefore be
+		// sharing a binary with another zstd's C symbols at a version nobody
+		// chose. See Source/VoxelEarth/VoxelTileCodec.h.
+		//
 		// With no zstd found, the module compiles and links exactly as before
 		// and CODEC_RAW tiles are unaffected; a CODEC_ZSTD tile is then refused
 		// whole by vxc::FineTile::parse with FineError::kNoDecompressor, and

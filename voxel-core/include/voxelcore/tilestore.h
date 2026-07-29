@@ -168,10 +168,12 @@ constexpr bool fineCodecNeedsDecompressor(uint8_t codec) { return codec == kCode
 //
 // (§3 justifies that by saying UE 5.8 ships zstd in Engine/Source/ThirdParty.
 // Checked 2026-07-29 against the installed UE 5.8: the binary/launcher
-// distribution does NOT -- it ships Oodle and LZ4. See
-// ue-project/Source/VoxelEarth/VoxelTileCodec.h for what was actually found.
-// The conclusion is unchanged and in fact firmer: WHICH zstd a binary uses is
-// the host's decision, so voxel-core stays out of it entirely.)
+// distribution does NOT -- it ships Oodle and LZ4. It DOES carry a zstd
+// statically linked inside ThirdParty/Blosc's libblosc.lib, which is the
+// collision the argument was about, just not the borrowable copy §3 expected.
+// See ue-project/Source/VoxelEarth/VoxelTileCodec.h for the full finding. The
+// conclusion is unchanged and in fact firmer: WHICH zstd a binary uses is the
+// host's decision, so voxel-core stays out of it entirely.)
 //
 // The UE module hands one over (VoxelTileCodec.h), a headless harness hands
 // over its own, and voxel-core builds and tests standalone with no compression
