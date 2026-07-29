@@ -29,6 +29,113 @@
 // public, overlay-aware) rather than duplicating terrain access.
 struct FVoxelWaterImpl;
 
+// --- W4 SWE diagnostics (read-only) -----------------------------------------
+//
+// Three PODs and three const queries, added for -VoxelSweBreachTest
+// (AVoxelEarthGameMode) and for nothing else. They exist because the question
+// that fixture answers -- "is the sheet SPREADING correctly, or are the beds
+// SEATED WRONG?" -- cannot be answered from the outside: the SweGrid lives
+// inside FVoxelWaterImpl, which this header must never see, and the 1Hz
+// SwePerf line reports whole-sheet totals only. A surge is a per-column
+// VELOCITY signature at a known place at a known time, and a mis-seated bed is
+// a per-column disagreement between a stored int and the terrain; neither is
+// visible in a total.
+//
+// Plain structs (not USTRUCT) and plain scalar members, so the doctrine above
+// holds: no voxel-core type crosses this header. All three queries are const,
+// allocate nothing, mutate no simulation state, and are safe to call at any
+// time from the game thread; none of them is on any hot path.
+
+// Whole-sheet state, i.e. the SwePerf status line in struct form plus the
+// grid's placement (which the log line does not carry and a fixture needs in
+// order to know whether the column it cares about is even inside the sheet).
+struct FVoxelSweProbe
+{
+	bool bArmed = false;      // a SweGrid + SweCaCoupler exist right now
+	int64 SheetVolume = 0;    // vxc::SweGrid::totalVolume(), fill units (255 == 1 voxel)
+	int64 CaVolume = 0;       // vxc::WaterCA::totalVolume(), same units
+	int64 Injected = 0;       // the running "total injected" the ADR-0004 invariant compares against
+	int64 ConservationFailures = 0; // ticks on which ca+sheet != injected
+	int32 SweColumns = 0;     // columns currently SWE-owned
+	int32 LastPunctured = 0;  // columns the last coupler step found punctured (bed no longer solid)
+	int64 TransferredToCA = 0;   // coupler ledger, cumulative fill units SWE -> CA
+	int64 TransferredToSWE = 0;  // coupler ledger, cumulative fill units CA -> SWE
+	int64 OriginVx = 0, OriginVy = 0; // sheet's inclusive voxel-column origin
+	int32 SizeX = 0, SizeY = 0;       // sheet extent in columns
+	int32 SheetScanVoxels = 0;        // SweCoupleConfig::sheetScanVoxels
+	int32 SettleToleranceFill = 0;    // sweSettleTolerance(cfg): the derived deadband a settled surface is flat to
+};
+
+// Everything about one voxel column that either solver could be holding, plus
+// the terrain's own answer for the same column. The three groups are
+// deliberately returned together: the whole diagnostic is a COMPARISON between
+// them, and sampling them through three separate calls would let them drift
+// across a fixed step.
+struct FVoxelWaterColumnProbe
+{
+	int64 Vx = 0, Vy = 0;
+
+	// --- CA side (always filled in) ---
+	int64 CaTopVz = 0;      // highest voxel in the scan window with fill > 0
+	uint8 CaTopFill = 0;    // that voxel's fill (0 == the column holds no CA water at all)
+	int32 CaColumnFill = 0; // sum of CA fill over the scan window, fill units
+
+	// --- terrain side (always filled in) ---
+	bool bTerrainTopFound = false; // a solid voxel was found in the scan window
+	int64 TerrainTopSolidVz = 0;   // topmost UVoxelWorldSubsystem::IsSolidAtVoxel == true voxel in it
+
+	// --- SWE side (meaningful only when bSweArmed && bInSheet) ---
+	bool bSweArmed = false;
+	bool bInSheet = false;  // the column is inside the sheet rectangle
+	bool bSweOwned = false; // ... and the coupler has promoted it
+	int32 Bed = 0;          // vxc::SweGrid::bedAt, the seated bed voxel z
+	int32 Depth = 0;        // vxc::SweGrid::depthAt, fill units in the column
+	int32 VelXMmPerSec = 0, VelYMmPerSec = 0; // vxc::SweGrid::velocityAt -- THE SURGE SIGNAL
+	int32 FluxXFillPerTick = 0, FluxYFillPerTick = 0; // the two faces this column owns
+};
+
+// The bed-seating audit. Beds are seated ONCE, when the sheet is armed
+// (VoxelWaterSubsystem.cpp's MaybeArmSwe), from the topmost solid voxel in a
+// window around GetSurfaceHeightUU, and are never re-seated afterwards. So
+// every later disagreement between a stored bed and the ground under it is a
+// real defect in the ownership boundary, and the sheet would be resting at the
+// wrong height with no other symptom than "the water settles somewhere odd".
+//
+// The audit re-runs the SAME seating function against the SAME wrapped
+// solidity callback, now, and diffs. It deliberately does NOT re-implement the
+// seating rule -- a forked copy would agree with the original for exactly as
+// long as nobody edited either.
+struct FVoxelSweBedAudit
+{
+	bool bArmed = false;
+	int32 Columns = 0;   // columns examined (the whole sheet)
+	int32 Seated = 0;    // columns whose stored bed voxel reads SOLID right now
+	int32 SweOwned = 0;  // columns currently SWE-owned
+
+	// Stored bed vs. what SeatSweBedZ would return TODAY, through the same
+	// mobilizer-wrapped solidity callback the coupler itself uses. Nonzero
+	// means the world changed under a seated bed (terrain streamed/edited
+	// after arming) and nothing re-seated it.
+	int32 Mismatched = 0;
+	int32 SweOwnedMismatched = 0; // ... restricted to promoted columns, which is where it MATTERS
+	int32 MaxAbsDeltaVoxels = 0;
+	int64 SumAbsDeltaVoxels = 0;
+
+	// Stored bed vs. the topmost solid voxel per UVoxelWorldSubsystem::
+	// IsSolidAtVoxel -- the BARE terrain query, with no mobilizer wrapper.
+	// This one is EXPECTED to differ over an unmobilized implicit cavern lake
+	// (the wrapper reads that as solid on purpose, see SeatSweBedZ's comment),
+	// so it is reported separately rather than folded into Mismatched: a
+	// nonzero count here with Mismatched == 0 is benign, the other way round
+	// is not.
+	int32 MismatchedVsTerrain = 0;
+
+	// Worst single disagreement (wrapped comparison), for a log line that
+	// names a column rather than just counting.
+	int64 WorstVx = 0, WorstVy = 0;
+	int32 WorstStoredBed = 0, WorstReseatedBed = 0;
+};
+
 UCLASS()
 class VOXELEARTH_API UVoxelWaterSubsystem : public UTickableWorldSubsystem
 {
@@ -145,6 +252,25 @@ public:
 	// rule for partial-fill surface cells) when a verification run's
 	// screenshot shows nothing visible.
 	uint8 GetMaxStoredFill() const;
+
+	// --- W4 SWE diagnostics (see the three PODs above) -----------------------
+
+	// Whole-sheet state. False (Out untouched apart from bArmed) when the sheet
+	// is not armed, so a caller can use the return value as "is W4 live".
+	bool GetSweProbe(FVoxelSweProbe& Out) const;
+
+	// One column, from all three sides at one instant. ScanFromVz is the top of
+	// the scan window and ScanVoxels its downward extent, in voxels; they bound
+	// the CA-fill and terrain-topmost searches (the SWE half is O(1) and ignores
+	// them). Returns false only when the subsystem has no Impl.
+	bool GetWaterColumnProbe(int64 Vx, int64 Vy, int64 ScanFromVz, int32 ScanVoxels,
+	                         FVoxelWaterColumnProbe& Out) const;
+
+	// Re-seats every sheet column's bed with the live world and diffs it against
+	// the stored bed. Walks the whole sheet (128x128 columns, each a downward
+	// solidity scan), so this is a one-shot verification call, NOT something to
+	// put on a tick. False when the sheet is not armed.
+	bool AuditSweBedSeating(FVoxelSweBedAudit& Out) const;
 
 	// --- C7/C8 underground water (docs/cavern-design.md SS5) -----------------
 
