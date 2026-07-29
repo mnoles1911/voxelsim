@@ -108,6 +108,15 @@ struct FVoxelSkyState
 	float SunIntensity = 0.f;
 	float SunTemperatureK = 0.f;   // constant 5778 K; the sunset red comes from the atmosphere
 	float MoonIntensity = 0.f;     // peak * illuminated fraction * gates; 0 when MoonEnabled is 0
+	// The RESOLVED moon temperature, after the mired lerp against
+	// voxel.Sky.MoonTintStrength and after UE's own 1000..15000 clamp -- not what
+	// voxel.Sky.MoonTemperatureK was asked for. Deliberately HIGHER than
+	// SunTemperatureK above: a cooler-looking moon is a HIGHER Kelvin, and that
+	// inversion is what made this file ship a warm moon once already. Perceptual
+	// convention, not spectroscopy; kMoonTemperatureK in the .cpp records the
+	// physical fact (albedo ~0.12, spectrum near-identical to sunlight) so that
+	// nobody undoes it on physical grounds.
+	float MoonTemperatureK = 0.f;
 	float ExposureBiasEV = 0.f;    // the stop the sky post-process is holding
 	int32 ExposureMode = 0;        // the mode it is holding it in (0/1/2)
 
@@ -251,6 +260,17 @@ namespace VoxelSky
 	// reading that.
 	VOXELEARTH_API float GetSunIntensity();
 	VOXELEARTH_API float GetMoonIntensity();
+	// The REQUESTED moon temperature, clamped to UE's own 1000..15000 window. NOT
+	// what the light is given: voxel.Sky.MoonTintStrength lerps between the sun's
+	// temperature and this one in mired space first. The resolved answer is
+	// FVoxelSkyState::MoonTemperatureK, and that is the one a log line may quote.
+	VOXELEARTH_API float GetMoonTemperatureK();
+	VOXELEARTH_API float GetMoonTintStrength();
+	// Stops subtracted from the +15.6 EV twilight cap once the sun is below
+	// astronomical twilight, ramped in over -15..-18 deg. 0 restores the flat cap
+	// the pre-fix curve had. Floored at 0 -- it may only ever darken, or it would
+	// reopen the constraint the cap was chosen to satisfy.
+	VOXELEARTH_API float GetDeepNightDropEV();
 	VOXELEARTH_API float GetShadowUpdateHz();
 	VOXELEARTH_API int32 GetExposureMode();
 	VOXELEARTH_API float GetExposureBias();

@@ -40,6 +40,9 @@ namespace
 	// either.
 	constexpr float kSunOuterSpaceIntensity = 15.0f;
 	constexpr float kMoonPeakIntensity = 0.04f;
+	constexpr float kMoonTemperatureK = 12000.f;
+	constexpr float kMoonTintStrength = 1.0f;
+	constexpr float kDeepNightDropEV = 2.0f;
 
 	TAutoConsoleVariable<int32> CVarSkyEnabled(
 		TEXT("voxel.Sky.Enabled"), 1,
@@ -133,6 +136,48 @@ namespace
 		TEXT("navigable night, lower for a harsher one; a NEW moon stays genuinely dark either way ")
 		TEXT("because MoonIlluminatedFraction multiplies this (0 at new, 1 at full). This knob and the ")
 		TEXT("night end of ExposureBiasForSunAltitude move the same pixel, so change one at a time."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<float> CVarSkyMoonTemperatureK(
+		TEXT("voxel.Sky.MoonTemperatureK"), kMoonTemperatureK,
+		TEXT("Moonlight colour temperature, Kelvin. Default 12000, i.e. DELIBERATELY BLUER THAN THE SUN'S ")
+		TEXT("5778. THIS IS PERCEPTUAL CONVENTION, NOT SPECTROSCOPY, and the physical fact is recorded ")
+		TEXT("beside kMoonTemperatureK so nobody 'corrects' it back: the moon is grey basalt at albedo ")
+		TEXT("~0.12 reflecting sunlight, so its raw spectrum is marginally WARMER than the sun's, not ")
+		TEXT("cooler. Every photograph and every film renders night cool anyway, and human scotopic ")
+		TEXT("vision genuinely shifts blue (the Purkinje effect), so a warm moon reads as a rendering ")
+		TEXT("mistake to any viewer. NOTE THE AXIS RUNS BACKWARDS from the word 'cool': LOWER Kelvin is ")
+		TEXT("WARMER light, which is exactly how this shipped at 4100 and rendered the terrain ")
+		TEXT("yellow-brown. UE clamps this to 1000..15000 inside FColorSpace::MakeFromColorTemperature, ")
+		TEXT("so 15000 is the hard ceiling; use voxel.Sky.MoonTintStrength for the rest. Changing this ")
+		TEXT("does NOT change how bright the moon is -- the blackbody colour is normalised to unit ")
+		TEXT("luminance (Y=1 in XYZ) at every temperature -- so this knob and voxel.Sky.MoonIntensity are ")
+		TEXT("genuinely independent, unlike this knob and the exposure curve."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<float> CVarSkyMoonTintStrength(
+		TEXT("voxel.Sky.MoonTintStrength"), kMoonTintStrength,
+		TEXT("How far to travel from the physically honest moon colour toward voxel.Sky.MoonTemperatureK. ")
+		TEXT("0 = the moon is given the SUN's temperature, which is what the spectrum actually says (it ")
+		TEXT("is reflected sunlight); 1 = the full artistic blue shift, DEFAULT. This is the A/B control ")
+		TEXT("for 'is the night blue because we chose it or because the sky is', and it is a separate ")
+		TEXT("knob from the temperature itself so that the SIZE of the lie is adjustable without ")
+		TEXT("relitigating the target. Interpolated in MIRED (1e6/K), not in Kelvin: equal steps in ")
+		TEXT("Kelvin are wildly unequal steps in perceived colour up at the blue end, so a Kelvin lerp ")
+		TEXT("would spend most of its travel in the first tenth of the slider."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<float> CVarSkyDeepNightDropEV(
+		TEXT("voxel.Sky.DeepNightDropEV"), kDeepNightDropEV,
+		TEXT("Stops the exposure curve gives back once the sun is below astronomical twilight, on top of ")
+		TEXT("the +15.6 EV twilight cap. Default 2.0. 0 RESTORES THE PREVIOUS FLAT CAP EXACTLY and is the ")
+		TEXT("control arm for this whole change. Why it exists: the cap alone cannot tell a -14 deg ")
+		TEXT("midsummer midnight from a -61 deg midwinter one, and since USkyAtmosphere has no airglow or ")
+		TEXT("starlight term its sky is equally dead at both, so BOTH used to render as whatever the moon ")
+		TEXT("happened to be doing -- making a high winter full moon the BRIGHTEST night of the year. See ")
+		TEXT("DeepNightDropForSunAltitude for the altitude band and why it is where it is. This only ever ")
+		TEXT("DARKENS, so it cannot break the constraint the +15.6 cap was set to satisfy (a full moon ")
+		TEXT("must not out-render noon)."),
 		ECVF_Default);
 
 	TAutoConsoleVariable<float> CVarSkyShadowUpdateHz(
@@ -233,6 +278,20 @@ namespace VoxelSky
 	// that must never leave the scene.
 	float GetMoonIntensity() { return FMath::Max(0.f, CVarSkyMoonIntensity.GetValueOnAnyThread()); }
 
+	// Clamped to the SAME 1000..15000 window UE clamps to inside
+	// FColorSpace::MakeFromColorTemperature (ColorSpace.cpp:271-273). Restated
+	// here rather than left to the engine so that the read-back log can report the
+	// ceiling being hit; a knob that silently stops moving at 15000 while the log
+	// echoes 20000 is exactly the failure the read-back rule exists to prevent.
+	float GetMoonTemperatureK() { return FMath::Clamp(CVarSkyMoonTemperatureK.GetValueOnAnyThread(), 1000.f, 15000.f); }
+
+	float GetMoonTintStrength() { return FMath::Clamp(CVarSkyMoonTintStrength.GetValueOnAnyThread(), 0.f, 1.f); }
+
+	// Floored at 0: this term may only ever DARKEN. A negative value would lift
+	// deep night ABOVE the +15.6 twilight cap, which is the one thing the cap was
+	// chosen to prevent (a full moon rendering brighter than noon).
+	float GetDeepNightDropEV() { return FMath::Max(0.f, CVarSkyDeepNightDropEV.GetValueOnAnyThread()); }
+
 	float GetShadowUpdateHz() { return FMath::Max(0.f, CVarSkyShadowUpdateHz.GetValueOnAnyThread()); }
 
 	int32 GetExposureMode() { return FMath::Clamp(CVarSkyExposureMode.GetValueOnAnyThread(), 0, 2); }
@@ -319,11 +378,52 @@ namespace
 	// not three times dimmer. The ladder log's `moonIntensity=` field is the
 	// number to compare against; the source constant is not.
 
-	// ~4100 K. Moonlight is reflected sunlight and is therefore spectrally
-	// almost identical to it; it LOOKS blue because of the Purkinje shift in
-	// human scotopic vision, not because the light is blue. We are rendering the
-	// perception, not the spectrum, so the cooler number is the right one.
-	constexpr float kMoonTemperatureK = 4100.f;
+	// THE MOON IS COLOURED BY CONVENTION, NOT BY SPECTROSCOPY, AND THE PHYSICS IS
+	// WRITTEN DOWN HERE SO THAT NOBODY "CORRECTS" IT BACK ON PHYSICAL GROUNDS.
+	// (kMoonTemperatureK, kMoonTintStrength: top of this file, beside the other
+	// cvar defaults. Runtime knobs voxel.Sky.MoonTemperatureK and
+	// voxel.Sky.MoonTintStrength.)
+	//
+	// WHAT THE PHYSICS ACTUALLY SAYS. Moonlight is sunlight reflected off lunar
+	// regolith -- basalt and anorthosite, geometric albedo ~0.12. That surface is
+	// spectrally near-neutral with a slight RED slope, so the moon's light is if
+	// anything marginally WARMER than the 5778 K sun it is reflecting, around
+	// 4100-4500 K by the usual correlated-colour-temperature fit. There is no
+	// physical sense in which moonlight is blue.
+	//
+	// WHY WE RENDER IT BLUE ANYWAY. Two reasons, both about the viewer rather than
+	// the light. (1) Human scotopic vision really does shift blue: at moonlight
+	// levels the rods take over and their peak sensitivity moves from 555 nm to
+	// 507 nm (the Purkinje effect), so a real moonlit scene IS perceived cooler
+	// than its spectrum. (2) Every photograph and every film of night is graded
+	// cool, and that convention is now what "night" looks like. We render the
+	// perception, not the spectrum. A warm moon does not read as an unusual
+	// artistic choice; it reads as a bug.
+	//
+	// THE TRAP THAT PUT THE 4100 HERE, NAMED SO IT CANNOT REPEAT. This constant
+	// shipped at 4100 K with a comment correctly arguing for the Purkinje shift
+	// and then writing down a number that produces its exact opposite. COLOUR
+	// TEMPERATURE RUNS BACKWARDS FROM THE WORD "COOL": lower Kelvin is redder.
+	// FColorSpace::MakeFromColorTemperature (ColorSpace.cpp:271) at 4100 K returns
+	// linear RGB (1.389, 0.929, 0.559) -- an R:B ratio of 2.48, TWICE as red-biased
+	// as the sun's own (1.113, 0.975, 0.915) at R:B 1.22. The moon was lighting the
+	// terrain more orange than the sun does. That is the "night reads as warm dusk"
+	// defect, whole. At 12000 K the same function returns (0.825, 0.995, 1.565),
+	// R:B 0.53, and the frame reads as night.
+	//
+	// AND IT COSTS NOTHING IN BRIGHTNESS, which is why this is a colour fix and not
+	// a lighting change. MakeFromColorTemperature normalises to Y = 1 in XYZ at
+	// every temperature, so the luminance the moon delivers is identical at 4100 K
+	// and at 12000 K to within the sRGB-encoding of the hue (<0.5% on a mean-luma
+	// metric). The one place it is NOT neutral is the SKY: the moon is atmosphere
+	// sun light 1, and UE's default Rayleigh coefficients scatter blue ~5.7x more
+	// efficiently than red, so a blue moon produces a moon-scattered night sky
+	// roughly 0.25 stops brighter as well as far more saturated. Expect the night
+	// rungs of a ladder to move up by a luma point or two and NOT more; if they
+	// move by ten, something other than this constant changed.
+	//
+	// Applied through ApplyLightsFromState, not through SpawnRig -- see there for
+	// why a colour set once at spawn is a colour no cvar can reach.
 
 	// The moon's contribution is faded out as the sun comes up, over the civil
 	// twilight band. Not for realism (the moon really is still up in daylight)
@@ -491,6 +591,33 @@ namespace
 		return T * T * (3.0 - 2.0 * T); // no visible kink at either end
 	}
 
+	// The moon's colour temperature the frame will ACTUALLY be given, after
+	// voxel.Sky.MoonTintStrength has decided how far from the physically honest
+	// answer to travel. Strength 0 hands the moon the sun's own temperature, which
+	// is what the spectrum says (reflected sunlight, see kMoonTemperatureK's
+	// comment); strength 1 hands it voxel.Sky.MoonTemperatureK in full.
+	//
+	// LERPED IN MIRED (1e6/K), NOT IN KELVIN. Reciprocal colour temperature is the
+	// axis on which equal steps are roughly equal perceived colour steps; Kelvin is
+	// not. 5778 K -> 12000 K is 173 -> 83 mired, and a Kelvin lerp at strength 0.5
+	// lands on 8889 K (112 mired) where the perceptual midpoint is 128 mired
+	// (7800 K). A Kelvin slider would therefore look like it does almost nothing
+	// for its first half and everything in its second, which is how a knob gets a
+	// reputation for being broken.
+	float ResolveMoonTemperatureK()
+	{
+		const float TargetK = VoxelSky::GetMoonTemperatureK();
+		const float Strength = VoxelSky::GetMoonTintStrength();
+		const float SunMired = 1.0e6f / kSunTemperatureK;
+		const float MoonMired = 1.0e6f / FMath::Max(1.f, TargetK);
+		const float Mired = FMath::Lerp(SunMired, MoonMired, Strength);
+		// Re-clamped to UE's own window rather than trusted to stay inside it: the
+		// lerp is between two already-clamped endpoints so it cannot escape today,
+		// but a future third term here could, and MakeFromColorTemperature would
+		// swallow it silently.
+		return FMath::Clamp(1.0e6f / FMath::Max(1.f, Mired), 1000.f, 15000.f);
+	}
+
 	// THE EXPOSURE CURVE, in UE AutoExposureBias stops (positive = brighter).
 	//
 	// WHY A CURVE AT ALL, AND WHY IT MUST NOT TRACK THE SCENE. This is the whole
@@ -540,6 +667,54 @@ namespace
 	// ~7, so half the fall survives to the screen. That is the same partial-
 	// compensation doctrine as before, now with the falls measured.
 	//
+	// WHAT THE FLAT CAP COULD NOT DO, AND WHY THAT IS NOT THE BUG IT LOOKS LIKE.
+	//
+	// The cap below was originally flat all the way down, so the curve returned
+	// +15.6 for a -14 deg midsummer midnight and +15.6 for a -61 deg midwinter one.
+	// That reads like a defect -- one number for two completely different nights --
+	// but an exposure BIAS does not need to distinguish them. It is a lift, and a
+	// constant lift passes whatever difference the scene has straight through to
+	// the screen 1:1. A curve that kept RISING below -2 deg would be the actual
+	// mistake: more lift where the scene is darker is compression, and it would
+	// erase the seasonal difference rather than preserve it. Anyone arriving here
+	// intending to "extend the curve downward" should be clear which direction they
+	// mean, because up is wrong.
+	//
+	// THE REAL PROBLEM IS THAT THE SCENE HAS NO DIFFERENCE TO PASS THROUGH, and the
+	// 06-21 ladder log says so. Take the three below-horizon rungs:
+	//
+	//   sun -3.8 deg, no moon                 luma 83.47
+	//   sun -5.1 deg, moon 100% lit at +7.9   luma 55.17
+	//   sun -14.1 deg, moon 99% lit at +18.1  luma 38.01
+	//
+	// The first two bracket the twilight falloff: 1.3 degrees of sun altitude costs
+	// 0.6 stops of displayed luminance even WITH a moon added, i.e. the sky is
+	// falling by roughly 2.5x per degree through civil twilight. Extrapolate that
+	// nine degrees further to -14.1 and the sky's contribution is down by ~3800x --
+	// three orders of magnitude below the moon term at that rung. So the 38.01 at
+	// midsummer midnight is NOT twilight. It is a nearly full moon 18 degrees up,
+	// and essentially nothing else.
+	//
+	// That is a statement about USkyAtmosphere, not about this curve: it models
+	// scattered SUNLIGHT and has no airglow, no starlight and no zodiacal term, so
+	// its sky is equally dead at -14 deg and at -61 deg. There is no midsummer
+	// skyglow for a curve to preserve, because the renderer never produced any.
+	//
+	// AND THE CONSEQUENCE WAS BACKWARDS. With the sky dead at both, a flat cap made
+	// every deep night render as whatever the moon happened to be doing -- and the
+	// moon is HIGHER in winter, because a full moon rides opposite the sun. At 52 N
+	// a full winter moon reaches ~60 deg where the midsummer one measured above sat
+	// at 18 deg, which is 1.7 stops MORE ground illuminance. Under a flat cap the
+	// darkest night of the year rendered as the brightest frame of any night. That
+	// is the defect, and it is a policy defect: sun altitude below -18 deg carries
+	// no information about how bright the sky is, so if deep night is to read as
+	// deep night, this curve is the only place that can say so.
+	//
+	// HENCE DeepNightDropForSunAltitude, SUBTRACTED FROM THE TABLE BELOW. It only
+	// ever darkens, so it cannot violate the constraint the +15.6 cap was set to
+	// satisfy (below). voxel.Sky.DeepNightDropEV 0 restores the old flat cap
+	// exactly, which is the control arm.
+	//
 	// WHY IT FLATTENS AT -2 DEG AND NOT AT -12. Below the horizon the scene falls
 	// off a cliff -- roughly 4x PER DEGREE through civil twilight -- and a curve
 	// that kept tracking it would need +20 EV by -6 deg. It cannot, because the
@@ -559,18 +734,80 @@ namespace
 	// they assume the SkyAtmosphere's twilight tracks the real one. If they are
 	// wrong they will be wrong together and in one direction, which
 	// voxel.Sky.ExposureBias shifts in one move without touching this table.
+
+	// THE DEEP-NIGHT DROP. Stops given back once the sun is below astronomical
+	// twilight, subtracted from the table below. Zero everywhere above the ramp.
+	//
+	// THE BAND IS -15 TO -18 DEG AND BOTH ENDS ARE DERIVED, NOT CHOSEN.
+	//
+	// -15 deg is the floor midsummer never reaches. At solar midnight the sun's
+	// altitude is exactly (latitude + declination - 90); at the shipped
+	// voxel.Sky.OriginLatitudeDeg 52.0 and the solstice declination +23.44 that is
+	// -14.56 deg, and the 06-21 ladder measured -14.135 at the observer's actual
+	// 52.48 N. Starting the ramp at -15 therefore leaves EVERY midsummer frame at
+	// this latitude on the flat cap, untouched, which is the owner's requirement
+	// that a midsummer midnight stay legitimately bright-ish.
+	//
+	//   THE TRAP THAT COMES WITH THAT: it is a latitude threshold, not a universal
+	//   one. Midsummer midnight clears -15 deg only for latitudes above
+	//   90 - 23.44 - 15 = 51.56 N. Move voxel.Sky.OriginLatitudeDeg south of that
+	//   and midsummer nights start dimming, gently at first. That is not a bug to
+	//   fix here -- this curve is a function of sun altitude ALONE and must stay
+	//   one, or the same sky renders differently in two places -- but it is the
+	//   thing to check first if a southern world's summer nights look wrong.
+	//
+	// -18 deg is where astronomical twilight ends BY DEFINITION: no sunlight
+	// reaches any part of the sky above the observer. There is nothing left for the
+	// curve to track down there, so it is free to express policy instead, and the
+	// policy is the owner's: night is genuinely dark, and the darkness comes from
+	// dimming lights and an exposure stop, never from crushing albedo. Nothing in
+	// this file touches voxel.GI.AmbientFloor or any other GI cvar and it must not.
+	//
+	// THE 3-DEGREE BAND IS NOT ABRUPT. At the default 1200 s day the sun sweeps
+	// 3 degrees in ~10 seconds of wall clock, so this is a 2-stop fade over ten
+	// seconds -- gentler than what already ships at sunrise, where the table below
+	// moves 3.1 stops across the 4 degrees from -2 to +2.
+	//
+	// WHY 2.0 STOPS. It is the size that puts a deep-night frame back below the
+	// midsummer-midnight frame it used to out-render. Worked from the one measured
+	// moonlit rung (sun -14.1, moon 99% at +18.1, luma 38.01): the brightest night
+	// this world can produce is a full moon at ~60 deg in midwinter, whose ground
+	// illuminance is 1.7 stops above that rung's. Two stops of exposure lands it
+	// just under, at ~34 luma predicted, which is still comfortably navigable and
+	// still ~1.9 display stops below noon. The cap's original constraint -- a full
+	// moon must not render brighter than noon -- was solved together with
+	// voxel.Sky.MoonIntensity and is NOT reopened here: this term only subtracts,
+	// so the margin it had can only grow.
+	constexpr double kDeepNightRampStartDeg = -15.0; // flat cap at and above this
+	constexpr double kDeepNightRampEndDeg = -18.0;   // full drop at and below this
+
+	double DeepNightDropForSunAltitude(double AltitudeDeg)
+	{
+		const double T = FMath::Clamp(
+			(kDeepNightRampStartDeg - AltitudeDeg) /
+				(kDeepNightRampStartDeg - kDeepNightRampEndDeg), 0.0, 1.0);
+		const double S = T * T * (3.0 - 2.0 * T); // same smoothstep the light gates use
+		return S * (double)VoxelSky::GetDeepNightDropEV();
+	}
+
 	double ExposureBiasForSunAltitude(double AltitudeDeg)
 	{
 		struct FAnchor { double AltDeg; double BiasEV; };
-		// Altitudes ascending. Below the first and above the last the curve is
-		// flat. The four night anchors are all equal on purpose -- the cap is
-		// reached at -2 deg and everything below it is held there because the
-		// moon, not the sun, is what the frame is lit by down there (above).
+		// Altitudes ascending. Below the first and above the last the TABLE is
+		// flat; the deep-night drop subtracted at the end is what carries the
+		// curve below -15. The four night anchors are all equal on purpose -- the
+		// cap is reached at -2 deg and the table holds it there because the moon,
+		// not the sun, is what the frame is lit by down there (above).
+		//
+		// The first anchor moved from -18 to -15 when the drop was added: -15 is
+		// where the ramp starts, so a table entry below it would be describing an
+		// altitude the drop already owns, and the two would have to be kept
+		// consistent by hand forever.
 		static const FAnchor Anchors[] = {
-			{-18.0, 15.6},  // astronomical night: the moon carries the frame here
+			{-15.0, 15.6},  // the deepest midsummer midnight at 52 N; below this the drop takes over
 			{-12.0, 15.6},  // nautical twilight
 			{ -6.0, 15.6},  // civil twilight ends
-			{ -2.0, 15.6},  // the cap; the scene keeps falling below this, the curve does not
+			{ -2.0, 15.6},  // the cap; the scene keeps falling below this, the table does not
 			{  0.0, 14.1},  // sunrise/sunset
 			{  2.0, 12.5},
 			{  5.0, 11.3},
@@ -582,20 +819,29 @@ namespace
 		};
 		constexpr int32 Count = UE_ARRAY_COUNT(Anchors);
 
+		// The drop is applied to EVERY return path rather than only to the
+		// below-table one, so that the two cannot disagree if the first anchor ever
+		// moves. It is identically zero above kDeepNightRampStartDeg, so the cost
+		// of that is one clamp on the day rungs.
+		double Bias = Anchors[Count - 1].BiasEV;
 		if (AltitudeDeg <= Anchors[0].AltDeg)
 		{
-			return Anchors[0].BiasEV;
+			Bias = Anchors[0].BiasEV;
 		}
-		for (int32 I = 1; I < Count; ++I)
+		else
 		{
-			if (AltitudeDeg <= Anchors[I].AltDeg)
+			for (int32 I = 1; I < Count; ++I)
 			{
-				const double Span = Anchors[I].AltDeg - Anchors[I - 1].AltDeg;
-				const double T = Span > 0.0 ? (AltitudeDeg - Anchors[I - 1].AltDeg) / Span : 0.0;
-				return FMath::Lerp(Anchors[I - 1].BiasEV, Anchors[I].BiasEV, T);
+				if (AltitudeDeg <= Anchors[I].AltDeg)
+				{
+					const double Span = Anchors[I].AltDeg - Anchors[I - 1].AltDeg;
+					const double T = Span > 0.0 ? (AltitudeDeg - Anchors[I - 1].AltDeg) / Span : 0.0;
+					Bias = FMath::Lerp(Anchors[I - 1].BiasEV, Anchors[I].BiasEV, T);
+					break;
+				}
 			}
 		}
-		return Anchors[Count - 1].BiasEV;
+		return Bias - DeepNightDropForSunAltitude(AltitudeDeg);
 	}
 } // namespace
 
@@ -800,7 +1046,9 @@ void UVoxelSkySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		UE_LOG(LogVoxelSky, Log,
 		       TEXT("VoxelSky settings RESOLVED: Enabled=%d TimeScale=%.3f DayLength=%.1f s DaysPerYear=%.1f ")
 		       TEXT("Origin=(%.4f N, %.4f E) Moon=%d SunIntensity=%.4f MoonIntensity=%.4f ")
-		       TEXT("ShadowUpdateHz=%.2f ExposureMode=%d ExposureBias=%.2f DayEV=%.2f NightEV=%.2f"),
+		       TEXT("MoonTempK=%.0f (requested %.0f, tint %.2f) ")
+		       TEXT("ShadowUpdateHz=%.2f ExposureMode=%d ExposureBias=%.2f ")
+		       TEXT("DayEV=%.2f TwilightEV=%.2f DeepNightEV=%.2f DeepNightDrop=%.2f"),
 		       VoxelSky::IsEnabled() ? 1 : 0, VoxelSky::GetTimeScale(), DayLength, DaysPerYear,
 		       VoxelSky::GetOriginLatitudeDeg(), VoxelSky::GetOriginLongitudeDeg(),
 		       VoxelSky::IsMoonEnabled() ? 1 : 0,
@@ -808,12 +1056,18 @@ void UVoxelSkySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		       // sun's is FLOORED away from zero and a run that hit that floor has
 		       // to be able to say so from its own log.
 		       VoxelSky::GetSunIntensity(), VoxelSky::GetMoonIntensity(),
+		       // Resolved AND requested, because the mired lerp against the tint
+		       // strength and UE's own 1000..15000 clamp can each move the answer.
+		       ResolveMoonTemperatureK(), VoxelSky::GetMoonTemperatureK(), VoxelSky::GetMoonTintStrength(),
 		       VoxelSky::GetShadowUpdateHz(),
 		       VoxelSky::GetExposureMode(), VoxelSky::GetExposureBias(),
-		       // The two ends of the retuned curve, logged so a capture states the
-		       // exposure policy it ran under rather than the one in this revision
-		       // of the source.
-		       ExposureBiasForSunAltitude(60.0), ExposureBiasForSunAltitude(-18.0));
+		       // THREE points on the curve, not two, and the third is the whole
+		       // point of the deep-night ramp: TwilightEV and DeepNightEV used to
+		       // be the same number, which is why a midwinter midnight rendered
+		       // like a midsummer one. A capture states the exposure policy it ran
+		       // under rather than the one in this revision of the source.
+		       ExposureBiasForSunAltitude(60.0), ExposureBiasForSunAltitude(-6.0),
+		       ExposureBiasForSunAltitude(-30.0), VoxelSky::GetDeepNightDropEV());
 	}
 }
 
@@ -961,8 +1215,17 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 			// the correct night-sky tint.
 			MoonComp->SetAtmosphereSunLight(true);
 			MoonComp->SetAtmosphereSunLightIndex(1);
+
+			// bUseTemperature only. THE TEMPERATURE ITSELF IS NOT SET HERE -- it
+			// is pushed on every light update from ApplyLightsFromState, the same
+			// way the sun's is. It used to be one SetTemperature call at spawn,
+			// which is why voxel.Sky.MoonTemperatureK could not have existed: a
+			// colour written once during OnWorldBeginPlay is a colour no cvar and
+			// no console can reach afterwards. The moon's colour is the number in
+			// this file most likely to be argued about after a play session and it
+			// should not need a rebuild to settle -- the same argument
+			// voxel.Sky.MoonIntensity is already exposed under.
 			MoonComp->SetUseTemperature(true);
-			MoonComp->SetTemperature(kMoonTemperatureK);
 
 			// NO SHADOWS FROM THE MOON. A second shadow-casting directional
 			// light is a second whole-scene shadow setup and a second set of
@@ -1100,24 +1363,37 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 		// invariant above: under rock the cave volume wins AutoExposureMethod
 		// with AEM_Manual, and manual exposure ignores those clamps entirely.)
 		//
-		// WHAT THE W6 EXPOSURE RETUNE DID TO THE STEP BETWEEN THE TWO VOLUMES.
+		// WHAT THE EXPOSURE RETUNES DID TO THE STEP BETWEEN THE TWO VOLUMES.
 		// Nothing about the ownership rule changed, but the SIZE of the jump at a
-		// cave mouth did, and it is now asymmetric enough to be worth stating.
-		// This curve used to run +7.0 (day) to +12.0 (night); it now runs +8.7 to
-		// +15.6. The cave's +10 did NOT move -- it is still the only exposure
-		// number in this project backed by an A/B, and re-deriving it to tidy up a
-		// step would throw that away. The consequence:
+		// cave mouth did, twice, and it is now asymmetric enough to be worth
+		// stating. This curve used to run +7.0 (day) to +12.0 (night); the W6
+		// retune made it +8.7 to +15.6; the deep-night ramp
+		// (DeepNightDropForSunAltitude) then gave 2.0 stops back below -18 deg. The
+		// cave's +10 did NOT move through any of that -- it is still the only
+		// exposure number in this project backed by an A/B, and re-deriving it to
+		// tidy up a step would throw that away. The three cases that now exist:
 		//
-		//   walking into a cave at NOON   +8.7 -> +10.0   1.3 stops BRIGHTER (was 3.0)
-		//   walking into a cave at NIGHT  +15.6 -> +10.0  5.6 stops DARKER   (was 2.0)
+		//   into a cave at NOON              +8.7  -> +10.0   1.3 stops BRIGHTER
+		//   into a cave in TWILIGHT          +15.6 -> +10.0   5.6 stops DARKER
+		//   into a cave in DEEP NIGHT        +13.6 -> +10.0   3.6 stops DARKER
 		//
-		// The night step is the one to watch: a cave is now much darker than the
-		// moonlit surface outside it, where it used to be slightly brighter. That
-		// is arguably correct -- a cave at night has no light in it at all and the
-		// lamp is the point -- but it is a behaviour change nobody asked for, and
-		// if it reads badly the fix belongs in AVoxelClipmapActor's rig (make
-		// CaveExposureEV100 track the sky's night end, re-measured), NOT in
-		// flattening this curve's night end, which is doing separate work.
+		// Twilight is the worst case and it is unchanged; the deep-night case, the
+		// one a player actually meets most often, improved by the full 2.0 stops.
+		// A cave being darker than the moonlit surface outside it is arguably
+		// correct -- a cave at night has no light in it at all and the lamp is the
+		// point -- and if it still reads badly the fix belongs in
+		// AVoxelClipmapActor's rig (make CaveExposureEV100 track the sky's night
+		// end, re-measured), NOT in flattening this curve's night end, which is
+		// doing separate work.
+		//
+		// >>> THE OTHER COPY OF THIS COMMENT IS NOW STALE, DELIBERATELY.
+		// VoxelClipmapActor.cpp:413-423 still states only the two-case W6 version
+		// ("at NIGHT +15.6 -> +10.0  5.6 stops DARKER"). That is still TRUE for
+		// twilight and merely INCOMPLETE for deep night, and it was left alone only
+		// because the change that added the third case was scoped to this file.
+		// Paste the three-case block above over it the next time
+		// VoxelClipmapActor.cpp is open; the rule that these two comments are kept
+		// in sync has not been repealed.
 		// ===================================================================
 		SkyExposurePP->Priority = 10.f;
 		SkyExposurePP->bEnabled = false; // ApplyExposureFromState turns it on
@@ -1470,6 +1746,7 @@ void UVoxelSkySubsystem::ApplyLightsFromState()
 		MoonFrac = MoonHorizonGate(S.MoonAltitudeDeg) * S.MoonIlluminatedFraction * SunSuppress;
 	}
 	S.MoonIntensity = (float)(VoxelSky::GetMoonIntensity() * MoonFrac);
+	S.MoonTemperatureK = ResolveMoonTemperatureK();
 	if (MoonLight)
 	{
 		if (UDirectionalLightComponent* MoonComp = Cast<UDirectionalLightComponent>(MoonLight->GetLightComponent()))
@@ -1481,6 +1758,31 @@ void UVoxelSkySubsystem::ApplyLightsFromState()
 			// value, so this does not churn the render state while it sits at 0.
 			MoonComp->SetIntensity(S.MoonIntensity);
 			MoonComp->SetVisibility(bMoonOn && S.MoonIntensity > 0.f);
+
+			// COLOUR, EVERY UPDATE, so voxel.Sky.MoonTemperatureK and
+			// voxel.Sky.MoonTintStrength are live knobs rather than build-time
+			// constants. SetUseTemperature/SetTemperature both early-out on an
+			// unchanged value (LightComponent.cpp), so on the overwhelming
+			// majority of updates this is two comparisons. Re-asserting
+			// bUseTemperature alongside is the same belt-and-braces the sun gets:
+			// a Blueprint or level tool that cleared it would otherwise leave the
+			// moon pure white with no log line anywhere to say so.
+			//
+			// A resolved value is LOGGED ON CHANGE and never echoed from the cvar,
+			// because two things can move it out from under a request: the mired
+			// lerp against voxel.Sky.MoonTintStrength, and UE's own 1000..15000
+			// clamp inside MakeFromColorTemperature.
+			MoonComp->SetUseTemperature(true);
+			if (!FMath::IsNearlyEqual(MoonComp->Temperature, S.MoonTemperatureK, 0.5f))
+			{
+				MoonComp->SetTemperature(S.MoonTemperatureK);
+				UE_LOG(LogVoxelSky, Log,
+				       TEXT("VoxelSky moon colour RESOLVED: %.0f K (requested %.0f K, tint strength %.2f ")
+				       TEXT("against the sun's %.0f K). Read back from the component: %.0f K. Cool BY ")
+				       TEXT("CONVENTION, not by spectrum -- see kMoonTemperatureK."),
+				       S.MoonTemperatureK, VoxelSky::GetMoonTemperatureK(), VoxelSky::GetMoonTintStrength(),
+				       kSunTemperatureK, MoonComp->Temperature);
+			}
 		}
 	}
 }
