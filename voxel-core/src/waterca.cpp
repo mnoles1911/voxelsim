@@ -49,9 +49,16 @@ constexpr int kCells = WaterBrick8::kCells; // 512
 // Voxel-coordinate key for hydrostaticPass's deferred-write list -- distinct
 // from BrickKey, which is truncated to int32_t brick coordinates; a voxel key
 // needs the full int64_t range solid_'s own (vx,vy,vz) contract uses.
+// No operator== any more. It existed for the per-tick
+// unordered_map<VoxelKey, MaterialId> that Phase READ used to rebuild every
+// tick -- and deleting that map IS the first of this pass's four changes, so
+// the comparison went with it. VoxelKey survives only as the payload half of
+// hydrostaticPass's deferred-write list, which never compares two of them.
+//
+// MSVC does not warn; clang's -Wunused-function -Werror does, so CI caught it
+// where the local build could not.
 struct VoxelKey {
     int64_t x, y, z;
-    friend bool operator==(const VoxelKey&, const VoxelKey&) = default;
 };
 
 // The 6 solidity masks Phase READ can possibly need for one active brick:
