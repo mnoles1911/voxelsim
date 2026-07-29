@@ -272,8 +272,8 @@ static const int64_t kFineLandformGradMmPerM = 281;
 static const int64_t kFineMetreGradMmPerM = 312;
 static const int64_t kFineMicroGradMmPerM = 350;
 static const int64_t kDetailGradCapKQ10 = 512;
-static const int64_t kDetailGradFloorMmPerM = 100;
-static const int64_t kFineDetailGradFloorMmPerM = 100;
+static const int64_t kDetailGradFloorMmPerM = 50;
+static const int64_t kFineDetailGradFloorMmPerM = 50;
 // On a COARSE world the cap ENGAGES on a ramp over landform relief (the same
 // per-cell reliefMm the amplitude gate reads): off at Lo, full at Hi, so flat
 // classes keep their texture bit-for-bit while valley floors -- where every

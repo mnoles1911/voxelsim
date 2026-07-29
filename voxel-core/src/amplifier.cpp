@@ -993,15 +993,37 @@ constexpr int64_t kDetailGradCeilMmPerM =
 static_assert(!kAmpUnscaled || kDetailGradCeilMmPerM == 2291,
               "the post-gate ladder's worst-case nominal gradient moved");
 
-// k and the floor. Worldgen constants under kWorldGenVersion, NOT cvars -- a
-// cvar here would let two clients disagree about the ground. Both set by the
-// calibration sweep against the three real exemplars (alpine, plains, and the
-// mislabelled "rolling" site); the sweep table and the chosen arm's costs are
-// in the v14 commit message.
-constexpr int64_t kDetailGradCapKQ10 = 512;      // 0.5 x carrier gradient
-constexpr int64_t kDetailGradFloorMmPerM = 100;  // minimum allowance once engaged
-// The fine tier takes its own floor -- see the engagement block below for why
-// the fine tier caps everywhere and what its floor defends.
+// k and the floors. Worldgen constants under kWorldGenVersion, NOT cvars -- a
+// cvar here would let two clients disagree about the ground. All set by the
+// calibration sweeps against the ten-site drainage ladder and the three baked
+// fine exemplars; the sweep tables and the chosen arm's costs are in the v14
+// measurement doc (docs/measurements/).
+//
+// k = 0.5: at 1.0 the capped ladder's nominal gradient EQUALS the carrier's
+// and the downhill direction is only marginally protected -- measured, alpine
+// read 63.8% stranded at an allowance equal to its own grade and 0.1% at half
+// of it. Half also pays the estimate's known optimism (the fade curve's peak
+// slope runs ~1.9x the amplitude/lattice mean this estimate sums).
+//
+// The floors sit at a measured KNEE, and the two tiers reach it for different
+// reasons. COARSE (engaged ground only -- the ramp already exempts every flat
+// class): the floor's only live effect is on engaged low-slope cells, i.e.
+// mountain benches and hollow floors, where any allowance above the local
+// grade ponds the very cells every hillside drains through. 100 -> 50 took
+// the steepest exemplar from 40.7% to 17.5% stranded with no other row moving
+// and the plains plateau untouched; 25 bought nothing further. A quiet hollow
+// is also the physically right hollow -- colluvium is smooth; that is the
+// curvature gate's own story. FINE (no exemption): the floor IS the flat-
+// ground texture knob, and it is a straight trade -- the baked fine plains
+// carrier alone measures 100% of its area in >= 4 m plateaus (mean terrace
+// run 3.6 m: full corduroy; the bake's swales do not reach decimetre scale),
+// v13's uncapped ladder gives 84.5% / 0.60 m but strands 97.3% of what the
+// swales drain. At 50 the drainage residual is 1.3 points from the carrier's
+// own (90.3% vs 89.0%) and lower floors erase the remaining texture to buy
+// less than that. Not ~0, deliberately: the last step to zero costs the whole
+// remaining anti-terrace band and recovers nothing measurable.
+constexpr int64_t kDetailGradCapKQ10 = 512;     // 0.5 x carrier gradient
+constexpr int64_t kDetailGradFloorMmPerM = 50;  // engaged minimum, coarse tier
 constexpr int64_t kFineDetailGradFloorMmPerM = 50;
 static_assert(kDetailGradCapKQ10 > 0 && kDetailGradCapKQ10 <= 1024,
               "k above 1.0 licenses detail steeper than the ground it decorates, which is "
