@@ -631,41 +631,80 @@ namespace
 	//
 	// So the exposure is pinned to the CLOCK, not to the frame. And critically it
 	// only PARTIALLY compensates: the scene's own ground illuminance drops about
-	// nine stops from noon to a moonlit midnight (11.2 to 0.008 in this file's
-	// units) and this curve lifts by 6.9 (+8.7 to +15.6). The two stops that do
-	// not get lifted are what the player sees as darkness -- and because the
-	// filmic toe steepens whatever it is handed down there, two scene stops read
-	// as roughly five on screen. A curve that compensated fully would be
-	// auto-exposure with extra steps.
+	// nine stops from noon to a moonlit midnight and this curve lifts by 6.8
+	// (+8.8 to +15.6). The stops that do not get lifted are what the player sees
+	// as darkness. A curve that compensated fully would be auto-exposure with
+	// extra steps -- and "fully" is exactly what the pre-retune table did above
+	// the horizon, which is the defect fixed below.
 	//
-	// THE ANCHORS BELOW ARE DERIVED FROM THE W6 LADDER, NOT GUESSED -- but the
-	// derivation still has one unmeasured leg and it is named at the end.
+	// THE ANCHORS BELOW ARE MEASURED, FROM TWO FULL LADDERS. This paragraph and
+	// the four that follow are the derivation; nothing in the table is a taste
+	// call except the target luminances, which are named.
 	//
-	// The previous anchor set was seeded before any capture existed and held
-	// +7.0 EV flat from +10 deg to the zenith. The first ladder run measured what
-	// that produced (mean luminance out of 255, over one simulated day at 52.5 N):
+	// The evidence is 16 (sun altitude -> EV bias -> mean luminance) triples: the
+	// 8-rung 06-21 ladder and the 8-rung 12-21 ladder, same observer (52.48 N),
+	// same camera, captured against the anchor set this one replaces. Between
+	// them they span -60.8 deg to +60.9 deg, and 8 of the 16 are above the
+	// horizon, which is enough to fit the transfer function properly.
 	//
-	//   sun +60.9 deg  intensity 12.59  bias +7.000  ->  luma 47.92   98.1% non-black
-	//   sun +17.5 deg  intensity  3.15  bias +7.149  ->  luma  4.85   60.2% non-black
+	//   FIRST TRAP, AND IT IS WORTH A STOP: "mean luma" is the mean of sRGB CODE
+	//   VALUES out of 255, not of light. Every stop arithmetic below decodes it
+	//   (v/255 -> linear) first. Skip that and the measured falloff comes out
+	//   about 0.7x of the true one and the fitted curve is a stop wrong at the
+	//   low end -- in the direction that makes low sun too bright, which is the
+	//   defect this retune exists to remove.
 	//
-	// Those two points calibrate the whole transfer function, because they share
-	// a bias to within 0.15 stops. Ground illuminance across them differs by 3.98
-	// stops (15 * sin(alt) * T(alt) at each) while the frame's DISPLAY-LINEAR
-	// luminance differs by 4.33 stops, so display-linear ~ scene^1.13 through
-	// this range -- a mild filmic toe, not the steep one a night frame suggests.
-	// (The 00h00 rung looks far steeper, but at 1.5% non-black its mean is
-	// measuring how many pixels exist, not how bright they are. It is not a
-	// usable calibration point and was not used as one.)
+	// THE MODEL. log2(Llin) = c + gamma * ( p * log2 sin(alt) + bias ), i.e. the
+	// scene's ground illuminance is a power of sin(alt), the bias adds stops on
+	// top, and the tonemapper turns the sum into display-linear luminance with a
+	// local slope gamma. Fitted by least squares on the DAY rungs of each ladder
+	// independently (three free parameters, and bias is not quite a linear
+	// function of log2 sin because the table it came from is piecewise linear in
+	// DEGREES, which is the only reason the two regressors separate at all):
 	//
-	// From that: each anchor below is the bias that lands a chosen mean luminance
-	// at that altitude, given the scene's own ground illuminance there (the
-	// standard clear-sky solar-altitude illuminance table, scaled so that
-	// +60.9 deg == our 11.19). The chosen luminances run 106 at the zenith, 80 at
-	// +20, 55 at +5, 38 at the horizon, and hold ~20 through twilight and night.
-	// The gap between "what the scene did" and "what was chosen" IS the darkness:
-	// the scene falls ~14 stops from noon to civil twilight and the curve lifts
-	// ~7, so half the fall survives to the screen. That is the same partial-
-	// compensation doctrine as before, now with the falls measured.
+	//   06-21 day rungs (5)   gamma 1.09   p 0.775
+	//   12-21 day rungs (3)   gamma 1.01   p 0.816
+	//
+	// Adopted: gamma 1.05, p 0.80. Residuals at those values are 0.09 stops
+	// across the five summer rungs and 0.03 across the three winter ones, so the
+	// model is not being generous to itself. gamma 1.05 also agrees with the two
+	// independent readings already on record -- the W6 two-point fit's 1.13, and
+	// ~1.17 from comparing the moonlit midsummer midnight against the midwinter
+	// deep-night rungs at their known moon intensities.
+	//
+	// AND THAT p IS THE WHOLE DEFECT. The scene falls as sin(alt)^0.80, i.e. 0.80
+	// stops per octave of sin. The old table lifted 0.763 EV per octave of sin.
+	// It was compensating 95% of the scene's own altitude falloff, so display
+	// luminance came out FLAT in altitude -- 123 to 129 across +17.5 to +60.9 --
+	// and any measurement noise on top of flat reads as an inversion. The old
+	// anchors were built on the standard clear-sky illuminance table, which is
+	// about sin^1.15; USkyAtmosphere plus this project's ambient floor is much
+	// shallower than that, and one wrong exponent is all it took.
+	//
+	// THE TWO LADDERS ARE NOT LIT BY THE SAME SCENE, AND THE BUDGET HAS TO SAY SO.
+	// At equal (altitude, bias) the 12-21 ladder is +0.52 DISPLAY STOPS brighter
+	// than the 06-21 one. Its three day rungs agree on that offset to 0.03 stops,
+	// so it is not noise -- it is scene content (seasonal ground albedo, and a
+	// due-south winter noon against a fixed camera). This curve is a function of
+	// sun altitude ALONE and must stay one, or the same sky renders differently
+	// in two places; it therefore cannot cancel the offset. But it has to be
+	// BUDGETED FOR, because "a low winter noon must read dimmer than a high
+	// summer noon" is a CROSS-LADDER comparison, and half a stop of the answer is
+	// already spent before the curve opens its mouth. That is why the day slope
+	// below is as shallow as it is.
+	//
+	// THE NEW DAY LAW: bias = 8.79 - 0.19 * log2 sin(alt), for alt >= +2 deg.
+	// 0.19 against the scene's 0.80 is 24% compensation instead of 95%, which
+	// leaves 0.64 display stops per octave of sin visible on screen. The chosen
+	// luminances that falls out to, on the 06-21 scene: 129 at +61, 122 at +45,
+	// 98 at +20, 80 at +10, 64 at +5, 47 at +2. Full daylight sits 105-130 and a
+	// low sun reads visibly low, which is the entire requirement.
+	//
+	//   NOTE WHAT DID NOT MOVE. The law returns 8.829 at +60.9 deg -- the same
+	//   number the old table returned there, to three decimals. High sun was
+	//   never the problem and the measurement says the old value was right; the
+	//   whole retune is below +45 deg. Anyone bisecting a "the day got darker"
+	//   report should start at +10 to +20, not at noon.
 	//
 	// WHAT THE FLAT CAP COULD NOT DO, AND WHY THAT IS NOT THE BUG IT LOOKS LIKE.
 	//
@@ -715,25 +754,58 @@ namespace
 	// satisfy (below). voxel.Sky.DeepNightDropEV 0 restores the old flat cap
 	// exactly, which is the control arm.
 	//
-	// WHY IT FLATTENS AT -2 DEG AND NOT AT -12. Below the horizon the scene falls
-	// off a cliff -- roughly 4x PER DEGREE through civil twilight -- and a curve
-	// that kept tracking it would need +20 EV by -6 deg. It cannot, because the
-	// MOON is also on down there, and a full moon under a +20 EV exposure renders
-	// brighter than noon. So the cap is set where a full moon reads as a full
-	// moon (voxel.Sky.MoonIntensity and this cap move the same pixel; they were
-	// solved together, and 15.6 / 0.04 is that solution). The price is paid by
-	// MOONLESS civil twilight, which lands dimmer than the moonlit kind. That is
-	// the honest trade for a curve driven by sun altitude alone, and it is the
-	// owner's stated preference: a new moon should be genuinely dark.
+	// WHY THE CAP IS REACHED AT -6 DEG AND NOT AT -12. Below the horizon the scene
+	// falls off a cliff -- the two measured summer twilight rungs put it near a
+	// stop PER DEGREE -- and a curve that kept tracking it would need +20 EV by
+	// -6 deg. It cannot, because the MOON is also on down there, and a full moon
+	// under a +20 EV exposure renders brighter than noon. So the cap is set where
+	// a full moon reads as a full moon (voxel.Sky.MoonIntensity and this cap move
+	// the same pixel; they were solved together, and 15.6 / 0.04 is that
+	// solution). The price is paid by MOONLESS civil twilight, which lands dimmer
+	// than the moonlit kind. That is the honest trade for a curve driven by sun
+	// altitude alone, and it is the owner's stated preference: a new moon should
+	// be genuinely dark.
 	//
-	// STILL UNMEASURED, and this is the one to check first if the re-run
-	// disagrees: everything at or below 0 deg. Both twilight rungs read 0.0%
-	// non-black before this change, so there is no observation of ANY below-
-	// horizon frame to calibrate against -- those anchors come from the
-	// illuminance table and the transfer function fitted above the horizon, and
-	// they assume the SkyAtmosphere's twilight tracks the real one. If they are
-	// wrong they will be wrong together and in one direction, which
-	// voxel.Sky.ExposureBias shifts in one move without touching this table.
+	// THE CAP'S ONSET MOVED FROM -2 DEG TO -6 DEG, AND THAT IS THIS RETUNE'S ONLY
+	// BELOW-HORIZON CHANGE. The cap's VALUE is untouched, the deep-night ramp is
+	// untouched, and everything at or below -6 keeps the exact bias it had.
+	//
+	// WHY IT HAD TO MOVE: THE SUNSET FLARE NOBODY HAD SAMPLED. Neither ladder has
+	// a rung between +4.6 deg and -3.8 deg -- an 8.4-degree hole containing the
+	// entire sunrise. Interpolate the scene across it from the two rungs that DO
+	// bracket it and the old table's +14.1 at 0 deg and +15.6 at -2 deg put the
+	// BRIGHTEST frame of the whole day at about -1 deg: ~140 luma against noon's
+	// 129. The sun was below the horizon and the frame was brighter than noon.
+	// Sixteen measured rungs and not one of them could see it, which is the thing
+	// to remember about this hole -- it is still there, and it is still the least
+	// certain part of this curve.
+	//
+	// WHY -6 IS THE PRINCIPLED PLACE AND -2 WAS NOT. The 15.6 number was solved
+	// against the MOON, not against the sky. Above -6 deg there is still real
+	// scattered sunlight for the curve to track, and handing that band a
+	// moon-sized lift is what produced the flare. Below -6 there is not: civil
+	// twilight ends there by definition, the frame is moon-lit from that point
+	// down, and a moon-solved cap is exactly the right policy for a moon-lit
+	// frame. So the table now descends 15.60 -> 9.71 across -6 .. +2 instead of
+	// jumping 15.6 -> 12.5 across -2 .. +2.
+	//
+	// WHAT THAT COSTS, STATED SO THE RE-RUN CAN BE CHECKED AGAINST IT: exactly two
+	// rungs in the whole corpus move below the horizon, both midsummer civil
+	// twilight. -3.8 deg goes 15.60 -> 13.59 (luma 83.47 -> ~39) and -5.1 deg goes
+	// 15.60 -> 14.76 (55.17 -> ~40). Midsummer midnight at -14.1 deg keeps 15.60
+	// and therefore keeps its measured 38.01, and every midwinter night rung
+	// (-17.9 through -60.8) keeps 13.60 and its measured 5.85 / 9.03 / 7.25 /
+	// 0.02. The seasonal night relationship the deep-night drop was built to
+	// produce -- midwinter 5.9-9.0 against midsummer 38.0 -- is preserved
+	// numerically, not approximately.
+	//
+	// STILL EXTRAPOLATION, and this is the one to check first if the re-run
+	// disagrees: the scene between +4.6 deg and -3.8 deg, per the hole above.
+	// The anchors at 0 and -2 assume the scene's fall accelerates smoothly across
+	// the horizon from the measured rung above to the measured rung below. If
+	// that assumption is wrong the two anchors will be wrong together and in one
+	// direction, which voxel.Sky.ExposureBias shifts in one move without touching
+	// this table. A ladder with rungs at +2, 0 and -2 would close it for good.
 
 	// THE DEEP-NIGHT DROP. Stops given back once the sun is below astronomical
 	// twilight, subtracted from the table below. Zero everywhere above the ramp.
@@ -765,8 +837,11 @@ namespace
 	//
 	// THE 3-DEGREE BAND IS NOT ABRUPT. At the default 1200 s day the sun sweeps
 	// 3 degrees in ~10 seconds of wall clock, so this is a 2-stop fade over ten
-	// seconds -- gentler than what already ships at sunrise, where the table below
-	// moves 3.1 stops across the 4 degrees from -2 to +2.
+	// seconds -- 0.20 stops/s, still no faster than what ships at sunrise, where
+	// the table below now moves 5.89 stops across the 8 degrees from -6 to +2
+	// (~27 s, 0.22 stops/s). That comparison was rechecked when the cap's onset
+	// moved from -2 to -6: the sunrise ramp got LONGER in degrees and gentler per
+	// degree, so the claim survives with margin it did not have before.
 	//
 	// WHY 2.0 STOPS. It is the size that puts a deep-night frame back below the
 	// midsummer-midnight frame it used to out-render. Worked from the one measured
@@ -795,27 +870,46 @@ namespace
 		struct FAnchor { double AltDeg; double BiasEV; };
 		// Altitudes ascending. Below the first and above the last the TABLE is
 		// flat; the deep-night drop subtracted at the end is what carries the
-		// curve below -15. The four night anchors are all equal on purpose -- the
-		// cap is reached at -2 deg and the table holds it there because the moon,
-		// not the sun, is what the frame is lit by down there (above).
+		// curve below -15. The three night anchors are all equal on purpose -- the
+		// cap is reached at -6 deg and the table holds it from there down because
+		// the moon, not the sun, is what the frame is lit by (above).
 		//
 		// The first anchor moved from -18 to -15 when the drop was added: -15 is
 		// where the ramp starts, so a table entry below it would be describing an
 		// altitude the drop already owns, and the two would have to be kept
 		// consistent by hand forever.
+		//
+		// EVERY ENTRY FROM +2 UP IS THE FITTED LAW bias = 8.79 - 0.19*log2 sin(alt),
+		// SAMPLED -- not hand-placed. The altitudes are chosen so that linear
+		// interpolation IN DEGREES between them reproduces that law to within 0.03
+		// EV everywhere (worst case is +3 deg, on the 2..5 span), which is under a
+		// luma point and well under capture noise. Add altitudes if a span ever
+		// needs to be finer; do NOT edit one entry by taste, because the entries
+		// are not independent -- they are eight samples of one two-parameter line
+		// and moving one alone puts a kink in the middle of the day.
+		//
+		// The four entries from 0 down to -6 are NOT that law: sin^0.80 diverges at
+		// the horizon and the scene does not (the sky's diffuse term and the GI
+		// ambient floor keep the ground lit through sunset). They interpolate the
+		// scene between the lowest measured day rung (+4.6) and the lowest measured
+		// moonless twilight rung (-3.8) and hand back a constant 90% of its fall,
+		// which is what lands the cap exactly at -6. This is the extrapolated part
+		// of the curve; see the hole named above.
 		static const FAnchor Anchors[] = {
-			{-15.0, 15.6},  // the deepest midsummer midnight at 52 N; below this the drop takes over
-			{-12.0, 15.6},  // nautical twilight
-			{ -6.0, 15.6},  // civil twilight ends
-			{ -2.0, 15.6},  // the cap; the scene keeps falling below this, the table does not
-			{  0.0, 14.1},  // sunrise/sunset
-			{  2.0, 12.5},
-			{  5.0, 11.3},
-			{ 10.0, 10.5},
-			{ 20.0,  9.8},
-			{ 30.0,  9.4},
-			{ 45.0,  8.9},
-			{ 90.0,  8.7},  // full day
+			{-15.0, 15.60}, // the deepest midsummer midnight at 52 N; below this the drop takes over
+			{-12.0, 15.60}, // nautical twilight
+			{ -6.0, 15.60}, // civil twilight ends; the cap, and the moon owns the frame below here
+			{ -4.0, 13.74}, // interpolated scene; -3.8 was measured moonless at luma 83.47
+			{ -2.0, 12.23},
+			{  0.0, 10.89}, // sunrise/sunset
+			{  2.0,  9.71}, // the fitted day law starts here and runs to the top of the table
+			{  5.0,  9.46},
+			{ 10.0,  9.27},
+			{ 20.0,  9.08},
+			{ 30.0,  8.98},
+			{ 45.0,  8.89},
+			{ 60.0,  8.83}, // the 12h00 rung of the 06-21 ladder; unchanged by this retune
+			{ 90.0,  8.79}, // full day
 		};
 		constexpr int32 Count = UE_ARRAY_COUNT(Anchors);
 
@@ -1048,7 +1142,7 @@ void UVoxelSkySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		       TEXT("Origin=(%.4f N, %.4f E) Moon=%d SunIntensity=%.4f MoonIntensity=%.4f ")
 		       TEXT("MoonTempK=%.0f (requested %.0f, tint %.2f) ")
 		       TEXT("ShadowUpdateHz=%.2f ExposureMode=%d ExposureBias=%.2f ")
-		       TEXT("DayEV=%.2f TwilightEV=%.2f DeepNightEV=%.2f DeepNightDrop=%.2f"),
+		       TEXT("DayEV=%.2f SunsetEV=%.2f TwilightEV=%.2f DeepNightEV=%.2f DeepNightDrop=%.2f"),
 		       VoxelSky::IsEnabled() ? 1 : 0, VoxelSky::GetTimeScale(), DayLength, DaysPerYear,
 		       VoxelSky::GetOriginLatitudeDeg(), VoxelSky::GetOriginLongitudeDeg(),
 		       VoxelSky::IsMoonEnabled() ? 1 : 0,
@@ -1061,12 +1155,17 @@ void UVoxelSkySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		       ResolveMoonTemperatureK(), VoxelSky::GetMoonTemperatureK(), VoxelSky::GetMoonTintStrength(),
 		       VoxelSky::GetShadowUpdateHz(),
 		       VoxelSky::GetExposureMode(), VoxelSky::GetExposureBias(),
-		       // THREE points on the curve, not two, and the third is the whole
-		       // point of the deep-night ramp: TwilightEV and DeepNightEV used to
-		       // be the same number, which is why a midwinter midnight rendered
-		       // like a midsummer one. A capture states the exposure policy it ran
-		       // under rather than the one in this revision of the source.
-		       ExposureBiasForSunAltitude(60.0), ExposureBiasForSunAltitude(-6.0),
+		       // FOUR points on the curve, and each one exists because two
+		       // policies that used to be indistinguishable in a log are not any
+		       // more. TwilightEV and DeepNightEV used to be the same number,
+		       // which is why a midwinter midnight rendered like a midsummer one.
+		       // SunsetEV is the newer of the pair: the cap's onset moved from -2
+		       // to -6, so the horizon is no longer at the cap and a capture that
+		       // does not print 0 deg cannot say which side of that change it ran
+		       // on. A capture states the exposure policy it ran under rather than
+		       // the one in this revision of the source.
+		       ExposureBiasForSunAltitude(60.0), ExposureBiasForSunAltitude(0.0),
+		       ExposureBiasForSunAltitude(-6.0),
 		       ExposureBiasForSunAltitude(-30.0), VoxelSky::GetDeepNightDropEV());
 	}
 }
@@ -1365,20 +1464,29 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 		//
 		// WHAT THE EXPOSURE RETUNES DID TO THE STEP BETWEEN THE TWO VOLUMES.
 		// Nothing about the ownership rule changed, but the SIZE of the jump at a
-		// cave mouth did, twice, and it is now asymmetric enough to be worth
+		// cave mouth did, three times now, and it is asymmetric enough to be worth
 		// stating. This curve used to run +7.0 (day) to +12.0 (night); the W6
 		// retune made it +8.7 to +15.6; the deep-night ramp
-		// (DeepNightDropForSunAltitude) then gave 2.0 stops back below -18 deg. The
-		// cave's +10 did NOT move through any of that -- it is still the only
-		// exposure number in this project backed by an A/B, and re-deriving it to
-		// tidy up a step would throw that away. The three cases that now exist:
+		// (DeepNightDropForSunAltitude) then gave 2.0 stops back below -18 deg; and
+		// the measured retune (see ExposureBiasForSunAltitude) then moved the cap's
+		// ONSET from -2 deg to -6 deg, which is what changed the sunset case below
+		// out of all recognition. The cave's +10 did NOT move through any of that --
+		// it is still the only exposure number in this project backed by an A/B, and
+		// re-deriving it to tidy up a step would throw that away. The four cases
+		// that now exist:
 		//
-		//   into a cave at NOON              +8.7  -> +10.0   1.3 stops BRIGHTER
-		//   into a cave in TWILIGHT          +15.6 -> +10.0   5.6 stops DARKER
-		//   into a cave in DEEP NIGHT        +13.6 -> +10.0   3.6 stops DARKER
+		//   into a cave at NOON               +8.8  -> +10.0   1.2 stops BRIGHTER
+		//   into a cave at SUNSET  (0 deg)    +10.9 -> +10.0   0.9 stops DARKER
+		//   into a cave in TWILIGHT (<= -6)   +15.6 -> +10.0   5.6 stops DARKER
+		//   into a cave in DEEP NIGHT (<=-18) +13.6 -> +10.0   3.6 stops DARKER
 		//
-		// Twilight is the worst case and it is unchanged; the deep-night case, the
-		// one a player actually meets most often, improved by the full 2.0 stops.
+		// Twilight is the worst case and it is unchanged. Deep night, the one a
+		// player actually meets most often, improved by the full 2.0 stops. And
+		// SUNSET -- which used to be a 4.1-stop DROP, because the old table had
+		// already reached the +15.6 moon cap by 0 deg -- is now very nearly
+		// seamless. That is a side effect of fixing the day curve, not something
+		// anyone tuned for, and it is the one case worth re-checking by eye rather
+		// than by arithmetic.
 		// A cave being darker than the moonlit surface outside it is arguably
 		// correct -- a cave at night has no light in it at all and the lamp is the
 		// point -- and if it still reads badly the fix belongs in
@@ -1386,14 +1494,13 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 		// end, re-measured), NOT in flattening this curve's night end, which is
 		// doing separate work.
 		//
-		// >>> THE OTHER COPY OF THIS COMMENT IS NOW STALE, DELIBERATELY.
-		// VoxelClipmapActor.cpp:413-423 still states only the two-case W6 version
-		// ("at NIGHT +15.6 -> +10.0  5.6 stops DARKER"). That is still TRUE for
-		// twilight and merely INCOMPLETE for deep night, and it was left alone only
-		// because the change that added the third case was scoped to this file.
-		// Paste the three-case block above over it the next time
-		// VoxelClipmapActor.cpp is open; the rule that these two comments are kept
-		// in sync has not been repealed.
+		// BOTH COPIES OF THIS COMMENT NOW AGREE, AND THE POINTER THAT SAID
+		// OTHERWISE IS GONE. The previous revision of this block ended with a note
+		// that the VoxelClipmapActor.cpp copy was deliberately stale at the
+		// two-case W6 version, to be pasted over the next time that file was open.
+		// It has been. Both blocks state the same four cases, and the rule stands:
+		// if you change one, change both -- they exist in duplicate precisely
+		// because whoever next touches either file will only read that one.
 		// ===================================================================
 		SkyExposurePP->Priority = 10.f;
 		SkyExposurePP->bEnabled = false; // ApplyExposureFromState turns it on
@@ -1831,7 +1938,7 @@ void UVoxelSkySubsystem::ApplyExposureFromState()
 	if (Mode == 2)
 	{
 		// MANUAL, and AEM_Manual specifically -- NOT "histogram with min == max".
-		// VoxelClipmapActor.cpp:417-427 records what happens if you take the
+		// VoxelClipmapActor.cpp:455-462 records what happens if you take the
 		// apparently-more-surgical route: the min/max clamp fields are
 		// interpreted through r.EyeAdaptation.ExposureFormat, so "0" is not
 		// unambiguously EV100 0, and the wrong reading of it is an exposure

@@ -270,6 +270,12 @@ namespace VoxelSky
 	// astronomical twilight, ramped in over -15..-18 deg. 0 restores the flat cap
 	// the pre-fix curve had. Floored at 0 -- it may only ever darken, or it would
 	// reopen the constraint the cap was chosen to satisfy.
+	//
+	// THE CAP IS NOW REACHED AT -6 DEG, NOT -2. Nothing about this knob changed
+	// with that -- it still starts at -15 and still only subtracts -- but a
+	// reader reasoning about "the twilight cap" should know the band it covers
+	// begins at civil twilight's end, because above -6 the curve is tracking a
+	// sky that is still lit. ExposureBiasForSunAltitude has the measurement.
 	VOXELEARTH_API float GetDeepNightDropEV();
 	VOXELEARTH_API float GetShadowUpdateHz();
 	VOXELEARTH_API int32 GetExposureMode();

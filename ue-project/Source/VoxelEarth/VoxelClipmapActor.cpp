@@ -407,23 +407,43 @@ void AVoxelClipmapActor::EnsureCaveRig()
 	// exception: this volume wins AutoExposureMethod with AEM_Manual, and manual
 	// exposure ignores those clamps entirely.)
 	//
-	// THE STEP AT A CAVE MOUTH CHANGED SIZE WHEN W6 RETUNED THE SKY CURVE, and
-	// this volume is on the other side of that step. The sky's curve used to run
-	// +7.0 (day) to +12.0 (night); measured against the first capture ladder it
-	// now runs +8.7 to +15.6. CaveExposureEV100 below was deliberately NOT moved
-	// with it -- +10 is the only exposure number in this project backed by an A/B
+	// WHAT THE EXPOSURE RETUNES DID TO THE STEP BETWEEN THE TWO VOLUMES, and this
+	// volume is on the other side of that step. Nothing about the ownership rule
+	// changed, but the SIZE of the jump at a cave mouth did, three times now. The
+	// sky's curve used to run +7.0 (day) to +12.0 (night); the W6 retune made it
+	// +8.7 to +15.6; the deep-night ramp (DeepNightDropForSunAltitude) then gave
+	// 2.0 stops back below -18 deg; and the measured retune (see
+	// ExposureBiasForSunAltitude, whose anchors are now fitted to two full capture
+	// ladders rather than to an illuminance table) then moved the cap's ONSET from
+	// -2 deg to -6 deg, which is what changed the sunset case below out of all
+	// recognition. CaveExposureEV100 below was deliberately NOT moved with any of
+	// it -- +10 is the only exposure number in this project backed by an A/B
 	// against a reference frame, and re-deriving it by taste to tidy up a step
-	// would spend that measurement for nothing. The consequence:
+	// would spend that measurement for nothing. The four cases that now exist:
 	//
-	//   entering a cave at NOON   +8.7 -> +10.0   1.3 stops BRIGHTER (was 3.0)
-	//   entering a cave at NIGHT  +15.6 -> +10.0  5.6 stops DARKER   (was 2.0)
+	//   into a cave at NOON               +8.8  -> +10.0   1.2 stops BRIGHTER
+	//   into a cave at SUNSET  (0 deg)    +10.9 -> +10.0   0.9 stops DARKER
+	//   into a cave in TWILIGHT (<= -6)   +15.6 -> +10.0   5.6 stops DARKER
+	//   into a cave in DEEP NIGHT (<=-18) +13.6 -> +10.0   3.6 stops DARKER
 	//
-	// So a cave is now markedly darker than the moonlit surface outside it, where
-	// it used to be marginally brighter. If that reads wrong, the fix is HERE --
-	// re-measure CaveExposureEV100 against a night reference frame the way it was
-	// originally measured against a day one, and note both numbers -- not in
-	// flattening the sky's night end, which is holding a full moon at a legible
+	// Twilight is the worst case and it is unchanged. Deep night, the one a player
+	// actually meets most often, improved by the full 2.0 stops. And SUNSET --
+	// which used to be a 4.1-stop DROP, because the old sky table had already
+	// reached the +15.6 moon cap by 0 deg -- is now very nearly seamless. That is
+	// a side effect of fixing the sky's DAY curve, not something anyone tuned for,
+	// and it is the one case worth re-checking by eye rather than by arithmetic.
+	//
+	// So a cave is still markedly darker than the moonlit surface outside it,
+	// where it used to be marginally brighter. If that reads wrong, the fix is
+	// HERE -- re-measure CaveExposureEV100 against a night reference frame the way
+	// it was originally measured against a day one, and note both numbers -- not
+	// in flattening the sky's night end, which is holding a full moon at a legible
 	// brightness and would take the whole night down with it.
+	//
+	// BOTH COPIES OF THIS COMMENT NOW AGREE. The sky-side copy used to carry a
+	// note that this one was deliberately stale at the two-case W6 version, to be
+	// pasted over the next time this file was open. It has been, and that pointer
+	// is gone. The rule stands: if you change one, change both.
 	// =======================================================================
 	CaveExposurePP->Priority = 100.f;
 
