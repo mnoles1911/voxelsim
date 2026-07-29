@@ -173,6 +173,50 @@ def ref_stream_power(acc, slope, K=0.15, m=0.45, n=0.8, cap_m=25.0,
     return np.minimum(d, cap_m).astype(np.float32)
 
 
+def ref_profile_incision(filled, receivers, acc, cell_m, K_dt=1.5, m=0.45, n=0.8,
+                         cap_m=25.0, a_crit_m2=1.0e4, gate_q=2.0,
+                         regional_slope=None, regional_s_ref=0.2,
+                         sea_taper_top_m=0.0, sea_taper_bottom_m=-200.0):
+    """LOCAL (radius-1) reference for the profile solve, on purpose.
+
+    The real ``incise.profile_incision`` propagates the solved receiver
+    elevation upstream along the whole D8 tree -- unbounded by nature, the
+    same class as flow accumulation, and the same reasoning as
+    ``ref_accumulate`` applies: a tree-walking reference would make the apron
+    tests measure the reference instead of the pipeline. This double is one
+    EXPLICIT step against the receiver's *input* elevation (radius 1), which
+    exercises the wiring -- receivers, gate, taper, cap, the eroded-vs-depth
+    orientation -- with an influence radius the apron provably covers. The
+    real kernel's own invariants are tested in test_bake_geomorph.py.
+    """
+    z = np.asarray(filled, np.float64)
+    h, w = z.shape
+    rec = np.asarray(receivers, np.int64).ravel()
+    a = np.clip(np.asarray(acc, np.float64), 0.0, None)
+    idx = np.arange(rec.size, dtype=np.int64)
+    tgt = np.where(rec >= 0, rec, idx)
+    zr = z.ravel()[tgt]
+    diag = (np.abs(idx // w - tgt // w) > 0) & (np.abs(idx % w - tgt % w) > 0)
+    dist = np.where(diag, cell_m * 1.4142135623730951, cell_m)
+    s = np.clip((z.ravel() - zr) / dist, 0.0, None)
+    kfac = K_dt * np.power(a, m).ravel()
+    if regional_slope is not None and regional_s_ref > 0.0:
+        kfac = kfac * np.minimum(
+            1.0, np.clip(np.asarray(regional_slope, np.float64), 0.0, None)
+            / regional_s_ref).ravel() ** n
+    if a_crit_m2 > 0.0:
+        aq = np.power(a, gate_q).ravel()
+        kfac = kfac * (aq / (aq + a_crit_m2 ** gate_q))
+    if sea_taper_bottom_m < sea_taper_top_m:
+        t = np.clip((z.ravel() - sea_taper_bottom_m)
+                    / (sea_taper_top_m - sea_taper_bottom_m), 0.0, 1.0)
+        kfac = kfac * (t * t * (3.0 - 2.0 * t))
+    d = np.minimum(kfac * s ** n, cap_m if cap_m > 0.0 else np.inf)
+    out = np.maximum(z.ravel() - d, zr)  # never below the receiver
+    out = np.where(rec >= 0, out, z.ravel())
+    return out.reshape(h, w).astype(np.float32)
+
+
 def ref_relax(z, cell_m, repose_deg=36.0, iters=48, rate=0.4):
     """`iters` 3x3 box passes: influence radius exactly `iters` cells.
 
@@ -199,6 +243,7 @@ def kernels(roughness=ref_roughness_world):
         accumulate_mfd=ref_accumulate,
         stream_power=ref_stream_power,
         relax=ref_relax,
+        profile_incision=ref_profile_incision,
     )
 
 
@@ -622,6 +667,79 @@ def test_bake_writes_only_the_interior():
     assert all(v >= 0.0 for v in r.cpu_seconds.values())
     assert r.missing_coarse == ()
     assert r.stats["relief_m"] > 0.0
+
+
+def test_stage_sink_observes_every_sub_stage_and_changes_nothing():
+    """The sink exists so 'which stage made it wrong' is answerable
+    (tools/dump_stage_heightfields.py --stages). Three contracts: every
+    STAGE_SINK_FIELDS entry arrives, interior-shaped, in pipeline order; the
+    last surface it sees IS the shipped one; and observing is free -- a bake
+    with a sink is byte-identical to one without."""
+    world = synth_world()
+    seen: dict[str, np.ndarray] = {}
+
+    def run(sink):
+        return pipeline.bake_tile(
+            world_seed=20260719, tile_x=0, tile_y=0,
+            coarse_fetch=lambda x, y: world.get((x, y)),
+            kernels=kernels(), geom=TEST_GEOM, consts=TEST_CONSTS,
+            stage_sink=sink,
+        )
+
+    r = run(lambda name, arr: seen.__setitem__(name, np.array(arr)))
+    assert list(seen) == [n for n, _ in pipeline.STAGE_SINK_FIELDS]
+    f = TEST_GEOM.fine_tile_px
+    assert all(a.shape == (f, f) for a in seen.values())
+    np.testing.assert_array_equal(seen["B3.relaxed"], r.elevation_m)
+    # The sub-stages must be consistent with each other, or a dump would be
+    # describing a bake that never ran: incised == filled - incision depth.
+    np.testing.assert_allclose(
+        seen["B2d.incised"],
+        seen["B2a.filled"] - seen["B2d.incision_depth_m"],
+        rtol=0.0, atol=1e-5,
+    )
+    r2 = run(None)
+    np.testing.assert_array_equal(r.elevation_m, r2.elevation_m)
+    np.testing.assert_array_equal(r.flow, r2.flow)
+
+
+def test_profile_mode_wires_the_profile_kernel_and_depth_is_the_default():
+    """incision_mode='profile' must reach the injected profile kernel (with a
+    regional-slope field when the constant enables one), change the surface
+    relative to depth mode, and refuse a kernel set that cannot provide it.
+    Depth mode is the default and must not touch the profile kernel at all."""
+    world = synth_world()
+    calls = []
+
+    def spy_profile(filled, receivers, acc, cell_m, **kw):
+        calls.append(kw)
+        return ref_profile_incision(filled, receivers, acc, cell_m, **kw)
+
+    def bake(consts, profile_kernel):
+        return pipeline.bake_tile(
+            world_seed=1, tile_x=0, tile_y=0,
+            coarse_fetch=lambda x, y: world.get((x, y)),
+            kernels=dataclasses.replace(kernels(), profile_incision=profile_kernel),
+            geom=TEST_GEOM, consts=consts,
+        )
+
+    assert TEST_CONSTS.incision_mode == "depth"  # the default, deliberately
+    base = bake(TEST_CONSTS, spy_profile)
+    assert calls == [], "depth mode must not call the profile kernel"
+
+    prof_consts = dataclasses.replace(TEST_CONSTS, incision_mode="profile")
+    prof = bake(prof_consts, spy_profile)
+    assert len(calls) == 1
+    assert calls[0]["K_dt"] == prof_consts.profile_K_dt
+    assert calls[0]["regional_slope"] is not None, \
+        "profile_regional_s_ref > 0 must hand the kernel a regional slope field"
+    assert calls[0]["regional_slope"].shape == (
+        TEST_GEOM.padded_fine_px, TEST_GEOM.padded_fine_px)
+    assert not np.array_equal(prof.elevation_m, base.elevation_m), \
+        "the two formulations must actually produce different surfaces"
+
+    with pytest.raises(RuntimeError, match="profile_incision"):
+        bake(prof_consts, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1087,7 +1205,7 @@ def test_every_bake_constant_rolls_the_fingerprint():
     base = pipeline.bake_fingerprint()
     seen = {base}
     # Alternatives that still satisfy BakeConstants' own validation.
-    valid_alt = {"thermal_rate": 0.25, "flat_eps": 1e-6}
+    valid_alt = {"thermal_rate": 0.25, "flat_eps": 1e-6, "incision_mode": "profile"}
     for fld in dataclasses.fields(BakeConstants):
         cur = getattr(pipeline.CONSTANTS, fld.name)
         if fld.name in valid_alt:

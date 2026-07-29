@@ -11,6 +11,7 @@ and are reached through ``BakeKernels``:
     roughness(carrier_z, cell_m, slope, seed, src_nyquist_m=30.0,
               origin_cells=(row0, col0)) -> delta
     stream_power(acc, slope, K=0.15, m=0.45, n=0.8, cap_m=25.0) -> depth_m
+    profile_incision(filled, receivers, acc, cell_m, K_dt=..., slope=...) -> eroded_z
     relax(z, cell_m, repose_deg=36.0, iters=48, rate=0.4) -> z
 
 ``origin_cells`` is optional in the interface and MANDATORY here: without it
@@ -115,6 +116,7 @@ __all__ = [
     "FlowLevel",
     "FlowSuperblock",
     "PRODUCTION",
+    "STAGE_SINK_FIELDS",
     "assemble_padded_coarse",
     "bake_identity_payload",
     "bake_fingerprint",
@@ -156,7 +158,17 @@ __all__ = [
 #: and the .vxfl container grew a field for it. The constants roll the id on
 #: their own; the counter moves because the .vxfl layout and the flow-plane
 #: packing code changed with them.
-BAKE_VERSION = 2
+#:
+#: 2 -> 3 (2026-07-29): B2d incision is now the IMPLICIT profile solve
+#: (``incise.profile_incision``, ``incision_mode = "profile"``) rather than the
+#: per-cell depth law. The depth law paints depth onto the carrier and cannot
+#: re-grade a channel's long profile, which left the sub-30 m band with no
+#: concavity (theta 0.028-0.086 against 0.177-0.318 for matched real 1 m DTMs
+#: -- docs/terrain-validation-2026-07.md section 7.1, confirmed per-stage by
+#: the 2026-07-29 stage dumps). ``incision_mode = "depth"`` reproduces the
+#: bake_ver-2 surface exactly. The constants roll the id on their own; the
+#: counter moves because the B2d code path changed with them.
+BAKE_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -318,7 +330,53 @@ class BakeConstants:
     #: Over-carving is its own failure mode; this is the sub-threshold cap.
     #: NOTE it binds at every K tested including 0.03, so ``max`` incision is
     #: censored and p99 is the only usable tail statistic when tuning.
+    #:
+    #: MEASURED NOT GUILTY of the concavity deficit (2026-07-29 stage dumps):
+    #: it binds only at A >= 1e6 m^2 -- 0.06% of channel cells on the plains
+    #: exemplar, 0.4% rolling, 2.5% alpine -- and removing it moved theta by
+    #: 2e-5. It is kept because the profile solve makes deep coherent canyons
+    #: REACHABLE (K_dt = 15 uncapped measured 679 m of incision); under
+    #: ``incision_mode = "profile"`` it bounds total lowering per cell while
+    #: the solve's own z >= z(receiver) guarantee is what prevents shafts.
     incision_cap_m: float = 25.0
+    #: B2d formulation. "profile" = ``incise.profile_incision``, the implicit
+    #: stream-power solve along the D8 tree: same law, same gate, same taper,
+    #: but the carve is a GRADED LONG PROFILE (concave, monotone, no
+    #: carve-created pits) instead of a per-cell depth. "depth" reproduces the
+    #: bake_ver-2 surface exactly, and is the DEFAULT -- deliberately, after
+    #: measuring both at production scale on the three exemplar tiles:
+    #:
+    #:   * the depth law leaves the invented sub-30 m band with no concavity
+    #:     (theta 0.040-0.065 against 0.177-0.318 for matched real 1 m DTMs)
+    #:     and moves it AWAY from real (B0+B1 0.083 -> B2d 0.040 on alpine);
+    #:   * the profile solve at K_dt=1.5 UNSCALED took alpine theta to 0.143
+    #:     (r^2 0.96, target 0.177) and put the plains geomorphon fractions in
+    #:     or near the real range -- but tripled the plains mean slope
+    #:     (1.82 -> 5.36 deg at 1.875 m against Illinois' 2.13) because a
+    #:     no-uplift solve grades every big catchment toward a peneplain,
+    #:     which digs 12 m trenches through a till plain;
+    #:   * with the regional-energy scale (``profile_regional_s_ref``) the
+    #:     trade improves -- plains mean slope +5% (K_dt 1.5) to +35%
+    #:     (K_dt 4.5) while alpine theta reaches ~0.146 -- but NO measured
+    #:     configuration meets the acceptance bars on every class at once.
+    #:
+    #: Flipping this to "profile" is one constant and rolls the world; do it
+    #: with the scorecard above in hand, not because the knob exists.
+    incision_mode: str = "depth"
+    #: Erosion number for the profile solve: K times the pass's pseudo-time.
+    #: Small values reproduce the explicit law to first order (0.15 measured
+    #: theta 0.084 on the alpine exemplar window -- barely moved); large
+    #: values run every channel to the steady-state graded profile (15
+    #: measured theta with a broken fit and, uncapped, 679 m of incision).
+    #: 4.5 with the regional scale below is the measured compromise: alpine
+    #: theta 0.146 (r^2 0.90) at +35% plains mean slope.
+    profile_K_dt: float = 4.5
+    #: Regional-slope reference for the profile solve's energy scale:
+    #: erodibility is multiplied by ``min(1, S_30m / this)^n`` where S_30m is
+    #: the carrier's 30 m-scale slope. This is the solve's stand-in for the
+    #: missing uplift term -- erosion energy follows regional relief -- and it
+    #: is what keeps a plain a plain while the mountains re-grade. 0 disables.
+    profile_regional_s_ref: float = 0.2
     #: Channel-initiation area, m^2. Without it ``K*A^m*S^n`` incises every cell
     #: that has any upslope area, which at 1.875 m/px is every cell in the tile:
     #: measured 77.6% of the domain incised past one voxel at K=0.03 and 98.6%
@@ -409,6 +467,18 @@ class BakeConstants:
             )
         if self.superblock_tiles < 1 or self.superblock_max_level < 0:
             raise ValueError("superblock_tiles >= 1 and max_level >= 0")
+        if self.incision_mode not in ("profile", "depth"):
+            raise ValueError(
+                f"incision_mode={self.incision_mode!r} is neither 'profile' "
+                "nor 'depth'"
+            )
+        if self.profile_K_dt < 0.0:
+            raise ValueError(f"profile_K_dt must be >= 0, got {self.profile_K_dt}")
+        if self.profile_regional_s_ref < 0.0:
+            raise ValueError(
+                f"profile_regional_s_ref must be >= 0 (0 disables), got "
+                f"{self.profile_regional_s_ref}"
+            )
 
     def as_payload(self) -> dict:
         return {
@@ -420,6 +490,9 @@ class BakeConstants:
             "stream_m": self.stream_m,
             "stream_n": self.stream_n,
             "incision_cap_m": self.incision_cap_m,
+            "incision_mode": self.incision_mode,
+            "profile_K_dt": self.profile_K_dt,
+            "profile_regional_s_ref": self.profile_regional_s_ref,
             "channel_init_area_m2": self.channel_init_area_m2,
             "channel_init_q": self.channel_init_q,
             "sea_taper_top_m": self.sea_taper_top_m,
@@ -625,6 +698,10 @@ class BakeKernels:
     accumulate_mfd: Callable
     stream_power: Callable
     relax: Callable
+    #: The implicit profile solve (``incise.profile_incision``). Optional with
+    #: a None default so pre-existing test doubles keep constructing; the
+    #: pipeline refuses to bake ``incision_mode = "profile"`` without it.
+    profile_incision: "Callable | None" = None
 
 
 _MISSING_KERNELS = (
@@ -646,7 +723,7 @@ def load_kernels() -> BakeKernels:
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(_MISSING_KERNELS.format(mod="noise", err=exc)) from exc
     try:
-        from .incise import stream_power
+        from .incise import profile_incision, stream_power
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError(_MISSING_KERNELS.format(mod="incise", err=exc)) from exc
     try:
@@ -661,6 +738,7 @@ def load_kernels() -> BakeKernels:
         accumulate_mfd=accumulate_mfd,
         stream_power=stream_power,
         relax=relax,
+        profile_incision=profile_incision,
     )
 
 
@@ -1672,6 +1750,33 @@ apron-sensitivity table above is what says they are not fine in general.
 """
 
 
+PROFILE_SEAM = """\
+What the profile solve does to the tile-to-tile seam -- measured, not assumed.
+
+``incise.profile_incision`` reads its receiver's SOLVED elevation, so the
+carve propagates base-level information upstream along the whole channel:
+an unbounded dependency of the same class as flow accumulation
+(HYDROLOGY_RESIDUALS), and one the apron cannot bound in principle. The
+magnitude, however, is bounded by ``incision_cap_m``, and the join was
+measured directly (2026-07-29, the APRON_BLIND_SPOT residual-seam method):
+two ADJACENT 3.84 km tiles of the real alpine exemplar baked independently at
+the production 960 m apron with a shared level-0 superblock, step across the
+join against the terrain's own one-cell step:
+
+    mode      join mean step   terrain's own   ratio    join max
+    depth        0.599 m          0.600 m      0.999     1.36 m
+    profile      0.681 m          0.681 m      1.000     2.36 m
+
+The mean join step is AT the terrain's own gradient in both modes -- the
+profile solve does not add an elevation seam at this apron on this terrain.
+Its footprint is in the tail (max step 1.36 -> 2.36 m): where the join cuts a
+carved channel, the two sides can disagree about the graded profile by up to
+the cap. The reference-kernel apron tests deliberately use a LOCAL incision
+double for the same reason ``ref_accumulate`` does not route: a tree-walking
+reference would make those tests measure the reference, not the pipeline.
+"""
+
+
 @dataclass
 class BakeResult:
     """Interior-only outputs, plus the numbers worth recording."""
@@ -1795,7 +1900,8 @@ def bake_padded_domain(
     # that produces any.
     rec = np.asarray(rec)
     interior_dead_ends = int((rec[1:-1, 1:-1] < 0).sum())
-    del rec
+    # rec stays live through B2d for the profile solve; it is in
+    # estimate_peak_bytes' count, so this frees nothing the estimate claims.
     tick("B2b.d8_receivers", c0)
 
     # -- B2c: MFD area, with the pyramid's inflow at the domain edge. THIS is
@@ -1820,24 +1926,82 @@ def bake_padded_domain(
     tick("B2c.accumulate_mfd", c0)
 
     # -- B2d: stream-power incision.
+    #
+    # "profile" solves the same law implicitly along the D8 tree, so the carve
+    # is a graded long profile rather than a per-cell depth -- see the
+    # incise.py module docstring for the measurements that forced it. The
+    # solve reads its receiver's SOLVED elevation, so profile information
+    # travels upstream along the network: a non-locality of the same class as
+    # flow accumulation (HYDROLOGY_RESIDUALS), bounded in magnitude by
+    # ``incision_cap_m``, and measured rather than assumed -- see
+    # PROFILE_SEAM below for the per-tile-vs-single-domain numbers.
     c0 = time.process_time()
-    depth = np.asarray(
-        kernels.stream_power(
-            acc64,
-            d8_slope,
-            K=consts.stream_K,
-            m=consts.stream_m,
-            n=consts.stream_n,
-            cap_m=consts.incision_cap_m,
-            a_crit_m2=consts.channel_init_area_m2,
-            gate_q=consts.channel_init_q,
-            elev_m=filled,
-            sea_taper_top_m=consts.sea_taper_top_m,
-            sea_taper_bottom_m=consts.sea_taper_bottom_m,
-        ),
-        dtype=np.float32,
-    )
-    eroded = filled - depth
+    if consts.incision_mode == "profile":
+        if kernels.profile_incision is None:
+            raise RuntimeError(
+                "incision_mode='profile' but this BakeKernels has no "
+                "profile_incision kernel; inject incise.profile_incision or "
+                "bake with incision_mode='depth'"
+            )
+        regional = None
+        if consts.profile_regional_s_ref > 0.0:
+            # The carrier's 30 m-scale slope, expanded back to the fine grid:
+            # a pure function of the (world-anchored, apron-consistent)
+            # carrier, so it cannot introduce a seam of its own. The scale
+            # factor 16 is the coarse/fine ratio whatever the geometry.
+            f = geom.scale
+            h_f, w_f = fine.shape
+            cb = fine[:h_f - h_f % f, :w_f - w_f % f].reshape(
+                h_f // f, f, w_f // f, f).mean(axis=(1, 3))
+            gyc, gxc = np.gradient(cb.astype(np.float64), cell_m * f)
+            regional = np.zeros(fine.shape, np.float32)
+            rs = np.repeat(np.repeat(np.hypot(gxc, gyc), f, axis=0), f, axis=1)
+            regional[:rs.shape[0], :rs.shape[1]] = rs
+            if rs.shape[0] < h_f:
+                regional[rs.shape[0]:, :] = regional[rs.shape[0] - 1: rs.shape[0], :]
+            if rs.shape[1] < w_f:
+                regional[:, rs.shape[1]:] = regional[:, rs.shape[1] - 1: rs.shape[1]]
+            del cb, gyc, gxc, rs
+        eroded = np.asarray(
+            kernels.profile_incision(
+                filled,
+                rec,
+                acc64,
+                cell_m,
+                K_dt=consts.profile_K_dt,
+                m=consts.stream_m,
+                n=consts.stream_n,
+                cap_m=consts.incision_cap_m,
+                a_crit_m2=consts.channel_init_area_m2,
+                gate_q=consts.channel_init_q,
+                regional_slope=regional,
+                regional_s_ref=consts.profile_regional_s_ref,
+                sea_taper_top_m=consts.sea_taper_top_m,
+                sea_taper_bottom_m=consts.sea_taper_bottom_m,
+            ),
+            dtype=np.float32,
+        )
+        del regional
+        depth = filled - eroded
+    else:
+        depth = np.asarray(
+            kernels.stream_power(
+                acc64,
+                d8_slope,
+                K=consts.stream_K,
+                m=consts.stream_m,
+                n=consts.stream_n,
+                cap_m=consts.incision_cap_m,
+                a_crit_m2=consts.channel_init_area_m2,
+                gate_q=consts.channel_init_q,
+                elev_m=filled,
+                sea_taper_top_m=consts.sea_taper_top_m,
+                sea_taper_bottom_m=consts.sea_taper_bottom_m,
+            ),
+            dtype=np.float32,
+        )
+        eroded = filled - depth
+    del rec
     tick("B2d.stream_power", c0)
 
     # -- B3: slope-limited thermal relaxation, AFTER incision so gully walls
@@ -1871,6 +2035,22 @@ def bake_padded_domain(
     }
 
 
+#: The sub-stage surfaces ``bake_tile`` hands to a ``stage_sink``, in pipeline
+#: order, with the ``bake_padded_domain`` output key each one is a view of.
+#: These exist for OBSERVABILITY (tools/dump_stage_heightfields.py): the final
+#: surface has repeatedly been measured as wrong without the measurement being
+#: able to say WHICH stage made it wrong, because only the finished bake was
+#: inspectable. A sink changes no baked byte and no identity hash.
+STAGE_SINK_FIELDS: tuple[tuple[str, str], ...] = (
+    ("B0B1.carrier_rough", "carrier_plus_roughness"),
+    ("B2a.filled", "filled"),
+    ("B2c.accumulation_m2", "acc"),
+    ("B2d.incision_depth_m", "incision"),
+    ("B2d.incised", "eroded"),
+    ("B3.relaxed", "z"),
+)
+
+
 def bake_tile(
     *,
     world_seed: int,
@@ -1881,6 +2061,7 @@ def bake_tile(
     geom: BakeGeometry = PRODUCTION,
     consts: BakeConstants = CONSTANTS,
     inflow_source: "FlowSuperblock | None" = None,
+    stage_sink: "Callable[[str, np.ndarray], None] | None" = None,
 ) -> BakeResult:
     """Bake one coarse tile's fine tier. Interior only; the apron is discarded.
 
@@ -1888,6 +2069,13 @@ def bake_tile(
     (coarse_tile_px, coarse_tile_px) array, or None if it does not exist.
     ``inflow_source`` is the level-0 flow superblock covering this tile; None
     means "no cross-tile hydrology", which is only correct for a test.
+
+    ``stage_sink(name, interior)`` is called once per `STAGE_SINK_FIELDS` entry
+    with the INTERIOR (apron already cropped) of that sub-stage's grid, in
+    pipeline order, before the result is assembled. The arrays are views into
+    the bake's own grids: a sink that keeps one must copy it. Purely an
+    observer -- it cannot change what is baked, and passing one does not touch
+    the bake identity.
     """
     kernels = kernels or load_kernels()
     padded, missing = assemble_padded_coarse(coarse_fetch, tile_x, tile_y, geom)
@@ -1902,6 +2090,9 @@ def bake_tile(
         inflow_source=inflow_source,
     )
     sl = geom.interior()
+    if stage_sink is not None:
+        for name, key in STAGE_SINK_FIELDS:
+            stage_sink(name, out[key][sl, sl])
     z = np.ascontiguousarray(out["z"][sl, sl])
     acc = np.ascontiguousarray(out["acc"][sl, sl])
     incision = out["incision"][sl, sl]
