@@ -491,6 +491,16 @@ the column; everything else differs by ≤4 columns in 147,456, i.e. 0.003%).
 - **Streaming:** the sanctioned flight leg (`tools/voxel-run-flight-leg.ps1` +
   `voxel-leg-summary.ps1`, spawn `-84480,53760`, `line` flight) after Phases 2 and 4, watching
   flight-phase hole distribution — not `holes(final)`, which cannot decide a latency question.
+
+  > **OUTSTANDING for Phase 1.** This leg has *not* been run for v9. It is the check that matters
+  > most for the rewritten `surfaceBoundsMm` and the deleted UE-side bound, because a bound that is
+  > too tight shows up as holes under motion and nowhere else. `VoxelEarthEditor` builds and the
+  > CPU/GPU gate is green, but neither exercises streaming admission.
+  >
+  > It could not be run here: `voxel-run-flight-leg.ps1` correctly refused to start while another
+  > session's `UnrealEditor-Cmd` (a `pr149-water` parity run) held the box, and a contended leg
+  > reads exactly like a slow configuration. Run it when the box is free, and compare against a v8
+  > leg rather than against the recorded numbers, since v9 changes chunk admission.
 - **Perf:** `vxc_bench` amplify-stage regression against the +5–10% world-average budget in Phase 4.
 
   **Phase 1 measured (radius 128, brick 8³, A/B against a v8 worktree):**
