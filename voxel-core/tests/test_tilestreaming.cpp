@@ -520,10 +520,22 @@ VXC_TEST(read_margin_reaches_into_the_next_tile_and_the_gate_demands_it) {
     // This is the shape that leaks: the chunk looks local, IsFootprintResident
     // is asked about a footprint that "obviously" lies in one tile, and the
     // generation then samples the raster next door and gets sea level.
-    constexpr int64_t kInset = 10;
+    // 10 until worldgen v13, which grew kCarrierStencilLo/Hi from (-1,+2) to
+    // (-16,+16) for the coarse carrier's prefilter halo. The guard below caught
+    // that immediately, which is what it is for.
+    constexpr int64_t kInset = 18;
     // The test is only meaningful while the margin is wider than the inset and
     // the stencil is narrower. If a cavern-size change ever breaks that, this
     // fails loudly rather than silently testing nothing.
+    //
+    // WORTH KNOWING: that window is now nearly shut. At 1.875 m/px the carrier
+    // stencil reaches 16 px = 30 m and the cavern reach is 36.4 m = 19.4 px, so
+    // the only legal insets are 17, 18 and 19. If the stencil grows again this
+    // test becomes impossible to write -- and that is a DESIGN signal, not a
+    // test problem: it would mean the carrier stencil had overtaken the cavern
+    // reach, so "the cavern margin is what pulls in the neighbouring tile" would
+    // no longer be the thing the gate has to get right. Re-derive the gate's
+    // dominant term before widening this test.
     CHECK(kCavernMaxReachMm / int64_t(kPxMm) > kInset);
     CHECK(kCarrierStencilHi < kInset);
 
