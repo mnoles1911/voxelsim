@@ -368,13 +368,24 @@ def _encode_plane(
     block boundary.
 
     `force_raw_blocks` is a set of (bx, by) block coordinates to force to
-    MODE_RAW regardless of size. This reference encoder does NOT pick RAW on
-    its own: under CODEC_RAW, RAW is only ever byte-cheaper than CODED when
-    CODED needed resid_bits=32 (both cost 2 bytes/px at resid_bits=16, a
-    tie broken to CODED), so a size-minimising auto-selector would make
-    resid_bits=32 unreachable through the public encoder — exactly the code
-    path the spec says must be tested (§5, §9 item 1). RAW is kept in the
-    format and reachable via this explicit opt-in instead.
+    MODE_RAW regardless of size.
+
+    RAW IS AUTO-SELECTED FOR 1-BYTE PLANES ONLY, i.e. the §6 flow plane, and
+    only when it is actually smaller. The argument for never auto-selecting it
+    was written about the ELEVATION plane and is correct there: an i2 element
+    ties CODED at resid_bits=16 and only beats it at resid_bits=32, so a
+    size-minimising selector would make resid_bits=32 unreachable through the
+    public encoder — exactly the code path the spec says must be tested (§5,
+    §9 item 1). None of that transfers to a u1 element, where a MED residual is
+    zigzagged into TWO bytes per pixel against RAW's one and resid_bits can
+    never be 32 (a uint8 difference fits int16 with room to spare). Measured on
+    the real baked flow plane of tile (-40,24): 2.10 -> 1.05 MB uncoded, and
+    0.144 -> 0.108 MB after zstd-19, i.e. CODED was costing 33% of the flow
+    plane's compressed size for nothing.
+
+    The choice is made on the FINAL payload lengths, after `codec`, so it stays
+    correct for CODEC_ZSTD as well as CODEC_RAW; ties go to CODED so a plane
+    that gains nothing keeps the predicted form.
     """
     size = values.shape[0]
     bs = 1 << block_log2
@@ -382,6 +393,9 @@ def _encode_plane(
     assert size % bs == 0
     nb = size // bs
     force_raw_blocks = force_raw_blocks or set()
+    # See the docstring: only a 1-byte element can be smaller RAW than CODED
+    # without taking resid_bits=32 out of the encoder's reach.
+    auto_raw = np.dtype(elem_dtype).itemsize == 1
 
     entries = []
     chunks = []
@@ -403,9 +417,19 @@ def _encode_plane(
                 # steep step forces this, not just pathological input.
                 resid_bits = 16 if (resid.min() >= -32768 and resid.max() <= 32767) else 32
                 payload = _compress(_pack_residuals(resid, resid_bits), codec)
-                entries.append(
-                    (data_offset, len(payload), MODE_CODED, 0, resid_bits, _ZERO_PAD4)
+                raw_payload = (
+                    _compress(blk.astype(elem_dtype).tobytes(), codec)
+                    if auto_raw else None
                 )
+                if raw_payload is not None and len(raw_payload) < len(payload):
+                    payload = raw_payload
+                    entries.append(
+                        (data_offset, len(payload), MODE_RAW, 0, 0, _ZERO_PAD4)
+                    )
+                else:
+                    entries.append(
+                        (data_offset, len(payload), MODE_CODED, 0, resid_bits, _ZERO_PAD4)
+                    )
             chunks.append(payload)
             data_offset += len(payload)
 
@@ -633,4 +657,148 @@ def decode_v2(data: bytes) -> TileV2:
         quant=quant, codec=codec, bake_ver=bake_ver,
         block_log2=block_log2, flow=flow,
         scale=scale, predictor=predictor, parent_scale=parent_scale,
+    )
+
+
+# --------------------------------------------------- bake surface -> v2 bytes
+#
+# `encode_v2` above takes a `TileV2`, i.e. it starts from control points that
+# someone else already produced. The bake does NOT produce control points: a
+# `BakeResult.elevation_m` is a field of SAMPLES (bake/pipeline.py's own
+# docstring on that field says so, and points here for the prefilter). Between
+# the two sits the step this function is:
+#
+#     samples (float m)  ->  prefilter  ->  cp (float m)  ->  datum + quantise
+#                        ->  int16 cp   ->  encode_v2
+#
+# Without it there is no path at all from a bake to shippable bytes --
+# `pregen._encode_fine` probes for exactly this name first, finds `encode_v2`
+# instead, and dies because it cannot synthesise a `TileV2` argument. That is
+# why no fine tile existed end-to-end before 2026-07-29.
+#
+# Skipping the prefilter and writing the samples straight into the cp plane is
+# the one tempting shortcut and it is wrong in a way no round-trip test would
+# catch: the file still decodes, but the client's spline then evaluates a
+# LOW-PASSED version of the bake (docs/vxtl-v2-format.md §2: detrended H
+# degrades 0.83 -> 1.47), quietly throwing away the fine band the whole bake
+# exists to create.
+
+#: Elevation datum granularity, mm. `base_offset_mm` is snapped to a multiple
+#: of this so that a tile's datum is a legible round number in a hex dump and
+#: two neighbouring tiles of similar relief usually share one, which costs
+#: nothing (the int16 range is 3.2 km either way at 100 mm) and makes a
+#: mis-set datum obvious rather than plausible.
+DATUM_STEP_MM = 100_000  # 100 m
+
+
+def choose_datum(cp_mm_min: int, cp_mm_max: int) -> tuple[int, int]:
+    """Pick `(base_offset_mm, quant)` covering [cp_mm_min, cp_mm_max].
+
+    Prefers `QUANT_100MM` (one voxel per LSB, the format's intent) and falls
+    back to `QUANT_250MM` only when the tile's control-point range genuinely
+    exceeds the int16 span at 100 mm -- 6553.4 m, which real terrain reaches
+    only where an alpine tile also contains deep bathymetry. Raises ValueError
+    if even 250 mm cannot hold it, rather than silently clipping mountains.
+    """
+    mid = (int(cp_mm_min) + int(cp_mm_max)) // 2
+    base = int(round(mid / DATUM_STEP_MM)) * DATUM_STEP_MM
+    for quant in (QUANT_100MM, QUANT_250MM):
+        q = QUANT_MM[quant]
+        lo = (int(cp_mm_min) - base) / q
+        hi = (int(cp_mm_max) - base) / q
+        if lo >= -32768 and hi <= 32767:
+            return base, quant
+    raise ValueError(
+        f"control-point range [{cp_mm_min / 1000:.1f}, {cp_mm_max / 1000:.1f}] m "
+        f"({(cp_mm_max - cp_mm_min) / 1000:.1f} m of relief) does not fit int16 at "
+        "either quant; the format cannot represent this tile"
+    )
+
+
+def elevation_control_points(
+    elevation_m: np.ndarray,
+    *,
+    base_offset_mm: int | None = None,
+    quant: int | None = None,
+) -> tuple[np.ndarray, int, int]:
+    """Sample field in metres -> `(int16 cp, base_offset_mm, quant)`.
+
+    Runs the §2 prefilter (`bake.noise.prefilter`, the same operator the B0
+    carrier uses, imported lazily because it needs scipy and this module must
+    import on a bare CI box), then picks a datum and quantises.
+
+    `base_offset_mm` / `quant` may be pinned by the caller -- a seam test wants
+    two tiles on ONE datum so their cp planes are directly comparable -- and are
+    otherwise chosen per tile by `choose_datum`.
+    """
+    from .bake.noise import prefilter  # scipy; lazy on purpose
+
+    z = np.asarray(elevation_m)
+    if z.ndim != 2 or z.shape[0] != z.shape[1]:
+        raise ValueError(f"elevation_m must be a square 2-D array, got {z.shape}")
+
+    cp_mm = np.rint(prefilter(z) * 1000.0)
+    lo, hi = int(cp_mm.min()), int(cp_mm.max())
+    if base_offset_mm is None or quant is None:
+        auto_base, auto_quant = choose_datum(lo, hi)
+        base_offset_mm = auto_base if base_offset_mm is None else int(base_offset_mm)
+        quant = auto_quant if quant is None else int(quant)
+    cp = mm_to_control_points(cp_mm.astype(np.int64), int(base_offset_mm), int(quant))
+    return cp, int(base_offset_mm), int(quant)
+
+
+def encode_fine(
+    *,
+    seed: int,
+    x: int,
+    y: int,
+    elevation_m: np.ndarray,
+    flow: np.ndarray | None = None,
+    bake_ver: int | None = None,
+    codec: int = CODEC_RAW,
+    block_log2: int = DEFAULT_BLOCK_LOG2,
+    base_offset_mm: int | None = None,
+    quant: int | None = None,
+) -> bytes:
+    """Encode one baked fine tier straight from the bake's SAMPLE field.
+
+    This is the entry point `pregen._encode_fine` looks for, and the only
+    sanctioned way to turn a `BakeResult` into `.vxtl` v2 bytes.
+
+    `bake_ver=None` stamps `bake.pipeline.BAKE_VERSION`, so a tile carries the
+    identity of the bake that made it without every caller having to remember
+    to pass it; pass an int to override (a fixture generator wants a fixed one).
+    """
+    if bake_ver is None:
+        try:
+            from .bake.pipeline import BAKE_VERSION
+
+            bake_ver = int(BAKE_VERSION)
+        except ImportError:  # pragma: no cover - bake package always ships
+            bake_ver = 0
+
+    cp, base_offset_mm, quant = elevation_control_points(
+        elevation_m, base_offset_mm=base_offset_mm, quant=quant
+    )
+    flow_arr = None
+    if flow is not None:
+        flow_arr = np.ascontiguousarray(flow, dtype=np.uint8)
+        if flow_arr.shape != cp.shape:
+            raise ValueError(
+                f"flow plane {flow_arr.shape} does not match elevation {cp.shape}"
+            )
+    return encode_v2(
+        TileV2(
+            seed=int(seed) & 0xFFFFFFFFFFFFFFFF,
+            x=int(x),
+            y=int(y),
+            size=int(cp.shape[0]),
+            elevation_cp=cp,
+            base_offset_mm=int(base_offset_mm),
+            quant=int(quant),
+            codec=int(codec),
+            bake_ver=int(bake_ver),
+            block_log2=int(block_log2),
+            flow=flow_arr,
+        )
     )
