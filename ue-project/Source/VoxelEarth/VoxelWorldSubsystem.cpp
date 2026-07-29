@@ -1,4 +1,4 @@
-#include "VoxelWorldSubsystem.h"
+﻿#include "VoxelWorldSubsystem.h"
 
 #include "VoxelChunkComponent.h"
 // MeshChunkBricks + ERingSkirtFace used to live in this file's anonymous
@@ -2215,9 +2215,15 @@ namespace VoxelSkyBand
 // FOLLOW-UP (reported upstream): this belongs in voxel-core as a
 // `Amplifier::surfaceUpperBoundMm(vx0, vy0, vx1, vy1)` next to the constants it
 // depends on, so a change to kDetailOctaves cannot silently invalidate it.
-constexpr int64 kDetailAmplitudeSumMm = 1800 + 700 + 260 + 100;
-constexpr int64 kMaxSlopeScaleQ10 = 4096;
-constexpr int64 kMaxDetailMm = kDetailAmplitudeSumMm * kMaxSlopeScaleQ10 / 1024; // 11'440 mm
+// REMOVED (worldgen v9). kDetailAmplitudeSumMm / kMaxSlopeScaleQ10 /
+// kMaxDetailMm mirrored the amplifier's octave table by hand, and the FOLLOW-UP
+// above is what happened to them: kDetailOctaves changed at v6 and silently
+// invalidated the copy, which sat at the v1 amplitudes (1800+700+260+100)
+// against a real table of 2600+1100+500+190+60 for three worldgen versions.
+//
+// The allowance now comes from vxc::Amplifier::surfaceUpperBoundMm, which
+// DERIVES it from the live table inside voxel-core and static_asserts the
+// couplings the derivation needs. Do not reintroduce a local copy.
 
 // Defensive cap on tile-corner reads per footprint. At level 4 (51.2 m
 // footprint) a 30 mm-class pixel needs 4x4 and the 11.25 m scale-8 pixel 6x6;
@@ -3261,7 +3267,7 @@ struct FVoxelWorldImpl
 	float LogTimerAccumSeconds = 0.f;
 	// S0-2: TotalChunksLoaded as of the previous MaybeLogCounters window, so
 	// the periodic log can report a per-window rate (apply rate decaying
-	// across a leg is the §2.2 prediction this counter tests) rather than
+	// across a leg is the Â§2.2 prediction this counter tests) rather than
 	// only the leg-long mean TotalChunksLoaded already gives.
 	int64 ChunksLoadedAtLastLog = 0;
 
@@ -3445,7 +3451,7 @@ struct FVoxelWorldImpl
 	// zero for the entire flight. Anything reading GetVelocity() reports a
 	// stationary camera while the world streams past at 20 m/s -- and it reports
 	// it on exactly the runs this is meant to explain
-	// (docs/speculative-generation-plan.md §2.4).
+	// (docs/speculative-generation-plan.md Â§2.4).
 	//
 	// The anchor is also the RIGHT point to measure: it is what every ring
 	// radius, admission cutoff and retention decision is computed against, so
@@ -3503,7 +3509,7 @@ struct FVoxelWorldImpl
 	int64 ZeroQuadAppliesSinceLog = 0;  // ...of which meshed to zero quads (buried: real work, no component)
 
 	// WHICH EXIT DrainResults TOOK, per 5s window. Wave S0
-	// (docs/speculative-generation-plan.md §4, executing T0-1).
+	// (docs/speculative-generation-plan.md Â§4, executing T0-1).
 	//
 	// This exists because the open P0's headline reading may be an artifact of a
 	// metric. The published claim is "apply budget only 8.5% saturated -- results
@@ -3525,14 +3531,14 @@ struct FVoxelWorldImpl
 	int64 DrainExitCountCapSinceLog = 0;    // Applied hit MaxAppliesPerFrame
 	int64 DrainExitDrainCapSinceLog = 0;    // Drains hit kMaxResultDrainsPerFrame (stale backlog)
 
-	// WHERE PER-APPLY TIME GOES, per 5s window. §1a prices the table push as the
+	// WHERE PER-APPLY TIME GOES, per 5s window. Â§1a prices the table push as the
 	// dominant term and the batching wave is built on that, but the split has
 	// never been measured. Milliseconds accumulated across the window; divide by
 	// AppliesTimedSinceLog for a per-apply figure.
 	//
 	// POOLED BRANCH ONLY -- the component branch is the control arm and is not
 	// split; see the note at the top of it in ApplyMeshResult. The fourth stage
-	// §1a names, the table push, is not here either: it happens inside the pool
+	// Â§1a names, the table push, is not here either: it happens inside the pool
 	// add, and splitting it needs the pool's own clocks. That is
 	// UVoxelGpuPoolComponent::GetAndResetPushStats, and poolAdd below is its
 	// total, so the two lines add up.
@@ -4911,7 +4917,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		// from the outside. capacityPct is beside it so the approach to the cliff
 		// is visible before the cliff.
 		const uint32 CapacityQuads = Pool->GetHighWaterMarkQuads() + Pool->GetFreeQuads();
-		// S0-2: allocsEver tests §2.2 -- Allocations is append-only by default
+		// S0-2: allocsEver tests Â§2.2 -- Allocations is append-only by default
 		// (see GetNumAllocationsEver), so this is chunks-ever-added, not resident
 		// (liveChunks is resident). Watch it against liveChunks over a leg: if
 		// it grows while liveChunks plateaus, BuildChunkRuns's per-publication
@@ -5095,7 +5101,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       AccumTicks > 0 ? AccumRecomputeMs / AccumTicks : 0.0);
 	// S0-2: apply throughput for THIS window, alongside the leg-long mean
 	// TotalChunksLoaded already gives on the "Voxel streaming" line above.
-	// §2.2's testable prediction is that this decays monotonically across a
+	// Â§2.2's testable prediction is that this decays monotonically across a
 	// leg as Allocations.Num() (see GetNumAllocationsEver) grows -- this is
 	// the number that decay would show up in. Divides by the actual elapsed
 	// window (ThisLogWindowSeconds), not the nominal LogIntervalSeconds, so a
@@ -5256,7 +5262,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       WidestAdmissionCutoffM(),
 	       (long long)CandidatesRejectedSinceLog, (long long)RecordsDroppedSinceLog);
 
-	// Wave S0 (docs/speculative-generation-plan.md §4, executing T0-1). Two
+	// Wave S0 (docs/speculative-generation-plan.md Â§4, executing T0-1). Two
 	// questions in one line, both of which the open P0 currently answers by
 	// assumption:
 	//
@@ -6126,123 +6132,36 @@ int64 FVoxelWorldImpl::FootprintSurfaceUpperBoundMm(int32 Level, int32 ChunkX, i
 {
 	using namespace VoxelCoords;
 
-	const int64 PxMm = Tiles ? int64(Tiles->pixelSizeMm()) : 0;
-	if (PxMm <= 0)
-	{
-		return INT64_MAX; // no tile raster to bound against
-	}
-
-	// Footprint in millimetres, level-0 datum (the amplifier's only unit).
-	const int64 LevelScale = int64(1) << Level;
-	const int64 SpanMm = int64(ChunkEdgeVoxels) * LevelScale * vxc::kVoxelSizeMm;
-	const int64 X0Mm = (int64(ChunkX) * ChunkEdgeVoxels) * LevelScale * vxc::kVoxelSizeMm;
-	const int64 Y0Mm = (int64(ChunkY) * ChunkEdgeVoxels) * LevelScale * vxc::kVoxelSizeMm;
-	const int64 X1Mm = X0Mm + SpanMm - 1;
-	const int64 Y1Mm = Y0Mm + SpanMm - 1;
-
-	// Every tile-pixel CORNER of every pixel cell the footprint touches. The
-	// bilinear base over a cell is a convex combination of that cell's four
-	// corners, so the largest corner elevation over this set bounds the base
-	// term exactly -- no sampling density argument required, and no dependence
-	// on where inside a pixel the footprint happens to fall. This is precisely
-	// the "interior extremes between the corners" term that the 4-corner column
-	// sampling below cannot see.
-	const int64 Px0 = vxc::floorDiv(X0Mm, PxMm);
-	const int64 Px1 = vxc::floorDiv(X1Mm, PxMm) + 1;
-	const int64 Py0 = vxc::floorDiv(Y0Mm, PxMm);
-	const int64 Py1 = vxc::floorDiv(Y1Mm, PxMm) + 1;
-	if ((Px1 - Px0 + 1) > VoxelSkyBand::kMaxPixelCornersPerAxis ||
-	    (Py1 - Py0 + 1) > VoxelSkyBand::kMaxPixelCornersPerAxis)
-	{
-		return INT64_MAX; // decline rather than pay an unbounded read count
-	}
-
-	// Read the corner elevations once. Everything below is derived from this
-	// grid -- no further sampler traffic, and the grid is at most 16x16.
-	const int32 NX = int32(Px1 - Px0 + 1);
-	const int32 NY = int32(Py1 - Py0 + 1);
-	int64 Elev[VoxelSkyBand::kMaxPixelCornersPerAxis * VoxelSkyBand::kMaxPixelCornersPerAxis];
-	for (int32 Iy = 0; Iy < NY; ++Iy)
-	{
-		for (int32 Ix = 0; Ix < NX; ++Ix)
-		{
-			Elev[Ix + NX * Iy] = Tiles->elevationMm(Px0 + Ix, Py0 + Iy);
-		}
-	}
-
-	// (a) EXACT maximum of the bilinear base over the footprint.
+	// DELEGATES to vxc::Amplifier::surfaceUpperBoundMm rather than reimplementing
+	// the bound. This function used to carry its own copy, and that copy went
+	// wrong twice, both times silently:
 	//
-	// Taking the largest corner elevation would be a valid bound but a badly
-	// loose one whenever the footprint is small relative to a 30 m tile pixel
-	// (levels 0-3), because the nearest pixel corner can be 30 m of relief away
-	// from any ground the footprint actually contains. Instead: the base
-	// restricted to one pixel cell is bilinear, and a bilinear patch is LINEAR
-	// along each axis with the other fixed, so its maximum over any axis-aligned
-	// sub-rectangle is attained at a CORNER of that sub-rectangle. Clip the
-	// footprint to each pixel cell it touches and evaluate the cell's own
-	// bilinear form at the four clipped corners -- exact, and at most 4x4 cells.
+	//   * at worldgen v6 the detail allowance stopped matching. It was derived
+	//     from kDetailAmplitudeSumMm = 1800+700+260+100, the v1 octave table,
+	//     while the real table became 2600+1100+500+190+60. The bound was
+	//     therefore allowing LESS detail than the amplifier can produce.
+	//   * at worldgen v9 the base term stopped matching. It computed a BILINEAR
+	//     maximum, while the carrier is now a cubic B-spline -- which is not
+	//     bounded by the bilinear value, since near a local minimum it sits
+	//     above it.
 	//
-	// (b) Bound on the detail term using this footprint's OWN slope.
+	// Either way the failure mode is the same and it is not a lost optimisation:
+	// IsChunkProvablyAllAir feeds the streaming skip, so an under-stated upper
+	// bound means a chunk containing terrain is never generated. A hole in the
+	// world.
 	//
-	// slopeScaleQ10 clamps to [256, 4096] q10, and the absolute worst case
-	// (4096, i.e. 11.44 m of detail) needs ~86 m of relief across a single 30 m
-	// pixel -- a cliff. slopeMmPerPx is |e10-e00| + |e01-e00| at the pixel the
-	// column falls in, and every such pixel is in the grid just read, so the
-	// maximum over the footprint is available exactly. On ordinary terrain this
-	// takes the detail allowance from 11.44 m to 1-3 m, which is the difference
-	// between the bound binding at level 4 and not.
-	int64 MaxBaseMm = INT64_MIN;
-	int64 MaxSlopeMmPerPx = 0;
-	for (int32 Iy = 0; Iy + 1 < NY; ++Iy)
-	{
-		for (int32 Ix = 0; Ix + 1 < NX; ++Ix)
-		{
-			const int64 E00 = Elev[Ix + NX * Iy];
-			const int64 E10 = Elev[(Ix + 1) + NX * Iy];
-			const int64 E01 = Elev[Ix + NX * (Iy + 1)];
-			const int64 E11 = Elev[(Ix + 1) + NX * (Iy + 1)];
-
-			// Amplifier::evalSurface's slope term for this pixel, verbatim.
-			MaxSlopeMmPerPx = FMath::Max(MaxSlopeMmPerPx,
-			                             FMath::Abs(E10 - E00) + FMath::Abs(E01 - E00));
-
-			// Footprint clipped to this cell, in cell-local mm [0, PxMm].
-			const int64 CellX0Mm = (Px0 + Ix) * PxMm;
-			const int64 CellY0Mm = (Py0 + Iy) * PxMm;
-			const int64 Lx0 = FMath::Max<int64>(0, X0Mm - CellX0Mm);
-			const int64 Lx1 = FMath::Min<int64>(PxMm, X1Mm - CellX0Mm);
-			const int64 Ly0 = FMath::Max<int64>(0, Y0Mm - CellY0Mm);
-			const int64 Ly1 = FMath::Min<int64>(PxMm, Y1Mm - CellY0Mm);
-			if (Lx0 > Lx1 || Ly0 > Ly1)
-			{
-				continue; // footprint does not reach this cell
-			}
-
-			const int64 Fxs[2] = {Lx0, Lx1};
-			const int64 Fys[2] = {Ly0, Ly1};
-			for (int64 Fx : Fxs)
-			{
-				for (int64 Fy : Fys)
-				{
-					// evalSurface's bilinear form, same integer math. Its
-					// division truncates toward zero, so +1 covers the one-mm
-					// the truncation can move the value upward for a negative
-					// numerator -- keeping this an upper bound unconditionally.
-					const int64 Gx = PxMm - Fx, Gy = PxMm - Fy;
-					const int64 BaseMm = ((E00 * Gx + E10 * Fx) * Gy + (E01 * Gx + E11 * Fx) * Fy) / (PxMm * PxMm) + 1;
-					MaxBaseMm = FMath::Max(MaxBaseMm, BaseMm);
-				}
-			}
-		}
-	}
-	if (MaxBaseMm == INT64_MIN)
-	{
-		return INT64_MAX; // degenerate grid (single corner): decline to bound
-	}
-
-	const int64 SlopeScaleQ10 = FMath::Clamp<int64>(512 + MaxSlopeMmPerPx / 24, 256, VoxelSkyBand::kMaxSlopeScaleQ10);
-	const int64 MaxDetailMm = VoxelSkyBand::kDetailAmplitudeSumMm * SlopeScaleQ10 / 1024;
-	return MaxBaseMm + MaxDetailMm;
+	// The comment on the old constants block predicted this exactly -- "this
+	// belongs in voxel-core ... so a change to kDetailOctaves cannot silently
+	// invalidate it". Amplifier::surfaceUpperBoundMm is that follow-up, and
+	// solidBelowBoundMm below already delegated to its sibling; this copy was
+	// simply left behind. Deleting it, rather than re-mirroring it, is the point.
+	//
+	// Both sides use INT64_MAX to decline (vxc::kSurfaceBoundDeclined), so every
+	// caller is unchanged.
+	const int64 SpanVox = int64(ChunkEdgeVoxels) * (int64(1) << Level);
+	const int64 Vx0 = int64(ChunkX) * SpanVox;
+	const int64 Vy0 = int64(ChunkY) * SpanVox;
+	return Voxels.amplifier().surfaceUpperBoundMm(Vx0, Vy0, Vx0 + SpanVox - 1, Vy0 + SpanVox - 1);
 }
 
 bool FVoxelWorldImpl::IsChunkProvablyAllAir(const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const
@@ -9750,7 +9669,7 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	// 64M = 49,349 peak chunks x ~902 quads/chunk (44.5M) + ~44% headroom for the
 	// fragmentation first-fit produces under this churn. 512 MB at 8 B/quad, plus
 	// the same again in the chunk-id buffer and 12 B/quad of CPU shadow -- see
-	// docs/speculative-generation-plan.md §2.6 for the full memory arithmetic and
+	// docs/speculative-generation-plan.md Â§2.6 for the full memory arithmetic and
 	// why the shadow is what makes further raises expensive.
 	//
 	// SIZED 2026-07-28 FROM A MEASURED PLATEAU, replacing the plan's 104M guess.
@@ -10503,12 +10422,12 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			// dropped.
 			UE_LOG(LogVoxelStream, Error,
 			       TEXT("voxel.GPU.MeshDirectToPool: chunk L%d (%d,%d,%d) acquired a component while its GPU "
-			            "mesh was in flight — %d quads DROPPED rather than draw the same chunk twice."),
+			            "mesh was in flight â€” %d quads DROPPED rather than draw the same chunk twice."),
 			       Key.Level, Key.Key.X, Key.Key.Y, Key.Key.Z, NumQuads);
 			return false;
 		}
 
-		// Wave S0 stage timing (docs/speculative-generation-plan.md §4, executing
+		// Wave S0 stage timing (docs/speculative-generation-plan.md Â§4, executing
 		// T0-1), gated on voxel.Stream.ApplyStageStats: these are
 		// FPlatformTime::Seconds pairs on a path that runs up to 64 times a frame,
 		// which is exactly the kind of instrument that becomes what it measures.
@@ -10578,7 +10497,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			// successful run with disappointing numbers.
 			bLoggedFirstDirectChunk = true;
 			UE_LOG(LogVoxelStream, Log,
-			       TEXT("voxel.GPU.MeshDirectToPool: first chunk written GPU-side — level=%d chunk=(%d,%d,%d) "
+			       TEXT("voxel.GPU.MeshDirectToPool: first chunk written GPU-side â€” level=%d chunk=(%d,%d,%d) "
 			            "quads=%d, no readback, no CPU staging, no re-upload."),
 			       Key.Level, Key.Key.X, Key.Key.Y, Key.Key.Z, NumQuads);
 		}
@@ -10591,7 +10510,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		// UpdateChunk path never sampled params and still must not, or this
 		// instrument would add a full Amplifier::column to every re-mesh.
 		//
-		// §1c is the reason it gets its own bucket: SampleChunkParamsForPool runs
+		// Â§1c is the reason it gets its own bucket: SampleChunkParamsForPool runs
 		// GetSurfaceHeightUU, which is a whole column with the cave lattice and
 		// cavern passes, on the GAME THREAD, once per applied chunk -- for a value
 		// the producing job already computed. If this bucket is large, T1-3's
@@ -10619,7 +10538,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			if (!bWasFirstLoad)
 			{
 				UE_LOG(LogVoxelStream, Error,
-				       TEXT("voxel.GPU.MeshDirectToPool: chunk L%d (%d,%d,%d) already holds pool slot %d — the "
+				       TEXT("voxel.GPU.MeshDirectToPool: chunk L%d (%d,%d,%d) already holds pool slot %d â€” the "
 				            "direct path has no in-place update, so %d quads were DROPPED. A re-mesh reached "
 				            "the fork, which is supposed to be impossible."),
 				       Key.Level, Key.Key.X, Key.Key.Y, Key.Key.Z, Rec.PoolSlot, NumQuads);
@@ -10730,7 +10649,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	}
 
 	// NOT TIMED, deliberately. The component-renderer branch is the CONTROL arm,
-	// and S0's question is entirely about the pooled path -- §1a's claim is that
+	// and S0's question is entirely about the pooled path -- Â§1a's claim is that
 	// the POOLED apply carries an O(resident) tax the component apply does not.
 	// The comparison that answers it is already the head-to-head's avgChunks/s;
 	// a stage split here would need its own timed-apply counter and a scope guard
@@ -13310,7 +13229,7 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 	// Resolve the terrain material once (deliverable 4: load by path,
 	// fallback to the engine default material, never crash).
-	// -VoxelDefaultMaterial: diagnostic switch — skip the authored material
+	// -VoxelDefaultMaterial: diagnostic switch â€” skip the authored material
 	// and use the engine default, to isolate material bugs from geometry
 	// bugs (an invisible-terrain failure with the authored material and a
 	// visible one with the default indicts the asset, not the mesh).
