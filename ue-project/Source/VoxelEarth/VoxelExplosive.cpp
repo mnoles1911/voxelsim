@@ -43,7 +43,9 @@ UVoxelBlastCameraShake::UVoxelBlastCameraShake(const FObjectInitializer& ObjectI
 
 AVoxelExplosive::AVoxelExplosive()
 {
-	PrimaryActorTick.bCanEverTick = false;
+	// Ticks so it can resolve its own collision against the voxel world -- see
+	// AVoxelExplosive::Tick. Nothing else here needs a tick.
+	PrimaryActorTick.bCanEverTick = true;
 
 	BlastMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("BlastMesh"));
 	SetRootComponent(BlastMesh);
@@ -103,11 +105,70 @@ void AVoxelExplosive::Launch(const FVector& InitialVelocityUUPerSec)
 		Projectile->Velocity = InitialVelocityUUPerSec;
 	}
 
+	// Roll this charge's radius once, here, rather than at detonation. The carve
+	// goes through the edit log, so the radius has to be a decided value that
+	// travels with the edit -- re-rolling it at detonation on each machine would
+	// make two clients carve different craters from the same entry.
+	ThisChargeRadiusUU = BlastRadiusUU + FMath::FRandRange(-BlastRadiusVarianceUU, BlastRadiusVarianceUU);
+
+	LastTickLocationUU = GetActorLocation();
+
 	UWorld* World = GetWorld();
 	if (World)
 	{
 		World->GetTimerManager().SetTimer(FuseTimerHandle, this, &AVoxelExplosive::Detonate, FuseSeconds, false);
 	}
+}
+
+void AVoxelExplosive::Tick(float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+
+	if (bLanded)
+	{
+		return; // already resting on terrain; the fuse does the rest
+	}
+
+	UWorld* World = GetWorld();
+	UVoxelWorldSubsystem* Subsystem = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	if (!Subsystem)
+	{
+		return;
+	}
+
+	const FVector Now = GetActorLocation();
+	const FVector Segment = Now - LastTickLocationUU;
+	const double Travelled = Segment.Size();
+	if (Travelled <= KINDA_SMALL_NUMBER)
+	{
+		LastTickLocationUU = Now;
+		return;
+	}
+
+	// Test the SEGMENT actually travelled, not the endpoint. A charge thrown at
+	// the top of the speed range covers well over a voxel per frame, so an
+	// endpoint test would let it tunnel through a thin roof and detonate in the
+	// open air below -- which is indistinguishable, from the player's side, from
+	// the falling-through bug this replaces.
+	FVector HitVoxelCenter, PrevVoxelCenter;
+	if (Subsystem->RaycastVoxelWorld(LastTickLocationUU, Segment, Travelled, HitVoxelCenter, PrevVoxelCenter))
+	{
+		// Rest in the last EMPTY voxel before the solid one, so the charge sits
+		// on the surface rather than inside it. Detonating from inside would
+		// bury the crater's centre and carve a hollow under the ground instead
+		// of a visible bowl in it.
+		SetActorLocation(PrevVoxelCenter);
+		if (Projectile)
+		{
+			Projectile->StopMovementImmediately();
+			Projectile->Deactivate();
+		}
+		bLanded = true;
+		LastTickLocationUU = PrevVoxelCenter;
+		return;
+	}
+
+	LastTickLocationUU = Now;
 }
 
 void AVoxelExplosive::Detonate()
@@ -117,9 +178,23 @@ void AVoxelExplosive::Detonate()
 	{
 		if (UVoxelWorldSubsystem* Subsystem = World->GetSubsystem<UVoxelWorldSubsystem>())
 		{
-			const int32 Removed = Subsystem->CarveSphere(GetActorLocation(), BlastRadiusUU, BlastJitterUU);
-			UE_LOG(LogVoxelEarth, Log, TEXT("VoxelExplosive detonated at (%.0f, %.0f, %.0f): removed %d voxels."),
-			       GetActorLocation().X, GetActorLocation().Y, GetActorLocation().Z, Removed);
+			const int32 Removed = Subsystem->CarveSphere(GetActorLocation(), ThisChargeRadiusUU, BlastJitterUU);
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("VoxelExplosive detonated at (%.0f, %.0f, %.0f): r=%.0f UU (+/-%.0f jitter), landed=%s, ")
+			       TEXT("removed %d voxels."),
+			       GetActorLocation().X, GetActorLocation().Y, GetActorLocation().Z, ThisChargeRadiusUU,
+			       BlastJitterUU, bLanded ? TEXT("y") : TEXT("n"), Removed);
+
+			// removed==0 with landed=y means the charge came to rest against
+			// terrain and then carved nothing, which should be impossible --
+			// worth a warning rather than a silent no-op, because that is
+			// exactly how the fall-through bug presented (a detonation log line
+			// that looked fine next to a crater that did not exist).
+			if (Removed == 0)
+			{
+				UE_LOG(LogVoxelEarth, Warning,
+				       TEXT("VoxelExplosive removed 0 voxels -- detonated in open air or against unstreamed terrain."));
+			}
 		}
 
 		// Brief camera shake on whichever local player controller exists (no
