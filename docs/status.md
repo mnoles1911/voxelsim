@@ -2672,6 +2672,14 @@ touched brick (~1.6M queries/tick) instead of only those the frontier reaches
 (~832K). With the memo ON that is one warm-up tick; with the memo OFF it is a
 ~2x regression on the default voxel-core path. Not landed on that trade-off.
 
+**The memo-OFF path (voxel-core's default, and what CI and the goldens run)
+improves too, and by a different mechanism**: 380.1 -> 138.0 ms/tick on the
+same band, 2.75x. There the flood really is the tick — 328 of 486 accounted ms
+— so finding 4's constant-factor work is what shows up, not finding 1's. ONE
+clean pair only (the box was saturated by other sessions' editor runs when this
+was taken), versus three for the memo-ON headline; treat it as a
+no-regression check with a large margin rather than a pinned figure.
+
 **Verification.** 249/249 `vxc_tests` (MSVC 14.51 / VS 2026, Release, `/W4
 /WX` clean). Both goldens unmoved. Float-ban clean: no `float`/`double` in
 `waterca.h`/`waterca.cpp` (the one match is the word "float-ban" in a
