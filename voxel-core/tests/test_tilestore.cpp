@@ -1354,12 +1354,20 @@ VXC_TEST(amplifier_over_fine_control_lattice_is_deterministic) {
     Amplifier ampA(seed, samplerA), ampB(seed, samplerB), ampHigh(seed, samplerHigh);
 
     // Amplifier::column takes VOXEL coordinates (100 mm each), so these span
-    // 40 m .. 400 m, i.e. fine pixels 21..213 at 1875 mm — stencils 20..215,
-    // well inside the one loaded 8192-pixel tile, the same margin the v1 test
-    // keeps for the v9 stencil contract.
+    // 120 m .. 480 m, i.e. fine pixels 64..256 at 1875 mm.
+    //
+    // v13 MOVED THE WINDOW IN, from 40 m, and the reason is a real widening of
+    // the read contract rather than a flaky test. The detail gate now reads the
+    // raster's relief at a 30 m PHYSICAL baseline, which is +/-16 pixels on this
+    // tier (carrier.h), and Amplifier::column ALSO evaluates the surface at a
+    // cavern site's own xy up to kCavernMaxReachMm (~19 pixels) away -- so a
+    // column at pixel 21 could reach pixel -14, off the single loaded tile, and
+    // the missingTileQueries check below caught it. Starting at pixel 64 keeps
+    // the whole read set inside the tile with room to spare, which is what this
+    // test has always been about.
     Digest digestA, digestB;
-    for (int64_t vy = 400; vy <= 4000; vy += 400) {
-        for (int64_t vx = 400; vx <= 4000; vx += 400) {
+    for (int64_t vy = 1200; vy <= 4800; vy += 400) {
+        for (int64_t vx = 1200; vx <= 4800; vx += 400) {
             const ColumnSample ca = ampA.column(vx, vy);
             const ColumnSample cb = ampB.column(vx, vy);
             digestA.u32(static_cast<uint32_t>(ca.surfaceMm));

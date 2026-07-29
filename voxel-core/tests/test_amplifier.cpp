@@ -212,7 +212,7 @@ VXC_TEST(amplifier_golden_digest) {
     // the rework had not taken effect.
     // (was 0xA29A7A767DC1543B at v5, 0x81785278E4DFCF67 at v3/v4,
     //  0x73B43CAE621CA286 at v2)
-    CHECK_EQ(d.h, 0xDFD9B7E6BD9ADE51ull);
+    CHECK_EQ(d.h, 0xC19A6FBF89A4186Eull);
 }
 
 // --- C4: the cavern pass is actually wired into the amplifier ---------------
@@ -475,7 +475,7 @@ VXC_TEST(amplifier_deep_column_golden_digest) {
     // (was 0xF88B88DB9D9341AA at v5, 0x3384824A6CF22450 at v6..v11; and
     //  0xB125856533E5C174 at the 700 mm cut of v12, which was measured and
     //  rejected before it shipped -- see the Wave C retry notes)
-    CHECK_EQ(d.h, 0xFB0F93A13E05B1F4ull);
+    CHECK_EQ(d.h, 0xEFFFBD7A5AB0BB9Eull);
 }
 
 VXC_TEST(generated_brick_matches_pointwise_queries) {
@@ -933,7 +933,7 @@ VXC_TEST(amplifier_surface_bound_golden_digest) {
     // samples) and by the real-tile sweep in vxc_terrainprobe.
     // (was 0x5588EBCD842ECE3D at v5, 0xBD833B557B0EC0AE at v6..v11; the entries
     //  are now +350 mm rather than the +700 the first cut of v12 gave them)
-    CHECK_EQ(d.h, 0x1AAFFD0BF8CAF324ull);
+    CHECK_EQ(d.h, 0x089A97E5D56E648Eull);
 }
 
 // ---------------------------------------------------------------------------
@@ -1077,7 +1077,15 @@ VXC_TEST(amplifier_solid_below_bound_has_no_air_beneath_it) {
     // And tier 1 (no cavern in reach, 42.8 m envelope) must actually be firing:
     // a flat 91 m envelope everywhere would leave a worst-case headroom near the
     // 38 m this measured before the two-tier split, not ~11 m.
-    CHECK(worstHeadroomMm < 20000);
+    // v13 raised this from 20000; measured 26085 mm. The bound's detail
+    // allowance now takes the relief gate at its CLAMP rather than at the
+    // footprint's own value -- the gate's argument is the raster's relief at a
+    // 30 m baseline and the Lipschitz machinery in surfaceBoundsMm bounds first
+    // differences over the footprint, not that. So gentle footprints, which
+    // used to get a tight slope-derived allowance, now get the ceiling. It is
+    // still far under the ~38 m a flat 91 m cavern envelope everywhere would
+    // give, which is what this check exists to detect.
+    CHECK(worstHeadroomMm < 32000);
     CHECK(worstHeadroomMm >= 0);
 }
 
@@ -1140,6 +1148,6 @@ VXC_TEST(amplifier_solid_below_bound_golden_digest) {
     // work to do, since the band genuinely puts air below surfaceMm.
     // (was 0xE9D395DF74D61495 at v5, 0x6E19AE5BC47B4E45 at v6..v11; -350 mm now,
     //  not the -700 the first cut of v12 gave it)
-    CHECK_EQ(d.h, 0x12C57186AD11F4D4ull);
+    CHECK_EQ(d.h, 0x7A19C5EB6C8A92FAull);
 }
 

@@ -214,10 +214,26 @@ ProbeCarrier evalProbeCarrier(ITileSampler& tiles, int64_t vx, int64_t vy) {
     const int64_t pxMm = tiles.pixelSizeMm();
     const int64_t px = floorDiv(xMm, pxMm), py = floorDiv(yMm, pxMm);
     const int64_t fx = xMm - px * pxMm, fy = yMm - py * pxMm;
+    // v13: PREFILTERED on a sample tier, exactly as amplifier.cpp's cachedStencil
+    // is. This probe's whole job is to be the carrier without the octaves, and a
+    // copy that skipped the prefilter would report the un-prefiltered carrier's
+    // seam and roughness numbers against an amplified surface that no longer has
+    // them -- the same class of mislabelled measurement this file's own header
+    // warns about.
     int64_t cp[16];
-    for (int j = 0; j < 4; ++j)
-        for (int i = 0; i < 4; ++i)
-            cp[i + 4 * j] = tiles.elevationMm(px - 1 + i, py - 1 + j);
+    if (carrierPrefiltersSamples(pxMm)) {
+        constexpr int64_t S = kCarrierPrefilterSpan;
+        int64_t raw[S * S];
+        for (int64_t b = 0; b < S; ++b)
+            for (int64_t a = 0; a < S; ++a)
+                raw[a + S * b] =
+                    tiles.elevationMm(px + kCarrierPrefilterLo + a, py + kCarrierPrefilterLo + b);
+        carrierPrefilterStencil(raw, cp);
+    } else {
+        for (int j = 0; j < 4; ++j)
+            for (int i = 0; i < 4; ++i)
+                cp[i + 4 * j] = tiles.elevationMm(px - 1 + i, py - 1 + j);
+    }
 
     const int64_t tx = fx * kCarrierT / pxMm, ty = fy * kCarrierT / pxMm;
     const ProbeW4 wx = probeValueW(tx), wy = probeValueW(ty);
@@ -1347,9 +1363,23 @@ int64_t probeCurvatureQ10(ITileSampler& tiles, int64_t vx, int64_t vy) {
     const int64_t xMm = vx * kVoxelSizeMm, yMm = vy * kVoxelSizeMm;
     const int64_t pxMm = tiles.pixelSizeMm();
     const int64_t px = floorDiv(xMm, pxMm), py = floorDiv(yMm, pxMm);
+    // v13: prefiltered, for the reason stated on this function -- a gate
+    // calibration is meaningless unless the quantity measured is bit-identical
+    // to the quantity the gate reads, and the gate reads the PREFILTERED
+    // stencil's curvature.
     int64_t cp[16];
-    for (int j = 0; j < 4; ++j)
-        for (int i = 0; i < 4; ++i) cp[i + 4 * j] = tiles.elevationMm(px - 1 + i, py - 1 + j);
+    if (carrierPrefiltersSamples(pxMm)) {
+        constexpr int64_t S = kCarrierPrefilterSpan;
+        int64_t raw[S * S];
+        for (int64_t b = 0; b < S; ++b)
+            for (int64_t a = 0; a < S; ++a)
+                raw[a + S * b] =
+                    tiles.elevationMm(px + kCarrierPrefilterLo + a, py + kCarrierPrefilterLo + b);
+        carrierPrefilterStencil(raw, cp);
+    } else {
+        for (int j = 0; j < 4; ++j)
+            for (int i = 0; i < 4; ++i) cp[i + 4 * j] = tiles.elevationMm(px - 1 + i, py - 1 + j);
+    }
     const CarrierCurvature c =
         evalCarrierCurvature(cp, xMm - px * pxMm, yMm - py * pxMm, pxMm);
     return carrierCurvatureMmPerM2Q10(c, pxMm);

@@ -171,7 +171,17 @@ inline constexpr int64_t kSurfaceLowerBoundDeclined = INT64_MIN;
 // If a future tier ever pushes this past ~128 (128*128*8 = 128 KB) the grid
 // should move to a static thread_local scratch buffer instead of growing
 // further on the stack. At 64 it does not need to.
-inline constexpr int64_t kSurfaceBoundMaxCornersPerAxis = 64;
+//  * 72 is v13's PREFILTER. On a tier that ships raster samples the bound has to
+//    materialise the same control lattice evalSurface does, which means reading
+//    a halo of kCarrierPrefilterRadius raw samples around the control grid --
+//    nx + 8 rather than nx. Keeping the CONTROL budget where it was (the 1.7 km
+//    footprint that must be accepted and the 2.0 km one that must decline are
+//    both pinned in test_amplifier.cpp) therefore needs the array to hold
+//    nx + 8 = 68. 72 is that, rounded. The 1.875 m fine tier is unaffected: it
+//    ships control points, so it takes no halo and still needs 62.
+//    The haloed raw grid is a thread_local scratch, not a second stack array --
+//    see surfaceBoundsMm -- so only `elev` grows, from 32 KB to 41.5 KB.
+inline constexpr int64_t kSurfaceBoundMaxCornersPerAxis = 72;
 
 class Amplifier {
 public:

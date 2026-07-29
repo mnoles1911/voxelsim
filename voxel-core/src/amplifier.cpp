@@ -113,27 +113,68 @@ int32_t cachedElevationMm(uint64_t amp, ITileSampler& tiles, int64_t px, int64_t
 // Bit-identical by construction: it returns the same values cachedElevationMm
 // would have, just fetched once. Eight slots because a chunk footprint touches
 // at most 2x2 cells (4), with headroom for the bound's wider walk.
+//
+// v13: the slot now also carries the cell's RELIEF (carrier.h), which is a
+// function of the same cell and costs four more reads, and the control points
+// are PREFILTERED on a tier that ships samples. Both are per-cell, so both
+// belong behind the same memo and neither adds a per-column read.
 constexpr uint32_t kStencilSlots = 8;
 
 struct StencilSlot {
     uint64_t amp = 0;
     int64_t px = 0, py = 0;
     int64_t cp[16] = {};
+    int64_t reliefMm = 0;
 };
 
-const int64_t* cachedStencil(uint64_t amp, ITileSampler& tiles, int64_t px, int64_t py) {
+// The 4x4 control stencil for cell (px, py) and the cell's landform relief.
+//
+// THE PREFILTER IS APPLIED HERE, ONCE PER CELL, and not inside evalCarrier:
+// evalCarrier's contract is "given control points, evaluate the spline", and
+// the question of whether a tier ships control points or samples belongs to the
+// tile interface, not to the evaluator. carrier.h's carrierPrefiltersSamples is
+// the single place that decides.
+const StencilSlot& cachedStencilSlot(uint64_t amp, ITileSampler& tiles, int64_t px,
+                                     int64_t py) {
     static thread_local StencilSlot slots[kStencilSlots];
     VXC_MEMO_COUNT(stencilProbes);
     StencilSlot& s = slots[slotIndex(amp, px, py, kStencilSlots)];
-    if (s.amp == amp && s.px == px && s.py == py) return s.cp;
+    if (s.amp == amp && s.px == px && s.py == py) return s;
     VXC_MEMO_COUNT(stencilMisses);
-    for (int j = 0; j < 4; ++j)
-        for (int i = 0; i < 4; ++i)
-            s.cp[i + 4 * j] = cachedElevationMm(amp, tiles, px - 1 + i, py - 1 + j);
+
+    const int64_t pxMm = tiles.pixelSizeMm();
+    if (carrierPrefiltersSamples(pxMm)) {
+        constexpr int64_t S = kCarrierPrefilterSpan;
+        int64_t raw[S * S];
+        for (int64_t b = 0; b < S; ++b)
+            for (int64_t a = 0; a < S; ++a)
+                raw[a + S * b] = cachedElevationMm(amp, tiles, px + kCarrierPrefilterLo + a,
+                                                   py + kCarrierPrefilterLo + b);
+        carrierPrefilterStencil(raw, s.cp);
+    } else {
+        for (int j = 0; j < 4; ++j)
+            for (int i = 0; i < 4; ++i)
+                s.cp[i + 4 * j] = cachedElevationMm(amp, tiles, px - 1 + i, py - 1 + j);
+    }
+
+    // Relief across a fixed 30 m PHYSICAL baseline, from the RAW raster rather
+    // than from the prefiltered control points. The raster is the measurement;
+    // the control points are a representation of it, and prefiltering amplifies
+    // exactly the high frequencies the relief statistic is trying not to be
+    // dominated by.
+    const int64_t L = carrierReliefLagPx(pxMm);
+    s.reliefMm = carrierReliefMm(cachedElevationMm(amp, tiles, px - L, py),
+                                 cachedElevationMm(amp, tiles, px + L, py),
+                                 cachedElevationMm(amp, tiles, px, py - L),
+                                 cachedElevationMm(amp, tiles, px, py + L));
     s.amp = amp;
     s.px = px;
     s.py = py;
-    return s.cp;
+    return s;
+}
+
+const int64_t* cachedStencil(uint64_t amp, ITileSampler& tiles, int64_t px, int64_t py) {
+    return cachedStencilSlot(amp, tiles, px, py).cp;
 }
 
 // The climate 2x2 blend block, memoized as a block for the same reason and
@@ -435,8 +476,8 @@ constexpr Octave kDetailOctaves[] = {
     // terracing artifact this band exists to break up. Cutting the two octaves
     // that are actually too steep is strictly the better trade.
     {1600, 500},
-    {400, 60},
-    {200, 15},
+    {400, 90},
+    {200, 25},
 };
 constexpr uint32_t kDetailOctaveCount = sizeof(kDetailOctaves) / sizeof(kDetailOctaves[0]);
 
@@ -480,8 +521,8 @@ constexpr Octave kFineDetailOctaves[] = {
     // reading as long terrace runs at 10 cm voxels, and gating it on slope would
     // undo exactly that.
     {1600, 500},
-    {400, 60},
-    {200, 15},
+    {400, 90},
+    {200, 25},
 };
 constexpr uint32_t kFineDetailOctaveCount =
     sizeof(kFineDetailOctaves) / sizeof(kFineDetailOctaves[0]);
@@ -538,55 +579,65 @@ constexpr bool kAmpUnscaled = (kDetailAmplitudeScaleQ10 == 1024) &&
 constexpr int64_t kFineTierMaxPixelMm = 3750;
 constexpr bool isFineTier(int64_t pxMm) { return pxMm <= kFineTierMaxPixelMm; }
 
-// The band split, by index into the table above (which is ordered coarse to
-// fine). Octaves [0, kLandformOctaveCount) take the slope scale; the rest take
-// the microrelief scale.
+// --- THE BAND SPLIT, THREE BANDS AT v13 ------------------------------------
+//
+// By index into the tables above, which are ordered COARSE TO FINE, so the
+// ordering is load-bearing in three places now instead of two.
+//
+//   [0, kLandformOctaveCount)          SHAPING   relief gate x full curvature
+//   [.., n - kMaterialOctaveCount)     METRE     relief gate x half curvature
+//   [n - kMaterialOctaveCount, n)      MATERIAL  half curvature ONLY
+//
+// WHY THE THIRD BAND EXISTS. v12 had two, split by which GATE they took, and
+// the microrelief gate's 0.75 floor was doing two incompatible jobs: keeping
+// decimetre roughness alive on flat ground (right) and keeping METRE-scale
+// roughness alive on flat ground (wrong -- that is landform, and a plain has
+// none). Measured, the second job is most of why a finished plain read as six
+// times more ridged than a finished mountain: the 1.6 m octave at 0.75x is
+// 375 mm of relief at a wavelength a 1.875 m posting resolves, on ground whose
+// real relief over the same distance is a few tens of mm.
+//
+// So the 1.6 m octave moves under the landform gate with the rest of the
+// ladder, and only 0.4 m and 0.2 m -- clods, stones, the material itself --
+// stay ungated. Those two are below the resolution of every reference DTM this
+// was calibrated against, which is exactly why they must NOT be conditioned on
+// a landform statistic: nothing in the calibration can see them, and a term
+// nothing can see must not be allowed to move with something that can.
 constexpr uint32_t kLandformOctaveCount = 2;
-static_assert(kLandformOctaveCount < kDetailOctaveCount,
-              "both bands must be non-empty; evalSurface and the bound both split here");
+constexpr uint32_t kMaterialOctaveCount = 2;
+static_assert(kLandformOctaveCount + kMaterialOctaveCount < kDetailOctaveCount,
+              "all three bands must be non-empty; evalSurface and the bound both split here");
 
 // The divisor evalSurface applies to each octave's raw noise before scaling it
 // by the octave amplitude. Named because Amplifier::surfaceUpperBoundMm's
 // detail allowance is derived through the same constant.
 constexpr int64_t kDetailNoiseScale = 32768;
 
-// Slope scale in q10 fixed point (1024 == 1.0): flat ground damps detail,
-// steep ground amplifies it (scree/cliff roughness), clamped to [0.25, 4.0].
-constexpr int64_t kSlopeScaleMinQ10 = 256;
-constexpr int64_t kSlopeScaleMaxQ10 = 4096;
-// v9: argument is MM PER METRE (see carrierSlopeMmPerM). The coefficient is a
-// pure unit conversion of v8's `+ slopeMmPerPx / 24` at the scale-1 pixel --
-// 30000/24 mm per pixel is 5/4 per mm per metre -- so the tuned v8 behaviour is
-// preserved exactly at scale 1 and now MEANS THE SAME GRADE at every scale.
-constexpr int64_t slopeScaleQ10(int64_t slopeMmPerM) {
-    return clampi64(512 + slopeMmPerM * 5 / 4, kSlopeScaleMinQ10, kSlopeScaleMaxQ10);
-}
-
-// Microrelief scale in q10, for the fine band. Same SHAPE as slopeScaleQ10 â€”
-// nondecreasing in slope, saturating â€” and deliberately a different CURVE: it
-// never drops below 0.75, because ground roughness at the decimetre scale is a
-// property of the material, not of the gradient. Flat ground is still bumpy;
-// it is only the hillside-shaping octaves that should vanish when there is no
-// hillside. The narrower range (0.75..2.0 against the landform band's
-// 0.25..4.0) also keeps the surface upper bound from widening much: this band
-// is small in amplitude, and the bound pays for its maximum.
-// It is DELIBERATELY almost slope-flat. The first cut of this used
-// `768 + slope/64` clamped to 2.0, by analogy with slopeScaleQ10 â€” and that
-// was wrong for a reason worth recording. On a 45-degree slope the tile slope
-// term reaches ~60000 mm/px, which took the fine band to x1.66, i.e. roughly
-// +/-11 VOXELS of 0.2-1.6 m noise. In-engine that turned the mountainside
-// from machined corduroy into uniform rubble: a different artifact, not a
-// fix. Amplifying the fine band on steep ground was never the point of this
-// band â€” the FLOOR on flat ground is. Decimetre roughness is a property of
-// the material, not of the gradient, so the curve is now nearly constant and
-// the ceiling is 1.25 rather than 2.0.
-constexpr int64_t kMicroScaleMinQ10 = 768;  // 0.75
-constexpr int64_t kMicroScaleMaxQ10 = 1280; // 1.25
-// v9: MM PER METRE, same pure unit conversion as slopeScaleQ10 -- v8's
-// `+ slopeMmPerPx / 256` at a 30 m pixel is 15/128 per mm per metre.
-constexpr int64_t microScaleQ10(int64_t slopeMmPerM) {
-    return clampi64(768 + slopeMmPerM * 15 / 128, kMicroScaleMinQ10, kMicroScaleMaxQ10);
-}
+// --- THE GATE THAT REPLACED slopeScaleQ10 AND microScaleQ10 (v13) -----------
+//
+// Both are GONE. They are not retuned, not narrowed, not floored differently:
+// the quantity they were conditioned on was the wrong one, and no setting of a
+// gradient gate can express what they were being asked to express. carrier.h's
+// reliefScaleQ10 is the replacement and its derivation lives there, beside the
+// measurement it is conditioned on.
+//
+// THE MEASUREMENT THAT KILLED THEM, in one line:
+// docs/terrain-validation-2026-07.md measured this detail pass adding +207% to
+// a plain's 1.875 m mean slope and +3.3% to alpine's -- a factor of 63 -- and
+// the finished plain coming out six times more RIDGED than the finished
+// mountain. slopeScaleQ10 spans 1.9x between those two sites and microScaleQ10
+// spans 1.06x. The landform they sit on spans 25x. A gate cannot correct for a
+// quantity it does not measure.
+//
+// WHAT REPLACED THEM IS ONE GATE OVER BOTH BANDS, not two. The two-gate split
+// existed because the shaping band was supposed to vanish on flats while the
+// microrelief band was not; with relief as the argument that distinction is
+// already expressed -- relief is exactly zero on a plane and the gate's own
+// floor is what keeps decimetre roughness alive there. Two curves over one
+// argument would just be two calibrations to get wrong.
+//
+// The curvature gate is unchanged and still splits the two bands (full
+// excursion on shaping, half on microrelief); see evalSurface.
 
 // Final clamp on a surface elevation, in mm above sea level.
 constexpr int32_t kSurfaceClampMinMm = -8'000'000;
@@ -649,50 +700,62 @@ static_assert(detailAmplitudesArePositive(),
 // and the bound must do the same or it is not a bound. `landform` selects
 // which half of the table to sum; both are DERIVED from the same table and the
 // same kLandformOctaveCount split that evalSurface's loop uses.
-constexpr int64_t detailMaxMm(const Octave* tab, uint32_t n, uint32_t nLandform,
-                              bool landform) {
+// v13: `band` is 0 shaping / 1 metre / 2 material, matching the split above and
+// evalSurface's own loop.
+constexpr uint32_t bandOf(uint32_t i, uint32_t n, uint32_t nLandform) {
+    if (i < nLandform) return 0;
+    return i < n - kMaterialOctaveCount ? 1u : 2u;
+}
+constexpr int64_t detailMaxMm(const Octave* tab, uint32_t n, uint32_t nLandform, uint32_t band) {
     int64_t sum = 0;
     for (uint32_t i = 0; i < n; ++i) {
-        if ((i < nLandform) != landform) continue;
+        if (bandOf(i, n, nLandform) != band) continue;
         sum += kNoiseMax * scaledAmpMm(tab[i].amplitudeMm) / kDetailNoiseScale;
     }
     return sum;
 }
 constexpr int64_t kLandformMaxMm =
-    detailMaxMm(kDetailOctaves, kDetailOctaveCount, kLandformOctaveCount, true);
+    detailMaxMm(kDetailOctaves, kDetailOctaveCount, kLandformOctaveCount, 0);
+constexpr int64_t kMetreMaxMm =
+    detailMaxMm(kDetailOctaves, kDetailOctaveCount, kLandformOctaveCount, 1);
 constexpr int64_t kMicroMaxMm =
-    detailMaxMm(kDetailOctaves, kDetailOctaveCount, kLandformOctaveCount, false);
+    detailMaxMm(kDetailOctaves, kDetailOctaveCount, kLandformOctaveCount, 2);
 // Same derivation over the fine-tier table. The bound is selected at RUNTIME
 // from the sampler's pitch, not maxed over both tiers: taking the max would keep
 // the coarse ladder's 3.7 m landform allowance on a world that never evaluates
 // it, and the whole point of deleting those octaves is that the envelope
 // tightens -- which streaming feels as more effective trims.
 constexpr int64_t kFineLandformMaxMm =
-    detailMaxMm(kFineDetailOctaves, kFineDetailOctaveCount, kFineLandformOctaveCount, true);
+    detailMaxMm(kFineDetailOctaves, kFineDetailOctaveCount, kFineLandformOctaveCount, 0);
+constexpr int64_t kFineMetreMaxMm =
+    detailMaxMm(kFineDetailOctaves, kFineDetailOctaveCount, kFineLandformOctaveCount, 1);
 constexpr int64_t kFineMicroMaxMm =
-    detailMaxMm(kFineDetailOctaves, kFineDetailOctaveCount, kFineLandformOctaveCount, false);
-// NB there is deliberately no combined kDetailMaxMm: the two bands are scaled
-// by DIFFERENT factors (slopeScaleQ10 vs microScaleQ10), so a single summed
-// ceiling has no caller and clang's -Wunused-const-variable rejects it under
-// -Werror. Sum the two named constants at the point of use instead.
+    detailMaxMm(kFineDetailOctaves, kFineDetailOctaveCount, kFineLandformOctaveCount, 2);
+// NB there is deliberately no combined kDetailMaxMm: the three bands are scaled
+// by DIFFERENT factors, so a single summed ceiling has no caller and clang's
+// -Wunused-const-variable rejects it under -Werror. Sum the named constants at
+// the point of use instead.
 
 // (4) Tripwire. (3) keeps the bound SOUND across an octave-table edit on its
 // own; this makes such an edit impossible to do ACCIDENTALLY without reading
 // the derivation. Any change here also moves worldgen output â€” bump
 // kWorldGenVersion and regenerate goldens.
-static_assert(!kAmpUnscaled || (kDetailOctaveCount == 5 && kLandformMaxMm == 3698 && kMicroMaxMm == 572),
+static_assert(!kAmpUnscaled || (kDetailOctaveCount == 5 && kLandformMaxMm == 3698 &&
+                                kMetreMaxMm == 499 && kMicroMaxMm == 113),
               "kDetailOctaves changed. Amplifier::surfaceUpperBoundMm derives its "
               "detail allowance from the table, so the bound is still sound -- but "
               "re-read its derivation before updating these numbers, and remember an "
               "octave change is a worldgen change (bump kWorldGenVersion).");
-static_assert(!kAmpUnscaled || (kFineDetailOctaveCount == 4 && kFineLandformMaxMm == 899 && kFineMicroMaxMm == 572),
+static_assert(!kAmpUnscaled || (kFineDetailOctaveCount == 4 && kFineLandformMaxMm == 899 &&
+                                kFineMetreMaxMm == 499 && kFineMicroMaxMm == 113),
               "kFineDetailOctaves changed; same obligation as the coarse table above.");
-// The envelope TIGHTENS on a fine world -- 1646 mm against 3698 + 747 = 4445 mm
-// before gating -- because two synthesised landform octaves were replaced by one.
-// This is the plan's claim that the bound gets better, checked rather than
-// asserted: if an edit ever makes the fine ladder the LOOSER of the two, the
-// gating in (6) below is sized for the wrong table and the claim is stale.
-static_assert(kFineLandformMaxMm + kFineMicroMaxMm < kLandformMaxMm + kMicroMaxMm,
+// The envelope TIGHTENS on a fine world -- because two synthesised landform
+// octaves were replaced by one. This is the plan's claim that the bound gets
+// better, checked rather than asserted: if an edit ever makes the fine ladder
+// the LOOSER of the two, the gating in (6) below is sized for the wrong table
+// and the claim is stale.
+static_assert(kFineLandformMaxMm + kFineMetreMaxMm + kFineMicroMaxMm <
+                  kLandformMaxMm + kMetreMaxMm + kMicroMaxMm,
               "the fine-tier ladder is supposed to be a TIGHTER envelope than the "
               "coarse one; if it is not, re-read the band-ownership comment.");
 
@@ -749,72 +812,40 @@ static_assert(int64_t(kSurfaceClampMaxMm) * kCarrierValueDen < (int64_t(1) << 62
               "carrier stage product can overflow int64; do not widen the q10 fraction "
               "or the elevation range without redoing this bound.");
 
-// (5) slopeScaleQ10 is fed the footprint's MAXIMUM slope, and the bound needs
-// the result to be (a) never above kSlopeScaleMaxQ10 and (b) NONDECREASING in
-// its argument â€” otherwise the max-slope pixel is not the worst pixel. (b) is
-// true because `512 + s/24` is nondecreasing for s >= 0 (truncating division by
-// a positive divisor is monotone) and clampi64 is monotone. Check it by
-// exhaustive-enough sweep at compile time so that a reshaped formula â€” anything
-// with a fold, an abs(), or a negative coefficient â€” fails the build.
-// (MSVC's constexpr step budget is 2^20, so the sweep is two resolutions
-// rather than one: every single value across the whole range where the result
-// actually varies -- it saturates at slope 86'016 -- then a coarse sweep out to
-// 3 m of relief per pixel, well past anything an int32 elevation can produce.)
-// v9 note: the sweep range moved with the currency. In MM PER METRE
-// slopeScaleQ10 saturates at 2868 and microScaleQ10 at 4370, so sweeping every
-// single value to 5000 covers the whole range where either result varies; the
-// coarse tail runs to 200 000 mm/m (a 20 000% grade), far past anything an
-// int32 elevation over a tile pixel can produce.
-constexpr bool slopeScaleIsNondecreasing() {
-    int64_t prev = slopeScaleQ10(0);
-    for (int64_t s = 0; s <= 5000; ++s) {
-        const int64_t v = slopeScaleQ10(s);
-        if (v < prev || v > kSlopeScaleMaxQ10) return false;
-        prev = v;
-    }
-    for (int64_t s = 5000; s <= 200'000; s += 17) {
-        const int64_t v = slopeScaleQ10(s);
-        if (v < prev || v > kSlopeScaleMaxQ10) return false;
-        prev = v;
-    }
-    return true;
-}
-static_assert(slopeScaleIsNondecreasing(),
-              "slopeScaleQ10 must be nondecreasing and clamped above; "
-              "Amplifier::surfaceUpperBoundMm feeds it the footprint's maximum slope.");
-static_assert(slopeScaleQ10(1LL << 40) == kSlopeScaleMaxQ10,
-              "slopeScaleQ10 must saturate; a slope past the sweep in "
-              "slopeScaleIsNondecreasing must still clamp.");
-
-// (5b) The SAME two properties for microScaleQ10, which the bound feeds the
-// footprint's maximum slope in exactly the same way and for exactly the same
-// reason. Verified by the same exhaustive sweep rather than by asserting that
-// it "looks like" slopeScaleQ10 â€” it is a different curve with a different
-// divisor and a different floor, so it needs its own proof.
-constexpr bool microScaleIsNondecreasing() {
-    int64_t prev = microScaleQ10(0);
-    for (int64_t s = 0; s <= 5000; ++s) {
-        const int64_t v = microScaleQ10(s);
-        if (v < prev || v > kMicroScaleMaxQ10) return false;
-        prev = v;
-    }
-    for (int64_t s = 5000; s <= 200'000; s += 17) {
-        const int64_t v = microScaleQ10(s);
-        if (v < prev || v > kMicroScaleMaxQ10) return false;
-        prev = v;
-    }
-    return true;
-}
-static_assert(microScaleIsNondecreasing(),
-              "microScaleQ10 must be nondecreasing and clamped above; "
-              "Amplifier::surfaceUpperBoundMm feeds it the footprint's maximum slope.");
-static_assert(microScaleQ10(1LL << 40) == kMicroScaleMaxQ10, "microScaleQ10 must saturate");
-// The floor is the entire point of this band existing; assert it directly so
-// that "re-tune microScaleQ10" cannot quietly reintroduce the artifact by
-// letting the fine band vanish on flat ground.
-static_assert(microScaleQ10(0) >= 768,
-              "the microrelief band must not vanish on flat ground -- that is the terrace "
-              "artifact this band exists to break up. See kDetailOctaves.");
+// (5) THE DETAIL GATE'S CEILING (v13). The bound multiplies both bands by
+// kReliefScaleMaxQ10, so soundness needs exactly one property of
+// reliefScaleQ10: that it can NEVER exceed that ceiling, for any input. That is
+// proved exhaustively in carrier.h next to the function itself (its clamp is
+// its last operation and the sweep covers the whole range where the result
+// varies plus a saturating tail), so this file only has to record WHY it takes
+// the ceiling rather than the footprint's own value, which is a property of the
+// bound and not of the gate:
+//
+//   the argument is a SECOND DIFFERENCE of the raster at a 30 m baseline, and
+//   the Lipschitz machinery in surfaceBoundsMm bounds FIRST differences. There
+//   is no cheap footprint-wide bound on a second difference that is tighter
+//   than the clamp, and inventing one is a second gating argument to get wrong
+//   in the one place an error is a hole in the world.
+//
+// This is the same trade the curvature gate already takes -- see (6). Taking a
+// gate at its clamp is normally a LOOSENING, and it would have been one here at
+// slopeScaleQ10's old 4.0x ceiling: v13 also moves the microrelief band and the
+// two additive terms under this gate, so a 4.0x ceiling would have taken the
+// coarse envelope from 27.3 m to 30.7 m. kReliefScaleMaxQ10 is 2.0x instead
+// (carrier.h explains why that costs no terrain), which takes it to 15.4 m --
+// so the bound is TIGHTER than v12's even though it can no longer use the
+// footprint's own value. That is the trade, stated in the two numbers rather
+// than asserted.
+static_assert(kReliefScaleMaxQ10 == 2048,
+              "the relief gate's ceiling is what the surface bound multiplies every detail "
+              "term by, so it is a term in the world's surface envelope and not a tuning "
+              "knob. Moving it moves the bound; re-derive kDetailMaxAtMaxSlopeMm below.");
+// The floor is the entire point of the gate not being a plain proportionality;
+// assert it here as well as in carrier.h, because THIS is the file whose octave
+// table comment explains what it defends against.
+static_assert(reliefScaleQ10(0) > 0,
+              "the detail ladder must not vanish on perfectly flat ground -- that is exactly "
+              "where the voxel terrace artifact is worst. See kDetailOctaves.");
 
 // (6) The detail allowance at full scale, per band, and a check that it stays a
 // small number of metres (i.e. that the bound has not quietly become useless).
@@ -832,23 +863,31 @@ constexpr int64_t kCurvatureScaleMicroMaxQ10 =
     1024 + (kCurvatureScaleMaxQ10 - 1024) / 2;
 static_assert(kCurvatureScaleMicroMaxQ10 == 1408, "micro curvature ceiling moved");
 
-constexpr int64_t detailAllowanceMm(int64_t landformMax, int64_t microMax) {
-    return landformMax * kSlopeScaleMaxQ10 / 1024 * kCurvatureScaleMaxQ10 / 1024 +
-           microMax * kMicroScaleMaxQ10 / 1024 * kCurvatureScaleMicroMaxQ10 / 1024 +
-           kRillMaxAbsMm + kBeddingMaxAbsMm;
+// v13: ONE gate over both bands, and the two additive terms now take it too --
+// written in exactly the order and the integer form evalSurface uses them, so
+// the bound tracks the code rather than paraphrasing it.
+constexpr int64_t detailAllowanceMm(int64_t landformMax, int64_t metreMax, int64_t microMax) {
+    return landformMax * kReliefScaleMaxQ10 / 1024 * kCurvatureScaleMaxQ10 / 1024 +
+           metreMax * kReliefScaleMaxQ10 / 1024 * kCurvatureScaleMicroMaxQ10 / 1024 +
+           microMax * kCurvatureScaleMicroMaxQ10 / 1024 +
+           (kRillMaxAbsMm + kBeddingMaxAbsMm) * kReliefScaleMaxQ10 / 1024;
 }
-constexpr int64_t kDetailMaxAtMaxSlopeMm = detailAllowanceMm(kLandformMaxMm, kMicroMaxMm);
+constexpr int64_t kDetailMaxAtMaxSlopeMm =
+    detailAllowanceMm(kLandformMaxMm, kMetreMaxMm, kMicroMaxMm);
 constexpr int64_t kFineDetailMaxAtMaxSlopeMm =
-    detailAllowanceMm(kFineLandformMaxMm, kFineMicroMaxMm);
-static_assert(!kAmpUnscaled || (kDetailMaxAtMaxSlopeMm == 27289), "detail allowance moved");
-static_assert(!kAmpUnscaled || (kFineDetailMaxAtMaxSlopeMm == 7696), "fine-tier detail allowance moved");
-// The plan's claim was that the net detail envelope drops from ~15.7 m to ~3.0 m
-// on a fine world and that the bound therefore TIGHTENS. It does tighten, by
-// 3.8x -- but not to 3.0 m, because the allowance is the worst case at MAXIMUM
-// slope and maximum curvature simultaneously, which the plan's 3.0 m figure was
-// not. Recorded here rather than quietly rounded, because the streaming layer
-// sizes its trims off this number.
-static_assert(kFineDetailMaxAtMaxSlopeMm * 3 < kDetailMaxAtMaxSlopeMm,
+    detailAllowanceMm(kFineLandformMaxMm, kFineMetreMaxMm, kFineMicroMaxMm);
+// v13: 27289 -> 15356 coarse and 7696 -> 5559 fine. Both SHRANK, which is the
+// direction the streaming layer feels as more effective trims; see coupling (5)
+// for why that is true even though the bound can no longer use the footprint's
+// own gate value.
+static_assert(!kAmpUnscaled || (kDetailMaxAtMaxSlopeMm == 15310), "detail allowance moved");
+static_assert(!kAmpUnscaled || (kFineDetailMaxAtMaxSlopeMm == 5513), "fine-tier detail allowance moved");
+// The fine tier still buys a materially tighter envelope, but the margin is
+// 2.76x at v13 rather than 3.8x -- because the coarse side came down by 1.8x
+// and the fine side only by 1.4x, the two tiers' worst cases converged. Written
+// as 2x rather than quietly re-fitted to 2.76 so that the assert keeps meaning
+// "materially", which is what it is for.
+static_assert(kFineDetailMaxAtMaxSlopeMm * 2 < kDetailMaxAtMaxSlopeMm,
               "the fine tier is supposed to buy a materially tighter surface bound");
 
 // ---------------------------------------------------------------------------
@@ -870,31 +909,38 @@ static_assert(kFineDetailMaxAtMaxSlopeMm * 3 < kDetailMaxAtMaxSlopeMm,
 // sound envelope: |noise| <= kDetailNoiseScale, so each octave's contribution
 // is at most its own amplitude. DERIVED from the same table as (3).
 constexpr int64_t detailAbsMaxMm(const Octave* tab, uint32_t n, uint32_t nLandform,
-                                 bool landform) {
+                                 uint32_t band) {
     int64_t sum = 0;
     for (uint32_t i = 0; i < n; ++i) {
-        if ((i < nLandform) != landform) continue;
+        if (bandOf(i, n, nLandform) != band) continue;
         sum += scaledAmpMm(tab[i].amplitudeMm);
     }
     return sum;
 }
 constexpr int64_t kLandformAbsMaxMm =
-    detailAbsMaxMm(kDetailOctaves, kDetailOctaveCount, kLandformOctaveCount, true);
+    detailAbsMaxMm(kDetailOctaves, kDetailOctaveCount, kLandformOctaveCount, 0);
+constexpr int64_t kMetreAbsMaxMm =
+    detailAbsMaxMm(kDetailOctaves, kDetailOctaveCount, kLandformOctaveCount, 1);
 constexpr int64_t kMicroAbsMaxMm =
-    detailAbsMaxMm(kDetailOctaves, kDetailOctaveCount, kLandformOctaveCount, false);
+    detailAbsMaxMm(kDetailOctaves, kDetailOctaveCount, kLandformOctaveCount, 2);
 constexpr int64_t kFineLandformAbsMaxMm =
-    detailAbsMaxMm(kFineDetailOctaves, kFineDetailOctaveCount, kFineLandformOctaveCount, true);
+    detailAbsMaxMm(kFineDetailOctaves, kFineDetailOctaveCount, kFineLandformOctaveCount, 0);
+constexpr int64_t kFineMetreAbsMaxMm =
+    detailAbsMaxMm(kFineDetailOctaves, kFineDetailOctaveCount, kFineLandformOctaveCount, 1);
 constexpr int64_t kFineMicroAbsMaxMm =
-    detailAbsMaxMm(kFineDetailOctaves, kFineDetailOctaveCount, kFineLandformOctaveCount, false);
-static_assert(kLandformAbsMaxMm >= kLandformMaxMm && kMicroAbsMaxMm >= kMicroMaxMm,
+    detailAbsMaxMm(kFineDetailOctaves, kFineDetailOctaveCount, kFineLandformOctaveCount, 2);
+static_assert(kLandformAbsMaxMm >= kLandformMaxMm && kMetreAbsMaxMm >= kMetreMaxMm &&
+                  kMicroAbsMaxMm >= kMicroMaxMm,
               "the symmetric detail envelope must cover the positive-side maximum too, or "
               "surfaceLowerBoundMm is looser than surfaceUpperBoundMm in the wrong direction");
-static_assert(!kAmpUnscaled || (kLandformAbsMaxMm == 3700 && kMicroAbsMaxMm == 575),
+static_assert(!kAmpUnscaled || (kLandformAbsMaxMm == 3700 && kMetreAbsMaxMm == 500 &&
+                                kMicroAbsMaxMm == 115),
               "detail amplitude sum moved; see (4)");
 static_assert(kFineLandformAbsMaxMm >= kFineLandformMaxMm &&
-                  kFineMicroAbsMaxMm >= kFineMicroMaxMm,
+                  kFineMetreAbsMaxMm >= kFineMetreMaxMm && kFineMicroAbsMaxMm >= kFineMicroMaxMm,
               "same obligation as the coarse pair, on the fine-tier table");
-static_assert(!kAmpUnscaled || (kFineLandformAbsMaxMm == 900 && kFineMicroAbsMaxMm == 575),
+static_assert(!kAmpUnscaled || (kFineLandformAbsMaxMm == 900 && kFineMetreAbsMaxMm == 500 &&
+                                kFineMicroAbsMaxMm == 115),
               "fine-tier detail amplitude sum moved; see (4)");
 
 // (8) The cave family's carve depth, in the QUERYING COLUMN'S OWN depth space.
@@ -1118,8 +1164,10 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     // gradient continuity across the cell boundary.
     const int64_t px = floorDiv(xMm, pxMm), py = floorDiv(yMm, pxMm);
     const int64_t fx = xMm - px * pxMm, fy = yMm - py * pxMm;
-    const CarrierEval carrier =
-        evalCarrier(cachedStencil(id_, *tiles_, px, py), fx, fy, pxMm);
+    // One per-cell read for all three things derived from the raster: the
+    // (v13: prefiltered) control points, and the cell's landform relief.
+    const StencilSlot& slot = cachedStencilSlot(id_, *tiles_, px, py);
+    const CarrierEval carrier = evalCarrier(slot.cp, fx, fy, pxMm);
     const int64_t baseMm = carrier.heightMm;
 
     // The carrier's ANALYTIC gradient, in mm per metre, conditions both detail
@@ -1136,11 +1184,13 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     // line, as the TYPICAL case.
     //
     // The spline derivative is continuous, so that step is now structurally
-    // impossible rather than merely small. (It does not show up in a windowed
-    // roughness estimate at fine lag â€” that band is gated by microScaleQ10,
-    // which is deliberately almost slope-flat. Measure it off the raster with
-    // vxc_terrainprobe's DIRECT GAIN STEP, not through an estimator that mostly
-    // sees the other band.)
+    // impossible rather than merely small.
+    //
+    // v13: this NO LONGER CONDITIONS DETAIL AMPLITUDE -- see the gate block
+    // above kDetailOctaves. It is still the slope classifyBiome, the topsoil
+    // retention term and density3 take, all of which are genuinely questions
+    // about the local GRADE (can soil stay on it, is it a cliff) rather than
+    // about how much landform there is.
     const int64_t slopeMmPerM = carrierSlopeMmPerM(carrier, pxMm);
 
     // Two bands, accumulated separately because they take different scales
@@ -1163,9 +1213,7 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     // hard-clipped at 1.875 m, which is not two settings of one gate, it is two
     // different failures.
     const int64_t curveQ10 = carrierCurvatureTierNormQ10(
-        carrierCurvatureMmPerM2Q10(
-            evalCarrierCurvature(cachedStencil(id_, *tiles_, px, py), fx, fy, pxMm), pxMm),
-        pxMm);
+        carrierCurvatureMmPerM2Q10(evalCarrierCurvature(slot.cp, fx, fy, pxMm), pxMm), pxMm);
     const int64_t cScale = curvatureScaleQ10(curveQ10);
 
     const bool fine = isFineTier(pxMm);
@@ -1173,9 +1221,11 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     const uint32_t nOct = fine ? kFineDetailOctaveCount : kDetailOctaveCount;
     const uint32_t nLand = fine ? kFineLandformOctaveCount : kLandformOctaveCount;
 
-    const int64_t sScale = slopeScaleQ10(slopeMmPerM);
-    const int64_t mScale = microScaleQ10(slopeMmPerM);
-    int64_t landformMm = 0, microMm = 0;
+    // THE LEVEL OF THE WHOLE LADDER, from the landform the raster measurably
+    // carries rather than from the local gradient. See carrier.h's relief
+    // block for why the argument changed and what it is measured against.
+    const int64_t rScale = reliefScaleQ10(slot.reliefMm);
+    int64_t landformMm = 0, metreMm = 0, microMm = 0;
     for (uint32_t i = 0; i < nOct; ++i) {
         const Octave& o = tab[i];
         // Faded, not raw: raw valueNoise2 puts a visible dead-straight crease
@@ -1190,8 +1240,11 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
         const int64_t term =
             valueNoise2Fade(seed_, xMm, yMm, o.latticeMm, CH_DETAIL_OCTAVE_BASE + i) *
             scaledAmpMm(o.amplitudeMm) / kDetailNoiseScale;
-        if (i < nLand)
+        const uint32_t band = bandOf(i, nOct, nLand);
+        if (band == 0)
             landformMm += term;
+        else if (band == 1)
+            metreMm += term;
         else
             microMm += term;
     }
@@ -1219,18 +1272,32 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     // that microScaleQ10 exists to defend, so hollows cannot go quiet enough to
     // bring back the terrace runs that floor was added to break up.
     const int64_t cScaleMicro = 1024 + (cScale - 1024) / 2;
-    int64_t detailMm = landformMm * sScale / 1024 * cScale / 1024 +
-                       microMm * mScale / 1024 * cScaleMicro / 1024;
+    // Three bands, three gates. The MATERIAL band takes no relief gate at all --
+    // see the band-split block above kDetailOctaves: it is the ground's own
+    // texture and does not scale with how much landform it is draped over.
+    int64_t detailMm = landformMm * rScale / 1024 * cScale / 1024 +
+                       metreMm * rScale / 1024 * cScaleMicro / 1024 +
+                       microMm * cScaleMicro / 1024;
 
     // Two ADDITIVE structured terms, each with its own gate and its own proved
     // envelope. They are added after the band scaling rather than folded into a
     // band because neither is an fBm octave: the rill term is anisotropic and
     // conditioned on the gradient direction, and the bedding term is
-    // quasi-periodic and conditioned on a regional structural field. Multiplying
-    // them by slopeScaleQ10 as well would double-count a gate each already has.
-    detailMm += rillMm(seed_, xMm, yMm, carrier.sxMmPerPx * 1000 / pxMm,
-                       carrier.syMmPerPx * 1000 / pxMm);
-    detailMm += beddingMm(seed_, xMm, yMm, baseMm);
+    // quasi-periodic and conditioned on a regional structural field.
+    //
+    // v13: they DO take the relief gate, which they did not take the slope gate.
+    // That is not an inconsistency, it is the same correction: the reason to
+    // keep them out of the old gate was that each already had a GRADIENT
+    // condition of its own and multiplying by a second gradient gate would
+    // double-count it. Neither has a LANDFORM condition, and the measurement
+    // that motivated this whole change -- 0.3-0.6 m of client roughness laid on
+    // a plain that has 6.7 m of relief -- includes these two terms; leaving them
+    // ungated would leave a 420 mm floor under a ladder whose whole point is
+    // that it comes down to nothing on flat ground.
+    const int64_t addMm = rillMm(seed_, xMm, yMm, carrier.sxMmPerPx * 1000 / pxMm,
+                                 carrier.syMmPerPx * 1000 / pxMm) +
+                          beddingMm(seed_, xMm, yMm, baseMm);
+    detailMm += addMm * rScale / 1024;
 
     SurfaceEval s;
     s.px = px;
@@ -1359,12 +1426,70 @@ bool Amplifier::surfaceBoundsMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t v
     const int64_t nx = (cx1 - cx0 + 1) + 3, ny = (cy1 - cy0 + 1) + 3;
     if (nx > kSurfaceBoundMaxCornersPerAxis || ny > kSurfaceBoundMaxCornersPerAxis) return false;
 
-    // Read the control points once (through the same per-thread tile memo
-    // column() uses); everything below is derived from this grid.
+    // v13: WHAT THIS GRID HOLDS IS CONTROL POINTS, WHICH ON A SAMPLE TIER ARE
+    // NO LONGER THE RASTER. Everything below -- the first-difference scan that
+    // gives the Lipschitz constant and the centre carrier evaluation -- is a
+    // statement about the spline's own control lattice, so on a tier that gets
+    // prefiltered the grid has to be prefiltered too. Reading raw elevations
+    // here and bounding a prefiltered carrier with them is not conservative in
+    // either direction: the prefilter is a SHARPENING filter, so it can grow a
+    // first difference by up to 2.98x per axis, and a bound derived from the
+    // unsharpened lattice would be too small. That is a hole in the world.
+    //
+    // The alternative -- keep the raw grid and multiply the Lipschitz constant
+    // by the filter's gain -- is sound but 8.9x looser on every footprint, which
+    // would take the sky-band trim out entirely. Prefiltering the grid costs one
+    // more pass over it and no extra sampler reads beyond the halo.
+    const bool prefilter = carrierPrefiltersSamples(pxMm);
+    const int64_t halo = prefilter ? kCarrierPrefilterRadius : 0;
+    const int64_t rnx = nx + 2 * halo, rny = ny + 2 * halo;
+    if (rnx > kSurfaceBoundMaxCornersPerAxis || rny > kSurfaceBoundMaxCornersPerAxis)
+        return false;
+
+    // Read the raster once (through the same per-thread tile memo column()
+    // uses); everything below is derived from this grid.
     int64_t elev[kSurfaceBoundMaxCornersPerAxis * kSurfaceBoundMaxCornersPerAxis];
-    for (int64_t iy = 0; iy < ny; ++iy)
-        for (int64_t ix = 0; ix < nx; ++ix)
-            elev[ix + nx * iy] = cachedElevationMm(id_, *tiles_, px0 + ix, py0 + iy);
+    {
+        // The haloed raw grid is a thread_local scratch rather than a second
+        // 32 KB stack array, which is exactly the escape hatch
+        // kSurfaceBoundMaxCornersPerAxis's own comment nominates for growing
+        // past ~128 KB of frame. It is written before it is read on every path
+        // that reads it, so it carries no state between calls.
+        static thread_local int64_t raw[kSurfaceBoundMaxCornersPerAxis *
+                                        kSurfaceBoundMaxCornersPerAxis];
+        int64_t* src = prefilter ? raw : elev;
+        for (int64_t iy = 0; iy < rny; ++iy)
+            for (int64_t ix = 0; ix < rnx; ++ix)
+                src[ix + rnx * iy] =
+                    cachedElevationMm(id_, *tiles_, px0 - halo + ix, py0 - halo + iy);
+        if (prefilter) {
+            // Separable, in the same two stages and the same integer form
+            // carrierPrefilterStencil uses, so the grid holds exactly the
+            // control points evalSurface's stencil holds. Stage 1 collapses y
+            // into a (rnx x ny) intermediate written back over `raw`'s own rows,
+            // which is safe because row iy reads only rows iy..iy+2R and writes
+            // row iy -- strictly behind the read window.
+            for (int64_t iy = 0; iy < ny; ++iy)
+                for (int64_t ix = 0; ix < rnx; ++ix) {
+                    int64_t acc = kCarrierPrefilterW[0] * raw[ix + rnx * (iy + halo)];
+                    for (int64_t n = 1; n <= halo; ++n)
+                        acc += kCarrierPrefilterW[n] * (raw[ix + rnx * (iy + halo + n)] +
+                                                        raw[ix + rnx * (iy + halo - n)]);
+                    raw[ix + rnx * iy] = acc / kCarrierPrefilterDen;
+                }
+            for (int64_t iy = 0; iy < ny; ++iy)
+                for (int64_t ix = 0; ix < nx; ++ix) {
+                    int64_t acc = kCarrierPrefilterW[0] * raw[(ix + halo) + rnx * iy];
+                    for (int64_t m = 1; m <= halo; ++m)
+                        acc += kCarrierPrefilterW[m] * (raw[(ix + halo + m) + rnx * iy] +
+                                                        raw[(ix + halo - m) + rnx * iy]);
+                    // The SAME clamp carrierPrefilterStencil applies, or the
+                    // grid is not the lattice the carrier evaluates.
+                    elev[ix + nx * iy] = clampi64(acc / kCarrierPrefilterDen,
+                                                  -kCarrierControlClampMm, kCarrierControlClampMm);
+                }
+        }
+    }
 
     // A LIPSCHITZ BOUND AROUND ONE CENTRE EVALUATION, rather than a hull.
     //
@@ -1417,12 +1542,14 @@ bool Amplifier::surfaceBoundsMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t v
     // rounded UP below.
     const int64_t cxMm = floorDiv(x0Mm + x1Mm, 2), cyMm = floorDiv(y0Mm + y1Mm, 2);
     const int64_t cpx = floorDiv(cxMm, pxMm), cpy = floorDiv(cyMm, pxMm);
-    int64_t ccp[16];
-    for (int j = 0; j < 4; ++j)
-        for (int i = 0; i < 4; ++i)
-            ccp[i + 4 * j] = cachedElevationMm(id_, *tiles_, cpx - 1 + i, cpy - 1 + j);
+    // Through the SAME per-cell stencil evalSurface uses, so the centre value
+    // this bound is built around is bit-identically the value a column at the
+    // centre would compute -- including the v13 prefilter. Building a second
+    // 4x4 read here is what would let the two drift.
     const int64_t centreMm =
-        evalCarrier(ccp, cxMm - cpx * pxMm, cyMm - cpy * pxMm, pxMm).heightMm;
+        evalCarrier(cachedStencilSlot(id_, *tiles_, cpx, cpy).cp, cxMm - cpx * pxMm,
+                    cyMm - cpy * pxMm, pxMm)
+            .heightMm;
 
     // Half-extents, rounded up, plus one mm each for the centre rounding above.
     const int64_t halfW = (x1Mm - x0Mm + 1) / 2 + 1, halfH = (y1Mm - y0Mm + 1) / 2 + 1;
@@ -1432,59 +1559,39 @@ bool Amplifier::surfaceBoundsMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t v
     const int64_t maxBaseMm = centreMm + carrierSlackMm;
     const int64_t minBaseMm = centreMm - carrierSlackMm;
 
-    // The footprint's maximum slope in the v9 currency, rounded UP so that
-    // feeding it to the nondecreasing scale curves stays conservative.
-    const int64_t maxSlopeMmPerM = ceilDivPos((lipDx + lipDy) * 1000, pxMm);
-
-    // The SAME slope scale feeds both sides. Sound for the upper bound because
-    // slopeScaleQ10 is nondecreasing (coupling (5)) and this dominates the
-    // footprint's slope; sound for the lower bound for the same reason, since
-    // scaling only ever grows the detail term's MAGNITUDE, in both directions.
-    const int64_t slopeQ10 = slopeScaleQ10(maxSlopeMmPerM);
-    const int64_t microQ10 = microScaleQ10(maxSlopeMmPerM);
-    // Two bands, two scales -- summed here exactly as evalSurface sums them.
-    // Sound because each band's maximum bounds that band at every column
-    // simultaneously (they need not be attained at the same column), and both
-    // scale curves are asserted nondecreasing so the footprint's maximum slope
-    // gives each band's maximum scale.
+    // v13: THE DETAIL GATE IS TAKEN AT ITS CEILING, NOT AT THE FOOTPRINT'S OWN
+    // VALUE. The gate's argument is now the raster's SECOND difference at a
+    // 30 m baseline (coupling (5)), and the Lipschitz machinery above bounds
+    // first differences; there is no cheaper sound bound on the argument than
+    // its clamp. This is the same trade the curvature gate has always taken and
+    // it is now the loosest step in the derivation for BOTH bands.
     //
-    // v10 adds three things to this sum, in the same order evalSurface applies
-    // them. (a) The tier selects which octave table's maxima apply -- runtime,
-    // from the sampler's pitch, exactly as evalSurface selects the table.
-    // (b) The shaping band takes the curvature gate's CEILING. The bound cannot
-    // evaluate curvature over the footprint the way it evaluates slope, because
-    // curvature is a second difference and the Lipschitz argument above bounds
-    // the FIRST; so this is the one gate the bound takes at its clamp rather
-    // than at the footprint's actual value. That is sound (kCurvatureScaleMaxQ10
-    // dominates every output of curvatureScaleQ10 by its own static_assert) and
-    // it is the loosest step in the derivation -- worth revisiting if the trim
-    // ever stops paying on fine worlds. (c) The two additive terms enter at
-    // their own proved envelopes, which are constants and need no gating
-    // argument at all.
+    // It does not widen the world's envelope: kReliefScaleMaxQ10 is exactly the
+    // 4096 slopeScaleQ10 used to clamp to, so kDetailMaxAtMaxSlopeMm is a
+    // WORST-CASE number that has not grown. What it costs is the typical case,
+    // where v12 could feed a gentle footprint's own small slope and get a
+    // tighter allowance. The adversarial sweep on real tiles is what says
+    // whether that matters, and it is reported rather than assumed.
+    //
+    // (a) The tier still selects which octave table's maxima apply -- at
+    // runtime, from the sampler's pitch, exactly as evalSurface selects it.
+    // (b) The two additive terms now take the gate as well, because evalSurface
+    // does; their own envelopes are still constants.
     const bool fineTier = isFineTier(pxMm);
     const int64_t landMax = fineTier ? kFineLandformMaxMm : kLandformMaxMm;
+    const int64_t metrMax = fineTier ? kFineMetreMaxMm : kMetreMaxMm;
     const int64_t micrMax = fineTier ? kFineMicroMaxMm : kMicroMaxMm;
     const int64_t landAbs = fineTier ? kFineLandformAbsMaxMm : kLandformAbsMaxMm;
+    const int64_t metrAbs = fineTier ? kFineMetreAbsMaxMm : kMetreAbsMaxMm;
     const int64_t micrAbs = fineTier ? kFineMicroAbsMaxMm : kMicroAbsMaxMm;
-    const int64_t maxDetailMm =
-        landMax * slopeQ10 / 1024 * kCurvatureScaleMaxQ10 / 1024 +
-        micrMax * microQ10 / 1024 * kCurvatureScaleMicroMaxQ10 / 1024 +
-        kRillMaxAbsMm + kBeddingMaxAbsMm;
+    const int64_t maxDetailMm = detailAllowanceMm(landMax, metrMax, micrMax);
     // The negative side uses the symmetric envelope (coupling (7)), and takes
-    // one further millimetre PER BAND for the truncation in each q10 divide,
-    // which rounds toward zero and so would otherwise shave the magnitude.
-    // Two bands, two truncations, two millimetres â€” this is the one place
-    // where splitting the sum costs the bound anything, and one millimetre of
-    // conservatism is the right price for not having to argue about it.
-    // The additive terms are symmetric about zero by construction (both are
-    // gated value noise, whose envelope is |v| <= amplitude on both sides), so
-    // the SAME two constants serve here with no asymmetry correction. The extra
-    // millimetre count rises to 3 because the shaping band now truncates twice
-    // -- once per q10 divide, and it has two of them.
-    const int64_t minDetailMm =
-        landAbs * slopeQ10 / 1024 * kCurvatureScaleMaxQ10 / 1024 +
-        micrAbs * microQ10 / 1024 * kCurvatureScaleMicroMaxQ10 / 1024 +
-        kRillMaxAbsMm + kBeddingMaxAbsMm + 4;
+    // one further millimetre PER TRUNCATION in the q10 divides, which round
+    // toward zero and so would otherwise shave the magnitude. v13 counts six:
+    // two on the shaping band, two on the metre band, one on the material band,
+    // one on the additive pair's own gate divide. One millimetre each is the
+    // right price for not having to argue about it.
+    const int64_t minDetailMm = detailAllowanceMm(landAbs, metrAbs, micrAbs) + 6;
 
     // THE 3D DENSITY BAND, ADDED AFTER THE CLAMP AND NOT BEFORE IT.
     //
