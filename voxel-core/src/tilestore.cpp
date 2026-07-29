@@ -284,6 +284,15 @@ bool parseBlockIndex(const uint8_t* file, uint64_t indexOff, uint64_t indexLen,
             // §4: comp_len is 0 when mode == CONSTANT. The block costs zero
             // bytes, so it can neither be truncated nor overrun.
             if (e.compLen != 0) return false;
+            // const_cp is i16 ON THE WIRE but carries one element of the
+            // TARGET plane, and for the §6 flow plane that element is an
+            // UNSIGNED 0..255 byte -- 0xFF means log2=31 with all three flag
+            // bits, never -1. Valid data never reaches the negative half, so
+            // this only ever fires on a corrupt file; reject it here rather
+            // than let a narrowing conversion wrap -1 into a perfectly
+            // plausible 255. (The same trap was found and fixed on the Python
+            // encoder side, where a numpy assignment was doing the wrapping.)
+            if (bytesPerSample == 1 && (e.constCp < 0 || e.constCp > 255)) return false;
             break;
         case kBlockCoded: {
             if (e.residBits != 16 && e.residBits != 32) return false;

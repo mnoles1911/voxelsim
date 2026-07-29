@@ -45,6 +45,14 @@ std::filesystem::path fineFixturePath() {
     return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_512.vxtl";
 }
 
+// The companion golden tile carrying a §6 flow plane, same provenance and the
+// same skip-if-absent rule. Its elevation plane is deliberately uniform (all
+// CODED/16) because mode diversity is already covered above; the FLOW plane is
+// the one carrying one block of each mode.
+std::filesystem::path fineFlowFixturePath() {
+    return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_flow_512.vxtl";
+}
+
 // Builds an in-memory TileData with a constant elevation and constant
 // climate planes, for tests that want to drive the amplifier from known
 // hand-built tile data rather than the on-disk fixture.
@@ -1410,4 +1418,220 @@ VXC_TEST(vxtl_v2_golden_fixture_cross_language_digest) {
     p.y = 0;
     CHECK(!s.loadTile(buildFineTile(p, makeFlatElevPlans(1))));
     CHECK_EQ(s.tileCount(), size_t(1));
+}
+
+VXC_TEST(vxtl_v2_golden_flow_fixture_cross_language) {
+    // §6 against the Python encoder, closing the last untested corner of the
+    // contract. The flow plane carries one block of each mode with the flag
+    // bits deliberately scattered at DIFFERENT positions than the log2 field
+    // varies, so a decoder that conflates the two — or shifts by one — fails
+    // loudly instead of passing on a plane of zeros.
+    const std::filesystem::path path = fineFlowFixturePath();
+    if (!std::filesystem::exists(path)) {
+        std::printf("  SKIP vxtl_v2_golden_flow_fixture_cross_language: no %s "
+                    "(Python encoder fixture, docs/vxtl-v2-format.md §6)\n",
+                    path.filename().string().c_str());
+        return;
+    }
+
+    auto bytes = readFileBytes(path);
+    CHECK(bytes.has_value());
+    CHECK_EQ(bytes->size(), size_t(852'251));
+
+    auto tile = FineTile::parse(bytes->data(), bytes->size());
+    CHECK(tile.has_value());
+    if (!tile) return;
+
+    CHECK_EQ(tile->seed(), uint64_t(20260729));
+    CHECK_EQ(tile->tileX(), 101);
+    CHECK_EQ(tile->tileY(), -42);
+    CHECK_EQ(tile->size(), uint32_t(512));
+    CHECK_EQ(int(tile->header().blockLog2), 8);
+    CHECK_EQ(tile->quantMm(), 100);
+    CHECK_EQ(int(tile->header().codec), int(kCodecRaw));
+    CHECK_EQ(int(tile->header().bakeVer), 7);
+    CHECK_EQ(tile->baseOffsetMm(), 500'000);
+    CHECK_EQ(tile->header().flags, kFineFlagFlowPresent);
+    CHECK(tile->hasFlow());
+
+    // Elevation: one smooth field, all CODED/16.
+    const std::vector<FineBlockEntry>& ei = tile->elevIndex();
+    CHECK_EQ(ei.size(), size_t(4));
+    for (const FineBlockEntry& e : ei) {
+        CHECK_EQ(int(e.mode), int(kBlockCoded));
+        CHECK_EQ(int(e.residBits), 16);
+        CHECK_EQ(e.compLen, uint32_t(256 * 256 * 2));
+    }
+
+    // Flow: one block of each mode, in §4 index order (bx fastest).
+    const std::vector<FineBlockEntry>& fi = tile->flowIndex();
+    CHECK_EQ(fi.size(), size_t(4));
+    CHECK_EQ(int(fi[0].mode), int(kBlockConstant)); // (0,0)
+    CHECK_EQ(fi[0].compLen, uint32_t(0));
+    // const_cp is i16 on the wire but holds an UNSIGNED flow byte: 0xFF is
+    // 255 (log2 = 31 with channel, bank and deposition all set), never -1.
+    CHECK_EQ(fi[0].constCp, int16_t(255));
+    CHECK_EQ(int(fi[1].mode), int(kBlockCoded)); // (1,0)
+    CHECK_EQ(int(fi[1].residBits), 16);
+    CHECK_EQ(int(fi[2].mode), int(kBlockRaw)); // (0,1)
+    // RAW on the flow plane is ONE byte per pixel, not two — the encoder is
+    // parameterised by element dtype, and this length is the check.
+    CHECK_EQ(fi[2].compLen, uint32_t(256 * 256 * 1));
+    CHECK_EQ(int(fi[2].residBits), 0);
+    CHECK_EQ(int(fi[3].mode), int(kBlockCoded)); // (1,1)
+
+    std::vector<int16_t> e00, e10, e01, e11;
+    CHECK(tile->decodeElevBlock(0, 0, e00));
+    CHECK(tile->decodeElevBlock(1, 0, e10));
+    CHECK(tile->decodeElevBlock(0, 1, e01));
+    CHECK(tile->decodeElevBlock(1, 1, e11));
+    CHECK_EQ(e00[0], int16_t(300));
+    CHECK_EQ(e00[1], int16_t(346));
+    CHECK_EQ(e00[255], int16_t(786));
+    CHECK_EQ(e00[256], int16_t(297));
+    CHECK_EQ(e00[65535], int16_t(192));
+    CHECK_EQ(e10[0], int16_t(744));
+    CHECK_EQ(e10[65535], int16_t(819));
+    CHECK_EQ(e01[0], int16_t(-312));
+    CHECK_EQ(e01[65535], int16_t(-546));
+    CHECK_EQ(e11[0], int16_t(131));
+    CHECK_EQ(e11[65535], int16_t(79));
+
+    std::vector<uint8_t> f00, f10, f01, f11;
+    CHECK(tile->decodeFlowBlock(0, 0, f00));
+    CHECK(tile->decodeFlowBlock(1, 0, f10));
+    CHECK(tile->decodeFlowBlock(0, 1, f01));
+    CHECK(tile->decodeFlowBlock(1, 1, f11));
+    CHECK_EQ(f00.size(), size_t(65536));
+
+    // CONSTANT: 255 everywhere, and 255 is the unsigned reading. A decoder
+    // that sign-extended const_cp would land on -1 and be rejected outright by
+    // the 0..255 range check, so this pin cannot silently pass either way.
+    CHECK_EQ(int(f00[0]), 255);
+    CHECK_EQ(int(f00[65535]), 255);
+
+    // CODED flow block: same MED predictor as the elevation plane, over u8.
+    CHECK_EQ(int(f10[0]), 224);
+    CHECK_EQ(int(f10[1]), 65);
+    CHECK_EQ(int(f10[2]), 66);
+    CHECK_EQ(int(f10[3]), 67);
+    CHECK_EQ(int(f10[255]), 111);
+    CHECK_EQ(int(f10[256]), 33);
+    CHECK_EQ(int(f10[257]), 2);
+    CHECK_EQ(int(f10[65535]), 38);
+
+    // RAW flow block: literal bytes, plus the three explicit edge pixels the
+    // encoder planted at (10,10), (11,10), (12,10).
+    CHECK_EQ(int(f01[0]), 0x8a);
+    CHECK_EQ(int(f01[1]), 0x46);
+    CHECK_EQ(int(f01[2]), 0xd8);
+    CHECK_EQ(int(f01[255]), 0x80);
+    CHECK_EQ(int(f01[256]), 26);
+    CHECK_EQ(int(f01[65535]), 0x5e);
+    CHECK_EQ(int(f01[10 * 256 + 10]), 0xff); // log2 31 + channel + bank + deposition
+    CHECK_EQ(int(f01[10 * 256 + 11]), 0x60); // channel | bank only, log2 0
+    CHECK_EQ(int(f01[10 * 256 + 12]), 0x80); // deposition only, log2 0
+
+    CHECK_EQ(int(f11[0]), 160);
+    CHECK_EQ(int(f11[1]), 35);
+    CHECK_EQ(int(f11[255]), 41);
+    CHECK_EQ(int(f11[256]), 37);
+    CHECK_EQ(int(f11[65535]), 143);
+
+    // §6's field split, counted rather than spot-checked: bits 0-4 are the
+    // log2 accumulation and bits 5/6/7 are channel/bank/deposition. These
+    // tallies pin that the flag bits and the log2 field are independent — an
+    // off-by-one shift anywhere in the byte moves every one of them, and
+    // f11's zero bank count is a value a masking bug cannot reproduce.
+    struct FlowStats {
+        uint64_t channel = 0, bank = 0, deposition = 0;
+        int32_t log2Min = 255, log2Max = -1;
+    };
+    auto stats = [](const std::vector<uint8_t>& b) {
+        FlowStats s;
+        for (uint8_t v : b) {
+            if (v & 0x20u) ++s.channel;
+            if (v & 0x40u) ++s.bank;
+            if (v & 0x80u) ++s.deposition;
+            const int32_t l = static_cast<int32_t>(v & 31u);
+            if (l < s.log2Min) s.log2Min = l;
+            if (l > s.log2Max) s.log2Max = l;
+        }
+        return s;
+    };
+    const FlowStats s10 = stats(f10), s01 = stats(f01), s11 = stats(f11);
+    CHECK_EQ(s10.channel, uint64_t(4096));
+    CHECK_EQ(s10.bank, uint64_t(3072));
+    CHECK_EQ(s10.deposition, uint64_t(2259));
+    CHECK_EQ(s10.log2Min, 0);
+    CHECK_EQ(s10.log2Max, 23);
+    CHECK_EQ(s01.channel, uint64_t(32213));
+    CHECK_EQ(s01.bank, uint64_t(32204));
+    CHECK_EQ(s01.deposition, uint64_t(32215));
+    CHECK_EQ(s01.log2Max, 31); // §6 clamps to 0..31; the RAW block reaches it
+    CHECK_EQ(s11.channel, uint64_t(6972));
+    CHECK_EQ(s11.bank, uint64_t(0));
+    CHECK_EQ(s11.deposition, uint64_t(2120));
+    CHECK_EQ(s11.log2Max, 26);
+
+    // Whole-plane digests, same recipe as the elevation fixture (FNV-1a 64,
+    // block index order then raster order; the flow plane feeds one byte per
+    // pixel rather than a little-endian uint16).
+    Digest de, df;
+    for (const std::vector<int16_t>* blk : {&e00, &e10, &e01, &e11})
+        for (int16_t cp : *blk) de.u16(static_cast<uint16_t>(cp));
+    for (const std::vector<uint8_t>* blk : {&f00, &f10, &f01, &f11})
+        for (uint8_t v : *blk) df.u8(v);
+    CHECK_EQ(de.h, uint64_t(0x76798ab9a9eace98ull));
+    CHECK_EQ(df.h, uint64_t(0xf49b2aaf18234d19ull));
+
+    // The elevation plane still goes through the sampler, unaffected by the
+    // flow plane's presence. Coarse tile (101, -42) owns fine pixels
+    // [51712, 52224) x [-21504, -20992).
+    FineTileSampler s(20260729);
+    CHECK(s.loadTile(*bytes));
+    const int64_t ox = int64_t(101) * 512, oy = int64_t(-42) * 512;
+    CHECK_EQ(s.elevationMm(ox, oy), 500'000 + 300 * 100);
+    CHECK_EQ(s.elevationMm(ox + 256, oy + 256), 500'000 + 131 * 100);
+    CHECK_EQ(s.missingTileQueries.load(), uint64_t(0));
+
+    // A corrupt file claiming const_cp = -1 for a CONSTANT flow block must be
+    // REJECTED, not wrapped into a plausible 255. FLOW_INDEX is at 524491 and
+    // entry 0's const_cp is at +13 (u64 offset + u32 comp_len + u8 mode).
+    constexpr size_t kFlowConstCp = 524491 + 13;
+    CHECK_EQ(int((*bytes)[kFlowConstCp]), 0xff);
+    CHECK_EQ(int((*bytes)[kFlowConstCp + 1]), 0x00);
+    {
+        std::vector<uint8_t> b = *bytes;
+        b[kFlowConstCp + 1] = 0xff; // 0x00ff -> 0xffff == -1
+        CHECK(!FineTile::parse(b.data(), b.size()).has_value());
+    }
+    {
+        std::vector<uint8_t> b = *bytes;
+        b[kFlowConstCp + 1] = 0x01; // 0x01ff == 511: past a flow byte
+        CHECK(!FineTile::parse(b.data(), b.size()).has_value());
+    }
+    // The same value on an ELEVATION CONSTANT block is perfectly legal, so the
+    // check must be per-plane and not a blanket rejection of negatives.
+    {
+        std::vector<PlanePlan<int16_t>> plans = makeFlatElevPlans(-1);
+        V2Params ep;
+        const std::vector<uint8_t> eb = buildFineTile(ep, plans);
+        auto t = FineTile::parse(eb.data(), eb.size());
+        CHECK(t.has_value());
+        std::vector<int16_t> blk;
+        CHECK(t->decodeElevBlock(0, 0, blk));
+        CHECK_EQ(blk[0], int16_t(-1));
+    }
+
+    // RAW on the flow plane is one byte per pixel: relabelling that block's
+    // length as if it were two must fail, which is what makes the dtype
+    // parameterisation an enforced contract rather than a convention.
+    {
+        std::vector<uint8_t> b = *bytes;
+        b[524491 + 2 * 20 + 8] = 0x00; // comp_len 65536 -> 131072
+        b[524491 + 2 * 20 + 9] = 0x00;
+        b[524491 + 2 * 20 + 10] = 0x02;
+        CHECK(!FineTile::parse(b.data(), b.size()).has_value());
+    }
 }
