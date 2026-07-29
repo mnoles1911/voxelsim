@@ -10,6 +10,7 @@
 
 #include "voxelcore/caverns.h"
 #include "voxelcore/caves.h"
+#include "voxelcore/hash_channel_registry.h" // compile-time HashChannel id uniqueness guard
 #include "voxelcore/tiles.h"
 
 namespace vxc {
