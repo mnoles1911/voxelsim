@@ -109,6 +109,12 @@ void UVoxelCharacterMovementComponent::ResetState()
 	JumpBufferRemainingSeconds = 0.0;
 	TimeSinceGroundedSeconds = 0.0;
 	bJumpKeyHeld = false;
+	// The remembered floor does NOT survive a mode toggle: fly mode may have
+	// moved the pawn kilometres from wherever it last stood, and clamping to
+	// that height on re-entry would hang it in mid-air -- the exact failure
+	// this memory exists to prevent.
+	bHadGroundContact = false;
+	LastGroundedFeetZ = 0.0;
 	bWaitingForTerrain = false;
 	bGroundedLastTick = false;
 	bSwimmingLastTick = false;
@@ -360,12 +366,22 @@ bool UVoxelCharacterMovementComponent::IsTerrainReadyAt(const FVector& Pos) cons
 	// does so silently and looks like a collision bug.
 	//
 	// THE RULE. Gravity runs unless the character's OWN chunk is TRACKED (in the
-	// streaming desired set) but does not yet own a COMPONENT -- precisely
-	// "queued, not here yet", the boot case and the reason it must not fall the
-	// moment it spawns. Anything else counts as ready:
+	// streaming desired set), does not yet own a COMPONENT, and has NOT SETTLED
+	// -- precisely "queued, not here yet", the boot case and the reason it must
+	// not fall the moment it spawns. Anything else counts as ready:
 	//
 	//   * tracked WITH a component -- the ground is really there (or the chunk
 	//     is genuinely empty air, a legitimate reason to fall);
+	//   * tracked, component-less, but SETTLED -- meshed to zero quads and final.
+	//     ApplyChunkMesh releases geometry and sets bMeshSettled for any chunk
+	//     with no visible faces (VoxelWorldSubsystem.cpp, `if (NumQuads == 0)`),
+	//     so every all-air chunk lives here PERMANENTLY. Vetoing on it hangs the
+	//     character in mid-air forever, which is exactly what happened: spawning
+	//     +5m above the surface (AVoxelEarthGameMode::RestartPlayer) drops the
+	//     box into the open-air chunk overhead, gravity latches off, and the HUD
+	//     sits on "WAITING FOR TERRAIN" for as long as you care to watch. The
+	//     settled flag is the only signal that separates this from the boot case;
+	//     both read tracked=y component=n.
 	//   * not tracked at all -- outside the streaming footprint, e.g. an all-air
 	//     chunk the sky-band optimisation never admits. Vetoing there would
 	//     leave the character hovering wherever it stepped into open sky.
@@ -394,7 +410,9 @@ bool UVoxelCharacterMovementComponent::IsTerrainReadyAt(const FVector& Pos) cons
 	bool bTracked = false;
 	bool bHasComponent = false;
 	int32 Quads = 0;
-	if (Subsystem->DebugChunkStatusAt(Pos, bTracked, bHasComponent, Quads) && bTracked && !bHasComponent)
+	bool bSettled = false;
+	if (Subsystem->DebugChunkStatusAt(Pos, bTracked, bHasComponent, Quads, bSettled) && bTracked && !bHasComponent
+	    && !bSettled)
 	{
 		return false;
 	}
@@ -505,12 +523,12 @@ void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 	UpdateCrouchState(Pos);
 
 	// Being GROUNDED on a real solid voxel is proof the terrain here has
-	// arrived -- it trumps the streaming-readiness probe unconditionally. This
-	// ordering matters: IsTerrainReadyAt also inspects the chunk one below, and
-	// when standing on the floor of a resident chunk that lower chunk is solid
-	// underground rock, which is legitimately never meshed (so "tracked, no
-	// component"). Without this short-circuit that would read as "not ready" and
-	// hold a character that is plainly standing on the ground.
+	// arrived -- it trumps the streaming-readiness probe unconditionally, and is
+	// a cheap short-circuit that skips the chunk lookup on the common path.
+	//
+	// (This comment used to justify itself by saying IsTerrainReadyAt "also
+	// inspects the chunk one below" -- it does not, and has not since that probe
+	// was made local; see the rationale in IsTerrainReadyAt itself.)
 	const bool bGroundedNow = IsGroundedAt(Pos);
 
 	// Jump-feel timers, advanced before the jump is considered so a landing
@@ -518,6 +536,13 @@ void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 	if (bGroundedNow)
 	{
 		TimeSinceGroundedSeconds = 0.0;
+		// Remember the floor we are standing on. This is the whole basis of the
+		// "known floor" rule below: once the character has physically rested on
+		// a voxel, the mover no longer has to treat the space beneath it as
+		// unknown. Stored as the BOTTOM FACE (stance-independent) so a crouch
+		// transition cannot shift the remembered height.
+		bHadGroundContact = true;
+		LastGroundedFeetZ = Pos.Z - GetHalfExtentZ();
 	}
 	else
 	{
@@ -525,13 +550,29 @@ void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 	}
 	JumpBufferRemainingSeconds = FMath::Max(0.0, JumpBufferRemainingSeconds - DeltaTime);
 
-	// Terrain not streamed underneath (see IsTerrainReadyAt): suspend gravity
-	// and hold Z. Horizontal movement is deliberately still allowed -- freezing
-	// completely would strand the player with no way to walk back to loaded
-	// ground -- but with no voxels to sweep against it is unobstructed, which is
-	// the honest behaviour: there is nothing there yet. The HUD shows "WAITING
-	// FOR TERRAIN" so this reads as a state, not a bug.
-	bWaitingForTerrain = !bGroundedNow && !IsTerrainReadyAt(Pos);
+	// Terrain not streamed underneath (see IsTerrainReadyAt).
+	//
+	// THE KNOWN-FLOOR RULE. This guard exists because the mover cannot tell
+	// "empty air" from "not generated yet", so it must not let the character
+	// fall through space that has no voxels in it. But that reasoning only
+	// holds while the floor is genuinely UNKNOWN. Once the character has
+	// actually rested on a voxel, there is a floor, we know its height, and
+	// freezing is both unnecessary and actively wrong:
+	//
+	//   * a jump is cancelled the instant it leaves the ground -- the rise is
+	//     zeroed on the first airborne frame, so the character never gets off
+	//     the floor at all. Measured: apex 0.00 m on the synthetic sampler,
+	//     where the chunk overhead is admitted but not yet meshed.
+	//   * it cannot self-correct, because holding Z means never descending back
+	//     into the resident chunk that would clear the condition.
+	//
+	// So the hold-position branch is now reserved for the case it was written
+	// for: spawned or toggled into walk mode over terrain that has never
+	// existed, with no ground contact yet to reason from. Everything after a
+	// real ground contact takes the clamp below instead, which lets gravity and
+	// jumps run normally and merely refuses to sink below the known floor.
+	const bool bTerrainUnready = !bGroundedNow && !IsTerrainReadyAt(Pos);
+	bWaitingForTerrain = bTerrainUnready && !bHadGroundContact;
 	if (bWaitingForTerrain)
 	{
 		VerticalVelocity = 0.0;
@@ -738,6 +779,36 @@ void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 		PendingAbruptZJumpUU += NewPos.Z - Pos.Z;
 	}
 
+	// --- Known-floor clamp (see the known-floor rule above) -----------------
+	//
+	// Terrain under us is unready, but we have stood on a real voxel before, so
+	// we know a floor exists at LastGroundedFeetZ. Gravity and jumps ran
+	// normally above; all this does is refuse to sink through that height,
+	// which is the ONLY thing the hold-position branch was actually protecting.
+	//
+	// Deliberately NOT flagged as "waiting for terrain": the character is
+	// standing on a floor it verified itself, which is a normal state, not a
+	// degraded one. Nothing here teleports -- unlike the analytic backstop
+	// below, this height was measured, not predicted.
+	//
+	// The known limit: walk off a cliff into unstreamed space and the
+	// remembered floor is behind you rather than beneath you, so this clamp
+	// would catch you at the ledge's height. That case belongs to the analytic
+	// backstop below, which is why this only engages while terrain is unready
+	// and leaves the genuine long fall to it.
+	if (bTerrainUnready && bHadGroundContact && !bSwimming)
+	{
+		const double MinCenterZ = LastGroundedFeetZ + GetHalfExtentZ();
+		if (NewPos.Z < MinCenterZ)
+		{
+			NewPos.Z = MinCenterZ;
+			if (VerticalVelocity < 0.0)
+			{
+				VerticalVelocity = 0.0;
+			}
+		}
+	}
+
 	// --- Backstop: never fall through the surface into unstreamed space -----
 	//
 	// IsTerrainReadyAt (above) catches "the chunk I am in is queued", but it
@@ -768,7 +839,9 @@ void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 			bool bTracked = false;
 			bool bHasComponent = false;
 			int32 Quads = 0;
-			const bool bResident = Subsystem->DebugChunkStatusAt(NewPos, bTracked, bHasComponent, Quads) && bHasComponent;
+			bool bSettledHere = false;
+			const bool bResident =
+				Subsystem->DebugChunkStatusAt(NewPos, bTracked, bHasComponent, Quads, bSettledHere) && bHasComponent;
 			if (!bResident)
 			{
 				NewPos.Z = SurfaceUU + GetHalfExtentZ();

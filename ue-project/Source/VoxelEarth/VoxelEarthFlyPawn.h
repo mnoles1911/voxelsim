@@ -94,6 +94,26 @@ public:
 	static int32 GetSpeedTierCount() { return VoxelMovementTuning::kNumSpeedTiers; }
 	double GetEffectiveWalkSpeedUU() const;
 
+	// --- Scripted input (unattended movement fixture, -VoxelWalkTest) -------
+	//
+	// Overrides the cached WASD axis values so an unattended run can exercise
+	// the mover with no keyboard attached.
+	//
+	// A SEPARATE channel rather than writing CurrentForwardInput/
+	// CurrentRightInput directly, because that would silently do nothing: UE
+	// polls input before actor tick, so the axis bindings re-set those fields
+	// to 0 every frame before TickWalkMode reads them. Only the AXIS values
+	// need this treatment -- sprint, crouch and jump are pushed to the mover on
+	// key EVENTS rather than per frame, so a fixture drives those through
+	// UVoxelCharacterMovementComponent's own API (see GetWalkMovement).
+	void SetScriptedInput(float Forward, float Right);
+	void ClearScriptedInput() { bScriptedInputActive = false; }
+	bool IsScriptedInputActive() const { return bScriptedInputActive; }
+
+	// The mover itself, so a fixture can push jump/crouch/sprint/tier and read
+	// grounded/crouched/velocity back without duplicating the forwarders.
+	UVoxelCharacterMovementComponent* GetWalkMovement() const { return WalkMovement; }
+
 	// Steps the fly speed table (Delta = +1 / -1), clamped. Public so the debug
 	// overlay can drive it as well as the ']' / '[' keys.
 	void AdjustFlySpeed(int32 Delta);
@@ -198,6 +218,13 @@ private:
 	float CurrentForwardInput = 0.f;
 	float CurrentRightInput = 0.f;
 	float CurrentUpInput = 0.f;
+
+	// Scripted-input override (see SetScriptedInput). Walk mode only -- fly
+	// mode applies its axes in the input callback itself, which a fixture has
+	// no reason to drive.
+	bool bScriptedInputActive = false;
+	float ScriptedForwardInput = 0.f;
+	float ScriptedRightInput = 0.f;
 
 	// LeftShift held. One key, two meanings -- see IsShiftHeld().
 	bool bShiftHeld = false;

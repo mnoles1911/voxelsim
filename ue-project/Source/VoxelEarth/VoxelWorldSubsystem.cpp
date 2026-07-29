@@ -13747,9 +13747,10 @@ void UVoxelWorldSubsystem::TickCavernShot(float DeltaSeconds)
 				// One voxel PAST the surface, so the sample lands in the solid
 				// chunk that owns the visible face rather than in the air chunk
 				// in front of it.
-				bool bTracked = false, bHasComponent = false;
+				bool bTracked = false, bHasComponent = false, bSettledUnused = false;
 				int32 Quads = 0;
-				const bool bKnown = DebugChunkStatusAt(Hit + Dir * VoxelCoords::VoxelSizeUU, bTracked, bHasComponent, Quads);
+				const bool bKnown =
+					DebugChunkStatusAt(Hit + Dir * VoxelCoords::VoxelSizeUU, bTracked, bHasComponent, Quads, bSettledUnused);
 				Res += FString::Printf(TEXT("[+%.0fdeg wall at %.1fm: %s] "), ElevDeg, DistM,
 				                       !bKnown          ? TEXT("NOT TRACKED -> renders as a hole")
 				                       : !bHasComponent ? TEXT("tracked but NOT MESHED -> renders as a hole")
@@ -13899,7 +13900,7 @@ bool UVoxelWorldSubsystem::TryPlace(const FVector& CameraWorldLocation, const FV
 }
 
 bool UVoxelWorldSubsystem::DebugChunkStatusAt(const FVector& WorldPos, bool& bOutTracked, bool& bOutHasComponent,
-                                              int32& OutQuads) const
+                                              int32& OutQuads, bool& bOutSettled) const
 {
 	if (!Impl)
 	{
@@ -13910,6 +13911,7 @@ bool UVoxelWorldSubsystem::DebugChunkStatusAt(const FVector& WorldPos, bool& bOu
 	bOutTracked = (Rec != nullptr);
 	bOutHasComponent = Rec && Rec->HoldsGeometry();
 	OutQuads = Rec ? Rec->LastQuadCount : 0;
+	bOutSettled = Rec && Rec->bMeshSettled;
 	return true;
 }
 

@@ -464,8 +464,17 @@ void AVoxelEarthFlyPawn::TickWalkMode(float DeltaTime)
 	{
 		return;
 	}
-	WalkMovement->SetMoveInput(CurrentForwardInput, CurrentRightInput, CurrentUpInput);
+	const float ForwardIn = bScriptedInputActive ? ScriptedForwardInput : CurrentForwardInput;
+	const float RightIn = bScriptedInputActive ? ScriptedRightInput : CurrentRightInput;
+	WalkMovement->SetMoveInput(ForwardIn, RightIn, CurrentUpInput);
 	WalkMovement->TickMovement(DeltaTime);
+}
+
+void AVoxelEarthFlyPawn::SetScriptedInput(float Forward, float Right)
+{
+	bScriptedInputActive = true;
+	ScriptedForwardInput = Forward;
+	ScriptedRightInput = Right;
 }
 
 // ---------------------------------------------------------------------------
