@@ -130,6 +130,14 @@ CODEC_ZSTD = 1
 
 MODE_CONSTANT = 0
 MODE_CODED = 1
+# RAW (§4): the block's literal plane elements, row-major, native byte width
+# for that plane — <i2 LE for elevation (2 bytes/px), u1 for flow (1 byte/px)
+# — with NO prediction and NO zigzag applied. resid_bits is meaningless in
+# this mode and is always written 0 (§4/§5). Under CODEC_RAW a RAW elevation
+# block and a resid_bits=16 CODED elevation block have the IDENTICAL byte
+# length (both 2 bytes/px) — comp_len alone can't distinguish them, only
+# `mode` can, so a decoder must branch on mode before doing anything else
+# with the payload.
 MODE_RAW = 2
 
 SECTION_ELEV_INDEX = 1
@@ -437,6 +445,15 @@ def _decode_plane(
         if mode == MODE_CONSTANT:
             if comp_len != 0:
                 raise ValueError("CONSTANT block must have comp_len 0")
+            # const_cp is a signed i16 on the wire (§4) regardless of plane;
+            # for the flow plane (uint8 elements) a corrupted/out-of-range
+            # value must be rejected here rather than silently wrapping on
+            # assignment into the uint8 output array below.
+            lo, hi = np.iinfo(out_dtype).min, np.iinfo(out_dtype).max
+            if const_cp < lo or const_cp > hi:
+                raise ValueError(
+                    f"const_cp {const_cp} out of range [{lo}, {hi}] for this plane"
+                )
             out[y0:y0 + bs, x0:x0 + bs] = const_cp
             continue
 
@@ -467,12 +484,19 @@ def _decode_plane(
 
 # ---------------------------------------------------------------- top level
 
-def encode_v2(tile: TileV2, *, raw_blocks: set[tuple[int, int]] | None = None) -> bytes:
+def encode_v2(
+    tile: TileV2,
+    *,
+    raw_blocks: set[tuple[int, int]] | None = None,
+    flow_raw_blocks: set[tuple[int, int]] | None = None,
+) -> bytes:
     """Encode a v2 fine tile (docs/vxtl-v2-format.md §3-§6).
 
-    `raw_blocks` forces the named (bx, by) elevation blocks to MODE_RAW — see
-    _encode_plane's docstring for why this is an explicit opt-in rather than
-    a size-minimising heuristic.
+    `raw_blocks` / `flow_raw_blocks` force the named (bx, by) elevation /
+    flow blocks to MODE_RAW — see _encode_plane's docstring for why this is
+    an explicit opt-in rather than a size-minimising heuristic. They are
+    independent: forcing an elevation block RAW says nothing about the flow
+    block at the same coordinate, and vice versa.
     """
     flags = FLAG_FLOW_PRESENT if tile.flow is not None else 0
 
@@ -491,7 +515,7 @@ def encode_v2(tile: TileV2, *, raw_blocks: set[tuple[int, int]] | None = None) -
             block_log2=tile.block_log2,
             codec=tile.codec,
             elem_dtype="u1",
-            force_raw_blocks=None,
+            force_raw_blocks=flow_raw_blocks,
         )
         sections += [(SECTION_FLOW_INDEX, flow_index), (SECTION_FLOW_DATA, flow_data)]
 

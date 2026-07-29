@@ -25,6 +25,10 @@ FIXTURE_PATH = (
     Path(__file__).resolve().parents[2]
     / "voxel-core" / "tests" / "fixtures" / "vxtl_v2_golden_512.vxtl"
 )
+FLOW_FIXTURE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "voxel-core" / "tests" / "fixtures" / "vxtl_v2_golden_flow_512.vxtl"
+)
 
 
 # --------------------------------------------------------------- helpers ---
@@ -212,6 +216,73 @@ def test_v2_flow_plane_roundtrip():
     assert back.flow[3, 20] & tc.FLOW_BIT_CHANNEL
     assert back.flow[3, 21] & tc.FLOW_BIT_BANK
     assert back.flow[3, 21] & tc.FLOW_BIT_DEPOSITION
+
+
+def test_v2_flow_constant_block_carries_full_u8_range():
+    """The C++ decoder flagged this as unverified: `const_cp` is a signed i16
+    on the wire (§4) even for the flow plane, whose elements are uint8. A
+    constant flow block with every bit set (255 = log2 31 | channel | bank |
+    deposition) must decode back to exactly 255, not wrap or sign-extend."""
+    size, block_log2 = 16, 4  # single block
+    cp = _smooth_field(size)
+    flow = np.full((size, size), 0xFF, dtype=np.uint8)
+    tile = tc.TileV2(seed=1, x=0, y=0, size=size, elevation_cp=cp, block_log2=block_log2, flow=flow)
+    data = tc.encode_v2(tile)
+
+    off = tc._HEADER.size + tc._V2_EXT.size
+    table = [tc._SECTION_ENTRY.unpack_from(data, off + i * tc._SECTION_ENTRY.size) for i in range(4)]
+    flow_index_off = next(o for sid, o, ln in table if sid == tc.SECTION_FLOW_INDEX)
+    offset, comp_len, mode, const_cp, resid_bits, pad = tc._BLOCK_ENTRY.unpack_from(data, flow_index_off)
+    assert mode == tc.MODE_CONSTANT
+    assert const_cp == 255  # NOT -1: must be read/written as an unsigned u8 value
+
+    back = tc.decode_v2(data)
+    np.testing.assert_array_equal(back.flow, flow)
+
+
+def test_v2_decode_rejects_out_of_range_flow_const_cp():
+    """A corrupted CONSTANT flow block whose const_cp doesn't fit uint8 must
+    be rejected, not silently wrapped by the uint8 output assignment."""
+    size, block_log2 = 16, 4
+    cp = _smooth_field(size)
+    flow = np.zeros((size, size), dtype=np.uint8)
+    tile = tc.TileV2(seed=1, x=0, y=0, size=size, elevation_cp=cp, block_log2=block_log2, flow=flow)
+    data = bytearray(tc.encode_v2(tile))
+
+    off = tc._HEADER.size + tc._V2_EXT.size
+    table = [tc._SECTION_ENTRY.unpack_from(bytes(data), off + i * tc._SECTION_ENTRY.size) for i in range(4)]
+    flow_index_off = next(o for sid, o, ln in table if sid == tc.SECTION_FLOW_INDEX)
+    struct.pack_into("<h", data, flow_index_off + 13, -1)  # const_cp field, out of u8 range
+    with pytest.raises(ValueError):
+        tc.decode_v2(bytes(data))
+
+
+def test_v2_flow_raw_block_forced_and_roundtrips():
+    """RAW for the flow plane is ONE byte per pixel (u1), not two (§6: 'same
+    block structure' means same mechanics, not the elevation plane's element
+    width). Force a flow block to RAW and confirm both the wire byte count
+    and the round-tripped values."""
+    size, block_log2 = 32, 4  # 2x2 blocks of 16x16
+    cp = _smooth_field(size)
+    yy, xx = np.mgrid[0:size, 0:size]
+    flow = ((xx * 3 + yy * 7) % 251).astype(np.uint8)
+    flow[5, 5] |= tc.FLOW_BIT_CHANNEL
+    flow[5, 6] |= tc.FLOW_BIT_BANK | tc.FLOW_BIT_DEPOSITION
+
+    tile = tc.TileV2(seed=1, x=0, y=0, size=size, elevation_cp=cp, block_log2=block_log2, flow=flow)
+    data = tc.encode_v2(tile, flow_raw_blocks={(0, 0)})
+
+    off = tc._HEADER.size + tc._V2_EXT.size
+    table = [tc._SECTION_ENTRY.unpack_from(data, off + i * tc._SECTION_ENTRY.size) for i in range(4)]
+    flow_index_off = next(o for sid, o, ln in table if sid == tc.SECTION_FLOW_INDEX)
+    entry = tc._BLOCK_ENTRY.unpack_from(data, flow_index_off)  # block (bx=0, by=0)
+    assert entry[2] == tc.MODE_RAW
+    bs = 1 << block_log2
+    assert entry[1] == bs * bs * 1  # comp_len: 1 byte/px under CODEC_RAW, not 2
+    assert entry[4] == 0  # resid_bits meaningless for RAW, written 0
+
+    back = tc.decode_v2(data)
+    np.testing.assert_array_equal(back.flow, flow)
 
 
 def test_v2_no_flow_plane_by_default():
@@ -431,3 +502,53 @@ def test_v2_golden_fixture_decodes():
             resid_bits_seen.add(entry[4])
     assert modes_seen == {tc.MODE_CONSTANT, tc.MODE_CODED, tc.MODE_RAW}
     assert resid_bits_seen == {16, 32}
+
+
+@pytest.mark.skipif(
+    not FLOW_FIXTURE_PATH.exists(), reason=f"fixture not generated: {FLOW_FIXTURE_PATH}"
+)
+def test_v2_golden_flow_fixture_decodes():
+    """Companion to test_v2_golden_fixture_decodes: the first golden fixture
+    has no flow plane, so §6 was never cross-language exercised. This one
+    sets flags bit0 and puts a CONSTANT (all bits set, 0xFF), a CODED, and a
+    RAW flow block in one file, with non-zero channel/bank/deposition/log2
+    bits throughout — so a decoder that mis-shifts a bit, mis-signs
+    const_cp, or reads RAW as 2 bytes/px instead of 1 fails here, not by
+    coincidence passing on all-zero data."""
+    data = FLOW_FIXTURE_PATH.read_bytes()
+    tile = tc.decode_v2(data)
+    assert tile.size == 512
+    assert tile.block_log2 == 8
+    assert tile.flow is not None
+
+    _, _, _, _, _, flags = struct.unpack_from("<BBBBHH", data, tc._HEADER.size)
+    assert flags & tc.FLAG_FLOW_PRESENT
+
+    bs = 1 << tile.block_log2
+    nb = tile.size // bs
+    off = tc._HEADER.size + tc._V2_EXT.size
+    table = [tc._SECTION_ENTRY.unpack_from(data, off + i * tc._SECTION_ENTRY.size) for i in range(4)]
+    flow_index_off = next(o for sid, o, ln in table if sid == tc.SECTION_FLOW_INDEX)
+
+    modes_seen = {}
+    for i in range(nb * nb):
+        by, bx = divmod(i, nb)
+        entry = tc._BLOCK_ENTRY.unpack_from(data, flow_index_off + i * tc._BLOCK_ENTRY.size)
+        modes_seen[(bx, by)] = entry
+    kinds = {e[2] for e in modes_seen.values()}
+    assert kinds == {tc.MODE_CONSTANT, tc.MODE_CODED, tc.MODE_RAW}
+
+    # The CONSTANT block: const_cp must be the unsigned byte 255, not -1.
+    constant_entries = [e for e in modes_seen.values() if e[2] == tc.MODE_CONSTANT]
+    assert any(e[3] == 255 for e in constant_entries)
+
+    # The RAW block: comp_len must be bs*bs*1 (one byte/px), never bs*bs*2.
+    raw_entries = [e for e in modes_seen.values() if e[2] == tc.MODE_RAW]
+    assert raw_entries and all(e[1] == bs * bs for e in raw_entries)
+
+    # Every flag bit actually appears somewhere in the decoded plane.
+    assert (tile.flow & tc.FLOW_BIT_CHANNEL).any()
+    assert (tile.flow & tc.FLOW_BIT_BANK).any()
+    assert (tile.flow & tc.FLOW_BIT_DEPOSITION).any()
+    assert (tile.flow == 0xFF).any()
+    assert (tile.flow & tc.FLOW_LOG2_MASK).max() <= 31
