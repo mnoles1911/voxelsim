@@ -432,3 +432,127 @@ offset 44, 56 bytes total), at both `cs_6_0` and `cs_6_6`.
 - Source: `voxel-core/shaders/worldgen.ush` on `claude/wave-c-determinism`.
 - Compiler: the same pinned Microsoft DXC `v1.9.2602.24`, via
   `tools/compile-shaders.ps1` with no flag changes.
+
+## 2026-07-29 respin: worldgen v10, structured sub-30 m detail (v9 -> v10)
+
+`VXC_WORLDGEN_VERSION_USH` 9 -> 10. `worldgen.ush` gained the mirror of four
+CPU changes (`amplifier.cpp`, `carrier.h`, `detail_rill.h`,
+`detail_bedding.h`): the curvature gate on the shaping band and its
+half-excursion form on the microrelief band, the rill term, the bedding term,
+and the fine-tier octave table selected by `isFineTier(pxMm)`.
+
+Three mirroring decisions worth recording, because each is a place where the
+"obviously equivalent" form is a divergence:
+
+1. **The gates truncate in a specific order and are not foldable.** The CPU
+   writes `landformMm * sScale / 1024 * cScale / 1024`, two successive
+   truncating q10 divides, and the microrelief band now does the same with
+   `cScaleMicro`. Folding either pair into one divide by `1024*1024` gives a
+   different number.
+2. **`floorDiv` and `truncDiv` are not interchangeable, and which one is
+   correct changes between adjacent functions.** `detail_rill.h` uses
+   `floorDiv` throughout; `carrier.h`'s curvature evaluation uses truncation;
+   `carrierCurvatureTierNormQ10` deliberately uses `floorDiv` so a crest and a
+   hollow of equal magnitude gate equally; and `evalSurface`'s
+   `(cScale - 1024) / 2` is a C++ `/` on a routinely negative *odd* numerator,
+   so it must be `truncDiv`. All four were checked by swapping the helper and
+   confirming the gate fails (see below).
+3. **`beddingMm` takes `baseMm`**, the carrier height before detail, not the
+   final surface. Beds sit at fixed absolute elevations.
+
+`beddingHashField16`'s `shift` parameter was NOT mirrored as a parameter: a
+shift by a non-literal is `VARIABLE_SHIFT` under `tools/lint-shader-ub.py`, and
+the same construct was deleted from this file once before (`coarseRep`'s
+`1 << level`). The helper here takes the already-extracted 16 bits and each
+caller shifts by its own literal.
+
+`python tools/lint-shader-ub.py voxel-core/shaders --spv-dir
+voxel-core/shaders/prebuilt` is clean on the respun bytecode: still ZERO
+`OpSDiv`/`OpSRem`/`OpSMod` across all seven modules.
+
+**ColumnMain and VoxelizeMain moved** (92,652 -> 168,064 and 110,816 ->
+185,912 bytes). `ScanAddMain` is byte-identical. The remaining four —
+`MeshCountMain`, `MeshEmitMain`, `ScanBlocksMain`, `ScanSumsMain` — kept their
+byte LENGTH exactly but not their bytes, for the module-layout reason recorded
+in respin 3: the new detail functions are declared ahead of them in the same
+translation unit, so SPIR-V result IDs renumber. Verified that this is layout
+and not staleness — recompiling the *base* `worldgen.ush` (commit `987f74c`)
+from the pinned DXC reproduces the base committed `.spv` for those kernels
+exactly, so the prebuilt was current before this respin, and the quad
+comparison passes after it.
+
+### Overflow margins re-checked in the shader's own arithmetic
+
+Not inherited from the CPU headers — re-derived against int64's 9.22e18 with
+`C = 9e6 mm` (the elevation clamp):
+
+| expression | bound | margin |
+|---|---|---|
+| curvature stage 1, `4C * kCarrierCurveDen` | 3.69e10 | 2.5e8x |
+| curvature stage 2, `4C * kCarrierValueDen` | 2.32e17 | **40x** (tightest) |
+| unit conversion, `8C * kCurveQ10One * kMmPerMSquared` | 7.4e16 | 125x |
+| tier norm, `curve * pxMm * pxMm` | 7.4e16 | 125x |
+| `rillQuinticQ`, `t^3 * inner <= T^5` | 1.15e18 | 8x |
+| bedding, `dipQ10 * perpRaw` | 1.97e15 | 4.7e3x |
+
+The tier normalisation's bound does **not** grow with a finer pitch: it
+re-forms exactly the quantity `carrierCurvatureMmPerM2Q10` divided down, so it
+is capped at `8C * 1024 * 1e6` at any pitch. Evaluation is left to right, so
+the intermediate `curve * pxMm` is smaller still (2.5e12 at 30000, 3.9e13 at
+1875).
+
+### The fixtures had to be extended before this respin proved anything
+
+`gpu_harness.cpp` gained three things, each closing a hole that let the gate
+pass while testing nothing:
+
+* a **per-region tile pitch**, because every fixture ran at 30000 and the
+  entire fine octave ladder was mirrored and then never executed;
+* a **per-region elevation divisor** (`ScaledTileSampler`), because on
+  `SyntheticTileSampler`'s own raster the curvature gate is pinned at a clamp
+  in **100% of compared columns** — measured tier-normalised |curvature|
+  3,295..46,094 q10 against a knee of 512. A clamped gate catches a sign error
+  but nothing about magnitude;
+* three regions using them: `fine-tier`, `gentle-crest`, `gentle-hollow` and
+  `gentle-fine-crest`.
+
+Negative controls run on this box, each a one-line edit to `worldgen.ush`
+followed by a respin and a gate run:
+
+| injected fault | caught by | not caught by |
+|---|---|---|
+| `kFineTierMaxPixelMm` 3750 -> 1875 | `fine-tier` (576/576 columns) | the three coarse regions |
+| `beddingMm(..., baseMm + 1)` | all 4 then-existing regions (1630 columns) | — |
+| `kCarrierCurveDen` 1024 -> 2048 (curvature halved) | the 3 gentle regions (9196 mismatches, 40% of columns) | **all four saturated regions, 0 mismatches** |
+| tier norm `floorDiv` -> `truncDiv` | `gentle-fine-crest` (151 columns) | every other region |
+| micro gate `truncDiv` -> `floorDiv` | `gentle-hollow` (318 columns) | every other region |
+
+The third row is the point: before the gentle regions existed, a 2x error in
+the curvature chain passed the gate completely.
+
+| Mode | Result | GPU output digest (columns+cells+quads) |
+|---|---|---|
+| default (7 regions) | **PASS**, bit-exact, 21632 columns / 804864 cells / 14202 quads | `e4b94bf51ede7778` |
+
+Device: AMD Radeon RX 7800 XT. **AMD ONLY** — there is no NVIDIA card on this
+box, so the cross-vendor leg of the M0 gate is still owed for these bytes as it
+was for the previous respin (`tools/run-nvidia-digest.sh`).
+
+CPU reference digest `vxc_bench --radius 128 --digest` is `8d74d670c53a21d3`
+before and after this respin: the shader is a mirror, and it moved no CPU
+behaviour.
+
+sha256 of the respun files:
+
+```
+b47d559eae047c2ad5da02c18a9b4fcb7e1ebcc54f3ece7d30b1e30f05ca551e  worldgen.ColumnMain.spv
+814bf996016d29ab1e125cdc72e487dae83c366d49b4bf889fcea7f034d84536  worldgen.MeshCountMain.spv
+3d265afe6e2f4d6a95bbf6670481834b6a419d42b08ff961c3e5497bb78d4e19  worldgen.MeshEmitMain.spv
+a88525da0b11441cafa3d7a823267f3cb878e180639723d48d76a86c6900c2b6  worldgen.ScanAddMain.spv
+2559f90b0cf10755159200f0a13dbd5172baa13b5521918a41ebdcb8d55192d2  worldgen.ScanBlocksMain.spv
+d90c7993c7f17a000da3a1c4d40e894ae7ccf161d6ca5f3fb15a685fd336b505  worldgen.ScanSumsMain.spv
+2582693b43afd4905ebacb67c1cf77913d2379b4b6640b99f0c1df05b05389d2  worldgen.VoxelizeMain.spv
+```
+
+- Compiler: the same pinned Microsoft DXC `v1.9.2602.24`, via
+  `tools/compile-shaders.ps1 -UpdatePrebuilt`, no flag changes.

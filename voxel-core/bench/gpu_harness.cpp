@@ -876,10 +876,72 @@ void destroyContext(GpuContext& ctx) {
 
 // --- one dispatch region ----------------------------------------------------
 
+// SyntheticTileSampler with its elevations divided down by a constant.
+//
+// WHY A HARNESS-LOCAL SAMPLER EXISTS AT ALL (worldgen v10). v10's curvature gate
+// is a RAMP between two clamps, and on SyntheticTileSampler's raster it is
+// pinned at a clamp in 100% of the columns this harness compares -- measured,
+// not guessed: tier-normalised |curvature| runs 3,295..46,094 q10 against a knee
+// of 512, i.e. 6x to 90x saturated, on every region and at both pitches. The
+// sampler is a COVERAGE sampler and its terrain is far rougher than the
+// realistic 30 m raster kCurvatureKneeQ10 was measured against (mean 288 q10).
+//
+// A saturated gate still catches a sign error -- crests clamp high, hollows
+// clamp low, and the regions below do both -- but it cannot catch an error in
+// the MAGNITUDE of anything upstream of it: a wrong basis denominator, a dropped
+// stage-1 divide or a mis-scaled tier normalisation all still saturate, and all
+// still pass. It also makes the two rounding choices in that chain
+// (carrierCurvatureTierNormQ10's floorDiv, and evalSurface's truncating
+// `(cScale - 1024) / 2`) unobservable, because the excursion is only ever the
+// clamp's own even value. Both were confirmed invisible by swapping the helper
+// in worldgen.ush and watching the gate still pass.
+//
+// Dividing the raster down moves curvature into the ramp without touching
+// worldgen, tiles.h, or the existing fixtures: it is just a gentler world, and
+// both the CPU reference and the uploaded GPU raster read it through this same
+// object, so it is as deterministic as the sampler it wraps. A divisor of 1 is
+// the identity (floorDiv by 1), so the pre-existing regions are bit-unchanged.
+class ScaledTileSampler final : public ITileSampler {
+public:
+    ScaledTileSampler(uint64_t seed, int32_t pixelSizeMm, int64_t elevationDivisor)
+        : inner_(seed, pixelSizeMm), divisor_(elevationDivisor) {}
+
+    int32_t pixelSizeMm() const override { return inner_.pixelSizeMm(); }
+    int32_t elevationMm(int64_t px, int64_t py) override {
+        // floorDiv, not `/`: elevations are routinely negative (this sampler
+        // makes oceans), and a truncating divide would round the two sides of
+        // sea level differently -- the exact operand pattern docs/determinism.md
+        // bans. The divisor is a fixture constant, so this is deterministic.
+        return static_cast<int32_t>(floorDiv(inner_.elevationMm(px, py), divisor_));
+    }
+    ClimateSample climate(int64_t px, int64_t py) override { return inner_.climate(px, py); }
+
+private:
+    SyntheticTileSampler inner_;
+    int64_t divisor_;
+};
+
 struct RegionSpec {
     const char* name;
     int32_t originVx, originVy;
     uint32_t width, height; // dispatch columns
+    // Tile raster pitch for this fixture's SyntheticTileSampler, and therefore
+    // WorldGenParams::PixelSizeMm.
+    //
+    // WHY THIS IS PER-REGION RATHER THAN ONE CONSTANT (worldgen v10). evalSurface
+    // now BRANCHES on the pitch: vxc::isFineTier(pxMm) (pxMm <= 3750) selects
+    // kFineDetailOctaves -- a different table, a different length, a different
+    // band split, and a different channel-to-lattice mapping -- from
+    // kDetailOctaves. Both branches are mirrored in worldgen.ush, and a mirror
+    // of a branch that only one side ever takes is not a mirror that has been
+    // tested. Before this field every fixture ran at 30000 and the entire fine
+    // ladder was unexercised on the GPU: it would have compiled, linted and
+    // PASSED with the fine table transposed, mis-channelled or simply absent.
+    int32_t pixelSizeMm;
+    // Elevation divisor for ScaledTileSampler; 1 is the identity. See that
+    // class's comment for why a gentler raster is the only way this harness can
+    // reach the INTERIOR of v10's curvature ramp rather than only its clamps.
+    int64_t elevationDivisor;
 };
 
 struct RegionResult {
@@ -1139,7 +1201,7 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
              "per worldgen.ush's VoxelizeMain contract");
     }
 
-    SyntheticTileSampler tiles(seed);
+    ScaledTileSampler tiles(seed, region.pixelSizeMm, region.elevationDivisor);
     const int64_t pixelSizeMm = tiles.pixelSizeMm();
 
     // Raster window covering every bilinear tap the dispatch touches
@@ -1159,9 +1221,11 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
     const uint32_t rasterW = static_cast<uint32_t>(pxMax - pxMin + 1);
     const uint32_t rasterH = static_cast<uint32_t>(pyMax - pyMin + 1);
 
-    std::printf("[%s] origin (%d,%d) %ux%u columns, raster window (%lld,%lld) %ux%u px\n",
+    std::printf("[%s] origin (%d,%d) %ux%u columns, raster window (%lld,%lld) %ux%u px, "
+                "pitch %lld mm (%s tier)\n",
                 region.name, region.originVx, region.originVy, region.width, region.height,
-                (long long)pxMin, (long long)pyMin, rasterW, rasterH);
+                (long long)pxMin, (long long)pyMin, rasterW, rasterH, (long long)pixelSizeMm,
+                pixelSizeMm <= 3750 ? "FINE" : "coarse");
 
     // CPU columns for the WHOLE region, computed once up front. This serves
     // two purposes and both need it before the GPU dispatch: (a) it derives
@@ -1172,7 +1236,7 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
     // returned to the caller and reused as ground truth for BOTH the
     // ColumnMain field comparison and the VoxelizeMain cell comparison, so
     // vxc::Amplifier::column is never computed twice for the same column.
-    SyntheticTileSampler cpuTiles(seed);
+    ScaledTileSampler cpuTiles(seed, region.pixelSizeMm, region.elevationDivisor);
     Amplifier cpuAmp(seed, cpuTiles);
     std::vector<ColumnSample> cpuCols(size_t(region.width) * region.height);
     int64_t vzMin = INT64_MAX, vzMax = INT64_MIN;
@@ -2759,10 +2823,56 @@ int main(int argc, char** argv) {
     // "positive" is the control: same size, same code path, no negative
     // coordinate anywhere in it. If it passes while the other two fail, the
     // fault is coordinate-sign-dependent; if all three fail, it is not.
+    //
+    // THE FOURTH REGION EXERCISES THE OTHER OCTAVE TABLE (worldgen v10). The
+    // three above all run at the 30 m pitch, which is the COARSE branch of
+    // evalSurface's isFineTier test; without a fixture below 3750 mm the fine
+    // ladder -- 4 octaves, 1 landform, its own channel-to-lattice mapping --
+    // was mirrored into worldgen.ush and then never executed on the GPU by
+    // anything. That is the same shape of hole as CoarseScale defaulting to 0
+    // (see the params note in runRegion): the gate passes and tests nothing.
+    //
+    // 3750 mm is scale 8, the largest pitch isFineTier accepts, so it also pins
+    // the THRESHOLD rather than merely landing somewhere inside the fine band --
+    // an off-by-one in the comparison (`<` for `<=`) sends the CPU and the GPU
+    // down different tables and shows up here as a total mismatch.
+    //
+    // It is deliberately smaller than the others. SyntheticTileSampler's octave
+    // lattices are in PIXELS, so at an 8x finer pitch the same noise produces 8x
+    // the world-space grade; a 64x64 footprint of that has enough vertical
+    // relief to overrun runMeshChain()'s 65,536-mask cap. 24x24 columns is 3x3
+    // bricks -- one interior brick, so the mesh path is still compared -- over a
+    // 2.4 m footprint, which the cap comfortably covers.
+    //
+    // THE LAST TWO REGIONS REACH THE INTERIOR OF THE CURVATURE RAMP. On the
+    // sampler's own raster the v10 gate is clamped in 100% of the columns above
+    // (see ScaledTileSampler), so everything upstream of the gate is checked
+    // only through a two-level step function. Dividing elevations by 100 puts
+    // tier-normalised curvature at roughly -460 q10 under "origin" and +100..170
+    // under "positive", against a knee of 512 -- inside the ramp on the CREST
+    // side and the HOLLOW side respectively, so the gate's output becomes a
+    // continuous function of the whole curvature chain and any magnitude error
+    // in it shows up as a mismatch instead of clamping away.
+    //
+    // The hollow one also supplies the only inputs in the fixture where
+    // `cScale - 1024` is negative AND ODD, which is the sole case in which
+    // evalSurface's truncating `/ 2` on the micro band differs from a floor.
     const RegionSpec regions[] = {
-        {"origin", -64, -64, 64, 64},
-        {"far-negative", -100000, 250000, 64, 64},
-        {"positive", 100064, 250064, 64, 64},
+        {"origin", -64, -64, 64, 64, 30000, 1},
+        {"far-negative", -100000, 250000, 64, 64, 30000, 1},
+        {"positive", 100064, 250064, 64, 64, 30000, 1},
+        {"fine-tier", -12, 40008, 24, 24, 3750, 1},
+        {"gentle-crest", -64, -64, 64, 64, 30000, 100},
+        {"gentle-hollow", 100064, 250064, 64, 64, 30000, 100},
+        // And one gentle FINE-tier region, which is the only fixture where
+        // carrierCurvatureTierNormQ10 actually rounds. At 30000 its divide is
+        // exact by construction (numerator is curvature * 30000^2 over 30000^2),
+        // so floored and truncated division cannot differ there no matter what
+        // the terrain does. At 3750 it divides by 64, and this origin puts all
+        // 576 columns on the crest side with a numerator that is negative and
+        // not a multiple of 64 -- i.e. 576 columns where the CPU's deliberate
+        // floorDiv and a truncating divide give different answers.
+        {"gentle-fine-crest", -400000, -400000, 24, 24, 3750, 100},
     };
 
     Digest gpuDigest;
