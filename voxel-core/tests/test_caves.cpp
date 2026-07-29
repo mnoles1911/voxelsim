@@ -1,6 +1,6 @@
-// M4 cave pass (voxelcore/caves.h): determinism, golden digest, the three
+﻿// M4 cave pass (voxelcore/caves.h): determinism, golden digest, the three
 // safety rules (bedrock floor, implicit ocean, roof thickness), the
-// segment-cap headroom, and — the point of the whole formulation —
+// segment-cap headroom, and â€” the point of the whole formulation â€”
 // CONNECTIVITY EVIDENCE from an actual flood fill rather than an assertion
 // that noise "probably" joins up.
 //
@@ -28,8 +28,8 @@ constexpr uint64_t kSeed = 20260719;
 
 // A flat synthetic column, used by the tests that want to look at the tunnel
 // NETWORK on its own with no terrain draping and no clipping in the way.
-constexpr int32_t kFlatSurfaceMm = 100000;   // 100 m — well clear of sea level
-constexpr int32_t kFlatBedrockMm = 45000;    // 45 m — deliberately kept at the
+constexpr int32_t kFlatSurfaceMm = 100000;   // 100 m â€” well clear of sea level
+constexpr int32_t kFlatBedrockMm = 45000;    // 45 m â€” deliberately kept at the
                                              // PRE-v5 amplifier band (bedrock
                                              // moved to 180-220 m at v5), so
                                              // this file keeps exercising the
@@ -119,7 +119,7 @@ VXC_TEST(cave_carve_is_deterministic_through_the_amplifier) {
 VXC_TEST(cave_golden_digest) {
     // Digests the cave layer ALONE (the carved/not-carved bit per voxel plus
     // the per-column segment reduction), so it moves only when the cave math
-    // moves — unlike the mips/GPU digests, which also move for any
+    // moves â€” unlike the mips/GPU digests, which also move for any
     // stratigraphy change.
     Digest d;
     for (int64_t y = -640; y < 640; y += 37) {
@@ -136,13 +136,13 @@ VXC_TEST(cave_golden_digest) {
                 d.u8(caveCarveAt(c, kFlatSurfaceMm, kFlatBedrockMm, vz) ? 1 : 0);
         }
     }
-    // GOLDEN(cave_layer) — new at kWorldGenVersion 4; MOVED for M4 cave pass v2
+    // GOLDEN(cave_layer) â€” new at kWorldGenVersion 4; MOVED for M4 cave pass v2
     // (docs/cavern-design.md C2): caveColumnFor now also emits crevice segs on
     // ~1-in-8 of existing edges, so count/segs[] shift for many sampled
     // columns even though the tunnel geometry itself is unchanged. Re-pinned
     // per the build plan's explicit "caves.h + test_caves.cpp headroom/golden
     // updates" ownership for this subtask.
-    CHECK_EQ(d.h, 0xBFE42E07FFA6B78Dull);
+    CHECK_EQ(d.h, 0xF809F0E416F80133ull);
 }
 
 // --- safety rule 1: the bedrock floor is never breached ----------------------
@@ -205,7 +205,7 @@ VXC_TEST(cave_never_carves_at_or_below_sea_level_or_in_coastal_columns) {
     // Directly driven: SyntheticTileSampler's terrain near the origin sits
     // around +1.1 km, so a world scan alone would never reach a coastal
     // column. The ocean guard is a property of the definition, so exercise it
-    // on the definition — every surface height from a deep seafloor up through
+    // on the definition â€” every surface height from a deep seafloor up through
     // the beach band to the cave threshold.
     size_t oceanColumns = 0;
     for (int32_t surfaceMm = -40000; surfaceMm < kCaveMinSurfaceMm; surfaceMm += 271)
@@ -326,7 +326,7 @@ VXC_TEST(cave_segment_cap_headroom) {
                 maxSegs, columns, kMaxCaveSegs, 100.0 * double(withAny) / double(columns));
 }
 
-// --- crevices (M4 cave pass v2, docs/cavern-design.md §4) -------------------
+// --- crevices (M4 cave pass v2, docs/cavern-design.md Â§4) -------------------
 
 VXC_TEST(crevice_gate_rate_is_about_one_in_eight) {
     // Direct hash-level check, independent of whether any particular edge
@@ -596,7 +596,7 @@ VXC_TEST(cave_sinkhole_reaches_the_surface_and_joins_the_main_network) {
 VXC_TEST(cave_air_is_plain_air_reachable_from_the_surface) {
     // M6 pathfinding, M5 digging and the water CA all key off MAT_AIR, so the
     // only thing the cave pass has to do to plug into them is produce MAT_AIR
-    // — which this asserts — plus actually have openings to the outside. A
+    // â€” which this asserts â€” plus actually have openings to the outside. A
     // "mouth" here is a carved voxel face-adjacent to above-surface air, which
     // is what a hillside daylighting looks like in voxel terms.
     SyntheticTileSampler tiles(kSeed);

@@ -313,8 +313,8 @@ static_assert(2 * kCavernMaxReachMm < kCavernCoarseMm - kCaveLatticeMm,
               "same column, or cavernColumnFor's single-site accumulation is wrong");
 
 // --- hash channels -----------------------------------------------------------
-// Extends caves.h's registry (18..21, 24 reserved for CH_CREVICE in
-// caves.h). APPEND ONLY, never renumber.
+// Extends caves.h's registry (20, 21, 24, 30, 31 — see the authoritative
+// table in hash.h). APPEND ONLY, never renumber.
 inline constexpr uint32_t CH_CAVERN_SITE = 22;  // per-room geometry (radii/floor/step)
 inline constexpr uint32_t CH_CAVERN_ROUGH = 23; // per-column wall roughness
 inline constexpr uint32_t CH_CAVERN_FLOOD = 25; // per-site flood level

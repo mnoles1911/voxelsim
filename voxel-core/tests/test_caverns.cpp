@@ -1,6 +1,6 @@
-// M4 cave pass v2 (voxelcore/caverns.h): determinism, golden digest,
+﻿// M4 cave pass v2 (voxelcore/caverns.h): determinism, golden digest,
 // connectivity evidence (structural claim verified by an actual flood fill,
-// not assumed), the safety clamps (bedrock/sea-level/roof — the latter
+// not assumed), the safety clamps (bedrock/sea-level/roof â€” the latter
 // measured on genuinely varied, sloped real terrain per Matt's post-design
 // direction, not just flat ground), the segment-cap headroom, flood-level
 // properties, and the measured per-column/per-voxel cost budget.
@@ -26,8 +26,8 @@ constexpr uint64_t kSeed = 20260719;
 
 // A flat synthetic column/surface, used by the tests that want to look at
 // the cavern SYSTEM on its own with no terrain draping in the way.
-constexpr int32_t kFlatSurfaceMm = 100000; // 100 m — well clear of sea level
-constexpr int32_t kFlatBedrockMm = 250000; // 250 m — comfortably past the post-
+constexpr int32_t kFlatSurfaceMm = 100000; // 100 m â€” well clear of sea level
+constexpr int32_t kFlatBedrockMm = 250000; // 250 m â€” comfortably past the post-
                                             // design 200 m bedrock move; this
                                             // file never assumes a specific
                                             // value, it is just a plausible
@@ -145,8 +145,8 @@ VXC_TEST(cavern_golden_digest) {
             d.u32(static_cast<uint32_t>(c.floodZMm));
         }
     }
-    // GOLDEN(cavern_layer) — new for the M4 cave pass v2 cavern system.
-    CHECK_EQ(d.h, 0x5B1F8E5E73ED6EF2ull);
+    // GOLDEN(cavern_layer) â€” new for the M4 cave pass v2 cavern system.
+    CHECK_EQ(d.h, 0xFB45CBD3F95E65C4ull);
 }
 
 // --- chain geometry: consecutive rooms overlap for real hashed sites --------
@@ -205,7 +205,7 @@ VXC_TEST(cavern_anchor_point_is_carved_by_both_cavern_and_tunnel_systems) {
     // The direct structural claim: a cavern's anchor sits exactly on a point
     // the tunnel network already carves (same node, same depth), so both
     // caveCarveAt and cavernCarveAt must agree that voxel is air, for EVERY
-    // valid site — not just the lucky first one.
+    // valid site â€” not just the lucky first one.
     int64_t sitesChecked = 0;
     for (int64_t fj = 0; fj <= 800 && sitesChecked < 40; fj += kCavernCoarseLatticeRatio) {
         for (int64_t fi = 0; fi <= 800 && sitesChecked < 40; fi += kCavernCoarseLatticeRatio) {
@@ -394,7 +394,7 @@ VXC_TEST(cavern_roof_clamp_is_load_bearing_on_sloped_real_terrain) {
     };
 
     // "Is a voxel inside a room's ELLIPSOID (plus its flat floor), ignoring
-    // every clamp?" — the same per-seg test cavernCarveAt runs, minus the
+    // every clamp?" â€” the same per-seg test cavernCarveAt runs, minus the
     // guards. The difference between this and cavernCarveAt is exactly the
     // set of voxels a clamp truncated, which is what "load-bearing" means.
     auto geometricallyInsideARoom = [](const CavernColumn& c, int64_t vz) {
@@ -547,7 +547,7 @@ VXC_TEST(cavern_flood_level_is_level_disc_consistent_bounded_and_roughly_forty_p
             // Disc-consistency: several columns within the reach disc (but
             // not necessarily overlapping any room) must report the SAME
             // flood level as the site itself -- "whether or not a cavern
-            // seg overlaps it" per design doc §5.1.
+            // seg overlaps it" per design doc Â§5.1.
             const int64_t vx0 = floorDiv(node.xMm, int64_t(kVoxelSizeMm));
             const int64_t vy0 = floorDiv(node.yMm, int64_t(kVoxelSizeMm));
             bool sawIt = false;
@@ -574,7 +574,7 @@ VXC_TEST(cavern_flood_level_is_level_disc_consistent_bounded_and_roughly_forty_p
 // --- cost budget --------------------------------------------------------------
 
 VXC_TEST(cavern_cost_budget_micro_benchmark) {
-    // Standalone timing, same spirit as docs/cavern-design.md §3.7's
+    // Standalone timing, same spirit as docs/cavern-design.md Â§3.7's
     // prototype: clang -O2, best of 3, a volatile sink to defeat dead-code
     // elimination. Not a hard CI gate (no timing test in this suite is), but
     // reported so the actual numbers are on record.
@@ -646,7 +646,7 @@ VXC_TEST(cavern_cost_budget_micro_benchmark) {
                 "segs, worst case in this sample)\n",
                 bestColumnNs, bestEmptyVoxelNs, bestFullVoxelNs, fullColSegs);
 
-    // Budget per docs/cavern-design.md §3.7: the common-case per-voxel cost
+    // Budget per docs/cavern-design.md Â§3.7: the common-case per-voxel cost
     // should be a hair above a single compare (a few ns is plenty of
     // headroom); worst-case per-voxel should stay well under ~4 ns/voxel;
     // per-column cost should be modest (the site is 4x rarer than the

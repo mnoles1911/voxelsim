@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // Rill / flute term -- terrain-amplification plan Phase 3c, "Structured,
 // anisotropic detail".
 //

@@ -4,6 +4,7 @@
 // -DVXC_PRINT_GOLDENS in the bench target to reprint).
 
 #include "voxelcore/hash.h"
+#include "voxelcore/hash_channel_registry.h"
 #include "vxctest.h"
 
 using namespace vxc;
@@ -45,6 +46,21 @@ VXC_TEST(value_noise_bounded_and_deterministic) {
             CHECK_EQ(a, b);
             CHECK(a >= -32768 && a <= 32767);
         }
+}
+
+// Guards the fix for the CH_CAVE_NODE/CH_CAVE_EDGE vs CH_ECOTONE_TEMP/
+// CH_ECOTONE_PRECIP double allocation (both pairs used to be 18/19). The
+// static_assert in hash_channel_registry.h already fails the BUILD on any
+// such collision; this test additionally exercises the same check at run
+// time (so a coverage/mutation tool sees it exercised) and pins the specific
+// ids the fix landed on, so an accidental revert back to 18/19 is caught
+// here even before someone rebuilds far enough to hit the static_assert.
+VXC_TEST(hash_channel_registry_has_no_collisions) {
+    CHECK(vxc::channel_registry_detail::firstCollisionOrNegativeOne() == -1);
+    CHECK_EQ(static_cast<uint32_t>(CH_CAVE_NODE), 30u);
+    CHECK_EQ(static_cast<uint32_t>(CH_CAVE_EDGE), 31u);
+    CHECK(CH_CAVE_NODE != CH_ECOTONE_TEMP);
+    CHECK(CH_CAVE_EDGE != CH_ECOTONE_PRECIP);
 }
 
 VXC_TEST(value_noise_continuity_across_lattice_cells) {
