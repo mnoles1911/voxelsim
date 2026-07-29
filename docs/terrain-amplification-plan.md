@@ -1,4 +1,4 @@
-# Terrain amplification redesign — 30 m diffusion tiles → 10 cm voxels
+﻿# Terrain amplification redesign — 30 m diffusion tiles → 10 cm voxels
 
 **Status:** planned and approved (Matt, 2026-07-28). **Phases 0 and 1 are LANDED** on
 `claude/terrain-amplification-redesign` (`0e55c4c`, `cf9aa46`, `e9fb524`) — worldgen is at v9,
@@ -273,7 +273,7 @@ and writes only its interior. Every bounded pass has influence radius well under
 (thermal 48 cells, carve stamps ~20), so each interior equals the infinite-domain answer and
 neighbours agree exactly — seamless by construction, no stitching pass.
 
-**MEASURED, and 960 m is right with room to spare.** `terrain-service/tools/bake_seam_test.py`
+**MEASURED, and 960 m is right with room to spare.** `terrain-service/tools/bake_seam_check.py`
 bakes one domain spanning two adjacent tiles (the "infinite domain" answer), bakes each tile
 separately on its own domain + apron, and compares. All bakes share one world-anchored noise
 field, so the test isolates apron adequacy rather than this prototype's array-coordinate fBm.

@@ -418,6 +418,15 @@ CarrierEval evalCarrier(int64_t cp[16], int64_t fx, int64_t fy, int64_t pxMm)
     return e;
 }
 
+// Faded-bilinear blend of four u8 corners -- one channel of vxc::blendClimate
+// (amplifier.cpp), bit-for-bit. Every input is a u8 and both weights are
+// non-negative, so the result cannot leave [0, 255] and needs no clamp.
+int64_t blendU8(int64_t v00, int64_t v10, int64_t v01, int64_t v11,
+                int64_t gx, int64_t fx, int64_t gy, int64_t fy, int64_t den)
+{
+    return truncDiv((v00 * gx + v10 * fx) * gy + (v01 * gx + v11 * fx) * fy, den);
+}
+
 // The slope currency, MM PER METRE. L1, keeping the shape of the v8
 // tileSlopeMmPerPx so the recalibrated gates below are a pure unit conversion.
 int64_t carrierSlopeMmPerM(CarrierEval c, int64_t pxMm)
@@ -822,18 +831,27 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
     const uint cl10 = rasterClimate(px + 1, py);
     const uint cl01 = rasterClimate(px, py + 1);
     const uint cl11 = rasterClimate(px + 1, py + 1);
-    // Per channel, in u8 space. Every input is a u8 and both weights are
-    // non-negative, so the result cannot leave [0, 255] and needs no clamp.
-    #define VXC_CLIMATE_MIX(SHIFT)                                                     \
-        truncDiv((((int64_t)((cl00 >> (SHIFT)) & 0xff) * cgx +                          \
-                   (int64_t)((cl10 >> (SHIFT)) & 0xff) * cfx) * cgy +                   \
-                  ((int64_t)((cl01 >> (SHIFT)) & 0xff) * cgx +                          \
-                   (int64_t)((cl11 >> (SHIFT)) & 0xff) * cfx) * cfy),                   \
-                 cden)
-    const uint clTemperature = (uint)VXC_CLIMATE_MIX(0);
-    const uint clSeasonality = (uint)VXC_CLIMATE_MIX(8);
-    const uint clPrecipitation = (uint)VXC_CLIMATE_MIX(16);
-    #undef VXC_CLIMATE_MIX
+    // LITERAL shift distances, one channel at a time.
+    //
+    // This was a macro taking the shift as a parameter, and tools/lint-shader-ub.py
+    // rejected it as a VARIABLE_SHIFT -- correctly. The linter is textual and
+    // cannot see that every expansion is a constant, and a non-literal shift
+    // distance is undefined when out of range with vendors differing on whether
+    // they mask it. That is exactly the class of construct this file exists to
+    // keep out, so the honest fix is to spell the three channels out rather than
+    // to annotate the macro away. Costs nothing.
+    const uint clTemperature =
+        (uint)blendU8((int64_t)(cl00 & 0xff), (int64_t)(cl10 & 0xff),
+                      (int64_t)(cl01 & 0xff), (int64_t)(cl11 & 0xff),
+                      cgx, cfx, cgy, cfy, cden);
+    const uint clSeasonality =
+        (uint)blendU8((int64_t)((cl00 >> 8) & 0xff), (int64_t)((cl10 >> 8) & 0xff),
+                      (int64_t)((cl01 >> 8) & 0xff), (int64_t)((cl11 >> 8) & 0xff),
+                      cgx, cfx, cgy, cfy, cden);
+    const uint clPrecipitation =
+        (uint)blendU8((int64_t)((cl00 >> 16) & 0xff), (int64_t)((cl10 >> 16) & 0xff),
+                      (int64_t)((cl01 >> 16) & 0xff), (int64_t)((cl11 >> 16) & 0xff),
+                      cgx, cfx, cgy, cfy, cden);
 
     // ECOTONE DITHER. Interpolation turns 30 m stair-steps into smooth curves,
     // but a smooth curve through a hard threshold is still a clean line, and a
