@@ -92,7 +92,6 @@ positionally identical to v1 so a v1 parser fails on `version`, not on garbage.
 | `base_offset_mm` | `i32` | per-tile elevation datum |
 | `parent_scale` | `u8` | 0 = absolute (this spec). Reserved for a future residual ladder. |
 | `reserved` | `u8[3]` | must be 0 |
-eserved | u8[3] | must be 0 |
 | `n_sections` | `u16` | |
 | section table | `n_sections × {u32 id, u64 offset, u64 length}` | offsets are from file start |
 
@@ -140,6 +139,18 @@ Residuals are zigzag-mapped (`(r << 1) ^ (r >> 31)`) and emitted little-endian.
 tile exceed int16** even at 100 mm quantisation — one 3.75 m post across a 30 m cliff does it. A
 block sets `resid_bits = 32` if any residual leaves `[-32768, 32767]`, else 16. Encoders must not
 assume 16.
+
+**Interop details settled while building the two halves — decoders must honour these:**
+
+- `resid_bits` is **written as 0** for `CONSTANT` and `RAW` blocks, where it has no meaning. A
+  decoder must ignore it in those modes, **not** validate it against {16, 32}.
+- `parent_scale != 0` must be **rejected**, not treated as absolute. This spec defines only the
+  absolute reading; silently misinterpreting a future residual-ladder tile is worse than refusing
+  it.
+- `RAW` is never auto-selected by the reference encoder. Under `CODEC_RAW` it only beats `CODED`
+  when `CODED` would need `resid_bits = 32`, so a size-minimising selector would make
+  `resid_bits = 32` unreachable through the encoder and untestable. Mode selection is encoder
+  policy, not wire format — decoders must handle all four modes regardless of how they were chosen.
 
 ## 6. Flow plane (optional, `flags` bit0)
 
