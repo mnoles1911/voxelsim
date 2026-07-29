@@ -1,0 +1,125 @@
+# ADR-0007: A depth term in the SWE eligibility predicate, so thin films stay CA-owned
+
+- **Status:** proposed
+- **Date:** 2026-07-29
+- **Doctrine sections affected:** NONE. §2.3's integer-only rule is kept; no
+  float appears, no waiver is requested. What this asks Matt to approve is a
+  **behaviour change to a shipped-but-default-off simulation layer**, its
+  version bump, and the golden it moves.
+- **Amends:** ADR-0004 (W4 shallow water, ACCEPTED 2026-07-21).
+- **Human sign-off:** REQUIRED. Nothing has been implemented.
+
+## Context
+
+W4's SWE layer was enabled behind `voxel.Water.SWE` (standalone-only) on
+2026-07-28, and the ADR-0004 renderer union now draws sheet depth, so its
+behaviour is visible for the first time.
+
+**The observation, from Matt's first hands-on pass.** The same 30,000-unit pour
+behaves differently with the layer on: the CA settles it into compact basins,
+while SWE spreads it laterally as a thin film. Volume is conserved exactly
+either way — measured `sheetVolume 29780 + caVolume 220 == 30000`, zero
+conservation failures — so this is not a leak. It is a difference in physics.
+
+**Matt's verdict:** CA-style pooling reads as more correct. Recorded as a
+preference, and explicitly flagged as something he may revisit.
+
+**The request was to "tune SWE toward pooling". That is not possible**, and
+establishing why is the substance of this ADR.
+
+## Why no tuning knob does it
+
+- **Spreading to a level surface is what the mass equation does.** It is not a
+  parameter. `dampingQ8` and `gainShift` set how *fast* and how *flat*, never
+  *whether*.
+- **Both trade directly against ADR-0004's own deadband.** That ADR derives
+  `d_min = 2^gainShift · (256 − dampingQ8)/256`. Moving `dampingQ8` 224→192, or
+  `gainShift` 7→8, each **doubles** the deadband from 16 to 32 fill units — a
+  settled surface flat only to 12.5% of a voxel, i.e. a visible step — while
+  weakening the surge by the same factor. You would lose the momentum the layer
+  exists for *and* gain a stepped surface, to buy nothing.
+- **`absorbPerTick` / `promoteDwellTicks` change only the transient**, not the
+  settled shape.
+
+## Where the actual lever is
+
+`SweCaCoupler`'s eligibility predicate decides which columns the sheet owns.
+It gates on **headroom** (`openClearanceVoxels`) and **lateral openness**
+(`minOpenNeighbours`) — and on nothing else.
+
+**It has no depth term.** A one-unit film on open ground is exactly as eligible
+as a lake. That is the whole mechanism behind what Matt saw: a thin pour on
+open terrain is, by this predicate, indistinguishable from the large open body
+the layer was designed for.
+
+## Proposal
+
+Add a **minimum-depth conjunct** to eligibility: a column is SWE-eligible only
+if its water depth exceeds `minSweDepthFillUnits`, and demotes below it.
+
+Sizing it is the part that needs care, and there is one hard constraint:
+**it must exceed the deadband.** ADR-0004's settled surface is flat only to
+±16 fill units, so a threshold at or below 16 would have columns crossing it
+every tick — promotion chatter, which `demoteDwellTicks` exists to prevent and
+which would be far worse than the film. A first estimate is **64 fill units**
+(a quarter voxel, 4× the deadband), with hysteresis: promote above 64, demote
+below 32.
+
+This is a *shape* proposal. The number wants measurement against the breach
+fixture, not selection here.
+
+## Costs, stated plainly
+
+- **`swe.h` changes** — it is golden-pinned, so this is not a local edit.
+- **`kSweVersion` 1 → 2**, and the SWE golden `0x61523E585CF7B782` is
+  **re-pinned**. Different columns promote, so the sheet evolves differently.
+- **Saved worlds with SWE state are invalidated.** Today that is acceptable
+  precisely because the cvar is default-off and standalone-only, so no shipped
+  world has any. **This window closes** the moment SWE is enabled by default or
+  reaches M3 replication — which is the strongest argument for deciding now
+  rather than later.
+- **The water goldens do NOT move.** `kWaterCAVersion` stays 4. Nothing here
+  touches `WaterCA::step()`, so the 4.7× optimisation landed 2026-07-29 is
+  unaffected.
+
+## The prerequisite, and why it is not optional
+
+**Run `-VoxelSweBreachTest` first.** A gentle pour onto near-flat ground cannot
+distinguish:
+
+- **(a)** shallow water correctly spreading as a thin film — which is what SWE
+  is *for*; from
+- **(b)** bed heights seated slightly wrong, so water sits where it should have
+  drained.
+
+Both look like a film. The fixture's `SweBreachBeds phase=pre-breach` line
+settles it: `sweOwnedMismatched > 0` before anything is dug has no innocent
+explanation, and the fixture prints `TUNING: WITHHELD` rather than proceeding.
+
+**If the beds are wrong, this ADR is moot** — the film is a bug, and adding a
+depth term would bury it behind a threshold rather than fix it. That failure
+mode is why the tuning was not simply applied when it was asked for.
+
+## Alternatives considered
+
+- **Tune damping/gain.** Rejected above: does not change the settled shape, and
+  costs the deadband and the surge.
+- **Do nothing; accept the film.** Legitimate. SWE is default-off, and the film
+  only appears when it is armed. The cost of waiting is that the free
+  golden-re-pin window closes at M3.
+- **Make the CA own all shallow water via a rendering rule instead.** Rejected:
+  it would draw one thing and simulate another, and the two would drift under
+  any flow the sheet actually models.
+- **Raise `openClearanceVoxels` so thin water fails on headroom.** Rejected: it
+  is the wrong axis. It would also disqualify genuinely deep water under a low
+  ceiling, which is exactly the confined-flow case the coupler handles well.
+
+## Decision
+
+**Pending Matt's sign-off.** Nothing implemented. Recommended sequence:
+
+1. Run `-VoxelSweBreachTest=25` with `-VoxelSweBreachSwe=1` and `0`.
+2. If `sweOwnedMismatched > 0` — stop, fix bed seating, and discard this ADR.
+3. If the beds are clean and the surge is directed, implement the depth term,
+   size the threshold against the fixture, re-pin the SWE golden, bump
+   `kSweVersion`.

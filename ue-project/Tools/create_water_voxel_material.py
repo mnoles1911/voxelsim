@@ -241,9 +241,25 @@ def main():
     # -- LinearColor(0.05, 0.25, 0.55) at 0.55 opacity -- which renders exactly
     # as the shipped water did. Re-enabling the effect is these four numbers,
     # with a human looking at it.
+    # CONSERVATIVE PASS (Matt, 2026-07-29). The authored (0.38, 0.66, 0.68)
+    # washed the pool to near-WHITE. Rather than guess a second pale value,
+    # SHALLOW IS PINNED TO THE SHIPPED BLUE and only the deep end moves.
+    #
+    # That makes the previous failure structurally impossible rather than
+    # merely less likely: thin water -- which is most of a spread pour, and
+    # every frame that looked wrong -- now renders EXACTLY as it did before
+    # the tint existed, because at depth01 ~ 0 both the colour and the opacity
+    # lerps resolve to their shallow ends, which are the old constants. Depth
+    # can only ever ADD darkness from there. There is no input for which this
+    # is brighter than the shipped water.
     shallow_tint.set_editor_property("constant", unreal.LinearColor(0.05, 0.25, 0.55, 1.0))
     deep_tint = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -500, -400)
-    deep_tint.set_editor_property("constant", unreal.LinearColor(0.05, 0.25, 0.55, 1.0))  # neutralised, see shallow_tint
+    # Deep end: the same hue, darkened and desaturated toward the absorption
+    # the real effect is modelling. Deliberately NOT the authored
+    # (0.012, 0.055, 0.16), which is nearly black -- a 2.5 m pond hitting that
+    # would read as a hole in the ground. This is roughly a third of the
+    # shallow value, so a deep body darkens visibly without going to ink.
+    deep_tint.set_editor_property("constant", unreal.LinearColor(0.018, 0.085, 0.20, 1.0))
 
     water_tint = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -320, -450)
     if not mel.connect_material_expressions(shallow_tint, "", water_tint, "A"):
@@ -259,9 +275,14 @@ def main():
     # at any tint. 0.18 -> 0.86 brackets the old 0.55 so a mid-depth body sits
     # close to where this material has always sat.
     shallow_opacity = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -500, -330)
-    shallow_opacity.set_editor_property("r", 0.55)  # neutralised, see shallow_tint
+    # Shallow opacity IS the shipped 0.55, for the same reason as the tint:
+    # thin water must be pixel-identical to what shipped.
+    shallow_opacity.set_editor_property("r", 0.55)
     deep_opacity = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -500, -270)
-    deep_opacity.set_editor_property("r", 0.55)  # neutralised, see shallow_tint
+    # Deep opacity rises, but nowhere near the authored 0.86. 0.72 keeps a
+    # deep body readable as WATER rather than as a painted surface -- you can
+    # still make out the bed through it, which is most of what sells depth.
+    deep_opacity.set_editor_property("r", 0.72)
     depth_opacity = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -320, -300)
     if not mel.connect_material_expressions(shallow_opacity, "", depth_opacity, "A"):
         raise RuntimeError("connect shallow_opacity -> depth_opacity.A failed")
@@ -345,7 +366,12 @@ def main():
     # that is a flicker. Slope alone can still reach 1.0, so a real breaking
     # front is not capped by this.
     activity_gain = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -650, 20)
-    activity_gain.set_editor_property("r", 0.0)  # DIAGNOSTIC: isolate foam-vs-tint
+    # Foam restored to the authored gain. It was zeroed only as a DIAGNOSTIC to
+    # isolate tint-versus-foam, and that test exonerated it: with the gain at 0
+    # the water was still white, so the fault was never here. The slope mask is
+    # correctly complemented (flat water gets zero slope-foam) and activity is
+    # binary on the CA active set, so a settled body carries none.
+    activity_gain.set_editor_property("r", 0.6)
     activity_foam = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -500, -20)
     if not mel.connect_material_expressions(vertex_color, "A", activity_foam, "A"):
         raise RuntimeError("connect vertex_color.A -> activity_foam.A failed")

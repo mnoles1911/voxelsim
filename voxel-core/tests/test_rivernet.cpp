@@ -211,7 +211,13 @@ VXC_TEST(rivernet_graph_diff_dam_replay_matches_live) {
     // `live` applies the dam directly; `replay` applies the exact same
     // change ONLY via the graph-diff replay hook.
     live.setConveyance(damSeg, 0);
-    replay.applyGraphDiff(RiverDiffRecord{RiverDiffKind::kSetConveyance, damSeg, 0});
+    // Designated, not positional: RiverDiffRecord grew `headNode` and `course`
+    // for the real kDivertChannel, and a positional brace-init that stops at
+    // `value` is an error under -Werror=missing-field-initializers on gcc and
+    // clang (MSVC does not warn, so the local build was green). Naming the
+    // fields also says what a conveyance diff actually carries.
+    replay.applyGraphDiff(RiverDiffRecord{
+        .kind = RiverDiffKind::kSetConveyance, .segId = damSeg, .value = 0});
 
     for (int i = 0; i < 60; ++i) {
         live.injectInflow(headwater, 700);
@@ -229,7 +235,12 @@ VXC_TEST(rivernet_graph_diff_dam_replay_matches_live) {
 
     // A diverted-channel diff is a documented no-op today: applying it
     // must not perturb state (no new segments, no digest change).
-    replay.applyGraphDiff(RiverDiffRecord{RiverDiffKind::kDivertChannel, 0, 0});
+    // An EMPTY course is a rejected (therefore inert) divert diff by
+    // construction -- that is what still makes this a no-op now that
+    // kDivertChannel is implemented, and leaving `course` unnamed here would
+    // hide the very field the assertion depends on.
+    replay.applyGraphDiff(RiverDiffRecord{
+        .kind = RiverDiffKind::kDivertChannel, .segId = 0, .value = 0, .headNode = 0, .course = {}});
     Digest dReplayAfterStub;
     replay.digest(dReplayAfterStub);
     CHECK_EQ(dReplay.h, dReplayAfterStub.h);
