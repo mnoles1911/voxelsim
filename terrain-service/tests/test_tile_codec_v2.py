@@ -1,12 +1,12 @@
-"""`.vxtl` v2 codec tests (docs/vxtl-v2-format.md — FROZEN CONTRACT, §9
+﻿"""`.vxtl` v2 codec tests (docs/vxtl-v2-format.md â€” FROZEN CONTRACT, Â§9
 conformance). v1 is exercised only as a non-regression / cross-version
 check here; its own golden tests live in test_tiles.py and are untouched.
 
-Conformance checklist this file covers (spec §9):
+Conformance checklist this file covers (spec Â§9):
   1. round-trip: CONSTANT, CODED/16, CODED/32, RAW blocks, both quant values.
   4. truncation/corruption rejected cleanly; version cross-checks both ways.
 Items 2 (C++ golden decode) and 3 (B-spline sample parity) are cross-language
-and out of scope for this file — see test_v2_golden_fixture_* below for what
+and out of scope for this file â€” see test_v2_golden_fixture_* below for what
 IS covered from the Python side of item 2 (the fixture decodes correctly
 here; a separate C++ agent/tests must confirm parity).
 """
@@ -14,12 +14,19 @@ here; a separate C++ agent/tests must confirm parity).
 from __future__ import annotations
 
 import struct
+import sys
+import zlib
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from terrain_service import tile_codec as tc
+
+TOOLS = Path(__file__).resolve().parent.parent / "tools"
+sys.path.insert(0, str(TOOLS))
+
+from vxtl_zstd_store import zstd_store_frame, zstd_store_inflate  # noqa: E402
 
 FIXTURE_PATH = (
     Path(__file__).resolve().parents[2]
@@ -29,12 +36,16 @@ FLOW_FIXTURE_PATH = (
     Path(__file__).resolve().parents[2]
     / "voxel-core" / "tests" / "fixtures" / "vxtl_v2_golden_flow_512.vxtl"
 )
+ZSTD_FIXTURE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "voxel-core" / "tests" / "fixtures" / "vxtl_v2_golden_zstd_512.vxtl"
+)
 
 
 # --------------------------------------------------------------- helpers ---
 
 def _smooth_field(size: int, base_offset_mm: int = 200_000, quant: int = tc.QUANT_100MM) -> np.ndarray:
-    """A gentle, fully CODED/16 control lattice — no cliffs, no flats."""
+    """A gentle, fully CODED/16 control lattice â€” no cliffs, no flats."""
     yy, xx = np.mgrid[0:size, 0:size]
     elev_mm = (
         base_offset_mm
@@ -44,7 +55,7 @@ def _smooth_field(size: int, base_offset_mm: int = 200_000, quant: int = tc.QUAN
 
 
 def _cliff_block(size: int) -> np.ndarray:
-    """A block engineered so the MED residual overflows int16 (§5): two
+    """A block engineered so the MED residual overflows int16 (Â§5): two
     adjacent first-row pixels jump from +32767 to -32768, forcing
     resid = -32768 - 32767 = -65535 for the encoder to represent, exactly
     the 'one post across a 30 m cliff' case the spec calls out."""
@@ -56,8 +67,8 @@ def _cliff_block(size: int) -> np.ndarray:
 
 def _mixed_tile(size: int, block_log2: int, *, quant: int = tc.QUANT_100MM, codec: int = tc.CODEC_RAW,
                  base_offset_mm: int = 200_000, flow: np.ndarray | None = None) -> tc.TileV2:
-    """A tile with a CONSTANT block, a smooth (CODED/16) block, and — if the
-    grid has a second block row — a cliff (CODED/32) block."""
+    """A tile with a CONSTANT block, a smooth (CODED/16) block, and â€” if the
+    grid has a second block row â€” a cliff (CODED/32) block."""
     bs = 1 << block_log2
     assert size % bs == 0 and size // bs >= 1
     cp = _smooth_field(size, base_offset_mm, quant)
@@ -79,7 +90,7 @@ def _mixed_tile(size: int, block_log2: int, *, quant: int = tc.QUANT_100MM, code
 @pytest.mark.parametrize("quant", [tc.QUANT_100MM, tc.QUANT_250MM])
 def test_v2_roundtrip_smooth_coded16(quant):
     """A typical smooth tile round-trips exactly and lands entirely in
-    CODED/16 (no cliffs, no flats) — the common case."""
+    CODED/16 (no cliffs, no flats) â€” the common case."""
     size, block_log2 = 32, 4
     cp = _smooth_field(size, quant=quant)
     tile = tc.TileV2(
@@ -95,7 +106,7 @@ def test_v2_roundtrip_smooth_coded16(quant):
 
 def test_v2_roundtrip_mixed_modes():
     """CONSTANT + CODED/16 + CODED/32 in one tile, all through the public
-    encode_v2/decode_v2 API — the core of §9 conformance item 1."""
+    encode_v2/decode_v2 API â€” the core of Â§9 conformance item 1."""
     size, block_log2 = 32, 4  # 2x2 blocks of 16x16
     tile = _mixed_tile(size, block_log2)
     data = tc.encode_v2(tile)
@@ -104,7 +115,7 @@ def test_v2_roundtrip_mixed_modes():
 
 
 def test_v2_constant_block_costs_zero_bytes():
-    """§4: 'CONSTANT blocks cost zero bytes and are common.' Verify at the
+    """Â§4: 'CONSTANT blocks cost zero bytes and are common.' Verify at the
     wire level, not just that decode is correct."""
     size, block_log2 = 16, 4  # exactly one block
     cp = np.full((size, size), -777, dtype=np.int16)
@@ -125,9 +136,9 @@ def test_v2_constant_block_costs_zero_bytes():
 
 
 def test_v2_resid_bits_32_required_for_a_single_cliff():
-    """§5: 'resid_bits is REQUIRED, not an optimisation... one post across a
+    """Â§5: 'resid_bits is REQUIRED, not an optimisation... one post across a
     30 m cliff does it.' A block that is otherwise perfectly ordinary except
-    for ONE steep step must be flagged resid_bits=32 and must round-trip —
+    for ONE steep step must be flagged resid_bits=32 and must round-trip â€”
     an encoder that assumes 16 bits would silently corrupt this."""
     bs = 16
     blk = _cliff_block(bs)
@@ -165,7 +176,7 @@ def test_v2_resid_bits_32_full_tile_roundtrip():
 
 
 def test_v2_raw_block_forced_and_roundtrips():
-    """RAW mode (§4 mode=2) is reachable and round-trips. The reference
+    """RAW mode (Â§4 mode=2) is reachable and round-trips. The reference
     encoder never selects RAW automatically (see _encode_plane's docstring
     for why); it's exercised here via the explicit raw_blocks override,
     which is the documented, supported way to reach it."""
@@ -190,7 +201,7 @@ def test_v2_raw_block_forced_and_roundtrips():
 
 
 def test_v2_flow_plane_roundtrip():
-    """§6: optional flow plane, same block structure and predictor, packs
+    """Â§6: optional flow plane, same block structure and predictor, packs
     channel/bank/deposition flag bits plus the log2 accumulation field."""
     size, block_log2 = 32, 4
     cp = _smooth_field(size)
@@ -220,7 +231,7 @@ def test_v2_flow_plane_roundtrip():
 
 def test_v2_flow_constant_block_carries_full_u8_range():
     """The C++ decoder flagged this as unverified: `const_cp` is a signed i16
-    on the wire (§4) even for the flow plane, whose elements are uint8. A
+    on the wire (Â§4) even for the flow plane, whose elements are uint8. A
     constant flow block with every bit set (255 = log2 31 | channel | bank |
     deposition) must decode back to exactly 255, not wrap or sign-extend."""
     size, block_log2 = 16, 4  # single block
@@ -258,7 +269,7 @@ def test_v2_decode_rejects_out_of_range_flow_const_cp():
 
 
 def test_v2_flow_raw_block_forced_and_roundtrips():
-    """RAW for the flow plane is ONE byte per pixel (u1), not two (§6: 'same
+    """RAW for the flow plane is ONE byte per pixel (u1), not two (Â§6: 'same
     block structure' means same mechanics, not the elevation plane's element
     width). Force a flow block to RAW and confirm both the wire byte count
     and the round-tripped values."""
@@ -335,6 +346,174 @@ def test_v2_codec_zstd_unavailable_fails_clearly_not_on_import():
         tc.encode_v2(tile)
 
 
+# ------------------------------------------------- injected codec boundary ---
+#
+# CODEC_ZSTD's compressor/decompressor is INJECTED, on both halves of the
+# contract: docs/vxtl-v2-format.md Â§3 puts it at the host boundary because
+# voxel-core has zero third-party dependencies and links into a UE binary that
+# already ships zstd (a second static copy is an ODR hazard, not just bloat).
+# The Python side mirrors that shape deliberately, and Â§7 licenses it â€” "the
+# ENCODER need not be deterministic", any conformant frame will do.
+#
+# These tests need NO compression library: zlib (stdlib) stands in as an
+# arbitrary injected codec, which is exactly the point â€” the boundary must not
+# know or care what is on the other side of it.
+
+
+def _zlib_pair():
+    def compress(payload: bytes) -> bytes:
+        return zlib.compress(payload, 9)
+
+    def decompress(frame: bytes, expected_len: int) -> bytes:
+        out = zlib.decompress(frame)
+        if len(out) != expected_len:
+            raise ValueError("wrong decompressed length")
+        return out
+
+    return compress, decompress
+
+
+def test_v2_injected_codec_roundtrips_without_zstandard():
+    size, block_log2 = 32, 4
+    tile = _mixed_tile(size, block_log2, codec=tc.CODEC_ZSTD)
+    compress, decompress = _zlib_pair()
+    data = tc.encode_v2(tile, compressor=compress)
+    back = tc.decode_v2(data, decompressor=decompress)
+    np.testing.assert_array_equal(back.elevation_cp, tile.elevation_cp)
+    assert back.codec == tc.CODEC_ZSTD
+
+
+def test_v2_injected_codec_is_per_block_never_whole_section():
+    """Â§4: one frame per block, no dictionary, no cross-block state â€” that is
+    what buys per-block random access. Count the calls and confirm each one
+    sees exactly one block's payload, never the section."""
+    size, block_log2 = 32, 4  # 2x2 blocks, one of them CONSTANT
+    tile = _mixed_tile(size, block_log2, codec=tc.CODEC_ZSTD)
+    seen: list[int] = []
+
+    def compress(payload: bytes) -> bytes:
+        seen.append(len(payload))
+        return zstd_store_frame(payload)
+
+    data = tc.encode_v2(tile, compressor=compress)
+    bs = 1 << block_log2
+    # 4 blocks, one CONSTANT (zero bytes, never compressed) -> 3 calls, each
+    # exactly one block's payload: 2 or 4 bytes/px, never a multiple of blocks.
+    assert len(seen) == 3
+    assert set(seen) <= {bs * bs * 2, bs * bs * 4}
+
+    inflated: list[int] = []
+
+    def decompress(frame: bytes, expected_len: int) -> bytes:
+        inflated.append(expected_len)
+        return zstd_store_inflate(frame, expected_len)
+
+    back = tc.decode_v2(data, decompressor=decompress)
+    np.testing.assert_array_equal(back.elevation_cp, tile.elevation_cp)
+    assert inflated == seen  # same blocks, same sizes, same order
+
+
+def test_v2_decode_rejects_a_frame_of_the_wrong_decompressed_length():
+    """Under CODEC_ZSTD `comp_len` is the COMPRESSED size and constrains
+    nothing, so 'expands to exactly the length the header implies' is the only
+    length check left. A decompressor handing back one byte too few must be
+    rejected, not silently reshaped or truncated."""
+    size, block_log2 = 16, 4
+    cp = _smooth_field(size)
+    tile = tc.TileV2(
+        seed=1, x=0, y=0, size=size, elevation_cp=cp,
+        block_log2=block_log2, codec=tc.CODEC_ZSTD,
+    )
+    data = tc.encode_v2(tile, compressor=zstd_store_frame)
+
+    def short(frame: bytes, expected_len: int) -> bytes:
+        return zstd_store_inflate(frame, expected_len)[:-1]
+
+    with pytest.raises(ValueError, match="expanded to"):
+        tc.decode_v2(data, decompressor=short)
+
+    def long_(frame: bytes, expected_len: int) -> bytes:
+        return zstd_store_inflate(frame, expected_len) + b"\x00"
+
+    with pytest.raises(ValueError, match="expanded to"):
+        tc.decode_v2(data, decompressor=long_)
+
+    # And the untouched pair still round-trips.
+    back = tc.decode_v2(data, decompressor=zstd_store_inflate)
+    np.testing.assert_array_equal(back.elevation_cp, cp)
+
+
+def test_v2_decode_rejects_truncated_and_corrupt_frames():
+    size, block_log2 = 16, 4
+    cp = _smooth_field(size)
+    tile = tc.TileV2(
+        seed=1, x=0, y=0, size=size, elevation_cp=cp,
+        block_log2=block_log2, codec=tc.CODEC_ZSTD,
+    )
+    data = bytearray(tc.encode_v2(tile, compressor=zstd_store_frame))
+
+    off = tc._HEADER.size + tc._V2_EXT.size
+    table = [
+        tc._SECTION_ENTRY.unpack_from(bytes(data), off + i * tc._SECTION_ENTRY.size)
+        for i in range(2)
+    ]
+    elev_index_off = next(o for sid, o, _ in table if sid == tc.SECTION_ELEV_INDEX)
+    elev_data_off = next(o for sid, o, _ in table if sid == tc.SECTION_ELEV_DATA)
+    entry = tc._BLOCK_ENTRY.unpack_from(bytes(data), elev_index_off)
+    assert entry[2] == tc.MODE_CODED
+    frame_off = elev_data_off + entry[0]
+
+    # comp_len is a FRAME length now â€” 9 bytes of frame header plus 3 per zstd
+    # block more than the payload â€” so it is no longer the plain length.
+    assert entry[1] != size * size * 2
+
+    corrupt = bytearray(data)
+    corrupt[frame_off] ^= 0xFF  # frame magic
+    with pytest.raises(ValueError):
+        tc.decode_v2(bytes(corrupt), decompressor=zstd_store_inflate)
+
+    corrupt = bytearray(data)
+    struct.pack_into("<I", corrupt, frame_off + 5, 7)  # lie about the content size
+    with pytest.raises(ValueError):
+        tc.decode_v2(bytes(corrupt), decompressor=zstd_store_inflate)
+
+    # comp_len 0 on a block that owns a frame: an empty frame cannot expand to
+    # anything, and a block that owns no bytes is CONSTANT by definition.
+    corrupt = bytearray(data)
+    struct.pack_into("<I", corrupt, elev_index_off + 8, 0)
+    with pytest.raises(ValueError):
+        tc.decode_v2(bytes(corrupt), decompressor=zstd_store_inflate)
+
+
+def test_v2_zstd_store_frames_are_conformant_zstd():
+    """The committed CODEC_ZSTD fixture is built from Raw_Block frames so that
+    CI needs no compression library. That is only defensible if the frames are
+    genuinely conformant zstd â€” verified here by the REAL decoder whenever it
+    is installed, and skipped (not quietly assumed) when it is not."""
+    zstandard = pytest.importorskip("zstandard")
+    for payload in (b"", b"x", bytes(range(256)) * 700, b"\xff" * (300 * 1024)):
+        frame = zstd_store_frame(payload)
+        assert zstandard.ZstdDecompressor().decompress(
+            frame, max_output_size=max(len(payload), 1)
+        ) == payload
+        assert zstd_store_inflate(frame, len(payload)) == payload
+
+
+@pytest.mark.skipif(not tc.HAVE_ZSTD, reason="zstandard not installed")
+def test_v2_real_zstd_and_injected_store_frames_decode_alike():
+    """Two different, both-conformant encoders of the same tile must decode to
+    the same lattice. This is the encoder half of Â§7's licence: the bytes may
+    differ, the values may not."""
+    size, block_log2 = 32, 4
+    tile = _mixed_tile(size, block_log2, codec=tc.CODEC_ZSTD)
+    real = tc.decode_v2(tc.encode_v2(tile))  # default zstandard compressor
+    stored = tc.decode_v2(
+        tc.encode_v2(tile, compressor=zstd_store_frame), decompressor=zstd_store_inflate
+    )
+    np.testing.assert_array_equal(real.elevation_cp, tile.elevation_cp)
+    np.testing.assert_array_equal(stored.elevation_cp, tile.elevation_cp)
+
+
 def test_v2_codec_raw_needs_no_compression_dependency():
     """CODEC_RAW must work with zero compression dependency, always."""
     size, block_log2 = 16, 4
@@ -405,7 +584,7 @@ def test_v2_rejects_nonzero_reserved_bytes():
 
 def test_v2_rejects_corrupted_block_pad():
     """Flip a byte inside a block index entry's `pad` field, which must be
-    all zero per §4."""
+    all zero per Â§4."""
     size, block_log2 = 16, 4  # single block, forced RAW so pad sits right after a known header
     cp = _smooth_field(size)
     tile = tc.TileV2(seed=1, x=0, y=0, size=size, elevation_cp=cp, block_log2=block_log2)
@@ -440,7 +619,7 @@ def test_v2_rejects_out_of_bounds_block_offset():
 # ----------------------------------------------------------- version cross
 
 def test_v1_file_still_decodes_as_v1():
-    """§9 done-means: 'A v1 file must still decode as v1.'"""
+    """Â§9 done-means: 'A v1 file must still decode as v1.'"""
     elevation = np.zeros((tc.TILE_SIZE, tc.TILE_SIZE), dtype=np.int16)
     elevation[10, 20] = -500
     climate = np.zeros((tc.CLIMATE_CHANNELS, tc.TILE_SIZE, tc.TILE_SIZE), dtype=np.uint8)
@@ -451,7 +630,7 @@ def test_v1_file_still_decodes_as_v1():
 
 
 def test_v2_file_rejected_by_v1_path_on_version_not_garbage():
-    """§9 done-means: 'a v2 file must be rejected by the v1 path on
+    """Â§9 done-means: 'a v2 file must be rejected by the v1 path on
     `version`, not on garbage.' The v1 `decode()` must reach its version
     check (i.e. magic parses fine) and fail there specifically."""
     v2_data = _good_v2_bytes()
@@ -489,7 +668,7 @@ def test_v2_golden_fixture_decodes():
     bs = 1 << tile.block_log2
     nb = tile.size // bs
     # Re-derive each block's mode straight from the wire bytes and confirm
-    # all four appear — CONSTANT, CODED/16, CODED/32, RAW.
+    # all four appear â€” CONSTANT, CODED/16, CODED/32, RAW.
     off = tc._HEADER.size + tc._V2_EXT.size
     table = [tc._SECTION_ENTRY.unpack_from(data, off + i * tc._SECTION_ENTRY.size) for i in range(2)]
     elev_index_off = next(o for sid, o, ln in table if sid == tc.SECTION_ELEV_INDEX)
@@ -509,10 +688,10 @@ def test_v2_golden_fixture_decodes():
 )
 def test_v2_golden_flow_fixture_decodes():
     """Companion to test_v2_golden_fixture_decodes: the first golden fixture
-    has no flow plane, so §6 was never cross-language exercised. This one
+    has no flow plane, so Â§6 was never cross-language exercised. This one
     sets flags bit0 and puts a CONSTANT (all bits set, 0xFF), a CODED, and a
     RAW flow block in one file, with non-zero channel/bank/deposition/log2
-    bits throughout — so a decoder that mis-shifts a bit, mis-signs
+    bits throughout â€” so a decoder that mis-shifts a bit, mis-signs
     const_cp, or reads RAW as 2 bytes/px instead of 1 fails here, not by
     coincidence passing on all-zero data."""
     data = FLOW_FIXTURE_PATH.read_bytes()
@@ -580,7 +759,7 @@ def test_encode_fine_ships_control_points_not_samples():
     Writing the bake's samples straight into the cp plane produces a valid file;
     the client's spline then renders a LOW-PASSED version of it. So the check is
     not "does it round-trip" (it would either way) but "does evaluating the
-    shipped lattice give the surface back". At a lattice point the §8 weights are
+    shipped lattice give the surface back". At a lattice point the Â§8 weights are
     (1,4,1,0)/6 per axis, so that evaluation is a separable [1,4,1]/6 stencil.
     """
     pytest.importorskip("scipy")
@@ -716,3 +895,64 @@ def test_flow_plane_blocks_pick_raw_when_it_is_smaller():
         for i in range(nb * nb)
     }
     assert tc.MODE_RAW not in elev_modes, "the int16 plane must not auto-select RAW"
+@pytest.mark.skipif(
+    not (ZSTD_FIXTURE_PATH.exists() and FIXTURE_PATH.exists()),
+    reason="fixtures not generated",
+)
+def test_v2_zstd_fixture_carries_the_same_lattice_as_the_raw_golden():
+    """The CODEC_ZSTD twin of the golden. Its whole reason to exist is that
+    the C++ decoder can digest-compare the two and get the same number, so
+    this side checks the same claim: identical lattice, identical block modes,
+    different codec on the wire.
+
+    Regenerate both with:
+        python terrain-service/tools/make_v2_zstd_fixture.py
+    """
+    raw = tc.decode_v2(FIXTURE_PATH.read_bytes())
+    zstd_bytes = ZSTD_FIXTURE_PATH.read_bytes()
+    zstd = tc.decode_v2(zstd_bytes, decompressor=zstd_store_inflate)
+
+    assert zstd.codec == tc.CODEC_ZSTD
+    assert raw.codec == tc.CODEC_RAW
+    for field in ("seed", "x", "y", "size", "block_log2", "quant", "bake_ver",
+                  "base_offset_mm"):
+        assert getattr(zstd, field) == getattr(raw, field), field
+    np.testing.assert_array_equal(zstd.elevation_cp, raw.elevation_cp)
+
+    # Same four modes at the same four positions, and comp_len is now a FRAME
+    # length rather than the plain payload length.
+    off = tc._HEADER.size + tc._V2_EXT.size
+    table = [
+        tc._SECTION_ENTRY.unpack_from(zstd_bytes, off + i * tc._SECTION_ENTRY.size)
+        for i in range(2)
+    ]
+    index_off = next(o for sid, o, _ in table if sid == tc.SECTION_ELEV_INDEX)
+    bs = 1 << zstd.block_log2
+    nb = zstd.size // bs
+    modes, resid_bits = set(), set()
+    for i in range(nb * nb):
+        e = tc._BLOCK_ENTRY.unpack_from(zstd_bytes, index_off + i * tc._BLOCK_ENTRY.size)
+        modes.add(e[2])
+        if e[2] == tc.MODE_CODED:
+            resid_bits.add(e[4])
+            assert e[1] != bs * bs * (2 if e[4] == 16 else 4)
+        elif e[2] == tc.MODE_RAW:
+            assert e[1] != bs * bs * 2
+        else:
+            assert e[1] == 0  # CONSTANT still owns no frame
+    assert modes == {tc.MODE_CONSTANT, tc.MODE_CODED, tc.MODE_RAW}
+    assert resid_bits == {16, 32}
+
+
+@pytest.mark.skipif(not ZSTD_FIXTURE_PATH.exists(), reason="fixture not generated")
+def test_v2_zstd_fixture_decodes_with_the_real_zstd_decoder():
+    """The committed fixture must be readable by a REAL zstd, not only by the
+    Raw_Block reader that wrote it â€” otherwise "conformant zstd frames" is an
+    unchecked claim and the UE module (which uses the engine's zstd) would be
+    the place it failed."""
+    zstandard = pytest.importorskip("zstandard")
+    assert zstandard is not None
+    tile = tc.decode_v2(ZSTD_FIXTURE_PATH.read_bytes())  # no injection: real zstd
+    assert tile.codec == tc.CODEC_ZSTD
+    raw = tc.decode_v2(FIXTURE_PATH.read_bytes())
+    np.testing.assert_array_equal(tile.elevation_cp, raw.elevation_cp)

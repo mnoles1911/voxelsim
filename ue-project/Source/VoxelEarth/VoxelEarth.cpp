@@ -1,5 +1,7 @@
 #include "VoxelEarth.h"
 
+#include "VoxelTileCodec.h"
+
 // voxel-core is UE-header-free C++20; safe to include directly from a UE
 // module .cpp (do not include it from headers pulled into UHT-parsed code).
 #include "voxelcore/hash.h"
@@ -40,6 +42,12 @@ void FVoxelEarthModule::StartupModule()
 	UE_LOG(LogVoxelEarth, Log,
 	       TEXT("voxelcore.lib Amplifier::column(0,0): surface %d mm, surfaceMat %u"),
 	       Col.surfaceMm, static_cast<uint32>(Col.surfaceMat));
+
+	// Which zstd (if any) this binary will decode `.vxtl` v2 CODEC_ZSTD tiles
+	// with. Stated once, here, because the alternative to reading it in the log
+	// is discovering it from a fine tile that will not load -- or worse, from
+	// terrain that is quietly wrong. See VoxelTileCodec.h.
+	VoxelEarth::LogFineTileCodecStatus();
 }
 
 void FVoxelEarthModule::ShutdownModule()

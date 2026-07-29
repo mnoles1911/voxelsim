@@ -148,12 +148,106 @@ inline constexpr uint8_t kPredMed = 1;
 // decoder does not understand.
 inline constexpr uint16_t kFineFlagFlowPresent = 0x1;
 
-// True for codecs this build can actually decode. CODEC_ZSTD is a valid part
-// of the format (§3 makes `codec` a field precisely so the C++ decoder could
-// land and be tested before any compression dependency existed) but voxel-core
-// vendors no third-party code, so a zstd tile is rejected cleanly rather than
-// mis-decoded.
-constexpr bool fineCodecSupported(uint8_t codec) { return codec == kCodecRaw; }
+// True for codec values the FORMAT defines. Says nothing about whether this
+// process can decode them -- see fineCodecNeedsDecompressor below.
+constexpr bool fineCodecKnown(uint8_t codec) {
+    return codec == kCodecRaw || codec == kCodecZstd;
+}
+// True for codecs whose block payloads are compressed frames and therefore
+// need an injected decompressor (below) to read.
+constexpr bool fineCodecNeedsDecompressor(uint8_t codec) { return codec == kCodecZstd; }
+
+// ---------------------------------------------------------------------------
+// CODEC_ZSTD: the decompressor is INJECTED, never linked into voxel-core.
+// docs/vxtl-v2-format.md §3 decides this, and the second reason is the serious
+// one: voxel-core has zero third-party dependencies on purpose, AND it is
+// compiled into a static library linked into a UE binary. A zstd vendored in
+// here would be a SECOND copy of zstd's symbols in that binary the moment the
+// engine or any plugin brings its own -- an ODR/symbol-collision hazard whose
+// failure mode is wrong terrain, not a link error.
+//
+// (§3 justifies that by saying UE 5.8 ships zstd in Engine/Source/ThirdParty.
+// Checked 2026-07-29 against the installed UE 5.8: the binary/launcher
+// distribution does NOT -- it ships Oodle and LZ4. It DOES carry a zstd
+// statically linked inside ThirdParty/Blosc's libblosc.lib, which is the
+// collision the argument was about, just not the borrowable copy §3 expected.
+// See ue-project/Source/VoxelEarth/VoxelTileCodec.h for the full finding. The
+// conclusion is unchanged and in fact firmer: WHICH zstd a binary uses is the
+// host's decision, so voxel-core stays out of it entirely.)
+//
+// The UE module hands one over (VoxelTileCodec.h), a headless harness hands
+// over its own, and voxel-core builds and tests standalone with no compression
+// library present at all.
+//
+// Decode stays a pure integer function of the bytes (§7) because zstd frame
+// decode is bit-exact by format definition. voxel-core cannot enforce that of
+// an arbitrary injected callback, so it enforces the part it can: the frame
+// must expand to EXACTLY the length the header implies, and nothing on this
+// side of the boundary is allowed to vary with the host.
+// ---------------------------------------------------------------------------
+
+// Decompress exactly one §4 block frame. Every clause here is load-bearing:
+//
+//   * `src`/`srcLen` is that block's stored frame and nothing else -- blocks
+//     are independent (§4), so there is no dictionary, no shared context and
+//     no cross-block state to thread through. A callback that keeps state
+//     between calls breaks the format's random-access guarantee.
+//   * `dst`/`dstLen` is the caller's buffer. voxel-core always knows the exact
+//     decompressed size from the header (block pixels x the mode's element
+//     width), so the callback never allocates and never reports a size.
+//   * Return true ONLY if exactly `dstLen` bytes were produced. A frame that
+//     expands to fewer or more bytes -- truncated, padded, or simply not the
+//     frame the index claims -- MUST return false. This is the check that
+//     stops a corrupt frame becoming plausible terrain, and it is the only
+//     length check that means anything under CODEC_ZSTD: `comp_len` is the
+//     COMPRESSED length there and constrains nothing about the contents.
+//   * Must not throw. voxel-core is exception-free on the query path.
+//   * Must be safe to call from several threads at once. Statelessness gets
+//     that for free; a shared decompression context would not, and would also
+//     break the clause above it. FineTileSampler::prewarm exists precisely so
+//     a region can be made resident from one thread and then read from many.
+//
+// `user` is the opaque context handed over at registration. A plain function
+// pointer rather than a std::function on purpose: trivially copyable, no
+// allocation, and it survives the C-ABI-ish boundary into a UE module cleanly.
+using FineDecompressFn = bool (*)(void* user, const uint8_t* src, size_t srcLen, uint8_t* dst,
+                                  size_t dstLen);
+
+struct FineDecompressor {
+    FineDecompressFn fn = nullptr;
+    void* user = nullptr;
+
+    bool valid() const { return fn != nullptr; }
+    bool operator()(const uint8_t* src, size_t srcLen, uint8_t* dst, size_t dstLen) const {
+        return fn != nullptr && fn(user, src, srcLen, dst, dstLen);
+    }
+};
+
+// Why a reason code rather than a bare nullopt: a tile that declares
+// CODEC_ZSTD with no decompressor injected is a DEPLOYMENT mistake (the host
+// forgot to register one), while a tile that fails its block index is corrupt
+// data. Both must refuse the tile, but a caller that cannot tell them apart
+// logs the wrong thing and chases the wrong bug -- and the failure mode this
+// whole path exists to prevent, silently decoding a compressed frame as
+// literal bytes, is a desync rather than a glitch.
+enum class FineError : uint8_t {
+    kNone = 0,
+    kFileUnreadable,   // loadTileFile only: the bytes never arrived
+    kNotVxtl,          // no "VXTL" magic, or too short to hold it
+    kWrongVersion,     // a .vxtl, but not v2
+    kBadHeader,        // a §3 field outside the contract, incl. a short header
+    kUnknownCodec,     // `codec` is neither CODEC_RAW nor CODEC_ZSTD
+    kNoDecompressor,   // CODEC_ZSTD declared and no decompressor was injected
+    kBadSectionTable,  // §3 table: out of bounds, overlapping, duplicated, missing
+    kBadBlockIndex,    // a §4 index entry is structurally impossible
+    kBadBlockCoords,   // decode: block coords outside the grid, or no flow plane
+    kDecompressFailed, // decode: the injected decompressor rejected the frame
+    kBadPayload,       // decode: payload length wrong for the block's mode
+    kValueOutOfRange,  // decode: a reconstructed value left the element's range
+};
+
+// Stable short name, for logs. Never null.
+const char* fineErrorName(FineError e);
 
 // mm per LSB for §3 `quant`. 0 for an unsupported value.
 constexpr int32_t fineQuantMm(uint8_t quant) {
@@ -198,13 +292,31 @@ struct FineBlockEntry {
 class FineTile {
 public:
     // Exact parse: validates magic, version, scale, size, predictor, quant,
-    // codec support, reserved/pad bytes, the section table (in bounds,
-    // non-overlapping, required sections present, no bytes past the last
-    // section) and every block-index entry, including that each block's stored
-    // length is exactly what CODEC_RAW implies. Returns nullopt on any
-    // mismatch -- the same all-or-nothing shape TileData::parse has for v1.
-    static std::optional<FineTile> parse(std::vector<uint8_t> bytes);
-    static std::optional<FineTile> parse(const uint8_t* data, size_t size);
+    // codec, reserved/pad bytes, the section table (in bounds, non-overlapping,
+    // required sections present, no bytes past the last section) and every
+    // block-index entry, including -- under CODEC_RAW -- that each block's
+    // stored length is exactly what the mode implies. Returns nullopt on any
+    // mismatch, and sets *err to why; the same all-or-nothing shape
+    // TileData::parse has for v1.
+    //
+    // `decompressor` is the injected CODEC_ZSTD reader. Leaving it default
+    // means CODEC_RAW only: a tile declaring CODEC_ZSTD is then refused here,
+    // with err == kNoDecompressor, and is never half-loaded. It is kept for
+    // the tile's lifetime, so whatever it borrows must outlive the FineTile.
+    //
+    // NOTE the length trap this cannot check for you (§4): under CODEC_RAW a
+    // literal int16 plane and a resid_bits=16 residual plane are the SAME
+    // LENGTH, so passing the length check is not evidence the payload was read
+    // as the right thing. Only `mode` distinguishes them. Under CODEC_ZSTD
+    // even the length check is gone -- comp_len is the compressed size and
+    // constrains nothing -- which is why decode insists the frame expand to
+    // exactly the size the header implies.
+    static std::optional<FineTile> parse(std::vector<uint8_t> bytes,
+                                         const FineDecompressor& decompressor = {},
+                                         FineError* err = nullptr);
+    static std::optional<FineTile> parse(const uint8_t* data, size_t size,
+                                         const FineDecompressor& decompressor = {},
+                                         FineError* err = nullptr);
 
     const FineTileHeader& header() const { return h_; }
     uint64_t seed() const { return h_.seed; }
@@ -222,6 +334,10 @@ public:
     const std::vector<FineBlockEntry>& elevIndex() const { return elevIndex_; }
     const std::vector<FineBlockEntry>& flowIndex() const { return flowIndex_; }
 
+    uint8_t codec() const { return h_.codec; }
+    // The decompressor this tile was parsed with. Empty for a CODEC_RAW tile.
+    const FineDecompressor& decompressor() const { return dec_; }
+
     // §2's formula, in int64 so the multiply cannot overflow before the sum.
     int32_t elevationMmFromCp(int16_t cp) const {
         const int64_t mm = static_cast<int64_t>(h_.baseOffsetMm) +
@@ -231,12 +347,19 @@ public:
 
     // Decodes one block's control points into `out` (resized to
     // blockPixelCount(), row-major, x fastest). Returns false if the block
-    // coords are out of range or the payload is corrupt. Pure: same bytes in,
-    // same values out, on every platform.
-    bool decodeElevBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& out) const;
+    // coords are out of range or the payload is corrupt, setting *err to why.
+    // Pure: same bytes in, same values out, on every platform.
+    //
+    // ONE BLOCK, ONE FRAME (§4). This decompresses exactly the requested
+    // block's frame into a buffer sized from the header, touching no other
+    // block and carrying no state between calls -- which is the whole reason
+    // the client can pull the ~0.23 km^2 it needs instead of 134 MB.
+    bool decodeElevBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& out,
+                         FineError* err = nullptr) const;
     // Same for the optional §6 flow plane (one uint8 per fine pixel). False
     // when the tile carries no flow plane.
-    bool decodeFlowBlock(uint32_t bx, uint32_t by, std::vector<uint8_t>& out) const;
+    bool decodeFlowBlock(uint32_t bx, uint32_t by, std::vector<uint8_t>& out,
+                         FineError* err = nullptr) const;
 
     // Single control point, tile-LOCAL pixel coords. Decodes the containing
     // block on every call, so it is for tests and cold paths; anything hot
@@ -244,11 +367,9 @@ public:
     bool controlPointAt(uint32_t lx, uint32_t ly, int16_t& cp) const;
 
 private:
-    bool decodeBlockInto(const std::vector<FineBlockEntry>& index, uint64_t dataOff,
-                         uint32_t bx, uint32_t by, bool isFlow, void* out) const;
-
     std::vector<uint8_t> bytes_;
     FineTileHeader h_;
+    FineDecompressor dec_{};
     std::vector<FineBlockEntry> elevIndex_, flowIndex_;
     uint64_t elevDataOff_ = 0, elevDataLen_ = 0;
     uint64_t flowDataOff_ = 0, flowDataLen_ = 0;
@@ -287,14 +408,26 @@ public:
     uint64_t seed() const { return seed_; }
     int32_t pixelSizeMm() const override { return tilePixelSizeMm(kFineTileScale); }
 
+    // Registers the injected CODEC_ZSTD reader used by the byte/file loaders
+    // below. Call it before loading anything: it is NOT retroactive, because a
+    // FineTile keeps the decompressor it was parsed with (blocks decode lazily,
+    // so the callback has to be reachable for the tile's whole life). With none
+    // registered, a CODEC_ZSTD tile is refused at load with kNoDecompressor
+    // rather than loaded and silently full of holes.
+    void setDecompressor(const FineDecompressor& d) { dec_ = d; }
+    const FineDecompressor& decompressor() const { return dec_; }
+
     // Stores a parsed tile keyed by its COARSE (x, y). Rejects (returns false,
     // no state change) if the tile's seed doesn't match this sampler, or if
     // its `size` differs from the already-loaded tiles': the grid stride is
     // what routes a pixel to a tile, so two edges in one sampler would make
     // addressing ambiguous rather than merely inconsistent.
     bool loadTile(FineTile tile);
-    bool loadTile(const std::vector<uint8_t>& bytes);
-    bool loadTileFile(const std::filesystem::path& path);
+    // Parse-then-store, using the registered decompressor. *err says why on
+    // failure -- kNoDecompressor is a host wiring bug, everything else is bad
+    // bytes, and a caller that cannot tell them apart chases the wrong one.
+    bool loadTile(const std::vector<uint8_t>& bytes, FineError* err = nullptr);
+    bool loadTileFile(const std::filesystem::path& path, FineError* err = nullptr);
 
     size_t tileCount() const { return tiles_.size(); }
     // Grid stride in fine pixels, taken from the first loaded tile; 0 before
@@ -354,6 +487,7 @@ private:
     uint64_t seed_;
     ITileSampler* climate_ = nullptr;
     uint32_t tileSize_ = 0;
+    FineDecompressor dec_{};
     std::unordered_map<uint64_t, Resident> tiles_;
 };
 

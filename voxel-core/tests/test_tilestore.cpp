@@ -17,6 +17,7 @@
 
 #include "voxelcore/detail_bedding.h" // kBeddingMaxAbsMm, for the translation test
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
@@ -53,6 +54,18 @@ std::filesystem::path fineFixturePath() {
 // the one carrying one block of each mode.
 std::filesystem::path fineFlowFixturePath() {
     return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_flow_512.vxtl";
+}
+
+// The CODEC_ZSTD twin of vxtl_v2_golden_512.vxtl: the SAME control lattice,
+// block mode for block mode, with each block's payload wrapped in its own zstd
+// frame. Regenerate both from the CODEC_RAW golden with
+//   python terrain-service/tools/make_v2_zstd_fixture.py
+// which also verifies the frames against the real zstandard decoder when it is
+// installed. The point of the pair is that decoding it must reproduce the
+// CODEC_RAW golden's whole-lattice digest exactly — same numbers, different
+// codec — which no length or structural check can fake.
+std::filesystem::path fineZstdFixturePath() {
+    return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_zstd_512.vxtl";
 }
 
 // Builds an in-memory TileData with a constant elevation and constant
@@ -100,6 +113,121 @@ uint32_t zigzagRef(int32_t r) {
     return (static_cast<uint32_t>(r) << 1) ^ static_cast<uint32_t>(r >> 31);
 }
 
+// ---------------------------------------------------------------------------
+// A zstd frame writer/reader restricted to Raw_Blocks (RFC 8878 §3.1.1), so
+// this file can exercise CODEC_ZSTD end to end with NO compression library
+// anywhere near voxel-core.
+//
+// That is not a workaround, it is the design being tested. §3 puts the
+// decompressor at the host boundary because voxel-core has zero third-party
+// dependencies and is linked into a UE binary that already ships zstd; a
+// second static copy would be an ODR hazard, not just bloat. So the thing
+// under test is the INJECTION and the validation either side of it, and the
+// right decompressor for that is a real-but-minimal one this file owns.
+//
+// The frames written here are conformant zstd — the committed
+// vxtl_v2_golden_zstd_512.vxtl fixture is built with the same subset by
+// terrain-service/tools/vxtl_zstd_store.py, and that script verifies its
+// output against the REAL zstandard decoder whenever it is installed. So a
+// Raw_Block frame is not a private format that only these two halves agree on.
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t kZstdMagic = 0xFD2FB528u;
+// Frame_Content_Size_flag = 2 (4-byte FCS, value stored directly),
+// Single_Segment_flag = 1 (no Window_Descriptor), no dict id, no checksum.
+constexpr uint8_t kZstdDescriptor = 0xA0;
+// Block_Maximum_Size is min(Window_Size, 128 KB). A 256x256 CODED/32 payload
+// is 256 KB, so real fixture frames DO span several blocks.
+constexpr size_t kZstdBlockMax = 128 * 1024;
+
+std::vector<uint8_t> zstdStoreFrame(const std::vector<uint8_t>& payload) {
+    std::vector<uint8_t> out;
+    ByteWriter w(out);
+    w.u32(kZstdMagic);
+    w.u8(kZstdDescriptor);
+    w.u32(static_cast<uint32_t>(payload.size()));
+    size_t i = 0;
+    for (;;) {
+        const size_t take = std::min(kZstdBlockMax, payload.size() - i);
+        const bool last = (i + take) >= payload.size();
+        const uint32_t header =
+            (last ? 1u : 0u) | (0u << 1) /* Raw_Block */ | (static_cast<uint32_t>(take) << 3);
+        w.u8(static_cast<uint8_t>(header));
+        w.u8(static_cast<uint8_t>(header >> 8));
+        w.u8(static_cast<uint8_t>(header >> 16));
+        out.insert(out.end(), payload.begin() + i, payload.begin() + i + take);
+        i += take;
+        if (last) break;
+    }
+    return out;
+}
+
+// Counters so a test can assert the PER-BLOCK property directly: one call, and
+// the src window is exactly that block's frame — no neighbouring bytes, no
+// state carried between calls (§4).
+struct TestDecompressorState {
+    uint64_t calls = 0;
+    uint64_t rejects = 0;
+    size_t lastSrcLen = 0;
+    size_t lastDstLen = 0;
+    // Refuse every frame, to exercise what the decoder does when the injected
+    // decompressor says no — as a real zstd would on a corrupt frame.
+    bool forceFail = false;
+};
+
+// The injected FineDecompressor. Strict on purpose: anything outside the
+// Raw_Block subset, and any frame whose content is not EXACTLY dstLen bytes,
+// is refused. Under CODEC_ZSTD comp_len is the compressed size and constrains
+// nothing, so this exactness is the only length check there is.
+bool testZstdInflate(void* user, const uint8_t* src, size_t srcLen, uint8_t* dst, size_t dstLen) {
+    TestDecompressorState* st = static_cast<TestDecompressorState*>(user);
+    if (st) {
+        ++st->calls;
+        st->lastSrcLen = srcLen;
+        st->lastDstLen = dstLen;
+    }
+    const auto reject = [st]() {
+        if (st) ++st->rejects;
+        return false;
+    };
+    if (st && st->forceFail) return reject();
+    if (srcLen < 9) return reject();
+    ByteReader r(src, srcLen);
+    uint32_t magic = 0, fcs = 0;
+    uint8_t descriptor = 0;
+    if (!r.u32(magic) || magic != kZstdMagic) return reject();
+    if (!r.u8(descriptor) || descriptor != kZstdDescriptor) return reject();
+    if (!r.u32(fcs) || fcs != dstLen) return reject();
+
+    size_t off = 9, written = 0;
+    for (;;) {
+        if (off + 3 > srcLen) return reject();
+        const uint32_t header = uint32_t(src[off]) | (uint32_t(src[off + 1]) << 8) |
+                                (uint32_t(src[off + 2]) << 16);
+        off += 3;
+        const bool last = (header & 1u) != 0;
+        const uint32_t blockType = (header >> 1) & 3u;
+        const size_t size = header >> 3;
+        if (blockType != 0) return reject(); // only Raw_Block
+        if (off + size > srcLen) return reject();
+        if (written + size > dstLen) return reject();
+        for (size_t k = 0; k < size; ++k) dst[written + k] = src[off + k];
+        off += size;
+        written += size;
+        if (last) break;
+    }
+    if (off != srcLen) return reject();
+    if (written != dstLen) return reject();
+    return true;
+}
+
+FineDecompressor testDecompressor(TestDecompressorState& st) {
+    FineDecompressor d;
+    d.fn = &testZstdInflate;
+    d.user = &st;
+    return d;
+}
+
 template <typename T>
 struct PlanePlan {
     uint8_t mode = 0;       // 0 CONSTANT, 1 CODED, 2 RAW
@@ -109,17 +237,20 @@ struct PlanePlan {
 };
 
 // Encodes one plane's §4 index + data sections. dim is the block edge in
-// pixels; plans is blocksPerAxis^2 entries, row-major with x fastest.
+// pixels; plans is blocksPerAxis^2 entries, row-major with x fastest. With
+// `zstd` set, each block's payload is wrapped in its OWN frame — one frame per
+// block, no dictionary, nothing shared (§4).
 template <typename T>
-void encodePlane(const std::vector<PlanePlan<T>>& plans, uint32_t dim,
+void encodePlane(const std::vector<PlanePlan<T>>& plans, uint32_t dim, bool zstd,
                  std::vector<uint8_t>& index, std::vector<uint8_t>& data) {
     const uint32_t n = dim * dim;
-    ByteWriter iw(index), dw(data);
+    ByteWriter iw(index);
     for (const PlanePlan<T>& p : plans) {
         uint64_t offset = 0;
         uint32_t compLen = 0;
+        std::vector<uint8_t> payload;
+        ByteWriter dw(payload);
         if (p.mode == 2) { // RAW: literal samples, no predictor, no zigzag
-            offset = static_cast<uint64_t>(data.size());
             for (uint32_t i = 0; i < n; ++i) {
                 if constexpr (sizeof(T) == 2) {
                     dw.u16(static_cast<uint16_t>(static_cast<int16_t>(p.v[i])));
@@ -127,9 +258,7 @@ void encodePlane(const std::vector<PlanePlan<T>>& plans, uint32_t dim,
                     dw.u8(static_cast<uint8_t>(p.v[i]));
                 }
             }
-            compLen = static_cast<uint32_t>(n * sizeof(T));
         } else if (p.mode == 1) { // CODED: MED residuals, zigzag, LE
-            offset = static_cast<uint64_t>(data.size());
             for (uint32_t y = 0; y < dim; ++y) {
                 for (uint32_t x = 0; x < dim; ++x) {
                     int32_t pred;
@@ -149,7 +278,12 @@ void encodePlane(const std::vector<PlanePlan<T>>& plans, uint32_t dim,
                     else dw.u32(zz);
                 }
             }
-            compLen = n * (p.residBits / 8u);
+        }
+        if (p.mode != 0) {
+            const std::vector<uint8_t> stored = zstd ? zstdStoreFrame(payload) : payload;
+            offset = static_cast<uint64_t>(data.size());
+            data.insert(data.end(), stored.begin(), stored.end());
+            compLen = static_cast<uint32_t>(stored.size());
         }
         iw.u64(offset);
         iw.u32(compLen);
@@ -184,10 +318,11 @@ std::vector<uint8_t> buildFineTile(const V2Params& p,
                                    const std::vector<PlanePlan<int16_t>>& elevPlans,
                                    const std::vector<PlanePlan<uint8_t>>& flowPlans = {}) {
     const uint32_t dim = 1u << p.blockLog2;
+    const bool zstd = p.codec == 1;
     std::vector<uint8_t> elevIndex, elevData, flowIndex, flowData;
-    encodePlane<int16_t>(elevPlans, dim, elevIndex, elevData);
+    encodePlane<int16_t>(elevPlans, dim, zstd, elevIndex, elevData);
     const bool hasFlow = !flowPlans.empty();
-    if (hasFlow) encodePlane<uint8_t>(flowPlans, dim, flowIndex, flowData);
+    if (hasFlow) encodePlane<uint8_t>(flowPlans, dim, zstd, flowIndex, flowData);
 
     const uint16_t nSections = hasFlow ? uint16_t(4) : uint16_t(2);
     const uint64_t tableEnd = 43 + uint64_t(nSections) * 20;
@@ -863,7 +998,11 @@ VXC_TEST(vxtl_v2_rejects_truncated_corrupt_and_trailing_input) {
     rejects(26, 2);    // predictor 2
     rejects(27, 0);    // quant 0
     rejects(27, 3);    // quant 3
-    rejects(28, 1);    // CODEC_ZSTD: valid format, not decodable in this build
+    // CODEC_ZSTD is a valid part of the format, but no decompressor is injected
+    // on this call, so the tile is refused whole rather than half-loaded. The
+    // two refusals are distinguishable — see
+    // vxtl_v2_zstd_without_a_decompressor_is_refused_loudly.
+    rejects(28, 1);
     rejects(28, 9);    // codec 9: not a codec at all
     rejects(32, 0x01); // flags bit8 — an undefined flag
     rejects(31, 0x02); // flags bit1 — an undefined flag
@@ -1652,4 +1791,565 @@ VXC_TEST(vxtl_v2_golden_flow_fixture_cross_language) {
         b[524491 + 2 * 20 + 10] = 0x02;
         CHECK(!FineTile::parse(b.data(), b.size()).has_value());
     }
+}
+
+// ===========================================================================
+// CODEC_ZSTD (docs/vxtl-v2-format.md §3): the decompressor is INJECTED at the
+// host boundary, never linked into voxel-core.
+//
+// Everything below runs with NO compression library present. The injected
+// decompressor is this file's own Raw_Block zstd reader (zstdStoreFrame /
+// testZstdInflate above), which is exactly the shape the UE module uses when
+// it hands over the engine's zstd instead.
+// ===========================================================================
+
+namespace {
+// Offsets into a hand-built 8192-edge, blockLog2=8 tile, from §3's layout.
+constexpr size_t kElevIndexOff = 43 + 2 * 20;                     // 83
+constexpr size_t kElevDataOff = kElevIndexOff + kTestBlocks * 20; // 20563
+constexpr size_t kEntryBytes = 20;
+} // namespace
+
+VXC_TEST(vxtl_v2_zstd_decodes_identically_to_codec_raw) {
+    // THE equivalence that makes a codec a codec: the same lattice, encoded
+    // once as CODEC_RAW and once as CODEC_ZSTD, must decode to identical
+    // control points. Nothing about the values may depend on how they were
+    // stored — and a whole-lattice digest is what proves it, because no
+    // length, bounds or structural check can (§4: a literal int16 plane and a
+    // resid_bits=16 residual plane are the same length under either codec).
+    V2Params rawP;
+    rawP.seed = 20260729;
+    rawP.x = -3;
+    rawP.y = 5;
+    rawP.baseOffsetMm = 123'400;
+    V2Params zstdP = rawP;
+    zstdP.codec = 1;
+
+    const std::vector<uint8_t> rawBytes = buildFineTile(rawP, makeMixedElevPlans());
+    const std::vector<uint8_t> zstdBytes = buildFineTile(zstdP, makeMixedElevPlans());
+
+    // The zstd file is BIGGER here, and that is expected: a Raw_Block frame
+    // adds 9 bytes of frame header plus 3 per zstd block and compresses
+    // nothing. Size is not what this test is about — real ratios are measured
+    // with a real compressor on real tiles.
+    CHECK(zstdBytes.size() > rawBytes.size());
+
+    TestDecompressorState st;
+    FineError rawErr = FineError::kBadHeader, zstdErr = FineError::kBadHeader;
+    auto rawTile = FineTile::parse(rawBytes.data(), rawBytes.size(), {}, &rawErr);
+    auto zstdTile =
+        FineTile::parse(zstdBytes.data(), zstdBytes.size(), testDecompressor(st), &zstdErr);
+    CHECK(rawTile.has_value());
+    CHECK(zstdTile.has_value());
+    CHECK(rawErr == FineError::kNone);
+    CHECK(zstdErr == FineError::kNone);
+    if (!rawTile || !zstdTile) return;
+    CHECK_EQ(int(rawTile->codec()), int(kCodecRaw));
+    CHECK_EQ(int(zstdTile->codec()), int(kCodecZstd));
+    CHECK(!rawTile->decompressor().valid());
+    CHECK(zstdTile->decompressor().valid());
+
+    // Every block, both codecs, digest-compared — and the four interesting
+    // blocks separately compared against what the PLANS say, so a bug that
+    // corrupted both codecs identically could not pass.
+    Digest dRaw, dZstd;
+    uint64_t mismatches = 0;
+    for (uint32_t by = 0; by < kTestPerAxis; ++by) {
+        for (uint32_t bx = 0; bx < kTestPerAxis; ++bx) {
+            std::vector<int16_t> a, b;
+            if (!rawTile->decodeElevBlock(bx, by, a)) { ++mismatches; continue; }
+            if (!zstdTile->decodeElevBlock(bx, by, b)) { ++mismatches; continue; }
+            for (uint32_t i = 0; i < kTestBlockPixels; ++i) {
+                dRaw.u16(static_cast<uint16_t>(a[i]));
+                dZstd.u16(static_cast<uint16_t>(b[i]));
+                if (a[i] != b[i]) ++mismatches;
+            }
+            if (by == 0 && bx < 4) {
+                for (uint32_t ly = 0; ly < kTestDim; ++ly)
+                    for (uint32_t lx = 0; lx < kTestDim; ++lx)
+                        if (b[ly * kTestDim + lx] != expectedCp(bx, by, lx, ly)) ++mismatches;
+            }
+        }
+    }
+    CHECK_EQ(mismatches, uint64_t(0));
+    CHECK_EQ(dRaw.h, dZstd.h);
+
+    // Only the three non-CONSTANT blocks own a frame; CONSTANT blocks cost
+    // zero data bytes, so the decompressor is never called for them (§4).
+    CHECK_EQ(st.calls, uint64_t(3));
+    CHECK_EQ(st.rejects, uint64_t(0));
+
+    // §2's mm conversion is codec-independent too.
+    int16_t cp = 0;
+    CHECK(zstdTile->controlPointAt(2 * kTestDim + 4, 6, cp));
+    CHECK_EQ(cp, codedWideCp(4, 6));
+    CHECK_EQ(zstdTile->elevationMmFromCp(cp), 123'400 + int32_t(cp) * 100);
+}
+
+VXC_TEST(vxtl_v2_zstd_without_a_decompressor_is_refused_loudly) {
+    // The requirement FineError exists for: with no decompressor registered, a
+    // CODEC_ZSTD tile must be refused with a DISTINGUISHABLE error, never
+    // loaded and left to answer zeros. Silently flat terrain under a client
+    // that believes it has the fine tier is a desync, not a glitch — and
+    // "kNoDecompressor" vs "kBadBlockIndex" is the difference between fixing
+    // host wiring and chasing a corrupt bake.
+    V2Params zstdP;
+    zstdP.codec = 1;
+    const std::vector<uint8_t> zstdBytes = buildFineTile(zstdP, makeMixedElevPlans());
+
+    FineError err = FineError::kNone;
+    CHECK(!FineTile::parse(zstdBytes.data(), zstdBytes.size(), {}, &err).has_value());
+    CHECK(err == FineError::kNoDecompressor);
+    // The default-argument form — every pre-existing caller — behaves the same.
+    CHECK(!FineTile::parse(zstdBytes.data(), zstdBytes.size()).has_value());
+
+    // A codec byte that is not part of the format at all is a DIFFERENT
+    // failure: bytes this build does not understand, not a host that forgot to
+    // wire something up.
+    {
+        std::vector<uint8_t> b = zstdBytes;
+        b[28] = 9;
+        err = FineError::kNone;
+        TestDecompressorState st;
+        CHECK(!FineTile::parse(b.data(), b.size(), testDecompressor(st), &err).has_value());
+        CHECK(err == FineError::kUnknownCodec);
+        CHECK_EQ(st.calls, uint64_t(0)); // refused before any block was touched
+    }
+
+    // CODEC_RAW never needs one, injected or otherwise — voxel-core must build
+    // and pass its whole suite with no compression library anywhere.
+    V2Params rawP;
+    const std::vector<uint8_t> rawBytes = buildFineTile(rawP, makeMixedElevPlans());
+    err = FineError::kBadHeader;
+    CHECK(FineTile::parse(rawBytes.data(), rawBytes.size(), {}, &err).has_value());
+    CHECK(err == FineError::kNone);
+
+    // Same rule through the sampler, which is where a host actually wires this
+    // up. setDecompressor is not retroactive, so the ordering is part of the
+    // contract: register first, load second.
+    FineTileSampler cold(1);
+    err = FineError::kNone;
+    CHECK(!cold.loadTile(zstdBytes, &err));
+    CHECK(err == FineError::kNoDecompressor);
+    CHECK_EQ(cold.tileCount(), size_t(0));
+    CHECK_EQ(cold.elevationMm(0, 0), 0); // and that reads as a MISS, not a lattice of zeros
+    CHECK_EQ(cold.missingTileQueries.load(), uint64_t(1));
+
+    TestDecompressorState st;
+    FineTileSampler warm(1);
+    warm.setDecompressor(testDecompressor(st));
+    CHECK(warm.decompressor().valid());
+    err = FineError::kBadHeader;
+    CHECK(warm.loadTile(zstdBytes, &err));
+    CHECK(err == FineError::kNone);
+    CHECK_EQ(warm.tileCount(), size_t(1));
+    CHECK_EQ(warm.elevationMm(int64_t(kTestDim) + 5, 9), int32_t(codedSmallCp(5, 9)) * 100);
+    CHECK_EQ(warm.missingTileQueries.load(), uint64_t(0));
+    CHECK_EQ(warm.blockDecodeFailures.load(), uint64_t(0));
+
+    // Reason codes have stable names for logs.
+    CHECK(std::string(fineErrorName(FineError::kNoDecompressor)) == "no-decompressor");
+    CHECK(std::string(fineErrorName(FineError::kUnknownCodec)) == "unknown-codec");
+    CHECK(std::string(fineErrorName(FineError::kNone)) == "none");
+}
+
+VXC_TEST(vxtl_v2_zstd_rejects_corrupt_and_truncated_frames) {
+    // Under CODEC_ZSTD comp_len is the COMPRESSED length, so it constrains
+    // nothing about the contents: every length check that mattered under
+    // CODEC_RAW is gone, and "the frame expands to exactly the size the header
+    // implies" is all that is left. These cases are that check, from both
+    // sides of it.
+    V2Params p;
+    p.codec = 1;
+    const std::vector<uint8_t> good = buildFineTile(p, makeMixedElevPlans());
+    TestDecompressorState st;
+    auto ok = FineTile::parse(good.data(), good.size(), testDecompressor(st));
+    CHECK(ok.has_value());
+    if (!ok) return;
+
+    // Block 1 (CODED/16) is the first block that owns a frame.
+    const FineBlockEntry e1 = ok->elevIndex()[1];
+    const size_t frame1 = kElevDataOff + static_cast<size_t>(e1.offset);
+    CHECK_EQ(int(good[frame1 + 0]), 0x28); // zstd magic 0xFD2FB528, LE
+    CHECK_EQ(int(good[frame1 + 1]), 0xB5);
+    CHECK_EQ(int(good[frame1 + 2]), 0x2F);
+    CHECK_EQ(int(good[frame1 + 3]), 0xFD);
+    // comp_len is genuinely not the plain length any more.
+    CHECK(e1.compLen != uint32_t(kTestBlockPixels) * 2);
+
+    auto decodeFails = [&](const std::vector<uint8_t>& b, uint32_t bx, FineError want) {
+        TestDecompressorState s;
+        auto t = FineTile::parse(b.data(), b.size(), testDecompressor(s));
+        CHECK(t.has_value()); // structurally fine: the failure is inside the frame
+        if (!t) return;
+        std::vector<int16_t> blk;
+        FineError err = FineError::kNone;
+        CHECK(!t->decodeElevBlock(bx, 0, blk, &err));
+        CHECK(err == want);
+    };
+
+    { // Corrupt frame magic.
+        std::vector<uint8_t> b = good;
+        b[frame1] ^= 0xFF;
+        decodeFails(b, 1, FineError::kDecompressFailed);
+    }
+    { // A frame declaring the WRONG decompressed size. This is the case that
+      // matters most: the bytes are otherwise a well-formed frame, and only
+      // the header-derived expectation catches it.
+        std::vector<uint8_t> b = good;
+        b[frame1 + 5] = 0x00; // Frame_Content_Size, 4 bytes LE at +5
+        b[frame1 + 6] = 0x00;
+        b[frame1 + 7] = 0x00;
+        b[frame1 + 8] = 0x00;
+        decodeFails(b, 1, FineError::kDecompressFailed);
+    }
+    { // Truncated frame: shrink comp_len so the last zstd block is cut short.
+      // Still non-zero and still in bounds, so parse cannot see it.
+        std::vector<uint8_t> b = good;
+        const uint32_t shorter = e1.compLen - 4;
+        for (int i = 0; i < 4; ++i)
+            b[kElevIndexOff + 1 * kEntryBytes + 8 + i] = uint8_t(shorter >> (8 * i));
+        decodeFails(b, 1, FineError::kDecompressFailed);
+    }
+    { // Garbage INSIDE the frame payload still inflates (Raw_Blocks are
+      // literal) but must then reconstruct out of int16 — the residual path's
+      // own guard, unchanged by the codec.
+        std::vector<uint8_t> b = good;
+        b[frame1 + 12] = 0xFE; // the block's first two residual words: +32767 twice
+        b[frame1 + 13] = 0xFF;
+        b[frame1 + 14] = 0xFE;
+        b[frame1 + 15] = 0xFF;
+        decodeFails(b, 1, FineError::kValueOutOfRange);
+    }
+    { // comp_len 0 on a block that must own a frame: rejected at PARSE, since
+      // an empty frame cannot expand to anything and a block that owns no
+      // bytes is CONSTANT by definition.
+        std::vector<uint8_t> b = good;
+        for (int i = 8; i < 12; ++i) b[kElevIndexOff + 1 * kEntryBytes + i] = 0;
+        TestDecompressorState s;
+        FineError err = FineError::kNone;
+        CHECK(!FineTile::parse(b.data(), b.size(), testDecompressor(s), &err).has_value());
+        CHECK(err == FineError::kBadBlockIndex);
+    }
+    { // A frame running past the end of ELEV_DATA is still caught at parse:
+      // bounds are the one thing comp_len can still be checked against.
+        std::vector<uint8_t> b = good;
+        b[kElevIndexOff + 1 * kEntryBytes + 10] = 0xFF;
+        TestDecompressorState s;
+        FineError err = FineError::kNone;
+        CHECK(!FineTile::parse(b.data(), b.size(), testDecompressor(s), &err).has_value());
+        CHECK(err == FineError::kBadBlockIndex);
+    }
+    { // A decompressor that simply refuses — what a real zstd does on a frame
+      // it dislikes — fails the block cleanly and bumps the sampler's decode
+      // counter. It does NOT fall back to reading the frame as literal bytes.
+        TestDecompressorState s;
+        s.forceFail = true;
+        FineTileSampler sampler(1);
+        sampler.setDecompressor(testDecompressor(s));
+        CHECK(sampler.loadTile(good));
+        CHECK_EQ(sampler.elevationMm(int64_t(kTestDim) + 5, 9), 0);
+        CHECK_EQ(sampler.blockDecodeFailures.load(), uint64_t(1));
+        CHECK_EQ(sampler.missingTileQueries.load(), uint64_t(0));
+        // A CONSTANT block owns no frame, so it still decodes: per-block
+        // independence cuts both ways.
+        CHECK_EQ(sampler.elevationMm(0, 0), int32_t(constCpForBlock(0, 0)) * 100);
+    }
+
+    // THE RECORDED TRAP, restated for CODEC_ZSTD. Relabel the RAW block
+    // (bx=3) as CODED/16: its payload is 2 bytes/px either way, so the frame's
+    // declared content size still matches and NOTHING structural can reject
+    // it. The tile parses, the block "decodes", and the values are simply
+    // wrong. That is why `mode` is authoritative and why the cross-language
+    // digest test below is the check that matters — a length check is not a
+    // correctness check.
+    {
+        std::vector<uint8_t> b = good;
+        b[kElevIndexOff + 3 * kEntryBytes + 12] = 1;  // mode RAW -> CODED
+        b[kElevIndexOff + 3 * kEntryBytes + 15] = 16; // resid_bits
+        TestDecompressorState s;
+        auto t = FineTile::parse(b.data(), b.size(), testDecompressor(s));
+        CHECK(t.has_value());
+        if (t) {
+            std::vector<int16_t> blk;
+            // It may or may not reconstruct in range. What must NOT happen is
+            // it coming back as the correct literal lattice.
+            if (t->decodeElevBlock(3, 0, blk)) CHECK(blk[7] != rawCp(7, 0));
+        }
+    }
+}
+
+VXC_TEST(vxtl_v2_zstd_blocks_are_independently_framed) {
+    // §4's point, and the reason the fine tier is streamable at all: one frame
+    // per block, no dictionary, no cross-block state. Decoding one block must
+    // call the decompressor exactly once, with exactly that block's frame —
+    // never the whole section, never a neighbour.
+    V2Params p;
+    p.codec = 1;
+    const std::vector<uint8_t> bytes = buildFineTile(p, makeMixedElevPlans());
+    TestDecompressorState st;
+    auto tile = FineTile::parse(bytes.data(), bytes.size(), testDecompressor(st));
+    CHECK(tile.has_value());
+    if (!tile) return;
+
+    const std::vector<FineBlockEntry> idx = tile->elevIndex();
+    std::vector<int16_t> blk;
+
+    CHECK(tile->decodeElevBlock(3, 0, blk)); // RAW: literal control points
+    CHECK_EQ(st.calls, uint64_t(1));
+    CHECK_EQ(st.lastSrcLen, size_t(idx[3].compLen));
+    CHECK_EQ(st.lastDstLen, size_t(kTestBlockPixels) * 2);
+    CHECK_EQ(blk[7], rawCp(7, 0));
+
+    CHECK(tile->decodeElevBlock(0, 0, blk)); // CONSTANT: no frame at all
+    CHECK_EQ(st.calls, uint64_t(1));
+    CHECK_EQ(blk[0], constCpForBlock(0, 0));
+
+    CHECK(tile->decodeElevBlock(2, 0, blk)); // CODED/32: 4 bytes/px
+    CHECK_EQ(st.calls, uint64_t(2));
+    CHECK_EQ(st.lastSrcLen, size_t(idx[2].compLen));
+    CHECK_EQ(st.lastDstLen, size_t(kTestBlockPixels) * 4);
+    CHECK_EQ(blk[6 * kTestDim + 4], codedWideCp(4, 6));
+
+    // That 256 KB payload cannot fit one zstd block (Block_Maximum_Size is
+    // 128 KB), so its frame necessarily carries several — the case a reader
+    // that assumed one block per frame passes everything else on and fails.
+    CHECK(idx[2].compLen > uint32_t(kTestBlockPixels) * 4 + 12);
+
+    // Corrupting one block's frame leaves its neighbours decodable: no shared
+    // state means no blast radius.
+    {
+        std::vector<uint8_t> b = bytes;
+        b[kElevDataOff + static_cast<size_t>(idx[2].offset)] ^= 0xFF;
+        TestDecompressorState s;
+        auto t = FineTile::parse(b.data(), b.size(), testDecompressor(s));
+        CHECK(t.has_value());
+        if (!t) return;
+        std::vector<int16_t> a;
+        CHECK(!t->decodeElevBlock(2, 0, a));
+        CHECK(t->decodeElevBlock(1, 0, a));
+        CHECK_EQ(a[9 * kTestDim + 5], codedSmallCp(5, 9));
+        CHECK(t->decodeElevBlock(3, 0, a));
+        CHECK_EQ(a[7], rawCp(7, 0));
+    }
+}
+
+VXC_TEST(vxtl_v2_zstd_flow_plane_round_trips) {
+    // §6's u8 plane under CODEC_ZSTD. Its element width differs from the
+    // elevation plane's, and so does the expected decompressed size, so a
+    // decoder that hardcoded 2 bytes/px in the zstd path passes every
+    // elevation test above and fails here.
+    std::vector<PlanePlan<uint8_t>> flow(kTestBlocks);
+    for (PlanePlan<uint8_t>& f : flow) {
+        f.mode = 0;
+        f.constCp = 0;
+    }
+    auto flowByte = [](uint32_t lx, uint32_t ly) {
+        const uint32_t acc = (lx * 7u + ly * 3u) & 31u;
+        uint32_t v = acc;
+        if (((lx + ly) & 3u) == 0u) v |= 0x20u;
+        if ((lx & 7u) == 1u) v |= 0x40u;
+        if ((ly & 15u) == 2u) v |= 0x80u;
+        return static_cast<uint8_t>(v);
+    };
+    for (uint32_t i : {1u, 2u}) {
+        flow[i].mode = (i == 1u) ? uint8_t(1) : uint8_t(2); // CODED, then RAW
+        flow[i].residBits = 16;
+        flow[i].v.resize(kTestBlockPixels);
+        for (uint32_t ly = 0; ly < kTestDim; ++ly)
+            for (uint32_t lx = 0; lx < kTestDim; ++lx)
+                flow[i].v[ly * kTestDim + lx] = flowByte(lx, ly);
+    }
+    flow[kTestPerAxis].constCp = 0x25;
+
+    V2Params rawP;
+    V2Params zstdP;
+    zstdP.codec = 1;
+    const std::vector<uint8_t> rawBytes = buildFineTile(rawP, makeFlatElevPlans(120), flow);
+    const std::vector<uint8_t> zstdBytes = buildFineTile(zstdP, makeFlatElevPlans(120), flow);
+
+    TestDecompressorState st;
+    auto rawTile = FineTile::parse(rawBytes.data(), rawBytes.size());
+    auto zstdTile = FineTile::parse(zstdBytes.data(), zstdBytes.size(), testDecompressor(st));
+    CHECK(rawTile.has_value());
+    CHECK(zstdTile.has_value());
+    if (!rawTile || !zstdTile) return;
+    CHECK(zstdTile->hasFlow());
+
+    // RAW on the flow plane is ONE byte per pixel, so the expected
+    // decompressed size handed to the decompressor is blockPixels, not twice
+    // that. Block (2,0) is the RAW flow block.
+    std::vector<uint8_t> fb;
+    CHECK(zstdTile->decodeFlowBlock(2, 0, fb));
+    CHECK_EQ(st.lastDstLen, size_t(kTestBlockPixels));
+
+    Digest dRaw, dZstd;
+    uint64_t mismatches = 0;
+    for (uint32_t by = 0; by < kTestPerAxis; ++by) {
+        for (uint32_t bx = 0; bx < kTestPerAxis; ++bx) {
+            std::vector<uint8_t> a, b;
+            if (!rawTile->decodeFlowBlock(bx, by, a)) { ++mismatches; continue; }
+            if (!zstdTile->decodeFlowBlock(bx, by, b)) { ++mismatches; continue; }
+            for (uint32_t i = 0; i < kTestBlockPixels; ++i) {
+                dRaw.u8(a[i]);
+                dZstd.u8(b[i]);
+                if (a[i] != b[i]) ++mismatches;
+            }
+        }
+    }
+    CHECK_EQ(mismatches, uint64_t(0));
+    CHECK_EQ(dRaw.h, dZstd.h);
+
+    // Spot-check against the plans, so a bug corrupting both codecs
+    // identically could not pass.
+    CHECK(zstdTile->decodeFlowBlock(1, 0, fb));
+    CHECK_EQ(int(fb[3 * kTestDim + 5]), int(flowByte(5, 3)));
+    CHECK(zstdTile->decodeFlowBlock(0, 1, fb));
+    CHECK_EQ(int(fb[0]), 0x25);
+}
+
+VXC_TEST(vxtl_v2_zstd_golden_fixture_cross_language_digest) {
+    // §9 item 2 for CODEC_ZSTD: a fixture written by PYTHON, decoded here with
+    // an injected decompressor, digest-compared against the CODEC_RAW
+    // golden's ALREADY PINNED whole-lattice digest. Same numbers, different
+    // codec.
+    //
+    // That equality is the real proof and nothing weaker substitutes: under
+    // CODEC_ZSTD comp_len says nothing, and even the decompressed length
+    // cannot tell a literal int16 plane from a resid_bits=16 residual plane
+    // (§4). Only the values can — against a value pinned before this codec
+    // existed.
+    const std::filesystem::path path = fineZstdFixturePath();
+    if (!std::filesystem::exists(path)) {
+        std::printf("  SKIP vxtl_v2_zstd_golden_fixture_cross_language_digest: no %s "
+                    "(regenerate: python terrain-service/tools/make_v2_zstd_fixture.py)\n",
+                    path.filename().string().c_str());
+        return;
+    }
+
+    auto bytes = readFileBytes(path);
+    CHECK(bytes.has_value());
+    if (!bytes) return;
+    CHECK_EQ(vxtlVersion(bytes->data(), bytes->size()).value_or(0), uint16_t(2));
+
+    // Without a decompressor this file is refused whole, so the fixture proves
+    // the deployment failure mode too, not just the happy path.
+    FineError err = FineError::kNone;
+    CHECK(!FineTile::parse(bytes->data(), bytes->size(), {}, &err).has_value());
+    CHECK(err == FineError::kNoDecompressor);
+
+    TestDecompressorState st;
+    auto tile = FineTile::parse(bytes->data(), bytes->size(), testDecompressor(st), &err);
+    CHECK(tile.has_value());
+    CHECK(err == FineError::kNone);
+    if (!tile) return;
+
+    // The same §3 header as the CODEC_RAW golden, except `codec`.
+    CHECK_EQ(tile->seed(), uint64_t(20260729));
+    CHECK_EQ(tile->tileX(), 100);
+    CHECK_EQ(tile->tileY(), -42);
+    CHECK_EQ(tile->size(), uint32_t(512));
+    CHECK_EQ(int(tile->header().blockLog2), 8);
+    CHECK_EQ(tile->quantMm(), 100);
+    CHECK_EQ(int(tile->header().codec), int(kCodecZstd));
+    CHECK_EQ(int(tile->header().bakeVer), 7);
+    CHECK_EQ(tile->baseOffsetMm(), 500'000);
+    CHECK(!tile->hasFlow());
+
+    // The same four modes at the same four positions.
+    const std::vector<FineBlockEntry> idx = tile->elevIndex();
+    CHECK_EQ(idx.size(), size_t(4));
+    CHECK_EQ(int(idx[0].mode), int(kBlockConstant));
+    CHECK_EQ(idx[0].constCp, int16_t(-1000));
+    CHECK_EQ(idx[0].compLen, uint32_t(0)); // CONSTANT owns no frame
+    CHECK_EQ(int(idx[1].mode), int(kBlockCoded));
+    CHECK_EQ(int(idx[1].residBits), 16);
+    CHECK_EQ(int(idx[2].mode), int(kBlockCoded));
+    CHECK_EQ(int(idx[2].residBits), 32);
+    CHECK_EQ(int(idx[3].mode), int(kBlockRaw));
+    CHECK_EQ(int(idx[3].residBits), 0);
+    // comp_len is a FRAME length now, so none of these equal the plain sizes
+    // the CODEC_RAW golden pins.
+    CHECK(idx[1].compLen != uint32_t(256 * 256 * 2));
+    CHECK(idx[2].compLen != uint32_t(256 * 256 * 4));
+    CHECK(idx[3].compLen != uint32_t(256 * 256 * 2));
+
+    std::vector<int16_t> b00, b10, b01, b11;
+    CHECK(tile->decodeElevBlock(0, 0, b00));
+    CHECK(tile->decodeElevBlock(1, 0, b10));
+    CHECK(tile->decodeElevBlock(0, 1, b01));
+    CHECK(tile->decodeElevBlock(1, 1, b11));
+    CHECK_EQ(st.calls, uint64_t(3)); // one per non-CONSTANT block, no more
+    CHECK_EQ(st.rejects, uint64_t(0));
+
+    // The same pinned control points the CODEC_RAW golden test asserts.
+    CHECK_EQ(b00[0], int16_t(-1000));
+    CHECK_EQ(b00[65535], int16_t(-1000));
+    CHECK_EQ(b10[0], int16_t(300));
+    CHECK_EQ(b10[256 * 128 + 128], int16_t(124));
+    CHECK_EQ(b01[128], int16_t(32767));
+    CHECK_EQ(b01[129], int16_t(-32768));
+    CHECK_EQ(b11[0], int16_t(-27010));
+    CHECK_EQ(b11[65535], int16_t(-20423));
+
+    // And the whole-lattice digest, pinned by the CODEC_RAW golden.
+    Digest d;
+    for (const std::vector<int16_t>* blk : {&b00, &b10, &b01, &b11})
+        for (int16_t cp : *blk) d.u16(static_cast<uint16_t>(cp));
+    CHECK_EQ(d.h, uint64_t(0xeb1b757a71c59444ull));
+
+    // Value-for-value against the CODEC_RAW golden itself when it is present:
+    // the strongest form of "the codec changed the bytes and nothing else".
+    const std::filesystem::path rawPath = fineFixturePath();
+    if (std::filesystem::exists(rawPath)) {
+        auto rawBytes = readFileBytes(rawPath);
+        CHECK(rawBytes.has_value());
+        auto rawTile = FineTile::parse(rawBytes->data(), rawBytes->size());
+        CHECK(rawTile.has_value());
+        if (rawTile) {
+            uint64_t mismatches = 0;
+            std::vector<int16_t> a;
+            const std::vector<int16_t>* zs[4] = {&b00, &b10, &b01, &b11};
+            for (uint32_t i = 0; i < 4; ++i) {
+                const uint32_t bx = i & 1u, by = i >> 1;
+                if (!rawTile->decodeElevBlock(bx, by, a)) { ++mismatches; continue; }
+                if (a.size() != zs[i]->size()) { ++mismatches; continue; }
+                for (size_t k = 0; k < a.size(); ++k)
+                    if (a[k] != (*zs[i])[k]) ++mismatches;
+            }
+            CHECK_EQ(mismatches, uint64_t(0));
+        }
+    }
+
+    // Through the sampler, at the fixture's own 512 stride, exactly as the
+    // CODEC_RAW golden does. Coarse tile (100, -42) owns fine pixels
+    // [51200, 51712) x [-21504, -20992).
+    TestDecompressorState st2;
+    FineTileSampler s(20260729);
+    s.setDecompressor(testDecompressor(st2));
+    CHECK(s.loadTile(*bytes));
+    CHECK_EQ(s.tileSize(), uint32_t(512));
+    const int64_t ox = int64_t(100) * 512, oy = int64_t(-42) * 512;
+    CHECK_EQ(s.elevationMm(ox, oy), 500'000 + (-1000) * 100);
+    CHECK_EQ(s.elevationMm(ox + 256, oy), 500'000 + 300 * 100);
+    CHECK_EQ(s.elevationMm(ox + 128, oy + 256), 500'000 + 32767 * 100);
+    CHECK_EQ(s.elevationMm(ox + 256, oy + 256), 500'000 + (-27010) * 100);
+    CHECK_EQ(s.missingTileQueries.load(), uint64_t(0));
+    CHECK_EQ(s.blockDecodeFailures.load(), uint64_t(0));
+
+    // Decode is a pure function of the bytes (§7): a second, independent parse
+    // with a second decompressor instance gives the identical digest.
+    TestDecompressorState st3;
+    auto tile2 = FineTile::parse(bytes->data(), bytes->size(), testDecompressor(st3));
+    CHECK(tile2.has_value());
+    if (!tile2) return;
+    Digest d2;
+    std::vector<int16_t> block;
+    for (uint32_t by = 0; by < 2; ++by) {
+        for (uint32_t bx = 0; bx < 2; ++bx) {
+            CHECK(tile2->decodeElevBlock(bx, by, block));
+            for (int16_t cp : block) d2.u16(static_cast<uint16_t>(cp));
+        }
+    }
+    CHECK_EQ(d.h, d2.h);
 }

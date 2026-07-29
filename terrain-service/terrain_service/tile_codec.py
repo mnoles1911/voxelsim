@@ -23,6 +23,7 @@ Wire format (little-endian throughout):
 from __future__ import annotations
 
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -328,26 +329,76 @@ def _unpack_residuals(buf: bytes, n: int, resid_bits: int) -> np.ndarray:
 
 # ------------------------------------------------------------------ codec (§3)
 
-def _compress(payload: bytes, codec: int) -> bytes:
+#: A CODEC_ZSTD frame compressor: plain block payload in, one frame out.
+#: Blocks are independent (§4) — no dictionary, no shared context, no state
+#: across calls — so this is called once per block and must be stateless.
+Compressor = Callable[[bytes], bytes]
+
+#: A CODEC_ZSTD frame decompressor: (frame, expected_plain_len) -> plain bytes.
+#: `expected_plain_len` is derived from the HEADER (block pixels x element or
+#: residual width), never from `comp_len`, and returning anything other than
+#: exactly that many bytes is an error. This mirrors voxel-core's injected
+#: FineDecompressor byte for byte (voxelcore/tilestore.h), deliberately: the
+#: two halves are built independently against docs/vxtl-v2-format.md, so the
+#: closer the two boundaries look, the fewer ways they have to disagree.
+Decompressor = Callable[[bytes, int], bytes]
+
+
+def _compress(payload: bytes, codec: int, compressor: Compressor | None = None) -> bytes:
     if codec == CODEC_RAW:
+        # CODEC_RAW must never depend on a compression library, injected or
+        # otherwise (§3) — an injected compressor is simply ignored here.
         return payload
     if codec == CODEC_ZSTD:
+        if compressor is not None:
+            return compressor(payload)
         if not HAVE_ZSTD:
             raise RuntimeError(
-                "zstandard is not installed; encode with codec=CODEC_RAW instead"
+                "zstandard is not installed and no compressor was injected; "
+                "encode with codec=CODEC_RAW instead"
             )
         return zstandard.ZstdCompressor().compress(payload)
     raise ValueError(f"unsupported codec {codec}")
 
 
-def _decompress(payload: bytes, codec: int) -> bytes:
+def _decompress(
+    payload: bytes,
+    codec: int,
+    expected_len: int,
+    decompressor: Decompressor | None = None,
+) -> bytes:
+    """Expand one block's stored bytes to exactly `expected_len` bytes.
+
+    The length check is the point, and it is the ONLY length check that
+    survives compression: under CODEC_ZSTD `comp_len` is the compressed size
+    and says nothing about the contents, so a truncated, padded or simply
+    wrong frame is caught here or not at all.
+    """
     if codec == CODEC_RAW:
-        return payload
-    if codec == CODEC_ZSTD:
-        if not HAVE_ZSTD:
-            raise RuntimeError("zstandard is not installed; cannot decode CODEC_ZSTD")
-        return zstandard.ZstdDecompressor().decompress(payload)
-    raise ValueError(f"unsupported codec {codec}")
+        out = payload
+    elif codec == CODEC_ZSTD:
+        if not payload:
+            # A block that owns zero data bytes is CONSTANT by definition;
+            # an empty frame cannot expand to anything.
+            raise ValueError("empty CODEC_ZSTD frame")
+        if decompressor is not None:
+            out = decompressor(payload, expected_len)
+        elif HAVE_ZSTD:
+            out = zstandard.ZstdDecompressor().decompress(
+                payload, max_output_size=expected_len
+            )
+        else:
+            raise RuntimeError(
+                "zstandard is not installed and no decompressor was injected; "
+                "cannot decode CODEC_ZSTD"
+            )
+    else:
+        raise ValueError(f"unsupported codec {codec}")
+    if len(out) != expected_len:
+        raise ValueError(
+            f"block payload expanded to {len(out)} bytes, header implies {expected_len}"
+        )
+    return out
 
 
 # ------------------------------------------------------------- block plane (§4)
@@ -359,6 +410,7 @@ def _encode_plane(
     codec: int,
     elem_dtype: str,
     force_raw_blocks: set[tuple[int, int]] | None = None,
+    compressor: Compressor | None = None,
 ) -> tuple[bytes, bytes]:
     """Encode one plane (elevation or flow) into (index_bytes, data_bytes).
 
@@ -409,16 +461,20 @@ def _encode_plane(
                 entries.append((0, 0, MODE_CONSTANT, int(const_val), 0, _ZERO_PAD4))
                 continue
             if (bx, by) in force_raw_blocks:
-                payload = _compress(blk.astype(elem_dtype).tobytes(), codec)
+                payload = _compress(blk.astype(elem_dtype).tobytes(), codec, compressor)
                 entries.append((data_offset, len(payload), MODE_RAW, 0, 0, _ZERO_PAD4))
             else:
                 resid = _med_residual(blk)
                 # resid_bits is REQUIRED, not an optimisation (§5): a single
                 # steep step forces this, not just pathological input.
                 resid_bits = 16 if (resid.min() >= -32768 and resid.max() <= 32767) else 32
-                payload = _compress(_pack_residuals(resid, resid_bits), codec)
+                # Both branches take the injected compressor: the auto-RAW choice
+                # is decided on COMPRESSED lengths, so comparing a compressed
+                # residual against an uncompressed literal would pick RAW almost
+                # never, and the flow plane's 26% saving would silently vanish.
+                payload = _compress(_pack_residuals(resid, resid_bits), codec, compressor)
                 raw_payload = (
-                    _compress(blk.astype(elem_dtype).tobytes(), codec)
+                    _compress(blk.astype(elem_dtype).tobytes(), codec, compressor)
                     if auto_raw else None
                 )
                 if raw_payload is not None and len(raw_payload) < len(payload):
@@ -446,6 +502,7 @@ def _decode_plane(
     codec: int,
     elem_dtype: str,
     out_dtype,
+    decompressor: Decompressor | None = None,
 ) -> np.ndarray:
     bs = 1 << block_log2
     if size % bs != 0:
@@ -483,26 +540,36 @@ def _decode_plane(
 
         if offset + comp_len > len(data_bytes):
             raise ValueError("block payload extends past end of data section")
-        raw = _decompress(data_bytes[offset:offset + comp_len], codec)
 
+        # The expected PLAIN length comes from the header (mode, resid_bits,
+        # element width) and never from comp_len — under CODEC_ZSTD comp_len
+        # is the compressed size, so it constrains nothing. _decompress
+        # enforces the expansion is exactly this many bytes.
+        n = bs * bs
         if mode == MODE_CODED:
             if resid_bits not in (16, 32):
                 raise ValueError(f"bad resid_bits {resid_bits}")
-            n = bs * bs
             expected = n * (2 if resid_bits == 16 else 4)
-            if len(raw) != expected:
-                raise ValueError("residual payload has the wrong length")
+        elif mode == MODE_RAW:
+            expected = n * elem_size
+        else:
+            raise ValueError(f"bad block mode {mode}")
+
+        raw = _decompress(
+            data_bytes[offset:offset + comp_len], codec, expected, decompressor
+        )
+
+        if mode == MODE_CODED:
             resid = _unpack_residuals(raw, n, resid_bits).reshape(bs, bs)
             out[y0:y0 + bs, x0:x0 + bs] = _med_reconstruct(resid).astype(out_dtype)
-        elif mode == MODE_RAW:
-            n = bs * bs
-            if len(raw) != n * elem_size:
-                raise ValueError("RAW payload has the wrong length")
+        else:
+            # MODE_RAW. Note this branch is chosen by `mode` and by nothing
+            # else: at resid_bits=16 a RAW int16 plane and a CODED residual
+            # plane have IDENTICAL lengths (§4), so `expected` above matching
+            # is not evidence the payload was read as the right thing.
             out[y0:y0 + bs, x0:x0 + bs] = np.frombuffer(
                 raw, dtype=elem_dtype, count=n
             ).reshape(bs, bs)
-        else:
-            raise ValueError(f"bad block mode {mode}")
     return out
 
 
@@ -513,6 +580,7 @@ def encode_v2(
     *,
     raw_blocks: set[tuple[int, int]] | None = None,
     flow_raw_blocks: set[tuple[int, int]] | None = None,
+    compressor: Compressor | None = None,
 ) -> bytes:
     """Encode a v2 fine tile (docs/vxtl-v2-format.md §3-§6).
 
@@ -521,6 +589,14 @@ def encode_v2(
     an explicit opt-in rather than a size-minimising heuristic. They are
     independent: forcing an elevation block RAW says nothing about the flow
     block at the same coordinate, and vice versa.
+
+    `compressor` replaces the default zstandard frame compressor for
+    CODEC_ZSTD. It exists for the same reason the C++ decoder takes an
+    injected decompressor (§3, and voxelcore/tilestore.h): compression lives
+    at the boundary, not in the codec. §7 also licenses it — "the ENCODER
+    need not be deterministic", any conformant zstd frame will do — which is
+    what lets the committed conformance fixture be built without the optional
+    zstandard dependency, since CI deliberately does not install it.
     """
     flags = FLAG_FLOW_PRESENT if tile.flow is not None else 0
 
@@ -530,6 +606,7 @@ def encode_v2(
         codec=tile.codec,
         elem_dtype="<i2",
         force_raw_blocks=raw_blocks,
+        compressor=compressor,
     )
     sections = [(SECTION_ELEV_INDEX, elev_index), (SECTION_ELEV_DATA, elev_data)]
 
@@ -540,6 +617,7 @@ def encode_v2(
             codec=tile.codec,
             elem_dtype="u1",
             force_raw_blocks=flow_raw_blocks,
+            compressor=compressor,
         )
         sections += [(SECTION_FLOW_INDEX, flow_index), (SECTION_FLOW_DATA, flow_data)]
 
@@ -569,10 +647,14 @@ def encode_v2(
     return header + ext + bytes(table) + b"".join(s for _, s in sections)
 
 
-def decode_v2(data: bytes) -> TileV2:
+def decode_v2(data: bytes, *, decompressor: Decompressor | None = None) -> TileV2:
     """Decode a v2 fine tile. Raises ValueError on any truncation, magic/
     version/field mismatch, or internal inconsistency — never lets a raw
-    struct.error or an out-of-bounds slice through silently (§9 item 4)."""
+    struct.error or an out-of-bounds slice through silently (§9 item 4).
+
+    `decompressor` is the injected CODEC_ZSTD reader; None falls back to
+    zstandard when it is importable and raises a clear RuntimeError when it
+    is not. CODEC_RAW never consults it."""
     if len(data) < _HEADER.size:
         raise ValueError("truncated header")
     magic, version, seed, x, y, scale, size = _HEADER.unpack_from(data, 0)
@@ -637,7 +719,7 @@ def decode_v2(data: bytes) -> TileV2:
     elevation_cp = _decode_plane(
         sections[SECTION_ELEV_INDEX], sections[SECTION_ELEV_DATA],
         size=size, block_log2=block_log2, codec=codec,
-        elem_dtype="<i2", out_dtype=np.int16,
+        elem_dtype="<i2", out_dtype=np.int16, decompressor=decompressor,
     )
 
     flow = None
@@ -647,7 +729,7 @@ def decode_v2(data: bytes) -> TileV2:
         flow = _decode_plane(
             sections[SECTION_FLOW_INDEX], sections[SECTION_FLOW_DATA],
             size=size, block_log2=block_log2, codec=codec,
-            elem_dtype="u1", out_dtype=np.uint8,
+            elem_dtype="u1", out_dtype=np.uint8, decompressor=decompressor,
         )
 
     return TileV2(

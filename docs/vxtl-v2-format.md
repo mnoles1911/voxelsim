@@ -105,10 +105,25 @@ format. Do not gate the decoder's correctness tests on having zstd.
 at the host boundary as an optional decompressor callback on the parse entry point, defaulting to
 null (= `CODEC_RAW` only). Two reasons, and the second is the serious one: voxel-core currently has
 **zero** third-party dependencies and that is deliberate; and voxel-core is linked into a UE 5.8
-project which **already ships zstd** in `Engine/Source/ThirdParty`, so a second static copy in the
-same binary is an ODR/symbol-collision risk rather than mere bloat. The UE module passes the
-engine's zstd; the headless harness passes its own. This keeps decode a pure function of the bytes
-(§7) either way, because zstd frame decode is bit-exact by format definition.
+binary in which a zstd already exists, so a second static copy is an ODR/symbol-collision risk
+rather than mere bloat. The UE module supplies the decompressor; the headless harness passes its
+own. This keeps decode a pure function of the bytes (§7) either way, because zstd frame decode is
+bit-exact by format definition.
+
+**Correction, 2026-07-29 — the original premise for that second reason was wrong, and the
+conclusion survives anyway.** This paragraph used to say UE "already ships zstd in
+`Engine/Source/ThirdParty`", so the module could simply link the engine's copy. It does not:
+UE 5.8.0-55116800 (binary/launcher) ships **Oodle and LZ4**, with no `zstd.h`, no `zstd*.lib`, no
+zstd module and no `.Build.cs` referencing one. Verified by scanning the engine tree.
+
+The ODR hazard is nevertheless **real, and worse than assumed**: a scan of all 3,672 engine
+binaries over 200 KB finds `ZSTD_decompress` *statically linked inside*
+`ThirdParty/Blosc/.../libblosc.lib`. So there is a zstd in the process, it is simply not one we may
+call — which is precisely the situation in which vendoring a second copy is dangerous rather than
+merely redundant. The injection design is therefore right for a better reason than the one
+originally given. The UE module probes for a zstd module and compiles with
+`VOXELEARTH_WITH_ZSTD=0` plus a startup warning when there is none, so a fine tier encoded with
+`CODEC_ZSTD` fails loudly at parse rather than silently yielding a lattice of zeros.
 
 This is a *when*, not an *if*: ~21–25 MB/tile is the **compressed** figure, while the `CODEC_RAW`
 form of an 8192² lattice is 134 MB (268 MB if blocks need 32-bit residuals). Production streaming
