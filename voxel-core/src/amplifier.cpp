@@ -890,6 +890,120 @@ static_assert(!kAmpUnscaled || (kFineDetailMaxAtMaxSlopeMm == 5513), "fine-tier 
 static_assert(kFineDetailMaxAtMaxSlopeMm * 2 < kDetailMaxAtMaxSlopeMm,
               "the fine tier is supposed to buy a materially tighter surface bound");
 
+// --- THE DETAIL GRADIENT CAP (v14) ------------------------------------------
+//
+// docs/measurements/client-detail-drainage-2026-07-29.txt is the brief. Each
+// octave contributes a local gradient of roughly amplitude/lattice (the v11
+// comment above used exactly this arithmetic to cut two octaves), and the
+// post-gate v13 ladder sums to ~2.3 of gradient at full gates on ground whose
+// own gradient is 0.4 -- so the downhill direction reversed almost everywhere,
+// and a reversed downhill is a closed basin. Measured: the client took the
+// alpine exemplar's carrier from 0 interior sinks and a 224 m mean flow path
+// to 1625 sinks and 29 m; 87.9% of a 40% slope could not drain. Worse, the
+// relief gate scales detail UP with relief, so the ladder was loudest exactly
+// where the physical argument says it must be quietest.
+//
+// THE FIX IS ONE JOINT NORMALISATION, not per-octave retuning: the relative
+// weighting between octaves was chosen deliberately (energy toward the metre
+// scale, quiet at the finest lattice) and nothing measured says that shape is
+// wrong; what is wrong is the summed gradient. So the summed post-gate detail
+// is scaled down, once, so that its NOMINAL gradient obeys
+//
+//     detailGradient <= max(kDetailGradFloorMmPerM,
+//                           kDetailGradCapKQ10 * carrierGradient / 1024)
+//
+// The nominal gradient is the same amplitude/lattice estimate per band, put
+// through the very gates evalSurface applies (relief x curvature), so the cap
+// tightens exactly where the gates get loud. It is an ESTIMATE of the typical
+// local extreme, not a proved bound on the noise field's derivative; k is
+// calibrated against the drainage instrument (vxc_terrainprobe raw pit
+// census), which is the only metric that turned out to see this defect at all.
+//
+// THE FLOOR IS NOT OPTIONAL. On flat ground the carrier's gradient is ~0.017
+// and a cap proportional to it would delete the decimetre roughness the
+// microrelief band exists to provide -- the fix that stopped flat terrain
+// reading as long terrace runs at 10 cm voxels. The floor is what that band
+// keeps regardless of how flat the carrier is.
+//
+// THE TWO ADDITIVE TERMS (rill, bedding) ride under the same scale factor --
+// the cap is one factor over the whole summed detail -- but do NOT enter the
+// nominal-gradient estimate: neither is an fBm octave with a single lattice,
+// each already carries its own gradient condition and its own proved envelope
+// (|rill| <= 300 mm, |bedding| <= 120 mm, both relief-gated), and k is
+// calibrated on the composite that includes them, so their contribution is
+// inside the measurement rather than inside the formula.
+//
+// BOUND OBLIGATIONS, stated so the coupling block above stays a proof. The cap
+// multiplies the summed detail by scale <= 1.0, applied only when it would
+// shrink, with one truncating divide toward zero. |trunc(d * a / g)| <= |d|
+// whenever 0 < a <= g, so the capped detail lies inside every envelope the
+// uncapped detail lies inside: kDetailMaxAtMaxSlopeMm, the AbsMax trio and the
+// derived tripwires above keep their v13 values, surfaceBoundsMm needs no new
+// term and no extra truncation millimetre (truncation toward zero can only
+// shrink a magnitude already inside the envelope). The bound's WORST CASE is
+// unchanged rather than tightened: at the bound's max-gate corner the carrier
+// slope that would license that much detail is not cheaply boundable over a
+// footprint, so the bound keeps taking the cap at its ceiling of 1.0 -- the
+// same trade couplings (5) and (6) already take for the gates. The TYPICAL
+// envelope of the actual surface tightens (that is the whole point); the
+// bound simply does not claim the credit.
+constexpr int64_t detailGradMmPerM(const Octave* tab, uint32_t n, uint32_t nLandform,
+                                   uint32_t band) {
+    int64_t sum = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (bandOf(i, n, nLandform) != band) continue;
+        sum += scaledAmpMm(tab[i].amplitudeMm) * 1000 / tab[i].latticeMm;
+    }
+    return sum;
+}
+constexpr int64_t kLandformGradMmPerM =
+    detailGradMmPerM(kDetailOctaves, kDetailOctaveCount, kLandformOctaveCount, 0);
+constexpr int64_t kMetreGradMmPerM =
+    detailGradMmPerM(kDetailOctaves, kDetailOctaveCount, kLandformOctaveCount, 1);
+constexpr int64_t kMicroGradMmPerM =
+    detailGradMmPerM(kDetailOctaves, kDetailOctaveCount, kLandformOctaveCount, 2);
+constexpr int64_t kFineLandformGradMmPerM =
+    detailGradMmPerM(kFineDetailOctaves, kFineDetailOctaveCount, kFineLandformOctaveCount, 0);
+constexpr int64_t kFineMetreGradMmPerM =
+    detailGradMmPerM(kFineDetailOctaves, kFineDetailOctaveCount, kFineLandformOctaveCount, 1);
+constexpr int64_t kFineMicroGradMmPerM =
+    detailGradMmPerM(kFineDetailOctaves, kFineDetailOctaveCount, kFineLandformOctaveCount, 2);
+// Tripwire, same doctrine as (4): DERIVED, so a table edit moves these with it;
+// pinned, so a table edit cannot happen without reading this block. These are
+// also the numbers hand-mirrored into worldgen.ush -- change them there too.
+static_assert(!kAmpUnscaled || (kLandformGradMmPerM == 272 && kMetreGradMmPerM == 312 &&
+                                kMicroGradMmPerM == 350),
+              "coarse ladder nominal gradient moved; re-mirror worldgen.ush and re-run the "
+              "drainage calibration (client-detail-drainage-2026-07-29.txt) before shipping");
+static_assert(!kAmpUnscaled || (kFineLandformGradMmPerM == 281 && kFineMetreGradMmPerM == 312 &&
+                                kFineMicroGradMmPerM == 350),
+              "fine ladder nominal gradient moved; same obligation as the coarse trio");
+// The measurement doc's headline mechanism, pinned: the coarse ladder at full
+// gates carries ~2.3 of nominal gradient. If this stops being true the whole
+// motivation for the cap should be re-read, not just the constant updated.
+constexpr int64_t kDetailGradCeilMmPerM =
+    kLandformGradMmPerM * kReliefScaleMaxQ10 / 1024 * kCurvatureScaleMaxQ10 / 1024 +
+    kMetreGradMmPerM * kReliefScaleMaxQ10 / 1024 * kCurvatureScaleMicroMaxQ10 / 1024 +
+    kMicroGradMmPerM * kCurvatureScaleMicroMaxQ10 / 1024;
+static_assert(!kAmpUnscaled || kDetailGradCeilMmPerM == 2291,
+              "the post-gate ladder's worst-case nominal gradient moved");
+
+// k and the floor. Worldgen constants under kWorldGenVersion, NOT cvars -- a
+// cvar here would let two clients disagree about the ground. Both set by the
+// calibration sweep against the three real exemplars (alpine, plains, and the
+// mislabelled "rolling" site); the sweep table and the chosen arm's costs are
+// in the v14 commit message.
+constexpr int64_t kDetailGradCapKQ10 = 768;      // 0.75 x carrier gradient
+constexpr int64_t kDetailGradFloorMmPerM = 250;  // the anti-terrace floor
+static_assert(kDetailGradCapKQ10 > 0 && kDetailGradCapKQ10 <= 1024,
+              "k above 1.0 licenses detail steeper than the ground it decorates, which is "
+              "the defect this cap exists to remove");
+static_assert(kDetailGradFloorMmPerM > 0,
+              "a zero floor deletes decimetre roughness on flats; that is the terrace "
+              "artifact the microrelief band was added to break up");
+static_assert(kDetailGradFloorMmPerM < kDetailGradCeilMmPerM,
+              "a floor at or above the ladder's own ceiling makes the cap a no-op");
+
 // ---------------------------------------------------------------------------
 // Couplings for the MIRROR bounds: Amplifier::surfaceLowerBoundMm and
 // Amplifier::solidBelowBoundMm. Same doctrine as (1)-(6) above -- derive from
@@ -1298,6 +1412,24 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
                                  carrier.syMmPerPx * 1000 / pxMm) +
                           beddingMm(seed_, xMm, yMm, baseMm);
     detailMm += addMm * rScale / 1024;
+
+    // v14: THE DETAIL GRADIENT CAP -- one scale-down over the whole summed
+    // detail. See the derivation block above kDetailGradCapKQ10. The nominal
+    // gradient is the per-band amplitude/lattice sum through the SAME gates,
+    // in the SAME order and integer form, as the detail sum itself, so the
+    // estimate and the thing it estimates cannot drift apart. Every quantity
+    // here is non-negative except detailMm itself, whose divide truncates
+    // toward zero -- truncDiv in the HLSL mirror, never floorDiv.
+    const int64_t gradLand = fine ? kFineLandformGradMmPerM : kLandformGradMmPerM;
+    const int64_t gradMetre = fine ? kFineMetreGradMmPerM : kMetreGradMmPerM;
+    const int64_t gradMicro = fine ? kFineMicroGradMmPerM : kMicroGradMmPerM;
+    const int64_t detailGradMmPerM = gradLand * rScale / 1024 * cScale / 1024 +
+                                     gradMetre * rScale / 1024 * cScaleMicro / 1024 +
+                                     gradMicro * cScaleMicro / 1024;
+    int64_t allowedGradMmPerM = kDetailGradCapKQ10 * slopeMmPerM / 1024;
+    if (allowedGradMmPerM < kDetailGradFloorMmPerM) allowedGradMmPerM = kDetailGradFloorMmPerM;
+    if (detailGradMmPerM > allowedGradMmPerM)
+        detailMm = detailMm * allowedGradMmPerM / detailGradMmPerM;
 
     SurfaceEval s;
     s.px = px;
