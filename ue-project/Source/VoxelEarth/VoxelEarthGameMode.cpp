@@ -20,6 +20,7 @@
 #include "VoxelEarthPlayerController.h"
 #include "VoxelEditRelay.h"
 #include "VoxelOceanActor.h"
+#include "VoxelSkyLadderFixture.h" // -VoxelSkyLadder=<N>, registered beside the SWE breach fixture below
 #include "VoxelSweBreachFixture.h" // -VoxelSweBreachTest, registered beside the other water fixtures below
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
@@ -2101,6 +2102,27 @@ void AVoxelEarthGameMode::BeginPlay()
 	// second possibility. A breach on a real slope tells them apart, because
 	// one produces a travelling velocity front and the other does not.
 	VoxelSweBreachFixture::StartFromCommandLine(World);
+
+	// --- W6 day/night acceptance ladder ---------------------------------------
+	//
+	// -VoxelSkyLadder[=<N>] (default 8). N screenshots spread evenly across one
+	// simulated day, in ONE process, with the clock FROZEN (voxel.Sky.TimeScale 0)
+	// and SET absolutely at each rung rather than waited for. It is the acceptance
+	// artifact for the W3-W5 sky work and the leg that calibrates
+	// ExposureBiasForSunAltitude's admittedly-guessed anchors.
+	//
+	// ONE PROCESS IS THE WHOLE POINT, not a convenience: this project's screenshot
+	// noise floor is BIMODAL -- 0.00% differing pixels within a session, 1.81%
+	// between sessions, from a per-session latch (VoxelGpuVerify.cpp:2074-2084).
+	// N separate launches would add that latch to every rung of a ladder whose
+	// entire content is small brightness differences.
+	//
+	// Out-of-line for the same reason -VoxelSweBreachTest above is: it carries a
+	// latched base epoch, a latched camera pose and a per-rung result table across
+	// a stage count chosen at RUNTIME by N, which the one-FTimerHandle-member-per-
+	// stage pattern in AVoxelEarthGameMode.h cannot express at all. See
+	// VoxelSkyLadderFixture.h for the structure argument and the switch set.
+	VoxelSkyLadderFixture::StartFromCommandLine(World);
 
 	// ADR-0003 item 3 verification (docs/adr/0003-hydrostatic-persistent-body.md
 	// "item 2 resolution"): -VoxelWaterMemoTest[=<delaySeconds>] (default 15s)
