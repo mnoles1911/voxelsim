@@ -1,0 +1,80 @@
+THE TILE CACHE IS ORPHANED, AND ONE NAMESPACE IS WHY — measured 2026-07-29
+===========================================================================
+
+Task #15 said "the tile cache is orphaned from the shipping provider_id". This is
+that, resolved with computed identities rather than asserted, plus the design cost
+it exposes.
+
+WHAT IS ON DISK, against what today's code computes:
+
+  on disk, 27 valid 3-channel tiles   terrain-diffusion-unlabeled-060b0c927ccc807e
+  on disk, 25 valid 3-channel tiles   terrain-diffusion-unlabeled-3e11cf157a836c70
+  on disk, 52 BROKEN elev-only tiles  ...-UNPINNED-UNVERIFIEDDATA-27ac04bc8c6b7b7d
+
+  recomputed today, same checkpoint (f50800c52932d446...) and the same
+  conditioning data under D:\terrain-diffusion\data\global:
+                                      terrain-diffusion-unlabeled-f974c898efe78a9c
+
+  DiffusionConfig() with no pinning:  ...-UNPINNED-UNVERIFIEDDATA-31157144d459a670
+
+So the shipping code path can reach NONE of the caches on disk. A service run
+today regenerates every tile.
+
+WHY IT ROLLED, narrowed rather than guessed. `_tile_format_fingerprint()` folds in
+`bake.pipeline.bake_identity_payload()`, which covers the bake's version, stage
+order, geometry AND every physical constant. Holding everything else fixed and
+varying only BAKE_VERSION:
+
+  BAKE_VERSION 3 -> terrain-diffusion-unlabeled-f906c3fd8e17834f
+  BAKE_VERSION 4 -> terrain-diffusion-unlabeled-f974c898efe78a9c
+
+Neither is 060b, so the version bump is NOT the whole story: the identity had
+already moved before BAKE_VERSION 4 landed. The ridge-deficit work changed bake
+CONSTANTS as well as the version (`incision_mode` to "profile",
+`channel_init_area_m2` 1e4 -> 156, `profile_regional_p` -> 2.0,
+`b1_constructional_amp` -> 0.40), and each of those is inside the identity payload
+by design.
+
+THIS IS THE MECHANISM WORKING. A different bake is a different world; the client's
+collision reads baked bytes, so a constant change must not be allowed to hide
+behind an unchanged identity. Nothing here is a bug.
+
+THE DESIGN COST, which IS worth fixing. Coarse s1 tile bytes do not depend on any
+bake constant -- the bake consumes coarse tiles, it does not produce them. But
+coarse and fine share ONE provider_id namespace, so a bake-only change discards
+perfectly good coarse tiles along with the stale fine ones. The asymmetry in what
+that costs is large:
+
+  regenerate a coarse tile   22.5 s of GPU inference (diffusion-bringup.md:277)
+  re-bake a fine tile        ~2 min of CPU, measured today at BAKE_VERSION 4
+
+and on this machine coarse regeneration is not merely slow but IMPOSSIBLE: the
+only env with torch is D:\terrain-diffusion\.venv at torch 2.12.1+cpu without
+terrain_diffusion installed, and the GPU is AMD, so CUDA is unavailable rather
+than unconfigured. Every tuning pass on the bake therefore throws away the one
+artifact this box cannot recreate.
+
+THE FIX, stated as a proposal and not taken here. Split the key:
+
+  * coarse tiles keyed on the inference inputs only -- checkpoint, conditioning,
+    terrain_diffusion version, world_shape, scale, channel mapping, wire geometry;
+  * fine tiles keyed on that PLUS bake_identity_payload().
+
+Then a bake tuning change re-bakes without re-inferring, and the expensive
+artifact survives. This does not weaken the guarantee: the fine tier still rolls
+on any bake change, which is the tier whose bytes the change actually alters, and
+the coarse key still rolls on anything that alters coarse bytes.
+
+It is a real change to the cache layout and to `_tile_format_fingerprint`'s
+contract, so it wants its own commit and its own test, not a drive-by.
+
+WHAT THIS DOES NOT AFFECT. Every measurement in this session pointed tools
+directly at a cache directory (`vxc_terrainprobe <tiledir>`, `--fine-dir`,
+`-VoxelTileDir`), bypassing provider resolution entirely. The numbers stand. What
+is broken is the pipeline finding its own cache, not the data in it.
+
+ue-project/Config/DefaultGame.ini's `DefaultTileDir` points at
+3e11cf157a836c70's s1 directory, which is a valid 25-tile set and the one the
+default spawn -84480,53760 (tile -6,3) lands in. That path is a literal directory
+and so is unaffected by the identity roll -- it keeps working, which is why this
+went unnoticed.
