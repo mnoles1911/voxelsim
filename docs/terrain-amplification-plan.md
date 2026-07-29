@@ -1057,7 +1057,14 @@ capacity argument to re-measure, not a hardware-impossibility argument to assert
    resolution decision. Measured at 3.75 m/px on three real tiles with
    `terrain-service/tools/measure_fine_tier_size.py`, 8 MB/tile stood for correlated detail there;
    at the **shipped 1.875 m/px tier** `docs/vxtl-v2-format.md` records **~21–25 MB/tile** (4× the
-   pixels, ~1 bit/px cheaper — see the size section above). The live risk is unchanged in kind: the
+   pixels, ~1 bit/px cheaper — see the size section above). **Now measured end-to-end at
+   BAKE_VERSION 4** on all three exemplar classes
+   (`docs/measurements/drainage-ladder-v13-2026-07-29.txt`): plains 17.87 MB, alpine 37.04 MB,
+   third-class 43.58 MB. So the 21–25 MB range **holds for gentle terrain and is low by up to
+   ~1.75× on dissected and steep terrain** — plan a worst case of ~44 MB, not ~25, and re-run the
+   prefetch-ring and client-RAM arithmetic at that bound. The codec itself is not in trouble: the
+   B-spline control points reproduce the bake's own surface to mean |e| 12–15 mm and max 50.5 mm
+   against the 100 mm quantum, i.e. inside half a voxel. The live risk is unchanged in kind: the
    bake must not introduce uncorrelated per-pixel noise, because a few cm of white costs more than
    metres of fBm. Also still open: the codec needs the int16→int32 escape it now has
    (`resid_bits`, §5 of the frozen spec) — 73–159 residuals per tile overflow int16 even at 100 mm
