@@ -2,34 +2,96 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <optional>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#ifdef VXC_WATER_PROFILE
+#include <chrono>
+#endif
+
 namespace vxc {
+
+#ifdef VXC_WATER_PROFILE
+// See waterca.h's WaterCAProfile comment for why this is a build option.
+WaterCAProfile& waterCAProfile() {
+    static WaterCAProfile p;
+    return p;
+}
+void resetWaterCAProfile() { waterCAProfile() = WaterCAProfile{}; }
+namespace {
+inline uint64_t profNowNs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+} // namespace
+#define VXC_WP_T0(v) const uint64_t v = profNowNs()
+#define VXC_WP_TV(v) uint64_t v = profNowNs()
+#define VXC_WP_SET(v) (v) = profNowNs()
+#define VXC_WP_ADD(field, v) waterCAProfile().field += profNowNs() - (v)
+#define VXC_WP_INC(field, n) waterCAProfile().field += static_cast<uint64_t>(n)
+#else
+#define VXC_WP_T0(v) ((void)0)
+#define VXC_WP_TV(v) ((void)0)
+#define VXC_WP_SET(v) ((void)0)
+#define VXC_WP_ADD(field, v) ((void)0)
+#define VXC_WP_INC(field, n) ((void)0)
+#endif
 
 namespace {
 
 constexpr int kEdge = WaterBrick8::kEdge;   // 8
 constexpr int kCells = WaterBrick8::kCells; // 512
 
-// Voxel-coordinate key for the per-tick solid_ memoization cache (see
-// stepWithOrder's `cachedSolid`/`solidCache`) -- distinct from BrickKey,
-// which is truncated to int32_t brick coordinates; a voxel key needs the
-// full int64_t range solid_'s own (vx,vy,vz) contract uses.
+// Voxel-coordinate key for hydrostaticPass's deferred-write list -- distinct
+// from BrickKey, which is truncated to int32_t brick coordinates; a voxel key
+// needs the full int64_t range solid_'s own (vx,vy,vz) contract uses.
+// No operator== any more. It existed for the per-tick
+// unordered_map<VoxelKey, MaterialId> that Phase READ used to rebuild every
+// tick -- and deleting that map IS the first of this pass's four changes, so
+// the comparison went with it. VoxelKey survives only as the payload half of
+// hydrostaticPass's deferred-write list, which never compares two of them.
+//
+// MSVC does not warn; clang's -Wunused-function -Werror does, so CI caught it
+// where the local build could not.
 struct VoxelKey {
     int64_t x, y, z;
-    friend bool operator==(const VoxelKey&, const VoxelKey&) = default;
 };
-struct VoxelKeyHash {
-    size_t operator()(const VoxelKey& k) const {
-        uint64_t h = splitmix64(static_cast<uint64_t>(k.x));
-        h = splitmix64(h ^ static_cast<uint64_t>(k.y));
-        h = splitmix64(h ^ static_cast<uint64_t>(k.z));
-        return static_cast<size_t>(h);
-    }
+
+// The 6 solidity masks Phase READ can possibly need for one active brick:
+// its own, the brick below (gravity's z-1 target when the cell sits on the
+// brick's floor), and its 4 lateral neighbours (+x,-x,+y,-y, in kLateralDx/Dy
+// order) -- exactly the same 6-brick neighbourhood computeDesiredForBrick
+// already resolves for `water`. Resolved ONCE PER TICK per active brick (the
+// mask store is node-based, so these pointers stay valid across every later
+// insert), which is what removes hashing from the solidity path entirely:
+// inside the per-cell loop a solidity question is a pointer already in hand
+// plus a shift-and-test.
+struct BrickSolidMasks {
+    SolidMaskBrick* self;
+    SolidMaskBrick* below;
+    SolidMaskBrick* lateral[4];
 };
+
+// Memoized solidity for one cell of one already-resolved brick. `miss` is the
+// raw terrain callback, consulted at most once per (brick, cell) for as long
+// as the mask lives -- one tick when the cross-tick memo is off, indefinitely
+// (until invalidated) when it is on. Memoizing a pure query never changes its
+// answer, so this is byte-identical to calling `miss` every time.
+template <typename SolidMiss>
+inline bool solidFromMask(SolidMaskBrick& m, int ci, int64_t vx, int64_t vy, int64_t vz, SolidMiss& miss) {
+    VXC_WP_INC(readSolidLookups, 1);
+    const size_t w = static_cast<size_t>(ci >> 6);
+    const uint64_t bit = 1ull << (ci & 63);
+    if (m.known[w] & bit) return (m.solid[w] & bit) != 0;
+    const bool s = miss(vx, vy, vz);
+    m.known[w] |= bit;
+    if (s) m.solid[w] |= bit;
+    return s;
+}
 
 // Phase C (hydrostatic) full 6-neighbor offsets -- unlike `touched`'s
 // gravity-only -z target direction, the hydrostatic flood fill must look
@@ -67,24 +129,69 @@ constexpr int kLateralDy[4] = {0, 0, 1, -1};
 // std::vector-based version of this struct -- reusing fixed storage across
 // rounds/ticks is what actually delivers the two-phase rewrite's speedup,
 // not the algorithm shape alone).
+// Cells of ONE color within an 8^3 brick (see kColorCells): 512/8.
+constexpr int kColorCellsPerBrick = 64;
+
 struct FlowScratch {
-    // desired[cellIndex*kSlots + slot]: this cell's outgoing flow to that
+    // desired[colorIndex*kSlots + slot]: this cell's outgoing flow to that
     // slot's neighbor, computed from tick-start data only and already
     // capped so one cell's 5 slots sum to at most its own tick-start fill
     // (source-side cap, fixed priority GRAVITY,+X,-X,+Y,-Y).
-    std::array<int16_t, kCells * kSlots> desired{};
-    // accepted[cellIndex*kSlots + slot]: how much of `desired` the TARGET
+    std::array<uint8_t, kColorCellsPerBrick * kSlots> desired{};
+    // accepted[colorIndex*kSlots + slot]: how much of `desired` the TARGET
     // actually admitted, once every target's own capacity was resolved
     // (target-side cap, same fixed order, applied at the RECEIVING cell).
     // Written by whichever touched brick turns out to own that slot's
     // target; never read until every touched brick has been gathered.
-    std::array<int16_t, kCells * kSlots> accepted{};
+    std::array<uint8_t, kColorCellsPerBrick * kSlots> accepted{};
+    // Did Phase READ write ANY nonzero `desired` for this brick this round?
+    // False is extremely common and extremely cheap to exploit: the deep
+    // interior of a settled pool is all-255 cells sitting on all-255 cells, so
+    // gravity offers 255-255 = 0 and every lateral neighbour is equal --
+    // the whole brick has nothing to send, every round, forever. GATHER can
+    // then skip the brick as a source without loading its desired[] at all
+    // (which is a cache miss into ANOTHER brick's scratch), and FINALIZE can
+    // skip its entire outflow scan (`accepted` is a subset of `desired`, so no
+    // desired means no accepted).
+    bool anyDesired = false;
 
     void resetForRound() {
         desired.fill(0);
         accepted.fill(0);
+        anyDesired = false;
     }
 };
+// WHY 64 CELLS AND uint8, NOT 512 CELLS AND int16 (the shape this replaced).
+//
+// INDEXING. Phase READ only ever writes `desired` at cells of the ROUND's own
+// color, and Phase GATHER only ever writes `accepted` back into one of those
+// same source cells -- so 7 of every 8 entries of a 512-cell array were
+// structurally zero for the whole round, every round. Indexing by the cell's
+// position WITHIN its color (colorIndex below) instead of by cellIndex stores
+// exactly the 64 that can be nonzero. This is a pure re-indexing: the same
+// values live at different offsets, nothing about what is computed changes.
+//
+// WIDTH. Every value either array can hold is a flow amount bounded by a cell
+// fill, and fills are uint8 by definition (0..255): `desired` is capped at
+// min(fill, 255-neighborFill) and again at the cell's own remaining budget,
+// and `accepted` is min(desired, 255-targetFill) -- so int16 was carrying a
+// sign and a high byte that could never be used.
+//
+// WHY IT MATTERS: 10,240 bytes per active brick became 640. At the ~2150
+// active bricks the 441-column pour bench reaches, the per-round working set
+// went from ~22 MB (nothing but last-level cache misses, and a 22 MB memset
+// per round to clear it -- 176 MB/tick over 8 rounds) to ~1.4 MB, which fits
+// in cache and clears 16x faster. Measured on that bench, memo on: scratch
+// reset 12.3 -> 0.9 ms/tick, GATHER 59.8 -> 22.0 ms/tick, FINALIZE 31.2 ->
+// 9.0 ms/tick, per-tick scratch construction 11.7 -> 1.8 ms/tick.
+
+// A cell's position within its own color's 64-cell stride-2 sublattice --
+// i.e. its index in kColorCells[colorOf(x,y,z)]. buildColorCells appends in
+// (z,y,x)-ascending order over the cells whose per-axis parities the color
+// fixes, so dropping each axis' (color-determined) parity bit and packing the
+// remaining 2 bits per axis reproduces that position exactly. Asserted below
+// against the table itself, at compile time, so the two can never drift.
+constexpr int colorIndex(int lx, int ly, int lz) { return (lx >> 1) + 4 * (ly >> 1) + 16 * (lz >> 1); }
 
 // Resolves the brick + local cell at (lx+dx, ly+dy, lz+dz) relative to brick
 // `key`, where exactly one of dx/dy/dz is nonzero (+/-1). Returns `key`
@@ -167,15 +274,16 @@ struct ColorCell {
 // (READ: kColorCells[roundColor], 64 cells; GATHER: the 3 colors that can
 // receive nonzero inflow from a `roundColor` source, kColorCells[roundColor
 // ^ 1/2/4], 192 cells; FINALIZE: the union of GATHER's 3 plus roundColor
-// itself for outflow, 256 cells) -- an output-preserving loop restructuring
-// only: every cell any of these loops used to actually touch (i.e. every
-// iteration that didn't immediately `continue` on a color mismatch) is
-// still visited, in the same relative order, doing the exact same
-// computation; cells that would have been skipped are now simply never
-// visited, since their arrays are already known-zero (resetForRound()'s
-// memset / the caller's inflow.fill(0) / a delta that's structurally
-// always 0 for that cell this round -- see gatherInflowForBrick's and the
-// FINALIZE loop's comments for the per-phase color-group derivation).
+// itself for outflow -- since split into a 64-cell outflow sweep and a
+// 192-cell inflow sweep, see the FINALIZE loop) -- an output-preserving loop
+// restructuring only: every cell any of these loops used to actually touch
+// (i.e. every iteration that didn't immediately `continue` on a color
+// mismatch) is still visited, in the same relative order, doing the exact
+// same computation; cells that would have been skipped are now simply never
+// visited, since their storage is already known-zero (resetForRound()'s
+// memset, or a delta that's structurally always 0 for that cell this round --
+// see gatherInflowForBrick's and the FINALIZE loop's comments for the
+// per-phase color-group derivation).
 constexpr std::array<std::array<ColorCell, 64>, 8> buildColorCells() {
     std::array<std::array<ColorCell, 64>, 8> out{};
     std::array<int, 8> idx{};
@@ -191,6 +299,21 @@ constexpr std::array<std::array<ColorCell, 64>, 8> buildColorCells() {
     return out;
 }
 constexpr std::array<std::array<ColorCell, 64>, 8> kColorCells = buildColorCells();
+
+// colorIndex() must be the exact inverse of kColorCells' own enumeration --
+// FlowScratch and the per-round inflow buffers are indexed by one and walked
+// by the other, so any drift would silently mis-address flows rather than
+// fail to compile. Checked here against the generated table itself.
+constexpr bool colorIndexMatchesColorCells() {
+    for (size_t c = 0; c < 8; ++c)
+        for (size_t i = 0; i < 64; ++i) {
+            const ColorCell& cc = kColorCells[c][i];
+            if (colorIndex(cc.x, cc.y, cc.z) != static_cast<int>(i)) return false;
+        }
+    return true;
+}
+static_assert(colorIndexMatchesColorCells(),
+              "colorIndex() no longer matches kColorCells' (z,y,x)-ascending enumeration");
 
 // Phase READ for one active brick: fills `scratch.desired` from the CURRENT
 // map state (tick-start for round 0; round-0-updated for round 1 -- see
@@ -209,19 +332,27 @@ constexpr std::array<std::array<ColorCell, 64>, 8> kColorCells = buildColorCells
 // looking these up per-cell instead, even after fixing the earlier
 // allocation-churn issue, was still the dominant remaining cost).
 //
-// `solid` is templated (not WaterCA::SolidFn directly) so callers can pass
-// stepWithOrder's per-tick memoizing `cachedSolid` wrapper instead of the
-// raw callback -- see stepWithOrder's `solidCache` comment for why: a
-// REAL terrain-backed SolidFn (bilinear elevation + several octaves of
-// value noise per call, no memoization of its own) measured at ~1us/call
-// is the dominant cost of this whole engine at pour scale, dwarfing every
-// per-cell-enumeration saving above; `solid` here is called the same
-// number of times, with the same arguments, producing the same results,
-// as the raw `solid_` would -- the template only changes WHICH callable
-// answers each call, never what gets asked or what comes back.
-template <typename SolidLookup>
-void computeDesiredForBrick(const BrickKey& key, const WaterMap& water, SolidLookup&& solid, int colorFilter,
-                            FlowScratch& scratch) {
+// Solidity comes in as `masks` (the caller-resolved 6-brick neighbourhood,
+// see BrickSolidMasks) plus `solidMiss`, the raw terrain callback used only
+// when a mask bit is not yet known. This is a pure MEMOIZATION of the same
+// query: every voxel this function used to ask about is still asked about
+// (once), the answers are the same, and the results are byte-identical. It
+// replaces a per-TICK unordered_map<VoxelKey,MaterialId> whose every probe
+// cost three splitmix64 rounds plus a hash-table walk -- measured at 134,500
+// probes/tick on the 441-column pour, all of them now a shift-and-test on a
+// pointer resolved once per brick per tick. When WaterCA's cross-tick memo is
+// enabled the masks are the PERSISTENT ones, so the 84,279 of those probes
+// that used to reach the real ~1us terrain callback every tick reach it only
+// once per (voxel, terrain edit) instead.
+//
+// A REAL terrain-backed SolidFn (bilinear elevation + several octaves of value
+// noise per call, no memoization of its own) measured at ~1us/call is the
+// dominant cost of this whole engine at pour scale, dwarfing every
+// per-cell-enumeration saving above -- which is why this path, not the
+// enumeration, is where the memo belongs.
+template <typename SolidMiss>
+void computeDesiredForBrick(const BrickKey& key, const WaterMap& water, const BrickSolidMasks& masks,
+                            SolidMiss&& solidMiss, int colorFilter, FlowScratch& scratch) {
     const WaterBrick8* self = water.find(key);
     if (!self) return; // drained-to-empty active brick: nothing left to send
 
@@ -240,16 +371,20 @@ void computeDesiredForBrick(const BrickKey& key, const WaterMap& water, SolidLoo
         const int64_t vx = int64_t(key.x) * kEdge + x;
         const int64_t vy = int64_t(key.y) * kEdge + y;
         const int64_t vz = int64_t(key.z) * kEdge + z;
-        const int ci = WaterBrick8::cellIndex(x, y, z);
+        const int cidx = colorIndex(x, y, z); // scratch slot base (see FlowScratch)
 
         int remaining = fill; // source-side cap: own tick-start fill
 
-        // Slot 0: GRAVITY (below = z-1).
-        const bool belowSolid = solid(vx, vy, vz - 1) != MAT_AIR;
+        // Slot 0: GRAVITY (below = z-1). The cell below is in this brick
+        // whenever z>0, in the z-1 brick otherwise -- the same split the
+        // `belowBrick` water lookup already makes, reused for the mask.
+        const int belowLz = (z > 0) ? z - 1 : kEdge - 1;
+        const bool belowSolid = solidFromMask(*((z > 0) ? masks.self : masks.below),
+                                              WaterBrick8::cellIndex(x, y, belowLz), vx, vy, vz - 1, solidMiss);
         uint8_t belowFill = 0;
         if (!belowSolid) {
             const WaterBrick8* b = (z > 0) ? self : belowBrick;
-            belowFill = b ? b->get(x, y, z > 0 ? z - 1 : kEdge - 1) : 0;
+            belowFill = b ? b->get(x, y, belowLz) : 0;
         }
         int gFlow = 0;
         if (!belowSolid) {
@@ -257,7 +392,8 @@ void computeDesiredForBrick(const BrickKey& key, const WaterMap& water, SolidLoo
             gFlow = std::min(gFlow, remaining);
         }
         remaining -= gFlow;
-        scratch.desired[static_cast<size_t>(ci * kSlots + SLOT_GRAVITY)] = static_cast<int16_t>(gFlow);
+        scratch.desired[static_cast<size_t>(cidx * kSlots + SLOT_GRAVITY)] = static_cast<uint8_t>(gFlow);
+        if (gFlow) scratch.anyDesired = true;
 
         const bool supported = belowSolid || belowFill >= 255;
 
@@ -267,10 +403,11 @@ void computeDesiredForBrick(const BrickKey& key, const WaterMap& water, SolidLoo
             if (supported && remaining > 0) {
                 const int64_t nvx = vx + kLateralDx[dir];
                 const int64_t nvy = vy + kLateralDy[dir];
-                if (solid(nvx, nvy, vz) == MAT_AIR) {
-                    int nlx, nly, nlz;
-                    const bool sameBrick =
-                        neighborOf(key, x, y, z, kLateralDx[dir], kLateralDy[dir], 0, nlx, nly, nlz) == key;
+                int nlx, nly, nlz;
+                const bool sameBrick =
+                    neighborOf(key, x, y, z, kLateralDx[dir], kLateralDy[dir], 0, nlx, nly, nlz) == key;
+                if (!solidFromMask(*(sameBrick ? masks.self : masks.lateral[dir]),
+                                   WaterBrick8::cellIndex(nlx, nly, nlz), nvx, nvy, vz, solidMiss)) {
                     const WaterBrick8* nBrick = sameBrick ? self : lateralBrick[dir];
                     const uint8_t nf = nBrick ? nBrick->get(nlx, nly, nlz) : 0;
                     if (fill > nf) {
@@ -283,7 +420,8 @@ void computeDesiredForBrick(const BrickKey& key, const WaterMap& water, SolidLoo
                 }
             }
             remaining -= flow;
-            scratch.desired[static_cast<size_t>(ci * kSlots + (SLOT_PX + dir))] = static_cast<int16_t>(flow);
+            scratch.desired[static_cast<size_t>(cidx * kSlots + (SLOT_PX + dir))] = static_cast<uint8_t>(flow);
+            if (flow) scratch.anyDesired = true;
         }
     }
 }
@@ -303,9 +441,10 @@ constexpr InboundSource kInbound[kSlots] = {
 };
 
 // Phase APPLY / GATHER for one touched brick: computes its per-cell inbound
-// total (into `outInflow`, size kCells, ALREADY pre-zeroed by the caller --
-// load-bearing now, see below) and writes each admitted amount back into
-// the sourcing active brick's scratch.accepted (via `selfScratch`/
+// total (into `outInflow`, ALREADY pre-zeroed by the caller -- load-bearing,
+// see below: this only ever WRITES nonzero admissions, so a cell it skips
+// keeps the caller's zero) and writes each admitted amount back into the
+// sourcing active brick's scratch.accepted (via `selfScratch`/
 // `inboundScratch`). Reads `water` only for this brick's own tick-start
 // fill (to size the per-cell budget) -- every inbound candidate's
 // magnitude comes from `scratch.desired`, already computed by Phase READ,
@@ -361,46 +500,154 @@ constexpr int kZFlipSlots[] = {0};
 constexpr int kXFlipSlots[] = {1, 2};
 constexpr int kYFlipSlots[] = {3, 4};
 
+// The three inbound target groups, in the FIXED order every phase walks them:
+// group 0 = the z-flip color (gravity from above), 1 = x-flip, 2 = y-flip.
+// `kInflowGroups * kColorCellsPerBrick` is the whole per-brick inflow buffer:
+// 192 bytes, not 512 int32s, because those 192 cells are exactly the ones that
+// can receive anything this round and an admitted inflow can never exceed the
+// 255-minus-current-fill budget it was capped against.
+constexpr int kInflowGroups = 3;
+constexpr int inflowGroupColor(int color, int group) {
+    return color ^ (group == 0 ? 4 : group == 1 ? 1 : 2);
+}
+
+struct InflowBuf {
+    std::array<uint8_t, kInflowGroups * kColorCellsPerBrick> v{};
+    // Did GATHER admit anything at all into this brick this round? Same idea
+    // (and same payoff) as FlowScratch::anyDesired: a settled brick receives
+    // nothing round after round, and this lets FINALIZE skip its whole
+    // 192-cell inflow scan instead of reading 192 zeroes to find that out.
+    bool any = false;
+
+    void resetForRound() {
+        if (any) v.fill(0); // already all-zero otherwise, by this same invariant
+        any = false;
+    }
+};
+
+// Where a target cell's inbound flow comes FROM, precomputed.
+//
+// GATHER used to answer that with neighborOf() per (cell, slot) -- a general
+// 3-axis fixup returning a BrickKey by value, then an equality compare against
+// the brick's own key to decide same-brick-or-not, then colorIndex() on the
+// result. At 192 candidate cells x up to 2 slots x every touched brick x 8
+// rounds that was ~7M neighborOf calls per tick on the pour bench, and it was
+// GATHER's single largest term. But none of it depends on the DATA: for a
+// given target colour and inbound slot, "does this step leave the brick, and
+// what is the source cell's index within the round's colour" is a fixed
+// property of the 8^3 lattice. So it is computed once, at COMPILE time, for
+// every (target colour, slot, cell) -- 8*5*64 entries, 5 KB -- and GATHER
+// becomes two table loads.
+//
+// Indexed [targetColor][slot][i] where i is the cell's position in
+// kColorCells[targetColor] (i.e. its colorIndex).
+struct InboundStep {
+    uint8_t srcColorIdx; // colorIndex of the source cell, in ITS own brick
+    uint8_t crosses;     // 1 if the step leaves this brick (use inboundScratch)
+};
+constexpr std::array<std::array<std::array<InboundStep, 64>, kSlots>, 8> buildInboundTable() {
+    std::array<std::array<std::array<InboundStep, 64>, kSlots>, 8> out{};
+    for (size_t tc = 0; tc < 8; ++tc)
+        for (size_t slot = 0; slot < kSlots; ++slot) {
+            const InboundSource& s = kInbound[slot];
+            for (size_t i = 0; i < 64; ++i) {
+                const ColorCell& cc = kColorCells[tc][i];
+                const int nx = int(cc.x) + s.dx, ny = int(cc.y) + s.dy, nz = int(cc.z) + s.dz;
+                const bool crosses = nx < 0 || nx >= kEdge || ny < 0 || ny >= kEdge || nz < 0 || nz >= kEdge;
+                out[tc][slot][i] = InboundStep{
+                    static_cast<uint8_t>(colorIndex((nx + kEdge) & 7, (ny + kEdge) & 7, (nz + kEdge) & 7)),
+                    static_cast<uint8_t>(crosses ? 1 : 0)};
+            }
+        }
+    return out;
+}
+constexpr std::array<std::array<std::array<InboundStep, 64>, kSlots>, 8> kInboundTable = buildInboundTable();
+
 void gatherInflowForBrick(const BrickKey& key, const WaterMap& water, int color, FlowScratch* selfScratch,
-                          const std::array<FlowScratch*, kSlots>& inboundScratch,
-                          std::array<int32_t, kCells>& outInflow) {
+                          const std::array<FlowScratch*, kSlots>& inboundScratch, InflowBuf& outInflow) {
     const WaterBrick8* self = water.find(key);
 
     struct TargetGroup {
-        int color;
         const int* slots;
         int slotCount;
     };
-    const TargetGroup groups[3] = {
-        {color ^ 4, kZFlipSlots, 1},
-        {color ^ 1, kXFlipSlots, 2},
-        {color ^ 2, kYFlipSlots, 2},
+    const TargetGroup groups[kInflowGroups] = {
+        {kZFlipSlots, 1},
+        {kXFlipSlots, 2},
+        {kYFlipSlots, 2},
     };
-    for (const TargetGroup& g : groups)
-        for (const ColorCell& cc : kColorCells[static_cast<size_t>(g.color)]) {
-            const int x = cc.x, y = cc.y, z = cc.z;
-            const int ci = WaterBrick8::cellIndex(x, y, z);
-            const uint8_t fillStart = self ? self->get(x, y, z) : 0;
-            int budget = 255 - int(fillStart);
-            int32_t inflow = 0;
+    for (int gIdx = 0; gIdx < kInflowGroups; ++gIdx) {
+        const TargetGroup& g = groups[gIdx];
+        const size_t targetColor = static_cast<size_t>(inflowGroupColor(color, gIdx));
+        const size_t outBase = static_cast<size_t>(gIdx) * kColorCellsPerBrick;
+        // The 1-2 source scratch pointers for this whole group are fixed by
+        // the group, not by the cell: a step either stays in this brick (self)
+        // or leaves it in this slot's one fixed direction. Resolve them here
+        // and skip the entire 64-cell group when neither can offer anything --
+        // which is the normal state of a settled brick.
+        FlowScratch* srcSelf[2];
+        FlowScratch* srcCross[2];
+        bool anySource = false;
+        for (int gi = 0; gi < g.slotCount; ++gi) {
+            const size_t i = static_cast<size_t>(g.slots[gi]);
+            FlowScratch* a = (selfScratch && selfScratch->anyDesired) ? selfScratch : nullptr;
+            FlowScratch* b = (inboundScratch[i] && inboundScratch[i]->anyDesired) ? inboundScratch[i] : nullptr;
+            srcSelf[gi] = a;
+            srcCross[gi] = b;
+            if (a || b) anySource = true;
+        }
+        if (!anySource) continue; // group stays at the caller's pre-zeroed 0
 
+        const WaterBrick8* selfBrick = self;
+        for (size_t i = 0; i < 64; ++i) {
+            // Resolve the (at most 2) inbound edges FIRST and bail before
+            // touching `water` at all if none of them is offering anything --
+            // the overwhelmingly common case, since a round's sources are one
+            // colour out of eight and most of those have no flow to give. The
+            // target's own fill is only needed to size the acceptance budget,
+            // so reading it up front (as this used to) spent a water-brick
+            // load per candidate cell, ~4.8M/tick on the pour bench, to
+            // compute a budget that was then never used.
+            size_t sidx[2];
+            FlowScratch* chosen[2];
+            int desired[2];
+            int offered = 0;
             for (int gi = 0; gi < g.slotCount; ++gi) {
-                const int i = g.slots[gi];
-                const InboundSource& s = kInbound[i];
-                int slx, sly, slz;
-                const bool sameBrick = neighborOf(key, x, y, z, s.dx, s.dy, s.dz, slx, sly, slz) == key;
-                FlowScratch* srcScratch = sameBrick ? selfScratch : inboundScratch[static_cast<size_t>(i)];
-                if (!srcScratch) continue; // that potential source wasn't active this tick: 0
-                const int sci = WaterBrick8::cellIndex(slx, sly, slz);
-                const int desired = srcScratch->desired[static_cast<size_t>(sci * kSlots + s.slot)];
-                if (desired <= 0) continue;
-                const int accepted = std::min(desired, budget);
+                const size_t slot = static_cast<size_t>(g.slots[gi]);
+                const InboundStep& st = kInboundTable[targetColor][slot][i];
+                FlowScratch* src = st.crosses ? srcCross[gi] : srcSelf[gi];
+                if (!src) continue; // source brick inactive, or nothing to send
+                // The source cell is of the ROUND's color (see the derivation
+                // above), which is what makes colorIndex the right slot base.
+                const size_t si = static_cast<size_t>(st.srcColorIdx) * kSlots +
+                                  static_cast<size_t>(kInbound[slot].slot);
+                const int d = src->desired[si];
+                if (d <= 0) continue;
+                chosen[offered] = src;
+                sidx[offered] = si;
+                desired[offered] = d;
+                ++offered;
+            }
+            if (offered == 0) continue; // stays at the caller's pre-zeroed 0
+            // Fixed inbound-acceptance order, unchanged: the surviving
+            // candidates are still visited in kInbound order, and a candidate
+            // that was skipped above would have been admitted 0 anyway.
+            const ColorCell& cc = kColorCells[targetColor][i];
+            const uint8_t fillStart = selfBrick ? selfBrick->get(cc.x, cc.y, cc.z) : uint8_t(0);
+            int budget = 255 - int(fillStart);
+            int inflow = 0;
+            for (int k = 0; k < offered; ++k) {
+                const int accepted = std::min(desired[k], budget);
                 budget -= accepted;
                 inflow += accepted;
-                srcScratch->accepted[static_cast<size_t>(sci * kSlots + s.slot)] = static_cast<int16_t>(accepted);
+                chosen[k]->accepted[sidx[k]] = static_cast<uint8_t>(accepted);
             }
-            outInflow[static_cast<size_t>(ci)] = inflow;
+            if (inflow) {
+                outInflow.v[outBase + i] = static_cast<uint8_t>(inflow);
+                outInflow.any = true;
+            }
         }
+    }
 }
 
 } // namespace
@@ -617,14 +864,31 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
     // a shift-and-test on the second and every later tick. Memoizing a pure
     // query never changes its answer, so this is byte-identical; the caller's
     // invalidation obligation is what keeps the memo pure (see waterca.h).
+    //
+    // Each node also carries LAZILY-RESOLVED POINTERS TO ITS 6 FACE NEIGHBOURS
+    // (`nbr`, in kHydroDx/Dy/Dz order, nullptr = not resolved yet). Without
+    // them the flood re-hashed `cache` on every brick-crossing step: of the
+    // 3072 directed cell->neighbour edges inside an 8^3 brick, 384 (12.5%)
+    // leave it, so at the 868,662 cells/tick this pass pops on the 441-column
+    // pour bench that was ~650,000 BrickKey hashes per tick — measured as the
+    // dominant remaining cost of the flood, well ahead of the solidity queries
+    // the memo already collapsed. Resolved once per (brick, direction) they
+    // become a pointer load. Safe for exactly the reason the comment above
+    // gives: `cache` is node-based and this pass never erases from it, so a
+    // BrickCell* stays valid for the whole call.
     struct BrickCell {
+        BrickKey key;
         const WaterBrick8* water; // nullptr if the brick is absent (all-empty)
         SolidMaskBrick* solidMask; // nullptr when the memo is disabled
         bool touched;
+        bool queued;                     // already on the brick worklist
         std::array<uint64_t, 8> visited; // 512 bits in cellIndex order
+        std::array<uint64_t, 8> pending; // discovered-but-not-yet-expanded cells
+        std::array<BrickCell*, 6> nbr;   // lazily resolved, kHydroD* order
     };
     // Bound the memo BEFORE any node pointer below is taken: clearing it here
     // is safe precisely because nothing holds a SolidMaskBrick* yet.
+    VXC_WP_T0(tHSetup);
     if (solidCacheEnabled_ && solidCache_.size() > kMaxSolidCacheBricks) solidCache_.clear();
 
     std::unordered_map<BrickKey, BrickCell, BrickKeyHash> cache;
@@ -634,16 +898,27 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
         auto it = cache.find(k);
         if (it != cache.end()) return it->second;
         BrickCell bc;
+        bc.key = k;
         bc.water = water_.find(k);
         // Node-based unordered_map: this reference stays valid across every
         // later insert into solidCache_, exactly like `cache`'s own nodes.
         bc.solidMask = solidCacheEnabled_ ? &solidCache_[k] : nullptr;
         bc.touched = touched.find(k) != touched.end();
+        bc.queued = false;
         bc.visited.fill(0);
+        bc.pending.fill(0);
+        bc.nbr.fill(nullptr);
         return cache.emplace(k, bc).first->second;
     };
-    auto fillOf = [](const BrickCell& bc, int lx, int ly, int lz) -> uint8_t {
-        return bc.water ? bc.water->get(lx, ly, lz) : uint8_t(0);
+    auto neighbourBrick = [&](BrickCell& bc, int dir) -> BrickCell& {
+        BrickCell*& slot = bc.nbr[static_cast<size_t>(dir)];
+        if (!slot)
+            slot = &brickOf(BrickKey{bc.key.x + kHydroDx[dir], bc.key.y + kHydroDy[dir],
+                                     bc.key.z + kHydroDz[dir]});
+        return *slot;
+    };
+    auto fillOf = [](const BrickCell& bc, int ci) -> uint8_t {
+        return bc.water ? bc.water->cell(ci) : uint8_t(0);
     };
     auto isVisited = [](const BrickCell& bc, int ci) {
         return (bc.visited[static_cast<size_t>(ci >> 6)] >> (ci & 63)) & 1ull;
@@ -652,22 +927,45 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
         bc.visited[static_cast<size_t>(ci >> 6)] |= (1ull << (ci & 63));
     };
 
-    // A flood stack entry keeps brick-local coordinates (like
-    // computeDesiredForBrick's neighborOf walk) so neighbor resolution is
-    // pure arithmetic -- no per-cell floorDiv/floorMod voxel->brick round
-    // trip -- AND caches the already-resolved BrickCell pointer so popping a
-    // cell needs no cache lookup at all, and a neighbor that stays in the
-    // SAME brick (the common case for an 8^3 brick -- every interior cell,
-    // and 5 of 6 faces of a boundary cell) reuses that pointer instead of
-    // hashing the cache again. Node-based std::unordered_map keeps the
-    // pointer valid across later inserts (only iterators are invalidated),
-    // and discovery never erases, so these cached pointers never dangle.
-    struct StackEntry {
-        BrickCell* brick;
-        BrickKey bk;
-        int lx, ly, lz;
+    // The flood's frontier is held BRICK-MAJOR: a worklist of bricks, plus a
+    // 512-bit `pending` mask per brick saying which of its cells are
+    // discovered but not yet expanded. A brick is drained completely (to its
+    // own local fixed point) before the worklist moves on.
+    //
+    // WHY, given a plain cell stack is simpler. Traversal ORDER is free here:
+    // the component's cell SET, its totalVol, and its overflow decision are
+    // all order-invariant, and `cells` is sorted by (z,x,y) before it is used,
+    // so any order produces byte-identical output (a component that overflows
+    // discards `cells` entirely, so the partial order it was filled in cannot
+    // matter either). A LIFO cell stack spends that freedom badly: it walks
+    // the frontier in discovery order, which on a wide flat pool hops between
+    // bricks constantly, so every pop is a fresh 512-byte water brick, a fresh
+    // ~200-byte BrickCell and a fresh solidity mask. Draining brick-by-brick
+    // keeps all three resident for the whole 512-cell brick, and turns the
+    // frontier itself from ~870,000 12-byte stack entries per tick into a few
+    // thousand brick pointers plus bit sets.
+    //
+    // Cells within a brick are drained by word (a word IS a z-layer, since
+    // cellIndex = x + 8*y + 64*z), lowest set bit first, re-scanning the 8
+    // words until the brick is empty -- expanding a cell can push new pending
+    // bits into a word the scan already passed, and the re-scan is 8 loads.
+    std::vector<BrickCell*> brickWork;
+    auto enqueue = [&brickWork](BrickCell& b, int ci) {
+        b.pending[static_cast<size_t>(ci >> 6)] |= (1ull << (ci & 63));
+        if (!b.queued) {
+            b.queued = true;
+            brickWork.push_back(&b);
+        }
     };
-    std::vector<StackEntry> stack;
+    // Per-direction (kHydroD* order: +x,-x,+y,-y,+z,-z) cellIndex deltas for a
+    // step that STAYS in the brick, and for one that LEAVES it (wrapping the
+    // local coordinate from 7 to 0 or 0 to 7).
+    constexpr int32_t kFloodStep[6] = {1, -1, 8, -8, 64, -64};
+    constexpr int32_t kFloodCross[6] = {-7, 7, -56, 56, -448, 448};
+    // Which 3-bit field of cellIndex each direction's axis lives in, and the
+    // field value at which a step in that direction leaves the brick.
+    constexpr int kFloodShift[6] = {0, 0, 3, 3, 6, 6};
+    constexpr int kFloodEdge[6] = {7, 0, 7, 0, 7, 0};
     // Each discovered cell carries the fill it had at flood time. That fill
     // is still current at apply time (all writes are deferred, so nothing
     // mutates these cells between discovery and apply), which lets the level
@@ -696,6 +994,147 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
     // when it is committed.
     std::vector<std::pair<VoxelKey, uint8_t>> pendingWrites;
 
+#ifdef VXC_WATER_PROFILE
+    uint64_t popsThisComponent = 0;
+#endif
+    // Expands ONE component from an already-marked-visited seed cell, filling
+    // `cells` and `totalVol`; returns whether it blew the cap. The bounded-
+    // through-air / unbounded-through-water rule it implements is the header's
+    // "Phase C -- HYDROSTATIC" step 1:
+    //
+    //   * a neighbour that HOLDS WATER (fill > 0) is always explorable, from
+    //     any cell, in any direction, whether or not its brick is `touched` --
+    //     that is what keeps a settled arm of a body in the volume accounting;
+    //   * a neighbour that is EMPTY is explorable only if (a) the step is not
+    //     -z (never explore NEWLY-discovered empty space downward -- any water
+    //     cell reaching this pass already settled this tick's gravity/lateral
+    //     rounds, so if it had empty space below it it would not be resting
+    //     there yet; going down would only ever reach dry floor BESIDE the
+    //     real body, not real headroom), AND (b) the CURRENT cell is either a
+    //     FULL water cell (fill==255 -- "this column is saturated, there may
+    //     be pressure to rise") or an already-included empty cell (fill==0 --
+    //     continuing a chain legitimately started at a full column), AND
+    //     (c) the neighbour's owning brick is in `touched` (the actual
+    //     "bounded to the active region" cap).
+    //
+    // Without the fill==255 gate on the FIRST air-ward step, any partially
+    // filled water cell whose owning brick simply happens to span several
+    // empty voxels above it (a brick is 8 voxels tall; that headroom is
+    // `touched` purely by being the SAME brick as the water, whether or not
+    // the water actually needs it) would pull that dry headroom into the
+    // redistribution every tick, diluting the level and reactivating a
+    // permanently growing footprint -- never a genuine pressure response, just
+    // brick-granularity leakage. That was a real never-settling bug.
+    auto floodComponent = [&](BrickCell& seed, int seedCi, uint64_t& totalVol) -> bool {
+        bool overflowed = false;
+        totalVol = 0;
+        cells.clear();
+        brickWork.clear();
+        enqueue(seed, seedCi);
+#ifdef VXC_WATER_PROFILE
+        popsThisComponent = 0;
+#endif
+        while (!brickWork.empty()) {
+            BrickCell& cBrick = *brickWork.back();
+            brickWork.pop_back();
+            // Deliberately stays queued==true for the whole drain: a same-brick
+            // discovery then just sets a pending bit instead of pushing this
+            // brick back onto the worklist, and nothing else can enqueue into
+            // it while we are the only brick expanding (its cells' cross-brick
+            // steps go to its neighbours, never back to itself).
+            bool brickHadWork = true;
+            while (brickHadWork) {
+                brickHadWork = false;
+                for (size_t pw = 0; pw < 8; ++pw) {
+                    while (cBrick.pending[pw]) {
+                        brickHadWork = true;
+                        const int cci = static_cast<int>(pw) * 64 + std::countr_zero(cBrick.pending[pw]);
+                        cBrick.pending[pw] &= cBrick.pending[pw] - 1;
+
+                        const uint8_t cFill = fillOf(cBrick, cci);
+                        VXC_WP_INC(hydroPops, 1);
+                        VXC_WP_INC(hydroPopsAir, cFill == 0 ? 1 : 0);
+#ifdef VXC_WATER_PROFILE
+                        ++popsThisComponent;
+#endif
+                        if (!overflowed) {
+                            cells.push_back(FloodCell{int64_t(cBrick.key.x) * kEdge + (cci & 7),
+                                                      int64_t(cBrick.key.y) * kEdge + ((cci >> 3) & 7),
+                                                      int64_t(cBrick.key.z) * kEdge + (cci >> 6), cFill});
+                            totalVol += cFill;
+                            if (cells.size() > kMaxHydrostaticComponentCells) overflowed = true;
+                        }
+                        const bool canEnterAir = cFill == 255 || cFill == 0;
+                        for (int i = 0; i < 6; ++i) {
+                            // Neighbour by index arithmetic: same brick unless
+                            // this direction's axis field is already at the
+                            // face it steps off (see kFloodStep/kFloodCross).
+                            const bool crosses = ((cci >> kFloodShift[i]) & 7) == kFloodEdge[i];
+                            const int nci = cci + (crosses ? kFloodCross[i] : kFloodStep[i]);
+                            BrickCell& nBrick = crosses ? neighbourBrick(cBrick, i) : cBrick;
+                            if (isVisited(nBrick, nci)) continue;
+                            const uint8_t nFill = fillOf(nBrick, nci);
+                            if (nFill == 0) {
+                                if (kHydroDz[i] < 0) continue; // never explore downward into empty space
+                                if (!canEnterAir) continue;    // gate: full water or already-air only
+                                if (!nBrick.touched) continue; // bounded to active region
+                                // Air cell passing the gates: confirm it is
+                                // genuinely open (not solid terrain) before
+                                // pulling it into the component. Only AIR
+                                // neighbors need this query -- a WATER
+                                // neighbor (nFill>0) is, by engine invariant,
+                                // never inside solid terrain (addWater guards
+                                // isSolid; Phase READ/APPLY only ever flows
+                                // into solid()==MAT_AIR cells; hydrostatic
+                                // only writes flood-included non-solid cells;
+                                // and conservation would break if any water
+                                // sat in a solid cell), so solid() on it is
+                                // ALWAYS MAT_AIR and calling it would only add
+                                // a redundant (~1us terrain) solid_ query.
+                                bool cellIsSolid;
+                                if (nBrick.solidMask) {
+                                    // Cross-tick memo hit: shift-and-test, no
+                                    // terrain query at all. Same answer as
+                                    // solid_ by the purity contract.
+                                    const size_t w = static_cast<size_t>(nci >> 6);
+                                    const uint64_t bit = 1ull << (nci & 63);
+                                    if (nBrick.solidMask->known[w] & bit) {
+                                        VXC_WP_INC(hydroMemoHits, 1);
+                                        cellIsSolid = (nBrick.solidMask->solid[w] & bit) != 0;
+                                    } else {
+                                        VXC_WP_INC(hydroSolidCalls, 1);
+                                        cellIsSolid =
+                                            solid_(int64_t(nBrick.key.x) * kEdge + (nci & 7),
+                                                   int64_t(nBrick.key.y) * kEdge + ((nci >> 3) & 7),
+                                                   int64_t(nBrick.key.z) * kEdge + (nci >> 6)) != MAT_AIR;
+                                        nBrick.solidMask->known[w] |= bit;
+                                        if (cellIsSolid) nBrick.solidMask->solid[w] |= bit;
+                                    }
+                                } else {
+                                    VXC_WP_INC(hydroSolidCalls, 1);
+                                    cellIsSolid =
+                                        solid_(int64_t(nBrick.key.x) * kEdge + (nci & 7),
+                                               int64_t(nBrick.key.y) * kEdge + ((nci >> 3) & 7),
+                                               int64_t(nBrick.key.z) * kEdge + (nci >> 6)) != MAT_AIR;
+                                }
+                                if (cellIsSolid) {
+                                    markVisited(nBrick, nci);
+                                    continue;
+                                }
+                            }
+                            markVisited(nBrick, nci);
+                            enqueue(nBrick, nci);
+                        }
+                    }
+                }
+            }
+            cBrick.queued = false;
+        }
+        return overflowed;
+    };
+    VXC_WP_ADD(hydroSetupNs, tHSetup);
+    VXC_WP_TV(tHScan);
+
     // Deterministic seed scan: `touched` is already a sorted std::set, and
     // each brick's 512 cells are walked in fixed (z,y,x) order -- matches
     // the fixed-order doctrine every other phase in this file follows, even
@@ -715,116 +1154,22 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
                     if (isVisited(seedBrick, ci)) continue;
                     if (seedBrick.water->get(x, y, z) == 0) continue; // not water: never a seed
 
-                    // Bounded-through-air / unbounded-through-water flood
-                    // fill (header comment "Phase C -- HYDROSTATIC" step 1).
-                    //
-                    // Empty-cell gating (the fix for an earlier version of
-                    // this pass that never settled on an open, unwalled
-                    // pool): an empty neighbor is explorable ONLY if (a) the
-                    // CURRENT cell is itself either a FULL water cell
-                    // (fill==255 -- "this column is saturated, there may be
-                    // pressure to rise") or an already-included empty cell
-                    // (fill==0 -- continuing a chain that was legitimately
-                    // started at a full column), AND (b) the step is not
-                    // -z (never explore NEWLY-discovered empty space
-                    // downward -- any water cell reaching this pass already
-                    // settled this tick's gravity/lateral rounds, so if it
-                    // had empty space below it it wouldn't be resting there
-                    // yet; going down would only ever reach dry floor
-                    // BESIDE the real body, not real headroom), AND (c) the
-                    // neighbor's owning brick is in `touched` (the actual
-                    // "bounded to the active region" cap). Without the
-                    // fill==255 gate on the FIRST air-ward step, any
-                    // partially-filled water cell whose owning brick simply
-                    // happens to span several empty voxels above it (a
-                    // brick is 8 voxels tall; that headroom is `touched`
-                    // purely by being the SAME brick as the water, whether
-                    // or not the water actually needs it) would pull that
-                    // dry headroom into the redistribution every tick,
-                    // diluting the level and reactivating a permanently
-                    // growing footprint -- never a genuine pressure
-                    // response, just brick-granularity leakage.
+                    // One component (see floodComponent above for the
+                    // bounded-through-air / unbounded-through-water rule).
                     markVisited(seedBrick, ci);
-                    stack.clear();
-                    stack.push_back(StackEntry{&seedBrick, key, x, y, z});
-                    cells.clear();
-                    bool overflowed = false;
                     uint64_t totalVol = 0;
-
-                    while (!stack.empty()) {
-                        const StackEntry c = stack.back();
-                        stack.pop_back();
-                        BrickCell& cBrick = *c.brick;
-                        const uint8_t cFill = fillOf(cBrick, c.lx, c.ly, c.lz);
-                        if (!overflowed) {
-                            cells.push_back(FloodCell{int64_t(c.bk.x) * kEdge + c.lx,
-                                                      int64_t(c.bk.y) * kEdge + c.ly,
-                                                      int64_t(c.bk.z) * kEdge + c.lz, cFill});
-                            totalVol += cFill;
-                            if (cells.size() > kMaxHydrostaticComponentCells) overflowed = true;
-                        }
-                        const bool canEnterAir = cFill == 255 || cFill == 0;
-                        for (int i = 0; i < 6; ++i) {
-                            int nlx, nly, nlz;
-                            const BrickKey nbk = neighborOf(c.bk, c.lx, c.ly, c.lz, kHydroDx[i], kHydroDy[i],
-                                                            kHydroDz[i], nlx, nly, nlz);
-                            // Same-brick neighbor (interior step): reuse the
-                            // popped cell's own brick node, no cache hash.
-                            BrickCell& nBrick = (nbk == c.bk) ? cBrick : brickOf(nbk);
-                            const int nci = WaterBrick8::cellIndex(nlx, nly, nlz);
-                            if (isVisited(nBrick, nci)) continue;
-                            const uint8_t nFill = fillOf(nBrick, nlx, nly, nlz);
-                            if (nFill == 0) {
-                                if (kHydroDz[i] < 0) continue;   // never explore downward into empty space
-                                if (!canEnterAir) continue;      // gate: full water or already-air only
-                                if (!nBrick.touched) continue;   // bounded to active region
-                                // Air cell passing the gates: confirm it is
-                                // genuinely open (not solid terrain) before
-                                // pulling it into the component. Only AIR
-                                // neighbors need this query -- a WATER
-                                // neighbor (nFill>0) is, by engine invariant,
-                                // never inside solid terrain (addWater guards
-                                // isSolid; Phase READ/APPLY only ever flows
-                                // into solid()==MAT_AIR cells; hydrostatic
-                                // only writes flood-included non-solid cells;
-                                // and conservation would break if any water
-                                // sat in a solid cell), so solid() on it is
-                                // ALWAYS MAT_AIR and calling it would only add
-                                // a redundant (~1us terrain) solid_ query.
-                                // Matching the old code's inclusion decision
-                                // exactly, just skipping the constant query.
-                                bool cellIsSolid;
-                                if (nBrick.solidMask) {
-                                    // Cross-tick memo hit: shift-and-test, no
-                                    // terrain query at all. Same answer as
-                                    // solid_ by the purity contract.
-                                    const size_t w = static_cast<size_t>(nci >> 6);
-                                    const uint64_t bit = 1ull << (nci & 63);
-                                    if (nBrick.solidMask->known[w] & bit) {
-                                        cellIsSolid = (nBrick.solidMask->solid[w] & bit) != 0;
-                                    } else {
-                                        const int64_t nx = int64_t(nbk.x) * kEdge + nlx;
-                                        const int64_t ny = int64_t(nbk.y) * kEdge + nly;
-                                        const int64_t nz = int64_t(nbk.z) * kEdge + nlz;
-                                        cellIsSolid = solid_(nx, ny, nz) != MAT_AIR;
-                                        nBrick.solidMask->known[w] |= bit;
-                                        if (cellIsSolid) nBrick.solidMask->solid[w] |= bit;
-                                    }
-                                } else {
-                                    const int64_t nx = int64_t(nbk.x) * kEdge + nlx;
-                                    const int64_t ny = int64_t(nbk.y) * kEdge + nly;
-                                    const int64_t nz = int64_t(nbk.z) * kEdge + nlz;
-                                    cellIsSolid = solid_(nx, ny, nz) != MAT_AIR;
-                                }
-                                if (cellIsSolid) {
-                                    markVisited(nBrick, nci);
-                                    continue;
-                                }
-                            }
-                            markVisited(nBrick, nci);
-                            stack.push_back(StackEntry{&nBrick, nbk, nlx, nly, nlz});
-                        }
+                    VXC_WP_INC(hydroComponents, 1);
+                    VXC_WP_ADD(hydroScanNs, tHScan);
+                    VXC_WP_TV(tHFlood);
+                    const bool overflowed = floodComponent(seedBrick, ci, totalVol);
+                    VXC_WP_ADD(hydroFloodNs, tHFlood);
+                    VXC_WP_TV(tHLevel);
+#ifdef VXC_WATER_PROFILE
+                    if (overflowed) {
+                        ++waterCAProfile().hydroOverflowed;
+                        waterCAProfile().hydroPopsOverflowed += popsThisComponent;
                     }
+#endif
 
                     // Too big to safely handle this tick (deferred, not
                     // truncated-and-wrong -- see header comment), or a
@@ -832,7 +1177,11 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
                     // nothing reachable) that's already its own fixed
                     // point: nothing to write. (Always has water: the seed
                     // itself does, unconditionally.)
-                    if (overflowed || cells.size() < 2) continue;
+                    if (overflowed || cells.size() < 2) {
+                        VXC_WP_ADD(hydroLevelNs, tHLevel);
+                        VXC_WP_SET(tHScan);
+                        continue;
+                    }
 
                     // Level computation (header comment step 2): bottom-up
                     // by z, fixed (x,y)-ascending tie-break within a layer.
@@ -872,8 +1221,13 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
                         }
                         idx = j;
                     }
+                    VXC_WP_ADD(hydroLevelNs, tHLevel);
+                    VXC_WP_SET(tHScan);
                 }
     }
+    VXC_WP_ADD(hydroScanNs, tHScan);
+    VXC_WP_T0(tHApply);
+    VXC_WP_INC(hydroWrites, pendingWrites.size());
 
     // Apply (header comment step 3): absolute targets through the normal
     // accounted-write path -- ledger, homogeneous-empty collapse, and
@@ -882,6 +1236,7 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
     // current fill is a no-op there. Deferred to here (see pendingWrites)
     // so the brick cache above never observes a mid-pass mutation of water_.
     for (const auto& [vk, target] : pendingWrites) setFillAccounted(vk.x, vk.y, vk.z, target, &changed);
+    VXC_WP_ADD(hydroApplyNs, tHApply);
 }
 
 void WaterCA::step() { stepWithOrder(activeSetSnapshot()); }
@@ -891,6 +1246,7 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
     // duplicates) of the intended active set; correctness below depends
     // only on the SET of keys, never on this vector's order (see header
     // "Tick rules v1" and waterca_twophase_order_independent_and_deterministic).
+    VXC_WP_T0(tSetup);
     std::sort(order.begin(), order.end(), BrickKeyLess{});
     order.erase(std::unique(order.begin(), order.end(),
                            [](const BrickKey& a, const BrickKey& b) { return a == b; }),
@@ -914,6 +1270,11 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
     for (const BrickKey& k : order)
         for (int i = 0; i < 5; ++i)
             touched.insert(BrickKey{k.x + kTargetDx[i], k.y + kTargetDy[i], k.z + kTargetDz[i]});
+    VXC_WP_ADD(setupOrderNs, tSetup);
+    VXC_WP_INC(ticks, 1);
+    VXC_WP_INC(orderBricks, order.size());
+    VXC_WP_INC(touchedBricks, touched.size());
+    VXC_WP_T0(tSnap);
 
     // Snapshot every touched cell's TRUE tick-start fill before either
     // color round runs. Round 0 and round 1 each commit real writes to
@@ -938,10 +1299,12 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
                         vals[static_cast<size_t>(WaterBrick8::cellIndex(x, y, z))] = b->get(x, y, z);
         initialFill.emplace(t, vals);
     }
+    VXC_WP_ADD(setupSnapshotNs, tSnap);
+    VXC_WP_T0(tScratch);
 
     // Scratch/inflow storage is allocated ONCE per tick and REUSED across
     // all 8 color rounds below (only zeroed between rounds via
-    // resetForRound()/fill(0), never reallocated or re-inserted) -- building
+    // resetForRound(), never reallocated or re-inserted) -- building
     // a fresh ~thousands-of-entries hashmap of heap-backed buffers 8 times
     // per tick was the dominant cost of an earlier version of this function
     // (measured: allocation/rehashing churn, not the per-cell math, was
@@ -956,14 +1319,14 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
         return it == scratchMap.end() ? nullptr : &it->second;
     };
 
-    std::unordered_map<BrickKey, std::array<int32_t, kCells>, BrickKeyHash> inflowMap;
+    std::unordered_map<BrickKey, InflowBuf, BrickKeyHash> inflowMap;
     inflowMap.reserve(touched.size() * 2);
     for (const BrickKey& t : touched) inflowMap[t];
 
     // Per-touched-brick GATHER/FINALIZE pointer cache, resolved ONCE per
     // tick and reused by all 8 rounds below -- the other half of "stop
-    // re-resolving round-INVARIANT lookups every round" (see solidCache
-    // just below for the round-VARYING case this does NOT apply to).
+    // re-resolving round-INVARIANT lookups every round" (activeCache below
+    // is the Phase READ counterpart).
     // `selfScratch`/`inboundScratch` answer "does brick K have scratch
     // storage" (K in `order`?) and "which FlowScratch object is it" --
     // both fixed by `order`'s CONTENTS, decided before round 0 ever runs
@@ -987,7 +1350,7 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
         BrickKey key;
         FlowScratch* selfScratch;
         std::array<FlowScratch*, kSlots> inboundScratch; // indexed like kInbound
-        std::array<int32_t, kCells>* inflow;
+        InflowBuf* inflow;
     };
     std::vector<TouchedBrickCache> touchedCache;
     touchedCache.reserve(touched.size());
@@ -1003,41 +1366,81 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
         tc.inflow = &inflowMap.at(t);
         touchedCache.push_back(tc);
     }
+    VXC_WP_ADD(setupScratchNs, tScratch);
 
-    // Per-tick memoization of solid_: solid_ is a PURE function of
-    // (vx,vy,vz) that never changes within one stepWithOrder() call
-    // (terrain isn't touched by water flow, and every existing WaterCA
-    // contract -- determinism, order-independence -- already requires
-    // callers' SolidFn be a deterministic, side-effect-free query, so
-    // reusing an answer instead of re-asking changes nothing observable).
-    // Measured (profiling this pass): a REAL terrain-backed SolidFn (the
-    // Amplifier's bilinear-elevation + multi-octave-noise column query,
-    // recomputed from scratch every call with no memoization of its own)
-    // costs on the order of 1us/call and is the dominant cost of the
-    // whole engine at pour scale -- not the per-cell enumeration this
-    // pass otherwise optimizes. And solid_ queries DO legitimately repeat
-    // the same voxel within a tick: up to 5 different active neighbors of
-    // one solid/air cell can each independently ask "is THIS voxel solid"
-    // as part of their own gravity/lateral check (the cell above asking
-    // via gravity, and up to 4 lateral neighbors each asking via their
-    // own lateral check) -- a real, structural source of duplicate
-    // queries this cache collapses to one real call. Scoped to exactly
-    // ONE stepWithOrder() call (built fresh here, discarded at return,
-    // same lifetime as scratchMap/inflowMap above) -- never carried
-    // across ticks, so a caller whose SolidFn reflects live-edited
-    // terrain (digging mid-game) is unaffected: the cache can only ever
-    // go stale WITHIN a tick, and solid_ is already required not to
-    // change within one.
-    std::unordered_map<VoxelKey, MaterialId, VoxelKeyHash> solidCache;
-    solidCache.reserve(order.size() * 16);
-    auto cachedSolid = [this, &solidCache](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
-        const VoxelKey k{vx, vy, vz};
-        const auto it = solidCache.find(k);
-        if (it != solidCache.end()) return it->second;
-        const MaterialId m = solid_(vx, vy, vz);
-        solidCache.emplace(k, m);
-        return m;
+    // Memoization of solid_, per BRICK rather than per voxel.
+    //
+    // solid_ is a PURE function of (vx,vy,vz) that never changes within one
+    // stepWithOrder() call (terrain isn't touched by water flow, and every
+    // existing WaterCA contract -- determinism, order-independence -- already
+    // requires callers' SolidFn be a deterministic, side-effect-free query, so
+    // reusing an answer instead of re-asking changes nothing observable). And
+    // solid_ queries DO legitimately repeat the same voxel: up to 5 different
+    // active neighbors of one solid/air cell can each independently ask "is
+    // THIS voxel solid" as part of their own gravity/lateral check (the cell
+    // above asking via gravity, and up to 4 lateral neighbors each asking via
+    // their own lateral check), and every one of the 8 rounds re-asks the same
+    // questions the previous rounds already answered.
+    //
+    // WHAT CHANGED HERE AND WHY. This used to be an
+    // unordered_map<VoxelKey,MaterialId> rebuilt every tick: correct, but it
+    // paid three splitmix64 rounds plus a hash-table walk for EVERY solidity
+    // question (measured: 134,500 probes/tick on the 441-column pour at ~2150
+    // active bricks), and -- the expensive half -- it was thrown away at the
+    // end of every tick, so the 84,279 probes/tick that reached the real
+    // ~1us terrain callback reached it AGAIN next tick over terrain that had
+    // not changed. Both problems go away by memoizing into the same dense
+    // per-brick SolidMaskBrick masks Phase C already uses:
+    //   * the masks for an active brick's whole 6-brick neighbourhood are
+    //     resolved ONCE PER TICK (below), so an in-loop solidity question is a
+    //     pointer already in hand plus a shift-and-test -- no hashing at all;
+    //   * when the caller has opted into the cross-tick memo
+    //     (setSolidCacheEnabled) the masks are the PERSISTENT ones, so the
+    //     terrain callback is consulted once per (voxel, terrain edit) instead
+    //     of once per voxel per tick.
+    // With the memo OFF the masks live in `localSolid` and are discarded at
+    // return, exactly like the old per-voxel map -- same number of real
+    // solid_ calls as before, just without the per-query hashing. Either way
+    // this is pure memoization of a pure query: same questions, same answers,
+    // byte-identical results.
+    //
+    // Node-based unordered_map: SolidMaskBrick references stay valid across
+    // every later insert (only iterators are invalidated), so the pointers
+    // cached per active brick below never dangle even as the store grows
+    // during the rounds.
+    std::unordered_map<BrickKey, SolidMaskBrick, BrickKeyHash> localSolid;
+    std::unordered_map<BrickKey, SolidMaskBrick, BrickKeyHash>& solidStore =
+        solidCacheEnabled_ ? solidCache_ : localSolid;
+    if (!solidCacheEnabled_) localSolid.reserve(touched.size() * 2);
+    auto solidMiss = [this](int64_t vx, int64_t vy, int64_t vz) -> bool {
+        VXC_WP_INC(readSolidMisses, 1);
+        return solid_(vx, vy, vz) != MAT_AIR;
     };
+
+    // Per-ACTIVE-brick round-invariant cache, the Phase READ counterpart of
+    // touchedCache above: the brick's own FlowScratch pointer (so the READ
+    // loop stops re-hashing scratchMap twice per brick per round) and its
+    // 6-brick solidity-mask neighbourhood. Both are fixed by `order`'s
+    // CONTENTS for the whole tick.
+    struct ActiveBrickCache {
+        BrickKey key;
+        FlowScratch* scratch;
+        BrickSolidMasks masks;
+    };
+    std::vector<ActiveBrickCache> activeCache;
+    activeCache.reserve(order.size());
+    for (const BrickKey& k : order) {
+        ActiveBrickCache ac;
+        ac.key = k;
+        ac.scratch = &scratchMap[k];
+        ac.masks.self = &solidStore[k];
+        ac.masks.below = &solidStore[BrickKey{k.x, k.y, k.z - 1}];
+        ac.masks.lateral[0] = &solidStore[BrickKey{k.x + 1, k.y, k.z}];
+        ac.masks.lateral[1] = &solidStore[BrickKey{k.x - 1, k.y, k.z}];
+        ac.masks.lateral[2] = &solidStore[BrickKey{k.x, k.y + 1, k.z}];
+        ac.masks.lateral[3] = &solidStore[BrickKey{k.x, k.y - 1, k.z}];
+        activeCache.push_back(ac);
+    }
 
     // Eight colored rounds per tick (see colorOf): round c moves color-c
     // cells' outflow using data AS UPDATED BY EVERY EARLIER ROUND this tick
@@ -1054,18 +1457,40 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
     for (int color = 0; color < 8; ++color) {
         // Phase READ: reset then refill every active brick's scratch (O(1)
         // lookup by key regardless of iteration order -- no allocation).
-        for (const BrickKey& k : order) scratchMap[k].resetForRound();
-        for (const BrickKey& k : order) computeDesiredForBrick(k, water_, cachedSolid, color, scratchMap[k]);
+        VXC_WP_T0(tReset);
+        for (const ActiveBrickCache& ac : activeCache) ac.scratch->resetForRound();
+        VXC_WP_ADD(readResetNs, tReset);
+        VXC_WP_T0(tRead);
+        for (const ActiveBrickCache& ac : activeCache)
+            computeDesiredForBrick(ac.key, water_, ac.masks, solidMiss, color, *ac.scratch);
+        VXC_WP_ADD(readNs, tRead);
 
         // Phase APPLY / GATHER: visit every touched brick exactly once.
         // Order over `touched` (a sorted std::set) never affects the
         // outcome -- each (source cell, slot) is written by exactly one
         // touched brick, a structural bijection (see header), so there is
         // no write race.
+#ifdef VXC_WATER_PROFILE
+        // Profile builds SPLIT this loop in two so the per-brick inflow
+        // zero-fill can be timed apart from the gather itself. The split is
+        // output-identical (gatherInflowForBrick only ever writes its OWN
+        // brick's inflow and the SOURCE bricks' `accepted`, never another
+        // brick's inflow), but it does change the memory access pattern, so
+        // gatherZeroNs+gatherNs is only approximately the fused loop's cost.
+        // The shipped (non-profile) build keeps the loop fused.
+        VXC_WP_T0(tZero);
+        for (const TouchedBrickCache& tc : touchedCache) tc.inflow->resetForRound();
+        VXC_WP_ADD(gatherZeroNs, tZero);
+        VXC_WP_T0(tGather);
+        for (const TouchedBrickCache& tc : touchedCache)
+            gatherInflowForBrick(tc.key, water_, color, tc.selfScratch, tc.inboundScratch, *tc.inflow);
+        VXC_WP_ADD(gatherNs, tGather);
+#else
         for (const TouchedBrickCache& tc : touchedCache) {
-            tc.inflow->fill(0);
+            tc.inflow->resetForRound();
             gatherInflowForBrick(tc.key, water_, color, tc.selfScratch, tc.inboundScratch, *tc.inflow);
         }
+#endif
 
         // Phase APPLY / FINALIZE: every active brick's `accepted` is now
         // fully populated (every one of its edges' targets has been
@@ -1077,38 +1502,70 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
         // results.
         //
         // Only 4 of the 8 colors can possibly have a nonzero delta this
-        // round: `color` itself (outflow only -- `scratch->accepted` is
-        // only ever written at a color-`color` source cell, per
-        // computeDesiredForBrick/gatherInflowForBrick above) and
-        // `color^1`/`color^2`/`color^4` (inflow only -- see
-        // gatherInflowForBrick's comment; those 3 are exactly the colors
-        // `outInflow` can be nonzero at). No cell is ever in both groups
-        // (color != color^{1,2,4} always), so there's no double-visit risk
-        // and every cell outside this 4-color union is skipped exactly
-        // where it would have hit `delta == 0` and `continue`d anyway.
-        const int finalizeColors[4] = {color, color ^ 1, color ^ 2, color ^ 4};
+        // round, and each of the 4 can only have ONE SIDE of it:
+        //   * `color` itself: OUTFLOW only. `scratch->accepted` is written
+        //     exclusively at color-`color` source cells (per
+        //     computeDesiredForBrick/gatherInflowForBrick), and a color-`color`
+        //     cell can never receive this round, because every inbound edge
+        //     comes from a cell one axis-step away, whose color therefore
+        //     differs from `color` -- so its inflow is structurally 0.
+        //   * `color^1`/`color^2`/`color^4`: INFLOW only, symmetrically --
+        //     these are exactly the 3 colors gatherInflowForBrick can write a
+        //     nonzero inflow at, and none of them is `color`, so none of them
+        //     has any `accepted` to spend.
+        // So the old "sum 5 accepted slots then subtract from inflow" per cell
+        // over all 4 groups was, for 3 of the 4 groups, summing 5 known-zero
+        // bytes; and for the 4th, reading a known-zero inflow. Splitting the
+        // loop in two drops both. No cell is ever in both groups (color !=
+        // color^{1,2,4} always), so every cell is still visited exactly once,
+        // in the same relative order, computing the same delta.
+        VXC_WP_T0(tFinal);
         for (const TouchedBrickCache& tc : touchedCache) {
-            const std::array<int32_t, kCells>& inflow = *tc.inflow;
+            const InflowBuf& inflow = *tc.inflow;
             const FlowScratch* scratch = tc.selfScratch;
             const BrickKey& t = tc.key;
-            for (int fc : finalizeColors)
-                for (const ColorCell& cc : kColorCells[static_cast<size_t>(fc)]) {
-                    const int x = cc.x, y = cc.y, z = cc.z;
-                    const int ci = WaterBrick8::cellIndex(x, y, z);
+            const int64_t bx = int64_t(t.x) * kEdge, by = int64_t(t.y) * kEdge, bz = int64_t(t.z) * kEdge;
+
+            // Outflow side: this round's own color, only if this brick is
+            // active (a touched-but-inactive brick has no scratch, hence no
+            // outflow at all, hence delta 0 for every cell of this color) and
+            // actually had something to send (see FlowScratch::anyDesired --
+            // `accepted` is a subset of `desired`, so no desired means the
+            // whole 64-cell scan below would find nothing but zeroes).
+            if (scratch && scratch->anyDesired) {
+                size_t cidx = 0;
+                for (const ColorCell& cc : kColorCells[static_cast<size_t>(color)]) {
                     int outflow = 0;
-                    if (scratch)
-                        for (int s = 0; s < kSlots; ++s) outflow += scratch->accepted[static_cast<size_t>(ci * kSlots + s)];
-                    const int32_t delta = inflow[static_cast<size_t>(ci)] - outflow;
-                    if (delta == 0) continue;
-                    const int64_t vx = int64_t(t.x) * kEdge + x;
-                    const int64_t vy = int64_t(t.y) * kEdge + y;
-                    const int64_t vz = int64_t(t.z) * kEdge + z;
+                    for (int s = 0; s < kSlots; ++s) outflow += scratch->accepted[cidx * kSlots + static_cast<size_t>(s)];
+                    ++cidx;
+                    if (outflow == 0) continue;
+                    const int64_t vx = bx + cc.x, vy = by + cc.y, vz = bz + cc.z;
                     const uint8_t fillStart = getFill(vx, vy, vz);
-                    const int newFill = int(fillStart) + delta;
-                    setFillAccounted(vx, vy, vz, static_cast<uint8_t>(newFill), nullptr);
+                    setFillAccounted(vx, vy, vz, static_cast<uint8_t>(int(fillStart) - outflow), nullptr);
                 }
+            }
+
+            // Inflow side: the 3 flip colors, in gatherInflowForBrick's own
+            // fixed group order (z-flip, x-flip, y-flip), which is the order
+            // `inflow` is laid out in. Skipped wholesale when GATHER admitted
+            // nothing into this brick this round (InflowBuf::any).
+            if (!inflow.any) continue;
+            for (int gIdx = 0; gIdx < kInflowGroups; ++gIdx) {
+                const size_t outBase = static_cast<size_t>(gIdx) * kColorCellsPerBrick;
+                size_t cidx = 0;
+                for (const ColorCell& cc : kColorCells[static_cast<size_t>(inflowGroupColor(color, gIdx))]) {
+                    const int in = inflow.v[outBase + cidx];
+                    ++cidx;
+                    if (in == 0) continue;
+                    const int64_t vx = bx + cc.x, vy = by + cc.y, vz = bz + cc.z;
+                    const uint8_t fillStart = getFill(vx, vy, vz);
+                    setFillAccounted(vx, vy, vz, static_cast<uint8_t>(int(fillStart) + in), nullptr);
+                }
+            }
         }
+        VXC_WP_ADD(finalizeNs, tFinal);
     }
+    VXC_WP_T0(tDiff);
 
     // Real "changed" set: a touched brick is active next tick iff its
     // content actually differs from its TRUE tick-start snapshot (not from
@@ -1125,11 +1582,15 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
         }
         if (differs) changed.insert(t);
     }
+    VXC_WP_ADD(diffNs, tDiff);
 
     // Phase C uses the raw solid_ callback directly (NOT cachedSolid): its
     // flood queries each air voxel at most once, so the memo cache would be
     // pure overhead -- see hydrostaticPass's declaration comment in waterca.h.
+    VXC_WP_T0(tHydro);
     hydrostaticPass(touched, changed);
+    VXC_WP_ADD(hydroTotalNs, tHydro);
+    VXC_WP_T0(tActive);
 
     // Next active set = changed bricks UNION every one of their 6
     // face-neighbors (all 6, not just the 5 "outgoing target" directions
@@ -1156,6 +1617,7 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
             nextActive.insert(BrickKey{c.x + kAllDx[i], c.y + kAllDy[i], c.z + kAllDz[i]});
 
     active_ = std::move(nextActive);
+    VXC_WP_ADD(activeNs, tActive);
 }
 
 void WaterCA::digest(Digest& d) const {

@@ -13,7 +13,69 @@ constexpr uint64_t splitmix64(uint64_t z) {
     return z ^ (z >> 31);
 }
 
-// Channel ids domain-separate hash uses. Append only — never renumber.
+// ============================================================================
+// CHANNEL ID REGISTRY — the single authoritative allocation table.
+// ============================================================================
+// The channel is hash2/hash3's ONLY domain separator. Two subsystems that
+// hash the same (seed, x, y[, z]) under the same channel are not "similar" —
+// they are literally the same noise function, differing only because they
+// happen to be evaluated at different coordinate magnitudes. That is luck,
+// not design, and it turns into a visible correlation the moment someone
+// changes a lattice size. This is not hypothetical: CH_CAVE_NODE/CH_CAVE_EDGE
+// (caves.h) shipped reusing 18/19, the same ids CH_ECOTONE_TEMP/CH_ECOTONE_
+// PRECIP already had here, for an entire worldgen version before anyone
+// noticed (see HISTORY below).
+//
+// hash.h cannot list every id as an enumerator: caves.h, caverns.h,
+// detail_rill.h, detail_bedding.h and density3.h all `#include "hash.h"`, so
+// the dependency only runs one way and their symbols cannot appear in this
+// file's own enum. This table is therefore the human-readable ledger — the
+// place to check before picking a new id — and voxelcore/hash_channel_
+// registry.h is the machine-checked one: a constexpr uniqueness scan over the
+// REAL symbols (downstream of all of them, where every one is visible at
+// once) wired into a static_assert, so a future collision fails the build
+// instead of waiting to be read about. Keep this table and that file in sync;
+// if they disagree, the static_assert is the one that is right.
+//
+//   id(s)    owner              symbol
+//   -------  -----------------  --------------------------------------------
+//   0..15    hash.h             CH_DETAIL_OCTAVE_BASE + octave index
+//   16       hash.h             CH_TOPSOIL_JITTER
+//   17       hash.h             CH_BEDROCK_JITTER
+//   18       hash.h             CH_ECOTONE_TEMP    (v9 biome-boundary dither)
+//   19       hash.h             CH_ECOTONE_PRECIP  (v9 biome-boundary dither)
+//   20       caves.h            CH_CAVE_RADIUS
+//   21       caves.h            CH_CAVE_SHAFT
+//   22       caverns.h          CH_CAVERN_SITE
+//   23       caverns.h          CH_CAVERN_ROUGH
+//   24       caves.h            CH_CREVICE
+//   25       caverns.h          CH_CAVERN_FLOOD
+//   26       detail_rill.h      CH_RILL
+//   27       detail_bedding.h   CH_BEDDING_STRIKE
+//   28       detail_bedding.h   CH_BEDDING
+//   29       density3.h         CH_POCKET
+//   30       caves.h            CH_CAVE_NODE       (moved from 18 — see HISTORY)
+//   31       caves.h            CH_CAVE_EDGE       (moved from 19 — see HISTORY)
+//   32..47   hash.h             CH_SYNTH_TILE_BASE + synthetic dev-tile index
+//   48..     FREE
+//
+// HISTORY. CH_CAVE_NODE and CH_CAVE_EDGE originally reused ids 18 and 19 —
+// the exact ids CH_ECOTONE_TEMP and CH_ECOTONE_PRECIP already occupied — a
+// genuine double allocation rather than a naming clash. It was moved here,
+// to 30 and 31 (the two ids density3.h's own channel-note survey had already
+// flagged as the free ones below the synthetic-tile reservation), so the
+// ecotone dither and the cave lattice draw from provably independent fields
+// instead of the same one. This changes the output of every hash2/hash3 call
+// with channel CH_CAVE_NODE or CH_CAVE_EDGE — see vxc_bench --radius 128
+// --digest — but was done WITHOUT a kWorldGenVersion bump at the explicit
+// request of the id's owner, who batches version bumps and goldens
+// separately. CH_ECOTONE_TEMP/PRECIP were left at 18/19 rather than moved:
+// they are the ids hash.h's own enum has always had, and caves.h's own
+// comment already deferred to hash.h as the numbering authority.
+// ============================================================================
+
+// Channel ids domain-separate hash uses. Append only — never renumber a
+// shipped id without a kWorldGenVersion bump (see the registry above).
 enum HashChannel : uint32_t {
     CH_DETAIL_OCTAVE_BASE = 0, // +octave index, reserve 0..15
     CH_TOPSOIL_JITTER = 16,

@@ -218,11 +218,19 @@ static_assert(kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm + kCaveRadiusMaxMm +
               "backstop, not the mechanism");
 
 // --- hash channels ----------------------------------------------------------
-// Extends hash.h's HashChannel registry (18..20; 32.. is reserved for
-// synthetic tiles). Declared here rather than in hash.h to keep the cave pass
-// self-contained; APPEND ONLY, never renumber — renumbering is world-breaking.
-inline constexpr uint32_t CH_CAVE_NODE = 18;   // node jitter (position + depth)
-inline constexpr uint32_t CH_CAVE_EDGE = 19;   // non-backbone edge gate
+// Extends hash.h's HashChannel registry — see the authoritative allocation
+// table at the top of hash.h (and its machine-checked twin,
+// voxelcore/hash_channel_registry.h) before adding or renumbering anything
+// here. Declared here rather than in hash.h to keep the cave pass
+// self-contained; APPEND ONLY, never renumber a shipped id without a
+// kWorldGenVersion bump.
+//
+// CH_CAVE_NODE/CH_CAVE_EDGE live at 30/31, not 18/19: they originally reused
+// 18/19, which collided with hash.h's own CH_ECOTONE_TEMP/CH_ECOTONE_PRECIP
+// (same two ids, two different features, a real double allocation — not
+// merely a name clash). Moved to the free ids hash.h's table identifies.
+inline constexpr uint32_t CH_CAVE_NODE = 30;   // node jitter (position + depth)
+inline constexpr uint32_t CH_CAVE_EDGE = 31;   // non-backbone edge gate
 inline constexpr uint32_t CH_CAVE_RADIUS = 20; // per-edge tube radius
 inline constexpr uint32_t CH_CAVE_SHAFT = 21;  // sinkhole gate + shaft radius
 // 22/23/25 belong to voxelcore/caverns.h (CH_CAVERN_SITE/_ROUGH/_FLOOD).

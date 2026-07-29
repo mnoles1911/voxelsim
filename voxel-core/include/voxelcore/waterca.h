@@ -361,6 +361,74 @@ namespace vxc {
 // that divergence is what the version constant exists to signal.
 inline constexpr uint32_t kWaterCAVersion = 4;
 
+#ifdef VXC_WATER_PROFILE
+// --- Opt-in per-phase step() accounting (diagnostic; OFF by default) --------
+//
+// WHY THIS EXISTS. Every optimization already in this file was justified by a
+// measured split ("profiling put the per-cell hashing, not the writes, as the
+// dominant cost"), but none of those splits was ever REPRODUCIBLE from the
+// repo: they came from ad-hoc, thrown-away instrumentation, so the next person
+// to touch this code has to re-derive them from scratch and is one wrong guess
+// away from optimizing a phase that is already 2% of the tick. These counters
+// are that instrumentation, kept.
+//
+// WHY IT IS A BUILD OPTION AND NOT ALWAYS ON. Same reasoning as
+// VXC_MEMO_STATS (voxel-core/CMakeLists.txt): the point of the counters is to
+// measure the code, not the instrument. Per-round timers add ~40 steady_clock
+// reads per tick (negligible against a 100ms+ tick) but the hydrostatic
+// per-component timers add two reads PER COMPONENT, which on a scenario with
+// many tiny components is not free — `hydroComponents` is reported so any
+// reader can size that overhead themselves. Default OFF means the shipped
+// library and every timing number quoted in docs/status.md are taken on code
+// with zero instrumentation in it.
+//
+// NOT part of the determinism contract: these are wall-clock counters, read by
+// nothing that feeds a digest, and the sim's outputs are byte-identical with
+// the option on or off (the float-ban is respected — every field is an integer
+// nanosecond/event count, and the only division into "ms" happens in the bench
+// reporter, exactly like every other bench timing).
+struct WaterCAProfile {
+    uint64_t ticks = 0;
+    // Phase READ/APPLY setup (once per tick, before round 0).
+    uint64_t setupOrderNs = 0;    // sort/dedup `order` + build `touched`
+    uint64_t setupSnapshotNs = 0; // `initialFill` tick-start snapshot
+    uint64_t setupScratchNs = 0;  // scratchMap + inflowMap + touchedCache
+    // The 8 colored rounds (summed over all 8).
+    uint64_t readResetNs = 0;  // FlowScratch::resetForRound
+    uint64_t readNs = 0;       // computeDesiredForBrick
+    uint64_t gatherZeroNs = 0; // per-brick InflowBuf::resetForRound
+    uint64_t gatherNs = 0;     // gatherInflowForBrick
+    uint64_t finalizeNs = 0;   // net + setFillAccounted
+    // Post-round bookkeeping.
+    uint64_t diffNs = 0;   // `changed` net-diff against initialFill
+    uint64_t activeNs = 0; // next active set (changed + 6-neighbors)
+    // Phase C.
+    uint64_t hydroTotalNs = 0;
+    uint64_t hydroSetupNs = 0; // cache construction/reserve
+    uint64_t hydroScanNs = 0;  // seed scan, excluding flood/level below
+    uint64_t hydroFloodNs = 0; // the flood-fill traversal itself
+    uint64_t hydroLevelNs = 0; // sort + bottom-up level allocation + emit
+    uint64_t hydroApplyNs = 0; // deferred setFillAccounted writes
+    // Event counts (what the timings are per).
+    uint64_t orderBricks = 0;
+    uint64_t touchedBricks = 0;
+    uint64_t readSolidLookups = 0; // Phase READ solidity questions (mask tests)
+    uint64_t readSolidMisses = 0;  // ...of which reached the real solid_
+    uint64_t hydroComponents = 0;
+    uint64_t hydroOverflowed = 0;     // ...of which blew kMaxHydrostaticComponentCells
+    uint64_t hydroPopsOverflowed = 0; // pops spent inside a component that overflowed
+    uint64_t hydroPops = 0;      // cells expanded by the flood
+    uint64_t hydroPopsAir = 0;   // ...of which had fill == 0
+    uint64_t hydroSolidCalls = 0; // real solid_ calls from the flood
+    uint64_t hydroMemoHits = 0;   // solidity answers served by the memo
+    uint64_t hydroWrites = 0;     // pendingWrites actually applied
+};
+
+// Process-wide accumulator (single-threaded core; no atomics needed).
+WaterCAProfile& waterCAProfile();
+void resetWaterCAProfile();
+#endif
+
 // Dense 8^3 fill-fraction brick. 0 = empty, 255 = full. Always brick edge
 // 8 (not templated like Brick<B> — water ticks at a fixed cell size).
 class WaterBrick8 {
@@ -371,6 +439,11 @@ public:
     static constexpr int cellIndex(int x, int y, int z) { return x + kEdge * (y + kEdge * z); }
 
     uint8_t get(int x, int y, int z) const { return fill_[cellIndex(x, y, z)]; }
+
+    // Same read, by an already-computed cellIndex. For traversals (the
+    // hydrostatic flood) that walk cell indices arithmetically and would
+    // otherwise have to unpack (x,y,z) only for get() to repack them.
+    uint8_t cell(int ci) const { return fill_[ci]; }
 
     void set(int x, int y, int z, uint8_t v) {
         uint8_t& cell = fill_[cellIndex(x, y, z)];
@@ -432,6 +505,23 @@ inline BrickKey waterKeyForVoxel(int64_t vx, int64_t vy, int64_t vz) {
                     static_cast<int32_t>(floorDiv(vy, WaterBrick8::kEdge)),
                     static_cast<int32_t>(floorDiv(vz, WaterBrick8::kEdge))};
 }
+
+// Per-brick memo of a SolidFn: 512 "have I asked?" bits + 512 "was it solid?"
+// bits, in WaterBrick8::cellIndex order (so mask word `ci>>6` is exactly
+// z-layer `ci>>6` — cellIndex is x + 8*y + 64*z). Dense masks rather than a
+// hashed per-voxel map because both consumers (Phase READ's per-brick
+// neighborhood, hydrostaticPass's BrickCell) already resolve each brick
+// exactly once, so a pointer to one of these turns every subsequent solidity
+// question on that brick into a shift-and-test with no hashing at all.
+//
+// At namespace scope rather than nested in WaterCA only so the tick's
+// free-function helpers in waterca.cpp can name it; the CACHE itself
+// (WaterCA::solidCache_) stays private, and nothing outside the .cpp
+// constructs one.
+struct SolidMaskBrick {
+    std::array<uint64_t, 8> known{};
+    std::array<uint64_t, 8> solid{};
+};
 
 class WaterCA {
 public:
@@ -659,6 +749,30 @@ public:
     // scratch every tick even though terrain almost never changes. This cache
     // collapses that repeat cost to a bit test.
     //
+    // WHAT USES IT. Both terrain-reading phases of a tick, not just Phase C:
+    //   * Phase READ (computeDesiredForBrick's gravity + 4 lateral solidity
+    //     checks), via the per-brick masks stepWithOrder resolves once per
+    //     tick for every active brick and its 5 flow-target neighbours; and
+    //   * Phase C's hydrostatic flood, via hydrostaticPass's BrickCell.
+    // Phase READ was measured (waterca_bench, 441-column pour, ~2150 active
+    // bricks) making 134,500 solidity lookups per tick of which 84,279 reached
+    // the real terrain callback — a cost the memo removes entirely from the
+    // second tick on, and one the cross-tick memo previously did nothing about
+    // because Phase READ used only a per-TICK map that was thrown away every
+    // tick. When the memo is OFF, Phase READ still memoizes into an identical
+    // set of masks held for one tick only, so the number of real `solid_` calls
+    // is unchanged from the old per-tick map — the masks just replace ~134K
+    // per-voxel hash probes per tick with a pointer already resolved per brick.
+    //
+    // The consequence for the caller's obligation below is that a MISSED
+    // invalidation is now visible to the flow rules as well as to the flood.
+    // That is a blast-radius statement, not a new obligation: the contract has
+    // always been "tell me about every change", and a caller that honours it
+    // sees byte-identical results either way (proved in-suite by
+    // waterca_solid_cache_golden_digests_unchanged, which re-derives BOTH
+    // pinned goldens with the memo enabled and therefore now exercises the
+    // memo through Phase READ too).
+    //
     // THE CALLER'S OBLIGATION (the whole safety contract, read this).
     // Enabling the cache asserts: "`solid_` is a pure function of position,
     // and I will tell WaterCA about EVERY change to it before the next
@@ -690,17 +804,6 @@ public:
     size_t solidCacheBrickCount() const { return solidCache_.size(); }
 
 private:
-    // Per-brick memo of `solid_`: 512 "have I asked?" bits + 512 "was it
-    // solid?" bits, in WaterBrick8::cellIndex order. Dense masks rather than a
-    // hashed per-voxel map because the hydrostatic flood already resolves each
-    // brick exactly once per tick (see hydrostaticPass's BrickCell), so a
-    // pointer to this node turns every subsequent solidity question on that
-    // brick into a shift-and-test with no hashing at all.
-    struct SolidMaskBrick {
-        std::array<uint64_t, 8> known{};
-        std::array<uint64_t, 8> solid{};
-    };
-
     // Hard bound on memo memory (128B of masks + node overhead per brick, so
     // ~16MB of masks at this cap). Overflowing simply CLEARS the whole memo —
     // safe by construction, since a memo miss only ever costs a re-query, and
@@ -721,20 +824,15 @@ private:
 
     void activate(const BrickKey& k) { active_.insert(k); }
 
-    // Phase C — see header comment "Phase C — HYDROSTATIC". Unlike Phase
-    // READ/APPLY (which is handed stepWithOrder's per-tick memoizing
-    // `cachedSolid` lambda, because its 5-neighbor gathers legitimately ask
-    // the SAME voxel's solidity several times per round so memoization pays
-    // off), the hydrostatic flood queries each air voxel at most ONCE per
-    // tick — the shared `visited` mask is checked before any solidity query,
-    // so a voxel is never re-examined — so routing those queries through the
-    // memo cache only adds a per-call VoxelKey hash plus an insert into a
-    // map that balloons to the full air-shell size (with the rehashing that
-    // implies), for ZERO dedup benefit. It therefore calls the raw `solid_`
-    // callback directly (measured: ~1.8x faster on the large-pour bench than
-    // going through the cache, byte-identical since memoization never changes
-    // a deterministic query's answer). No longer templated: with no
-    // cachedSolid lambda to inline it is a plain out-of-line member.
+    // Phase C — see header comment "Phase C — HYDROSTATIC". When the
+    // cross-tick memo is OFF this calls the raw `solid_` callback directly:
+    // the flood queries each air voxel at most ONCE per tick (the shared
+    // `visited` mask is checked before any solidity query, so a voxel is never
+    // re-examined), so a per-TICK memo in front of it would be pure overhead —
+    // a hash and an insert into a map that balloons to the full air-shell
+    // size, for zero dedup benefit (measured: ~1.8x faster without it). When
+    // the memo is ON it goes through the per-brick masks instead, which is
+    // where the real win is: the repeat is across TICKS, not within one.
     void hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
                          std::set<BrickKey, BrickKeyLess>& changed);
 
