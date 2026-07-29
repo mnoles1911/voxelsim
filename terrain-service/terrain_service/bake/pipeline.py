@@ -356,9 +356,14 @@ class BakeConstants:
     #:     no-uplift solve grades every big catchment toward a peneplain,
     #:     which digs 12 m trenches through a till plain;
     #:   * with the regional-energy scale (``profile_regional_s_ref``) the
-    #:     trade improves -- plains mean slope +5% (K_dt 1.5) to +35%
-    #:     (K_dt 4.5) while alpine theta reaches ~0.146 -- but NO measured
-    #:     configuration meets the acceptance bars on every class at once.
+    #:     trade improves, production-measured on all three exemplars at
+    #:     K_dt 4.5: alpine theta 0.146 (r^2 0.97, real 0.177), alpine
+    #:     valley+pit 0.0070 -> 0.0166 (real 0.023), plains valley+pit
+    #:     0.0103 -> 0.0338 (real 0.034-0.038, IN range), rolling theta
+    #:     0.048 -> 0.070 with valley+pit doubled -- at plains mean slope
+    #:     1.82 -> 2.78 deg at 1.875 m (Illinois reads 2.13: a 16% deficit
+    #:     became a 30% excess) -- but NO measured configuration meets the
+    #:     acceptance bars on every class at once.
     #:
     #: Flipping this to "profile" is one constant and rolls the world; do it
     #: with the scorecard above in hand, not because the knob exists.
@@ -368,8 +373,12 @@ class BakeConstants:
     #: theta 0.084 on the alpine exemplar window -- barely moved); large
     #: values run every channel to the steady-state graded profile (15
     #: measured theta with a broken fit and, uncapped, 679 m of incision).
-    #: 4.5 with the regional scale below is the measured compromise: alpine
-    #: theta 0.146 (r^2 0.90) at +35% plains mean slope.
+    #: 4.5 with the regional scale below is the measured compromise --
+    #: production-confirmed alpine theta 0.146 (r^2 0.97). On the steep
+    #: classes the cap, not this constant, then sets the carve: 65-82% of
+    #: channel cells reach ``incision_cap_m`` (against 0.4-2.5% under the
+    #: depth law), so ``max`` incision is fully censored there and the cap is
+    #: the depth knob that matters.
     profile_K_dt: float = 4.5
     #: Regional-slope reference for the profile solve's energy scale:
     #: erodibility is multiplied by ``min(1, S_30m / this)^n`` where S_30m is
@@ -1767,8 +1776,11 @@ join against the terrain's own one-cell step:
     depth        0.599 m          0.600 m      0.999     1.36 m
     profile      0.681 m          0.681 m      1.000     2.36 m
 
-The mean join step is AT the terrain's own gradient in both modes -- the
-profile solve does not add an elevation seam at this apron on this terrain.
+The profile row was measured at K_dt = 1.5 with NO regional scale -- a more
+aggressive carve than the shipped profile constants, so it bounds them from
+above. The mean join step is AT the terrain's own gradient in both modes --
+the profile solve does not add an elevation seam at this apron on this
+terrain.
 Its footprint is in the tail (max step 1.36 -> 2.36 m): where the join cuts a
 carved channel, the two sides can disagree about the graded profile by up to
 the cap. The reference-kernel apron tests deliberately use a LOCAL incision
