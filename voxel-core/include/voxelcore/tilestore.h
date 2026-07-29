@@ -302,6 +302,14 @@ public:
     uint32_t tileSize() const { return tileSize_; }
     const FineTile* findTile(int32_t tx, int32_t ty) const;
 
+    // Drops a previously loaded tile and every one of its decoded blocks,
+    // freeing the memory both hold -- the eviction primitive LRU streaming
+    // (voxelcore/tilestreaming.h) uses to stay under a byte budget. False (no
+    // state change) if (tx, ty) was never loaded. If this was the LAST loaded
+    // tile, tileSize() resets to 0 (matching the pre-any-load state) rather
+    // than pinning the grid to a stride nothing justifies any more.
+    bool unloadTile(int32_t tx, int32_t ty);
+
     // Raw lattice access in fine tile-pixel coords. False (and a counter bump)
     // when the tile isn't loaded or its block fails to decode.
     bool controlPointAt(int64_t px, int64_t py, int16_t& cp);
