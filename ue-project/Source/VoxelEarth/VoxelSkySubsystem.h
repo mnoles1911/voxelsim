@@ -99,9 +99,15 @@ struct FVoxelSkyState
 	double MoonIlluminatedFraction = 0.0; // 0..1, THE ONE to scale moonlight by
 
 	// --- what was pushed into the rig ----------------------------------------
-	float SunIntensity = 0.f;      // UDirectionalLightComponent::Intensity, sun
-	float SunTemperatureK = 0.f;   // colour temperature actually set
-	float MoonIntensity = 0.f;     // 0 when voxel.Sky.MoonEnabled is 0
+	// Sun: UDirectionalLightComponent::Intensity, which is the OUTER-SPACE
+	// illuminance and therefore does NOT vary with altitude and is NEVER zero.
+	// It is not a measure of how bright the frame is -- the SkyAtmosphere applies
+	// the air mass and UE applies N.L on top, so a reader wanting "how much sun
+	// is landing" wants SunAltitudeDeg alongside it. It reads constant across a
+	// whole ladder ON PURPOSE; that is the fix for twilight, not a stuck value.
+	float SunIntensity = 0.f;
+	float SunTemperatureK = 0.f;   // constant 5778 K; the sunset red comes from the atmosphere
+	float MoonIntensity = 0.f;     // peak * illuminated fraction * gates; 0 when MoonEnabled is 0
 	float ExposureBiasEV = 0.f;    // the stop the sky post-process is holding
 	int32 ExposureMode = 0;        // the mode it is holding it in (0/1/2)
 
@@ -237,6 +243,14 @@ namespace VoxelSky
 	VOXELEARTH_API double GetOriginLatitudeDeg();
 	VOXELEARTH_API double GetOriginLongitudeDeg();
 	VOXELEARTH_API bool IsMoonEnabled();
+	// Sun: the OUTER-SPACE illuminance, altitude-independent, and floored strictly
+	// above zero -- a directional light at exactly 0 is removed from FScene and
+	// takes the SkyAtmosphere's twilight with it. Moon: the full-moon peak, an
+	// artistic number ~10 stops above the real 1:400000 lux ratio. Both are
+	// argued at length beside their cvars in the .cpp; do not move either without
+	// reading that.
+	VOXELEARTH_API float GetSunIntensity();
+	VOXELEARTH_API float GetMoonIntensity();
 	VOXELEARTH_API float GetShadowUpdateHz();
 	VOXELEARTH_API int32 GetExposureMode();
 	VOXELEARTH_API float GetExposureBias();

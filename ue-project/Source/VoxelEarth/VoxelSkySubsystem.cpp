@@ -33,6 +33,14 @@ DEFINE_LOG_CATEGORY_STATIC(LogVoxelSky, Log, All);
 
 namespace
 {
+	// Declared up here ONLY so that the cvars below can use them as their
+	// defaults -- one number, not a constant and a literal that drift apart. The
+	// arguments for both values are long and live with the rest of the tuning
+	// constants further down; search for kSunOuterSpaceIntensity before moving
+	// either.
+	constexpr float kSunOuterSpaceIntensity = 15.0f;
+	constexpr float kMoonPeakIntensity = 0.04f;
+
 	TAutoConsoleVariable<int32> CVarSkyEnabled(
 		TEXT("voxel.Sky.Enabled"), 1,
 		TEXT("Day/night world clock drives the light rig. 1 = on (default). 0 = off, and genuinely ")
@@ -99,6 +107,34 @@ namespace
 		TEXT("which is also the A/B control for 'how much of the night frame is moonlight'."),
 		ECVF_Default);
 
+	TAutoConsoleVariable<float> CVarSkySunIntensity(
+		TEXT("voxel.Sky.SunIntensity"), kSunOuterSpaceIntensity,
+		TEXT("The sun's OUTER-SPACE illuminance -- what the light carries ABOVE the atmosphere, not ")
+		TEXT("what lands on the ground. Default 15.0. This is deliberately altitude-INDEPENDENT: ")
+		TEXT("USkyAtmosphereComponent already applies air-mass extinction to the direct beam ")
+		TEXT("(DirectionalLightComponent.cpp:592-595 GetSunIlluminanceOnGroundPostTransmittance = ")
+		TEXT("OuterSpaceIlluminance * AtmosphereTransmittanceTowardSun, consumed by the deferred ")
+		TEXT("directional pass at ShadowRendering.cpp:2676), and UE applies the N.L cosine on top of ")
+		TEXT("that. Anything this file multiplies in as well is counted two or three times. See the ")
+		TEXT("long comment above kSunOuterSpaceIntensity for why 15.0 reproduces the pre-W4 8-lux ")
+		TEXT("ground pose to within 0.1 stop even though the curve it replaces is gone."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<float> CVarSkyMoonIntensity(
+		TEXT("voxel.Sky.MoonIntensity"), kMoonPeakIntensity,
+		TEXT("Peak moonlight, i.e. the intensity a FULL moon well clear of the horizon is given. ")
+		TEXT("Default 0.04. AN ARTISTIC NUMBER, NOT A PHYSICAL ONE, AND THE SIZE OF THE LIE IS ")
+		TEXT("RECORDED SO NOBODY 'CORRECTS' IT: a real full moon delivers ~0.25 lux against the sun's ")
+		TEXT("~100000, a ratio of 1:400000 (18.6 stops). 0.04 against voxel.Sky.SunIntensity 15 is ")
+		TEXT("1:375 (8.6 stops), so this moon is cheated ten stops brighter than the sky it claims to ")
+		TEXT("model. That is intentional and universal -- every shipped game does it -- because a ")
+		TEXT("physically scaled moon renders as literally nothing, and because scene colour down at ")
+		TEXT("1e-5 is where fp16 stops carrying signal and starts carrying banding. Raise for a more ")
+		TEXT("navigable night, lower for a harsher one; a NEW moon stays genuinely dark either way ")
+		TEXT("because MoonIlluminatedFraction multiplies this (0 at new, 1 at full). This knob and the ")
+		TEXT("night end of ExposureBiasForSunAltitude move the same pixel, so change one at a time."),
+		ECVF_Default);
+
 	TAutoConsoleVariable<float> CVarSkyShadowUpdateHz(
 		TEXT("voxel.Sky.ShadowUpdateHz"), 10.0f,
 		TEXT("Cap on how often the sun/moon are actually RE-ORIENTED, in Hz. Default 10. A ")
@@ -121,8 +157,8 @@ namespace
 		TEXT("to be REPRODUCIBLE: modes 0 and 1 both make the frame's brightness a function of what ")
 		TEXT("was on screen a moment ago, so two runs of the same leg differ. It is also the only ")
 		TEXT("mode in which 'night' is verifiable at all -- see the long comment above ")
-		TEXT("SkyExposureBiasEV for why unclamped auto-exposure makes a dark ship render mid-grey ")
-		TEXT("and every screenshot gate pass anyway."),
+		TEXT("ExposureBiasForSunAltitude for why unclamped auto-exposure makes a dark ship render ")
+		TEXT("mid-grey and every screenshot gate pass anyway."),
 		ECVF_Default);
 
 	TAutoConsoleVariable<float> CVarSkyExposureBias(
@@ -179,6 +215,24 @@ namespace VoxelSky
 
 	bool IsMoonEnabled() { return CVarSkyMoonEnabled.GetValueOnAnyThread() != 0; }
 
+	// FLOORED AWAY FROM ZERO, and this floor is not defensive padding -- it is the
+	// whole of defect 1. ULightComponent::UpdateColorAndBrightness
+	// (LightComponent.cpp:1455-1477) computes
+	//     bValidIntensity = Intensity > 0.f || GetLightUnits() == ELightUnits::EV
+	// and UDirectionalLightComponent::GetLightUnits returns ELightUnits::Unitless
+	// (DirectionalLightComponent.cpp:1509), so a directional light at EXACTLY zero
+	// intensity is not a dim light -- it is MarkRenderStateDirty'd straight out of
+	// FScene, and FScene::ProcessAtmosphereLightRemoval_RenderThread
+	// (RendererScene.cpp:4721-4744) then clears AtmosphereLights[0]. See
+	// ApplyLightsFromState for what that costs.
+	float GetSunIntensity() { return FMath::Max(UE_KINDA_SMALL_NUMBER, CVarSkySunIntensity.GetValueOnAnyThread()); }
+
+	// Clamped to >= 0 only: the moon IS allowed to reach exactly zero, because a
+	// moon below the horizon dropping out of AtmosphereLights[1] costs nothing --
+	// the SUN is what the sky is scattering, at every hour. It is only index 0
+	// that must never leave the scene.
+	float GetMoonIntensity() { return FMath::Max(0.f, CVarSkyMoonIntensity.GetValueOnAnyThread()); }
+
 	float GetShadowUpdateHz() { return FMath::Max(0.f, CVarSkyShadowUpdateHz.GetValueOnAnyThread()); }
 
 	int32 GetExposureMode() { return FMath::Clamp(CVarSkyExposureMode.GetValueOnAnyThread(), 0, 2); }
@@ -190,53 +244,80 @@ namespace VoxelSky
 
 namespace
 {
-	// THE SUN'S PEAK INTENSITY, AND WHY IT IS NOT 100000 LUX.
+	// THE SUN'S INTENSITY IS AN OUTER-SPACE ILLUMINANCE AND IT DOES NOT VARY
+	// WITH ALTITUDE. Read this before "restoring" a falloff curve here.
 	//
-	// The pre-W4 static rig ran the sun at Intensity 8 (VoxelEarthGameMode.cpp's
-	// old BeginPlay). That number is load-bearing well outside this file:
-	// AVoxelClipmapActor's cave exposure lock was calibrated against it by A/B
-	// (VoxelClipmapActor.h:233-240, "the cave is lit by an 8-lux sun"), and every
-	// surface screenshot the harness has ever taken was framed at it. Replacing
-	// it with a physically-real ~100000 lux would be more correct and would
-	// invalidate all of that at once.
+	// What this number feeds. UDirectionalLightComponent's proxy returns
+	// GetOuterSpaceIlluminance() == GetColor() (DirectionalLightComponent.cpp:
+	// 582-585), and that value is used for TWO different things:
 	//
-	// So the peak is set so that the SHIPPED DEFAULT POSE reproduces the old
-	// number instead. The default pose is equinox noon at 52 N (see
-	// kDefaultTimeOfDayHours / kDefaultDateMonth below), where the sun sits at
-	// ~38 deg altitude, and SunIntensityFraction(38) is ~0.53 -- so 15.0 * 0.53
-	// is ~8.0, the value the static rig used. A no-switch capture therefore
-	// looks like a pre-W4 capture, and the difference between them is the
-	// TIME OF DAY rather than a global exposure shift.
+	//   (1) THE SKY. SkyAtmosphereRendering.cpp:1586-1597 hands it to the sky
+	//       LUT pass as AtmosphereLightIlluminanceOuterSpace0. This is the
+	//       radiance the atmosphere SCATTERS, and it is the only thing that
+	//       makes twilight exist at all.
+	//   (2) THE GROUND. DirectionalLightComponent.cpp:592-595 defines
+	//       GetSunIlluminanceOnGroundPostTransmittance() as OuterSpaceIlluminance
+	//       * AtmosphereTransmittanceTowardSun, and the deferred directional pass
+	//       reads it at ShadowRendering.cpp:2676. The transmittance factor is
+	//       FAtmosphereSetup::GetTransmittanceAtGroundLevel
+	//       (SkyAtmosphereCommonData.cpp:182-270), a real ray-march of the air
+	//       mass along the sun direction.
 	//
-	// UNVERIFIED PENDING THE BUILD: the 0.53 is arithmetic, not a measurement.
-	// The first capture leg is where this gets confirmed or corrected.
-	constexpr float kSunPeakIntensity = 15.0f;
+	// So the engine ALREADY dims and reddens the direct beam by air mass, and
+	// ALREADY applies the N.L cosine on top of that. The curve this constant
+	// replaced multiplied Intensity by sin(altitude)^1.3, which counted the
+	// cosine twice and the extinction twice -- and, far worse, applied a
+	// DIRECT-BEAM model to (1), the sky's source term, where it does not belong.
+	// A sun a few degrees below the horizon has undiminished outer-space
+	// illuminance; only its path to the ground has changed. Strangling (1) as the
+	// sun set is why twilight rendered as 0.0% non-black pixels.
+	//
+	// WHY 15.0 SURVIVES THE REMOVAL OF THAT CURVE. The old calibration story was
+	// "15.0 * SunIntensityFraction(38 deg) ~= 8.0, the pre-W4 static rig's
+	// Intensity, which AVoxelClipmapActor's cave lock was A/B'd against
+	// (VoxelClipmapActor.h:233-240)". Under the corrected model the equivalent
+	// quantity is the illuminance that actually lands on flat ground at the same
+	// default pose: 15.0 * sin(38 deg) * T(38 deg) ~= 15.0 * 0.616 * 0.80 ~= 7.4,
+	// against the old 8.0. That is 0.11 stops, i.e. the shipped default pose is
+	// preserved and the cave calibration does not move. Runtime knob:
+	// voxel.Sky.SunIntensity.
+	//
+	// T(38) ~= 0.80 is arithmetic from UE's default atmosphere (zenith optical
+	// depth ~0.14, air mass 1.62), NOT a measurement. It is the one number in
+	// this paragraph the ladder re-run can falsify.
+	//
+	// (kSunOuterSpaceIntensity itself is declared at the top of this file, beside
+	// kMoonPeakIntensity, only because voxel.Sky.SunIntensity needs it as its
+	// default and a cvar's default has to be visible before the cvar.)
 
-	// Colour temperature endpoints. 1900 K is a low sunrise/sunset sun (deep
-	// orange, heavily reddened by the air mass it is shining through); 6500 K is
-	// a high sun (the D65 white point, i.e. "no tint"). The interpolation runs
-	// over the first 25 degrees of altitude because that is roughly where the
-	// air-mass reddening stops being visible -- above it the sun is white and
-	// stays white all the way to the zenith, so spending curve on 25..90 would
-	// only make noon subtly wrong.
-	constexpr float kSunHorizonTemperatureK = 1900.f;
-	constexpr float kSunZenithTemperatureK = 6500.f;
-	constexpr double kSunTemperatureRampEndDeg = 25.0;
+	// ONE colour temperature, held at every altitude, and the flat value is the
+	// same correction as the flat intensity above.
+	//
+	// 5778 K is the sun's effective blackbody temperature -- what it is ABOVE the
+	// atmosphere. The orange sunset is not a property of the sun, it is Rayleigh
+	// scattering removing blue along a long air path, and
+	// GetTransmittanceAtGroundLevel computes it PER CHANNEL and applies it to the
+	// beam already. The ramp this replaced drove the light to 1900 K at the
+	// horizon, which double-reddened the beam and -- because the same colour is
+	// the sky's source term -- would have rendered the blue hour ORANGE. A blue
+	// twilight requires scattering a WHITE source; that is where the blue comes
+	// from. Do not reintroduce a horizon temperature ramp; tint the sky through
+	// USkyAtmosphereComponent if the sunset wants art direction.
+	constexpr float kSunTemperatureK = 5778.f;
 
-	// THE MOON IS A DELIBERATE CHEAT AND THE SIZE OF THE CHEAT IS STATED HERE.
+	// The moon's peak (kMoonPeakIntensity, declared at the top of this file) is
+	// reachable at runtime through voxel.Sky.MoonIntensity, because it is the
+	// number in this file most likely to be argued about after a play session and
+	// it should not need a rebuild to settle.
 	//
-	// A real full moon delivers ~0.25 lux against the sun's ~100000, a ratio of
-	// about 1:400000, i.e. 18.6 stops. Honouring that ratio against the peak
-	// above would give the moon an intensity of 0.00004 and a night frame lit by
-	// literally nothing -- which is astronomically right and unplayable, and is
-	// why every game that has ever shipped a moon has cheated here.
-	//
-	// 0.12 is ~1:125 against the peak (7 stops), so a full moon reads as a dim
-	// silver-blue key light with real directional shadowing rather than as
-	// ambient mush. The exposure curve (below) is doing the other half of the
-	// work: it lifts a night frame by ~5 stops, so the two together put the moon
-	// somewhere legible without ever approaching daylight.
-	constexpr float kMoonPeakIntensity = 0.12f;
+	// NOTE FOR ANYONE COMPARING AGAINST THE PRE-FIX NUMBER: the old peak read
+	// 0.12, but it was then multiplied by SunIntensityFraction(MoonAltitude),
+	// which at a moon 18 deg up is 0.22 -- so the value that actually reached the
+	// light was 0.026, and the 2.2 stops it lost were the same double-counted
+	// extinction described above the sun constant. 0.04 applied straight through
+	// is therefore ~0.6 stops BRIGHTER than the old 0.12 ever was in practice,
+	// not three times dimmer. The ladder log's `moonIntensity=` field is the
+	// number to compare against; the source constant is not.
 
 	// ~4100 K. Moonlight is reflected sunlight and is therefore spectrally
 	// almost identical to it; it LOOKS blue because of the Purkinje shift in
@@ -250,6 +331,32 @@ namespace
 	// invisible in the frame and not free in the renderer.
 	constexpr double kMoonSunSuppressStartDeg = -6.0; // sun at civil twilight: moon at full strength
 	constexpr double kMoonSunSuppressEndDeg = 0.0;    // sun at the horizon: moon contributes nothing
+
+	// The moon's own horizon fade. A GATE, NOT AN EXTINCTION MODEL -- the air
+	// mass a low moon is shining through is the atmosphere's job for the same
+	// reason it is the sun's (see kSunOuterSpaceIntensity), and applying a second
+	// one here is exactly the bug being fixed. This exists only so the moonlight
+	// does not switch on as a step the instant the disc clears the horizon, and
+	// so that a moon below the horizon reaches a clean zero and leaves
+	// AtmosphereLights[1] rather than lingering at a value nothing can see.
+	constexpr double kMoonHorizonGateStartDeg = -1.0; // fully off
+	constexpr double kMoonHorizonGateEndDeg = 3.0;    // fully on
+
+	// Below this sun altitude the sun stops CASTING SHADOWS (it emphatically does
+	// NOT stop existing -- see ApplyLightsFromState). By -2 deg the atmosphere's
+	// transmittance toward the sun is ray-marching through the planet body, so
+	// GetSunIlluminanceOnGroundPostTransmittance is already ~0 and there is
+	// nothing left for a cascade to shadow; all that survives is the scattered
+	// sky, which a whole-scene shadow setup contributes nothing to. This is what
+	// recovers the "do not pay for shadows all night" saving that hiding the
+	// light used to buy, without the side effect that made hiding fatal.
+	//
+	// 1 degree of hysteresis. ULightComponentBase::SetCastShadows
+	// (LightComponent.cpp:79-87) MarkRenderStateDirty's, which destroys and
+	// recreates the light's scene proxy -- harmless twice a day, silly twice a
+	// second if the sun is hovering exactly on the threshold.
+	constexpr double kSunShadowOffBelowDeg = -2.0;
+	constexpr double kSunShadowOnAboveDeg = -1.0;
 
 	// DEFAULT CLOCK POSE, and this default is doing real work.
 	//
@@ -373,33 +480,15 @@ namespace
 		return FMath::Clamp((int32)FMath::FloorToDouble(Wrapped * kDaysPerTropicalYear), 0, 365);
 	}
 
-	// Direct-beam strength, 0..1, as a function of apparent solar altitude.
-	//
-	// sin(altitude) is the geometric term (a surface receives light in proportion
-	// to the cosine of the incidence angle) and the 1.3 exponent folds in
-	// atmospheric extinction, which is what actually makes a low sun DIM as well
-	// as red: at 5 degrees the beam is crossing roughly ten atmospheres. A pure
-	// sin() would leave sunset far too bright and the whole cycle would read as
-	// "the sun changed colour" rather than "the sun went down".
-	//
-	// Zero at and below the horizon, and continuous there -- the apparent
-	// altitude the ephemeris returns already has refraction folded in, so
-	// altitude 0 IS the moment the disc appears to touch the horizon.
-	double SunIntensityFraction(double AltitudeDeg)
+	// Smoothstepped 0..1 gate over the moon's own horizon crossing. See
+	// kMoonHorizonGateStartDeg for why this is the ONLY altitude term the moon
+	// gets and why it must not grow an extinction exponent.
+	double MoonHorizonGate(double AltitudeDeg)
 	{
-		if (AltitudeDeg <= 0.0)
-		{
-			return 0.0;
-		}
-		const double S = FMath::Sin(FMath::DegreesToRadians(FMath::Min(AltitudeDeg, 90.0)));
-		return FMath::Clamp(FMath::Pow(FMath::Max(S, 0.0), 1.3), 0.0, 1.0);
-	}
-
-	double SunTemperatureK(double AltitudeDeg)
-	{
-		const double T = FMath::Clamp(AltitudeDeg / kSunTemperatureRampEndDeg, 0.0, 1.0);
-		const double Smooth = T * T * (3.0 - 2.0 * T); // smoothstep: no visible kink at either end
-		return FMath::Lerp((double)kSunHorizonTemperatureK, (double)kSunZenithTemperatureK, Smooth);
+		const double T = FMath::Clamp(
+			(AltitudeDeg - kMoonHorizonGateStartDeg) /
+				(kMoonHorizonGateEndDeg - kMoonHorizonGateStartDeg), 0.0, 1.0);
+		return T * T * (3.0 - 2.0 * T); // no visible kink at either end
 	}
 
 	// THE EXPOSURE CURVE, in UE AutoExposureBias stops (positive = brighter).
@@ -414,33 +503,82 @@ namespace
 	// not whether they are dark. Night is then unverifiable by construction.
 	//
 	// So the exposure is pinned to the CLOCK, not to the frame. And critically it
-	// only PARTIALLY compensates: the scene's own luminance drops by roughly ten
-	// stops from noon to a moonlit midnight, and this curve lifts by five. The
-	// remaining five stops are what the player sees as darkness. A curve that
-	// compensated fully would be auto-exposure with extra steps.
+	// only PARTIALLY compensates: the scene's own ground illuminance drops about
+	// nine stops from noon to a moonlit midnight (11.2 to 0.008 in this file's
+	// units) and this curve lifts by 6.9 (+8.7 to +15.6). The two stops that do
+	// not get lifted are what the player sees as darkness -- and because the
+	// filmic toe steepens whatever it is handed down there, two scene stops read
+	// as roughly five on screen. A curve that compensated fully would be
+	// auto-exposure with extra steps.
 	//
-	// THE ANCHORS BELOW ARE UNMEASURED FIRST GUESSES. The SHAPE is the part
-	// backed by an argument (monotone in altitude, partial compensation, ~1 stop
-	// per doubling); the numbers are seeded from the one measurement this project
-	// does have -- the cave rig's +10 against an 8-intensity sun -- and are what
-	// the W6 capture ladder exists to calibrate. Do not treat them as measured
-	// until that leg has run.
+	// THE ANCHORS BELOW ARE DERIVED FROM THE W6 LADDER, NOT GUESSED -- but the
+	// derivation still has one unmeasured leg and it is named at the end.
+	//
+	// The previous anchor set was seeded before any capture existed and held
+	// +7.0 EV flat from +10 deg to the zenith. The first ladder run measured what
+	// that produced (mean luminance out of 255, over one simulated day at 52.5 N):
+	//
+	//   sun +60.9 deg  intensity 12.59  bias +7.000  ->  luma 47.92   98.1% non-black
+	//   sun +17.5 deg  intensity  3.15  bias +7.149  ->  luma  4.85   60.2% non-black
+	//
+	// Those two points calibrate the whole transfer function, because they share
+	// a bias to within 0.15 stops. Ground illuminance across them differs by 3.98
+	// stops (15 * sin(alt) * T(alt) at each) while the frame's DISPLAY-LINEAR
+	// luminance differs by 4.33 stops, so display-linear ~ scene^1.13 through
+	// this range -- a mild filmic toe, not the steep one a night frame suggests.
+	// (The 00h00 rung looks far steeper, but at 1.5% non-black its mean is
+	// measuring how many pixels exist, not how bright they are. It is not a
+	// usable calibration point and was not used as one.)
+	//
+	// From that: each anchor below is the bias that lands a chosen mean luminance
+	// at that altitude, given the scene's own ground illuminance there (the
+	// standard clear-sky solar-altitude illuminance table, scaled so that
+	// +60.9 deg == our 11.19). The chosen luminances run 106 at the zenith, 80 at
+	// +20, 55 at +5, 38 at the horizon, and hold ~20 through twilight and night.
+	// The gap between "what the scene did" and "what was chosen" IS the darkness:
+	// the scene falls ~14 stops from noon to civil twilight and the curve lifts
+	// ~7, so half the fall survives to the screen. That is the same partial-
+	// compensation doctrine as before, now with the falls measured.
+	//
+	// WHY IT FLATTENS AT -2 DEG AND NOT AT -12. Below the horizon the scene falls
+	// off a cliff -- roughly 4x PER DEGREE through civil twilight -- and a curve
+	// that kept tracking it would need +20 EV by -6 deg. It cannot, because the
+	// MOON is also on down there, and a full moon under a +20 EV exposure renders
+	// brighter than noon. So the cap is set where a full moon reads as a full
+	// moon (voxel.Sky.MoonIntensity and this cap move the same pixel; they were
+	// solved together, and 15.6 / 0.04 is that solution). The price is paid by
+	// MOONLESS civil twilight, which lands dimmer than the moonlit kind. That is
+	// the honest trade for a curve driven by sun altitude alone, and it is the
+	// owner's stated preference: a new moon should be genuinely dark.
+	//
+	// STILL UNMEASURED, and this is the one to check first if the re-run
+	// disagrees: everything at or below 0 deg. Both twilight rungs read 0.0%
+	// non-black before this change, so there is no observation of ANY below-
+	// horizon frame to calibrate against -- those anchors come from the
+	// illuminance table and the transfer function fitted above the horizon, and
+	// they assume the SkyAtmosphere's twilight tracks the real one. If they are
+	// wrong they will be wrong together and in one direction, which
+	// voxel.Sky.ExposureBias shifts in one move without touching this table.
 	double ExposureBiasForSunAltitude(double AltitudeDeg)
 	{
 		struct FAnchor { double AltDeg; double BiasEV; };
 		// Altitudes ascending. Below the first and above the last the curve is
-		// flat, deliberately: there is nothing left to darken once the sun is 12
-		// degrees down (astronomical-ish twilight is over) and nothing left to
-		// brighten once it is well up.
+		// flat. The four night anchors are all equal on purpose -- the cap is
+		// reached at -2 deg and everything below it is held there because the
+		// moon, not the sun, is what the frame is lit by down there (above).
 		static const FAnchor Anchors[] = {
-			{-18.0, 12.0},  // full night: five stops of lift against ~ten stops of scene
-			{-12.0, 12.0},  // nautical twilight -- night has already bottomed out here
-			{ -6.0, 10.5},  // civil twilight: the sky still carries the frame
-			{  0.0,  9.0},  // sunrise/sunset
-			{  2.0,  8.6},
-			{ 10.0,  7.6},
-			{ 20.0,  7.0},  // full day
-			{ 90.0,  7.0},
+			{-18.0, 15.6},  // astronomical night: the moon carries the frame here
+			{-12.0, 15.6},  // nautical twilight
+			{ -6.0, 15.6},  // civil twilight ends
+			{ -2.0, 15.6},  // the cap; the scene keeps falling below this, the curve does not
+			{  0.0, 14.1},  // sunrise/sunset
+			{  2.0, 12.5},
+			{  5.0, 11.3},
+			{ 10.0, 10.5},
+			{ 20.0,  9.8},
+			{ 30.0,  9.4},
+			{ 45.0,  8.9},
+			{ 90.0,  8.7},  // full day
 		};
 		constexpr int32 Count = UE_ARRAY_COUNT(Anchors);
 
@@ -475,6 +613,13 @@ struct FVoxelSkyImpl
 	// Cadence accumulator for voxel.Sky.ShadowUpdateHz.
 	double LightUpdateAccumulator = 0.0;
 	bool bLightsEverApplied = false;
+
+	// Latched state of the sun's CastShadows flag, so the hysteresis in
+	// ApplyLightsFromState has something to compare against and so the flip is
+	// logged once rather than every tick. Starts true because SpawnRig leaves the
+	// light at ADirectionalLight's shadow-casting default; if the first tick
+	// happens to be at night, the first flip is OFF and it is logged.
+	bool bSunShadowsOn = true;
 
 	// Last-known observer XY, in world UU. Held across frames so that a frame
 	// with no player controller (loading, travel) reuses the previous position
@@ -654,11 +799,21 @@ void UVoxelSkySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 		UE_LOG(LogVoxelSky, Log,
 		       TEXT("VoxelSky settings RESOLVED: Enabled=%d TimeScale=%.3f DayLength=%.1f s DaysPerYear=%.1f ")
-		       TEXT("Origin=(%.4f N, %.4f E) Moon=%d ShadowUpdateHz=%.2f ExposureMode=%d ExposureBias=%.2f"),
+		       TEXT("Origin=(%.4f N, %.4f E) Moon=%d SunIntensity=%.4f MoonIntensity=%.4f ")
+		       TEXT("ShadowUpdateHz=%.2f ExposureMode=%d ExposureBias=%.2f DayEV=%.2f NightEV=%.2f"),
 		       VoxelSky::IsEnabled() ? 1 : 0, VoxelSky::GetTimeScale(), DayLength, DaysPerYear,
 		       VoxelSky::GetOriginLatitudeDeg(), VoxelSky::GetOriginLongitudeDeg(),
-		       VoxelSky::IsMoonEnabled() ? 1 : 0, VoxelSky::GetShadowUpdateHz(),
-		       VoxelSky::GetExposureMode(), VoxelSky::GetExposureBias());
+		       VoxelSky::IsMoonEnabled() ? 1 : 0,
+		       // Read back through the clamping accessors, never off the cvar: the
+		       // sun's is FLOORED away from zero and a run that hit that floor has
+		       // to be able to say so from its own log.
+		       VoxelSky::GetSunIntensity(), VoxelSky::GetMoonIntensity(),
+		       VoxelSky::GetShadowUpdateHz(),
+		       VoxelSky::GetExposureMode(), VoxelSky::GetExposureBias(),
+		       // The two ends of the retuned curve, logged so a capture states the
+		       // exposure policy it ran under rather than the one in this revision
+		       // of the source.
+		       ExposureBiasForSunAltitude(60.0), ExposureBiasForSunAltitude(-18.0));
 	}
 }
 
@@ -812,9 +967,10 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 			// NO SHADOWS FROM THE MOON. A second shadow-casting directional
 			// light is a second whole-scene shadow setup and a second set of
 			// cascades every frame -- the single most expensive thing in this
-			// file -- bought for shadows cast by a 0.12-intensity light that the
-			// exposure curve is simultaneously lifting five stops. It is not a
-			// close call today. Revisit only with a number from the W7 leg.
+			// file -- bought for shadows cast by a light running ~8.6 stops below
+			// the sun (voxel.Sky.MoonIntensity) while the exposure curve lifts
+			// the whole frame nearly seven. It is not a close call today. Revisit
+			// only with a number from the W7 leg.
 			MoonComp->SetCastShadows(false);
 		}
 	}
@@ -943,6 +1099,25 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 		// the cave volume does not. That is safe and not an exception to the
 		// invariant above: under rock the cave volume wins AutoExposureMethod
 		// with AEM_Manual, and manual exposure ignores those clamps entirely.)
+		//
+		// WHAT THE W6 EXPOSURE RETUNE DID TO THE STEP BETWEEN THE TWO VOLUMES.
+		// Nothing about the ownership rule changed, but the SIZE of the jump at a
+		// cave mouth did, and it is now asymmetric enough to be worth stating.
+		// This curve used to run +7.0 (day) to +12.0 (night); it now runs +8.7 to
+		// +15.6. The cave's +10 did NOT move -- it is still the only exposure
+		// number in this project backed by an A/B, and re-deriving it to tidy up a
+		// step would throw that away. The consequence:
+		//
+		//   walking into a cave at NOON   +8.7 -> +10.0   1.3 stops BRIGHTER (was 3.0)
+		//   walking into a cave at NIGHT  +15.6 -> +10.0  5.6 stops DARKER   (was 2.0)
+		//
+		// The night step is the one to watch: a cave is now much darker than the
+		// moonlit surface outside it, where it used to be slightly brighter. That
+		// is arguably correct -- a cave at night has no light in it at all and the
+		// lamp is the point -- but it is a behaviour change nobody asked for, and
+		// if it reads badly the fix belongs in AVoxelClipmapActor's rig (make
+		// CaveExposureEV100 track the sky's night end, re-measured), NOT in
+		// flattening this curve's night end, which is doing separate work.
 		// ===================================================================
 		SkyExposurePP->Priority = 10.f;
 		SkyExposurePP->bEnabled = false; // ApplyExposureFromState turns it on
@@ -964,6 +1139,12 @@ void UVoxelSkySubsystem::ApplyStaticRigPose()
 			SunComp->SetUseTemperature(false);
 			SunComp->SetIntensity(8.f);
 			SunComp->SetVisibility(true);
+			// The static pose is a fixed -45 deg sun, i.e. permanently up, so it
+			// casts shadows. Restored explicitly because the clock may have
+			// switched them off before voxel.Sky.Enabled went to 0, and "off"
+			// must mean the pre-W4 frame rather than the pre-W4 frame minus its
+			// shadows.
+			SunComp->SetCastShadows(true);
 		}
 	}
 	if (MoonLight)
@@ -983,6 +1164,7 @@ void UVoxelSkySubsystem::ApplyStaticRigPose()
 		Impl->AppliedExposureMode = -1;
 		Impl->AppliedExposureBias = TNumericLimits<double>::Max();
 		Impl->bLightsEverApplied = false;
+		Impl->bSunShadowsOn = true; // matches the SetCastShadows(true) just applied
 	}
 }
 
@@ -1174,9 +1356,55 @@ void UVoxelSkySubsystem::ApplyLightsFromState()
 	FVoxelSkyState& S = Impl->State;
 
 	// --- sun ----------------------------------------------------------------
-	const double SunFrac = SunIntensityFraction(S.SunAltitudeDeg);
-	S.SunIntensity = (float)(kSunPeakIntensity * SunFrac);
-	S.SunTemperatureK = (float)SunTemperatureK(S.SunAltitudeDeg);
+	//
+	// ===================================================================
+	// THE SUN LIGHT IS NEVER HIDDEN, NEVER DEREGISTERED, AND NEVER SET TO
+	// EXACTLY ZERO INTENSITY. All three are the same bug. Read before editing.
+	//
+	// This function used to end with SetVisibility(S.SunIntensity > 0.f), which
+	// hid the sun below the horizon on the argument that a light nothing can see
+	// should not be paying for shadow setup. The argument is fine. The mechanism
+	// is fatal, and it is fatal three layers down:
+	//
+	//   1. ULightComponent::CreateRenderState_Concurrent (LightComponent.cpp:
+	//      964-995) computes bHidden = !ShouldComponentAddToScene() ||
+	//      !ShouldRender() || !bValidIntensity, and SKIPS World->Scene->AddLight
+	//      entirely when it is true. A hidden light is not a dim light; it is not
+	//      in FScene at all.
+	//   2. FScene::ProcessAtmosphereLightRemoval_RenderThread (RendererScene.cpp:
+	//      4721-4744) then clears AtmosphereLights[Index] and rescans the
+	//      remaining lights for a replacement. There is no other index-0 light in
+	//      this world, so AtmosphereLights[0] stays null.
+	//   3. SkyAtmosphereRendering.cpp:1586-1597 branches on exactly that pointer:
+	//      with it null the sky LUT pass is handed
+	//      AtmosphereLightIlluminanceOuterSpace0 = FLinearColor::Black and a
+	//      direction forced to straight up. The atmosphere integrates zero
+	//      radiance, so the sky renders black -- and the SkyLight's real-time
+	//      capture (SpawnRig) then captures that black sky as the ambient term,
+	//      so the ground goes black too.
+	//
+	// That is the whole of "twilight renders 0.0% non-black". USkyAtmosphere
+	// computes civil, nautical and astronomical twilight precisely FROM a sun a
+	// few degrees below the horizon -- it is the one thing that needs the light
+	// most, at exactly the altitude the old code removed it.
+	//
+	// AND THE OBVIOUS FIX IS ALSO WRONG. "Do not hide it, just let the intensity
+	// fall to zero" reproduces the bug identically:
+	// ULightComponent::UpdateColorAndBrightness (LightComponent.cpp:1455-1477)
+	// treats Intensity == 0 on a unitless light as bNeedsToBeRemovedFromScene and
+	// MarkRenderStateDirty's it straight back out through step 1 above.
+	// UDirectionalLightComponent::GetLightUnits returns ELightUnits::Unitless
+	// (DirectionalLightComponent.cpp:1509), so the ELightUnits::EV escape hatch in
+	// that condition does not apply to us. Hence VoxelSky::GetSunIntensity's
+	// floor.
+	//
+	// WHAT REPLACES THE SAVING. The direct beam still falls to zero as the sun
+	// sets -- the atmosphere does it, per channel, by ray-marching the air mass
+	// (see kSunOuterSpaceIntensity) -- and the shadow cost is dropped separately
+	// by SetCastShadows below, which does NOT take the light out of FScene.
+	// ===================================================================
+	S.SunIntensity = VoxelSky::GetSunIntensity();
+	S.SunTemperatureK = kSunTemperatureK;
 	if (SunLight)
 	{
 		if (UDirectionalLightComponent* SunComp = Cast<UDirectionalLightComponent>(SunLight->GetLightComponent()))
@@ -1184,12 +1412,32 @@ void UVoxelSkySubsystem::ApplyLightsFromState()
 			SunComp->SetUseTemperature(true);
 			SunComp->SetTemperature(S.SunTemperatureK);
 			SunComp->SetIntensity(S.SunIntensity);
-			// Hidden outright below the horizon rather than merely set to zero
-			// intensity. A zero-intensity directional light still participates in
-			// shadow setup, and "the sun is down" is the half of the day where
-			// that cost buys literally nothing. It also stops the SkyAtmosphere
-			// drawing a black disc where the sun is.
-			SunComp->SetVisibility(S.SunIntensity > 0.f);
+
+			// Belt and braces against a future edit, a Blueprint, or a level
+			// tool: re-asserting the registration costs a branch (both setters
+			// early-out when unchanged) and makes AtmosphereLights[0] an
+			// invariant of this function rather than of SpawnRig running once.
+			SunComp->SetVisibility(true);
+			SunComp->SetAtmosphereSunLight(true);
+			SunComp->SetAtmosphereSunLightIndex(0);
+
+			// Shadow cadence, with hysteresis (see kSunShadowOffBelowDeg).
+			const bool bWantShadows = Impl->bSunShadowsOn
+				? S.SunAltitudeDeg > kSunShadowOffBelowDeg
+				: S.SunAltitudeDeg > kSunShadowOnAboveDeg;
+			if (bWantShadows != Impl->bSunShadowsOn)
+			{
+				Impl->bSunShadowsOn = bWantShadows;
+				SunComp->SetCastShadows(bWantShadows);
+				// Read back rather than echo: SetCastShadows early-outs when
+				// AreDynamicDataChangesAllowed() is false, which is exactly the
+				// case a Stationary-mobility regression would produce.
+				UE_LOG(LogVoxelSky, Log,
+				       TEXT("VoxelSky sun shadows %s at altitude %+.2f deg (CastShadows now %d). The light ")
+				       TEXT("itself stays registered as atmosphere sun light 0 at every altitude."),
+				       bWantShadows ? TEXT("ON") : TEXT("OFF"), S.SunAltitudeDeg,
+				       SunComp->CastShadows ? 1 : 0);
+			}
 		}
 	}
 
@@ -1198,9 +1446,18 @@ void UVoxelSkySubsystem::ApplyLightsFromState()
 	// Three multiplicands, and each is a different question:
 	//   IlluminatedFraction -- how much of the disc is lit (NOT PhaseFraction;
 	//                          VoxelEphemeris.h:85-93 is explicit that a "half
-	//                          moon" at PhaseFraction 0.25 is 50% lit).
-	//   the altitude falloff -- the moon low on the horizon is dimmed by the
-	//                          same air mass the sun is, so the same curve.
+	//                          moon" at PhaseFraction 0.25 is 50% lit). This is
+	//                          the physical one, and it is what makes a new moon
+	//                          genuinely dark without anything else changing.
+	//   the horizon gate    -- a smoothstep across the moon's own rise, and
+	//                          NOTHING MORE. The air mass a low moon shines
+	//                          through is the atmosphere's job: the moon is
+	//                          atmosphere sun light 1, so PrepareSunLightProxy
+	//                          (SkyAtmosphereRendering.cpp:507-509, 584-595) gives
+	//                          it its own transmittance exactly as it does the
+	//                          sun's. The sin^1.3 curve that used to sit here was
+	//                          a second copy of that extinction and cost a moon
+	//                          18 deg up 2.2 stops for nothing.
 	//   the daylight suppression -- a second atmosphere light contributing
 	//                          during the day is invisible and not free.
 	const bool bMoonOn = VoxelSky::IsMoonEnabled();
@@ -1210,13 +1467,18 @@ void UVoxelSkySubsystem::ApplyLightsFromState()
 		const double SunSuppress = 1.0 - FMath::Clamp(
 			(S.SunAltitudeDeg - kMoonSunSuppressStartDeg) /
 				(kMoonSunSuppressEndDeg - kMoonSunSuppressStartDeg), 0.0, 1.0);
-		MoonFrac = SunIntensityFraction(S.MoonAltitudeDeg) * S.MoonIlluminatedFraction * SunSuppress;
+		MoonFrac = MoonHorizonGate(S.MoonAltitudeDeg) * S.MoonIlluminatedFraction * SunSuppress;
 	}
-	S.MoonIntensity = (float)(kMoonPeakIntensity * MoonFrac);
+	S.MoonIntensity = (float)(VoxelSky::GetMoonIntensity() * MoonFrac);
 	if (MoonLight)
 	{
 		if (UDirectionalLightComponent* MoonComp = Cast<UDirectionalLightComponent>(MoonLight->GetLightComponent()))
 		{
+			// Unlike the sun, the moon MAY reach zero and leave the scene. Losing
+			// AtmosphereLights[1] costs nothing -- index 0 is what the sky is
+			// scattering at every hour -- and a moon below the horizon should not
+			// be contributing to it. SetIntensity early-outs on an unchanged
+			// value, so this does not churn the render state while it sits at 0.
 			MoonComp->SetIntensity(S.MoonIntensity);
 			MoonComp->SetVisibility(bMoonOn && S.MoonIntensity > 0.f);
 		}

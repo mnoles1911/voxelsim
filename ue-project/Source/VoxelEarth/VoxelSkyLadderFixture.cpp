@@ -55,7 +55,17 @@
 //    -VoxelWaterParityTest shipped without a self-quit once and left an editor
 //    running for 2h40m.
 
-namespace
+// NAMED, not anonymous, and that is load-bearing. This fixture is modelled on
+// VoxelSweBreachFixture and borrows its helper vocabulary wholesale -- FRunRef,
+// WorldOf, SetTimerOnce, SetTimerLooping, kPollIntervalSeconds. In separate
+// translation units two anonymous namespaces never meet, but UE builds this
+// module as a UNITY file: the two .cpp files get concatenated, both anonymous
+// namespaces merge into one scope, and every shared name becomes a redefinition
+// (C2374/C2084). It compiled exactly once, because adaptive unity happened to
+// exclude both files that build; the next unrelated edit pulled them back in and
+// broke the module. A named namespace keeps the shared vocabulary readable
+// against its template while making the symbols distinct under any unity policy.
+namespace VoxelSkyLadderDetail
 {
 // --- Tunables, all overridable and all logged ------------------------------
 
@@ -697,7 +707,12 @@ bool PinCVar(const TCHAR* Name, const TCHAR* Value, FString& OutActual)
 	return true;
 }
 
-} // namespace
+} // namespace VoxelSkyLadderDetail
+
+// Hoisted so the entry point below reads exactly as it would have with an
+// anonymous namespace. The names stay file-local in practice -- nothing outside
+// this .cpp includes it -- but they are now distinct symbols under unity.
+using namespace VoxelSkyLadderDetail;
 
 bool VoxelSkyLadderFixture::StartFromCommandLine(UWorld* World)
 {

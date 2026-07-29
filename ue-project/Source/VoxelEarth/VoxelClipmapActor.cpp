@@ -406,6 +406,24 @@ void AVoxelClipmapActor::EnsureCaveRig()
 	// brightness clamps, which this one does not. That is safe and not an
 	// exception: this volume wins AutoExposureMethod with AEM_Manual, and manual
 	// exposure ignores those clamps entirely.)
+	//
+	// THE STEP AT A CAVE MOUTH CHANGED SIZE WHEN W6 RETUNED THE SKY CURVE, and
+	// this volume is on the other side of that step. The sky's curve used to run
+	// +7.0 (day) to +12.0 (night); measured against the first capture ladder it
+	// now runs +8.7 to +15.6. CaveExposureEV100 below was deliberately NOT moved
+	// with it -- +10 is the only exposure number in this project backed by an A/B
+	// against a reference frame, and re-deriving it by taste to tidy up a step
+	// would spend that measurement for nothing. The consequence:
+	//
+	//   entering a cave at NOON   +8.7 -> +10.0   1.3 stops BRIGHTER (was 3.0)
+	//   entering a cave at NIGHT  +15.6 -> +10.0  5.6 stops DARKER   (was 2.0)
+	//
+	// So a cave is now markedly darker than the moonlit surface outside it, where
+	// it used to be marginally brighter. If that reads wrong, the fix is HERE --
+	// re-measure CaveExposureEV100 against a night reference frame the way it was
+	// originally measured against a day one, and note both numbers -- not in
+	// flattening the sky's night end, which is holding a full moon at a legible
+	// brightness and would take the whole night down with it.
 	// =======================================================================
 	CaveExposurePP->Priority = 100.f;
 
