@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import os
 import dataclasses
 import json
 import sys
@@ -71,6 +70,11 @@ def make_roughness(style: dict):
     amp_mul = float(style.get("amp", 1.0))
     gain_lo = float(style.get("gain_lo", bnoise._SLOPE_GAIN_LO))
     gain_hi = float(style.get("gain_hi", bnoise._SLOPE_GAIN_HI))
+    cons_amp = float(style.get("cons_amp", 0.0))
+    cons_lo = float(style.get("cons_lo", 0.10))
+    cons_hi = float(style.get("cons_hi", 0.30))
+    cons_max_wl = float(style.get("cons_max_wl", 1e9))
+    cons_min_wl = float(style.get("cons_min_wl", 0.0))
 
     def roughness(carrier_z, cell_m, slope, seed, src_nyquist_m=30.0,
                   origin_cells=(0, 0)):
@@ -88,9 +92,26 @@ def make_roughness(style: dict):
             if fold == "up":
                 f = (np.float32(_ABS_MEAN) - np.abs(f)) / np.float32(_ABS_STD)
             out += amp * f
-        gain = np.clip(np.asarray(slope, dtype=np.float32) / np.float32(bnoise._SLOPE_REF),
+        s = np.asarray(slope, dtype=np.float32)
+        gain = np.clip(s / np.float32(bnoise._SLOPE_REF),
                        np.float32(gain_lo), np.float32(gain_hi))
         out *= gain
+        if cons_amp > 0.0:
+            c = np.zeros((n0, n1), dtype=np.float32)
+            for octave, wavelength in enumerate(
+                    bnoise.octave_wavelengths(cell_m, float(src_nyquist_m))):
+                if not cons_min_wl <= wavelength <= cons_max_wl:
+                    continue
+                p = int(round(wavelength / cell_m))
+                amp = np.float32(cons_amp * bnoise._REF_AMPLITUDE_M
+                                 * (wavelength / src_nyquist_m) ** bnoise._ROUGHNESS_H)
+                g = bnoise._octave_field((n0, n1), p, seed, 100 + octave, oy, ox)
+                c += amp * ((np.float32(_ABS_MEAN) - np.abs(g))
+                            / np.float32(_ABS_STD))
+            cgain = np.clip((np.float32(cons_hi) - s)
+                            / np.float32(cons_hi - cons_lo),
+                            np.float32(0.0), np.float32(1.0))
+            out += c * cgain
         return out
 
     return roughness
@@ -289,6 +310,51 @@ def run_s1a(config: str, tile: str, style: dict | None):
     write_rec(rec)
 
 
+def run_seampair(config: str, tile: str, overrides: dict, style: dict | None):
+    """Bake TILE and its WEST neighbour with the same constants; measure the join.
+
+    The bar (pipeline.PROFILE_SEAM): the mean step across the join must sit AT
+    the terrain's own one-cell step (ratio ~1.000), with the tail bounded.
+    """
+    tx, ty = TILE_XY[tile]
+    geom = bp.PRODUCTION
+    consts = build_consts(overrides)
+    kernels = bp.load_kernels()
+    if style:
+        kernels = dataclasses.replace(kernels, roughness=make_roughness(style))
+    fetch = coarse_fetch()
+    lvl = bp.FlowLevel(0, geom, consts)
+    edges = {}
+    for name, x in (("W", tx - 1), ("E", tx)):
+        sx, sy = bp.superblock_index(x, ty, lvl)
+        inflow = bp.build_flow_superblock(fetch, sx, sy, lvl, kernels)
+        print(f"[seam {config}/{tile}] baking ({x},{ty})...", flush=True)
+        res = bp.bake_tile(world_seed=SEED, tile_x=x, tile_y=ty, coarse_fetch=fetch,
+                           kernels=kernels, geom=geom, consts=consts,
+                           inflow_source=inflow)
+        z = res.elevation_m
+        edges[name] = (np.array(z[:, -2:]) if name == "W" else np.array(z[:, :2]))
+        del res, z
+    step = np.abs(edges["W"][:, 1] - edges["E"][:, 0]).astype(np.float64)
+    own = 0.5 * (np.abs(np.diff(edges["W"], axis=1)[:, 0])
+                 + np.abs(np.diff(edges["E"], axis=1)[:, 0])).astype(np.float64)
+    rec = {
+        "config": config, "tile": tile, "mode": "seampair",
+        "overrides": overrides, "noise_style": style or {},
+        "join_mean_step_m": float(step.mean()),
+        "terrain_own_step_m": float(own.mean()),
+        "ratio": float(step.mean() / own.mean()),
+        "join_p99_step_m": float(np.percentile(step, 99)),
+        "join_max_step_m": float(step.max()),
+    }
+    (OUT / "metrics").mkdir(parents=True, exist_ok=True)
+    p = OUT / "metrics" / f"seam_{config}_{tile}.json"
+    p.write_text(json.dumps(rec, indent=1))
+    print(f"[seam {config}/{tile}] join mean {rec['join_mean_step_m']:.4f} m vs own "
+          f"{rec['terrain_own_step_m']:.4f} m  ratio {rec['ratio']:.3f}  "
+          f"max {rec['join_max_step_m']:.2f} m", flush=True)
+
+
 def write_rec(rec):
     (OUT / "metrics").mkdir(parents=True, exist_ok=True)
     p = OUT / "metrics" / f"{rec['config']}_{rec['tile']}.json"
@@ -303,7 +369,7 @@ def write_rec(rec):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["bake", "s1a"])
+    ap.add_argument("mode", choices=["bake", "s1a", "seampair"])
     ap.add_argument("--config", required=True)
     ap.add_argument("--tile", required=True, choices=list(TILE_XY))
     ap.add_argument("--set", action="append", default=[], metavar="K=V")
@@ -313,6 +379,8 @@ def main():
     style = json.loads(a.noise) if a.noise else None
     if a.mode == "bake":
         run_bake(a.config, a.tile, overrides, style)
+    elif a.mode == "seampair":
+        run_seampair(a.config, a.tile, overrides, style)
     else:
         run_s1a(a.config, a.tile, style)
 
