@@ -52,6 +52,23 @@ std::vector<BlockCoord> dilatedBlockCoverage(PixelRect footprint, int64_t tileSi
     return blocksCoveringRect(dilateForCarrierStencil(footprint), tileSizePx, blockDimPx);
 }
 
+PixelRect fineReadPixelRect(int64_t worldMmX0, int64_t worldMmY0, int64_t worldMmX1, int64_t worldMmY1,
+                            int64_t readMarginMm, int32_t pixelSizeMm) {
+    if (pixelSizeMm <= 0) return PixelRect{0, 0, -1, -1}; // inverted => "covers nothing"
+    if (readMarginMm < 0) readMarginMm = 0;
+    // The world rect is half-open, so the last mm actually touched is x1-1;
+    // taking floorDiv of x1 itself would claim one extra pixel column on every
+    // call, which is harmless for a gate but makes the rect wrong for anyone
+    // who later uses it to size a buffer.
+    const int64_t x0 = worldMmX0 - readMarginMm;
+    const int64_t y0 = worldMmY0 - readMarginMm;
+    const int64_t x1 = (worldMmX1 > worldMmX0 ? worldMmX1 - 1 : worldMmX0) + readMarginMm;
+    const int64_t y1 = (worldMmY1 > worldMmY0 ? worldMmY1 - 1 : worldMmY0) + readMarginMm;
+    const PixelRect cells{floorDiv(x0, pixelSizeMm), floorDiv(y0, pixelSizeMm),
+                          floorDiv(x1, pixelSizeMm), floorDiv(y1, pixelSizeMm)};
+    return dilateForCarrierStencil(cells);
+}
+
 TileCoord tileCoordForWorldMm(int64_t worldMmX, int64_t worldMmY, int64_t tileFootprintMm) {
     if (tileFootprintMm <= 0) return TileCoord{0, 0};
     return TileCoord{static_cast<int32_t>(floorDiv(worldMmX, tileFootprintMm)),
@@ -80,9 +97,10 @@ std::string formatFineTileCacheKey(const std::string& providerId, uint64_t seed,
 }
 
 FineTileValidationResult validateAndParseFineTile(std::vector<uint8_t> bytes, uint64_t expectedSeed,
-                                                   int32_t expectedX, int32_t expectedY) {
+                                                   int32_t expectedX, int32_t expectedY,
+                                                   const FineDecompressor& decompressor) {
     FineTileValidationResult out;
-    std::optional<FineTile> parsed = FineTile::parse(std::move(bytes));
+    std::optional<FineTile> parsed = FineTile::parse(std::move(bytes), decompressor, &out.error);
     if (!parsed) {
         out.verdict = FineTileVerdict::kCorrupt;
         return out;
