@@ -1,0 +1,56 @@
+﻿class        tile     grade% |  cSinks  aSinks |  cStrnd  aStrnd |  cPath_m  aPath_m  ratio
+-------------------------------------------------------------------------------------------
+plains       -56,20      1.7 |   8,623  11,536 |   91.7%   98.1% |     22.9      3.1  0.135
+very-gentle  14,54       3.7 |      28   7,084 |   90.2%   96.5% |     52.0      7.6  0.146
+gentle       49,-4       6.0 |       3   5,956 |   17.3%   93.7% |    130.9      8.0  0.061
+low-relief   15,54      11.8 |      12   4,931 |   57.4%   93.2% |     53.6     11.4  0.212
+moderate     50,-4      20.1 |       3   1,994 |   16.7%   94.1% |    147.9     28.2  0.191
+third-class  15,55      24.6 |       0   1,759 |    0.0%   90.8% |    215.1     18.6  0.087
+hilly        16,54      33.3 |       0   1,694 |    0.0%   85.0% |    101.4     19.7  0.194
+alpine       -5,15      40.6 |       0   1,625 |    0.0%   87.9% |    223.6     28.9  0.129
+high-alpine  5,25       46.9 |       0   1,612 |    0.0%   84.0% |    149.9     27.8  0.186
+steepest     -4,16      54.2 |       1   1,663 |    3.3%   96.2% |    224.4     24.7  0.110
+
+CONTROL AT TRUE VOXEL SPACING (--drain-stride 1, i.e. 10 cm; the table above is
+stride 10 = 1 m, where the 0.4 m and 0.2 m octaves alias and could in principle
+manufacture the whole effect):
+
+  site               carrier sinks/stranded    amplified sinks/stranded
+  alpine    (40.6%)        0 /   0.0%               292 /  87.9%
+  steepest  (54.2%)        0 /   0.0%              2726 /  97.4%
+  plains     (1.7%)    96543 /  99.0%              4224 /  97.5%
+
+Alpine reads 87.9% stranded at BOTH 1 m and 10 cm, so the steep-ground result is
+not a sampling artifact.
+
+THE PLAINS ROW INVERTS, and it is the most useful row here. At 10 cm postings a
+1.7% grade is flat: the carrier alone strands 99.0% of the domain with a mean
+flow path of 4 cm. The client's detail band takes that to 97.5% and a 35 cm path
+-- it IMPROVES drainage on flat ground, because giving near-level ground some
+relief is what gives water anywhere to go. This is the microrelief band doing
+exactly the job it was added for.
+
+So the defect is STEEP-GROUND ONLY, and the fix must be too:
+
+  * above roughly 25% grade the carrier is perfectly drained (0 sinks, 0%
+    stranded) and the client destroys it -> cap detail here;
+  * below roughly 12% grade the carrier cannot drain at 10 cm regardless and the
+    detail helps -> leave it alone. A cap proportional to carrier gradient with
+    no floor would remove the one thing helping here.
+
+That is measured justification for the floor in
+detailGradient <= max(gradFloor, k * carrierGradient), rather than the
+hand-waving justification it had when it was proposed.
+
+BOTH FIELDS ARE SAMPLED IDENTICALLY, checked rather than assumed, because an
+unfair comparison here would invent the entire finding: sampleAmplifiedRaster
+and sampleCarrierRaster (voxel-core/bench/terrainprobe.cpp:853-873) read raw
+`surfaceMm` and `carrierMm` in millimetres on the same lattice with the same
+stride, and NEITHER quantises to voxel heights.
+
+CLIMATE ON THESE TILES IS A CONSTANT. Every site except alpine (-5,15), plains'
+own exemplar (-55,20) and third-class (15,55) exists only as an elevation-only
+tile repaired by tools/reencode_elevation_only_tiles.py. Elevation is copied
+byte-for-byte so every number above is unaffected, but no material, biome or
+topsoil figure may be quoted off these tiles. The plains row here is tile
+(-56,20), a 90.7%-land neighbour of the (-55,20) exemplar, not the exemplar.
