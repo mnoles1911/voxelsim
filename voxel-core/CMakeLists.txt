@@ -28,6 +28,16 @@ option(VXC_MEMO_STATS "Count amplifier tile-memo probes/misses (diagnostic)" OFF
 if(VXC_MEMO_STATS)
   target_compile_definitions(voxelcore PUBLIC VXC_MEMO_STATS)
 endif()
+# Opt-in per-phase WaterCA::step() accounting (waterca.h WaterCAProfile). OFF
+# by default for the same reason VXC_MEMO_STATS is: the point of the counters
+# is to measure the code, not the instrument, and every timing quoted in
+# docs/status.md must be taken on an uninstrumented build. PUBLIC so
+# vxc_waterca_bench sees the same declarations the library was built with.
+option(VXC_WATER_PROFILE "Accumulate per-phase WaterCA::step() timings (diagnostic)" OFF)
+if(VXC_WATER_PROFILE)
+  target_compile_definitions(voxelcore PUBLIC VXC_WATER_PROFILE)
+endif()
+
 if(MSVC)
   target_compile_options(voxelcore PRIVATE /W4 /WX)
 else()
