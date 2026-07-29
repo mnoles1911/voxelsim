@@ -57,19 +57,46 @@ namespace
 }
 
 // ---------------------------------------------------------------------------
-// FVoxelFineTileSamplerProxy -- the worker-facing query path.
+// FVoxelFineTileSamplerProxy -- the worker-facing query path, AND the place the
+// block-until-ready rule is actually enforced.
 //
 // SHARED lock, and it is only sound because EnsureTileResident_Locked decodes
 // every block of a tile before publishing it: vxc::FineTileSampler::blockFor
 // then takes its found-block path and mutates nothing, so N workers reading
 // concurrently is N pure reads. If whole-tile decode were ever relaxed back to
 // lazy, this lock would have to become exclusive (see the header).
+//
+// THE RESIDENCY TEST HERE IS NOT REDUNDANT WITH THE CHUNK-ADMISSION GATE, and
+// the header's "WHY THE CHUNK-ADMISSION GATE WAS NOT ENOUGH" section is the
+// argument: FVoxelWorldImpl::Voxels is built over this sampler, so collision,
+// agents, water and the pawn-spawn height all read through here without ever
+// admitting a chunk. This is the one line every one of them crosses.
+//
+// COST: one extra findTile hash lookup per query on the hot path (the sampler
+// then does its own). That is the price of the rule being true rather than
+// conventional, it is paid only when the fine tier is switched on at all, and
+// it is nothing beside the block lookup and spline evaluation that follow.
 // ---------------------------------------------------------------------------
 
 int32_t FVoxelFineTileSamplerProxy::elevationMm(int64_t px, int64_t py)
 {
-	FRWScopeLock Lock(Owner.Lock_, SLT_ReadOnly);
-	return Owner.Sampler_.elevationMm(px, py);
+	// Routed by the FIXED production stride, not Sampler_.tileSize(): tileSize()
+	// is 0 until something is loaded, and "nothing is resident" is exactly the
+	// case that must be detected. Same constant, same reasoning, as
+	// FVoxelFineTileStreamer::CoveredTiles.
+	const vxc::TileCoord Tile = vxc::tileCoordForPixel(px, py, int64(vxc::kFineTileSize));
+	{
+		FRWScopeLock Lock(Owner.Lock_, SLT_ReadOnly);
+		// Whole-tile decode at load makes residency a per-TILE fact, so this one
+		// lookup is the complete check.
+		if (Owner.Sampler_.findTile(Tile.x, Tile.y) != nullptr)
+		{
+			return Owner.Sampler_.elevationMm(px, py);
+		}
+	}
+	// Lock released: the cold path may need it EXCLUSIVELY to load, and FRWLock
+	// is not recursive.
+	return Owner.ResolveNonResidentPixel(px, py);
 }
 
 vxc::ClimateSample FVoxelFineTileSamplerProxy::climate(int64_t px, int64_t py)
@@ -99,6 +126,39 @@ FVoxelFineTileStreamer::FVoxelFineTileStreamer(FString RootDir, FString Provider
 	// is an empty decompressor and a CODEC_ZSTD tile is refused whole at load
 	// (FineError::kNoDecompressor), which is the intended loud failure.
 	Sampler_.setDecompressor(VoxelEarth::GetFineTileDecompressor());
+
+	// SELF-CHECK: THE GATE REFUSES WHEN NOTHING IS RESIDENT.
+	//
+	// Nothing has been loaded yet, so IsFootprintResident MUST be false for any
+	// footprint at all. That sounds too trivial to assert -- and it is precisely
+	// the property that was never once checked, because every verification of
+	// this gate was performed with the tile PRESENT.
+	//
+	// It costs two hash lookups on an empty map, at construction, and it is
+	// worth them because of the shape of the regression it catches. The gate has
+	// several ways to become VACUOUSLY TRUE without looking wrong: an empty
+	// covering vector treated as "all resident" (see IsFootprintResident's early
+	// return, which nothing else exercises), a residency loop that iterates zero
+	// times, a short-circuit added for the "nothing loaded yet" case as a
+	// perceived optimisation. Each of those admits every chunk in the world and
+	// none of them faults. voxel-core's unit tests pin the pure coverage maths;
+	// this pins the UE wiring around it, on every run, with nobody having to
+	// remember.
+	//
+	// Deliberately checked at TWO very different footprints: the origin, and a
+	// far-negative one, because a truncating tile route mishandles only the
+	// latter and the leaking capture spawned at negative X.
+	const bool bRefusesOrigin = !IsFootprintResident(0, 0, 1, 1);
+	const bool bRefusesNegative = !IsFootprintResident(-1'000'000'000, -1'000'000'000, -999'999'999, -999'999'999);
+	if (!bRefusesOrigin || !bRefusesNegative)
+	{
+		UE_LOG(LogVoxelEarth, Fatal,
+		       TEXT("FINE TIER GATE IS BROKEN AT STARTUP: IsFootprintResident returned TRUE with zero tiles loaded ")
+		       TEXT("(origin refused=%d, far-negative refused=%d). The gate would admit every chunk in the world over ")
+		       TEXT("non-resident tiles and this run would generate terrain no other client reproduces. Refusing to ")
+		       TEXT("start rather than produce it."),
+		       bRefusesOrigin ? 1 : 0, bRefusesNegative ? 1 : 0);
+	}
 }
 
 FString FVoxelFineTileStreamer::LocalPathFor(vxc::TileCoord Tile) const
@@ -233,47 +293,48 @@ vxc::TileCoord FVoxelFineTileStreamer::CoarseTileForWorldMm(int64 WorldMmX, int6
 	return vxc::tileCoordForWorldMm(WorldMmX, WorldMmY, kTileFootprintMm);
 }
 
-void FVoxelFineTileStreamer::CoveredTileRange(int64 WorldMmX0, int64 WorldMmY0, int64 WorldMmX1, int64 WorldMmY1,
-                                              int32_t& OutTx0, int32_t& OutTy0, int32_t& OutTx1, int32_t& OutTy1)
+std::vector<vxc::TileCoord> FVoxelFineTileStreamer::CoveredTiles(int64 WorldMmX0, int64 WorldMmY0, int64 WorldMmX1,
+                                                                 int64 WorldMmY1)
 {
 	// One conversion, in voxel-core, applying BOTH the cavern read margin and
 	// the carrier stencil -- see vxc::fineReadPixelRect's comment for why
-	// leaving either out is a silent desync rather than a fault. The pixel rect
-	// is then divided by the FIXED production stride: tile selection has to
-	// work before anything is resident, and every production tile is
-	// kFineTileSize (the per-tile `size` field is a test-fixture convenience,
-	// see tilestore.h). A loaded tile whose size disagreed would have been
-	// refused by FineTileSampler::loadTile anyway.
-	const vxc::PixelRect Rect =
-		vxc::fineReadPixelRect(WorldMmX0, WorldMmY0, WorldMmX1, WorldMmY1, kFineReadMarginMm);
-	constexpr int64 TileSizePx = int64(vxc::kFineTileSize);
-	OutTx0 = int32_t(vxc::floorDiv(Rect.px0, TileSizePx));
-	OutTy0 = int32_t(vxc::floorDiv(Rect.py0, TileSizePx));
-	OutTx1 = int32_t(vxc::floorDiv(Rect.px1, TileSizePx));
-	OutTy1 = int32_t(vxc::floorDiv(Rect.py1, TileSizePx));
+	// leaving either out is a silent desync rather than a fault. The FIXED
+	// production stride is passed because tile selection has to work before
+	// anything is resident, and every production tile is kFineTileSize (the
+	// per-tile `size` field is a test-fixture convenience, see tilestore.h). A
+	// loaded tile whose size disagreed would have been refused by
+	// FineTileSampler::loadTile anyway.
+	//
+	// This function is now four lines because the arithmetic moved to
+	// vxc::tilesCoveringFootprint. That was not tidying: while it lived here it
+	// could only be exercised by launching an editor over a real bake, which is
+	// why it was only ever exercised with the tile PRESENT. In voxel-core the
+	// absent direction is a unit test (test_tilestreaming.cpp,
+	// "gate_blocks_when_nothing_is_resident" and the read-margin pair).
+	return vxc::tilesCoveringFootprint(WorldMmX0, WorldMmY0, WorldMmX1, WorldMmY1, kFineReadMarginMm,
+	                                   int64(vxc::kFineTileSize));
 }
 
 bool FVoxelFineTileStreamer::IsFootprintResident(int64 WorldMmX0, int64 WorldMmY0, int64 WorldMmX1,
                                                  int64 WorldMmY1) const
 {
-	int32_t Tx0, Ty0, Tx1, Ty1;
-	CoveredTileRange(WorldMmX0, WorldMmY0, WorldMmX1, WorldMmY1, Tx0, Ty0, Tx1, Ty1);
+	const std::vector<vxc::TileCoord> Tiles = CoveredTiles(WorldMmX0, WorldMmY0, WorldMmX1, WorldMmY1);
+	if (Tiles.empty())
+	{
+		// vxc::tilesCoveringFootprint declines only on degenerate geometry, which
+		// this call site cannot produce (compile-time stride and pitch). Refuse
+		// rather than admit: "covers nothing" must never read as "all resident".
+		return false;
+	}
 
 	FRWScopeLock Lock(Lock_, SLT_ReadOnly);
-	if (Sampler_.tileCount() == 0)
-	{
-		return false; // nothing loaded at all yet
-	}
 	// Whole-tile decode at load makes residency a per-TILE fact, so this is the
 	// complete check -- no block walk, no decode, no I/O.
-	for (int32_t Ty = Ty0; Ty <= Ty1; ++Ty)
+	for (const vxc::TileCoord& T : Tiles)
 	{
-		for (int32_t Tx = Tx0; Tx <= Tx1; ++Tx)
+		if (Sampler_.findTile(T.x, T.y) == nullptr)
 		{
-			if (Sampler_.findTile(Tx, Ty) == nullptr)
-			{
-				return false;
-			}
+			return false;
 		}
 	}
 	return true;
@@ -281,30 +342,147 @@ bool FVoxelFineTileStreamer::IsFootprintResident(int64 WorldMmX0, int64 WorldMmY
 
 bool FVoxelFineTileStreamer::RequestFootprint(int64 WorldMmX0, int64 WorldMmY0, int64 WorldMmX1, int64 WorldMmY1)
 {
-	int32_t Tx0, Ty0, Tx1, Ty1;
-	CoveredTileRange(WorldMmX0, WorldMmY0, WorldMmX1, WorldMmY1, Tx0, Ty0, Tx1, Ty1);
+	const std::vector<vxc::TileCoord> Tiles = CoveredTiles(WorldMmX0, WorldMmY0, WorldMmX1, WorldMmY1);
+	if (Tiles.empty())
+	{
+		return false; // see IsFootprintResident: decline, never admit
+	}
 
 	FRWScopeLock Lock(Lock_, SLT_Write);
 	bool bAllResident = true;
-	for (int32_t Ty = Ty0; Ty <= Ty1; ++Ty)
+	for (const vxc::TileCoord& T : Tiles)
 	{
-		for (int32_t Tx = Tx0; Tx <= Tx1; ++Tx)
+		if (KnownMissing_.find(TileHash(T)) != KnownMissing_.end())
 		{
-			const vxc::TileCoord T{Tx, Ty};
-			if (KnownMissing_.find(TileHash(T)) != KnownMissing_.end())
-			{
-				bAllResident = false; // absent as of this ring; do not re-stat per candidate
-				continue;
-			}
-			if (!EnsureTileResident_Locked(T))
-			{
-				bAllResident = false; // keep going: load whatever IS available, still report incomplete
-			}
+			bAllResident = false; // absent as of this ring; do not re-stat per candidate
+			continue;
+		}
+		if (!EnsureTileResident_Locked(T))
+		{
+			bAllResident = false; // keep going: load whatever IS available, still report incomplete
 		}
 	}
 	// At least one required tile missing/invalid => block. Never voxelize over
 	// a partially covered footprint: the uncovered part reads back as sea level.
 	return bAllResident;
+}
+
+// ---------------------------------------------------------------------------
+// The funnel's cold path: this pixel's tile is not resident.
+// ---------------------------------------------------------------------------
+
+int32_t FVoxelFineTileStreamer::ResolveNonResidentPixel(int64_t px, int64_t py)
+{
+	const vxc::TileCoord Tile = vxc::tileCoordForPixel(px, py, int64(vxc::kFineTileSize));
+
+	// BLOCK UNTIL READY, in the literal sense, on the one thread where blocking
+	// is permitted. This is the same synchronous load RequestFootprint performs
+	// and is legal for exactly the same reason: the game thread may do disk I/O
+	// and may hold this lock exclusively, whereas a meshing worker doing so
+	// would stall the whole pool behind a 200 MB read.
+	//
+	// This single branch is what fixes the ~100 unguarded consumers found in the
+	// audit -- character movement, the agent region graph, the water CA's
+	// solidity callback, GetSurfaceHeightUU, the SWE fixtures, the HUD. Every
+	// one of them runs on the game thread, so every one of them now gets a
+	// correct answer instead of sea level, without a gate call of its own.
+	if (IsInGameThread())
+	{
+		FRWScopeLock Lock(Lock_, SLT_Write);
+		// Re-check under the exclusive lock: another game-thread call earlier in
+		// this frame, or TickResidencyAndEviction, may have loaded it since the
+		// shared-lock miss above.
+		if (Sampler_.findTile(Tile.x, Tile.y) != nullptr)
+		{
+			return Sampler_.elevationMm(px, py);
+		}
+		// KnownMissing_ is the "we already stat'ed this and it is not on disk"
+		// memo. Honouring it here keeps a query storm over a genuinely absent
+		// tile from re-stat'ing the filesystem millions of times; the memo is
+		// cleared whenever the ring centre moves, so a tile the bake produces
+		// mid-session is still picked up.
+		if (KnownMissing_.find(TileHash(Tile)) == KnownMissing_.end())
+		{
+			BlockingLoads_.fetch_add(1, std::memory_order_relaxed);
+			if (EnsureTileResident_Locked(Tile))
+			{
+				return Sampler_.elevationMm(px, py);
+			}
+		}
+		return ReportGateLeak_Locked(Tile, px, py);
+	}
+
+	// A WORKER got here. With the chunk-admission gate in front of the meshing
+	// path this should be unreachable, and if it is reached the gate has a hole
+	// -- so it is reported as a leak rather than papered over. It is emphatically
+	// NOT loaded here: a worker taking this lock exclusively for a 200 MB read
+	// serialises every other worker behind it, and the tile may never arrive
+	// anyway, so "block" would mean "hang".
+	FRWScopeLock Lock(Lock_, SLT_Write);
+	if (Sampler_.findTile(Tile.x, Tile.y) != nullptr)
+	{
+		return Sampler_.elevationMm(px, py); // raced with a load; not a leak
+	}
+	return ReportGateLeak_Locked(Tile, px, py);
+}
+
+int32_t FVoxelFineTileStreamer::ReportGateLeak_Locked(vxc::TileCoord Tile, int64_t px, int64_t py)
+{
+	const uint64 LeakCount = GateLeaks_.fetch_add(1, std::memory_order_relaxed) + 1;
+
+	// WHY FATAL, AND WHY ONLY WHEN UNATTENDED.
+	//
+	// A leak means this process is generating collision and edits from sea level
+	// where a client holding the tile generates real terrain. There is no
+	// partially-correct outcome to salvage: the run's terrain is not
+	// reproducible, so every number, screenshot and digest it goes on to produce
+	// describes a world that does not exist. An unattended run that continues
+	// past this point does not degrade, it LIES -- and it lies while reporting
+	// success, which is strictly worse than not finishing, because the next
+	// person reads the artifact and believes it. That is not a hypothetical:
+	// this whole class of bug survived because a run leaked 18.7 million times
+	// and still exited 0.
+	//
+	// Interactive editor sessions get an Error instead. A developer poking at a
+	// half-populated tile cache is not producing an artifact anyone will trust,
+	// and killing their editor on the first frame the camera crosses the bake
+	// frontier teaches them to switch the check off -- which costs the
+	// unattended case its protection too.
+	const bool bFirstForThisTile = LeakReportedTiles_.insert(TileHash(Tile)).second;
+
+	if (bLeakIsFatal_)
+	{
+		UE_LOG(LogVoxelEarth, Fatal,
+		       TEXT("FINE TIER GATE LEAK (fatal, unattended run): elevation query at fine pixel (%lld,%lld) needs tile ")
+		       TEXT("(%d,%d), which is not resident and could not be loaded from %s. Answering it would mean sea level, ")
+		       TEXT("and on the fine tier sea level is not a fallback -- it is terrain no other client computes, so this ")
+		       TEXT("run's output would not be reproducible. Stopping instead of producing an artifact that looks fine. ")
+		       TEXT("Leaks so far=%llu, blocking loads=%llu, resident=%llu tile(s), absentOnDisk=%llu, corrupt=%llu, ")
+		       TEXT("identityMismatch=%llu. If the tile SHOULD exist, check -VoxelFineTileProviderId: it is part of the ")
+		       TEXT("cache key and of the on-disk path, and omitting it makes every lookup miss. Pass ")
+		       TEXT("-VoxelFineTileGateFatal=0 to downgrade this to an Error."),
+		       (long long)px, (long long)py, Tile.x, Tile.y, *LocalPathFor(Tile), (unsigned long long)LeakCount,
+		       (unsigned long long)BlockingLoads_.load(std::memory_order_relaxed), (unsigned long long)Sampler_.tileCount(),
+		       (unsigned long long)MissingFileLoads_, (unsigned long long)CorruptLoads_,
+		       (unsigned long long)IdentityMismatches_);
+		// UE_LOG(Fatal) does not return. The sea-level answer below is
+		// unreachable here and exists only for the non-fatal path.
+	}
+
+	if (bFirstForThisTile)
+	{
+		UE_LOG(LogVoxelEarth, Error,
+		       TEXT("FINE TIER GATE LEAK: elevation query at fine pixel (%lld,%lld) landed in NON-RESIDENT tile (%d,%d) ")
+		       TEXT("(%s) and is being answered with SEA LEVEL. That is a desync, not a fallback: this client's terrain, ")
+		       TEXT("collision and edits here will not match a client that has the tile. Logged once per tile; total ")
+		       TEXT("leaks=%llu. Thread=%s. Unattended runs stop on this instead (SetLeakIsFatal)."),
+		       (long long)px, (long long)py, Tile.x, Tile.y, *LocalPathFor(Tile), (unsigned long long)LeakCount,
+		       IsInGameThread() ? TEXT("game") : TEXT("worker"));
+	}
+
+	// The sampler's own missingTileQueries bump happens inside this call, which
+	// keeps MaybeLogCounters' after-the-fact check working unchanged.
+	return Sampler_.elevationMm(px, py);
 }
 
 void FVoxelFineTileStreamer::TickResidencyAndEviction(vxc::TileCoord PlayerCoarseTile)
