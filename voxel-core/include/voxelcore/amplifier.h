@@ -78,47 +78,85 @@ inline constexpr int64_t kSurfaceBoundDeclined = INT64_MAX;
 // something that looks like it works.
 inline constexpr int64_t kSurfaceLowerBoundDeclined = INT64_MIN;
 
-// Tile-pixel corners the bound will read per axis before declining. A level-4
-// chunk (51.2 m) needs 4 corners against a 30 m pixel and ~15 against the
-// 3.75 m scale-8 pixel; 16 leaves generous headroom at scale 1 while keeping
-// the read count and the on-stack corner grid bounded (16x16 int64 = 2 KB).
+// Tile CONTROL POINTS the bound will read per axis before declining.
 //
-// Re-checked when the ring cascade grew to level 5 (2 km edge): a level-5
-// footprint is 102.4 m plus a 6.4 m apron = 108.8 m, needing ~6 corners at
-// 30 m -- still inside the cap, so at SCALE 1 (the only scale any tile has
-// ever been generated at) the bound is COMPUTED, not declined, at every level
-// the cascade now uses. The bound does get looser with a bigger footprint,
-// because a larger rectangle spans more pixel cells and so admits a wider base
-// range and a higher max slope. That is the SAFE direction for both consumers:
-// surfaceUpperBoundMm rising and solidBelowBoundMm falling each mean FEWER
-// chunks are provably skippable, never more, so a looser bound costs
-// optimization and cannot open a hole in the world.
+// THE ARITHMETIC, spelled out so the next pixel-size change re-derives it
+// instead of trusting it. Both previous values were sized against a pixel that
+// then moved underneath them, which is how this constant became a cliff twice.
 //
-// SCALE 8 IS DIFFERENT, and this comment previously got it wrong by 3x because
-// it used the superseded 11.25 m pixel (90 m / 8) instead of the real 3.75 m
-// (30 m / 8) -- see tilestore.h's tilePixelSizeMm. At 3.75 m a level-5
-// footprint needs ~30 corners and a level-4 one ~15, so the bound would
-// DECLINE from level 5 up rather than at level 6. Declining is safe (it skips
-// nothing), but it means the sky-band and all-solid trims would quietly stop
-// paying off above level 4 on scale-8 tiles. Raise this cap, and re-check the
-// 2 KB stack grid, before generating scale-8 tiles or extending the cascade
-// past level 5.
-// v9 RAISED THIS FROM 16 TO 34, and the reason is the carrier's stencil. A
-// cubic B-spline on cell c reads control points c-1..c+2, so the grid the bound
-// must see is the cells the footprint touches DILATED by one on the low side
-// and two on the high side: three more control points per axis than v8's
-// bilinear needed. A level-5 footprint (108.8 m incl. apron) spans ~4 cells at
-// 30 m -> 7 control points, and ~29 cells at the 3.75 m scale-8 pixel -> 32.
-// 34 covers both with headroom; the on-stack grid is 34x34 int64 = 9.2 KB, up
-// from 2 KB.
+// The largest footprint the streaming layer ever asks about is the ALL-SOLID
+// trim's level-5 chunk WITH the mesher apron (VoxelWorldSubsystem's
+// FootprintSolidFloorMmCached): 32 * 2^5 = 1024 level-0 voxels of chunk plus
+// one level-scale voxel-run either side = 1088 voxels = 108.8 m, so the
+// INCLUSIVE span (x1Mm - x0Mm) is 108700 mm. The sky-band trim asks about the
+// same chunk without the apron, which is strictly smaller.
 //
-// This also discharges the v8 warning that used to live here: at 3.75 m the old
-// cap of 16 would have made the bound DECLINE from level 4 up, so the sky-band
-// and all-solid trims would have quietly stopped paying off on scale-8 tiles.
-// Declining is safe -- it skips nothing -- but it is a silent performance
-// cliff, and the baked fine tier (docs/terrain-amplification-plan.md Phase 2)
-// is about to make scale-8 the normal case.
-inline constexpr int64_t kSurfaceBoundMaxCornersPerAxis = 34;
+// A footprint at an arbitrary phase against a pxMm grid touches at most
+// floor(span/pxMm) + 2 cells per axis, and the cubic B-spline carrier dilates
+// that by one cell low and two high (a spline on cell c reads control points
+// c-1..c+2), so the grid this function must materialise is
+//
+//     nx <= floor(108700 / pxMm) + 2 + 3
+//
+//     30 m/px    (scale 1)  ->  nx <=  8
+//     3.75 m/px  (scale 8)  ->  nx <= 33
+//     1.875 m/px (scale 16) ->  nx <= 62   <-- the .vxtl v2 fine tier
+//
+// 64 covers all three, and it is NOT generous at 1.875 m: two control points
+// of headroom, i.e. the cap admits a 112.5 m footprint where the cascade asks
+// for 108.8 m. A level-6 footprint (204.8 m + apron) would need ~114 and
+// declines -- which it does at every pixel size, including 30 m, and is
+// unchanged by this constant.
+//
+// WHY THE CAP IS SIZED RATHER THAN JUST REMOVED. Declining is SAFE: the
+// sentinels mean "no information", so a decline skips no chunk and can never
+// open a hole in the world. It is a PERFORMANCE cliff, not a correctness one --
+// the sky-band and all-solid trims quietly stop paying off above the level
+// where the cap first bites. Sizing the cap to the cascade keeps the trims
+// alive at every level the streamer actually uses, while still refusing the
+// unbounded read that an arbitrarily large footprint would ask for.
+//
+// Note also that a bigger cap costs nothing when it is not needed: the read
+// loop and the first-difference scans in surfaceBoundsMm are bounded by nx/ny,
+// which come from the footprint, never by this constant. At 30 m the work is
+// identical at 16, 34 or 64 -- only the address space reserved for the grid
+// changes. Raising it cannot move worldgen output either: the only thing it
+// governs is WHEN the bound declines, and the bound is a derived query that no
+// generation path reads.
+//
+// HISTORY:
+//  * v8 used 16, sized for a 30 m pixel and a BILINEAR carrier (4 corners for
+//    a level-4 chunk). Its own comment warned that scale 8 would decline.
+//  * v9 raised it to 34 for the cubic carrier's three extra points per axis,
+//    sized for the 3.75 m pixel then planned for scale 8 -- nx <= 33, one
+//    point of headroom.
+//  * 64 is the .vxtl v2 fine tier (docs/vxtl-v2-format.md 1) moving that pixel
+//    from 3.75 m to 1.875 m. At 34 a 1.875 m level-5 footprint needs 62 and
+//    would decline -- exactly the cliff v9 had just removed at 3.75 m.
+//
+// THE STACK. surfaceBoundsMm materialises the control grid in one on-stack
+// int64 array: 64*64*8 = 32 KB, up from 34*34*8 = 9.2 KB (2 KB at v8). That is
+// acceptable in the two contexts that call it -- the game thread's desired-set
+// pass and the streaming worker pool -- for three reasons that are properties
+// of this code rather than assumptions about the host:
+//
+//   * it is ONE fixed frame, not a per-level or per-recursion cost.
+//     surfaceBoundsMm is a leaf as far as stack goes: it calls only
+//     cachedElevationMm and evalCarrier, neither of which recurses or holds a
+//     comparable frame, and the amplifier's own per-thread state (the memo
+//     tables) is thread_local, not stack. 32 KB is the peak of this chain, not
+//     a term in a sum.
+//   * 32 KB is ~3% of the 1 MB default thread stack reserve on Win64, and the
+//     array is not initialised -- only the nx*ny prefix is ever written or
+//     read -- so the larger cap costs reserved stack, not touched pages.
+//   * MSVC emits a __chkstk probe for any frame over one 4 KB page, so the
+//     guard page is walked in order rather than skipped. That was already true
+//     at 9.2 KB; 32 KB does not change the mechanism.
+//
+// If a future tier ever pushes this past ~128 (128*128*8 = 128 KB) the grid
+// should move to a static thread_local scratch buffer instead of growing
+// further on the stack. At 64 it does not need to.
+inline constexpr int64_t kSurfaceBoundMaxCornersPerAxis = 64;
 
 class Amplifier {
 public:
