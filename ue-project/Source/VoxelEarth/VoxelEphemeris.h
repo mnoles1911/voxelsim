@@ -190,4 +190,31 @@ namespace VoxelSky
 	// illuminated fraction, and taking it from the caller's FSunState keeps the
 	// returned phase self-consistent with the returned directions.
 	VOXELEARTH_API FMoonState ComputeMoon(double JulianDay, const FGeoCoord& Geo, const FSunState& Sun);
+
+	// Local mean sidereal time, in degrees, wrapped into [0, 360).
+	//
+	// WHAT IT IS FOR. This is the one number that turns a CELESTIAL coordinate
+	// (right ascension, which is fixed to the stars) into a LOCAL one (hour
+	// angle, which is where the thing actually is in your sky). Everything in
+	// this file that needs it already had it -- ComputeMoon computes the moon's
+	// hour angle from exactly this quantity -- but a star FIELD needs it too, and
+	// needs it OUTSIDE this file: M_NightSky's StarRotation parameter is local
+	// sidereal time expressed in TURNS, i.e. this divided by 360
+	// (Tools/create_sky_material.py, "EQUIRECT UV").
+	//
+	// EXPORTED AS A WRAPPER OVER THE EXISTING FORMULA, NOT AS A SECOND COPY OF
+	// IT. Meeus 12.4 is four coefficients and it would be trivial to paste into
+	// VoxelSkySubsystem.cpp; that is the trap. The stars and the moon would then
+	// be driven by two independently-editable expressions for the same angle, and
+	// a divergence between them shows up as a moon that drifts through a star
+	// field over hours of play -- slow, subtle, and impossible to attribute to
+	// either file. There is one expression, in ComputeMoon's own path, and this
+	// is it.
+	//
+	// MEAN, NOT APPARENT: no equation of the equinoxes (nutation in right
+	// ascension), which is under 1.2 arcseconds. That is four orders of magnitude
+	// below the moon model's own ~1.3-degree longitude error and about a
+	// thousandth of a star map texel at 4k, so it would be a term nothing here
+	// could resolve.
+	VOXELEARTH_API double LocalSiderealTimeDeg(double JulianDay, const FGeoCoord& Geo);
 }

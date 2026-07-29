@@ -382,7 +382,13 @@ FMoonState ComputeMoon(double JulianDay, const FGeoCoord& Geo, const FSunState& 
 		CosD(MoonLongDeg)));
 
 	// Local hour angle = local sidereal time - right ascension.
-	const double LocalSiderealDeg = GreenwichMeanSiderealTimeDeg(JulianDay) + Geo.LongitudeDeg;
+	//
+	// Routed through the EXPORTED LocalSiderealTimeDeg rather than calling
+	// GreenwichMeanSiderealTimeDeg directly, so that the moon's hour angle and
+	// M_NightSky's StarRotation are the same expression and not two copies of it
+	// (see the header). The wrap this now applies is harmless here -- WrapDeg180
+	// below wraps the difference anyway.
+	const double LocalSiderealDeg = LocalSiderealTimeDeg(JulianDay, Geo);
 	const double HourAngleDeg = WrapDeg180(LocalSiderealDeg - RaDeg);
 
 	const FHorizontal H = HorizontalFromHourAngle(HourAngleDeg, DecDeg, Geo.LatitudeDeg);
@@ -433,6 +439,25 @@ FMoonState ComputeMoon(double JulianDay, const FGeoCoord& Geo, const FSunState& 
 	Out.IlluminatedFraction = FMath::Clamp(0.5 * (1.0 - CosElongation), 0.0, 1.0);
 
 	return Out;
+}
+
+double LocalSiderealTimeDeg(double JulianDay, const FGeoCoord& Geo)
+{
+	// Greenwich mean sidereal time plus EAST longitude. The sign is the one place
+	// this can go wrong and it is fixed by FGeoCoord's own convention
+	// (VoxelEphemeris.h:59-64): longitude is east-positive, and sidereal time runs
+	// eastward with the observer, so a place further east reaches a given star's
+	// meridian transit EARLIER in universal time -- hence plus, not minus. Getting
+	// it backwards puts the star field at the antipodal longitude, which at this
+	// project's default OriginLongitudeDeg of 0.0 is exactly zero degrees of
+	// error and would ship unnoticed until someone moved the origin.
+	//
+	// Re-wrapped to [0, 360) because the sum can leave the range GMST was wrapped
+	// into: the caller in ComputeMoon takes a difference and does not care, but
+	// M_NightSky's StarRotation is this divided by 360 and a value outside [0,1)
+	// only survives because the star map's U wraps. It is cheaper to be in range
+	// than to depend on that.
+	return WrapDeg360(GreenwichMeanSiderealTimeDeg(JulianDay) + Geo.LongitudeDeg);
 }
 
 } // namespace VoxelSky

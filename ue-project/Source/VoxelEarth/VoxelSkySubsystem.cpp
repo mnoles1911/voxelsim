@@ -3,6 +3,7 @@
 #include "VoxelEarth.h"
 #include "VoxelEarthGameMode.h" // VoxelEarthSpawn::ParseSpawnColumnUU -- see SpawnRig
 #include "VoxelEphemeris.h"
+#include "VoxelSkyDomeActor.h"
 #include "VoxelWorldSubsystem.h"
 
 #include "Camera/PlayerCameraManager.h"
@@ -16,8 +17,11 @@
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
+#include "Kismet/KismetMaterialLibrary.h" // the MPC writes -- see ApplySkyMaterialParams
+#include "Materials/MaterialParameterCollection.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
+#include "UObject/StrongObjectPtr.h" // FVoxelSkyImpl is a plain struct; see SkyParams
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelSky, Log, All);
 
@@ -206,6 +210,46 @@ namespace
 		TEXT("mid-grey and every screenshot gate pass anyway."),
 		ECVF_Default);
 
+	TAutoConsoleVariable<int32> CVarSkyDomeEnabled(
+		TEXT("voxel.Sky.DomeEnabled"), 1,
+		TEXT("Draw the night-sky dome -- the stars and the textured, phased moon disc (AVoxelSkyDomeActor + ")
+		TEXT("/Game/Voxel/M_NightSky). 1 = on (default). 0 HIDES THE MESH ONLY: the light rig, the ")
+		TEXT("SkyAtmosphere, the exposure curve and the MPC writes are all untouched, so this is a clean A/B ")
+		TEXT("for 'how much of the night frame is the star dome' rather than a night-off switch. Live -- ")
+		TEXT("toggling it at runtime shows/hides within a frame and logs the transition. NOTE the moon's flat ")
+		TEXT("atmosphere disc is suppressed unconditionally (SetAtmosphereSunDiskColorScale in SpawnRig), so ")
+		TEXT("with this at 0 there is NO moon disc at all, not the old untextured one."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<float> CVarSkyDomeRadiusUU(
+		TEXT("voxel.Sky.DomeRadiusUU"), 2.0e7f,
+		TEXT("Radius of the night-sky dome, in Unreal units. Default 2e7 = 200 km. THIS IS A LOWER BOUND ")
+		TEXT("PROBLEM, NOT A TUNING KNOB: M_NightSky keeps depth testing on so that a mountain occludes the ")
+		TEXT("stars behind it, which means the dome must be FARTHER than the farthest drawn geometry or ")
+		TEXT("distant terrain is drawn in front of the sky instead. The binding constraint is ")
+		TEXT("AVoxelClipmapActor, whose outermost half-extent is 16x the ring cascade's outer radius -- 65.5 ")
+		TEXT("km at the shipped 4096 m cascade, whose CORNER is 92.7 km -- so the default clears it by 2.16x. ")
+		TEXT("Raise it if -VoxelRingOuterMeters grows the cascade; AVoxelSkyDomeActor::BeginPlay measures the ")
+		TEXT("actual extent and logs an Error if this loses. There is no upper clip to worry about: UE's ")
+		TEXT("default projection has an infinite far plane. Live."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<float> CVarSkyStarRotationOffsetTurns(
+		TEXT("voxel.Sky.StarRotationOffsetTurns"), 0.0f,
+		TEXT("Constant offset added to the star map's rotation, in TURNS (1.0 = a full revolution). Default ")
+		TEXT("0.0. WHY THIS EXISTS AS A CVAR AT ALL: M_NightSky's StarRotation parameter is documented as ")
+		TEXT("carrying local sidereal time PLUS whatever constant offset the star map's right-ascension ")
+		TEXT("origin needs (Tools/create_sky_material.py, 'EQUIRECT UV'). The two are folded into one scalar, ")
+		TEXT("so the moment C++ drives it every frame the MPC's own default is overwritten and there is no ")
+		TEXT("asset-side place left to put the offset -- it has to live here or in a rebuild. Whether the ")
+		TEXT("offset is needed cannot be known without an editor: if U=0 of T_SkyStarmap is not RA=0, the sky ")
+		TEXT("comes out correctly oriented, correctly rotating, and turned by a constant angle about the ")
+		TEXT("celestial pole, which no screenshot review would catch. This is the knob that fixes that in one ")
+		TEXT("console line instead of a recompile, exactly as StarUDirection is the one that fixes handedness ")
+		TEXT("in one asset edit. 0.25 = a quarter turn; the sign follows the resolved StarUDirection, so this ")
+		TEXT("is applied in the same sense the sidereal drive is."),
+		ECVF_Default);
+
 	TAutoConsoleVariable<float> CVarSkyExposureBias(
 		TEXT("voxel.Sky.ExposureBias"), 0.0f,
 		TEXT("Extra stops added on top of whatever voxel.Sky.ExposureMode resolves to. Default 0.0 ")
@@ -297,6 +341,28 @@ namespace VoxelSky
 	int32 GetExposureMode() { return FMath::Clamp(CVarSkyExposureMode.GetValueOnAnyThread(), 0, 2); }
 
 	float GetExposureBias() { return CVarSkyExposureBias.GetValueOnAnyThread(); }
+
+	bool IsDomeEnabled() { return CVarSkyDomeEnabled.GetValueOnAnyThread() != 0; }
+
+	// Floored at 1e6 UU (10 km) purely so that a fat-fingered 0 or a negative
+	// value cannot collapse the dome to a point at the camera, which renders as a
+	// full-screen wash of whatever texel the star map has at the zenith and looks
+	// nothing like "the dome is too small". The floor is NOT the correctness
+	// bound -- 10 km is well inside the clipmap and would still hide the stars;
+	// AVoxelSkyDomeActor::BeginPlay is what measures and reports that.
+	double GetDomeRadiusUU()
+	{
+		return FMath::Max(1.0e6, (double)CVarSkyDomeRadiusUU.GetValueOnAnyThread());
+	}
+
+	// Unclamped and unwrapped on purpose: it is a rotation in turns, so every
+	// real value is meaningful and 1.25 means the same thing as 0.25. Wrapping it
+	// into [0,1) here would only make the read-back log disagree with what was
+	// typed, which is the one thing the read-back rule forbids.
+	double GetStarRotationOffsetTurns()
+	{
+		return (double)CVarSkyStarRotationOffsetTurns.GetValueOnAnyThread();
+	}
 } // namespace VoxelSky
 
 // --- tuning constants ------------------------------------------------------
@@ -589,6 +655,84 @@ namespace
 			(AltitudeDeg - kMoonHorizonGateStartDeg) /
 				(kMoonHorizonGateEndDeg - kMoonHorizonGateStartDeg), 0.0, 1.0);
 		return T * T * (3.0 - 2.0 * T); // no visible kink at either end
+	}
+
+	// --- the night sky's material (M_NightSky + MPC_VoxelSky) ----------------
+
+	// The collection M_NightSky binds every one of its parameters to. Named once,
+	// here, because the string appears in a LoadObject and in three separate
+	// diagnostics and a typo in any of them is a night sky that renders the
+	// asset's DEFAULTS -- a plausible-looking star field frozen at the wrong
+	// sidereal time with a moon due east at 45 degrees -- rather than an error.
+	const TCHAR* kSkyCollectionPath = TEXT("/Game/Voxel/MPC_VoxelSky.MPC_VoxelSky");
+
+	// THE STAR FIELD'S SUNRISE FADE, and it is NOT optional decoration.
+	//
+	// M_NightSky is BLEND_Additive and is composited AFTER the SkyAtmosphere
+	// (Tools/create_sky_material.py, "WHY ADDITIVE TRANSLUCENT INSTEAD"), which
+	// means nothing in the renderer extinguishes the stars as the sky brightens
+	// -- physically the day sky drowns them, and here it simply does not. The
+	// material's author states the consequence plainly: an always-on star field
+	// at noon is the expected failure mode if this hook is never written. This is
+	// that hook, and it is the only thing standing between the shipped default
+	// (StarBrightness 1.0) and stars over a blue afternoon.
+	//
+	// THE BAND IS ASTRONOMICAL TWILIGHT TO THE HORIZON, which is the honest
+	// answer rather than a chosen one: -18 deg is where sunlight stops reaching
+	// any part of the sky above the observer, and 0 is where the sun's disc is on
+	// the horizon. -12 rather than -18 for the full-brightness end because real
+	// naked-eye stars are already out through most of nautical twilight, and
+	// because the last six degrees would otherwise spend the fade in a band where
+	// the atmosphere renders essentially nothing anyway. Smoothstepped for the
+	// same reason every other gate in this file is: a linear ramp's two corners
+	// are visible as a kink at exactly the moment anyone is watching the sky.
+	//
+	// NOTE WHAT THIS IS NOT COUPLED TO. It is a function of sun altitude ALONE,
+	// like the exposure curve above and for the same reason -- the same sky must
+	// not render differently in two places. In particular it does NOT know about
+	// the exposure curve, which is lifting the frame by up to 15.6 stops at the
+	// same time; the two multiply on screen, and if the stars come out too bright
+	// or too dim at twilight the knob for that is voxel.Sky.StarGain below.
+	//
+	// CORRECTION to the line above, which said the knob was "the MPC's own
+	// StarBrightness default (an asset edit, no regeneration)". It is not. This
+	// subsystem WRITES StarBrightness every frame, so the asset default is
+	// overwritten before anything renders and editing it does nothing. Same trap
+	// the star-map handedness note hit for StarRotation: once C++ drives a
+	// collection scalar, that scalar's asset default is dead as a tuning surface
+	// and the knob has to live here.
+	constexpr double kStarFadeFullBelowDeg = -12.0;
+	constexpr double kStarFadeZeroAboveDeg = 0.0;
+
+	// Master star gain. create_sky_material.py ships StarBrightness/MoonBrightness
+	// defaults deliberately high (1.0 / 20.0) so a first capture proves the graph
+	// compiled rather than being invisible -- an over-bright sky is diagnosable, an
+	// empty one is indistinguishable from a dozen other failures. Measured on the
+	// first live capture (winter 21h00, sun -44.7 deg, moon below the horizon):
+	// gain 1.0 gave mean luma 30.77 against 0.02 with no dome at all, i.e. the
+	// star field alone was outshining a moonlit night. This scales it back to
+	// something a night sky reads as.
+	//
+	// Artistic, not photometric, and deliberately a cvar rather than a constant:
+	// it multiplies against the exposure curve's lift of up to 15.6 stops, so the
+	// two have to be tuned against each other on real captures.
+	TAutoConsoleVariable<float> CVarSkyStarGain(
+		TEXT("voxel.Sky.StarGain"), 0.15f,
+		TEXT("Master multiplier on the star field's brightness (default 0.15). ")
+		TEXT("The MPC's own StarBrightness default cannot serve this purpose: the ")
+		TEXT("sky subsystem overwrites that scalar every frame. 1.0 is the raw ")
+		TEXT("asset default, which measured mean luma 30.77 on a moonless winter ")
+		TEXT("night against 0.02 with no star dome -- far too bright. Artistic, ")
+		TEXT("not photometric; it multiplies against the exposure curve."),
+		ECVF_Default);
+
+	double StarBrightnessForSunAltitude(double AltitudeDeg)
+	{
+		const double T = FMath::Clamp(
+			(kStarFadeZeroAboveDeg - AltitudeDeg) /
+				(kStarFadeZeroAboveDeg - kStarFadeFullBelowDeg), 0.0, 1.0);
+		const double Fade = T * T * (3.0 - 2.0 * T);
+		return Fade * FMath::Max(0.f, CVarSkyStarGain.GetValueOnAnyThread());
 	}
 
 	// The moon's colour temperature the frame will ACTUALLY be given, after
@@ -974,6 +1118,44 @@ struct FVoxelSkyImpl
 	int32 AppliedExposureMode = -1;
 	double AppliedExposureBias = TNumericLimits<double>::Max();
 
+	// --- the night sky's material parameters (ApplySkyMaterialParams) --------
+	//
+	// MPC_VoxelSky, resolved ONCE. LoadObject on the first frame that needs it
+	// rather than in Initialize, because Initialize can run before the asset
+	// registry is in a state where a /Game/ path resolves; and once rather than
+	// per frame because a failed LoadObject is a synchronous package-open attempt
+	// and retrying it sixty times a second would be a real cost for a case that is
+	// never going to start working mid-run.
+	//
+	// TStrongObjectPtr, NOT a raw pointer. FVoxelSkyImpl is a plain struct (see
+	// the header's PImpl note), so a UObject* here is invisible to the GC: the
+	// world's own UMaterialParameterCollectionInstance does reference the
+	// collection once a parameter has been written, but nothing guarantees that
+	// for the window before the first write, and a dangling collection pointer
+	// would be a crash rather than a blank sky.
+	TStrongObjectPtr<UMaterialParameterCollection> SkyParams;
+	bool bSkyParamsLoadAttempted = false;
+
+	// The frame's body directions, TOWARD the body, exactly as the ephemeris
+	// returned them and with no negation applied.
+	//
+	// CACHED HERE RATHER THAN IN FVoxelSkyState, which is where a reader would
+	// look for them first. FVoxelSkyState is deliberately scalar-only and
+	// deliberately free of every ephemeris type (see its header comment): it is a
+	// read-only report for a HUD and a capture log, both of which want degrees.
+	// ApplySkyMaterialParams wants the vectors, and this struct is in the .cpp
+	// where an FVector costs nothing. Recomputing them from
+	// SunAltitudeDeg/SunAzimuthDeg instead would mean a second copy of
+	// DirectionFromAltAz living outside VoxelEphemeris.cpp, which is exactly the
+	// duplication LocalSiderealTimeDeg was exported to avoid.
+	FVector SunDirection = FVector::ZeroVector;
+	FVector MoonDirection = FVector::ZeroVector;
+
+	// StarUDirection is an ASSET-SIDE knob the C++ has to agree with -- see
+	// ApplySkyMaterialParams for why StarRotation's sign depends on it. Latched so
+	// the resolved pair is logged when it changes and not every frame.
+	double AppliedStarUDirection = 0.0;
+
 	FVoxelSkyState State;
 };
 
@@ -1142,7 +1324,9 @@ void UVoxelSkySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		       TEXT("Origin=(%.4f N, %.4f E) Moon=%d SunIntensity=%.4f MoonIntensity=%.4f ")
 		       TEXT("MoonTempK=%.0f (requested %.0f, tint %.2f) ")
 		       TEXT("ShadowUpdateHz=%.2f ExposureMode=%d ExposureBias=%.2f ")
-		       TEXT("DayEV=%.2f SunsetEV=%.2f TwilightEV=%.2f DeepNightEV=%.2f DeepNightDrop=%.2f"),
+		       TEXT("DayEV=%.2f SunsetEV=%.2f TwilightEV=%.2f DeepNightEV=%.2f DeepNightDrop=%.2f ")
+		       TEXT("Dome=%d DomeRadiusUU=%.0f StarRotationOffsetTurns=%.4f ")
+		       TEXT("StarsAt0Deg=%.2f StarsAt-6Deg=%.2f StarsAt-12Deg=%.2f"),
 		       VoxelSky::IsEnabled() ? 1 : 0, VoxelSky::GetTimeScale(), DayLength, DaysPerYear,
 		       VoxelSky::GetOriginLatitudeDeg(), VoxelSky::GetOriginLongitudeDeg(),
 		       VoxelSky::IsMoonEnabled() ? 1 : 0,
@@ -1166,7 +1350,18 @@ void UVoxelSkySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		       // the one in this revision of the source.
 		       ExposureBiasForSunAltitude(60.0), ExposureBiasForSunAltitude(0.0),
 		       ExposureBiasForSunAltitude(-6.0),
-		       ExposureBiasForSunAltitude(-30.0), VoxelSky::GetDeepNightDropEV());
+		       ExposureBiasForSunAltitude(-30.0), VoxelSky::GetDeepNightDropEV(),
+		       // THREE points on the star fade rather than the two endpoints,
+		       // because the endpoints are 0 and 1 by construction and would say
+		       // nothing. The -6 sample is the one worth having in a capture log:
+		       // it is where the exposure curve reaches its +15.6 cap, so it is
+		       // where the star gain and the exposure lift are BOTH at their most
+		       // aggressive, and it is the rung to compare against if a twilight
+		       // frame comes back with a washed-out sky.
+		       VoxelSky::IsDomeEnabled() ? 1 : 0, VoxelSky::GetDomeRadiusUU(),
+		       VoxelSky::GetStarRotationOffsetTurns(),
+		       StarBrightnessForSunAltitude(0.0), StarBrightnessForSunAltitude(-6.0),
+		       StarBrightnessForSunAltitude(-12.0));
 	}
 }
 
@@ -1180,7 +1375,12 @@ void UVoxelSkySubsystem::Deinitialize()
 	SkyLightActor = nullptr;
 	SkyRigActor = nullptr;
 	SkyExposurePP = nullptr;
+	SkyDome = nullptr;
 	bHasState = false;
+	// Impl.Reset() releases the TStrongObjectPtr on MPC_VoxelSky with it, which is
+	// the whole reason that cache is a strong pointer rather than a raw one: the
+	// collection stops being rooted by this subsystem at exactly the moment the
+	// subsystem stops existing, without a second teardown line to forget.
 	Impl.Reset();
 
 	Super::Deinitialize();
@@ -1334,6 +1534,42 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 			// the whole frame nearly seven. It is not a close call today. Revisit
 			// only with a number from the W7 leg.
 			MoonComp->SetCastShadows(false);
+
+			// ===========================================================
+			// KILL UE'S OWN MOON DISC. There is exactly one moon and
+			// M_NightSky draws it.
+			//
+			// This light is atmosphere light index 1 (just above), and UE
+			// draws a disc for every atmosphere light it has -- that is what
+			// index 1 is FOR, and it is what the pre-dome sky showed as "the
+			// moon". It is a flat, untextured, PHASELESS disc: a uniform
+			// blob of the light's own colour, with no terminator, because
+			// the SkyAtmosphere has no concept of the moon being lit by the
+			// sun. Now that M_NightSky draws a textured moon with a
+			// geometrically correct terminator AT THE SAME DIRECTION, both
+			// would be drawn in the same place -- and the phaseless one is
+			// on top of the crescent, filling in the dark limb, which reads
+			// as "the phase code does not work" rather than as "there are
+			// two discs".
+			//
+			// SetAtmosphereSunDiskColorScale (verified against
+			// DirectionalLightComponent.h:317 in UE 5.8) scales ONLY the
+			// disc's colour, so this removes the disc and changes nothing
+			// else: the moon keeps its intensity, its temperature, its
+			// direct lighting and its own scattering contribution to the
+			// night sky. It is set unconditionally rather than under
+			// voxel.Sky.DomeEnabled because the alternative -- switching UE's
+			// disc back on whenever the dome is hidden -- would make the A/B
+			// compare two different moons instead of measuring the dome, and
+			// because a phaseless disc is not a thing this project wants
+			// back on any code path. voxel.Sky.DomeEnabled 0 therefore means
+			// NO moon disc at all; the cvar's help string says so.
+			//
+			// Once at spawn, not per update, and that is safe here for the
+			// reason the temperature is NOT: this is a constant, so no cvar
+			// or console command needs to reach it afterwards.
+			// ===========================================================
+			MoonComp->SetAtmosphereSunDiskColorScale(FLinearColor::Black);
 		}
 	}
 
@@ -1505,6 +1741,34 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 		SkyExposurePP->Priority = 10.f;
 		SkyExposurePP->bEnabled = false; // ApplyExposureFromState turns it on
 	}
+
+	// --- the night-sky dome (stars + the textured, phased moon disc) ---------
+	//
+	// SPAWNED AT THE SPAWN COLUMN like every other actor in this function, for
+	// the reason stated at the top of it: an actor left at the world origin while
+	// the player is 20,000 km out is not "slightly misplaced". For the dome
+	// specifically the failure is total rather than cosmetic -- the camera would
+	// be OUTSIDE a 200 km sphere, and an additive two-sided sphere seen from
+	// outside is a small ball of stars floating in the middle of the screen.
+	// AVoxelSkyDomeActor::UpdateFollowCamera takes over on the first tick that
+	// has a camera; this placement is what covers the frames before that.
+	//
+	// SPAWNED EVEN WHEN voxel.Sky.DomeEnabled IS 0, and hidden by the actor
+	// itself. A hidden actor with no collision and no shadow costs nothing per
+	// frame, and it makes the cvar a LIVE A/B control -- the same shape
+	// voxel.Sky.Enabled has, where "off" is a state the rig can be put into and
+	// taken back out of rather than a decision frozen at OnWorldBeginPlay.
+	SkyDome = World.SpawnActor<AVoxelSkyDomeActor>(
+		FVector(SpawnColumnXUU, SpawnColumnYUU, 0.0), FRotator::ZeroRotator);
+	if (!SkyDome)
+	{
+		UE_LOG(LogVoxelSky, Error,
+		       TEXT("AVoxelSkyDomeActor failed to spawn -- there is no night-sky dome this run, so there are NO ")
+		       TEXT("STARS and NO MOON DISC. The light rig, the atmosphere and the exposure curve are ")
+		       TEXT("unaffected, so a night capture will still be correctly dark and correctly lit; it will ")
+		       TEXT("simply be empty overhead, and this line is what distinguishes that from a material or ")
+		       TEXT("texture failure."));
+	}
 }
 
 void UVoxelSkySubsystem::ApplyStaticRigPose()
@@ -1666,6 +1930,12 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 	S.bMoonUp = Moon.AltitudeDeg > 0.0;
 	S.bClockRunning = TimeScale != 0.0;
 
+	// The vectors themselves, for M_NightSky. NOT NEGATED -- see
+	// ApplySkyMaterialParams, and see the negation two blocks down that exists
+	// only because a DirectionalLight's forward is where the light TRAVELS.
+	Impl->SunDirection = Sun.Direction;
+	Impl->MoonDirection = Moon.Direction;
+
 	// --- exposure, EVERY frame ---------------------------------------------
 	//
 	// Deliberately NOT under the shadow cadence cap. Exposure is a scalar on a
@@ -1674,6 +1944,19 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 	// brightness staircase for no saving at all. The at-most-100 ms disagreement
 	// between the stepped light and the continuous exposure is not observable.
 	ApplyExposureFromState();
+
+	// --- the night sky's material parameters, ALSO EVERY frame ---------------
+	//
+	// Immediately after the exposure and, like it, OUTSIDE the
+	// voxel.Sky.ShadowUpdateHz gate below. Same first reason: these are uniform
+	// writes into one UMaterialParameterCollectionInstance, they touch no
+	// primitive and bust no cached shadow setup, so the cap has nothing to save
+	// here. And one reason of their own, which is stronger than exposure's: this
+	// drives the position of a moon disc 0.52 degrees wide. A 10 Hz step through a
+	// 1200 s day moves the sun and moon 0.03 degrees per step -- invisible on a
+	// shadow, but 6% of the moon's own diameter, i.e. a disc that visibly jerks
+	// ten times a second while everything around it moves smoothly.
+	ApplySkyMaterialParams();
 
 	// --- light orientation, CADENCE-CAPPED ----------------------------------
 	//
@@ -1985,6 +2268,218 @@ void UVoxelSkySubsystem::ApplyExposureFromState()
 	PP.AutoExposureMinBrightness = (float)(SceneEV100 - kClampedAutoWindowStops);
 	PP.bOverride_AutoExposureMaxBrightness = true;
 	PP.AutoExposureMaxBrightness = (float)(SceneEV100 + kClampedAutoWindowStops);
+}
+
+void UVoxelSkySubsystem::ApplySkyMaterialParams()
+{
+	// ======================================================================
+	// THE ONE THING TO KNOW BEFORE EDITING ANY NAME IN THIS FUNCTION.
+	//
+	// An MPC parameter name that does not resolve DOES NOT FAIL. It is not a
+	// compile error, it is not a warning, and it is not a log line:
+	// UMaterialExpressionCollectionParameter::Compile falls through to emitting a
+	// CONSTANT when GetParameterIndex misses (MaterialExpressions.cpp:17179-17193,
+	// cited by Tools/create_sky_material.py:10-15, which raises on the same
+	// condition for the same reason). So a typo on the material side bakes a
+	// constant into the shader, and a typo HERE -- SetScalarParameterValue with a
+	// name the collection does not have -- writes into nothing at all and leaves
+	// the asset's DEFAULT standing forever.
+	//
+	// What that looks like: a perfectly plausible night sky. Stars, sharp,
+	// correctly oriented, frozen at sidereal time zero; a moon due east at 45
+	// degrees, permanently full, that never moves. Nothing about it says
+	// "unbound". EVERY name below was read out of Tools/create_sky_material.py's
+	// SCALAR_PARAMS / VECTOR_PARAMS tables (create_sky_material.py:442-463) rather
+	// than typed from memory, and the two log lines in this function print the
+	// values back so a capture can prove the writes landed.
+	// ======================================================================
+
+	if (!Impl)
+	{
+		return;
+	}
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+	FVoxelSkyState& S = Impl->State;
+
+	// --- resolve the collection, ONCE ---------------------------------------
+	if (!Impl->bSkyParamsLoadAttempted)
+	{
+		Impl->bSkyParamsLoadAttempted = true;
+		Impl->SkyParams.Reset(LoadObject<UMaterialParameterCollection>(nullptr, kSkyCollectionPath));
+		if (!Impl->SkyParams.IsValid())
+		{
+			// ERROR, NOT WARNING, AND THIS IS THE POINT OF THE WHOLE DIAGNOSTIC
+			// BUDGET IN THIS FILE. Without the collection the material still
+			// compiles, the dome still draws, and it draws MPC_VoxelSky's authored
+			// defaults -- a static star field at the wrong sidereal time with a
+			// permanently-full moon parked due east. That is a WORSE failure than a
+			// black sky, because it looks like a working feature. Nothing else in
+			// the frame can tell anyone it happened, so this line has to.
+			UE_LOG(LogVoxelSky, Error,
+			       TEXT("%s did not load. M_NightSky will render this collection's AUTHORED DEFAULTS -- a star ")
+			       TEXT("field frozen at sidereal time 0 and a permanently-full moon due east at 45 deg -- ")
+			       TEXT("which looks like a working night sky and is not one. Nothing in this subsystem can ")
+			       TEXT("reach the material without it. Run Tools/create_sky_material.py."),
+			       kSkyCollectionPath);
+		}
+		else
+		{
+			UE_LOG(LogVoxelSky, Log,
+			       TEXT("VoxelSky material params bound to %s (%d scalars, %d vectors in the asset). Driven ")
+			       TEXT("EVERY FRAME, outside the voxel.Sky.ShadowUpdateHz gate."),
+			       kSkyCollectionPath,
+			       Impl->SkyParams->ScalarParameters.Num(), Impl->SkyParams->VectorParameters.Num());
+		}
+	}
+	UMaterialParameterCollection* Collection = Impl->SkyParams.Get();
+	if (!Collection)
+	{
+		return; // already logged, once, above
+	}
+
+	// --- directions: TOWARD the body, NOT negated ---------------------------
+	//
+	// ===================================================================
+	// THE SIGN, AND IT IS THE OPPOSITE OF THE ONE TWO FUNCTIONS UP.
+	//
+	// FSunState::Direction and FMoonState::Direction point FROM the observer
+	// TOWARD the body (VoxelEphemeris.h:75-77, 84). Tick negates them -- see
+	// `SunLight->SetActorRotation((-Sun.Direction).Rotation())` -- and that
+	// negation exists for exactly one reason, which has nothing to do with the
+	// ephemeris: a DirectionalLight's forward vector is the direction the light
+	// TRAVELS, which is away from the body. It is a property of the light, not of
+	// the vector.
+	//
+	// M_NightSky is not a light. It dots these against the view direction to
+	// decide "am I looking at the moon" and "which way is the sun lighting it
+	// from" (create_sky_material.py, "MOON DISC" and "TERMINATOR"), and both of
+	// those want the TOWARD form -- which is why the ephemeris defines it that
+	// way in the first place (VoxelEphemeris.h:38-41: every consumer but the light
+	// wants toward). So they go through unchanged.
+	//
+	// GETTING THIS BACKWARDS IS NOT SUBTLE AND IS ALSO NOT OBVIOUS. The moon
+	// would be drawn exactly 180 degrees from where the moonlight comes from --
+	// below the horizon whenever the moon is up, hence invisible, hence a night
+	// sky with stars and no moon at all. That reads as "the moon disc code does
+	// not work", and the search would start in the material.
+	// ===================================================================
+	UKismetMaterialLibrary::SetVectorParameterValue(
+		World, Collection, TEXT("SunDirection"), FLinearColor(Impl->SunDirection));
+	UKismetMaterialLibrary::SetVectorParameterValue(
+		World, Collection, TEXT("MoonDirection"), FLinearColor(Impl->MoonDirection));
+
+	// --- the moon's phase ----------------------------------------------------
+	//
+	// PhaseFraction, NOT IlluminatedFraction, and this is the one place in this
+	// file where that is the right way round. ApplyLightsFromState uses
+	// IlluminatedFraction because it wants "how much light is coming from the
+	// moon". The material uses PhaseFraction for EARTHSHINE ONLY -- earthshine
+	// tracks the EARTH's illuminated fraction as seen from the moon, which is the
+	// complement of the moon's own phase, (1 + cos(2*pi*phase))/2, and that
+	// requires the SIGNED, monotonic quantity (create_sky_material.py's
+	// MoonPhaseFraction note). IlluminatedFraction is symmetric about full
+	// (VoxelEphemeris.h:85-93) and cannot express it. The TERMINATOR does not use
+	// this at all; it is pure geometry from SunDirection.
+	UKismetMaterialLibrary::SetScalarParameterValue(
+		World, Collection, TEXT("MoonPhaseFraction"), (float)S.MoonPhaseFraction);
+
+	// --- the observer ---------------------------------------------------------
+	//
+	// DEGREES, passed straight through with no conversion, because the material
+	// takes degrees for precisely this reason (create_sky_material.py's
+	// ObserverLatitude note: "one fewer place to get a factor wrong"). This is
+	// what puts the celestial pole at the right altitude, so it is the parameter
+	// that makes the star field a sky rather than a painting on the inside of a
+	// dome -- and it moves as the player walks north (GeoFromWorldUU), which is
+	// why it is written per frame rather than once.
+	UKismetMaterialLibrary::SetScalarParameterValue(
+		World, Collection, TEXT("ObserverLatitude"), (float)S.LatitudeDeg);
+
+	// --- the star field's rotation ------------------------------------------
+	//
+	// TURNS, not degrees and not radians: StarRotation is local sidereal time as a
+	// fraction of a rotation. The material folds LST wholesale into this one
+	// scalar because RA appears in its UV only as (LST - H)/2pi and LST is
+	// constant across the frame (create_sky_material.py, "EQUIRECT UV").
+	//
+	// The FGeoCoord is rebuilt from the state rather than threaded in from Tick:
+	// S.LatitudeDeg and S.LongitudeDeg are assigned directly from the same
+	// FGeoCoord the ephemeris was evaluated with, a few lines apart, so this is
+	// the same value and not an approximation of it.
+	//
+	// -------------------------------------------------------------------------
+	// AND IT IS MULTIPLIED BY StarUDirection, WHICH IS READ BACK OUT OF THE
+	// ASSET. This is the one piece of coupling in this function and it is not
+	// optional.
+	//
+	// StarUDirection (+1 / -1) exists because an equirectangular celestial map
+	// can be authored for viewing from outside the sphere or from inside it, and
+	// nobody has been able to check which this one is without an editor -- it is
+	// the material author's single named unverifiable ("WHAT COULD NOT BE
+	// VERIFIED", item 1), and the stated fix is to flip the MPC scalar to -1 and
+	// re-shoot, with no regeneration.
+	//
+	// THE TRAP: that flip alone does not work, because the material's U is
+	//     u = StarRotation + StarUDirection * (-H / 2pi)
+	// and RA/2pi = LST/2pi - H/2pi. At StarUDirection = +1 that identifies
+	// StarRotation with +LST/360 turns. At -1 the H term changes sign, so
+	// correctly mirroring the map requires StarRotation to be -LST/360 -- and if
+	// C++ keeps feeding +LST/360, the sky comes out mirrored AND rotating
+	// BACKWARDS. Since "does it rotate the right way about the pole" is the exact
+	// test the author documented for deciding the handedness, an uncompensated
+	// flip would make that test unreadable: both settings would fail it, for two
+	// different reasons, and the honest conclusion would be that neither is
+	// right.
+	//
+	// So the sign is taken from the asset. One MPC read per frame (a lookup in the
+	// world's collection instance), and the flip becomes a genuine one-value asset
+	// edit exactly as documented. Defaults to +1 if the parameter is missing --
+	// GetScalarParameterValue returns 0 for an unknown name, and a zero here would
+	// freeze the star field solid, which is a much worse failure than assuming the
+	// documented default.
+	// -------------------------------------------------------------------------
+	const float RawStarU = UKismetMaterialLibrary::GetScalarParameterValue(
+		World, Collection, TEXT("StarUDirection"));
+	const double StarU = RawStarU >= 0.f ? 1.0 : -1.0;
+
+	const VoxelSky::FGeoCoord Geo{S.LatitudeDeg, S.LongitudeDeg};
+	const double LstDeg = VoxelSky::LocalSiderealTimeDeg(S.JulianDay, Geo);
+	// The offset rides INSIDE the StarU factor, not outside it. Both terms are
+	// rotations about the same polar axis in the same UV, so mirroring the map has
+	// to mirror them together or a calibrated offset would flip to the wrong side
+	// the moment the handedness was corrected -- and the person doing that would
+	// then be re-calibrating an offset they had already found.
+	const double StarTurns = StarU * (LstDeg / 360.0 + VoxelSky::GetStarRotationOffsetTurns());
+	UKismetMaterialLibrary::SetScalarParameterValue(
+		World, Collection, TEXT("StarRotation"), (float)StarTurns);
+
+	if (!FMath::IsNearlyEqual(StarU, Impl->AppliedStarUDirection, 0.01))
+	{
+		Impl->AppliedStarUDirection = StarU;
+		UE_LOG(LogVoxelSky, Log,
+		       TEXT("VoxelSky star map handedness RESOLVED: StarUDirection=%+.1f (read back from %s, raw ")
+		       TEXT("%+.3f), so StarRotation is being driven as %+.1f * (LST/360 + %.4f turns). Flipping the ")
+		       TEXT("MPC scalar mirrors the map AND re-signs this drive together; driving +LST against a -1 ")
+		       TEXT("map would rotate the sky backwards."),
+		       StarU, kSkyCollectionPath, RawStarU, StarU, VoxelSky::GetStarRotationOffsetTurns());
+	}
+
+	// --- the sunrise fade ----------------------------------------------------
+	//
+	// The ONLY thing that stops stars rendering over a blue afternoon: the dome is
+	// additive and composited after the atmosphere, so nothing in the renderer
+	// extinguishes them (see StarBrightnessForSunAltitude for the whole argument,
+	// and create_sky_material.py's "THE COST OF THAT CHOICE" for the author's
+	// statement of the same fact). Note this scales the MOON's own brightness too
+	// in the material's gain path -- which is wanted, for the same reason
+	// ApplyLightsFromState suppresses the moon LIGHT through civil twilight.
+	UKismetMaterialLibrary::SetScalarParameterValue(
+		World, Collection, TEXT("StarBrightness"),
+		(float)StarBrightnessForSunAltitude(S.SunAltitudeDeg));
 }
 
 // --- queries / clock control -----------------------------------------------

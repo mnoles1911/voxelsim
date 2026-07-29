@@ -510,12 +510,19 @@ def create_collection():
         p = unreal.CollectionScalarParameter()
         p.set_editor_property("parameter_name", name)
         p.set_editor_property("default_value", float(default))
-        # Set explicitly rather than trusting FCollectionParameterBase's C++
-        # constructor to have run through the Python struct allocator. A zero id
-        # would make GetParameterId() return a zero guid for every name, and
-        # UMaterialExpressionCollectionParameter::Compile silently emits a
-        # CONSTANT when the id does not resolve -- a black sky with no error.
-        p.set_editor_property("id", stable_guid("scalar:" + name))
+        # The id is deliberately NOT set here. FCollectionParameterBase::Id is
+        # protected, and set_editor_property on it raises
+        #   "Property 'Id' ... is protected and cannot be set"
+        # (measured 2026-07-29, UE 5.8). UMaterialParameterCollection assigns the
+        # guids itself in PostEditChangeProperty, which the assignment of
+        # scalar_parameters/vector_parameters below routes through.
+        #
+        # The hazard the old explicit set was guarding against is REAL and is now
+        # guarded by a read-back instead: a zero id makes GetParameterId() return
+        # a zero guid, and UMaterialExpressionCollectionParameter::Compile then
+        # silently emits a CONSTANT rather than erroring -- a black sky with no
+        # diagnostic. See the assert_ids_assigned() call after the round-trip
+        # check, which turns that silence into a hard failure.
         scalars.append(p)
 
     vectors = []
@@ -523,7 +530,6 @@ def create_collection():
         p = unreal.CollectionVectorParameter()
         p.set_editor_property("parameter_name", name)
         p.set_editor_property("default_value", unreal.LinearColor(r, g, b, a))
-        p.set_editor_property("id", stable_guid("vector:" + name))
         vectors.append(p)
 
     collection.set_editor_property("scalar_parameters", scalars)
@@ -544,7 +550,65 @@ def create_collection():
         raise RuntimeError("MPC vector parameters did not round-trip: wrote %s, read back %s"
                            % (want_vectors, got_vectors))
 
+    # Every parameter must have come back with a NON-ZERO guid. This is the
+    # guard that replaces the old explicit id assignment (see create_collection
+    # above for why that had to go). A zero guid does not error at compile time
+    # -- UMaterialExpressionCollectionParameter::Compile silently emits a
+    # constant instead -- so without this check the failure mode is a black sky
+    # and no diagnostic, which is indistinguishable from the half-dozen other
+    # ways this material can render nothing.
+    #
+    # `id` is protected for WRITING but readable, so this costs nothing. If a
+    # future engine version also protects the read, this must become a hard
+    # failure rather than a skip: an unverified id is exactly the state the old
+    # code was trying to avoid.
+    zero_guid = str(unreal.Guid())
+    unassigned = []
+    unassignable = False
+    for kind, plist in (("scalar", collection.get_editor_property("scalar_parameters")),
+                        ("vector", collection.get_editor_property("vector_parameters"))):
+        for p in plist:
+            name = str(p.get_editor_property("parameter_name"))
+            try:
+                pid = str(p.get_editor_property("id"))
+            except Exception:
+                # Measured 2026-07-29 on UE 5.8: FCollectionParameterBase::Id is
+                # protected for READING as well as writing, so this check cannot
+                # run from Python at all. Do not turn that into a hard failure --
+                # it would block the script permanently over a guid that
+                # UMaterialParameterCollection::PostEditChangeProperty assigns
+                # for us anyway.
+                #
+                # The check moves to RUNTIME instead, which is where it can
+                # actually run: UKismetMaterialLibrary::SetScalarParameterValue /
+                # SetVectorParameterValue log a warning when a parameter name
+                # does not resolve in the collection, and UVoxelSkySubsystem
+                # drives every parameter in this MPC every frame. So the symptom
+                # of an unresolved id is a per-frame warning naming the
+                # parameter, not silence.
+                #
+                # WHAT TO CHECK IF THE SKY RENDERS BLACK: grep a run's log for
+                # those warnings first. An unresolved CollectionParameter
+                # compiles to a CONSTANT rather than erroring, so the material
+                # itself will never tell you.
+                unassignable = True
+                continue
+            if not pid or pid == zero_guid:
+                unassigned.append("%s:%s" % (kind, name))
+    if unassigned:
+        raise RuntimeError(
+            "MPC parameters have zero guids after PostEditChangeProperty: %s. "
+            "UMaterialExpressionCollectionParameter::Compile would emit constants for these "
+            "and the sky would render black with no error." % ", ".join(unassigned))
+
     unreal.EditorAssetLibrary.save_loaded_asset(collection)
+    if unassignable:
+        unreal.log_warning(
+            "%s: parameter guids could NOT be verified from Python (Id is protected for read "
+            "on this engine version). They are assigned by PostEditChangeProperty and are "
+            "almost certainly fine, but the proof is at runtime: if the sky renders black, "
+            "grep the run log for SetScalarParameterValue/SetVectorParameterValue warnings "
+            "naming a parameter before suspecting the graph." % COLLECTION_PATH)
     unreal.log("created %s with %d scalars + %d vectors"
                % (COLLECTION_PATH, len(scalars), len(vectors)))
     return collection
@@ -562,6 +626,7 @@ class SkyGraphBuilder(GraphBuilder):
     def __init__(self, material, collection):
         GraphBuilder.__init__(self, material)
         self.collection = collection
+        self._mpc_names = None  # lazily read back from the MPC, see collection_param
 
     def link(self, src, src_out, dst, dst_in):
         if not self.mel.connect_material_expressions(src, src_out, dst, dst_in):
@@ -585,16 +650,41 @@ class SkyGraphBuilder(GraphBuilder):
         Collection->GetParameterId(ParameterName) every time either changes
         (MaterialExpressions.cpp:17163-17177) and a null Collection blanks it.
         """
+        # The binding is checked by NAME MEMBERSHIP, not by reading ParameterId
+        # back. ParameterId is not exposed to Python on UE 5.8 ("Failed to find
+        # property 'parameter_id'", measured 2026-07-29) and neither is
+        # FCollectionParameterBase::Id, so the guid route is closed.
+        #
+        # Membership is the stronger check anyway, and it is complete. The only
+        # way a CollectionParameter fails to resolve is a name this script did
+        # not put on the MPC -- and this script authored the MPC, so it knows the
+        # full set. Comparing against the collection as READ BACK (not against
+        # the SCALAR_PARAMS/VECTOR_PARAMS literals) also catches the case where
+        # the MPC write silently dropped a parameter.
+        #
+        # This matters because an unresolved collection parameter does NOT fail
+        # to compile: UMaterialExpressionCollectionParameter::Compile emits a
+        # CONSTANT instead. A typo here would ship a black sky with no error.
+        if self._mpc_names is None:
+            self._mpc_names = set()
+            for prop in ("scalar_parameters", "vector_parameters"):
+                for p in self.collection.get_editor_property(prop):
+                    self._mpc_names.add(str(p.get_editor_property("parameter_name")))
+        if name not in self._mpc_names:
+            raise RuntimeError(
+                "CollectionParameter %r is not on %s. Present: %s. An unresolved "
+                "collection parameter compiles to a CONSTANT rather than failing, "
+                "so this must raise here."
+                % (name, COLLECTION_PATH, sorted(self._mpc_names)))
+
         n = self.node(unreal.MaterialExpressionCollectionParameter)
         n.set_editor_property("collection", self.collection)
         n.set_editor_property("parameter_name", name)
-        pid = n.get_editor_property("parameter_id")
-        if not guid_library().is_valid_guid(pid):
-            raise RuntimeError(
-                "CollectionParameter %r did not resolve against %s (ParameterId is "
-                "invalid). An unresolved collection parameter does NOT fail to "
-                "compile -- it compiles to a constant -- so this must raise here."
-                % (name, COLLECTION_PATH))
+        # Order is load-bearing (see docstring); verify it took.
+        if str(n.get_editor_property("parameter_name")) != name:
+            raise RuntimeError("CollectionParameter name did not round-trip for %r" % name)
+        if n.get_editor_property("collection") is None:
+            raise RuntimeError("CollectionParameter %r lost its Collection" % name)
         return n
 
     # --- small nodes --------------------------------------------------------
@@ -660,7 +750,12 @@ class SkyGraphBuilder(GraphBuilder):
 
     def clamp(self, value, lo, hi, value_out=""):
         n = self.node(unreal.MaterialExpressionClamp)
-        self.link(value, value_out, n, "Input")
+        # Clamp's first input is UNNAMED -- GetInputName reports it as 'None',
+        # so the pin list is ['None', 'Min', 'Max'] and "Input" does not match.
+        # Measured 2026-07-29 by the checked-connect assertion in link(), which
+        # is exactly what that assertion exists for: a silently-failed connect
+        # here would have left the clamp reading 0 and the star field blank.
+        self.link(value, value_out, n, "")
         self.link(lo, "", n, "Min")
         self.link(hi, "", n, "Max")
         return n

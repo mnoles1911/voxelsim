@@ -614,6 +614,20 @@ double AVoxelClipmapActor::SpacingUUForLevel(int32 LevelIndex)
 	return Spacing0UU * double(int64(1) << LevelIndex);
 }
 
+double AVoxelClipmapActor::OuterHalfExtentUU()
+{
+	// The outermost level's grid runs +-HalfIndex vertices from the shared
+	// origin at that level's spacing (RebuildLevel pass 1 lays out LocalX as
+	// (i - HalfIndex) * Spacing). Derived rather than written down so it cannot
+	// drift from the geometry: at the shipped defaults this is 32 * 8 *
+	// (409600/16) = 6,553,600 UU, and it moves whenever the ring cascade's outer
+	// radius does.
+	//
+	// The outer SKIRT hangs downward from this perimeter and adds no horizontal
+	// extent, so this really is the farthest this actor draws along an axis.
+	return double(HalfIndex) * SpacingUUForLevel(NumLevels - 1);
+}
+
 void AVoxelClipmapActor::BuildSharedTopology()
 {
 	if (bTopologyBuilt)

@@ -223,10 +223,31 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<class UPostProcessComponent> SkyExposurePP;
 
+	// The NIGHT SKY's mesh: a camera-following sphere carrying M_NightSky, which
+	// is where the stars and the phased moon disc are drawn. Spawned here rather
+	// than by the game mode (which spawns the ocean and the clipmap) because it
+	// is part of the sky rig and must go through the SAME ParseSpawnColumnUU as
+	// the rest of it -- see SpawnRig. It CANNOT be a component on SkyRigActor;
+	// AVoxelSkyDomeActor's header states why at length, in one line: that actor's
+	// root is the SkyAtmosphere and its transform must not move.
+	UPROPERTY(Transient)
+	TObjectPtr<class AVoxelSkyDomeActor> SkyDome;
+
 	void SpawnRig(UWorld& World);
 	void ApplyStaticRigPose();
 	void ApplyLightsFromState();
 	void ApplyExposureFromState();
+
+	// Pushes the frame's sun/moon/observer state into /Game/Voxel/MPC_VoxelSky,
+	// which is what M_NightSky reads. Called from Tick EVERY FRAME, immediately
+	// after ApplyExposureFromState and OUTSIDE the voxel.Sky.ShadowUpdateHz
+	// cadence gate; the reasoning is identical to exposure's (these are uniform
+	// writes that bust no shadow cache) plus one of its own: the moon disc this
+	// drives is 0.52 degrees across, so stepping its position at 10 Hz would be a
+	// visible stutter on the one object in the night sky small enough to see it
+	// happen.
+	void ApplySkyMaterialParams();
+
 	bool ResolveObserverXYUU(double& OutXUU, double& OutYUU) const;
 };
 
@@ -280,4 +301,19 @@ namespace VoxelSky
 	VOXELEARTH_API float GetShadowUpdateHz();
 	VOXELEARTH_API int32 GetExposureMode();
 	VOXELEARTH_API float GetExposureBias();
+
+	// --- the night-sky dome (AVoxelSkyDomeActor + M_NightSky) ----------------
+	// Read every tick by the dome actor, so both are live knobs.
+	VOXELEARTH_API bool IsDomeEnabled();
+	// FLOORED, not clamped to a default: the dome must be farther than the
+	// farthest drawn terrain or M_NightSky's depth test hides the stars behind
+	// the horizon. The floor here is a sanity bound only -- the REAL check is
+	// AVoxelSkyDomeActor::BeginPlay measuring this against
+	// AVoxelClipmapActor::OuterHalfExtentUU() and logging an Error if it loses.
+	VOXELEARTH_API double GetDomeRadiusUU();
+	// Constant offset on the star map's rotation, in TURNS. Exists because
+	// M_NightSky folds local sidereal time and the map's RA origin into one
+	// scalar, so once C++ drives that scalar every frame there is nowhere on the
+	// asset left to put the offset. See the cvar for the full argument.
+	VOXELEARTH_API double GetStarRotationOffsetTurns();
 }
