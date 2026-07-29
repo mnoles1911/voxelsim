@@ -1,5 +1,140 @@
 # Milestone gate status
 
+## 2026-07-29 — a working day/night cycle, and the plan's central claim was wrong
+
+Shipped: `VoxelEphemeris` (NOAA/Meeus solar position, circular-orbit moon),
+`UVoxelSkySubsystem` (world clock, calendar, cvars, command-line pins), the
+light rig taken out of `AVoxelEarthGameMode::BeginPlay` and driven per frame
+from a `UWorldSubsystem` instead, an exposure policy, and `-VoxelSkyLadder=N`,
+a capture fixture that produces a whole simulated day as N frames from ONE
+process (`tools/voxel-sun-arms.ps1`, `VoxelSkyLadderFixture.*`).
+
+**The plan's central claim was wrong, and is corrected in
+`docs/lighting-weather-plan.md` itself.** It said a moving sun forces a
+continuous re-solve of the light field because `VoxelLightField.cpp:771`
+fuses visibility and radiance. Checked against the code and it does not: sun
+direction appears nowhere in `SolveBrickInternal`, and `SkyIntensity` is a
+hardcoded 1.0f (`VoxelLightField.h:210`) never assigned anywhere else in the
+repo. The field stores sky visibility under an isotropic unit sky; absolute
+light comes from UE's deferred path, and the GI term is a relative modulation
+of albedo. **The cycle needed no GI work at all**, and no GI file was touched.
+
+**Hard gate green:** `VoxelEarth.Sky.SolarPosition` (`VoxelSkyTests.cpp`)
+passes at four checkpoints within 0.5° — equinox and both solstices at 52°N
+plus 70°N at solar midnight for the midnight sun. Runs headless
+(`-ExecCmds="Automation RunTests VoxelEarth.Sky; Quit"`). A separate live
+capture measured noon altitude 60.94° against a theoretical 60.96° at
+52.48°N on day-of-year 171.
+
+**Three defects the ladder found that no unit test would have.**
+
+1. *Twilight rendered pure black* (0.0% non-black at sun −5.1°). The rig hid
+   the sun below the horizon via `SetVisibility`. A hidden light is not dim —
+   `ULightComponent::CreateRenderState_Concurrent` computes
+   `bHidden = ... || !bValidIntensity` and skips `Scene->AddLight` entirely,
+   so `FScene::ProcessAtmosphereLightRemoval_RenderThread` clears
+   `AtmosphereLights[0]`, the sky LUT pass integrates zero radiance, and the
+   real-time-capture SkyLight then captures that black sky as ambient. **The
+   obvious fix reproduces it**: a `DirectionalLight` is Unitless, so
+   `bValidIntensity = Intensity > 0.f` there too — "set intensity to 0" hides
+   the light exactly the same way. Underneath was a physics error: the old
+   `sin(alt)^1.3` curve multiplied a value that UE already dims by air-mass
+   transmittance and the N·L cosine (`DirectionalLightComponent.cpp:592-595`,
+   `ShadowRendering.cpp:2676`) — counting the cosine and the extinction twice.
+2. *The moon lit terrain twice as orange as the sun.* `kMoonTemperatureK` was
+   4100 K with a comment correctly arguing for a cool Purkinje shift — colour
+   temperature runs backwards from the word "cool", so 4100 K is warmer than
+   the sun's 5778 K, not cooler. `FColorSpace::MakeFromColorTemperature` at
+   4100 K returns R:B 2.48 against the sun's 1.22 at 5778 K. Fixed to 12000 K
+   (R:B 0.53), confirmed at rest in `VoxelSkySubsystem.cpp` today; costs
+   nothing in brightness (the function normalises to Y=1 at every
+   temperature).
+3. *The darkest night of the year rendered brightest.* The exposure curve
+   capped flat below −2°, so it could not distinguish a −14° midsummer
+   midnight from a −61° midwinter one; `USkyAtmosphere` models scattered
+   sunlight only, so its sky is dead at both, leaving deep night rendered by
+   whatever the moon was doing — and the moon rides higher in winter. Fixed
+   with `voxel.Sky.DeepNightDropEV` (default 2.0, a −15°/−18° ramp, `0`
+   restores the old flat cap as the control arm).
+
+**A unity-build trap worth recording:** the new ladder fixture originally
+copied `VoxelSweBreachFixture`'s helper names (`FRunRef`, `WorldOf`,
+`SetTimerOnce`, `kPollIntervalSeconds`) into its own anonymous namespace. Two
+anonymous namespaces never meet across translation units, but UE builds this
+module as a unity file and they merged. It compiled once because adaptive
+unity happened to exclude both files; the next unrelated edit would have
+pulled them in and broken the module. `VoxelSkyLadderFixture.cpp` now uses a
+named namespace (`VoxelSkyLadderDetail`) instead — confirmed in the current
+tree.
+
+**Measurements.** Mean luminance across 8-rung ladders (one process each —
+the screenshot floor is 0.00% within a session and 1.81% between,
+`VoxelGpuVerify.cpp:2074-2084`):
+- Summer 06-21 after fixes: 00h 38.01, 03h 55.17, 06h 128.93, 09h 123.10,
+  12h 129.44, 15h 122.68, 18h 124.62, 21h 83.47.
+- Winter 12-21: 00h 5.85, 03h 9.03, 06h 7.25, 09h 146.78, 12h 150.00,
+  15h 143.89, 18h 0.02, 21h 0.02 (last two moonless, moon below horizon —
+  correctly black).
+- The exposure curve was then refitted from those 16 (altitude, bias, luma)
+  triples, least-squares against `log2(Llin) = c + gamma*(p*log2 sin(alt) +
+  bias)`: the scene falls as **sin(alt)^0.80**, not the sin^1.15 the old
+  anchor table was built on (a standard clear-sky illuminance table). The old
+  table compensated 95% of that falloff, so daylight luma came out flat
+  (123-129 across +17.5° to +60.9°); the new law compensates 24%, so a low
+  sun visibly reads low. This IS coded now (`ExposureBiasForSunAltitude`,
+  `VoxelSkySubsystem.cpp:868-960`) — confirmed in the current tree, comments
+  and all. **This refit is not yet verified by a re-run** — the file says so
+  itself, and names the +4.6°..−3.8° sunrise gap (never sampled by either
+  ladder) as the part most likely to be wrong.
+
+**THE ANSWER TO THE PLAN'S LARGEST OPEN RISK.** The plan flagged that
+cascades were measured cheap with a sun *frozen since spawn*, and that a
+rotating light busts UE's cached whole-scene shadows, so the number would not
+transfer. Measured, alternated arms, `tools/voxel-sun-arms.ps1`, real terrain
+at spawn `-84480,53760`, 2560x1440, discarding leg 1 for a cold shader cache
+(722 hitches vs 347):
+
+| arm | p50 | p95 | max | hitches |
+|---|---|---|---|---|
+| FROZEN (sun alt 37.55°, tod 12:00) | 15.18 | 25.31 | 69.52 | 347 |
+| MOVING (drift 29.4°, tod 12:02→17:23) | 15.18 | 25.32 | 78.19 | 268 |
+
+**A moving sun costs nothing measurable** at `voxel.Sky.ShadowUpdateHz=10`
+(confirmed as the cvar's shipped default) — p50 identical, p95 identical to
+0.01 ms. Record this as answered, and record the caveat that it was measured
+with the shadow update cadence-capped at 10 Hz, so it is that configuration
+that is free, not an uncapped rotating light.
+
+**Also built, not yet run:** `tools/fetch-sky-assets.ps1` (pinned NASA Deep
+Star Maps 2020 + CGI Moon Kit, gitignored, sha256 recorded in
+`ue-project/Content/Voxel/TextureSource/SKY_ASSET_CREDITS.md` — present and
+confirmed), `ue-project/Tools/import_sky_textures.py`, and
+`ue-project/Tools/create_sky_material.py` (authors `M_NightSky` + the
+project's first Material Parameter Collection). None of these has been run
+through the editor yet — no sky-dome actor or `M_NightSky` asset exists in
+`Content/` — no star map and no moon have anywhere to render.
+
+**Known gaps, recorded honestly:**
+- The exposure refit is unverified by a ladder re-run.
+- Winter noon read 150 against summer noon 129 before the refit — a low sun
+  must read dimmer; that is what the refit addresses.
+- Moonless winter nights are pure black (0.02 mean luma). No stars, no
+  airglow, and no local lights exist yet, so this is correct-but-unplayable
+  until light sources land.
+- Multiplayer: the rig now spawns from a `UWorldSubsystem` so clients get a
+  sky, but the clock is not yet replicated. Confirmed: `AVoxelEditRelay.h`
+  today carries only `ServerSeed` / `ServerWorldGenVersion` /
+  `ServerProbeDigest` as `UPROPERTY(Replicated)` — no epoch, no rate. The fix
+  named in the plan is two more `UPROPERTY(Replicated)` fields on that same
+  actor.
+- Three sites still describe the exposure anchors as unmeasured guesses and
+  are now stale — confirmed still present verbatim:
+  `VoxelEarthGameMode.cpp:2112` ("the leg that calibrates
+  ExposureBiasForSunAltitude's admittedly-guessed anchors"),
+  `VoxelSkyLadderFixture.h:19-21` ("UNMEASURED FIRST GUESSES"), and
+  `VoxelSkyLadderFixture.cpp:673-679`'s runtime log line ("explicitly
+  unmeasured guesses").
+
 ## 2026-07-29 — W3: the river network is coupled to the water CA, and armable
 
 `rivernet.h` shipped as "groundwork only": a coarse ~1 Hz segment graph whose

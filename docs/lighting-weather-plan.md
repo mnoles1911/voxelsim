@@ -543,12 +543,15 @@ shadow depths across frames; a sun that rotates every frame invalidates that
 cache and re-renders the pool into every cascade, every frame. **The number that
 cleared cascades was measured under exactly the condition this plan removes.**
 
-⇒ **This is the largest unmeasured GPU risk in the plan** (§8 risk 8). Measure it
-before building anything on top of it — see P1.5 in §6. Two runs, same binary,
-same spawn: `voxel.Sky.TimeScale 0` versus a rotating sun, comparing the GPU
-frame and the gather census. The mitigation if it bites is cadence: rotate the
-light every N frames rather than every frame, which the eye cannot resolve at
-0.3°/s.
+⇒ **This was the largest unmeasured GPU risk in the plan** (§8 risk 8). **Measured
+and answered 2026-07-29 — see P1.5 in §6 and `docs/status.md`'s 2026-07-29
+entry.** `tools/voxel-sun-arms.ps1` alternated FROZEN vs MOVING arms on real
+terrain: p50 15.18 ms identical, p95 25.31 vs 25.32 ms (0.01 ms apart), at
+`voxel.Sky.ShadowUpdateHz=10` (the shipped default, not the uncapped case). A
+moving sun costs nothing measurable under that cadence cap. The mitigation
+this section proposed — cap the cadence rather than pay per frame — is
+therefore not a fallback, it is the configuration that was actually measured;
+an uncapped rotating light (`voxel.Sky.ShadowUpdateHz=0`) remains unmeasured.
 
 **Far shadows are deferred, not solved.** The 50 km vista gets no cast shadows
 under this plan.
@@ -643,11 +646,11 @@ Drive the existing rig at `VoxelEarthGameMode.cpp:100-137` from the clock. Per
   exactly as is; only the sun direction changes. Aerial perspective is what sells
   the 50 km vista and it comes free with the component.
 - **SkyLight** — already `SetRealTimeCaptureEnabled(true)`, so it tracks the
-  atmosphere automatically. **Measure it in P1.5**: real-time capture with a
-  *moving* sun re-captures continuously, which is not the same cost as with a
-  static one. An arm for this already exists in the repo's history
-  (`C-noskylight.stdout`). Same pair of runs as the CSM measurement (§5.3) —
-  both are "frozen sun vs rotating sun", so one leg answers both.
+  atmosphere automatically. **Measured in P1.5, 2026-07-29**, alongside the CSM
+  cost (§5.3, `docs/status.md`'s 2026-07-29 entry): frozen vs moving sun on the
+  same terrain leg came back p50 15.18 ms identical, p95 0.01 ms apart — a
+  moving sun's continuous SkyLight re-capture is folded into that same GPU
+  frame number and does not move it measurably.
 - **ExponentialHeightFog** with volumetric fog — density and colour from the
   weather field's humidity and precipitation. Volumetric fog is also the god-ray
   mechanism, and it is a real GPU cost: tier it.
@@ -876,19 +879,19 @@ put the encoding split at P2, called it *"the critical path"*, and claimed
 part of the visible cycle. The order below front-loads what is visible and
 cheap, and defers what is expensive, blocked, or merely refining.
 
-| P | Phase | Gate |
-|---|---|---|
-| **P0** | Clock, calendar, ephemeris, lat/long mapping, cvars, HUD readout, headless switches. **No visual change** | **Hard:** sun position within 0.5° at 4 reference checkpoints (§4). Frame time unchanged — it is game-thread only |
-| **P1** | **The visible day/night cycle.** Drive the *existing* rig (§5.5) from the clock: sun rotation + intensity + colour temperature, moon as second atmosphere light, SkyLight, basic fog — **plus the exposure policy (§5.8)**. No GI work of any kind | Screenshot ladder at 8 times of day, **captured as N frames in ONE process** (§7.1); sunrise/sunset times correct for latitude and season. **Hard:** night is measurably darker than noon *after* exposure — a mean-luminance ladder, not eyeballs. Exposure and lighting ship together or the gate is meaningless |
-| **P1.5** | **Measure the moving sun.** CSM cost and SkyLight real-time-capture cost, moving vs frozen, same binary (§5.3, §8 risk 3, risk 8) | Recording, not gating — but it is the input to every later decision. GPU frame and gather census, two runs, byte-identical arguments apart from `voxel.Sky.TimeScale` |
-| **P2** | **Weather field**, sampling API, debug visualisation, fog/atmosphere response. **No particles.** Promoted: it is game-thread work and the game thread is idle 75% of the frame (§2.5) | Two clients at the same (seed, time, position) sample identical weather; a front visibly crosses the world over minutes; frame time unmoved |
-| **P3** | **Seasonal snow line** through the *existing* material parameters (§5.7). One animated scalar via an MPC or the pool MID — **not** per-chunk MIDs. Promoted: nearly free | The snow line visibly climbs and falls across a simulated year; near field and clipmap agree at the seam (they share the graph, so this is a check, not a build); **no new `SetScalarParameterValue` per chunk per frame** |
-| **P4** | **The encoding split** (§5.2). Per-direction sky *colour* in the uniform buffer. Demoted: a second-order refinement, not the cycle | **Hard, numeric:** extend `voxel.GI.VolumeCheck` (`VoxelGI.cpp:177-189`); **RMS < 1/255** against the field with radiance pinned to 1.0. Pixel-identical is *impossible* and is not the bar (§5.2). Plus: unoccluded cells still read 1.0 at every time of day (§2.3) |
-| **P5** | **Hero lights only:** player torch, headlamp, explosive flash as ordinary UE point lights (§5.4). Emissive-voxel *harvest* may land here; emissive *delivery* may not | A torch lights a cave; `MaxBricks` budget unmoved. **The long tail and the injection volume are NOT in this phase** — they are blocked on designing an additive path to the pixel (§5.4) |
-| **P6** | Volumetric clouds + weather-map render target + tiers. Enable Epic's `Volumetrics` content plugin (§5.5) | Cloud cover matches sampled weather at the camera; per-tier frame cost recorded at 2K |
-| **P7** | Precipitation: particle infrastructure from scratch (§5.6), occluded by the Vis volume; wetness shading once a channel is chosen (§5.7); ripples and splashes | **Hard:** no rain inside caves. Wetness present on **both** renderer paths, or explicitly gated off on the component path with a log line |
-| **P8** | Set pieces: lightning + thunder, god rays, rainbows, aurora | Visual ladder. Lightning demonstrably lights a cave mouth and not sealed rock |
-| **P9** | Scalability tiers, final measurement leg, backlog and status entries | Full leg at 2K against the P0 baseline; tiers 0/1/2 each measured |
+| P | Phase | Gate | Status |
+|---|---|---|---|
+| **P0** | Clock, calendar, ephemeris, lat/long mapping, cvars, HUD readout, headless switches. **No visual change** | **Hard:** sun position within 0.5° at 4 reference checkpoints (§4). Frame time unchanged — it is game-thread only | **DONE 2026-07-29.** `VoxelEarth.Sky.SolarPosition` passes all four checkpoints; noon altitude measured 60.94° against theoretical 60.96° at 52.48°N, day-of-year 171 |
+| **P1** | **The visible day/night cycle.** Drive the *existing* rig (§5.5) from the clock: sun rotation + intensity + colour temperature, moon as second atmosphere light, SkyLight, basic fog — **plus the exposure policy (§5.8)**. No GI work of any kind | Screenshot ladder at 8 times of day, **captured as N frames in ONE process** (§7.1); sunrise/sunset times correct for latitude and season. **Hard:** night is measurably darker than noon *after* exposure — a mean-luminance ladder, not eyeballs. Exposure and lighting ship together or the gate is meaningless | **DONE 2026-07-29**, with three defects found and fixed by the ladder itself (twilight rendering pure black, the moon rendering warmer than the sun, deep night rendering brighter than a moonlit midsummer midnight — see `docs/status.md`'s 2026-07-29 entry for each mechanism). Two 8-rung ladders measured (summer 06-21, winter 12-21); the exposure curve has since been refitted from those 16 points (sin(alt)^0.80, not the ^1.15 the first anchors assumed) but **that refit is itself not yet verified by a re-run** |
+| **P1.5** | **Measure the moving sun.** CSM cost and SkyLight real-time-capture cost, moving vs frozen, same binary (§5.3, §8 risk 3, risk 8) | Recording, not gating — but it is the input to every later decision. GPU frame and gather census, two runs, byte-identical arguments apart from `voxel.Sky.TimeScale` | **DONE 2026-07-29 — risk retired.** `tools/voxel-sun-arms.ps1`, real terrain, alternating arms: frozen p50/p95 15.18/25.31 ms vs moving 15.18/25.32 ms — **no measurable cost**, at `voxel.Sky.ShadowUpdateHz=10` (the shipped default). That cap is the load-bearing part of the result, not an incidental detail — an uncapped rotating light was not measured |
+| **P2** | **Weather field**, sampling API, debug visualisation, fog/atmosphere response. **No particles.** Promoted: it is game-thread work and the game thread is idle 75% of the frame (§2.5) | Two clients at the same (seed, time, position) sample identical weather; a front visibly crosses the world over minutes; frame time unmoved | Not started |
+| **P3** | **Seasonal snow line** through the *existing* material parameters (§5.7). One animated scalar via an MPC or the pool MID — **not** per-chunk MIDs. Promoted: nearly free | The snow line visibly climbs and falls across a simulated year; near field and clipmap agree at the seam (they share the graph, so this is a check, not a build); **no new `SetScalarParameterValue` per chunk per frame** | Not started |
+| **P4** | **The encoding split** (§5.2). Per-direction sky *colour* in the uniform buffer. Demoted: a second-order refinement, not the cycle | **Hard, numeric:** extend `voxel.GI.VolumeCheck` (`VoxelGI.cpp:177-189`); **RMS < 1/255** against the field with radiance pinned to 1.0. Pixel-identical is *impossible* and is not the bar (§5.2). Plus: unoccluded cells still read 1.0 at every time of day (§2.3) | Not started |
+| **P5** | **Hero lights only:** player torch, headlamp, explosive flash as ordinary UE point lights (§5.4). Emissive-voxel *harvest* may land here; emissive *delivery* may not | A torch lights a cave; `MaxBricks` budget unmoved. **The long tail and the injection volume are NOT in this phase** — they are blocked on designing an additive path to the pixel (§5.4) | Not started |
+| **P6** | Volumetric clouds + weather-map render target + tiers. Enable Epic's `Volumetrics` content plugin (§5.5) | Cloud cover matches sampled weather at the camera; per-tier frame cost recorded at 2K | Not started. Sky-asset fetch/import/material scripts exist (`tools/fetch-sky-assets.ps1`, `ue-project/Tools/import_sky_textures.py`, `create_sky_material.py`) but have not been run through the editor — no sky-dome actor or `M_NightSky` asset exists yet |
+| **P7** | Precipitation: particle infrastructure from scratch (§5.6), occluded by the Vis volume; wetness shading once a channel is chosen (§5.7); ripples and splashes | **Hard:** no rain inside caves. Wetness present on **both** renderer paths, or explicitly gated off on the component path with a log line | Not started |
+| **P8** | Set pieces: lightning + thunder, god rays, rainbows, aurora | Visual ladder. Lightning demonstrably lights a cave mouth and not sealed rock | Not started |
+| **P9** | Scalability tiers, final measurement leg, backlog and status entries | Full leg at 2K against the P0 baseline; tiers 0/1/2 each measured | Not started |
 
 **P0 → P1 is the whole day/night cycle**, and it is the shippable slice if time
 is short. P1.5 is the only thing that can invalidate the plan's cost assumptions,
@@ -982,18 +985,19 @@ cvar rather than by rebuild.
 
 Ordered roughly by how much is unknown, not by how much would hurt.
 
-1. **Moving-sun CSM cost is the largest unmeasured GPU unknown in this plan, and
-   the number that was used to dismiss it does not apply.** `docs/backlog.md` §0
-   reports `shadowGather=0` and ~1.03 gathers/frame and calls the shadow
-   hypothesis *"dead"* — **measured with a sun frozen at `(-45°, 30°)` since
-   spawn** (`VoxelEarthGameMode.cpp:103`, set once in `BeginPlay`, never moved).
-   A static movable directional light lets the engine cache whole-scene shadow
-   depths across frames. A sun that rotates every frame busts that cache and
-   re-renders the pool into every cascade, every frame — and `docs/backlog.md` §0
-   also establishes that the pool is 62,657 runs frustum-tested per gather. **The
-   measurement does not transfer.** Named, unmeasured, and the reason P1.5 exists.
-   Mitigation if it bites: `voxel.Sky.ShadowUpdateHz` — rotate the light on a
-   cadence rather than per frame; at 0.3°/s nobody can see the difference.
+1. ~~**Moving-sun CSM cost is the largest unmeasured GPU unknown in this plan.**~~
+   **MEASURED AND RETIRED, 2026-07-29 (P1.5).** `docs/backlog.md` §0's
+   `shadowGather=0` / ~1.03 gathers/frame number was measured with a sun frozen
+   at `(-45°, 30°)` since spawn (`VoxelEarthGameMode.cpp:103`, pre-W4) and did
+   not transfer by inspection alone — a rotating light busts UE's whole-scene
+   shadow cache. `tools/voxel-sun-arms.ps1` alternated frozen vs moving arms on
+   real terrain and found **no measurable difference**: p50 15.18 ms identical
+   both arms, p95 25.31 vs 25.32 ms. The mitigation named below
+   (`voxel.Sky.ShadowUpdateHz`, cadence-capped at 10 Hz by default) is what was
+   actually measured — this result does not extend to
+   `voxel.Sky.ShadowUpdateHz=0` (uncapped), which remains unmeasured. Mitigation
+   if the uncapped case ever bites: the same cadence cap; at 0.3°/s nobody can
+   see the difference.
 2. **Exposure will silently defeat every visual gate** unless §5.8's policy ships
    *with* P1 rather than after it. Auto-exposure lifts a dark frame toward 18%
    grey, so night ships "dark" and renders mid-grey, and the screenshot ladder
@@ -1003,8 +1007,9 @@ Ordered roughly by how much is unknown, not by how much would hurt.
 3. **Two unbound post-process volumes will fight, silently** (§5.8).
    `CaveExposurePP` already exists at `Priority = 100`, `bUnbound = true`. Its own
    comment assumes *"the project ships none"* others. This plan ships one.
-4. **Real-time SkyLight capture with a moving sun** is an unmeasured cost
-   (§5.5). Measured in P1.5 alongside risk 1, from the same pair of runs.
+4. ~~**Real-time SkyLight capture with a moving sun** is an unmeasured cost~~
+   **MEASURED 2026-07-29 (§5.5, P1.5), alongside risk 1, from the same pair of
+   runs: no measurable cost.**
 5. **Volumetric clouds and volumetric fog are the two heaviest items**, and both
    land on the GPU, which `docs/backlog.md` §0 identifies as the ceiling. The
    perf-blind decision means these may need to come back down after P6/P8. Tiers

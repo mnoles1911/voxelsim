@@ -1,0 +1,134 @@
+Day/night cycle — measurements, 2026-07-29
+==========================================
+
+Every number here was read back from the running engine, not from what was
+requested. Ladders are 8 rungs across one simulated day, all in ONE process:
+the screenshot noise floor is 0.00% within a session and 1.81% between them
+(VoxelGpuVerify.cpp:2074-2084), so rungs from separate runs are not comparable.
+
+Spawn -84480,53760 (tile-coverage centre, real terrain) throughout.
+Metric is mean luminance of the sRGB frame, 0-255, over 2560x1440.
+
+
+1. SOLAR POSITION GATE  —  PASS
+-------------------------------
+Automation test VoxelEarth.Sky.SolarPosition, headless, -nullrhi.
+Within 0.5 deg at four checkpoints: equinox and both solstices at 52 N, plus
+70 N at solar midnight (altitude > 0, proving the midnight sun).
+
+In-engine cross-check: noon altitude 60.936 deg measured at 52.4829 N on
+day-of-year 171, against 90 - |lat - decl| = 60.96 deg. Delta 0.03 deg.
+
+
+2. THE THREE DEFECTS THE LADDER FOUND
+-------------------------------------
+None of these would have been caught by a unit test. All are fixed.
+
+(a) Twilight rendered PURE BLACK.
+    Before:  sun -5.1 deg -> mean 0.02, 0.0% non-black
+             sun -3.8 deg -> mean 0.02, 0.0% non-black  (byte-identical files)
+    After:   55.17 / 98.3% and 83.47 / 96.6%
+    Cause chain, verified in engine source rather than guessed:
+      SetVisibility(false) -> CreateRenderState_Concurrent skips AddLight
+      -> ProcessAtmosphereLightRemoval clears AtmosphereLights[0]
+      -> sky pass integrates zero radiance -> black sky
+      -> real-time-capture SkyLight captures that black sky as ambient.
+    The obvious fix reproduces it: UpdateColorAndBrightness computes
+    bValidIntensity as Intensity > 0 unless the light is in EV units, and a
+    DirectionalLight is Unitless, so "set intensity to 0" hides it too.
+
+(b) The moon lit terrain twice as orange as the sun.
+    kMoonTemperatureK was 4100 K, with a comment correctly arguing for a cool
+    Purkinje shift. Colour temperature runs backwards from the word "cool":
+    linear RGB at 4100 K is R:B 2.48 against the sun's 5778 K at R:B 1.22.
+
+(c) The darkest night of the year rendered BRIGHTEST.
+    The exposure curve capped flat below -2 deg, so it could not distinguish a
+    -14 deg midsummer midnight from a -61 deg midwinter one. USkyAtmosphere
+    models scattered sunlight only, so its sky is equally dead at both, leaving
+    deep night rendered by whatever the moon was doing — and the moon rides
+    higher in winter.
+
+
+3. LADDERS
+----------
+Mean luminance per rung. "pre-fit" is before the exposure refit; "post-fit" is
+after it, run in the D:/voxelsim-sky worktree.
+
+  SUMMER 06-21, 52.4829 N
+  rung   sun alt   pre-fit   post-fit   predicted(post)
+  00h00   -14.1      38.01     44.85      38.0
+  03h00    -5.1      55.17     42.83      39.7
+  06h00   +17.5     128.93    104.28      96.6
+  09h00   +44.4     123.10    131.41     122.0
+  12h00   +60.9     129.44    138.63     129.4
+  15h00   +46.3     122.68    133.81     122.3
+  18h00   +19.5     124.62    109.97      96.5
+  21h00    -3.8      83.47     43.01      39.0
+
+  WINTER 12-21, 52.4829 N
+  rung   sun alt   pre-fit   post-fit   predicted(post)   moon
+  00h00   -60.8       5.85      8.54       5.85          76% at +29.4
+  03h00   -45.3       9.03     13.67       9.03          75% at +50.5
+  06h00   -18.5       7.25     11.31       7.25          64% at +48.1
+  09h00    +4.6     146.78     75.91      74.60          down
+  12h00   +14.2     150.00    116.19     106.40          down
+  15h00    +5.0     143.89     80.85      76.40          down
+  18h00   -17.9       0.02      0.02       0.02          BELOW HORIZON
+  21h00   -44.7       0.02      0.02       0.02          BELOW HORIZON
+
+  READING THESE:
+  * The refit's purpose was monotonicity in sun altitude. Pre-fit, a +14.2 deg
+    winter noon rendered 150 against a +60.9 deg summer noon at 129 — backwards.
+    Post-fit: 116.19 vs 138.63, i.e. winter noon 16.2% dimmer. Target was 15-25%.
+  * Every post-fit residual is POSITIVE (+1.3 to +13.5). That is a single
+    systematic offset of roughly 0.1 stop, not a shape error, and
+    voxel.Sky.ExposureBias shifts it in one move without touching the table.
+    Not yet applied — it is cosmetic and wanted a second opinion first.
+  * The two moonless winter rungs at 0.02 are CORRECT, not a streaming failure:
+    moonIntensity reads 0.0000 with the moon below the horizon, and no stars,
+    airglow or local lights exist yet. Confirm from the log before reading a
+    black frame as a bug.
+  * Nights are seasonal now: midwinter moonlit 8.5-13.7 against midsummer 44.9.
+
+
+4. THE MOVING-SUN COST  —  ANSWERED, AND IT IS FREE
+---------------------------------------------------
+The open risk was that docs/backlog.md section 0 measured cascades cheap
+(shadowGather=0, ~1.03 gathers/frame) with a sun FROZEN SINCE SPAWN. A static
+movable directional light lets the engine cache whole-scene shadows; a rotating
+one busts that cache every frame. The measurement did not transfer, so it was
+re-taken.
+
+tools/voxel-sun-arms.ps1, alternating arms (F,M,F,M — never grouped), 2560x1440,
+line flight, 90/120/60 s, identical spawn/seed/route/date, differing only in
+-TimeScale. Leg 1 discarded for a cold shader cache (722 hitches against 347).
+
+  arm      p50      p95      max     hitches   sun
+  FROZEN   15.18    25.31    69.52     347     alt 37.55, tod 12:00
+  MOVING   15.18    25.32    78.19     268     drift 29.4 deg, 12:02 -> 17:23
+
+  p50 identical. p95 identical to 0.01 ms.
+
+  CAVEAT THAT MUST TRAVEL WITH THIS NUMBER: measured with
+  voxel.Sky.ShadowUpdateHz = 10, i.e. the light's orientation is re-asserted at
+  10 Hz, not every frame. It is THAT CONFIGURATION which is free. An uncapped
+  rotating light has not been measured and this result says nothing about it.
+
+  A first attempt at this leg was VOID: it was the first run after a build, the
+  editor spent ~5 minutes compiling shaders before the world existed, and the
+  480 s wall fired mid-flight. Its editor then outlived the script and the
+  one-editor guard correctly refused the remaining three legs rather than
+  producing contended numbers. Discard the first run after any build.
+
+
+5. WHAT IS BUILT BUT NOT RUN
+----------------------------
+tools/fetch-sky-assets.ps1 (NASA Deep Star Maps 2020 + CGI Moon Kit, pinned,
+gitignored, sha256 in Content/Voxel/TextureSource/SKY_ASSET_CREDITS.md),
+ue-project/Tools/import_sky_textures.py, and create_sky_material.py (authors
+M_NightSky plus the project's first Material Parameter Collection).
+
+None has been through the editor. There is no sky-dome actor, so the star map
+and the moon disc have nowhere to render — the moon currently visible is
+UE's own flat atmosphere-light disc.
