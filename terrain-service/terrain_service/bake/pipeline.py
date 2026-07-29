@@ -47,8 +47,8 @@ tuning knob: do not shrink it. ``BakeGeometry`` is parameterised only so the
 tests can run a 60x smaller domain; ``BakeGeometry.assert_production()``
 exists to make an accidental production shrink fail loudly.
 
-TWO THINGS THE APRON DOES **NOT** SOLVE
----------------------------------------
+THREE THINGS THE APRON DOES **NOT** SOLVE
+-----------------------------------------
 1. **Roughness anchoring.** An apron only helps if the field being computed is
    a function of *world* position. fBm generated in array coordinates is not:
    two overlapping domains disagree in their overlap for reasons that have
@@ -57,14 +57,22 @@ TWO THINGS THE APRON DOES **NOT** SOLVE
    whose catchment spans many tiles. See ``FlowLevel`` /
    ``build_flow_superblock`` / ``inject_edge_inflow`` for the hydrology
    pyramid, and ``HYDROLOGY_RESIDUALS`` for what it still gets wrong.
+3. **The depression fill is unbounded too, and it was thought not to be.**
+   A cell's filled elevation is the minimum over all paths to the DOMAIN
+   BORDER of the highest point on that path, so cutting the domain closer does
+   not truncate information, it *invents an outlet*. Measured on real tile
+   (-5,2): widening the apron from 960 m to 1920 m moves **1.05% of the shipped
+   interior by more than the 100 mm wire LSB**, by up to 78.79 m, with the
+   influence reaching ~3.8 km inward. ``APRON_BLIND_SPOT`` has the table, the
+   distance decay, and why ``inject_edge_inflow`` cannot fix it (it runs after
+   the fill).
 
-And it is exactly those two: ``APRON_BLIND_SPOT`` records a stage-by-stage
-measurement through this pipeline against real numba/scipy kernels showing that
-the carrier, the roughness and the depression fill come out **bit-identical**
-between a per-tile bake and a single-domain bake, and that 100% of the residual
-enters at accumulation and rides through incision into the surface. The plan
-predicted this; nothing had attributed it to a stage before, because the
-existing seam test compares only end-of-pipeline fields.
+The first two were the plan's own prediction; ``APRON_BLIND_SPOT`` records the
+stage-by-stage measurement that isolated them, and the later one that found the
+third. The carrier and the roughness are bit-identical between a per-tile bake
+and a wider-domain bake on real terrain -- that part of the apron argument is
+exactly right and is now confirmed against the real kernels, not just the
+prototype's.
 
 MEMORY
 ------
@@ -120,6 +128,7 @@ __all__ = [
     "load_kernels",
     "roughness_seed",
     "superblock_index",
+    "superblock_inputs_fingerprint",
 ]
 
 
@@ -140,7 +149,14 @@ __all__ = [
 #: automatically (``bake_identity_payload``) so a value change rolls the id
 #: even if you forget; the counter exists for changes to the *code* that the
 #: constants cannot describe.
-BAKE_VERSION = 1
+#:
+#: 1 -> 2 (2026-07-29, Wave E): the flow plane's magnitude field is now gated
+#: (``flow_mag_min_area_m2``) and its channel flag tapers below sea level
+#: (``flow_flag_sea_taper``); ``FlowSuperblock`` carries an inputs fingerprint
+#: and the .vxfl container grew a field for it. The constants roll the id on
+#: their own; the counter moves because the .vxfl layout and the flow-plane
+#: packing code changed with them.
+BAKE_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -363,6 +379,26 @@ class BakeConstants:
     channel_depth_m: float = 0.25
     #: Thermal net gain that counts as deposition.
     deposition_m: float = 0.10
+    #: Accumulation (AFTER the sea-level taper) below which the flow plane's
+    #: log2 magnitude, bits 0-4, is written as ZERO.
+    #:
+    #: The format assumes the plane is "mostly zeros, ~5-10 KB compressed"
+    #: (docs/vxtl-v2-format.md section 6); measured on the first real bakes it
+    #: was 5.75 MB on an alpine tile and 8.88 MB on an ocean one, of which 87%
+    #: is this magnitude field -- because at 1.875 m/px every land cell has
+    #: upslope area, so bits 0-4 were dense. Set to the same value as
+    #: ``channel_init_area_m2`` on purpose rather than tuned: below it
+    #: ``stream_power``'s gate has already decided there is no channel, so the
+    #: magnitude there describes a river the bake declined to cut. 5.745 ->
+    #: 1.518 MB alpine, 7.677 -> 0.000 MB ocean. 0 disables the gate and
+    #: reproduces the pre-2026-07-29 plane exactly. See FLOW_PLANE_SIZE.
+    flow_mag_min_area_m2: float = 1.0e4
+    #: Apply the sea-level taper (``sea_taper_top_m``/``sea_taper_bottom_m``)
+    #: to the flow plane's CHANNEL flag and magnitude gate, not only to
+    #: incision. Without it the plane kept flagging dendritic drainage at 3 km
+    #: depth that the tapered incision no longer cuts -- a lie about the ground
+    #: as well as 7.7 MB of it. See FLOW_PLANE_SIZE.
+    flow_flag_sea_taper: bool = True
 
     def __post_init__(self) -> None:
         if not 0.0 < self.thermal_rate <= 0.5:
@@ -396,6 +432,8 @@ class BakeConstants:
             "channel_area_m2": self.channel_area_m2,
             "channel_depth_m": self.channel_depth_m,
             "deposition_m": self.deposition_m,
+            "flow_mag_min_area_m2": self.flow_mag_min_area_m2,
+            "flow_flag_sea_taper": self.flow_flag_sea_taper,
         }
 
 
@@ -699,6 +737,12 @@ What the pyramid still gets wrong. Recorded so nobody rediscovers it.
    frontier is not. This is the largest residual, and it is as much a policy
    question as a numerical one.
 
+   NOT FIXED, but no longer SILENT (2026-07-29): every superblock now carries
+   ``inputs_fingerprint``, every ``BakeResult`` carries the fingerprint of the
+   superblock it used plus ``superblock_complete``, and ``pregen`` refuses to
+   reuse a cached superblock whose fingerprint disagrees with the coarse world
+   that exists now. See ``ORDER_DEPENDENCE``.
+
 2. **The top of the pyramid is open.** Level ``superblock_max_level`` receives
    no inflow at its own edges, so a catchment larger than that level's span
    (245 km at the default level 1) is truncated. The plan's answer is to seed
@@ -726,15 +770,23 @@ What the pyramid still gets wrong. Recorded so nobody rediscovers it.
    before rejoining a coarse-resolved channel can still kink at a tile edge --
    the plan's own predicted residual, sub-metre and 1-2 px wide.
 
-6. **Wide flats route by epsilon staircase.** A flat wider than the apron can
-   be crossed in different directions by two neighbouring bakes, because the
-   staircase runs outward from whichever border the flood reached it from.
-   Heights still agree (sub-ULP, well under the 100 mm wire LSB); accumulation
-   need not. At 1.875 m/px "wider than the apron" is 512 px -- an ordinary
-   lake. Detected per tile via ``basin_exceeds_apron``; see
-   ``APRON_BLIND_SPOT``. The coarse superblock is the natural fix here too,
-   since it is world-anchored and shared between neighbours, but that is not
-   wired.
+6. **The fill LEVEL, not just the flat's routing.** This entry used to say
+   that a flat wider than the apron can be crossed in different directions by
+   two neighbouring bakes while heights still agree to sub-ULP. Measured, the
+   heights do NOT agree: the domain border is an invented outlet, so a basin
+   whose true rim lies outside the padded domain drains through the cut instead
+   of filling, and widening the apron on real tile (-5,2) moves 1.05% of the
+   shipped interior past the 100 mm wire LSB (max 78.79 m). Directly across the
+   (-5,2)/(-5,3) join the elevation seam is nonetheless small -- 27.41 cm mean
+   step against the terrain's own 26.61 cm, i.e. **0.80 cm of excess**, because
+   no large basin happens to straddle that particular edge -- while the
+   ACCUMULATION step is 4.56x the terrain's own and the channel flag disagrees
+   on 0.92% of the join cells. Numbers and method in ``APRON_BLIND_SPOT``.
+
+   The fix is a boundary condition on the FILL taken from the superblock's
+   ``filled`` raster (world-anchored, shared, 61 km at level 0), NOT more
+   inflow: ``inject_edge_inflow`` runs after the fill and cannot change where
+   the surface lets water go. Not wired.
 """
 
 
@@ -789,6 +841,114 @@ def superblock_index(tile_x: int, tile_y: int, level: FlowLevel) -> tuple[int, i
     return (int(tile_x) // n, int(tile_y) // n)
 
 
+ORDER_DEPENDENCE = """\
+Why a superblock carries a fingerprint of what it was built FROM.
+
+HYDROLOGY_RESIDUALS #1 is not a numerical error, it is a *provenance* problem:
+a superblock is built from whatever coarse tiles existed when the first tile
+inside it baked, a shipped tile is never regenerated, so an on-demand frontier
+freezes one arbitrary exploration order into the river network forever. Nothing
+about that is detectable after the fact from the tile bytes -- two worlds
+explored in different orders are both self-consistent and neither says so.
+
+``superblock_inputs_fingerprint`` is the thing that says so. It is a 16-byte
+digest over EVERY input the superblock's hydrology depends on, in a canonical
+world order that has nothing to do with the order the caller fetched them:
+
+  * the block's identity and geometry (level, index, tiles per side, cell size)
+    and the routing constants the accumulation used (``mfd_p``, ``flat_eps``);
+  * for each coarse tile of the block, in world (row, column) order, either a
+    present-marker plus the tile's float32 bytes, or an absent-marker;
+  * the PARENT level's fingerprint, so the digest covers the whole upstream
+    chain rather than one level of it.
+
+Three things follow, and all three are the point:
+
+1. **Absence is hashed, not skipped.** A block built while its north-west
+    quadrant did not yet exist has a different fingerprint from the same block
+    built after, even though both are "valid". That difference is exactly the
+    order dependence.
+2. **Fetch order cannot change it.** The loop is over world coordinates, so a
+    caller that walks its tiles in a different order gets the same digest. A
+    fingerprint that moved with iteration order would report order dependence
+    everywhere and mean nothing.
+3. **It is checkable against the present.** Recomputing it from the coarse
+    tiles that exist NOW and comparing against the digest stored in a cached
+    ``.vxfl`` answers "was this superblock built against a smaller world than
+    the one we are in?" -- which is the question ``pregen`` now asks before it
+    reuses one, and the answer it used to discard silently.
+
+What it deliberately does NOT do is fix anything. A tile baked against an
+incomplete superblock stays baked that way; ``pregen --mode bake`` over a
+radius is still the only way to be order-independent. This makes the residual
+visible and attributable instead of invisible, which is the difference between
+a known limitation and a mystery.
+"""
+
+#: Digest length of ``superblock_inputs_fingerprint``. 16 bytes: this is a
+#: provenance tag compared for equality, never a security boundary, and it
+#: rides in every .vxfl header.
+FLOW_FINGERPRINT_BYTES = 16
+
+_FP_DOMAIN = b"vxbake-flow-inputs:v1"
+
+
+def superblock_inputs_fingerprint(
+    coarse_fetch: CoarseFetch,
+    sx: int,
+    sy: int,
+    level: "FlowLevel",
+    parent_fingerprint: bytes = b"",
+) -> bytes:
+    """Digest of every input one superblock's hydrology is built from.
+
+    Read ``ORDER_DEPENDENCE`` for why this exists. Deterministic, canonical in
+    WORLD order (not fetch order), and it hashes a missing tile as a missing
+    tile rather than skipping it -- the whole value is that "this block was
+    built before that region existed" changes the answer.
+
+    Costs one pass over the block's coarse tiles: 16 MB of sha256 at level 0
+    with the default 4x4 block, 256 MB at level 1. That is I/O and hashing
+    against a priority flood over the same ground, so it is not what decides
+    whether the pyramid is affordable.
+    """
+    h = hashlib.sha256()
+    h.update(_FP_DOMAIN)
+    h.update(
+        json.dumps(
+            {
+                "bake_version": BAKE_VERSION,
+                "level": int(level.level),
+                "sx": int(sx),
+                "sy": int(sy),
+                "tiles_per_side": int(level.tiles_per_side),
+                "downsample": int(level.downsample),
+                "cell_m": float(level.cell_m),
+                "coarse_tile_px": int(level.geom.coarse_tile_px),
+                "mfd_p": float(level.consts.mfd_p),
+                "flat_eps": level.consts.flat_eps,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    # Length-prefixed so "no parent" and "a parent whose digest happens to
+    # start with zeros" cannot collide.
+    h.update(struct.pack("<B", len(parent_fingerprint)))
+    h.update(parent_fingerprint)
+
+    n = level.tiles_per_side
+    tx0, ty0 = sx * n, sy * n
+    for j in range(n):
+        for i in range(n):
+            src = coarse_fetch(tx0 + i, ty0 + j)
+            if src is None:
+                h.update(b"\x00")
+                continue
+            h.update(b"\x01")
+            h.update(np.ascontiguousarray(src, dtype=np.float32).tobytes())
+    return h.digest()[:FLOW_FINGERPRINT_BYTES]
+
+
 @dataclass
 class FlowSuperblock:
     """Cached coarse-hydrology artifact for one world-anchored superblock."""
@@ -807,17 +967,36 @@ class FlowSuperblock:
     filled: np.ndarray
     #: Coarse tiles that were unavailable when this was built.
     missing_tiles: tuple[tuple[int, int], ...] = ()
+    #: ``superblock_inputs_fingerprint`` of the world this was built from.
+    #: See ORDER_DEPENDENCE. Empty only for a hand-built test fixture.
+    inputs_fingerprint: bytes = b""
 
     @property
     def size_px(self) -> int:
         return int(self.acc.shape[0])
 
+    @property
+    def complete(self) -> bool:
+        """True when every coarse tile of the block existed at build time.
+
+        The ONLY case in which the hydrology this superblock feeds is
+        independent of exploration order.
+        """
+        return not self.missing_tiles
+
+    @property
+    def fingerprint_hex(self) -> str:
+        return self.inputs_fingerprint.hex()
+
 
 _FLOW_MAGIC = b"VXFL"
-_FLOW_VERSION = 1
+#: 1 -> 2: added the 16-byte inputs fingerprint. Old blobs are REFUSED rather
+#: than read with a zero fingerprint, because a zero fingerprint would read as
+#: "provenance unknown" everywhere and defeat the check it was added for.
+_FLOW_VERSION = 2
 #: magic, version, seed, bake_ver, level, pad, sx, sy, tiles_per_side, size,
-#: cell_m, origin_x_m, origin_y_m, n_missing
-_FLOW_HEADER = struct.Struct("<4sHQHBBiiHIfddI")
+#: cell_m, origin_x_m, origin_y_m, inputs_fingerprint, n_missing
+_FLOW_HEADER = struct.Struct("<4sHQHBBiiHIfdd16sI")
 
 
 def encode_flow_superblock(sb: FlowSuperblock, seed: int) -> bytes:
@@ -844,6 +1023,9 @@ def encode_flow_superblock(sb: FlowSuperblock, seed: int) -> bytes:
         float(sb.cell_m),
         float(sb.origin_m[0]),
         float(sb.origin_m[1]),
+        bytes(sb.inputs_fingerprint).ljust(FLOW_FINGERPRINT_BYTES, b"\x00")[
+            :FLOW_FINGERPRINT_BYTES
+        ],
         len(sb.missing_tiles),
     )
     missing = np.asarray(sb.missing_tiles, dtype="<i4").reshape(-1, 2)
@@ -866,6 +1048,7 @@ def decode_flow_superblock(data: bytes) -> tuple[FlowSuperblock, int]:
         cell_m,
         ox,
         oy,
+        fingerprint,
         n_missing,
     ) = _FLOW_HEADER.unpack_from(data)
     if magic != _FLOW_MAGIC:
@@ -898,6 +1081,7 @@ def decode_flow_superblock(data: bytes) -> tuple[FlowSuperblock, int]:
         acc=np.array(acc),
         filled=np.array(filled),
         missing_tiles=tuple((int(a), int(b)) for a, b in missing.reshape(-1, 2)),
+        inputs_fingerprint=bytes(fingerprint),
     )
     return sb, seed
 
@@ -932,6 +1116,11 @@ def build_flow_superblock(
     its channel and would route flow along an elevation field no real cell has.
     Mean keeps the drainage divides where the 30 m data put them, which is what
     the accumulation is for.
+
+    The result carries ``inputs_fingerprint`` -- a digest of the coarse tiles
+    (present AND absent) it was actually built from, chained to the parent's.
+    See ``ORDER_DEPENDENCE``: without it, "this block froze an earlier world"
+    is undetectable, and it is the residual the plan calls the largest one.
     """
     n_tiles = level.tiles_per_side
     tile_px = level.geom.coarse_tile_px
@@ -985,6 +1174,15 @@ def build_flow_superblock(
         acc=acc,
         filled=filled,
         missing_tiles=tuple(missing),
+        inputs_fingerprint=superblock_inputs_fingerprint(
+            coarse_fetch,
+            sx,
+            sy,
+            level,
+            parent_fingerprint=(
+                parent.inputs_fingerprint if parent is not None else b""
+            ),
+        ),
     )
 
 
@@ -1094,23 +1292,170 @@ def _max_axis_run(mask: np.ndarray) -> int:
     return best
 
 
+FLOW_PLANE_SIZE = """\
+What the flow plane costs, and why the format's "~5-10 KB" was out by 1000x.
+
+docs/vxtl-v2-format.md section 6 specifies one uint8 per fine pixel -- bits 0-4
+``log2(accumulation in m2)``, bit 5 channel, bit 6 bank, bit 7 deposition --
+and predicts "Mostly zeros; ~5-10 KB compressed". MEASURED on the first real
+bakes (zstd-19 over the actual block payloads, 8192^2, the accounting in
+tools/bake_real_tile.py):
+
+    tile              flow plane   elevation plane
+    (-5,2) alpine        5.75 MB       16.85 MB
+    (-7,4) ocean         8.88 MB       19.44 MB
+
+Three orders of magnitude over the spec, and a quarter of the whole tile.
+
+THE SPEC IS RIGHT ABOUT THE FLAGS AND WRONG ABOUT BITS 0-4. "Mostly zeros"
+holds only if the magnitude is zero away from channels, and it never was: at
+1.875 m/px EVERY land cell has upslope area, so ``log2(A)`` is a dense field of
+small integers that steps by +-1 between neighbours nearly everywhere. That is
+close to the worst case for a MED predictor -- too correlated to be noise, too
+noisy to predict -- and it is paid on all 67.1 M pixels. Decomposed on the
+alpine tile by encoding each half of the byte alone:
+
+    (-5,2)  bits 0-4 alone (magnitude)   5.015 MB   <- 87% of the plane
+            bits 5-7 alone (flags)       0.920 MB
+            whole byte                   5.745 MB
+
+TWO LEVERS, MEASURED SEPARATELY. Both are BakeConstants, so either rolls the
+bake fingerprint, hence provider_id, hence the world.
+
+1. ``flow_flag_sea_taper`` -- the channel flag now tests a DEPTH-TAPERED
+   accumulation, the same smoothstep ``incise.stream_power`` already applies to
+   incision. Without it the plane described dendritic rivers at 3 km depth that
+   the (already tapered) incision no longer cuts, which is not just expensive,
+   it is a lie about the ground.
+2. ``flow_mag_min_area_m2`` -- bits 0-4 are written only where the tapered
+   accumulation reaches the channel-initiation area, or on a channel/bank cell
+   whatever its own area. Below ``channel_init_area_m2`` the bake has ALREADY
+   decided there is no channel (that is what the gate in ``stream_power``
+   means), so the magnitude there describes a river the bake declined to cut.
+   Setting it to the same 1e4 m2 is the principled choice, not a tuned one:
+   the plane's magnitude covers exactly the domain where the bake believes
+   channels exist. 0 disables it and reproduces the pre-Wave-E plane exactly.
+
+    variant                          alpine (-5,2)   ocean (-7,4)
+    pre-Wave-E (dense, untapered)       5.745 MB       7.677 MB
+                                                      (8.88 MB before
+                                                       stream_power's
+                                                       own sea taper)
+    flag taper only                     5.745 MB       7.235 MB
+    magnitude gate 1e3 only             2.589 MB       5.800 MB
+    magnitude gate 1e4 only             1.518 MB       3.109 MB
+    magnitude gate 1e5 only             1.489 MB       1.075 MB
+    SHIPPED (1e4 + flag taper)          1.518 MB       0.000 MB
+                                          -73.6 %       -100.0 %
+
+Read the two columns against each other, because they say different things.
+
+  * On the ALPINE tile the taper does nothing at all -- the tile's minimum
+    elevation is 1017 m, so no cell is below sea level -- and the whole saving
+    is the magnitude gate. Note also that 1e5 buys almost nothing over 1e4
+    (1.489 vs 1.518): past the channel head the field is no longer dense, so
+    the gate has already done its work and tightening it only discards real
+    tributaries.
+  * On the OCEAN tile the reverse: the taper is what matters, and it only
+    works because the magnitude gate reads the TAPERED area too. Gating on raw
+    accumulation left the ocean tile at 2.673 MB; gating on tapered
+    accumulation takes it to **1024 CONSTANT blocks and zero data bytes**,
+    which is what section 4 assumed an ocean tile would produce ("Zero data
+    bytes. Common: ocean, flat basin") and what tools/bake_real_tile.py
+    measured as 0 of 1024 before any of this.
+
+Deposition is NOT tapered. Thermal relaxation is mass wasting, which happens
+underwater; and there was nothing to win anyway -- measured 0.00% of the ocean
+tile flagged as deposition against 2.98% alpine.
+
+WHAT IS LOST. Hillslope accumulation below the channel head is no longer on
+the wire. The consumers section 6 names are "client alluvium/cut-bank
+materials" and "flow-conditioned rill synthesis and bank undercuts"; the first
+two live on channel and bank cells, which keep their magnitude. Rill synthesis
+on open hillslopes now has flags but no magnitude there -- deliberately, since
+the drainage the bake actually resolved does not extend below 1e4 m2 and a
+client rill field at that scale is procedural either way. If that turns out to
+be wrong, ``flow_mag_min_area_m2`` is the one number to move, and moving it
+rolls the world.
+
+WHAT IT DOES TO THE TILE. zstd-19 over the real block payloads, against the
+three tiles tools/bake_real_tile.py first measured:
+
+    tile              was      elev now   flow now   now      delta
+    (-5,2) alpine   22.62 MB    16.82       1.52    18.34 MB  -18.9 %
+    (-5,3) mixed    23.13 MB    16.52       2.35    18.86 MB  -18.5 %
+    (-7,4) OCEAN    28.35 MB    11.10       0.00    11.10 MB  -60.8 %
+
+Attribute the ocean row carefully, because most of it is not this change. Its
+ELEVATION plane fell 19.44 -> 11.10 MB because ``stream_power``'s sea taper
+(landed before this work) stopped cutting river valleys into the seafloor, so
+there is less invented detail to encode; the flow plane's 7.68 -> 0.00 is this
+change. The two together turn the largest tile of the three into the smallest,
+which is what a mostly-ocean world needs and the opposite of what was measured
+before either.
+
+WHAT IS STILL NOT 5-10 KB. Even at the shipped setting the alpine plane is
+1.518 MB, ~150-300x the spec. The spec number is unreachable with ANY per-pixel
+magnitude field on dissected terrain: 4.13% of the alpine tile is channel and
+another 1.44% is bank, i.e. 3.7 M pixels of genuinely varying data however it
+is coded. "Mostly zeros; ~5-10 KB" is right for deep ocean and wrong by two
+orders of magnitude for land; that is a defect in docs/vxtl-v2-format.md
+section 6, which this module cannot fix (docs/ is not ours) and records here so
+the next person measures rather than trusts it.
+"""
+
+
+def _sea_taper(elev_m: np.ndarray, consts: BakeConstants) -> np.ndarray:
+    """``incise.stream_power``'s smoothstep, reused for the flow-plane flags.
+
+    Duplicated here rather than imported: ``pipeline`` must stay importable
+    without the numerics stack (see the module docstring), and this is six
+    lines of numpy. The two MUST agree -- a flow plane that flagged channels
+    the incision no longer cuts would be describing a river that is not in the
+    ground -- so ``tests/test_bake_pipeline.py`` asserts they match.
+    """
+    top = np.float32(consts.sea_taper_top_m)
+    bot = np.float32(consts.sea_taper_bottom_m)
+    if not bot < top:
+        return np.ones(np.shape(elev_m), np.float32)
+    t = (np.asarray(elev_m, dtype=np.float32) - bot) / (top - bot)
+    t = np.clip(t, 0.0, 1.0)
+    return t * t * (np.float32(3.0) - np.float32(2.0) * t)
+
+
 def flow_plane(
     acc: np.ndarray,
     incision_m: np.ndarray,
     thermal_gain_m: np.ndarray,
     consts: BakeConstants = CONSTANTS,
+    elev_m: "np.ndarray | None" = None,
 ) -> np.ndarray:
     """Pack the optional uint8 flow plane.
 
     bits 0-4 = log2(accumulation in m^2) clamped 0-31, bit 5 = channel,
     bit 6 = bank, bit 7 = deposition (docs/vxtl-v2-format.md section 6).
+
+    ``elev_m`` is the depression-filled surface, i.e. the same field
+    ``stream_power`` tapers against. Optional only so a unit test can pack a
+    plane without one; ``bake_tile`` always passes it, and without it
+    ``flow_flag_sea_taper`` cannot apply. See ``FLOW_PLANE_SIZE``.
     """
     acc = np.asarray(acc, dtype=np.float32)
     with np.errstate(divide="ignore", invalid="ignore"):
         mag = np.log2(np.maximum(acc, 1.0))
     out = np.clip(mag, 0, 31).astype(np.uint8)
 
-    channel = (acc >= consts.channel_area_m2) | (
+    # The channel test sees a DEPTH-TAPERED accumulation, so the flag's contour
+    # migrates continuously seaward instead of stepping along the coastline --
+    # the same reason ``stream_power`` tapers rather than cuts. Multiplying the
+    # area by the taper (rather than testing depth against a threshold) is what
+    # keeps it continuous: at the shelf break the effective threshold is
+    # infinite, at sea level it is unchanged, and in between it slides.
+    a_eff = acc
+    if consts.flow_flag_sea_taper and elev_m is not None:
+        a_eff = acc * _sea_taper(elev_m, consts)
+
+    channel = (a_eff >= consts.channel_area_m2) | (
         np.asarray(incision_m, dtype=np.float32) >= consts.channel_depth_m
     )
     out |= channel.astype(np.uint8) << 5
@@ -1126,11 +1471,25 @@ def flow_plane(
     for di in (0, 1, 2):
         for dj in (0, 1, 2):
             dil |= pad[di : di + h, dj : dj + w]
-    out |= (dil & ~channel).astype(np.uint8) << 6
+    bank = dil & ~channel
+    out |= bank.astype(np.uint8) << 6
 
     out |= (np.asarray(thermal_gain_m, dtype=np.float32) >= consts.deposition_m).astype(
         np.uint8
     ) << 7
+
+    # The magnitude gate, applied LAST so it can see the channel/bank flags.
+    # Zeroing bits 0-4 below the channel-initiation area is what makes the
+    # plane "mostly zeros" as the format assumes; see FLOW_PLANE_SIZE for the
+    # measurement and for what it costs.
+    if consts.flow_mag_min_area_m2 > 0.0:
+        # a_eff, not acc: below the shelf break the bake has decided there is
+        # no fluvial drainage (incision is tapered out and the channel flag
+        # with it), so storing its accumulation is storing a number about a
+        # river that does not exist. On a 100%-ocean tile this is what turns
+        # the plane into the CONSTANT blocks the format assumed it would be.
+        keep = (a_eff >= np.float32(consts.flow_mag_min_area_m2)) | channel | bank
+        out &= np.where(keep, np.uint8(0xFF), np.uint8(0xE0))
     return out
 
 
@@ -1202,6 +1561,114 @@ across a flat is consistent by construction.
 place: run against the prototype's plain (epsilon-free) fill it reports 357 and
 1,719 interior cells with no receiver on those two tiles, which is exactly the
 level-lake failure the epsilon variant exists to remove.
+
+-----------------------------------------------------------------------------
+2026-07-29, Wave E: THE FILL IS NOT BOUNDED BY THE APRON ON REAL TERRAIN
+-----------------------------------------------------------------------------
+Everything above about the depression fill was measured with the PROTOTYPE's
+kernels -- a plain fill, no epsilon -- on a synthetic domain with a global
+tilt, i.e. terrain that drains. Re-measured with the real ``flow.py``
+priority-flood on a real diffusion tile, it does not hold.
+
+The measurement is an apron-sensitivity test, which is stronger than a seam
+test and needs no neighbour: bake the SAME tile twice at the SAME 1.875 m/px
+with two different apron widths and diff the INTERIORS. If the shipped
+interior is the infinite-domain answer, widening the domain cannot move it.
+Real tile (-5,2) (alpine, 1571 m relief, complete 3x3 ring), 960 m apron
+against 1920 m, 8192^2 interior only:
+
+    stage                        cells differing   mean       max
+    B0+B1 carrier + roughness          0.000 %     0.0000 m   0.00 m  EXACT
+    B2a depression fill                0.940 %     0.3252 m  64.99 m
+    B2c MFD accumulation               1.559 %     3663 m2   49.3 km2
+    B2d incision                       1.535 %     0.0039 m  25.00 m (capped)
+    B3  final surface                  1.439 %     0.3289 m  78.79 m
+
+**1.05 % of the shipped tile moves by more than the 100 mm wire LSB.** The
+carrier and the roughness are still bit-identical -- the apron argument is
+exactly right for everything it was measured on. What breaks is the FILL, and
+it breaks first: accumulation and incision inherit it.
+
+Where it lives, as a function of distance from the tile edge:
+
+    band from tile edge   cells differing   mean       max
+        0 -  960 m             2.228 %      0.9337 m   64.99 m
+      960 - 1920 m             1.355 %      0.3722 m   64.99 m
+     1920 - 3840 m             0.455 %      0.0983 m   47.16 m
+     3840 - 7680 m             0.000 %      0.0000 m    0.00 m  EXACT
+
+So the domain boundary's influence on the fill reaches **about 3.8 km into the
+interior -- four apron widths** -- and is then exactly zero. The plan's "error
+collapses between 120 m and 480 m, so the influence radius is a few hundred
+metres and 960 m carries real margin" is a true statement about the CARRIER and
+about a plain fill on draining terrain, and a false one about the epsilon
+priority-flood on alpine terrain with real closed depressions.
+
+WHY, and why no apron fixes it. A cell's filled elevation is the minimum over
+all paths to the DOMAIN BORDER of the highest point on the path. Cutting the
+domain closer does not merely truncate information, it INVENTS AN OUTLET: the
+border is an escape at whatever elevation the border happens to be, so a basin
+whose true rim lies outside the domain drains through the cut instead of
+filling. Measured on this tile the smaller apron under-fills -- basin fraction
+1.705 % against 2.440 %, deepest filled basin 55.21 m against 88.79 m. This is
+the same unboundedness the plan already grants flow accumulation, one stage
+earlier, and it has the same cure and the same non-cure:
+
+  * ``inject_edge_inflow`` CANNOT fix it. Inflow is added to ``accumulate_mfd``
+    AFTER the fill, so it changes how much water is routed and never where the
+    surface lets it go. Anything that only supplies boundary area is answering
+    a different question.
+  * The superblock's ``filled`` raster CAN, and is the thing to use: it is
+    world-anchored, shared between neighbours, and spans 61 km at level 0 --
+    far enough to contain the rim of any basin a 15 km tile can hold. The fix
+    is a boundary CONDITION ON THE FILL, not on the accumulation: clamp the
+    fine fill's border seed to the coarse filled surface (upsampled) rather
+    than to the fine surface's own border values, so the fine domain cannot
+    invent an outlet the coarse hydrology says is not there. That is a change
+    to ``flow.fill_depressions``' seeding, it is not wired, and it is the right
+    next piece of work here.
+
+WHAT THE PER-TILE DETECTORS ARE WORTH. ``max_basin_run_m`` measures the longest
+run of filled cells along a row or column. On tile (-5,2) it reports 2091 m
+against a 960 m apron and fires ``basin_exceeds_apron`` -- but the object it
+found is a valley floor 2258 m long and 759 m across, 52 % of its own bounding
+box, one of 1316 filled components covering 1.71 % of the tile. It measured a
+LENGTH and the flag reads it as a WIDTH. It is kept because the plan quotes it,
+and it is not the condition that matters.
+
+The condition that matters is not cheaply detectable either, and it is worth
+saying why rather than shipping a detector that looks sound and is not. "No
+filled flat touches the padded border" sounds like it would prove the fill is
+domain-independent; it is VACUOUS, because priority-flood seeds the border with
+its own elevation and never raises it, so no border cell is ever in the filled
+mask -- measured 0 border basin cells on both a 100 %-ocean tile and the alpine
+tile whose interior demonstrably does move. ``padded_border_basin_frac`` is
+reported for exactly that reason: it is a control that must read 0, and a
+nonzero value would mean the fill kernel had changed under us. Even a correct
+connectivity test would not be sound, because widening the domain can always
+reveal a LOWER saddle that no cell inside the current domain knows about.
+``basin_max_depth_m`` is the honest cheap proxy -- a tile with a 55 m-deep
+filled basin near its edge is a tile whose fill is at risk -- and the
+definitive test is the apron-sensitivity diff above, which costs a second bake.
+
+THE RESIDUAL SEAM, measured directly rather than inferred. Tiles (-5,2) and
+(-5,3) baked independently at the production apron; their interiors are
+adjacent world rows, so the step across the join can be read against the
+terrain's own one-cell step on both sides:
+
+    field           join step   terrain's own   ratio
+    final surface    27.41 cm      26.61 cm      1.03
+    depression fill  25.28 cm      25.30 cm      1.00
+    accumulation     16939 m2       3713 m2      4.56
+    incision          3.20 cm       2.12 cm      1.51
+    channel flag     75 of 8192 join cells disagree (0.92%)
+
+Shipped HEIGHTS across this join are fine -- 0.80 cm of excess step over the
+terrain's own gradient, against the plan's claimed 0.00 cm. ACCUMULATION is
+not: 4.56x the natural step, which is the same unbounded dependency the plan
+names, still unfixed, and now with a number on real terrain. Heights are fine
+HERE because no large basin straddles this particular edge; the
+apron-sensitivity table above is what says they are not fine in general.
 """
 
 
@@ -1225,6 +1692,10 @@ class BakeResult:
     stats: dict[str, float]
     #: Coarse ring tiles that were unavailable.
     missing_coarse: tuple[tuple[int, int], ...] = ()
+    #: Hex ``superblock_inputs_fingerprint`` of the level-0 superblock this
+    #: tile's cross-tile hydrology came from; "" when it baked without one.
+    #: This is the tile's hydrology PROVENANCE -- see ORDER_DEPENDENCE.
+    superblock_fingerprint: str = ""
 
 
 def bake_padded_domain(
@@ -1435,9 +1906,35 @@ def bake_tile(
     acc = np.ascontiguousarray(out["acc"][sl, sl])
     incision = out["incision"][sl, sl]
     gain = out["thermal_gain"][sl, sl]
-    plane = flow_plane(acc, incision, gain, consts)
+    # The DEPRESSION-FILLED surface, not the relaxed one: it is what
+    # stream_power tapered against, so the flow plane's channel flag and the
+    # incision it describes agree cell for cell.
+    plane = flow_plane(acc, incision, gain, consts, elev_m=out["filled"][sl, sl])
 
-    basin = (out["filled"] - out["carrier_plus_roughness"])[sl, sl] > 0.0
+    basin_depth = out["filled"] - out["carrier_plus_roughness"]
+    padded_basin = basin_depth > 0.0
+    # THE SOUND CONDITION (see APRON_BLIND_SPOT): a filled flat whose whole
+    # extent is inside the padded domain has its spill point inside the padded
+    # domain too, so priority-flood enters it through the terrain and the
+    # epsilon staircase is a function of the terrain alone. Only a flat that
+    # REACHES THE PADDED BORDER is entered from the border, and only then can
+    # two neighbouring bakes cross it in different directions. Measured on the
+    # perimeter, O(padded_fine_px) work, and it needs no connected-component
+    # labelling -- which matters because pipeline.py may not import scipy.
+    border_basin = int(
+        padded_basin[0, :].sum()
+        + padded_basin[-1, :].sum()
+        + padded_basin[:, 0].sum()
+        + padded_basin[:, -1].sum()
+    )
+    border_cells = 2 * padded_basin.shape[0] + 2 * padded_basin.shape[1]
+    basin = padded_basin[sl, sl]
+    del padded_basin
+    # The honest cheap proxy for "this tile's fill is at risk of being decided
+    # by the domain boundary": how deep the deepest filled depression is. On
+    # (-5,2) it read 55.21 m at the 960 m apron and 88.79 m at 1920 m.
+    max_basin_depth = float(basin_depth[sl, sl].max())
+    del basin_depth
     run_px = _max_axis_run(basin)
     stats = {
         # Extents and counts only -- a contended box cannot distort these.
@@ -1452,10 +1949,30 @@ def bake_tile(
         ),
         # A routing bug after an epsilon fill, not a landscape feature.
         "interior_dead_ends": float(out["interior_dead_ends"]),
+        # HYDROLOGY PROVENANCE, per tile (ORDER_DEPENDENCE). -1 means the tile
+        # baked with NO superblock at all, which is a stronger statement than
+        # "an incomplete one" and must not read as 0 missing tiles.
+        "superblock_missing_tiles": (
+            -1.0 if inflow_source is None else float(len(inflow_source.missing_tiles))
+        ),
+        "superblock_complete": (
+            0.0 if inflow_source is None or not inflow_source.complete else 1.0
+        ),
         # THE APRON'S BLIND SPOT, per tile. See APRON_BLIND_SPOT.
+        #
+        # ``max_basin_run_m``/``basin_exceeds_apron`` measure the LONGEST axis
+        # run of the filled mask, which on real terrain is a valley floor's
+        # LENGTH, not the width of anything. They are kept because they are
+        # what the plan quotes, and demoted: the condition that actually
+        # decides whether the interior is the infinite-domain answer is
+        # ``basin_reaches_padded_border``.
         "basin_cells_frac": float(basin.mean()),
+        "basin_max_depth_m": max_basin_depth,
         "max_basin_run_m": float(run_px) * geom.fine_pixel_m,
         "basin_exceeds_apron": float(run_px * geom.fine_pixel_m > geom.apron_m),
+        "padded_border_basin_cells": float(border_basin),
+        "padded_border_basin_frac": float(border_basin) / float(border_cells),
+        "basin_reaches_padded_border": float(border_basin > 0),
         "peak_bytes_estimate": float(estimate_peak_bytes(geom)),
     }
     return BakeResult(
@@ -1467,4 +1984,7 @@ def bake_tile(
         cpu_seconds=out["cpu_seconds"],
         stats=stats,
         missing_coarse=tuple(missing),
+        superblock_fingerprint=(
+            "" if inflow_source is None else inflow_source.fingerprint_hex
+        ),
     )
