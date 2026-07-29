@@ -67,6 +67,9 @@ param(
     [string]$Date = '03-20',
     [double]$TimeScale = 0,
     [string]$Cvars = '',
+    # Keep the persisted edit log instead of clearing it. Only for deliberately
+    # photographing an EDITED world; see the note above the clear below.
+    [switch]$KeepEditLog,
     [string[]]$ExtraArgs = @(),
     [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe'
 )
@@ -76,6 +79,28 @@ $Root    = (Resolve-Path "$PSScriptRoot\..").Path
 $Project = (Resolve-Path "$Root\ue-project\VoxelEarth.uproject").Path
 $LogPath = Join-Path $Root "Saved\capture-$Name.log"
 $ShotDir = Join-Path $Root 'ue-project\Saved\Screenshots\WindowsEditor'
+
+# THE EDIT LOG PERSISTS ACROSS RUNS AND OVERRIDES -VoxelSpawnAt. This script did
+# not clear it, and voxel-run-flight-leg.ps1 always has (its ground rule 11: a leg
+# measured without clearing it is not cold). The consequence here is worse than a
+# stale measurement, because it moves the CAMERA:
+#
+#   2026-07-29: a capture launched with -VoxelSpawnAt=-837120,314880 (the plains
+#   exemplar) came up at the ALPINE exemplar instead -- the position left behind by
+#   the previous capture. It was caught only because the fine tier happened to be
+#   pinned to the plains tile, so the run tripped the residency gate and died
+#   loudly. With the coarse tier, or with both tiles resident, it would have
+#   written a screenshot named "plains" showing a mountain, and nothing in the log
+#   or the filename would have said so.
+#
+# So: clear it, and clear it BEFORE the one-editor check so a refused start does
+# not leave a half-prepared state.
+if (-not $KeepEditLog) {
+    $worldDir = Join-Path (Split-Path $Project) 'Saved\VoxelWorlds'
+    if (Test-Path $worldDir) {
+        Get-ChildItem $worldDir -Filter *.vxlog -ErrorAction SilentlyContinue | Remove-Item -Force
+    }
+}
 
 $running = @(Get-Process UnrealEditor-Cmd, UnrealEditor -ErrorAction SilentlyContinue)
 if ($running.Count -gt 0) {
