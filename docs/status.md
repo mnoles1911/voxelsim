@@ -2587,6 +2587,99 @@ really does detect a missed invalidation. Clang `-Wall -Wextra -Wconversion
 `waterca_bench.cpp` (also fixed a pre-existing sign-conversion in the bench's
 `samples.reserve`); float-ban clean.
 
+## Water track — W2 perf: the tick profile, kept; 161 -> 30 ms/tick on the large pour, BYTE-IDENTICAL (2026-07-29, worktree agent)
+
+A 1.7M-unit pour drove `WaterCA::step()` to ~161 ms/tick at ~2150 active
+bricks in the SHIPPING configuration (`voxel.Water.SolidCacheEnabled` defaults
+true), which is what made a large pour unplayable. Now **~30 ms/tick, 5.3x,
+with the tick output unchanged**: both pinned goldens
+(`0x3D2224BE4A253404`, `0x56BC18914355A205`) re-derive exactly,
+`kWaterCAVersion` stays 4, 249/249 `vxc_tests` green. Every change is an
+access-cost or memoization change; no rule, tie-break, cap or traversal
+DECISION was touched.
+
+**The profile is now IN THE REPO, not in a scratchpad.** `-DVXC_WATER_PROFILE=ON`
+(same opt-in pattern as `VXC_MEMO_STATS`) builds `WaterCAProfile` — per-phase
+nanosecond accumulators plus event counts — and `vxc_waterca_bench` prints the
+split over exactly the >=1800-active-brick band it reports ms/tick for. Default
+OFF, so every headline number above is taken on uninstrumented code. This
+exists because the previous four perf waves each cited a measured split that
+could not be reproduced from the repo.
+
+**What the profile actually said, and why it mattered.** Prior waves left a
+"the hydrostatic flood is the cost" model, and that model is only true with the
+memo OFF. With the memo ON — the shipping config — Phase C was 52 ms of a 224
+ms instrumented tick and **the 8 colored rounds were 159 ms**:
+
+| phase (memo ON, ~2150 active / 3114 touched bricks) | before | after |
+|---|---|---|
+| Phase READ (`computeDesiredForBrick`) | 58.9 ms | 6.5 ms |
+| GATHER | 56.1 | 5.3 |
+| FINALIZE | 28.1 | 5.3 |
+| per-round scratch reset | 12.4 | 0.24 |
+| per-tick scratch+inflow construction | 10.3 | 1.4 |
+| Phase C flood | 49.6 | 20.2 |
+| accounted total | 224 | 43 |
+
+**Four findings:**
+
+1. **The cross-tick solidity memo never covered Phase READ.** ADR-0003's memo
+   was wired into Phase C only; Phase READ used a per-TICK
+   `unordered_map<VoxelKey,MaterialId>` that was thrown away every tick, so
+   84,279 of its 134,500 solidity questions per tick reached the real ~1us
+   Amplifier callback AGAIN over terrain that had not changed. Routing Phase
+   READ through the same per-brick `SolidMaskBrick` masks (resolved once per
+   tick for each active brick's 6-brick neighbourhood) takes it to 9,314
+   misses. Memoizing a pure query cannot change its answer; the caller
+   contract is unchanged, and `waterca_solid_cache_golden_digests_unchanged`
+   now exercises the memo through Phase READ too.
+2. **`FlowScratch` was 16x larger than the round could use.** It was
+   `int16[512*5]` twice = 10,240 B per active brick, but Phase READ only ever
+   writes the round's own colour — 64 of 512 cells — and every flow value is
+   bounded by a `uint8` fill. Re-indexing by position-within-colour and
+   narrowing to `uint8` gives 640 B: the per-round working set went from
+   ~22 MB (a 176 MB/tick memset and nothing but LLC misses) to ~1.4 MB.
+   Per-brick inflow went from `int32[512]` to `uint8[3*64]` the same way.
+3. **GATHER was 7M `neighborOf()` calls per tick answering a question that
+   never depends on the data.** "Does this inbound step leave the brick, and
+   what is the source cell's index" is a fixed property of the 8^3 lattice per
+   (target colour, slot, cell) — now a 5 KB compile-time table. Plus two
+   emptiness flags (`FlowScratch::anyDesired`, `InflowBuf::any`) that let a
+   settled brick — all-255 sitting on all-255, offering and receiving nothing,
+   forever — skip its scans wholesale.
+4. **99% of the hydrostatic flood is thrown away.** Sharpening ADR-0003's
+   "traversed in full and then skipped": 862,320 of 868,662 cell pops per tick
+   are spent inside ~1 component that exceeds `kMaxHydrostaticComponentCells`
+   and is discarded whole. That cannot be short-circuited without changing
+   behaviour (the visited marks an over-cap component leaves are what stop
+   later seeds from re-flooding its leftovers as smaller, appliable
+   components — ADR-0003 option D), so the flood's CONSTANT was attacked
+   instead: lazily-cached per-brick neighbour pointers (killing ~650K BrickKey
+   hashes/tick on brick-crossing steps), cellIndex arithmetic instead of
+   `neighborOf`, and a brick-major frontier (a worklist of bricks plus a
+   512-bit pending mask each) so a brick's water, mask and cache node stay
+   resident while it drains. Traversal ORDER is free here — the cell set,
+   `totalVol` and the overflow decision are all order-invariant and `cells` is
+   sorted before use — so this is order-changing but not output-changing.
+
+**Proposed, NOT landed (needs a decision):** a bit-parallel flood. The
+component's reachable set is the least fixed point of a monotone operator over
+per-brick 512-bit masks, so it can be propagated with shifts (`+x` = `<<1`,
+`+y` = `<<8`, `+z` = next word) instead of cell-at-a-time, plausibly another
+5-10x on the remaining 20 ms. It is output-preserving in principle but it needs
+a brick's whole open-air mask, i.e. solidity for every air cell of every
+touched brick (~1.6M queries/tick) instead of only those the frontier reaches
+(~832K). With the memo ON that is one warm-up tick; with the memo OFF it is a
+~2x regression on the default voxel-core path. Not landed on that trade-off.
+
+**Verification.** 249/249 `vxc_tests` (MSVC 14.51 / VS 2026, Release, `/W4
+/WX` clean). Both goldens unmoved. Float-ban clean: no `float`/`double` in
+`waterca.h`/`waterca.cpp` (the one match is the word "float-ban" in a
+comment); the bench's `double`s are reporting only, as before. Measurement
+hygiene: every number above is a `voxel-measure-guard.ps1 -Check` QUIET run
+bracketed by a second check after the run, discarded if the box went
+contended mid-run.
+
 ## Backlog (parked / deferred, updated 2026-07-20)
 
 | Item | State | Unblock |
