@@ -18,7 +18,14 @@
 //      to lock onto.
 //
 // Usage: vxc_terrainprobe <tiledir> <seed> <xMetres> <yMetres> [lenMetres]
-//        vxc_terrainprobe --synthetic <seed> <xMetres> <yMetres> [lenMetres]
+//        vxc_terrainprobe --synthetic <seed> <xMetres> <yMetres> [lenMetres] [pixelMm]
+//
+// pixelMm is SYNTHETIC-ONLY and defaults to 30000. Real tiles carry their own
+// pixel size in the file, so overriding it there would be a lie about the data;
+// the tool rejects it rather than silently ignoring it. What it buys is the
+// bound sweep below: the corner-grid shape a footprint produces depends
+// entirely on the pixel size, so `--synthetic ... 1875` is the cheapest way to
+// exercise the .vxtl v2 fine tier (docs/vxtl-v2-format.md) without baking one.
 
 #include <algorithm>
 #include <cmath>
@@ -583,20 +590,28 @@ void terracePlateaus(Amplifier& amp, int64_t vx0, int64_t vy0, int64_t n, const 
 // or fully solid, so a bound that is too tight is not a lost optimisation, it
 // is terrain that never generates. A hole in the world.
 //
-// test_amplifier.cpp already sweeps them adversarially, but ONLY over
-// SyntheticTileSampler (four environments, pixel sizes 30000 and 11250 -- the
-// file's own FOLLOW-UP note asks for more). Real diffusion tiles are a
+// test_amplifier.cpp already sweeps them adversarially over
+// SyntheticTileSampler at four pixel sizes. Real diffusion tiles are a
 // different shape of input: kilometres of near-flat ocean, and cliffs where the
 // 30 m raster steps hard. v9's bound is a Lipschitz envelope around ONE centre
 // evaluation, and its tightness depends on the footprint-to-relief ratio, so
 // synthetic coverage does not transfer for free.
 //
+// It runs on whatever sampler main() built, which is the point of the
+// --synthetic pixelMm argument: the DECLINE column below is a pure function of
+// the pixel size and the footprint, so a synthetic run at 1875 answers "does
+// the cascade still get a computed bound on the fine tier?" without a baked
+// fine tile existing. The slack columns from a synthetic run are not
+// comparable with a real-tile run -- different terrain -- but the decline and
+// violation columns are exactly as meaningful.
+//
 // Sampling can only ever MISS a violation, never invent one: every reported
 // failure is a real counterexample.
-void boundSweep(Amplifier& amp, int64_t vx0, int64_t vy0, int64_t spanVox, int32_t levels) {
-    std::printf("\nADVERSARIAL BOUND SWEEP over real tiles\n");
-    std::printf("  %5s %9s %10s %12s %12s %12s\n", "level", "chunks", "declined",
-                "upper slack", "lower slack", "violations");
+void boundSweep(Amplifier& amp, int64_t vx0, int64_t vy0, int64_t spanVox, int32_t levels,
+                int64_t pxMm, const char* source) {
+    std::printf("\nADVERSARIAL BOUND SWEEP over %s (%lld mm/px)\n", source, (long long)pxMm);
+    std::printf("  %5s %9s %9s %9s %10s %12s %12s %12s\n", "level", "edge (m)", "points/ax",
+                "chunks", "declined", "upper slack", "lower slack", "violations");
     int64_t totalViol = 0;
     for (int32_t level = 0; level < levels; ++level) {
         const int64_t chunk = int64_t(32) << level;   // level-L chunk edge in level-0 voxels
@@ -667,8 +682,15 @@ void boundSweep(Amplifier& amp, int64_t vx0, int64_t vy0, int64_t spanVox, int32
             }
         }
         const int64_t used = n - declined;
-        std::printf("  %5d %9lld %10lld %10.2f m %10.2f m %12lld%s\n", level, (long long)n,
-                    (long long)declined,
+        // Control points the widest footprint at this level needs per axis:
+        // cells touched (phase-dependent, hence the +2) plus the cubic
+        // carrier's dilation of 3. This is the number
+        // kSurfaceBoundMaxCornersPerAxis has to cover, printed next to the
+        // decline count so the two can be read together.
+        const int64_t pointsPerAxis = (chunk - 1) * kVoxelSizeMm / pxMm + 2 + 3;
+        std::printf("  %5d %9.1f %9lld %9lld %10lld %10.2f m %10.2f m %12lld%s\n", level,
+                    static_cast<double>(chunk) * kVoxelSizeMm / 1000.0, (long long)pointsPerAxis,
+                    (long long)n, (long long)declined,
                     used ? static_cast<double>(slackHi / used) / 1000.0 : 0.0,
                     used ? static_cast<double>(slackLo / used) / 1000.0 : 0.0,
                     (long long)viol, viol ? "   <-- HOLE IN THE WORLD" : "");
@@ -682,8 +704,10 @@ void boundSweep(Amplifier& amp, int64_t vx0, int64_t vy0, int64_t spanVox, int32
 
 int main(int argc, char** argv) {
     if (argc < 5) {
-        std::fprintf(stderr,
-                     "usage: vxc_terrainprobe <tiledir|--synthetic> <seed> <xM> <yM> [lenM]\n");
+        std::fprintf(
+            stderr,
+            "usage: vxc_terrainprobe <tiledir|--synthetic> <seed> <xM> <yM> [lenM] [pixelMm]\n"
+            "       pixelMm is synthetic-only (default 30000; 3750 = scale 8, 1875 = scale 16)\n");
         return 2;
     }
     const std::string dir = argv[1];
@@ -691,10 +715,26 @@ int main(int argc, char** argv) {
     const int64_t x0M = std::strtoll(argv[3], nullptr, 10);
     const int64_t y0M = std::strtoll(argv[4], nullptr, 10);
     const int64_t lenM = argc > 5 ? std::strtoll(argv[5], nullptr, 10) : 200;
+    const int64_t pixelArgMm = argc > 6 ? std::strtoll(argv[6], nullptr, 10) : 0;
 
-    SyntheticTileSampler synth(seed);
+    if (pixelArgMm != 0 && dir == "--synthetic" && (pixelArgMm < 1 || pixelArgMm > 1000000)) {
+        std::fprintf(stderr, "pixelMm %lld is out of range (1..1000000)\n",
+                     (long long)pixelArgMm);
+        return 2;
+    }
+    if (pixelArgMm != 0 && dir != "--synthetic") {
+        // Refuse rather than ignore: a real tile's pixel size is a property of
+        // the file, and a run that silently probed at a size the data does not
+        // have would report a corner-grid shape nothing will ever see.
+        std::fprintf(stderr,
+                     "pixelMm is --synthetic-only; real tiles carry their own pixel size\n");
+        return 2;
+    }
+
+    SyntheticTileSampler synth(seed, pixelArgMm ? static_cast<int32_t>(pixelArgMm) : 30000);
     TileGridSampler grid(seed, 1);
     ITileSampler* tiles = &synth;
+    const char* sourceLabel = "synthetic tiles";
 
     if (dir != "--synthetic") {
         int loaded = 0, rejected = 0;
@@ -712,6 +752,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         tiles = &grid;
+        sourceLabel = "real tiles";
     } else {
         std::printf("using SyntheticTileSampler pixelSizeMm=%d\n", synth.pixelSizeMm());
     }
@@ -743,10 +784,14 @@ int main(int argc, char** argv) {
     const int64_t npx = std::max<int64_t>(64, lenM * 1000 / pxMm * 8);
     for (int64_t i = 0; i < npx; ++i) hTile.push_back(tiles->elevationMm(px0 + i, py0));
     std::vector<int64_t> plags = {1, 2, 4, 8, 16, 32, 64};
-    structureFunction(hTile, plags, "COARSE RASTER (30 m pixels)",
-                      static_cast<double>(pxMm) / 1000.0);
-    curvatureFunction(hTile, plags, "COARSE RASTER (30 m pixels)",
-                      static_cast<double>(pxMm) / 1000.0);
+    // Labelled from the sampler, not hardcoded: --synthetic can now run at any
+    // pixel size, and a header claiming 30 m over a 1.875 m raster is exactly
+    // the kind of mislabelled measurement this tool exists to avoid.
+    char rasterLabel[64];
+    std::snprintf(rasterLabel, sizeof(rasterLabel), "COARSE RASTER (%lld mm pixels)",
+                  (long long)pxMm);
+    structureFunction(hTile, plags, rasterLabel, static_cast<double>(pxMm) / 1000.0);
+    curvatureFunction(hTile, plags, rasterLabel, static_cast<double>(pxMm) / 1000.0);
 
     // --- Phase 0 seam instrumentation -------------------------------------
     //
@@ -773,7 +818,7 @@ int main(int argc, char** argv) {
     materialBoundaryAlignment(amp, vx0, vy0, n, pxMm, "AMPLIFIED SURFACE");
 
     // 6 levels covers the whole ring cascade the streamer uses.
-    boundSweep(amp, vx0, vy0, n, 6);
+    boundSweep(amp, vx0, vy0, n, 6, pxMm, sourceLabel);
 
     directionalRoughness(amp, vx0, vy0, n, {8, 16, 32, 64}, "AMPLIFIED SURFACE");
 

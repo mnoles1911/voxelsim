@@ -374,24 +374,37 @@ VXC_TEST(amplifier_surfaceMm_matches_column) {
 }
 
 VXC_TEST(amplifier_surface_bound_adversarial) {
-    // Four environments: two tile pixel sizes (30 m and 11.25 m, which give
-    // DIFFERENT corner-grid shapes for the same footprint) crossed with
-    // different world seeds.
+    // Six environments: four tile pixel sizes, which give DIFFERENT
+    // control-grid shapes for the same footprint, crossed with different world
+    // seeds.
     //
-    // 11250 is NOT the scale-8 pixel size -- that is 3750 (30 m / 8; see
-    // tilestore.h's tilePixelSizeMm). It is kept here purely as a second,
-    // arbitrary pixel size that exercises a different corner-grid shape,
-    // because GOLDEN(amplifier_surface_bound) is pinned against it and that
-    // digest is explicitly NOT worldgen output -- re-pinning it is a separate
-    // deliberate decision, not a free rider on a worldgen bump. FOLLOW-UP: add
-    // a 3750 environment so the real scale-8 shape is covered too; that is a
-    // new environment (and a re-pin), not an edit to this one.
+    //   30000 -- scale 1, the only size any tile has ever been generated at.
+    //   11250 -- not a shipping size at all. It is 90 m / 8, left over from the
+    //            superseded 90 m model, and is kept purely as an arbitrary
+    //            fourth grid shape rather than deleted.
+    //    3750 -- scale 8 (30 m / 8), the size v9 sized the corner cap for.
+    //    1875 -- scale 16, the .vxtl v2 FINE TIER (docs/vxtl-v2-format.md 1).
+    //            This is the shape that made kSurfaceBoundMaxCornersPerAxis
+    //            rise 34 -> 64, and the one production is about to run on.
+    //
+    // 3750 and 1875 were the FOLLOW-UP this test's own comment asked for. They
+    // are NEW environments, not edits to the existing ones, so the four already
+    // here still probe exactly the footprints they always did.
+    //
+    // Adding an environment does NOT move GOLDEN(amplifier_surface_bound):
+    // that digest is built by amplifier_surface_bound_golden_digest from its
+    // OWN sampler at the default 30 m pixel, so it is independent of this
+    // list. The comment that used to sit here claimed the digest was pinned
+    // against the 11250 environment; it never was. What is true, and is the
+    // part worth keeping, is that the digest is explicitly NOT worldgen output,
+    // so re-pinning it is a separate deliberate decision rather than a free
+    // rider on a worldgen bump.
     struct Env {
         uint64_t seed;
         int32_t pixelMm;
     };
-    const Env envs[] = {
-        {kSeed, 30000}, {kSeed, 11250}, {0x5DEECE66Dull, 30000}, {1, 11250}};
+    const Env envs[] = {{kSeed, 30000}, {kSeed, 11250}, {0x5DEECE66Dull, 30000},
+                        {1, 11250},     {kSeed, 3750},  {0x5DEECE66Dull, 1875}};
 
     BoundStats st;
     int64_t hotspotFootprints = 0;
@@ -538,15 +551,88 @@ VXC_TEST(amplifier_surface_bound_declines_rather_than_guesses) {
     // Empty footprints.
     CHECK_EQ(amp.surfaceUpperBoundMm(10, 0, 9, 0), kSurfaceBoundDeclined);
     CHECK_EQ(amp.surfaceUpperBoundMm(0, 10, 0, 9), kSurfaceBoundDeclined);
-    // A footprint far too large for the corner budget must DECLINE (the safe
-    // answer), never return a number it cannot justify. 16 corners per axis
-    // against a 30 m pixel is 450 m; ask for 100 km.
+    // A footprint far too large for the control-point budget must DECLINE (the
+    // safe answer), never return a number it cannot justify. Ask for 100 km.
     CHECK_EQ(amp.surfaceUpperBoundMm(0, 0, 1000000, 1000000), kSurfaceBoundDeclined);
-    // ...and the largest footprint it does accept is still bounded correctly.
+    // ...and a large accepted footprint is still bounded correctly.
     const int64_t big = amp.surfaceUpperBoundMm(0, 0, 4400, 4400);
     CHECK(big != kSurfaceBoundDeclined);
     for (int64_t x = 0; x <= 4400; x += 97)
         for (int64_t y = 0; y <= 4400; y += 89) CHECK(int64_t(amp.surfaceMm(x, y)) <= big);
+
+    // WHERE THE CAP ACTUALLY BITES, pinned as a test rather than left to the
+    // comment on kSurfaceBoundMaxCornersPerAxis. With the grid anchored at 0,
+    // a span of W mm needs floor(W / pxMm) + 1 cells and 3 more control points:
+    //   17000 voxels = 1.7 km  -> 57 cells -> nx = 60 <= 64, accepted
+    //   20000 voxels = 2.0 km  -> 67 cells -> nx = 70 >  64, declined
+    // At the previous cap of 34 the first of these declined, so this pair is
+    // what fails if the cap is ever quietly reverted.
+    const int64_t nearCap = amp.surfaceUpperBoundMm(0, 0, 17000, 17000);
+    CHECK(nearCap != kSurfaceBoundDeclined);
+    for (int64_t x = 0; x <= 17000; x += 397)
+        for (int64_t y = 0; y <= 17000; y += 389) CHECK(int64_t(amp.surfaceMm(x, y)) <= nearCap);
+    CHECK_EQ(amp.surfaceUpperBoundMm(0, 0, 20000, 20000), kSurfaceBoundDeclined);
+}
+
+VXC_TEST(amplifier_surface_bound_covers_fine_tier_cascade) {
+    // THE REGRESSION TEST FOR kSurfaceBoundMaxCornersPerAxis = 64.
+    //
+    // A decline is safe but silent: it skips no chunk, so nothing fails, the
+    // sky-band and all-solid trims simply stop paying off above whatever level
+    // the cap first bites at. That is a performance cliff you only find by
+    // asking. This test asks, at the exact footprints the streaming layer
+    // uses.
+    //
+    // The shape is production's, not this file's usual 16 << level: a level-L
+    // chunk is 32 << L level-0 voxels, and the ALL-SOLID trim dilates it by one
+    // level-scale run on each side for the mesher apron (VoxelWorldSubsystem's
+    // FootprintSolidFloorMmCached). Level 5 is therefore 1024 + 2*32 = 1088
+    // voxels = 108.8 m, which at 1.875 m/px needs 62 control points per axis --
+    // the number that forced the cap up from 34.
+    //
+    // Run at all three pixel sizes the format can present, so a future pixel
+    // change fails here rather than in a frame-time graph.
+    const int32_t pixelMm[] = {30000, 3750, 1875};
+    for (int32_t px : pixelMm) {
+        SyntheticTileSampler tiles(kSeed, px);
+        Amplifier amp(kSeed, tiles);
+        for (int32_t level = 0; level <= 5; ++level) {
+            const int64_t scale = int64_t(1) << level;
+            const int64_t span = 32 * scale;
+            // Several chunk indices, including negative ones: the footprint's
+            // PHASE against the pixel grid changes with the origin (chunk
+            // origins step by 3200 << level mm, the pixel grid by pxMm), and
+            // the worst-case cell count is a phase-dependent +1.
+            const int64_t chunks[] = {0, 1, 7, -1, -13, 1009};
+            for (int64_t c : chunks) {
+                const int64_t vx0 = c * span - scale, vy0 = (c + 3) * span - scale;
+                const int64_t vx1 = vx0 + span + 2 * scale - 1;
+                const int64_t vy1 = vy0 + span + 2 * scale - 1;
+                const int64_t hi = amp.surfaceUpperBoundMm(vx0, vy0, vx1, vy1);
+                const int64_t lo = amp.surfaceLowerBoundMm(vx0, vy0, vx1, vy1);
+                // THE claim: the cascade never declines at any level it uses.
+                CHECK(hi != kSurfaceBoundDeclined);
+                CHECK(lo != kSurfaceLowerBoundDeclined);
+                CHECK(lo <= hi);
+                // And a bound that does not decline still has to be SOUND --
+                // a wider cap must not be buying its coverage with a hole.
+                const int64_t step = (vx1 - vx0) / 24 + 1;
+                for (int64_t x = vx0; x <= vx1; x += step)
+                    for (int64_t y = vy0; y <= vy1; y += step) {
+                        const int64_t s = amp.surfaceMm(x, y);
+                        CHECK(s <= hi);
+                        CHECK(s >= lo);
+                    }
+            }
+        }
+        // One level PAST the cascade must still decline at the fine pixel:
+        // the cap is sized to the cascade, not removed. Level 6 with apron is
+        // 2048 + 128 = 2176 voxels = 217.6 m, which needs ~121 points at
+        // 1.875 m/px.
+        if (px == 1875) {
+            CHECK_EQ(amp.surfaceUpperBoundMm(-64, -64, 2111, 2111), kSurfaceBoundDeclined);
+        }
+    }
 }
 
 VXC_TEST(amplifier_surface_bound_golden_digest) {
@@ -556,6 +642,17 @@ VXC_TEST(amplifier_surface_bound_golden_digest) {
     // that only makes it LOOSER, which the adversarial test above would happily
     // accept — shows up as a deliberate decision rather than a silent drift in
     // how many chunks the sky-band trim skips.
+    //
+    // WHAT THIS DIGEST IS NOT SENSITIVE TO, since the point of pinning it is
+    // knowing which changes it can catch. It samples level 0..4 footprints
+    // (16..256 voxels, at most 25.6 m) at the DEFAULT 30 m pixel, so the widest
+    // grid it ever builds is 5 control points per axis. Raising
+    // kSurfaceBoundMaxCornersPerAxis therefore cannot move it -- and did not,
+    // when the cap went 34 -> 64 for the 1.875 m fine tier. A cap change is
+    // visible only in amplifier_surface_bound_declines_rather_than_guesses and
+    // amplifier_surface_bound_covers_fine_tier_cascade, which is where it is
+    // tested. Neither is adding an environment to the adversarial sweep above
+    // able to move this digest: that test builds its own samplers.
     SyntheticTileSampler tiles(kSeed);
     Amplifier amp(kSeed, tiles);
     Digest d;
@@ -571,7 +668,9 @@ VXC_TEST(amplifier_surface_bound_golden_digest) {
     // (kLandformMaxMm * slopeScale + kMicroMaxMm * microScale). At full slope
     // that is 11424 mm -> 15725 mm. The base term is untouched. Soundness is
     // re-established by amplifier_surface_bound_adversarial, which passes with
-    // VIOLATIONS=0 over 1189980 dense samples across 880 footprints.
+    // VIOLATIONS=0 over 1775101 dense samples across 1320 footprints (1189980
+    // over 880 before the 3750 and 1875 environments were added; the digest
+    // itself is unchanged by that, see above).
     // (was 0x5588EBCD842ECE3D at v5)
     CHECK_EQ(d.h, 0x9A8AAF0C3EB9BB06ull);
 }

@@ -437,9 +437,9 @@ DEFAULT_CONDITIONING_FILES: tuple[str, ...] = (
 #:     mapping (``i1 = y*TILE_SIZE, j1 = x*TILE_SIZE`` — still marked
 #:     ``# ASSUMPTION:`` and the single most likely edit in this file: if
 #:     bring-up finds it transposed, the whole world transposes);
-#:   * ``_get_terrain_at_scale``'s upsampling math (``mode="bilinear"``,
-#:     ``align_corners=False``, the 1-native-pixel pad, the ceil-div, the
-#:     crop offsets) — ``scale`` is in the id but the INTERPOLATOR is not;
+#:   * ``_get_native``'s fetch (it used to be ``_get_terrain_at_scale``, whose
+#:     bilinear upsampling math was in scope here for the same reason — see
+#:     v2 below);
 #:   * ``adapt_raster_to_tile``'s conversion beyond the ranges already
 #:     covered below, or ``_synthetic_stand_in``'s stand-in arithmetic.
 #:
@@ -447,7 +447,15 @@ DEFAULT_CONDITIONING_FILES: tuple[str, ...] = (
 #: would roll the id on comment edits and reformattings — a false kMismatch,
 #: the same failure mode as bug #1. An explicit, documented counter puts the
 #: decision where the judgement is.
-GENERATION_ALGORITHM_VERSION = 1
+#:
+#: History:
+#:   1 — bring-up.
+#:   2 — deleted ``_get_terrain_at_scale``'s bilinear scale>1 branch. Nothing
+#:       was ever generated at scale 8 so no cached tile changes meaning, but
+#:       the sub-30 m slot now means "baked fine tier" instead of "upsampled
+#:       coarse tile", and that is exactly the kind of reinterpretation this
+#:       counter exists to make visible.
+GENERATION_ALGORITHM_VERSION = 2
 
 
 def _tile_format_fingerprint() -> str:
@@ -467,11 +475,29 @@ def _tile_format_fingerprint() -> str:
       * the adapter's quantization contract: ``EXPECTED_CHANNELS`` min/max
         (which ``adapt_raster_to_tile`` uses as the uint8 mapping range) and
         ``_CLIMATE_ORDER`` (the plane packing order);
+      * **the geomorphic bake** — its version, stage order, geometry (tile
+        size, scale, apron) and every physical constant, via
+        ``bake.pipeline.bake_identity_payload()``. The fine tier is not a
+        derived view of the coarse tile, it is new canonical world data that
+        the client's collision reads, so a K change or an apron change is a
+        different world in exactly the sense ``provider_id`` exists to
+        express. Covering it here is what makes "a bake change yields a new
+        world rather than a mixed one" true rather than a convention: the
+        cache is keyed on ``provider_id`` alone, so without this a retuned
+        bake would drop tiles into a namespace already holding tiles from the
+        old one, and no consumer could tell them apart.
 
     plus ``GENERATION_ALGORITHM_VERSION`` for the logic that can only be
     tracked by hand (see that constant).
+
+    The bake import is deliberately NOT wrapped in try/except. ``pipeline.py``
+    imports nothing beyond stdlib+numpy at module scope precisely so this call
+    works on a box with no numba/scipy; if it ever fails, the honest outcome
+    is a loud error, because the alternative is a ``provider_id`` that
+    silently stops covering the bake.
     """
     from .. import tile_codec
+    from ..bake.pipeline import bake_identity_payload
 
     payload = {
         "algorithm_version": GENERATION_ALGORITHM_VERSION,
@@ -485,6 +511,7 @@ def _tile_format_fingerprint() -> str:
         "expected_channels": [
             [c.name, c.dtype, c.min, c.max] for c in EXPECTED_CHANNELS
         ],
+        "bake": bake_identity_payload(),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -1025,52 +1052,40 @@ class TerrainDiffusionBackend:
             self._bound_seed = seed
         return pipeline
 
-    def _get_terrain_at_scale(self, pipeline, i1: int, j1: int, i2: int, j2: int, scale: int):
-        """Transcribed from ``terrain_diffusion.inference.api._get_terrain``
-        (fetched verbatim during bring-up research): scale=1 is a direct
-        native-resolution fetch; scale>1 upsamples via bilinear
-        interpolation with 1-native-pixel padding for edge handling.
+    def _get_native(self, pipeline, i1: int, j1: int, i2: int, j2: int, scale: int):
+        """Fetch one tile's rasters at the model's NATIVE 30 m resolution.
 
-        ASSUMPTION: ``DiffusionConfig.scale`` (our tile_codec.py pixel-size
-        key -- 1 => 30m/px, 8 => 3.75m/px) is passed straight through as
-        terrain-diffusion's own ``scale`` upsample factor, which is relative
-        to the PINNED CHECKPOINT's ``native_resolution`` config field (a
-        ``WorldPipeline.__init__`` parameter, default 90.0 in the base
-        class -- the 30m/90m checkpoints presumably override it). Whether
-        our scale=1 truly means "no upsampling needed" for the checkpoint
-        actually pinned in bring-up (i.e. native_resolution == 30.0) must be
-        confirmed at that point -- see docs/diffusion-bringup.md steps 3/5.
+        **The scale>1 branch that used to live here is deleted, deliberately.**
+        It transcribed ``terrain_diffusion.inference.api._get_terrain``'s
+        bilinear upsample (``mode="bilinear"``, ``align_corners=False``, a
+        1-native-pixel pad, a ceil-div and matching crop offsets) and produced
+        a scale-8 tile carrying **exactly zero information the scale-1 tile did
+        not already have** -- the learned cascade ends at 30 m
+        (``amplifier.cpp:262-266``), so upsampling 8x is an interpolator, not a
+        model. docs/terrain-amplification-plan.md: "The 3.75 m/px tier already
+        exists in the format and carries zero information today. That is the
+        slot this fills."
+
+        The slot is now filled by the geomorphic bake
+        (``terrain_service.bake.pipeline``), which writes a real scale-16 fine
+        tier at 1.875 m/px. Removing the fake path is what makes the fine tier
+        unambiguous: a cached sub-30 m tile is now either baked or absent, and
+        can never be a bilinear stand-in that looks like data.
+
+        Anything above scale 1 is therefore refused here rather than
+        interpolated. See ``pregen.py --mode bake``.
         """
-        import torch
-
-        if scale == 1:
-            out = pipeline.get(i1, j1, i2, j2, with_climate=True)
-            return out["elev"], out["climate"]
-
-        i1n, j1n = i1 // scale, j1 // scale
-        i2n, j2n = -(-i2 // scale), -(-j2 // scale)  # ceil div
-        i1p, j1p, i2p, j2p = i1n - 1, j1n - 1, i2n + 1, j2n + 1  # 1px native pad
-
-        out_native = pipeline.get(i1p, j1p, i2p, j2p, with_climate=True)
-        elev_native, climate_native = out_native["elev"], out_native["climate"]
-
-        out_h, out_w = i2 - i1, j2 - j1
-        elev_up = torch.nn.functional.interpolate(
-            elev_native.unsqueeze(0).unsqueeze(0),
-            scale_factor=scale, mode="bilinear", align_corners=False,
-        ).squeeze()
-        climate_up = torch.nn.functional.interpolate(
-            climate_native.unsqueeze(0),
-            scale_factor=scale, mode="bilinear", align_corners=False,
-        ).squeeze(0)
-
-        pad_up = scale  # 1 native pixel of padding == `scale` upsampled pixels
-        offset_i = i1 - i1n * scale
-        offset_j = j1 - j1n * scale
-        ci1, cj1 = pad_up + offset_i, pad_up + offset_j
-        elev = elev_up[ci1:ci1 + out_h, cj1:cj1 + out_w]
-        climate = climate_up[:, ci1:ci1 + out_h, cj1:cj1 + out_w]
-        return elev, climate
+        if scale != 1:
+            raise ValueError(
+                f"terrain-diffusion generates at 30 m/px only (scale=1), got "
+                f"scale={scale}. The sub-30 m tier is BAKED, not upsampled: run "
+                "`python -m terrain_service.pregen --mode bake` "
+                "(terrain_service.bake.pipeline). The old bilinear scale-8 path "
+                "was deleted because it carried no information the scale-1 tile "
+                "did not already have."
+            )
+        out = pipeline.get(i1, j1, i2, j2, with_climate=True)
+        return out["elev"], out["climate"]
 
     def generate_rasters(self, seed: int, x: int, y: int, scale: int) -> dict[str, np.ndarray]:
         # _pipeline_for_seed -> _load_pipeline does the guarded `import
@@ -1111,7 +1126,7 @@ class TerrainDiffusionBackend:
         i1, j1 = y * TILE_SIZE, x * TILE_SIZE
         i2, j2 = i1 + TILE_SIZE, j1 + TILE_SIZE
 
-        elev, climate = self._get_terrain_at_scale(pipeline, i1, j1, i2, j2, scale)
+        elev, climate = self._get_native(pipeline, i1, j1, i2, j2, scale)
 
         elev_np = elev.detach().to("cpu").to(torch.float32).numpy()
         climate_np = climate.detach().to("cpu").to(torch.float32).numpy()
