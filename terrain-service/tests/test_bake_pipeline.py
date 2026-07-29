@@ -42,7 +42,15 @@ BakeKernels = pipeline.BakeKernels
 #: apron/tile ratio 0.5 here vs 0.0625 in production, so the apron is if
 #: anything over-generous relative to the reference kernels' reach.
 TEST_GEOM = BakeGeometry(coarse_tile_px=8, coarse_pixel_m=30.0, scale=4, apron_coarse_px=4)
-TEST_CONSTS = BakeConstants(thermal_iters=3, superblock_tiles=2, superblock_max_level=0)
+#: Pinned to the bake_ver-3 OFF-path (depth incision, no constructional term)
+#: on purpose: these tests exercise ORCHESTRATION -- aprons, cropping, seeds,
+#: inflow -- against locality-reference kernels that deliberately implement
+#: only the five-argument roughness form and no profile solve. The profile
+#: path and the constructional term have their own dedicated tests that
+#: replace these fields explicitly.
+TEST_CONSTS = BakeConstants(thermal_iters=3, superblock_tiles=2, superblock_max_level=0,
+                            incision_mode="depth", b1_constructional_amp=0.0,
+                            profile_regional_p=0.0)
 
 
 def ref_carrier(coarse, scale):
@@ -723,7 +731,9 @@ def test_profile_mode_wires_the_profile_kernel_and_depth_is_the_default():
             geom=TEST_GEOM, consts=consts,
         )
 
-    assert TEST_CONSTS.incision_mode == "depth"  # the default, deliberately
+    # TEST_CONSTS pins depth mode (bake_ver-4 defaults to "profile"; the
+    # reference kernel set has no profile solve, see the TEST_CONSTS note).
+    assert TEST_CONSTS.incision_mode == "depth"
     base = bake(TEST_CONSTS, spy_profile)
     assert calls == [], "depth mode must not call the profile kernel"
 
@@ -1205,7 +1215,7 @@ def test_every_bake_constant_rolls_the_fingerprint():
     base = pipeline.bake_fingerprint()
     seen = {base}
     # Alternatives that still satisfy BakeConstants' own validation.
-    valid_alt = {"thermal_rate": 0.25, "flat_eps": 1e-6, "incision_mode": "profile",
+    valid_alt = {"thermal_rate": 0.25, "flat_eps": 1e-6, "incision_mode": "depth",
                  # +0.5 would put slope_lo above slope_hi, which validation
                  # (correctly) refuses; use in-range alternatives instead.
                  "b1_constructional_slope_lo": 0.05,

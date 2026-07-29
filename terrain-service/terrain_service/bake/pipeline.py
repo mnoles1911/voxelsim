@@ -168,7 +168,22 @@ __all__ = [
 #: the 2026-07-29 stage dumps). ``incision_mode = "depth"`` reproduces the
 #: bake_ver-2 surface exactly. The constants roll the id on their own; the
 #: counter moves because the B2d code path changed with them.
-BAKE_VERSION = 3
+#:
+#: 3 -> 4 (2026-07-29, ridge deficit): the shipped defaults change to the
+#: measured composite that closes the 6-10x ridge+peak deficit on gentle
+#: ground -- ``incision_mode = "profile"``, ``channel_init_area_m2 = 156``,
+#: ``profile_regional_p = 2.0``, ``b1_constructional_amp = 0.40`` -- and the
+#: B1/B2d code grew the two default-off mechanisms those constants switch on
+#: (crest-up constructional octaves gated to gentle ground; a separately
+#: settable exponent on the regional-energy factor). Measured on the pinned
+#: 060b0c927ccc807e/000000000135276f exemplars at the matched 10-cell lookout:
+#: plains ridge+peak 0.0158 -> 0.0443 (real Illinois 0.0434), valley+pit
+#: 0.0118 -> 0.0336 (real 0.034-0.038), mean slope 2.13 deg (real 2.134), with
+#: the slope-by-scale ladder within 11.7% of Illinois at every rung (base:
+#: 11.8%); alpine 0.0030 -> 0.0213 and rolling 0.0034 -> ~0.05 (real alpine
+#: 0.0332 -- improved 6-7x, still short; see the B2d comment). The old
+#: surfaces are reproducible exactly with the bake_ver-3 constants.
+BAKE_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -304,7 +319,18 @@ class BakeConstants:
     #: (till knolls, hummocky moraine), which fBm cannot supply (symmetric, no
     #: crests) and which incision must not supply either (a plain's erosion is
     #: sub-metre by construction).
-    b1_constructional_amp: float = 0.0
+    #:
+    #: 0.40 measured 2026-07-29 on the plains exemplar (-55,20): ridge+peak at
+    #: the matched 10-cell lookout 0.0158 -> 0.0443 (real Illinois 0.0434,
+    #: Llano 0.0484), valley+pit 0.0118 -> 0.0336 (real 0.034-0.038), mean
+    #: slope 2.13 deg against Illinois' 2.134, slope-by-scale within 11.7% at
+    #: every rung. Its ridge cells sit at 1.70x the median distance-to-channel
+    #: (interfluve/knoll-positioned, not painted: routing runs AFTER B1 and
+    #: organises around the knolls). 0.30 measured 0.0319 (under the real
+    #: band); 0.55+ overshoots the ladder. NOT swept above 0.55 at production:
+    #: the S1a-level slope overshoot is absorbed by fill+incision+thermal, so
+    #: calibrate against the BAKED surface, not B0+B1.
+    b1_constructional_amp: float = 0.40
     #: Regional (carrier) slope below which the constructional term is at full
     #: strength, and at/above which it is zero, with a linear fade between.
     #: Steep ground is erosional: its ridges must be interfluves left by the
@@ -378,12 +404,18 @@ class BakeConstants:
     #:     0.0103 -> 0.0338 (real 0.034-0.038, IN range), rolling theta
     #:     0.048 -> 0.070 with valley+pit doubled -- at plains mean slope
     #:     1.82 -> 2.78 deg at 1.875 m (Illinois reads 2.13: a 16% deficit
-    #:     became a 30% excess) -- but NO measured configuration meets the
-    #:     acceptance bars on every class at once.
+    #:     became a 30% excess) -- at ``profile_regional_p`` = stream_n, NO
+    #:     measured configuration met the acceptance bars on every class at
+    #:     once, which is why bake_ver 3 shipped with "depth";
+    #:   * ``profile_regional_p = 2.0`` (2026-07-29, ridge deficit) resolves
+    #:     that blocker: the sharper exponent leaves a till plain 2.3% of the
+    #:     erosion energy instead of 22%, so the dense network carves
+    #:     sub-metre swales (plains carved-past-0.1m fraction 6.5%, mean
+    #:     slope 2.13 deg = Illinois' 2.134) while steep ground, at or above
+    #:     ``profile_regional_s_ref``, erodes exactly as before.
     #:
-    #: Flipping this to "profile" is one constant and rolls the world; do it
-    #: with the scorecard above in hand, not because the knob exists.
-    incision_mode: str = "depth"
+    #: "profile" became the default at bake_ver 4 with that scorecard in hand.
+    incision_mode: str = "profile"
     #: Erosion number for the profile solve: K times the pass's pseudo-time.
     #: Small values reproduce the explicit law to first order (0.15 measured
     #: theta 0.084 on the alpine exemplar window -- barely moved); large
@@ -409,7 +441,9 @@ class BakeConstants:
     #: (measured 2.03 -> 3.59 deg mean slope at 1.875 m against a real 2.13);
     #: at 2.0 it keeps 2.3% and the same network carves sub-metre swales.
     #: Ground at or above ``profile_regional_s_ref`` is unaffected.
-    profile_regional_p: float = 0.0
+    #: 2.0 is the bake_ver-4 production value; it is what lets
+    #: ``channel_init_area_m2`` sit at 156 without trenching a plain.
+    profile_regional_p: float = 2.0
     #: Channel-initiation area, m^2. Without it ``K*A^m*S^n`` incises every cell
     #: that has any upslope area, which at 1.875 m/px is every cell in the tile:
     #: measured 77.6% of the domain incised past one voxel at K=0.03 and 98.6%
@@ -420,7 +454,23 @@ class BakeConstants:
     #: At 1e4 the same tile drops to 25.4% incised while p99 depth is unchanged
     #: (8.66 -> 8.34 m), i.e. hillslopes are released and channels are not.
     #: 0 disables the gate and reproduces the pre-2026-07-29 bake exactly.
-    channel_init_area_m2: float = 1.0e4
+    #:
+    #: 1e4 -> 156 (2026-07-29, ridge deficit; bake_ver 4). Drainage density is
+    #: also INTERFLUVE density: at the matched 10-cell (18.75 m) lookout a rib
+    #: crest only classifies as ridge when the gullies either side are within
+    #: a lookout of it, so ridge+peak tracks a_crit directly (alpine exemplar:
+    #: 0.0042 at 1e4, 0.0155 at 625, 0.0213 at 156; real Teton DTM 0.0332 --
+    #: the largest lever found, and it saturates below the real value, see
+    #: the module-level RIDGE_DEFICIT note). 156 m^2 is 44 fine cells -- still
+    #: resolved, and at the low end of the 10^2-10^3 m^2 channel-initiation
+    #: areas reported for steep badland/alpine terrain. THE COST, stated
+    #: plainly: on steep tiles most of the surface drains more than 156 m^2
+    #: (68% of the alpine window; carved past 0.1 m: 98% against 93% at 625),
+    #: so the bake is dissection-dominated there. On gentle ground
+    #: ``profile_regional_p`` keeps the same network sub-metre (plains carved
+    #: fraction 6.5%). The flow-plane magnitude gate deliberately does NOT
+    #: follow this constant down -- see ``flow_mag_min_area_m2``.
+    channel_init_area_m2: float = 156.0
     #: Gate sharpness. The gate is SOFT deliberately: a hard cutoff puts a step
     #: in incision depth along the contour where area crosses the threshold,
     #: which is a visible seam along a curve -- the same failure class as the
@@ -477,12 +527,20 @@ class BakeConstants:
     #: (docs/vxtl-v2-format.md section 6); measured on the first real bakes it
     #: was 5.75 MB on an alpine tile and 8.88 MB on an ocean one, of which 87%
     #: is this magnitude field -- because at 1.875 m/px every land cell has
-    #: upslope area, so bits 0-4 were dense. Set to the same value as
-    #: ``channel_init_area_m2`` on purpose rather than tuned: below it
-    #: ``stream_power``'s gate has already decided there is no channel, so the
-    #: magnitude there describes a river the bake declined to cut. 5.745 ->
-    #: 1.518 MB alpine, 7.677 -> 0.000 MB ocean. 0 disables the gate and
-    #: reproduces the pre-2026-07-29 plane exactly. See FLOW_PLANE_SIZE.
+    #: upslope area, so bits 0-4 were dense. Originally set to the same value
+    #: as ``channel_init_area_m2`` (both 1e4): below the initiation gate the
+    #: bake had declined to cut a channel, so the magnitude there described a
+    #: river that does not exist. 5.745 -> 1.518 MB alpine, 7.677 -> 0.000 MB
+    #: ocean. 0 disables the gate and reproduces the pre-2026-07-29 plane.
+    #:
+    #: DELIBERATELY NOT lowered with ``channel_init_area_m2`` at bake_ver 4:
+    #: at 156 m^2 the majority of a steep tile is above the initiation area
+    #: (68% of the alpine exemplar), so following it down would make bits 0-4
+    #: dense again and reintroduce the multi-MB plane this gate exists to
+    #: prevent. The sub-1e4 network the bake now carves is hillslope-scale
+    #: swale/gully texture -- landform, not hydrology a client needs to query.
+    #: The plane keeps describing rivers from 1e4 m^2 up, exactly as at
+    #: bake_ver 2-3. See FLOW_PLANE_SIZE.
     flow_mag_min_area_m2: float = 1.0e4
     #: Apply the sea-level taper (``sea_taper_top_m``/``sea_taper_bottom_m``)
     #: to the flow plane's CHANNEL flag and magnitude gate, not only to
@@ -1803,6 +1861,45 @@ apron-sensitivity table above is what says they are not fine in general.
 """
 
 
+RIDGE_DEFICIT = """\
+The 6-10x ridge+peak deficit, what closed it, and what remains (2026-07-29).
+
+Measured at a matched 10-cell (18.75 m) lookout on the pinned
+060b0c927ccc807e/000000000135276f exemplars, ridge+peak was plains 0.0142-0.0158
+against a real 0.0434-0.0484 and alpine 0.0023-0.0030 against 0.0332, and the
+deficit is fully present after B0+B1 -- the un-eroded surface is a smooth
+spline that has no crests for ANY later pass to expose. Two mechanisms were
+raced head to head, and each won on the ground the other lost:
+
+* GENTLE ground: dissection cannot do it. A till plain's real erosion is
+  sub-metre; every energetic-enough carve either trenched the plain (mean
+  slope 2.03 -> 3.59 deg; ridge cells were trench LIPS, at 0.56x the median
+  distance-to-channel) or, made shallow via ``profile_regional_p``, produced
+  no ridges at all (0.0168). What works is the CONSTRUCTIONAL term
+  (``b1_constructional_amp``): real till knolls are built by ice, not carved
+  by water. Baked: plains 0.0443 / valley+pit 0.0336 / mean 2.13 deg -- all
+  three inside or at the real Illinois values -- with ridge cells at 1.70x
+  the median distance-to-channel because the routing organises around them.
+* STEEP ground: noise cannot do it. Folded noise strong enough to register at
+  the lookout (4x amplitude) reads as uniform crumpled paper and its ridges
+  are uncorrelated with drainage (placement 1.01-1.07); it is gated off by
+  slope. What works is DISSECTION DENSITY (``channel_init_area_m2`` down to
+  156): alpine 0.0030 -> 0.0213, rolling 0.0034 -> ~0.05, with an organised
+  gully-and-rib hillshade and theta 0.089-0.147 (r^2 0.84-0.93).
+
+STILL OPEN: alpine saturates at ~0.021-0.025 against the real 0.0332 --
+raising the cap to 40 m buys 0.003-0.004 for +3 deg of 30 m-band drift, and
+denser initiation than 156 m^2 is sub-Nyquist. The remaining gap is glacial
+rock morphology (aretes, gendarmes, benches) that a stream-power + repose bake
+does not model; closing it honestly needs a steep-ground process term
+(threshold-slope regrade or rock-structure anisotropy tied to the carrier's
+ridgelines), not more of either mechanism above. The 30 m band also drifts
+under dense dissection (alpine mean 21.1 -> 23.2 deg, ridge+peak 0.057 ->
+0.124 at 30 m; the direction is Copernicus-DSM-like -> 3DEP-DTM-like, within
+the real span but away from the S0 input) -- read the per-class scorecard in
+the 2026-07-29 ridge investigation before re-tuning any of it.
+"""
+
 PROFILE_SEAM = """\
 What the profile solve does to the tile-to-tile seam -- measured, not assumed.
 
@@ -1922,9 +2019,28 @@ def bake_padded_domain(
         raise RuntimeError(_ROUGHNESS_NO_ORIGIN)
     # The constructional kwargs are forwarded only when the term is ON, so a
     # test double written against the plain five-argument form keeps working
-    # and an amp of 0 exercises the identical call the prior bake made.
+    # and an amp of 0 exercises the identical call the prior bake made. A
+    # kernel that CANNOT take them while the constants demand the term is a
+    # hard error: silently skipping would bake a surface the identity hash
+    # says has knolls and does not.
     constructional_kwargs = {}
     if consts.b1_constructional_amp > 0.0:
+        import inspect
+
+        try:
+            params = inspect.signature(kernels.roughness).parameters
+        except (TypeError, ValueError):  # pragma: no cover - numba dispatchers
+            params = {}
+        has_kw = "constructional_amp" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        if not has_kw:
+            raise RuntimeError(
+                "b1_constructional_amp="
+                f"{consts.b1_constructional_amp} but this roughness kernel has "
+                "no 'constructional_amp' parameter; inject noise.roughness or "
+                "bake with b1_constructional_amp=0"
+            )
         constructional_kwargs = {
             "constructional_amp": consts.b1_constructional_amp,
             "constructional_slope_lo": consts.b1_constructional_slope_lo,
