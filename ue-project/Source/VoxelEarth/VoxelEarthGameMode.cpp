@@ -22,6 +22,7 @@
 #include "VoxelEarthPlayerController.h"
 #include "VoxelEditRelay.h"
 #include "VoxelOceanActor.h"
+#include "VoxelSweBreachFixture.h" // -VoxelSweBreachTest, registered beside the other water fixtures below
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -2105,6 +2106,30 @@ void AVoxelEarthGameMode::BeginPlay()
 				BreachTestDelaySeconds, false);
 		}
 	}
+
+	// --- W4 surge / bed-seating discriminator ---------------------------------
+	//
+	// -VoxelSweBreachTest[=<delaySeconds>] (default 20s). The one water fixture
+	// here whose body does NOT live in this file: see VoxelSweBreachFixture.h
+	// for what it decides and why, and VoxelSweBreachFixture.cpp for the
+	// sequence. It is registered from here, with the other water switches,
+	// because that is where anyone looking for a water fixture looks.
+	//
+	// It is out-of-line for one reason: this sequence carries a surveyed
+	// heightfield, a flooded basin region, a derived spill level and a probe
+	// set across ten stages, and the member-FTimerHandle-per-stage pattern the
+	// older fixtures use would put all of that into AVoxelEarthGameMode.h --
+	// a header every other class in the module already includes. Its run state
+	// lives in a heap object owned by its own timer delegates instead, so this
+	// class grows nothing.
+	//
+	// WHY IT EXISTS AT ALL, in one line: a gentle pour onto near-flat ground
+	// cannot tell correct thin-film spreading (what SWE is for) from beds
+	// seated slightly wrong (water sitting where it should have drained), and
+	// tuning SWE toward CA-style pooling before that is resolved would bury the
+	// second possibility. A breach on a real slope tells them apart, because
+	// one produces a travelling velocity front and the other does not.
+	VoxelSweBreachFixture::StartFromCommandLine(World);
 
 	// ADR-0003 item 3 verification (docs/adr/0003-hydrostatic-persistent-body.md
 	// "item 2 resolution"): -VoxelWaterMemoTest[=<delaySeconds>] (default 15s)

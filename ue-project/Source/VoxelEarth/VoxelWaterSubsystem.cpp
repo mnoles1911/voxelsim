@@ -3095,6 +3095,187 @@ uint8 UVoxelWaterSubsystem::GetMaxStoredFill() const
 	return Max;
 }
 
+// --- W4 SWE diagnostics (VoxelWaterSubsystem.h's three PODs) -----------------
+//
+// Read-only, added for -VoxelSweBreachTest. See the header for why they exist
+// at all; the short version is that the sheet lives inside FVoxelWaterImpl and
+// the difference between "spreading correctly" and "seated wrong" is a
+// per-column comparison, not a total.
+
+bool UVoxelWaterSubsystem::GetSweProbe(FVoxelSweProbe& Out) const
+{
+	Out = FVoxelSweProbe{};
+	if (!Impl)
+	{
+		return false;
+	}
+	// CA volume is reported whether or not the sheet is armed -- a CA-only run
+	// of the fixture needs exactly this number to compare against.
+	Out.CaVolume = int64(Impl->CA.totalVolume());
+	if (!Impl->SweSheet || !Impl->SweCoupler)
+	{
+		return false;
+	}
+
+	const vxc::SweGrid& Grid = *Impl->SweSheet;
+	Out.bArmed = true;
+	Out.SheetVolume = Grid.totalVolume();
+	Out.Injected = Impl->SweInjected;
+	Out.ConservationFailures = Impl->SweConservationFailures;
+	Out.SweColumns = Impl->SweCoupler->sweColumnCount();
+	Out.LastPunctured = Impl->SweCoupler->lastPuncturedCount();
+	Out.TransferredToCA = Impl->SweCoupler->transferredToCA();
+	Out.TransferredToSWE = Impl->SweCoupler->transferredToSWE();
+	Out.OriginVx = Grid.originVx();
+	Out.OriginVy = Grid.originVy();
+	Out.SizeX = Grid.sizeX();
+	Out.SizeY = Grid.sizeY();
+	Out.SheetScanVoxels = Impl->SweCoupler->config().sheetScanVoxels;
+	Out.SettleToleranceFill = vxc::sweSettleTolerance(Grid.config());
+	return true;
+}
+
+bool UVoxelWaterSubsystem::GetWaterColumnProbe(int64 Vx, int64 Vy, int64 ScanFromVz, int32 ScanVoxels,
+                                                FVoxelWaterColumnProbe& Out) const
+{
+	Out = FVoxelWaterColumnProbe{};
+	Out.Vx = Vx;
+	Out.Vy = Vy;
+	if (!Impl)
+	{
+		return false;
+	}
+	ScanVoxels = FMath::Max(ScanVoxels, 1);
+
+	// CA side and terrain side in ONE downward walk, so the two answers are
+	// read from the same instant and the same window.
+	for (int32 K = 0; K < ScanVoxels; ++K)
+	{
+		const int64 Vz = ScanFromVz - K;
+		const uint8 Fill = Impl->CA.fillAt(Vx, Vy, Vz);
+		if (Fill != 0)
+		{
+			Out.CaColumnFill += int32(Fill);
+			if (Out.CaTopFill == 0)
+			{
+				Out.CaTopFill = Fill;
+				Out.CaTopVz = Vz;
+			}
+		}
+		if (!Out.bTerrainTopFound && Impl->Terrain.IsSolidAtVoxel(Vx, Vy, Vz))
+		{
+			Out.bTerrainTopFound = true;
+			Out.TerrainTopSolidVz = Vz;
+		}
+	}
+
+	if (!Impl->SweSheet || !Impl->SweCoupler)
+	{
+		return true;
+	}
+	const vxc::SweGrid& Grid = *Impl->SweSheet;
+	Out.bSweArmed = true;
+	if (!Grid.inBounds(Vx, Vy))
+	{
+		return true;
+	}
+	Out.bInSheet = true;
+	Out.bSweOwned = Impl->SweCoupler->isSweColumn(Vx, Vy);
+	Out.Bed = Grid.bedAt(Vx, Vy);
+	Out.Depth = Grid.depthAt(Vx, Vy);
+	const vxc::SweVelocity V = Grid.velocityAt(Vx, Vy);
+	Out.VelXMmPerSec = V.xMmPerSec;
+	Out.VelYMmPerSec = V.yMmPerSec;
+	Out.FluxXFillPerTick = Grid.faceFluxX(Vx, Vy);
+	Out.FluxYFillPerTick = Grid.faceFluxY(Vx, Vy);
+	return true;
+}
+
+bool UVoxelWaterSubsystem::AuditSweBedSeating(FVoxelSweBedAudit& Out) const
+{
+	Out = FVoxelSweBedAudit{};
+	if (!Impl || !Impl->SweSheet || !Impl->SweCoupler)
+	{
+		return false;
+	}
+	Out.bArmed = true;
+
+	const vxc::SweGrid& Grid = *Impl->SweSheet;
+
+	// THE SAME callback the arming path built and handed to both SeatSweBedZ
+	// and the coupler. Re-deriving it here (rather than using the bare terrain
+	// query) is the whole point: the audit must ask the question the seating
+	// code asked, or a "mismatch" would just be the mobilizer wrapper.
+	vxc::WaterCA::SolidFn Solid = Impl->Mob.makeSolidFn();
+
+	for (int32 Cy = 0; Cy < Grid.sizeY(); ++Cy)
+	{
+		for (int32 Cx = 0; Cx < Grid.sizeX(); ++Cx)
+		{
+			const int64 Vx = Grid.originVx() + Cx;
+			const int64 Vy = Grid.originVy() + Cy;
+			++Out.Columns;
+
+			const int32 StoredBed = Grid.bedAt(Vx, Vy);
+			const bool bSweOwned = Impl->SweCoupler->isSweColumn(Vx, Vy);
+			if (bSweOwned)
+			{
+				++Out.SweOwned;
+			}
+			if (Solid(Vx, Vy, StoredBed) != vxc::MAT_AIR)
+			{
+				++Out.Seated;
+			}
+
+			// (a) Re-seat with the identical function and the live world.
+			const double SurfaceZUU = Impl->Terrain.GetSurfaceHeightUU(double(Vx) * VoxelCoords::VoxelSizeUU,
+			                                                           double(Vy) * VoxelCoords::VoxelSizeUU);
+			const int64 SurfaceVz = int64(FMath::FloorToDouble(SurfaceZUU / VoxelCoords::VoxelSizeUU));
+			bool bFound = false;
+			const int32 Reseated = SeatSweBedZ(Solid, Vx, Vy, SurfaceVz, bFound);
+			if (bFound && Reseated != StoredBed)
+			{
+				++Out.Mismatched;
+				if (bSweOwned)
+				{
+					++Out.SweOwnedMismatched;
+				}
+				const int32 AbsDelta = FMath::Abs(Reseated - StoredBed);
+				Out.SumAbsDeltaVoxels += AbsDelta;
+				if (AbsDelta > Out.MaxAbsDeltaVoxels)
+				{
+					Out.MaxAbsDeltaVoxels = AbsDelta;
+					Out.WorstVx = Vx;
+					Out.WorstVy = Vy;
+					Out.WorstStoredBed = StoredBed;
+					Out.WorstReseatedBed = Reseated;
+				}
+			}
+
+			// (b) The bare-terrain cross-check, over the same window, with no
+			// mobilizer wrapper. Differences here are EXPECTED over implicit
+			// cavern water and are reported separately for that reason.
+			const int64 TopZ = SurfaceVz + kSweBedScanAboveVoxels;
+			bool bTerrainFound = false;
+			int64 TerrainTop = 0;
+			for (int32 K = 0; K < kSweBedScanVoxels + kSweBedScanAboveVoxels; ++K)
+			{
+				if (Impl->Terrain.IsSolidAtVoxel(Vx, Vy, TopZ - K))
+				{
+					bTerrainFound = true;
+					TerrainTop = TopZ - K;
+					break;
+				}
+			}
+			if (bTerrainFound && TerrainTop != int64(StoredBed))
+			{
+				++Out.MismatchedVsTerrain;
+			}
+		}
+	}
+	return true;
+}
+
 // --- C7/C8 underground water ------------------------------------------------
 
 bool UVoxelWaterSubsystem::GetCavernFloodZUU(double WorldXUU, double WorldYUU, double& OutFloodZUU) const
