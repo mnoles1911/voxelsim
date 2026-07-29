@@ -154,6 +154,68 @@ PixelRect fineReadPixelRect(int64_t worldMmX0, int64_t worldMmY0, int64_t worldM
 // for a non-positive footprint (defensive; callers should never pass one).
 TileCoord tileCoordForWorldMm(int64_t worldMmX, int64_t worldMmY, int64_t tileFootprintMm);
 
+// The coarse tile coordinate containing a FINE PIXEL index, given the fine
+// grid's per-tile edge. The pixel-space twin of tileCoordForWorldMm, and the
+// SAME routing vxc::FineTileSampler::blockFor uses internally (floorDiv, not
+// truncation -- truncating folds pixels -tileSizePx+1..-1 onto tile 0 and
+// mirrors terrain across the origin). Returns {0,0} for a non-positive edge.
+//
+// A residency check that derives the tile from the pixel MUST use this rather
+// than its own division: this is how a host answers "is the tile behind THIS
+// query resident" for a single pixel, on the query path, where building a
+// whole coverage vector would be absurd.
+constexpr TileCoord tileCoordForPixel(int64_t px, int64_t py, int64_t tileSizePx) {
+    if (tileSizePx <= 0) return TileCoord{0, 0};
+    return TileCoord{static_cast<int32_t>(floorDiv(px, tileSizePx)),
+                     static_cast<int32_t>(floorDiv(py, tileSizePx))};
+}
+
+// --- THE GATE, as pure logic ------------------------------------------------
+//
+// tilesCoveringFootprint + missingTilesForFootprint ARE the block-until-ready
+// rule. They exist as free functions here, rather than as arithmetic inlined
+// into the host's gate, because of how this gate actually failed in the field:
+// it was only ever exercised with the tile PRESENT. Every check passed,
+// missingTileQueries stayed 0, and the absent branch -- the entire reason the
+// gate exists -- was never run. A gate whose decision lives in host code that
+// needs a UE editor, a baked 200 MB tile and a flight leg to observe is a gate
+// that will only ever be tested in the easy direction.
+//
+// Split out here, the decision is a pure function of (footprint, margin, which
+// tiles are resident), so tests/test_tilestreaming.cpp can and does assert
+// BOTH directions -- resident => admit, absent => block, and the boundary case
+// where the footprint itself is inside a resident tile but the read margin
+// reaches into an absent neighbour, which is the shape that leaked.
+
+// Every coarse tile a generator over the half-open world-mm rect
+// [x0,x1) x [y0,y1) may READ, with `readMarginMm` of generation reach and the
+// carrier's control stencil both applied (see fineReadPixelRect). Row-major,
+// y outer, no duplicates. Empty only for a degenerate `tileSizePx`.
+//
+// This is the definition of "the footprint's tiles". A host must not compute
+// it a second way -- that is precisely how the carrier stencil and the cavern
+// reach came to disagree once already (see fineReadPixelRect's comment).
+std::vector<TileCoord> tilesCoveringFootprint(int64_t worldMmX0, int64_t worldMmY0, int64_t worldMmX1,
+                                              int64_t worldMmY1, int64_t readMarginMm, int64_t tileSizePx,
+                                              int32_t pixelSizeMm = tilePixelSizeMm(kFineTileScale));
+
+using TileCoordSet = std::unordered_set<TileCoord, TileCoordHash>;
+
+// The residency VERDICT: every tile from tilesCoveringFootprint that is not in
+// `resident`, in the same order. EMPTY means the footprint may be voxelized;
+// NON-EMPTY means block, and names exactly which tiles the caller is waiting
+// on (a host that only gets a bool cannot log the thing an operator needs).
+//
+// Note what this does NOT do: there is no "close enough", no partial credit,
+// and no fallback. One absent tile blocks the whole footprint, because the
+// part of the footprint that tile covers would otherwise read back as
+// elevation 0 -- sea level -- which on the fine tier is not a degraded answer,
+// it is a different world from the one every other client computes.
+std::vector<TileCoord> missingTilesForFootprint(int64_t worldMmX0, int64_t worldMmY0, int64_t worldMmX1,
+                                                int64_t worldMmY1, int64_t readMarginMm, int64_t tileSizePx,
+                                                const TileCoordSet& resident,
+                                                int32_t pixelSizeMm = tilePixelSizeMm(kFineTileScale));
+
 // --- ring geometry -----------------------------------------------------
 
 // Every coarse tile coordinate within Chebyshev distance `radiusTiles` of

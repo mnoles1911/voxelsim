@@ -79,6 +79,7 @@
 #include "LocalVertexFactory.h" // hitch isolation: FLocalVertexFactory::StaticType for the BeginPlay PSO precache warmup
 #include "MaterialDomain.h"
 #include "Materials/Material.h"
+#include "Misc/App.h" // FApp::IsUnattended() -- fine-tier gate-leak policy, see MakeFineTileStreamer
 #include "Misc/CommandLine.h"
 #include "Misc/ConfigCacheIni.h" // DefaultTileDir ini fallback (GConfig/GGameIni) in Initialize()
 #include "Misc/FileHelper.h" // M3 wave 2: Saved/VoxelWorlds/<seed>.vxlog read/write
@@ -1093,6 +1094,43 @@ TUniquePtr<FVoxelFineTileStreamer> MakeFineTileStreamer(uint64 Seed, const FStri
 	{
 		Streamer->SetRingRadiusTiles(FineRingRadius);
 	}
+
+	// GATE-LEAK POLICY. A leak means this process is computing terrain from sea
+	// level that another client computes from the tile -- the run's output is
+	// not reproducible, so every screenshot, timing and digest it goes on to
+	// emit describes a world that does not exist.
+	//
+	// UNATTENDED (tools/voxel-capture.ps1 and the perf legs all pass
+	// -unattended): STOP. A run that leaks and still exits 0 is worse than one
+	// that fails, because the artifact gets read and believed -- which is
+	// precisely how a gate that leaked 18.7 million times went unnoticed.
+	// INTERACTIVE editor: Error, and keep going. A developer poking at a
+	// half-populated tile cache is not producing an artifact anyone trusts, and
+	// killing the editor the first time the camera crosses the bake frontier
+	// only teaches them to disable the check -- which would cost the unattended
+	// case its protection too.
+	//
+	//   -VoxelFineTileGateFatal=0/1 overrides in both directions.
+	bool bGateFatal = FApp::IsUnattended();
+	int32 GateFatalOverride = -1;
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileGateFatal="), GateFatalOverride);
+	if (GateFatalOverride >= 0)
+	{
+		bGateFatal = (GateFatalOverride != 0);
+	}
+	Streamer->SetLeakIsFatal(bGateFatal);
+	// NOTE THE WORDING. This line deliberately does not contain the word
+	// "F-a-t-a-l": tools/voxel-capture.ps1 greps its logs for /Fatal|Assertion
+	// failed/ and prints a warning banner for any hit, so announcing the POLICY
+	// with that word made every healthy fine-tier capture report a fatal error
+	// it did not have. A routine startup line must not look like a failure --
+	// the actual leak message is where that word belongs, and there it is
+	// correct for the grep to fire.
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("Fine tier gate-leak policy: %s. A leak is an elevation query answered with sea level over a ")
+	       TEXT("non-resident tile, i.e. terrain no other client reproduces."),
+	       bGateFatal ? TEXT("STOP THE RUN on the first leak (unattended -- it will not emit an artifact)")
+	                  : TEXT("log an Error and continue (interactive)"));
 
 	UE_LOG(LogVoxelEarth, Log,
 	       TEXT("Fine tier ENABLED: root=%s provider=%s seed=%llu pitch=%d mm/px ringRadius=%d budget=%.2f GiB. ")
@@ -2694,8 +2732,12 @@ struct FVoxelWorldImpl
 
 	// MaybeLogCounters' missing-tile delta tracking (bUsingTileGrid only).
 	uint64 LastMissingTileQueries = 0;
-	// Same delta tracking for the fine tier's gate-leak detector (MaybeLogCounters).
-	uint64 LastFineMissingTileQueries = 0;
+	// Same delta tracking for the fine tier's gate-leak detector
+	// (MaybeLogCounters). Tracks FVoxelFineTileStreamer::GateLeaksSinceStart(),
+	// NOT the sampler's missingTileQueries -- since the funnel started
+	// blocking-and-loading on a miss, missingTileQueries counts queries that
+	// were then served CORRECTLY and is no longer a correctness signal.
+	uint64 LastFineGateLeaks = 0;
 
 	// --- Stage 2 streaming state (docs/m1-plan.md Stage 2 decisions table);
 	// M2 (docs/m2-plan.md "Ring streaming" row) generalizes every key here
@@ -6049,7 +6091,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	{
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Fine tier (5s window): resident=%llu tile(s) %.2f/%.2f GiB (decoded %.2f GiB) | loaded=%llu ")
-		       TEXT("absentOnDisk=%llu corrupt=%llu identityMismatch=%llu | ringRadius=%d"),
+		       TEXT("absentOnDisk=%llu corrupt=%llu identityMismatch=%llu | blockingLoads=%llu gateLeaks=%llu ")
+		       TEXT("| ringRadius=%d"),
 		       (unsigned long long)FineStreamer->ResidentTileCount(),
 		       double(FineStreamer->ResidentBytes()) / double(1ull << 30),
 		       double(FineStreamer->BudgetBytes()) / double(1ull << 30),
@@ -6058,19 +6101,39 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       (unsigned long long)FineStreamer->MissingFileLoadsSinceStart(),
 		       (unsigned long long)FineStreamer->CorruptTileLoadsSinceStart(),
 		       (unsigned long long)FineStreamer->IdentityMismatchLoadsSinceStart(),
+		       (unsigned long long)FineStreamer->BlockingLoadsSinceStart(),
+		       (unsigned long long)FineStreamer->GateLeaksSinceStart(),
 		       FineStreamer->RingRadiusTiles());
 
-		const uint64 FineMissing = FineStreamer->MissingTileQueriesSinceStart();
-		if (FineMissing > LastFineMissingTileQueries)
+		// THE AFTER-THE-FACT CHECK, now reported against GateLeaksSinceStart()
+		// rather than the sampler's missingTileQueries.
+		//
+		// The two used to be the same number. They no longer are, and the
+		// difference is the fix: FVoxelFineTileSamplerProxy::elevationMm now
+		// intercepts a query into a non-resident tile and, on the game thread,
+		// LOADS it and answers correctly. The sampler still counts that as a
+		// missing-tile query on the way through, so missingTileQueries now
+		// includes queries that were correctly served -- it is a "how often did
+		// the funnel have to work" number, not a correctness one. Only
+		// GateLeaksSinceStart() counts queries that were actually answered with
+		// sea level, and only those are desyncs.
+		//
+		// Under an unattended run this branch is nearly unreachable by
+		// construction: SetLeakIsFatal(true) stops the process at the FIRST leak
+		// rather than letting it accumulate to 18.7 million and exit 0. It stays
+		// here for the interactive case, and as the belt to that braces.
+		const uint64 FineLeaks = FineStreamer->GateLeaksSinceStart();
+		if (FineLeaks > LastFineGateLeaks)
 		{
 			UE_LOG(LogVoxelPerf, Error,
 			       TEXT("FINE TIER GATE LEAK: +%llu elevation queries (total %llu) landed in a NON-RESIDENT fine tile ")
 			       TEXT("and were answered with sea level. On the fine tier that is not a fallback, it is a desync -- ")
-			       TEXT("this run's terrain is not reproducible on a client that has the tile. Something generated a ")
-			       TEXT("chunk IsFootprintResident had not cleared (check the read margin in ")
-			       TEXT("FVoxelFineTileStreamer::CoveredTileRange against every path that samples the raster)."),
-			       (unsigned long long)(FineMissing - LastFineMissingTileQueries), (unsigned long long)FineMissing);
-			LastFineMissingTileQueries = FineMissing;
+			       TEXT("this run's terrain is not reproducible on a client that has the tile. The per-tile Error lines ")
+			       TEXT("from FVoxelFineTileStreamer name the exact tiles and pixels; the usual cause is a tile that is ")
+			       TEXT("genuinely absent on disk (check -VoxelFineTileProviderId, which is part of the cache key), and ")
+			       TEXT("the other is a worker reaching the sampler over a footprint chunk admission had not cleared."),
+			       (unsigned long long)(FineLeaks - LastFineGateLeaks), (unsigned long long)FineLeaks);
+			LastFineGateLeaks = FineLeaks;
 		}
 	}
 }
@@ -7549,7 +7612,34 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					// footprint is not already resident.
 					if (FineStreamer)
 					{
-						const double HalfEdge = ChunkEdge * 0.5;
+						// THE FOOTPRINT CHECKED IS THE DISPATCH FOOTPRINT, NOT THE
+						// CHUNK'S OWN, and the difference is a real hole that was
+						// open until now.
+						//
+						// A chunk taken by the GPU fork is dispatched over 48
+						// columns starting at ChunkX*32 - 8
+						// (VoxelGpuChunkRegion::SetChunkFootprint): one BRICK of
+						// halo on each side, in level-L cells. VoxelGpuRegionBuild::
+						// FillRasterWindow then grows THAT by kRasterCavernMarginMm
+						// and the carrier stencil. So the raster the GPU actually
+						// samples reaches 8 cells further out than this gate was
+						// checking -- 0.8 m at level 0, but 25.6 m at level 5, since
+						// a level-L cell is 2^L level-0 voxels.
+						//
+						// Under 36.5 m of read margin that gap only bites within
+						// ~26 m of a tile boundary, which is exactly why it never
+						// showed up: it needs a high-level chunk straddling a tile
+						// edge with the neighbour not resident, and then it does not
+						// fault -- the kernel reads sea level and produces terrain
+						// no other client reproduces.
+						//
+						// Widening the gate by the halo costs nothing (it only ever
+						// defers a chunk slightly earlier) and makes the checked
+						// area a superset of BOTH paths' reach: the CPU worker's
+						// grid is the chunk plus a ONE-cell apron, comfortably
+						// inside this.
+						const double CellUU = ChunkEdge / double(VoxelCoords::ChunkEdgeVoxels);
+						const double HalfEdge = ChunkEdge * 0.5 + double(VoxelGpuChunkRegion::kBrickEdge) * CellUU;
 						const int64 FineX0Mm = WorldToMm(CenterX - HalfEdge);
 						const int64 FineX1Mm = WorldToMm(CenterX + HalfEdge);
 						const int64 FineY0Mm = WorldToMm(CenterY - HalfEdge);
@@ -14320,14 +14410,22 @@ double UVoxelWorldSubsystem::GetSurfaceHeightUU(double WorldX, double WorldY) co
 	// mountain" -- and it is silent.
 	//
 	// Requesting the column here is the streaming layer doing its job at the
-	// one place that cannot wait for a tick. It is the ONLY caller allowed to
-	// trigger a synchronous load outside RecomputeDesiredSet, and it is
-	// restricted to the game thread because RequestFootprint does disk I/O and
-	// takes the sampler's lock exclusively -- a worker calling it would stall
-	// the whole pool behind a 200 MB read. A worker that gets here with nothing
-	// resident gets sea level and MissingTileQueriesSinceStart moves, which
-	// MaybeLogCounters reports as a gate leak; that is the correct outcome
-	// (visible failure) rather than a hidden stall.
+	// one place that cannot wait for a tick. Restricted to the game thread
+	// because RequestFootprint does disk I/O and takes the sampler's lock
+	// exclusively -- a worker calling it would stall the whole pool behind a
+	// 200 MB read.
+	//
+	// THE RETURN VALUE IS DELIBERATELY IGNORED, and that is no longer a hole.
+	// This call is now a bulk PREFETCH, not the gate: it asks for the whole
+	// dilated footprint in one go so the amplifier column below finds
+	// everything resident, instead of the funnel discovering the same misses
+	// one pixel at a time. The gate itself lives in
+	// FVoxelFineTileSamplerProxy::elevationMm (see VoxelFineTileStreamer.h,
+	// "WHY THE CHUNK-ADMISSION GATE WAS NOT ENOUGH"), which blocks-and-loads on
+	// the game thread and reports a leak when it cannot. There is nothing
+	// useful for this function to DO with a false here in any case -- its
+	// signature returns a height, every one of its ~40 callers wants a number,
+	// and inventing one is the thing the fine tier forbids.
 	if (Impl->FineStreamer && IsInGameThread())
 	{
 		const int64 MmX = VoxelCoords::WorldToMm(WorldX);

@@ -12,6 +12,7 @@
 #include "voxelcore/tilestreaming.h"
 
 #include "voxelcore/bytes.h"
+#include "voxelcore/caverns.h" // kCavernMaxReachMm -- the read margin the gate must honour
 #include "vxctest.h"
 
 using namespace vxc;
@@ -418,4 +419,239 @@ VXC_TEST(lru_retouch_with_different_size_corrects_accounting) {
     cache.touch("a", 25); // same key, different byte count
     CHECK_EQ(cache.residentBytes(), uint64_t(25));
     CHECK_EQ(cache.size(), size_t(1));
+}
+
+// ---------------------------------------------------------------------------
+// THE GATE, BOTH DIRECTIONS -- tilesCoveringFootprint / missingTilesForFootprint
+//
+// These exist because of a specific field failure, and the failure was not in
+// the arithmetic: it was in the TESTING. The fine-tier residency gate was only
+// ever run with the baked tile PRESENT. Every check passed, missingTileQueries
+// stayed 0, and the absent branch -- block-until-ready, the entire reason the
+// gate exists -- was never executed once. When a run finally hit a fine-tier
+// root with no resolvable tile, 18.7 million elevation queries were answered
+// with sea level, which on the fine tier is not a degraded answer but a
+// different world from the one every other client computes.
+//
+// So every property below is asserted in BOTH directions. A test that only
+// shows "resident => admit" is the test that already shipped.
+// ---------------------------------------------------------------------------
+
+namespace {
+// The production geometry, spelled out once. kFineTileSize px of
+// tilePixelSizeMm(kFineTileScale) each == 15.36 km, vxtl-v2-format.md §1.
+constexpr int64_t kTilePx = int64_t(kFineTileSize);
+constexpr int32_t kPxMm = tilePixelSizeMm(kFineTileScale);
+
+bool containsTile(const std::vector<TileCoord>& v, int32_t x, int32_t y) {
+    for (const TileCoord& t : v) {
+        if (t.x == x && t.y == y) return true;
+    }
+    return false;
+}
+} // namespace
+
+VXC_TEST(tile_coord_for_pixel_routes_negatives_by_floor_not_truncation) {
+    // Truncation would fold pixel -1 onto tile 0 and mirror terrain across the
+    // origin -- the same aliasing FineTileSampler::blockFor uses floorDiv to
+    // avoid. Pixel -1 belongs to tile -1; pixel -kTilePx is tile -1's FIRST.
+    CHECK(tileCoordForPixel(0, 0, kTilePx) == (TileCoord{0, 0}));
+    CHECK(tileCoordForPixel(kTilePx - 1, kTilePx - 1, kTilePx) == (TileCoord{0, 0}));
+    CHECK(tileCoordForPixel(kTilePx, 0, kTilePx) == (TileCoord{1, 0}));
+    CHECK(tileCoordForPixel(-1, -1, kTilePx) == (TileCoord{-1, -1}));
+    CHECK(tileCoordForPixel(-kTilePx, 0, kTilePx) == (TileCoord{-1, 0}));
+    CHECK(tileCoordForPixel(-kTilePx - 1, 0, kTilePx) == (TileCoord{-2, 0}));
+    // Degenerate edge: never divide by zero, never claim a tile on no geometry.
+    CHECK(tileCoordForPixel(1234, 5678, 0) == (TileCoord{0, 0}));
+}
+
+VXC_TEST(footprint_deep_inside_one_tile_needs_exactly_that_tile) {
+    // A column at the middle of tile (0,0): margin and stencil both stay well
+    // inside, so the gate must demand one tile and not over-claim its
+    // neighbours (an over-claiming gate blocks forever on a correct bake).
+    const int64_t mid = (kTilePx / 2) * int64_t(kPxMm);
+    const std::vector<TileCoord> tiles =
+        tilesCoveringFootprint(mid, mid, mid + kPxMm, mid + kPxMm, kCavernMaxReachMm, kTilePx, kPxMm);
+    CHECK_EQ(tiles.size(), size_t(1));
+    CHECK(tiles[0] == (TileCoord{0, 0}));
+}
+
+// --- the direction that was never run --------------------------------------
+
+VXC_TEST(gate_blocks_when_nothing_is_resident) {
+    const int64_t mid = (kTilePx / 2) * int64_t(kPxMm);
+    const TileCoordSet residentNothing; // exactly the state the leaking run was in
+    const std::vector<TileCoord> missing = missingTilesForFootprint(
+        mid, mid, mid + kPxMm, mid + kPxMm, kCavernMaxReachMm, kTilePx, residentNothing, kPxMm);
+    // NON-EMPTY means block. This is the assertion whose absence cost 18.7M
+    // sea-level answers.
+    CHECK_EQ(missing.size(), size_t(1));
+    CHECK(missing[0] == (TileCoord{0, 0}));
+}
+
+VXC_TEST(gate_admits_only_once_the_covering_tile_is_resident) {
+    const int64_t mid = (kTilePx / 2) * int64_t(kPxMm);
+    TileCoordSet resident;
+    // Before: blocked.
+    CHECK(!missingTilesForFootprint(mid, mid, mid + kPxMm, mid + kPxMm, kCavernMaxReachMm, kTilePx, resident, kPxMm)
+               .empty());
+    // A DIFFERENT tile becoming resident must not unblock this footprint --
+    // "something is loaded" is not the question the gate asks.
+    resident.insert(TileCoord{5, 5});
+    CHECK(!missingTilesForFootprint(mid, mid, mid + kPxMm, mid + kPxMm, kCavernMaxReachMm, kTilePx, resident, kPxMm)
+               .empty());
+    // After: admitted.
+    resident.insert(TileCoord{0, 0});
+    CHECK(missingTilesForFootprint(mid, mid, mid + kPxMm, mid + kPxMm, kCavernMaxReachMm, kTilePx, resident, kPxMm)
+              .empty());
+}
+
+// --- the read margin, which is what the leak's own log line named -----------
+
+VXC_TEST(read_margin_reaches_into_the_next_tile_and_the_gate_demands_it) {
+    // A footprint whose own pixel sits INSIDE tile (0,0) -- ten pixels short of
+    // its last column -- but whose cavern read margin crosses into tile (1,0).
+    // This is the shape that leaks: the chunk looks local, IsFootprintResident
+    // is asked about a footprint that "obviously" lies in one tile, and the
+    // generation then samples the raster next door and gets sea level.
+    constexpr int64_t kInset = 10;
+    // The test is only meaningful while the margin is wider than the inset and
+    // the stencil is narrower. If a cavern-size change ever breaks that, this
+    // fails loudly rather than silently testing nothing.
+    CHECK(kCavernMaxReachMm / int64_t(kPxMm) > kInset);
+    CHECK(kCarrierStencilHi < kInset);
+
+    const int64_t px = kTilePx - 1 - kInset;
+    const int64_t x0 = px * int64_t(kPxMm);
+    const int64_t x1 = x0 + kPxMm;
+    const int64_t ymid = (kTilePx / 2) * int64_t(kPxMm);
+
+    // Carrier stencil ALONE keeps it in tile (0,0)...
+    const std::vector<TileCoord> noMargin =
+        tilesCoveringFootprint(x0, ymid, x1, ymid + kPxMm, /*readMarginMm=*/0, kTilePx, kPxMm);
+    CHECK_EQ(noMargin.size(), size_t(1));
+    CHECK(noMargin[0] == (TileCoord{0, 0}));
+
+    // ...and the cavern reach is what pulls tile (1,0) in. A gate that dilated
+    // only by the carrier stencil -- which is exactly what this codebase once
+    // did, see fineReadPixelRect's comment -- would return the vector above and
+    // admit a chunk that reads a non-resident tile.
+    const std::vector<TileCoord> withMargin =
+        tilesCoveringFootprint(x0, ymid, x1, ymid + kPxMm, kCavernMaxReachMm, kTilePx, kPxMm);
+    CHECK_EQ(withMargin.size(), size_t(2));
+    CHECK(containsTile(withMargin, 0, 0));
+    CHECK(containsTile(withMargin, 1, 0));
+
+    // And the verdict: with ONLY the footprint's own tile resident, the gate
+    // must still block, naming the neighbour it is waiting on.
+    TileCoordSet resident;
+    resident.insert(TileCoord{0, 0});
+    const std::vector<TileCoord> missing =
+        missingTilesForFootprint(x0, ymid, x1, ymid + kPxMm, kCavernMaxReachMm, kTilePx, resident, kPxMm);
+    CHECK_EQ(missing.size(), size_t(1));
+    CHECK(missing[0] == (TileCoord{1, 0}));
+
+    // Both resident => admit. Proves the block above is the margin talking and
+    // not a gate that refuses everything.
+    resident.insert(TileCoord{1, 0});
+    CHECK(missingTilesForFootprint(x0, ymid, x1, ymid + kPxMm, kCavernMaxReachMm, kTilePx, resident, kPxMm).empty());
+}
+
+VXC_TEST(read_margin_reaches_backwards_across_the_low_edge_too) {
+    // The mirror of the above at a tile's FIRST column: the margin reaches into
+    // tile (-1, ...). Negative tile coordinates are where truncation bugs hide.
+    constexpr int64_t kInset = 10;
+    CHECK(kCavernMaxReachMm / int64_t(kPxMm) > kInset);
+
+    const int64_t x0 = kInset * int64_t(kPxMm);
+    const int64_t x1 = x0 + kPxMm;
+    const int64_t ymid = (kTilePx / 2) * int64_t(kPxMm);
+
+    const std::vector<TileCoord> tiles =
+        tilesCoveringFootprint(x0, ymid, x1, ymid + kPxMm, kCavernMaxReachMm, kTilePx, kPxMm);
+    CHECK(containsTile(tiles, -1, 0));
+    CHECK(containsTile(tiles, 0, 0));
+
+    TileCoordSet resident;
+    resident.insert(TileCoord{0, 0});
+    const std::vector<TileCoord> missing =
+        missingTilesForFootprint(x0, ymid, x1, ymid + kPxMm, kCavernMaxReachMm, kTilePx, resident, kPxMm);
+    CHECK_EQ(missing.size(), size_t(1));
+    CHECK(missing[0] == (TileCoord{-1, 0}));
+}
+
+VXC_TEST(gate_reports_every_missing_tile_of_a_four_tile_corner_not_just_the_first) {
+    // A footprint straddling the (0,0)/(1,1) corner touches four tiles. A gate
+    // that stopped at the first miss would tell an operator to wait for one
+    // tile and then block again -- and, worse, a host that loaded only what it
+    // was told would never converge. Report all four.
+    const int64_t corner = kTilePx * int64_t(kPxMm); // exact tile boundary
+    const int64_t x0 = corner - kPxMm;
+    const int64_t y0 = corner - kPxMm;
+    const std::vector<TileCoord> tiles =
+        tilesCoveringFootprint(x0, y0, corner + kPxMm, corner + kPxMm, kCavernMaxReachMm, kTilePx, kPxMm);
+    CHECK_EQ(tiles.size(), size_t(4));
+
+    TileCoordSet resident;
+    resident.insert(TileCoord{0, 0});
+    resident.insert(TileCoord{1, 1});
+    const std::vector<TileCoord> missing = missingTilesForFootprint(
+        x0, y0, corner + kPxMm, corner + kPxMm, kCavernMaxReachMm, kTilePx, resident, kPxMm);
+    CHECK_EQ(missing.size(), size_t(2));
+    CHECK(containsTile(missing, 1, 0));
+    CHECK(containsTile(missing, 0, 1));
+}
+
+VXC_TEST(gate_blocks_a_wholly_negative_footprint_with_nothing_resident) {
+    // Far-negative world coordinates: the leaking capture spawned at
+    // (-69120, 38400) UU, i.e. negative X. A gate that mis-routed negatives
+    // would check the WRONG tile's residency and could answer "resident" --
+    // admitting a chunk over a tile that is not loaded at all.
+    const int64_t x = -3 * kTilePx * int64_t(kPxMm) + (kTilePx / 2) * int64_t(kPxMm);
+    const int64_t y = -2 * kTilePx * int64_t(kPxMm) + (kTilePx / 2) * int64_t(kPxMm);
+    const std::vector<TileCoord> tiles =
+        tilesCoveringFootprint(x, y, x + kPxMm, y + kPxMm, kCavernMaxReachMm, kTilePx, kPxMm);
+    CHECK_EQ(tiles.size(), size_t(1));
+    CHECK(tiles[0] == (TileCoord{-3, -2}));
+
+    TileCoordSet resident;
+    // The positive-quadrant twin being resident must NOT satisfy a negative
+    // footprint -- that is what a truncating gate would have concluded.
+    resident.insert(TileCoord{3, 2});
+    CHECK_EQ(missingTilesForFootprint(x, y, x + kPxMm, y + kPxMm, kCavernMaxReachMm, kTilePx, resident, kPxMm).size(),
+             size_t(1));
+    resident.insert(TileCoord{-3, -2});
+    CHECK(missingTilesForFootprint(x, y, x + kPxMm, y + kPxMm, kCavernMaxReachMm, kTilePx, resident, kPxMm).empty());
+}
+
+VXC_TEST(gate_covering_set_matches_the_pixel_routing_of_every_corner) {
+    // Cross-check tilesCoveringFootprint against tileCoordForPixel applied to
+    // fineReadPixelRect's own corners -- i.e. the coverage vector really is the
+    // tiles the read rect lands in, not an independently-derived range that
+    // could drift from it. Same footprint as the margin test.
+    const int64_t px = kTilePx - 11;
+    const int64_t x0 = px * int64_t(kPxMm);
+    const int64_t ymid = (kTilePx / 2) * int64_t(kPxMm);
+    const PixelRect r = fineReadPixelRect(x0, ymid, x0 + kPxMm, ymid + kPxMm, kCavernMaxReachMm, kPxMm);
+    const TileCoord lo = tileCoordForPixel(r.px0, r.py0, kTilePx);
+    const TileCoord hi = tileCoordForPixel(r.px1, r.py1, kTilePx);
+
+    const std::vector<TileCoord> tiles =
+        tilesCoveringFootprint(x0, ymid, x0 + kPxMm, ymid + kPxMm, kCavernMaxReachMm, kTilePx, kPxMm);
+    CHECK_EQ(tiles.size(), size_t(hi.x - lo.x + 1) * size_t(hi.y - lo.y + 1));
+    CHECK(containsTile(tiles, lo.x, lo.y));
+    CHECK(containsTile(tiles, hi.x, hi.y));
+}
+
+VXC_TEST(gate_declines_a_degenerate_tile_stride_rather_than_admitting) {
+    // tileSizePx <= 0 is a host wiring bug. Returning an EMPTY covering set
+    // would make missingTilesForFootprint return empty too -- i.e. "admit
+    // everything", the worst possible failure direction. Assert the covering
+    // set is empty AND document that the host must never reach this: the UE
+    // gate passes the compile-time kFineTileSize, never a runtime value.
+    CHECK(tilesCoveringFootprint(0, 0, 1, 1, kCavernMaxReachMm, 0, kPxMm).empty());
+    CHECK(tilesCoveringFootprint(0, 0, 1, 1, kCavernMaxReachMm, -8192, kPxMm).empty());
+    // Same for a degenerate pixel pitch, which fineReadPixelRect reports as an
+    // inverted rect.
+    CHECK(tilesCoveringFootprint(0, 0, 1, 1, kCavernMaxReachMm, kTilePx, 0).empty());
 }
