@@ -84,10 +84,40 @@ A_CRIT_M2 = 1.0e4
 # sharply real channel heads appear.
 GATE_Q = 2.0
 
+# --- the sea-level taper ----------------------------------------------------
+#
+# Nothing in the bake gated on depth, so priority-flood, MFD, stream power and
+# thermal relaxation all ran on the seafloor. Measured on a 100%-ocean tile
+# (-7,4), which the model emits as real BATHYMETRY rather than a water plane
+# (-4654 to -2405 m, 2.26 km of relief in one tile): 26.6 M cells flagged as
+# channel, **39.7% of the tile** against 4.1% on an alpine tile, and 0.87 m mean
+# incision against 0.13 m. That is subaerial fluvial erosion at three kilometres
+# depth -- dendritic river valleys cut by rain that cannot fall.
+#
+# It is also the single largest storage lever found: the ocean tile was the
+# LARGEST of the three baked, 28.35 MB against 22.62 for alpine, because all
+# that invented detail has to be encoded. An ocean-majority world was paying its
+# highest per-tile price for drainage no player can reach.
+#
+# TAPERED, NOT CUT. A hard stop at z=0 would put a step in incision depth along
+# the entire coastline -- a seam along the most visually scrutinised curve in the
+# world, which is the exact failure class this project exists to remove. The
+# taper also keeps the coast itself honest: river mouths, deltas and the incised
+# shelf valleys that are real features of a coastline all live in the first
+# hundred metres of depth, and they are cut by rivers that DID flow there at
+# lower sea level. -200 m is the shelf break, a real physiographic boundary
+# rather than a round number, and below it the erosion being suppressed is the
+# purely fictional kind.
+SEA_TAPER_TOP_M = 0.0
+SEA_TAPER_BOTTOM_M = -200.0
+
 
 def stream_power(acc: np.ndarray, slope: np.ndarray, K: float = 0.15,
                  m: float = 0.45, n: float = 0.8, cap_m: float = 25.0,
-                 a_crit_m2: float = A_CRIT_M2, gate_q: float = GATE_Q) -> np.ndarray:
+                 a_crit_m2: float = A_CRIT_M2, gate_q: float = GATE_Q,
+                 elev_m: np.ndarray | None = None,
+                 sea_taper_top_m: float = SEA_TAPER_TOP_M,
+                 sea_taper_bottom_m: float = SEA_TAPER_BOTTOM_M) -> np.ndarray:
     """Incision depth in **metres**, to be subtracted from the depression-filled surface.
 
     `acc`   upslope contributing area A, in m^2 (the MFD accumulation field).
@@ -129,5 +159,19 @@ def stream_power(acc: np.ndarray, slope: np.ndarray, K: float = 0.15,
         aq = np.power(a, np.float32(gate_q), dtype=np.float32)
         acq = np.float32(a_crit_m2) ** np.float32(gate_q)
         depth = depth * (aq / (aq + acq))
+
+    if elev_m is not None and sea_taper_bottom_m < sea_taper_top_m:
+        z = np.asarray(elev_m, dtype=np.float32)
+        if z.shape != a.shape:
+            raise ValueError(f"elev_m {z.shape} must match acc {a.shape}")
+        # Smoothstep, not a ramp: a linear taper is C0 but not C1, so its
+        # DERIVATIVE steps at both ends of the transition. The whole v9 carrier
+        # rework exists because a gradient discontinuity is visible under
+        # directional light even when the value is continuous, and there is no
+        # reason to reintroduce one along the shelf break.
+        t = (z - np.float32(sea_taper_bottom_m)) / np.float32(
+            sea_taper_top_m - sea_taper_bottom_m)
+        t = np.clip(t, 0.0, 1.0)
+        depth = depth * (t * t * (np.float32(3.0) - np.float32(2.0) * t))
 
     return np.minimum(depth, np.float32(cap_m))

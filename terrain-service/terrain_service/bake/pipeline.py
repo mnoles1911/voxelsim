@@ -319,6 +319,17 @@ class BakeConstants:
     #: which is a visible seam along a curve -- the same failure class as the
     #: 30 m grid seams, just not on the grid.
     channel_init_q: float = 2.0
+    #: Depth over which fluvial incision fades out below sea level. Nothing
+    #: gated on depth before this, so the bake cut dendritic river valleys into
+    #: the seafloor: measured on a 100%-ocean tile, 39.7% of the tile flagged as
+    #: channel (against 4.1% alpine) and 0.87 m mean incision (against 0.13 m),
+    #: at three kilometres depth. It made the OCEAN tile the largest of three
+    #: baked -- 28.35 MB against 22.62 for alpine -- because the invented detail
+    #: has to be encoded. Tapered rather than cut: a hard stop at z=0 would put a
+    #: step in incision along the entire coastline. -200 m is the shelf break,
+    #: which keeps river mouths, deltas and genuinely incised shelf valleys.
+    sea_taper_top_m: float = 0.0
+    sea_taper_bottom_m: float = -200.0
 
     # -- B3 thermal --------------------------------------------------------
     repose_deg: float = 36.0
@@ -375,6 +386,8 @@ class BakeConstants:
             "incision_cap_m": self.incision_cap_m,
             "channel_init_area_m2": self.channel_init_area_m2,
             "channel_init_q": self.channel_init_q,
+            "sea_taper_top_m": self.sea_taper_top_m,
+            "sea_taper_bottom_m": self.sea_taper_bottom_m,
             "repose_deg": self.repose_deg,
             "thermal_iters": self.thermal_iters,
             "thermal_rate": self.thermal_rate,
@@ -1347,6 +1360,9 @@ def bake_padded_domain(
             cap_m=consts.incision_cap_m,
             a_crit_m2=consts.channel_init_area_m2,
             gate_q=consts.channel_init_q,
+            elev_m=filled,
+            sea_taper_top_m=consts.sea_taper_top_m,
+            sea_taper_bottom_m=consts.sea_taper_bottom_m,
         ),
         dtype=np.float32,
     )

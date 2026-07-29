@@ -482,7 +482,19 @@ inline constexpr int64_t kCurvatureScaleMaxQ10 = 1792; // 1.75x on crests   [PRO
 // the gate was wired in, bounded, proved, mirrored, and doing NOTHING. A gate
 // whose knee sits far outside the data's range is indistinguishable from no gate,
 // and nothing but an end-to-end measurement catches that.                [PROVISIONAL]
-inline constexpr int64_t kCurvatureKneeQ10 = kCurveQ10One / 2;
+// MEASURED, twice, in opposite directions. 2.0 was seven times the mean and the
+// gate was inert. 0.5 overcorrected: the gate census on real tiles showed
+// **70% of samples saturated at a gentle site and 96% at a steep one**, gain
+// median 0.5-0.675 with only 0.4-2.7% of points anywhere inside [0.95, 1.05].
+// That is not a ramp, it is a two-valued step -- the same seam class this project
+// removes, just keyed on curvature instead of on the tile grid. A knee sweep on
+// measured data gives convex/concave 3.41 at 0.5, **3.11 at 1.0**, 2.18 at 2.0:
+// 1.0 keeps nearly all the conditioning for far less clipping, and 3.5 is only
+// reachable by a gate that has become a step. Note the tier-normalised mean |k|
+// is 1.00 mm/m^2 at a gentle site and 7.32 at a steep one, so no single knee can
+// be un-saturated everywhere; this one is chosen to sit AT the gentle site's mean
+// rather than far below both.
+inline constexpr int64_t kCurvatureKneeQ10 = kCurveQ10One;
 
 // --- WHY THE KNEE NEEDS A TIER NORMALISATION -------------------------------
 //

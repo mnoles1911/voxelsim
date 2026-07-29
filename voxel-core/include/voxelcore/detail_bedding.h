@@ -345,7 +345,16 @@ constexpr int64_t beddingRawAt(uint64_t seed, int64_t xMm, int64_t yMm, int64_t 
 // its 400mm-lattice/190mm-amplitude one, so 320mm is picked as a same-order-
 // of-magnitude starting amplitude for the 2D term -- NOT tuned by eye, and
 // NOT to be treated as final. Do not adjust without a real S2 measurement.
-inline constexpr int64_t kBeddingAmpMm = 320; // PROVISIONAL, see comment above
+// 320 -> 120, MEASURED. At 320 mm this term alone contributes **4.66x the whole
+// detail S2 budget** at the 0.4 m lag -- it was not one voice among several, it
+// was drowning the ladder it sits on. The S2 method gives a CEILING here rather
+// than a value (bedding is quasi-periodic and keyed on absolute elevation, so
+// its horizontal wavelength varies with local slope and it has no fixed lag,
+// which means S2 cannot distinguish it from an isotropic octave of the same
+// energy); that ceiling is 69-132 mm across the sites measured. 120 sits at the
+// top of the range, because the ceiling is the constraint and the term should be
+// as legible as the budget allows.                                [PROVISIONAL]
+inline constexpr int64_t kBeddingAmpMm = 120;
 
 // The 3D envelope: plan Phase 3d sets an overall |D(x,y,z)| <= 700mm budget
 // for stratigraphyAt's whole displacement, of which this bedding term is only
