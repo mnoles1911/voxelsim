@@ -998,16 +998,79 @@ static_assert(!kAmpUnscaled || kDetailGradCeilMmPerM == 2291,
 // calibration sweep against the three real exemplars (alpine, plains, and the
 // mislabelled "rolling" site); the sweep table and the chosen arm's costs are
 // in the v14 commit message.
-constexpr int64_t kDetailGradCapKQ10 = 768;      // 0.75 x carrier gradient
-constexpr int64_t kDetailGradFloorMmPerM = 250;  // the anti-terrace floor
+constexpr int64_t kDetailGradCapKQ10 = 512;      // 0.5 x carrier gradient
+constexpr int64_t kDetailGradFloorMmPerM = 100;  // minimum allowance once engaged
+// The fine tier takes its own floor -- see the engagement block below for why
+// the fine tier caps everywhere and what its floor defends.
+constexpr int64_t kFineDetailGradFloorMmPerM = 50;
 static_assert(kDetailGradCapKQ10 > 0 && kDetailGradCapKQ10 <= 1024,
               "k above 1.0 licenses detail steeper than the ground it decorates, which is "
               "the defect this cap exists to remove");
-static_assert(kDetailGradFloorMmPerM > 0,
-              "a zero floor deletes decimetre roughness on flats; that is the terrace "
-              "artifact the microrelief band was added to break up");
-static_assert(kDetailGradFloorMmPerM < kDetailGradCeilMmPerM,
+static_assert(kDetailGradFloorMmPerM > 0 && kFineDetailGradFloorMmPerM > 0,
+              "a zero floor deletes the ladder outright as slope tends to zero on engaged "
+              "ground; at 10 cm voxels that is the terrace artifact, back");
+static_assert(kDetailGradFloorMmPerM < kDetailGradCeilMmPerM &&
+                  kFineDetailGradFloorMmPerM < kDetailGradCeilMmPerM,
               "a floor at or above the ladder's own ceiling makes the cap a no-op");
+
+// THE ENGAGEMENT RAMP, and why a constant floor could not do the floor's job.
+// The drainage ladder (docs/measurements/drainage-ladder-v13-2026-07-29.txt)
+// splits the COARSE world by carrier grade: above ~25% the carrier is
+// perfectly drained and client detail destroys it -- cap here; below ~12% the
+// carrier cannot drain at 10 cm postings regardless, detail is the only thing
+// helping (plains carrier 99.0% stranded at 10 cm -> 97.5% with detail), and
+// the decimetre texture is the anti-terrace fix -- do not touch it.
+//
+// Those two jobs CANNOT be expressed as max(gradFloor, k * carrierGradient)
+// with a constant floor, and this was measured rather than argued: the plains
+// exemplar's post-gate ladder gradient is ~408 mm/m (material-band dominated),
+// so keeping its texture needs an allowance >= ~410 at 17 mm/m of slope, while
+// fixing the 20-25% rows needs an allowance <= ~200 at ten times the slope.
+// The required allowance is NON-MONOTONE in slope; no (k, floor) pair
+// produces that shape. The sweep that established it: floor 100 fixes the
+// steep half of the ladder (alpine 87.9% -> 0.0% stranded) and takes the
+// plains plateau fraction from 79.3% to 98.9% (the terrace artifact, back);
+// floor 350+ keeps the plateau and leaves every row from 20% grade up broken.
+// Exempting the material band instead (one obvious alternative) fails the
+// other way: with the two gated bands capped hard and the material band left
+// at 1.0x, alpine still strands 78.7% -- the decimetre band IS the pit field.
+//
+// THE RAMP ARGUMENT IS LANDFORM RELIEF, NOT SLOPE, and that too was measured
+// rather than reasoned into. A slope ramp was tried first and it fixed every
+// uniform class while leaving the two sites with incised valleys broken
+// (steepest 77.3%, third-class 67.0% stranded, against 26.0%/45.7% under the
+// unconditional cap): drainage is NON-LOCAL, every hillside's water exits
+// through a valley floor, and a slope-local exemption grants the outlet
+// itself full-amplitude detail -- a dam at the one place a dam strands the
+// whole catchment. relief30 tells a true plain (665 mm at the plains
+// exemplar; nothing within 30 m to drain into) from a valley floor (walls
+// inside the 30 m baseline read thousands of mm), which is exactly the
+// distinction the exemption needs, and it is the SAME per-cell slot.reliefMm
+// the v13 amplitude gate already reads -- no new seam class is introduced
+// (the gate itself shipped per-cell at v13, and the ramp is linear between
+// its ends rather than stepped). For uniform grades relief30 ~= grade x 30 m,
+// so the ramp ends below are the ladder's own 12% and 25% thresholds in
+// relief currency: 3600 mm and 7500 mm.
+//
+// ON A FINE-TIER WORLD THE CAP ENGAGES EVERYWHERE, with no exemption. The
+// flat exemption exists because the coarse carrier has NOTHING below 30 m and
+// synthetic decimetre texture is the only thing breaking up a dead-flat
+// plain. The baked fine tier carves sub-metre swales on exactly that ground
+// (BAKE_VERSION 4, profile_regional_p = 2.0): its plains carrier drains at
+// 19.1 m mean paths where the coarse one managed 4 cm, and the uncapped v13
+// ladder DEGRADES that to 3.7 m (94-97% stranded on all three baked
+// exemplars). Where the bake supplies structure at the client's own scales,
+// the client's job is to stay out of its way -- the plan's "complement, do
+// not add", showing up as a measurement. Tier-specific behaviour is house
+// style, not a compromise: kFineDetailOctaves and carrierCurvatureTierNormQ10
+// exist for the same reason.
+constexpr int64_t kDetailCapReliefLoMm = 3600;
+constexpr int64_t kDetailCapReliefHiMm = 7500;
+static_assert(kDetailCapReliefLoMm > 0 && kDetailCapReliefLoMm < kDetailCapReliefHiMm,
+              "the ramp must have positive width; its width divides");
+static_assert(reliefScaleQ10(kDetailCapReliefLoMm) < kReliefScaleMaxQ10,
+              "the ramp's low end should sit below the relief gate's saturation, or the "
+              "exemption never varies where the gate does");
 
 // ---------------------------------------------------------------------------
 // Couplings for the MIRROR bounds: Amplifier::surfaceLowerBoundMm and
@@ -1431,10 +1494,36 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     const int64_t detailGradMmPerM = gradLand * rScale / 1024 * cScale / 1024 +
                                      gradMetre * rScale / 1024 * cScaleMicro / 1024 +
                                      gradMicro * cScaleMicro / 1024;
-    int64_t allowedGradMmPerM = kDetailGradCapKQ10 * slopeMmPerM / 1024;
-    if (allowedGradMmPerM < kDetailGradFloorMmPerM) allowedGradMmPerM = kDetailGradFloorMmPerM;
-    if (detailGradMmPerM > allowedGradMmPerM)
-        detailMm = detailMm * allowedGradMmPerM / detailGradMmPerM;
+    // Engagement first: full on a fine world, ramped on the coarse one --
+    // exactly zero below the ramp so flat coarse classes are bit-for-bit v13,
+    // saturating to full above it. The branches keep every divide's numerator
+    // non-negative.
+    int64_t engageQ10 = 1024;
+    if (!fine) {
+        if (slot.reliefMm >= kDetailCapReliefHiMm) {
+            engageQ10 = 1024;
+        } else if (slot.reliefMm > kDetailCapReliefLoMm) {
+            engageQ10 = (slot.reliefMm - kDetailCapReliefLoMm) * 1024 /
+                        (kDetailCapReliefHiMm - kDetailCapReliefLoMm);
+        } else {
+            engageQ10 = 0;
+        }
+    }
+    if (engageQ10 > 0) {
+        const int64_t gradFloor = fine ? kFineDetailGradFloorMmPerM : kDetailGradFloorMmPerM;
+        int64_t allowedGradMmPerM = kDetailGradCapKQ10 * slopeMmPerM / 1024;
+        if (allowedGradMmPerM < gradFloor) allowedGradMmPerM = gradFloor;
+        if (detailGradMmPerM > allowedGradMmPerM) {
+            // Full-engagement scale, then blended toward 1.0 by the ramp. The
+            // truncation in the blend rounds the scale UP (less capping), so
+            // the result stays in (capQ10, 1024] -- never zero, never above
+            // one -- and the divide below is the only signed one: truncDiv in
+            // the HLSL mirror, never floorDiv.
+            const int64_t capQ10 = allowedGradMmPerM * 1024 / detailGradMmPerM;
+            const int64_t scaleQ10 = 1024 - engageQ10 * (1024 - capQ10) / 1024;
+            detailMm = detailMm * scaleQ10 / 1024;
+        }
+    }
 
     SurfaceEval s;
     s.px = px;
