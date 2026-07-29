@@ -552,3 +552,167 @@ def test_v2_golden_flow_fixture_decodes():
     assert (tile.flow & tc.FLOW_BIT_DEPOSITION).any()
     assert (tile.flow == 0xFF).any()
     assert (tile.flow & tc.FLOW_LOG2_MASK).max() <= 31
+
+
+# ------------------------------------------------- bake surface -> v2 bytes ---
+#
+# `encode_fine` is the step that did not exist until 2026-07-29, and its absence
+# is why no fine tile had ever been produced end-to-end: `encode_v2` starts from
+# a control lattice and a `BakeResult` is a field of SAMPLES. These tests pin the
+# two things that step can silently get wrong -- skipping the prefilter, and
+# picking a datum the tile does not fit in.
+
+
+def _bumpy_samples(size: int, offset_m: float = 1200.0) -> np.ndarray:
+    """A sample field with real content at the Nyquist, where the prefilter bites."""
+    yy, xx = np.mgrid[0:size, 0:size]
+    return (
+        offset_m
+        + 40.0 * np.sin(xx / 7.0)
+        + 25.0 * np.cos(yy / 5.0)
+        + 3.0 * ((-1.0) ** (xx + yy))
+    ).astype(np.float32)
+
+
+def test_encode_fine_ships_control_points_not_samples():
+    """The one shortcut that decodes perfectly and is still wrong.
+
+    Writing the bake's samples straight into the cp plane produces a valid file;
+    the client's spline then renders a LOW-PASSED version of it. So the check is
+    not "does it round-trip" (it would either way) but "does evaluating the
+    shipped lattice give the surface back". At a lattice point the §8 weights are
+    (1,4,1,0)/6 per axis, so that evaluation is a separable [1,4,1]/6 stencil.
+    """
+    pytest.importorskip("scipy")
+    size = 256
+    z = _bumpy_samples(size)
+    data = tc.encode_fine(seed=7, x=-5, y=3, elevation_m=z, block_log2=7)
+    tile = tc.decode_v2(data)
+
+    cp_mm = tc.control_points_to_mm(tile.elevation_cp, tile.base_offset_mm, tile.quant)
+
+    def smooth(a):
+        p = np.pad(a.astype(np.float64), ((1, 1), (0, 0)), mode="edge")
+        return (p[:-2] + 4.0 * p[1:-1] + p[2:]) / 6.0
+
+    recon = smooth(smooth(cp_mm).T).T
+    err = np.abs(recon[2:-2, 2:-2] - z[2:-2, 2:-2].astype(np.float64) * 1000.0)
+    # Quantisation is the floor: a convex combination of three cp each rounded
+    # to +-50 mm cannot do better, and the measured interior is well inside it.
+    assert err.max() < tc.QUANT_MM[tile.quant], err.max()
+
+    # ...and the test has power: the un-prefiltered path fails it badly.
+    naive = tc.mm_to_control_points(
+        np.rint(z.astype(np.float64) * 1000.0).astype(np.int64),
+        tile.base_offset_mm, tile.quant,
+    )
+    naive_recon = smooth(smooth(
+        tc.control_points_to_mm(naive, tile.base_offset_mm, tile.quant)
+    ).T).T
+    naive_err = np.abs(naive_recon[2:-2, 2:-2] - z[2:-2, 2:-2].astype(np.float64) * 1000.0)
+    assert naive_err.max() > 20 * err.max(), (naive_err.max(), err.max())
+
+
+def test_encode_fine_carries_flow_and_bake_version():
+    pytest.importorskip("scipy")
+    from terrain_service.bake.pipeline import BAKE_VERSION
+
+    size = 128
+    z = _bumpy_samples(size)
+    flow = np.arange(size * size, dtype=np.uint8).reshape(size, size)
+    tile = tc.decode_v2(
+        tc.encode_fine(seed=11, x=2, y=-4, elevation_m=z, flow=flow, block_log2=6)
+    )
+    assert tile.bake_ver == BAKE_VERSION
+    assert tile.flow is not None and np.array_equal(tile.flow, flow)
+    assert tile.x == 2 and tile.y == -4 and tile.scale == tc.FINE_SCALE
+
+    no_flow = tc.decode_v2(
+        tc.encode_fine(seed=11, x=2, y=-4, elevation_m=z, block_log2=6)
+    )
+    assert no_flow.flow is None
+
+
+def test_choose_datum_prefers_100mm_and_falls_back_before_clipping():
+    # A 3 km alpine tile: comfortably inside int16 at one voxel per LSB.
+    base, quant = tc.choose_datum(0, 3_000_000)
+    assert quant == tc.QUANT_100MM
+    assert base % tc.DATUM_STEP_MM == 0
+    # Abyssal seafloor to alpine summit in one tile: 100 mm cannot span it.
+    base, quant = tc.choose_datum(-5_000_000, 3_000_000)
+    assert quant == tc.QUANT_250MM
+    for lo, hi in ((0, 3_000_000), (-5_000_000, 3_000_000)):
+        q = tc.QUANT_MM[tc.choose_datum(lo, hi)[1]]
+        b = tc.choose_datum(lo, hi)[0]
+        assert -32768 <= round((lo - b) / q) and round((hi - b) / q) <= 32767
+    with pytest.raises(ValueError, match="does not fit int16"):
+        tc.choose_datum(-9_000_000, 9_000_000)
+
+
+def test_encode_fine_rejects_a_mismatched_flow_plane():
+    pytest.importorskip("scipy")
+    z = _bumpy_samples(64)
+    with pytest.raises(ValueError, match="does not match elevation"):
+        tc.encode_fine(seed=1, x=0, y=0, elevation_m=z, block_log2=6,
+                       flow=np.zeros((32, 32), np.uint8))
+
+
+def test_pregen_can_reach_the_fine_encoder():
+    """`pregen._encode_fine` probes tile_codec by NAME and passes only the
+    kwargs the encoder declares. It found `encode_v2`, could not synthesise its
+    `tile` argument, and raised -- so `--mode bake` had no path to bytes at all.
+    This asserts the probe now lands on something it can actually call."""
+    pytest.importorskip("scipy")
+    from terrain_service import pregen
+
+    # 256, because pregen passes no block_log2 and the default block edge is 256.
+    class _R:
+        tile_x, tile_y = -5, 3
+        elevation_m = _bumpy_samples(256)
+        flow = np.zeros((256, 256), np.uint8)
+
+    data = pregen._encode_fine(_R(), seed=99, provider_id="test")
+    tile = tc.decode_v2(data)
+    assert tile.seed == 99 and tile.x == -5 and tile.y == 3
+    assert tile.flow is not None
+
+
+def test_flow_plane_blocks_pick_raw_when_it_is_smaller():
+    """A uint8 plane costs TWO bytes per pixel as CODED residuals and one as
+    RAW, so CODED is never right for it under CODEC_RAW and (measured on a real
+    baked flow plane) not right under zstd either. The elevation plane must be
+    untouched by this: its resid_bits=32 path is only reachable because CODED
+    wins the tie there."""
+    size, block_log2 = 32, 4
+    cp = _smooth_field(size)
+    yy, xx = np.mgrid[0:size, 0:size]
+    flow = ((xx * 3 + yy * 7) % 251).astype(np.uint8)
+    flow[0:16, 0:16] = 0  # still CONSTANT: free beats both
+    data = tc.encode_v2(
+        tc.TileV2(seed=3, x=0, y=0, size=size, elevation_cp=cp,
+                  block_log2=block_log2, flow=flow)
+    )
+    np.testing.assert_array_equal(tc.decode_v2(data).flow, flow)
+
+    off = tc._HEADER.size + tc._V2_EXT.size
+    table = [tc._SECTION_ENTRY.unpack_from(data, off + i * tc._SECTION_ENTRY.size)
+             for i in range(4)]
+    bs = 1 << block_log2
+    nb = size // bs
+
+    flow_off = next(o for sid, o, _l in table if sid == tc.SECTION_FLOW_INDEX)
+    flow_modes, flow_bytes = [], 0
+    for i in range(nb * nb):
+        e = tc._BLOCK_ENTRY.unpack_from(data, flow_off + i * tc._BLOCK_ENTRY.size)
+        flow_modes.append(e[2])
+        flow_bytes += e[1]
+    assert tc.MODE_CONSTANT in flow_modes
+    assert tc.MODE_CODED not in flow_modes
+    assert flow_bytes == 3 * bs * bs  # 1 byte/px over the three non-flat blocks
+
+    elev_off = next(o for sid, o, _l in table if sid == tc.SECTION_ELEV_INDEX)
+    elev_modes = {
+        tc._BLOCK_ENTRY.unpack_from(data, elev_off + i * tc._BLOCK_ENTRY.size)[2]
+        for i in range(nb * nb)
+    }
+    assert tc.MODE_RAW not in elev_modes, "the int16 plane must not auto-select RAW"
