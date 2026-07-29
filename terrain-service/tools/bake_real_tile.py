@@ -37,6 +37,74 @@ of sub-tiles. It exists so a box that cannot afford the production domain can
 still produce real bytes -- and every report this tool prints names the geometry
 it actually ran, because "measured at 1/16 the area and quoted as production" is
 the failure mode the plan's own numbers already suffered from.
+
+FIRST REAL RESULTS (2026-07-29, full 8192^2 + 960 m apron, CPU only)
+--------------------------------------------------------------------
+Three real diffusion tiles, each with a complete 3x3 coarse ring, seed
+0x135276f, bake fingerprint 475fab2f588004c6, stream_K 0.15, a_crit 1e4 m^2.
+zstd-19 over the actual block payloads; the `.vxtl` on disk is CODEC_RAW.
+
+    tile              relief   bake cpu   peak WS   zstd MB   KB/km^2   elev-only
+    (-5,2) alpine     1571 m    150.6 s   5.54 GiB    22.62      93.6      16.85
+    (-5,3) mixed      2862 m    144.2 s   5.54 GiB    23.13      95.7      16.54
+    (-7,4) OCEAN      2257 m    135.7 s   5.53 GiB    28.35     117.3      19.44
+
+Against the estimates on record:
+
+    quantity        plan says   vxtl-v2 spec says   MEASURED       verdict
+    size/tile        ~8 MB        21-25 MB          22.6-28.4 MB   spec right
+    KB/km^2          ~34          ~106              93.6-117.3     spec right
+    bake cpu/tile    ~1.5 s       ~165 CPU-s        136-173 CPU-s  spec right
+    peak memory      ~0.5 GB      ~3 GB (counted)   5.5-5.9 GB     BOTH LOW
+
+The plan's 8 MB / 34 KB/km^2 was measured on the 4096^2 / 3.75 m tier
+(`measure_fine_tier_size.py` is still hard-coded to SCALE=8), and the shipped
+tier is 8192^2 / 1.875 m over the SAME ground -- 4x the samples. It is not a
+missed estimate, it is a superseded one; `vxtl-v2-format.md` already replaced it
+and the replacement is accurate.
+
+Peak memory is the one nobody has right. `estimate_peak_bytes` counts 9 named
+grids and says 3.16 GiB; the OS says 5.54 GiB resident / 5.70 GiB committed,
+1.75x more, and the excess is the kernels' own transients (the priority flood's
+queue, MFD's ordering, float64 accumulation). Size a bake pod on 8 GiB, not 4.
+
+The bake is deterministic: tile (-5,2) baked twice on a contended box produced a
+byte-identical control-point plane (sha256 bcf53bfd...). Its CPU total moved
+150.6 -> 172.9 s between the two runs, which is worth knowing -- CPU-seconds are
+immune to STOLEN wall time but not to memory-bandwidth contention, so +-15% is
+the resolution of this measurement even in the contention-robust unit.
+
+THE OCEAN CASE IS THE OPPOSITE OF WHAT THE FORMAT ASSUMES
+---------------------------------------------------------
+`vxtl-v2-format.md` §4 on CONSTANT blocks: "Zero data bytes. Common: ocean, flat
+basin." On tile (-7,4), which is 100% ocean by every measure `rank_tiles.py`
+has (0.0% land, -4654 m to -2405 m, p95 grade 0.0% at 30 m):
+
+    CONSTANT blocks: 0 of 1024.
+    flattest 256x256 block spans 14.3 m of relief; the median spans 56.7 m.
+    the tile is the LARGEST of the three at 28.35 MB, not ~0.1 MB.
+
+Two independent reasons, and neither is a bug in the codec:
+
+1. **This "ocean" is bathymetry, not a water plane.** The diffusion model emits
+   real seafloor with 2.26 km of relief in one tile; adjacent control points
+   120 m apart differ by 7.4 m at the median. A CONSTANT block needs 65,536
+   control points equal to within 100 mm across 480 m. Dropping to `quant`
+   250 mm does not rescue it -- the flattest block would still span 57 LSB.
+2. **The bake erodes below sea level.** Nothing in the pipeline gates on z < 0,
+   so priority-flood, MFD, stream power and thermal relaxation all run on the
+   seafloor. The result on (-7,4) is 26.6 M cells flagged as channel (39.7% of
+   the tile, against 4.1% on the alpine tile) and 0.87 m of MEAN incision
+   (against 0.13 m alpine) -- subaerial fluvial erosion at 3 km depth. That
+   invented high-frequency detail is why the ocean tile costs MORE than the
+   mountains: 19.44 MB of elevation against 16.85, and 8.88 MB of flow plane
+   against 5.75.
+
+The second is a bake-physics question, not a codec one: a sea-level gate would
+roll `BakeConstants`, hence the fingerprint, hence provider_id and the world, so
+it is deliberately NOT done here. But it is the single largest storage lever
+found so far -- an ocean-majority world currently pays full price per tile for
+drainage networks no player can reach.
 """
 from __future__ import annotations
 
