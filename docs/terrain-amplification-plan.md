@@ -1,6 +1,8 @@
 # Terrain amplification redesign — 30 m diffusion tiles → 10 cm voxels
 
-**Status:** planned and approved (Matt, 2026-07-28). Phase 0 is landed; Phases 1–4 are not started.
+**Status:** planned and approved (Matt, 2026-07-28). **Phases 0 and 1 are LANDED** on
+`claude/terrain-amplification-redesign` (`0e55c4c`, `cf9aa46`, `e9fb524`) — worldgen is at v9,
+`ctest` is green, and `vxc_gpu` passes bit-exact on AMD. Phases 2–4 are not started.
 **Supersedes the park decision** in `docs/terrain-amplification-reconciliation.md` — see
 "How this unparks the 2026-07-24 proposal" below.
 
@@ -394,23 +396,56 @@ Run: `vxc_terrainprobe <tiledir> 20260719 -84480 53760 2000`
 
 ### Phase 0 baselines, measured 2026-07-28 on real tiles (v8)
 
-| Metric | Baseline | Target |
-|---|---|---|
-| Seam ratio, carrier only | 8× @0.1 m → 950× @12.8 m (interior floor 0.48 mm) | < 1.2 at all lags |
-| Seam ratio, amplified | 3.28 / 1.61 / 1.23 @ 0.1 / 0.2 / 0.4 m | < 1.2 at all lags |
-| Gain step (envelope) | median 150–310 mm, p90 770–1075 mm, max 2302 mm | ~0 (continuous by construction) |
-| Directional across/along | 0.97–1.00 (isotropic) | > 1 on ≥20% grades, ≈1 on flats |
-| `S2` local H @0.1–0.2 m | **1.404** (still too smooth at the finest lag) | H ∈ [0.6, 1.0] at every decade 0.1 m → 3.75 m |
-| Terrace runs | mean 2.71 vox, 0.5% in runs ≥20 vox | no regression |
-| 2-D plateaus | area-weighted mean 146.7 vox, 7.3% in ≥400-vox plateaus | no regression |
+| Metric | v8 baseline | **v9 measured** | Target |
+|---|---|---|---|
+| Seam ratio, carrier only | 8× @0.1 m → 950× @12.8 m (interior floor 0.48 mm) | **0.86–1.26, no trend in lag** | < 1.2 at all lags |
+| Seam ratio, amplified | 3.28 / 1.61 / 1.23 @ 0.1 / 0.2 / 0.4 m | **1.09 / 1.03 / 1.00** (max 1.09 at any lag) | < 1.2 at all lags |
+| Gain step (envelope) | median 150–310 mm, p90 770–1075, max 2302 | **median 0 mm, p90 7, max 14 — and the mid-cell control reads the same** | ~0 (continuous by construction) |
+| Material boundaries on the grid | **89.1%** (49 of 55, vs 1.0% by chance = 89× excess) | **0.0%** (0 of 28) | ≈ chance |
+| Directional across/along | 0.97–1.00 (isotropic) | 0.95–1.00 (unchanged — Phase 3 owns this) | > 1 on ≥20% grades |
+| `S2` local H @0.1–0.2 m | 1.404 | unchanged (Phase 3 owns this) | H ∈ [0.6, 1.0] per decade |
+| Terrace runs | mean 2.71 vox, 0.5% in runs ≥20 | mean 2.76, 0.1% | no regression |
 
-Note the v2 octave work already fixed most of the terracing — the remaining smooth-band defect is
-confined to the 0.1–0.2 m lag, plus a spectral dip at 3.2 m (local H = 0.348).
+The carrier-only residual of ~1.2 at 1.6–12.8 m lags is **not** a crease: it is flat in lag,
+whereas a slope discontinuity grows linearly with lag (v8 went 8→950 by doubling). It is the
+C² spline's own curvature variation near knots, and the amplified surface — what is actually
+rendered — stays at ≤1.09 everywhere.
+
+The v2 octave work already fixed most of the terracing; the remaining smooth-band defect is
+confined to the 0.1–0.2 m lag, plus a spectral dip at 3.2 m (local H = 0.348). **Phase 3 owns
+both**, along with the still-isotropic roughness.
+
+Cross-checked with `vxc_climateprobe` on real tiles that the mm/px → mm/m change is a pure unit
+conversion and not a retune: median slope 7000 mm/px → 233 mm/m and the cliff gate 21000 → 700,
+both exactly ÷30, with the biome census unchanged (OCEAN, GRASSLAND and BARE_ROCK identical to
+the column; everything else differs by ≤4 columns in 147,456, i.e. 0.003%).
 
 ### Other gates
 
 - **Determinism:** `vxc_gpu` digest parity on AMD and NVIDIA every phase; Phase 4 must compare the
   full `VoxelizeMain` cell buffer, since that pass now hashes per voxel.
+
+  > **Read this before trusting a `vxc_gpu` result.** Two traps were found and fixed in Phase 1,
+  > and both made the gate report something other than what it was testing.
+  >
+  > 1. **`vxc_gpu` loads `voxel-core/shaders/prebuilt/`, not `build/shaders/`.**
+  >    `tools/compile-shaders.ps1` used to write only the latter, so editing the shader and
+  >    re-running the gate compared *months-old bytecode* against fresh CPU code. The script now
+  >    takes `-UpdatePrebuilt` and warns loudly when the two differ. The prebuilt `.spv` are
+  >    **committed artifacts** — respin and commit them with any shader change.
+  > 2. **The harness never set `params.CoarseScale`**, which is a multiplier (level 0 = 1, not 0),
+  >    so every column in every dispatch evaluated at world origin. It hid because
+  >    `rasterElevationMm` clamps to each region's window, so the wrong answer still varied per
+  >    region. `validateWorldGenParams` now rejects 0. Consequence while it was broken: the mesh
+  >    chain had nothing to emit, so the gate reported "0 quads" and the greedy mesher was never
+  >    compared at all.
+  >
+  > The gate now reports **total** mismatches and the share of columns affected (the printed list
+  > is still capped at 20 — previously the cap *was* the reported number, so 49,141 mismatches
+  > across 100% of columns printed as "20"), a per-region breakdown, and a per-region first-column
+  > dump. It also has a third fixture region at **all-positive** coordinates; there was none
+  > before, which is why "it only breaks at negative coordinates" stayed plausible for as long as
+  > it did.
 - **Bounds:** adversarial sweep of real columns against the new `surfaceUpperBoundMm` /
   `solidBelowBoundMm` every phase. A bound violation is a hole in the world.
 - **Codec:** golden fine tiles encoded in Python, decoded by the C++ parser, digest-compared; plus
