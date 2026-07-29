@@ -49,3 +49,12 @@ tile-cache-*.tar.gz
 # Bake/probe artifacts: large float32 dumps, never committed (see bake_prototype.py --npy)
 *.npy
 bake_out.npy
+
+# Stage-by-stage heightfield dumps (vxc_stagedump +
+# terrain-service/tools/dump_stage_heightfields.py). One run is hundreds of MB
+# of .npy plus its JSON sidecars, and the cached 8192^2 bake interior alone is
+# 268 MB. The TOOLS are the deliverable; the dumps are regenerated from the seed
+# in minutes. A 67 MB .npy was committed to this repo once already and had to be
+# amended out of history — the sidecars are ignored too so a `git add -A` can
+# never bring half a dump in.
+stage-dumps/

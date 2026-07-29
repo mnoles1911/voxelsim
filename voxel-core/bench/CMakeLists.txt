@@ -20,6 +20,18 @@ if(NOT MSVC)
   target_compile_options(vxc_terrainprobe PRIVATE -Wall -Wextra -Werror)
 endif()
 
+# --- vxc_stagedump: STAGE-BY-STAGE observability for the amplification
+# pipeline. Dumps the client half (S2 carrier-only / S3 continuous surface /
+# S4 voxelised) as float32 .npy + JSON sidecars over one world rectangle, at
+# both the 30 m coarse tier and the 1.875 m baked fine tier, so a defect can be
+# localised to a stage instead of only seen at the end. terrain-service/tools/
+# dump_stage_heightfields.py writes S0/S1 in the same shape. ------------------
+add_executable(vxc_stagedump stagedump.cpp)
+target_link_libraries(vxc_stagedump PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_stagedump PRIVATE -Wall -Wextra -Werror)
+endif()
+
 # --- vxc_climateprobe: climate/biome/stratigraphy diagnostic. Channel
 # percentiles in u8 AND physical units, biome census WITH gate attribution,
 # topsoil depth, and the top-voxel material histogram -- the numeric readout
