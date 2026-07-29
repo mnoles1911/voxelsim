@@ -13,6 +13,7 @@ add_executable(vxc_tests
   test_mips.cpp
   test_raycast.cpp
   test_tilestore.cpp
+  test_tilestreaming.cpp
   test_counters.cpp
   test_waterca.cpp
   test_connectivity.cpp

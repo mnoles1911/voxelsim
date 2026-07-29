@@ -515,6 +515,14 @@ const FineTile* FineTileSampler::findTile(int32_t tx, int32_t ty) const {
     return it == tiles_.end() ? nullptr : &it->second.tile;
 }
 
+bool FineTileSampler::unloadTile(int32_t tx, int32_t ty) {
+    const bool erased = tiles_.erase(tileKey(tx, ty)) > 0;
+    if (erased && tiles_.empty()) {
+        tileSize_ = 0; // no tile left to justify the stride; see the header comment
+    }
+    return erased;
+}
+
 size_t FineTileSampler::residentBlockCount() const {
     size_t n = 0;
     for (const auto& kv : tiles_) n += kv.second.blocks.size();
