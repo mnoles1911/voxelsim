@@ -1,6 +1,7 @@
 #include "VoxelPerfRunSubsystem.h"
 
 #include "VoxelDebug.h"
+#include "VoxelSkySubsystem.h" // FVoxelSkyState / VoxelSky::GetTimeScale -- the sun pose this run was measured at
 #include "VoxelWorldSubsystem.h"
 
 #include "Engine/World.h"
@@ -94,6 +95,68 @@ void ArmExitWatchdog(double TimeoutSec)
 	bArmed = true;
 	FVoxelExitWatchdog* Watchdog = new FVoxelExitWatchdog(TimeoutSec);
 	FRunnableThread::Create(Watchdog, TEXT("VoxelPerfExitWatchdog"), 0, TPri_Normal);
+}
+
+// ---------------------------------------------------------------------------
+// SKY READ-BACK HELPERS.
+//
+// FVoxelSkyState reports the clock as LocalHours (0..24) and DayOfYear (0..365)
+// because those are what the ephemeris computes. Both the periodic log line and
+// the summary JSON want the two forms a HUMAN pins a leg with -- HH:MM and
+// MM-DD -- so a recorded leg can be replayed by pasting its own numbers back
+// into -VoxelTimeOfDay= / -VoxelDate= without arithmetic in between.
+//
+// THE MONTH TABLE IS A DUPLICATE, AND THAT IS A KNOWN DEBT. The original is
+// VoxelSkySubsystem.cpp:271-275 (kDaysBeforeMonth/kDaysInMonth), where it sits
+// in an anonymous namespace and is therefore unreachable from here. It is
+// copied rather than exported ONLY because VoxelSkySubsystem.cpp is under
+// concurrent edit as this lands; the correct end state is a
+// VoxelSky::MonthDayFromDayOfYear accessor beside GetTimeScale in
+// VoxelSkySubsystem.h and this copy deleted. If the two ever disagree the
+// symptom is a JSON date one day off from the one the sky log printed, which
+// is exactly the kind of small discrepancy that gets rationalised instead of
+// fixed -- so: REFERENCE YEAR 2000, A LEAP YEAR, February has 29 days.
+constexpr int32 kPerfDaysBeforeMonth[12] = {0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335};
+constexpr int32 kPerfDaysInMonth[12] = {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+
+void PerfMonthDayFromDayOfYear(int32 DayOfYear, int32& OutMonth, int32& OutDay)
+{
+	const int32 Doy = FMath::Clamp(DayOfYear, 0, 365);
+	for (int32 M = 0; M < 12; ++M)
+	{
+		if (Doy < kPerfDaysBeforeMonth[M] + kPerfDaysInMonth[M])
+		{
+			OutMonth = M + 1;
+			OutDay = Doy - kPerfDaysBeforeMonth[M] + 1;
+			return;
+		}
+	}
+	OutMonth = 12;
+	OutDay = Doy - kPerfDaysBeforeMonth[11] + 1;
+}
+
+// Truncates rather than rounds, so 11:59.9 never prints as 12:00 -- a capture
+// labelled "noon" that was taken a minute either side of it is the sort of
+// rounding that makes two legs look identical when their sun angles are not.
+void PerfClockFromLocalHours(double LocalHours, int32& OutHour, int32& OutMinute)
+{
+	const double Hours = FMath::Clamp(LocalHours, 0.0, 24.0);
+	OutHour = FMath::Clamp((int32)Hours, 0, 23);
+	OutMinute = FMath::Clamp((int32)((Hours - (double)OutHour) * 60.0), 0, 59);
+}
+
+// THE EFFECTIVE clock rate, which is not the same question as "what is
+// voxel.Sky.TimeScale". voxel.Sky.Enabled 0 freezes the clock no matter what
+// TimeScale says (UVoxelSkySubsystem::Tick, VoxelSkySubsystem.cpp:1042-1053),
+// so reporting the raw cvar would put "timeScale: 1.0" in the artifact for a
+// run whose sun never moved -- a reader would then throw out a perfectly good
+// frozen-sun leg. FVoxelSkyState::bClockRunning is the state's own answer to
+// "did the clock advance this frame", so it is what gates the number, per
+// VoxelGpuVerify.cpp:2118-2126's rule that an instrument reports state and
+// never intent.
+float EffectiveSkyTimeScale(const FVoxelSkyState& State)
+{
+	return State.bClockRunning ? VoxelSky::GetTimeScale() : 0.f;
 }
 } // namespace
 
@@ -262,6 +325,21 @@ void UVoxelPerfRunSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 			LingerSec = LingerSecValue;
 		}
 
+		// -VoxelPerfLogInterval=, the SAME switch and the SAME 5 s default and
+		// 0.25 s floor FVoxelWorldImpl::MaybeLogCounters applies
+		// (VoxelWorldSubsystem.cpp:5019-5024). Read here rather than shared
+		// through a header because it is four lines and a cross-subsystem
+		// accessor for a command-line scalar is more coupling than the
+		// duplication costs -- but the two MUST stay equal, because
+		// tools/voxel-leg-summary.ps1 pairs sky windows with streaming windows
+		// positionally and a sky line on its own cadence would silently
+		// misalign that pairing.
+		float LogIntervalValue = 5.f;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfLogInterval="), LogIntervalValue))
+		{
+			SkyLogIntervalSec = FMath::Max(0.25f, LogIntervalValue);
+		}
+
 		// Four-way, not the two-way it used to be: with only
 		// underground-vs-"everything else" the static flight silently logged
 		// itself as "surface" here (though never in the FinishRun JSON, which
@@ -379,6 +457,21 @@ void UVoxelPerfRunSubsystem::Tick(float DeltaTime)
 		BudgetSaturationAccum += Subsystem->GetPerfSnapshot().BudgetSaturationPct;
 		++BudgetSaturationSamples;
 	}
+
+	// The sun, per window, for the WHOLE leg -- preflight and linger included,
+	// exactly like the streaming counters, because the sun does not stop moving
+	// when the flight path does and a shadow cache busted during preflight is
+	// busted for the frames after it too.
+	//
+	// WHY A PER-WINDOW LINE AND NOT JUST THE SUMMARY JSON. FinishRun records ONE
+	// sun pose (the last one). That is sufficient to compare two FROZEN legs and
+	// insufficient to characterise a moving one: a leg that swept 40 degrees of
+	// altitude and a leg that never moved can finish at the same angle, and the
+	// artifact would then say the two runs were taken at the same sun. This line
+	// is the sweep itself, on the record, and tools/voxel-leg-summary.ps1 turns
+	// it into a first->last range so "the sun moved" is a column rather than an
+	// assumption.
+	MaybeLogSky(DeltaTime);
 
 	ElapsedSeconds += DeltaTime;
 	// Bracketed by PreflightSec and LingerSec (both default 0, i.e. no change
@@ -637,6 +730,47 @@ void UVoxelPerfRunSubsystem::StepFlightPath(float DeltaTime)
 	}
 }
 
+void UVoxelPerfRunSubsystem::MaybeLogSky(float DeltaTime)
+{
+	SkyLogAccumSec += DeltaTime;
+	if (SkyLogAccumSec < SkyLogIntervalSec)
+	{
+		return;
+	}
+	SkyLogAccumSec = 0.f;
+
+	UWorld* World = GetWorld();
+	UVoxelSkySubsystem* Sky = World ? World->GetSubsystem<UVoxelSkySubsystem>() : nullptr;
+	if (!Sky)
+	{
+		// No line at all rather than a zeroed one. A "tod=00:00 sunAlt=0.00"
+		// line from a world with no sky subsystem is indistinguishable from a
+		// real midnight-at-the-horizon reading, and the summariser would report
+		// it as a sun pose. An ABSENT column reads as "this leg predates the
+		// instrument", which is the truth.
+		return;
+	}
+
+	const FVoxelSkyState& S = Sky->GetSkyState();
+	int32 Hour = 0, Minute = 0;
+	PerfClockFromLocalHours(S.LocalHours, Hour, Minute);
+	int32 Month = 1, Day = 1;
+	PerfMonthDayFromDayOfYear(S.DayOfYear, Month, Day);
+
+	// lightUpdates is the count of times the rig's rotation was ACTUALLY
+	// written (voxel.Sky.ShadowUpdateHz caps it -- FVoxelSkyState:108-112), and
+	// it is the number that matters for the frozen-vs-moving question: it is
+	// the rate at which UE's cached whole-scene shadow setup was invalidated.
+	// A leg with timeScale != 0 but lightUpdates flat across the whole log has
+	// a broken cadence cap, not a frozen sun, and those two are otherwise
+	// indistinguishable from the frame times alone.
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel sky (%.0fs window): tod=%02d:%02d sunAlt=%.2f sunAz=%.2f timeScale=%.3f date=%02d-%02d ")
+	       TEXT("sunUp=%d lightUpdates=%lld"),
+	       SkyLogIntervalSec, Hour, Minute, S.SunAltitudeDeg, S.SunAzimuthDeg, EffectiveSkyTimeScale(S), Month, Day,
+	       S.bSunUp ? 1 : 0, (long long)S.LightUpdates);
+}
+
 void UVoxelPerfRunSubsystem::FinishRun()
 {
 	bFinished = true;
@@ -688,6 +822,65 @@ void UVoxelPerfRunSubsystem::FinishRun()
 		}
 	}
 
+	// --- SKY STATE, READ BACK FROM THE SUBSYSTEM ------------------------------
+	//
+	// Read from UVoxelSkySubsystem::GetSkyState() rather than from the command
+	// line, so the artifact records what the run USED rather than what it was
+	// asked for. That distinction is not pedantic here: the calendar quantises
+	// the request (VoxelSkySubsystem.cpp:317-331 -- reachable dates are 7.6 real
+	// days apart at the default DaysPerYear), so -VoxelDate=06-21 does not
+	// generally produce 21 June, and a leg recorded from its switches would
+	// claim a date the sun was never at.
+	FVoxelSkyState SkyState;
+	bool bHaveSky = false;
+	if (UWorld* World = GetWorld())
+	{
+		if (UVoxelSkySubsystem* Sky = World->GetSubsystem<UVoxelSkySubsystem>())
+		{
+			SkyState = Sky->GetSkyState();
+			bHaveSky = true;
+		}
+	}
+	const float SkyTimeScale = EffectiveSkyTimeScale(SkyState);
+	int32 SkyHour = 0, SkyMinute = 0;
+	PerfClockFromLocalHours(SkyState.LocalHours, SkyHour, SkyMinute);
+	int32 SkyMonth = 1, SkyDay = 1;
+	PerfMonthDayFromDayOfYear(SkyState.DayOfYear, SkyMonth, SkyDay);
+
+	// Fixture-validity evidence, same shape and same purpose as the
+	// underground-fraction warning above: state the way this run could fail to
+	// mean what its label says, in the run's own log, rather than leaving it to
+	// be noticed.
+	//
+	// A MOVING SUN IS NOT A SMALL EFFECT ON THIS DRAW PATH. A movable
+	// directional light that has not rotated since spawn lets the renderer keep
+	// its cached whole-scene shadow setup; a sun that rotates re-renders the
+	// resident geometry into every cascade it touches. docs/backlog.md §0's
+	// shadowGather=0 / ~1.03 gathers-per-frame baseline was taken with a sun
+	// frozen since spawn, so it does not transfer to a day/night run -- and
+	// worse, a leg that spans a sunrise is not even comparable to ITSELF
+	// end-to-end, because the cost changes underneath the average.
+	if (SkyTimeScale != 0.f)
+	{
+		UE_LOG(LogVoxelPerf, Warning,
+		       TEXT("VoxelPerfRun: voxel.Sky.TimeScale=%.3f -- THE SUN MOVED DURING THIS LEG (%02d:%02d at exit, ")
+		       TEXT("sunAlt=%.2f deg, %lld light updates). These frame times are an average over a CHANGING ")
+		       TEXT("shadow-cache state and are not comparable against a frozen-sun leg, nor against another ")
+		       TEXT("moving-sun leg that started at a different hour. Pin -VoxelTimeScale=0 for any comparison ")
+		       TEXT("where the sun is not the variable under test; see the per-window 'Voxel sky' lines above ")
+		       TEXT("for the sweep this leg actually covered."),
+		       SkyTimeScale, SkyHour, SkyMinute, SkyState.SunAltitudeDeg, (long long)SkyState.LightUpdates);
+	}
+	if (!bHaveSky)
+	{
+		// The fields below will be a zeroed state's -- midnight, sun at 0/0.
+		// Say so, because "midnight" and "there was no sky subsystem" produce
+		// byte-identical JSON.
+		UE_LOG(LogVoxelPerf, Warning,
+		       TEXT("VoxelPerfRun: no UVoxelSkySubsystem in this world -- the sky fields in the summary JSON are ")
+		       TEXT("a ZEROED state, not a measurement. Do not read them as a sun pose."));
+	}
+
 	const FString Timestamp = FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"));
 	const FString OutDir = FPaths::ProjectSavedDir() / TEXT("PerfRuns");
 	IFileManager::Get().MakeDirectory(*OutDir, /*Tree*/ true);
@@ -733,7 +926,38 @@ void UVoxelPerfRunSubsystem::FinishRun()
 		// comparable, and that is exactly the mistake this mode exists to stop.
 		TEXT("  \"staticYawDeg\": %.1f,\n")
 		TEXT("  \"staticPitchDeg\": %.1f,\n")
-		TEXT("  \"undergroundFrameFraction\": %.4f\n")
+		TEXT("  \"undergroundFrameFraction\": %.4f,\n")
+		// THE SUN, RECORDED UNCONDITIONALLY, for exactly the reason
+		// staticYawDeg/staticPitchDeg two lines up are: "a static run's numbers
+		// can never be read without the pose they were taken at. Two static
+		// runs at different poses are not comparable, and that is exactly the
+		// mistake this mode exists to stop."
+		//
+		// TWO LEGS AT DIFFERENT SUN ANGLES ARE THE SAME CLASS OF MISTAKE. The
+		// sun is a pose too -- it decides how much geometry lands in each
+		// shadow cascade and whether the renderer's cached whole-scene shadow
+		// setup survives the frame -- and unlike the camera pose it now moves
+		// on its own unless something pins it. Every perf number this project
+		// has on record predates the day/night clock and was therefore taken at
+		// one frozen pose (docs/backlog.md §0); with these fields absent, the
+		// first leg run after the clock landed would have been silently
+		// comparable-looking against all of them.
+		//
+		// timeOfDay/dateMMDD are strings in the exact shape of the switches
+		// that set them, so a leg can be reproduced by pasting its own artifact
+		// back into -VoxelTimeOfDay= / -VoxelDate= with no arithmetic in
+		// between -- and sunAltitudeDeg is the ground truth to check that
+		// reproduction against, since the calendar may not be able to land on
+		// the requested date exactly.
+		//
+		// WITH timeScale != 0 THESE ARE END-OF-RUN VALUES, not the leg's. That
+		// leg is not comparable to anything (see the Warning logged above), and
+		// the per-window "Voxel sky" lines are where its sweep lives.
+		TEXT("  \"timeOfDay\": \"%02d:%02d\",\n")
+		TEXT("  \"dateMMDD\": \"%02d-%02d\",\n")
+		TEXT("  \"timeScale\": %.3f,\n")
+		TEXT("  \"sunAltitudeDeg\": %.2f,\n")
+		TEXT("  \"sunAzimuthDeg\": %.2f\n")
 		TEXT("}\n"),
 		DurationSeconds, N, P50, P95, Max, HitchCount, HitchThresholdMs, (long long)ChunksLoaded, AvgChunksPerSec,
 		AvgBudgetSaturationPct, WarmupExcludeSeconds, PostWarmupN, PostWarmupP50, PostWarmupP95, PostWarmupMax, PostWarmupHitchCount,
@@ -742,7 +966,8 @@ void UVoxelPerfRunSubsystem::FinishRun()
 		    : Flight == EVoxelPerfFlight::Line   ? TEXT("line")
 		                                          : TEXT("surface"),
 		DepthUU / 100.0, LinearSpeedUUPerSecOverride / 100.0, HeadingDeg, PreflightSec, LingerSec, StaticYawDeg, StaticPitchDeg,
-		UndergroundFraction);
+		UndergroundFraction,
+		SkyHour, SkyMinute, SkyMonth, SkyDay, SkyTimeScale, SkyState.SunAltitudeDeg, SkyState.SunAzimuthDeg);
 
 	FFileHelper::SaveStringToFile(Json, *OutPath);
 
@@ -754,6 +979,18 @@ void UVoxelPerfRunSubsystem::FinishRun()
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("VoxelPerfRun post-warmup (t>=%.0fs): frames=%d p50=%.2fms p95=%.2fms max=%.2fms hitches=%d"), WarmupExcludeSeconds,
 	       PostWarmupN, PostWarmupP50, PostWarmupP95, PostWarmupMax, PostWarmupHitchCount);
+
+	// The arm this leg belongs to, in one line, next to the numbers it
+	// qualifies. The per-window lines above already carry the same state, but a
+	// reader who has scrolled to the bottom for the p95 should not have to
+	// scroll back up to find out which sun it was measured under -- that is the
+	// exact reading failure the JSON fields are there to prevent, and the log
+	// is read far more often than the JSON.
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("VoxelPerfRun sky: tod=%02d:%02d date=%02d-%02d sunAlt=%.2f sunAz=%.2f timeScale=%.3f (sun %s)"),
+	       SkyHour, SkyMinute, SkyMonth, SkyDay, SkyState.SunAltitudeDeg, SkyState.SunAzimuthDeg, SkyTimeScale,
+	       SkyTimeScale == 0.f ? TEXT("FROZEN -- comparable to other frozen legs at the same tod/date")
+	                           : TEXT("MOVING -- see the warning above"));
 
 	// Arm the backstop BEFORE asking to exit, so a shutdown that wedges inside
 	// FEngineLoop::Exit is still covered -- see FVoxelExitWatchdog's comment.

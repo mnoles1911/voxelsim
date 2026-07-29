@@ -27,13 +27,26 @@
 # separate argv entries, so the engine silently receives only the first command.
 # The run succeeds, the log looks plausible, and nothing in it says the
 # measurement did not happen. First entry on this project's silent-nothing list.
+#
+# THE SKY PIN. Phase B's numbers are chunks/s and dispatch-to-ready latency for
+# the async GPU mesh fork, and both share the GPU with whatever the renderer is
+# doing. Left at the engine's default TimeScale 1, the sun keeps rotating for
+# the whole AsyncBudgetSec window, which means shadow-cascade rebuild work is
+# intermittently stealing GPU time from the mesh jobs being timed -- not a
+# difference between legs this time, but noise INSIDE the one number this
+# phase reports. Freeze it.
 
 param(
     [int]$Legs = 2,
     [int]$AsyncChunks = 16,
     [int]$AsyncInFlight = 4,
     [int]$AsyncDelaySec = 8,
-    [int]$AsyncBudgetSec = 150
+    [int]$AsyncBudgetSec = 150,
+    # THE SKY PINS. See the header. Same three defaults as
+    # tools/voxel-run-flight-leg.ps1.
+    [string]$TimeOfDay = '12:00',
+    [string]$Date = '03-20',
+    [double]$TimeScale = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,6 +54,11 @@ $Editor  = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe'
 $Project = (Resolve-Path "$PSScriptRoot\..\ue-project\VoxelEarth.uproject").Path
 $LogDir  = (Resolve-Path "$PSScriptRoot\..\ue-project\Saved\Logs").Path
 if (-not (Test-Path $Editor)) { throw "Editor not found: $Editor" }
+# InvariantCulture: PowerShell interpolates a [double] with the CURRENT
+# culture, so on a comma-decimal machine "-VoxelTimeScale=0,5" reaches
+# FParse::Value, which stops at the comma, and the gate silently runs frozen
+# while the script says 0.5.
+$TimeScaleArg = $TimeScale.ToString([cultureinfo]::InvariantCulture)
 
 function Assert-CommandLine {
     param([string]$Log, [string[]]$MustContain, [string]$Label)
@@ -61,6 +79,7 @@ for ($i = 1; $i -le $Legs; $i++) {
     # ---- Phase A: synchronous gates -------------------------------------
     $logA = Join-Path $LogDir "d4-gate-leg$i-region.log"
     & $Editor $Project -game -nosplash -unattended -sm6 `
+        "-VoxelTimeOfDay=$TimeOfDay" "-VoxelDate=$Date" "-VoxelTimeScale=$TimeScaleArg" `
         -ExecCmds="voxel.GPU.VerifyRegion, quit" -abslog="$logA" 2>&1 | Out-Null
 
     if (Test-Path $logA) {
@@ -74,6 +93,7 @@ for ($i = 1; $i -le $Legs; $i++) {
     $logB = Join-Path $LogDir "d4-gate-leg$i-async.log"
     $p = Start-Process -FilePath $Editor -PassThru -WindowStyle Hidden -ArgumentList @(
         "`"$Project`"", '-game', '-nosplash', '-unattended', '-sm6',
+        "-VoxelTimeOfDay=$TimeOfDay", "-VoxelDate=$Date", "-VoxelTimeScale=$TimeScaleArg",
         "-ExecCmds=`"voxel.GPU.VerifyAsyncMesh $AsyncChunks $AsyncInFlight $AsyncDelaySec`"",
         "-abslog=`"$logB`"")
 

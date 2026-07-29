@@ -34,6 +34,40 @@
 # Ground rule 1 says never conclude from a single run. This is its sibling:
 # never conclude from a run that was sharing the box.
 #
+# ============================================================================
+# THE SKY PINS, AND WHY THEY DEFAULT TO A FROZEN NOON
+# ============================================================================
+#
+# A day/night clock now exists (UVoxelSkySubsystem). Left to itself it advances
+# every frame, which means a leg run today and the same leg run twenty minutes
+# ago are measured under different sun angles -- and the sun is not a cosmetic
+# variable on this draw path. A movable directional light that has NOT rotated
+# since spawn lets the renderer keep its cached whole-scene shadow setup; a sun
+# that rotates re-renders the resident geometry into the cascades it touches.
+#
+# Every perf baseline this project has on record was taken before the clock
+# existed, i.e. with a sun frozen since spawn -- including docs/backlog.md §0's
+# shadowGather=0 / ~1.03 gathers-per-frame figure, which is the number people
+# quote. So the defaults here are chosen to REPRODUCE THAT, not to be
+# interesting:
+#
+#   -TimeOfDay 12:00 and -Date 03-20 are the engine's own defaults
+#     (VoxelSkySubsystem.cpp:254-269 -- equinox noon at 52 N, ~38 deg altitude,
+#     picked so a no-switch frame matches the pre-clock static rig). Passing
+#     them explicitly changes nothing about what a leg measures; it only puts
+#     the value in the log and in the run's JSON, where it can be checked.
+#
+#   -TimeScale 0 FREEZES the sun, which the engine default (1.0) does not.
+#     This is the one place the harness deliberately departs from the engine
+#     default, and it is the whole point: with TimeScale 1 every leg is a
+#     different measurement of a moving target, no leg is reproducible, and no
+#     historical baseline is comparable to anything run after the clock landed.
+#
+# A leg that WANTS a moving sun passes -TimeScale 1 and gets a Warning in its
+# own log saying its numbers are not comparable across the leg. That is the
+# frozen-vs-moving comparison, and tools/voxel-sun-arms.ps1 is how to run it --
+# alternated, both arms otherwise identical. Do not hand-roll it here.
+#
 # Usage:
 #   tools\voxel-run-flight-leg.ps1 -LogName s1close-1 `
 #       -Cvars "voxel.Stream.PoolBatchPublish 1, voxel.Stream.CoverageVerify 1"
@@ -67,6 +101,14 @@ param(
     [int]$Width = 1600,
     [int]$Height = 900,
     [int]$TimeoutSec = 480,
+    # THE SKY PINS. See "THE SKY PINS, AND WHY THEY DEFAULT TO A FROZEN NOON"
+    # in the header for why these three defaults are what they are. Short
+    # version: 12:00 / 03-20 is the engine's own default pose, so every leg ever
+    # taken stays comparable, and TimeScale 0 is what makes a leg reproducible
+    # at all.
+    [string]$TimeOfDay = '12:00',
+    [string]$Date = '03-20',
+    [double]$TimeScale = 0,
     [switch]$KeepEditLog,
     [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe'
 )
@@ -99,6 +141,17 @@ $argList = @(
     "-abslog=`"$LogPath`"",
     "-ResX=$Width", "-ResY=$Height", '-WinX=0', '-WinY=0',
     "-VoxelSpawnAt=$SpawnAt",
+    # Beside the spawn, because they are the same kind of thing: state that
+    # decides what the run measures and that nothing downstream can recover if
+    # it is left implicit. InvariantCulture on the scale deliberately --
+    # PowerShell interpolates a [double] with the CURRENT culture, so on a
+    # comma-decimal machine "-VoxelTimeScale=0,5" reaches FParse::Value, which
+    # stops at the comma, and the run silently freezes at 0 while the script
+    # says 0.5. Same class of silent truncation the -ExecCmds note below
+    # describes.
+    "-VoxelTimeOfDay=$TimeOfDay",
+    "-VoxelDate=$Date",
+    "-VoxelTimeScale=$($TimeScale.ToString([cultureinfo]::InvariantCulture))",
     "-VoxelPerfRun=$RunSec",
     "-VoxelPerfFlight=$Flight",
     "-VoxelPerfPreflightSec=$PreflightSec",
@@ -141,6 +194,10 @@ if ($elapsed -lt ($expected * 0.9)) {
 #     absence proves FinishRun never ran, which no timing heuristic can.
 # Verified against the archive: v10-flight-1 (the leg that died early) has no
 # completion line; v10-flight-2 and -3 both do. This discriminates the real cases.
+#
+# (Two sessions arrived at this same check independently and it merged as a
+# conflict. This is main's wording, kept because it names the archive legs the
+# discrimination was verified against.)
 $logSaysComplete = (Test-Path $LogPath) -and
     (Select-String -Path $LogPath -Pattern 'VoxelPerfRun complete' -Quiet)
 $perfDir = Join-Path (Split-Path $Project) 'Saved\PerfRuns'
@@ -159,5 +216,8 @@ if (-not $logSaysComplete -or -not $perfJson) {
     return $false
 }
 
-Write-Host "  ${LogName}: ok (${elapsed}s) at ${Width}x${Height}" -ForegroundColor Green
+# The sun goes in the console line for the same reason the resolution does: a
+# result pasted out of a terminal without it is not a result.
+$sun = if ($TimeScale -eq 0) { "frozen $TimeOfDay $Date" } else { "MOVING x$TimeScale from $TimeOfDay $Date" }
+Write-Host "  ${LogName}: ok (${elapsed}s) at ${Width}x${Height}, sun $sun" -ForegroundColor Green
 return $true
