@@ -135,6 +135,45 @@ Runs on the GPU pod that already generates tiles.
   Runs *after* incision so gully walls weather and spoil forms talus cones and fan aprons. Also a
   low-pass on the residual, so it directly improves compression.
 
+**Bake prototype — measured, and it corrected three of this plan's own choices.**
+`terrain-service/tools/bake_prototype.py` runs B0–B3 at full resolution on a real tile (needs the
+`terrain-diffusion` venv for numba/scipy). Per stage, 4096², one tile:
+
+| stage | s | note |
+|---|---|---|
+| B0 B-spline upsample | 0.3 | |
+| B1 conditioned fBm | 9.6 | scipy `zoom` is the slow part; a real implementation is far cheaper |
+| B2a priority-flood fill | 3.0 | inherently sequential, stays on CPU |
+| B2b D8 receivers | 1.5 | |
+| B2c elevation sort | 0.7 | |
+| B2d MFD accumulation | 2.1 | sequential sweep |
+| B2e stream-power incision | 0.3 | |
+| B3 thermal relaxation ×48 | 4.6 | trivially GPU-parallel |
+| **total** | **~22 s** | vs the ≈1.5 s originally estimated |
+
+The genuinely sequential core (priority-flood + sort + accumulation) is ~5.8 s; the rest is
+GPU-parallel. A production bake plausibly lands at 6–10 s/tile — still **4–6× the estimate**, but
+the on-demand argument is unaffected because coarse diffusion (22.5 s/tile, and 5 tiles per step
+of the frontier against 3 bakes) dominates it either way.
+
+Result: a real dendritic network — branching, tributaries joining, no lattice faceting — carved
+into the surface as incised hollows with sharpened spurs between (max accumulation 78 km²; 15,773
+cells above 1 km²). Incision currently reads gentle (mean 0.13 m, p99 0.63 m, max 6.3 m); that is
+a K calibration knob, and over-carving is its own failure mode.
+
+**Three prototype bugs, each of which validated a choice in this plan by violating it:**
+
+- *Thermal must conserve mass.* Subtracting the over-repose excess without depositing it stripped
+  128 m from cliff tops in 48 iterations. And the shed must be scaled by the **steepest** pair, not
+  the sum over eight neighbours — scaling by the sum diverged the field to ~1e23.
+- *B1's fBm must be properly interpolated.* Box-upsampling each octave (`np.kron`) produced a
+  hillshade of hard rectangles at every octave scale — the exact grid artifact this project exists
+  to remove, reintroduced by the pass meant to supply natural roughness. Invisible in any averaged
+  statistic; obvious the instant it is shaded.
+- *MFD, not D8, for the accumulation field.* Pure D8 gave dead-straight 45° diagonal channels tens
+  of pixels long, exactly as predicted below. D8 stays right for tracing a channel centreline; it
+  is wrong for the area field.
+
 **Rejected — full hydraulic pipe-model erosion (Mei et al.).** Its distinctive outputs at this
 resolution duplicate B2+B3 at 100–1000× the iteration count: pipe models move sediment over
 kilometres across thousands of small timesteps, while stream power *solves for the answer*
@@ -563,8 +602,11 @@ back at Tier A with a larger shipped region.
 
 ## Open risks
 
-1. **Bake cost is estimated, not measured.** The ≈1.5 s/tile figure drives the whole on-demand
-   latency argument. Measure in Phase 1 before committing to prefetch ring sizes.
+1. ~~Bake cost is estimated, not measured.~~ **RETIRED, and the estimate was wrong.** See
+   "Bake prototype" below: **~22 s/tile measured on CPU**, against the ≈1.5 s estimate. The
+   on-demand argument survives anyway, because the bake was never the bottleneck — coarse
+   diffusion at 22.5 s/tile is, and moving one tile at the frontier needs 5 coarse tiles against 3
+   bakes. Prefetch ring sizes do not change.
 2. ~~Compressed tile size is modelled, not measured.~~ **RETIRED** — measured on three real tiles
    with `terrain-service/tools/measure_fine_tier_size.py`; see the size section. 8 MB/tile stands
    for correlated detail. The live risk is now narrower and different: **the bake must not
