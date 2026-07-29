@@ -188,17 +188,41 @@ never interpolates samples at all — and the entropy lives in the gradient, not
 Per block: MED/LOCO-I prediction, zigzag mapping, one independent zstd frame. Independent frames
 buy per-block random access — the client decompresses only the ~0.92 km² blocks it needs.
 
-Size (entropy of a discretised Laplacian, `≈log₂(2e·σ/√2)`, +0.3 bit framing; B3 suppresses σ):
+**Size — MEASURED, and the model that predicted it was wrong.**
+`terrain-service/tools/measure_fine_tier_size.py` decodes a real tile, upsamples it 8× with the
+same cubic B-spline the client carrier uses, adds controlled roughness, and runs the actual MED +
+per-block codec. On tile (−6,3) — 3683 m of relief, so a hard case. (zstd is not installed on this
+box; zlib and lzma bracket it, and zstd −19 normally lands nearer lzma.)
 
-| Terrain | assumed MED-error σ | bits/px | per tile | per km² |
-|---|---|---|---|---|
-| Ocean / flat basin | ~0 (CONSTANT) | ~0.05 | 0.1 MB | 0.4 KB |
-| Plains | 5 cm | ~3.3 | 6.9 MB | 29 KB |
-| Rolling / dissected | 15 cm | ~4.9 | 10.3 MB | 44 KB |
-| Alpine | 60 cm | ~6.9 | 14.5 MB | 61 KB |
+| added roughness | RMS | MED σ | zlib | **lzma** | bits/px | model said | KB/km² |
+|---|---|---|---|---|---|---|---|
+| none (smooth 8× upsample) | — | 27.1 cm | 7.91 MB | **6.05 MB** | 2.88 | 7.01 | 25.0 |
+| fBm (correlated) | 0.5 m | 27.2 cm | 8.60 MB | **6.65 MB** | 3.17 | 7.01 | 27.5 |
+| fBm | 1.0 m | 27.2 cm | 9.39 MB | **7.33 MB** | 3.50 | 7.01 | 30.3 |
+| fBm | 2.0 m | 27.4 cm | 10.67 MB | **8.47 MB** | 4.04 | 7.02 | 35.1 |
+| white (uncorrelated) | **0.05 m** | 28.5 cm | 15.77 MB | **12.89 MB** | 6.15 | 7.08 | 53.4 |
+| white | 0.15 m | 37.3 cm | 18.85 MB | **15.17 MB** | 7.23 | 7.46 | 62.8 |
 
-**Planning number: 8 MB per land tile** (≈34 KB/km², ≈4:1 vs 33.5 MB raw). Decoded block 128 KB;
-zstd decode of a ~40 KB frame ≈0.1–0.3 ms.
+Three things this changes:
+
+1. **The 8 MB/tile planning number stands — but only for *correlated* detail.** fBm at a full 2 m
+   RMS lands at 8.47 MB. White noise at **0.05 m** — forty times less amplitude — costs
+   **12.89 MB**, half as much again. Compressed size tracks how *uncorrelated* the added detail
+   is, not how large it is. That is a hard constraint on the bake: B1's roughness must stay fractal
+   (it is), and the centimetre quantisation must not dither.
+2. **σ is the wrong predictor, and the old model was wrong.** It predicted ~7.0 bits/px across the
+   whole sweep where measurement ranges 2.88–7.23. It assumes i.i.d. Laplacian errors; real MED
+   errors are spatially correlated, so a real coder beats the marginal entropy by roughly 2×. It
+   over-predicts, i.e. it erred safe — the 8 MB number was accidentally right for the wrong
+   reason. Do not re-derive sizes from σ.
+3. **The floor is 4.0–6.3 MB/tile** across three tiles sampled (smooth upsample, no detail at all),
+   16–26 KB/km². Nothing the bake does can go below it.
+
+**Codec finding:** 73–159 MED errors per tile exceed int16 even at 10 cm quantisation — a 30 m
+cliff across one 3.75 m post will do it. The block format needs an escape: an int32 block mode or
+a per-block residual-width field, not a bare int16 everywhere.
+
+Decoded block 128 KB; zstd decode of a ~40 KB frame ≈0.1–0.3 ms.
 
 Decode is a pure integer function of the bytes: zstd decode is bit-exact by format spec, MED
 inverse and B-spline evaluation are exact int64 with specified floor division. **The encoder need
@@ -531,9 +555,11 @@ back at Tier A with a larger shipped region.
 
 1. **Bake cost is estimated, not measured.** The ≈1.5 s/tile figure drives the whole on-demand
    latency argument. Measure in Phase 1 before committing to prefetch ring sizes.
-2. **Compressed tile size is modelled, not measured.** The 8 MB number rests on assumed MED-error σ
-   per terrain class. Alpine could be worse; fallback is a coarser quantum or 25 cm control points,
-   both single-field changes.
+2. ~~Compressed tile size is modelled, not measured.~~ **RETIRED** — measured on three real tiles
+   with `terrain-service/tools/measure_fine_tier_size.py`; see the size section. 8 MB/tile stands
+   for correlated detail. The live risk is now narrower and different: **the bake must not
+   introduce uncorrelated per-pixel noise**, because 5 cm of white costs more than 2 m of fBm. Also
+   newly open: the codec needs an int16 escape (73–159 residuals per tile overflow).
 3. **`kWorldGenVersion` collision.** `core.h:42-43` notes v8 was taken to dodge a collision with an
    unmerged branch; confirm what is in flight before claiming v9–v12.
 4. **Fine resolution may want to be 1.875 m.** 3.75 m is the recommendation; the format leaves

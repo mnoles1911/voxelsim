@@ -1,11 +1,11 @@
-﻿// Coarse generation path tests (GeneratedWorld::coarseColumns /
-// makeCoarseBrick / coarseSurfaceBrickRange â€” generator.h): the outer-ring
+// Coarse generation path tests (GeneratedWorld::coarseColumns /
+// makeCoarseBrick / coarseSurfaceBrickRange — generator.h): the outer-ring
 // LOD path that generates a level-L brick at its own resolution instead of
 // materializing and downsampling its 8^L level-0 descendants.
 //
 // Covered here:
 //   - level-0 identity: the coarse path at level 0 is bit-identical to the
-//     fine path (columns, bricks, surface range) â€” one rule, provably
+//     fine path (columns, bricks, surface range) — one rule, provably
 //     degenerating to the existing generator;
 //   - pointwise consistency: every coarse cell equals a direct amplifier
 //     query at its representative level-0 voxel, including across brick
@@ -35,7 +35,7 @@ constexpr uint64_t kSeed = 20260719;
 constexpr int B = 8;
 
 // True-mip reference: recursive downsample over full-resolution generation,
-// with a level-0 source that (like the UE worker job) always materializes â€”
+// with a level-0 source that (like the UE worker job) always materializes —
 // nullptr never propagates, so all-air groups are still voted on.
 struct TrueMip {
     const GeneratedWorld<B>& gen;
@@ -151,7 +151,7 @@ VXC_TEST(coarsegen_surface_range_formula) {
     // For every column: the topmost solid coarse cell under the
     // representative-sample rule sits inside [bzMin, bzMax], the cell above
     // it is air. Checked against stratigraphyAt (surface rule without the
-    // cave carve, which coarseSurfaceBrickRange â€” like surfaceBrickRange â€”
+    // cave carve, which coarseSurfaceBrickRange — like surfaceBrickRange —
     // deliberately ignores).
     for (int32_t level = 1; level <= 4; ++level) {
         const int64_t s = int64_t(1) << level;
@@ -183,7 +183,7 @@ VXC_TEST(coarsegen_golden_digest) {
     const uint64_t d = coarseRegionDigest(kSeed);
     std::printf("    [coarsegen] golden digest 0x%016" PRIX64 "\n", d);
     // kWorldGenVersion 6: moves because the fine surface it samples moved
-    // (coarse-to-fine detail rework). The coarse RULE is unchanged â€” its own
+    // (coarse-to-fine detail rework). The coarse RULE is unchanged — its own
     // tests (coarsegen_level0_identity, coarsegen_matches_pointwise_queries,
     // coarsegen_surface_range_formula, coarsegen_fidelity_vs_true_mip) all
     // still pass, and the fidelity mismatch ceilings were not relaxed.
@@ -311,7 +311,7 @@ VXC_TEST(coarsegen_cavern_survival) {
     CHECK(found);
     if (!found) return;
 
-    // Phase 2: refine to the max-void column nearby â€” an anchor near the
+    // Phase 2: refine to the max-void column nearby — an anchor near the
     // room's centre, so every level's representative column for the cell
     // containing it (lateral offset < s voxels) still falls inside the room.
     int64_t foundVx = hitVx, foundVy = hitVy, fineVoid = 0, voidLo = 0, voidHi = 0;

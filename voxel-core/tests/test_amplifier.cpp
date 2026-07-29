@@ -1,4 +1,4 @@
-﻿// Amplifier v0: determinism, stratigraphy ordering, golden digest (plan Â§5
+// Amplifier v0: determinism, stratigraphy ordering, golden digest (plan §5
 // task 3). The golden digest is the cross-compiler determinism proxy for the
 // M0 NVIDIA-vs-AMD gate: gcc and clang CI builds must both match it.
 
@@ -76,7 +76,7 @@ VXC_TEST(amplifier_stratigraphy_ordering) {
 
             // Walking down the column: air above surface, then the layer
             // sequence, never air below the surface. This is the STRATIGRAPHY
-            // (Amplifier::stratigraphyAt) â€” since the M4 cave pass,
+            // (Amplifier::stratigraphyAt) — since the M4 cave pass,
             // materialAt() also carves tunnels out of it, so "no air below the
             // surface" is no longer true of the full material function and
             // holds only of the layer model this test is about. The cave
@@ -114,14 +114,14 @@ VXC_TEST(amplifier_golden_digest) {
             d.u32(static_cast<uint32_t>(col.bedrockDepthMm));
             d.u8(col.surfaceMat);
         }
-    // GOLDEN(amplifier_columns) â€” kWorldGenVersion 6: the coarse-to-fine
+    // GOLDEN(amplifier_columns) — kWorldGenVersion 6: the coarse-to-fine
     // detail rework. surfaceMm moves at essentially every column, for three
     // independent reasons, all in evalSurface: the octave table gained a fifth
     // octave and every amplitude changed; the octaves are split into two bands
     // with different scales; and they now use the quintic-faded value noise.
     // topsoilMm/subsoilMm/bedrockDepthMm move with it because stratigraphy is
-    // conditioned on the surface and the tile slope. This digest MUST move â€”
-    // it is the whole point of the change â€” and a stable value here would mean
+    // conditioned on the surface and the tile slope. This digest MUST move —
+    // it is the whole point of the change — and a stable value here would mean
     // the rework had not taken effect.
     // (was 0xA29A7A767DC1543B at v5, 0x81785278E4DFCF67 at v3/v4,
     //  0x73B43CAE621CA286 at v2)
@@ -131,8 +131,8 @@ VXC_TEST(amplifier_golden_digest) {
 // --- C4: the cavern pass is actually wired into the amplifier ---------------
 
 // Every pre-existing golden (mips_chain, both bench digests) only ever
-// voxelises SURFACE-SHELL bricks â€” bricks containing some column's topmost
-// voxel â€” and a cavern never comes within 12 m of the surface. So none of them
+// voxelises SURFACE-SHELL bricks — bricks containing some column's topmost
+// voxel — and a cavern never comes within 12 m of the surface. So none of them
 // moves when caverns are folded in, and none of them would notice if the
 // fold-in were silently dropped. These two tests are the ones that do.
 
@@ -206,7 +206,7 @@ VXC_TEST(amplifier_folds_caverns_into_materialAt) {
 }
 
 VXC_TEST(amplifier_deep_column_golden_digest) {
-    // GOLDEN(amplifier_deep_materials) â€” new at kWorldGenVersion 5. Digests
+    // GOLDEN(amplifier_deep_materials) — new at kWorldGenVersion 5. Digests
     // Amplifier::materialAt down 260 m over a 800 m-wide sparse grid, so unlike
     // every other worldgen golden it actually covers the cave pass, the cavern
     // pass and the bedrock boundary as the amplifier composes them, rather than
@@ -231,7 +231,7 @@ VXC_TEST(amplifier_deep_column_golden_digest) {
     CHECK(cavernColumns > 0);
     std::printf("    [amplifier] deep golden covers %lld cavern columns\n",
                 static_cast<long long>(cavernColumns));
-    // kWorldGenVersion 6: moves for the same reason amplifier_columns does â€”
+    // kWorldGenVersion 6: moves for the same reason amplifier_columns does —
     // this walks materialAt down each column from the surface, so a surface
     // that moved drags every sampled voxel's material with it. The cave and
     // cavern GEOMETRY is unchanged (see GOLDEN(cave_layer) / GOLDEN(cavern_
@@ -268,14 +268,14 @@ VXC_TEST(generated_brick_matches_pointwise_queries) {
 //
 // Amplifier::surfaceUpperBoundMm is a SAFETY primitive: the sky-band trim skips
 // streaming any chunk that sits entirely above it, so a bound that is ever too
-// low is an invisible hole in the terrain â€” a chunk declared all-air that
+// low is an invisible hole in the terrain — a chunk declared all-air that
 // really contains rock. These tests are written to BREAK it, not to demonstrate
 // it: randomised footprints, adversarial placement, and dense sampling inside
 // each one.
 
 namespace {
 
-// Deterministic RNG for the sweep â€” splitmix64 so the whole test is reproducible
+// Deterministic RNG for the sweep — splitmix64 so the whole test is reproducible
 // byte-for-byte on every compiler (it is worldgen's own mixer, used here only as
 // a test generator, never as worldgen randomness).
 struct BoundRng {
@@ -437,7 +437,7 @@ VXC_TEST(amplifier_surface_bound_adversarial) {
 
         for (int32_t trial = 0; trial < 220; ++trial) {
             // Size: half the real caller's shapes (a level-L chunk footprint is
-            // 16 << L voxels on a side, L = 0..5), half arbitrary â€” including
+            // 16 << L voxels on a side, L = 0..5), half arbitrary — including
             // degenerate 1-wide slivers and single columns, where the clipped
             // rectangle collapses to a segment or a point.
             int64_t w = 0, h = 0;
@@ -463,7 +463,7 @@ VXC_TEST(amplifier_surface_bound_adversarial) {
                 y0 = hotY[k] + rng.range(-600, 600);
                 ++hotspotFootprints;
             } else {
-                // Anywhere, including far negative coordinates â€” floorDiv's
+                // Anywhere, including far negative coordinates — floorDiv's
                 // sign handling is exactly where an off-by-one pixel index
                 // would hide.
                 x0 = rng.range(-2000000, 2000000);
@@ -550,11 +550,11 @@ VXC_TEST(amplifier_surface_bound_declines_rather_than_guesses) {
 }
 
 VXC_TEST(amplifier_surface_bound_golden_digest) {
-    // GOLDEN(amplifier_surface_bound) â€” NOT worldgen output (the bound is a
+    // GOLDEN(amplifier_surface_bound) — NOT worldgen output (the bound is a
     // derived query; kWorldGenVersion does not cover it and must not move for
-    // it). Pinned so that a change to the bound's arithmetic â€” including one
+    // it). Pinned so that a change to the bound's arithmetic — including one
     // that only makes it LOOSER, which the adversarial test above would happily
-    // accept â€” shows up as a deliberate decision rather than a silent drift in
+    // accept — shows up as a deliberate decision rather than a silent drift in
     // how many chunks the sky-band trim skips.
     SyntheticTileSampler tiles(kSeed);
     Amplifier amp(kSeed, tiles);
@@ -741,7 +741,7 @@ VXC_TEST(amplifier_solid_below_bound_declines_rather_than_guesses) {
 }
 
 VXC_TEST(amplifier_solid_below_bound_golden_digest) {
-    // GOLDEN(amplifier_solid_below_bound) Ã¢â‚¬â€ NOT worldgen output, same argument
+    // GOLDEN(amplifier_solid_below_bound) â€” NOT worldgen output, same argument
     // as amplifier_surface_bound_golden_digest. Pinned so a change that only
     // makes the floor LOWER (which the adversarial test accepts happily, and
     // which costs real chunks at admission) shows up as a decision.
@@ -760,7 +760,7 @@ VXC_TEST(amplifier_solid_below_bound_golden_digest) {
     }
     std::printf("    [amplifier] solid-below golden digest = 0x%016llX\n",
                 (unsigned long long)d.h);
-    // kWorldGenVersion 6: mirror of the surface-bound move above â€” the
+    // kWorldGenVersion 6: mirror of the surface-bound move above — the
     // symmetric envelope widened the same way (kLandformAbsMaxMm and
     // kMicroAbsMaxMm, each with its own +1 mm for its own q10 truncation), and
     // solidBelowBoundMm is derived from surfaceLowerBoundMm. The CARVE

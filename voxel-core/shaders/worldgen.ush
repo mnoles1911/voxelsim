@@ -1,4 +1,4 @@
-﻿// Worldgen GPU kernel v1 â€” HLSL port of the CPU reference (hash.h +
+// Worldgen GPU kernel v1 — HLSL port of the CPU reference (hash.h +
 // amplifier.cpp), per ADR-0001: single HLSL source compiled to DXIL for UE
 // RDG and to SPIR-V (DXC -spirv) for the headless Vulkan determinism/perf
 // harness.
@@ -6,18 +6,18 @@
 // DETERMINISM CONTRACT (docs/determinism.md): every expression here must be
 // a bit-exact mirror of the CPU reference. Integer-only; int64/uint64
 // arithmetic requires Int64 shader ops (D3D12 Int64ShaderOps / Vulkan
-// shaderInt64 â€” see ADR-0001). C++ and HLSL agree on two's-complement casts
+// shaderInt64 — see ADR-0001). C++ and HLSL agree on two's-complement casts
 // and arithmetic >> on signed values. They DO NOT reliably agree on signed
-// `/` and `%` when the operands have mixed signs â€” that is undefined in HLSL
+// `/` and `%` when the operands have mixed signs — that is undefined in HLSL
 // and diverged between AMD and NVIDIA at the M0 gate; see the floorDiv /
 // truncDiv comment below and use those helpers instead.
 // Any change here that alters output is world-breaking: bump
 // vxc::kWorldGenVersion and regenerate goldens, never patch silently.
 //
 // Kernels:
-//   ColumnMain   â€” one thread per column, computes the full ColumnSample
+//   ColumnMain   — one thread per column, computes the full ColumnSample
 //                  stratigraphy (mirrors vxc::Amplifier::column).
-//   VoxelizeMain â€” one thread per column, chained after ColumnMain: reads
+//   VoxelizeMain — one thread per column, chained after ColumnMain: reads
 //                  that column's GpuColumnSample (NOT recomputed) and fills
 //                  a vertical stack of brick-major cell buckets (mirrors
 //                  vxc::Amplifier::materialAt / GeneratedWorld<8>::makeBrick).
@@ -94,14 +94,14 @@
 
 static const int kVoxelSizeMm = 100;
 
-// HashChannel (hash.h) â€” append only, never renumber.
+// HashChannel (hash.h) — append only, never renumber.
 static const uint CH_DETAIL_OCTAVE_BASE = 0;
 static const uint CH_TOPSOIL_JITTER = 16;
 static const uint CH_BEDROCK_JITTER = 17;
 static const uint CH_ECOTONE_TEMP = 18;   // v9 biome-boundary dither
 static const uint CH_ECOTONE_PRECIP = 19; // v9 biome-boundary dither
 
-// Material ids (core.h) â€” append only, never renumber.
+// Material ids (core.h) — append only, never renumber.
 static const uint MAT_AIR = 0;
 static const uint MAT_BEDROCK = 1;
 static const uint MAT_ROCK = 2;
@@ -118,7 +118,7 @@ static const uint MAT_PERMAFROST = 12;
 static const uint MAT_MUD = 13;
 static const uint MAT_CLAY = 14;
 
-// BiomeId (voxelcore/biome.h) â€” append only, never renumber.
+// BiomeId (voxelcore/biome.h) — append only, never renumber.
 static const uint BIOME_OCEAN = 0;
 static const uint BIOME_BEACH = 1;
 static const uint BIOME_GRASSLAND = 2;
@@ -130,7 +130,7 @@ static const uint BIOME_TAIGA = 7;
 static const uint BIOME_TUNDRA_ALPINE = 8;
 static const uint BIOME_BARE_ROCK = 9;   // appended at worldgen v8
 
-// Biome gate/Whittaker thresholds (voxelcore/biome.h) â€” bit-exact mirror,
+// Biome gate/Whittaker thresholds (voxelcore/biome.h) — bit-exact mirror,
 // worldgen contract.
 //
 // SINCE v8 THESE ARE DERIVED, NOT CHOSEN. biome.h states each threshold in
@@ -191,7 +191,7 @@ static const int kOctaveAmplitudeMm[kOctaveCount] = {2600, 1100, 500, 190, 60};
 //     so the flooring correction `(r < 0) != (b < 0)` fired for negative
 //     coordinates. On NVIDIA it did not fire, and floorDiv silently degraded
 //     to TRUNCATING division for every column with a negative world
-//     coordinate â€” wrong raster pixel, wrong noise lattice cell, metre-scale
+//     coordinate — wrong raster pixel, wrong noise lattice cell, metre-scale
 //     surfaceMm/topsoilMm/subsoilMm divergence.
 //
 // Everything below therefore routes signed division through MAGNITUDE-ONLY
@@ -210,7 +210,7 @@ uint64_t absToU64(int64_t v)
     return (v < 0) ? ((uint64_t)0 - u) : u;
 }
 
-// Truncating division â€” bit-exact mirror of C++ `/` on int64_t.
+// Truncating division — bit-exact mirror of C++ `/` on int64_t.
 int64_t truncDiv(int64_t a, int64_t b)
 {
     const uint64_t uq = absToU64(a) / absToU64(b);
@@ -218,7 +218,7 @@ int64_t truncDiv(int64_t a, int64_t b)
     return ((a < 0) != (b < 0)) ? (int64_t)((uint64_t)0 - uq) : (int64_t)uq;
 }
 
-// Floored division â€” bit-exact mirror of vxc::floorDiv (core.h).
+// Floored division — bit-exact mirror of vxc::floorDiv (core.h).
 int64_t floorDiv(int64_t a, int64_t b)
 {
     const uint64_t ua = absToU64(a);
@@ -255,7 +255,7 @@ uint64_t hash2(uint64_t seed, int64_t x, int64_t y, uint channel)
                              splitmix64((uint64_t)channel))));
 }
 
-// vxc::hash3 (hash.h) bit-for-bit â€” one more splitmix64 round than hash2.
+// vxc::hash3 (hash.h) bit-for-bit — one more splitmix64 round than hash2.
 // Used by the cavern pass's per-room geometry channel (CH_CAVERN_SITE), which
 // needs the room index as a third coordinate.
 uint64_t hash3(uint64_t seed, int64_t x, int64_t y, int64_t z, uint channel)
@@ -285,7 +285,7 @@ int64_t valueNoise2(uint64_t seed, int64_t xMm, int64_t yMm, int64_t latticeMm, 
     const int64_t v11 = hashToSigned16(hash2(seed, x0 + 1, y0 + 1, channel));
     const int64_t gx = latticeMm - fx;
     const int64_t gy = latticeMm - fy;
-    // Numerator is routinely negative (v* in [-32768, 32767]) â€” truncDiv, not
+    // Numerator is routinely negative (v* in [-32768, 32767]) — truncDiv, not
     // `/`, per the floorDiv comment above.
     return truncDiv((v00 * gx + v10 * fx) * gy + (v01 * gx + v11 * fx) * fy,
                     latticeMm * latticeMm);
@@ -298,7 +298,7 @@ int64_t valueNoise2(uint64_t seed, int64_t xMm, int64_t yMm, int64_t latticeMm, 
 //
 // Every operand here is NON-NEGATIVE: fx is in [0, latticeMm) by floorDiv's
 // contract, and the quintic is nonneg on [0, 1]. So the divisions are
-// same-sign and truncDiv agrees with `/` on both CPU and GPU â€” but they go
+// same-sign and truncDiv agrees with `/` on both CPU and GPU — but they go
 // through truncDiv anyway, because "this operand happens to be positive
 // today" is exactly the reasoning the M0 NVIDIA-vs-AMD divergence punished.
 int64_t fadeFractionMm(int64_t fx, int64_t latticeMm)
@@ -311,7 +311,7 @@ int64_t fadeFractionMm(int64_t fx, int64_t latticeMm)
 }
 
 // vxc::valueNoise2Fade (hash.h) bit-for-bit. Same lattice, same hashes, same
-// output range as valueNoise2 â€” only the interpolation weights differ.
+// output range as valueNoise2 — only the interpolation weights differ.
 int64_t valueNoise2Fade(uint64_t seed, int64_t xMm, int64_t yMm, int64_t latticeMm, uint channel)
 {
     const int64_t x0 = floorDiv(xMm, latticeMm);
@@ -324,7 +324,7 @@ int64_t valueNoise2Fade(uint64_t seed, int64_t xMm, int64_t yMm, int64_t lattice
     const int64_t v11 = hashToSigned16(hash2(seed, x0 + 1, y0 + 1, channel));
     const int64_t gx = latticeMm - fx;
     const int64_t gy = latticeMm - fy;
-    // Numerator is routinely negative (v* in [-32768, 32767]) â€” truncDiv, not
+    // Numerator is routinely negative (v* in [-32768, 32767]) — truncDiv, not
     // `/`, per the floorDiv comment above.
     return truncDiv((v00 * gx + v10 * fx) * gy + (v01 * gx + v11 * fx) * fy,
                     latticeMm * latticeMm);
@@ -440,7 +440,7 @@ int64_t slopeScaleQ10(int64_t slopeMmPerM)
 
 // vxc::microScaleQ10 (amplifier.cpp) bit-for-bit. The microrelief band's
 // scale: same shape as slopeScaleQ10, deliberately a different curve, and it
-// NEVER drops below 0.75 â€” flat ground is still bumpy, and at 10 cm voxels
+// NEVER drops below 0.75 — flat ground is still bumpy, and at 10 cm voxels
 // flat ground is exactly where the terrace artifact is worst. It is also
 // almost slope-FLAT by design (divisor 256, ceiling 1.25): amplifying the
 // fine band on steep ground turned a mountainside into rubble in-engine.
@@ -556,7 +556,7 @@ cbuffer WorldGenParams : register(b0)
     uint SeedLo;            // uint64 seed split across two 32-bit values (ColumnMain)
     uint SeedHi;
     int OriginVx;           // world voxel coord of dispatch column (0,0);
-    int OriginVy;           // int32 spans +/-214,000 km at 10cm â€” Earth fits
+    int OriginVy;           // int32 spans +/-214,000 km at 10cm — Earth fits
     int BrickZMin;          // (VoxelizeMain) lowest brick z-index of the stack:
                              // covers voxel z in [BrickZMin*8, (BrickZMin+BricksZ)*8)
     uint BricksZ;           // (VoxelizeMain) number of bricks in the vertical stack
@@ -585,7 +585,7 @@ StructuredBuffer<uint> ClimatePacked VXC_REG(t1);
 RWStructuredBuffer<GpuColumnSample> OutColumns VXC_REG(u0);
 
 // VoxelizeMain-only bindings. InColumns is the SAME buffer OutColumns was
-// written to by the chained ColumnMain dispatch â€” columns are read back, not
+// written to by the chained ColumnMain dispatch — columns are read back, not
 // recomputed. Registers t3/u2 are deliberately non-contiguous with t0/t1/u0
 // so that after tools/compile-shaders.ps1's DXC -fvk-*-shift mapping
 // (b->+0, t->+1, u->+3) EVERY resource declared in this file lands on a
@@ -593,7 +593,7 @@ RWStructuredBuffer<GpuColumnSample> OutColumns VXC_REG(u0);
 // kernel's compiled entry point ends up referencing it:
 //   b0 WorldGenParams -> binding 0   (both kernels)
 //   t0 ElevationMm    -> binding 1   (ColumnMain AND, since the C6 cavern
-//                                     mirror, VoxelizeMain â€” cavernSiteFor
+//                                     mirror, VoxelizeMain — cavernSiteFor
 //                                     needs the surface at the SITE's xy)
 //   t1 ClimatePacked  -> binding 2   (ColumnMain)
 //   u0 OutColumns     -> binding 3   (ColumnMain)
@@ -604,7 +604,7 @@ RWStructuredBuffer<GpuColumnSample> OutColumns VXC_REG(u0);
 StructuredBuffer<GpuColumnSample> InColumns VXC_REG(t3);
 
 // One uint per cell, material id 0-255 in the low byte (packing optimization
-// left for later). Layout â€” see the VoxelizeMain doc comment below for the
+// left for later). Layout — see the VoxelizeMain doc comment below for the
 // precise brick/cell indexing this buffer is written with.
 RWStructuredBuffer<uint> OutCells VXC_REG(u2);
 
@@ -612,12 +612,12 @@ RWStructuredBuffer<uint> OutCells VXC_REG(u2);
 // controlled and unvalidated in-shader. When RasterSize.x == 0 the clamp
 // upper bound `(int64_t)RasterSize.x - 1` is -1 while the lower bound is 0,
 // so clamp64 returns -1 for any px past the origin (`v > hi` wins), and the
-// `(uint)` cast turns that into ~4 billion â€” a wild out-of-bounds load whose
+// `(uint)` cast turns that into ~4 billion — a wild out-of-bounds load whose
 // result is vendor-defined (AMD's range-checked descriptors return 0,
 // NVIDIA's may return adjacent memory). An empty raster window carries no
 // data to interpolate, so return the zero element deterministically instead.
-// This is a GUARD, not a behavior change: for RasterSize.{x,y} >= 1 â€” every
-// window the harness/RDG pass ever binds â€” the guard is never taken and the
+// This is a GUARD, not a behavior change: for RasterSize.{x,y} >= 1 — every
+// window the harness/RDG pass ever binds — the guard is never taken and the
 // clamp is unchanged.
 int rasterElevationMm(int64_t px, int64_t py)
 {
@@ -640,7 +640,7 @@ uint rasterClimate(int64_t px, int64_t py)
 }
 
 // --- evalSurface: bit-exact mirror of vxc::Amplifier::evalSurface ----------
-// The surface half of column() â€” bilinear tile base plus the slope-scaled
+// The surface half of column() — bilinear tile base plus the slope-scaled
 // detail octaves, and the two by-products (tile pixel, tile slope) the rest of
 // ColumnMain needs.
 //
@@ -650,7 +650,7 @@ uint rasterClimate(int64_t px, int64_t py)
 // the querying column's, and that height must be produced by the very same
 // function the querying column's own surfaceMm came from. VoxelizeMain
 // therefore calls this directly (see cavernSiteFor below) instead of
-// GpuColumnSample being widened to carry a site surface â€” which it could not
+// GpuColumnSample being widened to carry a site surface — which it could not
 // do anyway, since the site is not a column in the dispatch.
 //
 // CALLER CONTRACT: this reads ElevationMm, so any kernel that calls it must
@@ -703,7 +703,7 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     const int64_t slopeMmPerM = carrierSlopeMmPerM(carrier, pxMm);
 
     // Two bands, accumulated separately because they take different scales,
-    // and each scaled ONCE â€” mirroring Amplifier::evalSurface exactly,
+    // and each scaled ONCE — mirroring Amplifier::evalSurface exactly,
     // including WHERE the truncations happen. Moving a truncation is a
     // divergence even when the arithmetic is otherwise identical.
     const int64_t sScale = slopeScaleQ10(slopeMmPerM);
@@ -783,8 +783,8 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
     // (and on some stacks it can fault). There is no meaningful column to
     // derive from a zero-size pixel, so refuse the dispatch deterministically.
     // Mirrored by a host-side assert in voxel-core/bench/gpu_harness.cpp.
-    // GUARD ONLY: valid PixelSizeMm is 30000 (scale 1) or 3750 (scale 8) â€”
-    // never 0 â€” so this branch is never taken on any real dispatch.
+    // GUARD ONLY: valid PixelSizeMm is 30000 (scale 1) or 3750 (scale 8) —
+    // never 0 — so this branch is never taken on any real dispatch.
     if (PixelSizeMm == 0)
         return;
 
@@ -866,7 +866,7 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
     int64_t topsoil = truncDiv(topsoilBaseMm * retainQ10, 1024);
     const int64_t tj =
         (int64_t)hashToSigned16(hash2(seed, floorDiv(vx, 16), floorDiv(vy, 16), CH_TOPSOIL_JITTER));
-    topsoil += truncDiv(topsoil * tj, 4 * 32768); // tj is signed â€” truncDiv.
+    topsoil += truncDiv(topsoil * tj, 4 * 32768); // tj is signed — truncDiv.
     // Clamp AFTER the jitter: kTopsoilMinMm is what guarantees at least one
     // visible biome-coloured voxel on every column, and clamping first would
     // let a -25% draw break that.
@@ -877,14 +877,14 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
     outCol.subsoilMm = (int)clamp64((int64_t)outCol.topsoilMm * 2 + 500, 0, 6000);
 
     // Bedrock top: a jittered band CENTRED ON 200 m. kWorldGenVersion 5 moved
-    // this from 40-60 m to 180-220 m (amplifier.cpp â€” read its comment for
+    // this from 40-60 m to 180-220 m (amplifier.cpp — read its comment for
     // why 200 m is the band's MEAN, not its floor). Same deterministic shape
     // as before, one 16-bit hash field linearly mapped onto [base, base+span);
     // only the two constants moved.
     const uint64_t bj = hash2(seed, floorDiv(vx, 64), floorDiv(vy, 64), CH_BEDROCK_JITTER);
     outCol.bedrockDepthMm = (int)(180000 + ((bj >> 48) * 40000) / 65536);
 
-    // Surface material from biome classification (M4) â€” morphology gates
+    // Surface material from biome classification (M4) — morphology gates
     // then Whittaker climate lookup, bit-exact mirror of
     // vxc::Amplifier::column's classifyBiome/biomeSurfaceMaterial call.
     // Dithered temperature/precipitation, undithered seasonality -- and the
@@ -909,7 +909,7 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
 //     (bx, by) = (tid.x / 8, tid.y / 8) at local column (lx, ly) = (tid.x % 8, tid.y % 8).
 //   - The vertical stack for footprint (bx, by) holds BricksZ bricks; stack
 //     index bz in [0, BricksZ) maps to actual brick z = BrickZMin + bz,
-//     covering voxel z in [(BrickZMin+bz)*8, (BrickZMin+bz)*8 + 8) â€” i.e. the
+//     covering voxel z in [(BrickZMin+bz)*8, (BrickZMin+bz)*8 + 8) — i.e. the
 //     whole stack spans voxel z in [BrickZMin*8, (BrickZMin+BricksZ)*8).
 //   - Bricks are ordered z-major WITHIN a column's stack, and footprints are
 //     ordered bx-major-x-then-y (row-major, x fastest):
@@ -925,7 +925,7 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
 uint cellIndexInBrick(uint x, uint y, uint z) { return x + 8u * (y + 8u * z); }
 
 // vxc::Amplifier::stratigraphyAt bit-for-bit (the layer model, cave pass NOT
-// applied â€” materialAt below is the full function).
+// applied — materialAt below is the full function).
 uint stratigraphyAt(GpuColumnSample col, int64_t vz)
 {
     const int64_t centreMm = vz * (int64_t)kVoxelSizeMm + (int64_t)kVoxelSizeMm / 2;
@@ -954,7 +954,7 @@ uint stratigraphyAt(GpuColumnSample col, int64_t vz)
 // can be diffed by eye. DO NOT let them drift.
 //
 // Recomputed here per VoxelizeMain thread rather than carried through
-// GpuColumnSample: it needs only (seed, vx, vy, surfaceMm) â€” no raster reads â€”
+// GpuColumnSample: it needs only (seed, vx, vy, surfaceMm) — no raster reads —
 // so recomputing costs the same 34 hashes ColumnMain would have paid, keeps
 // the column buffer layout (and the harness's column comparison) unchanged,
 // and avoids widening a cross-kernel struct contract.
@@ -976,14 +976,14 @@ static const int kCaveMinSurfaceMm = 12000;
 static const int64_t kCaveMinVoxelZ = 0;
 // Raised 8 -> 12 by M4 cave pass v2 (C2): a crevice can now ride the SAME
 // lattice edge as a tunnel, so a junction column can see 4 tunnels + 4
-// crevices; 12 leaves headroom. Mirrors caves.h's kMaxCaveSegs exactly â€” the
+// crevices; 12 leaves headroom. Mirrors caves.h's kMaxCaveSegs exactly — the
 // cap is part of the worldgen contract because it decides, together with the
 // (dj, di, dir) iteration order, which segments survive if it were ever hit.
 static const int kMaxCaveSegs = 12;
 
-// Crevices (M4 cave pass v2, docs/cavern-design.md Â§4): a 1-in-8 gated thin
+// Crevices (M4 cave pass v2, docs/cavern-design.md §4): a 1-in-8 gated thin
 // lens-tapered vertical slab riding an EXISTING tube's axis. Not a new
-// generator and not a new per-voxel mechanism â€” it emits an ordinary CaveSeg
+// generator and not a new per-voxel mechanism — it emits an ordinary CaveSeg
 // in depth space, so caveCarveAt is untouched.
 static const uint64_t kCrevGateMask = 7;
 static const int64_t kCrevHalfThickMinMm = 300;
@@ -993,7 +993,7 @@ static const int64_t kCrevUpSpanMm = 7000;
 static const int64_t kCrevDownMinMm = 2000;
 static const int64_t kCrevDownSpanMm = 4000;
 
-// HashChannel ids from voxelcore/caves.h â€” append only, never renumber.
+// HashChannel ids from voxelcore/caves.h — append only, never renumber.
 static const uint CH_CAVE_NODE = 18;
 static const uint CH_CAVE_EDGE = 19;
 static const uint CH_CAVE_RADIUS = 20;
@@ -1116,7 +1116,7 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
                 // us within the (wider) tunnel radius of this axis, and
                 // kCrevHalfThickMaxMm < kCaveRadiusMinMm, so a column outside
                 // the tube is provably outside the crevice's narrower
-                // corridor too â€” no separate reject was skipped.
+                // corridor too — no separate reject was skipped.
                 //
                 // caves.h computes this hash for every existing edge (its
                 // lattice block) and reads it only here; recomputing it lazily
@@ -1146,7 +1146,7 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
                         // rather than the exact rational num*(den-num)/den^2:
                         // den = dx^2+dy^2 reaches ~5e9 mm^2 for a jittered
                         // edge, so den*den overflows int64. caves.h found that
-                        // overflow and took the same Q16 route â€” this mirrors
+                        // overflow and took the same Q16 route — this mirrors
                         // it exactly, including both floorDivs.
                         const int64_t uQ16 = floorDiv(num << 16, den);
                         const int64_t taperQ16 = (4 * uQ16 * ((int64_t)65536 - uQ16)) >> 16;
@@ -1166,7 +1166,7 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
         }
     }
 
-    // Sinkhole shaft â€” at most one backbone-crossing node is in reach.
+    // Sinkhole shaft — at most one backbone-crossing node is in reach.
     for (int sj = 0; sj < 3; ++sj)
     {
         for (int si = 0; si < 3; ++si)
@@ -1224,7 +1224,7 @@ bool caveCarveAt(GpuCaveColumn cc, int surfaceMm, int bedrockDepthMm, int64_t vz
 //
 // The CPU splits this into cavernCandidatesFor (per coarse cell) +
 // cavernSiteFor (per site) + cavernColumnFromSites (per column) purely so
-// amplifier.cpp can memoise the first two â€” each is a pure function of the
+// amplifier.cpp can memoise the first two — each is a pure function of the
 // coarse cell / site respectively. The fused form below is what caverns.h
 // calls "the pure, self-contained f(...) the HLSL mirror is written against",
 // and is bit-identical by construction: same arithmetic, same (dj, di, room)
@@ -1276,7 +1276,7 @@ static const uint CH_CAVERN_SITE = 22;  // per-room geometry (radii/floor/step)
 static const uint CH_CAVERN_ROUGH = 23; // per-column wall roughness
 static const uint CH_CAVERN_FLOOD = 25; // per-site flood level
 
-// vxc::cavernHashField10 â€” unsigned 10-bit field -> [0, spanMm), multiply-
+// vxc::cavernHashField10 — unsigned 10-bit field -> [0, spanMm), multiply-
 // then-shift, never a division. The CPU takes a `shift` parameter; here the
 // caller pre-shifts instead, so every shift distance in this file stays an
 // integer LITERAL (a variable shift distance is undefined past the operand
@@ -1322,7 +1322,7 @@ struct GpuCavernColumn
 // floor that drapes with the terrain overhead is visibly wrong; caverns anchor
 // at absolute z so floors and water tables stay level. amplifier.cpp supplies
 // `evalSurface(floorDiv(xMm, kVoxelSizeMm), floorDiv(yMm, kVoxelSizeMm))
-// .surfaceMm` â€” including the mm -> voxel floorDiv, mirrored exactly below.
+// .surfaceMm` — including the mm -> voxel floorDiv, mirrored exactly below.
 GpuCavernSite cavernSiteFor(uint64_t seed, int64_t fi, int64_t fj, GpuCaveNode node)
 {
     GpuCavernSite site;
@@ -1384,7 +1384,7 @@ GpuCavernSite cavernSiteFor(uint64_t seed, int64_t fi, int64_t fj, GpuCaveNode n
     return site;
 }
 
-// vxc::cavernColumnFor bit-for-bit â€” the fused candidates + per-column
+// vxc::cavernColumnFor bit-for-bit — the fused candidates + per-column
 // reduction, including the (dj, di) corner order and the per-room order that
 // together decide which segments survive the kMaxCavernSegs cap.
 GpuCavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm)
@@ -1399,7 +1399,7 @@ GpuCavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfa
         cv.zCenterMm[q] = 0;
         cv.zFloorMm[q] = 0;
     }
-    // The QUERYING column's ordinary ocean/beach guard â€” deliberately the more
+    // The QUERYING column's ordinary ocean/beach guard — deliberately the more
     // permissive kCaveMinSurfaceMm; kCavernMinSurfaceMm is stricter and
     // applies only to the SITE's own surface, inside cavernSiteFor.
     if (surfaceMm < kCaveMinSurfaceMm) return cv;
@@ -1416,7 +1416,7 @@ GpuCavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfa
             const int64_t fi = (si + (int64_t)di) * kCavernCoarseLatticeRatio;
             const int64_t fj = (sj + (int64_t)dj) * kCavernCoarseLatticeRatio;
 
-            // vxc::cavernCandidatesFor: cheapest reject first â€” the site gate
+            // vxc::cavernCandidatesFor: cheapest reject first — the site gate
             // folded into bits 60/61 of the node-jitter hash caveNode() would
             // compute anyway, then the node those same bits also encode
             // (vxc::caveNodeFromHash), then child 0's depth safety window.
@@ -1503,7 +1503,7 @@ bool cavernCarveAt(GpuCavernColumn cv, int surfaceMm, int bedrockDepthMm, int64_
 }
 
 // vxc::Amplifier::materialAt bit-for-bit (stratigraphy, then caves, then
-// caverns â€” caverns ordered last purely because a cavern column is far rarer,
+// caverns — caverns ordered last purely because a cavern column is far rarer,
 // so the common case never reaches that call: cavernCarveAt's first test is
 // `count == 0`).
 uint materialAt(GpuColumnSample col, GpuCaveColumn cc, GpuCavernColumn cv, int64_t vz)
@@ -1523,7 +1523,7 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
 
     // Same guard as ColumnMain, and now load-bearing for the same reason: the
     // cavern pass calls evalSurface (for the SITE's surface height), which
-    // divides by PixelSizeMm. GUARD ONLY â€” valid values are 30000 or 3750.
+    // divides by PixelSizeMm. GUARD ONLY — valid values are 30000 or 3750.
     if (PixelSizeMm == 0)
         return;
 
@@ -1534,7 +1534,7 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
 
     const GpuColumnSample col = InColumns[tid.x + tid.y * DispatchColumns.x];
 
-    // Cave pass: one reduction per column, reused down the whole brick stack â€”
+    // Cave pass: one reduction per column, reused down the whole brick stack —
     // the same split vxc::ColumnSample::cave makes on the CPU.
     const uint64_t caveSeed = ((uint64_t)SeedHi << 32) | (uint64_t)SeedLo;
     // D5: same coarse mapping ColumnMain used, so the cave and cavern passes
@@ -1545,9 +1545,9 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
 
     // Cavern pass, wired in exactly as the cave pass above: one reduction per
     // column, reused down the whole brick stack. Unlike caves it DOES read the
-    // raster â€” cavernSiteFor evaluates the terrain height at the site's own xy
-    // (see its comment) â€” so VoxelizeMain now binds ElevationMm (t3 -> Vulkan
-    // binding 1). caverns.h's design doc Â§3.5 chose this over widening
+    // raster — cavernSiteFor evaluates the terrain height at the site's own xy
+    // (see its comment) — so VoxelizeMain now binds ElevationMm (t3 -> Vulkan
+    // binding 1). caverns.h's design doc §3.5 chose this over widening
     // GpuColumnSample: the site is generally not a column in the dispatch, so
     // there is no column entry to carry its surface on.
     const GpuCavernColumn cavern = cavernColumnFor(caveSeed, colVx, colVy, col.surfaceMm);
@@ -1615,19 +1615,19 @@ RWStructuredBuffer<uint2> OutQuads VXC_REG(u5);
 // (voxel.GPU.VerifyRegion and the Vulkan bench) folds the packed quad FIELDS
 // into its digest. slice/u0/v0 are quad fields. Rebasing them changes the
 // digest even though the quads are display-only and the underlying geometry is
-// identical â€” so an unconditional edit here would turn Wave C's freshly green
+// identical — so an unconditional edit here would turn Wave C's freshly green
 // gate red for a reason that has nothing to do with worldgen. Gating it means
 // the gate keeps compiling and running the byte-for-byte identical program it
 // was pinned against, and the streaming path gets its own permutation.
 //
 // The gate on the NEW permutation is voxel.GPU.VerifyAsyncMesh, which
-// byte-compares against MeshChunkBricks + PackVoxelChunkQuad â€” a strictly
+// byte-compares against MeshChunkBricks + PackVoxelChunkQuad — a strictly
 // stronger check than the digest for this purpose, because the CPU mesher it
 // compares against is the shipping one and it compares CHUNK-local quads.
 //
 // UNREAL ONLY, DELIBERATELY. Keeping the whole thing behind a define that the
 // standalone DXC leg never sets means tools/compile-shaders.ps1 re-emits
-// byte-identical SPIR-V â€” the same property Wave C's version-lock edit relied
+// byte-identical SPIR-V — the same property Wave C's version-lock edit relied
 // on, and the reason the bench leg is provably still running the program its
 // digest was recorded from.
 #ifndef VXC_MESH_CHUNK_LOCAL
@@ -1646,13 +1646,13 @@ static const uint kBricksPerChunkEdge = 4u;
 // First slot in OutQuads this dispatch may write. Zero for a single chunk
 // meshing into its own buffer; non-zero when several chunks share one buffer.
 // Loose global under VXC_UE, bound by reflected name out of
-// FVoxelMeshEmitCS::FParameters â€” see the $Globals comment above.
+// FVoxelMeshEmitCS::FParameters — see the $Globals comment above.
 uint QuadWriteBase;
 
 // Chunk-local voxel origin of the interior brick that owns this mask.
 //
 // Interior brick (ix,iy,iz) of the region sits at region-local voxel origin
-// ((ix+1)*8, (iy+1)*8, (iz+1)*8) â€” the +1 is the halo brick decodeMask adds.
+// ((ix+1)*8, (iy+1)*8, (iz+1)*8) — the +1 is the halo brick decodeMask adds.
 // Its CHUNK-local origin is (ix*8, iy*8, iz*8) modulo the chunk, i.e. the halo
 // term comes straight back out. The `% kBricksPerChunkEdge` is what makes a
 // multi-chunk region work: interior brick 4 on an axis is brick 0 of the NEXT
@@ -1803,7 +1803,7 @@ uint greedyMask(int3 brickOriginRv, uint axis, uint dir, uint slice, uint emit, 
             }
             // HARDENING (2026-07 cross-vendor UB pass, issue 2). This was
             //   while (i2 + w < 8u && mask[i2 + w + 8u * j2] == key) ++w;
-            // which reads mask[64] â€” one past `uint mask[64]` â€” on the
+            // which reads mask[64] — one past `uint mask[64]` — on the
             // terminating iteration of the last row (i2 + w == 8, j2 == 7).
             // It is only safe if `&&` short-circuits, and HLSL has
             // historically declined to guarantee short-circuit evaluation for
@@ -1811,7 +1811,7 @@ uint greedyMask(int3 brickOriginRv, uint axis, uint dir, uint slice, uint emit, 
             // does short-circuit today, but that is a compiler property, not
             // a contract). Hoisting the bound into its own `if` makes the
             // in-range test structural. Identical iteration count and
-            // identical `w` for every input â€” pure control-flow rewrite.
+            // identical `w` for every input — pure control-flow rewrite.
             uint w = 1u;
             while (i2 + w < 8u)
             {
@@ -1844,7 +1844,7 @@ uint greedyMask(int3 brickOriginRv, uint axis, uint dir, uint slice, uint emit, 
 #if VXC_MESH_CHUNK_LOCAL
                 // D2: bake the brick's chunk-local origin into the three
                 // position fields, so the quad is positioned in the chunk on
-                // its own. slice runs along `axis`, i2 along u, j2 along v â€”
+                // its own. slice runs along `axis`, i2 along u, j2 along v —
                 // the same axis assignment RebaseQuadsToChunkLocal used on the
                 // CPU, which is the code this replaces. Every term stays under
                 // 32 for a 32-voxel chunk, so the 8-bit fields do not overflow.
@@ -1907,7 +1907,7 @@ bool decodeMask(uint maskIndex, out int3 brickOriginRv, out uint axis, out uint 
     // mbx*mby*mbz*48 then wraps to some large-but-arbitrary maskCount that
     // the `maskIndex >= maskCount` range check happily passes. decodeMask
     // would return true with a nonsense brick origin, and regionCellMat
-    // would read OutCells far out of bounds â€” vendor-defined behavior
+    // would read OutCells far out of bounds — vendor-defined behavior
     // exactly like the bug this pass exists to prevent (AMD's range-checked
     // descriptors return 0; NVIDIA's may return adjacent memory). A region
     // that thin has NO interior bricks, so the correct answer is "no mask".
@@ -1954,7 +1954,7 @@ void MeshCountMain(uint3 tid : SV_DispatchThreadID)
         return;
     // The chunk-local origin is an emit-time concern only: counting is
     // position-independent, so this passes zero and the count is identical
-    // under either permutation. That matters â€” the scan chain between count
+    // under either permutation. That matters — the scan chain between count
     // and emit must produce the SAME offsets whichever way emit is compiled.
     OutQuadCounts[tid.x] = greedyMask(origin, axis, dir, slice, 0u, 0u
 #if VXC_MESH_CHUNK_LOCAL
@@ -1971,7 +1971,7 @@ void MeshEmitMain(uint3 tid : SV_DispatchThreadID)
     if (!decodeMask(tid.x, origin, axis, dir, slice))
         return;
     // HARDENING (2026-07 cross-vendor UB pass, issue 3). InQuadOffsets[i] is
-    // only meaningful for i < ScanCount â€” those are the entries the
+    // only meaningful for i < ScanCount — those are the entries the
     // ScanBlocks/Sums/Add chain actually wrote. Emitting from an offset
     // beyond ScanCount would read never-written device memory, whose
     // contents differ by driver and allocation history, and then use it as a
@@ -1989,17 +1989,17 @@ void MeshEmitMain(uint3 tid : SV_DispatchThreadID)
 
 // --- GPU exclusive scan over per-mask quad counts ---------------------------
 // Replaces the host scan between count and emit (the 128m gate's dominant
-// cost â€” see docs/status.md). Determinism: fixed-order shared-memory
+// cost — see docs/status.md). Determinism: fixed-order shared-memory
 // Hillis-Steele over integers, identical result to the host scan by
 // definition of exclusive scan. Three dispatches chained in ONE command
 // buffer with barriers:
 //   ScanBlocksMain: per-256-block exclusive scan of OutQuadCounts into
 //                   OutQuadOffsets + per-block totals into OutBlockSums.
 //   ScanSumsMain:   ONE workgroup exclusive-scans OutBlockSums in place
-//                   (max 256 blocks => maskCount <= 65,536 per dispatch â€”
+//                   (max 256 blocks => maskCount <= 65,536 per dispatch —
 //                   the harness asserts this per tile).
 //   ScanAddMain:    adds the scanned block base to every element.
-// The emit pass then reads InQuadOffsets â€” the SAME buffer bound read-only.
+// The emit pass then reads InQuadOffsets — the SAME buffer bound read-only.
 // ScanCount (cbuffer append) = number of masks in this dispatch.
 
 RWStructuredBuffer<uint> OutQuadOffsets VXC_REG(u6);
@@ -2015,7 +2015,7 @@ void ScanBlocksMain(uint3 tid : SV_DispatchThreadID, uint3 gtid : SV_GroupThread
     const uint v = (tid.x < n) ? OutQuadCounts[tid.x] : 0u;
     gsScan[gtid.x] = v;
     GroupMemoryBarrierWithGroupSync();
-    // Hillis-Steele inclusive scan (fixed iteration order â€” deterministic).
+    // Hillis-Steele inclusive scan (fixed iteration order — deterministic).
     [unroll]
     for (uint offset = 1u; offset < 256u; offset <<= 1u)
     {

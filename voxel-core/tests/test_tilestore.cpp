@@ -1,7 +1,7 @@
-﻿// Tile decoding + sampling (plan Â§3.1 step 2, Â§3.4 ITerrainSource): a
+﻿// Tile decoding + sampling (plan §3.1 step 2, §3.4 ITerrainSource): a
 // cross-language fixture test. The fixture file is a byte-for-byte tile
 // produced by terrain-service's Python synthetic provider + tile_codec.encode
-// (seed=1, x=0, y=0, scale=1) â€” see voxel-core/tests/fixtures/README-less
+// (seed=1, x=0, y=0, scale=1) — see voxel-core/tests/fixtures/README-less
 // provenance note below. Pinned pixel values were read once from the same
 // Python invocation that generated the fixture and hardcoded here (golden
 // pattern, like amplifier_golden_digest in test_amplifier.cpp).
@@ -67,7 +67,7 @@ VXC_TEST(tiledata_parses_fixture_header_and_pinned_pixels) {
     CHECK_EQ(tile->elevation.size(), size_t(TileData::kPixelCount));
     for (const auto& plane : tile->climate) CHECK_EQ(plane.size(), size_t(TileData::kPixelCount));
 
-    // Pinned pixel values (synthetic-v1, seed=1, tile (0,0), scale=1) â€” read
+    // Pinned pixel values (synthetic-v1, seed=1, tile (0,0), scale=1) — read
     // once from the Python provider output that produced the fixture.
     CHECK_EQ(tile->elevationAt(0, 0), int16_t(1210));
     CHECK_EQ(tile->elevationAt(1, 0), int16_t(1204));
@@ -184,7 +184,7 @@ VXC_TEST(tilegridsampler_pixel_routing_and_missing_tile_counter) {
     CHECK_EQ(s.missingTileQueries.load(), uint64_t(2));
 
     // Negative pixel coords: floorDiv(-1,512) == -1, a different (missing)
-    // tile from tile (0,0) â€” must NOT alias to the loaded tile via truncation
+    // tile from tile (0,0) — must NOT alias to the loaded tile via truncation
     // toward zero.
     CHECK_EQ(s.elevationMm(-1, -1), int32_t(0));
     CHECK_EQ(s.missingTileQueries.load(), uint64_t(3));
@@ -200,7 +200,7 @@ VXC_TEST(tilegridsampler_pixel_routing_and_missing_tile_counter) {
 }
 
 VXC_TEST(amplifier_over_tilegridsampler_is_deterministic) {
-    // Determinism through the real-data path (plan Â§2.3): the amplifier must
+    // Determinism through the real-data path (plan §2.3): the amplifier must
     // produce identical output across two independently loaded samplers over
     // the same fixture tile, with zero missing-tile fallbacks in the probed
     // range (proving the columns are actually driven by loaded tile data).
@@ -246,7 +246,7 @@ VXC_TEST(amplifier_over_tilegridsampler_is_deterministic) {
 VXC_TEST(amplifier_over_manual_tiles_end_to_end) {
     // Same determinism proof as amplifier_over_tilegridsampler_is_deterministic,
     // but driving TileGridSampler from hand-built TileData (no fixture/codec
-    // in the loop) â€” this is the shape UE runtime code will construct tiles
+    // in the loop) — this is the shape UE runtime code will construct tiles
     // in once decoded from the terrain service, so it's worth pinning
     // independently of the fixture-based path.
     constexpr uint64_t seed = 20260721;
@@ -325,8 +325,8 @@ VXC_TEST(amplifier_over_manual_tiles_end_to_end) {
 VXC_TEST(missing_tile_fallback_is_deterministic_through_amplifier) {
     // Querying far outside any loaded tile must fall back to the documented
     // deterministic default (elevation 0, default ClimateSample), bump the
-    // counter, and â€” since the amplifier is a pure function of what the
-    // sampler returns â€” still produce byte-identical Amplifier output across
+    // counter, and — since the amplifier is a pure function of what the
+    // sampler returns — still produce byte-identical Amplifier output across
     // two independently constructed (empty) samplers.
     constexpr uint64_t seed = 555;
     TileGridSampler samplerA(seed, 1), samplerB(seed, 1); // no tiles loaded at all
@@ -364,7 +364,7 @@ VXC_TEST(missing_tile_fallback_is_deterministic_through_amplifier) {
     CHECK_EQ(digestA.h, digestB.h);
     // Every query in this loop misses (nothing is loaded), and both samplers
     // ran the exact same query sequence, so their tallies must match exactly
-    // â€” not merely both be nonzero.
+    // — not merely both be nonzero.
     CHECK_EQ(samplerA.missingTileQueries.load(), samplerB.missingTileQueries.load());
     CHECK(samplerA.missingTileQueries.load() > uint64_t(2));
 }

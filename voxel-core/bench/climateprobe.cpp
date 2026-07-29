@@ -1,4 +1,4 @@
-﻿// vxc_climateprobe -- diagnostic for the climate/biome/stratigraphy consumers.
+// vxc_climateprobe -- diagnostic for the climate/biome/stratigraphy consumers.
 //
 // WHY THIS EXISTS. The tile CLIMATE channels carry PHYSICAL WorldClim units
 // quantized over Earth-extreme ranges (terrain-service diffusion.py's

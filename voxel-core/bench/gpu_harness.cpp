@@ -1,4 +1,4 @@
-﻿// M0-gate Vulkan harness (ADR-0001): dispatches the SPIR-V worldgen kernels
+// M0-gate Vulkan harness (ADR-0001): dispatches the SPIR-V worldgen kernels
 // (voxel-core/shaders/worldgen.ush, ColumnMain + VoxelizeMain) on this
 // machine's GPU and byte-compares every field/cell against the CPU reference
 // (vxc::Amplifier::column / vxc::Amplifier::materialAt). This desktop is the
@@ -12,14 +12,14 @@
 // libvulkan.so.1 on Linux) is loaded dynamically at runtime
 // (LoadLibrary/dlopen + vkGetInstanceProcAddr) and every Vulkan entry point
 // used below is resolved through that one function via the X-macro tables,
-// so there is no import-lib link dependency â€” only tools/vulkan-headers'
+// so there is no import-lib link dependency — only tools/vulkan-headers'
 // headers on Windows, or the system Vulkan headers on Linux
 // (types/structs/PFN_ typedefs) are needed at compile time.
 //
 // Two kernels, two pipelines, one shared cbuffer, chained through one
 // buffer: ColumnMain writes OutColumns; that SAME VkBuffer is then bound as
 // VoxelizeMain's InColumns (a pipeline barrier makes the write visible to
-// the second dispatch's reads) â€” columns are never recomputed on GPU.
+// the second dispatch's reads) — columns are never recomputed on GPU.
 //
 // Resource bindings mirror worldgen.ush exactly, but DXC's default SPIR-V
 // codegen maps each HLSL register class (b/t/u) independently onto the same
@@ -39,7 +39,7 @@
 // Platform split (M0 close-out, NVIDIA/Linux leg): everything below this
 // comment is identical on both platforms except the ~30-line dynamic-loader
 // shim directly below (LoadLibrary/GetProcAddress/FreeLibrary on Windows,
-// dlopen/dlsym/dlclose on Linux) â€” the byte-compare logic, output format,
+// dlopen/dlsym/dlclose on Linux) — the byte-compare logic, output format,
 // and PASS/FAIL/digest reporting are untouched by platform.
 
 #ifdef _WIN32
@@ -50,7 +50,7 @@
 #include <dlfcn.h>
 #endif
 
-// Headless compute only â€” no WSI/surface, so plain vulkan_core.h (no
+// Headless compute only — no WSI/surface, so plain vulkan_core.h (no
 // platform header) is enough. VK_NO_PROTOTYPES keeps this a header-only
 // dependency: no vulkan-1.lib/libvulkan.so link dependency, every entry
 // point resolved dynamically below.
@@ -78,7 +78,7 @@ namespace {
 
 // --- Raster-window margin for the cavern pass (C6) -------------------------
 // VoxelizeMain's cavernSiteFor evaluates the terrain surface at the SITE's own
-// xy â€” caverns.h's `surfaceAt` contract, because caverns anchor at absolute z
+// xy — caverns.h's `surfaceAt` contract, because caverns anchor at absolute z
 // and a draped floor would be visibly wrong. A site can sit up to
 // kCavernMaxReachMm away in x and y from the querying column
 // (cavernColumnFromSites rejects anything further BEFORE it ever calls
@@ -257,7 +257,7 @@ uint32_t findMemoryType(const VkPhysicalDeviceMemoryProperties& memProps, uint32
 }
 
 // GPU-side mirror of worldgen.ush's GpuColumnSample (5 x 4 bytes, tightly
-// packed â€” verified against the compiled SPIR-V's member offsets).
+// packed — verified against the compiled SPIR-V's member offsets).
 struct GpuColumnSample {
     int32_t surfaceMm;
     int32_t topsoilMm;
@@ -268,7 +268,7 @@ struct GpuColumnSample {
 static_assert(sizeof(GpuColumnSample) == 20, "GpuColumnSample must match the HLSL layout");
 
 // GPU-side mirror of worldgen.ush's cbuffer WorldGenParams (56 bytes,
-// tightly packed â€” verified against the compiled SPIR-V's member offsets;
+// tightly packed — verified against the compiled SPIR-V's member offsets;
 // nothing here straddles a 16-byte boundary so DXC's HLSL-style cbuffer
 // packing matches plain sequential layout). BrickZMin/BricksZ are read only
 // by VoxelizeMain; ScanCount only by Scan*Main; the rest is shared or
@@ -300,7 +300,7 @@ static_assert(sizeof(WorldGenParamsCB) == 64, "WorldGenParamsCB must match the H
 // Host half of the 2026-07 cross-vendor UB hardening pass. worldgen.ush now
 // guards these in-shader (it returns without writing rather than executing an
 // OpUDiv-by-zero or an underflowed clamp bound), but a shader that silently
-// declines to produce output is a miserable thing to debug â€” and the guards
+// declines to produce output is a miserable thing to debug — and the guards
 // are a backstop, not a licence for the host to send garbage. Validating here
 // means a bad cbuffer fails loudly, at the call site that built it, naming
 // the field. Every value checked is a host-side invariant that already holds
@@ -310,7 +310,7 @@ void validateWorldGenParams(const WorldGenParamsCB& p, const char* where) {
     // PixelSizeMm reaches floorDiv/truncDiv as a divisor in ColumnMain
     // (SPIR-V leaves OpUDiv-by-zero undefined, i.e. vendor-specific).
     if (p.PixelSizeMm == 0)
-        fail(std::string(where) + ": PixelSizeMm is 0 â€” it is a divisor in ColumnMain");
+        fail(std::string(where) + ": PixelSizeMm is 0 — it is a divisor in ColumnMain");
     // RasterSize 0 underflows ColumnMain's clamp upper bound (RasterSize.x-1)
     // to -1, which the (uint) cast turns into a ~4-billion element index.
     if (p.RasterSizeX == 0 || p.RasterSizeY == 0)
@@ -335,7 +335,7 @@ void validateWorldGenParams(const WorldGenParamsCB& p, const char* where) {
 
 // Checked immediately before the mesh chain is recorded. MeshEmitMain reads
 // InQuadOffsets[tid.x] for every mask decodeMask accepts (tid.x < maskCount),
-// and only entries below ScanCount were actually written by the scan chain â€”
+// and only entries below ScanCount were actually written by the scan chain —
 // so ScanCount < maskCount would emit from never-written device memory.
 // ScanCount > maskCount is harmless for the offsets of real masks but means
 // the scan is reading past the counts buffer, which is equally not intended.
@@ -345,17 +345,17 @@ void validateScanCount(uint32_t scanCount, uint32_t maskCount, const char* where
     if (scanCount != maskCount)
         fail(std::string(where) + ": ScanCount (" + std::to_string(scanCount) +
              ") must equal maskCount (" + std::to_string(maskCount) +
-             ") â€” MeshEmitMain reads one offset per mask");
+             ") — MeshEmitMain reads one offset per mask");
 }
 
-// Cell index within one 8^3 brick â€” mirrors vxc::Brick<8>::cellIndex AND
+// Cell index within one 8^3 brick — mirrors vxc::Brick<8>::cellIndex AND
 // worldgen.ush's cellIndexInBrick exactly.
 constexpr uint32_t cellIndexInBrick(uint32_t x, uint32_t y, uint32_t z) {
     return x + 8u * (y + 8u * z);
 }
 
 // OutCells (RWStructuredBuffer<uint>, one uint per cell, material id 0-255 in
-// the low byte) layout â€” mirrors worldgen.ush's VoxelizeMain doc comment
+// the low byte) layout — mirrors worldgen.ush's VoxelizeMain doc comment
 // exactly:
 //   bricksX = width / 8, bricksY = height / 8 (dispatch footprint, brick-aligned)
 //   bx = x / 8, by = y / 8, lx = x % 8, ly = y % 8
@@ -424,7 +424,7 @@ struct GpuContext {
     VkDescriptorPool descPool = VK_NULL_HANDLE;
     VkDescriptorSet descSet = VK_NULL_HANDLE;
 
-    // VoxelizeMain â€” separate pipeline/layout/module/set (different SPIR-V
+    // VoxelizeMain — separate pipeline/layout/module/set (different SPIR-V
     // module, different bindings), same instance/device/queue/commandPool.
     VkDescriptorSetLayout voxDescSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout voxPipelineLayout = VK_NULL_HANDLE;
@@ -436,7 +436,7 @@ struct GpuContext {
     // Mesh + GPU-scan kernels (MeshCountMain / MeshEmitMain / ScanBlocksMain /
     // ScanSumsMain / ScanAddMain) share ONE superset descriptor layout
     // (binding 0 uniform; 5 cells, 6 offsets-read, 7 counts, 8 quads, 9
-    // offsets-write, 10 block sums storage) â€” a layout binding a kernel's
+    // offsets-write, 10 block sums storage) — a layout binding a kernel's
     // SPIR-V doesn't declare is legal, and it lets every kernel in the chain
     // reuse identical set wiring. Bindings 9/10 are the scan extension: 9 is
     // the SAME VkBuffer as binding 6 (offsets), bound both read-only (t5, for
@@ -577,7 +577,7 @@ GpuContext createContext(const std::string& spvPath, const std::string& voxelize
     vkGetPhysicalDeviceFeatures(ctx.physicalDevice, &features);
     if (!features.shaderInt64) {
         fail("chosen GPU (" + ctx.deviceName +
-             ") does not support shaderInt64 â€” required by worldgen.ush's 64-bit hash "
+             ") does not support shaderInt64 — required by worldgen.ush's 64-bit hash "
              "(ADR-0001)");
     }
 
@@ -596,7 +596,7 @@ GpuContext createContext(const std::string& spvPath, const std::string& voxelize
     if (!found) fail("chosen GPU (" + ctx.deviceName + ") has no compute-capable queue family");
     if (qfProps[ctx.queueFamily].timestampValidBits == 0) {
         fail("chosen GPU (" + ctx.deviceName +
-             ")'s compute queue family reports 0 timestampValidBits â€” required for the "
+             ")'s compute queue family reports 0 timestampValidBits — required for the "
              "per-stage GPU timing runMeshChain() uses to bracket the chained mesh/scan "
              "dispatches");
     }
@@ -693,13 +693,13 @@ GpuContext createContext(const std::string& spvPath, const std::string& voxelize
     // --- VoxelizeMain pipeline: separate SPIR-V module, separate descriptor
     // set layout (binding 0 uniform WorldGenParams shared with ColumnMain's
     // buffer, binding 1 ElevationMm read-only storage, binding 4 InColumns
-    // read-only storage, binding 5 OutCells RW storage â€” see the file header
+    // read-only storage, binding 5 OutCells RW storage — see the file header
     // for the DXC -fvk-*-shift derivation).
     //
     // Binding 1 is new as of the C6 cavern mirror. VoxelizeMain used to need
     // no raster at all (the cave pass is a pure function of seed/vx/vy/
     // surfaceMm), but caverns.h's `surfaceAt` contract makes the cavern pass
-    // evaluate terrain height at the SITE's own xy â€” which is generally not a
+    // evaluate terrain height at the SITE's own xy — which is generally not a
     // column in the dispatch, so it cannot be carried on GpuColumnSample and
     // must be recomputed from the elevation raster in-shader.
     VkDescriptorSetLayoutBinding voxBindings[4]{};
@@ -975,7 +975,7 @@ void writeMeshDescriptors(GpuContext& ctx, VkBuffer paramsBuffer, const MeshBuff
 // threads => up to 256 blocks of 256 masks = 65,536 masks); the gate mode's
 // z-slab splitting (see ZWindow in the gate section) and the 64x64 default
 // regions both keep maskCount under that, but callers must never dispatch
-// more â€” offsets for masks past the capacity would silently miss their
+// more — offsets for masks past the capacity would silently miss their
 // scanned block base and corrupt MeshEmitMain's write positions.
 //
 // Per-stage GPU timing without extra submits: 6 timestamp queries bracket
@@ -1204,7 +1204,7 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
     Buffer climBuf = ctx.createBuffer(VkDeviceSize(rasterW) * rasterH * sizeof(uint32_t),
                                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     // Columns buffer is shared: ColumnMain writes it (OutColumns, u0), then
-    // the SAME VkBuffer is bound as VoxelizeMain's InColumns (t3) â€” chained
+    // the SAME VkBuffer is bound as VoxelizeMain's InColumns (t3) — chained
     // dispatch, columns never recomputed on GPU.
     Buffer columnsBuf = ctx.createBuffer(
         VkDeviceSize(region.width) * region.height * sizeof(GpuColumnSample),
@@ -1215,7 +1215,7 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
 
     // Fill the raster window exactly as Amplifier::column would read it
     // through the same SyntheticTileSampler (elevation mm, packed climate
-    // t | s<<8 | p<<16 | v<<24 â€” matches worldgen.ush's cl unpack).
+    // t | s<<8 | p<<16 | v<<24 — matches worldgen.ush's cl unpack).
     int32_t* elev = static_cast<int32_t*>(elevBuf.mapped);
     uint32_t* clim = static_cast<uint32_t*>(climBuf.mapped);
     for (uint32_t ly = 0; ly < rasterH; ++ly) {
@@ -1349,7 +1349,7 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
 
     // Availability was already established by barrier1 above (its dst scope
     // included SHADER_READ); this repeats the dependency as the visibility
-    // operation for THIS submission's reads, per the Vulkan memory model â€”
+    // operation for THIS submission's reads, per the Vulkan memory model —
     // correct regardless of the (already GPU-idle) execution ordering from
     // the fence wait.
     VkBufferMemoryBarrier chainBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
@@ -1473,7 +1473,7 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
         ctx.destroyBuffer(blockSumsBuf);
         ctx.destroyBuffer(quadsBuf);
     } else {
-        std::printf("[%s] region too thin for interior mesh bricks (bricksZ=%u) â€” mesh pass "
+        std::printf("[%s] region too thin for interior mesh bricks (bricksZ=%u) — mesh pass "
                     "skipped\n",
                     region.name, bricksZ);
     }
@@ -1523,7 +1523,7 @@ constexpr int64_t kFullVerifyRadiusM = 64;   // <= this radius: full CPU compari
 // gate number with allocator overhead unrelated to the pipeline being
 // measured. Only cellsBuf/countsBuf/offsetsBuf/blockSumsBuf/quadsBuf
 // actually vary in size tile-to-tile (they scale with each tile's local
-// vertical extent, bricksZ, which depends on nearby terrain height) â€”
+// vertical extent, bricksZ, which depends on nearby terrain height) —
 // elevBuf/climBuf also use this so a rare +/-1 raster-window rounding
 // difference between tiles doesn't need special-casing either.
 // paramsBuf/columnsBuf are genuinely fixed-size (128x128 columns, every
@@ -1604,7 +1604,7 @@ struct TileSpec {
 //
 // CPU/GPU overlap ("flight k+1 prep while flight k's fence is pending, via a
 // deferred wait") additionally needs the slot SET flight k+1 writes into to
-// be different from the one flight k's GPU commands may still be reading â€”
+// be different from the one flight k's GPU commands may still be reading —
 // reusing the very same kFlightSize slots for both would race the CPU's
 // host-visible-memory writes against the GPU still consuming them. So slots
 // are double-buffered: kPipelineDepth (2) banks of kFlightSize slots each,
@@ -1725,7 +1725,7 @@ void writeColVoxDescriptorsSlot(GpuContext& ctx, FlightSlot& s) {
 
     VkDescriptorBufferInfo cellsInfo{s.gb.cellsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
     // Binding 1 (ElevationMm) is bound to the voxelize set too since the C6
-    // cavern mirror â€” see the voxBindings comment in initVulkan().
+    // cavern mirror — see the voxBindings comment in initVulkan().
     VkWriteDescriptorSet voxWrites[4]{};
     voxWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 0, 0, 1,
                     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &paramsInfo, nullptr};
@@ -1780,7 +1780,7 @@ struct TileGrid {
 // that range into fixed-size 128-column/16-brick dispatches with a 14-brick
 // interior means the LAST tile in each row/column can overshoot bMax by up
 // to kInteriorBricks-1 bricks when totalBricks isn't an exact multiple of
-// 14 (true for both 64m and 128m here) â€” deliberate: interiors must tile
+// 14 (true for both 64m and 128m here) — deliberate: interiors must tile
 // contiguously with no gap, and slightly overshooting the far edge is
 // harmless (it's still real, deterministically-generated terrain, just
 // outside the nominal radius) whereas a gap or a double-meshed brick would
@@ -1872,14 +1872,14 @@ struct GateStats {
 // z-layer, so > 6 interior layers overflows) are split into z-SLABS of at
 // most kMaxSlabInteriorLayers interior layers each. Slab interiors partition
 // the tile's interior layers exactly (no gap, no overlap) and adjacent slabs
-// share a 1-brick halo, mirroring how tile interiors partition the plane â€”
+// share a 1-brick halo, mirroring how tile interiors partition the plane —
 // so every brick is still meshed exactly once and apron reads stay inside
 // the slab's own voxelized range. Before worldgen v3's spectral-gap terrain
 // no gate tile ever exceeded 6 interior layers, so the overflow was
 // unreachable; v3's rougher relief made it routine (125/144 tiles at
 // --radius 64), and without this split the unscanned block bases silently
 // corrupted MeshEmitMain's write offsets (the default-regions path has
-// always FATALed loudly on the same condition â€” see runMeshChain()).
+// always FATALed loudly on the same condition — see runMeshChain()).
 struct ZWindow {
     int32_t brickZMin = 0;
     uint32_t bricksZ = 0;
@@ -1897,7 +1897,7 @@ void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t 
     s.verify = verify;
 
     // Both ends carry kRasterCavernMarginMm for VoxelizeMain's site-surface
-    // taps â€” see that constant's comment.
+    // taps — see that constant's comment.
     const int64_t xMmMin = int64_t(tile.originVx) * kVoxelSizeMm - kRasterCavernMarginMm;
     const int64_t xMmMax = int64_t(tile.originVx + W - 1) * kVoxelSizeMm + kRasterCavernMarginMm;
     const int64_t yMmMin = int64_t(tile.originVy) * kVoxelSizeMm - kRasterCavernMarginMm;
@@ -2027,7 +2027,7 @@ void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t 
         s.maskCount = s.mbx * s.mby * s.mbz * 48u;
         // The z-slab split above guarantees this; a failure here means the
         // slab math regressed. Same 65,536 contract runMeshChain() enforces
-        // for the default-regions path â€” never dispatch past the GPU scan's
+        // for the default-regions path — never dispatch past the GPU scan's
         // single-workgroup capacity, it silently corrupts emit offsets.
         if (s.maskCount > 65536)
             fail("prepTileCpu: maskCount " + std::to_string(s.maskCount) +
@@ -2272,7 +2272,7 @@ void harvestTile(FlightSlot& s, GateStats& stats) {
         if (verify) {
             // Re-run the CPU mesher per interior brick and cross-check
             // against the GPU quad stream, exactly like the default regions
-            // path above â€” but only for tiles selected for verification
+            // path above — but only for tiles selected for verification
             // (running meshBrick<8> on every brick of every tile would make
             // --radius 128's "sample every 8th tile" pointless).
             std::vector<Quad> cpuQuads;
@@ -2380,7 +2380,7 @@ int runGateMode(GpuContext& ctx, int64_t radiusM, uint64_t seed) {
         "(flight k+1's CPU prep overlaps flight k's pending fence via a deferred wait), "
         "%d total per-tile buffer/descriptor slots\n"
         "brick coord range [%d, %d] (%d bricks/side); covered square %.1fm/side "
-        "(requested %.1fm â€” the last tile row/col overshoots slightly so interiors stay "
+        "(requested %.1fm — the last tile row/col overshoots slightly so interiors stay "
         "brick-aligned and gapless)\n",
         (long long)radiusM, (unsigned long long)seed, grid.numTiles, grid.numTiles,
         grid.tiles.size(), kFlightSize, kPipelineDepth, totalSlots, grid.bMin, grid.bMax,
@@ -2725,7 +2725,7 @@ int main(int argc, char** argv) {
     }
 
     std::printf(
-        "voxel-core GPU harness (ADR-0001 M0 gate) â€” ColumnMain + VoxelizeMain + "
+        "voxel-core GPU harness (ADR-0001 M0 gate) — ColumnMain + VoxelizeMain + "
         "MeshCount/EmitMain + GPU Scan(Blocks/Sums/Add)Main, seed %llu\n",
         (unsigned long long)seed);
 
@@ -2746,7 +2746,7 @@ int main(int argc, char** argv) {
     // mask cap once worldgen v3's spectral-gap octaves made relief tall
     // enough (origin hit 10 brick layers = 75,264 masks); at 64x64 the cap
     // needs > 37 interior layers (~30 m of relief inside a 6.4 m footprint)
-    // â€” unreachable for surface terrain. Gate mode still exercises the full
+    // — unreachable for surface terrain. Gate mode still exercises the full
     // 128x128 dispatch shape (with z-slab splitting, see ZWindow).
     // BOTH ORIGINAL REGIONS SIT AT NEGATIVE vx, and that turned out to matter.
     // Every hash in worldgen takes lattice/pixel indices derived from world

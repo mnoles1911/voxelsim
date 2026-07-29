@@ -1,4 +1,4 @@
-﻿#include "VoxelWorldSubsystem.h"
+#include "VoxelWorldSubsystem.h"
 
 #include "VoxelChunkComponent.h"
 // MeshChunkBricks + ERingSkirtFace used to live in this file's anonymous
@@ -3267,7 +3267,7 @@ struct FVoxelWorldImpl
 	float LogTimerAccumSeconds = 0.f;
 	// S0-2: TotalChunksLoaded as of the previous MaybeLogCounters window, so
 	// the periodic log can report a per-window rate (apply rate decaying
-	// across a leg is the Â§2.2 prediction this counter tests) rather than
+	// across a leg is the §2.2 prediction this counter tests) rather than
 	// only the leg-long mean TotalChunksLoaded already gives.
 	int64 ChunksLoadedAtLastLog = 0;
 
@@ -3451,7 +3451,7 @@ struct FVoxelWorldImpl
 	// zero for the entire flight. Anything reading GetVelocity() reports a
 	// stationary camera while the world streams past at 20 m/s -- and it reports
 	// it on exactly the runs this is meant to explain
-	// (docs/speculative-generation-plan.md Â§2.4).
+	// (docs/speculative-generation-plan.md §2.4).
 	//
 	// The anchor is also the RIGHT point to measure: it is what every ring
 	// radius, admission cutoff and retention decision is computed against, so
@@ -3509,7 +3509,7 @@ struct FVoxelWorldImpl
 	int64 ZeroQuadAppliesSinceLog = 0;  // ...of which meshed to zero quads (buried: real work, no component)
 
 	// WHICH EXIT DrainResults TOOK, per 5s window. Wave S0
-	// (docs/speculative-generation-plan.md Â§4, executing T0-1).
+	// (docs/speculative-generation-plan.md §4, executing T0-1).
 	//
 	// This exists because the open P0's headline reading may be an artifact of a
 	// metric. The published claim is "apply budget only 8.5% saturated -- results
@@ -3531,14 +3531,14 @@ struct FVoxelWorldImpl
 	int64 DrainExitCountCapSinceLog = 0;    // Applied hit MaxAppliesPerFrame
 	int64 DrainExitDrainCapSinceLog = 0;    // Drains hit kMaxResultDrainsPerFrame (stale backlog)
 
-	// WHERE PER-APPLY TIME GOES, per 5s window. Â§1a prices the table push as the
+	// WHERE PER-APPLY TIME GOES, per 5s window. §1a prices the table push as the
 	// dominant term and the batching wave is built on that, but the split has
 	// never been measured. Milliseconds accumulated across the window; divide by
 	// AppliesTimedSinceLog for a per-apply figure.
 	//
 	// POOLED BRANCH ONLY -- the component branch is the control arm and is not
 	// split; see the note at the top of it in ApplyMeshResult. The fourth stage
-	// Â§1a names, the table push, is not here either: it happens inside the pool
+	// §1a names, the table push, is not here either: it happens inside the pool
 	// add, and splitting it needs the pool's own clocks. That is
 	// UVoxelGpuPoolComponent::GetAndResetPushStats, and poolAdd below is its
 	// total, so the two lines add up.
@@ -4917,7 +4917,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		// from the outside. capacityPct is beside it so the approach to the cliff
 		// is visible before the cliff.
 		const uint32 CapacityQuads = Pool->GetHighWaterMarkQuads() + Pool->GetFreeQuads();
-		// S0-2: allocsEver tests Â§2.2 -- Allocations is append-only by default
+		// S0-2: allocsEver tests §2.2 -- Allocations is append-only by default
 		// (see GetNumAllocationsEver), so this is chunks-ever-added, not resident
 		// (liveChunks is resident). Watch it against liveChunks over a leg: if
 		// it grows while liveChunks plateaus, BuildChunkRuns's per-publication
@@ -5101,7 +5101,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       AccumTicks > 0 ? AccumRecomputeMs / AccumTicks : 0.0);
 	// S0-2: apply throughput for THIS window, alongside the leg-long mean
 	// TotalChunksLoaded already gives on the "Voxel streaming" line above.
-	// Â§2.2's testable prediction is that this decays monotonically across a
+	// §2.2's testable prediction is that this decays monotonically across a
 	// leg as Allocations.Num() (see GetNumAllocationsEver) grows -- this is
 	// the number that decay would show up in. Divides by the actual elapsed
 	// window (ThisLogWindowSeconds), not the nominal LogIntervalSeconds, so a
@@ -5262,7 +5262,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       WidestAdmissionCutoffM(),
 	       (long long)CandidatesRejectedSinceLog, (long long)RecordsDroppedSinceLog);
 
-	// Wave S0 (docs/speculative-generation-plan.md Â§4, executing T0-1). Two
+	// Wave S0 (docs/speculative-generation-plan.md §4, executing T0-1). Two
 	// questions in one line, both of which the open P0 currently answers by
 	// assumption:
 	//
@@ -9669,7 +9669,7 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	// 64M = 49,349 peak chunks x ~902 quads/chunk (44.5M) + ~44% headroom for the
 	// fragmentation first-fit produces under this churn. 512 MB at 8 B/quad, plus
 	// the same again in the chunk-id buffer and 12 B/quad of CPU shadow -- see
-	// docs/speculative-generation-plan.md Â§2.6 for the full memory arithmetic and
+	// docs/speculative-generation-plan.md §2.6 for the full memory arithmetic and
 	// why the shadow is what makes further raises expensive.
 	//
 	// SIZED 2026-07-28 FROM A MEASURED PLATEAU, replacing the plan's 104M guess.
@@ -10422,12 +10422,12 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			// dropped.
 			UE_LOG(LogVoxelStream, Error,
 			       TEXT("voxel.GPU.MeshDirectToPool: chunk L%d (%d,%d,%d) acquired a component while its GPU "
-			            "mesh was in flight â€” %d quads DROPPED rather than draw the same chunk twice."),
+			            "mesh was in flight — %d quads DROPPED rather than draw the same chunk twice."),
 			       Key.Level, Key.Key.X, Key.Key.Y, Key.Key.Z, NumQuads);
 			return false;
 		}
 
-		// Wave S0 stage timing (docs/speculative-generation-plan.md Â§4, executing
+		// Wave S0 stage timing (docs/speculative-generation-plan.md §4, executing
 		// T0-1), gated on voxel.Stream.ApplyStageStats: these are
 		// FPlatformTime::Seconds pairs on a path that runs up to 64 times a frame,
 		// which is exactly the kind of instrument that becomes what it measures.
@@ -10497,7 +10497,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			// successful run with disappointing numbers.
 			bLoggedFirstDirectChunk = true;
 			UE_LOG(LogVoxelStream, Log,
-			       TEXT("voxel.GPU.MeshDirectToPool: first chunk written GPU-side â€” level=%d chunk=(%d,%d,%d) "
+			       TEXT("voxel.GPU.MeshDirectToPool: first chunk written GPU-side — level=%d chunk=(%d,%d,%d) "
 			            "quads=%d, no readback, no CPU staging, no re-upload."),
 			       Key.Level, Key.Key.X, Key.Key.Y, Key.Key.Z, NumQuads);
 		}
@@ -10510,7 +10510,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		// UpdateChunk path never sampled params and still must not, or this
 		// instrument would add a full Amplifier::column to every re-mesh.
 		//
-		// Â§1c is the reason it gets its own bucket: SampleChunkParamsForPool runs
+		// §1c is the reason it gets its own bucket: SampleChunkParamsForPool runs
 		// GetSurfaceHeightUU, which is a whole column with the cave lattice and
 		// cavern passes, on the GAME THREAD, once per applied chunk -- for a value
 		// the producing job already computed. If this bucket is large, T1-3's
@@ -10538,7 +10538,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 			if (!bWasFirstLoad)
 			{
 				UE_LOG(LogVoxelStream, Error,
-				       TEXT("voxel.GPU.MeshDirectToPool: chunk L%d (%d,%d,%d) already holds pool slot %d â€” the "
+				       TEXT("voxel.GPU.MeshDirectToPool: chunk L%d (%d,%d,%d) already holds pool slot %d — the "
 				            "direct path has no in-place update, so %d quads were DROPPED. A re-mesh reached "
 				            "the fork, which is supposed to be impossible."),
 				       Key.Level, Key.Key.X, Key.Key.Y, Key.Key.Z, Rec.PoolSlot, NumQuads);
@@ -10649,7 +10649,7 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	}
 
 	// NOT TIMED, deliberately. The component-renderer branch is the CONTROL arm,
-	// and S0's question is entirely about the pooled path -- Â§1a's claim is that
+	// and S0's question is entirely about the pooled path -- §1a's claim is that
 	// the POOLED apply carries an O(resident) tax the component apply does not.
 	// The comparison that answers it is already the head-to-head's avgChunks/s;
 	// a stage split here would need its own timed-apply counter and a scope guard
@@ -13229,7 +13229,7 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 
 	// Resolve the terrain material once (deliverable 4: load by path,
 	// fallback to the engine default material, never crash).
-	// -VoxelDefaultMaterial: diagnostic switch â€” skip the authored material
+	// -VoxelDefaultMaterial: diagnostic switch — skip the authored material
 	// and use the engine default, to isolate material bugs from geometry
 	// bugs (an invisible-terrain failure with the authored material and a
 	// visible one with the default indicts the asset, not the mesh).
