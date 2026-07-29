@@ -23,6 +23,7 @@ add_executable(vxc_tests
   test_caverns.cpp
   test_coarsegen.cpp
   test_swe.cpp
+  test_detail_bedding.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(vxc_tests PRIVATE voxelcore Threads::Threads)
