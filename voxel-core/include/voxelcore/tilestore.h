@@ -200,6 +200,10 @@ constexpr bool fineCodecNeedsDecompressor(uint8_t codec) { return codec == kCode
 //     length check that means anything under CODEC_ZSTD: `comp_len` is the
 //     COMPRESSED length there and constrains nothing about the contents.
 //   * Must not throw. voxel-core is exception-free on the query path.
+//   * Must be safe to call from several threads at once. Statelessness gets
+//     that for free; a shared decompression context would not, and would also
+//     break the clause above it. FineTileSampler::prewarm exists precisely so
+//     a region can be made resident from one thread and then read from many.
 //
 // `user` is the opaque context handed over at registration. A plain function
 // pointer rather than a std::function on purpose: trivially copyable, no
