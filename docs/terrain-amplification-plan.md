@@ -149,7 +149,7 @@ Runs on the GPU pod that already generates tiles.
 | B2d MFD accumulation | 2.1 | sequential sweep |
 | B2e stream-power incision | 0.3 | |
 | B3 thermal relaxation ×48 | 4.6 | trivially GPU-parallel |
-| **total** | **~22 s** | vs the ≈1.5 s originally estimated |
+| **total** | **~22 s** | vs the ≈1.5 s originally estimated — ⚠️ **contended, re-measure** |
 
 The genuinely sequential core (priority-flood + sort + accumulation) is ~5.8 s; the rest is
 GPU-parallel. A production bake plausibly lands at 6–10 s/tile — still **4–6× the estimate**, but
@@ -625,22 +625,60 @@ the column; everything else differs by ≤4 columns in 147,456, i.e. 0.003%).
   > it did.
 - **Bounds:** adversarial sweep of real columns against the new `surfaceUpperBoundMm` /
   `solidBelowBoundMm` every phase. A bound violation is a hole in the world.
+
+  **Bound soundness — v9 measured on REAL tiles, 0 violations.** `vxc_terrainprobe` gained a
+  `boundSweep` that walks every level of the ring cascade over the loaded tile set, densely samples
+  each footprint, and checks all three bounds. This matters because `test_amplifier.cpp`'s existing
+  `amplifier_surface_bound_adversarial` runs on `SyntheticTileSampler` only (its own FOLLOW-UP note
+  asks for more), and real diffusion tiles are a different shape of input — kilometres of near-flat
+  ocean, and cliffs where the 30 m raster steps hard. v9's bound is a Lipschitz envelope around one
+  centre evaluation, so its tightness depends on the footprint-to-relief ratio and synthetic
+  coverage does not transfer for free.
+
+  | level | footprints | declined | mean upper slack | mean lower slack | violations |
+  |---|---|---|---|---|---|
+  | 0 | 173,889 | 0 | 5.48 m | 5.50 m | **0** |
+  | 1 | 43,681 | 0 | 5.94 m | 5.96 m | **0** |
+  | 2 | 10,816 | 0 | 7.16 m | 7.19 m | **0** |
+  | 3 | 2,704 | 0 | 9.92 m | 9.97 m | **0** |
+  | 4 | 676 | 0 | 17.31 m | 17.35 m | **0** |
+  | 5 | 169 | 0 | 37.81 m | 36.35 m | **0** |
+
+  232,935 footprints, **zero violations and zero declines** — so the bound is computed rather than
+  skipped at every level the cascade uses, including level 5, which the old 16-corner cap would
+  have made decline on scale-8 tiles. Slack grows 5.5 m → ~37 m from level 0 to 5, the expected
+  shape for a Lipschitz bound over a growing footprint, and looseness is the *safe* direction.
+  Sampling can only miss a violation, never invent one, so any reported failure is a real
+  counterexample. This is a correctness check, so it is unaffected by box contention.
 - **Codec:** golden fine tiles encoded in Python, decoded by the C++ parser, digest-compared; plus
   a sample-for-sample check that C++ and Python B-spline evaluations agree.
 - **Streaming:** the sanctioned flight leg (`tools/voxel-run-flight-leg.ps1` +
   `voxel-leg-summary.ps1`, spawn `-84480,53760`, `line` flight) after Phases 2 and 4, watching
   flight-phase hole distribution — not `holes(final)`, which cannot decide a latency question.
 
-  > **OUTSTANDING for Phase 1.** This leg has *not* been run for v9. It is the check that matters
-  > most for the rewritten `surfaceBoundsMm` and the deleted UE-side bound, because a bound that is
-  > too tight shows up as holes under motion and nowhere else. `VoxelEarthEditor` builds and the
-  > CPU/GPU gate is green, but neither exercises streaming admission.
+  > **Still unrun for v9**, because `voxel-run-flight-leg.ps1` correctly refuses to start while
+  > another session holds the box. When it is run, compare against a fresh v8 leg rather than the
+  > recorded numbers, since v9 changes chunk admission.
   >
-  > It could not be run here: `voxel-run-flight-leg.ps1` correctly refused to start while another
-  > session's `UnrealEditor-Cmd` (a `pr149-water` parity run) held the box, and a contended leg
-  > reads exactly like a slow configuration. Run it when the box is free, and compare against a v8
-  > leg rather than against the recorded numbers, since v9 changes chunk admission.
+  > **But the risk it was standing in for is now retired directly, and better.** The concern was
+  > that the rewritten `surfaceBoundsMm` might be too tight, which shows up as holes under motion.
+  > A flight leg only finds such a bound if the player happens to fly past one; an adversarial
+  > sweep tests the property itself. `vxc_terrainprobe` now does that over **real tiles** — see
+  > "Bound soundness" below. The existing `amplifier_surface_bound_adversarial` test covers only
+  > `SyntheticTileSampler`, which is the gap that mattered.
 - **Perf:** `vxc_bench` amplify-stage regression against the +5–10% world-average budget in Phase 4.
+
+  > ⚠️ **THESE TIMINGS ARE CONTAMINATED AND MUST BE RE-RUN.** Every number in the table below was
+  > measured while another session's `UnrealEditor-Cmd` held the box (a `pr149-water` parity run,
+  > ~8,500 s of CPU and 5 GB resident). Both arms ran under contention but not necessarily *equal*
+  > contention, so neither the absolutes nor the ratio are trustworthy — a contended run reads
+  > exactly like a slow configuration, which is the standing lesson in
+  > `docs/measurements/s1-close-2026-07-27.txt`.
+  >
+  > What does still stand is the *correctness* claim: the bench digest is `ad1c1e8e8b5ba749`
+  > across the naive and both cached variants, so the block memos are bit-identical. The
+  > *direction* (16 per-point memo probes per column cost more than one block probe) is
+  > near-certain. The magnitudes are not. Re-run on a quiet box before quoting them.
 
   **Phase 1 measured (radius 128, brick 8³, A/B against a v8 worktree):**
 
@@ -702,11 +740,13 @@ back at Tier A with a larger shipped region.
 
 ## Open risks
 
-1. ~~Bake cost is estimated, not measured.~~ **RETIRED, and the estimate was wrong.** See
-   "Bake prototype" below: **~22 s/tile measured on CPU**, against the ≈1.5 s estimate. The
-   on-demand argument survives anyway, because the bake was never the bottleneck — coarse
-   diffusion at 22.5 s/tile is, and moving one tile at the frontier needs 5 coarse tiles against 3
-   bakes. Prefetch ring sizes do not change.
+1. **Bake cost: STILL OPEN — the measurement was contaminated.** The ~22 s/tile figure and the
+   per-stage split in "Bake prototype" below were taken while another session's `UnrealEditor-Cmd`
+   held the box, so they are upper bounds of unknown looseness rather than measurements. Re-run on
+   a quiet machine. The *qualitative* conclusion is robust to a large error — even at a 5× overstatement
+   the bake stays far below coarse diffusion's 22.5 s/tile, and advancing the frontier one tile
+   needs 5 coarse tiles against 3 bakes, so prefetch ring sizes do not change either way. But the
+   headline "4–6× the estimate" is not established.
 2. ~~Compressed tile size is modelled, not measured.~~ **RETIRED** — measured on three real tiles
    with `terrain-service/tools/measure_fine_tier_size.py`; see the size section. 8 MB/tile stands
    for correlated detail. The live risk is now narrower and different: **the bake must not

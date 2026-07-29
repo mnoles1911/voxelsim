@@ -576,6 +576,108 @@ void terracePlateaus(Amplifier& amp, int64_t vx0, int64_t vy0, int64_t n, const 
                 static_cast<double>(big * 100 / sum));
 }
 
+// ADVERSARIAL BOUND SWEEP OVER REAL TILES.
+//
+// surfaceUpperBoundMm / surfaceLowerBoundMm / solidBelowBoundMm are SAFETY
+// primitives: the streaming layer skips generating any chunk they prove empty
+// or fully solid, so a bound that is too tight is not a lost optimisation, it
+// is terrain that never generates. A hole in the world.
+//
+// test_amplifier.cpp already sweeps them adversarially, but ONLY over
+// SyntheticTileSampler (four environments, pixel sizes 30000 and 11250 -- the
+// file's own FOLLOW-UP note asks for more). Real diffusion tiles are a
+// different shape of input: kilometres of near-flat ocean, and cliffs where the
+// 30 m raster steps hard. v9's bound is a Lipschitz envelope around ONE centre
+// evaluation, and its tightness depends on the footprint-to-relief ratio, so
+// synthetic coverage does not transfer for free.
+//
+// Sampling can only ever MISS a violation, never invent one: every reported
+// failure is a real counterexample.
+void boundSweep(Amplifier& amp, int64_t vx0, int64_t vy0, int64_t spanVox, int32_t levels) {
+    std::printf("\nADVERSARIAL BOUND SWEEP over real tiles\n");
+    std::printf("  %5s %9s %10s %12s %12s %12s\n", "level", "chunks", "declined",
+                "upper slack", "lower slack", "violations");
+    int64_t totalViol = 0;
+    for (int32_t level = 0; level < levels; ++level) {
+        const int64_t chunk = int64_t(32) << level;   // level-L chunk edge in level-0 voxels
+        int64_t n = 0, declined = 0, viol = 0;
+        long double slackHi = 0, slackLo = 0;
+        int64_t worstHi = 0;
+        for (int64_t cy = 0; cy + chunk <= spanVox; cy += chunk * 3) {
+            for (int64_t cx = 0; cx + chunk <= spanVox; cx += chunk * 3) {
+                const int64_t x0 = vx0 + cx, y0 = vy0 + cy;
+                const int64_t x1 = x0 + chunk - 1, y1 = y0 + chunk - 1;
+                const int64_t hi = amp.surfaceUpperBoundMm(x0, y0, x1, y1);
+                const int64_t lo = amp.surfaceLowerBoundMm(x0, y0, x1, y1);
+                const int64_t floorMm = amp.solidBelowBoundMm(x0, y0, x1, y1);
+                ++n;
+                if (hi == kSurfaceBoundDeclined || lo == kSurfaceLowerBoundDeclined) {
+                    ++declined;
+                    continue;
+                }
+                // Sample the footprint densely but boundedly; corners included.
+                const int64_t step = chunk > 64 ? chunk / 64 : 1;
+                int64_t maxS = INT64_MIN, minS = INT64_MAX;
+                for (int64_t y = y0; y <= y1; y += step)
+                    for (int64_t x = x0; x <= x1; x += step) {
+                        const int64_t s = amp.surfaceMm(x, y);
+                        if (s > maxS) maxS = s;
+                        if (s < minS) minS = s;
+                    }
+                for (int64_t y : {y0, y1})
+                    for (int64_t x : {x0, x1}) {
+                        const int64_t s = amp.surfaceMm(x, y);
+                        if (s > maxS) maxS = s;
+                        if (s < minS) minS = s;
+                    }
+                if (maxS > hi) {
+                    ++viol;
+                    if (viol <= 3)
+                        std::printf("    !! UPPER VIOLATED at (%lld,%lld) L%d: bound %lld < "
+                                    "surface %lld\n",
+                                    (long long)x0, (long long)y0, level, (long long)hi,
+                                    (long long)maxS);
+                }
+                if (minS < lo) {
+                    ++viol;
+                    if (viol <= 3)
+                        std::printf("    !! LOWER VIOLATED at (%lld,%lld) L%d: bound %lld > "
+                                    "surface %lld\n",
+                                    (long long)x0, (long long)y0, level, (long long)lo,
+                                    (long long)minS);
+                }
+                // solidBelowBoundMm: every voxel strictly below the floor must
+                // be non-air. Probe a few columns down a short way.
+                if (floorMm != kSurfaceLowerBoundDeclined) {
+                    const int64_t vz = floorDiv(floorMm, kVoxelSizeMm) - 1;
+                    for (int64_t y : {y0, (y0 + y1) / 2, y1})
+                        for (int64_t x : {x0, (x0 + x1) / 2, x1})
+                            if (amp.materialAt(x, y, vz) == MAT_AIR) {
+                                ++viol;
+                                if (viol <= 3)
+                                    std::printf("    !! SOLID-BELOW VIOLATED at (%lld,%lld,%lld) "
+                                                "L%d: air beneath floor %lld\n",
+                                                (long long)x, (long long)y, (long long)vz, level,
+                                                (long long)floorMm);
+                            }
+                }
+                slackHi += static_cast<long double>(hi - maxS);
+                slackLo += static_cast<long double>(minS - lo);
+                if (hi - maxS > worstHi) worstHi = hi - maxS;
+            }
+        }
+        const int64_t used = n - declined;
+        std::printf("  %5d %9lld %10lld %10.2f m %10.2f m %12lld%s\n", level, (long long)n,
+                    (long long)declined,
+                    used ? static_cast<double>(slackHi / used) / 1000.0 : 0.0,
+                    used ? static_cast<double>(slackLo / used) / 1000.0 : 0.0,
+                    (long long)viol, viol ? "   <-- HOLE IN THE WORLD" : "");
+        totalViol += viol;
+    }
+    std::printf("  worst case is a bound that is TOO TIGHT; %lld violation(s) total\n",
+                (long long)totalViol);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -669,6 +771,9 @@ int main(int argc, char** argv) {
                    "TILE RASTER");
 
     materialBoundaryAlignment(amp, vx0, vy0, n, pxMm, "AMPLIFIED SURFACE");
+
+    // 6 levels covers the whole ring cascade the streamer uses.
+    boundSweep(amp, vx0, vy0, n, 6);
 
     directionalRoughness(amp, vx0, vy0, n, {8, 16, 32, 64}, "AMPLIFIED SURFACE");
 
