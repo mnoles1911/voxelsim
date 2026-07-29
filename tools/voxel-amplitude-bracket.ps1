@@ -32,19 +32,33 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path "$PSScriptRoot\..").Path
 $Amp  = Join-Path $Root 'voxel-core\src\amplifier.cpp'
+# THE SHADER IS NOT OPTIONAL. The first run of this script edited only the CPU,
+# and the GPU -- which is what actually generates the rendered voxels -- kept
+# producing unscaled terrain, so 1.0x, 0.5x and 0.25x came back looking the same
+# and the arms were silently CPU/GPU divergent. Both files, every arm.
+$Ush  = Join-Path $Root 'voxel-core\shaders\worldgen.ush'
 $Const = 'kDetailAmplitudeScaleQ10'
 
 $original = Select-String -Path $Amp -Pattern "constexpr int64_t $Const = (\d+);"
 if (-not $original) { throw "could not find $Const in $Amp" }
 $originalValue = [int]$original.Matches[0].Groups[1].Value
-Write-Host "original $Const = $originalValue (will restore)" -ForegroundColor Cyan
+if (-not (Select-String -Path $Ush -Pattern "static const int64_t $Const = \d+;")) {
+    throw "could not find $Const in $Ush -- the mirror is missing and this bracket would measure nothing"
+}
+Write-Host "original $Const = $originalValue (will restore both files)" -ForegroundColor Cyan
+
+function Set-Scale([int]$v) {
+    (Get-Content $Amp) -replace "constexpr int64_t $Const = \d+;", "constexpr int64_t $Const = $v;" |
+        Set-Content $Amp -Encoding utf8
+    (Get-Content $Ush) -replace "static const int64_t $Const = \d+;", "static const int64_t $Const = $v;" |
+        Set-Content $Ush -Encoding utf8
+}
 
 $results = @()
 try {
     foreach ($s in $Scales) {
         Write-Host "`n===== scale $s =====" -ForegroundColor Yellow
-        (Get-Content $Amp) -replace "constexpr int64_t $Const = \d+;", "constexpr int64_t $Const = $s;" |
-            Set-Content $Amp -Encoding utf8
+        Set-Scale $s
 
         # The bound's static_asserts are DERIVED from the table, so they move with
         # the scale and will fail until re-pinned. That is the guard working, not a
@@ -60,6 +74,11 @@ try {
         }
 
         $digest = (& "$BuildDir\bench\Release\vxc_bench.exe" --radius 128 --digest 2>&1 | Select-Object -Last 1)
+        # Respin so vxc_gpu stays meaningful for this arm. UE compiles worldgen.ush
+        # itself, so the capture does not depend on this -- but a bracket that
+        # leaves the two sides disagreeing is how the last one went wrong.
+        & (Join-Path $PSScriptRoot 'compile-shaders.ps1') -UpdatePrebuilt 2>&1 |
+            Select-String -Pattern 'error' | Select-Object -First 2
         Copy-Item "$BuildDir\Release\voxelcore.lib" (Join-Path $Root 'build\voxel-core-msvc\voxelcore.lib') -Force
         & "D:\UE_5.8\Engine\Build\BatchFiles\Build.bat" VoxelEarthEditor Win64 Development `
             -Project="$Root\ue-project\VoxelEarth.uproject" -WaitMutex 2>&1 |
@@ -71,9 +90,15 @@ try {
     }
 }
 finally {
-    (Get-Content $Amp) -replace "constexpr int64_t $Const = \d+;", "constexpr int64_t $Const = $originalValue;" |
-        Set-Content $Amp -Encoding utf8
-    Write-Host "`nrestored $Const = $originalValue" -ForegroundColor Cyan
+    # RESTORE AND REBUILD. Restoring the source alone leaves build-p3 holding the
+    # last arm's binary, which then disagrees with the freshly-restored shader --
+    # that produced a 99.96%-of-columns vxc_gpu failure that looked like a real
+    # determinism break and was only a stale artifact.
+    Set-Scale $originalValue
+    cmake --build $BuildDir --config Release 2>&1 | Select-String -Pattern 'error C' | Select-Object -First 3
+    & (Join-Path $PSScriptRoot 'compile-shaders.ps1') -UpdatePrebuilt 2>&1 |
+        Select-String -Pattern 'Updated prebuilt|error' | Select-Object -Last 2
+    Write-Host "restored $Const = $originalValue and rebuilt both sides" -ForegroundColor Cyan
 }
 
 $results | Format-Table -AutoSize

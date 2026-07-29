@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // voxel-core: engine-agnostic voxel world core. UE-header-free by doctrine.
 // Determinism conventions: docs/determinism.md. No floats in world derivation.
 
@@ -8,18 +8,18 @@ namespace vxc {
 
 // Bumped on any deliberate change to worldgen math (hash, octave tables,
 // stratigraphy constants). Invalidates edit logs and golden digests.
-// v3: SyntheticTileSampler spectral-gap fill — 4 new elevation octaves at
+// v3: SyntheticTileSampler spectral-gap fill â€” 4 new elevation octaves at
 // 480/240/120/60 m wavelength (70/38/20/11 m amplitude), terrain-realism audit.
-// v4: M4 cave pass (voxelcore/caves.h) — jittered-lattice tunnel network
+// v4: M4 cave pass (voxelcore/caves.h) â€” jittered-lattice tunnel network
 // carved into the voxelize path. Underground is no longer uniformly solid.
-// v5: M4 cave pass v2 — (a) the cavern system (voxelcore/caverns.h) folded
+// v5: M4 cave pass v2 â€” (a) the cavern system (voxelcore/caverns.h) folded
 // into ColumnSample/materialAt alongside caves, and (b) the bedrock top moved
 // from a 40-60 m band to a 180-220 m one (200 m mean, Matt's decision), which
 // is what gives the multi-storey cavern chains their vertical room. One bump
 // covers both; see docs/status.md "C4".
 // v6: coarse-to-fine detail rework, the first time the amplifier was measured
 // against REAL 30 m terrain-diffusion tiles rather than SyntheticTileSampler.
-// Three changes, all in the surface term: (a) detail octave table v2 — five
+// Three changes, all in the surface term: (a) detail octave table v2 â€” five
 // octaves down to a 200 mm lattice, split into a slope-scaled LANDFORM band
 // and a microrelief band whose scale has a floor so it does not vanish on flat
 // ground; (b) the detail octaves now use the quintic-faded value noise
@@ -73,7 +73,7 @@ namespace vxc {
 //
 // The surface bound is re-derived for all of it and TIGHTENS by 3.5x on a fine
 // world (7846 mm against 27439 mm at maximum slope and curvature).
-inline constexpr uint32_t kWorldGenVersion = 10;
+inline constexpr uint32_t kWorldGenVersion = 11;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 
@@ -81,7 +81,7 @@ using MaterialId = uint8_t;
 
 // Material set v1 (amplifier stratigraphy + M4 per-biome surface materials,
 // voxelcore/biome.h). Water is implicit (z<0 above terrain) and never stored
-// in terrain bricks. IDs are append-only — never renumber an existing entry,
+// in terrain bricks. IDs are append-only â€” never renumber an existing entry,
 // it would invalidate every saved edit log.
 enum Material : MaterialId {
     MAT_AIR = 0,
@@ -120,7 +120,7 @@ constexpr int32_t clampi32(int64_t v, int32_t lo, int32_t hi) {
     return static_cast<int32_t>(v < lo ? lo : (v > hi ? hi : v));
 }
 
-// FNV-1a 64 — determinism digests only (not worldgen randomness).
+// FNV-1a 64 â€” determinism digests only (not worldgen randomness).
 struct Digest {
     uint64_t h = 0xcbf29ce484222325ull;
     constexpr void u8(uint8_t v) { h = (h ^ v) * 0x100000001b3ull; }

@@ -1,4 +1,4 @@
-#include "voxelcore/amplifier.h"
+﻿#include "voxelcore/amplifier.h"
 
 #include "voxelcore/biome.h"
 #include "voxelcore/carrier.h"
@@ -11,11 +11,11 @@ namespace vxc {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Tile-raster memo (performance only — provably cannot change any output).
+// Tile-raster memo (performance only â€” provably cannot change any output).
 //
 // Measured on this box (clang -O2, seed 20260719, 409'600 columns): a column
 // costs 0.946 us, of which the five ITileSampler reads (four elevationMm
-// corners + one climate) are 0.574 us — 61%. Those reads are a function of the
+// corners + one climate) are 0.574 us â€” 61%. Those reads are a function of the
 // TILE PIXEL, and a 30 m pixel covers 300x300 = 90'000 voxel columns, so the
 // same handful of values was being recomputed tens of thousands of times: the
 // whole 640x640-column benchmark region spans just 25 distinct tile pixels.
@@ -26,7 +26,7 @@ namespace {
 // Memoising is safe because ITileSampler is a read-only view of canonical tile
 // DATA: elevationMm/climate are pure functions of (sampler, px, py). (They are
 // non-const only so an implementation may lazily page tiles in; that changes
-// no VALUE.) Determinism is therefore untouched — a hit and a miss return
+// no VALUE.) Determinism is therefore untouched â€” a hit and a miss return
 // bit-identical results, and no worldgen constant or iteration order moves.
 //
 // The tables are `thread_local`, so the memo needs no lock and adds no
@@ -70,7 +70,7 @@ struct ClimateSlot {
     ClimateSample value{};
 };
 
-// Cheap index mix. Only distribution matters — collisions cost a recompute,
+// Cheap index mix. Only distribution matters â€” collisions cost a recompute,
 // never a wrong answer.
 constexpr uint32_t slotIndex(uint64_t amp, int64_t px, int64_t py, uint32_t slots) {
     uint64_t h = static_cast<uint64_t>(px) * 0x9E3779B97F4A7C15ull;
@@ -204,12 +204,12 @@ ClimateSample blendClimate(const ClimateSample& c00, const ClimateSample& c10,
 }
 
 // ---------------------------------------------------------------------------
-// Cave-lattice memo (performance only — provably cannot change any output).
+// Cave-lattice memo (performance only â€” provably cannot change any output).
 //
 // With the tile-raster memo above in place, `caveColumnFor` became the largest
 // single term in column(): ~0.227 us/col, ~68% of the remaining cost. Almost
 // all of it is the 34-70 hashes of the 4x4 node block, the 18 candidate edges
-// and the sinkhole candidate — and caves.h now exposes those separately
+// and the sinkhole candidate â€” and caves.h now exposes those separately
 // (`CaveLattice` / `caveLatticeFor`) because they depend ONLY on the lattice
 // CELL (ci, cj), never on where in the cell the column sits. One cell is
 // 25.6 m square = 65'536 voxel columns, so a sweep recomputes the identical
@@ -218,7 +218,7 @@ ClimateSample blendClimate(const ClimateSample& c00, const ClimateSample& c10,
 // Same direct-mapped, thread_local, never-reused-id scheme as the tile memo:
 // a hit and a miss return bit-identical values (caveLatticeFor is pure), so
 // determinism is untouched and no worldgen constant or iteration order moves.
-// The key is (seed, ci, cj) — the seed, not the Amplifier id, because the
+// The key is (seed, ci, cj) â€” the seed, not the Amplifier id, because the
 // lattice is a function of the seed alone and two Amplifiers on one seed
 // legitimately share it.
 // ---------------------------------------------------------------------------
@@ -255,7 +255,7 @@ CaveColumn cachedCaveColumn(uint64_t seed, int64_t vx, int64_t vy, int32_t surfa
 }
 
 // ---------------------------------------------------------------------------
-// Cavern candidate-corner memo (performance only — same argument as above).
+// Cavern candidate-corner memo (performance only â€” same argument as above).
 //
 // caverns.h's gate + depth-safety pass over the 2x2 coarse corners is a
 // function of the coarse cell (si, sj) alone, and a coarse cell is 204.8 m
@@ -285,13 +285,13 @@ const CavernCandidates& cachedCavernCandidates(uint64_t seed, int64_t si, int64_
 }
 
 // ---------------------------------------------------------------------------
-// Cavern SITE memo — the one that actually matters, and the one caverns.h's
+// Cavern SITE memo â€” the one that actually matters, and the one caverns.h's
 // own cost model missed.
 //
 // A CavernSite is a function of (seed, fi, fj) and the terrain surface at the
 // site's own anchor xy: a per-SITE value. But it was being decoded once per
-// COLUMN, for every column inside the site's ~36 m reach disc — on the order
-// of 400'000 columns — and each decode calls `surfaceAt`, which in production
+// COLUMN, for every column inside the site's ~36 m reach disc â€” on the order
+// of 400'000 columns â€” and each decode calls `surfaceAt`, which in production
 // is the amplifier's full bilinear-tile-base + four-detail-octave surface
 // function, i.e. the single most expensive thing in column(). Measured on
 // vxc_bench --radius 32 (a 64 m square region, so a large fraction of it sits
@@ -345,7 +345,7 @@ CavernColumn cachedCavernColumn(uint64_t seed, int64_t vx, int64_t vy, int32_t s
 
 // Detail octave table v2 (worldgen-versioned constant, docs/determinism.md).
 // latticeMm chosen so octaves nest across brick sizes; amplitudes in mm before
-// scaling. Ordered COARSE to FINE — the split into the two bands below is by
+// scaling. Ordered COARSE to FINE â€” the split into the two bands below is by
 // index, so the ordering is load-bearing.
 //
 // ---------------------------------------------------------------------------
@@ -354,7 +354,7 @@ CavernColumn cachedCavernColumn(uint64_t seed, int64_t vx, int64_t vy, int32_t s
 // v1 was tuned entirely against SyntheticTileSampler, whose own octave ladder
 // already runs down to a 2-pixel (60 m) lattice. Real terrain-diffusion tiles
 // are a 30 m/px raster with nothing below Nyquist, so the amplifier was never
-// once asked to actually CONTINUE a spectrum — and it does not.
+// once asked to actually CONTINUE a spectrum â€” and it does not.
 //
 // Measured with vxc_terrainprobe against the real tiles, using the DETRENDED
 // roughness S2(d) = mean |h(x+d) - 2h(x) + h(x-d)| (the plain structure
@@ -363,7 +363,7 @@ CavernColumn cachedCavernColumn(uint64_t seed, int64_t vx, int64_t vy, int32_t s
 //
 //   * the coarse raster is self-affine with H ~ 0.7-0.9 from 960 m down to
 //     30 m, which is what natural terrain looks like;
-//   * the v1 amplified surface has H ~ 1.4-1.8 between 0.1 m and 0.4 m —
+//   * the v1 amplified surface has H ~ 1.4-1.8 between 0.1 m and 0.4 m â€”
 //     SMOOTHER THAN LINEAR. That is the signature of running out of octaves:
 //     below the 400 mm finest lattice the surface is an analytically smooth
 //     bilinear ramp, with roughness at 0.1 m lag of 0.05 voxels.
@@ -372,13 +372,13 @@ CavernColumn cachedCavernColumn(uint64_t seed, int64_t vx, int64_t vy, int32_t s
 // terraces, and that is the whole artifact. On 1.7% ground v1 gave terrace
 // runs averaging 8.8 voxels with 27% of a transect inside dead-flat runs of
 // 2 m or more; on a 98% slope it gave a perfect 1:1 staircase. Same defect,
-// two ranges — the smooth vista and the corduroy ground are one bug.
+// two ranges â€” the smooth vista and the corduroy ground are one bug.
 //
 // For calibration: terrain-diffusion's own Minecraft integration
 // (github.com/xandergos/terrain-diffusion-mc, ported from
 // terrain_diffusion/inference/minecraft_api.py) solves the identical
-// coarse->fine problem with the identical architecture we already had —
-// bilinear upsample plus slope-gated fBm, nothing learned — but applies up to
+// coarse->fine problem with the identical architecture we already had â€”
+// bilinear upsample plus slope-gated fBm, nothing learned â€” but applies up to
 // ~100 m + ~70 m of it at native scale. v1's ceiling was 2.856 m. We were
 // running at roughly 2.5% of the reference implementation's amplitude.
 //
@@ -400,7 +400,7 @@ constexpr Octave kDetailOctaves[] = {
     {6400, 1100},
     // --- MICRORELIEF band: scaled by microScaleQ10, which has a FLOOR.
     // This band is why v2 is not just "v1 with bigger numbers". Real ground
-    // has centimetre-to-metre roughness — clods, tussocks, stones, rills —
+    // has centimetre-to-metre roughness â€” clods, tussocks, stones, rills â€”
     // that does not disappear because the ground is level, and at 10 cm voxels
     // flat ground is precisely where the terrace runs are LONGEST and the
     // artifact is worst. Upstream's slope gate drives detail to exactly zero
@@ -411,12 +411,31 @@ constexpr Octave kDetailOctaves[] = {
     // per-voxel static.
     // Energy is weighted toward the METRE scale rather than the finest
     // lattice on purpose. An earlier cut put more into the 200 mm octave and
-    // it read in-engine as per-2-voxel static — the eye takes dense
+    // it read in-engine as per-2-voxel static â€” the eye takes dense
     // uncorrelated jitter as noise, not as ground. Larger, smoother lumps
     // with quieter fine detail on top read as terrain.
+    // v11: 190 -> 60 and 60 -> 15. MEASURED, and the measurement is the whole
+    // reason. Each octave contributes a local gradient of roughly
+    // amplitude/lattice, and at 10 cm voxels the 400 mm octave was contributing
+    // 190/400 = 0.475 and the 200 mm octave 0.30 -- so the finest two alone put
+    // ~0.8 of gradient into a band 2 to 4 voxels wide. A surface that steep at
+    // voxel scale cannot be anything but a field of one-voxel steps.
+    //
+    // terrainprobe's terrace metrics say it plainly. Shipped v10 measured a mean
+    // terrace run of 2.62 voxels (median 2) and 12,679 constant-height plateau
+    // components in a 51 m square: the surface changed voxel height every 2.6
+    // columns, which is uncorrelated at voxel scale, i.e. static. With these two
+    // amplitudes cut the mean run is 3.81 and the component count 1,883.
+    //
+    // WHY NOT A UNIFORM SCALE, which was tried first. Scaling every octave to
+    // 0.5x reaches a similar fragmentation (1,962 components) but puts 82.7% of
+    // the area into flat plateaus of 4 m or more, against 64.0% here -- it buys
+    // the same reduction in static by flattening the metre scale, which is the
+    // terracing artifact this band exists to break up. Cutting the two octaves
+    // that are actually too steep is strictly the better trade.
     {1600, 500},
-    {400, 190},
-    {200, 60},
+    {400, 60},
+    {200, 15},
 };
 constexpr uint32_t kDetailOctaveCount = sizeof(kDetailOctaves) / sizeof(kDetailOctaves[0]);
 
@@ -460,12 +479,56 @@ constexpr Octave kFineDetailOctaves[] = {
     // reading as long terrace runs at 10 cm voxels, and gating it on slope would
     // undo exactly that.
     {1600, 500},
-    {400, 190},
-    {200, 60},
+    {400, 60},
+    {200, 15},
 };
 constexpr uint32_t kFineDetailOctaveCount =
     sizeof(kFineDetailOctaves) / sizeof(kFineDetailOctaves[0]);
 constexpr uint32_t kFineLandformOctaveCount = 1;
+
+// --- THE DETAIL AMPLITUDE SCALE (v10.1) -------------------------------------
+//
+// One q10 multiplier over EVERY octave in both tables. It exists because the
+// first in-engine look at v10 showed something no instrument had: at 2560x1440,
+// settled, the ground reads as a dense field of isolated one-voxel blocks and
+// pits -- per-voxel static, not terrain. The amplifier's own octave-table
+// comment records this exact failure from an earlier cut ("it read in-engine as
+// per-2-voxel static -- the eye takes dense uncorrelated jitter as noise, not as
+// ground"), so this is a recurrence, not a novelty.
+//
+// It is a SCALE rather than a re-tuned table on purpose. The relative weighting
+// between octaves was chosen deliberately (energy toward the metre scale, quiet
+// at the finest lattice) and there is no evidence that shape is wrong; the
+// evidence is that the whole band is too loud. A scale moves the level and
+// leaves the shape alone, which also makes the bracket a single variable.
+//
+// It is not a free knob: it changes worldgen, so it is a compile-time constant
+// under kWorldGenVersion and NOT a cvar. A cvar here would let two clients
+// disagree about the ground.
+//
+// CORROBORATION, before the picture: the S2 calibration solved the fine ladder
+// at a 231-413 mm envelope against the shipped 1650 mm -- 4 to 7 times too loud
+// -- and was set aside because its target is anchored on an int16-METRE raster
+// whose 0.707 m quantisation floor sits above the 0.515 m it was extrapolating
+// to. That objection is still right about the TARGET and was wrong as a reason
+// to leave the level alone: the measurement and the photograph now agree on the
+// direction, and only disagree about how far.
+constexpr int64_t kDetailAmplitudeScaleQ10 = 1024;
+constexpr int64_t scaledAmpMm(int64_t amplitudeMm) {
+    return amplitudeMm * kDetailAmplitudeScaleQ10 / 1024;
+}
+
+// The octave-table tripwires below pin exact derived totals, so they necessarily
+// move when the scale does. They are guarded on the shipped scale rather than
+// deleted: their job is to stop the TABLE changing by accident, and a deliberate
+// bracket of the LEVEL is not that. At 1024 every one of them is live.
+// True only in the SHIPPED configuration. It covers the additive terms as well
+// as the scale because an ablation of either one legitimately moves the derived
+// totals, and a tripwire that fires during a deliberate experiment teaches the
+// experimenter to edit tripwires -- which is how a real regression gets waved
+// through later.
+constexpr bool kAmpUnscaled = (kDetailAmplitudeScaleQ10 == 1024) &&
+                              (kRillMaxAbsMm == 300) && (kBeddingMaxAbsMm == 120);
 
 // A tile raster at or below this pitch carries baked sub-30 m landform. 3750 is
 // scale 8 and 1875 is scale 16; only 16 is generated today, but the threshold is
@@ -498,8 +561,8 @@ constexpr int64_t slopeScaleQ10(int64_t slopeMmPerM) {
     return clampi64(512 + slopeMmPerM * 5 / 4, kSlopeScaleMinQ10, kSlopeScaleMaxQ10);
 }
 
-// Microrelief scale in q10, for the fine band. Same SHAPE as slopeScaleQ10 —
-// nondecreasing in slope, saturating — and deliberately a different CURVE: it
+// Microrelief scale in q10, for the fine band. Same SHAPE as slopeScaleQ10 â€”
+// nondecreasing in slope, saturating â€” and deliberately a different CURVE: it
 // never drops below 0.75, because ground roughness at the decimetre scale is a
 // property of the material, not of the gradient. Flat ground is still bumpy;
 // it is only the hillside-shaping octaves that should vanish when there is no
@@ -507,13 +570,13 @@ constexpr int64_t slopeScaleQ10(int64_t slopeMmPerM) {
 // 0.25..4.0) also keeps the surface upper bound from widening much: this band
 // is small in amplitude, and the bound pays for its maximum.
 // It is DELIBERATELY almost slope-flat. The first cut of this used
-// `768 + slope/64` clamped to 2.0, by analogy with slopeScaleQ10 — and that
+// `768 + slope/64` clamped to 2.0, by analogy with slopeScaleQ10 â€” and that
 // was wrong for a reason worth recording. On a 45-degree slope the tile slope
 // term reaches ~60000 mm/px, which took the fine band to x1.66, i.e. roughly
 // +/-11 VOXELS of 0.2-1.6 m noise. In-engine that turned the mountainside
 // from machined corduroy into uniform rubble: a different artifact, not a
 // fix. Amplifying the fine band on steep ground was never the point of this
-// band — the FLOOR on flat ground is. Decimetre roughness is a property of
+// band â€” the FLOOR on flat ground is. Decimetre roughness is a property of
 // the material, not of the gradient, so the curve is now nearly constant and
 // the ceiling is 1.25 rather than 2.0.
 constexpr int64_t kMicroScaleMinQ10 = 768;  // 0.75
@@ -529,9 +592,9 @@ constexpr int32_t kSurfaceClampMinMm = -8'000'000;
 constexpr int32_t kSurfaceClampMaxMm = 9'000'000;
 
 // ---------------------------------------------------------------------------
-// THE CARRIER now lives in voxelcore/carrier.h — kCarrierT, the three B-spline
+// THE CARRIER now lives in voxelcore/carrier.h â€” kCarrierT, the three B-spline
 // bases, evalCarrier, carrierSlopeMmPerM, the analytic curvature added for
-// docs/terrain-amplification-plan.md §3c, and the whole derivation. It was
+// docs/terrain-amplification-plan.md Â§3c, and the whole derivation. It was
 // moved out of this file verbatim (a pure move; worldgen output unchanged) so
 // that the Phase-3 curvature work and its tests can reach it.
 //
@@ -590,7 +653,7 @@ constexpr int64_t detailMaxMm(const Octave* tab, uint32_t n, uint32_t nLandform,
     int64_t sum = 0;
     for (uint32_t i = 0; i < n; ++i) {
         if ((i < nLandform) != landform) continue;
-        sum += kNoiseMax * tab[i].amplitudeMm / kDetailNoiseScale;
+        sum += kNoiseMax * scaledAmpMm(tab[i].amplitudeMm) / kDetailNoiseScale;
     }
     return sum;
 }
@@ -614,15 +677,14 @@ constexpr int64_t kFineMicroMaxMm =
 
 // (4) Tripwire. (3) keeps the bound SOUND across an octave-table edit on its
 // own; this makes such an edit impossible to do ACCIDENTALLY without reading
-// the derivation. Any change here also moves worldgen output — bump
+// the derivation. Any change here also moves worldgen output â€” bump
 // kWorldGenVersion and regenerate goldens.
-static_assert(kDetailOctaveCount == 5 && kLandformMaxMm == 3698 && kMicroMaxMm == 747,
+static_assert(!kAmpUnscaled || (kDetailOctaveCount == 5 && kLandformMaxMm == 3698 && kMicroMaxMm == 572),
               "kDetailOctaves changed. Amplifier::surfaceUpperBoundMm derives its "
               "detail allowance from the table, so the bound is still sound -- but "
               "re-read its derivation before updating these numbers, and remember an "
               "octave change is a worldgen change (bump kWorldGenVersion).");
-static_assert(kFineDetailOctaveCount == 4 && kFineLandformMaxMm == 899 &&
-                  kFineMicroMaxMm == 747,
+static_assert(!kAmpUnscaled || (kFineDetailOctaveCount == 4 && kFineLandformMaxMm == 899 && kFineMicroMaxMm == 572),
               "kFineDetailOctaves changed; same obligation as the coarse table above.");
 // The envelope TIGHTENS on a fine world -- 1646 mm against 3698 + 747 = 4445 mm
 // before gating -- because two synthesised landform octaves were replaced by one.
@@ -639,14 +701,14 @@ static_assert(kFineLandformMaxMm + kFineMicroMaxMm < kLandformMaxMm + kMicroMaxM
 // B-spline weights to be (a) never negative and (b) to sum EXACTLY to the
 // denominator, at every q10 fraction the evaluator can produce. Both are swept
 // exhaustively at compile time rather than argued from the algebra, so that any
-// future re-derivation of the basis — a different knot convention, a tweaked
-// denominator, a Catmull-Rom substitution — fails the build instead of quietly
+// future re-derivation of the basis â€” a different knot convention, a tweaked
+// denominator, a Catmull-Rom substitution â€” fails the build instead of quietly
 // unbounding the terrain.
 //
 // The two-stage evaluator composes the property: each stage-1 row value is a
 // convex combination of that row's control points, and the stage-2 value is a
 // convex combination of the rows, so the result lies within the stencil's
-// min/max. Truncation cannot escape it either — for integer m <= v <= M,
+// min/max. Truncation cannot escape it either â€” for integer m <= v <= M,
 // trunc(v) is still in [m, M], because trunc moves v toward zero and both
 // endpoints are integers on the same side of it.
 constexpr bool carrierWeightsAreConvex() {
@@ -679,8 +741,8 @@ static_assert(carrierWeightsAreConvex(),
 // are int32 millimetres at worst (kSurfaceClampMinMm..MaxMm is well inside
 // that), and the weight sums are the two denominators above, so the worst
 // product is bounded by |cp| * den. Asserted rather than trusted because the
-// natural "obvious" formulation of this evaluator — weights in fx rather than
-// q10 — overflows by ten orders of magnitude, and the next person to simplify
+// natural "obvious" formulation of this evaluator â€” weights in fx rather than
+// q10 â€” overflows by ten orders of magnitude, and the next person to simplify
 // it will reach for exactly that.
 static_assert(int64_t(kSurfaceClampMaxMm) * kCarrierValueDen < (int64_t(1) << 62),
               "carrier stage product can overflow int64; do not widen the q10 fraction "
@@ -688,11 +750,11 @@ static_assert(int64_t(kSurfaceClampMaxMm) * kCarrierValueDen < (int64_t(1) << 62
 
 // (5) slopeScaleQ10 is fed the footprint's MAXIMUM slope, and the bound needs
 // the result to be (a) never above kSlopeScaleMaxQ10 and (b) NONDECREASING in
-// its argument — otherwise the max-slope pixel is not the worst pixel. (b) is
+// its argument â€” otherwise the max-slope pixel is not the worst pixel. (b) is
 // true because `512 + s/24` is nondecreasing for s >= 0 (truncating division by
 // a positive divisor is monotone) and clampi64 is monotone. Check it by
-// exhaustive-enough sweep at compile time so that a reshaped formula — anything
-// with a fold, an abs(), or a negative coefficient — fails the build.
+// exhaustive-enough sweep at compile time so that a reshaped formula â€” anything
+// with a fold, an abs(), or a negative coefficient â€” fails the build.
 // (MSVC's constexpr step budget is 2^20, so the sweep is two resolutions
 // rather than one: every single value across the whole range where the result
 // actually varies -- it saturates at slope 86'016 -- then a coarse sweep out to
@@ -726,7 +788,7 @@ static_assert(slopeScaleQ10(1LL << 40) == kSlopeScaleMaxQ10,
 // (5b) The SAME two properties for microScaleQ10, which the bound feeds the
 // footprint's maximum slope in exactly the same way and for exactly the same
 // reason. Verified by the same exhaustive sweep rather than by asserting that
-// it "looks like" slopeScaleQ10 — it is a different curve with a different
+// it "looks like" slopeScaleQ10 â€” it is a different curve with a different
 // divisor and a different floor, so it needs its own proof.
 constexpr bool microScaleIsNondecreasing() {
     int64_t prev = microScaleQ10(0);
@@ -777,8 +839,8 @@ constexpr int64_t detailAllowanceMm(int64_t landformMax, int64_t microMax) {
 constexpr int64_t kDetailMaxAtMaxSlopeMm = detailAllowanceMm(kLandformMaxMm, kMicroMaxMm);
 constexpr int64_t kFineDetailMaxAtMaxSlopeMm =
     detailAllowanceMm(kFineLandformMaxMm, kFineMicroMaxMm);
-static_assert(kDetailMaxAtMaxSlopeMm == 27588, "detail allowance moved");
-static_assert(kFineDetailMaxAtMaxSlopeMm == 7995, "fine-tier detail allowance moved");
+static_assert(!kAmpUnscaled || (kDetailMaxAtMaxSlopeMm == 27289), "detail allowance moved");
+static_assert(!kAmpUnscaled || (kFineDetailMaxAtMaxSlopeMm == 7696), "fine-tier detail allowance moved");
 // The plan's claim was that the net detail envelope drops from ~15.7 m to ~3.0 m
 // on a fine world and that the bound therefore TIGHTENS. It does tighten, by
 // 3.8x -- but not to 3.0 m, because the allowance is the worst case at MAXIMUM
@@ -811,7 +873,7 @@ constexpr int64_t detailAbsMaxMm(const Octave* tab, uint32_t n, uint32_t nLandfo
     int64_t sum = 0;
     for (uint32_t i = 0; i < n; ++i) {
         if ((i < nLandform) != landform) continue;
-        sum += tab[i].amplitudeMm;
+        sum += scaledAmpMm(tab[i].amplitudeMm);
     }
     return sum;
 }
@@ -826,12 +888,12 @@ constexpr int64_t kFineMicroAbsMaxMm =
 static_assert(kLandformAbsMaxMm >= kLandformMaxMm && kMicroAbsMaxMm >= kMicroMaxMm,
               "the symmetric detail envelope must cover the positive-side maximum too, or "
               "surfaceLowerBoundMm is looser than surfaceUpperBoundMm in the wrong direction");
-static_assert(kLandformAbsMaxMm == 3700 && kMicroAbsMaxMm == 750,
+static_assert(!kAmpUnscaled || (kLandformAbsMaxMm == 3700 && kMicroAbsMaxMm == 575),
               "detail amplitude sum moved; see (4)");
 static_assert(kFineLandformAbsMaxMm >= kFineLandformMaxMm &&
                   kFineMicroAbsMaxMm >= kFineMicroMaxMm,
               "same obligation as the coarse pair, on the fine-tier table");
-static_assert(kFineLandformAbsMaxMm == 900 && kFineMicroAbsMaxMm == 750,
+static_assert(!kAmpUnscaled || (kFineLandformAbsMaxMm == 900 && kFineMicroAbsMaxMm == 575),
               "fine-tier detail amplitude sum moved; see (4)");
 
 // (8) The cave family's carve depth, in the QUERYING COLUMN'S OWN depth space.
@@ -969,7 +1031,7 @@ uint64_t Amplifier::nextId() {
 // detail octaves, and the two by-products (tile pixel, tile slope) the rest of
 // column() needs. Factored out ONLY so the cavern pass's `surfaceAt` callback
 // can be the very same function the querying column's own surfaceMm came from
-// — caverns.h's contract for it — bit-identically, by construction rather than
+// â€” caverns.h's contract for it â€” bit-identically, by construction rather than
 // by a comment asking two copies to stay in step.
 Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     const int64_t xMm = vx * kVoxelSizeMm;
@@ -977,7 +1039,7 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     const int64_t pxMm = tiles_->pixelSizeMm();
 
     // C2 carrier over the tile raster (exact integer math). The control stencil
-    // for the cell containing this column is px-1..px+2 on each axis — four
+    // for the cell containing this column is px-1..px+2 on each axis â€” four
     // control points per axis rather than bilinear's two, which is what buys
     // gradient continuity across the cell boundary.
     const int64_t px = floorDiv(xMm, pxMm), py = floorDiv(yMm, pxMm);
@@ -992,7 +1054,7 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     // v8 used tileSlopeMmPerPx: a forward difference of the cell's own corners,
     // and therefore CONSTANT over the whole cell. That fed slopeScaleQ10, whose
     // range is 0.25x..4.0x, so the same noise field was multiplied by a
-    // step-discontinuous gain on each side of every pixel line — the ground
+    // step-discontinuous gain on each side of every pixel line â€” the ground
     // changed character at an invisible boundary even where height and slope
     // were continuous. Measured on real tiles at v8, the detail envelope stepped
     // by a median of 150-310 mm per boundary (p90 770-1075, max 2302): one to
@@ -1001,7 +1063,7 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     //
     // The spline derivative is continuous, so that step is now structurally
     // impossible rather than merely small. (It does not show up in a windowed
-    // roughness estimate at fine lag — that band is gated by microScaleQ10,
+    // roughness estimate at fine lag â€” that band is gated by microScaleQ10,
     // which is deliberately almost slope-flat. Measure it off the raster with
     // vxc_terrainprobe's DIRECT GAIN STEP, not through an estimator that mostly
     // sees the other band.)
@@ -1053,7 +1115,7 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
         // the coarse table's length.
         const int64_t term =
             valueNoise2Fade(seed_, xMm, yMm, o.latticeMm, CH_DETAIL_OCTAVE_BASE + i) *
-            o.amplitudeMm / kDetailNoiseScale;
+            scaledAmpMm(o.amplitudeMm) / kDetailNoiseScale;
         if (i < nLand)
             landformMm += term;
         else
@@ -1107,7 +1169,7 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
 int32_t Amplifier::surfaceMm(int64_t vx, int64_t vy) const { return evalSurface(vx, vy).surfaceMm; }
 
 // ---------------------------------------------------------------------------
-// The sky-band trim's proof obligation. DERIVATION — read this before touching
+// The sky-band trim's proof obligation. DERIVATION â€” read this before touching
 // evalSurface above.
 //
 // evalSurface computes, for a column at (xMm, yMm) = (vx, vy) * kVoxelSizeMm:
@@ -1127,7 +1189,7 @@ int32_t Amplifier::surfaceMm(int64_t vx, int64_t vy) const { return evalSurface(
 // truncate, rather than having to carry rounding slack around. It is also why
 // applying clampi32/clampi64 to a bound yields a bound: clamping is monotone.
 //
-// (a) BASE — bounded EXACTLY, not conservatively.
+// (a) BASE â€” bounded EXACTLY, not conservatively.
 //     base is the bilinear interpolation of the four elevations of the tile
 //     pixel cell the column falls in. Restricted to one cell it is a bilinear
 //     patch, which is LINEAR along each axis with the other held fixed, so its
@@ -1136,7 +1198,7 @@ int32_t Amplifier::surfaceMm(int64_t vx, int64_t vy) const { return evalSurface(
 //     touches and evaluate that cell's own bilinear form at the four clipped
 //     corners, via the very function evalSurface uses. Taking the largest of
 //     those is the exact maximum of base over the footprint's bounding
-//     rectangle — a superset of the discrete columns in it, hence still a
+//     rectangle â€” a superset of the discrete columns in it, hence still a
 //     bound, with no sampling-density argument anywhere.
 //
 //     This matters: taking the largest pixel CORNER elevation instead would
@@ -1144,10 +1206,10 @@ int32_t Amplifier::surfaceMm(int64_t vx, int64_t vy) const { return evalSurface(
 //     a 30 m pixel (the level-0..3 chunks), because the nearest corner can be
 //     tens of metres of relief away from any ground the footprint contains.
 //
-// (b) DETAIL — bounded by the amplitude sum times the footprint's OWN slope
+// (b) DETAIL â€” bounded by the amplitude sum times the footprint's OWN slope
 //     scale. detail = (sum over octaves of trunc(noise_i * amp_i / 32768))
 //     scaled by trunc(* sScale / 1024). noise_i is a valueNoise2, whose range
-//     is pinned at compile time to [-32768, 32767] via hashToSigned16 — see
+//     is pinned at compile time to [-32768, 32767] via hashToSigned16 â€” see
 //     the numbered block near kDetailOctaves. Each octave's term is therefore
 //     at most trunc(32767 * amp_i / 32768) (amplitudes are asserted positive),
 //     and kLandformMaxMm / kMicroMaxMm are exactly those sums per band,
@@ -1318,7 +1380,7 @@ bool Amplifier::surfaceBoundsMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t v
     // The negative side uses the symmetric envelope (coupling (7)), and takes
     // one further millimetre PER BAND for the truncation in each q10 divide,
     // which rounds toward zero and so would otherwise shave the magnitude.
-    // Two bands, two truncations, two millimetres — this is the one place
+    // Two bands, two truncations, two millimetres â€” this is the one place
     // where splitting the sum costs the bound anything, and one millimetre of
     // conservatism is the right price for not having to argue about it.
     // The additive terms are symmetric about zero by construction (both are
@@ -1507,15 +1569,15 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     col.subsoilMm = clampi32(int64_t(col.topsoilMm) * 2 + 500, 0, 6000);
 
     // Bedrock top: a jittered band CENTRED ON 200 m (Matt's decision; was
-    // 40-60 m at kWorldGenVersion 4). Same deterministic shape as before — one
+    // 40-60 m at kWorldGenVersion 4). Same deterministic shape as before â€” one
     // 16-bit field of a 6.4 m-lattice hash, linearly mapped onto [base, base +
-    // span) — only the two constants move.
+    // span) â€” only the two constants move.
     //
     // Why 180-220 m rather than "the old 40 m + 50%-of-base shape scaled up"
     // (which would give 200-300 m, mean 250 m): 200 m is the number asked for,
     // so it is the band's MEAN, not its floor. The +/-20 m (10%) span is large
     // enough that the bedrock boundary does not read as a flat sheet draped
-    // under the terrain — the only reason the jitter exists — while staying
+    // under the terrain â€” the only reason the jitter exists â€” while staying
     // comfortably clear of everything above it: the deepest a cavern chain
     // reaches is ~128 m (test_caverns.cpp measures 128'050 mm of depth at a
     // 200 m bedrock), so even the shallowest 180 m draw leaves ~52 m of
@@ -1530,7 +1592,7 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
 
     // Surface material from biome classification (M4): morphology gates
     // (slope, coastal band, temperature-adjusted treeline) run before the
-    // Whittaker climate lookup — see voxelcore/biome.h, mirrored bit-exactly
+    // Whittaker climate lookup â€” see voxelcore/biome.h, mirrored bit-exactly
     // in worldgen.ush's ColumnMain.
     // Dithered temperature/precipitation, undithered seasonality: the dither
     // exists to ragged the two gates that draw long boundaries across the world
@@ -1543,7 +1605,7 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
 
     // M4 cave pass (voxelcore/caves.h): reduce the jittered lattice tunnel
     // network to the tube axes that pass near this column. Depends only on
-    // (seed, vx, vy, surfaceMm) — no raster reads — which is what lets
+    // (seed, vx, vy, surfaceMm) â€” no raster reads â€” which is what lets
     // worldgen.ush recompute it inside VoxelizeMain rather than widening
     // GpuColumnSample. Mirrored bit-exactly there.
     // Served from the per-thread cave-lattice memo above; bit-identical to
@@ -1557,7 +1619,7 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // The one shape difference is the `surfaceAt` callback. Caverns anchor at
     // ABSOLUTE z (level floors and water tables, not draped ones), so the
     // reduction needs the terrain height at the SITE's own xy rather than at
-    // the querying column's — see caverns.h's cavernSiteFor. Supplying
+    // the querying column's â€” see caverns.h's cavernSiteFor. Supplying
     // evalSurface() here makes that the identical function this column's own
     // surfaceMm came from, which is the contract that callback is written
     // against. It is invoked at most once per column and only for the <1% of
@@ -1621,16 +1683,16 @@ MaterialId Amplifier::materialAt(const ColumnSample& col, int64_t vz) {
     const MaterialId m = stratigraphyAt(col, vz);
     // Already void, or the unbounded bedrock floor: the cave pass never
     // touches either. Refusing MAT_BEDROCK here is the third and last of the
-    // independent bedrock guards (caves.h documents the other two) — even a
+    // independent bedrock guards (caves.h documents the other two) â€” even a
     // mis-tuned constant table cannot punch a hole in the world's floor.
     if (m == MAT_AIR || m == MAT_BEDROCK) return m;
     // MAT_AIR is an enumerator and `m` is a MaterialId variable, so a bare
-    // `cond ? MAT_AIR : m` mixes an enumerated and a non-enumerated operand —
+    // `cond ? MAT_AIR : m` mixes an enumerated and a non-enumerated operand â€”
     // gcc's -Wextra rejects that (clang does not), so name the type explicitly.
     if (caveCarveAt(col.cave, col.surfaceMm, col.bedrockDepthMm, vz))
         return static_cast<MaterialId>(MAT_AIR);
     // Caverns (voxelcore/caverns.h) carve the same way tunnels do and under
-    // the same three independent bedrock guards — the MAT_BEDROCK refusal
+    // the same three independent bedrock guards â€” the MAT_BEDROCK refusal
     // above, cavernCarveAt's own margin clamp, and the geometry itself.
     // Ordered after caves purely because a cavern column is far rarer, so the
     // common case never reaches this call: cavernCarveAt's first test is

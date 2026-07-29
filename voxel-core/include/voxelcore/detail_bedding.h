@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // Bedding term (Phase 3c/3d, docs/terrain-amplification-plan.md) -- regional
 // strike/dip and the quasi-periodic banding it produces where the ground
 // surface (2D) or a rock volume (3D) cuts through tilted bed planes.
