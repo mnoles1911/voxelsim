@@ -979,3 +979,50 @@ re-synchronising it: thresholds derived from `climate.h` at compile time, the
 seed default taken from the subsystem rather than re-typed, `world_map.py`
 parsing `biome.h` instead of hardcoding it. **Prefer deriving over copying, and
 when a copy is genuinely unavoidable, make it fail loudly rather than quietly.**
+
+## W3 rivers — PARKED 2026-07-29, blocked on the terrain pipeline
+
+Matt's call, and the evidence supports it: **do not resume river water until
+worldgen actually carves riverbeds and generates basins.**
+
+**What is built and merged (all inert):**
+- `channel.h`/`channel.cpp` — riverbed geometry from discharge. Verified
+  standalone via `vxc_riverprobe`: a real river from +130.6 m to −99.9 m,
+  monotone every step, 0 gaps across 571,500 centreline columns, 0.20% bank
+  leakage against a <1% guard. **Consumed by nothing.**
+- `rivercouple.h`/`.cpp` — discharge → CA water, sustained flux → channel
+  promotion, ocean as sink. `kDivertChannel` is no longer a stub. Behind
+  `voxel.Water.Rivers`, **default false**.
+
+**Why it is parked.** Run in engine, the coupling works exactly as designed —
+443 segments, 9,894,505 fill units injected, ledger exact to the unit
+(`storage + outlets + toCA == injected`), 3.69M units delivered into the CA.
+And it looks wrong: disconnected puddles scattered along the drainage lines
+rather than continuous rivers. The cause is not the coupling. **There are no
+riverbeds.** `ChannelField` is referenced nowhere in `amplifier.cpp`,
+`world.h` or `VoxelWorldSubsystem.cpp`, so discharge lands on unmodified
+hillside and pools wherever the ground happens to dip.
+
+The carving pass avoided a `kWorldGenVersion` bump by not wiring itself in.
+That was reported as a clean win; it was also precisely why the feature does
+not work.
+
+**What unblocks it, in order:**
+1. The amplifier and bake pipeline settle (the other session owns this).
+2. Wire `ChannelField` into worldgen output. **Costs `kWorldGenVersion` 10→11,
+   golden re-pins, and an HLSL mirror change in lockstep** — there is no free
+   route, because "free" was exactly what not-wiring-it bought.
+3. Basin detection → ponds and lakes (plan §3.7, entirely unimplemented). This
+   is the missing fourth determinism site for water placement, and no amount of
+   river work substitutes for it.
+
+**Collision warning.** `origin/claude/erosion-v7` took the version-bump route
+for drainage carving — 341 lines into `amplifier.cpp`, goldens re-pinned across
+five files — and is **permanently unmergeable**. The other session touched
+`amplifier.cpp` ×8, `worldgen.ush` ×5 and the **binary** `.spv` prebuilts ×4 in
+24 hours; binary conflicts do not merge. Coordinate before entering worldgen.
+
+**Also parked:** the `swe.h` §5 lateral-spill gap (an SWE-owned pool cannot
+spill into a lower CA-owned neighbour) and ADR-0007's depth term. Both need
+`kSweVersion` 1→2 and a re-pin of `0x61523E585CF7B782`; ADR-0007 argues for
+deciding them together.
