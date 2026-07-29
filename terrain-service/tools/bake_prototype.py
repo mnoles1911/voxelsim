@@ -383,18 +383,26 @@ def run_bake(coarse, iters=48, verbose=True, seed=20260719, noise=None,
     Takes the coarse array rather than a path so the seam test can bake a
     PADDED domain (centre tile + apron drawn from its neighbours) and crop the
     interior, which is the whole apron argument in the plan."""
-    t = {}
+    # Wall-clock AND process CPU time. Wall-clock is what a user waits, but it
+    # is badly distorted by anything else on the machine -- these numbers were
+    # first taken while another session held the box, which made them upper
+    # bounds of unknown looseness. process_time() sums kernel+user CPU across
+    # this process's threads, so a competing process steals wall-clock from it
+    # but not CPU-seconds. For the parallel (numba prange) stages CPU-s exceeds
+    # wall-s by roughly the thread count; that is the point, it is the WORK.
+    t, tc = {}, {}
 
-    def tick(name, t0):
+    def tick(name, t0, c0):
         t[name] = time.perf_counter() - t0
+        tc[name] = time.process_time() - c0
         if verbose:
-            print(f"  {name:<34} {t[name]:7.2f} s")
+            print(f"  {name:<34} {t[name]:7.2f} s wall  {tc[name]:8.2f} s cpu")
 
-    t0 = time.perf_counter(); fine = bspline_upsample(coarse, SCALE); tick("B0 B-spline upsample", t0)
+    t0, c0 = time.perf_counter(), time.process_time(); fine = bspline_upsample(coarse, SCALE); tick("B0 B-spline upsample", t0, c0)
 
     gy, gx = np.gradient(fine, PIXEL_M)
     slope0 = np.hypot(gx, gy)
-    t0 = time.perf_counter()
+    t0, c0 = time.perf_counter(), time.process_time()
     # The fBm here is generated in ARRAY coordinates, so two overlapping domains
     # would NOT agree in their overlap. Production B1 must hash WORLD
     # coordinates (the plan says so, and it is what makes the apron argument
@@ -407,17 +415,17 @@ def run_bake(coarse, iters=48, verbose=True, seed=20260719, noise=None,
         fine = fine + spectrum_fitted_fbm(fine, PIXEL_M, slope0, seed=seed)
     else:
         fine = fine + conditioned_fbm(fine.shape, slope0, seed=seed) * rough
-    tick("B1 conditioned fBm roughness", t0)
+    tick("B1 conditioned fBm roughness", t0, c0)
 
-    t0 = time.perf_counter(); filled = priority_flood(fine); tick("B2a priority-flood fill", t0)
-    t0 = time.perf_counter(); rec, slope = d8_receiver(filled, PIXEL_M); tick("B2b D8 receivers", t0)
-    t0 = time.perf_counter(); order = np.argsort(filled.ravel())[::-1].astype(np.int64); tick("B2c elevation sort", t0)
-    t0 = time.perf_counter()
+    t0, c0 = time.perf_counter(), time.process_time(); filled = priority_flood(fine); tick("B2a priority-flood fill", t0, c0)
+    t0, c0 = time.perf_counter(), time.process_time(); rec, slope = d8_receiver(filled, PIXEL_M); tick("B2b D8 receivers", t0, c0)
+    t0, c0 = time.perf_counter(), time.process_time(); order = np.argsort(filled.ravel())[::-1].astype(np.int64); tick("B2c elevation sort", t0, c0)
+    t0, c0 = time.perf_counter(), time.process_time()
     acc = accumulate_mfd(filled, order, np.float32(PIXEL_M * PIXEL_M),
                          np.float32(PIXEL_M), np.float32(1.1)).reshape(fine.shape)
-    tick("B2d MFD flow accumulation", t0)
+    tick("B2d MFD flow accumulation", t0, c0)
 
-    t0 = time.perf_counter()
+    t0, c0 = time.perf_counter(), time.process_time()
     # K calibrated so the largest channels carve metres, not millimetres: at
     # A = 10 km2 and a 10% slope, A^0.45 * S^0.8 ~ 220, so K of order 1e-2 gives
     # ~2 m. The first pass used 4e-4 and produced a p99 of 0.01 m -- a drainage
@@ -426,17 +434,17 @@ def run_bake(coarse, iters=48, verbose=True, seed=20260719, noise=None,
     incision = K * np.power(acc, m, dtype=np.float32) * np.power(slope + 1e-6, n, dtype=np.float32)
     incision = np.minimum(incision, cap)
     eroded = filled - incision
-    tick("B2e stream-power incision", t0)
+    tick("B2e stream-power incision", t0, c0)
 
-    t0 = time.perf_counter()
+    t0, c0 = time.perf_counter(), time.process_time()
     max_drop = np.float32(np.tan(np.radians(36.0)) * PIXEL_M)
     z = eroded
     for _ in range(iters):
         z = thermal_step(z, max_drop, np.float32(0.35))
-    tick(f"B3 thermal relaxation x{iters}", t0)
+    tick(f"B3 thermal relaxation x{iters}", t0, c0)
 
     if verbose:
-        print(f"  {'TOTAL':<34} {sum(t.values()):7.2f} s  "
+        print(f"  {'TOTAL':<34} {sum(t.values()):7.2f} s wall  {sum(tc.values()):8.2f} s cpu  "
               f"({coarse.shape[0]*SCALE}^2 = {(coarse.shape[0]*SCALE)**2/1e6:.1f} Mcell)")
     return {"fine": fine, "z": z, "acc": acc, "incision": incision,
             "filled": filled, "eroded": eroded, "times": t}

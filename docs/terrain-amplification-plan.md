@@ -139,17 +139,28 @@ Runs on the GPU pod that already generates tiles.
 `terrain-service/tools/bake_prototype.py` runs B0–B3 at full resolution on a real tile (needs the
 `terrain-diffusion` venv for numba/scipy). Per stage, 4096², one tile:
 
-| stage | s | note |
-|---|---|---|
-| B0 B-spline upsample | 0.3 | |
-| B1 conditioned fBm | 9.6 | scipy `zoom` is the slow part; a real implementation is far cheaper |
-| B2a priority-flood fill | 3.0 | inherently sequential, stays on CPU |
-| B2b D8 receivers | 1.5 | |
-| B2c elevation sort | 0.7 | |
-| B2d MFD accumulation | 2.1 | sequential sweep |
-| B2e stream-power incision | 0.3 | |
-| B3 thermal relaxation ×48 | 4.6 | trivially GPU-parallel |
-| **total** | **~22 s** | vs the ≈1.5 s originally estimated — ⚠️ **contended, re-measure** |
+Reported as **wall AND process CPU time**. Wall-clock is what a user waits but is badly distorted
+by anything else on the machine (these were taken while another session held the box). CPU-seconds
+sum kernel+user across this process's threads, so a competing process steals wall-clock but not
+CPU — that column is the contention-robust one, and it also separates parallel from sequential
+work for free.
+
+| stage | wall s | **cpu s** | note |
+|---|---|---|---|
+| B0 B-spline upsample | 0.55 | 0.52 | |
+| B1 conditioned fBm | 7.47 | 7.30 | single-threaded; scipy `zoom` dominates, easily improved |
+| B2a priority-flood fill | 2.67 | 2.55 | genuinely sequential — cpu≈wall confirms it, stays on CPU |
+| B2b D8 receivers | 1.32 | 1.67 | |
+| B2c elevation sort | 0.58 | 1.27 | |
+| B2d MFD accumulation | 1.74 | 1.67 | sequential sweep |
+| B2e stream-power incision | 0.34 | 0.34 | |
+| B3 thermal relaxation ×48 | 4.59 | **25.31** | ~5.5× parallel — the one stage a GPU really helps |
+| **total** | **19.25** | **40.62** | vs the ≈1.5 s originally estimated |
+
+The split is the useful part: **~13.5 CPU-s is sequential** (B1, priority-flood, sort, MFD,
+incision — all cpu≈wall, so more cores do not help), and **~27 CPU-s is parallel**, almost all of
+it thermal relaxation, which is exactly the stage a GPU eats. A production bake with the parallel
+work on the pod's GPU and B1 written properly plausibly lands at **5–10 s/tile**.
 
 The genuinely sequential core (priority-flood + sort + accumulation) is ~5.8 s; the rest is
 GPU-parallel. A production bake plausibly lands at 6–10 s/tile — still **4–6× the estimate**, but
@@ -759,13 +770,15 @@ back at Tier A with a larger shipped region.
 
 ## Open risks
 
-1. **Bake cost: STILL OPEN — the measurement was contaminated.** The ~22 s/tile figure and the
-   per-stage split in "Bake prototype" below were taken while another session's `UnrealEditor-Cmd`
-   held the box, so they are upper bounds of unknown looseness rather than measurements. Re-run on
-   a quiet machine. The *qualitative* conclusion is robust to a large error — even at a 5× overstatement
-   the bake stays far below coarse diffusion's 22.5 s/tile, and advancing the frontier one tile
-   needs 5 coarse tiles against 3 bakes, so prefetch ring sizes do not change either way. But the
-   headline "4–6× the estimate" is not established.
+1. **Bake cost: measured in CPU-seconds, which contention cannot steal.** **40.6 CPU-s/tile**
+   (19.3 s wall), against the ≈1.5 s originally estimated. ~13.5 CPU-s of that is sequential and
+   ~27 CPU-s parallel (almost all thermal relaxation), so a production bake with the parallel work
+   on GPU plausibly lands at 5–10 s/tile. Wall-clock alone was contaminated; CPU-seconds are not,
+   because a competing process steals wall-clock but not cycles attributed to this process.
+   Residual caveat: cache and memory-bandwidth pressure still inflate CPU-s somewhat, so treat it
+   as a tight upper bound rather than a clean number. Either way the on-demand argument is
+   unaffected — coarse diffusion at 22.5 s/tile dominates, and advancing the frontier one tile
+   needs 5 coarse tiles against 3 bakes.
 2. ~~Compressed tile size is modelled, not measured.~~ **RETIRED** — measured on three real tiles
    with `terrain-service/tools/measure_fine_tier_size.py`; see the size section. 8 MB/tile stands
    for correlated detail. The live risk is now narrower and different: **the bake must not
