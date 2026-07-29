@@ -1028,15 +1028,19 @@ static_assert(kDeepestCarveBelowSurfaceMm < kBedrockDepthMinMm - kCaveBedrockMar
 // between the bedding and pocket allocations -- which density3.h permits, as a
 // redistribution -- cannot silently widen the world's bounds without the
 // number in front of someone.
-static_assert(kDensity3MaxAbsMm == 700,
+static_assert(kDensity3MaxAbsMm == 350,
               "the 3D density envelope moved; surfaceBoundsMm, GeneratedWorld's surface brick "
               "range and amplifier.h's air-reason enumeration are all widened by exactly this "
               "constant, and a bound that did not follow it is a hole in the world.");
-static_assert(kDensity3MaxAbsMm % kVoxelSizeMm == 0,
-              "the envelope must be a whole number of voxels, or GeneratedWorld's brick-range "
-              "widening needs a rounding argument it currently does not have");
-constexpr int64_t kDensity3EnvelopeVoxels = kDensity3MaxAbsMm / kVoxelSizeMm;
-static_assert(kDensity3EnvelopeVoxels == 7, "3D density envelope is 7 voxels either side");
+// The envelope is 3.5 voxels, not a whole number of them, so every consumer
+// that works in voxels rounds UP -- see density3BandVoxels, which is the single
+// place that rounding lives so it cannot be done two different ways.
+constexpr int64_t kDensity3EnvelopeVoxels =
+    (kDensity3MaxAbsMm + kVoxelSizeMm - 1) / kVoxelSizeMm;
+static_assert(kDensity3EnvelopeVoxels == 4,
+              "3D density envelope is 3.5 voxels, covered by 4 either side");
+static_assert(kDensity3EnvelopeVoxels * kVoxelSizeMm >= kDensity3MaxAbsMm,
+              "the voxel envelope must cover the millimetre one");
 
 // (14) The lithology gate's argument. density3RockGateQ is fed the depth of
 // SOIL ABOVE ROCK, and stratigraphyAt's own layer model decides what that is:
@@ -1050,6 +1054,34 @@ int64_t soilAboveRockMm(const ColumnSample& col) {
     return col.surfaceMat == MAT_ROCK ? int64_t(col.topsoilMm)
                                       : int64_t(col.topsoilMm) + int64_t(col.subsoilMm);
 }
+
+// (14b) WHAT THE LITHOLOGY GATE ACTUALLY SELECTS, pinned so it cannot drift.
+//
+// density3.h promotes the lithology gate to the whole displacement at v12, and
+// its comment claims the continuous ramp resolves in practice to "bare rock
+// only". That claim is a COUPLING between three constants in this file and two
+// in density3.h, not a property of either, so it is asserted here where the
+// three live rather than described there where it would rot.
+//
+// The thinnest soil a NON-rock column can carry is the topsoil floor plus the
+// subsoil derived from it, and subsoil is `topsoil * 2 + 500`:
+constexpr int64_t kThinnestNonRockSoilMm = kTopsoilMinMm * 2 + 500 + kTopsoilMinMm;
+static_assert(kThinnestNonRockSoilMm >= kDensity3RockSoilZeroMm,
+              "the 3D density band's lithology gate is supposed to be shut on every column "
+              "that is not BARE_ROCK -- that is what keeps an undercut nose from cutting a "
+              "face across a soil profile and exposing MAT_SUBSOIL where the biome material "
+              "should be. It holds because the thinnest possible non-rock column already "
+              "carries kDensity3RockSoilZeroMm of soil. If kTopsoilMinMm, the subsoil formula "
+              "or that constant move, this stops being true SILENTLY: re-read density3.h's "
+              "lithology gate section and decide deliberately, do not just widen the assert.");
+// And the mirror-image half: on a rock cliff the gate must be OPEN, or the term
+// is inert everywhere and the whole band is cost with no output. Slope
+// retention pins topsoil at its floor on any column steep enough to pass the
+// slope gate, and a MAT_ROCK column's soil is topsoil alone.
+static_assert(kTopsoilMinMm <= kDensity3RockSoilFullMm,
+              "a bare-rock cliff must open the lithology gate FULLY; if the topsoil floor "
+              "rises past kDensity3RockSoilFullMm the band starts fading out on exactly the "
+              "ground it exists for");
 
 // (12) The dilation radius. A cavern site only reaches columns within
 // kCavernMaxReachMm of its anchor (cavernColumnFromSites culls on exactly
@@ -1699,17 +1731,15 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // argument is the depth of soil above rock, and which of the two soil bands
     // count is decided by the surface material -- see coupling (14).
     //
-    // COST ON A COLUMN THAT DOES NOT QUALIFY: density3SlopeGateQFromMag is one
-    // compare, and it returns 0 on ~93% of columns, at which point
+    // COST ON A COLUMN THAT DOES NOT QUALIFY: two compares and two divides, and
     // density3ColumnFor returns a zeroed struct having computed no hash at all.
-    // The qualifying ~7% pay one hash2 (the structural domain) plus, if the
-    // lithology gate is also open, eight hash3 (the pocket's corner cache). The
-    // slope fed in is the CARRIER's analytic gradient magnitude, the same
-    // scalar slopeScaleQ10 and classifyBiome already take -- density3.h's
-    // "primary form" exists precisely so this needs no gradient vector and
-    // SurfaceEval needs no new field.
-    col.d3 = density3ColumnFor(seed_, xMmC, yMmC, col.surfaceMm, slopeMmPerM,
-                               soilAboveRockMm(col));
+    // On the 25 real diffusion tiles that is 93.5% of columns -- 88% rejected by
+    // the slope gate and the rest by the lithology gate. The qualifying 6.5% pay
+    // exactly one hash2, the structural domain. The slope fed in is the
+    // CARRIER's analytic gradient magnitude, the same scalar slopeScaleQ10 and
+    // classifyBiome already take -- density3.h's "primary form" exists precisely
+    // so this needs no gradient vector and SurfaceEval needs no new field.
+    col.d3 = density3ColumnFor(seed_, xMmC, yMmC, slopeMmPerM, soilAboveRockMm(col));
 
     // M4 cave pass (voxelcore/caves.h): reduce the jittered lattice tunnel
     // network to the tube axes that pass near this column. Depends only on

@@ -2885,6 +2885,27 @@ int main(int argc, char** argv) {
         // not a multiple of 64 -- i.e. 576 columns where the CPU's deliberate
         // floorDiv and a truncating divide give different answers.
         {"gentle-fine-crest", -400000, -400000, 24, 24, 3750, 100},
+        // AND ONE REGION WHERE THE 3D DENSITY BAND ACTUALLY FIRES (v12).
+        //
+        // This one exists because of a near-miss. When the band was first wired
+        // in at a 700 mm envelope, the six regions above happened to contain
+        // gated columns and the cell comparison covered it. Halving the envelope
+        // and promoting the lithology gate to the whole displacement made every
+        // one of those regions non-rock or too gentle -- and vxc_gpu went on
+        // PASSING, bit-exact, over the identical 739,328 cells and the identical
+        // digest it produced at v11. A gate that closes everywhere in the
+        // fixture is indistinguishable from a term that is not mirrored at all,
+        // which is exactly the hole the fine-tier region above was added to
+        // close for the fine octave table.
+        //
+        // So the fixture is chosen by SEARCH rather than by eye: this is the
+        // 64x64 origin on the synthetic sampler with the highest gated-column
+        // count and a relief small enough for runMeshChain's mask cap. All 4096
+        // columns pass both gates and 956 of them are overhung, so every hash in
+        // the band, the contrast curve, the taper and the per-column brick
+        // widening are all live here -- and any divergence in them is a cell
+        // mismatch rather than a silent pass.
+        {"density-band-cliff", -8800, -30816, 64, 64, 30000, 1},
     };
 
     Digest gpuDigest;

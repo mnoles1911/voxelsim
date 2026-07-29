@@ -375,23 +375,36 @@ constexpr int64_t beddingRawAt(uint64_t seed, int64_t xMm, int64_t yMm, int64_t 
 // as legible as the budget allows.                                [PROVISIONAL]
 inline constexpr int64_t kBeddingAmpMm = 120;
 
-// The 3D envelope: plan Phase 3d sets an overall |D(x,y,z)| <= 700mm budget
-// for stratigraphyAt's whole displacement, of which this bedding term is only
-// ONE contributor (the plan's other contributor is a rock-gated valueNoise3
-// pocket term, owned by whichever agent lands Phase 4). 500mm is chosen so
-// the bedding contribution alone leaves ~200mm of the 700mm budget for that
-// sibling term when the two are eventually summed -- the integrator must
-// still check the SUM of all Phase-4 displacement terms against 700mm; this
-// file only guarantees ITS OWN term stays within kBedding3MaxAbsMm.
-inline constexpr int64_t kBedding3AmpMm = 500; // PROVISIONAL, see comment above
+// The 3D envelope. Plan Phase 3d set an overall |D(x,y,z)| <= 700 mm budget for
+// stratigraphyAt's whole displacement, of which this term was one contributor
+// at 500 mm and a rock-gated valueNoise3 pocket term was the other at 200 mm.
+//
+// 500 -> 350 at kWorldGenVersion 12, and the whole envelope is now this term's.
+// Two MEASURED reasons, both recorded at length in density3.h:
+//
+//   * 700 mm was not affordable. Wired in, it cost 2.6x world-average
+//     voxelisation on real diffusion tiles for an overhang on 0.22% of all
+//     columns. Halving the envelope halves the band, and the band width is what
+//     the per-voxel cost is proportional to.
+//   * the pocket term produced ZERO overhangs -- its z lattice is 6400 mm
+//     against a 200 mm amplitude, so it never approaches dD/dz > 1 -- while
+//     costing eight hash3 per voxel, and inside a 350 mm envelope any share it
+//     could be given is under one voxel. So the sibling it was leaving room for
+//     is gone, and this term inherits the budget.
+//
+// Halving the amplitude alone would have collapsed the overhang rate from 2.9%
+// of gated columns to 0.5%; density3.h's contrast curve goes to three passes to
+// recover it. See kDensity3SharpenPasses there for what that costs.
+inline constexpr int64_t kBedding3AmpMm = 350; // PROVISIONAL, see comment above
 
 inline constexpr int64_t kBeddingMaxAbsMm = kBeddingAmpMm;   // 2D bound, proved above
 inline constexpr int64_t kBedding3MaxAbsMm = kBedding3AmpMm; // 3D bound, proved above
 
 static_assert(kBeddingAmpMm > 0 && kBedding3AmpMm > 0, "amplitudes must be positive");
 static_assert(kBedding3MaxAbsMm <= 700,
-              "plan Phase 3d's total 3D displacement envelope is 700mm; this term must leave "
-              "room for the sibling pocket term, not consume the whole budget alone");
+              "plan Phase 3d's total 3D displacement envelope was 700mm; density3.h's "
+              "kDensity3MaxAbsMm is the number that actually binds and it asserts the exact "
+              "allocation itself. This is the plan's ceiling, kept as a backstop.");
 // Overflow guard for beddingMm/beddingDisplacement3Mm's `amp * beddingRawAt(...)`
 // multiply: with |beddingRawAt| <= kBeddingRawScale (33,554,432), this holds
 // with more than 12 orders of magnitude of margin for any sane amplitude, but

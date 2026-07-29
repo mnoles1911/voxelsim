@@ -76,7 +76,7 @@ namespace vxc {
 // v12 (docs/terrain-amplification-plan.md Phase 3d/4): the bounded 3D density
 // band. `Amplifier::stratigraphyAt` stops testing `voxel centre <= surface` and
 // tests `centre <= surface + D(x, y, z)` instead, with a compile-time envelope
-// |D| <= 700 mm (voxelcore/density3.h). This is the first time in this
+// |D| <= 350 mm (voxelcore/density3.h). This is the first time in this
 // codebase's history that the solid set is not the region under a graph: a
 // column can read air with solid above it, i.e. the world can have overhangs.
 //
@@ -84,14 +84,24 @@ namespace vxc {
 // seen volumetrically and put through a monotone odd contrast curve (the tent
 // profile alone produced overhangs on 0.098% of gated columns -- bounded,
 // continuous, gated and geometrically inert), plus a rock-gated 3D pocket term.
-// Both gates are cheap and hoisted per column, and outside the +/-700 mm band D
+// Both gates are cheap and hoisted per column, and outside the +/-350 mm band D
 // cannot flip the test, so the skip is EXACT rather than approximate -- which
 // is the only reason a per-voxel hashing pass is affordable at all.
 //
 // Everything derived from the surface widens by that one constant:
 // surfaceUpperBoundMm, surfaceLowerBoundMm and (through it) solidBelowBoundMm,
-// plus GeneratedWorld's surface brick range by 7 voxels either side. The
-// air-reason enumeration in amplifier.h gains its fourth reason.
+// plus GeneratedWorld's surface brick range -- the latter PER COLUMN, since D is
+// identically zero wherever the gates are shut. The air-reason enumeration in
+// amplifier.h gains its fourth reason.
+//
+// THE ENVELOPE IS 350 mm AND NOT THE PLAN'S 700, and that is the whole story of
+// this version. At 700 the term was implemented, wired in and MEASURED: 2.6x
+// world-average voxelisation on real diffusion tiles and +13% bricks, for an
+// overhang on 0.22% of all columns. It was not merged. At 350 the band halves,
+// the pocket contributor is deleted outright (it produced no overhangs at any
+// amplitude and was the dominant cost), the contrast curve goes to three passes
+// to recover the rate the smaller amplitude cost, and the lithology gate is
+// promoted to the whole displacement so the term is live on bare rock only.
 inline constexpr uint32_t kWorldGenVersion = 12;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level

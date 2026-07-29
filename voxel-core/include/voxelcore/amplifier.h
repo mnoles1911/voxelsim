@@ -201,11 +201,11 @@ public:
     //
     // v12 WIDENED THIS BY kDensity3MaxAbsMm AND REDEFINED IT ONTO THE DISPLACED
     // SURFACE, deliberately, rather than leaving it a bound on surfaceMm and
-    // asking every caller to add 700 mm. Callers use this as "everything above
+    // asking every caller to add 350 mm. Callers use this as "everything above
     // here is air", which was the same statement before Phase 4 and is not now;
     // a bound whose contract silently stopped matching its only use would be a
-    // hole in the world one refactor away. It costs 700 mm of slack against
-    // typical footprint slack of 8.5 m and upward, i.e. under 10%.
+    // hole in the world one refactor away. It costs 350 mm of slack against
+    // typical footprint slack of 8.5 m and upward, i.e. about 4%.
     //
     // WHY IT IS THE ONLY QUERY A SKY-BAND TRIM NEEDS. materialAt is
     // unconditionally MAT_AIR above the displaced surface (stratigraphyAt's
@@ -273,7 +273,7 @@ public:
     //   1b. THE FOURTH REASON, new at kWorldGenVersion 12: the bounded 3D
     //      density band (voxelcore/density3.h). stratigraphyAt now tests
     //      `centre <= surface + D` with |D| <= kDensity3MaxAbsMm, so a voxel up
-    //      to 700 mm BELOW a column's own surfaceMm can be air where it was
+    //      to 350 mm BELOW a column's own surfaceMm can be air where it was
     //      solid before. It needs no term of its own here because
     //      surfaceLowerBoundMm has already been widened by that constant and is
     //      therefore a bound on the DISPLACED surface — which is exactly the

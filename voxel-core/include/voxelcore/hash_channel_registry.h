@@ -73,8 +73,12 @@ inline constexpr ChannelAlloc kChannelAllocs[] = {
     // detail_bedding.h
     {CH_BEDDING_STRIKE, 1, "CH_BEDDING_STRIKE"},
     {CH_BEDDING, 1, "CH_BEDDING"},
-    // density3.h
-    {CH_POCKET, 1, "CH_POCKET"},
+    // density3.h allocates NOTHING. It held CH_POCKET = 29 for the pocket term
+    // until kWorldGenVersion 12 removed that term (density3.h section 2); 29 is
+    // free again. Everything the 3D density band hashes, it hashes through
+    // detail_bedding.h's two channels above -- which is the design, not an
+    // implementation detail: sharing the field is what puts the volumetric
+    // recesses in phase with the banding on the face.
 };
 
 inline constexpr int kChannelAllocCount =

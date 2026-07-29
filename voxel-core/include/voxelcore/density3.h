@@ -13,7 +13,7 @@
 //
 // Concretely: `stratigraphyAt` today tests `voxel centre <= surface`. This
 // header supplies a displacement D(x, y, z) so the test becomes
-// `z <= surface + D`, with a compile-time-provable envelope |D| <= 700 mm.
+// `z <= surface + D`, with a compile-time-provable envelope |D| <= 350 mm.
 //
 // WIRED IN AT kWorldGenVersion 12 (Wave C). `Amplifier::stratigraphyAt` now
 // tests `centre <= surface + D`, with the column-invariant half of D hoisted
@@ -21,8 +21,9 @@
 // same way the cave and cavern passes hoist theirs. That bump carried the
 // bound widening this header's section 0 asks for -- surfaceUpperBoundMm,
 // surfaceLowerBoundMm and solidBelowBoundMm all moved by kDensity3MaxAbsMm,
-// GeneratedWorld's surface brick range widened by 7 voxels either side, and
-// amplifier.h's air-reason enumeration gained its fourth reason.
+// GeneratedWorld's surface brick range widened PER COLUMN by the band (zero
+// where the gates are shut, which is most ground), and amplifier.h's air-reason
+// enumeration gained its fourth reason.
 //
 // Header-only, integer-only (CI float ban), C++20, UE-header-free. Every
 // expression is a plain free function of int64_t/uint64_t -- no templates, no
@@ -34,11 +35,15 @@
 // ---------------------------------------------------------------------------
 // CHANNEL NOTE
 // ---------------------------------------------------------------------------
-// Allocated here: CH_POCKET = 29. Survey of the whole tree at time of writing:
-// hash.h 0..15 (detail octaves), 16, 17, 18, 19, 32..47 (synthetic tiles);
-// caves.h 18, 19, 20, 21, 24; caverns.h 22, 23, 25; detail_rill.h 26;
-// detail_bedding.h 27, 28. So 29, 30 and 31 are the only free ids below the
-// synthetic-tile reservation, and this file takes the first.
+// This file now allocates NO channel of its own. It claimed CH_POCKET = 29 for
+// the pocket term; that term was removed at kWorldGenVersion 12 (see section 2)
+// and 29 went back to the free list. Survey of the whole tree at time of
+// writing: hash.h 0..15 (detail octaves), 16, 17, 18, 19, 32..47 (synthetic
+// tiles); caves.h 18, 19, 20, 21, 24; caverns.h 22, 23, 25; detail_rill.h 26;
+// detail_bedding.h 27, 28. So 29, 30 and 31 are free.
+//
+// Everything this file hashes, it hashes through detail_bedding.h's channels,
+// which is not an accident of implementation -- it is the design. See section 3.
 //
 // detail_bedding.h's channel note records a REAL collision already in the
 // tree: hash.h's CH_ECOTONE_TEMP/PRECIP (18/19) and caves.h's
@@ -57,33 +62,43 @@
 
 namespace vxc {
 
-inline constexpr uint32_t CH_POCKET = 29; // joint-controlled pocket/chimney noise
-
 // =============================================================================
 // 0. THE ENVELOPE, AND WHY THE BAND HALF-WIDTH EQUALS IT
 // =============================================================================
 //
-// The plan fixes |D| <= 700 mm. That single number does three jobs:
+// The plan fixed |D| <= 700 mm; this ships 350. That single number does three
+// jobs:
 //
 //   1. It is the amount every surface-derived bound must widen by (brick
 //      ranges, the air-reason enumeration at amplifier.h:167-196).
 //   2. It is the half-width of the band in which D may be non-zero.
 //   3. It is therefore what makes the skip EXACT rather than approximate.
 //
+// AND IT IS THE COST. Job (2) is why: the per-voxel work is proportional to how
+// many voxels fall inside the band, so the envelope is not a quality knob with a
+// cost side effect, it is the cost, linearly. 700 mm was measured end to end and
+// rejected -- 2.6x world-average voxelisation on real diffusion tiles and +13%
+// bricks, for an overhang on 0.22% of all columns. 350 halves the band and, with
+// the two changes below (the pocket term deleted, the contrast curve at three
+// passes), keeps two thirds of the overhang rate. The full before/after is in
+// the Wave C retry notes; what belongs HERE is that this constant is the dial
+// and that moving it moves cost linearly and overhang rate FASTER than
+// linearly -- see kDensity3SharpenPasses.
+//
 // (2) and (3) are the same fact, and it is worth writing the argument out
 // because "we skip far-from-surface voxels" usually means an approximation and
 // here it does not. Let dz = z - surface.
 //
-//   * If dz > 700: since D <= 700 <= dz, `dz <= D` is false. The voxel is air
+//   * If dz > 350: since D <= 350 <= dz, `dz <= D` is false. The voxel is air
 //     whether or not D was computed. Skipping gives the identical answer.
-//   * If dz < -700: since D >= -700 >= dz, `dz <= D` is true. The voxel is
+//   * If dz < -350: since D >= -350 >= dz, `dz <= D` is true. The voxel is
 //     solid whether or not D was computed. Skipping gives the identical answer.
 //
 // There is no epsilon and no "visually indistinguishable" in that argument.
 // Halving the envelope would halve the band and halve the cost, and widening
 // it widens both -- band half-width is not a free tuning knob, it is forced
 // equal to the envelope.
-inline constexpr int64_t kDensity3MaxAbsMm = 700;
+inline constexpr int64_t kDensity3MaxAbsMm = 350;
 inline constexpr int64_t kDensity3BandHalfMm = kDensity3MaxAbsMm; // forced equal, see above
 
 // Fixed-point quantum for all three gates. Aliased to detail_rill.h's rather
@@ -98,88 +113,70 @@ static_assert(kDensity3GateQ == 4096,
 // 1. THE GATES -- SEPARATE, CHEAP, AND CALLABLE BEFORE ANYTHING EXPENSIVE
 // =============================================================================
 //
-// WHY THIS TERM IS GATED AT ALL. The plan costs an ungated volumetric
-// displacement at roughly DOUBLE VoxelizeMain everywhere -- it turns a
-// stratigraphy lookup that is a handful of integer ops into one that hashes
-// per voxel. That was rejected. Gated, the plan's figure is +50-80% on a
-// cliff-dominated chunk and +5-10% world-average, and the whole difference is
-// that the expensive part runs only where it can change an answer.
+// WHY THIS TERM IS GATED AT ALL. An ungated volumetric displacement roughly
+// DOUBLES VoxelizeMain everywhere -- it turns a stratigraphy lookup that is a
+// handful of integer ops into one that hashes per voxel. Gated, the expensive
+// part runs only where it can change an answer.
 //
-// So the gates are exposed as their own functions, in the order the caller
-// should apply them, and NOT folded into the displacement call:
+// There are TWO gates and they are combined into ONE per column:
 //
-//     per column, once:   density3SlopeGateQ(gx, gy)   -- 4 compares, 1 divide
-//                         density3RockGateQ(soilMm)    -- 1 compare, 1 divide
-//                         if both are 0, the whole column is skipped
+//     per column, once:   density3ColumnFor(...)
+//                           slope gate  -- 2 compares, 1 divide
+//                           x lithology gate -- 2 compares, 1 divide
+//                           if the product is 0, the whole column is skipped
+//                           and not one hash is computed
 //     per voxel:          density3BandGateOpen(z, s)   -- 1 subtract, 1 compare
 //                         if false, D is exactly 0 -- skip
-//     only then:          density3DisplacementGatedMm(...)  -- ~70 hash rounds
+//     only then:          the hashes
 //
-// Hoisting the two column gates out of the z loop is the entire cost argument.
-// A caller that calls density3DisplacementMm per voxel gets the right answer
-// and pays the column gates 32x over; that overload exists for tests and for
-// the reference/HLSL mirror, not for the hot loop.
+// Hoisting the column gate out of the z loop is the entire cost argument.
+// density3DisplacementMm, which computes the gates itself, exists for tests and
+// for the reference/HLSL mirror, not for the hot loop.
 //
 // ---------------------------------------------------------------------------
-// MEASURED COST, AND WHERE THE PLAN'S FIGURE LOOKS OPTIMISTIC
+// MEASURED COST -- AND WHAT THE FIRST ESTIMATE HERE GOT WRONG
 // ---------------------------------------------------------------------------
-// Measured on this machine (CPU, single core, Release), against vxc_bench
-// --radius 64 at 8^3 bricks, whose voxelize pass runs at 6.45 ns/voxel:
+// This block used to carry an estimate. It has been replaced by an end-to-end
+// measurement of the term actually wired in (vxc_bench, three builds differing
+// only in this header, same brick set), because the estimate was wrong in a way
+// worth keeping on the record.
 //
-//     band predicate alone                     1.0 ns
-//     full D, both gates open                100.5 ns   <- 7 hash2 + 8 hash3
-//       of which  bedding component           48.4 ns
-//                 pocket component            43.0 ns
-//                 contrast curve               5.3 ns
+// WHAT IT GOT RIGHT: the per-voxel cost. It predicted ~100 ns per gated voxel
+// unhoisted and ~46 ns hoisted; measured 83 ns and 55 ns at the 700 mm
+// envelope. The cost model was sound.
 //
-// Gate pass rates on amplified SyntheticTileSampler terrain (90,000 columns;
-// the shipped diffusion tile set is not in this checkout, so these are an
-// ESTIMATE and the slope distribution is the synthetic sampler's, not a real
-// region's):
+// WHAT IT GOT WRONG, BY 3-5x: the GATE RATE, which is the multiplier on all of
+// it. It estimated the slope gate open on 6.9% of columns from a small sample
+// of SyntheticTileSampler -- and flagged that number as the one to distrust,
+// correctly. Measured since, with a census over 25 REAL diffusion tiles
+// (76.8 x 76.8 km, vxc_climateprobe): 11.95% of columns, and 30.6% on the
+// synthetic sampler the estimate came from. At the 700 mm envelope that made
+// voxelisation 2.6x world-average on real tiles and 4-6x on cliff ground,
+// against the plan's "+50-80% on a cliff chunk". The plan's cost figure was not
+// off by a tuning margin; it was off by an order of magnitude.
 //
-//     slope gate open                      6.9% of columns
-//     slope AND lithology gate open        5.1% of columns
-//     voxels reaching the hash             ~6.9% of the voxels voxelize visits
+// THE LESSON, which is why this is stated rather than just corrected: for a
+// per-voxel gated term the gate rate is not a detail of the cost model, it IS
+// the cost model, and it cannot be estimated off the synthetic sampler because
+// that sampler's slope distribution is nothing like a diffusion tile's. Measure
+// it on real tiles before costing anything else in this band.
 //
-// The slope-open rate is the number to distrust most: a second sample over a
-// wider area of the same synthetic world read 12.9%, so it swings by 2x with
-// the region and would swing further on real diffusion tiles, whose slope
-// distribution reaches grades the synthetic sampler does not (the plan's five
-// real sites run to 116% grade). Everything downstream of it scales linearly.
+// AT THE SHIPPED 350 mm ENVELOPE, per gated voxel (hoisted), the composition is
+// one bedding evaluation plus three quintic passes -- 4 hash2 after the domain
+// hoist, no hash3 at all -- and the band covers half as many voxels.
 //
-// That gives +6.9 ns on a 6.45 ns/voxel pass, i.e. voxelize roughly DOUBLES
-// world-average, which is about +10% of total worldgen time (voxelize is 9.6%
-// of amplify+voxelize+mesh). The plan quotes "+50-80% VoxelizeMain on a
-// cliff-dominated chunk, +5-10% world-average". The world-average figure
-// survives if it is read as a share of TOTAL worldgen; the cliff-chunk figure
-// does not -- on a chunk where the slope gate is open everywhere the band
-// covers essentially every visited voxel and voxelize goes up by an order of
-// magnitude, not by 50-80%. The integrator should re-cost that claim rather
-// than inherit it.
+// TWO HOISTS, BOTH DONE, both VALUE-IDENTICAL rearrangements (hash2 is pure, so
+// a hoisted evaluation and a fresh one return the same integer -- which is what
+// lets worldgen.ush mirror the UNHOISTED form and still be bit-exact):
 //
-// TWO HOISTS RECOVER ABOUT HALF, AND NEITHER NEEDS THIS FILE TO CHANGE:
-//
-//   1. The pocket's z lattice (6400 mm) is more than four times the band
-//      (1400 mm), so on 78% of columns all eight hash3 corners are the same
-//      eight for every voxel in the column. Caching them per column removes
-//      most of 43 ns.
-//   2. beddingRawAt calls beddingDomainHash three times for one hash --
+//   1. beddingRawAt called beddingDomainHash three times for one hash --
 //      beddingStrikeIndexAt, beddingDipQ10At and beddingThicknessMmAt each
-//      recompute it -- and all three are constant over an 819.2 m structural
-//      domain, so they are column-invariant. That is ~3 of bedding's 7 hash2,
-//      about 21 ns.
-//
-// Together those take ~100 ns to ~46 ns, i.e. voxelize +50% rather than +107%
-// world-average.
-//
-// BOTH ARE DONE, at kWorldGenVersion 12. detail_bedding.h grew
-// beddingRawFromDomain (hoist 2) and this file grew Density3PocketCorners
-// (hoist 1) plus the Density3Column that carries both; the numbers each
-// actually bought on the integrated path are in the Wave C notes rather than
-// here, because they are properties of the caller's loop shape, not of this
-// file. Both are VALUE-IDENTICAL rearrangements -- hash2/hash3 are pure, so a
-// hoisted evaluation and a fresh one return the same integer, which is what
-// lets worldgen.ush mirror the UNHOISTED form and still be bit-exact.
+//      recomputed it -- and all three are constant over an 819.2 m structural
+//      domain. detail_bedding.h grew beddingRawFromDomain for it.
+//   2. The pocket term's eight hash3 corners were constant across the band on
+//      78% of columns and were cached per column. That hoist is GONE because
+//      the term it optimised is gone (section 2) -- which is the better version
+//      of the same saving.
 
 // --- gate (b): slope ---------------------------------------------------------
 //
@@ -280,14 +277,23 @@ constexpr bool density3BandGateOpen(int64_t zMm, int64_t surfaceMm) {
 //
 // The core half-width is a real trade and worth stating. The taper caps how
 // far the displaced surface can actually move: a nose can protrude to the
-// largest dz satisfying dz <= taper(dz)/Q * 700, which for a 400/700 split is
-// 511 mm (pinned by test_density3.cpp). Widening the core raises that
-// toward 700 mm at the price of a steeper taper; narrowing it makes the term
-// gentler and the overhangs smaller. 400 is chosen so the reachable
-// displacement is ~+/-0.5 m -- about 1 m of peak-to-trough relief across a
-// face, which is a ledge, and about 5 voxels, which is enough for the mesher
-// to express.
-inline constexpr int64_t kDensity3BandCoreMm = 400;
+// largest dz satisfying dz <= taper(dz)/Q * envelope, which for the shipped
+// 200/350 split is 255 mm (pinned by test_density3.cpp). Widening the core
+// raises that toward the envelope at the price of a steeper taper; narrowing it
+// makes the term gentler and the overhangs smaller.
+//
+// HELD AT THE SAME FRACTION OF THE ENVELOPE (4/7) WHEN THE ENVELOPE HALVED, and
+// that was checked rather than assumed: swept over 150/200/250/300 at a 350 mm
+// envelope, the overhang rate moves 0.96% / 1.15% / 1.33% / 1.35% of columns --
+// monotone, shallow, and saturating past 250. So the core is not where the
+// overhang rate is won or lost (the contrast curve is), and holding the ratio
+// keeps the taper's shape identical to the one every continuity test in
+// test_density3.cpp was written against.
+//
+// The reachable displacement is now ~+/-0.25 m -- about 0.5 m of peak-to-trough
+// relief across a face, and about 2.5 voxels. That is still a ledge the mesher
+// can express; it is not the 5 voxels the 700 mm envelope bought.
+inline constexpr int64_t kDensity3BandCoreMm = 200;
 inline constexpr int64_t kDensity3BandRampMm = kDensity3BandHalfMm - kDensity3BandCoreMm;
 static_assert(kDensity3BandRampMm > 0, "the band needs a taper region");
 
@@ -300,21 +306,53 @@ constexpr int64_t density3BandTaperQ(int64_t zMm, int64_t surfaceMm) {
     return kDensity3GateQ - rillQuinticQ(t);
 }
 
-// --- the pocket term's own gate: lithology ----------------------------------
+// --- gate (c): lithology ----------------------------------------------------
 //
-// Joint-controlled chimneys and flutes are a bare-rock phenomenon. On a
-// soil-mantled slope the joints are buried and the surface is regolith, so the
-// pocket term must fade out as the column's soil thickens.
+// Undercutting is a bare-rock phenomenon. On a soil-mantled slope the rock is
+// buried and the surface is regolith, so the displacement must fade out as the
+// column's soil thickens.
+//
+// THIS GATE USED TO APPLY ONLY TO THE POCKET TERM. When that term was deleted
+// (section 2) the gate could have gone with it; instead it was promoted to the
+// WHOLE displacement, and that is a deliberate widening, not salvage:
+//
+//   * it is at least as physical. The pocket's justification was "joints are
+//     buried under regolith". A differentially weathered bedding CONTACT is
+//     buried by exactly the same regolith, and a weak bed cannot weather back
+//     out of a face that has no exposed face. If anything the argument is
+//     stronger for bedding, because bedding relief is produced BY exposure.
+//   * it is free and it pays. It is already computed per column, and closing it
+//     skips the column entirely. On the 25 real diffusion tiles it takes the
+//     gated share from 11.95% of columns to 6.52% -- a 45% cut in the term's
+//     entire cost, on ground where an overhang would have been wrong anyway.
+//   * it restores a guarantee. With the band live on soil columns, the top
+//     solid voxel of an undercut nose could be a cut ACROSS the soil profile
+//     and read MAT_SUBSOIL instead of the biome material -- measured at 0.48%
+//     of columns, and a real weakening of the invariant
+//     test_amplifier.cpp's amplifier_top_voxel_is_surface_material defends.
+//     Restricted to rock columns the exception cannot arise at all, because
+//     stratigraphyAt reads MAT_ROCK straight down under a BARE_ROCK surface.
+//
+// WHAT IT ACTUALLY SELECTS, and this is worth knowing because it is sharper
+// than the ramp suggests: amplifier.cpp's soilAboveRockMm passes topsoilMm on a
+// MAT_ROCK column and topsoilMm + subsoilMm otherwise, and subsoil is
+// 2*topsoil + 500 with topsoil floored at kTopsoilMinMm = 100. So a non-rock
+// column carries AT LEAST 100 + 700 = 800 mm, which is exactly
+// kDensity3RockSoilZeroMm. The gate is therefore closed on every non-rock
+// column and open on rock cliffs (where slope retention pins topsoil at its
+// 100 mm floor). It is a continuous ramp that in practice resolves to "bare
+// rock only" -- and the static_assert in amplifier.cpp pins that coupling so it
+// cannot drift into a knife-edge silently.
 //
 // This is a COLUMN property, not a per-voxel depth ramp, and getting that
 // wrong is a trap worth recording. The obvious implementation -- "zero the
-// pocket until you are below the soil, then ramp it in" -- makes the term
+// displacement until you are below the soil, then ramp it in" -- makes the term
 // completely inert. D only changes an answer where it can flip `dz <= D`, and
 // that happens near dz = 0; a term forced to zero in a neighbourhood of dz = 0
 // carves nothing at all (at dz = -400 with D = -200, `-400 <= -200` is still
 // true, so the voxel is still solid, and nothing was removed). So the gate is
-// on the column's soil THICKNESS, evaluated once, and the pocket keeps its
-// full profile through dz = 0 where it can actually cut.
+// on the column's soil THICKNESS, evaluated once, and D keeps its full profile
+// through dz = 0 where it can actually cut.
 //
 // Continuous for the same reason the slope gate is: soil depth is a smooth
 // field, and a step in it would be a seam along a soil-depth contour.
@@ -325,11 +363,9 @@ constexpr int64_t density3BandTaperQ(int64_t zMm, int64_t surfaceMm) {
 // `col.topsoilMm + col.subsoilMm`. Passing 0 opens the gate fully. Note that
 // the slope gate has already restricted us to >=60% grades, where
 // amplifier.cpp's slope-retention factor has driven topsoil to its floor
-// (kTopsoilMinMm = 100 mm), so on real cliffs this gate is open and it is
-// doing its work at the margins -- soil-choked benches inside an otherwise
-// steep face.
-inline constexpr int64_t kDensity3RockSoilFullMm = 200; // <= this: bare rock, full pockets
-inline constexpr int64_t kDensity3RockSoilZeroMm = 800; // >= this: mantled, no pockets
+// (kTopsoilMinMm = 100 mm), so on real rock cliffs this gate is open.
+inline constexpr int64_t kDensity3RockSoilFullMm = 200; // <= this: bare rock, full displacement
+inline constexpr int64_t kDensity3RockSoilZeroMm = 800; // >= this: mantled, none at all
 inline constexpr int64_t kDensity3RockSoilWidthMm =
     kDensity3RockSoilZeroMm - kDensity3RockSoilFullMm;
 static_assert(kDensity3RockSoilWidthMm > 0, "the lithology gate needs a ramp region");
@@ -343,8 +379,64 @@ constexpr int64_t density3RockGateQ(int64_t soilDepthMm) {
 }
 
 // =============================================================================
-// 2. THE POCKET TERM -- 3D VALUE NOISE
+// 2. THE POCKET TERM -- DELETED AT kWorldGenVersion 12, AND WHY
 // =============================================================================
+//
+// The plan specifies two contributors to D: this file's 3D bedding term and "a
+// rock-gated valueNoise3 pocket term" for joint-controlled chimneys and flutes.
+// The pocket term was implemented at 200 mm of the 700 mm envelope, wired in,
+// measured, and removed. Its removal is recorded here rather than in a commit
+// message because the measurement generalises to anything else anyone is
+// tempted to add to this band.
+//
+// (1) IT PRODUCED NO OVERHANGS. NOT FEW -- NONE. An overhang exists exactly
+//     where dD/dz > 1. Over 400 columns x the whole band sampled at 1 mm, the
+//     pocket term alone reached dD/dz > 1 on 0.000% of samples, with a maximum
+//     gradient of 1 mm per mm. Its overhang rate on 20,000 columns was 0.000%.
+//     That is not a tuning failure, it is arithmetic: the z lattice is 6400 mm
+//     -- deliberately 4x the horizontal one, because joints are near-vertical
+//     and the term wants vertical flutes -- so a 200 mm amplitude gives a
+//     vertical gradient of about 0.06. It was never going to double back. The
+//     very property that made it the right SHAPE for joints made it incapable
+//     of the geometry this band exists for.
+//
+// (2) IT WAS THE DOMINANT COST. 43 ns of the 100 ns per gated voxel, and eight
+//     of the fifteen hashes -- the only hash3 in the composition. Removing it
+//     removes more per-voxel work than every other saving in this file
+//     combined, and it deletes the corner cache that existed only to make it
+//     affordable.
+//
+// (3) INSIDE A 350 mm ENVELOPE IT IS BELOW THE RESOLUTION FLOOR. A proportional
+//     share is 50-100 mm, i.e. HALF TO ONE VOXEL. Measured on what it actually
+//     changes -- voxel solidity decisions with the term on versus off:
+//
+//       amplitude   cells flipped   of which ISOLATED single voxels   longest run
+//         200 mm       3.70%                  70%                     8 voxels
+//         100 mm       2.99%                  95%                     4 voxels
+//          70 mm       1.75%                  97%                     2 voxels
+//          50 mm       1.16%                  97%                     2 voxels
+//
+//     At any allocation a 350 mm envelope could give it, 97% of what it does is
+//     flip a single isolated voxel. That is not a flute; it is per-voxel
+//     speckle, and amplifier.cpp's octave table records the same artifact
+//     twice, in-engine, as the thing that makes ground read as static rather
+//     than as terrain ("the eye takes dense uncorrelated jitter as noise").
+//     Even at the shipped 200 mm it was 70% isolated flips.
+//
+// SO THE WHOLE ENVELOPE GOES TO THE BEDDING TERM. That is not "the leftover
+// budget": handing the pocket's 200 mm to the bedding term at the 700 mm
+// envelope took the overhang rate from 2.9% to 5.7% of columns -- the same cost
+// minus eight hashes, for double the geometry.
+//
+// WHAT IS LOST is the joint-controlled surface texture on rock faces. That is a
+// real loss, and it is a TEXTURE loss, not a structure loss -- the band still
+// has the rill term and the microrelief octaves working on the same faces at
+// the same scales. If the envelope ever grows back past ~600 mm, so that a
+// pocket allocation is two or more voxels again, this is the section to reverse
+// and git history has the code.
+//
+// density3ValueNoise3Fade below is KEPT. It is a general primitive hash.h does
+// not have, it is independently tested, and it is the restoration path.
 //
 // hash.h HAS NO valueNoise3. It ships valueNoise2 and valueNoise2Fade only,
 // and hash.h is owned by another change in flight, so the 3D form is
@@ -411,132 +503,13 @@ constexpr int64_t density3ValueNoise3Fade(uint64_t seed, int64_t xMm, int64_t yM
 
 inline constexpr int64_t kDensity3NoiseAbs = 32768; // |density3ValueNoise3Fade| <= this
 
-// PROVISIONAL / UNCALIBRATED -- do not treat as final, and do not tune by eye.
-//
-// detail_bedding.h's amplitudes carry the same warning for the same reason:
-// the thing these should be set against is the fine tier's measured S2 at the
-// relevant scale, and that measurement does not exist on the client yet. What
-// IS fixed, and is not provisional, is the arithmetic: 500 mm of the 700 mm
-// envelope is already claimed by detail_bedding.h's kBedding3MaxAbsMm, so this
-// term gets what is left and not a millimetre more. If the pocket amplitude is
-// ever raised, the bedding amplitude must come down by the same amount or the
-// envelope must be renegotiated with every consumer of kDensity3MaxAbsMm --
-// the static_assert below is what forces that conversation.
-//
-// The lattice sizes are likewise a starting point: 1.6 m across and 6.4 m
-// vertically, chosen to sit at the same scale as amplifier.cpp's finest
-// microrelief octave (1600 mm lattice) so the pockets read as the same
-// material as the surrounding rock rather than as a separate effect.
-inline constexpr int64_t kDensity3PocketAmpMm = kDensity3MaxAbsMm - kBedding3MaxAbsMm; // 200
+// The pocket lattice sizes, retained next to the primitive they parameterised:
+// 1.6 m across and 6.4 m vertically, the 4:1 vertical anisotropy that made the
+// term the right shape for near-vertical joints and, as section 2 records, the
+// exact reason it could never produce an overhang. Kept so the restoration path
+// is a whole one and so the 4:1 fact stays attached to its consequence.
 inline constexpr int64_t kDensity3PocketLatXYMm = 1600;
 inline constexpr int64_t kDensity3PocketLatZMm = 6400; // 4:1 vertical -- joints are near-vertical
-
-// Amplitude + lithology gate applied to a raw noise sample. Split out from
-// density3PocketMm so the bound can be static_asserted at the extremes.
-//
-// BOUND. noise is in [-kDensity3NoiseAbs, kDensity3NoiseAbs - 1] and gateQ in
-// [0, kDensity3GateQ], so the exact rational is in [-amp, amp) and floorDiv
-// (toward -inf) lands in [-amp, amp - 1] -- hence |result| <= amp, attained
-// exactly at the negative extreme and never exceeded at the positive one.
-constexpr int64_t density3PocketScaleMm(int64_t noise, int64_t rockGateQ) {
-    return floorDiv(noise * kDensity3PocketAmpMm * rockGateQ,
-                    kDensity3NoiseAbs * kDensity3GateQ);
-}
-
-static_assert(density3PocketScaleMm(-kDensity3NoiseAbs, kDensity3GateQ) ==
-                  -kDensity3PocketAmpMm,
-              "the negative extreme must reach exactly -amp");
-static_assert(density3PocketScaleMm(kDensity3NoiseAbs - 1, kDensity3GateQ) <
-                  kDensity3PocketAmpMm,
-              "the positive extreme must stay strictly inside +amp");
-static_assert(density3PocketScaleMm(-kDensity3NoiseAbs, 0) == 0 &&
-                  density3PocketScaleMm(kDensity3NoiseAbs - 1, 0) == 0,
-              "a closed lithology gate must give exactly zero, not a rounding residue");
-
-// Signed pocket displacement, mm. |result| <= kDensity3PocketAmpMm.
-constexpr int64_t density3PocketMm(uint64_t seed, int64_t xMm, int64_t yMm, int64_t zMm,
-                                   int64_t rockGateQ) {
-    if (rockGateQ == 0) return 0; // exact early out, not an approximation
-    const int64_t n = density3ValueNoise3Fade(seed, xMm, yMm, zMm, kDensity3PocketLatXYMm,
-                                              kDensity3PocketLatZMm, CH_POCKET);
-    return density3PocketScaleMm(n, rockGateQ);
-}
-
-// --- HOIST 1: the eight corners, cached per column ---------------------------
-//
-// The pocket's z lattice is 6400 mm and the band is 1400 mm, so
-// floorDiv(z, 6400) is the SAME index for every voxel of the band on
-// 1 - 1400/6400 = 78.1% of columns. On those columns all eight hash3 corners
-// are the same eight for the whole column, and eight hashes is nearly the whole
-// cost of the pocket term.
-//
-// Cached as the eight hashToSigned16 VALUES, not as the hashes: they are in
-// [-32768, 32767] so int32_t holds them exactly, and 8 x 4 bytes is what this
-// costs a ColumnSample. The cache carries its own z0 so the 21.9% of columns
-// whose band straddles a lattice plane are detected rather than mis-served --
-// density3PocketCachedMm falls back to a fresh evaluation there, so the answer
-// is the SAME integer either way and the cache is an optimisation with no
-// correctness surface at all. That is the property worldgen.ush's mirror leans
-// on: it does not cache, and it is still bit-exact.
-struct Density3PocketCorners {
-    int64_t z0 = 0;    // the z lattice index these eight corners belong to
-    int32_t v[8] = {}; // (x0,y0,z0) (x0+1,..) (..y0+1..) ... in the order below
-};
-
-constexpr Density3PocketCorners density3PocketCornersAt(uint64_t seed, int64_t xMm, int64_t yMm,
-                                                        int64_t zMm) {
-    const int64_t x0 = floorDiv(xMm, kDensity3PocketLatXYMm);
-    const int64_t y0 = floorDiv(yMm, kDensity3PocketLatXYMm);
-    const int64_t z0 = floorDiv(zMm, kDensity3PocketLatZMm);
-    Density3PocketCorners c;
-    c.z0 = z0;
-    c.v[0] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0, y0, z0, CH_POCKET)));
-    c.v[1] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0 + 1, y0, z0, CH_POCKET)));
-    c.v[2] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0, y0 + 1, z0, CH_POCKET)));
-    c.v[3] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0 + 1, y0 + 1, z0, CH_POCKET)));
-    c.v[4] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0, y0, z0 + 1, CH_POCKET)));
-    c.v[5] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0 + 1, y0, z0 + 1, CH_POCKET)));
-    c.v[6] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0, y0 + 1, z0 + 1, CH_POCKET)));
-    c.v[7] = static_cast<int32_t>(hashToSigned16(hash3(seed, x0 + 1, y0 + 1, z0 + 1, CH_POCKET)));
-    return c;
-}
-
-// density3ValueNoise3Fade's interpolation with the eight corner hashes already
-// in hand. Character-for-character the same arithmetic in the same order --
-// only the eight `hashToSigned16(hash3(...))` calls are replaced by the cached
-// values they would have produced.
-constexpr int64_t density3PocketNoiseFrom(const Density3PocketCorners& c, int64_t xMm,
-                                          int64_t yMm, int64_t zMm) {
-    const int64_t latXYMm = kDensity3PocketLatXYMm;
-    const int64_t latZMm = kDensity3PocketLatZMm;
-    const int64_t x0 = floorDiv(xMm, latXYMm);
-    const int64_t y0 = floorDiv(yMm, latXYMm);
-    const int64_t z0 = floorDiv(zMm, latZMm);
-    const int64_t fx = fadeFractionMm(xMm - x0 * latXYMm, latXYMm);
-    const int64_t fy = fadeFractionMm(yMm - y0 * latXYMm, latXYMm);
-    const int64_t fz = fadeFractionMm(zMm - z0 * latZMm, latZMm);
-    const int64_t gx = latXYMm - fx, gy = latXYMm - fy, gz = latZMm - fz;
-
-    const int64_t lo = (int64_t{c.v[0]} * gx + int64_t{c.v[1]} * fx) * gy +
-                       (int64_t{c.v[2]} * gx + int64_t{c.v[3]} * fx) * fy;
-    const int64_t hi = (int64_t{c.v[4]} * gx + int64_t{c.v[5]} * fx) * gy +
-                       (int64_t{c.v[6]} * gx + int64_t{c.v[7]} * fx) * fy;
-    return floorDiv(lo * gz + hi * fz, latXYMm * latXYMm * latZMm);
-}
-
-// density3PocketMm with the corner cache consulted. EXACTLY equal to
-// density3PocketMm for every input, whether the cache hits or misses; pinned by
-// test_density3.cpp's `pocket_cache_is_value_identical`.
-constexpr int64_t density3PocketCachedMm(const Density3PocketCorners& c, uint64_t seed,
-                                         int64_t xMm, int64_t yMm, int64_t zMm,
-                                         int64_t rockGateQ) {
-    if (rockGateQ == 0) return 0;
-    const int64_t n = (floorDiv(zMm, kDensity3PocketLatZMm) == c.z0)
-                          ? density3PocketNoiseFrom(c, xMm, yMm, zMm)
-                          : density3ValueNoise3Fade(seed, xMm, yMm, zMm, kDensity3PocketLatXYMm,
-                                                    kDensity3PocketLatZMm, CH_POCKET);
-    return density3PocketScaleMm(n, rockGateQ);
-}
 
 // =============================================================================
 // 3. THE BEDDING TERM -- THE SAME STRUCTURE, SEEN VOLUMETRICALLY
@@ -627,33 +600,41 @@ constexpr int64_t density3PocketCachedMm(const Density3PocketCorners& c, uint64_
 // two are perpendicular.
 //
 // HOW MANY PASSES -- MEASURED, AND THE TRADE IS REAL. Each pass multiplies the
-// contact slope by the quintic's own 1.875. Overhang incidence on 40,000
-// idealised columns with both gates fully open:
+// contact slope by the quintic's own 1.875 and costs about 2.6 ns.
 //
-//   passes  contact gain  overhang columns  hardness range retained
-//     0        1.00           0.098%              11 : 1
-//     1        1.88           0.973%               6 : 1
-//     2        3.52           3.737%             3.3 : 1     <-- chosen
-//     3        6.59           8.420%             1.9 : 1
-//     4       12.36          13.113%             ~1 : 1
+// THE ENVELOPE FORCED THIS FROM TWO TO THREE, and the reason is the whole
+// argument for why an overhang term does not scale gently. dD/dz > 1 is a
+// THRESHOLD, not a magnitude: halving the amplitude does not halve the overhang
+// rate, it moves a whole population of contacts from just above the threshold to
+// just below it. Measured on 20,000 columns with both gates open, the
+// bedding-only composition at the amplitude each envelope allows:
 //
-// The right-hand column is the cost, and it is why this stops at two. The
-// curve saturates large values toward the ends, and a bed's peak displacement
-// is exactly what carries its hashed hardness -- so sharpening the contact
-// also COMPRESSES the difference between a weak bed and a strong one. At three
-// passes a bed with a tenth the hardness of another still protrudes more than
-// half as far, and the face becomes a uniform square-wave corrugation in which
-// every bed is equally resistant. That throws away the differential weathering
-// this term exists to express, in exchange for overhangs. Two passes is the
-// point where the overhang rate is up 38x and a 3.3:1 spread in bed relief
-// survives.
+//   passes   contrast retained   overhangs @700mm   overhangs @350mm
+//     2          2.9 : 1              5.71%              0.54%
+//     3          1.7 : 1                 --              1.97%   <-- chosen
+//     4          1.1 : 1                 --              3.57%
+//     5          1.0 : 1                 --              4.82%
 //
-// PROVISIONAL, like every other shape parameter here. If a later measurement
-// wants more overhangs, three passes is the lever and the flattening above is
-// the price to argue about. This arguably belongs in detail_bedding.h next to
-// the tent it corrects; it is here because that file is owned by another
-// change in flight. Flagged for reconciliation at integration.
-inline constexpr int64_t kDensity3SharpenPasses = 2;
+// Halving the envelope at two passes cost 91% of the overhang rate. Three passes
+// buys 3.6x of it back for 2.6 ns and takes the retained bed contrast from
+// 2.9 : 1 to 1.7 : 1 -- i.e. a bed with a TENTH of another's hardness still
+// stands 59% as proud, where at two passes it stood 34% as proud.
+//
+// WHY IT STOPS AT THREE AND NOT FOUR, which would have restored the rate
+// outright. The curve saturates large values, and a bed's peak displacement is
+// exactly what carries its hashed hardness, so sharpening the contact
+// COMPRESSES the difference between a weak bed and a strong one. At four passes
+// the contrast is 1.1 : 1: a tenth-hardness bed stands 88% as proud as a full
+// one, and the face becomes a uniform square-wave corrugation in which every bed
+// is equally resistant. That is not a cheaper version of this term, it is a
+// different and worse one -- it throws away the differential weathering the term
+// exists to express in exchange for the overhangs the term exists to produce.
+// Three is where both survive.
+//
+// PROVISIONAL, like every other shape parameter here. This arguably belongs in
+// detail_bedding.h next to the tent it corrects; it is here because that file
+// was owned by another change in flight. Flagged for reconciliation.
+inline constexpr int64_t kDensity3SharpenPasses = 3;
 
 // Perlin's quintic 6t^5 - 15t^4 + 10t^3 on [0, T] -> [0, T], for an arbitrary
 // domain T. This is detail_rill.h's rillQuinticQ generalised off its hardwired
@@ -662,7 +643,8 @@ inline constexpr int64_t kDensity3SharpenPasses = 2;
 //
 // Same factoring as rillQuinticQ, for the same overflow reason: t^3 * inner is
 // the quintic itself times T^5 and so never exceeds T^5. That caps T at about
-// 6100 for int64; the only caller uses T = 1000.
+// 6100 for int64; the callers use T = 2 * kBedding3MaxAbsMm (700) and
+// T = kDensity3GateQ (4096), both comfortably inside it.
 constexpr int64_t density3QuinticOn(int64_t t, int64_t T) {
     const int64_t inner = 6 * t * t - 15 * t * T + 10 * T * T;
     return floorDiv(t * t * t * inner, T * T * T * T);
@@ -681,9 +663,10 @@ constexpr int64_t density3SharpenMm(int64_t rMm, int64_t ampMm) {
     int64_t t = rMm + ampMm; // [0, T]
     t = density3QuinticOn(t, T);
     t = density3QuinticOn(t, T);
+    t = density3QuinticOn(t, T);
     return t - ampMm;
 }
-static_assert(kDensity3SharpenPasses == 2,
+static_assert(kDensity3SharpenPasses == 3,
               "density3SharpenMm unrolls its passes explicitly for the HLSL mirror; if the "
               "pass count changes, change the body too");
 static_assert(density3SharpenMm(0, kBedding3MaxAbsMm) == 0,
@@ -713,38 +696,55 @@ constexpr int64_t density3BeddingFromDomainMm(uint64_t seed, uint64_t domainHash
 // 4. COMPOSITION AND THE BOUND
 // =============================================================================
 //
-// HOW 700 SPLITS.
+// HOW 350 SPLITS. It does not: there is one term.
 //
-//     bedding   |.| <= kBedding3MaxAbsMm      = 500   (detail_bedding.h's own)
-//     pocket    |.| <= kDensity3PocketAmpMm   = 200   (this file, = 700 - 500)
-//     sum       |.| <=                          700
-//     x slope gate (<= 1) x band taper (<= 1)
-//     D         |.| <= kDensity3MaxAbsMm      = 700
+//     bedding   |.| <= kBedding3MaxAbsMm      = 350   (detail_bedding.h's own)
+//     x column gate (<= 1) x band taper (<= 1)
+//     D         |.| <= kDensity3MaxAbsMm      = 350
 //
-// The two terms are independently bounded and then SUMMED, so checking each
-// against 700 separately would be wrong; the assert below checks the sum,
-// which is the only check that means anything. It is written as `==` rather
-// than `<=` deliberately: an inequality would let a future edit quietly leave
-// budget on the floor, and the point of a fixed envelope is that it is fully
-// allocated and every change is a redistribution.
-static_assert(kBedding3MaxAbsMm + kDensity3PocketAmpMm == kDensity3MaxAbsMm,
-              "the 3D displacement budget must be exactly allocated: bedding + pocket == 700 mm. "
-              "Raising one term means lowering the other, or renegotiating "
-              "kDensity3MaxAbsMm with every consumer of the widened bounds.");
-static_assert(kDensity3PocketAmpMm > 0,
-              "detail_bedding.h has consumed the entire envelope; there is no room for the "
-              "pocket term and the 700 mm figure needs revisiting, not silently exceeding");
+// Written as `==` rather than `<=` deliberately: an inequality would let a
+// future edit quietly leave budget on the floor, and the point of a fixed
+// envelope is that it is fully allocated. If a second contributor is ever added
+// back, this assert is what forces its allocation to come OUT of the bedding
+// term rather than on top of it -- which is the conversation section 2 says to
+// have before adding anything to this band.
+static_assert(kBedding3MaxAbsMm == kDensity3MaxAbsMm,
+              "the 3D displacement budget must be exactly allocated. The pocket term was "
+              "removed at kWorldGenVersion 12 (see section 2) and the bedding term inherited "
+              "its share; adding any second contributor means taking amplitude off the "
+              "bedding term or renegotiating kDensity3MaxAbsMm with every consumer of the "
+              "widened bounds.");
 
-// Applies the two multiplicative gates to the summed displacement.
+// Applies the two multiplicative gates to the displacement.
 //
-// BOUND. sum is in [-700, 700], each gate in [0, kDensity3GateQ]. The exact
-// rational is in [-700, 700] and floorDiv lands in [-700, 700] -- attained
+// BOUND. sum is in [-350, 350], each gate in [0, kDensity3GateQ]. The exact
+// rational is in [-350, 350] and floorDiv lands in [-350, 350] -- attained
 // exactly at both extremes when both gates are fully open, which is what the
-// static_asserts below pin. Widest intermediate is 700 * 4096 * 4096 = 1.17e10,
+// static_asserts below pin. Widest intermediate is 350 * 4096 * 4096 = 5.9e9,
 // nine orders inside int64.
-constexpr int64_t density3ScaleMm(int64_t sumMm, int64_t slopeGateQ, int64_t bandTaperQ) {
-    return floorDiv(sumMm * slopeGateQ * bandTaperQ, kDensity3GateQ * kDensity3GateQ);
+//
+// `columnGateQ` is the slope and lithology gates already multiplied together --
+// see density3ColumnGateQ. They were two arguments when the lithology gate
+// applied only to the pocket term; now that both gate the whole displacement,
+// combining them per column is one multiply saved per voxel and one fewer q12
+// truncation to keep in step across the HLSL mirror.
+constexpr int64_t density3ScaleMm(int64_t sumMm, int64_t columnGateQ, int64_t bandTaperQ) {
+    return floorDiv(sumMm * columnGateQ * bandTaperQ, kDensity3GateQ * kDensity3GateQ);
 }
+
+// The two column gates, combined once per column. Exactly zero iff either is
+// zero, and exactly kDensity3GateQ iff both are fully open -- both pinned
+// below, because the exact-skip argument rests on the first and the "a fully
+// open gate passes the maximum through exactly" bound rests on the second.
+constexpr int64_t density3ColumnGateQ(int64_t slopeGateQ, int64_t rockGateQ) {
+    return floorDiv(slopeGateQ * rockGateQ, kDensity3GateQ);
+}
+static_assert(density3ColumnGateQ(kDensity3GateQ, kDensity3GateQ) == kDensity3GateQ,
+              "two fully open gates must combine to a fully open gate");
+static_assert(density3ColumnGateQ(0, kDensity3GateQ) == 0 &&
+                  density3ColumnGateQ(kDensity3GateQ, 0) == 0,
+              "either gate closed must close the combined gate EXACTLY -- the exact-skip "
+              "argument and the whole cost model rest on this being 0 and not 1");
 
 static_assert(density3ScaleMm(kDensity3MaxAbsMm, kDensity3GateQ, kDensity3GateQ) ==
                   kDensity3MaxAbsMm,
@@ -792,14 +792,11 @@ static_assert(density3RockGateQ(kDensity3RockSoilFullMm) == kDensity3GateQ &&
 // tile, chunk or dispatch computed it. That is the property the whole streamed
 // world rests on and it is tested directly.
 constexpr int64_t density3DisplacementGatedMm(uint64_t seed, int64_t xMm, int64_t yMm, int64_t zMm,
-                                              int64_t surfaceMm, int64_t slopeGateQ,
-                                              int64_t rockGateQ) {
-    if (slopeGateQ == 0) return 0;
+                                              int64_t surfaceMm, int64_t columnGateQ) {
+    if (columnGateQ == 0) return 0;
     const int64_t taperQ = density3BandTaperQ(zMm, surfaceMm);
     if (taperQ == 0) return 0; // outside the band: exactly zero, see section 0
-    const int64_t sumMm = density3BeddingMm(seed, xMm, yMm, zMm) +
-                          density3PocketMm(seed, xMm, yMm, zMm, rockGateQ);
-    return density3ScaleMm(sumMm, slopeGateQ, taperQ);
+    return density3ScaleMm(density3BeddingMm(seed, xMm, yMm, zMm), columnGateQ, taperQ);
 }
 
 // Reference form: computes the column gates itself. Correct but not for the
@@ -813,9 +810,10 @@ constexpr int64_t density3DisplacementGatedMm(uint64_t seed, int64_t xMm, int64_
 constexpr int64_t density3DisplacementMm(uint64_t seed, int64_t xMm, int64_t yMm, int64_t zMm,
                                          int64_t surfaceMm, int64_t gradXMmPerM,
                                          int64_t gradYMmPerM, int64_t soilDepthMm) {
-    return density3DisplacementGatedMm(seed, xMm, yMm, zMm, surfaceMm,
-                                       density3SlopeGateQ(gradXMmPerM, gradYMmPerM),
-                                       density3RockGateQ(soilDepthMm));
+    return density3DisplacementGatedMm(
+        seed, xMm, yMm, zMm, surfaceMm,
+        density3ColumnGateQ(density3SlopeGateQ(gradXMmPerM, gradYMmPerM),
+                            density3RockGateQ(soilDepthMm)));
 }
 
 // The displaced solidity test itself, provided so callers cannot get the
@@ -838,52 +836,52 @@ constexpr bool density3IsSolid(int64_t zMm, int64_t surfaceMm, int64_t displacem
 // the sample. Widening the signature instead would be an API break across four
 // consumers, one of them out of this repository.
 //
-// EVERY FIELD IS BEHIND THE SLOPE GATE. On a column that fails it, this struct
-// is left zeroed and NOT ONE hash is computed -- not the domain hash, not the
-// eight corners. That is the whole cost argument: ~93% of columns pay two
-// compares and a divide (density3SlopeGateQFromMag) and nothing else, and the
-// skip is exact because slopeGateQ == 0 forces D == 0 identically.
+// EVERY FIELD IS BEHIND THE COLUMN GATE. On a column that fails it, this struct
+// is left zeroed and NOT ONE hash is computed. That is the whole cost argument:
+// the columns that fail pay two compares and two divides
+// (density3SlopeGateQFromMag, density3RockGateQ) and nothing else, and the skip
+// is exact because gateQ == 0 forces D == 0 identically. On the 25 real
+// diffusion tiles that is 93.5% of columns.
 struct Density3Column {
     uint64_t seed = 0;       // needed by the warp/hardness hashes, which are per-BED
-    uint64_t domainHash = 0; // beddingDomainHash(seed, xMm, yMm)   -- hoist 2
-    Density3PocketCorners pocket{};                        //       -- hoist 1
+    uint64_t domainHash = 0; // beddingDomainHash(seed, xMm, yMm)   -- the one hoist left
     int64_t xMm = 0, yMm = 0;
-    int32_t slopeGateQ = 0; // 0 == this column can never displace; see above
-    int32_t rockGateQ = 0;
+    int32_t gateQ = 0; // slope x lithology, q12. 0 == this column can never displace
 };
 
 // Reduce a column. `slopeMmPerM` is the carrier's analytic gradient MAGNITUDE
 // (Amplifier::SurfaceEval::slopeMmPerM); `soilDepthMm` is the depth of soil
 // above rock -- see density3RockGateQ's comment for which of topsoil /
-// topsoil+subsoil that is. `surfaceMm` picks the z lattice cell the corner
-// cache is built for, and is the band's own centre.
+// topsoil+subsoil that is.
+//
+// The gates are evaluated CHEAPEST FIRST and short-circuit: the slope gate is
+// two compares on a value the caller already has, and it rejects most ground
+// before the lithology gate is looked at, which rejects most of the rest before
+// the single hash is computed.
 constexpr Density3Column density3ColumnFor(uint64_t seed, int64_t xMm, int64_t yMm,
-                                           int64_t surfaceMm, int64_t slopeMmPerM,
-                                           int64_t soilDepthMm) {
+                                           int64_t slopeMmPerM, int64_t soilDepthMm) {
     Density3Column c;
     c.seed = seed;
     c.xMm = xMm;
     c.yMm = yMm;
     const int64_t slopeQ = density3SlopeGateQFromMag(slopeMmPerM);
     if (slopeQ == 0) return c; // exact skip -- no hash is computed on this column
-    c.slopeGateQ = static_cast<int32_t>(slopeQ);
-    c.rockGateQ = static_cast<int32_t>(density3RockGateQ(soilDepthMm));
+    const int64_t gateQ = density3ColumnGateQ(slopeQ, density3RockGateQ(soilDepthMm));
+    if (gateQ == 0) return c; // soil-mantled: same exact skip
+    c.gateQ = static_cast<int32_t>(gateQ);
     c.domainHash = beddingDomainHash(seed, xMm, yMm);
-    // The pocket's eight corners are only worth caching if the pocket can be
-    // non-zero at all; a closed lithology gate zeroes it exactly.
-    if (c.rockGateQ != 0) c.pocket = density3PocketCornersAt(seed, xMm, yMm, surfaceMm);
     return c;
 }
 
 // The per-voxel query. `zMm` is the VOXEL CENTRE in world millimetres and
 // `surfaceMm` the column's undisplaced surface. Equal, for every input, to
-// density3DisplacementGatedMm(c.seed, c.xMm, c.yMm, zMm, surfaceMm,
-// c.slopeGateQ, c.rockGateQ) -- pinned by test_density3.cpp.
+// density3DisplacementGatedMm(c.seed, c.xMm, c.yMm, zMm, surfaceMm, c.gateQ) --
+// pinned by test_density3.cpp.
 constexpr int64_t density3ColumnDisplacementMm(const Density3Column& c, int64_t zMm,
                                                int64_t surfaceMm) {
 #ifdef VXC_DENSITY3_NO_HOIST
-    // MEASUREMENT BUILD ONLY, and safe to have: this is the same answer with
-    // both hoists switched off, so what the hoists are worth can be measured on
+    // MEASUREMENT BUILD ONLY, and safe to have: this is the same answer with the
+    // domain hoist switched off, so what the hoist is worth can be measured on
     // one machine and one compiler instead of argued from a cost model. It is
     // also EXACTLY what worldgen.ush computes, which makes it a second, cruder
     // check on the mirror -- vxc_bench --digest must be identical between a
@@ -894,30 +892,42 @@ constexpr int64_t density3ColumnDisplacementMm(const Density3Column& c, int64_t 
     // the TERM off would produce v11 geometry under a v12 version stamp, which
     // is a desync waiting for someone to leave a flag set; this one cannot
     // change an output at all.
-    return density3DisplacementGatedMm(c.seed, c.xMm, c.yMm, zMm, surfaceMm, c.slopeGateQ,
-                                       c.rockGateQ);
+    return density3DisplacementGatedMm(c.seed, c.xMm, c.yMm, zMm, surfaceMm, c.gateQ);
 #else
-    if (c.slopeGateQ == 0) return 0;
+    if (c.gateQ == 0) return 0;
     const int64_t taperQ = density3BandTaperQ(zMm, surfaceMm);
     if (taperQ == 0) return 0; // outside the band: exactly zero, see section 0
-    const int64_t sumMm =
-        density3BeddingFromDomainMm(c.seed, c.domainHash, c.xMm, c.yMm, zMm) +
-        density3PocketCachedMm(c.pocket, c.seed, c.xMm, c.yMm, zMm, c.rockGateQ);
-    return density3ScaleMm(sumMm, c.slopeGateQ, taperQ);
+    return density3ScaleMm(density3BeddingFromDomainMm(c.seed, c.domainHash, c.xMm, c.yMm, zMm),
+                           c.gateQ, taperQ);
 #endif
 }
 
 // How far, in VOXELS, this column's top solid voxel can move, and equivalently
 // how far below its nominal top the bricks can stop being homogeneous. Zero on a
-// column whose slope gate is shut, which is the point: a brick-range widening
+// column whose column gate is shut, which is the point: a brick-range widening
 // applied unconditionally is sound but is paid by flat ground that can never use
 // it. Callers: GeneratedWorld::surfaceBrickRange and its coarse sibling, and the
 // gpu_harness mirror of the same rule.
+//
+// ROUNDED UP, AND THE ENVELOPE IS DELIBERATELY NOT A WHOLE VOXEL. At 700 mm this
+// was an exact 7 and the division was written as one; at 350 mm it is 3.5, and
+// the honest answer is 4 rather than a rounder envelope chosen to make the
+// arithmetic tidy. The reason is phase: a voxel centre sits at vz*100 + 50, so
+// whether a 350 mm displacement moves the top voxel by three indices or by four
+// depends on where the surface falls between two centres. Three would be right
+// most of the time and wrong some of the time, and "wrong some of the time"
+// here means a brick that is not homogeneous being treated as if it were --
+// i.e. an overhang's underside never meshed, or worse, a chunk skipped at
+// admission. Rounding up costs one brick's worth of z range on gated columns
+// only.
 constexpr int64_t density3BandVoxels(const Density3Column& c) {
-    static_assert(kDensity3MaxAbsMm % kVoxelSizeMm == 0,
-                  "the envelope must be a whole number of voxels, or every consumer of this "
-                  "needs a rounding argument it does not currently have");
-    return c.slopeGateQ == 0 ? 0 : kDensity3MaxAbsMm / kVoxelSizeMm;
+    // ceil, on operands that are provably positive; written out rather than via
+    // a helper because core.h's ceilDivPos is private to amplifier.cpp.
+    constexpr int64_t kVox = (kDensity3MaxAbsMm + kVoxelSizeMm - 1) / kVoxelSizeMm;
+    static_assert(kVox * kVoxelSizeMm >= kDensity3MaxAbsMm,
+                  "the band must round UP in voxels, or a displaced top voxel can fall outside "
+                  "the brick range that was supposed to contain it");
+    return c.gateQ == 0 ? 0 : kVox;
 }
 
 // The cheap per-voxel predicate a caller should apply BEFORE
@@ -926,7 +936,7 @@ constexpr int64_t density3BandVoxels(const Density3Column& c) {
 // most of them.
 constexpr bool density3ColumnCanDisplace(const Density3Column& c, int64_t zMm,
                                          int64_t surfaceMm) {
-    return c.slopeGateQ != 0 && density3BandGateOpen(zMm, surfaceMm);
+    return c.gateQ != 0 && density3BandGateOpen(zMm, surfaceMm);
 }
 
 } // namespace vxc

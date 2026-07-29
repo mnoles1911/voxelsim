@@ -47,10 +47,10 @@ constexpr int64_t kQ = kDensity3GateQ;
 // octagonal norm is exact and the test's slope is unambiguous.
 constexpr int64_t kSteepMmPerM = 1200;
 
-// Both gates fully open, for the tests that are about the displacement itself
-// rather than about the gates.
+// The column gate fully open, for the tests that are about the displacement
+// itself rather than about the gates.
 int64_t openD(int64_t xMm, int64_t yMm, int64_t zMm, int64_t surfaceMm) {
-    return density3DisplacementGatedMm(kSeed, xMm, yMm, zMm, surfaceMm, kQ, kQ);
+    return density3DisplacementGatedMm(kSeed, xMm, yMm, zMm, surfaceMm, kQ);
 }
 
 // The bedding half of the composed displacement, ungated, as the header
@@ -158,8 +158,9 @@ VXC_TEST(hoisted_gate_path_matches_the_reference_path) {
         const int64_t gx = rng.nextSigned(2000), gy = rng.nextSigned(2000);
         const int64_t soil = rng.next() % 2000;
         CHECK_EQ(density3DisplacementMm(kSeed, x, y, z, s, gx, gy, soil),
-                 density3DisplacementGatedMm(kSeed, x, y, z, s, density3SlopeGateQ(gx, gy),
-                                             density3RockGateQ(soil)));
+                 density3DisplacementGatedMm(
+                     kSeed, x, y, z, s,
+                     density3ColumnGateQ(density3SlopeGateQ(gx, gy), density3RockGateQ(soil))));
     }
 }
 
@@ -173,7 +174,7 @@ VXC_TEST(combined_envelope_holds_over_wide_coordinates) {
     // out because they are where a bare `/` diverges from floorDiv, which is
     // the failure this codebase has actually shipped once (docs/determinism.md).
     SplitMixRng rng(6);
-    int64_t worst = 0, worstBed = 0, worstPocket = 0;
+    int64_t worst = 0, worstBed = 0;
     int64_t negCoords = 0, n = 0;
     for (int i = 0; i < 400000; ++i) {
         const int64_t x = rng.nextSigned(2'000'000'000);
@@ -189,23 +190,19 @@ VXC_TEST(combined_envelope_holds_over_wide_coordinates) {
         CHECK(iabs(d) <= kDensity3MaxAbsMm);
         if (iabs(d) > worst) worst = iabs(d);
 
-        // The two contributors, checked against their own allocations too --
-        // so a failure says WHICH term overspent, not just that the sum did.
+        // The single contributor, checked against its own allocation too, so a
+        // failure says whether the TERM overspent or the gating did.
         const int64_t b = beddingComponent(x, y, z);
         CHECK(iabs(b) <= kBedding3MaxAbsMm);
         if (iabs(b) > worstBed) worstBed = iabs(b);
-        const int64_t p = density3PocketMm(kSeed, x, y, z, kQ);
-        CHECK(iabs(p) <= kDensity3PocketAmpMm);
-        if (iabs(p) > worstPocket) worstPocket = iabs(p);
     }
     // A fuzz that never reached a large negative coordinate would be silently
     // testing nothing about the thing it was written for.
     CHECK(negCoords > n / 8);
     std::printf("    [density3] fuzz n=%lld  max|D|=%lld/%lld  max|bed|=%lld/%lld  "
-                "max|pocket|=%lld/%lld  (x<0,y<0 on %lld)\n",
+                "(x<0,y<0 on %lld)\n",
                 (long long)n, (long long)worst, (long long)kDensity3MaxAbsMm, (long long)worstBed,
-                (long long)kBedding3MaxAbsMm, (long long)worstPocket,
-                (long long)kDensity3PocketAmpMm, (long long)negCoords);
+                (long long)kBedding3MaxAbsMm, (long long)negCoords);
     // Not vacuous: the fuzz must actually approach the envelope, or a term
     // that returned 0 everywhere would "pass".
     CHECK(worst > kDensity3MaxAbsMm / 2);
@@ -214,8 +211,13 @@ VXC_TEST(combined_envelope_holds_over_wide_coordinates) {
 VXC_TEST(budget_is_exactly_allocated) {
     // The static_assert in the header proves this at compile time; restated
     // here so the arithmetic is visible in the test log too.
-    CHECK_EQ(kBedding3MaxAbsMm + kDensity3PocketAmpMm, kDensity3MaxAbsMm);
-    CHECK_EQ(kDensity3PocketAmpMm, 200);
+    //
+    // kWorldGenVersion 12 halved the envelope and deleted the pocket term, so
+    // the whole 350 mm is the bedding term's. The pocket produced zero
+    // overhangs at any amplitude and, inside this envelope, could only ever
+    // have flipped isolated single voxels -- see density3.h section 2.
+    CHECK_EQ(kBedding3MaxAbsMm, kDensity3MaxAbsMm);
+    CHECK_EQ(kDensity3MaxAbsMm, 350);
     CHECK_EQ(kDensity3BandHalfMm, kDensity3MaxAbsMm);
 }
 
@@ -289,23 +291,20 @@ VXC_TEST(bedding_component_is_in_phase_with_2d_banding) {
                 (long long)sign2Changes, (long long)sign3Changes, (long long)opposed,
                 (long long)samples);
 
-    // (d) THE COMPOSED, GATED D AT THE SURFACE still follows the 2D banding
-    // wherever bedding dominates the pocket term. The threshold is DERIVED, not
-    // written down: b3 is b2 rescaled from kBeddingAmpMm to kBedding3AmpMm, so
-    // |b2| > kDensity3PocketAmpMm * kBeddingAmpMm / kBedding3AmpMm implies
-    // |b3| > the pocket's entire allocation, and the sum's sign is the bedding's
-    // sign. That makes this an exact claim rather than a statistical one.
+    // (d) THE COMPOSED, GATED D AT THE SURFACE still follows the 2D banding.
     //
-    // It was a literal 140, chosen when kBeddingAmpMm was 320. Re-calibrating
-    // that constant to 120 made the threshold unreachable and the subset empty --
-    // caught only by the `dominant > 1000` guard below, which is precisely what
-    // that guard is for. Deriving it means the next amplitude change cannot
-    // silently hollow the test out.
-    constexpr int64_t kDominanceThresholdMm =
-        kDensity3PocketAmpMm * kBeddingAmpMm / kBedding3AmpMm + 1;
-    static_assert(kDominanceThresholdMm < kBeddingAmpMm,
-                  "the dominance threshold must be reachable by the 2D term, or the "
-                  "subset is empty and the test proves nothing");
+    // This used to need a DOMINANCE threshold -- the 3D displacement was a sum
+    // of the bedding term and a pocket term hashed off an unrelated field, so
+    // the sign only had to follow the banding where the bedding half was large
+    // enough to outvote the pocket's whole allocation. With the pocket term
+    // removed at kWorldGenVersion 12 the sum has one contributor and the claim
+    // is unconditional: D is a monotone odd remap of a scaling of the SAME
+    // beddingRawAt the 2D term uses, so its sign is the 2D term's sign at every
+    // point where either is non-zero, with no threshold and no subset.
+    //
+    // Kept as a sign test rather than deleted as trivially true, because
+    // "trivially true given the composition" is exactly the property that would
+    // break silently if someone added a second contributor back.
     SplitMixRng rng2(8);
     int64_t dominant = 0, agree = 0;
     for (int i = 0; i < 200000; ++i) {
@@ -313,7 +312,7 @@ VXC_TEST(bedding_component_is_in_phase_with_2d_banding) {
         const int64_t y = rng2.nextSigned(2'000'000'000);
         const int64_t s = rng2.nextSigned(1'000'000);
         const int64_t b2 = beddingMm(kSeed, x, y, s);
-        if (iabs(b2) < kDominanceThresholdMm) continue;
+        if (b2 == 0) continue;
         ++dominant;
         const int64_t d = openD(x, y, s, s); // at the surface, both gates open
         if ((b2 > 0 && d > 0) || (b2 < 0 && d < 0)) ++agree;
@@ -456,7 +455,7 @@ VXC_TEST(pure_function_of_world_mm_and_seed) {
         const int64_t x = rng.nextSigned(1'000'000);
         const int64_t y = rng.nextSigned(1'000'000);
         if (openD(x, y, 0, 0) !=
-            density3DisplacementGatedMm(kSeed + 1, x, y, 0, 0, kQ, kQ))
+            density3DisplacementGatedMm(kSeed + 1, x, y, 0, 0, kQ))
             ++differs;
     }
     CHECK(differs > 4000);
@@ -469,19 +468,30 @@ VXC_TEST(constexpr_evaluation_matches_runtime) {
     // floorDiv discipline exists to prevent -- and a constant-folded
     // disagreement would be invisible to every other test here.
     constexpr int64_t a = density3DisplacementGatedMm(kSeed, -1'234'567'890, 987'654'321, -455,
-                                                      0, kQ, kQ);
+                                                      0, kQ);
     constexpr int64_t b = density3DisplacementGatedMm(kSeed, 555'444'333, -222'111'000, 301,
-                                                      0, kQ, kQ);
-    constexpr int64_t c = density3PocketMm(kSeed, -9'876'543, -8'765'432, -7'654, kQ);
+                                                      0, kQ);
+    constexpr int64_t c =
+        density3BeddingMm(kSeed, -9'876'543, -8'765'432, -7'654);
     volatile int64_t vx1 = -1'234'567'890, vy1 = 987'654'321, vz1 = -455;
     volatile int64_t vx2 = 555'444'333, vy2 = -222'111'000, vz2 = 301;
     volatile int64_t vx3 = -9'876'543, vy3 = -8'765'432, vz3 = -7'654;
-    CHECK_EQ(density3DisplacementGatedMm(kSeed, vx1, vy1, vz1, 0, kQ, kQ), a);
-    CHECK_EQ(density3DisplacementGatedMm(kSeed, vx2, vy2, vz2, 0, kQ, kQ), b);
-    CHECK_EQ(density3PocketMm(kSeed, vx3, vy3, vz3, kQ), c);
+    CHECK_EQ(density3DisplacementGatedMm(kSeed, vx1, vy1, vz1, 0, kQ), a);
+    CHECK_EQ(density3DisplacementGatedMm(kSeed, vx2, vy2, vz2, 0, kQ), b);
+    CHECK_EQ(density3BeddingMm(kSeed, vx3, vy3, vz3), c);
 }
 
 VXC_TEST(value_noise_3_stays_in_range_and_is_smooth) {
+    // density3ValueNoise3Fade outlived its only caller: the pocket term it was
+    // written for was deleted at kWorldGenVersion 12 (density3.h section 2). It
+    // is kept, and kept tested, because it is a general primitive hash.h does
+    // not have and it is the restoration path if the envelope ever grows back
+    // far enough for a sub-voxel term to stop being speckle.
+    //
+    // The channel is a bare literal because this file no longer allocates one --
+    // 29 is the id the pocket term released. Nothing else claims it, and the
+    // test is about the interpolation, not about any allocation.
+    constexpr uint32_t kFreedPocketChannel = 29;
     SplitMixRng rng(10);
     int64_t lo = 0, hi = 0, worstStep = 0;
     for (int i = 0; i < 100000; ++i) {
@@ -489,7 +499,7 @@ VXC_TEST(value_noise_3_stays_in_range_and_is_smooth) {
         const int64_t y = rng.nextSigned(2'000'000'000);
         const int64_t z = rng.nextSigned(2'000'000'000);
         const int64_t n = density3ValueNoise3Fade(kSeed, x, y, z, kDensity3PocketLatXYMm,
-                                                  kDensity3PocketLatZMm, CH_POCKET);
+                                                  kDensity3PocketLatZMm, kFreedPocketChannel);
         CHECK(n >= -kDensity3NoiseAbs && n < kDensity3NoiseAbs);
         if (n < lo) lo = n;
         if (n > hi) hi = n;
@@ -504,10 +514,10 @@ VXC_TEST(value_noise_3_stays_in_range_and_is_smooth) {
             const int64_t y = axis == 1 ? kDensity3PocketLatXYMm * 7 + t : 54321;
             const int64_t z = axis == 2 ? kDensity3PocketLatZMm * 7 + t : 6789;
             const int64_t a = density3ValueNoise3Fade(kSeed, x, y, z, kDensity3PocketLatXYMm,
-                                                      kDensity3PocketLatZMm, CH_POCKET);
+                                                      kDensity3PocketLatZMm, kFreedPocketChannel);
             const int64_t b = density3ValueNoise3Fade(
                 kSeed, x + (axis == 0), y + (axis == 1), z + (axis == 2),
-                kDensity3PocketLatXYMm, kDensity3PocketLatZMm, CH_POCKET);
+                kDensity3PocketLatXYMm, kDensity3PocketLatZMm, kFreedPocketChannel);
             const int64_t step = iabs(b - a);
             if (step > worstStep) worstStep = step;
         }
@@ -671,10 +681,16 @@ VXC_TEST(overhangs_actually_occur) {
 
 VXC_TEST(reachable_displacement_matches_the_taper_arithmetic) {
     // The band taper caps how far the displaced surface can actually move: a
-    // nose can protrude only as far as the largest dz with dz <= taper(dz)/Q *
-    // 700. The header quotes 511 mm; if the core/ramp split changes, this
-    // fails and the header's number has to be re-derived rather than left
-    // stale.
+    // nose can protrude only as far as the largest dz with
+    // dz <= taper(dz)/Q * kDensity3MaxAbsMm. The header quotes 255 mm at the
+    // 350 mm envelope (it was 511 at 700); if the envelope or the core/ramp
+    // split changes, this fails and the header's number has to be re-derived
+    // rather than left stale.
+    //
+    // 255 is almost exactly half of 511, which is the point: holding the core at
+    // the same 4/7 of the envelope makes the reachable displacement scale with
+    // the envelope, so this number is a check on the taper's SHAPE having
+    // survived the halving rather than an independent quantity.
     int64_t maxNose = -1, maxRecess = 1;
     for (int64_t dz = 0; dz <= kDensity3BandHalfMm; ++dz) {
         if (density3ScaleMm(kDensity3MaxAbsMm, kQ, density3BandTaperQ(dz, 0)) >= dz) maxNose = dz;
@@ -685,8 +701,8 @@ VXC_TEST(reachable_displacement_matches_the_taper_arithmetic) {
     }
     std::printf("    [density3] reachable displacement: nose +%lld mm, recess %lld mm\n",
                 (long long)maxNose, (long long)maxRecess);
-    CHECK_EQ(maxNose, 511);
-    CHECK_EQ(maxRecess, -511);
+    CHECK_EQ(maxNose, 255);
+    CHECK_EQ(maxRecess, -255);
 }
 
 VXC_TEST(skipping_outside_the_band_is_exact_not_approximate) {
@@ -736,40 +752,6 @@ VXC_TEST(bedding_domain_hoist_is_value_identical) {
     }
 }
 
-VXC_TEST(pocket_cache_is_value_identical) {
-    // The eight hash3 corners are cached for ONE z lattice cell. The 78% of
-    // columns whose whole band sits inside that cell hit it; the other 22% must
-    // fall THROUGH to a fresh evaluation rather than be served the wrong
-    // corners. Both branches are exercised deliberately -- the sweep spans two
-    // full z lattice periods either side of the cache's own cell -- because a
-    // cache that silently served stale corners would be a divergence that only
-    // showed up as a hole in someone's world.
-    SplitMixRng rng(22);
-    int64_t hits = 0, misses = 0;
-    for (int i = 0; i < 4000; ++i) {
-        const int64_t x = rng.nextSigned(2'000'000'000);
-        const int64_t y = rng.nextSigned(2'000'000'000);
-        const int64_t s = rng.nextSigned(1'000'000);
-        const Density3PocketCorners c = density3PocketCornersAt(kSeed, x, y, s);
-        for (int64_t dz = -2 * kDensity3PocketLatZMm; dz <= 2 * kDensity3PocketLatZMm;
-             dz += 977) {
-            const int64_t z = s + dz;
-            if (floorDiv(z, kDensity3PocketLatZMm) == c.z0)
-                ++hits;
-            else
-                ++misses;
-            CHECK_EQ(density3PocketCachedMm(c, kSeed, x, y, z, kQ),
-                     density3PocketMm(kSeed, x, y, z, kQ));
-            CHECK_EQ(density3PocketCachedMm(c, kSeed, x, y, z, 0),
-                     density3PocketMm(kSeed, x, y, z, 0));
-        }
-    }
-    CHECK(hits > 0);   // not vacuous: both branches must actually have run
-    CHECK(misses > 0);
-    std::printf("    [density3] pocket cache exercised: %lld hits, %lld misses\n",
-                (long long)hits, (long long)misses);
-}
-
 VXC_TEST(column_state_matches_the_reference_displacement) {
     // Density3Column is the object Amplifier::stratigraphyAt actually consults.
     // It must agree with the reference form that computes both gates itself, at
@@ -788,12 +770,13 @@ VXC_TEST(column_state_matches_the_reference_displacement) {
         const int64_t s = rng.nextSigned(1'000'000);
         const int64_t slope = 400 + static_cast<int64_t>(rng.next() % 800); // 400..1199 mm/m
         const int64_t soil = static_cast<int64_t>(rng.next() % 1200);       // 0..1199 mm
-        const Density3Column col = density3ColumnFor(kSeed, x, y, s, slope, soil);
+        const Density3Column col = density3ColumnFor(kSeed, x, y, slope, soil);
         for (int64_t dz = -1000; dz <= 1000; dz += 37) {
             const int64_t z = s + dz;
             const int64_t got = density3ColumnDisplacementMm(col, z, s);
             const int64_t want = density3DisplacementGatedMm(
-                kSeed, x, y, z, s, density3SlopeGateQFromMag(slope), density3RockGateQ(soil));
+                kSeed, x, y, z, s,
+                density3ColumnGateQ(density3SlopeGateQFromMag(slope), density3RockGateQ(soil)));
             CHECK_EQ(got, want);
             ++samples;
             if (got != 0) {
@@ -813,22 +796,29 @@ VXC_TEST(closed_slope_gate_computes_no_hash_state) {
     // gate costs one compare and nothing else. Checked STRUCTURALLY rather than
     // by timing: on such a column Density3Column carries no domain hash and no
     // corner cache, so there is nothing it could have computed.
-    const Density3Column shut = density3ColumnFor(kSeed, kAnchorX, kAnchorY, 1000,
-                                                  kDensity3SlopeStartMmPerM, 0);
-    CHECK_EQ(shut.slopeGateQ, 0);
-    CHECK_EQ(shut.domainHash, 0ull);
-    CHECK_EQ(shut.pocket.z0, 0);
-    for (int i = 0; i < 8; ++i) CHECK_EQ(shut.pocket.v[i], 0);
+    const Density3Column shutBySlope =
+        density3ColumnFor(kSeed, kAnchorX, kAnchorY, kDensity3SlopeStartMmPerM, 0);
+    CHECK_EQ(shutBySlope.gateQ, 0);
+    CHECK_EQ(shutBySlope.domainHash, 0ull); // nothing was hashed
     for (int64_t dz = -800; dz <= 800; dz += 13)
-        CHECK_EQ(density3ColumnDisplacementMm(shut, 1000 + dz, 1000), 0);
+        CHECK_EQ(density3ColumnDisplacementMm(shutBySlope, 1000 + dz, 1000), 0);
 
-    // And a closed LITHOLOGY gate skips the pocket corners while still
-    // computing the bedding half -- the two gates are independent, and a
-    // shortcut that skipped both together would quietly delete the bedding
-    // overhangs on soil-choked benches, which are the ones this term is for.
-    const Density3Column noPocket = density3ColumnFor(kSeed, kAnchorX, kAnchorY, 1000,
-                                                      kSteepMmPerM, kDensity3RockSoilZeroMm);
-    CHECK_EQ(noPocket.rockGateQ, 0);
-    for (int i = 0; i < 8; ++i) CHECK_EQ(noPocket.pocket.v[i], 0);
-    CHECK(noPocket.domainHash != 0ull);
+    // The LITHOLOGY gate closes a column just as exactly, and at v12 it closes
+    // it entirely rather than only silencing a pocket term. That is what keeps
+    // the band off soil-mantled ground -- 45% of otherwise-qualifying columns on
+    // real tiles -- so a shortcut that only ever checked the slope gate would
+    // both cost that and put undercuts through turf.
+    const Density3Column shutBySoil = density3ColumnFor(kSeed, kAnchorX, kAnchorY, kSteepMmPerM,
+                                                       kDensity3RockSoilZeroMm);
+    CHECK_EQ(shutBySoil.gateQ, 0);
+    CHECK_EQ(shutBySoil.domainHash, 0ull);
+    for (int64_t dz = -800; dz <= 800; dz += 13)
+        CHECK_EQ(density3ColumnDisplacementMm(shutBySoil, 1000 + dz, 1000), 0);
+
+    // And a column that passes both is populated, or the test above proves
+    // nothing about the gates and everything about a struct that is always zero.
+    const Density3Column open =
+        density3ColumnFor(kSeed, kAnchorX, kAnchorY, kSteepMmPerM, 0);
+    CHECK_EQ(open.gateQ, kQ);
+    CHECK(open.domainHash != 0ull);
 }

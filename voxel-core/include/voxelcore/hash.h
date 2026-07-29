@@ -53,7 +53,7 @@ constexpr uint64_t splitmix64(uint64_t z) {
 //   26       detail_rill.h      CH_RILL
 //   27       detail_bedding.h   CH_BEDDING_STRIKE
 //   28       detail_bedding.h   CH_BEDDING
-//   29       density3.h         CH_POCKET
+//   29       FREE               (was density3.h CH_POCKET — see HISTORY)
 //   30       caves.h            CH_CAVE_NODE       (moved from 18 — see HISTORY)
 //   31       caves.h            CH_CAVE_EDGE       (moved from 19 — see HISTORY)
 //   32..47   hash.h             CH_SYNTH_TILE_BASE + synthetic dev-tile index
@@ -72,6 +72,15 @@ constexpr uint64_t splitmix64(uint64_t z) {
 // separately. CH_ECOTONE_TEMP/PRECIP were left at 18/19 rather than moved:
 // they are the ids hash.h's own enum has always had, and caves.h's own
 // comment already deferred to hash.h as the numbering authority.
+//
+// Id 29 was density3.h's CH_POCKET, for the 3D density band's joint-controlled
+// pocket term. That term was deleted at kWorldGenVersion 12 -- it produced zero
+// overhangs (its 6400 mm z lattice made dD/dz > 1 unreachable) and, inside the
+// halved 350 mm envelope, any amplitude it could have had was under one voxel,
+// so 97% of what it changed was isolated single-voxel speckle. See density3.h
+// section 2. The id is FREE, and it is listed as free rather than quietly
+// reused so that anyone restoring the term gets its own field back rather than
+// colliding with whatever took the number in the meantime.
 // ============================================================================
 
 // Channel ids domain-separate hash uses. Append only — never renumber a

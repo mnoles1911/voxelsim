@@ -111,7 +111,7 @@ BenchResult run(const Options& opt) {
                     const ColumnSample& c = ext[(x + 1) + (B + 2) * (y + 1)];
                     ++r.columns;
                     r.voxelsVisited += size_t(bzMax - bzMin + 1) * B;
-                    if (c.d3.slopeGateQ == 0) continue;
+                    if (c.d3.gateQ == 0) continue;
                     ++r.gatedColumns;
                     for (int32_t bz = bzMin; bz <= bzMax; ++bz)
                         for (int z = 0; z < B; ++z) {

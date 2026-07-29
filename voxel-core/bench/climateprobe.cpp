@@ -317,7 +317,7 @@ int main(int argc, char** argv) {
     // gate rate is the entire cost model. density3.h's own estimate was taken
     // on SyntheticTileSampler, whose slope distribution is nothing like a
     // diffusion tile's, and it is the number its cost note says to distrust.
-    int64_t d3SlopeOpen = 0, d3BothOpen = 0, d3Overhung = 0, d3OverhungSpanMm = 0;
+    int64_t d3RockOpen = 0, d3BothOpen = 0, d3Overhung = 0, d3OverhungSpanMm = 0;
 
     for (int64_t j = 0; j < nAxis; ++j) {
         const int64_t py = py0 + (py1 - py0) * j / (nAxis - 1);
@@ -379,14 +379,25 @@ int main(int argc, char** argv) {
             liveMat[ml]++;
             if (isSurfaceMaterial(ms)) ++surfaceMatTop;
 
-            // 3D density band census. Walked BOTTOM-UP over the +/-700 mm band:
-            // its floor is unconditionally solid and its ceiling unconditionally
-            // air, so "air then solid" going up is an overhang and the reverse
-            // is just the ground.
-            if (col.d3.slopeGateQ != 0) {
-                ++d3SlopeOpen;
-                if (col.d3.rockGateQ != 0) ++d3BothOpen;
-                const int64_t band = kDensity3MaxAbsMm / kVoxelSizeMm;
+            // 3D density band census. Walked BOTTOM-UP over the band: its floor
+            // is unconditionally solid and its ceiling unconditionally air, so
+            // "air then solid" going up is an overhang and the reverse is just
+            // the ground.
+            //
+            // The two gates are multiplied into one q12 on the ColumnSample, so
+            // `gateQ != 0` is "the term is live here" -- the rate the whole cost
+            // model is proportional to. The lithology half is recomputed from
+            // the column's own layers so the two can be reported separately;
+            // the slope half is NOT separable from a ColumnSample (it needs the
+            // carrier gradient, which is not carried), so what is printed for
+            // it is a lower bound.
+            if (density3RockGateQ(col.surfaceMat == MAT_ROCK
+                                      ? int64_t(col.topsoilMm)
+                                      : int64_t(col.topsoilMm) + int64_t(col.subsoilMm)) != 0)
+                ++d3RockOpen;
+            if (col.d3.gateQ != 0) {
+                ++d3BothOpen;
+                const int64_t band = (kDensity3MaxAbsMm + kVoxelSizeMm - 1) / kVoxelSizeMm;
                 bool sawAir = false;
                 int64_t span = 0;
                 for (int64_t vz = topVz - band; vz <= topVz + band; ++vz) {
@@ -421,15 +432,17 @@ int main(int argc, char** argv) {
     }
 
     std::printf("\n=== 3D DENSITY BAND (kWorldGenVersion 12, voxelcore/density3.h) ===\n");
-    std::printf("  slope gate open      %10lld  %6.2f%%   (>%lld mm/m; this rate IS the cost)\n",
-                (long long)d3SlopeOpen, pct(d3SlopeOpen, total),
+    std::printf("  lithology gate open  %10lld  %6.2f%%   (<%lld mm of soil above rock)\n",
+                (long long)d3RockOpen, pct(d3RockOpen, total),
+                (long long)kDensity3RockSoilZeroMm);
+    std::printf("  BOTH gates open      %10lld  %6.2f%%   (>%lld mm/m too; THIS RATE IS THE "
+                "COST)\n",
+                (long long)d3BothOpen, pct(d3BothOpen, total),
                 (long long)kDensity3SlopeStartMmPerM);
-    std::printf("  slope AND rock gate  %10lld  %6.2f%%\n", (long long)d3BothOpen,
-                pct(d3BothOpen, total));
     std::printf("  overhung columns     %10lld  %6.2f%% of all, %6.2f%% of gated; mean span "
                 "%lld mm\n",
                 (long long)d3Overhung, pct(d3Overhung, total),
-                d3SlopeOpen ? 100.0 * double(d3Overhung) / double(d3SlopeOpen) : 0.0,
+                d3BothOpen ? 100.0 * double(d3Overhung) / double(d3BothOpen) : 0.0,
                 (long long)(d3Overhung ? d3OverhungSpanMm / d3Overhung : 0));
 
     std::printf("\n=== BIOME CENSUS ===\n");

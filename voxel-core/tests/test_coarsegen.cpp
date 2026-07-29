@@ -225,8 +225,9 @@ VXC_TEST(coarsegen_golden_digest) {
     // level 0 is still bit-identical to the fine path (coarsegen_level0_
     // identity), which is the property that would break if the band had been
     // wired in per-brick or per-dispatch rather than per world coordinate.
-    // (was 0x85B3E79EF8D01AFC at v5, 0xFCE6D8509799236D at v6..v11)
-    CHECK_EQ(d, 0xB812048EB08AA281ull);
+    // (was 0x85B3E79EF8D01AFC at v5, 0xFCE6D8509799236D at v6..v11, and
+    //  0xB812048EB08AA281 at the 700 mm cut of v12)
+    CHECK_EQ(d, 0x1833876BA6F3F9C3ull);
 }
 
 VXC_TEST(coarsegen_seed_sensitivity) {
