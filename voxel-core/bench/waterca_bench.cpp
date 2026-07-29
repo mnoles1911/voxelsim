@@ -45,6 +45,50 @@ struct TickSample {
     double ms;
 };
 
+#ifdef VXC_WATER_PROFILE
+// Per-phase split of everything step() did since the last reset. Only built
+// when the library was configured with -DVXC_WATER_PROFILE=ON (voxel-core/
+// CMakeLists.txt); the default build has no counters in it at all, so the
+// headline ms/tick figures above stay uninstrumented. See waterca.h's
+// WaterCAProfile comment.
+void reportProfile(const char* what) {
+    const WaterCAProfile& p = waterCAProfile();
+    if (p.ticks == 0) return;
+    const double t = double(p.ticks);
+    auto ms = [&](uint64_t ns) { return double(ns) / 1e6 / t; };
+    const uint64_t rounds = p.readResetNs + p.readNs + p.gatherZeroNs + p.gatherNs + p.finalizeNs;
+    const uint64_t accounted = p.setupOrderNs + p.setupSnapshotNs + p.setupScratchNs + rounds + p.diffNs +
+                               p.hydroTotalNs + p.activeNs;
+    std::printf("\n--- phase split (%s), %llu ticks, avg per tick ---\n", what,
+                (unsigned long long)p.ticks);
+    std::printf("  active bricks %.0f, touched bricks %.0f\n", double(p.orderBricks) / t,
+                double(p.touchedBricks) / t);
+    std::printf("  setup: order/touched %.2f ms, tick-start snapshot %.2f ms, scratch+inflow %.2f ms\n",
+                ms(p.setupOrderNs), ms(p.setupSnapshotNs), ms(p.setupScratchNs));
+    std::printf("  8 rounds: scratch reset %.2f ms, READ %.2f ms, inflow zero %.2f ms, GATHER %.2f ms, "
+                "FINALIZE %.2f ms  (rounds total %.2f ms)\n",
+                ms(p.readResetNs), ms(p.readNs), ms(p.gatherZeroNs), ms(p.gatherNs), ms(p.finalizeNs),
+                ms(rounds));
+    std::printf("  net-diff %.2f ms, next-active %.2f ms\n", ms(p.diffNs), ms(p.activeNs));
+    std::printf("  phase C total %.2f ms = setup %.2f + seed scan %.2f + flood %.2f + level %.2f + apply "
+                "%.2f\n",
+                ms(p.hydroTotalNs), ms(p.hydroSetupNs), ms(p.hydroScanNs), ms(p.hydroFloodNs),
+                ms(p.hydroLevelNs), ms(p.hydroApplyNs));
+    std::printf("  accounted %.2f ms/tick\n", ms(accounted));
+    std::printf("  counts/tick: READ solid lookups %.0f (misses %.0f), phase C components %.0f, pops %.0f "
+                "(air %.0f = %.0f%%), solid_ calls %.0f, memo hits %.0f, writes %.0f\n",
+                double(p.readSolidLookups) / t, double(p.readSolidMisses) / t, double(p.hydroComponents) / t,
+                double(p.hydroPops) / t, double(p.hydroPopsAir) / t,
+                p.hydroPops ? 100.0 * double(p.hydroPopsAir) / double(p.hydroPops) : 0.0,
+                double(p.hydroSolidCalls) / t, double(p.hydroMemoHits) / t, double(p.hydroWrites) / t);
+    std::printf("  phase C overflow (>cap, result DISCARDED): %.1f of %.0f components, %.0f of %.0f pops "
+                "(%.0f%% of the flood is thrown away)\n",
+                double(p.hydroOverflowed) / t, double(p.hydroComponents) / t,
+                double(p.hydroPopsOverflowed) / t, double(p.hydroPops) / t,
+                p.hydroPops ? 100.0 * double(p.hydroPopsOverflowed) / double(p.hydroPops) : 0.0);
+}
+#endif
+
 // --lake scenario: a large, FULLY SETTLED walled pool that is then disturbed
 // by one trivial local edit per tick (a single unit of water dropped in one
 // corner). This is the "persistent per-water-body structure" motivating case
@@ -77,7 +121,7 @@ WaterCA::SolidFn flatWalledBasin(int64_t halfSpan, uint32_t spin) {
     };
 }
 
-int runLake(int ticks, bool solidCache, int64_t kHalfSpan, uint32_t spin, bool wakeEdit) {
+int runLake(int ticks, bool solidCache, int64_t kHalfSpan, uint32_t spin, bool wakeEdit, bool trace) {
     WaterCA ca(flatWalledBasin(kHalfSpan, spin));
     ca.setSolidCacheEnabled(solidCache);
 
@@ -113,6 +157,9 @@ int runLake(int ticks, bool solidCache, int64_t kHalfSpan, uint32_t spin, bool w
     double wakeSum = 0;
     size_t wokenTotal = 0;
     int n = 0;
+#ifdef VXC_WATER_PROFILE
+    resetWaterCAProfile();
+#endif
     for (int t = 0; t < ticks; ++t) {
         if (wakeEdit) {
             // A 3x3x3-voxel dig on the lake floor's corner, moved along the rim
@@ -126,8 +173,10 @@ int runLake(int ticks, bool solidCache, int64_t kHalfSpan, uint32_t spin, bool w
         }
         const auto t0 = Clock::now();
         ca.step();
-        sum += msSince(t0);
+        const double ms = msSince(t0);
+        sum += ms;
         ++n;
+        if (trace) std::printf("  tick %d: active %zu, %.3f ms\n", t, ca.activeBrickCount(), ms);
     }
     std::printf("  %s avg step(): %.3f ms/tick over %d ticks\n",
                 wakeEdit ? "wake-edit-per-tick settled lake" : "disturbed-settled-lake",
@@ -135,6 +184,9 @@ int runLake(int ticks, bool solidCache, int64_t kHalfSpan, uint32_t spin, bool w
     if (wakeEdit)
         std::printf("  wakeRegion() itself: %.6f ms/call avg, %zu bricks woken over %d calls\n",
                     n ? wakeSum / double(n) : 0.0, wokenTotal, n);
+#ifdef VXC_WATER_PROFILE
+    reportProfile("settled lake, steady state");
+#endif
     return 0;
 }
 
@@ -155,6 +207,7 @@ int main(int argc, char** argv) {
     int64_t lakeSpan = 31; // --lake footprint is (2*span+1)^2
     uint32_t lakeSpin = 0;  // --lake-solid-spin: emulated per-query terrain cost
     bool wakeEdit = false;  // --wake-edit: disturb the settled lake with terrain-edit wakes, not water
+    bool trace = false;     // --trace: per-tick active count + ms (for picking a measurement band)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--seed" && i + 1 < argc) seed = std::strtoull(argv[++i], nullptr, 10);
@@ -163,18 +216,21 @@ int main(int argc, char** argv) {
         else if (a == "--count-queries") countQueries = true;
         else if (a == "--lake") lake = true;
         else if (a == "--wake-edit") wakeEdit = true;
+        else if (a == "--trace") trace = true;
         else if (a == "--lake-span" && i + 1 < argc) lakeSpan = std::atoi(argv[++i]);
         else if (a == "--lake-solid-spin" && i + 1 < argc)
             lakeSpin = static_cast<uint32_t>(std::atoi(argv[++i]));
         else {
             std::fprintf(stderr,
                          "usage: vxc_waterca_bench [--seed n] [--ticks n] [--solid-cache] "
-                         "[--count-queries]\n");
+                         "[--count-queries] [--trace]\n"
+                         "                         [--lake [--lake-span n] [--lake-solid-spin n] "
+                         "[--wake-edit]]\n");
             return 2;
         }
     }
 
-    if (lake) return runLake(ticks, solidCache, lakeSpan, lakeSpin, wakeEdit);
+    if (lake) return runLake(ticks, solidCache, lakeSpan, lakeSpin, wakeEdit, trace);
 
     SyntheticTileSampler tiles(seed);
     Amplifier amp(seed, tiles);
@@ -217,18 +273,42 @@ int main(int argc, char** argv) {
     std::vector<TickSample> samples;
     samples.reserve(static_cast<size_t>(ticks < 0 ? 0 : ticks));
     size_t maxActive = 0;
+#ifdef VXC_WATER_PROFILE
+    // Accumulate the phase split over exactly the high-active band the
+    // headline number reports on (the pour's active count rises to a peak then
+    // decays monotonically, so "first tick at/above the threshold" through
+    // "first tick back below it" is one contiguous run of ticks). Averaging
+    // the whole run instead would dilute the interesting ticks with hundreds
+    // of near-settled ones.
+    constexpr size_t kProfileMinActive = 1800;
+    bool profileStarted = false;
+    bool profileReported = false;
+#endif
     for (int t = 0; t < ticks; ++t) {
         const size_t activeBefore = ca.activeBrickCount();
+#ifdef VXC_WATER_PROFILE
+        if (!profileStarted && activeBefore >= kProfileMinActive) {
+            resetWaterCAProfile();
+            profileStarted = true;
+        } else if (profileStarted && !profileReported && activeBefore < kProfileMinActive) {
+            reportProfile("active-brick band >= 1800");
+            profileReported = true;
+        }
+#endif
         const auto t0 = Clock::now();
         ca.step();
         const double ms = msSince(t0);
         samples.push_back({activeBefore, ms});
+        if (trace) std::printf("  tick %d: active %zu, %.3f ms\n", t, activeBefore, ms);
         maxActive = std::max(maxActive, activeBefore);
         if (ca.steppedBrickCount() == 0) {
             std::printf("settled after %d ticks\n", t + 1);
             break;
         }
     }
+#ifdef VXC_WATER_PROFILE
+    if (!profileReported) reportProfile(profileStarted ? "active-brick band >= 1800" : "full run");
+#endif
 
     double sumAll = 0;
     for (const auto& s : samples) sumAll += s.ms;
