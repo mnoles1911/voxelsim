@@ -1,6 +1,7 @@
 #include "voxelcore/amplifier.h"
 
 #include "voxelcore/biome.h"
+#include "voxelcore/carrier.h"
 
 #include <atomic>
 
@@ -472,164 +473,20 @@ constexpr int32_t kSurfaceClampMinMm = -8'000'000;
 constexpr int32_t kSurfaceClampMaxMm = 9'000'000;
 
 // ---------------------------------------------------------------------------
-// THE CARRIER — a C2 uniform cubic B-spline over the tile raster.
+// THE CARRIER now lives in voxelcore/carrier.h — kCarrierT, the three B-spline
+// bases, evalCarrier, carrierSlopeMmPerM, the analytic curvature added for
+// docs/terrain-amplification-plan.md §3c, and the whole derivation. It was
+// moved out of this file verbatim (a pure move; worldgen output unchanged) so
+// that the Phase-3 curvature work and its tests can reach it.
 //
-// WHY THIS REPLACED BILINEAR (kWorldGenVersion 9). Bilinear interpolation is
-// C0 but not C1: the height is continuous across a tile-pixel boundary, the
-// GRADIENT is not. A slope discontinuity is invisible in the height and glaring
-// under directional light, which is exactly why the artifact survived every
-// check that looked at h alone -- it is a lighting defect, not a height defect.
-//
-// Measured with vxc_terrainprobe's seam scan (S2 stencils split by whether they
-// straddle a pixel boundary), on real tiles at kWorldGenVersion 8:
-//
-//   * carrier alone: straddle/interior ratio 8x at a 0.1 m lag rising to 950x
-//     at 12.8 m, over an interior floor of 0.48 mm. Growth exactly linear in
-//     lag over a zero floor is the signature of a slope step -- the interior of
-//     a bilinear cell is EXACTLY planar, so S2 there is pure division rounding,
-//     and every scrap of second difference lives on the cell boundary;
-//   * amplified surface: 3.28 / 1.61 / 1.23 at 0.1 / 0.2 / 0.4 m lags, ~1.1
-//     beyond. The detail octaves mask the crease at metre scale and DO NOT mask
-//     it at voxel scale, which is precisely where a 10 cm voxel game is looked
-//     at.
-//
-// Cubic B-spline rather than Catmull-Rom, for three reasons in order of weight:
-//
-//   1. THE BOUND SURVIVES STRUCTURALLY. B-spline weights are non-negative and
-//      sum exactly to the denominator, so the carrier is a convex combination
-//      of control points and min/max over the stencil bounds it -- the same
-//      property surfaceBoundsMm already leaned on for the bilinear patch.
-//      Catmull-Rom has negative weights; its overshoot is bounded but the bound
-//      would need a slack term derived from adjacent control-point differences,
-//      i.e. a whole new derivation in the one place an error is a hole in the
-//      world.
-//   2. C2, NOT MERELY C1. Catmull-Rom fixes the shading crease but its
-//      CURVATURE still steps at every cell line. The Phase-3 detail work
-//      conditions amplitude on curvature, so a C1 carrier would reproduce this
-//      same artifact one derivative down.
-//   3. The approximation deficit is fixable where it is cheap. A B-spline does
-//      not interpolate its control points, it approximates them. That is
-//      corrected by prefiltering the control lattice, which is a float IIR pass
-//      -- illegal here, trivial in the tile bake. Until the baked fine tier
-//      ships (docs/terrain-amplification-plan.md Phase 2) the raw samples are
-//      used as control points directly and the carrier is very slightly
-//      smoother than the raster; at 30 m posts that is far below the detail
-//      band and vxc_terrainprobe's carrier-only mode is how it stays honest.
-//
-// FIXED POINT. The cell fraction is q10 (the fadeFractionMm convention from
-// hash.h). Weights are exact integer numerators over 6*1024^3; the quadratic
-// derivative weights over 2*1024^2. Evaluation is TWO-STAGE SEPARABLE with an
-// intermediate division, and that is forced rather than chosen: the exact
-// tensor form (weights in fx, not in q10) needs a denominator of 36*pxMm^6,
-// which at pxMm = 30000 overflows int64 by about ten orders of magnitude.
-//
-// The q10 quantization of the cell fraction is harmless: one tq step is
-// pxMm/1024 = 29 mm of horizontal position at 30 m pixels, and adjacent voxel
-// columns (100 mm apart) advance tq by ~3, so no two columns collapse onto the
-// same weights.
-//
-// Every division below truncates toward zero -- plain C++ `/`, mirrored by
-// truncDiv in worldgen.ush. NOT floorDiv: the bound lemma (below) is stated
-// against truncation, and the two disagree on negative numerators.
+// What stayed here: ceilDivPos, which only the bound uses, and couplings
+// (4b)/(4c) below, which are properties the BOUND needs from the carrier rather
+// than properties of the carrier itself.
 // ---------------------------------------------------------------------------
 
 // Ceiling division for non-negative numerator and positive denominator. Used
 // only by the bound, where every rounding must go outward.
 constexpr int64_t ceilDivPos(int64_t a, int64_t b) { return (a + b - 1) / b; }
-
-constexpr int64_t kCarrierT = 1024;                                  // q10 one
-constexpr int64_t kCarrierValueDen = 6 * kCarrierT * kCarrierT * kCarrierT;
-constexpr int64_t kCarrierSlopeDen = 2 * kCarrierT * kCarrierT;
-
-// Cubic B-spline basis at t = tq/1024, as exact integer numerators over
-// kCarrierValueDen. Ordered for control points i-1, i, i+1, i+2.
-struct CarrierW4 {
-    int64_t w[4];
-};
-constexpr CarrierW4 carrierValueW(int64_t tq) {
-    const int64_t u = kCarrierT - tq;
-    const int64_t T = kCarrierT;
-    return CarrierW4{{u * u * u,
-                      3 * tq * tq * tq - 6 * tq * tq * T + 4 * T * T * T,
-                      -3 * tq * tq * tq + 3 * tq * tq * T + 3 * tq * T * T + T * T * T,
-                      tq * tq * tq}};
-}
-
-// Quadratic B-spline basis — the derivative of the cubic, applied to the THREE
-// first differences of the four control points. Result is mm per pixel.
-struct CarrierW3 {
-    int64_t w[3];
-};
-constexpr CarrierW3 carrierSlopeW(int64_t tq) {
-    const int64_t u = kCarrierT - tq;
-    const int64_t T = kCarrierT;
-    return CarrierW3{{u * u, -2 * tq * tq + 2 * T * tq + T * T, tq * tq}};
-}
-
-// The carrier's value and analytic gradient at a point inside one cell, from
-// the 4x4 control stencil (row-major, j = y outer, i = x inner; index 0
-// corresponds to control point px-1 / py-1).
-struct CarrierEval {
-    int64_t heightMm = 0;
-    int64_t sxMmPerPx = 0; // signed
-    int64_t syMmPerPx = 0; // signed
-};
-
-inline CarrierEval evalCarrier(const int64_t cp[16], int64_t fx, int64_t fy, int64_t pxMm) {
-    // fx, fy are in [0, pxMm) by floorDiv's contract, so both numerators are
-    // non-negative and tq lands in [0, 1023].
-    const int64_t tx = fx * kCarrierT / pxMm;
-    const int64_t ty = fy * kCarrierT / pxMm;
-    const CarrierW4 wx = carrierValueW(tx), wy = carrierValueW(ty);
-    const CarrierW3 dx = carrierSlopeW(tx), dy = carrierSlopeW(ty);
-
-    // Stage 1: collapse x for each of the four control rows. Both the value and
-    // the x-derivative come off the same row read.
-    int64_t rowVal[4], rowDx[4];
-    for (int j = 0; j < 4; ++j) {
-        const int64_t* r = cp + 4 * j;
-        int64_t v = 0, d = 0;
-        for (int i = 0; i < 4; ++i) v += r[i] * wx.w[i];
-        for (int i = 0; i < 3; ++i) d += (r[i + 1] - r[i]) * dx.w[i];
-        rowVal[j] = v / kCarrierValueDen;
-        rowDx[j] = d / kCarrierSlopeDen;
-    }
-
-    // Stage 2: collapse y. The y-derivative is the quadratic basis over the
-    // first differences of the already-collapsed rows — the tensor product
-    // commutes, so this is the same value as collapsing y first.
-    int64_t h = 0, sx = 0, sy = 0;
-    for (int j = 0; j < 4; ++j) {
-        h += rowVal[j] * wy.w[j];
-        sx += rowDx[j] * wy.w[j];
-    }
-    for (int j = 0; j < 3; ++j) sy += (rowVal[j + 1] - rowVal[j]) * dy.w[j];
-
-    CarrierEval e;
-    e.heightMm = h / kCarrierValueDen;
-    e.sxMmPerPx = sx / kCarrierValueDen;
-    e.syMmPerPx = sy / kCarrierSlopeDen;
-    return e;
-}
-
-// The slope currency, in MM PER METRE.
-//
-// This unit change is not cosmetic and it is not optional. The old currency was
-// mm per tile PIXEL, which is proportional to pixelSizeMm -- so every threshold
-// stated in it (slopeScaleQ10, microScaleQ10, classifyBiome's cliff gate, the
-// topsoil retention term) silently means a different GRADE at scale 8 than at
-// scale 1. biome.h recorded that latent bug and asked for all four to be fixed
-// together before scale-8 tiles are generated. This is that fix; the baked fine
-// tier in docs/terrain-amplification-plan.md Phase 2 is what made it urgent.
-//
-// L1 (|dx| + |dy|) rather than the Euclidean norm, keeping the SHAPE of the old
-// tileSlopeMmPerPx so the recalibrated thresholds below are a pure unit
-// conversion of the tuned v8 values rather than a fresh tuning problem.
-inline int64_t carrierSlopeMmPerM(const CarrierEval& c, int64_t pxMm) {
-    const int64_t ax = c.sxMmPerPx < 0 ? -c.sxMmPerPx : c.sxMmPerPx;
-    const int64_t ay = c.syMmPerPx < 0 ? -c.syMmPerPx : c.syMmPerPx;
-    return (ax + ay) * 1000 / pxMm;
-}
 
 // ---------------------------------------------------------------------------
 // Compile-time couplings for Amplifier::surfaceUpperBoundMm.
