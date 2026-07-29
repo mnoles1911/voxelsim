@@ -282,24 +282,43 @@ class BakeConstants:
     flat_eps: float | None = None
     #: Erodibility.
     #:
-    #: **UNCALIBRATED AGAINST CORRECTED ROUTING -- this is the first number
-    #: Phase 2 must fix.** The plan's sweep that chose 0.15 (mean 1.66 m,
-    #: p99 7.84 m, "properly dissected hillslope") ran on the plain-fill field
-    #: above, i.e. with two thirds of the drainage stranded. With the epsilon
-    #: fill the same tile goes from 69.6 to 203.1 km2 of max catchment and from
-    #: 13,256 to 107,496 cells above 1 km2, so ``A^0.45`` is ~1.6x larger on
-    #: trunk channels and 0.15 will OVER-carve.
+    #: **CALIBRATED 2026-07-29 on correctly-routed drainage** (real tile (-5,3),
+    #: 4096^2 at 1.875 m/px, ``tools/calibrate_stream_k.py``). The earlier sweep
+    #: that first chose 0.15 ran on the plain-fill field above, with two thirds
+    #: of the drainage stranded; the epsilon fill grows catchments ~2.9x, so the
+    #: same K cuts ~1.6x deeper and the expectation was that K had to fall to
+    #: ~0.09. On a hillshade that was **wrong**: 0.09 leaves trunk channels
+    #: legible but tributaries not, 0.15 gives a legible dendritic network at
+    #: both 7.7 km and 1.4 km, and 0.25+ begins showing parallel grooving. The
+    #: 1.6x arithmetic is right about the depth and wrong about the conclusion,
+    #: because the original judgement was made on a different tile at 3.75 m/px
+    #: -- there was never a like-for-like appearance to preserve.
     #:
-    #: Do not simply divide by 1.6: re-measure on a correctly routed field, and
-    #: judge it on a hillshade, because no summary statistic distinguishes a
-    #: good K from a bad one (the plan records that finding). Changing it is
-    #: cheap -- it rolls the bake identity, hence provider_id, hence the world,
-    #: with old caches untouched, which is exactly the sanctioned way.
+    #: Changing it is cheap -- it rolls the bake identity, hence provider_id,
+    #: hence the world, with old caches untouched, which is the sanctioned way.
     stream_K: float = 0.15
     stream_m: float = 0.45
     stream_n: float = 0.8
     #: Over-carving is its own failure mode; this is the sub-threshold cap.
+    #: NOTE it binds at every K tested including 0.03, so ``max`` incision is
+    #: censored and p99 is the only usable tail statistic when tuning.
     incision_cap_m: float = 25.0
+    #: Channel-initiation area, m^2. Without it ``K*A^m*S^n`` incises every cell
+    #: that has any upslope area, which at 1.875 m/px is every cell in the tile:
+    #: measured 77.6% of the domain incised past one voxel at K=0.03 and 98.6%
+    #: at K=0.15. That is a slope-dependent lowering of the whole surface with a
+    #: network faintly embedded in it, not a drainage network. This is the knob
+    #: that sets DRAINAGE DENSITY; without it K had to set both how deep
+    #: channels cut and how many there are, which are not the same question.
+    #: At 1e4 the same tile drops to 25.4% incised while p99 depth is unchanged
+    #: (8.66 -> 8.34 m), i.e. hillslopes are released and channels are not.
+    #: 0 disables the gate and reproduces the pre-2026-07-29 bake exactly.
+    channel_init_area_m2: float = 1.0e4
+    #: Gate sharpness. The gate is SOFT deliberately: a hard cutoff puts a step
+    #: in incision depth along the contour where area crosses the threshold,
+    #: which is a visible seam along a curve -- the same failure class as the
+    #: 30 m grid seams, just not on the grid.
+    channel_init_q: float = 2.0
 
     # -- B3 thermal --------------------------------------------------------
     repose_deg: float = 36.0
@@ -354,6 +373,8 @@ class BakeConstants:
             "stream_m": self.stream_m,
             "stream_n": self.stream_n,
             "incision_cap_m": self.incision_cap_m,
+            "channel_init_area_m2": self.channel_init_area_m2,
+            "channel_init_q": self.channel_init_q,
             "repose_deg": self.repose_deg,
             "thermal_iters": self.thermal_iters,
             "thermal_rate": self.thermal_rate,
@@ -1324,6 +1345,8 @@ def bake_padded_domain(
             m=consts.stream_m,
             n=consts.stream_n,
             cap_m=consts.incision_cap_m,
+            a_crit_m2=consts.channel_init_area_m2,
+            gate_q=consts.channel_init_q,
         ),
         dtype=np.float32,
     )

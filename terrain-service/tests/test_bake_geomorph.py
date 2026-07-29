@@ -341,6 +341,63 @@ def test_stream_power_handles_degenerate_inputs():
         incise.stream_power(np.zeros((2, 2)), np.zeros((2, 2)), cap_m=0.0)
 
 
+def test_channel_initiation_gate_suppresses_hillslopes_not_channels():
+    """The gate exists because without it EVERY cell is a channel.
+
+    Measured on real tile (-5,3) at 1.875 m/px before the gate existed: 77.6 % of the
+    domain incised by more than one voxel at K = 0.03 and 98.6 % at K = 0.15. Real
+    landscapes have a channel head at a critical contributing area, and that area --
+    not K -- is what sets drainage density.
+    """
+    slope = np.full((1, 1), 0.2)
+    hill = float(incise.stream_power(np.full((1, 1), 10.0), slope)[0, 0])
+    trunk = float(incise.stream_power(np.full((1, 1), 1e7), slope)[0, 0])
+    ungated_hill = float(
+        incise.stream_power(np.full((1, 1), 10.0), slope, a_crit_m2=0.0)[0, 0])
+    ungated_trunk = float(
+        incise.stream_power(np.full((1, 1), 1e7), slope, a_crit_m2=0.0)[0, 0])
+
+    # A single-cell hillslope must be suppressed hard...
+    assert hill < ungated_hill / 1000.0
+    # ...while a trunk channel three decades above A_crit is essentially untouched,
+    # so the gate cannot be smuggling in a global reduction of K.
+    assert trunk == pytest.approx(ungated_trunk, rel=1e-3)
+
+
+def test_channel_initiation_gate_is_continuous_and_monotone():
+    """A HARD cutoff at A_crit would put a step in incision depth along the contour
+    where contributing area crosses it -- a visible seam along a curve, which is the
+    same failure class as the 30 m grid seams this project exists to remove."""
+    area = np.geomspace(1.0, 1e9, 4096)[None, :]
+    slope = np.full_like(area, 0.15)
+    depth = incise.stream_power(area, slope, cap_m=1e6)[0]
+
+    assert np.all(np.diff(depth) >= 0.0), "gate must preserve monotonicity in A"
+    # No step: the largest jump between adjacent log-spaced samples must stay a small
+    # fraction of the full range. A hard cutoff would put ~100 % of the range in one step.
+    span = depth.max() - depth.min()
+    assert np.diff(depth).max() < 0.01 * span
+
+
+def test_channel_initiation_gate_defaults_off_reproduce_prior_behaviour():
+    """a_crit_m2=0 must recover the pre-gate function EXACTLY, so the parameter can be
+    used to reproduce anything measured before it existed."""
+    rng = np.random.default_rng(7)
+    area = rng.uniform(0.0, 1e8, size=(32, 32))
+    slope = rng.uniform(0.0, 1.5, size=(32, 32))
+    gated_off = incise.stream_power(area, slope, a_crit_m2=0.0)
+    manual = np.minimum(
+        np.float32(0.15) * np.power(np.float32(1) * area.astype(np.float32), np.float32(0.45))
+        * np.power(slope.astype(np.float32) + np.float32(1e-6), np.float32(0.8)),
+        np.float32(25.0))
+    assert np.allclose(gated_off, manual, rtol=1e-6, atol=0.0)
+
+    with pytest.raises(ValueError):
+        incise.stream_power(area, slope, a_crit_m2=-1.0)
+    with pytest.raises(ValueError):
+        incise.stream_power(area, slope, gate_q=0.0)
+
+
 def test_stream_power_default_K_carves_metres_not_millimetres():
     """LESSON: K is the one knob that decides whether the bake reads as terrain.
 

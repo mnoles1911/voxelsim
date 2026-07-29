@@ -158,10 +158,13 @@ def ref_accumulate(z, cell_m, p=1.1, inflow=None):
     return a
 
 
-def ref_stream_power(acc, slope, K=0.15, m=0.45, n=0.8, cap_m=25.0):
-    d = K * np.power(np.asarray(acc, np.float32), m) * np.power(
-        np.asarray(slope, np.float32) + 1e-6, n
-    )
+def ref_stream_power(acc, slope, K=0.15, m=0.45, n=0.8, cap_m=25.0,
+                     a_crit_m2=1.0e4, gate_q=2.0):
+    a = np.asarray(acc, np.float32)
+    d = K * np.power(a, m) * np.power(np.asarray(slope, np.float32) + 1e-6, n)
+    if a_crit_m2 > 0.0:
+        aq = np.power(a, gate_q)
+        d = d * (aq / (aq + a_crit_m2 ** gate_q))
     return np.minimum(d, cap_m).astype(np.float32)
 
 
