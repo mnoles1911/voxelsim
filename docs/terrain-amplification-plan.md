@@ -173,6 +173,36 @@ plausible-looking first value was far too small:
 K is the first thing to calibrate in Phase 2 proper, against real DEM drainage density rather than
 by eye, and over-carving is its own failure mode — the sub-threshold depth cap exists for that.
 
+**The prototype's output is still too smooth, and the probe says exactly where.** Detrended H of
+the baked surface, per stage (`report_spectrum`, same S2 definition as `vxc_terrainprobe`):
+
+| band | H, no prefilter | H, with prefilter | verdict |
+|---|---|---|---|
+| 120–240 m | 0.892 | **0.832** | real 30 m data, physical |
+| 60–120 m | 1.172 | **1.027** | |
+| 30–60 m | 1.475 | **1.239** | |
+| 7.5–30 m | ~1.60 | ~1.63 | below source Nyquist — B1 must supply this |
+| 3.8–7.5 m | 1.669 | 1.653 | ditto |
+
+Two separate findings, both of which the plan already specifies and the prototype violated:
+
+1. **The B-spline prefilter is required, and it is measurable.** A B-spline *approximates* its
+   control points, so feeding it raw samples low-passes the source: without the prefilter the
+   carrier is smoother than the raster it came from, right in the band the bake is meant to
+   extend. Adding it (`scipy.ndimage.spline_filter`) improves H throughout 30–240 m. This is the
+   float IIR pass the plan puts in the bake precisely because it cannot live in `voxel-core` — and
+   it is why the tier ships **control points, not samples**.
+2. **B1 must be built to a target SPECTRUM, not a target RMS.** H stays ~1.65 below 30 m at any
+   roughness tried, and quadrupling total roughness (1.5 → 6 m) moved S2(7.5 m) only 1.5×, because
+   nearly all of the fBm's energy sits at coarse scales. H > 1 is "smoother than linear" — the same
+   signature `amplifier.cpp:242` records as worldgen v1's failure. Extrapolating the coarse
+   raster's own H (0.83, measured at 120–240 m) down to 7.5 m gives a target of S2 ≈ 1.06 m against
+   the 0.23 m currently produced.
+
+Consequence for Phase 3: **do not calibrate the client's octaves off this prototype's output.**
+Its H is unphysical, so extrapolating from it would make the client *smoother*, which is
+backwards. `report_spectrum` refuses to emit amplitudes when H > 1.05 for that reason.
+
 **Three prototype bugs, each of which validated a choice in this plan by violating it:**
 
 - *Thermal must conserve mass.* Subtracting the over-repose excess without depositing it stripped

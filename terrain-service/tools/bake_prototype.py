@@ -63,7 +63,23 @@ def _up_axis(a, scale, W):
     return out.reshape(rows, n * scale)
 
 
-def bspline_upsample(a, scale):
+def bspline_upsample(a, scale, prefilter=True):
+    """Cubic B-spline upsample.
+
+    PREFILTER MATTERS AND THE PLAN SAYS SO. A B-spline APPROXIMATES its control
+    points rather than interpolating them, so feeding it raw samples low-passes
+    the source. Measured: without the prefilter the detrended H of the upsampled
+    surface is 0.89 over 120-240 m (i.e. the real 30 m data) but degrades to 1.47
+    by 30-60 m -- the carrier is smoother than the raster it came from, right at
+    the band the bake is supposed to be extending.
+
+    The standard fix is to solve for control points whose spline INTERPOLATES the
+    samples, which is a recursive IIR pass (pole sqrt(3)-2). That is a float
+    operation, which is exactly why the plan puts it in the bake and ships
+    control points rather than samples: illegal in voxel-core, trivial here."""
+    if prefilter:
+        from scipy.ndimage import spline_filter
+        a = spline_filter(a.astype(np.float64), order=3, mode="nearest").astype(np.float32)
     W = _weights(scale)
     b = _up_axis(a, scale, W)
     c = _up_axis(np.ascontiguousarray(b.T), scale, W)
@@ -361,7 +377,68 @@ def run_bake(coarse, iters=48, verbose=True, seed=20260719, noise=None,
     if verbose:
         print(f"  {'TOTAL':<34} {sum(t.values()):7.2f} s  "
               f"({coarse.shape[0]*SCALE}^2 = {(coarse.shape[0]*SCALE)**2/1e6:.1f} Mcell)")
-    return {"fine": fine, "z": z, "acc": acc, "incision": incision, "times": t}
+    return {"fine": fine, "z": z, "acc": acc, "incision": incision,
+            "filled": filled, "eroded": eroded, "times": t}
+
+
+def report_spectrum(z, cell_m, label="baked fine tier", brief=False):
+    """Detrended roughness S2(d) of the baked surface, and the client octave
+    amplitudes that CONTINUE it below the fine tier's Nyquist.
+
+    This is the measurement docs/terrain-amplification-plan.md Phase 3 asks for:
+    'amplitudes set by probe measurement, not taste', placed so S2(d) continues
+    at the fine tier's own exponent through 7.5 m. Same S2 definition as
+    voxel-core/bench/terrainprobe.cpp, so the two are directly comparable.
+    """
+    rows = z[::7]
+    print(f"\n  === {label}: detrended roughness S2(d) ===")
+    if not brief:
+        print(f"  {'lag':>10} {'S2(d)':>12} {'local H':>9}")
+    lags = [1, 2, 4, 8, 16, 32, 64]
+    prev = None
+    pts = []
+    for d in lags:
+        a = rows[:, 2 * d:]
+        b = rows[:, d:-d]
+        c = rows[:, :-2 * d]
+        s2 = float(np.mean(np.abs(a - 2 * b + c)))
+        dm = d * cell_m
+        H = ""
+        if prev is not None and s2 > 0:
+            h = np.log(s2 / prev[1]) / np.log(dm / prev[0])
+            H = f"{h:9.3f}"
+        pts.append((dm, s2))
+        prev = (dm, s2)
+        if not brief:
+            print(f"  {dm:8.1f} m {s2:11.4f} m {H}")
+
+    # Fit H over the well-resolved band (4-64 cells) and extrapolate down.
+    xs = np.log([p[0] for p in pts[2:]])
+    ys = np.log([max(p[1], 1e-9) for p in pts[2:]])
+    H = float(np.polyfit(xs, ys, 1)[0])
+    s2_at = lambda dm: float(np.exp(np.interp(np.log(dm), xs, ys))) if dm >= pts[2][0] \
+        else pts[2][1] * (dm / pts[2][0]) ** H
+    ref_m = 2 * cell_m                       # fine-tier Nyquist-ish reference
+    fine_H = np.log(pts[1][1] / pts[0][1]) / np.log(pts[1][0] / pts[0][0])
+    print(f"  H over 15-240 m: {H:.3f}   H over {pts[0][0]:.1f}-{pts[1][0]:.1f} m: "
+          f"{fine_H:.3f}   S2({ref_m:.2f} m) = {s2_at(ref_m):.4f} m")
+    if brief:
+        return
+    if fine_H > 1.05:
+        print(f"  !! H > 1 at the fine end means SMOOTHER THAN LINEAR -- the same")
+        print(f"     signature amplifier.cpp:242 records for worldgen v1, i.e. the")
+        print(f"     surface has run out of octaves. Real terrain is H 0.6-0.9.")
+        print(f"     Extrapolating client amplitudes from this H would make the")
+        print(f"     client SMOOTHER, which is backwards; fix the bake first.")
+        return
+    print("  client octave amplitudes that CONTINUE this trend "
+          "(voxel-core kDetailOctaves, mm):")
+    for lattice_mm in (3200, 1600, 400, 200):
+        dm = lattice_mm / 1000.0
+        amp = s2_at(ref_m) * (dm / ref_m) ** H
+        print(f"    lattice {lattice_mm:>5} mm  ->  amplitude {amp*1000:7.0f} mm")
+    print("  (v9 ships 1600/500, 400/190, 200/60 mm; the 3200 mm octave is new "
+          "in Phase 3)")
 
 
 # --------------------------------------------------------------------------- main
@@ -383,6 +460,14 @@ def main():
     coarse = decode_vxtl(a.tile)
     r = run_bake(coarse, iters=a.iters, K=a.K, cap=a.cap, rough=a.rough)
     fine, z, acc, incision = r["fine"], r["z"], r["acc"], r["incision"]
+
+    # Per STAGE, because a single end-of-pipeline number cannot say which pass
+    # is responsible for the fine end.
+    for label, arr in (("B1 (carrier+roughness)", fine),
+                       ("B2a filled", r["filled"]),
+                       ("B2e after incision", r["eroded"]),
+                       ("B3 after thermal", z)):
+        report_spectrum(arr, PIXEL_M, label=label, brief=(label != "B3 after thermal"))
 
     resid = z - fine
     print(f"\n  drainage: max accumulation {acc.max()/1e6:.1f} km2, "
