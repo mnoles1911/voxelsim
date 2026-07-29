@@ -3209,11 +3209,11 @@ void AVoxelEarthGameMode::LogDigDownColumn(UVoxelWorldSubsystem& Subsystem, doub
 	for (int32 Step = 1; Step <= 25; ++Step)
 	{
 		const double Z = SurfaceUU - double(Step) * VoxelCoords::ChunkEdgeUU;
-		bool bTracked = false, bComp = false;
+		bool bTracked = false, bComp = false, bSettled = false;
 		int32 Quads = 0;
-		Subsystem.DebugChunkStatusAt(FVector(ColumnXUU, ColumnYUU, Z), bTracked, bComp, Quads);
-		Line += FString::Printf(TEXT("%-.0fm:%s%s%d "), (SurfaceUU - Z) / 100.0, bTracked ? TEXT("T") : TEXT("-"),
-		                        bComp ? TEXT("C") : TEXT("-"), Quads);
+		Subsystem.DebugChunkStatusAt(FVector(ColumnXUU, ColumnYUU, Z), bTracked, bComp, Quads, bSettled);
+		Line += FString::Printf(TEXT("%-.0fm:%s%s%s%d "), (SurfaceUU - Z) / 100.0, bTracked ? TEXT("T") : TEXT("-"),
+		                        bComp ? TEXT("C") : TEXT("-"), bSettled ? TEXT("S") : TEXT("-"), Quads);
 		if (bTracked)
 		{
 			++TrackedCount;
@@ -3246,11 +3246,11 @@ void AVoxelEarthGameMode::LogUndergroundChunkStatus(UVoxelWorldSubsystem& Subsys
 	for (int32 Step = -6; Step <= 6; ++Step)
 	{
 		const double Z = Center.Z + double(Step) * VoxelCoords::ChunkEdgeUU;
-		bool bTracked = false, bComp = false;
+		bool bTracked = false, bComp = false, bSettled = false;
 		int32 Quads = 0;
-		Subsystem.DebugChunkStatusAt(FVector(Center.X, Center.Y, Z), bTracked, bComp, Quads);
-		Line += FString::Printf(TEXT("%+.1fm:%s%s%d "), (Z - SurfaceUU) / 100.0, bTracked ? TEXT("T") : TEXT("-"),
-		                        bComp ? TEXT("C") : TEXT("-"), Quads);
+		Subsystem.DebugChunkStatusAt(FVector(Center.X, Center.Y, Z), bTracked, bComp, Quads, bSettled);
+		Line += FString::Printf(TEXT("%+.1fm:%s%s%s%d "), (Z - SurfaceUU) / 100.0, bTracked ? TEXT("T") : TEXT("-"),
+		                        bComp ? TEXT("C") : TEXT("-"), bSettled ? TEXT("S") : TEXT("-"), Quads);
 	}
 	UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCaveTest [%s] column (depth:tracked/component/quads): %s"), Phase, *Line);
 }

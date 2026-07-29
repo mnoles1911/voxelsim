@@ -266,7 +266,16 @@ public:
 	// interior chunk (it has no visible faces, so it holds no component and no
 	// GPU memory); bOutTracked FALSE is the "there is no world here" case this
 	// task exists to fix. Game thread only; returns false if Impl is null.
-	bool DebugChunkStatusAt(const FVector& WorldPos, bool& bOutTracked, bool& bOutHasComponent, int32& OutQuads) const;
+	//
+	// bOutSettled is FChunkRecord::bMeshSettled: this chunk has finished meshing
+	// and its answer is final. It is the ONLY way to tell "queued, not here yet"
+	// (tracked, no component, NOT settled) from "meshed to nothing, and always
+	// will be" (tracked, no component, SETTLED -- an all-air or fully-buried
+	// chunk, which ApplyChunkMesh deliberately leaves component-less). Callers
+	// that treat every component-less tracked chunk as "not ready" hang forever
+	// on the second case; see UVoxelCharacterMovementComponent::IsTerrainReadyAt.
+	bool DebugChunkStatusAt(const FVector& WorldPos, bool& bOutTracked, bool& bOutHasComponent, int32& OutQuads,
+	                        bool& bOutSettled) const;
 
 	// docs/debug-tooling-plan.md P1 "Perf HUD": a snapshot refreshed at 1Hz
 	// (per-frame collection, see FVoxelWorldImpl::UpdatePerfSnapshot), read by

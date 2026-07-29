@@ -213,6 +213,13 @@ private:
 	double JumpBufferRemainingSeconds = 0.0;
 	bool bJumpKeyHeld = false;
 
+	// Known-floor memory (see the known-floor rule in TickMovement). Set the
+	// first time the character actually rests on a voxel, and CLEARED by
+	// ResetState -- a mode toggle may have flown the pawn kilometres away, and
+	// a remembered floor from before the flight would clamp it in mid-air.
+	bool bHadGroundContact = false;
+	double LastGroundedFeetZ = 0.0;
+
 	bool bWaitingForTerrain = false;
 	bool bGroundedLastTick = false;
 	bool bSwimmingLastTick = false;

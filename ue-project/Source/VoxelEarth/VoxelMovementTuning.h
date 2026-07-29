@@ -132,8 +132,21 @@ namespace VoxelMovementTuning
 
 	// --- Jump ---------------------------------------------------------------
 
-	// v = sqrt(2 * g * 100) UU/s, sized for a ~1.0 m (10 voxel) apex.
-	inline constexpr double JumpSpeedUU = 442.7;
+	// v = sqrt(2 * g * apex). Raised from 442.7 (a 1.0 m apex) to 495.0 (1.25 m)
+	// on 2026-07-29: the 1.0 m jump read as STICKY in play-test -- Matt asked
+	// for 20-30% more height and 25% is the middle of that.
+	//
+	// Note this was reported alongside a separate "jump gets stuck in mid-air"
+	// bug, which was NOT a tuning problem (the gravity veto latching on an
+	// all-air chunk, fixed by the known-floor rule in VoxelCharacterMovement).
+	// Worth keeping distinct: a jump that felt weak and a jump that froze had
+	// one shared symptom -- not going where you expected -- and only one of
+	// them was about this number.
+	//
+	// 1.25 m still clears 12 voxels, so the "taller rises need a jump" rule in
+	// m1-plan's Slope feel row (auto-step absorbs <= 3 voxels) is unchanged in
+	// character; it just makes the gap between step and jump less punishing.
+	inline constexpr double JumpSpeedUU = 495.0;
 
 	// Coyote time: a jump is still allowed this long after walking off an edge.
 	// With 10 cm voxels the world is nothing but edges, so without this the
