@@ -261,6 +261,14 @@ namespace VoxelDebug
 	// UVoxelWaterSubsystem.cpp's MaybeArmSwe for the refusal path.
 	VOXELEARTH_API bool GetWaterSwe();
 
+	// voxel.Water.Rivers -- W3 (plan S3.7 Layer R): arm the coarse river-network
+	// graph + its coupling to the water CA. Default OFF. Gated on NM_Client
+	// only (not NM_Standalone like GetWaterSwe): the river coupler's only
+	// client-visible output is WaterCA fill, which already replicates, so a
+	// server may run it without a desync surface. See MaybeArmRivers in
+	// VoxelWaterSubsystem.cpp.
+	VOXELEARTH_API bool GetWaterRivers();
+
 	// --- voxel.Stream.* (M1/M2 "Perf-run hitches" isolation work, docs/status.md) ---
 	//
 	// Per-frame streaming budgets, previously compile-time constexpr in

@@ -26,6 +26,21 @@ constexpr int64_t kCardNumerator = 128;
 // this discharge- or slope-conditioned.
 constexpr int64_t kFlowVelocityMmPerMilli = 5;
 
+// Planar reach length between two promoted-channel points, in mm, from their
+// world VOXEL coordinates. Generalizes buildFromFlowAccumulation's
+// cardinal/diagonal split (which only ever sees a one-pixel D8 step) to an
+// arbitrary offset using the SAME integer sqrt(2) approximation: for a step
+// that is diagonal in the pixel grid dx == dy and this reduces to exactly
+// major*181/128, and for an axial step it is exact. No floats, and never
+// zero (travelMillis divides by it downstream).
+int64_t channelStepLengthMm(const RiverNode& a, const RiverNode& b) {
+    const int64_t dx = std::abs(b.vx - a.vx) * kVoxelSizeMm;
+    const int64_t dy = std::abs(b.vy - a.vy) * kVoxelSizeMm;
+    const int64_t major = std::max(dx, dy);
+    const int64_t minor = std::min(dx, dy);
+    return std::max<int64_t>(1, major + minor * (kDiagNumerator - kCardNumerator) / kCardNumerator);
+}
+
 } // namespace
 
 void RiverNetwork::buildFromFlowAccumulation(ITileSampler& tiles, uint64_t seed,
@@ -33,9 +48,11 @@ void RiverNetwork::buildFromFlowAccumulation(ITileSampler& tiles, uint64_t seed,
     nodes_.clear();
     segments_.clear();
     outgoingSegmentOfNode_.clear();
+    extraOutgoing_.clear();
     totalStorage_ = 0;
     totalInjected_ = 0;
     totalOutflowToOutlets_ = 0;
+    totalWithdrawn_ = 0;
     seed_ = seed;
 
     const int64_t w = b.px1 - b.px0 + 1;
@@ -173,6 +190,112 @@ void RiverNetwork::setConveyance(uint32_t segId, uint8_t factor0to255) {
     segments_[segId].conveyance = factor0to255;
 }
 
+int32_t RiverNetwork::withdrawToCoupler(uint32_t segId, int32_t amount) {
+    if (segId >= segments_.size() || amount <= 0) return 0;
+    const int32_t take = std::min(amount, segments_[segId].storage);
+    if (take <= 0) return 0;
+    segments_[segId].storage -= take;
+    totalStorage_ -= take;
+    totalWithdrawn_ += take;
+    return take;
+}
+
+int32_t RiverNetwork::refundFromCoupler(uint32_t segId, int32_t amount) {
+    if (segId >= segments_.size() || amount <= 0) return 0;
+    // Clamped by what has actually been withdrawn: a refund is a REVERSAL,
+    // and letting one exceed the withdrawals would make this a second (and
+    // unaudited) injection path straight past totalInjected().
+    const int32_t give = static_cast<int32_t>(std::min<int64_t>(amount, totalWithdrawn_));
+    if (give <= 0) return 0;
+    segments_[segId].storage += give;
+    totalStorage_ += give;
+    totalWithdrawn_ -= give;
+    return give;
+}
+
+uint32_t RiverNetwork::outgoingSegmentCount(uint32_t nodeId) const {
+    if (nodeId >= outgoingSegmentOfNode_.size()) return 0;
+    if (outgoingSegmentOfNode_[nodeId] == kNoSegment) return 0;
+    const auto it = extraOutgoing_.find(nodeId);
+    return 1u + (it == extraOutgoing_.end() ? 0u : static_cast<uint32_t>(it->second.size()));
+}
+
+uint32_t RiverNetwork::promoteChannel(uint32_t headNode, const std::vector<RiverChannelPoint>& course) {
+    // --- VALIDATE EVERYTHING BEFORE MUTATING ANYTHING. A half-applied
+    // promotion is unrecoverable: there is no un-promote diff, and a segment
+    // pointing at a node that should not exist corrupts routing forever.
+    if (headNode >= nodes_.size() || course.empty()) return kNoSegment;
+
+    int32_t prevElev = nodes_[headNode].elevationMm;
+    int64_t prevVx = nodes_[headNode].vx, prevVy = nodes_[headNode].vy;
+    for (size_t i = 0; i < course.size(); ++i) {
+        const RiverChannelPoint& p = course[i];
+        if (p.elevationMm >= prevElev) return kNoSegment; // must strictly descend
+        if (p.vx == prevVx && p.vy == prevVy) return kNoSegment;
+        const bool isLast = (i + 1 == course.size());
+        if (p.existingNode != kNoNode) {
+            if (!isLast) return kNoSegment;            // only the tail may rejoin the network
+            if (p.existingNode >= nodes_.size()) return kNoSegment;
+            if (p.existingNode == headNode) return kNoSegment; // a self-loop is not a channel
+        }
+        // No repeated position anywhere in the course (an O(n^2) scan over a
+        // course that is bounded to a handful of points by the detector).
+        for (size_t j = 0; j < i; ++j)
+            if (course[j].vx == p.vx && course[j].vy == p.vy) return kNoSegment;
+        prevElev = p.elevationMm;
+        prevVx = p.vx;
+        prevVy = p.vy;
+    }
+
+    // A "diversion" whose first step lands on the node the head already
+    // drains into is just the main stem restated -- reject rather than
+    // silently double the stem's conveyance via the even split.
+    const uint32_t headPrimary = outgoingSegmentOfNode_[headNode];
+    if (headPrimary != kNoSegment) {
+        const RiverNode& stemTo = nodes_[segments_[headPrimary].toNode];
+        if (stemTo.vx == course[0].vx && stemTo.vy == course[0].vy) return kNoSegment;
+    }
+
+    // --- APPLY. Nodes first (so every segment below can name a real id).
+    std::vector<uint32_t> nodeIds(course.size(), kNoNode);
+    for (size_t i = 0; i < course.size(); ++i) {
+        if (course[i].existingNode != kNoNode) {
+            nodeIds[i] = course[i].existingNode;
+            continue;
+        }
+        RiverNode n;
+        n.vx = course[i].vx;
+        n.vy = course[i].vy;
+        n.elevationMm = course[i].elevationMm;
+        nodeIds[i] = static_cast<uint32_t>(nodes_.size());
+        nodes_.push_back(n);
+        outgoingSegmentOfNode_.push_back(kNoSegment);
+    }
+
+    const uint32_t firstNewSeg = static_cast<uint32_t>(segments_.size());
+    uint32_t fromNode = headNode;
+    for (size_t i = 0; i < course.size(); ++i) {
+        const uint32_t toNode = nodeIds[i];
+        RiverSegment seg;
+        seg.fromNode = fromNode;
+        seg.toNode = toNode;
+        seg.lengthMm = channelStepLengthMm(nodes_[fromNode], nodes_[toNode]);
+        seg.discharge = 0; // a brand-new channel has routed nothing yet
+        seg.storage = 0;
+        seg.conveyance = 255;
+        seg.travelMillis = std::max<int64_t>(1, seg.lengthMm / kFlowVelocityMmPerMilli);
+
+        const uint32_t segId = static_cast<uint32_t>(segments_.size());
+        if (outgoingSegmentOfNode_[fromNode] == kNoSegment)
+            outgoingSegmentOfNode_[fromNode] = segId;
+        else
+            extraOutgoing_[fromNode].push_back(segId); // THE bifurcation, see header
+        segments_.push_back(seg);
+        fromNode = toNode;
+    }
+    return firstNewSeg;
+}
+
 void RiverNetwork::step(int64_t dtMillis) {
     const size_t n = segments_.size();
     if (n == 0) return;
@@ -193,6 +316,12 @@ void RiverNetwork::step(int64_t dtMillis) {
     // APPLY phase: subtract from source, add to the downstream segment (or
     // the outlet ledger). Internal moves net to zero; only outlet-bound
     // flow changes totalStorage_.
+    // A graph that has never been promoted has no bifurcations, so this is
+    // false for every graph buildFromFlowAccumulation can produce and the
+    // loop below runs the identical arithmetic it did before kRiverNetVersion
+    // 3 -- one bool test, no hash probe, golden unmoved.
+    const bool anyBifurcation = !extraOutgoing_.empty();
+
     int64_t outletDeltaThisTick = 0;
     for (size_t i = 0; i < n; ++i) {
         RiverSegment& s = segments_[i];
@@ -200,11 +329,38 @@ void RiverNetwork::step(int64_t dtMillis) {
         s.storage -= of;
         s.discharge = of;
         const uint32_t downSeg = outgoingSegmentOfNode_[s.toNode];
-        if (downSeg != kNoSegment) {
-            segments_[downSeg].storage += of;
-        } else {
+        if (downSeg == kNoSegment) {
+            // Outlet: no primary means no extras either (promoteChannel fills
+            // the primary slot first), so this is the whole story.
             outletDeltaThisTick += of;
+            continue;
         }
+        if (!anyBifurcation) {
+            segments_[downSeg].storage += of;
+            continue;
+        }
+        const auto it = extraOutgoing_.find(s.toNode);
+        if (it == extraOutgoing_.end()) {
+            segments_[downSeg].storage += of;
+            continue;
+        }
+        // EVEN SPLIT across primary + extras (header comment "Bifurcation").
+        // The remainder is handed out one unit at a time in the fixed order
+        // primary-then-extras, so the shares sum to EXACTLY `of` -- the split
+        // moves water, it never rounds any away.
+        const int32_t targets = 1 + static_cast<int32_t>(it->second.size());
+        const int32_t share = of / targets;
+        int32_t rem = of % targets;
+        const auto take = [&]() {
+            int32_t give = share;
+            if (rem > 0) {
+                ++give;
+                --rem;
+            }
+            return give;
+        };
+        segments_[downSeg].storage += take();
+        for (uint32_t extra : it->second) segments_[extra].storage += take();
     }
     totalOutflowToOutlets_ += outletDeltaThisTick;
     totalStorage_ -= outletDeltaThisTick;
@@ -216,9 +372,14 @@ void RiverNetwork::applyGraphDiff(const RiverDiffRecord& diff) {
             setConveyance(diff.segId, diff.value);
             break;
         case RiverDiffKind::kDivertChannel:
-            // Documented stub -- see rivernet.h header comment "Hydrology
-            // graph-diff": promoting sustained CA flux to a new segment
-            // needs live CA data this graph-only layer doesn't have.
+            // Real since kRiverNetVersion 3. The DECISION (which course) was
+            // made by the detector in rivercouple.h against live CA state;
+            // this replays it verbatim, so a log replayed against a freshly
+            // built graph reproduces the promoted topology exactly. A record
+            // with an empty course is rejected by promoteChannel and is
+            // therefore inert, which is what keeps a default-constructed
+            // kDivertChannel diff a no-op.
+            promoteChannel(diff.headNode, diff.course);
             break;
     }
 }
