@@ -3640,6 +3640,55 @@ int main(int argc, char** argv) {
         std::printf("using SyntheticTileSampler pixelSizeMm=%d\n", synth.pixelSizeMm());
     }
 
+    // --- THE FINE TIER IS A PROPERTY OF THE WORLD, NOT OF ONE TABLE ----------
+    //
+    // This used to be loaded inside the --band-fit block, so `--fine-dir`
+    // rebound only the sampler the CALIBRATION read and left the terrace,
+    // drainage, structure and seam sections measuring the 30 m coarse tier. A
+    // run could therefore print "fine tier" in one table and 30 m numbers in
+    // every other one, which is precisely the mislabelled measurement this tool
+    // exists to prevent -- and it hid the question that matters most, because on
+    // a fine world the amplifier DELETES its two loudest octaves (25.6 m and
+    // 6.4 m; see kFineDetailOctaves) and nothing downstream could see the
+    // consequence.
+    //
+    // So the fine tier now rebinds `tiles` itself, before `amp` is constructed,
+    // and every metric in the run measures the world the client would actually
+    // evaluate. `fine` is declared in this scope so it outlives `amp`, which
+    // holds a reference to it. The coarse sampler stays as the climate source:
+    // a v2 fine tile carries elevation control points and a flow plane, not
+    // climate, so biome and material still come from the 30 m raster.
+    FineTileSampler fine(seed, tiles);
+    bool fineLoaded = false;
+    if (!fineDir.empty()) {
+        int loaded = 0, rejected = 0;
+        if (std::filesystem::exists(fineDir)) {
+            for (auto& e : std::filesystem::directory_iterator(fineDir)) {
+                if (e.path().extension() != ".vxtl") continue;
+                if (fine.loadTileFile(e.path()))
+                    ++loaded;
+                else
+                    ++rejected;
+            }
+        }
+        if (!optBaseline)
+            std::printf("fine tier: dir=%s loaded=%d rejected=%d pixelSizeMm=%d\n",
+                        fineDir.c_str(), loaded, rejected, fine.pixelSizeMm());
+        if (loaded == 0) {
+            // Refuse rather than silently fall back: the whole point of naming a
+            // fine tier is that the answer changes, and a run that quietly
+            // extrapolated from 30 m while its header said "fine tier" is the
+            // failure this tool exists to prevent.
+            std::fprintf(stderr, "no v2 fine tiles loaded from %s; refusing to silently "
+                                 "fall back to the coarse tier\n",
+                         fineDir.c_str());
+            return 1;
+        }
+        tiles = &fine;
+        sourceLabel = "real .vxtl v2 FINE tier";
+        fineLoaded = true;
+    }
+
     Amplifier amp(seed, *tiles);
 
     const int64_t vx0 = x0M * 1000 / kVoxelSizeMm;
@@ -3655,42 +3704,17 @@ int main(int argc, char** argv) {
     // and not the coarse one. When it is absent the run continues on the coarse
     // tier and says so in every table that depends on it.
     if (optBandFit) {
-        FineTileSampler fine(seed, tiles);
-        Amplifier ampFine(seed, fine);
+        // The fine tier is loaded and bound above, for the whole run rather than
+        // for this block, so there is nothing tier-specific left to do here:
+        // `tiles` and `amp` ARE the fine ones when --fine-dir was given. Keeping
+        // the calTiles/calAmp names avoids churning the body below, which reads
+        // them in a dozen places.
         ITileSampler* calTiles = tiles;
         Amplifier* calAmp = &amp;
-        std::string srcName = dir == "--synthetic" ? "synthetic tiles (30 m band)" : "real .vxtl "
-                                                                                    "v1 tiles "
-                                                                                    "(30 m/px "
-                                                                                    "coarse tier)";
-        if (!fineDir.empty()) {
-            int loaded = 0, rejected = 0;
-            if (std::filesystem::exists(fineDir)) {
-                for (auto& e : std::filesystem::directory_iterator(fineDir)) {
-                    if (e.path().extension() != ".vxtl") continue;
-                    if (fine.loadTileFile(e.path()))
-                        ++loaded;
-                    else
-                        ++rejected;
-                }
-            }
-            std::printf("fine tier: dir=%s loaded=%d rejected=%d\n", fineDir.c_str(), loaded,
-                        rejected);
-            if (loaded == 0) {
-                // Refuse rather than silently fall back: the whole point of
-                // naming a fine tier is that the answer changes, and a run that
-                // quietly extrapolated from 30 m while its header said "fine
-                // tier" is exactly the mislabelled measurement this tool exists
-                // to prevent.
-                std::fprintf(stderr, "no v2 fine tiles loaded from %s; refusing to silently "
-                                     "fall back to the coarse tier\n",
-                             fineDir.c_str());
-                return 1;
-            }
-            calTiles = &fine;
-            calAmp = &ampFine;
-            srcName = "real .vxtl v2 FINE tier (1875 mm/px)";
-        }
+        std::string srcName =
+            fineLoaded ? "real .vxtl v2 FINE tier (1875 mm/px)"
+                       : (dir == "--synthetic" ? "synthetic tiles (30 m band)"
+                                               : "real .vxtl v1 tiles (30 m/px coarse tier)");
         // Default the band's low end to the source's own Nyquist-ish floor: one
         // pixel. Stated in metres so it reads the same at either tier.
         const double loM = bandLoM > 0 ? bandLoM
