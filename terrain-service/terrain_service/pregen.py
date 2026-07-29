@@ -5,6 +5,29 @@ Run as: python -m terrain_service.pregen --seed <seed> --radius <r> [--center-x 
 
 Generates the (2*radius+1)^2 square of tiles around the center point. For each
 tile, skips if already cached (by provider_id), else generates+encodes+caches.
+
+TWO MODES
+---------
+``--mode coarse`` (default, unchanged) generates 30 m/px tiles from the
+provider.
+
+``--mode bake`` runs the Phase 2 geomorphic bake
+(``terrain_service.bake.pipeline``) over already-generated coarse tiles and
+writes the scale-16 fine tier (8192x8192 at 1.875 m/px) into the same
+content-addressed namespace. It runs in three ordered passes, and the ORDER IS
+LOAD-BEARING:
+
+  1. coarse: every tile in the requested square PLUS a one-tile ring (the bake
+     needs the 3x3 ring to fill its 960 m apron);
+  2. hydrology: every flow superblock touching the square, top level down, from
+     whatever coarse tiles are cached;
+  3. bake: each target tile, reading its superblock for cross-tile inflow.
+
+Doing hydrology before any bake is what makes a pregenerated world
+order-independent. An on-demand frontier that bakes a tile the moment its ring
+lands would build each superblock from whatever happened to exist at that
+moment, and since a shipped tile is never regenerated, that choice is
+permanent. See ``pipeline.HYDROLOGY_RESIDUALS`` #1.
 """
 
 from __future__ import annotations
@@ -12,11 +35,309 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from . import tile_codec
 from .cache import TileCache
 from .app import _make_provider
+
+
+#: The bake reads coarse tiles from the same namespace it writes the fine tier
+#: into, and the coarse tier is always 30 m/px -- the learned cascade ends
+#: there. Not a flag: a bake against anything else would be a bake against
+#: interpolated data.
+COARSE_SCALE = 1
+
+
+def _coarse_elevation_m(cache: TileCache, provider, seed: int, x: int, y: int,
+                        generate: bool):
+    """Coarse tile (x, y)'s elevation in METRES, or None if unavailable.
+
+    ``.vxtl`` v1 stores int16 whole metres (1 m vertical quantisation, 10x
+    coarser than a voxel) -- the bake widens to float32 and everything below
+    30 m of relief is synthesised from there.
+    """
+    import numpy as np
+
+    data = cache.get(provider.provider_id, seed, x, y, COARSE_SCALE)
+    if data is None:
+        if not generate:
+            return None
+        tile = provider.generate(seed, x, y, COARSE_SCALE)
+        data = tile_codec.encode(tile)
+        cache.put(provider.provider_id, seed, x, y, COARSE_SCALE, data)
+    return tile_codec.decode(data).elevation.astype(np.float32)
+
+
+def _encode_fine(result, seed: int, provider_id: str):
+    """Hand a BakeResult to tile_codec's v2 encoder, whatever it ended up called.
+
+    ``tile_codec.py`` is owned by another workstream and its v2 entry point may
+    not exist yet. Rather than guess a signature and silently write the wrong
+    bytes, this probes for a plausible encoder and passes only the keyword
+    arguments it actually accepts; if there is no v2 encoder it raises with an
+    instruction, and ``--bake-npz-dir`` remains a usable output in the
+    meantime. It never falls back to writing a v1 container -- a fine tier in a
+    v1 wrapper is exactly the "silent disagreement between the two halves"
+    docs/vxtl-v2-format.md opens by forbidding.
+    """
+    import inspect
+
+    enc = None
+    for name in ("encode_fine", "encode_v2", "encode_fine_tile"):
+        enc = getattr(tile_codec, name, None)
+        if enc is not None:
+            break
+    if enc is None:
+        raise NotImplementedError(
+            "tile_codec has no v2 fine-tier encoder yet (looked for "
+            "encode_fine / encode_v2 / encode_fine_tile). The bake itself is "
+            "done -- rerun with --bake-npz-dir to keep the output, and encode "
+            "once docs/vxtl-v2-format.md's encoder lands."
+        )
+    candidates = {
+        "seed": seed,
+        "x": result.tile_x,
+        "y": result.tile_y,
+        "elevation_m": result.elevation_m,
+        "elevation": result.elevation_m,
+        "flow": result.flow,
+        "flow_plane": result.flow,
+        "provider_id": provider_id,
+    }
+    params = inspect.signature(enc).parameters
+    kwargs = {k: v for k, v in candidates.items() if k in params}
+    missing = [
+        n
+        for n, p in params.items()
+        if p.default is inspect.Parameter.empty
+        and p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        and n not in kwargs
+    ]
+    if missing:
+        raise NotImplementedError(
+            f"tile_codec.{enc.__name__} needs arguments this CLI cannot supply "
+            f"({missing}); wire it explicitly rather than letting pregen guess."
+        )
+    return enc(**kwargs)
+
+
+def _run_bake(args, provider, cache: TileCache) -> int:
+    """Bake mode: coarse pass, then hydrology pass, then the tiles.
+
+    Reported in ``time.process_time()``. Wall-clock on this box reads exactly
+    like a slow configuration when another session holds it; CPU-seconds
+    cannot be stolen by a competing process.
+    """
+    import numpy as np
+
+    from .bake import pipeline as bp
+
+    if args.scale != COARSE_SCALE:
+        print(
+            f"note: --mode bake ignores --scale {args.scale}; it reads the "
+            f"s{COARSE_SCALE} tier and writes s{bp.PRODUCTION.scale}",
+            file=sys.stderr,
+        )
+
+    consts = bp.CONSTANTS
+    if args.bake_superblock_tiles is not None:
+        consts = replace(consts, superblock_tiles=args.bake_superblock_tiles)
+    if args.bake_max_level is not None:
+        consts = replace(consts, superblock_max_level=args.bake_max_level)
+    geom = bp.PRODUCTION
+    geom.assert_production()
+
+    if consts is not bp.CONSTANTS:
+        print(
+            "warning: overridden bake constants roll the bake fingerprint but "
+            "NOT provider_id unless the override is also made the default in "
+            "pipeline.py -- these tiles would land in the same namespace as "
+            "default-constant tiles. Use for experiments in a scratch "
+            "--cache-dir only.",
+            file=sys.stderr,
+        )
+
+    try:
+        kernels = bp.load_kernels()
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    targets = [
+        (args.center_x + dx, args.center_y + dy)
+        for dx in range(-args.radius, args.radius + 1)
+        for dy in range(-args.radius, args.radius + 1)
+    ]
+    generate_coarse = not args.bake_no_coarse_generate
+    cpu0 = time.process_time()
+
+    # -- pass 1: coarse tiles, target square plus the one-tile apron ring.
+    ring = {
+        (x + dx, y + dy)
+        for (x, y) in targets
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+    }
+    coarse_cache: dict[tuple[int, int], object] = {}
+
+    def fetch(x: int, y: int, generate: bool = False):
+        key = (x, y)
+        if key not in coarse_cache:
+            coarse_cache[key] = _coarse_elevation_m(
+                cache, provider, args.seed, x, y, generate
+            )
+        return coarse_cache[key]
+
+    have = 0
+    for x, y in sorted(ring):
+        if fetch(x, y, generate=generate_coarse) is not None:
+            have += 1
+    print(
+        f"[coarse] {have}/{len(ring)} ring tiles available "
+        f"(generate={generate_coarse}) cpu={time.process_time() - cpu0:.1f}s",
+        file=sys.stderr,
+    )
+    if have == 0:
+        print("error: no coarse tiles available to bake from", file=sys.stderr)
+        return 1
+
+    # -- pass 2: hydrology, TOP LEVEL FIRST so each level can inject into the
+    # one below. Doing this before any bake is what makes a pregenerated world
+    # order-independent (pipeline.HYDROLOGY_RESIDUALS #1).
+    levels = [
+        bp.FlowLevel(level=lv, geom=geom, consts=consts)
+        for lv in range(consts.superblock_max_level, -1, -1)
+    ]
+    superblocks: dict[tuple[int, int, int], object] = {}
+    for level in levels:
+        needed = {bp.superblock_index(x, y, level) for (x, y) in ring}
+        for sx, sy in sorted(needed):
+            blob = cache.get_flow(provider.provider_id, args.seed, level.level, sx, sy)
+            if blob is not None:
+                sb, _ = bp.decode_flow_superblock(blob)
+            else:
+                parent = None
+                if level.level < consts.superblock_max_level:
+                    up = bp.FlowLevel(
+                        level=level.level + 1, geom=geom, consts=consts
+                    )
+                    # The parent covering this block's own origin tile.
+                    ptx, pty = sx * level.tiles_per_side, sy * level.tiles_per_side
+                    parent = superblocks.get(
+                        (up.level,) + bp.superblock_index(ptx, pty, up)
+                    )
+                sb = bp.build_flow_superblock(
+                    lambda x, y: fetch(x, y, generate=False),
+                    sx,
+                    sy,
+                    level,
+                    kernels,
+                    parent=parent,
+                )
+                cache.put_flow(
+                    provider.provider_id,
+                    args.seed,
+                    level.level,
+                    sx,
+                    sy,
+                    bp.encode_flow_superblock(sb, args.seed),
+                )
+            superblocks[(level.level, sx, sy)] = sb
+        print(
+            f"[flow L{level.level}] {len(needed)} superblock(s) "
+            f"@ {level.cell_m:.0f} m/px, span {level.span_m / 1000:.0f} km  "
+            f"cpu={time.process_time() - cpu0:.1f}s",
+            file=sys.stderr,
+        )
+
+    # -- pass 3: the bakes.
+    level0 = bp.FlowLevel(level=0, geom=geom, consts=consts)
+    baked = skipped = failed = 0
+    npz_dir = Path(args.bake_npz_dir) if args.bake_npz_dir else None
+    if npz_dir:
+        npz_dir.mkdir(parents=True, exist_ok=True)
+
+    for i, (x, y) in enumerate(targets):
+        if cache.get_fine(provider.provider_id, args.seed, x, y) is not None:
+            skipped += 1
+            continue
+        sb = superblocks.get((0,) + bp.superblock_index(x, y, level0))
+        t0 = time.process_time()
+        result = bp.bake_tile(
+            world_seed=args.seed,
+            tile_x=x,
+            tile_y=y,
+            coarse_fetch=lambda cx, cy: fetch(cx, cy, generate=False),
+            kernels=kernels,
+            geom=geom,
+            consts=consts,
+            inflow_source=sb,
+        )
+        cpu = time.process_time() - t0
+        if result.missing_coarse:
+            print(
+                f"  warning: tile ({x},{y}) baked with {len(result.missing_coarse)} "
+                f"of its 9 ring tiles missing; the apron there is sea level and "
+                f"the interior near that edge is NOT the infinite-domain answer",
+                file=sys.stderr,
+            )
+        if result.stats["interior_dead_ends"]:
+            # After an epsilon fill, receiver == -1 means "border cell draining
+            # out of the domain" and nothing else. An interior one is a routing
+            # bug, and a bug baked into a shipped tile is permanent.
+            print(
+                f"error: tile ({x},{y}) has "
+                f"{int(result.stats['interior_dead_ends'])} interior cells with "
+                "no receiver after the depression fill. That is a routing bug, "
+                "not terrain -- refusing to ship it.",
+                file=sys.stderr,
+            )
+            failed += 1
+            continue
+        if result.stats["basin_exceeds_apron"]:
+            print(
+                f"  warning: tile ({x},{y}) contains a flat/basin "
+                f"{result.stats['max_basin_run_m']:.0f} m across, wider than the "
+                f"{bp.PRODUCTION.apron_m:.0f} m apron. Elevations still agree "
+                "across the seam (the effect is sub-ULP, below the 100 mm wire "
+                "LSB) but its ROUTING may not -- see pipeline.APRON_BLIND_SPOT.",
+                file=sys.stderr,
+            )
+        if npz_dir:
+            np.savez(
+                npz_dir / f"{x}_{y}.npz",
+                elevation_m=result.elevation_m,
+                accumulation_m2=result.accumulation_m2,
+                flow=result.flow,
+            )
+        try:
+            encoded = _encode_fine(result, args.seed, provider.provider_id)
+        except NotImplementedError as e:
+            print(f"error: {e}", file=sys.stderr)
+            failed += 1
+            if npz_dir is None:
+                return 1
+            continue
+        cache.put_fine(provider.provider_id, args.seed, x, y, encoded)
+        baked += 1
+        print(
+            f"[{i + 1}/{len(targets)}] baked ({x},{y}) cpu={cpu:.1f}s "
+            f"max_catchment={result.stats['max_accumulation_km2']:.1f}km2 "
+            f"incision_p99={result.stats['incision_p99_m']:.2f}m "
+            f"channels={int(result.stats['channel_cells'])} "
+            f"injected={result.stats['injected_inflow_km2']:.1f}km2 "
+            f"basin={result.stats['basin_cells_frac']*100:.1f}%",
+            file=sys.stderr,
+        )
+
+    print(
+        f"Bake complete: baked={baked} skipped={skipped} unencoded={failed} "
+        f"total={len(targets)} cpu_seconds={time.process_time() - cpu0:.1f}",
+        file=sys.stderr,
+    )
+    return 0 if failed == 0 else 1
 
 
 def main() -> int:
@@ -42,8 +363,65 @@ def main() -> int:
         "--scale",
         type=int,
         default=1,
-        choices=[1, 8],
-        help="Tile scale: 1 (30m/px) or 8 (3.75m/px) (default 1)",
+        help=(
+            "Coarse-mode tile scale. Only 1 (30 m/px) generates real data: "
+            "the learned cascade ends at 30 m and the bilinear scale-8 path "
+            "was deleted (see providers/diffusion.py::_get_native). The "
+            "sub-30 m tier comes from --mode bake, which always writes "
+            "cache.FINE_SCALE (16) regardless of this flag."
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="coarse",
+        choices=["coarse", "bake"],
+        help=(
+            "coarse (default): generate 30 m/px tiles from the provider. "
+            "bake: run the B0-B3 geomorphic bake over cached coarse tiles and "
+            "write the scale-16 fine tier. See this module's docstring for why "
+            "bake mode runs hydrology before any tile is baked."
+        ),
+    )
+    parser.add_argument(
+        "--bake-superblock-tiles",
+        type=int,
+        default=None,
+        help=(
+            "Bake mode: override BakeConstants.superblock_tiles (coarse tiles "
+            "per side of a level-0 flow superblock). Rolls the bake identity, "
+            "hence provider_id, hence the whole world -- for experiments only."
+        ),
+    )
+    parser.add_argument(
+        "--bake-max-level",
+        type=int,
+        default=None,
+        help=(
+            "Bake mode: override BakeConstants.superblock_max_level. Level L "
+            "spans 4^(L+1) tiles; the top level receives no inflow at its own "
+            "edges, so it is where catchment truncation happens."
+        ),
+    )
+    parser.add_argument(
+        "--bake-npz-dir",
+        type=str,
+        default=None,
+        help=(
+            "Bake mode: also dump each baked tier as an .npz here. Useful "
+            "before tile_codec's v2 encoder lands, and for feeding "
+            "tools/bake_seam_check.py. ~270 MB/tile uncompressed."
+        ),
+    )
+    parser.add_argument(
+        "--bake-no-coarse-generate",
+        action="store_true",
+        help=(
+            "Bake mode: never call the provider. Bake only tiles whose full "
+            "3x3 coarse ring is already cached, and build superblocks from "
+            "cached tiles only. What a pod uses when coarse generation is "
+            "another worker's job."
+        ),
     )
     parser.add_argument(
         "--cache-dir",
@@ -169,6 +547,14 @@ def main() -> int:
         print(f"error: seed must fit in u64, got {args.seed}", file=sys.stderr)
         return 1
 
+    if args.scale not in tile_codec.PIXEL_SIZE_MM:
+        print(
+            f"error: --scale must be one of {sorted(tile_codec.PIXEL_SIZE_MM)}, "
+            f"got {args.scale}",
+            file=sys.stderr,
+        )
+        return 1
+
     # Build a pinned DiffusionConfig for the diffusion provider so this CLI
     # can never silently fall back to DiffusionConfig()'s UNPINNED default
     # (docs/pod-bringup-commands.md Block 5's documented gap) -- --scale is
@@ -211,6 +597,9 @@ def main() -> int:
     # wrong namespace (or under an UNPINNED/UNVERIFIEDDATA-marked id) should
     # be obvious from the first line of the log, not discovered later.
     print(f"provider_id: {provider.provider_id}", file=sys.stderr)
+
+    if args.mode == "bake":
+        return _run_bake(args, provider, cache)
 
     # Generate tile coordinates in (2*radius+1)^2 square
     tiles_to_generate = []
