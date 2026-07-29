@@ -36,11 +36,19 @@ struct ClimateSample {
 class ITileSampler {
 public:
     virtual ~ITileSampler() = default;
-    // 30000 at scale 1, 3750 at scale 8 (scale is a SUPERSAMPLE factor on the
-    // pinned 30 m checkpoint: 30 m / 8 = 3.75 m/px). MIRROR: keep identical
-    // with terrain-service tile_codec.PIXEL_SIZE_MM and tilestore.h's
-    // tilePixelSizeMm(). (The old 11250 was 90 m / 8, from the superseded 90 m
-    // model — wrong by 3x here.)
+    // 30000 at scale 1, 3750 at scale 8, 1875 at scale 16 (scale is a
+    // SUPERSAMPLE factor on the pinned 30 m checkpoint: 30 m / 8 = 3.75 m/px,
+    // 30 m / 16 = 1.875 m/px). MIRROR: keep identical with terrain-service
+    // tile_codec.PIXEL_SIZE_MM and tilestore.h's tilePixelSizeMm(). (The old
+    // 11250 was 90 m / 8, from the superseded 90 m model — wrong by 3x here.)
+    //
+    // Scale 16 is the .vxtl v2 baked fine tier (docs/vxtl-v2-format.md): one
+    // 8192x8192 control lattice per coarse tile, same 15.36 km footprint.
+    // WHAT A SCALE-16 SAMPLER RETURNS IS A CONTROL POINT, NOT A SAMPLE — the
+    // plane ships prefiltered cubic B-spline control points, and the carrier
+    // below is what evaluates them. Feeding it samples instead low-passes the
+    // source, which is the exact failure the server-side prefilter exists to
+    // avoid (spec §2).
     virtual int32_t pixelSizeMm() const = 0;
     virtual int32_t elevationMm(int64_t px, int64_t py) = 0;
     virtual ClimateSample climate(int64_t px, int64_t py) = 0;
