@@ -121,6 +121,29 @@ std::vector<BlockCoord> blocksCoveringRect(PixelRect rect, int64_t tileSizePx, u
 // residency checks and prefetch requests should use.
 std::vector<BlockCoord> dilatedBlockCoverage(PixelRect footprint, int64_t tileSizePx, uint32_t blockDimPx);
 
+// --- the FULL read reach of a chunk's generation ---------------------------
+//
+// dilateForCarrierStencil covers the CARRIER's stencil and nothing else, and
+// that is not the whole of what generating one chunk reads. The cavern layer
+// samples the surface out to vxc::kCavernMaxReachMm around the column it is
+// carving, which is why the GPU raster window
+// (ue-project/Source/VoxelEarth/VoxelGpuRegionBuild.h, kRasterCavernMarginMm)
+// grows the dispatch footprint by that much in WORLD MILLIMETRES before it
+// converts to pixels. A residency gate that dilated only by the carrier
+// stencil would therefore let a chunk be admitted whose cavern reads land in
+// the NEXT, non-resident tile -- and vxc::FineTileSampler answers those with
+// elevation 0, i.e. exactly the sea-level fallback the fine tier's whole
+// block-until-ready rule exists to forbid. Undersizing does not fault; it
+// silently produces terrain no other client will reproduce.
+//
+// So this is the one conversion a residency gate should use: world-mm rect
+// (half-open, as the rest of the codebase's world rects are) -> the CLOSED
+// fine-pixel rect a generator over that rect may touch, margin and carrier
+// stencil both applied. `readMarginMm` is the caller's own generation reach
+// (the UE host passes kRasterCavernMarginMm); pass 0 for carrier-only.
+PixelRect fineReadPixelRect(int64_t worldMmX0, int64_t worldMmY0, int64_t worldMmX1, int64_t worldMmY1,
+                            int64_t readMarginMm, int32_t pixelSizeMm = tilePixelSizeMm(kFineTileScale));
+
 // --- tile <-> world mapping -------------------------------------------------
 
 // The coarse tile coordinate containing a world-mm point, given the tile's
@@ -161,6 +184,13 @@ enum class FineTileVerdict {
 struct FineTileValidationResult {
     FineTileVerdict verdict = FineTileVerdict::kCorrupt;
     std::optional<FineTile> tile; // present iff verdict == kOk
+    // Why FineTile::parse refused, meaningful only for kCorrupt. Carried out
+    // because the two reasons a host most needs to tell apart --
+    // kNoDecompressor (this build has no zstd wired up, a DEPLOYMENT bug) and
+    // everything else (bad bytes) -- are already distinguished by FineError
+    // and would otherwise be flattened into one "corrupt" log line, which is
+    // exactly the confusion tilestore.h's FineError comment warns about.
+    FineError error = FineError::kNone;
 };
 
 // Parses `bytes` (moved in; FineTile owns its bytes -- see tilestore.h) and
@@ -175,8 +205,16 @@ struct FineTileValidationResult {
 // anything but kOk MUST discard the bytes and re-fetch -- never use a
 // partially-validated tile, and never retry-loop on the SAME bytes (a
 // truncated/mismatched file will not become correct by re-parsing it).
+//
+// `decompressor` is the injected CODEC_ZSTD reader (tilestore.h), forwarded
+// straight to FineTile::parse and kept for the tile's lifetime. Defaulted to
+// none, which means CODEC_RAW only -- a CODEC_ZSTD tile is then refused whole,
+// with error == FineError::kNoDecompressor, rather than half-loaded. A host
+// that HAS a decompressor (ue-project/.../VoxelTileCodec.h) must pass it here
+// or its zstd tiles are all rejected as corrupt.
 FineTileValidationResult validateAndParseFineTile(std::vector<uint8_t> bytes, uint64_t expectedSeed,
-                                                   int32_t expectedX, int32_t expectedY);
+                                                   int32_t expectedX, int32_t expectedY,
+                                                   const FineDecompressor& decompressor = {});
 
 // --- LRU budget cache ----------------------------------------------------
 

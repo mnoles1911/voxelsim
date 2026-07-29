@@ -101,6 +101,60 @@ VXC_TEST(dilate_negative_footprint) {
     CHECK_EQ(dilated.px1, -3);
 }
 
+// --- fineReadPixelRect ------------------------------------------------------
+//
+// The residency gate's one conversion. Two things it must get right, and both
+// are silent failures rather than faults if it does not: (a) the world rect is
+// HALF-OPEN, so a rect that ends exactly on a pixel boundary must not claim the
+// next pixel; (b) the read margin is applied in WORLD MILLIMETRES before the
+// pixel division, because that is where the cavern layer's reach is defined and
+// dividing first would round it away at this pitch.
+
+VXC_TEST(fine_read_rect_zero_margin_is_dilate_of_the_closed_cell_rect) {
+    constexpr int32_t px = 1875;
+    // [0, 1875) mm is exactly pixel 0 on both axes; the half-open end must not
+    // pull in pixel 1.
+    const PixelRect r = fineReadPixelRect(0, 0, px, px, /*readMarginMm=*/0, px);
+    CHECK_EQ(r.px0, 0 + kCarrierStencilLo);
+    CHECK_EQ(r.px1, 0 + kCarrierStencilHi);
+    CHECK_EQ(r.py0, 0 + kCarrierStencilLo);
+    CHECK_EQ(r.py1, 0 + kCarrierStencilHi);
+}
+
+VXC_TEST(fine_read_rect_spans_two_pixels_when_it_really_does) {
+    constexpr int32_t px = 1875;
+    const PixelRect r = fineReadPixelRect(0, 0, px + 1, px + 1, 0, px);
+    CHECK_EQ(r.px0, 0 + kCarrierStencilLo);
+    CHECK_EQ(r.px1, 1 + kCarrierStencilHi);
+}
+
+VXC_TEST(fine_read_rect_margin_is_applied_in_world_mm) {
+    constexpr int32_t px = 1875;
+    // A 36.4 m margin is 19.4 pixels at this pitch: it must widen the rect by
+    // 19 pixels on the low side (floorDiv(-36494, 1875) == -20, +1 for the
+    // pixel the rect already had) rather than vanish.
+    const PixelRect r = fineReadPixelRect(0, 0, px, px, 36494, px);
+    CHECK_EQ(r.px0, floorDiv(int64_t(-36494), int64_t(px)) + kCarrierStencilLo);
+    CHECK_EQ(r.px1, floorDiv(int64_t(px - 1 + 36494), int64_t(px)) + kCarrierStencilHi);
+    CHECK(r.px0 <= -20 + kCarrierStencilLo);
+    CHECK(r.px1 >= 19 + kCarrierStencilHi);
+}
+
+VXC_TEST(fine_read_rect_negative_world_coordinates_do_not_alias_across_zero) {
+    constexpr int32_t px = 1875;
+    // The pixel containing world mm -1 is pixel -1, not pixel 0. Truncating
+    // division here would fold the whole first negative pixel onto 0 and mirror
+    // terrain across the origin -- the exact aliasing floorDiv exists to avoid.
+    const PixelRect r = fineReadPixelRect(-px, -px, 0, 0, 0, px);
+    CHECK_EQ(r.px0, -1 + kCarrierStencilLo);
+    CHECK_EQ(r.px1, -1 + kCarrierStencilHi);
+}
+
+VXC_TEST(fine_read_rect_rejects_a_nonsense_pitch) {
+    const PixelRect r = fineReadPixelRect(0, 0, 100, 100, 0, 0);
+    CHECK(r.px1 < r.px0); // inverted => covers nothing, rather than dividing by zero
+}
+
 // --- blocksCoveringRect ------------------------------------------------
 
 VXC_TEST(blocks_single_pixel_interior) {

@@ -1035,6 +1035,74 @@ std::unique_ptr<vxc::ITileSampler> MakeTileSampler(uint64 Seed, const FString& T
 	return Grid;
 }
 
+// Phase 2 fine tier (docs/terrain-amplification-plan.md; VoxelFineTileStreamer.h):
+// builds the streamer FVoxelWorldImpl::FineStreamer owns, or nullptr.
+//
+// FineTileDir empty (the default) => nullptr, unconditionally, and the world is
+// built over the coarse sampler exactly as before -- the same "no switch, no
+// change" guarantee MakeTileSampler gives.
+//
+// UNLIKE MakeTileSampler THIS DOES NOT FALL BACK. A bad -VoxelTileDir drops to
+// the synthetic sampler because a synthetic world is a legitimate (if
+// surprising) world. There is no equivalent for the fine tier: a run that asked
+// for a 1.875 m world and silently got a 30 m one has different collision,
+// different edits and different terrain from every other client on that world,
+// which is the desync amplifier.cpp's tier-branch comment forbids. So a
+// non-existent directory is reported LOUDLY and the streamer is built anyway --
+// it will then refuse every footprint, the ring will not stream, and the world
+// will be visibly, diagnosably empty rather than quietly wrong. "Blocks
+// forever" is the correct failure of a block-until-ready system.
+//
+// ClimateSource is the coarse sampler (borrowed, must outlive the streamer):
+// the fine tier's wire format carries elevation and an optional flow byte and
+// no climate at all, so vxc::FineTileSampler delegates climate() -- converting
+// pixel pitch itself -- to whatever is handed here. Passing the synthetic
+// sampler is legal and gives synthetic climate over baked elevation; passing a
+// real coarse grid (i.e. also using -VoxelTileDir) is what a real world does.
+TUniquePtr<FVoxelFineTileStreamer> MakeFineTileStreamer(uint64 Seed, const FString& FineTileDir,
+                                                        const FString& FineProviderId, uint64 FineBudgetBytes,
+                                                        int32 FineRingRadius, vxc::ITileSampler* ClimateSource)
+{
+	if (FineTileDir.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	std::error_code DirEc;
+	if (!std::filesystem::is_directory(std::filesystem::path(*FineTileDir), DirEc) || DirEc)
+	{
+		UE_LOG(LogVoxelEarth, Error,
+		       TEXT("-VoxelFineTileDir=%s does not exist or is not a directory. The fine tier is still ENABLED (there ")
+		       TEXT("is no safe coarse fallback -- see amplifier.cpp's tier branch), so every chunk will block ")
+		       TEXT("forever and the world will be empty. Note this switch names the cache ROOT, the directory that ")
+		       TEXT("CONTAINS <provider_id>/<seed>/s16/, not the s16 leaf that -VoxelTileDir names."),
+		       *FineTileDir);
+	}
+	if (FineProviderId.IsEmpty())
+	{
+		UE_LOG(LogVoxelEarth, Error,
+		       TEXT("-VoxelFineTileDir was given without -VoxelFineTileProviderId. The provider id is part of the ")
+		       TEXT("cache key AND of the on-disk path, so every tile lookup will miss. Pass the same provider_id ")
+		       TEXT("the coarse tile-cache directory is named after."));
+	}
+
+	auto Streamer = MakeUnique<FVoxelFineTileStreamer>(
+		FineTileDir, FineProviderId, Seed,
+		FineBudgetBytes != 0 ? FineBudgetBytes : FVoxelFineTileStreamer::kDefaultBudgetBytes, ClimateSource);
+	if (FineRingRadius >= 0)
+	{
+		Streamer->SetRingRadiusTiles(FineRingRadius);
+	}
+
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("Fine tier ENABLED: root=%s provider=%s seed=%llu pitch=%d mm/px ringRadius=%d budget=%.2f GiB. ")
+	       TEXT("Chunks whose fine footprint is not resident are BLOCKED, never generated from a coarse guess."),
+	       *FineTileDir, *FineProviderId, (unsigned long long)Seed,
+	       vxc::tilePixelSizeMm(vxc::kFineTileScale), Streamer->RingRadiusTiles(),
+	       double(Streamer->BudgetBytes()) / double(1ull << 30));
+	return Streamer;
+}
+
 // Sized dig/place cube anchoring (m1-plan.md "Player experience decisions",
 // "Dig sizes" / "Place" rows): the SizeVoxels^3 cube is centred on Anchor on
 // the two axes tangent to the hit face (FaceAxis), and biased along the face
@@ -2486,13 +2554,30 @@ struct FVoxelWorldImpl
 	// -VoxelFineTileDir on the command line) leaves FineStreamer null and
 	// every fine-tier gate below a no-op, so behavior is byte-identical to
 	// pre-Phase-2 unless the switch is explicitly passed. Same opt-in shape
-	// as TileDir/MakeTileSampler above, deliberately: this is new,
-	// unverified-in-engine glue (see the task report), and the existing
-	// -VoxelTileDir precedent is exactly the risk profile it should match.
+	// as TileDir/MakeTileSampler above, deliberately.
+	//
+	// WHEN IT IS ON, THE WORLD IS BUILT OVER THE FINE SAMPLER, not over the
+	// coarse one. That single substitution is what makes the baked tier
+	// actually render: the amplifier consumes an ITileSampler and treats what
+	// it returns as the carrier's control lattice, so pointing it at
+	// FVoxelFineTileStreamer::WorldSampler() (pixelSizeMm() == 1875) evaluates
+	// docs/vxtl-v2-format.md §8's spline on the baked control points using the
+	// already-shipped v9 carrier, and amplifier.cpp's isFineTier() branch
+	// selects kFineDetailOctaves so the client stops synthesising the 25.6 m /
+	// 6.4 m bands the raster now carries for real.
+	//
+	// The coarse sampler is still constructed and still owned: it is the fine
+	// tier's CLIMATE source (the fine tier carries elevation and flow only),
+	// and it remains what the far-field clipmap samples through
+	// SampleTerrainHeightUU -- a query that is deliberately NOT gated on
+	// residency, because the clipmap draws ground far beyond any resident fine
+	// tile and blocking it would leave a hole rather than a horizon.
 	explicit FVoxelWorldImpl(uint64 Seed, const FString& TileDir, int32 TileScale, const FString& FineTileDir,
-	                         const FString& FineProviderId, uint64 FineBudgetBytes)
+	                         const FString& FineProviderId, uint64 FineBudgetBytes, int32 FineRingRadius)
 		: Tiles(MakeTileSampler(Seed, TileDir, TileScale, bUsingTileGrid, TileCoverageUU))
-		, Voxels(Seed, *Tiles)
+		, FineStreamer(MakeFineTileStreamer(Seed, FineTileDir, FineProviderId, FineBudgetBytes, FineRingRadius,
+		                                    Tiles.get()))
+		, Voxels(Seed, FineStreamer ? FineStreamer->WorldSampler() : *Tiles)
 	{
 		// bUsingTileGrid (declared, and thus constructed via its NSDMI, BEFORE
 		// Tiles below -- member init order follows DECLARATION order, not this
@@ -2506,19 +2591,6 @@ struct FVoxelWorldImpl
 			// bUsingTileGrid being true is exactly MakeTileSampler's own
 			// guarantee that Tiles.get() really does point at a TileGridSampler.
 			GridTiles = static_cast<vxc::TileGridSampler*>(Tiles.get());
-		}
-
-		// Phase 2: construct the fine-tier streamer only when a directory was
-		// actually given. No directory-existence check here (unlike
-		// MakeTileSampler's TileDir): FVoxelFineTileStreamer's own
-		// EnsureTileResident already treats "file not found" as an ordinary,
-		// expected "not resident yet" outcome (a frontier tile the bake
-		// hasn't produced), never an error to fall back from -- see its
-		// class-level doc comment on "block until ready".
-		if (!FineTileDir.IsEmpty())
-		{
-			FineStreamer = MakeUnique<FVoxelFineTileStreamer>(
-				FineTileDir, FineProviderId, Seed, FineBudgetBytes != 0 ? FineBudgetBytes : FVoxelFineTileStreamer::kDefaultBudgetBytes);
 		}
 
 		// "Admit everything at this level" sentinel. Set by loop rather than by a
@@ -2593,19 +2665,37 @@ struct FVoxelWorldImpl
 	// captured by reference/pointer -- that compiles whether the member is
 	// today's plain uint64_t or the incoming std::atomic<uint64_t>.
 	vxc::TileGridSampler* GridTiles = nullptr;
+
+	// Phase 2 fine-tier residency/prefetch/eviction gate AND, when it exists,
+	// the owner of the sampler the world generates through
+	// (VoxelFineTileStreamer.h). Null unless -VoxelFineTileDir was passed, in
+	// which case every fine-tier gate this file adds (RecomputeDesiredSet's
+	// AddCandidate check and the per-call TickResidencyAndEviction) is a no-op
+	// and behavior is unchanged from before this feature existed.
+	//
+	// DECLARED BETWEEN Tiles AND Voxels, AND THAT IS LOAD-BEARING for the same
+	// reason the Tiles/Voxels ordering comment above is: members initialise in
+	// DECLARATION order, Voxels captures a live ITileSampler& chosen from this
+	// pointer, and the streamer borrows Tiles as its climate source. Tiles ->
+	// FineStreamer -> Voxels is the only order in which all three are valid.
+	TUniquePtr<FVoxelFineTileStreamer> FineStreamer;
+
 	vxc::World<VoxelCoords::BrickEdgeVoxels> Voxels;
 
-	// Phase 2 fine-tier residency/prefetch/eviction gate (VoxelFineTileStreamer.h);
-	// null unless -VoxelFineTileDir was passed, in which case every fine-tier
-	// gate this file adds (RecomputeDesiredSet's AddCandidate check, and the
-	// per-call TickResidencyAndEviction below) is a no-op and behavior is
-	// unchanged from before this feature existed. Independent of Tiles/Voxels
-	// above by design -- see VoxelFineTileStreamer.h's "SCOPE NOTE": it does
-	// NOT replace Tiles as the Amplifier's live sampler in this pass.
-	TUniquePtr<FVoxelFineTileStreamer> FineStreamer;
+	// The sampler this run actually generates terrain from -- the fine tier
+	// when it is live, the coarse tier otherwise. Every caller that must agree
+	// with the amplifier (above all VoxelGpuRegionBuild::FillRasterWindow,
+	// which uploads a raster window the GPU worldgen kernel reads INSTEAD of
+	// the sampler) has to go through this rather than through Tiles: the two
+	// have different pixel pitches, and a GPU path filling its window from the
+	// coarse sampler while the CPU path amplifies the fine one is not a small
+	// discrepancy, it is two different worlds.
+	vxc::ITileSampler& ActiveTiles() { return FineStreamer ? FineStreamer->WorldSampler() : *Tiles; }
 
 	// MaybeLogCounters' missing-tile delta tracking (bUsingTileGrid only).
 	uint64 LastMissingTileQueries = 0;
+	// Same delta tracking for the fine tier's gate-leak detector (MaybeLogCounters).
+	uint64 LastFineMissingTileQueries = 0;
 
 	// --- Stage 2 streaming state (docs/m1-plan.md Stage 2 decisions table);
 	// M2 (docs/m2-plan.md "Ring streaming" row) generalizes every key here
@@ -4731,9 +4821,66 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 	// raw pointers into Voxels.generated() and the results queue (see
 	// DispatchJobs) rather than a ref-counted handle, on the assumption that
 	// no job outlives Impl. This is what makes that assumption true.
+	//
+	// 2026-07-29: THIS FUNCTION WAS THE PRIME SUSPECT FOR AN EDITOR THAT NEVER
+	// EXITS AFTER A FLIGHT LEG (harness reports "ok", UnrealEditor-Cmd stays
+	// alive at ~4.5 GB, idle, and the next leg then dies on the one-editor
+	// guard). Three properties made it a hang rather than a wait:
+	//
+	//   1. InFlightTasks IS ONLY PRUNED IN Tick (the RemoveAllSwap above the
+	//      MaybeLogCounters call). Deinitialize runs after the last tick, so
+	//      the array here holds every task launched since that prune --
+	//      hundreds of them, most already finished. Pruning first turns most
+	//      of the loop below into nothing.
+	//   2. Task.Wait() TOOK NO TIMEOUT. The jobs run at
+	//      ETaskPriority::BackgroundNormal; a task already executing on a
+	//      background worker cannot be retracted and run inline by the waiter,
+	//      so if the scheduler's background workers are parked (which engine
+	//      exit paths do) the game thread blocks on an event nothing will ever
+	//      signal. An unbounded wait turns that into a permanently live
+	//      process instead of a diagnosable failure.
+	//   3. IT SAID NOTHING. A wedge here and a wedge in GPU teardown below
+	//      looked identical from the log, which is why this was still a
+	//      hypothesis and not a fact after two legs.
+	//
+	// So: prune, then wait with a deadline, then REPORT. The deadline does not
+	// make abandoning a task safe -- the raw-pointer capture above is still
+	// real -- which is exactly why timing out is logged as an Error and why
+	// UVoxelPerfRunSubsystem arms a hard exit watchdog around the whole
+	// shutdown rather than this function pretending it recovered.
+	const double WaitT0 = FPlatformTime::Seconds();
+	const int32 TasksBeforePrune = InFlightTasks.Num();
+	InFlightTasks.RemoveAllSwap([](const UE::Tasks::TTask<void>& T) { return T.IsCompleted(); }, EAllowShrinking::No);
+	const int32 TasksToWaitFor = InFlightTasks.Num();
+
+	// Generous but finite. A single worker job's p95 is ~1.2 s and they drain
+	// in parallel, so a healthy teardown of a few hundred tasks finishes in
+	// seconds; anything past this is not slow, it is stuck.
+	constexpr double kTaskDrainBudgetSec = 60.0;
+	const double Deadline = WaitT0 + kTaskDrainBudgetSec;
+	int32 TimedOut = 0;
 	for (UE::Tasks::TTask<void>& Task : InFlightTasks)
 	{
-		Task.Wait();
+		const double Remaining = Deadline - FPlatformTime::Seconds();
+		if (Remaining <= 0.0 || !Task.Wait(FTimespan::FromSeconds(Remaining)))
+		{
+			++TimedOut;
+		}
+	}
+	const double WaitMs = (FPlatformTime::Seconds() - WaitT0) * 1000.0;
+	if (TimedOut > 0)
+	{
+		UE_LOG(LogVoxelStream, Error,
+		       TEXT("WaitForInFlightTasks: %d of %d worker task(s) did NOT complete within %.0fs. Impl is about to be ")
+		       TEXT("destroyed while they may still hold raw pointers into it -- this shutdown is unsound, and the ")
+		       TEXT("process is expected to be terminated by the perf-run exit watchdog rather than exit cleanly."),
+		       TimedOut, TasksToWaitFor, kTaskDrainBudgetSec);
+	}
+	else
+	{
+		UE_LOG(LogVoxelStream, Log,
+		       TEXT("WaitForInFlightTasks: drained %d worker task(s) in %.0f ms (%d of %d were already complete)."),
+		       TasksToWaitFor, WaitMs, TasksBeforePrune - TasksToWaitFor, TasksBeforePrune);
 	}
 	InFlightTasks.Empty();
 
@@ -4779,6 +4926,33 @@ void FVoxelWorldImpl::WaitForInFlightTasks()
 			       Outstanding, (long long)GpuResultsAbsorbedAtTeardown);
 		}
 		GpuMeshJobs.Reset();
+	}
+
+	// ...AND THEN LET THE RENDER THREAD ACTUALLY RUN THEM.
+	//
+	// CancelAll + ~FVoxelGpuMeshJobManager destroy every outstanding job's
+	// payload, and FVoxelGpuQuadPayload's destructor does not free its RHI
+	// buffer directly -- it ENQUEUES a render command that does
+	// (ENQUEUE_RENDER_COMMAND(VoxelGpuQuadPayloadRelease)), as every
+	// RHI-owning object must. So a teardown with hundreds of jobs outstanding
+	// leaves hundreds of releases sitting in the render command queue at the
+	// exact moment the world is being destroyed. Anything still queued when
+	// the rendering thread is stopped is never executed, and those buffers --
+	// on a leg with 252 GPU jobs pending, a large share of a multi-GB pool --
+	// are simply leaked for the rest of the process's life. That is the other
+	// half of the "idle at 4.5 GB" symptom.
+	//
+	// Flushing here is the standard remedy and is safe on the game thread:
+	// FlushRenderingCommands handles the not-actually-threaded and
+	// already-suspended cases itself. Guarded on GIsRHIInitialized because a
+	// -nullrhi / commandlet run has no render thread to flush and no RHI
+	// resources to leak.
+	if (GIsRHIInitialized)
+	{
+		const double FlushT0 = FPlatformTime::Seconds();
+		FlushRenderingCommands();
+		UE_LOG(LogVoxelStream, Log, TEXT("WaitForInFlightTasks: flushed rendering commands at teardown in %.0f ms."),
+		       (FPlatformTime::Seconds() - FlushT0) * 1000.0);
 	}
 }
 
@@ -5856,6 +6030,49 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		}
 		LastMissingTileQueries = MissingNow;
 	}
+
+	// --- Phase 2 fine tier: residency, and whether the gate actually held ----
+	//
+	// THE SECOND LINE IS THE IMPORTANT ONE, and it is an Error on purpose.
+	// vxc::FineTileSampler answers a query into a non-resident tile with
+	// elevation 0 -- sea level -- exactly like the coarse grid above. On the
+	// coarse tier that is a documented, deterministic fallback and a Warning is
+	// the right volume. On the fine tier it is NOT a fallback, it is the
+	// failure mode amplifier.cpp's tier-branch comment says turns that branch
+	// into a desync: this client generated collision from flat water where
+	// another client, with the tile, generated a mountain. So a single
+	// missing-tile query means the block-until-ready gate leaked, and this run
+	// produced terrain that is not reproducible. It is reported as loudly as a
+	// log line can be reported, and it is the check the fine tier's whole
+	// safety argument rests on being able to make after the fact.
+	if (FineStreamer)
+	{
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Fine tier (5s window): resident=%llu tile(s) %.2f/%.2f GiB (decoded %.2f GiB) | loaded=%llu ")
+		       TEXT("absentOnDisk=%llu corrupt=%llu identityMismatch=%llu | ringRadius=%d"),
+		       (unsigned long long)FineStreamer->ResidentTileCount(),
+		       double(FineStreamer->ResidentBytes()) / double(1ull << 30),
+		       double(FineStreamer->BudgetBytes()) / double(1ull << 30),
+		       double(FineStreamer->DecodedBytes()) / double(1ull << 30),
+		       (unsigned long long)FineStreamer->TilesLoadedSinceStart(),
+		       (unsigned long long)FineStreamer->MissingFileLoadsSinceStart(),
+		       (unsigned long long)FineStreamer->CorruptTileLoadsSinceStart(),
+		       (unsigned long long)FineStreamer->IdentityMismatchLoadsSinceStart(),
+		       FineStreamer->RingRadiusTiles());
+
+		const uint64 FineMissing = FineStreamer->MissingTileQueriesSinceStart();
+		if (FineMissing > LastFineMissingTileQueries)
+		{
+			UE_LOG(LogVoxelPerf, Error,
+			       TEXT("FINE TIER GATE LEAK: +%llu elevation queries (total %llu) landed in a NON-RESIDENT fine tile ")
+			       TEXT("and were answered with sea level. On the fine tier that is not a fallback, it is a desync -- ")
+			       TEXT("this run's terrain is not reproducible on a client that has the tile. Something generated a ")
+			       TEXT("chunk IsFootprintResident had not cleared (check the read margin in ")
+			       TEXT("FVoxelFineTileStreamer::CoveredTileRange against every path that samples the raster)."),
+			       (unsigned long long)(FineMissing - LastFineMissingTileQueries), (unsigned long long)FineMissing);
+			LastFineMissingTileQueries = FineMissing;
+		}
+	}
 }
 
 // --- underground streaming policy --------------------------------------------
@@ -6763,7 +6980,23 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	{
 		const int64 AnchorMmX = WorldToMm(Anchor.X);
 		const int64 AnchorMmY = WorldToMm(Anchor.Y);
+		const double FineT0 = FPlatformTime::Seconds();
 		FineStreamer->TickResidencyAndEviction(FVoxelFineTileStreamer::CoarseTileForWorldMm(AnchorMmX, AnchorMmY));
+		// A tile load is a synchronous ~200 MB read plus a whole-tile decode
+		// (VoxelFineTileStreamer.h, threading rule 1), so a cold ring shift is a
+		// multi-second GAME THREAD STALL, not a hitch. Reported rather than
+		// hidden because the fix is a background loader, and the day someone
+		// measures frame time on a fine-tier world this is the first thing they
+		// must not mistake for a streaming regression.
+		const double FineMs = (FPlatformTime::Seconds() - FineT0) * 1000.0;
+		if (FineMs > 50.0)
+		{
+			UE_LOG(LogVoxelStream, Log,
+			       TEXT("Fine tier: residency tick stalled the game thread %.0f ms (synchronous tile load/decode). ")
+			       TEXT("Resident %llu tile(s), %.2f GiB."),
+			       FineMs, (unsigned long long)FineStreamer->ResidentTileCount(),
+			       double(FineStreamer->ResidentBytes()) / double(1ull << 30));
+		}
 	}
 
 	// Bounded admission: the cutoff was computed at the end of the PREVIOUS
@@ -8335,7 +8568,13 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// The one place the raster-window arithmetic may live -- see
 	// VoxelGpuRegionBuild's header. Undersizing it does not fault; the kernel
 	// clamps to the window edge and silently produces different terrain.
-	VoxelGpuRegionBuild::FillRasterWindow(Req, *Tiles);
+	// ActiveTiles(), NOT Tiles: with the fine tier live the GPU kernel must read
+	// the same 1.875 m raster the CPU amplifier does. Filling this window from
+	// the coarse sampler while the amplifier ran on the fine one would not be a
+	// seam or a pop -- the two pitches make two entirely different worlds, and
+	// which one a chunk got would depend on whether it happened to take the GPU
+	// fork. See FVoxelWorldImpl::ActiveTiles' comment.
+	VoxelGpuRegionBuild::FillRasterWindow(Req, ActiveTiles());
 
 	// --- Wave D / D1: may this chunk's quads stay on the GPU? ----------------
 	//
@@ -13208,16 +13447,22 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 	// Phase 2 fine-tier streaming (docs/terrain-amplification-plan.md;
 	// VoxelFineTileStreamer.h). Command-line only, no ini fallback, unlike
-	// -VoxelTileDir above: this is new, NOT verified against a running
-	// engine (see the task report that introduced it), so it deliberately
-	// stays opt-in-per-launch rather than becoming a standing project
-	// default the way -VoxelTileDir did once it was trusted.
+	// -VoxelTileDir above: passing it CHANGES THE WORLD -- pixel pitch goes
+	// from 30 m to 1.875 m, which selects a different octave ladder in
+	// amplifier.cpp and produces terrain that is not comparable with a coarse
+	// run's, so it must never become a silent standing default the way
+	// -VoxelTileDir did.
 	//
-	//   -VoxelFineTileDir=<path>   local directory mirroring terrain-service's
-	//                              cache.py layout (<root>/<provider_id>/
-	//                              <seed:016x>/s16/<x>_<y>.vxtl). Empty (the
-	//                              default) => FineStreamer stays null and
-	//                              every fine-tier gate is a no-op.
+	//   -VoxelFineTileDir=<path>   the terrain-service cache ROOT -- the
+	//                              directory that CONTAINS <provider_id>/
+	//                              <seed:016x>/s16/<x>_<y>.vxtl, NOT the s16
+	//                              leaf (-VoxelTileDir names a leaf; this one
+	//                              does not, because the provider/seed
+	//                              segments are part of the LRU cache key and
+	//                              are formatted in exactly one place). Empty
+	//                              (the default) => FineStreamer stays null,
+	//                              the world is built over the coarse sampler
+	//                              and every fine-tier gate is a no-op.
 	//   -VoxelFineTileProviderId=<id>  the content-addressed provider_id this
 	//                              run's fine tiles are stamped with; MUST
 	//                              match the encoder's provider_id or every
@@ -13230,15 +13475,35 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	//   -VoxelFineTileCacheBudgetGB=<N>  LRU cache budget in GiB (plan
 	//                              default 8-16); 0 or unset falls back to
 	//                              FVoxelFineTileStreamer::kDefaultBudgetBytes.
+	//                              Counts decoded lattice as well as file
+	//                              bytes -- ~335 MB for one production tile.
+	//   -VoxelFineTileRingRadius=<N>  prefetch ring radius in TILES (default
+	//                              0 = the tile under the player only). Each
+	//                              extra ring is (2N+1)^2 tiles, and every one
+	//                              of them is loaded and fully decoded
+	//                              SYNCHRONOUSLY on the game thread, so N=1 is
+	//                              nine tiles and ~3 GB. Raise it only with
+	//                              that in mind; correctness does not depend
+	//                              on it (RequestFootprint pulls in whatever a
+	//                              footprint needs regardless).
 	FString FineTileDir;
 	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileDir="), FineTileDir);
+	if (!FineTileDir.IsEmpty() && FPaths::IsRelative(FineTileDir))
+	{
+		// Same rule -VoxelTileDir uses: relative paths resolve against Content/.
+		FineTileDir = FPaths::Combine(FPaths::ProjectContentDir(), FineTileDir);
+		FPaths::CollapseRelativeDirectories(FineTileDir);
+	}
 	FString FineProviderId;
 	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileProviderId="), FineProviderId);
 	double FineBudgetGB = 0.0;
 	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileCacheBudgetGB="), FineBudgetGB);
 	const uint64 FineBudgetBytes = FineBudgetGB > 0.0 ? uint64(FineBudgetGB * 1024.0 * 1024.0 * 1024.0) : 0;
+	int32 FineRingRadius = -1; // <0 => leave the streamer's own default
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileRingRadius="), FineRingRadius);
 
-	Impl = MakeUnique<FVoxelWorldImpl>(Seed, TileDir, TileScale, FineTileDir, FineProviderId, FineBudgetBytes);
+	Impl = MakeUnique<FVoxelWorldImpl>(Seed, TileDir, TileScale, FineTileDir, FineProviderId, FineBudgetBytes,
+	                                   FineRingRadius);
 }
 
 void UVoxelWorldSubsystem::Deinitialize()
@@ -14042,6 +14307,34 @@ double UVoxelWorldSubsystem::GetSurfaceHeightUU(double WorldX, double WorldY) co
 	{
 		return 0.0;
 	}
+	// FINE TIER: THE SAME BLOCK-UNTIL-READY RULE APPLIES HERE, and this is not
+	// a nicety -- it is the difference between a working spawn and one buried
+	// under a kilometre of rock.
+	//
+	// This function is the analytic surface every non-streaming consumer uses:
+	// the pawn spawn height, agent placement, character movement's ground
+	// query, the chunk component's own surface Z. It is queried BEFORE the
+	// streaming ring has ever run, so at spawn nothing is resident yet, and a
+	// non-resident fine tile answers elevation 0. On a tile whose datum is
+	// 1800 m that is not a small error, it is "spawn at sea level inside the
+	// mountain" -- and it is silent.
+	//
+	// Requesting the column here is the streaming layer doing its job at the
+	// one place that cannot wait for a tick. It is the ONLY caller allowed to
+	// trigger a synchronous load outside RecomputeDesiredSet, and it is
+	// restricted to the game thread because RequestFootprint does disk I/O and
+	// takes the sampler's lock exclusively -- a worker calling it would stall
+	// the whole pool behind a 200 MB read. A worker that gets here with nothing
+	// resident gets sea level and MissingTileQueriesSinceStart moves, which
+	// MaybeLogCounters reports as a gate leak; that is the correct outcome
+	// (visible failure) rather than a hidden stall.
+	if (Impl->FineStreamer && IsInGameThread())
+	{
+		const int64 MmX = VoxelCoords::WorldToMm(WorldX);
+		const int64 MmY = VoxelCoords::WorldToMm(WorldY);
+		Impl->FineStreamer->RequestFootprint(MmX, MmY, MmX + 1, MmY + 1);
+	}
+
 	const int64 Vx = (int64)FMath::FloorToDouble(WorldX / VoxelCoords::VoxelSizeUU);
 	const int64 Vy = (int64)FMath::FloorToDouble(WorldY / VoxelCoords::VoxelSizeUU);
 	const vxc::ColumnSample Col = Impl->Voxels.amplifier().column(Vx, Vy);

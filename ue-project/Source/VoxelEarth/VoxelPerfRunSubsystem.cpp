@@ -8,11 +8,94 @@
 #include "GameFramework/PlayerController.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformMisc.h"
+#include "HAL/PlatformProcess.h"
+#include "HAL/RunnableThread.h"
 #include "Misc/CommandLine.h"
 #include "Misc/DateTime.h"
 #include "Misc/FileHelper.h"
+#include "Misc/OutputDeviceRedirector.h"
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
+
+namespace
+{
+// ---------------------------------------------------------------------------
+// THE EXIT WATCHDOG (2026-07-29).
+//
+// FinishRun asks the engine to exit and then has no further say: bFinished
+// makes IsTickable() false from that frame on, so this subsystem cannot even
+// observe whether the exit happened. Twice now it did not -- the harness
+// reported "ok (290s)" and returned, and UnrealEditor-Cmd stayed alive
+// indefinitely at ~4.5 GB, idle, until the NEXT leg died on the one-editor
+// guard and the wedge was attributed to the wrong run.
+//
+// The known-suspect list for that wedge is in
+// FVoxelWorldImpl::WaitForInFlightTasks, and the bounded wait added there
+// addresses the top of it. This is the backstop for the rest, and it exists
+// because of WHERE those wedges live: inside FEngineLoop::Exit. By then the
+// game thread is the thing that is stuck, and neither FTSTicker (only pumped
+// from FEngineLoop::Tick) nor a UObject tick nor an FCoreDelegate can fire.
+// Only a thread that is not the game thread can act, so this is a plain
+// FRunnable that sleeps and then terminates the process.
+//
+// SCOPE, deliberately narrow: armed only when -VoxelPerfRun= asked for a
+// scripted headless run, only once the run has ALREADY written its JSON and
+// requested exit, and it does nothing at all if exit completes first (the
+// process is gone). It is not a general "kill the editor" facility and must
+// never become one -- an interactive editor that hangs should be debugged,
+// not shot.
+//
+// bForce=true is TerminateProcess on Windows. That is the point: it is the
+// only thing that beats a game thread blocked on a task event, and a leg whose
+// results JSON is already on disk has nothing left to lose by dying hard. The
+// log line before it is what tells the next reader this happened -- an exit
+// code from a terminated process is otherwise indistinguishable from a crash.
+// ---------------------------------------------------------------------------
+class FVoxelExitWatchdog final : public FRunnable
+{
+public:
+	explicit FVoxelExitWatchdog(double InTimeoutSec) : TimeoutSec(InTimeoutSec) {}
+
+	uint32 Run() override
+	{
+		const double Deadline = FPlatformTime::Seconds() + TimeoutSec;
+		while (FPlatformTime::Seconds() < Deadline)
+		{
+			FPlatformProcess::Sleep(0.25f);
+		}
+		UE_LOG(LogVoxelPerf, Error,
+		       TEXT("VoxelPerfRun exit watchdog: the process did not exit within %.0fs of RequestExit. Terminating. ")
+		       TEXT("The run's JSON was already written, so its numbers are valid -- but SHUTDOWN IS BROKEN: read the ")
+		       TEXT("last WaitForInFlightTasks line in this log to see whether worker tasks failed to drain."),
+		       TimeoutSec);
+		if (GLog)
+		{
+			GLog->Flush(); // the message above is the whole value of this thread; do not lose it to buffering
+		}
+		FPlatformMisc::RequestExit(/*bForce*/ true);
+		return 0;
+	}
+
+private:
+	double TimeoutSec;
+};
+
+// Deliberately leaked, both of them: the process is either exiting normally
+// (in which case joining a sleeping thread would only slow that down, and is
+// precisely the class of shutdown join this whole mechanism exists to
+// survive) or being terminated by the watchdog itself.
+void ArmExitWatchdog(double TimeoutSec)
+{
+	static bool bArmed = false;
+	if (bArmed || TimeoutSec <= 0.0)
+	{
+		return;
+	}
+	bArmed = true;
+	FVoxelExitWatchdog* Watchdog = new FVoxelExitWatchdog(TimeoutSec);
+	FRunnableThread::Create(Watchdog, TEXT("VoxelPerfExitWatchdog"), 0, TPri_Normal);
+}
+} // namespace
 
 void UVoxelPerfRunSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -671,6 +754,26 @@ void UVoxelPerfRunSubsystem::FinishRun()
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("VoxelPerfRun post-warmup (t>=%.0fs): frames=%d p50=%.2fms p95=%.2fms max=%.2fms hitches=%d"), WarmupExcludeSeconds,
 	       PostWarmupN, PostWarmupP50, PostWarmupP95, PostWarmupMax, PostWarmupHitchCount);
+
+	// Arm the backstop BEFORE asking to exit, so a shutdown that wedges inside
+	// FEngineLoop::Exit is still covered -- see FVoxelExitWatchdog's comment.
+	// -VoxelPerfExitWatchdogSec=<seconds>, 0 disables (for a debugging session
+	// where you WANT the hung process to sit there and be attached to).
+	float WatchdogSec = 120.f;
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfExitWatchdogSec="), WatchdogSec);
+	if (WatchdogSec > 0.f)
+	{
+		UE_LOG(LogVoxelPerf, Log, TEXT("VoxelPerfRun: arming exit watchdog (%.0fs) and requesting exit."), WatchdogSec);
+		ArmExitWatchdog(double(WatchdogSec));
+	}
+
+	// Flush now rather than trusting shutdown to do it: if the exit does wedge,
+	// every line above this point is the evidence, and a wedged process never
+	// closes its log.
+	if (GLog)
+	{
+		GLog->Flush();
+	}
 
 	FPlatformMisc::RequestExit(/*bForce*/ false);
 }
