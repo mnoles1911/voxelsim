@@ -84,6 +84,13 @@ namespace VoxelDebug
 	// for the overlay to call.
 	VOXELEARTH_API bool IsPlayerBoxEnabled();
 
+	// voxel.Water.BucketFill -- how much the `1` key pours (fill units; 255 ==
+	// one full voxel). A console knob rather than a constant because the whole
+	// value of the bucket is trying different volumes on different terrain in
+	// one session: 30,000 is a puddle, 200,000 a bathtub, 1,000,000 a pond, and
+	// which one makes the flow legible depends entirely on the slope you are
+	// standing on.
+	VOXELEARTH_API int32 GetWaterBucketFill();
 	VOXELEARTH_API void SetPlayerBoxEnabled(bool bEnabled);
 
 	// Programmatic setter (ECVF_SetByCode, mirrors SetDebugMode) -- used by

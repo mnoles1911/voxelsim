@@ -54,6 +54,14 @@ TAutoConsoleVariable<bool> CVarVoxelDebugPlayerBox(
 	TEXT("Unlike the other layers this is live at ANY voxel.Debug mode (default on); set 0 for a clean capture."),
 	ECVF_Default);
 
+TAutoConsoleVariable<int32> CVarVoxelWaterBucketFill(
+	TEXT("voxel.Water.BucketFill"),
+	200000,
+	TEXT("How much water the `1` key pours at the player, in fill units (255 == one full voxel). ")
+	TEXT("30000 is a puddle, 200000 a bathtub, 1000000 a small pond. Design aid; the pour goes through the same ")
+	TEXT("SpawnWaterAt path as voxel.SpawnWater, so it is ledgered and conserved like any other injection."),
+	ECVF_Default);
+
 TAutoConsoleVariable<bool> CVarVoxelDebugRings(
 	TEXT("voxel.Debug.Rings"),
 	false,
@@ -939,6 +947,11 @@ bool VoxelDebug::IsBoundsEnabled()
 bool VoxelDebug::IsRingsEnabled()
 {
 	return GetDebugMode() >= 2 && CVarVoxelDebugRings.GetValueOnAnyThread();
+}
+
+int32 VoxelDebug::GetWaterBucketFill()
+{
+	return CVarVoxelWaterBucketFill.GetValueOnGameThread();
 }
 
 bool VoxelDebug::IsPlayerBoxEnabled()

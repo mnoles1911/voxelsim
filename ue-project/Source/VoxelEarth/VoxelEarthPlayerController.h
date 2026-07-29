@@ -90,6 +90,12 @@ private:
 	// wheel cycles 1<->2<->4, number keys 1/2/3 select directly.
 	void CycleDigSizeUp();
 	void CycleDigSizeDown();
+	// `1`: dump a bucket of water at the player's own position (design aid).
+	// Amount is voxel.Water.BucketFill so it can be dialled from the console
+	// mid-session without a rebuild -- the whole point is trying different
+	// volumes on different terrain until the behaviour is legible.
+	void PourWaterBucket();
+
 	void SelectDigSize1();
 	void SelectDigSize2();
 	void SelectDigSize4();
