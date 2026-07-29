@@ -1,4 +1,4 @@
-"""PROTOTYPE of the Phase 2 geomorphic bake, for MEASUREMENT not for shipping.
+﻿"""PROTOTYPE of the Phase 2 geomorphic bake, for MEASUREMENT not for shipping.
 
 docs/terrain-amplification-plan.md open risk #1: the "~1.5 s/tile" bake cost is
 an estimate, and the whole on-demand latency argument rests on it. This runs the
@@ -301,31 +301,34 @@ def thermal_step(z, max_drop, rate):
     return out
 
 
-# --------------------------------------------------------------------------- main
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("tile")
-    ap.add_argument("--iters", type=int, default=48, help="thermal iterations")
-    ap.add_argument("--png", help="write a before/after hillshade here")
-    ap.add_argument("--crop", type=int, default=1024)
-    ap.add_argument("--cx", type=int, default=None)
-    ap.add_argument("--cy", type=int, default=None)
-    a = ap.parse_args()
+# ---------------------------------------------------------------------- the bake
+def run_bake(coarse, iters=48, verbose=True, seed=20260719, noise=None):
+    """B0-B3 over whatever coarse array is handed in, including any apron.
 
+    Takes the coarse array rather than a path so the seam test can bake a
+    PADDED domain (centre tile + apron drawn from its neighbours) and crop the
+    interior, which is the whole apron argument in the plan."""
     t = {}
+
     def tick(name, t0):
         t[name] = time.perf_counter() - t0
-        print(f"  {name:<34} {t[name]:7.2f} s")
-
-    print(f"tile {a.tile}   -> {FINE}x{FINE} @ {PIXEL_M} m/px")
-    coarse = decode_vxtl(a.tile)
+        if verbose:
+            print(f"  {name:<34} {t[name]:7.2f} s")
 
     t0 = time.perf_counter(); fine = bspline_upsample(coarse, SCALE); tick("B0 B-spline upsample", t0)
 
     gy, gx = np.gradient(fine, PIXEL_M)
     slope0 = np.hypot(gx, gy)
     t0 = time.perf_counter()
-    fine = fine + conditioned_fbm(fine.shape, slope0) * 1.5
+    # The fBm here is generated in ARRAY coordinates, so two overlapping domains
+    # would NOT agree in their overlap. Production B1 must hash WORLD
+    # coordinates (the plan says so, and it is what makes the apron argument
+    # work at all). `noise` lets a caller pass a pre-computed field sliced from
+    # a shared parent, which is an exact stand-in for world-anchoring and is how
+    # the seam test isolates apron adequacy from this prototype's own limitation.
+    nz = conditioned_fbm(fine.shape, slope0, seed=seed) if noise is None else noise * np.clip(
+        slope0 / 0.3, 0.25, 2.0).astype(np.float32)
+    fine = fine + nz * 1.5
     tick("B1 conditioned fBm roughness", t0)
 
     t0 = time.perf_counter(); filled = priority_flood(fine); tick("B2a priority-flood fill", t0)
@@ -337,26 +340,44 @@ def main():
     tick("B2d MFD flow accumulation", t0)
 
     t0 = time.perf_counter()
-    # K calibrated so the largest channels on this tile carve metres, not
-    # millimetres: at A = 10 km2 and a 10% slope, A^0.45 * S^0.8 ~ 220, so K of
-    # order 1e-2 gives ~2 m. The first pass used 4e-4 and produced a p99 of
-    # 0.01 m -- a drainage network that existed in the flow field and nowhere in
-    # the terrain.
+    # K calibrated so the largest channels carve metres, not millimetres: at
+    # A = 10 km2 and a 10% slope, A^0.45 * S^0.8 ~ 220, so K of order 1e-2 gives
+    # ~2 m. The first pass used 4e-4 and produced a p99 of 0.01 m -- a drainage
+    # network that existed in the flow field and nowhere in the terrain.
     K, m, n = 1.2e-2, 0.45, 0.8
     incision = K * np.power(acc, m, dtype=np.float32) * np.power(slope + 1e-6, n, dtype=np.float32)
-    incision = np.minimum(incision, 8.0)                    # plan's sub-threshold cap
+    incision = np.minimum(incision, 8.0)
     eroded = filled - incision
     tick("B2e stream-power incision", t0)
 
     t0 = time.perf_counter()
     max_drop = np.float32(np.tan(np.radians(36.0)) * PIXEL_M)
     z = eroded
-    for _ in range(a.iters):
+    for _ in range(iters):
         z = thermal_step(z, max_drop, np.float32(0.35))
-    tick(f"B3 thermal relaxation x{a.iters}", t0)
+    tick(f"B3 thermal relaxation x{iters}", t0)
 
-    total = sum(t.values())
-    print(f"  {'TOTAL':<34} {total:7.2f} s  (one tile, {FINE**2/1e6:.1f} Mcell)")
+    if verbose:
+        print(f"  {'TOTAL':<34} {sum(t.values()):7.2f} s  "
+              f"({coarse.shape[0]*SCALE}^2 = {(coarse.shape[0]*SCALE)**2/1e6:.1f} Mcell)")
+    return {"fine": fine, "z": z, "acc": acc, "incision": incision, "times": t}
+
+
+# --------------------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("tile")
+    ap.add_argument("--iters", type=int, default=48, help="thermal iterations")
+    ap.add_argument("--png", help="write a before/after hillshade here")
+    ap.add_argument("--crop", type=int, default=1024)
+    ap.add_argument("--cx", type=int, default=None)
+    ap.add_argument("--cy", type=int, default=None)
+    a = ap.parse_args()
+
+    print(f"tile {a.tile}   -> {FINE}x{FINE} @ {PIXEL_M} m/px")
+    coarse = decode_vxtl(a.tile)
+    r = run_bake(coarse, iters=a.iters)
+    fine, z, acc, incision = r["fine"], r["z"], r["acc"], r["incision"]
 
     resid = z - fine
     print(f"\n  drainage: max accumulation {acc.max()/1e6:.1f} km2, "

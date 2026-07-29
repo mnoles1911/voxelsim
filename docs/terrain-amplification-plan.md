@@ -193,6 +193,25 @@ and writes only its interior. Every bounded pass has influence radius well under
 (thermal 48 cells, carve stamps ~20), so each interior equals the infinite-domain answer and
 neighbours agree exactly — seamless by construction, no stitching pass.
 
+**MEASURED, and 960 m is right with room to spare.** `terrain-service/tools/bake_seam_test.py`
+bakes one domain spanning two adjacent tiles (the "infinite domain" answer), bakes each tile
+separately on its own domain + apron, and compares. All bakes share one world-anchored noise
+field, so the test isolates apron adequacy rather than this prototype's array-coordinate fBm.
+
+| apron | mean err | **max err** | step across the join, vs the terrain's own gradient |
+|---|---|---|---|
+| 30 m | 0.43 cm | **9.78 m** | **+40.32 cm** |
+| 120 m | 0.36 cm | 6.05 m | −0.06 cm |
+| 480 m | 0.00 cm | 2.93 cm | +0.01 cm |
+| **960 m (this plan)** | **0.00 cm** | **0.01 cm** | **+0.00 cm** |
+
+At the plan's apron the per-tile bakes reproduce the single-domain answer to **0.1 mm**, and the
+one-cell step across the tile boundary is identical to truth (26.50 cm mean, 221.86 cm p99 — that
+is the terrain's own gradient, not a seam). The small-apron rows are the control proving the test
+can see a bad apron at all: at 30 m it finds ~10 m of error and a 40 cm join step. Error collapses
+between 120 m and 480 m, so the influence radius is a few hundred metres and 960 m carries real
+margin.
+
 The one unbounded dependency is flow accumulation. Handle it with a **hydrology pyramid mirroring
 the model's own hierarchy**: accumulate at the coarse-map level (7.7 km/px, where the coarse model
 is tiny and huge areas cost almost nothing), then at 30 m over the local neighbourhood, and inject
