@@ -93,6 +93,11 @@ private:
 	// process exit.
 	void FinishRun();
 
+	// Emits the periodic "Voxel sky (Ns window)" line on the -VoxelPerfLogInterval
+	// cadence. See SkyLogIntervalSec below for why this line lives in the perf
+	// subsystem rather than in UVoxelSkySubsystem::Tick.
+	void MaybeLogSky(float DeltaTime);
+
 	bool bRequested = false; // -VoxelPerfRun was present on the command line
 	bool bFinished = false;
 	float DurationSeconds = 0.f;
@@ -261,6 +266,22 @@ private:
 	// pattern be told apart from a genuine, ongoing steady-state one without
 	// re-running anything.
 	static constexpr float WarmupExcludeSeconds = 10.0f;
+
+	// Cadence for the periodic "Voxel sky (Ns window)" line, read once from
+	// -VoxelPerfLogInterval= in Initialize so it lands in the SAME windows
+	// FVoxelWorldImpl::MaybeLogCounters (VoxelWorldSubsystem.cpp:5005-5024)
+	// puts chunksPerSec= in -- tools/voxel-leg-summary.ps1 reads both out of
+	// one log and a second, unrelated cadence would make "which window" an
+	// extra thing to get wrong.
+	//
+	// WHY THIS LINE IS EMITTED HERE AND NOT FROM UVoxelSkySubsystem::Tick. It
+	// is a perf-harness instrument: its cadence is a perf-harness switch, it
+	// only has a reader while -VoxelPerfRun= is on the command line, and the
+	// sky subsystem has no business knowing about either. Emitting it here also
+	// makes it exactly zero cost in a normal session, since IsTickable() is
+	// false without -VoxelPerfRun=.
+	float SkyLogIntervalSec = 5.f;
+	float SkyLogAccumSec = 0.f;
 
 	TArray<float> FrameMsSamples;
 	int32 HitchCount = 0;

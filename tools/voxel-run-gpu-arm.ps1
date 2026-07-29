@@ -11,6 +11,22 @@
 # The capture is deferred via voxel.DeferExec because -ExecCmds fires at startup
 # and would profile frame 1 of an empty world -- which it reports as a
 # successful capture. That has now cost three separate runs on this project.
+#
+# THE SKY PIN, AND WHY A SPLIT LEG NEEDS IT MORE THAN MOST. This leg compares
+# TWO things taken at different instants of the SAME run -- the post-warmup
+# p50/p95 distribution and a single deferred ProfileGPU frame at -CaptureAt --
+# and the point above already warns against comparing a pass split from one
+# leg against a distribution from another because they can be "different
+# weather". A moving sun is exactly that failure arriving WITHIN one leg: by
+# the time the deferred capture fires, the sun has rotated past wherever it
+# was while the distribution was accumulating, so the two halves of this
+# leg's own output would be describing different lighting.
+#
+# -TimeOfDay/-Date default to 12:00 / 03-20, the engine's own default pose
+# (VoxelSkySubsystem.cpp:254-269), so this stays comparable to every leg taken
+# before the clock existed. -TimeScale defaults to 0, departing from the
+# engine's 1.0, because that is what keeps the distribution and the capture
+# looking at the same sun.
 
 param(
     [Parameter(Mandatory=$true)][string]$LogName,
@@ -22,7 +38,12 @@ param(
     [int]$LingerSec = 10,
     # Seconds from start to the capture. Must land INSIDE the flight: preflight
     # plus roughly half the run.
-    [int]$CaptureAt = 150
+    [int]$CaptureAt = 150,
+    # THE SKY PINS. See the header. Same three defaults as
+    # tools/voxel-run-flight-leg.ps1.
+    [string]$TimeOfDay = '12:00',
+    [string]$Date = '03-20',
+    [double]$TimeScale = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,6 +67,11 @@ $argList = @(
     "`"$Project`"", '-game', '-nosplash', '-unattended', '-sm6', '-dx12',
     "-abslog=`"$LogPath`"", "-ResX=$Width", "-ResY=$Height",
     '-VoxelSpawnAt=-84480,53760',
+    # InvariantCulture on the scale -- see tools/voxel-run-flight-leg.ps1's note
+    # on why a comma-decimal machine silently truncates this otherwise.
+    "-VoxelTimeOfDay=$TimeOfDay",
+    "-VoxelDate=$Date",
+    "-VoxelTimeScale=$($TimeScale.ToString([cultureinfo]::InvariantCulture))",
     "-VoxelPerfRun=$RunSec", '-VoxelPerfFlight=line',
     "-VoxelPerfPreflightSec=$PreflightSec", "-VoxelPerfLingerSec=$LingerSec",
     '-VoxelPerfLogInterval=5',

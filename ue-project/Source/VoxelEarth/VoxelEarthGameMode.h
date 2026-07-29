@@ -4,6 +4,24 @@
 #include "GameFramework/GameModeBase.h"
 #include "VoxelEarthGameMode.generated.h"
 
+// -VoxelSpawnAt=X,Y (meters, world) -> world UU.
+//
+// PROMOTED OUT OF VoxelEarthGameMode.cpp's anonymous namespace, and the reason
+// matters more than the mechanics. This helper was already deliberately shared
+// between the PAWN spawn and the old BeginPlay SKY placement so the two could
+// not drift apart (M2 task "SkyAtmosphere origin fix"); when the light rig moved
+// into UVoxelSkySubsystem (W4, docs/lighting-weather-plan.md) the sky half moved
+// into a different translation unit. Copying the parse over there would have
+// re-created exactly the drift this helper exists to prevent -- and the symptom
+// of that drift is an atmosphere 20,000 km from the player at a far LWC spawn,
+// which reads as a rendering bug rather than as two parsers disagreeing.
+//
+// Returns false (Out* left at 0,0 UU) if the switch is absent OR malformed
+// (malformed also logs a warning); true with parsed meters->UU values otherwise.
+// Definition stays in VoxelEarthGameMode.cpp -- there is still exactly one.
+// Declared at the BOTTOM of this header, after the UCLASS, matching VoxelGI.h's
+// placement of namespace VoxelGI.
+
 // Default game mode (docs/m1-plan.md Stage 2 decisions table item 3): fly
 // pawn + our dig/place controller, spawned above the terrain surface at
 // (0,0) rather than at a level-placed PlayerStart (none exists yet -- see
@@ -337,3 +355,11 @@ private:
 	// streamed down here" from "it is streamed but renders oddly".
 	void LogUndergroundChunkStatus(class UVoxelWorldSubsystem& Subsystem, const FVector& Center, const TCHAR* Phase) const;
 };
+
+// -VoxelSpawnAt=X,Y (meters, world) -> world UU. See the note above the UCLASS
+// for why this is no longer file-local to VoxelEarthGameMode.cpp; the definition
+// still lives there and there is still exactly one.
+namespace VoxelEarthSpawn
+{
+	VOXELEARTH_API bool ParseSpawnColumnUU(double& OutWorldX, double& OutWorldY);
+}

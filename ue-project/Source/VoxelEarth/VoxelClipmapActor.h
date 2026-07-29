@@ -105,6 +105,24 @@ public:
 	// number if ever needed.
 	static constexpr int32 NumLevels = 4;
 
+	// Half-extent of the OUTERMOST level's square grid, in world UU, measured
+	// from the shared camera-snapped origin. The farthest drawn point of this
+	// actor is the grid CORNER, i.e. this times sqrt(2).
+	//
+	// PUBLIC FOR THE SAME REASON NumLevels IS: so that code which has to be
+	// bigger than the clipmap can ask instead of guessing. AVoxelSkyDomeActor is
+	// the first such caller -- M_NightSky depth-tests, so a star dome inside this
+	// radius is occluded by distant terrain (Tools/create_sky_material.py, "DEPTH
+	// TEST STAYS ON") -- and a hard-coded number there would silently stop being
+	// true the first time -VoxelRingOuterMeters moved.
+	//
+	// NOT constexpr, and that is the whole point: this scales with the ring
+	// cascade's runtime outer radius (see SpacingUUForLevel), so it changes with
+	// -VoxelRingOuterMeters and -VoxelMaxRingLevel. At the shipped defaults
+	// (cascade edge 4096 m) it is 6,553,600 UU = 65.5 km, NOT the "~16.4 km" this
+	// header's class comment still quotes from when the cascade ended at 1 km.
+	static double OuterHalfExtentUU();
+
 private:
 	// 65x65 vertices per level (m2-plan.md binding decision), i.e. 64x64
 	// quads -- fixed for every level; only spacing/origin/heights differ.
@@ -202,10 +220,17 @@ private:
 	// only on a transition.
 	void SetCaveRigActive(bool bActive);
 
-	// Unbound (whole-world) post-process whose ONLY overrides are the two
-	// auto-exposure brightness clamps. Setting min == max pins eye adaptation
-	// to a fixed EV100 instead of letting the histogram hunt for 18% grey in a
-	// scene that has no 18% grey in it. See the .cpp for the measurement.
+	// Unbound (whole-world) post-process whose ONLY overrides are the
+	// auto-exposure method and bias, pinning eye adaptation to a fixed stop
+	// instead of letting the histogram hunt for 18% grey in a scene that has no
+	// 18% grey in it. See the .cpp for the measurement.
+	//
+	// IT IS NOT THE ONLY UNBOUND EXPOSURE VOLUME ANY MORE. UVoxelSkySubsystem
+	// owns a second one (the day/night EV curve) and two unbound volumes fight
+	// silently -- highest Priority takes every field both override. The
+	// ownership rule between them is written out in full beside
+	// `CaveExposurePP->Priority = 100.f` in the .cpp, and again in
+	// VoxelSkySubsystem.cpp. Read one of them before touching either volume.
 	UPROPERTY(Transient)
 	TObjectPtr<class UPostProcessComponent> CaveExposurePP;
 

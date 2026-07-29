@@ -48,6 +48,26 @@
 # reading 0.00ms -- i.e. "the apply path costs nothing", the exact opposite of
 # the truth, in a log that otherwise looked healthy. Embed the quotes:
 #   '-ExecCmds="cvar 1, cvar2 1"'
+#
+# ============================================================================
+# THE SKY PINS, AND WHY A COLD-FILL DRIVER NEEDS THEM TOO
+# ============================================================================
+#
+# A day/night clock now exists (UVoxelSkySubsystem) and defaults to
+# TimeScale 1, i.e. moving. This driver's whole job is turning a resident-quad
+# curve into a single "time to settle" number (see the settle rule above), and
+# a sun that rotates mid-fill adds shifting shadow-cascade rebuild work on top
+# of the fill itself -- the same "quoting the input" trap the lull-vs-finish
+# bug above is about, just arriving from the render side instead of the
+# streaming side. Two legs of the SAME config could then disagree not because
+# of noise but because one of them happened to have the sun cross a cascade
+# boundary mid-fill and the other didn't.
+#
+# So -TimeOfDay/-Date/-TimeScale default to a FROZEN 12:00 on 03-20 -- the
+# engine's own default pose (VoxelSkySubsystem.cpp:254-269) -- so every
+# historical cold-fill baseline stays comparable, and TimeScale 0 departs from
+# the engine default (1.0) because that is what makes "time to settle" measure
+# only the fill.
 
 param(
     [Parameter(Mandatory=$true)][string]$LogPath,
@@ -59,7 +79,12 @@ param(
     [int]$StableSamples = 3,
     [int]$PollSec = 3,
     [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe',
-    [switch]$ClearEditLog
+    [switch]$ClearEditLog,
+    # THE SKY PINS. See "THE SKY PINS, AND WHY A COLD-FILL DRIVER NEEDS THEM
+    # TOO" above. Same three defaults as tools/voxel-run-flight-leg.ps1.
+    [string]$TimeOfDay = '12:00',
+    [string]$Date = '03-20',
+    [double]$TimeScale = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -86,7 +111,16 @@ if ($ClearEditLog) {
     }
 }
 
-$argList = @("`"$Project`"", '-game', '-nosplash', '-unattended', '-sm6', "-abslog=`"$LogPath`"") + $ExtraArgs
+$argList = @(
+    "`"$Project`"", '-game', '-nosplash', '-unattended', '-sm6', "-abslog=`"$LogPath`"",
+    # InvariantCulture: PowerShell interpolates a [double] with the CURRENT
+    # culture, so on a comma-decimal machine "-VoxelTimeScale=0,5" reaches
+    # FParse::Value, which stops at the comma, and the fill silently runs
+    # frozen while the script says 0.5.
+    "-VoxelTimeOfDay=$TimeOfDay",
+    "-VoxelDate=$Date",
+    "-VoxelTimeScale=$($TimeScale.ToString([cultureinfo]::InvariantCulture))"
+) + $ExtraArgs
 $p = Start-Process -FilePath $Editor -PassThru -WindowStyle Hidden -ArgumentList $argList
 
 $deadline = (Get-Date).AddSeconds($BudgetSec)
