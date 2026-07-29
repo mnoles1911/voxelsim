@@ -602,10 +602,16 @@ int32 LogBedAudit(const TCHAR* Phase, FRunRef Run)
 		return -1;
 	}
 	const double MeanAbs = A.Mismatched > 0 ? double(A.SumAbsDeltaVoxels) / double(A.Mismatched) : 0.0;
+	// worstStoredBedVz / worstReseatedBedVz are voxel Z COORDINATES of the one
+	// worst column, not counts. The old label for the second one was `reseated=`,
+	// which read as "5,383 columns were re-seated" in the 2026-07-29 run and sent
+	// a whole investigation after a re-seating pass that did not exist at the
+	// time: AuditSweBedSeating is const, and until ReseatEditedSweBeds landed
+	// SweGrid::setBed had exactly one caller in the whole engine (MaybeArmSwe).
 	UE_LOG(LogVoxelEarth, Log,
 	       TEXT("SweBreachBeds phase=%s columns=%d seated=%d sweOwned=%d mismatched=%d sweOwnedMismatched=%d ")
-	       TEXT("maxAbsDelta=%d meanAbsDelta=%.2f voxels mismatchedVsBareTerrain=%d worst=(%lld,%lld) stored=%d ")
-	       TEXT("reseated=%d"),
+	       TEXT("maxAbsDelta=%d meanAbsDelta=%.2f voxels mismatchedVsBareTerrain=%d worst=(%lld,%lld) ")
+	       TEXT("worstStoredBedVz=%d worstReseatedBedVz=%d"),
 	       Phase, A.Columns, A.Seated, A.SweOwned, A.Mismatched, A.SweOwnedMismatched, A.MaxAbsDeltaVoxels, MeanAbs,
 	       A.MismatchedVsTerrain, (long long)A.WorstVx, (long long)A.WorstVy, A.WorstStoredBed, A.WorstReseatedBed);
 
@@ -619,9 +625,13 @@ int32 LogBedAudit(const TCHAR* Phase, FRunRef Run)
 		       TEXT("terrain by up to %d voxel(s). If phase=pre-breach, THIS IS THE ANSWER TO THE WHOLE QUESTION -- the ")
 		       TEXT("sheet is resting at the wrong height and the 'thin film' is a bed-seating defect, NOT shallow-water ")
 		       TEXT("physics. Do not tune damping/absorption until this is zero. If phase=post-breach, compare the count ")
-		       TEXT("against the %d voxel(s) the breach carve removed: mismatches confined to the carve footprint are ")
-		       TEXT("CORRECT (swe.h S5(a) deliberately does not re-seat a bed downward to follow a hole -- a punctured ")
-		       TEXT("column becomes a metered source into the CA instead, and demotes on its own)."),
+		       TEXT("against the %d voxel(s) the breach carve removed. A mismatch inside the carve footprint is ")
+		       TEXT("TRANSIENT and must clear: swe.h S5(a) does not re-seat a bed to follow a hole (a punctured column ")
+		       TEXT("is a metered source into the CA and demotes on its own), and ReseatEditedSweBeds then re-seats it ")
+		       TEXT("once it is CA-owned. A mismatch that PERSISTS to this line is the 2026-07-29 bug back: a column ")
+		       TEXT("resting on air fails eligible()'s first test forever, so it can never promote, never be punctured ")
+		       TEXT("again, and stays an inactive hard wall exactly where the ground was removed. Check bedsReseated= ")
+		       TEXT("on the SweBreachTick lines: a carve inside the sheet that moved it is a carve the sheet saw."),
 		       Phase, A.SweOwnedMismatched, A.MaxAbsDeltaVoxels, Run->BreachVoxelsRemoved);
 	}
 	else
@@ -645,13 +655,22 @@ void LogGlobalLine(const TCHAR* Tag, FRunRef Run, int32 SampleIdx, double Elapse
 	FVoxelSweProbe S;
 	Water->GetSweProbe(S); // CaVolume is filled in either way; the rest only when armed
 	const int64 Sum = S.SheetVolume + S.CaVolume;
+	// bedsReseated/pendingReseats are on this line because `punctured` alone
+	// cannot tell "the carve did nothing" from "the carve was never noticed".
+	// punctured is a PER-TICK count that only ever fires for a column the sheet
+	// OWNED at the instant of the carve, and only for demoteDwellTicks after it;
+	// a notch cut through a rim hits columns that are mostly not owned, so
+	// punctured=0 is the expected reading for a breach that the sheet HAS seen.
+	// bedsReseated is the reading that says it saw it.
 	UE_LOG(LogVoxelEarth, Log,
 	       TEXT("%s n=%d t=%+.1fs armed=%d sheet=%lld ca=%lld sum=%lld poured=%lld sumMinusPoured=%+lld ")
-	       TEXT("injected=%lld sumMinusInjected=%+lld consFail=%lld sweCols=%d punctured=%d toCA=%lld toSWE=%lld"),
+	       TEXT("injected=%lld sumMinusInjected=%+lld consFail=%lld sweCols=%d punctured=%d toCA=%lld toSWE=%lld ")
+	       TEXT("bedsReseated=%lld pendingReseats=%d"),
 	       Tag, SampleIdx, ElapsedSeconds, S.bArmed ? 1 : 0, (long long)S.SheetVolume, (long long)S.CaVolume,
 	       (long long)Sum, (long long)Run->ActuallyPouredUnits, (long long)(Sum - Run->ActuallyPouredUnits),
 	       (long long)S.Injected, (long long)(S.bArmed ? Sum - S.Injected : 0), (long long)S.ConservationFailures,
-	       S.SweColumns, S.LastPunctured, (long long)S.TransferredToCA, (long long)S.TransferredToSWE);
+	       S.SweColumns, S.LastPunctured, (long long)S.TransferredToCA, (long long)S.TransferredToSWE,
+	       (long long)S.BedsReseated, S.PendingBedReseats);
 }
 
 // ===========================================================================
@@ -1487,8 +1506,14 @@ void StageFinalReport(FRunRef Run)
 		       TEXT("VoxelSweBreachTest VERDICT: the sheet was ARMED but NOTHING happened on the SWE side -- no directed ")
 		       TEXT("velocity anywhere in the basin and not one fill unit crossed to the CA. That is not 'SWE spreads ")
 		       TEXT("too much'; it is the coupling failing to engage at all, and it invalidates the whole comparison. ")
-		       TEXT("Check sweOwned= on the basin probes and the puncture count in the SweBreachTick lines before ")
-		       TEXT("considering any tuning."));
+		       TEXT("Read bedsReseated= on the SweBreachTick lines FIRST -- it splits this into two very different ")
+		       TEXT("failures. bedsReseated=0 with a carve inside the sheet means the sheet never noticed the carve, ")
+		       TEXT("which is the 2026-07-29 bug (columns left resting on air are frozen out of the sheet forever); ")
+		       TEXT("that is a wiring failure and nothing downstream of it means anything. bedsReseated>0 with no ")
+		       TEXT("drawdown means the sheet DID re-form around the notch and still could not spill through it, ")
+		       TEXT("which is the open swe.h S5 gap: there is no SWE->CA channel at a LATERAL boundary, so an ")
+		       TEXT("SWE-owned pool cannot pour into a CA-owned notch however much lower its bed is. See ")
+		       TEXT("docs/adr/0007. Do not tune anything in either case."));
 	}
 	else
 	{

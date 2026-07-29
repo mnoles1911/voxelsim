@@ -42,13 +42,14 @@
 //      this file), so a C1 carrier would reproduce this same artifact one
 //      derivative down.
 //   3. The approximation deficit is fixable where it is cheap. A B-spline does
-//      not interpolate its control points, it approximates them. That is
-//      corrected by prefiltering the control lattice, which is a float IIR pass
-//      -- illegal here, trivial in the tile bake. Until the baked fine tier
-//      ships (docs/terrain-amplification-plan.md Phase 2) the raw samples are
-//      used as control points directly and the carrier is very slightly
-//      smoother than the raster; at 30 m posts that is far below the detail
-//      band and vxc_terrainprobe's carrier-only mode is how it stays honest.
+//      not interpolate its control points, it approximates them.
+//      *** THAT PARAGRAPH USED TO END "at 30 m posts that is far below the
+//      detail band". IT WAS WRONG, AND MEASURED WRONG AT v13. *** See THE
+//      PREFILTER below: on a 30 m world the deficit is 0.8 m of real diffusion
+//      output at a node, which is larger than every microrelief octave put
+//      together. The fine tier ships prefiltered control points
+//      (docs/vxtl-v2-format.md 2) and never had the problem; the COARSE tier
+//      had no such step until v13, and now does it on the client.
 //
 // FIXED POINT. The cell fraction is q10 (the fadeFractionMm convention from
 // hash.h). Weights are exact integer numerators over 6*1024^3; the quadratic
@@ -164,6 +165,274 @@ static_assert(carrierCurveWeightsPartition(),
               "the linear second-derivative basis must be non-negative and sum exactly to "
               "kCarrierCurveDen; both the curvature bound and the exact-zero-on-a-plane "
               "property depend on it");
+
+// ---------------------------------------------------------------------------
+// THE PREFILTER (kWorldGenVersion 13) — the coarse tier's missing step.
+//
+// WHAT WAS BROKEN. A uniform cubic B-spline APPROXIMATES its control points; at
+// a knot it evaluates (c[-1] + 4c[0] + c[1]) / 6, not c[0]. Feeding raster
+// SAMPLES straight in as control points therefore produces a surface that is
+// systematically LOW-PASSED relative to the samples: exactly
+//
+//     carrier(node) - sample(node) = (Laplacian of the samples) / 6
+//
+// which is not a rounding error, it is a whole band. MEASURED at v12 with
+// vxc_stagedump on the pinned 060b0c927ccc807e world, S0 raw tile against S2
+// carrier at the 30 m nodes: mean |S0 - S2| = 815 mm on plains (-55,20) and
+// 3222 mm on alpine (-5,15). That is real diffusion-model output thrown away
+// before any of our own amplification runs, and it is larger than the entire
+// microrelief band the client then synthesises to replace it.
+//
+// The fine tier never had this defect: `.vxtl` v2 ships PREFILTERED control
+// points (docs/vxtl-v2-format.md 2, and tiles.h's ITileSampler comment says so
+// in as many words). Only the 30 m s1 raster is samples. So the prefilter here
+// is gated on the tier, and `carrierPrefiltersSamples` is that gate.
+//
+// WHY A TRUNCATED EXPONENTIAL AND NOT A NEUMANN SERIES. The exact inverse of
+// the sampling operator B = [1,4,1]/6 is the two-sided exponential
+// h[m] = sqrt(3) * r^|m| with r = -2 + sqrt(3) = -0.2679..., which is the
+// standard Unser prefilter written as an FIR instead of as an IIR pass (an IIR
+// needs the whole row, which a per-column client evaluator does not have).
+// Truncating it at radius R and RENORMALISING so the weights sum exactly to the
+// denominator keeps DC exact — a constant elevation field must map to itself,
+// and an un-renormalised truncation gets that wrong by 5% at R=2, which would
+// move sea level.
+//
+// The obvious alternative, a Neumann series I + (I-B) + (I-B)^2 + ..., is far
+// worse per tap: its residual is e^(K+1) with e = (1-cos w)/3 reaching 2/3, so
+// a 7-tap Neumann still leaves 20% of the deficit at Nyquist where a 7-tap
+// exponential leaves 2.8%. Swept over the whole band (see the table below),
+// max |1 - B*H|:
+//
+//     R = 1   43.8%      R = 4    0.74%
+//     R = 2    9.5%      R = 5    0.20%
+//     R = 3    2.8%      R = 6    0.054%
+//
+// R = 4 is shipped: it recovers 99.3% of the deficit for 12x12 raster reads per
+// cell against the un-prefiltered 4x4, and the reads are memoised per cell on
+// the CPU and are 144 buffer loads per column on the GPU. R = 5 buys 0.5% for
+// another 44 reads and is not worth it; R = 3 gives back 2.8% of 3.2 m on
+// alpine (90 mm), which is a voxel, and is.
+//
+// FIXED POINT. Weights are round(2^20 * r^m), so they are exact integers and
+// the denominator is their exact sum — DC is exact BY CONSTRUCTION rather than
+// by an error bound. Every division truncates toward zero (plain C++ `/`), and
+// the numerators are routinely NEGATIVE (the odd taps are negative), so the
+// HLSL mirror MUST use truncDiv here and not a bare `/`.
+// ---------------------------------------------------------------------------
+
+inline constexpr int64_t kCarrierPrefilterRadius = 4;
+// round(2^20 * (-2+sqrt(3))^m) for m = 0..4. Generated, not typed: the sweep in
+// carrierPrefilterIsUnitDc below re-checks the only property the bound needs.
+inline constexpr int64_t kCarrierPrefilterW[kCarrierPrefilterRadius + 1] = {
+    1048576, -280965, 75284, -20172, 5405,
+};
+inline constexpr int64_t carrierPrefilterDen() {
+    int64_t d = kCarrierPrefilterW[0];
+    for (int64_t m = 1; m <= kCarrierPrefilterRadius; ++m) d += 2 * kCarrierPrefilterW[m];
+    return d;
+}
+inline constexpr int64_t kCarrierPrefilterDen = carrierPrefilterDen();
+static_assert(kCarrierPrefilterDen == 607680,
+              "the prefilter denominator is the exact sum of the weights; if it moved, the "
+              "weight table moved, and a worldgen change is a kWorldGenVersion bump");
+static_assert(kCarrierPrefilterDen > 0, "the prefilter denominator divides and must be positive");
+
+// The raster span, in pixels either side of the cell's own px, that the
+// prefiltered 4x4 control stencil reads. The stencil is px-1..px+2 and each
+// control point convolves +/- R raw samples around itself.
+inline constexpr int64_t kCarrierPrefilterLo = -1 - kCarrierPrefilterRadius;
+inline constexpr int64_t kCarrierPrefilterHi = 2 + kCarrierPrefilterRadius;
+inline constexpr int64_t kCarrierPrefilterSpan = kCarrierPrefilterHi - kCarrierPrefilterLo + 1;
+static_assert(kCarrierPrefilterSpan == 12, "the raw block is (4 + 2R)^2 = 12x12 at R = 4");
+
+// A tier at or below this pitch ships PREFILTERED CONTROL POINTS on the wire and
+// must not be prefiltered again. Same threshold, and the same reasoning, as
+// amplifier.cpp's isFineTier: it is written against the BAND the raster
+// resolves rather than against one blessed scale. Kept here rather than
+// imported from amplifier.cpp because the carrier is what consumes it and
+// stagedump/terrainprobe need the identical answer.
+inline constexpr int64_t kCarrierSampleTierMinPixelMm = 3751;
+constexpr bool carrierPrefiltersSamples(int64_t pxMm) {
+    return pxMm >= kCarrierSampleTierMinPixelMm;
+}
+static_assert(!carrierPrefiltersSamples(1875) && !carrierPrefiltersSamples(3750),
+              "the baked fine tiers already carry control points");
+static_assert(carrierPrefiltersSamples(30000), "the 30 m s1 raster carries SAMPLES");
+
+// Build the 4x4 control stencil from the (4+2R)^2 raw sample block.
+//
+// `raw` is row-major with j (y) outer and i (x) inner, kCarrierPrefilterSpan on
+// each axis; raw[a + span*b] is the sample at pixel
+// (px + kCarrierPrefilterLo + a, py + kCarrierPrefilterLo + b). `cp` comes out
+// in exactly the layout evalCarrier and evalCarrierCurvature already take.
+//
+// SEPARABLE, TWO STAGE, for the same reason the evaluator is: the exact 2-D
+// tensor form would carry kCarrierPrefilterDen^2 = 3.7e11 on a 9e6 mm control
+// point, and the intermediate divide keeps every product inside int64 with room
+// to spare (worst stage-1 numerator 9e6 * sum|w| = 1.6e13, worst stage-2
+// 2.8e7 * sum|w| = 5.1e13, against int64's 9.2e18).
+//
+// THE OUTPUT IS CLAMPED to the same elevation range coupling (4c) in
+// amplifier.cpp already assumes of a control point. The prefilter is a
+// SHARPENING filter with a gain of up to 2.98 per axis, so an adversarial
+// Nyquist checkerboard at the full +/-9000 m elevation range could produce a
+// control point ~8.9x out of range and tighten the carrier's own overflow
+// margins from 20x to 2.2x. Clamping costs two compares per control point and
+// keeps every static_assert in this file true VERBATIM instead of re-derived
+// against a number nobody will re-check. It cannot fire on real terrain: it
+// needs a 9 km second difference between adjacent 30 m posts.
+// The magnitude every control point is clamped to. It is the SAME number the
+// overflow analyses in this file are written against (coupling (4c) in
+// amplifier.cpp, and the curvature block below), so clamping here is what keeps
+// every one of those static_asserts literally true rather than re-derived.
+// Symmetric on purpose: the curvature path takes second differences of four
+// control points and only the magnitude matters there.
+inline constexpr int64_t kCarrierControlClampMm = 9'000'000;
+
+inline void carrierPrefilterStencil(const int64_t* raw, int64_t cp[16]) {
+    constexpr int64_t S = kCarrierPrefilterSpan;
+    constexpr int64_t R = kCarrierPrefilterRadius;
+    // Stage 1: convolve along y, for the four control rows only.
+    int64_t tmp[S * 4];
+    for (int64_t a = 0; a < S; ++a) {
+        for (int64_t j = 0; j < 4; ++j) {
+            int64_t acc = kCarrierPrefilterW[0] * raw[a + S * (j + R)];
+            for (int64_t n = 1; n <= R; ++n)
+                acc += kCarrierPrefilterW[n] *
+                       (raw[a + S * (j + R + n)] + raw[a + S * (j + R - n)]);
+            // Numerator is routinely negative: truncDiv in the HLSL mirror.
+            tmp[a + S * j] = acc / kCarrierPrefilterDen;
+        }
+    }
+    // Stage 2: convolve along x.
+    for (int64_t j = 0; j < 4; ++j) {
+        for (int64_t i = 0; i < 4; ++i) {
+            int64_t acc = kCarrierPrefilterW[0] * tmp[(i + R) + S * j];
+            for (int64_t m = 1; m <= R; ++m)
+                acc += kCarrierPrefilterW[m] *
+                       (tmp[(i + R + m) + S * j] + tmp[(i + R - m) + S * j]);
+            cp[i + 4 * j] = clampi64(acc / kCarrierPrefilterDen, -kCarrierControlClampMm,
+                                     kCarrierControlClampMm);
+        }
+    }
+}
+
+// The one property the whole thing rests on: a CONSTANT elevation field must
+// come out unchanged, or the prefilter moves sea level. True by construction
+// (the denominator IS the weight sum) and swept anyway, because "by
+// construction" is what the denominator being hand-typed would break.
+constexpr bool carrierPrefilterIsUnitDc() {
+    const int64_t probes[6] = {-9'000'000, -1234, 0, 1, 5678, 9'000'000};
+    for (int k = 0; k < 6; ++k) {
+        const int64_t v = probes[k];
+        int64_t acc = kCarrierPrefilterW[0] * v;
+        for (int64_t m = 1; m <= kCarrierPrefilterRadius; ++m)
+            acc += kCarrierPrefilterW[m] * (v + v);
+        if (acc / kCarrierPrefilterDen != v) return false;
+    }
+    return true;
+}
+static_assert(carrierPrefilterIsUnitDc(),
+              "the prefilter must reproduce a constant field EXACTLY; if it does not, the "
+              "denominator no longer equals the weight sum and every elevation in the world "
+              "is scaled by the difference.");
+
+// ---------------------------------------------------------------------------
+// LANDFORM RELIEF (kWorldGenVersion 13) — the quantity detail amplitude is
+// conditioned on, replacing the carrier GRADIENT.
+//
+// WHY THE GRADIENT WAS THE WRONG QUANTITY, MEASURED. v12 scaled the shaping
+// band by slopeScaleQ10(gradient) and the microrelief band by
+// microScaleQ10(gradient), both clamped to a narrow range, so the detail pass
+// laid down 0.36-0.70 m of second-difference roughness at a 1.875 m lag
+// REGARDLESS OF CLASS. Against a plain that is everything and against a
+// mountain it is nothing: docs/terrain-validation-2026-07.md measured the same
+// pass adding +207% to a plain's 1.875 m mean slope and +3.3% to alpine's, and
+// the finished plain coming out SIX TIMES more ridged than the finished
+// mountain (frac_ridge_peak 0.352 against 0.061, where real plains are
+// 0.054-0.073). A gradient cannot tell those apart: a plain and a mountainside
+// can have the same local grade and differ 25x in how much landform there is
+// to decorate.
+//
+// WHAT IS MEASURED INSTEAD. The relief the raster itself carries across a fixed
+// PHYSICAL baseline -- how much the land actually rises over 30 m, in mm:
+//
+//     relief30 = (|h(x+L) - h(x-L)| + |h(y+L) - h(y-L)| ) / 2,  L*pxMm = 30 m
+//
+// Three properties make this the right scalar, and the third is why it is a
+// FIRST difference and not a second one:
+//
+//   * it is a MEASUREMENT OF THE TIER, not an assumption about it. This is the
+//     mechanism the brief asked for under defect 2: the client stops adding a
+//     fixed ladder blind and reads how much landform the raster actually
+//     carries before deciding how much to decorate it with.
+//   * the BASELINE IS 30 m ON EVERY TIER, deliberately, and this is the whole
+//     reason it is not just carrierSlopeMmPerM under a new name. 30 m is the
+//     scale at which the diffusion tile is measurably Earth-like (every realism
+//     gate passes on S0) and the bake preserves it (S1 at 30 m reproduces S0).
+//     The carrier's own analytic gradient is a 30 m quantity on a 30 m tier and
+//     a 1.875 m quantity on the fine tier, so it silently means a different
+//     thing per tier; this does not. Anchoring at the tier's own Nyquist would
+//     be worse still: terrain-validation-2026-07 section 7.1 measures the baked
+//     fine tier at Hurst ~1.5 below 30 m, far smoother than the 0.7-0.9 of real
+//     ground, so a client that continued THAT trend would faithfully extend a
+//     defect. Measure where the data is known to be good.
+//   * IT HAS THE DYNAMIC RANGE THE CLASSES ACTUALLY DIFFER BY, which is the
+//     property that decides whether any of this works, and it was measured
+//     rather than assumed. On the two exemplars:
+//
+//         quantity                        plains    alpine    ratio
+//         second difference over 30 m      706 mm   3407 mm    4.8x
+//         FIRST difference over 30 m       665 mm  14565 mm   21.9x
+//         detail amplitude actually needed                    23.8x
+//
+//     The second difference is a perfectly good curvature and it separates the
+//     two classes by only 4.8x, because this plains tile is a DISSECTED plain:
+//     locally wrinkly relative to its own amplitude. Real terrain's own answer
+//     is the first difference -- the Illinois-to-Teton mean-slope ratio is 21x
+//     at 1.875 m and 33x at 30 m, i.e. roughly scale-free -- so a client that
+//     wants a plain to finish like a plain and a mountain like a mountain has
+//     to condition on the quantity that carries that ratio. This was tried both
+//     ways: at p = 1 on the second difference the plain still finished at 4.5
+//     degrees against a 2.1 degree reference.
+//
+// The cost of losing "exactly zero on a plane" is a uniformly tilted plane
+// getting detail in proportion to its tilt, which is what real hillsides do.
+// The cost the old gate had -- FLAT ground getting a mountain's roughness -- is
+// gone either way, because relief goes to zero there under both measures.
+//
+// COST: four extra raster reads per CELL (the centre is not even needed), on a
+// lattice constant over the whole cell, so it memoises exactly as the stencil
+// does. On the GPU it is four more buffer loads per column.
+// ---------------------------------------------------------------------------
+
+inline constexpr int64_t kReliefBaselineMm = 30000;
+
+// The lag in PIXELS that puts the relief baseline at kReliefBaselineMm, rounded
+// to nearest and never below one pixel.
+constexpr int64_t carrierReliefLagPx(int64_t pxMm) {
+    const int64_t l = (kReliefBaselineMm + pxMm / 2) / pxMm;
+    return l < 1 ? 1 : l;
+}
+static_assert(carrierReliefLagPx(30000) == 1, "30 m tier: one pixel IS the baseline");
+static_assert(carrierReliefLagPx(3750) == 8, "scale 8");
+static_assert(carrierReliefLagPx(1875) == 16, "scale 16, the shipped fine tier");
+
+// Mean of the two axis-aligned relief magnitudes across the baseline, in mm.
+// Arguments are the four raster samples at (px-L,py) (px+L,py) (px,py-L)
+// (px,py+L) -- note the baseline is 2L pixels wide, i.e. 60 m, and the number
+// is therefore the rise across 60 m; kReliefRefMm is calibrated in the same
+// currency so the factor of two never has to appear anywhere else.
+constexpr int64_t carrierReliefMm(int64_t wx, int64_t ex, int64_t sy, int64_t ny) {
+    const int64_t dx = ex - wx;
+    const int64_t dy = ny - sy;
+    return ((dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy)) / 2;
+}
+static_assert(carrierReliefMm(0, 0, 0, 0) == 0,
+              "relief must be EXACTLY zero on dead-flat ground -- that is the case the old "
+              "gate got wrong, and it is where the artifact was worst");
+static_assert(carrierReliefMm(-3000, 3000, -3000, 3000) == 6000, "a uniform 10% grade");
 
 // The carrier's value and analytic gradient at a point inside one cell, from
 // the 4x4 control stencil (row-major, j = y outer, i = x inner; index 0
@@ -585,5 +854,110 @@ static_assert(curvatureScaleQ10(INT64_MIN) == kCurvatureScaleMaxQ10,
 static_assert(curvatureScaleQ10(INT64_MAX) == kCurvatureScaleMinQ10,
               "the gate must saturate at the floor for ANY input, however extreme");
 static_assert(curvatureScaleQ10(0) == kCurvatureScaleOneQ10, "1.0x at zero curvature");
+
+// ---------------------------------------------------------------------------
+// THE RELIEF GATE (kWorldGenVersion 13) — one gate over the WHOLE detail
+// ladder, replacing slopeScaleQ10 and microScaleQ10.
+//
+// LINEAR IN RELIEF, because that is what a self-affine continuation is. If the
+// raster carries S2(30 m) = relief30 of detrended structure, then a surface
+// that continues its own trend carries S2(lambda) = relief30 * (lambda/30 m)^H
+// at every shorter wavelength: the SHAPE across octaves is the table's job and
+// the LEVEL is proportional to the measured relief. Doubling the landform
+// doubles the decoration; flattening it to a plane removes the decoration
+// entirely.
+//
+// kReliefRefMm IS A CALIBRATION, and it was made against the slope-by-scale
+// ladder in docs/terrain-validation-2026-07.md section 4 rather than by eye, at
+// BOTH exemplar sites and on BOTH tiers -- the single discipline whose absence
+// caused this defect. Measured relief30 (rise across the 60 m baseline) on the
+// pinned world -- and note it is nearly the SAME NUMBER ON EITHER TIER, which
+// is the property that lets one calibration serve both and is exactly what the
+// baseline being physical buys:
+//
+//                       30 m raster      1.875 m baked lattice
+//     plains (-55,20)       872 mm              881 mm
+//     alpine  (-5,15)    15,692 mm           18,983 mm
+//
+// (the alpine pair differs by 20% only because the two were measured over
+// different windows -- the whole 15.33 km tile against its central 2.04 km.)
+//
+// So the raw quantity spans 18x between the two classes where slopeScaleQ10
+// spanned 1.9x and microScaleQ10 spanned 1.06x. THAT RATIO IS THE FIX.
+// kReliefRefMm is set AT THE ALPINE MEASUREMENT, so alpine gates to ~1.0x: it
+// is the site whose detail level measured correct (+3.3% on its own mean slope,
+// and still under-textured against the Teton DTM), so it is the one that must
+// not move, and the plain is the one that comes down -- all the way onto the
+// floor, which is where a plain belongs.
+//
+// THE FLOOR. Decimetre roughness is a property of the material, not of the
+// landform: a dead-flat playa still has clods and stones, and at 10 cm voxels a
+// perfectly smooth surface is precisely where terrace runs are longest and the
+// corduroy artifact is worst (see kDetailOctaves). v13 answers that in TWO
+// places rather than one, because the old single answer -- microScaleQ10's 0.75
+// floor on everything from 1.6 m down -- is a large part of why a plain got a
+// mountain's roughness:
+//
+//   * the MATERIAL band (0.4 m and 0.2 m) is not relief-gated at all. It is
+//     material, not landform, so it does not scale with the landform.
+//   * this floor keeps a little of the METRE band alive on the flattest ground,
+//     which is what actually breaks a terrace run. 0.1x of a 500 mm octave is
+//     50 mm at 1.6 m -- half a voxel of relief across sixteen voxels, enough to
+//     wander across a contour and not enough to read as texture.
+// THE CEILING IS 2.0x, NOT slopeScaleQ10's 4.0x, and that is a deliberate
+// tightening rather than an oversight. The surface bound takes this gate AT its
+// clamp (it cannot bound a second difference over a footprint -- see coupling
+// (5) in amplifier.cpp), so the ceiling is multiplied straight into the world's
+// detail envelope. At 4.0 the envelope would GROW from 27.3 m to 30.7 m,
+// because v13 also puts the microrelief band and the two additive terms under
+// this gate where they used to be under a 1.25x one and a constant. At 2.0 it
+// SHRINKS to 15.4 m, and the streaming trims get better rather than worse.
+// 2.0x is not a compromise on the terrain either: relief30 has to reach 32 m of
+// rise across the 60 m baseline -- a sustained 53% grade, twice the alpine
+// exemplar's own mean -- before the clamp bites at all.
+inline constexpr int64_t kReliefScaleMinQ10 = 102;  // 0.10x -- the anti-terrace floor
+inline constexpr int64_t kReliefScaleMaxQ10 = 2048; // 2.0x
+inline constexpr int64_t kReliefRefMm = 16000;
+static_assert(kReliefRefMm > 0, "the relief reference divides");
+static_assert(kReliefScaleMinQ10 > 0,
+              "the relief gate must never reach zero: a flat raster still needs decimetre "
+              "roughness or the voxel terrace artifact comes straight back");
+static_assert(kReliefScaleMinQ10 < 1024 && 1024 < kReliefScaleMaxQ10,
+              "the gate must straddle 1.0x");
+
+constexpr int64_t reliefScaleQ10(int64_t relief30Mm) {
+    // relief30Mm is a magnitude, so the numerator is non-negative and
+    // truncation and flooring agree; the HLSL mirror may use either helper.
+    return clampi64(relief30Mm * 1024 / kReliefRefMm, kReliefScaleMinQ10, kReliefScaleMaxQ10);
+}
+
+// THE PROOF the bound needs: nondecreasing, and clamped at both ends for ANY
+// input. Amplifier::surfaceUpperBoundMm takes this gate at its ceiling, so
+// "cannot exceed kReliefScaleMaxQ10" has to be a proof and not a comment -- a
+// violation is a hole in the world. The sweep runs every value across the whole
+// range where the result varies (it saturates at relief30 = 9600 mm) plus a
+// coarse tail out to 300 m of second difference over a 30 m baseline, which no
+// int32 elevation can produce.
+constexpr bool reliefScaleIsNondecreasing() {
+    int64_t prev = reliefScaleQ10(0);
+    if (prev != kReliefScaleMinQ10) return false;
+    for (int64_t r = 0; r <= 60000; ++r) {
+        const int64_t v = reliefScaleQ10(r);
+        if (v < prev || v > kReliefScaleMaxQ10 || v < kReliefScaleMinQ10) return false;
+        prev = v;
+    }
+    for (int64_t r = 60000; r <= 3'000'000; r += 97) {
+        const int64_t v = reliefScaleQ10(r);
+        if (v < prev || v > kReliefScaleMaxQ10) return false;
+        prev = v;
+    }
+    return prev == kReliefScaleMaxQ10;
+}
+static_assert(reliefScaleIsNondecreasing(),
+              "reliefScaleQ10 must be nondecreasing, must reach both clamps, and must NEVER "
+              "exceed kReliefScaleMaxQ10; the surface bound feeds it the footprint's maximum "
+              "and takes the ceiling.");
+static_assert(reliefScaleQ10(INT64_MAX / 2048) == kReliefScaleMaxQ10,
+              "the gate must saturate at the ceiling for any input past the sweep");
 
 } // namespace vxc

@@ -427,6 +427,136 @@ VXC_TEST(swe_coupler_puncture_meters_the_inrush_then_hands_the_column_over) {
     CHECK(cp.transferredToCA() > 0);
 }
 
+// swe.h §5(a) says the coupler NEVER re-seats a bed, and it is right about the
+// case it is written for. This pins the case it is silent about, and the
+// caller-side obligation that follows from it.
+//
+// THE BUG (found by -VoxelSweBreachTest=25 -VoxelSweBreachSwe=1 on 2026-07-29,
+// against real terrain): a notch cut through the rim of a full basin, from
+// three voxels below the waterline up past the rim, produced punctured=0,
+// basinDrawdown=0, frontArrived=0 and ca=8 — a breach that did nothing, with
+// every conservation check green and nothing logged.
+//
+// The mechanism is entirely in this file's rules. §5(a) meters a punctured
+// column into the CA and lets the demote dwell hand it over — and then the
+// column is CA-owned with `bed` pointing at a voxel that is not there any more.
+// `eligible()` tests `solidAt(bed)` FIRST, so it can never promote again; and
+// every CA-owned column is an INACTIVE HARD WALL in the numerics
+// (`setColumnActive`). What a carve leaves behind is therefore not a gap in the
+// sheet, it is a permanent wall exactly where the ground was removed — and a
+// column that can never be a member can never be punctured either, because the
+// puncture test in step()'s pass 2 is guarded by membership.
+//
+// Nothing in voxel-core can fix that: the coupler is deliberately not told what
+// the ground looks like anywhere except at `bed`, and re-seating from inside
+// §5(a) is the design this header already rejects, for a reason that still
+// holds. It is the CALLER that owes a re-seat after it edits terrain under a
+// sheet, and the caller must do it only once the column is CA-owned, so the
+// re-seat can never race the metered drain. This test is that contract,
+// executed in order. UVoxelWaterSubsystem::ReseatEditedSweBeds is the engine's
+// implementation of it.
+VXC_TEST(swe_coupler_a_carved_bed_is_lost_to_the_sheet_until_the_caller_reseats_it) {
+    BasinTerrain terrain(0, 0, 7, 7, -1);
+    WaterCA ca(terrain.fn());
+    SweGrid g(0, 0, 8, 8);
+    for (int32_t y = 0; y < 8; ++y)
+        for (int32_t x = 0; x < 8; ++x) g.setBed(x, y, -1);
+
+    SweCoupleConfig cfg;
+    cfg.enabled = true;
+    SweCaCoupler cp(g, ca, terrain.fn(), cfg);
+
+    int64_t injected = 0;
+    for (int32_t y = 1; y < 7; ++y)
+        for (int32_t x = 1; x < 7; ++x) {
+            cp.forcePromote(x, y);
+            injected += g.addWater(x, y, 900);
+        }
+    CHECK(cp.isSweColumn(4, 4));
+    CHECK(g.columnActive(4, 4));
+
+    // Carve the sheet's bed out from under a 3x3 block — wide enough that the
+    // floor it exposes is not a one-voxel pipe, so nothing below turns on §5's
+    // confinement rule instead of the rule under test.
+    for (int32_t dy = -1; dy <= 1; ++dy)
+        for (int32_t dx = -1; dx <= 1; ++dx) terrain.dig(4 + dx, 4 + dy, -1);
+    ca.invalidateSolidCache();
+
+    // §5(a) fires exactly as documented: METERED, not a dump, and the column
+    // stays SWE-owned for the dwell window.
+    const int32_t before = g.depthAt(4, 4);
+    cp.step();
+    g.step();
+    ca.step();
+    CHECK(cp.lastPuncturedCount() >= 1);
+    CHECK(cp.isSweColumn(4, 4));
+    CHECK(before - g.depthAt(4, 4) <= cfg.drainPerTick);
+
+    // ...and then the hand-over completes on its own.
+    for (int t = 0; t < 200; ++t) {
+        cp.step();
+        g.step();
+        ca.step();
+        CHECK_EQ(ca.totalVolume() + static_cast<uint64_t>(g.totalVolume()),
+                 static_cast<uint64_t>(injected));
+    }
+    CHECK(!cp.isSweColumn(4, 4));
+    CHECK_EQ(g.depthAt(4, 4), 0);
+    CHECK(cp.transferredToCA() > 0);
+
+    // THE FAILURE. The bed still names z=-1, which is air, so the column is
+    // frozen out of the sheet: no promotion, no puncture, and a hard wall where
+    // the ground was dug away, for as long as the session runs.
+    CHECK_EQ(g.bedAt(4, 4), -1);
+    CHECK(!g.columnActive(4, 4));
+    for (int t = 0; t < 200; ++t) {
+        cp.step();
+        g.step();
+        ca.step();
+    }
+    CHECK(!cp.isSweColumn(4, 4));
+    CHECK_EQ(cp.lastPuncturedCount(), 0); // nothing left that CAN be punctured
+    CHECK(!g.columnActive(4, 4));
+
+    // THE CALLER'S HALF. Re-seat to the voxel that is actually there now — and
+    // only because the column is already CA-owned, which is the precondition
+    // that makes this safe: the sheet is walled out of it and it holds no depth,
+    // so moving the bed cannot strand a fill unit and cannot put a cell in two
+    // domains. It transfers nothing, and the ledgers say so.
+    const int64_t toCABefore = cp.transferredToCA();
+    const int64_t toSWEBefore = cp.transferredToSWE();
+    CHECK(!cp.isSweColumn(4, 4));
+    CHECK_EQ(g.depthAt(4, 4), 0);
+    for (int32_t dy = -1; dy <= 1; ++dy)
+        for (int32_t dx = -1; dx <= 1; ++dx) g.setBed(4 + dx, 4 + dy, -2);
+    CHECK_EQ(cp.transferredToCA(), toCABefore);
+    CHECK_EQ(cp.transferredToSWE(), toSWEBefore);
+    CHECK_EQ(ca.totalVolume() + static_cast<uint64_t>(g.totalVolume()),
+             static_cast<uint64_t>(injected));
+
+    // The coupler's own hysteresis takes it from there — the same self-healing
+    // a save flush already relies on — and the column is back in the sheet at
+    // the bed the ground actually has.
+    for (int t = 0; t <= cfg.promoteDwellTicks; ++t) {
+        cp.step();
+        g.step();
+        ca.step();
+        CHECK_EQ(ca.totalVolume() + static_cast<uint64_t>(g.totalVolume()),
+                 static_cast<uint64_t>(injected));
+    }
+    CHECK(cp.isSweColumn(4, 4));
+    CHECK(g.columnActive(4, 4));
+    CHECK_EQ(g.bedAt(4, 4), -2);
+
+    // And the property the breach fixture actually reads is restored: carve the
+    // NEW bed away and the column is a metered source once more.
+    for (int32_t dy = -1; dy <= 1; ++dy)
+        for (int32_t dx = -1; dx <= 1; ++dx) terrain.dig(4 + dx, 4 + dy, -2);
+    ca.invalidateSolidCache();
+    cp.step();
+    CHECK(cp.lastPuncturedCount() >= 1);
+}
+
 // swe.h §5 mechanism 1: a column flickering in and out of eligibility EVERY
 // tick must never flip owner. Membership chatter is the oscillation mode the
 // plan flags as W4's risk, and it is excluded by the dwell windows, not tuned

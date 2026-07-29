@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 12
+#define VXC_WORLDGEN_VERSION_USH 13
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -197,8 +197,14 @@ static const int64_t kDetailAmplitudeScaleQ10 = 1024;
 
 static const int kOctaveCount = 5;
 static const int kLandformOctaveCount = 2;
+// v13 THIRD BAND. The last kMaterialOctaveCount octaves are MATERIAL -- clods
+// and stones -- and take no relief gate, because they are not landform. The
+// 1.6 m octave moved out of that group and under the landform gate with the
+// rest of the ladder; MIRROR: amplifier.cpp's band-split block, which explains
+// why keeping 1.6 m floored on flat ground was most of the defect.
+static const int kMaterialOctaveCount = 2;
 static const int kOctaveLatticeMm[kOctaveCount] = {25600, 6400, 1600, 400, 200};
-static const int kOctaveAmplitudeMm[kOctaveCount] = {2600, 1100, 500, 60, 15};
+static const int kOctaveAmplitudeMm[kOctaveCount] = {2600, 1100, 500, 90, 25};
 
 // v10 BAND OWNERSHIP (amplifier.cpp kFineDetailOctaves). On a world whose tile
 // raster carries the baked fine tier, the 25.6 m and 6.4 m landform octaves are
@@ -217,11 +223,35 @@ static const int kOctaveAmplitudeMm[kOctaveCount] = {2600, 1100, 500, 60, 15};
 static const int kFineOctaveCount = 4;
 static const int kFineLandformOctaveCount = 1;
 static const int kFineOctaveLatticeMm[kFineOctaveCount] = {3200, 1600, 400, 200};
-static const int kFineOctaveAmplitudeMm[kFineOctaveCount] = {900, 500, 60, 15};
+static const int kFineOctaveAmplitudeMm[kFineOctaveCount] = {900, 500, 90, 25};
 
 // vxc::isFineTier -- a tile raster at or below this pitch carries baked sub-30 m
 // landform. 3750 is scale 8, 1875 is scale 16; both select the fine ladder.
 static const int64_t kFineTierMaxPixelMm = 3750;
+
+// --- v13 mirrors: carrier.h's prefilter and relief gate ---------------------
+//
+// MIRROR: vxc::kCarrierPrefilterRadius / W / Den / Lo / Hi / Span, and
+// vxc::kCarrierSampleTierMinPixelMm. A cubic B-spline approximates its control
+// points, so a tier that ships raster SAMPLES has to be prefiltered before the
+// carrier evaluates it or the model's own output is low-passed away -- measured
+// at 815 mm on plains and 3222 mm on alpine. The baked fine tier ships control
+// points and must NOT be prefiltered again, which is what the pitch test picks.
+static const int kCarrierPrefilterRadius = 4;
+static const int64_t kCarrierPrefilterW[5] = {1048576, -280965, 75284, -20172, 5405};
+static const int64_t kCarrierPrefilterDen = 607680; // the exact sum; DC is exact
+static const int kCarrierPrefilterLo = -5;         // -1 - R
+static const int kCarrierPrefilterSpan = 12;       // 4 + 2R
+static const int64_t kCarrierSampleTierMinPixelMm = 3751;
+static const int64_t kCarrierControlClampMm = 9000000;
+
+// MIRROR: vxc::kReliefBaselineMm / kReliefRefMm / kReliefScaleMinQ10 /
+// kReliefScaleMaxQ10. These are worldgen contract; carrier.h carries the
+// calibration and the measurements behind every one of them.
+static const int64_t kReliefBaselineMm = 30000;
+static const int64_t kReliefRefMm = 16000;
+static const int64_t kReliefScaleMinQ10 = 102;
+static const int64_t kReliefScaleMaxQ10 = 2048;
 
 // --- primitives mirrored from core.h / hash.h ------------------------------
 
@@ -293,6 +323,53 @@ int64_t floorDiv(int64_t a, int64_t b)
 int64_t clamp64(int64_t v, int64_t lo, int64_t hi)
 {
     return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// MIRROR: vxc::carrierPrefilterStencil (voxelcore/carrier.h). Separable, two
+// stage, with the intermediate divide -- folding the two stages into one tensor
+// form is a different number AND overflows.
+//
+// EVERY DIVISION HERE HAS A ROUTINELY NEGATIVE NUMERATOR: the odd taps of the
+// kernel are negative, so a bare `/` is exactly the operand pattern that
+// diverged AMD vs NVIDIA (see the VENDOR-DIVERGENCE FIX block above). truncDiv,
+// never floorDiv and never `/`.
+void carrierPrefilterStencil(int64_t raw[kCarrierPrefilterSpan * kCarrierPrefilterSpan],
+                             out int64_t cp[16])
+{
+    int64_t tmp[kCarrierPrefilterSpan * 4];
+    [unroll]
+    for (int a = 0; a < kCarrierPrefilterSpan; ++a)
+    {
+        [unroll]
+        for (int j = 0; j < 4; ++j)
+        {
+            int64_t acc = kCarrierPrefilterW[0] *
+                          raw[a + kCarrierPrefilterSpan * (j + kCarrierPrefilterRadius)];
+            [unroll]
+            for (int n = 1; n <= kCarrierPrefilterRadius; ++n)
+                acc += kCarrierPrefilterW[n] *
+                       (raw[a + kCarrierPrefilterSpan * (j + kCarrierPrefilterRadius + n)] +
+                        raw[a + kCarrierPrefilterSpan * (j + kCarrierPrefilterRadius - n)]);
+            tmp[a + kCarrierPrefilterSpan * j] = truncDiv(acc, kCarrierPrefilterDen);
+        }
+    }
+    [unroll]
+    for (int j2 = 0; j2 < 4; ++j2)
+    {
+        [unroll]
+        for (int i = 0; i < 4; ++i)
+        {
+            int64_t acc = kCarrierPrefilterW[0] *
+                          tmp[(i + kCarrierPrefilterRadius) + kCarrierPrefilterSpan * j2];
+            [unroll]
+            for (int m = 1; m <= kCarrierPrefilterRadius; ++m)
+                acc += kCarrierPrefilterW[m] *
+                       (tmp[(i + kCarrierPrefilterRadius + m) + kCarrierPrefilterSpan * j2] +
+                        tmp[(i + kCarrierPrefilterRadius - m) + kCarrierPrefilterSpan * j2]);
+            cp[i + 4 * j2] = clamp64(truncDiv(acc, kCarrierPrefilterDen), -kCarrierControlClampMm,
+                                     kCarrierControlClampMm);
+        }
+    }
 }
 
 uint64_t splitmix64(uint64_t z)
@@ -604,29 +681,40 @@ int64_t carrierSlopeMmPerM(CarrierEval c, int64_t pxMm)
     return truncDiv((ax + ay) * 1000, pxMm);
 }
 
-// v9: argument is MM PER METRE. The coefficient is a pure unit conversion of
-// v8's `+ truncDiv(slopeMmPerPx, 24)` at the scale-1 pixel -- 30000/24 mm per
-// pixel is 5/4 per mm per metre -- so tuned v8 behaviour is preserved exactly
-// at scale 1 and now means the same GRADE at every scale.
-int64_t slopeScaleQ10(int64_t slopeMmPerM)
+// vxc::reliefScaleQ10 (voxelcore/carrier.h) bit-for-bit, and the ONLY detail
+// gate at v13. slopeScaleQ10 and microScaleQ10 are GONE from both sides: the
+// quantity they conditioned on was the wrong one. The full derivation and the
+// measurement that killed them are in carrier.h; the one-line version is that
+// they spanned 1.9x and 1.06x between a plain and a mountain whose landform
+// differs 25x, so the client laid the same roughness on both and the finished
+// plain came out six times more ridged than the finished mountain.
+//
+// relief30Mm is a magnitude (>= 0), so both roundings agree; truncDiv keeps
+// that from becoming load-bearing.
+int64_t reliefScaleQ10(int64_t relief30Mm)
 {
-    // slopeMmPerM is a sum of absolute values (>= 0), so both roundings agree
-    // today; truncDiv keeps that from becoming load-bearing.
-    return clamp64(512 + truncDiv(slopeMmPerM * 5, 4), 256, 4096);
+    return clamp64(truncDiv(relief30Mm * 1024, kReliefRefMm), kReliefScaleMinQ10,
+                   kReliefScaleMaxQ10);
 }
 
-// vxc::microScaleQ10 (amplifier.cpp) bit-for-bit. The microrelief band's
-// scale: same shape as slopeScaleQ10, deliberately a different curve, and it
-// NEVER drops below 0.75 â€” flat ground is still bumpy, and at 10 cm voxels
-// flat ground is exactly where the terrace artifact is worst. It is also
-// almost slope-FLAT by design (divisor 256, ceiling 1.25): amplifying the
-// fine band on steep ground turned a mountainside into rubble in-engine.
-// See amplifier.cpp for that measurement.
-// v9: MM PER METRE, same pure unit conversion -- v8's divisor 256 at a 30 m
-// pixel is 15/128 per mm per metre.
-int64_t microScaleQ10(int64_t slopeMmPerM)
+// vxc::carrierReliefLagPx / vxc::carrierReliefMm (voxelcore/carrier.h).
+// The lag in PIXELS that puts the relief baseline at 30 m on any tier; 1 at
+// 30 m/px, 8 at scale 8, 16 at the scale-16 fine tier. pxMm > 0 always, so
+// truncDiv and floorDiv agree.
+int64_t carrierReliefLagPx(int64_t pxMm)
 {
-    return clamp64(768 + truncDiv(slopeMmPerM * 15, 128), 768, 1280);
+    const int64_t l = truncDiv(kReliefBaselineMm + truncDiv(pxMm, 2), pxMm);
+    return l < 1 ? 1 : l;
+}
+
+// Mean of the two axis relief magnitudes across the baseline, in mm. Both
+// numerators are magnitudes by the time they are halved, so truncDiv matches
+// the CPU's `/ 2`.
+int64_t carrierReliefMm(int64_t wx, int64_t ex, int64_t sy, int64_t ny)
+{
+    const int64_t dx = ex - wx;
+    const int64_t dy = ny - sy;
+    return truncDiv((dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy), 2);
 }
 
 // vxc::curvatureScaleQ10 (voxelcore/carrier.h) bit-for-bit. Convex crests
@@ -1350,17 +1438,48 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     const int64_t fx = xMm - px * pxMm;
     const int64_t fy = yMm - py * pxMm;
 
+    // v13: PREFILTERED on a tier that ships raster SAMPLES. MIRROR:
+    // amplifier.cpp cachedStencilSlot / carrier.h carrierPrefilterStencil. The
+    // CPU memoises this per cell; the GPU recomputes it per column, which is
+    // 144 buffer loads against 16 and is the whole cost of the change.
     int64_t cp[16];
-    [unroll]
-    for (int j = 0; j < 4; ++j)
+    if (pxMm >= kCarrierSampleTierMinPixelMm)
+    {
+        int64_t raw[kCarrierPrefilterSpan * kCarrierPrefilterSpan];
+        [unroll]
+        for (int b = 0; b < kCarrierPrefilterSpan; ++b)
+        {
+            [unroll]
+            for (int a = 0; a < kCarrierPrefilterSpan; ++a)
+                raw[a + kCarrierPrefilterSpan * b] = (int64_t)rasterElevationMm(
+                    px + kCarrierPrefilterLo + a, py + kCarrierPrefilterLo + b);
+        }
+        carrierPrefilterStencil(raw, cp);
+    }
+    else
     {
         [unroll]
-        for (int i = 0; i < 4; ++i)
-            cp[i + 4 * j] = (int64_t)rasterElevationMm(px - 1 + i, py - 1 + j);
+        for (int j = 0; j < 4; ++j)
+        {
+            [unroll]
+            for (int i = 0; i < 4; ++i)
+                cp[i + 4 * j] = (int64_t)rasterElevationMm(px - 1 + i, py - 1 + j);
+        }
     }
 
     const CarrierEval carrier = evalCarrier(cp, fx, fy, pxMm);
     const int64_t baseMm = carrier.heightMm;
+
+    // v13: LANDFORM RELIEF across a fixed 30 m physical baseline, four reads at
+    // +/- carrierReliefLagPx pixels. MIRROR: amplifier.cpp cachedStencilSlot /
+    // carrier.h carrierReliefMm. These reads sit up to 16 pixels outside the
+    // 4x4 stencil, which is why kCarrierStencilLo/Hi grew to +/-16 -- an
+    // undilated window would clamp here and silently disagree with the CPU.
+    const int64_t reliefLag = carrierReliefLagPx(pxMm);
+    const int64_t reliefMm = carrierReliefMm((int64_t)rasterElevationMm(px - reliefLag, py),
+                                             (int64_t)rasterElevationMm(px + reliefLag, py),
+                                             (int64_t)rasterElevationMm(px, py - reliefLag),
+                                             (int64_t)rasterElevationMm(px, py + reliefLag));
 
     // The carrier's ANALYTIC gradient, mm per metre. v8 used a per-cell forward
     // difference that was constant across a whole pixel, so the detail gain
@@ -1385,9 +1504,11 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
         carrierCurvatureMmPerM2Q10(evalCarrierCurvature(cp, fx, fy, pxMm), pxMm), pxMm);
     const int64_t cScale = curvatureScaleQ10(curveQ10);
 
-    const int64_t sScale = slopeScaleQ10(slopeMmPerM);
-    const int64_t mScale = microScaleQ10(slopeMmPerM);
+    // v13: ONE relief gate over the ladder, replacing slopeScaleQ10 and
+    // microScaleQ10, which are GONE. MIRROR: carrier.h reliefScaleQ10.
+    const int64_t rScale = reliefScaleQ10(reliefMm);
     int64_t landformMm = 0;
+    int64_t metreMm = 0;
     int64_t microMm = 0;
     // v10 TIER BRANCH (vxc::isFineTier). Two tables, two lengths, two band
     // splits, and the noise channel indexed by the octave's position in ITS OWN
@@ -1406,6 +1527,8 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
                                           32768);
             if (i < kFineLandformOctaveCount)
                 landformMm += term;
+            else if (i < kFineOctaveCount - kMaterialOctaveCount)
+                metreMm += term;
             else
                 microMm += term;
         }
@@ -1422,6 +1545,8 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
                                           32768);
             if (i < kLandformOctaveCount)
                 landformMm += term;
+            else if (i < kOctaveCount - kMaterialOctaveCount)
+                metreMm += term;
             else
                 microMm += term;
         }
@@ -1440,16 +1565,18 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     // truncating divide on a negative numerator: truncDiv, never floorDiv. They
     // differ by one whole q10 step on every odd hollow.
     const int64_t cScaleMicro = 1024 + truncDiv(cScale - 1024, 2);
-    // TWO SUCCESSIVE q10 DIVIDES ON EACH BAND now, each truncating, in this
-    // order: `landformMm * sScale / 1024 * cScale / 1024` and
-    // `microMm * mScale / 1024 * cScaleMicro / 1024`. Folding either pair into a
-    // single divide by 1024*1024 is NOT the same number and is a divergence.
-    int64_t detailMm = truncDiv(truncDiv(landformMm * sScale, 1024) * cScale, 1024) +
-                       truncDiv(truncDiv(microMm * mScale, 1024) * cScaleMicro, 1024);
+    // v13: THREE bands, three gates, and the MATERIAL band takes no relief gate
+    // at all. Each q10 divide truncates, in exactly this order; folding any pair
+    // into a single divide by 1024*1024 is NOT the same number and is a
+    // divergence.
+    int64_t detailMm = truncDiv(truncDiv(landformMm * rScale, 1024) * cScale, 1024) +
+                       truncDiv(truncDiv(metreMm * rScale, 1024) * cScaleMicro, 1024) +
+                       truncDiv(microMm * cScaleMicro, 1024);
 
     // Two ADDITIVE structured terms, added AFTER the band scaling because
-    // neither is an fBm octave and each already carries its own gate --
-    // multiplying them by slopeScaleQ10 as well would double-count.
+    // neither is an fBm octave. v13: they DO take the relief gate -- see
+    // amplifier.cpp for why the old reason to exempt them (each already carries
+    // a GRADIENT condition) does not apply to a LANDFORM one.
     //
     // The rill gradient is the carrier's analytic gradient converted to mm per
     // METRE. `sxMmPerPx` is SIGNED, so the CPU's bare `/` is a truncating divide
@@ -1457,9 +1584,10 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     //
     // beddingMm takes baseMm -- the carrier height BEFORE detail is added, not
     // the final surface.
-    detailMm += rillMm(seed, xMm, yMm, truncDiv(carrier.sxMmPerPx * 1000, pxMm),
-                       truncDiv(carrier.syMmPerPx * 1000, pxMm));
-    detailMm += beddingMm(seed, xMm, yMm, baseMm);
+    const int64_t addMm = rillMm(seed, xMm, yMm, truncDiv(carrier.sxMmPerPx * 1000, pxMm),
+                                 truncDiv(carrier.syMmPerPx * 1000, pxMm)) +
+                          beddingMm(seed, xMm, yMm, baseMm);
+    detailMm += truncDiv(addMm * rScale, 1024);
 
     SurfaceEval s;
     s.px = px;

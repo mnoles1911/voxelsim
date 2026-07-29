@@ -69,6 +69,40 @@ PixelRect fineReadPixelRect(int64_t worldMmX0, int64_t worldMmY0, int64_t worldM
     return dilateForCarrierStencil(cells);
 }
 
+std::vector<TileCoord> tilesCoveringFootprint(int64_t worldMmX0, int64_t worldMmY0, int64_t worldMmX1,
+                                              int64_t worldMmY1, int64_t readMarginMm, int64_t tileSizePx,
+                                              int32_t pixelSizeMm) {
+    std::vector<TileCoord> out;
+    if (tileSizePx <= 0) return out;
+
+    // ONE conversion, the shared one: margin in world mm, then pixels, then the
+    // carrier stencil. Everything this function knows about how far a generator
+    // reads comes from fineReadPixelRect and nowhere else.
+    const PixelRect rect = fineReadPixelRect(worldMmX0, worldMmY0, worldMmX1, worldMmY1, readMarginMm, pixelSizeMm);
+    if (rect.px1 < rect.px0 || rect.py1 < rect.py0) return out; // degenerate pixelSizeMm
+
+    const TileCoord lo = tileCoordForPixel(rect.px0, rect.py0, tileSizePx);
+    const TileCoord hi = tileCoordForPixel(rect.px1, rect.py1, tileSizePx);
+    out.reserve(size_t(hi.x - lo.x + 1) * size_t(hi.y - lo.y + 1));
+    for (int32_t ty = lo.y; ty <= hi.y; ++ty) {
+        for (int32_t tx = lo.x; tx <= hi.x; ++tx) {
+            out.push_back(TileCoord{tx, ty});
+        }
+    }
+    return out;
+}
+
+std::vector<TileCoord> missingTilesForFootprint(int64_t worldMmX0, int64_t worldMmY0, int64_t worldMmX1,
+                                                int64_t worldMmY1, int64_t readMarginMm, int64_t tileSizePx,
+                                                const TileCoordSet& resident, int32_t pixelSizeMm) {
+    std::vector<TileCoord> out;
+    for (const TileCoord& t :
+         tilesCoveringFootprint(worldMmX0, worldMmY0, worldMmX1, worldMmY1, readMarginMm, tileSizePx, pixelSizeMm)) {
+        if (resident.find(t) == resident.end()) out.push_back(t);
+    }
+    return out;
+}
+
 TileCoord tileCoordForWorldMm(int64_t worldMmX, int64_t worldMmY, int64_t tileFootprintMm) {
     if (tileFootprintMm <= 0) return TileCoord{0, 0};
     return TileCoord{static_cast<int32_t>(floorDiv(worldMmX, tileFootprintMm)),

@@ -462,3 +462,187 @@ VXC_TEST(curvature_magnitudes_on_a_realistic_raster) {
                     (long long)(100 * saturated / n), (long long)n, (long long)kCurvatureKneeQ10);
     }
 }
+
+// ---------------------------------------------------------------------------
+// THE PREFILTER (v13). The B-spline approximates its control points, so feeding
+// raster SAMPLES in as control points low-passes the model's own output away.
+// These are the properties the whole thing rests on, and the first is the one a
+// wrong denominator would break silently and catastrophically.
+// ---------------------------------------------------------------------------
+
+// Fill the (4+2R)^2 raw block that carrierPrefilterStencil consumes, from a
+// caller-supplied sampler over raster pixels around cell (px, py).
+template <typename Fn>
+void fillRawBlock(int64_t* raw, int64_t px, int64_t py, Fn sample) {
+    constexpr int64_t S = kCarrierPrefilterSpan;
+    for (int64_t b = 0; b < S; ++b)
+        for (int64_t a = 0; a < S; ++a)
+            raw[a + S * b] = sample(px + kCarrierPrefilterLo + a, py + kCarrierPrefilterLo + b);
+}
+
+// PROPERTY 1: a constant raster must come out exactly constant. Anything else
+// scales every elevation in the world -- it would move sea level. The
+// static_assert in carrier.h proves this for the 1-D kernel; this proves it for
+// the composed 2-D stencil AND through the carrier evaluation on top.
+VXC_TEST(carrier_prefilter_reproduces_a_constant_field_exactly) {
+    const int64_t probes[6] = {-8'000'000, -1, 0, 1, 123'456, 9'000'000};
+    for (int k = 0; k < 6; ++k) {
+        const int64_t v = probes[k];
+        int64_t raw[kCarrierPrefilterSpan * kCarrierPrefilterSpan];
+        fillRawBlock(raw, 0, 0, [v](int64_t, int64_t) { return v; });
+        int64_t cp[16];
+        carrierPrefilterStencil(raw, cp);
+        for (int i = 0; i < 16; ++i) CHECK_EQ(cp[i], v);
+        // ...and the carrier over those control points is still exactly v.
+        CHECK_EQ(evalCarrier(cp, 7777, 13331, kPx30m).heightMm, v);
+    }
+}
+
+// PROPERTY 2, AND THE ONE THE WHOLE CHANGE EXISTS FOR: the carrier over
+// PREFILTERED control points reproduces the raster AT ITS OWN NODES, where the
+// un-prefiltered carrier does not.
+//
+// This is the defect stated as a test. At a knot the cubic B-spline evaluates
+// (c[-1] + 4c[0] + c[1]) / 6, so feeding samples straight in returns the sample
+// plus one sixth of the raster's Laplacian -- which on the real 30 m tiles
+// measured 815 mm on plains and 3222 mm on alpine. The test asserts the
+// direction and the size on a synthetic raster of known roughness rather than
+// re-deriving the constant, because the constant IS the raster.
+VXC_TEST(carrier_prefilter_recovers_the_raster_at_its_own_nodes) {
+    int64_t worstRaw = 0, worstPre = 0, sumRaw = 0, sumPre = 0, n = 0;
+    for (int64_t px = -12; px <= 12; ++px)
+        for (int64_t py = -12; py <= 12; ++py) {
+            const int64_t truth = roughElev(px, py);
+
+            // v12 behaviour: samples used directly as control points.
+            int64_t cpRaw[16];
+            stencilAt(cpRaw, px, py);
+            const int64_t hRaw = evalCarrier(cpRaw, 0, 0, kPx30m).heightMm;
+
+            // v13 behaviour: prefiltered first.
+            int64_t raw[kCarrierPrefilterSpan * kCarrierPrefilterSpan];
+            fillRawBlock(raw, px, py, roughElev);
+            int64_t cpPre[16];
+            carrierPrefilterStencil(raw, cpPre);
+            const int64_t hPre = evalCarrier(cpPre, 0, 0, kPx30m).heightMm;
+
+            const int64_t eRaw = absi(hRaw - truth), ePre = absi(hPre - truth);
+            sumRaw += eRaw;
+            sumPre += ePre;
+            if (eRaw > worstRaw) worstRaw = eRaw;
+            if (ePre > worstPre) worstPre = ePre;
+            ++n;
+        }
+    std::printf("    [carrier] node error against the raster: unprefiltered mean %lld mm "
+                "(worst %lld), PREFILTERED mean %lld mm (worst %lld) over %lld nodes\n",
+                (long long)(sumRaw / n), (long long)worstRaw, (long long)(sumPre / n),
+                (long long)worstPre, (long long)n);
+    // The unprefiltered carrier really does discard a band -- if it did not,
+    // there would be nothing to fix and this whole change would be inert.
+    CHECK(sumRaw / n > 20);
+    // And the prefilter recovers essentially all of it. R = 4 leaves 0.74% of
+    // the deficit at the worst frequency (carrier.h's table), so a 20x margin
+    // is the honest claim and is not a round number.
+    CHECK(sumPre * 20 < sumRaw);
+}
+
+// The prefilter must never hand the carrier a control point outside the range
+// every overflow analysis in carrier.h is written against. It is a sharpening
+// filter with a per-axis gain near 3, so an adversarial Nyquist checkerboard at
+// full elevation range is exactly the input that would otherwise blow it.
+VXC_TEST(carrier_prefilter_clamps_an_adversarial_checkerboard) {
+    int64_t raw[kCarrierPrefilterSpan * kCarrierPrefilterSpan];
+    fillRawBlock(raw, 0, 0, [](int64_t x, int64_t y) {
+        return ((x + y) & 1) ? int64_t(9'000'000) : int64_t(-9'000'000);
+    });
+    int64_t cp[16];
+    carrierPrefilterStencil(raw, cp);
+    for (int k = 0; k < 16; ++k) {
+        CHECK(cp[k] <= kCarrierControlClampMm);
+        CHECK(cp[k] >= -kCarrierControlClampMm);
+    }
+    // ...and the carrier over the clamped lattice is still inside the range
+    // coupling (4c) in amplifier.cpp assumes of a control point.
+    const int64_t h = evalCarrier(cp, 3333, 7777, kPx30m).heightMm;
+    CHECK(absi(h) <= kCarrierControlClampMm);
+}
+
+// The tier gate. A baked fine tile ships CONTROL POINTS; prefiltering it again
+// would sharpen an already-sharp lattice, which is a different defect from the
+// one being fixed.
+VXC_TEST(carrier_prefilter_is_off_on_a_tier_that_ships_control_points) {
+    CHECK(carrierPrefiltersSamples(30000));
+    CHECK(carrierPrefiltersSamples(3751));
+    CHECK(!carrierPrefiltersSamples(3750));
+    CHECK(!carrierPrefiltersSamples(1875));
+}
+
+// ---------------------------------------------------------------------------
+// THE RELIEF GATE (v13) -- the quantity detail amplitude is conditioned on.
+// ---------------------------------------------------------------------------
+
+// The baseline is PHYSICAL, so the same ground reads the same relief on either
+// tier. That property is what makes one calibration serve both, and it is the
+// thing carrierSlopeMmPerM could never do: it is a one-pixel quantity, so it
+// silently means a different DISTANCE on each tier.
+VXC_TEST(relief_is_the_same_number_on_both_tiers_for_the_same_ground) {
+    const int64_t grades[3] = {0, 20, 486};
+    for (int gi = 0; gi < 3; ++gi) {
+        const int64_t gradeMmPerM = grades[gi];
+        int64_t r[2];
+        int k = 0;
+        const int64_t pxs[2] = {kPx30m, kPxFine};
+        for (int pi = 0; pi < 2; ++pi) {
+            const int64_t pxm = pxs[pi];
+            const int64_t L = carrierReliefLagPx(pxm);
+            const int64_t hL = gradeMmPerM * (-L) * pxm / 1000;
+            const int64_t hR = gradeMmPerM * (L)*pxm / 1000;
+            r[k++] = carrierReliefMm(hL, hR, 0, 0);
+        }
+        // Both tiers measure the rise across the SAME 60 m of ground; the lag
+        // rounds to a whole pixel and 16 * 1875 == 30000 exactly, so here the
+        // agreement is exact rather than approximate.
+        CHECK_EQ(r[0], r[1]);
+        std::printf("    [carrier] relief at grade %lld mm/m: %lld mm at 30 m/px, %lld mm at "
+                    "1.875 m/px\n",
+                    (long long)gradeMmPerM, (long long)r[0], (long long)r[1]);
+    }
+}
+
+// Dead-flat ground must gate to the FLOOR and never to zero: that floor is the
+// only thing standing between a plain and the voxel terrace artifact, now that
+// the metre band is no longer flooded on flat ground.
+VXC_TEST(relief_gate_floors_on_flat_ground_and_never_reaches_zero) {
+    CHECK_EQ(reliefScaleQ10(0), kReliefScaleMinQ10);
+    CHECK(kReliefScaleMinQ10 > 0);
+    int64_t prev = 0;
+    for (int64_t r = 0; r <= 200000; r += 13) {
+        const int64_t g = reliefScaleQ10(r);
+        CHECK(g >= prev);
+        CHECK(g >= kReliefScaleMinQ10 && g <= kReliefScaleMaxQ10);
+        prev = g;
+    }
+    CHECK_EQ(prev, kReliefScaleMaxQ10);
+}
+
+// THE MEASUREMENT THAT JUSTIFIES THE WHOLE CHANGE, pinned as a test: the gate
+// must separate a plain from a mountain by roughly the amount their landforms
+// actually differ. The two inputs are the exemplars' measured relief on the
+// pinned world (see carrier.h); the assertion is on the RATIO the gate gives
+// them, because that ratio is the fix.
+VXC_TEST(relief_gate_separates_a_plain_from_a_mountain) {
+    const int64_t plains = 872, alpine = 15692; // measured, mm across the baseline
+    const int64_t gp = reliefScaleQ10(plains), ga = reliefScaleQ10(alpine);
+    std::printf("    [carrier] relief gate: plains %lld q10 (%lld mm), alpine %lld q10 "
+                "(%lld mm), ratio %lld.%02lldx\n",
+                (long long)gp, (long long)plains, (long long)ga, (long long)alpine,
+                (long long)(ga / gp), (long long)(100 * ga / gp % 100));
+    // v12's slopeScaleQ10 spanned 1.9x between these two sites and
+    // microScaleQ10 spanned 1.06x, which is why the same roughness landed on
+    // both. Anything under 5x here is a return to that failure.
+    CHECK(ga > gp * 5);
+    // The mountain sits near 1.0x by construction (kReliefRefMm is calibrated
+    // there), because alpine is the site whose detail level measured CORRECT.
+    CHECK(ga > 900 && ga < 1200);
+}
+

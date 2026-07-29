@@ -227,7 +227,7 @@ VXC_TEST(coarsegen_golden_digest) {
     // wired in per-brick or per-dispatch rather than per world coordinate.
     // (was 0x85B3E79EF8D01AFC at v5, 0xFCE6D8509799236D at v6..v11, and
     //  0xB812048EB08AA281 at the 700 mm cut of v12)
-    CHECK_EQ(d, 0x1833876BA6F3F9C3ull);
+    CHECK_EQ(d, 0x2595BA8ED2D0AE4Cull);
 }
 
 VXC_TEST(coarsegen_seed_sensitivity) {
@@ -271,7 +271,15 @@ VXC_TEST(coarsegen_fidelity_vs_true_mip) {
     // collision -- is unchanged to within noise, and material at level >= 2 is
     // distant-ring shading. If occupancy ever degrades, that is a different
     // conversation and this comment is not a licence for it.
-    const int64_t occCeilPermille[5] = {0, 60, 40, 40, 40};
+    // v13 raised L2 from 40 to 45. Measured 41 per mille against a 512-cell
+    // sample, i.e. 21 cells and a quantum of ~2 per mille -- this is one or two
+    // cells of movement, not a fidelity change. It moved because v13's carrier
+    // prefilter genuinely sharpens the coarse tier (it recovers 815-3222 mm of
+    // model output the B-spline was low-passing away), so a representative
+    // column represents its coarse cell very slightly less well. Occupancy at
+    // every other level improved or held: 50/41/14/18 against 60/45/40/40, with
+    // L3 and L4 roughly halving.
+    const int64_t occCeilPermille[5] = {0, 60, 45, 40, 40};
     // v10 raised L3 from 85 to 135. This is a REAL fidelity regression and is
     // recorded as one rather than absorbed: measured L3 material mismatch went
     // 85 -> 125 per mille when the bedding term landed.
@@ -290,7 +298,16 @@ VXC_TEST(coarsegen_fidelity_vs_true_mip) {
     // value, not at a round number, so further degradation still trips it.
     // Worth a look in-engine on a layered cliff at distance; if bedding reads as
     // shimmering across an LOD transition, this number is why.
-    const int64_t matCeilPermille[5] = {0, 90, 165, 135, 140};
+    // v13 raised L1 from 90 to 105 (measured 99) and LOWERED L2/L3/L4 to just
+    // above their measured values, because the same change that cost L1 bought
+    // a large improvement further out: 127/52/31 against v12's 165/135/140.
+    // The mechanism is the mirror of the L1 note above -- the relief-gated
+    // detail ladder no longer sprays metre-scale roughness over gentle ground,
+    // so a coarse cell's representative column agrees with its neighbours far
+    // more often at the levels where a cell spans metres. Tightening the
+    // ceilings that improved is the point of setting them just above the
+    // measurement rather than at a round number.
+    const int64_t matCeilPermille[5] = {0, 105, 135, 60, 40};
 
     for (int32_t level = 1; level <= 4; ++level) {
         const auto grid = gen.coarseColumns(level, 0, 0);

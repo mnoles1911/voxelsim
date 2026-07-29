@@ -107,14 +107,28 @@ namespace {
 // The only thing not shared with amplifier.cpp is the memo (cachedStencil),
 // which is a cache and cannot change a value.
 // ---------------------------------------------------------------------------
+// v13: the control stencil is PREFILTERED on a tier that ships raster samples
+// (carrier.h). This tool exists to say where the pipeline loses the model's
+// output, so a lookalike carrier that skipped the prefilter would report the
+// defect it was measuring as still present after it was fixed.
 int64_t carrierHeightMm(ITileSampler& tiles, int64_t vx, int64_t vy) {
     const int64_t xMm = vx * kVoxelSizeMm, yMm = vy * kVoxelSizeMm;
     const int64_t pxMm = tiles.pixelSizeMm();
     const int64_t px = floorDiv(xMm, pxMm), py = floorDiv(yMm, pxMm);
     const int64_t fx = xMm - px * pxMm, fy = yMm - py * pxMm;
     int64_t cp[16];
-    for (int j = 0; j < 4; ++j)
-        for (int i = 0; i < 4; ++i) cp[i + 4 * j] = tiles.elevationMm(px - 1 + i, py - 1 + j);
+    if (carrierPrefiltersSamples(pxMm)) {
+        constexpr int64_t S = kCarrierPrefilterSpan;
+        int64_t raw[S * S];
+        for (int64_t b = 0; b < S; ++b)
+            for (int64_t a = 0; a < S; ++a)
+                raw[a + S * b] = tiles.elevationMm(px + kCarrierPrefilterLo + a,
+                                                   py + kCarrierPrefilterLo + b);
+        carrierPrefilterStencil(raw, cp);
+    } else {
+        for (int j = 0; j < 4; ++j)
+            for (int i = 0; i < 4; ++i) cp[i + 4 * j] = tiles.elevationMm(px - 1 + i, py - 1 + j);
+    }
     return evalCarrier(cp, fx, fy, pxMm).heightMm;
 }
 

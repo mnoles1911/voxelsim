@@ -36,6 +36,46 @@
 // after-the-fact check that the gate held; FVoxelWorldImpl::MaybeLogCounters
 // logs it as an Error if it ever moves.
 //
+// --- WHY THE CHUNK-ADMISSION GATE WAS NOT ENOUGH -------------------------
+//
+// It was believed for some time that gating chunk ADMISSION
+// (FVoxelWorldImpl::RecomputeDesiredSet) covered the rule, because that is the
+// only path that VOXELIZES. It is not, and a run with a fine-tier root and no
+// resolvable tile proved it with 18.7 MILLION sea-level answers while not a
+// single chunk was admitted.
+//
+// The reason is structural, not a missing call site: FVoxelWorldImpl::Voxels is
+// CONSTRUCTED OVER WorldSampler() (see FVoxelWorldImpl's ctor). Every consumer
+// of the world -- not just meshing -- therefore reads the fine raster:
+// character-movement collision, the agent Tier-1 region graph (a 1,875-region
+// box rebuilt every 9.6 m of travel, ~4k solidity probes per region), the water
+// CA's solidity callback at 10 Hz, GetSurfaceHeightUU for pawn spawn and agent
+// placement, the SWE fixtures' 128x128 column surveys, the HUD's per-frame
+// readout. None of those admit a chunk, so none of them ever consulted the
+// gate, and there is no realistic prospect of finding and gating all of them:
+// the audit found ~100 sites, and site 101 is one commit away.
+//
+// SO THE RULE IS ENFORCED AT THE FUNNEL INSTEAD, in
+// FVoxelFineTileSamplerProxy::elevationMm -- the single choke point every one
+// of those consumers passes through. A query whose tile is not resident does
+// not get sea level:
+//
+//   * on the GAME THREAD it BLOCKS -- literally: it loads the tile
+//     synchronously (EnsureTileResident_Locked) and then answers correctly.
+//     This is legal precisely where RequestFootprint is legal, and it is where
+//     essentially all of the leaking consumers above run. "Block until ready"
+//     is implemented as blocking.
+//   * when the tile CANNOT be made resident (absent on disk, corrupt, or the
+//     caller is a worker that must not do I/O), there is no correct answer to
+//     give, so the query is reported as a GATE LEAK and, under
+//     SetLeakIsFatal(true), STOPS THE RUN. See the .cpp for the argument.
+//
+// The chunk-admission gate stays exactly where it is. It is still the right
+// thing: it defers whole chunks cheaply and in bulk, before any work, rather
+// than discovering misses one pixel at a time. The funnel check is the
+// backstop that makes the RULE true rather than the meshing path's local
+// convention.
+//
 // --- WIRED, AS OF THIS CHANGE -------------------------------------------
 //
 // WorldSampler() is the vxc::ITileSampler FVoxelWorldImpl::Voxels is
@@ -87,6 +127,7 @@
 #include "CoreMinimal.h" // FString/uint64/int64 -- see VoxelCoords.h for the same self-containment reasoning
 #include "Misc/ScopeRWLock.h"
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -203,6 +244,21 @@ public:
 	void SetRingRadiusTiles(int32_t Radius) { RingRadiusTiles_ = Radius; }
 	int32_t RingRadiusTiles() const { return RingRadiusTiles_; }
 
+	// WHAT A GATE LEAK DOES. A leak means a query could not be answered from a
+	// resident tile and could not be made resident either -- i.e. this run is
+	// now generating terrain no other client will reproduce.
+	//
+	//   true  => UE_LOG(Fatal) on the FIRST leak. The run stops.
+	//   false => Error once per distinct tile, then the sea-level answer, and
+	//            the run continues.
+	//
+	// FVoxelWorldImpl::Initialize sets this from FApp::IsUnattended() (which
+	// tools/voxel-capture.ps1 and the perf legs pass via -unattended), so an
+	// automated run stops and an interactive editor session does not. See the
+	// .cpp for why "stop" is the right default for an unattended run.
+	void SetLeakIsFatal(bool bFatal) { bLeakIsFatal_ = bFatal; }
+	bool LeakIsFatal() const { return bLeakIsFatal_; }
+
 	// Diagnostics (HUD/logging), mirroring the missingTileQueries convention
 	// already used elsewhere in this codebase for tile telemetry.
 	uint64 ResidentBytes() const;
@@ -225,6 +281,18 @@ public:
 	{
 		return Sampler_.blockDecodeFailures.load(std::memory_order_relaxed);
 	}
+	// Queries that found their tile non-resident AND could not be satisfied by
+	// a blocking load -- the leak count proper. Distinct from
+	// MissingTileQueriesSinceStart(), which the sampler bumps for the same
+	// queries but which no longer implies a leak on its own: a game-thread
+	// query that misses, blocks, loads and answers correctly leaves this at 0.
+	uint64 GateLeaksSinceStart() const { return GateLeaks_.load(std::memory_order_relaxed); }
+	// Queries the funnel had to satisfy with a synchronous load because no
+	// caller had gated them. Not an error -- this is block-until-ready doing
+	// its job -- but a large number means some consumer should be calling
+	// RequestFootprint in bulk instead of discovering misses one pixel at a
+	// time, and it is the number that explains a stuttering game thread.
+	uint64 BlockingLoadsSinceStart() const { return BlockingLoads_.load(std::memory_order_relaxed); }
 
 private:
 	friend class FVoxelFineTileSamplerProxy;
@@ -235,8 +303,20 @@ private:
 	// the load succeeded this call). Caller must already hold Lock_ exclusively.
 	bool EnsureTileResident_Locked(vxc::TileCoord Tile);
 	// Which coarse tiles the dilated footprint of this world-mm rect touches.
-	static void CoveredTileRange(int64 WorldMmX0, int64 WorldMmY0, int64 WorldMmX1, int64 WorldMmY1,
-	                             int32_t& OutTx0, int32_t& OutTy0, int32_t& OutTx1, int32_t& OutTy1);
+	// Thin wrapper over vxc::tilesCoveringFootprint -- the arithmetic lives in
+	// voxel-core so that tests/test_tilestreaming.cpp can exercise it with a
+	// tile ABSENT, which is the direction this gate was never tested in.
+	static std::vector<vxc::TileCoord> CoveredTiles(int64 WorldMmX0, int64 WorldMmY0, int64 WorldMmX1,
+	                                                int64 WorldMmY1);
+	// The cold path of FVoxelFineTileSamplerProxy::elevationMm: this pixel's
+	// tile was NOT resident. Blocks and loads on the game thread; otherwise
+	// (and if the load fails) reports a gate leak. Takes Lock_ itself, so the
+	// caller must NOT hold it.
+	int32_t ResolveNonResidentPixel(int64_t px, int64_t py);
+	// Records + reports one leak, and terminates the run when bLeakIsFatal_.
+	// Caller must already hold Lock_ exclusively. Returns the sea-level answer
+	// for the non-fatal case, so the expression reads as the fallback it is.
+	int32_t ReportGateLeak_Locked(vxc::TileCoord Tile, int64_t px, int64_t py);
 
 	FString RootDir_;
 	std::string ProviderId_;
@@ -264,4 +344,21 @@ private:
 	uint64 IdentityMismatches_ = 0;
 	uint64 MissingFileLoads_ = 0;
 	uint64 TilesLoaded_ = 0;
+	// Gate-leak bookkeeping. Written only under Lock_ held exclusively (the
+	// funnel's cold path is the only writer) but READ without it by
+	// MaybeLogCounters on the game thread, so atomic: a torn or racing read of
+	// a plain uint64 here is UB, and this is the counter the whole
+	// after-the-fact correctness check rests on. Relaxed ordering is right --
+	// nothing is published through these, they are only ever compared against
+	// their own previous value.
+	std::atomic<uint64> GateLeaks_{0};
+	std::atomic<uint64> BlockingLoads_{0};
+	// Written once by SetLeakIsFatal before the streamer is handed to the world
+	// (MakeFineTileStreamer), read on every leak thereafter -- publish before
+	// use, so a plain bool is sound.
+	bool bLeakIsFatal_ = false;
+	// Tiles already reported, so a non-fatal run logs once per tile instead of
+	// 18.7 million times. Not cleared with KnownMissing_: the point is the
+	// LOG's volume, and a tile that reappears has already had its say.
+	std::unordered_set<uint64> LeakReportedTiles_;
 };

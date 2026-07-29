@@ -1,8 +1,45 @@
-"""B2e — stream-power incision depth.
+"""B2e — stream-power incision.
 
-`depth = K * A^m * S^n`, the detachment-limited stream-power law. It is the pass that turns
-a flow field into landform: without it the drainage network exists in the accumulation
-array and nowhere in the ground.
+Two formulations, and the measurement that forced the second:
+
+`stream_power` — the original per-cell depth law, `depth = K * A^m * S^n`, subtracted
+from the surface. It is the pass that turns a flow field into landform: without it the
+drainage network exists in the accumulation array and nowhere in the ground.
+
+`profile_incision` — the same detachment-limited stream-power law solved IMPLICITLY
+along the D8 receiver tree (Braun & Willett 2013), one downstream-to-upstream pass:
+
+    z_new(c)  solves  z_new = z - K_dt * A^m * ((z_new - z_new(rcv)) / dist)^n
+
+**Why the second exists.** The per-cell depth law paints depth onto the carrier; it
+cannot re-grade a channel's LONG PROFILE, because each cell's cut is decided by the
+carrier's local slope alone. Measured on the three exemplar tiles
+(docs/terrain-validation-2026-07.md section 7.1, and the stage dumps of 2026-07-29):
+at 30 m, where the carrier already carries real concavity, incision is fine (alpine
+theta 0.194 -> 0.207 against the Alps' 0.203); in the sub-30 m band the bake invents,
+theta reads 0.028-0.086 against 0.177-0.318 for matched real 1 m DTMs, and the depth
+law moves it the WRONG way (B0+B1 0.083 -> B2d 0.040 on alpine). Neither the 25 m cap
+(binds only at A >= 1e6 m^2, 0.06-2.5% of channel cells) nor B3 thermal (median carved
+depth survives it at ratio 1.00) is the mechanism -- both were measured before this
+formulation was written. The implicit solve grades each channel toward its own
+steady-state profile, which is the thing the depth law cannot do, and on the same
+alpine window moves theta 0.065 -> 0.240 (r^2 0.93) into the real 0.18-0.32 band.
+
+Three properties the solve gives that the depth law could not:
+
+  * **z_new >= z_new(receiver) by construction** -- the carve can never cut below the
+    downstream profile, so "a single cell with an enormous catchment punching a shaft
+    through the tile" is structurally impossible, not clamped away. (The cap is kept
+    anyway: it bounds total lowering where the graded profile is far below the
+    carrier, e.g. a trunk crossing a carrier bump, and K_dt = 15 UNCAPPED was measured
+    at 679 m of incision -- the failure mode is real.)
+  * **No carve-created pits along the network** (the depth law leaves the channel bed
+    non-monotone wherever d(depth)/dx < -slope, which the next fill flattens into
+    slope-free segments).
+  * **The profile information travels upstream along the tree**, which is exactly the
+    non-locality the apron cannot bound. That is the same class as flow accumulation
+    (HYDROLOGY_RESIDUALS), it is bounded in magnitude by `cap_m`, and it is measured
+    rather than assumed -- see the seam numbers in the pipeline's B2d block comment.
 
 **K is the single most important knob in the whole bake, and none of the summary statistics
 distinguish a good value from a useless one — only a hillshade does.** Measured on a real
@@ -41,14 +78,18 @@ Two caveats on that calibration, recorded so they are not rediscovered:
 
 `tools/calibrate_stream_k.py` is that whole procedure as a file.
 
-numpy only; no scipy, no numba.
+numpy for `stream_power`; `profile_incision` compiles its tree pass with numba when
+available (the bake pod has it) and falls back to a pure-python loop that is fine for
+test grids and hopeless for a real tile -- the same trade `flow.py` makes. No scipy.
 """
 
 from __future__ import annotations
 
+import functools
+
 import numpy as np
 
-__all__ = ["stream_power"]
+__all__ = ["stream_power", "profile_incision"]
 
 # Slope floor. Flow routing hands back S == 0 on filled pits and flats; without a floor the
 # `S**n` term is 0**0.8 == 0 there, which is fine, but the epsilon also keeps the function
@@ -175,3 +216,215 @@ def stream_power(acc: np.ndarray, slope: np.ndarray, K: float = 0.15,
         depth = depth * (t * t * (np.float32(3.0) - np.float32(2.0) * t))
 
     return np.minimum(depth, np.float32(cap_m))
+
+
+# ---------------------------------------------------------------------------
+# The implicit profile solve.
+# ---------------------------------------------------------------------------
+
+def _jit(**options):
+    """`numba.njit` deferred to first call, exactly `flow._jit`'s pattern.
+
+    Importing this module must not require numba (CI has none); the python
+    fallback is the reference implementation and is fine at test sizes.
+    """
+
+    def decorate(pyfunc):
+        state = {}
+
+        def dispatch(*args):
+            fn = state.get("fn")
+            if fn is None:
+                try:
+                    import numba
+                    fn = numba.njit(**options)(pyfunc)
+                except ImportError:  # pragma: no cover - the CI path
+                    fn = pyfunc
+                state["fn"] = fn
+            return fn(*args)
+
+        functools.update_wrapper(dispatch, pyfunc)
+        dispatch.py_func = pyfunc
+        return dispatch
+
+    return decorate
+
+
+@_jit(cache=True)
+def _profile_pass(order, rec, z, kfac, dist, n_exp, cap, out):
+    """One downstream-to-upstream Newton pass over the D8 tree.
+
+    ``order`` is ascending filled elevation, so a receiver (strictly lower on
+    the epsilon-filled surface) is always final before any of its donors is
+    visited. Sequential by nature -- a donor reads its receiver's SOLVED
+    elevation -- so, like the priority flood, do not reach for parallel=True.
+
+    The arrays are float32/int32 -- at the padded production domain every
+    float64 working array is 680 MB against the pod's 8 GiB, and the peak
+    already measures 5.5 GiB -- while the Newton itself runs in float64
+    scalars. The 1e-4 m tolerance is 0.1 mm, one thousandth of the wire LSB.
+    """
+    n = order.size
+    for k in range(n):
+        c = order[k]
+        r = rec[c]
+        zc = np.float64(z[c])
+        if r < 0 or kfac[c] <= 0.0:
+            out[c] = z[c]
+            continue
+        zr = np.float64(out[r])
+        if zc <= zr:
+            # A flat/inversion the epsilon fill did not resolve; do not erode
+            # into it, the receiver is already at or above us.
+            out[c] = z[c]
+            continue
+        # Solve f(x) = x - zc + kfac * ((x - zr) / dist)^n = 0 on (zr, zc].
+        # f(zr) = zr - zc < 0 and f(zc) > 0, f' >= 1, so the root exists, is
+        # unique, and Newton from x = zc converges monotonically downward;
+        # the half-step pullback guards the n < 1 derivative blowup at x = zr.
+        x = zc
+        dx = np.float64(dist[c])
+        kf = np.float64(kfac[c])
+        for _ in range(24):
+            s = (x - zr) / dx
+            if s < 0.0:
+                s = 0.0
+            f = x - zc + kf * s ** n_exp
+            if s > 0.0:
+                fp = 1.0 + kf * n_exp * (s ** (n_exp - 1.0)) / dx
+            else:
+                fp = 1.0
+            step = f / fp
+            x -= step
+            if x < zr:
+                x = 0.5 * ((x + step) + zr)
+            if abs(step) < 1e-4:
+                break
+        if x < zr:
+            x = zr
+        if x > zc:
+            x = zc
+        if cap > 0.0 and zc - x > cap:
+            x = zc - cap
+        out[c] = x
+
+
+def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
+                     m: float = 0.45, n: float = 0.8, cap_m: float = 25.0,
+                     a_crit_m2: float = A_CRIT_M2, gate_q: float = GATE_Q,
+                     regional_slope=None, regional_s_ref: float = 0.2,
+                     sea_taper_top_m: float = SEA_TAPER_TOP_M,
+                     sea_taper_bottom_m: float = SEA_TAPER_BOTTOM_M) -> np.ndarray:
+    """Eroded surface in **metres** -- the implicit stream-power step.
+
+    `filled`    the epsilon-filled surface the routing ran on (metres). It is
+                both the surface being carved and the elevation the sea taper
+                reads, which keeps the taper identical to `stream_power`'s.
+    `receivers` D8 receiver as flat index `y*w + x`, -1 where none, i.e. the
+                first return of `flow.d8_receivers(filled, cell_m)`.
+    `acc`       MFD contributing area, m^2.
+    `K_dt`      erosion number: K times the pass's pseudo-time. At small values
+                this reproduces `stream_power`'s explicit depth to first order;
+                as it grows, each channel approaches the steady-state graded
+                profile `S = (relief-rate/K)^(1/n) * A^(-m/n)`. It is a new
+                constant rather than `stream_K` because the two are only
+                dimensionally comparable at small depths.
+    `cap_m`     total-lowering bound, applied AFTER the solve. 0 disables --
+                do not: K_dt = 15 uncapped measured 679 m of incision on the
+                alpine exemplar. The structural guarantee z >= z_rcv makes a
+                shaft impossible but not a canyon.
+    `regional_slope` OPTIONAL 30 m-scale slope of the CARRIER (not the
+                per-cell fine slope -- that variant double-counts S and is
+                refuted, see the note below). When given, the erodibility is
+                scaled by ``min(1, S_reg / regional_s_ref)^n``: erosion energy
+                follows regional relief, which is the one piece of
+                class-identity information the bake legitimately has. Why it
+                is needed, measured on the exemplars: WITHOUT it, the solve
+                has no uplift term, so its steady state is a peneplain at
+                every A -- big-catchment trunks grade toward base level
+                regardless of how gentle the landscape is, and a till plain
+                whose whole relief is 200 m grew 12 m median channel trenches
+                and 2.5x its real mean slope at every scale rung. WITH it
+                (s_ref 0.2) the same K_dt leaves the plains exemplar's mean
+                slope within 5-35% of the un-eroded surface (K_dt 1.5-4.5)
+                while the alpine window keeps theta 0.146 (r^2 0.90).
+
+    Returns float32, `filled.shape`; everywhere `<= filled`, `>= filled - cap_m`
+    (when capped), and monotone along the receiver tree: `out[c] >= out[rec[c]]`
+    wherever the receiver is strictly lower, so the carve introduces no new pit
+    on its own network.
+    """
+    z = np.asarray(filled, dtype=np.float32)
+    if z.ndim != 2:
+        raise ValueError(f"filled must be 2-D, got shape {z.shape}")
+    rec = np.asarray(receivers, dtype=np.int64).ravel()
+    a = np.asarray(acc, dtype=np.float64)
+    if a.shape != z.shape:
+        raise ValueError(f"acc {a.shape} must match filled {z.shape}")
+    if rec.size != z.size:
+        raise ValueError(f"receivers has {rec.size} cells, filled {z.size}")
+    if K_dt < 0.0:
+        raise ValueError(f"K_dt must be non-negative, got {K_dt}")
+    if cap_m < 0.0:
+        raise ValueError(f"cap_m must be >= 0 (0 disables), got {cap_m}")
+    if a_crit_m2 < 0.0:
+        raise ValueError(f"a_crit_m2 must be non-negative, got {a_crit_m2}")
+    if gate_q <= 0.0:
+        raise ValueError(f"gate_q must be positive, got {gate_q}")
+    if float(cell_m) <= 0.0:
+        raise ValueError(f"cell_m must be positive, got {cell_m}")
+
+    # K_dt * A^m, with the same channel-initiation gate and sea-level taper as
+    # `stream_power` -- multiplied into the erodibility rather than the depth,
+    # which for the gate is the same thing and for the taper keeps the solved
+    # profile continuous across the shelf break.
+    # NOTE deliberately no S^n factor here: the solve evaluates stream power
+    # at the SOLVED slope -- `S_new^n` is inside the Newton residual -- so
+    # multiplying the erodibility by the pre-carve slope as well would count S
+    # twice. That variant was tried (it looked like "keep gentle ground
+    # gentle") and measured: it collapses the concavity gain (alpine theta
+    # 0.240 -> 0.077 at matched depth) because re-grading a profile is exactly
+    # the case where the pre-carve slope is the wrong slope.
+    #
+    # Working arrays are float32/int32 on purpose -- see _profile_pass.
+    af = np.clip(a, 0.0, None)
+    kfac = (np.float64(K_dt) * np.power(af, np.float64(m)))
+    if regional_slope is not None:
+        sreg = np.asarray(regional_slope, dtype=np.float64)
+        if sreg.shape != z.shape:
+            raise ValueError(f"regional_slope {sreg.shape} must match filled {z.shape}")
+        if regional_s_ref <= 0.0:
+            raise ValueError(f"regional_s_ref must be positive, got {regional_s_ref}")
+        kfac *= np.minimum(1.0, np.clip(sreg, 0.0, None) / np.float64(regional_s_ref)
+                           ) ** np.float64(n)
+    if a_crit_m2 > 0.0:
+        aq = np.power(af, np.float64(gate_q))
+        kfac *= aq / (aq + np.float64(a_crit_m2) ** np.float64(gate_q))
+    if sea_taper_bottom_m < sea_taper_top_m:
+        t = (z - np.float64(sea_taper_bottom_m)) / np.float64(
+            sea_taper_top_m - sea_taper_bottom_m)
+        t = np.clip(t, 0.0, 1.0)
+        kfac *= t * t * (3.0 - 2.0 * t)
+    kfac = kfac.astype(np.float32).ravel()
+
+    h, w = z.shape
+    if z.size > np.iinfo(np.int32).max:
+        raise ValueError(f"domain of {z.size} cells exceeds the int32 order index")
+    zf = np.ascontiguousarray(z).ravel()
+    order = np.argsort(zf, kind="stable").astype(np.int32)
+    rec32 = rec.astype(np.int32)
+    idx = np.arange(rec.size, dtype=np.int64)
+    tgt = np.where(rec >= 0, rec, idx)
+    diag = ((np.abs(idx // w - tgt // w) > 0) & (np.abs(idx % w - tgt % w) > 0))
+    dist = np.where(diag, float(cell_m) * _R2_DIST, float(cell_m)).astype(np.float32)
+    del idx, tgt, diag, a, af
+    # Seeded with the input, not empty: if a caller's fill ever produced a tie
+    # in float32, the tied donor would read its receiver's UNSOLVED elevation
+    # and take the no-erosion branch -- a safe degradation instead of a read
+    # of uninitialised memory.
+    out = zf.copy()
+    _profile_pass(order, rec32, zf, kfac, dist, float(n), float(cap_m), out)
+    return out.reshape(h, w)
+
+
+_R2_DIST = 1.4142135623730951

@@ -448,6 +448,120 @@ def test_sea_level_taper_is_smooth_not_a_step():
         "an empty taper range must reproduce the ungated result exactly"
 
 
+def _channel_strip(ncells=64, drop_per_cell=1.0, base=100.0):
+    """A 1 x N channel draining LEFT: receivers point to i-1, area grows
+    downstream. The simplest tree the profile solve can be read on."""
+    n = ncells
+    z = base + drop_per_cell * np.arange(n, dtype=np.float64)[None, :]
+    rec = np.arange(-1, n - 1, dtype=np.int64)[None, :]  # rec[0] = -1 (outlet)
+    acc = (3.52 * (n - np.arange(n, dtype=np.float64)) ** 2 * 1e2)[None, :]
+    return z, rec, acc
+
+
+def test_profile_incision_is_bounded_monotone_and_pit_free():
+    """The three structural guarantees the depth law could not give: the carve
+    never exceeds the cap, never cuts below the receiver's SOLVED elevation
+    (that is what makes a shaft impossible rather than clamped), and leaves the
+    channel bed monotone -- the explicit law leaves the bed non-monotone
+    wherever d(depth)/dx < -slope, which the next fill flattens into the
+    slope-free channel segments the concavity measurement then reads."""
+    z, rec, acc = _channel_strip()
+    out = incise.profile_incision(z, rec, acc, 1.875, K_dt=1.5, cap_m=5.0)
+    out = out.astype(np.float64)
+    assert out.shape == z.shape
+    assert np.all(out <= z + 1e-6), "erosion only"
+    assert np.all(z - out <= 5.0 + 1e-5), "cap bounds total lowering"
+    flat = out[0]
+    assert np.all(flat[1:] >= flat[:-1] - 1e-9), \
+        "bed must stay monotone along the receiver chain: no carve-created pits"
+
+
+def test_profile_incision_small_K_dt_reproduces_the_explicit_law():
+    """First-order consistency: for small K_dt the implicit step must agree
+    with `stream_power`'s depth read at the same (A, S) -- they are the same
+    law, and a formulation change that moved the small-erosion limit would be
+    a retune smuggled in as a solver."""
+    z, rec, acc = _channel_strip(drop_per_cell=2.0)
+    # Small means the carve is far below the 2 m per-cell drop; at larger K_dt
+    # the receiver's own solved lowering legitimately enters the slope (that
+    # upstream propagation IS the formulation), so first-order agreement is
+    # only claimed where erosion << relief.
+    k_dt = 1e-5
+    out = incise.profile_incision(z, rec, acc, 1.875, K_dt=k_dt, cap_m=25.0)
+    slope = np.full_like(z, 2.0 / 1.875)
+    explicit = incise.stream_power(acc, slope, K=k_dt, cap_m=25.0)
+    got = (z - out.astype(np.float64))[0, 1:]
+    want = explicit.astype(np.float64)[0, 1:]
+    # float32 output rounds elevations near 200 m to ~1.5e-5 m, so relative
+    # agreement is only claimable where the depth is well above that floor.
+    big = want > 1e-3
+    assert big.sum() >= 32, "fixture must resolve depths above the f32 floor"
+    assert np.all(np.abs(got - want)[big] <= 0.02 * want[big]), \
+        "small-K_dt implicit step must match the explicit depth to first order"
+
+
+def test_profile_incision_grades_a_concave_profile():
+    """The reason the formulation exists: on a uniform ramp (constant S, A
+    growing downstream), the solved bed must come out CONCAVE -- slope falling
+    as area grows -- which one explicit pass cannot produce because it reads
+    only the pre-carve slope. Measured at production scale this is theta
+    0.065 -> 0.240 on the alpine exemplar; here it is the same fact stripped
+    to a strip."""
+    z, rec, acc = _channel_strip(ncells=256, drop_per_cell=0.5)
+    out = incise.profile_incision(z, rec, acc, 1.875, K_dt=5.0, cap_m=50.0)
+    bed = out.astype(np.float64)[0]
+    s = np.diff(bed) / 1.875
+    up = s[200:220].mean()      # small-A end
+    down = s[20:40].mean()      # large-A end (drains left)
+    assert down < 0.7 * up, (
+        f"bed slope must fall with area (down {down:.4f} vs up {up:.4f}); "
+        "a flat ratio means the solve is not re-grading the profile"
+    )
+    # ... and the input ramp really was slope-uniform, so the concavity is the
+    # solve's doing, not the fixture's.
+    assert np.allclose(np.diff(z[0]), 0.5)
+
+
+def test_profile_incision_regional_scale_is_the_uplift_standin():
+    """kfac scales by min(1, S_reg/s_ref)^n: flat regional ground must not be
+    re-graded (the no-uplift solve's peneplain steady state is exactly what
+    dug 12 m trenches through a till plain), and ground at or above the
+    reference must erode exactly as if the scale were absent."""
+    z, rec, acc = _channel_strip()
+    steep = np.full_like(z, 0.5)
+    flat = np.full_like(z, 0.0)
+    unscaled = incise.profile_incision(z, rec, acc, 1.875, K_dt=1.5)
+    same = incise.profile_incision(z, rec, acc, 1.875, K_dt=1.5,
+                                   regional_slope=steep)
+    none = incise.profile_incision(z, rec, acc, 1.875, K_dt=1.5,
+                                   regional_slope=flat)
+    np.testing.assert_array_equal(same, unscaled)
+    np.testing.assert_allclose(none, z.astype(np.float32), rtol=0, atol=1e-5)
+    half = incise.profile_incision(z, rec, acc, 1.875, K_dt=1.5,
+                                   regional_slope=np.full_like(z, 0.1))
+    d_half = (z - half.astype(np.float64)).sum()
+    d_full = (z - unscaled.astype(np.float64)).sum()
+    assert 0.0 < d_half < d_full, "intermediate regional slope erodes partially"
+
+
+def test_profile_incision_respects_gate_taper_and_validation():
+    z, rec, acc = _channel_strip()
+    # channel-initiation gate: a hillslope's area erodes ~nothing
+    tiny = np.full_like(acc, 10.0)
+    out = incise.profile_incision(z, rec, tiny, 1.875, K_dt=1.5)
+    assert np.all(z - out.astype(np.float64) < 1e-4)
+    # abyssal cells are untouched, exactly like stream_power's taper
+    deep = z - 3000.0
+    out = incise.profile_incision(deep, rec, acc, 1.875, K_dt=1.5)
+    assert np.allclose(out, deep), "no subaerial fluvial erosion at 3 km depth"
+    with pytest.raises(ValueError, match="K_dt"):
+        incise.profile_incision(z, rec, acc, 1.875, K_dt=-1.0)
+    with pytest.raises(ValueError, match="acc"):
+        incise.profile_incision(z, rec, np.zeros((3, 3)), 1.875)
+    with pytest.raises(ValueError, match="cell_m"):
+        incise.profile_incision(z, rec, acc, 0.0)
+
+
 def test_stream_power_default_K_carves_metres_not_millimetres():
     """LESSON: K is the one knob that decides whether the bake reads as terrain.
 

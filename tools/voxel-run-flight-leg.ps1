@@ -180,19 +180,24 @@ if ($elapsed -lt ($expected * 0.9)) {
     return $false
 }
 
-# THE WALL-CLOCK TEST ALONE IS NOT AN ACCEPTANCE TEST, and this is the second
-# thing it let through. `$elapsed` is measured from Start-Process, so it includes
-# ~20 s of editor startup before the run's own clock begins; at a 0.9 threshold a
-# leg can lose ~45 s of the phase being measured and still print "ok". One leg
-# did exactly that -- it exited 6 s short of completing its flight and was caught
-# only because it happened to fall under 0.9 as well.
+# THE WALL-CLOCK TEST ALONE IS NOT AN ACCEPTANCE TEST, and it has now let a bad
+# leg through. `$elapsed` is measured from Start-Process, so it includes ~20 s of
+# editor startup before the run's own clock begins; at a 0.9 threshold a leg can
+# lose ~45 s of the phase being measured and still print "ok". One leg exited 6 s
+# short of completing its flight and was caught only because it also happened to
+# fall under 0.9 -- luck, not a check.
 #
-# So ask the RUN whether it finished, not the wall clock. Two independent
-# witnesses, both produced by UVoxelPerfRunSubsystem before it calls RequestExit:
+# So ask the RUN whether it finished, not the wall clock. Two witnesses, both
+# produced by UVoxelPerfRunSubsystem before it calls RequestExit:
 #   * "VoxelPerfRun complete" in the log, and
 #   * Saved/PerfRuns/perf_*.json, written BEFORE the exit request -- so its
 #     absence proves FinishRun never ran, which no timing heuristic can.
-# Either one missing means the leg did not finish, whatever the clock says.
+# Verified against the archive: v10-flight-1 (the leg that died early) has no
+# completion line; v10-flight-2 and -3 both do. This discriminates the real cases.
+#
+# (Two sessions arrived at this same check independently and it merged as a
+# conflict. This is main's wording, kept because it names the archive legs the
+# discrimination was verified against.)
 $logSaysComplete = (Test-Path $LogPath) -and
     (Select-String -Path $LogPath -Pattern 'VoxelPerfRun complete' -Quiet)
 $perfDir = Join-Path (Split-Path $Project) 'Saved\PerfRuns'
