@@ -2596,7 +2596,11 @@ CurvGateCal calibrateCurvatureGate(ITileSampler& tiles, const CalLattice& L, dou
     k.reserve(static_cast<size_t>(L.n * L.n));
     for (int64_t j = 0; j < L.n; ++j)
         for (int64_t i = 0; i < L.n; ++i)
-            k.push_back(probeCurvatureQ10(tiles, L.vx0 + i * L.strideVox, L.vy0 + j * L.strideVox));
+            // The TIER-NORMALISED value, because that is what the gate is
+            // handed. At 30 m the normalisation is the identity and this makes
+            // no difference; on the fine tier it is a factor of 256, and a knee
+            // solved against the raw quantity there would be wrong by that much.
+            k.push_back(probeGateInputQ10(tiles, L.vx0 + i * L.strideVox, L.vy0 + j * L.strideVox));
     g.nPts = static_cast<int64_t>(k.size());
     if (k.empty()) return g;
     std::vector<int64_t> sorted = k;
@@ -3194,18 +3198,34 @@ void runCalibration(uint64_t seed, ITileSampler& tiles, Amplifier& amp, int64_t 
                     static_cast<int>(std::llround(static_cast<double>(sol.ampMmInt[i]) /
                                                   (cg.rmsGain > 0 ? cg.rmsGain : 1.0))),
                     sol.ampMmInt[i]);
-    // Curvature is spectral: kappa ~ S2(b)/b^2 ~ C b^(H-2), so moving the
-    // baseline from the coarse pixel to the fine tier's 1.875 m scales the whole
-    // distribution — and therefore the knee — by that ratio. This is the
-    // quantified form of carrier.h's warning that the knee will not transfer.
-    const double tierScale = std::pow(1.875 / pxM, useH - 2.0);
-    std::printf("  fine-tier (1.875 m baseline) curvature scale factor = (1.875/%.3f)^(H-2) = "
-                "%.2fx\n",
-                pxM, tierScale);
+    // WILL THIS KNEE TRANSFER TO THE FINE TIER? Partly, and the two effects have
+    // to be separated or the answer is wrong by an order of magnitude.
+    //
+    //   (a) The PURELY GEOMETRIC part -- curvature measured over a shorter
+    //       baseline is larger by (b_fine/b_coarse)^-2 -- is already removed:
+    //       carrierCurvatureTierNormQ10 divides it out, and this block feeds the
+    //       gate the normalised value. So the knee IS tier-invariant against
+    //       that, which is exactly what that function was added for.
+    //
+    //   (b) The SPECTRAL part is NOT removed and cannot be. A 1.875 m raster
+    //       resolves real relief the 30 m raster never carried, so its
+    //       normalised curvature distribution is genuinely WIDER, by roughly
+    //       (1.875/pxM)^(H-2) / (1.875/pxM)^-2 = (1.875/pxM)^H if the measured
+    //       power law continues. That is a statement about the DATA, not about
+    //       units, and only a baked fine tier settles it.
+    const double geomFactor = std::pow(1.875 / pxM, -2.0);
+    const double spectralFactor = std::pow(1.875 / pxM, useH);
+    std::printf("  transfer to the 1.875 m fine tier:\n");
+    std::printf("    geometric factor %.1fx  -- ALREADY REMOVED by carrierCurvatureTierNormQ10\n",
+                geomFactor);
+    std::printf("    spectral factor  %.3fx  -- NOT removed: the fine raster carries relief the\n"
+                "                              coarse one does not, so its normalised curvature\n"
+                "                              distribution is genuinely different\n",
+                spectralFactor);
     if (cg.kneeSolved)
-        std::printf("    -> predicted fine-tier knee ~ %.4f mm/m^2. PREDICTED, not measured;\n"
-                    "       re-run with --fine-dir to measure it.\n",
-                    cg.kneeForTarget * tierScale);
+        std::printf("    -> predicted fine-tier knee ~ %.4f mm/m^2 (tier-normalised).\n"
+                    "       PREDICTED from the measured H, not measured; re-run with --fine-dir.\n",
+                    cg.kneeForTarget * spectralFactor);
 
     // ======================================================================
     // RILL — constrained by anisotropy, NOT by S2
@@ -3415,7 +3435,7 @@ void runCalibration(uint64_t seed, ITileSampler& tiles, Amplifier& amp, int64_t 
     row("cal.curv.knee_for_target", cg.kneeSolved ? cg.kneeForTarget : -1.0, "mm/m2_-1_if_none");
     row("cal.curv.target_ratio", curvRatioTarget, "dimensionless");
     row("cal.curv.rms_gain", cg.rmsGain, "dimensionless");
-    row("cal.curv.fine_tier_scale", tierScale, "dimensionless");
+    row("cal.curv.fine_tier_spectral_factor", spectralFactor, "dimensionless_geom_part_removed");
     rowI("cal.rill.points", (long long)rillPts, "count");
     row("cal.rill.kernel_aniso_1m6", rAlong[0] > 0 ? rAcross[0] / rAlong[0] : 0.0,
         "dimensionless");
