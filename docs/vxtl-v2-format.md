@@ -101,6 +101,19 @@ Section ids: `ELEV_INDEX` = 1, `ELEV_DATA` = 2, `FLOW_INDEX` = 3, `FLOW_DATA` = 
 tested before any compression dependency exists; `CODEC_ZSTD` is added without touching the
 format. Do not gate the decoder's correctness tests on having zstd.
 
+**Where the zstd decompressor lives (decided 2026-07-29): NOT inside voxel-core.** It is injected
+at the host boundary as an optional decompressor callback on the parse entry point, defaulting to
+null (= `CODEC_RAW` only). Two reasons, and the second is the serious one: voxel-core currently has
+**zero** third-party dependencies and that is deliberate; and voxel-core is linked into a UE 5.8
+project which **already ships zstd** in `Engine/Source/ThirdParty`, so a second static copy in the
+same binary is an ODR/symbol-collision risk rather than mere bloat. The UE module passes the
+engine's zstd; the headless harness passes its own. This keeps decode a pure function of the bytes
+(§7) either way, because zstd frame decode is bit-exact by format definition.
+
+This is a *when*, not an *if*: ~21–25 MB/tile is the **compressed** figure, while the `CODEC_RAW`
+form of an 8192² lattice is 134 MB (268 MB if blocks need 32-bit residuals). Production streaming
+needs zstd; it just belongs at the boundary rather than inside the deterministic core.
+
 ## 4. Block index and data
 
 `ELEV_INDEX` is `(size >> block_log2)²` entries, row-major, x fastest:
@@ -116,9 +129,23 @@ format. Do not gate the decoder's correctness tests on having zstd.
 
 Blocks are **independent** — one frame each, no shared dictionary, no cross-block prediction. That
 is what buys per-block random access: the client decodes only the ~0.23 km² blocks it needs, not
-134 MB. A decoded block is 128 KB.
+134 MB. A decoded block is 128 KB. "Independent" also fixes the predictor's edge rules: they are
+**block-local**, so the first row and column of every block use the §5 edge cases rather than
+reaching into a neighbouring block.
 
-`CONSTANT` blocks cost zero bytes and are common (ocean, flat basin).
+The three modes, all of which a decoder must handle (§5's closing note explains why mode selection
+is encoder policy):
+
+- **`CONSTANT`** — the whole block is `const_cp`. Zero data bytes. Common: ocean, flat basin.
+- **`CODED`** — §5 MED residuals, zigzagged, `resid_bits` wide.
+- **`RAW`** — **literal control points, `int16` little-endian, row-major, no prediction and no
+  zigzag.** Exactly `2 × (1 << block_log2)²` bytes.
+
+**`RAW`'s payload definition is load-bearing and cannot be inferred.** Under `CODEC_RAW` a literal
+`int16` plane and a `resid_bits = 16` MED-residual plane have **identical lengths**, so no length,
+bounds or structural check can distinguish them — a decoder that guesses wrong produces plausible
+geometry that is simply wrong terrain. (Measured on the golden fixture: reading its `RAW` block as
+MED residuals reconstructs to ±4.19 M.) `resid_bits` is meaningless in this mode and is written 0.
 
 ## 5. Predictor and residual coding
 
