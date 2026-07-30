@@ -1454,6 +1454,51 @@ struct SurfaceEval
     int surfaceMm;
 };
 
+// THE 4x4 CONTROL STENCIL, IN ONE PLACE. Prefiltered on a tier that ships raster
+// SAMPLES (the 30 m s1 raster), read straight through on a tier that already ships
+// control points (the baked fine tier).
+//
+// WHY IT IS A FUNCTION NOW. This was written out twice -- once in evalSurface and
+// once in columnCarrierSlopeMmPerM -- and the two copies were NOT the same: the
+// second did the raw 4x4 read unconditionally and so skipped the prefilter on the
+// coarse tier. That is a latent divergence in shipped v15, because the CPU's
+// density3 slope comes from evalSurface's PREFILTERED carrier while the GPU's came
+// from an unprefiltered one. vxc_gpu passes at v15 only because the slope feeds a
+// THRESHOLD (density3SlopeGateQFromMag) and no tested column sits near enough to
+// it for the difference to flip the gate. It surfaced the moment a v16 experiment
+// perturbed slopes by a few mm/m: cpu=2 gpu=0 on the top cells of gated columns,
+// with every column field still matching.
+//
+// One definition, two callers, so the copies cannot disagree again. This is the
+// same duplication that made four ablations void earlier in this session -- a
+// constant mirrored in two files that only one of them was edited in.
+void buildCarrierCp(int64_t px, int64_t py, int64_t pxMm, out int64_t cp[16])
+{
+    if (pxMm >= kCarrierSampleTierMinPixelMm)
+    {
+        int64_t raw[kCarrierPrefilterSpan * kCarrierPrefilterSpan];
+        [unroll]
+        for (int b = 0; b < kCarrierPrefilterSpan; ++b)
+        {
+            [unroll]
+            for (int a = 0; a < kCarrierPrefilterSpan; ++a)
+                raw[a + kCarrierPrefilterSpan * b] = (int64_t)rasterElevationMm(
+                    px + kCarrierPrefilterLo + a, py + kCarrierPrefilterLo + b);
+        }
+        carrierPrefilterStencil(raw, cp);
+    }
+    else
+    {
+        [unroll]
+        for (int j = 0; j < 4; ++j)
+        {
+            [unroll]
+            for (int i = 0; i < 4; ++i)
+                cp[i + 4 * j] = (int64_t)rasterElevationMm(px - 1 + i, py - 1 + j);
+        }
+    }
+}
+
 SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
 {
     const int64_t xMm = vx * kVoxelSizeMm;
@@ -1481,29 +1526,7 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     // CPU memoises this per cell; the GPU recomputes it per column, which is
     // 144 buffer loads against 16 and is the whole cost of the change.
     int64_t cp[16];
-    if (pxMm >= kCarrierSampleTierMinPixelMm)
-    {
-        int64_t raw[kCarrierPrefilterSpan * kCarrierPrefilterSpan];
-        [unroll]
-        for (int b = 0; b < kCarrierPrefilterSpan; ++b)
-        {
-            [unroll]
-            for (int a = 0; a < kCarrierPrefilterSpan; ++a)
-                raw[a + kCarrierPrefilterSpan * b] = (int64_t)rasterElevationMm(
-                    px + kCarrierPrefilterLo + a, py + kCarrierPrefilterLo + b);
-        }
-        carrierPrefilterStencil(raw, cp);
-    }
-    else
-    {
-        [unroll]
-        for (int j = 0; j < 4; ++j)
-        {
-            [unroll]
-            for (int i = 0; i < 4; ++i)
-                cp[i + 4 * j] = (int64_t)rasterElevationMm(px - 1 + i, py - 1 + j);
-        }
-    }
+    buildCarrierCp(px, py, pxMm, cp);
 
     const CarrierEval carrier = evalCarrier(cp, fx, fy, pxMm);
     const int64_t baseMm = carrier.heightMm;
@@ -1722,14 +1745,12 @@ int64_t columnCarrierSlopeMmPerM(int64_t vx, int64_t vy)
     const int64_t fx = xMm - px * pxMm;
     const int64_t fy = yMm - py * pxMm;
 
+    // Through the SHARED stencil builder, so this is prefiltered on a sample tier
+    // exactly as evalSurface is. It was a bare raw 4x4 read here, which made the
+    // header's "bit-identical to evalSurface" promise false on the coarse tier --
+    // see buildCarrierCp for why vxc_gpu did not catch it at v15.
     int64_t cp[16];
-    [unroll]
-    for (int j = 0; j < 4; ++j)
-    {
-        [unroll]
-        for (int i = 0; i < 4; ++i)
-            cp[i + 4 * j] = (int64_t)rasterElevationMm(px - 1 + i, py - 1 + j);
-    }
+    buildCarrierCp(px, py, pxMm, cp);
     return carrierSlopeMmPerM(evalCarrier(cp, fx, fy, pxMm), pxMm);
 }
 
