@@ -9,6 +9,7 @@
 #include "VoxelEarthFlyPawn.h"
 #include "VoxelEarthPlayerController.h"
 #include "VoxelGI.h"
+#include "VoxelSkySubsystem.h" // FVoxelSkyState + VoxelSky::MonthDayFromDayOfYear -- the overlay's geo/calendar block
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -39,6 +40,54 @@ const FLinearColor kOverlayWarn(1.0f, 0.45f, 0.35f, 1.0f);
 FString OnOff(bool bOn)
 {
 	return bOn ? TEXT("ON") : TEXT("off");
+}
+
+// Season from day-of-year AND hemisphere.
+//
+// ASTRONOMICAL CONVENTION -- seasons run solstice-to-equinox -- and not the
+// meteorological one (whole months, spring = Mar/Apr/May) because the boundaries
+// below then ARE the solar declination's own extremes and zero crossings, which
+// is exactly what the ephemeris this reads from is built on
+// (VoxelEphemeris.h:119-124). A season named on any other convention could
+// disagree with the sun the frame is actually lit by, and the overlay's whole job
+// is to state what the frame used.
+//
+// The boundary day-of-year values are in the ephemeris's REFERENCE YEAR 2000,
+// which is the year FVoxelSkyState::DayOfYear counts in and which is a LEAP year
+// -- so day-of-year 79 is 20 March, not 21 (VoxelEphemeris.h:150-153, and the
+// same fact is what the kDaysBeforeMonth table in VoxelSkySubsystem.cpp exists to
+// carry):
+//     79  = 20 Mar, March equinox
+//     172 = 21 Jun, June solstice
+//     265 = 22 Sep, September equinox
+//     355 = 21 Dec, December solstice
+//
+// THE SOUTHERN HEMISPHERE IS INVERTED, AND THAT IS NOT HYPOTHETICAL HERE.
+// voxel.Sky.OriginLatitudeDeg defaults to +52, but FVoxelSkyState::LatitudeDeg is
+// resolved from the PLAYER's position every tick, so a long enough southward
+// flight legitimately crosses the equator. Printing "summer" over a southern
+// midwinter is precisely the plausible-but-wrong reading this project prefers to
+// have absent. Latitude exactly 0 falls to the northern naming; the equator has
+// no seasons to get wrong, so there is nothing to arbitrate.
+const TCHAR* SeasonName(int32 DayOfYear, double LatitudeDeg)
+{
+	const int32 Doy = FMath::Clamp(DayOfYear, 0, 365);
+	const bool bNorth = LatitudeDeg >= 0.0;
+	if (Doy >= 79 && Doy < 172)
+	{
+		return bNorth ? TEXT("spring") : TEXT("autumn");
+	}
+	if (Doy >= 172 && Doy < 265)
+	{
+		return bNorth ? TEXT("summer") : TEXT("winter");
+	}
+	if (Doy >= 265 && Doy < 355)
+	{
+		return bNorth ? TEXT("autumn") : TEXT("spring");
+	}
+	// Wraps the year end: 355..365 and 0..78, i.e. December solstice to March
+	// equinox.
+	return bNorth ? TEXT("winter") : TEXT("summer");
 }
 } // namespace
 
@@ -343,9 +392,15 @@ void AVoxelEarthHUD::DrawDebugOverlay()
 	// Row budget with a little slack: an over-estimate is invisible, an
 	// under-estimate clips text outside the panel. Raised 28 -> 29 when the
 	// Player volume row was added; the worst-case path (real tiles + bounding
-	// box known, debug mode >= 1) now emits 28 lines plus 16px of spacers, which
-	// the old budget was 4px short of covering.
-	const float PanelHeight = OverlayLineHeightPx * 29.f + 12.f;
+	// box known, debug mode >= 1) then emitted 28 lines plus 16px of spacers,
+	// which the old budget was 4px short of covering.
+	//
+	// Raised 29 -> 33 for the four-line sky block (Geo / Time / Date / Season),
+	// which is the same arithmetic and the same trap: those lines are the LAST
+	// thing before the settings rows, so under-budgeting here does not clip them
+	// -- it clips the keybinding help at the bottom of the panel, several lines
+	// away from the change that caused it.
+	const float PanelHeight = OverlayLineHeightPx * 33.f + 12.f;
 	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.70f), PanelX, OverlayMarginPx, OverlayPanelWidthPx, PanelHeight);
 
 	float Y = OverlayMarginPx + 5.f;
@@ -389,6 +444,107 @@ void AVoxelEarthHUD::DrawDebugOverlay()
 		DrawOverlayInfo(
 			FString::Printf(TEXT("Tile    %d_%d   (tile px %lld, %lld)"), TileX, TileY, (long long)PixelX, (long long)PixelY),
 			kOverlayInfo, PanelX, Y);
+	}
+
+	// --- Where on the globe, and where in the year --------------------------
+	//
+	// READ-ONLY STATUS, so these are DrawOverlayInfo lines and deliberately NOT
+	// EOverlayRow entries -- nothing here is adjustable, and that enum exists to
+	// make "selectable" and "handled in AdjustOverlaySelection" the same thing
+	// (VoxelEarthHUD.h:43-46). The knobs behind these values are cvars
+	// (voxel.Sky.*) and CLI pins (-VoxelTimeOfDay / -VoxelDate / -VoxelTimeScale),
+	// which is where they belong.
+	//
+	// LatitudeDeg/LongitudeDeg are ALREADY the player's position, not the world
+	// origin's: UVoxelSkySubsystem::Tick resolves the observer through
+	// ResolveObserverXYUU and converts with GeoFromWorldUU, so there is no position
+	// work to do here and none should be added -- a second conversion in this file
+	// is a second answer that can drift from the one the sun was computed at.
+	//
+	// FETCHED DEFENSIVELY and the whole block SKIPPED when the subsystem is absent,
+	// the same shape DrawPerfHUD uses for the water snapshot
+	// (VoxelEarthHUD.cpp:234-247). A zeroed readout here would be far worse than a
+	// missing one: "0.0000 N, 0.0000 E" at "00:00" is a real place at a real time
+	// -- midnight on the equator -- so it is indistinguishable from a correct
+	// reading. VoxelPerfRunSubsystem.cpp's LogSky declines to print a line for the
+	// same reason, in the same words.
+	//
+	// AND "THE SUBSYSTEM EXISTS" IS NOT THE SAME QUESTION AS "IT HAS EVER RUN",
+	// which is the trap this block would otherwise walk straight into. With
+	// voxel.Sky.Enabled 0 the subsystem is still constructed and still returns a
+	// reference, but UVoxelSkySubsystem::IsTickable is false (VoxelSkySubsystem.cpp
+	// :1837-1844, the zero-cost-when-off gate), so FVoxelSkyState is never written
+	// and every field is its default -- i.e. EXACTLY the midnight-at-the-equator
+	// reading the paragraph above refuses to draw, arriving through the guard rather
+	// than around it. JulianDay is the sentinel because it is the one field with no
+	// legal zero: Tick always sets it to JD(2000-01-01) plus the elapsed clock
+	// (VoxelSkySubsystem.cpp:1924-1930), which is ~2451544.5 and up. bClockRunning
+	// would NOT do -- a deliberately pinned clock is false too, and that case must
+	// still draw.
+	UVoxelSkySubsystem* Sky = World->GetSubsystem<UVoxelSkySubsystem>();
+	if (Sky && Sky->GetSkyState().JulianDay > 0.0)
+	{
+		const FVoxelSkyState& SkyState = Sky->GetSkyState();
+
+		// HEMISPHERE LETTERS, NOT SIGNED DECIMALS. A leading '-' has to be decoded
+		// before it means anything and at a glance reads as a stray character;
+		// "1.2461 W" cannot be misread. 4 decimal places is ~11 m of latitude,
+		// i.e. finer than a chunk, which is the resolution at which this is
+		// actually useful for cross-checking against a tile or a probe.
+		DrawOverlayInfo(FString::Printf(TEXT("Geo     %.4f %s, %.4f %s"),
+		                                 FMath::Abs(SkyState.LatitudeDeg), SkyState.LatitudeDeg >= 0.0 ? TEXT("N") : TEXT("S"),
+		                                 FMath::Abs(SkyState.LongitudeDeg), SkyState.LongitudeDeg >= 0.0 ? TEXT("E") : TEXT("W")),
+		                kOverlayInfo, PanelX, Y);
+
+		// A FROZEN CLOCK IS CALLED OUT, AND WARN-COLOURED, BECAUSE IT IS THE NORMAL
+		// STATE IN A CAPTURE. Every perf and screenshot leg pins the sun
+		// (-VoxelTimeScale=0, or voxel.Sky.Enabled 0) so that it cannot drift
+		// between the settle wait and the shutter -- so a still clock is expected
+		// far more often than not, and without the label it reads as a broken
+		// clock. bClockRunning is the subsystem's own answer to that question
+		// (voxel.Sky.Enabled && TimeScale != 0), not a re-derivation from the cvars.
+		//
+		// Minutes TRUNCATED, not rounded, matching PerfClockFromLocalHours in
+		// VoxelPerfRunSubsystem.cpp: rounding lets 11:59.9 print as "12:00", and a
+		// frame labelled noon that was taken a minute off it is how two legs with
+		// different sun angles come to look identical. Truncation also cannot
+		// produce "12:60".
+		const int32 Hour = FMath::Clamp((int32)SkyState.LocalHours, 0, 23);
+		const int32 Minute = FMath::Clamp((int32)((SkyState.LocalHours - (double)Hour) * 60.0), 0, 59);
+		DrawOverlayInfo(FString::Printf(TEXT("Time    %02d:%02d%s   sun %+.1f deg (%s)"), Hour, Minute,
+		                                 SkyState.bClockRunning ? TEXT("") : TEXT("  CLOCK FROZEN"),
+		                                 SkyState.SunAltitudeDeg, SkyState.bSunUp ? TEXT("up") : TEXT("down")),
+		                SkyState.bClockRunning ? kOverlayInfo : kOverlayWarn, PanelX, Y);
+
+		// THE RAW DAY-OF-YEAR IS SHOWN ALONGSIDE THE DATE, not instead of it and not
+		// hidden behind it. Two reasons, both about the compressed calendar. (1)
+		// day-of-year is what actually drives the solar declination
+		// (VoxelEphemeris.h:119-124); the MM-DD is a rendering of it. (2) Only
+		// voxel.Sky.DaysPerYear distinct dates are REACHABLE in a game year -- 48 by
+		// default, so 7.6 real days apart -- which is why -VoxelDate=06-21 generally
+		// does not produce 21 June. Printing the year length makes a date that is
+		// several days off the request read as the calendar working rather than as
+		// the switch being ignored.
+		//
+		// MM-DD is the exact form -VoxelDate= takes, so this line is pasteable back
+		// into the switch that reproduces the frame -- the same choice
+		// VoxelPerfRunSubsystem's date= field makes. Formatted through the now-single
+		// VoxelSky::MonthDayFromDayOfYear, so the overlay, the perf log and the sky
+		// resolve log cannot disagree about what day-of-year 79 is called.
+		int32 Month = 1, Day = 1;
+		VoxelSky::MonthDayFromDayOfYear(SkyState.DayOfYear, Month, Day);
+		DrawOverlayInfo(FString::Printf(TEXT("Date    %02d-%02d   day-of-year %d   (%.0f-day year)"), Month, Day,
+		                                 SkyState.DayOfYear, VoxelSky::GetDaysPerYear()),
+		                kOverlayInfo, PanelX, Y);
+
+		// The hemisphere is NAMED rather than left implicit in the N/S letter three
+		// lines up, because "summer" is the half of this line a reader takes away
+		// and it means the opposite thing on either side of the equator. See
+		// SeasonName for the convention and the boundary dates.
+		DrawOverlayInfo(FString::Printf(TEXT("Season  %s (%s hemisphere)"),
+		                                 SeasonName(SkyState.DayOfYear, SkyState.LatitudeDeg),
+		                                 SkyState.LatitudeDeg >= 0.0 ? TEXT("northern") : TEXT("southern")),
+		                kOverlayInfo, PanelX, Y);
 	}
 
 	// --- Tile source: real diffusion tiles, or the synthetic sampler? -------

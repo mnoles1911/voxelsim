@@ -96,6 +96,14 @@ private:
 	FTimerHandle GICaveRepose1TimerHandle;
 	FTimerHandle GICaveRepose2TimerHandle;
 	FTimerHandle GICaveShotTimerHandle;
+	// -VoxelGICaveTorch: the L1 gate's second arm. ONE process, ONE camera, two
+	// captures -- torch off then torch on -- because this project's screenshot
+	// noise floor is 0.00% within a session and 1.81% between them
+	// (VoxelGpuVerify.cpp:2074-2084), and a 4x luma ratio measured across two
+	// launches would be carrying a per-session latch it cannot separate from the
+	// signal. See docs/sky-and-local-light-plan.md §4, phase L1.
+	FTimerHandle GICaveTorchTimerHandle;
+	FTimerHandle GICaveTorchShotTimerHandle;
 	FTimerHandle GICaveQuitTimerHandle;
 
 	// --- C7/C8 underground water verification (docs/cavern-design.md SS5) ----

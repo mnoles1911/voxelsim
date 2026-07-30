@@ -21,6 +21,12 @@ namespace
 	const TCHAR* kNightSkyMaterialPath = TEXT("/Game/Voxel/M_NightSky.M_NightSky");
 	const TCHAR* kDomeMeshPath = TEXT("/Engine/BasicShapes/Sphere.Sphere");
 
+	// The IsSky dome's material, authored by
+	// Tools/create_sky_atmosphere_dome_material.py -- which must run AFTER
+	// Tools/create_sky_material.py, because that script is the sole author of
+	// MPC_VoxelSky and deletes the asset on every run.
+	const TCHAR* kAtmosphereDomeMaterialPath = TEXT("/Game/Voxel/M_SkyAtmosphereDome.M_SkyAtmosphereDome");
+
 	// Fallback for the stock sphere's own radius, used only if
 	// UStaticMesh::GetBounds() comes back degenerate. /Engine/BasicShapes/Sphere
 	// is a 100 UU diameter ball; this is the documented value and the bounds read
@@ -71,6 +77,68 @@ AVoxelSkyDomeActor::AVoxelSkyDomeActor()
 	{
 		DomeMesh->SetMaterial(0, NightSkyMaterial);
 	}
+
+	// --- the second dome: the canonical IsSky sphere -------------------------
+	//
+	// ATTACHED TO DomeMesh RATHER THAN GIVEN ITS OWN TRANSFORM. The camera follow
+	// and the uniform radius scale then apply to both by construction: there is one
+	// place that decides where the domes are and how big they are, and it is
+	// impossible for the two to end up at different radii -- which would matter,
+	// because the radius is a lower bound against the clipmap corner for both of
+	// them and for two different reasons (see the header on AtmosphereDomeMesh).
+	//
+	// KeepRelativeTransform with an identity relative transform, so the child is
+	// the parent sphere exactly. Faceting is irrelevant for the same reason it is
+	// on the star dome: every quantity either material evaluates is a function of
+	// normalize(P - camera), which is the pixel's exact ray direction wherever
+	// along that ray the faceted surface happens to sit.
+	AtmosphereDomeMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("AtmosphereDomeMesh"));
+	AtmosphereDomeMesh->SetupAttachment(DomeMesh);
+	AtmosphereDomeMesh->SetMobility(EComponentMobility::Movable);
+	AtmosphereDomeMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	// SetCastShadow(false) is belt-and-braces: IsSky materials are already excluded
+	// from the shadow-depth pass (ShouldIncludeMaterialInDefaultOpaquePass,
+	// MaterialShared.h:3717-3721, gating ShadowDepthRendering.cpp:2311) and
+	// M_SkyAtmosphereDome sets cast_ray_traced_shadows false. A 200 km sphere that
+	// ever did cast would shadow the entire world, so all three places say so.
+	AtmosphereDomeMesh->SetCastShadow(false);
+	AtmosphereDomeMesh->SetReceivesDecals(false);
+	AtmosphereDomeMesh->SetCanEverAffectNavigation(false);
+	// SET EXPLICITLY EVEN THOUGH true IS THE ENGINE DEFAULT
+	// (PrimitiveComponent.cpp:364). This is the flag SceneVisibility.cpp:1976 copies
+	// into FSkyMeshBatch::bVisibleInRealTimeSkyCapture, and it is therefore the one
+	// bit that decides whether phase S2's starlight ever reaches the SkyLight at
+	// all. A silent default on the load-bearing bit of an unbuilt phase is how S2
+	// turns into an afternoon of wondering why the gain does nothing.
+	AtmosphereDomeMesh->bVisibleInRealTimeSkyCaptures = true;
+	// Starts HIDDEN and is shown by ApplyDomeCvars on the first tick, unlike the
+	// star dome. That ordering is not cosmetic: showing it flips
+	// View.bSceneHasSkyMaterial and takes the sky away from the atmosphere pass, so
+	// the one code path that decides whether that is allowed to happen --
+	// ApplyDomeCvars, which also holds the "material failed to load" refusal -- must
+	// be the only thing that ever turns it on.
+	AtmosphereDomeMesh->SetVisibility(false);
+
+	if (SphereMeshFinder.Succeeded())
+	{
+		AtmosphereDomeMesh->SetStaticMesh(SphereMeshFinder.Object);
+	}
+
+	// SAME CONSTRUCTOR-TIME LOAD as the night sky material above, and the fallback
+	// here is the worst of the three in this module. The ocean's fallback is a grey
+	// plane and the star dome's is an empty sky; this one is an IsSky dome painting
+	// the engine default material's checkerboard-grey OVER A SKY THE ATMOSPHERE
+	// PASS HAS ALREADY BEEN TOLD NOT TO PAINT. bAtmosphereMaterialValid is what
+	// stops that shipping: BeginPlay logs an Error and ApplyDomeCvars refuses to
+	// show the component at all, so the frame degrades to exactly today's frame
+	// rather than to a broken one.
+	UMaterialInterface* AtmosphereDomeMaterial = Cast<UMaterialInterface>(
+		StaticLoadObject(UMaterialInterface::StaticClass(), nullptr, kAtmosphereDomeMaterialPath));
+	if (AtmosphereDomeMaterial)
+	{
+		AtmosphereDomeMesh->SetMaterial(0, AtmosphereDomeMaterial);
+		bAtmosphereMaterialValid = true;
+	}
 }
 
 void AVoxelSkyDomeActor::BeginPlay()
@@ -89,6 +157,36 @@ void AVoxelSkyDomeActor::BeginPlay()
 		       TEXT("this run. Everything else about the day/night cycle is unaffected."),
 		       kDomeMeshPath);
 	}
+	// --- the IsSky dome's material, which is the loud one --------------------
+	//
+	// ERROR, AND THE DOME IS THEN REFUSED. Everything else in this file degrades to
+	// "a bit of the sky is missing"; this one degrades to "the sky is painted wrong
+	// AND the atmosphere has been told not to paint it", because
+	// View.bSceneHasSkyMaterial is set by the mere PRESENCE of a visible sky-material
+	// primitive (SceneVisibility.cpp:2096) and does not care whether the material is
+	// the intended one. The engine ships its own on-screen warning for the adjacent
+	// misconfiguration (ReflectionEnvironmentRealTimeCapture.cpp:313-316), which is a
+	// fair signal of how easy this is to get wrong.
+	//
+	// So the choice made here is: no dome rather than a wrong dome. With the
+	// component refused the frame is bit-for-bit the pre-S1 frame -- the atmosphere
+	// keeps painting the sky, the star dome keeps drawing stars, and the SkyLight
+	// keeps capturing the atmosphere alone. That is a state this project already
+	// understands and has numbers for.
+	if (!bAtmosphereMaterialValid)
+	{
+		UE_LOG(LogVoxelEarth, Error,
+		       TEXT("VoxelSky atmosphere dome: %s did not load. REFUSING TO ENABLE THE DOME (voxel.Sky.AtmosphereDome ")
+		       TEXT("is being treated as 0 for this run, whatever it is set to). An IsSky dome wearing the engine ")
+		       TEXT("default material would still set View.bSceneHasSkyMaterial, which stops the SkyAtmosphere pass ")
+		       TEXT("painting sky pixels (SkyAtmosphereRendering.cpp:2214) -- so the sky would be BOTH suppressed and ")
+		       TEXT("wrong, and would read as permanent night rather than as a missing asset. Run ")
+		       TEXT("Tools/create_sky_material.py and THEN Tools/create_sky_atmosphere_dome_material.py; the order ")
+		       TEXT("matters, the first one recreates MPC_VoxelSky from scratch. Until then this run behaves exactly ")
+		       TEXT("as it did before phase S1: the atmosphere paints the sky and the SkyLight captures it alone."),
+		       kAtmosphereDomeMaterialPath);
+	}
+
 	if (DomeMesh->GetMaterial(0) == nullptr)
 	{
 		UE_LOG(LogVoxelEarth, Error,
@@ -120,19 +218,32 @@ void AVoxelSkyDomeActor::BeginPlay()
 	const double ClipmapCornerUU = AVoxelClipmapActor::OuterHalfExtentUU() * UE_DOUBLE_SQRT_2;
 	const double RadiusUU = VoxelSky::GetDomeRadiusUU();
 	UE_LOG(LogVoxelEarth, Log,
-	       TEXT("VoxelSky dome RESOLVED: Enabled=%d RadiusUU=%.0f (%.1f km), source sphere radius %.1f UU -> ")
-	       TEXT("uniform scale %.1f. Clipmap outer half-extent %.1f km, corner %.1f km; margin %.2fx."),
-	       VoxelSky::IsDomeEnabled() ? 1 : 0, RadiusUU, RadiusUU / 100000.0, SourceRadiusUU,
+	       TEXT("VoxelSky dome RESOLVED: Enabled=%d AtmosphereDome=%d (material=%s) RadiusUU=%.0f (%.1f km), ")
+	       TEXT("source sphere radius %.1f UU -> uniform scale %.1f. Clipmap outer half-extent %.1f km, corner ")
+	       TEXT("%.1f km; margin %.2fx. ONE radius serves both domes, deliberately -- it is a lower bound against ")
+	       TEXT("that corner for each of them."),
+	       VoxelSky::IsDomeEnabled() ? 1 : 0, VoxelSky::IsAtmosphereDomeEnabled() ? 1 : 0,
+	       bAtmosphereMaterialValid ? TEXT("OK") : TEXT("MISSING -- dome refused"),
+	       RadiusUU, RadiusUU / 100000.0, SourceRadiusUU,
 	       SourceRadiusUU > 0.0 ? RadiusUU / SourceRadiusUU : 0.0,
 	       AVoxelClipmapActor::OuterHalfExtentUU() / 100000.0, ClipmapCornerUU / 100000.0,
 	       ClipmapCornerUU > 0.0 ? RadiusUU / ClipmapCornerUU : 0.0);
 
 	if (RadiusUU <= ClipmapCornerUU)
 	{
+		// TWO DISTINCT FAILURES, ONE CAUSE, AND THE SECOND ONE IS WORSE. For the
+		// star dome the symptom is subtractive: M_NightSky depth-tests, so distant
+		// terrain draws in front of it and the stars vanish behind a horizon ring.
+		// For the IsSky dome it is ADDITIVE and destructive -- EMeshPass::SkyPass
+		// depth-tests with CF_DepthNearOrEqual, so a dome NEARER than a mountain
+		// passes the test and paints sky OVER the mountain in the base-pass colour
+		// target, deleting the vista. Same number fixes both.
 		UE_LOG(LogVoxelEarth, Error,
 		       TEXT("VoxelSky dome: radius %.0f UU (%.1f km) does NOT exceed the clipmap's corner distance ")
-		       TEXT("%.0f UU (%.1f km). M_NightSky depth-tests, so distant terrain will be drawn IN FRONT of the ")
-		       TEXT("stars and the sky will read as empty over most of the horizon. Raise ")
+		       TEXT("%.0f UU (%.1f km). Both domes depth-test. M_NightSky loses -- distant terrain is drawn IN ")
+		       TEXT("FRONT of the stars and the sky reads as empty over most of the horizon. ")
+		       TEXT("M_SkyAtmosphereDome WINS, which is worse: it is nearer than the distant clipmap, so it ")
+		       TEXT("passes CF_DepthNearOrEqual and PAINTS SKY OVER THE DISTANT TERRAIN. Raise ")
 		       TEXT("voxel.Sky.DomeRadiusUU above %.0f."),
 		       RadiusUU, RadiusUU / 100000.0, ClipmapCornerUU, ClipmapCornerUU / 100000.0, ClipmapCornerUU);
 	}
@@ -147,10 +258,16 @@ void AVoxelSkyDomeActor::Tick(float DeltaTime)
 
 	ApplyDomeCvars();
 
-	// Skipped while hidden: a dome nobody can see does not need to be anywhere.
-	// It is recentred again the moment it is shown (ApplyDomeCvars logs that
-	// transition), so a toggle cannot leave it stranded where the camera was.
-	if (AppliedEnabled == 1)
+	// Skipped only while BOTH domes are hidden: a dome nobody can see does not need
+	// to be anywhere. Either one visible is enough to require the follow, because
+	// they share this actor's transform -- gating on AppliedEnabled alone would
+	// strand the IsSky dome around wherever the camera was whenever
+	// voxel.Sky.DomeEnabled happened to be 0, which is a legitimate configuration
+	// (the star dome is decorative; the IsSky dome is what paints the sky).
+	//
+	// Either dome is recentred again the moment it is shown (ApplyDomeCvars logs
+	// each transition), so a toggle cannot leave one stranded.
+	if (AppliedEnabled == 1 || AppliedAtmosphereEnabled == 1)
 	{
 		UpdateFollowCamera();
 	}
@@ -176,7 +293,16 @@ void AVoxelSkyDomeActor::ApplyDomeCvars()
 	if (bEnabled != AppliedEnabled)
 	{
 		AppliedEnabled = bEnabled;
-		SetActorHiddenInGame(bEnabled == 0);
+		// COMPONENT VISIBILITY ONLY -- the SetActorHiddenInGame that used to sit
+		// here has gone, and it had to. AActor::SetActorHiddenInGame hides every
+		// component on the actor, so once the IsSky dome became a second component
+		// here, voxel.Sky.DomeEnabled 0 would have hidden that one too. That is not
+		// a tidiness point: it would have made voxel.Sky.DomeEnabled silently
+		// decide who paints the sky, and it would have coupled the two arms of S1's
+		// A/B to a cvar the gate does not touch. The star dome's own contract says
+		// what it is allowed to do -- "0 HIDES THE MESH ONLY" -- and
+		// SetVisibility(false) already delivers exactly that, so nothing about the
+		// star dome's behaviour changes.
 		DomeMesh->SetVisibility(bEnabled != 0);
 		if (bEnabled != 0)
 		{
@@ -192,11 +318,64 @@ void AVoxelSkyDomeActor::ApplyDomeCvars()
 		       VoxelSky::IsDomeEnabled() ? 1 : 0, VoxelSky::IsEnabled() ? 1 : 0);
 	}
 
+	// --- the IsSky dome, switched independently -------------------------------
+	//
+	// NOT GATED ON voxel.Sky.Enabled, unlike the star dome above, and the asymmetry
+	// is deliberate. The star dome is gated because voxel.Sky.Enabled 0 stops the
+	// MPC writes and would leave it holding a stale StarBrightness -- a star field
+	// over a lit afternoon. This dome's MAIN-VIEW output reads no MPC parameter at
+	// all: SkyAtmosphereViewLuminance and SkyAtmosphereLightDiskLuminance both come
+	// from the atmosphere's own LUTs, which the frozen static rig still populates.
+	// Its only MPC-driven term is the star branch, and that is behind a
+	// ReflectionCapturePassSwitch and therefore unreachable on screen.
+	//
+	// So there is no stale-parameter hazard here, and hiding it on Enabled 0 would
+	// instead ADD one: the sky would change hands (atmosphere pass on, dome off) at
+	// the same moment the rig froze, which makes voxel.Sky.Enabled stop being the
+	// clean "return to the pre-W4 pose" control it is documented as. The dome is a
+	// faithful stand-in for the atmosphere pass at every hour and in every rig
+	// state, or it is broken -- that is what S1 measures.
+	//
+	// REFUSED OUTRIGHT when the material did not load; see bAtmosphereMaterialValid
+	// in the header, and the Error at BeginPlay.
+	const int32 bAtmosphereEnabled = (bAtmosphereMaterialValid && VoxelSky::IsAtmosphereDomeEnabled()) ? 1 : 0;
+	if (AtmosphereDomeMesh && bAtmosphereEnabled != AppliedAtmosphereEnabled)
+	{
+		AppliedAtmosphereEnabled = bAtmosphereEnabled;
+		AtmosphereDomeMesh->SetVisibility(bAtmosphereEnabled != 0);
+		if (bAtmosphereEnabled != 0)
+		{
+			// Recentre before the first visible frame, same as the star dome. It
+			// matters less here (the shading is a function of view direction alone,
+			// see the class comment) but the camera being INSIDE the dome is what
+			// makes that true, and this is what keeps it an identity.
+			UpdateFollowCamera();
+		}
+		// LOGGED AS AN ARM, NOT AS A SETTING, because that is what a ladder rung
+		// needs to be able to read back. The resolved value is printed alongside the
+		// raw cvar so a refusal (material missing) can never look like a 0 that
+		// someone typed.
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelSky ATMOSPHERE DOME %s (voxel.Sky.AtmosphereDome=%d, materialValid=%d -> resolved %d). ")
+		       TEXT("SHOWN means THIS MESH paints the sky and the SkyAtmosphere's full-screen pass does not ")
+		       TEXT("(View.bSceneHasSkyMaterial goes true, SkyAtmosphereRendering.cpp:2214); HIDDEN hands the sky ")
+		       TEXT("back to that pass. The two must agree to within 2/255 of mean luma at every hour -- that is ")
+		       TEXT("the whole of phase S1, and this line is what tells a capture which arm it is."),
+		       bAtmosphereEnabled != 0 ? TEXT("SHOWN") : TEXT("HIDDEN"),
+		       VoxelSky::IsAtmosphereDomeEnabled() ? 1 : 0, bAtmosphereMaterialValid ? 1 : 0, bAtmosphereEnabled);
+	}
+
 	const double RadiusUU = VoxelSky::GetDomeRadiusUU();
 	if (SourceRadiusUU > 0.0 && !FMath::IsNearlyEqual(RadiusUU, AppliedRadiusUU, 1.0))
 	{
 		AppliedRadiusUU = RadiusUU;
 		const double Scale = RadiusUU / SourceRadiusUU;
+		// ONE WRITE FOR BOTH DOMES. AtmosphereDomeMesh is attached to DomeMesh with
+		// an identity relative transform, so this uniform scale reaches it through
+		// the attachment rather than through a second SetRelativeScale3D that could
+		// drift from this one. See the header on AtmosphereDomeMesh: the radius is a
+		// lower bound against the clipmap corner for both domes, and two independent
+		// writes would be two chances to lose that bound.
 		DomeMesh->SetRelativeScale3D(FVector(Scale, Scale, Scale));
 	}
 }

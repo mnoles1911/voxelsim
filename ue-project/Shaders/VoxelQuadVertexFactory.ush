@@ -570,12 +570,75 @@ FMaterialPixelParameters GetMaterialPixelParameters(
 			const float DistUU = length(ProbePoolUU - VoxelGIVol.FadeCentrePoolUU);
 			const float Fade = 1.0f - saturate((DistUU - VoxelGIVol.FadeStartUU)
 			                                 / max(1.0f, VoxelGIVol.FadeEndUU - VoxelGIVol.FadeStartUU));
-			const float Ambient = lerp(VoxelGIVol.AmbientFloor, 1.0f, saturate(Irr));
+			float Ambient = lerp(VoxelGIVol.AmbientFloor, 1.0f, saturate(Irr));
 			const float Weight = saturate(VoxelGIVol.Strength * Fade);
+
+			// LOCAL LIGHT UN-CRUSH (docs/sky-and-local-light-plan.md §2.2, L1).
+			//
+			// THE PROBLEM, exactly: M_VoxelTerrain computes
+			// BaseColor = albedo * VertexColor.G * DebugTint, and a deferred point
+			// light's contribution is PROPORTIONAL to BaseColor. In a cave
+			// G ~= AO * lerp(0.06, 1, ~0) ~= 0.06, so a torch lights a wall at 6% of
+			// its albedo. This raises G back where a local source reaches, and does
+			// nothing else -- it adds no light of its own.
+			//
+			// max(), not add or multiply. The un-crush must stay a RELATIVE
+			// modulation <= 1 with no time-of-day input or the composition contract
+			// in docs/lighting-weather-plan.md §2.3 breaks (a term that scales with
+			// time of day multiplied into VertexColor.g gives a camera-relative ring
+			// of "correct" brightness sliding across the world). max() with a value
+			// in 0..1 cannot exceed the unoccluded 1.0 that contract fixes.
+			//
+			// SAMPLED THROUGH VoxelGIVol, never as a loose `Texture3D VolumeLocal;`
+			// -- see this file's header at :21-26. A loose declaration compiles
+			// perfectly and reads zeros forever, which here presents as "the torch
+			// does nothing", indistinguishable from a splat that never ran.
+			//
+			// Interpolants.GIUVW is reused UNCHANGED because VolumeLocal covers the
+			// same box as VolumePos/VolumeNeg: zero new interpolants, and the local
+			// volume's own texel count is free to differ.
+			//
+			// The FIRST probe's UVW, not whichever fallback hit, for the same reason
+			// the fade above uses it: a local light must not step by a cell where the
+			// irradiance fallback engages.
+			//
+			// And note WHAT that UVW is: the VS builds it at the surface pushed
+			// 0.6 cells (24 UU) OUT ALONG THE NORMAL (:328-330), not at the surface
+			// itself. That is what this wants -- the un-crush is read in the air in
+			// front of the wall, which is where the torch's light is, rather than
+			// inside the wall's own solid cell where the splat's occlusion march
+			// deliberately refuses to look.
+			//
+			// Nothing is needed on the W <= 1e-3 miss path below: there G keeps the
+			// mesher's raw AO with no GI modulation at all, which is already the
+			// un-crushed value -- Ambient is implicitly 1 and max(1, L.a) == 1.
+			float LocalUnCrush = 0.0f;
+			if (VoxelGIVol.LocalEnabled != 0u)
+			{
+				const float4 L = Texture3DSampleLevel(VoxelGIVol.VolumeLocal,
+				                                      VoxelGIVol.VolumeSampler, Interpolants.GIUVW, 0);
+				// L.rgb is deliberately unread: L1 writes A only, and L2 is what
+				// routes RGB (tail radiance x RAW AO) out through TexCoords[1]/[2].
+				LocalUnCrush = saturate(L.a);
+				Ambient = max(Ambient, LocalUnCrush);
+			}
 
 			// Must match VoxelChunkComponent.cpp's shade term for term:
 			// voxel.Stream.GPUMaxLevel puts both renderers in one frame, so a
 			// divergence here shows up as a lighting seam at the ring boundary.
+			//
+			// THE UN-CRUSH IS THE ONE DELIBERATE EXCEPTION, and it is bounded rather
+			// than free. VoxelChunkComponent.cpp:369-372 computes exactly this from
+			// Irradiance and the ambient floor with no local-light term, so with
+			// voxel.GI.LocalLights 1 a torch standing ON the voxel.Stream.GPUMaxLevel
+			// ring lights the pooled side and not the component side -- a seam
+			// wherever the two renderers meet under a local light. Not fixed here
+			// because fixing it means re-shading component vertex colours per torch on
+			// the CPU, which is a different feature; tolerable because the shipped
+			// config is fully pooled (docs/sky-and-local-light-plan.md §2.2), because
+			// the feature ships gated at 0, and because a torch is a 10 m object while
+			// the ring is kilometres out. If a config ever ships with both renderers
+			// live AND local lights on, this is the first thing to look at.
 			VertexColorWithGI.g *= (half)lerp(1.0f, Ambient, Weight);
 
 			// DebugVis 3: show the sampled value raw, ignoring AO and the fade.
@@ -584,6 +647,16 @@ FMaterialPixelParameters GetMaterialPixelParameters(
 			if (VoxelGIVol.DebugVis == 3u)
 			{
 				VertexColorWithGI.g = (half)saturate(Irr);
+			}
+			// DebugVis 4: the same rung for VolumeLocal -- show its A channel raw,
+			// ignoring AO, the ambient floor and the fade. Kept permanently for the
+			// same reason 3 is: this path fails silently in two ways that both look
+			// like "the torch does nothing" (a loose Texture3D declaration, a
+			// uniform member missing from operator==), and this is the cheapest
+			// proof that the sampled bytes reach the pixel.
+			if (VoxelGIVol.DebugVis == 4u)
+			{
+				VertexColorWithGI.g = (half)LocalUnCrush;
 			}
 		}
 	}

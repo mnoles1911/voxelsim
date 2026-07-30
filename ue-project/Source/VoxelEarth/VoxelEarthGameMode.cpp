@@ -612,6 +612,12 @@ void AVoxelEarthGameMode::BeginPlay()
 	// shaft axis, and looks back up at the lit shaft mouth so the same frame
 	// contains daylight, the lit floor under the shaft, and cave wall the light
 	// does not reach. Pair with -VoxelGIOn for the A/B.
+	//
+	// -VoxelGICaveTorch adds the L1 local-light arm: a SECOND capture from the
+	// SAME camera in the SAME process with a torch placed at it, which is what the
+	// torch-off/torch-on luma ratio in docs/sky-and-local-light-plan.md §4 is
+	// measured from. -VoxelGICaveTorchSettle=<s> is the wait between the two
+	// shutters (default 10).
 	float GICaveDelaySeconds = 18.f;
 	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelGICaveTest="), GICaveDelaySeconds) ||
 	    FParse::Param(FCommandLine::Get(), TEXT("VoxelGICaveTest")))
@@ -808,10 +814,91 @@ void AVoxelEarthGameMode::BeginPlay()
 								FScreenshotRequest::RequestScreenshot(TEXT("VoxelGICave"), false, true);
 							}),
 						CaveSettleSeconds, false);
+
+					// --- -VoxelGICaveTorch: the L1 gate's second arm ------------
+					//
+					// TWO CAPTURES IN ONE PROCESS FROM ONE CAMERA. The gate is a
+					// luma RATIO between torch-off and torch-on, and this
+					// project's screenshot noise floor is bimodal -- 0.00%
+					// differing pixels WITHIN a session, 1.81% BETWEEN them
+					// (VoxelGpuVerify.cpp:2074-2084). Two launches would add a
+					// per-session latch to the very quantity being read, which is
+					// the argument VoxelSkyLadderFixture.h makes at length for the
+					// day/night ladder. So the torch is placed AFTER the first
+					// shutter and the SAME camera is photographed again.
+					//
+					// The torch is placed by executing the console command rather
+					// than by calling the subsystem, so this fixture and a human at
+					// the console drive exactly one code path. It deliberately does
+					// NOT set voxel.GI.LocalLights: which arms are being run is the
+					// operator's statement, made on the command line.
+					const bool bCaveTorch = FParse::Param(FCommandLine::Get(), TEXT("VoxelGICaveTorch"));
+					float CaveTorchSettleSeconds = 10.f;
+					FParse::Value(FCommandLine::Get(), TEXT("VoxelGICaveTorchSettle="), CaveTorchSettleSeconds);
+					// The splat is budgeted (voxel.GI.MaxLocalUploadsPerFrame) and
+					// the deferred light needs a frame to register, so this is a
+					// settle and not a formality -- capture too early and the torch
+					// arm photographs a partially splatted volume, which reads as a
+					// weak effect rather than as a race.
+					CaveTorchSettleSeconds = FMath::Max(2.f, CaveTorchSettleSeconds);
+					if (bCaveTorch)
+					{
+						// One second after the first shutter: FScreenshotRequest only
+						// RAISES A FLAG and the viewport services it at the end of the
+						// frame, so placing the torch in the same frame would put it
+						// in the "off" arm.
+						GetWorldTimerManager().SetTimer(
+							GICaveTorchTimerHandle,
+							FTimerDelegate::CreateWeakLambda(this,
+								[this, PoseInCave]()
+								{
+									PoseInCave(); // the torch is placed AT THE CAMERA
+									// GEngine->Exec, not UWorld::Exec: console COMMANDS are
+									// dispatched by IConsoleManager through UEngine::Exec, and
+									// UWorld::Exec only handles the world's own small command
+									// set -- it would swallow this silently. Same call shape as
+									// VoxelDebug.cpp:693.
+									if (UWorld* TWorld = GetWorld())
+									{
+										UE_LOG(LogVoxelEarth, Log,
+										       TEXT("VoxelGICaveTorch: placing the torch at the cave camera ")
+										       TEXT("(voxel.GI.LocalLightTest)"));
+										if (GEngine)
+										{
+											GEngine->Exec(TWorld, TEXT("voxel.GI.LocalLightTest"));
+										}
+									}
+								}),
+							CaveSettleSeconds + 1.f, false);
+						GetWorldTimerManager().SetTimer(
+							GICaveTorchShotTimerHandle,
+							FTimerDelegate::CreateWeakLambda(this,
+								[this, PoseInCave]()
+								{
+									PoseInCave(); // re-assert: the two arms must share a camera exactly
+									if (APlayerController* TC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr)
+									{
+										if (TC->PlayerCameraManager)
+										{
+											const FVector L = TC->PlayerCameraManager->GetCameraLocation();
+											const FRotator R = TC->PlayerCameraManager->GetCameraRotation();
+											UE_LOG(LogVoxelEarth, Log,
+											       TEXT("VoxelGICaveTorch capture: ACTUAL cam=(%.0f,%.0f,%.0f) rot=(pitch %.1f ")
+											       TEXT("yaw %.1f) -- MUST match the off-arm line above, or the two frames ")
+											       TEXT("are not comparable"),
+											       L.X, L.Y, L.Z, R.Pitch, R.Yaw);
+										}
+									}
+									FScreenshotRequest::RequestScreenshot(TEXT("VoxelGICaveTorch"), false, true);
+								}),
+							CaveSettleSeconds + 1.f + CaveTorchSettleSeconds, false);
+					}
 					GetWorldTimerManager().SetTimer(
 						GICaveQuitTimerHandle,
 						FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(false); }),
-						CaveSettleSeconds + 4.f, false);
+						bCaveTorch ? CaveSettleSeconds + 1.f + CaveTorchSettleSeconds + 4.f
+						           : CaveSettleSeconds + 4.f,
+						false);
 				}),
 			GICaveDelaySeconds, false);
 	}

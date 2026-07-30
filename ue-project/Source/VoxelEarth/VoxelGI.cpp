@@ -16,7 +16,12 @@
 #include "VoxelWorldSubsystem.h"
 
 #include "Camera/PlayerCameraManager.h"
+#include "Components/PointLightComponent.h"
 #include "Engine/Engine.h"
+// voxel.GI.LocalLightTest spawns a REAL deferred point light beside the un-crush
+// it registers. The un-crush is a BaseColor change and emits nothing, so without
+// a light to un-crush for there is nothing to photograph.
+#include "Engine/PointLight.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
@@ -172,6 +177,51 @@ namespace
 		TEXT("has no component and no vertex colours to re-shade, so lighting updates are texel ")
 		TEXT("uploads instead. Bricks are merged into X-runs before uploading, so this bounds ")
 		TEXT("BYTES, not draw-call count."),
+		ECVF_Default);
+
+	// docs/sky-and-local-light-plan.md §2.2 / L1. MIRRORS
+	// voxel.GI.MaxBrickUploadsPerFrame above, in the same units the local splat
+	// actually works in: dirty BOXES, not bricks. Every box is at most 8 local
+	// texels deep in Z -- a light's neighbourhood is SLICED to that depth by
+	// MarkLocalLightDirty precisely so that this number bounds something, since one
+	// box per light would put a whole light's marches in one frame no matter what
+	// this is set to.
+	TAutoConsoleVariable<int32> CVarGIMaxLocalUploadsPerFrame(
+		TEXT("voxel.GI.MaxLocalUploadsPerFrame"), 16,
+		TEXT("Local-light splat boxes recomputed and uploaded into VolumeLocal per frame. The local ")
+		TEXT("counterpart of voxel.GI.MaxBrickUploadsPerFrame. A box is at most 8 local texels deep: at the ")
+		TEXT("default LocalVolumeDim 96 (80 UU texels) a 10 m REACH torch is 27^3 texels = 79 KB, sliced into ")
+		TEXT("4 boxes of ~5k texels, and the work inside each is the inverse-square falloff plus one ")
+		TEXT("occlusion march (<= 25 opacity taps, early-out on the first hit) per texel. NOTE the reach, not ")
+		TEXT("the diameter: the plan's '~12^3 texels, ~7 KB' figure is for a 160 UU texel and is 11x low ")
+		TEXT("here. This is what keeps 'ten torches were just placed' a longer queue rather than a longer ")
+		TEXT("frame."),
+		ECVF_Default);
+
+	// The falsification knob for the half of L1 that is actually research (the
+	// plan's own §7 item 4: splat occlusion quality at 80 UU). With this at 0 the
+	// splat is pure inverse-square and a torch lights through walls, which is what
+	// makes "the march is doing something" a measurement rather than a claim.
+	TAutoConsoleVariable<int32> CVarGILocalLightOcclusion(
+		TEXT("voxel.GI.LocalLightOcclusion"), 1,
+		TEXT("1 = a local light's un-crush is attenuated by a line-march through the light field's level-0 ")
+		TEXT("opacity, so a wall occludes. 0 = pure inverse-square with no occlusion at all -- kept so the ")
+		TEXT("march's contribution can be captured as an A/B from ONE build, exactly as ")
+		TEXT("voxel.GI.LegacyConeBasis is. 0 is a diagnostic, not a performance setting."),
+		ECVF_Default);
+
+	// Whether voxel.GI.LocalLightTest also spawns the real deferred light.
+	//
+	// THIS IS THE INSTRUMENT FOR §5 ITEM 9 (double-counting a hero light). With it
+	// at 0 the un-crush is placed with NO light to un-crush for, and the wall must
+	// stay dark: the un-crush is a BaseColor change, not a light, and a build where
+	// it brightens a wall on its own is adding energy from nowhere.
+	TAutoConsoleVariable<int32> CVarGILocalLightDeferred(
+		TEXT("voxel.GI.LocalLightDeferred"), 1,
+		TEXT("1 = voxel.GI.LocalLightTest also spawns the UPointLightComponent that actually emits (the ")
+		TEXT("hero light; the un-crush only gives it a BaseColor to work against). 0 = register the ")
+		TEXT("un-crush alone, which is the control arm: with no deferred light the wall MUST stay dark, ")
+		TEXT("because A is a relative modulation and not a light source."),
 		ECVF_Default);
 
 	TAutoConsoleVariable<int32> CVarGIVolumeCheck(
@@ -375,6 +425,14 @@ void UVoxelGISubsystem::ClearAllState()
 	// volume from a resident set that no longer exists.
 	bVolumeRecentring = false;
 	RecentreRowBricks.Reset();
+	// The local splat queue names texels against an origin and a light list that a
+	// toggle-off may outlive, so it is dropped and the feature re-arms from scratch
+	// (bLocalLightsActive false forces the full re-splat in TickVolume). The
+	// REGISTERED LIGHTS themselves survive: they are the caller's state, not this
+	// module's, and a torch the player lit does not stop existing because a
+	// rendering cvar moved.
+	LocalSplatQueue.Reset();
+	bLocalLightsActive = false;
 	// The shadow and the origin deliberately SURVIVE a toggle-off: the GPU
 	// texture still holds those bytes, and throwing the mirror away would leave
 	// the harness comparing against nothing while the volume kept rendering.
@@ -590,6 +648,18 @@ bool UVoxelGISubsystem::EnsureVolumeOrigin()
 	VolumeShadow.SetNumZeroed(int64(VolumeDim) * VolumeDim * VolumeDim * 4);
 	VolumeShadowNeg.Empty();
 	VolumeShadowNeg.SetNumZeroed(int64(VolumeDim) * VolumeDim * VolumeDim * 4);
+
+	// VolumeLocal's mirror. SIZED FROM ITS OWN DIM: the two volumes cover the same
+	// box at different resolutions, so reusing VolumeDim here would allocate 8x too
+	// much at the defaults and index wrongly at every other pair of dims. Allocated
+	// only when the feature is on -- 3.4 MB of resident CPU memory nothing reads is
+	// the same objection the texture's lazy allocation answers.
+	VolumeLocalDim = VoxelGIVolume::GetLocalDim();
+	if (VoxelGIVolume::IsLocalEnabled() && VolumeLocalDim > 0)
+	{
+		VolumeLocalShadow.Empty();
+		VolumeLocalShadow.SetNumZeroed(int64(VolumeLocalDim) * VolumeLocalDim * VolumeLocalDim * 4);
+	}
 	bVolumeOriginSet = true;
 
 	UE_LOG(LogVoxelGI, Log,
@@ -600,6 +670,18 @@ bool UVoxelGISubsystem::EnsureVolumeOrigin()
 	       PoolWorldUU.X, PoolWorldUU.Y, PoolWorldUU.Z,
 	       OriginPoolUU.X, OriginPoolUU.Y, OriginPoolUU.Z,
 	       HalfExtentUU, 2.0 * double(VolumeShadow.Num()) / (1024.0 * 1024.0));
+	// Every cvar this feature reads, resolved, on one line. The local volume shares
+	// the origin above, so its own numbers belong beside them rather than in a log
+	// line somewhere else that has to be correlated by timestamp.
+	UE_LOG(LogVoxelGI, Log,
+	       TEXT("VoxelGI local lights: voxel.GI.LocalLights=%d voxel.GI.LocalVolumeDim=%d (texel %.0f UU, ")
+	       TEXT("mirror %.1f MB) voxel.GI.LocalLightOcclusion=%d voxel.GI.MaxLocalUploadsPerFrame=%d ")
+	       TEXT("voxel.GI.LocalLightDeferred=%d"),
+	       VoxelGIVolume::IsLocalEnabled() ? 1 : 0, VolumeLocalDim, LocalTexelUU(),
+	       double(VolumeLocalShadow.Num()) / (1024.0 * 1024.0),
+	       CVarGILocalLightOcclusion.GetValueOnGameThread(),
+	       CVarGIMaxLocalUploadsPerFrame.GetValueOnGameThread(),
+	       CVarGILocalLightDeferred.GetValueOnGameThread());
 
 	// The uniform buffer is published by PushVolumeParamsIfChanged, which runs
 	// straight after this in TickVolume and now owns every input to it.
@@ -723,6 +805,12 @@ void UVoxelGISubsystem::BeginVolumeRecentre()
 	// DURING the re-centre re-queues itself and drains normally afterwards.
 	VolumeUploadQueue.Reset();
 	VolumeUploadSet.Reset();
+	// Same for the local splat queue, and for a sharper version of the same
+	// reason: its entries are TEXEL INDICES, so after the origin re-snaps they name
+	// a different piece of the world than the light that queued them. Every one of
+	// them is about to be rewritten by RestageVolumeZRange's own local pass, which
+	// walks the whole volume against the new staging origin.
+	LocalSplatQueue.Reset();
 
 	bVolumeRecentring = true;
 	RecentreLoRow = 0;
@@ -845,6 +933,14 @@ void UVoxelGISubsystem::RestageVolumeZRange(int32 Z0, int32 Z1)
 		                                         BytesPos.GetData(), BytesNeg.GetData());
 	});
 	++VolumeRunsUploaded;
+
+	// VolumeLocal RESTAGES IN THE SAME ROWS, IN THE SAME CALL, AND COMMITS ON THE
+	// SAME FRAME AS ITS SIBLINGS. That is not tidiness: the three volumes share one
+	// origin uniform, so a VolumeLocal that re-centred on its own schedule would be
+	// addressed by an origin the shader is not using, displacing torch light by up
+	// to the whole dead zone (2560 UU) mid-flight. Docs §5 item 7, and the
+	// VOLUMECHECK local arm is what catches it if this line is ever moved out.
+	RestageLocalZRange(Z0, Z1);
 }
 
 void UVoxelGISubsystem::StepVolumeRecentre()
@@ -947,12 +1043,19 @@ void UVoxelGISubsystem::FlushVolume()
 		StepVolumeRecentre();
 	}
 	DrainVolumeUploads(-1);
+	// The local splat queue too, and for the same reason: a harness that measures a
+	// VolumeLocal which is merely BEHIND the light list measures the queue.
+	DrainLocalSplats(-1);
 }
 
 void UVoxelGISubsystem::PushVolumeParamsIfChanged()
 {
 	FVoxelGIVolumeSettings New;
 	New.bEnabled = VoxelGIVolume::IsEnabled() && bVolumeOriginSet;
+	// The mirror's existence is part of the condition, not just the cvar: with no
+	// mirror there has been no splat, so publishing LocalEnabled=1 would bind a
+	// texture whose contents are the zero fill and claim it means something.
+	New.bLocalEnabled = VoxelGIVolume::IsLocalEnabled() && bVolumeOriginSet && VolumeLocalShadow.Num() > 0;
 	New.DebugVis = VoxelGIVolume::GetDebugVis();
 	New.OriginPoolUU = CommittedOriginPoolUU;
 	// The CAMERA in pool space, not the volume centre: this is the quantity the
@@ -996,6 +1099,7 @@ void UVoxelGISubsystem::PushVolumeParamsIfChanged()
 	// be greppable rather than inferable.
 	if (!bVolumeSettingsValid
 	    || New.bEnabled != LastVolumeSettings.bEnabled
+	    || New.bLocalEnabled != LastVolumeSettings.bLocalEnabled
 	    || New.Strength != LastVolumeSettings.Strength
 	    || New.AmbientFloor != LastVolumeSettings.AmbientFloor
 	    || New.FadeStartUU != LastVolumeSettings.FadeStartUU
@@ -1003,9 +1107,10 @@ void UVoxelGISubsystem::PushVolumeParamsIfChanged()
 	    || New.DebugVis != LastVolumeSettings.DebugVis)
 	{
 		UE_LOG(LogVoxelGI, Log,
-		       TEXT("VoxelGI volume params: enabled=%d strength=%.3f ambientFloor=%.3f fade=%.0f..%.0f UU ")
-		       TEXT("(cvars asked %.0f..%.0f; volume half-extent %.0f) debugVis=%d"),
-		       New.bEnabled ? 1 : 0, New.Strength, New.AmbientFloor, New.FadeStartUU, New.FadeEndUU,
+		       TEXT("VoxelGI volume params: enabled=%d localEnabled=%d strength=%.3f ambientFloor=%.3f ")
+		       TEXT("fade=%.0f..%.0f UU (cvars asked %.0f..%.0f; volume half-extent %.0f) debugVis=%d"),
+		       New.bEnabled ? 1 : 0, New.bLocalEnabled ? 1 : 0, New.Strength, New.AmbientFloor,
+		       New.FadeStartUU, New.FadeEndUU,
 		       VoxelGI::GetFadeStartUU(), VoxelGI::GetFadeEndUU(), HalfExtentUU, New.DebugVis);
 	}
 	LastVolumeSettings = New;
@@ -1041,8 +1146,64 @@ void UVoxelGISubsystem::TickVolume()
 	if (!bVolumeAllocated)
 	{
 		bVolumeAllocated = true;
+		// bWantLocal is read HERE, on the game thread, and carried into the command
+		// -- voxel.GI.LocalLights is ECVF_RenderThreadSafe and a read on the render
+		// thread returns a shadow value that lags by up to a frame. See the note at
+		// VoxelGIVolume.cpp's VolumeLocal allocation.
+		const bool bWantLocal = VoxelGIVolume::IsLocalEnabled();
 		ENQUEUE_RENDER_COMMAND(VoxelGIVolumeAlloc)(
-			[](FRHICommandListImmediate& RHICmdList) { GVoxelGIVolume.EnsureAllocated_RenderThread(RHICmdList); });
+			[bWantLocal](FRHICommandListImmediate& RHICmdList)
+			{ GVoxelGIVolume.EnsureAllocated_RenderThread(RHICmdList, bWantLocal); });
+	}
+
+	// --- local lights: arm, allocate, splat ---------------------------------
+	//
+	// READ PER FRAME, not latched. voxel.GI.Volume's own "read per frame" claim was
+	// false until Wave B because UpdateParameters_RenderThread had three callers
+	// and none of them ran per frame; this switch is wired through the same tick so
+	// it does not repeat that.
+	const bool bLocalWanted = VoxelGIVolume::IsLocalEnabled();
+	if (bLocalWanted != bLocalLightsActive)
+	{
+		bLocalLightsActive = bLocalWanted;
+		UE_LOG(LogVoxelGI, Log,
+		       TEXT("VoxelGI local lights: voxel.GI.LocalLights=%d (localDim=%d, texel %.0f UU, ")
+		       TEXT("occlusion=%d, maxUploadsPerFrame=%d, %d light(s) registered)"),
+		       bLocalWanted ? 1 : 0, VolumeLocalDim, LocalTexelUU(),
+		       CVarGILocalLightOcclusion.GetValueOnGameThread(),
+		       CVarGIMaxLocalUploadsPerFrame.GetValueOnGameThread(), LocalLights.Num());
+		if (bLocalWanted)
+		{
+			// Arriving late is the normal case (the switch is off at startup), so
+			// everything the first-time path in EnsureVolumeOrigin would have done
+			// happens here instead: the mirror, the texture, and a full re-splat.
+			if (VolumeLocalDim <= 0)
+			{
+				VolumeLocalDim = VoxelGIVolume::GetLocalDim();
+			}
+			if (VolumeLocalShadow.Num() == 0 && VolumeLocalDim > 0)
+			{
+				VolumeLocalShadow.SetNumZeroed(int64(VolumeLocalDim) * VolumeLocalDim * VolumeLocalDim * 4);
+			}
+			bLocalVolumeAllocated = false;
+			MarkLocalVolumeDirty();
+		}
+	}
+	if (bLocalWanted && !bLocalVolumeAllocated)
+	{
+		bLocalVolumeAllocated = true;
+		// Re-enters EnsureAllocated_RenderThread, which guards each texture
+		// separately: the irradiance volumes already exist and are left alone.
+		//
+		// bWantLocal is passed as a hard TRUE rather than letting the callee re-read
+		// the cvar. bLocalWanted was read on THIS thread and this branch latches
+		// bLocalVolumeAllocated, so a callee that re-read voxel.GI.LocalLights on the
+		// render thread and got the pre-sink shadow value of 0 would skip the
+		// allocation and never be asked again -- the feature would then be on
+		// everywhere except in the one place that matters.
+		ENQUEUE_RENDER_COMMAND(VoxelGIVolumeLocalAlloc)(
+			[](FRHICommandListImmediate& RHICmdList)
+			{ GVoxelGIVolume.EnsureAllocated_RenderThread(RHICmdList, /*bWantLocal*/ true); });
 	}
 
 	if (bVolumeRecentring)
@@ -1061,6 +1222,12 @@ void UVoxelGISubsystem::TickVolume()
 	else
 	{
 		DrainVolumeUploads(FMath::Max(0, CVarGIMaxBrickUploadsPerFrame.GetValueOnGameThread()));
+		// Suspended for the duration of a re-centre, exactly as the per-brick drain
+		// is: during one, every local texel is being restaged by
+		// RestageVolumeZRange's own call anyway, and letting the two paths
+		// interleave would make "the origin uniform changed on exactly one frame"
+		// harder to state than it needs to be.
+		DrainLocalSplats(FMath::Max(0, CVarGIMaxLocalUploadsPerFrame.GetValueOnGameThread()));
 	}
 
 	PushVolumeParamsIfChanged();
@@ -1219,6 +1386,438 @@ int32 UVoxelGISubsystem::DrainVolumeUploads(int32 Budget)
 	});
 
 	return Batch.Num();
+}
+
+// --- local lights (docs/sky-and-local-light-plan.md §2.2, phase L1) ---------
+//
+// WHAT THIS IS AND WHAT IT IS NOT. There is no additive path from a light to a
+// pixel today: M_VoxelTerrain computes BaseColor = albedo * VertexColor.G *
+// DebugTint, the pooled vertex factory can only SCALE .g, and a deferred point
+// light's contribution is proportional to BaseColor -- so in a cave, where
+// G ~= AO * lerp(0.06, 1, ~0) ~= 0.06, a torch lights a wall at 6% of its
+// albedo. L1 fixes exactly that 6% and nothing else: it splats an UN-CRUSH
+// SCALAR into VolumeLocal's A channel, the factory takes Ambient =
+// max(Ambient, A), and the deferred light then has a real BaseColor to
+// illuminate. The A channel emits nothing. RGB stays zero; L2 owns it.
+//
+// ON THE GAME THREAD, which is idle ~75% of the frame (docs/backlog.md §0.1).
+// The render thread is the bound one, so the cheap side is where this belongs,
+// and everything here is game-thread work that ends in one UpdateTexture3D.
+
+double UVoxelGISubsystem::LocalTexelUU() const
+{
+	// The two volumes cover the SAME BOX -- that identity is what lets the factory
+	// reuse Interpolants.GIUVW with zero new interpolants -- so the local texel
+	// size follows from the two dims and is never a second hardcoded constant.
+	const int32 MainDim = VolumeDim > 0 ? VolumeDim : VoxelGIVolume::GetDim();
+	const int32 LocalDim = VolumeLocalDim > 0 ? VolumeLocalDim : VoxelGIVolume::GetLocalDim();
+	return double(MainDim) * double(VoxelLF::CellSizeUU) / double(FMath::Max(1, LocalDim));
+}
+
+float UVoxelGISubsystem::LocalLightContributionAt(const FVoxelLocalLight& Light, const FVector& PointUU,
+                                                 const FVoxelLightField::FReadScope& Read) const
+{
+	const double R = FMath::Max(1.0, Light.RadiusUU);
+	const double D = FVector::Dist(Light.PositionUU, PointUU);
+	if (D >= R)
+	{
+		return 0.f;
+	}
+
+	// INVERSE-SQUARE, with a CORE and a WINDOW, and both of those earn their place.
+	//
+	// The core (a quarter of the reach) exists because A is not a radiance: it is
+	// "how lit is this cell by local sources, 0..1", and 1/d^2 without a core
+	// diverges at the light and would make the un-crush a function of how close
+	// the torch happens to be rather than of whether it reaches. Inside the core
+	// the surface is simply un-crushed, which is the state a lit surface is
+	// supposed to be in.
+	//
+	// The window is UE's own (1-(d/R)^4)^2 shape and it takes the term to EXACTLY
+	// zero at the radius. Without it the influence sphere ends on a step, and
+	// because the splat's dirty box is derived from the same radius, that step
+	// would land on the boundary between written and unwritten texels -- a hard
+	// edge that reads as an addressing bug.
+	const double CoreUU = 0.25 * R;
+	const double Inv = (D <= CoreUU) ? 1.0 : (CoreUU * CoreUU) / FMath::Max(1.0, D * D);
+	const double Ratio = D / R;
+	const double Window = FMath::Square(1.0 - Ratio * Ratio * Ratio * Ratio);
+	float A = float(double(Light.Intensity) * Inv * Window);
+	if (A <= 0.f)
+	{
+		return 0.f;
+	}
+
+	// The occlusion march, which is what makes a wall a wall. Skippable via
+	// voxel.GI.LocalLightOcclusion 0 so the march's own contribution is an A/B
+	// from one build rather than an assertion.
+	if (CVarGILocalLightOcclusion.GetValueOnGameThread() != 0)
+	{
+		A *= Read.LocalTransmittance(Light.PositionUU, PointUU);
+	}
+	return FMath::Clamp(A, 0.f, 1.f);
+}
+
+float UVoxelGISubsystem::LocalUnCrushAt(const FVector& PointUU, const FVoxelLightField::FReadScope& Read) const
+{
+	// MAX over all local sources, per the channel contract. Not a sum: A is a
+	// visibility-like scalar bounded by 1, and summing two torches would push the
+	// un-crush past the unoccluded 1.0 that docs/lighting-weather-plan.md §2.3
+	// fixes for all time.
+	float Best = 0.f;
+	for (const FVoxelLocalLight& Light : LocalLights)
+	{
+		Best = FMath::Max(Best, LocalLightContributionAt(Light, PointUU, Read));
+		if (Best >= 1.f)
+		{
+			break;
+		}
+	}
+	return Best;
+}
+
+int32 UVoxelGISubsystem::AddLocalLight(const FVector& PositionUU, double RadiusUU, float Intensity)
+{
+	if (!bVolumeOriginSet)
+	{
+		UE_LOG(LogVoxelGI, Warning,
+		       TEXT("VoxelGI local light: refused -- the volume origin is not established yet (needs ")
+		       TEXT("voxel.GI.Enabled 1, voxel.GI.Volume 1, voxel.Stream.GPU 1 and one tick with a pool)."));
+		return 0;
+	}
+	FVoxelLocalLight& Light = LocalLights.AddDefaulted_GetRef();
+	Light.PositionUU = PositionUU;
+	Light.RadiusUU = FMath::Clamp(RadiusUU, double(VoxelLF::CellSizeUU), 20000.0);
+	Light.Intensity = FMath::Clamp(Intensity, 0.f, 1.f);
+	Light.Id = NextLocalLightId++;
+	MarkLocalLightDirty(Light.PositionUU, Light.RadiusUU);
+	return Light.Id;
+}
+
+bool UVoxelGISubsystem::MoveLocalLight(int32 LightId, const FVector& PositionUU)
+{
+	for (FVoxelLocalLight& Light : LocalLights)
+	{
+		if (Light.Id != LightId)
+		{
+			continue;
+		}
+		// BOTH neighbourhoods, old first. Every dirty box is recomputed from the
+		// whole light list, so marking the old one is what removes the lit ghost the
+		// light leaves behind; skipping it looks like a falloff bug rather than a
+		// missing clear.
+		MarkLocalLightDirty(Light.PositionUU, Light.RadiusUU);
+		Light.PositionUU = PositionUU;
+		MarkLocalLightDirty(Light.PositionUU, Light.RadiusUU);
+		return true;
+	}
+	return false;
+}
+
+bool UVoxelGISubsystem::RemoveLocalLight(int32 LightId)
+{
+	for (int32 I = 0; I < LocalLights.Num(); ++I)
+	{
+		if (LocalLights[I].Id != LightId)
+		{
+			continue;
+		}
+		const FVector WasAt = LocalLights[I].PositionUU;
+		const double WasR = LocalLights[I].RadiusUU;
+		if (AActor* Actor = LocalLights[I].TestActor.Get())
+		{
+			Actor->Destroy();
+		}
+		LocalLights.RemoveAt(I);
+		// Marked AFTER the removal, so the box is recomputed from a list that no
+		// longer contains this light.
+		MarkLocalLightDirty(WasAt, WasR);
+		return true;
+	}
+	return false;
+}
+
+void UVoxelGISubsystem::ClearLocalLights()
+{
+	const int32 Num = LocalLights.Num();
+	for (FVoxelLocalLight& Light : LocalLights)
+	{
+		if (AActor* Actor = Light.TestActor.Get())
+		{
+			Actor->Destroy();
+		}
+	}
+	LocalLights.Reset();
+	// The whole volume, not the union of the boxes just dropped: this is the
+	// torch-off arm of the L1 gate and "some texel kept its light" is exactly the
+	// failure that would make the arm read as a pass.
+	MarkLocalVolumeDirty();
+	UE_LOG(LogVoxelGI, Log,
+	       TEXT("VoxelGI local lights: cleared %d light(s) and their deferred actors; VolumeLocal queued for ")
+	       TEXT("a full re-splat (%d boxes)"),
+	       Num, LocalSplatQueue.Num());
+}
+
+void UVoxelGISubsystem::MarkLocalLightDirty(const FVector& PositionUU, double RadiusUU)
+{
+	if (VolumeLocalDim <= 0 || VolumeLocalShadow.Num() == 0)
+	{
+		return;
+	}
+	const double T = LocalTexelUU();
+	// Texel i's CENTRE is VolumeOriginWorldUU + (i+0.5)*T, so a world coordinate's
+	// texel index is (W - Origin)/T - 0.5. Same convention as the irradiance
+	// volumes' P/40 - 0.5, which is what makes one brick-snapped origin serve both.
+	//
+	// ONE TEXEL OF MARGIN on each side. The falloff window reaches exactly 0 at
+	// the radius, but the volume is read with hardware trilinear, so the first ring
+	// of texels OUTSIDE the light still contributes to samples inside it and must
+	// therefore be written (as 0) rather than left holding whatever was there.
+	auto LoIdx = [T](double W, double O, double R) { return int32(FMath::FloorToDouble((W - R - O) / T - 0.5)) - 1; };
+	auto HiIdx = [T](double W, double O, double R) { return int32(FMath::CeilToDouble((W + R - O) / T - 0.5)) + 1; };
+	const FIntVector RawMin(LoIdx(PositionUU.X, VolumeOriginWorldUU.X, RadiusUU),
+	                        LoIdx(PositionUU.Y, VolumeOriginWorldUU.Y, RadiusUU),
+	                        LoIdx(PositionUU.Z, VolumeOriginWorldUU.Z, RadiusUU));
+	const FIntVector RawMax(HiIdx(PositionUU.X, VolumeOriginWorldUU.X, RadiusUU),
+	                        HiIdx(PositionUU.Y, VolumeOriginWorldUU.Y, RadiusUU),
+	                        HiIdx(PositionUU.Z, VolumeOriginWorldUU.Z, RadiusUU));
+	const FIntVector Min(FMath::Clamp(RawMin.X, 0, VolumeLocalDim - 1),
+	                     FMath::Clamp(RawMin.Y, 0, VolumeLocalDim - 1),
+	                     FMath::Clamp(RawMin.Z, 0, VolumeLocalDim - 1));
+	const FIntVector Max(FMath::Clamp(RawMax.X, 0, VolumeLocalDim - 1),
+	                     FMath::Clamp(RawMax.Y, 0, VolumeLocalDim - 1),
+	                     FMath::Clamp(RawMax.Z, 0, VolumeLocalDim - 1));
+	if (RawMax.X < 0 || RawMax.Y < 0 || RawMax.Z < 0 ||
+	    RawMin.X >= VolumeLocalDim || RawMin.Y >= VolumeLocalDim || RawMin.Z >= VolumeLocalDim)
+	{
+		return; // entirely outside the volume: nothing to splat, and not an error
+	}
+
+	// SLICED IN Z, exactly as MarkLocalVolumeDirty is, and for the same reason:
+	// otherwise voxel.GI.MaxLocalUploadsPerFrame does not bound anything for a
+	// SINGLE light and its help text is a lie.
+	//
+	// The arithmetic that forces this. The plan (§2.2) estimates a 10 m light at
+	// "~12^3 texels ~= 7 KB", which is the figure for a 160 UU texel. At the
+	// shipped voxel.GI.LocalVolumeDim 96 against VolumeDim 192 the texel is 80 UU,
+	// so a 1000 UU REACH spans 2000/80 = 25 texels per axis, +1 margin each side =
+	// 27 -- 27^3 = 19,683 texels and 79 KB, eleven times the estimate. The texels
+	// are cheap; the OCCLUSION MARCHES are not, at up to 25 opacity taps each, so
+	// one box would put ~0.5M taps in the single frame the torch was placed in.
+	// Slicing turns that into ~4 boxes the budget can spread, and the splat is
+	// idempotent per box (it recomputes from the whole light list), so the slices
+	// are independent rather than a partially applied whole.
+	constexpr int32 kSlabTexels = 8;
+	constexpr int32 kMaxLocalSplatBoxes = 64;
+	for (int32 Z = Min.Z; Z <= Max.Z; Z += kSlabTexels)
+	{
+		const int32 SizeZ = FMath::Min(kSlabTexels, Max.Z - Z + 1);
+		const FVoxelLocalSplatBox Box{FIntVector(Min.X, Min.Y, Z),
+		                              FIntVector(Max.X - Min.X + 1, Max.Y - Min.Y + 1, SizeZ)};
+		bool bAlready = false;
+		for (const FVoxelLocalSplatBox& Existing : LocalSplatQueue)
+		{
+			if (Existing.Min == Box.Min && Existing.Size == Box.Size)
+			{
+				// A light marked twice in one frame is one slice of work. Matched on
+				// the WHOLE box, not just Min: a slice and the volume-wide slab that
+				// starts at the same texel are different amounts of work and
+				// collapsing them would drop the wider one.
+				bAlready = true;
+				break;
+			}
+		}
+		if (bAlready)
+		{
+			continue;
+		}
+		// OVERFLOW COLLAPSES TO A FULL RESTAGE rather than dropping slices. Dropping
+		// one drops a CLEAR, and a lost clear is a permanent lit ghost -- the queue's
+		// contents are not interchangeable the way the voxelize queue's are.
+		if (LocalSplatQueue.Num() >= kMaxLocalSplatBoxes)
+		{
+			MarkLocalVolumeDirty();
+			return;
+		}
+		LocalSplatQueue.Add(Box);
+	}
+}
+
+void UVoxelGISubsystem::MarkLocalVolumeDirty()
+{
+	if (VolumeLocalDim <= 0 || VolumeLocalShadow.Num() == 0)
+	{
+		return;
+	}
+	// Z SLABS, NOT ONE BOX. A single whole-volume box would be one entry against a
+	// per-frame budget of 16, i.e. the budget would stop bounding anything and a
+	// re-arm would cost a whole volume of work in one frame.
+	LocalSplatQueue.Reset();
+	constexpr int32 kSlabTexels = 8;
+	for (int32 Z = 0; Z < VolumeLocalDim; Z += kSlabTexels)
+	{
+		const int32 SizeZ = FMath::Min(kSlabTexels, VolumeLocalDim - Z);
+		LocalSplatQueue.Add(FVoxelLocalSplatBox{FIntVector(0, 0, Z),
+		                                        FIntVector(VolumeLocalDim, VolumeLocalDim, SizeZ)});
+	}
+}
+
+void UVoxelGISubsystem::MarkLocalLightsDirtyForBrick(const FIntVector& BrickCoord)
+{
+	if (LocalLights.Num() == 0 || VolumeLocalShadow.Num() == 0)
+	{
+		return;
+	}
+	// The brick's world box, against each light's reach. A dig, a stream-in or an
+	// eviction changes what the occlusion march sees, so any light that could see
+	// this brick has a stale splat -- this is what makes torchlight follow a tunnel
+	// as it is dug, and it is also what eventually corrects the
+	// "not resident = not an occluder" assumption the march makes.
+	const FVector BrickMin(double(BrickCoord.X) * VoxelLF::BrickEdgeUU,
+	                       double(BrickCoord.Y) * VoxelLF::BrickEdgeUU,
+	                       double(BrickCoord.Z) * VoxelLF::BrickEdgeUU);
+	const FVector BrickMax = BrickMin + FVector(double(VoxelLF::BrickEdgeUU));
+	for (const FVoxelLocalLight& Light : LocalLights)
+	{
+		const FVector Closest(FMath::Clamp(Light.PositionUU.X, BrickMin.X, BrickMax.X),
+		                      FMath::Clamp(Light.PositionUU.Y, BrickMin.Y, BrickMax.Y),
+		                      FMath::Clamp(Light.PositionUU.Z, BrickMin.Z, BrickMax.Z));
+		if (FVector::Dist(Closest, Light.PositionUU) <= Light.RadiusUU)
+		{
+			MarkLocalLightDirty(Light.PositionUU, Light.RadiusUU);
+		}
+	}
+}
+
+void UVoxelGISubsystem::SplatLocalBox(const FIntVector& Min, const FIntVector& Size)
+{
+	if (!Field || VolumeLocalDim <= 0 || VolumeLocalShadow.Num() == 0)
+	{
+		return;
+	}
+	if (Size.X <= 0 || Size.Y <= 0 || Size.Z <= 0)
+	{
+		return;
+	}
+	if (Min.X < 0 || Min.Y < 0 || Min.Z < 0 ||
+	    Min.X + Size.X > VolumeLocalDim || Min.Y + Size.Y > VolumeLocalDim || Min.Z + Size.Z > VolumeLocalDim)
+	{
+		UE_LOG(LogVoxelGI, Warning,
+		       TEXT("VoxelGI local splat: rejected out-of-range box min=(%d,%d,%d) size=(%d,%d,%d) localDim=%d"),
+		       Min.X, Min.Y, Min.Z, Size.X, Size.Y, Size.Z, VolumeLocalDim);
+		return;
+	}
+
+	const int32 Dim = VolumeLocalDim;
+	const double T = LocalTexelUU();
+	const double StartSeconds = FPlatformTime::Seconds();
+
+	// 1) Zero the box. A texel no light reaches MUST read A=0 -- "no local
+	//    source", which the factory's max(Ambient, A) turns into no change at all.
+	//    All four bytes go, not just A: RGB is premultiplied-by-validity territory
+	//    in the sibling volumes and L2's tail radiance here, and leaving stale RGB
+	//    under a zero A is exactly the "energy from nowhere" the encoder's own
+	//    comment refuses.
+	for (int32 Z = 0; Z < Size.Z; ++Z)
+	for (int32 Y = 0; Y < Size.Y; ++Y)
+	{
+		const int64 Offset = ((int64(Min.Z + Z) * Dim + (Min.Y + Y)) * Dim + Min.X) * 4;
+		FMemory::Memzero(VolumeLocalShadow.GetData() + Offset, int64(Size.X) * 4);
+	}
+
+	// 2) Max in every light that overlaps the box, iterating each light's OWN
+	//    intersection rather than the whole box per light: the marches are the
+	//    cost here, and a full restage slab is mostly empty space no light reaches.
+	if (LocalLights.Num() > 0)
+	{
+		const FVoxelLightField::FReadScope Read(*Field);
+		for (const FVoxelLocalLight& Light : LocalLights)
+		{
+			// Texel index range of this light, clipped to the box being splatted.
+			auto LoIdx = [T](double W, double O, double R) { return int32(FMath::FloorToDouble((W - R - O) / T - 0.5)); };
+			auto HiIdx = [T](double W, double O, double R) { return int32(FMath::CeilToDouble((W + R - O) / T - 0.5)); };
+			const int32 X0 = FMath::Max(Min.X, LoIdx(Light.PositionUU.X, VolumeOriginWorldUU.X, Light.RadiusUU));
+			const int32 Y0 = FMath::Max(Min.Y, LoIdx(Light.PositionUU.Y, VolumeOriginWorldUU.Y, Light.RadiusUU));
+			const int32 Z0 = FMath::Max(Min.Z, LoIdx(Light.PositionUU.Z, VolumeOriginWorldUU.Z, Light.RadiusUU));
+			const int32 X1 = FMath::Min(Min.X + Size.X - 1, HiIdx(Light.PositionUU.X, VolumeOriginWorldUU.X, Light.RadiusUU));
+			const int32 Y1 = FMath::Min(Min.Y + Size.Y - 1, HiIdx(Light.PositionUU.Y, VolumeOriginWorldUU.Y, Light.RadiusUU));
+			const int32 Z1 = FMath::Min(Min.Z + Size.Z - 1, HiIdx(Light.PositionUU.Z, VolumeOriginWorldUU.Z, Light.RadiusUU));
+
+			for (int32 Z = Z0; Z <= Z1; ++Z)
+			for (int32 Y = Y0; Y <= Y1; ++Y)
+			for (int32 X = X0; X <= X1; ++X)
+			{
+				const FVector P(VolumeOriginWorldUU.X + (double(X) + 0.5) * T,
+				                VolumeOriginWorldUU.Y + (double(Y) + 0.5) * T,
+				                VolumeOriginWorldUU.Z + (double(Z) + 0.5) * T);
+				const float A = LocalLightContributionAt(Light, P, Read);
+				if (A <= 0.f)
+				{
+					continue;
+				}
+				const uint8 Byte = uint8(FMath::Clamp(FMath::RoundToInt(A * 255.f), 0, 255));
+				uint8& Dst = VolumeLocalShadow[((int64(Z) * Dim + Y) * Dim + X) * 4 + 3];
+				Dst = FMath::Max(Dst, Byte);
+				++LocalTexelsLit;
+			}
+		}
+	}
+
+	// 3) Compact the box out of the mirror and upload it. The mirror is the source
+	//    of truth for what is on the GPU, so the payload always carries the LATEST
+	//    bytes -- including contributions from a light that was not the reason this
+	//    box became dirty.
+	TArray<uint8> Payload;
+	Payload.SetNumUninitialized(int64(Size.X) * Size.Y * Size.Z * 4);
+	for (int32 Z = 0; Z < Size.Z; ++Z)
+	for (int32 Y = 0; Y < Size.Y; ++Y)
+	{
+		const int64 Src = ((int64(Min.Z + Z) * Dim + (Min.Y + Y)) * Dim + Min.X) * 4;
+		const int64 Dst = (int64(Z) * Size.Y + Y) * int64(Size.X) * 4;
+		FMemory::Memcpy(Payload.GetData() + Dst, VolumeLocalShadow.GetData() + Src, int64(Size.X) * 4);
+	}
+
+	ENQUEUE_RENDER_COMMAND(VoxelGIVolumeLocalUpload)(
+		[Min, Size, Bytes = MoveTemp(Payload)](FRHICommandListImmediate& RHICmdList)
+	{
+		GVoxelGIVolume.UpdateLocalTexels_RenderThread(RHICmdList, Min, Size, Bytes.GetData());
+	});
+
+	++LocalBoxesSplatted;
+	LocalSplatMs += (FPlatformTime::Seconds() - StartSeconds) * 1000.0;
+}
+
+int32 UVoxelGISubsystem::DrainLocalSplats(int32 Budget)
+{
+	if (LocalSplatQueue.Num() == 0 || !VoxelGIVolume::IsLocalEnabled())
+	{
+		return 0;
+	}
+	int32 Done = 0;
+	while ((Budget < 0 || Done < Budget) && LocalSplatQueue.Num() > 0)
+	{
+		const FVoxelLocalSplatBox Box = LocalSplatQueue[0];
+		LocalSplatQueue.RemoveAt(0, 1, EAllowShrinking::No);
+		SplatLocalBox(Box.Min, Box.Size);
+		++Done;
+	}
+	return Done;
+}
+
+void UVoxelGISubsystem::RestageLocalZRange(int32 Z0, int32 Z1)
+{
+	if (VolumeLocalDim <= 0 || VolumeLocalShadow.Num() == 0 || VolumeDim <= 0 || Z1 <= Z0)
+	{
+		return;
+	}
+	// MAIN texel rows -> LOCAL texel rows. Floor the low end and ceil the high one
+	// so the mapped ranges COVER the volume with no gap even when the two dims are
+	// not integer multiples; double-covering a boundary texel is harmless because
+	// SplatLocalBox recomputes from the whole light list rather than accumulating.
+	const double Scale = double(VolumeLocalDim) / double(VolumeDim);
+	const int32 LocalZ0 = FMath::Clamp(int32(FMath::FloorToDouble(double(Z0) * Scale)), 0, VolumeLocalDim - 1);
+	const int32 LocalZ1 = FMath::Clamp(int32(FMath::CeilToDouble(double(Z1) * Scale)), LocalZ0 + 1, VolumeLocalDim);
+	SplatLocalBox(FIntVector(0, 0, LocalZ0), FIntVector(VolumeLocalDim, VolumeLocalDim, LocalZ1 - LocalZ0));
 }
 
 // --- voxel.GI.VolumeCheck ---------------------------------------------------
@@ -1510,6 +2109,107 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 		}
 	}
 
+	// --- VolumeLocal arm (docs/sky-and-local-light-plan.md §4, L1's gate) -----
+	//
+	// SAME METHOD, DIFFERENT QUANTITY, and one deliberate difference in what it is
+	// compared against. The comparison is TRILINEAR-VS-TRILINEAR, not
+	// trilinear-vs-analytic: the volume stores point samples at texel centres and
+	// the shader reads them through hardware trilinear, so the filtered value at an
+	// arbitrary point is not the analytic splat there, and comparing those two would
+	// report the filter as a bug. Both sides therefore interpolate the SAME 8 texel
+	// centres -- one side from the staged bytes, the other recomputed from the live
+	// light list -- which is what catches an addressing shift, a wrong local dim and
+	// a missed upload.
+	//
+	// WHAT IT CATCHES OF §5 ITEM 7, STATED HONESTLY, because an instrument credited
+	// with a detection it does not have is worse than no instrument. Both sides here
+	// are addressed by VolumeOriginWorldUU, the STAGING origin, and RunVolumeCheck
+	// calls FlushVolume first -- which runs any re-centre to completion, making
+	// staging == committed. So this arm can NOT observe the mid-re-centre frames in
+	// which a stale origin is live; nothing on the game thread can, because the
+	// mismatch exists only in the uniform buffer the render thread holds.
+	//
+	// It does catch the DURABLE half, which is the half that matters: delete the
+	// RestageLocalZRange call out of RestageVolumeZRange and the mirror keeps bytes
+	// written against the PRE-re-centre origin for good (BeginVolumeRecentre drops
+	// the splat queue, so nothing else rewrites them), while the reference here is
+	// computed against the new one. The error is then a whole re-centre shift and the
+	// arm fails loudly. The transient frames are covered instead by the structural
+	// argument -- one call, same rows, same frame as the siblings -- and by
+	// VOLUMERECENTRE's own transient line at voxel.GI.Debug >= 2.
+	//
+	// Reports cells=0 and no verdict when no local light is registered. That is not
+	// a failure: there is nothing to compare, and a harness that failed on an unlit
+	// session would be turned off.
+	FClassStats StatsLocal;
+	int32 LocalAttempts = 0;
+	int32 LocalOutside = 0;
+	double LocalSignalSum = 0.0;
+	double LocalSignalMax = 0.0;
+	if (LocalLights.Num() > 0 && VolumeLocalShadow.Num() > 0 && VolumeLocalDim > 0)
+	{
+		const double T = LocalTexelUU();
+		const int32 LDim = VolumeLocalDim;
+		const uint8* LocalBytes = VolumeLocalShadow.GetData();
+		const FVoxelLightField::FReadScope Read(*Field);
+		FRandomStream LocalRand(0x5EED0003);
+		const int32 LocalTarget = FMath::Clamp(Target / 4, 64, 4096);
+		const int32 LocalMaxAttempts = LocalTarget * 32;
+		while (StatsLocal.Count < LocalTarget && LocalAttempts < LocalMaxAttempts)
+		{
+			++LocalAttempts;
+			const FVoxelLocalLight& Light = LocalLights[LocalRand.RandHelper(LocalLights.Num())];
+			// Uniform in the light's bounding cube. Nothing is snapped to a texel
+			// centre, for the same reason the main harness jitters: on a centre the
+			// frac terms are zero and trilinear degenerates to one tap, which is a
+			// test that cannot fail.
+			const FVector P(Light.PositionUU.X + (LocalRand.GetFraction() * 2.0 - 1.0) * Light.RadiusUU,
+			                Light.PositionUU.Y + (LocalRand.GetFraction() * 2.0 - 1.0) * Light.RadiusUU,
+			                Light.PositionUU.Z + (LocalRand.GetFraction() * 2.0 - 1.0) * Light.RadiusUU);
+
+			// UVW = (P - Origin) * InvSize, so the local texel coordinate is
+			// UVW*LocalDim - 0.5 == (P - Origin)/T - 0.5 -- the same convention as
+			// the irradiance volumes' P/40 - 0.5, which is what one brick-snapped
+			// origin serving both volumes means in arithmetic.
+			const double TX = (P.X - VolumeOriginWorldUU.X) / T - 0.5;
+			const double TY = (P.Y - VolumeOriginWorldUU.Y) / T - 0.5;
+			const double TZ = (P.Z - VolumeOriginWorldUU.Z) / T - 0.5;
+			const int32 BX = int32(FMath::FloorToDouble(TX));
+			const int32 BY = int32(FMath::FloorToDouble(TY));
+			const int32 BZ = int32(FMath::FloorToDouble(TZ));
+			if (BX < 0 || BY < 0 || BZ < 0 || BX + 1 >= LDim || BY + 1 >= LDim || BZ + 1 >= LDim)
+			{
+				++LocalOutside; // all 8 taps must be real texels, not clamped ones
+				continue;
+			}
+			const float FX = float(TX - double(BX));
+			const float FY = float(TY - double(BY));
+			const float FZ = float(TZ - double(BZ));
+
+			float Staged = 0.f;
+			float Reference = 0.f;
+			for (int32 Tap = 0; Tap < 8; ++Tap)
+			{
+				const int32 OX = Tap & 1, OY = (Tap >> 1) & 1, OZ = (Tap >> 2) & 1;
+				const float W = (OX ? FX : 1.f - FX) * (OY ? FY : 1.f - FY) * (OZ ? FZ : 1.f - FZ);
+				if (W <= 0.f)
+				{
+					continue;
+				}
+				const int32 CX = BX + OX, CY = BY + OY, CZ = BZ + OZ;
+				Staged += W * float(LocalBytes[((int64(CZ) * LDim + CY) * LDim + CX) * 4 + 3]) * (1.f / 255.f);
+				const FVector Centre(VolumeOriginWorldUU.X + (double(CX) + 0.5) * T,
+				                     VolumeOriginWorldUU.Y + (double(CY) + 0.5) * T,
+				                     VolumeOriginWorldUU.Z + (double(CZ) + 0.5) * T);
+				Reference += W * LocalUnCrushAt(Centre, Read);
+			}
+
+			StatsLocal.Add(FMath::Abs(double(Reference) - double(Staged)) * 255.0);
+			LocalSignalSum += double(Reference);
+			LocalSignalMax = FMath::Max(LocalSignalMax, double(Reference));
+		}
+	}
+
 	// THE grep line. Headline is the +-Z class, because that is the one Scheme B
 	// claims to reproduce exactly and therefore the one that can falsify the
 	// encoding, the addressing, the origin snap and the run merge in one number.
@@ -1546,8 +2246,26 @@ void UVoxelGISubsystem::RunVolumeCheck(int32 NumSamples)
 	// mean of zero and an RMS of zero are the same statement; the RMS is logged
 	// beside it anyway so the two can never drift apart unnoticed again.
 	constexpr double kPassMeanBytes = 2.0;
+	// The local arm, on the SAME bar and folded into the SAME verdict -- but only
+	// when it has cells. An unlit session has nothing to say about VolumeLocal, and
+	// failing it for that would make the whole harness something people stop
+	// running. The signal columns are here for the same reason the +-Z ones are: a
+	// mean error of 0.000 over a field of uniform zeros is not evidence.
+	UE_LOG(LogVoxelGI, Log,
+	       TEXT("VOLUMECHECK local (VolumeLocal.A un-crush, trilinear vs trilinear): cells=%d meanAbsErr=%.3f ")
+	       TEXT("rms=%.3f maxAbsErr=%.3f | signal mean=%.1f max=%.1f bytes | lights=%d localDim=%d texel=%.0f UU ")
+	       TEXT("attempts=%d outsideVolume=%d %s"),
+	       StatsLocal.Count, StatsLocal.Mean(), StatsLocal.Rms(), StatsLocal.MaxAbsErr,
+	       StatsLocal.Count > 0 ? 255.0 * LocalSignalSum / double(StatsLocal.Count) : 0.0,
+	       255.0 * LocalSignalMax,
+	       LocalLights.Num(), VolumeLocalDim, LocalTexelUU(), LocalAttempts, LocalOutside,
+	       StatsLocal.Count == 0
+	           ? TEXT("(no local light registered -- nothing to compare, not a failure)")
+	           : (StatsLocal.Mean() < kPassMeanBytes ? TEXT("PASS") : TEXT("FAIL")));
+
 	const bool bPass = StatsZ.Count > 0 && StatsZ.Mean() < kPassMeanBytes
-	                && StatsXY.Count > 0 && StatsXY.Mean() < kPassMeanBytes;
+	                && StatsXY.Count > 0 && StatsXY.Mean() < kPassMeanBytes
+	                && (StatsLocal.Count == 0 || StatsLocal.Mean() < kPassMeanBytes);
 	UE_LOG(LogVoxelGI, Log,
 	       TEXT("VOLUMECHECK detail: verdict=%s (bar: BOTH classes mean < %.1f bytes) | dim=%d bricksResident=%d bricksInVolume=%d ")
 	       TEXT("flushedNow=%d uploadedTotal=%d runsTotal=%d queueLeft=%d | attempts=%d unsolvedCell=%d ")
@@ -1901,6 +2619,111 @@ void UVoxelGISubsystem::StartDigTest(double RadiusUU)
 	       Removed, CentreUU.X, CentreUU.Y, CentreUU.Z, RadiusUU, DigTestBricks.Num());
 }
 
+// voxel.GI.LocalLightTest -- THE INSTRUMENT FOR THE L1 GATE.
+//
+// Places a torch at the camera: one registered local light (the un-crush) plus,
+// unless voxel.GI.LocalLightDeferred is 0, one real UPointLightComponent (the
+// thing that actually emits). Both halves are needed to photograph anything,
+// and that is the point rather than a limitation:
+//
+//   * the un-crush alone is a BaseColor change and emits nothing, so with
+//     voxel.GI.LocalLightDeferred 0 the wall MUST stay dark -- the control arm
+//     for §5 item 9;
+//   * the deferred light alone is what ships today, and in a cave it lights the
+//     wall at 6% of its albedo -- which is the defect L1 exists to fix.
+//
+// Same shape as voxel.GI.VolumeDigTest and voxel.GI.RelightTest: reached through
+// the subsystem, camera-relative, and it logs everything a capture needs to be
+// believed or thrown away on evidence.
+//
+// HONEST NOTE ON WHAT THE UN-CRUSH TOUCHES. Raising VertexColor.G raises the
+// surface's response to EVERY light, not only to this torch -- G multiplies
+// albedo, and BaseColor is what all deferred lighting is proportional to. In a
+// cave the other terms are tiny and the torch dominates, which is why the gate is
+// stated in a cave; in open terrain Ambient is already ~1 and the un-crush is a
+// no-op. It is still the reason the splat's occlusion march has to agree with
+// where the light actually reaches, rather than being merely decorative.
+void UVoxelGISubsystem::PlaceLocalLightTestAtCamera(double RadiusUU, float Intensity)
+{
+	if (!Field || !VoxelGI::IsEnabled() || !VoxelGIVolume::IsEnabled() || !bVolumeOriginSet)
+	{
+		UE_LOG(LogVoxelGI, Warning,
+		       TEXT("VOLUMELOCAL: needs voxel.GI.Enabled 1, voxel.GI.Volume 1, voxel.Stream.GPU 1 and a ")
+		       TEXT("settled field (giEnabled=%d volume=%d originSet=%d)."),
+		       VoxelGI::IsEnabled() ? 1 : 0, VoxelGIVolume::IsEnabled() ? 1 : 0, bVolumeOriginSet ? 1 : 0);
+		return;
+	}
+	if (!VoxelGIVolume::IsLocalEnabled())
+	{
+		// Registered anyway rather than refused: the light list is real state and
+		// the switch is read per frame, so turning it on afterwards works. But say
+		// so, because "the torch does nothing" with the switch off is the single
+		// most likely way to lose an afternoon here.
+		UE_LOG(LogVoxelGI, Warning,
+		       TEXT("VOLUMELOCAL: voxel.GI.LocalLights is 0 -- the light will be registered but NOT splatted ")
+		       TEXT("and NOT sampled. Set voxel.GI.LocalLights 1 first."));
+	}
+
+	const FVector PosUU = FieldCentreUU;
+	// Un-crush peak 1.0, i.e. "fully un-crushed at the core", which is the state a
+	// lit surface is supposed to be in. The command's Intensity argument goes to
+	// the DEFERRED light, in candelas -- brightness belongs on the light and
+	// nowhere else (docs/lighting-weather-plan.md §2.3). Conflating the two is how
+	// the un-crush would quietly become a second brightness knob.
+	const int32 Id = AddLocalLight(PosUU, RadiusUU, /*un-crush peak*/ 1.0f);
+	if (Id == 0)
+	{
+		return;
+	}
+
+	AActor* Spawned = nullptr;
+	if (CVarGILocalLightDeferred.GetValueOnGameThread() != 0)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			if (APointLight* Torch = World->SpawnActor<APointLight>(PosUU, FRotator::ZeroRotator))
+			{
+				// MOVABLE. ALight defaults to Stationary and UE refuses to move a
+				// Stationary light at runtime -- the same trap the sun rig documents
+				// at VoxelSkySubsystem.cpp:1475-1483. It matters here because the
+				// torch is spawned at a camera that has usually just teleported.
+				Torch->SetMobility(EComponentMobility::Movable);
+				if (UPointLightComponent* Comp = Cast<UPointLightComponent>(Torch->GetLightComponent()))
+				{
+					Comp->SetAttenuationRadius(float(RadiusUU));
+					// Candelas explicitly, and the value is a FIRST GUESS to be
+					// calibrated against the gate, not a tuned number: the exposure
+					// curve was fitted for daylight (VoxelSkySubsystem.cpp), so what
+					// reads as "a torch" underground is a measurement, not a
+					// derivation. Stated here so the number is not later mistaken for
+					// one that was fitted.
+					Comp->SetIntensityUnits(ELightUnits::Candelas);
+					Comp->SetIntensity(Intensity);
+					Comp->MarkRenderStateDirty();
+				}
+				Spawned = Torch;
+			}
+		}
+	}
+	for (FVoxelLocalLight& Light : LocalLights)
+	{
+		if (Light.Id == Id)
+		{
+			Light.TestActor = Spawned;
+			break;
+		}
+	}
+
+	UE_LOG(LogVoxelGI, Log,
+	       TEXT("VOLUMELOCAL: torch id=%d at (%.0f,%.0f,%.0f) reach=%.0f UU intensity=%.0f cd | localLights=%d ")
+	       TEXT("deferredLight=%s occlusion=%d | %d light(s) registered, %d splat box(es) queued"),
+	       Id, PosUU.X, PosUU.Y, PosUU.Z, RadiusUU, Intensity,
+	       VoxelGIVolume::IsLocalEnabled() ? 1 : 0,
+	       Spawned ? TEXT("spawned") : TEXT("NONE (control arm)"),
+	       CVarGILocalLightOcclusion.GetValueOnGameThread(),
+	       LocalLights.Num(), LocalSplatQueue.Num());
+}
+
 // Forces a re-centre by the given number of BRICKS, on whatever field is
 // resident right now.
 //
@@ -1968,6 +2791,43 @@ namespace
 		{
 			const double RadiusUU = Args.Num() > 0 ? FMath::Clamp(FCString::Atod(*Args[0]), 40.0, 2000.0) : 300.0;
 			GI->StartRelightTest(RadiusUU);
+		}
+	}));
+
+	FAutoConsoleCommandWithWorldAndArgs GVoxelGILocalLightTestCmd(
+		TEXT("voxel.GI.LocalLightTest"),
+		TEXT("Place a torch at the camera: one registered local light (the un-crush written into ")
+		TEXT("VolumeLocal's A channel) plus, unless voxel.GI.LocalLightDeferred is 0, the real point light ")
+		TEXT("that emits. THIS IS THE ON ARM OF THE L1 GATE; voxel.GI.LocalLightClear is the off arm, and ")
+		TEXT("running both in ONE process is what keeps the comparison inside the 0.00%% within-session ")
+		TEXT("screenshot floor instead of the 1.81%% between-session one. Optional arguments: reach in UU ")
+		TEXT("(default 1000 = 10 m) and intensity in candelas (default 2000, an unfitted first guess). ")
+		TEXT("Needs voxel.GI.Volume 1 and voxel.GI.LocalLights 1."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+			[](const TArray<FString>& Args, UWorld* World)
+	{
+		if (!World) { return; }
+		if (UVoxelGISubsystem* GI = World->GetSubsystem<UVoxelGISubsystem>())
+		{
+			const double RadiusUU = Args.Num() > 0 ? FMath::Clamp(FCString::Atod(*Args[0]), 40.0, 20000.0) : 1000.0;
+			const float Intensity = Args.Num() > 1 ? float(FMath::Clamp(FCString::Atod(*Args[1]), 0.0, 1.0e6)) : 2000.f;
+			GI->PlaceLocalLightTestAtCamera(RadiusUU, Intensity);
+		}
+	}));
+
+	FAutoConsoleCommandWithWorldAndArgs GVoxelGILocalLightClearCmd(
+		TEXT("voxel.GI.LocalLightClear"),
+		TEXT("Remove every registered local light AND the deferred actors voxel.GI.LocalLightTest spawned ")
+		TEXT("for them, then queue VolumeLocal for a full re-splat. The OFF arm of the L1 gate: it has to ")
+		TEXT("take both halves away, because leaving the point light behind measures the un-crush against ")
+		TEXT("itself and leaving a lit texel behind makes the arm read as a pass."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+			[](const TArray<FString>& Args, UWorld* World)
+	{
+		if (!World) { return; }
+		if (UVoxelGISubsystem* GI = World->GetSubsystem<UVoxelGISubsystem>())
+		{
+			GI->ClearLocalLights();
 		}
 	}));
 
@@ -2051,6 +2911,10 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		// all-zero bytes; skipping this would leave a dug tunnel lit with its
 		// pre-dig irradiance until the solve landed several frames later.
 		PushVolumeUpload(BrickCoord);
+		// The occlusion march reads this brick's opacity, so a light whose reach
+		// covers it now has a stale splat. This is what makes torchlight follow a
+		// tunnel as it is dug rather than staying where the wall used to be.
+		MarkLocalLightsDirtyForBrick(BrickCoord);
 		bCoarseDirty = true;
 		++Voxelized;
 	}
@@ -2089,6 +2953,7 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		BrickComponents.Remove(BrickCoord);
 		MarkBrickNeighbourhoodDirty(BrickCoord, EditRadius);
 		PushVolumeUpload(BrickCoord); // zero-on-revoxelize, as above
+		MarkLocalLightsDirtyForBrick(BrickCoord); // stale occlusion march, as above
 		bCoarseDirty = true;
 		++Voxelized;
 	}
@@ -2325,6 +3190,11 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 			// validity channel: A = 0 reads as "no data" and falls back to plain
 			// AO, never to black.
 			PushVolumeUpload(Key);
+			// An evicted brick stops occluding, so any light that could see it has
+			// a stale march. The march treats a missing brick as clear, so this
+			// makes the splat AGREE with that rather than keeping a shadow cast by
+			// geometry the field no longer holds.
+			MarkLocalLightsDirtyForBrick(Key);
 		}
 		if (NumEvicted > 0)
 		{
@@ -2419,6 +3289,20 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		       VolumeUploaded, VolumeUploadQueue.Num(), VolumeBricksUploaded, VolumeRunsUploaded,
 		       (FPlatformTime::Seconds() - TickStart) * 1000.0);
 		VoxRejectedRadius = 0;
+		// Local lights on their own line, and only when the feature has been armed,
+		// so a session with it off (the shipped default) logs byte-identically to
+		// one built before this existed. texelsLit is the number that separates
+		// "the splat ran" from "the splat ran and found geometry": a torch in a cave
+		// lights thousands of texels, and a torch whose march is wrong lights none.
+		if (bLocalLightsActive || LocalLights.Num() > 0)
+		{
+			UE_LOG(LogVoxelGI, Log,
+			       TEXT("GI local: lights=%d splatQueue=%d boxes=%d texelsLit=%lld splatMs=%.2f (cumulative) ")
+			       TEXT("localDim=%d texel=%.0f UU occlusion=%d"),
+			       LocalLights.Num(), LocalSplatQueue.Num(), LocalBoxesSplatted, (long long)LocalTexelsLit,
+			       LocalSplatMs, VolumeLocalDim, LocalTexelUU(),
+			       CVarGILocalLightOcclusion.GetValueOnGameThread());
+		}
 	}
 }
 
