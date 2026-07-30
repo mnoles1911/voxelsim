@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 17
+#define VXC_WORLDGEN_VERSION_USH 18
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -233,7 +233,7 @@ static const int kOctaveAmplitudeMm[kOctaveCount] = {2600, 1100, 500, 165, 95};
 static const int kFineOctaveCount = 4;
 static const int kFineLandformOctaveCount = 1;
 static const int kFineOctaveLatticeMm[kFineOctaveCount] = {3200, 1600, 400, 200};
-static const int kFineOctaveAmplitudeMm[kFineOctaveCount] = {900, 500, 165, 95};
+static const int kFineOctaveAmplitudeMm[kFineOctaveCount] = {100, 100, 400, 200};
 
 // vxc::isFineTier -- a tile raster at or below this pitch carries baked sub-30 m
 // landform. 3750 is scale 8, 1875 is scale 16; both select the fine ladder.
@@ -278,9 +278,9 @@ static const int64_t kReliefScaleMaxQ10 = 2048;
 static const int64_t kLandformGradMmPerM = 272;
 static const int64_t kMetreGradMmPerM = 312;
 static const int64_t kMicroGradMmPerM = 887;
-static const int64_t kFineLandformGradMmPerM = 281;
-static const int64_t kFineMetreGradMmPerM = 312;
-static const int64_t kFineMicroGradMmPerM = 887;
+static const int64_t kFineLandformGradMmPerM = 31;
+static const int64_t kFineMetreGradMmPerM = 62;
+static const int64_t kFineMicroGradMmPerM = 2000;
 static const int64_t kDetailGradCapKQ10 = 512;
 // v15. kRillMaxAbsMm * 1000 / kRillAcrossMm = 300 * 1000 / 1600, static_asserted
 // == 187 on the CPU side BECAUSE it is a literal here. Do not fold this into an

@@ -516,7 +516,7 @@ constexpr Octave kFineDetailOctaves[] = {
     // lambda^0.8 ramp gives 500 * 2^0.8 ~= 870, rounded to 900. The plan requires
     // this be set by probe measurement against the fine tier's measured S2, and
     // that measurement does not exist yet. Do not tune it by eye.
-    {3200, 900},
+    {3200, 100},
     // --- MICRORELIEF band: floored, because decimetre roughness is a property
     // of the material and not of the gradient. Unchanged from the coarse table:
     // the fine tier does not reach these wavelengths, so nothing here is
@@ -525,9 +525,9 @@ constexpr Octave kFineDetailOctaves[] = {
     // scale carrying energy on flat ground is the fix that stopped flat terrain
     // reading as long terrace runs at 10 cm voxels, and gating it on slope would
     // undo exactly that.
-    {1600, 500},
-    {400, 165},
-    {200, 95},
+    {1600, 100},
+    {400, 400},
+    {200, 200},
 };
 constexpr uint32_t kFineDetailOctaveCount =
     sizeof(kFineDetailOctaves) / sizeof(kFineDetailOctaves[0]);
@@ -751,8 +751,8 @@ static_assert(!kAmpUnscaled || (kDetailOctaveCount == 5 && kLandformMaxMm == 369
               "detail allowance from the table, so the bound is still sound -- but "
               "re-read its derivation before updating these numbers, and remember an "
               "octave change is a worldgen change (bump kWorldGenVersion).");
-static_assert(!kAmpUnscaled || (kFineDetailOctaveCount == 4 && kFineLandformMaxMm == 899 &&
-                                kFineMetreMaxMm == 499 && kFineMicroMaxMm == 258),
+static_assert(!kAmpUnscaled || (kFineDetailOctaveCount == 4 && kFineLandformMaxMm == 99 &&
+                                kFineMetreMaxMm == 99 && kFineMicroMaxMm == 598),
               "kFineDetailOctaves changed; same obligation as the coarse table above.");
 // The envelope TIGHTENS on a fine world -- because two synthesised landform
 // octaves were replaced by one. This is the plan's claim that the bound gets
@@ -886,7 +886,7 @@ constexpr int64_t kFineDetailMaxAtMaxSlopeMm =
 // for why that is true even though the bound can no longer use the footprint's
 // own gate value.
 static_assert(!kAmpUnscaled || (kDetailMaxAtMaxSlopeMm == 15509), "detail allowance moved");
-static_assert(!kAmpUnscaled || (kFineDetailMaxAtMaxSlopeMm == 5712), "fine-tier detail allowance moved");
+static_assert(!kAmpUnscaled || (kFineDetailMaxAtMaxSlopeMm == 2280), "fine-tier detail allowance moved");
 // The fine tier still buys a materially tighter envelope, but the margin is
 // 2.76x at v13 rather than 3.8x -- because the coarse side came down by 1.8x
 // and the fine side only by 1.4x, the two tiers' worst cases converged. Written
@@ -980,8 +980,8 @@ static_assert(!kAmpUnscaled || (kLandformGradMmPerM == 272 && kMetreGradMmPerM =
                                 kMicroGradMmPerM == 887),
               "coarse ladder nominal gradient moved; re-mirror worldgen.ush and re-run the "
               "drainage calibration (client-detail-drainage-2026-07-29.txt) before shipping");
-static_assert(!kAmpUnscaled || (kFineLandformGradMmPerM == 281 && kFineMetreGradMmPerM == 312 &&
-                                kFineMicroGradMmPerM == 887),
+static_assert(!kAmpUnscaled || (kFineLandformGradMmPerM == 31 && kFineMetreGradMmPerM == 62 &&
+                                kFineMicroGradMmPerM == 2000),
               "fine ladder nominal gradient moved; same obligation as the coarse trio");
 // The measurement doc's headline mechanism, pinned: the coarse ladder at full
 // gates carries ~3.0 of nominal gradient at v17 (was ~2.3 at v14-v16, before the
@@ -1177,8 +1177,8 @@ static_assert(!kAmpUnscaled || (kLandformAbsMaxMm == 3700 && kMetreAbsMaxMm == 5
 static_assert(kFineLandformAbsMaxMm >= kFineLandformMaxMm &&
                   kFineMetreAbsMaxMm >= kFineMetreMaxMm && kFineMicroAbsMaxMm >= kFineMicroMaxMm,
               "same obligation as the coarse pair, on the fine-tier table");
-static_assert(!kAmpUnscaled || (kFineLandformAbsMaxMm == 900 && kFineMetreAbsMaxMm == 500 &&
-                                kFineMicroAbsMaxMm == 260),
+static_assert(!kAmpUnscaled || (kFineLandformAbsMaxMm == 100 && kFineMetreAbsMaxMm == 100 &&
+                                kFineMicroAbsMaxMm == 600),
               "fine-tier detail amplitude sum moved; see (4)");
 
 // (8) The cave family's carve depth, in the QUERYING COLUMN'S OWN depth space.

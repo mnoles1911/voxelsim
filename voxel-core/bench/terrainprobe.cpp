@@ -1384,6 +1384,87 @@ std::vector<int64_t> levelsFromHeights(const std::vector<double>& zMm, int64_t n
     return L;
 }
 
+// --- RIB CONTINUITY ---------------------------------------------------------
+//
+// The feature the owner actually sees, pinned by a top-down data map and an
+// in-game raking capture of the same 51 m patch: on a steep smooth face the
+// surface crosses a voxel level every ~25 cm, so it is tiled by ribs of constant
+// level. That spacing is pure geometry and cannot be removed. What makes them read
+// as MACHINED rather than as rock is that each rib runs unbroken for tens of
+// metres, because there is no roughness at the 10-50 cm scale to interrupt it.
+//
+// So the target is not the ribs' existence, it is their LENGTH. This measures a
+// connected component of constant voxel level and reports how far it extends along
+// its longest axis. A rib crossing the whole 38 m window is 384 cells; one broken
+// every couple of metres is ~20.
+//
+// Reported as p50/p90/p99/max of component extent, area-weighted for the p-values
+// so the answer is "how long is the rib under a randomly chosen voxel", which is
+// what the eye samples -- not "how long is the average component", which is
+// dominated by the thousands of tiny ones.
+struct RibStats {
+    double p50 = 0, p90 = 0, p99 = 0;
+    int64_t maxExtent = 0, components = 0;
+};
+
+RibStats ribContinuity(const std::vector<int64_t>& level, int64_t n) {
+    RibStats out;
+    std::vector<int32_t> comp(size_t(n * n), -1);
+    std::vector<int64_t> stack;
+    std::vector<std::pair<int64_t, int64_t>> extents; // (extent, area)
+    int32_t next = 0;
+    for (int64_t j0 = 0; j0 < n; ++j0) {
+        for (int64_t i0 = 0; i0 < n; ++i0) {
+            if (comp[size_t(j0 * n + i0)] >= 0) continue;
+            const int64_t lv = level[size_t(j0 * n + i0)];
+            const int32_t id = next++;
+            int64_t xmin = i0, xmax = i0, ymin = j0, ymax = j0, area = 0;
+            stack.clear();
+            stack.push_back(j0 * n + i0);
+            comp[size_t(j0 * n + i0)] = id;
+            while (!stack.empty()) {
+                const int64_t p = stack.back();
+                stack.pop_back();
+                const int64_t i = p % n, j = p / n;
+                ++area;
+                if (i < xmin) xmin = i;
+                if (i > xmax) xmax = i;
+                if (j < ymin) ymin = j;
+                if (j > ymax) ymax = j;
+                const int64_t di[4] = {1, -1, 0, 0}, dj[4] = {0, 0, 1, -1};
+                for (int k = 0; k < 4; ++k) {
+                    const int64_t ni = i + di[k], nj = j + dj[k];
+                    if (ni < 0 || nj < 0 || ni >= n || nj >= n) continue;
+                    const size_t q = size_t(nj * n + ni);
+                    if (comp[q] >= 0 || level[q] != lv) continue;
+                    comp[q] = id;
+                    stack.push_back(int64_t(q));
+                }
+            }
+            const int64_t ext = std::max(xmax - xmin, ymax - ymin) + 1;
+            extents.push_back({ext, area});
+        }
+    }
+    out.components = int64_t(extents.size());
+    if (extents.empty()) return out;
+    std::sort(extents.begin(), extents.end());
+    int64_t total = 0;
+    for (auto& e : extents) total += e.second;
+    // Area-weighted quantiles: walk the sorted extents accumulating AREA.
+    int64_t acc = 0;
+    double q50 = -1, q90 = -1, q99 = -1;
+    for (auto& e : extents) {
+        acc += e.second;
+        const double frac = double(acc) / double(total);
+        if (q50 < 0 && frac >= 0.50) q50 = double(e.first);
+        if (q90 < 0 && frac >= 0.90) q90 = double(e.first);
+        if (q99 < 0 && frac >= 0.99) q99 = double(e.first);
+    }
+    out.p50 = q50; out.p90 = q90; out.p99 = q99;
+    out.maxExtent = extents.back().first;
+    return out;
+}
+
 void reportContourStraightness(const Raster& r, const char* label) {
     // --- CONTROLS FIRST. See the header: this instrument has earned distrust.
     const int64_t n = r.n;
@@ -1420,6 +1501,19 @@ void reportContourStraightness(const Raster& r, const char* label) {
                 "(%.2f m)\n",
                 st.meanStraightRun, st.meanStraightRun * r.cellM, st.p99StraightRun,
                 st.p99StraightRun * r.cellM);
+    {
+        const RibStats rb = ribContinuity(levelsFromHeights(r.zMm, n), n);
+        std::printf("  RIB CONTINUITY (constant-level runs, area-weighted): p50 %.0f cells "
+                    "(%.1f m), p90 %.0f (%.1f m), p99 %.0f (%.1f m), max %lld (%.1f m), "
+                    "%lld components\n",
+                    rb.p50, rb.p50 * r.cellM, rb.p90, rb.p90 * r.cellM, rb.p99,
+                    rb.p99 * r.cellM, (long long)rb.maxExtent, double(rb.maxExtent) * r.cellM,
+                    (long long)rb.components);
+        std::printf("    This is the length of the rib a randomly chosen voxel sits on. Rib "
+                    "SPACING is geometry and cannot be removed; rib LENGTH is what reads as "
+                    "machined. A rib spanning the whole window is %lld cells.\n",
+                    (long long)n);
+    }
     std::printf("  HOW TO READ IT: real topographic contours box-count at D ~ 1.15-1.25; a smooth "
                 "analytic surface's contours are rectifiable, D = 1.0 exactly. D near 1.0 with long "
                 "straight runs is the machined-terrace signature. This is an ABSOLUTE benchmark, "
