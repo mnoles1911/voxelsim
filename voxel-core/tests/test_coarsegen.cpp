@@ -227,7 +227,7 @@ VXC_TEST(coarsegen_golden_digest) {
     // wired in per-brick or per-dispatch rather than per world coordinate.
     // (was 0x85B3E79EF8D01AFC at v5, 0xFCE6D8509799236D at v6..v11, and
     //  0xB812048EB08AA281 at the 700 mm cut of v12)
-    CHECK_EQ(d, 0x600892F3F081F265ull);
+    CHECK_EQ(d, 0x5EB1BAC665ED3CE0ull);
 }
 
 VXC_TEST(coarsegen_seed_sensitivity) {
@@ -295,7 +295,22 @@ VXC_TEST(coarsegen_fidelity_vs_true_mip) {
     // synthetic cliffs). Worth an in-engine look at an LOD ring on a real
     // mountainside; if popping appears at the L1/L2 transition, this number
     // is where to start.
-    const int64_t occCeilPermille[5] = {0, 65, 65, 25, 25};
+    // v16 (the horizontal carrier warp) moved it again, and in both directions:
+    // measured 68/48/26/20 against v14's 60/62/20/20. L2 IMPROVED substantially,
+    // 62 -> 48, which is the interesting half -- the warp decorrelates a
+    // representative column from its cell's own contour geometry, and at L2 that
+    // helps more than the extra positional variance hurts. L1 and L3 rose slightly
+    // (60 -> 68, 20 -> 26) for the mechanism the v14 note already describes: the
+    // representative column now samples the carrier up to 500 mm away from its
+    // nominal position, so on this fixture's extreme synthetic grades it represents
+    // its cell a little less well.
+    //
+    // Ceilings set just above the measurements rather than left generous, so the
+    // next movement is caught. Same caveat as v14: 68 per mille at L1 is ~35 cells
+    // of a 512-cell sample on grades real tiles do not reach, and occupancy IS
+    // silhouette and collision, so if LOD popping shows up at the L1 transition on
+    // a real mountainside this is the number to start from.
+    const int64_t occCeilPermille[5] = {0, 70, 65, 28, 25};
     // v10 raised L3 from 85 to 135. This is a REAL fidelity regression and is
     // recorded as one rather than absorbed: measured L3 material mismatch went
     // 85 -> 125 per mille when the bedding term landed.

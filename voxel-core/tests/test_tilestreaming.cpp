@@ -1,4 +1,4 @@
-// Tests for voxelcore/tilestreaming.h -- the fine-tier residency/prefetch/
+﻿// Tests for voxelcore/tilestreaming.h -- the fine-tier residency/prefetch/
 // eviction POLICY layer (docs/terrain-amplification-plan.md Phase 2 client
 // side). Pure logic, no UE, no file I/O beyond what FineTile::parse itself
 // does on an in-memory byte buffer we build here.
@@ -22,7 +22,7 @@ namespace {
 // ---------------------------------------------------------------------------
 // Minimal, deliberately separate .vxtl v2 encoder (CONSTANT blocks only) for
 // validateAndParseFineTile's tests. Mirrors test_tilestore.cpp's buildFineTile
-// (same file-scope spec, docs/vxtl-v2-format.md §3-4) but trimmed to the one
+// (same file-scope spec, docs/vxtl-v2-format.md Â§3-4) but trimmed to the one
 // shape these tests need: no CODED/RAW modes, no flow plane -- that ground is
 // already covered by test_tilestore.cpp, and duplicating it here would test
 // nothing new.
@@ -95,15 +95,19 @@ VXC_TEST(dilate_single_column_matches_stencil_constants) {
     // points are now a 9-tap prefilter of the raster (carrier.h) and the detail
     // gate reads the raster's relief at a 30 m physical baseline, which is
     // +/-16 pixels on the 1.875 m fine tier.
-    CHECK_EQ(dilated.px0, -6);
-    CHECK_EQ(dilated.px1, 26);
+    // v16 widened them again to (-17, +17): the horizontal carrier warp displaces
+    // which cell a column samples by up to kCarrierWarpMaxMm, which is one pixel at
+    // the finest shipped pitch, and it ADDS to the prefilter/relief reach rather
+    // than competing with it.
+    CHECK_EQ(dilated.px0, -7);
+    CHECK_EQ(dilated.px1, 27);
 }
 
 VXC_TEST(dilate_negative_footprint) {
     const PixelRect footprint{-5, -5, -5, -5};
     const PixelRect dilated = dilateForCarrierStencil(footprint);
-    CHECK_EQ(dilated.px0, -21);
-    CHECK_EQ(dilated.px1, 11);
+    CHECK_EQ(dilated.px0, -22);
+    CHECK_EQ(dilated.px1, 12);
 }
 
 // --- fineReadPixelRect ------------------------------------------------------
@@ -445,7 +449,7 @@ VXC_TEST(lru_retouch_with_different_size_corrects_accounting) {
 
 namespace {
 // The production geometry, spelled out once. kFineTileSize px of
-// tilePixelSizeMm(kFineTileScale) each == 15.36 km, vxtl-v2-format.md §1.
+// tilePixelSizeMm(kFineTileScale) each == 15.36 km, vxtl-v2-format.md Â§1.
 constexpr int64_t kTilePx = int64_t(kFineTileSize);
 constexpr int32_t kPxMm = tilePixelSizeMm(kFineTileScale);
 

@@ -107,11 +107,21 @@ inline constexpr int64_t kCarrierMaxReliefLagPx = carrierReliefLagPx(1875);
 static_assert(kCarrierMaxReliefLagPx == 16,
               "the shipped fine tier's relief lag; if a finer tier ever ships, this is the "
               "line that has to grow with it");
-inline constexpr int64_t kCarrierStencilLo =
+// v16 adds a THIRD widener, and it ADDS to the max of the other two rather than
+// competing with it: the horizontal warp displaces the cell a column samples, so
+// the prefilter and relief reads all shift with it. Taken at the finest shipped
+// pitch, where the warp costs the most pixels.
+inline constexpr int64_t kCarrierMaxWarpPx = carrierWarpPx(1875);
+static_assert(kCarrierMaxWarpPx == 1,
+              "the warp's pixel cost moved; it is a ceiling division of kCarrierWarpMaxMm "
+              "by the finest tier's pitch and it dilates every host's raster window");
+inline constexpr int64_t kCarrierReachLo =
     kCarrierPrefilterLo < -kCarrierMaxReliefLagPx ? kCarrierPrefilterLo : -kCarrierMaxReliefLagPx;
-inline constexpr int64_t kCarrierStencilHi =
+inline constexpr int64_t kCarrierReachHi =
     kCarrierPrefilterHi > kCarrierMaxReliefLagPx ? kCarrierPrefilterHi : kCarrierMaxReliefLagPx;
-static_assert(kCarrierStencilLo == -16 && kCarrierStencilHi == 16,
+inline constexpr int64_t kCarrierStencilLo = kCarrierReachLo - kCarrierMaxWarpPx;
+inline constexpr int64_t kCarrierStencilHi = kCarrierReachHi + kCarrierMaxWarpPx;
+static_assert(kCarrierStencilLo == -17 && kCarrierStencilHi == 17,
               "the control-stencil contract moved; every host that copies a raster window to "
               "the GPU derives its margin from these two numbers, and a window that is not "
               "dilated to match does not fault -- it silently generates different terrain.");

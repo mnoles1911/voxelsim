@@ -1399,8 +1399,25 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     // for the cell containing this column is px-1..px+2 on each axis â€” four
     // control points per axis rather than bilinear's two, which is what buys
     // gradient continuity across the cell boundary.
-    const int64_t px = floorDiv(xMm, pxMm), py = floorDiv(yMm, pxMm);
-    const int64_t fx = xMm - px * pxMm, fy = yMm - py * pxMm;
+    // v16 HORIZONTAL WARP of the carrier sample position. See carrier.h's
+    // kCarrierWarpMaxMm block: it breaks up straight contour terracing by moving the
+    // contour lines rather than by adding vertical relief, so it does not spend the
+    // drainage gradient allowance the v14/v15 cap exists to enforce.
+    //
+    // EVERYTHING CARRIER-DERIVED USES THE WARPED POSITION -- the control stencil,
+    // the analytic gradient and the relief gate all come off px/py/fx/fy below, so
+    // the surface stays a single-valued function of one position rather than a blend
+    // of two. Climate does NOT: see the s.px/s.py assignment at the end of this
+    // function.
+    const int64_t warpX =
+        valueNoise2Fade(seed_, xMm, yMm, kCarrierWarpLatticeMm, CH_CARRIER_WARP_X) *
+        kCarrierWarpMaxMm / kDetailNoiseScale;
+    const int64_t warpY =
+        valueNoise2Fade(seed_, xMm, yMm, kCarrierWarpLatticeMm, CH_CARRIER_WARP_Y) *
+        kCarrierWarpMaxMm / kDetailNoiseScale;
+    const int64_t xW = xMm + warpX, yW = yMm + warpY;
+    const int64_t px = floorDiv(xW, pxMm), py = floorDiv(yW, pxMm);
+    const int64_t fx = xW - px * pxMm, fy = yW - py * pxMm;
     // One per-cell read for all three things derived from the raster: the
     // (v13: prefiltered) control points, and the cell's landform relief.
     const StencilSlot& slot = cachedStencilSlot(id_, *tiles_, px, py);
@@ -1582,8 +1599,16 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     }
 
     SurfaceEval s;
-    s.px = px;
-    s.py = py;
+    // UNWARPED, and this is load-bearing. Callers index the tile raster with these
+    // to read CLIMATE, which is a field on the tile grid and has nothing to do with
+    // where the carrier was sampled. Returning the warped indices made column()
+    // compute its climate fade as fadeFractionMm(xMmC - px * pxMmC, ...) -- an
+    // unwarped coordinate against a warped pixel index -- which perturbed climate,
+    // hence topsoil, hence density3's lithology gate. vxc_gpu reported it as
+    // cpu=2 gpu=0 on the top cells of gated columns while every column field still
+    // matched, which is a confusing signature for a climate bug.
+    s.px = floorDiv(xMm, pxMm);
+    s.py = floorDiv(yMm, pxMm);
     s.slopeMmPerM = slopeMmPerM;
     s.surfaceMm = clampi32(baseMm + detailMm, kSurfaceClampMinMm, kSurfaceClampMaxMm);
     return s;
@@ -1691,8 +1716,21 @@ bool Amplifier::surfaceBoundsMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t v
 
     // Footprint bounding rectangle in mm. Inclusive of both end columns: an
     // amplifier column at index vx sits exactly at vx * kVoxelSizeMm.
-    const int64_t x0Mm = vx0 * kVoxelSizeMm, x1Mm = vx1 * kVoxelSizeMm;
-    const int64_t y0Mm = vy0 * kVoxelSizeMm, y1Mm = vy1 * kVoxelSizeMm;
+    //
+    // v16: DILATED BY THE CARRIER WARP, and this is the line that keeps the bound a
+    // bound. A column at (x,y) now evaluates the carrier at (x + wx, y + wy) with
+    // |w| <= kCarrierWarpMaxMm, so the set of carrier positions this footprint can
+    // reach is the footprint grown by that much on every side. Bounding the
+    // undilated rectangle would miss the extremum a warped column can actually
+    // sample, and a surface bound that is too tight is not a cosmetic error -- the
+    // streaming layer trims against it, so the consequence is a hole in the world.
+    // Dilated at the entry rather than corrected later so that every derivation
+    // below -- the control grid, the Lipschitz differences, the centre column --
+    // inherits it automatically.
+    const int64_t x0Mm = vx0 * kVoxelSizeMm - kCarrierWarpMaxMm;
+    const int64_t x1Mm = vx1 * kVoxelSizeMm + kCarrierWarpMaxMm;
+    const int64_t y0Mm = vy0 * kVoxelSizeMm - kCarrierWarpMaxMm;
+    const int64_t y1Mm = vy1 * kVoxelSizeMm + kCarrierWarpMaxMm;
 
     // THE CONTROL GRID. The cells the columns fall in are cx0..cx1; a cubic
     // B-spline on cell c reads control points c-1..c+2, so the grid the bound

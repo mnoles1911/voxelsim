@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 15
+#define VXC_WORLDGEN_VERSION_USH 16
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -98,6 +98,16 @@ static const int kVoxelSizeMm = 100;
 static const uint CH_DETAIL_OCTAVE_BASE = 0;
 static const uint CH_TOPSOIL_JITTER = 16;
 static const uint CH_BEDROCK_JITTER = 17;
+// MIRROR: hash.h CH_CARRIER_WARP_X/Y and carrier.h kCarrierWarpMaxMm /
+// kCarrierWarpLatticeMm. kCarrierWarpNoiseScale mirrors amplifier.cpp
+// kDetailNoiseScale, which this file spells as a literal at every other use -- it
+// is named here because the warp divides by it on both sides and a mismatch would
+// be a determinism break, not a visual difference.
+static const uint CH_CARRIER_WARP_X = 48;
+static const uint CH_CARRIER_WARP_Y = 49;
+static const int64_t kCarrierWarpMaxMm = 500;
+static const int64_t kCarrierWarpLatticeMm = 4096;
+static const int64_t kCarrierWarpNoiseScale = 32768;
 static const uint CH_ECOTONE_TEMP = 18;   // v9 biome-boundary dither
 static const uint CH_ECOTONE_PRECIP = 19; // v9 biome-boundary dither
 // v10 structured-detail channels. detail_rill.h owns 26; detail_bedding.h owns
@@ -1516,10 +1526,25 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     // return an edge value where the CPU reads the real tile -- a divergence
     // that no bounds check would catch. The host pass and gpu_harness both
     // dilate; see kCarrierStencilLo / kCarrierStencilHi below.
-    const int64_t px = floorDiv(xMm, pxMm);
-    const int64_t py = floorDiv(yMm, pxMm);
-    const int64_t fx = xMm - px * pxMm;
-    const int64_t fy = yMm - py * pxMm;
+    // v16 HORIZONTAL WARP. MIRROR: amplifier.cpp's warpX/warpY block. Applied at
+    // BOTH carrier evaluation sites in this file -- evalSurface and
+    // columnCarrierSlopeMmPerM -- because they must agree; warping only the first
+    // made VoxelizeMain's density3 gate read an unwarped slope and vxc_gpu failed
+    // exactly as columnCarrierSlopeMmPerM's own header predicted.
+        // evalSurface already receives the seed; do not rebuild it from uniforms here.
+    const uint64_t warpSeed = seed;
+    const int64_t warpX = truncDiv(valueNoise2Fade(warpSeed, xMm, yMm, kCarrierWarpLatticeMm,
+                                                  CH_CARRIER_WARP_X) * kCarrierWarpMaxMm,
+                                   kCarrierWarpNoiseScale);
+    const int64_t warpY = truncDiv(valueNoise2Fade(warpSeed, xMm, yMm, kCarrierWarpLatticeMm,
+                                                  CH_CARRIER_WARP_Y) * kCarrierWarpMaxMm,
+                                   kCarrierWarpNoiseScale);
+    const int64_t xW = xMm + warpX;
+    const int64_t yW = yMm + warpY;
+    const int64_t px = floorDiv(xW, pxMm);
+    const int64_t py = floorDiv(yW, pxMm);
+    const int64_t fx = xW - px * pxMm;
+    const int64_t fy = yW - py * pxMm;
 
     // v13: PREFILTERED on a tier that ships raster SAMPLES. MIRROR:
     // amplifier.cpp cachedStencilSlot / carrier.h carrierPrefilterStencil. The
@@ -1709,8 +1734,11 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     }
 
     SurfaceEval s;
-    s.px = px;
-    s.py = py;
+    // MIRROR: amplifier.cpp. UNWARPED on purpose -- callers index the raster for
+    // CLIMATE with these, which is a tile-grid field, not the carrier. See the CPU
+    // comment for the divergence that taught this.
+    s.px = floorDiv(xMm, pxMm);
+    s.py = floorDiv(yMm, pxMm);
     s.slopeMmPerM = slopeMmPerM;
     s.surfaceMm = (int)clamp64(baseMm + detailMm, -8000000, 9000000);
     return s;
@@ -1740,10 +1768,24 @@ int64_t columnCarrierSlopeMmPerM(int64_t vx, int64_t vy)
     const int64_t xMm = vx * kVoxelSizeMm;
     const int64_t yMm = vy * kVoxelSizeMm;
     const int64_t pxMm = (int64_t)PixelSizeMm;
-    const int64_t px = floorDiv(xMm, pxMm);
-    const int64_t py = floorDiv(yMm, pxMm);
-    const int64_t fx = xMm - px * pxMm;
-    const int64_t fy = yMm - py * pxMm;
+    // v16 HORIZONTAL WARP. MIRROR: amplifier.cpp's warpX/warpY block. Applied at
+    // BOTH carrier evaluation sites in this file -- evalSurface and
+    // columnCarrierSlopeMmPerM -- because they must agree; warping only the first
+    // made VoxelizeMain's density3 gate read an unwarped slope and vxc_gpu failed
+    // exactly as columnCarrierSlopeMmPerM's own header predicted.
+    const uint64_t warpSeed = ((uint64_t)SeedHi << 32) | (uint64_t)SeedLo;
+    const int64_t warpX = truncDiv(valueNoise2Fade(warpSeed, xMm, yMm, kCarrierWarpLatticeMm,
+                                                  CH_CARRIER_WARP_X) * kCarrierWarpMaxMm,
+                                   kCarrierWarpNoiseScale);
+    const int64_t warpY = truncDiv(valueNoise2Fade(warpSeed, xMm, yMm, kCarrierWarpLatticeMm,
+                                                  CH_CARRIER_WARP_Y) * kCarrierWarpMaxMm,
+                                   kCarrierWarpNoiseScale);
+    const int64_t xW = xMm + warpX;
+    const int64_t yW = yMm + warpY;
+    const int64_t px = floorDiv(xW, pxMm);
+    const int64_t py = floorDiv(yW, pxMm);
+    const int64_t fx = xW - px * pxMm;
+    const int64_t fy = yW - py * pxMm;
 
     // Through the SHARED stencil builder, so this is prefiltered on a sample tier
     // exactly as evalSurface is. It was a bare raw 4x4 read here, which made the

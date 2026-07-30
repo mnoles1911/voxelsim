@@ -241,6 +241,54 @@ static_assert(kCarrierPrefilterDen > 0, "the prefilter denominator divides and m
 // The raster span, in pixels either side of the cell's own px, that the
 // prefiltered 4x4 control stencil reads. The stencil is px-1..px+2 and each
 // control point convolves +/- R raw samples around itself.
+// --- v16: THE HORIZONTAL CARRIER WARP ---------------------------------------
+//
+// WHAT IT FIXES, measured rather than assumed. The carrier is C2 and therefore very
+// smooth by design; voxelising a smooth surface at 10 cm produces contour steps
+// spaced 100 mm / local grade, which on gentle ground is METRES, running dead
+// straight along the contour. Measured terrace runs at 1.2-3.7% local grade on
+// three real sites: mean 0.48-0.55 m but p90 1.0-1.2 m and p99 1.9-2.4 m, and the
+// eye reads the long runs. That is the "jump ridges in a straight line every metre
+// or two" reported against the v15 survey.
+//
+// It is not any detail term, established by ablation with the shader mirrored so the
+// GPU actually saw each change: the 1.6 m octave, the rill term, the bedding term,
+// and finally the WHOLE ladder at 1/16 all left it intact, and dropping the fine
+// tier left it intact too. Removing detail makes it WORSE, because sub-voxel
+// dithering is what used to ragged the step edges -- and v14/v15's gradient cap
+// took most of that away as the price of fixing drainage.
+//
+// WHY HORIZONTAL RATHER THAN MORE VERTICAL NOISE. Vertical noise is what the
+// drainage cap forbids: moving a step edge needs about half a voxel at a wavelength
+// short enough to vary along the step, and 50 mm over 400 mm is 0.125 of gradient
+// against an allowance of 0.05 on 4% ground. Warping the EVALUATION POSITION moves
+// the contour lines instead of adding relief: h(p + w(p)) has gradient
+// grad(h)*(I + grad(w)), so 500 mm over a 4096 mm lattice changes the gradient
+// MAGNITUDE by order 12% and preserves its DIRECTION. Straight contours become
+// wandering ones for almost nothing in the quantity the cap bounds.
+//
+// TWO CONTRACTS IT TOUCHES, both of which bite silently if missed:
+//
+//   * THE READ WINDOW. The warp displaces which raster cell a column samples, so
+//     every host's control-stencil window must dilate by carrierWarpPx or it
+//     clamps at the edge and generates different terrain there without faulting.
+//     tiles.h's kCarrierStencilLo/Hi derive from this.
+//   * THE SURFACE BOUND. A column inside a footprint now reads the carrier up to
+//     kCarrierWarpMaxMm OUTSIDE it, so surfaceBoundsMm must dilate its footprint
+//     by the same amount before bounding. A bound that does not is a hole in the
+//     world, which is why it is dilated at the entry rather than adjusted late.
+//
+// The warp does NOT apply to climate. Climate is a field on the tile grid, not on
+// the carrier; SurfaceEval::px/py stay unwarped for that reason and the comment
+// there records the divergence that taught it.
+inline constexpr int64_t kCarrierWarpMaxMm = 500;
+inline constexpr int64_t kCarrierWarpLatticeMm = 4096;
+// Ceiling division, so a finer tier cannot quietly under-dilate: 1 at both shipped
+// pitches (0.27 px at 1875 mm, 0.017 px at 30000 mm).
+constexpr int64_t carrierWarpPx(int64_t pxMm) {
+    return (kCarrierWarpMaxMm + pxMm - 1) / pxMm;
+}
+
 inline constexpr int64_t kCarrierPrefilterLo = -1 - kCarrierPrefilterRadius;
 inline constexpr int64_t kCarrierPrefilterHi = 2 + kCarrierPrefilterRadius;
 inline constexpr int64_t kCarrierPrefilterSpan = kCarrierPrefilterHi - kCarrierPrefilterLo + 1;
