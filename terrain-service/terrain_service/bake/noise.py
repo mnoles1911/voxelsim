@@ -534,11 +534,19 @@ def repose_field(z_m: np.ndarray, cell_m: float, seed: int,
         del sp
 
     if strata_amp_deg > 0.0:
-        st = _strata_1d(z_m, seed, _REPOSE_STRATA_OCTAVE_KEY, strata_wavelength_m)
-        st += 0.5 * _strata_1d(z_m, seed, _REPOSE_STRATA_OCTAVE_KEY + 1,
-                               strata_wavelength_m / 4.0)
-        out += (float(strata_amp_deg) / _TWO_OCTAVE_NORM) * st
-        del st
+        # Chunked over rows, bit-identically (everything here is elementwise):
+        # the unchunked form holds ~8 full-domain float64/int64 temporaries at
+        # once, which measured 13.4 GiB peak working set on a production tile
+        # against the 8 GiB bake-pod sizing. 512-row blocks keep the same math
+        # inside a few hundred MB.
+        coef = float(strata_amp_deg) / _TWO_OCTAVE_NORM
+        for r0 in range(0, n0, 512):
+            r1 = min(r0 + 512, n0)
+            blk = z_m[r0:r1]
+            st = _strata_1d(blk, seed, _REPOSE_STRATA_OCTAVE_KEY, strata_wavelength_m)
+            st += 0.5 * _strata_1d(blk, seed, _REPOSE_STRATA_OCTAVE_KEY + 1,
+                                   strata_wavelength_m / 4.0)
+            out[r0:r1] += coef * st
 
     np.clip(out, float(min_deg), float(max_deg), out=out)
     return out.astype(np.float32)
