@@ -83,10 +83,52 @@ RESULTS -- filled in below as measured.
     the uniform gray sheets between gullies become irregular facets, held rock
     pads and bench edges; the drainage layout is unchanged.
 
-  vxc_terrainprobe, site -69120,38400, 512 m, worldgen v18 client:
-    v4: carrier D=1.006, rib p50 1.7 m p90 9.7 m; amplified D=1.020;
-        drainage carrier 0 sinks / 0.0% stranded / 244.5 m mean path;
-        amplified 0 / 0.0% / 246.2 m
-    v5: TBD
+  vxc_terrainprobe, site -69120,38400, 512 m, worldgen v18 client (same probe
+  binary, same window, boundary-cell counts quoted per the noise-vs-crookedness
+  rule):
+
+                        v4 (survey-g35)          v5 (survey-g35-v5)
+    carrier D           1.006  (5080 bcells)     0.991  (4797 bcells)
+    carrier ribs        p50 1.7 m  p90 9.7 m     p50 0.5 m  p90 5.0 m
+                        p99 21.7 m max 26.5 m    p99 11.8 m max 12.7 m
+    amplified D         1.020  (5287 bcells)     1.002  (4841 bcells)
+    amplified ribs      p50 0.8 m  p90 2.3 m     p50 0.5 m  p90 1.6 m
+    drainage carrier    0 sinks / 0.0% / 244 m   0 sinks / 0.0% / 243 m
+    drainage amplified  0 sinks / 0.0% / 246 m   0 sinks / 0.0% / 245 m
+
+    Rib length halves at every quantile WITHOUT boundary-cell inflation (the
+    count FALLS), i.e. this is structure, not noise -- the failure mode the
+    crookedness file warns about (D rising toward the 1.872 noise control on a
+    10x boundary-cell jump) is absent. D itself barely moves, as expected:
+    benches are locally straight too; what they change is spacing and length.
+    Drainage is untouched at every stage. The known caveat stands: the bedding
+    experiment improved rib p99 5x with no visual change, so the capture below
+    is the deciding evidence, not this table.
+
+  COST. Bake 298.7 CPU-s / 142.7 wall (B3.relax 208.5 CPU-s -- the field
+  kernel roughly doubles the bake; it was already the stage a GPU eats).
+  Peak working set 13.45 GiB on the first run; the strata pass is now chunked
+  bit-identically and should return the pod budget to ~6 GiB (re-measure on
+  the next full bake). Tile size unchanged (raw codec, fixed layout).
 
   in-engine raking capture at the repro site: TBD
+
+WHAT THIS DOES NOT FIX, AND THE RANKED REMAINDER. The field only acts where
+thermal binds -- steep ground, which is the named blocker. Moderate sub-repose
+faces (15-35% grade) keep whatever smoothness the carrier has there. In rank
+order of expected value if more is needed:
+
+  1. Strength-modulate INCISION with the same field (hard bands resist
+     carving): knickpoints and bench treads at streams, extends the structure
+     below the repose regime. Same bake-side machinery, one more consumer.
+  2. Client meso band: restore 6.4 m / 12.8 m landform octaves on the fine
+     tier under the existing v14/v15 cap. The cap prices gradient, and
+     amplitude-per-gradient scales with wavelength, so ~0.5-1 m of relief at
+     12.8 m costs what a sub-metre octave costs -- every previous additive
+     attempt sat below 3.2 m where the cap forces sub-voxel amplitude. Needs
+     the full worldgen/HLSL/version ceremony, hence ranked below the bake
+     levers.
+  3. Larger horizontal warp (the v16 mechanism at 30-60 m wavelength, metres
+     of throw): bends and re-spaces contours structurally without touching
+     drainage topology, but dilates every read window and the surface bound;
+     and it cannot make benches, only wavier ramps.
