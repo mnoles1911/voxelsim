@@ -1,0 +1,55 @@
+NINE-CLASS SHAPE SURVEY: THE OWNER'S VERDICT — 2026-07-30
+==========================================================
+
+Nine in-engine frames, worldgen v15, fine tier (1.875 m bake -> 10 cm voxels),
+grade 1.7% to 43%. Every frame's camera position verified from its own log,
+undrawn chunks zero on all nine. Frames in D:\ue-cache\shape-survey (gitignored;
+regenerate with tools/shape-survey.ps1).
+
+OVERALL: accepted as a large step forward and worth keeping. Refinement continues
+from here rather than any rollback.
+
+DEFECTS NAMED BY THE OWNER, who was judging physical voxel shape only (colour
+explicitly out of scope for this pass):
+
+  g25-third (24.6%)  a few odd blue specks
+  g26       (25.9%)  blue specks, and noticeable ridges in the terrain
+  g35       (35.0%)  a CLEAR PATTERN OF JUMP RIDGES IN A STRAIGHT LINE
+  g43       (43.0%)  vertical ridge jumps every metre or two, as in the others
+
+THE SPACING ESTIMATE IS THE MOST USEFUL PART, and it is why this is written down
+rather than filed as "looks a bit regular". An independent estimate of "every
+metre or two" lands on a 1.6 m periodicity, and there are exactly two terms in the
+client at that wavelength:
+
+  (a) the rill/flute term  -- kRillAcrossMm = 1600, warped 8:1 along the local
+      fall line, so its pattern should follow the slope as CHEVRONS; and
+  (b) the 1600 mm microrelief octave -- {1600, 500} in both kDetailOctaves and
+      kFineDetailOctaves, ordinary value noise on an AXIS-ALIGNED world lattice,
+      whose visible structure runs along world x/y as STRAIGHT LINES.
+
+The owner's word for g35 was "straight line", not chevron. That discriminates
+between the two, and it points at (b) rather than at (a) -- which is the opposite
+of the hypothesis I offered when sending the frames, where I named the rill term as
+the suspect on the strength of the chevrons I thought I saw in g41 and g43.
+
+So the direction is: ABLATE BOTH AND RE-CAPTURE THE SAME FRAME, rather than fix
+the term I already have a theory about. g35 is the right frame for it -- it is in
+the clean part of the ladder (complete 3x3 coarse ring, real climate, from the
+contiguous 25-tile block) and it is where the artifact was called clearest.
+
+SECOND DEFECT, INDEPENDENTLY CONFIRMED. The blue specks are the same artifact
+already filed as unexplained on the alpine and third-class captures, now seen by a
+second observer on g25 and g26. What has been ruled out: undrawn chunks (zero on
+every frame), the water subsystem (silent in every log), implicit sea level (water
+is implicit only below z=0 per core.h:134, and these tiles bottom well above it),
+and the flow plane (the amplifier has no consumer for it). Narrowed but NOT
+confirmed to MAT_PERMAFROST (12) or MAT_SNOW (7) from a marginal cold-biome flip,
+which fits their appearing on higher and more dissected sites and not on plains.
+The colour table is not in C++; it is a generated UE material asset.
+
+WHAT THE SURVEY STILL CANNOT ANSWER. Every frame sits inside a single 15.36 km
+tile, so tile-to-tile coherence across a 100-tile world is not in evidence. That
+was the original question and it needs more tiles than this machine can generate:
+the only torch environment is CPU-only and the GPU is AMD, so CUDA inference is
+unavailable rather than merely unconfigured.
