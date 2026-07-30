@@ -84,3 +84,63 @@ detail_rill.h itself names as costing nothing.
 
 STATE: reverted to v17, tree green -- ctest 2/2, vxc_gpu bit-exact. Nothing from
 this investigation ships.
+
+=============================================================================
+THE LEVER-ARM TEST, RUN. THE ACROSS-SLOPE DIRECTION IS A PROVEN DEAD END.
+=============================================================================
+The prototype was re-instated and measured on SYNTHETIC terrain, which is
+statistically homogeneous, so any systematic change with position is the
+construction and not the ground:
+
+  distance from origin        D        boundary cells
+        0 m                 0.976            4,623
+        5 km                1.443           46,192
+       69 km                1.412           47,712
+      500 km                1.433           48,845
+
+At the origin the field is coherent -- D just under 1.0, a modest boundary set.
+Everywhere beyond, D is ~1.43 (PAST real terrain's 1.15-1.25, heading for the
+1.872 noise control) and the boundary-cell count is 10x higher. That is
+per-voxel static, exactly the degeneration detail_rill.h documents and measures
+at 54 km. The real exemplar sites sit at 69 km.
+
+SO THE PROTOTYPE'S D = 1.155 WAS DEGENERATION, NOT STRUCTURE. It is retracted.
+
+This also supplies the companion signal the metric needed. D alone can be raised
+by making a surface noisy; a 10x jump in BOUNDARY CELL COUNT at constant terrain
+is how noise is told from crookedness. Quote both, always.
+
+AND THE BLENDED FORM FAILS FOR THE SAME REASON FROM THE OTHER SIDE, which
+explains its measured collapse to D = 1.020 at four times the amplitude. The two
+frames' across-coordinates differ by about |p| * dTheta. At 69 km with 16 sectors
+(11.25 deg) that is 13.5 km -- roughly 11,000 wavelengths of a 1.2 m field, so
+the two blended fields are independent and averaging them destroys the phase.
+Closing that gap needs dTheta < lambda / (4|p|) = 4.3e-6 rad, i.e. ~700,000
+sectors. Raising kRillSectors, which detail_rill.h names as the free lever, does
+not reach: 256 sectors still leaves ~845 wavelengths of separation at this range.
+
+Anchoring the coordinate to a local lattice bounds |p| but trades the problem for
+a seam: a 32 m anchor with 256 sectors gets separation down to ~0.5 wavelength,
+which is coherent, at the cost of a visible discontinuity every 32 m -- the exact
+artifact class this project exists to remove.
+
+THE GENERAL STATEMENT, which is detail_rill.h's own theorem and now has a second
+measurement behind it: ANY construction whose noise phase is a position-dependent
+transform of the GLOBAL coordinate carries this defect. Either the transform is
+exact and the phase derivative grows with |p| (static), or it is quantised and
+blended and the phase decorrelates with |p| (vanishing). The rill term escapes
+because its field is 2-D -- rotation mostly REORIENTS its features -- whereas for
+a 1-D across-slope field the phase IS the content.
+
+WHAT IS LEFT, honestly. Client-side terms cannot fix this: the CARRIER alone
+measures D = 1.006, so the smoothness is upstream. The remaining candidates are
+all upstream or out-of-band:
+  * give the BAKE sub-metre roughness so the carrier itself is crooked. It
+    currently stops at 1.875 m/px, so this means a finer baked tier or a
+    bake-side roughness pass below its own Nyquist;
+  * relax the drainage bar, which is stricter than real ground at 10 cm and is
+    what forbids vertical roughness -- this needs a real decimetre DTM to set
+    honestly, and none is available on this machine;
+  * accept it as a property of 10 cm voxels on smooth ground and address the
+    LOOK through material and shading variation, which costs no geometry and so
+    no drainage.
