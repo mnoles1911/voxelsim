@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 14
+#define VXC_WORLDGEN_VERSION_USH 15
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -272,6 +272,11 @@ static const int64_t kFineLandformGradMmPerM = 281;
 static const int64_t kFineMetreGradMmPerM = 312;
 static const int64_t kFineMicroGradMmPerM = 350;
 static const int64_t kDetailGradCapKQ10 = 512;
+// v15. kRillMaxAbsMm * 1000 / kRillAcrossMm = 300 * 1000 / 1600, static_asserted
+// == 187 on the CPU side BECAUSE it is a literal here. Do not fold this into an
+// expression involving the rill constants: they live in detail_rill.h, which this
+// file does not include, so the assert is the only thing tying the two together.
+static const int64_t kRillGradMmPerM = 187;
 static const int64_t kDetailGradFloorMmPerM = 50;
 static const int64_t kFineDetailGradFloorMmPerM = 50;
 // On a COARSE world the cap ENGAGES on a ramp over landform relief (the same
@@ -1637,10 +1642,18 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
                                                             : kMetreGradMmPerM;
     const int64_t gradMicro = (pxMm <= kFineTierMaxPixelMm) ? kFineMicroGradMmPerM
                                                             : kMicroGradMmPerM;
+    // v15: the rill's nominal across-slope gradient joins the budget. Mirrors
+    // amplifier.cpp's kRillGradMmPerM, which is kRillMaxAbsMm * 1000 /
+    // kRillAcrossMm = 300 * 1000 / 1600 and is static_asserted == 187 there
+    // precisely because it appears here as a literal. See the derivation block
+    // above kDetailGradCapKQ10 for why v14's omission was a leaking guarantee
+    // rather than a tuning choice. Every term is non-negative so truncDiv and
+    // floorDiv agree, but truncDiv is used to match the CPU's `/` exactly.
     const int64_t detailGradMmPerM =
         truncDiv(truncDiv(gradLand * rScale, 1024) * cScale, 1024) +
         truncDiv(truncDiv(gradMetre * rScale, 1024) * cScaleMicro, 1024) +
-        truncDiv(gradMicro * cScaleMicro, 1024);
+        truncDiv(gradMicro * cScaleMicro, 1024) +
+        truncDiv(kRillGradMmPerM * rScale, 1024);
     int64_t engageQ10 = 1024;
     if (pxMm > kFineTierMaxPixelMm)
     {

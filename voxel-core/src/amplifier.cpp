@@ -1022,6 +1022,39 @@ static_assert(!kAmpUnscaled || kDetailGradCeilMmPerM == 2291,
 // own (90.3% vs 89.0%) and lower floors erase the remaining texture to buy
 // less than that. Not ~0, deliberately: the last step to zero costs the whole
 // remaining anti-terrace band and recovers nothing measurable.
+// v15: THE ADDITIVE TERMS ARE IN THE BUDGET NOW, and at v14 they were not.
+//
+// v14 summed only the three OCTAVE bands into detailGradMmPerM, then applied the
+// resulting scale to a detailMm that already contained the rill and bedding terms.
+// The post-cap gradient was therefore (octaves + rill) * allowed / octaves --
+// ABOVE the allowance by the rill's share -- while the comment on the block
+// asserted that the estimate and the thing it estimates cannot drift apart. The
+// guarantee leaked, and in the unsafe direction.
+//
+// It did not SHOW as stranded area, because scaling the rill down along with the
+// octaves happened to compensate: the code was right by accident. That is the
+// failure mode this file documents over and over -- a gate that is inert, a knee
+// outside the data's range, a metric binned on the wrong quantity -- correct
+// today and silently wrong the first time an unrelated constant moves. Changing
+// kRillAmplitudeMm or kCurvatureScaleMaxQ10 would have broken it with nothing to
+// say so.
+//
+// Counting it costs almost nothing, measured rather than assumed: alpine fine
+// tier holds at 0 interior sinks and 0.0% stranded area, with the mean flow path
+// moving 218.798 -> 218.364 m, a 0.2% change. Cheap enough that there is no
+// argument for keeping a false invariant.
+//
+// Bedding is deliberately NOT counted. Its strike/dip field is hashed on an
+// 819.2 m lattice, so 120 mm spread over hundreds of metres is a gradient in the
+// single mm/m -- below the resolution of everything else in this sum, and adding
+// it would be noise in the budget rather than rigour.
+constexpr int64_t kRillGradMmPerM = kRillMaxAbsMm * 1000 / kRillAcrossMm;
+static_assert(kRillGradMmPerM == 187,
+              "the rill's nominal across-slope gradient is mirrored as a literal in "
+              "worldgen.ush; if kRillAmplitudeMm or kRillAcrossMm moved, update BOTH or "
+              "the CPU and GPU will disagree about the cap and that is a desync, not a "
+              "tuning difference.");
+
 constexpr int64_t kDetailGradCapKQ10 = 512;     // 0.5 x carrier gradient
 constexpr int64_t kDetailGradFloorMmPerM = 50;  // engaged minimum, coarse tier
 constexpr int64_t kFineDetailGradFloorMmPerM = 50;
@@ -1515,7 +1548,8 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     const int64_t gradMicro = fine ? kFineMicroGradMmPerM : kMicroGradMmPerM;
     const int64_t detailGradMmPerM = gradLand * rScale / 1024 * cScale / 1024 +
                                      gradMetre * rScale / 1024 * cScaleMicro / 1024 +
-                                     gradMicro * cScaleMicro / 1024;
+                                     gradMicro * cScaleMicro / 1024 +
+                                     kRillGradMmPerM * rScale / 1024;
     // Engagement first: full on a fine world, ramped on the coarse one --
     // exactly zero below the ramp so flat coarse classes are bit-for-bit v13,
     // saturating to full above it. The branches keep every divide's numerator
