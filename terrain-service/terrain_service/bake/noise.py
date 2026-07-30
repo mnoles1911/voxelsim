@@ -28,6 +28,7 @@ __all__ = [
     "carrier",
     "prefilter",
     "roughness",
+    "repose_field",
     "octave_wavelengths",
     "bspline_weights",
     "SPLINE_DEN",
@@ -434,6 +435,113 @@ def roughness(carrier_z: np.ndarray, cell_m: float, slope: np.ndarray, seed: int
         out += c * cgain
 
     return out
+
+
+# --------------------------------------------------------------------------------------
+# Material strength -> per-cell angle of repose (B3's threshold field)
+# --------------------------------------------------------------------------------------
+
+#: Octave-key offsets for the repose field's lattices, disjoint from the
+#: substrate octaves (0..) and the constructional term (100..) — the key is
+#: hashed as ``octave & 0xFFFF`` and there are never more than a handful of
+#: octaves in any family.
+_REPOSE_SPATIAL_OCTAVE_KEY = 200
+_REPOSE_STRATA_OCTAVE_KEY = 300
+
+#: Two octaves per family, weights (1, 0.5); this normalises their sum back to
+#: unit RMS.
+_TWO_OCTAVE_NORM = float(np.sqrt(1.0 + 0.25))
+
+
+def _strata_1d(z_m: np.ndarray, seed: int, octave: int, wavelength_m: float) -> np.ndarray:
+    """Smooth unit-variance-ish 1-D value noise over ELEVATION, elementwise.
+
+    Keyed on physical elevation only, so it is world-anchored by construction:
+    two overlapping bake domains agree bit-for-bit wherever their surfaces
+    agree. Smoothstep-faded linear interpolation between iid normal lattice
+    values at integer multiples of ``wavelength_m`` — C1 in z, which is all a
+    threshold field needs.
+    """
+    inv = 1.0 / float(wavelength_m)
+    zf = z_m.astype(np.float64, copy=False) * inv
+    k = np.floor(zf)
+    f = (zf - k).astype(np.float64)
+    ki = k.astype(np.int64)
+    del k, zf
+    zero = np.zeros_like(ki)
+    g0 = _hash_lattice(seed, octave, ki, zero)
+    g1 = _hash_lattice(seed, octave, ki + 1, zero)
+    del ki, zero
+    s = f * f * (3.0 - 2.0 * f)
+    return g0 * (1.0 - s) + g1 * s
+
+
+def repose_field(z_m: np.ndarray, cell_m: float, seed: int,
+                 origin_cells: Tuple[int, int], *,
+                 base_deg: float = 36.0,
+                 spatial_amp_deg: float = 6.0,
+                 spatial_wavelength_m: float = 160.0,
+                 strata_amp_deg: float = 14.0,
+                 strata_wavelength_m: float = 30.0,
+                 min_deg: float = 26.0,
+                 max_deg: float = 60.0) -> np.ndarray:
+    """Per-cell angle of repose, in degrees float32 — ``thermal.relax``'s field form.
+
+    WHY THIS EXISTS. B3 with one global angle planes every face it touches to
+    the SAME slope: measured on the g35 exemplar, incision hands B3 a broad,
+    heavy-tailed slope distribution (p90 grade 1.25) and B3 returns one with a
+    third of the mountainside within +-10% of tan(36 deg). A constant-slope
+    face voxelises to evenly spaced parallel contour terraces — the corduroy
+    artifact — and no client-side term may roughen it (the drainage cap forbids
+    exactly the gradients that would). So the variation has to live in the
+    THRESHOLD: rock strength is not one number in nature and stops being one
+    here.
+
+    Two components, both world-anchored, both unit-RMS before their amplitude:
+
+    * **spatial** — smooth 2-D octaves at ``spatial_wavelength_m`` and a
+      quarter of it, on the same integer world lattice as ``roughness`` (so
+      apron overlaps agree exactly). Reads as lithology patches: one nose of a
+      ridge ravels at 30 deg while its neighbour holds 45.
+    * **strata** — 1-D value noise over ELEVATION at ``strata_wavelength_m``
+      and a quarter of it. Reads as sub-horizontal bedding: bands of strong
+      rock that hold near-cliff faces (thermal leaves everything the incision
+      carved into them) alternating with weak bands that ravel back to talus —
+      bench-and-cliff structure, which is precisely the metre-scale slope
+      CHANGE a smooth ramp lacks. Keyed on the pre-relaxation surface, i.e.
+      strata are glued to the rock, not to the finished skin.
+
+    Both amplitudes at 0 reproduce a constant field (the scalar bake).
+    """
+    if spatial_amp_deg < 0.0 or strata_amp_deg < 0.0:
+        raise ValueError("repose amplitudes must be >= 0")
+    if spatial_wavelength_m <= 0.0 or strata_wavelength_m <= 0.0:
+        raise ValueError("repose wavelengths must be positive")
+    if not (0.0 < min_deg <= base_deg <= max_deg < 85.0):
+        raise ValueError(
+            f"need 0 < min {min_deg} <= base {base_deg} <= max {max_deg} < 85"
+        )
+    n0, n1 = z_m.shape
+    oy, ox = int(origin_cells[0]), int(origin_cells[1])
+    out = np.full((n0, n1), float(base_deg), dtype=np.float64)
+
+    if spatial_amp_deg > 0.0:
+        p = max(4, int(round(spatial_wavelength_m / float(cell_m))))
+        sp = _octave_field((n0, n1), p, seed, _REPOSE_SPATIAL_OCTAVE_KEY, oy, ox).astype(np.float64)
+        sp += 0.5 * _octave_field((n0, n1), max(4, p // 4), seed,
+                                  _REPOSE_SPATIAL_OCTAVE_KEY + 1, oy, ox)
+        out += (float(spatial_amp_deg) / _TWO_OCTAVE_NORM) * sp
+        del sp
+
+    if strata_amp_deg > 0.0:
+        st = _strata_1d(z_m, seed, _REPOSE_STRATA_OCTAVE_KEY, strata_wavelength_m)
+        st += 0.5 * _strata_1d(z_m, seed, _REPOSE_STRATA_OCTAVE_KEY + 1,
+                               strata_wavelength_m / 4.0)
+        out += (float(strata_amp_deg) / _TWO_OCTAVE_NORM) * st
+        del st
+
+    np.clip(out, float(min_deg), float(max_deg), out=out)
+    return out.astype(np.float32)
 
 
 def _octave_field(shape: Tuple[int, int], p: int, seed: int, octave: int,

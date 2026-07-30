@@ -20,6 +20,23 @@ Two properties are load-bearing and both were learned by getting them wrong:
 Structure is two passes (compute excess, then gather) so it stays parallel-safe: no cell
 writes to a neighbour, every cell only reads. numba accelerates it when available; the
 numpy path is the reference implementation and the two are checked against each other.
+
+**Per-cell repose (2026-07-30).** ``repose_deg`` may be a 2-D array of degrees, one per
+cell — a material-strength field. A single global angle is what machines the terrain:
+measured on the g35 exemplar (tile -5,2), a third of a 3.8 km mountainside finishes
+within ±10% of tan(36°), because every face that thermal touches is driven toward the
+SAME slope, and a constant-slope face voxelises to evenly spaced parallel contour
+terraces (docs/measurements/contour-crookedness-2026-07-30.txt). With a field, each
+face relaxes toward its OWN angle: weak bands ravel back to gentle talus aprons, strong
+bands hold near-cliff faces and keep the relief incision carved into them — which is
+bench-and-riser structure, the thing a smooth ramp lacks.
+
+The threshold is keyed on the DONOR cell (the higher cell of the pair) in both passes,
+which is what keeps the two passes describing the same set of moves and therefore keeps
+mass conservation exact: material leaves a cell only by its own strength, and the gather
+pass recomputes exactly the donor-keyed excess the shed pass used. The stability bound is
+unchanged per pair (a donor can be driven *to its own* repose, never through it, for any
+``rate <= 0.5``).
 """
 
 from __future__ import annotations
@@ -86,6 +103,27 @@ def _work_dtype(z: np.ndarray):
     return np.float64 if z.dtype == np.float64 else np.float32
 
 
+def _repose_tan_field(repose_deg: np.ndarray, cell_m: float, shape, dtype) -> np.ndarray:
+    """Per-cell ``tan(repose) * cell_m`` (the CARDINAL drop), validated.
+
+    The per-direction drop for a pair at distance ``dist`` cells is this times
+    ``dist`` — same per-direction scaling as ``_max_drops``, so diagonal pairs
+    are held to the same *slope*, not the same height drop.
+    """
+    r = np.asarray(repose_deg)
+    if r.shape != shape:
+        raise ValueError(
+            f"repose_deg field shape {r.shape} does not match z {shape}"
+        )
+    lo = float(np.min(r))
+    hi = float(np.max(r))
+    if not (0.0 < lo and hi < 85.0):
+        raise ValueError(
+            f"repose_deg field range [{lo}, {hi}] outside (0, 85) degrees"
+        )
+    return (np.tan(np.radians(r.astype(np.float64))) * float(cell_m)).astype(dtype)
+
+
 def excess_over_repose(z: np.ndarray, cell_m: float, repose_deg: float = 36.0) -> np.ndarray:
     """Per-cell max over-repose drop, in metres. Zero everywhere means "at or below repose"."""
     a = np.asarray(z)
@@ -136,6 +174,42 @@ def _relax_numpy(z: np.ndarray, max_drops, iters: int, rate) -> np.ndarray:
             # covers every ordered pair exactly once in each direction.
             c, n = _pair_slices(dy, dx, shape)
             e = out[n] - out[c] - drop
+            np.clip(e, 0.0, None, out=e)
+            en = exc[n]
+            share = np.divide(e, en, out=np.zeros_like(e), where=en > 0)
+            gain[c] += share * shed[n]
+
+        out = out - shed + gain
+    return out
+
+
+def _relax_numpy_field(z: np.ndarray, tcell: np.ndarray, iters: int, rate) -> np.ndarray:
+    """Reference implementation of the per-cell-repose variant.
+
+    Identical structure to ``_relax_numpy``; the only change is that a pair's
+    threshold is the DONOR's ``tcell * dist`` instead of a constant. Keying on
+    the donor in BOTH passes is what keeps the gather pass reconstructing the
+    exact excesses the shed pass summed, hence mass conservation.
+    """
+    dt = z.dtype
+    out = z
+    shape = z.shape
+    dists = tuple(dt.type(d[2]) for d in _NEIGHBOURS)
+    for _ in range(iters):
+        exc = np.zeros(shape, dtype=dt)
+        mx = np.zeros(shape, dtype=dt)
+        for (dy, dx, _), dist in zip(_NEIGHBOURS, dists):
+            c, n = _pair_slices(dy, dx, shape)
+            e = out[c] - out[n] - tcell[c] * dist
+            np.clip(e, 0.0, None, out=e)
+            exc[c] += e
+            np.maximum(mx[c], e, out=mx[c])
+
+        shed = mx * rate
+        gain = np.zeros(shape, dtype=dt)
+        for (dy, dx, _), dist in zip(_NEIGHBOURS, dists):
+            c, n = _pair_slices(dy, dx, shape)
+            e = out[n] - out[c] - tcell[n] * dist
             np.clip(e, 0.0, None, out=e)
             en = exc[n]
             share = np.divide(e, en, out=np.zeros_like(e), where=en > 0)
@@ -201,6 +275,77 @@ def _build_numba_step():
     return _step
 
 
+_njit_step_field = None
+
+
+def _build_numba_step_field():
+    global _njit_step_field
+    if _njit_step_field is not None:
+        return _njit_step_field
+    njit, prange = _numba()
+    if njit is None:
+        return None
+
+    @njit(cache=True, parallel=True, fastmath=False)
+    def _step(z, out, exc, mx, tcell, dy_a, dx_a, dist_a, rate):
+        h, w = z.shape
+        for y in prange(h):
+            for x in range(w):
+                zc = z[y, x]
+                tc = tcell[y, x]
+                s = 0.0
+                m = 0.0
+                for k in range(8):
+                    ny = y + dy_a[k]
+                    nx = x + dx_a[k]
+                    if ny < 0 or nx < 0 or ny >= h or nx >= w:
+                        continue
+                    e = zc - z[ny, nx] - tc * dist_a[k]
+                    if e > 0.0:
+                        s += e
+                        if e > m:
+                            m = e
+                exc[y, x] = s
+                mx[y, x] = m
+        for y in prange(h):
+            for x in range(w):
+                zc = z[y, x]
+                gain = 0.0
+                for k in range(8):
+                    ny = y + dy_a[k]
+                    nx = x + dx_a[k]
+                    if ny < 0 or nx < 0 or ny >= h or nx >= w:
+                        continue
+                    en = exc[ny, nx]
+                    if en <= 0.0:
+                        continue
+                    # Donor-keyed threshold: the DONOR's own strength decides
+                    # what it sheds, in both passes.
+                    e = z[ny, nx] - zc - tcell[ny, nx] * dist_a[k]
+                    if e > 0.0:
+                        gain += (e / en) * (mx[ny, nx] * rate)
+                out[y, x] = zc - mx[y, x] * rate + gain
+
+    _njit_step_field = _step
+    return _step
+
+
+def _relax_numba_field(z: np.ndarray, tcell: np.ndarray, iters: int, rate) -> np.ndarray:
+    step = _build_numba_step_field()
+    dt = z.dtype
+    dy_a = np.array([d[0] for d in _NEIGHBOURS], dtype=np.int64)
+    dx_a = np.array([d[1] for d in _NEIGHBOURS], dtype=np.int64)
+    dist_a = np.array([d[2] for d in _NEIGHBOURS], dtype=dt)
+    a = z.copy()
+    b = np.empty_like(a)
+    exc = np.empty_like(a)
+    mx = np.empty_like(a)
+    for _ in range(iters):
+        step(a, b, exc, mx, tcell, dy_a, dx_a, dist_a, dt.type(rate))
+        a, b = b, a
+    return a
+
+
 def _relax_numba(z: np.ndarray, max_drops, iters: int, rate) -> np.ndarray:
     step = _build_numba_step()
     dt = z.dtype
@@ -219,9 +364,14 @@ def _relax_numba(z: np.ndarray, max_drops, iters: int, rate) -> np.ndarray:
 
 # --------------------------------------------------------------------------------------
 
-def relax(z: np.ndarray, cell_m: float, repose_deg: float = 36.0, iters: int = 48,
+def relax(z: np.ndarray, cell_m: float, repose_deg=36.0, iters: int = 48,
           rate: float = 0.4) -> np.ndarray:
     """Slope-limited, mass-conserving thermal relaxation. Returns a new array.
+
+    ``repose_deg`` is either a scalar (one global angle — the historical
+    behaviour, bit-identical code path) or a 2-D array of per-cell degrees (a
+    material-strength field; see the module docstring). The field variant keys
+    each pair's threshold on the donor cell.
 
     `rate` must stay `<= 0.5`: the stability argument is that a cell sheds `rate` times its
     *steepest* over-repose drop, so that pair can be driven to repose but not through it.
@@ -250,10 +400,21 @@ def relax(z: np.ndarray, cell_m: float, repose_deg: float = 36.0, iters: int = 4
     a = a.astype(dt, copy=True)
     if iters == 0:
         return a
-    max_drops = _max_drops(float(cell_m), repose_deg, dt)
     rate_v = dt(rate)
-
     njit, _ = _numba()
+
+    if np.ndim(repose_deg) == 2:
+        tcell = _repose_tan_field(repose_deg, float(cell_m), a.shape, dt)
+        if njit is not None and a.size >= 4096:
+            return _relax_numba_field(a, tcell, iters, rate_v)
+        return _relax_numpy_field(a, tcell, iters, rate_v)
+    if np.ndim(repose_deg) != 0:
+        raise ValueError(
+            f"repose_deg must be a scalar or a 2-D field, got ndim {np.ndim(repose_deg)}"
+        )
+
+    max_drops = _max_drops(float(cell_m), float(repose_deg), dt)
+
     if njit is not None and a.size >= 4096:
         return _relax_numba(a, max_drops, iters, rate_v)
     return _relax_numpy(a, max_drops, iters, rate_v)

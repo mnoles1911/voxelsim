@@ -183,7 +183,21 @@ __all__ = [
 #: 11.8%); alpine 0.0030 -> 0.0213 and rolling 0.0034 -> ~0.05 (real alpine
 #: 0.0332 -- improved 6-7x, still short; see the B2d comment). The old
 #: surfaces are reproducible exactly with the bake_ver-3 constants.
-BAKE_VERSION = 4
+#:
+#: 4 -> 5 (2026-07-30, contour corduroy): B3's angle of repose becomes a
+#: per-cell MATERIAL STRENGTH FIELD (``noise.repose_field``: world-anchored
+#: spatial lithology octaves plus elevation-keyed strata bands), consumed by
+#: ``thermal.relax``'s new 2-D ``repose_deg`` form. Measured motivation: with
+#: one global angle, B3 takes the broad slope distribution incision hands it
+#: (g35 exemplar p90 grade 1.25) and returns a third of the mountainside
+#: within +-10% of tan(36 deg) -- and a constant-slope face voxelises to the
+#: evenly spaced parallel contour terraces the owner rejects, upstream of
+#: every client term (docs/measurements/contour-crookedness-2026-07-30.txt).
+#: ``repose_spatial_amp_deg = repose_strata_amp_deg = 0`` with repose_deg 36
+#: reproduces the bake_ver-4 surface exactly. The constants roll the id on
+#: their own; the counter moves because thermal.relax and the B3 call grew the
+#: field path.
+BAKE_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -490,6 +504,27 @@ class BakeConstants:
 
     # -- B3 thermal --------------------------------------------------------
     repose_deg: float = 36.0
+    #: Material-strength modulation of the repose angle (bake_ver 5). Both at
+    #: 0 reproduce the scalar bake_ver-4 relaxation exactly. See
+    #: ``noise.repose_field`` for the construction and the measured motivation
+    #: (one global angle planes a third of a mountainside to a single slope,
+    #: which voxelises as the parallel contour-terrace corduroy).
+    #:
+    #: The SPATIAL term is lithology patches: smooth world-anchored octaves at
+    #: this wavelength and a quarter of it. The STRATA term is sub-horizontal
+    #: bedding: 1-D noise over elevation, so strong bands hold near-cliff
+    #: faces (keeping what incision carved into them) and weak bands ravel
+    #: back to talus -- bench-and-cliff structure at metre scale.
+    #: Amplitudes are degrees per unit-RMS field; the result is clamped to
+    #: [repose_min_deg, repose_max_deg].
+    repose_spatial_amp_deg: float = 6.0
+    repose_spatial_wavelength_m: float = 160.0
+    repose_strata_amp_deg: float = 14.0
+    repose_strata_wavelength_m: float = 30.0
+    #: 26 deg is a weathered debris slope; 60 deg holds jointed-rock faces.
+    #: The ceiling stays well under thermal.relax's 85 deg validity bound.
+    repose_min_deg: float = 26.0
+    repose_max_deg: float = 60.0
     thermal_iters: int = 48
     #: Must stay <= 0.5 -- ``thermal.relax`` rejects more outright. The shed is
     #: capped by the STEEPEST over-repose pair, so that pair can at most be
@@ -556,6 +591,15 @@ class BakeConstants:
                 "thermal.relax rejects it, and above 0.5 the steepest-pair "
                 "bound no longer holds"
             )
+        if self.repose_spatial_amp_deg < 0.0 or self.repose_strata_amp_deg < 0.0:
+            raise ValueError("repose amplitudes must be >= 0 (0 disables)")
+        if self.repose_spatial_wavelength_m <= 0.0 or self.repose_strata_wavelength_m <= 0.0:
+            raise ValueError("repose wavelengths must be positive")
+        if not (0.0 < self.repose_min_deg <= self.repose_deg <= self.repose_max_deg < 85.0):
+            raise ValueError(
+                f"need 0 < repose_min_deg {self.repose_min_deg} <= repose_deg "
+                f"{self.repose_deg} <= repose_max_deg {self.repose_max_deg} < 85"
+            )
         if self.superblock_tiles < 1 or self.superblock_max_level < 0:
             raise ValueError("superblock_tiles >= 1 and max_level >= 0")
         if self.incision_mode not in ("profile", "depth"):
@@ -609,6 +653,12 @@ class BakeConstants:
             "sea_taper_top_m": self.sea_taper_top_m,
             "sea_taper_bottom_m": self.sea_taper_bottom_m,
             "repose_deg": self.repose_deg,
+            "repose_spatial_amp_deg": self.repose_spatial_amp_deg,
+            "repose_spatial_wavelength_m": self.repose_spatial_wavelength_m,
+            "repose_strata_amp_deg": self.repose_strata_amp_deg,
+            "repose_strata_wavelength_m": self.repose_strata_wavelength_m,
+            "repose_min_deg": self.repose_min_deg,
+            "repose_max_deg": self.repose_max_deg,
             "thermal_iters": self.thermal_iters,
             "thermal_rate": self.thermal_rate,
             "superblock_tiles": self.superblock_tiles,
@@ -2196,17 +2246,44 @@ def bake_padded_domain(
 
     # -- B3: slope-limited thermal relaxation, AFTER incision so gully walls
     # weather and spoil forms talus.
+    #
+    # bake_ver 5: the threshold is a per-cell MATERIAL STRENGTH FIELD rather
+    # than one global angle (see the repose_* constants and noise.repose_field
+    # for the measured motivation: a single angle planes every relaxed face to
+    # the same slope, which voxelises as parallel contour-terrace corduroy).
+    # The field is keyed on the PRE-relaxation surface — strata are glued to
+    # the rock — and on the same world-anchored lattice/seed machinery as B1,
+    # so apron overlaps agree exactly. Both amplitudes at 0 reproduce the
+    # scalar call bit-for-bit.
     c0 = time.process_time()
+    repose = consts.repose_deg
+    if consts.repose_spatial_amp_deg > 0.0 or consts.repose_strata_amp_deg > 0.0:
+        from .noise import repose_field  # lazy, like load_kernels: numerics stay out of import time
+
+        repose = repose_field(
+            eroded,
+            cell_m,
+            seed,
+            origin_cells,
+            base_deg=consts.repose_deg,
+            spatial_amp_deg=consts.repose_spatial_amp_deg,
+            spatial_wavelength_m=consts.repose_spatial_wavelength_m,
+            strata_amp_deg=consts.repose_strata_amp_deg,
+            strata_wavelength_m=consts.repose_strata_wavelength_m,
+            min_deg=consts.repose_min_deg,
+            max_deg=consts.repose_max_deg,
+        )
     z = np.asarray(
         kernels.relax(
             eroded,
             cell_m,
-            repose_deg=consts.repose_deg,
+            repose_deg=repose,
             iters=consts.thermal_iters,
             rate=consts.thermal_rate,
         ),
         dtype=np.float32,
     )
+    del repose
     tick("B3.relax", c0)
 
     return {

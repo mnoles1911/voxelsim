@@ -819,6 +819,82 @@ def test_relax_numba_matches_the_numpy_reference():
     assert np.abs(ref - fast).max() < 1e-9
 
 
+def test_relax_field_constant_matches_scalar():
+    """A constant repose FIELD must reproduce the scalar path to float ulp.
+
+    NOT bit-for-bit, deliberately: the scalar path rounds `tan * dist * cell`
+    once per direction, the field path stores `tan * cell` per cell and scales
+    by `dist` in the kernel, and the two associations differ in the last ulp.
+    The bake_ver-4 reproducibility guarantee is NOT this test -- it is the
+    pipeline skipping the field entirely when both amplitudes are 0, which
+    leaves the scalar code path untouched. This test pins the field path to
+    the same physics, ulp noise aside.
+    """
+    z = _spiky_field(n=48)
+    a = thermal.relax(z, CELL_M, repose_deg=REPOSE_DEG, iters=24)
+    b = thermal.relax(z, CELL_M, repose_deg=np.full(z.shape, REPOSE_DEG), iters=24)
+    assert np.abs(a - b).max() < 1e-6
+
+
+def test_relax_field_conserves_mass_and_stays_stable():
+    """The donor-keyed threshold keeps both passes describing the same moves,
+    so conservation is exact with a VARYING field too -- and the steepest-pair
+    stability bound is per-pair, so it survives the field as well."""
+    rng = np.random.default_rng(11)
+    z = _spiky_field()
+    fld = np.clip(36.0 + 14.0 * rng.normal(size=z.shape), 26.0, 60.0)
+    before = z.sum()
+    out = thermal.relax(z, CELL_M, repose_deg=fld, iters=200)
+    assert np.isfinite(out).all()
+    rel = abs(out.sum() - before) / abs(before)
+    assert rel < 1e-12, rel
+    assert np.abs(out).max() < 10.0 * np.abs(z).max()
+
+
+def test_relax_field_weak_zone_relaxes_while_strong_zone_holds():
+    """The point of the field: a strong band must KEEP the relief a weak band
+    loses. Relief whose slopes sit BETWEEN the two thresholds (45-degree hills,
+    over a 26-degree weak repose and under a 60-degree strong one): the weak
+    half must relax, the strong half must not move at all -- holding what the
+    upstream passes carved is the entire mechanism this field exists for."""
+    n = 64
+    yy, xx = np.mgrid[0:n, 0:n].astype(np.float64)
+    # ~45-degree local slopes: amplitude chosen so max |grad| ~ 1.0-1.3.
+    z = 6.5 * np.sin(xx / 3.0) * np.sin(yy / 3.0)
+    assert 1.0 < thermal.max_slope(z, CELL_M) < np.tan(np.radians(60.0))
+    fld = np.full(z.shape, 26.0)
+    fld[:, 32:] = 60.0
+    out = thermal.relax(z, CELL_M, repose_deg=fld, iters=48)
+    moved = np.abs(out - z)
+    weak = float(moved[:, :30].mean())
+    strong = float(moved[:, 34:].mean())
+    assert strong == 0.0, strong
+    assert weak > 0.1, weak
+
+
+def test_relax_field_numba_matches_the_numpy_reference():
+    pytest.importorskip("numba")
+    rng = np.random.default_rng(3)
+    z = _spiky_field(n=48)
+    fld = np.clip(36.0 + 14.0 * rng.normal(size=z.shape), 26.0, 60.0)
+    t = thermal._repose_tan_field(fld, CELL_M, z.shape, np.float64)
+    ref = thermal._relax_numpy_field(z.copy(), t, 40, np.float64(0.4))
+    fast = thermal._relax_numba_field(z.copy(), t, 40, np.float64(0.4))
+    assert np.abs(ref - fast).max() < 1e-9
+
+
+def test_relax_field_rejects_bad_shapes_and_ranges():
+    z = _spiky_field(n=32)
+    with pytest.raises(ValueError):
+        thermal.relax(z, CELL_M, repose_deg=np.full((8, 8), 36.0))
+    with pytest.raises(ValueError):
+        thermal.relax(z, CELL_M, repose_deg=np.full(z.shape, 90.0))
+    with pytest.raises(ValueError):
+        thermal.relax(z, CELL_M, repose_deg=np.full(z.shape, 0.0))
+    with pytest.raises(ValueError):
+        thermal.relax(z, CELL_M, repose_deg=np.full((4, 4, 4), 36.0))
+
+
 def test_relax_preserves_float32():
     z = _spiky_field(n=48).astype(np.float32)
     out = thermal.relax(z, CELL_M, iters=16)
