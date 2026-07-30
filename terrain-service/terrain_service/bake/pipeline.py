@@ -517,14 +517,22 @@ class BakeConstants:
     #: back to talus -- bench-and-cliff structure at metre scale.
     #: Amplitudes are degrees per unit-RMS field; the result is clamped to
     #: [repose_min_deg, repose_max_deg].
-    repose_spatial_amp_deg: float = 6.0
+    #: First cut was 6/14 deg amplitude clamped to [26, 60]. The in-engine A/B
+    #: (docs/measurements/repose-field-2026-07-30.txt) showed the banding
+    #: broken into patches but still legible on the big distant faces, and the
+    #: mechanism says why: thermal transport is translation-invariant on a
+    #: uniform ramp (shed == receive), so restructuring happens near THRESHOLD
+    #: BOUNDARIES, and a 60 deg ceiling is still just a steeper uniform ramp.
+    #: So: stronger strata, a genuinely cliff-holding ceiling (72 deg,
+    #: tan = 3.08 -- still far under relax's 85 deg validity bound), and a
+    #: slightly softer floor so weak treads cut back further.
+    repose_spatial_amp_deg: float = 8.0
     repose_spatial_wavelength_m: float = 160.0
-    repose_strata_amp_deg: float = 14.0
+    repose_strata_amp_deg: float = 20.0
     repose_strata_wavelength_m: float = 30.0
-    #: 26 deg is a weathered debris slope; 60 deg holds jointed-rock faces.
-    #: The ceiling stays well under thermal.relax's 85 deg validity bound.
-    repose_min_deg: float = 26.0
-    repose_max_deg: float = 60.0
+    #: 24 deg is a weathered debris slope; 72 deg holds jointed-rock faces.
+    repose_min_deg: float = 24.0
+    repose_max_deg: float = 72.0
     thermal_iters: int = 48
     #: Must stay <= 0.5 -- ``thermal.relax`` rejects more outright. The shed is
     #: capped by the STEEPEST over-repose pair, so that pair can at most be

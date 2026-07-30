@@ -111,7 +111,25 @@ RESULTS -- filled in below as measured.
   bit-identically and should return the pod budget to ~6 GiB (re-measure on
   the next full bake). Tile size unchanged (raw codec, fixed layout).
 
-  in-engine raking capture at the repro site: TBD
+  in-engine raking capture at the repro site (owner's exact command: spawn
+  -69094,38426, VistaShot=10, pitch -12, yaw 45, 200 s settle, both arms on
+  the SAME main-checkout client build so the diff is bake-only):
+    before: D:\ue-cache\tmp\repose-before.png  (provider survey-g35,
+            peak loaded 54,616, fine tile resident, log capture-repose-before)
+    after:  D:\ue-cache\tmp\repose-after.png   (provider survey-g35-v5,
+            fine tile resident, log capture-repose-after)
+    reading, honestly. The before frame is the artifact at its worst: long
+    unbroken scallop rows wrapping the whole hillside at even spacing. The
+    after frame breaks the single machined sheet into patches -- the mid-slope
+    bowl loses coherent banding almost entirely and reads as talus; row
+    lengths shorten and spacing varies -- but the big DISTANT faces still band
+    legibly. The mechanism explains the residual: thermal transport is
+    translation-invariant on a uniform ramp (every cell sheds exactly what it
+    receives), so a strength field restructures the surface near THRESHOLD
+    BOUNDARIES and leaves the interior of a uniform patch a uniform ramp --
+    and a 60 deg ceiling is still a uniform ramp, just steeper. Iteration 2
+    below raises the ceiling to a genuinely cliff-holding 72 deg, deepens the
+    weak floor to 24 deg and the strata swing to +-20 deg.
 
 WHAT THIS DOES NOT FIX, AND THE RANKED REMAINDER. The field only acts where
 thermal binds -- steep ground, which is the named blocker. Moderate sub-repose
