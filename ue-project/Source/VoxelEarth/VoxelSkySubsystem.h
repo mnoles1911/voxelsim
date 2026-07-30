@@ -333,4 +333,28 @@ namespace VoxelSky
 	// scalar, so once C++ drives that scalar every frame there is nowhere on the
 	// asset left to put the offset. See the cvar for the full argument.
 	VOXELEARTH_API double GetStarRotationOffsetTurns();
+
+	// --- the IsSky dome (AVoxelSkyDomeActor + M_SkyAtmosphereDome) ------------
+	//
+	// A SEPARATE KNOB FROM IsDomeEnabled, and the two must not be folded together.
+	// IsDomeEnabled hides the star dome, which is additive and purely decorative:
+	// off means one less thing added to the sky. This one decides WHO PAINTS THE
+	// SKY AT ALL -- while the IsSky dome is in the scene the SkyAtmosphere's
+	// full-screen pass stops emitting sky pixels (SkyAtmosphereRendering.cpp:2214),
+	// so hiding it hands that job back and showing it takes it away. Same actor,
+	// same follow, same radius; completely different consequence, which is why
+	// each has its own cvar and its own logged transition.
+	//
+	// Read every tick by AVoxelSkyDomeActor::ApplyDomeCvars, so it is a live knob
+	// -- non-negotiable, because S1's gate is an on/off A/B inside ONE process
+	// (the cross-session screenshot floor is 1.81%, the within-session floor
+	// 0.00%) and a spawn-time-only switch cannot express that comparison.
+	VOXELEARTH_API bool IsAtmosphereDomeEnabled();
+
+	// Gain on the star map inside the SkyLight's real-time capture, written into
+	// MPC_VoxelSky.StarAmbientGain every frame. DEFAULT 0 -- phase S1 ships the
+	// capture's star branch present but gained to nothing, so S2 is a cvar flip
+	// rather than a material rebuild. Floored at 0; see the cvar for why negative
+	// is refused rather than clamped silently.
+	VOXELEARTH_API float GetStarAmbientGain();
 }

@@ -234,6 +234,54 @@ namespace
 		TEXT("default projection has an infinite far plane. Live."),
 		ECVF_Default);
 
+	TAutoConsoleVariable<int32> CVarSkyAtmosphereDome(
+		TEXT("voxel.Sky.AtmosphereDome"), 1,
+		TEXT("Draw the canonical IsSky dome -- AVoxelSkyDomeActor's SECOND sphere, carrying ")
+		TEXT("/Game/Voxel/M_SkyAtmosphereDome. 1 = on (default). THIS IS NOT A COSMETIC TOGGLE: while the dome ")
+		TEXT("is in the scene View.bSceneHasSkyMaterial is true and the SkyAtmosphere's own full-screen pass ")
+		TEXT("STOPS PAINTING SKY PIXELS (SkyAtmosphereRendering.cpp:2214 sets bRenderSkyPixel = ")
+		TEXT("!bSceneHasSkyMaterial, and SkyAtmosphere.usf:982-992 then clips far-depth pixels out), so the dome ")
+		TEXT("is the thing painting the sky. 0 hands the sky back to the atmosphere pass. Which means this cvar ")
+		TEXT("is exactly an A/B on WHO PAINTS THE SKY, and it must agree to within 2/255 of mean luma at every ")
+		TEXT("hour -- see docs/sky-and-local-light-plan.md S1 and run it with -VoxelSkyLadder=N ")
+		TEXT("-VoxelSkyLadderAltCvar=voxel.Sky.AtmosphereDome, which pairs each hour on/off inside ONE process ")
+		TEXT("(the cross-session screenshot floor is 1.81%%, the within-session floor 0.00%%). LIVE -- toggling ")
+		TEXT("at runtime shows/hides within a frame and logs the transition; a spawn-time-only switch would make ")
+		TEXT("that gate unreadable. REFUSED, with an Error, if M_SkyAtmosphereDome failed to load: an IsSky dome ")
+		TEXT("wearing the engine default material would suppress the atmosphere pass AND paint the sky wrong."),
+		ECVF_Default);
+
+	// The star branch of M_SkyAtmosphereDome's REFLECTION-pass output, i.e. how
+	// much starlight the SkyLight's real-time capture integrates into the world's
+	// ambient term.
+	//
+	// DEFAULT 0, AND THE ZERO IS THE DELIVERABLE. Phase S1 of
+	// docs/sky-and-local-light-plan.md ships the star branch present in the graph
+	// but gained to nothing, so that S1's only claim is "the IsSky dome is a
+	// faithful stand-in for today's sky". S2 is then a cvar flip rather than a
+	// material regeneration -- which matters because regenerating the material
+	// needs the single-occupancy editor and a commandlet, and flipping a cvar
+	// needs neither.
+	//
+	// WHY IT CANNOT LIVE ON THE MPC ASSET AS A TUNING KNOB: ApplySkyMaterialParams
+	// writes StarAmbientGain every frame, so the asset default is overwritten
+	// before anything renders. Same trap StarBrightness and StarRotation both hit
+	// -- once C++ drives a collection scalar, that scalar's asset default is dead
+	// as a tuning surface (see CVarSkyStarGain and CVarSkyStarRotationOffsetTurns).
+	TAutoConsoleVariable<float> CVarSkyStarAmbientGain(
+		TEXT("voxel.Sky.StarAmbientGain"), 0.0f,
+		TEXT("Gain on the star map inside the SkyLight's real-time capture, via ")
+		TEXT("MPC_VoxelSky.StarAmbientGain and M_SkyAtmosphereDome's ReflectionCapturePassSwitch. DEFAULT 0 ")
+		TEXT("= no starlight in the ambient term, which is what phase S1 ships and verifies. Raising it is ")
+		TEXT("phase S2. It multiplies StarBrightness (the sunrise fade, already carrying voxel.Sky.StarGain's ")
+		TEXT("measured 0.15) and the horizon fade, and then rides the exposure curve's up-to-15.6-stop night ")
+		TEXT("lift -- so the S2 gate is two-sided: winter night ground luma must rise above 0.5 and stay ")
+		TEXT("STRICTLY BELOW the moonlit 17.4-25.5, or 'brighter' just means 'washed grey' and every ")
+		TEXT("one-sided gate passes anyway. Does NOT affect the main view: the switch reads ")
+		TEXT("View.RenderingReflectionCaptureMask (Common.ush:2306-2309), which is 0 on screen. It IS also ")
+		TEXT("read by ordinary reflection captures; this project ships none."),
+		ECVF_Default);
+
 	TAutoConsoleVariable<float> CVarSkyStarRotationOffsetTurns(
 		TEXT("voxel.Sky.StarRotationOffsetTurns"), 0.0f,
 		TEXT("Constant offset added to the star map's rotation, in TURNS (1.0 = a full revolution). Default ")
@@ -354,6 +402,18 @@ namespace VoxelSky
 	{
 		return FMath::Max(1.0e6, (double)CVarSkyDomeRadiusUU.GetValueOnAnyThread());
 	}
+
+	bool IsAtmosphereDomeEnabled() { return CVarSkyAtmosphereDome.GetValueOnAnyThread() != 0; }
+
+	// Floored at 0 only. There is deliberately no ceiling: the honest upper bound
+	// is whatever the S2 capture measures, and a clamp invented here would silently
+	// cap the very sweep S2 exists to run -- which is the failure the read-back rule
+	// in this file exists to prevent (a knob that stops moving while the log echoes
+	// what was typed). Negative is refused because a negative gain would SUBTRACT
+	// radiance from the capture, and a SkyLight irradiance SH with negative lobes
+	// darkens surfaces that face the Milky Way. That reads as "the band is wrong
+	// side up" rather than as a bad input.
+	float GetStarAmbientGain() { return FMath::Max(0.f, CVarSkyStarAmbientGain.GetValueOnAnyThread()); }
 
 	// Unclamped and unwrapped on purpose: it is a rotation in turns, so every
 	// real value is meaningful and 1.25 means the same thing as 0.25. Wrapping it
@@ -1172,6 +1232,12 @@ struct FVoxelSkyImpl
 	// ApplySkyMaterialParams for why StarRotation's sign depends on it. Latched so
 	// the resolved pair is logged when it changes and not every frame.
 	double AppliedStarUDirection = 0.0;
+
+	// Last voxel.Sky.StarAmbientGain logged. Starts at a value the cvar cannot
+	// hold (it is floored at 0) so the FIRST frame always logs the gain the run is
+	// actually at -- an S2 capture has to be able to state its own gain from its
+	// own log, and "no line" would be indistinguishable from "gain 0".
+	float AppliedStarAmbientGain = -1.f;
 
 	FVoxelSkyState State;
 };
@@ -2497,6 +2563,43 @@ void UVoxelSkySubsystem::ApplySkyMaterialParams()
 	UKismetMaterialLibrary::SetScalarParameterValue(
 		World, Collection, TEXT("StarBrightness"),
 		(float)StarBrightnessForSunAltitude(S.SunAltitudeDeg));
+
+	// --- the capture's star gain (phase S2's switch, shipped at 0) ------------
+	//
+	// Read by M_SkyAtmosphereDome ONLY, and only on the Reflection branch of its
+	// ReflectionCapturePassSwitch -- so at any gain it is invisible on screen and
+	// only ever changes what the SkyLight's real-time capture integrates
+	// (View.RenderingReflectionCaptureMask, Common.ush:2306-2309, is 0 in the main
+	// view and 1 in the capture, ReflectionEnvironmentRealTimeCapture.cpp:570).
+	//
+	// WRITTEN EVERY FRAME EVEN THOUGH IT IS A CVAR THAT RARELY MOVES, for the same
+	// reason every other name in this function is: the MPC has no per-material
+	// fallback, so "sometimes written" and "written once" both mean the asset
+	// default is standing on the frames in between. There is no cheap path here to
+	// take -- these are uniform writes that bust no shadow cache, which is the
+	// whole argument for this function being outside the ShadowUpdateHz gate.
+	//
+	// WHY THE ASSET DEFAULT CANNOT BE THE KNOB: this write kills it. Editing
+	// MPC_VoxelSky.StarAmbientGain does nothing once this line exists -- exactly
+	// the correction recorded above StarBrightnessForSunAltitude, and the reason
+	// voxel.Sky.StarAmbientGain exists as a cvar at all.
+	UKismetMaterialLibrary::SetScalarParameterValue(
+		World, Collection, TEXT("StarAmbientGain"), VoxelSky::GetStarAmbientGain());
+
+	// Logged on TRANSITION only, and logged at all because S2's whole gate is
+	// "did the ambient term move, and by how much" -- a capture has to be able to
+	// state the gain it was shot at from its own log rather than from the command
+	// line that was supposed to have been used.
+	if (!FMath::IsNearlyEqual(VoxelSky::GetStarAmbientGain(), Impl->AppliedStarAmbientGain, 1.e-6f))
+	{
+		Impl->AppliedStarAmbientGain = VoxelSky::GetStarAmbientGain();
+		UE_LOG(LogVoxelSky, Log,
+		       TEXT("VoxelSky StarAmbientGain -> %.4f (voxel.Sky.StarAmbientGain, written into %s). This is the ")
+		       TEXT("SkyLight capture's star gain ONLY -- it cannot change a main-view pixel, because ")
+		       TEXT("M_SkyAtmosphereDome routes it through a ReflectionCapturePassSwitch. 0 is phase S1's shipped ")
+		       TEXT("value: the branch exists in the graph and contributes nothing."),
+		       Impl->AppliedStarAmbientGain, kSkyCollectionPath);
+	}
 }
 
 // --- queries / clock control -----------------------------------------------

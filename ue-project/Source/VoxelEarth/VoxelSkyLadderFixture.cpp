@@ -162,6 +162,21 @@ struct FSkyLadderRun
 	double StartHour = 0.0;
 	float WatchdogSeconds = 0.f;
 
+	// --- paired A/B mode (-VoxelSkyLadderAltCvar) ---------------------------
+	//
+	// AltArms is 1 (plain ladder) or 2 (paired). It multiplies the capture count
+	// and NOT the hour count: rung h is shot AltArms times at the same epoch, so
+	// the pair is diffable. See the header for why alternating the cvar against
+	// the hour instead produces an uninterpretable artifact.
+	//
+	// AltTag is the cvar's last dot-separated segment, used in filenames -- a full
+	// cvar name has dots in it and a dot in a screenshot basename is an extension
+	// waiting to be misparsed.
+	FString AltCvarName;
+	FString AltTag;
+	FString AltValues[2];
+	int32 AltArms = 1;
+
 	// --- latched at the first rung ---
 	//
 	// THE GAME-DAY INDEX, LATCHED ONCE. Not re-read per rung: it is derived from
@@ -204,6 +219,11 @@ struct FSkyLadderRun
 		float ExposureBiasEV = 0.f;
 		int32 ExposureMode = 0;
 		FString ShotName;
+		// The alt cvar's value AS READ BACK at this rung's shutter -- not the value
+		// that was requested. Empty in a plain ladder. This is what lets the summary
+		// table be read as pairs, and what makes a refused set visible as two rows
+		// with the SAME arm value rather than as a mysteriously null result.
+		FString AltValue;
 	};
 	TArray<FRung> Rungs;
 
@@ -227,9 +247,36 @@ void StageAdvance(FRunRef Run);
 void StageSummary(FRunRef Run);
 void Finish(FRunRef Run, const TCHAR* Reason);
 
+// Defined below beside the arm-time preconditions, forward-declared because the
+// paired-A/B stage needs it per rung. It sets a cvar and returns WHAT IT READ
+// BACK, which is the only reason it exists rather than an inline Var->Set.
+bool PinCVar(const TCHAR* Name, const TCHAR* Value, FString& OutActual);
+
 FORCEINLINE UWorld* WorldOf(const FRunRef& Run)
 {
 	return Run->World.Get();
+}
+
+// Total CAPTURES, not hours. Steps is the number of simulated instants; AltArms
+// is how many frames each instant is shot at (1 plain, 2 paired). Every loop
+// bound and every "n/N" in a log line uses this, because a paired ladder that
+// counted hours would report itself half finished at the end.
+FORCEINLINE int32 TotalRungs(const FRunRef& Run)
+{
+	return Run->Steps * FMath::Max(1, Run->AltArms);
+}
+
+// Which simulated instant capture i belongs to, and which arm of the A/B it is.
+// The pair is (2h, 2h+1) in paired mode, and both share one epoch -- see the
+// header for why the hour must NOT advance between the arms.
+FORCEINLINE int32 HourIndexOf(const FRunRef& Run, int32 StepIndex)
+{
+	return StepIndex / FMath::Max(1, Run->AltArms);
+}
+
+FORCEINLINE int32 ArmIndexOf(const FRunRef& Run, int32 StepIndex)
+{
+	return StepIndex % FMath::Max(1, Run->AltArms);
 }
 
 // Timer helpers, verbatim in shape from VoxelSweBreachFixture.cpp:392-410. The
@@ -275,8 +322,11 @@ void Finish(FRunRef Run, const TCHAR* Reason)
 	}
 	Run->bFinishing = true;
 
+	// TotalRungs, not Steps: in paired A/B mode the expected count is 2 per hour, and
+	// a "finished 8/8" line on a 16-frame ladder is how a truncated artifact passes
+	// for a complete one.
 	UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSkyLadder: FINISHED (%s) after %d/%d capture(s). Quitting in 5s."), Reason,
-	       Run->CapturesTaken, Run->Steps);
+	       Run->CapturesTaken, TotalRungs(Run));
 
 	UWorld* W = WorldOf(Run);
 	if (!W)
@@ -374,12 +424,27 @@ void ReassertPose(FRunRef Run)
 // DaysPerYear cvar help both call it out as the point of a compressed year, not
 // a wrapping bug), not something this fixture can or should correct -- so every
 // rung LOGS its day of the year and the arm-time line states the total drift.
-double ComputeRungEpochSeconds(const FRunRef& Run, int32 StepIndex)
+//
+// THE INDEX IT TAKES IS THE HOUR INDEX, NOT THE CAPTURE INDEX. In paired A/B mode
+// two consecutive captures share one hour index and therefore one epoch, which is
+// the property that makes the pair diffable -- see the header. Callers pass
+// HourIndexOf(Run, StepIndex) rather than StepIndex.
+double ComputeRungEpochSeconds(const FRunRef& Run, int32 HourIndex)
 {
 	const double N = FMath::Max(1.0, (double)Run->Steps);
-	const double Fraction = FMath::Frac(Run->StartHour / 24.0 + (double)StepIndex / N);
+	const double Fraction = FMath::Frac(Run->StartHour / 24.0 + (double)HourIndex / N);
 	const double Wrapped = Fraction < 0.0 ? Fraction + 1.0 : Fraction;
 	return Run->DayLengthSeconds * (Run->BaseDayIndex + Wrapped);
+}
+
+// The arm's value for capture i, or an empty string in a plain ladder.
+FString ArmValueOf(const FRunRef& Run, int32 StepIndex)
+{
+	if (Run->AltArms <= 1)
+	{
+		return FString();
+	}
+	return Run->AltValues[ArmIndexOf(Run, StepIndex)];
 }
 
 // Hours -> (HH, MM), rounded to the nearest minute WITH the carry handled.
@@ -536,16 +601,68 @@ void StageSetClock(FRunRef Run)
 	// THE ABSOLUTE SET. Never "advance the clock by 24/N hours": voxel.Sky.TimeScale
 	// is 0 precisely so that the epoch is a value this fixture owns rather than a
 	// quantity that also moves on its own between here and the shutter.
-	const double Epoch = ComputeRungEpochSeconds(Run, Run->StepIndex);
+	//
+	// In paired mode both arms of a pair write the SAME epoch, because the hour
+	// index -- not the capture index -- decides it. Writing it twice is not a
+	// redundancy worth optimising away: SetEpochSeconds also clears the light
+	// cadence accumulator (VoxelSkySubsystem.cpp's bLightsEverApplied reset), so the
+	// second arm gets the same forced re-orientation the first one did rather than
+	// depending on where the accumulator happened to be.
+	const double Epoch = ComputeRungEpochSeconds(Run, HourIndexOf(Run, Run->StepIndex));
 	Sky->SetEpochSeconds(Epoch);
+
+	// --- the A/B arm, SET BEFORE THE SETTLE ---------------------------------
+	//
+	// Before, not after, because anything worth A/B-ing here is likely to feed the
+	// SkyLight's real-time capture, which amortises its cubemap and convolution
+	// across several frames (see kDefaultSettleSeconds (a)). A flip after the settle
+	// would photograph the PREVIOUS arm's ambient term -- the same stale-sky failure
+	// the settle exists to prevent, arriving through a different door.
+	//
+	// READ BACK, never echoed: ECVF_SetByCode loses to ECVF_SetByConsole, so an
+	// -ExecCmds that also sets this cvar would refuse both writes and the ladder
+	// would run an A/B against itself. The read-back lands in the rung record and
+	// in the summary table, so that failure shows up as two rows with the same arm
+	// value rather than as a null result nobody can explain.
+	if (Run->AltArms > 1)
+	{
+		const FString Requested = ArmValueOf(Run, Run->StepIndex);
+		FString Actual;
+		if (!PinCVar(*Run->AltCvarName, *Requested, Actual))
+		{
+			UE_LOG(LogVoxelEarth, Error,
+			       TEXT("VoxelSkyLadder: %s vanished mid-run (it resolved at arm time). Cannot set arm %d."),
+			       *Run->AltCvarName, ArmIndexOf(Run, Run->StepIndex));
+			Finish(Run, TEXT("alt cvar lost"));
+			return;
+		}
+		if (Actual != Requested)
+		{
+			UE_LOG(LogVoxelEarth, Warning,
+			       TEXT("VoxelSkyLadder rung %d: asked %s=%s and read back %s. The ECVF_SetByCode write was REFUSED, ")
+			       TEXT("almost certainly by an -ExecCmds set at a higher priority. THE PAIR AT THIS HOUR IS NOW AN ")
+			       TEXT("A/B AGAINST ITSELF and any 'no difference' conclusion from it is worthless."),
+			       Run->StepIndex, *Run->AltCvarName, *Requested, *Actual);
+		}
+	}
 
 	const double RequestedHours = FMath::Frac(Epoch / Run->DayLengthSeconds) * 24.0;
 	int32 ReqH = 0, ReqM = 0;
 	SplitHours(RequestedHours, ReqH, ReqM);
+	// Named local rather than an inline *ArmValueOf(...) inside the UE_LOG: it is a
+	// by-value FString, and reaching into a temporary through operator* inside a
+	// variadic call is the kind of lifetime question nobody should have to answer
+	// while reading a log line.
+	const FString ArmLabel = Run->AltArms > 1
+		                         ? FString::Printf(TEXT(" %s=%s"), *Run->AltTag, *ArmValueOf(Run, Run->StepIndex))
+		                         : FString();
 	UE_LOG(LogVoxelEarth, Log,
-	       TEXT("VoxelSkyLadder rung %d/%d: clock SET to epoch %.3f s (requested %02dh%02d); settling %.1fs before ")
-	       TEXT("the shutter (SkyLight real-time capture has to reconverge after a %0.1f-hour jump)."),
-	       Run->StepIndex, Run->Steps - 1, Epoch, ReqH, ReqM, Run->SettleSeconds, 24.0 / FMath::Max(1.0, (double)Run->Steps));
+	       TEXT("VoxelSkyLadder rung %d/%d (hour %d/%d, arm %d/%d%s): clock SET to epoch %.3f s (requested ")
+	       TEXT("%02dh%02d); settling %.1fs before the shutter (SkyLight real-time capture has to reconverge ")
+	       TEXT("after a %0.1f-hour jump)."),
+	       Run->StepIndex, TotalRungs(Run) - 1, HourIndexOf(Run, Run->StepIndex), Run->Steps - 1,
+	       ArmIndexOf(Run, Run->StepIndex), FMath::Max(1, Run->AltArms) - 1, *ArmLabel,
+	       Epoch, ReqH, ReqM, Run->SettleSeconds, 24.0 / FMath::Max(1.0, (double)Run->Steps));
 
 	SetTimerOnce(Run, Run->StageHandle, Run->SettleSeconds, &StageCapture);
 }
@@ -570,7 +687,7 @@ void StageCapture(FRunRef Run)
 	// VoxelGpuVerify.cpp:2118-2126.
 	const FVoxelSkyState& S = Sky->GetSkyState();
 
-	const double RequestedEpoch = ComputeRungEpochSeconds(Run, Run->StepIndex);
+	const double RequestedEpoch = ComputeRungEpochSeconds(Run, HourIndexOf(Run, Run->StepIndex));
 	const double RequestedHours = FMath::Frac(RequestedEpoch / Run->DayLengthSeconds) * 24.0;
 
 	// A drift guard, because "the clock did not take" has no other symptom. If the
@@ -590,16 +707,52 @@ void StageCapture(FRunRef Run)
 	int32 Hour = 0, Minute = 0;
 	SplitHours(S.LocalHours, Hour, Minute);
 
+	// The arm's value AS READ BACK at the shutter, not as requested -- same rule the
+	// sky state follows two lines up, and for the same reason: an -ExecCmds that
+	// outranks the per-rung write would otherwise be invisible in the artifact.
+	FString AltActual;
+	if (Run->AltArms > 1)
+	{
+		if (IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(*Run->AltCvarName))
+		{
+			AltActual = Var->GetString();
+		}
+		else
+		{
+			AltActual = TEXT("<missing>");
+		}
+	}
+
 	// %02d index first so the ladder sorts in ladder order in a directory listing,
 	// then the hour so each frame states what time it is without opening a log.
-	const FString ShotName = FString::Printf(TEXT("VoxelSkyLadder_%02d_%02dh%02d"), Run->StepIndex, Hour, Minute);
+	//
+	// In paired mode the arm suffix is what makes a pair a pair: the two frames of
+	// one hour differ ONLY in that suffix, so `imgdiff.py A B` on two adjacent files
+	// is the gate, with no bookkeeping about which index went with which value. The
+	// suffix carries the READ-BACK value for the same reason the log line does.
+	FString ShotName = FString::Printf(TEXT("VoxelSkyLadder_%02d_%02dh%02d"), Run->StepIndex, Hour, Minute);
+	if (Run->AltArms > 1)
+	{
+		// Sanitised: a cvar value can legally be something like "-1" or "0.5", and a
+		// screenshot basename with a dot in it is an extension waiting to be
+		// misparsed by every tool downstream.
+		FString SafeValue = AltActual;
+		SafeValue.ReplaceInline(TEXT("."), TEXT("p"));
+		SafeValue.ReplaceInline(TEXT("-"), TEXT("m"));
+		SafeValue.ReplaceInline(TEXT(" "), TEXT("_"));
+		ShotName += FString::Printf(TEXT("_%s%s"), *Run->AltTag, *SafeValue);
+	}
 
 	UE_LOG(LogVoxelEarth, Log,
-	       TEXT("VoxelSkyLadderShot n=%d/%d name=%s requestedHours=%06.3f resolvedHours=%06.3f (%02dh%02d) ")
+	       TEXT("VoxelSkyLadderShot n=%d/%d hour=%d/%d arm=%d altCvar=%s altValue=%s name=%s ")
+	       TEXT("requestedHours=%06.3f resolvedHours=%06.3f (%02dh%02d) ")
 	       TEXT("dayOfYear=%d epoch=%.3f lat=%.4f lon=%.4f sunAltDeg=%+.3f sunAzDeg=%.3f sunUp=%d sunIntensity=%.4f ")
 	       TEXT("sunTempK=%.0f moonAltDeg=%+.3f moonIllum=%.3f moonIntensity=%.4f exposureMode=%d exposureBiasEV=%+.3f ")
 	       TEXT("lightUpdates=%lld"),
-	       Run->StepIndex, Run->Steps - 1, *ShotName, RequestedHours, S.LocalHours, Hour, Minute, S.DayOfYear,
+	       Run->StepIndex, TotalRungs(Run) - 1, HourIndexOf(Run, Run->StepIndex), Run->Steps - 1,
+	       ArmIndexOf(Run, Run->StepIndex),
+	       Run->AltArms > 1 ? *Run->AltCvarName : TEXT("<none>"), Run->AltArms > 1 ? *AltActual : TEXT("-"),
+	       *ShotName, RequestedHours, S.LocalHours, Hour, Minute, S.DayOfYear,
 	       S.EpochSeconds, S.LatitudeDeg, S.LongitudeDeg, S.SunAltitudeDeg, S.SunAzimuthDeg, S.bSunUp ? 1 : 0,
 	       S.SunIntensity, S.SunTemperatureK, S.MoonAltitudeDeg, S.MoonIlluminatedFraction, S.MoonIntensity,
 	       S.ExposureMode, S.ExposureBiasEV, (long long)S.LightUpdates);
@@ -617,6 +770,7 @@ void StageCapture(FRunRef Run)
 	Rung.ExposureBiasEV = S.ExposureBiasEV;
 	Rung.ExposureMode = S.ExposureMode;
 	Rung.ShotName = ShotName;
+	Rung.AltValue = AltActual;
 	Run->Rungs.Add(MoveTemp(Rung));
 
 	// FScreenshotRequest, NOT HighResShot. HighResShot re-renders through a tiled
@@ -636,7 +790,7 @@ void StageCapture(FRunRef Run)
 void StageAdvance(FRunRef Run)
 {
 	++Run->StepIndex;
-	if (Run->StepIndex < Run->Steps)
+	if (Run->StepIndex < TotalRungs(Run))
 	{
 		StageSetClock(Run);
 		return;
@@ -656,11 +810,20 @@ void StageSummary(FRunRef Run)
 	{
 		int32 H = 0, M = 0;
 		SplitHours(R.ResolvedHours, H, M);
+		// A blank line between pairs in paired mode, so the table reads as pairs and
+		// not as a flat list of 2N rows. The whole point of the artifact is that rows
+		// 2h and 2h+1 are the two things being compared.
+		if (Run->AltArms > 1 && R.Index > 0 && (R.Index % Run->AltArms) == 0)
+		{
+			Table += TEXT("\n");
+		}
 		Table += FString::Printf(
 			TEXT("\n  %02d  %02dh%02d  doy=%3d  sunAlt=%+7.2f  sunAz=%7.2f  sunI=%6.3f  moonAlt=%+7.2f  moonIllum=%.2f  ")
-			TEXT("expEV=%+6.2f (mode %d)  %s"),
+			TEXT("expEV=%+6.2f (mode %d)%s%s  %s"),
 			R.Index, H, M, R.DayOfYear, R.SunAltitudeDeg, R.SunAzimuthDeg, R.SunIntensity, R.MoonAltitudeDeg,
-			R.MoonIlluminatedFraction, R.ExposureBiasEV, R.ExposureMode, *R.ShotName);
+			R.MoonIlluminatedFraction, R.ExposureBiasEV, R.ExposureMode,
+			R.AltValue.IsEmpty() ? TEXT("") : TEXT("  arm="), R.AltValue.IsEmpty() ? TEXT("") : *R.AltValue,
+			*R.ShotName);
 	}
 
 	UE_LOG(LogVoxelEarth, Log,
@@ -669,6 +832,22 @@ void StageSummary(FRunRef Run)
 	       TEXT("rungs are comparable -- VoxelGpuVerify.cpp:2074-2084). Every row below is READ BACK from ")
 	       TEXT("GetSkyState() at the shutter, not requested.%s"),
 	       Run->Rungs.Num(), Run->StartHour, *Table);
+
+	if (Run->AltArms > 1)
+	{
+		// Say what to do with the artifact, where it will be read. A paired ladder is
+		// only useful if someone diffs the pairs, and the pairs are adjacent by
+		// construction -- consecutive indices, identical hour in the filename,
+		// differing only in the arm suffix.
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelSkyLadder PAIRED A/B on %s (arms %s vs %s): the rows above come in pairs sharing one ")
+		       TEXT("simulated instant and one camera pose, differing ONLY in that cvar. Diff each pair with ")
+		       TEXT("`python Tools/imgdiff.py <arm0>.png <arm1>.png` -- it reports the mean max-channel delta, which ")
+		       TEXT("bounds |delta mean luma| from above, so a reading under 2/255 satisfies a 2/255 luma gate ")
+		       TEXT("outright. READ THE TWILIGHT ROWS FIRST (|sunAlt| under about 18 deg): they are where the ")
+		       TEXT("atmosphere is doing the most work and where three defects were found last time."),
+		       *Run->AltCvarName, *Run->AltValues[0], *Run->AltValues[1]);
+	}
 
 	// The one thing a reviewer should check before believing any of it, stated
 	// where they will read it. VoxelSkySubsystem.cpp's exposure anchors are
@@ -751,6 +930,83 @@ bool VoxelSkyLadderFixture::StartFromCommandLine(UWorld* World)
 		Run->StartHour = FMath::Fmod(FMath::Fmod((double)StartHour, 24.0) + 24.0, 24.0);
 	}
 
+	// --- paired A/B mode -----------------------------------------------------
+	//
+	// Parsed and VALIDATED here rather than lazily at the first rung, because every
+	// failure below turns the artifact into a plausible-looking lie: 2N frames that
+	// look like a completed A/B and are not one. The precedent for refusing rather
+	// than proceeding is VoxelGpuVerify.cpp:2104-2110 declining to schedule an A/B
+	// against a misspelt cvar -- "This would have run an A/B against itself."
+	FString AltCvar;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelSkyLadderAltCvar="), AltCvar) && !AltCvar.IsEmpty())
+	{
+		AltCvar.TrimStartAndEndInline();
+
+		// 1. THE CVAR MUST EXIST. A typo would otherwise produce 2N identical frames
+		//    in N pairs that all diff to zero, which reads as "the feature is a
+		//    perfect no-op" -- the single most misleading result this mode can give,
+		//    because that is also exactly what a PASS looks like.
+		if (IConsoleManager::Get().FindConsoleVariable(*AltCvar) == nullptr)
+		{
+			UE_LOG(LogVoxelEarth, Error,
+			       TEXT("VoxelSkyLadder: -VoxelSkyLadderAltCvar=%s does not name a console variable in this build. ")
+			       TEXT("Every pair would then be two identical frames diffing to zero, which is INDISTINGUISHABLE ")
+			       TEXT("from the A/B passing. NOT ARMING; check the spelling."),
+			       *AltCvar);
+			return false;
+		}
+
+		FString ValueA = TEXT("1");
+		FString ValueB = TEXT("0");
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelSkyLadderAltA="), ValueA);
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelSkyLadderAltB="), ValueB);
+		ValueA.TrimStartAndEndInline();
+		ValueB.TrimStartAndEndInline();
+
+		// 2. THE TWO ARMS MUST DIFFER, for the same reason.
+		if (ValueA == ValueB)
+		{
+			UE_LOG(LogVoxelEarth, Error,
+			       TEXT("VoxelSkyLadder: -VoxelSkyLadderAltA and -VoxelSkyLadderAltB are both '%s'. That is an A/B ")
+			       TEXT("against itself: N pairs of identical frames, all diffing to zero, which looks exactly like ")
+			       TEXT("a pass. NOT ARMING."),
+			       *ValueA);
+			return false;
+		}
+
+		// 3. THE CAPTURE COUNT MUST STILL FIT. kMaxSteps bounds the number of PNGs
+		//    and sizes the watchdog; paired mode doubles the count, so the hour count
+		//    has to halve rather than the cap quietly doubling.
+		if (Run->Steps * 2 > kMaxSteps)
+		{
+			UE_LOG(LogVoxelEarth, Warning,
+			       TEXT("VoxelSkyLadder: paired mode doubles the capture count, and %d hours x 2 exceeds the %d-frame ")
+			       TEXT("cap. Clamping to %d hours (%d frames)."),
+			       Run->Steps, kMaxSteps, kMaxSteps / 2, (kMaxSteps / 2) * 2);
+			Run->Steps = kMaxSteps / 2;
+		}
+
+		Run->AltCvarName = AltCvar;
+		Run->AltValues[0] = ValueA;
+		Run->AltValues[1] = ValueB;
+		Run->AltArms = 2;
+
+		// The filename tag: the last dot-separated segment of the cvar name.
+		// "voxel.Sky.AtmosphereDome" -> "AtmosphereDome". Full names have dots in
+		// them and a dot in a screenshot basename is an extension waiting to be
+		// misparsed by everything downstream.
+		int32 LastDot = INDEX_NONE;
+		if (AltCvar.FindLastChar(TEXT('.'), LastDot) && LastDot + 1 < AltCvar.Len())
+		{
+			Run->AltTag = AltCvar.Mid(LastDot + 1);
+		}
+		else
+		{
+			Run->AltTag = AltCvar;
+		}
+		Run->AltTag.ReplaceInline(TEXT("."), TEXT("_"));
+	}
+
 	// --- Precondition 1: nothing else may be driving a capture ---------------
 	//
 	// -VoxelScreenshotAfter does not merely take an extra picture: it captures and
@@ -821,7 +1077,7 @@ bool VoxelSkyLadderFixture::StartFromCommandLine(UWorld* World)
 		       TEXT("VoxelSkyLadder: asked for voxel.Sky.Enabled 1 and read back %s. With the clock off the rig is ")
 		       TEXT("frozen at the static pose, so all %d rungs would be identical frames with different hours in their ")
 		       TEXT("names. NOT ARMING."),
-		       *ActualEnabled, Run->Steps);
+		       *ActualEnabled, TotalRungs(Run));
 		return false;
 	}
 
@@ -833,17 +1089,33 @@ bool VoxelSkyLadderFixture::StartFromCommandLine(UWorld* World)
 	// poll ceiling + N x (settle + hold) + the closing 5 s exit, doubled and given
 	// 30 s of slack -- the same "worst case the stages can actually reach, roughly
 	// doubled" sizing VoxelSweBreachFixture.cpp:131-137 uses.
+	// SIZED FROM THE CAPTURE COUNT, not the hour count -- paired mode doubles the
+	// number of settle+hold cycles and a watchdog sized from hours would kill a
+	// paired ladder just past halfway, leaving an artifact that looks complete
+	// unless someone counts the files.
 	const float NominalSeconds = Run->PreflightSeconds + kMaxTerrainPolls * kPollIntervalSeconds +
-	                             (float)Run->Steps * (Run->SettleSeconds + kPostCaptureHoldSeconds) + 10.f;
+	                             (float)TotalRungs(Run) * (Run->SettleSeconds + kPostCaptureHoldSeconds) + 10.f;
 	Run->WatchdogSeconds = NominalSeconds * 2.f + 30.f;
 
 	UE_LOG(LogVoxelEarth, Log,
-	       TEXT("VoxelSkyLadder: ARMED. %d rung(s) every %.2f simulated hours from %05.2f h, settle %.1fs, preflight ")
-	       TEXT("%.1fs. voxel.Sky.TimeScale=%s voxel.Sky.Enabled=%s (both read back, not echoed). Nominal run %.0fs; ")
-	       TEXT("the watchdog quits this process unconditionally %.0fs from now. Captures -> ")
-	       TEXT("Saved/Screenshots/WindowsEditor/VoxelSkyLadder_*.png"),
-	       Run->Steps, 24.0 / (double)Run->Steps, Run->StartHour, Run->SettleSeconds, Run->PreflightSeconds,
+	       TEXT("VoxelSkyLadder: ARMED. %d hour(s) every %.2f simulated hours from %05.2f h x %d arm(s) = %d ")
+	       TEXT("capture(s), settle %.1fs, preflight %.1fs. voxel.Sky.TimeScale=%s voxel.Sky.Enabled=%s (both read ")
+	       TEXT("back, not echoed). Nominal run %.0fs; the watchdog quits this process unconditionally %.0fs from ")
+	       TEXT("now. Captures -> Saved/Screenshots/WindowsEditor/VoxelSkyLadder_*.png"),
+	       Run->Steps, 24.0 / (double)Run->Steps, Run->StartHour, FMath::Max(1, Run->AltArms), TotalRungs(Run),
+	       Run->SettleSeconds, Run->PreflightSeconds,
 	       *ActualTimeScale, *ActualEnabled, NominalSeconds, Run->WatchdogSeconds);
+
+	if (Run->AltArms > 1)
+	{
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelSkyLadder: PAIRED A/B on %s, arm0=%s arm1=%s. Each simulated instant is shot TWICE from ")
+		       TEXT("one latched pose with only that cvar changing, and the cvar is set BEFORE the %.1fs settle so ")
+		       TEXT("the SkyLight's real-time capture reconverges into the new arm rather than the frame ")
+		       TEXT("photographing the previous one. The hour does NOT advance between the arms -- that is what ")
+		       TEXT("makes each pair diffable. Filenames get a _%s<value> suffix carrying the READ-BACK value."),
+		       *Run->AltCvarName, *Run->AltValues[0], *Run->AltValues[1], Run->SettleSeconds, *Run->AltTag);
+	}
 
 	// THE WATCHDOG GOES ON FIRST, before anything that could stall
 	// (VoxelSweBreachFixture.cpp:1638-1641). Note it is armed even though every
