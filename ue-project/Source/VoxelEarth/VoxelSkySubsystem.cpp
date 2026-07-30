@@ -268,11 +268,24 @@ namespace
 	// before anything renders. Same trap StarBrightness and StarRotation both hit
 	// -- once C++ drives a collection scalar, that scalar's asset default is dead
 	// as a tuning surface (see CVarSkyStarGain and CVarSkyStarRotationOffsetTurns).
+	// S2 MEASURED AND ADOPTED 1.0. The gate ran this cvar as its A arm against 0,
+	// paired at one frozen epoch and pose, winter 12-21 (docs/measurements has the
+	// table). Ground-crop mean luma:
+	//
+	//   18h00 moonless   0.050 -> 5.756      21h00 moonless   0.050 -> 4.415
+	//   00h00 moonlit    7.826 -> 12.717     12h00 daylight  101.888 -> 101.866
+	//
+	// All three conditions of the S2 gate hold at 1.0: moonless ground leaves black,
+	// moonless stays strictly BELOW moonlit, and daylight is unchanged to 0.02/255
+	// because the star branch only exists in the capture pass. So the default moves
+	// 0 -> 1.0 and starlight ships live. It stays a cvar because it multiplies
+	// against the exposure curve's deep-night lift and the two are tuned together.
 	TAutoConsoleVariable<float> CVarSkyStarAmbientGain(
-		TEXT("voxel.Sky.StarAmbientGain"), 0.0f,
+		TEXT("voxel.Sky.StarAmbientGain"), 1.0f,
 		TEXT("Gain on the star map inside the SkyLight's real-time capture, via ")
-		TEXT("MPC_VoxelSky.StarAmbientGain and M_SkyAtmosphereDome's ReflectionCapturePassSwitch. DEFAULT 0 ")
-		TEXT("= no starlight in the ambient term, which is what phase S1 ships and verifies. Raising it is ")
+		TEXT("MPC_VoxelSky.StarAmbientGain and M_SkyAtmosphereDome's ReflectionCapturePassSwitch. DEFAULT 1.0, ")
+		TEXT("measured at S2: it takes moonless ground from 0.05 to ~5 mean luma while leaving daylight ")
+		TEXT("unchanged to 0.02/255. Set 0 to remove starlight from the ambient term entirely. Raising it is ")
 		TEXT("phase S2. It multiplies StarBrightness (the sunrise fade, already carrying voxel.Sky.StarGain's ")
 		TEXT("measured 0.15) and the horizon fade, and then rides the exposure curve's up-to-15.6-stop night ")
 		TEXT("lift -- so the S2 gate is two-sided: winter night ground luma must rise above 0.5 and stay ")

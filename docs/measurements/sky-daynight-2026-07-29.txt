@@ -190,3 +190,68 @@ The EXR path that was flagged unproven WORKS: starmap_2020_4k.exr imports to a
   at the right altitude -- only the constellations are reversed), and whether any
   constant RA offset is needed. voxel.Sky.StarUDirection and
   voxel.Sky.StarRotationOffsetTurns exist for both, no rebuild required.
+
+
+6. THE SKY LIGHTING THE GROUND (S1 + S2), 2026-07-29 late
+---------------------------------------------------------
+The star dome could not light anything: the SkyLight's real-time capture renders
+only the atmosphere, clouds, height fog and meshes whose material sets bIsSky,
+and M_NightSky sets is_sky False deliberately. Fixed by adding a canonical IsSky
+dome (M_SkyAtmosphereDome) that the capture CAN see, with the star branch behind
+a ReflectionCapturePassSwitch so stars reach the capture and never the main view.
+
+S1 GATE -- is the IsSky dome a faithful stand-in for the atmosphere pass?
+Once any IsSky mesh exists, View.bSceneHasSkyMaterial goes true and the
+atmosphere's full-screen pass stops painting sky pixels, so the dome must match
+it or the sky breaks. 8 hours x 2 arms, one process, same frozen epoch and pose,
+only voxel.Sky.AtmosphereDome changing:
+
+  hour    dome ON    dome OFF   |delta|
+  00h00    27.200      27.139     0.061
+  03h00    26.537      26.539     0.002
+  06h00    35.835      35.864     0.029
+  09h00   120.595     120.625     0.030
+  12h00   135.346     135.364     0.018
+  15h00   126.584     126.575     0.009
+  18h00    54.788      54.820     0.032
+  21h00    10.382      10.383     0.001
+
+  Worst 0.061/255 against a 2.0 gate -- PASS with 33x margin. The three twilight
+  rungs are deliberate: twilight is where the last three defects in this system
+  lived.
+
+S2 GATE -- does the Milky Way actually light the ground?
+Winter 12-21, paired arms on voxel.Sky.StarAmbientGain, 1.0 vs 0.
+Ground crop is the bottom 45% of the frame.
+
+  hour     moon        ground gain1   ground gain0   frame gain1  frame gain0
+  00h00    76% up        12.717          7.826         20.118       17.389
+  03h00    75% up        20.013         15.568         28.032       25.675
+  06h00    64% up        17.861         12.937         27.702       25.116
+  09h00    down          54.322         54.472         76.965       77.038
+  12h00    down         101.866        101.888        116.834      116.847
+  15h00    down          61.367         61.384         81.470       81.479
+  18h00    BELOW HORIZON  5.756          0.050          4.887        1.675
+  21h00    BELOW HORIZON  4.415          0.050          8.061        5.583
+
+  All three conditions hold, so gain 1.0 is ADOPTED as the default:
+  * The two moonless rungs leave black: 0.050 -> 5.756 and 0.050 -> 4.415. Those
+    are the rungs section 5 recorded as correct-but-unplayable; they are now a
+    faint starlit landscape, with the snowfield reading brighter than rock as
+    higher albedo under the same ambient should.
+  * Ordering survives: moonless (4.4-5.8) stays strictly BELOW moonlit
+    (12.7-20.0). A starlit night must not out-read a moonlit one.
+  * Daylight is unchanged to 0.02/255 (101.888 -> 101.866). The star branch
+    exists only in the capture pass, so it cannot leak into the main view -- this
+    is the check that proves the ReflectionCapturePassSwitch is doing its job,
+    and a failure here would look like "stars at noon".
+
+WHY THIS UPDATES ITSELF. The light comes from a per-frame capture of the dome
+material, not from a baked cubemap. Change T_SkyStarmap, the gain, or the graph
+and the ambient light on the terrain follows within a few frames with no re-bake.
+The rejected alternative -- prefiltering the EXR into SH offline -- would have
+needed a re-bake on every art change. The moon is deliberately the exception: its
+LIGHT is a directional light scaled by illuminated fraction, and its DISC art is
+kept out of the capture so it cannot light the world twice. The engine enforces
+the same for the sun disc (MaterialTemplate.ush:2346-2348, "avoid double
+specular").
