@@ -144,3 +144,63 @@ all upstream or out-of-band:
   * accept it as a property of 10 cm voxels on smooth ground and address the
     LOOK through material and shading variation, which costs no geometry and so
     no drainage.
+
+=============================================================================
+THE MOUND ATTEMPT, AND THE GEOMETRIC REASON THE WHOLE CLASS CANNOT WORK
+=============================================================================
+Twelfth attempt, and the one that finally produces a proof rather than another
+measurement.
+
+THE IDEA. Every previous attempt perturbed a RAMP. The level sets of a monotone
+surface are nested parallel curves, so roughening or shortening them leaves them
+parallel -- and parallel, evenly spaced bands ARE the artifact. Only CLOSED
+contours break that. Closed contours need local extrema. Pits were ruled out by
+the drainage cap, but MOUNDS are not pits: water flows around a mound, and on a
+slope a mound only dams if it is taller than the hill drops across its half-width.
+So: rectified (positive-only) noise, amplitude self-limited to slope/4, which is
+half the damming bound.
+
+RESULT: rib continuity essentially unmoved (p50 1.3 m, p90 4.0 vs 4.1 m), drainage
+untouched at 0.0% stranded, and the in-engine raking capture shows the ribbing
+unchanged. Reverted.
+
+WHY, AND THIS IS THE PART WORTH KEEPING. The reason is not the amplitude or the
+lattice; it is geometry, and it kills every variant of this idea:
+
+  A closed contour on a slope requires the surface to be locally flat or reversed.
+  That requires the perturbation's gradient to REACH the carrier's own gradient.
+  A perturbation whose gradient reaches the slope's gradient is, by the definition
+  the drainage cap uses, exactly the thing that creates pits.
+
+So on steep ground "closed contours" and "no pits" are the same constraint pulled
+in opposite directions. The self-limiting amplitude that makes mounds safe
+(slope/4) is precisely what stops them from ever closing a contour. Safe and
+ineffective are the same setting.
+
+WHICH MEANS: for a HEIGHTFIELD on a smooth steep slope, parallel contour banding
+at the voxel scale is not a defect to be tuned out. It is forced. Any single-valued
+h(x, y) that is monotone over a few metres has nested parallel level sets, and
+quantising it produces parallel bands whose spacing is voxel / grade. No client-side
+term can escape this, which is consistent with every measurement in this file: the
+carrier alone sits at D = 1.006 and rib p50 13.7 m, and twelve different terms moved
+those numbers around without changing what the surface IS.
+
+THE TWO ESCAPES, both structural rather than parametric:
+
+  1. STOP BEING A SMOOTH RAMP. Real steep ground is not monotone over metres -- it
+     has benches, ledges, cliff bands and outcrops, which are metre-scale STRUCTURE
+     with near-vertical faces. Those break banding because the slope itself changes,
+     not because noise was added to it. This is bake-side: the bake currently stops
+     at 1.875 m/px and its thermal relaxation actively smooths toward the angle of
+     repose, which is the opposite of what produces benches.
+  2. STOP BEING A HEIGHTFIELD. Overhangs and undercuts are not expressible as
+     h(x, y) at all. density3 already exists for this and is heavily gated; a
+     genuine cliff with a recessed base reads as rock in a way no heightfield can.
+
+RAISING THE BEDDING TERM was tried as a proxy for (1) -- it is the one existing term
+that makes metre-scale ledges, at 120 mm (1.2 voxels). At 400 mm rib p99 went
+15.6 -> 5.4 m and at 900 mm to 2.8 m, drainage untouched at 0.0% throughout. The
+metric improved 5x and the picture did not, because shorter ribs are still PARALLEL
+ribs. Reverted, but recorded: it is the cheapest existing lever if (1) is pursued,
+and the reason it failed alone is that bedding modulates the surface rather than
+replacing the ramp with facets.
