@@ -46,6 +46,12 @@ param(
     [int]$Width = 1600,
     [int]$Height = 900,
     [string]$OutDir = 'D:\ue-cache\shape-survey',
+    # How long to WAIT for someone else's editor to finish before giving up on a
+    # site. The one-editor rule is right -- two runs sharing the box produce
+    # contended numbers that look like a slow configuration -- but a nine-site
+    # survey that DIES on the first contention is fragile for no reason. Another
+    # session on this machine legitimately holds the editor for minutes at a time.
+    [int]$WaitForEditorSec = 1800,
     [switch]$SkipStage
 )
 
@@ -94,12 +100,40 @@ foreach ($s in $sites) {
     $yM = $s.ty * $TilePitchM + $TilePitchM / 2
     Write-Host ("=== {0}  tile ({1},{2})  grade {3}%  spawn {4},{5}" -f $label, $s.tx, $s.ty, $s.grade, $xM, $yM) -ForegroundColor Cyan
 
+    # WAIT FOR THE BOX, do not fight for it and do not die. Another session on
+    # this machine holds the editor for minutes at a time; a survey that aborts on
+    # the first contention throws away the eight sites it could have captured.
+    $waited = 0
+    while (@(Get-Process UnrealEditor-Cmd, UnrealEditor -ErrorAction SilentlyContinue).Count -gt 0) {
+        if ($waited -ge $WaitForEditorSec) { break }
+        if ($waited -eq 0) {
+            Write-Host "  waiting for another editor to finish (up to ${WaitForEditorSec}s)..." -ForegroundColor DarkGray
+        }
+        Start-Sleep -Seconds 15
+        $waited += 15
+    }
+
     $name = "shape-$label"
-    & (Join-Path $PSScriptRoot 'voxel-capture.ps1') -Name $name -SpawnAt "$xM,$yM" `
-        -SettleSec $SettleSec -Width $Width -Height $Height -TimeoutSec 700 `
-        -ExtraArgs @("-VoxelTileDir=$($s.coarse)",
-                     "-VoxelFineTileDir=$StageRoot",
-                     "-VoxelFineTileProviderId=$pid_")
+    # PER-SITE FAILURE MUST NOT END THE SURVEY. voxel-capture.ps1 throws on a
+    # refused start, a timeout, or a missing screenshot -- all legitimate refusals,
+    # none of them a reason to abandon the remaining classes. Record and continue,
+    # so the result table shows exactly which sites are evidence and which are not.
+    $captureOk = $true
+    try {
+        & (Join-Path $PSScriptRoot 'voxel-capture.ps1') -Name $name -SpawnAt "$xM,$yM" `
+            -SettleSec $SettleSec -Width $Width -Height $Height -TimeoutSec 700 `
+            -ExtraArgs @("-VoxelTileDir=$($s.coarse)",
+                         "-VoxelFineTileDir=$StageRoot",
+                         "-VoxelFineTileProviderId=$pid_")
+    } catch {
+        $captureOk = $false
+        Write-Host "  $label : capture FAILED -- $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+    if (-not $captureOk) {
+        $results += [pscustomobject]@{ label=$label; grade=$s.grade; status='capture-failed'
+                                       shot=''; camOk=$false; undrawn=-1; cam='' }
+        continue
+    }
 
     # VERIFY THE CAMERA LANDED WHERE WE ASKED. See the header.
     $log = Join-Path $Root "Saved\capture-$name.log"
