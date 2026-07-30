@@ -273,6 +273,24 @@ public:
 	// black flash on a chunk whose brick has streamed in but not yet solved.
 	bool SampleIrradiance(const FVector& WorldUU, const FVector3f& Normal, float& OutIrradiance) const;
 
+	// --- local light occlusion (docs/sky-and-local-light-plan.md §2.2, L1) ----
+	//
+	// Fraction of a local light that survives the straight line from FromUU to
+	// ToUU: 1.0 = clear, 0.0 = a solid cell stands between them. This is what
+	// makes a torch stop at a wall instead of lighting the room next door.
+	//
+	// A NEW METHOD HERE RATHER THAN A PUBLIC SampleOpacity, deliberately.
+	// SampleOpacity is private and should stay private: it is a mip-level
+	// accessor whose Level argument only means anything beside the cone march's
+	// own aperture schedule, and handing it out invites a second, subtly
+	// different occlusion walk in the caller -- which for a MAX-aggregated
+	// pyramid is not a small difference (see the level-0 note in the .cpp).
+	// The splat asks exactly one question, so this answers exactly that one.
+	//
+	// Game thread; takes the read lock. Use the FReadScope form below when
+	// marching a whole light's worth of texels, which is the only real caller.
+	float LocalLightTransmittance(const FVector& FromUU, const FVector& ToUU) const;
+
 	// --- GPU volume encode (docs/gpu-gi-volume-design.md §2, Scheme A) ------
 	//
 	// Bytes one brick produces PER VOLUME: 8x8x8 cells x RGBA8, laid out
@@ -354,6 +372,14 @@ public:
 			return Field.EncodeBrickTexelsUnlocked(Key, OutPos, OutNeg);
 		}
 
+		// See FVoxelLightField::LocalLightTransmittance. The local-light splat
+		// marches one line per affected texel per light -- thousands of them for
+		// one torch -- so the lock is hoisted exactly as it is for shading.
+		float LocalTransmittance(const FVector& FromUU, const FVector& ToUU) const
+		{
+			return Field.LocalLightTransmittanceUnlocked(FromUU, ToUU);
+		}
+
 		// Raw brick access for diagnostics that need SolvedCells directly (the
 		// voxel.GI.VolumeCheck harness picks random SOLVED cells, which is not
 		// expressible through the sampler). Read-locked by construction; the
@@ -387,6 +413,7 @@ public:
 
 private:
 	bool SampleIrradianceUnlocked(const FVector& WorldUU, const FVector3f& Normal, float& OutIrradiance) const;
+	float LocalLightTransmittanceUnlocked(const FVector& FromUU, const FVector& ToUU) const;
 	bool EncodeBrickTexelsUnlocked(const FIntVector& Key, uint8* OutPos, uint8* OutNeg) const;
 	bool SampleIrradianceAtProbe(const FVector& P, const float (&DirWeight)[VoxelLF::NumDirs],
 	                             float InvDirWeightSum, float& OutIrradiance) const;

@@ -39,6 +39,23 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelGIVolumeParameters, VOXELEARTHSHADERS
 	// bar by 2.6x, worst on exactly the cave walls the feature exists for).
 	SHADER_PARAMETER_TEXTURE(Texture3D, VolumePos)
 	SHADER_PARAMETER_TEXTURE(Texture3D, VolumeNeg)
+	// LOCAL LIGHT INJECTION (docs/sky-and-local-light-plan.md §2.2, phase L1).
+	//
+	// Covers exactly the SAME BOX as VolumePos/VolumeNeg -- same OriginPoolUU,
+	// same normalised UVW -- which is the whole trick: the factory reuses
+	// Interpolants.GIUVW and adds ZERO new interpolants. Only the texel DIMENSION
+	// differs (voxel.GI.LocalVolumeDim), because "how lit is this cell by a
+	// torch" needs far less spatial resolution than the ambient cube does.
+	//
+	// L1 writes the A CHANNEL ONLY: an un-crush scalar in 0..1. It exists because
+	// there is no additive path from a light to a pixel today --
+	// M_VoxelTerrain computes BaseColor = albedo * VertexColor.G * DebugTint and a
+	// deferred point light's contribution is proportional to BaseColor, so in a
+	// cave (G ~= AO * lerp(0.06, 1, ~0) ~= 0.06) a torch lights a wall at 6% of
+	// its albedo. RGB is deliberately left ZEROED here; L2 fills it with additive
+	// radiance from TAIL lights only (hero lights are already deferred lights, so
+	// giving them RGB as well would count them twice).
+	SHADER_PARAMETER_TEXTURE(Texture3D, VolumeLocal)
 	SHADER_PARAMETER_SAMPLER(SamplerState, VolumeSampler)
 	// Volume origin in POOL-PRIMITIVE space, and 1/(N*CellSizeUU) per axis.
 	//
@@ -72,6 +89,11 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelGIVolumeParameters, VOXELEARTHSHADERS
 	// 0 = the factory skips the sample entirely and vertex colour G keeps the
 	// mesher's AO, byte-identical to today.
 	SHADER_PARAMETER(uint32, Enabled)
+	// 0 = the factory does not sample VolumeLocal at all, so the un-crush costs
+	// nothing and the emitted vertex colour is byte-identical to what it is
+	// without this feature. Shipped 0 (voxel.GI.LocalLights), exactly as
+	// voxel.GI.Volume and T4-1 were shipped gated.
+	SHADER_PARAMETER(uint32, LocalEnabled)
 	// docs/gpu-gi-volume-design.md §9: 3 = world checkerboard. Kept as a
 	// permanent rung of the diagnostic ladder rather than deleted after
 	// bring-up, because a pooled primitive fails silently and this is the
@@ -90,9 +112,22 @@ namespace VoxelGIVolume
 	// 256 (+/-5120 UU, 67 MB) and is a cvar, not a recompile.
 	VOXELEARTHSHADERS_API int32 GetDim();
 
+	// Per-axis texel count of VolumeLocal (voxel.GI.LocalVolumeDim). INDEPENDENT
+	// of GetDim() even though the two textures cover the same box: 96 against a
+	// VolumeDim of 192 is an 80 UU texel, 3.4 MB of VRAM plus an equal CPU
+	// mirror. Same clamping and same round-down-to-8 shape as GetDim(), for the
+	// same two reasons (N^3 grows fast enough that a typo'd 1024 is 4 GB, and a
+	// whole number of light-field bricks per axis means no upload path needs a
+	// partial-brick clip case).
+	VOXELEARTHSHADERS_API int32 GetLocalDim();
+
 	// Master switch. Off by default: with it off the factory does not sample,
 	// and the emitted vertex colour is byte-identical to what it is today.
 	VOXELEARTHSHADERS_API bool IsEnabled();
+
+	// voxel.GI.LocalLights. Second master switch, independent of IsEnabled():
+	// with it off VolumeLocal is not allocated, not splatted and not sampled.
+	VOXELEARTHSHADERS_API bool IsLocalEnabled();
 
 	VOXELEARTHSHADERS_API int32 GetDebugVis();
 
@@ -127,7 +162,16 @@ struct FVoxelGIVolumeSettings
 	float FadeEndUU = 6400.0f;
 	int32 DebugVis = 0;
 	bool bEnabled = false;
+	bool bLocalEnabled = false;
 
+	// EVERY FIELD ABOVE MUST APPEAR BELOW. UVoxelGISubsystem::PushVolumeParamsIfChanged
+	// (VoxelGI.cpp) diffs the new settings against LastVolumeSettings and returns
+	// early when they compare equal, so a field left out of this comparison
+	// LATCHES ITS FIRST VALUE FOREVER -- the uniform buffer is never rebuilt and
+	// the feature it gates silently never turns on. That is failure mode 5 in
+	// docs/sky-and-local-light-plan.md §5, and it produces a plausible image
+	// rather than an error: bLocalEnabled was the field this warning was written
+	// for.
 	bool operator==(const FVoxelGIVolumeSettings& Other) const
 	{
 		return OriginPoolUU == Other.OriginPoolUU
@@ -137,7 +181,8 @@ struct FVoxelGIVolumeSettings
 			&& FadeStartUU == Other.FadeStartUU
 			&& FadeEndUU == Other.FadeEndUU
 			&& DebugVis == Other.DebugVis
-			&& bEnabled == Other.bEnabled;
+			&& bEnabled == Other.bEnabled
+			&& bLocalEnabled == Other.bLocalEnabled;
 	}
 	bool operator!=(const FVoxelGIVolumeSettings& Other) const { return !(*this == Other); }
 };
@@ -170,7 +215,14 @@ public:
 	// is not a rounding error to hand to a player who never enables GI. Nothing
 	// samples the volume while voxel.GI.Volume is 0 (the factory binds
 	// GBlackVolumeTexture and Enabled=0), so there is nothing to allocate for.
-	void EnsureAllocated_RenderThread(FRHICommandListBase& RHICmdList);
+	//
+	// bWantLocal ALSO allocates VolumeLocal, and it is a PARAMETER rather than a
+	// re-read of voxel.GI.LocalLights inside the function ON PURPOSE: that cvar is
+	// ECVF_RenderThreadSafe, so a read on the render thread returns the shadow value
+	// the once-per-frame console sink has not necessarily copied yet. The game
+	// thread that enqueues this knows the answer; the render thread does not. See
+	// the long note at the allocation site.
+	void EnsureAllocated_RenderThread(FRHICommandListBase& RHICmdList, bool bWantLocal = false);
 
 	// docs/gpu-gi-volume-design.md §7 step 1: fills every texel with a
 	// per-brick checkerboard, A=255. This is the "does the same pool draw
@@ -179,6 +231,22 @@ public:
 	// mapping, the origin and pool-space precision in ONE screenshot. Uniform
 	// shading instead means the buffer reaches the VS but not the PS.
 	void FillCheckerboard_RenderThread(FRHICommandListBase& RHICmdList);
+
+	// THE SAME RUNG FOR VolumeLocal, and it is not optional decoration.
+	//
+	// VolumeLocal adds a second texture, a second dim, a second uniform member and
+	// a second upload path, and every one of those fails silently: a loose
+	// `Texture3D VolumeLocal;` in the .ush reads zeros forever (§5 item 6) and a
+	// uniform member missing from FVoxelGIVolumeSettings::operator== latches off
+	// forever (§5 item 5). Both produce "the torch does nothing", which is
+	// indistinguishable from a splat that never ran. This rung fills A with a
+	// per-brick checker and nothing else, so a crisp checker means bind, sample
+	// and display are all reachable and the remaining suspect is the splat.
+	//
+	// READ IT IN A CAVE. The un-crush is max(Ambient, L.a), so where Ambient is
+	// already ~1 (open terrain) the pattern is invisible BY DESIGN -- that is the
+	// composition contract, not a broken rung.
+	void FillLocalCheckerboard_RenderThread(FRHICommandListBase& RHICmdList);
 
 	// Uploads one axis-aligned box of RGBA8 texels. SrcRGBA is tightly packed:
 	// row pitch Size.X*4, depth pitch Size.X*Size.Y*4.
@@ -198,14 +266,31 @@ public:
 	                               const FIntVector& DestMin, const FIntVector& Size,
 	                               const uint8* SrcPos, const uint8* SrcNeg);
 
+	// Same contract as UpdateTexels_RenderThread, for VolumeLocal.
+	//
+	// A SIBLING RATHER THAN A THIRD POINTER ON THE FUNCTION ABOVE, deliberately.
+	// The two volumes have INDEPENDENT dims, so the range check, the row pitch and
+	// the depth pitch are all computed from different numbers; passing a nullptr
+	// SrcLocal through the existing signature would mean one function silently
+	// validating a box against the wrong extent, which is precisely the class of
+	// bug UpdateTexels_RenderThread's own out-of-range branch exists to refuse to
+	// hide. Every existing caller also passes a Pos/Neg PAIR, and the local splat
+	// never has one.
+	void UpdateLocalTexels_RenderThread(FRHICommandListBase& RHICmdList,
+	                                    const FIntVector& DestMin, const FIntVector& Size,
+	                                    const uint8* SrcLocal);
+
 	int32 GetDimTexels() const { return DimTexels; }
+	int32 GetLocalDimTexels() const { return LocalDimTexels; }
 
 private:
 	FTextureRHIRef VolumePos;
 	FTextureRHIRef VolumeNeg;
+	FTextureRHIRef VolumeLocal;
 	TUniformBufferRef<FVoxelGIVolumeParameters> UniformBuffer;
 	FVoxelGIVolumeSettings Settings;
 	int32 DimTexels = 0;
+	int32 LocalDimTexels = 0;
 };
 
 extern VOXELEARTHSHADERS_API TGlobalResource<FVoxelGIVolume> GVoxelGIVolume;

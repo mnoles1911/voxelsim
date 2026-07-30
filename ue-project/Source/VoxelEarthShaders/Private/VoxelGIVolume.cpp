@@ -42,13 +42,45 @@ namespace
 		TEXT("texture is allocated once."),
 		ECVF_ReadOnly);
 
+	// docs/sky-and-local-light-plan.md §2.2 / phase L1. SHIPPED OFF, exactly as
+	// voxel.GI.Volume and T4-1 were: the first build with this compiled in must
+	// not be able to regress anything, and with this at 0 the factory does not
+	// sample VolumeLocal, the texture is not allocated, no CPU mirror is
+	// allocated, and the emitted vertex colour is byte-identical.
+	TAutoConsoleVariable<int32> CVarGILocalLights(
+		TEXT("voxel.GI.LocalLights"), 0,
+		TEXT("Local light injection (L1: the UN-CRUSH half). 0 = off (default) and genuinely zero-cost. ")
+		TEXT("1 = registered local lights are splatted into VolumeLocal's A channel and the pooled vertex ")
+		TEXT("factory takes Ambient = max(Ambient, A) before folding it into vertex colour G. THIS IS NOT ")
+		TEXT("EXTRA LIGHT: it is what gives a deferred point light a real BaseColor to work against, since ")
+		TEXT("in a cave G ~= AO * lerp(0.06, 1, ~0) ~= 0.06 and a torch would otherwise light a wall at 6%% ")
+		TEXT("of its albedo. The term stays a RELATIVE modulation <= 1 with no time-of-day input, so the ")
+		TEXT("composition contract in docs/lighting-weather-plan.md 2.3 holds. Needs voxel.GI.Volume 1 and ")
+		TEXT("a CONSUMER (only the pooled vertex factory samples the volume)."),
+		ECVF_RenderThreadSafe);
+
+	// READ ONLY, like voxel.GI.VolumeDim and for the same reason: it sizes an
+	// allocation made once, and both the render thread (the texture) and the game
+	// thread (the CPU mirror) read it independently -- a value that could move
+	// between those two reads would mis-size one of them silently.
+	TAutoConsoleVariable<int32> CVarGILocalVolumeDim(
+		TEXT("voxel.GI.LocalVolumeDim"), 96,
+		TEXT("Per-axis texel count of VolumeLocal. It covers the SAME BOX as the irradiance volumes (same ")
+		TEXT("origin, same UVW, zero new interpolants), so its texel SIZE is voxel.GI.VolumeDim*40 / this: ")
+		TEXT("96 against the default VolumeDim 192 is an 80 UU texel, 3.4 MB of VRAM plus an equal CPU ")
+		TEXT("mirror. Costs N^3*4 bytes. Escalate to 192 only if the wall-leak gate fails -- that is L2's ")
+		TEXT("decision, not a knob to turn first. STARTUP ONLY."),
+		ECVF_ReadOnly);
+
 	TAutoConsoleVariable<int32> CVarGIVolumeDebugVis(
 		TEXT("voxel.GI.VolumeDebugVis"), 0,
 		TEXT("0 = off. 3 = world checkerboard: fills the volume with a per-brick pattern instead of ")
 		TEXT("irradiance. A crisp 3.2 m checker aligned to chunk boundaries proves the volume is ")
 		TEXT("created, bound, reachable FROM THE PIXEL SHADER, and correctly addressed -- in one ")
 		TEXT("screenshot. Uniform shading instead means the uniform buffer reaches the vertex shader ")
-		TEXT("but not the pixel shader."),
+		TEXT("but not the pixel shader. 4 = the same rung for VolumeLocal: shows its A channel RAW, ")
+		TEXT("ignoring AO, the ambient floor and the fade, so a checker (voxel.GI.VolumeLocalTest) or a ")
+		TEXT("torch's falloff sphere is legible without also being a statement about the un-crush maths."),
 		ECVF_RenderThreadSafe);
 }
 
@@ -67,9 +99,24 @@ namespace VoxelGIVolume
 		return Clamped & ~7;
 	}
 
+	int32 GetLocalDim()
+	{
+		// Same shape as GetDim() above, deliberately -- clamped because it sizes
+		// an allocation, and rounded DOWN to a multiple of 8 so the volume is a
+		// whole number of light-field bricks on every axis and no upload path
+		// needs a partial-brick clip case.
+		const int32 Clamped = FMath::Clamp(CVarGILocalVolumeDim.GetValueOnAnyThread(), 16, 256);
+		return Clamped & ~7;
+	}
+
 	bool IsEnabled()
 	{
 		return CVarGIVolume.GetValueOnAnyThread() != 0;
+	}
+
+	bool IsLocalEnabled()
+	{
+		return CVarGILocalLights.GetValueOnAnyThread() != 0;
 	}
 
 	int32 GetDebugVis()
@@ -92,63 +139,138 @@ void FVoxelGIVolume::InitRHI(FRHICommandListBase& RHICmdList)
 	UpdateParameters_RenderThread(Settings);
 }
 
-void FVoxelGIVolume::EnsureAllocated_RenderThread(FRHICommandListBase& RHICmdList)
+void FVoxelGIVolume::EnsureAllocated_RenderThread(FRHICommandListBase& RHICmdList, bool bWantLocal)
 {
-	if (VolumePos.IsValid())
+	// TWO INDEPENDENT LAZY ALLOCATIONS, not one early return.
+	//
+	// This used to be `if (VolumePos.IsValid()) return;`, which would have made
+	// VolumeLocal permanently unallocatable the moment the irradiance volumes
+	// existed -- i.e. always, since voxel.GI.Volume defaults on and
+	// voxel.GI.LocalLights defaults off. Each texture therefore guards itself, and
+	// the caller re-enters this function when voxel.GI.LocalLights turns on.
+	bool bCreatedAny = false;
+
+	if (!VolumePos.IsValid())
 	{
-		return;
-	}
-	if (DimTexels <= 0)
-	{
-		DimTexels = VoxelGIVolume::GetDim();
-	}
-
-	// NOT ETextureCreateFlags::Dynamic, and no lock/Map path anywhere. That is
-	// the texture-side reading of gpu-pool-rendering-notes.md invariant 5, and
-	// it is avoided by construction as long as every write goes through
-	// UpdateTexture3D -- which, unlike the buffer lock path, does honour its
-	// destination offsets (verified in D3D12Texture.cpp).
-	const FRHITextureCreateDesc DescPos =
-		FRHITextureCreateDesc::Create3D(TEXT("VoxelGI.IrradiancePos"),
-		                                DimTexels, DimTexels, DimTexels,
-		                                PF_R8G8B8A8)
-			.SetFlags(ETextureCreateFlags::ShaderResource);
-	const FRHITextureCreateDesc DescNeg =
-		FRHITextureCreateDesc::Create3D(TEXT("VoxelGI.IrradianceNeg"),
-		                                DimTexels, DimTexels, DimTexels,
-		                                PF_R8G8B8A8)
-			.SetFlags(ETextureCreateFlags::ShaderResource);
-
-	VolumePos = RHICmdList.CreateTexture(DescPos);
-	VolumeNeg = RHICmdList.CreateTexture(DescNeg);
-
-	UE_LOG(LogTemp, Log,
-	       TEXT("VoxelGI volume: allocated 2x dims=%dx%dx%d fmt=RGBA8 (Scheme A) MB=%.1f coverage=+/-%.0f UU"),
-	       DimTexels, DimTexels, DimTexels,
-	       2.0 * double(DimTexels) * DimTexels * DimTexels * 4.0 / (1024.0 * 1024.0),
-	       0.5 * DimTexels * VoxelGIVolume::kCellSizeUU);
-
-	// A freshly created texture's contents are undefined, and undefined bytes in
-	// the validity channel read as "there is data here" -- i.e. arbitrary
-	// irradiance on every surface until the first upload covers that texel.
-	// Zeroing means A=0 everywhere, which the shader turns into plain AO.
-	{
-		TArray<uint8> ZeroSlab;
-		ZeroSlab.SetNumZeroed(int64(DimTexels) * DimTexels * 4);
-		for (int32 Z = 0; Z < DimTexels; ++Z)
+		if (DimTexels <= 0)
 		{
-			const FUpdateTextureRegion3D Slab(0, 0, Z, 0, 0, 0, DimTexels, DimTexels, 1);
-			RHICmdList.UpdateTexture3D(VolumePos, 0, Slab,
-			                           uint32(DimTexels) * 4, uint32(DimTexels) * DimTexels * 4,
-			                           ZeroSlab.GetData());
-			RHICmdList.UpdateTexture3D(VolumeNeg, 0, Slab,
-			                           uint32(DimTexels) * 4, uint32(DimTexels) * DimTexels * 4,
-			                           ZeroSlab.GetData());
+			DimTexels = VoxelGIVolume::GetDim();
 		}
+
+		// NOT ETextureCreateFlags::Dynamic, and no lock/Map path anywhere. That is
+		// the texture-side reading of gpu-pool-rendering-notes.md invariant 5, and
+		// it is avoided by construction as long as every write goes through
+		// UpdateTexture3D -- which, unlike the buffer lock path, does honour its
+		// destination offsets (verified in D3D12Texture.cpp).
+		const FRHITextureCreateDesc DescPos =
+			FRHITextureCreateDesc::Create3D(TEXT("VoxelGI.IrradiancePos"),
+			                                DimTexels, DimTexels, DimTexels,
+			                                PF_R8G8B8A8)
+				.SetFlags(ETextureCreateFlags::ShaderResource);
+		const FRHITextureCreateDesc DescNeg =
+			FRHITextureCreateDesc::Create3D(TEXT("VoxelGI.IrradianceNeg"),
+			                                DimTexels, DimTexels, DimTexels,
+			                                PF_R8G8B8A8)
+				.SetFlags(ETextureCreateFlags::ShaderResource);
+
+		VolumePos = RHICmdList.CreateTexture(DescPos);
+		VolumeNeg = RHICmdList.CreateTexture(DescNeg);
+
+		UE_LOG(LogTemp, Log,
+		       TEXT("VoxelGI volume: allocated 2x dims=%dx%dx%d fmt=RGBA8 (Scheme A) MB=%.1f coverage=+/-%.0f UU"),
+		       DimTexels, DimTexels, DimTexels,
+		       2.0 * double(DimTexels) * DimTexels * DimTexels * 4.0 / (1024.0 * 1024.0),
+		       0.5 * DimTexels * VoxelGIVolume::kCellSizeUU);
+
+		// A freshly created texture's contents are undefined, and undefined bytes in
+		// the validity channel read as "there is data here" -- i.e. arbitrary
+		// irradiance on every surface until the first upload covers that texel.
+		// Zeroing means A=0 everywhere, which the shader turns into plain AO.
+		{
+			TArray<uint8> ZeroSlab;
+			ZeroSlab.SetNumZeroed(int64(DimTexels) * DimTexels * 4);
+			for (int32 Z = 0; Z < DimTexels; ++Z)
+			{
+				const FUpdateTextureRegion3D Slab(0, 0, Z, 0, 0, 0, DimTexels, DimTexels, 1);
+				RHICmdList.UpdateTexture3D(VolumePos, 0, Slab,
+				                           uint32(DimTexels) * 4, uint32(DimTexels) * DimTexels * 4,
+				                           ZeroSlab.GetData());
+				RHICmdList.UpdateTexture3D(VolumeNeg, 0, Slab,
+				                           uint32(DimTexels) * 4, uint32(DimTexels) * DimTexels * 4,
+				                           ZeroSlab.GetData());
+			}
+		}
+		bCreatedAny = true;
 	}
 
-	// Re-publish so Parameters.Volume stops pointing at GBlackVolumeTexture.
-	UpdateParameters_RenderThread(Settings);
+	// VolumeLocal, gated on the CALLER'S bWantLocal as well as on being unallocated.
+	// Lazy because this is a TGlobalResource: allocating it unconditionally would
+	// charge 3.4 MB to every session including the ones that never turn local
+	// lights on, and nothing samples it while voxel.GI.LocalLights is 0 (the
+	// factory binds GBlackVolumeTexture and LocalEnabled=0).
+	//
+	// PASSED IN, NEVER `VoxelGIVolume::IsLocalEnabled()` READ HERE, and that is a
+	// bug fix rather than a preference. voxel.GI.LocalLights is
+	// ECVF_RenderThreadSafe, so GetValueOnAnyThread() returns the RENDER-THREAD
+	// SHADOW value on this thread -- and that shadow is only copied from the game
+	// value by the once-per-frame console variable sink. `voxel.GI.LocalLights 1`
+	// therefore reads 1 on the game thread that enqueues this command and can still
+	// read 0 on the render thread that executes it. The caller latches
+	// bLocalVolumeAllocated=true regardless (VoxelGI.h), so losing that race meant
+	// the texture was never created, never retried, LocalEnabled bound 0 forever and
+	// LastVolumeSettings.bLocalEnabled latched 1 -- docs/sky-and-local-light-plan.md
+	// §5 item 5 exactly, reintroduced one level down from the operator== it warns
+	// about. The irradiance volumes above never had this exposure because they are
+	// gated on nothing but !IsValid(). Intent now travels with the command.
+	if (!VolumeLocal.IsValid() && bWantLocal)
+	{
+		if (LocalDimTexels <= 0)
+		{
+			LocalDimTexels = VoxelGIVolume::GetLocalDim();
+		}
+		const FRHITextureCreateDesc DescLocal =
+			FRHITextureCreateDesc::Create3D(TEXT("VoxelGI.Local"),
+			                                LocalDimTexels, LocalDimTexels, LocalDimTexels,
+			                                PF_R8G8B8A8)
+				.SetFlags(ETextureCreateFlags::ShaderResource);
+		VolumeLocal = RHICmdList.CreateTexture(DescLocal);
+
+		const float LocalTexelUU = float(DimTexels > 0 ? DimTexels : VoxelGIVolume::GetDim())
+		                         * VoxelGIVolume::kCellSizeUU / float(FMath::Max(1, LocalDimTexels));
+		UE_LOG(LogTemp, Log,
+		       TEXT("VoxelGI volume: allocated VolumeLocal dims=%dx%dx%d fmt=RGBA8 MB=%.1f texel=%.0f UU ")
+		       TEXT("(voxel.GI.LocalVolumeDim=%d, same box as the irradiance volumes)"),
+		       LocalDimTexels, LocalDimTexels, LocalDimTexels,
+		       double(LocalDimTexels) * LocalDimTexels * LocalDimTexels * 4.0 / (1024.0 * 1024.0),
+		       LocalTexelUU, LocalDimTexels);
+
+		// ZEROED EXPLICITLY, for the same reason the volumes above are: a fresh
+		// texture's contents are undefined, and an undefined A here reads as "this
+		// cell is fully lit by a local source", i.e. every surface in the volume
+		// un-crushed to full albedo until the first splat covers that texel. Note
+		// the slab is sized from LocalDimTexels, NOT from the DimTexels the loop
+		// above uses -- the two volumes have independent dims and reusing the
+		// sibling's Dim*Dim*4 slab would either under-fill or overrun.
+		{
+			TArray<uint8> ZeroSlab;
+			ZeroSlab.SetNumZeroed(int64(LocalDimTexels) * LocalDimTexels * 4);
+			for (int32 Z = 0; Z < LocalDimTexels; ++Z)
+			{
+				const FUpdateTextureRegion3D Slab(0, 0, Z, 0, 0, 0, LocalDimTexels, LocalDimTexels, 1);
+				RHICmdList.UpdateTexture3D(VolumeLocal, 0, Slab,
+				                           uint32(LocalDimTexels) * 4,
+				                           uint32(LocalDimTexels) * LocalDimTexels * 4,
+				                           ZeroSlab.GetData());
+			}
+		}
+		bCreatedAny = true;
+	}
+
+	if (bCreatedAny)
+	{
+		// Re-publish so Parameters.Volume* stop pointing at GBlackVolumeTexture.
+		UpdateParameters_RenderThread(Settings);
+	}
 }
 
 void FVoxelGIVolume::ReleaseRHI()
@@ -156,7 +278,9 @@ void FVoxelGIVolume::ReleaseRHI()
 	UniformBuffer.SafeRelease();
 	VolumePos.SafeRelease();
 	VolumeNeg.SafeRelease();
+	VolumeLocal.SafeRelease();
 	DimTexels = 0;
+	LocalDimTexels = 0;
 }
 
 void FVoxelGIVolume::UpdateParameters_RenderThread(const FVoxelGIVolumeSettings& InSettings)
@@ -164,6 +288,10 @@ void FVoxelGIVolume::UpdateParameters_RenderThread(const FVoxelGIVolumeSettings&
 	Settings = InSettings;
 
 	const bool bEnabled = Settings.bEnabled && VolumePos.IsValid() && VolumeNeg.IsValid();
+	// AND'ed with bEnabled, not independent of it: the local sample lives inside
+	// the factory's `if (Enabled != 0u && bInsideVolume)` block, so LocalEnabled=1
+	// with Enabled=0 would be a claim the shader can never act on.
+	const bool bLocalEnabled = bEnabled && Settings.bLocalEnabled && VolumeLocal.IsValid();
 	const float ExtentUU = FMath::Max(1.0f, float(DimTexels) * VoxelGIVolume::kCellSizeUU);
 
 	FVoxelGIVolumeParameters Parameters;
@@ -172,6 +300,10 @@ void FVoxelGIVolume::UpdateParameters_RenderThread(const FVoxelGIVolumeSettings&
 	// documents the same rule for its SRVs).
 	Parameters.VolumePos = bEnabled ? VolumePos.GetReference() : GBlackVolumeTexture->TextureRHI.GetReference();
 	Parameters.VolumeNeg = bEnabled ? VolumeNeg.GetReference() : GBlackVolumeTexture->TextureRHI.GetReference();
+	// NO MEMBER MAY BE NULL, including this one when local lights are off. Black
+	// is also the correct VALUE to fall back to: A=0 means "no local source here",
+	// which the factory's max(Ambient, L.a) turns into no change at all.
+	Parameters.VolumeLocal = bLocalEnabled ? VolumeLocal.GetReference() : GBlackVolumeTexture->TextureRHI.GetReference();
 	Parameters.VolumeSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 	Parameters.OriginPoolUU = Settings.OriginPoolUU;
 	Parameters.InvSizeUU = FVector3f(1.0f / ExtentUU);
@@ -188,6 +320,7 @@ void FVoxelGIVolume::UpdateParameters_RenderThread(const FVoxelGIVolumeSettings&
 	Parameters.FadeEndUU = Settings.FadeEndUU;
 	Parameters.CellSizeUU = VoxelGIVolume::kCellSizeUU;
 	Parameters.Enabled = bEnabled ? 1u : 0u;
+	Parameters.LocalEnabled = bLocalEnabled ? 1u : 0u;
 	Parameters.DebugVis = uint32(FMath::Max(0, Settings.DebugVis));
 
 	// MultiFrame, not SingleFrame: this is rebuilt when the volume re-centres or
@@ -249,6 +382,62 @@ void FVoxelGIVolume::FillCheckerboard_RenderThread(FRHICommandListBase& RHICmdLi
 	       DimTexels, DimTexels, DimTexels, DimTexels / kCellsPerBrick);
 }
 
+void FVoxelGIVolume::FillLocalCheckerboard_RenderThread(FRHICommandListBase& RHICmdList)
+{
+	if (!VolumeLocal.IsValid() || LocalDimTexels <= 0)
+	{
+		UE_LOG(LogTemp, Warning,
+		       TEXT("VoxelGI volume: local checkerboard skipped -- VolumeLocal is not allocated ")
+		       TEXT("(needs voxel.GI.Volume 1 AND voxel.GI.LocalLights 1, and one tick of the GI subsystem ")
+		       TEXT("to allocate it)."));
+		return;
+	}
+
+	// The brick period is expressed in LOCAL texels, computed from the ratio of
+	// the two dims rather than hardcoded to 8: the two volumes cover the same box
+	// with different resolutions, so one light-field brick is
+	// LocalDim/(Dim/8) local texels -- 4 of them at the default 96 against 192.
+	// Hardcoding 8 here would draw a checker of the wrong period and then invite
+	// somebody to "fix" the origin snap that is not broken.
+	const int32 MainDim = DimTexels > 0 ? DimTexels : VoxelGIVolume::GetDim();
+	const int32 TexelsPerBrick = FMath::Max(1, (LocalDimTexels * 8) / FMath::Max(1, MainDim));
+
+	// A ONLY, RGB left at zero. That is L1's channel contract stated in the
+	// instrument as well as in the shader: if this rung ever paints RGB, a later
+	// reader cannot tell an L1 build from a half-landed L2 one.
+	TArray<uint8> Slab;
+	Slab.SetNumUninitialized(int64(LocalDimTexels) * LocalDimTexels * 4);
+
+	for (int32 Z = 0; Z < LocalDimTexels; ++Z)
+	{
+		const int32 BrickZ = Z / TexelsPerBrick;
+		for (int32 Y = 0; Y < LocalDimTexels; ++Y)
+		{
+			const int32 BrickY = Y / TexelsPerBrick;
+			for (int32 X = 0; X < LocalDimTexels; ++X)
+			{
+				const int32 BrickX = X / TexelsPerBrick;
+				const bool bLit = ((BrickX + BrickY + BrickZ) & 1) != 0;
+				uint8* Texel = Slab.GetData() + (int64(Y) * LocalDimTexels + X) * 4;
+				Texel[0] = 0; Texel[1] = 0; Texel[2] = 0;  // RGB is L2's, not L1's
+				Texel[3] = bLit ? 255 : 0;                 // the un-crush scalar
+			}
+		}
+
+		const FUpdateTextureRegion3D Region(0, 0, Z, 0, 0, 0, LocalDimTexels, LocalDimTexels, 1);
+		RHICmdList.UpdateTexture3D(VolumeLocal, /*MipIndex*/ 0, Region,
+		                           /*SourceRowPitch*/ uint32(LocalDimTexels) * 4,
+		                           /*SourceDepthPitch*/ uint32(LocalDimTexels) * LocalDimTexels * 4,
+		                           Slab.GetData());
+	}
+
+	UE_LOG(LogTemp, Log,
+	       TEXT("VoxelGI volume: LOCAL checkerboard uploaded (%d slabs of %dx%d, period %d texels = one ")
+	       TEXT("light-field brick). Read it IN A CAVE with voxel.GI.VolumeDebugVis 4 -- where Ambient is ")
+	       TEXT("already 1 the un-crush is a no-op by design."),
+	       LocalDimTexels, LocalDimTexels, LocalDimTexels, TexelsPerBrick);
+}
+
 void FVoxelGIVolume::UpdateTexels_RenderThread(FRHICommandListBase& RHICmdList,
                                                const FIntVector& DestMin, const FIntVector& Size,
                                                const uint8* SrcPos, const uint8* SrcNeg)
@@ -285,6 +474,41 @@ void FVoxelGIVolume::UpdateTexels_RenderThread(FRHICommandListBase& RHICmdList,
 	                           /*SourceRowPitch*/ uint32(Size.X) * 4,
 	                           /*SourceDepthPitch*/ uint32(Size.X) * uint32(Size.Y) * 4,
 	                           SrcNeg);
+}
+
+void FVoxelGIVolume::UpdateLocalTexels_RenderThread(FRHICommandListBase& RHICmdList,
+                                                    const FIntVector& DestMin, const FIntVector& Size,
+                                                    const uint8* SrcLocal)
+{
+	if (!VolumeLocal.IsValid() || LocalDimTexels <= 0 || !SrcLocal)
+	{
+		return;
+	}
+	if (Size.X <= 0 || Size.Y <= 0 || Size.Z <= 0)
+	{
+		return;
+	}
+	// Refused with a log rather than clipped, for the same reason the sibling
+	// above refuses: silently clipping hides an addressing bug behind a plausible
+	// image, and the extent this is checked against is LocalDimTexels -- the whole
+	// point of this being a separate function.
+	if (DestMin.X < 0 || DestMin.Y < 0 || DestMin.Z < 0 ||
+	    DestMin.X + Size.X > LocalDimTexels || DestMin.Y + Size.Y > LocalDimTexels ||
+	    DestMin.Z + Size.Z > LocalDimTexels)
+	{
+		UE_LOG(LogTemp, Warning,
+		       TEXT("VoxelGI volume: rejected out-of-range LOCAL upload min=(%d,%d,%d) size=(%d,%d,%d) localDim=%d"),
+		       DestMin.X, DestMin.Y, DestMin.Z, Size.X, Size.Y, Size.Z, LocalDimTexels);
+		return;
+	}
+
+	const FUpdateTextureRegion3D Region(uint32(DestMin.X), uint32(DestMin.Y), uint32(DestMin.Z),
+	                                    0, 0, 0,
+	                                    uint32(Size.X), uint32(Size.Y), uint32(Size.Z));
+	RHICmdList.UpdateTexture3D(VolumeLocal, /*MipIndex*/ 0, Region,
+	                           /*SourceRowPitch*/ uint32(Size.X) * 4,
+	                           /*SourceDepthPitch*/ uint32(Size.X) * uint32(Size.Y) * 4,
+	                           SrcLocal);
 }
 
 namespace
@@ -337,4 +561,44 @@ namespace
 		TEXT("3.2 m checker aligned to chunk boundaries proves the volume is created, bound, reachable from ")
 		TEXT("the PIXEL shader, and correctly addressed. Needs voxel.GI.Volume 1."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&GIVolumeTestCommand));
+
+	// THE SAME RUNG FOR VolumeLocal. Deliberately does NOT touch the origin or the
+	// fade the way voxel.GI.VolumeTest does: by the time local lights are being
+	// brought up the subsystem owns the origin and re-centres it per frame, and
+	// stamping a bring-up origin over a live one would move the irradiance volumes
+	// too. So this only fills and logs; the binding is whatever the subsystem last
+	// published, which is the thing under test.
+	void GIVolumeLocalTestCommand(const TArray<FString>& Args)
+	{
+		UE_LOG(LogTemp, Log,
+		       TEXT("VoxelGI volume: LOCAL TEST requested (volume=%d localLights=%d localDim=%d debugVis=%d)"),
+		       VoxelGIVolume::IsEnabled() ? 1 : 0, VoxelGIVolume::IsLocalEnabled() ? 1 : 0,
+		       VoxelGIVolume::GetLocalDim(), VoxelGIVolume::GetDebugVis());
+
+		// The cvar is read HERE, on the game thread the console command runs on, and
+		// carried into the command. Reading it inside the render command instead would
+		// return the render-thread shadow value, which the once-per-frame console sink
+		// may not have updated yet -- so `voxel.GI.LocalLights 1` immediately followed
+		// by `voxel.GI.VolumeLocalTest` would allocate nothing and print the
+		// not-allocated warning, which reads as "the feature is broken".
+		const bool bWantLocal = VoxelGIVolume::IsLocalEnabled();
+		ENQUEUE_RENDER_COMMAND(VoxelGIVolumeLocalTest)(
+			[bWantLocal](FRHICommandListImmediate& RHICmdList)
+		{
+			GVoxelGIVolume.EnsureAllocated_RenderThread(RHICmdList, bWantLocal);
+			GVoxelGIVolume.FillLocalCheckerboard_RenderThread(RHICmdList);
+		});
+	}
+
+	FAutoConsoleCommand GVoxelGIVolumeLocalTestCmd(
+		TEXT("voxel.GI.VolumeLocalTest"),
+		TEXT("Fill VolumeLocal's A channel with a per-brick checkerboard. The reachability rung for local ")
+		TEXT("light injection: it is the only instrument that separates 'the bind/sample/display chain is ")
+		TEXT("broken' from 'the splat never ran', and it catches both of the silent failures L1 can produce ")
+		TEXT("-- a loose Texture3D declaration in the .ush (reads zeros forever) and a uniform member left ")
+		TEXT("out of FVoxelGIVolumeSettings::operator== (latches off forever). Needs voxel.GI.Volume 1 and ")
+		TEXT("voxel.GI.LocalLights 1. READ IT IN A CAVE, with voxel.GI.VolumeDebugVis 4 for the raw channel: ")
+		TEXT("in open terrain Ambient is already 1 and max(Ambient, A) is a no-op by design. The NEXT splat ")
+		TEXT("overwrites the pattern, so a torch placed afterwards is not fighting it."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&GIVolumeLocalTestCommand));
 }
