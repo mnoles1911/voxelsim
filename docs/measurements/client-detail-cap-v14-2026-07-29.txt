@@ -1,0 +1,189 @@
+THE DETAIL GRADIENT CAP — worldgen v14, measured 2026-07-29
+===========================================================
+
+The fix for docs/measurements/client-detail-drainage-2026-07-29.txt and the
+ten-class ladder in drainage-ladder-v13-2026-07-29.txt: at v13 the post-gate
+detail ladder summed to ~2.3 of nominal gradient on ground whose own gradient
+is 0.4, so the client's texture reversed the carrier's downhill direction and
+turned the bake's routed drainage into closed decimetre basins.
+
+WHAT SHIPPED (amplifier.cpp "THE DETAIL GRADIENT CAP", mirrored bit-exactly in
+worldgen.ush, kWorldGenVersion 13 -> 14):
+
+  One scale-down factor over the whole summed post-gate detail so that its
+  nominal gradient (per-band amplitude/lattice, through the same gates as the
+  detail itself) obeys
+
+      detailGradient <= max(gradFloor, k * carrierGradient)
+
+  ENGAGED per column: everywhere on a fine-tier world; on a coarse world on a
+  linear ramp over per-cell landform relief (off <= 3600 mm of relief30, full
+  >= 7500 mm — the ladder's own 12%/25% grade thresholds in relief currency).
+  Constants: k = 0.5 (q10 512), gradFloor = 50 mm/m on both tiers.
+
+Relative octave weighting untouched. Scale-down only, one truncating divide
+toward zero, so every v13 surface bound is still sound unchanged; the derived
+tripwires (kLandformMaxMm trio, AbsMax trio, kDetailMaxAtMaxSlopeMm 15310 /
+5513) keep their v13 values — checked by static_assert, not assumed. The
+bound's WORST case is not tightened (the cap is taken at its 1.0 ceiling in
+surfaceBoundsMm, the same trade couplings (5)/(6) already take); the typical
+surface tightens, the bound does not claim the credit.
+
+-------------------------------------------------------------------------------
+THE COARSE LADDER, v13 -> v14 (stride 10 = 1 m, repaired tiles, 384 m domains;
+carrier column unchanged by construction)
+
+  class        grade% | cSinks cStrnd |  v13 aStrnd -> v14 aStrnd |  v13 aPath -> v14 aPath (cPath)
+  plains          1.7 |  8,623  91.7% |  98.1% -> 98.1% (bit-exact) |   3.1 ->   3.1  (22.9)
+  very-gentle     3.7 |     28  90.2% |  96.5% -> 96.5%             |   7.6 ->   7.6  (52.0)
+  gentle          6.0 |      3  17.3% |  93.7% -> 91.8%             |   8.0 ->   8.6  (130.9)
+  low-relief     11.8 |     12  57.4% |  93.2% -> 93.1%             |  11.4 ->  11.5  (53.6)
+  moderate       20.1 |      3  16.7% |  94.1% -> 83.4%             |  28.2 ->  91.6  (147.9)
+  third-class    24.6 |      0   0.0% |  90.8% -> 63.4%             |  18.6 -> 124.3  (215.1)
+  hilly          33.3 |      0   0.0% |  85.0% ->  0.4%             |  19.7 -> 102.7  (101.4)
+  alpine         40.6 |      0   0.0% |  87.9% ->  0.7%             |  28.9 -> 209.6  (223.6)
+  high-alpine    46.9 |      0   0.0% |  84.0% ->  0.8%             |  27.8 -> 155.1  (149.9)
+  steepest       54.2 |      1   3.3% |  96.2% -> 17.5%             |  24.7 -> 187.3  (224.4)
+
+Steep rows (>= 33% grade) return to their carrier's connectivity; sub-12% rows
+are bit-for-bit v13 (the exemption is exact, not approximate). The alpine
+headline against the original brief: interior sinks 1625 -> 18, stranded
+87.9% -> 0.7%, mean flow path 28.9 m -> 209.6 m against the carrier's 223.6 m.
+
+TRANSITION BAND, stated as the residual it is: moderate (20.1%) 83.4% and
+third-class (24.6%) 63.4% stranded against drained carriers. Both sit inside
+the ramp (site-mean relief ~6,000 mm against the 3600..7500 ramp), so they get
+partial engagement by construction. Lowering the ramp to 2400..6000 was
+measured: moderate 58.5%, third 61.6%, steepest 33.1%, at the cost of engaging
+sub-12% ground (gentle 91.8 -> 87.5, i.e. mild flattening of a row the ladder
+says to leave alone). The shipped ramp honours the ladder's own thresholds;
+the alternative is two constants away and its full row-by-row cost is in this
+doc's source sweeps (capsweep* logs, session 2026-07-29).
+
+STRIDE-1 (10 cm) CONTROLS:
+  alpine:   v13 87.9% -> v14 1.2% stranded (5 sinks; carrier 0 / 22.6 m).
+  plains:   v14 bit-identical to v13's control (4,224 sinks / 97.50% / 0.35 m
+            against carrier 96,543 / 99.0% / 0.04 m) — on true flats the
+            detail band still IMPROVES drainage, and the cap never touches it.
+  steepest: the tile-centre control window (38.4 m) reads 97.5% at every k and
+            floor tried — because that window sits on exempt low-relief ground
+            (a bench), where v14 == v13 by design. A window offset +200 m onto
+            the engaged hillside reads 3.3% stranded against carrier 0%
+            (detail-only field: 93.5%) — the site is fixed; the centre window
+            samples the exemption. Textured flats pond at 10 cm; that is the
+            accepted price of keeping flat-ground texture, and it is the same
+            price v13 pays on plains.
+
+-------------------------------------------------------------------------------
+THE FINE TIER (BAKE_VERSION 4 exemplars, --fine-dir), v13 -> v14
+
+  class   carrier (sinks/strnd/path) |  v13 amplified        ->  v14 amplified
+  plains  14,095 / 89.0% / 19.1 m    |  9,036 / 97.3% / 3.7 m -> 2,651 / 90.3% / 16.8 m
+  third       11 / 59.5% / 123.8 m   |  1,620 / 94.2% / 15.9 m ->   14 / 61.6% / 124.0 m
+  alpine       0 /  0.0% / 216.6 m   |  1,761 / 93.1% / 15.5 m ->    0 /  0.0% / 218.8 m
+
+The fine tier engages everywhere (no relief exemption): the bake carves
+sub-metre swales even on plains and the uncapped ladder was filling them.
+Alpine and third return to their carrier exactly; plains to within 1.3 points
+and 2.3 m of it.
+
+THE FINE-PLAINS TEXTURE COST, quantified with both references (plateau = % of
+area in >= 4 m constant-height plateaus / mean terrace run, at the plains
+fine exemplar):
+
+  carrier alone (bake, no client detail):   100.0% / 3.61 m   <- full corduroy
+  v13 (uncapped ladder):                     84.5% / 0.60 m   <- but 97.3% stranded
+  v14 fine floor 200:                        94.7% / 1.10 m      (95.1% stranded)
+  v14 fine floor 100:                        97.8% / 1.49 m      (91.8%)
+  v14 fine floor  50 (SHIPPED):              98.9% / 1.95 m      (90.3%)
+
+The bake supplies NO decimetre texture (the 100% row), so on the fine tier the
+floor is a straight trade between the swales' drainage and the flats' anti-
+terrace band, and no column-local discriminator separates a swale bottom from
+an inter-swale flat (both are locally gentle; exempting either exempts both).
+50 is the measured knee: below it the drainage residual (1.3 points from
+carrier) cannot shrink by more than it is, while the last of the texture goes.
+IF FINE PLAINS READS AS TERRACED IN-ENGINE, kFineDetailGradFloorMmPerM is the
+knob, and each +50 buys back roughly 0.4 m of terrace run for ~3 m of mean
+flow path. This is the largest open cost in v14 and it is stated, not hidden.
+
+-------------------------------------------------------------------------------
+BARS, each with its number
+
+1. PLAINS SLOPE BY SCALE: untouched BIT-EXACT — the plains exemplar is below
+   the engagement ramp, and its full report (structure function at every lag,
+   plateau census 3,854 / 79.3%, terrace mean 5.33 vox) is byte-identical to
+   v13's. Alpine: fine-rung S/d falls 0.544 -> 0.480 (~28.2 deg -> ~25.6 deg
+   at the 1.6 m rung), i.e. ~9% BELOW the real exemplar the bake tracks —
+   inside the bake's 12% envelope but at its edge, and stated plainly: v13's
+   28.168 deg included the pit field's spurious gradient, and removing the
+   gradient removes the slope it manufactured. The 30 m rung is carrier-owned
+   and unchanged (0.485 -> 0.485).
+
+2. FLAT GROUND KEEPS ITS ROUGHNESS: coarse plains 3,854 components / 79.3%
+   at v14, bit-exact against v13's 3,854 / 79.3%. (Alpine texture, for the
+   record: 19,576 plateau components -> 1,668, mean terrace run 1.81 -> 2.07
+   voxels against a ~2.5 geometric floor at that grade — the per-voxel static
+   the in-engine capture showed is gone; an in-engine look at the smoother
+   hillside is owed, see UNVERIFIED.)
+
+3. ctest: 2/2 green after golden regeneration.
+
+4. GPU PARITY (vxc_gpu, standard region set incl. both fine-tier regions),
+   AMD RX 7800 XT: v13 before-digest 2d1b93ab0363d42f PASS; v14 after-digest
+   74e5fabf61366c5c PASS, bit-exact CPU/GPU. AMD-ONLY: cross-vendor NVIDIA
+   parity is owed and unavailable on this box.
+
+5. ADVERSARIAL BOUND SWEEP: 0 violations at all six levels on all three real
+   exemplars (alpine, plains, third-class) plus the in-suite synthetic sweeps
+   (part of ctest, incl. solid-below: zero air below floor).
+
+6. float-ban clean (comments/strings stripped, src+include); lint-shader-ub
+   clean incl. the SPIR-V OpSDiv/OpSRem/OpSMod opcode audit of the respun
+   prebuilt kernels.
+
+7. Goldens regenerated (amplifier, deep-column, mips, coarsegen); prebuilt
+   SPIR-V respun (ColumnMain, VoxelizeMain changed). Saved edit logs
+   invalidate on the version bump, as on every worldgen bump.
+   coarsegen_fidelity_vs_true_mip ceilings moved per that test's own policy;
+   the occupancy L1/L2 rise (50/41 -> 60/62 per mille on the synthetic
+   fixture's extreme grades) is recorded as a regression in the test, with
+   L3/L4 halved and tightened.
+
+-------------------------------------------------------------------------------
+FORMULATIONS REJECTED ON MEASUREMENT (kept so nobody retries them)
+
+* CONSTANT FLOOR (the brief's formula taken literally): the required
+  allowance is NON-MONOTONE in slope — plains needs >= ~410 mm/m at 17 mm/m
+  of slope (floor 100 took its plateau fraction from 79.3% to 98.9%: the
+  terrace artifact, back), the 20-25% rows need <= ~200 at ten times the
+  slope. No (k, floor) pair produces that shape.
+* MATERIAL-BAND EXEMPTION: capping only the relief-gated bands keeps the
+  plains plateau bit-exact and leaves alpine 78.7% stranded — the decimetre
+  band IS the pit field.
+* SLOPE-RAMPED ENGAGEMENT: fixes every uniform class and leaves the incised
+  sites broken (steepest 77.3%, third 67.0%): drainage is non-local, water
+  exits through valley floors, and a slope-local exemption grants the outlet
+  itself full-amplitude detail. Relief30 distinguishes a true plain (665 mm)
+  from a valley floor (walls inside the 30 m baseline), which is why the
+  shipped ramp is on relief.
+
+MEASUREMENT TRAPS HIT IN THIS SESSION (recorded per house rule):
+* Two "stride-1 steepest is stuck at 97%" hypotheses (cap disengaging on
+  cliffs; broken source tiles) were both falsified by direct measurement
+  before the real mechanism (the control window sits on an exempt bench) was
+  confirmed by an offset window. The k128 diagnostic that falsified the first
+  also produced a void number (moderate 98.3%) by reading a tile absent from
+  the original cache — single-site probes must use the repaired set.
+
+UNVERIFIED, stated plainly:
+* NVIDIA parity (no NVIDIA GPU on this box).
+* In-engine captures: the capped alpine hillside (smoother, contour-banded
+  where v13 was per-voxel static), a real-mountain LOD ring (the coarsegen
+  occupancy ceilings moved), and fine-plains terracing at floor 50.
+* The moderate/third transition band's residual stranding (83.4% / 63.4%) —
+  partially engaged by design; the 2400..6000 ramp alternative is measured
+  and costs gentle-row texture.
+* The exact stage_realism_report slope-by-scale pipeline (needs the earth-
+  reference cache; not on this box). The probe's structure function was used
+  instead, anchored to v13's published numbers.

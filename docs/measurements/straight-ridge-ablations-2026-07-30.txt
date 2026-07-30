@@ -1,0 +1,66 @@
+THE STRAIGHT-LINE RIDGES: THREE ABLATIONS, THREE NEGATIVES, CAUSE STILL UNKNOWN
+==============================================================================
+2026-07-30, worldgen v15. Frame under test: g35 (tile -5,2, p50 grade 35.0%,
+complete 3x3 coarse ring, real climate), the frame where the owner called the
+artifact clearest: "a clear pattern of jump ridges in a straight line", with the
+spacing on other frames estimated as "every metre or two".
+
+HYPOTHESES TESTED AND KILLED
+
+  arm B  fine-table 1600 mm microrelief octave, 500 -> 50 mm amplitude.
+         Rationale: plain value noise on an AXIS-ALIGNED world lattice at exactly
+         1.6 m, which should read as straight lines along world x/y -- the best
+         match for the word "straight".
+         RESULT: pattern unchanged. Not the cause.
+
+  arm A  rill/flute term, kRillAmplitudeMm 300 -> 30.
+         Rationale: also 1.6 m across-slope (kRillAcrossMm), and on a UNIFORM
+         slope a gradient-aligned term produces straight parallel lines down the
+         fall line, so "straight" does not exonerate it.
+         RESULT: pattern unchanged. Not the cause.
+
+  arm C  drop the fine tier entirely; same site on the 30 m coarse tier.
+         Rationale: the fine raster's own 1.875 m pitch, with control points
+         quantised to a 100 mm LSB and a measured reconstruction error up to
+         50 mm, is half a voxel of ripple at exactly the pixel spacing and
+         axis-aligned.
+         RESULT: pattern still present, if anything more pronounced. Not the
+         fine tier.
+
+AND THE FALLBACK EXPLANATION IS ALSO DEAD. Contour terracing -- the geometric
+consequence of voxelising any smooth slope -- would show up as terrace runs of the
+reported length. Measured at g35:
+
+  voxel terrace runs: count=2138  mean=2.39 voxels (0.24 m)  median=2  p90=4  max=19
+  (local grade in the probe window 81.2%)
+
+0.24 m is an order of magnitude short of "a metre or two", so the visible ridges
+are not contour steps at that spacing.
+
+WHAT I GOT WRONG, twice, and why it is recorded. When the frames were sent I named
+the rill term as the suspect, on the strength of chevrons I thought I saw. On the
+owner's word "straight line" I switched to the 1600 mm axis-aligned octave. Both
+were guesses from the picture, and both are now falsified by ablation. Three
+one-at-a-time term ablations have cost more than a direct measurement would have.
+
+THE NEXT STEP IS TO MEASURE THE PERIODICITY, NOT TO GUESS ANOTHER TERM. What is
+needed is the wavelength AND orientation of the artifact, from the height field
+itself -- a 2-D autocorrelation or power spectrum of the amplified surface over a
+window where the artifact is visible, reported as peak wavelength and peak
+direction relative to world x/y and to the local fall line. That distinguishes
+in ONE measurement between:
+  * an axis-aligned lattice term (peak along world x/y),
+  * a fall-line-aligned term (peak rotates with local aspect),
+  * a raster-pitch artifact (peak at 1.875 m or 30 m exactly), and
+  * quantisation (peak at a wavelength that scales with 1/local slope).
+terrainprobe already computes directional roughness and a structure function, so
+this is an addition to an existing instrument rather than a new one.
+
+RESOLVED ALONG THE WAY: THE BLUE SPECKS ARE WATER. In the arm-B frame they form a
+CONNECTED LINEAR CHAIN following a valley line rather than scattered specks -- a
+river, rendered thin and discontinuous. That retires the MAT_PERMAFROST /
+MAT_SNOW cold-biome-flip hypothesis. The remaining question is why it renders
+discontinuously, which is a water/rendering question and not a terrain-shape one.
+
+TREE STATE: all three arms reverted. kWorldGenVersion 15, kRillAmplitudeMm 300,
+both tables' 1600 mm octave at 500. Nothing from this investigation ships.

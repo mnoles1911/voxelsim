@@ -330,9 +330,28 @@ def octave_wavelengths(cell_m: float, src_nyquist_m: float = 30.0):
     return out
 
 
+#: Folded-normal constants for the constructional term: for X ~ N(0,1),
+#: E|X| = sqrt(2/pi) and std|X| = sqrt(1 - 2/pi). Folding a unit-RMS smooth
+#: field as (E|X| - |X|) / std|X| yields a unit-RMS field whose SHARP features
+#: are crests (the zero-contours of X, a connected curvilinear network) and
+#: whose lows are smooth — the convex/concave asymmetry isotropic fBm cannot
+#: have, in the crest-up direction.
+_ABS_MEAN = float(np.sqrt(2.0 / np.pi))
+_ABS_STD = float(np.sqrt(1.0 - 2.0 / np.pi))
+
+#: Octave-key offset for the constructional term's lattices, so its values are
+#: independent of the substrate octaves at the same wavelengths (the key is
+#: hashed as ``octave & 0xFFFF``; substrate octaves count from 0 and there are
+#: never more than a handful).
+_CONSTRUCTIONAL_OCTAVE_KEY = 100
+
+
 def roughness(carrier_z: np.ndarray, cell_m: float, slope: np.ndarray, seed: int,
               src_nyquist_m: float = 30.0,
-              origin_cells: Tuple[int, int] = (0, 0)) -> np.ndarray:
+              origin_cells: Tuple[int, int] = (0, 0),
+              constructional_amp: float = 0.0,
+              constructional_slope_lo: float = 0.10,
+              constructional_slope_hi: float = 0.30) -> np.ndarray:
     """B1: slope-conditioned fBm, in metres, to be ADDED to the carrier.
 
     Only octaves at or below `src_nyquist_m` are synthesised. Above it the carrier already
@@ -352,6 +371,23 @@ def roughness(carrier_z: np.ndarray, cell_m: float, slope: np.ndarray, seed: int
     `carrier_z` is used for its shape and dtype only. It is in the signature because B1 is
     specified as conditioned on the carrier, and curvature conditioning (not implemented
     here) would need it.
+
+    **The constructional term** (``constructional_amp > 0``; 0 reproduces the
+    prior surface bit-for-bit). Gentle real landscapes owe their fine-scale
+    ridge-and-knoll relief to CONSTRUCTIONAL processes — glacial till knolls,
+    hummocky moraine, playa/dune surfaces — not to erosion, and such relief is
+    genuinely uncorrelated with the modern drainage network. Isotropic fBm
+    cannot supply it: it is symmetric by construction, so it has no crests.
+    This term adds crest-up folded noise (see ``_ABS_MEAN``), at
+    ``constructional_amp`` times the reference amplitude per octave, gated to
+    ZERO on steep ground by the regional slope: full strength at or below
+    ``constructional_slope_lo``, fading linearly to nothing at
+    ``constructional_slope_hi``. Steep ground is erosional — its ridges must be
+    left by incision (interfluves), not painted — and folded noise on a
+    mountainside was measured (2026-07-29, ridge-deficit investigation) to read
+    as exactly the "uniform crumpled paper" failure the amplitude note above
+    records, with ridge cells uncorrelated with the flow field (placement
+    ratio 1.01–1.07 against 1.7–3.0 for erosional ridges).
     """
     z = np.asarray(carrier_z)
     if z.ndim != 2:
@@ -359,6 +395,13 @@ def roughness(carrier_z: np.ndarray, cell_m: float, slope: np.ndarray, seed: int
     cell_m = float(cell_m)
     if cell_m <= 0.0:
         raise ValueError(f"cell_m must be positive, got {cell_m}")
+    if constructional_amp < 0.0:
+        raise ValueError(
+            f"constructional_amp must be >= 0, got {constructional_amp}")
+    if not 0.0 <= constructional_slope_lo < constructional_slope_hi:
+        raise ValueError(
+            f"need 0 <= constructional_slope_lo < constructional_slope_hi, got "
+            f"{constructional_slope_lo}, {constructional_slope_hi}")
     src_nyquist_m = float(src_nyquist_m)
     oy, ox = int(origin_cells[0]), int(origin_cells[1])
     n0, n1 = z.shape
@@ -370,9 +413,26 @@ def roughness(carrier_z: np.ndarray, cell_m: float, slope: np.ndarray, seed: int
         amp = np.float32(_REF_AMPLITUDE_M * (wavelength / src_nyquist_m) ** _ROUGHNESS_H)
         out += amp * _octave_field((n0, n1), p, seed, octave, oy, ox)
 
-    gain = np.clip(np.asarray(slope, dtype=np.float32) / np.float32(_SLOPE_REF),
+    s = np.asarray(slope, dtype=np.float32)
+    gain = np.clip(s / np.float32(_SLOPE_REF),
                    np.float32(_SLOPE_GAIN_LO), np.float32(_SLOPE_GAIN_HI))
     out *= gain
+
+    if constructional_amp > 0.0:
+        c = np.zeros((n0, n1), dtype=np.float32)
+        for octave, wavelength in enumerate(octave_wavelengths(cell_m, src_nyquist_m)):
+            p = int(round(wavelength / cell_m))
+            amp = np.float32(constructional_amp * _REF_AMPLITUDE_M
+                             * (wavelength / src_nyquist_m) ** _ROUGHNESS_H)
+            g = _octave_field((n0, n1), p, seed,
+                              _CONSTRUCTIONAL_OCTAVE_KEY + octave, oy, ox)
+            c += amp * ((np.float32(_ABS_MEAN) - np.abs(g)) / np.float32(_ABS_STD))
+        cgain = np.clip(
+            (np.float32(constructional_slope_hi) - s)
+            / np.float32(constructional_slope_hi - constructional_slope_lo),
+            np.float32(0.0), np.float32(1.0))
+        out += c * cgain
+
     return out
 
 

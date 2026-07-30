@@ -124,7 +124,20 @@ namespace vxc {
 //      0.054-0.073). Relief is a second difference of the raster at a fixed 30 m
 //      baseline: exactly zero on a plane at any grade, and a direct measurement
 //      of what the tier carries rather than an assumption about it.
-inline constexpr uint32_t kWorldGenVersion = 13;
+// --- v14: the detail ladder stops reversing the carrier's downhill -----------
+//
+// One change (amplifier.cpp, "THE DETAIL GRADIENT CAP"), driven by
+// docs/measurements/client-detail-drainage-2026-07-29.txt: at v13 the post-gate
+// detail ladder sums to ~2.3 of local gradient on ground whose own gradient is
+// 0.4, so the downhill direction reversed almost everywhere and the client
+// turned the bake's routed drainage into a field of closed decimetre basins
+// (alpine: carrier 0 interior sinks -> amplified 1625; 87.9% of a 40% slope
+// stranded). v14 scales the summed post-gate detail down, in one joint factor,
+// so its nominal gradient stays within max(gradFloor, k * carrierGradient).
+// The relative octave weighting is untouched; the floor keeps decimetre
+// roughness alive on flats (the anti-terrace band). Scale-down only, so every
+// surface bound derived at v13 is still sound unchanged.
+inline constexpr uint32_t kWorldGenVersion = 15;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 

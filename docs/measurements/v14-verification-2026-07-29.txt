@@ -1,0 +1,126 @@
+v14 VERIFIED INDEPENDENTLY, AND IT FIXED THE GPU POOL TOO — 2026-07-29
+=======================================================================
+
+Verification of the gradient cap by the integrator rather than its author, using
+tools/drainage-ladder.ps1 (which the implementing agent did not write) and the
+three baked fine tiles.
+
+COARSE LADDER, amplified stranded area, v13 -> v14, against each row's carrier:
+
+  class        grade    carrier    v13     v14     path ratio v14
+  plains        1.7%     91.7%    98.1%   98.1%   0.135   exempt, bit-exact
+  very-gentle   3.7%     90.2%    96.5%   96.5%   0.146   exempt, bit-exact
+  gentle        6.0%     17.3%    93.7%   91.8%   0.066
+  low-relief   11.8%     57.4%    93.2%   93.1%   0.214
+  moderate     20.1%     16.7%    94.1%   83.4%   0.620
+  third        24.6%      0.0%    90.8%   63.4%   0.578
+  hilly        33.3%      0.0%    85.0%    0.4%   1.013
+  alpine       40.6%      0.0%    87.9%    0.7%   0.938
+  high-alpine  46.9%      0.0%    84.0%    0.8%   1.035
+  steepest     54.2%      3.3%    96.2%   17.5%   0.835
+
+The four steepest rows now MATCH their carrier: path ratios 0.94-1.04 mean the
+client no longer shortens the bake's flow paths at all. That is the defect closed
+where the carrier is well drained.
+
+FINE TIER, which is the shipping configuration and the case that matters:
+
+  class    carrier                    v13                      v14
+  alpine   0 sinks / 0.0% / 216.6 m   1761 / 93.1% / 15.5 m    0 / 0.0% / 218.8 m
+  third    11 / 59.5% / 123.8 m       1620 / 94.2% / 15.9 m    14 / 61.6% / 124.0 m
+  plains   14095 / 89.0% /  19.1 m    9036 / 97.3% /  3.7 m    2651 / 90.3% / 16.8 m
+
+Alpine is exact -- zero interior sinks, zero stranded, flow path slightly LONGER
+than the carrier's. Third and plains land within ~2 points of their carrier. On
+the tier the game actually ships, the defect is gone at every class.
+
+IT ALSO FIXED THE GPU POOL, which was filed separately as its own defect and
+deliberately NOT worked on first. Same site, same view, alpine fine tier:
+
+                        v13              v14
+  quad high-water       79,999,988       52,008,094
+  live chunks           71,541           51,947
+  pool capacity         93.9%            65.0%
+  free runs             18,217           1
+  alloc failures        7,290            0
+  alloc-failed quads    12,846,450       0
+  CHUNKS LEFT UNDRAWN   7,178            0
+
+Those 7,178 undrawn chunks are the black gaps in the v13 fine-tier capture. The
+reasoning that deferred this was: the micro-texture is what emits the quads, so
+sizing the pool before capping the gradient would size it for a count about to
+drop by a third. That held -- a 35% cut in quads took the pool from 18,217
+fragments and 7,178 dropped chunks to a single free run and none.
+
+Recorded because the opposite call was tempting and would have wasted the work,
+and because an earlier reading of this same defect was WRONG in the other
+direction: from alpine's `largest run 642` the conclusion drawn was "fragmented,
+wants compaction". It wanted fewer quads.
+
+WHAT v14 DOES NOT BUY, and the picture says it plainly.
+
+An in-engine capture at alpine on the fine tier at v14 shows a coherent slope
+with organised contour terracing and visible channel structure, where v13 showed
+per-voxel static. Structurally that is the fix. Aesthetically it trades one
+artifact for another: voxel-scale dithering for CONTOUR RIBBONS. The mechanism is
+arithmetic -- on 40% ground the cap allows a detail gradient of 0.5 x 0.4 = 0.2,
+so the 200 mm octave gets ~40 mm of amplitude, which is sub-voxel and therefore
+cannot dither a step edge.
+
+NOTE THE TWO ALPINE FINE CAPTURES ARE NOT A LIKE-FOR-LIKE BEFORE AND AFTER: v13's
+was taken at pitch -3.0 (a vista) and v14's at pitch -40.0 (looking down). They
+show different things about the same world and must not be presented as one
+comparison.
+
+THE WAY OUT I PROPOSED HERE IS FALSIFIED. Measured, not argued, the same day.
+
+The claim was: an ISOTROPIC detail term cannot add texture without risking a
+reversed downhill, but the plan's ANISOTROPIC rill/flute term can, because it is
+warped 8:1 along the fall line (kRillAcrossMm 1600, kRillAlongMm 12800) so its
+gradient is almost entirely ACROSS the slope where it cannot close a basin. That
+reasoning predicted the rill term was free texture under the cap.
+
+It is not. Three arms, alpine fine tier, carrier 0 sinks / 0.0% / 216.6 m:
+
+  arm                                       sinks  stranded  path
+  v14 as shipped (rill inside capped sum)       0      0.0%   218.8 m
+  rill exempt from the cap, not budgeted       12      9.2%   185.9 m
+  rill given first claim on the budget          2      7.0%   187.6 m
+
+Giving the rill its full amplitude costs 7-9% of the tile's drainage however the
+accounting is arranged. The anisotropy reduces the damage per unit of visible
+texture -- 7.0% with the octaves absorbing the reduction is better than 9.2%
+without -- but it does not remove it. At 300 mm over a 1.6 m across-slope
+wavelength, doubled by the relief gate, the rill's own gradient is ~0.375 against
+an alpine allowance of ~0.2, and the octagonal-norm frame carries up to 12%
+direction error, so a real fraction of that lands along-slope.
+
+ONE REAL BUG WAS FOUND ON THE WAY and is worth fixing on its own terms, separately
+from any texture ambition. detailGradMmPerM sums only the three OCTAVE bands, yet
+the scale it produces is applied to a detailMm that already includes the rill and
+bedding terms. So the post-cap gradient is (octaves + rill) * allowed/octaves --
+ABOVE the allowance by the rill's share -- while the comment above the block
+asserts the estimate and the thing it estimates cannot drift apart. The guarantee
+leaks in the unsafe direction. It does not currently show up as stranded area
+because scaling the rill down along with the octaves happens to compensate, i.e.
+the code is right by accident. Either count the additive terms in the budget or
+say in the comment that they are outside it; do not leave the assertion false.
+
+CONCLUSION FOR THE TEXTURE QUESTION: under a drainage constraint there is no
+cheap isotropic OR anisotropic client-side term. Sub-voxel-dithering texture and
+preserved drainage are in genuine tension at 10 cm voxels, and the remaining
+budget is small. The honest next places to look are not amplitude at all: surface
+MATERIAL variation and shading, which cost no geometry and therefore no drainage,
+and the bake supplying decimetre structure that the client can then follow rather
+than invent.
+
+STILL OPEN: the 20-25% transition band (moderate 83.4%, third 63.4% coarse) where
+the relief ramp only partially engages; the fine-plains drainage-vs-terracing
+trade (terrace runs 0.60 -> 1.95 m) which has no column-local discriminator
+because the bake supplies no decimetre texture there; alpine's ridge deficit,
+unrelated to this and needing a steep-ground process term; and NVIDIA parity,
+which remains owed -- every parity claim here is AMD RX 7800 XT only.
+
+No timings are quoted from any run in this file: the box's GPU was shared with a
+game throughout. Geometry, materials and pool occupancy counters are unaffected by
+that; milliseconds are not.

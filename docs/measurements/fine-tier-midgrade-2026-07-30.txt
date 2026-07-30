@@ -1,0 +1,52 @@
+THE MID-GRADE "TRANSITION BAND" IS A COARSE-TIER PROBLEM, NOT A FINE-TIER ONE
+=============================================================================
+Measured 2026-07-30 at worldgen v15, BAKE_VERSION 4.
+
+v14's verification recorded a residual in the 20-25% grade band -- moderate 84.0%
+and third-class 63.3% of the domain stranded -- and called it the next thing to
+fix. That was measured on the COARSE tier, and generalising it to the shipping
+configuration was wrong. Six fine tiles were baked across the grade range to check
+it, and on the fine tier the client is not the problem anywhere in that band.
+
+Fine tier, carrier -> amplified, v15:
+
+  site          grade   carrier                    amplified
+  g10 (-7,2)    10.1%   1881 / 73.5% /  51.4 m     373 / 73.2% / 49.9 m
+  g16 (-6,3)    16.4%   1163 / 80.0% /  71.0 m     342 / 81.1% / 61.5 m
+  g21 (-5,3)    21.2%      1 /  0.05% / 203.6 m      1 /  0.80% / 201.6 m
+  g25 (15,55)   24.6%     11 / 59.5% / 123.8 m      14 / 61.6% / 124.0 m
+  g41 (-5,15)   40.6%      0 /  0.0% / 216.6 m       0 /  0.0% / 218.8 m
+
+The amplified column tracks the carrier at every grade -- within 1.2 points
+everywhere, and at g10 the client's surface has FEWER interior sinks than the
+carrier it was built on (373 against 1881). Whatever stranding remains at 10-16% is
+the BAKE's, and the client is faithfully reproducing it.
+
+AND IT IS NOT KEYED ON GRADE, which is why "transition band" was the wrong name.
+It tracks COASTLINE:
+
+  site   land%   min elevation   carrier stranded
+  g10     98.5%       -504 m          73.5%
+  g16     69.8%      -2395 m          80.0%
+  g21    100.0%        +20 m           0.05%
+  g41    100.0%       +171 m           0.0%
+
+The two tiles with sea in them strand 73-80% of the domain; the two that are
+entirely land strand essentially nothing, and they sit on either side of the
+supposed band (21.2% and 40.6%). A tile with coastline has genuinely closed basins
+near sea level, and this metric counts them as stranded whether or not that is a
+defect -- water that reaches the sea has not been "stranded" in any sense a player
+would notice.
+
+SO THE OPEN QUESTION CHANGED SHAPE. It is no longer "why does the client break the
+20-25% band" -- it doesn't. It is "are the closed basins on coastal tiles real
+coastal landforms or artifacts", and the drainage metric cannot answer that,
+because it scores a legitimate coastal flat identically to a field of noise pits.
+That is a question for a picture and a human, and it is what the shape survey
+(tools/shape-survey.ps1) exists to put in front of one.
+
+WHAT THIS DOES NOT RETRACT. The coarse-tier ladder is unchanged and still shows the
+client stranding 84-92% at 6-25% grade where the carrier drains well (gentle 49,-4
+is 100% land with a carrier at 17.3% and an amplified surface at 91.8%). On a
+COARSE world that is a real defect and the engagement ramp is genuinely partial
+there. It matters less than it looked only because the fine tier is what ships.

@@ -873,6 +873,361 @@ Raster sampleCarrierRaster(ITileSampler& tiles, int64_t vx0, int64_t vy0, int64_
     return r;
 }
 
+// --- PERIODICITY: WAVELENGTH *AND* ORIENTATION ------------------------------
+//
+// WHY THIS EXISTS. The owner reported "a clear pattern of jump ridges in a
+// straight line", spacing "every metre or two". Three terms were then ablated one
+// at a time on the strength of hypotheses read off the picture -- the 1.6 m
+// axis-aligned microrelief octave, the rill term, and the whole fine tier -- and
+// all three came back negative, while a fourth explanation (contour terracing) was
+// killed by the terrace-run statistic (0.24 m, an order of magnitude short). Three
+// ablations cost more than one measurement would have.
+//
+// Guessing terms is the wrong move because the artifact's ORIENTATION already
+// distinguishes the candidates, and nothing was measuring it:
+//
+//   * a lattice term (value noise on a world-axis lattice) peaks along world x/y,
+//     at its lattice wavelength, REGARDLESS of the local slope direction;
+//   * a fall-line-aligned term (the rill/flute frame) peaks perpendicular to the
+//     local aspect, so its peak direction ROTATES as the aspect does;
+//   * a raster-pitch artifact peaks at exactly the tile pitch -- 1.875 m on the
+//     fine tier, 30 m on the coarse one -- and again ignores aspect;
+//   * pure voxel quantisation of a smooth ramp has a spacing that scales as
+//     1/local-grade, so its wavelength MOVES between windows of different slope
+//     while the others stay put.
+//
+// So this reports, per window: the plane-detrended residual's strongest
+// directional autocorrelation peak (wavelength, strength, direction), the two
+// cardinal directions explicitly, and the window's own aspect and grade. One run
+// on two windows of different slope separates all four.
+//
+// Floats are used freely: bench/ is outside the float ban, which covers src/ and
+// include/ only.
+struct PeriodPeak {
+    double wavelengthM = 0; // first autocorrelation maximum at nonzero lag
+    double strength = 0;    // normalised autocorrelation there, 0..1
+    double dirDeg = 0;      // direction of the SCAN, degrees CCW from world +x
+    bool found = false;
+};
+
+// Bilinear read of a residual field, in cell coordinates. Out-of-range reads are
+// rejected by the caller rather than clamped: clamping would fabricate
+// correlation at the domain edge, which is exactly the kind of self-inflicted
+// periodicity this function exists to detect.
+inline bool residualAt(const std::vector<double>& e, int64_t n, double x, double y, double& out) {
+    if (x < 0 || y < 0 || x > double(n - 1) || y > double(n - 1)) return false;
+    const int64_t i0 = int64_t(x), j0 = int64_t(y);
+    const int64_t i1 = std::min<int64_t>(i0 + 1, n - 1), j1 = std::min<int64_t>(j0 + 1, n - 1);
+    const double fx = x - double(i0), fy = y - double(j0);
+    const double a = e[size_t(j0 * n + i0)], b = e[size_t(j0 * n + i1)];
+    const double c = e[size_t(j1 * n + i0)], d = e[size_t(j1 * n + i1)];
+    out = (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy;
+    return true;
+}
+
+// Directional autocorrelation peak search. `dirDeg` is the scan direction; a
+// ridge pattern shows its peak when scanning ACROSS the ridges, so the reported
+// direction is perpendicular to the ridge crests.
+PeriodPeak periodPeakAlong(const std::vector<double>& e, int64_t n, double cellM, double dirDeg,
+                           int64_t maxLag) {
+    const double th = dirDeg * 3.14159265358979323846 / 180.0;
+    const double ux = std::cos(th), uy = std::sin(th);
+    PeriodPeak best;
+    // PEARSON CORRELATION OVER THE OVERLAP, and both halves of that matter.
+    //
+    // The first cut of this divided by sum(v1*v1) and did not re-centre, which is
+    // neither of the two things a normalised autocorrelation needs: the
+    // denominator must be sqrt(sum(v1^2)*sum(v2^2)) so the Cauchy-Schwarz bound
+    // holds, and the means must be taken over the OVERLAPPING set rather than the
+    // whole window, because the overlap shrinks with lag and its mean drifts. The
+    // consequence was not subtle and is the only reason it was caught: every lag
+    // reported r just above 1.0 (1.001, 1.005, 1.006), which is impossible, so the
+    // "first local maximum" was picking numerical noise and the wavelengths it
+    // printed were meaningless. An instrument that returns r > 1 is announcing its
+    // own bug; one that returns a plausible 0.6 would not have.
+    std::vector<double> rr(size_t(maxLag) + 1, 0.0);
+    rr[0] = 1.0;
+    int64_t usable = maxLag;
+    for (int64_t L = 1; L <= maxLag; ++L) {
+        double s1 = 0, s2 = 0, s11 = 0, s22 = 0, s12 = 0;
+        int64_t cnt = 0;
+        for (int64_t j = 0; j < n; ++j) {
+            for (int64_t i = 0; i < n; ++i) {
+                double v2;
+                if (!residualAt(e, n, double(i) + ux * double(L), double(j) + uy * double(L), v2))
+                    continue;
+                const double v1 = e[size_t(j * n + i)];
+                s1 += v1;
+                s2 += v2;
+                s11 += v1 * v1;
+                s22 += v2 * v2;
+                s12 += v1 * v2;
+                ++cnt;
+            }
+        }
+        // Too few overlapping samples to mean anything; stop rather than report a
+        // peak computed from a sliver of the window.
+        if (cnt < n * n / 8) {
+            usable = L - 1;
+            break;
+        }
+        const double inv = 1.0 / double(cnt);
+        const double m1 = s1 * inv, m2 = s2 * inv;
+        const double var1 = s11 * inv - m1 * m1;
+        const double var2 = s22 * inv - m2 * m2;
+        const double cov = s12 * inv - m1 * m2;
+        if (var1 <= 0 || var2 <= 0) {
+            usable = L - 1;
+            break;
+        }
+        rr[size_t(L)] = cov / std::sqrt(var1 * var2);
+    }
+    for (int64_t L = 2; L + 1 <= usable; ++L) {
+        const double a = rr[size_t(L - 1)], b = rr[size_t(L)], c = rr[size_t(L + 1)];
+        if (b > a && b >= c && b > 0.15) { // 0.15: below this a "peak" is noise
+            best.found = true;
+            best.wavelengthM = double(L) * cellM;
+            best.strength = b;
+            best.dirDeg = dirDeg;
+            break; // FIRST peak: the fundamental, not a harmonic
+        }
+    }
+    return best;
+}
+
+// HIGH-PASS, NOT A PLANE FIT, and this is the third correction to this instrument.
+//
+// The first version's normalisation was wrong and returned r > 1. Fixed, it
+// reported "no periodic component" -- and the reason was the DETRENDING, not the
+// correlation: a least-squares plane over a 25.6 m window on 85%-grade ground
+// leaves a detrended residual with an RMS of 1711 mm, i.e. 17 voxels. That
+// residual IS the landform. Its autocorrelation decays smoothly from 1.0 and
+// buries any centimetre-scale periodic component at r ~ 0.001, so the curve was
+// measuring hillslope curvature and calling it "no pattern".
+//
+// A plane cannot remove curvature; a local mean can. Subtracting a box mean of
+// radius R keeps everything shorter than roughly 2R and removes the landform, so
+// the residual is the decimetre-to-metre roughness the artifact would live in. R
+// is 4 m here: comfortably above the 1-2 m spacing under investigation, so the
+// signal survives, and far below the landform scale that was swamping it.
+//
+// The lesson is the same one this file keeps recording: an instrument that has not
+// been sanity-checked against the quantity it is supposed to isolate is not
+// evidence. Two of the three failures here were caught only because the output was
+// impossible (r > 1) or absurd (a 17-voxel "residual" on ground the eye reads as
+// smooth).
+std::vector<double> highPassResidual(const Raster& r, double radiusM, double* rmsOut) {
+    const int64_t n = r.n;
+    const int64_t R = std::max<int64_t>(1, int64_t(radiusM / r.cellM + 0.5));
+    // Separable box mean via prefix sums along each axis, clamped at the edges.
+    std::vector<double> tmp(size_t(n * n), 0.0), out(size_t(n * n), 0.0);
+    for (int64_t j = 0; j < n; ++j) {
+        for (int64_t i = 0; i < n; ++i) {
+            double s = 0; int64_t c = 0;
+            for (int64_t k = std::max<int64_t>(0, i - R); k <= std::min<int64_t>(n - 1, i + R); ++k) {
+                s += r.zMm[size_t(j * n + k)]; ++c;
+            }
+            tmp[size_t(j * n + i)] = s / double(c);
+        }
+    }
+    double rms = 0;
+    for (int64_t j = 0; j < n; ++j) {
+        for (int64_t i = 0; i < n; ++i) {
+            double s = 0; int64_t c = 0;
+            for (int64_t k = std::max<int64_t>(0, j - R); k <= std::min<int64_t>(n - 1, j + R); ++k) {
+                s += tmp[size_t(k * n + i)]; ++c;
+            }
+            const double v = r.zMm[size_t(j * n + i)] - s / double(c);
+            out[size_t(j * n + i)] = v;
+            rms += v * v;
+        }
+    }
+    if (rmsOut) *rmsOut = std::sqrt(rms / double(n * n));
+    return out;
+}
+
+// Fit and remove the least-squares plane, then scan directions. Centring the
+// coordinates makes the normal equations diagonal, so the fit is three divides
+// rather than a 3x3 solve.
+PeriodPeak periodicityScan(const Raster& r, double* aspectDegOut, double* gradePctOut,
+                           PeriodPeak* axisX, PeriodPeak* axisY) {
+    const int64_t n = r.n;
+    const double mid = double(n - 1) / 2.0;
+    double sz = 0, sxx = 0, syy = 0, sxz = 0, syz = 0;
+    for (int64_t j = 0; j < n; ++j) {
+        for (int64_t i = 0; i < n; ++i) {
+            const double x = double(i) - mid, y = double(j) - mid;
+            const double z = r.zMm[size_t(j * n + i)];
+            sz += z;
+            sxx += x * x;
+            syy += y * y;
+            sxz += x * z;
+            syz += y * z;
+        }
+    }
+    const double a = sxx > 0 ? sxz / sxx : 0.0; // mm per cell in +x
+    const double b = syy > 0 ? syz / syy : 0.0; // mm per cell in +y
+    const double c = sz / double(n * n);
+    // The plane is used ONLY for grade and aspect; the field the correlation runs
+    // on is high-passed instead. See highPassResidual for why.
+    (void)c;
+    const std::vector<double> e = highPassResidual(r, 4.0, nullptr);
+
+    // Grade and aspect of the fitted plane. Aspect is the direction of steepest
+    // DESCENT, which is the fall line the rill frame would align to.
+    const double gxMmPerM = a / r.cellM, gyMmPerM = b / r.cellM;
+    if (gradePctOut) *gradePctOut = std::hypot(gxMmPerM, gyMmPerM) / 1000.0 * 100.0;
+    if (aspectDegOut) {
+        double d = std::atan2(-gyMmPerM, -gxMmPerM) * 180.0 / 3.14159265358979323846;
+        if (d < 0) d += 360.0;
+        *aspectDegOut = d;
+    }
+
+    // SEARCH ONLY LAGS THE HIGH-PASS ACTUALLY PASSES. A box mean of radius R
+    // removes everything longer than roughly 2R and, worse, its negative lobe puts
+    // a correlation MINIMUM near R followed by a rise -- which a "first local
+    // maximum" search happily reports as a peak. That is exactly what happened:
+    // the first working version of this returned 4.00 m at 0.1 m cells (R itself),
+    // 6.00 m at 0.5 m cells and 28.50 m on the carrier, i.e. numbers that scale
+    // with the FILTER rather than sitting at a fixed physical wavelength. A peak
+    // whose value tracks the instrument's own parameter is the instrument's, not
+    // the terrain's. Capping the search at 3R/4 keeps the search inside the passed
+    // band; anything the artifact does at 1.6 m or 1.875 m is comfortably inside it.
+    const int64_t R = std::max<int64_t>(1, int64_t(4.0 / r.cellM + 0.5));
+    const int64_t maxLag = std::max<int64_t>(4, std::min<int64_t>(n / 4, R * 3 / 4));
+    PeriodPeak best;
+    for (int k = 0; k < 18; ++k) { // 10-degree steps over 180; the field is symmetric
+        const PeriodPeak p = periodPeakAlong(e, n, r.cellM, double(k) * 10.0, maxLag);
+        if (p.found && p.strength > best.strength) best = p;
+    }
+    if (axisX) *axisX = periodPeakAlong(e, n, r.cellM, 0.0, maxLag);
+    if (axisY) *axisY = periodPeakAlong(e, n, r.cellM, 90.0, maxLag);
+    return best;
+}
+
+// The full correlation curve for one direction, so a WEAK peak is visible instead
+// of being thresholded away. This exists because the first honest version of this
+// instrument reported "no periodic component above r=0.15" on a frame where a human
+// had just described a clear repeating ridge pattern. Both can be true: the
+// detrended residual is dominated by metre-scale landform variance, so a periodic
+// component only a few centimetres tall is a small fraction of it -- and yet at
+// 10 cm voxels under a low sun it casts a hard shadow every ridge and the eye locks
+// onto it. A pass/fail threshold is the wrong output for that; the curve is the
+// right one, and the reader can see whether there is a bump at all.
+std::vector<double> correlationCurve(const std::vector<double>& e, int64_t n, double dirDeg,
+                                     int64_t maxLag) {
+    const double th = dirDeg * 3.14159265358979323846 / 180.0;
+    const double ux = std::cos(th), uy = std::sin(th);
+    std::vector<double> rr(size_t(maxLag) + 1, std::nan(""));
+    rr[0] = 1.0;
+    for (int64_t L = 1; L <= maxLag; ++L) {
+        double s1 = 0, s2 = 0, s11 = 0, s22 = 0, s12 = 0;
+        int64_t cnt = 0;
+        for (int64_t j = 0; j < n; ++j) {
+            for (int64_t i = 0; i < n; ++i) {
+                double v2;
+                if (!residualAt(e, n, double(i) + ux * double(L), double(j) + uy * double(L), v2))
+                    continue;
+                const double v1 = e[size_t(j * n + i)];
+                s1 += v1; s2 += v2; s11 += v1 * v1; s22 += v2 * v2; s12 += v1 * v2;
+                ++cnt;
+            }
+        }
+        if (cnt < n * n / 8) break;
+        const double inv = 1.0 / double(cnt);
+        const double m1 = s1 * inv, m2 = s2 * inv;
+        const double var1 = s11 * inv - m1 * m1, var2 = s22 * inv - m2 * m2;
+        const double cov = s12 * inv - m1 * m2;
+        if (var1 <= 0 || var2 <= 0) break;
+        rr[size_t(L)] = cov / std::sqrt(var1 * var2);
+    }
+    return rr;
+}
+
+void printCurve(const std::vector<double>& e, int64_t n, double cellM, double dirDeg,
+                const char* what, int64_t maxLag) {
+    const std::vector<double> rr = correlationCurve(e, n, dirDeg, maxLag);
+    std::printf("    %-22s", what);
+    // A handful of physically meaningful lags rather than every one: the two
+    // finest octaves, the rill spacing, the fine raster pitch, and above.
+    const double wantM[] = {0.2, 0.4, 0.8, 1.6, 1.875, 3.2, 6.4};
+    for (double w : wantM) {
+        const int64_t L = int64_t(w / cellM + 0.5);
+        if (L < 1 || L > maxLag || std::isnan(rr[size_t(L)])) {
+            std::printf("  %5s", "-");
+            continue;
+        }
+        std::printf("  %+.2f", rr[size_t(L)]);
+    }
+    std::printf("\n");
+}
+
+void reportPeriodicity(const Raster& r, const char* label) {
+    double aspectDeg = 0, gradePct = 0;
+    PeriodPeak ax, ay;
+    const PeriodPeak best = periodicityScan(r, &aspectDeg, &gradePct, &ax, &ay);
+    std::printf("\n%s — PERIODICITY of the plane-detrended residual "
+                "(%lldx%lld cells at %.2f m, %.1f m window)\n",
+                label, (long long)r.n, (long long)r.n, r.cellM, r.domainM());
+    std::printf("  window plane: grade %.1f%%  aspect %.0f deg (steepest descent, CCW from +x)\n",
+                gradePct, aspectDeg);
+    if (best.found) {
+        // The scan direction is ACROSS the ridges, so crests run perpendicular.
+        double crest = best.dirDeg + 90.0;
+        if (crest >= 180.0) crest -= 180.0;
+        const double dFromAspect = std::fabs(best.dirDeg - aspectDeg);
+        std::printf("  STRONGEST peak: wavelength %.2f m  r=%.3f  scan dir %.0f deg "
+                    "(crests run %.0f deg)\n",
+                    best.wavelengthM, best.strength, best.dirDeg, crest);
+        std::printf("    scan dir vs fall line: %.0f deg apart -- near 0/180 means the pattern is "
+                    "ALIGNED WITH THE SLOPE (rill-frame family); near 90 means it runs along the "
+                    "contour (quantisation/terracing family)\n",
+                    dFromAspect > 180.0 ? 360.0 - dFromAspect : dFromAspect);
+    } else {
+        std::printf("  STRONGEST peak: none above r=0.15 -- no periodic component at this scale\n");
+    }
+    if (ax.found)
+        std::printf("  world +x: wavelength %.2f m  r=%.3f\n", ax.wavelengthM, ax.strength);
+    else
+        std::printf("  world +x: no peak\n");
+    if (ay.found)
+        std::printf("  world +y: wavelength %.2f m  r=%.3f\n", ay.wavelengthM, ay.strength);
+    else
+        std::printf("  world +y: no peak\n");
+    // THE CURVE, not just the verdict. Four directions: the two world axes, and
+    // along/across the fall line, which is what separates a lattice term from a
+    // rill-frame one.
+    {
+        const int64_t n = r.n;
+        const double mid = double(n - 1) / 2.0;
+        double sz = 0, sxx = 0, syy = 0, sxz = 0, syz = 0;
+        for (int64_t j = 0; j < n; ++j)
+            for (int64_t i = 0; i < n; ++i) {
+                const double x = double(i) - mid, y = double(j) - mid;
+                const double z = r.zMm[size_t(j * n + i)];
+                sz += z; sxx += x * x; syy += y * y; sxz += x * z; syz += y * z;
+            }
+        (void)sxx; (void)syy; (void)sxz; (void)syz; (void)sz; (void)mid;
+        double rms = 0;
+        const std::vector<double> e = highPassResidual(r, 4.0, &rms);
+        const int64_t maxLag = std::max<int64_t>(4, r.n / 4);
+        std::printf("  HIGH-PASSED residual (4 m box mean removed) RMS %.1f mm (%.2f voxels) -- this "
+                    "is the band the artifact would live in; a plane fit left 17 voxels of landform "
+                    "here and buried it\n",
+                    rms, rms / 100.0);
+        std::printf("    %-22s  %5s  %5s  %5s  %5s  %5s  %5s  %5s\n", "correlation at lag:",
+                    "0.2m", "0.4m", "0.8m", "1.6m", "1.88m", "3.2m", "6.4m");
+        printCurve(e, n, r.cellM, 0.0, "world +x", maxLag);
+        printCurve(e, n, r.cellM, 90.0, "world +y", maxLag);
+        printCurve(e, n, r.cellM, aspectDeg, "along fall line", maxLag);
+        printCurve(e, n, r.cellM, aspectDeg + 90.0, "across fall line", maxLag);
+    }
+    std::printf("  READ IT LIKE THIS: a strong peak on world +x/+y at a fixed wavelength that does "
+                "NOT move between windows of different grade is a LATTICE term; a peak that rotates "
+                "with aspect is FALL-LINE aligned; exactly 1.875 m or 30.00 m is the RASTER pitch; "
+                "a wavelength that scales as 1/grade is voxel QUANTISATION.\n");
+}
+
 // D8 neighbour offsets, in a FIXED scan order. Ties in steepest-descent are
 // broken by taking the first in this order, so the routing is reproducible.
 const int kD8dx[8] = {1, 1, 0, -1, -1, -1, 0, 1};
@@ -3640,6 +3995,55 @@ int main(int argc, char** argv) {
         std::printf("using SyntheticTileSampler pixelSizeMm=%d\n", synth.pixelSizeMm());
     }
 
+    // --- THE FINE TIER IS A PROPERTY OF THE WORLD, NOT OF ONE TABLE ----------
+    //
+    // This used to be loaded inside the --band-fit block, so `--fine-dir`
+    // rebound only the sampler the CALIBRATION read and left the terrace,
+    // drainage, structure and seam sections measuring the 30 m coarse tier. A
+    // run could therefore print "fine tier" in one table and 30 m numbers in
+    // every other one, which is precisely the mislabelled measurement this tool
+    // exists to prevent -- and it hid the question that matters most, because on
+    // a fine world the amplifier DELETES its two loudest octaves (25.6 m and
+    // 6.4 m; see kFineDetailOctaves) and nothing downstream could see the
+    // consequence.
+    //
+    // So the fine tier now rebinds `tiles` itself, before `amp` is constructed,
+    // and every metric in the run measures the world the client would actually
+    // evaluate. `fine` is declared in this scope so it outlives `amp`, which
+    // holds a reference to it. The coarse sampler stays as the climate source:
+    // a v2 fine tile carries elevation control points and a flow plane, not
+    // climate, so biome and material still come from the 30 m raster.
+    FineTileSampler fine(seed, tiles);
+    bool fineLoaded = false;
+    if (!fineDir.empty()) {
+        int loaded = 0, rejected = 0;
+        if (std::filesystem::exists(fineDir)) {
+            for (auto& e : std::filesystem::directory_iterator(fineDir)) {
+                if (e.path().extension() != ".vxtl") continue;
+                if (fine.loadTileFile(e.path()))
+                    ++loaded;
+                else
+                    ++rejected;
+            }
+        }
+        if (!optBaseline)
+            std::printf("fine tier: dir=%s loaded=%d rejected=%d pixelSizeMm=%d\n",
+                        fineDir.c_str(), loaded, rejected, fine.pixelSizeMm());
+        if (loaded == 0) {
+            // Refuse rather than silently fall back: the whole point of naming a
+            // fine tier is that the answer changes, and a run that quietly
+            // extrapolated from 30 m while its header said "fine tier" is the
+            // failure this tool exists to prevent.
+            std::fprintf(stderr, "no v2 fine tiles loaded from %s; refusing to silently "
+                                 "fall back to the coarse tier\n",
+                         fineDir.c_str());
+            return 1;
+        }
+        tiles = &fine;
+        sourceLabel = "real .vxtl v2 FINE tier";
+        fineLoaded = true;
+    }
+
     Amplifier amp(seed, *tiles);
 
     const int64_t vx0 = x0M * 1000 / kVoxelSizeMm;
@@ -3655,42 +4059,17 @@ int main(int argc, char** argv) {
     // and not the coarse one. When it is absent the run continues on the coarse
     // tier and says so in every table that depends on it.
     if (optBandFit) {
-        FineTileSampler fine(seed, tiles);
-        Amplifier ampFine(seed, fine);
+        // The fine tier is loaded and bound above, for the whole run rather than
+        // for this block, so there is nothing tier-specific left to do here:
+        // `tiles` and `amp` ARE the fine ones when --fine-dir was given. Keeping
+        // the calTiles/calAmp names avoids churning the body below, which reads
+        // them in a dozen places.
         ITileSampler* calTiles = tiles;
         Amplifier* calAmp = &amp;
-        std::string srcName = dir == "--synthetic" ? "synthetic tiles (30 m band)" : "real .vxtl "
-                                                                                    "v1 tiles "
-                                                                                    "(30 m/px "
-                                                                                    "coarse tier)";
-        if (!fineDir.empty()) {
-            int loaded = 0, rejected = 0;
-            if (std::filesystem::exists(fineDir)) {
-                for (auto& e : std::filesystem::directory_iterator(fineDir)) {
-                    if (e.path().extension() != ".vxtl") continue;
-                    if (fine.loadTileFile(e.path()))
-                        ++loaded;
-                    else
-                        ++rejected;
-                }
-            }
-            std::printf("fine tier: dir=%s loaded=%d rejected=%d\n", fineDir.c_str(), loaded,
-                        rejected);
-            if (loaded == 0) {
-                // Refuse rather than silently fall back: the whole point of
-                // naming a fine tier is that the answer changes, and a run that
-                // quietly extrapolated from 30 m while its header said "fine
-                // tier" is exactly the mislabelled measurement this tool exists
-                // to prevent.
-                std::fprintf(stderr, "no v2 fine tiles loaded from %s; refusing to silently "
-                                     "fall back to the coarse tier\n",
-                             fineDir.c_str());
-                return 1;
-            }
-            calTiles = &fine;
-            calAmp = &ampFine;
-            srcName = "real .vxtl v2 FINE tier (1875 mm/px)";
-        }
+        std::string srcName =
+            fineLoaded ? "real .vxtl v2 FINE tier (1875 mm/px)"
+                       : (dir == "--synthetic" ? "synthetic tiles (30 m band)"
+                                               : "real .vxtl v1 tiles (30 m/px coarse tier)");
         // Default the band's low end to the source's own Nyquist-ish floor: one
         // pixel. Stated in metres so it reads the same at either tier.
         const double loM = bandLoM > 0 ? bandLoM
@@ -3770,6 +4149,21 @@ int main(int argc, char** argv) {
 
     terraceStats(hAmp, "AMPLIFIED SURFACE");
     terracePlateaus(amp, vx0, vy0, 512, "AMPLIFIED SURFACE");
+
+    // PERIODICITY, at two cell sizes on purpose. A 0.1 m lattice resolves
+    // everything down to the voxel but only spans 25.6 m; a 0.5 m lattice spans
+    // 128 m and so can see a metre-to-decametre pattern that the tight window
+    // clips. An artifact that appears at ONE cell size and not the other is a
+    // sampling artifact of this instrument, not a property of the terrain -- which
+    // is the failure mode a single window would hide.
+    {
+        const Raster pFine = sampleAmplifiedRaster(amp, vx0, vy0, 256, 1);
+        reportPeriodicity(pFine, "AMPLIFIED SURFACE (0.1 m cells)");
+        const Raster pWide = sampleAmplifiedRaster(amp, vx0, vy0, 256, 5);
+        reportPeriodicity(pWide, "AMPLIFIED SURFACE (0.5 m cells)");
+        const Raster cWide = sampleCarrierRaster(*tiles, vx0, vy0, 256, 5);
+        reportPeriodicity(cWide, "CARRIER ONLY (0.5 m cells)");
+    }
 
     // Optional raw dump of the voxel-quantised height field, for hillshading
     // offline. A hillshade of floor(h/100mm) shows the terrace artifact

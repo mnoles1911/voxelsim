@@ -1,0 +1,84 @@
+FIRST IN-ENGINE SURVEY OF THE FINE TIER, THREE CLASSES — 2026-07-29
+====================================================================
+
+The .vxtl v2 fine tier had never been rendered before this. All three exemplar
+classes baked at BAKE_VERSION 4, staged as s16 tiles, captured at 1600x900 with a
+200 s settle, sun frozen at 12:00 on 03-20.
+
+EVERY CAPTURE'S POSITION IS VERIFIED FROM ITS OWN LOG, not assumed from the
+switch, because the harness had a bug that silently moved the camera (see
+tools/voxel-capture.ps1 and the commit that added the edit-log clear):
+
+  capture              requested            camera actually at
+  v13-plains           -837120,314880       -837119.65, 314880.35   OK
+  v13-alpine            -69120,238080        -69119.65, 238080.35   OK
+  v13-alpine-FINE       -69120,238080        -69708.95, 237982.78   OK (pitch -3.0)
+  v13-plains-FINE2     -837120,314880       -837119.65, 314880.35   OK
+  v13-third-FINE        238080,852480        238080.35, 852480.35   OK
+
+The alpine fine capture used pitch -3.0 where the others used -40.0, which is why
+it frames a vista rather than looking down. Same site, different pose.
+
+WHAT EACH CLASS LOOKS LIKE
+
+alpine (-5,15), 40.6% grade. The first image in this project that reads as a
+mountain: coherent ridgeline, real valleys, material banding from vegetated lower
+slopes to bare rock above, a proper skyline. Compare the coarse tier at the same
+site, which is a field of isolated one-voxel pillars. This is the step the plan
+was aiming at, and it is worth saying plainly that the LANDFORM half of the design
+works.
+
+Overlaid on all of it, everywhere, is a uniform scaly micro-texture. That is the
+detail band whose gradient strands 93.1% of this tile's drainage. It is not new
+information -- it is what the drainage number looks like.
+
+plains (-55,20), 1.7% grade. WORSE than the same site on the coarse tier: where
+coarse plains gave broad plateaus with ragged edges, fine plains is dense isolated
+single-voxel speckle. This agrees with the measurement rather than contradicting
+it (fine amplified 97.3% stranded against its own carrier's 89.0%, where on the
+coarse tier the detail IMPROVED a plain). The bake now supplies sub-metre swales
+here and the client is fighting them.
+
+third class (15,55), 24.6% grade. The most informative of the three, because the
+bake's dendritic drainage is VISIBLE THROUGH the static -- branching sinuous
+valleys organise the whole frame. The landform is there and the client's noise is
+sitting on top of it rather than replacing it. That is the encouraging reading of
+an otherwise bad picture.
+
+TWO CORRECTIONS TO EARLIER REASONING IN THIS SESSION
+
+1. THE GPU POOL IS NOT INTRINSICALLY FRAGMENTED, and I had this backwards. The
+   alpine fine run reported `no room for 1633 quads (1385893 free, largest run
+   642)` and chunks left undrawn, and by the code's own criterion (far apart =>
+   fragmented => wants compaction) I leaned toward compaction over capacity. The
+   third-class run says otherwise:
+
+     liveChunks=49723 highWater=52332061 free=27667939 largestRun=27667939
+     freeRuns=1 capacityPct=65.4 allocFail=0
+
+   ONE free run, zero allocation failures, zero undrawn chunks. The pool is
+   perfectly healthy at 65% capacity. Alpine's fragmentation appeared only under
+   near-exhaustion (139,532 chunks and 130.7M quads produced, against 49,723 and
+   52.3M here). So fragmentation is a SYMPTOM of running the pool near full, and
+   capacity -- or reducing the quad count -- is the primary lever. Compaction is
+   secondary at best.
+
+   This also strengthens the case for sequencing: the micro-texture is what emits
+   those quads, so the gradient cap should be measured before the pool is resized.
+
+2. SMALL BLUE PATCHES, UNEXPLAINED, and deliberately left that way rather than
+   given a story. They appear mid-slope on alpine and third class and NOT on
+   plains. What has been ruled out:
+     * not undrawn chunks -- the third-class run reports zero;
+     * not the water subsystem -- it logged nothing; the only "Water" matches in
+       the log are the pool's own `highWater`;
+     * not implicit sea level -- core.h:134 makes water implicit only below z=0,
+       and this tile's minimum elevation is +47 m;
+     * not the flow plane painting a wet material -- the amplifier does not read
+       the flow plane at all (no flowPlane/channelFlag consumer in voxel-core/src).
+   A river system does exist (rivernet.cpp, rivercouple.h) and is the obvious next
+   place to look. Filed rather than guessed.
+
+NO TIMINGS ARE QUOTED FROM ANY OF THESE RUNS. The box's GPU was shared with a
+game throughout, which does not affect geometry, materials or the pool's
+occupancy counters but does affect anything measured in milliseconds.

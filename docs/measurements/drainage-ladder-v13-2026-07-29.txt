@@ -1,0 +1,118 @@
+﻿class        tile     grade% |  cSinks  aSinks |  cStrnd  aStrnd |  cPath_m  aPath_m  ratio
+-------------------------------------------------------------------------------------------
+plains       -56,20      1.7 |   8,623  11,536 |   91.7%   98.1% |     22.9      3.1  0.135
+very-gentle  14,54       3.7 |      28   7,084 |   90.2%   96.5% |     52.0      7.6  0.146
+gentle       49,-4       6.0 |       3   5,956 |   17.3%   93.7% |    130.9      8.0  0.061
+low-relief   15,54      11.8 |      12   4,931 |   57.4%   93.2% |     53.6     11.4  0.212
+moderate     50,-4      20.1 |       3   1,994 |   16.7%   94.1% |    147.9     28.2  0.191
+third-class  15,55      24.6 |       0   1,759 |    0.0%   90.8% |    215.1     18.6  0.087
+hilly        16,54      33.3 |       0   1,694 |    0.0%   85.0% |    101.4     19.7  0.194
+alpine       -5,15      40.6 |       0   1,625 |    0.0%   87.9% |    223.6     28.9  0.129
+high-alpine  5,25       46.9 |       0   1,612 |    0.0%   84.0% |    149.9     27.8  0.186
+steepest     -4,16      54.2 |       1   1,663 |    3.3%   96.2% |    224.4     24.7  0.110
+
+CONTROL AT TRUE VOXEL SPACING (--drain-stride 1, i.e. 10 cm; the table above is
+stride 10 = 1 m, where the 0.4 m and 0.2 m octaves alias and could in principle
+manufacture the whole effect):
+
+  site               carrier sinks/stranded    amplified sinks/stranded
+  alpine    (40.6%)        0 /   0.0%               292 /  87.9%
+  steepest  (54.2%)        0 /   0.0%              2726 /  97.4%
+  plains     (1.7%)    96543 /  99.0%              4224 /  97.5%
+
+Alpine reads 87.9% stranded at BOTH 1 m and 10 cm, so the steep-ground result is
+not a sampling artifact.
+
+THE PLAINS ROW INVERTS, and it is the most useful row here. At 10 cm postings a
+1.7% grade is flat: the carrier alone strands 99.0% of the domain with a mean
+flow path of 4 cm. The client's detail band takes that to 97.5% and a 35 cm path
+-- it IMPROVES drainage on flat ground, because giving near-level ground some
+relief is what gives water anywhere to go. This is the microrelief band doing
+exactly the job it was added for.
+
+So the defect is STEEP-GROUND ONLY, and the fix must be too:
+
+  * above roughly 25% grade the carrier is perfectly drained (0 sinks, 0%
+    stranded) and the client destroys it -> cap detail here;
+  * below roughly 12% grade the carrier cannot drain at 10 cm regardless and the
+    detail helps -> leave it alone. A cap proportional to carrier gradient with
+    no floor would remove the one thing helping here.
+
+That is measured justification for the floor in
+detailGradient <= max(gradFloor, k * carrierGradient), rather than the
+hand-waving justification it had when it was proposed.
+
+BOTH FIELDS ARE SAMPLED IDENTICALLY, checked rather than assumed, because an
+unfair comparison here would invent the entire finding: sampleAmplifiedRaster
+and sampleCarrierRaster (voxel-core/bench/terrainprobe.cpp:853-873) read raw
+`surfaceMm` and `carrierMm` in millimetres on the same lattice with the same
+stride, and NEITHER quantises to voxel heights.
+
+CLIMATE ON THESE TILES IS A CONSTANT. Every site except alpine (-5,15), plains'
+own exemplar (-55,20) and third-class (15,55) exists only as an elevation-only
+tile repaired by tools/reencode_elevation_only_tiles.py. Elevation is copied
+byte-for-byte so every number above is unaffected, but no material, biome or
+topsoil figure may be quoted off these tiles. The plains row here is tile
+(-56,20), a 90.7%-land neighbour of the (-55,20) exemplar, not the exemplar.
+
+FINE TIER (.vxtl v2, 1.875 m/px, BAKE_VERSION 4), THREE CLASSES
+---------------------------------------------------------------
+Measurable only after terrainprobe's --fine-dir was fixed to bind the whole run
+rather than just the calibration block (58f00e2). `config.pixel_size` reads 1875
+and `band.fine_tier_table` reads 1 in every run below.
+
+  class              carrier sinks/stranded/path      amplified sinks/stranded/path
+  plains   ( 1.7%)   14095 / 89.0% /  19.1 m           9036 / 97.3% /  3.7 m
+  third    (24.6%)      11 / 59.5% / 123.8 m           1620 / 94.2% / 15.9 m
+  alpine   (40.6%)       0 /  0.0% / 216.6 m           1761 / 93.1% / 15.5 m
+
+TWO THINGS HERE CHANGE THE FIX.
+
+1. THE FINE TIER IS THE HARDER CASE, not the easier one. Alpine amplified goes
+   87.9% stranded on the coarse tier to 93.1% here, with the mean flow path
+   halving from 28.9 m to 15.5 m. Deleting the 25.6 m and 6.4 m octaves buys
+   nothing because {3200, 900} restores comparable gradient, and the carrier now
+   carries real 1.875 m structure for the detail to fight at closer wavelengths.
+   Any hope that shipping the fine tier fixes sub-30 m realism on its own is dead.
+
+2. THE FLOOR'S JUSTIFICATION IS TIER-SPECIFIC, which was not visible before.
+   On the coarse tier sampled at 10 cm, a 1.7% plain's carrier is undrainable
+   (99.0% stranded, 4 cm paths) and the detail band IMPROVES it to 97.5% and
+   35 cm -- so a cap with no floor would remove the only thing helping. On the
+   FINE tier the same plain's carrier drains: 19.1 m paths, because
+   BAKE_VERSION 4 carves sub-metre swales on plains (profile_regional_p = 2.0),
+   and the detail band then DEGRADES it to 97.3% and 3.7 m.
+
+   So the detail helps flat ground only where the carrier has nothing at that
+   scale. Where the bake supplies sub-metre structure, the client's job is to
+   stay out of its way. That is the plan's "complement, do not add" principle
+   arriving as a measurement instead of an intention, and it means the cap should
+   bite at every class on a fine world while sparing flat ground on a coarse one.
+
+CODEC AND SIZE, from the same three bakes. Control points reproduce the bake's
+own surface well inside the 100 mm quantum in every case -- mean |e| 14.96 mm
+(plains), 12.21 (third), 12.79 (alpine); max 50.48, 50.43, 50.48. So the fine
+tier is not a source of error in anything above.
+
+CORRECTED 2026-07-29, and the correction matters more than the number. I first
+compared these against the plan's 29/44/61 KB/km2 table, which is the SUPERSEDED
+3.75 m/px tier, and reported 2.5-4x over. That was wrong. The plan retired that
+number with the resolution decision and records ~21-25 MB/tile for the shipped
+1.875 m/px tier (docs/vxtl-v2-format.md, quoted at plan risk 2), which over
+235.9 km2 is ~89-106 KB/km2. Against the right baseline:
+
+  class     measured zstd    measured/tile   plan 1.875 m tier   vs plan
+  plains     74.0 KB/km2      17.87 MB        21-25 MB           15-30% UNDER
+  alpine    153.3 KB/km2      37.04 MB        21-25 MB           1.48x over
+  third     180.4 KB/km2      43.58 MB        21-25 MB           1.74x over
+
+So the plan's range holds for gentle terrain and is low by up to ~1.75x for
+dissected and steep terrain -- a real overshoot on the classes that matter for
+worst-case budgeting, and nothing like the 2.5-4x I first claimed. Plan risk 2's
+live concern is unchanged and is the right one: what costs bytes is uncorrelated
+per-pixel noise, and BAKE_VERSION 4's dissection raises exactly that on steep
+tiles (68% of the alpine window above a_crit).
+
+At ~200 MB CODEC_RAW before compression the wire format is fine, but a worst-case
+tile is ~44 MB rather than ~25, so the plan's prefetch-ring and client-RAM
+arithmetic should be re-run at the upper bound before it is quoted again.

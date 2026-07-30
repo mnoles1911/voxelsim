@@ -67,6 +67,9 @@ param(
     [string]$Date = '03-20',
     [double]$TimeScale = 0,
     [string]$Cvars = '',
+    # Keep the persisted edit log instead of clearing it. Only for deliberately
+    # photographing an EDITED world; see the note above the clear below.
+    [switch]$KeepEditLog,
     [string[]]$ExtraArgs = @(),
     [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe'
 )
@@ -76,6 +79,28 @@ $Root    = (Resolve-Path "$PSScriptRoot\..").Path
 $Project = (Resolve-Path "$Root\ue-project\VoxelEarth.uproject").Path
 $LogPath = Join-Path $Root "Saved\capture-$Name.log"
 $ShotDir = Join-Path $Root 'ue-project\Saved\Screenshots\WindowsEditor'
+
+# THE EDIT LOG PERSISTS ACROSS RUNS AND OVERRIDES -VoxelSpawnAt. This script did
+# not clear it, and voxel-run-flight-leg.ps1 always has (its ground rule 11: a leg
+# measured without clearing it is not cold). The consequence here is worse than a
+# stale measurement, because it moves the CAMERA:
+#
+#   2026-07-29: a capture launched with -VoxelSpawnAt=-837120,314880 (the plains
+#   exemplar) came up at the ALPINE exemplar instead -- the position left behind by
+#   the previous capture. It was caught only because the fine tier happened to be
+#   pinned to the plains tile, so the run tripped the residency gate and died
+#   loudly. With the coarse tier, or with both tiles resident, it would have
+#   written a screenshot named "plains" showing a mountain, and nothing in the log
+#   or the filename would have said so.
+#
+# So: clear it, and clear it BEFORE the one-editor check so a refused start does
+# not leave a half-prepared state.
+if (-not $KeepEditLog) {
+    $worldDir = Join-Path (Split-Path $Project) 'Saved\VoxelWorlds'
+    if (Test-Path $worldDir) {
+        Get-ChildItem $worldDir -Filter *.vxlog -ErrorAction SilentlyContinue | Remove-Item -Force
+    }
+}
 
 $running = @(Get-Process UnrealEditor-Cmd, UnrealEditor -ErrorAction SilentlyContinue)
 if ($running.Count -gt 0) {
@@ -129,16 +154,45 @@ if (Test-Path $ShotDir) {
 # photograph of an empty world; print the numbers next to the file so that is
 # decidable without opening the image.
 if (Test-Path $LogPath) {
-    $loaded = Select-String -Path $LogPath -Pattern 'loaded=(\d+)' -AllMatches |
+    # ANCHOR THIS TO THE STREAMING LINE. A bare 'loaded=(\d+)' also matches
+    # `unloaded=` (the substring is right there) and the fine-tier line's own
+    # `loaded=1`, so on the first fine-tier capture ever run it reported
+    # "peak loaded=195548, final=1" -- the peak was the UNLOADED count and the
+    # final was resident fine TILES. The world had 139,532 chunks and 64.4M
+    # resident quads at the time, i.e. the two numbers that were supposed to
+    # decide "did this stream in" both came from somewhere else. A harness that
+    # reports a result it did not obtain is the failure this file exists to
+    # prevent, so match the counter by its own line.
+    $rx = 'Voxel streaming: loaded=(\d+)'
+    $loaded = Select-String -Path $LogPath -Pattern $rx -AllMatches |
         ForEach-Object { $_.Matches } | ForEach-Object { [int]$_.Groups[1].Value }
     $peak = if ($loaded) { ($loaded | Measure-Object -Maximum).Maximum } else { 0 }
     $final = if ($loaded) { $loaded[-1] } else { 0 }
     Write-Host ("  streaming: peak loaded={0}, final={1}, samples={2}" -f
                 $peak, $final, $loaded.Count)
-    if ($peak -lt 1000) {
+    if (-not $loaded) {
+        Write-Warning ("no 'Voxel streaming: loaded=' line in the log -- the streaming counters " +
+                       "could not be read at all, so this capture has NO evidence either way " +
+                       "about whether terrain was resident. Do not treat it as settled.")
+    }
+    elseif ($peak -lt 1000) {
         Write-Warning ("peak loaded=$peak is LOW -- this is very likely a photograph of " +
                        "terrain that had not streamed in. Raise -SettleSec, or check the " +
                        "spawn is inside the generated tile set, before believing the image.")
+    }
+    # CHUNKS THE GPU POOL REFUSED, which is a different failure from "not
+    # streamed yet" and looks identical in the image: black gaps in otherwise
+    # finished terrain. The fine tier is where this first showed up, because its
+    # quad density is far higher -- the allocator reported 1,385,893 quads free
+    # but a largest contiguous run of 642 against a 1,633-quad chunk, so the
+    # pool was fragmented rather than full. Surfaced here because reading it out
+    # of the log by hand is exactly what does not happen.
+    $undrawn = @(Select-String -Path $LogPath -Pattern 'Chunk left undrawn' -AllMatches).Count
+    if ($undrawn -gt 0) {
+        Write-Warning ("$undrawn chunk(s) were left UNDRAWN by the GPU pool (search the log for " +
+                       "'no room for'). Black gaps in this image are that, not missing terrain " +
+                       "and not a mesher bug -- check the reported largest contiguous run before " +
+                       "blaming pool size.")
     }
     # THE SUN THE FRAME WAS ACTUALLY TAKEN AT, read back rather than echoed from
     # the switches: the calendar quantises -Date to reachable days (7.6 real days

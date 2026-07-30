@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 13
+#define VXC_WORLDGEN_VERSION_USH 15
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -252,6 +252,44 @@ static const int64_t kReliefBaselineMm = 30000;
 static const int64_t kReliefRefMm = 16000;
 static const int64_t kReliefScaleMinQ10 = 102;
 static const int64_t kReliefScaleMaxQ10 = 2048;
+
+// --- v14 mirror: the detail gradient cap (amplifier.cpp) --------------------
+//
+// MIRROR: amplifier.cpp kLandformGradMmPerM .. kFineMicroGradMmPerM (DERIVED
+// there from the octave tables as sum of scaledAmpMm(amp) * 1000 / lattice per
+// band, and pinned by static_assert; hand-mirrored here as literals because
+// HLSL cannot run that constexpr loop), plus kDetailGradCapKQ10 /
+// kDetailGradFloorMmPerM (calibrated worldgen constants). The cap scales the
+// whole summed post-gate detail down so its nominal gradient stays within
+// max(floor, k * carrierGradient) -- detail steeper than the ground it
+// decorates reverses the downhill direction and turns routed drainage into
+// closed decimetre basins. See the v14 block in amplifier.cpp for the
+// derivation, the drainage measurement, and why the floor is load-bearing.
+static const int64_t kLandformGradMmPerM = 272;
+static const int64_t kMetreGradMmPerM = 312;
+static const int64_t kMicroGradMmPerM = 350;
+static const int64_t kFineLandformGradMmPerM = 281;
+static const int64_t kFineMetreGradMmPerM = 312;
+static const int64_t kFineMicroGradMmPerM = 350;
+static const int64_t kDetailGradCapKQ10 = 512;
+// v15. kRillMaxAbsMm * 1000 / kRillAcrossMm = 300 * 1000 / 1600, static_asserted
+// == 187 on the CPU side BECAUSE it is a literal here. Do not fold this into an
+// expression involving the rill constants: they live in detail_rill.h, which this
+// file does not include, so the assert is the only thing tying the two together.
+static const int64_t kRillGradMmPerM = 187;
+static const int64_t kDetailGradFloorMmPerM = 50;
+static const int64_t kFineDetailGradFloorMmPerM = 50;
+// On a COARSE world the cap ENGAGES on a ramp over landform relief (the same
+// per-cell reliefMm the amplitude gate reads): off at Lo, full at Hi, so flat
+// classes keep their texture bit-for-bit while valley floors -- where every
+// hillside's water must exit -- stay protected. On a FINE world it engages
+// everywhere: the bake carves sub-metre structure and the client must stay
+// out of its way. MIRROR: amplifier.cpp's engagement-ramp block, which
+// carries the measured justification (the required allowance is NON-MONOTONE
+// in slope, so no constant floor works; a slope-local exemption dams the
+// catchment outlets).
+static const int64_t kDetailCapReliefLoMm = 3600;
+static const int64_t kDetailCapReliefHiMm = 7500;
 
 // --- primitives mirrored from core.h / hash.h ------------------------------
 
@@ -1588,6 +1626,64 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
                                  truncDiv(carrier.syMmPerPx * 1000, pxMm)) +
                           beddingMm(seed, xMm, yMm, baseMm);
     detailMm += truncDiv(addMm * rScale, 1024);
+
+    // v14: THE DETAIL GRADIENT CAP -- one scale-down over the whole summed
+    // detail, engaged on a slope ramp. MIRROR: Amplifier::evalSurface and the
+    // derivation blocks above amplifier.cpp kDetailGradCapKQ10. The nominal
+    // per-band gradients go through the SAME gates in the SAME order and
+    // integer form as the detail sum itself. Every operand here is
+    // non-negative -- gates, gradients, slope, ramp -- EXCEPT detailMm, so the
+    // final divide is on a routinely-negative numerator: truncDiv (mirrors
+    // C++ `/`), never floorDiv. The other divides use truncDiv on
+    // non-negative numerators, where it equals `/` exactly.
+    const int64_t gradLand = (pxMm <= kFineTierMaxPixelMm) ? kFineLandformGradMmPerM
+                                                           : kLandformGradMmPerM;
+    const int64_t gradMetre = (pxMm <= kFineTierMaxPixelMm) ? kFineMetreGradMmPerM
+                                                            : kMetreGradMmPerM;
+    const int64_t gradMicro = (pxMm <= kFineTierMaxPixelMm) ? kFineMicroGradMmPerM
+                                                            : kMicroGradMmPerM;
+    // v15: the rill's nominal across-slope gradient joins the budget. Mirrors
+    // amplifier.cpp's kRillGradMmPerM, which is kRillMaxAbsMm * 1000 /
+    // kRillAcrossMm = 300 * 1000 / 1600 and is static_asserted == 187 there
+    // precisely because it appears here as a literal. See the derivation block
+    // above kDetailGradCapKQ10 for why v14's omission was a leaking guarantee
+    // rather than a tuning choice. Every term is non-negative so truncDiv and
+    // floorDiv agree, but truncDiv is used to match the CPU's `/` exactly.
+    const int64_t detailGradMmPerM =
+        truncDiv(truncDiv(gradLand * rScale, 1024) * cScale, 1024) +
+        truncDiv(truncDiv(gradMetre * rScale, 1024) * cScaleMicro, 1024) +
+        truncDiv(gradMicro * cScaleMicro, 1024) +
+        truncDiv(kRillGradMmPerM * rScale, 1024);
+    int64_t engageQ10 = 1024;
+    if (pxMm > kFineTierMaxPixelMm)
+    {
+        if (reliefMm >= kDetailCapReliefHiMm)
+        {
+            engageQ10 = 1024;
+        }
+        else if (reliefMm > kDetailCapReliefLoMm)
+        {
+            engageQ10 = truncDiv((reliefMm - kDetailCapReliefLoMm) * 1024,
+                                 kDetailCapReliefHiMm - kDetailCapReliefLoMm);
+        }
+        else
+        {
+            engageQ10 = 0;
+        }
+    }
+    if (engageQ10 > 0)
+    {
+        const int64_t gradFloor = (pxMm <= kFineTierMaxPixelMm) ? kFineDetailGradFloorMmPerM
+                                                                : kDetailGradFloorMmPerM;
+        int64_t allowedGradMmPerM = truncDiv(kDetailGradCapKQ10 * slopeMmPerM, 1024);
+        if (allowedGradMmPerM < gradFloor) allowedGradMmPerM = gradFloor;
+        if (detailGradMmPerM > allowedGradMmPerM)
+        {
+            const int64_t capQ10 = truncDiv(allowedGradMmPerM * 1024, detailGradMmPerM);
+            const int64_t scaleQ10 = 1024 - truncDiv(engageQ10 * (1024 - capQ10), 1024);
+            detailMm = truncDiv(detailMm * scaleQ10, 1024);
+        }
+    }
 
     SurfaceEval s;
     s.px = px;

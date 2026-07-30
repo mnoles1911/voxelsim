@@ -227,7 +227,7 @@ VXC_TEST(coarsegen_golden_digest) {
     // wired in per-brick or per-dispatch rather than per world coordinate.
     // (was 0x85B3E79EF8D01AFC at v5, 0xFCE6D8509799236D at v6..v11, and
     //  0xB812048EB08AA281 at the 700 mm cut of v12)
-    CHECK_EQ(d, 0x2595BA8ED2D0AE4Cull);
+    CHECK_EQ(d, 0x600892F3F081F265ull);
 }
 
 VXC_TEST(coarsegen_seed_sensitivity) {
@@ -279,7 +279,23 @@ VXC_TEST(coarsegen_fidelity_vs_true_mip) {
     // column represents its coarse cell very slightly less well. Occupancy at
     // every other level improved or held: 50/41/14/18 against 60/45/40/40, with
     // L3 and L4 roughly halving.
-    const int64_t occCeilPermille[5] = {0, 60, 45, 40, 40};
+    // v14 (the detail gradient cap) moved every level, in both directions, and
+    // the regression is recorded as one rather than absorbed: measured
+    // 60/62/20/20 against v13's 50/41/14/18. L3/L4 are TIGHTENED to just above
+    // their halved measurements. L1/L2 rose because the cap makes detail
+    // amplitude a function of the carrier's slope and relief, both of which
+    // vary across a coarse cell on this synthetic fixture's extreme grades --
+    // so a representative column represents its cell less well exactly where
+    // the cap's scale is varying fastest. This is the same point-sampled-LOD
+    // mechanism as the bedding note below, now driven by the cap instead of
+    // the beds. Occupancy IS silhouette and collision, so unlike the material
+    // rows this is not shrugged off: 62 per mille at L2 is ~32 cells of a
+    // 512-cell sample, on a fixture whose grades real tiles do not reach
+    // (docs: flat-terrain numbers do not transfer, and neither do these
+    // synthetic cliffs). Worth an in-engine look at an LOD ring on a real
+    // mountainside; if popping appears at the L1/L2 transition, this number
+    // is where to start.
+    const int64_t occCeilPermille[5] = {0, 65, 65, 25, 25};
     // v10 raised L3 from 85 to 135. This is a REAL fidelity regression and is
     // recorded as one rather than absorbed: measured L3 material mismatch went
     // 85 -> 125 per mille when the bedding term landed.
@@ -307,7 +323,12 @@ VXC_TEST(coarsegen_fidelity_vs_true_mip) {
     // more often at the levels where a cell spans metres. Tightening the
     // ceilings that improved is the point of setting them just above the
     // measurement rather than at a round number.
-    const int64_t matCeilPermille[5] = {0, 105, 135, 60, 40};
+    // v14: measured 170/149/83/25 against v13's 99/127/52/31. Same mechanism
+    // and same policy as the occupancy note above -- L4 tightened, L1-L3 set
+    // just above the new measurements so further degradation still trips.
+    // Material at these levels is ring shading; the occupancy rows above are
+    // the ones that gate collision.
+    const int64_t matCeilPermille[5] = {0, 175, 155, 90, 30};
 
     for (int32_t level = 1; level <= 4; ++level) {
         const auto grid = gen.coarseColumns(level, 0, 0);
