@@ -481,8 +481,8 @@ constexpr Octave kDetailOctaves[] = {
     // terracing artifact this band exists to break up. Cutting the two octaves
     // that are actually too steep is strictly the better trade.
     {1600, 500},
-    {400, 90},
-    {200, 25},
+    {400, 165},
+    {200, 95},
 };
 constexpr uint32_t kDetailOctaveCount = sizeof(kDetailOctaves) / sizeof(kDetailOctaves[0]);
 
@@ -526,8 +526,8 @@ constexpr Octave kFineDetailOctaves[] = {
     // reading as long terrace runs at 10 cm voxels, and gating it on slope would
     // undo exactly that.
     {1600, 500},
-    {400, 90},
-    {200, 25},
+    {400, 165},
+    {200, 95},
 };
 constexpr uint32_t kFineDetailOctaveCount =
     sizeof(kFineDetailOctaves) / sizeof(kFineDetailOctaves[0]);
@@ -746,13 +746,13 @@ constexpr int64_t kFineMicroMaxMm =
 // the derivation. Any change here also moves worldgen output â€” bump
 // kWorldGenVersion and regenerate goldens.
 static_assert(!kAmpUnscaled || (kDetailOctaveCount == 5 && kLandformMaxMm == 3698 &&
-                                kMetreMaxMm == 499 && kMicroMaxMm == 113),
+                                kMetreMaxMm == 499 && kMicroMaxMm == 258),
               "kDetailOctaves changed. Amplifier::surfaceUpperBoundMm derives its "
               "detail allowance from the table, so the bound is still sound -- but "
               "re-read its derivation before updating these numbers, and remember an "
               "octave change is a worldgen change (bump kWorldGenVersion).");
 static_assert(!kAmpUnscaled || (kFineDetailOctaveCount == 4 && kFineLandformMaxMm == 899 &&
-                                kFineMetreMaxMm == 499 && kFineMicroMaxMm == 113),
+                                kFineMetreMaxMm == 499 && kFineMicroMaxMm == 258),
               "kFineDetailOctaves changed; same obligation as the coarse table above.");
 // The envelope TIGHTENS on a fine world -- because two synthesised landform
 // octaves were replaced by one. This is the plan's claim that the bound gets
@@ -885,8 +885,8 @@ constexpr int64_t kFineDetailMaxAtMaxSlopeMm =
 // direction the streaming layer feels as more effective trims; see coupling (5)
 // for why that is true even though the bound can no longer use the footprint's
 // own gate value.
-static_assert(!kAmpUnscaled || (kDetailMaxAtMaxSlopeMm == 15310), "detail allowance moved");
-static_assert(!kAmpUnscaled || (kFineDetailMaxAtMaxSlopeMm == 5513), "fine-tier detail allowance moved");
+static_assert(!kAmpUnscaled || (kDetailMaxAtMaxSlopeMm == 15509), "detail allowance moved");
+static_assert(!kAmpUnscaled || (kFineDetailMaxAtMaxSlopeMm == 5712), "fine-tier detail allowance moved");
 // The fine tier still buys a materially tighter envelope, but the margin is
 // 2.76x at v13 rather than 3.8x -- because the coarse side came down by 1.8x
 // and the fine side only by 1.4x, the two tiers' worst cases converged. Written
@@ -977,20 +977,21 @@ constexpr int64_t kFineMicroGradMmPerM =
 // pinned, so a table edit cannot happen without reading this block. These are
 // also the numbers hand-mirrored into worldgen.ush -- change them there too.
 static_assert(!kAmpUnscaled || (kLandformGradMmPerM == 272 && kMetreGradMmPerM == 312 &&
-                                kMicroGradMmPerM == 350),
+                                kMicroGradMmPerM == 887),
               "coarse ladder nominal gradient moved; re-mirror worldgen.ush and re-run the "
               "drainage calibration (client-detail-drainage-2026-07-29.txt) before shipping");
 static_assert(!kAmpUnscaled || (kFineLandformGradMmPerM == 281 && kFineMetreGradMmPerM == 312 &&
-                                kFineMicroGradMmPerM == 350),
+                                kFineMicroGradMmPerM == 887),
               "fine ladder nominal gradient moved; same obligation as the coarse trio");
 // The measurement doc's headline mechanism, pinned: the coarse ladder at full
-// gates carries ~2.3 of nominal gradient. If this stops being true the whole
+// gates carries ~3.0 of nominal gradient at v17 (was ~2.3 at v14-v16, before the
+// micro band was re-shaped to a Hurst-0.8 ladder). If this stops being true the whole
 // motivation for the cap should be re-read, not just the constant updated.
 constexpr int64_t kDetailGradCeilMmPerM =
     kLandformGradMmPerM * kReliefScaleMaxQ10 / 1024 * kCurvatureScaleMaxQ10 / 1024 +
     kMetreGradMmPerM * kReliefScaleMaxQ10 / 1024 * kCurvatureScaleMicroMaxQ10 / 1024 +
     kMicroGradMmPerM * kCurvatureScaleMicroMaxQ10 / 1024;
-static_assert(!kAmpUnscaled || kDetailGradCeilMmPerM == 2291,
+static_assert(!kAmpUnscaled || kDetailGradCeilMmPerM == 3029,
               "the post-gate ladder's worst-case nominal gradient moved");
 
 // k and the floors. Worldgen constants under kWorldGenVersion, NOT cvars -- a
@@ -1171,13 +1172,13 @@ static_assert(kLandformAbsMaxMm >= kLandformMaxMm && kMetreAbsMaxMm >= kMetreMax
               "the symmetric detail envelope must cover the positive-side maximum too, or "
               "surfaceLowerBoundMm is looser than surfaceUpperBoundMm in the wrong direction");
 static_assert(!kAmpUnscaled || (kLandformAbsMaxMm == 3700 && kMetreAbsMaxMm == 500 &&
-                                kMicroAbsMaxMm == 115),
+                                kMicroAbsMaxMm == 260),
               "detail amplitude sum moved; see (4)");
 static_assert(kFineLandformAbsMaxMm >= kFineLandformMaxMm &&
                   kFineMetreAbsMaxMm >= kFineMetreMaxMm && kFineMicroAbsMaxMm >= kFineMicroMaxMm,
               "same obligation as the coarse pair, on the fine-tier table");
 static_assert(!kAmpUnscaled || (kFineLandformAbsMaxMm == 900 && kFineMetreAbsMaxMm == 500 &&
-                                kFineMicroAbsMaxMm == 115),
+                                kFineMicroAbsMaxMm == 260),
               "fine-tier detail amplitude sum moved; see (4)");
 
 // (8) The cave family's carve depth, in the QUERYING COLUMN'S OWN depth space.
