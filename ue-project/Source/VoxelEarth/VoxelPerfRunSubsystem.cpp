@@ -106,34 +106,17 @@ void ArmExitWatchdog(double TimeoutSec)
 // MM-DD -- so a recorded leg can be replayed by pasting its own numbers back
 // into -VoxelTimeOfDay= / -VoxelDate= without arithmetic in between.
 //
-// THE MONTH TABLE IS A DUPLICATE, AND THAT IS A KNOWN DEBT. The original is
-// VoxelSkySubsystem.cpp:271-275 (kDaysBeforeMonth/kDaysInMonth), where it sits
-// in an anonymous namespace and is therefore unreachable from here. It is
-// copied rather than exported ONLY because VoxelSkySubsystem.cpp is under
-// concurrent edit as this lands; the correct end state is a
-// VoxelSky::MonthDayFromDayOfYear accessor beside GetTimeScale in
-// VoxelSkySubsystem.h and this copy deleted. If the two ever disagree the
-// symptom is a JSON date one day off from the one the sky log printed, which
-// is exactly the kind of small discrepancy that gets rationalised instead of
-// fixed -- so: REFERENCE YEAR 2000, A LEAP YEAR, February has 29 days.
-constexpr int32 kPerfDaysBeforeMonth[12] = {0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335};
-constexpr int32 kPerfDaysInMonth[12] = {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-
-void PerfMonthDayFromDayOfYear(int32 DayOfYear, int32& OutMonth, int32& OutDay)
-{
-	const int32 Doy = FMath::Clamp(DayOfYear, 0, 365);
-	for (int32 M = 0; M < 12; ++M)
-	{
-		if (Doy < kPerfDaysBeforeMonth[M] + kPerfDaysInMonth[M])
-		{
-			OutMonth = M + 1;
-			OutDay = Doy - kPerfDaysBeforeMonth[M] + 1;
-			return;
-		}
-	}
-	OutMonth = 12;
-	OutDay = Doy - kPerfDaysBeforeMonth[11] + 1;
-}
+// THE MONTH TABLE THAT USED TO BE COPIED HERE IS GONE. It was a deliberate,
+// documented duplicate of VoxelSkySubsystem.cpp's kDaysBeforeMonth/kDaysInMonth,
+// copied only because that file was under concurrent edit at the time, with a
+// note naming the correct end state: export it as VoxelSky::MonthDayFromDayOfYear
+// and delete the copy. That is now done -- the single definition lives in
+// VoxelSkySubsystem.cpp beside VoxelSky::kDaysBeforeMonth and is declared in
+// VoxelSkySubsystem.h -- so this file calls it instead. The failure it avoided:
+// two tables disagreeing shows up as a JSON date one day off from the one the sky
+// log printed, which is exactly the size of discrepancy that gets rationalised
+// rather than fixed. (REFERENCE YEAR 2000, A LEAP YEAR, February has 29 days --
+// stated at the definition, not here.)
 
 // Truncates rather than rounds, so 11:59.9 never prints as 12:00 -- a capture
 // labelled "noon" that was taken a minute either side of it is the sort of
@@ -755,7 +738,7 @@ void UVoxelPerfRunSubsystem::MaybeLogSky(float DeltaTime)
 	int32 Hour = 0, Minute = 0;
 	PerfClockFromLocalHours(S.LocalHours, Hour, Minute);
 	int32 Month = 1, Day = 1;
-	PerfMonthDayFromDayOfYear(S.DayOfYear, Month, Day);
+	VoxelSky::MonthDayFromDayOfYear(S.DayOfYear, Month, Day);
 
 	// lightUpdates is the count of times the rig's rotation was ACTUALLY
 	// written (voxel.Sky.ShadowUpdateHz caps it -- FVoxelSkyState:108-112), and
@@ -845,7 +828,7 @@ void UVoxelPerfRunSubsystem::FinishRun()
 	int32 SkyHour = 0, SkyMinute = 0;
 	PerfClockFromLocalHours(SkyState.LocalHours, SkyHour, SkyMinute);
 	int32 SkyMonth = 1, SkyDay = 1;
-	PerfMonthDayFromDayOfYear(SkyState.DayOfYear, SkyMonth, SkyDay);
+	VoxelSky::MonthDayFromDayOfYear(SkyState.DayOfYear, SkyMonth, SkyDay);
 
 	// Fixture-validity evidence, same shape and same purpose as the
 	// underground-fraction warning above: state the way this run could fail to

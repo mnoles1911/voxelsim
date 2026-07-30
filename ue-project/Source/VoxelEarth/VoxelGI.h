@@ -131,6 +131,38 @@ public:
 	// This is the cost side of lowering voxel.GI.MaxChunkRefreshesPerFrame.
 	void StartRelightTest(double RadiusUU);
 
+	// --- local lights (docs/sky-and-local-light-plan.md §2.2, phase L1) ------
+	//
+	// THE REGISTERED LIGHT LIST. A local light is a POSITION, a reach and a
+	// strength; registering one asks this subsystem to splat an un-crush scalar
+	// into VolumeLocal's A channel so that a deferred point light at the same
+	// place has a real BaseColor to illuminate. It is NOT a light source in its
+	// own right and it emits nothing: see the channel contract in the plan, and
+	// the composition contract in docs/lighting-weather-plan.md §2.3.
+	//
+	// The caller owns whatever renders (a UPointLightComponent, usually); this
+	// owns only the volume side. Returns an id for RemoveLocalLight, or 0 if the
+	// registration was refused.
+	int32 AddLocalLight(const FVector& PositionUU, double RadiusUU, float Intensity);
+	// Moves an already-registered light. Marks BOTH the old and the new
+	// neighbourhood dirty -- forgetting the old one leaves a lit ghost where the
+	// light used to be, which reads as a bug in the falloff rather than as a
+	// missing clear.
+	bool MoveLocalLight(int32 LightId, const FVector& PositionUU);
+	bool RemoveLocalLight(int32 LightId);
+	// Removes every registered light AND destroys the actors the console test
+	// command spawned for them. Both halves in one call on purpose: the L1 gate's
+	// torch-off arm has to remove the un-crush and the deferred light together, or
+	// it is measuring something else.
+	void ClearLocalLights();
+	int32 NumLocalLights() const { return LocalLights.Num(); }
+
+	// voxel.GI.LocalLightTest. Places a torch at the camera: registers a local
+	// light and (unless voxel.GI.LocalLightDeferred is 0) spawns the
+	// UPointLightComponent that actually emits. Public because the console command
+	// reaches it through the subsystem, as StartDigTest and StartRelightTest do.
+	void PlaceLocalLightTestAtCamera(double RadiusUU, float Intensity);
+
 	// Read access for the scene proxy. Never null once Initialize has run.
 	const FVoxelLightField& GetField() const { return *Field; }
 
@@ -140,6 +172,11 @@ public:
 	FVector GetFieldCentreUU() const { return FieldCentreUU; }
 
 private:
+	// Defined with the members below (it is data, and it belongs beside the array
+	// that holds it); forward-declared here only so the splat helpers can take it
+	// by reference.
+	struct FVoxelLocalLight;
+
 	void ClearAllState();
 	void RunConvergenceHarness();
 	void MarkBrickNeighbourhoodDirty(const FIntVector& BrickCoord, int32 RadiusBricks);
@@ -175,6 +212,56 @@ private:
 	// Zeroes, re-encodes from the field, and uploads texel Z rows [Z0, Z1) of the
 	// volume, addressed by the STAGING origin. Game thread, one FReadScope.
 	void RestageVolumeZRange(int32 Z0, int32 Z1);
+
+	// --- local light splat (docs/sky-and-local-light-plan.md §2.2) -----------
+	//
+	// Recomputes VolumeLocal's A channel for one box of LOCAL texels from the
+	// whole registered light list, writes the CPU mirror and uploads the box.
+	//
+	// FROM SCRATCH, over every light that overlaps the box, rather than
+	// incrementally per light. A is the MAX over all local sources, and max is not
+	// invertible under removal -- the same reason RebuildCoarse is a full rebuild
+	// -- so "subtract the light that moved" is not expressible. Recomputing also
+	// makes every dirty box idempotent, which is what lets the re-centre restage
+	// double-cover a boundary texel without consequence.
+	void SplatLocalBox(const FIntVector& Min, const FIntVector& Size);
+	// Uploads at most Budget dirty boxes (Budget < 0 = the whole queue).
+	int32 DrainLocalSplats(int32 Budget);
+	// Pushes the texel box a light covers onto the dirty queue. Clipped to the
+	// volume; a no-op when the light is entirely outside it.
+	void MarkLocalLightDirty(const FVector& PositionUU, double RadiusUU);
+	// Whole volume, as LocalDim/8 Z slabs rather than one box, so the drain budget
+	// still bounds the work. Used when the feature is switched on, when the queue
+	// overflows, and when the volume's origin commits.
+	void MarkLocalVolumeDirty();
+	// A brick was re-voxelized or evicted: any light whose reach covers it has a
+	// stale occlusion march. This is what makes digging through a wall let the
+	// torchlight follow, and what clears the "not resident = not an occluder"
+	// assumption in FVoxelLightField::LocalLightTransmittance once the brick
+	// actually arrives.
+	void MarkLocalLightsDirtyForBrick(const FIntVector& BrickCoord);
+	// The un-crush a point receives from every registered light: inverse-square
+	// falloff x the light field's line-march occlusion, maxed over lights, 0..1.
+	// Read scope supplied by the caller because the splat evaluates thousands of
+	// these under one lock.
+	float LocalUnCrushAt(const FVector& PointUU, const FVoxelLightField::FReadScope& Read) const;
+	// One light's contribution at one point. THE single definition of the falloff
+	// and the occlusion: the splat calls it per texel and voxel.GI.VolumeCheck's
+	// reference arm calls it per tap, so the two cannot drift apart -- a harness
+	// with its own copy of the formula compares a thing against itself.
+	float LocalLightContributionAt(const FVoxelLocalLight& Light, const FVector& PointUU,
+	                              const FVoxelLightField::FReadScope& Read) const;
+	// Restages the LOCAL texels that lie in main-volume texel rows [Z0, Z1).
+	// Called from RestageVolumeZRange so VolumeLocal moves in the SAME rows as its
+	// siblings and commits on the SAME frame: a volume that re-centred
+	// independently would leave torch light displaced by up to the dead zone
+	// (2560 UU) mid-flight, which is §5 item 7.
+	void RestageLocalZRange(int32 Z0, int32 Z1);
+	// Local texel edge, UU. The two volumes cover the same box, so this is
+	// VolumeDim*CellSize / VolumeLocalDim -- 80 UU at the defaults. Derived, never
+	// a second hardcoded constant, because the box identity is what makes the
+	// factory able to reuse Interpolants.GIUVW.
+	double LocalTexelUU() const;
 	// Runs any in-flight re-centre to completion and drains the whole upload
 	// queue, so VolumeShadow and the GPU texture agree and both are addressed by
 	// the committed origin. The equivalence harness needs that; nothing else does.
@@ -260,6 +347,54 @@ private:
 	TArray<uint8> VolumeShadow;    // (+X,+Y,+Z,v)
 	TArray<uint8> VolumeShadowNeg; // (-X,-Y,-Z,v)
 
+	// CPU mirror of VolumeLocal, LocalDim^3 * 4 -- 3.4 MB at the default 96.
+	// Same job as the two above (voxel.GI.VolumeCheck has to compare against the
+	// bytes that were actually uploaded, not against a re-encode) and the same
+	// RGBA8 stride, but sized from VolumeLocalDim, NOT from VolumeDim: the two
+	// volumes cover the same box at different resolutions, and copying the
+	// sibling's Dim^3*4 would allocate 8x too much at the defaults and index
+	// wrongly at every other pair of dims. Only A is written in L1.
+	TArray<uint8> VolumeLocalShadow;
+	int32 VolumeLocalDim = 0;
+	// Registered local lights. Tiny by construction (a handful), so every lookup
+	// here is a linear scan -- deliberately, because a map keyed by id would add
+	// bookkeeping to something the splat iterates in full anyway.
+	struct FVoxelLocalLight
+	{
+		FVector PositionUU = FVector::ZeroVector;
+		double RadiusUU = 1000.0;
+		// Peak un-crush at the light's core, 0..1. NOT an intensity in any
+		// radiometric unit -- the light's actual brightness lives on the deferred
+		// light, per §2.3. 1.0 means "a surface here should be lit against its full
+		// albedo", which is the un-crushed state, not a bright one.
+		float Intensity = 1.0f;
+		int32 Id = 0;
+		// Only set for lights the console test command spawned, so ClearLocalLights
+		// can take the deferred half away with the un-crush half. A real caller
+		// registers a position and owns its own component.
+		TWeakObjectPtr<AActor> TestActor;
+	};
+	TArray<FVoxelLocalLight> LocalLights;
+	int32 NextLocalLightId = 1;
+	struct FVoxelLocalSplatBox
+	{
+		FIntVector Min = FIntVector::ZeroValue;
+		FIntVector Size = FIntVector::ZeroValue;
+	};
+	TArray<FVoxelLocalSplatBox> LocalSplatQueue;
+	int32 LocalBoxesSplatted = 0;
+	// Texels that actually received a non-zero un-crush, i.e. the ones that paid
+	// for an occlusion march AND survived it. Reported beside the box count because
+	// the two together are what tell "the splat ran and found geometry" from "the
+	// splat ran into a wall" -- the same reason the volume driver reports bricks
+	// AND runs.
+	int64 LocalTexelsLit = 0;
+	double LocalSplatMs = 0.0;
+	// Last resolved value of voxel.GI.LocalLights, so the switch's own value is
+	// logged when it moves and the feature can re-arm (allocate, splat everything)
+	// on the way up.
+	bool bLocalLightsActive = false;
+
 	// World UU of texel (0,0,0)'s CELL ORIGIN (not its centre), snapped to a
 	// whole 320 UU brick so the texel lattice coincides with the field's cell
 	// lattice and no sample ever resamples. Texel i is world
@@ -290,6 +425,12 @@ private:
 	bool bVolumeCheckDone = false;
 	bool bLoggedNoPool = false;
 	bool bVolumeAllocated = false;
+	// VolumeLocal is allocated lazily and INDEPENDENTLY, because
+	// voxel.GI.LocalLights ships off and a 3.4 MB texture nothing samples is a
+	// cost with no consumer. Tracked separately from bVolumeAllocated so turning
+	// the switch on mid-session re-enters EnsureAllocated_RenderThread exactly
+	// once.
+	bool bLocalVolumeAllocated = false;
 	// Bricks the volume driver pushed this frame, for the voxel.GI.Debug 1 line.
 	int32 VolumeUploadedThisFrame = 0;
 

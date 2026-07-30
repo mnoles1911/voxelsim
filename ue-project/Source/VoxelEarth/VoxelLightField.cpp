@@ -492,6 +492,99 @@ bool FVoxelLightField::SampleIrradianceAtProbe(const FVector& P, const float (&D
 	return true;
 }
 
+// --- local light occlusion --------------------------------------------------
+
+float FVoxelLightField::LocalLightTransmittance(const FVector& FromUU, const FVector& ToUU) const
+{
+	FRWScopeLock ScopeLock(Lock, SLT_ReadOnly);
+	return LocalLightTransmittanceUnlocked(FromUU, ToUU);
+}
+
+float FVoxelLightField::LocalLightTransmittanceUnlocked(const FVector& FromUU, const FVector& ToUU) const
+{
+	const FVector Delta = ToUU - FromUU;
+	const double DistUU = Delta.Size();
+	// Same cell as the light, or closer: nothing can be between them, and a march
+	// with fewer than two interior samples would only ever test the endpoints,
+	// which are both deliberately excluded below.
+	if (DistUU <= double(VoxelLF::CellSizeUU))
+	{
+		return 1.f;
+	}
+
+	// LEVEL 0 ONLY, and that is not an optimisation choice.
+	//
+	// The mip pyramid is MAX-aggregated on purpose -- "erring toward too dark is
+	// the correct side to be wrong on" for sky visibility (see the header). For a
+	// local light that same aggregation is fatal rather than conservative: a
+	// level-1 tap reports the whole 80 UU parent solid because any one of its
+	// eight 40 UU children is, so a torch standing next to a wall would occlude
+	// itself and light nothing at all. So this walks the finest level, one sample
+	// per cell, and pays for it with an early-out on the first hit.
+	//
+	// COST. Steps <= radius/40 UU, so a 10 m light is <= 25 samples, and each is an
+	// array index plus a brick-map probe that is memoised across steps. A whole
+	// 10 m torch is ~13^3 texels at the default LocalVolumeDim, i.e. ~2.2k marches
+	// of <= 25 steps with the great majority terminating early -- tens of
+	// microseconds of game thread, which is the thread that is idle ~75% of the
+	// frame (docs/backlog.md §0.1). It runs when a light or the geometry under it
+	// CHANGES, not per frame.
+	static constexpr int32 kMaxSteps = 256; // 10.24 km; a bound, never reached in practice
+	const int32 Steps = FMath::Min(kMaxSteps,
+	                               FMath::CeilToInt(DistUU / double(VoxelLF::CellSizeUU)));
+	const FVector Step = Delta / double(Steps);
+
+	// One brick-map lookup memoised across steps, exactly as
+	// SampleIrradianceAtProbe does it: a march crosses a handful of bricks, and a
+	// TMap probe per step would dominate the walk.
+	FIntVector CachedKey(MAX_int32, MAX_int32, MAX_int32);
+	const FVoxelLFBrick* CachedBrick = nullptr;
+
+	// BOTH ENDS EXCLUDED, and the far end matters most.
+	//
+	// The light's own cell is not an occluder. Neither is the destination cell: the
+	// splat writes one 80 UU texel whose centre routinely lands INSIDE the very
+	// surface cell it is meant to light -- level-0 opacity is a SURFACE
+	// voxelization, so the wall's own face cell is solid -- and counting that as a
+	// blocker would leave every wall facing the torch dark, i.e. the feature
+	// failing at precisely the geometry it exists for.
+	for (int32 I = 1; I < Steps; ++I)
+	{
+		const FVector P = FromUU + Step * double(I);
+		const FIntVector Key = WorldToBrick(P);
+		if (Key != CachedKey)
+		{
+			CachedKey = Key;
+			CachedBrick = FindBrick(Key);
+		}
+		if (!CachedBrick)
+		{
+			// A brick that is not resident is NOT treated as an occluder. Erring
+			// the other way would put a hard dark wedge wherever the field has not
+			// streamed in yet and leave it there, because the splat is event-driven
+			// rather than per-frame: the wedge would only clear if something else
+			// happened to re-dirty that light. The caller re-splats when a brick is
+			// voxelized, which is what closes this properly.
+			continue;
+		}
+		const int32 IX = FMath::Clamp(int32((P.X - double(Key.X) * VoxelLF::BrickEdgeUU) / VoxelLF::CellSizeUU), 0, 7);
+		const int32 IY = FMath::Clamp(int32((P.Y - double(Key.Y) * VoxelLF::BrickEdgeUU) / VoxelLF::CellSizeUU), 0, 7);
+		const int32 IZ = FMath::Clamp(int32((P.Z - double(Key.Z) * VoxelLF::BrickEdgeUU) / VoxelLF::CellSizeUU), 0, 7);
+		// Level 0 opacity is 0 or 255 (VoxelizeChunk writes a face or it does not),
+		// so this is a binary test and the >= 128 is only defensive. The resulting
+		// shadow is therefore hard at the splat's own resolution and softened only
+		// by the volume's trilinear filter; making it genuinely soft, and dealing
+		// with the bilinear smear through a thin wall, is L2's wall-leak gate
+		// (docs/sky-and-local-light-plan.md §5 item 8) and not something to
+		// pre-empt here.
+		if (CachedBrick->Opacity[VoxelLF::CellIndex(IX, IY, IZ)] >= 128)
+		{
+			return 0.f;
+		}
+	}
+	return 1.f;
+}
+
 // --- GPU volume encode -----------------------------------------------------
 
 bool FVoxelLightField::EncodeBrickTexels(const FIntVector& Key, uint8* OutPos, uint8* OutNeg) const

@@ -190,3 +190,136 @@ The EXR path that was flagged unproven WORKS: starmap_2020_4k.exr imports to a
   at the right altitude -- only the constellations are reversed), and whether any
   constant RA offset is needed. voxel.Sky.StarUDirection and
   voxel.Sky.StarRotationOffsetTurns exist for both, no rebuild required.
+
+
+6. THE SKY LIGHTING THE GROUND (S1 + S2), 2026-07-29 late
+---------------------------------------------------------
+The star dome could not light anything: the SkyLight's real-time capture renders
+only the atmosphere, clouds, height fog and meshes whose material sets bIsSky,
+and M_NightSky sets is_sky False deliberately. Fixed by adding a canonical IsSky
+dome (M_SkyAtmosphereDome) that the capture CAN see, with the star branch behind
+a ReflectionCapturePassSwitch so stars reach the capture and never the main view.
+
+S1 GATE -- is the IsSky dome a faithful stand-in for the atmosphere pass?
+Once any IsSky mesh exists, View.bSceneHasSkyMaterial goes true and the
+atmosphere's full-screen pass stops painting sky pixels, so the dome must match
+it or the sky breaks. 8 hours x 2 arms, one process, same frozen epoch and pose,
+only voxel.Sky.AtmosphereDome changing:
+
+  hour    dome ON    dome OFF   |delta|
+  00h00    27.200      27.139     0.061
+  03h00    26.537      26.539     0.002
+  06h00    35.835      35.864     0.029
+  09h00   120.595     120.625     0.030
+  12h00   135.346     135.364     0.018
+  15h00   126.584     126.575     0.009
+  18h00    54.788      54.820     0.032
+  21h00    10.382      10.383     0.001
+
+  Worst 0.061/255 against a 2.0 gate -- PASS with 33x margin. The three twilight
+  rungs are deliberate: twilight is where the last three defects in this system
+  lived.
+
+S2 GATE -- does the Milky Way actually light the ground?
+Winter 12-21, paired arms on voxel.Sky.StarAmbientGain, 1.0 vs 0.
+Ground crop is the bottom 45% of the frame.
+
+  hour     moon        ground gain1   ground gain0   frame gain1  frame gain0
+  00h00    76% up        12.717          7.826         20.118       17.389
+  03h00    75% up        20.013         15.568         28.032       25.675
+  06h00    64% up        17.861         12.937         27.702       25.116
+  09h00    down          54.322         54.472         76.965       77.038
+  12h00    down         101.866        101.888        116.834      116.847
+  15h00    down          61.367         61.384         81.470       81.479
+  18h00    BELOW HORIZON  5.756          0.050          4.887        1.675
+  21h00    BELOW HORIZON  4.415          0.050          8.061        5.583
+
+  All three conditions hold, so gain 1.0 is ADOPTED as the default:
+  * The two moonless rungs leave black: 0.050 -> 5.756 and 0.050 -> 4.415. Those
+    are the rungs section 5 recorded as correct-but-unplayable; they are now a
+    faint starlit landscape, with the snowfield reading brighter than rock as
+    higher albedo under the same ambient should.
+  * Ordering survives: moonless (4.4-5.8) stays strictly BELOW moonlit
+    (12.7-20.0). A starlit night must not out-read a moonlit one.
+  * Daylight is unchanged to 0.02/255 (101.888 -> 101.866). The star branch
+    exists only in the capture pass, so it cannot leak into the main view -- this
+    is the check that proves the ReflectionCapturePassSwitch is doing its job,
+    and a failure here would look like "stars at noon".
+
+WHY THIS UPDATES ITSELF. The light comes from a per-frame capture of the dome
+material, not from a baked cubemap. Change T_SkyStarmap, the gain, or the graph
+and the ambient light on the terrain follows within a few frames with no re-bake.
+The rejected alternative -- prefiltering the EXR into SH offline -- would have
+needed a re-bake on every art change. The moon is deliberately the exception: its
+LIGHT is a directional light scaled by illuminated fraction, and its DISC art is
+kept out of the capture so it cannot light the world twice. The engine enforces
+the same for the sun disc (MaterialTemplate.ush:2346-2348, "avoid double
+specular").
+
+
+7. COUPLING THE TWO STAR GAINS, AND A GATE THAT IS NOT READY
+------------------------------------------------------------
+Concern raised: the Milky Way looks very bright against a much darker ground --
+is that realistic? It is, and here is the yardstick. For a Lambertian surface
+under a sky of luminance L_sky the illuminance is E = pi*L_sky and the surface
+reads rho*E/pi, so L_ground / L_sky == ALBEDO. Geometry, units and exposure all
+cancel in the ratio.
+
+Measured on a starlit capture (22:00 on 03-20, core high, +3 EV for visibility
+which cancels), proper sRGB EOTF, clipped pixels excluded, Y = 0.2126R + 0.7152G
++ 0.0722B:
+
+  whole visible sky   0.14342 linear
+  Milky Way core      0.27833
+  snowfield ground    0.11325
+  snow / sky          0.790     <- snow's albedo is 0.75-0.85
+
+So the ground receives light in correct proportion to the sky casting it. The
+"bright sky, dark ground" impression is because most of the frame is water and
+dark vegetation at 0.03-0.10 albedo, which are CORRECTLY 10-30x darker than the
+sky. What the frame resembles is a long-exposure photograph, which is what
+essentially all Milky Way imagery is; to the naked eye the band is a faint smudge
+and the ground is unnavigable.
+
+A PREMISE THAT WAS WRONG, AND THE BUG IT NEARLY CAUSED. The concern was framed as
+"voxel.Sky.StarGain and voxel.Sky.StarAmbientGain are independent knobs and
+nothing couples them". They are not independent. BOTH domes multiply the same MPC
+scalar StarBrightness, which the subsystem writes as sunriseFade * StarGain:
+
+  visible (create_sky_material.py:628)                StarMap * StarBrightness * fade
+  capture (create_sky_atmosphere_dome_material.py:286) StarMap * StarBrightness * fade * StarAmbientGain
+
+so StarAmbientGain is a pure RATIO with no StarGain left in it -- StarGain already
+reaches the ambient term linearly. The proposed fix, deriving
+StarAmbientGain = StarGain / 0.15, would have multiplied StarGain in a SECOND
+time and made ambient starlight QUADRATIC in it: at StarGain 0.30 stars would look
+2x brighter and light the world 4x harder. It would have been bit-identical at the
+shipped defaults, so no gate would have caught it.
+
+What was actually unenforced is that StarAmbientGain was a free artistic knob
+whose correct value is a measured constant. It now defaults to a negative sentinel
+meaning "derive from kStarAmbientCalibration" (1.0, measured at StarGain 0.15),
+with any value >= 0 taken as an explicit override so the S2 A/B still works. The
+resolved value AND whether it was derived or overridden are both logged, because
+with a sentinel default echoing the cvar would print -1 for a frame that rendered
+at 1.0 -- the one reading that says "starlight was off".
+
+  Gate: explicit 1.0 vs derived, one process, same epoch and pose
+    sky    mean 110.8418 vs 110.8423
+    ground mean  37.7295 vs  37.7558
+    whole frame  72.05166 vs 72.06588   delta 0.014 / 255
+
+  PASS. Note "bit-identical" was the wrong bar and is not achievable here: per-
+  pixel deltas reach 29 with 3-7% of pixels differing, because TSR resolves a
+  point-star field slightly differently between two frames of identical input.
+  Mean luma is the right instrument, and 0.014 against S1's 2.0 standard is a
+  140x margin.
+
+tools/sky-albedo-check.py IS NOT A GATE YET, and its header says so. Two runs at
+identical pose, date, hour, exposure and resolved gain gave ratio 0.7928 (snow
+mask 8.39% of frame) and 0.6446 (12.62%) -- a ~20% spread on a quantity tested
+against a +/-6% band, with the mask growing by half. It is partly measuring frame
+CONTENT, most likely differing terrain streaming state, so a FAIL from it does not
+currently distinguish a drifted calibration from a differently-streamed run. It
+needs a deterministic reference surface: a fixture-spawned quad of known albedo at
+a known screen rectangle, or a fixed pixel window gated on streaming convergence.

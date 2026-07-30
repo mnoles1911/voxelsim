@@ -21,6 +21,25 @@ Requires Tools/import_sky_textures.py to have run first (it produces
 /Game/Voxel/T_SkyStarmap and /Game/Voxel/T_MoonColor). T_MoonDisplacement is
 NOT used here -- see "WHAT THIS DOES NOT DO" below.
 
+THIS SCRIPT IS THE SOLE AUTHOR OF /Game/Voxel/MPC_VoxelSky, AND IT DELETES AND
+RECREATES THE ASSET EVERY RUN (create_collection below). That makes the ordering
+between the two sky-material generators mandatory, not stylistic:
+
+    1. Tools/create_sky_material.py                (MPC_VoxelSky + M_NightSky)
+    2. Tools/create_sky_atmosphere_dome_material.py (M_SkyAtmosphereDome)
+
+Run them the other way round -- or re-run only (1) after (2) -- and every
+CollectionParameter in M_SkyAtmosphereDome unbinds. An unresolved collection
+parameter does not fail to compile, it compiles to a CONSTANT
+(MaterialExpressions.cpp:17179-17193), so the symptom is a plausible-looking sky
+with frozen stars in the SkyLight capture and no diagnostic anywhere. Both
+scripts re-check every binding by name against the collection as read back, so
+running (2) after a stale (1) raises immediately instead.
+
+The star-map subgraph itself lives in Tools/sky_star_graph.py, shared with the
+dome material. See that file for the horizon->equatorial derivation, the equirect
+UV and the seam fix; the sections that used to be repeated here now point at it.
+
 
 ================================================================================
 DOMAIN / BLEND / SHADING MODEL, AND WHY
@@ -176,6 +195,23 @@ another agent's task, and this material has to be verifiable before it lands.
                                 peak is "an artistic number ~10 stops above the
                                 real 1:400000 lux ratio". default 0.02
 
+    -- added for M_SkyAtmosphereDome, NOT read by M_NightSky ------------------
+    StarAmbientGain     scalar  gain on the star branch of M_SkyAtmosphereDome's
+                                REFLECTION-pass output -- i.e. how much starlight
+                                the SkyLight's real-time capture integrates into
+                                the world's ambient term. DEFAULT 0.0, and the
+                                zero is the whole point: phase S1 of
+                                docs/sky-and-local-light-plan.md ships the star
+                                branch present in the graph but gained to zero,
+                                so that S1's only claim is "the IsSky dome is a
+                                pixel-faithful stand-in for today's atmosphere
+                                pass". S2 turns it on via voxel.Sky.StarAmbientGain
+                                (which overwrites this default every frame, like
+                                every other scalar here). It is declared HERE
+                                rather than by the dome script because this script
+                                deletes and recreates the collection -- see the
+                                ordering note at the top of this file.
+
 STAR/MOON BRIGHTNESS DEFAULTS ARE UNCALIBRATED AND DELIBERATELY ON THE HIGH
 SIDE. The NASA EXR carries no calibrated radiance and this project pins exposure
 by curve (voxel.Sky.ExposureMode, ~+15.6 EV100 at night), so the correct gain is
@@ -191,64 +227,17 @@ material regeneration.
 THE MATH
 ================================================================================
 
-VIEW DIRECTION. d = normalize(-CameraVectorWS). CameraVectorWS points from the
-shaded pixel TOWARD the camera, so its negation is the direction of gaze. In this
-project's world frame that is d = (north, east, up) directly -- VoxelEphemeris.h:
-44-48 fixes X=north, Y=east, Z=up and defines every ephemeris direction as
-(cos(Alt)cos(Az), cos(Alt)sin(Az), sin(Alt)) in exactly that frame. So
-SunDirection and MoonDirection need no transform at all on the way in; they are
-already world-space unit vectors and can be dotted against d as-is.
+VIEW DIRECTION, HORIZON -> EQUATORIAL, EQUIRECT UV AND THE SEAM FIX ALL MOVED TO
+Tools/sky_star_graph.py, whose module docstring is now the only copy of that
+derivation and whose build_view_direction / build_star_uv / sample_starmap are
+the only graph that expresses it. M_SkyAtmosphereDome samples the same star map
+at the same sidereal rotation, and two copies of an alt/az -> RA/dec rotation
+that disagree would light the world from a sky that is not the sky on screen --
+with both still sharp, both still rotating at the right rate, and nothing in a
+frame saying so. VoxelClimateProbe.h is the standing record of what duplicated
+derivations cost here.
 
-HORIZON -> EQUATORIAL (the star map is in celestial coordinates, so this is the
-step that makes the sky rotate correctly instead of being painted on the inside
-of the dome). With phi = ObserverLatitude and d = (dN, dE, dU):
-
-    Ex = dU*cos(phi) - dN*sin(phi)      == cos(dec) * cos(H)
-    Ey = -dE                            == cos(dec) * sin(H)
-    Ez = dN*cos(phi) + dU*sin(phi)      == sin(dec)
-
-That is the standard alt/az -> hour-angle/declination rotation written
-rectangularly (it is a single rotation by 90-phi about the east axis, which is
-what puts the celestial pole at altitude phi where it belongs). Two checks that
-pin the signs:
-
-    * north celestial pole: it must sit at altitude phi, azimuth 0, i.e.
-      d = (cos phi, 0, sin phi). Then Ez = cos^2 + sin^2 = 1 (dec = +90) and
-      Ex = sin(phi)cos(phi) - cos(phi)sin(phi) = 0. Correct.
-    * observer on the equator (phi = 0) looking at the zenith, d = (0,0,1):
-      Ex = 1, Ez = 0, so dec = 0 and H = 0 -- the celestial equator crossing the
-      meridian. Correct.
-
-    dec = asin(clamp(Ez, -1, 1))
-    H   = atan2(Ey, Ex)                 hour angle, increasing westward
-    RA  = LST - H
-
-EQUIRECT UV.
-
-    v = 0.5 - dec/pi              V=0 is the top row = dec +90 = north pole
-    u = StarRotation + StarUDirection * (-H / 2pi)
-
-RA/2pi appears only as (LST - H)/2pi, and LST/2pi is a constant per frame -- so
-it is folded wholesale into StarRotation. That is what makes StarRotation "a
-rotation the game supplies": one scalar in turns carrying local sidereal time
-plus the map's RA origin offset, with no second knob to keep in sync.
-
-THE SEAM. atan2's branch cut (Ey = 0, Ex < 0) makes u jump by exactly 1. The
-FETCH is unharmed -- import_sky_textures.py sets TA_WRAP in U precisely because
-right ascension wraps -- but the hardware's mip selection is not: ddx(u) at the
-seam column is ~1.0 instead of ~1e-4, the sampler picks the lowest mip, and the
-result is a permanent blurred meridian across the sky that shimmers as the view
-turns. The fix is to sample with EXPLICIT derivatives (TMVM_Derivative) and
-wrap-correct the U component of each:
-
-    dudx' = dudx - round(dudx)          a +/-1 jump maps back to ~0
-
-which is exact everywhere except within a pixel or two of the celestial poles,
-where du/dx legitimately exceeds 0.5 because all meridians converge there. Near
-the poles the correction can pick a slightly wrong mip; the visible consequence
-is a small soft spot exactly at the pole, which is the benign end of equirect's
-inherent pole singularity and is the reason mips were enabled on this texture in
-the first place (import_sky_textures.py:22-26).
+Everything below is M_NightSky's alone.
 
 MOON DISC. Small-angle-safe throughout: comparing cos(theta) against
 cos(0.26 deg) would spend the whole disc inside the last ~1e-5 of the float range
@@ -412,24 +401,28 @@ import uuid
 
 import unreal
 
-# Shared GraphBuilder, same directory. A -run=pythonscript commandlet does not
-# put the script's own directory on sys.path, so add it explicitly (same as
+# Shared sky graph, same directory. A -run=pythonscript commandlet does not put
+# the script's own directory on sys.path, so add it explicitly (same as
 # create_voxel_material.py:56-58).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from terrain_material_common import GraphBuilder, load_texture  # noqa: E402
+from sky_star_graph import (  # noqa: E402
+    COLLECTION_NAME,
+    COLLECTION_PATH,
+    DEG2RAD,
+    PACKAGE_PATH,
+    PI,
+    TWO_PI,
+    SkyGraphBuilder,
+    build_horizon_fade,
+    build_star_uv,
+    build_view_direction,
+    sample_starmap,
+)
 
-PACKAGE_PATH = "/Game/Voxel"
 MATERIAL_NAME = "M_NightSky"
-COLLECTION_NAME = "MPC_VoxelSky"
 MATERIAL_PATH = PACKAGE_PATH + "/" + MATERIAL_NAME
-COLLECTION_PATH = PACKAGE_PATH + "/" + COLLECTION_NAME
 
-STARMAP_TEXTURE = "/Game/Voxel/T_SkyStarmap.T_SkyStarmap"
 MOON_COLOR_TEXTURE = "/Game/Voxel/T_MoonColor.T_MoonColor"
-
-PI = 3.14159265358979
-TWO_PI = 2.0 * PI
-DEG2RAD = PI / 180.0
 
 # Fixed namespace so re-running this script produces the SAME parameter GUIDs.
 # FCollectionParameterBase::Id is what materials store to survive a parameter
@@ -451,6 +444,11 @@ SCALAR_PARAMS = [
     ("MoonEdgeSoftness", 0.12),
     ("MoonTerminatorSoftness", 0.05),
     ("MoonEarthshine", 0.02),
+    # Read by M_SkyAtmosphereDome, not by M_NightSky. Default 0.0 -- S1 ships the
+    # capture's star branch present but gained to zero. See the parameter table in
+    # the module docstring, and the ordering note at the top of this file for why
+    # it is declared here rather than by the dome generator.
+    ("StarAmbientGain", 0.0),
 ]
 
 # (name, r, g, b, a)
@@ -614,238 +612,18 @@ def create_collection():
     return collection
 
 
-class SkyGraphBuilder(GraphBuilder):
-    """GraphBuilder plus the nodes this graph needs.
-
-    link() is overridden only to widen the error message: when a connect fails
-    the usual cause is a pin NAME, and the fastest fix is seeing the list of
-    names the node actually has. The failure is still a raise, never a warn --
-    create_clipmap_material.py:3-5.
-    """
-
-    def __init__(self, material, collection):
-        GraphBuilder.__init__(self, material)
-        self.collection = collection
-        self._mpc_names = None  # lazily read back from the MPC, see collection_param
-
-    def link(self, src, src_out, dst, dst_in):
-        if not self.mel.connect_material_expressions(src, src_out, dst, dst_in):
-            try:
-                names = [str(n) for n in self.mel.get_material_expression_input_names(dst)]
-            except Exception:  # noqa: BLE001 -- diagnostics only, the raise below stands
-                names = ["<could not enumerate>"]
-            raise RuntimeError(
-                "connect %s.%s -> %s.%s failed; %s inputs are %s"
-                % (type(src).__name__, src_out or "<default>",
-                   type(dst).__name__, dst_in or "<default>",
-                   type(dst).__name__, names))
-
-    # --- parameters ---------------------------------------------------------
-
-    def collection_param(self, name):
-        """A CollectionParameter bound to MPC_VoxelSky, with the binding CHECKED.
-
-        Order is load-bearing: Collection must be set before ParameterName,
-        because PostEditChangeProperty resolves ParameterId from
-        Collection->GetParameterId(ParameterName) every time either changes
-        (MaterialExpressions.cpp:17163-17177) and a null Collection blanks it.
-        """
-        # The binding is checked by NAME MEMBERSHIP, not by reading ParameterId
-        # back. ParameterId is not exposed to Python on UE 5.8 ("Failed to find
-        # property 'parameter_id'", measured 2026-07-29) and neither is
-        # FCollectionParameterBase::Id, so the guid route is closed.
-        #
-        # Membership is the stronger check anyway, and it is complete. The only
-        # way a CollectionParameter fails to resolve is a name this script did
-        # not put on the MPC -- and this script authored the MPC, so it knows the
-        # full set. Comparing against the collection as READ BACK (not against
-        # the SCALAR_PARAMS/VECTOR_PARAMS literals) also catches the case where
-        # the MPC write silently dropped a parameter.
-        #
-        # This matters because an unresolved collection parameter does NOT fail
-        # to compile: UMaterialExpressionCollectionParameter::Compile emits a
-        # CONSTANT instead. A typo here would ship a black sky with no error.
-        if self._mpc_names is None:
-            self._mpc_names = set()
-            for prop in ("scalar_parameters", "vector_parameters"):
-                for p in self.collection.get_editor_property(prop):
-                    self._mpc_names.add(str(p.get_editor_property("parameter_name")))
-        if name not in self._mpc_names:
-            raise RuntimeError(
-                "CollectionParameter %r is not on %s. Present: %s. An unresolved "
-                "collection parameter compiles to a CONSTANT rather than failing, "
-                "so this must raise here."
-                % (name, COLLECTION_PATH, sorted(self._mpc_names)))
-
-        n = self.node(unreal.MaterialExpressionCollectionParameter)
-        n.set_editor_property("collection", self.collection)
-        n.set_editor_property("parameter_name", name)
-        # Order is load-bearing (see docstring); verify it took.
-        if str(n.get_editor_property("parameter_name")) != name:
-            raise RuntimeError("CollectionParameter name did not round-trip for %r" % name)
-        if n.get_editor_property("collection") is None:
-            raise RuntimeError("CollectionParameter %r lost its Collection" % name)
-        return n
-
-    # --- small nodes --------------------------------------------------------
-
-    def mask(self, src, src_out, r=False, g=False, b=False, a=False):
-        n = self.node(unreal.MaterialExpressionComponentMask)
-        n.set_editor_property("r", r)
-        n.set_editor_property("g", g)
-        n.set_editor_property("b", b)
-        n.set_editor_property("a", a)
-        self.link(src, src_out, n, "")
-        return n
-
-    def xyz(self, src, src_out=""):
-        return self.mask(src, src_out, r=True, g=True, b=True)
-
-    def unary(self, cls, a, a_out=""):
-        n = self.node(cls)
-        self.link(a, a_out, n, "")
-        return n
-
-    def sine(self, a, a_out=""):
-        return self.unary(unreal.MaterialExpressionSine, a, a_out)
-
-    def cosine(self, a, a_out=""):
-        return self.unary(unreal.MaterialExpressionCosine, a, a_out)
-
-    def arcsine(self, a, a_out=""):
-        return self.unary(unreal.MaterialExpressionArcsine, a, a_out)
-
-    def sqrt(self, a, a_out=""):
-        return self.unary(unreal.MaterialExpressionSquareRoot, a, a_out)
-
-    def normalize(self, a, a_out=""):
-        return self.unary(unreal.MaterialExpressionNormalize, a, a_out)
-
-    def round_(self, a, a_out=""):
-        return self.unary(unreal.MaterialExpressionRound, a, a_out)
-
-    def ddx(self, a, a_out=""):
-        return self.unary(unreal.MaterialExpressionDDX, a, a_out)
-
-    def ddy(self, a, a_out=""):
-        return self.unary(unreal.MaterialExpressionDDY, a, a_out)
-
-    def neg(self, a, a_out=""):
-        return self.mul(a, self.const(-1.0), a_out, "")
-
-    def dot(self, a, b, a_out="", b_out=""):
-        return self.binary(unreal.MaterialExpressionDotProduct, a, a_out, b, b_out)
-
-    def cross(self, a, b, a_out="", b_out=""):
-        return self.binary(unreal.MaterialExpressionCrossProduct, a, a_out, b, b_out)
-
-    def dist(self, a, b, a_out="", b_out=""):
-        return self.binary(unreal.MaterialExpressionDistance, a, a_out, b, b_out)
-
-    def atan2(self, y, x, y_out="", x_out=""):
-        n = self.node(unreal.MaterialExpressionArctangent2)
-        self.link(y, y_out, n, "Y")
-        self.link(x, x_out, n, "X")
-        return n
-
-    def clamp(self, value, lo, hi, value_out=""):
-        n = self.node(unreal.MaterialExpressionClamp)
-        # Clamp's first input is UNNAMED -- GetInputName reports it as 'None',
-        # so the pin list is ['None', 'Min', 'Max'] and "Input" does not match.
-        # Measured 2026-07-29 by the checked-connect assertion in link(), which
-        # is exactly what that assertion exists for: a silently-failed connect
-        # here would have left the clamp reading 0 and the star field blank.
-        self.link(value, value_out, n, "")
-        self.link(lo, "", n, "Min")
-        self.link(hi, "", n, "Max")
-        return n
-
-    def smoothstep(self, lo, hi, value, value_out=""):
-        n = self.node(unreal.MaterialExpressionSmoothStep)
-        self.link(lo, "", n, "Min")
-        self.link(hi, "", n, "Max")
-        self.link(value, value_out, n, "Value")
-        return n
-
-    def sample_derivative(self, texture_path, param_name, sampler_type,
-                          uv, ddx_uv, ddy_uv):
-        """TextureSampleParameter2D with EXPLICIT derivatives.
-
-        MipValueMode MUST be set before the DDX/DDY pins are connected: the pin
-        NAMES only exist in Derivative mode (UMaterialExpressionTextureSample::
-        GetInputName, MaterialExpressions.cpp:2743-2749). Set it afterwards and
-        the connects fail -- loudly, via link(), but pointlessly.
-        """
-        n = self.node(unreal.MaterialExpressionTextureSampleParameter2D)
-        n.set_editor_property("parameter_name", param_name)
-        n.set_editor_property("texture", load_texture(texture_path))
-        n.set_editor_property("sampler_type", sampler_type)
-        n.set_editor_property("mip_value_mode", unreal.TextureMipValueMode.TMVM_DERIVATIVE)
-        self.link(uv, "", n, "UVs")
-        self.link(ddx_uv, "", n, "DDX(UVs)")
-        self.link(ddy_uv, "", n, "DDY(UVs)")
-        return n
-
-    # sample() (hardware mip selection) is inherited from GraphBuilder unchanged
-    # -- it is what the moon disc uses.
-
-
 def build_stars(b, view, vz, horizon_fade):
-    """Equirect star-map lookup in celestial coordinates. Returns an RGB expr."""
-    # --- observer latitude, degrees -> radians ------------------------------
-    lat_rad = b.mul(b.collection_param("ObserverLatitude"), b.const(DEG2RAD))
-    sin_lat = b.sine(lat_rad)
-    cos_lat = b.cosine(lat_rad)
+    """M_NightSky's star field: the SHARED equirect lookup, gained and faded.
 
-    d_n = b.mask(view, "", r=True)
-    d_e = b.mask(view, "", g=True)
-    d_u = vz
-
-    # Horizon -> equatorial, rectangular. See the module docstring for the two
-    # checks that pin these signs (celestial pole at altitude phi; equator
-    # zenith on the meridian).
-    e_x = b.sub(b.mul(d_u, cos_lat), b.mul(d_n, sin_lat))     # cos(dec)cos(H)
-    e_y = b.neg(d_e)                                          # cos(dec)sin(H)
-    e_z = b.add(b.mul(d_n, cos_lat), b.mul(d_u, sin_lat))     # sin(dec)
-
-    # asin's input is a dot of unit vectors, so it is in [-1,1] mathematically
-    # but not necessarily after float rounding. Clamp before the arcsine.
-    dec = b.arcsine(b.clamp(e_z, b.const(-1.0), b.const(1.0)))
-    v = b.sub(b.const(0.5), b.mul(dec, b.const(1.0 / PI)))
-
-    hour_angle = b.atan2(e_y, e_x)
-    ra_turns = b.mul(hour_angle, b.const(-1.0 / TWO_PI))
-    u = b.add(b.collection_param("StarRotation"),
-              b.mul(b.collection_param("StarUDirection"), ra_turns))
-
-    uv = b.append(u, "", v, "")
-
-    # --- seam-safe derivatives ---------------------------------------------
-    #
-    # u jumps by exactly 1 across atan2's branch cut. TA_WRAP makes the FETCH
-    # correct there; it does not make the hardware's mip selection correct, and
-    # a one-texel column at the lowest mip is a permanent blurred meridian.
-    # Subtracting round() folds a +/-1 jump back to ~0 and leaves every other
-    # derivative untouched.
-    ddx_uv = b.ddx(uv)
-    ddy_uv = b.ddy(uv)
-    du_dx = b.mask(ddx_uv, "", r=True)
-    dv_dx = b.mask(ddx_uv, "", g=True)
-    du_dy = b.mask(ddy_uv, "", r=True)
-    dv_dy = b.mask(ddy_uv, "", g=True)
-    ddx_fixed = b.append(b.sub(du_dx, b.round_(du_dx)), "", dv_dx, "")
-    ddy_fixed = b.append(b.sub(du_dy, b.round_(du_dy)), "", dv_dy, "")
-
-    # SAMPLERTYPE_LINEAR_COLOR, not COLOR: T_SkyStarmap is TC_HDR with sRGB OFF
-    # (import_sky_textures.py:82-84), and GetSamplerTypeForTexture maps
-    # (non-sRGB, non-special compression) to LinearColor
-    # (MaterialExpressionUtils.cpp:45-47). A mismatch is a compile error, not a
-    # silent wrong colour -- but it is a compile error that would only show up
-    # in the editor, so get it right here.
-    star = b.sample_derivative(
-        STARMAP_TEXTURE, "StarmapTex",
-        unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR,
-        uv, ddx_fixed, ddy_fixed)
+    The celestial rotation, the UV and the seam fix are all in
+    sky_star_graph.build_star_uv -- M_SkyAtmosphereDome samples the same map at
+    the same rotation and the two must not be able to disagree. All that is left
+    here is the gain, which IS M_NightSky's alone: StarBrightness carries the
+    sunrise fade for the visible, additive dome (see "THE COST OF THAT CHOICE" in
+    the module docstring), and the capture dome multiplies it by a second scalar.
+    """
+    uv, ddx_fixed, ddy_fixed = build_star_uv(b, view, vz)
+    star = sample_starmap(b, uv, ddx_fixed, ddy_fixed)
 
     gain = b.mul(b.collection_param("StarBrightness"), horizon_fade)
     return b.mul(star, gain, "RGB", "")
@@ -987,21 +765,14 @@ def main():
 
     b = SkyGraphBuilder(material, collection)
 
-    # --- view direction -----------------------------------------------------
+    # --- view direction and horizon fade ------------------------------------
     #
-    # CameraVectorWS points from the shaded pixel TOWARD the camera; the
-    # direction of gaze is its negation. In this project's frame that is
-    # (north, east, up) directly -- VoxelEphemeris.h:44-48 -- so the ephemeris
-    # direction vectors need no transform on the way in.
-    camera_vector = b.node(unreal.MaterialExpressionCameraVectorWS)
-    view = b.normalize(b.neg(camera_vector))
-    view_z = b.mask(view, "", b=True)
-
-    # Stars and moon both vanish through the horizon line rather than showing
-    # through gaps under the terrain. Doubles as a crude stand-in for horizon
-    # extinction on a rising moon.
-    fade_half_width = b.collection_param("StarHorizonFade")
-    horizon_fade = b.smoothstep(b.neg(fade_half_width), fade_half_width, view_z)
+    # Both shared with M_SkyAtmosphereDome (sky_star_graph.py). The gaze
+    # direction is normalize(-CameraVectorWS), which in this project's frame is
+    # (north, east, up) directly; the fade makes stars and moon vanish THROUGH
+    # the horizon line rather than showing through gaps under the terrain.
+    view, view_z = build_view_direction(b)
+    horizon_fade = build_horizon_fade(b, view_z)
 
     stars = build_stars(b, view, view_z, horizon_fade)
     moon = build_moon(b, view, horizon_fade)

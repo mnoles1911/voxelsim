@@ -69,6 +69,51 @@ private:
 	UPROPERTY(VisibleAnywhere, Category = "Voxel Earth|Sky")
 	TObjectPtr<UStaticMeshComponent> DomeMesh;
 
+	// THE SECOND DOME: the same stock sphere at the same radius, carrying
+	// /Game/Voxel/M_SkyAtmosphereDome. Phase S1 of
+	// docs/sky-and-local-light-plan.md.
+	//
+	// WHAT IT IS FOR, and it is not decoration. The SkyLight's real-time capture
+	// renders only four things -- the SkyAtmosphere raymarch, volumetric clouds,
+	// height fog, and meshes whose material sets bIsSky
+	// (ReflectionEnvironmentRealTimeCapture.cpp:343, and :743-746's "if there are
+	// any mesh tagged as IsSky then we render them only"). M_NightSky sets
+	// is_sky = False deliberately, so the star dome above contributes EXACTLY ZERO
+	// ambient light to the world. This dome is the IsSky mesh a later phase can
+	// feed the star map into.
+	//
+	// WHY IT IS NOT A CAPTURE-ONLY MESH, which is the obvious cheap version. The
+	// moment ANY primitive uses a sky material, View.bSceneHasSkyMaterial goes true
+	// (SceneVisibility.cpp:2096) and the main view's atmosphere pass STOPS PAINTING
+	// SKY PIXELS: SkyAtmosphereRendering.cpp:2214 sets bRenderSkyPixel =
+	// !bSceneHasSkyMaterial, and with RENDERSKY_ENABLED==0 the shader clips
+	// far-depth pixels out entirely (SkyAtmosphere.usf:982-992). The engine ships an
+	// editor warning for exactly this configuration
+	// (ReflectionEnvironmentRealTimeCapture.cpp:313-316). So this dome does not
+	// merely join the frame -- it TAKES OVER painting the sky, and S1's entire job
+	// is proving it is a faithful stand-in for what the atmosphere pass paints
+	// today. Hence voxel.Sky.AtmosphereDome and its live A/B.
+	//
+	// WHY IT DOES NOT NEED ITS OWN TRANSFORM, DEPTH BEHAVIOUR OR RADIUS. It is
+	// attached to DomeMesh and inherits the exact camera follow and the exact
+	// uniform scale, which is the point: two domes at two radii would be two
+	// numbers to keep above the clipmap corner. IsSky puts it in EMeshPass::SkyPass
+	// ONLY -- ShouldIncludeMaterialInDefaultOpaquePass returns !Material.IsSky()
+	// (MaterialShared.h:3717-3721), which gates the depth prepass
+	// (DepthRendering.cpp:999), the opaque base pass (BasePassRendering.cpp:2040),
+	// shadow depth (ShadowDepthRendering.cpp:2311) and velocity
+	// (VelocityRendering.cpp:939) -- and that pass masks depth WRITES off
+	// (CreateSkyPassProcessor, SkyPassRendering.cpp:341-348). So sky depth stays at
+	// the far plane and height fog, aerial perspective and TSR behave as today.
+	//
+	// It still DEPTH-TESTS, though, with CF_DepthNearOrEqual, and that makes the
+	// radius requirement STRICTER here than for the star dome rather than looser: a
+	// dome nearer than a distant mountain PASSES the test and paints sky over the
+	// mountain in the base-pass colour target. BeginPlay's clipmap-corner check is
+	// therefore load-bearing for this component too, and the log line says so.
+	UPROPERTY(VisibleAnywhere, Category = "Voxel Earth|Sky")
+	TObjectPtr<UStaticMeshComponent> AtmosphereDomeMesh;
+
 	// Recentres the dome on the first player controller's camera (falling back
 	// to its pawn, then doing nothing), in all three axes. Same resolution chain
 	// and same early-outs as AVoxelOceanActor::UpdateFollowPlane
@@ -85,10 +130,18 @@ private:
 	// when the radius or the snap size changes.
 	void UpdateFollowCamera();
 
-	// Applies voxel.Sky.DomeEnabled and voxel.Sky.DomeRadiusUU. Both are live
-	// knobs, so this runs every tick rather than once at BeginPlay; both writes
-	// early-out on an unchanged value and the visibility flip is logged once per
-	// transition, never per frame.
+	// Applies voxel.Sky.DomeEnabled, voxel.Sky.AtmosphereDome and
+	// voxel.Sky.DomeRadiusUU. All three are live knobs, so this runs every tick
+	// rather than once at BeginPlay; every write early-outs on an unchanged value
+	// and each visibility flip is logged once per transition, never per frame.
+	//
+	// THE TWO DOMES ARE SWITCHED INDEPENDENTLY, and that independence is the
+	// deliverable rather than a convenience. voxel.Sky.AtmosphereDome decides who
+	// paints the sky (see AtmosphereDomeMesh) and S1's gate is an on/off A/B on it
+	// INSIDE ONE PROCESS, because this project's screenshot noise floor is bimodal
+	// -- 0.00% differing pixels within a session and 1.81% between
+	// (VoxelGpuVerify.cpp:2074-2084) -- and 1.81% is larger than the effect being
+	// measured. A spawn-time-only switch cannot express that comparison at all.
 	void ApplyDomeCvars();
 
 	// The stock sphere's own radius in UU, read from UStaticMesh::GetBounds()
@@ -109,4 +162,22 @@ private:
 	// state the run is actually in -- a capture has to be able to say whether
 	// the dome was on from its own log.
 	int32 AppliedEnabled = -1;
+
+	// Same, for voxel.Sky.AtmosphereDome. Same -1 start and for a stronger version
+	// of the same reason: a ladder rung that cannot state from its own log which
+	// arm of the A/B it was is not evidence of anything.
+	int32 AppliedAtmosphereEnabled = -1;
+
+	// Did /Game/Voxel/M_SkyAtmosphereDome resolve in the constructor?
+	//
+	// THE DOME IS REFUSED OUTRIGHT WHEN THIS IS FALSE, which is a harder line than
+	// the star dome takes and deliberately so. The star dome's failure is a blank
+	// night sky: bad, but subtractive. An IsSky dome wearing the ENGINE DEFAULT
+	// material is worse than no dome at all -- it still sets
+	// View.bSceneHasSkyMaterial, so the SkyAtmosphere's pass still stops painting
+	// sky pixels, and something wrong gets painted in its place. "No sky" plus "the
+	// atmosphere suppressed" is a frame that looks like permanent night and reads
+	// as a bug in the day/night cycle. So: Error at BeginPlay, and the component
+	// stays hidden however voxel.Sky.AtmosphereDome is set.
+	bool bAtmosphereMaterialValid = false;
 };

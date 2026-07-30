@@ -116,10 +116,52 @@ class UWorld;
 //                                    already resolved it by the time this fixture
 //                                    arms. The ladder walks one game day and
 //                                    logs which one it landed on.
+//   -VoxelSkyLadderAltCvar=<name>    PAIRED A/B MODE. See below.
+//   -VoxelSkyLadderAltA=<value>      Arm A's value for that cvar. Default "1".
+//   -VoxelSkyLadderAltB=<value>      Arm B's value. Default "0".
 //
 // Captures land in ue-project/Saved/Screenshots/WindowsEditor/ named
 // VoxelSkyLadder_<ii>_<hh>h<mm>, so they sort in ladder order and each frame
-// states the hour it is of.
+// states the hour it is of. In paired mode the name gains a
+// _<lastCvarSegment><value> suffix.
+//
+// ===========================================================================
+// PAIRED A/B MODE, AND WHY IT PAIRS THE HOUR RATHER THAN ALTERNATING IT
+// ===========================================================================
+//
+// -VoxelSkyLadderAltCvar=<name> turns each rung into TWO captures at the SAME
+// simulated instant, one with <name> set to -VoxelSkyLadderAltA and one with it
+// set to -VoxelSkyLadderAltB, from the same latched camera pose, in the same
+// process. So a ladder of N rungs produces 2N frames in N diffable PAIRS.
+//
+// The naive version -- flip the cvar as the hour advances -- does not work, and
+// the reason is the whole point of this fixture. The gate a paired ladder exists
+// to serve is of the form "|delta mean luma| < 2/255 at every rung", which is a
+// statement about TWO FRAMES OF THE SAME SKY. Alternate the cvar against the
+// hour and consecutive frames differ in both, so the difference is
+// uninterpretable: the sky moved AND the arm changed, and no arithmetic
+// separates them. Pairing at a frozen clock is what makes the difference
+// attributable to the cvar alone. (The clock is already pinned to 0 and set
+// absolutely per rung, so "the same instant twice" costs nothing -- the epoch is
+// simply written twice with the same value.)
+//
+// THE CVAR IS SET BEFORE THE SETTLE, NOT AFTER. Anything worth A/B-ing this way
+// is likely to feed the SkyLight's real-time capture, which amortises over
+// several frames -- so a flip after the settle would photograph the previous
+// arm's ambient term. The arm therefore lands first and then gets the full
+// -VoxelSkyLadderSettle before the shutter, exactly as a clock jump does.
+//
+// It is deliberately GENERAL rather than a voxel.Sky.AtmosphereDome switch: it
+// takes any cvar name and any two values, and it verifies by READ-BACK that the
+// set actually took (ECVF_SetByCode loses to -ExecCmds, so a silently refused
+// pin would run an A/B against itself -- the failure VoxelGpuVerify.cpp:2104-2110
+// refuses to schedule). Its first customer is phase S1 of
+// docs/sky-and-local-light-plan.md:
+//
+//   -VoxelSkyLadder=8 -VoxelSkyLadderAltCvar=voxel.Sky.AtmosphereDome
+//
+// which asks "does the IsSky dome paint the same sky the SkyAtmosphere pass
+// paints?" at eight hours, twilight included.
 namespace VoxelSkyLadderFixture
 {
 // Parses the switch set and arms the ladder if -VoxelSkyLadder[=<N>] is present.

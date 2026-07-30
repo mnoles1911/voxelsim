@@ -270,6 +270,23 @@ namespace VoxelSky
 	VOXELEARTH_API void SetTimeScale(float NewScale); // ECVF_SetByCode; -VoxelTimeScale= uses it
 	VOXELEARTH_API double GetDayLengthSeconds();
 	VOXELEARTH_API double GetDaysPerYear();
+
+	// FVoxelSkyState::DayOfYear (0..365) -> calendar month (1..12) and day (1..31)
+	// in the ephemeris's REFERENCE YEAR 2000, which is a LEAP year -- February has
+	// 29 days and day-of-year 79 is 20 March, not 21 (VoxelEphemeris.h:150-153).
+	// The output pair is deliberately the same MM-DD form -VoxelDate= takes, so a
+	// recorded leg can be replayed by pasting its own numbers back.
+	//
+	// EXPORTED RATHER THAN COPIED, and that is the point of it being here. This
+	// derivation had two independent copies -- the anonymous-namespace original in
+	// VoxelSkySubsystem.cpp and kPerfDaysBeforeMonth/kPerfDaysInMonth in
+	// VoxelPerfRunSubsystem.cpp, whose own comment recorded the copy as debt and
+	// named this accessor as the correct end state. The F1 overlay was the third
+	// consumer, and a third copy is how VoxelClimateProbe.h's disaster happens:
+	// four independent climate calibrations drifting apart is what made the whole
+	// world classify as desert. One table, one definition, one answer.
+	VOXELEARTH_API void MonthDayFromDayOfYear(int32 DayOfYear, int32& OutMonth, int32& OutDay);
+
 	VOXELEARTH_API double GetOriginLatitudeDeg();
 	VOXELEARTH_API double GetOriginLongitudeDeg();
 	VOXELEARTH_API bool IsMoonEnabled();
@@ -316,4 +333,43 @@ namespace VoxelSky
 	// scalar, so once C++ drives that scalar every frame there is nowhere on the
 	// asset left to put the offset. See the cvar for the full argument.
 	VOXELEARTH_API double GetStarRotationOffsetTurns();
+
+	// --- the IsSky dome (AVoxelSkyDomeActor + M_SkyAtmosphereDome) ------------
+	//
+	// A SEPARATE KNOB FROM IsDomeEnabled, and the two must not be folded together.
+	// IsDomeEnabled hides the star dome, which is additive and purely decorative:
+	// off means one less thing added to the sky. This one decides WHO PAINTS THE
+	// SKY AT ALL -- while the IsSky dome is in the scene the SkyAtmosphere's
+	// full-screen pass stops emitting sky pixels (SkyAtmosphereRendering.cpp:2214),
+	// so hiding it hands that job back and showing it takes it away. Same actor,
+	// same follow, same radius; completely different consequence, which is why
+	// each has its own cvar and its own logged transition.
+	//
+	// Read every tick by AVoxelSkyDomeActor::ApplyDomeCvars, so it is a live knob
+	// -- non-negotiable, because S1's gate is an on/off A/B inside ONE process
+	// (the cross-session screenshot floor is 1.81%, the within-session floor
+	// 0.00%) and a spawn-time-only switch cannot express that comparison.
+	VOXELEARTH_API bool IsAtmosphereDomeEnabled();
+
+	// The RESOLVED gain on the star map inside the SkyLight's real-time capture,
+	// written into MPC_VoxelSky.StarAmbientGain every frame.
+	//
+	// DERIVED BY DEFAULT from kStarAmbientCalibration (VoxelSkySubsystem.cpp), which
+	// is the measured ratio between the two rendering contexts that carry the same
+	// star map: the visible additive dome and the capture's emissive branch. That is
+	// what stops "how bright stars look" and "how much they light the world" from
+	// being two free knobs that agree only by coincidence.
+	//
+	// voxel.Sky.StarAmbientGain defaults to the NEGATIVE SENTINEL -1 meaning derive;
+	// any value >= 0 overrides verbatim. So -1 does NOT mean "off" -- 0 means off --
+	// and this accessor never returns a negative number whatever the cvar holds.
+	// Always report what this returns, never the cvar: the cvar reads -1 on every
+	// shipped run.
+	VOXELEARTH_API float GetStarAmbientGain();
+	// Whether GetStarAmbientGain() came from the calibration constant or from an
+	// explicit override. Exists so the log can say WHICH -- an override and the
+	// derived value can be the same number (the S2 gate's A arm pins 1.0, which is
+	// also what the calibration derives), and "the calibration is not being enforced
+	// on this run" is not visible in the value alone.
+	VOXELEARTH_API bool IsStarAmbientGainDerived();
 }
