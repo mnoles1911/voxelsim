@@ -1,0 +1,92 @@
+THE CORDUROY IS MANUFACTURED IN B3: ONE GLOBAL REPOSE ANGLE PLANES THE FACES
+============================================================================
+2026-07-30. Thirteenth attempt at the parallel contour-terrace artifact, and the
+first to locate WHERE the smoothness is created rather than proving one more
+place it cannot be removed.
+
+WHERE THE PREVIOUS FRAMING WAS RIGHT, AND WHERE IT STOPPED SHORT. The
+contour-crookedness file proves the client cannot fix this (the carrier alone
+measures D = 1.006; the drainage cap forbids exactly the gradients that would
+crook a contour; every rotated-frame construction degenerates at 69 km), and its
+closing geometric argument -- closed contours require the pit condition -- is
+correct as stated. But it proves the wrong thing dispositive: real steep-slope
+contours are NOT closed either. Open, parallel-ish contours look natural when
+their SPACING varies, because spacing is 100 mm / local grade, and real ground
+varies its grade at every scale. So the question is not "how do we close or
+crook contours against the cap", it is "why is the local grade of our steep
+faces so nearly CONSTANT". That question has a measurable answer, and it is not
+"because a heightfield must be smooth".
+
+THE MEASUREMENT. Stage-differenced bake of the g35 exemplar (tile -5,2, seed
+20260719, bake_ver 4, no superblock -- statistics only), slope distribution of
+the 1.875 m surface over the central 3.84 km window (repro site):
+
+                          p10     p50     p90    frac within +-7% of tan(36)
+  B0+B1 carrier+rough    0.263   0.480   0.674        7.7%
+  B2d incised            0.328   0.626   1.246       10.7%
+  B3 relaxed             0.344   0.706   0.903       19.1%
+
+  B3 moved 40% of cells by >0.1 m (rms 1.33 m, p99 5.3 m), and the histogram
+  says exactly what it did: the entire >0.85 tail incision carved is collapsed
+  into a spike at 0.70-0.85, i.e. at tan(36 deg) = 0.727. The density JUMPS
+  discontinuously at the repose value (4.8% in the 0.65-0.70 bin, 9.1% in
+  0.70-0.75, 14.1% in 0.75-0.80). A third of a mountainside within +-10% of one
+  angle is a constant-grade surface, and a constant-grade surface voxelises to
+  evenly spaced parallel terraces. The corduroy is not an emergent property of
+  heightfields; it is the fixed point of a relaxation operator with one global
+  threshold.
+
+  (Note B2d's distribution -- broad, heavy-tailed -- is the shape a real steep
+  DTM has. The bake CARVES believable variance and then erases it. "Carved then
+  erased" is directly visible in the stage diff, which is what stage sinks were
+  built for.)
+
+WHY THIS ESCAPES THE GEOMETRIC ARGUMENT. Nothing here perturbs a ramp against
+the drainage cap. The fix changes the angle each face is driven TOWARD, in the
+bake, before the fill/probe contract is measured. The client is untouched: no
+worldgen change, no HLSL mirror, no version bump, no float-ban exposure.
+kWorldGenVersion stays where it is; provider_id rolls through bake_ver 5, which
+is the sanctioned route for a bake change, and the 52 coarse tiles are consumed
+as-is (the bake runs CPU-only in ~2 min/tile on this box).
+
+THE CHANGE (bake_ver 5). thermal.relax accepts a per-cell repose_deg field;
+noise.repose_field builds it from two world-anchored components:
+  * spatial lithology octaves (160 m and 40 m, +-6 deg RMS) -- patches of
+    stronger and weaker rock, so adjacent noses of one ridge finish at
+    different angles;
+  * elevation-keyed strata bands (30 m and 7.5 m vertical wavelength, +-14 deg
+    RMS) -- sub-horizontal bedding, so strong bands hold near-cliff faces and
+    keep the relief incision carved into them while weak bands ravel back to
+    talus: bench-and-cliff structure, which is exactly the "stop being a smooth
+    ramp" escape named in the crookedness file, produced by process rather than
+    painted on.
+Clamped to [26, 60] deg. Both amplitudes at 0 skip the field and reproduce
+bake_ver 4 bit-for-bit. Mass conservation and the steepest-pair stability bound
+survive the field (donor-keyed threshold; tested, including numba-vs-numpy).
+
+RESULTS -- filled in below as measured.
+
+  slope distribution (same window; frac@repose = within +-7% of tan 36 deg):
+    v4 B3:  p10/p50/p90 0.344/0.706/0.903   frac@repose 19.1%
+    v5 B2d: p10/p50/p90 0.328/0.628/1.247   frac@repose 10.8%   (control: same
+            statistics as v4's B2d, so the change is B3's and only B3's)
+    v5 B3:  p10/p50/p90 0.345/0.641/0.979   frac@repose 14.9%
+
+    The v4 histogram is discontinuous AT the repose value (4.85% density in the
+    0.65-0.70 bin jumping to 9.08 / 14.14 / 10.17 in the three bins straddling
+    tan 36); the v5 histogram is smooth through it (6.4 -> 7.4 -> 6.5 -> 5.6) and
+    keeps a genuine steep tail to 1.3+ where v4 had cut it off. Thermal still
+    moves the same amount of material overall (rms 1.39 m vs 1.33 m) -- talus
+    still forms -- it just no longer planes every face to one angle.
+
+  offline hillshade (D:\ue-cache\tmp\g35-v4-vs-v5-hillshade.png, v4 left):
+    the uniform gray sheets between gullies become irregular facets, held rock
+    pads and bench edges; the drainage layout is unchanged.
+
+  vxc_terrainprobe, site -69120,38400, 512 m, worldgen v18 client:
+    v4: carrier D=1.006, rib p50 1.7 m p90 9.7 m; amplified D=1.020;
+        drainage carrier 0 sinks / 0.0% stranded / 244.5 m mean path;
+        amplified 0 / 0.0% / 246.2 m
+    v5: TBD
+
+  in-engine raking capture at the repro site: TBD
