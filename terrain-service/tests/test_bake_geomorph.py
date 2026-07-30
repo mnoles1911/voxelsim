@@ -290,6 +290,49 @@ def test_roughness_is_world_anchored():
     assert np.array_equal(big[y0:y0 + 96, x0:x0 + 96], win)
 
 
+def test_repose_field_is_world_anchored():
+    """Same seam obligation as the roughness: a tile's apron and its
+    neighbour's interior must agree EXACTLY, or bake_ver 5 reintroduces the
+    seam class the whole anchoring section exists to remove. The spatial part
+    rides the same integer world lattice as the roughness octaves; the strata
+    part is a pure function of elevation, so identical z in the overlap is
+    identical strata by construction -- which this asserts rather than argues."""
+    rng = np.random.default_rng(9)
+    zbig = (rng.random((192, 192)).astype(np.float32) * 700.0)
+    y0, x0 = -13 - (-64), 29 - (-64)
+    zwin = zbig[y0:y0 + 96, x0:x0 + 96]
+    big = noise.repose_field(zbig, CELL_M, 42, (-64, -64))
+    win = noise.repose_field(zwin, CELL_M, 42, (-13, 29))
+    assert np.array_equal(big[y0:y0 + 96, x0:x0 + 96], win)
+
+
+def test_repose_field_range_and_determinism():
+    rng = np.random.default_rng(4)
+    z = (rng.random((96, 96)).astype(np.float32) * 900.0)
+    a = noise.repose_field(z, CELL_M, 7, (0, 0))
+    b = noise.repose_field(z, CELL_M, 7, (0, 0))
+    c = noise.repose_field(z, CELL_M, 8, (0, 0))
+    assert np.array_equal(a, b)
+    assert not np.array_equal(a, c)
+    assert a.min() >= 26.0 and a.max() <= 60.0
+    # Both amplitudes off -> exactly the base angle everywhere.
+    flat = noise.repose_field(z, CELL_M, 7, (0, 0),
+                              spatial_amp_deg=0.0, strata_amp_deg=0.0)
+    assert np.array_equal(flat, np.full(z.shape, np.float32(36.0)))
+
+
+def test_repose_field_rejects_bad_arguments():
+    z = np.zeros((16, 16), dtype=np.float32)
+    with pytest.raises(ValueError):
+        noise.repose_field(z, CELL_M, 1, (0, 0), spatial_amp_deg=-1.0)
+    with pytest.raises(ValueError):
+        noise.repose_field(z, CELL_M, 1, (0, 0), strata_wavelength_m=0.0)
+    with pytest.raises(ValueError):
+        noise.repose_field(z, CELL_M, 1, (0, 0), min_deg=40.0, base_deg=36.0)
+    with pytest.raises(ValueError):
+        noise.repose_field(z, CELL_M, 1, (0, 0), max_deg=90.0)
+
+
 def test_roughness_rejects_bad_arguments():
     z = np.zeros((16, 16), dtype=np.float32)
     with pytest.raises(ValueError):
