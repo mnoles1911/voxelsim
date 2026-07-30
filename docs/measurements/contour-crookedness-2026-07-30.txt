@@ -1,0 +1,86 @@
+THE CONTOUR-TERRACING ARTIFACT: MEASURED, AND WHY NOTHING HAS FIXED IT
+======================================================================
+2026-07-30. Written because the artifact has survived ten attempts and the useful
+output of that is a sharp statement of the constraint, not another guess.
+
+THE ARTIFACT, QUANTIFIED WITHOUT ANYONE'S EYE. terrainprobe now measures the
+box-counting dimension of the voxel level field's terrace boundaries, with controls
+computed every run:
+
+  tilted plane (control)        D = 1.000
+  our carrier                   D = 1.006
+  our amplified surface (v17)   D = 1.014
+  REAL topographic contours     D = 1.15 - 1.25   (published, external)
+  white noise (control)         D = 1.872
+
+So the shipped surface's contours are ~1% of the way from a machined plane toward
+natural. That is the owner's complaint, as a number.
+
+NOTE THE TOP OF THE SCALE. D is bounded above by NOISE, not by realism. A term that
+degenerates into per-voxel static raises D toward 1.87. D alone therefore cannot
+distinguish "crooked like real ground" from "noisy", and must be read alongside the
+drainage ladder and the terrace-run statistics.
+
+WHAT IT IS NOT. Established by ablation with the shader mirrored, so the GPU
+actually saw each change: the 1.6 m octave, the rill term, the bedding term, the
+entire detail ladder at 1/16, and the fine tier itself. All left it intact. Removing
+detail makes it WORSE. A sun-angle control (08:00 / 12:00 / 16:00) confirms geometry
+rather than shading. A periodicity scan finds no periodic component at 1-2 m, which
+is correct and was the wrong question: terracing is a THRESHOLD phenomenon in
+floor(h / 100 mm), not a spectral one in h.
+
+THE CONSTRAINT, which is the useful part. Crooking a contour needs of order one
+voxel of vertical deviation at sub-metre wavelength. At 0.4 m that IS a gradient of
+0.25. The v14/v15 drainage cap permits max(0.05, 0.5 x carrierGradient). So:
+  * below ~50% grade the two requirements are arithmetically incompatible;
+  * and the CARRIER alone measures D = 1.006, so it sets a floor no client term can
+    lift -- the smoothness is upstream of the client entirely.
+
+Two experiments confirm the trade is real and unprofitable:
+  * doubling the cap's k to 1.0 cost 53.8% of the tile's drainage and moved D by
+    -0.001. Amplitude is not the lever.
+  * reshaping the micro band to a Hurst-0.8 ladder (v17: 400:90 -> 165, 200:25 ->
+    95) moved local H at 0.4 m from 1.352 to 0.979, INTO the plan's [0.6, 1.0]
+    target band, at zero drainage cost -- and moved D only 1.010 -> 1.014. Spectral
+    shape is not the lever either.
+
+THE ONE MECHANISM THAT SHOULD WORK, AND WHY THE SHIPPABLE FORM DOES NOT. A
+displacement varying ONLY across the slope has a gradient perpendicular to the fall
+line, so it cannot change the downhill component and cannot close a basin at any
+amplitude -- exempt from the cap by construction. A prototype using the EXACT
+gradient direction measured, on the fine tier at a 35% site:
+
+  150 mm  D = 1.021   0.0% stranded
+  400 mm  D = 1.060   0.0%
+  800 mm  D = 1.155   0.0%      <- in the real band
+ 1600 mm  D = 1.307   42.9%     <- breaks
+
+Promoted to a shippable form -- the rill's 16-direction table with two-frame
+blending, which is what makes the rill free of the lever-arm defect documented at
+length in detail_rill.h -- it collapses:
+
+  amp 0     D = 1.014
+  amp 3200  D = 1.020
+
+The blend is the reason. At a 1.2 m across-slope wavelength the two fields either
+side of the measured aspect are effectively INDEPENDENT, so averaging them destroys
+the coherence that crooks a contour. The rill survives this because its features are
+12.8 m along-slope, where the blend mostly affects orientation rather than phase.
+
+AND THE PROTOTYPE'S RESULT IS PROBABLY A FALSE POSITIVE, which is why nothing was
+shipped. detail_rill.h records that the exact-direction construction has a noise
+phase whose derivative grows with distance from the world origin, degenerating into
+per-voxel static -- measured there at 54 km. The sites used here sit at 69 km
+(x = -69120 m). So the prototype's D = 1.155 is consistent with the metric climbing
+toward the 1.872 NOISE control rather than toward real terrain. Its drainage held at
+0.0%, which argues against full degeneration, but the two explanations are not
+separated by the evidence in hand.
+
+WHAT WOULD SEPARATE THEM, and it is cheap: run the prototype at a near-origin site
+and at 69 km and compare D. If D collapses near the origin, it was the lever arm and
+the direction is dead. If it holds, the construction is real and the task is to make
+it lever-arm-free without the decorrelating blend -- more sectors is the lever
+detail_rill.h itself names as costing nothing.
+
+STATE: reverted to v17, tree green -- ctest 2/2, vxc_gpu bit-exact. Nothing from
+this investigation ships.
