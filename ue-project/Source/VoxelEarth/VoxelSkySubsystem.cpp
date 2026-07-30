@@ -251,17 +251,101 @@ namespace
 		TEXT("wearing the engine default material would suppress the atmosphere pass AND paint the sky wrong."),
 		ECVF_Default);
 
+	// --- the star ambient calibration ----------------------------------------
+	//
+	// THE ONE CONSTANT THAT TIES "HOW BRIGHT STARS LOOK" TO "HOW MUCH THEY LIGHT
+	// THE WORLD", and it is CALIBRATION, NOT PHYSICS. It converts between two
+	// renderer conventions carrying the SAME star map:
+	//
+	//   VISIBLE   M_NightSky, BLEND_Additive, composited onto already-composited
+	//             scene colour in the main view (Tools/create_sky_material.py:628).
+	//   AMBIENT   M_SkyAtmosphereDome's star branch, emissive into the SkyLight's
+	//             real-time cubemap behind a ReflectionCapturePassSwitch, then
+	//             SH-projected into irradiance
+	//             (Tools/create_sky_atmosphere_dome_material.py:286-289).
+	//
+	// Nothing makes those two paths owe each other the same number, so the number
+	// is MEASURED. Starlit capture, 22h00 on 03-20 with the Milky Way core high
+	// (Saved/Screenshots/WindowsEditor/VoxelSkyLadder_00_22h00_StarAmbientGain1,
+	// +3 EV bias for visibility -- the bias CANCELS in a ratio, which is exactly
+	// why the gate below is a ratio and not an absolute level). Proper sRGB EOTF,
+	// clipped pixels excluded, Y = 0.2126R + 0.7152G + 0.0722B:
+	//
+	//   whole visible sky   0.14342 linear        Milky Way core   0.27833
+	//   snowfield ground    0.11325               ground / sky     0.790
+	//
+	// For a Lambertian surface under a sky of luminance L_sky the illuminance is
+	// E = pi * L_sky and the surface reads rho * E / pi, so L_ground / L_sky IS the
+	// albedo -- every geometry term cancels, which is what makes this measurable off
+	// one screenshot with no light meter. Snow is conventionally 0.75..0.85 and it
+	// measured 0.790. So the shipped pair (StarGain 0.15, ambient gain 1.0) is
+	// physically consistent, and the calibration constant IS that consistent ratio.
+	//
+	// RE-MEASURE IF EITHER DOME'S MATERIAL CHANGES. This is a fit to two specific
+	// material graphs, not a derived quantity: change the star branch's gain chain,
+	// the horizon fade, T_SkyStarmap's encoding, or M_NightSky's blend mode and this
+	// constant is stale with no error anywhere. tools/sky-albedo-check.py IS the
+	// re-measurement, and it exits non-zero, so it can gate.
+	constexpr float kStarAmbientCalibration = 1.0f;
+
+	// The visible star gain the calibration was measured against. NOT a factor in
+	// the derivation -- see the next paragraph -- it is logged as the anchor so a
+	// capture can state what its ambient gain was calibrated at, and it is what to
+	// compare against if voxel.Sky.StarGain's default ever moves.
+	constexpr float kStarAmbientCalibrationStarGain = 0.15f;
+
+	// WHY THE DERIVED VALUE IS A CONSTANT AND NOT "StarGain / 0.15", WHICH IS THE
+	// OBVIOUS-LOOKING SHAPE AND IS A DOUBLE COUNT.
+	//
+	// Both domes multiply the SAME MPC scalar, StarBrightness, and this subsystem
+	// writes it as StarBrightnessForSunAltitude() = sunriseFade * voxel.Sky.StarGain
+	// (see ApplySkyMaterialParams). So:
+	//
+	//   visible radiance  V = StarMap * fade * StarGain
+	//   capture radiance  C = StarMap * fade * StarGain * StarAmbientGain
+	//   ==> C / V = StarAmbientGain, exactly, with no StarGain left in it.
+	//
+	// StarGain therefore ALREADY propagates to the ambient term, linearly, through
+	// the shared scalar -- the two gains are not independent today and never were.
+	// Making the derived value proportional to StarGain would multiply it in a
+	// SECOND time and give the ambient term a quadratic response: at StarGain 0.30
+	// the stars would look twice as bright and light the world four times as hard,
+	// which is precisely the appearance/illumination mismatch this constant exists
+	// to prevent, introduced by the fix for it. The honest coupling is that
+	// StarAmbientGain is a DIMENSIONLESS CONVERSION FACTOR and its value is 1.0.
+	// (A second reason not to write it as a product: 0.15f * 6.667f is 1.0000501f,
+	// so the "obvious" spelling is not even a bit-identical no-op at the defaults.)
+	//
+	// AND WHY THE AMBIENT BRANCH NEEDS NO SUNRISE FADE OF ITS OWN. It already HAS
+	// one, the visible dome's, for free: StarBrightness carries it, so above 0 deg
+	// solar altitude StarBrightnessForSunAltitude returns exactly 0 and the capture
+	// branch is IDENTICALLY zero at noon whatever this gain is. That -- not merely
+	// "the atmosphere swamps it" -- is why the S2 day rungs came back unchanged to
+	// 0.02/255 (101.888 -> 101.866). Adding a second fade here would be a second
+	// curve to keep in sync with the first, and the sky would then be capable of
+	// fading its light and its look on different schedules.
+
 	// The star branch of M_SkyAtmosphereDome's REFLECTION-pass output, i.e. how
 	// much starlight the SkyLight's real-time capture integrates into the world's
 	// ambient term.
 	//
-	// DEFAULT 0, AND THE ZERO IS THE DELIVERABLE. Phase S1 of
-	// docs/sky-and-local-light-plan.md ships the star branch present in the graph
-	// but gained to nothing, so that S1's only claim is "the IsSky dome is a
-	// faithful stand-in for today's sky". S2 is then a cvar flip rather than a
-	// material regeneration -- which matters because regenerating the material
-	// needs the single-occupancy editor and a commandlet, and flipping a cvar
-	// needs neither.
+	// DEFAULT -1, WHICH MEANS "DERIVE FROM kStarAmbientCalibration". Any value
+	// >= 0 is an explicit override; the whole negative half-line is the sentinel.
+	// It used to default to a bare 1.0, and that was the defect: a second free gain
+	// sitting beside voxel.Sky.StarGain, in a different rendering context, with
+	// nothing tying them together. They agreed. Nothing enforced it, nothing would
+	// have said so if they stopped, and the symptom -- a sky whose brightness does
+	// not match its illumination -- is not a shape anyone recognises as a bug.
+	//
+	// THE WHOLE NEGATIVE HALF-LINE, not just exactly -1, because the alternative is
+	// worse in both directions: a typo'd -0.5 must not reach the material (a
+	// negative gain SUBTRACTS radiance from the capture, and a SkyLight irradiance
+	// SH with negative lobes darkens the surfaces facing the Milky Way -- that reads
+	// as "the band is upside down", not as bad input), and it must not silently
+	// become 0 either, because "starlight quietly switched off" is the one outcome
+	// no ladder rung would flag. Both collapse into "derive", which is loud in the
+	// log and correct in the frame. NOTE the consequence: -1 does NOT mean "off".
+	// 0 means off.
 	//
 	// WHY IT CANNOT LIVE ON THE MPC ASSET AS A TUNING KNOB: ApplySkyMaterialParams
 	// writes StarAmbientGain every frame, so the asset default is overwritten
@@ -277,22 +361,30 @@ namespace
 	//
 	// All three conditions of the S2 gate hold at 1.0: moonless ground leaves black,
 	// moonless stays strictly BELOW moonlit, and daylight is unchanged to 0.02/255
-	// because the star branch only exists in the capture pass. So the default moves
-	// 0 -> 1.0 and starlight ships live. It stays a cvar because it multiplies
-	// against the exposure curve's deep-night lift and the two are tuned together.
+	// because the star branch only exists in the capture pass. That is the value the
+	// calibration constant now carries, so the shipped behaviour is unchanged and
+	// the S2 measurement still stands behind it. It stays an OVERRIDABLE cvar
+	// because the S2 gate A/Bs it directly, arm A 1.0 against arm B 0, and because
+	// it multiplies against the exposure curve's deep-night lift.
 	TAutoConsoleVariable<float> CVarSkyStarAmbientGain(
-		TEXT("voxel.Sky.StarAmbientGain"), 1.0f,
+		TEXT("voxel.Sky.StarAmbientGain"), -1.0f,
 		TEXT("Gain on the star map inside the SkyLight's real-time capture, via ")
-		TEXT("MPC_VoxelSky.StarAmbientGain and M_SkyAtmosphereDome's ReflectionCapturePassSwitch. DEFAULT 1.0, ")
-		TEXT("measured at S2: it takes moonless ground from 0.05 to ~5 mean luma while leaving daylight ")
-		TEXT("unchanged to 0.02/255. Set 0 to remove starlight from the ambient term entirely. Raising it is ")
-		TEXT("phase S2. It multiplies StarBrightness (the sunrise fade, already carrying voxel.Sky.StarGain's ")
-		TEXT("measured 0.15) and the horizon fade, and then rides the exposure curve's up-to-15.6-stop night ")
-		TEXT("lift -- so the S2 gate is two-sided: winter night ground luma must rise above 0.5 and stay ")
-		TEXT("STRICTLY BELOW the moonlit 17.4-25.5, or 'brighter' just means 'washed grey' and every ")
-		TEXT("one-sided gate passes anyway. Does NOT affect the main view: the switch reads ")
-		TEXT("View.RenderingReflectionCaptureMask (Common.ush:2306-2309), which is 0 on screen. It IS also ")
-		TEXT("read by ordinary reflection captures; this project ships none."),
+		TEXT("MPC_VoxelSky.StarAmbientGain and M_SkyAtmosphereDome's ReflectionCapturePassSwitch. DEFAULT -1, ")
+		TEXT("WHICH MEANS DERIVE: the effective gain becomes the measured star-ambient calibration constant ")
+		TEXT("(1.0), so appearance and illumination cannot be tuned apart by accident. Any value >= 0 is an ")
+		TEXT("explicit override and is used verbatim; every negative value means derive, so -1 does NOT mean ")
+		TEXT("'off' -- 0 means off. The run log states the RESOLVED gain and whether it was DERIVED or ")
+		TEXT("OVERRIDDEN, so read that rather than this default. Measured at S2: 1.0 takes moonless ground ")
+		TEXT("from 0.05 to ~5 mean luma while leaving daylight unchanged to 0.02/255. It multiplies ")
+		TEXT("StarBrightness (the sunrise fade, ALREADY carrying voxel.Sky.StarGain) and the horizon fade, ")
+		TEXT("which is why the derived value is a constant and not proportional to StarGain -- StarGain is ")
+		TEXT("already in there once, and putting it in twice would make ambient starlight quadratic. Then it ")
+		TEXT("rides the exposure curve's up-to-15.6-stop night lift, so the S2 gate is two-sided: winter ")
+		TEXT("night ground luma must rise above 0.5 and stay STRICTLY BELOW the moonlit 17.4-25.5, or ")
+		TEXT("'brighter' just means 'washed grey' and every one-sided gate passes anyway. Does NOT affect ")
+		TEXT("the main view: the switch reads View.RenderingReflectionCaptureMask (Common.ush:2306-2309), ")
+		TEXT("which is 0 on screen. It IS also read by ordinary reflection captures; this project ships ")
+		TEXT("none. tools/sky-albedo-check.py re-measures the calibration off a starlit capture."),
 		ECVF_Default);
 
 	TAutoConsoleVariable<float> CVarSkyStarRotationOffsetTurns(
@@ -418,15 +510,40 @@ namespace VoxelSky
 
 	bool IsAtmosphereDomeEnabled() { return CVarSkyAtmosphereDome.GetValueOnAnyThread() != 0; }
 
-	// Floored at 0 only. There is deliberately no ceiling: the honest upper bound
-	// is whatever the S2 capture measures, and a clamp invented here would silently
-	// cap the very sweep S2 exists to run -- which is the failure the read-back rule
-	// in this file exists to prevent (a knob that stops moving while the log echoes
-	// what was typed). Negative is refused because a negative gain would SUBTRACT
-	// radiance from the capture, and a SkyLight irradiance SH with negative lobes
-	// darkens surfaces that face the Milky Way. That reads as "the band is wrong
-	// side up" rather than as a bad input.
-	float GetStarAmbientGain() { return FMath::Max(0.f, CVarSkyStarAmbientGain.GetValueOnAnyThread()); }
+	// The ONE place voxel.Sky.StarAmbientGain turns into a number the material sees.
+	// Both public accessors go through it so "what gain am I at" and "was that
+	// derived" can never answer from two different reads of the cvar.
+	//
+	// There is deliberately no ceiling on an override: the honest upper bound is
+	// whatever a capture measures, and a clamp invented here would silently cap the
+	// very sweep the S2 gate exists to run -- the failure the read-back rule in this
+	// file exists to prevent (a knob that stops moving while the log echoes what was
+	// typed). No floor is needed either, because the sentinel test below already
+	// makes every negative value unreachable by the material.
+	float ResolveStarAmbientGain(bool& bOutDerived)
+	{
+		const float Requested = CVarSkyStarAmbientGain.GetValueOnAnyThread();
+
+		// SPELT AS !(x >= 0) RATHER THAN (x < 0) SO NaN DERIVES. A NaN gain would
+		// otherwise pass a `< 0` test as false, reach the MPC, and NaN-poison the
+		// SkyLight's irradiance SH -- which does not look like a bad input, it looks
+		// like the world's ambient term went black or white at random.
+		bOutDerived = !(Requested >= 0.f);
+		return bOutDerived ? kStarAmbientCalibration : Requested;
+	}
+
+	float GetStarAmbientGain()
+	{
+		bool bDerived = false;
+		return ResolveStarAmbientGain(bDerived);
+	}
+
+	bool IsStarAmbientGainDerived()
+	{
+		bool bDerived = false;
+		ResolveStarAmbientGain(bDerived);
+		return bDerived;
+	}
 
 	// Unclamped and unwrapped on purpose: it is a rotation in turns, so every
 	// real value is meaningful and 1.25 means the same thing as 0.25. Wrapping it
@@ -1246,11 +1363,21 @@ struct FVoxelSkyImpl
 	// the resolved pair is logged when it changes and not every frame.
 	double AppliedStarUDirection = 0.0;
 
-	// Last voxel.Sky.StarAmbientGain logged. Starts at a value the cvar cannot
-	// hold (it is floored at 0) so the FIRST frame always logs the gain the run is
-	// actually at -- an S2 capture has to be able to state its own gain from its
-	// own log, and "no line" would be indistinguishable from "gain 0".
+	// Last RESOLVED star ambient gain logged -- the number the material was handed,
+	// never the number the cvar was asked for. Starts at a value the RESOLVED gain
+	// cannot hold (resolution maps the whole negative half-line to the calibration
+	// constant, so nothing negative ever comes out of it) so the FIRST frame always
+	// logs the gain the run is actually at -- an S2 capture has to be able to state
+	// its own gain from its own log, and "no line" would be indistinguishable from
+	// "gain 0".
 	float AppliedStarAmbientGain = -1.f;
+
+	// Whether that gain was DERIVED or OVERRIDDEN, latched separately because the
+	// two can change without the value changing: `voxel.Sky.StarAmbientGain 1.0`
+	// resolves to the same 1.0 the default derives, and a run that had been pinned
+	// to an explicit value would otherwise never say so. -1 = nothing logged yet,
+	// which is distinct from both states rather than aliasing one of them.
+	int32 AppliedStarAmbientGainDerived = -1;
 
 	FVoxelSkyState State;
 };
@@ -1422,7 +1549,8 @@ void UVoxelSkySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		       TEXT("ShadowUpdateHz=%.2f ExposureMode=%d ExposureBias=%.2f ")
 		       TEXT("DayEV=%.2f SunsetEV=%.2f TwilightEV=%.2f DeepNightEV=%.2f DeepNightDrop=%.2f ")
 		       TEXT("Dome=%d DomeRadiusUU=%.0f StarRotationOffsetTurns=%.4f ")
-		       TEXT("StarsAt0Deg=%.2f StarsAt-6Deg=%.2f StarsAt-12Deg=%.2f"),
+		       TEXT("StarsAt0Deg=%.2f StarsAt-6Deg=%.2f StarsAt-12Deg=%.2f ")
+		       TEXT("StarAmbientGain=%.4f (%s, calibrated at StarGain %.2f)"),
 		       VoxelSky::IsEnabled() ? 1 : 0, VoxelSky::GetTimeScale(), DayLength, DaysPerYear,
 		       VoxelSky::GetOriginLatitudeDeg(), VoxelSky::GetOriginLongitudeDeg(),
 		       VoxelSky::IsMoonEnabled() ? 1 : 0,
@@ -1457,7 +1585,15 @@ void UVoxelSkySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		       VoxelSky::IsDomeEnabled() ? 1 : 0, VoxelSky::GetDomeRadiusUU(),
 		       VoxelSky::GetStarRotationOffsetTurns(),
 		       StarBrightnessForSunAltitude(0.0), StarBrightnessForSunAltitude(-6.0),
-		       StarBrightnessForSunAltitude(-12.0));
+		       StarBrightnessForSunAltitude(-12.0),
+		       // RESOLVED and MODE, on the same line as StarsAt-12Deg (which IS
+		       // voxel.Sky.StarGain, the fade being 1 there) so the two halves of the
+		       // star calibration are readable side by side in one grep. Printing the
+		       // cvar instead would print the -1 sentinel, i.e. would report every
+		       // shipped run as having negative starlight.
+		       VoxelSky::GetStarAmbientGain(),
+		       VoxelSky::IsStarAmbientGainDerived() ? TEXT("DERIVED") : TEXT("OVERRIDDEN"),
+		       kStarAmbientCalibrationStarGain);
 	}
 }
 
@@ -2577,13 +2713,27 @@ void UVoxelSkySubsystem::ApplySkyMaterialParams()
 		World, Collection, TEXT("StarBrightness"),
 		(float)StarBrightnessForSunAltitude(S.SunAltitudeDeg));
 
-	// --- the capture's star gain (phase S2's switch, shipped at 0) ------------
+	// --- the capture's star gain (the star ambient calibration) ---------------
 	//
 	// Read by M_SkyAtmosphereDome ONLY, and only on the Reflection branch of its
 	// ReflectionCapturePassSwitch -- so at any gain it is invisible on screen and
 	// only ever changes what the SkyLight's real-time capture integrates
 	// (View.RenderingReflectionCaptureMask, Common.ush:2306-2309, is 0 in the main
 	// view and 1 in the capture, ReflectionEnvironmentRealTimeCapture.cpp:570).
+	//
+	// RESOLVED ONCE, then written and logged from that one value. Calling the
+	// accessor twice would be a second read of a live cvar between the write and
+	// the log, so a console edit landing in the gap would make the log describe a
+	// frame that was never rendered -- the exact class of lie the read-back rule in
+	// this file exists to forbid.
+	//
+	// NOTE WHAT THE GAIN IS MULTIPLYING. The MPC's StarBrightness, written a few
+	// lines above, is sunriseFade * voxel.Sky.StarGain, and BOTH domes multiply it
+	// (create_sky_material.py:628, create_sky_atmosphere_dome_material.py:286-289).
+	// So this scalar is exactly the ratio (capture star radiance)/(visible star
+	// radiance) and nothing else -- it carries no StarGain of its own and needs no
+	// fade of its own. See kStarAmbientCalibration for the measurement that fixes
+	// its value and for why deriving it from StarGain would be a double count.
 	//
 	// WRITTEN EVERY FRAME EVEN THOUGH IT IS A CVAR THAT RARELY MOVES, for the same
 	// reason every other name in this function is: the MPC has no per-material
@@ -2596,22 +2746,47 @@ void UVoxelSkySubsystem::ApplySkyMaterialParams()
 	// MPC_VoxelSky.StarAmbientGain does nothing once this line exists -- exactly
 	// the correction recorded above StarBrightnessForSunAltitude, and the reason
 	// voxel.Sky.StarAmbientGain exists as a cvar at all.
+	bool bStarAmbientDerived = false;
+	const float StarAmbientGain = VoxelSky::ResolveStarAmbientGain(bStarAmbientDerived);
 	UKismetMaterialLibrary::SetScalarParameterValue(
-		World, Collection, TEXT("StarAmbientGain"), VoxelSky::GetStarAmbientGain());
+		World, Collection, TEXT("StarAmbientGain"), StarAmbientGain);
 
 	// Logged on TRANSITION only, and logged at all because S2's whole gate is
 	// "did the ambient term move, and by how much" -- a capture has to be able to
 	// state the gain it was shot at from its own log rather than from the command
 	// line that was supposed to have been used.
-	if (!FMath::IsNearlyEqual(VoxelSky::GetStarAmbientGain(), Impl->AppliedStarAmbientGain, 1.e-6f))
+	//
+	// THE LOG STATES THE RESOLVED GAIN AND THE MODE, NOT THE REQUESTED VALUE. With
+	// a sentinel default the requested value is -1 on every shipped run, so a log
+	// that echoed the cvar would say "-1" for the frames that rendered at 1.0 --
+	// which is not merely unhelpful, it is the one reading that would make someone
+	// conclude starlight was off. The mode is latched separately because an explicit
+	// `voxel.Sky.StarAmbientGain 1.0` resolves to the same number the default
+	// derives, and a pinned run has to be able to say it was pinned.
+	if (!FMath::IsNearlyEqual(StarAmbientGain, Impl->AppliedStarAmbientGain, 1.e-6f) ||
+		Impl->AppliedStarAmbientGainDerived != (bStarAmbientDerived ? 1 : 0))
 	{
-		Impl->AppliedStarAmbientGain = VoxelSky::GetStarAmbientGain();
+		Impl->AppliedStarAmbientGain = StarAmbientGain;
+		Impl->AppliedStarAmbientGainDerived = bStarAmbientDerived ? 1 : 0;
 		UE_LOG(LogVoxelSky, Log,
-		       TEXT("VoxelSky StarAmbientGain -> %.4f (voxel.Sky.StarAmbientGain, written into %s). This is the ")
-		       TEXT("SkyLight capture's star gain ONLY -- it cannot change a main-view pixel, because ")
-		       TEXT("M_SkyAtmosphereDome routes it through a ReflectionCapturePassSwitch. 0 is phase S1's shipped ")
-		       TEXT("value: the branch exists in the graph and contributes nothing."),
-		       Impl->AppliedStarAmbientGain, kSkyCollectionPath);
+		       TEXT("VoxelSky StarAmbientGain RESOLVED to %.4f, %s (voxel.Sky.StarAmbientGain requested %.4f; ")
+		       TEXT("written into %s). %s This is the SkyLight capture's star gain ONLY -- it cannot change a ")
+		       TEXT("main-view pixel, because M_SkyAtmosphereDome routes it through a ")
+		       TEXT("ReflectionCapturePassSwitch. It is the RATIO of capture star radiance to visible star ")
+		       TEXT("radiance: voxel.Sky.StarGain (%.4f here) is already inside the shared StarBrightness ")
+		       TEXT("scalar both domes multiply, so this number carries none of it. 0 removes starlight from ")
+		       TEXT("the ambient term entirely. Re-measure with tools/sky-albedo-check.py on a starlit ")
+		       TEXT("capture: ground/sky luminance must equal the ground's albedo."),
+		       StarAmbientGain,
+		       bStarAmbientDerived ? TEXT("DERIVED from kStarAmbientCalibration") : TEXT("OVERRIDDEN explicitly"),
+		       CVarSkyStarAmbientGain.GetValueOnAnyThread(), kSkyCollectionPath,
+		       bStarAmbientDerived
+		           ? TEXT("Derived means appearance and illumination cannot drift apart unnoticed; the ")
+		             TEXT("constant was measured at voxel.Sky.StarGain 0.15 against a snowfield whose ")
+		             TEXT("ground/sky luminance ratio came out 0.790, i.e. snow's albedo.")
+		           : TEXT("OVERRIDDEN: the calibration is NOT being enforced on this run, which is right ")
+		             TEXT("for an A/B arm and wrong for a shipped capture. Set it to -1 to hand it back."),
+		       FMath::Max(0.f, CVarSkyStarGain.GetValueOnAnyThread()));
 	}
 }
 

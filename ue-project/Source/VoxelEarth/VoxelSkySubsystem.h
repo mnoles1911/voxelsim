@@ -351,10 +351,25 @@ namespace VoxelSky
 	// 0.00%) and a spawn-time-only switch cannot express that comparison.
 	VOXELEARTH_API bool IsAtmosphereDomeEnabled();
 
-	// Gain on the star map inside the SkyLight's real-time capture, written into
-	// MPC_VoxelSky.StarAmbientGain every frame. DEFAULT 0 -- phase S1 ships the
-	// capture's star branch present but gained to nothing, so S2 is a cvar flip
-	// rather than a material rebuild. Floored at 0; see the cvar for why negative
-	// is refused rather than clamped silently.
+	// The RESOLVED gain on the star map inside the SkyLight's real-time capture,
+	// written into MPC_VoxelSky.StarAmbientGain every frame.
+	//
+	// DERIVED BY DEFAULT from kStarAmbientCalibration (VoxelSkySubsystem.cpp), which
+	// is the measured ratio between the two rendering contexts that carry the same
+	// star map: the visible additive dome and the capture's emissive branch. That is
+	// what stops "how bright stars look" and "how much they light the world" from
+	// being two free knobs that agree only by coincidence.
+	//
+	// voxel.Sky.StarAmbientGain defaults to the NEGATIVE SENTINEL -1 meaning derive;
+	// any value >= 0 overrides verbatim. So -1 does NOT mean "off" -- 0 means off --
+	// and this accessor never returns a negative number whatever the cvar holds.
+	// Always report what this returns, never the cvar: the cvar reads -1 on every
+	// shipped run.
 	VOXELEARTH_API float GetStarAmbientGain();
+	// Whether GetStarAmbientGain() came from the calibration constant or from an
+	// explicit override. Exists so the log can say WHICH -- an override and the
+	// derived value can be the same number (the S2 gate's A arm pins 1.0, which is
+	// also what the calibration derives), and "the calibration is not being enforced
+	// on this run" is not visible in the value alone.
+	VOXELEARTH_API bool IsStarAmbientGainDerived();
 }
