@@ -1228,6 +1228,204 @@ void reportPeriodicity(const Raster& r, const char* label) {
                 "a wavelength that scales as 1/grade is voxel QUANTISATION.\n");
 }
 
+// --- TERRACE-BOUNDARY CROOKEDNESS ------------------------------------------
+//
+// WHY THIS EXISTS, and why the previous instrument could not see the artifact it
+// is aimed at. The periodicity scan above analyses the CONTINUOUS height field h,
+// and found no periodic component at the reported 1-2 m spacing -- correctly. The
+// artifact does not live in h. It lives in floor(h / kVoxelSizeMm), the QUANTISED
+// level field, because terracing is a THRESHOLD phenomenon: a perfectly smooth
+// surface with no periodic content at all still produces hard, long, straight step
+// edges once it is quantised. Measuring h's spectrum was measuring amplitude
+// structure when the defect is edge structure.
+//
+// So this measures the terrace boundaries themselves -- the curves where the voxel
+// level changes -- and asks how crooked they are.
+//
+// THE PRIMARY METRIC HAS AN ABSOLUTE BENCHMARK, which is the whole reason to prefer
+// it. Box-counting dimension of real topographic contour lines is a published
+// quantity: natural contours measure D ~ 1.15-1.25. A smooth analytic surface's
+// contours are rectifiable curves with D = 1.0 exactly. So "our contours are
+// machined" becomes a number against an external target rather than an opinion, and
+// needs no reference DTM -- which matters here because no metre-scale real DTM is
+// available on this machine.
+//
+// CONTROLS ARE COMPUTED EVERY RUN, NOT ASSUMED. This file has now had three
+// instrument bugs in one session (a normalisation that returned r > 1, a plane fit
+// that left 17 voxels of landform in the "residual", and a peak search that
+// reported its own filter radius). So contourStraightness is run on two fields
+// whose answers are known before it is run on terrain:
+//   * a tilted PLANE, which must give D ~= 1.0 and very long straight runs;
+//   * a WHITE-NOISE field, which must give D ~= 2.0 and runs of ~1.
+// If those two do not come out, the terrain number is not reported as meaningful.
+struct ContourStats {
+    double boxDim = 0;          // mean box-counting D over sampled levels
+    double meanStraightRun = 0; // mean maximal axis-aligned boundary run, cells
+    double p99StraightRun = 0;
+    int64_t levelsUsed = 0;
+    int64_t boundaryCells = 0;
+};
+
+// Maximal axis-aligned runs of boundary cells. A straight machined step edge is a
+// long run; a natural contour turns every few cells.
+void accumulateRuns(const std::vector<uint8_t>& b, int64_t n, std::vector<int64_t>& runs) {
+    for (int64_t j = 0; j < n; ++j) {
+        int64_t run = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            if (b[size_t(j * n + i)]) {
+                ++run;
+            } else {
+                if (run >= 2) runs.push_back(run);
+                run = 0;
+            }
+        }
+        if (run >= 2) runs.push_back(run);
+    }
+    for (int64_t i = 0; i < n; ++i) {
+        int64_t run = 0;
+        for (int64_t j = 0; j < n; ++j) {
+            if (b[size_t(j * n + i)]) {
+                ++run;
+            } else {
+                if (run >= 2) runs.push_back(run);
+                run = 0;
+            }
+        }
+        if (run >= 2) runs.push_back(run);
+    }
+}
+
+ContourStats contourStraightness(const std::vector<int64_t>& level, int64_t n) {
+    ContourStats out;
+    int64_t lo = level[0], hi = level[0];
+    for (int64_t v : level) {
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    if (hi <= lo) return out; // dead flat: no terraces to measure
+
+    // Sample up to 12 levels spread through the range. Each level's boundary is
+    // box-counted SEPARATELY: the union of all boundaries fills the plane on steep
+    // ground (every column changes level), which would drive D to 2 for a reason
+    // that has nothing to do with crookedness.
+    const int64_t want = 12;
+    const int64_t span = hi - lo;
+    std::vector<double> dims;
+    std::vector<int64_t> runs;
+    std::vector<uint8_t> b(size_t(n * n), 0);
+    for (int64_t t = 1; t <= want; ++t) {
+        const int64_t k = lo + span * t / (want + 1);
+        int64_t cells = 0;
+        for (int64_t j = 0; j < n; ++j) {
+            for (int64_t i = 0; i < n; ++i) {
+                const bool inside = level[size_t(j * n + i)] >= k;
+                bool edge = false;
+                if (i + 1 < n && (level[size_t(j * n + i + 1)] >= k) != inside) edge = true;
+                if (j + 1 < n && (level[size_t((j + 1) * n + i)] >= k) != inside) edge = true;
+                b[size_t(j * n + i)] = edge ? 1u : 0u;
+                if (edge) ++cells;
+            }
+        }
+        // Too sparse to fit a slope over; skip rather than fit noise.
+        if (cells < 64) continue;
+        out.boundaryCells += cells;
+        accumulateRuns(b, n, runs);
+
+        // Box counting over dyadic sizes. Fit ln N vs ln s by least squares; D is
+        // the negative slope.
+        double sx = 0, sy = 0, sxx = 0, sxy = 0;
+        int pts = 0;
+        for (int64_t s = 1; s <= 32; s *= 2) {
+            int64_t occupied = 0;
+            for (int64_t by = 0; by < n; by += s) {
+                for (int64_t bx = 0; bx < n; bx += s) {
+                    bool any = false;
+                    for (int64_t j = by; j < by + s && j < n && !any; ++j)
+                        for (int64_t i = bx; i < bx + s && i < n; ++i)
+                            if (b[size_t(j * n + i)]) {
+                                any = true;
+                                break;
+                            }
+                    if (any) ++occupied;
+                }
+            }
+            if (occupied <= 0) continue;
+            const double X = std::log(double(s)), Y = std::log(double(occupied));
+            sx += X; sy += Y; sxx += X * X; sxy += X * Y;
+            ++pts;
+        }
+        if (pts < 3) continue;
+        const double den = double(pts) * sxx - sx * sx;
+        if (den == 0) continue;
+        const double slope = (double(pts) * sxy - sx * sy) / den;
+        dims.push_back(-slope);
+        ++out.levelsUsed;
+    }
+    if (!dims.empty()) {
+        double s = 0;
+        for (double d : dims) s += d;
+        out.boxDim = s / double(dims.size());
+    }
+    if (!runs.empty()) {
+        std::sort(runs.begin(), runs.end());
+        double s = 0;
+        for (int64_t r : runs) s += double(r);
+        out.meanStraightRun = s / double(runs.size());
+        out.p99StraightRun = double(runs[size_t(double(runs.size()) * 0.99)]);
+    }
+    return out;
+}
+
+// Quantise a height raster to voxel levels.
+std::vector<int64_t> levelsFromHeights(const std::vector<double>& zMm, int64_t n) {
+    std::vector<int64_t> L(size_t(n * n), 0);
+    for (size_t i = 0; i < L.size(); ++i)
+        L[i] = int64_t(std::floor(zMm[i] / double(kVoxelSizeMm)));
+    return L;
+}
+
+void reportContourStraightness(const Raster& r, const char* label) {
+    // --- CONTROLS FIRST. See the header: this instrument has earned distrust.
+    const int64_t n = r.n;
+    std::vector<double> planeZ(size_t(n * n)), noiseZ(size_t(n * n));
+    // A tilted plane at ~4% grade, the grade band where the artifact reads worst.
+    // Voxel steps every 2.5 cells, so terraces exist and are perfectly straight.
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    for (int64_t j = 0; j < n; ++j)
+        for (int64_t i = 0; i < n; ++i) {
+            planeZ[size_t(j * n + i)] = 0.04 * double(i) * double(kVoxelSizeMm);
+            rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+            noiseZ[size_t(j * n + i)] =
+                double((rng >> 33) % 1000u) * double(kVoxelSizeMm) / 100.0;
+        }
+    const ContourStats ctlPlane = contourStraightness(levelsFromHeights(planeZ, n), n);
+    const ContourStats ctlNoise = contourStraightness(levelsFromHeights(noiseZ, n), n);
+    const bool controlsOk = ctlPlane.boxDim > 0.90 && ctlPlane.boxDim < 1.15 &&
+                            ctlNoise.boxDim > 1.70 && ctlNoise.boxDim < 2.10;
+
+    const ContourStats st = contourStraightness(levelsFromHeights(r.zMm, n), n);
+    std::printf("\n%s — TERRACE-BOUNDARY CROOKEDNESS (voxel level field, %lldx%lld at %.2f m)\n",
+                label, (long long)n, (long long)n, r.cellM);
+    std::printf("  CONTROLS   tilted plane D=%.3f (want ~1.0, straight runs %.1f cells)\n",
+                ctlPlane.boxDim, ctlPlane.meanStraightRun);
+    std::printf("             white noise  D=%.3f (want ~2.0, straight runs %.1f cells)\n",
+                ctlNoise.boxDim, ctlNoise.meanStraightRun);
+    if (!controlsOk) {
+        std::printf("  *** CONTROLS FAILED -- the instrument is wrong, and the terrain number below "
+                    "is NOT evidence. Fix the metric before reading it. ***\n");
+    }
+    std::printf("  TERRAIN    D=%.3f over %lld levels, %lld boundary cells\n", st.boxDim,
+                (long long)st.levelsUsed, (long long)st.boundaryCells);
+    std::printf("             straight boundary runs: mean %.2f cells (%.2f m), p99 %.0f cells "
+                "(%.2f m)\n",
+                st.meanStraightRun, st.meanStraightRun * r.cellM, st.p99StraightRun,
+                st.p99StraightRun * r.cellM);
+    std::printf("  HOW TO READ IT: real topographic contours box-count at D ~ 1.15-1.25; a smooth "
+                "analytic surface's contours are rectifiable, D = 1.0 exactly. D near 1.0 with long "
+                "straight runs is the machined-terrace signature. This is an ABSOLUTE benchmark, "
+                "not a calibration against a reference DTM -- none is available on this box.\n");
+}
+
 // D8 neighbour offsets, in a FIXED scan order. Ties in steepest-descent are
 // broken by taking the first in this order, so the routing is reproducible.
 const int kD8dx[8] = {1, 1, 0, -1, -1, -1, 0, 1};
@@ -4163,6 +4361,14 @@ int main(int argc, char** argv) {
         reportPeriodicity(pWide, "AMPLIFIED SURFACE (0.5 m cells)");
         const Raster cWide = sampleCarrierRaster(*tiles, vx0, vy0, 256, 5);
         reportPeriodicity(cWide, "CARRIER ONLY (0.5 m cells)");
+
+        // TERRACE CROOKEDNESS at true voxel spacing, which is the only spacing at
+        // which the quantisation artifact exists. Amplified and carrier-only, so the
+        // client's contribution is separable from the bake's.
+        const Raster tFine = sampleAmplifiedRaster(amp, vx0, vy0, 384, 1);
+        reportContourStraightness(tFine, "AMPLIFIED SURFACE");
+        const Raster tCar = sampleCarrierRaster(*tiles, vx0, vy0, 384, 1);
+        reportContourStraightness(tCar, "CARRIER ONLY");
     }
 
     // Optional raw dump of the voxel-quantised height field, for hillshading
