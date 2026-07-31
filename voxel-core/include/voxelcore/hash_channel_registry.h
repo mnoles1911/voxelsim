@@ -76,6 +76,9 @@ inline constexpr ChannelAlloc kChannelAllocs[] = {
     // hash.h -- v16 horizontal carrier warp, one channel per axis.
     {CH_CARRIER_WARP_X, 1, "CH_CARRIER_WARP_X"},
     {CH_CARRIER_WARP_Y, 1, "CH_CARRIER_WARP_Y"},
+    // hash.h -- v19 landform-scale warp component, one channel per axis.
+    {CH_CARRIER_WARP2_X, 1, "CH_CARRIER_WARP2_X"},
+    {CH_CARRIER_WARP2_Y, 1, "CH_CARRIER_WARP2_Y"},
     // density3.h allocates NOTHING. It held CH_POCKET = 29 for the pocket term
     // until kWorldGenVersion 12 removed that term (density3.h section 2); 29 is
     // free again. Everything the 3D density band hashes, it hashes through

@@ -96,18 +96,18 @@ VXC_TEST(dilate_single_column_matches_stencil_constants) {
     // gate reads the raster's relief at a 30 m physical baseline, which is
     // +/-16 pixels on the 1.875 m fine tier.
     // v16 widened them again to (-17, +17): the horizontal carrier warp displaces
-    // which cell a column samples by up to kCarrierWarpMaxMm, which is one pixel at
-    // the finest shipped pitch, and it ADDS to the prefilter/relief reach rather
-    // than competing with it.
-    CHECK_EQ(dilated.px0, -7);
-    CHECK_EQ(dilated.px1, 27);
+    // which cell a column samples, and it ADDS to the prefilter/relief reach
+    // rather than competing with it. v19's second warp component takes the
+    // total throw to 3750 mm = 2 px at the finest shipped pitch: (-18, +18).
+    CHECK_EQ(dilated.px0, -8);
+    CHECK_EQ(dilated.px1, 28);
 }
 
 VXC_TEST(dilate_negative_footprint) {
     const PixelRect footprint{-5, -5, -5, -5};
     const PixelRect dilated = dilateForCarrierStencil(footprint);
-    CHECK_EQ(dilated.px0, -22);
-    CHECK_EQ(dilated.px1, 12);
+    CHECK_EQ(dilated.px0, -23);
+    CHECK_EQ(dilated.px1, 13);
 }
 
 // --- fineReadPixelRect ------------------------------------------------------
@@ -527,20 +527,27 @@ VXC_TEST(read_margin_reaches_into_the_next_tile_and_the_gate_demands_it) {
     // 10 until worldgen v13, which grew kCarrierStencilLo/Hi from (-1,+2) to
     // (-16,+16) for the coarse carrier's prefilter halo. The guard below caught
     // that immediately, which is what it is for.
-    constexpr int64_t kInset = 18;
+    // v19: the carrier stencil grew to +/-18 px (second warp component), so 19
+    // is now the ONLY legal inset -- see the window note below.
+    constexpr int64_t kInset = 19;
     // The test is only meaningful while the margin is wider than the inset and
     // the stencil is narrower. If a cavern-size change ever breaks that, this
     // fails loudly rather than silently testing nothing.
     //
-    // WORTH KNOWING: that window is now nearly shut. At 1.875 m/px the carrier
-    // stencil reaches 16 px = 30 m and the cavern reach is 36.4 m = 19.4 px, so
-    // the only legal insets are 17, 18 and 19. If the stencil grows again this
+    // WORTH KNOWING: that window is now SHUT TO ONE VALUE. At 1.875 m/px the
+    // carrier stencil reaches 18 px = 33.75 m and the cavern reach is 36.4 m =
+    // 19.4 px, so the only legal inset is 19. The v19 warp total was SIZED to
+    // keep this window open (carrier.h kCarrierWarp2MaxMm). If the stencil grows again this
     // test becomes impossible to write -- and that is a DESIGN signal, not a
     // test problem: it would mean the carrier stencil had overtaken the cavern
     // reach, so "the cavern margin is what pulls in the neighbouring tile" would
     // no longer be the thing the gate has to get right. Re-derive the gate's
     // dominant term before widening this test.
-    CHECK(kCavernMaxReachMm / int64_t(kPxMm) > kInset);
+    // mm precision, not floored pixels: the claim is that the cavern margin
+    // reaches past the inset column's far edge, which is 36400 mm vs
+    // kInset * 1875 mm. The floored-px form (19 > 19) went false at v19 while
+    // the geometric fact stayed true by 775 mm.
+    CHECK(kCavernMaxReachMm > kInset * int64_t(kPxMm));
     CHECK(kCarrierStencilHi < kInset);
 
     const int64_t px = kTilePx - 1 - kInset;

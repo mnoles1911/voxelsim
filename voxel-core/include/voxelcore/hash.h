@@ -59,7 +59,9 @@ constexpr uint64_t splitmix64(uint64_t z) {
 //   32..47   hash.h             CH_SYNTH_TILE_BASE + synthetic dev-tile index
 //   48       hash.h             CH_CARRIER_WARP_X  (v16 carrier warp)
 //   49       hash.h             CH_CARRIER_WARP_Y  (v16 carrier warp)
-//   50..     FREE
+//   50       hash.h             CH_CARRIER_WARP2_X (v19 landform-scale warp)
+//   51       hash.h             CH_CARRIER_WARP2_Y (v19 landform-scale warp)
+//   52..     FREE
 //
 // HISTORY. CH_CAVE_NODE and CH_CAVE_EDGE originally reused ids 18 and 19 â€”
 // the exact ids CH_ECOTONE_TEMP and CH_ECOTONE_PRECIP already occupied â€” a
@@ -99,6 +101,10 @@ enum HashChannel : uint32_t {
     // both. Registered in hash_channel_registry.h.
     CH_CARRIER_WARP_X = 48,
     CH_CARRIER_WARP_Y = 49,
+    // v19 landform-scale warp (32.8 m lattice, 4 m throw). Same mechanism as
+    // 48/49, independent field. Registered in hash_channel_registry.h.
+    CH_CARRIER_WARP2_X = 50,
+    CH_CARRIER_WARP2_Y = 51,
     CH_SYNTH_TILE_BASE = 32, // synthetic dev tiles, reserve 32..47
 };
 

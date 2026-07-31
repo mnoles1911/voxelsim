@@ -112,16 +112,18 @@ static_assert(kCarrierMaxReliefLagPx == 16,
 // the prefilter and relief reads all shift with it. Taken at the finest shipped
 // pitch, where the warp costs the most pixels.
 inline constexpr int64_t kCarrierMaxWarpPx = carrierWarpPx(1875);
-static_assert(kCarrierMaxWarpPx == 1,
-              "the warp's pixel cost moved; it is a ceiling division of kCarrierWarpMaxMm "
-              "by the finest tier's pitch and it dilates every host's raster window");
+static_assert(kCarrierMaxWarpPx == 2,
+              "the warp's pixel cost moved; it is a ceiling division of "
+              "kCarrierWarpTotalMaxMm by the finest tier's pitch and it dilates every "
+              "host's raster window (v19: 3750 mm total over the two components -- "
+              "sized to stay UNDER the cavern reach, see carrier.h)");
 inline constexpr int64_t kCarrierReachLo =
     kCarrierPrefilterLo < -kCarrierMaxReliefLagPx ? kCarrierPrefilterLo : -kCarrierMaxReliefLagPx;
 inline constexpr int64_t kCarrierReachHi =
     kCarrierPrefilterHi > kCarrierMaxReliefLagPx ? kCarrierPrefilterHi : kCarrierMaxReliefLagPx;
 inline constexpr int64_t kCarrierStencilLo = kCarrierReachLo - kCarrierMaxWarpPx;
 inline constexpr int64_t kCarrierStencilHi = kCarrierReachHi + kCarrierMaxWarpPx;
-static_assert(kCarrierStencilLo == -17 && kCarrierStencilHi == 17,
+static_assert(kCarrierStencilLo == -18 && kCarrierStencilHi == 18,
               "the control-stencil contract moved; every host that copies a raster window to "
               "the GPU derives its margin from these two numbers, and a window that is not "
               "dilated to match does not fault -- it silently generates different terrain.");

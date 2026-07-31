@@ -511,8 +511,29 @@ constexpr uint32_t kDetailOctaveCount = sizeof(kDetailOctaves) / sizeof(kDetailO
 // other in a comment rather than in two files.
 constexpr Octave kFineDetailOctaves[] = {
     // --- SHAPING band: slope- and curvature-gated, vanishes on flats.
-    // One octave, not two: 3.2 m is the first wavelength the 1.875 m raster
-    // cannot resolve. PROVISIONAL amplitude -- 500 mm at 1.6 m continued down a
+    //
+    // v19 RESTORES THE MESO OCTAVES (12.8 m, 6.4 m), and the band-ownership
+    // argument above is not being un-learned -- it is being priced. The baked
+    // tier resolves these wavelengths, but what it MEASURABLY carries there on
+    // steep open faces is a near-constant grade: B3 relaxation planes every
+    // face toward its local threshold, and a face whose grade is constant over
+    // tens of metres voxelises to evenly spaced parallel terraces (band
+    // spacing = 100 mm / grade -- docs/measurements/repose-field-2026-07-30
+    // .txt and contour-crookedness-2026-07-30.txt). The repose-strength bake
+    // varies grade where thermal or incision BINDS; nothing on either side
+    // varied it on translation-invariant expanses, which is exactly where the
+    // owner still traces bands. These two octaves put +-1 m of relief at the
+    // 6-13 m wavelength -- grade variation of order 10-25% on engaged ground
+    // -- and the v14 cap prices GRADIENT, which is what makes them affordable
+    // where every sub-3.2 m attempt was not: amplitude-per-gradient scales
+    // with wavelength. They ride the shaping band's own gates, so they still
+    // vanish on the flats where the bake's structure is complete and correct;
+    // and the two-pool cap below guarantees them a gradient budget the
+    // material band cannot crowd out (see kDetailGradMesoShareQ10).
+    {12800, 800},
+    {6400, 400},
+    // 3.2 m is the first wavelength the 1.875 m raster cannot resolve.
+    // PROVISIONAL amplitude -- 500 mm at 1.6 m continued down a
     // lambda^0.8 ramp gives 500 * 2^0.8 ~= 870, rounded to 900. The plan requires
     // this be set by probe measurement against the fine tier's measured S2, and
     // that measurement does not exist yet. Do not tune it by eye.
@@ -531,7 +552,7 @@ constexpr Octave kFineDetailOctaves[] = {
 };
 constexpr uint32_t kFineDetailOctaveCount =
     sizeof(kFineDetailOctaves) / sizeof(kFineDetailOctaves[0]);
-constexpr uint32_t kFineLandformOctaveCount = 1;
+constexpr uint32_t kFineLandformOctaveCount = 3;
 
 // --- THE DETAIL AMPLITUDE SCALE (v10.1) -------------------------------------
 //
@@ -751,7 +772,7 @@ static_assert(!kAmpUnscaled || (kDetailOctaveCount == 5 && kLandformMaxMm == 369
               "detail allowance from the table, so the bound is still sound -- but "
               "re-read its derivation before updating these numbers, and remember an "
               "octave change is a worldgen change (bump kWorldGenVersion).");
-static_assert(!kAmpUnscaled || (kFineDetailOctaveCount == 4 && kFineLandformMaxMm == 99 &&
+static_assert(!kAmpUnscaled || (kFineDetailOctaveCount == 6 && kFineLandformMaxMm == 1297 &&
                                 kFineMetreMaxMm == 99 && kFineMicroMaxMm == 598),
               "kFineDetailOctaves changed; same obligation as the coarse table above.");
 // The envelope TIGHTENS on a fine world -- because two synthesised landform
@@ -886,12 +907,18 @@ constexpr int64_t kFineDetailMaxAtMaxSlopeMm =
 // for why that is true even though the bound can no longer use the footprint's
 // own gate value.
 static_assert(!kAmpUnscaled || (kDetailMaxAtMaxSlopeMm == 15509), "detail allowance moved");
-static_assert(!kAmpUnscaled || (kFineDetailMaxAtMaxSlopeMm == 2280), "fine-tier detail allowance moved");
+static_assert(!kAmpUnscaled || (kFineDetailMaxAtMaxSlopeMm == 6473), "fine-tier detail allowance moved");
 // The fine tier still buys a materially tighter envelope, but the margin is
 // 2.76x at v13 rather than 3.8x -- because the coarse side came down by 1.8x
 // and the fine side only by 1.4x, the two tiers' worst cases converged. Written
 // as 2x rather than quietly re-fitted to 2.76 so that the assert keeps meaning
 // "materially", which is what it is for.
+// v19: the restored meso octaves take the fine allowance 2280 -> 6473 mm. That
+// is a real streaming cost (looser trims on fine worlds, ~4 m of envelope) and
+// it is paid deliberately: the envelope is priced at the gates' ceiling, while
+// the CAPPED surface stays inside max(floor, k * slope) like everything else.
+// The 2x margin below still holds -- barely -- and if a future octave breaks
+// it, the meso band's amplitude is the knob to revisit first.
 static_assert(kFineDetailMaxAtMaxSlopeMm * 2 < kDetailMaxAtMaxSlopeMm,
               "the fine tier is supposed to buy a materially tighter surface bound");
 
@@ -980,7 +1007,7 @@ static_assert(!kAmpUnscaled || (kLandformGradMmPerM == 272 && kMetreGradMmPerM =
                                 kMicroGradMmPerM == 887),
               "coarse ladder nominal gradient moved; re-mirror worldgen.ush and re-run the "
               "drainage calibration (client-detail-drainage-2026-07-29.txt) before shipping");
-static_assert(!kAmpUnscaled || (kFineLandformGradMmPerM == 31 && kFineMetreGradMmPerM == 62 &&
+static_assert(!kAmpUnscaled || (kFineLandformGradMmPerM == 155 && kFineMetreGradMmPerM == 62 &&
                                 kFineMicroGradMmPerM == 2000),
               "fine ladder nominal gradient moved; same obligation as the coarse trio");
 // The measurement doc's headline mechanism, pinned: the coarse ladder at full
@@ -1059,6 +1086,36 @@ static_assert(kRillGradMmPerM == 187,
 constexpr int64_t kDetailGradCapKQ10 = 512;     // 0.5 x carrier gradient
 constexpr int64_t kDetailGradFloorMmPerM = 50;  // engaged minimum, coarse tier
 constexpr int64_t kFineDetailGradFloorMmPerM = 50;
+// --- v19: THE CAP SPLITS INTO TWO POOLS -------------------------------------
+//
+// Measured motivation, and it is arithmetic rather than taste: under ONE joint
+// scale the fine ladder's nominal gradient on a steep face is dominated by the
+// material band (2000 of ~2800 mm/m), so the shared scale lands near 0.12 and
+// a restored meso octave ships at an eighth of its amplitude -- sub-voxel,
+// which is precisely the failure mode every additive anti-banding attempt died
+// of (contour-crookedness-2026-07-30.txt). The meso band's whole claim to
+// existence is that its gradient is CHEAP (amplitude/lattice ~ 78 mm/m per
+// metre of relief at 12.8 m); a budget split makes that cheapness effective
+// instead of notional.
+//
+// The SHAPING band gets up to kDetailGradMesoShareQ10 of the allowance; the
+// metre + material bands + rill get the REMAINDER, which includes whatever the
+// shaping band did not use -- on flat ground the relief gate silences the
+// shaping band, its measured share is ~0, and the material band keeps the
+// whole floor, so the anti-terrace texture on plains is intact by
+// construction, not by tuning.
+//
+// THE DRAINAGE PROOF SHAPE IS UNCHANGED: post-cap total nominal gradient <=
+// share + (allowance - share) = allowance, the same bound the one-pool cap
+// enforced, and each pool's factor is still a pure scale-down (<= 1.0), so
+// every amplitude envelope above holds verbatim. What changes is only WHICH
+// octaves spend the budget. Calibration of k and the floors carries over
+// because the total is what they were calibrated against; the ten-class
+// ladder and the fine exemplars are re-run at every worldgen bump regardless.
+constexpr int64_t kDetailGradMesoShareQ10 = 512; // half the allowance
+static_assert(kDetailGradMesoShareQ10 > 0 && kDetailGradMesoShareQ10 < 1024,
+              "the shaping pool must get a positive share and must leave the material "
+              "band a positive remainder -- both divides below rely on it");
 static_assert(kDetailGradCapKQ10 > 0 && kDetailGradCapKQ10 <= 1024,
               "k above 1.0 licenses detail steeper than the ground it decorates, which is "
               "the defect this cap exists to remove");
@@ -1177,7 +1234,7 @@ static_assert(!kAmpUnscaled || (kLandformAbsMaxMm == 3700 && kMetreAbsMaxMm == 5
 static_assert(kFineLandformAbsMaxMm >= kFineLandformMaxMm &&
                   kFineMetreAbsMaxMm >= kFineMetreMaxMm && kFineMicroAbsMaxMm >= kFineMicroMaxMm,
               "same obligation as the coarse pair, on the fine-tier table");
-static_assert(!kAmpUnscaled || (kFineLandformAbsMaxMm == 100 && kFineMetreAbsMaxMm == 100 &&
+static_assert(!kAmpUnscaled || (kFineLandformAbsMaxMm == 1300 && kFineMetreAbsMaxMm == 100 &&
                                 kFineMicroAbsMaxMm == 600),
               "fine-tier detail amplitude sum moved; see (4)");
 
@@ -1410,12 +1467,21 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     // the surface stays a single-valued function of one position rather than a blend
     // of two. Climate does NOT: see the s.px/s.py assignment at the end of this
     // function.
+    // v19: TWO warp components, added. The 4 m lattice raggeds a step edge;
+    // the 32.8 m lattice bends the whole band stack and varies its apparent
+    // spacing -- a wander whose coherence length is shorter than the rhythm
+    // cannot break the rhythm. Same throw/lattice ratio, so each component
+    // perturbs gradient magnitude by the same ~12% the v16 analysis priced.
     const int64_t warpX =
         valueNoise2Fade(seed_, xMm, yMm, kCarrierWarpLatticeMm, CH_CARRIER_WARP_X) *
-        kCarrierWarpMaxMm / kDetailNoiseScale;
+            kCarrierWarpMaxMm / kDetailNoiseScale +
+        valueNoise2Fade(seed_, xMm, yMm, kCarrierWarp2LatticeMm, CH_CARRIER_WARP2_X) *
+            kCarrierWarp2MaxMm / kDetailNoiseScale;
     const int64_t warpY =
         valueNoise2Fade(seed_, xMm, yMm, kCarrierWarpLatticeMm, CH_CARRIER_WARP_Y) *
-        kCarrierWarpMaxMm / kDetailNoiseScale;
+            kCarrierWarpMaxMm / kDetailNoiseScale +
+        valueNoise2Fade(seed_, xMm, yMm, kCarrierWarp2LatticeMm, CH_CARRIER_WARP2_Y) *
+            kCarrierWarp2MaxMm / kDetailNoiseScale;
     const int64_t xW = xMm + warpX, yW = yMm + warpY;
     const int64_t px = floorDiv(xW, pxMm), py = floorDiv(yW, pxMm);
     const int64_t fx = xW - px * pxMm, fy = yW - py * pxMm;
@@ -1530,9 +1596,12 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     // Three bands, three gates. The MATERIAL band takes no relief gate at all --
     // see the band-split block above kDetailOctaves: it is the ground's own
     // texture and does not scale with how much landform it is draped over.
-    int64_t detailMm = landformMm * rScale / 1024 * cScale / 1024 +
-                       metreMm * rScale / 1024 * cScaleMicro / 1024 +
-                       microMm * cScaleMicro / 1024;
+    // v19: the SHAPING band is kept separate from the rest through the cap,
+    // because the cap now budgets the two pools separately (see
+    // kDetailGradMesoShareQ10); they are summed after it.
+    int64_t shapingMm = landformMm * rScale / 1024 * cScale / 1024;
+    int64_t restMm = metreMm * rScale / 1024 * cScaleMicro / 1024 +
+                     microMm * cScaleMicro / 1024;
 
     // Two ADDITIVE structured terms, each with its own gate and its own proved
     // envelope. They are added after the band scaling rather than folded into a
@@ -1552,22 +1621,28 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     const int64_t addMm = rillMm(seed_, xMm, yMm, carrier.sxMmPerPx * 1000 / pxMm,
                                  carrier.syMmPerPx * 1000 / pxMm) +
                           beddingMm(seed_, xMm, yMm, baseMm);
-    detailMm += addMm * rScale / 1024;
+    restMm += addMm * rScale / 1024;
 
-    // v14: THE DETAIL GRADIENT CAP -- one scale-down over the whole summed
-    // detail. See the derivation block above kDetailGradCapKQ10. The nominal
-    // gradient is the per-band amplitude/lattice sum through the SAME gates,
-    // in the SAME order and integer form, as the detail sum itself, so the
-    // estimate and the thing it estimates cannot drift apart. Every quantity
-    // here is non-negative except detailMm itself, whose divide truncates
-    // toward zero -- truncDiv in the HLSL mirror, never floorDiv.
+    // v14: THE DETAIL GRADIENT CAP. See the derivation block above
+    // kDetailGradCapKQ10. The nominal gradient is the per-band
+    // amplitude/lattice sum through the SAME gates, in the SAME order and
+    // integer form, as the detail sum itself, so the estimate and the thing it
+    // estimates cannot drift apart. Every quantity here is non-negative except
+    // the two band sums, whose divides truncate toward zero -- truncDiv in the
+    // HLSL mirror, never floorDiv.
+    //
+    // v19: TWO POOLS (see kDetailGradMesoShareQ10). The shaping band gets up
+    // to half the allowance; the rest -- metre + material + rill -- gets the
+    // remainder, INCLUDING whatever the shaping band's own nominal gradient
+    // left unspent, so a silenced shaping band (flat ground) hands the whole
+    // allowance to the texture bands exactly as before.
     const int64_t gradLand = fine ? kFineLandformGradMmPerM : kLandformGradMmPerM;
     const int64_t gradMetre = fine ? kFineMetreGradMmPerM : kMetreGradMmPerM;
     const int64_t gradMicro = fine ? kFineMicroGradMmPerM : kMicroGradMmPerM;
-    const int64_t detailGradMmPerM = gradLand * rScale / 1024 * cScale / 1024 +
-                                     gradMetre * rScale / 1024 * cScaleMicro / 1024 +
-                                     gradMicro * cScaleMicro / 1024 +
-                                     kRillGradMmPerM * rScale / 1024;
+    const int64_t gradShaping = gradLand * rScale / 1024 * cScale / 1024;
+    const int64_t gradRest = gradMetre * rScale / 1024 * cScaleMicro / 1024 +
+                             gradMicro * cScaleMicro / 1024 +
+                             kRillGradMmPerM * rScale / 1024;
     // Engagement first: full on a fine world, ramped on the coarse one --
     // exactly zero below the ramp so flat coarse classes are bit-for-bit v13,
     // saturating to full above it. The branches keep every divide's numerator
@@ -1587,17 +1662,36 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
         const int64_t gradFloor = fine ? kFineDetailGradFloorMmPerM : kDetailGradFloorMmPerM;
         int64_t allowedGradMmPerM = kDetailGradCapKQ10 * slopeMmPerM / 1024;
         if (allowedGradMmPerM < gradFloor) allowedGradMmPerM = gradFloor;
-        if (detailGradMmPerM > allowedGradMmPerM) {
+        // Pool 1: the shaping band against its share. usedShaping is what it
+        // actually claims -- its own nominal gradient when under the share,
+        // the share when capped -- so the remainder below is exact and the
+        // post-cap total stays <= the allowance, which is the entire drainage
+        // guarantee.
+        const int64_t allowedShaping =
+            allowedGradMmPerM * kDetailGradMesoShareQ10 / 1024;
+        int64_t usedShaping = gradShaping;
+        if (gradShaping > allowedShaping) {
             // Full-engagement scale, then blended toward 1.0 by the ramp. The
             // truncation in the blend rounds the scale UP (less capping), so
             // the result stays in (capQ10, 1024] -- never zero, never above
-            // one -- and the divide below is the only signed one: truncDiv in
+            // one -- and the band-sum divide is the signed one: truncDiv in
             // the HLSL mirror, never floorDiv.
-            const int64_t capQ10 = allowedGradMmPerM * 1024 / detailGradMmPerM;
+            const int64_t capQ10 = allowedShaping * 1024 / gradShaping;
             const int64_t scaleQ10 = 1024 - engageQ10 * (1024 - capQ10) / 1024;
-            detailMm = detailMm * scaleQ10 / 1024;
+            shapingMm = shapingMm * scaleQ10 / 1024;
+            usedShaping = allowedShaping;
+        }
+        // Pool 2: everything else against the remainder. allowedRest >= the
+        // allowance minus its shaping share > 0 by the static_assert on
+        // kDetailGradMesoShareQ10, so the divide below cannot see zero.
+        const int64_t allowedRest = allowedGradMmPerM - usedShaping;
+        if (gradRest > allowedRest) {
+            const int64_t capQ10 = allowedRest * 1024 / gradRest;
+            const int64_t scaleQ10 = 1024 - engageQ10 * (1024 - capQ10) / 1024;
+            restMm = restMm * scaleQ10 / 1024;
         }
     }
+    const int64_t detailMm = shapingMm + restMm;
 
     SurfaceEval s;
     // UNWARPED, and this is load-bearing. Callers index the tile raster with these
@@ -1720,7 +1814,8 @@ bool Amplifier::surfaceBoundsMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t v
     //
     // v16: DILATED BY THE CARRIER WARP, and this is the line that keeps the bound a
     // bound. A column at (x,y) now evaluates the carrier at (x + wx, y + wy) with
-    // |w| <= kCarrierWarpMaxMm, so the set of carrier positions this footprint can
+    // |w| <= kCarrierWarpTotalMaxMm (v19: the SUM of the two components' throws),
+    // so the set of carrier positions this footprint can
     // reach is the footprint grown by that much on every side. Bounding the
     // undilated rectangle would miss the extremum a warped column can actually
     // sample, and a surface bound that is too tight is not a cosmetic error -- the
@@ -1728,10 +1823,10 @@ bool Amplifier::surfaceBoundsMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t v
     // Dilated at the entry rather than corrected later so that every derivation
     // below -- the control grid, the Lipschitz differences, the centre column --
     // inherits it automatically.
-    const int64_t x0Mm = vx0 * kVoxelSizeMm - kCarrierWarpMaxMm;
-    const int64_t x1Mm = vx1 * kVoxelSizeMm + kCarrierWarpMaxMm;
-    const int64_t y0Mm = vy0 * kVoxelSizeMm - kCarrierWarpMaxMm;
-    const int64_t y1Mm = vy1 * kVoxelSizeMm + kCarrierWarpMaxMm;
+    const int64_t x0Mm = vx0 * kVoxelSizeMm - kCarrierWarpTotalMaxMm;
+    const int64_t x1Mm = vx1 * kVoxelSizeMm + kCarrierWarpTotalMaxMm;
+    const int64_t y0Mm = vy0 * kVoxelSizeMm - kCarrierWarpTotalMaxMm;
+    const int64_t y1Mm = vy1 * kVoxelSizeMm + kCarrierWarpTotalMaxMm;
 
     // THE CONTROL GRID. The cells the columns fall in are cx0..cx1; a cubic
     // B-spline on cell c reads control points c-1..c+2, so the grid the bound
