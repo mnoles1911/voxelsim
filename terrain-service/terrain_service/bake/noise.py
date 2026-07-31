@@ -594,10 +594,19 @@ def repose_erodibility(repose_deg: np.ndarray, *, base_deg: float = 36.0,
         raise ValueError(f"ratio must be positive, got {ratio}")
     if not base_deg < max_deg:
         raise ValueError(f"need base_deg {base_deg} < max_deg {max_deg}")
-    f = np.asarray(repose_deg, dtype=np.float64)
-    return np.power(float(ratio),
-                    -(f - float(base_deg)) / (float(max_deg) - float(base_deg))
-                    ).astype(np.float32)
+    f = np.asarray(repose_deg)
+    out = np.empty(f.shape, dtype=np.float32)
+    # Chunked over the leading axis for the bake pod's memory budget; per-cell
+    # float64 with one final cast, so bit-identical to the whole-array form.
+    fr = f.reshape(-1, f.shape[-1]) if f.ndim > 1 else f.reshape(1, -1)
+    outr = out.reshape(fr.shape)
+    for r0 in range(0, fr.shape[0], 512):
+        r1 = min(r0 + 512, fr.shape[0])
+        outr[r0:r1] = np.power(
+            float(ratio),
+            -(fr[r0:r1].astype(np.float64, copy=False) - float(base_deg))
+            / (float(max_deg) - float(base_deg)))
+    return out
 
 
 def _octave_field(shape: Tuple[int, int], p: int, seed: int, octave: int,

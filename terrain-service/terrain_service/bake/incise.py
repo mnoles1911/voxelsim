@@ -412,47 +412,74 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
     # the case where the pre-carve slope is the wrong slope.
     #
     # Working arrays are float32/int32 on purpose -- see _profile_pass.
-    af = np.clip(a, 0.0, None)
-    kfac = (np.float64(K_dt) * np.power(af, np.float64(m)))
+    #
+    # CHUNKED over row blocks (2026-07-30, bake pod budget): the unchunked
+    # chain held five to seven full-domain float64 temporaries at once, which
+    # at a production 9216^2 measured as THE bake's working-set peak
+    # (11.4 GiB against the 8 GiB pod, with the pipeline's own live grids
+    # underneath). Every op here is elementwise, the arithmetic per cell is
+    # unchanged (float64 throughout, one final cast to float32 -- exactly what
+    # `.astype(np.float32)` did at the end before), so the result is
+    # bit-identical and independent of the block layout.
     if regional_p < 0.0:
         raise ValueError(f"regional_p must be >= 0 (0 = use n), got {regional_p}")
+    p_exp = regional_p if regional_p > 0.0 else n
+    sreg = None
     if regional_slope is not None:
-        sreg = np.asarray(regional_slope, dtype=np.float64)
+        sreg = np.asarray(regional_slope)
         if sreg.shape != z.shape:
             raise ValueError(f"regional_slope {sreg.shape} must match filled {z.shape}")
         if regional_s_ref <= 0.0:
             raise ValueError(f"regional_s_ref must be positive, got {regional_s_ref}")
-        p_exp = regional_p if regional_p > 0.0 else n
-        kfac *= np.minimum(1.0, np.clip(sreg, 0.0, None) / np.float64(regional_s_ref)
-                           ) ** np.float64(p_exp)
+    ero = None
     if erodibility is not None:
-        ero = np.asarray(erodibility, dtype=np.float64)
+        ero = np.asarray(erodibility)
         if ero.shape != z.shape:
             raise ValueError(f"erodibility {ero.shape} must match filled {z.shape}")
         if float(ero.min()) < 0.0:
             raise ValueError("erodibility must be non-negative everywhere")
-        kfac *= ero
-    if a_crit_m2 > 0.0:
-        aq = np.power(af, np.float64(gate_q))
-        kfac *= aq / (aq + np.float64(a_crit_m2) ** np.float64(gate_q))
-    if sea_taper_bottom_m < sea_taper_top_m:
-        t = (z - np.float64(sea_taper_bottom_m)) / np.float64(
-            sea_taper_top_m - sea_taper_bottom_m)
-        t = np.clip(t, 0.0, 1.0)
-        kfac *= t * t * (3.0 - 2.0 * t)
-    kfac = kfac.astype(np.float32).ravel()
 
     h, w = z.shape
+    kfac32 = np.empty((h, w), dtype=np.float32)
+    for r0 in range(0, h, 512):
+        r1 = min(r0 + 512, h)
+        af_b = np.clip(a[r0:r1], 0.0, None)
+        k_b = np.float64(K_dt) * np.power(af_b, np.float64(m))
+        if sreg is not None:
+            k_b *= np.minimum(1.0, np.clip(sreg[r0:r1].astype(np.float64, copy=False),
+                                           0.0, None) / np.float64(regional_s_ref)
+                              ) ** np.float64(p_exp)
+        if ero is not None:
+            k_b *= ero[r0:r1].astype(np.float64, copy=False)
+        if a_crit_m2 > 0.0:
+            aq = np.power(af_b, np.float64(gate_q))
+            k_b *= aq / (aq + np.float64(a_crit_m2) ** np.float64(gate_q))
+        if sea_taper_bottom_m < sea_taper_top_m:
+            t = (z[r0:r1] - np.float64(sea_taper_bottom_m)) / np.float64(
+                sea_taper_top_m - sea_taper_bottom_m)
+            t = np.clip(t, 0.0, 1.0)
+            k_b *= t * t * (3.0 - 2.0 * t)
+        kfac32[r0:r1] = k_b
+    kfac = kfac32.ravel()
+    del kfac32
     if z.size > np.iinfo(np.int32).max:
         raise ValueError(f"domain of {z.size} cells exceeds the int32 order index")
     zf = np.ascontiguousarray(z).ravel()
     order = np.argsort(zf, kind="stable").astype(np.int32)
     rec32 = rec.astype(np.int32)
-    idx = np.arange(rec.size, dtype=np.int64)
-    tgt = np.where(rec >= 0, rec, idx)
-    diag = ((np.abs(idx // w - tgt // w) > 0) & (np.abs(idx % w - tgt % w) > 0))
-    dist = np.where(diag, float(cell_m) * _R2_DIST, float(cell_m)).astype(np.float32)
-    del idx, tgt, diag, a, af
+    # Receiver distances, chunked for the same pod-budget reason as kfac above:
+    # the flat idx/tgt/diag form held two full-domain int64 temporaries (1.3 GiB
+    # at production scale) for one float32 result. Elementwise, so bit-identical
+    # and block-layout independent.
+    dist = np.empty(rec.size, dtype=np.float32)
+    for c0 in range(0, rec.size, 512 * 16384):
+        c1 = min(c0 + 512 * 16384, rec.size)
+        idx = np.arange(c0, c1, dtype=np.int64)
+        tgt = np.where(rec[c0:c1] >= 0, rec[c0:c1], idx)
+        diag = ((np.abs(idx // w - tgt // w) > 0) & (np.abs(idx % w - tgt % w) > 0))
+        dist[c0:c1] = np.where(diag, float(cell_m) * _R2_DIST, float(cell_m))
+        del idx, tgt, diag
+    del a
     # Seeded with the input, not empty: if a caller's fill ever produced a tie
     # in float32, the tied donor would read its receiver's UNSOLVED elevation
     # and take the no-erosion branch -- a safe degradation instead of a read
