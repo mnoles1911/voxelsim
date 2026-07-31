@@ -314,6 +314,7 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
                      a_crit_m2: float = A_CRIT_M2, gate_q: float = GATE_Q,
                      regional_slope=None, regional_s_ref: float = 0.2,
                      regional_p: float = 0.0,
+                     erodibility=None,
                      sea_taper_top_m: float = SEA_TAPER_TOP_M,
                      sea_taper_bottom_m: float = SEA_TAPER_BOTTOM_M) -> np.ndarray:
     """Eroded surface in **metres** -- the implicit stream-power step.
@@ -345,6 +346,18 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
                 2.13) — while at p = 2 it keeps 2.3%, and the same dense
                 network carves sub-metre swales instead. Steep ground
                 (S_reg >= s_ref) is unaffected at any p.
+    `erodibility` OPTIONAL per-cell multiplier on the erodibility (same shape
+                as `filled`, non-negative). This is the MATERIAL STRENGTH hook
+                (bake_ver 6): the same repose field that keys thermal's
+                threshold is mapped to a K multiplier, so hard strata resist
+                the carve -- a stream crossing a strong band holds its bed
+                (a knickpoint) while the weak band downstream cuts a tread.
+                It multiplies `kfac` exactly where the gates and tapers do, so
+                every structural guarantee of the solve (z >= z_rcv, cap,
+                monotone network) is untouched: a multiplier of 0 simply means
+                "this cell does not erode", which the a_crit gate already
+                exercises everywhere below threshold. None disables and
+                reproduces the prior surface bit-for-bit.
     `regional_slope` OPTIONAL 30 m-scale slope of the CARRIER (not the
                 per-cell fine slope -- that variant double-counts S and is
                 refuted, see the note below). When given, the erodibility is
@@ -412,6 +425,13 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
         p_exp = regional_p if regional_p > 0.0 else n
         kfac *= np.minimum(1.0, np.clip(sreg, 0.0, None) / np.float64(regional_s_ref)
                            ) ** np.float64(p_exp)
+    if erodibility is not None:
+        ero = np.asarray(erodibility, dtype=np.float64)
+        if ero.shape != z.shape:
+            raise ValueError(f"erodibility {ero.shape} must match filled {z.shape}")
+        if float(ero.min()) < 0.0:
+            raise ValueError("erodibility must be non-negative everywhere")
+        kfac *= ero
     if a_crit_m2 > 0.0:
         aq = np.power(af, np.float64(gate_q))
         kfac *= aq / (aq + np.float64(a_crit_m2) ** np.float64(gate_q))

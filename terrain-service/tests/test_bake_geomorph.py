@@ -711,6 +711,80 @@ def test_profile_incision_respects_gate_taper_and_validation():
         incise.profile_incision(z, rec, acc, 0.0)
 
 
+def test_profile_incision_erodibility_is_the_strength_hook():
+    """bake_ver 6: hard strata resist the carve. Ones must reproduce the
+    unmodulated solve exactly (the disable path is bit-for-bit, not merely
+    close), a strong band must carve strictly less than baseline in that band,
+    and the structural guarantees (erosion-only, cap, monotone bed) must
+    survive a spatially varying multiplier."""
+    # K_dt small and the cap wide, so the carve is UNCENSORED: at the ladder's
+    # production numbers 65-82% of channel cells sit at the cap, where a K
+    # multiplier is invisible by construction -- the censoring trap the
+    # pipeline's own incision_cap_m comment documents.
+    z, rec, acc = _channel_strip(ncells=128)
+    base = incise.profile_incision(z, rec, acc, 1.875, K_dt=0.05, cap_m=200.0)
+    ones = incise.profile_incision(z, rec, acc, 1.875, K_dt=0.05, cap_m=200.0,
+                                   erodibility=np.ones_like(z))
+    np.testing.assert_array_equal(base, ones)
+
+    ero = np.ones_like(z)
+    ero[0, 40:80] = 1.0 / 6.0          # a strong band mid-channel
+    banded = incise.profile_incision(z, rec, acc, 1.875, K_dt=0.05, cap_m=200.0,
+                                     erodibility=ero)
+    d_base = (z - base.astype(np.float64))[0]
+    d_band = (z - banded.astype(np.float64))[0]
+    assert d_base[40:80].mean() < 190.0, "fixture must not be cap-censored"
+    assert d_band[40:80].mean() < 0.5 * d_base[40:80].mean(), \
+        "the strong band must resist the carve"
+    assert np.all(banded <= z + 1e-6), "erosion only"
+    assert np.all(z - banded <= 200.0 + 1e-4), "cap still bounds total lowering"
+    bed = banded.astype(np.float64)[0]
+    assert np.all(bed[1:] >= bed[:-1] - 1e-9), \
+        "monotone along the receiver chain: strength cannot create pits"
+
+    with pytest.raises(ValueError, match="erodibility"):
+        incise.profile_incision(z, rec, acc, 1.875,
+                                erodibility=np.ones((3, 3)))
+    with pytest.raises(ValueError, match="erodibility"):
+        incise.profile_incision(z, rec, acc, 1.875,
+                                erodibility=np.full_like(z, -0.5))
+
+
+def test_repose_erodibility_pins_and_disable():
+    """The mapping is pinned at its three anchor points -- 1.0 on baseline
+    rock (so the calibrated mean carve is untouched), 1/ratio on the strongest
+    -- and ratio 1 is an exact disable."""
+    f = np.array([[36.0, 72.0, 24.0]], dtype=np.float32)
+    m = noise.repose_erodibility(f, base_deg=36.0, max_deg=72.0, ratio=6.0)
+    assert m.dtype == np.float32
+    assert abs(float(m[0, 0]) - 1.0) < 1e-6
+    assert abs(float(m[0, 1]) - 1.0 / 6.0) < 1e-6
+    # weakest rock erodes FASTER than baseline, by less than the strong side
+    # resists (the sub-base range is narrower).
+    assert 1.0 < float(m[0, 2]) < 6.0
+    ones = noise.repose_erodibility(f, ratio=1.0)
+    assert np.array_equal(ones, np.ones_like(f))
+    with pytest.raises(ValueError):
+        noise.repose_erodibility(f, ratio=0.0)
+    with pytest.raises(ValueError):
+        noise.repose_erodibility(f, base_deg=72.0, max_deg=36.0)
+
+
+def test_repose_field_spatial_pass_is_chunk_invariant():
+    """The spatial pass is chunked in 512-row blocks for the memory budget
+    (the unchunked form was most of an 11 GiB peak against the 8 GiB pod).
+    Chunking must be invisible: a window that STRADDLES a big domain's block
+    boundary, evaluated standalone (one block), must agree bit-for-bit --
+    which holds only if each cell's value never depends on the block layout."""
+    rng = np.random.default_rng(11)
+    zbig = (rng.random((1100, 96)).astype(np.float32) * 700.0)
+    y0 = 462                           # rows 462..562 straddle the 512 line
+    zwin = zbig[y0:y0 + 100]
+    big = noise.repose_field(zbig, CELL_M, 42, (-64, -64))
+    win = noise.repose_field(zwin, CELL_M, 42, (-64 + y0, -64))
+    assert np.array_equal(big[y0:y0 + 100], win)
+
+
 def test_stream_power_default_K_carves_metres_not_millimetres():
     """LESSON: K is the one knob that decides whether the bake reads as terrain.
 

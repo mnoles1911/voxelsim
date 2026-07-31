@@ -197,7 +197,21 @@ __all__ = [
 #: reproduces the bake_ver-4 surface exactly. The constants roll the id on
 #: their own; the counter moves because thermal.relax and the B3 call grew the
 #: field path.
-BAKE_VERSION = 5
+#:
+#: 5 -> 6 (2026-07-30, contour corduroy, second front): the SAME material
+#: strength field now modulates B2d INCISION (``noise.repose_erodibility`` ->
+#: ``incise.profile_incision(erodibility=...)``), keyed on the filled surface
+#: being carved. Motivation, from the owner's in-engine verdict on bake_ver 5:
+#: the repose field restructures faces where thermal BINDS (gullies --
+#: confirmed by eye), but thermal is translation-invariant on a uniform
+#: sub-threshold ramp, so open faces kept their banding. Strength-modulated
+#: incision extends the structure below the repose regime: streams crossing
+#: strong strata hold their bed (knickpoints) while weak bands cut treads, so
+#: slope now varies at strata wavelength wherever there is any drainage at
+#: all, not only where thermal moves mass. ``incision_strength_ratio = 1``
+#: reproduces the bake_ver-5 surface exactly. The constant rolls the id on its
+#: own; the counter moves because the B2d call grew the field path.
+BAKE_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -533,6 +547,15 @@ class BakeConstants:
     #: 24 deg is a weathered debris slope; 72 deg holds jointed-rock faces.
     repose_min_deg: float = 24.0
     repose_max_deg: float = 72.0
+    #: bake_ver 6: how much harder strong rock is to CARVE than baseline
+    #: (``noise.repose_erodibility``; consumed by ``profile_incision`` in
+    #: "profile" mode). The strongest strata (repose_max_deg) erode 1/this as
+    #: fast; 1 disables and reproduces the bake_ver-5 incision exactly. 6 is
+    #: within the measured range of lithologic erodibility contrasts (an order
+    #: of magnitude between shale and well-jointed sandstone is conservative)
+    #: and, at the 30 m strata wavelength, gives channels crossing a full
+    #: strong band a knickpoint the cap does not censor on hillslope gullies.
+    incision_strength_ratio: float = 6.0
     thermal_iters: int = 48
     #: Must stay <= 0.5 -- ``thermal.relax`` rejects more outright. The shed is
     #: capped by the STEEPEST over-repose pair, so that pair can at most be
@@ -627,6 +650,11 @@ class BakeConstants:
                 f"profile_regional_p must be >= 0 (0 = use stream_n), got "
                 f"{self.profile_regional_p}"
             )
+        if self.incision_strength_ratio <= 0.0:
+            raise ValueError(
+                f"incision_strength_ratio must be positive (1 disables), got "
+                f"{self.incision_strength_ratio}"
+            )
         if self.b1_constructional_amp < 0.0:
             raise ValueError(
                 f"b1_constructional_amp must be >= 0 (0 disables), got "
@@ -667,6 +695,7 @@ class BakeConstants:
             "repose_strata_wavelength_m": self.repose_strata_wavelength_m,
             "repose_min_deg": self.repose_min_deg,
             "repose_max_deg": self.repose_max_deg,
+            "incision_strength_ratio": self.incision_strength_ratio,
             "thermal_iters": self.thermal_iters,
             "thermal_rate": self.thermal_rate,
             "superblock_tiles": self.superblock_tiles,
@@ -2209,6 +2238,38 @@ def bake_padded_domain(
             {"regional_p": consts.profile_regional_p}
             if consts.profile_regional_p > 0.0 else {}
         )
+        # bake_ver 6: material strength modulates the CARVE, not only the
+        # threshold. Same field construction as B3 below, keyed on the FILLED
+        # surface -- the rock actually being carved -- and world-anchored, so
+        # apron overlaps agree exactly. Forwarded only when live, for the
+        # test-double reason above; ratio 1 (or a zero-amplitude field)
+        # reproduces the bake_ver-5 incision bit-for-bit.
+        strength_kwargs = {}
+        if consts.incision_strength_ratio != 1.0 and (
+                consts.repose_spatial_amp_deg > 0.0
+                or consts.repose_strata_amp_deg > 0.0):
+            from .noise import repose_erodibility, repose_field
+
+            strength_kwargs = {
+                "erodibility": repose_erodibility(
+                    repose_field(
+                        filled,
+                        cell_m,
+                        seed,
+                        origin_cells,
+                        base_deg=consts.repose_deg,
+                        spatial_amp_deg=consts.repose_spatial_amp_deg,
+                        spatial_wavelength_m=consts.repose_spatial_wavelength_m,
+                        strata_amp_deg=consts.repose_strata_amp_deg,
+                        strata_wavelength_m=consts.repose_strata_wavelength_m,
+                        min_deg=consts.repose_min_deg,
+                        max_deg=consts.repose_max_deg,
+                    ),
+                    base_deg=consts.repose_deg,
+                    max_deg=consts.repose_max_deg,
+                    ratio=consts.incision_strength_ratio,
+                )
+            }
         eroded = np.asarray(
             kernels.profile_incision(
                 filled,
@@ -2226,10 +2287,11 @@ def bake_padded_domain(
                 sea_taper_top_m=consts.sea_taper_top_m,
                 sea_taper_bottom_m=consts.sea_taper_bottom_m,
                 **regional_p_kwargs,
+                **strength_kwargs,
             ),
             dtype=np.float32,
         )
-        del regional
+        del regional, strength_kwargs
         depth = filled - eroded
     else:
         depth = np.asarray(

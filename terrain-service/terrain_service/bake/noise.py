@@ -29,6 +29,7 @@ __all__ = [
     "prefilter",
     "roughness",
     "repose_field",
+    "repose_erodibility",
     "octave_wavelengths",
     "bspline_weights",
     "SPLINE_DEN",
@@ -526,11 +527,24 @@ def repose_field(z_m: np.ndarray, cell_m: float, seed: int,
     out = np.full((n0, n1), float(base_deg), dtype=np.float64)
 
     if spatial_amp_deg > 0.0:
+        # Chunked over rows exactly like the strata pass below, and for the
+        # same reason: the unchunked form held two full-domain float64 fields
+        # plus the upsample transients at once, which is most of why the first
+        # v5b production bake peaked at 11 GiB against the 8 GiB pod. Chunking
+        # is bit-identical because ``_octave_field`` is world-anchored (each
+        # cell's value is its own 4x4 stencil at absolute lattice indices, so
+        # the block origin only selects WHICH cells are evaluated, never what
+        # any cell evaluates to).
         p = max(4, int(round(spatial_wavelength_m / float(cell_m))))
-        sp = _octave_field((n0, n1), p, seed, _REPOSE_SPATIAL_OCTAVE_KEY, oy, ox).astype(np.float64)
-        sp += 0.5 * _octave_field((n0, n1), max(4, p // 4), seed,
-                                  _REPOSE_SPATIAL_OCTAVE_KEY + 1, oy, ox)
-        out += (float(spatial_amp_deg) / _TWO_OCTAVE_NORM) * sp
+        p4 = max(4, p // 4)
+        coef = float(spatial_amp_deg) / _TWO_OCTAVE_NORM
+        for r0 in range(0, n0, 512):
+            r1 = min(r0 + 512, n0)
+            sp = _octave_field((r1 - r0, n1), p, seed,
+                               _REPOSE_SPATIAL_OCTAVE_KEY, oy + r0, ox).astype(np.float64)
+            sp += 0.5 * _octave_field((r1 - r0, n1), p4, seed,
+                                      _REPOSE_SPATIAL_OCTAVE_KEY + 1, oy + r0, ox)
+            out[r0:r1] += coef * sp
         del sp
 
     if strata_amp_deg > 0.0:
@@ -550,6 +564,40 @@ def repose_field(z_m: np.ndarray, cell_m: float, seed: int,
 
     np.clip(out, float(min_deg), float(max_deg), out=out)
     return out.astype(np.float32)
+
+
+def repose_erodibility(repose_deg: np.ndarray, *, base_deg: float = 36.0,
+                       max_deg: float = 72.0, ratio: float = 6.0) -> np.ndarray:
+    """Map the repose (material-strength) field to a per-cell K multiplier.
+
+    ``incise.profile_incision``'s ``erodibility`` argument (bake_ver 6): the
+    SAME field that sets thermal's threshold also sets how fast fluvial
+    incision cuts, because both are the same physical fact -- rock strength.
+    Strong strata resisting the carve is what puts knickpoints and bench
+    treads where streams cross them; with strength in thermal only, incision
+    still carves every profile through hard and soft rock at one rate and the
+    structure exists only where thermal binds.
+
+    Log-linear in the field, pinned at 1.0 on baseline rock so the calibrated
+    mean carve (K_dt, the concavity numbers, the class scorecard) is
+    preserved:
+
+        mult = ratio ** (-(repose_deg - base_deg) / (max_deg - base_deg))
+
+    i.e. the strongest rock (``max_deg``) erodes ``1/ratio`` as fast as
+    baseline and the weakest correspondingly faster (the sub-base range is
+    narrower, so the boost is milder than the resistance -- deliberate:
+    holding rock up is the visible mechanism, digging soft rock out faster is
+    just its complement). ``ratio = 1`` disables (returns all ones).
+    """
+    if ratio <= 0.0:
+        raise ValueError(f"ratio must be positive, got {ratio}")
+    if not base_deg < max_deg:
+        raise ValueError(f"need base_deg {base_deg} < max_deg {max_deg}")
+    f = np.asarray(repose_deg, dtype=np.float64)
+    return np.power(float(ratio),
+                    -(f - float(base_deg)) / (float(max_deg) - float(base_deg))
+                    ).astype(np.float32)
 
 
 def _octave_field(shape: Tuple[int, int], p: int, seed: int, octave: int,

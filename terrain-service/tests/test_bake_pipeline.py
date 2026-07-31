@@ -184,6 +184,7 @@ def ref_stream_power(acc, slope, K=0.15, m=0.45, n=0.8, cap_m=25.0,
 def ref_profile_incision(filled, receivers, acc, cell_m, K_dt=1.5, m=0.45, n=0.8,
                          cap_m=25.0, a_crit_m2=1.0e4, gate_q=2.0,
                          regional_slope=None, regional_s_ref=0.2,
+                         erodibility=None,
                          sea_taper_top_m=0.0, sea_taper_bottom_m=-200.0):
     """LOCAL (radius-1) reference for the profile solve, on purpose.
 
@@ -208,6 +209,10 @@ def ref_profile_incision(filled, receivers, acc, cell_m, K_dt=1.5, m=0.45, n=0.8
     dist = np.where(diag, cell_m * 1.4142135623730951, cell_m)
     s = np.clip((z.ravel() - zr) / dist, 0.0, None)
     kfac = K_dt * np.power(a, m).ravel()
+    if erodibility is not None:
+        # bake_ver 6 material-strength hook: multiplied where the gates are,
+        # exactly as the real kernel does.
+        kfac = kfac * np.asarray(erodibility, np.float64).ravel()
     if regional_slope is not None and regional_s_ref > 0.0:
         kfac = kfac * np.minimum(
             1.0, np.clip(np.asarray(regional_slope, np.float64), 0.0, None)
