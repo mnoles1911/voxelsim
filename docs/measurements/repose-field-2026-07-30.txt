@@ -131,6 +131,27 @@ RESULTS -- filled in below as measured.
     below raises the ceiling to a genuinely cliff-holding 72 deg, deepens the
     weak floor to 24 deg and the strata swing to +-20 deg.
 
+  ITERATION 2 (v5b = the SHIPPED constants: spatial 8 deg / 160 m, strata
+  20 deg / 30 m, clamp [24, 72]):
+    slope p10/p50/p90/p99 over the 3.84 km window:
+      v4  0.344/0.706/0.903/1.080   frac within +-7% of tan36: 19.1%
+      v5  0.346/0.641/0.980/1.328                              14.9%
+      v5b 0.347/0.628/1.000/1.452                              13.9%
+    probe, same site/window: amplified D=1.011 (4824 bcells), ribs p50 0.5 m
+    p90 1.9 m; carrier ribs p90 8.6 m p99 12.3 m max 14.3 m (v4: p90 9.7 p99
+    21.7 max 26.5). Drainage: 0 sinks / 0.0% stranded / 243-245 m mean path
+    at both stages -- byte-for-byte the v4 posture. Bake 307 CPU-s; peak WS
+    11.0 GiB with the strata pass chunked (remaining excess over the 8 GiB
+    pod note is the float64 spatial field + field-kernel buffers; chunk the
+    spatial part the same way before any fleet bake).
+    Capture: D:\ue-cache\tmp\repose-after2.png (provider survey-g35-v5b).
+    Reading: the mid-slope bowl loses coherent banding and reads as talus
+    with held rock pads; the upper rows become short ragged segments at
+    variable spacing; the far-right face still carries a legible rhythm,
+    interrupted. Against the before frame the "one machined topographic
+    sheet" read is gone. Whether what remains passes the owner's eye is the
+    owner's call -- the three frames are the evidence.
+
 WHAT THIS DOES NOT FIX, AND THE RANKED REMAINDER. The field only acts where
 thermal binds -- steep ground, which is the named blocker. Moderate sub-repose
 faces (15-35% grade) keep whatever smoothness the carrier has there. In rank
