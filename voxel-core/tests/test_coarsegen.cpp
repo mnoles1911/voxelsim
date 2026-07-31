@@ -227,7 +227,7 @@ VXC_TEST(coarsegen_golden_digest) {
     // wired in per-brick or per-dispatch rather than per world coordinate.
     // (was 0x85B3E79EF8D01AFC at v5, 0xFCE6D8509799236D at v6..v11, and
     //  0xB812048EB08AA281 at the 700 mm cut of v12)
-    CHECK_EQ(d, 0xDD3579F3FD812E27ull);
+    CHECK_EQ(d, 0xF060CCF654203DD8ull);
 }
 
 VXC_TEST(coarsegen_seed_sensitivity) {
@@ -310,17 +310,7 @@ VXC_TEST(coarsegen_fidelity_vs_true_mip) {
     // of a 512-cell sample on grades real tiles do not reach, and occupancy IS
     // silhouette and collision, so if LOD popping shows up at the L1 transition on
     // a real mountainside this is the number to start from.
-    //
-    // v19: measured 83/33/13/17 against v16's 68/48/26/20. L2/L3 IMPROVED
-    // substantially (48 -> 33, 26 -> 13) and L1 rose (68 -> 83), and both are
-    // the two changes' fingerprints: the second warp component decorrelates a
-    // representative column further (the v16 L2 note, more so), while the
-    // two-pool gradient cap gives the coarse LANDFORM band a budget the
-    // material band can no longer crowd out on steep ground -- more metre-to-
-    // 25 m relief inside an L1 cell is exactly what a single representative
-    // column represents worst. Same policy: ceilings just above the measured
-    // values, same caveat about synthetic grades real tiles do not reach.
-    const int64_t occCeilPermille[5] = {0, 90, 40, 20, 25};
+    const int64_t occCeilPermille[5] = {0, 70, 65, 28, 25};
     // v10 raised L3 from 85 to 135. This is a REAL fidelity regression and is
     // recorded as one rather than absorbed: measured L3 material mismatch went
     // 85 -> 125 per mille when the bedding term landed.
@@ -353,10 +343,7 @@ VXC_TEST(coarsegen_fidelity_vs_true_mip) {
     // just above the new measurements so further degradation still trips.
     // Material at these levels is ring shading; the occupancy rows above are
     // the ones that gate collision.
-    // v19: measured 112/123/66/33 against v14's 170/149/83/25 -- three of four
-    // improved with the two-pool cap (quieter material band on steep ground);
-    // L4 rose 25 -> 33. Same set-just-above policy.
-    const int64_t matCeilPermille[5] = {0, 120, 130, 70, 36};
+    const int64_t matCeilPermille[5] = {0, 175, 155, 90, 30};
 
     for (int32_t level = 1; level <= 4; ++level) {
         const auto grid = gen.coarseColumns(level, 0, 0);

@@ -283,30 +283,10 @@ static_assert(kCarrierPrefilterDen > 0, "the prefilter denominator divides and m
 // there records the divergence that taught it.
 inline constexpr int64_t kCarrierWarpMaxMm = 500;
 inline constexpr int64_t kCarrierWarpLatticeMm = 4096;
-// v19: a SECOND, larger warp component. The v16 warp bends contours at its own
-// 4 m wavelength, which is why step edges stopped being dead straight -- but a
-// band RHYTHM spanning tens of metres is untouched by a wander whose coherence
-// length is 4 m: adjacent contours wander together only over distances shorter
-// than the rhythm the eye traces. This component is the same mechanism at
-// landform scale: a 24.6 m lattice with 3.25 m of throw bends the whole band
-// stack and locally dilates/compresses its spacing (the gradient magnitude
-// modulation is amp/lattice ~ 13%, deliberately the same order as v16's
-// 500/4096 = 12%, so the drainage argument carries over unchanged: direction
-// is preserved, magnitude wobbles by order 13% per component). The throw is
-// sized so the TOTAL (3750 mm) is exactly two fine pixels: at three the
-// carrier stencil (+/-19) would overtake the cavern reach (19.4 px), which is
-// the residency gate's dominant term -- see test_tilestreaming's read-margin
-// test for why that boundary is load-bearing.
-//
-// Both contracts below (read window, surface bound) dilate by the SUM of the
-// two throws -- kCarrierWarpTotalMaxMm -- because the components add.
-inline constexpr int64_t kCarrierWarp2MaxMm = 3250;
-inline constexpr int64_t kCarrierWarp2LatticeMm = 24576;
-inline constexpr int64_t kCarrierWarpTotalMaxMm = kCarrierWarpMaxMm + kCarrierWarp2MaxMm;
-// Ceiling division, so a finer tier cannot quietly under-dilate: 2 px at
-// 1875 mm, 1 px at 30000 mm since the v19 second component.
+// Ceiling division, so a finer tier cannot quietly under-dilate: 1 at both shipped
+// pitches (0.27 px at 1875 mm, 0.017 px at 30000 mm).
 constexpr int64_t carrierWarpPx(int64_t pxMm) {
-    return (kCarrierWarpTotalMaxMm + pxMm - 1) / pxMm;
+    return (kCarrierWarpMaxMm + pxMm - 1) / pxMm;
 }
 
 inline constexpr int64_t kCarrierPrefilterLo = -1 - kCarrierPrefilterRadius;

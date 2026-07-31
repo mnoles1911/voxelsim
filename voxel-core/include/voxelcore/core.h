@@ -137,31 +137,7 @@ namespace vxc {
 // The relative octave weighting is untouched; the floor keeps decimetre
 // roughness alive on flats (the anti-terrace band). Scale-down only, so every
 // surface bound derived at v13 is still sound unchanged.
-// --- v19: the fine tier gets its landform back, and the cap learns to pay ----
-//
-// Three changes, one target: the parallel contour-terrace banding on steep
-// fine-tier faces (docs/measurements/repose-field-2026-07-30.txt and
-// contour-crookedness-2026-07-30.txt -- band spacing = 100 mm / local grade,
-// and nothing on either side of the pipeline varied grade at 10-60 m
-// wavelength on translation-invariant expanses).
-//
-//   1. THE MESO OCTAVES RETURN (amplifier.cpp kFineDetailOctaves): 12.8 m /
-//      800 mm and 6.4 m / 400 mm in the fine shaping band. Amplitude-per-
-//      gradient scales with wavelength, so this is the one band that can vary
-//      local grade visibly while staying inside the v14 cap.
-//   2. THE CAP SPLITS INTO TWO POOLS (kDetailGradMesoShareQ10): the shaping
-//      band gets up to half the allowance, the texture bands the remainder
-//      plus whatever shaping leaves unspent. Under the old joint scale the
-//      material band's 2000 mm/m crowded any meso octave to sub-voxel
-//      amplitude. Post-cap total <= allowance -- the drainage guarantee is
-//      unchanged.
-//   3. A SECOND WARP COMPONENT (carrier.h kCarrierWarp2*): 24.6 m lattice,
-//      3.25 m throw -- same throw/lattice ratio as v16's, so the same
-//      drainage argument -- bending the whole band stack where the 4 m
-//      component can only ragged one step edge. Read windows and surface
-//      bounds dilate by the summed throw (kCarrierWarpTotalMaxMm, tiles.h
-//      +/-18 px, sized to stay under the cavern reach).
-inline constexpr uint32_t kWorldGenVersion = 19;
+inline constexpr uint32_t kWorldGenVersion = 18;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 

@@ -211,6 +211,18 @@ __all__ = [
 #: all, not only where thermal moves mass. ``incision_strength_ratio = 1``
 #: reproduces the bake_ver-5 surface exactly. The constant rolls the id on its
 #: own; the counter moves because the B2d call grew the field path.
+#: Also at 6 (same unshipped series): a B3b micro-refill -- the B2a epsilon
+#: fill re-run on the relaxed surface -- because thermal can receive-overfill
+#: a channel cell into a dam (its stability rule bounds what a cell GIVES, not
+#: what it receives; measured at one 41 mm interior sink on the exemplar), and
+#: "the carrier drains" is a contract, not a statistic. STAGE_ORDER carries
+#: the new stage, so the identity rolls with it. The refill then moved to
+#: B4b behind the B4 meso stage (post-thermal 15/7.5 m relief, steep-gated;
+#: noise.meso_relief carries the full why), and incision_strength_ratio
+#: shipped at 3 rather than 6 -- at 6 the knickpoint treads it makes are flat
+#: enough to fall under the codec's 100 mm quantization floor, which
+#: manufactures reconstruction-level pits the raw surface does not have
+#: (measured: 1 carrier sink at ratio 6, 0 at ratio 3, same window).
 BAKE_VERSION = 6
 
 
@@ -555,7 +567,19 @@ class BakeConstants:
     #: of magnitude between shale and well-jointed sandstone is conservative)
     #: and, at the 30 m strata wavelength, gives channels crossing a full
     #: strong band a knickpoint the cap does not censor on hillslope gullies.
-    incision_strength_ratio: float = 6.0
+    incision_strength_ratio: float = 3.0
+    #: bake_ver 6, B4: post-thermal meso relief (noise.meso_relief). RMS metres
+    #: at the 15 m / 7.5 m octaves, gated to zero at or below meso_slope_lo
+    #: (regional plains keep their calibrated statistics) and full at
+    #: meso_slope_hi. This is the band that varies local grade at the
+    #: band-spacing wavelength on steep faces -- the contour-banding residual's
+    #: named mechanism -- placed AFTER thermal so relaxation cannot plane it
+    #: back into the threshold pattern, and BEFORE the B4b refill so it cannot
+    #: cost drainage. 0/0 disables and reproduces the prior surface exactly.
+    meso_amp15_m: float = 0.8
+    meso_amp75_m: float = 0.4
+    meso_slope_lo: float = 0.20
+    meso_slope_hi: float = 0.40
     thermal_iters: int = 48
     #: Must stay <= 0.5 -- ``thermal.relax`` rejects more outright. The shed is
     #: capped by the STEEPEST over-repose pair, so that pair can at most be
@@ -650,6 +674,13 @@ class BakeConstants:
                 f"profile_regional_p must be >= 0 (0 = use stream_n), got "
                 f"{self.profile_regional_p}"
             )
+        if self.meso_amp15_m < 0.0 or self.meso_amp75_m < 0.0:
+            raise ValueError("meso amplitudes must be >= 0 (0 disables)")
+        if not 0.0 <= self.meso_slope_lo < self.meso_slope_hi:
+            raise ValueError(
+                f"need 0 <= meso_slope_lo < meso_slope_hi, got "
+                f"{self.meso_slope_lo}, {self.meso_slope_hi}"
+            )
         if self.incision_strength_ratio <= 0.0:
             raise ValueError(
                 f"incision_strength_ratio must be positive (1 disables), got "
@@ -696,6 +727,10 @@ class BakeConstants:
             "repose_min_deg": self.repose_min_deg,
             "repose_max_deg": self.repose_max_deg,
             "incision_strength_ratio": self.incision_strength_ratio,
+            "meso_amp15_m": self.meso_amp15_m,
+            "meso_amp75_m": self.meso_amp75_m,
+            "meso_slope_lo": self.meso_slope_lo,
+            "meso_slope_hi": self.meso_slope_hi,
             "thermal_iters": self.thermal_iters,
             "thermal_rate": self.thermal_rate,
             "superblock_tiles": self.superblock_tiles,
@@ -721,6 +756,8 @@ STAGE_ORDER: tuple[str, ...] = (
     "B2c.accumulate_mfd",
     "B2d.stream_power",
     "B3.relax",
+    "B4.meso",
+    "B4b.refill",
 )
 
 
@@ -2355,6 +2392,39 @@ def bake_padded_domain(
     )
     del repose
     tick("B3.relax", c0)
+
+    # -- B4: post-thermal meso relief. See noise.meso_relief for why this band
+    # can live NOWHERE else: B1 substrate at these wavelengths is planed by
+    # thermal back into the threshold pattern, and a client-side band coherent
+    # over 6-13 m makes pits the drainage lattice resolves (measured
+    # 0.04-0.33% stranded, realization-dependent). Here thermal never sees it
+    # and the refill below resolves every basin it could create.
+    c0 = time.process_time()
+    if consts.meso_amp15_m > 0.0 or consts.meso_amp75_m > 0.0:
+        from .noise import meso_relief  # lazy, same reason as repose_field
+
+        z = z + meso_relief(
+            z,
+            cell_m,
+            seed,
+            origin_cells,
+            amp15_m=consts.meso_amp15_m,
+            amp75_m=consts.meso_amp75_m,
+            slope_lo=consts.meso_slope_lo,
+            slope_hi=consts.meso_slope_hi,
+        )
+    tick("B4.meso", c0)
+
+    # -- B4b: micro-refill, and the stage that makes B4 affordable at all.
+    # Two producers of post-fill pits: thermal (its steepest-pair rule bounds
+    # what a cell gives, not what it receives -- measured as one 41 mm sink on
+    # the exemplar) and the B4 meso band (a bump can dam a marginal dip).
+    # "The carrier drains" is a CONTRACT (0 sinks / 0.0% stranded on steep
+    # ground), so every such basin is resolved here, before the codec sees the
+    # ground. Same epsilon fill as B2a, so filled flats stay routable.
+    c0 = time.process_time()
+    z = np.asarray(kernels.fill_depressions(z, **fill_kwargs), dtype=np.float32)
+    tick("B4b.refill", c0)
 
     return {
         "z": z,

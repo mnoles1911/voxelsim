@@ -212,7 +212,7 @@ VXC_TEST(amplifier_golden_digest) {
     // the rework had not taken effect.
     // (was 0xA29A7A767DC1543B at v5, 0x81785278E4DFCF67 at v3/v4,
     //  0x73B43CAE621CA286 at v2)
-    CHECK_EQ(d.h, 0x63AB25D57E00FF44ull);
+    CHECK_EQ(d.h, 0x31181C57D40172D6ull);
 }
 
 // --- C4: the cavern pass is actually wired into the amplifier ---------------
@@ -475,7 +475,7 @@ VXC_TEST(amplifier_deep_column_golden_digest) {
     // (was 0xF88B88DB9D9341AA at v5, 0x3384824A6CF22450 at v6..v11; and
     //  0xB125856533E5C174 at the 700 mm cut of v12, which was measured and
     //  rejected before it shipped -- see the Wave C retry notes)
-    CHECK_EQ(d.h, 0xCF234F105EDD4B8Cull);
+    CHECK_EQ(d.h, 0x93E5E64CF2DB5EACull);
 }
 
 VXC_TEST(generated_brick_matches_pointwise_queries) {
@@ -754,13 +754,7 @@ VXC_TEST(amplifier_surface_bound_adversarial) {
     // And the bound is not trivially large: somewhere in there it came within
     // the detail allowance of the true maximum.
     CHECK(st.minSlackMm >= 0);
-    // v19: the footprint dilation grew from 500 mm to kCarrierWarpTotalMaxMm =
-    // 3750 mm (second warp component), so even the tightest footprint carries
-    // ~2 x 3250 mm more of Lipschitz slack than at v16. Observed minimum on
-    // this sweep: 18006 mm (was under 12000). The ceiling still binds well
-    // under the mean slack (~100 m), so the assert keeps its power to catch
-    // the bound going trivially loose.
-    CHECK(st.minSlackMm < 22000);
+    CHECK(st.minSlackMm < 12000);
 }
 
 VXC_TEST(amplifier_surface_bound_single_column_is_base_exact) {
@@ -796,12 +790,9 @@ VXC_TEST(amplifier_surface_bound_single_column_is_base_exact) {
     // worst case, because the point of this test is to catch the BASE term
     // silently becoming conservative, and a ceiling loose enough to be
     // unfalsifiable would not. Observed worst on this sweep: 24585 mm (was
-    // 22848 at v9); 27756 mm at v19, where the single column's "point" is
-    // really a 7.6 m warp-dilated square (kCarrierWarpTotalMaxMm each side),
-    // so the base term is no longer point-exact and carries a few metres of
-    // real Lipschitz spread on steep synthetic ground. If this trips, check
-    // whether the base term regressed before assuming the detail table moved.
-    CHECK(worst <= 30000);
+    // 22848 at v9). If this trips, check whether the base term regressed before
+    // assuming the detail table simply moved.
+    CHECK(worst <= 26000);
 }
 
 VXC_TEST(amplifier_surface_bound_declines_rather_than_guesses) {
@@ -942,7 +933,7 @@ VXC_TEST(amplifier_surface_bound_golden_digest) {
     // samples) and by the real-tile sweep in vxc_terrainprobe.
     // (was 0x5588EBCD842ECE3D at v5, 0xBD833B557B0EC0AE at v6..v11; the entries
     //  are now +350 mm rather than the +700 the first cut of v12 gave them)
-    CHECK_EQ(d.h, 0xEBAA6BB5FF1B7EE9ull);
+    CHECK_EQ(d.h, 0x303322BAC788FEA0ull);
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,6 +1148,6 @@ VXC_TEST(amplifier_solid_below_bound_golden_digest) {
     // work to do, since the band genuinely puts air below surfaceMm.
     // (was 0xE9D395DF74D61495 at v5, 0x6E19AE5BC47B4E45 at v6..v11; -350 mm now,
     //  not the -700 the first cut of v12 gave it)
-    CHECK_EQ(d.h, 0xB9DEEC74084CE148ull);
+    CHECK_EQ(d.h, 0x9F5270A8AAB7C660ull);
 }
 

@@ -770,6 +770,44 @@ def test_repose_erodibility_pins_and_disable():
         noise.repose_erodibility(f, base_deg=72.0, max_deg=36.0)
 
 
+def test_meso_relief_gate_anchoring_and_disable():
+    """B4 meso: zero at or below slope_lo (plains keep their calibrated
+    statistics), live on steep ground, world-anchored (the same seam
+    obligation as every other bake field), disabled-at-zero exactly, and
+    chunk-invariant across the 512-row line (the slope gate takes a one-row
+    halo so np.gradient's central differences cannot depend on block layout)."""
+    n = 96
+    yy, xx = np.mgrid[0:n, 0:n].astype(np.float64)
+    flat = np.zeros((n, n), dtype=np.float32)
+    steep = (xx * CELL_M * 0.6).astype(np.float32)          # uniform 60% grade
+
+    assert np.array_equal(noise.meso_relief(flat, CELL_M, 7, (0, 0)),
+                          np.zeros((n, n), np.float32)), "flat ground must be untouched"
+    on = noise.meso_relief(steep, CELL_M, 7, (0, 0))
+    assert float(np.abs(on).mean()) > 0.1, "steep ground must carry meso relief"
+    off = noise.meso_relief(steep, CELL_M, 7, (0, 0), amp15_m=0.0, amp75_m=0.0)
+    assert np.array_equal(off, np.zeros((n, n), np.float32))
+
+    # World anchoring + chunk invariance in one: a window of a tall domain,
+    # straddling the big domain's 512-row block boundary, evaluated standalone.
+    rng = np.random.default_rng(5)
+    zbig = (rng.random((1100, 96)).astype(np.float32) * 400.0)
+    y0 = 462
+    zwin = zbig[y0:y0 + 100].copy()
+    big = noise.meso_relief(zbig, CELL_M, 42, (-64, -64))
+    win = noise.meso_relief(zwin, CELL_M, 42, (-64 + y0, -64))
+    # Interior rows only: the standalone window's np.gradient is one-sided at
+    # its own top/bottom edge, which the big domain's interior is not. That
+    # boundary behaviour is the apron's to cover in production (960 m >> one
+    # row); asserting the interior is what checks anchoring and chunking.
+    assert np.array_equal(big[y0 + 1:y0 + 99], win[1:99])
+
+    with pytest.raises(ValueError):
+        noise.meso_relief(steep, CELL_M, 7, (0, 0), amp15_m=-1.0)
+    with pytest.raises(ValueError):
+        noise.meso_relief(steep, CELL_M, 7, (0, 0), slope_lo=0.4, slope_hi=0.4)
+
+
 def test_repose_field_spatial_pass_is_chunk_invariant():
     """The spatial pass is chunked in 512-row blocks for the memory budget
     (the unchunked form was most of an 11 GiB peak against the 8 GiB pod).

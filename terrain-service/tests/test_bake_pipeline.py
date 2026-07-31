@@ -552,13 +552,15 @@ def test_flat_eps_is_forwarded_only_when_pinned():
     pipeline.bake_tile(world_seed=1, tile_x=0, tile_y=0,
                        coarse_fetch=lambda x, y: world.get((x, y)),
                        kernels=k, geom=TEST_GEOM, consts=TEST_CONSTS)
-    assert seen == [{}]
+    # TWO fills since B3b (the post-thermal micro-refill), both with the same
+    # forwarding: the auto epsilon is one decision, made once.
+    assert seen == [{}, {}]
     seen.clear()
     pipeline.bake_tile(world_seed=1, tile_x=0, tile_y=0,
                        coarse_fetch=lambda x, y: world.get((x, y)),
                        kernels=k, geom=TEST_GEOM,
                        consts=dataclasses.replace(TEST_CONSTS, flat_eps=1e-6))
-    assert seen == [{"flat_eps": 1e-6}]
+    assert seen == [{"flat_eps": 1e-6}, {"flat_eps": 1e-6}]
 
 
 def test_interior_dead_ends_are_counted():
@@ -1224,7 +1226,9 @@ def test_every_bake_constant_rolls_the_fingerprint():
                  # +0.5 would put slope_lo above slope_hi, which validation
                  # (correctly) refuses; use in-range alternatives instead.
                  "b1_constructional_slope_lo": 0.05,
-                 "b1_constructional_slope_hi": 0.25}
+                 "b1_constructional_slope_hi": 0.25,
+                 "meso_slope_lo": 0.10,
+                 "meso_slope_hi": 0.50}
     for fld in dataclasses.fields(BakeConstants):
         cur = getattr(pipeline.CONSTANTS, fld.name)
         if fld.name in valid_alt:

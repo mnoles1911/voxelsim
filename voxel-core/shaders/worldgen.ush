@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 19
+#define VXC_WORLDGEN_VERSION_USH 18
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -108,15 +108,6 @@ static const uint CH_CARRIER_WARP_Y = 49;
 static const int64_t kCarrierWarpMaxMm = 500;
 static const int64_t kCarrierWarpLatticeMm = 4096;
 static const int64_t kCarrierWarpNoiseScale = 32768;
-// v19 second warp component: landform-scale (24.6 m lattice, 3.25 m throw), the
-// same mechanism bending the whole band stack instead of one step edge.
-// MIRROR: hash.h CH_CARRIER_WARP2_X/Y, carrier.h kCarrierWarp2MaxMm /
-// kCarrierWarp2LatticeMm. Applied at BOTH carrier evaluation sites, like the
-// first component.
-static const uint CH_CARRIER_WARP2_X = 50;
-static const uint CH_CARRIER_WARP2_Y = 51;
-static const int64_t kCarrierWarp2MaxMm = 3250;
-static const int64_t kCarrierWarp2LatticeMm = 24576;
 static const uint CH_ECOTONE_TEMP = 18;   // v9 biome-boundary dither
 static const uint CH_ECOTONE_PRECIP = 19; // v9 biome-boundary dither
 // v10 structured-detail channels. detail_rill.h owns 26; detail_bedding.h owns
@@ -239,16 +230,10 @@ static const int kOctaveAmplitudeMm[kOctaveCount] = {2600, 1100, 500, 165, 95};
 // table, so fine octave 0 (3.2 m) draws the same channel as coarse octave 0
 // (25.6 m). That is deliberate on the CPU side and mirrored exactly here: they
 // are different worlds, never two renderings of one world.
-// v19: the 12.8 m and 6.4 m meso octaves are RESTORED to the fine shaping
-// band. MIRROR: amplifier.cpp kFineDetailOctaves, whose comment carries the
-// measured motivation (B3 planes open faces to near-constant grade; band
-// spacing = 100 mm / grade; nothing varied grade at 10-60 m on
-// translation-invariant expanses). They ride the shaping band's gates and the
-// two-pool cap below.
-static const int kFineOctaveCount = 6;
-static const int kFineLandformOctaveCount = 3;
-static const int kFineOctaveLatticeMm[kFineOctaveCount] = {12800, 6400, 3200, 1600, 400, 200};
-static const int kFineOctaveAmplitudeMm[kFineOctaveCount] = {800, 400, 100, 100, 400, 200};
+static const int kFineOctaveCount = 4;
+static const int kFineLandformOctaveCount = 1;
+static const int kFineOctaveLatticeMm[kFineOctaveCount] = {3200, 1600, 400, 200};
+static const int kFineOctaveAmplitudeMm[kFineOctaveCount] = {100, 100, 400, 200};
 
 // vxc::isFineTier -- a tile raster at or below this pitch carries baked sub-30 m
 // landform. 3750 is scale 8, 1875 is scale 16; both select the fine ladder.
@@ -293,18 +278,10 @@ static const int64_t kReliefScaleMaxQ10 = 2048;
 static const int64_t kLandformGradMmPerM = 272;
 static const int64_t kMetreGradMmPerM = 312;
 static const int64_t kMicroGradMmPerM = 887;
-static const int64_t kFineLandformGradMmPerM = 155;  // v19: meso octaves joined
+static const int64_t kFineLandformGradMmPerM = 31;
 static const int64_t kFineMetreGradMmPerM = 62;
 static const int64_t kFineMicroGradMmPerM = 2000;
 static const int64_t kDetailGradCapKQ10 = 512;
-// v19 TWO-POOL CAP. MIRROR: amplifier.cpp kDetailGradMesoShareQ10 and its
-// derivation block: under ONE joint scale the material band (2000 of ~2800
-// nominal mm/m on a steep fine face) crowds the meso octaves to sub-voxel
-// amplitude -- the exact death of every prior anti-banding attempt. The
-// shaping band gets up to this share of the allowance; the rest pool gets the
-// remainder plus whatever shaping left unspent. Post-cap total <= allowance,
-// so the drainage guarantee is the one-pool cap's, verbatim.
-static const int64_t kDetailGradMesoShareQ10 = 512;
 // v15. kRillMaxAbsMm * 1000 / kRillAcrossMm = 300 * 1000 / 1600, static_asserted
 // == 187 on the CPU side BECAUSE it is a literal here. Do not fold this into an
 // expression involving the rill constants: they live in detail_rill.h, which this
@@ -1556,18 +1533,11 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     // exactly as columnCarrierSlopeMmPerM's own header predicted.
         // evalSurface already receives the seed; do not rebuild it from uniforms here.
     const uint64_t warpSeed = seed;
-    // v19: TWO components, added -- MIRROR: amplifier.cpp's warpX/warpY block.
     const int64_t warpX = truncDiv(valueNoise2Fade(warpSeed, xMm, yMm, kCarrierWarpLatticeMm,
                                                   CH_CARRIER_WARP_X) * kCarrierWarpMaxMm,
-                                   kCarrierWarpNoiseScale) +
-                          truncDiv(valueNoise2Fade(warpSeed, xMm, yMm, kCarrierWarp2LatticeMm,
-                                                  CH_CARRIER_WARP2_X) * kCarrierWarp2MaxMm,
                                    kCarrierWarpNoiseScale);
     const int64_t warpY = truncDiv(valueNoise2Fade(warpSeed, xMm, yMm, kCarrierWarpLatticeMm,
                                                   CH_CARRIER_WARP_Y) * kCarrierWarpMaxMm,
-                                   kCarrierWarpNoiseScale) +
-                          truncDiv(valueNoise2Fade(warpSeed, xMm, yMm, kCarrierWarp2LatticeMm,
-                                                  CH_CARRIER_WARP2_Y) * kCarrierWarp2MaxMm,
                                    kCarrierWarpNoiseScale);
     const int64_t xW = xMm + warpX;
     const int64_t yW = yMm + warpY;
@@ -1685,11 +1655,9 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     // at all. Each q10 divide truncates, in exactly this order; folding any pair
     // into a single divide by 1024*1024 is NOT the same number and is a
     // divergence.
-    // v19: the SHAPING band stays separate through the cap (two pools; see
-    // kDetailGradMesoShareQ10); summed after it. MIRROR: amplifier.cpp.
-    int64_t shapingMm = truncDiv(truncDiv(landformMm * rScale, 1024) * cScale, 1024);
-    int64_t restMm = truncDiv(truncDiv(metreMm * rScale, 1024) * cScaleMicro, 1024) +
-                     truncDiv(microMm * cScaleMicro, 1024);
+    int64_t detailMm = truncDiv(truncDiv(landformMm * rScale, 1024) * cScale, 1024) +
+                       truncDiv(truncDiv(metreMm * rScale, 1024) * cScaleMicro, 1024) +
+                       truncDiv(microMm * cScaleMicro, 1024);
 
     // Two ADDITIVE structured terms, added AFTER the band scaling because
     // neither is an fBm octave. v13: they DO take the relief gate -- see
@@ -1705,7 +1673,7 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     const int64_t addMm = rillMm(seed, xMm, yMm, truncDiv(carrier.sxMmPerPx * 1000, pxMm),
                                  truncDiv(carrier.syMmPerPx * 1000, pxMm)) +
                           beddingMm(seed, xMm, yMm, baseMm);
-    restMm += truncDiv(addMm * rScale, 1024);
+    detailMm += truncDiv(addMm * rScale, 1024);
 
     // v14: THE DETAIL GRADIENT CAP -- one scale-down over the whole summed
     // detail, engaged on a slope ramp. MIRROR: Amplifier::evalSurface and the
@@ -1729,11 +1697,8 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
     // above kDetailGradCapKQ10 for why v14's omission was a leaking guarantee
     // rather than a tuning choice. Every term is non-negative so truncDiv and
     // floorDiv agree, but truncDiv is used to match the CPU's `/` exactly.
-    // v19: two nominal-gradient pools, mirroring amplifier.cpp's gradShaping /
-    // gradRest exactly (same gates, same order, same truncations).
-    const int64_t gradShaping =
-        truncDiv(truncDiv(gradLand * rScale, 1024) * cScale, 1024);
-    const int64_t gradRest =
+    const int64_t detailGradMmPerM =
+        truncDiv(truncDiv(gradLand * rScale, 1024) * cScale, 1024) +
         truncDiv(truncDiv(gradMetre * rScale, 1024) * cScaleMicro, 1024) +
         truncDiv(gradMicro * cScaleMicro, 1024) +
         truncDiv(kRillGradMmPerM * rScale, 1024);
@@ -1760,29 +1725,13 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
                                                                 : kDetailGradFloorMmPerM;
         int64_t allowedGradMmPerM = truncDiv(kDetailGradCapKQ10 * slopeMmPerM, 1024);
         if (allowedGradMmPerM < gradFloor) allowedGradMmPerM = gradFloor;
-        // Pool 1: shaping vs its share; usedShaping is exact, so the post-cap
-        // total stays <= the allowance. MIRROR: amplifier.cpp's two-pool
-        // block, including WHERE each truncation happens.
-        const int64_t allowedShaping =
-            truncDiv(allowedGradMmPerM * kDetailGradMesoShareQ10, 1024);
-        int64_t usedShaping = gradShaping;
-        if (gradShaping > allowedShaping)
+        if (detailGradMmPerM > allowedGradMmPerM)
         {
-            const int64_t capQ10 = truncDiv(allowedShaping * 1024, gradShaping);
+            const int64_t capQ10 = truncDiv(allowedGradMmPerM * 1024, detailGradMmPerM);
             const int64_t scaleQ10 = 1024 - truncDiv(engageQ10 * (1024 - capQ10), 1024);
-            shapingMm = truncDiv(shapingMm * scaleQ10, 1024);
-            usedShaping = allowedShaping;
-        }
-        // Pool 2: the remainder. Positive because the share is < 1024.
-        const int64_t allowedRest = allowedGradMmPerM - usedShaping;
-        if (gradRest > allowedRest)
-        {
-            const int64_t capQ10 = truncDiv(allowedRest * 1024, gradRest);
-            const int64_t scaleQ10 = 1024 - truncDiv(engageQ10 * (1024 - capQ10), 1024);
-            restMm = truncDiv(restMm * scaleQ10, 1024);
+            detailMm = truncDiv(detailMm * scaleQ10, 1024);
         }
     }
-    const int64_t detailMm = shapingMm + restMm;
 
     SurfaceEval s;
     // MIRROR: amplifier.cpp. UNWARPED on purpose -- callers index the raster for
@@ -1825,19 +1774,11 @@ int64_t columnCarrierSlopeMmPerM(int64_t vx, int64_t vy)
     // made VoxelizeMain's density3 gate read an unwarped slope and vxc_gpu failed
     // exactly as columnCarrierSlopeMmPerM's own header predicted.
     const uint64_t warpSeed = ((uint64_t)SeedHi << 32) | (uint64_t)SeedLo;
-    // v19: both components here too -- the two sites must agree or the density3
-    // gate reads a differently-warped slope than the surface it gates.
     const int64_t warpX = truncDiv(valueNoise2Fade(warpSeed, xMm, yMm, kCarrierWarpLatticeMm,
                                                   CH_CARRIER_WARP_X) * kCarrierWarpMaxMm,
-                                   kCarrierWarpNoiseScale) +
-                          truncDiv(valueNoise2Fade(warpSeed, xMm, yMm, kCarrierWarp2LatticeMm,
-                                                  CH_CARRIER_WARP2_X) * kCarrierWarp2MaxMm,
                                    kCarrierWarpNoiseScale);
     const int64_t warpY = truncDiv(valueNoise2Fade(warpSeed, xMm, yMm, kCarrierWarpLatticeMm,
                                                   CH_CARRIER_WARP_Y) * kCarrierWarpMaxMm,
-                                   kCarrierWarpNoiseScale) +
-                          truncDiv(valueNoise2Fade(warpSeed, xMm, yMm, kCarrierWarp2LatticeMm,
-                                                  CH_CARRIER_WARP2_Y) * kCarrierWarp2MaxMm,
                                    kCarrierWarpNoiseScale);
     const int64_t xW = xMm + warpX;
     const int64_t yW = yMm + warpY;

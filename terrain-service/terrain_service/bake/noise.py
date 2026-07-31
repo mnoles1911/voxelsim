@@ -30,6 +30,7 @@ __all__ = [
     "roughness",
     "repose_field",
     "repose_erodibility",
+    "meso_relief",
     "octave_wavelengths",
     "bspline_weights",
     "SPLINE_DEN",
@@ -564,6 +565,92 @@ def repose_field(z_m: np.ndarray, cell_m: float, seed: int,
 
     np.clip(out, float(min_deg), float(max_deg), out=out)
     return out.astype(np.float32)
+
+
+#: Octave-key offset for the post-thermal meso band, disjoint from substrate
+#: (0..), constructional (100..), and the repose families (200.., 300..).
+_MESO_OCTAVE_KEY = 400
+
+
+def meso_relief(z_m: np.ndarray, cell_m: float, seed: int,
+                origin_cells: Tuple[int, int], *,
+                amp15_m: float = 0.8,
+                amp75_m: float = 0.4,
+                slope_lo: float = 0.20,
+                slope_hi: float = 0.40) -> np.ndarray:
+    """B4: steep-gated meso relief (15 m / 7.5 m), in metres, POST-thermal.
+
+    WHY THIS STAGE EXISTS, AND WHY IT RUNS AFTER B3. The residual contour
+    banding lives on steep faces whose grade is near-constant over tens of
+    metres; band spacing is 100 mm / grade, so what kills the rhythm is grade
+    VARIATION at the 6-30 m wavelength. Both prior owners of that band are
+    structurally unable to provide it there:
+
+    * B1 substrate at these wavelengths is planed away by B3 -- on an
+      at-threshold face, thermal converts any pre-existing meso bump back into
+      the threshold field's own pattern, which is exactly the surface that
+      banded;
+    * the CLIENT's capped ladder cannot carry it safely: a band coherent over
+      6-13 m makes pits the drainage lattice resolves, and a point-sampled
+      gradient cap cannot prevent a 13 m feature from damming a neighbouring
+      dip (measured 2026-07-30: a client 12.8/6.4 m band under a budgeted cap
+      stranded 0.04-0.33% of the fine repro site, realization-dependent).
+
+    Post-thermal, pre-refill is the one slot where the relief SURVIVES (thermal
+    never sees it) and drainage is still GUARANTEED (the B4b epsilon refill
+    runs on the summed surface, so every basin this band could create is
+    resolved before the codec ever sees the ground).
+
+    Slope-gated to steep ground: zero at or below ``slope_lo`` (a plain keeps
+    its calibrated ridge/knoll statistics untouched), full at ``slope_hi``.
+    World-anchored on the same integer lattice machinery as B1, so apron
+    overlaps agree exactly. Both amplitudes at 0 reproduce the prior surface
+    bit-for-bit.
+
+    ``z_m`` is the post-thermal surface; the gate reads ITS local slope,
+    computed here (chunked, with a one-row halo) so the gate and the field
+    cannot be computed against different stages.
+    """
+    if amp15_m < 0.0 or amp75_m < 0.0:
+        raise ValueError("meso amplitudes must be >= 0")
+    if not 0.0 <= slope_lo < slope_hi:
+        raise ValueError(f"need 0 <= slope_lo < slope_hi, got {slope_lo}, {slope_hi}")
+    z = np.asarray(z_m)
+    if z.ndim != 2:
+        raise ValueError(f"meso_relief expects a 2-D surface, got shape {z.shape}")
+    cell_m = float(cell_m)
+    if cell_m <= 0.0:
+        raise ValueError(f"cell_m must be positive, got {cell_m}")
+    n0, n1 = z.shape
+    oy, ox = int(origin_cells[0]), int(origin_cells[1])
+
+    out = np.zeros((n0, n1), dtype=np.float32)
+    if amp15_m == 0.0 and amp75_m == 0.0:
+        return out
+
+    p15 = max(4, int(round(15.0 / cell_m)))
+    p75 = max(4, int(round(7.5 / cell_m)))
+    inv_span = 1.0 / (float(slope_hi) - float(slope_lo))
+    for r0 in range(0, n0, 512):
+        r1 = min(r0 + 512, n0)
+        blk = np.zeros((r1 - r0, n1), dtype=np.float64)
+        if amp15_m > 0.0:
+            blk += float(amp15_m) * _octave_field(
+                (r1 - r0, n1), p15, seed, _MESO_OCTAVE_KEY, oy + r0, ox)
+        if amp75_m > 0.0:
+            blk += float(amp75_m) * _octave_field(
+                (r1 - r0, n1), p75, seed, _MESO_OCTAVE_KEY + 1, oy + r0, ox)
+        # Local slope of z over this block with a one-row halo, so the block
+        # layout cannot change any cell's gate (np.gradient uses central
+        # differences interior, one-sided at the array edge -- the halo keeps
+        # every interior row central regardless of chunking).
+        h0 = max(0, r0 - 1)
+        h1 = min(n0, r1 + 1)
+        gy, gx = np.gradient(z[h0:h1].astype(np.float64, copy=False), cell_m)
+        s = np.hypot(gx, gy)[r0 - h0:(r0 - h0) + (r1 - r0)]
+        gate = np.clip((s - float(slope_lo)) * inv_span, 0.0, 1.0)
+        out[r0:r1] = blk * gate
+    return out
 
 
 def repose_erodibility(repose_deg: np.ndarray, *, base_deg: float = 36.0,
