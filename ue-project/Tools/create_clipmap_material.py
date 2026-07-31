@@ -87,12 +87,14 @@ def main():
     detail_uv = b.mul(tex_coord, b.scalar("DetailTileRepeats", 28.0))
 
     base_color, snow_w, base_color_out = build_terrain_base_color(
-        b, vertex_color, detail_uv, "",
+        b, vertex_color, detail_uv, "", None, "",
         # Full strength, unlike the voxel material's 0.35: a clipmap vertex
         # normal is a REAL terrain normal (central-difference heightmap
         # gradient, RebuildLevel pass 2), so a steep face here genuinely is
         # exposed rock rather than a 10 cm voxel step riser.
         rock_slope_strength=1.0,
+        # Per-voxel jitter is meaningless at 64-512 m per vertex and would alias.
+        enable_block_noise=False,
         # Weaker than the voxel material's: at 64-512 m per vertex the fine
         # band is far below a pixel and would only add noise for TSR to chew on.
         detail_fine_strength=0.06,

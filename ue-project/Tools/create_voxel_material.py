@@ -108,7 +108,7 @@ def main():
     detail_uv = b.div(tex_coord, b.scalar("DetailTileMeters", 8.0))
 
     base_color, snow_w, base_color_out = build_terrain_base_color(
-        b, vertex_color, detail_uv, "",
+        b, vertex_color, detail_uv, "", tex_coord, "",
         # Voxel face normals are AXIS-ALIGNED, so every 10 cm step riser on a
         # gentle grassy hill is a "vertical" face. At full strength the slope
         # term would stripe the entire world grass/rock; at 0.35 it reads as

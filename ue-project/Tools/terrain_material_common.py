@@ -40,6 +40,7 @@ import unreal
 PALETTE_TEXTURE = "/Game/Voxel/T_VoxelPalette.T_VoxelPalette"
 BIOME_LUT_TEXTURE = "/Game/Voxel/T_VoxelBiomeLUT.T_VoxelBiomeLUT"
 DETAIL_TEXTURE = "/Game/Voxel/T_VoxelDetail.T_VoxelDetail"
+BLOCK_NOISE_TEXTURE = "/Game/Voxel/T_VoxelBlockNoise.T_VoxelBlockNoise"
 
 from terrain_palette import PALETTE_WIDTH, biome_tinted_runs  # noqa: E402
 
@@ -191,8 +192,11 @@ def build_terrain_base_color(
     vertex_color,
     detail_uv,
     detail_uv_out,
+    planar_uv,
+    planar_uv_out,
     *,
     rock_slope_strength,
+    enable_block_noise=True,
     detail_fine_strength,
     detail_coarse_strength,
 ):
@@ -328,6 +332,37 @@ def build_terrain_base_color(
     coarse = b.mul(b.sub(detail, b.const(0.5), "B"), b.scalar("DetailCoarseStrength", detail_coarse_strength))
     variation = b.add(b.add(b.const(1.0), fine), coarse)
     base = b.mul(base, variation)
+
+    # --- per-voxel jitter (2026-07-31) ---------------------------------------
+    #
+    # WHY, at the end of a long road: nineteen worldgen versions and three bake
+    # versions attacked the contour-banding artifact with geometry, and the
+    # owner's screenshot still showed corduroy -- because on a near-uniform
+    # albedo the ONLY signal is geometric shading, and a quantised heightfield's
+    # shading is periodic. The smooth 8 m detail above cannot decorrelate step
+    # edges 0.25 m apart. Voxel games with far coarser blocks solve exactly this
+    # with strong per-block texture variation; this is that, at our voxel size.
+    #
+    # T_VoxelBlockNoise is nearest-filtered white noise, one value per texel.
+    # R sampled at 0.1 m/texel gives each voxel one flat random tone; G sampled
+    # at 0.4 m/texel adds a second, coarser decorrelation so the per-voxel
+    # jitter does not read as uniform static. Both multiplicative around 1.0.
+    # Strengths are ScalarParameters so they can be tuned per-instance without
+    # regenerating the material.
+    if not enable_block_noise:
+        planar_uv = None
+    voxel_uv = planar_uv and b.binary(unreal.MaterialExpressionDivide, planar_uv, planar_uv_out,
+                        b.scalar("BlockNoiseTileMeters", 32.0), "")
+    if voxel_uv is not None:
+        block4_uv = b.binary(unreal.MaterialExpressionDivide, planar_uv, planar_uv_out,
+                             b.scalar("BlockNoise4TileMeters", 128.0), "")
+        bn1 = b.sample(BLOCK_NOISE_TEXTURE, voxel_uv, "", "BlockNoiseTex",
+                       unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+        bn4 = b.sample(BLOCK_NOISE_TEXTURE, block4_uv, "", "BlockNoiseTex4",
+                       unreal.MaterialSamplerType.SAMPLERTYPE_LINEAR_COLOR)
+        j1 = b.mul(b.sub(bn1, b.const(0.5), "R"), b.scalar("VoxelJitterStrength", 0.22))
+        j4 = b.mul(b.sub(bn4, b.const(0.5), "G"), b.scalar("Voxel4JitterStrength", 0.14))
+        base = b.mul(base, b.add(b.add(b.const(1.0), j1), j4))
 
     # --- generation-time debug bisect ---------------------------------------
     #
