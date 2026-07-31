@@ -1,0 +1,101 @@
+BAND PERIOD — what the parallel lines actually are
+==================================================
+2026-07-31. Site -69094,38426 (g35, the owner's repro pose), bake_ver 6, 51.2 m
+window of the CONTINUOUS surface (VXC_PROBE_DUMP, pre-voxelisation) at 10 cm.
+Tool: terrain-service/tools/band_period.py. Relief 52.1 m, median grade 95%.
+
+Twenty-plus attempts had been made on this artifact without anyone measuring its
+spacing. Three candidate causes predicted different spacings, so one measurement
+discriminates. It did, and it falsified two of the three -- including the one I
+had argued for hardest.
+
+
+1. THE BANDING IS PURE VOXEL QUANTISATION OF A LOCALLY SMOOTH SURFACE
+---------------------------------------------------------------------
+A smooth ramp cut into 100 mm voxels produces a step every 0.1/slope metres.
+Measured against that law, by grade bin:
+
+    grade        observed band width   law predicts    n
+    15- 30%            0.40 m            0.44 m       413
+    30- 60%            0.20 m            0.22 m      6645
+    60-120%            0.10 m            0.11 m     51258
+    all (median)       0.10 m            0.10 m     41789   ratio 1.25
+
+The law holds in every bin. Ratio 1.25 means the realised surface is only 25%
+more irregular than a perfectly smooth ramp would be. There are no terraces in
+the data; there is a smooth surface being sampled by a cubic lattice.
+
+The slope dependence is the part that reconciles the screenshots with the
+metrics. Shallow ground gives WIDE bands -- at 10% grade one voxel of rise takes
+a full metre of run -- which is the metre-scale banding the owner photographs on
+moderate slopes. On steep faces the band width collapses to 0.10 m, i.e. ONE
+VOXEL: those faces are not banded so much as they are a regular staircase at
+voxel pitch, whose regularity is what the eye integrates into lines.
+
+
+2. THE CARRIER IS NOT PRINTING ITS LATTICE  (hypothesis dead)
+-------------------------------------------------------------
+If the fine control lattice (1.875 m) were imprinting, the continuous surface
+would carry a discrete spectral spike at 1.875 / 3.75 / 7.5 m, independent of
+slope -- and every detail-amplitude fix to date would have been aimed at the
+wrong layer. It does not. High-passed spectra show power rising smoothly with
+wavelength with no discrete peak anywhere in the sub-4 m band; the nominal
+"peak" simply rides the largest wavelength the filter passes, which is red noise
+behaving normally (and is the same filter-shoulder trap this project has now hit
+four times -- the search limit is hp/3 for that reason).
+
+Good news, and it retires a real worry: the fine tier is clean.
+
+
+3. THE SURFACE IS NOT MONOTONE  (my own hypothesis, dead)
+----------------------------------------------------------
+I argued that the v14/v15 drainage cap (|grad detail| <= 0.5 |grad carrier|)
+makes the surface strictly monotone downslope, and that monotone surfaces cannot
+break a contour. The first half is false as implemented:
+
+    fall line from a  2 m carrier:   4.2% of ground rises going downhill
+    fall line from a  5 m carrier:  11.3%
+    fall line from a 15 m carrier:  30.4%
+
+There is counter-slope, and at landform scale there is plenty of it. The cap is
+not the blocker I claimed. What IS true is the weaker, quantitative statement in
+section 4, which the cap only partly bears on.
+
+
+4. THE CRITERION THAT ACTUALLY GOVERNS  (and why 20 fixes failed)
+------------------------------------------------------------------
+A band of width W is broken only by relief of at least ONE VOXEL (100 mm) at a
+wavelength no longer than W. Anything smoother than that leaves the level
+crossings parallel, no matter how much relief is added at longer wavelengths.
+
+Every fix attempted so far -- meso relief, folded strata, repose fields, ridge
+composites, couloirs, and the amplitude ladders before them -- added relief at
+metre-and-up wavelengths. That moves where the bands run. It cannot stop them
+being a regular staircase, because at 0.2-1 m the surface stays smooth (ratio
+1.25). This is why the metrics kept improving while the picture did not.
+
+Consequences, by ground type:
+
+  moderate ground (15-30% grade, W = 0.4 m): genuinely fixable. It needs
+  10-20 cm of relief at wavelengths <= 40 cm. The gradient cap PERMITS this
+  (0.5 x 0.22 = 0.11 gradient floor territory) -- the detail simply is not there.
+
+  steep ground (>60%, W = 0.10 m): the band width is already one voxel. No
+  sub-voxel change can alter a one-voxel staircase. The only geometric levers
+  are the voxel size itself, discrete objects that stand proud of the surface by
+  several voxels, or -- at distance, where LOD sets the effective voxel size --
+  giving each LOD level its own roughness rather than decimating L0.
+
+
+5. WHAT THIS RULES IN
+----------------------
+  * Sub-metre roughness with an ABSOLUTE floor of 1-2 voxels in the 0.2-0.8 m
+    band, rather than a floor proportional to carrier slope (a slope-proportional
+    floor vanishes exactly where bands are widest -- on gentle ground).
+  * Discrete debris and blocks: relief of several voxels at sub-metre scale is
+    precisely the missing term, and it is the mechanism nature uses.
+  * LOD-own roughness for the distance percept, which no work to date has tried.
+
+  Drainage exposure must be measured, not assumed, for the first two: sub-metre
+  bumps of 10-20 cm will create micro-pits. They are physically real (puddles),
+  but the stranded-area metric is measured at 10 cm and will see them.
