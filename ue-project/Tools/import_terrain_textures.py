@@ -40,14 +40,6 @@ SPECS = [
     ("T_VoxelDetail", False, unreal.TextureCompressionSettings.TC_DEFAULT,
      unreal.TextureMipGenSettings.TMGS_FROM_TEXTURE_GROUP, unreal.TextureFilter.TF_DEFAULT,
      unreal.TextureAddress.TA_WRAP),
-    # Per-voxel jitter MUST be nearest + no mips + uncompressed: bilinear would
-    # blend adjacent texels back into the smooth gradient whose absence is the
-    # whole point, a mip chain would average it to grey at distance (distance is
-    # where the corduroy is boldest, so the jitter must SURVIVE there), and DXT
-    # blocks would correlate neighbouring texels.
-    ("T_VoxelBlockNoise", False, unreal.TextureCompressionSettings.TC_VECTOR_DISPLACEMENTMAP,
-     unreal.TextureMipGenSettings.TMGS_NO_MIPMAPS, unreal.TextureFilter.TF_NEAREST,
-     unreal.TextureAddress.TA_WRAP),
 ]
 
 

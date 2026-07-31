@@ -236,44 +236,6 @@ def write_detail(path, size=512):
     return img
 
 
-def write_block_noise(path, size=256):
-    """Per-VOXEL albedo jitter, one random value per texel. LINEAR, not sRGB.
-
-    WHY THIS EXISTS, after nineteen worldgen versions and three bake versions
-    failed to kill the contour-banding artifact with geometry. The owner's own
-    screenshot made the mechanism plain: the terrain is a near-uniform albedo, so
-    the ONLY signal on a hillside is geometric shading -- and the geometry of a
-    quantised heightfield is periodic (a step edge every voxel/grade metres). The
-    eye integrates rows of identical step shadows into corduroy. Voxel games with
-    far coarser blocks than ours do not read this way because every block carries
-    strong per-block texture variation that decorrelates adjacent steps; our
-    T_VoxelDetail is smooth 8 m fBm at 0.30 strength, which leaves adjacent step
-    edges essentially identical.
-
-    So: uniform white noise, one value per texel, sampled NEAREST with UV =
-    world-planar metres / kBlockNoiseTileMeters so each 10 cm voxel lands on its
-    own texel and gets ONE flat random tone (the Minecraft read, not grain).
-    Two channels for two granularities:
-
-      R = per-voxel   (tile 25.6 m over 256 px  -> 0.1 m per texel)
-      G = per-4-voxel (tile 102.4 m over 256 px -> 0.4 m per texel, sampled at
-          the same UV so one texture bind serves both; the material divides the
-          UV by 4 for this channel)
-
-    The material converts each to a multiplier centred on 1.0. Deliberately NOT
-    fBm and deliberately NOT smooth: the point is that neighbouring voxels
-    DIFFER, which is exactly what a band-limited texture avoids.
-    """
-    rng = np.random.default_rng(SEED + 7)
-    img = np.zeros((size, size, 3), dtype=np.uint8)
-    img[..., 0] = rng.integers(0, 256, (size, size), dtype=np.uint8)
-    img[..., 1] = rng.integers(0, 256, (size, size), dtype=np.uint8)
-    # B reserved; mid-grey so an accidental read is a no-op multiplier.
-    img[..., 2] = 128
-    Image.fromarray(img, "RGB").save(path)
-    return img
-
-
 def main():
     out = os.path.normpath(OUT_DIR)
     os.makedirs(out, exist_ok=True)
@@ -285,10 +247,6 @@ def main():
     b = write_biome_lut(os.path.join(out, "T_VoxelBiomeLUT.png"))
     print("T_VoxelBiomeLUT.png  %dx%d  temp u8 %d..%d, precip u8 %d..%d"
           % (b.shape[0], b.shape[1], TEMP_U8_LO, TEMP_U8_HI, PRECIP_U8_LO, PRECIP_U8_HI))
-
-    n = write_block_noise(os.path.join(out, "T_VoxelBlockNoise.png"))
-    print("T_VoxelBlockNoise.png %dx%d  per-voxel albedo jitter (R 0.1 m, G 0.4 m)"
-          % (n.shape[0], n.shape[1]))
 
     d = write_detail(os.path.join(out, "T_VoxelDetail.png"))
     print("T_VoxelDetail.png    %dx%d  tiling fBm, mean=%.3f"
