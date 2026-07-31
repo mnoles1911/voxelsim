@@ -137,7 +137,7 @@ namespace vxc {
 // The relative octave weighting is untouched; the floor keeps decimetre
 // roughness alive on flats (the anti-terrace band). Scale-down only, so every
 // surface bound derived at v13 is still sound unchanged.
-inline constexpr uint32_t kWorldGenVersion = 18;
+inline constexpr uint32_t kWorldGenVersion = 19;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 

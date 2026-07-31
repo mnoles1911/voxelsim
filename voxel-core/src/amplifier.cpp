@@ -1059,6 +1059,55 @@ static_assert(kRillGradMmPerM == 187,
 constexpr int64_t kDetailGradCapKQ10 = 512;     // 0.5 x carrier gradient
 constexpr int64_t kDetailGradFloorMmPerM = 50;  // engaged minimum, coarse tier
 constexpr int64_t kFineDetailGradFloorMmPerM = 50;
+
+// v19: THE MICRO POOL IS CAPPED SEPARATELY, AND ABOVE 1.0. Derivation, because
+// this number is forced by geometry rather than chosen by taste.
+//
+// A slope quantised to 100 mm voxels steps every W = 100/s metres, s in mm/m.
+// Measured on real g35 ground (docs/measurements/band-period-2026-07-31.txt) the
+// law holds in every grade bin -- 0.40 m observed vs 0.44 predicted at 15-30%,
+// 0.20 vs 0.22 at 30-60%, 0.10 vs 0.11 at 60-120% -- with an observed/predicted
+// ratio of 1.25, i.e. the surface is smooth and the lattice is sampling it.
+// There are no terraces in the data. The bands ARE the quantisation.
+//
+// To break such a band the surface must rise a whole voxel inside half a band
+// width: 100 mm over W/2 = 50/s metres, which is a gradient of 2s. So the detail
+// gradient required to disturb a quantisation band is TWICE the carrier's, at
+// every slope, identically -- the requirement scales with the artifact, which is
+// why no single amplitude ever fixed this at all slopes.
+//
+// The v14 cap allows 0.5s. A cap below 1.0 therefore GUARANTEES the bands
+// survive, at every slope, by construction. That is the whole explanation for
+// twenty-odd failed attempts: they added relief at metre-and-up wavelengths,
+// which moves where the bands run, while the cap held the sub-metre band -- the
+// only band that can break them -- a factor of four below the threshold.
+//
+// Why it is safe to exceed 1.0 here and nowhere else: the cap exists so detail
+// cannot reverse the carrier's downhill and strand drainage (alpine was 87.9%
+// stranded before v14). But routing happens in the metre-and-up band; the bake
+// routes at 1.875 m. A 400 mm bump 100 mm high is a puddle, not a captured
+// stream. So the ROUTING pool keeps k=0.5 unchanged and only the MICRO pool --
+// the 400/200 mm octaves, which carry no routing -- is allowed past 1.0.
+// Drainage is measured after this change, never assumed; see the doc.
+// The derivation above says 2.0. MEASUREMENT says 1.5 buys the same picture for a
+// third of the cost, because that derivation is a worst case over a single
+// sinusoid while the micro band is stochastic -- its peaks exceed the nominal
+// gradient often enough to break bands below the deterministic threshold. Swept
+// at the g35 repro site, amplified drainage against observed band width on 3-8%
+// ground, where bands are widest and the law predicts 1.82 m:
+//     k=1.2    7 sinks   8.30% stranded   0.20 m
+//     k=1.5   11 sinks   8.46% stranded   0.10 m   <-- chosen
+//     k=2.0   32 sinks  26.67% stranded   0.10 m
+// 2.0 buys nothing over 1.5 on band width and triples the stranding, so the knee
+// is real and 1.5 sits on it.
+constexpr int64_t kMicroGradCapKQ10 = 1536;  // 1.5 x carrier gradient
+static_assert(kMicroGradCapKQ10 > 1024,
+              "at or below 1.0 the micro pool cannot disturb a quantisation band at ANY "
+              "slope -- the gradient required scales with the carrier's, which is exactly "
+              "why v14's 0.5 guaranteed the artifact survived every amplitude ever tried");
+constexpr int64_t kMicroGradFloorMmPerM = 200;
+static_assert(kMicroGradFloorMmPerM >= kFineDetailGradFloorMmPerM,
+              "the micro floor must not sit below the routing floor it was split out of");
 static_assert(kDetailGradCapKQ10 > 0 && kDetailGradCapKQ10 <= 1024,
               "k above 1.0 licenses detail steeper than the ground it decorates, which is "
               "the defect this cap exists to remove");
@@ -1530,9 +1579,12 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     // Three bands, three gates. The MATERIAL band takes no relief gate at all --
     // see the band-split block above kDetailOctaves: it is the ground's own
     // texture and does not scale with how much landform it is draped over.
+    // v19: the micro band is held apart from here to the cap, because the two
+    // pools are capped against different allowances. Summing them first would
+    // make that impossible without a second pass over the octaves.
     int64_t detailMm = landformMm * rScale / 1024 * cScale / 1024 +
-                       metreMm * rScale / 1024 * cScaleMicro / 1024 +
-                       microMm * cScaleMicro / 1024;
+                       metreMm * rScale / 1024 * cScaleMicro / 1024;
+    int64_t microDetailMm = microMm * cScaleMicro / 1024;
 
     // Two ADDITIVE structured terms, each with its own gate and its own proved
     // envelope. They are added after the band scaling rather than folded into a
@@ -1564,10 +1616,14 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     const int64_t gradLand = fine ? kFineLandformGradMmPerM : kLandformGradMmPerM;
     const int64_t gradMetre = fine ? kFineMetreGradMmPerM : kMetreGradMmPerM;
     const int64_t gradMicro = fine ? kFineMicroGradMmPerM : kMicroGradMmPerM;
+    // v19: two estimates, split on the same line the two pools are split on.
+    // The routing estimate keeps the rill term -- it is a metre-scale channel
+    // form and does route -- so the routing pool is v18's sum minus its micro
+    // component, and the micro estimate is exactly that component.
     const int64_t detailGradMmPerM = gradLand * rScale / 1024 * cScale / 1024 +
                                      gradMetre * rScale / 1024 * cScaleMicro / 1024 +
-                                     gradMicro * cScaleMicro / 1024 +
                                      kRillGradMmPerM * rScale / 1024;
+    const int64_t microGradMmPerM = gradMicro * cScaleMicro / 1024;
     // Engagement first: full on a fine world, ramped on the coarse one --
     // exactly zero below the ramp so flat coarse classes are bit-for-bit v13,
     // saturating to full above it. The branches keep every divide's numerator
@@ -1584,6 +1640,18 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
         }
     }
     if (engageQ10 > 0) {
+        // v19: the micro pool first, against its own allowance. Same integer
+        // form, same engagement blend, same truncating divide as the routing
+        // pool below -- two pools, one shape of arithmetic, so the HLSL mirror
+        // stays a copy rather than a second implementation.
+        int64_t allowedMicroMmPerM = kMicroGradCapKQ10 * slopeMmPerM / 1024;
+        if (allowedMicroMmPerM < kMicroGradFloorMmPerM)
+            allowedMicroMmPerM = kMicroGradFloorMmPerM;
+        if (microGradMmPerM > allowedMicroMmPerM) {
+            const int64_t capQ10 = allowedMicroMmPerM * 1024 / microGradMmPerM;
+            const int64_t scaleQ10 = 1024 - engageQ10 * (1024 - capQ10) / 1024;
+            microDetailMm = microDetailMm * scaleQ10 / 1024;
+        }
         const int64_t gradFloor = fine ? kFineDetailGradFloorMmPerM : kDetailGradFloorMmPerM;
         int64_t allowedGradMmPerM = kDetailGradCapKQ10 * slopeMmPerM / 1024;
         if (allowedGradMmPerM < gradFloor) allowedGradMmPerM = gradFloor;
@@ -1598,6 +1666,10 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
             detailMm = detailMm * scaleQ10 / 1024;
         }
     }
+    // The pools rejoin here, after both caps. When engagement is zero neither
+    // cap ran and this is a plain sum, which is what keeps flat coarse classes
+    // bit-for-bit with v13 exactly as v14 left them.
+    detailMm += microDetailMm;
 
     SurfaceEval s;
     // UNWARPED, and this is load-bearing. Callers index the tile raster with these
