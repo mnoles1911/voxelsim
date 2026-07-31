@@ -1,0 +1,124 @@
+THE MESO BAND: GRADE VARIATION AT THE BANDING WAVELENGTH, BAKE-SIDE, DRAINAGE-CLEAN
+===================================================================================
+2026-07-31. Follow-up to repose-field-2026-07-30.txt, after the owner's live
+verdict on bake_ver 5: the repose field is confirmed where thermal binds
+(gullies), the banding on open steep faces is not fixed, and partial
+improvement is not acceptance.
+
+THE TARGET, restated from the diagnosis both prior docs converge on: band
+spacing = 100 mm / local grade, so banding is legible wherever grade is
+near-constant over tens of metres, and NOTHING in the pipeline varied grade at
+the 10-60 m wavelength on translation-invariant expanses -- thermal is
+translation-invariant there (shed == receive), incision needs drainage to act,
+and every client-side attempt died against the drainage cap.
+
+WHAT SHIPS (all bake-side, bake_ver 6; the client is BIT-EXACT worldgen v18):
+
+  1. STRENGTH-MODULATED INCISION (noise.repose_erodibility ->
+     incise.profile_incision(erodibility=...)): the same material-strength
+     field that keys thermal's threshold now multiplies erodibility,
+     log-linear, pinned at 1.0 on baseline rock. Strong strata hold their bed
+     (knickpoints), weak bands cut treads -- slope varies at strata wavelength
+     wherever there is any drainage at all, not only where thermal moves mass.
+     RATIO 3, NOT 6, and the reason is the codec: at 6 the treads it makes
+     are flat enough to fall under the wire format's 100 mm quantization
+     floor, and the RECONSTRUCTED carrier grows pits the raw surface does not
+     have (measured: 1 carrier sink at ratio 6, 0 at ratio 3, same window).
+  2. B4 MESO RELIEF (noise.meso_relief): 15 m / 11.25 m octaves, RMS 0.8 /
+     0.4 m, gated to steep ground (slope 0.20-0.40 ramp), world-anchored,
+     applied POST-THERMAL -- the one slot where the relief survives (thermal
+     never sees it) -- then drainage-reconciled (below) and refilled before
+     encode. This is the band that varies grade at the banding wavelength on
+     exactly the faces that band.
+  3. B4b MICRO-REFILL + DESCENT ENFORCEMENT (pipeline.bake_padded_domain):
+     after the meso field is added, every cell is raised until it keeps at
+     least min(its pre-meso drop, 0.11 m) over its pre-meso D8 receiver --
+     zero pits structurally -- then the B2a epsilon fill re-runs as belt and
+     braces.
+
+THE FALSIFIED LEVERS, because three of the four ranked candidates died by
+measurement and the reasons are worth more than the code:
+
+  * CLIENT MESO OCTAVES (12.8/6.4 m in the fine shaping band, under a
+    two-pool v14 cap that gave them their own gradient budget): they DO vary
+    grade -- and strand 0.04-0.33% of the fine repro site, realization-
+    dependent (1-6 sinks, up to 390 mm deep). A band coherent over 6-13 m
+    makes pits the drainage lattice RESOLVES; every earlier sub-metre band
+    was "safe" only because its pits were smaller than the lattice. A
+    point-sampled gradient cap cannot prevent a 13 m feature from damming the
+    dip beside it. Withdrawn.
+  * THE SECOND (LANDFORM-SCALE) WARP: 24.6 m lattice, throw swept 1.0-3.25 m
+    -- 0.3-3.2% stranded at EVERY setting (v16's shipped 4 m component reads
+    0.0%). Mechanism: the warp compresses the carrier gradient by up to its
+    own peak derivative, the cap prices detail against the UNCOMPRESSED
+    slope, and the capped ladder's true peak runs ~1.9x nominal; where the
+    two coincide, downhill reverses in basins metres wide. Withdrawn; the
+    negative result is recorded in carrier.h's carrierWarpPx block.
+  * THE TWO-POOL CAP ON THE COARSE TIER: with no client meso band left to
+    fund, its only measured effect was moving the coarse ten-class ladder
+    against the documented v14 posture (steepest 17.5 -> 22.9% stranded,
+    moderate 83.4 -> 89.5). Withdrawn with the rest of the client change.
+
+THE LESSON THAT COST THE MOST ITERATIONS: **THE CODEC IS A STAGE.** Every
+pre-existing pass was implicitly codec-safe -- incision creates real
+gradients, thermal drives toward a threshold, the fill's epsilon flats get
+carved through by incision afterwards. B4 is the first pass whose output goes
+to the encoder with no process behind it, and THREE distinct sub-LSB failure
+classes appeared before the guarantee held:
+  1. a 7.5 m octave (4 cells/wavelength -- exactly the B-spline floor)
+     produced a 230 mm basin BETWEEN the native samples via prefilter
+     ringing; no fill on the sample lattice can repair what the sample
+     lattice cannot see (it stranded 10.4% of the window through a sub-pixel
+     sill in a trunk channel). Fixed by moving the octave to 11.25 m
+     (6 cells), verified by a half-pixel pit census on the DECODED tile.
+  2. meso-flattened channel reaches under 100 mm/cell reconstruct as +-50 mm
+     noise and dam even when no float-precision pit exists. Fixed by gating
+     on min(local, D8-downstream) slope -- a bed must read its own profile,
+     not its walls -- with the gate slope field ERODED (9-cell min) and
+     SMOOTHED (5-cell) so full-amplitude band content never sits one cell
+     from a gentle reach, plus the descent enforcement.
+  3. using the 0.11 m codec-proof step as the REFILL's flood epsilon domed
+     every wide flat it refloods (lake floors tilted into 5-17 m cones,
+     flat-shaded scars in the hillshade). The refill keeps the auto epsilon;
+     the 0.11 m bound lives only in the enforcement, which takes
+     min(original drop, 0.11) and therefore preserves gentle reaches exactly.
+
+NUMBERS, fine repro site (-69120,38400, 512 m, v18 probe, decoded tile through
+the real client carrier path):
+
+                        v5b (shipped)            v6 (this work)
+  carrier drainage      0 sinks / 0.0% / 244 m   0 sinks / 0.0% / 246.4 m
+  amplified drainage    0 sinks / 0.0% / 245 m   0 sinks / 0.0% / 248.9 m
+  carrier ribs          p90 8.6 m p99 12.3 m     p90 9.5 m p99 18.5 m
+  amplified ribs        p50 0.5 m p90 1.9 m      p50 0.5 m p90 2.3 m
+  slope frac@tan36      13.9% (3.84 km window)   14.9/14.8% (1.5 km window*)
+  * different window than the v5b number's; quoted only to show the meso band
+    did not re-concentrate slopes. The known caveat stands: rib metrics have
+    moved 5x with zero visual change; the capture decides, these verify
+    physics.
+
+  Ten-class coarse ladder: byte-identical to the shipped v18 client posture
+  (the client is unchanged). D:\ue-cache\tmp\drainage-ladder-v19b.txt was the
+  two-pool arm that motivated the withdrawal.
+
+  Bake cost: ~350 CPU-s / tile (B3 relax 207, B2d 86 with the strength field,
+  B4+enforcement ~25). Peak working set 6.3 GiB against the 8 GiB pod -- down
+  from 12.85 GiB at first measurement; the peak was profile_incision's kfac
+  chain holding five full-domain float64 temporaries, now chunked
+  bit-identically (as are repose_field's spatial pass and repose_erodibility).
+
+THE CLIENT THE OWNER ACTUALLY SEES, recorded because it took a log grep to
+rediscover: the main-checkout editor DLL (2026-07-29 14:49) compiles
+kWorldGenVersion = 12 -- the v13-v18 client evolution (prefilter, relief
+gate, gradient cap, v16 warp, v17/v18 ladder reshapes) has never been in any
+frame the owner judged. Both capture arms here use that same DLL, so the
+diff is bake-only, matching the conditions of the verdict this work answers.
+If the client is ever rebuilt to v18 for the same world, re-run the fine
+drainage probe first -- the v12 ladder is uncapped and the probe numbers
+above are v18's.
+
+CAPTURES (owner's exact pose: spawn -69094,38426, VistaShot=10, pitch -12,
+yaw 45, 200 s settle, 1600x900, both arms on the same v12 DLL):
+  before: D:\ue-cache\tmp\meso-before.png  (provider survey-g35-v5b)
+  after:  D:\ue-cache\tmp\meso-after.png   (provider survey-g35-v6)
+  reading: filled in below.
