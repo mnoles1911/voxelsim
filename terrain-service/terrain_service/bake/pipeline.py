@@ -1,4 +1,4 @@
-"""B0-B3 bake orchestration: one coarse tile -> one 8192x8192 fine tier.
+﻿"""B0-B3 bake orchestration: one coarse tile -> one 8192x8192 fine tier.
 
 This module owns the *orchestration* only. The numerics live in sibling
 modules written independently (``flow``, ``noise``, ``incise``, ``thermal``)
@@ -588,8 +588,8 @@ class BakeConstants:
     #: named mechanism -- placed AFTER thermal so relaxation cannot plane it
     #: back into the threshold pattern, and BEFORE the B4b refill so it cannot
     #: cost drainage. 0/0 disables and reproduces the prior surface exactly.
-    meso_amp15_m: float = 0.8
-    meso_amp11_m: float = 0.4
+    meso_amp15_m: float = 1.6
+    meso_amp11_m: float = 0.8
     #: First cut was 0.20/0.40 -- full amplitude only on 40%+ grades. The
     #: in-engine A/B showed exactly what that arithmetic predicts: the
     #: mid-slope bowl (steep) lost its banding and read as talus, while the
@@ -598,7 +598,7 @@ class BakeConstants:
     #: there. 0.12/0.28 puts full amplitude on every face that can band
     #: visibly while the plains classes (2-6% grade) stay untouched.
     meso_slope_lo: float = 0.12
-    meso_slope_hi: float = 0.28
+    meso_slope_hi: float = 2.0
     #: The B4 descent-enforcement step, metres: after the meso band is added,
     #: every cell is raised until it keeps at least min(its pre-meso drop,
     #: this) over its pre-meso D8 receiver. One codec LSB (100 mm) plus both
@@ -2396,8 +2396,8 @@ def bake_padded_domain(
     # than one global angle (see the repose_* constants and noise.repose_field
     # for the measured motivation: a single angle planes every relaxed face to
     # the same slope, which voxelises as parallel contour-terrace corduroy).
-    # The field is keyed on the PRE-relaxation surface — strata are glued to
-    # the rock — and on the same world-anchored lattice/seed machinery as B1,
+    # The field is keyed on the PRE-relaxation surface â€” strata are glued to
+    # the rock â€” and on the same world-anchored lattice/seed machinery as B1,
     # so apron overlaps agree exactly. Both amplitudes at 0 reproduce the
     # scalar call bit-for-bit.
     c0 = time.process_time()
