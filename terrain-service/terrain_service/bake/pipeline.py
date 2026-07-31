@@ -556,6 +556,18 @@ class BakeConstants:
     repose_spatial_wavelength_m: float = 160.0
     repose_strata_amp_deg: float = 20.0
     repose_strata_wavelength_m: float = 30.0
+    #: bake_ver 6: the strata are FOLDED -- keyed on z + a bounded
+    #: world-anchored undulation of this amplitude, so bench traces wander
+    #: across contours instead of ringing the hill at one elevation. Measured
+    #: motivation: flat-lying strata bind at constant elevation, so their
+    #: benches (sharpened by the strength-modulated incision) are horizontal,
+    #: contour-parallel and quasi-evenly spaced at the 30 m wavelength -- the
+    #: capture showed the owner's banding artifact re-manufactured at bench
+    #: scale on the distant faces. +-12 m at 300 m gives apparent local dips
+    #: up to ~15 deg, well inside folded-sedimentary reality. 0 disables and
+    #: reproduces flat-lying strata exactly.
+    repose_strata_fold_amp_m: float = 15.0
+    repose_strata_fold_wavelength_m: float = 300.0
     #: 24 deg is a weathered debris slope; 72 deg holds jointed-rock faces.
     repose_min_deg: float = 24.0
     repose_max_deg: float = 72.0
@@ -578,8 +590,15 @@ class BakeConstants:
     #: cost drainage. 0/0 disables and reproduces the prior surface exactly.
     meso_amp15_m: float = 0.8
     meso_amp11_m: float = 0.4
-    meso_slope_lo: float = 0.20
-    meso_slope_hi: float = 0.40
+    #: First cut was 0.20/0.40 -- full amplitude only on 40%+ grades. The
+    #: in-engine A/B showed exactly what that arithmetic predicts: the
+    #: mid-slope bowl (steep) lost its banding and read as talus, while the
+    #: moderate-grade upper faces -- which band just as legibly, spacing =
+    #: 100 mm / grade -- kept their rhythm because the gate was barely open
+    #: there. 0.12/0.28 puts full amplitude on every face that can band
+    #: visibly while the plains classes (2-6% grade) stay untouched.
+    meso_slope_lo: float = 0.12
+    meso_slope_hi: float = 0.28
     #: The B4 descent-enforcement step, metres: after the meso band is added,
     #: every cell is raised until it keeps at least min(its pre-meso drop,
     #: this) over its pre-meso D8 receiver. One codec LSB (100 mm) plus both
@@ -660,6 +679,8 @@ class BakeConstants:
             raise ValueError("repose amplitudes must be >= 0 (0 disables)")
         if self.repose_spatial_wavelength_m <= 0.0 or self.repose_strata_wavelength_m <= 0.0:
             raise ValueError("repose wavelengths must be positive")
+        if self.repose_strata_fold_amp_m < 0.0 or self.repose_strata_fold_wavelength_m <= 0.0:
+            raise ValueError("strata fold amplitude must be >= 0 and wavelength > 0")
         if not (0.0 < self.repose_min_deg <= self.repose_deg <= self.repose_max_deg < 85.0):
             raise ValueError(
                 f"need 0 < repose_min_deg {self.repose_min_deg} <= repose_deg "
@@ -736,6 +757,8 @@ class BakeConstants:
             "repose_spatial_wavelength_m": self.repose_spatial_wavelength_m,
             "repose_strata_amp_deg": self.repose_strata_amp_deg,
             "repose_strata_wavelength_m": self.repose_strata_wavelength_m,
+            "repose_strata_fold_amp_m": self.repose_strata_fold_amp_m,
+            "repose_strata_fold_wavelength_m": self.repose_strata_fold_wavelength_m,
             "repose_min_deg": self.repose_min_deg,
             "repose_max_deg": self.repose_max_deg,
             "incision_strength_ratio": self.incision_strength_ratio,
@@ -2312,6 +2335,8 @@ def bake_padded_domain(
                         spatial_wavelength_m=consts.repose_spatial_wavelength_m,
                         strata_amp_deg=consts.repose_strata_amp_deg,
                         strata_wavelength_m=consts.repose_strata_wavelength_m,
+                        strata_fold_amp_m=consts.repose_strata_fold_amp_m,
+                        strata_fold_wavelength_m=consts.repose_strata_fold_wavelength_m,
                         min_deg=consts.repose_min_deg,
                         max_deg=consts.repose_max_deg,
                     ),
@@ -2390,6 +2415,8 @@ def bake_padded_domain(
             spatial_wavelength_m=consts.repose_spatial_wavelength_m,
             strata_amp_deg=consts.repose_strata_amp_deg,
             strata_wavelength_m=consts.repose_strata_wavelength_m,
+            strata_fold_amp_m=consts.repose_strata_fold_amp_m,
+            strata_fold_wavelength_m=consts.repose_strata_fold_wavelength_m,
             min_deg=consts.repose_min_deg,
             max_deg=consts.repose_max_deg,
         )

@@ -449,6 +449,8 @@ def roughness(carrier_z: np.ndarray, cell_m: float, slope: np.ndarray, seed: int
 #: octaves in any family.
 _REPOSE_SPATIAL_OCTAVE_KEY = 200
 _REPOSE_STRATA_OCTAVE_KEY = 300
+#: The strata-fold field's key (see ``strata_fold_amp_m`` below).
+_REPOSE_FOLD_OCTAVE_KEY = 320
 
 #: Two octaves per family, weights (1, 0.5); this normalises their sum back to
 #: unit RMS.
@@ -485,6 +487,8 @@ def repose_field(z_m: np.ndarray, cell_m: float, seed: int,
                  spatial_wavelength_m: float = 160.0,
                  strata_amp_deg: float = 14.0,
                  strata_wavelength_m: float = 30.0,
+                 strata_fold_amp_m: float = 0.0,
+                 strata_fold_wavelength_m: float = 300.0,
                  min_deg: float = 26.0,
                  max_deg: float = 60.0) -> np.ndarray:
     """Per-cell angle of repose, in degrees float32 — ``thermal.relax``'s field form.
@@ -514,6 +518,22 @@ def repose_field(z_m: np.ndarray, cell_m: float, seed: int,
       strata are glued to the rock, not to the finished skin.
 
     Both amplitudes at 0 reproduce a constant field (the scalar bake).
+
+    **The strata FOLD** (``strata_fold_amp_m`` > 0; 0 reproduces the flat-lying
+    form bit-for-bit): the strata are keyed on ``z + w(x, y)`` where ``w`` is a
+    bounded, world-anchored 2-D undulation. Flat-lying strata are a banding
+    machine one level up: an elevation-keyed band binds at the SAME elevation
+    everywhere, so its bench traces are horizontal, contour-parallel, and
+    quasi-evenly spaced at the strata wavelength -- the owner's artifact,
+    manufactured by the very field that was added to break it (and the
+    strength-modulated incision sharpens the benches further). Folding the
+    datum by +-amp over a few hundred metres makes every bench trace wander
+    ACROSS contours, exactly as folded sedimentary bedding does. It is a
+    bounded VERTICAL warp, deliberately not a dip field: a dip term
+    ``dip(x,y) * x`` carries the lever-arm defect documented in
+    detail_rill.h (its phase derivative grows with |x| and the strata
+    degenerate to noise tens of km out), while ``w`` and its derivative are
+    bounded by construction at any distance from the origin.
     """
     if spatial_amp_deg < 0.0 or strata_amp_deg < 0.0:
         raise ValueError("repose amplitudes must be >= 0")
@@ -549,15 +569,30 @@ def repose_field(z_m: np.ndarray, cell_m: float, seed: int,
         del sp
 
     if strata_amp_deg > 0.0:
+        if strata_fold_amp_m < 0.0 or strata_fold_wavelength_m <= 0.0:
+            raise ValueError("strata fold amplitude must be >= 0 and wavelength > 0")
         # Chunked over rows, bit-identically (everything here is elementwise):
         # the unchunked form holds ~8 full-domain float64/int64 temporaries at
         # once, which measured 13.4 GiB peak working set on a production tile
         # against the 8 GiB bake-pod sizing. 512-row blocks keep the same math
         # inside a few hundred MB.
         coef = float(strata_amp_deg) / _TWO_OCTAVE_NORM
+        pf = max(4, int(round(strata_fold_wavelength_m / float(cell_m))))
         for r0 in range(0, n0, 512):
             r1 = min(r0 + 512, n0)
-            blk = z_m[r0:r1]
+            blk = z_m[r0:r1].astype(np.float64, copy=False)
+            if strata_fold_amp_m > 0.0:
+                # Two fold octaves, self-similar (A at lambda, A/3 at
+                # lambda/3). One octave tilts every bench on a 300 m face
+                # section TOGETHER -- locally the rows stay parallel, just
+                # inclined, which the capture still read as a stack. The
+                # shorter octave changes the local dip every ~100 m, so
+                # adjacent bench traces pinch and swell within a single face.
+                blk = blk + float(strata_fold_amp_m) * _octave_field(
+                    (r1 - r0, n1), pf, seed, _REPOSE_FOLD_OCTAVE_KEY, oy + r0, ox)
+                blk = blk + (float(strata_fold_amp_m) / 3.0) * _octave_field(
+                    (r1 - r0, n1), max(4, pf // 3), seed,
+                    _REPOSE_FOLD_OCTAVE_KEY + 1, oy + r0, ox)
             st = _strata_1d(blk, seed, _REPOSE_STRATA_OCTAVE_KEY, strata_wavelength_m)
             st += 0.5 * _strata_1d(blk, seed, _REPOSE_STRATA_OCTAVE_KEY + 1,
                                    strata_wavelength_m / 4.0)

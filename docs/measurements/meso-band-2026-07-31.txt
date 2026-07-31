@@ -25,11 +25,28 @@ WHAT SHIPS (all bake-side, bake_ver 6; the client is BIT-EXACT worldgen v18):
      floor, and the RECONSTRUCTED carrier grows pits the raw surface does not
      have (measured: 1 carrier sink at ratio 6, 0 at ratio 3, same window).
   2. B4 MESO RELIEF (noise.meso_relief): 15 m / 11.25 m octaves, RMS 0.8 /
-     0.4 m, gated to steep ground (slope 0.20-0.40 ramp), world-anchored,
+     0.4 m, gated to steep ground (slope 0.12-0.28 ramp -- the first cut,
+     0.20/0.40, fixed the steep bowl and left the moderate-grade upper faces
+     banded, which is exactly what that arithmetic predicts), world-anchored,
      applied POST-THERMAL -- the one slot where the relief survives (thermal
      never sees it) -- then drainage-reconciled (below) and refilled before
      encode. This is the band that varies grade at the banding wavelength on
      exactly the faces that band.
+  2b. THE STRATA ARE FOLDED (repose_strata_fold_amp_m = 15 m at 300 m, plus a
+     self-similar third at 100 m): the third capture arm showed the residual
+     rhythm on the distant faces was no longer the 10 cm corduroy at all --
+     it was the REPOSE FIELD'S OWN STRATA, re-manufacturing the artifact one
+     level up. Flat-lying elevation-keyed strata bind at the same elevation
+     everywhere, so their benches (sharpened by the strength incision) are
+     horizontal, contour-parallel, quasi-evenly spaced at 30 m. Keying the
+     strata on z + w(x,y), with w a BOUNDED world-anchored undulation, makes
+     every bench trace wander across contours the way folded bedding does.
+     One fold octave was not enough either -- a 300 m fold tilts every bench
+     on a face section TOGETHER, so locally the stack stays parallel; the
+     100 m octave changes the local dip within a single face, so adjacent
+     traces pinch, swell and anastomose. Deliberately NOT a dip field
+     (dip * x carries detail_rill.h's lever-arm defect; w and its derivative
+     are bounded at any distance from the origin).
   3. B4b MICRO-REFILL + DESCENT ENFORCEMENT (pipeline.bake_padded_domain):
      after the meso field is added, every cell is raised until it keeps at
      least min(its pre-meso drop, 0.11 m) over its pre-meso D8 receiver --
@@ -97,9 +114,15 @@ the real client carrier path):
     moved 5x with zero visual change; the capture decides, these verify
     physics.
 
-  Ten-class coarse ladder: byte-identical to the shipped v18 client posture
-  (the client is unchanged). D:\ue-cache\tmp\drainage-ladder-v19b.txt was the
-  two-pool arm that motivated the withdrawal.
+  Ten-class coarse ladder (D:\ue-cache\tmp\drainage-ladder-final-v18client
+  .txt): byte-identical to the shipped v18 client posture, because the client
+  is unchanged -- and WORTH KNOWING, that posture is not the v14 doc's:
+  steepest reads 69.0% stranded against v14's 17.5%. This is pre-existing
+  (the v17 micro reshape raised the 400/200 mm amplitudes and was only ever
+  spot-checked for drainage, never re-laddered), not this work's. A datum for
+  whoever fixes it: the withdrawn two-pool cap read 22.9% on that row
+  (D:\ue-cache\tmp\drainage-ladder-v19b.txt) -- splitting the budget starves
+  the material band on steep ground, which is most of that regression.
 
   Bake cost: ~350 CPU-s / tile (B3 relax 207, B2d 86 with the strength field,
   B4+enforcement ~25). Peak working set 6.3 GiB against the 8 GiB pod -- down
@@ -118,7 +141,36 @@ drainage probe first -- the v12 ladder is uncapped and the probe numbers
 above are v18's.
 
 CAPTURES (owner's exact pose: spawn -69094,38426, VistaShot=10, pitch -12,
-yaw 45, 200 s settle, 1600x900, both arms on the same v12 DLL):
-  before: D:\ue-cache\tmp\meso-before.png  (provider survey-g35-v5b)
-  after:  D:\ue-cache\tmp\meso-after.png   (provider survey-g35-v6)
-  reading: filled in below.
+yaw 45, 200 s settle, 1600x900, all arms on the same v12 DLL). Four arms,
+because the first three each taught something:
+  before:  D:\ue-cache\tmp\meso-before.png  (survey-g35-v5b -- the shipped
+           repose field; the owner's rejected state)
+  after 1: meso-after.png  (survey-g35-v6, gate 0.20/0.40): the mid-slope
+           bowl and the left slope lose their banding entirely -- talus,
+           benches, no traceable rows -- and the moderate-grade distant faces
+           keep theirs: the gate was barely open there.
+  after 2: meso-after2.png (survey-g35-v6b, gate 0.12/0.28): near-identical
+           to after 1, which is what exposed that the residual rows were not
+           grade-constancy corduroy at all but the strata's own benches (the
+           offline hillshade of the same face shows the meso mottling present
+           and the bench stack riding above it).
+  after 3: meso-after3.png (survey-g35-v6c, one 12 m fold): bench traces
+           undulate and their spacing varies, but within a 200-400 m face
+           section they still tilt together -- a locally parallel stack.
+  after 4: meso-after4.png (survey-g35-v6d = THE SHIPPED CONSTANTS): the
+           machined signature -- long unbroken parallel rows at constant
+           spacing -- is absent at this pose. Bench traces are short, wavy,
+           pinching and merging; spacing varies 2-3x within any face; the
+           bowl and foreground read as talus and irregular ledges. What
+           remains is stratified-rock texture, quasi-repetitive the way
+           folded sedimentary faces are, not machined. My verdict against
+           the bar ("can I trace parallel evenly-spaced bands"): no face in
+           this frame supports it. The owner's eye is the acceptance;
+           these four frames plus the before are the evidence to show.
+
+REPRO of the shipped state: bake tile (-5,2) at the current constants
+(terrain-service/tools/bake_real_tile.py --tiles-dir <s1> --tile -5 2
+--out-dir <dir>), stage as provider survey-g35-v6d, and run the capture
+command above. Probe: vxc_terrainprobe <s1> 20260719 -69120 38400 512
+--fine-dir <dir> -- carrier and amplified must both read 0 interior sinks /
+0.0% stranded (they do, at every constants iteration shipped here).
