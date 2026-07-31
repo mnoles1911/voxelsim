@@ -569,7 +569,7 @@ class BakeConstants:
     #: strong band a knickpoint the cap does not censor on hillslope gullies.
     incision_strength_ratio: float = 3.0
     #: bake_ver 6, B4: post-thermal meso relief (noise.meso_relief). RMS metres
-    #: at the 15 m / 7.5 m octaves, gated to zero at or below meso_slope_lo
+    #: at the 15 m / 11.25 m octaves, gated to zero at or below meso_slope_lo
     #: (regional plains keep their calibrated statistics) and full at
     #: meso_slope_hi. This is the band that varies local grade at the
     #: band-spacing wavelength on steep faces -- the contour-banding residual's
@@ -577,9 +577,19 @@ class BakeConstants:
     #: back into the threshold pattern, and BEFORE the B4b refill so it cannot
     #: cost drainage. 0/0 disables and reproduces the prior surface exactly.
     meso_amp15_m: float = 0.8
-    meso_amp75_m: float = 0.4
+    meso_amp11_m: float = 0.4
     meso_slope_lo: float = 0.20
     meso_slope_hi: float = 0.40
+    #: The B4 descent-enforcement step, metres: after the meso band is added,
+    #: every cell is raised until it keeps at least min(its pre-meso drop,
+    #: this) over its pre-meso D8 receiver. One codec LSB (100 mm) plus both
+    #: half-LSB reconstruction errors, so an enforced reach stays monotone
+    #: through encode/decode worst-case. NOTE this constant must NOT be used
+    #: as a flood-fill epsilon: an epsilon this large DOMES every wide flat it
+    #: refloods (measured: lake floors tilted into 5-17 m cones, flat-shaded
+    #: scars in the hillshade). The enforcement form preserves gentle reaches
+    #: exactly because it takes min(original drop, this).
+    refill_eps_m: float = 0.11
     thermal_iters: int = 48
     #: Must stay <= 0.5 -- ``thermal.relax`` rejects more outright. The shed is
     #: capped by the STEEPEST over-repose pair, so that pair can at most be
@@ -674,13 +684,15 @@ class BakeConstants:
                 f"profile_regional_p must be >= 0 (0 = use stream_n), got "
                 f"{self.profile_regional_p}"
             )
-        if self.meso_amp15_m < 0.0 or self.meso_amp75_m < 0.0:
+        if self.meso_amp15_m < 0.0 or self.meso_amp11_m < 0.0:
             raise ValueError("meso amplitudes must be >= 0 (0 disables)")
         if not 0.0 <= self.meso_slope_lo < self.meso_slope_hi:
             raise ValueError(
                 f"need 0 <= meso_slope_lo < meso_slope_hi, got "
                 f"{self.meso_slope_lo}, {self.meso_slope_hi}"
             )
+        if self.refill_eps_m < 0.0:
+            raise ValueError(f"refill_eps_m must be >= 0, got {self.refill_eps_m}")
         if self.incision_strength_ratio <= 0.0:
             raise ValueError(
                 f"incision_strength_ratio must be positive (1 disables), got "
@@ -728,9 +740,10 @@ class BakeConstants:
             "repose_max_deg": self.repose_max_deg,
             "incision_strength_ratio": self.incision_strength_ratio,
             "meso_amp15_m": self.meso_amp15_m,
-            "meso_amp75_m": self.meso_amp75_m,
+            "meso_amp11_m": self.meso_amp11_m,
             "meso_slope_lo": self.meso_slope_lo,
             "meso_slope_hi": self.meso_slope_hi,
+            "refill_eps_m": self.refill_eps_m,
             "thermal_iters": self.thermal_iters,
             "thermal_rate": self.thermal_rate,
             "superblock_tiles": self.superblock_tiles,
@@ -2400,28 +2413,73 @@ def bake_padded_domain(
     # 0.04-0.33% stranded, realization-dependent). Here thermal never sees it
     # and the refill below resolves every basin it could create.
     c0 = time.process_time()
-    if consts.meso_amp15_m > 0.0 or consts.meso_amp75_m > 0.0:
+    if consts.meso_amp15_m > 0.0 or consts.meso_amp11_m > 0.0:
         from .noise import meso_relief  # lazy, same reason as repose_field
 
+        # The gate needs the DOWNSTREAM slope of this exact surface: a gully
+        # bed between steep walls must read its own gentle profile, or the
+        # band perturbs bed long-profiles into the codec's quantization floor
+        # (see meso_relief's flow_slope note). rec4 is a 680 MB transient,
+        # dropped before the field is built.
+        rec4, d8s4 = kernels.d8_receivers(z, cell_m)
+        z_pre = z
         z = z + meso_relief(
             z,
             cell_m,
             seed,
             origin_cells,
             amp15_m=consts.meso_amp15_m,
-            amp75_m=consts.meso_amp75_m,
+            amp11_m=consts.meso_amp11_m,
             slope_lo=consts.meso_slope_lo,
             slope_hi=consts.meso_slope_hi,
+            flow_slope=np.asarray(d8s4, dtype=np.float32),
         )
+        del d8s4
+        # DESCENT ENFORCEMENT along the pre-meso D8 tree, and this is the
+        # guarantee, not the gate. The gate keeps the band off gentle beds;
+        # what it cannot do is bound the band's ALONG-FLOW gradient where the
+        # gate itself varies, and a reach whose post-meso drop lands under the
+        # codec's 100 mm LSB dams on RECONSTRUCTION even though no pit exists
+        # at float precision (measured three times, at 10.4%, 5.0% and 0.9%
+        # of the repro window, across three gate refinements -- the class
+        # cannot be tuned away). So: every cell is raised until it keeps at
+        # least min(its pre-meso drop, refill_eps_m) over its own pre-meso
+        # receiver. Every interior cell then still has a strictly lower
+        # neighbour (no pit, structurally) and every reach that was
+        # codec-proof stays codec-proof. Pure-numpy fixed point: each pass
+        # propagates one tree level; the raise is bounded by the band's own
+        # amplitude, so convergence is tens of passes, not thousands.
+        recf = np.asarray(rec4, dtype=np.int64).ravel()
+        del rec4
+        n_cells = recf.size
+        self_idx = np.arange(n_cells, dtype=np.int64)
+        tgt = np.where(recf >= 0, recf, self_idx)
+        del recf
+        zp = z_pre.ravel()
+        drop = np.minimum(zp - zp[tgt], np.float32(consts.refill_eps_m)
+                          ).astype(np.float32)
+        del zp, z_pre, self_idx
+        zf = np.ascontiguousarray(z, dtype=np.float32).ravel()
+        for _ in range(256):
+            need = zf[tgt] + drop
+            if not (zf < need).any():
+                break
+            np.maximum(zf, need, out=zf)
+        del tgt, drop
+        z = zf.reshape(z.shape)
+        del zf
     tick("B4.meso", c0)
 
-    # -- B4b: micro-refill, and the stage that makes B4 affordable at all.
-    # Two producers of post-fill pits: thermal (its steepest-pair rule bounds
-    # what a cell gives, not what it receives -- measured as one 41 mm sink on
-    # the exemplar) and the B4 meso band (a bump can dam a marginal dip).
-    # "The carrier drains" is a CONTRACT (0 sinks / 0.0% stranded on steep
-    # ground), so every such basin is resolved here, before the codec sees the
-    # ground. Same epsilon fill as B2a, so filled flats stay routable.
+    # -- B4b: micro-refill, belt and braces behind the descent enforcement
+    # above. Producers of post-fill pits: thermal (its steepest-pair rule
+    # bounds what a cell gives, not what it receives -- measured as one 41 mm
+    # sink on the exemplar) and, before the enforcement existed, the meso
+    # band. "The carrier drains" is a CONTRACT (0 sinks / 0.0% stranded on
+    # steep ground), so any stray basin is resolved here, before the codec
+    # sees the ground. The AUTO epsilon, deliberately: refill_eps_m used as a
+    # flood epsilon domes every wide flat it refloods (lake floors became
+    # 5-17 m cones -- flat-shaded scars in the hillshade); the auto epsilon
+    # raises only true pits by their own depth.
     c0 = time.process_time()
     z = np.asarray(kernels.fill_depressions(z, **fill_kwargs), dtype=np.float32)
     tick("B4b.refill", c0)

@@ -552,8 +552,9 @@ def test_flat_eps_is_forwarded_only_when_pinned():
     pipeline.bake_tile(world_seed=1, tile_x=0, tile_y=0,
                        coarse_fetch=lambda x, y: world.get((x, y)),
                        kernels=k, geom=TEST_GEOM, consts=TEST_CONSTS)
-    # TWO fills since B3b (the post-thermal micro-refill), both with the same
-    # forwarding: the auto epsilon is one decision, made once.
+    # TWO fills since B4b (the post-meso refill), BOTH on the auto epsilon --
+    # refill_eps_m is the descent-enforcement bound, and using it as a flood
+    # epsilon was measured to dome every wide flat it refloods.
     assert seen == [{}, {}]
     seen.clear()
     pipeline.bake_tile(world_seed=1, tile_x=0, tile_y=0,

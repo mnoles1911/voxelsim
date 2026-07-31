@@ -575,10 +575,11 @@ _MESO_OCTAVE_KEY = 400
 def meso_relief(z_m: np.ndarray, cell_m: float, seed: int,
                 origin_cells: Tuple[int, int], *,
                 amp15_m: float = 0.8,
-                amp75_m: float = 0.4,
+                amp11_m: float = 0.4,
                 slope_lo: float = 0.20,
-                slope_hi: float = 0.40) -> np.ndarray:
-    """B4: steep-gated meso relief (15 m / 7.5 m), in metres, POST-thermal.
+                slope_hi: float = 0.40,
+                flow_slope: "np.ndarray | None" = None) -> np.ndarray:
+    """B4: steep-gated meso relief (15 m / 11.25 m), in metres, POST-thermal.
 
     WHY THIS STAGE EXISTS, AND WHY IT RUNS AFTER B3. The residual contour
     banding lives on steep faces whose grade is near-constant over tens of
@@ -610,8 +611,31 @@ def meso_relief(z_m: np.ndarray, cell_m: float, seed: int,
     ``z_m`` is the post-thermal surface; the gate reads ITS local slope,
     computed here (chunked, with a one-row halo) so the gate and the field
     cannot be computed against different stages.
+
+    ``flow_slope`` (optional, same shape): the DOWNSTREAM (D8) slope of the
+    surface. When given, the gate takes ``min(local_slope, flow_slope)`` --
+    and this distinction is a measured drainage requirement, not a nicety. The
+    hypot slope on a gully BED between steep walls is steep (it reads the
+    walls), so the bed passes the steep gate and the band perturbs the bed's
+    own long profile; a bed descending at under ~100 mm/cell is then at the
+    mercy of the codec's 100 mm quantization even when no pit exists at float
+    precision (measured: 2 carrier sinks behind sub-quantization sills,
+    stranding 5% of the repro window). The D8 slope reads the bed's own
+    descent, so gentle-profile reaches shut the gate no matter how steep their
+    walls -- "the channels stay open", which is also what real meso roughness
+    does: talus and benches yield to the thalweg.
+
+    WHY THE SECOND OCTAVE IS 11.25 m AND NOT 7.5. The first cut used 7.5 m --
+    4 cells per wavelength, exactly ``_MIN_CELLS_PER_OCTAVE`` -- and the
+    shipped SURFACE grew a 230 mm closed basin that exists only BETWEEN the
+    native samples: the encoder's sharpening prefilter rings on near-Nyquist
+    content, and a basin the native lattice cannot see is one the B4b refill
+    cannot fill (it stranded 10.4% of the repro window through a sub-pixel
+    sill in a trunk channel). At 6 cells per wavelength the spline renders the
+    octave without inter-sample ringing at this amplitude, measured by a
+    half-pixel pit census on the DECODED tile: 0 basins.
     """
-    if amp15_m < 0.0 or amp75_m < 0.0:
+    if amp15_m < 0.0 or amp11_m < 0.0:
         raise ValueError("meso amplitudes must be >= 0")
     if not 0.0 <= slope_lo < slope_hi:
         raise ValueError(f"need 0 <= slope_lo < slope_hi, got {slope_lo}, {slope_hi}")
@@ -623,13 +647,34 @@ def meso_relief(z_m: np.ndarray, cell_m: float, seed: int,
         raise ValueError(f"cell_m must be positive, got {cell_m}")
     n0, n1 = z.shape
     oy, ox = int(origin_cells[0]), int(origin_cells[1])
+    fs = None
+    if flow_slope is not None:
+        fs = np.asarray(flow_slope)
+        if fs.shape != z.shape:
+            raise ValueError(f"flow_slope {fs.shape} must match z {z.shape}")
+        # ERODED, then smoothed, and both operations are drainage load-bearing:
+        # a pointwise gate puts full-amplitude 11-15 m content ONE CELL from a
+        # gentle bed, and the codec's reconstruction error is content-local --
+        # a 30 mm/cell reach that survives quantization under smooth
+        # surroundings dams when the band rings next to it (measured: the last
+        # residual sink sat exactly so). The minimum filter keeps the band a
+        # buffer away from every gentle cell; the uniform filter makes the
+        # fade band-limited so the gate itself cannot re-introduce the
+        # high-frequency content it exists to keep away. scipy is a bake-pod
+        # dependency (see _prefilter); lazy import for the same CI reason.
+        from scipy.ndimage import minimum_filter, uniform_filter
+
+        fs = uniform_filter(
+            minimum_filter(fs.astype(np.float32, copy=False), size=9,
+                           mode="nearest"),
+            size=5, mode="nearest")
 
     out = np.zeros((n0, n1), dtype=np.float32)
-    if amp15_m == 0.0 and amp75_m == 0.0:
+    if amp15_m == 0.0 and amp11_m == 0.0:
         return out
 
-    p15 = max(4, int(round(15.0 / cell_m)))
-    p75 = max(4, int(round(7.5 / cell_m)))
+    p15 = max(6, int(round(15.0 / cell_m)))
+    p11 = max(6, int(round(11.25 / cell_m)))
     inv_span = 1.0 / (float(slope_hi) - float(slope_lo))
     for r0 in range(0, n0, 512):
         r1 = min(r0 + 512, n0)
@@ -637,9 +682,9 @@ def meso_relief(z_m: np.ndarray, cell_m: float, seed: int,
         if amp15_m > 0.0:
             blk += float(amp15_m) * _octave_field(
                 (r1 - r0, n1), p15, seed, _MESO_OCTAVE_KEY, oy + r0, ox)
-        if amp75_m > 0.0:
-            blk += float(amp75_m) * _octave_field(
-                (r1 - r0, n1), p75, seed, _MESO_OCTAVE_KEY + 1, oy + r0, ox)
+        if amp11_m > 0.0:
+            blk += float(amp11_m) * _octave_field(
+                (r1 - r0, n1), p11, seed, _MESO_OCTAVE_KEY + 1, oy + r0, ox)
         # Local slope of z over this block with a one-row halo, so the block
         # layout cannot change any cell's gate (np.gradient uses central
         # differences interior, one-sided at the array edge -- the halo keeps
@@ -648,6 +693,8 @@ def meso_relief(z_m: np.ndarray, cell_m: float, seed: int,
         h1 = min(n0, r1 + 1)
         gy, gx = np.gradient(z[h0:h1].astype(np.float64, copy=False), cell_m)
         s = np.hypot(gx, gy)[r0 - h0:(r0 - h0) + (r1 - r0)]
+        if fs is not None:
+            s = np.minimum(s, fs[r0:r1].astype(np.float64, copy=False))
         gate = np.clip((s - float(slope_lo)) * inv_span, 0.0, 1.0)
         out[r0:r1] = blk * gate
     return out

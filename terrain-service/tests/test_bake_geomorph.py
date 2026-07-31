@@ -785,7 +785,7 @@ def test_meso_relief_gate_anchoring_and_disable():
                           np.zeros((n, n), np.float32)), "flat ground must be untouched"
     on = noise.meso_relief(steep, CELL_M, 7, (0, 0))
     assert float(np.abs(on).mean()) > 0.1, "steep ground must carry meso relief"
-    off = noise.meso_relief(steep, CELL_M, 7, (0, 0), amp15_m=0.0, amp75_m=0.0)
+    off = noise.meso_relief(steep, CELL_M, 7, (0, 0), amp15_m=0.0, amp11_m=0.0)
     assert np.array_equal(off, np.zeros((n, n), np.float32))
 
     # World anchoring + chunk invariance in one: a window of a tall domain,
