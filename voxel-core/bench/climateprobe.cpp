@@ -305,6 +305,11 @@ int main(int argc, char** argv) {
     subsoils.reserve(size_t(total));
 
     int64_t biomeCount[kBiomeCount] = {0};
+    // The sampled biome lattice, kept so a representative SITE can be reported
+    // per biome and not merely a count -- see the block after the census.
+    std::vector<uint8_t> biomeGrid(size_t(nAxis) * size_t(nAxis), 0);
+    std::vector<int64_t> gridVx(size_t(nAxis) * size_t(nAxis), 0);
+    std::vector<int64_t> gridVy(size_t(nAxis) * size_t(nAxis), 0);
     int64_t gateCount[kGateCount] = {0};
     int64_t stratMat[kMaterialCount] = {0};
     int64_t liveMat[kMaterialCount] = {0};
@@ -348,6 +353,9 @@ int main(int argc, char** argv) {
             const BiomeId biome =
                 classifyBiome(cl.temperature, cl.precipitation, cl.seasonality, col.surfaceMm, slope);
             biomeCount[biome]++;
+            biomeGrid[size_t(j) * size_t(nAxis) + size_t(i)] = static_cast<uint8_t>(biome);
+            gridVx[size_t(j) * size_t(nAxis) + size_t(i)] = vx;
+            gridVy[size_t(j) * size_t(nAxis) + size_t(i)] = vy;
 
             const Gate g = attributeGate(cl.temperature, col.surfaceMm, slope);
             gateCount[g]++;
@@ -403,6 +411,86 @@ int main(int argc, char** argv) {
     for (int b = 0; b < kBiomeCount; ++b)
         std::printf("  %-18s %10lld  %6.2f%%%s\n", kBiomeName[b], (long long)biomeCount[b],
                     pct(biomeCount[b], total), biomeCount[b] == 0 ? "   <-- UNREACHABLE" : "");
+
+    // ONE REPRESENTATIVE SITE PER BIOME, in world metres, for -VoxelSpawnAt.
+    //
+    // WHY INTERIORITY IS THE WHOLE POINT. The census above says a biome exists;
+    // it does not say where you can stand in it. A capture aimed at the first
+    // sample of a biome usually lands on its BOUNDARY -- biome edges are where
+    // most of a biome's samples are when the patches are small -- and a
+    // screenshot of a boundary tells you about two biomes badly instead of one
+    // well. So this reports a site all four of whose lattice neighbours share
+    // its biome, and among those the one furthest from the sampled edge.
+    //
+    // The lattice spacing is the sampling stride, so "interior" here means
+    // interior AT THAT STRIDE -- with the default 192 samples over a 5-tile
+    // block that is ~400 m, comfortably wider than a capture's framing. A
+    // biome that never has an interior sample at this stride is reported as
+    // EDGE-ONLY rather than silently given a boundary site: that is a real
+    // property of the world (the patch is thinner than the stride), and it is
+    // worth seeing rather than papering over.
+    int64_t bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
+    bool haveBounds = false;
+    if (const char* bs = std::getenv("VXC_SITE_BOUNDS")) {
+        haveBounds = std::sscanf(bs, "%lld,%lld,%lld,%lld", (long long*)&bx0, (long long*)&by0,
+                                 (long long*)&bx1, (long long*)&by1) == 4;
+    }
+    std::printf("\n=== REPRESENTATIVE SITE PER BIOME (world metres, for -VoxelSpawnAt) ===\n");
+    if (haveBounds)
+        std::printf("  (restricted to x [%lld, %lld], y [%lld, %lld])\n", (long long)bx0,
+                    (long long)bx1, (long long)by0, (long long)by1);
+    for (int b = 0; b < kBiomeCount; ++b) {
+        if (biomeCount[b] == 0) continue;
+        int64_t bestI = -1, bestJ = -1, bestScore = -1;
+        int64_t anyI = -1, anyJ = -1;
+        for (int64_t j = 1; j + 1 < nAxis; ++j) {
+            for (int64_t i = 1; i + 1 < nAxis; ++i) {
+                const size_t k = size_t(j) * size_t(nAxis) + size_t(i);
+                if (biomeGrid[k] != b) continue;
+                // The EDGE-ONLY fallback must respect the bounds too, or it
+                // reports a site outside the region it just said it searched --
+                // which is worse than reporting nothing, because the caller
+                // cannot tell.
+                const bool inBounds =
+                    !haveBounds || (gridVx[k] * kVoxelSizeMm / 1000 >= bx0 &&
+                                    gridVx[k] * kVoxelSizeMm / 1000 <= bx1 &&
+                                    gridVy[k] * kVoxelSizeMm / 1000 >= by0 &&
+                                    gridVy[k] * kVoxelSizeMm / 1000 <= by1);
+                if (anyI < 0 && inBounds) { anyI = i; anyJ = j; }
+                const bool interior = biomeGrid[k - 1] == b && biomeGrid[k + 1] == b &&
+                                      biomeGrid[k - size_t(nAxis)] == b &&
+                                      biomeGrid[k + size_t(nAxis)] == b;
+                if (!interior) continue;
+                // Optional world-metre bounds (VXC_SITE_BOUNDS="x0,y0,x1,y1").
+                // A representative site is only useful if the client can
+                // actually render it, and the fine tier BLOCKS chunks whose
+                // fine footprint is not resident rather than falling back to a
+                // coarse guess -- so a site outside the baked fine block
+                // photographs nothing at all, which looks like a bug and is
+                // not. Restricting the search is better than discovering that
+                // one capture at a time.
+                if (haveBounds) {
+                    const int64_t xM = gridVx[k] * kVoxelSizeMm / 1000;
+                    const int64_t yM = gridVy[k] * kVoxelSizeMm / 1000;
+                    if (xM < bx0 || xM > bx1 || yM < by0 || yM > by1) continue;
+                }
+                // Distance from the sampled edge, so the site is not only inside
+                // its biome but inside the MEASURED REGION -- a capture at the
+                // very corner of the tile block photographs the fallback plane
+                // just off it.
+                const int64_t score = std::min(std::min(i, nAxis - 1 - i), std::min(j, nAxis - 1 - j));
+                if (score > bestScore) { bestScore = score; bestI = i; bestJ = j; }
+            }
+        }
+        const bool edgeOnly = bestI < 0;
+        const int64_t ui = edgeOnly ? anyI : bestI, uj = edgeOnly ? anyJ : bestJ;
+        if (ui < 0) continue;
+        const size_t k = size_t(uj) * size_t(nAxis) + size_t(ui);
+        std::printf("  %-18s -VoxelSpawnAt '%lld,%lld'%s\n", kBiomeName[b],
+                    (long long)(gridVx[k] * kVoxelSizeMm / 1000),
+                    (long long)(gridVy[k] * kVoxelSizeMm / 1000),
+                    edgeOnly ? "   <-- EDGE-ONLY: no interior sample at this stride" : "");
+    }
 
     std::printf("\n=== GATE ATTRIBUTION (which gate decided) ===\n");
     for (int g = 0; g < kGateCount; ++g)
