@@ -70,7 +70,7 @@ def _coarse_elevation_m(cache: TileCache, provider, seed: int, x: int, y: int,
     return tile_codec.decode(data).elevation.astype(np.float32)
 
 
-def _encode_fine(result, seed: int, provider_id: str):
+def _encode_fine(result, seed: int, provider_id: str, codec: int | None = None):
     """Hand a BakeResult to tile_codec's v2 encoder, whatever it ended up called.
 
     ``tile_codec.py`` is owned by another workstream and its v2 entry point may
@@ -105,6 +105,25 @@ def _encode_fine(result, seed: int, provider_id: str):
         "flow": result.flow,
         "flow_plane": result.flow,
         "provider_id": provider_id,
+        # THE CODEC HAS TO BE PASSED, and it was not until 2026-08-01.
+        #
+        # tile_codec.encode_fine defaults to CODEC_RAW, and that default is
+        # RIGHT for the library: CODEC_RAW must never depend on an optional
+        # compression package, and CI deliberately does not install zstandard.
+        # But this dict is the ONLY channel through which pregen reaches the
+        # encoder, and `codec` was absent from it -- so there was no way to
+        # produce a compressed fine tile through the production path at all.
+        # Every tile pregen has ever written is uncompressed.
+        #
+        # MEASURED on tile (-5,2): 201.4 MB RAW against 33.4 MB CODEC_ZSTD,
+        # 6.0x, with elevation and flow planes both bit-identical on round
+        # trip. At 4,200 tiles per 1M km^2 that is ~845 GB against ~140 GB of
+        # storage and of wire, and the client has decoded zstd since the
+        # runtime binder landed.
+        #
+        # None means "let the encoder choose", which keeps the library's own
+        # default reachable for a box with no zstandard installed.
+        **({"codec": codec} if codec is not None else {}),
     }
     params = inspect.signature(enc).parameters
     kwargs = {k: v for k, v in candidates.items() if k in params}
