@@ -80,7 +80,12 @@ import functools
 
 import numpy as np
 
-__all__ = ["fill_depressions", "d8_receivers", "accumulate_mfd"]
+__all__ = [
+    "fill_depressions",
+    "d8_receivers",
+    "accumulate_mfd",
+    "enforce_descent",
+]
 
 # Rebound to `numba.prange` by `_compile` before any kernel is compiled; numba
 # resolves a jitted function's globals at compile time, which is what lets the
@@ -210,7 +215,11 @@ def _priority_flood(z, eps, seed):
 def _d8_receivers(z, cell_m):
     """Steepest-descent neighbour per cell. Genuinely parallel: rows are independent."""
     h, w = z.shape
-    rec = np.full((h, w), -1, np.int64)
+    # int32, not int64: `_as_grid` has already refused any domain whose flat
+    # indices do not fit, and at the padded production domain this is 340 MB
+    # rather than 680 -- live from B2b all the way through B2d, and half the
+    # store bandwidth in the one genuinely parallel kernel in the bake.
+    rec = np.full((h, w), -1, np.int32)
     slope = np.zeros_like(z)
     dy = np.array(_DY, np.int64)
     dx = np.array(_DX, np.int64)
@@ -278,6 +287,58 @@ def _accumulate_mfd(z, order_asc, acc, inv_dist, p):
             if wgt[k] > 0.0:
                 acc[(cy + dy[k]) * w + (cx + dx[k])] += a * (wgt[k] / tot)
     return acc
+
+
+@_jit(cache=True)
+def _descent_enforce(rec, z_ref, z, eps):
+    """One topological sweep of ``z[c] = max(z[c], z[rec[c]] + min(drop, eps))``.
+
+    ``rec`` is a receiver forest on ``z_ref`` -- every receiver is STRICTLY
+    lower than its donor there -- so it is acyclic and each chain ends at a
+    ``rec < 0`` root. The stack walks a chain down to the first already-final
+    cell and then applies the rule on the way back up, which visits every cell
+    exactly once after its own receiver is final. That is the unique least
+    fixed point, so the answer does not depend on the order chains are
+    started in.
+
+    Arithmetic is float32 throughout on purpose: the Jacobi form this replaces
+    computed ``zf[tgt] + drop`` in float32 too, and float32 addition is
+    monotone, so every intermediate that form produced was dominated by the
+    final one and the two agree bit-for-bit rather than approximately.
+    """
+    n = z.size
+    done = np.zeros(n, np.uint8)
+    # Grown by doubling rather than allocated at n: a full-domain int32 stack
+    # would be 340 MB for a chain depth that is in practice thousands.
+    stack = np.empty(1024, np.int32)
+    for start in range(n):
+        if done[start] != 0:
+            continue
+        top = 0
+        c = start
+        while True:
+            if top >= stack.size:
+                bigger = np.empty(2 * stack.size, np.int32)
+                bigger[:top] = stack[:top]
+                stack = bigger
+            stack[top] = c
+            top += 1
+            done[c] = 1
+            t = rec[c]
+            if t < 0 or done[t] != 0:
+                break
+            c = t
+        for i in range(top - 1, -1, -1):
+            c = stack[i]
+            t = rec[c]
+            if t < 0:
+                continue  # root: its "drop" is 0, so the rule is a no-op
+            d = z_ref[c] - z_ref[t]
+            if d > eps:
+                d = eps
+            need = z[t] + d
+            if z[c] < need:
+                z[c] = need
 
 
 # ---------------------------------------------------------------------------- public
@@ -355,7 +416,7 @@ def d8_receivers(z: np.ndarray, cell_m: float) -> tuple[np.ndarray, np.ndarray]:
 
     Returns ``(receiver, slope)``, both shaped like `z`:
 
-    * ``receiver`` -- int64 **flat** index (``y * width + x``) of the steepest lower
+    * ``receiver`` -- int32 **flat** index (``y * width + x``) of the steepest lower
       neighbour, or **-1** where the cell has none. After `fill_depressions` with a
       non-zero ``flat_eps`` that means exactly "a domain-border cell that drains out
       of the domain"; on a raw surface it also means "pit".
@@ -379,6 +440,8 @@ def accumulate_mfd(
     cell_m: float,
     p: float = 1.1,
     inflow: np.ndarray | None = None,
+    *,
+    return_order: bool = False,
 ) -> np.ndarray:
     """Multiple-flow-direction catchment area, in m^2, as float64.
 
@@ -386,6 +449,15 @@ def accumulate_mfd(
     proportion to ``slope ** p``, sweeping in descending elevation. `z` should already
     be depression-filled; on a raw surface the sweep is still correct, it just parks
     each pit's catchment in the pit.
+
+    ``return_order=True`` additionally hands back the ascending-elevation
+    ``argsort`` this sweep had to compute anyway, as **int32 flat indices**.
+    ``incise.profile_incision`` walks the same order over the same array, and
+    recomputing it there cost a second full-domain sort inside the bake's peak
+    stage (13.6 s at 9216^2 with ``kind="stable"``, plus a 680 MB int64
+    transient). The order is a plain ascending sort, so callers must not assume
+    anything about how EQUAL elevations are arranged -- both sweeps that use it
+    only ever read strictly-lower neighbours, which makes ties inert.
 
     ``inflow`` is per-cell externally supplied upstream area in m^2, added to the
     initial accumulation -- this is how the apron and the hydrology pyramid's boundary
@@ -418,6 +490,56 @@ def accumulate_mfd(
         acc += inf.ravel()
 
     inv_dist = (1.0 / (np.array(_DIST, np.float64) * cell_m)).astype(zz.dtype)
-    order = np.argsort(zz, axis=None)
+    # int32, not argsort's native intp: `_as_grid` has already refused any
+    # domain whose flat indices do not fit, this is the array the sweep
+    # random-accesses, and at 9216^2 it is 340 MB rather than 680 -- which
+    # matters because B2d now holds it too instead of sorting again.
+    order = np.argsort(zz, axis=None).astype(np.int32)
     _accumulate_mfd(zz, order, acc, inv_dist, zz.dtype.type(p))
-    return acc.reshape(zz.shape)
+    acc = acc.reshape(zz.shape)
+    return (acc, order) if return_order else acc
+
+
+def enforce_descent(
+    receivers: np.ndarray,
+    z_ref: np.ndarray,
+    z: np.ndarray,
+    eps: float,
+) -> np.ndarray:
+    """Raise `z` until every cell clears its receiver by its own `z_ref` drop.
+
+    Precisely: the least ``z' >= z`` satisfying, for every cell with a
+    receiver, ``z'[c] >= z'[rec[c]] + min(z_ref[c] - z_ref[rec[c]], eps)``.
+
+    This is the guarantee behind the bake's post-meso band (B4): the band's
+    along-flow gradient is not bounded by the gate that shapes it, so a reach
+    whose drop lands under the codec's 100 mm LSB dams on RECONSTRUCTION even
+    though no pit exists at float precision. Enforcing the ORIGINAL drop,
+    capped at `eps`, keeps every reach that was codec-proof codec-proof and
+    leaves gentle reaches exactly as they were.
+
+    `receivers` must be a receiver forest on `z_ref` -- flat ``y*w + x``, -1
+    where none, i.e. `d8_receivers(z_ref, ...)[0]`. Because every receiver is
+    strictly lower on `z_ref`, the constraint graph is an acyclic forest and
+    ONE sweep in receiver-before-donor order is the exact answer; iterating a
+    ``max`` to convergence reaches the same fixed point and costs a pass per
+    tree level.
+
+    Works IN PLACE when `z` is already a C-contiguous float32 array; the
+    result is returned either way, so callers should use the return value.
+    """
+    rec = np.ascontiguousarray(receivers, dtype=np.int32).ravel()
+    zr = np.ascontiguousarray(z_ref, dtype=np.float32).ravel()
+    zz = np.ascontiguousarray(z, dtype=np.float32).ravel()
+    if rec.size != zz.size or zr.size != zz.size:
+        raise ValueError(
+            f"receivers {rec.size}, z_ref {zr.size} and z {zz.size} must all "
+            "have the same number of cells"
+        )
+    if zz.size > _MAX_CELLS:
+        raise ValueError(f"z has {zz.size} cells; flat indices are int32 here")
+    eps = float(eps)
+    if not np.isfinite(eps) or eps < 0.0:
+        raise ValueError(f"eps must be finite and >= 0, got {eps!r}")
+    _descent_enforce(rec, zr, zz, np.float32(eps))
+    return zz.reshape(np.shape(z))

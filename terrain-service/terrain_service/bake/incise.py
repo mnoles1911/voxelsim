@@ -314,9 +314,11 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
                      a_crit_m2: float = A_CRIT_M2, gate_q: float = GATE_Q,
                      regional_slope=None, regional_s_ref: float = 0.2,
                      regional_p: float = 0.0,
+                     regional_scale: int = 1,
                      erodibility=None,
                      sea_taper_top_m: float = SEA_TAPER_TOP_M,
-                     sea_taper_bottom_m: float = SEA_TAPER_BOTTOM_M) -> np.ndarray:
+                     sea_taper_bottom_m: float = SEA_TAPER_BOTTOM_M,
+                     order=None) -> np.ndarray:
     """Eroded surface in **metres** -- the implicit stream-power step.
 
     `filled`    the epsilon-filled surface the routing ran on (metres). It is
@@ -373,6 +375,27 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
                 (s_ref 0.2) the same K_dt leaves the plains exemplar's mean
                 slope within 5-35% of the un-eroded surface (K_dt 1.5-4.5)
                 while the alpine window keeps theta 0.146 (r^2 0.90).
+    `regional_scale` COARSENING factor of `regional_slope`. 1 (the default)
+                means it is a full-resolution field, as before. With ``f > 1``
+                the field is read as ``regional_slope[min(y // f, ch - 1),
+                min(x // f, cw - 1)]``, which is what expanding a ``ch x cw``
+                field with two ``np.repeat``s and then edge-extending any
+                remainder used to produce -- bit-for-bit, since the gather
+                copies values rather than computing them. The caller's
+                regional slope IS a block-constant 30 m-scale quantity, so at
+                the padded production domain this keeps a 1.3 MB array instead
+                of materialising 340 MB of duplicated float32 inside the
+                bake's peak stage.
+    `order`     OPTIONAL ascending-elevation ``argsort`` of `filled`, flat
+                indices, exactly ``flow.accumulate_mfd(..., return_order=True)``'s
+                second return. The MFD sweep in B2c already sorts this same
+                array, and sorting it again here cost 13.6 s and a 680 MB
+                int64 transient at 9216^2. Ties may be ordered any way: a
+                receiver is STRICTLY lower than its donor on the filled
+                surface, so a receiver precedes its donors in every ascending
+                order, and two equal-elevation cells are never in a
+                receiver relationship and never read each other. None
+                recomputes it.
 
     Returns float32, `filled.shape`; everywhere `<= filled`, `>= filled - cap_m`
     (when capped), and monotone along the receiver tree: `out[c] >= out[rec[c]]`
@@ -382,12 +405,17 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
     z = np.asarray(filled, dtype=np.float32)
     if z.ndim != 2:
         raise ValueError(f"filled must be 2-D, got shape {z.shape}")
-    rec = np.asarray(receivers, dtype=np.int64).ravel()
+    if z.size > np.iinfo(np.int32).max:
+        raise ValueError(f"domain of {z.size} cells exceeds the int32 order index")
+    # int32 flat indices: the domain is bounded above, `_profile_pass` takes
+    # them as int32 anyway, and this is where the extra `.astype(np.int32)`
+    # copy of a 680 MB int64 array used to happen.
+    rec32 = np.ascontiguousarray(receivers, dtype=np.int32).ravel()
     a = np.asarray(acc, dtype=np.float64)
     if a.shape != z.shape:
         raise ValueError(f"acc {a.shape} must match filled {z.shape}")
-    if rec.size != z.size:
-        raise ValueError(f"receivers has {rec.size} cells, filled {z.size}")
+    if rec32.size != z.size:
+        raise ValueError(f"receivers has {rec32.size} cells, filled {z.size}")
     if K_dt < 0.0:
         raise ValueError(f"K_dt must be non-negative, got {K_dt}")
     if cap_m < 0.0:
@@ -424,11 +452,26 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
     if regional_p < 0.0:
         raise ValueError(f"regional_p must be >= 0 (0 = use n), got {regional_p}")
     p_exp = regional_p if regional_p > 0.0 else n
+    rscale = int(regional_scale)
+    if rscale < 1:
+        raise ValueError(f"regional_scale must be >= 1, got {regional_scale}")
     sreg = None
     if regional_slope is not None:
         sreg = np.asarray(regional_slope)
-        if sreg.shape != z.shape:
-            raise ValueError(f"regional_slope {sreg.shape} must match filled {z.shape}")
+        if rscale == 1:
+            if sreg.shape != z.shape:
+                raise ValueError(
+                    f"regional_slope {sreg.shape} must match filled {z.shape}")
+        else:
+            if sreg.ndim != 2 or min(sreg.shape) < 1:
+                raise ValueError(
+                    f"regional_slope must be a non-empty 2-D coarse field, got "
+                    f"shape {sreg.shape}")
+            cover = (-(-z.shape[0] // rscale), -(-z.shape[1] // rscale))
+            if sreg.shape[0] > cover[0] or sreg.shape[1] > cover[1]:
+                raise ValueError(
+                    f"regional_slope {sreg.shape} at regional_scale={rscale} is "
+                    f"finer than filled {z.shape} allows (at most {cover})")
         if regional_s_ref <= 0.0:
             raise ValueError(f"regional_s_ref must be positive, got {regional_s_ref}")
     ero = None
@@ -440,15 +483,28 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
             raise ValueError("erodibility must be non-negative everywhere")
 
     h, w = z.shape
+    # Column gather for a COARSE regional field, hoisted out of the row loop.
+    # Clamped, which is what the caller's old edge-extension of the leftover
+    # rows/columns amounted to when the domain was not a multiple of `rscale`.
+    sreg_cols = None
+    if sreg is not None and rscale > 1:
+        sreg_cols = np.minimum(np.arange(w) // rscale, sreg.shape[1] - 1)
     kfac32 = np.empty((h, w), dtype=np.float32)
     for r0 in range(0, h, 512):
         r1 = min(r0 + 512, h)
         af_b = np.clip(a[r0:r1], 0.0, None)
         k_b = np.float64(K_dt) * np.power(af_b, np.float64(m))
         if sreg is not None:
-            k_b *= np.minimum(1.0, np.clip(sreg[r0:r1].astype(np.float64, copy=False),
+            if sreg_cols is None:
+                s_b = sreg[r0:r1]
+            else:
+                # Rows first: (nrows x cw) is a few MB, and only then widened.
+                rows = np.minimum(np.arange(r0, r1) // rscale, sreg.shape[0] - 1)
+                s_b = sreg[rows][:, sreg_cols]
+            k_b *= np.minimum(1.0, np.clip(s_b.astype(np.float64, copy=False),
                                            0.0, None) / np.float64(regional_s_ref)
                               ) ** np.float64(p_exp)
+            del s_b
         if ero is not None:
             k_b *= ero[r0:r1].astype(np.float64, copy=False)
         if a_crit_m2 > 0.0:
@@ -462,23 +518,45 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
         kfac32[r0:r1] = k_b
     kfac = kfac32.ravel()
     del kfac32
-    if z.size > np.iinfo(np.int32).max:
-        raise ValueError(f"domain of {z.size} cells exceeds the int32 order index")
     zf = np.ascontiguousarray(z).ravel()
-    order = np.argsort(zf, kind="stable").astype(np.int32)
-    rec32 = rec.astype(np.int32)
+    if order is None:
+        order = np.argsort(zf, kind="stable").astype(np.int32)
+    else:
+        order = np.ascontiguousarray(order, dtype=np.int32).ravel()
+        if order.size != zf.size:
+            raise ValueError(
+                f"order has {order.size} entries, filled {zf.size}")
     # Receiver distances, chunked for the same pod-budget reason as kfac above:
     # the flat idx/tgt/diag form held two full-domain int64 temporaries (1.3 GiB
     # at production scale) for one float32 result. Elementwise, so bit-identical
     # and block-layout independent.
-    dist = np.empty(rec.size, dtype=np.float32)
-    for c0 in range(0, rec.size, 512 * 16384):
-        c1 = min(c0 + 512 * 16384, rec.size)
-        idx = np.arange(c0, c1, dtype=np.int64)
-        tgt = np.where(rec[c0:c1] >= 0, rec[c0:c1], idx)
-        diag = ((np.abs(idx // w - tgt // w) > 0) & (np.abs(idx % w - tgt % w) > 0))
-        dist[c0:c1] = np.where(diag, float(cell_m) * _R2_DIST, float(cell_m))
-        del idx, tgt, diag
+    #
+    # And no division: a D8 receiver is one of the eight neighbours, so with
+    # d = |rec[c] - c| the step is CARDINAL iff d is 1 or w and DIAGONAL iff it
+    # is w-1 or w+1. Those four are distinct for w >= 3, which is the only case
+    # the decomposition is unique in, so the `//`/`%` form stays as the general
+    # fallback. (The array is only ever READ at cells with a receiver -- the
+    # solve takes the no-erosion branch at rec < 0 before it looks -- but the
+    # `rec >= 0` mask is kept so the array means what its name says.)
+    dist = np.empty(rec32.size, dtype=np.float32)
+    _CARD = np.float32(float(cell_m))
+    _DIAG = np.float32(float(cell_m) * _R2_DIST)
+    for c0 in range(0, rec32.size, 512 * 16384):
+        c1 = min(c0 + 512 * 16384, rec32.size)
+        if w >= 3:
+            d = rec32[c0:c1] - np.arange(c0, c1, dtype=np.int32)
+            np.abs(d, out=d)
+            diag = (d == w - 1) | (d == w + 1)
+            diag &= rec32[c0:c1] >= 0
+            dist[c0:c1] = np.where(diag, _DIAG, _CARD)
+            del d, diag
+        else:
+            idx = np.arange(c0, c1, dtype=np.int64)
+            tgt = np.where(rec32[c0:c1] >= 0, rec32[c0:c1], idx)
+            diag = ((np.abs(idx // w - tgt // w) > 0)
+                    & (np.abs(idx % w - tgt % w) > 0))
+            dist[c0:c1] = np.where(diag, float(cell_m) * _R2_DIST, float(cell_m))
+            del idx, tgt, diag
     del a
     # Seeded with the input, not empty: if a caller's fill ever produced a tie
     # in float32, the tied donor would read its receiver's UNSOLVED elevation
