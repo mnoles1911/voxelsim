@@ -53,14 +53,43 @@ namespace
 	// It exists to answer "which side moved?" before anyone reads a per-cell
 	// mismatch. Re-pin it ONLY on a deliberate vxc::kWorldGenVersion bump, and
 	// in the same commit as the worldgen.ush re-mirror and the SPIR-V respin.
-	// Pinned at kWorldGenVersion 8, measured 2026-07-26 against
-	// build/voxel-core-msvc/voxelcore.lib rebuilt from main @ a416a8b.
 	//
 	// It coincides with the GPU digest today, and must: when the gate passes,
 	// the two folds see identical bytes. The value is still worth pinning
 	// separately, because GPU-vs-CPU equality cannot detect BOTH sides moving
 	// together — which is the shape of every worldgen-version accident.
-	constexpr uint64 kExpectedCpuDigest = 0x6e893ab3679a8c81ull;
+	//
+	// THE INSTRUCTION ABOVE WAS NOT FOLLOWED FOR THIRTEEN VERSIONS. This was
+	// pinned at kWorldGenVersion 8 and sat unchanged through v9..v20 while the
+	// tree bumped past it, so the gate reported a mismatch on every run and the
+	// mismatch meant nothing. A guard that cries wolf at every version is not a
+	// weaker guard, it is an absent one -- and it is one of only two things
+	// covering the STALE voxelcore.lib case that worldgen.ush's #error
+	// deliberately does not (see its SCOPE note).
+	//
+	// So the version is pinned ALONGSIDE the digest and asserted, which is what
+	// makes the discipline mechanical instead of remembered: bump
+	// kWorldGenVersion without re-measuring this and the build stops.
+	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 21;
+	static_assert(vxc::kWorldGenVersion == kExpectedCpuDigestWorldGenVersion,
+	              "vxc::kWorldGenVersion moved without kExpectedCpuDigest being re-measured. "
+	              "Run voxel.GPU.VerifyRegion over BOTH fixture regions, take the 'got' value "
+	              "out of the CPU REFERENCE DIGEST MISMATCH line, and update both constants in "
+	              "the same commit as the worldgen.ush re-mirror and the SPIR-V respin. Do NOT "
+	              "just widen this assert -- the pin is the only check that catches the CPU and "
+	              "the GPU moving together.");
+
+	// Measured 2026-08-01 at kWorldGenVersion 21, over BOTH fixture regions,
+	// against build/voxel-core-msvc/voxelcore.lib rebuilt from 4ff655b.
+	//
+	// The previous value (0x6e893ab3679a8c81, v8) was additionally a ONE-REGION
+	// fold wearing a two-region contract: kRegions[0] "origin" is 2 bricks tall
+	// and its dispatch was refused outright by the mesh chain, so it contributed
+	// nothing. BuildRequest now drops bMeshChain on a region too thin to mesh,
+	// exactly as the bench does, so worldgen still runs there and its columns and
+	// cells fold in. That is why this value differs from a v21 measurement taken
+	// before that fix (0x23cd9b86724c4e2b) -- same worldgen, one more region.
+	constexpr uint64 kExpectedCpuDigest = 0xb2b5d2f1044caa35ull;
 
 	struct FRegionSpec
 	{
@@ -236,6 +265,35 @@ namespace
 		const int32 BrickZMax = static_cast<int32>(vxc::floorDiv(VzMax, 8));
 		Req.BrickZMin = BrickZMin;
 		Req.BricksZ = static_cast<uint32>(BrickZMax - BrickZMin + 1);
+
+		// A REGION TOO THIN TO MESH RUNS WORLDGEN-ONLY, exactly as the bench
+		// does ("region too thin for interior mesh bricks (bricksZ=N) — mesh
+		// pass skipped", gpu_harness.cpp). bMeshChain defaults TRUE and nothing
+		// here used to lower it, so RunRegionBlocking refused the whole dispatch
+		// with "Mesh chain needs >= 3 bricks per axis" and the region contributed
+		// NOTHING -- no columns, no cells, no digest.
+		//
+		// WHY THAT MATTERED MORE THAN IT LOOKS. kRegions[0] "origin" is 2 bricks
+		// tall on this terrain and always has been (verified 2026-08-01 by
+		// building vxc_gpu at ecda4b6, before the v20 brick-range change:
+		// identical "brick z [1457, 1458]"). So one of the TWO fixtures the
+		// pinned CPU digest is documented to cover has been silently absent from
+		// it, and kExpectedCpuDigest was a one-region fold wearing a two-region
+		// contract. The coarse path at D5 already handled this case as a SKIP;
+		// the level-0 digest path did not.
+		//
+		// Skipping only the MESH here, rather than the region, is what keeps the
+		// digest honest: ColumnMain and VoxelizeMain still run, columns and cells
+		// still fold, and only the quad fold is absent -- which is precisely what
+		// the bench folds for the same fixture, so the two toolchains stay
+		// comparable, which is the whole reason these fixtures are copied
+		// verbatim.
+		const uint32 BricksX = Req.DispatchColumns.X / 8u;
+		const uint32 BricksY = Req.DispatchColumns.Y / 8u;
+		if (BricksX < 3 || BricksY < 3 || Req.BricksZ < 3)
+		{
+			Req.bMeshChain = false;
+		}
 
 		return Req;
 	}
