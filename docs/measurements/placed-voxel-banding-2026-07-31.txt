@@ -1,0 +1,254 @@
+THE BANDING IS THE 3D DENSITY BAND — measured on placed voxels
+==============================================================
+2026-07-31. Tool: voxel-core/bench/terrainprobe.cpp VXC_PROBE_DUMP_VOXEL +
+terrain-service/tools/placed_ab.py. Site -69094,38426, seed 20260719, alpine,
+512x512 columns at 1 voxel = 51.2 m across.
+
+
+1. WHY EVERY EARLIER MEASUREMENT CAME BACK CLEAN
+-------------------------------------------------
+Every terrain instrument in this tree consumed VXC_PROBE_DUMP, which is
+terrainprobe.cpp writing `amp.surfaceMm` -- the continuous HEIGHT FIELD.
+band_period.py, riser_height.py, aspect_lock.py, voxel_ladder.py and the whole
+probe campaign read that one file format.
+
+Since kWorldGenVersion 12 the client does not render a height field.
+Amplifier::stratigraphyAt (amplifier.cpp:2300) tests
+
+    centre <= surfaceMm + D(x, y, z),    |D| <= kDensity3MaxAbsMm = 350 mm
+
+so the solid set is displaced OFF the surface those tools measure, by up to 3.5
+voxels. An artifact living in D is not merely hard to see with a heightfield
+instrument -- it is structurally invisible to one. That is why roughly twenty
+attempts and a full day of measurement kept returning clean data on a game that
+stayed visibly banded, and why the owner's inspection of the bake hillshades and
+the voxel ladder (continuous / 10 / 20 / 40 / 80 cm) correctly reported all of
+them fine. They were fine. They were not what renders.
+
+
+2. THE INSTRUMENT
+------------------
+VXC_PROBE_DUMP_VOXEL scans the +/-350 mm band DOWNWARD per column and writes the
+top solid voxel's top face, i.e. what the mesher sees, and writes it twice:
+
+    <path>        col.d3 as built           -- what ships
+    <path>.nod3   col.d3 default-constructed -- the term off
+
+The second is an EXACT ablation with no constant touched and no version bump:
+density3ColumnDisplacementMm returns 0 identically when gateQ == 0 (density3.h
+section 0), so a zeroed Density3Column is the term switched off bit-exactly.
+This matters because density3.h deliberately refuses a real off switch -- a flag
+producing v11 geometry under a v12 stamp is a desync waiting to happen. Ablating
+in the PROBE has neither problem and needs no rebuild of anything shipped.
+
+It also means the two earlier "bedding is not the cause" negatives can now be
+explained rather than merely doubted: both ablated kBeddingAmpMm (the 2D term,
+120 mm) and left kBedding3AmpMm at 350, because
+static_assert(kBeddingAmpMm > 0 && kBedding3AmpMm > 0) and the budget assert
+kBedding3MaxAbsMm == kDensity3MaxAbsMm block zeroing the 3D one. The larger,
+volumetric, instrument-invisible term was never under test.
+
+
+3. THE RESULT
+--------------
+At -69094,38426, over 262,144 columns:
+
+    d3 slope+lithology gate open        262144 / 262144   (100.00%)
+    top solid voxel MOVED by the band   232282 / 262144   ( 88.61%)
+    displacement                        -300 .. +300 mm, mean|d| 212 mm, std 211
+    relief                              45.2 m with, 45.0 m without
+
+Side by side under identical light (placed-ab-69094.png), the band-off panel is
+clean, irregular, natural-looking rock. The band-on panel is the owner's
+artifact exactly as described: parallel, evenly spaced, sharing direction,
+running diagonally across the slope. Same ground, same light, one term.
+
+SPECTRUM OF THE DISPLACEMENT FIELD (with_d3 - no_d3), Hann-windowed 2D FFT:
+
+    dominant wavelength        10.04 m   (apparent on-ground spacing)
+    stripes run at             78.7 deg
+    variance by wavelength band
+        0.4 - 0.8 m     4.9%
+        0.8 - 1.6 m    19.2%
+        1.6 - 3.2 m    40.9%    <-- 60.1% combined
+        3.2 - 6.4 m     8.3%
+        6.4 - 25.6 m   18.0%
+
+60% of the variance falls in 0.8-3.2 m, which is detail_bedding.h's documented
+bed thickness range verbatim. The mechanism is not inferred from the picture; it
+is pinned to a specific constant by the spectrum. The 10 m dominant APPARENT
+wavelength is the bed thickness projected onto the slope by the dip -- a bed of
+fixed thickness outcrops wider the shallower it cuts the face, which is also why
+the spacing looks so regular over a uniform slope.
+
+
+4. WHY IT LOOKS THE WAY IT DOES, TERM BY TERM
+----------------------------------------------
+Every property the owner reported falls out of the term's own design:
+
+  parallel                 bedding planes are parallel by construction
+  evenly spaced            bed thickness 800-3200 mm
+  jumps several voxels     |D| <= 350 mm = 3.5 voxels; measured p5/p95 +/-300
+  only on steep ground     slope gate 600-800 mm/m, lithology gate bare rock
+  diagonal, direction
+    flips between areas    regional strike/dip hashed from an 819.2 m lattice
+                           off a table of 16 integer direction pairs, so strike
+                           is CONSTANT within a domain and steps at its edges
+
+The contrast curve (kDensity3SharpenPasses = 3) is what makes the contacts hard
+rather than sinusoidal. density3.h's own comment predicted the visual outcome
+and approved of it: "it turns a sine-ish corrugation into a stack of ledges."
+That is precisely the artifact. The term is doing what it was written to do; the
+disagreement is with the specification, not the implementation.
+
+density3.h also anticipates the objection and dismisses it, wrongly:
+
+    "A flat region in D means dD/dz = 0, which is an exactly VERTICAL face -- on
+     a cliff that is a feature, not a terrace. Terracing is flatness in the
+     SURFACE HEIGHT field; this is flatness in a vertical displacement, and the
+     two are perpendicular."
+
+The argument is sound about a vertical face and irrelevant to the observed
+geometry. On a 60-90% grade the face is not vertical, so a periodic vertical
+displacement of the solid set writes a periodic band ACROSS the slope -- and at
+88.61% of columns moved, it is not decorating the surface, it IS the surface.
+
+
+5. WHAT ACTUALLY SOLVED IT -- THE OWNER'S OWN VERDICT
+------------------------------------------------------
+Recorded because it generalises past this artifact. What broke the case open was
+not a statistic. It was being shown bake maps and top-down renders of the SAME
+terrain area at successive stages of the pipeline, so the owner could narrow down
+where the artifact was being introduced.
+
+The numbers could not settle it, by construction: every metric in the harness was
+computed on the height field while the artifact lived in voxel placement, so
+improving those metrics was indistinguishable from progress. The owner's eye was
+the only instrument that could see the artifact at all. The fast path was not a
+better statistic -- it was giving that instrument a controlled comparison at each
+stage.
+
+The ladder, each panel the same ground under the same light:
+
+    bake hillshade, 3 bake variants          -> "all three look fine"
+    continuous client surface                -> "looks great"
+    voxel 10 cm, LOD 20 / 40 / 80 cm         -> "all look great"
+    placed voxels, 3D band OFF vs ON         -> "exactly what we don't want"
+
+Each "this looks fine" eliminated an entire stage in one sentence. Three sentences
+eliminated the whole generator and the whole voxelisation ladder -- which no
+amount of measurement had managed in twenty attempts, because the measurements
+were all of the stages that were already fine.
+
+THE RULE, for the next artifact: when the owner reports something visual and the
+metrics disagree, the owner is right and the metric is measuring the wrong thing.
+Do not iterate on the metric. Build the A/B ladder -- same ground, same light,
+same framing, native resolution with no downsampling, exactly one thing varying
+per panel -- and prefer ablating in the PROBE over ablating in shipped constants,
+because that needs no rebuild, no version bump, and cannot leave a flag set.
+
+
+6. THE FIX, AND HOW IT WAS VERIFIED (worldgen v20, same day)
+-------------------------------------------------------------
+Commit 1 of 2: the term is no longer applied. Amplifier::stratigraphyAt tests
+`centre <= surfaceMm` again and Amplifier::column leaves ColumnSample::d3
+default-constructed; worldgen.ush mirrors both, and stratigraphyAt/materialAt
+there drop the four parameters (seed, xMm, yMm, columnGateQ) that existed only
+to evaluate D. Bounds are deliberately UNCHANGED and still widened by
+kDensity3MaxAbsMm -- conservative is never unsound, and the tightening is
+commit 2 so the geometry change and the bound change can be reverted apart.
+
+THE DECISIVE CHECK. The v20 placed-voxel dump at -69094,38426 is BIT-IDENTICAL
+to the `.nod3` panel of the A/B above -- the one the owner inspected and
+approved -- and differs from the shipped v19 geometry on 232,282 of 262,144
+columns. So the change does exactly what the ablation predicted and nothing
+else. That comparison is the whole point of having ablated in the probe first:
+the prediction was made before the code was touched, and could then be checked
+against it rather than merely described.
+
+  vxc_tests            381 pass, 0 fail (2 golden digests regenerated:
+                       amplifier_deep_column 0x09D0..741D -> 0xB030..1779,
+                       coarsegen 0xAD39..FCBF -> 0x946C..DBAF)
+  overhang scan        0 overhung columns of 185,850 (was ~1.97% of gated)
+  surface bound sweep  1320 footprints, 1,775,101 dense samples, VIOLATIONS=0,
+                       slack min 5587 mm
+  vxc_gpu              PASS, bit-exact CPU vs GPU over 25,728 columns /
+                       903,168 CELLS / 12,137 quads, 8 regions including
+                       `density-band-cliff`. Cell-level (not column-level)
+                       comparison is what makes this meaningful for a term that
+                       hashed per voxel.
+  vxc_bench            slope gate open on 0/409,600 columns; 0 of 11.6M visited
+                       voxels inside an open band; 0.0 ns/gated voxel
+  prebuilt SPIR-V      respun, exactly ONE kernel changed (VoxelizeMain), which
+                       is the only kernel the term lived in
+
+TWO GUARDS BEHAVED WELL AND ARE WORTH THE RECORD, because this project has been
+burned by guards that did not.
+
+  * test_amplifier.cpp's non-vacuity assertion -- "otherwise this test would
+    keep passing after someone disabled the term" -- is what FAILED when the
+    term was disabled. It was right, it did its job, and it was removed only
+    because the removal is now intentional. It has been replaced by its inverse
+    (gated == 0, displacedTop == 0, and a new amplifier_world_is_a_heightfield
+    test asserting no column anywhere is overhung), so reintroducing a
+    displacement fails a test rather than passing silently.
+  * compile-shaders.ps1's staleness warning correctly named
+    worldgen.VoxelizeMain.spv as stale before -UpdatePrebuilt was passed.
+
+ONE GUARD IS NARROWER THAN IT LOOKS, and this was checked rather than assumed.
+worldgen.ush's version-skew #error is inside `#ifdef VXC_UE`, so it fires only
+on the Unreal compile path, where ModifyCompilationEnvironment supplies
+VXC_WORLDGEN_VERSION_CPP. Deliberately setting VXC_WORLDGEN_VERSION_USH back to
+19 against a CPP value of 20 and running tools/compile-shaders.ps1 compiled
+CLEANLY. That is correct scoping -- standalone dxc has nothing to compare
+against -- but it means the standalone path is covered by the staleness warning
+alone, not by the #error. Passing -D VXC_WORLDGEN_VERSION_CPP=<n> parsed out of
+core.h would make the guard live there too; not done here, flagged.
+
+NOT VERIFIED HERE: NVIDIA digest parity. vxc_gpu passed on an AMD Radeon RX
+7800 XT, which is the only device on this machine. The AMD-vs-NVIDIA gate is the
+one that caught the truncDiv/floorDiv divergence historically and it has not
+been run for v20.
+
+THE OWNER'S VERDICT, which is the one that closes this. Judging a LIVE
+interactive session -- editor at the cliff site (-69094,38426), camera 250 m,
+pitch -20 deg, sun frozen 12:00 03-20, real diffusion tiles (tile grid, 25
+tiles, no synthetic fallback), v20 build: "YES THIS LOOKS GOOD. PASS".
+
+TWO PROCESS FAILURES ON THE WAY THERE, recorded because both nearly reopened a
+closed investigation:
+
+  * THE FIRST TWO CAPTURES WERE OF THE WRONG WORLD. This repo has no
+    tile-cache/, so DefaultGame.ini's DefaultTileDir resolves to nothing and the
+    engine falls back to the synthetic sampler -- it says so in the log, and
+    both the capture script's header and DefaultGame.ini's own comment warn that
+    the fallback is "a plausible-looking fake world". Captures here MUST pass
+    -VoxelTileDir explicitly until the cache is present (open task #15), and the
+    log line to check is `VoxelClimateProbe: tile grid, tiles=N` -- if it reads
+    SYNTHETIC, throw the capture away.
+  * I READ A CAPTURE AS "STILL BANDED" AND IT WAS NOT. The owner rejected that
+    reading. I had pattern-matched regular repeating structure to the artifact
+    without checking it against what they had actually been describing, and was
+    already building a probe for the LOD path to chase it. The rule now, in the
+    owner's words, is "I should be the judge of any recent screenshots": produce
+    the capture and state the conditions that make it trustworthy -- settle
+    counters, tile source, sun pins, pose, what varies between panels -- and
+    stop there. The conditions are mine to verify; the verdict is theirs.
+
+
+7. WHAT IS NOT ESTABLISHED
+---------------------------
+  * The gate rate at this site is 100% of columns against the design's measured
+    6.52% world-average over 25 real diffusion tiles. This is a 51.2 m window
+    chosen for being steep, so it is a worst case, not a typical one. Three
+    other sites probed the same day (+900, +1800, +2700 m) read 0.00%. How much
+    of the world looks like the right-hand panel has NOT been measured; the
+    census that would answer it is a wider stride than terrainprobe's fixed
+    1-voxel dump currently allows.
+  * This is a measurement of the CPU path. worldgen.ush carries its own copies
+    of every constant, so the GPU mirror has not been shown to agree here --
+    though a disagreement would be a separate and worse bug.
+  * No fix is proposed or tested. kDensity3MaxAbsMm, kDensity3SharpenPasses and
+    the bed thickness are all flagged PROVISIONAL in their own source; which of
+    them to move, and whether the term survives at all, is the next decision.
+    Note the term buys an overhang on ~1.97% of gated columns for this.

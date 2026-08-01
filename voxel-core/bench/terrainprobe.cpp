@@ -4483,6 +4483,95 @@ int main(int argc, char** argv) {
                         (long long)nn, out);
         }
     }
+
+    // PLACED VOXELS, not the height field — and the distinction is the whole
+    // reason this block exists.
+    //
+    // VXC_PROBE_DUMP above writes amp.surfaceMm, and so does every other
+    // instrument in this tree (band_period.py, riser_height.py, aspect_lock.py,
+    // voxel_ladder.py all consume that dump). But since kWorldGenVersion 12 the
+    // client is NOT a heightfield renderer: stratigraphyAt tests
+    // `centre <= surfaceMm + D` with D = D(x,y,z) from density3.h, |D| <= 350 mm
+    // = 3.5 voxels. So the solid set is displaced OFF the surface those tools
+    // measure, and any artifact living in D is invisible to all of them. On
+    // 2026-07-31 that blind spot cost a full day: every measurement of the
+    // banding artifact came back clean while the game stayed banded.
+    //
+    // This writes what the mesher would actually see — the top solid voxel's
+    // top face, found by scanning the band — and writes it TWICE:
+    //
+    //   <path>        with the 3D density band live (what ships)
+    //   <path>.nod3   with col.d3 zeroed
+    //
+    // The second is an EXACT ablation of the term with no constant touched and
+    // no version bump: density3ColumnDisplacementMm returns 0 identically when
+    // gateQ == 0 (density3.h section 0), so a default-constructed Density3Column
+    // is the term switched off, bit-exactly. That matters because density3.h
+    // deliberately refuses a real off switch — a flag that produced v11 geometry
+    // under a v12 stamp would be a desync waiting to happen. Ablating in the
+    // PROBE instead of in the world has neither problem, and needs no rebuild of
+    // anything the client ships.
+    //
+    // Hillshade the two side by side: any banding present in the first and
+    // absent from the second is created by the 3D density band and by nothing
+    // else in the pipeline.
+    if (const char* out = std::getenv("VXC_PROBE_DUMP_VOXEL")) {
+        const int64_t nn = 512;
+        // The scan range is forced by the envelope, not chosen: outside
+        // +/-kDensity3MaxAbsMm the displaced test provably agrees with the
+        // undisplaced one, so a scan that starts one voxel above the band's top
+        // and ends one below its bottom cannot miss a solid voxel. Scanning
+        // DOWNWARD from the top is what makes this the top solid voxel of a
+        // possibly-overhanging column rather than the first one found from below.
+        const int64_t bandVox = (kDensity3MaxAbsMm + kVoxelSizeMm - 1) / kVoxelSizeMm + 1;
+        std::vector<int32_t> withD3(static_cast<size_t>(nn * nn));
+        std::vector<int32_t> noD3(static_cast<size_t>(nn * nn));
+        int64_t gated = 0, differ = 0;
+        for (int64_t j = 0; j < nn; ++j) {
+            for (int64_t i = 0; i < nn; ++i) {
+                ColumnSample col = amp.column(vx0 + i, vy0 + j);
+                if (col.d3.gateQ != 0) ++gated;
+                const int64_t vzTop = floorDiv(col.surfaceMm, kVoxelSizeMm) + bandVox;
+                const int64_t vzBot = floorDiv(col.surfaceMm, kVoxelSizeMm) - bandVox;
+                ColumnSample off = col;
+                off.d3 = Density3Column{}; // gateQ == 0 => D == 0 identically
+                int32_t a = static_cast<int32_t>(col.surfaceMm);
+                int32_t b = a;
+                for (int64_t vz = vzTop; vz >= vzBot; --vz) {
+                    if (Amplifier::stratigraphyAt(col, vz) != MAT_AIR) {
+                        a = static_cast<int32_t>(vz * kVoxelSizeMm + kVoxelSizeMm);
+                        break;
+                    }
+                }
+                for (int64_t vz = vzTop; vz >= vzBot; --vz) {
+                    if (Amplifier::stratigraphyAt(off, vz) != MAT_AIR) {
+                        b = static_cast<int32_t>(vz * kVoxelSizeMm + kVoxelSizeMm);
+                        break;
+                    }
+                }
+                if (a != b) ++differ;
+                withD3[static_cast<size_t>(j * nn + i)] = a;
+                noD3[static_cast<size_t>(j * nn + i)] = b;
+            }
+        }
+        const std::string p2 = std::string(out) + ".nod3";
+        for (const auto& pr : {std::pair<const char*, const std::vector<int32_t>*>{out, &withD3},
+                               std::pair<const char*, const std::vector<int32_t>*>{p2.c_str(),
+                                                                                  &noD3}}) {
+            FILE* fp = std::fopen(pr.first, "wb");
+            if (fp) {
+                std::fwrite(pr.second->data(), sizeof(int32_t), pr.second->size(), fp);
+                std::fclose(fp);
+                std::printf("dumped %lldx%lld int32 TOP SOLID VOXEL to %s\n", (long long)nn,
+                            (long long)nn, pr.first);
+            }
+        }
+        std::printf("  d3 slope+lithology gate open on %lld/%lld columns (%.2f%%)\n",
+                    (long long)gated, (long long)(nn * nn),
+                    100.0 * static_cast<double>(gated) / static_cast<double>(nn * nn));
+        std::printf("  top voxel MOVED by the band on %lld columns (%.2f%%)\n", (long long)differ,
+                    100.0 * static_cast<double>(differ) / static_cast<double>(nn * nn));
+    }
     } // end of the legacy report
 
     if (!optStructure) return 0;

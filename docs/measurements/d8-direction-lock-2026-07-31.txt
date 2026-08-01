@@ -1,0 +1,158 @@
+D8 DIRECTION LOCK — the 45-degree parallel lines
+================================================
+2026-07-31. Tool: terrain-service/tools/aspect_lock.py. Site g35, tile (-5,2),
+seed 20260719, alpine, ~890 m relief in the 3.84 km measured window. Statistic
+computed on the ENCODED control points, i.e. exactly the bytes that ship.
+
+The owner's description is what broke the case open, and it falsified the
+explanation I had given an hour earlier: the parallel lines run DOWNHILL at
+45 degrees, sometimes one diagonal and sometimes the other, evenly spaced and
+sharing direction. Contours are iso-elevation by construction, so a level-set
+explanation was simply wrong. 45 degrees is the signature of an 8-neighbour
+lock, and the pipeline already documents one.
+
+
+1. THE MECHANISM WAS ALREADY WRITTEN DOWN
+------------------------------------------
+flow.py:24-25, in the code's own words:
+
+    "single steepest neighbour -- can only route along 8 compass directions,
+    and at this resolution that shows up in a hillshade as dead-straight
+    45-degree channels tens of pixels long"
+
+This was mitigated for the ACCUMULATION field (MFD, mfd_p = 1.1) and
+deliberately kept for channel centrelines, which was a defensible call while
+D8 only picked out a few trunk lines. Two bake_ver-4 changes then promoted it
+from "picks a centreline" to "defines the carve geometry over most of a
+mountain":
+
+  * incision_mode = "profile" became the default. profile_incision solves the
+    graded long profile ALONG THE D8 RECEIVER TREE (incise.py:10, 255,
+    325-326), so the carve inherits the 8-direction lock everywhere it acts.
+  * channel_init_area_m2 fell 1e4 -> 156. The bake_ver-5 manifest for this very
+    tile records channel_cells = 61,238,394 of 67.1 M, i.e. **91% of the tile
+    is above the initiation threshold**. (The source comments quote 68%; the
+    measured figure on this tile is higher.)
+
+
+2. THE MEASUREMENT
+-------------------
+Two independent statistics, since either alone can mislead:
+
+  ASPECT LOCK. Gradient direction, 360 bins, gradient-magnitude weighted, read
+  as Fourier harmonics. Real landforms are anisotropic at LOW harmonics -- a
+  hillside faces one way (h1) -- so a raw histogram peak proves nothing. An
+  8-direction lock is specifically h8 (period 45 deg). h4 is a grid-axis bias;
+  D8 excites both, because its 4 axial and 4 diagonal steps have different path
+  lengths and are therefore not equivalent directions.
+
+  ORIENTATION LOCK. 2-D power spectrum binned by direction over [0,180) in a
+  7.5-60 m annulus, same harmonics. Measures the orientation of linear
+  structure directly instead of inferring it from per-cell slope.
+
+INSTRUMENT CONTROL, and it is the reason the numbers below mean anything: on a
+synthetic isotropic fractal surface (radial 1/f^1.8 spectrum, random phase, no
+preferred direction at any scale, 300 m relief) the aspect statistic returns
+h8 = 0.0010 against a noise floor of 0.0010 -- EXACTLY the floor, 1.0x. The
+tool does not manufacture 8-fold structure from a grid, a gradient operator or
+a square window. The orientation statistic is dirtier (control h4 = 0.024,
+10.8x floor), so the aspect harmonic is the load-bearing one.
+
+    tile                        a_crit    aspect h8    x floor   stripe dir
+    synthetic isotropic ctrl      --       0.0010        1.0x       --
+    bake-g35-acrit1e4            1e4       0.0029        2.9x       17 deg
+    bake-g35-v6 (bake_ver 6)     156       0.0497       50.8x      142 deg
+    bake-g35-v5 (bake_ver 5)     156       0.0676       69.2x       45 deg
+    bake-g35 (2026-07-29)        156       0.1098      112.3x       90 deg
+    bake-v4-plains (-55,20)      156       0.1012       58.7x      120 deg
+
+Every bake carrying the dense network reads 50-112x the noise floor. The single
+bake with the sparse network reads 2.9x, which is nothing. That is a 17-38x
+separation, and it is not subtle.
+
+The orientation test agrees and adds a detail worth more than its harmonic:
+the DOMINANT STRIPE DIRECTION on the sparse-network bake is 17 degrees -- an
+arbitrary angle set by the terrain, which is what a real landscape looks like.
+On the dense-network bakes it snaps to 45, 90, 142 and 120 degrees. Three of
+those four are exact multiples of 45.
+
+
+3. WHAT IS AND IS NOT ESTABLISHED
+----------------------------------
+ESTABLISHED: the shipped baked surface carries a strong 8-fold direction lock
+that an isotropic surface does not, it is absent from the sparse-network bake,
+and its strength tracks how much of the tile the D8 receiver tree carves.
+
+NOT ESTABLISHED, and it must be said: bake-g35-acrit1e4 differs from the v5/v6
+bakes in bake_ver as well as in a_crit, so the ablation is not single-variable.
+The repose-strength field added at bake_ver 5 is a smooth world-anchored noise
+field with no direction quantisation anywhere in it, so it is not a plausible
+source of 8-fold structure -- but "not plausible" is not "measured".
+
+THE CLEAN CONFIRMATION, one bake each:
+  (a) hold bake_ver 6 fixed and bake with channel_init_area_m2 = 1e4; or
+  (b) hold everything fixed and set incision_mode = "depth", which the code
+      guarantees reproduces the bake_ver-2 surface exactly and bypasses the D8
+      tree entirely.
+Either isolates the variable. (b) is the stronger test of the mechanism, (a) is
+the stronger test of the shipped configuration.
+
+CONFIRMED 2026-07-31, same day, by three fresh bakes of tile (-5,2) with an
+IDENTICAL invocation and exactly one constant varied each time. The baseline was
+re-baked rather than reused, and it reproduced bake-g35-v6 to every printed digit
+(h8 0.0497, h1 0.3119, relief 887.4 m) -- so the bake is deterministic and the
+earlier comparison tiles were legitimately shipped-config.
+
+    variant (one field changed)      aspect h8   x floor   orient h4  stripe dir
+    BASE, shipped bake_ver 6          0.0497      50.8x     0.1807     142 deg
+    channel_init_area_m2 156 -> 1e4   0.0102      10.5x     0.0414      17 deg
+    incision_mode profile -> depth    0.0159      16.2x     0.0414      18 deg
+
+Both ablations collapse the 45-degree signature: h8 falls 3.1-4.9x, the
+orientation harmonic falls 4.4x, and the dominant stripe direction leaves its
+grid-locked 142 deg for ~17 deg -- the SAME arbitrary terrain-set angle in both
+variants independently, arrived at by two different mechanisms. That is the
+result: D8 exposure causes the lock.
+
+RESIDUAL, stated because it bounds the fix: even with the tree bypassed the
+variants read 10-16x the noise floor against the isotropic control's 1.0x, so D8
+tree-carving is most of the artifact but not all of it. Two remaining suspects,
+both untested: `accumulate_mfd` is itself an 8-neighbour stencil, and in "depth"
+mode `stream_power` still consumes the D8-derived steepest-of-8 slope magnitude.
+D-infinity on the carve will not take h8 to the floor on its own.
+
+NEITHER ABLATION IS A SHIPPABLE CONFIGURATION, and the hillshade makes this
+plainer than the numbers do. The dense network at a_crit = 156 is exactly what
+bake_ver 4 added to close a measured 6-10x ridge+peak deficit against real DTMs
+(alpine ridge+peak 0.0042 at a_crit 1e4 against a real Teton 0.0332). Turning it
+off removes the artifact by removing the dissection with it: variants A and B
+read smooth and under-featured, which is the state that was rejected on realism
+grounds before this artifact was ever the subject. The fix has to KEEP the dense
+network and make its routing continuous -- which is the D-infinity change, and is
+why the ablations are diagnostic rather than a candidate fix.
+
+SEPARATE SUSPECTED MECHANISM, not to be confused with this one: the plains tile
+shows h16 = 0.6611, an order of magnitude above anything else measured. On
+gentle ground the 100 mm wire LSB is comparable to the entire rise across a
+cell -- at 2% grade over 1.875 m the rise is 37 mm, well under one LSB -- so
+the encoded aspect is quantised by the CODEC rather than by D8. That would be a
+second, independent direction-quantisation mechanism hitting exactly the
+moderate ground where band width is widest. It has its own test (re-encode at
+quant = 25 mm and re-measure) and is not evidence for or against D8.
+
+
+4. WHY THIS RECONCILES THE WHOLE FAILURE HISTORY
+-------------------------------------------------
+Twenty-plus attempts added RELIEF -- meso bands, folded strata, repose fields,
+ridge composites, couloirs, amplitude ladders, and my own v19 two-pool cap. Not
+one of them removed a lock to 8 directions, because amplitude and direction are
+orthogonal. A direction quantisation is invisible to every amplitude metric in
+the harness, which is precisely why the metrics kept improving while the
+picture did not.
+
+It also corrects two things I told the owner today:
+  * the contour explanation (parallelism from level sets) -- wrong; these lines
+    are flow paths and run downhill.
+  * the 0.5 m/px bake proposal -- a finer grid gives FINER 45-degree stripes,
+    not fewer. Resolution does not fix a direction quantisation. That option
+    should not be funded on banding grounds.
