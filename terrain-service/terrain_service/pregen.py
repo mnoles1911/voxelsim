@@ -134,6 +134,22 @@ def _run_bake(args, provider, cache: TileCache) -> int:
 
     from .bake import pipeline as bp
 
+    # EVERYTHING THIS FUNCTION WRITES IS BAKE-DERIVED, so it all keys on
+    # fine_provider_id (inference identity + bake digest), never on
+    # provider_id (inference only). The coarse tiles it READS are still under
+    # provider_id -- see _coarse_elevation_m, which is left alone deliberately.
+    #
+    # That asymmetry is the entire point of the split: retuning a bake constant
+    # must re-key the fine tier and the flow pyramid together while leaving the
+    # ~22.5 s/tile coarse inference output exactly where it is. See
+    # providers/diffusion.py::_bake_fingerprint for what the old single-id
+    # policy cost.
+    # An ATTRIBUTE on providers, not a method -- same shape as provider_id,
+    # per the TileProvider protocol. (DiffusionConfig.fine_provider_id() IS a
+    # method; the provider snapshots it at construction the way it does
+    # provider_id, so a config mutated afterwards cannot repoint a live cache.)
+    fine_provider_id = provider.fine_provider_id
+
     if args.scale != COARSE_SCALE:
         print(
             f"note: --mode bake ignores --scale {args.scale}; it reads the "
@@ -225,7 +241,7 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                 parent = superblocks.get((up.level,) + bp.superblock_index(ptx, pty, up))
             parent_fp = parent.inputs_fingerprint if parent is not None else b""
 
-            blob = cache.get_flow(provider.provider_id, args.seed, level.level, sx, sy)
+            blob = cache.get_flow(fine_provider_id, args.seed, level.level, sx, sy)
             sb = None
             if blob is not None:
                 try:
@@ -275,7 +291,7 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                     parent=parent,
                 )
                 cache.put_flow(
-                    provider.provider_id,
+                    fine_provider_id,
                     args.seed,
                     level.level,
                     sx,
@@ -314,7 +330,7 @@ def _run_bake(args, provider, cache: TileCache) -> int:
         npz_dir.mkdir(parents=True, exist_ok=True)
 
     for i, (x, y) in enumerate(targets):
-        if cache.get_fine(provider.provider_id, args.seed, x, y) is not None:
+        if cache.get_fine(fine_provider_id, args.seed, x, y) is not None:
             skipped += 1
             continue
         sb = superblocks.get((0,) + bp.superblock_index(x, y, level0))
@@ -381,14 +397,14 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                 flow=result.flow,
             )
         try:
-            encoded = _encode_fine(result, args.seed, provider.provider_id)
+            encoded = _encode_fine(result, args.seed, fine_provider_id)
         except NotImplementedError as e:
             print(f"error: {e}", file=sys.stderr)
             failed += 1
             if npz_dir is None:
                 return 1
             continue
-        cache.put_fine(provider.provider_id, args.seed, x, y, encoded)
+        cache.put_fine(fine_provider_id, args.seed, x, y, encoded)
         baked += 1
         print(
             f"[{i + 1}/{len(targets)}] baked ({x},{y}) cpu={cpu:.1f}s "

@@ -5,12 +5,25 @@ provider identity+version so switching providers (synthetic dev tiles vs the
 real diffusion worker) can never serve stale bytes. Writes are atomic
 (tmp + rename) so a crashed worker never leaves a torn tile.
 
-Three artifact kinds share one layout, all keyed by ``provider_id`` first:
+Three artifact kinds share one layout, keyed by an identity string first --
+but NOT THE SAME identity string, and that is the load-bearing detail:
 
-    <root>/<provider_id>/<seed:016x>/s1/<x>_<y>.vxtl      coarse tile, 30 m/px
-    <root>/<provider_id>/<seed:016x>/s16/<x>_<y>.vxtl     FINE TIER, 1.875 m/px
-    <root>/<provider_id>/<seed:016x>/flow<L>/<sx>_<sy>.vxfl
-                                                          flow superblock, level L
+    <root>/<provider_id>/<seed:016x>/s1/<x>_<y>.vxtl       coarse tile, 30 m/px
+    <root>/<fine_provider_id>/<seed:016x>/s16/<x>_<y>.vxtl FINE TIER, 1.875 m/px
+    <root>/<fine_provider_id>/<seed:016x>/flow<L>/<sx>_<sy>.vxfl
+                                                           flow superblock, level L
+
+``provider_id`` covers inference identity only; ``fine_provider_id`` is that
+plus the bake's digest (``providers/diffusion.py::fine_id_for``). Artifacts key
+on what they DEPEND ON, so retuning a bake constant re-keys the fine tier and
+the flow pyramid together and leaves the coarse tiles -- ~22.5 s of GPU each,
+and unrecreatable on a CPU-only box -- exactly where they are.
+
+Callers must pass the right one. ``path``/``get``/``put`` take whatever they
+are given and cannot check it: a fine tile written under a coarse id lands in a
+namespace that will not be re-keyed when the bake changes, which is silent
+until the day it serves stale geometry. ``pregen._run_bake`` binds
+``fine_provider_id`` once at the top for exactly this reason.
 
 The fine tier reuses the scale slot rather than inventing a new axis: the
 .vxtl v2 container is one fine tier per COARSE tile coordinate at scale 16
@@ -28,10 +41,12 @@ Two adjacent tiles that share an edge read the SAME superblock bytes, so they
 cannot disagree about how much upstream area crosses that edge; a per-tile
 neighbourhood computed on the fly would give each side its own answer.
 
-Being under ``provider_id`` matters for the same reason it matters for tiles:
-``provider_id`` now covers the bake version and constants (see
-``providers/diffusion.py::_tile_format_fingerprint``), so a bake change lands
-in a fresh namespace and can never mix with superblocks built by the old one.
+Being under ``fine_provider_id`` matters for the same reason it matters for the
+fine tier: that id covers the bake version and constants (see
+``providers/diffusion.py::_bake_fingerprint``), so a bake change lands in a
+fresh namespace and can never mix with superblocks built by the old one. They
+sit beside the fine tiles they fed rather than beside the coarse tiles they
+were computed FROM, because a superblock is bake output, not inference output.
 """
 
 from __future__ import annotations

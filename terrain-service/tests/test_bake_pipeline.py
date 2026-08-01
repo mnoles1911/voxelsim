@@ -1262,17 +1262,55 @@ def test_bake_identity_payload_is_json_stable():
     json.dumps(payload, sort_keys=True)  # must not raise
 
 
-def test_provider_id_covers_the_bake(monkeypatch):
-    """A bake change must yield a NEW world, not a mixed one: the cache is
-    keyed on provider_id alone, so a retuned bake would otherwise drop tiles
-    into a namespace already holding tiles from the old bake."""
+def test_bake_identity_keys_only_the_bake_derived_namespace(monkeypatch):
+    """A bake change must yield a NEW world for everything the bake produced,
+    and must leave the coarse tiles alone.
+
+    Both halves matter and they used to conflict. provider_id covered the bake,
+    which got the first half right and made the second half impossible: a
+    bake-only tuning change discarded coarse tiles costing ~22.5 s of GPU each
+    and unrecreatable on a CPU-only box. Since the split, fine_provider_id
+    carries the bake digest and provider_id does not.
+    """
     from terrain_service.providers import diffusion
 
-    before = diffusion.DiffusionConfig().provider_id()
+    coarse_before = diffusion.DiffusionConfig().provider_id()
+    fine_before = diffusion.DiffusionConfig().fine_provider_id()
+
     monkeypatch.setattr(pipeline, "BAKE_VERSION", pipeline.BAKE_VERSION + 1)
-    assert diffusion.DiffusionConfig().provider_id() != before
+    # The half that must still hold: bake-derived artifacts re-key.
+    assert diffusion.DiffusionConfig().fine_provider_id() != fine_before
+    # The half the split exists to buy: inference output does NOT.
+    assert diffusion.DiffusionConfig().provider_id() == coarse_before
+
     monkeypatch.undo()
-    assert diffusion.DiffusionConfig().provider_id() == before
+    assert diffusion.DiffusionConfig().provider_id() == coarse_before
+    assert diffusion.DiffusionConfig().fine_provider_id() == fine_before
+
+
+def test_fine_namespace_is_the_coarse_one_plus_a_bake_suffix():
+    """The fine id must name its own coarse namespace, so a human reading a
+    cache root can tell which fine generations belong to which coarse tiles
+    without running anything -- and so the UNPINNED / UNVERIFIEDDATA / dryrun
+    markers survive into it."""
+    from terrain_service.providers import diffusion
+
+    cfg = diffusion.DiffusionConfig()
+    coarse, fine = cfg.provider_id(), cfg.fine_provider_id()
+    assert fine.startswith(coarse + "-b") and len(fine) == len(coarse) + 10
+
+    # Every provider that pregen can bake from must offer both ids, or the
+    # bake writes into whatever namespace happens to be lying around.
+    from terrain_service.providers.synthetic import SyntheticProvider
+
+    syn = SyntheticProvider()
+    assert syn.fine_provider_id.startswith(syn.provider_id + "-b")
+
+    # A dry-run's fine tier inherits the dry-run tag rather than landing in
+    # the real namespace.
+    dry = diffusion.DiffusionProvider(dry_run=True)
+    assert "-dryrun-" in dry.provider_id
+    assert dry.fine_provider_id.startswith(dry.provider_id + "-b")
 
 
 def test_the_fake_bilinear_scale8_path_is_gone():

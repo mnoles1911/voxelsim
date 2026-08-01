@@ -497,7 +497,6 @@ def _tile_format_fingerprint() -> str:
     silently stops covering the bake.
     """
     from .. import tile_codec
-    from ..bake.pipeline import bake_identity_payload
 
     payload = {
         "algorithm_version": GENERATION_ALGORITHM_VERSION,
@@ -511,11 +510,76 @@ def _tile_format_fingerprint() -> str:
         "expected_channels": [
             [c.name, c.dtype, c.min, c.max] for c in EXPECTED_CHANNELS
         ],
-        "bake": bake_identity_payload(),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
     ).hexdigest()
+
+
+def _bake_fingerprint() -> str:
+    """sha256 of the geomorphic bake's identity — version, stage order,
+    geometry and every physical constant (``bake.pipeline``).
+
+    SPLIT OUT OF ``_tile_format_fingerprint`` 2026-08-01, and the reason is
+    the whole point of this function existing separately.
+
+    The bake used to be folded into ``provider_id`` alongside the wire format,
+    on a correct argument: the fine tier is not a derived view of the coarse
+    tile, it is new canonical world data that the client's collision reads, so
+    a K change or an apron change really is a different world. But
+    ``provider_id`` keys the WHOLE namespace, coarse tiles included — and a
+    coarse tile does not depend on the bake in any way. A bake-only tuning
+    change therefore discarded coarse tiles that cost ~22.5 s of GPU each and,
+    on a box with a CPU-only torch and an AMD GPU, cannot be regenerated at
+    all. Three orphaned cache generations on this machine, one of them tagged
+    BROKEN-DO-NOT-USE, are what that policy actually produced.
+
+    So the namespaces split by what each artifact DEPENDS ON:
+
+        coarse (s1)          provider_id           inference identity only
+        fine (s16), flow     fine_provider_id      inference + bake identity
+
+    Retuning the bake now re-keys only the artifacts the bake produced. The
+    guarantee that made folding it in right — "a bake change yields a new
+    world rather than a mixed one" — is unchanged, because every artifact the
+    bake touches still moves to a fresh namespace together.
+
+    NO CLIENT PATH GRAMMAR CHANGES, which is why this shape was chosen over
+    adding a path segment: the client already takes the fine tier's provider
+    id as its own parameter (``-VoxelFineTileProviderId`` /
+    ``DefaultFineTileProviderId``), independent of the coarse tile directory,
+    and ``FVoxelFineTileStreamer`` validates every tile's stamp against it.
+    Two ids in config, zero C++ changes, and a mismatch is still refused and
+    counted rather than trusted.
+
+    The import stays unwrapped for the same reason it always was: ``pipeline``
+    imports nothing beyond stdlib+numpy at module scope so this works on a box
+    with no numba/scipy, and a silent fallback would mean an id that stopped
+    covering the bake.
+    """
+    from ..bake.pipeline import bake_identity_payload
+
+    return hashlib.sha256(
+        json.dumps({"bake": bake_identity_payload()}, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def fine_id_for(provider_id: str) -> str:
+    """The bake-derived namespace belonging to a coarse ``provider_id``.
+
+    ONE function rather than the same f-string in three places, because the
+    three places are ``DiffusionConfig.fine_provider_id``,
+    ``DiffusionProvider.__init__`` (which must inherit the ``-dryrun-`` tag its
+    ``provider_id`` already carries) and ``SyntheticProvider``. A suffix that
+    drifted between them would put the fine tier and the flow pyramid in
+    different namespaces while every test still passed.
+
+    Suffixing rather than re-hashing is deliberate: the coarse namespace stays
+    readable straight off the directory name, and the UNPINNED /
+    UNVERIFIEDDATA / dryrun markers that ``provider_id`` inserts in plain text
+    survive into the fine id, so a stray fine cache is still self-describing.
+    """
+    return f"{provider_id}-b{_bake_fingerprint()[:8]}"
 
 
 @dataclass(frozen=True)
@@ -689,6 +753,35 @@ class DiffusionConfig:
             parts.append("UNVERIFIEDDATA")
         parts.append(digest)
         return "-".join(parts)
+
+    def fine_provider_id(self) -> str:
+        """Identity for BAKE-DERIVED artifacts: the fine tier and the flow
+        superblocks.
+
+        ``provider_id()`` above covers inference only, so coarse tiles survive
+        a bake retune (see ``_bake_fingerprint`` for why that split exists and
+        what the old policy cost). Everything the bake produced keys on this
+        instead: the same inference identity plus the bake's own digest, so a
+        constant change moves the fine tier and the flow pyramid to a fresh
+        namespace TOGETHER, and neither can ever mix with the other's
+        generation.
+
+        Formed by suffixing ``provider_id()`` rather than hashing a combined
+        payload, deliberately: the coarse namespace it derives from is then
+        readable straight off the directory name, so a human looking at a cache
+        root can see which fine generations belong to which coarse tiles
+        without running anything. It also keeps the "unpinned/unverified"
+        markers ``provider_id`` inserts in plain text — a stray fine cache
+        stays self-describing.
+
+        8 hex digits of the bake digest, not 16: this suffixes an id that is
+        already 16, the space being distinguished is bake configurations of one
+        project rather than all content everywhere, and a directory name that
+        no one can read at a glance is its own kind of hazard. Collisions are
+        change-detection failures, not correctness failures — the fine tile's
+        stamp is validated against this same string by the client.
+        """
+        return fine_id_for(self.provider_id())
 
 
 # ---------------------------------------------------------------------------
@@ -1189,6 +1282,10 @@ class DiffusionProvider:
             self.provider_id = f"{base_id}-dryrun-{SyntheticProvider.provider_id}"
         else:
             self.provider_id = base_id
+        # The bake-derived namespace, derived from the id ABOVE rather than
+        # from config.provider_id(), so a dry-run's fine tier inherits the
+        # -dryrun- tag instead of landing in the real namespace.
+        self.fine_provider_id = fine_id_for(self.provider_id)
 
     def generate(self, seed: int, x: int, y: int, scale: int) -> Tile:
         if scale != self.config.scale:

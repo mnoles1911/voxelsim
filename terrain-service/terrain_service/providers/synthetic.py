@@ -58,6 +58,26 @@ def _value_noise(
 class SyntheticProvider:
     provider_id = "synthetic-v1"
 
+    @property
+    def fine_provider_id(self) -> str:
+        """The bake-derived namespace for synthetic tiles.
+
+        Synthetic coarse tiles do not depend on the bake, but anything BAKED
+        from them does -- ``pregen --mode bake`` runs over whatever provider it
+        is given -- so this carries the bake digest exactly as the diffusion
+        provider's does. Without it a retuned bake would silently reuse fine
+        tiles baked by the previous one.
+
+        A property with a local import, not a class attribute: importing
+        ``diffusion`` at module scope here would close a cycle (``diffusion``
+        imports this module to tag dry-run ids), and evaluating the bake digest
+        at import time would drag ``bake.pipeline`` into every process that
+        merely touches the synthetic sampler.
+        """
+        from .diffusion import fine_id_for
+
+        return fine_id_for(self.provider_id)
+
     def generate(self, seed: int, x: int, y: int, scale: int) -> Tile:
         px = np.arange(TILE_SIZE, dtype=np.int64) + x * TILE_SIZE
         py = np.arange(TILE_SIZE, dtype=np.int64) + y * TILE_SIZE
