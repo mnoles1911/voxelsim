@@ -472,10 +472,46 @@ def _strata_1d(z_m: np.ndarray, seed: int, octave: int, wavelength_m: float) -> 
     f = (zf - k).astype(np.float64)
     ki = k.astype(np.int64)
     del k, zf
-    zero = np.zeros_like(ki)
-    g0 = _hash_lattice(seed, octave, ki, zero)
-    g1 = _hash_lattice(seed, octave, ki + 1, zero)
-    del ki, zero
+
+    # EVALUATE THE LATTICE ONCE PER DISTINCT INDEX, NOT ONCE PER CELL.
+    #
+    # The second argument to _hash_lattice is `np.zeros_like(ki)` -- there is no
+    # horizontal lattice here, this is 1-D noise over ELEVATION. So the value is
+    # a pure function of the scalar `ki`, and `ki` takes very few distinct values:
+    # it is elevation divided by the wavelength, so a 3 km range at the 30 m
+    # wavelength spans ~101 indices and at 7.5 m spans ~401. Evaluating splitmix64
+    # three times plus a Box-Muller sqrt/log/cos for all 85 M cells was computing
+    # a ~100-entry lookup table 85 million times.
+    #
+    # Measured at 9216^2: 22.1 s -> 2.70 s for this function, 8.2x, and it made
+    # repose_field (which calls this twice, and is itself called twice per bake --
+    # once in B2d for erodibility, once in B3) go from 50.7 CPU-s to ~11.
+    #
+    # BIT-IDENTICAL, and that is why this needs no BAKE_VERSION bump: the table
+    # entries are the same _hash_lattice calls with the same arguments, merely
+    # deduplicated, and the gather reproduces them exactly. Verified with
+    # np.array_equal against the direct form at both wavelengths.
+    lo = int(ki.min())
+    hi = int(ki.max())
+    span = hi - lo + 2  # +1 for the ki+1 lookup, +1 because both ends are inclusive
+    if span <= 0 or span > ki.size:
+        # PATHOLOGICAL RANGE FALLBACK. The table only wins when distinct indices
+        # are far fewer than cells; a degenerate wavelength or an absurd
+        # elevation range could invert that and make the table the larger
+        # allocation. Falling back keeps this a pure optimisation with no input
+        # for which it is worse, rather than a fast path with a cliff.
+        zero = np.zeros_like(ki)
+        g0 = _hash_lattice(seed, octave, ki, zero)
+        g1 = _hash_lattice(seed, octave, ki + 1, zero)
+        del zero
+    else:
+        idx = np.arange(lo, lo + span, dtype=np.int64)
+        table = _hash_lattice(seed, octave, idx, np.zeros_like(idx))
+        off = ki - lo
+        g0 = table[off]
+        g1 = table[off + 1]
+        del idx, table, off
+    del ki
     s = f * f * (3.0 - 2.0 * f)
     return g0 * (1.0 - s) + g1 * s
 

@@ -2166,7 +2166,15 @@ def bake_padded_domain(
     # it is worth the extra line to be explicit about which one it is.
     c0 = time.process_time()
     gy, gx = np.gradient(fine, cell_m)
-    slope = np.hypot(gx, gy).astype(np.float32)
+    # np.gradient already returns float32 for float32 input, and np.hypot
+    # preserves it -- so .astype(np.float32) was allocating a redundant full
+    # -domain copy (340 MB at 9216^2). copy=False keeps the cast as a no-op
+    # assertion of the dtype rather than a second array.
+    slope = np.hypot(gx, gy).astype(np.float32, copy=False)
+    # gy and gx are dead the moment slope exists, and at 9216^2 they are
+    # 340 MB each. Held to the end of the bake they inflate the B2d/B3 peak,
+    # which is what caps how many bakes fit on one host.
+    del gy, gx
     origin_cells = geom.padded_origin_cells(tile_x, tile_y)
     seed = roughness_seed(
         world_seed,
@@ -2218,7 +2226,12 @@ def bake_padded_domain(
         ),
         dtype=np.float32,
     )
-    fine = fine + delta
+    # In-place: `fine = fine + delta` allocates a third full-domain array while
+    # both operands are still live. `delta` and `slope` are both dead after
+    # this, and freeing them here rather than at function exit is worth ~680 MB
+    # of the measured 7.76 GB peak.
+    fine += delta
+    del delta, slope
     tick("B1.roughness", c0)
 
     # -- B2a: depressions. The epsilon variant is the DEFAULT and must stay
