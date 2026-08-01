@@ -191,7 +191,49 @@ namespace vxc {
 // THIS IS THE ONLY SURVIVING v19 CLIENT CHANGE. Its other two -- the meso
 // octaves and the second carrier-warp component -- were already withdrawn when
 // the meso band moved into the bake as B4.
-inline constexpr uint32_t kWorldGenVersion = 21;
+// --- v22: the savanna gate changes CHANNEL, bio_4 -> bio_15 ------------------
+//
+// One gate in biome.h, where the derivation lives. Summary of why it moved:
+//
+// SAVANNA was UNREACHABLE from v8 to v21 -- not rare, impossible. The gate was
+// `bio_1 >= 18 C && bio_4 >= 1500` (temperature seasonality, sd of monthly
+// temperature >= 15 C). Those two conditions do not co-occur on Earth and
+// nearly cannot: the warm band IS the tropics, and what makes a place tropical
+// is that its temperature barely moves through the year. Measured over the
+// WorldClim 2.1 10' rasters inside the same +/-60 deg crop the conditioning
+// stats use, the maximum bio_4 anywhere with bio_1 >= 18 C is 1084 against a
+// threshold of 1500 -- ZERO pixels of Earth land, so MAT_SAVANNA_GRASS has
+// never been placed and every warm semi-arid column fell through to GRASSLAND.
+//
+// AND NO bio_4 THRESHOLD FIXES IT. Sweeping it down to a value that admits a
+// plausible share selects the wrong places: bio_4 >= 200 takes 12.5% of land
+// but only 77.0% of it lies inside |lat| < 25, against 87.2% for the eligible
+// window itself -- the rule is ANTI-selective for the tropics. It calls
+// Houston, Brisbane, Miami, Durban and Seville savanna while rejecting the
+// Serengeti, the Cerrado and Tsavo. Wrong variable, not wrong number.
+//
+// bio_15 (precipitation seasonality, the CV of monthly rainfall) is the
+// variable a savanna actually differs by -- a DRY SEASON -- and it was already
+// in the wire format and already uploaded to the GPU, so nothing new is
+// plumbed; the shader blends bits 24-31 of the same packed word instead of bits
+// 8-15. At CV >= 70% every in-window negative control above is rejected, 8 of 9
+// savanna sites accepted, and 93.4% of the selected area is inside |lat| < 25.
+//
+// The threshold is derived twice and both routes give 70%: a year with d dry
+// months has CV = sqrt(d/(12-d)), so four dry months is sqrt(4/8) = 70.7%; and
+// 70% puts SAVANNA at 15.57% of Earth land against the ~15.6% it really covers.
+//
+// NOT CHANGED, DELIBERATELY: kBiomeTempHotU8 stays at 24 C even though the v21
+// census showed DESERT at 0.00%. On Earth 24 C gives 9.50% desert, which is
+// right; the census world is 16.7% arid but its land temperature p95 is 20.7 C,
+// so the fault is the coarse model's compressed climate tails, not the gate.
+// Lowering it would paint dry temperate land with sand. See
+// docs/measurements/biome-gates-2026-08-01.txt.
+//
+// WIRE FORMAT UNCHANGED. All four climate bytes were already carried and
+// blended; only which byte classifyBiome reads moved. Tiles do not need
+// regenerating and provider_id does not roll for this.
+inline constexpr uint32_t kWorldGenVersion = 22;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 

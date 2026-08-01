@@ -2905,6 +2905,34 @@ int main(int argc, char** argv) {
         // widening are all live here -- and any divergence in them is a cell
         // mismatch rather than a silent pass.
         {"density-band-cliff", -8800, -30816, 64, 64, 30000, 1},
+        // SAVANNA BOUNDARY (worldgen v22). Same argument as density-band-cliff
+        // one paragraph up, for the gate v22 changed.
+        //
+        // v22 moved classifyBiome's savanna test from the seasonality byte
+        // (bits 8-15 of the packed climate word) to the precipVariability byte
+        // (bits 24-31), which means ColumnMain now blends a byte it never blended
+        // before. NOT ONE of the eight fixtures above reaches that gate: over all
+        // of their columns the synthetic sampler is either too cool or too wet,
+        // so `warm && seasonal` is false everywhere and the branch is dead. That
+        // was measured, not assumed -- a v21 CPU build compared against v22
+        // SPIR-V reported 0 mismatches over 25,728 columns, i.e. the two
+        // versions are indistinguishable on this fixture set. clPrecipVar could
+        // have been shifted by the wrong amount and every region would still
+        // have passed.
+        //
+        // Found by search (the same two-stage scan that produced the band-only
+        // fixtures): the 2x2 tile-pixel block here STRADDLES the CV threshold
+        // while all four corners stay warm and inside the savanna precipitation
+        // window, and the origin is placed on the pixel corner, so the region
+        // contains 2,133 SAVANNA columns and 1,963 TEMPERATE_FOREST ones with
+        // the boundary between them set by the faded-bilinear blend of exactly
+        // the byte that moved. A wrong shift, a wrong blend or a wrong threshold
+        // relocates that boundary and shows up as column mismatches rather than
+        // as a silent pass. Relief is 2.7 m, well inside runMeshChain's cap.
+        //
+        // Climate there (u8): temp 207, precip 17, bio_15 89 -- against gates
+        // warm 185, arid 9, mod 34, CV 89.
+        {"savanna-boundary", -249632, 1151968, 64, 64, 30000, 1},
     };
 
     Digest gpuDigest;

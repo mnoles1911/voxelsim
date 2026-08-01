@@ -1,0 +1,299 @@
+TWO EMPTY BIOME GATES: SAVANNA AND DESERT AT worldgen v21 -> v22
+=================================================================
+2026-08-01. Constants: kBiomeSeasonalHighU8 (removed), kBiomePrecipSeasonalHighU8
+(new), kBiomeTempHotU8 (re-examined, NOT moved). All in
+voxel-core/include/voxelcore/biome.h + its worldgen.ush mirror.
+
+Ground truth: WorldClim 2.1 10-arc-minute bio_1/4/12/15 and etopo_10m, cropped
+h//6 .. h-h//6 (+/-60 deg latitude) with values < -30000 treated as nodata --
+the same crop and nodata rule _compute_map_stats uses, so these numbers describe
+exactly the distribution the conditioning statistics were built from. 437,571
+land pixels; every "% of land" below is cos(latitude) area-weighted.
+Game world: the coarse model at seed 20260719, 96x96 coarse cells (7.68 km each).
+
+
+1. WHAT WAS WRONG
+------------------
+SAVANNA had never been produced. Not rarely -- never. The v8..v21 gate was
+
+    tempU8 >= kBiomeTempWarmU8 (18 C)  AND  seasonalityU8 >= 1500 (bio_4)
+
+and those two conditions do not co-occur on Earth. The maximum bio_4 anywhere
+with bio_1 >= 18 C is 1084, against a threshold of 1500: ZERO of 437,571 land
+pixels satisfy the gate. MAT_SAVANNA_GRASS has therefore never been placed by
+any build, and every warm semi-arid column fell through to GRASSLAND.
+
+It is close to mutually exclusive by construction rather than by accident. The
+warm band IS the tropics, and what makes a place tropical is that its
+temperature barely moves through the year -- so asking for high TEMPERATURE
+seasonality inside the warm band asks for a contradiction.
+
+DESERT was also at 0.00% of land in the v21 census, but for a completely
+different reason, and the distinction is the main point of this file. See 4.
+
+
+2. NO bio_4 THRESHOLD FIXES SAVANNA -- IT IS THE WRONG VARIABLE
+-----------------------------------------------------------------
+Sweeping the bio_4 threshold down until it admits a plausible share does not
+produce savanna, it produces mislabelled temperate land. Inside the eligible
+window (bio_1 >= 18 C and 400 <= bio_12 < 1600, which is 22.47% of Earth land
+and is the ceiling on any savanna rule):
+
+    rule            share of land   of which inside |lat| < 25
+    ------------------------------------------------------------
+    window itself       22.47%              87.2%     <- base rate
+    bio_4  >= 200       12.49%              77.0%     <- DEPLETED
+    bio_4  >= 300        7.42%              62.6%     <- worse
+    bio_15 >=  70       16.27%              93.4%     <- enriched
+    bio_15 >=  90       10.77%              93.4%
+
+A bio_4 rule is ANTI-selective for the tropics: it takes a SMALLER tropical
+fraction than the window it draws from. On named sites, bio_4 >= 200 calls
+Houston, Brisbane, Miami, Durban and Seville savanna while rejecting the
+Serengeti, the Cerrado and Tsavo.
+
+The variable that separates savanna from both rainforest and temperate woodland
+is a DRY SEASON, which is a precipitation phenomenon. bio_15 (CV of monthly
+precipitation) was already in the wire format and already uploaded to the GPU:
+
+  site                bio_1  bio_12  bio_4  bio_15   in window  b15>=70  b4>=200
+  Niamey, Sahel        29.3     497    303     137      Y          Y        Y
+  Serengeti            19.8     837     95      65      Y          .        .
+  Cerrado, Brasilia    21.1    1460    130      83      Y          Y        .
+  Katherine, N Aus     27.2     982    285     114      Y          Y        Y
+  Zambia miombo        20.2    1034    248     113      Y          Y        Y
+  Deccan, India        27.0     794    309     108      Y          Y        Y
+  Tsavo, Kenya         24.6    1000    146      72      Y          Y        .
+  Burkina Faso         27.8     807    223     117      Y          Y        Y
+  ---- warm, in the same precipitation window, NOT savanna ----
+  Houston, TX          20.9    1209    639      22      Y          .        Y
+  Brisbane, AU         20.2    1218    395      46      Y          .        Y
+  Miami, FL            24.5    1498    318      54      Y          .        Y
+  Durban, ZA           20.8    1010    267      41      Y          .        Y
+  Seville, ES          18.4     536    595      67      Y          .        Y
+
+bio_15 >= 70 accepts 8 of 9 savanna sites (the Serengeti, at 65, is the miss)
+and rejects all 5 in-window negatives. bio_4 >= 200 gets 5 wrong of 13.
+
+
+3. THE NEW THRESHOLD IS DERIVED TWICE AND BOTH ROUTES GIVE 70%
+----------------------------------------------------------------
+PHYSICAL. A year with d months of no rain and the rest uniform has
+CV = sqrt(d / (12 - d)). Four dry months -- a third of the year, the usual
+marked-dry-season line for tropical savanna -- is sqrt(4/8) = 70.7%.
+
+    d dry months   CV      SAVANNA, % of Earth land
+       2          44.7%          20.60%
+       3          57.7%          18.75%
+       4          70.7%          16.13%     <- shipped
+       5          84.5%          12.52%
+       6         100.0%           8.32%
+
+EMPIRICAL. 70% puts SAVANNA at 15.57% of Earth land in the full classifier
+(the 16.13% above is the gate in isolation; the treeline and cold gates take the
+rest), against the ~15.6% that tropical/subtropical grassland-savanna-shrubland
+actually covers. The neighbours bracket it and are both worse: d=3 starts
+admitting Mediterranean Seville, d=6 drops the Cerrado.
+
+kBiomePrecipSeasonalHighU8 = climatePrecipVarU8FromDeciPct(700) = u8 89, which
+decodes back to 69.8% -- one u8 step is 0.78%, so the quantization is not doing
+anything interesting here.
+
+EARTH CENSUS, % of land area, no slope gate, elevation from etopo:
+
+    biome              v21 (bio_4 1500)   v22 (bio_15 70%)
+    BEACH                    5.90%             5.90%
+    GRASSLAND               30.93%            25.25%
+    TEMPERATE_FOREST        21.88%            11.99%
+    RAINFOREST              12.88%            12.88%
+    DESERT                   9.50%             9.50%
+    SAVANNA                  0.00%            15.57%
+    TAIGA                    9.35%             9.35%
+    TUNDRA_ALPINE            9.56%             9.56%
+
+
+4. DESERT IS A DIFFERENT BUG AND kBiomeTempHotU8 WAS NOT MOVED
+----------------------------------------------------------------
+The v21 census showed DESERT at 0.00% of land while 16.74% of that land is arid
+(bio_12 < 400). The obvious reading -- "the 24 C gate is too high, lower it" --
+is wrong, and the measurement says so twice.
+
+On EARTH, 24 C is already the right answer:
+
+    temp_hot   DESERT, % of Earth land
+      18 C          18.17%
+      20 C          16.09%
+      22 C          13.04%
+      24 C           9.50%     <- Earth is ~8.6%
+      26 C           6.30%
+
+Every lower value overshoots hard; at 18 C half the world's dry TEMPERATE land
+is sand.
+
+In the CENSUS WORLD there is no value that works at all. Land temperature over
+3,464 land cells:
+
+    bio_1 >= 14 C : 51.93% of land        p1   -0.5 C
+    bio_1 >= 16 C : 36.23%                p5    3.1
+    bio_1 >= 18 C : 19.75%                p50  14.3
+    bio_1 >= 20 C :  7.04%                p95  20.6
+    bio_1 >= 22 C :  1.27%                p99  22.1
+    bio_1 >= 24 C :  0.06%                max  24.9   <- the WHOLE world's max
+    bio_1 >= 26 C :  0.00%
+
+Earth land, same crop: p5 -3.8, p50 17.3, p95 27.6, max 31.0. The coarse model's
+land is about 7 C short at the warm end and its maximum barely clears the gate.
+Consequently:
+
+    if temp_hot were   14 C  16 C  18 C  20 C  22 C  24 C
+    census DESERT     5.60% 3.67% 1.79% 0.35% 0.03% 0.00%
+
+Nothing reaches Earth's 8.6% even at 14 C -- a threshold that would put Madrid
+and Paris in the "hot" band. THE GATE IS CORRECT AND THE WORLD IS WRONG. The
+blocker is the coarse model's compressed climate tails, which is the same
+mechanism already recorded for elevation in
+conditioning-stats-real-climate-2026-08-01.txt (finding 1) and for the cold end
+of temperature (finding 3). Fixing it belongs to the model, not to biome.h.
+
+
+5. THE CENSUS, BEFORE AND AFTER, ON IDENTICAL DATA
+----------------------------------------------------
+Same generated coarse world, classified both ways in one run, so this is a
+controlled comparison rather than two separate generations. Seed 20260719,
+96x96 coarse cells, orographic ON. The v21 column reproduces the previously
+recorded census exactly, which is what validates the harness.
+
+    biome              v21 (bio_4)   v22 (bio_15)
+    BEACH                   6.15%         6.15%
+    GRASSLAND              47.01%        44.68%
+    TEMPERATE_FOREST       31.94%        31.21%
+    RAINFOREST              4.39%         4.39%
+    DESERT                  0.00%         0.00%   <-- still zero, see 4
+    SAVANNA                 0.00%         3.06%
+    TAIGA                   2.44%         2.44%
+    TUNDRA_ALPINE           8.07%         8.07%
+
+    land precip p5/p50/p95   244 / 700 / 2470 mm    (16.74% under 400)
+    land temp   p5/p95       3.3 / 20.7 C           (0.08% at or above 24 C)
+    land bio_15 p5/p50/p95   16 / 50 / 94 %         (21.13% over the 70% gate)
+    land bio_4  p5/p50/p95   480 / 752 / 1143       (0.00% over the old 1500)
+
+Orographic OFF is within 0.2 points on every row; the gate change is not
+sensitive to Wave 1b.
+
+SAVANNA IS NOW REACHABLE, WHICH IS THE FIX. 3.06% is well short of Earth's
+15.6%, and the shortfall decomposes into two separate deficits:
+
+    quantity                          census world    Earth (+/-60)
+    warm AND 400-1600 mm (eligible)      13.28%          22.47%
+    bio_15 >= 70% over all land          21.22%          44.60%
+    bio_15 >= 70% INSIDE the window      24.5%           72.4%
+    bio_15 >= 70% OUTSIDE the window      --             36.5%
+
+The first two are the tail compression of section 4 again. The THIRD is a
+different and previously unrecorded defect: on Earth a warm 400-1600 mm place is
+usually monsoonal, so bio_15 >= 70% is TWICE as likely inside the window
+(72.4%) as outside it (36.5%). In the census world it is 24.5% inside against
+21.22% over all land -- essentially independent, which is what an independently
+sampled channel gives you.
+The model reproduces each channel's marginal and not their joint -- which is
+expected, since the channels are independent noise fields quantile-matched one
+at a time, but it had not been measured before. It is the reason a correct gate
+still under-produces savanna, and it is the thing to attack next if savanna
+share matters.
+
+
+6. WHAT SHIPPED
+----------------
+kWorldGenVersion 21 -> 22 (core.h, with the changelog entry).
+VXC_WORLDGEN_VERSION_USH 21 -> 22 (worldgen.ush).
+kBiomeSeasonalHighU8 removed; kBiomePrecipSeasonalHighU8 = 89 added, in both the
+header and the HLSL mirror (mirror value taken from vxc_dump_biome_constants,
+not hand-computed).
+classifyBiome's third argument changed channel, bio_4 -> bio_15; all three
+non-test call sites moved (Amplifier::column, worldgen.ush ColumnMain,
+climateprobe.cpp). The shader now blends bits 24-31 of the packed climate word
+instead of bits 8-15; the packing and the wire format are UNCHANGED, so no tile
+needs regenerating and provider_id does not roll.
+terrain-service/tools/world_map.py and water_viewer.py follow the header (they
+parse it, so a stale copy would have exited loudly rather than drawn a wrong
+map) and now read the coarse model's "Precip CV" channel.
+voxel-core/shaders/prebuilt/worldgen.ColumnMain.spv respun; the other six
+kernels are byte-identical.
+
+gpu_harness.cpp gained a ninth fixture, "savanna-boundary" -- see below.
+
+TESTS. vxc_tests: 361 passed, 0 failed (360 before; one test added,
+biome_savanna_gate_is_reachable_from_real_climates, which pins the site table in
+section 2 so a gate no real climate satisfies fails in CI).
+GOLDEN(biome_map) re-pinned 0x7D36AFFD6B9DE5C5 -> 0xD7E49028948294F5. Only the
+SAVANNA cells of that sweep move.
+
+vxc_gpu: PASS, bit-exact CPU/GPU over 29,824 columns / 1,067,008 cells /
+14,642 quads on an AMD Radeon RX 7800 XT.
+
+THE FIRST vxc_gpu RUN OF THIS CHANGE WAS WORTHLESS AND ALMOST GOT BELIEVED. Its
+build had failed on missing Vulkan headers while a piped exit status hid it, so
+a STALE v21 binary ran against the freshly respun v22 SPIR-V -- exactly the
+stale-voxelcore.lib shape VoxelGpuVerify.cpp warns about. It reported 0
+mismatches over 25,728 columns and looked like a pass.
+
+Rebuilt properly it also reported 0 mismatches, and that second result exposed
+the real problem: NONE of the eight existing fixtures reaches the changed gate.
+The accidental v21-CPU-against-v22-GPU comparison is the proof -- if any fixture
+had exercised the savanna branch, the two versions would have disagreed there.
+Over every fixture the synthetic sampler is either too cool or too wet, so
+`warm && seasonal` is false everywhere and clPrecipVar could have been shifted
+by the wrong amount with every region still passing. This is the failure the
+harness's own density-band-cliff comment describes: "a gate that closes
+everywhere in the fixture is indistinguishable from a term that is not mirrored
+at all."
+
+So a fixture was added by SEARCH, the same way that one was. "savanna-boundary"
+sits at voxel (-249632, 1151968), 64x64 at 30 m pitch, on a tile-pixel CORNER
+where the 2x2 climate block straddles the CV threshold while all four corners
+stay warm and inside the savanna precipitation window. It contains 2,133
+SAVANNA columns against 1,963 TEMPERATE_FOREST, with the boundary between them
+set by the faded-bilinear blend of the byte that moved -- so a wrong shift, a
+wrong blend or a wrong threshold relocates it into column mismatches. Climate
+there (u8): temp 207, precip 17, bio_15 89, against gates 185 / 9..34 / 89.
+Relief 2.7 m, 5 bricks of z, 2,636 quads. It passes bit-exact.
+
+kExpectedCpuDigest (VoxelGpuVerify.cpp) DID NOT CHANGE, and that is a finding
+rather than a pass. Re-measured with a standalone mirror of the CPU-side fold,
+validated by reproducing the v21 value 0xb2b5d2f1044caa35 byte for byte before
+the change was applied; it prints the same value after. The reason is that
+NEITHER DIGEST FIXTURE CAN REACH THE CHANGED GATE: across all 8,192 columns of
+the two regions the synthetic sampler gives temperature u8 [66, 114] against
+kBiomeTempWarmU8 = 185 and precipitation u8 [47, 66] against
+kBiomePrecipModU8 = 34, so zero columns are both warm and inside the savanna
+window -- old gate fires 0 times, new gate fires 0 times. Only
+kExpectedCpuDigestWorldGenVersion moved, 21 -> 22.
+
+
+7. WHAT IS STILL UNKNOWN
+-------------------------
+* Nobody has SEEN savanna. Every number here is a classifier census; no
+  screenshot of MAT_SAVANNA_GRASS on real ground exists, and per the standing
+  rule the owner judges screenshots, not censuses. The 3.06% is spread across a
+  768 km window, so finding a patch worth capturing needs world_map.py first.
+* The 24.5% vs 69.3% joint deficit in section 5 is measured but not diagnosed.
+  It could be the quantile-matching, the diffusion model's own smoothing, or the
+  orographic pass; nothing here separates them.
+* Whether 70% is right AT 30 m. Every threshold here was derived against 10-arcmin
+  WorldClim (~18 km) and the game classifies per 30 m pixel off tiles whose
+  climate came through the same coarse channels. A CV computed at 18 km and a CV
+  interpolated to 30 m are not the same statistic, and no measurement here
+  bridges that.
+* VoxelGpuVerify's OWN two fixtures still cannot reach the savanna gate
+  (section 6), so voxel.GPU.VerifyRegion -- the Unreal-side gate, which is a
+  different code path from vxc_gpu -- does not cover the changed branch. vxc_gpu
+  now does. Closing it needs a savanna-bearing region added to
+  kBandOnlyRegions (NOT to kRegions, which would move the pinned digest);
+  the origin found here is on the synthetic sampler and transfers directly.
+* kBiomeTreelineBaseMm is still TUNED, not derived, and TUNDRA_ALPINE at 8.07%
+  of census land sits on it. Untouched here.
+* ClimateSample::seasonality (bio_4) is now read by NOTHING in worldgen. It stays
+  in the wire format and is still generated, blended and tested; it just has no
+  consumer. Removing it would roll the tile format, which is not worth doing for
+  one byte, but it should not be mistaken for live data.

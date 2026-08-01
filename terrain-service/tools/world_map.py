@@ -118,7 +118,12 @@ def _read_constants() -> dict:
         "precip_arid_mm": phys("kBiomePrecipAridU8", "climatePrecipU8FromMmPerYr"),
         "precip_semi_mm": phys("kBiomePrecipSemiU8", "climatePrecipU8FromMmPerYr"),
         "precip_mod_mm": phys("kBiomePrecipModU8", "climatePrecipU8FromMmPerYr"),
-        "seasonal_high": phys("kBiomeSeasonalHighU8", "climateSeasonalityU8From"),
+        # bio_15, the CV of monthly precipitation, in PERCENT. The header states
+        # it in tenths of a percent (climate.h's unit), hence the /10. At
+        # worldgen v22 this replaced "seasonal_high", which read bio_4 out of
+        # kBiomeSeasonalHighU8 -- a gate no climate on Earth could satisfy.
+        "precip_seasonal_high_pct":
+            phys("kBiomePrecipSeasonalHighU8", "climatePrecipVarU8FromDeciPct") / 10.0,
         "beach_lower_m": plain("kBiomeBeachLowerMm") / 1000.0,
         "beach_upper_m": plain("kBiomeBeachUpperMm") / 1000.0,
         "treeline_base_m": plain("kBiomeTreelineBaseMm") / 1000.0,
@@ -142,11 +147,16 @@ BIOMES = [
 OCEAN, BEACH, GRASSLAND, TEMPERATE_FOREST, RAINFOREST, DESERT, SAVANNA, TAIGA, TUNDRA_ALPINE = range(9)
 
 
-def classify(elev_m, temp_c, precip_mm, seasonality, k) -> np.ndarray:
+def classify(elev_m, temp_c, precip_mm, precip_cv, k) -> np.ndarray:
     """Vectorised mirror of vxc::classifyBiome, in physical units.
 
     Gate order follows the header exactly -- sea level, then treeline, then the
     Whittaker table. The cliff gate is deliberately absent (see module docstring).
+
+    THE FOURTH ARGUMENT CHANGED CHANNEL AT WORLDGEN v22: it was bio_4
+    (temperature seasonality, the "T std" coarse channel) and is now bio_15
+    (precipitation seasonality, "Precip CV"). Passing the old one still runs and
+    silently draws a wrong map, so check the caller, not just the arity.
     """
     b = np.full(elev_m.shape, -1, dtype=np.int8)
     b = np.where((b < 0) & (elev_m < k["beach_lower_m"]), OCEAN, b)
@@ -158,7 +168,7 @@ def classify(elev_m, temp_c, precip_mm, seasonality, k) -> np.ndarray:
     b = np.where((b < 0) & (temp_c < k["temp_cold_c"]), TAIGA, b)
     warm = temp_c >= k["temp_warm_c"]
     hot = temp_c >= k["temp_hot_c"]
-    seasonal = seasonality >= k["seasonal_high"]
+    seasonal = precip_cv >= k["precip_seasonal_high_pct"]
     b = np.where((b < 0) & (precip_mm < k["precip_arid_mm"]), np.where(hot, DESERT, GRASSLAND), b)
     b = np.where((b < 0) & (precip_mm < k["precip_semi_mm"]),
                  np.where(warm & seasonal, SAVANNA, GRASSLAND), b)
@@ -187,6 +197,8 @@ def fetch(url: str, ci0: int, ci1: int, cj0: int, cj1: int) -> dict:
         "temp": np.array(ch["Temp"], dtype=np.float64),
         "tstd": np.array(ch["T std"], dtype=np.float64),
         "precip": np.array(ch["Precip"], dtype=np.float64),
+        # v22: the savanna gate reads this, not "T std".
+        "precip_cv": np.array(ch["Precip CV"], dtype=np.float64),
     }
 
 
@@ -477,7 +489,7 @@ def audition(url: str, seeds: list, half: int, k: dict, out: str) -> None:
         set_seed(url, seed)
         print(f"  rendering seed {seed} ...")
         d = fetch(url, -half, half, -half, half)
-        biome = classify(d["elev"], d["temp"], d["precip"], d["tstd"], k)
+        biome = classify(d["elev"], d["temp"], d["precip"], d["precip_cv"], k)
         f = 6
         elev = upsample(d["elev"], f)
         b_up = np.kron(biome, np.ones((f, f), dtype=np.int8))
@@ -669,7 +681,7 @@ def main() -> None:
         d["elev"] = d["elev"] - args.sea_level
         print(f"rendering at sea level {args.sea_level:+.0f} m (a VIEW; the game's is z=0)")
 
-    biome_coarse = classify(d["elev"], d["temp"], d["precip"], d["tstd"], k)
+    biome_coarse = classify(d["elev"], d["temp"], d["precip"], d["precip_cv"], k)
     f = max(1, args.smooth)
     elev = upsample(d["elev"], f)
     # Biome is CATEGORICAL, so replicate it -- never interpolate between ids.

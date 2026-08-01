@@ -70,7 +70,7 @@ namespace
 	// So the version is pinned ALONGSIDE the digest and asserted, which is what
 	// makes the discipline mechanical instead of remembered: bump
 	// kWorldGenVersion without re-measuring this and the build stops.
-	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 21;
+	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 22;
 	static_assert(vxc::kWorldGenVersion == kExpectedCpuDigestWorldGenVersion,
 	              "vxc::kWorldGenVersion moved without kExpectedCpuDigest being re-measured. "
 	              "Run voxel.GPU.VerifyRegion over BOTH fixture regions, take the 'got' value "
@@ -90,6 +90,37 @@ namespace
 	// cells fold in. That is why this value differs from a v21 measurement taken
 	// before that fix (0x23cd9b86724c4e2b) -- same worldgen, one more region.
 	constexpr uint64 kExpectedCpuDigest = 0xb2b5d2f1044caa35ull;
+
+	// v22 RE-MEASURED IT AND IT DID NOT MOVE, WHICH IS A FINDING, NOT A PASS.
+	// v22 changed classifyBiome's savanna gate from bio_4 to bio_15 (core.h's
+	// changelog has the why). Re-measuring the fold gave the identical value,
+	// and the reason is that NEITHER FIXTURE CAN REACH THAT GATE: over all 8,192
+	// columns of the two regions the synthetic sampler's climate spans
+	// temperature u8 [66, 114] against kBiomeTempWarmU8 = 185, and precipitation
+	// u8 [47, 66] against kBiomePrecipModU8 = 34, so ZERO columns are both warm
+	// and inside the savanna precipitation window. Old gate fires 0 times, new
+	// gate fires 0 times.
+	//
+	// So this pin says nothing about whether v22 is right, and the CPU/GPU
+	// parity gate does not cover the changed branch at all. That is a fixture
+	// gap of exactly the shape the SyntheticTileSampler comment warns about
+	// ("if a threshold is not crossed here it is never checked for CPU/GPU
+	// agreement anywhere") -- the sampler's RANGES span every threshold, but
+	// these two 6.4 m windows sample a narrow, cool, wet slice of them. A
+	// savanna-bearing fixture has to be added to kBandOnlyRegions rather than to
+	// kRegions, so this pin stays comparable to the bench.
+	//
+	// ONE HAS ALREADY BEEN FOUND, by the same search that produced the band-only
+	// origins, and gpu_harness.cpp carries it as its "savanna-boundary" fixture:
+	// voxel (-249632, 1151968), 64x64 at 30000 mm pitch, sitting on a tile-pixel
+	// corner where the 2x2 climate block straddles the CV threshold. It holds
+	// 2,133 SAVANNA columns against 1,963 TEMPERATE_FOREST, so the boundary
+	// between them is set by the faded-bilinear blend of the byte v22 moved.
+	// vxc_gpu passes bit-exact on it; this path does not run it yet.
+	//
+	// Measured 2026-08-01 at kWorldGenVersion 22 by a standalone mirror of the
+	// CPU-side fold below, validated by reproducing the v21 value byte for byte
+	// against the same tree before the change was applied.
 
 	struct FRegionSpec
 	{

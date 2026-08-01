@@ -351,7 +351,8 @@ int main(int argc, char** argv) {
             subsoils.push_back(col.subsoilMm);
 
             const BiomeId biome =
-                classifyBiome(cl.temperature, cl.precipitation, cl.seasonality, col.surfaceMm, slope);
+                classifyBiome(cl.temperature, cl.precipitation, cl.precipVariability,
+                              col.surfaceMm, slope);
             biomeCount[biome]++;
             biomeGrid[size_t(j) * size_t(nAxis) + size_t(i)] = static_cast<uint8_t>(biome);
             gridVx[size_t(j) * size_t(nAxis) + size_t(i)] = vx;

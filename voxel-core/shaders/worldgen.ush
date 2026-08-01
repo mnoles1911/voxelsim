@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 21
+#define VXC_WORLDGEN_VERSION_USH 22
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -173,7 +173,11 @@ static const int kBiomeTempHotU8 = 204;    // climateTempU8FromDegC(24)
 static const int kBiomePrecipAridU8 = 9;   // climatePrecipU8FromMmPerYr(400)
 static const int kBiomePrecipSemiU8 = 17;  // climatePrecipU8FromMmPerYr(800)
 static const int kBiomePrecipModU8 = 34;   // climatePrecipU8FromMmPerYr(1600)
-static const int kBiomeSeasonalHighU8 = 128; // climateSeasonalityU8From(1500)
+// v22: the savanna gate reads bio_15 (precipitation seasonality), not bio_4
+// (temperature seasonality). The old kBiomeSeasonalHighU8 = 128 is GONE, not
+// renamed -- see biome.h for why the bio_4 gate was unsatisfiable rather than
+// mistuned.
+static const int kBiomePrecipSeasonalHighU8 = 89; // climatePrecipVarU8FromDeciPct(700)
 
 // Topsoil (amplifier.cpp). v8 replaced an absolute slope SUBTRACTION with a
 // retained FRACTION -- the old form was swamped by any realistic 30 m-pixel
@@ -1128,7 +1132,7 @@ int biomeTreelineMm(int tempU8)
     return (int)clamp64(adjusted, (int64_t)kBiomeBeachUpperMm, (int64_t)9000000);
 }
 
-uint classifyBiome(int tempU8, int precipU8, int seasonalityU8, int surfaceMm,
+uint classifyBiome(int tempU8, int precipU8, int precipVarU8, int surfaceMm,
                     int64_t slopeMmPerM)
 {
     // SEA LEVEL FIRST (v8). The slope gate used to run ahead of these, so steep
@@ -1141,7 +1145,7 @@ uint classifyBiome(int tempU8, int precipU8, int seasonalityU8, int surfaceMm,
 
     if (tempU8 < kBiomeTempColdU8) return BIOME_TAIGA;
 
-    const bool seasonal = seasonalityU8 >= kBiomeSeasonalHighU8;
+    const bool seasonal = precipVarU8 >= kBiomePrecipSeasonalHighU8;
     const bool warm = tempU8 >= kBiomeTempWarmU8;
     const bool hot = tempU8 >= kBiomeTempHotU8;
 
@@ -1781,9 +1785,15 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
         (uint)blendU8((int64_t)(cl00 & 0xff), (int64_t)(cl10 & 0xff),
                       (int64_t)(cl01 & 0xff), (int64_t)(cl11 & 0xff),
                       cgx, cfx, cgy, cfy, cden);
-    const uint clSeasonality =
-        (uint)blendU8((int64_t)((cl00 >> 8) & 0xff), (int64_t)((cl10 >> 8) & 0xff),
-                      (int64_t)((cl01 >> 8) & 0xff), (int64_t)((cl11 >> 8) & 0xff),
+    // v22: bits 24-31 (precipVariability / bio_15) instead of bits 8-15
+    // (seasonality / bio_4). The packing is unchanged -- VoxelGpuRegionBuild.h
+    // and gpu_harness.cpp have always uploaded all four channels -- and the CPU
+    // side blends all four in blendClimate, so this is the same faded-bilinear
+    // blend on a different byte of the same word. Only the byte the classifier
+    // consumes moved.
+    const uint clPrecipVar =
+        (uint)blendU8((int64_t)((cl00 >> 24) & 0xff), (int64_t)((cl10 >> 24) & 0xff),
+                      (int64_t)((cl01 >> 24) & 0xff), (int64_t)((cl11 >> 24) & 0xff),
                       cgx, cfx, cgy, cfy, cden);
     const uint clPrecipitation =
         (uint)blendU8((int64_t)((cl00 >> 16) & 0xff), (int64_t)((cl10 >> 16) & 0xff),
@@ -1842,11 +1852,12 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
     // Surface material from biome classification (M4) â€” morphology gates
     // then Whittaker climate lookup, bit-exact mirror of
     // vxc::Amplifier::column's classifyBiome/biomeSurfaceMaterial call.
-    // Dithered temperature/precipitation, undithered seasonality -- and the
-    // topsoil depth above deliberately uses the UNDITHERED rainfall, because it
-    // is a depth model rather than a boundary. Mirrors Amplifier::column.
+    // Dithered temperature/precipitation, undithered precipitation seasonality
+    // -- and the topsoil depth above deliberately uses the UNDITHERED rainfall,
+    // because it is a depth model rather than a boundary. Mirrors
+    // Amplifier::column.
     const uint biome = classifyBiome(clTempDithered, clPrecipDithered,
-                                     (int)clSeasonality, outCol.surfaceMm, slopeMmPerM);
+                                     (int)clPrecipVar, outCol.surfaceMm, slopeMmPerM);
     outCol.surfaceMat = biomeSurfaceMaterial(biome, outCol.surfaceMm);
 
     OutColumns[tid.x + tid.y * DispatchColumns.x] = outCol;

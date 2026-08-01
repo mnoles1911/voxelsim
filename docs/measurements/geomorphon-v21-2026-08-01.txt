@@ -1,0 +1,502 @@
+GEOMORPHONS AT WORLDGEN v21 — RE-MEASURING THE v12 TERRAIN VALIDATION
+======================================================================
+
+Written because every `frac_ridge_peak` figure in circulation comes from
+docs/terrain-validation-2026-07.md, which was measured at WORLDGEN v12 on
+2026-07-29. The current version is 21. v13, v14, v18, v19, v20 and v21 all
+shipped terrain-shaping changes in between; v20 deleted an entire 3D density
+band. A search of docs/ and docs/measurements/ finds no post-v12 geomorphon
+measurement of any kind — terrain-stage-metrics-2026-07-29.json is the v12 raw
+output and nothing has re-run the suite since. Confirmed before starting.
+
+THE ONE-PARAGRAPH ANSWER. On the FINE tier the v12 defect is gone: the client's
+detail pass now moves 1.875 m mean slope by +1.0% and `frac_ridge_peak` by
++3.4%, against v12's +204% and +255%. On the COARSE tier it is real, it is
+smaller than it was, and it is exactly where the brief guessed: on ground with
+`relief30` under 900 mm the coarse client MORE THAN DOUBLES the carrier's
+1.875 m mean slope (1.363 deg -> 3.229 deg, +137%), and 98.7% of the energy it
+adds sits at wavelengths of 3.2 m and longer — the two SHAPING octaves, not the
+microrelief band. The amplification falls monotonically as relief rises and is
++0.5% on alpine ground. 23.4% of the surviving world's land sits in the fully
+exempt zone.
+
+BUT THE LEVER IS NOT THE ONE NAMED IN THE BRIEF. `engageQ10` gates the detail
+GRADIENT CAP, and the gradient cap is not what is putting metre-scale landform
+on flat ground. `kReliefScaleMinQ10` is — the 0.10x anti-terrace floor on
+`reliefScaleQ10`, which is justified in carrier.h purely in terms of the metre
+and material bands and is nonetheless applied to the 25.6 m and 6.4 m landform
+octaves as well. See section 7.
+
+
+1. WHAT COULD NOT BE REPRODUCED, AND WHY
+----------------------------------------
+
+THE WORLD v12 MEASURED NO LONGER EXISTS. terrain-validation-2026-07.md ran on
+provider `terrain-diffusion-unlabeled-UNPINNED-UNVERIFIEDDATA-27ac04bc8c6b7b7d`
+tiles (-55,20) plains, (-5,15) alpine, (15,55) "rolling", later re-identified in
+docs/measurements/tile-corpus-inventory-2026-07-29.txt as living in the VALID
+provider `terrain-diffusion-unlabeled-060b0c927ccc807e`. Neither directory
+survives. D:\voxelsim\tile-cache today holds exactly one provider:
+
+    terrain-diffusion-unlabeled-3e11cf157a836c70   25 tiles   1,572,889 B each
+    tiles (-8..-4, 1..5), the contiguous 5x5 region around the default spawn
+
+The three class exemplars are gone, so THIS IS NOT A LIKE-FOR-LIKE RE-RUN. It is
+the same instruments on different ground. Every ground-dependent number below is
+therefore reported twice: once as an absolute (which is not comparable to v12)
+and once as an S2 -> S3 delta or a relief-binned curve (which is).
+
+NO s16 FINE TIER EXISTS ANYWHERE. Only s1. As in v12 section 8.2, the fine tier
+was produced by `dump_stage_heightfields.py --emit-vxtl`, which encodes THIS
+run's S1 as the .vxtl v2 tile the client reads, so S1 and S2/S3/S4-fine are
+provably the same bake.
+
+THE EARTH REFERENCE CORPUS WAS NOT BUILT (only manifest.json is committed).
+Rebuilt for the five sites used by v12. Worth recording as a positive result for
+the second time: every site record came back byte-identical to the committed
+manifest, the only diff was `generated_utc`, and the rewrite was reverted. The
+reference numbers in this file are the committed ones.
+
+THE 30 m BAND WAS NOT MEASURED. These footprints are 2040 m, chosen for their
+relief30 rather than for tile alignment, so there is no 15330 m companion band.
+`stage_realism_report.py` requires both bands and aborts without the 30 m one, so
+its 1.875 m half was driven by a thin script (D:\tmp_scratch\w3a\band1875.py)
+that IMPORTS that tool and calls its own `box_resample`, `patch_voids`,
+`centre_crop`, `describe_cached`, `BAND1875` and `require_same_resolution`. No
+metric code was re-implemented. v12's own conclusion was that S0 and S1 pass at
+30 m and that "the clean statement about S3 is the one made at 1.875 m".
+
+THE BINARY IS v21, VERIFIED RATHER THAN ASSUMED. build-int's vxc_stagedump.exe
+predates commit 4a4de04 ("worldgen v21") by 21 minutes, so a fresh
+vxc_stagedump was built from HEAD (8ce2890) in a throwaway worktree and every
+window re-dumped. All twelve S3/S4 fields are BIT-IDENTICAL between the two
+binaries. Note also that the working tree is mid-flight toward v22 (another
+agent's uncommitted climate work in core.h/biome.h and a `classifyBiome`
+signature change in amplifier.cpp); nothing in that touches `surfaceMm`, and the
+build used was HEAD, not the working tree.
+
+
+2. THE GROUND THAT WAS MEASURED
+-------------------------------
+
+The 25 tiles were mosaicked at 30 m and scored by `relief30` computed exactly as
+`carrierReliefMm` computes it at the coarse tier (L = 1 px):
+(|E[x+1]-E[x-1]| + |E[y+1]-E[y-1]|) / 2, the rise across the 60 m baseline.
+
+  WHOLE WORLD, LAND ONLY (3.59 M of 6.55 M cells are land, 54.9%)
+
+    relief30 < 3600 mm  (engageQ10 == 0, cap fully OFF)          23.38% of land
+    relief30 < 7500 mm  (cap partly or fully off)                44.79% of land
+    relief30 percentiles p5/p25/p50/p75/p95, metres    1.5 / 4.0 / 8.5 / 15.5 / 25.5
+
+Three 2040 m windows were then picked, ALL INSIDE THE SAME COARSE TILE (-5,3),
+so all three share one bake, one emitted fine tile and one carrier — the only
+thing that varies between them is the ground:
+
+  name    origin (m)         frac cells    mean       p50      relief
+                             exempt        relief30   grade    over 2040 m
+  flat    -76650, 51060      0.938         1875 mm    4.71%     82 m   elev 566-648
+  mid     -74190, 50550      0.500         4783 mm   10.14%    287 m   elev 634-921
+  steep   -73920, 57630      0.019        28483 mm   56.01%   1309 m   elev 107-1416
+
+THE SURVIVING WORLD HAS NO PLAIN. The flattest all-land 2040 m window anywhere in
+it carries 1875 mm of mean relief30 against the v12 plains exemplar's 665-872 mm,
+and 4.71% p50 grade against 1.7%. `flat` is a gently rolling upland, not a till
+plain. This is why the relief-binned tables in section 5 are the load-bearing
+result and the class table in section 4 is context.
+
+A fourth window in tile (-5,2) was dumped and then DISCARDED for the fine tier:
+it sits on the tile's south edge, `vxc_stagedump` reported 6 missing-tile queries
+and the S3-fine field carries a 390 m spike. Its coarse columns are clean and are
+quoted once, labelled.
+
+
+3. v12 AND v21 SIDE BY SIDE, 1.875 m BAND
+------------------------------------------
+
+v12 columns are the `plains / band1875` block of terrain-validation-2026-07.md
+Appendix A. v21 columns are the `flat` window. DIFFERENT GROUND — read the
+S2 -> S3 arrows, not the absolutes.
+
+                          v12 plains exemplar (-55,20)        v21 flat window (-5,3)
+  metric                  S2crs   S3crs  S2fine  S3fine     S2crs   S3crs  S2fine  S3fine
+  ----------------------------------------------------------------------------------------
+  frac_ridge_peak         0.0145  0.269  0.0991  0.352      0.0497  0.162  0.1087  0.1124
+  frac_valley_pit         0.0176  0.293  0.0647  0.343      0.0674  0.203  0.1233  0.1273
+  frac_flat               0.329   0      0.0710  0          0.0019  0      0.0011  0.0004
+  frac_flat_coarse_thresh 0.989   0.0003 0.831   0.00002    0.557   0.075  0.341   0.312
+  mean_deg                1.37    7.06   2.06    6.27       3.149   3.951  4.445   4.488
+  p95_deg                 3.31    16.4   5.31    12.3       6.483   8.542  11.55   11.64
+  curvature_asymmetry     0       0.0019 0.0186  0.0013     0.0023  0.0083 0.0042  0.0029
+  relief_m                38.1    41.4   39.2    40.4       85.0    85.9   81.3    81.3
+
+  S1 bake, same window:  v12 frac_ridge_peak 0.0961, mean_deg 2.04, relief 39.2 m
+                         v21 frac_ridge_peak 0.1083, mean_deg 4.432, relief 81.3 m
+  REF Llano Estacado 3DEP @1.875 m:    frac_ridge_peak 0.0537, mean_deg 0.910
+  REF Illinois till plain 3DEP:        frac_ridge_peak 0.0734, mean_deg 2.134
+
+  THE CLIENT'S OWN CONTRIBUTION, S2 -> S3, which IS comparable across ground:
+
+                              frac_ridge_peak        mean_deg
+    v12  coarse tier            x 18.6               + 415%
+    v21  coarse tier            x  3.26              +  25.5%
+    v12  fine tier              x  3.55              + 204%
+    v21  fine tier              x  1.03              +   1.0%
+
+The v12 headline — "our finished plain reads as six times more ridged than our
+own finished mountain", `frac_ridge_peak` 0.352 against real plains at
+0.054-0.073 — DOES NOT REPRODUCE at v21 on the fine tier. `frac_flat` is no
+longer identically zero, `frac_flat_coarse_thresh` is 0.312 rather than
+0.00002, and S3-fine differs from the bake it decorates by 3.4% rather than by
+3.7x. Whatever v13-v21 did to the fine ladder, it worked.
+
+  S3 - S2 RESIDUAL (v12 section 4's table, same statistic)
+
+    class / tier             RMS       p99 |d|    as fraction of the
+                                                  window's detrended sigma
+    v12 plains, fine        0.295 m    0.716 m       4.4%   (sigma  6.67 m)
+    v12 plains, coarse      0.825 m    2.39  m      12.4%
+    v21 flat,   fine        0.044 m    0.160 m       0.48%  (sigma  9.23 m)
+    v21 flat,   coarse      0.243 m    0.794 m       2.59%  (sigma  9.35 m)
+    v21 mid,    fine        0.122 m    0.461 m       0.64%
+    v21 mid,    coarse      0.327 m    1.007 m       1.63%
+    v21 steep,  fine        0.315 m    1.007 m       0.21%
+    v21 steep,  coarse      0.964 m    3.412 m       0.63%
+
+
+4. SLOPE BY SCALE, THE MEASUREMENT v12 CALLED THE CLEAREST ONE
+--------------------------------------------------------------
+
+Mean slope of the same 2040 m rectangle, block-averaged from 1.875 m; the
+references are area-resampled from 1 m to 1.875 m and then block-averaged the
+same way, so every column is one operator applied to a different surface.
+
+ESTIMATOR NOTE, because two numbers in this file would otherwise look like a
+contradiction. This table and every binned table in section 5 use a central-
+difference gradient over two cells; `mean_deg` in section 3 is `geomorph`'s own
+estimator. On smooth fields they agree; on a field carrying energy AT the cell
+scale the central difference sees more of it, which is why the coarse tier's
+1.875 m amplification on the flat window reads +42% here and +25.5% there. Both
+are correct measurements of different quantities and neither is quoted against
+the other — the v12 comparisons in section 3 are geomorph-to-geomorph, and the
+ladders in sections 4 and 5 are central-difference throughout.
+
+  field                    1.875 m    3.75 m     7.5 m      15 m      30 m
+  ---------------------------------------------------------------------------
+  flat  S1 bake              4.495     4.243     3.866     3.387     2.884
+  flat  S2 coarse            3.154     3.142     3.102     2.979     2.737
+  flat  S3 coarse            4.493     3.504     3.245     3.028     2.745
+  flat  S2 fine              4.515     4.249     3.867     3.387     2.884
+  flat  S3 fine              4.602     4.259     3.868     3.387     2.884
+  steep S1 bake             34.727    34.623    34.356    33.891    33.239
+  steep S2 coarse           32.827    32.834    32.821    32.780    32.703
+  steep S3 coarse           33.012    32.898    32.848    32.790    32.703
+  steep S3 fine             34.878    34.642    34.357    33.891    33.239
+  REF Llano 3DEP             0.970     0.706     0.560     0.474     0.428
+  REF Illinois 3DEP          2.173     1.999     1.794     1.585     1.379
+  REF Teton 3DEP            44.778    45.015    45.092    44.868    43.986
+
+  for comparison, the same rows at v12 (plains exemplar):
+  v12 plains S2 coarse       1.37      1.36      1.35      1.33      1.28
+  v12 plains S3 coarse       7.057     4.845     3.430     2.231     1.319
+  v12 plains S3 fine         6.268     2.856     1.931     1.530     1.148
+
+v12's coarse defect contaminated FOUR rungs (7.06 / 4.85 / 3.43 / 2.23 against a
+carrier at 1.37 flat across all of them). v21's contaminates ONE clearly and a
+second faintly: +42% at 1.875 m, +12% at 3.75 m, +4.6% at 7.5 m, +1.6% at 15 m,
++0.3% at 30 m. The fine tier is +1.9% at 1.875 m and flat thereafter.
+
+
+5. THE DECISIVE MEASUREMENT: RESIDUAL BINNED BY THE GATE'S OWN ARGUMENT
+-----------------------------------------------------------------------
+
+Every 1.875 m cell of all four windows (4 x 1089^2 = 4.7 M cells) was labelled
+with the `relief30` the amplifier reads at that cell, and the client's own
+contribution measured inside each bin. This is ground-independent: it does not
+care that the surviving world has no plain, because it asks what the client does
+to a cell AS A FUNCTION OF the quantity the gate keys on.
+
+  MEAN SLOPE AT 1.875 m, S2 -> S3
+
+  relief30 bin (mm)      n      COARSE TIER                FINE TIER
+                                S2     S3      +%          S2      S3      +%
+  ----------------------------------------------------------------------------
+  0 - 900             168504   1.363  3.229  +136.9%      1.981   2.148   +8.4%
+  900 - 1800          514905   2.338  3.768   +61.2%      4.013   4.105   +2.3%
+  1800 - 2700         581992   3.682  4.876   +32.4%      7.158   7.220   +0.9%
+  2700 - 3600         459002   5.193  6.267   +20.7%     10.231  10.298   +0.6%
+  ---- kDetailCapReliefLoMm = 3600: the ramp starts ----
+  3600 - 5500         338106   6.951  7.788   +12.0%     13.883  13.968   +0.6%
+  5500 - 7500         221988   9.472  9.985    +5.4%     17.179  17.285   +0.6%
+  ---- kDetailCapReliefHiMm = 7500: cap fully engaged ----
+  7500 - 15000        376917  16.663 16.895    +1.4%     21.745  21.879   +0.6%
+  > 15000            2082270  35.361 35.523    +0.5%     37.750  37.898   +0.4%
+
+  S3 - S2 RESIDUAL MAGNITUDE, same bins
+
+  relief30 bin (mm)      COARSE RMS   COARSE p99|d|      FINE RMS
+  ---------------------------------------------------------------
+  0 - 900                  191 mm        583 mm            30 mm
+  900 - 1800               207 mm        649 mm            46 mm
+  1800 - 2700              261 mm        825 mm            69 mm
+  2700 - 3600              318 mm        965 mm            88 mm
+  3600 - 4500              348 mm       1056 mm           107 mm
+  4500 - 5500              349 mm       1059 mm           125 mm
+  5500 - 7500              324 mm        980 mm           138 mm
+  7500 - 10000             282 mm        839 mm           154 mm
+  10000 - 15000            376 mm       1054 mm           175 mm
+  15000 - 25000            590 mm       1624 mm           220 mm
+  > 25000                 1105 mm       3430 mm           415 mm
+
+READ THESE TWO TABLES TOGETHER AND THREE THINGS FALL OUT.
+
+  (a) THE FINE TIER'S RESIDUAL GOES TO ZERO WITH THE GROUND — 30 mm at the
+      flattest bin, monotone all the way up. That is what a self-affine
+      continuation looks like and it is the behaviour carrier.h's
+      `reliefScaleQ10` comment describes: "flattening it to a plane removes the
+      decoration entirely".
+
+  (b) THE COARSE TIER'S DOES NOT. It bottoms out at 191 mm RMS / 583 mm p99 and
+      stops falling. On ground whose ENTIRE relief across a 60 m baseline is
+      under 900 mm, the client lays down excursions whose 99th percentile is
+      583 mm — 65% of the landform's whole relief, at metre wavelengths. That is
+      the floor, and it is 6.4x the fine tier's answer on identically flat ground.
+
+  (c) THE CAP IS WORKING AND IS NOT THE PROBLEM. Between the 2700-3600 bin
+      (uncapped) and the 7500-10000 bin (fully capped) the residual FALLS from
+      318 mm to 282 mm while the ground gets three times steeper — the cap
+      taking amplitude out faster than relief puts it in. The amplification
+      percentage falls smoothly through the ramp (20.7 -> 12.0 -> 5.4 -> 1.4).
+      The ramp is doing exactly its job. What it does not and cannot do is
+      remove the residual on the exempt side, because there it is switched off
+      by design and the floor is what remains.
+
+
+6. WHICH OCTAVES THE RESIDUAL IS MADE OF
+-----------------------------------------
+
+Radial power spectrum of the S3 - S2 field (Hann-windowed, 1.875 m cells), as a
+percentage of total residual energy:
+
+  case   tier     RMS      > 50 m   50-12.8 m   12.8-3.2 m   < 3.2 m
+                           (envelope) (25.6 m)    (6.4 m)    (microrelief)
+  ---------------------------------------------------------------------
+  flat   coarse   243 mm    46.6%      30.8%       21.3%        1.3%
+  mid    coarse   327 mm    56.0%      31.3%       12.1%        0.5%
+  steep  coarse   964 mm    57.4%      32.6%        9.8%        0.2%
+  flat   fine      44 mm     1.7%      17.0%       77.3%        4.0%
+  mid    fine     122 mm     2.1%      23.8%       71.6%        2.4%
+  steep  fine     315 mm     2.8%      26.4%       68.6%        2.2%
+
+THE COARSE TIER'S CONTRIBUTION IS 98.7% LANDFORM AND 1.3% TEXTURE. The two
+SHAPING octaves (25.6 m and 6.4 m) plus the low-frequency envelope that their
+own relief- and curvature-gating imposes on them account for essentially all of
+it; the microrelief band (1.6 m, 0.4 m, 0.2 m) contributes 1.3% of the energy at
+this posting. The fine tier, where those two octaves are DELETED, puts 68-77% of
+its energy in the 3.2-12.8 m band — which is its 3.2 m shaping octave doing
+precisely what the table says it should.
+
+This matters more than any other number in this file, because it separates two
+things that the exemption currently treats as one. carrier.h justifies
+`kReliefScaleMinQ10` — the 0.10x floor — entirely in terms of texture:
+
+    "the MATERIAL band (0.4 m and 0.2 m) is not relief-gated at all"
+    "this floor keeps a little of the METRE band alive on the flattest ground,
+     which is what actually breaks a terrace run. 0.1x of a 500 mm octave is
+     50 mm at 1.6 m"
+
+Every worked example in that comment is about 1.6 m and below. The floor is
+nevertheless applied to `kDetailOctaves[0] = {25600, 2600}` and
+`kDetailOctaves[1] = {6400, 1100}` as well, where 0.10x is 260 mm and 110 mm,
+raised by `kCurvatureScaleMaxQ10` = 1.75x to 647 mm of landform-wavelength
+amplitude that does not go away no matter how flat the ground gets. 647 mm is
+the figure the brief quoted, and it is confirmed arithmetically here
+((2600 + 1100) x 0.10 x 1.75 = 647.5 mm) and observationally by the spectrum.
+
+
+7. IS THE PROBLEM REAL, AND HOW BIG
+------------------------------------
+
+REAL, ON THE COARSE TIER ONLY, AND THE BRIEF NAMED THE WRONG CONSTANT.
+
+  Size, stated four ways:
+    * on relief30 < 900 mm ground the coarse client turns a 1.363 deg carrier
+      into a 3.229 deg surface (+137%), where the fine tier on the SAME cells
+      reaches 2.148 deg. Excess over our own better answer: +1.08 deg, or 50%.
+    * on the flat window it takes `frac_ridge_peak` from 0.0497 — a value that
+      sits BELOW both real plains references — to 0.162, which is 2.2x Illinois
+      and 3.0x the Llano Estacado.
+    * `frac_flat_coarse_thresh` falls 0.557 -> 0.075 on the same pass: 87% of
+      the cells that read as flat at 3 deg stop doing so.
+    * 23.4% of the surviving world's land is in the fully exempt zone and 44.8%
+      is at least partly exempt, so this is not a corner case.
+
+  NOT REAL ON THE FINE TIER. +8.4% mean slope on the flattest bin, +1.0% over
+  the flat window as a whole, `frac_ridge_peak` +3.4%. Where a baked .vxtl v2
+  tile exists — the shipping configuration — the client is very nearly
+  transparent and the remaining distance to the Earth references is the BAKE's,
+  not the client's. v12's recommendation 1 ("condition the client's detail
+  amplitude on landform relief, not only on carrier gradient") was carried out
+  and it worked.
+
+  RESIZED, NOT DISSOLVED. The v12 number for this defect on the coarse tier was
+  `frac_ridge_peak` x 18.6 and mean slope +415%; it is now x 3.26 and +25.5%
+  over a whole window, concentrated on the flattest fifth of it. That is a 5-16x
+  improvement and a real residue, not a phantom.
+
+  AND THE MECHANISM IS NOT `engageQ10`. `engageQ10` switches off the detail
+  GRADIENT CAP. Section 5 (c) shows the cap doing its job wherever it is on, and
+  section 6 shows that what survives on the exempt side is 98.7% landform-
+  wavelength energy from the two shaping octaves — which the cap was never the
+  primary control on. The control on those two octaves is `reliefScaleQ10`, and
+  specifically its 0.10x floor. Attacking `kDetailCapReliefLoMm` would either
+  re-cap the decimetre texture on flat ground (the anti-terrace regression the
+  ramp exists to prevent, and the drainage regression amplifier.cpp measured at
+  99.0% -> 97.5% stranded) or do nothing to the octaves that are actually
+  responsible.
+
+
+8. THE SECOND JOB: kFineDetailOctaves' 3200 mm PROVISIONAL ENTRY
+-----------------------------------------------------------------
+
+The comment at voxel-core/src/amplifier.cpp:512 is stale in the way the brief
+described: it derives 900 mm from a lambda^0.8 ramp, the shipped value is 100,
+and v18 ("move the fine ladder's budget to sub-metre, halving rib length") is
+why. It also states that the calibrating measurement does not exist.
+
+CAN IT BE RUN? YES, WITH ONE SUBSTITUTION. There are no s16 fine tiles anywhere
+under D:\voxelsim\tile-cache — only s1. But `--fine-dir` accepts the .vxtl v2
+tile that `dump_stage_heightfields.py --emit-vxtl` writes from this run's own
+bake, which is the same substitution v12 section 8.2 made, and the probe then
+reports `cal.pixel_size 1875` and `cal.band_edge_measured 1`, i.e. it is
+genuinely calibrating against a fine-tier raster and not predicting from a
+coarse one. Three runs, all inside tile (-5,3), 720 m footprints centred on the
+three windows of section 2:
+
+  site    H_used   r2     target_rms_7m5   amp_3200   amp_1600   amp_400   amp_200
+  ------------------------------------------------------------------------------
+  flat    0.607   0.959      1.147 m         488        343       157       101
+  mid     0.704   0.964      3.024 m        1253        770       323       175
+  steep   1.025   0.983      2.219 m         332        310        92        24
+  shipped                                    100        100       400       200
+
+SO THE MEASUREMENT IS POSSIBLE AND ITS ANSWER IS "NOT YET". `amp_3200` spans
+3.8x across three sites in a single tile. That is not measurement noise — the
+model residual is 7.5-8.3% at every site and r2 is 0.96+ — it is the constant
+being genuinely site-dependent, because it is solved from the site's own fitted
+Hurst exponent and 7.5 m target and both of those vary with the landform. Note
+also `H_used` = 1.025 on the steep site: a Hurst exponent above 1 is outside the
+fBm range the ladder model assumes and says the fit there is reading landform
+rather than the roughness band, so that row should not be averaged in as if it
+were a third sample of the same quantity.
+
+Setting a single global constant from this needs a site-selection and averaging
+policy that neither the tool nor the comment defines, and none of the three
+numbers speaks to the rib-length reason v18 chose 100. NO NUMBER IS PROPOSED. If
+this is to be closed properly it needs (a) a defined corpus of calibration sites
+spanning the classes, (b) a stated rule for combining them, and (c) a re-run of
+whatever rib-length measurement v18 used, since a 3-5x increase would undo it.
+The one thing that can be done cheaply and should be: fix the comment, which
+currently documents a value of 900 that has never shipped.
+
+
+9. EXACT COMMANDS
+------------------
+
+  # 0. references (~230 MB; rebuilt byte-identical to the committed manifest)
+  cd D:\vox-int\terrain-service
+  D:\terrain-diffusion\.venv\Scripts\python.exe tools/earth_reference.py build \
+      --site llano_estacado_plains --site illinois_till_plain \
+      --site alps_valais_alpine --site teton_range_alpine --site iowa_rolling_hills
+  git checkout terrain-service/data/earth_reference/manifest.json   # only generated_utc moved
+
+  # 1. S0 + S1 + the v2 fine tile the client reads (bake 299 s cpu, ~5 GiB RSS,
+  #    ONE AT A TIME; the other two windows are free slices of the same cache)
+  python tools/dump_stage_heightfields.py --out D:/tmp_scratch/w3a/dump/flat \
+      --tiles-dir D:/voxelsim/tile-cache/terrain-diffusion-unlabeled-3e11cf157a836c70/000000000135276f/s1 \
+      --seed 20260719 --origin -76650 51060 --span 2040 --cell 1875 \
+      --bake --bake-cache-dir D:/tmp_scratch/w3a/bakecache --emit-vxtl D:/tmp_scratch/w3a/s16
+  #   mid:   --origin -74190 50550     steep: --origin -73920 57630   (no --emit-vxtl needed)
+
+  # 2. S2 + S3 + S4, both tiers, same rectangle
+  vxc_stagedump --out D:/tmp_scratch/w3a/dump/flat --seed 20260719 \
+      --coarse-dir <s1 above> --fine-dir D:/tmp_scratch/w3a/s16 \
+      --origin -76650 51060 --span 2040 --cell 1875 --tier both
+
+  # 3. the 1.875 m band, driving stage_realism_report.py's own functions
+  D:\terrain-diffusion\.venv\Scripts\python.exe D:/tmp_scratch/w3a/band1875.py \
+      --case "flat:D:/tmp_scratch/w3a/dump/flat:llano_estacado_plains,illinois_till_plain" \
+      --case "mid:D:/tmp_scratch/w3a/dump/mid:iowa_rolling_hills,illinois_till_plain" \
+      --case "steep:D:/tmp_scratch/w3a/dump/steep:teton_range_alpine" \
+      --cache D:/tmp_scratch/w3a/cache1875.json --out D:/tmp_scratch/w3a/res_flat.json
+
+  # 4. the v21 binary check
+  git worktree add D:/tmp_scratch/w3a-v21 HEAD --detach
+  cmake -S D:/tmp_scratch/w3a-v21/voxel-core -B D:/tmp_scratch/w3a-v21/build \
+        -G "Visual Studio 18 2026" -A x64
+  cmake --build D:/tmp_scratch/w3a-v21/build --config Release --target vxc_stagedump
+  #   re-dumped all three windows; all 12 S3/S4 fields bit-identical. Worktree
+  #   scanned for LinkType (none) before `git worktree remove`, per the incident
+  #   in docs/measurements that cost the tile cache once already.
+
+  # 5. the fine-ladder calibration probe
+  vxc_terrainprobe <s1 dir> 20260719 -75630 52080 --calibrate \
+      --fine-dir D:/tmp_scratch/w3a/s16
+  #   also at -73170 51570 and -72900 58650
+
+
+================================================================================
+10. PROPOSED CHANGE — NOT APPLIED, AND CONDITIONAL ON ONE MORE MEASUREMENT
+================================================================================
+
+Stated separately because the measurement above stands whether or not this is
+ever done, and because it depends on a claim this run did not test.
+
+WHAT. Give the LANDFORM band its own, lower relief floor, separate from the
+material band's. Today `reliefScaleQ10` clamps at `kReliefScaleMinQ10` = 102
+(0.10x) for every octave in `kDetailOctaves`. The proposal is a second constant
+applied only to indices [0, kLandformOctaveCount) — the 25.6 m and 6.4 m
+shaping octaves — leaving the 1.6/0.4/0.2 m bands, `engageQ10`, the gradient-cap
+ladder and every threshold in it untouched.
+
+WHY THIS AND NOT THE RAMP. Section 6: the coarse tier's contribution on exempt
+ground is 98.7% landform-wavelength and 1.3% texture. Section 5(c): the cap is
+already correct wherever it is engaged. carrier.h's own justification for the
+floor is written entirely about 1.6 m and below. Nothing in the repo argues the
+landform octaves need a floor at all; they inherited one.
+
+THIS DOES NOT ASSUME MONOTONICITY IN SLOPE. It touches no (k, floor) pair on the
+gradient allowance and does not re-open the question amplifier.cpp:1140-1192
+settled. `engageQ10`, `kDetailCapReliefLoMm` and `kDetailCapReliefHiMm` are
+unchanged; the non-monotone allowance the ramp exists to express is expressed
+exactly as it is today.
+
+SIZE, FROM THE 0-900 BIN. Coarse S3 there is 3.229 deg from a 1.363 deg carrier
+(+1.866 deg). The fine tier's own answer on the same cells is 2.148 deg, which
+would need the coarse detail to add +0.785 deg instead — a factor of 0.42 on a
+band carrying ~99% of the residual. 0.42 x 102 is about 43/1024, i.e. a landform
+floor near 0.04x. Because `reliefScaleQ10` is linear above its clamp, a floor of
+102 currently binds everywhere below relief30 = 1594 mm, so lowering it reaches
+the 0-900 bin entirely and most of the 900-1800 bin — the two bins that carry
++137% and +61%. The 1800-2700 bin (+32%) is already on the linear ramp and this
+would not touch it.
+
+THE MEASUREMENT THAT MUST COME FIRST, AND COULD KILL IT. amplifier.cpp justifies
+the flat exemption with a drainage result: on the coarse plains carrier, 99.0%
+of area is stranded at 10 cm postings and client detail takes it to 97.5%. That
+was measured with the WHOLE ladder present. If the 1.5 points come from the
+6.4 m octave rather than from the decimetre bands, this proposal regresses
+drainage on exactly the ground the exemption was built to protect, and the right
+answer is to leave it alone. Re-running docs/measurements/drainage-ladder-v13-
+2026-07-29.txt's sweep with the landform band alone scaled down decides it, and
+it is cheap. Do not ship this without it.
+
+SECONDARY NOTES. A lower floor only ever scales detail DOWN, so no surface bound
+can loosen and the two BOUND goldens should not move (same argument v21's commit
+message makes for the micro cap). `kWorldGenVersion` rolls, `worldgen.ush` and
+the prebuilt SPIR-V need the mirror, and the amplifier/deep-column/mips/coarsegen
+digests will move. The fine tier is unaffected: `kFineDetailOctaves` has one
+shaping octave at 3.2 m and this constant would be read through the same path,
+so whether the fine tier gets the new floor or keeps 0.10x is a decision that
+should be made on the fine tier's own numbers — which, per section 3, currently
+say it is fine.

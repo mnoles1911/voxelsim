@@ -21,48 +21,54 @@ constexpr int32_t kInlandMm = 200'000; // 200m
 // landed in the arid branch because that branch had swallowed the entire range.
 constexpr int32_t T(int64_t degC) { return climateTempU8FromDegC(degC); }
 constexpr int32_t P(int64_t mmPerYr) { return climatePrecipU8FromMmPerYr(mmPerYr); }
-constexpr int32_t S(int64_t bio4) { return climateSeasonalityU8From(bio4); }
+// v22: the savanna gate's channel is bio_15 (precipitation seasonality, a
+// coefficient of variation in TENTHS OF A PERCENT), not bio_4. The old helper
+// was S(bio4) = climateSeasonalityU8From; it is deliberately not kept, because
+// the argument type is the whole point -- a test that still passed a bio_4
+// number here would compile and quietly mean CV 400% clamped to the top of the
+// range. V(1000) is CV 100%.
+constexpr int32_t V(int64_t cvDeciPct) { return climatePrecipVarU8FromDeciPct(cvDeciPct); }
 } // namespace
 
 VXC_TEST(biome_hot_dry_is_desert) {
     // 30 C and 150 mm/yr: Sahara.
-    CHECK_EQ(classifyBiome(T(30), P(150), S(1000), kInlandMm, 0), DESERT);
+    CHECK_EQ(classifyBiome(T(30), P(150), V(400), kInlandMm, 0), DESERT);
 }
 
 VXC_TEST(biome_cold_is_taiga_or_tundra) {
     // Cold, but below the (temperature-lowered) treeline at this elevation:
     // Whittaker's cold band -> TAIGA.
-    CHECK_EQ(classifyBiome(T(-5), P(600), S(1000), 100'000, 0), TAIGA);
+    CHECK_EQ(classifyBiome(T(-5), P(600), V(400), 100'000, 0), TAIGA);
     // Same cold climate, higher elevation crosses that lowered treeline ->
     // gated to TUNDRA_ALPINE before Whittaker ever runs.
-    CHECK_EQ(classifyBiome(T(-5), P(600), S(1000), 500'000, 0), TUNDRA_ALPINE);
+    CHECK_EQ(classifyBiome(T(-5), P(600), V(400), 500'000, 0), TUNDRA_ALPINE);
 }
 
 VXC_TEST(biome_steep_slope_overrides_climate) {
     // Warm + wet would Whittaker-pick RAINFOREST at slope 0 ...
-    CHECK_EQ(classifyBiome(T(25), P(2500), S(1000), kInlandMm, 0), RAINFOREST);
+    CHECK_EQ(classifyBiome(T(25), P(2500), V(400), kInlandMm, 0), RAINFOREST);
     // ... but a cliff-steep slope gates to BARE_ROCK regardless. (Before v8
     // this returned TUNDRA_ALPINE, i.e. permafrost, on a 25 C rainforest
     // hillside -- and at a "cliff" threshold of 11 degrees.)
-    CHECK_EQ(classifyBiome(T(25), P(2500), S(1000), kInlandMm,
+    CHECK_EQ(classifyBiome(T(25), P(2500), V(400), kInlandMm,
                            kBiomeCliffSlopeMmPerM + 1),
              BARE_ROCK);
 }
 
 VXC_TEST(biome_wet_warm_is_rainforest) {
-    CHECK_EQ(classifyBiome(T(25), P(2500), S(1000), kInlandMm, 0), RAINFOREST);
+    CHECK_EQ(classifyBiome(T(25), P(2500), V(400), kInlandMm, 0), RAINFOREST);
 }
 
-VXC_TEST(biome_seasonality_splits_savanna_from_grassland) {
-    // Same warm, semi-arid climate; only seasonality differs.
-    CHECK_EQ(classifyBiome(T(20), P(600), S(2000), kInlandMm, 0), SAVANNA);
-    CHECK_EQ(classifyBiome(T(20), P(600), S(500), kInlandMm, 0), GRASSLAND);
+VXC_TEST(biome_precip_seasonality_splits_savanna_from_grassland) {
+    // Same warm, semi-arid climate; only the DRY SEASON differs (bio_15).
+    CHECK_EQ(classifyBiome(T(20), P(600), V(1000), kInlandMm, 0), SAVANNA);
+    CHECK_EQ(classifyBiome(T(20), P(600), V(200), kInlandMm, 0), GRASSLAND);
 }
 
-VXC_TEST(biome_seasonality_splits_forest_types) {
-    // Same warm, moderate-precip climate; only seasonality differs.
-    CHECK_EQ(classifyBiome(T(20), P(1200), S(2000), kInlandMm, 0), SAVANNA);
-    CHECK_EQ(classifyBiome(T(20), P(1200), S(500), kInlandMm, 0), TEMPERATE_FOREST);
+VXC_TEST(biome_precip_seasonality_splits_forest_types) {
+    // Same warm, moderate-precip climate; only the DRY SEASON differs (bio_15).
+    CHECK_EQ(classifyBiome(T(20), P(1200), V(1000), kInlandMm, 0), SAVANNA);
+    CHECK_EQ(classifyBiome(T(20), P(1200), V(200), kInlandMm, 0), TEMPERATE_FOREST);
 }
 
 VXC_TEST(biome_coastal_band_beach_and_ocean) {
@@ -76,10 +82,10 @@ VXC_TEST(biome_coastal_band_beach_and_ocean) {
 VXC_TEST(biome_morphology_gate_varying_slope) {
     // Fixed climate that Whittaker-picks TEMPERATE_FOREST at slope 0
     // (10 C is not "warm", 1200 mm/yr is in the moderate band).
-    CHECK_EQ(classifyBiome(T(10), P(1200), S(500), kInlandMm, 0), TEMPERATE_FOREST);
-    CHECK_EQ(classifyBiome(T(10), P(1200), S(500), kInlandMm, kBiomeCliffSlopeMmPerM),
+    CHECK_EQ(classifyBiome(T(10), P(1200), V(200), kInlandMm, 0), TEMPERATE_FOREST);
+    CHECK_EQ(classifyBiome(T(10), P(1200), V(200), kInlandMm, kBiomeCliffSlopeMmPerM),
              TEMPERATE_FOREST);
-    CHECK_EQ(classifyBiome(T(10), P(1200), S(500), kInlandMm, kBiomeCliffSlopeMmPerM + 1),
+    CHECK_EQ(classifyBiome(T(10), P(1200), V(200), kInlandMm, kBiomeCliffSlopeMmPerM + 1),
              BARE_ROCK);
 }
 
@@ -127,15 +133,55 @@ VXC_TEST(biome_every_id_reachable_from_physical_ranges) {
     // would have caught the original bug on day one: at v6, four of the nine
     // ids were unreachable from ANY input a real tile could carry, because
     // kBiomePrecipAridU8 sat above the whole precipitation range.
+    //
+    // IT DID NOT CATCH THE v8..v21 SAVANNA BUG, and the reason is worth writing
+    // down: the sweep is a CARTESIAN PRODUCT, so it happily evaluated bio_4
+    // 2200 together with 30 C -- a combination that does not exist anywhere on
+    // Earth (the maximum bio_4 above 18 C is 1084). Reachability from the
+    // product of the marginals is not reachability from the JOINT distribution,
+    // and only the latter says whether a biome can occur. See
+    // biome_savanna_gate_is_reachable_from_real_climates below, which uses
+    // measured co-occurring values rather than a product.
     bool seen[kBiomeCount] = {false};
     for (int64_t degC = -35; degC <= 35; degC += 1)
         for (int64_t mm = 0; mm <= 4000; mm += 50)
-            for (int64_t bio4 : {int64_t(400), int64_t(2200)})
+            for (int64_t cv : {int64_t(200), int64_t(1200)})
                 for (int32_t elevMm : {kBiomeBeachLowerMm - 1, kBiomeBeachUpperMm,
                                        kInlandMm, 2'000'000, 4'000'000})
                     for (int64_t slope : {int64_t(0), kBiomeCliffSlopeMmPerM + 1})
-                        seen[classifyBiome(T(degC), P(mm), S(bio4), elevMm, slope)] = true;
+                        seen[classifyBiome(T(degC), P(mm), V(cv), elevMm, slope)] = true;
     for (int b = 0; b < kBiomeCount; ++b) CHECK(seen[b]);
+}
+
+VXC_TEST(biome_savanna_gate_is_reachable_from_real_climates) {
+    // THE REGRESSION FOR THE v8..v21 GATE BUG. Every triple below is a real
+    // (bio_1, bio_12, bio_15) read off the WorldClim 2.1 10' rasters at the
+    // named place -- co-occurring values, not a product of marginals -- so a
+    // gate that no climate on Earth satisfies fails here instead of shipping.
+    // Measurement: docs/measurements/biome-gates-2026-08-01.txt.
+    struct Site { const char* name; int64_t degC; int64_t mm; int64_t cvDeciPct; };
+    constexpr Site kSavanna[] = {
+        {"Niamey, Sahel",          29, 497, 1370},
+        {"Cerrado, Brasilia",      21, 1460, 830},
+        {"Katherine, N Australia", 27, 982, 1140},
+        {"Zambia miombo",          20, 1034, 1130},
+        {"Deccan, India",          27, 794, 1080},
+        {"Tsavo, Kenya",           24, 1000, 720},
+        {"Burkina Faso",           27, 807, 1170},
+    };
+    // Warm and in the same precipitation window, but with no dry season. These
+    // are the false positives a bio_4 gate produced.
+    constexpr Site kNotSavanna[] = {
+        {"Houston, TX",   20, 1209, 220},
+        {"Brisbane, AU",  20, 1218, 460},
+        {"Miami, FL",     24, 1498, 540},
+        {"Durban, ZA",    20, 1010, 410},
+        {"Seville, ES",   18, 536, 670},
+    };
+    for (const Site& s : kSavanna)
+        CHECK_EQ(classifyBiome(T(s.degC), P(s.mm), V(s.cvDeciPct), kInlandMm, 0), SAVANNA);
+    for (const Site& s : kNotSavanna)
+        CHECK(classifyBiome(T(s.degC), P(s.mm), V(s.cvDeciPct), kInlandMm, 0) != SAVANNA);
 }
 
 VXC_TEST(biome_classification_is_deterministic) {
@@ -153,15 +199,19 @@ VXC_TEST(biome_map_golden_digest) {
     Digest d;
     for (int32_t t = 0; t <= 255; t += 5)
         for (int32_t p = 0; p <= 255; p += 7) {
-            const int32_t seasonality = (t * 3 + p * 5) & 0xff;
+            const int32_t precipVar = (t * 3 + p * 5) & 0xff;
             for (int64_t elevM = -20; elevM <= 40; elevM += 4) {
                 const int32_t surfaceMm = static_cast<int32_t>(elevM * 100'000);
                 for (int64_t slope = 0; slope <= 9000; slope += 3000) {
-                    const BiomeId biome = classifyBiome(t, p, seasonality, surfaceMm, slope);
+                    const BiomeId biome = classifyBiome(t, p, precipVar, surfaceMm, slope);
                     d.u8(static_cast<uint8_t>(biome));
                     d.u8(biomeSurfaceMaterial(biome, surfaceMm));
                 }
             }
         }
-    CHECK_EQ(d.h, 0x7D36AFFD6B9DE5C5ull); // GOLDEN(biome_map)
+    // Re-pinned at worldgen v22 (was 0x7D36AFFD6B9DE5C5 at v8..v21). The third
+    // argument of the sweep is a raw u8 either way; what moved is the gate it
+    // is compared against -- bio_4 >= 128 became bio_15 >= 89 -- so the SAVANNA
+    // cells of this map change and nothing else does.
+    CHECK_EQ(d.h, 0xD7E49028948294F5ull); // GOLDEN(biome_map)
 }

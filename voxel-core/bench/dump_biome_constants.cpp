@@ -38,8 +38,8 @@ int main() {
                 kBiomePrecipSemiU8);
     std::printf("static const int kBiomePrecipModU8 = %d;   // 1600 mm/yr\n",
                 kBiomePrecipModU8);
-    std::printf("static const int kBiomeSeasonalHighU8 = %d; // bio_4 1500\n",
-                kBiomeSeasonalHighU8);
+    std::printf("static const int kBiomePrecipSeasonalHighU8 = %d; // bio_15 CV 70.0%%\n",
+                kBiomePrecipSeasonalHighU8);
     std::printf("\n// precipitation decode, for the topsoil formula:\n");
     std::printf("//   climatePrecipMmPerYrFromU8(u8) == (u8 * %lld) / 255\n",
                 (long long)(kClimatePrecipMaxMmPerYr - kClimatePrecipMinMmPerYr));

@@ -2175,12 +2175,16 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // (slope, coastal band, temperature-adjusted treeline) run before the
     // Whittaker climate lookup â€” see voxelcore/biome.h, mirrored bit-exactly
     // in worldgen.ush's ColumnMain.
-    // Dithered temperature/precipitation, undithered seasonality: the dither
-    // exists to ragged the two gates that draw long boundaries across the world
-    // (treeline and the Whittaker precipitation bands). Topsoil depth above
-    // deliberately uses the UNDITHERED rainfall -- it is a depth model, not a
-    // boundary, and dithering it would just add noise to a smooth field.
-    const BiomeId biome = classifyBiome(clTempDithered, clPrecipDithered, cl.seasonality,
+    // Dithered temperature/precipitation, undithered precipitation seasonality:
+    // the dither exists to ragged the two gates that draw long boundaries across
+    // the world (treeline and the Whittaker precipitation bands). Topsoil depth
+    // above deliberately uses the UNDITHERED rainfall -- it is a depth model,
+    // not a boundary, and dithering it would just add noise to a smooth field.
+    //
+    // v22: the third argument is cl.precipVariability (bio_15), not
+    // cl.seasonality (bio_4). Same arity, so this compiles either way -- see
+    // biome.h's note on classifyBiome.
+    const BiomeId biome = classifyBiome(clTempDithered, clPrecipDithered, cl.precipVariability,
                                          col.surfaceMm, slopeMmPerM);
     col.surfaceMat = biomeSurfaceMaterial(biome, col.surfaceMm);
 

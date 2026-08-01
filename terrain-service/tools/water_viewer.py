@@ -130,7 +130,7 @@ const K = __CONST__;
 const BIOME_COLS = __COLS__, BIOME_NAMES = __NAMES__;
 const H = D.h, W = D.w, F = 6;                    // F = render upsample
 const elev = Float32Array.from(D.elev), temp = Float32Array.from(D.temp);
-const prec = Float32Array.from(D.prec), tstd = Float32Array.from(D.tstd);
+const prec = Float32Array.from(D.prec), pcv = Float32Array.from(D.pcv);
 
 const cv = document.getElementById('cv'), cx = cv.getContext('2d');
 const OW = W * F, OH = H * F;
@@ -170,7 +170,8 @@ function rep(src) {
     for (let x = 0; x < OW; x++) big[y * OW + x] = src[sy * W + ((x / F) | 0)]; }
   return big;
 }
-const T = rep(temp), P = rep(prec), S = rep(tstd);
+// v22: the savanna gate reads bio_15 (precipitation CV), not bio_4.
+const T = rep(temp), P = rep(prec), S = rep(pcv);
 
 // --- multi-scale hillshade, four azimuths (see world_map.py for why both).
 function hillshade(relief) {
@@ -220,7 +221,7 @@ function biomeAt(i, water) {
   if (e <= water + K.beachHi) return 1;                      // BEACH
   if (e > Math.max(K.treeBase + t * K.treePerC, K.beachHi)) return 8;  // TUNDRA_ALPINE
   if (t < K.tempCold) return 7;                              // TAIGA
-  const warm = t >= K.tempWarm, hot = t >= K.tempHot, seas = s >= K.seasonHigh;
+  const warm = t >= K.tempWarm, hot = t >= K.tempHot, seas = s >= K.precSeasonHigh;
   if (p < K.precArid) return hot ? 5 : 2;
   if (p < K.precSemi) return (warm && seas) ? 6 : 2;
   if (p < K.precMod)  return (warm && seas) ? 6 : 3;
@@ -315,14 +316,15 @@ def main() -> None:
         "elev": [round(float(v), 1) for v in d["elev"].ravel()],
         "temp": [round(float(v), 2) for v in d["temp"].ravel()],
         "prec": [round(float(v), 1) for v in d["precip"].ravel()],
-        "tstd": [round(float(v), 1) for v in d["tstd"].ravel()],
+        "pcv": [round(float(v), 1) for v in d["precip_cv"].ravel()],
     }
     consts = {
         "beachLo": k["beach_lower_m"], "beachHi": k["beach_upper_m"],
         "treeBase": k["treeline_base_m"], "treePerC": k["treeline_m_per_c"],
         "tempCold": k["temp_cold_c"], "tempWarm": k["temp_warm_c"], "tempHot": k["temp_hot_c"],
         "precArid": k["precip_arid_mm"], "precSemi": k["precip_semi_mm"],
-        "precMod": k["precip_mod_mm"], "seasonHigh": k["seasonal_high"],
+        "precMod": k["precip_mod_mm"],
+        "precSeasonHigh": k["precip_seasonal_high_pct"],
     }
     html = (_HTML
             .replace("__DATA__", json.dumps(payload, separators=(",", ":")))

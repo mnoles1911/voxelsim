@@ -10,7 +10,8 @@
 // of climate; a coastal band around sea level reads as ocean/beach; terrain
 // above a temperature-adjusted treeline reads as alpine/tundra. Only once
 // every gate has passed does climate (temperature x precipitation, with
-// seasonality splitting savanna/grassland and forest types) pick among the
+// PRECIPITATION seasonality -- bio_15, not bio_4; see kBiomePrecipSeasonalHighU8
+// -- splitting savanna off grassland and the forest types) pick among the
 // remaining biomes. No floats; every threshold below is an integer worldgen
 // contract constant — tune only on a deliberate kWorldGenVersion bump.
 
@@ -118,16 +119,72 @@ inline constexpr int32_t kBiomeAlpineRockLineMm = 3'200'000;
 // Earth took the arid branch and the three below it were dead code.
 inline constexpr int32_t kBiomeTempColdU8 = climateTempU8FromDegC(5);   // was 70 = -18 C
 inline constexpr int32_t kBiomeTempWarmU8 = climateTempU8FromDegC(18);  // was 140 = +3.9 C
+// 24 C WAS RE-EXAMINED AT v22 AND DELIBERATELY NOT MOVED. The v21 biome census
+// off the coarse model showed DESERT at exactly 0.00% of land, and the cause is
+// this gate: 16.7% of that world's land is arid (bio_12 < 400) but its land
+// temperature p95 is 20.7 C, so `arid && hot` is empty and every arid column
+// falls through to GRASSLAND. It is tempting to lower the threshold until
+// deserts appear. Do not: measured against the WorldClim rasters, 24 C puts
+// DESERT at 9.50% of Earth land, which is already the right answer (Earth is
+// ~8.6%), and every lower value overshoots hard -- 22 C gives 13.0%, 20 C gives
+// 16.1%, 18 C gives 18.2%, at which point half the world's dry TEMPERATE land
+// is sand. The gate is correct and the WORLD is wrong; the blocker is the
+// coarse model's compressed climate tails, not this constant. See
+// docs/measurements/biome-gates-2026-08-01.txt.
 inline constexpr int32_t kBiomeTempHotU8 = climateTempU8FromDegC(24);   // was 170 = +13.3 C
 inline constexpr int32_t kBiomePrecipAridU8 = climatePrecipU8FromMmPerYr(400);  // was 60 = 2824 mm
 inline constexpr int32_t kBiomePrecipSemiU8 = climatePrecipU8FromMmPerYr(800);  // was 100 = 4706 mm
 inline constexpr int32_t kBiomePrecipModU8 = climatePrecipU8FromMmPerYr(1600);  // was 170 = 8000 mm
-//: bio_4 1500 = sd(monthly) 15 C, the maritime/continental divide. This is the
-//: one Whittaker constant whose VALUE does not move: 128 was already exactly
-//: right, only its derivation was missing.
-inline constexpr int32_t kBiomeSeasonalHighU8 = climateSeasonalityU8From(1500);
 
-static_assert(kBiomeSeasonalHighU8 == 128, "the seasonality divide should not have moved");
+// THE SAVANNA GATE READS PRECIPITATION SEASONALITY (bio_15), NOT TEMPERATURE
+// SEASONALITY (bio_4). Changed at worldgen v22; the whole reason is worth
+// keeping, because the old gate was not merely mistuned, it was UNSATISFIABLE.
+//
+// v8..v21 asked for `tempU8 >= kBiomeTempWarmU8 && seasonalityU8 >=
+// climateSeasonalityU8From(1500)` -- bio_1 >= 18 C together with bio_4 >= 1500
+// (sd of monthly temperature >= 15 C). Those two conditions are mutually
+// exclusive ON EARTH, and close to mutually exclusive by definition: the warm
+// band IS the tropics, and what makes a place tropical is that its temperature
+// barely varies through the year. Measured over the WorldClim 2.1 10' rasters
+// inside the +/-60 deg crop the conditioning stats use (docs/measurements/
+// biome-gates-2026-08-01.txt): the maximum bio_4 anywhere with bio_1 >= 18 C is
+// 1084, against a threshold of 1500. ZERO pixels of Earth land satisfy the
+// gate, so SAVANNA was dead code for fourteen worldgen versions and every arid
+// warm column fell through to GRASSLAND.
+//
+// No value of a bio_4 threshold fixes it. Sweeping it down to where it admits a
+// plausible share (bio_4 >= 200 gives 12.5% of land) puts the savanna in the
+// WRONG PLACES: only 77.0% of what it selects lies inside |lat| < 25, against
+// 87.2% for the eligible window itself, i.e. the rule is actively ANTI-
+// selective for the tropics. On named sites it calls Houston, Brisbane, Miami,
+// Durban and Seville savanna while rejecting the Serengeti, the Cerrado and
+// Tsavo. That is the signature of the wrong variable, not a wrong number.
+//
+// What actually distinguishes savanna from both rainforest and temperate
+// woodland is a DRY SEASON -- a precipitation phenomenon. bio_15, the
+// coefficient of variation of monthly precipitation, is already in the wire
+// format (climate.h, ClimateSample::precipVariability) and separates them
+// cleanly: at CV >= 70% every in-window negative control above is rejected and
+// 8 of 9 savanna sites accepted (the Serengeti, at 65, is the one miss), and
+// 93.4% of the selected area lies inside |lat| < 25.
+//
+// THE VALUE IS DERIVED TWICE AND BOTH ROUTES AGREE.
+//   * Physically: a year with d months of no rain and the rest uniform has
+//     CV = sqrt(d / (12 - d)). Four dry months -- a third of the year, the
+//     usual marked-dry-season line for tropical savanna -- gives
+//     sqrt(4/8) = 70.7%.
+//   * Empirically: it puts SAVANNA at 15.57% of Earth land, against the ~15.6%
+//     that tropical/subtropical grassland-savanna-shrubland actually covers.
+// The neighbouring dry-season lengths bracket it and are both worse: d=3
+// (CV 57.7%) reaches 18.75% and starts admitting Mediterranean Seville, d=6
+// (CV 100%) falls to 8.32% and drops the Cerrado.
+//
+// Stated in TENTHS OF A PERCENT because that is climate.h's bio_15 unit (see
+// its note on why whole percent breaks the encode/decode round trip).
+inline constexpr int32_t kBiomePrecipSeasonalHighU8 = climatePrecipVarU8FromDeciPct(700);
+
+static_assert(kBiomePrecipSeasonalHighU8 == 89,
+              "CV 70% must quantize to u8 89; a change here changes every savanna boundary");
 static_assert(kBiomeTempColdU8 < kBiomeTempWarmU8 && kBiomeTempWarmU8 < kBiomeTempHotU8);
 static_assert(kBiomePrecipAridU8 < kBiomePrecipSemiU8 && kBiomePrecipSemiU8 < kBiomePrecipModU8);
 
@@ -142,7 +199,14 @@ constexpr int32_t biomeTreelineMm(int32_t tempU8) {
 
 // Per-column biome classification. Gate order (m4-plan): slope -> beach/
 // ocean -> temperature-adjusted treeline -> Whittaker climate table.
-constexpr BiomeId classifyBiome(int32_t tempU8, int32_t precipU8, int32_t seasonalityU8,
+//
+// THE THIRD ARGUMENT CHANGED CHANNEL AT v22: it was seasonalityU8 (bio_4,
+// temperature seasonality) and is now precipVarU8 (bio_15, precipitation
+// seasonality). Same arity, so a caller that was not updated still COMPILES --
+// there are only three outside the tests (Amplifier::column, worldgen.ush's
+// ColumnMain, climateprobe.cpp) and all three moved in the same commit, but
+// check the argument, not the call count, if this is ever revisited.
+constexpr BiomeId classifyBiome(int32_t tempU8, int32_t precipU8, int32_t precipVarU8,
                                  int32_t surfaceMm, int64_t slopeMmPerM) {
     // SEA LEVEL FIRST. Until v8 the slope gate ran ahead of these, so steep
     // SEAFLOOR classified as TUNDRA_ALPINE: measured over the real 25-tile set,
@@ -160,7 +224,7 @@ constexpr BiomeId classifyBiome(int32_t tempU8, int32_t precipU8, int32_t season
     // consumed anything coastal, steep, or above the treeline).
     if (tempU8 < kBiomeTempColdU8) return TAIGA;
 
-    const bool seasonal = seasonalityU8 >= kBiomeSeasonalHighU8;
+    const bool seasonal = precipVarU8 >= kBiomePrecipSeasonalHighU8;
     const bool warm = tempU8 >= kBiomeTempWarmU8;
     const bool hot = tempU8 >= kBiomeTempHotU8;
 
