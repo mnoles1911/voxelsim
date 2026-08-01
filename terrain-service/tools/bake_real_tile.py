@@ -146,6 +146,25 @@ class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
     ]
 
 
+def numba_threads() -> str:
+    """What the parallel kernels ACTUALLY got, recorded next to the timings.
+
+    Nothing in this repo sets ``NUMBA_NUM_THREADS`` or calls
+    ``numba.set_num_threads``, so this is whatever numba defaulted to -- on the
+    measuring box, all 12 LOGICAL processors of a 6-core part. Every bake
+    timing on record was taken at an unrecorded thread count; that is exactly
+    the ambiguity this line closes. (``OMP_NUM_THREADS``, which
+    ``gen_world_tiles2.py`` does set, does NOT cap numba: numba calls
+    ``omp_set_num_threads`` itself. Verified.)
+    """
+    try:
+        import numba
+
+        return f"{numba.get_num_threads()} (max {numba.config.NUMBA_NUM_THREADS})"
+    except Exception:  # pragma: no cover - numba is optional here
+        return "n/a"
+
+
 def memory_counters() -> dict:
     """Resident/committed bytes for THIS process, current and peak.
 
@@ -480,10 +499,18 @@ def main() -> int:
 
     print(f"\n  BAKE  {cpu_bake:.1f} s cpu   {wall_bake:.1f} s wall "
           f"({cpu_bake/max(wall_bake,1e-9):.1f}x parallel)")
+    # PER-STAGE cpu/wall. The bake-wide ratio above is an AMDAHL number -- only
+    # B2b and B3 are numba parallel=True and they are ~58% of the CPU total, so
+    # it reads ~2x even when those two are scaling at 7-9x. Reading it as the
+    # kernels' scaling factor is a mistake this column makes impossible.
+    print(f"    {'stage':<22} {'cpu s':>8} {'wall s':>8} {'cpu/wall':>9}")
     for k, v in result.cpu_seconds.items():
         w = result.wall_seconds.get(k)
-        wtxt = "" if w is None else f"   {w:7.2f} s wall"
-        print(f"    {k:<22} {v:7.2f} s cpu{wtxt}")
+        if w is None:
+            print(f"    {k:<22} {v:8.2f}")
+        else:
+            print(f"    {k:<22} {v:8.2f} {w:8.2f} {v/max(w,1e-9):8.2f}x")
+    print(f"    numba threads {numba_threads()}")
     print(f"  peak working set {mem_bake['peak_working_set']/2**30:.2f} GiB   "
           f"peak commit {mem_bake['peak_commit']/2**30:.2f} GiB   "
           f"(before bake: {mem_pre['peak_working_set']/2**30:.2f} GiB)")
@@ -548,6 +575,7 @@ def main() -> int:
         "cpu_seconds_encode": cpu_enc, "wall_seconds_encode": wall_enc,
         "cpu_stages": result.cpu_seconds,
         "wall_stages": result.wall_seconds,
+        "numba_threads": numba_threads(),
         "mem_before": mem_pre, "mem_after_bake": mem_bake, "mem_after_encode": mem_enc,
         "estimate_peak_bytes": bp.estimate_peak_bytes(geom),
         "stats": result.stats,
