@@ -172,12 +172,11 @@ VXC_TEST(coarsegen_surface_range_formula) {
             const ColumnSample& col = grid.cols[i];
             const int64_t top0 = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
             const int64_t nominal = floorDiv(top0 - s / 2, s);
-            // The band in LEVEL-0 voxels, mapped to coarse cells the same way
-            // coarseSurfaceBrickRange maps it. Zero on an ungated column, so on
-            // 80%+ of ground this is bit-identical to the pre-v12 assertion.
-            const int64_t band = density3BandVoxels(col.d3);
-            const int64_t lo = floorDiv(top0 - band - s / 2, s);
-            const int64_t hi = floorDiv(top0 + band - s / 2, s);
+            // v12 to v19 widened this by the 3D density band before mapping to
+            // coarse cells; the term is gone at v20 and so is the widening, so
+            // lo and hi collapse onto the same cell again.
+            const int64_t lo = floorDiv(top0 - s / 2, s);
+            const int64_t hi = lo;
             int64_t top = lo;
             for (int64_t c = hi; c >= lo; --c)
                 if (Amplifier::stratigraphyAt(col, GeneratedWorld<B>::coarseRep(c, level)) !=

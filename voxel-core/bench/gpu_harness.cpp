@@ -1252,14 +1252,14 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
             // way and for the same two reasons -- the top voxel moves, and the
             // bricks under it stop being homogeneous).
             //
-            // Here it does a third job that matters more than either: it is what
-            // puts the band's cells INSIDE the compared buffer. Without it the
-            // dispatch would still be bit-exact and would be comparing 739k
-            // cells that the new term barely touches.
-            const int64_t band = density3BandVoxels(c.d3);
+            // Until v20 it did a third job: widening by the 3D density band's
+            // envelope so the band's own cells were INSIDE the compared buffer.
+            // The term is gone (core.h v20) and so is the widening. The lesson
+            // survives it -- a per-voxel term is only actually compared if the
+            // range being compared covers the voxels it touches.
             const int64_t top = floorDiv(int64_t(c.surfaceMm) - kVoxelSizeMm / 2, kVoxelSizeMm);
-            vzMin = top - band < vzMin ? top - band : vzMin;
-            vzMax = top + band > vzMax ? top + band : vzMax;
+            vzMin = top < vzMin ? top : vzMin;
+            vzMax = top > vzMax ? top : vzMax;
         }
     }
     const int32_t brickZMin = static_cast<int32_t>(floorDiv(vzMin, 8));
@@ -1992,12 +1992,11 @@ void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t 
             const int64_t vy = int64_t(tile.originVy) + y;
             const ColumnSample c = amp.column(vx, vy);
             s.cpuCols[size_t(x) + size_t(y) * W] = c;
-            // Same v12 widening as runRegion's copy above -- the 3D density
-            // band's 7-voxel envelope either side of the top voxel.
-            const int64_t band = density3BandVoxels(c.d3);
+            // Mirrors runRegion's copy above; the v12 3D-density widening both
+            // carried was removed at v20 with the term.
             const int64_t top = floorDiv(int64_t(c.surfaceMm) - kVoxelSizeMm / 2, kVoxelSizeMm);
-            vzMin = top - band < vzMin ? top - band : vzMin;
-            vzMax = top + band > vzMax ? top + band : vzMax;
+            vzMin = top < vzMin ? top : vzMin;
+            vzMax = top > vzMax ? top : vzMax;
         }
     }
     stats.cpuColumnPassMs += msSince(tCpu0);

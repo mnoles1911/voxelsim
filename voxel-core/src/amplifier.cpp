@@ -2,7 +2,7 @@
 
 #include "voxelcore/biome.h"
 #include "voxelcore/carrier.h"
-#include "voxelcore/density3.h"
+
 #include "voxelcore/detail_bedding.h"
 #include "voxelcore/detail_rill.h"
 
@@ -1343,78 +1343,23 @@ static_assert(kDeepestCarveBelowSurfaceMm < kBedrockDepthMinMm - kCaveBedrockMar
               "the geometric carve envelope must stay inside the bedrock clamp; if it does "
               "not, either (8)/(9) or the bedrock depth range is wrong.");
 
-// (13) THE 3D DENSITY BAND'S ENVELOPE (voxelcore/density3.h, new at
-// kWorldGenVersion 12). stratigraphyAt no longer tests `centre <= surfaceMm`;
-// it tests `centre <= surfaceMm + D`, and D is what every surface-derived bound
-// in this file now has to widen by.
+// (13) and (14) WERE THE 3D DENSITY BAND'S COUPLINGS, and both are gone at
+// kWorldGenVersion 20 along with the term (core.h's v20 entry). Recorded as a
+// hole in the numbering rather than silently renumbered, because the couplings
+// either side are cited by number from other files.
 //
-// The whole widening is ONE constant, in both directions, and that is the
-// point of the term having a compile-time envelope at all. density3.h proves
-// |D| <= kDensity3MaxAbsMm by static_assert on the sum of its two components,
-// so nothing here has to re-derive geometry the way couplings (8) and (9) do
-// for the carve passes -- there is no hashed field to bound, no chain to walk,
-// no worst-case draw to argue about. Both directions are ATTAINED (density3.h
-// asserts equality at both extremes with the gates fully open), so this is the
-// tight envelope and not a conservative one.
+// (13) asserted the envelope |D| <= 350 mm that surfaceBoundsMm, GeneratedWorld's
+// brick range and amplifier.h's air-reason enumeration all widened by. Nothing
+// widens by it now.
 //
-// It is asserted rather than used directly so that a change to the split
-// between the bedding and pocket allocations -- which density3.h permits, as a
-// redistribution -- cannot silently widen the world's bounds without the
-// number in front of someone.
-static_assert(kDensity3MaxAbsMm == 350,
-              "the 3D density envelope moved; surfaceBoundsMm, GeneratedWorld's surface brick "
-              "range and amplifier.h's air-reason enumeration are all widened by exactly this "
-              "constant, and a bound that did not follow it is a hole in the world.");
-// The envelope is 3.5 voxels, not a whole number of them, so every consumer
-// that works in voxels rounds UP -- see density3BandVoxels, which is the single
-// place that rounding lives so it cannot be done two different ways.
-constexpr int64_t kDensity3EnvelopeVoxels =
-    (kDensity3MaxAbsMm + kVoxelSizeMm - 1) / kVoxelSizeMm;
-static_assert(kDensity3EnvelopeVoxels == 4,
-              "3D density envelope is 3.5 voxels, covered by 4 either side");
-static_assert(kDensity3EnvelopeVoxels * kVoxelSizeMm >= kDensity3MaxAbsMm,
-              "the voxel envelope must cover the millimetre one");
-
-// (14) The lithology gate's argument. density3RockGateQ is fed the depth of
-// SOIL ABOVE ROCK, and stratigraphyAt's own layer model decides what that is:
-// under a BARE_ROCK surface the subsoil band reads MAT_ROCK straight through
-// (see stratigraphyAt below), so the only soil is the topsoil band; under
-// anything else both bands are soil. Written as a function next to the layer
-// model it is derived from rather than inlined at the call site, because the
-// two must move together -- if stratigraphyAt ever stops reading rock through
-// the subsoil band, this is wrong and nothing else would say so.
-int64_t soilAboveRockMm(const ColumnSample& col) {
-    return col.surfaceMat == MAT_ROCK ? int64_t(col.topsoilMm)
-                                      : int64_t(col.topsoilMm) + int64_t(col.subsoilMm);
-}
-
-// (14b) WHAT THE LITHOLOGY GATE ACTUALLY SELECTS, pinned so it cannot drift.
-//
-// density3.h promotes the lithology gate to the whole displacement at v12, and
-// its comment claims the continuous ramp resolves in practice to "bare rock
-// only". That claim is a COUPLING between three constants in this file and two
-// in density3.h, not a property of either, so it is asserted here where the
-// three live rather than described there where it would rot.
-//
-// The thinnest soil a NON-rock column can carry is the topsoil floor plus the
-// subsoil derived from it, and subsoil is `topsoil * 2 + 500`:
-constexpr int64_t kThinnestNonRockSoilMm = kTopsoilMinMm * 2 + 500 + kTopsoilMinMm;
-static_assert(kThinnestNonRockSoilMm >= kDensity3RockSoilZeroMm,
-              "the 3D density band's lithology gate is supposed to be shut on every column "
-              "that is not BARE_ROCK -- that is what keeps an undercut nose from cutting a "
-              "face across a soil profile and exposing MAT_SUBSOIL where the biome material "
-              "should be. It holds because the thinnest possible non-rock column already "
-              "carries kDensity3RockSoilZeroMm of soil. If kTopsoilMinMm, the subsoil formula "
-              "or that constant move, this stops being true SILENTLY: re-read density3.h's "
-              "lithology gate section and decide deliberately, do not just widen the assert.");
-// And the mirror-image half: on a rock cliff the gate must be OPEN, or the term
-// is inert everywhere and the whole band is cost with no output. Slope
-// retention pins topsoil at its floor on any column steep enough to pass the
-// slope gate, and a MAT_ROCK column's soil is topsoil alone.
-static_assert(kTopsoilMinMm <= kDensity3RockSoilFullMm,
-              "a bare-rock cliff must open the lithology gate FULLY; if the topsoil floor "
-              "rises past kDensity3RockSoilFullMm the band starts fading out on exactly the "
-              "ground it exists for");
+// (14) derived `soilAboveRockMm` for the band's lithology gate, and (14b)
+// asserted the coupling that made that gate resolve to "bare rock only" -- that
+// the thinnest non-rock column already carries more soil than the gate's zero
+// point. Both existed solely to feed the band; its only other consumer was a
+// comment. Worth knowing if an undercut term ever returns: the reason (14b) was
+// asserted HERE rather than described in density3.h is that it was a coupling
+// between three constants in this file and two in that one, and a claim like
+// that rots wherever it is only written down.
 
 // (12) The dilation radius. A cavern site only reaches columns within
 // kCavernMaxReachMm of its anchor (cavernColumnFromSites culls on exactly
@@ -1990,24 +1935,20 @@ bool Amplifier::surfaceBoundsMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t v
     //
     // evalSurface clamps its own output to [kSurfaceClampMinMm,
     // kSurfaceClampMaxMm], so `clampi64(base +/- detail, MIN, MAX)` bounds
-    // surfaceMm exactly as it did before v12. What stratigraphyAt now tests
-    // against is surfaceMm + D, and D is applied AFTER that clamp -- the
-    // displaced surface genuinely can sit 700 mm outside the clamped range, so
-    // folding the envelope in before clamping would bound the wrong quantity
-    // and would be too tight by up to 700 mm at exactly the two elevations
-    // where the clamp bites. Sound because clamping is monotone and D is
-    // bounded independently of position: for every column and every z,
-    //     surfaceMm + D <= clampi64(...) + kDensity3MaxAbsMm.
+    // surfaceMm exactly -- and at v20 that IS what stratigraphyAt tests
+    // against, so no envelope is added on either side.
     //
-    // See coupling (13). No slope, curvature or tier argument is needed: unlike
-    // every other term in this sum the envelope is a constant, and the gates
-    // can only ever shrink it toward zero.
-    outUpperMm =
-        clampi64(maxBaseMm + maxDetailMm, kSurfaceClampMinMm, kSurfaceClampMaxMm) +
-        kDensity3MaxAbsMm;
-    outLowerMm =
-        clampi64(minBaseMm - minDetailMm, kSurfaceClampMinMm, kSurfaceClampMaxMm) -
-        kDensity3MaxAbsMm;
+    // v12 to v19 widened both by kDensity3MaxAbsMm because the test was
+    // `centre <= surfaceMm + D` and D was applied AFTER this clamp, so the
+    // displaced surface could genuinely sit outside the clamped range. v20
+    // removed D (core.h's v20 entry), so the widening bounds nothing and is
+    // gone with it. TIGHTENING A BOUND IS THE DIRECTION THAT CAN PUT A HOLE IN
+    // THE WORLD, so it is not done on the reasoning alone: the adversarial
+    // sweep in test_amplifier.cpp measures the actual slack over real columns,
+    // and it stood at 5587 mm minimum with the envelope still included -- an
+    // order of magnitude more than the 350 mm being removed.
+    outUpperMm = clampi64(maxBaseMm + maxDetailMm, kSurfaceClampMinMm, kSurfaceClampMaxMm);
+    outLowerMm = clampi64(minBaseMm - minDetailMm, kSurfaceClampMinMm, kSurfaceClampMaxMm);
     return true;
 }
 
@@ -2078,13 +2019,14 @@ bool Amplifier::cavernMayReachFootprint(int64_t vx0, int64_t vy0, int64_t vx1, i
     return false;
 }
 
-// v12 note: the 3D density band needs NO term of its own here. Both tiers
-// derive from surfaceLowerBoundMm, which is now a bound on the DISPLACED
-// surface (it already has kDensity3MaxAbsMm subtracted), and the carve
-// envelopes below are measured in each column's own depth space from that same
-// surface. So the floor drops by exactly 700 mm and the enumeration in
-// amplifier.h stays closed -- reason 1 already covers the band, which is why it
-// is written there as 1b rather than as a fourth subtracted constant.
+// v20 note: this needed no term of its own for the 3D density band and needs
+// none now that the band is gone. Both tiers derive from surfaceLowerBoundMm,
+// and the carve envelopes below are measured in each column's own depth space
+// from that same surface -- so when the band's envelope came off that bound
+// (see surfaceBoundsMm), this floor rose by exactly 350 mm with it and nothing
+// here had to change. That is what the v12 comment meant by writing the band as
+// reason 1b rather than as a fourth subtracted constant: it was never an
+// independent term, so removing it is not an independent edit.
 int64_t Amplifier::solidBelowBoundMm(int64_t vx0, int64_t vy0, int64_t vx1, int64_t vy1) const {
     if (vx1 < vx0 || vy1 < vy0) return kSurfaceLowerBoundDeclined;
 
@@ -2223,43 +2165,16 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
                                          col.surfaceMm, slopeMmPerM);
     col.surfaceMat = biomeSurfaceMaterial(biome, col.surfaceMm);
 
-    // THE 3D DENSITY BAND IS NOT BUILT (worldgen v20). `col.d3` is left
-    // default-constructed, so gateQ == 0 and density3ColumnDisplacementMm
-    // returns exactly 0 on every voxel of every column -- see density3.h
-    // section 0 for why that is bit-exact and not an approximation.
-    //
-    // WHY, in one line: the term was measured on 2026-07-31 to be the source of
-    // the parallel-band artifact the owner has rejected since this project
-    // started (docs/measurements/placed-voxel-banding-2026-07-31.txt). Its
-    // displacement moved the top solid voxel on 88.61% of gated columns, and an
-    // FFT of that displacement puts 60% of its variance at 0.8-3.2 m, which is
-    // detail_bedding.h's bed-thickness range verbatim.
-    //
-    // AND IT COULD NOT BE TUNED OUT, which is the part worth recording so nobody
-    // re-derives it. An overhang needs dD/dz > 1, and density3.h's own sweep
-    // shows the rate is monotone in the contrast curve: 0.01% raw, 0.54% at two
-    // passes, 1.97% at three (shipped), 3.57% at four. Sharpening the bed
-    // contacts is EXACTLY what turns a soft corrugation into the hard parallel
-    // ledges the owner sees -- the header says so itself ("it turns a sine-ish
-    // corrugation into a stack of ledges"). Amplitude is trapped the same way:
-    // halving the envelope 700 -> 350 collapsed the overhang rate by 91%. Every
-    // setting of this term is either banded or geometrically inert, so the
-    // choice was to keep it or delete it, not to soften it.
-    //
-    // WHAT IT BOUGHT, for the trade to be on the record: 1.97% of gated columns
-    // x a 6.52% world gate rate = an overhang on about 0.13% of world columns,
-    // paid for by banding ~90% of every steep bare-rock face.
+    // THE 3D DENSITY BAND WAS REDUCED HERE, once per column, until v20 removed
+    // it (core.h's v20 entry has the measurement and the argument for why the
+    // term could not be tuned instead of deleted). Nothing replaces it: the
+    // solid set is the region under surfaceMm again.
     //
     // THE 2D BEDDING TERM STAYS (kBeddingAmpMm = 120, applied in evalSurface).
-    // It is in surfaceMm, so it was present in BOTH panels of the A/B the owner
-    // approved -- the clean panel already contains it. That is evidence, not a
-    // judgement call, and it is the first thing to re-examine if any residual
-    // banding survives this change.
-    //
-    // The density3.h machinery, ColumnSample::d3, the bound widening and the
-    // worldgen.ush mirror are unwound in the follow-up commit; this one only
-    // stops the term from displacing anything, so that the geometry change is
-    // reviewable on its own and every surface bound stays conservatively wide.
+    // It is part of surfaceMm, so it was present in BOTH panels of the A/B the
+    // owner approved -- the clean panel already contained it. That is evidence
+    // rather than a judgement call, and it is the first thing to re-examine if
+    // banding is ever reported on this ground again.
 
     // M4 cave pass (voxelcore/caves.h): reduce the jittered lattice tunnel
     // network to the tube axes that pass near this column. Depends only on

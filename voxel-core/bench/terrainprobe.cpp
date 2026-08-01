@@ -4523,54 +4523,45 @@ int main(int argc, char** argv) {
         // and ends one below its bottom cannot miss a solid voxel. Scanning
         // DOWNWARD from the top is what makes this the top solid voxel of a
         // possibly-overhanging column rather than the first one found from below.
-        const int64_t bandVox = (kDensity3MaxAbsMm + kVoxelSizeMm - 1) / kVoxelSizeMm + 1;
-        std::vector<int32_t> withD3(static_cast<size_t>(nn * nn));
-        std::vector<int32_t> noD3(static_cast<size_t>(nn * nn));
-        int64_t gated = 0, differ = 0;
+        // FOUR VOXELS either side of the nominal top. At v20 nothing displaces
+        // the solid set, so one would do -- but this instrument exists to catch
+        // a displacement that should not be there, and a scan that assumes the
+        // answer cannot find a surprise. Four is what the removed band's 350 mm
+        // envelope needed, kept as the width a reintroduced term would most
+        // likely use.
+        const int64_t bandVox = 4;
+        std::vector<int32_t> placed(static_cast<size_t>(nn * nn));
+        int64_t displaced = 0;
         for (int64_t j = 0; j < nn; ++j) {
             for (int64_t i = 0; i < nn; ++i) {
-                ColumnSample col = amp.column(vx0 + i, vy0 + j);
-                if (col.d3.gateQ != 0) ++gated;
-                const int64_t vzTop = floorDiv(col.surfaceMm, kVoxelSizeMm) + bandVox;
-                const int64_t vzBot = floorDiv(col.surfaceMm, kVoxelSizeMm) - bandVox;
-                ColumnSample off = col;
-                off.d3 = Density3Column{}; // gateQ == 0 => D == 0 identically
-                int32_t a = static_cast<int32_t>(col.surfaceMm);
-                int32_t b = a;
-                for (int64_t vz = vzTop; vz >= vzBot; --vz) {
+                const ColumnSample col = amp.column(vx0 + i, vy0 + j);
+                const int64_t nominal = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
+                // DOWNWARD from the top of the band. On a heightfield world the
+                // first hit is the nominal top voxel, which is the point: any
+                // column whose top voxel is NOT where the heightfield puts it is
+                // being displaced by something, and that is what this counts.
+                int32_t topMm = static_cast<int32_t>((nominal + 1) * kVoxelSizeMm);
+                for (int64_t vz = nominal + bandVox; vz >= nominal - bandVox; --vz) {
                     if (Amplifier::stratigraphyAt(col, vz) != MAT_AIR) {
-                        a = static_cast<int32_t>(vz * kVoxelSizeMm + kVoxelSizeMm);
+                        topMm = static_cast<int32_t>(vz * kVoxelSizeMm + kVoxelSizeMm);
+                        if (vz != nominal) ++displaced;
                         break;
                     }
                 }
-                for (int64_t vz = vzTop; vz >= vzBot; --vz) {
-                    if (Amplifier::stratigraphyAt(off, vz) != MAT_AIR) {
-                        b = static_cast<int32_t>(vz * kVoxelSizeMm + kVoxelSizeMm);
-                        break;
-                    }
-                }
-                if (a != b) ++differ;
-                withD3[static_cast<size_t>(j * nn + i)] = a;
-                noD3[static_cast<size_t>(j * nn + i)] = b;
+                placed[static_cast<size_t>(j * nn + i)] = topMm;
             }
         }
-        const std::string p2 = std::string(out) + ".nod3";
-        for (const auto& pr : {std::pair<const char*, const std::vector<int32_t>*>{out, &withD3},
-                               std::pair<const char*, const std::vector<int32_t>*>{p2.c_str(),
-                                                                                  &noD3}}) {
-            FILE* fp = std::fopen(pr.first, "wb");
-            if (fp) {
-                std::fwrite(pr.second->data(), sizeof(int32_t), pr.second->size(), fp);
-                std::fclose(fp);
-                std::printf("dumped %lldx%lld int32 TOP SOLID VOXEL to %s\n", (long long)nn,
-                            (long long)nn, pr.first);
-            }
+        FILE* fp = std::fopen(out, "wb");
+        if (fp) {
+            std::fwrite(placed.data(), sizeof(int32_t), placed.size(), fp);
+            std::fclose(fp);
+            std::printf("\ndumped %lldx%lld int32 TOP SOLID VOXEL to %s\n", (long long)nn,
+                        (long long)nn, out);
         }
-        std::printf("  d3 slope+lithology gate open on %lld/%lld columns (%.2f%%)\n",
-                    (long long)gated, (long long)(nn * nn),
-                    100.0 * static_cast<double>(gated) / static_cast<double>(nn * nn));
-        std::printf("  top voxel MOVED by the band on %lld columns (%.2f%%)\n", (long long)differ,
-                    100.0 * static_cast<double>(differ) / static_cast<double>(nn * nn));
+        std::printf("  top voxel displaced off the height field on %lld/%lld columns (%.2f%%)"
+                    " -- expected 0 at v20\n",
+                    (long long)displaced, (long long)(nn * nn),
+                    100.0 * static_cast<double>(displaced) / static_cast<double>(nn * nn));
     }
     } // end of the legacy report
 

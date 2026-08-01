@@ -16,14 +16,19 @@ using namespace vxc;
 namespace {
 constexpr uint64_t kSeed = 20260719;
 
-// --- kWorldGenVersion 12: "the top voxel" needs a definition now -------------
+// --- "the top voxel" is arithmetic again at v20, and is still SEARCHED -------
 //
-// Up to v11 the topmost solid voxel of a column was floorDiv(surfaceMm - 50,
-// 100) BY DEFINITION -- stratigraphyAt tested `centre <= surfaceMm`, so the
-// solid set was the region under a graph and the top voxel was arithmetic.
-// With the 3D density band it is not: the test is `centre <= surfaceMm + D`
-// with |D| <= kDensity3MaxAbsMm, so the top voxel sits anywhere in
-// [nominal - kBandVox, nominal + kBandVox] and has to be FOUND.
+// Up to v11 the topmost solid voxel was floorDiv(surfaceMm - 50, 100) BY
+// DEFINITION -- stratigraphyAt tested `centre <= surfaceMm`, so the solid set
+// was the region under a graph. v12's 3D density band broke that: the test
+// became `centre <= surfaceMm + D`, so the top voxel could sit anywhere in the
+// band and had to be found. v20 removed the band, so the arithmetic answer is
+// correct once more.
+//
+// These helpers still SEARCH anyway, deliberately. Their job here is to verify
+// that the top voxel is where the height field says, and a helper that computed
+// it could not fail. Searching is what makes CHECK_EQ(displacedTop, 0) below a
+// real assertion rather than a tautology.
 //
 // Searching downward from the top of the band rather than upward from the
 // nominal voxel is deliberate: on an overhung column there are several
@@ -31,10 +36,11 @@ constexpr uint64_t kSeed = 20260719;
 // voxel" means. (The overhang DETECTION loops below run the other way, upward,
 // for the mirror-image reason -- see them.)
 //
-// Rounded UP, exactly as density3BandVoxels does: the 350 mm envelope is 3.5
-// voxels, and searching a voxel short of it would miss a displaced top voxel
-// at the wrong grid phase.
-constexpr int64_t kBandVox = (kDensity3MaxAbsMm + kVoxelSizeMm - 1) / kVoxelSizeMm;
+// FOUR VOXELS either side, which is what the removed 350 mm envelope needed.
+// At v20 nothing displaces the solid set, so one would do -- but these tests
+// exist to catch a displacement that should NOT be there, and a search sized to
+// the expected answer cannot find a surprise.
+constexpr int64_t kBandVox = 4;
 
 int64_t nominalTopVz(const ColumnSample& col) {
     return floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
@@ -44,8 +50,8 @@ int64_t topSolidVz(const ColumnSample& col) {
     const int64_t nominal = nominalTopVz(col);
     for (int64_t vz = nominal + kBandVox; vz > nominal - kBandVox; --vz)
         if (Amplifier::stratigraphyAt(col, vz) != MAT_AIR) return vz;
-    // Unreachable: D >= -kDensity3MaxAbsMm makes every voxel at or below
-    // nominal - kBandVox solid, so the loop above always returns.
+    // Unreachable: with no displacement, the voxel at `nominal` is solid by
+    // construction, so the loop above always returns before reaching here.
     return nominal - kBandVox;
 }
 } // namespace
@@ -104,27 +110,24 @@ VXC_TEST(amplifier_top_voxel_is_surface_material) {
     // visible in the output.
     SyntheticTileSampler tiles(kSeed);
     Amplifier amp(kSeed, tiles);
-    int64_t columns = 0, gated = 0, displacedTop = 0;
+    int64_t columns = 0, displacedTop = 0;
     for (int64_t x = -3000; x <= 3000; x += 271)
         for (int64_t y = -3000; y <= 3000; y += 337) {
             const ColumnSample col = amp.column(x, y);
             const int64_t topVz = topSolidVz(col);
             ++columns;
-            if (col.d3.gateQ != 0) ++gated;
             if (topVz != nominalTopVz(col)) ++displacedTop;
             CHECK(col.topsoilMm >= kVoxelSizeMm);
             CHECK_EQ(Amplifier::stratigraphyAt(col, topVz), col.surfaceMat);
         }
-    std::printf("    [amplifier] top-voxel material: %lld/%lld columns gated, %lld had their "
-                "top voxel moved by a density band; surface material intact on all %lld\n",
-                (long long)gated, (long long)columns, (long long)displacedTop,
-                (long long)columns);
-    // At v20 both counts must be ZERO: no term displaces the solid set, so no
-    // column is gated and no top voxel moves off its nominal position. This is
-    // the inverse of the guard that used to stand here, and it is a real check
-    // rather than a formality -- it fails if a displacement is reintroduced
-    // without this test being reconsidered.
-    CHECK_EQ(gated, 0);
+    std::printf("    [amplifier] top-voxel material: %lld of %lld columns had their top voxel "
+                "moved off the height field; surface material intact on all %lld\n",
+                (long long)displacedTop, (long long)columns, (long long)columns);
+    // At v20 this must be ZERO: no term displaces the solid set, so no top
+    // voxel moves off its nominal position. This is the inverse of the
+    // non-vacuity guard that used to stand here, and it is a real check rather
+    // than a formality -- it fails if a displacement is reintroduced without
+    // this test being reconsidered.
     CHECK_EQ(displacedTop, 0);
 }
 
@@ -872,7 +875,7 @@ VXC_TEST(amplifier_surface_bound_golden_digest) {
     // samples) and by the real-tile sweep in vxc_terrainprobe.
     // (was 0x5588EBCD842ECE3D at v5, 0xBD833B557B0EC0AE at v6..v11; the entries
     //  are now +350 mm rather than the +700 the first cut of v12 gave them)
-    CHECK_EQ(d.h, 0x303322BAC788FEA0ull);
+    CHECK_EQ(d.h, 0x55A0BB2E02678434ull);
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,6 +1090,6 @@ VXC_TEST(amplifier_solid_below_bound_golden_digest) {
     // work to do, since the band genuinely puts air below surfaceMm.
     // (was 0xE9D395DF74D61495 at v5, 0x6E19AE5BC47B4E45 at v6..v11; -350 mm now,
     //  not the -700 the first cut of v12 gave it)
-    CHECK_EQ(d.h, 0x9F5270A8AAB7C660ull);
+    CHECK_EQ(d.h, 0x94F4B64F8B4E95D8ull);
 }
 

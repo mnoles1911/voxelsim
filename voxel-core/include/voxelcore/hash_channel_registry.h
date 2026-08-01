@@ -3,7 +3,7 @@
 // that comment first â€” this file is the enforcement, not the explanation.
 //
 // WHY THIS CANNOT LIVE IN hash.h. hash.h is the bottom of this dependency
-// stack: caves.h, caverns.h, detail_rill.h, detail_bedding.h and density3.h
+// stack: caves.h, caverns.h, detail_rill.h and detail_bedding.h
 // all `#include "voxelcore/hash.h"`, never the other way around, so none of
 // their channel symbols (CH_CAVE_NODE, CH_CAVERN_SITE, CH_RILL, ...) can be
 // named from inside hash.h itself. The uniqueness check has to live
@@ -31,7 +31,6 @@
 
 #include "voxelcore/caverns.h"
 #include "voxelcore/caves.h"
-#include "voxelcore/density3.h"
 #include "voxelcore/detail_bedding.h"
 #include "voxelcore/detail_rill.h"
 #include "voxelcore/hash.h"
@@ -76,12 +75,12 @@ inline constexpr ChannelAlloc kChannelAllocs[] = {
     // hash.h -- v16 horizontal carrier warp, one channel per axis.
     {CH_CARRIER_WARP_X, 1, "CH_CARRIER_WARP_X"},
     {CH_CARRIER_WARP_Y, 1, "CH_CARRIER_WARP_Y"},
-    // density3.h allocates NOTHING. It held CH_POCKET = 29 for the pocket term
-    // until kWorldGenVersion 12 removed that term (density3.h section 2); 29 is
-    // free again. Everything the 3D density band hashes, it hashes through
-    // detail_bedding.h's two channels above -- which is the design, not an
-    // implementation detail: sharing the field is what puts the volumetric
-    // recesses in phase with the banding on the face.
+    // density3.h allocated NOTHING and is deleted at kWorldGenVersion 20. It
+    // held CH_POCKET = 29 for the pocket term until v12 removed that; 29, 30 and
+    // 31 are free. Everything the 3D density band hashed, it hashed through
+    // detail_bedding.h's two channels above -- deliberately, so the volumetric
+    // recesses stayed in phase with the banding on the face -- so removing the
+    // band frees no channel and leaves this table unchanged.
 };
 
 inline constexpr int kChannelAllocCount =

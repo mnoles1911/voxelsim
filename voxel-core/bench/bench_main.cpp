@@ -98,28 +98,22 @@ BenchResult run(const Options& opt) {
                     const ColumnSample& c = ext[(x + 1) + (B + 2) * (y + 1)];
                     const int64_t top =
                         floorDiv(c.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
-                    const int64_t band = density3BandVoxels(c.d3);
-                    vzMin = top - band < vzMin ? top - band : vzMin;
-                    vzMax = top + band > vzMax ? top + band : vzMax;
+                    vzMin = top < vzMin ? top : vzMin;
+                    vzMax = top > vzMax ? top : vzMax;
                 }
             const int32_t bzMin = static_cast<int32_t>(floorDiv(vzMin, B));
             const int32_t bzMax = static_cast<int32_t>(floorDiv(vzMax, B));
 
-            // Density-band census for this footprint (untimed; see BenchResult).
+            // A density-band census stood here until v20 removed the term: it
+            // counted gated columns and in-band voxels so the per-gated-voxel
+            // cost could be reported separately from the world average. That
+            // separation was the one thing that made the term's cost model
+            // legible -- for a gated per-voxel term the GATE RATE is the cost
+            // model -- and it is worth rebuilding the same way if one returns.
             for (int y = 0; y < B; ++y)
                 for (int x = 0; x < B; ++x) {
-                    const ColumnSample& c = ext[(x + 1) + (B + 2) * (y + 1)];
                     ++r.columns;
                     r.voxelsVisited += size_t(bzMax - bzMin + 1) * B;
-                    if (c.d3.gateQ == 0) continue;
-                    ++r.gatedColumns;
-                    for (int32_t bz = bzMin; bz <= bzMax; ++bz)
-                        for (int z = 0; z < B; ++z) {
-                            const int64_t centre =
-                                (int64_t(bz) * B + z) * kVoxelSizeMm + kVoxelSizeMm / 2;
-                            if (density3ColumnCanDisplace(c.d3, centre, c.surfaceMm))
-                                ++r.gatedVoxels;
-                        }
                 }
 
             for (int32_t bz = bzMin; bz <= bzMax; ++bz) {

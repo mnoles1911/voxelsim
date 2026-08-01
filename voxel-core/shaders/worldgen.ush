@@ -1108,156 +1108,13 @@ int64_t beddingMm(uint64_t seed, int64_t xMm, int64_t yMm, int64_t surfaceMm)
     return floorDiv(kBeddingAmpMm * beddingRawAt(seed, xMm, yMm, surfaceMm), kBeddingRawScale);
 }
 
-// --- bounded 3D density band (v12, voxelcore/density3.h) --------------------
-// Bit-exact mirror. Read that header for the design; what matters HERE is the
-// three things that make this mirror different from every other block in this
-// file:
-//
-//   1. IT HASHES PER VOXEL, not per column. Every other worldgen term in this
-//      file is a function of (x, y) and is evaluated once per thread; this one
-//      runs inside VoxelizeMain's z loop. That is why vxc_gpu comparing the
-//      full CELL buffer (rather than only the column buffer) is load-bearing
-//      for this change in a way it was not for the ones before it -- a column
-//      comparison cannot see this term at all.
-//
-//   2. THE CPU SIDE IS HOISTED AND THIS IS NOT. voxelcore/density3.h caches the
-//      structural-domain hash per column (Density3Column); this file recomputes
-//      it per voxel. That is DELIBERATE and it is safe for exactly one reason:
-//      hash2 is pure, so a hoisted evaluation and a fresh one are the same
-//      integer, and test_density3.cpp pins that equality directly. Mirroring the
-//      cache here would mean mirroring a per-thread object across a language
-//      boundary for no arithmetic gain.
-//
-//   3. EVERY DIVISION IS floorDiv. density3.h's own comment is explicit that a
-//      bare `/` on a negative operand is what diverged AMD vs NVIDIA once
-//      already, and the numerators here are routinely negative -- the noise is
-//      signed, the bedding value is signed, and the displacement is signed.
-static const int64_t kDensity3MaxAbsMm = 350;
-static const int64_t kDensity3BandHalfMm = 350; // forced equal to the envelope
-static const int64_t kDensity3GateQ = 4096;     // == kRillGateQ
-static const int64_t kDensity3SlopeStartMmPerM = 600;
-static const int64_t kDensity3SlopeFullMmPerM = 800;
-static const int64_t kDensity3SlopeWidthMmPerM = 200;
-static const int64_t kDensity3BandCoreMm = 200;
-static const int64_t kDensity3BandRampMm = 150;
-static const int64_t kDensity3RockSoilFullMm = 200;
-static const int64_t kDensity3RockSoilZeroMm = 800;
-static const int64_t kDensity3RockSoilWidthMm = 600;
-static const int64_t kBedding3AmpMm = 350; // the WHOLE envelope; see density3.h section 2
-static const int64_t kBedding3MaxAbsMm = 350;
-
-// The slope gate, taking a slope MAGNITUDE in mm per metre. Zero at or below
-// 60% grade, full at or above 80%, Perlin quintic between, so it is C2 at both
-// ends: a step here would be a seam following an iso-slope contour.
-int64_t density3SlopeGateQFromMag(int64_t slopeMmPerM)
-{
-    if (slopeMmPerM <= kDensity3SlopeStartMmPerM) return 0;
-    if (slopeMmPerM >= kDensity3SlopeFullMmPerM) return kDensity3GateQ;
-    const int64_t t = floorDiv((slopeMmPerM - kDensity3SlopeStartMmPerM) * kDensity3GateQ,
-                               kDensity3SlopeWidthMmPerM);
-    return rillQuinticQ(t);
-}
-
-// The lithology gate, on the column's depth of soil above rock. At v12 it gates
-// the WHOLE displacement rather than a pocket term, so a soil-mantled column is
-// skipped outright -- 45% of otherwise-qualifying columns on real tiles.
-int64_t density3RockGateQ(int64_t soilDepthMm)
-{
-    if (soilDepthMm <= kDensity3RockSoilFullMm) return kDensity3GateQ;
-    if (soilDepthMm >= kDensity3RockSoilZeroMm) return 0;
-    const int64_t t = floorDiv((soilDepthMm - kDensity3RockSoilFullMm) * kDensity3GateQ,
-                               kDensity3RockSoilWidthMm);
-    return kDensity3GateQ - rillQuinticQ(t);
-}
-
-// The two column gates, multiplied into one q12. Exactly 0 iff either is 0 and
-// exactly kDensity3GateQ iff both are open -- the exact-skip argument rests on
-// the first and the envelope bound on the second.
-int64_t density3ColumnGateQ(int64_t slopeGateQ, int64_t rockGateQ)
-{
-    return floorDiv(slopeGateQ * rockGateQ, kDensity3GateQ);
-}
-
-// The band's taper: full strength within +/-200 mm, quintic to exactly 0 at
-// +/-350 mm. Exactly zero at and beyond the band edge is what makes the skip an
-// identity rather than an approximation.
-int64_t density3BandTaperQ(int64_t zMm, int64_t surfaceMm)
-{
-    const int64_t d0 = zMm - surfaceMm;
-    const int64_t d = d0 < 0 ? -d0 : d0;
-    if (d >= kDensity3BandHalfMm) return 0;
-    if (d <= kDensity3BandCoreMm) return kDensity3GateQ;
-    const int64_t t = floorDiv((d - kDensity3BandCoreMm) * kDensity3GateQ, kDensity3BandRampMm);
-    return kDensity3GateQ - rillQuinticQ(t);
-}
-
-// Perlin's quintic on [0, T] -> [0, T] for an arbitrary domain T -- rillQuinticQ
-// generalised off its hardwired q12 domain. FACTORED for the same overflow
-// reason rillQuinticQ is: t^3 * inner never exceeds T^5, and the callers use
-// T = 700 and T = 4096, so the widest product is 1.15e18 against 9.2e18. Do not
-// expand it.
-int64_t density3QuinticOn(int64_t t, int64_t T)
-{
-    const int64_t inner = 6 * t * t - 15 * t * T + 10 * T * T;
-    return floorDiv(t * t * t * inner, T * T * T * T);
-}
-
-// The monotone odd contrast curve. This is what makes the term produce
-// overhangs at all: the bedding tent alone reaches dD/dz > 1 on 0.29% of
-// samples and yields overhangs on 0.098% of gated columns -- bounded,
-// continuous, gated and geometrically inert.
-//
-// THREE passes at v12, up from two, unrolled explicitly (density3.h
-// static_asserts that its own pass count still matches this body). Halving the
-// envelope to 350 mm cost 91% of the overhang rate at two passes, because
-// dD/dz > 1 is a threshold rather than a magnitude; the third pass buys 3.6x of
-// it back and costs retained bed contrast, 2.9:1 -> 1.7:1. A fourth would take
-// it to 1.1:1, which is a uniform corrugation with no differential weathering
-// left. It fixes 0 and both endpoints EXACTLY in integers, which is what
-// preserves the phase of the banding.
-int64_t density3SharpenMm(int64_t rMm, int64_t ampMm)
-{
-    const int64_t T = 2 * ampMm;
-    int64_t t = rMm + ampMm; // [0, T]
-    t = density3QuinticOn(t, T);
-    t = density3QuinticOn(t, T);
-    t = density3QuinticOn(t, T);
-    return t - ampMm;
-}
-
-// D's ONLY contributor: the SAME beddingRawAt the 2D banding uses -- same
-// regional strike/dip field, same 819.2 m structural lattice, same warp, same
-// bed index, same hardness -- at the full 350 mm envelope and through the
-// contrast curve. Sharing the field is the whole design: an independently
-// hashed 3D term would put the undercuts at heights unrelated to the bands on
-// the face above them.
-//
-// The pocket term that used to sit beside this one was deleted at v12. It
-// produced ZERO overhangs -- its 6400 mm z lattice made dD/dz > 1 unreachable --
-// while costing eight hash3 per voxel, which was the only reason this block
-// ever needed a hash3. See density3.h section 2.
-int64_t density3BeddingMm(uint64_t seed, int64_t xMm, int64_t yMm, int64_t zMm)
-{
-    return density3SharpenMm(
-        floorDiv(kBedding3AmpMm * beddingRawAt(seed, xMm, yMm, zMm), kBeddingRawScale),
-        kBedding3MaxAbsMm);
-}
-
-int64_t density3ScaleMm(int64_t sumMm, int64_t columnGateQ, int64_t bandTaperQ)
-{
-    return floorDiv(sumMm * columnGateQ * bandTaperQ, kDensity3GateQ * kDensity3GateQ);
-}
-
-// D itself, with the combined column gate supplied. |D| <= kDensity3MaxAbsMm
-// always.
-int64_t density3DisplacementGatedMm(uint64_t seed, int64_t xMm, int64_t yMm, int64_t zMm,
-                                    int64_t surfaceMm, int64_t columnGateQ)
-{
-    if (columnGateQ == 0) return 0;
-    const int64_t taperQ = density3BandTaperQ(zMm, surfaceMm);
-    if (taperQ == 0) return 0; // outside the band: exactly zero
-    return density3ScaleMm(density3BeddingMm(seed, xMm, yMm, zMm), columnGateQ, taperQ);
-}
+// The bounded 3D density band (v12) was mirrored here and is GONE at v20.
+// See core.h's v20 entry: it was the source of the parallel-band artifact and
+// could not produce overhangs without also striping every steep face. It was
+// the only worldgen term in this file that hashed PER VOXEL rather than per
+// column, which is why vxc_gpu compares the full CELL buffer -- keep that in
+// mind before reintroducing anything here, because a column-level comparison
+// is structurally blind to a per-voxel term.
 
 // --- biome classification (voxelcore/biome.h) -------------------------------
 // Bit-exact mirror of vxc::classifyBiome / vxc::biomeTreelineMm /
@@ -1476,10 +1333,10 @@ struct SurfaceEval
 // WHY IT IS A FUNCTION NOW. This was written out twice -- once in evalSurface and
 // once in columnCarrierSlopeMmPerM -- and the two copies were NOT the same: the
 // second did the raw 4x4 read unconditionally and so skipped the prefilter on the
-// coarse tier. That is a latent divergence in shipped v15, because the CPU's
-// density3 slope comes from evalSurface's PREFILTERED carrier while the GPU's came
-// from an unprefiltered one. vxc_gpu passes at v15 only because the slope feeds a
-// THRESHOLD (density3SlopeGateQFromMag) and no tested column sits near enough to
+// coarse tier. That was a latent divergence in shipped v15: the CPU's slope for
+// the (since-removed, v20) 3D density gate came from evalSurface's PREFILTERED
+// carrier while the GPU's came from an unprefiltered one. vxc_gpu passed at v15
+// only because the slope fed a THRESHOLD and no tested column sat near enough to
 // it for the difference to flip the gate. It surfaced the moment a v16 experiment
 // perturbed slopes by a few mm/m: cpu=2 gpu=0 on the top cells of gated columns,
 // with every column field still matching.
@@ -2021,17 +1878,6 @@ void ColumnMain(uint3 tid : SV_DispatchThreadID)
 //   idx = tid.x + tid.y * DispatchColumns.x
 
 uint cellIndexInBrick(uint x, uint y, uint z) { return x + 8u * (y + 8u * z); }
-
-// The lithology gate's argument, mirroring amplifier.cpp's soilAboveRockMm: the
-// depth of soil above rock, which under a BARE_ROCK surface is the topsoil band
-// alone, because stratigraphyAt below reads MAT_ROCK straight through the
-// subsoil there. The two must move together -- if that case ever changes, this
-// is wrong and nothing else in either file would say so.
-int64_t density3SoilAboveRockMm(GpuColumnSample col)
-{
-    if (col.surfaceMat == MAT_ROCK) return (int64_t)col.topsoilMm;
-    return (int64_t)col.topsoilMm + (int64_t)col.subsoilMm;
-}
 
 // vxc::Amplifier::stratigraphyAt bit-for-bit (the layer model, cave pass NOT
 // applied â€” materialAt below is the full function).
