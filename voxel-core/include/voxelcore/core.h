@@ -137,7 +137,37 @@ namespace vxc {
 // The relative octave weighting is untouched; the floor keeps decimetre
 // roughness alive on flats (the anti-terrace band). Scale-down only, so every
 // surface bound derived at v13 is still sound unchanged.
-inline constexpr uint32_t kWorldGenVersion = 19;
+// --- v20: the 3D density band is removed -------------------------------------
+//
+// v12's bounded 3D density band (density3.h) is no longer applied.
+// Amplifier::stratigraphyAt tests `centre <= surfaceMm` again, and
+// Amplifier::column leaves ColumnSample::d3 default-constructed.
+//
+// WHY. Measured on 2026-07-31 as the source of the parallel-band artifact this
+// project has been chasing since it started
+// (docs/measurements/placed-voxel-banding-2026-07-31.txt). The displacement
+// moved the top solid voxel on 88.61% of gated columns, and an FFT of it puts
+// 60% of the variance at 0.8-3.2 m -- detail_bedding.h's bed-thickness range.
+// It went unfound for so long because every instrument in the tree measured
+// amp.surfaceMm, and this term displaces voxel PLACEMENT off that surface by up
+// to 3.5 voxels; the fix included a new probe that reads placed voxels
+// (terrainprobe.cpp's VXC_PROBE_DUMP_VOXEL).
+//
+// AND IT COULD NOT BE TUNED. An overhang needs dD/dz > 1, which needs the bed
+// contacts sharpened, which is exactly what makes the ledges hard and parallel:
+// density3.h's own sweep gives 0.01% overhangs raw, 0.54% at two contrast
+// passes, 1.97% at three (shipped), 3.57% at four. Every setting is either
+// banded or geometrically inert. The trade it was making: an overhang on about
+// 0.13% of world columns, paid for by banding ~90% of every steep rock face.
+//
+// KEPT: the 2D bedding term (kBeddingAmpMm = 120, in evalSurface). It is part
+// of surfaceMm and was present in the clean panel of the A/B the owner
+// approved.
+//
+// Bounds are UNCHANGED at v20 and stay widened by kDensity3MaxAbsMm. That is
+// conservative, never unsound, and the tightening is a separate commit so the
+// geometry change and the bound change can be reviewed and reverted apart.
+inline constexpr uint32_t kWorldGenVersion = 20;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 

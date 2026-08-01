@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 19
+#define VXC_WORLDGEN_VERSION_USH 20
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -2036,27 +2036,23 @@ int64_t density3SoilAboveRockMm(GpuColumnSample col)
 // vxc::Amplifier::stratigraphyAt bit-for-bit (the layer model, cave pass NOT
 // applied â€” materialAt below is the full function).
 //
-// v12 GAINS THE 3D DENSITY BAND. The test was `centre <= surfaceMm`; it is now
-// `centre <= surfaceMm + D`. `columnGateQ` is this column's slope and lithology
-// gates already multiplied together, reduced ONCE per thread in VoxelizeMain
-// and passed down the z loop --
-// the same split vxc::ColumnSample::d3 makes on the CPU. They are passed rather
-// than carried on GpuColumnSample on purpose: that struct is a cross-module
-// contract (FVoxelGpuColumnSample in the UE module static_asserts its 20-byte
-// layout, and ue-project/Shaders/VoxelBandReduce.usf reads the same buffer), and
-// widening it would be a silent stride mismatch outside this repository. The
-// same reasoning caves.h's mirror records for recomputing the cave column here.
+// v20 REMOVES THE 3D DENSITY BAND. v12 made this `centre <= surfaceMm + D` and
+// took `seed`, `xMm`, `yMm` and a per-column `columnGateQ` purely to evaluate D;
+// all four are gone with it, which puts this signature back in step with the
+// CPU's `stratigraphyAt(const ColumnSample&, int64_t)`.
 //
-// D DISPLACES THE WHOLE PROFILE, not just the air test, exactly as on the CPU:
-// depthMm is measured from the displaced surface so topsoil, subsoil and the
-// bedrock boundary hang below it rather than below a ghost surface 700 mm away.
-uint stratigraphyAt(GpuColumnSample col, int64_t vz, uint64_t seed, int64_t xMm, int64_t yMm,
-                    int64_t columnGateQ)
+// The term was measured as the source of the owner's parallel-band artifact and
+// could not be softened without becoming inert -- the reasoning is in core.h's
+// v20 changelog entry and in
+// docs/measurements/placed-voxel-banding-2026-07-31.txt. Note for anyone
+// reintroducing a per-voxel displacement here: it is the one worldgen term that
+// hashes per VOXEL rather than per column, so vxc_gpu must compare the full CELL
+// buffer to see it at all. A column comparison is blind to it, which is the GPU
+// analogue of the height-field blind spot that hid this term on the CPU side.
+uint stratigraphyAt(GpuColumnSample col, int64_t vz)
 {
     const int64_t centreMm = vz * (int64_t)kVoxelSizeMm + (int64_t)kVoxelSizeMm / 2;
-    const int64_t displacementMm = density3DisplacementGatedMm(
-        seed, xMm, yMm, centreMm, (int64_t)col.surfaceMm, columnGateQ);
-    const int64_t depthMm = (int64_t)col.surfaceMm + displacementMm - centreMm;
+    const int64_t depthMm = (int64_t)col.surfaceMm - centreMm;
     if (depthMm < 0) return MAT_AIR;
     if (depthMm < (int64_t)col.topsoilMm) return col.surfaceMat;
     if (depthMm < (int64_t)col.topsoilMm + (int64_t)col.subsoilMm)
@@ -2633,10 +2629,9 @@ bool cavernCarveAt(GpuCavernColumn cv, int surfaceMm, int bedrockDepthMm, int64_
 // caverns â€” caverns ordered last purely because a cavern column is far rarer,
 // so the common case never reaches that call: cavernCarveAt's first test is
 // `count == 0`).
-uint materialAt(GpuColumnSample col, GpuCaveColumn cc, GpuCavernColumn cv, int64_t vz,
-                uint64_t seed, int64_t xMm, int64_t yMm, int64_t columnGateQ)
+uint materialAt(GpuColumnSample col, GpuCaveColumn cc, GpuCavernColumn cv, int64_t vz)
 {
-    const uint m = stratigraphyAt(col, vz, seed, xMm, yMm, columnGateQ);
+    const uint m = stratigraphyAt(col, vz);
     if (m == MAT_AIR || m == MAT_BEDROCK) return m;
     if (caveCarveAt(cc, col.surfaceMm, col.bedrockDepthMm, vz)) return MAT_AIR;
     if (cavernCarveAt(cv, col.surfaceMm, col.bedrockDepthMm, vz)) return MAT_AIR;
@@ -2680,33 +2675,18 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
     // there is no column entry to carry its surface on.
     const GpuCavernColumn cavern = cavernColumnFor(caveSeed, colVx, colVy, col.surfaceMm);
 
-    // v12 3D density band (voxelcore/density3.h): the column-invariant half,
-    // reduced once here and reused down the whole brick stack, exactly as the
-    // cave and cavern passes above are.
+    // v20: the 3D density band's per-column reduction is GONE from this kernel.
+    // It used to compute a slope gate and a lithology gate here and thread the
+    // product down the brick stack.
     //
-    // THE SLOPE IS RECOMPUTED FROM THE CARRIER, and that is the one place this
-    // kernel pays a real price for not widening GpuColumnSample. ColumnMain
-    // already computed this exact number inside evalSurface and threw it away;
-    // columnCarrierSlopeMmPerM below re-reads the 4x4 control stencil and
-    // re-evaluates the spline to get it back. It is bit-identical BY
-    // CONSTRUCTION -- it calls the very same evalCarrier and carrierSlopeMmPerM
-    // on the very same inputs -- and it is ~16 raster loads plus one spline per
-    // THREAD, not per voxel. The alternative was a 24-byte GpuColumnSample,
-    // which the UE module's FVoxelGpuColumnSample static_asserts against and
-    // ue-project/Shaders/VoxelBandReduce.usf reads with the old stride.
-    const int64_t d3xMm = colVx * (int64_t)kVoxelSizeMm;
-    const int64_t d3yMm = colVy * (int64_t)kVoxelSizeMm;
-    // The two gates multiply into one q12, exactly as Density3Column does on the
-    // CPU. Ordered cheapest-first and short-circuited: the slope gate rejects
-    // most ground before the lithology gate is looked at, and on the 25 real
-    // diffusion tiles the pair together rejects 93.5% of columns.
-    const int64_t d3SlopeGateQ =
-        density3SlopeGateQFromMag(columnCarrierSlopeMmPerM(colVx, colVy));
-    const int64_t d3GateQ =
-        d3SlopeGateQ == 0
-            ? 0
-            : density3ColumnGateQ(d3SlopeGateQ,
-                                  density3RockGateQ(density3SoilAboveRockMm(col)));
+    // WORTH KNOWING WHAT THAT COST, because it is reclaimed and because it was
+    // the one place this kernel paid a real price for not widening
+    // GpuColumnSample: the gate needed the carrier's analytic slope, which
+    // ColumnMain had already computed inside evalSurface and thrown away, so
+    // columnCarrierSlopeMmPerM re-read the 4x4 control stencil and re-evaluated
+    // the spline to get it back -- ~16 raster loads plus one spline per THREAD.
+    // That whole recomputation is now dead, along with the per-voxel hashing the
+    // gate was protecting.
 
     for (uint bz = 0; bz < BricksZ; ++bz)
     {
@@ -2720,7 +2700,7 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
             const int64_t vz = coarseRep(brickZ * (int64_t)8 + (int64_t)z, CoarseScale);
             // lint-shader-ub: allow UNGUARDED_WRITE - index is bounded by construction: the entry guard caps tid below DispatchColumns, so footprintIndex < bricksX*bricksY and brickIndex < bricksX*bricksY*BricksZ, while lx/ly/z are all < 8; the host sizes OutCells to exactly bricksX*bricksY*BricksZ*512 (contract mirrored in gpu_harness.cpp, asserted there)
             OutCells[brickIndex * 512u + cellIndexInBrick(lx, ly, z)] =
-                materialAt(col, cave, cavern, vz, caveSeed, d3xMm, d3yMm, d3GateQ);
+                materialAt(col, cave, cavern, vz);
         }
     }
 }

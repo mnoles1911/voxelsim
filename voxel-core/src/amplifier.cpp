@@ -2223,23 +2223,43 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
                                          col.surfaceMm, slopeMmPerM);
     col.surfaceMat = biomeSurfaceMaterial(biome, col.surfaceMm);
 
-    // Phase 4 bounded 3D density (voxelcore/density3.h), reduced once per column
-    // exactly as the cave and cavern passes are, and for the same reason: the
-    // per-voxel test is a static function of (ColumnSample, vz).
+    // THE 3D DENSITY BAND IS NOT BUILT (worldgen v20). `col.d3` is left
+    // default-constructed, so gateQ == 0 and density3ColumnDisplacementMm
+    // returns exactly 0 on every voxel of every column -- see density3.h
+    // section 0 for why that is bit-exact and not an approximation.
     //
-    // ORDERED AFTER surfaceMat BECAUSE IT READS IT. The lithology gate's
-    // argument is the depth of soil above rock, and which of the two soil bands
-    // count is decided by the surface material -- see coupling (14).
+    // WHY, in one line: the term was measured on 2026-07-31 to be the source of
+    // the parallel-band artifact the owner has rejected since this project
+    // started (docs/measurements/placed-voxel-banding-2026-07-31.txt). Its
+    // displacement moved the top solid voxel on 88.61% of gated columns, and an
+    // FFT of that displacement puts 60% of its variance at 0.8-3.2 m, which is
+    // detail_bedding.h's bed-thickness range verbatim.
     //
-    // COST ON A COLUMN THAT DOES NOT QUALIFY: two compares and two divides, and
-    // density3ColumnFor returns a zeroed struct having computed no hash at all.
-    // On the 25 real diffusion tiles that is 93.5% of columns -- 88% rejected by
-    // the slope gate and the rest by the lithology gate. The qualifying 6.5% pay
-    // exactly one hash2, the structural domain. The slope fed in is the
-    // CARRIER's analytic gradient magnitude, the same scalar slopeScaleQ10 and
-    // classifyBiome already take -- density3.h's "primary form" exists precisely
-    // so this needs no gradient vector and SurfaceEval needs no new field.
-    col.d3 = density3ColumnFor(seed_, xMmC, yMmC, slopeMmPerM, soilAboveRockMm(col));
+    // AND IT COULD NOT BE TUNED OUT, which is the part worth recording so nobody
+    // re-derives it. An overhang needs dD/dz > 1, and density3.h's own sweep
+    // shows the rate is monotone in the contrast curve: 0.01% raw, 0.54% at two
+    // passes, 1.97% at three (shipped), 3.57% at four. Sharpening the bed
+    // contacts is EXACTLY what turns a soft corrugation into the hard parallel
+    // ledges the owner sees -- the header says so itself ("it turns a sine-ish
+    // corrugation into a stack of ledges"). Amplitude is trapped the same way:
+    // halving the envelope 700 -> 350 collapsed the overhang rate by 91%. Every
+    // setting of this term is either banded or geometrically inert, so the
+    // choice was to keep it or delete it, not to soften it.
+    //
+    // WHAT IT BOUGHT, for the trade to be on the record: 1.97% of gated columns
+    // x a 6.52% world gate rate = an overhang on about 0.13% of world columns,
+    // paid for by banding ~90% of every steep bare-rock face.
+    //
+    // THE 2D BEDDING TERM STAYS (kBeddingAmpMm = 120, applied in evalSurface).
+    // It is in surfaceMm, so it was present in BOTH panels of the A/B the owner
+    // approved -- the clean panel already contains it. That is evidence, not a
+    // judgement call, and it is the first thing to re-examine if any residual
+    // banding survives this change.
+    //
+    // The density3.h machinery, ColumnSample::d3, the bound widening and the
+    // worldgen.ush mirror are unwound in the follow-up commit; this one only
+    // stops the term from displacing anything, so that the geometry change is
+    // reviewable on its own and every surface bound stays conservatively wide.
 
     // M4 cave pass (voxelcore/caves.h): reduce the jittered lattice tunnel
     // network to the tube axes that pass near this column. Depends only on
@@ -2299,30 +2319,22 @@ const ColumnSample& Amplifier::columnCached(int64_t vx, int64_t vy) const {
 
 MaterialId Amplifier::stratigraphyAt(const ColumnSample& col, int64_t vz) {
     const int64_t centreMm = vz * kVoxelSizeMm + kVoxelSizeMm / 2;
-    // THE ONE LINE THAT MAKES THIS NOT A HEIGHTFIELD (kWorldGenVersion 12).
-    // The test was `centre <= surfaceMm`; it is now `centre <= surfaceMm + D`,
-    // with |D| <= kDensity3MaxAbsMm from voxelcore/density3.h. Because D is a
-    // function of z, the solid set is no longer the region under a graph, and a
-    // column can read air-then-solid going up -- an overhang.
+    // THIS IS A HEIGHTFIELD TEST AGAIN (worldgen v20). v12 made it
+    // `centre <= surfaceMm + D` with |D| <= kDensity3MaxAbsMm, so that a column
+    // could read air-then-solid going up and express an overhang. v20 removes D:
+    // it was measured to be the source of the parallel-band artifact, and it
+    // could not produce overhangs without producing them (see the long note at
+    // the density3ColumnFor site in Amplifier::column, and
+    // docs/measurements/placed-voxel-banding-2026-07-31.txt).
     //
-    // D DISPLACES THE WHOLE PROFILE, not just the air test. depthMm is measured
-    // from the displaced surface, so topsoil, subsoil and the rock/bedrock
-    // boundary all hang below the displaced surface rather than below a ghost
-    // one 700 mm away. The alternative -- move the air boundary and leave the
-    // layers where they were -- would put an undercut nose made of BEDROCK on a
-    // cliff whose bedrock top is 200 m down, and would break stratigraphy's own
-    // depth ordering (the surface material reappearing below the top layer),
-    // which the MAT_ROCK case below already exists to protect.
-    //
-    // COST: on a column whose slope gate is closed (~93% of them, and the whole
-    // reason this is affordable) density3ColumnDisplacementMm is one compare
-    // against a zeroed field. Inside a qualifying column it is one more compare
-    // per voxel outside the +/-700 mm band, and only inside the band does it
-    // hash. Nothing here is approximate -- see density3.h section 0 for why both
-    // skips return the identical answer rather than a close one.
-    const int64_t displacementMm =
-        density3ColumnDisplacementMm(col.d3, centreMm, col.surfaceMm);
-    const int64_t depthMm = static_cast<int64_t>(col.surfaceMm) + displacementMm - centreMm;
+    // The solid set is once again the region under a graph. Anything that wants
+    // to reintroduce overhangs has to add a displacement here, and the thing to
+    // read first is why THIS one failed: a regional stratigraphic field is
+    // coherent over 819.2 m and periodic at 0.8-3.2 m, so it cannot cut a face
+    // without also striping it. The plan's deferred bank-undercut term is
+    // sparse, aperiodic and driven by the bake's flow plane, which is the shape
+    // that does not have this failure mode.
+    const int64_t depthMm = static_cast<int64_t>(col.surfaceMm) - centreMm;
     if (depthMm < 0) return MAT_AIR;
     if (depthMm < col.topsoilMm) return col.surfaceMat;
     if (depthMm < col.topsoilMm + col.subsoilMm) {
