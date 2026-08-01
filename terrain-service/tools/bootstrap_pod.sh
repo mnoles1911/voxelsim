@@ -173,7 +173,24 @@ if have deps; then
   ok "already installed (rm $STAMPS/deps to force)"
 else
   python3 -m pip install --no-input --upgrade pip >/dev/null || true
-  python3 -m pip install --no-input "${DEPS[@]}" \
+  # --ignore-installed is NOT optional on a Debian/Ubuntu system python.
+  #
+  # Ubuntu ships some of these (blinker, and whatever else the base image's
+  # apt layer pulled in) into /usr/lib/python3/dist-packages WITHOUT the
+  # .dist-info RECORD file pip needs to uninstall a package. When pip decides
+  # it must upgrade one, it aborts the WHOLE transaction with
+  #     Cannot uninstall blinker 1.7.0, RECORD file not found.
+  #     Hint: The package was installed by debian.
+  # after having already downloaded everything -- which is how this failed on
+  # 2026-08-01, ~10 minutes and 2.5 GB in.
+  #
+  # --ignore-installed sidesteps it by installing fresh copies into
+  # /usr/local/lib/python3.*/dist-packages, which precedes dist-packages on
+  # sys.path, instead of trying to remove the apt-owned ones. It costs a few
+  # redundant downloads and is immune to whichever packages the next base
+  # image happens to apt-install. Targeting the one offending package by name
+  # would just move the failure to the next image.
+  python3 -m pip install --no-input --ignore-installed "${DEPS[@]}" \
     || die "dependency install failed. Re-run this script; it resumes here.
     If one package is the problem, install it alone to see the real error."
   mark deps
