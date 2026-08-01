@@ -167,7 +167,31 @@ namespace vxc {
 // Bounds are UNCHANGED at v20 and stay widened by kDensity3MaxAbsMm. That is
 // conservative, never unsound, and the tightening is a separate commit so the
 // geometry change and the bound change can be reviewed and reverted apart.
-inline constexpr uint32_t kWorldGenVersion = 20;
+// --- v21: the micro gradient cap comes down, 1.5 -> 1.2 ---------------------
+//
+// One constant, kMicroGradCapKQ10 in amplifier.cpp, where the derivation and
+// both sweeps live. Summary of why it moved:
+//
+// v19 raised the micro pool's cap above 1.0 to break voxel-quantisation bands,
+// and chose 1.5 over 1.2 while the owner's rejected banding was still
+// unexplained -- so band width was being bought at whatever drainage it cost.
+// v20 identified that banding as the 3D density band, which no setting of this
+// constant could ever have affected. With the confound gone the trade is
+// honest, and a fresh sweep says 1.5 was paying too much:
+//
+//     k=0.5    1 sink    0.4% stranded      k=1.2    9 sinks   1.2% stranded
+//     k=1.0    5 sinks   0.4% stranded      k=1.5   17 sinks   3.5% stranded
+//
+// 1.2 halves the sinks and cuts stranded area threefold against 1.5, for a band
+// width of 0.20 m against 0.10 -- nine times better than the 1.82 m an uncapped
+// micro pool leaves on that ground. The measurement also killed the idea of
+// reverting to v14's 0.5: the drainage knee is at 1.0, and below it there is no
+// stranding left to recover.
+//
+// THIS IS THE ONLY SURVIVING v19 CLIENT CHANGE. Its other two -- the meso
+// octaves and the second carrier-warp component -- were already withdrawn when
+// the meso band moved into the bake as B4.
+inline constexpr uint32_t kWorldGenVersion = 21;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 

@@ -1089,18 +1089,37 @@ constexpr int64_t kFineDetailGradFloorMmPerM = 50;
 // stream. So the ROUTING pool keeps k=0.5 unchanged and only the MICRO pool --
 // the 400/200 mm octaves, which carry no routing -- is allowed past 1.0.
 // Drainage is measured after this change, never assumed; see the doc.
-// The derivation above says 2.0. MEASUREMENT says 1.5 buys the same picture for a
-// third of the cost, because that derivation is a worst case over a single
-// sinusoid while the micro band is stochastic -- its peaks exceed the nominal
-// gradient often enough to break bands below the deterministic threshold. Swept
-// at the g35 repro site, amplified drainage against observed band width on 3-8%
-// ground, where bands are widest and the law predicts 1.82 m:
+// The derivation above says 2.0. MEASUREMENT says less, because that derivation
+// is a worst case over a single sinusoid while the micro band is stochastic --
+// its peaks exceed the nominal gradient often enough to break bands below the
+// deterministic threshold. Swept at the g35 repro site on 3-8% ground, where
+// bands are widest and the law predicts 1.82 m:
 //     k=1.2    7 sinks   8.30% stranded   0.20 m
-//     k=1.5   11 sinks   8.46% stranded   0.10 m   <-- chosen
+//     k=1.5   11 sinks   8.46% stranded   0.10 m
 //     k=2.0   32 sinks  26.67% stranded   0.10 m
-// 2.0 buys nothing over 1.5 on band width and triples the stranding, so the knee
-// is real and 1.5 sits on it.
-constexpr int64_t kMicroGradCapKQ10 = 1536;  // 1.5 x carrier gradient
+// v19 read that as "2.0 buys nothing over 1.5 and triples the stranding" and
+// shipped 1.5.
+//
+// BACKED DOWN TO 1.2 AT v21, and the reason is worth more than the number.
+// v19 chose 1.5 while the owner's rejected banding was still unexplained, so
+// band width was being bought at any drainage price it cost -- and the banding
+// turned out to be the 3D density band (core.h's v20 entry), which no setting of
+// this constant could ever have touched. With that confound removed the two
+// columns can finally be traded against each other honestly.
+//
+// Re-swept 2026-08-01 at the same site, DRAINAGE ON THE AMPLIFIED SURFACE
+// (carrier control: 0 sinks, 0.0% stranded):
+//     k=0.5    1 sink    0.4% stranded
+//     k=1.0    5 sinks   0.4% stranded
+//     k=1.2    9 sinks   1.2% stranded   <-- chosen
+//     k=1.5   17 sinks   3.5% stranded
+// The drainage knee is at 1.0, not at 0.5: going below 1.0 buys four sinks and
+// NO stranding improvement, so v14's factor-of-four margin was never paying for
+// itself. 1.2 halves the sinks and cuts stranded area threefold against 1.5,
+// for a band width of 0.20 m against 0.10 -- still nine times better than the
+// 1.82 m an uncapped micro pool leaves on that ground. It is also the value the
+// owner approved when this was first raised.
+constexpr int64_t kMicroGradCapKQ10 = 1229;  // 1.2 x carrier gradient
 static_assert(kMicroGradCapKQ10 > 1024,
               "at or below 1.0 the micro pool cannot disturb a quantisation band at ANY "
               "slope -- the gradient required scales with the carrier's, which is exactly "

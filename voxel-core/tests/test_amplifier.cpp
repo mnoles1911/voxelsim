@@ -214,7 +214,7 @@ VXC_TEST(amplifier_golden_digest) {
     // the rework had not taken effect.
     // (was 0xA29A7A767DC1543B at v5, 0x81785278E4DFCF67 at v3/v4,
     //  0x73B43CAE621CA286 at v2)
-    CHECK_EQ(d.h, 0xD608AC2286642274ull);
+    CHECK_EQ(d.h, 0xAC6FD6D20F90BE27ull);
 }
 
 // --- C4: the cavern pass is actually wired into the amplifier ---------------
@@ -417,7 +417,7 @@ VXC_TEST(amplifier_deep_column_golden_digest) {
     // (was 0xF88B88DB9D9341AA at v5, 0x3384824A6CF22450 at v6..v11; and
     //  0xB125856533E5C174 at the 700 mm cut of v12, which was measured and
     //  rejected before it shipped -- see the Wave C retry notes)
-    CHECK_EQ(d.h, 0xB030A0DA16D91779ull);
+    CHECK_EQ(d.h, 0x1ABFCEDC951C6741ull);
 }
 
 VXC_TEST(generated_brick_matches_pointwise_queries) {

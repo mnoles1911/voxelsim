@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 20
+#define VXC_WORLDGEN_VERSION_USH 21
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -285,7 +285,7 @@ static const int64_t kDetailGradCapKQ10 = 512;
 // v19 MIRROR: amplifier.cpp kMicroGradCapKQ10 / kMicroGradFloorMmPerM. The micro
 // pool's cap is deliberately ABOVE 1.0 -- it is the only band that can disturb a
 // voxel quantisation band, and doing so requires twice the carrier gradient.
-static const int64_t kMicroGradCapKQ10 = 1536;
+static const int64_t kMicroGradCapKQ10 = 1229; // v21: 1.5 -> 1.2, see amplifier.cpp
 static const int64_t kMicroGradFloorMmPerM = 200;
 // v15. kRillMaxAbsMm * 1000 / kRillAcrossMm = 300 * 1000 / 1600, static_asserted
 // == 187 on the CPU side BECAUSE it is a literal here. Do not fold this into an

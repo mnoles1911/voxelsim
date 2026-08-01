@@ -226,7 +226,7 @@ VXC_TEST(coarsegen_golden_digest) {
     // wired in per-brick or per-dispatch rather than per world coordinate.
     // (was 0x85B3E79EF8D01AFC at v5, 0xFCE6D8509799236D at v6..v11, and
     //  0xB812048EB08AA281 at the 700 mm cut of v12)
-    CHECK_EQ(d, 0x946C76FAEA15DBAFull);
+    CHECK_EQ(d, 0x4954D7436976D9B1ull);
 }
 
 VXC_TEST(coarsegen_seed_sensitivity) {
