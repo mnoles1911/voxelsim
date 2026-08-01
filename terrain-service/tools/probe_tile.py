@@ -67,14 +67,33 @@ def main() -> int:
             return 3
 
     from terrain_service.providers.diffusion import (
+        ConditioningDataMissing,
         DiffusionConfig,
         DiffusionProvider,
         ModelOutputMismatch,
+        compute_conditioning_digest,
+        resolve_conditioning_root,
         validate_model_output,
     )
 
+    # Hash the conditioning rasters this box actually has. Without this the
+    # digest defaults to UNVERIFIED and verify_conditioning_digest refuses to
+    # run inference at all -- which is what silently broke pod bring-up when
+    # identity schema v2 added the gate: pregen_at.py and scan_land.py were
+    # updated to compute it, probe_tile.py was missed, and the failure
+    # surfaced two steps later as a misleading "WorldClim did not land".
+    try:
+        digest = compute_conditioning_digest()
+    except ConditioningDataMissing as e:
+        print(f"ERROR: {e}")
+        print(f"Run from the directory containing {resolve_conditioning_root()}, "
+              f"and build ETOPO first:")
+        print("  python tools/fetch_etopo.py")
+        return 2
+
     config = DiffusionConfig(checkpoint_id=checkpoint_dir,
-                             checkpoint_sha256=checkpoint_sha256)
+                             checkpoint_sha256=checkpoint_sha256,
+                             conditioning_digest=digest)
     print("provider_id:", config.provider_id())
 
     provider = DiffusionProvider(config=config)

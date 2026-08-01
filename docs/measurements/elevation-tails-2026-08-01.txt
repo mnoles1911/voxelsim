@@ -1,0 +1,93 @@
+Wave 2b -- elevation tails: the stated diagnosis was WRONG
+==========================================================
+2026-08-01
+
+THE CLAIM BEING TESTED
+----------------------
+docs/worldgen-variety-plan.md, Wave 2b: "the model compresses the tails, not
+the sketch. The cached table implies 22.6% of land above 1000 m; delivered is
+1.4%. Likely mechanism: sqrt(5814) = 76.2 normalises to +2.87 sigma, well
+outside training, so the denoiser regresses to the mean."
+
+MEASURED: THE MODEL OBEYS THE TABLE
+------------------------------------
+Coarse stage only, 64x64 coarse cells (492 km per side), seed 20260719,
+orographic on, power 2.0. "TABLE asks" is the fraction of above-sea-level
+quantile KNOTS above 1000 m -- granular at 1/64, so read it as a proxy, not a
+precise figure. "MODEL delivers" is measured on coarse output.
+
+ gain  snr0 |             TABLE asks |                    MODEL delivers
+            |    %>1km         max m |  land%   %>1km   %>2km     p50     p95     max      min
+ 1.00  0.30 |   22.22%         5814 |  40.6%  24.31%   5.29%     417    2025    4799    -6341
+ 1.30  0.30 |   25.93%         7558 |  40.6%  25.84%   6.91%     428    2219    6578    -6337
+ 1.60  0.30 |   25.93%         9303 |  40.5%  27.05%   8.07%     445    2406    7465    -6334
+ 2.00  0.30 |   25.93%        11628 |  40.5%  28.63%   9.34%     470    2665    8144    -6330
+ 1.60  0.15 |   25.93%         9303 |  37.7%  24.87%   7.97%     467    2410    7850    -7104
+
+At gain 1.0 the table asks for 22.2% of land above 1000 m and the model
+delivers 24.31% -- it slightly OVER-delivers. There is no tail compression to
+fix. The world already spans -6341 m to +4799 m at the coarse tier.
+
+WHERE THE "1.4%" CAME FROM -- A CONFLATION
+-------------------------------------------
+The 1.4% figure is real and correctly computed. It is from the plan's own
+relief measurement: "Local relief per 2 km window on land: p50 394 m, 96.6%
+above 100 m, 1.4% above 1000 m."
+
+That is RELIEF WITHIN A 2 km WINDOW. The 22.6% is ELEVATION ABOVE 1000 m.
+Different quantities, different units of meaning; comparing them produced a
+compression that does not exist. The plan then built Wave 2b on it.
+
+This is the fourth time in this project a metric that was real, correctly
+computed, and measuring the wrong quantity has driven a decision. See
+voxelsim-banding-3d-density-blindspot for the worst case.
+
+WHAT IS ACTUALLY WRONG IS THE 2 km RELIEF, AND THIS LEVER DOES NOT FIX IT
+-------------------------------------------------------------------------
+Short-range dissection is produced by the latent + decoder stages and the
+bake, not by the coarse elevation marginal. Stretching the quantile table
+raises PEAKS; it does not carve valleys between them. Wave 3 (coarse shaping
+octaves) and Wave 4 (province-varying erosion) are the levers that touch
+relief. Do not expect this one to move it, and do not re-run this measurement
+expecting it to.
+
+COND_SNR DOES NOT HELP, AND ITS DOC WAS BACKWARDS
+--------------------------------------------------
+world_pipeline.py:985,942:  t = atan(cond_snr);
+                            cond = cos(t)*sketch + sin(t)*noise
+So snr -> 0 is PURE SKETCH. LOWER IS TIGHTER. worldgen-levers.md:108 said the
+opposite ("Elevation at 0.3 is loose... Raise it if hand-drawn coastlines are
+being ignored") and has been corrected.
+
+Tightening it does NOT increase relief -- the opposite. At gain 1.6, dropping
+cond_snr[0] from 0.30 to 0.15 took land above 1 km from 27.05% to 24.87% and
+land fraction from 40.5% to 37.7%. Tighter obedience to the sketch means less
+model-added structure. Shipping keeps 0.30.
+
+WHAT SHIPS, AND WHY
+-------------------
+elev_gain = 1.6, elev_gain_power = 2.0.
+
+  v' = v + (gain-1) * vmax * (v/vmax)^power,  applied to knots above v=0 only.
+
+Identity at v=0, so sea level and every coastline are untouched. Strictly
+increasing for gain > 1, power >= 1, so the table stays monotone (np.interp
+requires it). power > 1 concentrates the gain in the upper tail: mid
+elevations barely move while high ground grows a lot, which is "extreme
+terrain becomes more common" rather than "everything gets taller".
+
+1.6 over 2.0: at 2.0 the table asks for 11628 m and the model returns 8144 m,
+so it is visibly clipping -- we would be paying in out-of-distribution
+conditioning for relief the model declines to deliver. 1.6 asks 9303 and gets
+7465, a much smaller gap.
+
+Note the coarse tier is a 7.68 km cell MEAN. In-game peaks sit above these
+numbers once the fine tier and bake add relief on top, so 7465 m here is
+Everest-class terrain in the world, not a 7465 m summit.
+
+STILL UNKNOWN
+-------------
+Whether the stretch survives the latent + decoder stages, which were NOT run
+here (they need a GPU; this box is CPU-only torch on an AMD card). The coarse
+sketch only weakly steers them. The 2 km-relief statistic on delivered tiles
+is the measurement that would settle it, and it needs pod time.

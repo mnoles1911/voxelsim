@@ -1,0 +1,115 @@
+Wave 1a -- synthetic_map_stats.json rebuilt from real WorldClim
+================================================================
+2026-08-01
+
+WHAT WAS WRONG
+--------------
+D:\terrain-diffusion\_prep_stats.py records that WorldClim was unreachable when
+the conditioning statistics were built, and that hand-written latitude formulas
+were substituted for bio_1/4/12/15. The real WorldClim 2.1 10-arc-minute
+rasters were present in data/global (dated 2019) and unused.
+
+_load_stats_cache (synthetic_map.py:134-157) returns that file whenever it
+exists. It is keyed on NOTHING -- make_synthetic_map_factory (:185-188) passes
+frequency_mult and drop_water_pct only on a cache MISS, so on every real run
+the shipped tables were consumed and the configured parameters were ignored.
+
+Confirmed consumed, not inert: the cache file uses key names
+(data_quantile_tables / noise_quantile_tables) that differ from the names
+_compute_map_stats returns (base_image_quantiles_N / noise_quantiles_N). The
+loader contains a translation layer, prints "Synthetic map stats cache hit.",
+and returns 14 keys with both required names present.
+
+REBUILD
+-------
+Params: frequency_mult = [1.5, 3.0, 3.0, 3.0, 3.0], drop_water_pct = 0.5
+(SyntheticMapConfig defaults, diffusion.py:350,357).
+Interpreter: D:\terrain-diffusion\.venv (the system python lacks rasterio).
+STATS_CACHE_PATH is CWD-relative, so this must run from D:\terrain-diffusion.
+
+channel        source        min         p5        p25        p50        p75        p95        max
+----------------------------------------------------------------------------------------------------
+elevation      fake      -8713.8    -5458.3    -4371.0    -1967.8      305.1     1419.6     5814.1
+elevation      REAL      -8713.8    -5458.3    -4371.0    -1967.8      305.1     1419.6     5814.1
+
+temperature    fake        -11.1       -5.2        3.5       13.7       22.3       28.1       47.7
+temperature    REAL         -7.5       -0.1       10.0       22.3       26.8       30.0       35.6
+
+temp_std       fake       -226.7      -99.1      -40.0        0.4       40.5       97.7      215.0
+temp_std       REAL      -1189.5     -440.7     -209.2       -0.7      203.2      448.1      757.6
+
+precipitation  fake        180.6      320.3      482.8      769.9      924.0     2260.5     2525.4
+precipitation  REAL          0.0       39.0      295.8      588.0     1147.2     2421.6     6444.7
+
+precip_std     fake         25.9       39.3       48.2       56.7       65.1       74.1       87.3
+precip_std     REAL          0.0       17.6       36.6       60.6       91.6      126.6      199.4
+
+a_temp_std   fake -26.766568  REAL -34.755221
+b_temp_std   fake 915.667095  REAL 1189.496463
+temp_std_p1  fake -188.603    REAL -900.943
+temp_std_p99 fake  181.760    REAL  630.015
+
+Backup of the fake file (13,058 B, sha256 a1d3a1ab...837d6af0) is in the
+session scratchpad as synthetic_map_stats-FAKE-backup.json.
+
+THREE FINDINGS
+--------------
+1. ELEVATION IS BYTE-IDENTICAL fake vs real. It came from etopo_10m.tif, a
+   real raster, all along -- _prep_stats.py only faked the four bio channels.
+   This MATTERS for Wave 2b: the plan's finding that "the cached table implies
+   22.6% of land above 1000 m while delivered is 1.4%, so the coarse model is
+   compressing the tails" is UNAFFECTED by this fix. Do not expect Wave 1a to
+   move relief. It cannot; the elevation table did not change.
+
+2. PRECIPITATION IS THE FIX. IQR 441 -> 851 mm, p5 320 -> 39 mm, max
+   2525 -> 6445 mm. The predicted p25/p50/p75 (296/588/1148) matched the
+   measured (295.8/588.0/1147.2) to the decimal. This is the direct cause of
+   the isohyetal world -- precipitation spanned 7.8% of its encodable range
+   over land while temperature spanned 43.9%, collapsing every biome decision
+   onto temperature and elevation.
+
+3. TEMPERATURE NARROWS, and this was not predicted. Span 58.8 -> 43.1 C
+   (fake -11.1..47.7, real -7.5..35.6). The real table is sea-level-EQUIVALENT
+   temperature: _compute_map_stats:83-84 adds the lapse rate back out before
+   building quantiles, and the crop is +/-60 deg latitude, so -7.5 C as a
+   minimum is plausible. High terrain still gets cold because
+   finalize_synthetic_map re-applies the lapse rate at :239-240, so
+   TUNDRA_ALPINE and BARE_ROCK are unaffected. The cold END of the SEA-LEVEL
+   ladder loses range -- expect less lowland TAIGA.
+
+   Net: widening precipitation while narrowing temperature is what makes the
+   climate genuinely two-dimensional, which was the goal. But it is a
+   trade, not a pure win, and the biome census in Wave 1c should be read with
+   that in mind.
+
+WAVE 2a IS CONFIRMED, NOT FIXED, BY THIS
+-----------------------------------------
+temp_std holds bio_4 RESIDUALS (a linear fit a*temp+b is subtracted at :81 and
+added back on reconstruction). With the real fit, at bio_1 = 18 C the base is
+-34.755*18 + 1189.50 = 563.9. Adding the p95 residual (448.1) reaches ~1012;
+adding the MAXIMUM residual (757.6) reaches ~1321. kBiomeSeasonalHighU8
+requires 1500. SAVANNA remains unreachable after the rebuild, as predicted.
+The threshold itself has to move.
+
+IDENTITY
+--------
+synthetic_map_stats.json added to DEFAULT_CONDITIONING_FILES
+(diffusion.py:422-428). It is derived from the five rasters already in the
+list, which would normally make hashing it redundant. It is not, for two
+measured reasons recorded in the comment there: the cache is keyed on nothing
+so it can silently disagree with the config it is used under, and the shipped
+copy was built from fake climate under a byte-identical set of input rasters.
+It is also gitignored and untracked in the terrain-diffusion repo.
+
+conditioning digest, root D:\terrain-diffusion\data\global:
+  OLD (5 files) 1b8235d215fed3664a397f191212cf22c3b444ff7a7f86f54988f2741ccfaed4
+  NEW (6 files) c49e052e75da7a3cd8cb61742df9df86553c117d42e2f61730cf7a0ec64e48d2
+
+This rolls provider_id. Nothing breaks today: provider_id is DERIVED, the
+existing 25 coarse tiles remain in the old namespace directory, and
+DefaultGame.ini still points there. DefaultTileDir / DefaultFineTileDir /
+DefaultFineTileProviderId are deliberately NOT repointed until a GPU pod run
+fills the new namespace -- repointing now would name an empty directory and
+fall back to the synthetic sampler.
+
+terrain-service/tests/test_diffusion.py: 57 passed.

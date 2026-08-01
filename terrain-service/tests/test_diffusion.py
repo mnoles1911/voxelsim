@@ -917,6 +917,26 @@ def test_world_shape_defaults_are_pinned():
         "coarse_pooling": 1,
         "elev_coarse_pool_mode": "avg",
         "p5_coarse_pool_mode": "avg",
+        # NOT an upstream default. `orographic` is OURS: upstream's parameter
+        # defaults to None (no coupling), and we deliberately turn it on. It is
+        # pinned here for the same reason as the rest -- so the world can only
+        # change on purpose -- but do NOT "fix" it by diffing against upstream
+        # when bumping terrain_diffusion_version. Setting orographic_enabled
+        # False restores upstream's exact behaviour.
+        "orographic": {
+            "wind_from_deg": 270.0,
+            "probe_wavelengths": [0.15, 0.30, 0.60, 1.20],
+            "barrier_m": 1200.0,
+            "upslope_m": 600.0,
+            "shadow_strength": 0.75,
+            "enhance_strength": 0.60,
+            "sea_blend_m": 200.0,
+        },
+        # Also OURS, not upstream: upstream defaults elev_gain to 1.0 (the
+        # untouched Earth marginal). 1.6 is measured -- see the table in
+        # WorldShapeConfig and docs/measurements/elevation-tails-2026-08-01.txt.
+        "elev_gain": 1.6,
+        "elev_gain_power": 2.0,
     }
     # Lists, not tuples: upstream indexes and slices these.
     assert isinstance(kw["frequency_mult"], list)

@@ -100,14 +100,46 @@ ok "GPU present, ${avail_gb} GB free on $WORK"
 # 2. terrain-diffusion source
 # ---------------------------------------------------------------------------
 say "2/8 terrain-diffusion source"
+# PINNED, not --depth 1 of whatever main happens to be. Two reasons:
+#   * the patch below applies to exactly this tree, and a moved upstream would
+#     make it fail (loudly now -- see the die) or, worse, apply with fuzz;
+#   * "the world depends on an unpinned third-party HEAD" is the same class of
+#     bug the conditioning digest exists to prevent.
+# Bump both the SHA and the patch together, never one alone.
+TD_COMMIT="82a0431"
+TD_PATCH="$TS_DIR/patches/terrain-diffusion-worldgen.patch"
+
 if have clone && [ -d "$TD_DIR/terrain_diffusion" ]; then
   ok "already cloned at $TD_DIR"
 else
   rm -rf "$TD_DIR"
-  git clone --depth 1 https://github.com/xandergos/terrain-diffusion "$TD_DIR" \
+  git clone https://github.com/xandergos/terrain-diffusion "$TD_DIR" \
     || die "clone of terrain-diffusion failed (network?)."
+  git -C "$TD_DIR" checkout --quiet "$TD_COMMIT" \
+    || die "terrain-diffusion has no commit $TD_COMMIT -- upstream rewrote
+    history, or the pin is wrong. Do not proceed on whatever main is now:
+    the worldgen patch was written against $TD_COMMIT."
+
+  # OUR worldgen changes: the orographic rain shadow and the elevation tail
+  # stretch. They live here rather than in a fork because voxelsim is the repo
+  # that owns the decision; the fork would be one more thing to keep in sync.
+  #
+  # THIS MUST NOT BE SKIPPED SILENTLY. Upstream's WorldPipeline.__init__ ends
+  # in **deprecated_kwargs, which reads only histogram_raw -- so if the patch
+  # is absent, `orographic=` and `elev_gain=` are ACCEPTED AND DISCARDED. The
+  # pod would generate a world with no rain shadow and unstretched relief,
+  # stamped with a provider_id that says otherwise. There is no way to tell
+  # from the tiles. Hence: hard failure, not a warning.
+  [ -f "$TD_PATCH" ] || die "missing $TD_PATCH -- the worldgen patch is part of
+    this repo; a checkout that lacks it cannot produce the shipping world."
+  git -C "$TD_DIR" apply --check "$TD_PATCH" \
+    || die "worldgen patch does not apply cleanly to $TD_COMMIT.
+    Regenerate it against the pinned commit; do NOT force it."
+  git -C "$TD_DIR" apply "$TD_PATCH" \
+    || die "worldgen patch failed to apply after --check passed (disk?)."
+
   mark clone
-  ok "cloned to $TD_DIR"
+  ok "cloned to $TD_DIR at $TD_COMMIT + worldgen patch"
 fi
 
 # NOTE: do NOT `pip install -e $TD_DIR`. The repo ships no setup.py and no
@@ -245,13 +277,25 @@ if have rasters && [ -f data/global/etopo_10m.tif ]; then
 else
   # WorldClim auto-downloads on first pipeline run and PROMPTS FOR CONSENT
   # on stdin -- which hangs an unattended script forever. `yes` answers it.
-  # This warm-up run is EXPECTED to fail at the ETOPO step (etopo_10m.tif
-  # does not exist yet); we only want its WorldClim side effect, so its exit
-  # status is deliberately ignored.
+  #
+  # CALL THE DOWNLOADER DIRECTLY, do not run an inference probe for its side
+  # effect. This used to be `probe_tile.py ... || true`, relying on the probe
+  # failing LATE -- after _compute_map_stats had fetched WorldClim on its way
+  # to the missing ETOPO file. That stopped working when identity schema v2
+  # (2026-07-22) added the conditioning gate: probe_tile.py builds a
+  # DiffusionConfig with no conditioning_digest, so it defaults to UNVERIFIED
+  # and verify_conditioning_digest refuses BEFORE any download happens. The
+  # `|| true` swallowed it and the next line died with "WorldClim did not
+  # land", with nothing in the log explaining why. A fresh pod could not
+  # bootstrap at all.
+  #
+  # _ensure_wc_files is the function whose entire job is this download. It
+  # has no identity gate and nothing to regress when the schema changes again.
   if [ ! -f data/global/wc2.1_10m_bio_1.tif ]; then
-    say "    warming up WorldClim (this downloads a few hundred MB; the"
-    say "    'failure' at the end of this sub-step is expected)"
-    yes | timeout 3600 python3 tools/probe_tile.py "$CKPT_DIR" "$SHA" || true
+    say "    downloading WorldClim (a few hundred MB)"
+    yes | timeout 3600 python3 -c \
+      'from terrain_diffusion.inference.synthetic_map import _ensure_wc_files; _ensure_wc_files()' \
+      || true
   fi
   [ -f data/global/wc2.1_10m_bio_1.tif ] \
     || die "WorldClim did not land in $TS_DIR/data/global/.

@@ -1,0 +1,266 @@
+diff --git a/terrain_diffusion/inference/synthetic_map.py b/terrain_diffusion/inference/synthetic_map.py
+index aaa55f3..353cab7 100644
+--- a/terrain_diffusion/inference/synthetic_map.py
++++ b/terrain_diffusion/inference/synthetic_map.py
+@@ -1,4 +1,5 @@
+ import os
++import math
+ import random
+ import json
+ import numpy as np
+@@ -179,7 +180,28 @@ def _save_stats_cache(stats):
+     with open(STATS_CACHE_PATH, "w", encoding="utf-8") as cache_file:
+         json.dump(payload, cache_file)
+ 
+-def make_synthetic_map_factory(frequency_mult=[1.0, 1.0, 1.0, 1.0, 1.0], seed=None, drop_water_pct=0.0):
++#: Orographic precipitation defaults. ``None`` disables the term entirely and
++#: reproduces pre-2026-08-01 behaviour, which is why it is opt-in rather than
++#: always-on: ``visualize_coarse_simple.py`` and any pinned reproduction must
++#: keep working unchanged.
++#:
++#: Distances are FRACTIONS OF THE ELEVATION FIELD'S BASE WAVELENGTH, not cell
++#: counts, so the physics stays scale-correct if ``frequency_mult[0]`` moves.
++#: At the shipping 1.5 the base wavelength is 1/(0.05*1.5) = 13.3 cells, so
++#: these probe at roughly 2, 4, 8 and 16 cells.
++OROGRAPHIC_DEFAULTS = {
++    "wind_from_deg": 270.0,      # bearing the wind blows FROM; 270 = westerly
++    "probe_wavelengths": (0.15, 0.30, 0.60, 1.20),
++    "barrier_m": 1200.0,         # upwind barrier height giving a full shadow
++    "upslope_m": 600.0,          # local windward rise giving full enhancement
++    "shadow_strength": 0.75,     # deep lee keeps 1 - 0.75 = 0.25x its precip
++    "enhance_strength": 0.60,    # full windward slope reaches 1.6x
++    "sea_blend_m": 200.0,        # ramp in over the first 200 m of land
++}
++
++
++def make_synthetic_map_factory(frequency_mult=[1.0, 1.0, 1.0, 1.0, 1.0], seed=None, drop_water_pct=0.0,
++                               orographic=None, elev_gain=1.0, elev_gain_power=2.0):
+     actual_seeds = [((seed or random.randint(0, 2**30)) + i + 1) & 0x7FFFFFFF for i in range(5)]
+ 
+     stats = _load_stats_cache()
+@@ -187,6 +209,50 @@ def make_synthetic_map_factory(frequency_mult=[1.0, 1.0, 1.0, 1.0, 1.0], seed=No
+         stats = _compute_map_stats(frequency_mult, drop_water_pct)
+         _save_stats_cache(stats)
+ 
++    # ELEVATION TAIL STRETCH. Deliberately AFTER _save_stats_cache: the cache
++    # must keep holding Earth's true marginal, or the next process to load it
++    # would inherit an already-stretched table and stretch it again.
++    #
++    # The quantile table is the only elevation-variance lever that exists --
++    # `seed` picks a realization of a fixed process and `frequency_mult`
++    # cannot change a marginal that quantile matching pins by construction.
++    # This edits the 64 knots between load and build.
++    #
++    # Safe by construction: the map is identity at v=0 (so sea level and every
++    # coastline are untouched), applies only to knots ABOVE sea level, and is
++    # strictly increasing for gain > 1 and power >= 1 --
++    #   v' = v + (gain-1) * vmax * (v/vmax)^power
++    #   dv'/dv = 1 + (gain-1) * power * (v/vmax)^(power-1)  >  0
++    # so the table stays monotone, which np.interp requires
++    # (perlin_transform.py clamps at both ends).
++    #
++    # power > 1 concentrates the gain in the UPPER tail: mid elevations barely
++    # move while high ground grows a lot, which is "extreme terrain becomes
++    # more common" rather than "everything gets taller".
++    #
++    # CAVEAT, and it is the reason this is measured rather than assumed:
++    # the model sees sign(x)*sqrt(|x|) normalised by coarse_means/coarse_stds,
++    # and the UNSTRETCHED max already sits at +2.87 sigma -- outside training.
++    # Stretching pushes it further out, so the coarse denoiser may regress to
++    # the mean HARDER rather than obey. Pair with a LOWER cond_snr[0] (lower is
++    # tighter; see worldgen-levers.md) and check the delivered relief, not the
++    # table.
++    if elev_gain != 1.0:
++        if elev_gain <= 0 or elev_gain_power < 1:
++            raise ValueError("elev_gain must be > 0 and elev_gain_power >= 1")
++        table = np.asarray(stats['base_image_quantiles_0'], dtype=np.float64).copy()
++        vmax = float(table.max())
++        if vmax > 0:
++            pos = table > 0
++            v = table[pos]
++            table[pos] = v + (elev_gain - 1.0) * vmax * (v / vmax) ** elev_gain_power
++            if np.any(np.diff(table) < 0):
++                raise ValueError(
++                    "elevation tail stretch broke table monotonicity -- np.interp "
++                    "would produce a non-invertible transform. Lower elev_gain."
++                )
++        stats['base_image_quantiles_0'] = table
++
+     a_temp_std = float(stats['a_temp_std'])
+     b_temp_std = float(stats['b_temp_std'])
+     temp_std_p1 = float(stats['temp_std_p1'])
+@@ -229,13 +295,114 @@ def make_synthetic_map_factory(frequency_mult=[1.0, 1.0, 1.0, 1.0, 1.0], seed=No
+     ]
+     synthetic_elev_params, synthetic_temp_params, synthetic_temp_std_params, synthetic_precip_params, synthetic_precip_std_params = synthetic_params
+ 
+-    def finalize_synthetic_map(raw_map):
++    oro = None
++    if orographic is not None:
++        oro = dict(OROGRAPHIC_DEFAULTS)
++        unknown = set(orographic) - set(OROGRAPHIC_DEFAULTS)
++        if unknown:
++            raise ValueError(f"unknown orographic keys: {sorted(unknown)}")
++        oro.update(orographic)
++        # Bearing the wind comes FROM, in the same convention as
++        # make_conditioning.py's wind_from_deg. The unit vector points UPWIND,
++        # i.e. toward the air's origin, and is applied as a shift of the
++        # SAMPLING COORDINATES (i1, j1), never as an array axis roll.
++        #
++        # BEWARE THE AXIS MAPPING, which is measured, not assumed: shifting j
++        # moves array AXIS 0 and shifting i moves AXIS 1, because
++        # sample_synthetic_map pairs meshgrid(x, y) -- shape (len(y), len(x))
++        # -- with reshape(i2-i1, j2-j1). For the square windows this is always
++        # called with, that pair transposes silently.
++        #
++        # Consequence: wind_from_deg sets a CONSISTENT prevailing direction,
++        # but its absolute compass bearing in the finished world is NOT traced.
++        # Two further coordinate swaps sit downstream (_sample_raw_conditioning
++        # swaps ci/cj at world_pipeline.py:823, and generate_rasters' tile-to-
++        # pixel mapping is still marked ASSUMPTION), so claiming "the west
++        # sides of ranges are wet" would be a guess. The physics does not
++        # depend on which way it points; only on it pointing the same way
++        # everywhere. If a specific in-game bearing is ever wanted, set it by
++        # rendering a map and reading the shadows off it, not by arithmetic.
++        rad = math.radians(float(oro["wind_from_deg"]))
++        u_i = -math.cos(rad)
++        u_j = math.sin(rad)
++        base_wavelength_cells = 1.0 / (0.05 * frequency_mult[0])
++        probe_offsets = []
++        for frac in oro["probe_wavelengths"]:
++            d = frac * base_wavelength_cells
++            di, dj = int(round(u_i * d)), int(round(u_j * d))
++            if (di, dj) != (0, 0) and (di, dj) not in probe_offsets:
++                probe_offsets.append((di, dj))
++        if not probe_offsets:
++            raise ValueError(
++                "orographic probe_wavelengths all round to a zero offset at "
++                f"frequency_mult[0]={frequency_mult[0]} -- the rain shadow would "
++                "be identically 1.0. Raise probe_wavelengths or lower frequency_mult[0]."
++            )
++
++    def _orographic_factor(synthetic_elev, window):
++        """Windward enhancement / lee rain shadow as a multiplier on precip.
++
++        SEAM-FREE BY CONSTRUCTION. The upwind terrain is obtained by sampling
++        the SAME elevation noise field at absolute world coordinates shifted
++        upwind -- never by marching across the window's array. finalize runs
++        per 64x64 window with NO HALO (world_pipeline.py:924), so any
++        neighbourhood operation on ``synthetic_elev`` would produce a
++        different answer near a window edge than in its interior and tile
++        borders would print into the climate. Re-sampling the field costs
++        len(probe_offsets) extra Perlin evaluations per window and depends
++        only on where a cell IS, so the value at a given world cell is
++        identical no matter which window asked for it.
++        """
++        i1, j1, i2, j2 = window
++        # How much higher the highest upwind barrier is than this cell. Air
++        # that crossed a 2 km ridge arrives dry regardless of the local slope,
++        # which is the part a pure gradient term cannot express.
++        barrier = np.zeros_like(synthetic_elev)
++        for di, dj in probe_offsets:
++            e_up = sample_synthetic_map(*synthetic_elev_params, i1 + di, j1 + dj, i2 + di, j2 + dj)
++            barrier = np.maximum(barrier, e_up - synthetic_elev)
++        # Local windward rise, from the nearest probe. Clipped at 0: a
++        # negative rise means we are in the lee, and that case belongs to the
++        # barrier term. Letting both fire would double-count it.
++        di0, dj0 = probe_offsets[0]
++        e_near = sample_synthetic_map(*synthetic_elev_params, i1 + di0, j1 + dj0, i2 + di0, j2 + dj0)
++        upslope = synthetic_elev - e_near
++
++        enhance = np.clip(upslope / float(oro["upslope_m"]), 0.0, 1.0)
++        shadow = np.clip(barrier / float(oro["barrier_m"]), 0.0, 1.0)
++        factor = (1.0 + float(oro["enhance_strength"]) * enhance) * (
++            1.0 - float(oro["shadow_strength"]) * shadow
++        )
++        # Ramp in over the first metres of land. Open ocean has no terrain to
++        # be upwind of, and a hard land/sea switch would put a step in the
++        # conditioning exactly on the coastline the model is most sensitive to.
++        land = np.clip(synthetic_elev / float(oro["sea_blend_m"]), 0.0, 1.0)
++        return 1.0 + (factor - 1.0) * land
++
++    def finalize_synthetic_map(raw_map, window=None):
+         synthetic_elev = np.asarray(raw_map[0], dtype=np.float32)
+         synthetic_temp = np.asarray(raw_map[1], dtype=np.float32)
+         synthetic_temp_std = np.asarray(raw_map[2], dtype=np.float32)
+         synthetic_precip = np.asarray(raw_map[3], dtype=np.float32)
+         synthetic_precip_std = np.asarray(raw_map[4], dtype=np.float32)
+ 
++        if oro is not None:
++            if window is None:
++                # Refuse rather than silently skip. A half-applied orographic
++                # term would put un-shadowed climate into whichever caller
++                # forgot the window, under an identity that claims otherwise.
++                raise ValueError(
++                    "finalize_synthetic_map needs window=(i1, j1, i2, j2) when the "
++                    "factory was built with orographic=... -- the rain shadow is a "
++                    "function of absolute world position, not of raw_map alone."
++                )
++            # BEFORE the lapse rate and precip_std on purpose: both read
++            # precipitation (:lapse uses it for the moist adiabat, precip_std
++            # for seasonality), and both should see the shadowed value.
++            synthetic_precip = np.maximum(
++                synthetic_precip * _orographic_factor(synthetic_elev, window), 0.0
++            ).astype(np.float32)
++
+         lapse_rate = (-6.5 + 0.0015 * synthetic_precip).clip(-9.8, -4.0) / 1000
+         synthetic_temp = synthetic_temp + lapse_rate * np.maximum(0, synthetic_elev)
+         synthetic_temp = np.clip(synthetic_temp, -10, 40)
+@@ -262,7 +429,9 @@ def make_synthetic_map_factory(frequency_mult=[1.0, 1.0, 1.0, 1.0, 1.0], seed=No
+         return np.stack([synthetic_elev, synthetic_temp, synthetic_temp_std, synthetic_precip, synthetic_precip_std], axis=0)
+ 
+     def sample_full_synthetic_map(i1, j1, i2, j2):
+-        synthetic_map = finalize_synthetic_map(sample_raw_synthetic_map(i1, j1, i2, j2))
++        synthetic_map = finalize_synthetic_map(
++            sample_raw_synthetic_map(i1, j1, i2, j2), window=(i1, j1, i2, j2)
++        )
+         synthetic_map[0] = np.sign(synthetic_map[0]) * np.sqrt(np.abs(synthetic_map[0]))
+         return torch.from_numpy(synthetic_map).float()
+ 
+diff --git a/terrain_diffusion/inference/world_pipeline.py b/terrain_diffusion/inference/world_pipeline.py
+index 6642764..d9e014f 100644
+--- a/terrain_diffusion/inference/world_pipeline.py
++++ b/terrain_diffusion/inference/world_pipeline.py
+@@ -299,6 +299,9 @@ class WorldPipeline(ConfigMixin):
+         latent_compression: int = 8,
+         frequency_mult: list = None,
+         drop_water_pct: float = 0.5,
++        orographic: dict | None = None,
++        elev_gain: float = 1.0,
++        elev_gain_power: float = 2.0,
+         cond_snr: list = None,
+         coarse_pooling: int = 1,
+         elev_coarse_pool_mode: str = 'avg',
+@@ -350,6 +353,16 @@ class WorldPipeline(ConfigMixin):
+             'log_mode': log_mode,
+             'frequency_mult': frequency_mult if frequency_mult is not None else [1.5, 3, 3, 3, 3],
+             'drop_water_pct': drop_water_pct,
++            # None = no orographic term (pre-2026-08-01 behaviour). A dict
++            # enables the windward/lee precipitation coupling; see
++            # synthetic_map.OROGRAPHIC_DEFAULTS for keys. Lives in kwargs so
++            # it is stored with the world and travels into the identity.
++            'orographic': orographic,
++            # Elevation quantile-table tail stretch. 1.0 = untouched Earth
++            # marginal. See synthetic_map.py for why this is the only
++            # elevation-variance lever that exists.
++            'elev_gain': elev_gain,
++            'elev_gain_power': elev_gain_power,
+             'cond_snr': cond_snr if cond_snr is not None else [0.3, 0.1, 1.0, 0.1, 1.0],
+             'coarse_pooling': coarse_pooling,
+             'elev_coarse_pool_mode': elev_coarse_pool_mode,
+@@ -677,8 +690,14 @@ class WorldPipeline(ConfigMixin):
+         """Initialize conditioning (synthetic maps, etc)."""
+         self.synthetic_map_factory = make_synthetic_map_factory(
+             seed=self.seed, 
+-            frequency_mult=self.kwargs['frequency_mult'], 
+-            drop_water_pct=self.kwargs['drop_water_pct']
++            frequency_mult=self.kwargs['frequency_mult'],
++            drop_water_pct=self.kwargs['drop_water_pct'],
++            # .get, not [], so a world stored before this key existed
++            # (_load_stored_kwargs at :664 replaces self.kwargs wholesale)
++            # still opens instead of raising KeyError.
++            orographic=self.kwargs.get('orographic'),
++            elev_gain=self.kwargs.get('elev_gain', 1.0),
++            elev_gain_power=self.kwargs.get('elev_gain_power', 2.0),
+         )
+     
+     def _build_hierarchy(self):

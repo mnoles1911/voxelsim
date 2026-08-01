@@ -363,6 +363,68 @@ class WorldShapeConfig:
     elev_coarse_pool_mode: str = "avg"
     p5_coarse_pool_mode: str = "avg"
 
+    #: OROGRAPHIC PRECIPITATION. Upstream couples temperature to elevation via
+    #: a real lapse rate but couples precipitation to NOTHING, so before this
+    #: the two fields were independent Perlin draws and a desert could sit on
+    #: the wet side of a range. This makes rain shadows a consequence of the
+    #: terrain the model was already going to generate: precip is scaled by a
+    #: windward-enhancement / lee-suppression factor computed from how much
+    #: higher the upwind terrain is.
+    #:
+    #: MEASURED on the 256x256 sketch at seed 20260719: correlation between
+    #: upwind barrier height and the precip multiplier is -0.734; mean
+    #: multiplier is 0.493 behind a >600 m barrier against 1.393 with none.
+    #: Land under 400 mm/yr goes 34.7% -> 40.4%; land over 2000 mm/yr goes
+    #: 7.8% -> 9.1%. Both tails grow, which is the signature of redistribution
+    #: rather than a global scale factor.
+    #:
+    #: Flat scalars rather than a dict because the dataclass is frozen and
+    #: hashable, and because every one of them then shows up individually in
+    #: the identity payload.
+    orographic_enabled: bool = True
+    #: Bearing the wind blows FROM. Sets a CONSISTENT prevailing direction; its
+    #: absolute compass mapping through the pipeline's coordinate swaps is
+    #: deliberately not claimed. See the note in synthetic_map.py.
+    oro_wind_from_deg: float = 270.0
+    #: Upwind probe distances as FRACTIONS OF THE ELEVATION BASE WAVELENGTH,
+    #: so the physics stays scale-correct if frequency_mult[0] moves.
+    oro_probe_wavelengths: tuple[float, ...] = (0.15, 0.30, 0.60, 1.20)
+    oro_barrier_m: float = 1200.0
+    oro_upslope_m: float = 600.0
+    oro_shadow_strength: float = 0.75
+    oro_enhance_strength: float = 0.60
+    oro_sea_blend_m: float = 200.0
+
+    #: ELEVATION TAIL STRETCH. Monotone gain applied to the elevation quantile
+    #: table's above-sea-level knots, anchored at v=0 so coastlines never move:
+    #: ``v' = v + (gain-1)*vmax*(v/vmax)^power``. It is the ONLY elevation-
+    #: variance lever that exists -- ``seed`` picks a realization of a fixed
+    #: process, and ``frequency_mult`` cannot change a marginal that quantile
+    #: matching pins by construction.
+    #:
+    #: MEASURED on the coarse model, 64x64 cells (492 km) at seed 20260719,
+    #: which also FALSIFIED the reason this lever was originally proposed. The
+    #: claim was that the model compresses the elevation tails (table implies
+    #: 22.6% of land above 1000 m, "delivered 1.4%"). It does not: at gain 1.0
+    #: the table asks 22.2% and the model DELIVERS 24.3%. The 1.4% figure was
+    #: local relief per 2 km WINDOW, a different quantity that was conflated
+    #: with elevation. See docs/measurements/elevation-tails-2026-08-01.txt.
+    #:
+    #:   gain  delivered  %land>1km  %land>2km   p95      max
+    #:   1.0              24.31%      5.29%     2025 m   4799 m
+    #:   1.6              27.05%      8.07%     2406 m   7465 m
+    #:   2.0              28.63%      9.34%     2665 m   8144 m
+    #:
+    #: 1.6 ships: it lifts peaks 4799 -> 7465 m and half again as much land
+    #: above 2 km, while staying less far outside the model's training
+    #: distribution than 2.0 (whose table max of 11.6 km comes back as 8.1 km,
+    #: i.e. the model is visibly clipping it). The coarse tier is a 7.68 km
+    #: cell MEAN, so in-game peak voxels sit above these numbers once the fine
+    #: tier and bake add relief on top -- 7465 m here is Everest-class terrain
+    #: in the world, not a 7465 m summit.
+    elev_gain: float = 1.6
+    elev_gain_power: float = 2.0
+
     def as_pipeline_kwargs(self) -> dict:
         """The exact kwargs to hand ``WorldPipeline.from_pretrained``.
 
@@ -378,6 +440,24 @@ class WorldShapeConfig:
             "coarse_pooling": self.coarse_pooling,
             "elev_coarse_pool_mode": self.elev_coarse_pool_mode,
             "p5_coarse_pool_mode": self.p5_coarse_pool_mode,
+            # None, not an empty dict: upstream treats None as "no orographic
+            # term at all" and reproduces its pre-2026-08-01 output exactly,
+            # which is what makes the old world reconstructible.
+            "orographic": (
+                {
+                    "wind_from_deg": self.oro_wind_from_deg,
+                    "probe_wavelengths": list(self.oro_probe_wavelengths),
+                    "barrier_m": self.oro_barrier_m,
+                    "upslope_m": self.oro_upslope_m,
+                    "shadow_strength": self.oro_shadow_strength,
+                    "enhance_strength": self.oro_enhance_strength,
+                    "sea_blend_m": self.oro_sea_blend_m,
+                }
+                if self.orographic_enabled
+                else None
+            ),
+            "elev_gain": self.elev_gain,
+            "elev_gain_power": self.elev_gain_power,
         }
 
 
@@ -419,12 +499,33 @@ DEFAULT_CONDITIONING_ROOT = "data/global"
 #: would make identity depend on incidental local junk — a false kMismatch,
 #: which is the same class of bug as embedding the load path. The list itself
 #: is a config field, so extending it rolls the provider_id honestly.
+#: ``synthetic_map_stats.json`` is in the list even though it is DERIVED from
+#: the five rasters above, and hashing a derived file alongside its inputs is
+#: normally redundant. It is not redundant here, for two measured reasons:
+#:
+#:   1. It is a cache **keyed on nothing**. ``_load_stats_cache``
+#:      (``synthetic_map.py:185-188``) returns it whenever the file exists,
+#:      ignoring the ``frequency_mult`` and ``drop_water_pct`` it was built
+#:      under — so it can disagree with this config's values and no code
+#:      notices. Hashing the inputs tells you what the cache SHOULD hold;
+#:      only hashing the file tells you what it DOES hold.
+#:   2. The shipped copy was built from FAKE climate. ``_prep_stats.py``
+#:      records that WorldClim was unreachable and hand-written latitude
+#:      formulas were substituted for bio_1/4/12/15; the real rasters sat
+#:      unused beside it. Rebuilt from the real rasters 2026-08-01, which
+#:      moved precipitation's IQR 441 -> 851 mm and its p5 320 -> 39 mm --
+#:      a different world under a byte-identical set of input rasters.
+#:
+#: It is also gitignored and untracked in the terrain-diffusion repo, so it
+#: is exactly the kind of machine-local derived artifact that silently
+#: diverges between boxes. That is an argument for hashing it, not against.
 DEFAULT_CONDITIONING_FILES: tuple[str, ...] = (
     "etopo_10m.tif",
     "wc2.1_10m_bio_1.tif",
     "wc2.1_10m_bio_4.tif",
     "wc2.1_10m_bio_12.tif",
     "wc2.1_10m_bio_15.tif",
+    "synthetic_map_stats.json",
 )
 
 
@@ -639,7 +740,15 @@ class DiffusionConfig:
     #: Not bit-determinism (doctrine §2.3 says that is unattainable), but a
     #: package upgrade can change output STRUCTURALLY, and that should not
     #: hide under an unchanged id. "UNRECORDED" if a bring-up did not note it.
-    terrain_diffusion_version: str = "UNRECORDED"
+    #:
+    #: Now records BOTH halves of what is actually installed: the pinned
+    #: upstream commit AND sha256[0:12] of our worldgen patch
+    #: (terrain-service/patches/terrain-diffusion-worldgen.patch, which adds
+    #: the orographic rain shadow and the elevation tail stretch). Upstream
+    #: alone would be a half-truth -- two boxes on the same commit, one
+    #: patched and one not, generate different worlds. bootstrap_pod.sh pins
+    #: the same commit at its TD_COMMIT; bump both together or neither.
+    terrain_diffusion_version: str = "82a0431+worldgen.c55a6382c524"
     #: The WorldPipeline kwargs that shape the world. Replaces the old
     #: ``sampler`` field, which was hashed but never passed to anything — see
     #: WorldShapeConfig's docstring.
@@ -1090,6 +1199,44 @@ class TerrainDiffusionBackend:
                 "the terrain-diffusion package is not installed -- see "
                 "terrain-service/docs/diffusion-bringup.md step 2."
             ) from exc
+
+        # THE INSTALLED PIPELINE MUST ACTUALLY ACCEPT OUR WORLD-SHAPING KWARGS.
+        #
+        # Upstream's WorldPipeline.__init__ ends in `**deprecated_kwargs`,
+        # which is read exactly once and only for `histogram_raw`. So against
+        # an UNPATCHED upstream, `orographic=` and `elev_gain=` are accepted,
+        # discarded, and never mentioned again: tiles generate normally with no
+        # rain shadow and unstretched relief, while provider_id() -- which
+        # hashes as_pipeline_kwargs() wholesale -- stamps them as having both.
+        # A silently mislabeled tile set is unrecoverable after the fact; there
+        # is nothing in the output that distinguishes it.
+        #
+        # from_pretrained splats a plain dict (`cls(**config)`) with no key
+        # filtering, so nothing upstream will ever raise on our behalf. This is
+        # the only place that can catch it. Checked by signature rather than by
+        # version string because the version string is what would be wrong.
+        import inspect
+
+        params = inspect.signature(WorldPipeline.__init__).parameters
+        required = [k for k in self.config.world_shape.as_pipeline_kwargs()
+                    if k not in params]
+        if required:
+            raise RuntimeError(
+                f"the installed terrain-diffusion does not accept "
+                f"{sorted(required)} -- these would be swallowed by its "
+                f"**deprecated_kwargs and SILENTLY IGNORED, producing a world "
+                f"that does not match the provider_id this config would stamp "
+                f"on it.\n"
+                f"Apply terrain-service/patches/terrain-diffusion-worldgen.patch "
+                f"to the terrain-diffusion checkout (bootstrap_pod.sh does this "
+                f"automatically for a fresh clone; a checkout stamped as already "
+                f"cloned by an older bootstrap will NOT have it -- delete the "
+                f"clone stamp and re-run).\n"
+                f"To generate the pre-patch world deliberately, set the "
+                f"corresponding WorldShapeConfig fields to their neutral values "
+                f"(orographic_enabled=False, elev_gain=1.0) so the identity "
+                f"stops claiming them."
+            )
 
         # ASSUMPTION: checkpoint_id is a LOCAL filesystem path to a
         # pre-downloaded pipeline snapshot (e.g. via `huggingface_hub.

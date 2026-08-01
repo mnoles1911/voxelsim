@@ -4,3 +4,10 @@
 # though the dev machine is Windows.
 *.sh text eol=lf
 *.py text eol=lf
+
+# Same hazard, worse symptom. terrain-service/patches/*.patch is applied on
+# the pod with `git apply`, which is strict about line endings: a CRLF
+# checkout makes the patch fail to apply, and bootstrap_pod.sh treats that as
+# fatal (correctly -- see patches/README.md for why silently skipping it is
+# the one outcome we cannot allow).
+*.patch text eol=lf
