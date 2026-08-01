@@ -331,6 +331,39 @@ else
   ok "data/global/etopo_10m.tif built"
 fi
 
+# The DERIVED conditioning cache -- quantile tables built from the five
+# rasters above. It is in DEFAULT_CONDITIONING_FILES, so the digest (and
+# therefore every provider_id) covers it.
+#
+# THAT CREATES A DEADLOCK THIS STEP EXISTS TO BREAK. Upstream writes this file
+# lazily, on the first pipeline run, from _load_stats_cache's miss path. But
+# verify_conditioning_digest refuses to run inference while any listed file is
+# absent -- so on a fresh pod nothing can ever create it, and step 8 dies with
+# "conditioning data missing" naming a file no documented command produces.
+#
+# Built explicitly here instead. Deterministic given the rasters and the
+# config's own frequency_mult/drop_water_pct, which are read from
+# WorldShapeConfig rather than repeated, so this cannot drift from what
+# inference will actually ask for. Deliberately OUTSIDE the `have rasters`
+# branch: a pod whose rasters are stamped but whose cache was deleted must
+# still rebuild it.
+#
+# NOTE: takes a couple of minutes -- it reads all five global rasters and
+# builds 64-knot quantile tables per channel.
+if [ -f data/global/synthetic_map_stats.json ]; then
+  ok "synthetic_map_stats.json already built"
+else
+  say "    building synthetic_map_stats.json (reads all five rasters; ~2 min)"
+  python3 -c 'from terrain_service.providers.diffusion import DiffusionConfig; from terrain_diffusion.inference.synthetic_map import make_synthetic_map_factory; ws = DiffusionConfig().world_shape; make_synthetic_map_factory(frequency_mult=list(ws.frequency_mult), seed=0, drop_water_pct=ws.drop_water_pct)' \
+    || die "could not build synthetic_map_stats.json. Without it the
+    conditioning digest cannot be computed and no inference can run."
+  [ -f data/global/synthetic_map_stats.json ] \
+    || die "synthetic_map_stats.json still absent after the build ran.
+    STATS_CACHE_PATH is CWD-RELATIVE ('data/global/...'), so this must run
+    from $TS_DIR -- check the working directory before anything else."
+  ok "synthetic_map_stats.json built"
+fi
+
 # ---------------------------------------------------------------------------
 # 8. validation -- the gate
 # ---------------------------------------------------------------------------
