@@ -1,0 +1,83 @@
+THE MICRO GRADIENT CAP: 1.5 -> 1.2 at worldgen v21
+====================================================
+2026-08-01. Constant: kMicroGradCapKQ10 (amplifier.cpp). Site: g35 repro
+-69094,38426 for drainage, -67500,40000 (gentle) for terracing. Seed 20260719.
+OWNER-CONFIRMED in a live session: terrain passes on every item of the test
+checklist, including the gentle-ground item this change was actually about.
+
+
+1. WHY IT COULD ONLY BE JUDGED NOW
+-----------------------------------
+v19 raised the micro pool's cap above 1.0 so the 400/200 mm octaves could break
+voxel-quantisation terracing, and chose 1.5 over 1.2 while the owner's rejected
+banding was still unexplained. Band width was therefore being bought at whatever
+drainage it cost. v20 identified that banding as the 3D density band -- which no
+setting of this constant could ever have affected. With the confound gone the
+two columns can be traded against each other honestly, which is the whole reason
+this was sequenced AFTER v20 rather than alongside it.
+
+
+2. THE TWO MEASUREMENTS, AND THEY DISAGREE ABOUT WHICH WAY TO GO
+------------------------------------------------------------------
+DRAINAGE, amplified surface at the alpine site (carrier control: 0 sinks,
+0.0% stranded):
+
+    k=0.5    1 sink    0.4% stranded
+    k=1.0    5 sinks   0.4% stranded
+    k=1.2    9 sinks   1.2% stranded   <-- shipped
+    k=1.5   17 sinks   3.5% stranded
+
+The knee is at 1.0, NOT at 0.5. Below 1.0 there are four sinks left to win and
+no stranded area at all, while a cap at or below 1.0 provably cannot disturb a
+quantisation band at any slope -- the required detail gradient is 2x the
+carrier's, identically, at every slope. v14's factor-of-four margin was never
+paying for itself, so the agreed "revert to 0.5" was dropped on evidence.
+
+TERRACING, gentle site, amplified:
+
+                              k=1.2        k=1.5
+    mean run                  3.35 vox     3.04 vox
+    median / p90 / p99        2 / 7 / 15   2 / 6 / 13
+    area in flat patches
+      >= 4 m^2                39.4%        15.4%
+
+So 1.2 costs 2.6x the flat-plateau area. Both numbers are on the table because
+they point opposite ways: drainage says lower, terracing says higher.
+
+
+3. THE METRIC THAT NEARLY HID IT
+----------------------------------
+Read the run-length rows again. Mean 3.35 vs 3.04 voxels, medians identical,
+p90 within one voxel -- by that statistic the two settings are the same surface.
+By plateau area they differ 2.6-fold.
+
+The run-length distribution is dominated by thousands of tiny runs, so it
+averages the artifact away; plateau area measures the thing the eye locks onto,
+which is a big flat shelf. On the strength of the run-length rows alone the
+honest prediction was "you will not be able to tell them apart", and that
+prediction was stated to the owner and was WRONG.
+
+This is the same failure that cost a full day on the banding artifact: a metric
+that is real, correctly computed, and measuring the wrong quantity. It is worth
+stating as a rule -- for a terracing artifact, measure the AREA IN FLAT PATCHES,
+not the length of runs. One is what the eye reads and the other is what the
+histogram is made of.
+
+
+4. THE DECISION
+----------------
+Shipped 1.2. The drainage win is halved sinks and threefold less stranded area;
+the terracing cost is 39.4% of gentle ground in >= 4 m^2 flat patches against
+15.4%. The owner tested the shipped build in a live session against an explicit
+checklist -- steep bare rock for the v20 banding regression, GENTLE GROUND for
+this trade, channel connectivity for the fine tier, general believability -- and
+passed it on all of them.
+
+That verdict is what settles it, not the plateau number: 39.4% is worse than
+15.4% and both are far better than an uncapped micro pool, and the only question
+that ever mattered was whether the difference is visible at play distance. It is
+not. Had it been, k=1.35 was the next thing to sweep.
+
+RESIDUAL, stated because the numbers above are not zero: 9 interior sinks and
+1.2% stranded area remain against a carrier that has neither. Detail still
+strands some drainage; it strands a third of what v19 did.
