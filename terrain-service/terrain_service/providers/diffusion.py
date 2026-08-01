@@ -264,6 +264,83 @@ def validate_model_output(
 # ---------------------------------------------------------------------------
 
 
+#: MODEL-OUTPUT CLIMATE CALIBRATION -- fitted, not guessed.
+#:
+#: THE PROBLEM, measured across 10 windows spanning ~2,600 km at seed
+#: 20260719: the coarse model obeys the elevation conditioning (asks 22.2% of
+#: land above 1 km, delivers 24.3%) but CRUSHES the climate channels. Land
+#: temperature came back capped at ~20.5 C p95 / ~25 C max in EVERY window
+#: while the conditioning asked for 28.5 / 33.9. The consequence was total:
+#: cells that are simultaneously hot (>=24 C) and arid (<400 mm) were 10.04%
+#: of land as ASKED and 0.00% as DELIVERED, everywhere. No choice of pregen
+#: origin fixes that, and no biome threshold can honestly invent a desert out
+#: of climate that contains none.
+#:
+#: WHY A MONOTONE REMAP IS THE RIGHT FIX. The model preserves each channel's
+#: spatial PATTERN and squashes its RANGE. A strictly monotone per-pixel map
+#: therefore restores the range while leaving spatial structure *exactly*
+#: untouched -- it cannot move a warm cell to a different place, only relabel
+#: how warm it is. It is the same quantile-matching idea the conditioning
+#: already uses on the input side, applied on the output side.
+#:
+#: WHY IT CANNOT SEAM. These are FIXED GLOBAL CONSTANTS, a pure function of
+#: the value alone. A per-tile empirical quantile match would seam badly: each
+#: tile has its own local distribution, so the same physical temperature would
+#: encode differently on either side of a tile border.
+#:
+#: Fitted by pairing pooled DELIVERED land quantiles with pooled ASKED land
+#: quantiles (the conditioning target, itself built from real WorldClim).
+#: Regenerate with tools/fit_climate_calibration.py if the model, the
+#: conditioning stats, or elev_gain change -- all three move these curves.
+#: See docs/measurements/climate-calibration-2026-08-01.txt.
+CLIMATE_CALIBRATION: dict[str, tuple[tuple[float, ...], tuple[float, ...]]] = {
+    "temperature": (
+        (-2.437, 2.751, 10.355, 14.544, 17.541, 20.512, 22.043),
+        (-9.448, -2.904, 11.790, 21.192, 25.081, 28.535, 30.491),
+    ),
+    "seasonality": (
+        (375.151, 502.709, 649.444, 757.944, 875.138, 1138.371, 1326.095),
+        (177.080, 329.931, 491.965, 664.604, 885.186, 1406.515, 1761.142),
+    ),
+    "precipitation": (
+        (122.220, 250.843, 464.981, 680.713, 1065.561, 2281.607, 3458.090),
+        (7.472, 36.139, 237.813, 553.879, 1162.630, 2787.452, 4385.236),
+    ),
+    "precip_variability": (
+        (4.998, 16.131, 35.360, 50.374, 67.088, 96.200, 117.753),
+        (1.121, 10.489, 26.801, 46.423, 74.282, 112.256, 142.234),
+    ),
+}
+
+
+def apply_climate_calibration(raw: np.ndarray, xs, ys) -> np.ndarray:
+    """Piecewise-linear monotone remap with LINEAR EXTRAPOLATION at both ends.
+
+    The extrapolation is the whole point and must not be dropped for a bare
+    ``np.interp``. ``np.interp`` CLAMPS outside its anchors, which would pin
+    every delivered temperature above the 99th-percentile anchor to a single
+    output value -- a hard ceiling at 30.5 C. That is precisely the
+    range-crushing this function exists to undo, so clamping would reintroduce
+    the bug at the top of the distribution where the deserts live.
+
+    Extending the end segments' slopes keeps the map strictly monotone over
+    the whole real line, so ordering -- and therefore spatial pattern -- is
+    preserved for extreme values too.
+    """
+    x = np.asarray(xs, dtype=np.float64)
+    y = np.asarray(ys, dtype=np.float64)
+    v = raw.astype(np.float64)
+    out = np.interp(v, x, y)
+
+    lo_slope = (y[1] - y[0]) / (x[1] - x[0])
+    hi_slope = (y[-1] - y[-2]) / (x[-1] - x[-2])
+    below = v < x[0]
+    above = v > x[-1]
+    out[below] = y[0] + (v[below] - x[0]) * lo_slope
+    out[above] = y[-1] + (v[above] - x[-1]) * hi_slope
+    return out
+
+
 def adapt_raster_to_tile(
     raster_dict: dict[str, np.ndarray],
     config: "DiffusionConfig",
@@ -299,6 +376,14 @@ def adapt_raster_to_tile(
         # producing four identical constant planes that would have looked
         # like "climate exists" while carrying no information at all.
         spec = _CLIMATE_SPECS[name]
+        # Undo the model's range compression BEFORE quantizing. Order matters:
+        # calibrating after the uint8 step would work on 1/255-of-range
+        # buckets and could not recover detail the quantizer had already
+        # merged. See CLIMATE_CALIBRATION for why this is a fixed global curve
+        # rather than a per-tile fit.
+        if config.climate_calibration and name in CLIMATE_CALIBRATION:
+            xs, ys = CLIMATE_CALIBRATION[name]
+            raw = apply_climate_calibration(raw, xs, ys)
         span = spec.max - spec.min
         unit = (raw.astype(np.float64) - spec.min) / span
         climate[i] = np.clip(np.rint(unit * 255.0), 0, 255).astype(np.uint8)
@@ -749,6 +834,14 @@ class DiffusionConfig:
     #: patched and one not, generate different worlds. bootstrap_pod.sh pins
     #: the same commit at its TD_COMMIT; bump both together or neither.
     terrain_diffusion_version: str = "82a0431+worldgen.c55a6382c524"
+    #: Apply CLIMATE_CALIBRATION to model output before quantization. NOT a
+    #: WorldShapeConfig field on purpose: as_pipeline_kwargs() is documented as
+    #: "exactly what the model receives", and this is OUR post-processing of
+    #: what comes back. It is hashed separately into provider_id below.
+    #:
+    #: Set False to reproduce the raw, uncalibrated model climate -- which
+    #: contains no hot-and-arid land anywhere in the world, so no desert.
+    climate_calibration: bool = True
     #: The WorldPipeline kwargs that shape the world. Replaces the old
     #: ``sampler`` field, which was hashed but never passed to anything — see
     #: WorldShapeConfig's docstring.
@@ -848,6 +941,16 @@ class DiffusionConfig:
             # a kwarg that stops being passed can no longer sit in the identity
             # pretending to matter, which is precisely how `sampler` went wrong.
             "world_shape": self.world_shape.as_pipeline_kwargs(),
+            # Post-processing of model output, so it does not live in
+            # world_shape. The CURVES are hashed, not just the on/off flag:
+            # re-fitting them silently changes every tile's climate, which is
+            # exactly the kind of change that must not hide under an unchanged
+            # id -- the same lesson as synthetic_map_stats.json.
+            "climate_calibration": (
+                {k: [list(v[0]), list(v[1])] for k, v in sorted(CLIMATE_CALIBRATION.items())}
+                if self.climate_calibration
+                else None
+            ),
             "scale": self.scale,
             "channel_mapping": dict(self.channel_mapping),
             "tile_format": _tile_format_fingerprint(),

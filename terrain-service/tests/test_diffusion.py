@@ -15,6 +15,7 @@ from terrain_service import tile_codec
 from terrain_service.app import _make_provider, create_app
 from terrain_service.cache import TileCache
 from terrain_service.providers.diffusion import (
+    CLIMATE_CALIBRATION,
     DEFAULT_CHANNEL_MAPPING,
     DEFAULT_CONDITIONING_FILES,
     EXPECTED_CHANNELS,
@@ -26,6 +27,7 @@ from terrain_service.providers.diffusion import (
     WorldShapeConfig,
     TerrainDiffusionBackend,
     adapt_raster_to_tile,
+    apply_climate_calibration,
     compute_conditioning_digest,
     derive_tile_seed,
     resolve_conditioning_root,
@@ -148,7 +150,12 @@ def test_validate_model_output_respects_custom_channel_mapping():
 
 
 def test_adapt_raster_to_tile_quantizes_correctly():
-    config = DiffusionConfig()
+    # climate_calibration=False on purpose: this test pins the QUANTIZER, and
+    # the hand-chosen physical values below are meaningful only if they reach
+    # it unmodified. The calibration is a separate transform with its own
+    # tests; leaving it on here would silently turn this into a test of both
+    # and make the expected constants unreadable.
+    config = DiffusionConfig(climate_calibration=False)
     raster = _good_raster()
     raster["elevation"] = np.full((TILE_SIZE, TILE_SIZE), 1234.6, dtype=np.float32)
     raster["temperature"] = np.full((TILE_SIZE, TILE_SIZE), 40.0, dtype=np.float32)
@@ -164,6 +171,69 @@ def test_adapt_raster_to_tile_quantizes_correctly():
     assert tile.climate[1, 0, 0] == 128  # seasonality 1500 of [0, 3000]
     assert tile.climate[2, 0, 0] == 128  # precipitation 6000 of [0, 12000]
     assert tile.climate[3, 0, 0] == 128  # precip_variability 100 of [0, 200]
+
+
+def test_climate_calibration_curves_are_strictly_monotone():
+    """The whole safety argument rests on this.
+
+    A monotone map cannot move a warm cell somewhere else -- it only relabels
+    how warm it is -- which is why calibrating model output leaves spatial
+    structure exactly intact. If a curve ever became non-monotone, two
+    different physical values would swap order and the terrain/climate
+    correlation the orographic term builds would be silently scrambled.
+    """
+    for name, (xs, ys) in CLIMATE_CALIBRATION.items():
+        assert len(xs) == len(ys) >= 2, name
+        assert all(b > a for a, b in zip(xs, xs[1:])), f"{name}: xs not increasing"
+        assert all(b > a for a, b in zip(ys, ys[1:])), f"{name}: ys not increasing"
+
+
+def test_climate_calibration_extrapolates_rather_than_clamping():
+    """np.interp CLAMPS outside its anchors; this must not.
+
+    Clamping would pin every value above the top anchor to one output -- a
+    hard ceiling exactly where the hot, arid, desert-forming cells live, which
+    is the range compression the calibration exists to undo. Extending the end
+    segments' slopes keeps the map monotone over the whole real line.
+    """
+    xs, ys = CLIMATE_CALIBRATION["temperature"]
+    beyond = np.array([xs[-1], xs[-1] + 1.0, xs[-1] + 5.0], dtype=np.float64)
+    out = apply_climate_calibration(beyond, xs, ys)
+    assert out[1] > out[0], "top end clamped instead of extrapolating"
+    assert out[2] > out[1]
+    # Slope beyond the last anchor must match the last segment's.
+    expected = (ys[-1] - ys[-2]) / (xs[-1] - xs[-2])
+    assert out[2] - out[1] == pytest.approx(expected * 4.0, rel=1e-9)
+
+    below = np.array([xs[0], xs[0] - 1.0, xs[0] - 5.0], dtype=np.float64)
+    lo = apply_climate_calibration(below, xs, ys)
+    assert lo[1] < lo[0], "bottom end clamped instead of extrapolating"
+    assert lo[2] < lo[1]
+
+
+def test_climate_calibration_restores_the_hot_arid_corner():
+    """The measured failure it was built for.
+
+    Across 10 windows the model delivered land temperature capped near 20.5 C
+    p95, so cells that were simultaneously hot (>=24 C) and arid were 0.00% of
+    land everywhere, and no biome threshold could produce an honest desert.
+    A delivered value at the model's observed 95th percentile must land above
+    24 C after calibration.
+    """
+    xs, ys = CLIMATE_CALIBRATION["temperature"]
+    delivered_p95 = np.array([20.512], dtype=np.float64)
+    assert apply_climate_calibration(delivered_p95, xs, ys)[0] >= 24.0
+
+
+def test_climate_calibration_is_in_the_identity():
+    """Re-fitting the curves changes every tile's climate; it must roll the id.
+
+    Same lesson as synthetic_map_stats.json: a derived table that decides the
+    world is not allowed to change under an unchanged provider_id.
+    """
+    on = DiffusionConfig(climate_calibration=True).provider_id()
+    off = DiffusionConfig(climate_calibration=False).provider_id()
+    assert on != off
 
 
 def test_adapt_raster_to_tile_clips_out_of_range_elevation():
@@ -632,7 +702,11 @@ class _ExtraChannelBackend:
 
 def test_injected_backend_produces_correct_tile():
     fake = _FakeBackend()
-    provider = DiffusionProvider(model_backend=fake)
+    # Uncalibrated, same reason as test_adapt_raster_to_tile_quantizes_correctly:
+    # this asserts the plumbing carries values through unchanged.
+    provider = DiffusionProvider(
+        config=DiffusionConfig(climate_calibration=False), model_backend=fake
+    )
     tile = provider.generate(seed=5, x=2, y=-3, scale=1)
 
     assert tile.seed == 5 and tile.x == 2 and tile.y == -3 and tile.scale == 1

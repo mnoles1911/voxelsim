@@ -1,0 +1,109 @@
+Wave 1d -- the coarse model crushes climate; calibrate its OUTPUT
+=================================================================
+2026-08-01
+
+WHY THIS EXISTS
+---------------
+Wave 1a rebuilt the conditioning from real WorldClim and Wave 1b coupled
+precipitation to terrain. The coarse census still showed DESERT at 0.00% and
+SAVANNA at 0.00%. Precipitation was not the cause: 16.7% of land was already
+arid (<400 mm). classifyBiome needs precip < 400 AND temp >= 24 C, and land
+temperature never reached 24 C.
+
+WHERE THE TEMPERATURE GOES -- MEASURED, 96x96 cells (737 km), seed 20260719
+---------------------------------------------------------------------------
+  ASKED (finalized sketch)  temp p5/p50/p95  -4.3 / 20.4 / 28.4   max 33.9
+  DELIVERED (coarse model)  temp p5/p50/p95   1.5 / 13.9 / 20.5   max 24.7
+
+Both tails pulled in; ~58% of the asked spread survives. Not altitude: at
+0-200 m the delivered max is still only 24.7 C.
+
+IS IT JUST A COOL WINDOW? NO -- 6 windows over ~2,600 km
+--------------------------------------------------------
+        origin |  ASKED hot&arid | DELIVERED hot&arid | DELIVERED t_p95
+        (0, 0) |           9.85% |              0.00% |            19.7
+      (400, 0) |           8.84% |              0.00% |            20.3
+   (-400, 300) |          10.49% |              0.00% |            21.2
+   (900, -600) |          13.03% |              0.00% |            19.7
+ (-1100, -900) |           8.71% |              0.00% |            20.6
+  (1500, 1200) |           9.32% |              0.00% |            20.7
+          MEAN |          10.04% |              0.00%
+
+The model hard-caps land temperature at ~21 C p95 / ~25 C max EVERYWHERE. The
+conditioning asks for a tenth of the continent as desert and the model returns
+none of it, in every window. NO CHOICE OF PREGEN ORIGIN FIXES THIS.
+
+Note precipitation, at the SAME cond_snr of 0.1, is only mildly compressed
+(asked arid 35-46%, delivered 15-21%). So this is not generic conditioning
+weakness -- it is specific to temperature.
+
+THE FIX, AND WHY THIS ONE
+--------------------------
+A fixed, global, strictly monotone remap of the model's OUTPUT, applied in
+adapt_raster_to_tile before quantization.
+
+  * MONOTONE => spatial structure is exactly preserved. The map cannot move a
+    warm cell somewhere else, only relabel how warm it is. This matters
+    because Wave 1b's whole point is that precipitation correlates with
+    terrain; a non-monotone map would scramble that.
+  * FIXED AND GLOBAL => it cannot seam. A per-tile empirical quantile match
+    WOULD seam badly: each tile has its own local distribution, so the same
+    physical temperature would encode differently across a tile border.
+  * OUTPUT SIDE, not input side. Pre-inflating the conditioning to compensate
+    would push it further out of the model's training distribution, which is
+    the mechanism that was already suspected of causing the compression.
+  * Raising obedience does NOT work and was measured: cond_snr[0] 0.30 -> 0.15
+    REDUCED high ground (see elevation-tails-2026-08-01.txt).
+
+Fitted by pairing pooled DELIVERED land quantiles against pooled ASKED land
+quantiles over 10 windows. All four climate channels are compressed; all four
+are calibrated. Every curve is strictly monotone (asserted in tests).
+
+  channel              delivered p5/p50/p95  ->  after      target
+  temperature              2.75/14.54/20.51  ->  -2.90/21.20/28.53   -2.90/21.19/28.53
+  seasonality           502.7/757.9/1138.4   ->  329.9/664.6/1406.5  329.9/664.6/1406.5
+  precipitation         250.8/680.7/2281.6   ->   36.2/553.9/2787.5   36.1/553.9/2787.5
+  precip_variability      16.1/50.4/96.2     ->   10.5/46.4/112.3     10.5/46.4/112.3
+
+EXTRAPOLATION IS LOAD-BEARING. np.interp CLAMPS outside its anchors, which
+would pin every delivered temperature above the 99th-percentile anchor to a
+single value -- a hard ceiling at 30.5 C, exactly where the desert-forming
+cells live. apply_climate_calibration extends the end segments' slopes
+instead, keeping the map monotone over the whole real line. There is a test
+for this specifically.
+
+RESULT -- 6 windows, calibration off vs on
+-------------------------------------------
+  biome                    RAW  CALIBRATED
+  BEACH                  6.76%       6.76%
+  GRASSLAND             42.34%      27.26%
+  TEMPERATE_FOREST      23.92%       8.06%
+  RAINFOREST             3.23%       8.77%
+  DESERT                 0.00%       8.79%   <-- was unreachable
+  SAVANNA               12.60%      25.90%
+  TAIGA                  2.02%       2.89%
+  TUNDRA_ALPINE          9.14%      11.57%
+
+  raw  temp p5/p95   2.5/20.7   precip p5/p95  253/2232   hot&arid 0.00%
+  cal  temp p5/p95  -3.2/28.7   precip p5/p95   38/2721   hot&arid 9.88%
+
+DESERT lands at 8.79% against Earth's ~8.6%. Every mappable biome is non-zero.
+(BARE_ROCK is absent from this table only because world_map.py cannot evaluate
+its slope gate at a 7.68 km cell; it appears in game.)
+
+CAVEATS
+-------
+1. The SAVANNA figures are a JOINT result. biome.h was being reworked
+   concurrently -- note precip_seasonal_high_pct replacing the old
+   seasonal_high -- and world_map.py parses the header live, which is why
+   SAVANNA is non-zero even in the RAW column. 25.90% is high against Earth's
+   ~10-20% and TEMPERATE_FOREST at 8.06% is low; treat both as provisional
+   pending that work's own report.
+2. These curves are fitted against THIS model, THIS conditioning stats file,
+   and elev_gain=1.6. All three move them. Re-fit if any changes.
+3. Measured on the COARSE stage only. The latent and decoder stages need a
+   GPU and were not run; they could reintroduce compression at finer scale.
+   The 2 km-relief statistic on delivered tiles remains unmeasured.
+4. The calibration is hashed into provider_id -- the CURVES, not just the
+   on/off flag -- so re-fitting cannot silently change every tile's climate
+   under an unchanged id. Same lesson as synthetic_map_stats.json.
