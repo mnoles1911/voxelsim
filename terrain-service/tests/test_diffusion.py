@@ -28,6 +28,7 @@ from terrain_service.providers.diffusion import (
     TerrainDiffusionBackend,
     adapt_raster_to_tile,
     apply_climate_calibration,
+    clamp_to_physical_range,
     compute_conditioning_digest,
     derive_tile_seed,
     resolve_conditioning_root,
@@ -1027,3 +1028,44 @@ def test_world_shape_is_hashable_and_frozen():
     hash(ws)  # tuples, not lists, on the dataclass itself
     with pytest.raises(dataclasses.FrozenInstanceError):
         ws.drop_water_pct = 0.1
+
+
+def test_clamp_to_physical_range_pulls_in_small_negative_precipitation():
+    """The real failure: an all-arid tile with precipitation slightly below 0.
+
+    Tile (-4, 19) on the pod came back with precipitation in
+    [-98.83, 361.55] -- a whole desert tile. Negative rainfall is noise about
+    a floor the model does not know exists, not a prediction, and refusing it
+    would block exactly the arid terrain the conditioning work produces.
+    """
+    raster = _good_raster()
+    raster["precipitation"] = np.full((TILE_SIZE, TILE_SIZE), 200.0, dtype=np.float32)
+    raster["precipitation"][0, 0] = -98.83
+    n = clamp_to_physical_range(raster, DEFAULT_CHANNEL_MAPPING)
+    assert n == {"precipitation": 1}
+    assert raster["precipitation"][0, 0] == 0.0
+    # And it now passes validation, which it did not before.
+    validate_model_output(raster, DEFAULT_CHANNEL_MAPPING)
+
+
+def test_clamp_to_physical_range_does_not_hide_real_breakage():
+    """A blanket clip would mask the saturation bug adapt_raster_to_tile warns of.
+
+    Excursions beyond the tolerance must survive into validate_model_output
+    and still fail there.
+    """
+    raster = _good_raster()
+    # 5% of precipitation's [0, 12000] span is 600; -5000 is far outside.
+    raster["precipitation"] = np.full((TILE_SIZE, TILE_SIZE), -5000.0, dtype=np.float32)
+    assert clamp_to_physical_range(raster, DEFAULT_CHANNEL_MAPPING) == {}
+    assert raster["precipitation"][0, 0] == -5000.0
+    with pytest.raises(ModelOutputMismatch):
+        validate_model_output(raster, DEFAULT_CHANNEL_MAPPING)
+
+
+def test_clamp_to_physical_range_leaves_in_range_values_untouched():
+    raster = _good_raster()
+    before = {k: v.copy() for k, v in raster.items()}
+    assert clamp_to_physical_range(raster, DEFAULT_CHANNEL_MAPPING) == {}
+    for k, v in raster.items():
+        assert np.array_equal(v, before[k]), k

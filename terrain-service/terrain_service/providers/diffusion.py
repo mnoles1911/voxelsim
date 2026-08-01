@@ -341,6 +341,56 @@ def apply_climate_calibration(raw: np.ndarray, xs, ys) -> np.ndarray:
     return out
 
 
+#: How far outside a channel's declared physical range a value may stray and
+#: still be treated as model noise rather than breakage, as a fraction of the
+#: channel's span. 5% of precipitation's [0, 12000] is 600 mm.
+PHYSICAL_CLAMP_TOLERANCE = 0.05
+
+
+def clamp_to_physical_range(
+    raster_dict: dict[str, np.ndarray], mapping: dict[str, str]
+) -> dict[str, int]:
+    """Clamp small, physically-meaningless excursions; leave real breakage alone.
+
+    WHY THIS IS NEEDED. Precipitation, seasonality and precip_variability are
+    NON-NEGATIVE physical quantities, but the coarse model generates in a
+    normalized latent space with nothing constraining its sign. On genuinely
+    arid ground it undershoots zero: a real tile at (-4, 19) came back with
+    precipitation in [-98.83, 361.55] -- an entire desert tile, max 362 mm/yr.
+    ``validate_model_output`` refused it, which would have blocked generation
+    of exactly the arid terrain the conditioning work exists to produce.
+
+    Negative rainfall is not a prediction, it is noise about a floor the model
+    does not know exists. Clamping it to that floor is the correct physical
+    reading.
+
+    WHY IT IS BOUNDED. A blanket clip would hide real breakage -- notably the
+    failure mode ``adapt_raster_to_tile`` documents, where every climate plane
+    saturated and four constant planes looked like "climate exists" while
+    carrying no information. So excursions beyond
+    ``PHYSICAL_CLAMP_TOLERANCE`` of the channel span are deliberately NOT
+    clamped: they survive into ``validate_model_output`` and still fail there.
+
+    Mutates ``raster_dict`` in place. Returns per-channel counts of clamped
+    cells so callers can report rather than silently absorb.
+    """
+    clamped: dict[str, int] = {}
+    for spec in EXPECTED_CHANNELS:
+        key = mapping.get(spec.name, spec.name)
+        arr = raster_dict.get(key)
+        if arr is None:
+            continue
+        span = spec.max - spec.min
+        slack = span * PHYSICAL_CLAMP_TOLERANCE
+        low = (arr < spec.min) & (arr >= spec.min - slack)
+        high = (arr > spec.max) & (arr <= spec.max + slack)
+        n = int(low.sum()) + int(high.sum())
+        if n:
+            np.clip(arr, spec.min, spec.max, out=arr)
+            clamped[spec.name] = n
+    return clamped
+
+
 def adapt_raster_to_tile(
     raster_dict: dict[str, np.ndarray],
     config: "DiffusionConfig",
@@ -1545,6 +1595,13 @@ class DiffusionProvider:
                 "(and provider_id) per scale"
             )
         raster = self._call_model(seed, x, y, scale)
+        # Before validation, not instead of it: this only pulls in excursions
+        # small enough to be model noise about a physical floor (see
+        # clamp_to_physical_range). Anything larger still reaches
+        # validate_model_output and still fails.
+        clamped = clamp_to_physical_range(raster, self.config.channel_mapping)
+        if clamped:
+            self._clamped_cells = clamped
         validate_model_output(raster, self.config.channel_mapping)
         return adapt_raster_to_tile(raster, self.config, seed, x, y, scale)
 
