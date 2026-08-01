@@ -77,10 +77,19 @@ prototype's.
 
 MEMORY
 ------
-A production padded domain is 9216^2 = 84.9 Mcell. Every float32 grid is
-340 MB and the D8 receiver array is int64, i.e. 680 MB. ``estimate_peak_bytes``
-puts the live set at ~3 GB, which is well above the "~0.5 GB of bake grids"
-the plan's offline-appendix assumes. Size the pod accordingly.
+A production padded domain is 9216^2 = 84.9 Mcell, so every full-domain
+float32 or int32 grid is 340 MB and every float64 one is 680.
+``estimate_peak_bytes`` puts the live set at ~3 GB, which is well above the
+"~0.5 GB of bake grids" the plan's offline-appendix assumes. Size the pod
+accordingly.
+
+The peak stage is B2d, and the things that used to make it the peak were
+mostly bookkeeping rather than data: the D8 receiver array was int64 (680 MB
+for indices that cannot exceed 2^31), the implicit solve re-sorted the same
+surface B2c had already sorted (a 680 MB int64 argsort plus its 340 MB int32
+copy), and the regional-slope field was a 16x16-replicated 340 MB expansion of
+a 1.3 MB one. None of those are gone because anything was approximated -- each
+removal is byte-identical on the real tile and is asserted that way.
 
 TIMING
 ------
@@ -97,6 +106,7 @@ bottleneck**; thermal relaxation still is, and it is the stage a GPU eats.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import struct
@@ -828,10 +838,10 @@ def estimate_peak_bytes(geom: BakeGeometry = PRODUCTION) -> int:
 
     Counted, not timed, so box contention cannot touch it: 8 float32 grids
     (carrier, roughness delta, slope, filled, acc, depth, eroded, relaxed) plus
-    one int64 receiver grid over the PADDED domain.
+    one int32 receiver grid over the PADDED domain.
     """
     n = geom.padded_fine_px**2
-    return 8 * 4 * n + 8 * n
+    return 8 * 4 * n + 4 * n
 
 
 # ---------------------------------------------------------------------------
@@ -2114,6 +2124,11 @@ class BakeResult:
     #: tile's cross-tile hydrology came from; "" when it baked without one.
     #: This is the tile's hydrology PROVENANCE -- see ORDER_DEPENDENCE.
     superblock_fingerprint: str = ""
+    #: perf_counter() per stage, DIAGNOSTIC ONLY. Kept out of `cpu_seconds`
+    #: deliberately: this box is contended and wall-clock here is a fiction,
+    #: so nothing may gate on it. It exists to tell "the kernel got faster"
+    #: from "the kernel stopped using four threads".
+    wall_seconds: dict[str, float] = dataclasses.field(default_factory=dict)
 
 
 def bake_padded_domain(
@@ -2140,9 +2155,19 @@ def bake_padded_domain(
         )
     cell_m = geom.fine_pixel_m
     cpu: dict[str, float] = {}
+    wall: dict[str, float] = {}
+    # Wall is recorded as the gap between consecutive ticks -- the stages are
+    # back-to-back, so this is the stage plus a few microseconds of validation
+    # between them. It is DIAGNOSTIC only and `cpu_seconds` stays the reported
+    # unit: on a shared box wall-clock reads exactly like a slow configuration,
+    # which is the whole reason this pipeline never used it.
+    _wall_mark = [time.perf_counter()]
 
     def tick(name, c0):
         cpu[name] = time.process_time() - c0
+        now = time.perf_counter()
+        wall[name] = now - _wall_mark[0]
+        _wall_mark[0] = now
 
     # -- B0: C2 carrier. The B-spline prefilter is an IIR pass over the WHOLE
     # array, so the carrier itself has a domain dependence -- which is one of
@@ -2263,9 +2288,26 @@ def bake_padded_domain(
     # the STORED field is narrowed to float32 (measured to agree to 2 ppm, and
     # 340 MB against 680 MB over the padded domain matters here) since its
     # consumers are a log2 flow plane and threshold tests.
-    acc64 = np.asarray(
-        kernels.accumulate_mfd(filled, cell_m, p=consts.mfd_p, inflow=inflow)
+    #
+    # The sweep sorts `filled` by elevation, and B2d's implicit solve walks
+    # that SAME order over that SAME array. Asking for it here rather than
+    # sorting again there removes a full-domain argsort (13.6 s at 9216^2 with
+    # `kind="stable"`) and a ~1.0 GB int64-plus-int32 transient from the bake's
+    # PEAK stage, at the cost of keeping one 340 MB int32 array live across
+    # B2c->B2d. Asked for only when B2d will use it, and a kernel double that
+    # does not know the flag simply returns the area alone.
+    order_kwargs = (
+        {"return_order": True} if consts.incision_mode == "profile" else {}
     )
+    acc_result = kernels.accumulate_mfd(
+        filled, cell_m, p=consts.mfd_p, inflow=inflow, **order_kwargs
+    )
+    if isinstance(acc_result, tuple):
+        acc64, elev_order = acc_result
+    else:
+        acc64, elev_order = acc_result, None
+    acc64 = np.asarray(acc64)
+    del acc_result
     tick("B2c.accumulate_mfd", c0)
 
     # -- B2d: stream-power incision.
@@ -2287,24 +2329,31 @@ def bake_padded_domain(
                 "bake with incision_mode='depth'"
             )
         regional = None
+        regional_scale = 1
         if consts.profile_regional_s_ref > 0.0:
-            # The carrier's 30 m-scale slope, expanded back to the fine grid:
-            # a pure function of the (world-anchored, apron-consistent)
-            # carrier, so it cannot introduce a seam of its own. The scale
-            # factor 16 is the coarse/fine ratio whatever the geometry.
+            # The carrier's 30 m-scale slope: a pure function of the
+            # (world-anchored, apron-consistent) carrier, so it cannot
+            # introduce a seam of its own. The scale factor 16 is the
+            # coarse/fine ratio whatever the geometry.
+            #
+            # Kept COARSE. It used to be np.repeat-ed twice back up to the
+            # fine grid, which at 9216^2 is 340 MB of 16x16-replicated float32
+            # allocated inside the bake's peak stage; `profile_incision` now
+            # takes `regional_scale` and gathers `coarse[y // f, x // f]` in
+            # its row blocks instead. The gather copies values rather than
+            # computing them, and its index clamp reproduces the old
+            # edge-extension of a non-multiple domain, so the carve is
+            # bit-identical.
             f = geom.scale
             h_f, w_f = fine.shape
             cb = fine[:h_f - h_f % f, :w_f - w_f % f].reshape(
                 h_f // f, f, w_f // f, f).mean(axis=(1, 3))
             gyc, gxc = np.gradient(cb.astype(np.float64), cell_m * f)
-            regional = np.zeros(fine.shape, np.float32)
-            rs = np.repeat(np.repeat(np.hypot(gxc, gyc), f, axis=0), f, axis=1)
-            regional[:rs.shape[0], :rs.shape[1]] = rs
-            if rs.shape[0] < h_f:
-                regional[rs.shape[0]:, :] = regional[rs.shape[0] - 1: rs.shape[0], :]
-            if rs.shape[1] < w_f:
-                regional[:, rs.shape[1]:] = regional[:, rs.shape[1] - 1: rs.shape[1]]
-            del cb, gyc, gxc, rs
+            # float32 HERE, exactly where the assignment into the float32
+            # full-resolution array used to round it.
+            regional = np.hypot(gxc, gyc).astype(np.float32)
+            regional_scale = f
+            del cb, gyc, gxc
         # regional_p forwarded only when set, for the same test-double reason
         # as the constructional kwargs above; 0 means "use stream_n".
         regional_p_kwargs = (
@@ -2345,6 +2394,9 @@ def bake_padded_domain(
                     ratio=consts.incision_strength_ratio,
                 )
             }
+        # Forwarded only when B2c actually handed one back, for the same
+        # test-double reason as the kwargs above.
+        order_fwd = {} if elev_order is None else {"order": elev_order}
         eroded = np.asarray(
             kernels.profile_incision(
                 filled,
@@ -2359,14 +2411,16 @@ def bake_padded_domain(
                 gate_q=consts.channel_init_q,
                 regional_slope=regional,
                 regional_s_ref=consts.profile_regional_s_ref,
+                regional_scale=regional_scale,
                 sea_taper_top_m=consts.sea_taper_top_m,
                 sea_taper_bottom_m=consts.sea_taper_bottom_m,
                 **regional_p_kwargs,
                 **strength_kwargs,
+                **order_fwd,
             ),
             dtype=np.float32,
         )
-        del regional, strength_kwargs
+        del regional, strength_kwargs, order_fwd
         depth = filled - eroded
     else:
         depth = np.asarray(
@@ -2386,7 +2440,7 @@ def bake_padded_domain(
             dtype=np.float32,
         )
         eroded = filled - depth
-    del rec
+    del rec, elev_order
     tick("B2d.stream_power", c0)
 
     # -- B3: slope-limited thermal relaxation, AFTER incision so gully walls
@@ -2441,12 +2495,13 @@ def bake_padded_domain(
     # and the refill below resolves every basin it could create.
     c0 = time.process_time()
     if consts.meso_amp15_m > 0.0 or consts.meso_amp11_m > 0.0:
-        from .noise import meso_relief  # lazy, same reason as repose_field
+        from .flow import enforce_descent  # lazy, same reason as repose_field
+        from .noise import meso_relief
 
         # The gate needs the DOWNSTREAM slope of this exact surface: a gully
         # bed between steep walls must read its own gentle profile, or the
         # band perturbs bed long-profiles into the codec's quantization floor
-        # (see meso_relief's flow_slope note). rec4 is a 680 MB transient,
+        # (see meso_relief's flow_slope note). rec4 is a 340 MB transient,
         # dropped before the field is built.
         rec4, d8s4 = kernels.d8_receivers(z, cell_m)
         z_pre = z
@@ -2473,28 +2528,19 @@ def bake_padded_domain(
         # least min(its pre-meso drop, refill_eps_m) over its own pre-meso
         # receiver. Every interior cell then still has a strictly lower
         # neighbour (no pit, structurally) and every reach that was
-        # codec-proof stays codec-proof. Pure-numpy fixed point: each pass
-        # propagates one tree level; the raise is bounded by the band's own
-        # amplitude, so convergence is tens of passes, not thousands.
-        recf = np.asarray(rec4, dtype=np.int64).ravel()
-        del rec4
-        n_cells = recf.size
-        self_idx = np.arange(n_cells, dtype=np.int64)
-        tgt = np.where(recf >= 0, recf, self_idx)
-        del recf
-        zp = z_pre.ravel()
-        drop = np.minimum(zp - zp[tgt], np.float32(consts.refill_eps_m)
-                          ).astype(np.float32)
-        del zp, z_pre, self_idx
-        zf = np.ascontiguousarray(z, dtype=np.float32).ravel()
-        for _ in range(256):
-            need = zf[tgt] + drop
-            if not (zf < need).any():
-                break
-            np.maximum(zf, need, out=zf)
-        del tgt, drop
-        z = zf.reshape(z.shape)
-        del zf
+        # codec-proof stays codec-proof.
+        #
+        # ONE topological sweep, not a fixed point. This was a ~15-20 pass
+        # numpy iteration of `np.maximum(zf, zf[tgt] + drop)` at 1.22 s a
+        # pass, each pass propagating one tree level and each pass building a
+        # 340 MB `need`. But the constraint lives on the pre-meso D8 forest,
+        # whose receivers are strictly lower, so visiting each cell after its
+        # own receiver computes the unique least fixed point directly -- and
+        # in the same float32 arithmetic, which (addition being monotone) makes
+        # it the same bits rather than merely the same value. It also drops
+        # the int64 `tgt` and the full-domain `arange` that built it.
+        z = enforce_descent(rec4, z_pre, z, consts.refill_eps_m)
+        del rec4, z_pre
     tick("B4.meso", c0)
 
     # -- B4b: micro-refill, belt and braces behind the descent enforcement
@@ -2524,6 +2570,7 @@ def bake_padded_domain(
         "roughness_seed": seed,
         "interior_dead_ends": interior_dead_ends,
         "cpu_seconds": cpu,
+        "wall_seconds": wall,
     }
 
 
@@ -2670,4 +2717,5 @@ def bake_tile(
         superblock_fingerprint=(
             "" if inflow_source is None else inflow_source.fingerprint_hex
         ),
+        wall_seconds=out.get("wall_seconds", {}),
     )

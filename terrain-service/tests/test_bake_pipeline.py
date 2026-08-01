@@ -150,8 +150,12 @@ def ref_d8(z, cell_m):
     return rec, best.astype(np.float32)
 
 
-def ref_accumulate(z, cell_m, p=1.1, inflow=None):
+def ref_accumulate(z, cell_m, p=1.1, inflow=None, *, return_order=False):
     """Own cell area plus any injected inflow. NO routing, on purpose.
+
+    ``return_order`` is accepted because the real kernel hands B2d the
+    ascending-elevation order it had to sort anyway; this double has no sweep,
+    so it sorts only when asked, which is what keeps the wiring under test.
 
     Routing is unbounded by nature (that is why the hydrology pyramid exists),
     so a routing reference would make the apron test measure the reference
@@ -163,6 +167,8 @@ def ref_accumulate(z, cell_m, p=1.1, inflow=None):
     a = np.full(np.shape(z), cell_m * cell_m, np.float64)
     if inflow is not None:
         a = a + np.asarray(inflow, np.float64)
+    if return_order:
+        return a, np.argsort(np.asarray(z), axis=None).astype(np.int32)
     return a
 
 
@@ -184,9 +190,16 @@ def ref_stream_power(acc, slope, K=0.15, m=0.45, n=0.8, cap_m=25.0,
 def ref_profile_incision(filled, receivers, acc, cell_m, K_dt=1.5, m=0.45, n=0.8,
                          cap_m=25.0, a_crit_m2=1.0e4, gate_q=2.0,
                          regional_slope=None, regional_s_ref=0.2,
-                         erodibility=None,
-                         sea_taper_top_m=0.0, sea_taper_bottom_m=-200.0):
+                         regional_scale=1, erodibility=None,
+                         sea_taper_top_m=0.0, sea_taper_bottom_m=-200.0,
+                         order=None):
     """LOCAL (radius-1) reference for the profile solve, on purpose.
+
+    ``regional_scale`` and ``order`` mirror the real kernel's memory-saving
+    parameters: the pipeline hands over a COARSE regional field plus its
+    coarsening factor, and the ascending-elevation order B2c already sorted.
+    Expanded/ignored here respectively -- what these tests check is that the
+    pipeline hands over the right field, not how the solve consumes it.
 
     The real ``incise.profile_incision`` propagates the solved receiver
     elevation upstream along the whole D8 tree -- unbounded by nature, the
@@ -214,9 +227,14 @@ def ref_profile_incision(filled, receivers, acc, cell_m, K_dt=1.5, m=0.45, n=0.8
         # exactly as the real kernel does.
         kfac = kfac * np.asarray(erodibility, np.float64).ravel()
     if regional_slope is not None and regional_s_ref > 0.0:
+        sreg = np.asarray(regional_slope, np.float64)
+        if regional_scale > 1:
+            f = int(regional_scale)
+            ys = np.minimum(np.arange(h) // f, sreg.shape[0] - 1)
+            xs = np.minimum(np.arange(w) // f, sreg.shape[1] - 1)
+            sreg = sreg[ys][:, xs]
         kfac = kfac * np.minimum(
-            1.0, np.clip(np.asarray(regional_slope, np.float64), 0.0, None)
-            / regional_s_ref).ravel() ** n
+            1.0, np.clip(sreg, 0.0, None) / regional_s_ref).ravel() ** n
     if a_crit_m2 > 0.0:
         aq = np.power(a, gate_q).ravel()
         kfac = kfac * (aq / (aq + a_crit_m2 ** gate_q))
@@ -751,8 +769,15 @@ def test_profile_mode_wires_the_profile_kernel_and_depth_is_the_default():
     assert calls[0]["K_dt"] == prof_consts.profile_K_dt
     assert calls[0]["regional_slope"] is not None, \
         "profile_regional_s_ref > 0 must hand the kernel a regional slope field"
+    # COARSE plus its coarsening factor, not a 16x16-replicated full-resolution
+    # copy: expanding it here cost 340 MB inside the bake's peak stage. The
+    # pair must still cover the padded domain exactly.
+    f = TEST_GEOM.scale
+    assert calls[0]["regional_scale"] == f
     assert calls[0]["regional_slope"].shape == (
-        TEST_GEOM.padded_fine_px, TEST_GEOM.padded_fine_px)
+        TEST_GEOM.padded_fine_px // f, TEST_GEOM.padded_fine_px // f)
+    assert "order" in calls[0], \
+        "B2c's ascending-elevation order must reach the profile solve"
     assert not np.array_equal(prof.elevation_m, base.elevation_m), \
         "the two formulations must actually produce different surfaces"
 

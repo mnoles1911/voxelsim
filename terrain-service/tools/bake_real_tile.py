@@ -481,7 +481,9 @@ def main() -> int:
     print(f"\n  BAKE  {cpu_bake:.1f} s cpu   {wall_bake:.1f} s wall "
           f"({cpu_bake/max(wall_bake,1e-9):.1f}x parallel)")
     for k, v in result.cpu_seconds.items():
-        print(f"    {k:<22} {v:7.2f} s cpu")
+        w = result.wall_seconds.get(k)
+        wtxt = "" if w is None else f"   {w:7.2f} s wall"
+        print(f"    {k:<22} {v:7.2f} s cpu{wtxt}")
     print(f"  peak working set {mem_bake['peak_working_set']/2**30:.2f} GiB   "
           f"peak commit {mem_bake['peak_commit']/2**30:.2f} GiB   "
           f"(before bake: {mem_pre['peak_working_set']/2**30:.2f} GiB)")
@@ -545,6 +547,7 @@ def main() -> int:
         "cpu_seconds_superblock": cpu_sb,
         "cpu_seconds_encode": cpu_enc, "wall_seconds_encode": wall_enc,
         "cpu_stages": result.cpu_seconds,
+        "wall_stages": result.wall_seconds,
         "mem_before": mem_pre, "mem_after_bake": mem_bake, "mem_after_encode": mem_enc,
         "estimate_peak_bytes": bp.estimate_peak_bytes(geom),
         "stats": result.stats,
