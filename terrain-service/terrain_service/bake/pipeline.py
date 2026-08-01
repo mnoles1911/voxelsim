@@ -101,7 +101,7 @@ import hashlib
 import json
 import struct
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as np
@@ -824,14 +824,61 @@ def bake_fingerprint(
 
 
 def estimate_peak_bytes(geom: BakeGeometry = PRODUCTION) -> int:
-    """Rough live-set of ``bake_padded_domain`` in bytes.
+    """Live-set HIGH-WATER MARK of ``bake_padded_domain``, in bytes.
 
-    Counted, not timed, so box contention cannot touch it: 8 float32 grids
-    (carrier, roughness delta, slope, filled, acc, depth, eroded, relaxed) plus
-    one int64 receiver grid over the PADDED domain.
+    Counted, not timed, so box contention cannot touch it -- but counted from
+    the CODE, which the previous version was not. It counted "8 float32 grids
+    plus one int64 receiver grid" = 3.16 GiB against a measured 6.90 GiB peak
+    commit, a 2.2x undercount, and this is the number pod sizing reads.
+
+    Three things it missed, all of them named arrays or first-class kernel
+    working sets rather than allocator noise:
+
+    1. **Four B1 temporaries that are never freed.** ``gy``, ``gx`` (the
+       gradient pair), ``slope`` and ``delta`` are dead after B1's roughness
+       call, but nothing drops the references, so all four stay live to the
+       end of the function. That is 4 padded float32 grids -- 1.27 GiB at
+       production geometry, ~19% of the peak -- of pure ballast. (Not fixed
+       here: it is a live-range change in a file three sessions are editing.
+       ``del gy, gx`` after ``slope``, ``del slope`` after the roughness call
+       and ``del delta`` after ``fine = fine + delta`` reclaim all of it and
+       cannot move a baked byte.)
+    2. **Only ONE wide grid was counted, and the peak holds four.** The D8
+       receivers are int64 (8 bytes/cell, 680 MB), MFD accumulation is float64
+       (another 680 MB), and B4's descent enforcement materialises THREE
+       int64 index grids at once -- ``recf``, ``self_idx`` and ``tgt``.
+    3. **The kernels' own working sets.** ``profile_incision`` argsorts
+       84.9 M cells (an int64 order array, then an int32 copy of it) and
+       builds ``kfac32``/``rec32``/``dist``; ``repose_field`` and
+       ``repose_erodibility`` each yield a full grid; the priority flood
+       carries ``done``/``hz``/``hi``.
+
+    The high-water is reached TWICE, at nearly the same height, which is why
+    the total below is not attributed to one stage: B2d (measured 6.65 GiB,
+    inside ``profile_incision``'s argsort) and B4 (measured 6.90 GiB, at the
+    three-index-grid line). Both enumerate to the same 12 float32-equivalent
+    grids + 4 wide grids, i.e. 80 bytes per padded cell.
+
+    MEASURED, 9216^2 padded domain, one tile per process, Windows
+    PeakPagefileUsage: 6.90 GiB commit / 6.24 GiB working set, against 6.33 GiB
+    from this count. The residual is the interpreter, numba and the compiled
+    kernel cache -- 0.39 GiB of commit before the bake starts -- so a pod still
+    wants headroom over this number, but it is now headroom and not a factor
+    of two. Size a bake worker at 8 GiB.
     """
     n = geom.padded_fine_px**2
-    return 8 * 4 * n + 8 * n
+    grid32 = 4 * n          # one padded float32 grid: 340 MB at production
+    grid64 = 8 * n          # one padded int64 / float64 grid: 680 MB
+
+    # Live at the B4 high-water. B2d's high-water enumerates to the same
+    # total with different names (regional + erodibility + kfac32 + rec32 +
+    # dist in place of z_pre/d8s4/z, and profile_incision's int64 order array
+    # in place of one of B4's index grids).
+    held = 6 * grid32       # fine, filled, d8_slope, eroded, depth, z
+    leaked_b1 = 4 * grid32  # gy, gx, slope, delta -- see (1) above
+    stage_tmp = 2 * grid32  # z_pre, d8s4 (B4) / kfac32, dist (B2d)
+    wide = 4 * grid64       # acc64 + three int64 index grids
+    return held + leaked_b1 + stage_tmp + wide
 
 
 # ---------------------------------------------------------------------------
@@ -2104,7 +2151,9 @@ class BakeResult:
     accumulation_m2: np.ndarray
     #: uint8 flow plane, interior.
     flow: np.ndarray
-    #: process_time() per stage. NEVER wall-clock: this box is contended.
+    #: process_time() per stage. The contention-robust unit, and the one to
+    #: quote -- but see ``wall_seconds``: for a stage running numba's OpenMP
+    #: layer this over-counts, because idle workers spin at the barrier.
     cpu_seconds: dict[str, float]
     #: Diagnostics that a contended box cannot distort (counts and extents).
     stats: dict[str, float]
@@ -2114,6 +2163,12 @@ class BakeResult:
     #: tile's cross-tile hydrology came from; "" when it baked without one.
     #: This is the tile's hydrology PROVENANCE -- see ORDER_DEPENDENCE.
     superblock_fingerprint: str = ""
+    #: perf_counter() per stage, same keys as ``cpu_seconds``. Recorded so the
+    #: PER-STAGE parallel factor (cpu/wall) is visible: only B2b and B3 are
+    #: numba parallel=True, so the bake's overall ratio is an Amdahl figure and
+    #: says nothing about how well those two scale. Defaulted so an existing
+    #: constructor keeps working.
+    wall_seconds: dict[str, float] = field(default_factory=dict)
 
 
 def bake_padded_domain(
@@ -2140,9 +2195,38 @@ def bake_padded_domain(
         )
     cell_m = geom.fine_pixel_m
     cpu: dict[str, float] = {}
+    wall: dict[str, float] = {}
+
+    # WALL alongside CPU, per stage. process_time() stays the headline unit --
+    # this box is contended and wall reads like a slow configuration -- but on
+    # its own it is UNINTERPRETABLE for the two parallel stages, and that has
+    # already cost one wrong diagnosis:
+    #
+    #   * numba's OpenMP layer SPIN-WAITS at the parallel barrier, so a worker
+    #     that has finished its prange slice keeps billing CPU until the last
+    #     one lands. B3.relax's CPU total is therefore ~1.7x the useful work it
+    #     did (measured: the same 9216^2 step bills 2.83 CPU-s at 1 thread and
+    #     4.83 CPU-s at 12 for identical output).
+    #   * With only B2b and B3 parallel, the bake's headline cpu/wall is an
+    #     AMDAHL number, not a scaling number: ~58% of the CPU total is in the
+    #     parallel stages, so even a perfect 7.5x there caps the whole bake at
+    #     2.0x -- which is exactly what it reports. Reading that 2.0x as
+    #     "the parallel kernels only get 2x" is the mistake this makes
+    #     impossible, because now every stage carries its own ratio.
+    #
+    # Stages are contiguous: each one opens with ``c0 = time.process_time()``
+    # on the line after the previous ``tick``, with only comments between, so
+    # wall-since-the-last-tick IS that stage's wall and no second timestamp has
+    # to be threaded through nine call sites. Timings only -- no baked byte
+    # moves.
+    _wall_mark = time.perf_counter()
 
     def tick(name, c0):
+        nonlocal _wall_mark
         cpu[name] = time.process_time() - c0
+        now = time.perf_counter()
+        wall[name] = now - _wall_mark
+        _wall_mark = now
 
     # -- B0: C2 carrier. The B-spline prefilter is an IIR pass over the WHOLE
     # array, so the carrier itself has a domain dependence -- which is one of
@@ -2524,6 +2608,7 @@ def bake_padded_domain(
         "roughness_seed": seed,
         "interior_dead_ends": interior_dead_ends,
         "cpu_seconds": cpu,
+        "wall_seconds": wall,
     }
 
 
@@ -2665,6 +2750,7 @@ def bake_tile(
         accumulation_m2=acc,
         flow=plane,
         cpu_seconds=out["cpu_seconds"],
+        wall_seconds=out["wall_seconds"],
         stats=stats,
         missing_coarse=tuple(missing),
         superblock_fingerprint=(
