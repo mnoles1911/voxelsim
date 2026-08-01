@@ -161,13 +161,51 @@ audit's items 1–4 have landed and the per-tile cost has come down.
 ## What provinces do NOT solve
 
 **Pacing.** Provinces vary the terrain *given* the climate; they do not make the
-climate change faster. The stated goal — Iceland to Eastern Europe in a session
-— is mostly a *climate-gradient* problem, and the lever for it is spatial
-compression of the model's conditioning (sample the conditioning fields at 2–4×
-the rate so continental gradients arrive 2–4× sooner). Provinces then make each
-climate zone *look* correspondingly different. The two are complementary and the
-conditioning work should be evaluated first, because it is cheaper and it
-determines how much province variety a player actually encounters.
+climate change faster.
+
+**CORRECTION, 2026-08-01.** An earlier revision of this document said the lever
+for pacing was "spatial compression of the model's conditioning (sample the
+conditioning fields at 2–4× the rate)". That was written from an unverified
+inference — the model is conditioned on ETOPO/WorldClim, therefore it inherits
+Earth's transition scales, therefore compressing the conditioning compresses the
+scales. **Every step of that is wrong**, and it was measured rather than argued:
+
+* **The conditioning is not Earth data.** `world_pipeline.py:676-682` builds it
+  from Perlin fBm quantile-matched to Earth's MARGINAL HISTOGRAM
+  (`synthetic_map.py:45-132`). Earth's rasters are read once to build 64-knot
+  quantile tables; only the value distribution survives. Earth's spatial
+  arrangement is discarded before inference ever runs.
+* **The pipeline is already 100–1000× faster than Earth.** Measured E-W
+  autocorrelation to 1/e: Earth's temperature never decorrelates within
+  17,500 km (latitude dominates) and its precipitation takes 2,285 km; the
+  shipping sketch decorrelates at 20.6 km and 18.3 km respectively.
+* **And it is saturated.** Median |ΔT| over a 31 km walk is 12.0 °C; over 100 km
+  it is 12.3 °C. The full swing already arrives by ~30 km, and biome persistence
+  reaches its floor by 61 km. Further compression only moves the sub-15 km end,
+  which is below one coarse cell (7.68 km).
+* **There is a hard aliasing ceiling anyway.** The sketch is sampled at exactly
+  the resolution the coarse model generates, so `frequency_mult` has honest
+  headroom of 3 → 4. That is 1.3×, not 2–4×.
+
+So pacing is NOT the deficiency. If mechanical compression is ever wanted
+regardless, the right knob is `coarse_pooling` (pools the coarse model's OUTPUT,
+so the model stays in-distribution) rather than `frequency_mult` (feeds
+compressed gradients to a model trained on ~130 km crops). Both are already
+`WorldShapeConfig` fields and already hashed into `provider_id`; neither has
+ever been run in this project.
+
+**The actual deficiency is contrast and coverage, not rate.**
+`finalize_synthetic_map` couples temperature to elevation through a real lapse
+rate but never couples precipitation to anything — there is no orographic
+rainfall, no rain shadow, no continentality. So **no spatial scale and no
+compression factor can produce an arid interior**: the sketch classifies to
+DESERT 1.84% and SAVANNA 0.00%. That is why three biomes are unreachable in the
+shipped seed, and it is structural rather than unlucky — a different seed does
+not fix it. The fix is conditioning contrast, for which `tools/make_conditioning.py`
+and the custom-GeoTIFF path (`world_pipeline.py:779-819`) already exist.
+
+This matters for provinces directly: `ARID` cannot be tuned, judged, or even
+encountered until the conditioning produces dry climate at all.
 
 The hashed geological provinces are the exception: their frequency is ours to
 choose, so `VOLCANIC` and `KARST` regions can be tuned to ~50–100 km and give
@@ -204,10 +242,25 @@ should be cut.
 
 ## Recommended order
 
-1. Bake audit items 1–4 (bit-identical, ~350 s → ~230 s). Do not build on a
-   known-slow bake.
-2. Conditioning spatial compression — determines pacing, and determines whether
-   province variety is actually encountered.
-3. Generate a world that contains dry climate, so `ARID` can be judged.
-4. Tier 1.
+Revised 2026-08-01 after the conditioning measurement above.
+
+1. **Bake audit.** Item 1 landed: 350 s → 143 s wall, byte-identical. Remaining
+   items in flight. Do not build on a known-slow bake.
+2. **Run `terrain-service/tools/world_map.py` at the shipping default.** ~35 s on
+   CPU torch, no pod. It runs the COARSE stage only — latent and decoder are lazy
+   InfiniteTensors never touched — and its `classify()` mirrors
+   `vxc::classifyBiome` by reading thresholds out of `biome.h` directly, so it
+   cannot drift from the client. Compare the delivered coarse world's
+   biome-transition distances against the sketch measurements above.
+   * If they MATCH, variety is already at target and any remaining monotony is
+     downstream in voxelsim's rendering or materials, not in generation. That
+     would redirect this whole effort.
+   * If the delivered world is much SMOOTHER than the sketch, the coarse model is
+     the smoother, and `cond_snr` is the suspect rather than any spatial knob.
+   Blocked only on `terrain_diffusion` not being installed on this box; torch is
+   (CPU build).
+3. **Conditioning contrast**, not compression: orographic rainfall / rain shadow
+   so that arid interiors can exist at all. Until this lands, `ARID` is
+   untunable and three biomes stay unreachable on every seed.
+4. **Tier 1 provinces.**
 5. Re-measure, then decide whether Tier 2/3 earn their cost.
