@@ -2,6 +2,11 @@
 
 #include "VoxelEarth.h"
 
+#include "HAL/PlatformProcess.h" // runtime zstd bind (GetDllHandle/GetDllExport)
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
+#include "Misc/Paths.h"
+
 #ifndef VOXELEARTH_WITH_ZSTD
 #define VOXELEARTH_WITH_ZSTD 0
 #endif
@@ -66,6 +71,51 @@ namespace VoxelEarth
 		}
 #endif // VOXELEARTH_WITH_ZSTD
 
+		// --- runtime-bound zstd ---------------------------------------------
+		//
+		// Same contract as ZstdDecompressBlock above, against pointers resolved
+		// by the dynamic loader instead of by the linker. See the header for
+		// why this route exists at all: binding at runtime introduces no
+		// link-time zstd symbols, so it cannot collide with the zstd already
+		// statically linked inside ThirdParty/Blosc's libblosc.lib -- the
+		// hazard VoxelEarth.Build.cs measured and that keeps zstd out of
+		// voxel-core.
+		//
+		// Signatures are zstd's public C ABI and are restated rather than
+		// included, because including zstd.h is precisely what this avoids.
+		// They have been stable since zstd 1.0 and are covered by its
+		// API-stability promise; a library that does not match is rejected by
+		// the both-or-neither export check in TryRegisterRuntimeZstd.
+		using FZstdDecompressFn = size_t (*)(void* Dst, size_t DstCap, const void* Src,
+		                                     size_t SrcSize);
+		using FZstdIsErrorFn = unsigned (*)(size_t Code);
+
+		void* GRuntimeZstdHandle = nullptr;
+		FZstdDecompressFn GRuntimeZstdDecompress = nullptr;
+		FZstdIsErrorFn GRuntimeZstdIsError = nullptr;
+		FString GRuntimeZstdPath;
+
+		bool RuntimeZstdDecompressBlock(void* /*User*/, const uint8_t* Src, size_t SrcLen,
+		                                uint8_t* Dst, size_t DstLen)
+		{
+			if (Src == nullptr || Dst == nullptr || SrcLen == 0 || DstLen == 0)
+			{
+				return false;
+			}
+			if (GRuntimeZstdDecompress == nullptr || GRuntimeZstdIsError == nullptr)
+			{
+				return false;
+			}
+			const size_t Produced = GRuntimeZstdDecompress(Dst, DstLen, Src, SrcLen);
+			if (GRuntimeZstdIsError(Produced))
+			{
+				return false;
+			}
+			// The exact-length clause, and the only length check that means
+			// anything under CODEC_ZSTD -- see ZstdDecompressBlock's comment.
+			return Produced == DstLen;
+		}
+
 		vxc::FineDecompressor& MutableDecompressor()
 		{
 			static vxc::FineDecompressor Instance = []
@@ -96,10 +146,102 @@ namespace VoxelEarth
 		MutableDecompressor() = Decompressor;
 	}
 
+	bool TryRegisterRuntimeZstd()
+	{
+		// Already have one (compile-time zstd, or an explicit
+		// SetFineTileDecompressor from a plugin or a test): never override it.
+		// Whoever registered deliberately outranks a library found by search.
+		if (HasFineTileDecompressor())
+		{
+			return true;
+		}
+		if (GRuntimeZstdHandle != nullptr)
+		{
+			return GRuntimeZstdDecompress != nullptr; // already tried
+		}
+
+		TArray<FString> Candidates;
+		FString Override;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelZstdDll="), Override) && !Override.IsEmpty())
+		{
+			Candidates.Add(Override);
+		}
+		// Shipped with the game, if anyone puts one there.
+		const FString Shipped = FPaths::Combine(FPaths::ProjectDir(), TEXT("Binaries"),
+		                                        TEXT("ThirdParty"), TEXT("zstd"),
+		                                        FString(FPlatformProcess::GetBinariesSubdirectory()));
+		// Bare names last, so the platform's own search path is the fallback
+		// rather than the first thing tried -- a game that ships its own zstd
+		// must not be silently overridden by whatever is on PATH.
+#if PLATFORM_WINDOWS
+		const TCHAR* Names[] = {TEXT("libzstd.dll"), TEXT("zstd.dll")};
+#elif PLATFORM_MAC
+		const TCHAR* Names[] = {TEXT("libzstd.1.dylib"), TEXT("libzstd.dylib")};
+#else
+		const TCHAR* Names[] = {TEXT("libzstd.so.1"), TEXT("libzstd.so")};
+#endif
+		for (const TCHAR* Name : Names)
+		{
+			Candidates.Add(FPaths::Combine(Shipped, Name));
+		}
+		for (const TCHAR* Name : Names)
+		{
+			Candidates.Add(FString(Name));
+		}
+
+		for (const FString& Candidate : Candidates)
+		{
+			void* Handle = FPlatformProcess::GetDllHandle(*Candidate);
+			if (Handle == nullptr)
+			{
+				continue;
+			}
+			// BIND BOTH OR NEITHER. A library that exports ZSTD_decompress but
+			// not ZSTD_isError is not a zstd this code understands, and
+			// registering a half-bound decompressor would turn a deployment
+			// mistake into wrong terrain -- exactly what the whole
+			// kNoDecompressor path exists to prevent.
+			auto* Decompress = reinterpret_cast<FZstdDecompressFn>(
+			    FPlatformProcess::GetDllExport(Handle, TEXT("ZSTD_decompress")));
+			auto* IsError = reinterpret_cast<FZstdIsErrorFn>(
+			    FPlatformProcess::GetDllExport(Handle, TEXT("ZSTD_isError")));
+			if (Decompress == nullptr || IsError == nullptr)
+			{
+				UE_LOG(LogVoxelEarth, Warning,
+				       TEXT("vxtl v2 CODEC_ZSTD: loaded '%s' but it does not export both "
+				            "ZSTD_decompress and ZSTD_isError -- ignoring it rather than "
+				            "registering a half-bound decompressor."),
+				       *Candidate);
+				FPlatformProcess::FreeDllHandle(Handle);
+				continue;
+			}
+			GRuntimeZstdHandle = Handle;
+			GRuntimeZstdDecompress = Decompress;
+			GRuntimeZstdIsError = IsError;
+			GRuntimeZstdPath = Candidate;
+
+			vxc::FineDecompressor D;
+			D.fn = &RuntimeZstdDecompressBlock;
+			D.user = nullptr;
+			SetFineTileDecompressor(D);
+			return true;
+		}
+		return false;
+	}
+
 	void LogFineTileCodecStatus()
 	{
 		if (HasFineTileDecompressor())
 		{
+			if (!GRuntimeZstdPath.IsEmpty())
+			{
+				UE_LOG(LogVoxelEarth, Log,
+				       TEXT("vxtl v2 CODEC_ZSTD: decompressor bound at RUNTIME from '%s'. No "
+				            "zstd symbols are linked into this binary, so it cannot collide "
+				            "with the zstd already inside ThirdParty/Blosc."),
+				       *GRuntimeZstdPath);
+				return;
+			}
 			UE_LOG(LogVoxelEarth, Log,
 			       TEXT("vxtl v2 CODEC_ZSTD: decompressor registered at the host boundary "
 			            "(voxel-core links none of its own)."));
@@ -112,10 +254,14 @@ namespace VoxelEarth
 		// is stated once, up front, with the exact reason code the parse will
 		// give.
 		UE_LOG(LogVoxelEarth, Warning,
-		       TEXT("vxtl v2 CODEC_ZSTD: NO decompressor registered. CODEC_RAW tiles are "
-		            "unaffected; a CODEC_ZSTD tile will be REFUSED WHOLE by "
-		            "vxc::FineTile::parse with FineError::kNoDecompressor (never decoded "
-		            "as zeros). Build with a zstd module visible to VoxelEarth.Build.cs, "
-		            "or call VoxelEarth::SetFineTileDecompressor before loading tiles."));
+		       TEXT("vxtl v2 CODEC_ZSTD: NO decompressor registered, and no zstd was found "
+		            "at runtime. CODEC_RAW tiles are unaffected; a CODEC_ZSTD tile will be "
+		            "REFUSED WHOLE by vxc::FineTile::parse with FineError::kNoDecompressor "
+		            "(never decoded as zeros). Fixes, cheapest first: drop a zstd shared "
+		            "library in <Project>/Binaries/ThirdParty/zstd/%s/, pass "
+		            "-VoxelZstdDll=<path>, build with a zstd module visible to "
+		            "VoxelEarth.Build.cs, or call VoxelEarth::SetFineTileDecompressor "
+		            "before loading tiles."),
+		       FPlatformProcess::GetBinariesSubdirectory());
 	}
 } // namespace VoxelEarth

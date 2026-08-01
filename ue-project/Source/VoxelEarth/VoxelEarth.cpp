@@ -43,6 +43,14 @@ void FVoxelEarthModule::StartupModule()
 	       TEXT("voxelcore.lib Amplifier::column(0,0): surface %d mm, surfaceMat %u"),
 	       Col.surfaceMm, static_cast<uint32>(Col.surfaceMat));
 
+	// Bind a zstd found at runtime, if this build did not link one. Must come
+	// BEFORE the status log below (which reports the outcome) and before any
+	// tile is loaded -- a vxc::FineTile keeps the decompressor it was parsed
+	// with, so registration is deliberately non-retroactive. A no-op when
+	// something is already registered; failure is not an error. See
+	// VoxelTileCodec.h for why runtime binding rather than linking.
+	VoxelEarth::TryRegisterRuntimeZstd();
+
 	// Which zstd (if any) this binary will decode `.vxtl` v2 CODEC_ZSTD tiles
 	// with. Stated once, here, because the alternative to reading it in the log
 	// is discovering it from a fine tile that will not load -- or worse, from

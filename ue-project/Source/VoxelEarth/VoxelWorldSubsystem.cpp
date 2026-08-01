@@ -13576,8 +13576,39 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	//                              that in mind; correctness does not depend
 	//                              on it (RequestFootprint pulls in whatever a
 	//                              footprint needs regardless).
+	// INI FALLBACK ADDED 2026-08-01, and the paragraph above is the reason it
+	// needs justifying rather than just doing. That text argued command-line
+	// only "so it must never become a silent standing default the way
+	// -VoxelTileDir did", because a fine run and a coarse run are not
+	// comparable. That argument is correct FOR A BENCH, and it is the wrong
+	// default for a product: the plan makes the fine tier a hard dependency,
+	// not a progressive enhancement ("terrain must BLOCK until the fine tile is
+	// present rather than pop"), so a shipping launch that quietly renders the
+	// 30 m tier is the same class of trap -VoxelTileDir's ini default was added
+	// to remove -- verifying against terrain that is not the terrain.
+	//
+	// What made the original objection bite was SILENCE, not the default. So
+	// the default is added and the silence is not: MakeFineTileStreamer already
+	// logs "Fine tier ENABLED: ... pitch=1875 mm/px" with the root, provider,
+	// seed, ring and budget on every run that has one, the HUD carries a tier
+	// row, and a run with no fine tier says so too. Anyone comparing two runs
+	// can see in one grep which tier each was.
+	//
+	// PRECEDENCE, identical to -VoxelTileDir's so there is one rule to learn:
+	//   1. -VoxelFineTileDir= on the command line WINS, including an EMPTY
+	//      value, which is how a bench A/B deliberately selects the coarse
+	//      tier against a project that defaults to fine.
+	//   2. DefaultFineTileDir / DefaultFineTileProviderId under
+	//      [/Script/VoxelEarth.VoxelWorldSubsystem] in Config/DefaultGame.ini.
+	//   3. Neither -> empty -> FineStreamer null, coarse world, as before.
+	// FParse::Value returning false (switch absent) is what falls through to
+	// the ini; a present-but-empty switch returns true and stops here.
 	FString FineTileDir;
-	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileDir="), FineTileDir);
+	if (!FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileDir="), FineTileDir) && GConfig)
+	{
+		GConfig->GetString(TEXT("/Script/VoxelEarth.VoxelWorldSubsystem"),
+		                   TEXT("DefaultFineTileDir"), FineTileDir, GGameIni);
+	}
 	if (!FineTileDir.IsEmpty() && FPaths::IsRelative(FineTileDir))
 	{
 		// Same rule -VoxelTileDir uses: relative paths resolve against Content/.
@@ -13585,7 +13616,17 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		FPaths::CollapseRelativeDirectories(FineTileDir);
 	}
 	FString FineProviderId;
-	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileProviderId="), FineProviderId);
+	if (!FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileProviderId="), FineProviderId) && GConfig)
+	{
+		// Resolved from the ini INDEPENDENTLY of the dir above, so that a
+		// command-line -VoxelFineTileDir pointed at a scratch bake still picks
+		// up the project's provider id and does not have to restate it. The
+		// mismatch case is not silent either: FVoxelFineTileStreamer refuses
+		// every tile whose stamp disagrees and counts them as
+		// identityMismatch, which the 5 s fine-tier log line reports.
+		GConfig->GetString(TEXT("/Script/VoxelEarth.VoxelWorldSubsystem"),
+		                   TEXT("DefaultFineTileProviderId"), FineProviderId, GGameIni);
+	}
 	double FineBudgetGB = 0.0;
 	FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileCacheBudgetGB="), FineBudgetGB);
 	const uint64 FineBudgetBytes = FineBudgetGB > 0.0 ? uint64(FineBudgetGB * 1024.0 * 1024.0 * 1024.0) : 0;

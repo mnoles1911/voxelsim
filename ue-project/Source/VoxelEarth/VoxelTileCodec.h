@@ -97,4 +97,34 @@ namespace VoxelEarth
 	 * time a fine tile fails to load.
 	 */
 	VOXELEARTH_API void LogFineTileCodecStatus();
+
+	/**
+	 * Tries to bind a zstd found AT RUNTIME and register it. Called from
+	 * FVoxelEarthModule::StartupModule before LogFineTileCodecStatus, and a
+	 * no-op if something is already registered (an explicit
+	 * SetFineTileDecompressor always wins).
+	 *
+	 * WHY RUNTIME BINDING AND NOT A LINKED LIBRARY. VoxelEarth.Build.cs
+	 * measured that the UE 5.8 binary/launcher distribution ships no C/C++
+	 * zstd, and that scanning engine binaries for ZSTD_decompress finds one
+	 * already statically linked inside ThirdParty/Blosc's libblosc.lib. Linking
+	 * a second copy puts two zstds' C symbols in one binary at a version nobody
+	 * chose -- the hazard that argument is about, and whose failure mode is
+	 * wrong terrain rather than a link error. Binding through the platform's
+	 * dynamic loader introduces NO link-time symbols at all, so that collision
+	 * cannot occur, and it honours the injection seam voxel-core was built
+	 * around instead of working past it.
+	 *
+	 * Search order, first hit wins:
+	 *   1. -VoxelZstdDll=<path>            explicit override, absolute path
+	 *   2. <Project>/Binaries/ThirdParty/zstd/<Platform>/<lib>  shipped with
+	 *                                      the game
+	 *   3. the platform's own search path  a system or engine-provided zstd
+	 *
+	 * Returns true if a decompressor is registered when it returns -- including
+	 * the case where one already was. Failure is NOT an error: a build that
+	 * only meets CODEC_RAW tiles is valid, and LogFineTileCodecStatus states
+	 * the outcome either way.
+	 */
+	VOXELEARTH_API bool TryRegisterRuntimeZstd();
 } // namespace VoxelEarth
