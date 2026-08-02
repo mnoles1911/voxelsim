@@ -319,3 +319,70 @@ def test_pregen_print_conditioning_digest(tmp_path, monkeypatch):
     )
     assert ok.returncode == 0, ok.stderr
     assert compute_conditioning_digest(root=root) in ok.stdout
+
+
+# ---------------------------------------------------------------------------
+# The superblock completeness PUBLISH gate.
+#
+# Before this existed, "INCOMPLETE (102 of 256 coarse tiles absent)" was printed
+# and the tile was published anyway -- which is how the 2026-08-02 world got
+# baked. The defect is permanent (a shipped tile is never regenerated) and in
+# multiplayer it desyncs terrain between players who bake the same ground at
+# different frontier sizes. See pregen.superblock_gate_verdict.
+# ---------------------------------------------------------------------------
+
+
+def test_superblock_gate_publishes_only_complete():
+    from terrain_service.pregen import superblock_gate_verdict
+
+    ok, msg = superblock_gate_verdict(0.0, allow_incomplete=False)
+    assert ok is True
+    assert msg == ""
+
+
+@pytest.mark.parametrize("missing", [1.0, 102.0, 255.0])
+def test_superblock_gate_refuses_incomplete(missing):
+    from terrain_service.pregen import superblock_gate_verdict
+
+    ok, msg = superblock_gate_verdict(missing, allow_incomplete=False)
+    assert ok is False
+    assert "refusing to publish" in msg
+    assert f"{int(missing)} coarse tiles absent" in msg
+    # The operator must be told how to proceed, not just refused.
+    assert "--allow-incomplete-superblock" in msg
+
+
+def test_superblock_gate_refuses_when_there_is_no_superblock_at_all():
+    """A negative count means NO superblock, which must not read as 0 missing."""
+    from terrain_service.pregen import superblock_gate_verdict
+
+    ok, msg = superblock_gate_verdict(-1.0, allow_incomplete=False)
+    assert ok is False
+    assert "NO flow superblock at all" in msg
+
+
+@pytest.mark.parametrize("missing", [-1.0, 1.0, 102.0])
+def test_superblock_gate_override_publishes_but_says_do_not_ship(missing):
+    from terrain_service.pregen import superblock_gate_verdict
+
+    ok, msg = superblock_gate_verdict(missing, allow_incomplete=True)
+    assert ok is True
+    assert "do NOT ship this tile" in msg
+
+
+def test_superblock_gate_message_carries_tile_coordinates():
+    """The caller formats {x}/{y} in; a gate that cannot name the tile is noise."""
+    from terrain_service.pregen import superblock_gate_verdict
+
+    _, msg = superblock_gate_verdict(7.0, allow_incomplete=False)
+    assert msg.format(x=-3, y=-11).startswith("error: tile (-3,-11)")
+
+
+def test_allow_incomplete_superblock_is_advertised_in_help():
+    out = subprocess.run(
+        ["python", "-m", "terrain_service.pregen", "--help"],
+        cwd=Path(__file__).parent.parent, capture_output=True, text=True,
+    )
+    assert out.returncode == 0
+    assert "--allow-incomplete-superblock" in out.stdout
+    assert "DEVELOPMENT ONLY" in out.stdout

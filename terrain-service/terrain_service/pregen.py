@@ -372,6 +372,7 @@ def _run_bake(args, provider, cache: TileCache) -> int:
         )
 
     # -- pass 3: the bakes.
+    allow_incomplete = bool(getattr(args, "allow_incomplete_superblock", False))
     level0 = bp.FlowLevel(level=0, geom=geom, consts=consts)
     baked = skipped = failed = 0
     npz_dir = Path(args.bake_npz_dir) if args.bake_npz_dir else None
@@ -416,20 +417,14 @@ def _run_bake(args, provider, cache: TileCache) -> int:
             )
             failed += 1
             continue
-        if result.stats["superblock_missing_tiles"] != 0.0:
-            n_missing = int(result.stats["superblock_missing_tiles"])
-            print(
-                f"  warning: tile ({x},{y}) baked against "
-                + (
-                    "NO flow superblock at all"
-                    if n_missing < 0
-                    else f"an INCOMPLETE flow superblock ({n_missing} coarse "
-                    "tiles absent)"
-                )
-                + "; its river network is frozen to this exploration order and "
-                "the tile is never regenerated (pipeline.ORDER_DEPENDENCE)",
-                file=sys.stderr,
-            )
+        publishable, gate_msg = superblock_gate_verdict(
+            result.stats["superblock_missing_tiles"], allow_incomplete
+        )
+        if gate_msg:
+            print(f"  {gate_msg.format(x=x, y=y)}", file=sys.stderr)
+        if not publishable:
+            failed += 1
+            continue
         if result.stats["basin_exceeds_apron"]:
             print(
                 f"  warning: tile ({x},{y}) contains a flat/basin "
@@ -476,6 +471,65 @@ def _run_bake(args, provider, cache: TileCache) -> int:
         file=sys.stderr,
     )
     return 0 if failed == 0 else 1
+
+
+def superblock_gate_verdict(
+    missing_tiles: float, allow_incomplete: bool
+) -> tuple[bool, str]:
+    """May a tile baked against this superblock be PUBLISHED?
+
+    ``missing_tiles`` is ``BakeResult.stats["superblock_missing_tiles"]``:
+    ``0`` complete, ``> 0`` that many coarse tiles absent, ``< 0`` no superblock
+    at all. Returns ``(publishable, message)``; the message takes ``{x}``/``{y}``.
+
+    WHY THIS IS A HARD GATE AND NOT A WARNING.
+
+    Stream-power incision scales with discharge, and discharge is the whole
+    upstream catchment -- which routinely lies outside the tile. A superblock
+    supplies that context. When it is incomplete, rivers entering from the
+    absent tiles contribute nothing, so the tile is carved by less water than
+    really flows through it: you do not get wrong water, you get wrong
+    mountains, and the valleys fade out where the data ran out.
+
+    And it never heals. ``pipeline.ORDER_DEPENDENCE`` is explicit: "A tile baked
+    against an incomplete superblock stays baked that way", because a shipped
+    tile is never regenerated. So the defect is permanent in a way an ordinary
+    warning is not, and it was previously emitted as a warning that pregen then
+    ignored -- the 2026-08-02 world was baked with "INCOMPLETE (102 of 256
+    coarse tiles absent)" scrolling past.
+
+    In MULTIPLAYER it is worse than a quality problem. Terrain must be identical
+    on every client, and a frontier tile baked against a thin superblock differs
+    from the same coordinates baked later against a full one. Two players then
+    disagree about the ground they are standing on and building on. Because
+    ``waterca`` re-simulates from terrain, their water desyncs too.
+
+    ``--allow-incomplete-superblock`` exists because development needs to bake
+    single tiles without first generating 256 coarse neighbours. It must stay
+    OFF for anything a player will ever see.
+    """
+    n = int(missing_tiles)
+    if n == 0:
+        return True, ""
+    what = (
+        "NO flow superblock at all"
+        if n < 0
+        else f"an INCOMPLETE flow superblock ({n} coarse tiles absent)"
+    )
+    if allow_incomplete:
+        return True, (
+            f"warning: tile ({{x}},{{y}}) baked against {what}; its river "
+            "network is frozen to this exploration order and the tile is never "
+            "regenerated (pipeline.ORDER_DEPENDENCE). Published anyway because "
+            "--allow-incomplete-superblock was passed -- do NOT ship this tile."
+        )
+    return False, (
+        f"error: tile ({{x}},{{y}}) baked against {what}. Its upstream "
+        "catchment is truncated, so it is carved by less water than really "
+        "flows through it, and a shipped tile is never regenerated -- refusing "
+        "to publish it. Generate the missing coarse tiles and re-run, or pass "
+        "--allow-incomplete-superblock for a throwaway development bake."
+    )
 
 
 def main() -> int:
@@ -673,6 +727,19 @@ def main() -> int:
             "(nothing is generated). Run this at bring-up to get the value "
             "for --conditioning-digest / "
             "TERRAIN_DIFFUSION_CONDITIONING_DIGEST."
+        ),
+    )
+    parser.add_argument(
+        "--allow-incomplete-superblock",
+        action="store_true",
+        help=(
+            "DEVELOPMENT ONLY: publish fine tiles whose flow superblock is "
+            "incomplete. Such a tile is carved by less water than really flows "
+            "through it (its upstream catchment is truncated) and is never "
+            "regenerated, so the defect is permanent -- and in multiplayer two "
+            "players baking the same ground at different frontier sizes get "
+            "different terrain. Use only for throwaway bakes; see "
+            "pregen.superblock_gate_verdict."
         ),
     )
 
