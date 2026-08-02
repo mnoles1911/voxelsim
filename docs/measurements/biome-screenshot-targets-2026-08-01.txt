@@ -1,0 +1,79 @@
+Where each biome is, in the shipped world
+==========================================
+2026-08-01
+
+Seed 20260719, provider terrain-diffusion-unlabeled-71e2b362e3241e71,
+origin (-3,-6) radius 5 = 121 coarse tiles. Classified through
+tools/world_map.py's classify(), which parses biome.h at run time so it cannot
+drift from the client. 20,011,163 land pixels.
+
+CENSUS
+------
+  biome               % of land   best tile   its share
+  GRASSLAND              27.06%      -6_-2       94.3%
+  TUNDRA_ALPINE          26.34%      -4_-2      100.0%
+  SAVANNA                18.69%       2_-8      100.0%
+  DESERT                  8.85%      -3_-11      96.6%
+  TAIGA                   6.74%      -4_-8       66.3%
+  BEACH                   5.81%      -2_-7      100.0%
+  RAINFOREST              4.08%      -2_-4       59.5%
+  TEMPERATE_FOREST        2.43%      -8_-11      56.6%
+
+ALL EIGHT MAPPABLE BIOMES ARE PRESENT. On the previous world DESERT and
+SAVANNA were 0.00% and no threshold could reach them. (BARE_ROCK is absent
+from this table only because world_map.py cannot evaluate its slope gate; it
+is a client-side cliff test and appears in game.)
+
+DESERT at 8.85% against Earth's ~8.6% is the closest match any channel
+achieved.
+
+FOR SCREENSHOTS
+---------------
+The "best tile" column is where to point a capture. A tile is 15.36 km across,
+so its world coordinates are (tile_x * 15360, tile_y * 15360) metres from the
+origin of the tile grid. Prefer the ones at or near 100%: -4_-2 (tundra),
+2_-8 (savanna), -2_-7 (beach), -6_-2 (grassland), -3_-11 (desert).
+
+RAINFOREST and TEMPERATE_FOREST have no dominant tile -- their best are 59.5%
+and 56.6% -- so a capture there will show a mixed scene. That is a real
+property of the world, not a sampling problem.
+
+TWO IMBALANCES, BOTH CLIENT-SIDE AND RETUNABLE
+-----------------------------------------------
+1. TUNDRA_ALPINE at 26.34% is high. This is a DIRECT CONSEQUENCE of Wave 2b:
+   elev_gain 1.6 raised the terrain, and the treeline is a fixed
+   kBiomeTreelineBaseMm 900 m + 150 m per degree C, so more land now sits
+   above it. The trade was made deliberately for bigger mountains; it can be
+   unwound by raising the treeline rather than by lowering elev_gain, which
+   would cost the peaks.
+
+2. TEMPERATE_FOREST at 2.43% is low against Earth's ~10-15%. Savanna takes the
+   warm-seasonal band ahead of it in classifyBiome's gate order, and savanna
+   is over-firing (18.69% here, and up to 55% on other seeds) because the
+   conditioning channels are quantile-matched ONE AT A TIME -- every marginal
+   is correct while the joint is not. See biome-gates-2026-08-01.txt.
+
+Neither requires regenerating tiles: biome.h classifies from the tiles' climate
+channels at runtime.
+
+SEED SENSITIVITY -- READ BEFORE GENERALISING ANY OF THIS
+---------------------------------------------------------
+Four seeds, 9 tiles each, same pipeline:
+
+  seed        land%  t_p95  p_p50  arid%  hot&arid  DESERT  SAVANNA  peak_m
+  20260719    32.1%   24.6    235  66.5%     7.0%    6.8%    28.4%    1471
+  1           52.3%   27.1   1224  34.9%    19.3%   18.1%    27.9%    2643
+  987654321   49.4%   27.1    471  42.3%    11.9%   11.4%    55.5%    2001
+  424242      38.5%   26.2    141  96.7%    20.8%   19.0%     0.9%    2233
+
+EVERY SEED HAS DESERTS (6.8-19.0%) and a non-zero hot-arid corner. That is the
+question this was run to answer, and it passes: the calibration is not
+overfitted to one seed.
+
+DO NOT read the spread as seed character. Nine tiles is 2,124 km2, and climate
+decorrelates at ~20 km while these samples sit 184 km apart -- so each seed
+gets about nine independent draws, and the per-seed mean is noisy. The proof is
+in the table itself: seed 20260719 reads peak_m 1471 here, while the full
+121-tile set of THE SAME SEED peaks at 6,021 m. Same world, 4x apart, purely
+from sample size. Separating true seed variation from sampling noise needs far
+more tiles per seed than this.
