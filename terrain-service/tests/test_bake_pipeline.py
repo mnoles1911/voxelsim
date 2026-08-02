@@ -433,6 +433,7 @@ def test_roughness_origin_kwarg_is_detected():
 
 
 def test_bake_refuses_a_roughness_that_cannot_be_world_anchored():
+    pytest.importorskip("scipy")  # carrier() needs scipy.ndimage; CI has none
     """Array-anchored noise is a correctness bug, not a tolerance: no apron
     size fixes it. The pipeline must not quietly bake a seam."""
     world = synth_world()
@@ -514,6 +515,7 @@ def _bake(world, tx, ty, roughness=ref_roughness_world, geom=TEST_GEOM):
 
 
 def test_neighbouring_bakes_agree_exactly_when_the_noise_is_world_anchored():
+    pytest.importorskip("scipy")  # carrier() needs scipy.ndimage; CI has none
     """Per-tile bakes reproduce a single-domain bake -- the apron claim.
 
     This is the harness-scale analogue of tools/bake_seam_check.py's measured
@@ -555,6 +557,7 @@ def test_neighbouring_bakes_agree_exactly_when_the_noise_is_world_anchored():
 
 
 def test_array_coordinate_noise_breaks_the_seam_even_with_the_apron():
+    pytest.importorskip("scipy")  # carrier() needs scipy.ndimage; CI has none
     """CONTROL. Without this, the test above could be passing because the
     harness cannot see a seam at all.
 
@@ -573,6 +576,7 @@ def test_array_coordinate_noise_breaks_the_seam_even_with_the_apron():
 
 
 def test_flat_eps_is_forwarded_only_when_pinned():
+    pytest.importorskip("scipy")  # carrier() needs scipy.ndimage; CI has none
     """None means 'use the module's auto epsilon'. Pinning 0 would reproduce
     the plain fill that stranded 69.2% of land area on a real tile, so the
     constant exists to make that choice explicit and hashed, not easy."""
@@ -600,6 +604,7 @@ def test_flat_eps_is_forwarded_only_when_pinned():
 
 
 def test_interior_dead_ends_are_counted():
+    pytest.importorskip("scipy")  # carrier() needs scipy.ndimage; CI has none
     """After an epsilon fill a receiver of -1 can only mean 'border cell
     draining out of the domain'; an interior one is a routing bug, and pregen
     refuses to ship a tile that has any."""
@@ -632,6 +637,7 @@ def test_interior_dead_ends_are_counted():
 
 
 def test_basin_width_detector_flags_flats_wider_than_the_apron():
+    pytest.importorskip("scipy")  # carrier() needs scipy.ndimage; CI has none
     """The apron's blind spot is cheap to DETECT even though it is not cheap
     to fix -- see pipeline.APRON_BLIND_SPOT."""
     assert pipeline._max_axis_run(np.zeros((4, 4), bool)) == 0
@@ -658,6 +664,7 @@ def test_basin_width_detector_flags_flats_wider_than_the_apron():
 
 
 def test_border_detector_separates_a_contained_flat_from_a_spilling_one():
+    pytest.importorskip("scipy")  # carrier() needs scipy.ndimage; CI has none
     """``max_basin_run_m`` measures a LENGTH; the seam depends on a REACH.
 
     A filled flat that lies wholly inside the padded domain is entered by
@@ -708,6 +715,7 @@ def test_border_detector_separates_a_contained_flat_from_a_spilling_one():
 
 
 def test_bake_writes_only_the_interior():
+    pytest.importorskip("scipy")  # carrier() needs scipy.ndimage; CI has none
     world = synth_world()
     r = _bake(world, 0, 0)
     f = TEST_GEOM.fine_tile_px
@@ -721,6 +729,7 @@ def test_bake_writes_only_the_interior():
 
 
 def test_stage_sink_observes_every_sub_stage_and_changes_nothing():
+    pytest.importorskip("scipy")  # carrier() needs scipy.ndimage; CI has none
     """The sink exists so 'which stage made it wrong' is answerable
     (tools/dump_stage_heightfields.py --stages). Three contracts: every
     STAGE_SINK_FIELDS entry arrives, interior-shaped, in pipeline order; the
@@ -755,6 +764,7 @@ def test_stage_sink_observes_every_sub_stage_and_changes_nothing():
 
 
 def test_profile_mode_wires_the_profile_kernel_and_depth_is_the_default():
+    pytest.importorskip("scipy")  # carrier() needs scipy.ndimage; CI has none
     """incision_mode='profile' must reach the injected profile kernel (with a
     regional-slope field when the constant enables one), change the surface
     relative to depth mode, and refuse a kernel set that cannot provide it.
@@ -996,6 +1006,7 @@ def test_the_fingerprint_chains_the_parent_level():
 
 
 def test_a_baked_tile_records_which_hydrology_it_used():
+    pytest.importorskip("scipy")  # carrier() needs scipy.ndimage; CI has none
     """Provenance has to reach the BakeResult or it cannot be logged per tile."""
     lv = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=TEST_CONSTS)
     world = synth_world()
@@ -1128,6 +1139,7 @@ def test_inject_edge_inflow_returns_zero_when_the_domains_do_not_overlap():
 
 
 def test_inflow_reaches_accumulate_mfd_through_bake_padded_domain():
+    pytest.importorskip("scipy")  # carrier() needs scipy.ndimage; CI has none
     """The wiring, end to end: a superblock's through-flow must show up in the
     fine domain's accumulation."""
     world = ramp_world()

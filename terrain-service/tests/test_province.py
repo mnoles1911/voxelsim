@@ -24,6 +24,13 @@ import dataclasses
 import numpy as np
 import pytest
 
+# CI installs flask/numpy/pytest ONLY -- see terrain-service/requirements.txt
+# and bake/noise.py's header, which states the design outright: the bake
+# modules must import cleanly on a box with neither scipy nor numba. These
+# tests drive the numba kernels, so they SKIP there rather than fail. Without
+# this guard they added 8 red tests to CI on 2026-08-02.
+pytest.importorskip("numba")
+
 from terrain_service.bake import incise, noise, pipeline, province
 
 

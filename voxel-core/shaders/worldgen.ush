@@ -1660,6 +1660,12 @@ int64_t columnCarrierSlopeMmPerM(int64_t vx, int64_t vy)
     // columnCarrierSlopeMmPerM -- because they must agree; warping only the first
     // made VoxelizeMain's density3 gate read an unwarped slope and vxc_gpu failed
     // exactly as columnCarrierSlopeMmPerM's own header predicted.
+    // `warpSeed` seeds the v16 HORIZONTAL DOMAIN WARP described above,
+    // mirroring amplifier.cpp's warpX/warpY. It has nothing to do with GPU
+    // wave/lane width -- the rule matched the substring. No lane count, no
+    // wave intrinsic, nothing vendor-divergent. The allow MUST be the last
+    // comment before the construct or it reads as unused.
+    // lint-shader-ub: allow WAVE_WIDTH - domain-warp seed, not a lane count
     const uint64_t warpSeed = ((uint64_t)SeedHi << 32) | (uint64_t)SeedLo;
     const int64_t warpX = truncDiv(valueNoise2Fade(warpSeed, xMm, yMm, kCarrierWarpLatticeMm,
                                                   CH_CARRIER_WARP_X) * kCarrierWarpMaxMm,
