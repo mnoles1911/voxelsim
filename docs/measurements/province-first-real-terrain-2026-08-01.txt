@@ -1,0 +1,81 @@
+Landform provinces on real terrain -- first measurement
+========================================================
+2026-08-01
+
+WHY THIS DID NOT EXIST BEFORE
+------------------------------
+Wave 4 implemented province Tier 1 but could not validate it: no coarse world
+existed on the dev box, so separation was measured on a random-fBm domain
+whose within-scene sigma was flagged as probably a PESSIMISTIC denominator.
+Separately, two of four provinces were unreachable on the shipped world --
+its climate never dropped below 3,900 mm/yr of precipitation anywhere.
+
+Both blockers are gone: the conditioning rebuild produced a world with real
+climate contrast, and 121 tiles of it are on disk.
+
+A BUG FOUND BEFORE ANY RESULT WAS TRUSTED
+------------------------------------------
+bake_real_tile.py -- the tool the plan names as the verification reference --
+never passed climate. bake_tile's climate_fetch defaults to None and None does
+NOT raise: the province partition silently falls back to relief alone.
+
+Tile (-3,-3), which is 98.9% arid by precipitation, was reported as 100%
+FLUVIAL. Nothing in the output said climate was absent; province_climate 0.0000
+sat among 24 other stat lines. A validation tool that cannot exercise the
+feature it validates is worse than none, because its clean output reads as
+confirmation. Fixed in 36ed0fb.
+
+THE MEASUREMENT
+---------------
+Two tiles at comparable relief and opposite climate, seed 0x135276f, full
+8192^2 interior + 960 m apron, production geometry, bake_ver 7.
+
+  tile        coarse relief   arid%(precip<400)   precip median
+  (-3,-3)          3058 m            98.9%             94 mm
+  (-2,-4)          2801 m             0.0%           1741 mm
+
+                        (-2,-4) WET     (-3,-3) ARID
+  province_climate         1.0000          1.0000
+  province_fluvial_frac    0.9418          0.0880
+  province_glacial_frac    0.0578          0.7962
+  province_arid_frac       0.0000          0.1157
+  province_lowland_frac    0.0004          0.0000
+  relief_m               4,239.8442      4,560.5742
+  interior_dead_ends       0.0000          0.0000
+  padded_border_basin_frac 0.0000          0.0000
+
+WHAT THIS ESTABLISHES
+---------------------
+1. The partition DISCRIMINATES, decisively, on the wet/dry axis. A wet massif
+   is 94% fluvial; a dry one of the same relief is 9%. On the old world every
+   tile was fluvial 0.918 / arid 0.0000 regardless of appearance.
+2. The per-cell fields REACH THE EROSION KERNELS rather than being inert:
+   relief_m on (-3,-3) moved 4560.1348 -> 4560.5742 between the no-climate and
+   with-climate bakes of identical terrain.
+3. Drainage invariants hold IN BOTH PROVINCES -- 0 interior sinks, 0.0%
+   stranded. That is Wave 4's stated acceptance criterion, now met on real
+   terrain instead of a synthetic domain.
+
+WHAT THIS DOES NOT ESTABLISH
+----------------------------
+That the MULTIPLIER TABLE is right. Wave 4 measured the best separation at
+0.52x of three within-scene sigmas and deliberately declined to tune the table
+upward to clear the bar. Two tiles are a data point, not a verdict; confirming
+the constants needs geomorph_validate.py --sweep bake across many tiles, and
+the next anchor is channel_head_area_m2, which spans 866-8,660 m2 (10x) across
+five real classes against the 2.5-4x the table currently uses.
+
+THE OPEN QUESTION, NARROWED
+---------------------------
+The wet/dry axis works. What is untested is the ARID-vs-GLACIAL split WITHIN
+dry terrain: a 98.9%-arid tile reads 79.6% GLACIAL and only 11.6% ARID, so the
+discriminant weights cold over dry. That is plausible for a 4.5 km-relief cold
+desert (Karakoram, Tibetan margin) and may be entirely correct -- but nobody
+has checked it.
+
+The check is cheap and specific. tools/earth_reference.py's corpus maps almost
+1:1 onto the provinces: Teton/Alps -> GLACIAL (Teton has 1 m 3DEP bare-earth),
+Smokies/Nepal -> FLUVIAL, Badlands -> ARID, Iowa/Llano/Illinois -> LOWLAND.
+Classify those real windows through province.py and see whether the labels come
+back right. If the Badlands classify GLACIAL, the DISCRIMINANT is wrong, not
+the multipliers -- and that is a different and prior problem.
