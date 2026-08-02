@@ -77,3 +77,47 @@ in the table itself: seed 20260719 reads peak_m 1471 here, while the full
 121-tile set of THE SAME SEED peaks at 6,021 m. Same world, 4x apart, purely
 from sample size. Separating true seed variation from sampling noise needs far
 more tiles per seed than this.
+
+
+================================================================
+SUPERSEDED BY THE RADIUS-8 SET -- READ THIS, NOT THE TABLE ABOVE
+================================================================
+2026-08-01, later the same night
+
+The world was extended to radius 8 (289 tiles, 435 MB, 37,913,342 land px,
+2.4x the area). The larger sample CORRECTS TWO CLAIMS made above, both in the
+same direction, and both were mine.
+
+  biome              121 tiles   289 tiles   best tile now
+  GRASSLAND            27.06%      28.06%     -1_1    (96.3%)
+  SAVANNA              18.69%      20.76%      2_-8  (100.0%)
+  TUNDRA_ALPINE        26.34%      19.62%     -4_-2  (100.0%)
+  DESERT                8.85%       9.74%     -3_-11  (96.6%)
+  TAIGA                 6.74%       6.64%    -11_-6   (83.2%)
+  BEACH                 5.81%       5.54%     -2_-7  (100.0%)
+  RAINFOREST            4.08%       4.73%      5_-14   (89.8%)
+  TEMPERATE_FOREST      2.43%       4.90%     -8_-12   (97.2%)
+
+CORRECTION 1. Above I attributed TUNDRA_ALPINE at 26.34% to elev_gain 1.6
+raising terrain past a fixed 900 m treeline, and proposed raising the treeline
+to fix it. On 2.4x the area it is 19.62%. Most of that excess was SAMPLE BIAS,
+not the mechanism I named with confidence. The mechanism may still contribute;
+the magnitude did not justify the fix.
+
+CORRECTION 2. Above I called TEMPERATE_FOREST at 2.43% "squeezed by savanna
+taking the warm-seasonal band". It is 4.90%. Same error: a real gate-order
+effect exists, but the number I built the argument on was small-sample.
+
+This is the same lesson three separate times tonight -- match the sample to
+the claim. Nine tiles said seed 20260719 peaks at 1,471 m; 121 said 6,021 m;
+289 say 6,143 m.
+
+CAPTURE TARGETS ARE NOW MUCH BETTER. All eight biomes have a dominant tile:
+temperate forest went 56.6% -> 97.2% and rainforest 59.5% -> 89.8%, so every
+biome can be captured in a scene that actually reads as that biome.
+
+WORLD TOTALS, 289 tiles, 50.0% land
+  elevation   p50   444   p95  2329   MAX  6143 m
+  temperature p5   -7.4   p95  26.8 C
+  precip      p5      0   p50   376   p95  1694 mm
+  hot 28.14%   arid 53.95%   hot&arid 10.83%
