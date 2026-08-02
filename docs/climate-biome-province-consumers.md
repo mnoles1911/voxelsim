@@ -83,9 +83,22 @@ one stitched map settled it.
 Build the biome layer by calling `world_map.classify()`, which parses `biome.h`
 at run time so it cannot drift from the client. Build the province layer by
 calling `province.province_fields` — the same function `bake/pipeline.py` calls
-— never a reimplementation. A hand-rolled province discriminant was tried once
-and could not be trusted either way until it was validated against the
-documented thresholds.
+— never a reimplementation.
+
+**Validate a province map by reproducing the `province_*_frac` values the bake
+already printed for tiles it has baked.** That check is exact: recomputing
+`province_fields` on the tiles actually baked matches the bake to 0.0000 on
+every province. Two cautions learned the hard way on 2026-08-02:
+
+* **Check you are comparing the same tile.** A whole investigation was spent
+  "proving" the bake wrong because the tiles baked were `(-3,-3)` and
+  `(-2,-4)` while the numbers being compared came from `(-3,-11)` and
+  `(-4,-2)`. Nothing was broken.
+* **A cold desert is GLACIAL, and that is correct.** `province_cold_c` is
+  −2.0 °C and temperature dominates aridity in the discriminant, so an arid
+  tile at −3 °C classifies GLACIAL. Do not read that as a bug; whether it is
+  the *desired* weighting is a separate, open question — see the Earth-corpus
+  check in the backlog.
 
 Keep the images under ~10 MB; a 20.7 MB PNG failed to upload. `matplotlib` is
 not in the system python — use `D:\terrain-diffusion\.venv\Scripts\python.exe`
