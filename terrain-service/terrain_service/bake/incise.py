@@ -472,12 +472,69 @@ def _profile_pass(order, rec, z, kfac, dist, n_exp, cap, out):
     _profile_sweep(starts, cells, rec, z, kfac, dist, n_exp, cap, out)
 
 
-def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
-                     m: float = 0.45, n: float = 0.8, cap_m: float = 25.0,
-                     a_crit_m2: float = A_CRIT_M2, gate_q: float = GATE_Q,
+def _prepare_param(value, name, *, scale: int, cover, positive: bool = False):
+    """Accept a scalar OR a coarse 2-D field for one elementwise parameter.
+
+    Returns ``(scalar_or_None, coarse_field_or_None)``: exactly one is not None.
+
+    THE COARSE FORM IS THE POINT (landform provinces, Tier 1). A per-cell
+    parameter materialised at the padded fine domain is 340 MB inside the
+    bake's peak stage, per parameter -- the same waste the ``regional``
+    ``np.repeat`` was, and it is fixed the same way: keep the field at its
+    native coarse pitch and gather ``coarse[y // scale, x // scale]`` in the
+    row blocks below. The gather COPIES values rather than computing them, so a
+    constant field reproduces the scalar path exactly.
+    """
+    if value is None:
+        raise ValueError(f"{name} must not be None")
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        v = float(arr)
+        if positive and not v > 0.0:
+            raise ValueError(f"{name} must be positive, got {v}")
+        if not positive and v < 0.0:
+            raise ValueError(f"{name} must be non-negative, got {v}")
+        return v, None
+    if arr.ndim != 2 or min(arr.shape) < 1:
+        raise ValueError(
+            f"{name} must be a scalar or a non-empty 2-D field, got shape "
+            f"{arr.shape}")
+    if scale < 1:
+        raise ValueError(f"field_scale must be >= 1, got {scale}")
+    if arr.shape[0] > cover[0] or arr.shape[1] > cover[1]:
+        raise ValueError(
+            f"{name} field {arr.shape} at field_scale={scale} is finer than the "
+            f"domain allows (at most {cover})")
+    if not np.isfinite(arr).all():
+        raise ValueError(f"{name} field must be finite everywhere")
+    lo = float(arr.min())
+    if positive and not lo > 0.0:
+        raise ValueError(f"{name} field must be positive everywhere, min was {lo}")
+    if not positive and lo < 0.0:
+        raise ValueError(
+            f"{name} field must be non-negative everywhere, min was {lo}")
+    return None, arr.astype(np.float64, copy=False)
+
+
+def _gather_rows(scalar, coarse, rows, cols):
+    """One row block of a parameter: the scalar, or the coarse gather.
+
+    Rows first -- ``(nrows x cw)`` is a few MB -- and only then widened to the
+    block's columns, the same order the ``regional_slope`` gather uses and for
+    the same reason.
+    """
+    if coarse is None:
+        return np.float64(scalar)
+    return coarse[np.minimum(rows, coarse.shape[0] - 1)][:, cols]
+
+
+def profile_incision(filled, receivers, acc, cell_m, *, K_dt=4.5,
+                     m=0.45, n: float = 0.8, cap_m: float = 25.0,
+                     a_crit_m2=A_CRIT_M2, gate_q=GATE_Q,
                      regional_slope=None, regional_s_ref: float = 0.2,
                      regional_p: float = 0.0,
                      regional_scale: int = 1,
+                     field_scale: int = 1,
                      erodibility=None,
                      sea_taper_top_m: float = SEA_TAPER_TOP_M,
                      sea_taper_bottom_m: float = SEA_TAPER_BOTTOM_M,
@@ -549,6 +606,20 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
                 the padded production domain this keeps a 1.3 MB array instead
                 of materialising 340 MB of duplicated float32 inside the
                 bake's peak stage.
+    `field_scale` COARSENING factor for any of ``K_dt``, ``m``, ``a_crit_m2``
+                and ``gate_q`` that is supplied as a 2-D FIELD rather than a
+                scalar, with exactly ``regional_scale``'s gather and clamp.
+                This is the landform-province hook (bake_ver 7): the whole
+                ``kfac`` chain below is elementwise, so making these per-cell
+                is arithmetic, not a kernel change -- and it is verified as
+                such, since a per-cell ``K_dt`` is identical to folding the
+                same field into ``erodibility`` (``tests/test_province.py``).
+
+                ``n`` and ``cap_m`` are deliberately NOT in that list. They are
+                scalars *inside* the numba Newton kernel (``_profile_cell``),
+                so making them per-cell is a real kernel change rather than an
+                array multiply, and it is out of Tier 1's scope.
+
     `order`     OPTIONAL ascending-elevation ``argsort`` of `filled`, flat
                 indices, exactly ``flow.accumulate_mfd(..., return_order=True)``'s
                 second return. The MFD sweep in B2c already sorts this same
@@ -579,16 +650,24 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
         raise ValueError(f"acc {a.shape} must match filled {z.shape}")
     if rec32.size != z.size:
         raise ValueError(f"receivers has {rec32.size} cells, filled {z.size}")
-    if K_dt < 0.0:
-        raise ValueError(f"K_dt must be non-negative, got {K_dt}")
     if cap_m < 0.0:
         raise ValueError(f"cap_m must be >= 0 (0 disables), got {cap_m}")
-    if a_crit_m2 < 0.0:
-        raise ValueError(f"a_crit_m2 must be non-negative, got {a_crit_m2}")
-    if gate_q <= 0.0:
-        raise ValueError(f"gate_q must be positive, got {gate_q}")
     if float(cell_m) <= 0.0:
         raise ValueError(f"cell_m must be positive, got {cell_m}")
+    fscale = int(field_scale)
+    _cover = (-(-z.shape[0] // max(fscale, 1)), -(-z.shape[1] // max(fscale, 1)))
+    # Scalar OR coarse field, per parameter. The scalar branches raise exactly
+    # what they raised before; the field branches add "everywhere" to the same
+    # sentence. a_crit and gate_q are POSITIVE-only as fields (a scalar
+    # a_crit_m2 of 0 still means "no gate at all" and skips the block below,
+    # but a field of zeros would be a 0/0 at every cell with no upslope area).
+    K_dt_s, K_dt_f = _prepare_param(K_dt, "K_dt", scale=fscale, cover=_cover)
+    m_s, m_f = _prepare_param(m, "m", scale=fscale, cover=_cover)
+    a_crit_s, a_crit_f = _prepare_param(
+        a_crit_m2, "a_crit_m2", scale=fscale, cover=_cover,
+        positive=a_crit_m2 is not None and np.ndim(a_crit_m2) > 0)
+    gate_q_s, gate_q_f = _prepare_param(
+        gate_q, "gate_q", scale=fscale, cover=_cover, positive=True)
 
     # K_dt * A^m, with the same channel-initiation gate and sea-level taper as
     # `stream_power` -- multiplied into the erodibility rather than the depth,
@@ -652,11 +731,24 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
     sreg_cols = None
     if sreg is not None and rscale > 1:
         sreg_cols = np.minimum(np.arange(w) // rscale, sreg.shape[1] - 1)
+    # Same hoist for the province parameter fields (landform provinces, Tier 1).
+    # They share `field_scale` by construction, so each needs only its own
+    # column clamp against its own width.
+    pf_cols = {
+        nm: np.minimum(np.arange(w) // fscale, fld.shape[1] - 1)
+        for nm, fld in (("K_dt", K_dt_f), ("m", m_f),
+                        ("a_crit", a_crit_f), ("gate_q", gate_q_f))
+        if fld is not None
+    }
     kfac32 = np.empty((h, w), dtype=np.float32)
     for r0 in range(0, h, 512):
         r1 = min(r0 + 512, h)
         af_b = np.clip(a[r0:r1], 0.0, None)
-        k_b = np.float64(K_dt) * np.power(af_b, np.float64(m))
+        pf_rows = np.arange(r0, r1) // fscale
+        K_b = _gather_rows(K_dt_s, K_dt_f, pf_rows, pf_cols.get("K_dt"))
+        m_b = _gather_rows(m_s, m_f, pf_rows, pf_cols.get("m"))
+        k_b = K_b * np.power(af_b, m_b)
+        del K_b, m_b
         if sreg is not None:
             if sreg_cols is None:
                 s_b = sreg[r0:r1]
@@ -670,9 +762,12 @@ def profile_incision(filled, receivers, acc, cell_m, *, K_dt: float = 4.5,
             del s_b
         if ero is not None:
             k_b *= ero[r0:r1].astype(np.float64, copy=False)
-        if a_crit_m2 > 0.0:
-            aq = np.power(af_b, np.float64(gate_q))
-            k_b *= aq / (aq + np.float64(a_crit_m2) ** np.float64(gate_q))
+        if a_crit_f is not None or a_crit_s > 0.0:
+            q_b = _gather_rows(gate_q_s, gate_q_f, pf_rows, pf_cols.get("gate_q"))
+            ac_b = _gather_rows(a_crit_s, a_crit_f, pf_rows, pf_cols.get("a_crit"))
+            aq = np.power(af_b, q_b)
+            k_b *= aq / (aq + np.power(ac_b, q_b))
+            del q_b, ac_b
         if sea_taper_bottom_m < sea_taper_top_m:
             t = (z[r0:r1] - np.float64(sea_taper_bottom_m)) / np.float64(
                 sea_taper_top_m - sea_taper_bottom_m)

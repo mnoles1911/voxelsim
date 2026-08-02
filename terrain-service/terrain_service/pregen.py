@@ -50,13 +50,21 @@ from .app import _make_provider
 COARSE_SCALE = 1
 
 
-def _coarse_elevation_m(cache: TileCache, provider, seed: int, x: int, y: int,
-                        generate: bool):
-    """Coarse tile (x, y)'s elevation in METRES, or None if unavailable.
+def _coarse_planes(cache: TileCache, provider, seed: int, x: int, y: int,
+                   generate: bool):
+    """Coarse tile (x, y) as ``(elevation_m float32, climate uint8)``, or None.
 
     ``.vxtl`` v1 stores int16 whole metres (1 m vertical quantisation, 10x
     coarser than a voxel) -- the bake widens to float32 and everything below
     30 m of relief is synthesised from there.
+
+    CLIMATE IS NOW KEPT (bake_ver 7). This used to be ``_coarse_elevation_m``
+    and threw the ``(4, 512, 512)`` uint8 climate plane away at the decode,
+    which is why the bake could only ever vary its physics with SHAPE. The
+    landform-province partition (``bake.province``) needs temperature and
+    precipitation to tell a glacial mountain from a fluvial one, and the
+    shipped cache tiles are already the full 1,572,889-byte form -- the data
+    was there the whole time and cost nothing more to read.
     """
     import numpy as np
 
@@ -67,7 +75,8 @@ def _coarse_elevation_m(cache: TileCache, provider, seed: int, x: int, y: int,
         tile = provider.generate(seed, x, y, COARSE_SCALE)
         data = tile_codec.encode(tile)
         cache.put(provider.provider_id, seed, x, y, COARSE_SCALE, data)
-    return tile_codec.decode(data).elevation.astype(np.float32)
+    tile = tile_codec.decode(data)
+    return tile.elevation.astype(np.float32), tile.climate
 
 
 def _encode_fine(result, seed: int, provider_id: str, codec: int | None = None):
@@ -156,7 +165,7 @@ def _run_bake(args, provider, cache: TileCache) -> int:
     # EVERYTHING THIS FUNCTION WRITES IS BAKE-DERIVED, so it all keys on
     # fine_provider_id (inference identity + bake digest), never on
     # provider_id (inference only). The coarse tiles it READS are still under
-    # provider_id -- see _coarse_elevation_m, which is left alone deliberately.
+    # provider_id -- see _coarse_planes, which is left alone deliberately.
     #
     # That asymmetry is the entire point of the split: retuning a bake constant
     # must re-key the fine tier and the flow pyramid together while leaving the
@@ -218,13 +227,34 @@ def _run_bake(args, provider, cache: TileCache) -> int:
     }
     coarse_cache: dict[tuple[int, int], object] = {}
 
-    def fetch(x: int, y: int, generate: bool = False):
+    def _planes(x: int, y: int, generate: bool = False):
         key = (x, y)
         if key not in coarse_cache:
-            coarse_cache[key] = _coarse_elevation_m(
+            coarse_cache[key] = _coarse_planes(
                 cache, provider, args.seed, x, y, generate
             )
         return coarse_cache[key]
+
+    def fetch(x: int, y: int, generate: bool = False):
+        """ELEVATION only -- this is the ``CoarseFetch`` the hydrology hashes.
+
+        Kept byte-identical to what it returned before climate was plumbed
+        through: ``superblock_inputs_fingerprint`` digests this array directly,
+        so widening it would have rewritten every cached flow superblock's
+        fingerprint for a plane the pyramid does not read.
+        """
+        p = _planes(x, y, generate)
+        return None if p is None else p[0]
+
+    def fetch_climate(x: int, y: int):
+        """The ``(4, n, n)`` uint8 climate planes, for the province partition.
+
+        Never generates: a tile that does not already exist here has no climate
+        to offer, and the elevation pass above has already decided what the ring
+        contains.
+        """
+        p = _planes(x, y, generate=False)
+        return None if p is None else p[1]
 
     have = 0
     for x, y in sorted(ring):
@@ -359,6 +389,7 @@ def _run_bake(args, provider, cache: TileCache) -> int:
             tile_x=x,
             tile_y=y,
             coarse_fetch=lambda cx, cy: fetch(cx, cy, generate=False),
+            climate_fetch=fetch_climate,
             kernels=kernels,
             geom=geom,
             consts=consts,

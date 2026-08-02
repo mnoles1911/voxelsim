@@ -190,16 +190,17 @@ def ref_stream_power(acc, slope, K=0.15, m=0.45, n=0.8, cap_m=25.0,
 def ref_profile_incision(filled, receivers, acc, cell_m, K_dt=1.5, m=0.45, n=0.8,
                          cap_m=25.0, a_crit_m2=1.0e4, gate_q=2.0,
                          regional_slope=None, regional_s_ref=0.2,
-                         regional_scale=1, erodibility=None,
+                         regional_scale=1, field_scale=1, erodibility=None,
                          sea_taper_top_m=0.0, sea_taper_bottom_m=-200.0,
                          order=None):
     """LOCAL (radius-1) reference for the profile solve, on purpose.
 
-    ``regional_scale`` and ``order`` mirror the real kernel's memory-saving
-    parameters: the pipeline hands over a COARSE regional field plus its
-    coarsening factor, and the ascending-elevation order B2c already sorted.
-    Expanded/ignored here respectively -- what these tests check is that the
-    pipeline hands over the right field, not how the solve consumes it.
+    ``regional_scale``, ``field_scale`` and ``order`` mirror the real kernel's
+    memory-saving parameters: the pipeline hands over COARSE fields plus their
+    coarsening factor (the regional slope, and at bake_ver 7 the four landform-
+    province parameter fields), plus the ascending-elevation order B2c already
+    sorted. Expanded/ignored here respectively -- what these tests check is that
+    the pipeline hands over the right field, not how the solve consumes it.
 
     The real ``incise.profile_incision`` propagates the solved receiver
     elevation upstream along the whole D8 tree -- unbounded by nature, the
@@ -213,6 +214,21 @@ def ref_profile_incision(filled, receivers, acc, cell_m, K_dt=1.5, m=0.45, n=0.8
     """
     z = np.asarray(filled, np.float64)
     h, w = z.shape
+
+    def _expand(v):
+        """A scalar stays a scalar; a coarse province field is gathered to (h, w)."""
+        arr = np.asarray(v, np.float64)
+        if arr.ndim == 0:
+            return float(arr)
+        f = int(field_scale)
+        ys = np.minimum(np.arange(h) // f, arr.shape[0] - 1)
+        xs = np.minimum(np.arange(w) // f, arr.shape[1] - 1)
+        return arr[ys][:, xs]
+
+    K_dt, m, a_crit_m2, gate_q = (_expand(K_dt), _expand(m),
+                                  _expand(a_crit_m2), _expand(gate_q))
+    # `a_crit_m2 > 0` below must stay a plain bool once a_crit can be an array.
+    a_crit_on = bool(np.all(np.asarray(a_crit_m2) > 0.0))
     rec = np.asarray(receivers, np.int64).ravel()
     a = np.clip(np.asarray(acc, np.float64), 0.0, None)
     idx = np.arange(rec.size, dtype=np.int64)
@@ -221,7 +237,7 @@ def ref_profile_incision(filled, receivers, acc, cell_m, K_dt=1.5, m=0.45, n=0.8
     diag = (np.abs(idx // w - tgt // w) > 0) & (np.abs(idx % w - tgt % w) > 0)
     dist = np.where(diag, cell_m * 1.4142135623730951, cell_m)
     s = np.clip((z.ravel() - zr) / dist, 0.0, None)
-    kfac = K_dt * np.power(a, m).ravel()
+    kfac = (np.asarray(K_dt) * np.power(a, m)).ravel()
     if erodibility is not None:
         # bake_ver 6 material-strength hook: multiplied where the gates are,
         # exactly as the real kernel does.
@@ -235,9 +251,10 @@ def ref_profile_incision(filled, receivers, acc, cell_m, K_dt=1.5, m=0.45, n=0.8
             sreg = sreg[ys][:, xs]
         kfac = kfac * np.minimum(
             1.0, np.clip(sreg, 0.0, None) / regional_s_ref).ravel() ** n
-    if a_crit_m2 > 0.0:
+    if a_crit_on:
         aq = np.power(a, gate_q).ravel()
-        kfac = kfac * (aq / (aq + a_crit_m2 ** gate_q))
+        acq = np.asarray(np.power(a_crit_m2, gate_q)).ravel()
+        kfac = kfac * (aq / (aq + acq))
     if sea_taper_bottom_m < sea_taper_top_m:
         t = np.clip((z.ravel() - sea_taper_bottom_m)
                     / (sea_taper_top_m - sea_taper_bottom_m), 0.0, 1.0)
@@ -766,7 +783,23 @@ def test_profile_mode_wires_the_profile_kernel_and_depth_is_the_default():
     prof_consts = dataclasses.replace(TEST_CONSTS, incision_mode="profile")
     prof = bake(prof_consts, spy_profile)
     assert len(calls) == 1
-    assert calls[0]["K_dt"] == prof_consts.profile_K_dt
+    # bake_ver 7: K_dt reaches the kernel as a COARSE province FIELD, not a
+    # scalar (see bake.province). Its shape and coarsening factor are asserted
+    # with the other province kwargs below; here it only has to be the right
+    # constant, which it is exactly where the province mix is pure FLUVIAL.
+    assert calls[0]["field_scale"] == TEST_GEOM.scale
+    for key, base_const in (("K_dt", prof_consts.profile_K_dt),
+                            ("m", prof_consts.stream_m),
+                            ("a_crit_m2", prof_consts.channel_init_area_m2),
+                            ("gate_q", prof_consts.channel_init_q)):
+        fld = calls[0][key]
+        assert fld.shape == (TEST_GEOM.padded_coarse_px,
+                             TEST_GEOM.padded_coarse_px), key
+        # FLUVIAL's multipliers are all 1.0 and it is the only province with a
+        # constant baseline weight, so the constant must lie inside the field's
+        # range wherever the mix is not pure -- and the field must never be a
+        # different number everywhere.
+        assert float(fld.min()) <= base_const + 1e-6, key
     assert calls[0]["regional_slope"] is not None, \
         "profile_regional_s_ref > 0 must hand the kernel a regional slope field"
     # COARSE plus its coarsening factor, not a 16x16-replicated full-resolution
@@ -1254,7 +1287,10 @@ def test_every_bake_constant_rolls_the_fingerprint():
                  "b1_constructional_slope_lo": 0.05,
                  "b1_constructional_slope_hi": 0.25,
                  "meso_slope_lo": 0.10,
-                 "meso_slope_hi": 0.50}
+                 "meso_slope_hi": 0.50,
+                 # Same story: +0.5 on a dimensionless slope threshold of 0.03
+                 # would put province_relief_lo above province_relief_hi.
+                 "province_relief_lo": 0.05}
     for fld in dataclasses.fields(BakeConstants):
         cur = getattr(pipeline.CONSTANTS, fld.name)
         if fld.name in valid_alt:

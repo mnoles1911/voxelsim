@@ -643,10 +643,50 @@ def repose_field(z_m: np.ndarray, cell_m: float, seed: int,
 _MESO_OCTAVE_KEY = 400
 
 
+def _meso_amp(value, name, *, scale: int, cover):
+    """One meso amplitude as a scalar OR a coarse 2-D field (bake_ver 7).
+
+    Same contract as ``incise._prepare_param``: returns ``(scalar_or_None,
+    coarse_or_None)`` and the field is gathered ``coarse[y // scale, x //
+    scale]`` per row block, never ``np.repeat``-ed to the fine grid. The
+    province plumbing exists so a lowland's floodplain margin can carry half
+    the band a glacial headwall does; at 9216^2 the repeat would be 340 MB per
+    amplitude.
+    """
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        v = float(arr)
+        if v < 0.0:
+            raise ValueError(f"meso {name} must be >= 0, got {v}")
+        return v, None
+    if arr.ndim != 2 or min(arr.shape) < 1:
+        raise ValueError(
+            f"meso {name} must be a scalar or a non-empty 2-D field, got "
+            f"shape {arr.shape}")
+    if scale < 1:
+        raise ValueError(f"amp_scale must be >= 1, got {scale}")
+    if arr.shape[0] > cover[0] or arr.shape[1] > cover[1]:
+        raise ValueError(
+            f"meso {name} field {arr.shape} at amp_scale={scale} is finer than "
+            f"the domain allows (at most {cover})")
+    if not np.isfinite(arr).all() or float(arr.min()) < 0.0:
+        raise ValueError(f"meso {name} field must be finite and >= 0 everywhere")
+    # float32 ON PURPOSE, matching the SCALAR path's precision exactly.
+    # ``_octave_field`` returns float32, and under NEP 50 a python-float
+    # amplitude is a weak scalar -- so ``float(amp) * octave`` stays float32,
+    # while a float64 amplitude array would promote the product to float64.
+    # That is more accurate and it is the wrong thing: it would mean a constant
+    # amplitude FIELD did not reproduce the same amplitude as a SCALAR (measured
+    # 2.4e-7 m apart), and "province_strength = 0 reproduces bake_ver 6 exactly"
+    # has to be exact.
+    return None, arr.astype(np.float32, copy=False)
+
+
 def meso_relief(z_m: np.ndarray, cell_m: float, seed: int,
                 origin_cells: Tuple[int, int], *,
-                amp15_m: float = 0.8,
-                amp11_m: float = 0.4,
+                amp15_m=0.8,
+                amp11_m=0.4,
+                amp_scale: int = 1,
                 slope_lo: float = 0.20,
                 slope_hi: float = 0.40,
                 flow_slope: "np.ndarray | None" = None) -> np.ndarray:
@@ -679,6 +719,12 @@ def meso_relief(z_m: np.ndarray, cell_m: float, seed: int,
     overlaps agree exactly. Both amplitudes at 0 reproduce the prior surface
     bit-for-bit.
 
+    Either amplitude may be a scalar or a COARSE 2-D field read at
+    ``amp_scale`` (bake_ver 7, landform provinces -- see ``bake.province``).
+    The amplitudes only ever multiply a per-cell octave value, so this is an
+    array multiply in a loop that already exists; a constant field reproduces
+    the scalar exactly.
+
     ``z_m`` is the post-thermal surface; the gate reads ITS local slope,
     computed here (chunked, with a one-row halo) so the gate and the field
     cannot be computed against different stages.
@@ -706,8 +752,6 @@ def meso_relief(z_m: np.ndarray, cell_m: float, seed: int,
     octave without inter-sample ringing at this amplitude, measured by a
     half-pixel pit census on the DECODED tile: 0 basins.
     """
-    if amp15_m < 0.0 or amp11_m < 0.0:
-        raise ValueError("meso amplitudes must be >= 0")
     if not 0.0 <= slope_lo < slope_hi:
         raise ValueError(f"need 0 <= slope_lo < slope_hi, got {slope_lo}, {slope_hi}")
     z = np.asarray(z_m)
@@ -740,21 +784,40 @@ def meso_relief(z_m: np.ndarray, cell_m: float, seed: int,
                            mode="nearest"),
             size=5, mode="nearest")
 
+    ascale = int(amp_scale)
+    cover = (-(-n0 // max(ascale, 1)), -(-n1 // max(ascale, 1)))
+    a15_s, a15_f = _meso_amp(amp15_m, "amp15_m", scale=ascale, cover=cover)
+    a11_s, a11_f = _meso_amp(amp11_m, "amp11_m", scale=ascale, cover=cover)
+
     out = np.zeros((n0, n1), dtype=np.float32)
-    if amp15_m == 0.0 and amp11_m == 0.0:
+    if a15_f is None and a11_f is None and a15_s == 0.0 and a11_s == 0.0:
         return out
 
     p15 = max(6, int(round(15.0 / cell_m)))
     p11 = max(6, int(round(11.25 / cell_m)))
     inv_span = 1.0 / (float(slope_hi) - float(slope_lo))
+    a_cols = {}
+    for nm, fld in (("15", a15_f), ("11", a11_f)):
+        if fld is not None:
+            a_cols[nm] = np.minimum(np.arange(n1) // ascale, fld.shape[1] - 1)
     for r0 in range(0, n0, 512):
         r1 = min(r0 + 512, n0)
         blk = np.zeros((r1 - r0, n1), dtype=np.float64)
-        if amp15_m > 0.0:
-            blk += float(amp15_m) * _octave_field(
+        if a_cols:
+            a_rows = np.arange(r0, r1) // ascale
+        if a15_f is not None:
+            blk += (a15_f[np.minimum(a_rows, a15_f.shape[0] - 1)][:, a_cols["15"]]
+                    * _octave_field((r1 - r0, n1), p15, seed,
+                                    _MESO_OCTAVE_KEY, oy + r0, ox))
+        elif a15_s > 0.0:
+            blk += float(a15_s) * _octave_field(
                 (r1 - r0, n1), p15, seed, _MESO_OCTAVE_KEY, oy + r0, ox)
-        if amp11_m > 0.0:
-            blk += float(amp11_m) * _octave_field(
+        if a11_f is not None:
+            blk += (a11_f[np.minimum(a_rows, a11_f.shape[0] - 1)][:, a_cols["11"]]
+                    * _octave_field((r1 - r0, n1), p11, seed,
+                                    _MESO_OCTAVE_KEY + 1, oy + r0, ox))
+        elif a11_s > 0.0:
+            blk += float(a11_s) * _octave_field(
                 (r1 - r0, n1), p11, seed, _MESO_OCTAVE_KEY + 1, oy + r0, ox)
         # Local slope of z over this block with a one-row halo, so the block
         # layout cannot change any cell's gate (np.gradient uses central

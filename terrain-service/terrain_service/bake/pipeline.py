@@ -116,6 +116,10 @@ from typing import Callable
 
 import numpy as np
 
+# Pure numpy, no kernels, no scipy -- safe to import eagerly here (the lazy
+# imports elsewhere in this file exist for scipy/numba, not for module cycles).
+from . import province as _province
+
 __all__ = [
     "BAKE_VERSION",
     "BakeConstants",
@@ -233,7 +237,37 @@ __all__ = [
 #: enough to fall under the codec's 100 mm quantization floor, which
 #: manufactures reconstruction-level pits the raw surface does not have
 #: (measured: 1 carrier sink at ratio 6, 0 at ratio 3, same window).
-BAKE_VERSION = 6
+#:
+#: 6 -> 7 (2026-08-01, LANDFORM PROVINCES, Tier 1 -- docs/landform-provinces-plan.md):
+#: the fine bake stopped applying one global constant set everywhere. Four bake
+#: constants -- ``profile_K_dt``, ``channel_init_area_m2``, ``channel_init_q``,
+#: ``stream_m`` -- plus the two meso amplitudes are now PER-CELL FIELDS blended
+#: from a province partition (FLUVIAL / GLACIAL / ARID / LOWLAND) that is itself
+#: derived from relief, elevation, temperature and precipitation. The counter
+#: moves for two independent reasons and either alone would justify it:
+#:
+#:   * the domain now carries CLIMATE. ``bake_padded_domain`` used to receive
+#:     elevation only; the coarse tile's ``(4, 512, 512)`` uint8 climate plane
+#:     is now gathered over the same 3x3 ring and reaches the province
+#:     discriminants. Nothing else in the bake reads it.
+#:   * ``province_strength = 0`` reproduces the bake_ver-6 surface exactly (the
+#:     partition collapses to pure FLUVIAL, whose multipliers are all 1.0, and
+#:     a constant parameter field gathers to the same scalar the scalar path
+#:     used) -- so the constant rolls the id on its own, and the counter moves
+#:     because B2d and B4 grew the field path.
+#:
+#: WHAT THIS DOES NOT DO. It does not restore a seam guarantee: see
+#: ``APRON_BLIND_SPOT``, which measured that guarantee already violated by
+#: 1.05% of the shipped interior. Province fields add no influence radius (they
+#: are pointwise at the point of use, and their one non-local step is a
+#: landform smooth bounded well under the apron), so they neither worsen nor
+#: repair it. It also does not touch ``mfd_p``, ``stream_n`` or
+#: ``incision_cap_m``: the last two are scalars inside the numba Newton kernel,
+#: and ``mfd_p`` is hashed as a SCALAR into ``superblock_inputs_fingerprint``
+#: and drives the superblock MFD at 30 m and 120 m/px, so a per-cell value at
+#: 1.875 m would have no counterpart at the parent levels and parent and child
+#: would route differently -- worsening HYDROLOGY_RESIDUALS #3.
+BAKE_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -634,6 +668,56 @@ class BakeConstants:
     #: never a higher rate.
     thermal_rate: float = 0.4
 
+    # -- landform provinces (bake_ver 7) -----------------------------------
+    #
+    # See docs/landform-provinces-plan.md and bake/province.py. These are the
+    # DISCRIMINANT thresholds only; the per-province multipliers live in
+    # province.PROVINCE_MULTIPLIERS and ride the identity through
+    # bake_identity_payload.
+    #
+    #: Master dial. 0 collapses the partition to pure FLUVIAL, whose
+    #: multipliers are all 1.0, and therefore reproduces the bake_ver-6 surface
+    #: exactly -- which is the property that makes every other constant here
+    #: safe to retune. 1 is full strength.
+    province_strength: float = 1.0
+    #: Landform-scale smoothing applied to every discriminant, metres, on the
+    #: PADDED coarse domain.
+    #:
+    #: THIS IS AN APRON OBLIGATION, not a taste knob. Climate arrives at 30 m/px
+    #: and uint8-quantised (precipitation's LSB is 47 mm/yr), so an unsmoothed
+    #: discriminant prints 30 m blocks into erosion intensity. But the smooth is
+    #: also the ONLY non-pointwise step province adds, so its influence radius
+    #: must stay well inside the 960 m apron or a tile's interior would read a
+    #: cell its neighbour's padded domain does not have. 480 m is half the
+    #: apron, i.e. 16 coarse cells of total radius against 32 available.
+    #: ``province_fields`` refuses a value that reaches the apron.
+    province_smooth_m: float = 480.0
+    #: Relief discriminant: smoothed 30 m-scale slope (dimensionless, rise/run)
+    #: at which terrain stops reading as "gentle" and starts reading as "high
+    #: relief". 0.03 is a till plain (the plains exemplar's regional slope is
+    #: ~0.03); 0.15 is a mountain flank. Deliberately the SAME quantity
+    #: ``profile_regional_s_ref`` keys the regional-energy factor on, because
+    #: it is the one piece of class-identity information the bake legitimately
+    #: has and it is world-anchored by construction.
+    province_relief_lo: float = 0.03
+    province_relief_hi: float = 0.15
+    #: Temperature discriminant, degrees C mean annual. Below cold_c the ground
+    #: reads fully glacial-capable, above temperate_c not at all. -2 C is near
+    #: the MAAT at which cirque glaciers persist; 6 C is comfortably temperate.
+    province_cold_c: float = -2.0
+    province_temperate_c: float = 6.0
+    #: Precipitation discriminant, mm/yr. 300 is the conventional arid ceiling
+    #: and 800 a humid floor. NOTE the shipped conditioning cannot currently
+    #: produce an arid interior at all (plan, "What provinces do not solve":
+    #: DESERT 1.84%, SAVANNA 0.00%), so ARID is wired but untuned and unjudged.
+    province_arid_mm: float = 300.0
+    province_humid_mm: float = 800.0
+    #: Elevation band, metres, over which "lowland" fades out. Combined with
+    #: LOW relief, not on its own: a high plateau is gentle but is not a
+    #: floodplain.
+    province_lowland_elev_lo_m: float = 150.0
+    province_lowland_elev_hi_m: float = 600.0
+
     # -- hydrology pyramid -------------------------------------------------
     #: Coarse tiles per side of a level-0 flow superblock. 4 => 61.4 km,
     #: 2048x2048 cells at 30 m, catchments to ~3,700 km2.
@@ -729,6 +813,26 @@ class BakeConstants:
                 f"incision_strength_ratio must be positive (1 disables), got "
                 f"{self.incision_strength_ratio}"
             )
+        if self.province_strength < 0.0:
+            raise ValueError(
+                f"province_strength must be >= 0 (0 disables), got "
+                f"{self.province_strength}"
+            )
+        if self.province_smooth_m < 0.0:
+            raise ValueError(
+                f"province_smooth_m must be >= 0, got {self.province_smooth_m}")
+        for lo, hi, nm in (
+            (self.province_relief_lo, self.province_relief_hi, "relief"),
+            (self.province_cold_c, self.province_temperate_c, "cold/temperate"),
+            (self.province_arid_mm, self.province_humid_mm, "arid/humid"),
+            (self.province_lowland_elev_lo_m, self.province_lowland_elev_hi_m,
+             "lowland_elev"),
+        ):
+            if not lo < hi:
+                raise ValueError(
+                    f"province {nm} thresholds must satisfy lo < hi, got "
+                    f"{lo}, {hi}"
+                )
         if self.b1_constructional_amp < 0.0:
             raise ValueError(
                 f"b1_constructional_amp must be >= 0 (0 disables), got "
@@ -777,6 +881,16 @@ class BakeConstants:
             "meso_slope_lo": self.meso_slope_lo,
             "meso_slope_hi": self.meso_slope_hi,
             "refill_eps_m": self.refill_eps_m,
+            "province_strength": self.province_strength,
+            "province_smooth_m": self.province_smooth_m,
+            "province_relief_lo": self.province_relief_lo,
+            "province_relief_hi": self.province_relief_hi,
+            "province_cold_c": self.province_cold_c,
+            "province_temperate_c": self.province_temperate_c,
+            "province_arid_mm": self.province_arid_mm,
+            "province_humid_mm": self.province_humid_mm,
+            "province_lowland_elev_lo_m": self.province_lowland_elev_lo_m,
+            "province_lowland_elev_hi_m": self.province_lowland_elev_hi_m,
             "thermal_iters": self.thermal_iters,
             "thermal_rate": self.thermal_rate,
             "superblock_tiles": self.superblock_tiles,
@@ -822,6 +936,12 @@ def bake_identity_payload(
         "stage_order": list(STAGE_ORDER),
         "geometry": geom.as_payload(),
         "constants": consts.as_payload(),
+        # The per-province multiplier table is a tuning surface that decides
+        # baked bytes but does not live on BakeConstants (it is a table, not a
+        # scalar). Hashed here so retuning it rolls fine_provider_id like every
+        # other bake constant, instead of silently reusing tiles baked under
+        # different physics.
+        "provinces": _province.identity_payload(),
     }
 
 
@@ -1094,6 +1214,97 @@ MISSING_ELEVATION_M = 0.0
 
 CoarseFetch = Callable[[int, int], "np.ndarray | None"]
 
+#: ``climate_fetch(x, y)`` -> that coarse tile's ``(4, coarse_tile_px,
+#: coarse_tile_px)`` uint8 climate planes in ``province.CLIMATE_ORDER``, or
+#: None.
+#:
+#: A SEPARATE callable rather than a widened ``CoarseFetch``, deliberately.
+#: ``CoarseFetch``'s return value is hashed byte-for-byte by
+#: ``superblock_inputs_fingerprint`` and fed to ``build_flow_superblock``; the
+#: hydrology pyramid has no business knowing climate exists, and widening the
+#: type would have put a climate plane inside every flow fingerprint and forced
+#: every existing test double and ``tools/bake_real_tile.py``'s v1-tile path to
+#: change. Climate is an input to the PROVINCE partition and to nothing else.
+ClimateFetch = Callable[[int, int], "np.ndarray | None"]
+
+
+def _ring_windows(tile_x: int, tile_y: int, geom: "BakeGeometry"):
+    """Yield ``(dx, dy, win)`` for all nine ring tiles, in the original order.
+
+    ``win`` is ``(dst_y, dst_x, src_y, src_x)`` slices, or None when this ring
+    tile contributes nothing to the padded domain (only possible at
+    ``apron_coarse_px == 0``). All nine are yielded, present or not, because
+    ``assemble_padded_coarse``'s ``missing`` list records a ring tile's absence
+    whether or not its window is empty.
+
+    Factored out so the elevation gather and the climate gather cannot drift
+    apart -- they must place the same tile at the same offset, or a province
+    boundary would sit one apron away from the terrain it was derived from.
+    """
+    n = geom.coarse_tile_px
+    a = geom.apron_coarse_px
+    span = geom.padded_coarse_px
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            dy0, dx0 = a + dy * n, a + dx * n
+            sy0, sx0 = max(0, -dy0), max(0, -dx0)
+            sy1, sx1 = min(n, span - dy0), min(n, span - dx0)
+            if sy0 >= sy1 or sx0 >= sx1:
+                yield dx, dy, None
+                continue
+            yield dx, dy, (slice(dy0 + sy0, dy0 + sy1),
+                           slice(dx0 + sx0, dx0 + sx1),
+                           slice(sy0, sy1), slice(sx0, sx1))
+
+
+def assemble_padded_climate(
+    climate_fetch: "ClimateFetch | None",
+    tile_x: int,
+    tile_y: int,
+    geom: BakeGeometry = PRODUCTION,
+) -> "np.ndarray | None":
+    """Gather the 3x3 ring's uint8 climate planes into the padded domain.
+
+    Returns ``(4, padded_coarse_px, padded_coarse_px)`` uint8, or None when
+    there is no fetcher or no tile in the ring carries climate. 1.3 MB at
+    production -- three orders of magnitude under any fine-grid array, which is
+    the whole reason province works at the coarse pitch and indexes at ``//16``.
+
+    A MISSING ring tile leaves its window at zero, which de-quantises to the
+    BOTTOM of each physical range (-40 C, 0 mm/yr). That is deliberately the
+    same conservative posture ``MISSING_ELEVATION_M`` takes: a never-generated
+    neighbour reads as cold and dry rather than as a plausible climate, so it
+    biases toward GLACIAL/ARID in an apron the interior never reads, and never
+    invents a temperate province out of absent data.
+    """
+    if climate_fetch is None:
+        return None
+    ch = len(_province.CLIMATE_ORDER)
+    n = geom.coarse_tile_px
+    dom = np.zeros((ch, geom.padded_coarse_px, geom.padded_coarse_px), np.uint8)
+    any_found = False
+    for dx, dy, win in _ring_windows(tile_x, tile_y, geom):
+        if win is None:
+            continue
+        src = climate_fetch(tile_x + dx, tile_y + dy)
+        if src is None:
+            continue
+        src = np.asarray(src)
+        if src.shape != (ch, n, n):
+            raise ValueError(
+                f"climate tile ({tile_x + dx},{tile_y + dy}) has shape "
+                f"{src.shape}, expected {(ch, n, n)}"
+            )
+        if src.dtype != np.uint8:
+            raise ValueError(
+                f"climate tile ({tile_x + dx},{tile_y + dy}) is {src.dtype}, "
+                "expected uint8 -- these are the wire planes, not physical units"
+            )
+        dys, dxs, sys_, sxs = win
+        dom[:, dys, dxs] = src[:, sys_, sxs]
+        any_found = True
+    return dom if any_found else None
+
 
 def assemble_padded_coarse(
     coarse_fetch: CoarseFetch,
@@ -1109,32 +1320,26 @@ def assemble_padded_coarse(
     order-independent (see HYDROLOGY_RESIDUALS #1).
     """
     n = geom.coarse_tile_px
-    a = geom.apron_coarse_px
     dom = np.full((geom.padded_coarse_px, geom.padded_coarse_px), MISSING_ELEVATION_M, np.float32)
     missing: list[tuple[int, int]] = []
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            src = coarse_fetch(tile_x + dx, tile_y + dy)
-            if src is None:
-                missing.append((tile_x + dx, tile_y + dy))
-                continue
-            src = np.asarray(src, dtype=np.float32)
-            if src.shape != (n, n):
-                raise ValueError(
-                    f"coarse tile ({tile_x + dx},{tile_y + dy}) has shape "
-                    f"{src.shape}, expected ({n},{n})"
-                )
-            # Destination window of this ring tile inside the padded domain,
-            # clipped to the domain (the corner/edge tiles contribute only
-            # their apron strip).
-            dy0, dx0 = a + dy * n, a + dx * n
-            sy0 = max(0, -dy0)
-            sx0 = max(0, -dx0)
-            sy1 = min(n, dom.shape[0] - dy0)
-            sx1 = min(n, dom.shape[1] - dx0)
-            if sy0 >= sy1 or sx0 >= sx1:
-                continue
-            dom[dy0 + sy0 : dy0 + sy1, dx0 + sx0 : dx0 + sx1] = src[sy0:sy1, sx0:sx1]
+    # The destination window of each ring tile inside the padded domain,
+    # clipped to the domain (the corner/edge tiles contribute only their apron
+    # strip). Shared with the climate gather so the two cannot drift.
+    for dx, dy, win in _ring_windows(tile_x, tile_y, geom):
+        src = coarse_fetch(tile_x + dx, tile_y + dy)
+        if src is None:
+            missing.append((tile_x + dx, tile_y + dy))
+            continue
+        src = np.asarray(src, dtype=np.float32)
+        if src.shape != (n, n):
+            raise ValueError(
+                f"coarse tile ({tile_x + dx},{tile_y + dy}) has shape "
+                f"{src.shape}, expected ({n},{n})"
+            )
+        if win is None:
+            continue
+        dys, dxs, sys_, sxs = win
+        dom[dys, dxs] = src[sys_, sxs]
     return dom, missing
 
 
@@ -2203,17 +2408,64 @@ def bake_padded_domain(
     geom: BakeGeometry = PRODUCTION,
     consts: BakeConstants = CONSTANTS,
     inflow_source: "FlowSuperblock | None" = None,
+    padded_climate: "np.ndarray | None" = None,
 ) -> dict:
     """Run B0-B3 over the padded domain and return every padded grid.
 
     Separated from ``bake_tile`` so a seam test can compare a per-tile bake's
     apron against a neighbour's interior directly, which is the check that
     caught the array-coordinate fBm in the first place.
+
+    ``padded_climate`` is the ``(4, padded_coarse_px, padded_coarse_px)`` uint8
+    climate stack from ``assemble_padded_climate``, or None. It is read by the
+    LANDFORM PROVINCE partition (``bake.province``) and by nothing else; with
+    None the partition degrades to relief and elevation alone, which is what
+    every elevation-only caller gets.
     """
     if padded_coarse.shape != (geom.padded_coarse_px, geom.padded_coarse_px):
         raise ValueError(
             f"padded coarse domain is {padded_coarse.shape}, expected "
             f"{(geom.padded_coarse_px, geom.padded_coarse_px)}"
+        )
+    if padded_climate is not None:
+        exp = (len(_province.CLIMATE_ORDER),
+               geom.padded_coarse_px, geom.padded_coarse_px)
+        if tuple(np.shape(padded_climate)) != exp:
+            raise ValueError(
+                f"padded climate is {np.shape(padded_climate)}, expected {exp}")
+
+    # -- LANDFORM PROVINCES (bake_ver 7). Built once, up front, on the COARSE
+    # domain: 576^2 at production, so the whole partition plus all six
+    # parameter fields is ~10 MB against the 7 GB peak, and every consumer
+    # gathers `field[y // geom.scale, x // geom.scale]` rather than materialising
+    # 340 MB of np.repeat. Computed from `padded_coarse` -- the raster the model
+    # produced -- rather than from independently hashed noise, which is the
+    # plan's load-bearing principle and also the stronger seam story.
+    #
+    # NOT free the way "regional" is free, and worth being precise about: the
+    # regional-energy factor is a pure function of the CARRIER, computed inside
+    # B2d. This is a pure function of the coarse SOURCE, which is the carrier's
+    # own input, so it is available before B0 and is world-anchored by the same
+    # argument.
+    #
+    # THE APRON OBLIGATION is the landform smooth, and it is enforced by
+    # geometry rather than trusted: `apron_coarse_px // 4` caps the smoothing
+    # half-width so the influence radius (2 * half) is at most HALF the apron
+    # on ANY geometry, production or test. Below that radius, two neighbouring
+    # bakes read the same coarse cells throughout their overlap and compute
+    # identical province values there.
+    #
+    # That is a statement about what province ADDS, and it is not a seam
+    # guarantee -- see APRON_BLIND_SPOT, which measured the guarantee already
+    # violated by 1.05% of the shipped interior for reasons (an unbounded
+    # depression fill on a truncated domain) that predate this and are
+    # untouched by it.
+    prov = None
+    if consts.province_strength > 0.0:
+        prov = _province.province_fields(
+            padded_coarse, padded_climate,
+            coarse_pixel_m=geom.coarse_pixel_m, consts=consts,
+            max_half=geom.apron_coarse_px // 4,
         )
     cell_m = geom.fine_pixel_m
     cpu: dict[str, float] = {}
@@ -2491,18 +2743,41 @@ def bake_padded_domain(
         # Forwarded only when B2c actually handed one back, for the same
         # test-double reason as the kwargs above.
         order_fwd = {} if elev_order is None else {"order": elev_order}
+        # PROVINCE PARAMETER FIELDS (bake_ver 7). Forwarded only when the
+        # partition is live, for the same test-double reason as the kwargs
+        # above -- a kernel double written against the scalar form keeps
+        # working, and province_strength = 0 takes this branch's `else` and
+        # reproduces bake_ver 6 exactly.
+        #
+        # These are the four constants the `kfac` chain treats ELEMENTWISE
+        # (K_dt * A^m * regional * erodibility * gate * taper), so per-cell is
+        # arithmetic rather than a kernel change. stream_n and incision_cap_m
+        # are NOT here: they are scalars inside the numba Newton kernel.
+        province_kwargs = {}
+        if prov is not None:
+            province_kwargs = {
+                "K_dt": prov.k_dt,
+                "m": prov.stream_m,
+                "a_crit_m2": prov.a_crit_m2,
+                "gate_q": prov.gate_q,
+                "field_scale": geom.scale,
+            }
+        else:
+            province_kwargs = {
+                "K_dt": consts.profile_K_dt,
+                "m": consts.stream_m,
+                "a_crit_m2": consts.channel_init_area_m2,
+                "gate_q": consts.channel_init_q,
+            }
         eroded = np.asarray(
             kernels.profile_incision(
                 filled,
                 rec,
                 acc64,
                 cell_m,
-                K_dt=consts.profile_K_dt,
-                m=consts.stream_m,
                 n=consts.stream_n,
                 cap_m=consts.incision_cap_m,
-                a_crit_m2=consts.channel_init_area_m2,
-                gate_q=consts.channel_init_q,
+                **province_kwargs,
                 regional_slope=regional,
                 regional_s_ref=consts.profile_regional_s_ref,
                 regional_scale=regional_scale,
@@ -2514,7 +2789,7 @@ def bake_padded_domain(
             ),
             dtype=np.float32,
         )
-        del regional, strength_kwargs, order_fwd
+        del regional, strength_kwargs, order_fwd, province_kwargs
         depth = filled - eroded
     else:
         depth = np.asarray(
@@ -2592,6 +2867,16 @@ def bake_padded_domain(
         from .flow import enforce_descent  # lazy, same reason as repose_field
         from .noise import meso_relief
 
+        # Province amplitude fields, coarse and gathered at `amp_scale`. The
+        # existing slope gate still applies on top: this varies HOW MUCH band a
+        # steep face gets, not WHICH faces get one.
+        meso_amp_kwargs = (
+            {"amp15_m": prov.meso_amp15_m, "amp11_m": prov.meso_amp11_m,
+             "amp_scale": geom.scale}
+            if prov is not None else
+            {"amp15_m": consts.meso_amp15_m, "amp11_m": consts.meso_amp11_m}
+        )
+
         # The gate needs the DOWNSTREAM slope of this exact surface: a gully
         # bed between steep walls must read its own gentle profile, or the
         # band perturbs bed long-profiles into the codec's quantization floor
@@ -2604,8 +2889,7 @@ def bake_padded_domain(
             cell_m,
             seed,
             origin_cells,
-            amp15_m=consts.meso_amp15_m,
-            amp11_m=consts.meso_amp11_m,
+            **meso_amp_kwargs,
             slope_lo=consts.meso_slope_lo,
             slope_hi=consts.meso_slope_hi,
             flow_slope=np.asarray(d8s4, dtype=np.float32),
@@ -2663,6 +2947,10 @@ def bake_padded_domain(
         "inflow": inflow,
         "roughness_seed": seed,
         "interior_dead_ends": interior_dead_ends,
+        # The COARSE province object (or None). Observability only -- nothing
+        # downstream reads it, and it is ~10 MB rather than a fine grid. A
+        # province the probe cannot see is a province nobody can tune.
+        "province": prov,
         "cpu_seconds": cpu,
         "wall_seconds": wall,
     }
@@ -2695,6 +2983,7 @@ def bake_tile(
     consts: BakeConstants = CONSTANTS,
     inflow_source: "FlowSuperblock | None" = None,
     stage_sink: "Callable[[str, np.ndarray], None] | None" = None,
+    climate_fetch: "ClimateFetch | None" = None,
 ) -> BakeResult:
     """Bake one coarse tile's fine tier. Interior only; the apron is discarded.
 
@@ -2702,6 +2991,12 @@ def bake_tile(
     (coarse_tile_px, coarse_tile_px) array, or None if it does not exist.
     ``inflow_source`` is the level-0 flow superblock covering this tile; None
     means "no cross-tile hydrology", which is only correct for a test.
+
+    ``climate_fetch(x, y)`` returns that coarse tile's ``(4, coarse_tile_px,
+    coarse_tile_px)`` uint8 climate planes, or None. Optional: without it the
+    landform-province partition sees relief and elevation but no climate, so
+    GLACIAL and ARID -- which cannot be inferred from shape alone -- stay at
+    zero weight everywhere.
 
     ``stage_sink(name, interior)`` is called once per `STAGE_SINK_FIELDS` entry
     with the INTERIOR (apron already cropped) of that sub-stage's grid, in
@@ -2712,6 +3007,7 @@ def bake_tile(
     """
     kernels = kernels or load_kernels()
     padded, missing = assemble_padded_coarse(coarse_fetch, tile_x, tile_y, geom)
+    padded_climate = assemble_padded_climate(climate_fetch, tile_x, tile_y, geom)
     out = bake_padded_domain(
         padded,
         world_seed=world_seed,
@@ -2721,6 +3017,7 @@ def bake_tile(
         geom=geom,
         consts=consts,
         inflow_source=inflow_source,
+        padded_climate=padded_climate,
     )
     sl = geom.interior()
     if stage_sink is not None:
@@ -2799,6 +3096,18 @@ def bake_tile(
         "basin_reaches_padded_border": float(border_basin > 0),
         "peak_bytes_estimate": float(estimate_peak_bytes(geom)),
     }
+    # LANDFORM PROVINCE MIX over the tile INTERIOR, as area fractions summing
+    # to 1. Cheap (a mean over 512^2) and it is the only way to know whether a
+    # tile actually encountered the province whose constants it was baked with
+    # -- "ARID cannot be tuned or judged until there is a world containing it"
+    # is a plan risk, and this is the instrument that answers it per tile.
+    prov = out.get("province")
+    if prov is not None:
+        cs = slice(geom.apron_coarse_px,
+                   geom.apron_coarse_px + geom.coarse_tile_px)
+        for name, wgt in prov.weights.items():
+            stats[f"province_{name}_frac"] = float(wgt[cs, cs].mean())
+        stats["province_climate"] = 0.0 if prov.temp_c is None else 1.0
     return BakeResult(
         tile_x=tile_x,
         tile_y=tile_y,

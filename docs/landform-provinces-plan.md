@@ -1,7 +1,10 @@
 # Landform provinces — process-varying bake rules
 
-**Status:** design, not implemented. Written 2026-08-01 against `BAKE_VERSION` 6
-and worldgen v21.
+**Status:** Tier 1 IMPLEMENTED at `BAKE_VERSION` 7 (2026-08-01), uncommitted.
+Tiers 2 and 3 still design. Written against `BAKE_VERSION` 6 and worldgen v21.
+
+See "Tier 1 as built" at the bottom for what shipped, what was measured, and the
+one finding that should change the recommended order.
 
 ## The problem, stated as a player would state it
 
@@ -264,3 +267,122 @@ Revised 2026-08-01 after the conditioning measurement above.
    untunable and three biomes stay unreachable on every seed.
 4. **Tier 1 provinces.**
 5. Re-measure, then decide whether Tier 2/3 earn their cost.
+
+## Tier 1 as built (2026-08-01, `BAKE_VERSION` 7)
+
+### What shipped
+
+`terrain_service/bake/province.py`. Four climate-derived provinces as a soft
+partition on the **576² padded coarse grid**, consumed by `//16` indexing at the
+point of use — never `np.repeat`-ed to 9216², which would have cost 340 MB per
+field inside the bake's peak stage. All six parameter fields together measure
+**7.96 MB**.
+
+Six constants became per-cell fields, in the order the plan's cost argument
+predicted:
+
+| constant | how | cost |
+|---|---|---|
+| `profile_K_dt` | `incise.profile_incision(K_dt=field, field_scale=16)` | free |
+| `channel_init_area_m2`, `channel_init_q`, `stream_m` | same elementwise `kfac` block | free |
+| `meso_amp15_m` / `meso_amp11_m` | `noise.meso_relief(amp_scale=16)` | free |
+
+Climate is plumbed: `bake_padded_domain` now takes `padded_climate`, gathered
+over the same 3×3 ring by `assemble_padded_climate`, and `pregen._coarse_planes`
+stops discarding the tile's `(4, 512, 512)` uint8 plane. `ClimateFetch` is a
+**separate** callable from `CoarseFetch` on purpose — `CoarseFetch`'s return is
+digested byte-for-byte by `superblock_inputs_fingerprint`, and the hydrology
+pyramid has no business knowing climate exists.
+
+Not done, deliberately: `stream_n` and `incision_cap_m` are scalars *inside* the
+numba Newton kernel, so per-cell is a real kernel change. `mfd_p` is cut — it
+drives the superblock MFD at 30 m and 120 m/px and is hashed as a scalar into
+`superblock_inputs_fingerprint`, so a per-cell value at 1.875 m would make
+parent and child route differently, worsening `HYDROLOGY_RESIDUALS` #3.
+
+### The Tier 1 premise held
+
+`kfac = K_dt * A^m * regional * erodibility * gate * taper` is fully
+elementwise, so a per-cell `K_dt` **is** the same arithmetic as folding that
+field into the array already passed as `erodibility=`. Verified to 3e-5 m — a
+thousandth of the 100 mm wire LSB, the residue of float32 multiplication not
+being associative. `tests/test_province.py` keeps that assertion, because if it
+ever stops holding the tier's whole cost estimate is wrong.
+
+### What was measured, and the bad news
+
+Method: one fixed synthetic coarse domain, 128² coarse → 2048² fine at 1.875 m,
+baked once per province with that province's multipliers applied globally, so
+the terrain is identical and only the constants move. Metrics are the four that
+`docs/geomorph-validation.md` records as *not* blind. The denominator is the
+within-scene spread across four quadrants of the FLUVIAL bake.
+
+**Drainage invariants hold: 0 interior sinks in every bake, scalar and field
+path alike.**
+
+**No province clears three within-scene sigmas.** Best is `ARID` on `p99_deg`
+at **0.52×** the bar; `GLACIAL` peaks at 0.17×.
+
+| vs FLUVIAL | `dd_km_per_km2` | `hurst_overall` | `frac_above_repose` | `p99_deg` |
+|---|---|---|---|---|
+| GLACIAL | 0.965× (0.07σ₃) | 1.007× (0.17σ₃) | 0.946× (0.11σ₃) | 0.990× (0.09σ₃) |
+| ARID | 1.131× (0.24σ₃) | 0.983× (0.39σ₃) | 1.141× (0.27σ₃) | 1.054× (**0.52σ₃**) |
+| LOWLAND | 1.135× (0.25σ₃) | 0.996× (0.11σ₃) | 1.059× (0.11σ₃) | 1.017× (0.16σ₃) |
+
+A single-knob sweep says this is a **calibration gap, not a mechanism gap, but
+only barely**: pushing `channel_init_area_m2` to ×256 moves `dd_km_per_km2` from
+16.6 to 9.3 — a 44% move, and into the real-world range of 2.4–10.7 — yet still
+only 0.82× the bar. `meso_amp` ×4 reaches 0.68× on `hurst_overall`. Nothing
+tested reaches 1.0× alone.
+
+Two caveats on the denominator, both pointing the same way:
+
+* the domain is a random fBm, whose four quadrants genuinely differ a lot
+  (`dd` σ is 18% of its mean), so this within-scene σ is probably **pessimistic**
+  against the doc's cross-scene within-class σ;
+* `rasterio` is not installed on this box, so the real exemplar windows could
+  not be fetched. **Re-run this on `tools/geomorph_validate.py --sweep bake`
+  before concluding anything about the table.**
+
+The first-cut multipliers are recorded in `province.PROVINCE_MULTIPLIERS` with
+their reasoning, and they are the least-supported part of this change — exactly
+the risk #3 the plan already named. They were deliberately *not* tuned upward to
+hit a statistical bar on synthetic terrain, because that is the "hand-tuned
+constants drift into artifacts nobody can trace" failure mode. The anchor that
+should drive the next pass is real and already in the validation doc:
+`channel_head_area_m2` spans **866–8,660 m² across five real terrain classes**,
+a 10× contrast, against the 2.5–4× this table currently uses.
+
+### The finding that should change the recommended order
+
+Decoding the shipped fixture tile (`voxel-core/tests/fixtures/tile_s1_seed1_0_0.vxtl`,
+the full 1,572,889-byte form) and running the production ring gather on it:
+
+```
+temperature          3.29 .. 31.53 C
+precipitation     3905.88 .. 5788.24 mm/yr
+province mix   fluvial 0.9181   lowland 0.0814   glacial 0.0004   arid 0.0000
+```
+
+Precipitation never drops below **3,900 mm/yr anywhere on the tile**. `ARID`'s
+weight is not small, it is *zero*, and `GLACIAL`'s is 4e-4. So on the shipped
+world Tier 1 delivers FLUVIAL plus a little LOWLAND and essentially nothing else
+— which is the plan's own "we currently cannot see half the climate space",
+now confirmed at the bake's own input rather than inferred from the biome
+classifier.
+
+**Step 3 (conditioning contrast) is therefore a hard prerequisite for judging
+Tier 1, not a parallel track.** The machinery is in and tested; two of its four
+provinces cannot be encountered, tuned, or judged until the world contains dry
+and cold climate at all.
+
+### What is NOT claimed
+
+Not a seam guarantee. `pipeline.APRON_BLIND_SPOT` measured that guarantee
+already violated — 1.05% of the shipped interior moving past the 100 mm wire LSB
+by up to 78.79 m, with the domain border's influence reaching 3.8 km inward,
+because the depression fill is unbounded and a truncated domain invents an
+outlet. Province fields neither worsen it nor repair it. The narrower claim that
+*is* made and tested: province adds no influence radius beyond its own landform
+smooth, which `apron_coarse_px // 4` clamps to at most half the apron on any
+geometry.
