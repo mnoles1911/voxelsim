@@ -68,6 +68,33 @@ Downsample (120 m/px is plenty for a 261 km world) or use JPEG.
 | `temperature.py` | Where is it hot/cold, and where does a **snow system** matter? |
 | `vs_earth.py` | Is our hypsometry more or less extreme than real Earth? |
 | `province_vs_earth.py` | Does the province discriminant label real Earth correctly? |
+| `vista_sites.py` | What biome and province is each screenshot site ACTUALLY at? |
+| `vista_map.py` | Where are the screenshot sites? (pins on the world hillshade) |
+| `find_site.py` | Where should I stand to photograph biome X? |
+
+## Picking screenshot sites
+
+Sites chosen off a biome map by eye are wrong often enough to be worth
+checking. Of the first nine vista sites, **three were bad** and neither the
+filenames nor the pictures said so: one "beach" spawned at −142 m with zero
+land inside 6 km, and two sat on the world edge, where a 1200 m camera fills
+its far field with the flat fallback plane. So:
+
+```sh
+$PY tools/worldmaps/find_site.py "$TILES" BEACH --min-edge-km 32   # pick
+$PY tools/worldmaps/vista_sites.py "$TILES" out/vista-sites.md     # then VERIFY
+$PY tools/worldmaps/vista_map.py "$TILES" out/vista-sites.json out/index.png
+```
+
+`vista_sites.py` re-derives both labels at the exact spawn column through the
+real classifiers, and reports what is in frame separately from what is under
+the camera — where those disagree, the filename is overclaiming. Audition
+candidates without editing the production list via
+`VISTA_SITES="a:-102390:-23670;b:47370:-169590"`.
+
+Two things about vista sites that a biome map cannot show you: **a vista sees
+far past its own tile** (so `--min-edge-km`), and **a coastline needs a land
+fraction near half** to be legible at all.
 
 See `docs/climate-biome-province-consumers.md` for which layer drives
 vegetation, weather and materials — and which must NOT.
