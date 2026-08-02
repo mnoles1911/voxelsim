@@ -121,3 +121,45 @@ WORLD TOTALS, 289 tiles, 50.0% land
   temperature p5   -7.4   p95  26.8 C
   precip      p5      0   p50   376   p95  1694 mm
   hot 28.14%   arid 53.95%   hot&arid 10.83%
+
+
+================================================================
+BIOME TRANSITION DISTANCE -- the owner's actual stated goal
+================================================================
+
+The ask was: "richer, more varied world in which the terrain character
+transition and occur in CLOSE PROXIMITY to one another so the world feels more
+alive", and "jump from Iceland like rugged terrain to eastern European dense
+temperate forests in relatively short order", explicitly FASTER than Earth.
+
+Nothing had measured that. This does, on the stitched 289-tile world
+(1088x1088 at 240 m/px = 261 km across, 50.0% land).
+
+BIOME RUN LENGTH along E-W land transects, n = 30,301
+  p25   0.5 km
+  MEDIAN 1.4 km
+  p75   5.5 km
+  p95  19.9 km
+
+DISTINCT BIOMES WITHIN A RADIUS
+   5 km   mean 2.59   median 3   max 5
+  10 km   mean 3.84   median 4   max 7
+  25 km   mean 6.40   median 7   max 8
+  50 km   mean 7.88   median 8   max 8
+
+Within 25 km a player typically encounters SEVEN of the eight biomes; within
+50 km, all eight. On Earth that traverse is hundreds to thousands of km, so
+this is roughly 10-50x faster -- which is the stated design goal, not an
+accident.
+
+THE CAVEAT, AND IT IS A REAL DESIGN QUESTION
+A median run of 1.4 km with p25 at 0.5 km means A QUARTER OF BIOME PATCHES ARE
+UNDER 500 m ACROSS. That can read two ways in game: alive, or SPECKLED, with
+biomes flickering as the player walks. The distribution is heavily skewed
+(median 1.4 km against p95 19.9 km), so both tiny patches and large coherent
+regions exist; which dominates the FEEL is a visual judgement and not
+answerable from these numbers.
+
+If it reads as speckled, the fix is CLIENT-SIDE -- biome hysteresis, or a
+minimum-patch filter in classifyBiome's consumer -- not a regeneration. The
+tiles carry climate; the classifier decides patches.
