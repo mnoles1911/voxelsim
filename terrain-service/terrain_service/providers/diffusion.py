@@ -293,22 +293,39 @@ def validate_model_output(
 #: Regenerate with tools/fit_climate_calibration.py if the model, the
 #: conditioning stats, or elev_gain change -- all three move these curves.
 #: See docs/measurements/climate-calibration-2026-08-01.txt.
+#: FITTED ON THE FULL PIPELINE, on a GPU. The first version of these curves
+#: was fitted on the COARSE STAGE ALONE, because the dev box is CPU-only torch
+#: on an AMD card and the latent/decoder stages cannot run there. That was
+#: wrong, and only a real pod could show it:
+#:
+#:   raw precipitation p50 -- coarse stage 680 mm, FULL PIPELINE 1788 mm
+#:
+#: 2.6x wetter. The coarse-fitted curve was being fed values far above its top
+#: anchor, so it extrapolated and made an already-wet world wetter still
+#: (delivered p50 2118 mm against a 554 mm target). Temperature was off the
+#: same way in the other direction: raw p95 is 25.9 on the full pipeline
+#: against 20.5 on coarse, so the coarse curve over-stretched it to 32.8.
+#:
+#: Re-fitted over 25 tiles / 2,800,790 land pixels against the co-located
+#: conditioning sketch. Regenerate with tools/fit_climate_calibration.py --
+#: and regenerate it ON A MACHINE THAT CAN RUN THE DECODER, or this mistake
+#: repeats.
 CLIMATE_CALIBRATION: dict[str, tuple[tuple[float, ...], tuple[float, ...]]] = {
     "temperature": (
-        (-2.437, 2.751, 10.355, 14.544, 17.541, 20.512, 22.043),
-        (-9.448, -2.904, 11.790, 21.192, 25.081, 28.535, 30.491),
+        (-3.922, 1.412, 9.882, 14.902, 19.294, 25.882, 26.510),
+        (-10.984, -3.108, 10.921, 21.435, 24.753, 28.086, 30.512),
     ),
     "seasonality": (
-        (375.151, 502.709, 649.444, 757.944, 875.138, 1138.371, 1326.095),
-        (177.080, 329.931, 491.965, 664.604, 885.186, 1406.515, 1761.142),
+        (470.588, 482.353, 647.059, 717.647, 811.765, 952.941, 1023.529),
+        (155.332, 305.646, 469.854, 643.542, 870.275, 1420.825, 1800.959),
     ),
     "precipitation": (
-        (122.220, 250.843, 464.981, 680.713, 1065.561, 2281.607, 3458.090),
-        (7.472, 36.139, 237.813, 553.879, 1162.630, 2787.452, 4385.236),
+        (47.059, 188.235, 611.765, 1082.353, 1505.882, 4564.706, 4894.118),
+        (6.849, 39.703, 256.887, 583.683, 1181.637, 2900.612, 4990.798),
     ),
     "precip_variability": (
-        (4.998, 16.131, 35.360, 50.374, 67.088, 96.200, 117.753),
-        (1.121, 10.489, 26.801, 46.423, 74.282, 112.256, 142.234),
+        (21.176, 25.098, 39.216, 52.549, 64.314, 81.569, 83.922),
+        (0.0, 7.586, 26.130, 45.783, 72.548, 110.545, 138.160),
     ),
 }
 

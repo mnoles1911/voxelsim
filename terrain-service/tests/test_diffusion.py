@@ -215,11 +215,15 @@ def test_climate_calibration_extrapolates_rather_than_clamping():
 def test_climate_calibration_restores_the_hot_arid_corner():
     """The measured failure it was built for.
 
-    Across 10 windows the model delivered land temperature capped near 20.5 C
-    p95, so cells that were simultaneously hot (>=24 C) and arid were 0.00% of
-    land everywhere, and no biome threshold could produce an honest desert.
-    A delivered value at the model's observed 95th percentile must land above
-    24 C after calibration.
+    The model delivered land temperature capped near 20.5 C p95 on the coarse
+    stage, so cells that were simultaneously hot (>=24 C) and arid were 0.00%
+    of land everywhere, and no biome threshold could produce an honest desert.
+
+    20.512 is that ORIGINAL coarse-stage p95, kept deliberately as a fixed
+    regression point rather than tracking whichever percentile the current
+    curves were fitted at -- the curves are now fitted on the full pipeline,
+    where raw p95 is 25.9, but this value is what the bug looked like and any
+    calibration worth shipping must still lift it past the desert gate.
     """
     xs, ys = CLIMATE_CALIBRATION["temperature"]
     delivered_p95 = np.array([20.512], dtype=np.float64)
