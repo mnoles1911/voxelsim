@@ -214,28 +214,50 @@ def make_coarse_fetch(tiles_dir: Path, coarse_tile_px: int):
             f"--coarse-tile-px {coarse_tile_px} must divide {SRC_TILE_PX}"
         )
     per = SRC_TILE_PX // coarse_tile_px
-    cache: dict[tuple[int, int], np.ndarray | None] = {}
+    cache: dict[tuple[int, int], tuple[np.ndarray, np.ndarray] | None] = {}
 
     def load(fx: int, fy: int):
         if (fx, fy) not in cache:
             p = tiles_dir / f"{fx}_{fy}.vxtl"
             if p.exists():
                 t = tile_codec.decode(p.read_bytes())
-                cache[(fx, fy)] = t.elevation.astype(np.float32)
+                # Climate is kept, not discarded. bake_ver 7's province
+                # partition needs it; without it prov.temp_c is None, the
+                # partition silently falls back to relief only, and every
+                # tile comes out 100% FLUVIAL. That is not hypothetical --
+                # it is what this tool reported for tile (-3,-3), a tile
+                # that is 98.9% arid.
+                cache[(fx, fy)] = (t.elevation.astype(np.float32), t.climate)
             else:
                 cache[(fx, fy)] = None
         return cache[(fx, fy)]
 
-    def fetch(x: int, y: int):
+    def _sub(x: int, y: int):
         fx, sx = divmod(x, per)
         fy, sy = divmod(y, per)
-        src = load(fx, fy)
+        return load(fx, fy), sx, sy
+
+    def fetch(x: int, y: int):
+        src, sx, sy = _sub(x, y)
         if src is None:
             return None
         n = coarse_tile_px
-        return np.ascontiguousarray(src[sy * n:(sy + 1) * n, sx * n:(sx + 1) * n])
+        return np.ascontiguousarray(src[0][sy * n:(sy + 1) * n, sx * n:(sx + 1) * n])
 
-    return fetch
+    def fetch_climate(x: int, y: int):
+        """The ``(4, n, n)`` uint8 climate planes for the province partition.
+
+        Subdivided on the same world-anchored grid as elevation -- the climate
+        plane is (4, 512, 512), i.e. the same spatial grid with a leading
+        channel axis, so the slice is identical with one extra leading colon.
+        """
+        src, sx, sy = _sub(x, y)
+        if src is None:
+            return None
+        n = coarse_tile_px
+        return np.ascontiguousarray(src[1][:, sy * n:(sy + 1) * n, sx * n:(sx + 1) * n])
+
+    return fetch, fetch_climate
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +483,7 @@ def main() -> int:
     geom = bp.BakeGeometry(coarse_tile_px=a.coarse_tile_px)
     production = (a.coarse_tile_px == 512)
     consts = bp.CONSTANTS
-    fetch = make_coarse_fetch(tiles_dir, a.coarse_tile_px)
+    fetch, fetch_climate = make_coarse_fetch(tiles_dir, a.coarse_tile_px)
 
     print(f"tile ({tx},{ty})  seed 0x{a.seed:x}")
     print(f"  geometry: interior {geom.fine_tile_px}^2 @ {geom.fine_pixel_m} m/px "
@@ -491,6 +513,10 @@ def main() -> int:
     c0, w0 = time.process_time(), time.perf_counter()
     result = bp.bake_tile(
         world_seed=a.seed, tile_x=tx, tile_y=ty, coarse_fetch=fetch,
+        # Without this the province partition has no climate, falls back
+        # to relief alone, and reports 100% FLUVIAL on every tile --
+        # including one that is 98.9% arid. See make_coarse_fetch.
+        climate_fetch=fetch_climate,
         kernels=kernels, geom=geom, consts=consts, inflow_source=inflow_source,
     )
     cpu_bake = time.process_time() - c0
