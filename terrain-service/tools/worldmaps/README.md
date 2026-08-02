@@ -15,7 +15,7 @@ terrain-diffusion venv:
 ```sh
 TILES=D:/voxelsim/tile-cache/<provider>/<seed:016x>/s1
 PY=D:/terrain-diffusion/.venv/Scripts/python.exe
-export PYTHONPATH=D:/vox-int/terrain-service
+export PYTHONPATH=D:/voxelsim/terrain-service
 
 $PY tools/worldmaps/heightmap.py    "$TILES" out/01-heightmap.png 4
 $PY tools/worldmaps/biomes.py       "$TILES" out/02-biomes.png

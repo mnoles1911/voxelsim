@@ -24,7 +24,7 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, "D:/vox-int/terrain-service/tools")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from world_map import _read_constants, classify, BIOMES        # noqa: E402
 from terrain_service import tile_codec                          # noqa: E402
 

@@ -8,7 +8,7 @@ against the terrain-diffusion venv.
 
     cd D:/terrain-diffusion
     PYTHONPATH=D:/terrain-diffusion ./.venv/Scripts/python.exe \
-        D:/vox-int/terrain-service/tools/orographic_check.py
+        D:/voxelsim/terrain-service/tools/orographic_check.py
 
 (CWD must be the terrain-diffusion repo: ``STATS_CACHE_PATH`` and the WorldClim
 rasters are opened at paths relative to the process CWD.)

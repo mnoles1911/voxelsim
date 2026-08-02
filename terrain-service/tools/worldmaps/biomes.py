@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LightSource, ListedColormap
 from matplotlib.patches import Patch
 
-sys.path.insert(0, "D:/vox-int/terrain-service/tools")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from world_map import _read_constants, classify, BIOMES          # noqa: E402
 from terrain_service import tile_codec                            # noqa: E402
 

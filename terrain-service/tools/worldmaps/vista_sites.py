@@ -26,14 +26,14 @@ It reports TWO scales per site, because they answer different questions:
 
 Usage:
     PY=D:/terrain-diffusion/.venv/Scripts/python.exe
-    PYTHONPATH=D:/vox-int/terrain-service $PY vista_sites.py <seed_dir> <out.md>
+    PYTHONPATH=D:/voxelsim/terrain-service $PY vista_sites.py <seed_dir> <out.md>
 """
 import pathlib
 import sys
 
 import numpy as np
 
-sys.path.insert(0, "D:/vox-int/terrain-service/tools")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from world_map import _read_constants, classify, BIOMES        # noqa: E402
 from terrain_service import tile_codec                          # noqa: E402
 from terrain_service.bake import pipeline as bp                 # noqa: E402
