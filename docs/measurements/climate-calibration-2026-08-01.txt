@@ -107,3 +107,82 @@ CAVEATS
 4. The calibration is hashed into provider_id -- the CURVES, not just the
    on/off flag -- so re-fitting cannot silently change every tile's climate
    under an unchanged id. Same lesson as synthetic_map_stats.json.
+
+
+================================================================
+ADDENDUM -- MEASURED ON A REAL GPU POD, SAME DAY
+================================================================
+
+Everything above was measured on the COARSE STAGE ONLY, because the dev box
+runs CPU-only torch on an AMD card and cannot execute the latent or decoder
+stages. Caveat 3 above says exactly that, and says the fine stages "could
+reintroduce compression at finer scale". They do something worse than
+compress: they SHIFT the distribution, so the coarse-fitted curves were
+mis-applied.
+
+WHAT THE FULL PIPELINE ACTUALLY EMITS (RTX 4090, 25 tiles, 2,800,790 land px)
+
+  raw precipitation p50   coarse 680 mm   FULL PIPELINE 1788 mm   (2.6x)
+  raw temperature   p95   coarse 20.5 C   FULL PIPELINE  25.9 C   (+5.4 C)
+
+The coarse-fitted curves were therefore fed values ABOVE their top anchors
+and extrapolated. Delivered precipitation came out at p50 2118 mm against a
+554 mm target -- the calibration was making an already-wet world wetter --
+and temperature was over-stretched to 32.8 C.
+
+This is the same error class the plan already records twice: a statistic that
+was real, correctly computed, and measuring the wrong thing. COARSE OUTPUT IS
+NOT TILE OUTPUT. tools/fit_climate_calibration.py must be run on a machine
+that can execute the decoder.
+
+WHAT SURVIVED THE FULL PIPELINE, AND IT IS THE IMPORTANT PART
+
+Temperature calibration WORKS end to end. This was the one thing that could
+not be tested without a GPU. Raw tile temperature p95 23.7 C -> calibrated
+32.8 C, max 34.4 C, against a world that capped at 20.7 C before any of this
+work. Hot land went from nonexistent to 38% of land. The latent and decoder
+stages do not undo it.
+
+Deserts are generated. Tile (-4, 19) is 98.8% land with a maximum of
+362 mm/yr across all 512x512 px -- an entire arid tile. It is what surfaced
+the negative-precipitation clamp (see PHYSICAL_CLAMP_TOLERANCE): the coarse
+model generates in a normalised space with nothing constraining sign, so on
+genuinely dry ground it undershoots zero, and validate_model_output was
+refusing exactly the terrain this work exists to produce.
+
+THE REMAINING PROBLEM IS THE JOINT, NOT THE MARGINALS
+
+On real tiles, hot (>=24 C) and arid (<400 mm) land both exist and DO NOT
+OVERLAP. Measured on 5 tiles:
+
+  corr(elev, precip)  -0.031
+  corr(elev, temp)    -0.802
+  corr(temp, precip)  +0.408      <-- the blocker
+
+Arid cells average 238 m elevation against 821 m for all land, so the "cold
+high plateau desert" hypothesis is FALSIFIED -- arid land is low. The blocker
+is that dry places are cold: temperature and precipitation are positively
+correlated.
+
+That correlation is roughly Earth-like in bulk (tropics hot-wet, poles
+cold-dry). Earth's HOT deserts are a subtropical exception produced by Hadley
+descent, and this world has no latitude and no such mechanism. The model
+reproduces the bulk correlation faithfully and leaves the hot-dry corner
+empty.
+
+This is the same joint-distribution gap found independently from the savanna
+side (biome-gates-2026-08-01.txt): on Earth 72.4% of warm 400-1600 mm land is
+monsoonal; here 24.5%. The channels are quantile-matched ONE AT A TIME, so
+every marginal can be made correct while the joint stays wrong.
+
+Re-fitting the marginals may open the hot-arid corner or may not. If it does
+not, the honest fix is CAUSAL and belongs in the conditioning: suppress
+precipitation in hot lowlands the way the orographic term suppresses it
+downwind of ranges. Stretching marginals until the classifier reports the
+desired number is not a fix.
+
+A SAMPLING CAUTION, recorded because it nearly caused a wrong conclusion
+8 tiles cover ~1,900 km2. The coarse census covered ~817,000 km2 -- 400x more
+area. An 8-tile sample showing 0.00% hot-and-arid is NOT evidence against a
+9.88% coarse figure; it is too small to say anything. Match the sample to the
+claim.
