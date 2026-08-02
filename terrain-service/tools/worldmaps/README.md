@@ -21,7 +21,16 @@ $PY tools/worldmaps/heightmap.py    "$TILES" out/01-heightmap.png 4
 $PY tools/worldmaps/biomes.py       "$TILES" out/02-biomes.png
 $PY tools/worldmaps/provinces.py    "$TILES"            # writes 03-provinces
 $PY tools/worldmaps/temperature.py  "$TILES" out/04-temperature-and-snow.png
+$PY tools/worldmaps/vista_sites.py  "$TILES" out/vista-sites.md
+$PY tools/worldmaps/vista_map.py    "$TILES" out/vista-sites.json out/07-vista-site-index.png
 ```
+
+**Map 07 is a standing deliverable like 01-04**, added at the owner's request:
+the hillshade with a numbered pin at every screenshot site and each pin's
+`-VoxelSpawnAt` in the legend, which is what turns a coordinate into somewhere
+a developer can go. **Regenerate it whenever a site moves** — a stale pin map
+is worse than none. `vista_map.py` reads the JSON `vista_sites.py` writes, so
+the pins cannot drift from the labels as long as you run them in that order.
 
 Analysis, not maps:
 
