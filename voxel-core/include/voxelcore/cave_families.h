@@ -83,14 +83,37 @@ struct CaveColumnVariants {
 // `full` is bit-identical to what caveColumnFor(seed, vx, vy, surfaceMm)
 // returns, including its below-threshold empty case -- callers cross-check
 // that against the ColumnSample they already have.
+// THE v24 ENTRANCE, OUT OF THE v25 WORLD -- the control panel for W3's A/B.
+//
+// An A/B that shows a feature is PRESENT needs the frame where it is absent,
+// and the absent frame has to differ in exactly one thing. Building the actual
+// v24 tree gets that wrong twice over: it also reverts nothing-to-do-with-W3
+// (and on the fine tier the v24 instrument cannot even load the tiles), and it
+// makes the comparison a two-build argument instead of a one-world one.
+//
+// So the control is made the same way the family attribution is: by
+// DIFFERENCING the shipping predicate over a controlled variant of the lattice
+// block. Zeroing `entranceReachMm` makes the cavity's own xy reject
+// (distSq < reachSq) fail at every column, which leaves exactly the THROAT --
+// a bore of the same hashed radius from the surface to the same node. That IS
+// v24's entrance construct, in the same world, with everything else identical.
+// No worldgen is edited and nothing here is mirrored in the shader.
+inline CaveLattice caveLatticeWithoutEntranceCavity(CaveLattice L) {
+    L.entranceReachMm = 0;
+    return L;
+}
+
 template <typename SurfaceFn>
 inline CaveColumnVariants caveColumnVariantsFor(uint64_t seed, int64_t vx, int64_t vy,
-                                                int32_t surfaceMm, const SurfaceFn& surfaceAt) {
+                                                int32_t surfaceMm, const SurfaceFn& surfaceAt,
+                                                bool entranceCavityOff = false) {
     CaveColumnVariants out;
     if (surfaceMm < kCaveMinSurfaceMm) return out; // caveColumnFor's own guard
     const int64_t ci = floorDiv(vx * kVoxelSizeMm, kCaveLatticeMm);
     const int64_t cj = floorDiv(vy * kVoxelSizeMm, kCaveLatticeMm);
-    const CaveLattice L = caveLatticeFor(seed, ci, cj, surfaceAt);
+    const CaveLattice L = entranceCavityOff
+                              ? caveLatticeWithoutEntranceCavity(caveLatticeFor(seed, ci, cj, surfaceAt))
+                              : caveLatticeFor(seed, ci, cj, surfaceAt);
 
     CaveLattice lns = L;
     lns.shaftNodeSlot = -1;

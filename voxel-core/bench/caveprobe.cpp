@@ -113,6 +113,12 @@
 //                        chosen on -- the amplifier branches on the pitch
 //     --coarse-dir D     s1 tile dir supplying CLIMATE behind a --scale 16 run
 //                        (the fine tier carries elevation and flow, no climate)
+//     --entrance-off     THE CONTROL PANEL: reduce the SAME world with the v25
+//                        entrance cavity switched off, leaving only the v24
+//                        bore. For A/B pairs that have to show the cavity is
+//                        the thing that changed (cave_families.h explains why
+//                        this is done by differencing rather than by building
+//                        the v24 tree)
 //     --connect N        connectivity flood-fill sample box edge (default 192
 //                        samples at 0.4 m = 76.8 m); 0 disables it
 //     --out PREFIX       output path prefix (default ./caveprobe)
@@ -298,7 +304,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: vxc_caveprobe <tiledir|--synthetic> <seed> [--origin XM YM]\n"
                      "       [--span M] [--px N] [--max-depth M] [--headroom M] [--steep MM]\n"
-                     "       [--connect N] [--scale N] [--coarse-dir D] [--out PREFIX] [--no-images]\n"
+                     "       [--connect N] [--scale N] [--coarse-dir D] [--entrance-off] [--out PREFIX]\n"
+                     "       [--no-images]\n"
                      "       [--section-only]\n");
         return 2;
     }
@@ -315,6 +322,7 @@ int main(int argc, char** argv) {
     // of open shaft nodes actually inside it is printed next to the result.
     int64_t maxDepthM = 45, steepMmPerM = 300, connectN = 512;
     int px = 512, tileScale = 1;
+    bool entranceCavityOff = false;
     std::string coarseDir;
     bool images = true, sectionOnly = false, connectAtSet = false;
     double connectAtXM = 0, connectAtYM = 0;
@@ -350,6 +358,8 @@ int main(int argc, char** argv) {
             i += 2;
         } else if (a == "--out" && i + 1 < argc) {
             outPrefix = argv[++i];
+        } else if (a == "--entrance-off") {
+            entranceCavityOff = true;
         } else if (a == "--no-images") {
             images = false;
         } else if (a == "--section-only") {
@@ -456,8 +466,9 @@ int main(int argc, char** argv) {
     const double sampleAreaM2 = static_cast<double>(stride * stride * kVoxelSizeMm * kVoxelSizeMm) / 1e6;
     const double regionKm2 = (static_cast<double>(px) * static_cast<double>(px) * sampleAreaM2) / 1e6;
 
-    std::printf("\nvxc_caveprobe  seed=%llu  kWorldGenVersion=%u\n", (unsigned long long)seed,
-                kWorldGenVersion);
+    std::printf("\nvxc_caveprobe  seed=%llu  kWorldGenVersion=%u%s\n", (unsigned long long)seed,
+                kWorldGenVersion,
+                entranceCavityOff ? "  [--entrance-off: the v24 bore, cavity suppressed]" : "");
     std::printf("region centre=(%.1f, %.1f) m  span=%.1f m  %dx%d samples  stride=%.1f m "
                 "(%.4f km^2)\n",
                 originXM, originYM, spanM, px, px,
@@ -536,7 +547,7 @@ int main(int argc, char** argv) {
                 const bool steep = slopeMmPerM >= steepMmPerM;
                 if (steep) ++colsSteep;
 
-                const CaveColumnVariants cv = caveColumnVariantsFor(seed, vx, vy, col.surfaceMm, amp.surfaceAtFn());
+                const CaveColumnVariants cv = caveColumnVariantsFor(seed, vx, vy, col.surfaceMm, amp.surfaceAtFn(), entranceCavityOff);
                 if (cv.full.count != col.cave.count ||
                     cv.full.shaftMarginSq != col.cave.shaftMarginSq)
                     ++memoMismatch;
@@ -711,7 +722,7 @@ int main(int argc, char** argv) {
                 const int64_t vx = (axis == 0) ? x0 + static_cast<int64_t>(i) * stride : cx;
                 const int64_t vy = (axis == 0) ? cy : y0 + static_cast<int64_t>(i) * stride;
                 const ColumnSample col = amp.column(vx, vy);
-                const CaveColumnVariants cv = caveColumnVariantsFor(seed, vx, vy, col.surfaceMm, amp.surfaceAtFn());
+                const CaveColumnVariants cv = caveColumnVariantsFor(seed, vx, vy, col.surfaceMm, amp.surfaceAtFn(), entranceCavityOff);
                 for (int64_t r = 0; r < h; ++r) {
                     const int64_t vz = zTop - r; // row 0 = top of image
                     const MaterialId strat = Amplifier::stratigraphyAt(col, vz);
